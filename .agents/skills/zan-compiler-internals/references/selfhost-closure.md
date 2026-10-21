@@ -2172,3 +2172,25 @@ kernel32、shell32、user32、advapi32、version）。
   内存、FFI 结构体），写入前必须显式窄化；而且判断依据要用"类别"
   （浮点/整数），不要用"类型名相等"——值的声明类型可能是 float 而它的
   LLVM 形状是 double。
+
+## 116. LLVM 的 `null` 实参必须带类型——裸 `null` 不是实参
+
+- 坑（2026-10-21 实测，A484）：自举拼出来的 IR 里出现了裸 `null` 当调用实参，
+  clang 报 "expected type"：
+
+  ```
+  %p = call i8* @zalloc(i64 24, i8* bitcast (void (i8*)* @zsb_dtor to i8*), null)
+  ```
+
+  根因：自举 irgen 的 `ContainerCid()`（`src/selfhost/irgen.zan`）在"这个类型
+  不是内建容器"时返回**裸 `null`**，直接拼进 `@zalloc(size, dtor, cid)` 的第三个
+  实参。LLVM 的调用实参必须带类型（`i8* null`）；裸 `null` 只在少数常量位置
+  合法。
+  - 触发条件很隐蔽：**用户自定义了与内建容器同名的类**（`class StringBuilder` /
+    `class List` / `class Dict`）→ `IsContainerType()` 判 false → 走 null 分支。
+    普通程序一切正常，差分门 85 个用例一个都没撞上。
+- 做法：`ContainerCid()` 的 null 分支返回 `"i8* null"`。
+- 通用教训：**自举拼 IR 文本时，任何"空指针"都要带类型**。宿主侧的 IR 一直是
+  `i8* null`（参数类型是已知的），自举把参数类型藏进字符串拼接里就容易把
+  类型丢掉——而拼出来的 IR 只能靠 clang/llvm-as 验证，肉眼看 `null` 完全合理，
+  看不出问题。

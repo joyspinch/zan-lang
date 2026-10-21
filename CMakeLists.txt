@@ -2994,40 +2994,12 @@ foreach(_sh_line IN LISTS _sh_lines)
   endif()
   list(APPEND SELFHOST_SOURCES ${CMAKE_SOURCE_DIR}/src/${_sh_line}.zan)
 endforeach()
-add_test(NAME selfhost_gen1
-  COMMAND ${CMAKE_COMMAND}
-    -DZANC=$<TARGET_FILE:zanc>
-    -DSELFHOST_DIR=${CMAKE_SOURCE_DIR}/src/selfhost
-    "-DSELFHOST_SOURCES=${SELFHOST_SOURCES}"
-    -DPROG=${CMAKE_SOURCE_DIR}/tests/selfhost/prog1.zan
-    -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/selfhost/prog1.out
-    -DGEN1=${CMAKE_BINARY_DIR}/selfhost_gen1${_exe_ext}
-    -DOUTLL=${CMAKE_BINARY_DIR}/selfhost_gen1.ll
-    -DCLANG=${SELFHOST_CLANG}
-    -DBADPROG=${CMAKE_SOURCE_DIR}/tests/selfhost/bad_unknown_type.zan
-    -DBADLL=${CMAKE_BINARY_DIR}/selfhost_bad.ll
-    -P ${CMAKE_SOURCE_DIR}/tests/run_selfhost.cmake)
-set_tests_properties(selfhost_gen1 PROPERTIES TIMEOUT 600)
-
-# ---- Self-hosting: jsongen must fail closed on unsupported field types ----
-# The ok program maps a class whose int[] field is [JsonIgnore]-annotated
-# (compiles, runs, serializes without the field); the bad program leaves the
-# same field unannotated and must be rejected with a compile error and no IR.
-# One gen1 build serves both directions (PROG + BADPROG in one invocation).
-add_test(NAME selfhost_json_ignore
-  COMMAND ${CMAKE_COMMAND}
-    -DZANC=$<TARGET_FILE:zanc>
-    -DSELFHOST_DIR=${CMAKE_SOURCE_DIR}/src/selfhost
-    "-DSELFHOST_SOURCES=${SELFHOST_SOURCES}"
-    -DPROG=${CMAKE_SOURCE_DIR}/tests/selfhost/json_ignore_ok.zan
-    -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/selfhost/json_ignore_ok.out
-    -DGEN1=${CMAKE_BINARY_DIR}/selfhost_jsongen1${_exe_ext}
-    -DOUTLL=${CMAKE_BINARY_DIR}/selfhost_json_ok.ll
-    -DCLANG=${SELFHOST_CLANG}
-    -DBADPROG=${CMAKE_SOURCE_DIR}/tests/selfhost/json_ignore_bad.zan
-    -DBADLL=${CMAKE_BINARY_DIR}/selfhost_json_bad.ll
-    -P ${CMAKE_SOURCE_DIR}/tests/run_selfhost.cmake)
-set_tests_properties(selfhost_json_ignore PROPERTIES TIMEOUT 600)
+# The selfhost_gen1 and selfhost_json_ignore tests are registered further
+# down, right after the zanrt_selfhost_bundle block: their stage 3 links the
+# emitted IR against the C runtime, so they need the bundle's objects
+# (RT_OBJS/SYSLIBS) -- the same link set the differential gate uses.
+# Registered up here they could not pass them (the bundle is defined below)
+# and therefore always failed to link.
 
 # ---- Self-hosting native backend (ngen) smoke gate ----
 # The ngen path emits machine code directly (arm64 object / wasm). It has no
@@ -3203,6 +3175,55 @@ if(SELFHOST_CLANG)
   endif()
 
 endif()
+
+# ---- Self-hosting: build gen1 with the C host, emit IR for a real program,
+#      clang-compile + run + diff stdout, and verify malformed input fails
+#      closed (non-zero, no .ll). clang is optional -- without it the stdout
+#      stage is skipped and the harness still proves gen1 builds and emits IR.
+#
+# Registered here (not next to the other self-host tests further up) because
+# stage 3 links the emitted IR against the C runtime and therefore needs the
+# bundle's objects -- the same link set the differential gate uses. Without
+# them the link failed with "unresolved external symbol zan_rt_dbl_str" and
+# the test stayed red for a reason unrelated to the self-hosted compiler.
+add_test(NAME selfhost_gen1
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSELFHOST_DIR=${CMAKE_SOURCE_DIR}/src/selfhost
+    "-DSELFHOST_SOURCES=${SELFHOST_SOURCES}"
+    -DPROG=${CMAKE_SOURCE_DIR}/tests/selfhost/prog1.zan
+    -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/selfhost/prog1.out
+    -DGEN1=${CMAKE_BINARY_DIR}/selfhost_gen1${_exe_ext}
+    -DOUTLL=${CMAKE_BINARY_DIR}/selfhost_gen1.ll
+    -DCLANG=${SELFHOST_CLANG}
+    -DBADPROG=${CMAKE_SOURCE_DIR}/tests/selfhost/bad_unknown_type.zan
+    -DBADLL=${CMAKE_BINARY_DIR}/selfhost_bad.ll
+    "-DRT_OBJS=${_sh_rt_objs}"
+    "-DSYSLIBS=${_sh_syslibs}"
+    -P ${CMAKE_SOURCE_DIR}/tests/run_selfhost.cmake)
+set_tests_properties(selfhost_gen1 PROPERTIES TIMEOUT 600)
+
+# ---- Self-hosting: jsongen must fail closed on unsupported field types ----
+# The ok program maps a class whose int[] field is [JsonIgnore]-annotated
+# (compiles, runs, serializes without the field); the bad program leaves the
+# same field unannotated and must be rejected with a compile error and no IR.
+# One gen1 build serves both directions (PROG + BADPROG in one invocation).
+add_test(NAME selfhost_json_ignore
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSELFHOST_DIR=${CMAKE_SOURCE_DIR}/src/selfhost
+    "-DSELFHOST_SOURCES=${SELFHOST_SOURCES}"
+    -DPROG=${CMAKE_SOURCE_DIR}/tests/selfhost/json_ignore_ok.zan
+    -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/selfhost/json_ignore_ok.out
+    -DGEN1=${CMAKE_BINARY_DIR}/selfhost_jsongen1${_exe_ext}
+    -DOUTLL=${CMAKE_BINARY_DIR}/selfhost_json_ok.ll
+    -DCLANG=${SELFHOST_CLANG}
+    -DBADPROG=${CMAKE_SOURCE_DIR}/tests/selfhost/json_ignore_bad.zan
+    -DBADLL=${CMAKE_BINARY_DIR}/selfhost_json_bad.ll
+    "-DRT_OBJS=${_sh_rt_objs}"
+    "-DSYSLIBS=${_sh_syslibs}"
+    -P ${CMAKE_SOURCE_DIR}/tests/run_selfhost.cmake)
+set_tests_properties(selfhost_json_ignore PROPERTIES TIMEOUT 600)
 
 # ---- Gui conformance: headless layout/text math (needs the zan_gui lib) ----
 # These programs import Gui modules that reference [DllImport("zan_gui")], so the

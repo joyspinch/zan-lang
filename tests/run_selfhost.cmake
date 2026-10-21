@@ -104,8 +104,28 @@ if(CLANG AND EXPECTED)
   get_filename_component(_ext ${GEN1} EXT)
   set(_prog_exe ${_exedir}/selfhost_prog${_ext})
   file(REMOVE ${_prog_exe})
+  # The emitted IR calls into the C runtime (zan_rt_*, zan_hw_*), so the link
+  # needs the SAME runtime objects the host links. The differential gate
+  # (run_selfhost_diff.cmake) has always passed them as RT_OBJS; this harness
+  # did not, so the link failed with "unresolved external symbol zan_rt_dbl_str"
+  # and the test stayed red for a reason that had nothing to do with the
+  # self-hosted compiler.
+  set(_link_extra)
+  if(RT_OBJS)
+    foreach(_rt_obj IN LISTS RT_OBJS)
+      if(NOT EXISTS ${_rt_obj})
+        message(FATAL_ERROR
+          "runtime object ${_rt_obj} is missing -- build the bundle first "
+          "(cmake --build <build> --target zanrt_selfhost_bundle)")
+      endif()
+      list(APPEND _link_extra ${_rt_obj})
+    endforeach()
+  endif()
+  if(SYSLIBS)
+    list(APPEND _link_extra ${SYSLIBS})
+  endif()
   execute_process(
-    COMMAND ${CLANG} ${OUTLL} -o ${_prog_exe}
+    COMMAND ${CLANG} ${OUTLL} ${_link_extra} -o ${_prog_exe}
     RESULT_VARIABLE cc_rc
     OUTPUT_VARIABLE cc_out
     ERROR_VARIABLE  cc_err)

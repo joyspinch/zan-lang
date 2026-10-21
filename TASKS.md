@@ -1664,7 +1664,7 @@
   `tests/selfhost/diff_cases.txt`，差分门跑它应 PASS。
 - 关联：A481（自举侧同一条战线的前瞻洞）、A469 / A479（宿主侧解析）。
 
-### [ ] A483 `selfhost_gen1` 这个 ctest 链接不过——它的 stage 3 没带运行时对象
+### [x] A483 `selfhost_gen1` 这个 ctest 链接不过——它的 stage 3 没带运行时对象
 
 - 现象：`ctest -R "^selfhost_gen1$"` 失败在 stage 3（clang 链接 gen1 产出的 IR）：
   `LNK2019: 无法解析的外部符号 zan_rt_dbl_str`（连带 zan_hw_base64_encode 等）。
@@ -1674,11 +1674,46 @@
   运行时对象带进去**；而差分门 `tests/run_selfhost_diff.cmake` 是带
   `${RTOBJS} ${SYSLIBS}` 的。运行时拆成独立 bundle 之后，这个 ctest 就再没人
   修过 → 它一直红着，且红的原因跟自举正确性无关。
-- 修法：stage 3 与差分门对齐——把 `zanrt_selfhost_bundle` 产出的对象与系统库
-  一起传给 clang（CMakeLists 侧 `zanrt_selfhost_bundle` 已经在建这些对象，
-  `_sh_rt_objs` 就在那里）。
+- 修法（两处）：
+  - `tests/run_selfhost.cmake` 的 stage 3 按差分门的样子把 `${RT_OBJS}` 与
+    `${SYSLIBS}` 一起传给 clang；对象缺失时给出明确的"先 build bundle"提示，
+    不要再让人对着一个 LNK 错误猜；
+  - `CMakeLists.txt`：`selfhost_gen1` 与 `selfhost_json_ignore` 两个测试的**注册
+    挪到 `zanrt_selfhost_bundle` 之后**（在那里 `_sh_rt_objs` / `_sh_syslibs`
+    才存在），并把这两个参数传进去。原来它们注册在 bundle 之前，传不了。
+- 验证（自举源码取 HEAD 的一份干净副本，避免撞上并发会话在途的改动）：
+  - `selfhost_gen1` 的四个阶段全绿——"OK: gen1 IR clang-compiled, ran, and stdout
+    matched for prog1.zan" + "OK: gen1 rejected malformed ..."；
+  - `selfhost_json_ignore` 同样四阶段全绿（**这一步顺带逼出了 A484**：补上
+    运行时对象之后，它才走到"IR 非法"那一步）；
+  - gen1 对 `prog1.zan` 的 IR **逐字节不变**（SHA256 仍是 `9E54D3DC…`）。
 - 备注：**差分门（`selfhost_diff`）本身是好的**，只是它的 bundle 对象曾经是陈的
-  —— 重建 `zanrt_selfhost_diff_bundle` 之后差分门能跑通（本轮实测子集 10/10 PASS，
-  含新增的 `ternary_stmt_start`）。也就是说，差分门此前很可能长期在用**旧对象**
-  评估新自举。
-- 关联：A481（自举侧同一条战线）、A482（自举 irgen 的 void-phi 洞）。
+  —— 重建 `zanrt_selfhost_diff_bundle` 之后差分门能跑通（A481 的验证就是这么做的）。
+  也就是说，差分门此前很可能长期在用**旧对象**评估新自举。
+- 关联：A481（自举侧同一条战线）、A484（自举 IR 的无类型 null）。
+
+### [x] A484 自举 IR 把 `null` 当实参发出——LLVM 要的是 `i8* null`
+
+- 现象（2026-10-21 修 A483 时撞见）：自举把 `tests/selfhost/json_ignore_ok.zan`
+  编译出的 IR，clang 拒收：
+
+  ```
+  a483_json_ok.ll:489:77: error: expected type
+    489 |   %p = call i8* @zalloc(i64 24, i8* bitcast (void (i8*)* @zsb_dtor to i8*), null)
+  ```
+
+- 根因：自举 irgen 的 `ContainerCid()`（`src/selfhost/irgen.zan`）在"这个类型
+  不是内建容器"时返回**裸 `null`**，直接拼进 `@zalloc(size, dtor, cid)` 的第三个
+  实参。LLVM 的调用实参必须带类型，裸 `null` 只在少数常量位置合法；作为实参要写
+  `i8* null`。
+  - 触发条件很隐蔽：**用户自定义了与内建容器同名的类**（`class StringBuilder` /
+    `class List` / `class Dict`）→ `IsContainerType()` 判 false → 走 null 分支。
+    所以只有这种程序会炸，普通程序一切正常——差分门 85 个用例一个都没撞上。
+- 修法：`ContainerCid()` 的 null 分支返回 `"i8* null"`。
+- 验证：自举源码取 HEAD 的干净副本 + 本条改动重建 gen1 → `json_ignore_ok.zan`
+  的 IR 过 clang、程序跑起来、stdout 与黄金逐字相同；`prog1.zan` 的 IR 逐字节
+  不变（SHA256 `9E54D3DC…`）。
+- 教训：**自举拼 IR 文本时，任何"空指针"都要带类型**。宿主侧的 IR 一直是
+  `i8* null`（参数类型是已知的），自举把参数类型藏进字符串拼接里，就容易把
+  类型丢掉——而拼出来的 IR 只能靠 clang/llvm-as 验证，肉眼看 `null` 完全合理。
+- 关联：A483（同一个测试的前一道坎）、A481 / A482（自举侧同一条战线）。
