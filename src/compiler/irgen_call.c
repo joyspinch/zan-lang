@@ -1,4 +1,7 @@
 
+/* bool -> 托管串（irgen_generics.c）："true" / "false" */
+LLVMValueRef emit_bool_to_cstr(zan_irgen_t *g, LLVMValueRef v);
+
 static LLVMValueRef emit_detach_async_call(zan_irgen_t *g, LLVMValueRef sub,
                                            bool keep_result, bool is_explicit_spawn) {
     if (!sub || LLVMGetTypeKind(LLVMTypeOf(sub)) != LLVMPointerTypeKind)
@@ -2033,6 +2036,12 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                                        (st->element_type->kind == TYPE_UINT ||
                                         st->element_type->kind == TYPE_ULONG);
                             return emit_to_cstr_u(g, arg, uns ? 1 : 0);
+                        }
+                        /* bool 渲染成 "true"/"false"（不是 itoa 的 "1"）——
+                           与 b.ToString() / Console.WriteLine / 插值同口径 */
+                        if (LLVMGetTypeKind(LLVMTypeOf(arg)) == LLVMIntegerTypeKind &&
+                            LLVMGetIntTypeWidth(LLVMTypeOf(arg)) == 1) {
+                            return emit_bool_to_cstr(g, arg);
                         }
                         /* 双精度浮点数最短往返格式化缓冲区 (40 字节容量) */
                         LLVMValueRef buf_size = LLVMConstInt(i64, 40, 0);

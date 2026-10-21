@@ -268,7 +268,7 @@
 - ⚠ 跨后端：自举后端 `src/selfhost/irgen_expr.zan:4036` 的 `Convert.ToString`
   特判是**无条件拦截**的（不像 Console 那样有 `LocalIdx("Console") < 0` 守卫），
   必须同时加上守卫，否则自举侧不会调用 stdlib 方法。两端要同一次落地。
-### [ ] A441 布尔值→字符串的渲染有三条口径：`true` / `1` / `x1`
+### [x] A441 布尔值→字符串的渲染有三条口径：`true` / `1` / `x1`
 
 - 现象（2026-10-20 探针 `_scratch/bool_str.zan`，C 宿主 `build/zanc.exe` 实测）：
   ```zan
@@ -294,19 +294,32 @@
     是两边各自都有的语义缺口。
 - 影响：`Convert.ToString(b)` 与 `"x" + b` 拿到的不是 `"true"`；按字符串比对、
   落库、拼消息的代码会踩坑，而且**同一个值在不同上下文里长得不一样**。
-- 方向：统一到 **`true` / `false`**（与已有的 `ToString()` / `Console.WriteLine`
-  口径一致）。C 宿主侧已有现成的 bool→串内建
-  `emit_value_as_cstr`（`src/compiler/irgen_generics.c:2022-2038`，内部已做
-  `select "true"/"false"`），照它补分支即可：
-  1. `src/compiler/irgen_call.c:1878` 的 `Convert.ToString` 特判：加 bool 分支，
-     复用 `emit_value_as_cstr` 的 `select "true"/"false"` 写法。
-  2. `src/compiler/irgen_generics.c:2439` `emit_to_cstr_of`：加 bool 分支
-     （拼接路径），可用 `expr_is_bool(g, ast, locals)` 判型。
-  3. 自举后端 `src/selfhost/irgen_expr.zan:933` `ToCStr`：加同样的 bool 分支。
-- ⚠ 3 步必须**同一次提交**落地：只改 C 宿主会让差分门
-  （`tests/selfhost/diff_cases.txt`）打红——两个后端当前都输出 "1"，改一边就分叉。
-- 影响面：改完要 grep 全部用 `Convert.ToString(<bool>)` / `<bool>` 参与拼接的
-  用例与 golden（现有 golden 已把 "1" 固化在部分用例里）。
+- 修法（2026-10-22 落地）：口径统一到 **`true` / `false`**（与已有的
+  `ToString()` / `Console.WriteLine` 一致），并且**改在汇合点上**：
+  - 宿主侧：抽出公共助手 `emit_bool_to_cstr`（`select "true"/"false"`），
+    `emit_value_as_cstr` 改用它；bool 分支放进**取串的汇合点**
+    `emit_to_cstr_u`（`src/compiler/irgen_generics.c`）——字符串拼接、可空值
+    取串、`string.Format` 的参数全都经过它，一处分支覆盖多条路径；
+  - `Convert.ToString` 的内建特判（`src/compiler/irgen_call.c`）不走
+    `emit_to_cstr_u`，单独补一条 bool 分支；
+  - 自举后端 `src/selfhost/irgen_expr.zan` 的 `ToCStr` 补同样的 bool 分支
+    （照抄同文件标量 `ToString` 的写法：两个托管串字面量 + `select`）。
+- 验证：
+  - 新增 `tests/conformance/bool_string_rendering.zan`（四条路径 × true/false）
+    钉住输出，并进差分门清单；
+  - 宿主与自举对同一份源码的输出**逐字一致**（`true / true / true / xtrue /
+    true / false / yfalse / false / false`）；
+  - 差分门子集 PASS；pkg_sweep 62 包全绿；conformance smoke 全绿——现有
+    golden 里没有把 bool 的 `"1"` 固化的用例（`Convert.ToString` 的 230 处
+    调用逐个看过，都是 int/long/标识符一类）。
+- 教训：**取串路径有"汇合点"**。缺口不在四个调用点，而在它们共同经过的那个
+  取串函数——在汇合点加一条分支，比在每个调用点各写一遍可靠，而且以后新增的
+  取串路径会自动继承。
+- 教训：**两个后端当前一致 ≠ 没问题**。这条里两个后端都输出 `"1"`，差分门是
+  绿的，但两边都与 C# 语义不符——差分门只保证"两个后端一致"，语义缺口要另外
+  对着标准钉。
+- 关联：A442（自举侧 `Convert.ToString(<引用类型>)` 仍吐指针地址，宿主侧已修）、
+  A443（把 `Convert.ToString` 声明进公开面）。
 ### [x] A393 自举调用 `async void` 方法不启动协程——方法体根本不执行
 
 - 现象（2026-10-20 差分门探针实测，探针在 `_scratch/sd/p_asyncvoid.zan`）：

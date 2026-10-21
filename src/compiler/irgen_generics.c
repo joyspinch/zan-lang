@@ -2032,14 +2032,22 @@ static LLVMValueRef emit_entry_scratch(zan_irgen_t *g, unsigned size,
     return LLVMBuildInBoundsGEP2(g->builder, arr, slot, idxs, 2, name);
 }
 
+/* bool -> 托管串："true" / "false"。
+   所有把值转成字符串的路径都要走这一条：i1 落进 itoa 会渲染成 "1"/"0"，
+   同一个 bool 在不同上下文里长得不一样（`Convert.ToString(b)` -> "1"，
+   `"x" + b` -> "x1"，而 `b.ToString()` -> "true"）。C# 的口径是 true/false。 */
+LLVMValueRef emit_bool_to_cstr(zan_irgen_t *g, LLVMValueRef v) {
+    zan_istr_t t = { "true", 4 }, f = { "false", 5 };
+    return LLVMBuildSelect(g->builder, v,
+        emit_string_literal_rc(g, t), emit_string_literal_rc(g, f), "b2s");
+}
+
 static LLVMValueRef emit_value_as_cstr(zan_irgen_t *g, LLVMValueRef v) {
     LLVMTypeRef vt = LLVMTypeOf(v);
     if (LLVMGetTypeKind(vt) == LLVMPointerTypeKind) return v;
     LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
     if (LLVMGetTypeKind(vt) == LLVMIntegerTypeKind && LLVMGetIntTypeWidth(vt) == 1) {
-        zan_istr_t t = { "true", 4 }, f = { "false", 5 };
-        return LLVMBuildSelect(g->builder, v,
-            emit_string_literal_rc(g, t), emit_string_literal_rc(g, f), "b2s");
+        return emit_bool_to_cstr(g, v);
     }
     LLVMValueRef buf = emit_entry_scratch(g, 40, "v2s.buf");
     if (LLVMGetTypeKind(vt) == LLVMDoubleTypeKind || LLVMGetTypeKind(vt) == LLVMFloatTypeKind) {
@@ -2318,6 +2326,10 @@ static LLVMValueRef emit_to_cstr_u(zan_irgen_t *g, LLVMValueRef val,
     LLVMTypeRef vt = LLVMTypeOf(val);
     LLVMTypeKind vtk = LLVMGetTypeKind(vt);
     if (vtk == LLVMPointerTypeKind) return val;
+    /* bool 是 i1：统一渲染成 "true"/"false"（否则掉进 itoa 变成 "1"） */
+    if (vtk == LLVMIntegerTypeKind && LLVMGetIntTypeWidth(vt) == 1) {
+        return emit_bool_to_cstr(g, val);
+    }
 
     /* 可空类型字符串格式化：有值输出值字符串，无值输出空字符串 "" */
     if (llvm_is_nullable(vt)) {
