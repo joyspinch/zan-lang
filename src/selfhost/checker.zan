@@ -177,6 +177,62 @@ public class Checker {
     }
 
     // ---- overload arity ----
+    // The overload of `name` a call with `argc` arguments reaches. The
+    // candidates are the whole class chain; the C host resolves an overload
+    // by the argument types, but the argument COUNT already tells the
+    // overloads apart in the common case -- `Description()` must not pick
+    // `Description(string desc)` just because it is declared first (the
+    // by-name pick handed the caller the setter's `Result` type).
+    // The lookup stays conservative: when several candidates take the same
+    // number of arguments the first one wins, exactly as before.
+    Node MethodUpArity(Node cls, string name, int argc) {
+        if (cls == null) { return null; }
+        List<Node> cands = new List<Node>();
+        Node c = cls;
+        int cg4 = 0;
+        while (c != null) {
+            int i = 0;
+            while (i < c.kids.Count) {
+                Node m = c.kids[i];
+                if (m.kind == AK.MethodDecl() && m.sval == name) { cands.Add(m); }
+                i = i + 1;
+            }
+            c = binder.FindType(c.sval2);
+            cg4 = cg4 + 1;
+            if (cg4 > 512) { c = null; }
+        }
+        if (cands.Count == 0) { return null; }
+        if (cands.Count == 1) { return cands[0]; }
+        Node hit = null;
+        int hits = 0;
+        int i = 0;
+        while (i < cands.Count) {
+            if (AcceptsArgcOf(cands[i], argc)) {
+                hit = cands[i];
+                hits = hits + 1;
+            }
+            i = i + 1;
+        }
+        if (hits == 1) { return hit; }
+        return cands[0];
+    }
+    // Does this one method take `argc` positional arguments? A `params` tail
+    // takes the arguments the fixed parameters do not.
+    bool AcceptsArgcOf(Node m, int argc) {
+        int tot = 0; int req = 0; int j = 0;
+        Node lastP = null;
+        while (j < m.kids.Count) {
+            if (m.kids[j].kind == AK.Param()) {
+                tot = tot + 1;
+                if (m.kids[j].b == null) { req = req + 1; }
+                lastP = m.kids[j];
+            }
+            j = j + 1;
+        }
+        if (argc >= req && argc <= tot) { return true; }
+        if (lastP != null && lastP.op == 1 && argc >= req - 1) { return true; }
+        return false;
+    }
     // True if some method named `name` (up the base chain) can accept `argc`
     // positional arguments, or if any candidate is an extension method (whose
     // receiver shifts the count) -- in which case we do not second-guess it.
@@ -218,8 +274,8 @@ public class Checker {
         infCount = infCount + 1;
         if (e == null) { return null; }
         int k = e.kind;
-        if (k == AK.IntLit()) { return MkType("int"); }
-        if (k == AK.FloatLit()) { return MkType("double"); }
+        if (k == AK.IntLit()) { return MkType(IntLitTypeName(e)); }
+        if (k == AK.FloatLit()) { return MkType(FloatLitTypeName(e)); }
         if (k == AK.StringLit()) { return MkType("string"); }
         if (k == AK.CharLit()) { return MkType("char"); }
         if (k == AK.BoolLit()) { return MkType("bool"); }
@@ -304,7 +360,7 @@ public class Checker {
         if (k == AK.Call()) {
             Node callee = e.a;
             if (callee != null && callee.kind == AK.Ident()) {
-                Node m = MethodUp(curClass, callee.sval);
+                Node m = MethodUpArity(curClass, callee.sval, e.kids.Count);
                 if (m != null) { return m.type; }
                 return null;
             }
@@ -312,7 +368,7 @@ public class Checker {
                 Node ot = InferType(callee.a);
                 Node cls = ClassOf(ot);
                 if (cls != null) {
-                    Node m = MethodUp(cls, callee.sval);
+                    Node m = MethodUpArity(cls, callee.sval, e.kids.Count);
                     if (m != null) { return m.type; }
                 }
                 // `Task.Run(...)` / `Task.Spawn(...)`: the handle's shape
@@ -331,6 +387,26 @@ public class Checker {
     }
 
     bool IsStr(Node t) { return t != null && t.sval == "string"; }
+
+    // The literal's own type follows its suffix: `5` is an int, `5L` a long,
+    // `5u` a uint, `5UL` a ulong, `0x1FL` a long (the parser folds the radix
+    // into the same field -- 16 for hex, 8 for binary -- so the type suffix
+    // is `suffix % 8`), `5.0f` a float, `5.0m` a decimal. The C host types
+    // them the same way (checker.c: AST_INT_LITERAL / AST_FLOAT_LITERAL ->
+    // lit_suffix), and the diagnostics name the type -- `bool b = 5L;` says
+    // "cannot convert 'long' to 'bool'", not "'int'".
+    string IntLitTypeName(Node e) {
+        int sfx = e.suffix % 8;
+        if (sfx == 1) { return "long"; }
+        if (sfx == 2) { return "uint"; }
+        if (sfx == 3) { return "ulong"; }
+        return "int";
+    }
+    string FloatLitTypeName(Node e) {
+        if (e.suffix == 1) { return "float"; }
+        if (e.suffix == 2) { return "decimal"; }
+        return "double";
+    }
 
     // The result type of `Task.Run(...)` / `Task.Spawn(...)`, mirroring the C
     // host's task_run_result_type (src/compiler/checker.c):
@@ -389,6 +465,102 @@ public class Checker {
         if (value == null) { return; }
         if (IsTaskTy(value)) { return; }   // a handle; the no-result case has its own message
         diags.Error("cannot convert '" + value.sval + "' to 'Task' in " + what
+            + ": no implicit conversion", line, col);
+    }
+
+    // ---- the general assignability check ----
+    // The C host (src/compiler/checker.c, checker_check_assignable) rejects a
+    // value that cannot land in the target slot with
+    //   cannot convert 'X' to 'Y' in <what>: no implicit conversion
+    // The self-host's type model is coarse, so the rule stays narrow: it
+    // fires only when the target is a known primitive and the value is a
+    // known primitive, an enum or a class instance. A type parameter, a
+    // generic instantiation, an unknown name or a user-defined target is
+    // never judged -- the host resolves those through the class hierarchy or
+    // the instantiation, which the self-host does not model.
+    //
+    // Categories: 0 other/unknown, 1 integral, 2 floating, 3 bool,
+    // 4 string, 5 char, 6 enum, 7 class instance.
+    int PrimCat(string n) {
+        if (n == "") { return 0; }
+        if (n == "int" || n == "long" || n == "byte" || n == "short" ||
+            n == "uint" || n == "ulong" || n == "ushort" || n == "sbyte" ||
+            n == "nint") { return 1; }
+        if (n == "float" || n == "double" || n == "decimal") { return 2; }
+        if (n == "bool") { return 3; }
+        if (n == "string") { return 4; }
+        if (n == "char") { return 5; }
+        Node d = binder.FindType(n);
+        if (d != null) {
+            if (d.kind == AK.EnumDecl()) { return 6; }
+            if (d.kind == AK.ClassDecl() || d.kind == AK.StructDecl() ||
+                d.kind == AK.DelegateDecl()) { return 7; }
+        }
+        return 0;
+    }
+
+    // `valueNull` marks a null literal: the C host types it as `object`, so
+    // that is the name its diagnostics print.
+    void CheckAssignable(Node target, Node valueTy, bool valueNull,
+                         string what, int line, int col) {
+        if (target == null || target.ival >= 1) { return; }  // array target
+        string tn = target.sval;
+        if (tn == "" || tn == "var") { return; }
+        if (binder.IsTypeParam(tn)) { return; }
+        int tcat = PrimCat(tn);
+        // only a primitive target is judged: a user target (a class, a struct,
+        // an enum) is resolved by the host through the class hierarchy, which
+        // the self-host does not model
+        if (tcat == 0 || tcat == 6 || tcat == 7) { return; }
+        bool tnull = (target.op == 1);
+        if (valueNull) {
+            // null lands in a nullable slot or in a string (`string s = null;`
+            // is legal in the host) -- nowhere else
+            if (tcat == 4 || tnull) { return; }
+            diags.Error("cannot convert 'object' to '" + tn + "' in " + what
+                + ": no implicit conversion", line, col);
+            return;
+        }
+        if (valueTy == null || valueTy.ival >= 1) { return; }   // unknown / array
+        string vn = valueTy.sval;
+        if (vn == "" || vn == "var") { return; }
+        if (binder.IsTypeParam(vn)) { return; }
+        int vcat = PrimCat(vn);
+        if (vcat == 0) { return; }
+        bool vnull = (valueTy.op == 1);
+        if (vnull && !tnull) {
+            // a nullable value only lands in a nullable slot
+            diags.Error("cannot convert '" + vn + "' to '" + tn + "' in " + what
+                + ": no implicit conversion", line, col);
+            return;
+        }
+        bool ok = false;
+        if (tnull) {
+            if (vnull) {
+                // a nullable slot takes a nullable value of the same element
+                // type (`int? <- int?` yes, `int? <- double?` no)
+                ok = (vcat == tcat);
+            } else if (tcat == 1 || tcat == 2) {
+                // a nullable numeric slot takes any numeric
+                ok = (vcat == 1 || vcat == 2 || vcat == 5 || vcat == 6);
+            } else if (tcat == 3) { ok = (vcat == 3); }
+            else if (tcat == 4) { ok = (vcat == 4); }
+            else if (tcat == 5) { ok = (vcat == 5 || vcat == 1 || vcat == 6); }
+        } else {
+            if ((tcat == 1 || tcat == 5) && vcat == 2) {
+                // a float value in an integral slot is the host's *narrowing*
+                // rule (`narrowing conversion from 'double' to 'int' ...`),
+                // not this one -- stay quiet until that rule lands too
+                return;
+            }
+            if (tcat == 1) { ok = (vcat == 1 || vcat == 5 || vcat == 6); }
+            else if (tcat == 2) { ok = (vcat == 1 || vcat == 2 || vcat == 5 || vcat == 6); }
+            else if (tcat == 3) { ok = (vcat == 3); }
+            else if (tcat == 4) { ok = (vcat == 4); }
+            else if (tcat == 5) { ok = (vcat == 5 || vcat == 1 || vcat == 6); }
+        }
+        if (ok) { return; }
+        diags.Error("cannot convert '" + vn + "' to '" + tn + "' in " + what
             + ": no implicit conversion", line, col);
     }
 
@@ -706,6 +878,8 @@ public class Checker {
                 Node vt = InferType(n.b);
                 CheckTaskNoResult(n.type, vt, "initializer", n.type.line, n.type.col);
                 CheckTaskOnlyHandle(n.type, vt, "initializer", n.type.line, n.type.col);
+                CheckAssignable(n.type, vt, n.b != null && n.b.kind == AK.NullLit(),
+                    "initializer", n.type.line, n.type.col);
             }
             Node ty = n.type;
             if (ty == null) { ty = InferType(n.b); }
@@ -718,6 +892,8 @@ public class Checker {
                     Node dv = InferType(d.b);
                     CheckTaskNoResult(d.type, dv, "initializer", d.type.line, d.type.col);
                     CheckTaskOnlyHandle(d.type, dv, "initializer", d.type.line, d.type.col);
+                    CheckAssignable(d.type, dv, d.b != null && d.b.kind == AK.NullLit(),
+                        "initializer", d.type.line, d.type.col);
                 }
                 Node dty = d.type;
                 if (dty == null) { dty = InferType(d.b); }
@@ -751,6 +927,8 @@ public class Checker {
                 Node rv = InferType(n.a);
                 CheckTaskNoResult(curRet, rv, "return statement", n.line, n.col);
                 CheckTaskOnlyHandle(curRet, rv, "return statement", n.line, n.col);
+                CheckAssignable(curRet, rv, n.a.kind == AK.NullLit(),
+                    "return statement", n.line, n.col);
             }
             return;
         }

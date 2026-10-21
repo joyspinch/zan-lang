@@ -1457,7 +1457,7 @@
   名字（binder 的类型名或源文件名），不要用内部符号名。
 - 关联：A475（同一类"公开面/成员存在性"问题）、A471（checker 漏检）。
 
-### [ ] A477 自举检查器没有通用隐式转换检查——`int y = "hello";` 在自举里编译通过
+### [x] A477 自举检查器没有通用隐式转换检查——`int y = "hello";` 在自举里编译通过
 
 - 现象（2026-10-21 修 A471 时实测，探针 `_scratch/sh_method_conv_probe.zan`，
   gen1 直接跑 `build\selfhost_gen1.exe out.ll probe.zan`）：自举的检查器**不实现
@@ -1476,12 +1476,39 @@
   形参入作用域 → `curRet = null` → `CheckExpr(n.a)`（表达式体）+ `CheckStmt(n.d)`
   （块体）→ 还原。实测自举会报 lambda 体里的 `undefined identifier`（探针
   `_scratch/sh_lambda_undef_probe.zan`）。**A471 的洞只在宿主这边。**
-- 方向：给自举的 `CheckStmt(AK.VarDecl)` / `CheckStmt(AK.ReturnStmt)` 补一条通用的
-  可赋值性检查，措辞与宿主**逐字一致**（`cannot convert 'X' to 'Y' in initializer:
-  no implicit conversion`），并给 `tests/selfhost/reject_cases.txt` 加三段式拒绝用例
-  （`name|||自举措辞|||宿主措辞`）把这条边界钉住。
-- 关联：A471（宿主侧同一条战线）、`.agents/skills/zan-compiler-internals/references/selfhost-closure.md` §26/§36。
-
+- 修法（2026-10-21 落地）：
+  - `src/selfhost/checker.zan` 新增 `PrimCat()`（把类型名分成 0 其他 / 1 整型 /
+    2 浮点 / 3 bool / 4 string / 5 char / 6 枚举 / 7 类实例）与
+    `CheckAssignable()`；在 `CheckStmt(AK.VarDecl)`（含逗号续列）与
+    `CheckStmt(AK.ReturnStmt)` 上调用；
+  - 措辞与宿主**逐字一致**：`cannot convert 'X' to 'Y' in initializer: no implicit
+    conversion` / `... in return statement: ...`；
+  - **判据是先量后写**：拿 12 个目标类型 × 17 个值 = 204 组矩阵探针（分块编译，
+    绕开宿主 100 条诊断的上限），把宿主的判定表**量出来**再照着实现；
+  - 顺带修了字面量的类型：`5L` 是 long、`5u` 是 uint、`5UL` 是 ulong、`5.0f` 是
+    float、`5.0m` 是 decimal、`0x1FL` 是 long（解析器把进制折进了同一个字段，
+    类型后缀取 `suffix % 8`）——宿主这么分，诊断里点的类型名也就一致了。
+- **刻意不判的三类**（宁可漏报，不可误报）：
+  - `double`/`float` 进整型槽：那是宿主的**窄化**规则（另一条诊断，见 A485）；
+    宿主报 "narrowing conversion from 'double' to 'int' ... (C# rules)"；
+  - `object` 目标：Zan 的 `object` 不是万物的基类（宿主只收 string 与类实例），
+    它的判定规则与整型族不同；
+  - 用户类目标：宿主靠类层次判定（子类可赋给基类），自举的类型模型没有层次。
+- 验证：
+  - 204 组矩阵对照：自举对宿主 **误报 0、措辞差 0**；漏报 43 组，全部落在上面
+    刻意不判的三类里（窄化 15 / `object` 目标 13 / 用户类目标 15）；
+  - 自举 64 个源用宿主 zanc 重建 gen1 通过（自举自己的源码没有被误伤）；
+  - 新增三条拒绝用例 `tests/selfhost/reject/implicit_conversion_*.zan` 进
+    `tests/selfhost/reject_cases.txt`（三段式：自举措辞 + 宿主措辞），宿主与自举
+    逐字相同；
+  - return 路径也逐字相同（含列号）：`cannot convert 'string' to 'int' in return
+    statement: no implicit conversion`。
+- 教训：**规则要照着"量出来的表"写，不是照着想象写**。204 组矩阵把"简单名 vs
+  限定名"这类直觉区分全部推翻；真正决定判不判的是「目标是不是原始类型」+「值
+  是不是已知类型」两件事，而"可空值只能进同种可空槽"这条规则是从矩阵里长出来的，
+  凭直觉写不出来。
+- 关联：A471（宿主侧同一条战线）、A485（自举缺的窄化规则）、A463（宿主诊断不渲染
+  可空标志——两边目前一致地"不渲染"）。
 ### [x] A478 「标题栏浮动组件忽略标题栏高度」——浮动件的基准没让开父容器的顶部停靠带
 
 - 现象（用户 2026-10-21 报）：「标题栏浮动组件会忽略标题栏高度」。现场确认为
