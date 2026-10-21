@@ -1750,3 +1750,27 @@ kernel32、shell32、user32、advapi32、version）。
   `MethodGroupScore`（返回类型同族：同型 +2，不同族直接排除）。
 - 通用教训：**"方法名不带括号"是一种实参形状**，要按形状（而不是按
   "类型未知"）去筛候选。
+## 91. 命名空间限定的静态接收者也要走命名空间解析
+
+- 坑（实测）：`Widget.Tooltip.Flush(this)`（`namespace Gui;` 里的
+  `Gui.Widget.Tooltip`）在自举里报 "unresolved identifier 'Widget'"。
+  自举的 nsresolve 只对**单段**接收者（`Cls.Method`）做命名空间解析，
+  限定接收者（`A.B.C`）只做**全名精确匹配**——"Widget.Tooltip" 不是
+  任何声明的全名（"Gui.Widget.Tooltip" 才是），于是没被折叠成那个声明。
+  宿主的 nsresolve 对限定名同样按"当前命名空间 → using → 全局"解析。
+- 做法：限定接收者的折叠改用与静态接收者同一套解析
+  （`ResolveStaticReceiver`），并加一条保护：链头的标识符若是局部变量
+  （被遮蔽）就不折叠——那是字段访问，不是类型。
+- 通用教训：**同一套名字解析规则要覆盖单段名和限定名**——只给一半用
+  命名空间解析，缺口就会出现在"带点号的名字"上。
+## 92. `base.M()` 是**直调**，绕过虚表
+
+- 坑（实测）：`base.Name()` 在自举里报 "call to 'Name' is not supported by
+  the self-hosted compiler yet"——自举根本没处理 base 接收者。
+  宿主把 `base.M()` 降成**直调**（`irgen_call.c` 的 base_recv →
+  `emit_dispatch_call` 传 NULL 类，绕过虚表）：基类自己的函数体执行，不是
+  虚函数分发。
+- 做法：`EmitInstanceCall` 加 `direct` 开关（跳过虚表），`EmitBaseCall`
+  把 `this` 按基类指针转换后直调基类方法。
+- 通用教训：**"基类调用"不是"虚调用的另一种写法"**——它绕过虚表，语义
+  与 `this.M()` 相反，实现时不能复用虚分发那条路。

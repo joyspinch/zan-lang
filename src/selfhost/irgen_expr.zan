@@ -4569,6 +4569,17 @@ partial class Irgen {
         if (callee.kind == AK.MemberAccess()) {
             Node obj = callee.a;
             string mname = callee.sval;
+            // `base.Method(...)`: a DIRECT call to the base class' method --
+            // the C host bypasses the vtable for it (src/compiler/
+            // irgen_call.c: base_recv -> emit_dispatch_call with a NULL
+            // class, so the base's own body runs, not the override).
+            if (obj.kind == AK.BaseExpr()) {
+                ExprVal br = EmitBaseCall(mname, e);
+                if (br != null) { return br; }
+                diags.Error("'" + curClass + "' has no base class with a method '"
+                    + mname + "'", e.line, e.col);
+                return new ExprVal("0", MkType("int"));
+            }
             // static call: ClassName.Method(...)
             if (obj.kind == AK.Ident() && binder.FindType(obj.sval) != null
                 && LocalIdx(obj.sval) < 0 && !ShadowsTypeName(obj.sval)) {
@@ -5866,9 +5877,16 @@ partial class Irgen {
     }
 
     ExprVal EmitInstanceCall(ExprVal recv, string clsName, string name, Node e) {
+        return EmitInstanceCallAs(recv, clsName, name, e, false);
+    }
+
+    // `direct` bypasses the virtual dispatch: the C host's `base.M()` calls
+    // the base class' own body, not the override (src/compiler/irgen_call.c:
+    // base_recv -> emit_dispatch_call with a NULL class).
+    ExprVal EmitInstanceCallAs(ExprVal recv, string clsName, string name, Node e, bool direct) {
         Node cls = binder.FindType(clsName);
         Node m = ResolveMethodUp(cls, name, e, false);
-        if (m != null && IsPolyClass(cls) && VSlotIndexM(cls, m) >= 0) {
+        if (!direct && m != null && IsPolyClass(cls) && VSlotIndexM(cls, m) >= 0) {
             return EmitVirtualCall(recv, cls, name, m, e);
         }
         string owner = MethodOwner(cls, name);
@@ -5983,6 +6001,26 @@ partial class Irgen {
         Node retTy = MkType("int"); if (m != null) { retTy = m.type; }
         AddTemp(t, retTy);
         return new ExprVal(t, retTy);
+    }
+
+    // `base.Method(...)`: a direct call to the base class' method with `this`
+    // as the receiver. Returns null when the current class has no base class
+    // or the base has no such method.
+    ExprVal EmitBaseCall(string name, Node e) {
+        if (!curHasThis) { return null; }
+        Node cls = binder.FindType(curClass);
+        if (cls == null) { return null; }
+        Node bcls = BaseClassOf(cls);
+        if (bcls == null) { return null; }
+        // the receiver: `this` seen as the base class
+        string thisOp = "%this";
+        if (bcls.sval != curClass) {
+            string bc = NT();
+            L("  " + bc + " = bitcast %" + curClass + "* %this to %" + bcls.sval + "*");
+            thisOp = bc;
+        }
+        ExprVal recv = new ExprVal(thisOp, MkType(bcls.sval));
+        return EmitInstanceCallAs(recv, bcls.sval, name, e, true);
     }
 
     ExprVal EmitVirtualCall(ExprVal recv, Node cls, string name, Node m, Node e) {
