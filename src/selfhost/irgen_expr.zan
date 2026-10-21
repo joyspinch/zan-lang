@@ -624,7 +624,7 @@ partial class Irgen {
         string owner = declCls.sval;
         Node p0 = ParamTypeNode(m, 0);
         Node p1 = ParamTypeNode(m, 1);
-        string args = MapType(p0) + " " + CallArg(a, p0) + ", " + MapType(p1) + " " + CallArg(b, p1);
+        string args = MapType(p0) + " " + CallArg(a, p0, false) + ", " + MapType(p1) + " " + CallArg(b, p1, false);
         string rt = MapType(m.type);
         // an overloaded operator needs the mangled symbol -- `Owner_op_add`
         // would not exist (and the plain name would collide between the
@@ -779,7 +779,7 @@ partial class Irgen {
         Node p0 = m.kids[0].type;
         string t = NT();
         L("  " + t + " = call " + MapType(m.type) + " @" + MethodSym(convOwner, m)
-            + "(" + MapType(p0) + " " + CallArg(v, p0) + ")");
+            + "(" + MapType(p0) + " " + CallArg(v, p0, false) + ")");
         convApplied = true;
         return new ExprVal(t, m.type);
     }
@@ -1785,7 +1785,7 @@ partial class Irgen {
         }
         string t = NT();
         L("  " + t + " = call " + rtm + " @" + sym + "(%" + owner + "* " + thisOp
-            + ", " + p0m + " " + CallArg(idx, p0) + ")");
+            + ", " + p0m + " " + CallArg(idx, p0, false) + ")");
         return new ExprVal(t, rty);
     }
 
@@ -1818,8 +1818,8 @@ partial class Irgen {
             p1m = MapType(p1);
         }
         L("  call void @" + sym + "(%" + owner + "* " + thisOp
-            + ", " + p0m + " " + CallArg(idx, p0)
-            + ", " + p1m + " " + CallArg(v, p1) + ")");
+            + ", " + p0m + " " + CallArg(idx, p0, false)
+            + ", " + p1m + " " + CallArg(v, p1, false) + ")");
     }
 
     // obj.Name = v  ->  Owner_set_Name(obj, v). Returns false if no setter.
@@ -1834,7 +1834,7 @@ partial class Irgen {
         // a static property setter takes no receiver: `Custom = 40` inside
         // the class means `Custom.set_Custom(40)`
         if (HasMod(m, MOD.Static())) {
-            L("  call void @" + MethodSym(owner, m) + "(" + MapType(pty) + " " + CallArg(v, pty) + ")");
+            L("  call void @" + MethodSym(owner, m) + "(" + MapType(pty) + " " + CallArg(v, pty, false) + ")");
             return true;
         }
         string thisOp = objOp;
@@ -1854,7 +1854,7 @@ partial class Irgen {
             ptym = MapType(pty);
         }
         L("  call void @" + sym + "(%" + owner + "* " + thisOp
-            + ", " + ptym + " " + CallArg(v, pty) + ")");
+            + ", " + ptym + " " + CallArg(v, pty, false) + ")");
         return true;
     }
 
@@ -2921,7 +2921,7 @@ partial class Irgen {
                         continue;
                     }
                     ExprVal av = GenArgExpr(cargs[i], epty);
-                    args = args + ", " + MapType(cty) + " " + CallArg(av, cty);
+                    args = args + ", " + MapType(cty) + " " + CallArg(av, cty, false);
                     i = i + 1;
                 }
                 string ctorSym = CtorSym(cn, ctor);
@@ -5394,14 +5394,24 @@ partial class Irgen {
         return GenExpr(a);
     }
 
-    // build a call argument for a (possibly erased) parameter type
-    string CallArg(ExprVal av, Node pty) {
+    // build a call argument for a (possibly erased) parameter type.
+    //
+    // `rawStr` skips the byte[] -> managed string packing: an EXTERN
+    // (DllImport) callee is C code that wants the raw buffer, and the C host
+    // hands it the array's own pointer (src/compiler/irgen_arc.c:
+    // coerce_args_to_params only bitcasts the pointer types -- it never
+    // copies). Packing instead would give the C side a throwaway copy:
+    // `sqlite3_open(filename, ppDb)` would write the connection handle into
+    // that copy's payload (over the string header) and the program's buffer
+    // would stay empty -- and the copy's header would be corrupted.
+    string CallArg(ExprVal av, Node pty, bool rawStr) {
         // a user-defined implicit conversion applies to the argument
         av = ApplyUserConv(pty, av, false);
         // a struct parameter is a value: the callee gets its own copy
         if (NeedsStructCopy(pty, av)) { av = StructCopyTemp(av, pty); }
         if (IsErasedType(pty)) { return ToSlot(av, av.ty); }
-        ExprVal src = StrSlotConv(pty, av);
+        ExprVal src = av;
+        if (!rawStr) { src = StrSlotConv(pty, av); }
         src = NarrowToDeclared(src, pty);
         return Coerce(src, MapType(pty));
     }
@@ -5591,7 +5601,10 @@ partial class Irgen {
                 L("  " + fp + " = load i8*, i8** " + cp);
                 args = args + "i8* " + fp;
             } else {
-                args = args + MapTypeDecl(pty, declCls) + " " + CallArg(av, pty);
+                // an extern (DllImport) callee is C code: it gets the raw
+                // buffer, not a packed copy of it (see CallArg)
+                bool rawArg = m != null && HasMod(m, MOD.Extern());
+                args = args + MapTypeDecl(pty, declCls) + " " + CallArg(av, pty, rawArg);
             }
             i = i + 1;
         }
@@ -6136,14 +6149,14 @@ partial class Irgen {
         Node p0 = ParamTypeNode(m, 0);
         if (spec) { mrt = SubstTP(m.type, tns, trs); p0 = SubstTP(p0, tns, trs); }
         string rt = MapType(mrt);
-        string args = MapType(p0) + " " + CallArg(recv, p0);
+        string args = MapType(p0) + " " + CallArg(recv, p0, false);
         int i = 0;
         while (i < e.kids.Count) {
             Node pty = ParamTypeNode(m, i + 1);
             Node spty = SubstTP(pty, tns, trs);
             if (spec) { pty = spty; }
             ExprVal av = GenArgExpr(e.kids[i], spty);
-            args = args + ", " + MapType(pty) + " " + CallArg(av, pty);
+            args = args + ", " + MapType(pty) + " " + CallArg(av, pty, false);
             i = i + 1;
         }
         if (rt == "void") {
@@ -6264,7 +6277,9 @@ partial class Irgen {
             }
             ExprVal av = GenArgExpr(aargs[i], pty);
             if (args != "") { args = args + ", "; }
-            args = args + MapTypeDecl(pty, owner) + " " + CallArg(av, pty);
+            // an extern (DllImport) callee is C code: it gets the raw buffer
+            bool rawArg = m != null && HasMod(m, MOD.Extern());
+            args = args + MapTypeDecl(pty, owner) + " " + CallArg(av, pty, rawArg);
             i = i + 1;
         }
         if (rt == "void") {
@@ -6352,7 +6367,9 @@ partial class Irgen {
                 continue;
             }
             ExprVal av = GenArgExpr(aargs[i], pty);
-            args = args + ", " + MapTypeDecl(pty, declCls) + " " + CallArg(av, pty);
+            // an extern (DllImport) callee is C code: it gets the raw buffer
+            bool rawArg = m != null && HasMod(m, MOD.Extern());
+            args = args + ", " + MapTypeDecl(pty, declCls) + " " + CallArg(av, pty, rawArg);
             i = i + 1;
         }
         if (rt == "void") {
