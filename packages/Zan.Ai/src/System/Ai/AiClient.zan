@@ -305,6 +305,9 @@ public class AiClient : IDisposable {
         // 半行缓冲：一次到达的字节可能把一行切成两半，跨次拼接。
         string pending = "";
         bool stopped = false;
+        // 流内错误帧（provider 在 SSE 数据里报错）。它**不是**调用方
+        // 叫停，所以不能被"主动停止不算失败"那条规则吞掉。
+        bool failed = false;
         while (true) {
             SseDelivery d = await sink.TakeCo();
             if (d.data.Length > 0) {
@@ -313,7 +316,16 @@ public class AiClient : IDisposable {
                 while (nl >= 0) {
                     string line = pending.Substring(0, nl).Trim();
                     pending = pending.Substring(nl + 1);
-                    if (!this.OnStreamLine(line, sb, onDelta)) {
+                    int r = this.OnStreamLine(line, sb, onDelta);
+                    if (r == 0) {
+                        // 调用方要求停止。
+                        stopped = true;
+                        break;
+                    }
+                    if (r < 0) {
+                        // 流内错误帧：不是调用方叫停（错误已记进 lastError，
+                        // 不能被"主动停止不算失败"那条规则吞掉）。
+                        failed = true;
                         stopped = true;
                         break;
                     }
@@ -342,6 +354,9 @@ public class AiClient : IDisposable {
         // **调用方主动停止不算失败**：中止上游必然让传输层报
         // "err: cancelled"，那是我们自己叫停的，报成错误会让调用方
         // 以为流挂了。
+        //
+        // 但**流内错误帧**要报：那不是我们叫停的，lastError 已经被
+        // OnStreamLine 填好了，这里不能覆盖也不能吞掉。
         if (!stopped) {
             string attempt = sink.Attempt();
             if (attempt.Length > 0 && attempt.StartsWith("err:")) {
@@ -350,36 +365,54 @@ public class AiClient : IDisposable {
                 this.lastError = "流式请求失败：" + reason;
                 if (sb.Length == 0) { return null; }
             }
+        } else if (failed) {
+            // 流内错误：已收到过内容就把半截内容交回去（内容仍然有用），
+            // 一个字都没有就当失败返回 null。
+            if (sb.Length == 0) { return null; }
         }
         return sb.ToString();
     }
 
-    // 解析一行 SSE。返回 false 表示调用方要求停止。
-    private bool OnStreamLine(string line, StringBuilder sb, AiDeltaFn onDelta) {
-        if (line.Length == 0) { return true; }
-        if (!line.StartsWith("data:")) { return true; }
+    // 解析一行 SSE。返回：
+    //   1  = 继续读下一行
+    //   0  = 调用方要求停止（onDelta 返回了 false）
+    //  -1  = 流内错误帧（错误已记进 lastError）
+    private int OnStreamLine(string line, StringBuilder sb, AiDeltaFn onDelta) {
+        if (line.Length == 0) { return 1; }
+        if (!line.StartsWith("data:")) { return 1; }
         string payload = line.Substring(5).Trim();
-        if (payload == "[DONE]") { return true; }
+        if (payload == "[DONE]") { return 1; }
         JsonValue frame = null;
         try {
             frame = JsonValue.Parse(payload);
         } catch (Exception e) {
-            return true;   // 坏帧跳过，不让整条流断掉
+            return 1;   // 坏帧跳过，不让整条流断掉
         }
-        if (frame == null) { return true; }
+        if (frame == null) { return 1; }
+        // 流内错误帧：OpenAI 兼容的 provider 可以在 SSE 数据里报错，
+        // 而不是靠 HTTP 状态码。这种帧必须**报给调用方**——否则调用方
+        // 拿到的是半截内容 + 空 lastError，看起来像"正常结束"，
+        // 实际是上游炸了。
+        JsonValue frameError = frame.Get("error");
+        if (frameError != null && !frameError.IsNull()) {
+            string reason = frameError.Str("message", "");
+            if (reason.Length == 0) { reason = "流内错误帧"; }
+            this.lastError = "流式请求失败：" + reason;
+            return -1;
+        }
         JsonValue choices = frame.Get("choices");
         if (choices == null || !choices.IsArray() || choices.Count() == 0) {
-            return true;
+            return 1;
         }
         JsonValue delta = choices.At(0).Get("delta");
-        if (delta == null) { return true; }
+        if (delta == null) { return 1; }
         string piece = delta.Str("content", "");
-        if (piece.Length == 0) { return true; }
+        if (piece.Length == 0) { return 1; }
         sb.Append(piece);
         if (onDelta != null) {
-            if (!onDelta(piece)) { return false; }
+            if (!onDelta(piece)) { return 0; }
         }
-        return true;
+        return 1;
     }
 
     // 流式专用的客户端：Accept 必须是 text/event-stream，读取超时按

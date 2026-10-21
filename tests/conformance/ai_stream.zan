@@ -13,6 +13,8 @@
 // - 半行缓冲：一次到达的字节把一行切成两半时不能丢字。
 // - 回调返回 false → 调用方主动停止，返回已收到的全文。
 // - 坏帧跳过，不让整条流断掉。
+// - 最后一帧不以换行收尾 → 残留的半行要按完整的一行补处理。
+// - 流内错误帧 → 报进 lastError（不能被"主动停止不算失败"吞掉）。
 // - 服务端报错 → lastError 有可读原因。
 using System;
 using System.Ai;
@@ -140,6 +142,43 @@ class Prog {
         listener.Stop();
     }
 
+    // 服务端（第四阶段用）：在 SSE **数据里**报错。
+    //
+    // OpenAI 兼容的 provider 可以在流内报错，而不是靠 HTTP 状态码。
+    // 这种帧如果被当成普通帧跳过，调用方拿到的是半截内容 + 空
+    // lastError——看起来像"正常结束"，实际是上游炸了。
+    static async void ServeStreamError(int port) {
+        TcpListener listener = new TcpListener("127.0.0.1", port);
+        listener.Start();
+        Prog.SignalReady();
+        nint c = await listener.AcceptAsync();
+        string head = await Socket.RecvAsync(c, 8192);
+        int hb = Prog.Find(head, "\r\n\r\n");
+        if (hb >= 0) {
+            int cl = Prog.ContentLengthOf(head.Substring(0, hb));
+            string body = head.Substring(hb + 4, head.Length - hb - 4);
+            while (body.Length < cl) {
+                string piece = await Socket.RecvAsync(c, 8192);
+                if (piece.Length == 0) { break; }
+                body = body + piece;
+            }
+        }
+        int _h = await Socket.SendStringAsync(c,
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
+            + "Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n");
+        // 先来一段正常内容，再来一个流内错误帧。
+        string f1 = "data: {\"choices\":[{\"delta\":{\"content\":\"A\"}}]}\n\n";
+        int _c1 = await Socket.SendStringAsync(c,
+            Prog.Hex(f1.Length) + "\r\n" + f1 + "\r\n");
+        string f2 = "data: {\"error\":{\"message\":\"upstream exploded\","
+            + "\"type\":\"server_error\"}}\n\n";
+        int _c2 = await Socket.SendStringAsync(c,
+            Prog.Hex(f2.Length) + "\r\n" + f2 + "\r\n");
+        int _e = await Socket.SendStringAsync(c, "0\r\n\r\n");
+        Socket.Close(c);
+        listener.Stop();
+    }
+
     static async int Main() {
         int bad = 0;
         Task.Spawn(Prog.Serve(Prog.PORT));
@@ -232,6 +271,38 @@ class Prog {
             bad = bad + 1;
         }
         client3.Close();
+
+        // ---- 4. 流内错误帧 ----
+        //
+        // provider 可以在 SSE 数据里报错（HTTP 状态码仍是 200）。这种
+        // 帧必须报进 lastError——否则调用方拿到半截内容 + 空 lastError，
+        // 看起来像"正常结束"，实际是上游炸了。
+        Prog.ResetAck();
+        Prog.ResetReady();
+        Prog.DeltaCount = 0;
+        Prog.Deltas.Clear();
+        Task.Spawn(Prog.ServeStreamError(Prog.PORT + 3));
+        if (!Prog.WaitReady(5000)) {
+            Console.WriteLine("server4 not ready");
+            return 1;
+        }
+        AiConfig cfg4 = new AiConfig("http://127.0.0.1:"
+            + Convert.ToString(Prog.PORT + 3), "k", "m");
+        cfg4.connectTimeoutMs = 3000;
+        cfg4.readTimeoutMs = 5000;
+        cfg4.totalTimeoutMs = 10000;
+        cfg4.maxAttempts = 1;
+        AiClient client4 = new AiClient(cfg4);
+        string full4 = await client4.Stream(msgs, 0.0, Prog.OnDelta);
+        Console.WriteLine("streamerr full=" + full4);
+        // 错误帧之前收到的内容仍然有用，交回给调用方。
+        if (full4 != "A") { bad = bad + 1; }
+        // 但 lastError 必须有可读原因。
+        if (client4.lastError.Length == 0) {
+            Console.WriteLine("streamerr missing lastError");
+            bad = bad + 1;
+        }
+        client4.Close();
 
         Console.WriteLine("ai-stream-ok: " + Convert.ToString(bad == 0 ? 1 : 0));
         return bad == 0 ? 0 : 1;
