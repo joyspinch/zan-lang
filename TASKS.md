@@ -1465,3 +1465,19 @@
 - 已落地的项目侧绕行（不算修复，只是把 coreforge 摆正）：`client/src/
   main.zan` 把 HUD 根改成 flex 列 + Overlay `flex-grow:1`。
 - 关联：coreforge 外部项目 `D:/project/games/coreforge`（仓库外）。
+### [x] A473 gui-webapp 的 66KB webview 运行时——评估后暂不抽包
+
+- 评估对象：`templates/gui/gui-webapp/src/` 下的客户端 webview 宿主机制
+  （`WebAssets.zan` 42KB + `WebBridge`/`WebServer`/`WebUpdater`/`WebSecurity`/
+  `WebDevWatch` 约 25KB，合计约 66KB）。
+- 判据复核（规则 14"换个游戏还成立吗"）：**成立**——web 前端做 UI 的桌面
+  应用都需要"本地静态服务 + 前端打包 + 自动更新 + CSP/origin 安全策略 +
+  双向桥"这一整套。它与 `Zan.Web`（服务端路由/视图，不是一层）和
+  `Zan.Gui.Browser`（CEF 控件驱动，opt-in 原生依赖）都不重叠。
+- **结论：暂不抽包**。理由：目前只有 gui-webapp 一个使用者，抽出去会让
+  模板多一层包依赖（还得改编译口径），而"两处重复"这个真正的收益前提
+  还没出现——现在抽属于提前抽象。触发条件：出现第二个 webview 宿主
+  项目（另一个模板或仓库外项目用同一套桥/打包/更新机制）时再抽，那时
+  直接按包拆（建议落 `packages/Zan.Web.Client` 或 `Zan.Desktop.WebHost`，
+  模板只留 `web/` 前端源码 + 一份薄配置）。
+- 关联：A472（GUI 排版层的同类结构性遗留）。
