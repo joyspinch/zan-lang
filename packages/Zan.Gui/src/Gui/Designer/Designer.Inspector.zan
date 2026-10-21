@@ -568,6 +568,70 @@ partial class Designer {
         return ps;
     }
 
+    // 颜色行建器：给行配一个真取色器（ColorPicker）。色块就是
+    // 它的触发条——皮肤透明底 + 当前色，点开是 SV 面板 + 色相/
+    // 透明度条 + RGBA/HEX/HSL/HSB 输入行（Naive UI n-color-picker
+    // 那套）。初值取当前文本；非字面色（var(--x) 等）解析不出就
+    // 留在黑色，等用户自己挑。
+    void InitColorPicker(CompPropEditRow er, string curVal) {
+        ColorPicker cp = new ColorPicker(0xFF000000);
+        cp.Mode = "hex";
+        Color c = Designer.ParseColorValue(curVal);
+        if (!c.IsNone()) {
+            cp.SetColor(c.ToARGB());
+        }
+        er.cpick = cp;
+        er.cpickVal = cp.Value();
+    }
+
+    // 颜色属性行：文本框 + 真取色器色块。
+    // 两条写回路径：
+    //   文本 → 属性：用户手改文本（文本是权威，解析不出就只更新
+    //     文本，不动取色器）。
+    //   取色器 → 属性：用户在弹层里拖了色盘，取色器模型值变了，
+    //     把它翻成 CSS 颜色文本写回。靠每帧比对模型值发现，不用
+    //     事件——弹层在覆盖阶段绘制，事件要等下一帧才到。
+    void RenderColorPropRow(App app, Canvas c, FormField f, CompPropEditRow er,
+                             int ix, int iy, int iw, int labelW, int rowH,
+                             string gate) {
+        int swatchW = app.Scale(28);
+        int inpW = iw - labelW - swatchW - app.Scale(4);
+        er.input.Render(app, ix + labelW, iy, inpW, rowH);
+        int sx = ix + labelW + inpW + app.Scale(4);
+        ColorPicker cp = er.cpick;
+        if (cp == null) { return; }
+        string cur = er.input.GetText();
+        Color parsed = Designer.ParseColorValue(cur);
+        bool literal = !parsed.IsNone();
+        if (cur != er.shadow && literal) {
+            cp.SetColor(parsed.ToARGB());
+            er.cpickVal = cp.Value();
+        }
+        int pv = cp.Value();
+        if (pv != er.cpickVal) {
+            er.cpickVal = pv;
+            cur = Designer.ColorValueText(pv);
+            er.input.SetText(cur);
+        }
+        // 色块 = 取色器触发条（透明底 + 当前色圆角块）。
+        cp.RenderIn(app, sx, iy, swatchW, rowH);
+        if (!literal) {
+            // 非字面色（var(--x) / 命名色等）：斜杠标记"这不是字面
+            // 颜色"，免得色块上那点旧色被当成真值。
+            c.DrawLine(sx + app.Scale(3), iy + app.Scale(3),
+                       sx + swatchW - app.Scale(3), iy + rowH - app.Scale(3),
+                       Style.Part(app, "designer", "field", "", "", "",
+                                  Style.SNormal()).BorderOr(0), app.Scale(1));
+        }
+        if (cur != er.shadow) {
+            this.GateInspectorUndo(gate);
+            SetCompPropValue(f, er.key, cur);
+            this.MarkDocDirty();
+            er.shadow = cur;
+            app.RequestRedraw();
+        }
+    }
+
     // 选中组件的属性选项卡（不含事件——它们在事件选项卡）。
     // 属性行交给 PropertyGrid，这里只处理绑定选择器、选项表
     // 这些语义动作。返回最后一行之后的 y，供主体滚动。
@@ -1195,7 +1259,10 @@ partial class Designer {
                                 CompPropEditRow er = new CompPropEditRow(key, rawLabel, false, pin, null, pin.GetText());
                                 if (key == "icon") { er.isIcon = true; }
                                 else if (Designer.IsAssetProp(key)) { er.isAsset = true; }
-                                else if (Designer.IsColorProp(key)) { er.isColor = true; }
+                                else if (Designer.IsColorProp(key)) {
+                                    er.isColor = true;
+                                    this.InitColorPicker(er, curVal);
+                                }
                                 compPropEditRows.Add(er);
                             }
                         }
@@ -1289,43 +1356,8 @@ partial class Designer {
                             app.RequestRedraw();
                         }
                     } else if (er.isColor) {
-                        int swatchW = app.Scale(28);
-                        int inpW = iw - labelW - swatchW - app.Scale(4);
-                        er.input.Render(app, ix + labelW, iy, inpW, rowH);
-                        string bcur = er.input.GetText();
-                        int sx = ix + labelW + inpW + app.Scale(4);
-                        int swatchColor = 0;
-                        bool hasColor = false;
-                        if (bcur != null && bcur != "") {
-                            swatchColor = ColorPicker.HexParse(bcur);
-                            if (ColorPicker.parseOk) {
-                                hasColor = true;
-                            } else {
-                                swatchColor = ColorPicker.FuncParse(bcur);
-                                if (ColorPicker.parseOk) { hasColor = true; }
-                            }
-                        }
-                        int swatchBtnId = SmallBtn(app, hasColor ? "" : Designer.T("color", "色"), 0, sx, iy, swatchW);
-                        if (hasColor) {
-                            c.FillRoundRect(sx + app.Scale(3), iy + app.Scale(3), swatchW - app.Scale(6), rowH - app.Scale(6), app.Scale(2), swatchColor);
-                            c.DrawRoundRect(sx + app.Scale(3), iy + app.Scale(3), swatchW - app.Scale(6), rowH - app.Scale(6), app.Scale(2), Style.Part(app, "designer", "field", "", "", "", Style.SNormal()).BorderOr(0), app.Scale(1));
-                        }
-                        if (Ui.Clicked(app, swatchBtnId)) {
-                            string nextC = Designer.NextPresetColor(bcur);
-                            er.input.SetText(nextC);
-                            this.GateInspectorUndo("bprop|" + browId + "|" + er.key);
-                            SetCompPropValue(f, er.key, nextC);
-                            this.MarkDocDirty();
-                            er.shadow = nextC;
-                            app.RequestRedraw();
-                        }
-                        if (bcur != er.shadow) {
-                            this.GateInspectorUndo("bprop|" + browId + "|" + er.key);
-                            SetCompPropValue(f, er.key, bcur);
-                            this.MarkDocDirty();
-                            er.shadow = bcur;
-                            app.RequestRedraw();
-                        }
+                        this.RenderColorPropRow(app, c, f, er, ix, iy, iw,
+                            labelW, rowH, "bprop|" + browId + "|" + er.key);
                     } else {
                         er.input.Render(app, ix + labelW, iy,
                             iw - labelW, rowH);
@@ -1392,7 +1424,10 @@ partial class Designer {
                                 CompPropEditRow er = new CompPropEditRow(decl.key, decl.label, false, pin, null, pin.GetText());
                                 if (decl.key == "icon") { er.isIcon = true; }
                                 else if (Designer.IsAssetProp(decl.key)) { er.isAsset = true; }
-                                else if (Designer.IsColorProp(decl.key)) { er.isColor = true; }
+                                else if (Designer.IsColorProp(decl.key)) {
+                                    er.isColor = true;
+                                    this.InitColorPicker(er, curVal);
+                                }
                                 compPropEditRows.Add(er);
                             }
                         }
@@ -1475,41 +1510,8 @@ partial class Designer {
                             app.RequestRedraw();
                         }
                     } else if (er.isColor) {
-                        int swatchW = app.Scale(28);
-                        int inpW = iw - labelW - swatchW - app.Scale(4);
-                        er.input.Render(app, ix + labelW, iy, inpW, rowH);
-                        string cur = er.input.GetText();
-                        int sx = ix + labelW + inpW + app.Scale(4);
-                        int swatchColor = 0;
-                        bool hasColor = false;
-                        if (cur != null && cur != "") {
-                            swatchColor = ColorPicker.HexParse(cur);
-                            if (ColorPicker.parseOk) {
-                                hasColor = true;
-                            } else {
-                                swatchColor = ColorPicker.FuncParse(cur);
-                                if (ColorPicker.parseOk) { hasColor = true; }
-                            }
-                        }
-                        int swatchBtnId = SmallBtn(app, hasColor ? "" : Designer.T("color", "色"), 0, sx, iy, swatchW);
-                        if (hasColor) {
-                            c.FillRoundRect(sx + app.Scale(3), iy + app.Scale(3), swatchW - app.Scale(6), rowH - app.Scale(6), app.Scale(2), swatchColor);
-                            c.DrawRoundRect(sx + app.Scale(3), iy + app.Scale(3), swatchW - app.Scale(6), rowH - app.Scale(6), app.Scale(2), Style.Part(app, "designer", "field", "", "", "", Style.SNormal()).BorderOr(0), app.Scale(1));
-                        }
-                        if (Ui.Clicked(app, swatchBtnId)) {
-                            string nextC = Designer.NextPresetColor(cur);
-                            er.input.SetText(nextC);
-                            this.GateInspectorUndo("cprop|" + rowId + "|" + er.key);
-                            SetCompPropValue(f, er.key, nextC);
-                            er.shadow = nextC;
-                            app.RequestRedraw();
-                        }
-                        if (cur != er.shadow) {
-                            this.GateInspectorUndo("cprop|" + rowId + "|" + er.key);
-                            SetCompPropValue(f, er.key, cur);
-                            er.shadow = cur;
-                            app.RequestRedraw();
-                        }
+                        this.RenderColorPropRow(app, c, f, er, ix, iy, iw,
+                            labelW, rowH, "cprop|" + rowId + "|" + er.key);
                     } else {
                         er.input.Render(app, ix + labelW, iy,
                             iw - labelW, rowH);

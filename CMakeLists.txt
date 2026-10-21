@@ -4799,6 +4799,19 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_colorpicker.out
       -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_colorpicker${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+  # 设计器颜色属性行接真取色器：kind 4 颜色属性认十进制打包色与 CSS
+  # 颜色文本两种形态（只按整数解析的话 "#ff0000" 静默落成 0=没设颜
+  # 色，用户挑了色却什么都没发生），取色器即时模式锚点（弹层落在色
+  # 块下方而不是窗口原点），以及取色器改色 / 手改文本两条写回路径。
+  add_test(NAME conformance_gui_designer_color_picker
+    COMMAND ${CMAKE_COMMAND}
+      -DZANC=$<TARGET_FILE:zanc>
+      -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/designer_color_picker_test.zan
+      "-DZANC_ARGS=--auto-stdlib${_gui_driver_tail}"
+      -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_designer_color_picker.out
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_designer_color_picker${_exe_ext}
+    -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+
 
   # SelectBox 级联增强：父子指针链（单选路径/重开自动展开/联动关闭
   # 选分支）、多选勾选模型（联动带动、祖链回推、半勾）、勾选策略

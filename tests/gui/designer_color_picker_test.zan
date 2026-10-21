@@ -1,0 +1,160 @@
+using System;
+using Gui;
+using Gui.Widget;
+using Gui.Designer;
+
+// 设计器颜色属性行接真取色器的回归。四件事，缺一都会让"点色块弹
+// 取色器"变成哑的：
+// 1. 属性值的两种形态——kind 4 的颜色属性既认十进制打包色（历史
+//    形态，Read 的输出），也认 CSS 颜色文本（取色器写回的形态）。
+//    只按整数解析的话，SetProp("color", "#ff0000") 会静默落成 0
+//    （= 没设颜色），用户挑了色却什么都没发生。
+// 2. 取色器的即时模式锚点——弹层按 bx/by/bh 定位；即时模式没有
+//    Arrange，锚点必须由 RenderIn 自己落，否则弹层跑到窗口原点。
+// 3. 颜色行的写回——取色器里改了色，属性值要翻成 CSS 文本写回、
+//    输入框要同步。
+// 4. 反向——手改文本时取色器要跟着走（文本是权威）。
+class DesignerColorPickerTest {
+    static int fails;
+
+    static void Check(string label, bool ok) {
+        if (ok) { return; }
+        fails = fails + 1;
+        Console.WriteLine("FAIL " + label);
+    }
+
+    static void EqStr(string label, string got, string want) {
+        if (got == want) { return; }
+        fails = fails + 1;
+        Console.WriteLine("FAIL " + label + ": got '" + got + "' want '" + want + "'");
+    }
+
+    static void EqInt(string label, int got, int want) {
+        if (got == want) { return; }
+        fails = fails + 1;
+        Console.WriteLine("FAIL " + label + ": got " + Convert.ToString(got)
+            + " want " + Convert.ToString(want));
+    }
+
+    // ---- 1. 颜色属性的两种文档形态 --------------------------------
+    static void TestPropFormats() {
+        Check("tint is color prop", Designer.IsColorProp("tint"));
+        Check("accent is color prop", Designer.IsColorProp("accent"));
+        Check("titleColor is color prop", Designer.IsColorProp("titleColor"));
+        Check("size is not color prop", !Designer.IsColorProp("size"));
+        Check("token is not literal", Designer.ParseColorValue("var(--x)").IsNone());
+        Check("hex is literal", !Designer.ParseColorValue("#1890ff").IsNone());
+        Check("named is literal", !Designer.ParseColorValue("red").IsNone());
+        Check("decimal is literal", !Designer.ParseColorValue("-65536").IsNone());
+        EqStr("packed to css", Designer.ColorValueText(0 - 65536), "#ff0000");
+        EqStr("packed alpha to css", Designer.ColorValueText(0 - 2130771968),
+              "#80ff0000");
+
+        Button b = new Button();
+        b.SetProp("color", "#ff0000");
+        EqStr("prop from hex", b.GetProp("color"), "-65536");
+        b.SetProp("color", "rgba(255, 0, 0, 0.5)");
+        EqStr("prop from rgba", b.GetProp("color"), "2147418112");
+        b.SetProp("color", "red");
+        EqStr("prop from named", b.GetProp("color"), "-65536");
+        b.SetProp("color", "-65536");
+        EqStr("prop from int", b.GetProp("color"), "-65536");
+        b.SetProp("color", "garbage");
+        EqStr("prop from garbage", b.GetProp("color"), "0");
+    }
+
+    // ---- 2~4. 颜色行：锚点 / 写回 / 反向 --------------------------
+    static void TestColorRow() {
+        App app = new App("dcolor", 900, 640);
+        Designer designer = new Designer();
+        FormField field = FormField.New(0, 1);
+        Designer.SetCompPropValue(field, "tint", "#1890ff");
+
+        Input input = new Input("");
+        input.SetText("#1890ff");
+        CompPropEditRow row = new CompPropEditRow("tint", "Tint", false, input,
+                                                   null, "#1890ff");
+        designer.InitColorPicker(row, "#1890ff");
+        EqInt("picker seeded from value",
+              ColorPicker.RgbOf(row.cpick.Value()), 0x1890ff);
+
+        int ix = 20;
+        int iy = 20;
+        int iw = 300;
+        int labelW = 116;
+        int rowH = 32;
+        // 帧 1：画一行。锚点必须落在色块上（弹层据此定位）。
+        app.BeginFrame();
+        designer.RenderColorPropRow(app, app.canvas, field, row, ix, iy, iw,
+                                    labelW, rowH, "test|tint");
+        app.RunOverlays();
+        // 缩放系数在首帧后才稳定（离屏 App 首次取系统 DPI），几何
+        // 期望值必须在帧后算，否则会拿 1.0 倍去比 1.5 倍的结果。
+        int swatchW = app.Scale(28);
+        int swatchX = ix + iw - swatchW;
+        EqInt("anchor x", row.cpick.bx, swatchX);
+        EqInt("anchor y", row.cpick.by, iy);
+        EqInt("anchor h", row.cpick.bh, rowH);
+
+        // 弹层打开时，SV 面板必须落在色块下方（不是窗口原点）。
+        row.cpick.open = true;
+        app.BeginFrame();
+        designer.RenderColorPropRow(app, app.canvas, field, row, ix, iy, iw,
+                                    labelW, rowH, "test|tint");
+        app.RunOverlays();
+        int svId = row.cpick.wid + ColorPicker.SvPanelOff();
+        // 沿色块右侧竖扫，找 SV 面板的命中区：它必须落在色块下方
+        // （弹层贴着触发条），而不是窗口原点。
+        int foundY = 0 - 1;
+        for (int y = 0; y < 400; y = y + 1) {
+            if (app.hitTester.HitTest(swatchX + app.Scale(20), y) == svId) {
+                foundY = y;
+                break;
+            }
+        }
+        Check("sv panel below swatch", foundY > iy + rowH);
+        Check("sv panel near swatch", foundY < iy + rowH + app.Scale(80));
+        Check("sv panel not at origin", foundY != 0 - 1);
+
+        // 帧 2：用户在弹层里挑了红色 → 属性值写回 CSS 文本。
+        row.cpick.open = false;
+        row.cpick.SetColor(0 - 65536);
+        app.BeginFrame();
+        designer.RenderColorPropRow(app, app.canvas, field, row, ix, iy, iw,
+                                    labelW, rowH, "test|tint");
+        app.RunOverlays();
+        EqStr("prop after pick", DesignerColorPickerTest.PropValue(field),
+              "#ff0000");
+        EqStr("input after pick", row.input.GetText(), "#ff0000");
+
+        // 帧 3：手改文本 → 取色器跟着走，属性值 = 文本。
+        row.input.SetText("#00ff00");
+        app.BeginFrame();
+        designer.RenderColorPropRow(app, app.canvas, field, row, ix, iy, iw,
+                                    labelW, rowH, "test|tint");
+        app.RunOverlays();
+        EqInt("picker follows text",
+              ColorPicker.RgbOf(row.cpick.Value()), 0x00FF00);
+        EqStr("prop after typing", DesignerColorPickerTest.PropValue(field),
+              "#00ff00");
+
+        app.canvas.Destroy();
+    }
+
+    static string PropValue(FormField f) {
+        if (f.extra == null) { return ""; }
+        JsonValue props = f.extra.Get("props");
+        if (props == null || !props.IsObject()) { return ""; }
+        return props.Str("tint", "");
+    }
+
+    static void Main() {
+        DesignerColorPickerTest.TestPropFormats();
+        DesignerColorPickerTest.TestColorRow();
+        if (DesignerColorPickerTest.fails > 0) {
+            Console.WriteLine("DESIGNER_COLOR_PICKER_TEST_FAILED");
+            return;
+        }
+        Console.WriteLine("DESIGNER_COLOR_PICKER_TEST_OK");
+    }
+}
