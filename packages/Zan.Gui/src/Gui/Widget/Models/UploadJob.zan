@@ -48,8 +48,10 @@ public class UploadJob {
     public string doneErr;
     public bool donePosted;
 
-    // UI 线程：入队并（worker 空闲时）拉起后台线程。
-    // 线程起不来时返回 false（任务已从队列摘除），调用方负责失败该项。
+    // UI 线程：入队并（worker 空闲时）拉起 worker 协程。
+    // worker 是 async 协程（M:1 协作式调度，见 rt_co.c）：协程挂起
+    // 时不占线程，传输在 IO 反应器上推进，续体由调度器恢复。
+    // 协程不会"起不来"，因此这里没有线程启动失败那套回滚。
     static bool Enqueue(UploadJob job) {
         if (lockHandle == 0) {
             lockHandle = Mutex.Create();
@@ -60,24 +62,25 @@ public class UploadJob {
         bool needWorker = !workerStarted;
         workerStarted = true;
         Mutex.Unlock(lockHandle);
-        if (needWorker && !Thread.Start(UploadJob.Run)) {
-            Mutex.Lock(lockHandle);
-            int i = 0;
-            while (i < pending.Count) {
-                if (pending[i].itemId == job.itemId) { pending.RemoveAt(i); }
-                else { i = i + 1; }
-            }
-            workerStarted = false;
-            Mutex.Unlock(lockHandle);
-            return false;
+        if (needWorker) {
+            UploadJob.RunLoop();
         }
         return true;
     }
 
-    // 后台线程入口（静态方法组）：逐条取任务直到队列清空，
-    // 然后退出（下一次入队会重新拉起）。await 让出期间
-    // IO 反应器推进传输——与 ImageHttp.WorkerLoop 同构。
-    static void Run() {
+    // worker 协程：逐条取任务直到队列清空，然后退出（下一次入队会
+    // 重新拉起）。await 让出期间 IO 反应器推进传输。
+    //
+    // 必须是 async 方法：await 只在 async 方法里有意义，放在普通方法里
+    // 会被直接丢掉——"取一项 await 一项"就退化成"一次并发拉起全部"，
+    // 上传并发数失控（编译器会报 'await' is only allowed in an async
+    // method）。
+    //
+    // 也不能放在后台线程里跑：Zan 的协程是 M:1 协作式（rt_co.c 的就绪
+    // 队列），await 挂起后由调度器在同一个线程上恢复，裸线程里 await
+    // 既等不到也占着线程不放。传输本身在 IO 反应器上跑，UI 不会被
+    // 传输过程卡住。
+    static async void RunLoop() {
         Socket.Initialize();
         while (true) {
             UploadJob job = UploadJob.Take();

@@ -71,18 +71,20 @@ public class ImageHttp {
         workerStarted = true;
         Mutex.Unlock(lockHandle);
         if (needWorker) {
-            if (!Thread.Start(ImageHttp.WorkerLoop)) {
-                // 线程起不来：统一走 Apply 失败路径（控件显示失败占位，
-                // URL 槽置失败态）。
-                ImageHttpReq fail = r;
-                app.Post(() => { ImageHttp.Apply(fail, null, null, 0, "no worker"); }, "ImageHttp.Fail");
-            }
+            // worker 是 async 协程（M:1 协作式调度，见 rt_co.c）：协程
+            // 不会"起不来"，所以没有线程启动失败那套兜底。
+            ImageHttp.WorkerLoop();
         }
     }
 
-    // worker 线程入口：逐条取回直到队列清空，然后退出
+    // worker 协程：逐条取回直到队列清空，然后退出
     // （下一次 Fetch 会重新拉起）。await 让出期间 IO 反应器推进传输。
-    static void WorkerLoop() {
+    //
+    // 必须是 async 方法：await 只在 async 方法里有意义（放在普通方法里
+    // 会被丢掉，"取回一条 await 一条"就退化成并发拉起全部）；也不能放在
+    // 后台线程里跑——Zan 的协程是 M:1 协作式，await 挂起后由调度器在
+    // 同一个线程上恢复。传输本身在 IO 反应器上跑，UI 不会被卡住。
+    static async void WorkerLoop() {
         Socket.Initialize();
         while (true) {
             ImageHttpReq r = ImageHttp.Take();
