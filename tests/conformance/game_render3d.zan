@@ -1,0 +1,407 @@
+// Zan.Game.Render3D 的 conformance：纯逻辑断言（无窗口、无 GPU）。
+//
+// 覆盖：相机（默认参数 / 视图阵 / 投影阵 / 视口宽高比 / 轨道机位 /
+// 视锥远近平面）· 变换与场景树（模型阵的平移与旋转、父子世界变换）·
+// 视锥剔除（视锥内 / 视锥外 / 相机背后 / 远裁剪面）· 光照（平行光朝向 /
+// 点光衰减 / 聚光锥角 / 自发光 / 金属高光）· 渲染计划（绘制项数 /
+// 剔除计数 / 排序分组 / 透明由远及近 / 着色 tint / 复用与确定性）·
+// 后处理（曝光 / 色调映射 / 雾 / 钳位）· 绘制层（空输入返回 0）。
+using System;
+using System.Collections.Generic;
+using System.Numerics;
+using Game.Render3D;
+
+class Program {
+    static int bad;
+
+    static void Check(bool ok, string label) {
+        if (!ok) { Console.WriteLine("FAIL " + label); bad = bad + 1; }
+        else { Console.WriteLine("ok " + label); }
+    }
+
+    static bool Near(float a, float b) {
+        float d = a - b;
+        if (d < 0.0f) { d = -d; }
+        return d <= 0.001f;
+    }
+
+    // 列向量约定下 clip = M * p：clip.x 是第 0 行点乘，clip.w 是第 3 行点乘。
+    static float ClipW(Mat4 m, float x, float y, float z) {
+        return m.m[12] * x + m.m[13] * y + m.m[14] * z + m.m[15];
+    }
+
+    static float ClipX(Mat4 m, float x, float y, float z) {
+        return m.m[0] * x + m.m[4] * y + m.m[8] * z + m.m[12];
+    }
+
+    static float ClipY(Mat4 m, float x, float y, float z) {
+        return m.m[1] * x + m.m[5] * y + m.m[9] * z + m.m[13];
+    }
+
+    // ---------------------------------------------------------------- 相机
+
+    static Camera3D MakeCamera() {
+        Camera3D cam = new Camera3D();
+        cam.SetViewport(1280, 720);
+        cam.SetLookAt(new Vector3(0.0f, 0.0f, 5.0f), Vector3.Zero);
+        return cam;
+    }
+
+    static void Camera() {
+        Camera3D cam = MakeCamera();
+        Check(Near(cam.FieldOfView, 1.0471975512f), "camera-default-fov");
+        Check(Near(cam.AspectRatio, 16.0f / 9.0f), "camera-default-aspect");
+        Check(Near(cam.NearPlane, 0.1f) && Near(cam.FarPlane, 1000.0f),
+              "camera-default-clip");
+
+        Mat4 view = cam.ViewMatrix();
+        // 相机在 (0,0,5) 看向原点：视线阵把 z 平移 -5（列向量约定）。
+        Check(Near(view.m[11], -5.0f), "camera-view-translation");
+        Check(Near(view.m[0], 1.0f) && Near(view.m[5], 1.0f)
+              && Near(view.m[10], 1.0f), "camera-view-basis");
+
+        Mat4 proj = cam.ProjectionMatrix();
+        // 60 度垂直视场：m[5] = 1 / tan(30°)。
+        Check(Near(proj.m[5], 1.7320508f), "camera-projection-focal");
+        Check(Near(proj.m[0], 1.7320508f / (16.0f / 9.0f)), "camera-projection-aspect");
+        Check(Near(proj.m[14], -1.0f), "camera-projection-w-row");
+
+        Camera3D vp = MakeCamera();
+        vp.SetViewport(800, 600);
+        Check(Near(vp.AspectRatio, 4.0f / 3.0f), "camera-viewport-aspect");
+
+        Camera3D orb = MakeCamera();
+        orb.Orbit(0.0f, 0.0f, 10.0f);
+        Check(Near(orb.Position.X, 10.0f) && Near(orb.Position.Y, 0.0f)
+              && Near(orb.Position.Z, 0.0f), "camera-orbit-position");
+        Camera3D orb2 = MakeCamera();
+        orb2.Orbit(1.5707963f, 0.0f, 4.0f);
+        Check(Near(orb2.Position.X, 0.0f) && Near(orb2.Position.Z, 4.0f),
+              "camera-orbit-yaw90");
+
+        // 投影：原点在画面正中；相机背后的点 w < 0。
+        Mat4 vpm = cam.ViewProjectionMatrix();
+        float wOrigin = ClipW(vpm, 0.0f, 0.0f, 0.0f);
+        Check(wOrigin > 0.0f, "camera-project-in-front-w");
+        Check(ClipW(vpm, 0.0f, 0.0f, 9.0f) < 0.0f, "camera-project-behind-w");
+        Check(Near(ClipX(vpm, 0.0f, 0.0f, 0.0f) / wOrigin, 0.0f)
+              && Near(ClipY(vpm, 0.0f, 0.0f, 0.0f) / wOrigin, 0.0f),
+              "camera-project-center-ndc");
+    }
+
+    // ------------------------------------------------------ 变换与场景树
+
+    static void Transform() {
+        Transform3D t = new Transform3D(new Vector3(1.0f, 2.0f, 3.0f),
+                                        Quaternion.Identity,
+                                        new Vector3(2.0f, 3.0f, 4.0f));
+        Mat4 m = new Mat4();
+        RenderTransform.WriteModelMatrix(m, t);
+        // 列向量约定：平移在 m[3] / m[7] / m[11]。
+        Check(Near(m.m[3], 1.0f) && Near(m.m[7], 2.0f) && Near(m.m[11], 3.0f),
+              "transform-model-translation");
+        // 缩放作用在基向量上（第 col 列 = m[col] / m[4+col] / m[8+col]）。
+        Check(Near(m.m[0], 2.0f) && Near(m.m[5], 3.0f) && Near(m.m[10], 4.0f),
+              "transform-model-scale-columns");
+
+        Transform3D rot = new Transform3D(Vector3.Zero,
+                                          Quaternion.FromEulerDegrees(0.0f, 90.0f, 0.0f),
+                                          Vector3.One);
+        Mat4 rm = new Mat4();
+        RenderTransform.WriteModelMatrix(rm, rot);
+        // 绕 +y 转 90 度：x 轴基向量（第 0 列）变成 (0,0,-1)。
+        Check(Near(rm.m[0], 0.0f) && Near(rm.m[4], 0.0f) && Near(rm.m[8], -1.0f),
+              "transform-model-yaw90");
+
+        // 原地矩阵乘与 Mat4.Mul 结果一致。
+        Mat4 a = Mat4.Translate(1.0f, 2.0f, 3.0f);
+        Mat4 b = Mat4.Scale(2.0f, 2.0f, 2.0f);
+        Mat4 mul = a.Mul(b);
+        Mat4 into = new Mat4();
+        RenderTransform.MulInto(into, a, b);
+        bool same = true;
+        for (int i = 0; i < 16; i = i + 1) {
+            if (!Near(mul.m[i], into.m[i])) { same = false; }
+        }
+        Check(same, "transform-mulinto-matches-mul");
+
+        // 父子世界变换：父 (1,0,0) + 子 (0,2,0) → 子在世界 (1,2,0)。
+        SceneNode root = new SceneNode("root");
+        root.SetPosition(1.0f, 0.0f, 0.0f);
+        SceneNode child = new SceneNode("child");
+        child.SetPosition(0.0f, 2.0f, 0.0f);
+        child.MeshKey = 3;
+        root.AddChild(child);
+
+        RenderPlan plan = new RenderPlan(MakeCamera());
+        plan.Build(root);
+        Check(plan.Count() == 1, "scene-plan-one-item");
+        RenderItem item = plan.ItemAt(0);
+        bool worldOk = false;
+        if (item != null) {
+            worldOk = Near(item.Model.m[3], 1.0f) && Near(item.Model.m[7], 2.0f)
+                   && Near(item.Model.m[11], 0.0f);
+        }
+        Check(worldOk, "scene-child-world-transform");
+    }
+
+    // ------------------------------------------------------------ 视锥剔除
+
+    static void FrustumCulling() {
+        Camera3D cam = MakeCamera();
+        cam.FarPlane = 100.0f;
+        Frustum fr = Frustum.FromViewProjection(cam.ViewProjectionMatrix());
+        Check(fr.ContainsSphere(Vector3.Zero, 1.0f), "frustum-inside");
+        Check(!fr.ContainsSphere(new Vector3(0.0f, 0.0f, 50.0f), 1.0f),
+              "frustum-outside-far");
+        Check(!fr.ContainsSphere(new Vector3(0.0f, 0.0f, 9.0f), 1.0f),
+              "frustum-outside-behind");
+        Check(!fr.ContainsSphere(new Vector3(0.0f, 0.0f, -96.0f), 0.5f),
+              "frustum-beyond-far-plane");
+        Check(fr.ContainsSphere(new Vector3(0.0f, 0.0f, -94.0f), 0.5f),
+              "frustum-inside-far-plane");
+        Check(fr.ContainsPoint(Vector3.Zero), "frustum-contains-point");
+    }
+
+    // ---------------------------------------------------------------- 光照
+
+    static void Lighting() {
+        // 平行光自上而下：朝上的面亮，朝下的面暗（半兰伯特 1 vs 0）。
+        Light sun = Light.DirectionalLight(1.0f, 1.0f, 1.0f, 1.0f,
+                                           new Vector3(0.0f, -1.0f, 0.0f));
+        List<Light> lights = new List<Light>();
+        lights.Add(sun);
+        Material mat = Material.Solid(1.0f, 1.0f, 1.0f);
+        float upR; float upG; float upB;
+        float dnR; float dnG; float dnB;
+        Lighting.Shade(mat, Vector3.Zero, new Vector3(0.0f, 1.0f, 0.0f),
+                       lights, new Vector3(0.0f, 0.0f, 5.0f),
+                       0.0f, 0.0f, 0.0f, out upR, out upG, out upB);
+        Lighting.Shade(mat, Vector3.Zero, new Vector3(0.0f, -1.0f, 0.0f),
+                       lights, new Vector3(0.0f, 0.0f, 5.0f),
+                       0.0f, 0.0f, 0.0f, out dnR, out dnG, out dnB);
+        Check(upR > dnR && Near(upR, 1.0f) && Near(dnR, 0.0f),
+              "light-directional-facing");
+
+        // 点光：近处比远处亮（光源在原点，表面法线朝 -z 正对光源）。
+        Light bulb = Light.PointLight(1.0f, 1.0f, 1.0f, 1.0f,
+                                      new Vector3(0.0f, 0.0f, 0.0f), 10.0f);
+        List<Light> pointLights = new List<Light>();
+        pointLights.Add(bulb);
+        float nearR; float nearG; float nearB;
+        float farR; float farG; float farB;
+        Lighting.Shade(mat, new Vector3(0.0f, 0.0f, 1.0f),
+                       new Vector3(0.0f, 0.0f, -1.0f), pointLights,
+                       new Vector3(0.0f, 0.0f, 1.0f), 0.0f, 0.0f, 0.0f,
+                       out nearR, out nearG, out nearB);
+        Lighting.Shade(mat, new Vector3(0.0f, 0.0f, 9.0f),
+                       new Vector3(0.0f, 0.0f, -1.0f), pointLights,
+                       new Vector3(0.0f, 0.0f, 9.0f), 0.0f, 0.0f, 0.0f,
+                       out farR, out farG, out farB);
+        Check(nearR > farR, "light-point-attenuation");
+        Check(Near(nearR, 0.81f), "light-point-near-value");
+
+        // 聚光：锥内亮，锥外灭。
+        Light spot = Light.SpotLight(1.0f, 1.0f, 1.0f, 1.0f,
+                                     new Vector3(0.0f, 0.0f, 0.0f),
+                                     new Vector3(0.0f, 0.0f, 1.0f), 20.0f,
+                                     0.2f, 0.5f);
+        List<Light> spotLights = new List<Light>();
+        spotLights.Add(spot);
+        float inR; float inG; float inB;
+        float outR; float outG; float outB;
+        Lighting.Shade(mat, new Vector3(0.0f, 0.0f, 2.0f),
+                       new Vector3(0.0f, 0.0f, -1.0f), spotLights,
+                       new Vector3(0.0f, 0.0f, 2.0f), 0.0f, 0.0f, 0.0f,
+                       out inR, out inG, out inB);
+        Lighting.Shade(mat, new Vector3(3.0f, 0.0f, 2.0f),
+                       new Vector3(0.0f, 0.0f, -1.0f), spotLights,
+                       new Vector3(3.0f, 0.0f, 2.0f), 0.0f, 0.0f, 0.0f,
+                       out outR, out outG, out outB);
+        Check(inR > 0.0f && Near(outR, 0.0f), "light-spot-cone");
+        Check(inR <= 1.0f, "light-spot-cone-clamped");
+
+        // 自发光：没有光源也亮。
+        Material glow = Material.Emissive(0.25f, 0.5f, 0.75f);
+        float eR; float eG; float eB;
+        Lighting.Shade(glow, Vector3.Zero, new Vector3(0.0f, 1.0f, 0.0f),
+                       new List<Light>(), new Vector3(0.0f, 0.0f, 5.0f),
+                       0.0f, 0.0f, 0.0f, out eR, out eG, out eB);
+        Check(Near(eR, 0.25f) && Near(eG, 0.5f) && Near(eB, 0.75f),
+              "light-emissive");
+
+        // 金属度：漫反射被压掉、高光出现（相机不在镜面方向，高光只是
+        // 一部分，但必须 > 0；漫反射材质则相反）。
+        Material metal = Material.Solid(1.0f, 1.0f, 1.0f);
+        metal.Metallic = 1.0f;
+        metal.Roughness = 0.5f;
+        Material matte = Material.Solid(1.0f, 1.0f, 1.0f);
+        float mR; float mG; float mB;
+        float dR; float dG; float dB;
+        Lighting.Shade(metal, Vector3.Zero, new Vector3(0.0f, 1.0f, 0.0f),
+                       lights, new Vector3(0.0f, 3.0f, 4.0f),
+                       0.0f, 0.0f, 0.0f, out mR, out mG, out mB);
+        Lighting.Shade(matte, Vector3.Zero, new Vector3(0.0f, 1.0f, 0.0f),
+                       lights, new Vector3(0.0f, 3.0f, 4.0f),
+                       0.0f, 0.0f, 0.0f, out dR, out dG, out dB);
+        Check(mR > 0.0f, "light-metallic-specular");
+        Check(mR < dR, "light-metallic-no-diffuse");
+
+        // 打包：0xAARRGGBB。
+        Check(Lighting.PackArgb(1.0f, 0.0f, 0.0f, 1.0f) == -65536,
+              "light-pack-argb");
+        Check(Lighting.PackArgb(0.0f, 0.0f, 0.0f, 0.0f) == 0, "light-pack-zero");
+    }
+
+    // ------------------------------------------------------------ 渲染计划
+
+    static SceneNode Node(string name, int mesh, float x, float y, float z) {
+        SceneNode n = new SceneNode(name);
+        n.MeshKey = mesh;
+        n.SetPosition(x, y, z);
+        return n;
+    }
+
+    static void Plan() {
+        Camera3D cam = MakeCamera();
+        SceneNode root = new SceneNode("root");
+        root.AddChild(Node("a", 2, 0.0f, 0.0f, 0.0f));
+        root.AddChild(Node("b", 1, 0.5f, 0.0f, 0.0f));
+        root.AddChild(Node("c", 2, -0.5f, 0.0f, 0.0f));
+        root.AddChild(Node("hidden", 3, 0.0f, 0.0f, 30.0f));
+
+        RenderPlan plan = new RenderPlan(cam);
+        plan.Build(root);
+        Check(plan.Count() == 3, "plan-visible-count");
+        Check(plan.Considered() == 4, "plan-considered-count");
+        Check(plan.Culled() == 1, "plan-culled-count");
+
+        // 排序：同网格相邻（网格号小的在前）。
+        bool grouped = true;
+        int firstMesh = 0;
+        RenderItem i0 = plan.ItemAt(0);
+        if (i0 != null) { firstMesh = i0.MeshKey; }
+        for (int i = 1; i < plan.Count(); i = i + 1) {
+            RenderItem it = plan.ItemAt(i);
+            if (it == null) { grouped = false; }
+        }
+        Check(firstMesh == 1 && grouped, "plan-order-by-mesh");
+
+        // 复用：再建一次，项数不变（对象池不丢不重）。
+        plan.Build(root);
+        Check(plan.Count() == 3, "plan-rebuild-count");
+
+        // 确定性：同一场景两次构建结果一致。
+        RenderPlan p1 = new RenderPlan(MakeCamera());
+        RenderPlan p2 = new RenderPlan(MakeCamera());
+        p1.Build(root);
+        p2.Build(root);
+        bool same = p1.Count() == p2.Count();
+        for (int i = 0; same && i < p1.Count(); i = i + 1) {
+            RenderItem a = p1.ItemAt(i);
+            RenderItem b = p2.ItemAt(i);
+            if (a == null || b == null) { same = false; break; }
+            if (a.MeshKey != b.MeshKey || a.Tint != b.Tint) { same = false; }
+            for (int k = 0; k < 16; k = k + 1) {
+                if (!Near(a.Model.m[k], b.Model.m[k])) { same = false; }
+            }
+        }
+        Check(same, "plan-determinism");
+
+        // 透明层：由远及近。
+        SceneNode troot = new SceneNode("troot");
+        SceneNode t1 = Node("near", 5, 0.0f, 0.0f, 1.0f);
+        t1.Layer = 1;
+        SceneNode t2 = Node("far", 6, 0.0f, 0.0f, -2.0f);
+        t2.Layer = 1;
+        troot.AddChild(t1);
+        troot.AddChild(t2);
+        RenderPlan tplan = new RenderPlan(MakeCamera());
+        tplan.Build(troot);
+        bool farFirst = false;
+        RenderItem ti0 = tplan.ItemAt(0);
+        if (ti0 != null) { farFirst = ti0.NodeName == "far"; }
+        Check(tplan.Count() == 2 && farFirst, "plan-transparent-far-to-near");
+
+        // 着色影响 tint：同一材质，有光与只有环境光结果不同。
+        SceneNode sroot = new SceneNode("sroot");
+        sroot.AddChild(Node("lit", 9, 0.0f, 0.0f, 0.0f));
+        RenderPlan sp = new RenderPlan(MakeCamera());
+        sp.AmbientRed = 0.0f;
+        sp.AmbientGreen = 0.0f;
+        sp.AmbientBlue = 0.0f;
+        sp.Build(sroot);
+        int darkTint = 0;
+        RenderItem si = sp.ItemAt(0);
+        if (si != null) { darkTint = si.Tint; }
+        sp.Lights.Add(Light.DirectionalLight(1.0f, 1.0f, 1.0f, 1.0f,
+                                            new Vector3(0.0f, -1.0f, 0.0f)));
+        sp.Build(sroot);
+        int litTint = 0;
+        RenderItem si2 = sp.ItemAt(0);
+        if (si2 != null) { litTint = si2.Tint; }
+        Check(darkTint != litTint, "plan-tint-follows-lighting");
+
+        // 隐藏节点不进计划。
+        SceneNode hroot = new SceneNode("hroot");
+        SceneNode hn = Node("hidden", 4, 0.0f, 0.0f, 0.0f);
+        hn.Visible = false;
+        hroot.AddChild(hn);
+        RenderPlan hp = new RenderPlan(MakeCamera());
+        hp.Build(hroot);
+        Check(hp.Count() == 0 && hp.Considered() == 0, "plan-hidden-skipped");
+    }
+
+    // ------------------------------------------------------------ 后处理
+
+    static void Post() {
+        PostProcess post = new PostProcess();
+        float r; float g; float b;
+        post.Apply(0.5f, 0.5f, 0.5f, 0.0f, out r, out g, out b);
+        Check(Near(r, 0.5f), "post-identity");
+
+        post.Exposure = 2.0f;
+        post.Apply(0.25f, 0.25f, 0.25f, 0.0f, out r, out g, out b);
+        Check(Near(r, 0.5f), "post-exposure");
+
+        post.Exposure = 1.0f;
+        post.Tonemap = TonemapKind.Reinhard;
+        post.Apply(2.0f, 0.0f, 0.0f, 0.0f, out r, out g, out b);
+        Check(Near(r, 2.0f / 3.0f), "post-reinhard");
+
+        post.Tonemap = TonemapKind.None;
+        post.FogRed = 1.0f;
+        post.FogGreen = 1.0f;
+        post.FogBlue = 1.0f;
+        post.FogDensity = 1.0f;
+        post.Apply(0.0f, 0.0f, 0.0f, 0.0f, out r, out g, out b);
+        Check(Near(r, 0.0f), "post-fog-near-untouched");
+        post.Apply(0.0f, 0.0f, 0.0f, 1000.0f, out r, out g, out b);
+        Check(r > 0.99f, "post-fog-far-saturates");
+
+        post.FogDensity = 0.0f;
+        post.Apply(4.0f, -1.0f, 0.5f, 0.0f, out r, out g, out b);
+        Check(Near(r, 1.0f) && Near(g, 0.0f), "post-clamp");
+    }
+
+    // ------------------------------------------------------------ 绘制层
+
+    static void Renderer() {
+        Renderer3D r = new Renderer3D(16);
+        RenderPlan plan = new RenderPlan(MakeCamera());
+        Check(r.Draw(null, plan) == 0, "renderer-null-canvas");
+        Check(r.Draw(null, null) == 0, "renderer-null-plan");
+        r.Dispose();
+    }
+
+    static void Main() {
+        Camera();
+        Transform();
+        FrustumCulling();
+        Lighting();
+        Plan();
+        Post();
+        Renderer();
+        if (bad == 0) { Console.WriteLine("game-render3d-done"); }
+    }
+}

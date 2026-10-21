@@ -1,0 +1,76 @@
+using System;
+using System.Numerics;
+using Gui;
+
+namespace Game.Render3D;
+
+// 视锥：六个平面，用来剔除视锥外的物体。
+//
+// 平面存放在一个 float[24] 里，每个平面 4 个 float：
+// (nx, ny, nz, d)，平面内满足 dot(n, p) + d >= 0，法线已归一化。
+// 顺序：0 左 1 右 2 下 3 上 4 近 5 远。
+//
+// **为什么不放结构体数组**：生态里没有结构体数组的先例（全是
+// float[] / int[] / string[]），用 float[24] 少一个语言层面的赌注。
+public class Frustum {
+    // 六个平面，每个 4 个 float：(nx, ny, nz, d)。
+    public float[] Planes;
+
+    public Frustum() {
+        this.Planes = new float[24];
+    }
+
+    // 从观察-投影矩阵提取视锥。
+    //
+    // 行主序下 row i = m[i*4 .. i*4+3]。近平面取 row2、远平面取
+    // row3 - row2——这是 D3D 风格（深度 0..1）投影的写法，与
+    // Gui.Mat4.Perspective / Ortho 一致；OpenGL 风格（深度 -1..1）
+    // 的近平面要改成 row2 + row3。
+    public static Frustum FromViewProjection(Mat4 vp) {
+        Frustum f = new Frustum();
+        float[] m = vp.m;
+        // 左 = row3 + row0，右 = row3 - row0
+        f.SetPlane(0, m[12] + m[0], m[13] + m[1], m[14] + m[2], m[15] + m[3]);
+        f.SetPlane(1, m[12] - m[0], m[13] - m[1], m[14] - m[2], m[15] - m[3]);
+        // 下 = row3 + row1，上 = row3 - row1
+        f.SetPlane(2, m[12] + m[4], m[13] + m[5], m[14] + m[6], m[15] + m[7]);
+        f.SetPlane(3, m[12] - m[4], m[13] - m[5], m[14] - m[6], m[15] - m[7]);
+        // 近 = row2，远 = row3 - row2
+        f.SetPlane(4, m[8], m[9], m[10], m[11]);
+        f.SetPlane(5, m[12] - m[8], m[13] - m[9], m[14] - m[10], m[15] - m[11]);
+        return f;
+    }
+
+    // 写入并归一化一个平面。
+    void SetPlane(int index, float x, float y, float z, float w) {
+        float len = (float)Math.Sqrt((double)(x * x + y * y + z * z));
+        if (len < 1e-8f) {
+            // 退化平面（法线为零）：给一个恒过的平面，别把整个视锥判死。
+            x = 0.0f; y = 0.0f; z = 1.0f; w = 0.0f; len = 1.0f;
+        }
+        float inv = 1.0f / len;
+        int o = index * 4;
+        this.Planes[o] = x * inv;
+        this.Planes[o + 1] = y * inv;
+        this.Planes[o + 2] = z * inv;
+        this.Planes[o + 3] = w * inv;
+    }
+
+    // 球是否完全在视锥内（保守剔除：球心在内且半径不越界）。
+    public bool ContainsSphere(Vector3 center, float radius) {
+        for (int i = 0; i < 6; i = i + 1) {
+            int o = i * 4;
+            float d = this.Planes[o] * center.X
+                    + this.Planes[o + 1] * center.Y
+                    + this.Planes[o + 2] * center.Z
+                    + this.Planes[o + 3];
+            if (d < -radius) { return false; }
+        }
+        return true;
+    }
+
+    // 点是否在视锥内。
+    public bool ContainsPoint(Vector3 point) {
+        return this.ContainsSphere(point, 0.0f);
+    }
+}

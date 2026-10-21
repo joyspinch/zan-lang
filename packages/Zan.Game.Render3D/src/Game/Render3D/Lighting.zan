@@ -1,0 +1,138 @@
+using System;
+using System.Collections.Generic;
+using System.Numerics;
+
+namespace Game.Render3D;
+
+// CPU 光照：材质 + 多光源 → 线性 RGB。
+//
+// 模型是"半兰伯特漫反射 + Blinn-Phong 高光"：
+//   漫反射 lam = clamp(dot(n, l) * 0.5 + 0.5, 0, 1)
+//     —— 半兰伯特让背光面仍有一点环境亮度，不像纯 Lambert 那样死黑。
+//   高光   用 n·h 的 shininess 次幂（Blinn-Phong），shininess 由粗糙度
+//     推出；金属度同时压低漫反射、提高高光。
+//
+// **为什么在 CPU 上算**：当前 GPU 后端（src/runtime/zan_game.c）的 3D
+// 片元着色器把键光方向写死在 GLSL 里，没有材质与光源 uniform——想让它
+// 支持多光源/材质就得改原生侧（已记 TASKS）。在原生侧改好之前，CPU 侧
+// 算出的着色结果作为每实例 tint 传给 GPU，画面依然受材质与光照影响。
+public class Lighting {
+    // 计算一个点的着色。输出用 out 参数——热路径上不分配临时数组。
+    public static void Shade(Material mat, Vector3 worldPos, Vector3 normal,
+                             List<Light> lights, Vector3 cameraPos,
+                             float ambientRed, float ambientGreen, float ambientBlue,
+                             out float outRed, out float outGreen, out float outBlue) {
+        outRed = 0.0f;
+        outGreen = 0.0f;
+        outBlue = 0.0f;
+        if (mat == null) { return; }
+
+        Vector3 n = Vector3.Normalize(normal);
+        Vector3 view = Vector3.Normalize(Vector3.Subtract(cameraPos, worldPos));
+        float metallic = Clamp01(mat.Metallic);
+        float shininess = Shininess(mat.Roughness);
+
+        float diffRed = 0.0f;
+        float diffGreen = 0.0f;
+        float diffBlue = 0.0f;
+        float specRed = 0.0f;
+        float specGreen = 0.0f;
+        float specBlue = 0.0f;
+
+        if (lights != null) {
+            for (int i = 0; i < lights.Count; i = i + 1) {
+                Light lt = lights[i];
+                if (lt == null || !lt.Enabled) { continue; }
+
+                Vector3 toLight;
+                float atten = 1.0f;
+                if (lt.Kind == LightKind.Directional) {
+                    // Direction 是光线传播方向，入射方向取反。
+                    toLight = Vector3.Negate(lt.Direction);
+                } else {
+                    Vector3 delta = Vector3.Subtract(lt.Position, worldPos);
+                    toLight = Vector3.Normalize(delta);
+                    float dist = delta.Length();
+                    if (lt.Range > 0.0f) {
+                        float k = 1.0f - dist / lt.Range;
+                        if (k <= 0.0f) { continue; }
+                        atten = k * k;
+                    }
+                    if (lt.Kind == LightKind.Spot) {
+                        float cosOuter = (float)Math.Cos((double)lt.OuterAngle);
+                        float cosInner = (float)Math.Cos((double)lt.InnerAngle);
+                        // 锥轴比较用"从光源指向表面"的方向。
+                        float cd = Vector3.Dot(Vector3.Negate(toLight), lt.Direction);
+                        float cone = 0.0f;
+                        if (cosInner > cosOuter) {
+                            cone = (cd - cosOuter) / (cosInner - cosOuter);
+                        } else if (cd >= cosOuter) {
+                            cone = 1.0f;
+                        }
+                        // 锥因子是衰减（0..1），不能因为落在内锥里就超过 1。
+                        if (cone > 1.0f) { cone = 1.0f; }
+                        if (cone <= 0.0f) { continue; }
+                        atten = atten * cone;
+                    }
+                }
+
+                Vector3 l = Vector3.Normalize(toLight);
+                float lam = Vector3.Dot(n, l) * 0.5f + 0.5f;
+                lam = Clamp01(lam);
+                float energy = lt.Intensity * atten;
+                float kd = (1.0f - metallic) * lam;
+                diffRed = diffRed + lt.Red * energy * kd;
+                diffGreen = diffGreen + lt.Green * energy * kd;
+                diffBlue = diffBlue + lt.Blue * energy * kd;
+
+                if (metallic > 0.0f) {
+                    Vector3 h = Vector3.Normalize(Vector3.Add(l, view));
+                    float nh = Vector3.Dot(n, h);
+                    if (nh > 0.0f) {
+                        float sp = (float)Math.Pow((double)nh, (double)shininess)
+                                 * metallic * energy;
+                        specRed = specRed + lt.Red * sp;
+                        specGreen = specGreen + lt.Green * sp;
+                        specBlue = specBlue + lt.Blue * sp;
+                    }
+                }
+            }
+        }
+
+        outRed = mat.Red * (ambientRed + diffRed) + specRed + mat.EmissiveRed;
+        outGreen = mat.Green * (ambientGreen + diffGreen) + specGreen + mat.EmissiveGreen;
+        outBlue = mat.Blue * (ambientBlue + diffBlue) + specBlue + mat.EmissiveBlue;
+    }
+
+    // 线性 0..1 → 8 位通道值。
+    public static int ToByte(float value) {
+        if (value <= 0.0f) { return 0; }
+        if (value >= 1.0f) { return 255; }
+        return (int)(value * 255.0f + 0.5f);
+    }
+
+    // 打包成 0xAARRGGBB（与 Game.Kit.CDraw.Argb 的位布局一致）。
+    public static int PackArgb(float red, float green, float blue, float alpha) {
+        int a = Lighting.ToByte(alpha);
+        int r = Lighting.ToByte(red);
+        int g = Lighting.ToByte(green);
+        int b = Lighting.ToByte(blue);
+        return (a << 24) | (r << 16) | (g << 8) | b;
+    }
+
+    // 粗糙度 → Blinn-Phong 指数（越光滑指数越大）。
+    public static float Shininess(float roughness) {
+        float r = Clamp01(roughness);
+        if (r < 0.05f) { r = 0.05f; }
+        float s = 2.0f / (r * r * r * r) - 2.0f;
+        if (s < 1.0f) { return 1.0f; }
+        if (s > 512.0f) { return 512.0f; }
+        return s;
+    }
+
+    static float Clamp01(float value) {
+        if (value < 0.0f) { return 0.0f; }
+        if (value > 1.0f) { return 1.0f; }
+        return value;
+    }
+}

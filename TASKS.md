@@ -1891,3 +1891,43 @@
   空间的类型——`System.Text.Json` 那两处大概率是想用 `System.Json`）。
 - 关联：`Zan.Game.Debug`（`docs/ECOSYSTEM_ROADMAP.md` §1.29）。
   `packages/Zan.Gui/**` 在并发会话的在途区域，本轮未动。
+
+### [ ] A489 GPU 3D 片元着色器把光照写死成固定键光——没有材质与光源 uniform 通路
+
+- 现象：`src/runtime/zan_game.c` 的 3D 片元着色器（四份：plain / color /
+  inst / inst-color）里键光方向是**写死的常量**：
+  `float lam = clamp(dot(normalize(v_normal), normalize(vec3(0.4, 0.8, 0.6))) * 0.5 + 0.5, 0.0, 1.0);`
+  `float shade = 0.55 + 0.45 * lam;`
+  再 `frag = vec4(tex.rgb * uColor.rgb * shade, tex.a * uColor.a);`。
+  而 `zan_game_draw3d(surface_id, mesh_id, mvp, color, texture)`（同文件 589 行）
+  的参数里**没有任何材质 / 光源 / uniform 槽位**。
+- 影响：GPU 档的光照**不可配置**——场景里放几盏灯、材质金属度多少，画面都
+  一样。`Zan.Game.Render3D` 只能在 CPU 侧算一遍着色当 tint 传进去，于是画面
+  是"CPU 着色 × 固定键光"两套光照叠加。
+- 方向：给 3D 管线补 uniform 通路（材质槽 + 有限盏灯的方向/位置/颜色/强度）。
+  注意**实例化批次路径每实例只带 20 个 float**（mvp 16 + tint 4），光源只能
+  走 uniform 数组或每批次一次的提交，塞不进实例属性。
+- 关联：`Zan.Game.Render3D`（`docs/ECOSYSTEM_ROADMAP.md` §1.30）。
+  `src/runtime/**` 在并发会话的在途区域，本轮未动。
+
+### [ ] A490 3D 实例化批次依赖 GL 3.3 / GLES 3.1 的 core 特性——移动端可用性未实测
+
+- 现象：3D 批次提交（`zan_game_draw3d_batch`）用 `gl->VertexAttribDivisor`
+  与 `gl->DrawElementsInstanced`（`src/runtime/zan_game.c` 719 / 724 / 768 行）。
+  这两个是 **GL 3.3 core / GLES 3.1 core** 的特性；GLES 3.0（同文件 168 行的
+  `ZAN_GAME_GLSL_HEAD_GLES` 用的是 `#version 300 es`）只有 ANGLE 扩展
+  `ANGLE_instanced_arrays` 才有等价物。单发路径（`zan_game_draw3d` →
+  `glDrawElements`，同文件 634 行）**没有**这个限制。
+- 影响：`Zan.Gui` 的 EGL/GLES 上下文路径是有的（`src/runtime/gui_gl_context.c`
+  的 `zan_egl_ctx_t`），移动端**单发 3D** 可用；但 `Gui.MeshBatch` 的
+  **实例化批次**在 GLES 3.0 设备上没有等价实现——而 `Zan.Game.Render3D` 的
+  绘制层走的正是批次路径。
+- 未实测：路线图 §3 表里"Android/OHOS 是 stub"这句到底是旧结论还是现状，
+  本机没有设备/模拟器，**无法验证**。`SetRenderBackend(1)` 返回 0 的真实
+  原因是"这台机器没有可用的 GL 上下文（远程桌面 / 虚拟机 / CI）"，见
+  `packages/Zan.Gui/src/Gui/Core/App.zan` 的 `SetRenderBackend` 注释——
+  不能据此判定移动端不可用。
+- 方向：Android / OHOS 真机实测（记 GLES 版本），再决定是补
+  `ANGLE_instanced_arrays` 扩展路径，还是把移动端批次降级成逐实例
+  `DrawMesh3D`。
+- 关联：`Zan.Game.Render3D`（`docs/ECOSYSTEM_ROADMAP.md` §1.30）。

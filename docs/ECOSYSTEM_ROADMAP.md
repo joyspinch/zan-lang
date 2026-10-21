@@ -1692,6 +1692,66 @@ conformance `game_debug`（44 项断言）：实体行格式化 · 过滤（id �
 的 Zan Gui 上没有对应物——能做的是"面板 + 行"。所以本包给的是可挂载的面板
 与可断言的行，而不是自绘的即时模式窗口。
 
+### 1.30 3D 渲染管线：`Zan.Game.Render3D`
+
+§3 表里最后一个没落地的游戏包。渲染这件事生态里一直只有"薄"的一层：
+`Gui.Mesh3D` / `Gui.Mat4` / `Canvas.DrawMesh3D` 给的是**能画一个网格**的
+能力，相机、场景组织、材质、光照、剔除、后处理全没有——每个 3D 项目都得
+自己重写一遍（`examples/gui_3d_demo` 里那份手写相机就是活例子）。本包把
+这层补上：`packages/Zan.Game.Render3D`（`Game.Render3D`，复用 `Zan.Gui`
+的矩阵与批次、`Zan.Game.Animation` 的变换原语）。
+
+**八条硬取舍**：
+
+1. **先算后画**。渲染决策全部在 `RenderPlan` 里算完——遍历场景树、算世界
+   矩阵、视锥剔除、CPU 光照、排序，最后交出一份绘制项列表；`Renderer3D`
+   只把列表装进批次提交。为什么：**最该被测的恰恰是"谁被剔除了、谁排在
+   前面、颜色算对没有"**——这些不需要像素，可以在无头环境里逐条断言；反过来
+   去比像素，断言既脆又测不到逻辑。
+2. **矩阵只用一套**。生态里 4x4 矩阵只有两个：`Gui.Mat4`（列向量
+   `v' = M*v`）与 `System.Numerics.Matrix4x4`（行向量 `v' = v*M`）。渲染
+   管线吃的是列向量那套，本包一律用 `Gui.Mat4`，不造第三套——两套约定
+   之间的转换地雷已经够踩了。
+3. **光照在 CPU 上算**。当前 GPU 后端（`src/runtime/zan_game.c`）的 3D
+   片元着色器把键光方向写死在 GLSL 里，没有材质与光源 uniform。本包在 CPU
+   上算好着色、作为每实例 tint 传给 GPU，画面依然受材质与光照影响；原生侧
+   接上多光源后可以直接切换。
+4. **逐实例着色，不是逐顶点**。绘制项只有一个 tint，用节点的"代表法线"
+   着色；真逐顶点光照要改 GPU 管线与顶点属性格式，是原生侧的事。
+5. **排序是确定的**。不透明项按 (网格, 纹理分组) 升序——同组相邻，批次能
+   连成一段实例化绘制；透明项按视深从远到近；同键保持原顺序。
+6. **帧内零分配**。绘制项、矩阵、排序缓冲全部复用；排序用包内自带的归并
+   排序（`List<T>` 没有 `Sort`，`Zan.Linq` 的排序每次调用都新分配一组
+   数组，放每帧热路径上不合适）。
+7. **不反射**。Zan 没有反射，网格与材质由调用方显式喂进来——包负责组织
+   与计算，不负责知道引擎里有什么。
+8. **复用现成的 3D 管线，不自造**：`Gui.Mesh3D` 造网格、`Gui.MeshBatch`
+   装批、`Canvas.DrawMesh3D` 提交、`Game.Animation.Transform3D` 存变换。
+
+conformance `game_render3d`（53 项断言，纯逻辑层）：相机（默认参数 / 视图阵 /
+投影阵 / 视口宽高比 / 轨道机位 / 投影 w 与 NDC 中心）· 变换与场景树（模型阵
+的平移、列缩放、绕 y 旋转、父子世界变换、原地矩阵乘与 `Mat4.Mul` 一致）·
+视锥剔除（视锥内 / 视锥外 / 相机背后 / 远近裁剪面）· 光照（平行光朝向 /
+点光衰减 / 聚光锥角 / 自发光 / 金属度与高光 / ARGB 打包）· 渲染计划（可见
+项数 / 剔除计数 / 按网格排序 / 透明由远及近 / 着色 tint / 隐藏节点跳过 /
+复用与确定性）· 后处理（曝光 / 色调映射 / 雾 / 钳位）· 绘制层空输入。
+
+**已知边界**：**移动端 3D 未实测**——GPU 后端的 EGL/GLES 上下文路径是有的
+（`src/runtime/gui_gl_context.c`），单发 3D 没有 API 障碍，但**实例化批次**
+（`Gui.MeshBatch`）依赖 `DrawElementsInstanced` / `VertexAttribDivisor`
+（GL 3.3 / GLES 3.1 core 特性，GLES 3.0 只有 ANGLE 扩展），本机无设备无法
+验证，见 `TASKS.md` A490 · **GPU 后端自带一层固定键光**，画面是"CPU 着色 ×
+固定键光" · **后处理只有曝光 / 色调映射 / 雾真正参与计算**（泛光与暗角要整帧
+缓冲与后处理 pass，`PostProcess` 里那两个字段是参数契约）· **包围球是保守
+代理**（用节点半径乘最大缩放）· **不做材质资源加载与纹理缓存**（那是
+`Zan.Game.Assets` 的活）。
+
+**为什么不是 §3 表里写的"8–12 周"**：那 8–12 周是"补齐跨平台 GPU 后端 +
+写一套完整 shader 体系"的估算。本包交付的是**可验证的那一半**——渲染决策
+链（相机 / 场景 / 剔除 / 光照 / 排序 / 提交）全部落在纯逻辑层，能无头断言；
+剩下的一半（原生侧多光源 uniform、后处理 pass、Android/OHOS 的 GL 后端）
+依赖硬件路径，本机没有可对拍的环境，单开条目跟进，不混进纯逻辑交付里。
+
 ---
 
 ---
@@ -1745,7 +1805,7 @@ conformance `game_debug`（44 项断言）：实体行格式化 · 过滤（id �
 | `Zan.Game.Netcode` | Mirror / LiteNetLib | 6,366 / 3,632 | ✅ 已落地 `packages/Zan.Game.Netcode`（`Game.Netcode`：确定性校验和 + 快照环形缓冲 + 逐帧输入预测 + 回滚重放会话（含分叉检测）+ 服务器侧延迟补偿，见 §1.13）；已有 lockstep + 回放 → 二者并列（lockstep 适合 RTS 同频，rollback 适合格斗/射击跟手） | — |
 | `Zan.Game.Particles` | MonoGame.Extended | 榜外 | ✅ 已落地 `packages/Zan.Game.Particles`（`Game.Particles`：对象池 + 速率/突发发射器 + 曲线驱动 + 确定性噪声湍流，见 §1.8） | — |
 | `Zan.Game.Animation` | Unity Animation Rigging | 榜外 | ✅ 已落地 `packages/Zan.Game.Animation`（`Game.Animation`：TRS 变换 + 骨骼层级 + 线性混合蒙皮 + 关键帧片段 + 播放器 + 状态机交叉淡化 + 两骨解析 IK，见 §1.16） | — |
-| `Zan.Game.Render3D` | Silk.NET / OpenTK | 5,242 / 3,543 | `Mesh3D` 很薄；**GPU 后端只接 WGL/GLX，Android/OHOS 是 stub**（`SetRenderBackend(1)` 返回 0 是预期行为）→ 相机/材质/光照/shader/后处理 + 补齐跨平台 GPU 后端 | 8–12 周 |
+| `Zan.Game.Render3D` | Silk.NET / OpenTK | 5,242 / 3,543 | ✅ 已落地 `packages/Zan.Game.Render3D`（`Game.Render3D`：3D 相机 + 场景树 + 材质/多光源 CPU 光照 + 视锥剔除 + 绘制编排与排序 + 后处理参数；先算后画，纯逻辑层可无头断言，见 §1.30）；**跨平台 GPU 后端（Android/OHOS 的 GL stub）仍未补齐，原生侧另排** | — |
 | `Zan.Game.Procgen` | WaveFunctionCollapse / MarkovJunior | 25,416 / 8,443 | ✅ 已落地 `packages/Zan.Game.Procgen`（`Game.Procgen`：WFC 波函数坍缩 + 有向邻接规则 + 关卡拼接 + 房间走廊 MST 布局，见 §1.11） | — |
 | `Zan.Game.Debug` | ImGui.NET | 榜外 | ✅ 已落地 `packages/Zan.Game.Debug`（`Game.Debug`：数据与绘制分层的帧剖析覆盖层 + 实体检查器；不反射，字段由调用方喂；见 §1.29）；**不做内存精灵缓存可视化** | — |
 | `Zan.Game.Common` | — | — | ✅ 已落地 `packages/Zan.Game.Common`（`Game.Common`：版本化存档 + 飘字 + 血条残影 + 冷却条充能 + 背包堆叠 + 小地图投影，见 §1.12） | — |
@@ -1774,9 +1834,9 @@ conformance `game_debug`（44 项断言）：实体行格式化 · 过滤（id �
 **第 1 批（生态骨架）**：`Zan.Logging` ✅ → `Zan.Math` ✅ → `Zan.Validation` ✅ → `Zan.Cli` ✅
 **第 2 批（游戏纵深）**：`Zan.Game.Ecs` ✅ → `Zan.Game.Physics2D` ✅ → `Zan.Game.Pathfinding` ✅ → `Zan.Game.Particles` ✅
 **第 3 批（内容生产）**：`Zan.Game.Assets` ✅ → `Zan.Game.Audio` ✅ → `Zan.Game.Procgen` ✅ → `Zan.Game.Common` ✅
-**第 4 批（重型）**：`Zan.Game.Netcode` ✅ → `Zan.Game.Animation` ✅ → `Zan.Game.Render3D`（含跨平台 GPU 后端）→ `Zan.Pdf`
+**第 4 批（重型）**：`Zan.Game.Netcode` ✅ → `Zan.Game.Animation` ✅ → `Zan.Game.Render3D` ✅（纯逻辑层，见 §1.30；跨平台 GPU 后端原生侧另排）→ `Zan.Pdf`
 **第 5 批（生态纵深）**：`Zan.Test.Mocks` ✅ → `Zan.Test.Fixtures` ✅ → `Zan.Messaging` ✅ → `Zan.Mapping` ✅ → `Zan.Jobs` ✅ → `Zan.Bench` ✅ → `Zan.Barcode` ✅
-**第 6 批（游戏工具链）**：`Zan.Game.Profiler` ✅ → `Zan.Game.Physics3D` ✅ → `Zan.Game.Debug` ✅（帧剖析覆盖层 / 实体检查器；数据与绘制分层，见 §1.29）→ `Zan.Game.Render3D`（含跨平台 GPU 后端，8–12 周）
+**第 6 批（游戏工具链）**：`Zan.Game.Profiler` ✅ → `Zan.Game.Physics3D` ✅ → `Zan.Game.Debug` ✅（帧剖析覆盖层 / 实体检查器；数据与绘制分层，见 §1.29）→ `Zan.Game.Render3D` ✅（先算后画：相机 / 场景 / 剔除 / 光照 / 排序 / 提交，纯逻辑层，见 §1.30；跨平台 GPU 后端原生侧另排）
 **第 7 批（协议层）**：`Zan.Ssh` ✅（传输层 + 认证 + exec 通道；SFTP 与更多算法另算，见 §1.28）
 
 ## 7. 已知缺陷：包级 static 持有 rc 集合在退出时不释放

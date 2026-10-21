@@ -1,0 +1,257 @@
+using System;
+using System.Collections.Generic;
+using System.Numerics;
+using Gui;
+using Game.Animation;
+
+namespace Game.Render3D;
+
+// 渲染计划：一帧要画什么、按什么顺序画。
+//
+// **这一层是纯逻辑**：遍历场景树 → 算世界矩阵 → 视锥剔除 → 光照着色
+// → 排序，产出绘制项列表。它不碰画布、不碰窗口、不碰绘制接口，所以
+// 整条渲染决策链可以无头断言（见 tests/conformance/game_render3d.zan）。
+// 绘制层（Renderer3D）只负责把列表塞进批次。
+//
+// **帧内零分配**：绘制项、矩阵、排序缓冲都复用——Build() 把上一帧的
+// 绘制项回收进池子，矩阵按递归深度预分配，排序用自带的归并排序
+// （List<T> 没有 Sort，而 Zan.Linq 的排序每次调用都新分配一组数组，
+// 放在每帧的热路径上不合适）。
+public class RenderPlan {
+    // 相机（计划用它算观察-投影矩阵与剔除用的视锥）。
+    public Camera3D Camera;
+    // 光源列表。
+    public List<Light> Lights;
+    // 环境光（线性 0..1）。
+    public float AmbientRed;
+    public float AmbientGreen;
+    public float AmbientBlue;
+    // 后处理参数。
+    public PostProcess Post;
+
+    List<RenderItem> items;
+    List<RenderItem> ordered;
+    List<RenderItem> pool;
+    List<Mat4> matrices;
+    Dict<string, int> texGroups;
+    Mat4 identity;
+    int[] idxA;
+    int[] idxB;
+    int poolCursor;
+    int nextTexGroup;
+    int considered;
+    int culled;
+
+    public RenderPlan(Camera3D camera) {
+        this.Camera = camera;
+        this.Lights = new List<Light>();
+        this.AmbientRed = 0.12f;
+        this.AmbientGreen = 0.12f;
+        this.AmbientBlue = 0.14f;
+        this.Post = new PostProcess();
+        this.items = new List<RenderItem>();
+        this.ordered = new List<RenderItem>();
+        this.pool = new List<RenderItem>();
+        this.matrices = new List<Mat4>();
+        this.texGroups = new Dict<string, int>();
+        this.identity = Mat4.Identity();
+        this.poolCursor = 0;
+        this.nextTexGroup = 0;
+        this.considered = 0;
+        this.culled = 0;
+    }
+
+    // 重建一帧的计划。root 为空或没有相机时清空计划。
+    public void Build(SceneNode root) {
+        // 回收上一帧的绘制项（复用对象，帧内不分配）。
+        for (int i = 0; i < this.items.Count; i = i + 1) {
+            this.pool.Add(this.items[i]);
+        }
+        this.items.Clear();
+        this.ordered.Clear();
+        this.poolCursor = 0;
+        this.texGroups.Clear();
+        this.nextTexGroup = 0;
+        this.considered = 0;
+        this.culled = 0;
+        if (root == null || this.Camera == null) { return; }
+
+        Mat4 vp = this.Camera.ViewProjectionMatrix();
+        Frustum frustum = Frustum.FromViewProjection(vp);
+        Vector3 camPos = this.Camera.Position;
+        Vector3 fwd = this.Camera.Forward();
+        this.Collect(root, this.identity, Quaternion.Identity,
+                    frustum, camPos, fwd, 0);
+        this.SortItems();
+    }
+
+    // 遍历场景树。parentWorld / parentRot 是父级的世界变换与旋转。
+    void Collect(SceneNode node, Mat4 parentWorld, Quaternion parentRot,
+                 Frustum frustum, Vector3 camPos, Vector3 fwd, int depth) {
+        if (node == null || !node.Visible) { return; }
+        Mat4 local = this.MatrixAt(depth * 2);
+        Mat4 world = this.MatrixAt(depth * 2 + 1);
+        RenderTransform.WriteModelMatrix(local, node.Local);
+        RenderTransform.MulInto(world, parentWorld, local);
+        Quaternion worldRot = Quaternion.Multiply(parentRot, node.Local.Rotation);
+
+        if (node.MeshKey > 0) {
+            this.considered = this.considered + 1;
+            Vector3 pos = new Vector3(world.m[3], world.m[7], world.m[11]);
+            float radius = node.BoundsRadius * MaxAbsScale(node.Local.Scale);
+            if (frustum.ContainsSphere(pos, radius)) {
+                Material mat = node.Material == null ? new Material() : node.Material;
+                RenderItem it = this.TakeItem();
+                it.MeshKey = node.MeshKey;
+                it.TextureKey = mat.TextureKey == null ? "" : mat.TextureKey;
+                it.TexGroup = this.TextureGroup(it.TextureKey);
+                RenderTransform.Copy(it.Model, world);
+                it.Layer = node.Layer;
+                it.NodeName = node.Name;
+                float viewDepth = Vector3.Dot(Vector3.Subtract(pos, camPos), fwd);
+                it.Depth = viewDepth;
+                Vector3 normal = Quaternion.Rotate(node.Normal, worldRot);
+                float r;
+                float g;
+                float b;
+                Lighting.Shade(mat, pos, normal, this.Lights, camPos,
+                               this.AmbientRed, this.AmbientGreen, this.AmbientBlue,
+                               out r, out g, out b);
+                float pr = 0.0f;
+                float pg = 0.0f;
+                float pb = 0.0f;
+                if (this.Post != null) {
+                    this.Post.Apply(r, g, b, viewDepth, out pr, out pg, out pb);
+                } else {
+                    pr = r;
+                    pg = g;
+                    pb = b;
+                }
+                it.Tint = Lighting.PackArgb(pr, pg, pb, mat.Alpha);
+                this.items.Add(it);
+            } else {
+                this.culled = this.culled + 1;
+            }
+        }
+
+        int n = node.Children.Count;
+        for (int i = 0; i < n; i = i + 1) {
+            this.Collect(node.Children[i], world, worldRot,
+                         frustum, camPos, fwd, depth + 1);
+        }
+    }
+
+    // 排序：不透明项按 (网格, 纹理分组) 升序——同组相邻，批次能连成
+    // 一段实例化绘制；透明项按视深从远到近。
+    void SortItems() {
+        int n = this.items.Count;
+        this.ordered.Clear();
+        if (n == 0) { return; }
+        if (this.idxA == null || this.idxA.Length < n) {
+            this.idxA = new int[n];
+            this.idxB = new int[n];
+        }
+        int[] a = this.idxA;
+        int[] b = this.idxB;
+        for (int i = 0; i < n; i = i + 1) { a[i] = i; }
+        int width = 1;
+        while (width < n) {
+            int lo = 0;
+            while (lo < n) {
+                int mid = lo + width;
+                if (mid > n) { mid = n; }
+                int hi = lo + width + width;
+                if (hi > n) { hi = n; }
+                int i = lo;
+                int j = mid;
+                int o = lo;
+                while (i < mid && j < hi) {
+                    if (this.Compare(a[i], a[j]) <= 0) {
+                        b[o] = a[i];
+                        i = i + 1;
+                    } else {
+                        b[o] = a[j];
+                        j = j + 1;
+                    }
+                    o = o + 1;
+                }
+                while (i < mid) { b[o] = a[i]; i = i + 1; o = o + 1; }
+                while (j < hi) { b[o] = a[j]; j = j + 1; o = o + 1; }
+                lo = hi;
+            }
+            int[] swap = a;
+            a = b;
+            b = swap;
+            width = width + width;
+        }
+        for (int i = 0; i < n; i = i + 1) { this.ordered.Add(this.items[a[i]]); }
+    }
+
+    // 比较两个绘制项（返回负数表示 a 在前）。
+    int Compare(int indexA, int indexB) {
+        RenderItem a = this.items[indexA];
+        RenderItem b = this.items[indexB];
+        if (a.Layer != b.Layer) { return a.Layer < b.Layer ? -1 : 1; }
+        if (a.Layer == 1) {
+            // 透明：远 → 近。
+            if (a.Depth != b.Depth) { return a.Depth > b.Depth ? -1 : 1; }
+            return 0;
+        }
+        if (a.MeshKey != b.MeshKey) { return a.MeshKey < b.MeshKey ? -1 : 1; }
+        if (a.TexGroup != b.TexGroup) { return a.TexGroup < b.TexGroup ? -1 : 1; }
+        return 0;
+    }
+
+    // 按递归深度取一块复用的矩阵（两个一块：局部阵与世界阵）。
+    Mat4 MatrixAt(int slot) {
+        while (this.matrices.Count <= slot) {
+            this.matrices.Add(new Mat4());
+        }
+        return this.matrices[slot];
+    }
+
+    // 取一个可复用的绘制项。
+    RenderItem TakeItem() {
+        if (this.poolCursor < this.pool.Count) {
+            RenderItem it = this.pool[this.poolCursor];
+            this.poolCursor = this.poolCursor + 1;
+            return it;
+        }
+        return new RenderItem();
+    }
+
+    // 纹理分组号：同一个纹理键共用一个号。
+    int TextureGroup(string key) {
+        int group;
+        if (this.texGroups.TryGetValue(key, out group)) { return group; }
+        group = this.nextTexGroup;
+        this.nextTexGroup = this.nextTexGroup + 1;
+        this.texGroups.Add(key, group);
+        return group;
+    }
+
+    static float MaxAbsScale(Vector3 scale) {
+        float x = scale.X < 0.0f ? -scale.X : scale.X;
+        float y = scale.Y < 0.0f ? -scale.Y : scale.Y;
+        float z = scale.Z < 0.0f ? -scale.Z : scale.Z;
+        float m = x;
+        if (y > m) { m = y; }
+        if (z > m) { m = z; }
+        return m;
+    }
+
+    // 计划里的绘制项数（已排序）。
+    public int Count() { return this.ordered.Count; }
+
+    // 取第 i 个绘制项（越界返回 null）。
+    public RenderItem ItemAt(int index) {
+        if (index < 0 || index >= this.ordered.Count) { return null; }
+        return this.ordered[index];
+    }
+
+    // 本帧考虑过的带网格节点数。
+    public int Considered() { return this.considered; }
+
+    // 本帧被视锥剔除掉的节点数。
+    public int Culled() { return this.culled; }
+}

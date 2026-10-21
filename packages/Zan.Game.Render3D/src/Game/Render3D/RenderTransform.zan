@@ -1,0 +1,62 @@
+using System;
+using System.Numerics;
+using Gui;
+using Game.Animation;
+
+namespace Game.Render3D;
+
+// 变换 → 矩阵的换算，以及矩阵的原地乘法。
+//
+// **为什么要"原地"版本**：Gui.Mat4.Mul 每次都 new 一个 Mat4（外加一个
+// float[16]），一帧几百个节点就是几百次堆分配——渲染热路径最忌讳这个。
+// 这里的 MulInto 把结果写进调用方准备好的矩阵，帧内零分配。
+//
+// **约定**：全部按 Gui.Mat4 的列向量约定（v' = M * v），矩阵按行主序
+// 存储（m[row*4+col]）。
+public class RenderTransform {
+    // 就地写入 T * R * S：先缩放、再旋转、最后平移
+    // （与 Game.Animation.Transform3D 的 p' = R * (S * p) + T 一致）。
+    //
+    // 旋转矩阵来自 stdlib 的 Quaternion.ToMatrix——它存的是行向量矩阵，
+    // 与列向量约定差一个转置，这里就地完成转置。
+    //
+    // **布局提醒**：列向量约定下平移在最后一"列"，行主序存储里就是
+    // m[3] / m[7] / m[11]（与 Mat4.Translate 一致）；m[12..14] 是最后
+    // 一行，写错位置会让整棵场景树停在原点。
+    //
+    // **缩放作用在列上**：M = T * R * S 时 (R*S)[row][col] = R[row][col]
+    // * S[col][col]——缩放的是基向量（第 col 列），不是行。行主序下
+    // 第 col 列是 m[col] / m[4+col] / m[8+col]。
+    public static void WriteModelMatrix(Mat4 dst, Transform3D t) {
+        Quaternion q = Quaternion.Normalize(t.Rotation);
+        Matrix4x4 rm = q.ToMatrix();
+        float sx = t.Scale.X;
+        float sy = t.Scale.Y;
+        float sz = t.Scale.Z;
+        dst.m[0] = rm.M11 * sx; dst.m[1] = rm.M21 * sy; dst.m[2] = rm.M31 * sz; dst.m[3] = t.Position.X;
+        dst.m[4] = rm.M12 * sx; dst.m[5] = rm.M22 * sy; dst.m[6] = rm.M32 * sz; dst.m[7] = t.Position.Y;
+        dst.m[8] = rm.M13 * sx; dst.m[9] = rm.M23 * sy; dst.m[10] = rm.M33 * sz; dst.m[11] = t.Position.Z;
+        dst.m[12] = 0.0f; dst.m[13] = 0.0f; dst.m[14] = 0.0f; dst.m[15] = 1.0f;
+    }
+
+    // 就地矩阵乘：dst = a * b（列向量约定，先施 b 再施 a）。
+    // 与 Gui.Mat4.Mul 的结果逐元素相同，只是不分配新矩阵。
+    public static void MulInto(Mat4 dst, Mat4 a, Mat4 b) {
+        for (int row = 0; row < 4; row = row + 1) {
+            int o = row * 4;
+            float a0 = a.m[o];
+            float a1 = a.m[o + 1];
+            float a2 = a.m[o + 2];
+            float a3 = a.m[o + 3];
+            dst.m[o] = a0 * b.m[0] + a1 * b.m[4] + a2 * b.m[8] + a3 * b.m[12];
+            dst.m[o + 1] = a0 * b.m[1] + a1 * b.m[5] + a2 * b.m[9] + a3 * b.m[13];
+            dst.m[o + 2] = a0 * b.m[2] + a1 * b.m[6] + a2 * b.m[10] + a3 * b.m[14];
+            dst.m[o + 3] = a0 * b.m[3] + a1 * b.m[7] + a2 * b.m[11] + a3 * b.m[15];
+        }
+    }
+
+    // 矩阵拷贝（逐元素，避免共享同一个 float[]）。
+    public static void Copy(Mat4 dst, Mat4 src) {
+        for (int i = 0; i < 16; i = i + 1) { dst.m[i] = src.m[i]; }
+    }
+}

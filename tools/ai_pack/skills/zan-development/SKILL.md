@@ -390,6 +390,32 @@ Without MCP the same index is a file: `knowledge/symbols.json` next to the SDK
   **没有 `ToString` 重载**——`Convert.ToString(5)` 编译不过。数字转文本直接用
   数字自带的 `ToString()`（`5.ToString()`、`v.ToString()`）。浮点要定点格式
   就自己写（固定小数位那种），别指望 `Convert.ToString(double)`。
+* **`Gui.Mat4` 是唯一能直接喂渲染管线的 4x4 矩阵，布局别搞反**（实证，
+  2026-10-30）：`Gui.Mat4` 是**列向量**约定（`v' = M * v`）+ 行主序存储
+  （`m[row*4+col]`）：
+  - **平移在 `m[3] / m[7] / m[11]`**（最后一"列"），**不是** `m[12..14]`
+    （那是最后一行）——写错位置整棵场景树会停在原点；
+  - **缩放作用在列上**（第 col 列 = `m[col] / m[4+col] / m[8+col]`），不是行；
+  - `System.Numerics.Matrix4x4` 走**行向量**约定（`v' = v * M`，平移在
+    `M41..M43`），与 `Gui.Mat4` **差一个转置**；`Quaternion.ToMatrix()` 返回的
+    也是行向量矩阵，喂列向量管线必须先转置；
+  - `Mat4.Perspective` 是 **D3D 风格深度 0..1**（它没调 `Identity()`，
+    `m15 = 0`），所以从 VP 阵提视锥时**近平面取 row2、远平面取 row3 - row2**；
+    照搬 OpenGL 风格（row2 + row3）会把远近平面算错。
+  坑出处：写 3D 渲染包时先把平移写到 `m[12..14]`（场景全停在原点）、又把
+  缩放按行乘（"绕 y 转 90°"的断言挂了）——两次错的都是**布局**不是公式，
+  读公式读不出来，只能靠断言钉住。
+* **编译器会检查可空返回值**（实证，2026-10-30）：可能返回 null 的方法
+  （自己写的取值器，如 `ItemAt(i)`）直接取字段，编译器报 "'X' can return
+  null; accessing 'Y' on its result faults at runtime"——先判空再用。
+* **结构体数组没有先例**（实证，2026-10-30）：生态里 `float[]` / `int[]` /
+  `string[]` / `byte[]` 一堆，`Vector3[]` / `Quaternion[]` 这类**结构体数组
+  一次都没出现过**——要存一组结构体（比如六个视锥平面）就用 `float[]` 摊平，
+  别赌语言支持。
+* **每帧热路径上的排序自己写**（实证，2026-10-30）：`Zan.Linq` 的
+  `OrderBy` / `MergeSort*` 每次调用都新分配一组 `T[]` + 键数组 + 结果 `List`
+  ——放在"每帧重建一次"的渲染计划这类热路径上就是纯 GC 压力。包内自带一份
+  **复用缓冲**的归并排序更合适（`List<T>` 没有 `Sort`，见上面那条）。
 ## 4. Edit
 
 `edit_file(path, old, new)` (MCP) replaces an exact snippet in place — the

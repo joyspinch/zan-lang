@@ -1,0 +1,124 @@
+using System;
+using System.Numerics;
+using Gui;
+
+namespace Game.Render3D;
+
+// 3D 相机：位置 / 目标 / 上方向 + 投影参数，产出视图矩阵与投影矩阵。
+//
+// **矩阵约定**：与 <see cref="Gui.Mat4"/> 完全一致——行主序存储
+// （m[row*4+col]）、列向量（v' = M * v）、右手系（+y 上、相机看向 -z）、
+// 深度 0..1（D3D 风格）。因此 <see cref="ViewProjectionMatrix"/> 的结果
+// 可以直接喂给 Canvas.DrawMesh3D（取列主序上传），不需要任何换基。
+//
+// **为什么复用 Gui.Mat4 而不是自己一套**：生态里只有两套 4x4 矩阵——
+// Gui.Mat4（列向量）与 System.Numerics.Matrix4x4（行向量，v' = v * M）。
+// 两者差一个转置，渲染管线吃的又是列主序上传的列向量阵。自造第三套
+// 等于把"两套约定"的转换地雷再挖一遍——本包一律用列向量那套。
+public class Camera3D {
+    // 相机世界位置。
+    public Vector3 Position;
+    // 注视点。
+    public Vector3 Target;
+    // 上方向（不能与视线平行）。
+    public Vector3 Up;
+    // 垂直视场角（弧度）。
+    public float FieldOfView;
+    // 视口宽高比（宽 / 高）。
+    public float AspectRatio;
+    // 近裁剪面距离（正数）。
+    public float NearPlane;
+    // 远裁剪面距离（正数）。
+    public float FarPlane;
+    // 正交投影开关：开启时用 OrthoHeight（半高）代替 FieldOfView。
+    public bool Orthographic;
+    // 正交投影的半高。
+    public float OrthoHeight;
+
+    public Camera3D() {
+        this.Position = new Vector3(0.0f, 0.0f, 5.0f);
+        this.Target = Vector3.Zero;
+        this.Up = new Vector3(0.0f, 1.0f, 0.0f);
+        this.FieldOfView = 1.0471975512f;   // 60 度
+        this.AspectRatio = 16.0f / 9.0f;
+        this.NearPlane = 0.1f;
+        this.FarPlane = 1000.0f;
+        this.Orthographic = false;
+        this.OrthoHeight = 5.0f;
+    }
+
+    // 按画布像素尺寸设置宽高比。高为 0 或负时保持原值。
+    public void SetViewport(int width, int height) {
+        if (height <= 0 || width <= 0) { return; }
+        this.AspectRatio = (float)width / (float)height;
+    }
+
+    // 视线方向（单位向量，指向 Target）。
+    public Vector3 Forward() {
+        return Vector3.Normalize(Vector3.Subtract(this.Target, this.Position));
+    }
+
+    // 右方向（单位向量，水平于视线）。
+    public Vector3 Right() {
+        return Vector3.Normalize(Vector3.Cross(this.Forward(), this.Up));
+    }
+
+    // 视线矩阵（右手系，相机看向 -z）。
+    public Mat4 ViewMatrix() {
+        Vector3 p = this.Position;
+        Vector3 t = this.Target;
+        Vector3 u = this.Up;
+        return Mat4.LookAt(p.X, p.Y, p.Z, t.X, t.Y, t.Z, u.X, u.Y, u.Z);
+    }
+
+    // 投影矩阵（透视或正交，深度 0..1）。
+    public Mat4 ProjectionMatrix() {
+        if (this.Orthographic) {
+            float halfH = this.OrthoHeight;
+            float halfW = halfH * this.AspectRatio;
+            return Mat4.Ortho(-halfW, halfW, -halfH, halfH,
+                              this.NearPlane, this.FarPlane);
+        }
+        return Mat4.Perspective(this.FieldOfView, this.AspectRatio,
+                                this.NearPlane, this.FarPlane);
+    }
+
+    // 观察-投影矩阵 = P * V。
+    public Mat4 ViewProjectionMatrix() {
+        return this.ProjectionMatrix().Mul(this.ViewMatrix());
+    }
+
+    // 设定机位（同时移动注视点）。
+    public void SetLookAt(Vector3 eye, Vector3 target) {
+        this.Position = eye;
+        this.Target = target;
+    }
+
+    // 轨道机位：绕 Target 摆到 (yaw, pitch) 方向、距离 distance 处。
+    // yaw 绕 +y，pitch 绕 x，俯仰限制在 ±89 度内避免翻转。
+    public void Orbit(float yaw, float pitch, float distance) {
+        if (pitch > 1.5533f) { pitch = 1.5533f; }
+        if (pitch < -1.5533f) { pitch = -1.5533f; }
+        float cp = (float)Math.Cos((double)pitch);
+        float x = (float)Math.Cos((double)yaw) * cp * distance;
+        float y = (float)Math.Sin((double)pitch) * distance;
+        float z = (float)Math.Sin((double)yaw) * cp * distance;
+        this.Position = new Vector3(this.Target.X + x,
+                                    this.Target.Y + y,
+                                    this.Target.Z + z);
+    }
+
+    // 沿视线推拉（相机与注视点一起移动，保持朝向）。
+    public void MoveForward(float delta) {
+        Vector3 f = this.Forward();
+        this.Position = Vector3.Add(this.Position, Vector3.Multiply(f, delta));
+        this.Target = Vector3.Add(this.Target, Vector3.Multiply(f, delta));
+    }
+
+    // 沿右方向平移（相机与注视点一起移动）。
+    public void MoveRight(float delta) {
+        Vector3 r = this.Right();
+        this.Position = Vector3.Add(this.Position, Vector3.Multiply(r, delta));
+        this.Target = Vector3.Add(this.Target, Vector3.Multiply(r, delta));
+    }
+}

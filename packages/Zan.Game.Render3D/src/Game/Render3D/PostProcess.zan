@@ -1,0 +1,78 @@
+using System;
+using System.Numerics;
+
+namespace Game.Render3D;
+
+// 后处理参数。
+//
+// **当前真正参与计算的是曝光、色调映射与雾**——这三项都能按"每个物体
+// 一次"的方式在计划层算完。泛光与暗角是屏幕空间效果，需要整帧缓冲，
+// 当前 GPU 后端没有后处理 pass（TASKS 已登记），所以这两个字段只是
+// 参数契约，暂不参与计算——写在这里是为了将来原生侧接 pass 时接口
+// 不用再改。
+public class PostProcess {
+    // 曝光（乘在颜色上，1 = 不变）。
+    public float Exposure;
+    // 色调映射方式。
+    public TonemapKind Tonemap;
+    // 雾色（线性 0..1）。
+    public float FogRed;
+    public float FogGreen;
+    public float FogBlue;
+    // 雾密度（按视深指数衰减，0 = 无雾）。
+    public float FogDensity;
+    // 暗角强度（屏幕空间，当前不参与计算）。
+    public float VignetteStrength;
+    // 泛光阈值（屏幕空间，当前不参与计算）。
+    public float BloomThreshold;
+    // 泛光强度（屏幕空间，当前不参与计算）。
+    public float BloomIntensity;
+
+    public PostProcess() {
+        this.Exposure = 1.0f;
+        this.Tonemap = TonemapKind.None;
+        this.FogRed = 0.0f;
+        this.FogGreen = 0.0f;
+        this.FogBlue = 0.0f;
+        this.FogDensity = 0.0f;
+        this.VignetteStrength = 0.0f;
+        this.BloomThreshold = 1.0f;
+        this.BloomIntensity = 0.0f;
+    }
+
+    // 应用后处理：曝光 → 雾（线性空间按视深混合）→ 色调映射 → 钳位。
+    // depth 是沿视线方向的正距离（相机背后的物体为负，按 0 处理）。
+    public void Apply(float red, float green, float blue, float depth,
+                      out float outRed, out float outGreen, out float outBlue) {
+        float r = red * this.Exposure;
+        float g = green * this.Exposure;
+        float b = blue * this.Exposure;
+
+        if (this.FogDensity > 0.0f) {
+            float d = depth > 0.0f ? depth : 0.0f;
+            float f = 1.0f - (float)MathUtil.Exp(
+                                -(double)(this.FogDensity * d));
+            if (f < 0.0f) { f = 0.0f; }
+            if (f > 1.0f) { f = 1.0f; }
+            r = r + (this.FogRed - r) * f;
+            g = g + (this.FogGreen - g) * f;
+            b = b + (this.FogBlue - b) * f;
+        }
+
+        if (this.Tonemap == TonemapKind.Reinhard) {
+            r = r / (1.0f + r);
+            g = g / (1.0f + g);
+            b = b / (1.0f + b);
+        }
+
+        outRed = Clamp01(r);
+        outGreen = Clamp01(g);
+        outBlue = Clamp01(b);
+    }
+
+    static float Clamp01(float value) {
+        if (value < 0.0f) { return 0.0f; }
+        if (value > 1.0f) { return 1.0f; }
+        return value;
+    }
+}
