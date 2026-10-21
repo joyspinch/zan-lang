@@ -70,4 +70,7 @@ zan_token_t zan_lexer_peek2(zan_lexer_t *lex);
 
 void zan_lexer_define(zan_lexer_t *lex, const char *name, const char *value);
 
+/* 关键字 token → 词面文本；不是关键字返回 NULL */
+const char *zan_lexer_keyword_text(zan_token_kind_t kind);
+
 #endif /* ZAN_LEXER_H */

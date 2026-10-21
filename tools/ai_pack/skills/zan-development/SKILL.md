@@ -195,10 +195,11 @@ Without MCP the same index is a file: `knowledge/symbols.json` next to the SDK
   0 列）要另算，见 `Zan.Cli` 的 `TextWidth`。
 * **右 trim 用 `StringExtensions.TrimEnd`**（`s.TrimEnd()`）：内建 `Trim()`
   只去两端；渲染表格/日志时想去掉行尾空白得用扩展方法。
-* **保留字坑**：`out`、`fixed` 不能作变量名（编译器报 "expected ';'，
-  got 'fixed'" 这类看着莫名其妙的错）。**`base` 也是保留字**——不能当
-  参数名（报 "expected ')'" / "expected type"，像签名写坏了）。写"分批
-  解析"这类代码时容易撞上，起名用 `baseIndex` 之类。
+* **保留字坑**：`out`、`fixed`、`base` 都不能作变量名/参数名/字段名。编译器
+  现在会**直接点名**：报 "'base' is a reserved word and cannot be used as a
+  name here"（改前是 "expected variable name" / "expected ')'" 这类通用消息，
+  还跟一串级联报错，只能靠"换个名字就好了"反推）。写"分批解析"这类代码
+  时容易撞上，起名用 `baseIndex` 之类。
 * **泛型容器的两条现状**（实证，2026-10-21）：
   - 泛型类里的 `List<T>`（T 是类级类型参数）**装结构体元素**现在可用了：
     元素类型会按实例替换，写入读回原样（`Zan.Game.Ecs` 的组件池就靠它）。
@@ -246,8 +247,8 @@ Without MCP the same index is a file: `knowledge/symbols.json` next to the SDK
   `JsonException`、`NotSupportedException`、`TimeoutException` 等。
   **没有** `DirectoryNotFoundException` / `UnauthorizedAccessException`——
   写 catch 子句前先确认类型存在，否则编译报 "undefined type"。
-* **`out` 是保留字**（实证，2026-10-22）：局部变量不能叫 `out`
-  （报 "expected variable name"）。`Math`、`String` 这类**大写标识符
+* **`out` 是保留字**：局部变量不能叫 `out`（报 "'out' is a reserved word
+  and cannot be used as a name here"）。`Math`、`String` 这类**大写标识符
   按类型/命名空间解析**——`Math.PI` 在表达式里能用，但 `Math.PI.ToString()`
   会报 "'PI' is not a known variable, type, or namespace"。
 * **`double` 没有 `IsNaN` / `IsInfinity`**（实证，2026-10-22）：用
@@ -345,9 +346,9 @@ Without MCP the same index is a file: `knowledge/symbols.json` next to the SDK
 * **`File.AppendAllText` 不加 BOM**（实证，2026-10-29）：追加的内容原样写入，
   换行按传入的字符串来（自己带 `\n`），不会替你补 BOM 或转成 CRLF。
   读回来用 `File.ReadAllText` / `ReadAllLines`。
-* **`var` 是保留字，不能作变量名**（实证，2026-10-21）：局部变量写 `var x = 1;`
-  报 "expected variable name"——和 `out` / `base` 同一类坑：报错措辞完全看不出
-  是保留字撞车，只能靠"换个名字就好了"反推。要类型就显式写类型。
+* **`var` 是保留字，不能作变量名**：局部变量写 `var x = 1;` 报 "'var' is a
+  reserved word and cannot be used as a name here"——和 `out` / `base` 同一类
+  坑。要类型就显式写类型。
 * **同名泛型与非泛型类型不能共存**（实证，2026-10-21）：同一作用域里写
   `class Foo` 和 `class Foo<T>` 报 "duplicate type declaration 'Foo'"——绑定器
   按**名字**占位（`src/compiler/binder.c` 的类型声明分支用 `scope_find` 查名字，

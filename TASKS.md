@@ -1555,3 +1555,39 @@
 - 方向：声明前瞻的限定名分支补 `?`（以及 `?` 之后的 `[]`）：扫完点号链后允许一个
   `?`，再允许数组后缀，最后要求后面是标识符。改完用上面三条探针一起回归。
 - 关联：A469（数组的元素类型要过名字解析）、§2（语法解析器分派契约）。
+
+### [x] A480 保留字当名字用时诊断不点名——134 条报错没有一个说是哪个保留字
+
+- 现象：外部项目 `mahjong` 的 agent 连撞四次保留字（`base` / `out`），
+  编译器给出的 134 条报错全是 `expected variable name` / `expected member name` /
+  `expected ')', got 'base'` 这类**通用语法消息**，**一条都没说是保留字撞车**——
+  只能靠"换个名字就好了"反推，定位成本极高。
+- 根因：解析器在"这里应该是个名字"的位置只发通用消息（`src/compiler/parser.c`
+  里 12 处 `zan_diag_emit(..., "expected variable name")` 之类），不看当前 token
+  是不是关键字；而 `zan_token_kind_name` 虽能反查词面，对未知 kind 却返回
+  `"???"`，当不了"是不是保留字"的谓词。
+- 修法：
+  - `src/compiler/lexer.c` 新增 `zan_lexer_keyword_text(kind)`：拿关键字表
+    （`s_keywords`）反查词面，不是关键字返回 NULL——**关键字表是唯一事实源**，
+    不在编译器里另抄一份保留字清单；
+  - `src/compiler/parser.c` 新增 `parser_at_reserved_word` /
+    `parser_diag_expected_name`，把 12 处"这里应该是个名字"的位置改走该
+    helper：撞上保留字就点名，否则退回原来的通用消息；
+  - `parse_parameter` 的静默名字槽补一条：撞上保留字时点名**并吃掉 token**
+    （留着的话外层还会补一条 `expected ')'`，把真正的错盖住）；**没有**给
+    "无名字参数"新增任何诊断——避免给既有合法代码引入新报错。
+- 边界（刻意不动）：保留字在 `base` 有合法语义——`base(...)` 构造器初始化器与
+  `base.Method()` 表达式（`AST_BASE_EXPR`）照旧；本次只改"这里应该是个名字"的
+  位置。没改编译器的关键字规则本身（`base` / `out` 是 C# 风格保留字，自首版
+  `4a5809755` 起即存在）。
+- 验证：
+  - 4 个探针（局部变量 / 字段 / 成员访问 / 参数名）改前全是通用消息，改后全部
+    点名，参数那条的 `expected ')'` 级联消失；
+  - `ctest -R "diag_reserved_word"` → 2/2 Passed（新增
+    `tests/diag/reserved_word_as_local_name.zan` /
+    `tests/diag/reserved_word_as_member_name.zan` 两条用例锁住措辞）；
+  - 19 个外部 GUI 项目全量回归 → OK=19 / FAIL=0，5872 个编译单元 0 error。
+- 教训：诊断要说"是什么错"，不是"哪里不合语法"。通用语法消息在语法**确实**
+  坏掉时够用，但撞保留字这类**词法层**问题会把它变成噪音——一条能点名的诊断
+  省掉的是"逐个试改名"的那一轮。
+- 关联：A476（同类"诊断不说到点上"）、A469 / A479（解析器前瞻与分派）。

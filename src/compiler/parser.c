@@ -41,6 +41,26 @@ static zan_ast_node_t *parser_error_node(zan_parser_t *p) {
     return zan_ast_new(p->arena, AST_INT_LITERAL, p->current.loc);
 }
 
+/* 保留字不能当名字用（base / out / value ... 都是关键字）。
+ * 撞上时直接点名道姓，别只丢一句 "expected variable name"——
+ * 那让人怀疑自己语法写错了，实际只是撞了保留字。
+ * 坑出处：外部项目里 agent 连撞四次 base/out，134 条报错全在说别的。 */
+static bool parser_at_reserved_word(zan_parser_t *p) {
+    return zan_lexer_keyword_text(p->current.kind) != NULL;
+}
+
+/* "这里应该是个名字"的位置统一走这里：
+ * 撞上保留字就说清楚，否则退回原来的通用消息。 */
+static void parser_diag_expected_name(zan_parser_t *p, zan_loc_t loc, const char *generic) {
+    const char *word = zan_lexer_keyword_text(p->current.kind);
+    if (word) {
+        zan_diag_emit(p->diag, DIAG_ERROR, p->current.loc,
+                      "'%s' is a reserved word and cannot be used as a name here", word);
+    } else {
+        zan_diag_emit(p->diag, DIAG_ERROR, loc, "%s", generic);
+    }
+}
+
 static void parser_expect_gt(zan_parser_t *p) {
     switch (p->current.kind) {
     case TK_GREATER:
@@ -1404,7 +1424,7 @@ static zan_ast_node_t *parse_postfix(zan_parser_t *p) {
             int null_cond = parser_check(p, TK_QUESTION_DOT);
             parser_advance(p);
             if (!parser_check(p, TK_IDENT)) {
-                zan_diag_emit(p->diag, DIAG_ERROR, loc, "expected member name after '.'");
+                parser_diag_expected_name(p, loc, "expected member name after '.'");
                 break;
             }
             parser_advance(p);
@@ -2077,8 +2097,8 @@ static zan_ast_node_t *parse_tuple_decon_body(zan_parser_t *p, zan_loc_t loc,
             parser_advance(p);
             name->ident.name = p->previous.str_val;
         } else {
-            zan_diag_emit(p->diag, DIAG_ERROR, p->current.loc,
-                          "expected variable name in deconstruction");
+            parser_diag_expected_name(p, p->current.loc,
+                                      "expected variable name in deconstruction");
             name->ident.name = (zan_istr_t){ (char *)"__bad", 5 };
         }
         zan_ast_list_push(&n->tuple_decon.names, name, p->arena);
@@ -2331,7 +2351,7 @@ static zan_ast_node_t *parse_var_decl(zan_parser_t *p) {
         parser_advance(p);
         name = p->previous.str_val;
     } else {
-        zan_diag_emit(p->diag, DIAG_ERROR, p->current.loc, "expected variable name");
+        parser_diag_expected_name(p, p->current.loc, "expected variable name");
     }
 
     zan_ast_node_t *init = NULL;
@@ -2353,8 +2373,8 @@ static zan_ast_node_t *parse_var_decl(zan_parser_t *p) {
             parser_advance(p);
             more = p->previous.str_val;
         } else {
-            zan_diag_emit(p->diag, DIAG_ERROR, p->current.loc,
-                          "expected variable name after ','");
+            parser_diag_expected_name(p, p->current.loc,
+                                      "expected variable name after ','");
             break;
         }
         zan_ast_node_t *more_init = NULL;
@@ -2454,8 +2474,8 @@ static zan_ast_node_t *parse_for_stmt(zan_parser_t *p) {
                         parser_advance(p);
                         name = p->previous.str_val;
                     } else {
-                        zan_diag_emit(p->diag, DIAG_ERROR, p->current.loc,
-                                      "expected variable name");
+                        parser_diag_expected_name(p, p->current.loc,
+                                                  "expected variable name");
                     }
                     zan_ast_node_t *dinit = NULL;
                     if (parser_match(p, TK_EQ)) {
@@ -2797,8 +2817,8 @@ static zan_ast_node_t *parse_local_func(zan_parser_t *p) {
         parser_advance(p);
         name = p->previous.str_val;
     } else {
-        zan_diag_emit(p->diag, DIAG_ERROR, p->current.loc,
-                      "expected local function name");
+        parser_diag_expected_name(p, p->current.loc,
+                                  "expected local function name");
         return parser_error_node(p);
     }
 
@@ -2991,8 +3011,8 @@ static zan_ast_node_t *parse_statement(zan_parser_t *p) {
                 parser_advance(p);
                 name = p->previous.str_val;
             } else {
-                zan_diag_emit(p->diag, DIAG_ERROR, p->current.loc,
-                              "expected variable name in using declaration");
+                parser_diag_expected_name(p, p->current.loc,
+                                          "expected variable name in using declaration");
             }
             if (parser_match(p, TK_EQ)) {
                 init = parse_expression(p);
@@ -3151,8 +3171,8 @@ static void parse_where_clauses(zan_parser_t *p, zan_ast_list_t *out) {
             parser_advance(p);
             pname = p->previous.str_val;
         } else {
-            zan_diag_emit(p->diag, DIAG_ERROR, loc,
-                          "expected type parameter name after 'where'");
+            parser_diag_expected_name(p, loc,
+                                      "expected type parameter name after 'where'");
         }
         parser_expect(p, TK_COLON);
         zan_ast_node_t *n = zan_ast_new(p->arena, AST_WHERE_CLAUSE, loc);
@@ -3203,6 +3223,11 @@ static zan_ast_node_t *parse_parameter(zan_parser_t *p) {
     if (parser_check(p, TK_IDENT)) {
         parser_advance(p);
         name = p->previous.str_val;
+    } else if (parser_at_reserved_word(p)) {
+        /* 保留字当参数名（`F(int out)`）：点名道姓，并把它吃掉——
+         * 留着的话外层还会补一条 "expected ')'"，把真正的错盖住。 */
+        parser_diag_expected_name(p, p->current.loc, "expected parameter name");
+        parser_advance(p);
     }
 
     zan_ast_node_t *default_val = NULL;
@@ -3804,7 +3829,7 @@ ordinary_member:
     }
 
     if (!parser_check(p, TK_IDENT)) {
-        zan_diag_emit(p->diag, DIAG_ERROR, p->current.loc, "expected member name");
+        parser_diag_expected_name(p, p->current.loc, "expected member name");
         return parser_error_node(p);
     }
     parser_advance(p);
@@ -4004,8 +4029,7 @@ ordinary_member:
     n->field_decl.modifiers = mods;
     while (parser_match(p, TK_COMMA)) {
         if (!parser_check(p, TK_IDENT)) {
-            zan_diag_emit(p->diag, DIAG_ERROR, p->current.loc,
-                          "expected member name");
+            parser_diag_expected_name(p, p->current.loc, "expected member name");
             return parser_error_node(p);
         }
         parser_advance(p);
@@ -4047,7 +4071,7 @@ static zan_ast_node_t *parse_type_decl(zan_parser_t *p, uint32_t modifiers) {
         parser_advance(p);
         name = p->previous.str_val;
     } else {
-        zan_diag_emit(p->diag, DIAG_ERROR, p->current.loc, "expected type name");
+        parser_diag_expected_name(p, p->current.loc, "expected type name");
     }
 
     zan_ast_list_t type_params;

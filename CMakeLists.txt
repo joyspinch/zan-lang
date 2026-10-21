@@ -5373,6 +5373,27 @@ add_test(NAME diag_index_wrong_type
     "-DEXPECT_REGEX=no .Bag. indexer takes an index of type .string."
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_index_wrong_type PROPERTIES TIMEOUT 60)
+
+# 保留字不能当名字用。旧路径只报 "expected variable name" / "expected
+# member name after '.'" 这类通用消息，还跟着一串级联报错，把真正的原因
+# 盖住了；现在应直接点名是哪个保留字。
+add_test(NAME diag_reserved_word_as_local_name
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/reserved_word_as_local_name.zan
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_reserved_word_as_local_name${_exe_ext}
+    "-DEXPECT_REGEX='base' is a reserved word and cannot be used as a name"
+    -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
+set_tests_properties(diag_reserved_word_as_local_name PROPERTIES TIMEOUT 60)
+
+add_test(NAME diag_reserved_word_as_member_name
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/reserved_word_as_member_name.zan
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_reserved_word_as_member_name${_exe_ext}
+    "-DEXPECT_REGEX='base' is a reserved word and cannot be used as a name"
+    -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
+set_tests_properties(diag_reserved_word_as_member_name PROPERTIES TIMEOUT 60)
 add_test(NAME diag_index_write_wrong_type
   COMMAND ${CMAKE_COMMAND}
     -DZANC=$<TARGET_FILE:zanc>

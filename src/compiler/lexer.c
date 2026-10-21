@@ -170,6 +170,17 @@ const char *zan_token_kind_name(zan_token_kind_t kind) {
     return "???";
 }
 
+/* 关键字 token → 词面文本；不是关键字返回 NULL。
+ * 解析器在"这里应该是个名字"的位置撞上关键字时靠它拼诊断——
+ * zan_token_kind_name 也能反查词面，但它对未知 kind 返回 "???"，
+ * 没法用来判断"当前 token 是不是保留字"。 */
+const char *zan_lexer_keyword_text(zan_token_kind_t kind) {
+    for (size_t i = 0; i < KEYWORD_COUNT; i++) {
+        if (s_keywords[i].kind == kind) return s_keywords[i].name;
+    }
+    return NULL;
+}
+
 bool zan_is_keyword(const char *name) {
     if (!name) return false;
     for (size_t i = 0; i < KEYWORD_COUNT; i++) {
