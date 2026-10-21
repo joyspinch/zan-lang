@@ -71,8 +71,10 @@ public class ImageHttp {
         workerStarted = true;
         Mutex.Unlock(lockHandle);
         if (needWorker) {
-            // worker 是 async 协程（M:1 协作式调度，见 rt_co.c）：协程
-            // 不会"起不来"，所以没有线程启动失败那套兜底。
+            // worker 是 async 协程：裸调用只创建帧并入队，协程体由运行时
+            // 的协程调度器在别的线程上推进（宿主平台是多 worker 池，见
+            // src/runtime/rt_io.c；M:1 协作式就绪队列只在交叉目标用）。
+            // 协程不会"起不来"，所以没有线程启动失败那套兜底。
             ImageHttp.WorkerLoop();
         }
     }
@@ -80,10 +82,16 @@ public class ImageHttp {
     // worker 协程：逐条取回直到队列清空，然后退出
     // （下一次 Fetch 会重新拉起）。await 让出期间 IO 反应器推进传输。
     //
-    // 必须是 async 方法：await 只在 async 方法里有意义（放在普通方法里
-    // 会被丢掉，"取回一条 await 一条"就退化成并发拉起全部）；也不能放在
-    // 后台线程里跑——Zan 的协程是 M:1 协作式，await 挂起后由调度器在
-    // 同一个线程上恢复。传输本身在 IO 反应器上跑，UI 不会被卡住。
+    // 必须是 async 方法：这里要的是**让出**——await 挂起后 worker 协程
+    // 立刻把线程还给调度器，传输在 IO 反应器上跑，UI 不被卡住；恢复由
+    // 调度器在续体里安排。
+    //
+    // 放在普通方法里不是"不能编译"，而是**语义不同**：普通方法里的
+    // `await <async 调用>` 是阻塞式根驱动（编译器把子协程驱动到完成
+    // 才返回，拿到正确结果），那会让整个取回循环在 UI 线程上同步跑完，
+    // 既不并发也不让出——"取回一条 await 一条"退化成"全部串行阻塞"。
+    // 协程形态下 await 才是真让出，取回一条才真正并发拉起下一条之前
+    // 交还控制权。
     static async void WorkerLoop() {
         Socket.Initialize();
         while (true) {
