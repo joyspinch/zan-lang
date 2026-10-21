@@ -3114,6 +3114,16 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
             if (expr->new_expr.is_array && type && type->kind != TYPE_ERROR &&
                 type->kind != TYPE_ARRAY)
                 type = zan_binder_make_array_type(c->binder, type);
+            /* 类型参数不能实例化（**标量**形态）：类型参数没有构造器，
+               irgen 侧只会造出一个 null 引用——运行期第一次成员访问就崩
+               进程（0xC0000005）。数组形态 `new T[n]` 不在此列：元素类型
+               在实例化时被替换，是合法的（实测 `T[] buf = new T[3]` 正常）。
+               真要"由类型参数造对象"，只能把工厂交给调用方。 */
+            if (type && type->kind == TYPE_TYPE_PARAM) {
+                zan_diag_emit(c->diag, DIAG_ERROR, expr->loc,
+                              "cannot instantiate a type parameter '%.*s'",
+                              (int)type->name.len, type->name.str);
+            }
             check_generic_constraints(c, type, expr->loc);
             if (type && type->kind == TYPE_CLASS && type->sym &&
                 checker_class_is_abstract(type->sym)) {

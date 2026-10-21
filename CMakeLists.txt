@@ -1235,6 +1235,18 @@ add_test(NAME diag_unary_bang_nullable
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_unary_bang_nullable PROPERTIES TIMEOUT 60)
 
+# A type parameter cannot be instantiated: `new T()` had no constructor
+# entry, so the compiler handed out a null reference and the first member
+# access crashed the process.
+add_test(NAME diag_new_type_param
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/new_type_param.zan
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_new_type_param${_exe_ext}
+    "-DEXPECT_REGEX=cannot instantiate a type parameter .T."
+    -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
+set_tests_properties(diag_new_type_param PROPERTIES TIMEOUT 60)
+
 
 # Convert.ToString 的实参必须有字符串形态。类实例不是 C 字符串：此前编译器
 # 拿 strlen 去量对象指针，越界读进程内存（打印出进程映像里的符号名并把程序
