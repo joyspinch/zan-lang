@@ -947,6 +947,135 @@ partial class Irgen {
         return buf;
     }
 
+    // The C host maps an interpolated-string format specifier to a printf
+    // pattern (src/compiler/irgen_expr.c: interp_format_to_printf). "" means
+    // "no format": the value is rendered the default way. The rules are
+    // the host's, not C#'s: D/X need a digit count (> 0), F/E clamp it,
+    // G means "significant digits", and 0/# is the custom pattern.
+    string FormatSpecToPrintf(string spec, bool isUlong) {
+        if (spec == null || spec.Length == 0) { return ""; }
+        string code = spec.Substring(0, 1);
+        int digits = 0;
+        int i = 1;
+        while (i < spec.Length) {
+            int d = spec[i] - 48;
+            if (d >= 0 && d <= 9) { if (digits <= 9999) { digits = digits * 10 + d; } }
+            i = i + 1;
+        }
+        if (code == "D" || code == "d") {
+            if (digits <= 0 || digits > 512) { return ""; }
+            return "%0" + Convert.ToString(digits) + (isUlong ? "llu" : "lld");
+        }
+        if (code == "X" || code == "x") {
+            if (digits <= 0 || digits > 512) { return ""; }
+            return "%0" + Convert.ToString(digits) + (code == "X" ? "llX" : "llx");
+        }
+        if (code == "F" || code == "f") {
+            if (digits > 512) { digits = 512; }
+            return "%." + Convert.ToString(digits) + "f";
+        }
+        if (code == "E" || code == "e") {
+            if (digits > 512) { digits = 512; }
+            return "%." + Convert.ToString(digits) + "E";
+        }
+        if (code == "G" || code == "g") {
+            if (digits > 0) { return "%." + Convert.ToString(digits) + "g"; }
+            return "";
+        }
+        if (code == "0" || code == "#") {
+            // custom numeric pattern: 0 = required digit, # = optional
+            int ipad = 0;
+            int frac = 0;
+            bool afterDot = false;
+            bool haveDot = false;
+            i = 0;
+            while (i < spec.Length) {
+                string ch = spec.Substring(i, 1);
+                if (ch == ".") { afterDot = true; haveDot = true; }
+                else if (ch == "0" || ch == "#") {
+                    if (afterDot) { frac = frac + 1; }
+                    else if (ch == "0") { ipad = ipad + 1; }
+                }
+                i = i + 1;
+            }
+            if (haveDot) { return "%." + Convert.ToString(frac) + "f"; }
+            if (ipad > 0) { return "%0" + Convert.ToString(ipad) + (isUlong ? "llu" : "lld"); }
+            return "";
+        }
+        return "";
+    }
+
+    // does the mapped printf pattern render as a double (a fixed/scientific
+    // spec on an integer widens it first)?
+    bool SpecWantsDouble(string spec) {
+        if (spec == null || spec.Length == 0) { return false; }
+        string code = spec.Substring(0, 1);
+        if (code == "F" || code == "f" || code == "E" || code == "e" || code == "G" || code == "g") { return true; }
+        if (code == "0" || code == "#") {
+            int i = 0;
+            while (i < spec.Length) {
+                if (spec.Substring(i, 1) == ".") { return true; }
+                i = i + 1;
+            }
+        }
+        return false;
+    }
+
+    // A printf pattern global (one per distinct pattern).
+    string FmtPatGlobal(string pat) {
+        fmtSeq = fmtSeq + 1;
+        string g = "@.fmt.p" + Convert.ToString(fmtSeq);
+        int n = pat.Length + 1;
+        H(g + " = private unnamed_addr constant [" + n + " x i8] c\"" + pat + "\\00\"");
+        return "getelementptr inbounds ([" + n + " x i8], [" + n + " x i8]* " + g + ", i64 0, i64 0)";
+    }
+
+    // scalar x.ToString("spec"): the interpolated-string hole format (the
+    // lexer splices the hole `{v:D4}` into `v.ToString("D4")`). The C host
+    // formats the hole with printf semantics (irgen_expr.c
+    // emit_expr_string_interp + interp_format_to_printf).
+    ExprVal EmitScalarToStringFmt(ExprVal recv, string spec) {
+        if (recv.ty == null) { return new ExprVal(ToCStr(recv), MkType("string")); }
+        string sty = recv.ty.sval;
+        if (sty == "bool") {
+            // a bool renders as "true"/"false" (the host's interpolation
+            // branch), not as 1/0
+            ExprVal ts = GenStr("true");
+            ExprVal fs = GenStr("false");
+            string c = NT(); L("  " + c + " = icmp ne i64 " + recv.op + ", 0");
+            string r = NT(); L("  " + r + " = select i1 " + c + ", i8* " + ts.op + ", i8* " + fs.op);
+            return new ExprVal(r, MkType("string"));
+        }
+        if (sty == "char" && recv.ty.ival == 0) {
+            return new ExprVal(CharToStr(recv.op), MkType("string"));
+        }
+        bool isDbl = IsDbl(recv.ty);
+        bool isU = IsUlong(recv.ty);
+        // a double ignores the decimal/hex padding specs (the host: the
+        // spec-to-printf mapping refuses them for a float operand)
+        string code = spec != null && spec.Length > 0 ? spec.Substring(0, 1) : "";
+        if (isDbl && (code == "D" || code == "d" || code == "X" || code == "x")) {
+            return new ExprVal(ToCStr(recv), MkType("string"));
+        }
+        string pat = FormatSpecToPrintf(spec, isU);
+        if (pat == "") { return new ExprVal(ToCStr(recv), MkType("string")); }
+        string vop = recv.op;
+        string vty = "i64";
+        if (isDbl) { vty = "double"; }
+        else if (SpecWantsDouble(spec)) {
+            string d = NT(); L("  " + d + " = sitofp i64 " + recv.op + " to double");
+            vop = d; vty = "double";
+        }
+        string fp = FmtPatGlobal(pat);
+        string need = NT();
+        L("  " + need + " = call i32 (i8*, i64, i8*, ...) @snprintf(i8* null, i64 0, i8* " + fp + ", " + vty + " " + vop + ")");
+        string need64 = NT(); L("  " + need64 + " = sext i32 " + need + " to i64");
+        string bsz = NT(); L("  " + bsz + " = add i64 " + need64 + ", 1");
+        string buf = NT(); L("  " + buf + " = call i8* @malloc(i64 " + bsz + ")");
+        L("  call i32 (i8*, i64, i8*, ...) @snprintf(i8* " + buf + ", i64 " + bsz + ", i8* " + fp + ", " + vty + " " + vop + ")");
+        return new ExprVal(WrapManaged(buf), MkType("string"));
+    }
+
     // coerce a value to i8* string form (numbers via snprintf)
     string ToCStr(ExprVal v) {
         if (IsStr(v.ty)) { return v.op; }
@@ -4730,6 +4859,25 @@ partial class Irgen {
             }
             if (mname == "ToStr" && (e.kids.Count == 0 || e.kids.Count == 2) && IsByteArr(recv.ty)) {
                 return ByteArrWindowToStr(recv, e);
+            }
+            // scalar ToString with a format specifier: the interpolated-string
+            // hole format (the lexer splices the hole `{v:D4}` into
+            // `v.ToString("D4")`; the C host formats the hole with printf
+            // semantics).
+            if (mname == "ToString" && e.kids.Count == 1 && !IsStr(recv.ty)
+                && ClassOf(recv.ty) == null && !IsListType(recv.ty) && !IsDictType(recv.ty) && !IsSbType(recv.ty)
+                && e.kids[0] != null && e.kids[0].kind == AK.StringLit()) {
+                string spec = StrEsc.DecodeText(e.kids[0].sval);
+                return EmitScalarToStringFmt(recv, spec);
+            }
+            // a string receiver ignores the format specifier (the host's
+            // interpolation uses the string as it is)
+            if (mname == "ToString" && e.kids.Count == 1 && IsStr(recv.ty)
+                && e.kids[0] != null && e.kids[0].kind == AK.StringLit()) {
+                string n = StrCLen(recv.op);
+                string buf = NT(); L("  " + buf + " = call i8* @zstr_new(i64 " + n + ")");
+                L("  call i8* @memcpy(i8* " + buf + ", i8* " + recv.op + ", i64 " + n + ")");
+                return new ExprVal(buf, MkType("string"));
             }
             // scalar ToString: bool -> "true"/"false", numbers via snprintf
             if (mname == "ToString" && e.kids.Count == 0 && !IsStr(recv.ty)
