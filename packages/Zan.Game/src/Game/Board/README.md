@@ -75,3 +75,39 @@ the worked example: its adapter owns the terminal decision, carries the
 distance-to-mate term, and caches the legal-move list so the terminal check
 costs no extra search work.
 
+
+## Go rules (围棋)
+
+`GoBoard` implements the Go ruleset — placement, capture, suicide and ko
+prohibitions, liberties, Chinese-style territory scoring — with **no rendering
+dependency**, so the same rules run in a headless server:
+
+```zan
+using Game.Board;
+
+GoBoard board = new GoBoard(19);
+board.Play(3, 3, GoBoard.Black);         // returns captured stones (0 = none)
+List<int> taken = new List<int>();
+board.Play(15, 3, GoBoard.Black, taken);  // taken = captured coordinates
+GoScore score = board.Score(7.5);        // Chinese rules, 7.5 komi
+int winner = score.Winner();
+```
+
+- `Play` returns the number of captured stones, or **-1** for an illegal move
+  (occupied point, ko point, suicide). An illegal move leaves the board and
+  every counter untouched.
+- `Probe` / `ProbeMove` answer "what if I play here" **without touching the
+  state** — the standard question a Go AI asks. `ProbeMove` returns legality,
+  captures, the resulting liberties and the resulting group size in one call.
+- The board owns `KoPoint`, `ConsecutivePasses` and the capture counters.
+  **Read them from the board instead of keeping a second copy in the game**:
+  two sources of truth drift the moment a pass or a ko is handled in one place
+  and not the other.
+- Effects stay on the game side — capture animations are driven from the
+  coordinate list `Play` hands back, not from a board that knows about pixels.
+
+The Weiqi project (`D:/project/games/weiqi`, `client/src/WqGame.zan`) is the
+worked example: its self-written `Group` / `TryPlay` / `TryPlayRaw` / `Probe` /
+`Score` are gone, and the game only keeps the burst effect for captured
+stones. The rules themselves are pinned by
+`tests/conformance/game_go_board.zan` in the language repository.
