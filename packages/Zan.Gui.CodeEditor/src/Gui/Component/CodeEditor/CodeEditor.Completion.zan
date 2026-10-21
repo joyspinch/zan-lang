@@ -133,13 +133,17 @@ partial class CodeEditor {
         for (; i < acAllCandidates.Count; i = i + 1) {
             CeCandidateItem cand = acAllCandidates[i];
             string k = cand.kind;
-            if (acFilter == "" || acFilter == k) {
+            bool keep = acFilter == "" || acFilter == k;
+            // 片段选择器模式只留片段：这是 VS「插入代码片段...」
+            // 的口径——列表里只有片段，不掺符号与关键字。
+            if (acSnippetOnly && k != "S") { keep = false; }
+            if (keep) {
                 acVisibleCandidates.Add(cand);
                 acItems.Add(cand.item);
                 acKinds.Add(k);
             }
         }
-        if (acItems.Count == 0 && acAllCandidates.Count > 0) {
+        if (acItems.Count == 0 && acAllCandidates.Count > 0 && !acSnippetOnly) {
             // 用户保留的种类过滤器对正在输入的字词没有候选项，
             // 保留它只会显示空弹窗（且 Enter/Tab
             // 会接受并不存在的行），因此丢弃该过滤器。
@@ -494,6 +498,9 @@ partial class CodeEditor {
     void UpdateCompletion() {
         CancelSemanticCompletion();
         CaptureCompletionSource();
+        // 弹窗已经关掉了：片段选择器模式随之结束（否则之后的打字
+        // 会一直只列片段，看起来像补全坏了）。
+        if (!acActive) { acSnippetOnly = false; }
 
         // 字符串字面量或行注释内不弹自动补全，避免干扰文本录入
         if (!acForced && InStringOrCommentContext()) {
@@ -533,6 +540,37 @@ partial class CodeEditor {
 
             if (acAllCandidates.Count == 0) { acActive = false; acDot = false; return; }
             CodeEditor.SortCandidatesByScore(acAllCandidates, dscores);
+            acSel = 0;
+            ApplyKindFilter();
+            return;
+        }
+
+        // 片段选择器模式（右键「插入代码片段...」）：列表里只有片段。
+        // 首次打开列出全部片段；之后用户输入的字符当作片段名的
+        // 过滤前缀（VS 的「插入代码片段」对话框就是这个手感）。
+        if (acSnippetOnly) {
+            acAllCandidates = new List<CeCandidateItem>();
+            List<string> sItems = new List<string>();
+            List<string> sKinds = new List<string>();
+            CodeEditor.SnippetListK(sItems, sKinds);
+            string sPfx = "";
+            if (acForced) {
+                // 刚打开：插入点固定在光标处，不吞掉光标前的字词。
+                acStart = curCol;
+            } else {
+                int sSt = curCol;
+                while (sSt > 0 && CodeEditor.IsIdentByte(ln[sSt - 1] & 255)) {
+                    sSt = sSt - 1;
+                }
+                acStart = sSt;
+                sPfx = ln.Substring(sSt, curCol - sSt);
+            }
+            for (int si = 0; si < sItems.Count; si = si + 1) {
+                if (sPfx.Length > 0 && !CodeEditor.StartsWithI(sItems[si], sPfx)) {
+                    continue;
+                }
+                acAllCandidates.Add(new CeCandidateItem(sItems[si], sKinds[si]));
+            }
             acSel = 0;
             ApplyKindFilter();
             return;
@@ -1270,8 +1308,17 @@ partial class CodeEditor {
         CeCandidateItem candidate = acVisibleCandidates[acSel];
         string chosen = candidate.item;
         CodeCompletionItem semantic = candidate.semantic;
-        if (viaTab && candidate.kind == "S" && semantic == null) {
-            SaveUndo(); ExpandSnippet(chosen); BumpTextVersion(); return;
+        if ((viaTab || acSnippetOnly) && candidate.kind == "S" && semantic == null) {
+            // 片段候选：Tab 接受时展开模板；片段选择器里 Enter 也展开
+            // （那里的语境就是"插入这段片段"，插触发词没有意义）。
+            // 普通补全体里 Enter 仍然只插入触发词——那是既有契约。
+            SaveUndo();
+            acSnippetOnly = false;
+            acActive = false;
+            acFilter = "";
+            ExpandSnippet(chosen);
+            BumpTextVersion();
+            return;
         }
         if (semantic != null && semantic.isSnippet) {
             // 语言服务推来的片段：按模板插入，插入后 Tab 在洞之间跳。
@@ -1293,6 +1340,7 @@ partial class CodeEditor {
             acActive = false;
             acDot = false;
             acFilter = "";
+            acSnippetOnly = false;
             CheckErrors();
             return;
         }
@@ -1336,6 +1384,7 @@ partial class CodeEditor {
         acActive = false;
         acDot = false;
         acFilter = "";
+        acSnippetOnly = false;
     }
 
     // 无弹窗时的 Tab 词补全：光标前是标识符前缀且光标不在词中时，

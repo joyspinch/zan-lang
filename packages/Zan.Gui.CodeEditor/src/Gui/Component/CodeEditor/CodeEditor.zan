@@ -95,6 +95,9 @@ partial class CodeEditor {
     bool acDot;             // 弹窗由 '.' 触发（成员补全）时为 true
     string acDotReceiverType; // 成员补全时点号左侧解析出的接收者类型（如 StatusBar、Button 等）
     bool acForced;          // Ctrl+Space：列出所有内容，即使没有前缀
+    // 片段选择器模式（右键「插入代码片段...」）：弹窗只列代码片段，
+    // 输入的字符当作片段名的过滤前缀。退出时随弹窗一起清掉。
+    bool acSnippetOnly;
     List<string> acKinds;   // 每项种类标签："M"=方法、"P"=属性、"T"=类型、"K"=关键字、"S"=片段、"F"=字段
 
     // ---- 弹窗几何（Render 时设置，点击时读取） ----
@@ -1782,6 +1785,31 @@ partial class CodeEditor {
             menuItems.Insert(0, new ContextMenuItem("", "", 0));
             menuItems.Insert(0, new ContextMenuItem(CodeEditor.T("Add using ", "添加 using ") + qfNs + ";", "Ctrl+.", 20));
         }
+        // VS 对齐的实例相关项：代码片段、调试断点、代码折叠。
+        // 它们取决于光标位置与当前折叠状态，只能在实例里组装
+        // （BuildCtxMenu 是静态的，只放与位置无关的基础项）。
+        menuItems.Add(new ContextMenuItem("", "", 0));
+        menuItems.Add(new ContextMenuItem(
+            CodeEditor.T("Insert Snippet...", "插入代码片段..."), "", 21));
+        menuItems.Add(new ContextMenuItem(
+            CodeEditor.T("Toggle Breakpoint", "切换断点"), "F9", 22));
+        bool canFold = this.FoldableAt(curLine) && !this.FoldedAt(curLine);
+        bool isFolded = this.FoldedAt(curLine) || this.FoldHides(curLine);
+        if (canFold || isFolded) {
+            menuItems.Add(new ContextMenuItem("", "", 0));
+            if (canFold) {
+                menuItems.Add(new ContextMenuItem(
+                    CodeEditor.T("Fold", "折叠"), "Ctrl+M", 23));
+            }
+            if (isFolded) {
+                menuItems.Add(new ContextMenuItem(
+                    CodeEditor.T("Unfold", "展开"), "Ctrl+Shift+M", 24));
+            }
+            if (this.AnyFolded()) {
+                menuItems.Add(new ContextMenuItem(
+                    CodeEditor.T("Unfold All", "全部展开"), "", 25));
+            }
+        }
         if (hostCtxItems != null && hostCtxItems.Count > 0) {
             menuItems.Add(new ContextMenuItem("", "", 0));
             for (int hi = 0; hi < hostCtxItems.Count; hi = hi + 1) {
@@ -1790,7 +1818,6 @@ partial class CodeEditor {
         }
         return menuItems;
     }
-
     // 按 id 执行右键菜单动作（见 BuildCtxMenu）。
     void RunCtxAction(App app, int act) {
         this.DispatchCtxAction(act);
@@ -1818,6 +1845,11 @@ partial class CodeEditor {
         else if (act == 15) { Undo(); CheckErrors(); }
         else if (act == 16) { Redo(); CheckErrors(); }
         else if (act == 20) { ApplyQuickFix(); }
+        else if (act == 21) { this.ShowSnippetPicker(); }
+        else if (act == 22) { this.ToggleBreakpoint(curLine); }
+        else if (act == 23) { this.ToggleFold(curLine); }
+        else if (act == 24) { this.ExpandFoldAt(curLine); }
+        else if (act == 25) { this.UnfoldAll(); }
         else if (act >= 100) {
             string hc = HostCtxCmd(act);
             if (hc.Length > 0) { ctxCmd = hc; }
@@ -1860,6 +1892,34 @@ partial class CodeEditor {
         int winW = c.Width();
         int winH = c.Height();
         int topB = app.titlebarH;
+        // 菜单放不下时先去掉次要项：VS 的菜单不会弹到屏幕外——
+        // 宁可少几项，也不能让最后几项点不到。删除顺序按 VS 的
+        // 菜单口径排：VS 的代码右键里本来就没有「跳转到行」
+        // 「查找」（它们在编辑/转到菜单里），先去掉这两个。
+        int availH = winH - topB - app.Scale(8);
+        List<int> droppable = new List<int>();
+        droppable.Add(10);
+        droppable.Add(9);
+        droppable.Add(7);
+        droppable.Add(8);
+        droppable.Add(13);
+        droppable.Add(14);
+        for (int di = 0; di < droppable.Count; di = di + 1) {
+            if (mH <= availH) { break; }
+            for (int ri = menuItems.Count - 1; ri >= 0; ri = ri - 1) {
+                if (menuItems[ri].action == droppable[di]) {
+                    menuItems.RemoveAt(ri);
+                    mH = mH - itemH;
+                    break;
+                }
+            }
+        }
+        for (int ri = menuItems.Count - 1; ri > 0; ri = ri - 1) {
+            if (menuItems[ri].action == 0 && menuItems[ri - 1].action == 0) {
+                menuItems.RemoveAt(ri);
+                mH = mH - sepH;
+            }
+        }
         int mX = ctxX;
         int mY = ctxY;
         if (mX + mW > winW) { mX = winW - mW - app.Scale(4); }

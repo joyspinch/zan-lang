@@ -1,0 +1,198 @@
+using System;
+using System.Collections.Generic;
+using Gui;
+using Gui.Component.CodeEditor;
+
+namespace CodeEditorCtxMenuVsTest;
+
+// 代码编辑区右键菜单向 Visual Studio 看齐的回归：
+//   ①菜单里有 VS 的那几个项：插入代码片段…、切换断点，
+//     以及按折叠状态出现的折叠/展开/全部展开；
+//   ②动作派发真的落到编辑器能力上（断点、折叠、展开）；
+//   ③「插入代码片段…」打开的选择器里只有片段，输入字符
+//     当作片段名的过滤前缀，选中后插入模板并进入洞位模式。
+class Program {
+    static int fails;
+
+    static void Req(string what, bool cond) {
+        if (cond) { return; }
+        fails = fails + 1;
+        Console.WriteLine("FAIL " + what);
+    }
+
+    static void ReqInt(string what, int got, int want) {
+        if (got == want) { return; }
+        fails = fails + 1;
+        Console.WriteLine("FAIL " + what + ": got " + Convert.ToString(got)
+            + " want " + Convert.ToString(want));
+    }
+
+    static void ReqStr(string what, string got, string want) {
+        if (got == want) { return; }
+        fails = fails + 1;
+        Console.WriteLine("FAIL " + what + ": got [" + got + "] want [" + want + "]");
+    }
+
+    static int ActionIndex(List<ContextMenuItem> items, int action) {
+        for (int i = 0; i < items.Count; i = i + 1) {
+            if (items[i].action == action) { return i; }
+        }
+        return -1;
+    }
+
+    static bool HasLabel(List<ContextMenuItem> items, string label) {
+        for (int i = 0; i < items.Count; i = i + 1) {
+            if (items[i].label == label) { return true; }
+        }
+        return false;
+    }
+
+    static bool HasText(List<string> items, string label) {
+        for (int i = 0; i < items.Count; i = i + 1) {
+            if (items[i] == label) { return true; }
+        }
+        return false;
+    }
+
+    // 候选列表里是否全是片段（种类 "S"）。
+    static bool AllSnippets(List<string> kinds) {
+        if (kinds.Count == 0) { return false; }
+        for (int i = 0; i < kinds.Count; i = i + 1) {
+            if (kinds[i] != "S") { return false; }
+        }
+        return true;
+    }
+
+    static void SelectSnippet(CodeEditor e, string label) {
+        for (int i = 0; i < e.acItems.Count; i = i + 1) {
+            if (e.acItems[i] == label) { e.acSel = i; return; }
+        }
+    }
+
+    static void CheckMenuItems() {
+        CodeEditor e = new CodeEditor();
+        e.LoadText("class A {\n    void M() {\n    }\n}");
+        e.curLine = 0;
+        List<ContextMenuItem> items = e.BuildCtxMenuItems();
+        Req("snippet item present", ActionIndex(items, 21) >= 0);
+        Req("snippet item label", HasLabel(items, "插入代码片段..."));
+        Req("breakpoint item present", ActionIndex(items, 22) >= 0);
+        Req("breakpoint item shortcut", HasLabel(items, "切换断点"));
+        // 还没有折叠区间：折叠/展开项不出现。
+        ReqInt("no fold item yet", ActionIndex(items, 23), -1);
+        ReqInt("no unfold item yet", ActionIndex(items, 24), -1);
+
+        List<int> fs = new List<int>();
+        List<int> fe = new List<int>();
+        fs.Add(0);
+        fe.Add(2);
+        e.SetFoldRanges(fs, fe);
+        items = e.BuildCtxMenuItems();
+        Req("fold item appears", ActionIndex(items, 23) >= 0);
+        ReqInt("unfold item hidden before folding", ActionIndex(items, 24), -1);
+    }
+
+    static void CheckFoldActions() {
+        CodeEditor e = new CodeEditor();
+        e.LoadText("class A {\n    void M() {\n    }\n}");
+        List<int> fs = new List<int>();
+        List<int> fe = new List<int>();
+        fs.Add(0);
+        fe.Add(2);
+        e.SetFoldRanges(fs, fe);
+        e.curLine = 0;
+
+        // 派发「折叠」→ 该行折叠；菜单此时给「展开」。
+        e.DispatchCtxAction(23);
+        Req("folded by menu action", e.FoldedAt(0));
+        List<ContextMenuItem> items = e.BuildCtxMenuItems();
+        Req("unfold item appears", ActionIndex(items, 24) >= 0);
+        ReqInt("fold item gone while folded", ActionIndex(items, 23), -1);
+
+        // 派发「展开」→ 展开这一层。
+        e.DispatchCtxAction(24);
+        Req("unfolded by menu action", !e.FoldedAt(0));
+
+        // 「全部展开」：先折两层再全部展开。
+        e.ToggleFold(0);
+        List<ContextMenuItem> items2 = e.BuildCtxMenuItems();
+        Req("unfold all item appears", ActionIndex(items2, 25) >= 0);
+        e.DispatchCtxAction(25);
+        Req("everything unfolded", !e.AnyFolded());
+    }
+
+    static void CheckBreakpointAction() {
+        CodeEditor e = new CodeEditor();
+        e.LoadText("one\ntwo");
+        e.curLine = 1;
+        e.DispatchCtxAction(22);
+        Req("breakpoint toggled on", e.HasBreakpoint(1));
+        e.DispatchCtxAction(22);
+        Req("breakpoint toggled off", !e.HasBreakpoint(1));
+    }
+
+    static void CheckSnippetPicker() {
+        CodeEditor s = new CodeEditor();
+        s.LoadText("");
+        s.curLine = 0;
+        s.curCol = 0;
+        s.ShowSnippetPicker();
+        Req("picker opens", s.acActive);
+        Req("picker lists snippets only", AllSnippets(s.acKinds));
+        Req("picker has if", HasText(s.acItems, "if"));
+        Req("picker has switch", HasText(s.acItems, "switch"));
+        Req("picker has main", HasText(s.acItems, "main"));
+        ReqInt("picker item count", s.acItems.Count, 18);
+
+        SelectSnippet(s, "if");
+        s.AcceptCompletion(false);
+        ReqStr("template inserted", s.GetText(), "if () {\n    \n}");
+        Req("snippet mode is on", s.SnippetActive());
+        ReqInt("caret on the first hole", s.CurCol(), 4);
+    }
+
+    static void CheckSnippetFilter() {
+        CodeEditor s = new CodeEditor();
+        s.LoadText("");
+        s.curLine = 0;
+        s.curCol = 0;
+        s.ShowSnippetPicker();
+        // 输入当作片段名的过滤前缀（VS 的插入片段对话框手感）。
+        s.InsertStr("sw");
+        s.UpdateCompletion();
+        Req("filtered to switch", HasText(s.acItems, "switch"));
+        Req("other snippets filtered out", !HasText(s.acItems, "if"));
+        SelectSnippet(s, "switch");
+        s.AcceptCompletion(false);
+        ReqStr("switch template inserted", s.GetText(),
+            "switch () {\n    case :\n        \n        break;\n    default:\n        break;\n}");
+    }
+
+    static void CheckSnippetTable() {
+        List<string> names = new List<string>();
+        List<string> tpls = new List<string>();
+        CodeEditor.SnippetTable(names, tpls);
+        ReqInt("snippet table size", names.Count, tpls.Count);
+        ReqInt("snippet count", names.Count, 18);
+        bool allTpl = true;
+        for (int i = 0; i < names.Count; i = i + 1) {
+            if (CodeEditor.SnippetTemplateOf(names[i]) != tpls[i]) { allTpl = false; }
+            if (tpls[i].Length == 0) { allTpl = false; }
+        }
+        Req("every snippet has a template", allTpl);
+        ReqStr("unknown snippet has no template", CodeEditor.SnippetTemplateOf("nope"), "");
+    }
+
+    static void Main() {
+        fails = 0;
+        CheckMenuItems();
+        CheckFoldActions();
+        CheckBreakpointAction();
+        CheckSnippetPicker();
+        CheckSnippetFilter();
+        CheckSnippetTable();
+        if (fails == 0) { Console.WriteLine("CTXMENU VS PASS"); return; }
+        Console.WriteLine("CTXMENU VS FAIL " + Convert.ToString(fails));
+        Environment.Exit(1);
+    }
+}
