@@ -1921,3 +1921,91 @@ kernel32、shell32、user32、advapi32、version）。
   加分）——宿主允许 float 实参进 double 形参（加宽），也允许反向。
 - 通用教训：**"不匹配"和"不是精确匹配"是两件事**：能隐式转换的类型对不该
   被判出局，只是排序靠后。
+## 103. `await` 有三种形态：协程帧 / 任务句柄 / 普通值透传
+
+- 坑（实测）：`await sqlite3_step(stmt)`（一个返回 int 的
+  extern 调用）在自举里报 "'await' expects an async call in the self-hosted
+  compiler -- this operand is not lowered as a coroutine frame"，宿主却编译
+  通过。宿主的三种形态在 `src/compiler/irgen_expr.c: emit_expr_await_expr`：
+  ① 被 await 的调用开了一个**协程帧** → 挂起等它完成；② 被 await 的是
+  **任务句柄** → 轮询到完成再取结果；③ **其它任何值** → 函数的最后一句是
+  `return sub`，值原样透传（等于"await 了但没等待什么"）。
+  自举原来只认第 ① 种。
+- 做法：`EmitAwait` 分流——不是协程帧时，Task 句柄走"泵调度器到 done 再读
+  结果槽 6 并回收帧"（与 `t.Result` 同一套协议），其它类型直接透传。
+- 通用教训：**"await"不是"必须等"**——它先是一种**类型规则**（Task<T> → T），
+  再是一种**降级**（帧 / 句柄 / 透传）；只实现其中一种就会把合法程序判死。
+
+## 104. 实例方法组要绑定接收者（`obj.Method` 当委托值）
+
+- 坑（实测）：`Action<int> f = probe.Probe;`（把实例方法当委托
+  值传出去）在自举里报 "member 'Probe' of type 'Probe' is not supported"，宿主
+  却编译通过。宿主的 `emit_method_group_closure`
+  （`src/compiler/irgen_expr.c`）把方法组变成一条**带接收者的闭包记录**：
+  `{fn, dtor, target}`——fn 是一个从 env 槽 0 取接收者的 thunk。
+- 做法：自举生成 thunk `@__mg_<target>`：从 env 槽 0 读接收者，调目标方法，
+  返回值按方法返回类型转换。ARC 类的接收者在 thunk 内部 zretain/zrelease
+  （自举的闭包记录不会释放成员，所以释放责任落在 thunk 上）。
+- 通用教训：**"方法组"不是一个方法指针**——它是一段"等接收者到齐才调用"的
+  代码；只把函数地址塞进闭包、丢了接收者，调用时会拿随机值当 `this`。
+
+## 105. `nint` 是关键字：词法、语法、类型名三处都要有
+
+- 坑（实测）：`(nint)-1` 在自举报 "unresolved identifier
+  'nint'"，宿主编译通过。宿主有 `TK_NINT`（`src/compiler/lexer.c`），绑定器
+  也认识 `nint` 这个类型名（`binder.c` 的 `type_nint`）；自举的绑定器早就能
+  解析 `nint` 这个类型名，缺的是**词法与语法**把它当类型关键字。
+- 做法：`token.zan` 加 `static int Nint()`；`lexer.zan` 的关键字表加
+  `if (s == "nint") { return TK.Nint(); }`；`parser.zan` 的 `IsTypeKeyword`
+  / `TypeKeywordName` 加上 Nint → "nint"（注意 `decimal` 在
+  `TypeKeywordName` 里映射成 "double"，`nint` 映射成 "nint"）。
+- 通用教训：**类型名认识 ≠ 类型能用**——词法、语法、绑定三张表要一起补；
+  只补绑定器，最先炸的是"把它当表达式用的地方"（强制转换）。
+
+## 106. 数组级优先于元素名：`List<string>[]` 的元素是 `List<string>`
+
+- 坑（实测）：`List<string>[] a; a[0].Add("x");` 在自举把
+  `a[0]` 定型成 **string**（报 "string method 'Add' is not supported"），
+  宿主正常。两处根因：① 检查器 `InferType` 的 `AK.Index` 分支先判
+  `sval == "List"` 就返回类型实参（`kids[0]`），没先看数组级——`List<string>[]`
+  的类型节点是 `sval="List"` + `kids=[string]` + `ival=1`，于是命中了 List
+  特例。② 后端 `IsListType` / `IsDictType` 只看 `sval` 不看 `ival`，
+  `List<string>[]` 被当成 List 走 `zlist_get`；`ArrayElemType` / `GenNew` 的
+  数组分支还把类型实参（`kids`）丢了。
+- 做法：**数组级（`ival`）先判**——`ival >= 1` 就是数组，元素类型是
+  `sval` + `kids`（类型实参）+ `ival - 1`；`IsListType` / `IsDictType` /
+  `IsSbType` 与 `IsStr` / `IsSpanType` 一样要先排除 `ival >= 1`；派生元素
+  类型时把 `kids` 一起带走。
+- 通用教训：**类型节点上的"名字"只是类型的一部分**——名字后面还挂着数组级、
+  可空标志和类型实参；凡是"从类型 A 推出类型 B"的地方，只抄名字就会丢信息。
+
+## 107. 裸 `throw;` 是重抛
+
+- 坑（实测）：`catch { ...; throw; }`（把捕获的异常原样再抛）
+  在自举里被降成 `bitcast i64 0 to i8*`——clang 报 "invalid cast opcode for
+  cast from 'i64' to 'ptr'"。自举原来只有 `throw <expr>`，裸 `throw;` 的
+  表达式是 null，被当成"抛 0"处理。
+- 做法：后端在 catch 子句体里把当时的 `@__exc_val` / `@__exc_tid` 存进
+  自己的槽（每个子句一份），裸 `throw;` 重新写回这两个全局再 `EmitRaise()`；
+  检查器加 `catchDepth`，在 catch 块之外用裸 `throw;` 报宿主同款诊断
+  "a rethrow (`throw;`) is only valid inside a catch block"。
+- 通用教训：**"重抛"不是"抛 null"**——它重抛的是**在飞的那一个异常**；
+  子句体里可能又跑过嵌套 try（在飞的全局已被覆盖），所以要按子句各存一份。
+
+## 108. `await` 的隐藏内建：`Socket.ResolveSockAddr` / `Socket.ResolveAsync`
+
+- 坑（实测）：标准库的 `Socket.BuildSockAddrAsync` 里
+  `await Socket.ResolveSockAddr(ip, port, addr, 28)` 在自举里编译出对
+  未定义函数 `@Socket_ResolveSockAddr` 的调用；`Socket.ResolveAsync` 同理。
+  这两个不是普通方法：宿主在 `emit_expr_await_expr` 里把它们**识别成
+  编译器内建**（`src/compiler/irgen_expr.c`），降级成
+  `zan_io_resolve_sa_co` / `zan_io_resolve_co` 的挂起调用；标准库自己写的
+  `public static async int ResolveAsync(string hostname) { return await
+  Socket.ResolveAsync(hostname); }` 就是靠这条内建才不递归。
+- 做法：自举的 `IsSocketIntrinsic` 加上这两个名字，`EmitSocketIntrinsic`
+  按运行时契约发调用（`zan_io_resolve_sa_co(name, port, buf, cap, frame,
+  resume, out)`，结果长度写在帧的结果槽 6 上，是个 **i32**），并在
+  `EmitAsyncRuntime` 里补上对应的 `declare`。
+- 通用教训：**"标准库自己调用的方法"往往不是普通方法**——宿主可能把它当
+  编译器内建；自举补齐内建时，要按运行时的**真实契约**（参数顺序、结果
+  槽位宽度）来，不能照抄别处内建的形状。

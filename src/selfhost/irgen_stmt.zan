@@ -1770,6 +1770,22 @@ partial class Irgen {
     // throw expr — store the exception object, pop the innermost handler and
     // longjmp back into its try (setjmp returns nonzero -> catch path).
     void GenThrow(Node s) {
+        if (s.a == null) {
+            // a bare `throw;`: re-raise the exception the enclosing catch
+            // clause caught. The in-flight globals may have been overwritten
+            // by a nested try inside the clause body, so the clause's own
+            // copy is the one that is re-raised.
+            if (catchExcVal.Count > 0) {
+                string rv = NT();
+                L("  " + rv + " = load i8*, i8** " + catchExcVal[catchExcVal.Count - 1]);
+                L("  store i8* " + rv + ", i8** @__exc_val");
+                string rt = NT();
+                L("  " + rt + " = load i8*, i8** " + catchExcTid[catchExcTid.Count - 1]);
+                L("  store i8* " + rt + ", i8** @__exc_tid");
+            }
+            EmitRaise();
+            return;
+        }
         ExprVal v = GenExpr(s.a);
         string vt = MapType(v.ty);
         string ev = v.op;
@@ -2000,7 +2016,24 @@ partial class Irgen {
                     }
                     L("  store " + cty + " " + cv + ", " + cty + "* " + reg);
                 }
+                // the exception this clause caught: a bare `throw;` in the body
+                // re-raises it (the in-flight globals may have been
+                // overwritten by a nested try inside the clause body)
+                string exSlot = NT();
+                L("  " + exSlot + " = alloca i8*");
+                string exNow = NT();
+                L("  " + exNow + " = load i8*, i8** @__exc_val");
+                L("  store i8* " + exNow + ", i8** " + exSlot);
+                string tdSlot = NT();
+                L("  " + tdSlot + " = alloca i8*");
+                string tdNow = NT();
+                L("  " + tdNow + " = load i8*, i8** @__exc_tid");
+                L("  store i8* " + tdNow + ", i8** " + tdSlot);
+                catchExcVal.Add(exSlot);
+                catchExcTid.Add(tdSlot);
                 GenStmt(cc.a);
+                catchExcVal.RemoveAt(catchExcVal.Count - 1);
+                catchExcTid.RemoveAt(catchExcTid.Count - 1);
                 if (!term) {
                     ReleaseLocalsFrom(catchScope);
                     L("  br label %L" + lfin);

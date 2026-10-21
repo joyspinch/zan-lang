@@ -499,6 +499,8 @@ partial class Irgen {
         if (cn == "Task" && mn == "Delay") { return true; }
         if (cn == "Gate" && mn == "Park") { return true; }
         if (cn != "Socket") { return false; }
+        if (mn == "ResolveSockAddr" && callExpr.kids.Count == 4) { return true; }
+        if (mn == "ResolveAsync" && callExpr.kids.Count == 1) { return true; }
         return mn == "ReadReady" || mn == "WriteReady" || mn == "RecvOv" || mn == "AcceptOv" || mn == "RecvToOv";
     }
     string ArgI64(Node a) {
@@ -592,18 +594,82 @@ partial class Irgen {
             return new ExprVal(rv, MkType("int"));
         }
         // AcceptOv
-        string fd2 = ArgI64(callExpr.kids[0]);
-        string outfd = FrameGep("%ff", 6);
-        EmitAsyncSaveSlots();
-        L("  store i64 " + st + ", i64* " + FrameGep("%ff", 2));
-        L("  call void @zan_io_accept_co(i64 " + fd2 + ", i8* %fp, void(i8*)* @" + curResumeSym + ", i64* " + outfd + ")");
-        L("  ret void");
-        L("resume_" + st + ":");
-        term = false; curLbl = "resume_" + st;
-        EmitAsyncReloadSlots();
-        string rs2 = FrameGep("%ff", 6);
-        string rv2 = NT(); L("  " + rv2 + " = load i64, i64* " + rs2);
-        return new ExprVal(rv2, MkType("int"));
+        if (mn == "AcceptOv") {
+            string fd2 = ArgI64(callExpr.kids[0]);
+            string outfd = FrameGep("%ff", 6);
+            EmitAsyncSaveSlots();
+            L("  store i64 " + st + ", i64* " + FrameGep("%ff", 2));
+            L("  call void @zan_io_accept_co(i64 " + fd2 + ", i8* %fp, void(i8*)* @" + curResumeSym + ", i64* " + outfd + ")");
+            L("  ret void");
+            L("resume_" + st + ":");
+            term = false; curLbl = "resume_" + st;
+            EmitAsyncReloadSlots();
+            string rs2 = FrameGep("%ff", 6);
+            string rv2 = NT(); L("  " + rv2 + " = load i64, i64* " + rs2);
+            return new ExprVal(rv2, MkType("int"));
+        }
+        // ResolveSockAddr(name, port, buf, cap): the runtime resolves the host
+        // name in a worker thread and writes the sockaddr length into the
+        // frame's result slot (an i32 there, the host's result slot is the
+        // same field -- irgen_expr_core.c ASYNC_FRAME_RESULT).
+        if (mn == "ResolveSockAddr") {
+            ExprVal namev = GenExpr(callExpr.kids[0]);
+            string nm = namev.op;
+            if (MapType(namev.ty) != "i8*") {
+                string nt = NT(); L("  " + nt + " = bitcast " + MapType(namev.ty) + " " + nm + " to i8*"); nm = nt;
+            }
+            string portv = ArgI64(callExpr.kids[1]);
+            string port32 = NT(); L("  " + port32 + " = trunc i64 " + portv + " to i32");
+            ExprVal bufv = GenExpr(callExpr.kids[2]);
+            string buf = bufv.op;
+            if (MapType(bufv.ty) != "i8*") {
+                string bt = NT(); L("  " + bt + " = bitcast " + MapType(bufv.ty) + " " + buf + " to i8*"); buf = bt;
+            }
+            string capv = ArgI64(callExpr.kids[3]);
+            string cap32 = NT(); L("  " + cap32 + " = trunc i64 " + capv + " to i32");
+            string outp = FrameGep("%ff", 6);
+            string out32 = NT(); L("  " + out32 + " = bitcast i64* " + outp + " to i32*");
+            EmitAsyncSaveSlots();
+            L("  store i64 " + st + ", i64* " + FrameGep("%ff", 2));
+            L("  call void @zan_io_resolve_sa_co(i8* " + nm + ", i32 " + port32 + ", i8* " + buf + ", i32 " + cap32 + ", i8* %fp, void(i8*)* @" + curResumeSym + ", i32* " + out32 + ")");
+            L("  ret void");
+            L("resume_" + st + ":");
+            term = false; curLbl = "resume_" + st;
+            EmitAsyncReloadSlots();
+            string rs = FrameGep("%ff", 6);
+            string rs32 = NT(); L("  " + rs32 + " = bitcast i64* " + rs + " to i32*");
+            string rv = NT(); L("  " + rv + " = load i32, i32* " + rs32);
+            string rv64 = NT(); L("  " + rv64 + " = zext i32 " + rv + " to i64");
+            return new ExprVal(rv64, MkType("int"));
+        }
+        // ResolveAsync(hostname): the runtime resolves the host name to an
+        // IPv4 address (host byte order) in a worker thread.
+        if (mn == "ResolveAsync") {
+            ExprVal hostv = GenExpr(callExpr.kids[0]);
+            string host = hostv.op;
+            if (MapType(hostv.ty) != "i8*") {
+                string ht = NT(); L("  " + ht + " = bitcast " + MapType(hostv.ty) + " " + host + " to i8*"); host = ht;
+            }
+            string outp = FrameGep("%ff", 6);
+            string out32 = NT(); L("  " + out32 + " = bitcast i64* " + outp + " to i32*");
+            EmitAsyncSaveSlots();
+            L("  store i64 " + st + ", i64* " + FrameGep("%ff", 2));
+            L("  call void @zan_io_resolve_co(i8* " + host + ", i8* %fp, void(i8*)* @" + curResumeSym + ", i32* " + out32 + ")");
+            L("  ret void");
+            L("resume_" + st + ":");
+            term = false; curLbl = "resume_" + st;
+            EmitAsyncReloadSlots();
+            string rs = FrameGep("%ff", 6);
+            string rs32 = NT(); L("  " + rs32 + " = bitcast i64* " + rs + " to i32*");
+            string rv = NT(); L("  " + rv + " = load i32, i32* " + rs32);
+            string rv64 = NT(); L("  " + rv64 + " = zext i32 " + rv + " to i64");
+            return new ExprVal(rv64, MkType("int"));
+        }
+        // an unknown intrinsic must not answer with a constant: the program
+        // would silently get wrong answers
+        diags.Error("await Socket." + mn + " is not supported by the self-hosted "
+            + "compiler yet", callExpr.line, callExpr.col);
+        return new ExprVal("0", MkType("int"));
     }
     // The result type of an awaited call: `Task<T>` -> T, a bare `Task` ->
     // void (no result). A declared return type spelled `Task<T>` is the C#
@@ -625,10 +691,22 @@ partial class Irgen {
         // handle, a plain value) has no such slot -- reading it produced
         // `bitcast i8* 0 to i64*` and clang rejected the IR outright. Report
         // it instead of emitting broken IR.
+        //
+        // The C host has THREE shapes (src/compiler/irgen_expr.c:
+        // emit_expr_await_expr): a coroutine frame (the awaited call started
+        // one), a TASK HANDLE (poll the task until it is done, then take
+        // its result), and anything else -- the value passes through
+        // unchanged (the host's function ends with `return sub`).
+        // `await sqlite3_step(stmt)` (a plain int call) is that third shape:
+        // the host awaits nothing and hands the value on.
         if (!sub.asyncCall) {
-            diags.Error("'await' expects an async call in the self-hosted compiler -- " +
-                "this operand is not lowered as a coroutine frame", callExpr.line, callExpr.col);
-            return new ExprVal("0", MkType("int"));
+            if (sub.ty != null && sub.ty.sval == "Task") {
+                ExprVal r = EmitAwaitTaskHandle(sub);
+                EmitAwaitNoSuspend();
+                return r;
+            }
+            EmitAwaitNoSuspend();
+            return sub;
         }
         Node resTy = MkType("int");
         if (sub.ty != null && sub.ty.a != null) { resTy = sub.ty.a; }
@@ -695,6 +773,51 @@ partial class Irgen {
         L("  call void @__zan_co_frame_free(i8* " + subv + ")");
         return new ExprVal(rvv2, resTy);
     }
+    // An await that does NOT suspend: the awaited value is already there (the
+    // host awaits nothing and hands the value on) or the task handle was
+    // waited for synchronously. The async frame numbers its resume labels by
+    // the await points in the body, so the label has to exist even though
+    // nothing ever reaches it -- otherwise the frame's switch refers to a
+    // label nobody emitted ("use of undefined value '%resume_2'").
+    void EmitAwaitNoSuspend() {
+        if (!curAsync) { return; }
+        int seq = curAwaitSeq; curAwaitSeq = curAwaitSeq + 1;
+        int st = seq + 1;
+        // the label starts a new basic block: the block before it has to be
+        // terminated first (the suspending path ends with `ret void`)
+        if (!term) { L("  br label %resume_" + st + ";"); }
+        L("resume_" + st + ":");
+        term = false; curLbl = "resume_" + st;
+    }
+
+    // `await <task handle>`: the handle is a frame pointer -- pump the
+    // cooperative scheduler until the frame is done, then take its result
+    // (the frame is reaped by the reader, the same protocol as `t.Result`).
+    // The C host polls the task's completion field and reads its result
+    // (irgen_expr.c: the task-struct branch of emit_expr_await_expr).
+    ExprVal EmitAwaitTaskHandle(ExprVal sub) {
+        Node resTy = MkType("void");
+        if (sub.ty != null && sub.ty.kids.Count > 0) { resTy = AsyncElemTyOf(sub.ty.kids[0]); }
+        string fp = sub.op;
+        if (MapType(sub.ty) == "i64") {
+            string p = NT();
+            L("  " + p + " = inttoptr i64 " + fp + " to i8*");
+            fp = p;
+        }
+        EmitTaskWait(fp);
+        string lt = MapType(resTy);
+        if (lt == "void") {
+            L("  call void @__zan_co_frame_free(i8* " + fp + ")");
+            return new ExprVal("0", MkType("int"));
+        }
+        string fph = TaskFrameHeader(fp);
+        string rp = FrameGep(fph, 6);
+        string resi = NT(); L("  " + resi + " = load i64, i64* " + rp);
+        string rvv = FromI64(resi, lt);
+        L("  call void @__zan_co_frame_free(i8* " + fp + ")");
+        return new ExprVal(rvv, resTy);
+    }
+
     // Release the frame's owned refs (params + locals via ReleaseLocalsFrom, and
     // the receiver which is not tracked as a local). Call exactly once per exit.
     void EmitAsyncEpilogue() {
@@ -1159,7 +1282,10 @@ partial class Irgen {
         H("declare void @zan_io_wait_co(i64, i32, i8*, void(i8*)*)");
         H("declare void @zan_gate_park(i64, i8*, void(i8*)*)");
         H("declare void @zan_io_recv_co(i64, i8*, i32, i8*, void(i8*)*, i64*)");
+        H("declare void @zan_io_recv_to_co(i64, i8*, i32, i64, i8*, void(i8*)*, i64*)");
         H("declare void @zan_io_accept_co(i64, i8*, void(i8*)*, i64*)");
+        H("declare void @zan_io_resolve_sa_co(i8*, i32, i8*, i32, i8*, void(i8*)*, i32*)");
+        H("declare void @zan_io_resolve_co(i8*, i8*, void(i8*)*, i32*)");
         if (hostWin) {
             if (!ExternSeen("GetTickCount64")) { externDecls.Add("GetTickCount64"); H("declare i64 @GetTickCount64()"); }
             if (!ExternSeen("Sleep")) { externDecls.Add("Sleep"); H("declare void @Sleep(i64)"); }

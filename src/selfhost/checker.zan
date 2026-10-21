@@ -32,12 +32,14 @@ public class Checker {
     bool curStatic;             // is the current method static
     int infCount;
     int loopDepth;              // enclosing loop/switch nesting
+    int catchDepth;             // enclosing catch-clause nesting (a bare `throw;`
+                                // is only valid inside a catch block)
     List<string> scopeName;     // value names currently in scope
     List<Node> scopeType;       // parallel declared/inferred types (may be null)
 
     public Checker(Binder b, Diags d) {
         binder = b; diags = d; curClass = null; curRet = null;
-        curStatic = false; loopDepth = 0;
+        curStatic = false; loopDepth = 0; catchDepth = 0;
         scopeName = new List<string>(); scopeType = new List<Node>();
     }
 
@@ -271,16 +273,20 @@ public class Checker {
         if (k == AK.Index()) {
             Node ot = InferType(e.a);
             if (ot != null) {
-                if (ot.sval == "List" && ot.kids.Count > 0) { return ot.kids[0]; }
-                if (ot.sval == "Span" && ot.kids.Count > 0) { return ot.kids[0]; }
-                if (ot.sval == "string") { return MkType("char"); }
-                if (ot.ival == 1) {
+                // an array is indexed first: `List<string>[]` yields
+                // `List<string>`, not the list's own element type -- the
+                // array rank (ival) decides, the element name does not.
+                if (ot.ival >= 1) {
                     Node el = MkType(ot.sval); el.kids = ot.kids;
+                    el.ival = ot.ival - 1;
                     // the element of a `T?[]` is nullable: the flag rides on
                     // the array type
                     el.op = ot.op;
                     return el;
                 }
+                if (ot.sval == "List" && ot.kids.Count > 0) { return ot.kids[0]; }
+                if (ot.sval == "Span" && ot.kids.Count > 0) { return ot.kids[0]; }
+                if (ot.sval == "string") { return MkType("char"); }
             }
             return null;
         }
@@ -596,6 +602,7 @@ public class Checker {
         if (m.type != null) { CheckSignatureType(m.type); }
         scopeName = new List<string>(); scopeType = new List<Node>();
         loopDepth = 0;
+        catchDepth = 0;
         // An async method with a Task-shaped return type returns its RESULT,
         // not a handle: the C host's parser rewrites `async Task<T>` to `T`
         // and `async Task` to `void` (desugar_async_task_method) before the
@@ -747,7 +754,20 @@ public class Checker {
             }
             return;
         }
-        if (k == AK.ThrowStmt()) { CheckExpr(n.a); return; }
+        if (k == AK.ThrowStmt()) {
+            if (n.a == null) {
+                // a bare `throw;` re-raises the exception the enclosing catch
+                // clause caught -- outside a catch block it is an error (the
+                // C host refuses it with the very same wording)
+                if (catchDepth == 0) {
+                    diags.Error("a rethrow (`throw;`) is only valid inside a catch block",
+                        n.line, n.col);
+                }
+                return;
+            }
+            CheckExpr(n.a);
+            return;
+        }
         if (k == AK.IfStmt()) {
             CheckExpr(n.a);
             int m1 = ScopeMark(); CheckStmt(n.b); ScopeTrim(m1);
@@ -832,7 +852,9 @@ public class Checker {
                 CheckType(cc.type);
                 int m2 = ScopeMark();
                 ScopeAdd(cc.sval, cc.type);
+                catchDepth = catchDepth + 1;
                 CheckStmt(cc.a);
+                catchDepth = catchDepth - 1;
                 ScopeTrim(m2);
                 cc = cc.b;
             }

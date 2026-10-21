@@ -2400,6 +2400,15 @@ partial class Irgen {
         if (cls != null && FindMethodUp(cls, "get_" + e.sval) != null) {
             return EmitInstanceCall(obj, obj.ty.sval, "get_" + e.sval, new Node(AK.Call()));
         }
+        // an INSTANCE method group used as a delegate value (`obj.Method`):
+        // the closure binds the receiver (the C host's
+        // emit_method_group_closure).
+        if (cls != null) {
+            Node mg = FindMethodUp(cls, e.sval);
+            if (mg != null && !HasMod(mg, MOD.Static()) && !HasMod(mg, MOD.Extern())) {
+                return EmitInstanceMethodGroup(obj, cls, mg);
+            }
+        }
         // The member is not a field, not a property and not a known builtin
         // member of the receiver's type. Fail closed: a silent 0 would hand
         // the program wrong answers without a word.
@@ -2526,6 +2535,9 @@ partial class Irgen {
         // (a jagged T[][] keeps its remaining levels on the element)
         if (obj.ty != null && obj.ty.ival >= 1) {
             Node et2 = MkType(obj.ty.sval); et2.ival = obj.ty.ival - 1;
+            // the type arguments travel with the element: the element of a
+            // `List<string>[]` is a `List<string>`, not a bare `List`
+            et2.kids = obj.ty.kids;
             // the element of a `T?[]` is a NULLABLE value: the flag rides on
             // the array type, so it has to travel down to the element
             et2.op = obj.ty.op;
@@ -2561,6 +2573,7 @@ partial class Irgen {
             // the element's NULLABLE flag rides along: `new int?[3]` is an
             // array of nullable ints, not a nullable array of ints
             Node at = MkType(ty.sval); at.ival = 1 + e.op; at.op = ty.op;
+            at.kids = ty.kids;
             Node elemTy = ArrElemOf(at);
             int esz = ArrElemSize(elemTy);
             string bytes = NT();
@@ -3738,6 +3751,87 @@ partial class Irgen {
         deferred.Append(gname + " = global [2 x i8*] [i8* bitcast ("
             + LamFnType(retTy, pt) + " " + fname + " to i8*), i8* null]\n");
         return new ExprVal(MgClosureValue(gname), DelegTypeOf(retTy, pt));
+    }
+
+    // An INSTANCE method group used as a delegate value (`obj.Method`): the
+    // closure binds the receiver -- the C host's emit_method_group_closure
+    // (the receiver travels in the closure record; the thunk calls the
+    // method with it as the first argument).
+    //
+    // The self-host's closure ABI is the lambda one: a { fn, env } record and
+    // a thunk with the signature (i8* env, params...). The env of an
+    // instance method group holds exactly one slot -- the receiver.
+    ExprVal EmitInstanceMethodGroup(ExprVal recv, Node cls, Node m) {
+        string owner = DeclOwnerOf(cls, m);
+        if (owner == "") { owner = MethodOwner(cls, m.sval); }
+        if (owner == "") { owner = cls.sval; }
+        string target = MethodSym(owner, m);
+        List<Node> pt = new List<Node>();
+        int i = 0;
+        while (i < m.kids.Count) {
+            Node p = m.kids[i];
+            if (p.kind == AK.Param()) { pt.Add(p.type); }
+            i = i + 1;
+        }
+        Node retTy = m.type; if (retTy == null) { retTy = MkType("void"); }
+        string rt = MapType(retTy);
+        string fname = "@__mg_" + target;
+        // the receiver's type: the class that declares the method
+        string rcvTy = MapType(MkType(owner));
+        bool arc = ArcManaged(MkType(owner));
+        // one thunk per method (the receiver is not part of it -- it comes
+        // from the closure's env)
+        if (IndexOfStr(mgTargets, target) < 0) {
+            mgTargets.Add(target);
+            string sig = "define " + rt + " " + fname + "(i8* %env";
+            int a = 0;
+            while (a < pt.Count) { sig = sig + ", " + MapType(pt[a]) + " %p" + a; a = a + 1; }
+            sig = sig + ") {";
+            deferred.Append(sig); deferred.Append("\n");
+            deferred.Append("entry:\n");
+            deferred.Append("  %envi = bitcast i8* %env to i64*\n");
+            deferred.Append("  %rcvi = load i64, i64* %envi\n");
+            deferred.Append("  %rcv = inttoptr i64 %rcvi to " + rcvTy + "\n");
+            if (arc) { deferred.Append("  %rcv8 = bitcast " + rcvTy + " %rcv to i8*\n"); }
+            string args = rcvTy + " %rcv";
+            a = 0;
+            while (a < pt.Count) { args = args + ", " + MapType(pt[a]) + " %p" + a; a = a + 1; }
+            // the closure keeps the receiver alive for the duration of the
+            // call (the host's closure record retains its target and releases
+            // it when the record dies; the self-host's records are never
+            // freed, so the retain/release pair lives in the thunk)
+            if (arc) { deferred.Append("  call void @zretain(i8* %rcv8)\n"); }
+            if (rt == "void") {
+                deferred.Append("  call void @" + target + "(" + args + ")\n");
+                if (arc) { deferred.Append("  call void @zrelease(i8* %rcv8)\n"); }
+                deferred.Append("  ret void\n");
+            } else {
+                deferred.Append("  %r = call " + rt + " @" + target + "(" + args + ")\n");
+                if (arc) { deferred.Append("  call void @zrelease(i8* %rcv8)\n"); }
+                deferred.Append("  ret " + rt + " %r\n");
+            }
+            deferred.Append("}\n");
+        }
+        // the env: one slot holding the receiver
+        string env = NT();
+        L("  " + env + " = call i8* @malloc(i64 8)");
+        string envi = NT();
+        L("  " + envi + " = bitcast i8* " + env + " to i64*");
+        string rcvi = NT();
+        L("  " + rcvi + " = ptrtoint " + MapType(recv.ty) + " " + recv.op + " to i64");
+        L("  store i64 " + rcvi + ", i64* " + envi);
+        // the closure record { fn, env }
+        string rec = NT();
+        L("  " + rec + " = call i8* @malloc(i64 16)");
+        string recp = NT();
+        L("  " + recp + " = bitcast i8* " + rec + " to i8**");
+        string fni8 = NT();
+        L("  " + fni8 + " = bitcast " + LamFnType(retTy, pt) + " " + fname + " to i8*");
+        L("  store i8* " + fni8 + ", i8** " + recp);
+        string envp = NT();
+        L("  " + envp + " = getelementptr i8*, i8** " + recp + ", i64 1");
+        L("  store i8* " + env + ", i8** " + envp);
+        return new ExprVal(TagClosure(rec), DelegTypeOf(retTy, pt));
     }
 
     ExprVal GenLambda(Node lam) {
@@ -4989,6 +5083,9 @@ partial class Irgen {
         et.ival = t.ival - 1;
         et.op = t.op;
         et.sval2 = t.sval2;
+        // the type arguments travel with the element: the element of a
+        // `List<string>[]` is a `List<string>`, not a bare `List`
+        et.kids = t.kids;
         return et;
     }
 
