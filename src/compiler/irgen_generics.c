@@ -2580,14 +2580,14 @@ static LLVMValueRef emit_str_concat_n(zan_irgen_t *g, zan_ast_node_t *expr,
         owned[i] = !is_string_expr(g, ops[i], locals) ||
                    expr_yields_owned_rc_value(g, ops[i], locals);
         if (owned[i]) {
-            int ehk = eh_slot_kind_of(infer_expr_type(g, ops[i], locals));
-            if (ehk == ZAN_EH_SLOT_OBJ) {
-                emit_eh_tmp_push(g, s);
-            } else {
-                LLVMValueRef slot = emit_entry_alloca(g, LLVMTypeOf(s), "ct.eh");
-                LLVMBuildStore(g->builder, s, slot);
-                emit_eh_tmp_push_slot(g, slot, ehk);
-            }
+            /* s 永远是托管字符串的数据指针（整数/字符操作数已由
+             * emit_to_cstr_of 转成 itoa 缓冲），所以 EH 槽位种类必须是
+             * ZAN_EH_SLOT_STR。若按源操作数的类型取种类，整数操作数会
+             * 落到 ZAN_EH_SLOT_OBJ，异常展开时 zan_rt_release_dyn 会把
+             * 字符串头字当成 site 下标去查析构表——读坏内存。 */
+            LLVMValueRef slot = emit_entry_alloca(g, LLVMTypeOf(s), "ct.eh");
+            LLVMBuildStore(g->builder, s, slot);
+            emit_eh_tmp_push_slot(g, slot, ZAN_EH_SLOT_STR);
         }
         lens[i] = emit_cstr_len_of(g, s, ops[i]);
         total = zan_add(g->builder, total, lens[i], "ct");
