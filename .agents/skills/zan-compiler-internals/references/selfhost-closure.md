@@ -1687,3 +1687,46 @@ kernel32、shell32、user32、advapi32、version）。
 - 通用教训：**同一个语义只留一条实现路径**。转义解码曾经有三份
   （irgen / parser / attrgen），各写各的，改一处就漂。宿主在词法期解、
   自举在生成期解——位置可以不同，规则必须只有一份。
+## 86. 泛型类的构造器要**按实例特化**（宿主 find_generic_ctor）
+
+- 坑（2026-10-21 实测）：`class Bag<T> { List<T> src; Bag(...) { src = new List<T>(); } }`
+  在自举里构造器是**所有实例共用的那一份**（`Bag_ctor__TextOf.T`），于是
+  `new List<T>()` 的元素类型是擦除的 T → 列表建出来是
+  `zlist_new(i64 0)`（**不拥有元素**）→ 元素没被 retain → lambda 读完
+  字段就 release 掉 → 之后再读就是 use-after-free → 堆损坏
+  （exit 0xC0000374，离崩溃点很远）。
+  宿主按实例特化构造器（`src/compiler/irgen_expr.c` 的
+  `find_generic_ctor`）：`Bag<Item>` 的构造器里 `new List<Item>()` 的
+  列表带元素描述符、**拥有**元素。
+- 做法：泛型类的 `new` 调用点按类实例特化构造器（符号带类型实参），
+  构造器体用**代入后的** AST（`CloneSubst`）生成，接收者的静态类型带上
+  具体类型实参（`curThisTy`/`curInstArgs`），字段读回来才是
+  `List<Item>` 而不是 `List<T>`；调用点的实参也用具体形参类型。
+- 通用教训：**"所有实例共用一份泛型代码"和"每个实例一份"是两种语义**，
+  差别通常落在集合的**拥有关系**上（谁 retain 谁）。宿主选了每个实例
+  一份，自举就得跟上，否则表现为远处的堆损坏。
+## 87. 泛型类里的委托字段：签名要按接收者特化（宿主 subst_delegate_sig）
+
+- 坑（2026-10-21 实测）：`class Bag<T> { TextOf<T> text; string TextAt(int i) { return text(src[i]); } }`
+  在自举里 `text` 的类型是擦除的 `TextOf<T>` → 委托调用按
+  `i8* (i8*, i64)*` 发出，把元素**当整数**传进去；而闭包
+  （`__lambda_0`）的形参是 `%Item*` → 闭包把整数当指针解 → 崩。
+  宿主在 `src/compiler/irgen_expr.c` 的 `subst_delegate_sig` 里按
+  **接收者的类型实参**特化委托签名（`T` → `Item`）。
+- 做法：委托调用发射前，按当前实例（`curInstCls`/`curInstArgs`）把委托
+  类型的类型实参代入（`InstDelegateType`）。
+- 通用教训：**擦除的槽位形状和真实的值形状要分开**——存储用擦除形，
+  值的类型按实例还原；漏了还原就是"把整数当指针"。
+## 88. 构造器重载：lambda 实参**只**匹配委托形参（宿主 find_ctor）
+
+- 坑（2026-10-21 实测）：`new Bag<Item>(i => i.name)`（`Bag<T>` 有
+  `Bag(List<string>)`、`Bag(TextOf<T>)`、`Bag(RowOf<T>)` 三个构造器），
+  自举按"实参类型未知"把三个都打平 → 按声明顺序选中
+  `Bag(List<string>)` → lambda 的形参没有类型 → 体里的 `i.name` 报
+  "member 'name' of type 'int'"。
+  宿主的 `find_ctor`（`src/compiler/irgen_expr_core.c:917`）把不匹配的
+  候选**排除**（compatible=false）：lambda 实参只匹配委托形参，且委托的
+  形参个数必须与 lambda 的相同。
+- 做法：构造器候选筛选阶段加这条规则（`CtorTakesLambda`）。
+- 通用教训：**"实参类型未知"不等于"实参适配任何形参"**——宿主在实参
+  类型推不出来时按**形状**（是不是 lambda、委托的元数）先筛一遍。

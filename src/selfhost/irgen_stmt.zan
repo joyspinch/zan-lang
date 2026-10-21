@@ -412,6 +412,65 @@ partial class Irgen {
     // arguments, so the class name is enough.
     string StaticCtorSym(string owner) { return owner + "_sctor"; }
 
+    // A generic class' constructor is shared by every instantiation, so the
+    // collections it creates would not know their element type -- a list of
+    // objects would not own its elements, and they would be freed while the
+    // list still holds them. The C host specializes the constructor per
+    // instantiation (src/compiler/irgen_expr.c: find_generic_ctor); the
+    // self-host does the same, so `new Bag<Item>(...)` runs a body that knows
+    // the element type is Item. The specialized body is queued for emission.
+    string SpecCtorSym(string owner, Node ctor, Node instTy) {
+        Node cls = binder.FindType(owner);
+        if (cls == null) { return CtorSym(owner, ctor); }
+        List<string> tps = TParams(cls);
+        if (tps.Count == 0 || instTy == null) { return CtorSym(owner, ctor); }
+        if (instTy.kids.Count != tps.Count) { return CtorSym(owner, ctor); }
+        StringBuilder sb = new StringBuilder();
+        sb.Append(CtorSym(owner, ctor));
+        sb.Append("__SPI");
+        int i = 0;
+        while (i < instTy.kids.Count) {
+            if (instTy.kids[i] == null || MentionsTypeParam(instTy.kids[i])) { return CtorSym(owner, ctor); }
+            sb.Append("_");
+            sb.Append(TypeTag(instTy.kids[i]));
+            i = i + 1;
+        }
+        string sym = sb.ToString();
+        if (IndexOfStr(specSyms, sym) < 0) {
+            specSyms.Add(sym);
+            specCtors.Add(CloneSubst(ctor, tps, instTy.kids));
+            specCtorCls.Add(cls);
+            specCtorThis.Add(instTy);
+            specCtorSyms.Add(sym);
+        }
+        return sym;
+    }
+
+    // The symbol of the constructor to CALL for `owner` inside the current
+    // instantiation: the specialized clone when the class is generic and the
+    // instantiation is concrete, the shared one otherwise.
+    string CtorCallSym(string owner, Node ctor) {
+        if (curInstCls != "" && curInstCls == owner
+            && curInstArgs != null && curInstArgs.Count > 0) {
+            Node it = new Node(AK.TypeRef());
+            it.sval = owner;
+            int i = 0;
+            while (i < curInstArgs.Count) { it.Add(curInstArgs[i]); i = i + 1; }
+            return SpecCtorSym(owner, ctor, it);
+        }
+        return CtorSym(owner, ctor);
+    }
+
+    // The parameter type of a constructor of the CURRENTLY specialized class,
+    // with the class's type arguments applied (`TextOf<T>` in `Bag<Item>` is
+    // `TextOf<Item>`): the specialized constructor takes the concrete shapes.
+    Node InstCtorParamType(Node ctor, int idx) {
+        Node t = CtorParamType(ctor, idx);
+        if (curInstCls == "" || curInstArgs == null || curInstArgs.Count == 0) { return t; }
+        if (curInstCls != curClass) { return t; }
+        return SubstTP(t, TParams(binder.FindType(curInstCls)), curInstArgs);
+    }
+
     // ---- non-emitting argument typer (for overload resolution only) ----
     // Yields the static type of an argument expression without generating any
     // IR. Returns null when the type cannot be determined; callers treat that
@@ -704,6 +763,45 @@ partial class Irgen {
         return argc <= seen;
     }
 
+    // The number of parameters a lambda declares.
+    int LambdaArity(Node lam) {
+        int n = 0; int i = 0;
+        while (i < lam.kids.Count) {
+            if (lam.kids[i].kind == AK.Param()) { n = n + 1; }
+            i = i + 1;
+        }
+        return n;
+    }
+
+    // The C host's constructor selection (src/compiler/irgen_expr_core.c:
+    // find_ctor) rules a constructor OUT when an argument does not fit its
+    // parameter: a lambda fits only a delegate-typed parameter whose
+    // parameter count matches the lambda's arity -- anything else makes the
+    // whole constructor incompatible. Without that rule a `Bag<T>(List<string>)`
+    // overload swallows the lambda argument of `new Bag<Item>(i => i.name)`,
+    // the lambda's parameter stays untyped and its body does not compile.
+    bool CtorTakesLambda(Node ctor, Node e) {
+        int argc = e.kids.Count;
+        int j = 0;
+        int i = 0;
+        while (i < ctor.kids.Count) {
+            Node p = ctor.kids[i];
+            if (p.kind == AK.Param()) {
+                if (j < argc) {
+                    Node arg = e.kids[j];
+                    if (arg != null && arg.kind == AK.Lambda()) {
+                        Node pt = p.type;
+                        if (pt == null || !IsDelegate(pt)) { return false; }
+                        if (DelegParams(pt).Count != LambdaArity(arg)) { return false; }
+                    }
+                }
+                j = j + 1;
+            }
+            i = i + 1;
+        }
+        return true;
+    }
+
     // Select the constructor for `new C(args)`: a constructor fits when the
     // argument count fits its parameters (the omitted trailing ones have
     // defaults); with several fitting overloads the argument types pick the
@@ -722,7 +820,7 @@ partial class Irgen {
         List<Node> fit = new List<Node>();
         i = 0;
         while (i < cands.Count) {
-            if (CtorFitsStrict(cands[i], argc)) { fit.Add(cands[i]); }
+            if (CtorFitsStrict(cands[i], argc) && CtorTakesLambda(cands[i], e)) { fit.Add(cands[i]); }
             i = i + 1;
         }
         if (fit.Count == 0) { return null; }

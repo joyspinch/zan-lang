@@ -2763,20 +2763,28 @@ partial class Irgen {
                     // body is shared, so it takes the value in a slot.
                     Node epty = pty;
                     if (ctorSpec) { epty = SubstTP(pty, ctps, ty.kids); }
+                    // The CALL matches the constructor that actually runs: a
+                    // specialized constructor takes the CONCRETE parameter
+                    // types (the C host's find_generic_ctor), the shared one
+                    // the erased shapes.
+                    Node cty = pty;
+                    if (ctorSpec) { cty = epty; }
                     if (IsRefParam(ctor, i) && cargs[i] != null
                         && cargs[i].kind == AK.OutArg()) {
                         string addr;
                         if (cargs[i].type != null) { addr = NewOutLocal(cargs[i]); }
-                        else { addr = RefPlacePtr(cargs[i].a, pty); }
-                        args = args + ", " + MapType(pty) + "* " + addr;
+                        else { addr = RefPlacePtr(cargs[i].a, cty); }
+                        args = args + ", " + MapType(cty) + "* " + addr;
                         i = i + 1;
                         continue;
                     }
                     ExprVal av = GenArgExpr(cargs[i], epty);
-                    args = args + ", " + MapType(pty) + " " + CallArg(av, pty);
+                    args = args + ", " + MapType(cty) + " " + CallArg(av, cty);
                     i = i + 1;
                 }
-                L("  call void @" + CtorSym(cn, ctor) + "(" + args + ")");
+                string ctorSym = CtorSym(cn, ctor);
+                if (ctorSpec) { ctorSym = SpecCtorSym(cn, ctor, ty); }
+                L("  call void @" + ctorSym + "(" + args + ")");
             }
             else {
                 int argc = e.kids.Count;
@@ -3990,8 +3998,24 @@ partial class Irgen {
         return EmitDelegateCallVal(GenExpr(calleeExpr), dty, e);
     }
 
+    // A delegate field of a generic class carries the class's type parameter
+    // in its signature: `TextOf<T>` in `Bag<T>` means `TextOf<Item>` in
+    // `Bag<Item>`. The C host specializes the signature with the receiver's
+    // type arguments (src/compiler/irgen_expr.c: subst_delegate_sig) --
+    // without it the call passes an erased i64 where the closure expects the
+    // object pointer, and the closure dereferences the integer.
+    Node InstDelegateType(Node dty) {
+        if (dty == null) { return dty; }
+        if (curInstCls == "" || curInstArgs == null || curInstArgs.Count == 0) { return dty; }
+        List<string> tps = TParams(binder.FindType(curInstCls));
+        if (tps.Count == 0) { return dty; }
+        if (!MentionsTypeParam(dty)) { return dty; }
+        return SubstTP(dty, tps, curInstArgs);
+    }
+
     // invoke an already-evaluated delegate value
     ExprVal EmitDelegateCallVal(ExprVal clo, Node dty, Node e) {
+        dty = InstDelegateType(dty);
         List<Node> pt = DelegParams(dty);
         Node retTy = DelegRet(dty);
         // The arguments are evaluated ONCE, before the closure/bare split.
