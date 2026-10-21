@@ -1713,6 +1713,9 @@
 - 验证：自举源码取 HEAD 的干净副本 + 本条改动重建 gen1 → `json_ignore_ok.zan`
   的 IR 过 clang、程序跑起来、stdout 与黄金逐字相同；`prog1.zan` 的 IR 逐字节
   不变（SHA256 `9E54D3DC…`）。
+  - 另一会话的在途改动落定后，工作树里直接 `ctest -R "selfhost_gen1|selfhost_json_ignore"`
+    → **2/2 Passed**；
+  - 自举差分门子集重跑 → **11/11 PASS**（含 `ternary_stmt_start`）→ 无回归。
 - 教训：**自举拼 IR 文本时，任何"空指针"都要带类型**。宿主侧的 IR 一直是
   `i8* null`（参数类型是已知的），自举把参数类型藏进字符串拼接里，就容易把
   类型丢掉——而拼出来的 IR 只能靠 clang/llvm-as 验证，肉眼看 `null` 完全合理。
