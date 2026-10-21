@@ -1501,3 +1501,55 @@
   （wuwei 已在用 `Game.Data`）。"看着像重复"不等于"该抽"——判据是换题材
   还成不成立。
 - 关联：A473（同类评估：机制成立但只有一个使用者，暂不抽）。
+
+### [x] A475 抽包时 `Gui.Widget.QrEncoder` 的公开面缩水——`SeqByteLen` 等无修饰符成员消失
+
+- 背景：编码器实现在 `32a91d0c7` 抽到 `Zan.Barcode` 包（`System.Barcode`），
+  `packages/Zan.Gui/src/Gui/Widget/QrEncoder.zan` 退化成薄适配（只留 `Encode` /
+  `ParseEcl`）。那次 commit message 写的是"公开签名与行为不变"——**不成立**：
+  旧类上的 `static int SeqByteLen(int lead)` 等成员**没有修饰符**，而 Zan 里
+  "无修饰符"= 默认跨包可访问（成员可见性判断只拦 `private/protected/internal`），
+  所以它们一直是外部项目的既成公开面，不是"内部实现"。删掉就是公开面断裂。
+- 波及面（实测）：外部项目 `legend` 的名牌宽度计算直接调
+  `QrEncoder.SeqByteLen(s[i] & 255)`，抽包后编译报
+  `QrEncoder.SeqByteLen has no member` + `unresolved call` +
+  `code generation failed`；仓库自己的 `gui-design` skill 文档也还在教用户
+  这么调。绕行（改 `using System.Barcode`）不可用：同时 `using Gui.Widget`
+  时裸 `QrEncoder` 是歧义名。
+- 已落地的修法：兼容面**只转发纯函数**（`SeqByteLen` / `IsNumeric` /
+  `AlnumValueByte` / `ModeOfByte`），实现仍然只有 System.Barcode 一份；规格表
+  （EC 分块表、GF 表）在 `System.Barcode.QrSpec`；其余成员用**全限定名**可达
+  （全限定名不撞名）。`System.Barcode.QrEncoder` 侧把这四个函数显式标成
+  `public`，不再靠"无修饰符=可访问"的隐式规则。回归用例
+  `tests/conformance/qr_encoder_compat_surface.zan` 锁住"只用 `using Gui.Widget`
+  时兼容面仍在、行为不变"。
+- 教训：抽包/搬实现时**公开面要逐项核对**——"无修饰符"不是私有而是默认公开；
+  commit message 写"公开面不变"之前，按名字把旧类成员对一遍。
+- 关联：A476（同类"成员存在性"漏网）、A472。
+
+### [ ] A476 未知方法调用目标不在类型检查阶段拦下，且诊断泄漏内部符号名
+
+- 现象：调用**不存在的成员方法**时类型检查阶段不报，拖到发码阶段才炸：
+  - 实例方法调用 `s.NoSuchInstanceMethod()` → `'string' has no member
+    'NoSuchInstanceMethod'` + `error: code generation failed`；
+  - 静态方法调用 `Encoding.NoSuchStaticMember(1)` → `type 'System.Text.Encoding'
+    has no member 'NoSuchStaticMember'` + `unresolved call
+    'Encoding.NoSuchStaticMember'` + `code generation failed`。
+  而**成员访问**（不调用）是拦得住的：`s.NoSuchInstanceMember` /
+  `Encoding.NoSuchStaticField` 都在类型检查阶段报
+  `1 error(s) after type checking`。
+- 根因：`src/compiler/checker.c` 的成员解析里 `if (!in_call_callee && ...)`
+  （现 4331 行）让"调用目标"整段跳过成员存在性检查——`in_call_callee` 为真时
+  直接落到函数末尾返回 `type_error` 而**不发任何诊断**，错误被推迟到
+  `src/compiler/irgen_call.c`：`diagnose_unresolved_static_chain`（304 行起）
+  与 5389 / 5425 / 5431 行的补诊断。
+- 连带影响（诊断质量）：
+  - 用户看到的是 `code generation failed` 这种**发码阶段兜底文案**，而不是类型
+    错误，定位成本高；
+  - 诊断里泄漏编译器内部符号名：`checker.c` 4335-4341 行把命名空间 `ns` 与
+    `obj_type->sym->name` 拼起来打印，而包内类的 `sym->name` 是路径式内部名
+    （如 `Gui.Widget.Gui_Widget_QrEncoder`）。
+- 可行方向：让"调用目标成员不存在"也在 checker 阶段报（`in_call_callee` 时照样
+  走成员存在性检查，只是措辞区分成"没有这个方法"）；诊断里的类名改用面向用户的
+  名字（binder 的类型名或源文件名），不要用内部符号名。
+- 关联：A475（同一类"公开面/成员存在性"问题）、A471（checker 漏检）。
