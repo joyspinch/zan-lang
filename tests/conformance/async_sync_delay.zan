@@ -1,0 +1,57 @@
+// 非 async 方法里的 `await Task.Delay(ms)` 必须真的等。
+//
+// 坑：编译器原来在"顶层非异步上下文"分支里**只查**模块里的 `Sleep`
+// （Windows）/ `poll`（POSIX）。这两个符号本来就不在当前模块里——Sleep
+// 是 Win32 API、poll 是 libc 符号，链接期才进来——`LLVMGetNamedFunction`
+// 找不到就返回 NULL，于是整个等待被**静默跳过**：
+// `await Task.Delay(500)` 编译成一条 ret，方法立刻返回。
+// 实测：请求 500ms，实际耗时 0.0002ms。
+//
+// 修法：与 irgen.c 里 zan_io_pump_timeout 一致——**声明**符号
+// （LLVMAddFunction）而不是只查。
+//
+// 断言只卡**下界**（等了 >= 阈值），不卡上界：上界在慢机器上会 flaky，
+// 而"等没等"是二值事实——跳过等待必然低于下界，真等了必然不低于。
+using System;
+
+class Program {
+    // 非 async 方法里的 await Task.Delay：编译器只能同步地把线程睡掉。
+    static void SyncDelay(int ms) {
+        await Task.Delay(ms);
+    }
+
+    // 非 async 方法里 await 一个 async 调用：编译器把子协程驱动到完成。
+    static int SyncAwaitCall(int x) {
+        int r = await ComputeAsync(x);
+        return r;
+    }
+
+    static async int ComputeAsync(int x) {
+        await Task.Delay(10);
+        return x * 2;
+    }
+
+    static void Main() {
+        // 1. 同步等待必须真的等。
+        Stopwatch sw = new Stopwatch();
+        sw.Restart();
+        SyncDelay(200);
+        double elapsed = sw.ElapsedMilliseconds();
+        Console.WriteLine("syncDelay waited=" + Convert.ToString(elapsed >= 150 ? 1 : 0));
+
+        // 2. 非 async 方法里 await async 调用：结果要对。
+        int r = SyncAwaitCall(21);
+        Console.WriteLine("syncAwaitCall r=" + Convert.ToString(r));
+
+        // 3. async 方法里的 await Task.Delay 仍然照常（回归护栏）。
+        sw.Restart();
+        await AsyncDelay(120);
+        double elapsed2 = sw.ElapsedMilliseconds();
+        Console.WriteLine("asyncDelay waited=" + Convert.ToString(elapsed2 >= 90 ? 1 : 0));
+    }
+
+    static async int AsyncDelay(int ms) {
+        await Task.Delay(ms);
+        return 1;
+    }
+}

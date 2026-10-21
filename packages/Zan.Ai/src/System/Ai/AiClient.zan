@@ -257,10 +257,15 @@ public class AiClient : IDisposable {
 
     // 流式补全：逐块把增量文本推给 onDelta。
     //
-    // onDelta 返回 false 表示调用方要停止（客户端断开）——此时不再
-    // 继续读流，直接返回已收到的全文。
+    // **增量投递**：传输在后台跑，字节边到边解析，onDelta 在**对应
+    // 分片到达时**就被调用——不是等整条响应收完再一次性倾倒。整条
+    // 缓冲完再回调等于没有流式：用户要等模型把话说完才看到第一个字。
     //
-    // 返回完整文本（把所有增量拼起来）。
+    // onDelta 返回 false 表示调用方要停止（客户端断开）——此时中止
+    // 传输，返回已收到的全文。
+    //
+    // 返回完整文本（把所有增量拼起来）。失败返回 null，原因在
+    // lastError。
     public async string Stream(List<AiMessage> messages, double temperature,
     AiDeltaFn onDelta) {
         this.lastError = "";
@@ -277,48 +282,121 @@ public class AiClient : IDisposable {
         body.PutBool("stream", true);
         body.PutJson("messages", AiClient.MessagesJson(messages));
 
+        string payload = body.ToJson();
+        if (payload.Length > this.config.requestLimitBytes) {
+            this.lastError = "请求体超过上限（"
+            + Convert.ToString(this.config.requestLimitBytes) + " 字节）";
+            return null;
+        }
+
+        HttpClient http = this.StreamClient(ep);
+        if (http == null) {
+            this.lastError = "服务地址不合法: " + this.config.baseUrl;
+            return null;
+        }
+
+        // 传输与消费分离：producer 把字节推进 sink（内存缓冲 + 事件门），
+        // consumer 用 TakeCo 真挂起地等数据——有数据才醒，不靠轮询。
+        SseSink sink = SseSink.ToMemory();
+        Task.Spawn(http.PostSseToSinkAsync(ep.Path() + "/chat/completions",
+        payload, sink));
+
         StringBuilder sb = new StringBuilder();
-        string raw = await this.PostJson(ep, "/chat/completions", body);
-        if (raw == null) { return null; }
-        // SSE 帧：每行一条 "data: {...}"，以 "[DONE]" 结束。
-        // 按行切用 IndexOf 手工做（Zan 的 string 没有 Split）。
+        // 半行缓冲：一次到达的字节可能把一行切成两半，跨次拼接。
         string pending = "";
-        int at = 0;
-        while (at < raw.Length) {
-            int nl = raw.IndexOf("\n", at);
-            string line;
-            if (nl < 0) {
-                line = raw.Substring(at);
-                at = raw.Length;
-            } else {
-                line = raw.Substring(at, nl - at);
-                at = nl + 1;
+        bool stopped = false;
+        while (true) {
+            SseDelivery d = await sink.TakeCo();
+            if (d.data.Length > 0) {
+                pending = pending + d.data;
+                int nl = pending.IndexOf("\n");
+                while (nl >= 0) {
+                    string line = pending.Substring(0, nl).Trim();
+                    pending = pending.Substring(nl + 1);
+                    if (!this.OnStreamLine(line, sb, onDelta)) {
+                        stopped = true;
+                        break;
+                    }
+                    nl = pending.IndexOf("\n");
+                }
             }
-            line = line.Trim();
-            if (line.Length == 0) { continue; }
-            if (!line.StartsWith("data:")) { continue; }
-            string payload = line.Substring(5).Trim();
-            if (payload == "[DONE]") { break; }
-            JsonValue frame = null;
-            try {
-                frame = JsonValue.Parse(payload);
-            } catch (Exception e) {
-                continue;   // 坏帧跳过，不让整条流断掉
+            if (stopped) {
+                // 调用方主动停止：中止上游（别让对端接着算 token），
+                // 返回已收到的全文。
+                sink.Abort();
+                break;
             }
-            if (frame == null) { continue; }
-            JsonValue choices = frame.Get("choices");
-            if (choices == null || !choices.IsArray() || choices.Count() == 0) { continue; }
-            JsonValue delta = choices.At(0).Get("delta");
-            if (delta == null) { continue; }
-            string piece = delta.Str("content", "");
-            if (piece.Length == 0) { continue; }
-            sb.Append(piece);
-            if (onDelta != null) {
-                if (!onDelta(piece)) { break; }
+            if (d.finished) { break; }
+        }
+
+        // 传输结果：ok / err: ...
+        //
+        // **调用方主动停止不算失败**：中止上游必然让传输层报
+        // "err: cancelled"，那是我们自己叫停的，报成错误会让调用方
+        // 以为流挂了。
+        if (!stopped) {
+            string attempt = sink.Attempt();
+            if (attempt.Length > 0 && attempt.StartsWith("err:")) {
+                string reason = attempt.Substring(4).Trim();
+                // 已经收到过内容却中途失败：内容仍然有用，但原因要报出来。
+                this.lastError = "流式请求失败：" + reason;
+                if (sb.Length == 0) { return null; }
             }
         }
         return sb.ToString();
     }
+
+    // 解析一行 SSE。返回 false 表示调用方要求停止。
+    private bool OnStreamLine(string line, StringBuilder sb, AiDeltaFn onDelta) {
+        if (line.Length == 0) { return true; }
+        if (!line.StartsWith("data:")) { return true; }
+        string payload = line.Substring(5).Trim();
+        if (payload == "[DONE]") { return true; }
+        JsonValue frame = null;
+        try {
+            frame = JsonValue.Parse(payload);
+        } catch (Exception e) {
+            return true;   // 坏帧跳过，不让整条流断掉
+        }
+        if (frame == null) { return true; }
+        JsonValue choices = frame.Get("choices");
+        if (choices == null || !choices.IsArray() || choices.Count() == 0) {
+            return true;
+        }
+        JsonValue delta = choices.At(0).Get("delta");
+        if (delta == null) { return true; }
+        string piece = delta.Str("content", "");
+        if (piece.Length == 0) { return true; }
+        sb.Append(piece);
+        if (onDelta != null) {
+            if (!onDelta(piece)) { return false; }
+        }
+        return true;
+    }
+
+    // 流式专用的客户端：Accept 必须是 text/event-stream，读取超时按
+    // **空闲窗口**算（每收到一个分片就重新计时），否则长回答会被
+    // 读超时掐断——读超时要的是"对端沉默一段时间"，不是"总共读多久"。
+    private HttpClient StreamClient(AiEndpoint ep) {
+        string key = ep.Canonical() + "|sse";
+        if (this.clients.ContainsKey(key)) { return this.clients[key]; }
+        HttpClient http = null;
+        if (ep.Tls()) {
+            http = HttpClient.CreateHttps(ep.Host(), ep.Port());
+        } else {
+            http = new HttpClient(ep.Host(), ep.Port());
+        }
+        ExternalCallPolicy p = this.Policy(ep).IdleTimeout(this.config.readTimeoutMs);
+        http.SetCallPolicy(p);
+        http.SetHeader("Content-Type", "application/json");
+        http.SetHeader("Accept", "text/event-stream");
+        if (this.config.apiKey.Length > 0) {
+            http.SetHeader("Authorization", "Bearer " + this.config.apiKey);
+        }
+        this.clients[key] = http;
+        return http;
+    }
+
 
     // ------------------------------------------------------------------
     // 内部：HTTP

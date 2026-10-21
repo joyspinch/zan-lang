@@ -435,4 +435,8 @@ List<AiMessage> history = await agent.Run(questions);
   的私有嵌入协议。
 - 成本是估算（单价表由调用方提供，token 数是启发式估算）；无 Token
   精确计数（要接厂商的 tokenizer）。
-- 流式没有背压：回调返回 false 只能停在这一帧读完之后。
+- 流式是**真增量**：`onDelta` 在对应分片**到达时**就被调用（传输走
+  `SseSink` + `TakeCo`，有数据才醒，不靠轮询），不是等整条响应收完
+  再一次性倾泻。
+- 流式没有背压：回调返回 false 只能停在这一帧读完之后（中止上游，
+  返回已收到的全文——**主动停止不算失败**，`lastError` 保持为空）。

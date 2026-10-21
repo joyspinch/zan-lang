@@ -823,7 +823,7 @@ conformance `table_transform`（选列的列序与不改入参 / 缺列抛异常
 
 | 文件 | 位置 | 内容 |
 |---|---|---|
-| `AiClient.zan` | `packages/Zan.Ai/src/System/Ai/` | `AiClient`：非流式/流式补全、重试、超时预算、Token 计数、`lastError` 失败语义 |
+| `AiClient.zan` | `packages/Zan.Ai/src/System/Ai/` | `AiClient`：非流式/**真流式**（`SseSink` + `TakeCo` 增量投递）补全、重试、超时预算、Token 计数、`lastError` 失败语义 |
 | `Embeddings.zan` | 同上 | `Embeddings`：OpenAI 兼容 `/v1/embeddings`、批量、归一化、**按 index 归位**、维度校验 |
 | `Chunking.zan` | 同上 | `Chunking`：递归字符分割 / token 窗口 / 句子 / 段落，四种策略 |
 | `AiEndpoint.zan` | 同上 | `AiEndpoint`：base URL → scheme/host/port/path；本地端点识别 |
@@ -909,6 +909,22 @@ conformance `ai_tools`（工具调用循环：单工具一轮、**一轮多个�
 
 conformance `async_await_sync_delegate`（`await` 一个**同步委托**拿到的是
 委托的返回值，不是子协程帧——判错就是静默读野指针）。
+
+conformance `ai_stream`（**真流式**：`onDelta` 在分片**到达时**就被调用，
+不是等整条响应收完再一次性倾泻。判定是**确定性**的：服务端发完第一帧
+后**等客户端确认收到**才发第二帧——缓冲式客户端的确认永远到不了，
+服务端等超时，用例直接看到"没增量"。另含：完整文本拼接、**回调返回
+false → 主动停止**（中止上游、返回已收到的全文，且**主动停止不算失败**，
+`lastError` 保持为空））。
+
+conformance `async_sync_delay`（**非 async 方法里的 `await Task.Delay(ms)`
+必须真的等**：编译器原来在"顶层非异步上下文"分支**只查**模块里的 `Sleep`
+（Win32 API）/ `poll`（libc 符号）——`LLVMGetNamedFunction` 找不到就返回
+NULL，而这两个符号本来就不在当前模块里（链接期才进来），于是整个等待被
+**静默跳过**，`await Task.Delay(500)` 编译成一条 ret。实测请求 500ms、
+实际耗时 0.0002ms。改法与 `irgen.c` 里 `zan_io_pump_timeout` 一致：
+**声明**符号（`LLVMAddFunction`）而不是只查。断言只卡**下界**（等了 >=
+阈值），不卡上界：上界在慢机器上会 flaky，而"等没等"是二值事实）。
 
 **检索为什么是混合 + RRF**（§1.20 补记）：
 

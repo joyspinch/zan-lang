@@ -9992,23 +9992,33 @@ static LLVMValueRef emit_expr_await_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                 LLVMPositionBuilderAtEnd(g->builder, rk);
                 return LLVMConstInt(di64, 0, 0);
             }
-            /* 顶层非异步上下文：同步休眠等待 */
+            /* 顶层非异步上下文：同步休眠等待。
+             *
+             * 这里原来只**查**模块里的 "Sleep"（Windows）/ "poll"
+             * （POSIX）：LLVMGetNamedFunction 找不到就返回 NULL，而这两个
+             * 符号本来就不在当前模块里（Sleep 是 Win32 API、poll 是 libc
+             * 符号，链接期才进来）——查不到就**整段等待被静默跳过**：
+             * `await Task.Delay(500)` 编译成一条 ret，方法立刻返回，
+             * 调用方以为等了 500ms，其实等了 0ms。
+             *
+             * 改法与 irgen.c 里 zan_io_pump_timeout 一致：**声明**符号
+             * （LLVMAddFunction）而不是只查——声明进模块后链接期由系统库
+             * 解析，符号一定找得到。
+             */
             LLVMValueRef ms32 = LLVMBuildTrunc(g->builder, ms, di32, "ms32");
             if (g->target_is_windows) {
+                LLVMTypeRef sl_args[] = { di32 };
+                LLVMTypeRef sl_ty = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), sl_args, 1, 0);
                 LLVMValueRef fn_sleep = LLVMGetNamedFunction(g->mod, "Sleep");
-                if (fn_sleep) {
-                    LLVMTypeRef sl_args[] = { di32 };
-                    LLVMTypeRef sl_ty = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), sl_args, 1, 0);
-                    zan_call2(g->builder, sl_ty, fn_sleep, (LLVMValueRef[]){ ms32 }, 1, "");
-                }
+                if (!fn_sleep) fn_sleep = LLVMAddFunction(g->mod, "Sleep", sl_ty);
+                zan_call2(g->builder, sl_ty, fn_sleep, (LLVMValueRef[]){ ms32 }, 1, "");
             } else {
+                LLVMTypeRef pl_args[] = { di8ptr, di64, di32 };
+                LLVMTypeRef pl_ty = LLVMFunctionType(di32, pl_args, 3, 0);
                 LLVMValueRef fn_poll = LLVMGetNamedFunction(g->mod, "poll");
-                if (fn_poll) {
-                    LLVMTypeRef pl_args[] = { di8ptr, di64, di32 };
-                    LLVMTypeRef pl_ty = LLVMFunctionType(di32, pl_args, 3, 0);
-                    zan_call2(g->builder, pl_ty, fn_poll,
-                        (LLVMValueRef[]){ LLVMConstNull(di8ptr), LLVMConstInt(di64, 0, 0), ms32 }, 3, "");
-                }
+                if (!fn_poll) fn_poll = LLVMAddFunction(g->mod, "poll", pl_ty);
+                zan_call2(g->builder, pl_ty, fn_poll,
+                    (LLVMValueRef[]){ LLVMConstNull(di8ptr), LLVMConstInt(di64, 0, 0), ms32 }, 3, "");
             }
             return LLVMConstInt(di64, 0, 0);
         }

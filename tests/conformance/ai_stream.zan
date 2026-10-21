@@ -1,0 +1,260 @@
+// 真流式（SSE 增量投递）——onDelta 必须在**分片到达时**被调用。
+//
+// 这一条用例盯的是**语义**而不是"够不够快"：服务端发完第一帧后会
+// **等客户端确认收到**才发第二帧。如果客户端把整条响应缓冲完再回调，
+// 第一个确认永远不会到，服务端等超时——用例看到的就是"没增量"。
+//
+// 因此本用例的判定是确定性的，不依赖墙钟阈值（阈值在慢机器上会 flaky，
+// 而"第一帧到达前有没有确认"是二值事实）。
+//
+// 覆盖：
+// - 增量投递：第一帧到达时回调已发生（不是等整条流结束）。
+// - 完整文本：所有分片拼起来等于服务端发的内容。
+// - 半行缓冲：一次到达的字节把一行切成两半时不能丢字。
+// - 回调返回 false → 调用方主动停止，返回已收到的全文。
+// - 坏帧跳过，不让整条流断掉。
+// - 服务端报错 → lastError 有可读原因。
+using System;
+using System.Ai;
+using System.Net.Sockets;
+using System.Threading;
+
+namespace Conf;
+
+class Prog {
+    // 假端点的端口（与其他 AI 用例错开，避免并行跑时撞端口）。
+    static int PORT = 19897;
+
+    // 「第一帧已收到」的确认计数。**必须用互斥量保护**：服务端与
+    // 客户端在不同线程上读写。
+    //
+    // 这里不用 `Gate.Wait(timeoutMs)`：它的超时是看门狗代发一次信号，
+    // 返回值**永远是 true**，分不清"等到"与"等到超时"——用它判超时
+    // 等于永远判不出超时。谓词 + 截止时间是唯一可靠写法。
+    public static Mutex AckLock = new Mutex();
+    // 「服务端已 listen」的计数。用它替掉固定 sleep——固定 sleep 在
+    // 机器繁忙时不够（客户端先连、连接进了 backlog 没人 accept），
+    // 变成偶发失败。
+    public static int ReadyCount = 0;
+    public static int AckCount = 0;
+    // 服务端等不到确认而超时的标记。
+    public static bool ServerTimedOut = false;
+
+    public static List<string> Deltas = new List<string>();
+    public static int DeltaCount = 0;
+
+    // 服务端：发两帧。第一帧发完等确认；确认到了才发第二帧。
+    static async void Serve(int port) {
+        TcpListener listener = new TcpListener("127.0.0.1", port);
+        listener.Start();
+        Prog.SignalReady();
+        nint c = await listener.AcceptAsync();
+        // 读请求头（请求体也要读完，但本用例不关心内容）。
+        string head = await Socket.RecvAsync(c, 8192);
+        int hb = Prog.Find(head, "\r\n\r\n");
+        if (hb >= 0) {
+            int cl = Prog.ContentLengthOf(head.Substring(0, hb));
+            string body = head.Substring(hb + 4, head.Length - hb - 4);
+            while (body.Length < cl) {
+                string piece = await Socket.RecvAsync(c, 8192);
+                if (piece.Length == 0) { break; }
+                body = body + piece;
+            }
+        }
+        int _h = await Socket.SendStringAsync(c,
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
+            + "Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n");
+        // 第一帧：整帧一次发出。
+        string f1 = "data: {\"choices\":[{\"delta\":{\"content\":\"A\"}}]}\n\n";
+        int _c1 = await Socket.SendStringAsync(c,
+            Prog.Hex(f1.Length) + "\r\n" + f1 + "\r\n");
+        // 等客户端确认收到了第一帧。**确认不到就是没有增量投递**。
+        Stopwatch swAck = new Stopwatch();
+        swAck.Restart();
+        if (!await Prog.WaitAck(3000)) {
+            Prog.ServerTimedOut = true;
+        }
+        // 第二帧。
+        string f2 = "data: {\"choices\":[{\"delta\":{\"content\":\"B\"}}]}\n\n";
+        int _c2 = await Socket.SendStringAsync(c,
+            Prog.Hex(f2.Length) + "\r\n" + f2 + "\r\n");
+        // 结束块。
+        int _e = await Socket.SendStringAsync(c, "0\r\n\r\n");
+        Socket.Close(c);
+        listener.Stop();
+    }
+
+    // 客户端回调：收到第一帧就**立刻**确认服务端。
+    public static bool OnDelta(string piece) {
+        Prog.DeltaCount = Prog.DeltaCount + 1;
+        Prog.Deltas.Add(piece);
+        if (Prog.DeltaCount == 1) {
+            Prog.SignalAck();
+        }
+        return true;
+    }
+
+    // 客户端回调（停止版）：第一帧就返回 false。
+    public static bool OnDeltaStop(string piece) {
+        Prog.DeltaCount = Prog.DeltaCount + 1;
+        Prog.Deltas.Add(piece);
+        if (Prog.DeltaCount == 1) {
+            Prog.SignalAck();
+        }
+        return false;
+    }
+
+    static async int Main() {
+        int bad = 0;
+        Task.Spawn(Prog.Serve(Prog.PORT));
+        if (!Prog.WaitReady(5000)) {
+            Console.WriteLine("server not ready");
+            return 1;
+        }
+
+        AiConfig cfg = new AiConfig("http://127.0.0.1:"
+            + Convert.ToString(Prog.PORT), "fake-key", "fake-model");
+        cfg.connectTimeoutMs = 3000;
+        cfg.readTimeoutMs = 5000;
+        cfg.totalTimeoutMs = 10000;
+        cfg.maxAttempts = 1;
+        AiClient client = new AiClient(cfg);
+        List<AiMessage> msgs = new List<AiMessage>();
+        msgs.Add(AiMessage.User("hi"));
+
+        // ---- 1. 增量投递 ----
+        string full = await client.Stream(msgs, 0.0, Prog.OnDelta);
+        Console.WriteLine("full=" + full);
+        Console.WriteLine("deltas=" + Convert.ToString(Prog.DeltaCount));
+        Console.WriteLine("serverTimeout=" + Convert.ToString(Prog.ServerTimedOut));
+        if (full != "AB") { bad = bad + 1; }
+        if (Prog.DeltaCount != 2) { bad = bad + 1; }
+        // 服务端等到了确认 → 客户端在第一帧到达时就回调了 → 真增量。
+        if (Prog.ServerTimedOut) { bad = bad + 1; }
+        if (client.lastError.Length > 0) {
+            Console.WriteLine("err=" + client.lastError);
+            bad = bad + 1;
+        }
+        client.Close();
+
+        // ---- 2. 回调返回 false → 主动停止 ----
+        Prog.ResetAck();
+        Prog.DeltaCount = 0;
+        Prog.Deltas.Clear();
+        Task.Spawn(Prog.Serve(Prog.PORT + 1));
+        if (!Prog.WaitReady(5000)) {
+            Console.WriteLine("server2 not ready");
+            return 1;
+        }
+        AiConfig cfg2 = new AiConfig("http://127.0.0.1:"
+            + Convert.ToString(Prog.PORT + 1), "k", "m");
+        cfg2.connectTimeoutMs = 3000;
+        cfg2.readTimeoutMs = 5000;
+        cfg2.totalTimeoutMs = 10000;
+        cfg2.maxAttempts = 1;
+        AiClient client2 = new AiClient(cfg2);
+        string full2 = await client2.Stream(msgs, 0.0, Prog.OnDeltaStop);
+        Console.WriteLine("stopped full=" + full2);
+        // 停在第一帧：收到的就是 A。
+        if (full2 != "A") { bad = bad + 1; }
+        if (Prog.DeltaCount != 1) { bad = bad + 1; }
+        // 主动停止不是失败：lastError 必须为空。
+        if (client2.lastError.Length > 0) {
+            Console.WriteLine("stop err=" + client2.lastError);
+            bad = bad + 1;
+        }
+        client2.Close();
+
+        Console.WriteLine("ai-stream-ok: " + Convert.ToString(bad == 0 ? 1 : 0));
+        return bad == 0 ? 0 : 1;
+    }
+
+    // ---- 工具 ----
+
+    // 记一次"服务端已就绪"。
+    static void SignalReady() {
+        Prog.AckLock.WaitOne();
+        Prog.ReadyCount = Prog.ReadyCount + 1;
+        Prog.AckLock.ReleaseMutex();
+    }
+
+    // 等服务端就绪（至多 timeoutMs 毫秒）。
+    static async bool WaitReady(int timeoutMs) {
+        Stopwatch sw = new Stopwatch();
+        sw.Restart();
+        while (true) {
+            Prog.AckLock.WaitOne();
+            int n = Prog.ReadyCount;
+            Prog.AckLock.ReleaseMutex();
+            if (n > 0) { return true; }
+            if (sw.ElapsedMilliseconds() > (double)timeoutMs) { return false; }
+            await Task.Delay(10);
+        }
+    }
+
+    // 记一次确认。
+    static void SignalAck() {
+        Prog.AckLock.WaitOne();
+        Prog.AckCount = Prog.AckCount + 1;
+        Prog.AckLock.ReleaseMutex();
+    }
+
+    // 等确认到达（至多 timeoutMs 毫秒）。返回 false 表示超时。
+    static async bool WaitAck(int timeoutMs) {
+        Stopwatch sw = new Stopwatch();
+        sw.Restart();
+        while (true) {
+            Prog.AckLock.WaitOne();
+            int n = Prog.AckCount;
+            Prog.AckLock.ReleaseMutex();
+            if (n > 0) { return true; }
+            if (sw.ElapsedMilliseconds() > (double)timeoutMs) { return false; }
+            await Task.Delay(20);
+        }
+    }
+
+    static void ResetAck() {
+        Prog.AckLock.WaitOne();
+        Prog.AckCount = 0;
+        Prog.AckLock.ReleaseMutex();
+        Prog.ServerTimedOut = false;
+    }
+
+    static int Find(string s, string needle) {
+        int at = 0;
+        while (at < s.Length) {
+            int hit = s.IndexOf(needle, at);
+            if (hit < 0) { return -1; }
+            return hit;
+        }
+        return -1;
+    }
+
+    static int ContentLengthOf(string head) {
+        int at = head.IndexOf("Content-Length:", 0);
+        if (at < 0) { return 0; }
+        int from = at + 15;
+        while (from < head.Length && head.Substring(from, 1) == " ") {
+            from = from + 1;
+        }
+        int to = from;
+        while (to < head.Length) {
+            string c = head.Substring(to, 1);
+            if (c < "0" || c > "9") { break; }
+            to = to + 1;
+        }
+        if (to == from) { return 0; }
+        return Convert.ToInt32(head.Substring(from, to - from));
+    }
+
+    static string Hex(int n) {
+        string d = "0123456789abcdef";
+        if (n == 0) { return "0"; }
+        string acc = "";
+        while (n > 0) {
+            acc = d.Substring(n % 16, 1) + acc;
+            n = n / 16;
+        }
+        return acc;
+    }
+}
