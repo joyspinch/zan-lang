@@ -40,7 +40,7 @@ $projects = Get-ChildItem $GamesRoot -Directory |
 $rows = @()
 foreach ($p in $projects) {
     $files = Get-ChildItem $p.FullName -Recurse -File -Include *.zan -ErrorAction SilentlyContinue |
-        Where-Object { $_.FullName -notmatch 'build|obj|bin|\.git' }
+        Where-Object { $_.FullName -notmatch 'build|obj|bin|\.git|[\\/]_scratch[\\/]' }
     $text = ($files | ForEach-Object { [IO.File]::ReadAllText($_.FullName) }) -join "`n"
 
     $save = ($text -match 'File\.WriteAllText|File\.WriteAllBytes|Serialize|Save\(|SaveGame|存档|\.Save\(')
@@ -62,9 +62,11 @@ foreach ($p in $projects) {
 
     # 美术资产数：位图 + 音频。**这是"像不像游戏"的第一道硬门槛**——
     # 四条基础设施全绿但 art=0 的项目只是可运行的原型（几何图形 + TODO）。
+    # 只数**入库资产**：build/（编译产物）与 _scratch/（一次性原图与脚本）
+    # 都不算——原图是 1024² 的未处理素材，算进来会把"实际入库 10 张"报成 21 张。
     $artFiles = @(Get-ChildItem $p.FullName -Recurse -File -ErrorAction SilentlyContinue |
         Where-Object {
-            $_.FullName -notmatch 'build|obj|bin|\.git' -and
+            $_.FullName -notmatch 'build|obj|bin|\.git|[\\/]_scratch[\\/]' -and
             $_.Extension -match '^\.(png|jpg|jpeg|webp|bmp|wav|ogg|mp3)$'
         })
     $art = $artFiles.Count
