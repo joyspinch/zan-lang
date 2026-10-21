@@ -1936,3 +1936,34 @@
   `ANGLE_instanced_arrays` 扩展路径，还是把移动端批次降级成逐实例
   `DrawMesh3D`。
 - 关联：`Zan.Game.Render3D`（`docs/ECOSYSTEM_ROADMAP.md` §1.30）。
+
+### [ ] A492 bool 的「按静态类型渲染」只补了拼接路径——插值与 `Convert.ToString` 仍按 i1 宽度判
+
+- 现象（2026-10-22 探针 `_scratch/a442_bool_path.zan`，宿主 `build/zanc.exe` 实测）：
+  ```zan
+  List<string> l = new List<string>(); l.Add("a");
+  bool local = l.Contains("a");
+  Console.WriteLine("var     : " + local);              // true
+  Console.WriteLine("call    : " + l.Contains("a"));    // true
+  Console.WriteLine("write   : " + l.Contains("a"));    // true
+  Console.WriteLine("interp  : " + $"{l.Contains("a")}"); // 1   ← 口径不一致
+  Console.WriteLine("convert : " + Convert.ToString(l.Contains("a"))); // 1 ← 口径不一致
+  ```
+  同一个 bool 表达式，**存进变量**再渲染是 "true"，**直接内联**在插值和
+  `Convert.ToString` 里却是 "1"。
+- 根因：bool 的值在**泛型实例化的方法返回值**上（`List<T>.Contains` 这类）被
+  提升成 i64。三条取串路径的判据不一样：
+  - 字符串拼接（`emit_to_cstr_of`）**已经**按静态类型判——`df4f022f4` 加的
+    `infer_expr_type` 分支会先 `icmp ne 0` 再渲染，所以拼接是 "true"；
+  - 插值（`src/compiler/irgen_expr.c`）与 `Convert.ToString`
+    （`src/compiler/irgen_call.c` 的内建特判）仍只按 **LLVM 值的宽度**判
+    （`LLVMGetIntTypeWidth(vt) == 1`），i64 的 bool 掉进 itoa → "1"/"0"。
+- 影响：同一个 bool 在同一行代码里长得不一样；按字符串比对/落库的代码会踩坑。
+  宿主与自举两侧都还有这两条路径。
+- 方向：把 `df4f022f4` 的静态类型判据（`TYPE_BOOL` → i1 直接渲染、i64 先
+  `icmp ne 0`）也搬到插值与 `Convert.ToString` 两条路上；**自举侧同款**
+  （`src/selfhost/irgen_expr.zan` 的 `ToCStr` 与插值/取串路径）。
+- ⚠ 并发会话正在这条战线（`df4f022f4` 已修拼接路径，其工作树里
+  `tests/conformance/list_wide_struct_ops.out` 的在途更新也在等这个修）——
+  动手前先对齐，别两边各改一半。
+- 关联：A441（bool→字符串的口径统一，这条是它的余账）。
