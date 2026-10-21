@@ -1247,6 +1247,19 @@ add_test(NAME diag_new_type_param
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_new_type_param PROPERTIES TIMEOUT 60)
 
+# `await` 落在 async 方法的 lambda 体内：lambda 不是协程，没有自己的帧可挂。
+# 改前宿主把 await 挂到外层协程的块上（跨函数的 br），LLVM 校验直接失败，
+# 只吐一句 "code generation failed"；现在给编译期诊断（同步方法里的同样
+# 写法合法：没有外层协程，根驱动等得到）。
+add_test(NAME diag_await_in_lambda
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/await_in_lambda.zan
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_await_in_lambda${_exe_ext}
+    "-DEXPECT_REGEX=.await. inside a lambda is not supported: a lambda is not a coroutine"
+    -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
+set_tests_properties(diag_await_in_lambda PROPERTIES TIMEOUT 60)
+
 
 # Convert.ToString 的实参必须有字符串形态。类实例不是 C 字符串：此前编译器
 # 拿 strlen 去量对象指针，越界读进程内存（打印出进程映像里的符号名并把程序

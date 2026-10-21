@@ -9949,6 +9949,17 @@ static bool await_target_is_async(zan_irgen_t *g, zan_ast_node_t *expr,
 
 static LLVMValueRef emit_expr_await_expr(zan_irgen_t *g, zan_ast_node_t *expr,
         local_scope_t *locals) {
+        /* await 落在 async 方法的 lambda 体内：lambda 不是协程，没有自己的帧可挂
+         * ——硬降级会把外层协程的块当自己的用（跨函数的 br，LLVM 校验直接失败：
+         * "Referring to a basic block in another function"）。这里报诊断，不落那条
+         * 非法 IR。同步方法里的 lambda 没有外层协程，根驱动等得到，不算错。 */
+        if (g->lambda_in_async_method) {
+            zan_diag_emit(g->diag, DIAG_ERROR, expr->loc,
+                          "'await' inside a lambda is not supported: "
+                          "a lambda is not a coroutine");
+            return LLVMConstInt(LLVMInt64TypeInContext(g->ctx), 0, 0);
+        }
+
         /* await Task.Yield(): 协作式让出控制权并将当前协程帧重新入队 */
         if (is_call_to(expr->await_expr.expr, "Task", "Yield") &&
             expr->await_expr.expr->call.args.count == 0) {
@@ -12515,6 +12526,11 @@ static LLVMValueRef emit_lambda_typed(zan_irgen_t *g, zan_ast_node_t *expr,
     g->eh_armed_base = g->eh_armed_count;
     g->eh_armed_loop_base = g->eh_armed_count;
     g->current_this = NULL;
+    /* 外层方法有协程帧 = 外层方法是 async：这个 lambda 里的 await 没有
+     * 自己的帧可挂，只能挂到外层协程的块上（跨函数的 br，非法 IR）。
+     * 同步方法里的 lambda 没有外层协程，根驱动等得到，不算错。 */
+    bool saved_lambda_in_async = g->lambda_in_async_method;
+    g->lambda_in_async_method = saved_lambda_in_async || (saved_async_frame != NULL);
     g->current_async_frame = NULL;
     g->lambda_depth++;
 
@@ -12634,6 +12650,7 @@ static LLVMValueRef emit_lambda_typed(zan_irgen_t *g, zan_ast_node_t *expr,
     g->current_this = saved_this;
     g->current_async_frame = saved_async_frame;
     g->current_fn_body = saved_fn_body;
+    g->lambda_in_async_method = saved_lambda_in_async;
     g->lambda_depth--;
     LLVMPositionBuilderAtEnd(g->builder, saved_bb);
     /* 返回外层函数上下文：恢复外层调试位置 */

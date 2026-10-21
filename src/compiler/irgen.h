@@ -160,6 +160,9 @@ struct zan_irgen {
     bool current_fn_no_runtime;
     /* 处于 Lambda 函数体内部：此时 current_this 为 NULL */
     int lambda_depth;
+    /* 当前 lambda 处在 async 方法里：lambda 不是协程，它里面的 await 没有
+     * 自己的帧可挂（挂到外层协程的块上 = 跨函数的 br，LLVM 校验直接失败）。 */
+    bool lambda_in_async_method;
 
     LLVMValueRef rt_println;
     LLVMValueRef rt_print_int; /* zan_rt_print_int(int64) */
