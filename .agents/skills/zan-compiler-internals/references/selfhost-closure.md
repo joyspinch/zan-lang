@@ -1647,3 +1647,43 @@ kernel32、shell32、user32、advapi32、version）。
   坑出处：`tests/conformance/objinit_ctor_field_overwrite.zan`。
 - 通用教训：**同一个语义只留一条实现路径**。初始化器与普通赋值是同一
   件事的两种写法，分开实现就会漏掉其中一种的转换规则。
+## 84. 委托重载打平，多半是**参与打分的类型没推出来**
+
+- 坑（2026-10-21 实测）：`items.OrderBy(x => x.Length)`（x 是 string）
+  在自举里选中了 `StrKeySelector` 重载而不是 `KeySelector`（int 返回），
+  委托按 string 返回而 lambda 返回 int，运行时崩（exit -1073741819）。
+  宿主靠"lambda 体类型 == 委托返回类型"给候选加分
+  （`src/compiler/irgen_expr_core.c`：`types_concrete_equal(bt,
+  pt->delegate_ret_type)` → +2）。自举的 `ArgTypeNode` 对成员访问
+  **只查类字段**，`x.Length` 的接收者是 string 这个内建类型 → 查不到
+  → 返回类型推不出来 → 三个同名重载全部打平 → 按声明顺序选中第一个
+  （`Enumerable.zan` 里 `OrderBy` 的第一个重载就是 `StrKeySelector`）。
+- 做法：
+  - `ArgTypeNode` 的成员访问按宿主 `src/compiler/builtin_api.c` 的属性表
+    补内建成员：string.Length、List.Count、Dict.Count/Keys/Values、
+    StringBuilder.Length，以及数组的 Length/Count。
+  - 块体 lambda 的返回类型按宿主 `stmt_lambda_return_type` 收集：所有
+    `return` 的类型必须一致（第一个说了算）；裸 `return;`、循环体、
+    推不出的类型 → 未知。
+  - 评分与宿主一致：**类型相同加分，类型不同不扣分**（未知与不匹配同分，
+    按声明顺序决胜）。自举原来给"不匹配"扣分，于是"候选 A 未知 /
+    候选 B 不匹配"时会选错。
+- 通用教训：**"重载打平"往往不是重载规则的问题，是参与打分的那个类型
+  没推出来**——先确认评分输入的类型是真的，再去调权重。宿主是规格：
+  加分制不是扣分制。
+## 85. 字符串转义解码只有一份实现（宿主在**词法期**解）
+
+- 坑（2026-10-21 实测）：`"\u0001"` 在自举里解成了 "u0001" —— 自举的
+  `DecodeStr` 只认 `\n \r \t \0`，其余转义原样落成字母。宿主在**词法期**
+  就把转义解掉（`src/compiler/lexer.c` 的 `lexer_escape_seq`）：`\xNN`
+  （1..4 位十六进制）与 `\uNNNN`（4 位）解成码点，再按 UTF-8 编码
+  （`zan_utf8_encode`）；代理码点（D800..DFFF）不接受。
+  表现：`Log.EscapeJson("x\u0001y").Contains("\u0001")` 在自举里恒为真
+  → 断言反转 → `log_structured` 第 6 行输出 false（宿主 true）。
+- 做法：转义解码只留一份实现（`ast.zan` 的 `StrEsc`），运行期字符串
+  （`irgen`）、属性字面量（`parser`）、编译期元数据（`attrgen`）三处都
+  走它。原生后端那套早就自己解了 `\x` `\u`（`ngen.zan` 的
+  `DecodeLiteralNg`），这次是把 LLVM IR 后端补齐。
+- 通用教训：**同一个语义只留一条实现路径**。转义解码曾经有三份
+  （irgen / parser / attrgen），各写各的，改一处就漂。宿主在词法期解、
+  自举在生成期解——位置可以不同，规则必须只有一份。
