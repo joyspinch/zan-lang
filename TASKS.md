@@ -948,6 +948,12 @@
   会话在途，解禁后同修并把 `nullable_user_type.zan`（void 臂）加进
   `tests/selfhost/diff_cases.txt` 跑差分门）。
 - 验证：把 `tests/conformance/nullable_user_type.zan`（void 臂）加进
+- **自举半边已修（2026-10-23，goal round 4）**：selfhost `GenConditional`
+  在两臂类型都是 void 时不建 phi（直接汇合返哑值 0/int），与宿主同口径。
+  复验：gen1 编 `flag ? A() : B();` 通过且 IR 零 `phi void`、clang -c 过；
+  值三元（int/string/嵌套条件）回归 clang codegen 通过。因 gen1 产物链接
+  需要运行时对象，本条以"编译+IR 合法性"为验（运行语义已由宿主侧证明）；
+  差分门用例（nullable_user_type.zan 进 diff_cases.txt）留给闸门批次。
   `tests/selfhost/diff_cases.txt`，差分门跑它应 PASS。
 - 关联：A481（自举侧同一条战线的前瞻洞）、A469 / A479（宿主侧解析）。
 
