@@ -33,6 +33,7 @@ public class UsersController : AdminController {
             .Tag("status", "状态", "1=启用|ok,0=禁用|off", "88px")
             .OpsEdit("/admin/system/users/form")
             .Ops("角色", "/admin/system/users/roles", "", "", "u")
+            .Ops("数据范围", "/admin/system/users/scopes", "", "", "u")
             .Ops("密码", "/admin/system/users/passwordform", "", "", "u")
             .Ops("{toggleLabel}", "/admin/system/users/status", "",
                  "id={id}&status={nextStatus}", "u")
@@ -423,6 +424,106 @@ public class UsersController : AdminController {
             "#" + Convert.ToString(id) + " " + u.username, true,
             Convert.ToString(granted) + " 个角色");
         this.Saved("角色已保存");
+    }
+
+    /* 数据范围对话框：按业务注册的资源域分组列出可授予的资源（店铺、
+       门店…），已授予者打勾。一项都不选 = 该域内看不到任何数据。 */
+    [HttpGet]
+    [Custom(Perm = PermBit.Update)]
+    [Description("分配数据范围")]
+    public async void Scopes() {
+        int id = this.InInt("id", 0);
+        SysUser u = await this.Reach(id);
+        ViewData d = new ViewData();
+        d.Set("id", Convert.ToString(id));
+        d.Set("username", u.username);
+        List<SysUserScope> mine = await DataGrant.OfUser(this.Held(), id);
+        List<GrantDomain> domains = DataGrant.All();
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < domains.Count; i = i + 1) {
+            GrantDomain g = domains[i];
+            RowScope all = new RowScope();
+            all.all = true;
+            string opts = await DataGrant.Options(this.Held(), g.key, all, 300);
+            sb.Append("<div class=\"scope-group\">\n");
+            sb.Append("  <div class=\"scope-title\">" + Esc(g.label)
+                + " <span class=\"hint\">可多选；一项都不选 = 该域内看不到任何数据</span></div>\n");
+            sb.Append("  <div class=\"checks\">\n");
+            string rest = opts;
+            while (rest.Length > 0) {
+                string one = rest;
+                int comma = rest.IndexOf(",");
+                if (comma >= 0) { one = rest.Substring(0, comma); rest = rest.Substring(comma + 1); }
+                else { rest = ""; }
+                int eq = one.IndexOf("=");
+                string rid = eq > 0 ? one.Substring(0, eq) : one;
+                string lb = eq > 0 ? one.Substring(eq + 1) : rid;
+                int resourceId = Filter.ToInt(rid, 0);
+                if (resourceId <= 0) { continue; }
+                bool on = false;
+                for (int j = 0; j < mine.Count; j = j + 1) {
+                    if (mine[j].scopeKey == g.key && mine[j].resourceId == resourceId) { on = true; }
+                }
+                sb.Append("    <label><input type=\"checkbox\" name=\"scope_" + Esc(g.key)
+                    + "[]\" value=\"" + Convert.ToString(resourceId) + "\""
+                    + (on ? " checked" : "") + "> " + Esc(lb) + "</label>\n");
+            }
+            sb.Append("  </div>\n</div>\n");
+        }
+        if (domains.Count == 0) {
+            sb.Append("<p class=\"hint\">本应用还没有注册资源域。业务启动时调用 "
+                + "DataGrant.Define(\"shop\", \"店铺\", \"shop\", \"name\") 后，"
+                + "这里会按域列出可授予的资源。</p>\n");
+        }
+        d.Set("scopeHtml", sb.ToString());
+        this.Dialog(d);
+    }
+
+    [HttpPost]
+    [Custom(Perm = PermBit.Update)]
+    [Description("保存数据范围")]
+    public async void ScopesSave() {
+        int id = this.InInt("id", 0);
+        SysUser u = await this.Reach(id);
+        List<GrantDomain> domains = DataGrant.All();
+        StringBuilder detail = new StringBuilder();
+        for (int i = 0; i < domains.Count; i = i + 1) {
+            GrantDomain g = domains[i];
+            List<int> ids = this.IdList("scope_" + g.key);
+            int n = await DataGrant.Replace(this.Held(), id, g.key, ids);
+            if (detail.Length > 0) { detail.Append("；"); }
+            detail.Append(Lang.T(g.label) + " " + Convert.ToString(n) + " 项");
+        }
+        await this.Note("分配数据范围",
+            "#" + Convert.ToString(id) + " " + u.username, true, detail.ToString());
+        this.Saved("数据范围已保存");
+    }
+
+    /* 逗号分隔的 id 串 → 去重正整数列表（复选框组由前端合并为一个字段）。 */
+    private List<int> IdList(string name) {
+        List<int> outp = new List<int>();
+        string csv = this.In(name);
+        int start = 0;
+        int len = csv.Length;
+        for (int i = 0; i <= len; i = i + 1) {
+            if (i < len && (csv[i] & 255) != 44) { continue; }
+            if (i > start) {
+                int v = Filter.ToInt(csv.Substring(start, i - start).Trim(), 0);
+                if (v > 0 && !outp.Contains(v)) { outp.Add(v); }
+            }
+            start = i + 1;
+        }
+        return outp;
+    }
+
+    private static string Esc(string s) {
+        if (s == null) { return ""; }
+        string r = s;
+        r = r.Replace("&", "&amp;");
+        r = r.Replace("<", "&lt;");
+        r = r.Replace(">", "&gt;");
+        r = r.Replace("\"", "&quot;");
+        return r;
     }
 
     /* 请求有权操作的账号；超调用方数据 scope 的答与不存在的行同 404——无法列表的账号不得在对话框或 POST 中确认其存在。 */

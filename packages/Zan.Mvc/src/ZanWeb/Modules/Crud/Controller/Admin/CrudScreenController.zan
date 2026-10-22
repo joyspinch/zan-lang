@@ -34,9 +34,65 @@ public class CrudScreenController : AdminController {
        投影）。StrMap 无键枚举，行 JSON 序列化按此显式键集进行。 */
     protected List<string> rowKeys;
 
+    /* 本屏声明的资源数据域：一次请求解析一次，列表 / 计数 / 详情 / 写入
+       共用同一份白名单（详见 Framework/Security/DataGrant.zan）。 */
+    protected RowScope rowScope;
+    protected string rowScopeKey = "";
+
     /* 子类必覆写：本屏的完整声明。 */
     protected virtual CrudConf Def() {
         throw new ApiError(500, "9999", "CrudScreenController 未覆写 Def()");
+    }
+
+    /* 本屏的资源域；未声明 Scope 返回 null（不启用，旧行为）。 */
+    protected async RowScope ScopeRow(CrudConf conf) {
+        if (conf.scopeKey.Length == 0) { return null; }
+        if (this.rowScope != null && this.rowScopeKey == conf.scopeKey) {
+            return this.rowScope;
+        }
+        DataScope dept = await this.Scope();
+        this.rowScope = await DataGrant.Of(
+            this.Held(), Filter.ToInt(this.uid, 0), conf.scopeKey, dept);
+        this.rowScopeKey = conf.scopeKey;
+        return this.rowScope;
+    }
+
+    /* 域条件并入查询：未声明或不受限时原样返回；空白名单由 ORM 按恒假
+       处理（IN () 不会拼进 SQL）。列名出自声明，值走占位符。 */
+    protected async DbTableQuery Scoped(DbTableQuery q, CrudConf conf) {
+        RowScope sc = await this.ScopeRow(conf);
+        if (sc == null || sc.all) { return q; }
+        return q.WhereIn(conf.scopeCol, sc.ids);
+    }
+
+    /* 单行是否落在域内。越权与不存在同答 404（不泄露其他店铺 id 的
+       存在性）；声明了域却缺列一律拒绝（fail closed）。 */
+    protected async bool RowAllowed(CrudConf conf, DbResult r) {
+        if (conf.scopeKey.Length == 0) { return true; }
+        if (r == null || r.RowCount() == 0) { return false; }
+        RowScope sc = await this.ScopeRow(conf);
+        if (sc == null || sc.all) { return true; }
+        int col = r.GetColumnIndex(conf.scopeCol);
+        if (col < 0 || r.IsNull(0, col)) { return false; }
+        return sc.Allows(r.GetLong(0, col));
+    }
+
+    /* 保存时把资源列钉进域内：受域账号不能把行迁到别的店铺，也不能
+       留空——只有一个可见资源时自动归属，多个时必须显式选择。 */
+    protected async string BindScope(CrudConf conf, DbValues row) {
+        if (conf.scopeKey.Length == 0 || conf.scopeCol.Length == 0) { return ""; }
+        RowScope sc = await this.ScopeRow(conf);
+        if (sc == null || sc.all) { return ""; }
+        long sid = Filter.ToLong(this.InAny(conf.scopeCol).Trim(), 0);
+        if (sid <= 0) {
+            if (sc.ids.Count == 1) { sid = sc.ids[0]; }
+            else { return "请选择" + DataGrant.Label(conf.scopeKey); }
+        }
+        if (!sc.Allows(sid)) {
+            return "数据权限不允许操作该" + DataGrant.Label(conf.scopeKey);
+        }
+        row.Set(conf.scopeCol, sid);
+        return "";
     }
 
     /* ---- 基座端点（子类属性壳转发到这里） ------------------------ */
@@ -89,6 +145,7 @@ public class CrudScreenController : AdminController {
         DbTable t = DbTable.Of(this.Held(), conf.table);
         DbResult r = await t.ReadAsync("id", id);
         if (r == null || r.RowCount() == 0) { this.Fail(404, "0404", "记录不存在"); }
+        if (!await this.RowAllowed(conf, r)) { this.Fail(404, "0404", "记录不存在"); }
         this.LoadKeys(conf, r);
         /* 行对象就地构建（与 DoFormConf 同形）：列名 + 声明的虚拟列，
            虚拟列取空串（编辑回显不投影计数列）。 */
@@ -171,12 +228,28 @@ public class CrudScreenController : AdminController {
         if (isEdit) {
             DbResult r = await DbTable.Of(this.Held(), conf.table).ReadAsync("id", id);
             if (r == null || r.RowCount() == 0) { this.Fail(404, "0404", "记录不存在"); }
+            if (!await this.RowAllowed(conf, r)) { this.Fail(404, "0404", "记录不存在"); }
             for (int i = 0; i < conf.forms.Count; i = i + 1) {
                 FormField f = conf.forms[i];
                 if (f.name.Length == 0 || f.kind == "pass" || f.kind == "hint") { continue; }
                 int col = r.GetColumnIndex(f.name);
                 if (col < 0) { continue; }
                 fp.Field(f.name).Val(r.GetString(0, col));
+            }
+        }
+        /* 资源列渲染成"只含可见资源"的下拉：受域账号不该手填店铺 id，
+           也不该在下拉里看见别人的店铺。 */
+        if (conf.scopeKey.Length > 0 && conf.scopeCol.Length > 0) {
+            RowScope sc = await this.ScopeRow(conf);
+            if (sc != null) {
+                bool declared = false;
+                for (int i = 0; i < conf.forms.Count; i = i + 1) {
+                    if (conf.forms[i].name == conf.scopeCol) { declared = true; }
+                }
+                if (declared) {
+                    string opts = await DataGrant.Options(this.Held(), conf.scopeKey, sc, 300);
+                    fp.Field(conf.scopeCol).AsSelect(opts);
+                }
             }
         }
         fp.Render(d);
@@ -217,6 +290,15 @@ public class CrudScreenController : AdminController {
         DbTable t = DbTable.Of(this.Held(), conf.table);
         List<string> onlyId = new List<string>();
         onlyId.Add("id");
+        /* 编辑：先确认目标行落在域内，再确认新值仍在域内——防止把
+           别人的行改到自己名下，或把自己的行改到别人名下。 */
+        if (!isNew) {
+            DbResult cur = await t.ReadAsync("id", id);
+            if (cur == null || cur.RowCount() == 0) { this.Fail(404, "0404", "记录不存在"); }
+            if (!await this.RowAllowed(conf, cur)) { this.Fail(404, "0404", "记录不存在"); }
+        }
+        string scopeWhy = await this.BindScope(conf, row);
+        if (scopeWhy.Length > 0) { this.Fail(403, "0403", scopeWhy); }
         for (int i = 0; i < conf.uniques.Count; i = i + 1) {
             StrMap u = conf.uniques[i];
             string col = u.Get("col");
@@ -249,6 +331,7 @@ public class CrudScreenController : AdminController {
         ListPage lp = conf.Build(false);
         DbResult r = await DbTable.Of(this.Held(), conf.table).ReadAsync("id", id);
         if (r == null || r.RowCount() == 0) { this.Fail(404, "0404", "记录不存在"); }
+        if (!await this.RowAllowed(conf, r)) { this.Fail(404, "0404", "记录不存在"); }
         string why = await this.OnDeleting(id);
         if (why.Length > 0) { this.Fail(400, "0004", why); }
         List<int> allowed = new List<int>();
@@ -279,6 +362,9 @@ public class CrudScreenController : AdminController {
                 if (r == null || r.RowCount() == 0) {
                     this.Fail(404, "0404", "记录不存在"); return;
                 }
+                if (!await this.RowAllowed(conf, r)) {
+                    this.Fail(404, "0404", "记录不存在"); return;
+                }
                 string why = await this.OnDeleting(id);
                 if (why.Length > 0) { this.Fail(400, "0004", why); return; }
                 checkedIds.Add(id);
@@ -291,6 +377,17 @@ public class CrudScreenController : AdminController {
         }
         string bad = this.CheckValue(conf, conf.toggleField, value);
         if (bad.Length > 0) { this.Fail(400, "0004", bad); }
+        /* 批量启停同样逐行校验域：ids 里混入域外行时整批拒绝，不做
+           "能改的改、不能改的跳过"——半成功比失败更难解释。 */
+        if (conf.scopeKey.Length > 0) {
+            DbTable tt = DbTable.Of(this.Held(), conf.table);
+            for (int i = 0; i < ids.Count; i = i + 1) {
+                DbResult r = await tt.ReadAsync("id", ids[i]);
+                if (r == null || r.RowCount() == 0 || !await this.RowAllowed(conf, r)) {
+                    this.Fail(404, "0404", "记录不存在"); return;
+                }
+            }
+        }
         await CrudOps.Batch(this, lp, conf.toggleField, value, ids, conf.title + "·批量");
         await this.OnBatched(conf.toggleField, value, ids);
     }
@@ -317,6 +414,7 @@ public class CrudScreenController : AdminController {
         ListPage lp = conf.Build(true);
         DbResult r = await DbTable.Of(this.Held(), conf.table).ReadAsync("id", id);
         if (r == null || r.RowCount() == 0) { this.Fail(404, "0404", "记录不存在"); }
+        if (!await this.RowAllowed(conf, r)) { this.Fail(404, "0404", "记录不存在"); }
         string bad = this.CheckValue(conf, field, value);
         if (bad.Length > 0) { this.Fail(400, "0004", bad); }
         List<int> allowed = new List<int>();
@@ -339,7 +437,7 @@ public class CrudScreenController : AdminController {
             DbResult r = await t.Query().WhereEq("id", Filter.ToLong(idv, 0))
                 .Limit(1).ToResultAsync();
             JsonValue one = JsonValue.NewObject();
-            if (r != null && r.RowCount() > 0) {
+            if (r != null && r.RowCount() > 0 && await this.RowAllowed(conf, r)) {
                 one.Set("id", JsonValue.NewInt(Filter.ToInt(idv, 0)));
                 one.Set("label", JsonValue.NewStr(r.GetString(0, r.GetColumnIndex(conf.labelCol))));
             }
@@ -347,6 +445,7 @@ public class CrudScreenController : AdminController {
             return;
         }
         DbTableQuery q = t.Query();
+        q = await this.Scoped(q, conf);
         if (kw.Length > 0) { q = q.WhereContains(conf.labelCol, kw); }
         DbResult rows = await q.OrderBy(conf.orderCol).Limit(20).ToResultAsync();
         JsonValue arr = JsonValue.NewArray();
@@ -431,7 +530,9 @@ public class CrudScreenController : AdminController {
     /* 计数：声明条件下的总行数（分页不参与）。 */
     public async long CountRows(CrudConf conf, List<OrmCond> conds) {
         DbTable t = DbTable.Of(this.Held(), conf.table);
-        return await Apply(t.Query(), conds).CountAsync();
+        DbTableQuery q = Apply(t.Query(), conds);
+        q = await this.Scoped(q, conf);
+        return await q.CountAsync();
     }
 
     /* 取页：条件 + 排序 + 分页，行投影过 OnRows 钩子；同时记下本页
@@ -439,6 +540,7 @@ public class CrudScreenController : AdminController {
     public async List<StrMap> LoadRows(CrudConf conf, List<OrmCond> conds, ListQuery q) {
         DbTable t = DbTable.Of(this.Held(), conf.table);
         DbTableQuery rq = Apply(t.Query(), conds);
+        rq = await this.Scoped(rq, conf);
         if (conf.orderDesc) { rq = rq.OrderByDesc(conf.orderCol); }
         else { rq = rq.OrderBy(conf.orderCol); }
         DbResult r = await rq.Page(q.Limit(), q.Skip()).ToResultAsync();

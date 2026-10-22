@@ -1,0 +1,74 @@
+// 数据域（DataGrant）的安全契约：解析规则必须 fail closed。
+//
+// 这里只钉纯逻辑与空库行为——真实查询过滤在 examples/admin_demo 里用
+// 两个运营账号走 HTTP 验证（列表 8/4/2、详情 404、写入 403、选项收敛）。
+// 三条不能退化的语义：
+//   1. 没登记 = 看不到（不是默认全部）；
+//   2. 组织架构"全部"（超管/全量角色）才放行；
+//   3. 未注册的域不产生任何放行。
+using System;
+using System.Web;
+using ZanWeb.Core;
+using ZanWeb.Security;
+
+class Program {
+    static int failures;
+
+    static void Check(bool ok, string label) {
+        if (!ok) {
+            Program.failures = Program.failures + 1;
+            Console.WriteLine("FAIL " + label);
+        }
+    }
+
+    static async void Main() {
+        /* 域注册：重复注册以最后一次为准，列表保持注册序。 */
+        DataGrant.Define("shop", "店铺", "shop", "name");
+        DataGrant.Define("warehouse", "仓库", "warehouse", "name");
+        DataGrant.Define("shop", "店铺", "shop", "name");
+        Program.Check(DataGrant.Defined("shop"), "shop domain registered");
+        Program.Check(!DataGrant.Defined("nope"), "unknown domain is not defined");
+        Program.Check(DataGrant.Label("shop") == "店铺", "domain label");
+        Program.Check(DataGrant.Label("nope") == "nope", "unknown domain label falls back to key");
+        Program.Check(DataGrant.All().Count == 2, "re-register replaces instead of duplicating");
+        Program.Check(DataGrant.All()[0].key == "shop", "registration order preserved");
+
+        /* 白名单语义。 */
+        RowScope all = new RowScope();
+        all.all = true;
+        Program.Check(all.Allows(999) && !all.Empty(), "all scope allows anything");
+
+        RowScope none = new RowScope();
+        Program.Check(none.Empty(), "empty scope is empty");
+        Program.Check(!none.Allows(1), "empty scope allows nothing");
+
+        RowScope two = new RowScope();
+        two.ids.Add(1);
+        two.ids.Add(3);
+        Program.Check(two.Allows(1) && two.Allows(3), "listed ids allowed");
+        Program.Check(!two.Allows(2), "unlisted id denied");
+        Program.Check(!two.Empty(), "non-empty scope");
+
+        /* 空库/无连接：fail closed——不能因为查不到就放行。 */
+        RowScope anon = await DataGrant.Of(null, 7, "shop", DataScope.None());
+        Program.Check(anon.Empty(), "no db fails closed");
+        Program.Check(!anon.all, "no db does not widen to all");
+
+        /* 组织架构"全部"= 不受限（超管或角色 dataScope=全部）。 */
+        RowScope wide = await DataGrant.Of(null, 7, "shop", DataScope.Everything(7));
+        Program.Check(wide.all, "role-all widens to all");
+        Program.Check(wide.Allows(42), "role-all allows any resource");
+
+        /* 未注册的域即便组织架构放行也不额外授予资源（由调用方声明决定）。 */
+        Program.Check(!DataGrant.Defined(""), "empty key is not a domain");
+
+        /* 选项串在无库时为空，不产生"看起来能选"的假下拉。 */
+        Program.Check((await DataGrant.Options(null, "shop", all, 300)).Length == 0,
+            "options without db is empty");
+        Program.Check((await DataGrant.Options(null, "nope", all, 300)).Length == 0,
+            "options for unknown domain is empty");
+
+        Console.WriteLine("failures=" + Convert.ToString(Program.failures));
+        if (Program.failures != 0) { throw new Exception("data grant contract regression"); }
+    }
+}

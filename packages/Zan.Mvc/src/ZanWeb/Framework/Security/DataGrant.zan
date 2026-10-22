@@ -1,0 +1,222 @@
+using System;
+using System.Data;
+using System.Data.Orm;
+using System.Text;
+using ZanWeb.Core;
+using ZanWeb.Model;
+
+namespace ZanWeb.Security;
+
+/* 资源级数据域（店铺、门店、项目、仓库……）：账号 → 一个或多个资源 id。
+ *
+ * 与 DataScope 的分工：
+ *   DataScope 回答"按组织架构能看哪些行"（全部/本部门/仅本人），面向
+ *   账号、部门这类有层级的主数据；
+ *   DataGrant 回答"按业务归属能看哪些行"（我管哪几个店铺），面向扁平
+ *   的、数量可变的业务资源，一个账号可以同时持有多个，且彼此无关。
+ *
+ * 解析规则（fail closed）：
+ *   · 超管，或角色 dataScope=全部 → 不受限；
+ *   · 其余账号 → sys_user_scope 里登记的 id；
+ *   · **一条都没登记 = 一条都看不到**，而不是"默认全部"。
+ *
+ * 使用方式（业务在启动时注册一次域，之后只在声明里写一行）：
+ *   DataGrant.Define("shop", "店铺", "shop", "name");
+ *   CrudConf.Of(...).Scope("shop", "shopId")
+ * 基座据此在列表、计数、详情、写入、批量、关联选项六处统一过滤。 */
+public class GrantDomain {
+    public string key;
+    public string label;
+    public string table;
+    public string labelCol;
+}
+
+/* 一次请求内的可见集合：all=true 不受限；否则 ids 为白名单（可为空）。 */
+public class RowScope {
+    public bool all;
+    public List<int> ids;
+
+    public RowScope() {
+        this.all = false;
+        this.ids = new List<int>();
+    }
+
+    public bool Allows(long id) {
+        if (this.all) { return true; }
+        for (int i = 0; i < this.ids.Count; i = i + 1) {
+            if (Convert.ToInt64(this.ids[i]) == id) { return true; }
+        }
+        return false;
+    }
+
+    public bool Empty() {
+        return !this.all && this.ids.Count == 0;
+    }
+}
+
+public class DataGrant {
+    static Dict<string, GrantDomain> defs = null;
+    /* 注册顺序 + 键列表（Dict 不暴露遍历，界面顺序由这里给出）。 */
+    static List<GrantDomain> order = null;
+
+    /* 业务启动时注册一个资源域。重复注册以后者为准（热重载/测试友好）。 */
+    public static void Define(string key, string label, string table, string labelCol) {
+        if (key.Length == 0 || table.Length == 0) { return; }
+        if (defs == null) { defs = new Dict<string, GrantDomain>(); }
+        if (order == null) { order = new List<GrantDomain>(); }
+        GrantDomain g = new GrantDomain();
+        g.key = key;
+        g.label = label;
+        g.table = table;
+        g.labelCol = labelCol.Length > 0 ? labelCol : "name";
+        /* 重注册保持原位置：菜单/分配界面的域顺序不因一次热重载而跳动。 */
+        List<GrantDomain> next = new List<GrantDomain>();
+        bool placed = false;
+        for (int i = 0; i < order.Count; i = i + 1) {
+            if (order[i].key == key) {
+                next.Add(g);
+                placed = true;
+            } else {
+                next.Add(order[i]);
+            }
+        }
+        if (!placed) { next.Add(g); }
+        order = next;
+        if (defs.ContainsKey(key)) { defs.Remove(key); }
+        defs.Add(key, g);
+    }
+
+    public static bool Defined(string key) {
+        if (defs == null || key.Length == 0) { return false; }
+        return defs.ContainsKey(key);
+    }
+
+    public static GrantDomain Get(string key) {
+        if (defs == null || key.Length == 0) { return null; }
+        GrantDomain g = null;
+        if (!defs.TryGetValue(key, out g)) { return null; }
+        return g;
+    }
+
+    /* 域的中文名（错误文案用）；未注册时回落到键本身。 */
+    public static string Label(string key) {
+        GrantDomain g = Get(key);
+        return g == null ? key : g.label;
+    }
+
+    public static List<GrantDomain> All() {
+        List<GrantDomain> outp = new List<GrantDomain>();
+        if (order == null) { return outp; }
+        for (int i = 0; i < order.Count; i = i + 1) { outp.Add(order[i]); }
+        return outp;
+    }
+
+    /* 解析一次请求的可见集合。dept 是组织架构范围：它为"全部"时直接
+     * 放行（超管/全量角色），否则只认 sys_user_scope 的登记。 */
+    public static async RowScope Of(IDbConnection db, int userId, string key, DataScope dept) {
+        RowScope sc = new RowScope();
+        if (dept != null && dept.Any()) { sc.all = true; return sc; }
+        if (userId <= 0 || key.Length == 0 || db == null) { return sc; }
+        IZanSql fsql = ZanSql.FromConnection(db);
+        List<SysUserScope> rows = await fsql.Select<SysUserScope>()
+            .Where(a => a.userId == userId && a.scopeKey == key)
+            .ToListAsync();
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            if (rows[i].resourceId <= 0) { continue; }
+            if (Has(sc.ids, rows[i].resourceId)) { continue; }
+            sc.ids.Add(rows[i].resourceId);
+        }
+        return sc;
+    }
+
+    /* 账号在某个域里的登记行（分配界面回显用）。 */
+    public static async List<SysUserScope> OfUser(IDbConnection db, int userId) {
+        List<SysUserScope> outp = new List<SysUserScope>();
+        if (userId <= 0 || db == null) { return outp; }
+        IZanSql fsql = ZanSql.FromConnection(db);
+        return await fsql.Select<SysUserScope>()
+            .Where(a => a.userId == userId)
+            .ToListAsync();
+    }
+
+    /* 域内可见资源的 "id=名称" 选项串（表单下拉 / 筛选下拉）。
+     * all=true 时取全量（上限 300），否则只取白名单里的行。 */
+    public static async string Options(IDbConnection db, string key, RowScope sc, int limit) {
+        GrantDomain g = Get(key);
+        if (g == null || db == null) { return ""; }
+        if (sc == null) { return ""; }
+        DbTable t = DbTable.Of(db, g.table);
+        DbResult r = await t.Query().OrderBy(g.labelCol).Limit(limit).ToResultAsync();
+        if (r == null) { return ""; }
+        int idc = r.GetColumnIndex("id");
+        int lbc = r.GetColumnIndex(g.labelCol);
+        if (idc < 0) { return ""; }
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < r.RowCount(); i = i + 1) {
+            int rid = r.GetInt(i, idc);
+            if (!sc.Allows(rid)) { continue; }
+            string lb = lbc >= 0 ? r.GetString(i, lbc) : Convert.ToString(rid);
+            lb = Clean(lb);
+            if (sb.Length > 0) { sb.Append(","); }
+            sb.Append(Convert.ToString(rid));
+            sb.Append("=");
+            sb.Append(lb);
+        }
+        return sb.ToString();
+    }
+
+    /* 单条资源的名称（审计文案/列表映射用）；不存在返回 ""。 */
+    public static async string LabelOf(IDbConnection db, string key, int resourceId) {
+        GrantDomain g = Get(key);
+        if (g == null || db == null || resourceId <= 0) { return ""; }
+        DbTable t = DbTable.Of(db, g.table);
+        DbResult r = await t.ReadAsync("id", resourceId);
+        if (r == null || r.RowCount() == 0) { return ""; }
+        int lbc = r.GetColumnIndex(g.labelCol);
+        if (lbc < 0) { return Convert.ToString(resourceId); }
+        return r.GetString(0, lbc);
+    }
+
+    /* 全量替换某个账号在某个域里的登记：先删后插，空列表即收回全部。 */
+    public static async int Replace(IDbConnection db, int userId, string key, List<int> ids) {
+        if (db == null || userId <= 0 || key.Length == 0) { return 0; }
+        IZanSql fsql = ZanSql.FromConnection(db);
+        int _gone = await fsql.Delete<SysUserScope>()
+            .Where(a => a.userId == userId && a.scopeKey == key)
+            .ExecuteAffrowsAsync();
+        if (ids == null) { return 0; }
+        long now = WebApp.NowSeconds();
+        int added = 0;
+        List<int> seen = new List<int>();
+        for (int i = 0; i < ids.Count; i = i + 1) {
+            int rid = ids[i];
+            if (rid <= 0 || Has(seen, rid)) { continue; }
+            seen.Add(rid);
+            SysUserScope row = new SysUserScope();
+            row.userId = userId;
+            row.scopeKey = key;
+            row.resourceId = rid;
+            row.createdAt = now;
+            int _n = await fsql.Insert<SysUserScope>(row).ExecuteIdentityAsync();
+            added = added + 1;
+        }
+        return added;
+    }
+
+    /* 选项串里不能出现逗号/等号：它们是分隔符。 */
+    private static string Clean(string s) {
+        if (s == null) { return ""; }
+        string r = s;
+        r = r.Replace(",", " ");
+        r = r.Replace("=", " ");
+        r = r.Replace("|", " ");
+        return r.Trim();
+    }
+
+    private static bool Has(List<int> list, int id) {
+        for (int i = 0; i < list.Count; i = i + 1) {
+            if (list[i] == id) { return true; }
+        }
+        return false;
+    }
+}

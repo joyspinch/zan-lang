@@ -4,6 +4,7 @@ using System.IO;
 using System.Data;
 using System.Data.Sqlite;
 using System.Data.Orm;
+using System.Collections.Generic;
 using System.Web;
 using ZanWeb.Core;
 using ZanWeb.Web;
@@ -20,16 +21,144 @@ public class Program {
         ctx.Redirect("/admin");
     }
 
-    static async bool SeedProducts(IZanSql zsql) {
-        int count = await zsql.Select<Product>().CountAsync();
-        if (count > 0) { return true; }
+    /* 业务种子：店铺（数据域资源）+ 商品（按 shopId 归属店铺）。
+       每个运营只被授予其中一部分店铺，商品列表据此过滤。 */
+    static async bool SeedProducts(IZanSql fsql) {
         long now = DateTime.UtcNow().ToUnixSeconds();
-        await zsql.Insert<Product>(new Product { id = 1, name = "ThinkPad X1 Carbon 商务本", category = "数码3C", price = 9999.0, stock = 42, status = 1, createdAt = now }).ExecuteAffrowsAsync();
-        await zsql.Insert<Product>(new Product { id = 2, name = "4K 极清电竞显示器 27寸", category = "数码3C", price = 1899.0, stock = 120, status = 1, createdAt = now }).ExecuteAffrowsAsync();
-        await zsql.Insert<Product>(new Product { id = 3, name = "人体工学办公转椅", category = "家居日用", price = 899.0, stock = 65, status = 1, createdAt = now }).ExecuteAffrowsAsync();
-        await zsql.Insert<Product>(new Product { id = 4, name = "云南精品高山咖啡豆 500g", category = "生鲜食品", price = 88.0, stock = 300, status = 1, createdAt = now }).ExecuteAffrowsAsync();
+        int shops = await fsql.Select<Shop>().CountAsync();
+        if (shops == 0) {
+            await SeedShop(fsql, "北京旗舰店", "华北", now);
+            await SeedShop(fsql, "上海陆家嘴店", "华东", now);
+            await SeedShop(fsql, "广州天河店", "华南", now);
+            await SeedShop(fsql, "成都高新店", "西南", now);
+            await SeedShop(fsql, "杭州滨江店", "华东", now);
+            Console.WriteLine("[Init] 演示店铺种子数据注入完成！");
+        }
+
+        int count = await fsql.Select<Product>().CountAsync();
+        if (count > 0) { return true; }
+        await SeedProduct(fsql, 1, "ThinkPad X1 Carbon 商务本", "数码3C", 9999.0, 42, 1, now);
+        await SeedProduct(fsql, 2, "4K 极清电竞显示器 27寸", "数码3C", 1899.0, 120, 1, now);
+        await SeedProduct(fsql, 3, "人体工学办公转椅", "家居日用", 899.0, 65, 2, now);
+        await SeedProduct(fsql, 4, "云南精品高山咖啡豆 500g", "生鲜食品", 88.0, 300, 2, now);
+        await SeedProduct(fsql, 5, "机械键盘 K8 Pro", "数码3C", 499.0, 0, 3, now);
+        await SeedProduct(fsql, 6, "空气循环扇 静音款", "家居日用", 329.0, 88, 3, now);
+        await SeedProduct(fsql, 7, "手冲咖啡壶套装", "家居日用", 259.0, 51, 4, now);
+        await SeedProduct(fsql, 8, "降噪耳机 Air Pro", "数码3C", 1299.0, 36, 5, now);
         Console.WriteLine("[Init] 演示商品种子数据注入完成！");
         return true;
+    }
+
+    static async void SeedShop(IZanSql fsql, string name, string region, long now) {
+        Shop s = new Shop();
+        s.name = name;
+        s.region = region;
+        s.status = 1;
+        s.createdAt = now;
+        await fsql.Insert<Shop>(s).ExecuteIdentityAsync();
+    }
+
+    static async void SeedProduct(IZanSql fsql, int id, string name, string cat,
+            double price, int stock, int shopId, long now) {
+        Product p = new Product();
+        p.id = id;
+        p.name = name;
+        p.category = cat;
+        p.price = price;
+        p.stock = stock;
+        p.shopId = shopId;
+        p.status = 1;
+        p.createdAt = now;
+        await fsql.Insert<Product>(p).ExecuteAffrowsAsync();
+    }
+
+    /* 两个运营账号 + 一个"运营"角色。
+     *
+     * 关键点：角色 dataScope = 4（仅本人），**不是** 全部——角色给的是
+     * "能做什么"（商品/店铺屏的位），资源域给的是"能看哪几行"（店铺
+     * 白名单）。只有两者都成立，账号才看得到数据。
+     *
+     * 必须在 Perm.Index 之后调用：路由键（screen）此时才可枚举，按屏
+     * 标题授权不必硬编码 action 名。 */
+    static async bool SeedOps(DbContext dbCtx) {
+        IDbConnection db = await dbCtx.Acquire();
+        if (db == null) { return false; }
+        try {
+            IZanSql fsql = ZanSql.FromConnection(db);
+            int have = await fsql.Select<SysUser>().Where(a => a.username == "ops_a").CountAsync();
+            if (have > 0) { return true; }
+            long now = DateTime.UtcNow().ToUnixSeconds();
+
+            SysRole role = new SysRole();
+            role.name = "运营";
+            role.code = "ops";
+            role.rank = 20;
+            role.status = 1;
+            role.dataScope = 4;
+            role.scopeDepts = "";
+            role.description = "按店铺授权：只能在被授予的店铺内操作";
+            role.createdAt = now;
+            role.updatedAt = now;
+            int roleId = await fsql.Insert<SysRole>(role).ExecuteIdentityAsync();
+            if (roleId <= 0) { return false; }
+
+            List<string> screens = Perm.Screens();
+            for (int i = 0; i < screens.Count; i = i + 1) {
+                string screen = screens[i];
+                string title = Perm.TitleOf(screen);
+                int mask = 0;
+                if (title == "商品管理") { mask = 31; }
+                else if (title == "店铺管理") { mask = 15; }
+                if (mask == 0) { continue; }
+                SysRoleGrant g = new SysRoleGrant();
+                g.roleId = roleId;
+                g.action = screen;
+                g.mask = mask;
+                g.createdAt = now;
+                int _n = await fsql.Insert<SysRoleGrant>(g).ExecuteIdentityAsync();
+            }
+
+            int a = await MakeOps(fsql, "ops_a", "运营·小满", roleId, now);
+            int b = await MakeOps(fsql, "ops_b", "运营·周行", roleId, now);
+
+            List<int> aShops = new List<int>();
+            aShops.Add(1);
+            aShops.Add(3);
+            List<int> bShops = new List<int>();
+            bShops.Add(2);
+            int _x = await DataGrant.Replace(db, a, "shop", aShops);
+            int _y = await DataGrant.Replace(db, b, "shop", bShops);
+
+            await PermTable.LoadRoles(fsql);
+            PermTable.ForgetAll();
+            Console.WriteLine("[Init] 演示运营账号：ops_a（店铺 1、3）/ ops_b（店铺 2），密码 ops12345678");
+            return true;
+        } finally {
+            dbCtx.Release(db);
+        }
+    }
+
+    static async int MakeOps(IZanSql fsql, string user, string nick, int roleId, long now) {
+        SysUser u = new SysUser();
+        u.username = user;
+        u.passwordSalt = "";
+        u.passwordHash = AuthUser.NewHash("ops12345678");
+        u.nickname = nick;
+        u.email = "";
+        u.mobile = "";
+        u.departmentId = 0;
+        u.status = AuthUser.Active;
+        u.isSuper = 0;
+        u.tokenVersion = 1;
+        u.createdAt = now;
+        u.updatedAt = now;
+        int id = await fsql.Insert<SysUser>(u).ExecuteIdentityAsync();
+        SysUserRole link = new SysUserRole();
+        link.userId = id;
+        link.roleId = roleId;
+        link.createdAt = now;
+        int _n = await fsql.Insert<SysUserRole>(link).ExecuteIdentityAsync();
+        return id;
     }
 
     static async int Main() {
@@ -45,7 +174,12 @@ public class Program {
         // 1. 初始化配置与数据库
         Cfg.Db.driver = "sqlite";
         Cfg.Db.sqlitePath = dbPath;
-        Cfg.Auth.bootstrapPassword = "admin123456";
+        Cfg.Auth.bootstrapPassword = "admin12345678";
+        Cfg.Auth.secret = "0123456789abcdef0123456789abcdef";
+
+        /* 数据域：注册"店铺"这个资源维度。注册之后，任何声明了
+           CrudConf.Scope("shop", "<列>") 的屏自动按账号可见店铺过滤。 */
+        DataGrant.Define("shop", "店铺", "shop", "name");
 
         // 2. 构造连接池与 DbContext
         DbPool pool = SqliteConnector.Pool(dbPath, 4);
@@ -70,9 +204,35 @@ public class Program {
         app.PermissionResolver(AuthUser.Allow);
         app.LoginPath(Routes.Login);
 
+        /* 视图与静态资源：演示工程直接指向包内目录；正式发布时把
+           views/ 与 wwwroot/ 放到可执行文件旁边即可（Boot.Run 的默认布局）。 */
+        app.Views("packages/Zan.Mvc/views");
+        StaticFiles.MaxAge(3600);
+        StaticFiles.Mount(app, "/static", "packages/Zan.Mvc/wwwroot");
+
+        /* 侧栏分组名：不注册时回退成 URL 段（Content / Shop / System），
+           中文后台里就是中英混排——这是框架的兜底，不是设计。 */
+        MenuBuilder.Section("shop", "电商商城");
+        MenuBuilder.Section("content", "内容管理");
+        MenuBuilder.Section("monitor", "运行监控");
+        MenuBuilder.Section("system", "系统管理");
+        MenuBuilder.Section("dev", "开发工具");
+        MenuBuilder.Section("wiki", "知识库");
+        MenuBuilder.Section("media", "媒体库");
+
         // 注册所有属性控制器路由、权限位索引与管理区安全守门
         __AttrRoutes.Register(app);
         Perm.Index(app);
+
+        /* 权限共享内存：与 Boot.Run 同一顺序（Index → Open → LoadRoles）。
+           演示工程不走 Boot，这一步不能省，否则非超管账号一条权限都判不出来。 */
+        if (!PermTable.Open()) {
+            Console.WriteLine("[rbac] shared memory unavailable");
+        }
+        await PermTable.LoadRoles(services.Orm());
+        bool opsReady = await SeedOps(dbCtx);
+        if (!opsReady) { Console.WriteLine("[warn] 演示运营账号未注入"); }
+
         Boot.AdminGate(app);
 
         // 根路径跳转至管理后台
@@ -82,7 +242,8 @@ public class Program {
         Console.WriteLine("---------------------------------------------------------");
         Console.WriteLine("  ZanWeb 企业级管理后台服务已启动！");
         Console.WriteLine("  访问地址: http://127.0.0.1:" + Convert.ToString(port) + "/admin");
-        Console.WriteLine("  超级管理员: admin / admin123456");
+        Console.WriteLine("  超级管理员: admin / admin12345678");
+        Console.WriteLine("  运营账号: ops_a（店铺 1、3）/ ops_b（店铺 2），密码 ops12345678");
         Console.WriteLine("  业务演示: 电商商城 -> 商品管理 (/admin/shop/product)");
         Console.WriteLine("---------------------------------------------------------");
         Console.WriteLine("");
