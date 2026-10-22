@@ -65,6 +65,37 @@ Without MCP the same index is a file: `knowledge/symbols.json` next to the SDK
   value-shaped targets, not null: check `!= ""`. （the parse
   ambiguity was fixed in zanc; the old advice to write `(x is T) ? a : b`
   is obsolete.)
+* **A failed cast does not throw — it silently yields the target type's
+  default**: casting a non-string object to `string` gives `""`, and a failed
+  class cast is just as silent. So reading a value out of `object` means
+  testing the type with `is` first; never rely on a cast failure to reveal a
+  type mismatch — it hides the bug. (probe-verified)
+* **Generic `is T` does not work for strings, but concrete `is string`
+  does**: a string in an `object` slot has no allocation-site metadata, so
+  its runtime type name reports as `object`; class types are unaffected
+  (`object o = new Box(); o is Box` is true). So `is T` inside
+  `T Get<T>()` misjudges strings as "type mismatch" — record a type tag at
+  registration time (`typeof(T).Name`) instead of trusting runtime `is`.
+* **`throw <expr>` goes by the static type**: `catch (Exception e) { throw e; }`
+  degrades a concrete exception type to `Exception`, so an outer
+  `catch (MyEx)` no longer matches (it only catches `Exception`). Keep the
+  type with `catch (MyEx e) { throw e; }`, or do not rethrow verbatim from a
+  `catch (Exception)` — a wrapper layer that catches everything and rethrows
+  erases the distinction for every caller above it.
+* **A lambda passed as an argument to a delegate returning `object` must
+  return an explicit `object`**: `Factory f = () => { return "x"; };` compiles
+  (assigned to a delegate variable) but `Take(() => { return "x"; })` fails
+  with "no overload matches" — the **argument position** applies a stricter
+  lambda conversion than the assignment position; write
+  `return (object)"x";`.
+* **`object` slots do not box value types**: `List<object>` cannot hold an
+  int. "Any value" containers (parameterized case lists, heterogeneous
+  result tables) can only hold reference types (string / custom classes);
+  keep ints in type-specific collections.
+* **Never put a delegate into an `object` variable and compare it to null**:
+  `object f = someDelegate;` followed by `f == null` crashes with an access
+  violation. Keep delegates in typed fields (a named delegate type such as
+  `public delegate object Factory();` works directly).
 * Never list attribute names with `*/` inside a `/* ... */` comment —
   `data-on-*/data-if` closes the comment mid-sentence and the rest becomes
   code (209 cascading errors). Separate with `、` or spaces.

@@ -1,0 +1,276 @@
+using System;
+using System.Collections.Generic;
+using System.Test;
+
+// pytest 式 fixture + 参数化：
+//  1. fixture 按需创建、依赖先建、函数作用域用完就拆；
+//  2. 模块作用域跨用例复用，Test.Reset 时才拆；
+//  3. autouse 在用例体之前自动建好；
+//  4. 无类型注册（类 / 字符串）也能安全取回；
+//  5. 未注册 / 类型不符 / 依赖成环 / 重复注册都报错，不静默给默认值；
+//  6. 用例体抛异常、拆毁回调抛异常的处置；
+//  7. 参数化：id 形如 name[值]、每个组合独立记账、每个组合独立 fixture 生命周期。
+class FakeDb {
+    public string tag;
+
+    public FakeDb(string tag) {
+        this.tag = tag;
+    }
+}
+
+class Program {
+    static int failures = 0;
+    static List<string> log = new List<string>();
+    static FakeDb sharedFirst = null;
+
+    static void Check(bool cond, string name) {
+        if (cond) {
+            Console.WriteLine("ok " + name);
+        } else {
+            Console.WriteLine("FAIL " + name);
+            failures = failures + 1;
+        }
+    }
+
+    static void Note(string s) {
+        log.Add(s);
+    }
+
+    // 打印并清空事件日志——顺序本身就是被钉住的行为。
+    static void Dump(string tag) {
+        for (int i = 0; i < log.Count; i = i + 1) {
+            Console.WriteLine("log " + tag + " " + log[i]);
+        }
+        log.Clear();
+    }
+
+    static void Main() {
+        // ---- 注册 fixture ----
+        Fixture.Register<FakeDb>("db", () => { Note("create-db"); return new FakeDb("db"); });
+        Fixture.Register<FakeDb>("tx", () => { Note("create-tx"); return new FakeDb("tx"); });
+        Fixture.Depends("tx", "db");
+        Fixture.OnTeardown("db", (object v) => { Note("teardown-db"); });
+        Fixture.OnTeardown("tx", (object v) => { Note("teardown-tx"); });
+
+        Fixture.RegisterModule<FakeDb>("shared", () => { Note("create-shared"); return new FakeDb("shared"); });
+        Fixture.OnTeardown("shared", (object v) => { Note("teardown-shared"); });
+
+        // 无类型注册：类靠运行期判定，字符串靠创建时打的标签。
+        Fixture.RegisterUntyped("clock", () => { return new FakeDb("clock"); });
+        Fixture.RegisterUntyped("label", () => { return (object)"hello"; });
+
+        // autouse：每个用例体之前自动建好。
+        Fixture.Register<FakeDb>("seed", () => { Note("create-seed"); return new FakeDb("seed"); });
+        Fixture.OnTeardown("seed", (object v) => { Note("teardown-seed"); });
+        Fixture.Autouse("seed");
+
+        Test.Group("fx");
+
+        // 1. 按需创建 + 依赖先建 + 函数作用域用完就拆（逆序）。
+        Test.Run("lazy", () => {
+            Note("body");
+            FakeDb tx = Fixture.Get<FakeDb>("tx");
+            Check(tx != null, "tx-not-null");
+        });
+        Dump("lazy");
+
+        // 2. 模块作用域：第一次建，之后复用同一份。
+        Test.Run("shared-first", () => {
+            Note("body");
+            sharedFirst = Fixture.Get<FakeDb>("shared");
+            Check(sharedFirst != null, "shared-not-null");
+        });
+        Dump("shared-first");
+
+        Test.Run("shared-again", () => {
+            Note("body");
+            FakeDb sharedSecond = Fixture.Get<FakeDb>("shared");
+            Check(sharedSecond == sharedFirst, "module-scope-reused");
+            Check(Fixture.Live() == 2, "live-count");
+        });
+        Dump("shared-again");
+
+        // 3. autouse 已经在用例体之前建好了（create-seed 排在 body 前面）。
+        Test.Run("autouse", () => {
+            Note("body");
+            Check(Fixture.Get<FakeDb>("seed") != null, "autouse-seed");
+        });
+        Dump("autouse");
+
+        // 4. 无类型注册取值。
+        Test.Run("untyped", () => {
+            Note("body");
+            FakeDb clock = Fixture.Get<FakeDb>("clock");
+            string label = Fixture.Get<string>("label");
+            Check(clock != null && clock.tag == "clock", "untyped-class");
+            Check(label == "hello", "untyped-string");
+        });
+        Dump("untyped");
+
+        // 5. 错误路径：未注册 / 类型不符 / 重复注册 / 依赖成环。
+        Test.Run("errors", () => {
+            Note("body");
+            bool missing = false;
+            try {
+                FakeDb db = Fixture.Get<FakeDb>("nope");
+                Check(db == null, "unreachable");
+            } catch (FixtureException e) {
+                missing = true;
+            }
+            Check(missing, "missing-throws");
+
+            bool wrongType = false;
+            try {
+                string s = Fixture.Get<string>("db");
+                Check(s == null, "unreachable");
+            } catch (FixtureException e) {
+                wrongType = true;
+            }
+            Check(wrongType, "wrong-type-throws");
+
+            bool dup = false;
+            try {
+                Fixture.Register<FakeDb>("db", () => { return new FakeDb("dup"); });
+            } catch (FixtureException e) {
+                dup = true;
+            }
+            Check(dup, "duplicate-throws");
+
+            Fixture.Register<FakeDb>("cyc-a", () => { return new FakeDb("a"); });
+            Fixture.Register<FakeDb>("cyc-b", () => { return new FakeDb("b"); });
+            Fixture.Depends("cyc-a", "cyc-b");
+            Fixture.Depends("cyc-b", "cyc-a");
+            bool cycle = false;
+            try {
+                FakeDb a = Fixture.Get<FakeDb>("cyc-a");
+                Check(a == null, "unreachable");
+            } catch (FixtureException e) {
+                cycle = true;
+            }
+            Check(cycle, "dependency-cycle-throws");
+        });
+        Dump("errors");
+
+        // 6. 用例体抛异常：fixture 照样拆。
+        Test.Run("boom", () => {
+            Note("body");
+            throw new Exception("boom");
+        });
+        Dump("boom");
+
+        // 6b. 依赖解析中途炸了，解析栈要回卷——否则下一次建同名依赖会被
+        //     误判成"依赖成环"。
+        Test.Run("unwind", () => {
+            Note("body");
+            Fixture.Register<FakeDb>("thrower", () => { throw new Exception("factory boom"); });
+            Fixture.Register<FakeDb>("victim", () => { return new FakeDb("victim"); });
+            Fixture.Depends("victim", "thrower");
+            bool factoryFailed = false;
+            try {
+                FakeDb v = Fixture.Get<FakeDb>("victim");
+                Check(v == null, "unreachable");
+            } catch (Exception e) {
+                factoryFailed = e.Message != null && e.Message.Contains("factory boom");
+            }
+            Check(factoryFailed, "factory-error-propagates");
+
+            Fixture.Register<FakeDb>("after", () => { return new FakeDb("after"); });
+            Fixture.Depends("after", "victim");
+            bool misreported = false;
+            try {
+                FakeDb a = Fixture.Get<FakeDb>("after");
+                Check(a == null, "unreachable");
+            } catch (Exception e) {
+                if (e.Message != null && e.Message.Contains("依赖成环")) { misreported = true; }
+            }
+            Check(!misreported, "resolving-stack-unwound");
+        });
+        Dump("unwind");
+
+        // 7. 拆毁回调抛异常：报出来，不覆盖用例体原本的失败原因。
+        Fixture.Register<FakeDb>("bad", () => { Note("create-bad"); return new FakeDb("bad"); });
+        Fixture.OnTeardown("bad", (object v) => { Note("teardown-bad"); throw new Exception("cleanup failed"); });
+        Test.Run("cleanup-error", () => {
+            Note("body");
+            FakeDb bad = Fixture.Get<FakeDb>("bad");
+            Check(bad != null, "bad-not-null");
+        });
+        Dump("cleanup-error");
+
+        // 8. 参数化：每个组合是独立用例，id 形如 name[值]。
+        List<int> ints = new List<int>();
+        ints.Add(1);
+        ints.Add(2);
+        Test.ParamInts("param-int", ints, (int v) => {
+            Note("body-" + Convert.ToString(v));
+            Check(v > 0, "param-int-positive");
+        });
+        Dump("param-int");
+
+        List<string> strings = new List<string>();
+        strings.Add("a");
+        strings.Add("b c");
+        Test.ParamStrings("param-string", strings, (string v) => {
+            Note("body-" + v);
+            Check(v != "", "param-string-nonempty");
+        });
+        Dump("param-string");
+
+        List<double> doubles = new List<double>();
+        doubles.Add(1.5);
+        doubles.Add(2.0);
+        Test.ParamDoubles("param-double", doubles, (double v) => {
+            Note("body-" + Convert.ToString(v));
+            Check(v > 0.0, "param-double-positive");
+        });
+        Dump("param-double");
+
+        List<bool> bools = new List<bool>();
+        bools.Add(true);
+        bools.Add(false);
+        Test.ParamBools("param-bool", bools, (bool v) => {
+            Note("body-" + Convert.ToString(v));
+        });
+        Dump("param-bool");
+
+        List<int> left = new List<int>();
+        left.Add(1);
+        left.Add(2);
+        List<int> right = new List<int>();
+        right.Add(10);
+        right.Add(20);
+        Test.ParamIntPairs("param-pair", left, right, (int a, int b) => {
+            Note("body-" + Convert.ToString(a) + "-" + Convert.ToString(b));
+            Check(a < b, "param-pair-order");
+        });
+        Dump("param-pair");
+
+        List<TestCase> cases = new List<TestCase>();
+        cases.Add(new TestCase("first", () => { Note("body-first"); }));
+        cases.Add(new TestCase("sec ond]", () => { Note("body-second"); }));
+        Test.RunCases("param-case", cases);
+        Dump("param-case");
+
+        Test.EndGroup();
+
+        // ---- 用例 id 与记账 ----
+        List<TestResult> rs = Test.Results();
+        Console.WriteLine("cases " + Convert.ToString(rs.Count));
+        for (int i = 0; i < rs.Count; i = i + 1) {
+            Console.WriteLine("case " + rs[i].name + " " + (rs[i].ok ? "ok" : "fail"));
+        }
+        Check(Test.total == 23, "total-count");
+        Check(Test.passed == 21, "passed-count");
+        Check(Test.failed == 2, "failed-count");
+
+        // ---- Test.Reset：模块作用域的 fixture 收尾 ----
+        Test.Reset();
+        Dump("reset");
+        Check(Test.total == 0, "reset-clears-total");
+        Check(Fixture.Live() == 0, "reset-clears-live");
+
+        Fixture.Clear();
+        Console.WriteLine("failures " + Convert.ToString(failures));
+        if (failures > 0) { Environment.Exit(1); }
+    }
+}

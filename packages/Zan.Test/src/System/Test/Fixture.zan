@@ -1,0 +1,330 @@
+using System;
+using System.Collections.Generic;
+
+namespace System.Test;
+
+// fixture 工厂：产出一个被测资源（连接、临时目录、假对象……）。
+// 返回值必须是**引用类型**——Zan 的 object 不装箱值类型，int / bool 这类
+// 值类型装不进 object，也就当不了 fixture 的值。
+public delegate object FixtureFactory();
+
+// 带类型的工厂：注册时就把 fixture 的类型钉死。Zan 的转型失败**不抛异常**，
+// 而是静默给出目标类型的默认值（(string)某个非字符串 → ""），所以取回时
+// 必须能证明"类型对得上"——靠的就是这个委托的类型参数。
+public delegate T TypedFactory<T>();
+
+// 拆毁回调：拿回工厂产出的实例做清理（关连接、删临时目录……）。
+public delegate void FixtureTeardown(object value);
+
+// fixture 未注册 / 类型不符 / 依赖成环。
+public class FixtureException : Exception {
+    public FixtureException(string message) {
+        this.Message = message;
+    }
+}
+
+// 一条 fixture 定义。注册时写死，跨用例存活。
+public class FixtureDef {
+    public string name;
+    public FixtureFactory factory;
+    public FixtureTeardown teardown;
+    // 显式声明的依赖，按声明顺序递归创建。
+    public List<string> deps;
+    // true = 每个用例开始前自动创建（不用在用例体里显式取）。
+    public bool autouse;
+    // true = 模块作用域（跨用例复用，Test.Reset 时才拆）。
+    public bool moduleScope;
+    // 类型标签：注册时声明的类型名（"" = 没声明，取值时靠运行期判定）。
+    public string typeName;
+
+    public FixtureDef(string name, FixtureFactory factory) {
+        this.name = name;
+        this.factory = factory;
+        this.teardown = null;
+        this.deps = new List<string>();
+        this.autouse = false;
+        this.moduleScope = false;
+        this.typeName = "";
+    }
+}
+
+// 一个已创建的 fixture 实例。
+public class FixtureInstance {
+    public FixtureDef def;
+    public object value;
+
+    public FixtureInstance(FixtureDef def, object value) {
+        this.def = def;
+        this.value = value;
+    }
+}
+
+// fixture 注册表与生命周期。语义对齐 pytest：
+//
+//   * 注册：Register<T>（类型化，推荐）/ RegisterUntyped（运行期判型）；
+//   * 作用域：函数作用域（默认，每个用例一份，用例结束就拆）与模块作用域
+//     （RegisterModule，跨用例复用，Test.Reset 时拆）；
+//   * 依赖：Depends(name, [deps]) 显式声明，框架按声明顺序递归建依赖；
+//   * 自动生效：Autouse(name) 让它在每个用例开始前自动创建；
+//   * 拆毁：OnTeardown(name, fn) 挂回调，逆序执行；用例体抛异常也拆。
+//
+// 生命周期由 Test.Run 驱动：BeginTest → 用例体 → EndTest。测试框架之外
+// 直接用 Fixture.Get 也能取值（第一次取即创建）。
+public class Fixture {
+    static Dictionary<string, FixtureDef> defs = new Dictionary<string, FixtureDef>();
+    // 注册顺序：autouse 按这个顺序解析，结果可预期。
+    static List<string> defOrder = new List<string>();
+    // 已创建的实例。
+    static Dictionary<string, FixtureInstance> live = new Dictionary<string, FixtureInstance>();
+    // 创建顺序：拆毁时逆序（后建的先拆，跟 pytest 一致）。
+    static List<string> liveOrder = new List<string>();
+    static int created = 0;
+    static string currentTest = "";
+
+    // ---- 注册 ----
+
+    // 类型化注册（推荐）：工厂的返回类型就是 fixture 的类型，Get<T> 取回时
+    // 按类型标签校验，不会出现"转型失败静默变成默认值"。
+    public static void Register<T>(string name, TypedFactory<T> factory) {
+        TypedFactory<T> held = factory;
+        Fixture.RegisterRaw(name, typeof(T).Name, () => { return (object)held(); });
+    }
+
+    // 无类型注册：类型在首次创建时按值推断（字符串特判；类走运行期判定）。
+    public static void RegisterUntyped(string name, FixtureFactory factory) {
+        Fixture.RegisterRaw(name, "", factory);
+    }
+
+    // 模块作用域：跨用例复用同一份实例，直到 Test.Reset() / Fixture.Reset()。
+    public static void RegisterModule<T>(string name, TypedFactory<T> factory) {
+        Fixture.Register<T>(name, factory);
+        FixtureDef def = Fixture.Find(name);
+        def.moduleScope = true;
+    }
+
+    // 模块作用域 + 无类型注册。
+    public static void RegisterModuleUntyped(string name, FixtureFactory factory) {
+        Fixture.RegisterUntyped(name, factory);
+        FixtureDef def = Fixture.Find(name);
+        def.moduleScope = true;
+    }
+
+    private static void RegisterRaw(string name, string typeName, FixtureFactory factory) {
+        if (name == "") { throw new FixtureException("fixture 名字不能为空"); }
+        if (factory == null) { throw new FixtureException("fixture '" + name + "' 的工厂不能为空"); }
+        if (Fixture.defs.ContainsKey(name)) {
+            throw new FixtureException("fixture '" + name + "' 重复注册");
+        }
+        FixtureDef def = new FixtureDef(name, factory);
+        def.typeName = typeName;
+        Fixture.defs.Add(name, def);
+        Fixture.defOrder.Add(name);
+    }
+
+    // ---- 定义修饰 ----
+
+    // 标记为自动生效：每个用例开始前自动创建，它的依赖也随之解析。
+    public static bool Autouse(string name) {
+        FixtureDef def = Fixture.Find(name);
+        def.autouse = true;
+        return true;
+    }
+
+    // 追加依赖（显式声明）。框架按声明顺序递归创建依赖。
+    public static bool Depends(string name, List<string> deps) {
+        FixtureDef def = Fixture.Find(name);
+        foreach (string dep in deps) {
+            def.deps.Add(dep);
+        }
+        return true;
+    }
+
+    // 追加单个依赖。
+    public static bool Depends(string name, string dep) {
+        FixtureDef def = Fixture.Find(name);
+        def.deps.Add(dep);
+        return true;
+    }
+
+    // 挂拆毁回调：实例拆掉前调用，参数是工厂产出的那个实例。
+    public static bool OnTeardown(string name, FixtureTeardown teardown) {
+        FixtureDef def = Fixture.Find(name);
+        def.teardown = teardown;
+        return true;
+    }
+
+    // ---- 取值 ----
+
+    // 类型化取值。未注册 / 类型不符都抛 FixtureException——不返回默认值，
+    // 因为转型失败在 Zan 里是静默的，悄悄给个默认值比报错难查得多。
+    public static T Get<T>(string name) {
+        FixtureInstance inst = Fixture.Require(name);
+        object raw = inst.value;
+        string want = typeof(T).Name;
+        if (inst.def.typeName != "") {
+            // 类型化注册：标签就是注册时声明的类型，对不上直接报错。
+            if (inst.def.typeName != want) {
+                throw new FixtureException("fixture '" + name + "' 是 "
+                    + inst.def.typeName + "，不是 " + want);
+            }
+            return (T)raw;
+        }
+        // 无类型注册：靠运行期判定。泛型 is 对字符串无效（字符串在 object
+        // 槽里没有分配点元数据），所以无类型注册的字符串靠创建时打的标签。
+        if (raw == null) {
+            throw new FixtureException("fixture '" + name + "' 的值是 null");
+        }
+        if (raw is T) { return (T)raw; }
+        throw new FixtureException("fixture '" + name + "' 类型不符（要 " + want + "）");
+    }
+
+    // 取活实例（object）。未注册抛 FixtureException。
+    public static object GetRaw(string name) {
+        FixtureInstance inst = Fixture.Require(name);
+        return inst.value;
+    }
+
+    // ---- 观察 ----
+
+    // 是否已注册。
+    public static bool Exists(string name) { return Fixture.defs.ContainsKey(name); }
+
+    // 累计创建过的实例数。
+    public static int Created() { return Fixture.created; }
+
+    // 当前存活实例数。
+    public static int Live() { return Fixture.live.Count; }
+
+    // 当前用例全名（不在用例内则为空串）。
+    public static string CurrentTest() { return Fixture.currentTest; }
+
+    // ---- 生命周期（由 Test.Run 驱动） ----
+
+    // 用例开始：解析 autouse fixture（含它们的依赖）。
+    public static void BeginTest(string testName) {
+        Fixture.currentTest = testName;
+        for (int i = 0; i < Fixture.defOrder.Count; i = i + 1) {
+            FixtureDef def = Fixture.Find(Fixture.defOrder[i]);
+            if (!def.autouse) { continue; }
+            Fixture.Create(Fixture.defOrder[i]);
+        }
+    }
+
+    // 用例结束：拆掉本轮创建的函数作用域实例（逆序），返回首个错误
+    // （空串 = 一切正常）。模块作用域的实例留着不动。
+    public static string EndTest() {
+        string err = "";
+        for (int i = Fixture.liveOrder.Count - 1; i >= 0; i = i - 1) {
+            string name = Fixture.liveOrder[i];
+            FixtureInstance inst = Fixture.live[name];
+            if (inst == null) { continue; }
+            if (inst.def.moduleScope) { continue; }
+            Fixture.liveOrder.RemoveAt(i);
+            Fixture.live.Remove(name);
+            err = Fixture.TeardownOne(inst, err);
+        }
+        Fixture.currentTest = "";
+        return err;
+    }
+
+    // 拆掉全部存活实例（含模块作用域），定义保留——可以接着再跑一轮。
+    public static void Reset() {
+        string err = "";
+        for (int i = Fixture.liveOrder.Count - 1; i >= 0; i = i - 1) {
+            string name = Fixture.liveOrder[i];
+            FixtureInstance inst = Fixture.live[name];
+            Fixture.liveOrder.RemoveAt(i);
+            Fixture.live.Remove(name);
+            if (inst != null) { err = Fixture.TeardownOne(inst, err); }
+        }
+        Fixture.created = 0;
+        Fixture.currentTest = "";
+        if (err != "") { Console.WriteLine("FAIL " + err); }
+    }
+
+    // 拆掉全部实例并清空定义（彻底重来）。
+    public static void Clear() {
+        Fixture.Reset();
+        Fixture.defs.Clear();
+        Fixture.defOrder.Clear();
+    }
+
+    // ---- 内部 ----
+
+    // 创建（或取回）一个实例：依赖先建。
+    private static object Create(string name) {
+        if (Fixture.live.ContainsKey(name)) {
+            FixtureInstance inst = Fixture.live[name];
+            if (inst != null) { return inst.value; }
+        }
+        FixtureDef def = Fixture.Find(name);
+        if (Fixture.Reaches(name, name, 0)) {
+            throw new FixtureException("fixture 依赖成环：" + name);
+        }
+        for (int i = 0; i < def.deps.Count; i = i + 1) {
+            Fixture.Create(def.deps[i]);
+        }
+        object value = def.factory();
+        if (def.typeName == "" && value != null && value is string) {
+            // 无类型注册碰到字符串：打个标签（运行期类型名对字符串无效，
+            // 它在 object 槽里报成 object），否则 Get<string> 取不回来。
+            def.typeName = "string";
+        }
+        FixtureInstance made = new FixtureInstance(def, value);
+        Fixture.live.Add(name, made);
+        Fixture.liveOrder.Add(name);
+        Fixture.created = Fixture.created + 1;
+        return value;
+    }
+
+    // 依赖链能不能从 from 绕回 target（成环判定）。纯读，不改状态——
+    // 用"解析栈"判环的话，中途失败还得回卷，而回卷的 rethrow 会丢异常
+    // 类型（Zan 的 throw 按静态类型走：在 catch(Exception) 里再 throw，
+    // 具体类型就退化成基类了），所以这里宁可多走一遍图。
+    private static bool Reaches(string from, string target, int depth) {
+        if (depth > 64) { return true; }
+        FixtureDef def;
+        if (!Fixture.defs.TryGetValue(from, out def) || def == null) { return false; }
+        for (int i = 0; i < def.deps.Count; i = i + 1) {
+            string dep = def.deps[i];
+            if (dep == target) { return true; }
+            if (Fixture.Reaches(dep, target, depth + 1)) { return true; }
+        }
+        return false;
+    }
+
+    private static string TeardownOne(FixtureInstance inst, string err) {
+        if (inst.def.teardown == null) { return err; }
+        try {
+            inst.def.teardown(inst.value);
+        } catch (Exception e) {
+            if (err == "") {
+                err = "fixture teardown '" + inst.def.name + "': "
+                    + (e.Message == null ? "threw" : e.Message);
+            }
+        } catch {
+            if (err == "") { err = "fixture teardown '" + inst.def.name + "': threw"; }
+        }
+        return err;
+    }
+
+    private static FixtureDef Find(string name) {
+        FixtureDef def;
+        if (!Fixture.defs.TryGetValue(name, out def) || def == null) {
+            throw new FixtureException("fixture '" + name + "' 未注册");
+        }
+        return def;
+    }
+
+    private static FixtureInstance Require(string name) {
+        Fixture.Find(name);
+        if (!Fixture.live.ContainsKey(name)) {
+            Fixture.Create(name);
+        }
+        FixtureInstance inst = Fixture.live[name];
+        if (inst == null) {
+            throw new FixtureException("fixture '" + name + "' 创建失败");
+        }
+        return inst;
+    }
+}

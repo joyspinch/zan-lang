@@ -66,6 +66,30 @@ Without MCP the same index is a file: `knowledge/symbols.json` next to the SDK
   value-shaped targets, not null: check `!= ""`. （the parse
   ambiguity was fixed in zanc; the old advice to write `(x is T) ? a : b`
   is obsolete.)
+* **转型失败不抛异常，静默给目标类型的默认值**：`(string)某个非字符串对象`
+  得到 `""`，类转型失败同样静默。所以从 `object` 取值必须先 `is` 判类型，
+  别指望"转型失败"来暴露类型不对——它会把错误藏起来。（探针实测）
+* **泛型 `is T` 对字符串无效，具体类型的 `is string` 有效**：字符串装在
+  `object` 槽里没有分配点元数据，运行期类型名会报成 `object`；类类型不受
+  影响（`object o = new Box(); o is Box` 为真）。所以 `T Get<T>()` 里想用
+  `is T` 校验字符串会误判成"类型不符"——要判字符串就在注册时记类型标签
+  （`typeof(T).Name`），别指望运行期 `is`。
+* **`throw <表达式>` 按静态类型走**：`catch (Exception e) { throw e; }` 会把
+  具体异常类型退化成 `Exception`，外层的 `catch (MyEx)` 接不住（只接得住
+  `Exception`）。要保类型就 `catch (MyEx e) { throw e; }`，或者别在
+  `catch (Exception)` 里原样 rethrow——这条在"统一 catch 再抛"的包装层里
+  很容易踩，会让上层再也分不清异常种类。
+* **lambda 传给返回 `object` 的委托时，返回值必须显式是 `object`**：
+  `Factory f = () => { return "x"; };`（赋值给委托变量）能编过，但
+  `Take(() => { return "x"; })`（形参是返回 object 的委托）报
+  "no overload matches"——**传参位置**的 lambda 转换比赋值位置严格，写成
+  `return (object)"x";`。
+* **`object` 槽不装箱值类型**：`List<object>` 装不了 int。"任意值"容器
+  （参数化用例集合、异构结果表）只能收引用类型（string / 自定义类），
+  要装 int 就按类型分开收。
+* **委托不能装进 `object` 变量再比 null**：`object f = someDelegate;` 之后
+  `f == null` 会直接 access violation 崩掉。委托要留在类型化字段里
+  （`public delegate object Factory();` 这类具名委托类型可以直接用）。
 * Never list attribute names with `*/` inside a `/* ... */` comment —
   `data-on-*/data-if` closes the comment mid-sentence and the rest becomes
   code (209 cascading errors). Separate with `、` or spaces.

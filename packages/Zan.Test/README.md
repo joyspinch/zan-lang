@@ -11,6 +11,8 @@
 | `Assert` | 非中断断言：失败立刻打一行 `FAIL …` 并计数，用例体继续跑完 |
 | `Test` | 运行器：显式注册用例、setup/teardown、分组、skip、结果记账、汇总与退出码 |
 | `TestResult` | 单用例结果（名字/是否通过/原因/耗时微秒） |
+| `Fixture` | pytest 式 fixture：注册 / 依赖 / 作用域 / autouse / 拆毁 |
+| `TestCase` | 带标签的用例（参数化的通用形态）+ `ParamInt/ParamString/…` 委托 |
 
 ## 用法
 
@@ -53,6 +55,88 @@ skip slow-path: not implemented
 tests: 4 passed, 1 failed, 1 skipped
 ```
 
+## fixture 与参数化
+
+### fixture
+
+```zan
+using System;
+using System.Collections.Generic;
+using System.Test;
+
+class FakeDb {
+    public string name;
+    public FakeDb(string name) { this.name = name; }
+}
+
+class Tests {
+    static void Main() {
+        // 注册：类型化（推荐）。类型在注册时就钉死，取值时能校验。
+        Fixture.Register<FakeDb>("db", () => { return new FakeDb("main"); });
+        // 模块作用域：跨用例复用同一份，直到 Test.Reset()。
+        Fixture.RegisterModule<string>("conn", () => { return "conn-1"; });
+        // 依赖：db 先建 conn。
+        Fixture.Depends("db", "conn");
+        // 每个用例体之前自动建好。
+        Fixture.Autouse("conn");
+        // 拆毁回调：实例拆掉前调用。
+        Fixture.OnTeardown("db", (object v) => {
+            Console.WriteLine("close " + ((FakeDb)v).name);
+        });
+
+        Test.Run("uses-db", () => {
+            FakeDb db = Fixture.Get<FakeDb>("db");   // 第一次取即创建
+            Assert.Equal("main", db.name, "db name");
+            Assert.Equal("conn-1", Fixture.Get<string>("conn"), "conn");
+        });
+
+        Test.Finish();
+    }
+}
+```
+
+| API | 作用 |
+|---|---|
+| `Register<T>(name, factory)` | 注册（函数作用域）。`factory` 的返回类型就是 fixture 的类型 |
+| `RegisterUntyped(name, factory)` | 无类型注册：类型在首次创建时按值推断 |
+| `RegisterModule<T>(name, factory)` | 模块作用域：跨用例复用，`Test.Reset()` 时才拆 |
+| `RegisterModuleUntyped(name, factory)` | 模块作用域 + 无类型 |
+| `Depends(name, dep)` / `Depends(name, [deps])` | 显式声明依赖，框架按声明顺序递归创建 |
+| `Autouse(name)` | 标记为每个用例自动创建（依赖也随之解析） |
+| `OnTeardown(name, fn)` | 挂拆毁回调，参数是工厂产出的实例 |
+| `Get<T>(name)` / `GetRaw(name)` | 取值；未注册或类型不符抛 `FixtureException` |
+| `Exists(name)` / `Created()` / `Live()` / `CurrentTest()` | 观察注册表与当前用例 |
+| `Reset()` / `Clear()` | 拆掉模块作用域实例（定义保留）/ 连定义一起清空 |
+
+### 参数化
+
+```zan
+List<int> nums = new List<int>();
+nums.Add(1);
+nums.Add(2);
+Test.ParamInts("adds", nums, (int v) => {
+    Assert.True(v > 0, "positive");
+});
+// → 用例 id：adds[1]、adds[2]，各自独立记账
+
+Test.ParamIntPairs("sum", left, right, (int a, int b) => { /* … */ });
+// → 用例 id：sum[1,10]
+
+List<TestCase> cases = new List<TestCase>();
+cases.Add(new TestCase("first", () => { /* … */ }));
+Test.RunCases("scenarios", cases);
+// → 用例 id：scenarios[first]
+```
+
+| API | 作用 |
+|---|---|
+| `ParamInts(name, values, body)` | int 参数，id 形如 `name[1]` |
+| `ParamStrings(name, values, body)` | string 参数（空白与方括号在 id 里换成 `_`） |
+| `ParamDoubles(name, values, body)` | double 参数 |
+| `ParamBools(name, values, body)` | bool 参数 |
+| `ParamIntPairs(name, a, b, body)` | 两个 int 参数的笛卡尔积，id 形如 `name[1,10]` |
+| `RunCases(name, cases)` | 一组带标签的用例（多参数/异构走这条） |
+
 ## 语义契约
 
 - **断言不抛异常**。失败的断言打行并累加 `Assert.Failures()`；`Test.Run` 用
@@ -77,6 +161,17 @@ tests: 4 passed, 1 failed, 1 skipped
   **不能比较 `T`**，所以不提供 `Equal<T>`——这是语言事实，不是遗漏；
   `NotNull`/`Null` 收 `object`，而 Zan 的 `object` 不接受值类型装箱，值类型
   用对应的 `Equal` 重载。
+- **fixture 的值必须是引用类型**。Zan 的 `object` 不装箱值类型，`int` /
+  `bool` 这类值类型装不进 fixture，也放不进 `List<object>`——参数化因此按
+  类型特化（`ParamInt` / `ParamString` / …），而不是一个泛型的 `Param<T>`。
+- **fixture 的类型在注册时就定下**。`Register<T>` 的类型参数既约束工厂的
+  返回类型，也决定 `Get<T>` 怎么校验：类型对不上抛 `FixtureException`，
+  不返回默认值。原因是 Zan 的**转型失败不抛异常**——`(string)某个非字符串`
+  静默得到 `""`，靠转型失败来发现类型不对会把错误藏起来。
+- **拆毁是逆序**（后建的先拆），函数作用域的 fixture 在用例结束时拆，
+  模块作用域的等 `Test.Reset()`；用例体抛异常也照拆。拆毁回调抛异常的
+  原因会报出来，但不覆盖用例体原本的失败原因——原失败优先。
+- **依赖成环会被挡住**（抛 `FixtureException`），不会栈溢出。
 
 ## 与仓库 `ctest` 的关系
 
@@ -98,3 +193,7 @@ tests: 4 passed, 1 failed, 1 skipped
   避免运行器持有共享状态影响被测代码的时序。
 - 不做 mock/替身：动态代理与 ARC 模型不匹配，替身请手写实现接口的假对象
   （见 `tests/conformance/cache_memory.zan` 里的 `FakeRemote`）。
+- fixture 不做 pytest 的"间接参数化"（`indirect=True`）与 fixture 工厂的
+  作用域覆盖：作用域只有函数级与模块级两种，依赖必须显式声明。
+- 参数化不提供 `ids=` 覆盖与多参数笛卡尔积以外的组合：多参数异构走
+  `RunCases`（自带 label）。

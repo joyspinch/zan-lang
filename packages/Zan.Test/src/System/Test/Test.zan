@@ -13,6 +13,8 @@ namespace System.Test;
 //   * 用例体抛异常（Exception 或字符串 throw）也算失败，消息进结果。
 //   * setup/teardown 包住用例体；teardown 一定会跑，且不覆盖用例体原本
 //     的失败原因。
+//   * fixture 的生命周期由运行器驱动：BeginTest（建 autouse）→ 用例体
+//     → EndTest（拆本轮建的函数作用域 fixture，逆序）。
 //   * 输出只有三类行，方便 grep 与金样比对：
 //       ok <name>              （verbose 模式）
 //       FAIL <name>: <原因>    （异常/teardown 失败；断言失败行由 Assert 打）
@@ -32,7 +34,8 @@ public class Test {
     public static TestBody teardown;
     public static List<TestResult> results = new List<TestResult>();
 
-    // 清空全部状态（同一进程里多轮跑用）。
+    // 清空全部状态（同一进程里多轮跑用）。模块作用域的 fixture 也在这一轮
+    // 收尾——拆掉实例，但定义留着（下一轮会重新建）。
     public static void Reset() {
         Test.total = 0;
         Test.passed = 0;
@@ -42,6 +45,7 @@ public class Test {
         Test.setup = null;
         Test.teardown = null;
         Test.results.Clear();
+        Fixture.Reset();
         Assert.Reset();
     }
 
@@ -60,12 +64,18 @@ public class Test {
 
     // 跑一个用例。断言失败在 Assert 里已经打过行，这里只处理异常与结果记账。
     public static void Run(string name, TestBody body) {
-        string full = Test.FullName(name);
+        Test.RunCase(Test.FullName(name), body);
+    }
+
+    // 跑一个用例（名字已经是全名，参数化用例走这里）。
+    private static void RunCase(string full, TestBody body) {
         Test.total = Test.total + 1;
         long t0 = Stopwatch.GetMicroseconds();
         int before = Assert.Failures();
         string err = "";
         try {
+            // autouse fixture 先建；建砸了也算这个用例的失败。
+            Fixture.BeginTest(full);
             if (Test.setup != null) { Test.setup(); }
             body();
         } catch (Exception e) {
@@ -82,6 +92,10 @@ public class Test {
                 if (err == "") { err = "teardown threw"; }
             }
         }
+        // 函数作用域的 fixture 一定会拆（用例体抛异常也拆），拆砸了不覆盖
+        // 用例体原本的失败原因。
+        string ferr = Fixture.EndTest();
+        if (err == "") { err = ferr; }
         long dt = Stopwatch.GetMicroseconds() - t0;
         bool ok = err == "" && Assert.Failures() == before;
         TestResult r = new TestResult(full, ok, err, dt);
@@ -97,6 +111,85 @@ public class Test {
         }
         Test.failed = Test.failed + 1;
         if (err != "") { Console.WriteLine("FAIL " + full + ": " + err); }
+    }
+
+    // ---- 参数化 ----
+    //
+    // 每个参数组合都是**独立的用例**：独立记账（总数按组合数涨）、独立
+    // fixture 生命周期（每个组合都重建 autouse）。测试 id 形如
+    // <name>[<值>]，跟 pytest 的 test_foo[1] 一个路子。
+
+    // 一组带标签的用例：id 形如 <name>[<label>]。
+    public static void RunCases(string name, List<TestCase> cases) {
+        string full = Test.FullName(name);
+        foreach (TestCase c in cases) {
+            Test.RunCase(full + "[" + Test.SafeLabel(c.label) + "]", c.body);
+        }
+    }
+
+    // int 参数：id 形如 <name>[1]。
+    public static void ParamInts(string name, List<int> values, ParamInt body) {
+        string full = Test.FullName(name);
+        foreach (int v in values) {
+            int cur = v;
+            Test.RunCase(full + "[" + Convert.ToString(cur) + "]", () => { body(cur); });
+        }
+    }
+
+    // string 参数：id 形如 <name>[文本]。
+    public static void ParamStrings(string name, List<string> values, ParamString body) {
+        string full = Test.FullName(name);
+        foreach (string v in values) {
+            string cur = v;
+            Test.RunCase(full + "[" + Test.SafeLabel(cur) + "]", () => { body(cur); });
+        }
+    }
+
+    // double 参数：id 形如 <name>[1.5]。
+    public static void ParamDoubles(string name, List<double> values, ParamDouble body) {
+        string full = Test.FullName(name);
+        foreach (double v in values) {
+            double cur = v;
+            Test.RunCase(full + "[" + Convert.ToString(cur) + "]", () => { body(cur); });
+        }
+    }
+
+    // bool 参数：id 形如 <name>[true]。
+    public static void ParamBools(string name, List<bool> values, ParamBool body) {
+        string full = Test.FullName(name);
+        foreach (bool v in values) {
+            bool cur = v;
+            Test.RunCase(full + "[" + Convert.ToString(cur) + "]", () => { body(cur); });
+        }
+    }
+
+    // 两个 int 参数的笛卡尔积：id 形如 <name>[1,2]。
+    public static void ParamIntPairs(string name, List<int> first, List<int> second,
+        ParamIntPair body) {
+        string full = Test.FullName(name);
+        foreach (int a in first) {
+            foreach (int b in second) {
+                int x = a;
+                int y = b;
+                Test.RunCase(full + "[" + Convert.ToString(x) + "," + Convert.ToString(y) + "]",
+                    () => { body(x, y); });
+            }
+        }
+    }
+
+    // 标签净化：方括号、逗号、空白换成下划线，保证 id 形如 name[label]
+    // 还能被切开看。
+    private static string SafeLabel(string label) {
+        if (label == null) { return ""; }
+        string s = label;
+        s = s.Replace("[", "_");
+        s = s.Replace("]", "_");
+        s = s.Replace(",", "_");
+        s = s.Replace(" ", "_");
+        s = s.Replace("\n", "_");
+        s = s.Replace("\r", "_");
+        s = s.Replace("\t", "_");
+        return s;
     }
 
     // 打印汇总行，返回失败数（0 = 全绿）。
