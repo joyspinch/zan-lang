@@ -4936,6 +4936,21 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
     -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
   set_tests_properties(conformance_gui_scene_designer_color PROPERTIES TIMEOUT 120)
 
+  # 设计器宿主模式的窄区回归：宿主（IDE）把组件面板与属性面板挂进自己
+  # 的 dock，设计器本体两栏宽度都归零；编辑区窄到放不下最小画布时，
+  # 三栏按比例压缩那句 `side * palW / sum` 的分母是 0 —— 除零。运行期
+  # 守卫只写 stderr、程序照样退出 0，所以这个用例走独立门禁脚本，把
+  # stderr 合进输出一并判。
+  add_test(NAME conformance_gui_designer_narrow_host
+    COMMAND ${CMAKE_COMMAND}
+      -DZANC=$<TARGET_FILE:zanc>
+      -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/designer_narrow_host_test.zan
+      "-DZANC_ARGS=--auto-stdlib${_gui_driver_tail}"
+      -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_designer_narrow_host.out
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_designer_narrow_host${_exe_ext}
+    -P ${CMAKE_SOURCE_DIR}/tests/run_gui_no_runtime_error.cmake)
+  set_tests_properties(conformance_gui_designer_narrow_host PROPERTIES TIMEOUT 120)
+
 
   # SelectBox 级联增强：父子指针链（单选路径/重开自动展开/联动关闭
   # 选分支）、多选勾选模型（联动带动、祖链回推、半勾）、勾选策略
