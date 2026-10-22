@@ -9661,6 +9661,20 @@ static LLVMValueRef emit_expr_conditional(zan_irgen_t *g, zan_ast_node_t *expr,
         LLVMValueRef else_val = emit_expr(g, expr->conditional.else_expr, locals);
         LLVMBasicBlockRef else_end = LLVMGetInsertBlock(g->builder);
 
+        /* A482：两臂都是 void 调用（语句位三元 `flag ? A() : B();`，最常见
+         * 的三元写法之一）时不建 phi——phi void 是非法 IR（宿主与自举同病，
+         * "Instruction has a name, but provides a void value!"），直接分支
+         * 汇合返回哑值。 */
+        if (LLVMGetTypeKind(LLVMTypeOf(then_val)) == LLVMVoidTypeKind &&
+            LLVMGetTypeKind(LLVMTypeOf(else_val)) == LLVMVoidTypeKind) {
+            LLVMPositionBuilderAtEnd(g->builder, then_end);
+            LLVMBuildBr(g->builder, merge_bb);
+            LLVMPositionBuilderAtEnd(g->builder, else_end);
+            LLVMBuildBr(g->builder, merge_bb);
+            LLVMPositionBuilderAtEnd(g->builder, merge_bb);
+            return LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 0, 0);
+        }
+
         /* 分支字面量位宽对齐转换 */
         LLVMTypeRef tty = LLVMTypeOf(then_val);
         LLVMTypeRef ety = LLVMTypeOf(else_val);

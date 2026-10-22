@@ -917,6 +917,14 @@
 - 影响：编不出「语句开头的三元且两臂是 void 调用」的程序——而这正是最
   常见的一种三元写法（`ok ? Log() : Log2();`）。
 - 方向：两后端在两臂类型是 void 时**不建 phi**（直接按分支走），同一提交改。
+- **宿主半边已修（2026-10-23，goal round 2）**：`emit_expr_conditional` 在
+  两臂值都是 LLVM void 时不建 phi（直接分支汇合返哑值 i32 0）。
+  `flag ? A() : B();` 实测 A/done 正常；回归赋值臂（2）、值三元
+  （20/2.5/y/pos）全绿。探针
+  `_scratch/csaudit/operators/v_void_ternary.zan`、`v_tern_reg.zan`。
+- **自举半边待办**：`src/selfhost/irgen_expr.zan` 同类分支（该文件另一
+  会话在途，解禁后同修并把 `nullable_user_type.zan`（void 臂）加进
+  `tests/selfhost/diff_cases.txt` 跑差分门）。
 - 验证：把 `tests/conformance/nullable_user_type.zan`（void 臂）加进
   `tests/selfhost/diff_cases.txt`，差分门跑它应 PASS。
 - 关联：A481（自举侧同一条战线的前瞻洞）、A469 / A479（宿主侧解析）。
