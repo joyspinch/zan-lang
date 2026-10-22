@@ -2918,6 +2918,7 @@ partial class Irgen {
         // C host switches a null base to a scratch page and keeps running)
         H("@.zeropage = private unnamed_addr constant [16 x i8] zeroinitializer");
         EmitArcRuntime();
+        EmitWeakRuntime();
         EmitListRuntime();
         EmitSbRuntime();
         EmitStrRuntime();
@@ -3489,8 +3490,21 @@ partial class Irgen {
         H("  %c = load i64, i64* %rc");
         H("  %nc = sub i64 %c, 1");
         H("  store i64 %nc, i64* %rc");
-        H("  %dead = icmp sle i64 %nc, 0");
-        H("  br i1 %dead, label %dofree, label %done");
+        // The count that was there BEFORE the release decides what happens.
+        // 1 -> the last strong reference: the weak slots pointing at the
+        // object are cleared first, then the object dies.  0 or less -> an
+        // over-release: the count only goes down, the object is NOT freed a
+        // second time (the C host answers the same way -- the file
+        // src/compiler/irgen_arc.c, build_class_release_body).
+        H("  %over = icmp sle i64 %c, 0");
+        H("  br i1 %over, label %overblk, label %lastchk");
+        H("lastchk:");
+        H("  %last = icmp eq i64 %c, 1");
+        H("  br i1 %last, label %lastblk, label %done");
+        H("lastblk:");
+        H("  %pv = ptrtoint i8* %p to i64");
+        H("  %ok = call i1 @zan_rt_weak_destroy_begin(i64 %pv)");
+        H("  br i1 %ok, label %dofree, label %done");
         H("dofree:");
         H("  %ds0 = getelementptr i8, i8* %p, i64 -8");
         H("  %ds = bitcast i8* %ds0 to i8**");
@@ -3505,6 +3519,11 @@ partial class Irgen {
         // the block starts 24 bytes before the object pointer
         H("  %base = getelementptr i8, i8* %p, i64 -24");
         H("  call void @free(i8* %base)");
+        H("  br label %done");
+        H("overblk:");
+        H("  %c2 = load i64, i64* %rc");
+        H("  %nc2 = sub i64 %c2, 1");
+        H("  store i64 %nc2, i64* %rc");
         H("  br label %done");
         H("done:");
         H("  ret void");
@@ -3719,7 +3738,21 @@ partial class Irgen {
         string savedScope = typeScopeCls;
         typeScopeCls = cls.sval;
         while (i < names.Count) {
-            if (ArcManaged(types[i]) && !WeakTy(types[i])) {
+            if (WeakTy(types[i])) {
+                // a weak field leaves the registry when its holder dies: the
+                // registry must not keep a pointer into freed memory, and the
+                // slot itself is cleared
+                string lt = MapType(types[i]);
+                if (lt == "i64" || lt.EndsWith("*")) {
+                    int idx = fb + i;
+                    string fp = "%f" + seq;
+                    string ws = "%w" + seq;
+                    H("  " + fp + " = getelementptr %" + cn + ", %" + cn + "* %o, i32 0, i32 " + idx);
+                    H("  " + ws + " = bitcast %" + cn + "* " + fp + " to i64*");
+                    EmitWeakClear(ws);
+                    seq = seq + 1;
+                }
+            } else if (ArcManaged(types[i])) {
                 int idx = fb + i;
                 string lt = MapType(types[i]);
                 string fp = "%f" + seq;

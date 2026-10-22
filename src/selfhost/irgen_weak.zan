@@ -1,0 +1,193 @@
+using System;
+using System.Collections.Generic;
+namespace Zan;
+
+// Irgen part: the weak-reference runtime.
+//
+// A weak field holds a pointer it does NOT own: the target may die while the
+// holder lives.  The C host keeps a registry of the weak slots (the file
+// src/compiler/irgen_weak.c): a weak store registers the slot, and when the
+// target dies the registry clears every slot that points at it -- the holder
+// then reads null instead of a dangling pointer.
+//
+// The self-host emits the same registry.  Two shapes of slot exist:
+//   - a concrete class field: a pointer cell, bitcast to i64*
+//   - an erased generic field (`weak T _target`): already an i64 cell
+// so the registry works on i64 slots and one API covers both.
+//
+// The registry is a singly linked list of nodes { next, target, slot } under a
+// spin lock.  The host uses 8192 hash buckets; the list is the same registry
+// with a different shape -- the observable behaviour (a weak slot reads null
+// once the target is gone) is identical.
+//
+// Ownership: the self-host's convention is that the PRODUCER of a value does
+// not own it and the CONSUMER retains what it stores (a local, a field, a
+// container element).  A weak read therefore loads the slot WITHOUT
+// retaining: the value it hands out is borrowed, exactly like the C host's
+// weak field, and the consumer's own retain keeps the target alive.
+partial class Irgen {
+    // The weak runtime.  Emitted once per module.
+    void EmitWeakRuntime() {
+        H("%zan.weak.node = type { i8*, i64, i64* }");
+        H("@zan_weak_head = internal global i8* null");
+        H("@zan_weak_lock = internal global i32 0");
+        H("@zan_weak_count = internal global i64 0");
+        // ---- the spin lock ----
+        H("define void @zan_weak_acquire() {");
+        H("entry:");
+        H("  br label %try");
+        H("try:");
+        H("  %old = atomicrmw xchg i32* @zan_weak_lock, i32 1 seq_cst");
+        H("  %held = icmp ne i32 %old, 0");
+        H("  br i1 %held, label %spin, label %got");
+        H("spin:");
+        H("  br label %try");
+        H("got:");
+        H("  ret void");
+        H("}");
+        H("define void @zan_weak_release() {");
+        H("  %old = atomicrmw xchg i32* @zan_weak_lock, i32 0 seq_cst");
+        H("  ret void");
+        H("}");
+        // ---- weak_store(slot, val) ----
+        // The slot leaves the old registration (a slot holds one target at a
+        // time), then takes the new one.
+        H("define void @zan_rt_weak_store(i64* %slot, i64 %val) {");
+        H("entry:");
+        H("  call void @zan_weak_acquire()");
+        H("  %headp = bitcast i8** @zan_weak_head to i8**");
+        H("  %prevp = alloca i8**");
+        H("  %currp = alloca i8**");
+        H("  store i8** %headp, i8** %prevp");
+        H("  %head = load i8*, i8** @zan_weak_head");
+        H("  store i8* %head, i8** %currp");
+        H("  br label %loop");
+        H("loop:");
+        H("  %c = load i8*, i8** %currp");
+        H("  %cnull = icmp eq i8* %c, null");
+        H("  br i1 %cnull, label %set, label %check");
+        H("check:");
+        H("  %nn = bitcast i8* %c to %zan.weak.node*");
+        H("  %sp = getelementptr %zan.weak.node, %zan.weak.node* %nn, i32 0, i32 2");
+        H("  %s = load i64*, i64** %sp");
+        H("  %same = icmp eq i64* %s, %slot");
+        H("  br i1 %same, label %drop, label %adv");
+        H("adv:");
+        H("  %nxp = getelementptr %zan.weak.node, %zan.weak.node* %nn, i32 0, i32 0");
+        H("  %nx = load i8*, i8** %nxp");
+        H("  store i8** %nxp, i8** %prevp");
+        H("  store i8* %nx, i8** %currp");
+        H("  br label %loop");
+        H("drop:");
+        H("  %nxp2 = getelementptr %zan.weak.node, %zan.weak.node* %nn, i32 0, i32 0");
+        H("  %nx2 = load i8*, i8** %nxp2");
+        H("  %pp2 = load i8**, i8** %prevp");
+        H("  store i8* %nx2, i8** %pp2");
+        H("  call void @free(i8* %c)");
+        H("  %cnt = atomicrmw sub i64* @zan_weak_count, i64 1 seq_cst");
+        H("  store i8* %nx2, i8** %currp");
+        H("  br label %loop");
+        H("set:");
+        H("  store i64 %val, i64* %slot");
+        H("  %vnull = icmp eq i64 %val, 0");
+        H("  br i1 %vnull, label %done, label %add");
+        H("add:");
+        H("  %node = call i8* @malloc(i64 24)");
+        H("  %nn2 = bitcast i8* %node to %zan.weak.node*");
+        H("  %f0 = getelementptr %zan.weak.node, %zan.weak.node* %nn2, i32 0, i32 0");
+        H("  %f1 = getelementptr %zan.weak.node, %zan.weak.node* %nn2, i32 0, i32 1");
+        H("  %f2 = getelementptr %zan.weak.node, %zan.weak.node* %nn2, i32 0, i32 2");
+        H("  %h2 = load i8*, i8** @zan_weak_head");
+        H("  store i8* %h2, i8** %f0");
+        H("  store i64 %val, i64** %f1");
+        H("  store i64* %slot, i64** %f2");
+        H("  store i8* %node, i8** @zan_weak_head");
+        H("  %cnt2 = atomicrmw add i64* @zan_weak_count, i64 1 seq_cst");
+        H("  br label %done");
+        H("done:");
+        H("  call void @zan_weak_release()");
+        H("  ret void");
+        H("}");
+        // ---- nil_all_locked(target) ----
+        // Clear every slot that points at the target and drop those nodes.
+        // The caller holds the lock.
+        H("define void @zan_weak_nil_all_locked(i64 %target) {");
+        H("entry:");
+        H("  %headp = bitcast i8** @zan_weak_head to i8**");
+        H("  %prevp = alloca i8**");
+        H("  %currp = alloca i8**");
+        H("  store i8** %headp, i8** %prevp");
+        H("  %head = load i8*, i8** @zan_weak_head");
+        H("  store i8* %head, i8** %currp");
+        H("  br label %loop");
+        H("loop:");
+        H("  %c = load i8*, i8** %currp");
+        H("  %cnull = icmp eq i8* %c, null");
+        H("  br i1 %cnull, label %ret, label %check");
+        H("check:");
+        H("  %nn = bitcast i8* %c to %zan.weak.node*");
+        H("  %tp = getelementptr %zan.weak.node, %zan.weak.node* %nn, i32 0, i32 1");
+        H("  %t = load i64, i64** %tp");
+        H("  %same = icmp eq i64 %t, %target");
+        H("  br i1 %same, label %drop, label %adv");
+        H("adv:");
+        H("  %nxp = getelementptr %zan.weak.node, %zan.weak.node* %nn, i32 0, i32 0");
+        H("  %nx = load i8*, i8** %nxp");
+        H("  store i8** %nxp, i8** %prevp");
+        H("  store i8* %nx, i8** %currp");
+        H("  br label %loop");
+        H("drop:");
+        H("  %sp = getelementptr %zan.weak.node, %zan.weak.node* %nn, i32 0, i32 2");
+        H("  %s = load i64*, i64** %sp");
+        H("  store i64 0, i64* %s");
+        H("  %nxp2 = getelementptr %zan.weak.node, %zan.weak.node* %nn, i32 0, i32 0");
+        H("  %nx2 = load i8*, i8** %nxp2");
+        H("  %pp2 = load i8**, i8** %prevp");
+        H("  store i8* %nx2, i8** %pp2");
+        H("  call void @free(i8* %c)");
+        H("  %cnt = atomicrmw sub i64* @zan_weak_count, i64 1 seq_cst");
+        H("  store i8* %nx2, i8** %currp");
+        H("  br label %loop");
+        H("ret:");
+        H("  ret void");
+        H("}");
+        // ---- destroy_begin(target) ----
+        // The last strong reference is gone: clear the weak slots that point
+        // at the object and tell the caller whether the object may die.  The
+        // count is 0 when nobody registered a weak slot -- nothing to clear.
+        H("define i1 @zan_rt_weak_destroy_begin(i64 %target) {");
+        H("entry:");
+        H("  %cnt = load i64, i64* @zan_weak_count");
+        H("  %empty = icmp eq i64 %cnt, 0");
+        H("  br i1 %empty, label %yes, label %lock");
+        H("lock:");
+        H("  call void @zan_weak_acquire()");
+        H("  call void @zan_weak_nil_all_locked(i64 %target)");
+        H("  %obj = inttoptr i64 %target to i8*");
+        H("  %hdr = getelementptr i8, i8* %obj, i64 -16");
+        H("  %rcp = bitcast i8* %hdr to i64*");
+        H("  %rc = load i64, i64* %rcp");
+        H("  %ok = icmp eq i64 %rc, 0");
+        H("  call void @zan_weak_release()");
+        H("  ret i1 %ok");
+        H("yes:");
+        H("  ret i1 true");
+        H("}");
+    }
+
+    // Store `val` (a pointer as an integer) into the weak slot at `slotPtr`
+    // and register the slot.  The value is NOT owned: the slot never
+    // retains it.
+    void EmitWeakStore(string slotPtr, string valI64) {
+        L("  call void @zan_rt_weak_store(i64* " + slotPtr + ", i64 " + valI64 + ")");
+    }
+
+    // Drop the weak slot at `slotPtr` from the registry and clear it.
+    //
+    // The class destructor is emitted into the module HEAD buffer (the
+    // destructor definitions live there), so this line goes to the head as
+    // well -- a body line would land outside any function.
+    void EmitWeakClear(string slotPtr) {
+        H("  call void @zan_rt_weak_store(i64* " + slotPtr + ", i64 0)");
+    }
+}
