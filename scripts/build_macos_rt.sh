@@ -45,6 +45,15 @@ for pair in arm64:aarch64 x64:x86_64; do
     # so a cross-link needs this object unconditionally (see main.c).
     "$ZIG" cc -target "$arch-macos.11.0" -g0 -std=c11 -fPIC -I "$RT" -O2 \
         -c "$RT/rt_timer.c" -o "$out/zanrt_timer.o"
+    # 128-bit Decimal runtime: programs that reach System.Numerics (and so
+    # NativeMemory) reference __zan_decimal_*, and the cross link injects this
+    # object for them (main.c injects <toolchain>/macos/<arch>/zanrt_decimal.o).
+    # Without it a macOS cross build of a decimal-using program dies with
+    # "bundled macOS runtime objects not found" -- and the object is only
+    # needed when the program actually uses decimal, so a plain console
+    # program never notices it is missing.
+    "$ZIG" cc -target "$arch-macos.11.0" -g0 -std=c11 -fPIC -I "$RT" -O2 \
+        -c "$RT/rt_decimal.c" -o "$out/zanrt_decimal.o"
     # Hardware-accelerated crypto, shipped as an ARCHIVE member and not as a
     # bare object: a bare .o on the link line is loaded whole, so every
     # program carried the entire SHA/AES/SM3/SM4 block even when it used none
@@ -71,7 +80,7 @@ for pair in arm64:aarch64 x64:x86_64; do
         -DMINIZ_NO_TIME -DMINIZ_NO_ARCHIVE_WRITERS \
         -I "$ROOT/src/common" \
         -c "$RT/zan_inflate.c" -o "$out/zan_inflate.o"
-    echo "built toolchain/macos/$sub: zanrt_io.o zanrt_io_mt.o zanrt_sync.o zanrt_file.o zanrt_timer.o libzancrypto.a zanrt_gui.o zan_embed_api.o zan_inflate.o"
+    echo "built toolchain/macos/$sub: zanrt_io.o zanrt_io_mt.o zanrt_sync.o zanrt_file.o zanrt_timer.o zanrt_decimal.o libzancrypto.a zanrt_gui.o zan_embed_api.o zan_inflate.o"
 done
 
 mkdir -p "$ROOT/toolchain/ios/arm64"

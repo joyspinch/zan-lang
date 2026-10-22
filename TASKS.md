@@ -941,6 +941,11 @@
   ③ 剩下的**产物**要等一台有 NDK 的机器（或那个 CI job）跑一次。
 - 未验证：`build_android_rt.sh` 在写它的机器上没有 NDK，**没实跑过**（脚本每
   步都有存在性检查，缺文件会点名而不是静默跳过）。
+- 另一处同源的缺口（2026-10-22 查 macOS 时顺带发现）：**android-x64 的
+  `zanrt_decimal.o` 根本不存在**，而 android-arm64 有 ⇒ android-x64 交叉编译
+  一个用到 decimal 的程序会死在 "no bundled runtime objects for this target"。
+  同一个 NDK 重建会补上（`build_android_rt.sh` 已产出它，CI 提交清单用的是
+  `zanrt_*.o` 通配，覆盖得到）。
 - 关联：A501（A501 扫描发现的第一个"对象比源码旧"的实例）、A493、A504。
 
 ### [~] A503 OHOS 的 GUI 交叉链接缺 EGL/GLES——静态 exe 形态装不下预编译驱动的 GL 依赖
@@ -1004,11 +1009,36 @@
   linux×3 + macos×2 + win×2 有）。ohos 已接上（zig 路径，`ohos-objects`
   job）；android 已在 `android-objects` job 里接上（NDK 路径）；wasm32 与 ios
   还没（wasm32 的配方是 .cmd、GUI 那一支还依赖外部 freetype checkout）。
-- 补法（2026-10-22 落地）：三份清单补齐 + 触发路径补齐（20 条）+ 新增
+- 补法（2026-10-22 落地）：三份清单补齐 + 触发路径补齐（21 条）+ 新增
   `ohos-objects` / `android-objects` 两个 job + `stale-check` 依赖 ohos job。
-- 留下的纪律（比清单本身更重要）：**"配方产出的东西"与"CI 提交的东西"是同一
+- **macOS 这条腿整个是死的**（2026-10-22 顺着查 macOS 的 decimal 查出来的）：
+  - `runtime-objects` job 的检查步骤 `python3 scripts/check_macos_rt.py` 从
+    **2026-09-20**（`e35521ad7` 让 `gui_compat_mac.c` 开始 import
+    `zan_gui_draw_text` / `zan_gui_draw_polyline` / `zan_gui_font_height`，
+    而检查器只认 libSystem.tbd 与同目录对象）起就是红的 ⇒ **job 在提交步骤
+    之前就中止** ⇒ 一个月里没有任何 macOS 对象被 CI 刷新过。检查步骤红了
+    就等于腿没了：检查在提交前面，红了根本到不了提交。
+  - macOS 的 decimal 对象**四处皆无**（配方 / CI 清单 / ARTIFACTS 表 / 跟踪
+    的文件）：`main.c` 的 macOS 分支会给用 decimal 的程序注入
+    `toolchain/macos/<arch>/zanrt_decimal.o`，而新克隆的仓库里没有这个文件
+    ⇒ **macOS 交叉编译一个用到 decimal 的程序必然失败**（报
+    "bundled macOS runtime objects not found"，与"目录不存在"一样的措辞，
+    容易误判成环境问题）。普通 console 程序不用 decimal，所以这条红灯平时
+    看不见。
+  - 补法（2026-10-22 落地）：配方（`build_macos_rt.sh` + `build_cross_rt.cmd`
+    的 macos 块）加 decimal 编译；ARTIFACTS 表加两条；两个对象用 zig 重出
+    并**跟踪进仓库**；检查器改成**从驱动 dylib 里读导出符号**当白名单
+    （`packages/Zan.Gui/.../macos-<arch>/libzan_gui.dylib`，写死清单会让
+    驱动一加新入口就又变红——这正是它当初变红的原因）；触发路径补
+    `scripts/check_macos_rt.py`（检查器自己也要被 CI 验）。
+- 留下的纪律（比清单本身更重要）：
+  ① **"配方产出的东西"与"CI 提交的东西"是同一
   个集合**。加一条配方产物时，提交清单与过时检查的 ARTIFACTS 表要同步加，
   否则它会静默停在旧代，而且**构建是绿的**。
+  ② **CI 腿的每一步都要单独验**：检查步骤红了会吃掉后面的提交步骤，整条腿
+  静默停摆——而"腿停了"和"配方没产出"在仓库里长得一模一样（对象停在旧代）。
+  ③ **白名单要从产物里读，不要写死**：允许集写成代码里的常量，就会在产物
+  变化时过期。
 - 关联：A502（android 的具体症状）、A503（ohos 的具体症状）、A493（归档拆分
   后 win 变胖的根因）、A501。
 

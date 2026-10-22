@@ -8,6 +8,16 @@ arch directory, otherwise `zanc --target macos-*` fails at link time on the
 user's machine. `zan_co_ready` is provided by the compiled program itself and
 is the only expected exception.
 
+A GUI program's compat object also imports `zan_gui_*` entry points; those come
+from the platform's GUI driver dylib (packages/Zan.Gui/.../libzan_gui.dylib),
+which the cross link adds to the link line. They are therefore provided by the
+driver, not by libSystem -- they are read out of the driver dylib instead of
+being hard-coded, so a driver that grows a new entry point does not turn this
+check red (that is how the macOS leg of the toolchain workflow died on
+2026-09-20: the checker did not know about the driver, the check step failed,
+and the job never reached its commit step -- so no macOS object was refreshed
+for a month).
+
     python3 scripts/check_macos_rt.py
 """
 import os
@@ -43,6 +53,22 @@ def symbols(path):
     return undef, defined
 
 
+def driver_symbols(root, sub):
+    """Symbols the platform's GUI driver dylib exports.
+
+    The driver is linked next to a macOS GUI program, so its entry points are
+    resolved at link time; the compat object is allowed to import them.
+    """
+    path = os.path.join(root, "packages", "Zan.Gui", "src", "Gui", "drivers",
+                        "macos-" + sub, "libzan_gui.dylib")
+    if not os.path.exists(path):
+        return set()
+    try:
+        return symbols(path)[1]
+    except SystemExit:
+        return set()
+
+
 def main():
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     mac = os.path.join(root, "toolchain", "macos")
@@ -57,10 +83,11 @@ def main():
         bundled = set()
         for name in objects:
             bundled |= symbols(os.path.join(mac, sub, name))[1]
+        provided = bundled | PROVIDED_BY_PROGRAM | driver_symbols(root, sub)
         for name in objects:
             path = os.path.join(mac, sub, name)
             missing = sorted(
-                symbols(path)[0] - exported - bundled - PROVIDED_BY_PROGRAM)
+                symbols(path)[0] - exported - provided)
             print(f"{sub}/{name}: {'ok' if not missing else 'MISSING ' + ', '.join(missing)}")
             bad += len(missing)
     return 1 if bad else 0

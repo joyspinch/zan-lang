@@ -58,6 +58,9 @@ for %%P in (arm64:aarch64 x64:x86_64) do (
     "%ZIG%" cc -target %%B-macos.11.0 -g0 -std=c11 -fPIC -I %RT% -O2 -c %RT%\rt_sync.c  -o toolchain\macos\%%A\zanrt_sync.o  || exit /b 1
     "%ZIG%" cc -target %%B-macos.11.0 -g0 -std=c11 -fPIC -I %RT% -O2 -c %RT%\rt_file.c  -o toolchain\macos\%%A\zanrt_file.o  || exit /b 1
     "%ZIG%" cc -target %%B-macos.11.0 -g0 -std=c11 -fPIC -I %RT% -O2 -c %RT%\rt_timer.c -o toolchain\macos\%%A\zanrt_timer.o || exit /b 1
+    rem 128-bit Decimal runtime: programs that reach System.Numerics reference
+    rem __zan_decimal_*, and the cross link injects this object for them.
+    "%ZIG%" cc -target %%B-macos.11.0 -g0 -std=c11 -fPIC -I %RT% -O2 -c %RT%\rt_decimal.c -o toolchain\macos\%%A\zanrt_decimal.o || exit /b 1
     rem Crypto as an archive member -- see the linux block above for why.
     "%ZIG%" cc -target %%B-macos.11.0 -g0 -std=c11 -fPIC -I %RT% -O2 -c %RT%\rt_hw_accel.c -o toolchain\macos\%%A\zan_crypto.o || exit /b 1
     if exist toolchain\macos\%%A\libzancrypto.a del /q toolchain\macos\%%A\libzancrypto.a

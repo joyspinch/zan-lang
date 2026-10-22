@@ -139,6 +139,7 @@ ARTIFACTS = [
     ("toolchain/macos/arm64/zanrt_sync.o", RT_SYNC, "runtime"),
     ("toolchain/macos/arm64/zanrt_file.o", RT_FILE, "runtime"),
     ("toolchain/macos/arm64/zanrt_timer.o", RT_TIMER, "runtime"),
+    ("toolchain/macos/arm64/zanrt_decimal.o", RT_DECIMAL, "runtime"),
     ("toolchain/macos/arm64/libzancrypto.a", RT_CRYPTO, "runtime"),
     ("toolchain/macos/arm64/zanrt_gui.o", RT_GUI_MAC, "runtime"),
     ("toolchain/macos/x64/zanrt_io.o", RT_IO, "runtime"),
@@ -146,6 +147,7 @@ ARTIFACTS = [
     ("toolchain/macos/x64/zanrt_sync.o", RT_SYNC, "runtime"),
     ("toolchain/macos/x64/zanrt_file.o", RT_FILE, "runtime"),
     ("toolchain/macos/x64/zanrt_timer.o", RT_TIMER, "runtime"),
+    ("toolchain/macos/x64/zanrt_decimal.o", RT_DECIMAL, "runtime"),
     ("toolchain/macos/x64/libzancrypto.a", RT_CRYPTO, "runtime"),
     ("toolchain/macos/x64/zanrt_gui.o", RT_GUI_MAC, "runtime"),
     ("toolchain/macos/arm64/zan_embed_api.o", EMBED, "runtime"),
@@ -684,6 +686,7 @@ def do_rebuild():
             subprocess.run([zig, "cc", "-target", f"{arch}-macos.11.0", "-g0", "-std=c11", "-fPIC", "-I", rt, "-O2", "-c", f"{rt}/rt_sync.c", "-o", f"{outdir}/zanrt_sync.o"], check=True)
             subprocess.run([zig, "cc", "-target", f"{arch}-macos.11.0", "-g0", "-std=c11", "-fPIC", "-I", rt, "-O2", "-c", f"{rt}/rt_file.c", "-o", f"{outdir}/zanrt_file.o"], check=True)
             subprocess.run([zig, "cc", "-target", f"{arch}-macos.11.0", "-g0", "-std=c11", "-fPIC", "-I", rt, "-O2", "-c", f"{rt}/rt_timer.c", "-o", f"{outdir}/zanrt_timer.o"], check=True)
+            subprocess.run([zig, "cc", "-target", f"{arch}-macos.11.0", "-g0", "-std=c11", "-fPIC", "-I", rt, "-O2", "-c", f"{rt}/rt_decimal.c", "-o", f"{outdir}/zanrt_decimal.o"], check=True)
             subprocess.run([zig, "cc", "-target", f"{arch}-macos.11.0", "-g0", "-std=c11", "-fPIC", "-I", rt, "-O2", "-c", f"{rt}/gui_compat_mac.c", "-o", f"{outdir}/zanrt_gui.o"], check=True)
             subprocess.run([zig, "cc", "-target", f"{arch}-macos.11.0", "-g0", "-std=c11", "-fPIC", "-I", rt, "-O2", "-c", f"{rt}/zan_embed_api.c", "-o", f"{outdir}/zan_embed_api.o"], check=True)
             subprocess.run([zig, "cc", "-target", f"{arch}-macos.11.0", "-g0", "-std=c11", "-fPIC", "-O2", "-DMINIZ_NO_ARCHIVE_APIS", "-DMINIZ_NO_ZIP_APIS", "-DMINIZ_NO_STDIO", "-DMINIZ_NO_TIME", "-DMINIZ_NO_ARCHIVE_WRITERS", "-I", "src/common", "-c", f"{rt}/zan_inflate.c", "-o", f"{outdir}/zan_inflate.o"], check=True)
