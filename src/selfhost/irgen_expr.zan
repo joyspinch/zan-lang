@@ -373,6 +373,119 @@ partial class Irgen {
         return 0;
     }
 
+    // The C host's operand width: an int VARIABLE (a local, a field, a cast
+    // result) keeps its storage width in the host, while an int LITERAL --
+    // and every constant expression the host folds -- is an i64. The
+    // operation takes the common width, so `a * 3` does not wrap at 32 bits
+    // while `a * b` does.
+    bool IsWidthedInt(Node en, ExprVal v) {
+        if (v == null || v.ty == null) { return false; }
+        if (v.ty.ival != 0) { return false; }
+        if (HostIntWidth(v.ty) == 0) { return false; }
+        if (en == null) { return false; }
+        if (en.kind == AK.IntLit()) { return false; }
+        if (IsConstInt(en)) { return false; }
+        return true;
+    }
+
+    // The storage width of an integer type in the C host (the host keeps the
+    // narrow types narrow -- there is no integer promotion).
+    int HostIntWidth(Node t) {
+        if (t == null) { return 0; }
+        string n = t.sval;
+        if (n == "byte" || n == "sbyte") { return 8; }
+        if (n == "short" || n == "ushort") { return 16; }
+        if (n == "int" || n == "uint") { return 32; }
+        if (n == "long" || n == "ulong" || n == "nint" || n == "char") { return 64; }
+        return 0;
+    }
+
+    // The width of the arithmetic operation: the wider of the two storage
+    // widths, or 64 when a literal or a folded constant takes part (those are
+    // i64 in the host, so the whole operation widens).
+    int ArithWidth(Node an, ExprVal av, Node bn, ExprVal bv) {
+        if (!IsWidthedInt(an, av) || !IsWidthedInt(bn, bv)) { return 64; }
+        int wa = HostIntWidth(av.ty);
+        int wb = HostIntWidth(bv.ty);
+        if (wa == 0 || wb == 0) { return 64; }
+        if (wa > wb) { return wa; }
+        return wb;
+    }
+
+    // The signedness of the operation's result: the wider operand decides,
+    // and an unsigned one wins a tie (the host's common type).
+    bool ArithUnsigned(Node an, ExprVal av, Node bn, ExprVal bv) {
+        int wa = HostIntWidth(av == null ? null : av.ty);
+        int wb = HostIntWidth(bv == null ? null : bv.ty);
+        bool ua = IntUnsigned(av == null ? null : av.ty);
+        bool ub = IntUnsigned(bv == null ? null : bv.ty);
+        if (wa > wb) { return ua; }
+        if (wb > wa) { return ub; }
+        return ua || ub;
+    }
+
+    // Bring an arithmetic result back into the operation's width: the host
+    // computes the narrow types in their own width, so the result wraps
+    // there (an int add wraps at 32 bits).
+    string WrapArith(string v, int w, bool uns) {
+        if (w <= 0 || w >= 64) { return v; }
+        if (uns) {
+            string m = "" + ((1L << w) - 1);
+            string t = NT();
+            L("  " + t + " = and i64 " + v + ", " + m);
+            return t;
+        }
+        string s1 = NT();
+        L("  " + s1 + " = shl i64 " + v + ", " + (64 - w));
+        string s2 = NT();
+        L("  " + s2 + " = ashr i64 " + s1 + ", " + (64 - w));
+        return s2;
+    }
+
+    // The C host's integer division guard (src/compiler/irgen_expr.c): a zero
+    // divisor and the MIN / -1 combination both divide by 1 instead of
+    // trapping, and the zero divisor is reported through the runtime guard
+    // (zan_rt_guard_fail3) before the program continues.
+    string GuardDivisor(ExprVal a, ExprVal b, int op, Node e, int width, bool uns) {
+        string isz = NT();
+        L("  " + isz + " = icmp eq i64 " + b.op + ", 0");
+        // the report: the host prints "file:line:col: runtime error: division
+        // by zero" and keeps going
+        int lbad = NL(); int lcont = NL();
+        L("  br i1 " + isz + ", label %L" + lbad + ", label %L" + lcont);
+        Label(lbad);
+        string msg = "division by zero";
+        if (op == TK.Percent()) { msg = "division by zero (modulo)"; }
+        ExprVal fs = GenStr(diags.FileOfLine(e.line));
+        ExprVal ms = GenStr(msg);
+        if (!ExternSeen("zan_rt_guard_fail3")) {
+            externDecls.Add("zan_rt_guard_fail3");
+            H("declare void @zan_rt_guard_fail3(i8*, i32, i32, i8*)");
+        }
+        L("  call void @zan_rt_guard_fail3(i8* " + fs.op + ", i32 "
+            + diags.LineInFile(e.line) + ", i32 " + e.col + ", i8* " + ms.op + ")");
+        L("  br label %L" + lcont);
+        Label(lcont);
+        string unsf = isz;
+        if (!uns && width > 0) {
+            string minv = "";
+            if (width >= 64) { minv = "-9223372036854775808"; }
+            else { minv = "" + (0 - (1L << (width - 1))); }
+            string ismin = NT();
+            L("  " + ismin + " = icmp eq i64 " + a.op + ", " + minv);
+            string ism1 = NT();
+            L("  " + ism1 + " = icmp eq i64 " + b.op + ", -1");
+            string ovf = NT();
+            L("  " + ovf + " = and i1 " + ismin + ", " + ism1);
+            string u2 = NT();
+            L("  " + u2 + " = or i1 " + isz + ", " + ovf);
+            unsf = u2;
+        }
+        string d = NT();
+        L("  " + d + " = select i1 " + unsf + ", i64 1, i64 " + b.op);
+        return d;
+    }
+
     ExprVal GenBinary(Node e) {
         int op = e.op;
         // constant folding: collapse pure integer-constant subtrees to a literal
@@ -502,6 +615,10 @@ partial class Irgen {
             }
             string t = NT();
             L("  " + t + " = add i64 " + a.op + ", " + b.op);
+            // the host adds in the operands' width: two int values add in
+            // 32 bits and wrap there
+            int aw = ArithWidth(e.a, a, e.b, b);
+            if (aw < 64) { t = WrapArith(t, aw, ArithUnsigned(e.a, a, e.b, b)); }
             if (uns) { return new ExprVal(t, MkType("ulong")); }
             return new ExprVal(t, MkType("int"));
         }
@@ -594,7 +711,17 @@ partial class Irgen {
                 L("  " + m + " = and i64 " + bs + ", " + mbits);
                 bs = m;
             }
+            // the operation width: the host computes the narrow types in
+            // their own width, so the result wraps there
+            int aw = ArithWidth(e.a, a, e.b, b);
+            bool awu = ArithUnsigned(e.a, a, e.b, b);
+            if (op == TK.Slash() || op == TK.Percent()) {
+                // the C host's division guard: a zero divisor and the
+                // MIN / -1 combination divide by 1 instead of trapping
+                bs = GuardDivisor(a, b, op, e, aw, awu);
+            }
             L("  " + t + " = " + ar + " i64 " + a.op + ", " + bs);
+            if (aw < 64) { t = WrapArith(t, aw, awu); }
             if (uns) { return new ExprVal(t, MkType("ulong")); }
             return new ExprVal(t, MkType("int"));
         }
@@ -1559,12 +1686,17 @@ partial class Irgen {
             L("  " + m + " = and i64 " + rs + ", " + mbits);
             rs = m;
         }
+        if (e.op == TK.SlashEq() || e.op == TK.PercentEq()) {
+            // the C host's division guard, same as in the plain division
+            int dop = TK.Slash(); if (e.op == TK.PercentEq()) { dop = TK.Percent(); }
+            int dw = ArithWidth(e.a, cur, e.b, r);
+            rs = GuardDivisor(cur, r, dop, e, dw, ArithUnsigned(e.a, cur, e.b, r));
+        }
         L("  " + t + " = " + opn + " i64 " + cur.op + ", " + rs);
         ExprVal nv = new ExprVal(t, MkType("int"));
         StoreTo(e.a, nv);
         return nv;
     }
-
     void StoreTo(Node lhs, ExprVal v) {
         if (lhs.kind == AK.Ident()) {
             int li = LocalIdx(lhs.sval);
