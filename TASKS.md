@@ -6,10 +6,10 @@
 >
 > 平账纪律：闭账条目当批移出
 >
-> 2026-10-22 平账：移出 45 条已闭账条目（A390/A393/A394/A395/A396/A397/A399/
+> 2026-10-22 平账：移出 46 条已闭账条目（A390/A393/A394/A395/A396/A397/A399/
 > A400/A401/A402/A403/A404/A405/A406/A407/A413/A415/A416/A428/A431/A432/A437/
 > A441/A442/A445/A447/A448/A449/A463/A473/A474/A475/A476/A477/A478/A479/A480/
-> A481/A483/A484/A485/A488/A491/A492/A497）。编号不复用，结论与验证见 git 历史。
+> A481/A483/A484/A485/A488/A491/A492/A497/A500）。编号不复用，结论与验证见 git 历史。
 
 ## 未完成
 
@@ -876,33 +876,6 @@
   `MathNumBadType` 要同步把 `bool` 逐出白名单。
 - 关联：A445（自举侧的同款守卫已补齐）、A444（`object` 的同类白名单问题）。
 
-### [ ] A500 自举 checker 不给条件表达式定型——`int + (c ? "a" : "b")` 被误判成 `int`
-
-- 编号说明：登记时拟用 A499，与另一会话已提交的「crypto 归档成员」A499 撞号，
-  改为 A500（编号不复用）。
-- 现象（2026-10-22 随 A445 跑固定点门时浮出）：`selfhost_fixed_point` 门在
-  **gen1 → g2.ll** 这一步就断，自举编译器拒绝编译自举源码本身：
-  ```
-  src/selfhost/ngen_binding.zan:74:9: error: cannot convert 'int' to 'string'
-     in initializer: no implicit conversion
-     74 |         string key = off + (isSet ? "#s" : "#g");
-  ```
-- 根因：`src/selfhost/checker.zan` 的 `InferType` **没有 `AK.Conditional()` 分支**，
-  条件表达式的类型恒为 `null`。于是 `checker.zan:372` 的 `AK.Binary()` 分支里
-  `rt = InferType(e.b)` 拿到 `null`，`IsStr(lt) || IsStr(rt)` 落空 → 整式按
-  **左操作数**定型成 `int`，`string key = ...` 随即被可赋值性检查拒掉。
-  宿主（`src/compiler/checker.c:3343` `AST_CONDITIONAL` → `merge_conditional_types`）
-  正确合并两支的类型 → 宿主**接受**这段代码（实测 `off=7` → 输出 `7#s`）。
-- **与 A445 无关**：用 HEAD 版 `irgen_expr.zan` 重建的基线 gen1 报**同一个错**
-  （`_scratch/a445/fixedpoint/gen1_head.exe`），所以这条在 A445 之前就断着。
-- 影响：`selfhost_fixed_point` 门**整条不绿**（gen2 链接与 g2.ll==g3.ll 的
-  比较都跑不到）；自举源码里凡是「`int + (条件 ? 字符串 : 字符串)`」的写法
-  都会被自举编译器误拒。
-- 方向：在 `InferType` 里补 `AK.Conditional()` 分支——两支类型同名取该名；
-  一支为 null 取另一支；一支是数值另一支是数值按提升取宽的；其余取 null
-  （保持宽松）。修好之后固定点门恢复，A445 才能拿到"自举侧自举一致"的背书。
-- 关联：A445（本轮 A445 的验证被这条挡在固定点门外，差分门已过）。
-
 ### [~] A501 跨目标全量扫描：13 个目标的 console 与 GUI 交叉链接体检
 
 - 起因（2026-10-22）：被问"跨平台交叉编译现在都是全绿的吗"。此前只逐个目标试过
@@ -1070,3 +1043,33 @@
   显示出来并给一键重连）。
 - 坑出处：探针的等待时长必须按被测服务端的**实测**耗时定——本轮最初按 10 s
   等，真实冷启动 13 s，直接判成假失败。
+
+### [ ] A505 自举门的运行时对象集缺 `rt_hw_accel.c`——crypto 拆成独立 TU 后两条门链接红
+
+- 现象（2026-10-22 随 A500 复跑自举门浮出）：ctest 的 `selfhost_diff` 与
+  `selfhost_fixed_point` 两条门**在链接期**就红（`LNK2019`），门根本没跑到
+  比对阶段。宿主程序本身不受影响——只有这两条自举门。
+- 根因：`ce1041cf9` 把硬件加速 crypto 从 `rt_timer.c` 里拆成独立 TU
+  （`src/runtime/rt_hw_accel.c` + 归档 `libzancrypto.a`，`CMakeLists.txt:288-299`），
+  自举门的两套运行时对象集没跟着改：
+  - `CMakeLists.txt:3184` `_sh_rt_srcs`（固定点门）
+  - `CMakeLists.txt:3259` `_shd_rt_srcs`（差分门）
+  两处仍只有 `rt_file.c rt_io.c rt_sched.c rt_timer.c rt_decimal.c rt_sync.c
+  zan_embed_api.c`——既没有 `rt_hw_accel.c`，也没链 `libzancrypto.a`。
+  于是 `zan_hw_base64_encode/decode`（现在住在 `src/runtime/rt_hw_accel.c:3700`
+  与 `:3768`）在门的链接行上**根本不存在**。
+- 为什么门一定会引用它：自举编译器把 base64 降成对 `zan_hw_base64_encode` 的
+  extern 调用（`src/selfhost/irgen.zan:802-833`），而 stdlib 的
+  `System.Convert.ToBase64String` / `FromBase64String`（`stdlib/System/Convert.zan:19`）
+  走 `NativeMemory.Base64Encode` → 门链的编译器二进制里就有这个未定义符号。
+- 证据（2026-10-22 实测）：用 committed 的那套对象集链接固定点门的 g2.ll →
+  `LNK2019 无法解析的外部符号 zan_hw_base64_encode，函数 Convert_ToBase64String
+  中引用了该符号`（decode 同理）；对象集里补进一份用 clang 编的
+  `rt_hw_accel.obj` → 链接通过（exit 0），两条门随之跑绿。
+- 方向：把 `rt_hw_accel.c` 加进两处对象集——**必须用 `SELFHOST_CLANG` 编**
+  （与同一行里的其它对象一致；链 MSVC `ar` 产出的 `libzancrypto.a` 会撞 C
+  运行时），或者另建一个门专用归档（成员也得是 clang 编的）。
+- 关联：A499（crypto 归档成员的收口）、A500（本轮正是靠门才复验得动）。
+- 坑出处已记在 `.agents/skills/zan-compiler-internals/references/selfhost-closure.md`
+  §140「差分门的链接集必须覆盖自举 IR 引用的全部硬件助手」。
+
