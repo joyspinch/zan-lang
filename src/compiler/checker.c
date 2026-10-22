@@ -4361,17 +4361,58 @@ static int checker_builtin_member_state(zan_type_t *t, zan_istr_t name) {
     return zan_builtin_has_member(bt, name.str, (int)name.len) ? 1 : 0;
 }
 
+/* 类型里提到了类型形参（泛型模板里的 T）。 */
+static bool checker_type_mentions_type_param(zan_type_t *t, int depth) {
+    if (!t || depth > 8) return false;
+    if (t->kind == TYPE_TYPE_PARAM || t->kind == TYPE_ERROR) return true;
+    if (t->element_type &&
+        checker_type_mentions_type_param(t->element_type, depth + 1))
+        return true;
+    for (int i = 0; i < t->type_arg_count; i++)
+        if (checker_type_mentions_type_param(t->type_args[i], depth + 1))
+            return true;
+    return false;
+}
+
+/* 这个调用是不是要到运行期才落到真正的成员上。
+ *
+ * 开放泛型模板（类/结构体带类型形参）的方法体是"擦除模板"：真身由
+ * 泛型基类特化（zan_parser_specialize_generic_bases）在派生类里补出，
+ * 模板体本身只留一个运行期转发桩。ORM 的泛型基类就是这个形状：
+ *
+ *     public class BaseDao<T> {
+ *         IDbConnection db;
+ *         public List<T> All() { return this.db.Select<T>().ToList(); }
+ *     }
+ *
+ * `IDbConnection` 上并没有 Select —— 编译期 ORM 代码生成器（GenDb）
+ * 只改写类型实参是具体实体类的调用（db.Select<Blog>()），模板里的 T
+ * 不是具体实体，改写不了。irgen 对这种调用不报错：解析不到就发运行期
+ * 转发桩（见 irgen_call.c 的 call_receiver_is_open_generic）。checker
+ * 必须同口径，否则 BaseDao<T> / BaseRepository<T> 直接编不过。 */
+static bool checker_call_is_runtime_dispatched(zan_checker_t *c, zan_type_t *recv) {
+    if (c->current_type_sym && c->current_type_sym->decl &&
+        (c->current_type_sym->decl->kind == AST_CLASS_DECL ||
+         c->current_type_sym->decl->kind == AST_STRUCT_DECL) &&
+        c->current_type_sym->decl->type_decl.type_params.count > 0)
+        return true;
+    return checker_type_mentions_type_param(recv, 0);
+}
+
 /* 调用目标上有没有这个成员。
  *
  * 1 = 有；0 = 没有（可以报"没有这个方法"）；-1 = 判不了（保持原样，不报）。
  *
  * 口径必须和 irgen 一致：irgen 能发出去的调用，checker 不能判成不存在。
- * 所以扩展方法（接收者类型上查不到成员，但 recv.Foo() 合法）必须算进去。 */
+ * 所以扩展方法（接收者类型上查不到成员，但 recv.Foo() 合法）必须算进去；
+ * 运行期才落地的调用（开放泛型模板）同样判不了成员集，也得放行。 */
 static int checker_call_target_member_state(zan_checker_t *c, zan_type_t *t,
                                             zan_istr_t name) {
     if (!t || t == c->binder->type_error) return -1;
     if (!name.str || name.len == 0) return -1;
     if (zan_binder_has_extension_method(c->binder, t, name)) return 1;
+    /* 运行期才落地的调用：成员集编译期根本判不出来 —— 判不了就不报。 */
+    if (checker_call_is_runtime_dispatched(c, t)) return -1;
     switch (t->kind) {
     case TYPE_CLASS:
     case TYPE_STRUCT:

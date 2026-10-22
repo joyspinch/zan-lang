@@ -117,7 +117,17 @@ description: zanc 编译器内部（parser/checker/irgen/runtime/ABI）设计契
      必漏 → 判不了就不报；`object` / `decimal` / 类型参数 / 可空 / 枚举 / 数组 /
      无符号的内建泛型容器同样判不了。判不了一律放行到发码阶段，绝不猜。
      漏掉一条原生成员的后果不是"少报一个错"，而是**整个标准库编不过**——
-     原生成员表必须与发码侧的分派点逐条对齐。回归用例：
+     原生成员表必须与发码侧的分派点逐条对齐。
+     **开放泛型模板（类/结构体带类型形参）里的调用同样要放行**：模板体是"擦除
+     模板"，真身由泛型基类特化（`zan_parser_specialize_generic_bases`）在派生类
+     里补出，模板体只留一个运行期转发桩。ORM 泛型基类就是这个形状——
+     `class BaseDao<T> { IDbConnection db;
+     List<T> All() { return this.db.Select<T>().ToList(); } }`——`IDbConnection`
+     上并没有 `Select`（编译期 ORM 代码生成器只改写"类型实参是具体实体类"的调用，
+     模板里的 T 不是具体实体，改写不了），发码侧对这种调用是放行并发运行期桩的
+     （`irgen_call.c` 的 `call_receiver_is_open_generic`），checker 必须同口径，
+     否则 `BaseDao<T>` / `BaseRepository<T>` 整包编不过。
+     回归用例：
      `tests/diag/call_unknown_method.zan`（必须点名报出方法名）+
      `tests/diag/call_unknown_method_name.zan`（同名类型显示原始名）+
      `tests/conformance/native_member_call.zan`（原生成员必须能正常调用）。
