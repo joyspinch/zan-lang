@@ -185,7 +185,7 @@
     override-result；SPEC §5.2 已补声明（覆盖 try 返回值 + conformance 指针）。
   - ② switch 隐式贯穿：**保留 Go 语义 + SPEC §5.2 补声明**（非空 case 隐式
     break、空 case 标签显式贯穿；C# 直觉漏写 break 是"每个 case 独立"）。
-- 待办：自举半边（③的错误判定在 selfhost checker 对齐）。
+- 自举半边已补（2026-10-23，goal round 2）：selfhost checker.zan 的 IfStmt/WhileStmt/DoWhileStmt 对条件位置 AK.Assignment() 报同文案错误；gen1 实测——if (x = 1) 当场拒绝（同文案 + 非零退出），合法 bool 条件/while/do-while 正控通过。
 - 原始记录：① C# CS0157；Zan 接受且语义=覆盖 try 返回值（override-result=2），无警告。② switch 非空 case 隐式贯穿：C# CS0163；Zan 接受且语义=**隐式 break**（隔离探针亲验：case 1 不落入 case 2）——Go 风格，C# 直觉漏写 break 静默变行为。③ `if (x = 1)`：C# CS0029 硬错；Zan 仅警告，运行 C 风格真假（x=1 进分支，亲验）。
 - 探针：`_scratch/csaudit/exceptions/{p03_finally_override,p13_implicit_fallthrough}.zan`、`operators/p13_assign_cond.zan`、`operators/v_assign_cond.zan`（复验：当场报错）。
 ### [~] A523 渲染与诊断输出口径族（与 .NET 不一致的小偏差集合）
