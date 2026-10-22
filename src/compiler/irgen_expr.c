@@ -4019,6 +4019,23 @@ static LLVMValueRef emit_binary_op_values(zan_irgen_t *g, zan_ast_node_t *expr,
         /* 混合位宽整数与浮点数类型隐式提升转换 */
         coerce_int_pair(g, &left, &right);
 
+        /* A510：定型为 32 位 int/uint 的算术/移位/位运算按 32 位环绕（C#
+         * unchecked 口径）——曾一律 64 位寄存器，表达式级溢出不环绕
+         * （int.MaxValue+1 打出 2147483648、0u-1u 打出 64 位回绕、-8>>>1
+         * 按 64 位移）。比较运算定型是 bool 不走这条；臂内层的 int 表达式
+         * 已各自按 i32 包回，这里只截对齐后的公共位宽。 */
+        {
+            zan_type_t *bty = infer_expr_type(g, expr, locals);
+            LLVMTypeRef lty = LLVMTypeOf(left);
+            if (bty && (bty->kind == TYPE_INT || bty->kind == TYPE_UINT) &&
+                LLVMGetTypeKind(lty) == LLVMIntegerTypeKind &&
+                LLVMGetIntTypeWidth(lty) > 32) {
+                LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
+                left = LLVMBuildTrunc(g->builder, left, i32t, "n32.l");
+                right = LLVMBuildTrunc(g->builder, right, i32t, "n32.r");
+            }
+        }
+
         /* 双操作数类型对齐后根据统一类型发射相应指令 */
         LLVMTypeRef left_type = LLVMTypeOf(left);
         bool is_float = (LLVMGetTypeKind(left_type) == LLVMDoubleTypeKind ||
@@ -4366,6 +4383,17 @@ static LLVMValueRef emit_null_coalesce(zan_irgen_t *g, zan_ast_node_t *expr,
         is_null = zan_icmp(g->builder, LLVMIntEQ, left, LLVMConstNull(lt),
                            "coal.lnull");
 
+    /* p07 批次回归照出的存量缺陷：负载提取必须在 left_bb（分支前）完成
+     * ——曾在 merge 块里先发 nullable_get_payload 提取指令再建 phi，触发
+     * "PHI nodes not grouped at top of basic block!"（`int y = x ?? 5;`）。 */
+    LLVMTypeRef res_ty = lt;
+    LLVMValueRef lres = left;
+    if (l_nullable) {
+        LLVMValueRef lpayload = nullable_get_payload(g, left);
+        res_ty = LLVMTypeOf(lpayload);
+        lres = lpayload;
+    }
+
     LLVMBasicBlockRef left_bb = LLVMGetInsertBlock(g->builder);
     LLVMBasicBlockRef rhs_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "coal.rhs");
     LLVMBasicBlockRef merge = LLVMAppendBasicBlockInContext(g->ctx, fn, "coal.end");
@@ -4377,21 +4405,9 @@ static LLVMValueRef emit_null_coalesce(zan_irgen_t *g, zan_ast_node_t *expr,
     LLVMBuildBr(g->builder, merge);
 
     LLVMPositionBuilderAtEnd(g->builder, merge);
-    LLVMTypeRef res_ty = lt;
-    LLVMValueRef lres = left;
     LLVMValueRef rres = right;
-    if (l_nullable) {
-        bool r_nullable = llvm_is_nullable(LLVMTypeOf(right)) != 0;
-        if (r_nullable) {
-            /* T? ?? T? → 聚合体直取 */
-        } else {
-            /* T? ?? T → 结果取负载（静态已保证同型，此处仅防御性归一） */
-            res_ty = LLVMTypeOf(nullable_get_payload(g, left));
-            lres = nullable_get_payload(g, left);
-            if (LLVMTypeOf(right) != res_ty)
-                rres = coerce_int_to(g, right, res_ty);
-        }
-    }
+    if (l_nullable && LLVMTypeOf(right) != res_ty)
+        rres = coerce_int_to(g, right, res_ty);
     LLVMValueRef phi = LLVMBuildPhi(g->builder, res_ty, "coal");
     LLVMValueRef vals[] = { lres, rres };
     LLVMBasicBlockRef bbs[] = { left_bb, rhs_end };
