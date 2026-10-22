@@ -434,6 +434,21 @@ Without MCP the same index is a file: `knowledge/symbols.json` next to the SDK
   会把 `stdlib/System` 整棵子树拉进来，靠它"顺便"解析到 `System.Json` 的
   `JsonValue` 是**依赖副作用**——要 `JsonValue` 就写 `using System.Json;`
   （仓库里 6700+ 个文件都这么写），别指望父命名空间兜底。
+* **编译期 ORM 的 `Insert<T>` / `Select<T>` / `Update<T>` / `Delete<T>` 不是接口
+  方法**（实证，2026-10-22）：数据库执行接口上只有 `Query` / `Execute` /
+  `ExecuteScalar` / `GetProvider`；那四个泛型方法是编译器的**代码生成器**
+  （GenDb）把调用点改写成 `__DbQ_<E>` / `__DbI_<E>` 类型化门面才有的——
+  门面里才调 `OrmSelect` / `OrmInsert`，接口上当然没有。
+  - 生成器**只在类型实参是具体实体类**时才改写（`GenDb.IsRoot` 要求
+    `ClassGet(targ) != null`）；类型实参是**类型形参**（泛型仓储基类里的
+    `T`）就改写不了——那正是"开放泛型模板"：真身由
+    `zan_parser_specialize_generic_bases` 在派生类里特化出来，模板体本身只留
+    运行期转发桩。
+  - 推论：看到"数据库接口没有 `Insert`"**不要去补接口**——补了只是多一份
+    要同步的空契约；正确问法是"类型实参是不是具体实体类"。
+  - 坑出处：查 ORM 报错时先按"接口缺方法"读接口，读完发现全仓**没有任何
+    `Insert<T>` 的声明**——真身在生成器里；而泛型仓储基类必须**继承**才能用
+    （直接 `new` 会静默返回默认值）。
 ## 4. Edit
 
 `edit_file(path, old, new)` (MCP) replaces an exact snippet in place — the
