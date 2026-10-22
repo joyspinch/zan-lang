@@ -4135,6 +4135,20 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_codeeditor_ctxmenu_vs${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
+  # 代码编辑器右键菜单的点击穿透回归：右键菜单是模态浮层，菜单外的
+  # 那一下点击只用来「关菜单」，不该再落回下层控件。此前菜单只注册
+  # 了自身矩形的命中阻挡区，菜单外的按下照常解析成下层按钮的点击
+  # 目标（关菜单的同时把下层也点了一下）。菜单须铺全窗拦截区，且
+  # 登记为 hit-only（只吞点击、不把原生浮层裁掉）。
+  add_test(NAME conformance_gui_codeeditor_ctxmenu_penetration
+    COMMAND ${CMAKE_COMMAND}
+      -DZANC=$<TARGET_FILE:zanc>
+      -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/codeeditor_ctxmenu_penetration_test.zan
+      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/packages/Zan.Gui.CodeEditor/src/Gui/Component/CodeEditor/CodeEditor.zan;--auto-stdlib${_gui_driver_tail}"
+      -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_codeeditor_ctxmenu_penetration.out
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_codeeditor_ctxmenu_penetration${_exe_ext}
+      -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+
   add_test(NAME conformance_gui_codeeditor_bp_menu_ui
     COMMAND ${CMAKE_COMMAND}
       -DZANC=$<TARGET_FILE:zanc>

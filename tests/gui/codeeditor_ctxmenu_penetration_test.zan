@@ -1,0 +1,96 @@
+using System;
+using System.Collections.Generic;
+using Gui;
+using Gui.Widget;
+using Gui.Component.CodeEditor;
+
+// 代码编辑器右键菜单的点击穿透回归。
+//
+// 右键菜单是模态浮层（Windows 口径）：菜单外的那一下点击只用来
+// 「关菜单」，不该再落回下层控件。此前菜单只注册了自身矩形的命中
+// 阻挡区（app.BlockHitsRect(mX, mY, mW, mH)），菜单外的按下照常
+// 解析成下层控件的点击目标——「关菜单的同时把下层也点了一下」。
+// 菜单须铺一层全窗拦截区：只吞点击、不画像素，且登记为 hit-only，
+// 不能把原生浮层（WebView）整片裁掉。
+//
+// 事件节拍：UiDriver 一次 click 注入 move+press+release 三个事件，
+// 一帧只消费一个，故每次注入后多喂几帧。
+class CodeEditorCtxMenuPenetrationTest {
+    static int fails;
+    static App app;
+    static CodeEditor ed;
+    static Button underBtn;
+    static int underClicks;
+
+    static void EqInt(string what, int got, int want) {
+        if (got == want) {
+            Console.WriteLine(what + "=1");
+            return;
+        }
+        fails = fails + 1;
+        Console.WriteLine(what + "=0");
+        Console.WriteLine("FAIL " + what + ": got " + Convert.ToString(got)
+            + " want " + Convert.ToString(want));
+    }
+
+    // 下层按钮先画（先注册命中区），编辑器随后，右键菜单最后画——与
+    // IDE 一致：菜单在帧末渲染，它的全窗拦截区才落在最顶层。
+    static void Body() {
+        int id = underBtn.Render(app, 40, 600, 160);
+        if (Ui.Clicked(app, id)) { underClicks = underClicks + 1; }
+        ed.Render(app, new Rect(40, 60, 640, 400));
+        ed.RenderCtxMenu(app);
+    }
+
+    static void Frame() {
+        app.PumpGuarded();
+        app.FrameGuarded(CodeEditorCtxMenuPenetrationTest.Body);
+    }
+
+    static void Frames(int n) {
+        for (int i = 0; i < n; i = i + 1) { Frame(); }
+    }
+
+    static void Main() {
+        fails = 0;
+        app = new App("ce-ctxmenu-penetrate", 1200, 900);
+        app.Show();
+        app.RequestAnimationFrame(16);
+
+        ed = new CodeEditor();
+        ed.documentPath = "probe.zan";
+        ed.LoadText("class Program {\n    static void Main() { }\n}\n");
+        underBtn = new Button("Under");
+        underClicks = 0;
+
+        UiDriver.app = app;
+        UiDriver.probes = new List<UiProbe>();
+        UiDriver.resultsPath = "build/ce_ctxmenu_penetration_results.log";
+        if (File.Exists(UiDriver.resultsPath)) { File.Delete(UiDriver.resultsPath); }
+
+        Frames(3);
+
+        // ---- 右键弹出菜单 ----
+        bool ok = UiDriver.Exec("rclick 120 120");
+        EqInt("rclick accepted", ok ? 1 : 0, 1);
+        Frames(5);
+        EqInt("menu open", ed.CtxMenuOpen() ? 1 : 0, 1);
+
+        // ---- 菜单开着时点下层按钮：不得穿透 ----
+        ok = UiDriver.Exec("click 60 615");
+        EqInt("click accepted", ok ? 1 : 0, 1);
+        Frames(5);
+        EqInt("outsideClickDoesNotPenetrateToUnderButton", underClicks, 0);
+        EqInt("menu closed by outside click", ed.CtxMenuOpen() ? 1 : 0, 0);
+
+        // ---- 菜单关掉后普通点击照常触发（防线不粘滞）----
+        ok = UiDriver.Exec("click 60 615");
+        EqInt("second click accepted", ok ? 1 : 0, 1);
+        Frames(5);
+        EqInt("normalClickAfterMenuClosedStillFires", underClicks, 1);
+
+        if (File.Exists(UiDriver.resultsPath)) { File.Delete(UiDriver.resultsPath); }
+        Console.WriteLine(fails == 0 ? "CODEEDITOR CTXMENU PENETRATION PASS"
+            : "CODEEDITOR CTXMENU PENETRATION FAIL " + Convert.ToString(fails));
+    }
+}
