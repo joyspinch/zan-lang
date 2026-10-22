@@ -29,6 +29,10 @@ partial class LspSession {
     CancellationToken serviceCancellation;
     CancellationToken activeCancellation;
     LspPendingState lastRequestState;
+    // 启动诊断（起不来时的原因）；成功时 code=0。
+    LspStartReport startReport;
+    // 进程内启动轮次：每次启动换一个端口段（见 Start）。
+    static int lspStartSeq;
 
     nint sock;
     int seq;
@@ -227,7 +231,11 @@ partial class LspSession {
         LspCommand activeCommand = null;
         bool readyPublished = false;
         try {
-            connection = LspSession.Start(root, shutdownSource.Token);
+            // 启动诊断袋：起不来时把原因（找不到 exe / 连不上 / 握手超时）
+            // 留给 IDE 状态栏，别只回一个 null 让用户猜。
+            LspStartReport report = new LspStartReport();
+            this.startReport = report;
+            connection = LspSession.Start(root, report, shutdownSource.Token);
             this.WireConnectionDiagnostics(connection);
             bool ready = connection != null;
             if (uiDispatcher != null) {
@@ -418,23 +426,64 @@ partial class LspSession {
         cache.Clear();
     }
 
-    static LspSession Start(string root, CancellationToken cancellation = null) {
+    static LspSession Start(string root, LspStartReport report, CancellationToken cancellation = null) {
         if (cancellation != null && cancellation.IsCancellationRequested) { return null; }
-        string exe = ZanIDE.ToolchainDir() + "/zan-lsp" + ZanIDE.ExeSuffix();
-        if (!File.Exists(exe)) { exe = ZanIDE.ExeDir() + "/zan-lsp" + ZanIDE.ExeSuffix(); }
-        if (!File.Exists(exe)) { return null; }
-        int portBase = 47411 + (Runtime.GetProcessId() % 89) * 4;
+        string toolchain = ZanIDE.ToolchainDir() + "/zan-lsp" + ZanIDE.ExeSuffix();
+        string exeDir = ZanIDE.ExeDir() + "/zan-lsp" + ZanIDE.ExeSuffix();
+        string exe = "";
+        // ZAN_IDE_LSP_EXE 是严格覆盖：指定了就只认它（自定义工具链
+        // 位置的用户用这个；指错了也要立刻报"找不到"而不是偷偷
+        // 退回别处去，用户才知道自己配错了）。
+        string envExe = ZanIDE.getenv("ZAN_IDE_LSP_EXE");
+        if (envExe != null && envExe != "") {
+            exe = envExe;
+            if (!File.Exists(exe)) {
+                if (report != null) { report.code = 1; report.detail = exe; }
+                return null;
+            }
+        } else {
+            exe = toolchain;
+            if (!File.Exists(exe)) { exe = exeDir; }
+            if (!File.Exists(exe)) {
+                if (report != null) {
+                    report.code = 1;
+                    report.detail = toolchain + " / " + exeDir;
+                }
+                return null;
+            }
+        }
+        // 端口按进程内轮转：重启语言服务时旧的那个 zan-lsp 还没退，
+        // 它占着上一个端口段——新服务绑不上就自己退了，客户端却连上了
+        // 旧服务，状态与实际服务对不上。轮转端口段让每次启动都落在
+        // 没人占的段上。
+        int portBase = 47411 + ((Runtime.GetProcessId() + lspStartSeq * 4) % 89) * 4;
+        lspStartSeq = lspStartSeq + 1;
         for (int attempt = 0; attempt < 4; attempt = attempt + 1) {
             if (cancellation != null && cancellation.IsCancellationRequested) { return null; }
             int port = portBase + attempt;
-            Process.RunDetached("\"" + exe + "\" --port " + Convert.ToString(port));
-            LspSession s = LspSession.Open(port, root, cancellation);
+            if (report != null) {
+                report.attempts = attempt + 1;
+                report.lastPort = port;
+            }
+            // 长期运行的子进程必须走 StartDetachedSafe：RunDetached 在
+            // Windows 上会多挂一层 cmd.exe + conhost.exe，语言服务这种
+            // 每次开工程都要起的进程正是这类堆积的来源。
+            List<string> args = new List<string>();
+            args.Add("--port");
+            args.Add(Convert.ToString(port));
+            Process.StartDetachedSafe(exe, args);
+            LspSession s = LspSession.Open(port, root, report, cancellation);
             if (s != null) { return s; }
+        }
+        if (report != null && report.code == 0) { report.code = 2; }
+        if (report != null && report.code == 2) {
+            // 四个端口都试过：把端口区间给用户，比"连不上"三个字有用。
+            report.detail = Convert.ToString(portBase) + " - " + Convert.ToString(portBase + 3);
         }
         return null;
     }
 
-    static LspSession Open(int port, string root, CancellationToken cancellation = null) {
+    static LspSession Open(int port, string root, LspStartReport report, CancellationToken cancellation = null) {
         LspSession d = new LspSession();
         d.sock = 0 - 1;
         d.seq = 1;
@@ -452,29 +501,38 @@ partial class LspSession {
         if (s < 0) { return null; }
         d.sock = s;
 
+        // 连服务器。zan-lsp 是刚拉起来的，此刻多半还没 listen：
+        // 非阻塞 connect 第一次返回 WSAEWOULDBLOCK(10035)/EINPROGRESS(115)，
+        // 连接建立后再 connect 一次会返回 WSAEISCONN(10056)/EISCONN(56)——
+        // 这两个码才是"连上了"。
+        //
+        // 关键在于"被拒"这一路：服务还没起来时 connect 直接拿到
+        // WSAECONNREFUSED(10061)/ECONNREFUSED(111)，而**这个套接字已经废了**
+        // ——在它上面再 connect 只会拿到 WSAEINVAL(10022)/EINVAL(22)。
+        // 原来的循环不认这两个码，于是在同一个废套接字上空转 500ms，
+        // 判定"连不上"——语言服务其实好好的，只是起得比连接慢。
+        // 现在：被拒就换一个套接字接着试，直到窗口用完。
         bool connected = false;
-        #if WINDOWS
         if (Socket.SetNonBlocking(s) != 0) { Socket.Close(s); return null; }
         int tries = 0;
-        while (tries < 25 && !connected && !d.OperationCancelled()) {
+        while (tries < 60 && !connected && !d.OperationCancelled()) {
             int r = Socket.Connect(s, "127.0.0.1", port);
-            if (r == 0 || Socket.LastSocketError() == 10056) { connected = true; }
-            else { d.SnoozeMs(20); tries = tries + 1; }
+            int err = Socket.LastSocketError();
+            if (r == 0 || err == 10056 || err == 56) { connected = true; break; }
+            if (err == 10061 || err == 111 || err == 10022 || err == 22) {
+                Socket.Close(s);
+                s = Socket.CreateTcp();
+                if (s < 0) { return null; }
+                d.sock = s;
+                if (Socket.SetNonBlocking(s) != 0) { return null; }
+            }
+            d.SnoozeMs(25);
+            tries = tries + 1;
         }
-        #else
-        if (Socket.SetNonBlocking(s) != 0) { Socket.Close(s); return null; }
-        int tries = 0;
-        while (tries < 100 && !connected && !d.OperationCancelled()) {
-            int r = Socket.Connect(s, "127.0.0.1", port);
-            #if MACOS
-            if (r == 0 || Socket.LastSocketError() == 56) { connected = true; }
-            #else
-            if (r == 0 || Socket.LastSocketError() == 106) { connected = true; }
-            #endif
-            else { d.SnoozeMs(20); tries = tries + 1; }
+        if (!connected) {
+            if (report != null) { report.code = 2; report.detail = Convert.ToString(port); }
+            Socket.Close(s); return null;
         }
-        #endif
-        if (!connected) { Socket.Close(s); return null; }
         d.alive = true;
 
         d.waitBudget = 240;
@@ -484,6 +542,10 @@ partial class LspSession {
         init.capabilities = JsonValue.NewObject();
         string m = d.RequestWait("initialize", Json.Serialize<LspInitParams>(init));
         if (m.Length == 0) {
+            // 连上了但 initialize 没回：服务起来了却不按协议应答
+            // （版本不匹配、端口上蹲着别的服务）。这是"握手超时"，
+            // 和"连不上"是两回事，用户要看的正是这个区别。
+            if (report != null) { report.code = 3; report.detail = Convert.ToString(port); }
             d.waitBudget = 4;
             if (d.OperationCancelled()) { d.Disconnect(); }
             else { d.Shutdown(); }
@@ -497,6 +559,9 @@ partial class LspSession {
     }
 
     bool Alive() { return this.alive; }
+
+    // 启动诊断袋：IDE 拿它把"语言服务不可用"翻译成具体原因。
+    LspStartReport StartReport() { return this.startReport; }
 
     void Shutdown() {
         if (background) {

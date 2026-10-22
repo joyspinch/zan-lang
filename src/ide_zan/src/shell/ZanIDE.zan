@@ -315,6 +315,11 @@ partial class ZanIDE {
 
             this.SyncEditorDocument();
 
+            // 语言服务：工程打开后接上（补全/跳转定义/重命名/折叠全靠它）。
+            // 此前 EnsureLsp 定义了却没有任何调用点——语言服务从未启动过，
+            // 智能感知整套是死代码，用户只看到"敲了没反应"。
+            if (haveProject) { this.EnsureLsp(); }
+
             this.SyncEditorTabs();
             editorTabs.Select(activeTab.Get());
             editorTabs.TakeChanged();
@@ -731,8 +736,38 @@ partial class ZanIDE {
             statusBar.SetText(sbModeItem, modeInfo);
             statusBar.SetColor(sbModeItem, sbText);
             statusBar.SetColor(sbEncItem, sbMuted);
+            // 语言服务状态：VS 把语言服务/代码分析的状态摆在状态栏，
+            // 用户据此知道补全、跳转现在能不能用；不可用时用告警色，
+            // 点击那一项一键重连。
+            int lspNow = this.RefreshLspState();
+            statusBar.SetText(sbLspItem, this.LspStatusText());
+            if (lspNow == 3) { statusBar.SetColor(sbLspItem, t.warning); }
+            else if (lspNow == 2) { statusBar.SetColor(sbLspItem, sbText); }
+            else { statusBar.SetColor(sbLspItem, sbMuted); }
             statusBar.RenderAt(app, 0, sbY, W, sbH);
             app.PerfMark("sh.status");
+            // 语言服务状态项的命中区：点一下 = 重连语言服务。
+            app.BeginIdScope(960000);
+            Label lspItem = statusBar.ItemAt(sbLspItem);
+            if (lspItem != null && lspItem.bw > 0 && lspItem.bh > 0) {
+                int lspHit = WidgetId.Block(1);
+                app.hitTester.RegisterRectL(lspHit, lspItem.bx, lspItem.by,
+                    lspItem.bw, lspItem.bh, 0, "ide-lsp-status");
+                if (Ui.Clicked(app, lspHit)) {
+                    app.ClaimClick();
+                    this.RetryLsp();
+                }
+            }
+            app.EndIdScope();
+            if (UiDriver.Active()) {
+                // 语言服务状态探针：状态栏那一条说的是不是真话，
+                // 靠断言读它，不靠看截图猜。
+                UiDriver.SetProbe("lsp.state", Convert.ToString(lspNow));
+                UiDriver.SetProbe("lsp.text", this.LspStatusText());
+                UiDriver.SetProbe("lsp.error", this.lspError == null ? "" : this.lspError);
+                UiDriver.SetProbe("lsp.restarts", Convert.ToString(lspRestarts));
+                UiDriver.SetProbe("lsp.connectMs", Convert.ToString(lspConnectMs));
+            }
 
             if (!designerMode && !activeIsStart && !activeIsDocs) {
                 app.BeginIdScope(930000);

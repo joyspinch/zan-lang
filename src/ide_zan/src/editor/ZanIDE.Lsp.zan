@@ -11,9 +11,31 @@ partial class ZanIDE {
     int syncedEditorStamp;
     LspSession syncedEditorSession;
 
+    // 语言服务状态（lspState / lspError / lspStartedMs）与别的 IDE
+    // 状态放在一起，见 ZanIDE.State.zan。
+    //
+    // 状态常驻状态栏（VS 把语言服务/代码分析的状态摆在状态栏），
+    // 用户据此一眼知道补全、跳转定义、重命名现在能不能用——比
+    // "敲了没反应"强得多。不可用时 lspError 说清原因，点击那一项
+    // 一键重连。
+    //
+    // 语言服务"连接中"卡住多久算超时（毫秒）：zan-lsp 起不来时
+    // 状态栏不能永远停在"连接中"。
+    //
+    // 这个值必须按**实测冷启动时间**留余量，不能拍脑袋：zan-lsp 在
+    // 收到 initialize 后会同步索引 stdlib + 全部可见包仓库（本仓库
+    // 是 8491 个 .zan），建树里实测 11~13 秒才回 initialize（机器忙
+    // 时更久）。按 20 秒卡，超时一到就误报"不可用"，等服务随后连上
+    // 又翻回"已连接"——用户看到的是"服务坏了又好了"，纯属自伤。
+    // 60 秒是冷启动的 4 倍余量，握手真的失败时也还等得起。
+    const int LspConnectTimeoutMs = 60000;
+
     void EnsureLsp() {
         if (lspSess != null || lspTried || shuttingDown) { return; }
         lspTried = true;
+        lspState = 1;  // 连接中
+        lspError = "";
+        lspStartedMs = Gui.Backend.Window.GetTickMs();
         int workspace = documentWorkspace;
         lspSess = LspSession.StartAsync(app, root, delegate (LspSession session, bool ready) {
             if (shuttingDown || documentWorkspace != workspace || lspSess != session) {
@@ -21,11 +43,14 @@ partial class ZanIDE {
                 return;
             }
             if (ready) {
+                lspState = 2;
+                lspError = "";
+                lspConnectMs = Gui.Backend.Window.GetTickMs() - lspStartedMs;
                 log.Add("> zan-lsp connected: semantic navigation & completion enabled.");
                 this.SyncEditorDocument();
                 this.RefreshFoldRanges();
             } else {
-                log.Add(ZanIDE.T("> Language service unavailable.", "> 语言服务不可用。"));
+                this.MarkLspUnavailable(this.LspFailureText(session.StartReport()));
             }
             app.RequestRedraw();
         });
@@ -46,6 +71,84 @@ partial class ZanIDE {
         // 不只是上次构建的日志）。
         this.SetIdeDiagnostics(path, diagnostics);
         app.RequestRedraw();
+    }
+
+    // 语言服务起不来：记下原因，状态栏显示，并弹一次 toast。
+    void MarkLspUnavailable(string reason) {
+        lspState = 3;
+        lspError = reason;
+        log.Add(ZanIDE.T("> Language service unavailable: ", "> 语言服务不可用：") + reason);
+        Layer.Msg(ZanIDE.T("Language service unavailable: ", "语言服务不可用：") + reason, 4);
+    }
+
+    // 一键重连（VS 的老招：语言服务出问题先重启它）。关掉旧会话，
+    // 重新拉起；旧会话挂进退休列表，等它自己的线程收尾。
+    void RetryLsp() {
+        if (shuttingDown) { return; }
+        if (!haveProject) {
+            Layer.Msg(ZanIDE.T("No project open - language service stays off",
+                "没有打开工程，语言服务不启动"), 4);
+            return;
+        }
+        if (lspSess != null) {
+            lspSess.Shutdown();
+            retiredLanguageServices.Add(lspSess);
+            lspSess = null;
+        }
+        lspTried = false;
+        lspState = 1;
+        lspError = "";
+        lspRestarts = lspRestarts + 1;
+        log.Add(ZanIDE.T("> Restarting language service...", "> 正在重启语言服务……"));
+        this.EnsureLsp();
+        app.RequestRedraw();
+    }
+
+    // 每帧刷新语言服务状态：连接超时、服务半路退出都要落到"不可用"，
+    // 否则状态栏会一直说"已连接"，而补全其实早就不动了。
+    int RefreshLspState() {
+        if (shuttingDown) { return lspState; }
+        if (!haveProject) {
+            lspState = 0;
+            return lspState;
+        }
+        if (lspState == 1 && lspStartedMs != 0
+            && Gui.Backend.Window.GetTickMs() - lspStartedMs > LspConnectTimeoutMs) {
+            this.MarkLspUnavailable(ZanIDE.T("connect timed out", "连接超时"));
+            return lspState;
+        }
+        if (lspState == 2 && lspSess != null && !lspSess.Alive()) {
+            this.MarkLspUnavailable(ZanIDE.T("service exited", "服务已退出"));
+            return lspState;
+        }
+        return lspState;
+    }
+
+    // 状态栏上那一条的文案。
+    string LspStatusText() {
+        if (lspState == 2) { return ZanIDE.T("LSP: connected", "语言服务：已连接"); }
+        if (lspState == 3) { return ZanIDE.T("LSP: unavailable", "语言服务：不可用"); }
+        if (lspState == 1) { return ZanIDE.T("LSP: connecting", "语言服务：连接中"); }
+        return ZanIDE.T("LSP: off", "语言服务：未启用");
+    }
+
+    // 启动诊断翻成人话：分清"找不到程序""连不上""握手超时"——
+    // 三者的修法完全不同，用户要看的正是这个区别。
+    string LspFailureText(LspStartReport report) {
+        if (report == null) { return ZanIDE.T("connection failed", "连接失败"); }
+        if (report.code == 1) {
+            return ZanIDE.T("zan-lsp not found (looked in ", "找不到 zan-lsp（查过 ")
+                + report.detail + "）";
+        }
+        if (report.code == 2) {
+            return ZanIDE.T("zan-lsp did not accept a connection (ports ", "zan-lsp 连不上（端口 ")
+                + report.detail + "）";
+        }
+        if (report.code == 3) {
+            return ZanIDE.T("zan-lsp handshake timed out (port ", "zan-lsp 握手超时（端口 ")
+                + report.detail + "）";
+        }
+        return ZanIDE.T("connection failed", "连接失败");
     }
 
     // 关闭/保存/切换可能先改活动下标，旧缓冲须按实际文档路径同步。
