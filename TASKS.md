@@ -6,12 +6,142 @@
 >
 > 平账纪律：闭账条目当批移出
 >
+> 2026-10-23 全仓 C# 语义复审（八域 96+ 探针实测，探针在 `_scratch/csaudit/`）：
+> 新登记 A507–A526；A482 更正（宿主同病）。各域"实测确认正确面"见探针文件与提交正文。
+>
 > 2026-10-22 平账：移出 48 条已闭账条目（A390/A393/A394/A395/A396/A397/A399/
 > A400/A401/A402/A403/A404/A405/A406/A407/A413/A415/A416/A428/A431/A432/A437/
 > A441/A442/A445/A447/A448/A449/A463/A473/A474/A475/A476/A477/A478/A479/A480/
 > A481/A483/A484/A485/A488/A491/A492/A497/A500/A502/A505）。编号不复用，结论与验证见 git 历史。
 
 ## 未完成
+
+### [ ] A507 运行期错误 fail-mode 全线偏离 C#：软失败继续执行、不可 catch
+- 现象（2026-10-23 八域审计交叉证实，全部亲验复现）：
+  - 数组/List/字符串越界**读**：stderr 一行 `runtime error: ...`（带 file:line:col，每位置一次）后**钳位继续**，返回槽 0 的值；越界**写确定性写入槽 0**（`a[9]=99` 落进 `a[0]`，其余元素不动）——静默数据破坏，exit=0。
+  - 整数除零：软 guard 后**返回被除数**（5/0→5、7/0→7、5%0→0）继续执行。
+  - null 接收者**字段访问**：guard 后读出 0 继续；null 接收者**方法调用则完全无 guard，调用成功返回**（连报告都没有，隔离实测）。
+  - `null.Length`→0、`Substring(7)`→钳 0 返回整串。
+  - 硬模式（`--strict-runtime`/`ZAN_RT_HARD=1`）exit=70，仍不可 catch；`--publish` 不启用 strict。
+- 期望 C#：以上全部是可 catch 的异常（IndexOutOfRange/DivideByZero/NullReference/ArgumentOutOfRange），未捕获才非零退出。
+- 影响：迁移 C# 代码的异常处理假设全部失效——软模式脏数据向下游扩散，硬模式无法补救；靠 stderr+退出码判错的 CI/脚本全部漏采。
+- 根因落点：`src/compiler/irgen_generics.c` `emit_runtime_check`（bad 路径 br 回 cont_bb 继续）；null 方法调用无 guard 在 `irgen_call.c` ~2103；软/硬开关在 `rt_timer.c` `zan_rt_soft_is_hard`。
+- 方向：先给"越界写、null 方法调用"这两条响亮失败；最终口径应对齐 C#（全部可 catch）。
+- 探针：`_scratch/csaudit/{collections/{p03,p09},exceptions/{p08,p09,p10},numeric/p02,string/p06}`。
+- 关联：A508（Dict 缺 key 连 soft error 都没有）、A526（TOOLING.md 文档失真）。
+
+### [ ] A508 Dict 缺 key 读完全静默返回默认值（连 soft error 都没有）
+- 现象：`d["missing"]` 返回 0，无 stderr、无 zan_crash.log、exit=0。C# 抛 KeyNotFoundException。越界读尚有一行 runtime error，这条连一行都没有。
+- 根因落点：`src/compiler/irgen_expr.c` ~7571-7596（Dict 索引读取 miss 直接走零值路径）。TryGetValue/ContainsKey 是正确出口。
+- 探针：`_scratch/csaudit/collections/p06_dict_missing.zan`、`exceptions/p11_dictmiss.zan`。
+
+### [ ] A509 失败下转静默类型混淆（无 InvalidCastException）
+- 现象：`(string)userObj`（object 装 User）得**空字符串**；`(User)"x"`（object 装 string）得**非 null 的 User 槽**（实为 string 指针）——两边都"成功"，exit=0。C# 抛 InvalidCastException（可 catch）。
+- 根因落点：`src/compiler/irgen_expr.c` `emit_expr_cast_expr`（:10723）对引用→引用无运行时检查分支（:10850-10876 落到 `return val`）；`is` 已有 `emit_runtime_is_check`（:10894）可复用。
+- 方向：引用下转补运行时类型检查，失败走响亮失败/异常路径。
+- 探针：`_scratch/csaudit/types/p09_object_cast.zan`（F6–F10）。
+
+### [ ] A510 整数表达式按 64 位计算、不按声明类型收窄（表达式级溢出不环绕）
+- 现象：`int a=int.MaxValue; WriteLine(a+1)`→2147483648、`a*2`→4294967294、`0u-1u`→18446744073709551615、`long j=i+1`→2147483648、`-8>>>1`→9223372036854775804。C# 全按 32 位环绕。存回 int 变量才截断——传参/打印/加宽路径不收窄。
+- 同根：`TryParse(...)` 调用表达式直接打印得 "1"，存 bool 变量再打印得 "true"（调用结果表达式未按声明类型定型）。
+- 根因落点：irgen 整数运算一律 64 位寄存器、仅写回 int 槽时截断；表达式定型与收窄缺失。
+- 附带：`>>>` 宿主支持但 SPEC §2.6 运算符表未声明（→A526）。
+- 探针：`_scratch/csaudit/numeric/{p03,p04,p12}`。
+
+### [ ] A511 decimal 三处语义缺口：除法截断、与 double 混算垃圾、WriteLine(decimal) 编译崩溃
+- ① 除法恒 18 位截断：`1m/3m`→"0.333333333333333333"（C# 28 位且末位进位）、scale 恒 18（`10m/4m`→"2.500000000000000000"）；加/乘精确。
+- ② decimal+double 混算被接受且产出垃圾：`0.5m+0.5`→"19768355002338416264795389952"、`0.1m+2.0`→"19807040628566225135759764102"（C# CS0019 拒绝）。`Decimal.FromDouble` 本身正确——坏的只是混合算术的隐式转换 lowering（checker.c:1280-1285 对赋值路径已有拒绝，算术实参路径放行）。
+- ③ `Console.WriteLine(decimal)` 直接编译失败：LLVM 校验错——`%Decimal` 结构体传给 `zan_rt_print_int(i64)`（亲验复现）。C# 正常打印。
+- 根因落点：① `src/runtime/rt_decimal.c` 除法 scale 策略；② checker 算术实参 decimal 提升 + irgen 转换 lowering；③ irgen 打印分派缺 decimal 分支。
+- 探针：`_scratch/csaudit/numeric/{p07,p08,p13}`。
+
+### [ ] A512 字符串解析失败/溢出静默返 0 继续执行
+- `Convert.ToInt32("abc")`、`int.Parse("abc")`、`Convert.ToDouble("xyz")` 全返 0 继续；`"2147483648"` 溢出静默接受（还借 A510 打出 64 位值）。C#：FormatException/OverflowException。
+- `int.TryParse` 存在且正常——失败语义应与它对齐或补异常通道。
+- 根因落点：同 A507（runtime 无异常通道，Convert/Parse 失败分支返 0）。
+- 探针：`_scratch/csaudit/numeric/p11_convert_fail.zan`。
+
+### [ ] A513 舍入语义偏离：Math.Round 远离零、Convert.ToInt32(double) 截断
+- `Math.Round(2.5)`=3、`Round(-2.5)`=-3、`Round(0.5)`=1（C# 银行家：2/-2/0）；无 MidpointRounding 重载。`Convert.ToInt32(3.9)`=3（C# 舍入=4）；`Decimal.ToInt64(2.9m)`=2（C# 3）。Floor/Ceiling 正确。
+- 根因落点：`irgen_call.c` Math/Convert 分支舍入模式（C 运行时 away-from-zero）；stdlib `System/Decimal.zan` ToInt64。
+- 探针：`_scratch/csaudit/numeric/{p09,p12}`。
+
+### [ ] A514 三元类型合并两侧各选一遍：checker 有提升阶梯、irgen 按 then 臂定型
+- 现象：`(t?1:2.0)/2`→**0**（整数除法截断）、`(t?1:2L)/2`→0；double 在前才对；赋值语境靠隐式转换掩盖（`double v=(t?1:2.0); v/2`=0.5）。C# 公共类型=double。
+- 根因：checker 的 `merge_conditional_types`（checker.c:1212-1214）有数值提升阶梯，但 irgen 的 `expr_family`（irgen_expr_core.c:1076-1080）对 AST_CONDITIONAL **先取 then 臂 family**，未共用同一份合并——与重载分解同病（skill §10）。
+- 探针：`_scratch/csaudit/operators/p07_ternary.zan`。
+
+### [ ] A515 ?? 的右支总是求值（短路缺失）
+- `nn ?? Side()`：返回值对但 Side() 被调用（C# 非 null 时 calls=0）。日志/计数/惰性初始化全受影响。
+- 根因：`irgen_expr.c:4320-4329`（可空路径）与 :4132（主路径）两臂无条件求值后 `LLVMBuildSelect`——skill 二.2 明令禁止的形态（带副作用的死臂）。
+- 方向：cond-br + phi 合流。
+- 探针：`_scratch/csaudit/operators/p08_nullish.zan`。
+
+### [ ] A516 构造顺序与 C# 分叉：基类构造先于派生字段初始化器
+- 实测 `b-init / base-ctor / d-init / derived-ctor`；C# 是**派生字段初始化器最先**（d-init → b-init → base-ctor → derived-ctor）。直接后果：基类构造器里的虚调用读派生内联字段得默认值（实测 `derived:0`，C# `derived:42`）。静默错值。
+- 根因落点：`src/compiler/irgen.c` 构造器发射顺序。
+- 探针：`_scratch/csaudit/objectmodel/{p02_ctor_chain,p03_ctor_virtual}.zan`。
+
+### [ ] A517 析构器 `~X()` 是死语法：解析/检查过、从不发射、从不调用
+- `~Node()`/`~Solo()` 编译通过、运行无任何析构输出；IR 里 `__zan_release_*` 只逐字段 release，析构体内容不存在。依赖确定性清理的迁移代码静默失效。
+- 根因链：parser.c:3639 解析 ✓ → checker.c:5022 检查 ✓ → **binder.c 无 `AST_DESTRUCTOR_DECL` 分支**（grep 全文件 0 命中）→ irgen 无处理。
+- SPEC §4.4（L297-300、L532-539）宣称 "Destructor (called when refcount reaches 0)" 与实现不符。
+- 方向：binder/irgen 补分支（refcount 归零调析构体再释放），或编译期拒绝 + SPEC 改口径——不能停在"静默吞掉"。
+- 探针：`_scratch/csaudit/objectmodel/p10_cycle_leak.zan`。
+
+### [ ] A518 泛型方法调用点不检查 where 约束
+- `static T FirstItem<T>(List<T> xs) where T : Entity` 传 `List<int>` **静默编译运行通过**（隔离探针亲验）；方法体用到约束成员时报错落在方法体解析（措辞/位置误导）。类泛型 `new Repo<int>()` 有检查但**重复报两次**。
+- 根因落点：checker.c `check_generic_constraints`（:776）只挂 new 表达式（:3194）/var 声明（:3716）/返回类型（:4686）三处，调用解析路径缺失。
+- 探针：`_scratch/csaudit/types/{p12_compile_rejects,p14_method_constraint}.zan`。
+
+### [ ] A519 for 循环变量逐迭代新建（C# 的 for 头变量是共享单变量）
+- 实测 `for:0/1/2`（C# 3/3/3）、闭包内赋值 `10/11/12`（C# 13/23/33）；foreach 每迭代新建与 C#5+ 一致、普通局部捕获一致（plain:9）。比 C# 安全但属未声明差异，C# 经典"共享循环计数"模式迁移即错。
+- 根因落点：irgen for 语句发射（每次迭代实例化循环变量）。
+- 附带文档漂移：SPEC §4.7"只读捕获创建时复制值"与实测（按引用共享）不符。
+- 探针：`_scratch/csaudit/objectmodel/p06_for_capture.zan`。
+
+### [ ] A520 静态构造器启动时急切全量执行（C# 首次使用触发）
+- 实测 static-init/static-ctor/**unused-ctor-RAN**（从未引用的类）全部在 main-start 之前按声明序跑完；C# 惰性触发、未用不触发。启动副作用顺序、静态构造器异常时机（启动 vs 首用）随之改变。
+- 根因落点：irgen 静态初始化发射（全量前置）。
+- 探针：`_scratch/csaudit/objectmodel/p09_static_init.zan`。
+
+### [ ] A521 foreach 枚举中修改集合静默放行（无失效检测）
+- List 枚举中 Add：跟随 Count 增长继续枚举（真实程序=死循环，实测 count=103/guard=101）；Dict 枚举中 Remove：**静默跳元素**（k1,k2,k3 逐个 Remove → 只访到 k1;k3）。C# 两类都抛 InvalidOperationException。
+- 根因落点：`irgen_stmt.c` foreach 发射（索引式枚举器，无版本号检查）。
+- 探针：`_scratch/csaudit/collections/p07_foreach.zan`。
+
+### [ ] A522 C# 硬错误的三个构造 Zan 放行
+- ① finally 里 return：C# CS0157；Zan 接受且语义=覆盖 try 返回值（override-result=2），无警告。
+- ② switch 非空 case 隐式贯穿：C# CS0163；Zan 接受且语义=**隐式 break**（隔离探针亲验：case 1 不落入 case 2）——Go 风格，C# 直觉漏写 break 静默变行为。
+- ③ `if (x = 1)`：C# CS0029 硬错；Zan 仅警告，运行 C 风格真假（x=1 进分支，亲验）。
+- 方向：三条升级为错误；switch 贯穿若刻意保留 Go 语义，SPEC 必须声明。
+- 探针：`_scratch/csaudit/exceptions/{p03_finally_override,p13_implicit_fallthrough}.zan`、`operators/p13_assign_cond.zan`。
+
+### [ ] A523 渲染与诊断输出口径族（与 .NET 不一致的小偏差集合）
+- bool 全路径小写 true/false（五条渲染路径内部一致；C# True/False——A441 闭账口径=统一，非 .NET 口径，协议/日志大小写敏感场景有实害）。
+- `char.ToString()` 返回码点数字 "65"（C# "A"；WriteLine(char) 与拼接却正确——渲染路径互相不一致）。
+- `-0.0` 打印丢符号（C# "-0"）；float 打印按 double 展开（0.1f+0.2f→"0.30000001192092896"，C# "0.3"）。
+- 未捕获异常：exit=1（C# 0xE0434352）、消息打 **stdout** 且不含异常 Message（C# stderr+Message+栈）；`e.ToString()` 裸 Message；无 `Exception.StackTrace`（编译期拒绝）。
+- 探针：`_scratch/csaudit/{string/p08,numeric/p05,exceptions/,operators/p00}`。
+
+### [ ] A524 多字节字符串的索引与 Length 按 UTF-8 字节（SPEC 未声明口径）
+- `"中文"[0]` 返回首字节 0xE4（渲染 ä，C# '中'）；`"中文".Length`=6（C# 2）。char 为 8 字节码点 SPEC §2.5 已声明，字符串索引/Length 的字节口径 §3.1/§8 未写。
+- 迁移影响：按字符处理文本的 C# 代码（索引/Length/Split 边界）在非 ASCII 文本上全部偏移；GBK/UTF-8 编解码 API 已就位（Zan.Text）。
+- 方向：先补 SPEC 口径声明（廉价）；C# 口径需引入 UTF-16 语义或 per-codepoint API——独立战线。
+- 探针：`_scratch/csaudit/string/p07_index.zan`。
+
+### [ ] A525 API 面小缺口族（编译期显性暴露，迁移时需改写）
+- 无 `StringSplitOptions`（Split 单参）；无 char 静态类（IsDigit/ToUpper）；`double.ToString("F2")` 无格式串；`"a"+null` 字面量拒绝（string null 变量可拼）；无 operator++/--（自定义类型）；`new` 隐藏修饰符解析拒绝（隐藏语义本身正确）；委托无 multicast（`d+=h` 拒绝、诊断已指路 UiEvent/List 替代）；无 Array 静态类（Sort/CopyTo）；Stack/Queue/HashSet 的 Count 是方法非属性；object==string 按值比较（C# 引用比较，引用同一性不可表达）。
+- foreach-over-Dict 枚举变量是键 K 而非 KeyValuePair（取值需再 `d[k]`）；Dict 保插入序（比 C# 强的保证，未声明）。
+- 特点：全部编译期显性（除 object== 与 foreach-dict 形状），不产生静默错值；按需求频度逐个补。
+- 探针：`_scratch/csaudit/{string,collections,objectmodel}/` 各探针。
+
+### [ ] A526 文档与诊断文案失真五条（本轮审计顺带查实）
+- SPEC L174"decimal 是保留关键字，尚无对应类型"已过期——宿主已实现 m 字面量/四则/比较/System.Decimal。
+- SPEC §2.6 运算符表漏 `>>>`（宿主支持；移位宽度语义归 A510）。
+- SPEC §4.7"只读捕获创建时复制值"与实测不符（按引用共享——见 A519）。
+- TOOLING.md「Runtime diagnostics」称默认 trap+exit 70——实测默认软模式继续（见 A507）。
+- A380 的拒绝文案指向不存在的 `.Wait()`（checker.c:1593-1594；句柄 API 无 Wait，实际出口=await WhenAll/JoinWait）。另 `--api` 对内建成员覆盖不全（`List.Remove` 查不到但存在），与 A443 同族。
 
 ### [ ] A495 八条 conformance 用例在 `--check-leaks` 下报泄漏——所有权欠账浮出
 
@@ -654,7 +784,7 @@
   `Math.Sqrt(2.5m)` **照收**、`Convert.ToInt32(2.5m)` 给 2。A445 只在自举侧
   补了"按静态类型分流"的守卫，这两条 decimal 差异要等本条目把 decimal
   还原成独立类型才会消失。
-### [ ] A482 自举把「void 臂的三元表达式」降成非法 IR（`phi void`）
+### [ ] A482 「void 臂的三元表达式」两后端都降成非法 IR（`phi void`）——2026-10-23 更正：宿主同病
 
 - 现象（2026-10-21 修 A481 时被差分门照出来，用例
   `tests/conformance/nullable_user_type.zan`）：宿主编译运行正常；自举 gen1
@@ -665,17 +795,19 @@
     1577 |   %t127 = phi void [ 0, %L1 ], [ 0, %L2 ]
   ```
 
-- 根因：自举的 irgen 降三元表达式时**无条件**给结果建一个 phi；当两臂是
-  **void 表达式**（`flag ? Console.WriteLine("a") : Console.WriteLine("b");`）
-  时 phi 的类型成了 void → LLVM 不允许 `phi void` → IR 非法，clang 拒绝。
-  宿主没这个问题（void 结果不建 phi）。
-- 影响：自举编不出「语句开头的三元且两臂是 void 调用」的程序——而这正是最
+- **2026-10-23 审计更正（原"宿主没这个问题"只对了一半）**：宿主对
+  **void 方法臂**的语句位三元同样编译失败——`flag ? A() : B();`（A/B 是
+  void 方法）在宿主报同一 `phi void` 非法 IR
+  （`_scratch/csaudit/operators/p07b_void_ternary.zan` 实测，
+  "Instruction has a name, but provides a void value!"）。当时宿主验证的
+  形状是**赋值臂**（`flag?(n=1):(n=2);`，该形态宿主至今正确）——两臂是
+  void 方法调用才是共同触发条件。本条从"自举侧缺陷"改为**两后端同病**。
+- 根因：两后端的 irgen 降三元表达式时对 void 臂仍建结果 phi。宿主落点
+  `src/compiler/irgen_expr.c` 三元合并；自举落点
+  `src/selfhost/irgen_expr.zan` 同类分支。
+- 影响：编不出「语句开头的三元且两臂是 void 调用」的程序——而这正是最
   常见的一种三元写法（`ok ? Log() : Log2();`）。
-- 方向：自举 irgen 在两臂类型是 void 时**不建 phi**（直接按分支走），
-  或把结果槽降级成 void 的分支合并，与宿主 `irgen` 的 void 处理对齐。
-  - 动手前先定位 `src/selfhost/irgen_expr.zan` 里三元（cond expr）的 phi 生成，
-    对照宿主的同类分支；**`src/selfhost/irgen_expr.zan` 当前有并发会话的在途
-    改动**，动手前先核对工作树，别撞车。
+- 方向：两后端在两臂类型是 void 时**不建 phi**（直接按分支走），同一提交改。
 - 验证：把 `tests/conformance/nullable_user_type.zan`（void 臂）加进
   `tests/selfhost/diff_cases.txt`，差分门跑它应 PASS。
 - 关联：A481（自举侧同一条战线的前瞻洞）、A469 / A479（宿主侧解析）。
