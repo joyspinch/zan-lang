@@ -102,8 +102,18 @@
   UB）。失败语义与 TryParse 对齐。
 - 探针复验：p11 五条失败形状全点名；正例 42/123/2.5/3.25/2147483647 与
   TryParse true/77、false/0 全对。
-- 待办：可 catch 的 FormatException/OverflowException 通道（A507 族）；
-  自举半边。
+- **自举半边已修（2026-10-23，软诊断口径同宿主）**：`irgen_expr.zan` 的
+  `Parse`/`Convert.ToInt32/64/ToInt/ToDouble` 字符串路径从裸 `strtoll/strtod
+  (endp=null)` 改为宿主同款——null 串先报（"null string passed to a parse
+  function"）再用空串替身；endptr 谓词（没消费/残留/epnull）+ int.Parse 与
+  Convert.ToInt32/ToInt 的 int 范围溢出 + double 侧 ±inf 全并入 bad 谓词 →
+  `EmitRuntimeCheckIf` 软诊断（消息/去重/空行形状与 `zan_rt_soft_note3`
+  逐字节同形，列锚是被调者起点——自举 Call 节点没存左括号位置，宿主锚在
+  `(`，唯一定位差）+ select 安全值 0；硬模式打印单行后 exit 70。double.Parse
+  改走 `zan_rt_dbl_parse`（strtod + C# NaN/Infinity 字面量，同宿主）。17 形
+  探针 stdout 两侧逐行一致（含 long.Parse 的 int32 钳制与 Convert.ToInt64
+  的不钳制），TryParse 路径不动（正确出口）。
+- 待办：可 catch 的 FormatException/OverflowException 通道（A507 族）。
 - 原始实测：`Convert.ToInt32("abc")`、`int.Parse("abc")`、`Convert.ToDouble("xyz")` 全返 0 继续；`"2147483648"` 溢出静默接受（还借 A510 打出 64 位值）。C#：FormatException/OverflowException。
 - `int.TryParse` 存在且正常——失败语义应与它对齐或补异常通道。
 - 根因落点：同 A507（runtime 无异常通道，Convert/Parse 失败分支返 0）。

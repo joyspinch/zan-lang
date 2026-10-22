@@ -381,13 +381,40 @@ partial class Irgen {
     // Every other value answers 0 (the host's fallback branch). A nullable
     // lowers to a struct on the host, so the value never reaches the parser
     // there either.
-    string ConvertIntOperand(ExprVal a) {
+    string ConvertIntOperand(Node at, ExprVal a, bool int64) {
         if (IsNullable(a.ty)) { return "0"; }
         if (IsStr(a.ty)) {
+            // A512: the C host parses with strtoll + the end-pointer
+            // predicate (irgen_call.c ~2078) and reports failure, trailing
+            // garbage and (ToInt32/ToInt only) the int-range overflow
+            // through the soft channel, then hands back 0. ToInt64 keeps
+            // the full strtoll range (irgen_call.c:2096 keys on the '4').
             if (!ExternSeen("strtoll")) { externDecls.Add("strtoll"); H("declare i64 @strtoll(i8*, i8**, i32)"); }
+            string s = ParseStrGuard(at, a.op);
+            string endp = NT();
+            EA(endp, "i8*");
+            L("  store i8* null, i8** " + endp);
             string r = NT();
-            L("  " + r + " = call i64 @strtoll(i8* " + a.op + ", i8** null, i32 10)");
-            return r;
+            L("  " + r + " = call i64 @strtoll(i8* " + s + ", i8** " + endp + ", i32 10)");
+            string ep = NT();
+            L("  " + ep + " = load i8*, i8** " + endp);
+            string bad = ParseBadPred(s, ep);
+            if (!int64) {
+                string lo = NT();
+                L("  " + lo + " = icmp slt i64 " + r + ", -2147483648");
+                string hi = NT();
+                L("  " + hi + " = icmp sgt i64 " + r + ", 2147483647");
+                string ov = NT();
+                L("  " + ov + " = or i1 " + lo + ", " + hi);
+                string b2 = NT();
+                L("  " + b2 + " = or i1 " + bad + ", " + ov);
+                bad = b2;
+            }
+            EmitRuntimeCheckIf(at, bad,
+                "Convert.ToInt*: input is not a valid integer (or out of range)");
+            string safe = NT();
+            L("  " + safe + " = select i1 " + bad + ", i64 0, i64 " + r);
+            return safe;
         }
         if (IsDbl(a.ty)) {
             if (!ExternSeen("rint")) { externDecls.Add("rint"); H("declare double @rint(double)"); }
@@ -402,13 +429,36 @@ partial class Irgen {
     }
     // Convert.ToDouble: a string is parsed as text, an integer is converted
     // and a float is kept -- the C host does the same (irgen_call.c:1679).
-    string ConvertDoubleOperand(ExprVal a) {
+    string ConvertDoubleOperand(Node at, ExprVal a) {
         if (IsNullable(a.ty)) { return "0.0"; }
         if (IsStr(a.ty)) {
+            // A512: strtod with the same end-pointer predicate; strtod
+            // saturates to +-inf on overflow and C# double.Parse-style
+            // overflow is an error, so +-inf joins the bad predicate (the
+            // C host folds it through fabs == DBL_MAX*2, irgen_call.c).
             if (!ExternSeen("strtod")) { externDecls.Add("strtod"); H("declare double @strtod(i8*, i8**)"); }
+            string s = ParseStrGuard(at, a.op);
+            string endp = NT();
+            EA(endp, "i8*");
+            L("  store i8* null, i8** " + endp);
             string r = NT();
-            L("  " + r + " = call double @strtod(i8* " + a.op + ", i8** null)");
-            return r;
+            L("  " + r + " = call double @strtod(i8* " + s + ", i8** " + endp + ")");
+            string ep = NT();
+            L("  " + ep + " = load i8*, i8** " + endp);
+            string bad = ParseBadPred(s, ep);
+            string pinf = NT();
+            L("  " + pinf + " = fcmp oeq double " + r + ", 0x7FF0000000000000");
+            string ninf = NT();
+            L("  " + ninf + " = fcmp oeq double " + r + ", 0xFFF0000000000000");
+            string inf = NT();
+            L("  " + inf + " = or i1 " + pinf + ", " + ninf);
+            string b2 = NT();
+            L("  " + b2 + " = or i1 " + bad + ", " + inf);
+            EmitRuntimeCheckIf(at, b2,
+                "Convert.ToDouble: input is not a valid number");
+            string safe = NT();
+            L("  " + safe + " = select i1 " + b2 + ", double 0.0, double " + r);
+            return safe;
         }
         if (IsDbl(a.ty)) { return a.op; }
         if (ConvertIsIntegral(a)) {
@@ -3354,9 +3404,28 @@ partial class Irgen {
     // column but not the file (TASKS.md A508's "same-shape diagnostic" is the
     // message and the once-per-location behaviour, not the file name).
     void EmitSoftRuntimeError(Node at, string msg) {
+        EmitRuntimeCheckIf(at, "1", msg);
+    }
+
+    // The predicate form: the C host's emit_runtime_check takes the `bad`
+    // value and reports only when it is set (irgen_generics.c). Same-shape
+    // diagnostic, same once-per-text dedup, same exit 70 under
+    // --strict-runtime / ZAN_RT_HARD=1. The bad value must be computed
+    // BEFORE this call: everything it needs has to live in the block that
+    // dominates both the report and the skip path.
+    void EmitRuntimeCheckIf(Node at, string bad, string msg) {
+        // The C host's split-path report (irgen_generics.c emit_runtime_check
+        // -> emit_guard_report3 -> zan_rt_guard_fail3 -> zan_rt_soft_note3)
+        // appends a newline to the message and then another one when it
+        // prints, so a soft diagnostic is "file:line:col: ... msg" followed
+        // by a BLANK line; the hard path prints the single-newline form
+        // before exiting. The location is the expression the check came
+        // from -- for the parse family that is the ARGUMENT node (the
+        // string literal's own line:col).
         string text = "<unknown>:" + at.line + ":" + at.col
             + ": runtime error: " + msg + "\n";
-        string tp = RawCString(text);
+        string tsoft = RawCString(text + "\n");
+        string thard = RawCString(text);
         if (!ExternSeen("zan_rt_soft_is_hard")) {
             externDecls.Add("zan_rt_soft_is_hard");
             H("declare i32 @zan_rt_soft_is_hard()");
@@ -3366,19 +3435,59 @@ partial class Irgen {
             H("declare void @zan_rt_soft_note(i8*)");
         }
         if (!ExternSeen("exit")) { externDecls.Add("exit"); H("declare void @exit(i32)"); }
-        int lhard = NL(); int lsoft = NL(); int lend = NL();
+        int lcheck = NL(); int lskip = NL();
+        L("  br i1 " + bad + ", label %L" + lcheck + ", label %L" + lskip);
+        Label(lcheck);
+        int lhard = NL(); int lsoft = NL();
         string hd = NT();
         L("  " + hd + " = call i32 @zan_rt_soft_is_hard()");
         string hz = NT();
         L("  " + hz + " = icmp ne i32 " + hd + ", 0");
         L("  br i1 " + hz + ", label %L" + lhard + ", label %L" + lsoft);
         Label(lhard);
+        L("  call void @zan_rt_soft_note(i8* " + thard + ")");
         L("  call void @exit(i32 70)");
         L("  unreachable");
         Label(lsoft);
-        L("  call void @zan_rt_soft_note(i8* " + tp + ")");
-        L("  br label %L" + lend);
-        Label(lend);
+        L("  call void @zan_rt_soft_note(i8* " + tsoft + ")");
+        L("  br label %L" + lskip);
+        Label(lskip);
+    }
+
+    // The null-string guard in front of every parse (the C host's
+    // emit_parse_str_guard, irgen_call.c): strtoll/strtod on null is UB,
+    // so the null is reported once and replaced with the empty string.
+    string ParseStrGuard(Node at, string s) {
+        string isn = NT();
+        L("  " + isn + " = icmp eq i8* " + s + ", null");
+        string empty = RawCString("");
+        EmitRuntimeCheckIf(at, isn, "null string passed to a parse function");
+        string safe = NT();
+        L("  " + safe + " = select i1 " + isn + ", i8* " + empty + ", i8* " + s);
+        return safe;
+    }
+
+    // The parse-failure predicate of the C host (irgen_call.c
+    // emit_parse_bad_pred): strtoll/strtod leave the end pointer at the
+    // string start when nothing was consumed, and trailing garbage is any
+    // non-NUL byte where the scan stopped. A null end pointer folds to the
+    // empty string so the byte read stays in bounds.
+    string ParseBadPred(string s, string endp) {
+        string epn = NT();
+        L("  " + epn + " = icmp eq i8* " + endp + ", null");
+        string eps = NT();
+        L("  " + eps + " = select i1 " + epn + ", i8* " + RawCString("") + ", i8* " + endp);
+        string ch = NT();
+        L("  " + ch + " = load i8, i8* " + eps);
+        string tr = NT();
+        L("  " + tr + " = icmp ne i8 " + ch + ", 0");
+        string no = NT();
+        L("  " + no + " = icmp eq i8* " + endp + ", " + s);
+        string b1 = NT();
+        L("  " + b1 + " = or i1 " + epn + ", " + tr);
+        string bad = NT();
+        L("  " + bad + " = or i1 " + b1 + ", " + no);
+        return bad;
     }
 
     // ---- indexing (string char / list element / array) ----
@@ -5704,7 +5813,7 @@ partial class Irgen {
                         e.line, e.col);
                     return new ExprVal("0.0", MkType("double"));
                 }
-                return new ExprVal(ConvertDoubleOperand(a), MkType("double"));
+                return new ExprVal(ConvertDoubleOperand(e, a), MkType("double"));
             }
             if ((callee.sval == "ToInt32" || callee.sval == "ToInt" ||
                  callee.sval == "ToInt64") && e.kids.Count == 1) {
@@ -5723,7 +5832,7 @@ partial class Irgen {
                         e.line, e.col);
                     return new ExprVal("0", MkType(rt));
                 }
-                return new ExprVal(ConvertIntOperand(a), MkType(rt));
+                return new ExprVal(ConvertIntOperand(e, a, callee.sval == "ToInt64"), MkType(rt));
             }
         }
         // int/long.Parse(s), double/float.Parse(s) and matching
@@ -5744,13 +5853,63 @@ partial class Irgen {
                 ExprVal a = GenExpr(e.kids[0]);
                 string r = NT();
                 if (intRecv) {
+                    // A512: same end-pointer predicate as the C host
+                    // (irgen_call.c ~1821) -- failure, trailing garbage and
+                    // the int-range overflow all report through the soft
+                    // channel, then a safe 0. The host applies the INT32
+                    // bounds to the whole int/long/Int32/Int64 family (no
+                    // per-name key there), so long.Parse mirrors that too.
                     if (!ExternSeen("strtoll")) { externDecls.Add("strtoll"); H("declare i64 @strtoll(i8*, i8**, i32)"); }
-                    L("  " + r + " = call i64 @strtoll(i8* " + a.op + ", i8** null, i32 10)");
-                    return new ExprVal(r, MkType("int"));
+                    string s = ParseStrGuard(e, a.op);
+                    string endp = NT();
+                    EA(endp, "i8*");
+                    L("  store i8* null, i8** " + endp);
+                    L("  " + r + " = call i64 @strtoll(i8* " + s + ", i8** " + endp + ", i32 10)");
+                    string ep = NT();
+                    L("  " + ep + " = load i8*, i8** " + endp);
+                    string bad = ParseBadPred(s, ep);
+                    string lo = NT();
+                    L("  " + lo + " = icmp slt i64 " + r + ", -2147483648");
+                    string hi = NT();
+                    L("  " + hi + " = icmp sgt i64 " + r + ", 2147483647");
+                    string ov = NT();
+                    L("  " + ov + " = or i1 " + lo + ", " + hi);
+                    string b2 = NT();
+                    L("  " + b2 + " = or i1 " + bad + ", " + ov);
+                    EmitRuntimeCheckIf(e, b2,
+                        "int.Parse: input is not a valid integer (or out of range)");
+                    string safe = NT();
+                    L("  " + safe + " = select i1 " + b2 + ", i64 0, i64 " + r);
+                    return new ExprVal(safe, MkType("int"));
                 }
-                if (!ExternSeen("strtod")) { externDecls.Add("strtod"); H("declare double @strtod(i8*, i8**)"); }
-                L("  " + r + " = call double @strtod(i8* " + a.op + ", i8** null)");
-                return new ExprVal(r, MkType("double"));
+                // The C host parses through zan_rt_dbl_parse (strtod plus
+                // the C# NaN/Infinity literals, rt_timer.c) and reports
+                // failure, trailing garbage and the +-inf overflow.
+                if (!ExternSeen("zan_rt_dbl_parse")) {
+                    externDecls.Add("zan_rt_dbl_parse");
+                    H("declare double @zan_rt_dbl_parse(i8*, i8**)");
+                }
+                string dstr = ParseStrGuard(e, a.op);
+                string dendp = NT();
+                EA(dendp, "i8*");
+                L("  store i8* null, i8** " + dendp);
+                L("  " + r + " = call double @zan_rt_dbl_parse(i8* " + dstr + ", i8** " + dendp + ")");
+                string dep = NT();
+                L("  " + dep + " = load i8*, i8** " + dendp);
+                string dbad = ParseBadPred(dstr, dep);
+                string dpinf = NT();
+                L("  " + dpinf + " = fcmp oeq double " + r + ", 0x7FF0000000000000");
+                string dninf = NT();
+                L("  " + dninf + " = fcmp oeq double " + r + ", 0xFFF0000000000000");
+                string dinf = NT();
+                L("  " + dinf + " = or i1 " + dpinf + ", " + dninf);
+                string db2 = NT();
+                L("  " + db2 + " = or i1 " + dbad + ", " + dinf);
+                EmitRuntimeCheckIf(e, db2,
+                    "double.Parse: input is not a valid number (or out of range)");
+                string dsafe = NT();
+                L("  " + dsafe + " = select i1 " + db2 + ", double 0.0, double " + r);
+                return new ExprVal(dsafe, MkType("double"));
             }
             if ((intRecv || dblRecv) && callee.sval == "TryParse" && e.kids.Count == 2
                 && e.kids[1].kind == AK.OutArg()) {
