@@ -1,0 +1,553 @@
+using System;
+using System.Collections.Generic;
+using System.Data.Orm;
+using System.Json;
+using System.Web;
+using ZanWeb.Model;
+using ZanWeb.Model.Bitable;
+
+namespace ZanWeb.Api;
+
+/* 多维表格（bitable）JSON 接口：桌面端 /api/bitable/ 一族端点。
+   数据分三层：表（bitable_app）/ 列（bitable_field）/ 行（bitable_record）。
+   行不存列名，只存与列一一对应的 cells 字符串数组（JSON 数组文本）——
+   列是运行期才定的，按下标对齐就不必在加列/删列时迁移字段；
+   列序（sortOrder 升序、id 升序）就是 cells 的下标，读面铺网格与
+   删列摘元素共用这一个口径。
+   口径：
+     - 读写两侧同补 tenantId 闸（本部署单租户，取 Tenant.Cur()）；
+     - 读：本租户内人人可读；
+     - 写：表 shared=1 时租户内可写；shared=0 时仅拥有者（或超管）可写，
+       权限只按表判，不按行列细分（内部协作工具够用）；
+     - 行删除走软删（deletedAt），不抹行；
+     - 载荷里的标量一律字符串（客户端按字符串读），列数/行数等计数也是。 */
+[Route("api/bitable/[action]")]
+[Custom(Authorization = CustomAuthorization.ApiAuth)]
+[Description("多维表格")]
+public class BitableApi : ApiController {
+
+    /* 单次返回的行数上限：网格首屏够用；total 仍是真实行数，
+       超出部分由后续分页取（免得一张大表把应答撑爆）。 */
+    const int MaxRecords = 200;
+
+    /* cells 序列化后的长度上限：列宽 4096 的存储留一点余量，
+       超长直接拒（截断会让用户以为存进去了，其实没存全）。 */
+    const int MaxCells = 4000;
+
+    /* 表清单：本租户未归档的表，按 id 升序。
+       每行的列数/行数各查一次 count——表数量级小（十来个），
+       比把列/行全拉进内存数省。 */
+    [HttpGet]
+    [Custom(Perm = PermBit.View)]
+    [Description("多维表格清单")]
+    async void Apps() {
+        SysUser _me = await this.Me();
+        List<BitableApp> apps = await this.BitableApp
+            .Where(a => a.tenantId == Tenant.Cur() && a.archivedAt == 0)
+            .OrderBy(a => a.id).ToListAsync();
+        JsonValue items = JsonValue.NewArray();
+        for (int i = 0; i < apps.Count; i = i + 1) {
+            BitableApp app = apps[i];
+            int fields = await this.BitableField
+                .Where(a => a.tenantId == Tenant.Cur() && a.appId == app.id)
+                .CountAsync();
+            int records = await this.BitableRecord
+                .Where(a => a.tenantId == Tenant.Cur() && a.appId == app.id
+                    && a.deletedAt == 0).CountAsync();
+            JsonValue o = JsonValue.NewObject();
+            o.Put("id", JsonValue.NewStr(Convert.ToString(app.id)));
+            o.Put("name", JsonValue.NewStr(BitableApi.Text(app.name)));
+            o.Put("icon", JsonValue.NewStr(BitableApi.Text(app.icon)));
+            o.Put("description",
+                JsonValue.NewStr(BitableApi.Text(app.description)));
+            o.Put("fields", JsonValue.NewStr(Convert.ToString(fields)));
+            o.Put("records", JsonValue.NewStr(Convert.ToString(records)));
+            o.Put("updatedAt", JsonValue.NewStr(Convert.ToString(app.updatedAt)));
+            items.Append(o);
+        }
+        JsonValue body = JsonValue.NewObject();
+        body.Put("total", JsonValue.NewStr(Convert.ToString(apps.Count)));
+        body.Put("items", items);
+        this.Ok(body.ToJson());
+    }
+
+    /* 表详情：表本体 + 列定义 + 行。
+       行的 cells 与列一一对应：缺列补空串、多列截断——历史脏数据
+       （列被删过、cells 存坏）也不至于让整张网格错位。 */
+    [HttpGet]
+    [Custom(Perm = PermBit.View)]
+    [Description("多维表格详情")]
+    async void App() {
+        SysUser _me = await this.Me();
+        int id = this.InInt("id", 0);
+        BitableApp app = await this.AppOf(id);
+        if (app == null) { this.Fail(404, "表格不存在"); return; }
+        List<BitableField> fields = await this.FieldsOf(app.id);
+        List<BitableRecord> recs = await this.RecordsOf(app.id,
+            BitableApi.MaxRecords);
+        int total = await this.BitableRecord
+            .Where(a => a.tenantId == Tenant.Cur() && a.appId == app.id
+                && a.deletedAt == 0).CountAsync();
+        string owner = await this.OwnerName(app.ownerId);
+
+        JsonValue appJson = JsonValue.NewObject();
+        appJson.Put("id", JsonValue.NewStr(Convert.ToString(app.id)));
+        appJson.Put("name", JsonValue.NewStr(BitableApi.Text(app.name)));
+        appJson.Put("icon", JsonValue.NewStr(BitableApi.Text(app.icon)));
+        appJson.Put("description",
+            JsonValue.NewStr(BitableApi.Text(app.description)));
+        appJson.Put("owner", JsonValue.NewStr(owner));
+        appJson.Put("shared",
+            JsonValue.NewStr(app.shared == 1 ? "1" : "0"));
+        appJson.Put("updatedAt",
+            JsonValue.NewStr(Convert.ToString(app.updatedAt)));
+
+        JsonValue fieldJson = JsonValue.NewArray();
+        for (int i = 0; i < fields.Count; i = i + 1) {
+            BitableField f = fields[i];
+            JsonValue o = JsonValue.NewObject();
+            o.Put("id", JsonValue.NewStr(Convert.ToString(f.id)));
+            o.Put("name", JsonValue.NewStr(BitableApi.Text(f.name)));
+            o.Put("type", JsonValue.NewStr(BitableApi.Text(f.type)));
+            o.Put("options", JsonValue.NewStr(BitableApi.Text(f.options)));
+            o.Put("width", JsonValue.NewStr(Convert.ToString(f.width)));
+            fieldJson.Append(o);
+        }
+
+        JsonValue rowJson = JsonValue.NewArray();
+        for (int i = 0; i < recs.Count; i = i + 1) {
+            BitableRecord r = recs[i];
+            JsonValue o = JsonValue.NewObject();
+            o.Put("id", JsonValue.NewStr(Convert.ToString(r.id)));
+            o.Put("cells", BitableApi.CellsJson(r.cells, fields.Count));
+            rowJson.Append(o);
+        }
+        JsonValue recJson = JsonValue.NewObject();
+        recJson.Put("total", JsonValue.NewStr(Convert.ToString(total)));
+        recJson.Put("items", rowJson);
+
+        JsonValue body = JsonValue.NewObject();
+        body.Put("app", appJson);
+        body.Put("fields", fieldJson);
+        body.Put("records", recJson);
+        this.Ok(body.ToJson());
+    }
+
+    /* 新建表：连同三列默认列（名称/数量/日期）一次落库——
+       空表对用户没有意义，默认给一组能立刻用的列。 */
+    [HttpPost]
+    [Custom(Perm = PermBit.Update)]
+    [Description("新建多维表格")]
+    async void Create() {
+        SysUser me = await this.Me();
+        string name = this.Need("name", "表格名称");
+        string icon = this.In("icon");
+        if (icon.Length == 0) { icon = "table"; }
+        long now = WebApp.NowSeconds();
+        BitableApp app = new BitableApp();
+        app.tenantId = Tenant.Cur();
+        app.name = name;
+        app.icon = icon;
+        app.description = "";
+        app.ownerId = me.id;
+        /* 默认租户共享：多维表格是协作物，建表人之外的同事也要能填；
+           私有表（shared=0）由表的主人自己改（本期无改共享的端点，
+           需要时直接在数据侧调整）。 */
+        app.shared = 1;
+        app.createdAt = now;
+        app.updatedAt = now;
+        app.archivedAt = 0;
+        int id = await this.BitableApp.Insert(app).ExecuteIdentityAsync();
+        await this.AddField(id, "名称", "text", "", 160, 1);
+        await this.AddField(id, "数量", "number", "", 100, 2);
+        await this.AddField(id, "日期", "date", "", 140, 3);
+        JsonValue body = JsonValue.NewObject();
+        body.Put("id", JsonValue.NewStr(Convert.ToString(id)));
+        this.Ok(body.ToJson());
+    }
+
+    /* 改表名：与 GET app 同路径、不同动词，故动作另起一个名
+       （动作名就是 URL 段，一个动作只能带一个动词属性）。 */
+    [HttpPost]
+    [Route("/api/bitable/app")]
+    [Custom(Perm = PermBit.Update)]
+    [Description("重命名多维表格")]
+    async void AppRename() {
+        SysUser me = await this.Me();
+        int id = this.InInt("id", 0);
+        BitableApp app = await this.AppOf(id);
+        if (app == null) { this.Fail(404, "表格不存在"); return; }
+        if (!this.CanWrite(app, me)) {
+            this.Fail(403, "没有该表的写入权限");
+            return;
+        }
+        string name = this.Need("name", "表格名称");
+        int _n = await this.BitableApp.Update()
+            .Set(a => a.name, name)
+            .Set(a => a.updatedAt, WebApp.NowSeconds())
+            .Where(a => a.id == id && a.tenantId == Tenant.Cur())
+            .ExecuteAffrowsAsync();
+        JsonValue body = JsonValue.NewObject();
+        body.Put("ok", JsonValue.NewStr("1"));
+        this.Ok(body.ToJson());
+    }
+
+    /* 加一列：类型限白名单（网格只认这几种，非法类型直接拒，
+       免得存下客户端渲染不了的列）；sortOrder 取当前最大值 +1，
+       新列永远落在最后（列序即 cells 下标，中间插列会整体错位）。 */
+    [HttpPost]
+    [Custom(Perm = PermBit.Update)]
+    [Description("新增列")]
+    async void Fields() {
+        SysUser me = await this.Me();
+        int appId = this.InInt("appId", 0);
+        BitableApp app = await this.AppOf(appId);
+        if (app == null) { this.Fail(404, "表格不存在"); return; }
+        if (!this.CanWrite(app, me)) {
+            this.Fail(403, "没有该表的写入权限");
+            return;
+        }
+        string name = this.Need("name", "列名");
+        string type = this.In("type");
+        if (type.Length == 0) { type = "text"; }
+        if (!BitableApi.IsType(type)) {
+            this.Fail(400, "列类型不支持");
+            return;
+        }
+        string options = this.In("options");
+        int width = this.InInt("width", 160);
+        List<BitableField> fields = await this.FieldsOf(app.id);
+        int maxSort = 0;
+        for (int i = 0; i < fields.Count; i = i + 1) {
+            if (fields[i].sortOrder > maxSort) { maxSort = fields[i].sortOrder; }
+        }
+        int id = await this.AddField(app.id, name, type, options, width,
+            maxSort + 1);
+        await this.Touch(app.id);
+        JsonValue body = JsonValue.NewObject();
+        body.Put("id", JsonValue.NewStr(Convert.ToString(id)));
+        this.Ok(body.ToJson());
+    }
+
+    /* 删一列：列行直接删，同时把各行 cells 里对应下标的元素摘掉——
+       列的"位置"就是 cells 的下标，不摘的话整表的值会整体左移一格。
+       下标按列序（sortOrder 升序、id 升序）算，与读面同一口径。 */
+    [HttpPost]
+    [Custom(Perm = PermBit.Update)]
+    [Description("删除列")]
+    async void FieldDelete() {
+        SysUser me = await this.Me();
+        int id = this.InInt("id", 0);
+        BitableField field = await this.BitableField
+            .Where(a => a.id == id && a.tenantId == Tenant.Cur()).FirstAsync();
+        if (field == null) { this.Fail(404, "列不存在"); return; }
+        BitableApp app = await this.AppOf(field.appId);
+        if (app == null) { this.Fail(404, "表格不存在"); return; }
+        if (!this.CanWrite(app, me)) {
+            this.Fail(403, "没有该表的写入权限");
+            return;
+        }
+        List<BitableField> fields = await this.FieldsOf(app.id);
+        int index = -1;
+        for (int i = 0; i < fields.Count; i = i + 1) {
+            if (fields[i].id == field.id) { index = i; break; }
+        }
+        if (index < 0) { this.Fail(404, "列不存在"); return; }
+        List<BitableRecord> recs = await this.AllRecords(app.id);
+        for (int i = 0; i < recs.Count; i = i + 1) {
+            BitableRecord r = recs[i];
+            List<string> cells = BitableApi.ParseCells(r.cells);
+            if (index < cells.Count) { cells.RemoveAt(index); }
+            string text = BitableApi.JoinCells(cells);
+            int _u = await this.BitableRecord.Update()
+                .Set(a => a.cells, text)
+                .Set(a => a.updatedAt, WebApp.NowSeconds())
+                .Where(a => a.id == r.id && a.tenantId == Tenant.Cur())
+                .ExecuteAffrowsAsync();
+        }
+        int _d = await this.BitableField.Delete()
+            .Where(a => a.id == field.id && a.tenantId == Tenant.Cur())
+            .ExecuteAffrowsAsync();
+        await this.Touch(app.id);
+        JsonValue body = JsonValue.NewObject();
+        body.Put("ok", JsonValue.NewStr("1"));
+        this.Ok(body.ToJson());
+    }
+
+    /* 新增一行：cells 长度必须与列数一致（网格按下标对齐，
+       长度不齐的行写进去必然错位）；序列化后过长直接拒。 */
+    [HttpPost]
+    [Custom(Perm = PermBit.Update)]
+    [Description("新增行")]
+    async void Records() {
+        SysUser me = await this.Me();
+        int appId = this.InInt("appId", 0);
+        BitableApp app = await this.AppOf(appId);
+        if (app == null) { this.Fail(404, "表格不存在"); return; }
+        if (!this.CanWrite(app, me)) {
+            this.Fail(403, "没有该表的写入权限");
+            return;
+        }
+        List<BitableField> fields = await this.FieldsOf(app.id);
+        List<string> vals = BitableApi.ParseCells(this.In("cells"));
+        if (vals.Count != fields.Count) {
+            this.Fail(400, "列数不匹配");
+            return;
+        }
+        string text = BitableApi.JoinCells(vals);
+        if (text.Length > BitableApi.MaxCells) {
+            this.Fail(400, "内容过长");
+            return;
+        }
+        long now = WebApp.NowSeconds();
+        BitableRecord r = new BitableRecord();
+        r.tenantId = Tenant.Cur();
+        r.appId = app.id;
+        r.cells = text;
+        r.createdBy = me.id;
+        r.createdAt = now;
+        r.updatedAt = now;
+        r.deletedAt = 0;
+        int id = await this.BitableRecord.Insert(r).ExecuteIdentityAsync();
+        await this.Touch(app.id);
+        JsonValue body = JsonValue.NewObject();
+        body.Put("id", JsonValue.NewStr(Convert.ToString(id)));
+        this.Ok(body.ToJson());
+    }
+
+    /* 改一行：整行覆盖（网格回写的是整行，服务端不猜哪一格变了）。 */
+    [HttpPost]
+    [Custom(Perm = PermBit.Update)]
+    [Description("修改行")]
+    async void Record() {
+        SysUser me = await this.Me();
+        int id = this.InInt("id", 0);
+        BitableRecord r = await this.BitableRecord
+            .Where(a => a.id == id && a.tenantId == Tenant.Cur()
+                && a.deletedAt == 0).FirstAsync();
+        if (r == null) { this.Fail(404, "记录不存在"); return; }
+        BitableApp app = await this.AppOf(r.appId);
+        if (app == null) { this.Fail(404, "表格不存在"); return; }
+        if (!this.CanWrite(app, me)) {
+            this.Fail(403, "没有该表的写入权限");
+            return;
+        }
+        List<BitableField> fields = await this.FieldsOf(app.id);
+        List<string> vals = BitableApi.ParseCells(this.In("cells"));
+        if (vals.Count != fields.Count) {
+            this.Fail(400, "列数不匹配");
+            return;
+        }
+        string text = BitableApi.JoinCells(vals);
+        if (text.Length > BitableApi.MaxCells) {
+            this.Fail(400, "内容过长");
+            return;
+        }
+        int _u = await this.BitableRecord.Update()
+            .Set(a => a.cells, text)
+            .Set(a => a.updatedAt, WebApp.NowSeconds())
+            .Where(a => a.id == id && a.tenantId == Tenant.Cur())
+            .ExecuteAffrowsAsync();
+        await this.Touch(app.id);
+        JsonValue body = JsonValue.NewObject();
+        body.Put("ok", JsonValue.NewStr("1"));
+        this.Ok(body.ToJson());
+    }
+
+    /* 删一行：软删（deletedAt 打时间戳），不抹行——多维表格的行
+       可能被别处引用，抹了就查无对证；读面一律过滤 deletedAt > 0。 */
+    [HttpPost]
+    [Custom(Perm = PermBit.Update)]
+    [Description("删除行")]
+    async void Delete() {
+        SysUser me = await this.Me();
+        int id = this.InInt("id", 0);
+        BitableRecord r = await this.BitableRecord
+            .Where(a => a.id == id && a.tenantId == Tenant.Cur()
+                && a.deletedAt == 0).FirstAsync();
+        if (r == null) { this.Fail(404, "记录不存在"); return; }
+        BitableApp app = await this.AppOf(r.appId);
+        if (app == null) { this.Fail(404, "表格不存在"); return; }
+        if (!this.CanWrite(app, me)) {
+            this.Fail(403, "没有该表的写入权限");
+            return;
+        }
+        int _u = await this.BitableRecord.Update()
+            .Set(a => a.deletedAt, WebApp.NowSeconds())
+            .Where(a => a.id == id && a.tenantId == Tenant.Cur())
+            .ExecuteAffrowsAsync();
+        await this.Touch(app.id);
+        JsonValue body = JsonValue.NewObject();
+        body.Put("ok", JsonValue.NewStr("1"));
+        this.Ok(body.ToJson());
+    }
+
+    /* ---- helpers ---- */
+
+    /* 当前登录账号（ApiAuth 下 uid 必在；查不到即 401——token 版本
+       失效等）。与 NotifyApi.Me 同款（基类无此件，各 Api 自带）。 */
+    private async SysUser Me() {
+        SysUser me = await this.SysUser
+            .Where(a => a.id == Filter.ToInt(this.uid, 0)).FirstAsync();
+        if (me == null || me.status != 1) {
+            this.Fail(401, "1001", "账号不可用，请重新登录");
+        }
+        return me;
+    }
+
+    /* 表本体（本租户、未归档）。查无即 null——跨租户与不存在同答，
+       不泄露别的租户有没有这张表。 */
+    private async BitableApp AppOf(int id) {
+        if (id <= 0) { return null; }
+        BitableApp app = await this.BitableApp
+            .Where(a => a.id == id && a.tenantId == Tenant.Cur()
+                && a.archivedAt == 0).FirstAsync();
+        return app;
+    }
+
+    /* 列定义（按列序：sortOrder 升序、id 升序）。 */
+    private async List<BitableField> FieldsOf(int appId) {
+        List<BitableField> rows = await this.BitableField
+            .Where(a => a.tenantId == Tenant.Cur() && a.appId == appId)
+            .ToListAsync();
+        return BitableApi.SortFields(rows);
+    }
+
+    /* 行（未删除，按 id 升序，最多 limit 条）。 */
+    private async List<BitableRecord> RecordsOf(int appId, int limit) {
+        List<BitableRecord> rows = await this.BitableRecord
+            .Where(a => a.tenantId == Tenant.Cur() && a.appId == appId
+                && a.deletedAt == 0)
+            .OrderBy(a => a.id).Take(limit).ToListAsync();
+        return rows;
+    }
+
+    /* 行（未删除，按 id 升序，全取）——删列时要给每一行摘元素。 */
+    private async List<BitableRecord> AllRecords(int appId) {
+        List<BitableRecord> rows = await this.BitableRecord
+            .Where(a => a.tenantId == Tenant.Cur() && a.appId == appId
+                && a.deletedAt == 0)
+            .OrderBy(a => a.id).ToListAsync();
+        return rows;
+    }
+
+    /* 落一列（sortOrder 由调用方给定：新增列取当前最大值 +1）。 */
+    private async int AddField(int appId, string name, string type,
+            string options, int width, int sortOrder) {
+        BitableField f = new BitableField();
+        f.tenantId = Tenant.Cur();
+        f.appId = appId;
+        f.name = name;
+        f.type = type;
+        f.options = options;
+        f.sortOrder = sortOrder;
+        f.width = width;
+        f.createdAt = WebApp.NowSeconds();
+        return await this.BitableField.Insert(f).ExecuteIdentityAsync();
+    }
+
+    /* 顶一下表的更新时间（列/行改动都算表的改动）。 */
+    private async void Touch(int appId) {
+        int _u = await this.BitableApp.Update()
+            .Set(a => a.updatedAt, WebApp.NowSeconds())
+            .Where(a => a.id == appId && a.tenantId == Tenant.Cur())
+            .ExecuteAffrowsAsync();
+    }
+
+    /* 拥有者昵称（查不到用 "?"——详情页要显示归属，
+       但不该因一个失效账号让整张表打不开）。 */
+    private async string OwnerName(int ownerId) {
+        if (ownerId <= 0) { return "?"; }
+        SysUser owner = await this.SysUser
+            .Where(a => a.id == ownerId).FirstAsync();
+        if (owner == null) { return "?"; }
+        string nick = owner.nickname;
+        if (nick == null || nick.Length == 0) { return "?"; }
+        return nick;
+    }
+
+    /* 写权限：shared=1 租户内人人可写；shared=0 只有拥有者（或超管）
+       可写。行与列的写都经它——权限只按表判。 */
+    private bool CanWrite(BitableApp app, SysUser me) {
+        if (app == null || me == null) { return false; }
+        if (app.shared == 1) { return true; }
+        if (me.isSuper == 1) { return true; }
+        return app.ownerId == me.id;
+    }
+
+    /* 列序 = sortOrder 升序、id 升序。列的"位置"就是行 cells 的下标，
+       读面与删列面必须同一口径，故这里显式排序（复合序在内存里做，
+       列数少，插入排序足够）。 */
+    static List<BitableField> SortFields(List<BitableField> rows) {
+        List<BitableField> outp = new List<BitableField>();
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            BitableField cur = rows[i];
+            int at = outp.Count;
+            for (int j = 0; j < outp.Count; j = j + 1) {
+                BitableField prev = outp[j];
+                if (prev.sortOrder > cur.sortOrder ||
+                    (prev.sortOrder == cur.sortOrder && prev.id > cur.id)) {
+                    at = j;
+                    break;
+                }
+            }
+            outp.Insert(at, cur);
+        }
+        return outp;
+    }
+
+    /* cells 的 JSON 数组文本 → 字符串数组；非法/非数组一律当空数组
+       ——单元格是用户输入，坏数据不该让整张表打不开。 */
+    static List<string> ParseCells(string text) {
+        List<string> outp = new List<string>();
+        if (text == null || text.Length == 0) { return outp; }
+        JsonValue v = JsonValue.ParseLenient(text);
+        if (v == null || !v.IsArray()) { return outp; }
+        int n = v.Count();
+        for (int i = 0; i < n; i = i + 1) {
+            JsonValue e = v.At(i);
+            if (e == null) { outp.Add(""); continue; }
+            outp.Add(e.AsString(""));
+        }
+        return outp;
+    }
+
+    /* 字符串数组 → JSON 数组文本（存库用）。走 JsonValue 转义，
+       引号/反斜杠/换行不会毁掉整行。 */
+    static string JoinCells(List<string> cells) {
+        JsonValue arr = JsonValue.NewArray();
+        for (int i = 0; i < cells.Count; i = i + 1) {
+            string v = cells[i];
+            if (v == null) { v = ""; }
+            arr.Append(JsonValue.NewStr(v));
+        }
+        return arr.ToJson();
+    }
+
+    /* 行 cells → 客户端要的数组（长度 = 列数）：缺的补空串、
+       多的截断，保证与列一一对应。 */
+    static JsonValue CellsJson(string stored, int count) {
+        List<string> cells = BitableApi.ParseCells(stored);
+        JsonValue arr = JsonValue.NewArray();
+        for (int i = 0; i < count; i = i + 1) {
+            string v = "";
+            if (i < cells.Count) { v = cells[i]; }
+            arr.Append(JsonValue.NewStr(v));
+        }
+        return arr;
+    }
+
+    /* 列类型白名单（网格只认这几种）。 */
+    static bool IsType(string type) {
+        return type == "text" || type == "longtext" || type == "number" ||
+               type == "date" || type == "select" || type == "multi" ||
+               type == "checkbox" || type == "url";
+    }
+
+    /* 文本兜底：模型里的字符串列没赋值就是 null，直接塞进 JSON
+       会得到 null（客户端按字符串读）。 */
+    static string Text(string s) {
+        if (s == null) { return ""; }
+        return s;
+    }
+}

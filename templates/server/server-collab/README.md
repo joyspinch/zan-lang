@@ -440,6 +440,11 @@ every sign-in "wrong password").
   `taskapprove|taskreject` / `taskcancel`，事件时间线只追加），配额计数器 CAS（`oa_attach_usage`）；
   验证 `tools/e2e_collab.py`（契约 113 项）与 `tools/e2e_realtime.py`（生产配置
   实时 25 项）；AI 总结仍为提案，契约见下节「协作域契约」
+- `/api/bitable/*` — 多维表格域：**表 / 列 / 行**三层（`apps` / `app?id=` /
+  `create` / `app` / `fields` / `fielddelete` / `records` / `record` /
+  `delete`），契约见下节「多维表格域契约」
+- `/api/agent/*` — 智能体：`list`（清单与服务端就绪态）/ `chat`（转发模型，
+  密钥不出服务器）
 
 ## 协作域契约（会话/成员/消息/实时事件/附件/任务已落地，其余端点未实现）
 
@@ -551,6 +556,62 @@ WHERE id=? AND tenantId=? AND assigneeId=0 AND status='unassigned' AND version=?
 待办；客户端文件面板弃用假数据改真上传；电话/视频按钮在具备真实能力前隐藏
 或标注未启用；AI 默认只读、不自动 DDL / 改权限 / 改任务状态；
 `ZAN_NO_BG=1` 下的测试不算实时已验证。
+
+## 多维表格域契约（bitable）与智能体端点（agent）
+
+桌面客户端（gui-wechat）新增两块后端能力：**多维表格**（表 / 列 / 行三层
+的共享数据）与**智能体**（模型与密钥留在服务端，客户端只发问题收回答）。
+
+### 表结构（CodeFirst，缺表自动建）
+
+```text
+bitable_app     id, tenantId, name, icon, description, ownerId,
+                shared(0 私有|1 租户共享), createdAt, updatedAt, archivedAt
+bitable_field   id, tenantId, appId, name, type, options,
+                sortOrder, width, createdAt
+bitable_record  id, tenantId, appId, cells(JSON 数组文本), createdBy,
+                createdAt, updatedAt, deletedAt(0 = 未删)
+```
+
+- **三张表都带 tenantId 闸**：读写两侧同补 `tenantId == Tenant.Cur()`，
+  与管理端一致，防跨租户串数据。
+- **`cells` 是与列一一对应的字符串数组**（顺序 = `bitable_field.sortOrder`
+  升序）：客户端据此建动态列网格，不必再约定字段名；缺值的列补空串。
+- **列类型**：`text` / `longtext` / `number` / `date` / `select` / `multi` /
+  `checkbox` / `url`；`options` 存选项与格式的 JSON 文本。
+
+### 端点（Bearer 令牌，路由属性派生）
+
+| 端点 | 方法 | 说明 |
+|---|---|---|
+| `/api/bitable/apps` | GET | 表清单：`{total, items:[{id,name,icon,description,fields,records,updatedAt}]}` |
+| `/api/bitable/app?id=` | GET | 表详情：`{app:{...}, fields:[{id,name,type,options,width}], records:{total, items:[{id,cells[]}]}}`（记录上限 200 条） |
+| `/api/bitable/create` | POST | 建表（`name`、`icon`），并给三列默认列（文本 / 数量 / 日期） |
+| `/api/bitable/app` | POST | 改表名（`id`、`name`） |
+| `/api/bitable/fields` | POST | 加列（`appId`、`name`、`type`、`options`、`width`） |
+| `/api/bitable/fielddelete` | POST | 删列（`id`），并把各行 `cells` 里对应下标摘掉 |
+| `/api/bitable/records` | POST | 新增行（`appId`、`cells` JSON 数组），列数必须与表一致 |
+| `/api/bitable/record` | POST | 改行（`id`、`cells` JSON 数组） |
+| `/api/bitable/delete` | POST | 软删行（`id`），写 `deletedAt` |
+| `/api/agent/list` | GET | 智能体清单：`{ready, agents:[{code,name,hint,icon}]}` |
+| `/api/agent/chat` | POST | 对话（`agent`、`q`、`history` JSON 数组），回 `{text}` |
+
+### 权限口径
+
+- **读**：租户内登录用户都能读本租户的表。
+- **写**：`shared = 1`（租户共享）全员可写；`shared = 0`（私有）只有拥有者
+  与超管可写，其余答 403「没有该表的写入权限」。
+- **智能体端点不带管理权限**（不加 `Perm`）：桌面端用普通登录用户的令牌
+  调用；服务端未配置 AI 时 `/api/agent/list` 如实回 `ready=false`，
+  `/api/agent/chat` 答错，不静默返回空串。
+
+### 客户端对接
+
+- 客户端页 `templates/gui/gui-wechat/src/WxPageBitable.*`：左栏表清单，
+  右栏 `Gui.Component.DataTable.DataGrid<DataRow>`（动态列 + 单元格编辑
+  即时回写 `/api/bitable/record`）。
+- 客户端页 `templates/gui/gui-wechat/src/WxAgent.*`：左栏智能体清单，右栏
+  `ChatView` 气泡对话；历史按 `[{role,content}]` 回传（服务端最多留 20 轮）。
 
 ## 已知行为说明（T17 回归观察项，非缺陷）
 

@@ -1,0 +1,66 @@
+using System;
+using System.Collections.Generic;
+using System.Json;
+using System.Web;
+using ZanWeb.Ai;
+using ZanWeb.Model.Dev;
+
+namespace ZanWeb.Api;
+
+/* 智能体接口（桌面端 /api/agent/ 一族端点）：复用服务端已装的助手能力
+   （ZanWeb.Ai 包）。密钥只留在服务端的设置表里，客户端只拿到助手
+   清单与答复文本——模型厂商的 key 永不出服务器。
+   口径：
+     - GET list 永远 200：AI 服务没配好时 ready=false、助手清单照常给
+       （前端据此提示"去设置"，而不是把整页打成错误）；
+     - POST chat 把问题与历史转给助手，答复原样回传；
+     - 权限位照常标（list=View / chat=Update）：框架对**未标注 Perm 的受控
+       action 一律拒绝授权**（启动时打 "[rbac] N 个受控 action 未标注
+       Perm"），不标等于只有超级管理员用得着——桌面端拿的是普通账号的
+       Bearer 令牌，必须让管理员能在「系统管理 → 角色」里把这两个屏授权
+       出去；能不能用助手由"AI 服务是否已配置"决定，不由角色决定。 */
+[Route("api/agent/[action]")]
+[Custom(Authorization = CustomAuthorization.ApiAuth)]
+[Description("智能体")]
+public class AgentApi : ApiController {
+
+    /* 助手清单：能否对话（ready）与有哪些助手。助手定义在服务端包里
+       （Ai.Agents），客户端不另存一份——加了助手只改服务端。 */
+    [HttpGet]
+    [Custom(Perm = PermBit.View)]
+    [Description("助手清单")]
+    async void List() {
+        AiStateDoc doc = new AiStateDoc();
+        doc.ready = await Ai.Ready();
+        doc.agents = new List<AiAgentDoc>();
+        List<AiAgent> agents = Ai.Agents();
+        for (int i = 0; i < agents.Count; i = i + 1) {
+            AiAgent a = agents[i];
+            AiAgentDoc d = new AiAgentDoc();
+            d.code = a.code;
+            d.name = a.name;
+            d.hint = a.hint;
+            d.icon = a.icon;
+            d.apply = a.apply;
+            doc.agents.Add(d);
+        }
+        this.Ok(Json.Serialize<AiStateDoc>(doc));
+    }
+
+    /* 与助手对话：history 是客户端回发的会话上下文（JSON 数组文本），
+       空串按空历史处理；答复文本原样回传（引号与换行由 JSON 转义）。 */
+    [HttpPost]
+    [Custom(Perm = PermBit.Update)]
+    [Description("与助手对话")]
+    async void Chat() {
+        string question = this.Need("q", "问题");
+        string agent = this.In("agent");
+        string history = this.In("history");
+        if (history.Length == 0) { history = "[]"; }
+        AiReply r = await Ai.AskConv(agent, history, question);
+        if (!r.ok) { this.Fail(400, r.text); return; }
+        AiTextDoc doc = new AiTextDoc();
+        doc.text = r.text;
+        this.Ok(Json.Serialize<AiTextDoc>(doc));
+    }
+}
