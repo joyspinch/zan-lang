@@ -2066,6 +2066,20 @@ static zan_type_t *infer_expr_type_raw(zan_irgen_t *g, zan_ast_node_t *e,
                             return zan_binder_make_list_type(g->binder,
                                                              g->binder->type_string);
                     }
+                    /* A529：标量实例类型上的 native 静态成员（int.Parse 等）
+                     * 曾推断为 NULL——`int.Parse("9").ToString()` 断在
+                     * "could not be resolved"（var x = int.Parse(...) 与
+                     * 比较运算不吃 infer 才侥幸能用）。返回类型就是标量
+                     * 本身，与 irgen_call.c 的原生分派点同口径。 */
+                    if (bt && !bt->is_static &&
+                        zan_builtin_has_native_member(cls, cn,
+                            callee->member.name.str,
+                            (int)callee->member.name.len)) {
+                        if (strcmp(cls, "int") == 0) return g->binder->type_int;
+                        if (strcmp(cls, "long") == 0) return g->binder->type_long;
+                        if (strcmp(cls, "double") == 0) return g->binder->type_double;
+                        if (strcmp(cls, "float") == 0) return g->binder->type_float;
+                    }
                 }
             }
             /* static: Namespace */

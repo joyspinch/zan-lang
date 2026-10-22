@@ -1325,11 +1325,19 @@
 - 坑出处：结构体没有析构这件事，被类路径"对象析构顺带释放字段"盖住了——
   同一个形状换个载体就漏，测的时候必须把类与结构体分开测。
 
-### [ ] A529 内建静态调用结果上的链式成员解析失败（checker）
-- 实测：`Five().ToString()`（自定义静态方法）正常；`int.Parse("123").ToString()`、
-  `Convert.ToInt32("42").ToString()` 报 "this call could not be resolved to any
-  callable"——buitin/Parse 型调用的结果作为接收者再取成员时 checker 解析不了。
-- 根因落点：checker 的成员访问解析对「实参已是内建 lowering 的静态调用」没有
-  类型可挂（`int.Parse` 的返回类型在 checker 侧没有符号化），成员链断在第一步。
-  避开写法：先存局部变量再 `.ToString()`（迁移手册注记）。
+### [~] A529 内建静态调用结果上的链式成员解析失败（irgen 推断侧）
+- **宿主侧已修（2026-10-23）**：`int.Parse("123").ToString()` 曾报 "this call
+  could not be resolved to any callable"。根因在 irgen 的 `infer_expr_type_raw`
+  对 AST_CALL 的静态内建分支：标量类型（int/long/double/float）是实例内建，
+  `builtin_static_class_for` 只映射 string→String，标量上的 native 成员
+  （Parse，`native_members[]` 表）推断落空返 NULL——var 接收与比较运算不吃
+  infer 才侥幸能用，链上取成员就断。
+- 修法：推断分支补 native 成员判定（`zan_builtin_has_native_member`），
+  返回标量自身类型，与 irgen_call.c 的原生分派点同口径。
+- 实测复验：`int.Parse("123").ToString()`→123、`double.Parse("2.5")`→2.5、
+  `long.Parse("77")`→77；`Convert.ToInt32("42").ToString()` 本来就能跑
+  （42，Convert 是静态内建有成员表——本条登记时误写它也挂，更正）；
+  正例回归 p11/v_parse_ok 全绿。
+- 探针：`_scratch/csaudit/numeric/{v_chain2,v_chain5,v_chain6}.zan`。
+- 待办：自举半边（selfhost 推断侧同缺口对齐）。
 - 探针：`_scratch/csaudit/numeric/{v_chain,v_chain2}.zan`（隔离复验：前者过、后者挂）。
