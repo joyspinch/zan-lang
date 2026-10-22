@@ -1169,15 +1169,35 @@ static int method_args_score(zan_irgen_t *g, zan_symbol_t *m,
         if (a->kind == AST_NAMED_ARG) {
             continue;
         }
-        if (a->kind == AST_LAMBDA) {
+        /* lambda 实参（也包括三元表达式里的一支是 lambda 的形状）：lambda
+         * 没有自己的类型——类型由目标委托形参决定。所以打分只能按形参的
+         * 委托类型来，不能按实参自身的类型（推不出来）。
+         *
+         * 形参不是委托 → 判死（-1）。不判死的话这个候选与正确候选同分，
+         * 重载决议退化成「取成员表里第一个同名方法」：IDE 里
+         * `LspSession.StartAsync(app != null ? (Action a) => ... : null)`
+         * 就绑到了 App 那个重载上，无限自我递归，一开工程就 exit(1)。 */
+        zan_ast_node_t *lam = zan_ast_lambda_source(a);
+        if (lam) {
             zan_type_t *dp = method_param_type_at(g, m, j, call, recv_expr, locals);
-            if (!dp || dp->kind != TYPE_DELEGATE) continue;
-            if (a->lambda.params.count != dp->delegate_param_count) return -1;
-            zan_ast_node_t *body = a->lambda.body;
+            if (!dp) continue;                        /* 判不出来：宽容放过 */
+            if (dp->kind == TYPE_TYPE_PARAM || type_mentions_tp(dp)) continue;
+            if (dp->kind != TYPE_DELEGATE) return -1; /* lambda 只能转委托 */
+            if (lam->lambda.params.count != dp->delegate_param_count) return -1;
+            score += 2;
+            /* lambda 显式声明的形参类型与委托形参类型一致 → 更贴 */
+            for (int k = 0; k < lam->lambda.params.count; k++) {
+                zan_ast_node_t *lp = lam->lambda.params.items[k];
+                if (!lp || lp->kind != AST_PARAM || !lp->param.type) continue;
+                zan_type_t *lpt = zan_binder_resolve_type(g->binder, lp->param.type);
+                zan_type_t *dpt = dp->delegate_param_types[k];
+                if (lpt && dpt && types_concrete_equal(lpt, dpt)) score += 2;
+            }
+            zan_ast_node_t *body = lam->lambda.body;
             if (!body) continue;
             int mark = locals->count;
-            for (int k = 0; k < a->lambda.params.count; k++) {
-                zan_ast_node_t *lp = a->lambda.params.items[k];
+            for (int k = 0; k < lam->lambda.params.count; k++) {
+                zan_ast_node_t *lp = lam->lambda.params.items[k];
                 zan_type_t *lpt = lp->param.type
                     ? zan_binder_resolve_type(g->binder, lp->param.type)
                     : dp->delegate_param_types[k];

@@ -1729,6 +1729,34 @@ static zan_symbol_t *checker_find_method_typed(zan_checker_t *c,
                 if (param->param.is_params && pt && pt->kind == TYPE_ARRAY)
                     pt = pt->element_type;
                 zan_type_t *at = args[j];
+                /* lambda 实参：lambda 自己没有类型（类型由目标委托形参决定），
+                 * 所以这里不能拿 at 比——at 是 error，比不出结果，只能按
+                 * 「形参是不是委托 + 委托的形参个数对不对得上」判。
+                 *
+                 * 踩过的坑：这里早退（at 是 error）时，所有候选同分，
+                 * 重载决议就退化成「取成员表里第一个同名方法」。IDE 里
+                 * `StartAsync(app != null ? (Action a) => ... : null)`
+                 * 因此绑到了 App 那个重载上，无限自我递归。 */
+                zan_ast_node_t *lam = zan_ast_lambda_source(arg);
+                if (lam) {
+                    if (!pt || pt->kind == TYPE_ERROR) continue;
+                    if (pt->kind == TYPE_TYPE_PARAM) continue; /* T 可能是委托 */
+                    if (pt->kind != TYPE_DELEGATE) { compatible = false; break; }
+                    if (lam->lambda.params.count != pt->delegate_param_count) {
+                        compatible = false;
+                        break;
+                    }
+                    score += 4;
+                    /* lambda 显式声明的形参类型与委托形参类型一致 → 更贴 */
+                    for (int k = 0; k < lam->lambda.params.count; k++) {
+                        zan_ast_node_t *lp = lam->lambda.params.items[k];
+                        if (!lp || lp->kind != AST_PARAM || !lp->param.type) continue;
+                        zan_type_t *lpt = zan_binder_resolve_type(c->binder, lp->param.type);
+                        zan_type_t *dpt = pt->delegate_param_types[k];
+                        if (lpt && dpt && checker_type_equal(lpt, dpt)) score += 1;
+                    }
+                    continue;
+                }
                 if (!pt || !at || pt->kind == TYPE_ERROR ||
                     at->kind == TYPE_ERROR || pt->kind == TYPE_TYPE_PARAM ||
                     at->kind == TYPE_TYPE_PARAM) continue;

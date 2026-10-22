@@ -80,3 +80,40 @@ void zan_ast_list_push(zan_ast_list_t *list, zan_ast_node_t *node, zan_arena_t *
     }
     list->items[list->count++] = node;
 }
+
+/* 表达式是不是「lambda 或 null」的形状。 */
+static bool ast_expr_is_lambda_or_null(zan_ast_node_t *e) {
+    if (!e) return true;
+    switch (e->kind) {
+    case AST_LAMBDA:
+    case AST_NULL_LITERAL:
+        return true;
+    case AST_CAST_EXPR:
+        return ast_expr_is_lambda_or_null(e->cast.expr);
+    case AST_CONDITIONAL:
+        return ast_expr_is_lambda_or_null(e->conditional.then_expr) &&
+               ast_expr_is_lambda_or_null(e->conditional.else_expr);
+    default:
+        return false;
+    }
+}
+
+zan_ast_node_t *zan_ast_lambda_source(zan_ast_node_t *arg) {
+    if (!arg) return NULL;
+    switch (arg->kind) {
+    case AST_LAMBDA:
+        return arg;
+    case AST_CAST_EXPR: {
+        zan_ast_node_t *inner = zan_ast_lambda_source(arg->cast.expr);
+        return inner ? inner : NULL;
+    }
+    case AST_CONDITIONAL: {
+        if (!ast_expr_is_lambda_or_null(arg)) return NULL;
+        zan_ast_node_t *t = zan_ast_lambda_source(arg->conditional.then_expr);
+        if (t) return t;
+        return zan_ast_lambda_source(arg->conditional.else_expr);
+    }
+    default:
+        return NULL;
+    }
+}

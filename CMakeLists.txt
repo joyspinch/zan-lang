@@ -2552,6 +2552,13 @@ foreach(_src ${_conf_srcs})
     # nsresolve sees the cross-namespace collision it locks in.
     set(_extra_args
       "${CMAKE_SOURCE_DIR}/tests/conformance/helpers/ns_conflict_other_action.zan")
+  elseif(_name STREQUAL "overload_lambda_target")
+    # The target delegate overload lives in another file (partial class
+    # merged across files) while the call site declares the other overload
+    # itself -- the shape where a lambda argument used to tie every
+    # candidate and the resolution degraded to "first same-name method".
+    set(_extra_args
+      "${CMAKE_SOURCE_DIR}/tests/conformance/helpers/overload_lambda_target_other.zan")
   elseif(_name STREQUAL "file_embed_bytes")
     # The case reads its fixtures back through the embedded-resource API;
     # they are registered under "assets/..." via --embed.
@@ -3181,8 +3188,17 @@ if(SELFHOST_CLANG)
   # mingw vs MSVC). rt_co.c is deliberately absent: rt_io.c already provides
   # the coroutine scheduler, and the self-host emits its own copy as a weak
   # fallback (mirroring the host's zan_runtime_fallback).
+  # rt_hw_accel.c belongs here: the self-hosted compiler binary itself pulls in
+  # the stdlib's NativeMemory crypto declarations (Extern -> zan_hw_*), so
+  # gen2's IR references those symbols and the link needs them. Since
+  # ce1041cf9 the host links crypto as an *archive member* (libzancrypto.a)
+  # that the linker only pulls in on demand -- but that archive is built with
+  # the host's own toolchain (a different C runtime, e.g. mingw vs MSVC), so
+  # it cannot be reused for a link driven by SELFHOST_CLANG. The TU is
+  # therefore compiled again here, with the same clang as the rest of the
+  # bundle.
   set(_sh_rt_srcs rt_file.c rt_io.c rt_sched.c rt_timer.c rt_decimal.c
-                   rt_sync.c zan_embed_api.c)
+                   rt_sync.c zan_embed_api.c rt_hw_accel.c)
   set(_sh_rt_objs)
   foreach(_sh_src IN LISTS _sh_rt_srcs)
     get_filename_component(_sh_stem ${_sh_src} NAME_WE)

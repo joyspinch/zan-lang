@@ -528,6 +528,19 @@ bool zan_ast_has_attr(const zan_ast_node_t *decl, const char *name);
 void zan_ast_list_init(zan_ast_list_t *list);
 void zan_ast_list_push(zan_ast_list_t *list, zan_ast_node_t *node, zan_arena_t *arena);
 
+/* 实参里藏着的 lambda：裸 lambda，或三元表达式 / 强制转换里的一支是
+ * lambda。没有 lambda 返回 NULL。
+ *
+ * 为什么要有这个：lambda 没有自己的类型（类型由目标委托形参决定），
+ * 所以判「实参接不接得住形参」时必须先找到这个 lambda，再拿形参的
+ * 委托类型去比——拿实参自身的类型比是比不出来的（未知类型）。
+ *
+ * 踩过的坑：只认裸 lambda 的话，`f(cond ? (Action a) => ... : null)`
+ * 这种三元表达式就没人管，两个重载同分 → 谁在成员表里靠前谁赢。
+ * IDE 里 `LspSession.StartAsync(app != null ? (Action a) => ... : null)`
+ * 就这样绑到了 App 那个重载上，无限自我递归，一开工程就 exit(1)。 */
+zan_ast_node_t *zan_ast_lambda_source(zan_ast_node_t *arg);
+
 zan_method_ext_t *zan_ast_ensure_method_ext(zan_ast_node_t *n, zan_arena_t *arena);
 
 static inline zan_istr_t zan_ast_method_extern_lib(const zan_ast_node_t *n) {
