@@ -171,6 +171,13 @@ Type
     └── T?                 (nullable wrapper)
 ```
 
+**声明的语言差异（相对 C#，TASKS.md A524）**：`string` 是不可变 UTF-8
+字节串，索引与 `Length` 按 **UTF-8 字节**口径：`"中文".Length` 是 6
+（C# 2）、`"中文"[0]` 是首字节（C# '中'）。多字节字符的逐字符处理请走
+`Zan.Text` 的编解码 API（GBK/UTF-8 转换已就位）或按码点遍历；C# 的
+UTF-16 语义（char=码元）不在 Zan 口径内（Zan 的 char 是 8 字节码点，
+见 §2.5 类型表）。
+
 `nint` 是普通有符号整数类型（指针宽度），原生内存访问通过 `NativeMemory` / `[DllImport]` 完成，见 §7。`decimal` 有独立类型（`m` 后缀字面量、四则与比较运算，公开面在 `System.Decimal`；已知缺口见 TASKS.md A511——除法 scale、与 double 混算、打印路径）。
 
 ### 3.2 Type Inference

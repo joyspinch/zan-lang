@@ -191,7 +191,14 @@
 - 未捕获异常：exit=1（C# 0xE0434352）、消息打 **stdout** 且不含异常 Message（C# stderr+Message+栈）；`e.ToString()` 裸 Message；无 `Exception.StackTrace`（编译期拒绝）。
 - 探针：`_scratch/csaudit/{string/p08,numeric/p05,exceptions/,operators/p00}`。
 
-### [ ] A524 多字节字符串的索引与 Length 按 UTF-8 字节（SPEC 未声明口径）
+### [~] A524 多字节字符串的索引与 Length 按 UTF-8 字节（SPEC 未声明口径）
+- **宿主侧已补声明（2026-10-23，便宜件）**：SPEC §3.1 类型表下补"声明的
+  语言差异"——string 是不可变 UTF-8 字节串，索引/Length 按字节口径
+  （"中文".Length=6、"中文"[0]=首字节），逐字符处理走 Zan.Text 编解码
+  或按码点遍历；char=8 字节码点（§2.5）与 C# 的 UTF-16 码元口径互斥，
+  已明说。字节口径本身不改（改口径=C# 语义战线，见下）。
+- 待办：C# 口径需引入 UTF-16 语义或 per-codepoint API——独立战线；
+  自举半边。
 - `"中文"[0]` 返回首字节 0xE4（渲染 ä，C# '中'）；`"中文".Length`=6（C# 2）。char 为 8 字节码点 SPEC §2.5 已声明，字符串索引/Length 的字节口径 §3.1/§8 未写。
 - 迁移影响：按字符处理文本的 C# 代码（索引/Length/Split 边界）在非 ASCII 文本上全部偏移；GBK/UTF-8 编解码 API 已就位（Zan.Text）。
 - 方向：先补 SPEC 口径声明（廉价）；C# 口径需引入 UTF-16 语义或 per-codepoint API——独立战线。
