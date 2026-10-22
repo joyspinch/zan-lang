@@ -1678,10 +1678,11 @@ server-dev-standards；数据建模见 data-modeling；SQL 细则见 server-db-d
   "无头冒烟超时"。`Update` 在隐藏分支里照常调，计时/超时/收尾都放 `Update`；
   `Render` 只管画与抓帧。
 - **共享工作树里公共包被别人改到半坏时，别等也别抢改**：用上面「冻结床」
-  那套隔离法（把公共包解析根 `--package-project` 指向一棵干净的树）；只改
-  公共包解析根时更轻的变体是 `git worktree add --detach <路径> HEAD`
-  （包与 stdlib 都是 HEAD 的，事后 `git worktree remove` 收掉）。坑出处：并行
-  会话把某个 Gui 包文件改到引用了尚未声明的字段，整个树编译不过。
+  那套隔离法（把公共包解析根 `--package-project` 指向一棵**拷贝**出来的
+  干净树）；**不要拿 `git worktree` 副本当隔离树**——副本与主仓天然漂移，
+  公共包一改就落后（"公共包不要用 worktree 副本"那条同样适用：隔离靠拷贝，
+  不靠 worktree）。坑出处：并行会话把某个 Gui 包文件改到引用了尚未声明的
+  字段，整个树编译不过。
 - **音效别每个项目各写一遍加载与降级**：公共包 `Game.Foundation.SfxBank`
   （游戏基础包）已经把三件事收好了——按名加载（磁盘优先 + 内嵌兜底）、
   按事件播放并限频、**没有音频设备时整库静默失效**（无头 CI/无声卡不崩不卡）。
@@ -1695,10 +1696,11 @@ server-dev-standards；数据建模见 data-modeling；SQL 细则见 server-db-d
 - **抠 alpha 用边缘连通洪泛，不是全图阈值**：主体内部也有暗部，全图按亮度
   抠会把角色的暗面一起抠穿；从图边洪泛只吃掉背景连通区。
 - **跨树编译前先确认符号在目标树里存在**：公共包的改动没提交时，工作区
-  里能读到的 API 在干净 worktree 里可能还不存在（表现为"文档里有、编译说
-  没有"）。裁源矩形取景的稳妥写法是 `CDraw.BlitSource` 拿 key + 底层
-  `Canvas.BlitImage(key, dx, dy, dw, dh, sx, sy, sw, sh)` + `CDraw.MapX/MapY/MapW`
-  自己算坐标，不依赖包里的便捷函数。
+  里能读到的 API 在隔离树里可能还不存在（表现为"文档里有、编译说
+  没有"）。裁源矩形取景用包里的便捷函数 `CDraw.BlitImageSrc`——**目标
+  矩形走视口映射、源矩形按源图像素裁**，两组坐标单位不同，最容易搞错；
+  底层是 `Canvas.BlitImage(key, dx, dy, dw, dh, sx, sy, sw, sh)`（源矩形
+  在最后，`sw=0,sh=0` 是整幅）。别再各项目自己写一份 BlitSrc。
 - **宿主标题栏压在内容区之上**：GUI 壳的 chrome 画在内容区顶部，HUD 与
   按钮要避开顶部一条（按窗口高度比例，实测约 48px），否则点不到、
   截图上像"文字被切了"。
@@ -1725,8 +1727,11 @@ server-dev-standards；数据建模见 data-modeling；SQL 细则见 server-db-d
   三个坑：① `UseSkin` 要在默认皮肤（`UseSkin("dark")`）**之后**调用，否则
   被盖回去；② 真正生效的圆角令牌是 `--border-radius-*`（Theme 字段名
   `borderRadiusSmall`），`--radius-*` 只在皮肤自己的规则里有效，两组都写；
-  ③ skin.css 依赖公共包的 `base.css`（组件基线），要一起拷到 exe 同级
-  `skins/`——缺了整层组件基线就没了。
+  ③ **基线 `base.css` 不要手工拷**：编译器对引用 Gui 的程序自动把
+  `Gui/skins` 整目录烤进 exe（内嵌兜底），运行时加载是**磁盘优先、
+  内嵌兜底**。磁盘上再放一份 base.css 反而会盖住 exe 内嵌的新基线，
+  "内嵌兜底到底生效没有"就永远测不出来。必须落磁盘的是**游戏自己的
+  皮肤包**（`skins/<名>/skin.css`），它被内嵌过滤器排除在外。
 - **HUD 控件宿主要负责排版**：`HudLayer.Render` 只 `RenderTree` 不
   `Measure/Arrange` 时，"根填满窗口 + 内部居中"的浮层整层是空的
   （Esc 打开等于没打开）。这一层已在公共包 `HudLayer` 修好（渲染前按
