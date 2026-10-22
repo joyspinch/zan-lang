@@ -374,11 +374,13 @@ partial class Irgen {
         if (a.ty.sval == "bool") { return true; }
         return IsEnumTy(a.ty);
     }
-    // Convert.ToInt32 / ToInt / ToInt64: a string is parsed with strtoll, a
-    // float is truncated towards zero and an integer is kept -- exactly what
-    // the C host does (irgen_call.c:1937). Every other value answers 0 (the
-    // host's fallback branch). A nullable lowers to a struct on the host, so
-    // the value never reaches the parser there either.
+    // Convert.ToInt32 / ToInt / ToInt64: a string is parsed with strtoll and a
+    // float is rounded to even (rint) before the truncating conversion -- the
+    // C host does both (irgen_call.c; TASKS.md A513 turned the float path from
+    // truncate into banker's rounding, 3.9 converts to 4). An integer is kept.
+    // Every other value answers 0 (the host's fallback branch). A nullable
+    // lowers to a struct on the host, so the value never reaches the parser
+    // there either.
     string ConvertIntOperand(ExprVal a) {
         if (IsNullable(a.ty)) { return "0"; }
         if (IsStr(a.ty)) {
@@ -388,8 +390,11 @@ partial class Irgen {
             return r;
         }
         if (IsDbl(a.ty)) {
+            if (!ExternSeen("rint")) { externDecls.Add("rint"); H("declare double @rint(double)"); }
+            string rn = NT();
+            L("  " + rn + " = call double @rint(double " + a.op + ")");
             string r = NT();
-            L("  " + r + " = fptosi double " + a.op + " to i64");
+            L("  " + r + " = fptosi double " + rn + " to i64");
             return r;
         }
         if (ConvertIsIntegral(a)) { return a.op; }
@@ -2004,7 +2009,7 @@ partial class Irgen {
             }
             if (IsDictType(obj.ty)) {
                 string sv = StructElemSlot(v, DictVal(obj.ty));
-                L("  call void @zdict_set(i8* " + obj.op + ", i8* " + DictKeyOp(idx) + ", i64 " + sv + ")");
+                L("  call void @zdict_set(i8* " + obj.op + ", i8* " + DictKeyOp(idx, obj.ty) + ", i64 " + sv + ", i64 " + DictKeyStrFlag(obj.ty) + ")");
                 return;
             }
             if (IsSpanType(obj.ty)) {
@@ -2095,8 +2100,19 @@ partial class Irgen {
             }
             if (ArcManaged(v.ty)) { EmitArcRetain(v.op, v.ty); }
             // a float element carries single precision: the host stores an f32
-            if (IsFloatTy(elemTy) && v.ty != null && IsDbl(v.ty)) {
-                v = new ExprVal(F32Round(v.op), v.ty);
+            // A floating element carries its own precision: the host stores an f32
+            // for `float` and converts an integer into the slot -- the array path
+            // converts where the container path does not.
+            if (elemTy != null && elemTy.ival == 0
+                    && (elemTy.sval == "float" || elemTy.sval == "double")) {
+                if (v.ty != null && MapType(v.ty) == "i64") {
+                    string t = NT();
+                    L("  " + t + " = sitofp i64 " + v.op + " to double");
+                    v = new ExprVal(t, MkType("double"));
+                }
+                if (IsFloatTy(elemTy) && v.ty != null && IsDbl(v.ty)) {
+                    v = new ExprVal(F32Round(v.op), v.ty);
+                }
             }
             L("  store i64 " + ToI64(v.op, MapType(v.ty)) + ", i64* " + p);
             return;
@@ -2310,6 +2326,31 @@ partial class Irgen {
         string lt = MapType(elemTy);
         if (lt == "i64") { return v.op; }
         if (lt == "double") {
+            // A floating element slot holds the value's bits.  A floating value
+            // keeps its own bits; an INTEGER keeps the host's unconverted bit
+            // pattern -- the container path does not convert where the array path
+            // does, so `List<float>.Add(1)` reads back as the f32 whose bits are 1.
+            if (v.ty != null && MapType(v.ty) == "i64" && v.op != "null") {
+                if (IsFloatTy(elemTy)) {
+                    string ap = NT();
+                    L("  " + ap + " = alloca i64");
+                    L("  store i64 " + v.op + ", i64* " + ap);
+                    string fp = NT();
+                    L("  " + fp + " = bitcast i64* " + ap + " to float*");
+                    string fb = NT();
+                    L("  " + fb + " = load float, float* " + fp);
+                    string db = NT();
+                    L("  " + db + " = fpext float " + fb + " to double");
+                    string tb = NT();
+                    L("  " + tb + " = bitcast double " + db + " to i64");
+                    return tb;
+                }
+                string db2 = NT();
+                L("  " + db2 + " = bitcast i64 " + v.op + " to double");
+                string tb2 = NT();
+                L("  " + tb2 + " = bitcast double " + db2 + " to i64");
+                return tb2;
+            }
             string tb = NT();
             L("  " + tb + " = bitcast double " + v.op + " to i64");
             return tb;
@@ -3283,6 +3324,63 @@ partial class Irgen {
         return new ExprVal("0", MkType("int"));
     }
 
+    // A raw C-string constant for a compile-time message: the payload pointer
+    // the zan_rt_* helpers take (not a managed string).  The self-host has no
+    // per-node file name (one merged compilation unit), so runtime-error text
+    // prefixes the location with "<unknown>" -- the same placeholder the C
+    // runtime prints when its site file is unavailable.
+    string RawCString(string s) {
+        List<int> bytes = new List<int>();
+        int i = 0;
+        while (i < s.Length) { StrEsc.AddUtf8(bytes, (int)s[i]); i = i + 1; }
+        string txt = "";
+        i = 0;
+        while (i < bytes.Count) { txt = txt + "\\" + Hex2(bytes[i]); i = i + 1; }
+        txt = txt + "\\00";
+        int n = bytes.Count + 1;
+        strn = strn + 1;
+        string g = "@.r" + strn;
+        H(g + " = private unnamed_addr constant [" + n + " x i8] c\"" + txt + "\"");
+        string t = NT();
+        L("  " + t + " = getelementptr inbounds [" + n + " x i8], [" + n + " x i8]* " + g + ", i64 0, i64 0");
+        return t;
+    }
+
+    // The soft runtime-error channel, the self-host's mirror of the C host's
+    // emit_runtime_check (src/compiler/irgen_generics.c): one stderr line per
+    // distinct text (the runtime deduplicates) and, under --strict-runtime /
+    // ZAN_RT_HARD=1, exit 70.  The C host builds the "file:line:col: runtime
+    // error: msg" text at compile time; this backend knows the line and the
+    // column but not the file (TASKS.md A508's "same-shape diagnostic" is the
+    // message and the once-per-location behaviour, not the file name).
+    void EmitSoftRuntimeError(Node at, string msg) {
+        string text = "<unknown>:" + at.line + ":" + at.col
+            + ": runtime error: " + msg + "\n";
+        string tp = RawCString(text);
+        if (!ExternSeen("zan_rt_soft_is_hard")) {
+            externDecls.Add("zan_rt_soft_is_hard");
+            H("declare i32 @zan_rt_soft_is_hard()");
+        }
+        if (!ExternSeen("zan_rt_soft_note")) {
+            externDecls.Add("zan_rt_soft_note");
+            H("declare void @zan_rt_soft_note(i8*)");
+        }
+        if (!ExternSeen("exit")) { externDecls.Add("exit"); H("declare void @exit(i32)"); }
+        int lhard = NL(); int lsoft = NL(); int lend = NL();
+        string hd = NT();
+        L("  " + hd + " = call i32 @zan_rt_soft_is_hard()");
+        string hz = NT();
+        L("  " + hz + " = icmp ne i32 " + hd + ", 0");
+        L("  br i1 " + hz + ", label %L" + lhard + ", label %L" + lsoft);
+        Label(lhard);
+        L("  call void @exit(i32 70)");
+        L("  unreachable");
+        Label(lsoft);
+        L("  call void @zan_rt_soft_note(i8* " + tp + ")");
+        L("  br label %L" + lend);
+        Label(lend);
+    }
+
     // ---- indexing (string char / list element / array) ----
     ExprVal GenIndex(Node e) {
         ExprVal obj = GenExpr(e.a);
@@ -3337,7 +3435,22 @@ partial class Irgen {
         }
         if (IsDictType(obj.ty)) {
             string slot = NT();
-            L("  " + slot + " = call i64 @zdict_get(i8* " + obj.op + ", i8* " + DictKeyOp(idx) + ")");
+            L("  " + slot + " = call i64 @zdict_get(i8* " + obj.op + ", i8* " + DictKeyOp(idx, obj.ty) + ", i64 " + DictKeyStrFlag(obj.ty) + ")");
+            // A missing key is a runtime error, not a silent default: the C
+            // host reports "Dict key not found in indexer read" through the
+            // soft channel and hands back the zero value (TASKS.md A508).
+            // TryGetValue is the correct exit for a may-miss lookup and does
+            // not report; only the indexer read does.
+            string hit = NT();
+            L("  " + hit + " = call i64 @zdict_contains(i8* " + obj.op + ", i8* " + DictKeyOp(idx, obj.ty) + ", i64 " + DictKeyStrFlag(obj.ty) + ")");
+            string missv = NT();
+            L("  " + missv + " = icmp eq i64 " + hit + ", 0");
+            int lmiss = NL(); int ldone = NL();
+            L("  br i1 " + missv + ", label %L" + lmiss + ", label %L" + ldone);
+            Label(lmiss);
+            EmitSoftRuntimeError(e, "Dict key not found in indexer read");
+            L("  br label %L" + ldone);
+            Label(ldone);
             return FromSlot(slot, DictVal(obj.ty));
         }
         // A user class indexer: the parser desugars `this[int i]` into an
@@ -3555,7 +3668,7 @@ partial class Irgen {
                         ExprVal key = GenExpr(item.kids[0]);
                         ExprVal val = GenExpr(item.kids[1]);
                         string sv = StructElemSlot(val, DictVal(ty));
-                        L("  call void @zdict_set(i8* " + t + ", i8* " + DictKeyOp(key) + ", i64 " + sv + ")");
+                        L("  call void @zdict_set(i8* " + t + ", i8* " + DictKeyOp(key, ty) + ", i64 " + sv + ", i64 " + DictKeyStrFlag(ty) + ")");
                     }
                     j = j + 1;
                 }
@@ -3925,28 +4038,113 @@ partial class Irgen {
         return "eq";
     }
 
-    // conditional expression: cond ? a : b, lowered to branches + phi
+    // conditional expression: cond ? a : b, lowered to branches + phi.
+    //
+    // Each branch owns its own temporaries and releases them INSIDE the
+    // branch (the shape the null-coalescing operator above uses): the branch
+    // value is retained first, so the merged phi carries exactly one
+    // reference.  Releasing the branch temporaries after the merge would
+    // also release the slot of the branch that did NOT run -- that slot is
+    // still null, and releasing it corrupts the heap (the C host's
+    // emit_expr_conditional retains the non-owned branch inside the branch
+    // for the same reason).
+    // The static type of a conditional arm, decided BEFORE either arm is
+    // generated: the merged result type must be known while the then-block is
+    // still current (the then arm's coercion is emitted there and the block is
+    // never revisited), so the arms are typed from the AST -- the same
+    // pre-lowering inference the C host does (infer_expr_type, TASKS.md
+    // A514).  Null means "unknown"; the caller keeps the then arm's type then,
+    // which is exactly the old behaviour.
+    Node ArmStaticTy(Node e) {
+        if (e == null) { return null; }
+        int k = e.kind;
+        if (k == AK.IntLit()) { return MkType(e.IntLitTypeName()); }
+        if (k == AK.FloatLit()) {
+            if (e.suffix == 1) { return MkType("float"); }
+            if (e.suffix == 2) { return MkType("decimal"); }
+            return MkType("double");
+        }
+        if (k == AK.StringLit()) { return MkType("string"); }
+        if (k == AK.CharLit()) { return MkType("char"); }
+        if (k == AK.BoolLit()) { return MkType("bool"); }
+        if (k == AK.CastExpr() || k == AK.NewExpr()) { return e.type; }
+        if (k == AK.Ident()) {
+            int si = LocalIdx(e.sval);
+            if (si >= 0) { return locType[si]; }
+            Node tc = curClass != null && curClass != "" ? binder.FindType(curClass) : null;
+            if (tc != null) { return FieldType(tc, e.sval); }
+            return null;
+        }
+        if (k == AK.Conditional()) {
+            return MergeArmTypes(ArmStaticTy(e.b), ArmStaticTy(e.c));
+        }
+        return null;
+    }
+
+    // The merged conditional type: C#'s ?: takes the common promoted type of
+    // the two arms -- the host's irgen_promote_pair ladder (TASKS.md A514):
+    // decimal over every integer, double over float, float over every
+    // integer, ulong over long, long over int.  A decimal mixed with a
+    // float/double has no common type and unknown or non-numeric mixes keep
+    // the then arm -- the host's "return lt" fallback.
+    Node MergeArmTypes(Node a, Node b) {
+        if (a == null || b == null) { return a != null ? a : b; }
+        if (a.sval == b.sval && a.ival == b.ival) { return a; }
+        string an = a.sval; string bn = b.sval;
+        if (an == "decimal") { return (bn == "float" || bn == "double") ? a : MkType("decimal"); }
+        if (bn == "decimal") { return (an == "float" || an == "double") ? b : MkType("decimal"); }
+        if (an == "double" || bn == "double") { return MkType("double"); }
+        if (an == "float" || bn == "float") { return MkType("float"); }
+        if (an == "ulong" || bn == "ulong") { return MkType("ulong"); }
+        if (an == "long" || bn == "long") { return MkType("long"); }
+        return a;
+    }
+
     ExprVal GenConditional(Node e) {
         ExprVal c = GenExpr(e.a);
         string ci = NT();
         L("  " + ci + " = icmp ne i64 " + c.op + ", 0");
+        // The merged type is decided before the then arm is coerced.  It is
+        // adopted only when both carriers are plain numeric slots (i64 or
+        // double -- floats ride doubles here), because a decimal travels as a
+        // %Decimal* in this backend and coercing an integer into that phi
+        // would mint a garbage pointer; such mixes keep the then arm, which
+        // is what this backend did before the merge existed.
+        Node mty = MergeArmTypes(ArmStaticTy(e.b), ArmStaticTy(e.c));
         int lt = NL(); int lf = NL(); int lend = NL();
         L("  br i1 " + ci + ", label %L" + lt + ", label %L" + lf);
         Label(lt);
+        List<string> svT = stmtTemps; List<Node> svTT = stmtTempTypes;
+        stmtTemps = new List<string>(); stmtTempTypes = new List<Node>();
         ExprVal tv = GenExpr(e.b);
         Node rty = tv.ty;
+        if (mty != null && tv.ty != null && mty.sval != tv.ty.sval) {
+            string ml = MapType(mty); string tl = MapType(tv.ty);
+            if ((ml == "i64" || ml == "double") && (tl == "i64" || tl == "double")) {
+                rty = mty;
+            }
+        }
         string rll = MapType(rty);
         string tvo = Coerce(tv, rll);
+        EmitArcRetain(tvo, rty);
+        EmitTempReleases();
+        stmtTemps = svT; stmtTempTypes = svTT;
         string tlbl = curLbl;
         L("  br label %L" + lend);
         Label(lf);
+        List<string> svT2 = stmtTemps; List<Node> svTT2 = stmtTempTypes;
+        stmtTemps = new List<string>(); stmtTempTypes = new List<Node>();
         ExprVal fv = GenExpr(e.c);
         string fvo = Coerce(fv, rll);
+        EmitArcRetain(fvo, rty);
+        EmitTempReleases();
+        stmtTemps = svT2; stmtTempTypes = svTT2;
         string flbl = curLbl;
         L("  br label %L" + lend);
         Label(lend);
         string r = NT();
         L("  " + r + " = phi " + rll + " [ " + tvo + ", %" + tlbl + " ], [ " + fvo + ", %" + flbl + " ]");
+        AddTemp(r, rty);
         return new ExprVal(r, rty);
     }
 
@@ -5179,8 +5377,14 @@ partial class Irgen {
     // an integer, a float or a double is numeric, everything else -- a class
     // instance, an array, a delegate, a string (all of them pointers) -- is
     // not. The self-host only has the static type here, so the same set is
-    // reproduced by name: the integral types, the floating types, `char` and
-    // `bool` lower to numbers, a string lowers to a pointer.
+    // reproduced by name: the integral types, the floating types and `char`
+    // lower to numbers, a string lowers to a pointer.
+    //
+    // `bool` is NOT one of them: the host lowers it to i1 and takes i1 out of
+    // the numeric whitelist (TASKS.md A498), so `Math.Sqrt(true)` is refused
+    // there. C# agrees -- bool has no implicit conversion to double. The
+    // self-host used to answer 1.0, so the two backends disagreed on the same
+    // program.
     //
     // The self-host used to lower every argument with `sitofp i64 <ptr>`,
     // which is invalid IR ("'x' defined with type 'ptr' but expected 'i64'")
@@ -5194,7 +5398,8 @@ partial class Irgen {
         if (n == "" || n == "var") { return ""; }
         if (IsIntLike(ty)) { return ""; }            // every integer rides an i64
         if (n == "double" || n == "float") { return ""; }
-        if (n == "char" || n == "bool") { return ""; }
+        if (n == "char") { return ""; }
+        if (n == "bool") { return "bool"; }          // no implicit bool -> double
         if (n == "string") { return "string"; }      // a string is a pointer
         if (n == "object") { return "object"; }      // `object` is a pointer
         if (n == "decimal") { return "decimal"; }    // the host lowers it to a struct
@@ -5598,16 +5803,19 @@ partial class Irgen {
                 return new ExprVal(okz, MkType("bool"));
             }
         }
-        // Math.Round(x[, digits]) -> libm round; digits scale by 10^d
+        // Math.Round(x[, digits]) -> libm rint: C# rounds to even (banker's)
+        // and the host lowers it to rint for the same reason (TASKS.md A513);
+        // libc round is away-from-zero and turned 2.5 into 3. The digits form
+        // scales by 10^d, rints and divides back.
         if (callee.kind == AK.MemberAccess() && callee.a != null && callee.a.kind == AK.Ident()
             && callee.a.sval == "Math" && LocalIdx("Math") < 0 && binder.FindType("Math") == null
             && callee.sval == "Round" && e.kids.Count >= 1 && e.kids.Count <= 2) {
-            if (!ExternSeen("round")) { externDecls.Add("round"); H("declare double @round(double)"); }
+            if (!ExternSeen("rint")) { externDecls.Add("rint"); H("declare double @rint(double)"); }
             ExprVal a = GenExpr(e.kids[0]);
             string av = ToDbl(a, "Round", e);
             if (e.kids.Count == 1) {
                 string r = NT();
-                L("  " + r + " = call double @round(double " + av + ")");
+                L("  " + r + " = call double @rint(double " + av + ")");
                 return new ExprVal(r, MkType("double"));
             }
             if (!ExternSeen("pow")) { externDecls.Add("pow"); H("declare double @pow(double, double)"); }
@@ -5618,7 +5826,7 @@ partial class Irgen {
             string sd = NT();
             L("  " + sd + " = fmul double " + av + ", " + sc);
             string rr = NT();
-            L("  " + rr + " = call double @round(double " + sd + ")");
+            L("  " + rr + " = call double @rint(double " + sd + ")");
             string res = NT();
             L("  " + res + " = fdiv double " + rr + ", " + sc);
             return new ExprVal(res, MkType("double"));
@@ -7777,10 +7985,49 @@ partial class Irgen {
         return acc;
     }
 
-    // dict keys are stored as C strings; scalar keys use their decimal image
-    string DictKeyOp(ExprVal k) {
-        if (IsStr(k.ty)) { return k.op; }
-        return ToCStr(k);
+    // The declared key type of a dictionary (null when it is not known).
+    Node DictKeyTy(Node dictTy) {
+        if (dictTy != null && dictTy.kids.Count > 0) { return dictTy.kids[0]; }
+        return null;
+    }
+
+    // The dictionary's key kind, taken from the DECLARED key type: the C host
+    // compares string keys ordinally and every other key by identity
+    // (src/compiler/irgen_expr.c:3391 -- is_str is 1 only for a string key).
+    // A non-string key is an opaque 64-bit token, so `Dictionary<int,V>.Keys`
+    // hands back the int keys instead of their decimal image.
+    bool DictKeyIsStr(Node dictTy) {
+        Node kt = DictKeyTy(dictTy);
+        if (kt == null) { return true; }
+        return kt.sval == "string" && kt.ival == 0;
+    }
+
+    // The `is_str` flag the dict runtime calls take.
+    string DictKeyStrFlag(Node dictTy) {
+        if (DictKeyIsStr(dictTy)) { return "1"; }
+        return "0";
+    }
+
+    // The key operand of a dict call: a string key is the C string itself; any
+    // other key is an opaque token -- an integer key is its value narrowed to
+    // the key type's width, a reference key is its address.  The SLOT width
+    // decides: an erased type parameter (Dictionary<TKey,V>) rides an i64
+    // slot too, so the token conversion must not be limited to the named
+    // integer types.
+    string DictKeyOp(ExprVal k, Node dictTy) {
+        if (DictKeyIsStr(dictTy)) {
+            if (IsStr(k.ty)) { return k.op; }
+            return ToCStr(k);
+        }
+        if (k.ty != null && MapType(k.ty) == "i64") {
+            int w = HostIntWidth(k.ty);
+            string v = k.op;
+            if (w > 0 && w < 64) { v = WrapArith(v, w, IntUnsigned(k.ty)); }
+            string t = NT();
+            L("  " + t + " = inttoptr i64 " + v + " to i8*");
+            return t;
+        }
+        return k.op;
     }
 
     ExprVal EmitDictMethod(ExprVal recv, string name, Node e) {
@@ -7788,19 +8035,19 @@ partial class Irgen {
             ExprVal key = GenExpr(e.kids[0]);
             ExprVal val = GenExpr(e.kids[1]);
             string sv = StructElemSlot(val, DictVal(recv.ty));
-            L("  call void @zdict_set(i8* " + recv.op + ", i8* " + DictKeyOp(key) + ", i64 " + sv + ")");
+            L("  call void @zdict_set(i8* " + recv.op + ", i8* " + DictKeyOp(key, recv.ty) + ", i64 " + sv + ", i64 " + DictKeyStrFlag(recv.ty) + ")");
             return new ExprVal("0", MkType("void"));
         }
         if (name == "ContainsKey") {
             ExprVal key = GenExpr(e.kids[0]);
             string t = NT();
-            L("  " + t + " = call i64 @zdict_contains(i8* " + recv.op + ", i8* " + DictKeyOp(key) + ")");
+            L("  " + t + " = call i64 @zdict_contains(i8* " + recv.op + ", i8* " + DictKeyOp(key, recv.ty) + ", i64 " + DictKeyStrFlag(recv.ty) + ")");
             return new ExprVal(t, MkType("bool"));
         }
         if (name == "Remove") {
             ExprVal key = GenExpr(e.kids[0]);
             string t = NT();
-            L("  " + t + " = call i64 @zdict_remove(i8* " + recv.op + ", i8* " + DictKeyOp(key) + ")");
+            L("  " + t + " = call i64 @zdict_remove(i8* " + recv.op + ", i8* " + DictKeyOp(key, recv.ty) + ", i64 " + DictKeyStrFlag(recv.ty) + ")");
             return new ExprVal(t, MkType("bool"));
         }
         if (name == "get_Count" || name == "Count") {
@@ -7819,14 +8066,14 @@ partial class Irgen {
                 return new ExprVal("0", MkType("bool"));
             }
             ExprVal key = GenExpr(e.kids[0]);
-            string kstr = DictKeyOp(key);
+            string kstr = DictKeyOp(key, recv.ty);
             Node vty = DictVal(recv.ty);
             string kidx = NT();
-            L("  " + kidx + " = call i64 @zdict_index(i8* " + recv.op + ", i8* " + kstr + ")");
+            L("  " + kidx + " = call i64 @zdict_index(i8* " + recv.op + ", i8* " + kstr + ", i64 " + DictKeyStrFlag(recv.ty) + ")");
             string hit = NT();
             L("  " + hit + " = icmp sge i64 " + kidx + ", 0");
             string slot = NT();
-            L("  " + slot + " = call i64 @zdict_get(i8* " + recv.op + ", i8* " + kstr + ")");
+            L("  " + slot + " = call i64 @zdict_get(i8* " + recv.op + ", i8* " + kstr + ", i64 " + DictKeyStrFlag(recv.ty) + ")");
             ExprVal val = FromSlot(slot, vty);
             int lhit = NL(); int lmiss = NL(); int ldone = NL();
             L("  br i1 " + hit + ", label %L" + lhit + ", label %L" + lmiss);

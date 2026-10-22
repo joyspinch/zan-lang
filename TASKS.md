@@ -9,6 +9,13 @@
 > 2026-10-23 全仓 C# 语义复审（八域 96+ 探针实测，探针在 `_scratch/csaudit/`）：
 > 新登记 A507–A526；A482 更正（宿主同病）。各域"实测确认正确面"见探针文件与提交正文。
 >
+> 2026-10-23 平账（自举半边收口）：移出 4 条两侧已闭环条目（A508/A513/A514/A515）。
+> A508 自举侧走 `zan_rt_soft_note` 软诊断通道（`<unknown>:行:列`——自举无按节点文件名；
+> 硬模式 exit 70 同宿主）；A513 `Math.Round`/`Convert.ToInt*` 改 `rint`（IR 与 ngen 双路径），
+> 差分门 `convert_int_semantics` 翻绿；A514 自举 irgen 侧 `ArmStaticTy`+`MergeArmTypes`
+> 按宿主 `irgen_promote_pair` 同阶梯合一定型（仅数值载体 i64/double 采用，decimal 混合维持
+> then 臂）；A515 自举 `??` 降级本就右支惰性（探针复核 `empty9/x/1` 两侧一致）。
+>
 > 2026-10-22 平账：移出 48 条已闭账条目（A390/A393/A394/A395/A396/A397/A399/
 > A400/A401/A402/A403/A404/A405/A406/A407/A413/A415/A416/A428/A431/A432/A437/
 > A441/A442/A445/A447/A448/A449/A463/A473/A474/A475/A476/A477/A478/A479/A480/
@@ -44,15 +51,6 @@
 - 方向：先给"越界写、null 方法调用"这两条响亮失败；最终口径应对齐 C#（全部可 catch）。
 - 探针：`_scratch/csaudit/{collections/{p03,p09},exceptions/{p08,p09,p10},numeric/p02,string/p06}`。
 - 关联：A508（Dict 缺 key 连 soft error 都没有）、A526（TOOLING.md 文档失真）。
-
-### [~] A508 Dict 缺 key 读完全静默返回默认值（连 soft error 都没有）
-- **宿主侧已修（2026-10-23）**：`irgen_expr.c` Dict 索引读取 miss 改走 `emit_runtime_check`
-  软诊断（"Dict key not found in indexer read"，stderr 一次 + 安全零值 + 继续，
-  `--strict-runtime` 下 exit 70）。探针 `p06_dict_missing.zan` 复验通过。
-- 待办：自举半边（`src/selfhost/irgen_expr.zan` 在途窗口过了之后对齐同款诊断）。
-- 现象：`d["missing"]` 返回 0，无 stderr、无 zan_crash.log、exit=0。C# 抛 KeyNotFoundException。越界读尚有一行 runtime error，这条连一行都没有。
-- 根因落点：`src/compiler/irgen_expr.c` ~7571-7596（Dict 索引读取 miss 直接走零值路径）。TryGetValue/ContainsKey 是正确出口。
-- 探针：`_scratch/csaudit/collections/p06_dict_missing.zan`、`exceptions/p11_dictmiss.zan`。
 
 ### [~] A509 失败下转静默类型混淆（无 InvalidCastException）
 - **宿主侧已修最小语义（2026-10-23）**：`emit_expr_cast_expr` 引用→引用且静态
@@ -103,39 +101,6 @@
 - `int.TryParse` 存在且正常——失败语义应与它对齐或补异常通道。
 - 根因落点：同 A507（runtime 无异常通道，Convert/Parse 失败分支返 0）。
 - 探针：`_scratch/csaudit/numeric/p11_convert_fail.zan`。
-
-### [~] A513 舍入语义偏离：Math.Round 远离零、Convert.ToInt32(double) 截断
-- **宿主侧已修（2026-10-23）**：`Math.Round` 1/2 参改 `rint`（银行家，2.5→2、0.5→0、
-  2.345→2.35）；`Convert.ToInt32/64(double)` 先 `rint` 再 FPToSI（3.9→4）；
-  `Decimal.ToInt64/ToInt32`（`rt_decimal.c`）改一次取商余的银行家舍入（2.9m→3、
-  2.5m→2、-2.5m→-2）。探针复验通过。
-- 待办：自举半边（stdlib `Decimal.zan` 两后端共用、天然对齐；`rint` 特判的自举侧
-  待 `src/selfhost/irgen_expr.zan` 窗口）。
-- `Math.Round(2.5)`=3、`Round(-2.5)`=-3、`Round(0.5)`=1（C# 银行家：2/-2/0）；无 MidpointRounding 重载。`Convert.ToInt32(3.9)`=3（C# 舍入=4）；`Decimal.ToInt64(2.9m)`=2（C# 3）。Floor/Ceiling 正确。
-- 根因落点：`irgen_call.c` Math/Convert 分支舍入模式（C 运行时 away-from-zero）；stdlib `System/Decimal.zan` ToInt64。
-- 探针：`_scratch/csaudit/numeric/{p09,p12}`。
-
-### [~] A514 三元类型合并两侧各选一遍：checker 有提升阶梯、irgen 按 then 臂定型
-- **宿主侧已修（2026-10-23）**：两层同修——`expr_family`（AST_CONDITIONAL）改两臂
-  数值提升合并（float/double/decimal 赢整数，与 checker 阶梯同口径；奇异混合维持
-  then 臂旧行为）；`infer_expr_type`（AST_CONDITIONAL）新增 `irgen_promote_pair`
-  按 checker promote_numeric 同阶梯合一定型。`(t?1:2.0)/2`=0.5、`(t?1:2L)/2`、
-  右结合、臂惰性全部复验通过。
-- 待办：自举半边（`src/selfhost/irgen_expr.zan` 在途窗口）。
-- 现象：`(t?1:2.0)/2`→**0**（整数除法截断）、`(t?1:2L)/2`→0；double 在前才对；赋值语境靠隐式转换掩盖（`double v=(t?1:2.0); v/2`=0.5）。C# 公共类型=double。
-- 根因：checker 的 `merge_conditional_types`（checker.c:1212-1214）有数值提升阶梯，但 irgen 的 `expr_family`（irgen_expr_core.c:1076-1080）对 AST_CONDITIONAL **先取 then 臂 family**，未共用同一份合并——与重载分解同病（skill §10）。
-- 探针：`_scratch/csaudit/operators/p07_ternary.zan`。
-
-### [~] A515 ?? 的右支总是求值（短路缺失）
-- **宿主侧已修（2026-10-23）**：新增 `emit_null_coalesce`（cond_br + phi，skill 二.2
-  口径）——右支只在左支为 null 时求值；只覆盖三种干净形态（指针同型、双可空聚合、
-  可空左+裸负载同型），形态覆盖不了在**发码前**回退旧急切路径（绝不发码中途放弃，
-  避免悬空块/二次求值）。探针 `p08_nullish.zan`：`nn ?? Side()` 后 calls=0 复验通过。
-- 待办：自举半边（`src/selfhost/irgen_expr.zan` 在途窗口）。
-- `nn ?? Side()`：返回值对但 Side() 被调用（C# 非 null 时 calls=0）。日志/计数/惰性初始化全受影响。
-- 根因：`irgen_expr.c:4320-4329`（可空路径）与 :4132（主路径）两臂无条件求值后 `LLVMBuildSelect`——skill 二.2 明令禁止的形态（带副作用的死臂）。
-- 方向：cond-br + phi 合流。
-- 探针：`_scratch/csaudit/operators/p08_nullish.zan`。
 
 ### [~] A516 构造顺序与 C# 分叉：基类构造先于派生字段初始化器
 - **宿主侧已修（2026-10-23）**：构造器 prologue（irgen_emit.c）把本类字段初始化器
