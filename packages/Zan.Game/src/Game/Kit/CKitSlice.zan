@@ -1,0 +1,154 @@
+using System;
+using System.IO;
+using Gui;
+
+namespace Game.Kit;
+
+// 九宫格切图（3×3 边框图拼到任意大小的目标矩形）。
+//
+// 为什么要进包：这一件事曾经被 8 个游戏项目各写了一份，签名漂成 8 种——
+// 有的收内存键、有的收路径，参数顺序、切角语义、目标过窄时怎么退化各不
+// 一样（9 个项目、约 170 处调用点）。同一件事修一次 bug 要改 8 处。
+// 通用绘制机制不该由游戏实现层各写一遍：游戏只说"我要一张九宫格底板"。
+//
+// 统一语义（各项目原实现的共同部分 + 差异处的取舍）：
+//   - border 是**源图像素**的切角边长。角切片内的所有细节（圆弧、铆钉、
+//     描边）都必须落在角切片里，否则被拉伸就会变形。
+//   - targetScale：源切角与目标切角的比值。素材按 N 倍烘的底板传 N
+//     （目标切角 = border / N）；1:1 的传 1（默认）。
+//   - 目标矩形比两个切角还窄 → **退化成整幅拉伸**（不切了）。宁可拉伸，
+//     也不要画出 0 宽/负宽的块——原来的实现在这条边界上行为不一。
+//   - 坐标是**逻辑坐标**，经 CDraw 视口映射；源矩形按**源图像素**裁，不映射。
+//     两组坐标单位不同，是这类原语最容易错的地方。
+//   - 中间与四边是**整块拉伸**（底板中间是纯色/渐变，拉伸不变形；放噪声
+//     会被拉成条纹，所以中间必须平滑）。
+public class CKitSlice {
+    // 目标切角边长（纯函数）：源切角 border 像素、素材按 targetScale 倍烘的
+    // 底板，目标切角就是 border / targetScale（1:1 的传 1）。
+    // 单独拆出来是为了能被 conformance 逐值钉住——目标切角算错时，角部在
+    // 缩放+插值下会糊成一片，从像素反推很费劲。
+    public static int TargetCorner(int border, int targetScale) {
+        if (border < 1) { return 0; }
+        int sc = targetScale;
+        if (sc < 1) { sc = 1; }
+        int dc = border / sc;
+        if (dc < 1) { dc = 1; }
+        return dc;
+    }
+
+    // 已取到内存键的版本（同一张图反复切时省掉一次 BlitSource）。
+    // 7 参重载 = 素材 1:1 烘的（目标切角 = 源切角），是最常见的那种；
+    // 带 targetScale 的重载给"素材按 N 倍烘"的底板用。
+    public static void NineSliceKey(Canvas c, string key, int x, int y, int w, int h,
+                                    int border) {
+        CKitSlice.NineSliceKey(c, key, x, y, w, h, border, 1);
+    }
+
+    public static void NineSliceKey(Canvas c, string key, int x, int y, int w, int h,
+                                    int border, int targetScale) {
+        if (c == null || key == null || key == "") { return; }
+        if (w <= 0 || h <= 0) { return; }
+        int iw = Canvas.ImageWidth(key);
+        int ih = Canvas.ImageHeight(key);
+        if (iw <= 0 || ih <= 0) { return; }
+        int b = border;
+        if (b > iw / 2) { b = iw / 2; }
+        if (b > ih / 2) { b = ih / 2; }
+        if (b < 1) { return; }
+        int sc = targetScale;
+        if (sc < 1) { sc = 1; }
+        int dc = CKitSlice.TargetCorner(b, sc);  // 目标切角边长
+        // 目标比两个切角还窄 → 整幅拉伸退化。
+        // 注意**不能**把 dc 再夹到 w/2：夹完 w < dc*2 恒不成立，退化分支
+        // 就成了死代码，于是这种窄目标会画出 0 宽/负宽的块。
+        if (w < dc * 2 || h < dc * 2) {
+            CDraw.BlitImageSrcKey(c, key, x, y, w, h, 0, 0, 0, 0);
+            return;
+        }
+        int midW = iw - b * 2;                 // 源图中间列/行宽
+        int midH = ih - b * 2;
+        int dw = w - dc * 2;                   // 目标中间列/行宽
+        int dh = h - dc * 2;
+        if (midW < 1 || midH < 1 || dw < 1 || dh < 1) { return; }
+        // 四角：原样贴，不拉伸。
+        CDraw.BlitImageSrcKey(c, key, x, y, dc, dc, 0, 0, b, b);
+        CDraw.BlitImageSrcKey(c, key, x + w - dc, y, dc, dc, iw - b, 0, b, b);
+        CDraw.BlitImageSrcKey(c, key, x, y + h - dc, dc, dc, 0, ih - b, b, b);
+        CDraw.BlitImageSrcKey(c, key, x + w - dc, y + h - dc, dc, dc,
+                           iw - b, ih - b, b, b);
+        // 四边：横边横拉、竖边竖拉。
+        CDraw.BlitImageSrcKey(c, key, x + dc, y, dw, dc, b, 0, midW, b);
+        CDraw.BlitImageSrcKey(c, key, x + dc, y + h - dc, dw, dc, b, ih - b, midW, b);
+        CDraw.BlitImageSrcKey(c, key, x, y + dc, dc, dh, 0, b, b, midH);
+        CDraw.BlitImageSrcKey(c, key, x + w - dc, y + dc, dc, dh, iw - b, b, b, midH);
+        // 中间：整块拉伸。
+        CDraw.BlitImageSrcKey(c, key, x + dc, y + dc, dw, dh, b, b, midW, midH);
+    }
+
+    // 按路径切图（盘优先、内嵌兜底）。
+    public static void NineSlice(Canvas c, string path, int x, int y, int w, int h,
+                                  int border) {
+        CKitSlice.NineSlice(c, path, x, y, w, h, border, 1);
+    }
+
+    public static void NineSlice(Canvas c, string path, int x, int y, int w, int h,
+                                  int border, int targetScale) {
+        if (c == null || path == null || path == "") { return; }
+        // 素材缺失就跳过：模板被拷到新项目后素材不一定在原位，游戏不该崩。
+        // （File.Exists 带内嵌兜底，所以内嵌资源不会被误判成缺失。）
+        if (!File.Exists(path)) { return; }
+        string key = CDraw.BlitSource(c, path);
+        if (key == null) { return; }
+        CKitSlice.NineSliceKey(c, key, x, y, w, h, border, targetScale);
+    }
+
+    // 从精灵表的某一帧里切一块出来拼（sw/sh=0 表示整幅）。
+    public static void NineSliceSrc(Canvas c, string path, int x, int y, int w, int h,
+                                    int sx, int sy, int sw, int sh,
+                                    int border) {
+        CKitSlice.NineSliceSrc(c, path, x, y, w, h, sx, sy, sw, sh, border, 1);
+    }
+
+    public static void NineSliceSrc(Canvas c, string path, int x, int y, int w, int h,
+                                    int sx, int sy, int sw, int sh,
+                                    int border, int targetScale) {
+        if (c == null || path == null || path == "") { return; }
+        if (!File.Exists(path)) { return; }
+        string key = CDraw.BlitSource(c, path);
+        if (key == null) { return; }
+        int iw = Canvas.ImageWidth(key);
+        int ih = Canvas.ImageHeight(key);
+        if (iw <= 0 || ih <= 0) { return; }
+        if (sw <= 0) { sw = iw; }
+        if (sh <= 0) { sh = ih; }
+        int b = border;
+        if (b > sw / 2) { b = sw / 2; }
+        if (b > sh / 2) { b = sh / 2; }
+        if (b < 1) { return; }
+        int sc = targetScale;
+        if (sc < 1) { sc = 1; }
+        int dc = CKitSlice.TargetCorner(b, sc);
+        if (w < dc * 2 || h < dc * 2) {
+            CDraw.BlitImageSrcKey(c, key, x, y, w, h, sx, sy, sw, sh);
+            return;
+        }
+        int midW = sw - b * 2;
+        int midH = sh - b * 2;
+        int dw = w - dc * 2;
+        int dh = h - dc * 2;
+        if (midW < 1 || midH < 1 || dw < 1 || dh < 1) { return; }
+        // 四角：原样贴。
+        CDraw.BlitImageSrcKey(c, key, x, y, dc, dc, sx, sy, b, b);
+        CDraw.BlitImageSrcKey(c, key, x + w - dc, y, dc, dc, sx + sw - b, sy, b, b);
+        CDraw.BlitImageSrcKey(c, key, x, y + h - dc, dc, dc, sx, sy + sh - b, b, b);
+        CDraw.BlitImageSrcKey(c, key, x + w - dc, y + h - dc, dc, dc,
+                           sx + sw - b, sy + sh - b, b, b);
+        // 四边：横边横拉、竖边竖拉。
+        CDraw.BlitImageSrcKey(c, key, x + dc, y, dw, dc, sx + b, sy, midW, b);
+        CDraw.BlitImageSrcKey(c, key, x + dc, y + h - dc, dw, dc, sx + b, sy + sh - b, midW, b);
+        CDraw.BlitImageSrcKey(c, key, x, y + dc, dc, dh, sx, sy + b, b, midH);
+        CDraw.BlitImageSrcKey(c, key, x + w - dc, y + dc, dc, dh, sx + sw - b, sy + b, b, midH);
+        // 中间：整块拉伸。
+        CDraw.BlitImageSrcKey(c, key, x + dc, y + dc, dw, dh, sx + b, sy + b, midW, midH);
+    }
+}

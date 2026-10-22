@@ -1,0 +1,215 @@
+using System;
+using Gui;
+using Game.Kit;
+
+// Game.Kit.CText 的契约：画布文字（档位族 + 像素族）。
+//
+// 为什么要进包：8 个游戏项目各写了一份一模一样的 DrawText 包装（连量宽都
+// 要自己把设备像素换算回逻辑像素），描边更是一人一套——1 设备像素的、1
+// 逻辑像素的、随字号加粗的，同一件事 6 份实现。现在统一到 CText。
+//
+// 判据分两段：
+//   1. 纯函数逐值钉：OutlineOffset 的档位→偏移映射；WidthPx 在 1:1 视口下
+//      等于 Canvas.MeasureText；空串/空串指针都返回 0。
+//   2. 像素钉：正文与描边两种画法的墨迹范围关系——**描边必须四向都比正文
+//      宽**（这正是"描边"的可观测定义）；同一串字换个锚点，墨迹必须整体
+//      平移同样的距离（左对齐/居中都靠这条钉住）。
+//      缩放视口不在这条用例里（画布缩放带插值，边缘像素会混色）。
+class Program {
+    static int fails;
+    static int bg;      // 背景的 RGB（比较用）
+    static int bgFill;  // 带 alpha 的填充色（alpha=0 的 FillRect 等于没清）
+
+    static void Eq(string what, int got, int want) {
+        if (got == want) { return; }
+        fails = fails + 1;
+        Console.WriteLine("FAIL " + what + ": got " + Convert.ToString(got)
+            + " want " + Convert.ToString(want));
+    }
+
+    static void Ok(bool cond, string what) {
+        if (cond) { return; }
+        fails = fails + 1;
+        Console.WriteLine("FAIL " + what);
+    }
+
+    // 不是背景色的像素的最左位置（没有则 -1）。
+    static int Leftmost(Canvas c, int w, int h) {
+        for (int x = 0; x < w; x = x + 1) {
+            for (int y = 0; y < h; y = y + 1) {
+                if ((c.GetPixel(x, y) & 0x00FFFFFF) != bg) { return x; }
+            }
+        }
+        return -1;
+    }
+
+    // 不是背景色的像素的最右位置（没有则 -1）。
+    static int Rightmost(Canvas c, int w, int h) {
+        for (int x = w - 1; x >= 0; x = x - 1) {
+            for (int y = 0; y < h; y = y + 1) {
+                if ((c.GetPixel(x, y) & 0x00FFFFFF) != bg) { return x; }
+            }
+        }
+        return -1;
+    }
+
+    static int Topmost(Canvas c, int w, int h) {
+        for (int y = 0; y < h; y = y + 1) {
+            for (int x = 0; x < w; x = x + 1) {
+                if ((c.GetPixel(x, y) & 0x00FFFFFF) != bg) { return y; }
+            }
+        }
+        return -1;
+    }
+
+    static int Bottommost(Canvas c, int w, int h) {
+        for (int y = h - 1; y >= 0; y = y - 1) {
+            for (int x = 0; x < w; x = x + 1) {
+                if ((c.GetPixel(x, y) & 0x00FFFFFF) != bg) { return y; }
+            }
+        }
+        return -1;
+    }
+
+    // 画布上等于该颜色的像素数。
+    static int CountColor(Canvas c, int color, int w, int h) {
+        int n = 0;
+        int want = color & 0x00FFFFFF;
+        for (int y = 0; y < h; y = y + 1) {
+            for (int x = 0; x < w; x = x + 1) {
+                if ((c.GetPixel(x, y) & 0x00FFFFFF) == want) { n = n + 1; }
+            }
+        }
+        return n;
+    }
+
+    static void Main() {
+        fails = 0;
+        bg = 0x101010;
+        bgFill = 0xFF101010;
+
+        // ---- 1. 纯函数：描边偏移随档位加粗 ----
+        // 偏移 = 1 + scale/2（逻辑像素）：档位 0→1、2→2、4→3、8→5。
+        Eq("outline offset 0", CText.OutlineOffset(0), 1);
+        Eq("outline offset 1", CText.OutlineOffset(1), 1);
+        Eq("outline offset 2", CText.OutlineOffset(2), 2);
+        Eq("outline offset 4", CText.OutlineOffset(4), 3);
+        Eq("outline offset 8", CText.OutlineOffset(8), 5);
+        Eq("outline offset negative", CText.OutlineOffset(-3), 1);
+
+        // ---- 2. 纯函数：量宽（1:1 视口下逻辑宽 = 设备宽）----
+        Eq("width empty", CText.WidthPx("", 16), 0);
+        Eq("width null", CText.WidthPx(null, 16), 0);
+        Eq("width matches measure",
+           CText.WidthPx("Hg", 16), Canvas.MeasureText("Hg", 16));
+
+        App app = new App("ctext-draw", 64, 64);
+        app.BeginFrame();
+        Canvas c = app.canvas;
+        if (c == null || c.Width() <= 0 || c.Height() <= 0) {
+            // 没有可用表面（无显示环境）：按 harness 的 SKIP 约定退出。
+            Console.WriteLine("SKIP: no GUI surface in this session");
+            return;
+        }
+        if (Canvas.MeasureText("Hg", 16) <= 0) {
+            // 没有可用系统字体：文字画不出来，像素判据无从谈起。
+            Console.WriteLine("SKIP: no system font in this session");
+            return;
+        }
+
+        int w = 64;
+        int h = 64;
+        int white = 0xFFFFFF;
+        int red = 0xFF0000;
+
+        // ---- 3. 正文：锚点平移距离必须精确相等 ----
+        c.FillRect(0, 0, w, h, bgFill);
+        CText.DrawPx(c, "Hg", 8, 20, 16, white);
+        int l1 = Leftmost(c, w, h);
+        int r1 = Rightmost(c, w, h);
+        int t1 = Topmost(c, w, h);
+        int b1 = Bottommost(c, w, h);
+        Ok(l1 >= 0, "body drawn");
+        Ok(CountColor(c, white, w, h) > 0, "body has body color pixels");
+
+        c.FillRect(0, 0, w, h, bgFill);
+        CText.DrawPx(c, "Hg", 32, 20, 16, white);
+        int l2 = Leftmost(c, w, h);
+        Ok(l2 >= 0, "body drawn at second anchor");
+        // 锚点右移 24px，墨迹必须整体右移 24px（不是"差不多"）。
+        Eq("body shifts with anchor", l2 - l1, 24);
+
+        // ---- 4. 描边：四向都比正文宽 ----
+        c.FillRect(0, 0, w, h, bgFill);
+        CText.DrawOutlinedPx(c, "Hg", 8, 20, 16, white, red);
+        int l3 = Leftmost(c, w, h);
+        int r3 = Rightmost(c, w, h);
+        int t3 = Topmost(c, w, h);
+        int b3 = Bottommost(c, w, h);
+        Ok(l3 >= 0, "outlined drawn");
+        Ok(CountColor(c, red, w, h) > 0, "outline has outline color pixels");
+        Ok(CountColor(c, white, w, h) > 0, "outlined has body color pixels");
+        // 描边比正文**四向都宽**——这就是"描边"的可观测定义。
+        Ok(l3 < l1, "outline extends left");
+        Ok(r3 > r1, "outline extends right");
+        Ok(t3 < t1, "outline extends top");
+        Ok(b3 > b1, "outline extends bottom");
+
+        // ---- 5. 居中：换个中心线，墨迹平移同样的距离 ----
+        c.FillRect(0, 0, w, h, bgFill);
+        CText.DrawCenteredPx(c, "Hg", 16, 20, 16, white);
+        int cl1 = Leftmost(c, w, h);
+        c.FillRect(0, 0, w, h, bgFill);
+        CText.DrawCenteredPx(c, "Hg", 40, 20, 16, white);
+        int cl2 = Leftmost(c, w, h);
+        Ok(cl1 >= 0 && cl2 >= 0, "centered drawn");
+        Eq("centered shifts with center", cl2 - cl1, 24);
+
+        // 居中描边同理。
+        c.FillRect(0, 0, w, h, bgFill);
+        CText.DrawCenteredOutlinedPx(c, "Hg", 16, 20, 16, white, red);
+        int co1 = Leftmost(c, w, h);
+        c.FillRect(0, 0, w, h, bgFill);
+        CText.DrawCenteredOutlinedPx(c, "Hg", 40, 20, 16, white, red);
+        int co2 = Leftmost(c, w, h);
+        Ok(co1 >= 0 && co2 >= 0, "centered outlined drawn");
+        Eq("centered outlined shifts", co2 - co1, 24);
+
+        // ---- 6. 阴影：正文与暗色副本都在 ----
+        c.FillRect(0, 0, w, h, bgFill);
+        CText.DrawShadowPx(c, "Hg", 8, 20, 16, white, 0x000000);
+        Ok(CountColor(c, white, w, h) > 0, "shadow has body color pixels");
+        Ok(CountColor(c, 0x000000, w, h) > 0, "shadow has shadow color pixels");
+
+        // ---- 7. 档位族：描边同样四向更宽 ----
+        c.FillRect(0, 0, w, h, bgFill);
+        CText.Draw(c, "Hg", 8, 20, 2, 255, 255, 255, 255);
+        int sl1 = Leftmost(c, w, h);
+        int sr1 = Rightmost(c, w, h);
+        int st1 = Topmost(c, w, h);
+        int sb1 = Bottommost(c, w, h);
+        Ok(sl1 >= 0, "scale body drawn");
+
+        c.FillRect(0, 0, w, h, bgFill);
+        CText.DrawOutlined(c, "Hg", 8, 20, 2, 255, 255, 255, 255,
+                          255, 0, 0, 255);
+        int sl2 = Leftmost(c, w, h);
+        int sr2 = Rightmost(c, w, h);
+        int st2 = Topmost(c, w, h);
+        int sb2 = Bottommost(c, w, h);
+        Ok(sl2 >= 0, "scale outlined drawn");
+        Ok(CountColor(c, 0xFF0000, w, h) > 0, "scale outline has outline pixels");
+        Ok(sl2 < sl1, "scale outline extends left");
+        Ok(sr2 > sr1, "scale outline extends right");
+        Ok(st2 < st1, "scale outline extends top");
+        Ok(sb2 > sb1, "scale outline extends bottom");
+
+        // 档位族居中描边。
+        c.FillRect(0, 0, w, h, bgFill);
+        CText.DrawCenteredOutlined(c, "Hg", 32, 20, 2, 255, 255, 255, 255,
+                                   255, 0, 0, 255);
+        Ok(Leftmost(c, w, h) >= 0, "scale centered outlined drawn");
+
+        if (fails == 0) { Console.WriteLine("ctext-draw-ok"); }
+    }
+}

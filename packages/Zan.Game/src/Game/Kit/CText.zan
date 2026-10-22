@@ -4,8 +4,24 @@ using Gui;
 
 namespace Game.Kit;
 
-// 系统字体文字（画布版 DrawText 使用系统
-// 字体，scale 沿用 Kit 的"字号档"语义：PxOf = scale*9 像素）。
+// 画布文字（系统字体）。
+//
+// **两套字号约定并存，靠名字区分**：
+//
+//   - 档位（无后缀）：size 是 scale 档位，实际字号 = scale*9 逻辑像素。
+//     Draw / DrawCentered / DrawShadow / DrawCenteredShadow /
+//     DrawOutlined / DrawCenteredOutlined。模板与 goldminer、breakout、
+//     gomoku 走这套。
+//
+//   - 像素（Px 后缀）：sizePx 直接是逻辑像素字号，颜色是打包 ARGB。
+//     档位表达不出 13/15/22/54 这类字号，于是 8 个游戏项目各写了一份
+//     DrawText 包装（MjPaint.Text / CardPaint.Text / HackerPaint.Text …），
+//     描边、阴影、量宽也各写一遍——同一件事 6 份实现，描边偏移还各不相同
+//     （有 1 设备像素的、有 1 逻辑像素的、有随字号加粗的）。现在统一到
+//     这里，游戏实现层不再自己落笔。
+//
+// 坐标一律是**逻辑坐标**（经 CDraw 视口映射），字号是逻辑像素；
+// 描边偏移也是逻辑像素（经 MapW 落到设备像素，至少 1px——缩到最小也得看得见）。
 public class CText {
     // Kit scale 档 → 画布字号（对齐 SysFont.PxOf，HUD 版式不用重调）。
     // FontPx 保持逻辑单位（排版用它）；落笔时经视口缩放成设备字号，
@@ -25,7 +41,7 @@ public class CText {
     }
 
     // 左上角锚定（y 是行盒顶，不是基线）——与 Text.Draw 契约一致。
-    // 其余 CText 入口（居中/阴影）全部经此落笔，原点只加这一处。
+    // 其余 CText 入口（居中/阴影/描边）全部经此落笔，原点只加这一处。
     public static void Draw(Canvas c, string text, int x, int y, int scale,
                      int cr, int cg, int cb, int ca) {
         if (text == null || text.Length == 0) { return; }
@@ -54,5 +70,118 @@ public class CText {
         if (text == null || text.Length == 0) { return; }
         int w = CText.Width(text, scale);
         CText.DrawShadow(c, text, centerX - w / 2, y, scale, cr, cg, cb, ca);
+    }
+
+    // ---- 描边 ------------------------------------------------------------
+    //
+    // 引擎的 Canvas.DrawText 没有描边参数，描边只能用"四个偏移副本"拼：
+    // 左右各画一份、上下各画一份，最后盖上正文。
+    //
+    // 偏移取多少？统一成**逻辑像素**、随视口一起缩放（CDraw.MapW 落到设备
+    // 像素，且至少 1px——窗口缩到最小也要看得见）。之前 6 个项目各写一份：
+    // 有的硬编码 1 设备像素（窗口放大后描边细得看不见），有的是 1 逻辑
+    // 像素（缩小时被取整抹成 0），还有的随字号加粗（goldminer）。现在只有
+    // 这一条规则。
+
+    // 描边偏移（逻辑像素，档位版）：字号越大描边越粗。
+    // 单独拆出来是为了能被 conformance 逐值钉住。
+    public static int OutlineOffset(int scale) {
+        if (scale < 0) { scale = 0; }
+        return 1 + scale / 2;
+    }
+
+    // 描边文字（左上角锚定）。
+    public static void DrawOutlined(Canvas c, string text, int x, int y, int scale,
+                                    int cr, int cg, int cb, int ca,
+                                    int orr, int org, int orb, int oa) {
+        if (text == null || text.Length == 0) { return; }
+        int px = CDraw.MapX(x + CDraw.originX);
+        int py = CDraw.MapY(y + CDraw.originY);
+        int fs = CText.DevPx(scale);
+        int o = CDraw.MapW(CText.OutlineOffset(scale));
+        int oc = CDraw.Argb(oa, orr, org, orb);
+        int tc = CDraw.Argb(ca, cr, cg, cb);
+        c.DrawText(px - o, py, text, oc, fs);
+        c.DrawText(px + o, py, text, oc, fs);
+        c.DrawText(px, py - o, text, oc, fs);
+        c.DrawText(px, py + o, text, oc, fs);
+        c.DrawText(px, py, text, tc, fs);
+    }
+
+    // 描边文字（水平居中，centerX 是中心线）。
+    public static void DrawCenteredOutlined(Canvas c, string text, int centerX, int y,
+                                             int scale, int cr, int cg, int cb, int ca,
+                                             int orr, int org, int orb, int oa) {
+        if (text == null || text.Length == 0) { return; }
+        int w = CText.Width(text, scale);
+        CText.DrawOutlined(c, text, centerX - w / 2, y, scale,
+                           cr, cg, cb, ca, orr, org, orb, oa);
+    }
+
+    // ---- 像素字号族（sizePx = 逻辑像素字号，颜色 = 打包 ARGB）------------
+    //
+    // 8 个游戏项目原来各有一份一模一样的 DrawText 包装（连量宽都要自己把
+    // 设备像素换算回逻辑像素），描边还各写各的。这族方法就是它们的统一版。
+
+    // 量宽（逻辑像素）：Canvas.MeasureText 返回设备像素，而布局写在逻辑
+    // 坐标里——不换算回去，视口缩放后居中文字就会跑偏。
+    public static int WidthPx(string text, int sizePx) {
+        if (text == null || text.Length == 0) { return 0; }
+        int dev = Canvas.MeasureText(text, CDraw.MapW(sizePx));
+        if (CDraw.vpS <= 0) { return dev; }
+        return dev * 65536 / CDraw.vpS;
+    }
+
+    // 左上角锚定（y 是行盒顶，不是基线）。
+    public static void DrawPx(Canvas c, string text, int x, int y, int sizePx, int color) {
+        if (text == null || text.Length == 0) { return; }
+        c.DrawText(CDraw.MapX(x + CDraw.originX), CDraw.MapY(y + CDraw.originY),
+                   text, color, CDraw.MapW(sizePx));
+    }
+
+    public static void DrawCenteredPx(Canvas c, string text, int centerX, int y,
+                                       int sizePx, int color) {
+        if (text == null || text.Length == 0) { return; }
+        int w = CText.WidthPx(text, sizePx);
+        CText.DrawPx(c, text, centerX - w / 2, y, sizePx, color);
+    }
+
+    // 软阴影：(1,1) 逻辑像素偏移处先画一层暗色，再画正文。
+    public static void DrawShadowPx(Canvas c, string text, int x, int y, int sizePx,
+                                     int color, int shadow) {
+        if (text == null || text.Length == 0) { return; }
+        CText.DrawPx(c, text, x + 1, y + 1, sizePx, shadow);
+        CText.DrawPx(c, text, x, y, sizePx, color);
+    }
+
+    public static void DrawCenteredShadowPx(Canvas c, string text, int centerX, int y,
+                                             int sizePx, int color, int shadow) {
+        if (text == null || text.Length == 0) { return; }
+        int w = CText.WidthPx(text, sizePx);
+        CText.DrawShadowPx(c, text, centerX - w / 2, y, sizePx, color, shadow);
+    }
+
+    // 描边文字（左上角锚定）：四向偏移画一圈描边色，再画正文。
+    // 偏移固定 1 逻辑像素（MapW 后至少 1 设备像素）。
+    public static void DrawOutlinedPx(Canvas c, string text, int x, int y, int sizePx,
+                                       int color, int outline) {
+        if (text == null || text.Length == 0) { return; }
+        int px = CDraw.MapX(x + CDraw.originX);
+        int py = CDraw.MapY(y + CDraw.originY);
+        int fs = CDraw.MapW(sizePx);
+        int o = CDraw.MapW(1);
+        c.DrawText(px - o, py, text, outline, fs);
+        c.DrawText(px + o, py, text, outline, fs);
+        c.DrawText(px, py - o, text, outline, fs);
+        c.DrawText(px, py + o, text, outline, fs);
+        c.DrawText(px, py, text, color, fs);
+    }
+
+    // 描边文字（水平居中，centerX 是中心线）。
+    public static void DrawCenteredOutlinedPx(Canvas c, string text, int centerX, int y,
+                                               int sizePx, int color, int outline) {
+        if (text == null || text.Length == 0) { return; }
+        int w = CText.WidthPx(text, sizePx);
+        CText.DrawOutlinedPx(c, text, centerX - w / 2, y, sizePx, color, outline);
     }
 }

@@ -1,0 +1,142 @@
+using System;
+using System.IO;
+using Gui;
+using Game.Kit;
+
+// Game.Kit.CKitSlice 的契约：九宫格切图（3×3 边框图拼到任意大小的目标矩形）。
+//
+// 为什么要进包：这一件事曾被 8 个游戏项目各写一份，签名漂成 8 种——有的收
+// 内存键、有的收路径，参数顺序、切角语义、目标过窄时怎么退化各不一样
+// （9 个项目、约 170 处调用点）。通用绘制机制不该由游戏实现层各写一遍。
+//
+// 夹具：20x20 PNG。四角各有一块 2x2 异色（红/绿/蓝/黄），中央 12x12 青色，
+// 其余紫色。内嵌为 "ckitslicefx/src.png"（见 CMakeLists 的 --embed 分支），
+// 盘上没有这个路径，走 File.ReadAllBytes 的内嵌兜底。
+//
+// 源图布局（R=红 G=绿 B=蓝 Y=黄 C=青 P=紫）：
+//   RRPPPPPPPPPPPPPPGGPP
+//   RRPPPPPPPPPPPPPPGGPP
+//   PPPPPPPPPPPPPPPPPPPP
+//   PPPPPPPPPPPPPPPPPPPP
+//   PPPPCCCCCCCCCCCCPPPP   <- 中央 12x12 青色
+//   ...（共 12 行青色）
+//   BBPPPPPPPPPPPPPPYYPP
+//   BBPPPPPPPPPPPPPPYYPP
+//   PPPPPPPPPPPPPPPPPPPP
+//   PPPPPPPPPPPPPPPPPPPP
+//
+// 判据分两段（因为缩放带插值，角部缩小后的像素是混色，钉不准）：
+//   1. 纯函数 TargetCorner 钉住"目标切角 = 源切角 / 素材倍率"；
+//   2. 1:1 的标准九宫格用像素逐点钉（角原样、边/中拉伸、位置、界外不溢出）；
+//      缩放与退化只钉"画到了、画的是对的那块"的稳定特征。
+class Program {
+    static int fails;
+
+    static void Eq(string what, int got, int want) {
+        if (got == want) { return; }
+        fails = fails + 1;
+        Console.WriteLine("FAIL " + what + ": got " + Convert.ToString(got)
+            + " want " + Convert.ToString(want));
+    }
+
+    static void Ok(bool cond, string what) {
+        if (cond) { return; }
+        fails = fails + 1;
+        Console.WriteLine("FAIL " + what);
+    }
+
+    // 取像素的 RGB（0xRRGGBB）。
+    static int Px(Canvas c, int x, int y) {
+        return c.GetPixel(x, y) & 0x00FFFFFF;
+    }
+
+    static void Main() {
+        fails = 0;
+
+        App app = new App("ckit-slice", 64, 64);
+        app.BeginFrame();
+        Canvas c = app.canvas;
+        if (c == null || c.Width() <= 0 || c.Height() <= 0) {
+            // 没有可用表面（无显示环境）：按 harness 的 SKIP 约定退出。
+            Console.WriteLine("SKIP: no GUI surface in this session");
+            return;
+        }
+
+        string src = "ckitslicefx/src.png";
+        CDraw.Origin(0, 0);   // 逻辑原点归零、视口 1:1（默认态）
+
+        // ---- 1. 纯函数：目标切角 = 源切角 / 素材倍率 ----
+        Eq("corner 1:1", CKitSlice.TargetCorner(4, 1), 4);
+        Eq("corner 2x", CKitSlice.TargetCorner(8, 2), 4);
+        Eq("corner 3x", CKitSlice.TargetCorner(9, 3), 3);
+        Eq("corner bad scale", CKitSlice.TargetCorner(4, 0), 4);   // 0 视为 1
+        Eq("corner zero border", CKitSlice.TargetCorner(0, 1), 0);
+
+        // ---- 2. 标准九宫格：60x60 目标，border=4（源像素），1:1 ----
+        // 源切角 4x4、源中间 12x12、源边 4x2 / 2x4。
+        c.FillRect(0, 0, 64, 64, 0xFF101010);
+        CKitSlice.NineSlice(c, src, 0, 0, 60, 60, 4, 1);
+
+        // 角：源角 4x4 原样贴到目标 4x4 —— 只有左上 2x2 是红的，其余紫。
+        // (2,0) 是紫正是"角没被整幅拉伸"的关键（拉伸过就会是红）。
+        Eq("tl red", Px(c, 0, 0), 0xFF0000);
+        Eq("tl red inner", Px(c, 1, 1), 0xFF0000);
+        Eq("tl not stretched", Px(c, 2, 0), 0xA000FF);
+        Eq("tl far corner", Px(c, 3, 3), 0xA000FF);
+
+        // 右上角（源 (16..17, 0..1) 绿）、左下角（蓝）、右下角（黄）。
+        Eq("tr green", Px(c, 56, 0), 0x00FF00);
+        Eq("tr green inner", Px(c, 57, 1), 0x00FF00);
+        Eq("bl blue", Px(c, 0, 56), 0x0000FF);
+        Eq("br yellow", Px(c, 56, 56), 0xFFFF00);
+
+        // 四边（源边条是紫）与中心（源中间 12x12 是青）都是拉伸区。
+        Eq("top edge", Px(c, 30, 0), 0xA000FF);
+        Eq("left edge", Px(c, 0, 30), 0xA000FF);
+        Eq("center", Px(c, 30, 30), 0x00C8C8);
+        Eq("center near edge", Px(c, 10, 10), 0x00C8C8);
+        // 目标矩形之外仍是底色：说明没溢出到界外。
+        Eq("untouched", Px(c, 62, 62), 0x101010);
+
+        // ---- 3. targetScale：源切角 8 像素、目标切角 4 像素（素材按 2 倍烘） ----
+        // 源角 8x8 缩到目标 4x4（带插值，角部是混色，不断言具体颜色），
+        // 但中央（源 4x4 青 → 目标中央）必须是青。
+        c.FillRect(0, 0, 64, 64, 0xFF101010);
+        CKitSlice.NineSlice(c, src, 0, 0, 60, 60, 8, 2);
+        Eq("scaled center", Px(c, 30, 30), 0x00C8C8);
+        Ok(Px(c, 0, 0) != 0x101010, "scaled corner drawn");
+        Eq("scaled outside", Px(c, 62, 62), 0x101010);
+
+        // ---- 4. 目标比切角还窄 → 整幅拉伸退化（不切） ----
+        // 4x4 目标、border=4 → 目标切角 4，两个切角 8 > 4 → 退化。
+        // 退化后画的是整幅缩到 4x4，(0,0) 来自源左上（红）附近。
+        c.FillRect(0, 0, 64, 64, 0xFF101010);
+        CKitSlice.NineSlice(c, src, 0, 0, 4, 4, 4, 1);
+        Ok(Px(c, 0, 0) != 0x101010, "degenerate drawn");
+        Ok(Px(c, 3, 3) != 0x101010, "degenerate filled");
+
+        // ---- 5. 非法输入：切角为 0 / 超出源图 → 不崩、不画 ----
+        c.FillRect(0, 0, 64, 64, 0xFF101010);
+        CKitSlice.NineSlice(c, src, 0, 0, 60, 60, 0, 1);
+        Eq("zero border draws nothing", Px(c, 0, 0), 0x101010);
+        CKitSlice.NineSlice(c, src, 0, 0, 60, 60, 999, 1);
+        // 切角被夹到源图一半（10），源中间 20-20=0 → 画不出来，保持底色。
+        Eq("oversize border draws nothing", Px(c, 0, 0), 0x101010);
+
+        // ---- 6. 精灵表帧：从第 0 帧切（sw/sh 指定源矩形） ----
+        // 与整幅路径版结果一致：源矩形 (0,0,20,20) 覆盖整幅。
+        c.FillRect(0, 0, 64, 64, 0xFF101010);
+        CKitSlice.NineSliceSrc(c, src, 0, 0, 60, 60, 0, 0, 20, 20, 4, 1);
+        Eq("src tl red", Px(c, 0, 0), 0xFF0000);
+        Eq("src center", Px(c, 30, 30), 0x00C8C8);
+        Eq("src br yellow", Px(c, 56, 56), 0xFFFF00);
+
+        // ---- 7. 素材缺失：跳过，不抛异常（矢量兜底由调用方负责） ----
+        // 这条曾经崩过：缺素材时 File.ReadAllBytes 抛 FileNotFoundException。
+        c.FillRect(0, 0, 64, 64, 0xFF101010);
+        CKitSlice.NineSlice(c, "ckitslicefx/missing.png", 32, 32, 8, 8, 4, 1);
+        Eq("missing asset leaves canvas", Px(c, 33, 33), 0x101010);
+
+        if (fails == 0) { Console.WriteLine("ckit-slice-ok"); }
+    }
+}
