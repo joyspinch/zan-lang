@@ -136,6 +136,10 @@
 
 ### [~] A517 析构器 `~X()` 是死语法：解析/检查过、从不发射、从不调用
 - **宿主侧已修（2026-10-23，口径=编译期拒绝）**：binder 补
+- **自举半边已补（2026-10-23，goal round 2）**：selfhost parser.zan 的析构分支
+  （At(TK.Bang())/At(TK.Tilde())）加同文案 diags.Error——gen1 实测 `~Widget()`
+  当场拒绝（同文案 + 非零退出）；selfhost 自身 66 源无析构、gen1 构建通过
+  （全仓 29 处 ~X() 已在 274938124 迁移删除）。
   `AST_DESTRUCTOR_DECL` 分支——声明析构器当场报错（"ARC runtime has no
   destructor hook on release ... do deterministic cleanup explicitly"）。
   SPEC 同步改口径：§6.2 删 "refcount 0 → destructor called" 示例、正文声明
