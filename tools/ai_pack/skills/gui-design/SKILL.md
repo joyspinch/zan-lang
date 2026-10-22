@@ -372,8 +372,16 @@ description: Zan GUI (stdlib/Gui) 审美与排版规范——对齐、间距、�
          **防露白第二铁律**：沉浸式暗色应用必须使用 `Form.CreateDark` 创建深色宿主，并配合 `form.GetApp().SetChromeVisible(false)` 隐藏默认标题栏，让 HTML 顶栏完全接管视口，底栏贴底，杜绝浅色窗体外框露白边。
          通过 `HtmlHandlers.Add("OnTogglePlay", OnTogglePlay)` 编译期安全绑定原生事件。
        - **验收铁律**: 一律经 `zan_gui_snapshot` 或无头 `ZAN_UI_SCRIPT` 回收 `tree.json` 验真，确保各主要容器高度不塌陷、子项不叠放、无无效坐标警告。
-- 项目自带 `skins/` 目录要连 base.css 一起带——同名目录整体跳过
-  stdlib 基线内嵌,基线层丢了 flex 全退化成叠矩形(wuwei 百艺页签全叠)。
+- **基线 `base.css` 由编译器内嵌兜底,磁盘上不要再放一份**:编译器对 GUI 程序
+  自动把 stdlib 的 Gui 皮肤目录整份烤进 exe(含 base.css),运行时
+  `Skin.BaseCss()` 是**磁盘优先、内嵌兜底**——exe 旁再放一份 base.css 会
+  **盖住**内嵌基线,"内嵌兜底到底生效没有"永远测不出来。
+- **暂存形态分两种,别混**:单文件形态(只暂存自家 `skins/<名>/skin.css`)
+  不顶替基线,编译器照旧自动内嵌 stdlib 基线,**不要**拷 base.css;目录形态
+  (暂存整个 `skins/` 目录)只有该目录自带 base.css 时编译器才跳过 stdlib
+  基线内嵌,此时要换基线就得给**完整**基线——基线层整层丢失会让 flex 全
+  退化成叠矩形(wuwei 百艺页签全叠的根因:只带自家 skin.css 的目录暂存吞掉
+  了 stdlib 基线内嵌,编译器已把跳过条件收紧成"暂存目录自带 base.css")。
 - 游戏帧循环:菜单/面板可嵌(脏区门控,实测均值 3ms);每帧热路径 HUD
   仍走代码直绘,不进 DOM。
 - **HTML 里"当前选中项"高亮必须 class 驱动,行内 style 只留几何**:

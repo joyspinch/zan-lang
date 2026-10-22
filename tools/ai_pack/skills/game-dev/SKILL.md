@@ -234,9 +234,10 @@ App.html + 游戏自己的皮肤。坑与定式，每条都是踩过才成立的
   代码直绘 + 门控渲染（上一节）——那是性能边界不是能力缺口；
   RTS/动作类整体属这类，HTML 化收益低。放置类主城的计数条量少，
   直绘或 HTML 都行。
-- 已知坑出处：项目 `skins/` 目录连 base.css 一起带（wuwei 百艺页签
-  全叠的根因）；运行时建树用 `App.LoadHtml`，编译期通道用 GenHtml，
-  两者同语义。
+- 已知坑出处：wuwei 百艺页签全叠的根因是**只带自家 skin.css 的目录暂存吞掉
+  了 stdlib 基线内嵌**（编译器已把跳过条件收紧成"暂存目录自带 base.css"），
+  不是"该把 base.css 一起带"；运行时建树用 `App.LoadHtml`，编译期通道用
+  GenHtml，两者同语义。
 
 ## GPU 档 3D（DrawMesh3D）平台事实与 NVIDIA 死锁定式
 

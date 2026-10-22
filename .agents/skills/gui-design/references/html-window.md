@@ -178,10 +178,15 @@ STANDARDS.md §6.7）。
 
 - 皮肤基线（base.css，`flex{display:flex}` 等 UA 规则）+ 应用级
   （`app.UseAppCss(...)`）。颜色走 `var(--*)` 令牌，尺寸走阶梯。
-- **项目自带 `skins/` 目录要连 base.css 一起带**：`--embed skins`
-  见到同名目录就整体跳过 stdlib 基线内嵌，只放自家 skin.css 会让
-  基线层整层丢失、flex 全退化成叠矩形（无为修仙传百艺页签全叠的根因，
-  模板补带 base.css 后消除）。
+- **基线 base.css 由编译器内嵌兜底，磁盘上不要再放一份**：编译器把 stdlib
+  皮肤目录整份烤进 exe，运行时是**磁盘优先、内嵌兜底**——exe 旁那份
+  base.css 会盖住内嵌基线，"内嵌兜底到底生效没有"永远测不出来。
+- **暂存形态分两种**：单文件形态（`--embed <pack.css>=skins/<名>/skin.css`）
+  只内嵌自家皮肤包、不顶替基线，编译器仍自动内嵌 stdlib 基线，**不要**拷
+  base.css；目录形态（`--embed skins`）只有该目录自带 base.css 时编译器才
+  跳过 stdlib 基线内嵌，此时要换基线就得给**完整**基线，否则基线层整层丢失、
+  flex 全退化成叠矩形（无为修仙传百艺页签全叠的根因：只带自家 skin.css 的
+  目录暂存吞掉了 stdlib 基线内嵌，编译器已把跳过条件收紧）。
 - 运行时换肤是实例方法：`form.GetApp.UseSkin("neon")`——按静态
   `App.UseSkin(...)` 调会报 cannot call instance method（踩过）。
 
