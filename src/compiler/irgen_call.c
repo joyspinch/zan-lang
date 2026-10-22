@@ -710,6 +710,18 @@ static bool math_arg_is_numeric(LLVMValueRef v) {
            k == LLVMFloatTypeKind;
 }
 
+/* Math.* 的实参不能是 bool。判据是**语义类型**不是 LLVM 宽度：一个从泛型
+ * 方法回来的 bool 走的是 i64 槽位（extend_int_for_slot 的 zeroext），
+ * 按宽度判会漏过它 —— 同一个 bool 在两条路径上得到不同的判决
+ * （TASKS.md A498；与 A492 的「宽度不是类型」同源）。C# 里 bool 没有到
+ * double 的隐式转换，Math.Sqrt(true) 是编译错误。 */
+static bool math_arg_is_bool(zan_irgen_t *g, zan_ast_node_t *arg_ast,
+                              local_scope_t *locals) {
+    /* infer_expr_type does not take a null node */
+    if (!arg_ast) return false;
+    return expr_is_bool(g, arg_ast, locals);
+}
+
 /* 数值实参统一成 double（int 走 sitofp，float 走 fpext）。 */
 static LLVMValueRef math_arg_to_double(zan_irgen_t *g, LLVMValueRef v) {
     LLVMTypeRef dbl = LLVMDoubleTypeInContext(g->ctx);
@@ -719,10 +731,14 @@ static LLVMValueRef math_arg_to_double(zan_irgen_t *g, LLVMValueRef v) {
     return v;
 }
 
-/* 不是数值就报人话诊断（fail-closed），返回 false 让调用方回一个 0 值。 */
+/* 不是数值就报人话诊断（fail-closed），返回 false 让调用方回一个 0 值。
+ * arg_ast 是实参的 AST 节点：bool 的判决按语义类型做（见 math_arg_is_bool），
+ * 宽度判 i1 只是兜底（expr_is_bool 判不出的类型仍按降级后的宽度拒）。 */
 static bool math_require_numeric(zan_irgen_t *g, zan_ast_node_t *expr,
-                                  LLVMValueRef v, const char *name) {
-    if (math_arg_is_numeric(v)) return true;
+                                  zan_ast_node_t *arg_ast, LLVMValueRef v,
+                                  local_scope_t *locals, const char *name) {
+    if (math_arg_is_numeric(v) && !math_arg_is_bool(g, arg_ast, locals))
+        return true;
     zan_diag_emit(g->diag, DIAG_ERROR, expr->loc,
                   "Math.%s requires an int or floating-point argument", name);
     return false;
@@ -1474,7 +1490,8 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
             is_call_to(expr, "Math", "Sqrt") && expr->call.args.count == 1) {
             LLVMValueRef arg = emit_expr(g, expr->call.args.items[0], locals);
             LLVMTypeRef dbl = LLVMDoubleTypeInContext(g->ctx);
-            if (!math_require_numeric(g, expr, arg, "Sqrt"))
+            if (!math_require_numeric(g, expr, expr->call.args.items[0], arg,
+                                      locals, "Sqrt"))
                 return LLVMConstReal(dbl, 0.0);
             arg = math_arg_to_double(g, arg);
             LLVMValueRef sqrt_fn = LLVMGetNamedFunction(g->mod, "sqrt");
@@ -1497,7 +1514,7 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                     is_call_to(expr, "Math", math1[mi]) && expr->call.args.count == 1) {
                     LLVMValueRef arg = emit_expr(g, expr->call.args.items[0], locals);
                     LLVMTypeRef dbl = LLVMDoubleTypeInContext(g->ctx);
-                    if (!math_require_numeric(g, expr, arg, math1[mi]))
+                    if (!math_require_numeric(g, expr, expr->call.args.items[0], arg, locals, math1[mi]))
                         return LLVMConstReal(dbl, 0.0);
                     arg = math_arg_to_double(g, arg);
                     LLVMTypeRef fty = LLVMFunctionType(dbl, (LLVMTypeRef[]){ dbl }, 1, 0);
@@ -1513,8 +1530,8 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
             LLVMTypeRef dbl = LLVMDoubleTypeInContext(g->ctx);
             LLVMValueRef y_v = emit_expr(g, expr->call.args.items[0], locals);
             LLVMValueRef x_v = emit_expr(g, expr->call.args.items[1], locals);
-            if (!math_require_numeric(g, expr, y_v, "Atan2") ||
-                !math_require_numeric(g, expr, x_v, "Atan2"))
+            if (!math_require_numeric(g, expr, expr->call.args.items[0], y_v, locals, "Atan2") ||
+                !math_require_numeric(g, expr, expr->call.args.items[1], x_v, locals, "Atan2"))
                 return LLVMConstReal(dbl, 0.0);
             y_v = math_arg_to_double(g, y_v);
             x_v = math_arg_to_double(g, x_v);
@@ -1534,7 +1551,7 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
             is_call_to(expr, "Math", "Abs") && expr->call.args.count == 1) {
             LLVMValueRef arg = emit_expr(g, expr->call.args.items[0], locals);
             LLVMTypeRef arg_type = LLVMTypeOf(arg);
-            if (!math_require_numeric(g, expr, arg, "Abs"))
+            if (!math_require_numeric(g, expr, expr->call.args.items[0], arg, locals, "Abs"))
                 return LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 0, 0);
             if (LLVMGetTypeKind(arg_type) == LLVMDoubleTypeKind ||
                 LLVMGetTypeKind(arg_type) == LLVMFloatTypeKind) {
@@ -1614,8 +1631,8 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
             LLVMTypeRef dbl = LLVMDoubleTypeInContext(g->ctx);
             LLVMValueRef base_v = emit_expr(g, expr->call.args.items[0], locals);
             LLVMValueRef exp_v = emit_expr(g, expr->call.args.items[1], locals);
-            if (!math_require_numeric(g, expr, base_v, "Pow") ||
-                !math_require_numeric(g, expr, exp_v, "Pow"))
+            if (!math_require_numeric(g, expr, expr->call.args.items[0], base_v, locals, "Pow") ||
+                !math_require_numeric(g, expr, expr->call.args.items[1], exp_v, locals, "Pow"))
                 return LLVMConstReal(dbl, 0.0);
             base_v = math_arg_to_double(g, base_v);
             exp_v = math_arg_to_double(g, exp_v);
@@ -1634,7 +1651,7 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
             is_call_to(expr, "Math", "Floor") && expr->call.args.count == 1) {
             LLVMTypeRef dbl = LLVMDoubleTypeInContext(g->ctx);
             LLVMValueRef arg = emit_expr(g, expr->call.args.items[0], locals);
-            if (!math_require_numeric(g, expr, arg, "Floor"))
+            if (!math_require_numeric(g, expr, expr->call.args.items[0], arg, locals, "Floor"))
                 return LLVMConstReal(dbl, 0.0);
             arg = math_arg_to_double(g, arg);
             LLVMValueRef floor_fn = LLVMGetNamedFunction(g->mod, "floor");
@@ -1650,7 +1667,7 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
             is_call_to(expr, "Math", "Ceiling") && expr->call.args.count == 1) {
             LLVMTypeRef dbl = LLVMDoubleTypeInContext(g->ctx);
             LLVMValueRef arg = emit_expr(g, expr->call.args.items[0], locals);
-            if (!math_require_numeric(g, expr, arg, "Ceiling"))
+            if (!math_require_numeric(g, expr, expr->call.args.items[0], arg, locals, "Ceiling"))
                 return LLVMConstReal(dbl, 0.0);
             arg = math_arg_to_double(g, arg);
             LLVMValueRef ceil_fn = LLVMGetNamedFunction(g->mod, "ceil");
@@ -1669,7 +1686,7 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
             LLVMTypeRef dbl = LLVMDoubleTypeInContext(g->ctx);
             LLVMTypeRef d1_ty = LLVMFunctionType(dbl, (LLVMTypeRef[]){ dbl }, 1, 0);
             LLVMValueRef arg = emit_expr(g, expr->call.args.items[0], locals);
-            if (!math_require_numeric(g, expr, arg, "Round"))
+            if (!math_require_numeric(g, expr, expr->call.args.items[0], arg, locals, "Round"))
                 return LLVMConstReal(dbl, 0.0);
             arg = math_arg_to_double(g, arg);
             /* C# Math.Round 是银行家舍入（to-even）——libc rint 按默认 FP
@@ -1680,7 +1697,7 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                 return zan_call2(g->builder, d1_ty, round_fn, &arg, 1, "rint");
             /* digits: rint(x * 10^d) / 10^d（同样银行家） */
             LLVMValueRef digits = emit_expr(g, expr->call.args.items[1], locals);
-            if (!math_require_numeric(g, expr, digits, "Round"))
+            if (!math_require_numeric(g, expr, expr->call.args.items[1], digits, locals, "Round"))
                 return LLVMConstReal(dbl, 0.0);
             digits = math_arg_to_double(g, digits);
             LLVMTypeRef d2_ty = LLVMFunctionType(dbl, (LLVMTypeRef[]){ dbl, dbl }, 2, 0);
@@ -4679,6 +4696,41 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                                         call_args[0] = LLVMBuildLoad2(g->builder, at, local->alloca, "recv");
                                     } else {
                                         call_args[0] = local->alloca;
+                                    }
+                                    /* null 接收者 guard（TASKS.md A507）：这条
+                                     * 局部变量快速路径曾完全无检查——this=null
+                                     * 一路进方法体读字段，SIGSEGV 且无任何诊断
+                                     * （字段访问路径早有 emit_weak_read_guard，
+                                     * 方法调用偏偏漏了）。补齐同口径：软诊断 +
+                                     * 软基址（scratch），--strict-runtime 下
+                                     * exit 70。 */
+                                    if (LLVMGetTypeKind(LLVMTypeOf(call_args[0]))
+                                            == LLVMPointerTypeKind &&
+                                        !callee->member.null_cond) {
+                                        zan_type_t *rty = local->type;
+                                        bool reflike = rty &&
+                                            (rty->kind == TYPE_OBJECT ||
+                                             rty->kind == TYPE_CLASS ||
+                                             rty->kind == TYPE_INTERFACE ||
+                                             rty->kind == TYPE_TYPE_PARAM ||
+                                             rty->kind == TYPE_ERROR);
+                                        if (reflike) {
+                                            LLVMValueRef isnull = zan_icmp(
+                                                g->builder, LLVMIntEQ,
+                                                call_args[0],
+                                                LLVMConstNull(LLVMTypeOf(call_args[0])),
+                                                "recv.null");
+                                            char nm[256];
+                                            snprintf(nm, sizeof(nm),
+                                                "null reference: receiver '%.*s' is null",
+                                                (int)callee->member.object->ident.name.len,
+                                                callee->member.object->ident.name.str);
+                                            emit_runtime_check(g, isnull,
+                                                callee->member.object->loc, nm);
+                                            call_args[0] = emit_soft_base_select(
+                                                g, call_args[0], isnull,
+                                                callee->member.object->loc);
+                                        }
                                     }
                                 }
                                 int n_eh_args = 0;

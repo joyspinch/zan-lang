@@ -5535,7 +5535,10 @@ binding_lowered:
                     LLVMValueRef idx = emit_expr(g, expr->binary.left->index.index, locals);
                     LLVMValueRef span_len = LLVMBuildExtractValue(g->builder, span_val,
                         1, "sps.len");
+                    LLVMValueRef sp_oob = emit_index_oob_pred(g, idx, span_len);
                     emit_index_bounds_check(g, idx, span_len, expr->loc, "span");
+                    LLVMBasicBlockRef sp_do = NULL, sp_end = NULL;
+                    emit_oob_store_split(g, sp_oob, &sp_do, &sp_end);
                     if (LLVMGetTypeKind(LLVMTypeOf(idx)) == LLVMIntegerTypeKind &&
                         LLVMGetIntTypeWidth(LLVMTypeOf(idx)) < 64)
                         idx = LLVMBuildSExt(g->builder, idx,
@@ -5547,6 +5550,7 @@ binding_lowered:
                         sv = coerce_int_to(g, sv, elem_llvm);
                     /* 非对齐内存跨度 (Span) 内存读写支持 */
                     LLVMSetAlignment(LLVMBuildStore(g->builder, sv, ep), 1);
+                    emit_oob_store_finish(g, sp_do, sp_end);
                     return right;
                 }
             }
@@ -5588,7 +5592,10 @@ binding_lowered:
                         g->list_struct_type, list_ptr, 0, "countf");
                     LLVMValueRef count = LLVMBuildLoad2(g->builder,
                         LLVMInt64TypeInContext(g->ctx), count_field, "count");
+                    LLVMValueRef ls_oob = emit_index_oob_pred(g, idx, count);
                     emit_index_bounds_check(g, idx, count, expr->loc, "list");
+                    LLVMBasicBlockRef ls_do = NULL, ls_end = NULL;
+                    emit_oob_store_split(g, ls_oob, &ls_do, &ls_end);
                     if (LLVMGetTypeKind(LLVMTypeOf(idx)) == LLVMIntegerTypeKind &&
                         LLVMGetIntTypeWidth(LLVMTypeOf(idx)) < 64) {
                         idx = LLVMBuildSExt(g->builder, idx, LLVMInt64TypeInContext(g->ctx), "idxext");
@@ -5600,25 +5607,33 @@ binding_lowered:
                     emit_collection_slot_store(g, container_elem_type(local->type),
                         LLVMInt64TypeInContext(g->ctx), slot_ptr,
                         right, expr->binary.right, locals, 1);
+                    emit_oob_store_finish(g, ls_do, ls_end);
                 } else if (local) {
                     LLVMValueRef arr_ptr = LLVMBuildLoad2(g->builder,
                         LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0),
                         local->alloca, "arrload");
                     if (local->type && local->type->kind == TYPE_STRING) {
                         LLVMValueRef idx = emit_expr(g, expr->binary.left->index.index, locals);
+                        LLVMValueRef st_oob = LLVMConstInt(LLVMInt1TypeInContext(g->ctx), 0, 0);
+                        LLVMValueRef st_len = NULL;
                         if (!local->opaque_string) {
                             arr_ptr = emit_string_base_guard(g, arr_ptr, expr->loc);
-                            LLVMValueRef len = emit_string_buffer_len(g, arr_ptr, expr->loc);
-                            emit_index_bounds_check(g, idx, len, expr->loc, "string");
-                            idx = emit_index_safe_bounds(g, idx, len, expr->loc, "string");
+                            st_len = emit_string_buffer_len(g, arr_ptr, expr->loc);
+                            st_oob = emit_index_oob_pred(g, idx, st_len);
+                            emit_index_bounds_check(g, idx, st_len, expr->loc, "string");
                         } else {
                             idx = emit_string_elem_guard(g, arr_ptr, idx, expr->loc, &arr_ptr);
                         }
+                        LLVMBasicBlockRef st_do = NULL, st_end = NULL;
+                        emit_oob_store_split(g, st_oob, &st_do, &st_end);
+                        if (!local->opaque_string)
+                            idx = emit_index_safe_bounds(g, idx, st_len, expr->loc, "string");
                         LLVMTypeRef i8 = LLVMInt8TypeInContext(g->ctx);
                         LLVMValueRef elem_ptr = LLVMBuildGEP2(g->builder, i8, arr_ptr, &idx, 1, "eidx");
                         LLVMValueRef val8 = LLVMBuildTrunc(g->builder, right, i8, "byte");
                         zan_store_fit(g, val8, elem_ptr);
                         emit_string_len_invalidate(g, arr_ptr);
+                        emit_oob_store_finish(g, st_do, st_end);
                     } else {
                         LLVMTypeRef elem_llvm = LLVMInt32TypeInContext(g->ctx);
                         if (local->type && local->type->element_type) {
@@ -5626,6 +5641,7 @@ binding_lowered:
                             elem_llvm = map_type(g, et);
                         }
                         LLVMValueRef elem_ptr;
+                        LLVMValueRef ar_oob = LLVMConstInt(LLVMInt1TypeInContext(g->ctx), 0, 0);
                         if (local->type && local->type->kind == TYPE_ARRAY &&
                             local->type->array_rank > 1) {
                             /* 多维矩形数组槽位：多维越界检查与行优先平铺寻址 */
@@ -5634,6 +5650,8 @@ binding_lowered:
                         } else {
                             LLVMValueRef idx = emit_expr(g, expr->binary.left->index.index, locals);
                             if (local->type && local->type->kind == TYPE_ARRAY) {
+                                ar_oob = emit_index_oob_pred(g, idx,
+                                    zan_array_len(g, arr_ptr));
                                 emit_index_bounds_check(g, idx, zan_array_len(g, arr_ptr),
                                     expr->loc, "array");
                                 idx = emit_index_safe_bounds(g, idx,
@@ -5643,6 +5661,8 @@ binding_lowered:
                                 LLVMPointerType(elem_llvm, 0), "arrp");
                             elem_ptr = LLVMBuildGEP2(g->builder, elem_llvm, typed_arr, &idx, 1, "eidx");
                         }
+                        LLVMBasicBlockRef ar_do = NULL, ar_end = NULL;
+                        emit_oob_store_split(g, ar_oob, &ar_do, &ar_end);
                         zan_type_t *et = local->type ? local->type->element_type : NULL;
                         LLVMValueRef stored = right;
                         /* 可空元素槽写入：将标量值封装为可空结构体 */
@@ -5676,6 +5696,7 @@ binding_lowered:
                             }
                             zan_store_fit(g, stored, elem_ptr);
                         }
+                        emit_oob_store_finish(g, ar_do, ar_end);
                     }
                 } else if (g->current_type_sym) {
                     zan_symbol_t *fsym = get_field_sym(g->current_type_sym, arr_expr->ident.name);
@@ -5710,7 +5731,10 @@ binding_lowered:
                                 g->list_struct_type, list_ptr, 0, "countf");
                             LLVMValueRef count = LLVMBuildLoad2(g->builder, i64t,
                                 count_field, "count");
+                            LLVMValueRef lf_oob = emit_index_oob_pred(g, idx, count);
                             emit_index_bounds_check(g, idx, count, expr->loc, "list");
+                            LLVMBasicBlockRef lf_do = NULL, lf_end = NULL;
+                            emit_oob_store_split(g, lf_oob, &lf_do, &lf_end);
                             if (LLVMGetTypeKind(LLVMTypeOf(idx)) == LLVMIntegerTypeKind &&
                                 LLVMGetIntTypeWidth(LLVMTypeOf(idx)) < 64) {
                                 idx = LLVMBuildSExt(g->builder, idx, i64t, "idxext");
@@ -5721,6 +5745,7 @@ binding_lowered:
                             LLVMValueRef slot_ptr = LLVMBuildGEP2(g->builder, i64t, data, &idx, 1, "ep");
                             emit_collection_slot_store(g, container_elem_type(fsym->type), i64t, slot_ptr,
                                 right, expr->binary.right, locals, 1);
+                            emit_oob_store_finish(g, lf_do, lf_end);
                         } else if (fsym->type && type_named(fsym->type, "Dict", 4)) {
                             LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
                             LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
@@ -5817,7 +5842,10 @@ binding_lowered:
                         LLVMValueRef count = LLVMBuildLoad2(g->builder, i64t,
                             LLVMBuildStructGEP2(g->builder, g->list_struct_type,
                                 list_ptr, 0, "countf"), "count");
+                        LLVMValueRef lm_oob = emit_index_oob_pred(g, idx, count);
                         emit_index_bounds_check(g, idx, count, expr->loc, "list");
+                        LLVMBasicBlockRef lm_do = NULL, lm_end = NULL;
+                        emit_oob_store_split(g, lm_oob, &lm_do, &lm_end);
                         if (LLVMGetTypeKind(LLVMTypeOf(idx)) == LLVMIntegerTypeKind &&
                             LLVMGetIntTypeWidth(LLVMTypeOf(idx)) < 64) {
                             idx = LLVMBuildSExt(g->builder, idx, i64t, "idxext");
@@ -5828,6 +5856,7 @@ binding_lowered:
                         LLVMValueRef slot_ptr = LLVMBuildGEP2(g->builder, i64t, data, &idx, 1, "ep");
                         emit_collection_slot_store(g, container_elem_type(at), i64t, slot_ptr,
                             right, expr->binary.right, locals, 1);
+                        emit_oob_store_finish(g, lm_do, lm_end);
                     } else if (type_named(at, "Dict", 4)) {
                         LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
                         LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);

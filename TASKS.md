@@ -16,7 +16,22 @@
 
 ## 未完成
 
-### [ ] A507 运行期错误 fail-mode 全线偏离 C#：软失败继续执行、不可 catch
+### [~] A507 运行期错误 fail-mode 全线偏离 C#：软失败继续执行、不可 catch
+- **宿主侧已修两条（2026-10-23，软诊断口径）**：
+  - **null 接收者方法调用**：irgen_call.c 局部变量快速路径补 guard——曾
+    this=null 一路进方法体读字段 SIGSEGV 且无任何诊断（字段访问路径早有
+    emit_weak_read_guard，方法调用漏了）。补齐同口径：软诊断（点名接收者
+    位置）+ 软基址 scratch，`--strict-runtime` exit 70。探针 v_nullcall
+    复验：诊断 + 继续 + exit 0；strict exit 70。
+  - **越界写不再落槽 0**：irgen 新增 emit_index_oob_pred/emit_oob_store_
+    split/finish 三帮手，数组/List/Span/string 的元素 **store** 位点在诊断
+    之后用 cond_br 跳过写入（连配套 retain/release 一起跳，ARC 平衡保持）。
+    曾 `a[9]=99` 钳位写进 a[0]（静默覆盖）；现在元素保住（11 22 33）。
+    未覆盖：多维数组 store（emit_mdarray_elem_ptr 内部仍钳位）、字段/成员
+    链形状的部分位点，见待办。
+- 待办：① 全线可 catch 异常通道（对齐 C#，最终口径）；② 多维数组与剩余
+  成员链 store 位点的跳写；③ 读路径的钳位返回 0 值语义未动（软值兜底）；
+  ④ 自举半边。
 - 现象（2026-10-23 八域审计交叉证实，全部亲验复现）：
   - 数组/List/字符串越界**读**：stderr 一行 `runtime error: ...`（带 file:line:col，每位置一次）后**钳位继续**，返回槽 0 的值；越界**写确定性写入槽 0**（`a[9]=99` 落进 `a[0]`，其余元素不动）——静默数据破坏，exit=0。
   - 整数除零：软 guard 后**返回被除数**（5/0→5、7/0→7、5%0→0）继续执行。

@@ -1394,6 +1394,52 @@ static void emit_index_bounds_check(zan_irgen_t *g, LLVMValueRef index,
     emit_index_range_check(g, index, length, false, loc, kind);
 }
 
+/* A507 越界写保护（TASKS.md）：与 emit_index_range_check 同一谓词，但把
+ * "坏"标志返回给调用方——store 位点用它做 cond_br 跳过写入。曾
+ * `a[9]=99` 诊断照发后仍钳位落进槽 0（静默覆盖 a[0]）。 */
+static LLVMValueRef emit_index_oob_pred(zan_irgen_t *g, LLVMValueRef index,
+                                        LLVMValueRef length) {
+    LLVMTypeRef i1 = LLVMInt1TypeInContext(g->ctx);
+    if (!g->runtime_checks || !g->current_fn)
+        return LLVMConstInt(i1, 0, 0);
+    if (LLVMGetTypeKind(LLVMTypeOf(index)) != LLVMIntegerTypeKind ||
+        LLVMGetTypeKind(LLVMTypeOf(length)) != LLVMIntegerTypeKind)
+        return LLVMConstInt(i1, 0, 0);
+    LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
+    index = emit_index_i64(g, index, "oob.idx");
+    length = emit_index_i64(g, length, "oob.len");
+    LLVMValueRef neg = zan_icmp(g->builder, LLVMIntSLT, index,
+                                LLVMConstInt(i64, 0, 0), "oob.neg");
+    LLVMValueRef high = zan_icmp(g->builder, LLVMIntSGE, index, length,
+                                 "oob.high");
+    return LLVMBuildOr(g->builder, neg, high, "oob.bad");
+}
+
+/* 越界写位点协议：split 在诊断之后切控制流（oob → end，否则 → do 块），
+ * 调用方把 store（连着配套的 retain/release）发射在 do 块里，finish 收口。
+ * end_bb 为 NULL 表示谓词恒假/检查关闭，store 照旧直落。 */
+static void emit_oob_store_split(zan_irgen_t *g, LLVMValueRef oob,
+                                 LLVMBasicBlockRef *do_bb,
+                                 LLVMBasicBlockRef *end_bb) {
+    *do_bb = NULL;
+    *end_bb = NULL;
+    if (!g->runtime_checks || !g->current_fn) return;
+    if (LLVMIsConstant(oob)) return; /* 恒假：不切块 */
+    LLVMValueRef fn = LLVMGetBasicBlockParent(LLVMGetInsertBlock(g->builder));
+    *do_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "sto.do");
+    *end_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "sto.end");
+    LLVMBuildCondBr(g->builder, oob, *end_bb, *do_bb);
+    LLVMPositionBuilderAtEnd(g->builder, *do_bb);
+}
+
+static void emit_oob_store_finish(zan_irgen_t *g, LLVMBasicBlockRef do_bb,
+                                  LLVMBasicBlockRef end_bb) {
+    if (!end_bb) return;
+    (void)do_bb;
+    LLVMBuildBr(g->builder, end_bb);
+    LLVMPositionBuilderAtEnd(g->builder, end_bb);
+}
+
 static LLVMValueRef emit_index_safe_check(zan_irgen_t *g, LLVMValueRef index,
                                           LLVMValueRef length, bool allow_end,
                                           zan_loc_t loc, const char *kind) {
