@@ -233,6 +233,13 @@
   相不一致）。ToString lowering 补 TYPE_CHAR 分支，对齐 emit_char_to_cstr
   （UTF-8 编码）。探针 v_chartost 复验："A" + Length 1。
 - 待办：其余件（bool 大小写=A441 已闭的统一口径、-0.0 符号、float 按精度
+- **自举半边已修（2026-10-23，goal round 4）**：selfhost 无参 scalar
+  ToString 的 char 接收者分支接 `CharToStr`（WriteLine(char) 与拼接路径
+  早就在用的 UTF-8 编码帮手），与宿主 09dbfbc5d 同口径。复验：gen1 编
+  `char c = 'A'; string s = c.ToString(); c.ToString().Length` 通过，IR
+  两处调用点都是 `and i64 …, 2097151` + `< 128` 的 UTF-8 编码序列（非
+  itoa）。'中' 多字节**字符字面量**自举 parser 尚不支持（词法层报
+  unexpected，另登记 A538 留观——宿主正常）。
   打印、未捕获异常的 stdout/无 Message/无栈）按需逐件；自举半边。
 - bool 全路径小写 true/false（五条渲染路径内部一致；C# True/False——A441 闭账口径=统一，非 .NET 口径，协议/日志大小写敏感场景有实害）。
 - `char.ToString()` 返回码点数字 "65"（C# "A"；WriteLine(char) 与拼接却正确——渲染路径互相不一致）。
@@ -1507,3 +1514,12 @@
 - 复验：p07 全断言通过（"OK p07"）；p03/p04 不受影响。
 - 待办：自举半边（selfhost 的 ?? 降级路径同查）；`bool?`/`T? ?? T?` 聚合
   路径同样只建 phi 未动，留观。
+
+### [ ] A538 自举 parser 不支持多字节字符字面量 `'中'`（词法层 unexpected）
+- 现象：gen1 编 `char z = '中';` 报两行 "syntax error: unexpected ''"——
+  源文件是 UTF-8，自举 lexer 按字节扫描把多字节序列当非法字符。宿主
+  zanc 同文件正常（A523 探针含 '中' 编码路径）。
+- 影响：含中文/emoji 字符字面量的程序自举编不过（字符串字面量不受影响，
+  已按 UTF-8 透传）。
+- 方向：selfhost lexer 的 CharLit 分支按 UTF-8 解码多点序列取首码点；
+  CharToStr 的编码帮手已就绪，只差词法。
