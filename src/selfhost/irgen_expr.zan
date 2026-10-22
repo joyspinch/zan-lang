@@ -4074,6 +4074,40 @@ partial class Irgen {
                 return new ExprVal(t, tgt);
             }
         }
+        // A509: a reference -> reference cast whose static types cannot
+        // prove safety gets the host's runtime check (irgen_expr.c ~10959).
+        // A failing downcast used to retag the pointer -- a string posing
+        // as a User, silent type confusion. Same type / upcast / object
+        // target stay unchecked; everything else runs the class-id test
+        // (the same closed-world test `is` uses) and reports
+        // "InvalidCastException: ..." through the soft channel with a safe
+        // null on failure (null itself fails the test, as on the host).
+        if (tgt != null && v.ty != null && tgt.ival < 1 && IsPtrLL(MapType(v.ty)) && IsPtrLL(MapType(tgt))) {
+            string tn = tgt.sval;
+            Node tc = binder.FindType(tn);
+            bool refTarget = tn == "string" || tn == "object" || IsContainerType(tn)
+                || (tc != null && tc.kind == AK.ClassDecl());
+            bool staticOk = tn == "object" || v.ty.sval == tn || IsSubclassName(v.ty.sval, tn);
+            if (refTarget && !staticOk) {
+                string ok;
+                if (tn == "string") { ok = EmitStringIdTest(v); }
+                else { ok = EmitClassIdTest(v, tn); }
+                string inv = NT();
+                L("  " + inv + " = xor i1 " + ok + ", 1");
+                EmitRuntimeCheckIf(e, inv,
+                    "InvalidCastException: object is not an instance of the target type");
+                string tll = MapType(tgt);
+                string cv = v.op;
+                if (MapType(v.ty) != tll) {
+                    string b = NT();
+                    L("  " + b + " = bitcast " + MapType(v.ty) + " " + v.op + " to " + tll);
+                    cv = b;
+                }
+                string safe = NT();
+                L("  " + safe + " = select i1 " + ok + ", " + tll + " " + cv + ", " + tll + " null");
+                return new ExprVal(safe, tgt);
+            }
+        }
         // remaining numeric casts are all i64 in this model; just retag
         return new ExprVal(v.op, tgt);
     }

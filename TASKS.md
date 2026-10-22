@@ -59,8 +59,17 @@
   （stderr 一次 + 安全值 null + 继续；`--strict-runtime` 下 exit 70）。
   关键坑：LLVM 不透明指针下 `%User*` 与 `%string*` 同型，检查必须放在
   `src == target` 早退**之前**，否则永远到不了。
+- **自举半边已修（2026-10-23，软诊断口径同宿主）**：`irgen_expr.zan` GenCast 的
+  引用→引用重贴标签路径补运行时检查——同型/上转/object 目标静态放行（宿主
+  static_ok 同判据，`IsSubclassName` 复用 `is` 的闭世界判定），其余走
+  `EmitClassIdTest`/`EmitStringIdTest`（`is` 同一件），失败经 `EmitRuntimeCheckIf`
+  报 "InvalidCastException: object is not an instance of the target type"
+  （行:列与宿主逐字一致——转型节点两侧同锚）+ select 安全 null；null 源按宿主
+  判 false（与 C# 不同，宿主是规格）；struct 载体、数组目标（ival≥1，自举无
+  数组运行时身份件，暂回退旧行为）与 i64 擦除载体不查。探针 `(string)o`/
+  `(Admin)o` 失败两侧同 stderr、`(User)o` 上转不报、`u2.name` 值不变。
 - 待办：可 catch 的 InvalidCastException 通道（A507 族，deferred）——探针
-  F7/F10 的 throw/catch 断言要等通道落地才能全绿；自举半边。
+  F7/F10 的 throw/catch 断言要等通道落地才能全绿。
 - 原始现象：`(string)userObj`（object 装 User）得**空字符串**；`(User)"x"`（object 装 string）得**非 null 的 User 槽**（实为 string 指针）——两边都"成功"，exit=0。C# 抛 InvalidCastException（可 catch）。
 - 根因落点：`src/compiler/irgen_expr.c` `emit_expr_cast_expr` 对引用→引用无运行时检查分支（落到 `return val`）；`is` 已有 `emit_runtime_is_check` 可复用。
 - 探针：`_scratch/csaudit/types/p09_object_cast.zan`（F6–F10）、`v_cast_min.zan`（最小复现：两方向都 null-res + 软诊断 + exit 0）。
