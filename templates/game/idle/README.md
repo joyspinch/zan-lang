@@ -17,7 +17,7 @@
 |---|---|
 | `packages/Zan.Game/src/Game/Idle/`（`namespace Game.Idle`） | `IdleState` / `IdleBuilding`：点击产出、升级成本曲线（1.15 倍率）、每秒产出、定步结算；另有离线收益、钱包、飘字 |
 | `src/Model/MineCatalog.zan` | 内容表：六座矿机的名字、描述、基础价、基础产出 |
-| `src/Program.zan` | 界面搭建、点击反馈、渲染 |
+| `src/main.zan` | 界面搭建、点击反馈、渲染 |
 | `src/ParticleSystem.zan` | 金币/火花的离屏烘焙 + `SpriteBatch` 合批绘制 |
 
 契约测试：`tests/conformance/idle_state.zan`（点击产出、成本曲线、每秒产出、定步结算的数值全锁死）。
