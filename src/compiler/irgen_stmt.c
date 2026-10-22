@@ -1022,6 +1022,10 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                                 LLVMValueRef *call_args = (LLVMValueRef *)calloc(
                                     (size_t)argc, sizeof(LLVMValueRef));
                                 call_args[0] = alloca;
+                                /* 实参里的拥有型临时量：构造函数抛异常时由展开器
+                                 * 释放（与普通方法调用路径同源判定）。 */
+                                int *arg_eh_pushed = (int *)calloc(
+                                    (size_t)argc, sizeof(int));
                                 for (int k = 0; k < ctor_args.count; k++) {
                                     zan_ast_node_t *param =
                                         ctor->decl->method_decl.params.items[k];
@@ -1029,14 +1033,20 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                                         g->binder, param->param.type);
                                     call_args[k + 1] = emit_arg_typed(
                                         g, ctor_args.items[k], pt, locals);
+                                    arg_eh_pushed[k + 1] = emit_call_arg_eh_push(
+                                        g, ctor_args.items[k], call_args[k + 1],
+                                        locals);
                                 }
                                 coerce_args_to_params(g, ctor->fn_type, call_args, argc);
                                 zan_call2(g->builder, ctor->fn_type, ctor->fn,
                                     call_args, (unsigned)argc, "");
+                                for (int k = argc - 1; k >= 0; k--)
+                                    if (arg_eh_pushed[k]) emit_eh_tmp_pop(g);
                                 for (int k = 0; k < ctor_args.count; k++)
                                     emit_release_owned_call_temp(g,
                                         ctor_args.items[k],
                                         call_args[k + 1], locals);
+                                free(arg_eh_pushed);
                                 free(call_args);
                                 ctor_called = true;
                             }

@@ -1,0 +1,65 @@
+using System;
+using System.Collections.Generic;
+
+// 构造函数在实参求值之后抛异常：实参里的拥有型临时量必须由展开器释放。
+//
+// 修之前，类构造路径（irgen_expr.c）只把「对象」压进 EH 临时栈，实参里的
+// 拥有型临时量没人登记——构造函数一抛，这些临时量就再也无人回收
+//（--check-leaks 会报出来）。普通方法调用路径一直做了这件事
+//（见 arc_throw_owned_arg）。
+class Holder {
+    public List<int> payload;
+
+    public Holder(List<int> p, bool explode) {
+        this.payload = p;
+        if (explode) { throw new Exception("boom"); }
+    }
+}
+
+// 结构体构造走的是另一条 irgen 路径（字段初始化式），实参临时量同样要登记。
+// 这里刻意在写字段**之前**抛：写字段之后的残留是另一个根因——结构体没有
+// 析构来兜住字段引用（类路径由对象析构兜住），单独立条目跟进。
+struct Pair {
+    List<int> first;
+    List<int> second;
+
+    Pair(List<int> a, List<int> b, bool explode) {
+        if (explode) { throw new Exception("boom"); }
+        this.first = a;
+        this.second = b;
+    }
+}
+
+class Prog {
+    static List<int> Make() {
+        List<int> l = new List<int>();
+        l.Add(1);
+        return l;
+    }
+
+    static void Main() {
+        // 1) 类构造抛异常：实参里的 List 临时量要由展开器回收
+        try {
+            Holder h = new Holder(Make(), true);
+        } catch (Exception e) {
+            Console.WriteLine("caught-class");
+        }
+
+        // 2) 类构造不抛：临时量只能回收一次（多回收会被 ARC guard 逮到）
+        Holder ok = new Holder(Make(), false);
+        Console.WriteLine("class-payload=" + Convert.ToString(ok.payload.Count));
+
+        // 3) 结构体构造抛异常
+        try {
+            Pair p = new Pair(Make(), Make(), true);
+        } catch (Exception e) {
+            Console.WriteLine("caught-struct");
+        }
+
+        // 4) 结构体构造不抛
+        Pair okp = new Pair(Make(), Make(), false);
+        Console.WriteLine("struct-first=" + Convert.ToString(okp.first.Count));
+
+        Console.WriteLine("done");
+    }
+}
