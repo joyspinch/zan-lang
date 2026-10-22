@@ -325,6 +325,28 @@ int changed = await this.SysUser.ResetPassword(id, salt, hash, now);
 品牌蓝，同一个语义（卡片内衬、表头、按钮高度）在不同页面取值不同——"看着
 总觉得不齐"不是审美问题，是没有单点约束。
 
+**收口验收（当前状态）**：admin.css 里裸 `font-size` 0 处、非标准字重 0 处、
+裸圆角 0 处、裸过渡时长 0 处、裸间距 2 处（见例外清单）、裸色值只剩
+`var(--on-brand, #fff)` 的兜底。改完样式跑一遍：
+
+```powershell
+$c = Get-Content packages/Zan.Mvc/wwwroot/css/admin.css -Raw
+([regex]::Matches($c,'font-size:\s*[0-9.]+px')).Count        # 0
+([regex]::Matches($c,'font-weight:\s*(?!400\b|500\b|600\b)[0-9]+')).Count  # 0
+([regex]::Matches($c,'border-radius:\s*[0-9]+px')).Count      # 0
+([regex]::Matches($c,'transition:[^;]*[0-9.]+s\b')).Count     # 0
+```
+
+**允许的例外**（写进规则之前先看这里，别把功能性值当成违规）：
+
+| 例外 | 为什么 |
+|---|---|
+| 功能性透明度 `rgba()`：开关滑钮阴影、toast 深色底、抽屉投影 | 它们是"浮在内容之上的黑胶"，与主题明暗无关 |
+| 1px `inset` 阴影画 hairline（表格钉住列、页签下划线） | 引擎没有 sub-pixel border 原语；换成 border 会改变盒模型 |
+| `margin: -1px` 页签重叠、`min(12vh, 88px)` 垂直居中 | 布局技巧与视口相关值，不属于间距阶梯 |
+| `width/height` 等控件几何（图标 18px、开关 36×20） | 阶梯管留白，不管形状 |
+| `i.c-*` 图表图例色 | 与 `js/charts.js` 的 series 调色板同步；统一到 `--viz-*` 留待 BI 看板改造 |
+
 ## 配置驱动的管理屏（Modules/Crud）
 
 大多数管理屏只有"一张表的增删改查"：`Modules/Crud` 把这一层做成引擎——
