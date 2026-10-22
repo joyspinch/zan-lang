@@ -1467,6 +1467,11 @@
 - 修法：推断分支补 native 成员判定（`zan_builtin_has_native_member`），
   返回标量自身类型，与 irgen_call.c 的原生分派点同口径。
 - 实测复验：`int.Parse("123").ToString()`→123、`double.Parse("2.5")`→2.5、
+- **自举半边平账（2026-10-23，goal round 5，实测）**：selfhost 的 Parse
+  发射本就返回 `MkType("int")`（irgen_expr.zan Parse 分支），链上 ToString
+  正常——gen1 编 `int.Parse("123").ToString()`、`(int.Parse("2147483647")
+  + 1).ToString()`（A510 自举半边修后按 32 位回绕）全过，无需改动。
+  A512 守卫套件（endptr/越界/软通道）也已在位（另一会话 fe2b8f143）。
   `long.Parse("77")`→77；`Convert.ToInt32("42").ToString()` 本来就能跑
   （42，Convert 是静态内建有成员表——本条登记时误写它也挂，更正）；
   正例回归 p11/v_parse_ok 全绿。
