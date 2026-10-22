@@ -69,5 +69,14 @@ for pair in linux-musl:x86_64 linux-arm64:aarch64 linux-riscv64:riscv64; do
         -DMINIZ_NO_TIME -DMINIZ_NO_ARCHIVE_WRITERS \
         -I "$ROOT/src/common" \
         -c "$RT/zan_inflate.c" -o "$out/zan_inflate.o"
+    # The small-object allocator's memory object: only linux-musl ships it (the
+    # other arches use the platform allocator). It was missing here while the
+    # stale-check table listed it -- the recipe and the check disagreed about
+    # what exists, so the object could never be refreshed and the freshness
+    # gate stayed red on it forever.
+    if [ "$sub" = linux-musl ]; then
+        "$ZIG" cc -target "$arch-linux-musl" -g0 -std=c11 -fPIC \
+            -I "$RT" -O2 -c "$RT/rt_mem.c" -o "$out/zanrt_mem.o"
+    fi
     echo "built toolchain/$sub: zanrt_io.o zanrt_io_mt.o zanrt_sync.o zanrt_file.o zanrt_decimal.o zanrt_timer.o libzancrypto.a zan_embed_api.o zan_inflate.o"
 done

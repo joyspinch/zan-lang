@@ -154,25 +154,31 @@ ARTIFACTS = [
     ("toolchain/macos/arm64/zan_inflate.o", INFLATE, "runtime"),
     ("toolchain/macos/x64/zan_embed_api.o", EMBED, "runtime"),
     ("toolchain/macos/x64/zan_inflate.o", INFLATE, "runtime"),
-    ("toolchain/ios/arm64/zanrt_gui.o", RT_GUI_MAC, "runtime"),
+    # iOS has no CI leg yet (its recipe is still the .cmd one), so nothing
+    # refreshes these objects automatically -- they stay "manual" (reported,
+    # not gating) until a job of its own exists. Listing them as "runtime"
+    # would keep the freshness gate red forever on a target nobody rebuilds.
+    ("toolchain/ios/arm64/zanrt_gui.o", RT_GUI_MAC, "manual"),
     # The five companions rebuild locally via zig's ios target plus zig's
     # bundled Darwin headers (-I lib/libc/include/any-macos-any -- the ios
     # os-tag does not wire them the way macos does; 2026-10-02 recipe).
-    ("toolchain/ios/arm64/zanrt_io.o", RT_IO, "runtime"),
-    ("toolchain/ios/arm64/zanrt_io_mt.o", RT_IO, "runtime"),
-    ("toolchain/ios/arm64/zanrt_sync.o", RT_SYNC, "runtime"),
-    ("toolchain/ios/arm64/zanrt_file.o", RT_FILE, "runtime"),
-    ("toolchain/ios/arm64/zanrt_decimal.o", RT_DECIMAL, "runtime"),
-    ("toolchain/ios/arm64/zanrt_timer.o", RT_TIMER, "runtime"),
-    ("toolchain/ios/arm64/zan_embed_api.o", EMBED, "runtime"),
-    ("toolchain/ios/arm64/zan_inflate.o", INFLATE, "runtime"),
+    ("toolchain/ios/arm64/zanrt_io.o", RT_IO, "manual"),
+    ("toolchain/ios/arm64/zanrt_io_mt.o", RT_IO, "manual"),
+    ("toolchain/ios/arm64/zanrt_sync.o", RT_SYNC, "manual"),
+    ("toolchain/ios/arm64/zanrt_file.o", RT_FILE, "manual"),
+    ("toolchain/ios/arm64/zanrt_decimal.o", RT_DECIMAL, "manual"),
+    ("toolchain/ios/arm64/zanrt_timer.o", RT_TIMER, "manual"),
+    ("toolchain/ios/arm64/zan_embed_api.o", EMBED, "manual"),
+    ("toolchain/ios/arm64/zan_inflate.o", INFLATE, "manual"),
     ("toolchain/ios/libSystem.tbd", ZIG_BUNDLED, "manual"),
-    ("toolchain/wasm32/zanrt_wasm.o", RT_WASM, "runtime"),
-    ("toolchain/wasm32/zanrt_file.o", RT_FILE, "runtime"),
-    ("toolchain/wasm32/zanrt_decimal.o", RT_DECIMAL, "runtime"),
-    ("toolchain/wasm32/zanrt_timer.o", RT_TIMER, "runtime"),
-    ("toolchain/wasm32/libzancrypto.a", RT_CRYPTO, "runtime"),
-    ("toolchain/wasm32/zan_inflate.o", INFLATE, "runtime"),
+    # wasm32 has no CI leg yet either (its recipe is the .cmd one and the GUI
+    # branch needs an external freetype checkout) -- reported, not gating.
+    ("toolchain/wasm32/zanrt_wasm.o", RT_WASM, "manual"),
+    ("toolchain/wasm32/zanrt_file.o", RT_FILE, "manual"),
+    ("toolchain/wasm32/zanrt_decimal.o", RT_DECIMAL, "manual"),
+    ("toolchain/wasm32/zanrt_timer.o", RT_TIMER, "manual"),
+    ("toolchain/wasm32/libzancrypto.a", RT_CRYPTO, "manual"),
+    ("toolchain/wasm32/zan_inflate.o", INFLATE, "manual"),
     # Built with mozbuild clang -fexceptions -mllvm -wasm-enable-eh (zig's
     # clang cannot emit the tag); source lives beside the object. The commit
     # below it keeps the artifact fresh by hand -- see build_cross_rt.cmd.
@@ -180,11 +186,11 @@ ARTIFACTS = [
      ["toolchain/wasm32/zanrt_ehtag.c"], "manual"),
     # Independent core/decoder/audio/game objects plus single-threaded sync,
     # all built by build_cross_rt.cmd and selected by actual native references.
-    ("toolchain/wasm32/zanrt_gui.o", WASM_GUI, "runtime"),
-    ("toolchain/wasm32/zanrt_image.o", IMAGE, "runtime"),
-    ("toolchain/wasm32/zanrt_audio.o", AUDIO, "runtime"),
-    ("toolchain/wasm32/zanrt_game.o", GAME, "runtime"),
-    ("toolchain/wasm32/zanrt_syncw.o", ["src/runtime/rt_sync_wasm.c"], "runtime"),
+    ("toolchain/wasm32/zanrt_gui.o", WASM_GUI, "manual"),
+    ("toolchain/wasm32/zanrt_image.o", IMAGE, "manual"),
+    ("toolchain/wasm32/zanrt_audio.o", AUDIO, "manual"),
+    ("toolchain/wasm32/zanrt_game.o", GAME, "manual"),
+    ("toolchain/wasm32/zanrt_syncw.o", ["src/runtime/rt_sync_wasm.c"], "manual"),
     # wasi-libc subset + external prebuilts (freetype archive): no repo source.
     ("toolchain/wasm32/crt1.o", ZIG_BUNDLED, "manual"),
     ("toolchain/wasm32/libc.a", ZIG_BUNDLED, "manual"),
@@ -193,22 +199,27 @@ ARTIFACTS = [
     ("toolchain/wasm32/libclang_rt.builtins-wasm32.a", ZIG_BUNDLED, "manual"),
     ("toolchain/wasm32/libfreetype.a", ZIG_BUNDLED, "manual"),
     # Android (bionic) runtime objects: built with the NDK's clang per the
-    # recipe in build_cross_rt.cmd -- zig cc has no bionic target.
-    ("toolchain/android-x64/zanrt_io.o", RT_IO, "manual"),
-    ("toolchain/android-x64/zanrt_sync.o", RT_SYNC, "manual"),
-    ("toolchain/android-x64/zanrt_file.o", RT_FILE, "manual"),
-    ("toolchain/android-x64/zanrt_timer.o", RT_TIMER, "manual"),
-    ("toolchain/android-x64/libzancrypto.a", RT_CRYPTO, "manual"),
-    ("toolchain/android-arm64/zanrt_io.o", RT_IO, "manual"),
-    ("toolchain/android-arm64/zanrt_sync.o", RT_SYNC, "manual"),
-    ("toolchain/android-arm64/zanrt_file.o", RT_FILE, "manual"),
-    ("toolchain/android-arm64/zanrt_timer.o", RT_TIMER, "manual"),
-    ("toolchain/android-arm64/libzancrypto.a", RT_CRYPTO, "manual"),
+    # recipe in build_cross_rt.cmd -- zig cc has no bionic target. The
+    # android-objects job (toolchain.yml) owns these since 2026-10-22: it
+    # downloads the NDK, runs scripts/build_android_rt.sh and commits the
+    # result, so they are gated like every other CI-owned bundle.
+    ("toolchain/android-x64/zanrt_io.o", RT_IO, "runtime"),
+    ("toolchain/android-x64/zanrt_sync.o", RT_SYNC, "runtime"),
+    ("toolchain/android-x64/zanrt_file.o", RT_FILE, "runtime"),
+    ("toolchain/android-x64/zanrt_decimal.o", RT_DECIMAL, "runtime"),
+    ("toolchain/android-x64/zanrt_timer.o", RT_TIMER, "runtime"),
+    ("toolchain/android-x64/libzancrypto.a", RT_CRYPTO, "runtime"),
+    ("toolchain/android-arm64/zanrt_io.o", RT_IO, "runtime"),
+    ("toolchain/android-arm64/zanrt_sync.o", RT_SYNC, "runtime"),
+    ("toolchain/android-arm64/zanrt_file.o", RT_FILE, "runtime"),
+    ("toolchain/android-arm64/zanrt_decimal.o", RT_DECIMAL, "runtime"),
+    ("toolchain/android-arm64/zanrt_timer.o", RT_TIMER, "runtime"),
+    ("toolchain/android-arm64/libzancrypto.a", RT_CRYPTO, "runtime"),
     # Embedded-resource pair, NDK clang recipe (same block as above).
-    ("toolchain/android-x64/zan_embed_api.o", EMBED, "manual"),
-    ("toolchain/android-x64/zan_inflate.o", INFLATE, "manual"),
-    ("toolchain/android-arm64/zan_embed_api.o", EMBED, "manual"),
-    ("toolchain/android-arm64/zan_inflate.o", INFLATE, "manual"),
+    ("toolchain/android-x64/zan_embed_api.o", EMBED, "runtime"),
+    ("toolchain/android-x64/zan_inflate.o", INFLATE, "runtime"),
+    ("toolchain/android-arm64/zan_embed_api.o", EMBED, "runtime"),
+    ("toolchain/android-arm64/zan_inflate.o", INFLATE, "runtime"),
     # app-glue object + dynamic crt + the NDK stub/link .so set: NDK-derived.
     ("toolchain/android-x64/android_native_app_glue.o", ANDROID_NDK, "manual"),
     ("toolchain/android-x64/crtbegin_dynamic.o", ANDROID_NDK, "manual"),
@@ -231,25 +242,26 @@ ARTIFACTS = [
     # win-arm64/win-x64 PE objects: built by scripts/build_win_rt.sh with the
     # matching MSYS2 CLANGARM64/MINGW64 clang of the CI drivers.yml job (mingw
     # ABI; zig's own mingw headers are a different vintage, so no byte-stable
-    # local builder). Report staleness; rebuild in that environment.
-    ("toolchain/win-arm64/zanrt_io.o", RT_IO, "manual"),
-    ("toolchain/win-arm64/zanrt_io_mt.o", RT_IO, "manual"),
-    ("toolchain/win-arm64/zanrt_sync.o", RT_SYNC, "manual"),
-    ("toolchain/win-arm64/zanrt_file.o", RT_FILE, "manual"),
-    ("toolchain/win-arm64/zanrt_decimal.o", RT_DECIMAL, "manual"),
-    ("toolchain/win-arm64/zanrt_timer.o", RT_TIMER, "manual"),
-    ("toolchain/win-arm64/libzancrypto.a", RT_CRYPTO, "manual"),
-    ("toolchain/win-arm64/zan_embed_api.o", EMBED, "manual"),
-    ("toolchain/win-arm64/zan_inflate.o", INFLATE, "manual"),
-    ("toolchain/win-x64/zanrt_io.o", RT_IO, "manual"),
-    ("toolchain/win-x64/zanrt_io_mt.o", RT_IO, "manual"),
-    ("toolchain/win-x64/zanrt_sync.o", RT_SYNC, "manual"),
-    ("toolchain/win-x64/zanrt_file.o", RT_FILE, "manual"),
-    ("toolchain/win-x64/zanrt_decimal.o", RT_DECIMAL, "manual"),
-    ("toolchain/win-x64/zanrt_timer.o", RT_TIMER, "manual"),
-    ("toolchain/win-x64/libzancrypto.a", RT_CRYPTO, "manual"),
-    ("toolchain/win-x64/zan_embed_api.o", EMBED, "manual"),
-    ("toolchain/win-x64/zan_inflate.o", INFLATE, "manual"),
+    # local builder). That job rebuilds and commits them on every runtime
+    # change, so they are gated like the other CI-owned bundles.
+    ("toolchain/win-arm64/zanrt_io.o", RT_IO, "runtime"),
+    ("toolchain/win-arm64/zanrt_io_mt.o", RT_IO, "runtime"),
+    ("toolchain/win-arm64/zanrt_sync.o", RT_SYNC, "runtime"),
+    ("toolchain/win-arm64/zanrt_file.o", RT_FILE, "runtime"),
+    ("toolchain/win-arm64/zanrt_decimal.o", RT_DECIMAL, "runtime"),
+    ("toolchain/win-arm64/zanrt_timer.o", RT_TIMER, "runtime"),
+    ("toolchain/win-arm64/libzancrypto.a", RT_CRYPTO, "runtime"),
+    ("toolchain/win-arm64/zan_embed_api.o", EMBED, "runtime"),
+    ("toolchain/win-arm64/zan_inflate.o", INFLATE, "runtime"),
+    ("toolchain/win-x64/zanrt_io.o", RT_IO, "runtime"),
+    ("toolchain/win-x64/zanrt_io_mt.o", RT_IO, "runtime"),
+    ("toolchain/win-x64/zanrt_sync.o", RT_SYNC, "runtime"),
+    ("toolchain/win-x64/zanrt_file.o", RT_FILE, "runtime"),
+    ("toolchain/win-x64/zanrt_decimal.o", RT_DECIMAL, "runtime"),
+    ("toolchain/win-x64/zanrt_timer.o", RT_TIMER, "runtime"),
+    ("toolchain/win-x64/libzancrypto.a", RT_CRYPTO, "runtime"),
+    ("toolchain/win-x64/zan_embed_api.o", EMBED, "runtime"),
+    ("toolchain/win-x64/zan_inflate.o", INFLATE, "runtime"),
     # The NDK sysroot subset (crt + libc/libm/libdl + compiler-rt builtins)
     # tracks the NDK itself, not repo sources -- report-only, refreshed by hand.
     ("toolchain/android-x64/libc.a", ANDROID_NDK, "manual"),
