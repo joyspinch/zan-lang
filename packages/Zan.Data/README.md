@@ -10,7 +10,13 @@ to zanc (project `packages/`, `.zan-packages/`, or a toolchain-relative
 - `System.Data.Orm` — ZanSQL ORM. `[DbTable]` models plus
   `db.Select<T>()` fluent queries; the compiler's ORM codegen
   (`System/Compiler/ZanGen.zan`) emits the per-entity facades, so user code
-  never spells `OrmMeta`/`OrmSelect` directly.
+  never spells `OrmMeta`/`OrmSelect` directly. Navigation is **bidirectional**:
+  `Include(p => p.user)` joins the parent into the child row, and
+  `Children(parentId)` / `ChildrenOf(parentTable, parentId)` fetch the
+  children of a parent row — the reverse relation is *derived* from the
+  child's navigation declaration (foreign key column = `<navField>Id`, the
+  same convention as the join's ON clause), so callers never spell the
+  foreign key column by hand.
 - Wire-protocol drivers (no ODBC needed): `System.Data.MySql`,
   `System.Data.Postgres` (native `pq` driver bundle under `drivers/`),
   `System.Data.SqlServer` (TDS), `System.Data.Sqlite` (embedded),

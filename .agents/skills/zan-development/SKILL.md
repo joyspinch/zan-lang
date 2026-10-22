@@ -96,6 +96,12 @@ Without MCP the same index is a file: `knowledge/symbols.json` next to the SDK
   `public async string Handle(JsonValue)`）——编译、运行都对。**最坑的是
   同步 lambda 赋给 async 委托**：不报错，但**调用返回空串**（实测
   `r3=` 空），静默错、还看不出错。所以异步委托一律用具名方法。
+* **async 方法的静态类型就是它的结果类型，不是 `Task<T>`**（实证，2026-10-22）：
+  `Task<List<int>> t = MakeAsync();` 报 "cannot convert 'List<int>' to
+  'Task<List<int>>' in initializer"；把 async 调用先存进 `Task<T>` 变量再
+  `await`，编译器认为 `await` 的结果**还是那个 Task 本身**（类型对不上）。
+  **直接 `await f()`**（`List<int> b = await MakeAsync();` 编译运行都对）。
+  推论：Zan 里 `Task<T>` 变量几乎没有用武之地——async 调用与它的结果同型。
 * **字符串方法是编译器内建，不在 stdlib 里**：`Trim` / `ToLower` /
   `ToUpper` / `StartsWith` / `EndsWith` / `Substring` / `IndexOf` /
   `LastIndexOf` / `Split` / `Replace` / `Contains` / `Equals` 定义在

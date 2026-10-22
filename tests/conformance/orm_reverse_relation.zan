@@ -1,0 +1,198 @@
+// ORM **反向关系**（父 → 子）——从子实体的导航声明反推，按父行取子集合。
+//
+// 覆盖：
+// - **反推**：外键列名沿用 `<导航字段名>Id`（`OrmNav.Join` 的 ON 子句同一
+//   约定），调用方不用手写外键列名。
+// - **反向取子集合**：`Children(id)`（子实体只有一个导航时）与
+//   `ChildrenOf(父表, id)`（显式指定父表）。
+// - **歧义不猜**：子实体有多个导航时 `Children` 抛异常并说清怎么办——
+//   猜错会静默返回另一个父的子集合。
+// - **找不到父表** → 空集合，不是崩。
+// - **文本外键**：父行 id 是字符串时按文本绑定。
+// - **外键没被映射** → 明确报错（不是干巴巴的 "has no column"）。
+// - 异步版与同步版等价。
+// - **正向导航没被改坏**：`Include` 仍然把父行的列带进子行。
+using System;
+using System.Collections.Generic;
+using System.Data;
+using System.Data.Orm;
+using System.Data.Sqlite;
+using System.IO;
+
+class User {
+    int id;
+    string name;
+    bool active;
+}
+
+class UserPoint {
+    int id;
+    int userId;
+    int points;
+    User user;
+}
+
+// 两个导航：反查时必须指明父表。
+class Shop {
+    int id;
+    string title;
+}
+
+class Sale {
+    int id;
+    int userId;
+    int shopId;
+    User user;
+    Shop shop;
+}
+
+// 文本外键。
+class Tag {
+    int id;
+    string name;
+}
+
+class Note {
+    int id;
+    string tagId;
+    Tag tag;
+}
+
+// 声明了导航，但外键列**没有**映射成实体字段。
+class Orphan {
+    int id;
+    int points;
+    User user;
+}
+
+class Program {
+    static int failures = 0;
+
+    static void Ok(bool cond, string name) {
+        if (cond) {
+            Console.WriteLine("ok " + name);
+        } else {
+            Console.WriteLine("FAIL " + name);
+            Program.failures = Program.failures + 1;
+        }
+    }
+
+    static void Main() {
+        string path = "orm_reverse_relation.tmp.db";
+        File.Delete(path);
+        SqliteConnection db = SqliteConnection.Open(path);
+        db.Execute("CREATE TABLE User (id INTEGER PRIMARY KEY, name TEXT, active INTEGER)");
+        db.Execute("CREATE TABLE UserPoint (id INTEGER PRIMARY KEY, userId INTEGER, points INTEGER)");
+        db.Execute("CREATE TABLE Shop (id INTEGER PRIMARY KEY, title TEXT)");
+        db.Execute("CREATE TABLE Sale (id INTEGER PRIMARY KEY, userId INTEGER, shopId INTEGER)");
+        db.Execute("CREATE TABLE Tag (id INTEGER PRIMARY KEY, name TEXT)");
+        db.Execute("CREATE TABLE Note (id INTEGER PRIMARY KEY, tagId TEXT)");
+        db.Execute("CREATE TABLE Orphan (id INTEGER PRIMARY KEY, points INTEGER)");
+        db.Execute("INSERT INTO User VALUES (1, 'Alice', 1), (2, 'Bob', 0), (3, 'Carol', 1)");
+        db.Execute("INSERT INTO UserPoint VALUES (10, 1, 120), (11, 2, 80), (12, 3, 200), (13, 1, 40), (14, 9, 300)");
+        db.Execute("INSERT INTO Shop VALUES (1, 'Corner'), (2, 'Mall')");
+        db.Execute("INSERT INTO Sale VALUES (20, 1, 1), (21, 2, 1), (22, 1, 2)");
+        db.Execute("INSERT INTO Tag VALUES (1, 'x'), (2, 'y')");
+        db.Execute("INSERT INTO Note VALUES (30, 'x'), (31, 'y'), (32, 'x')");
+        db.Execute("INSERT INTO Orphan VALUES (40, 7), (41, 8)");
+
+        // ---- 1. 反向取子集合（唯一的导航） ----
+        {
+            List<UserPoint> pts = db.Query<UserPoint>().Children(1);
+            Ok(pts.Count == 2, "children count");
+            // 不断言顺序（`Children` 返回的是集合，SQL 不保证顺序）——
+            // 只断言"这两个 id 都在"。
+            bool ids = false;
+            if (pts.Count == 2) {
+                int a = pts[0].id;
+                int b = pts[1].id;
+                ids = (a == 10 && b == 13) || (a == 13 && b == 10);
+            }
+            Ok(ids, "children ids");
+            Console.WriteLine("children of user 1: " + Convert.ToString(pts.Count)
+                + " idsum=" + Convert.ToString(pts.Count == 2 ? pts[0].id + pts[1].id : 0));
+        }
+
+        // ---- 2. 显式父表 ----
+        {
+            List<UserPoint> pts = db.Query<UserPoint>().ChildrenOf("User", 1);
+            Ok(pts.Count == 2, "childrenOf count");
+            // 表名大小写不同也认（SQL 里表名通常不区分大小写）。
+            List<UserPoint> pts2 = db.Query<UserPoint>().ChildrenOf("user", 1);
+            Ok(pts2.Count == 2, "childrenOf case-insensitive table");
+        }
+
+        // ---- 3. 找不到的父行 / 找不到的父表 → 空集合 ----
+        {
+            List<UserPoint> none = db.Query<UserPoint>().Children(999);
+            Ok(none.Count == 0, "children of unknown parent is empty");
+            List<UserPoint> bad = db.Query<UserPoint>().ChildrenOf("Nope", 1);
+            Ok(bad.Count == 0, "childrenOf unknown table is empty");
+        }
+
+        // ---- 4. 多个导航 → 歧义抛异常（不猜） ----
+        {
+            string msg = "";
+            bool threw = false;
+            try {
+                db.Query<Sale>().Children(1);
+            } catch (Exception e) {
+                threw = true;
+                msg = e.Message;
+            }
+            Ok(threw, "ambiguous children throws");
+            Ok(msg.IndexOf("ChildrenOf") >= 0, "ambiguous message names the way out");
+            Console.WriteLine("ambiguous: " + msg);
+            // 指明父表就不歧义了。
+            List<Sale> ofShop = db.Query<Sale>().ChildrenOf("Shop", 1);
+            Ok(ofShop.Count == 2, "childrenOf picks the named parent");
+        }
+
+        // ---- 5. 文本外键 ----
+        {
+            List<Note> notes = db.Query<Note>().Children("x");
+            Ok(notes.Count == 2, "text fk children count");
+            Console.WriteLine("notes of tag x: " + Convert.ToString(notes.Count));
+        }
+
+        // ---- 6. 外键没被映射 → 明确报错 ----
+        {
+            string msg = "";
+            bool threw = false;
+            try {
+                db.Query<Orphan>().Children(1);
+            } catch (Exception e) {
+                threw = true;
+                msg = e.Message;
+            }
+            Ok(threw, "unmapped foreign key throws");
+            Ok(msg.IndexOf("userId") >= 0, "unmapped message names the column");
+            Console.WriteLine("unmapped: " + msg);
+        }
+
+        // ---- 7. 异步版等价 ----
+        {
+            List<UserPoint> pts = await db.Query<UserPoint>().ChildrenAsync(1);
+            Ok(pts.Count == 2, "childrenAsync count");
+        }
+
+        // ---- 8. 正向导航没被改坏 ----
+        {
+            List<UserPoint> inc = db.Query<UserPoint>()
+                .Include(p => p.user)
+                .OrderBy(p => p.id)
+                .ToList();
+            Ok(inc.Count == 5, "include rows");
+            Ok(inc.Count > 0 && inc[0].user != null && inc[0].user.name == "Alice",
+                "include fills parent");
+            bool miss = inc.Count > 4 && inc[4].user == null;
+            Ok(miss, "include leaves orphan null");
+            Console.WriteLine("include nav0: "
+                + (inc.Count > 0 && inc[0].user != null ? inc[0].user.name : "-"));
+        }
+
+        db.Close();
+        File.Delete(path);
+        Console.WriteLine("failures=" + Convert.ToString(Program.failures));
+    }
+}

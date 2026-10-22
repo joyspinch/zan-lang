@@ -104,6 +104,14 @@ Without MCP the same index is a file: `knowledge/symbols.json` next to the SDK
   trap is a **sync lambda assigned to an async delegate**: no error, but the
   call **returns an empty string** (measured: `r3=` empty) — a silent
   failure. Always use a named method for async delegates.
+* **An async method's static type is its result type, not `Task<T>`**
+  (verified 2026-10-22): `Task<List<int>> t = MakeAsync();` fails with
+  "cannot convert 'List<int>' to 'Task<List<int>>' in initializer", and
+  storing the async call in a `Task<T>` variable before awaiting makes the
+  compiler treat the awaited value as the Task itself (type mismatch).
+  **Just `await f()` directly** (`List<int> b = await MakeAsync();` compiles
+  and runs). Corollary: a `Task<T>` variable has almost no use in Zan — an
+  async call and its result share a type.
 * **String methods are compiler builtins, not stdlib code**: `Trim`,
   `ToLower`, `ToUpper`, `StartsWith`, `EndsWith`, `Substring`, `IndexOf`,
   `LastIndexOf`, `Split`, `Replace`, `Contains`, `Equals` live in the
