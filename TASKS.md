@@ -6,10 +6,10 @@
 >
 > 平账纪律：闭账条目当批移出
 >
-> 2026-10-22 平账：移出 47 条已闭账条目（A390/A393/A394/A395/A396/A397/A399/
+> 2026-10-22 平账：移出 48 条已闭账条目（A390/A393/A394/A395/A396/A397/A399/
 > A400/A401/A402/A403/A404/A405/A406/A407/A413/A415/A416/A428/A431/A432/A437/
 > A441/A442/A445/A447/A448/A449/A463/A473/A474/A475/A476/A477/A478/A479/A480/
-> A481/A483/A484/A485/A488/A491/A492/A497/A500/A505）。编号不复用，结论与验证见 git 历史。
+> A481/A483/A484/A485/A488/A491/A492/A497/A500/A502/A505）。编号不复用，结论与验证见 git 历史。
 
 ## 未完成
 
@@ -917,36 +917,6 @@
   GUI 请用 `--emit-lib`），不是一串 undefined symbol；OHOS 的 GUI 走
   `--emit-lib` 实测**链接成功**。
 - 关联：A493（归档成员机制）、A502、A503、A499。
-
-### [~] A502 `toolchain/android-x64/zanrt_sync.o` 停在 10-05——GUI 交叉链接缺 `zan_ui_thread_set`
-
-- 现象（2026-10-22 A501 扫描）：`--target android-x64` 链接 GUI 程序报
-  `undefined symbol: zan_ui_thread_set`（引用方是用户对象里的
-  `Gui_Dispatcher_Init`）。同一目标 android-arm64 **是绿的**。
-- 根因：两个 arch 的 `zanrt_sync.o` 不是同一代——arm64 是 10-12 重出的（有
-  `zan_ui_thread_set`），**x64 还是 10-05 的旧对象**（只有 `zan_dispatch_*`）。
-  `zan_ui_thread_set` 是后来加进 `rt_sync.c` 的，旧对象里没有。
-- 真正的根因不是"这个对象旧了"，是**没有任何机制会重出 android 的对象**：
-  `.github/workflows/` 里**没有任何一处**重建它们（toolchain.yml 只管
-  linux×3 + macos×2，drivers.yml 只管 win×2），全靠"谁记得手跑一次配方"。
-  症状只是这条的一个侧面。
-- 补法（2026-10-22 已落地前两步）：
-  ① **一条命令**：`scripts/build_android_rt.sh [ndk-root]`（新增，NDK 版配方，
-     与 `build_cross_rt.cmd` 的 android 块同旗标同顺序；顺带把 NDK sysroot
-     子集的拷贝也写进脚本——那一步此前只存在于注释里，没人做）。
-  ② **CI 自动重出**：toolchain.yml 新增 `android-objects` job（下载 NDK r27b
-     → 跑上面的脚本 → 提交 `toolchain/android-*/` 的产物）。该 job 标了
-     `continue-on-error`：脚本是在**没有 NDK 的机器**上写的，第一次在 CI 跑
-     就是它的第一次执行，失败不该把整条流水线染红，看日志修即可。
-  ③ 剩下的**产物**要等一台有 NDK 的机器（或那个 CI job）跑一次。
-- 未验证：`build_android_rt.sh` 在写它的机器上没有 NDK，**没实跑过**（脚本每
-  步都有存在性检查，缺文件会点名而不是静默跳过）。
-- 另一处同源的缺口（2026-10-22 查 macOS 时顺带发现）：**android-x64 的
-  `zanrt_decimal.o` 根本不存在**，而 android-arm64 有 ⇒ android-x64 交叉编译
-  一个用到 decimal 的程序会死在 "no bundled runtime objects for this target"。
-  同一个 NDK 重建会补上（`build_android_rt.sh` 已产出它，CI 提交清单用的是
-  `zanrt_*.o` 通配，覆盖得到）。
-- 关联：A501（A501 扫描发现的第一个"对象比源码旧"的实例）、A493、A504。
 
 ### [~] A503 OHOS 的 GUI 交叉链接缺 EGL/GLES——静态 exe 形态装不下预编译驱动的 GL 依赖
 
