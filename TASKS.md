@@ -1957,7 +1957,7 @@
   类型丢掉——而拼出来的 IR 只能靠 clang/llvm-as 验证，肉眼看 `null` 完全合理。
 - 关联：A483（同一个测试的前一道坎）、A481 / A482（自举侧同一条战线）。
 
-### [ ] A488 `Zan.Gui` 里有 4 类指向**不存在命名空间**的 `using` —— 编译期打 `ZANPKG_MISSING`
+### [x] A488 `Zan.Gui` 里有 4 类指向**不存在命名空间**的 `using` —— 编译期打 `ZANPKG_MISSING`
 
 - 现象（2026-10-22 落地 `Zan.Game.Debug` 时撞到）：凡是编译到 `Zan.Gui`
   的目标，编译器都往 stderr 打四条
@@ -1979,8 +1979,29 @@
   零警告"这类验收门无法成立。
 - 方向：删掉这四类**无效**的 `using` 声明（先确认文件里没用到对应命名
   空间的类型——`System.Text.Json` 那两处大概率是想用 `System.Json`）。
+- 修法（2026-10-22 落地）：**97 个文件、97 行**——`packages/Zan.Gui`（47）、
+  `packages/Zan.Gui.CodeEditor`（47）、`packages/Zan.Industrial`（3）：
+  - `using System.Runtime.InteropServices;`（15）、`using Gui.Styling;`（1）、
+    `using Gui.Rendering;`（50）——**直接删**。这三个命名空间在仓库里不存在，
+    编译器按"命名空间 = 目录"查不到（`zan_pkg_source_index_visit` 的
+    `pkg_index_find_namespace` 按**声明的命名空间**建桶，`Gui/Rendering`
+    目录下的文件声明的是 `namespace Gui;`），所以这些 `using` 除了那条警告
+    之外**什么也没做**——删掉不改变任何名字解析。
+  - `using System.Text.Json;`（31）——其中 **10 个文件真的在用**
+    `JsonValue` / `JsonDoc` / `JsonReader` / `JsonSerializer`，**改成
+    `using System.Json;`**（JSON 在 `stdlib/System/Json/`，命名空间
+    `System.Json`；仓库里 6757 个文件已经这么写）。剩下 21 个没用到 JSON
+    类型的，**直接删**。那 10 个文件此前是靠 `using System;` 把
+    `stdlib/System` 整棵子树拉进来才碰巧解析到 `JsonValue` 的——兜底
+    解析能用，但依赖的是副作用而不是声明。
+  - 验证：编译拉入 `Gui` / `Gui.Component`（CodeEditor）/ `Gui.Hmi`
+    （Industrial）三个包的探针，stderr 的 `ZANPKG_MISSING` 从 4 条降到
+    **0 条**，退出码 0；受影响的 conformance 用例（`gui_input` /
+    `unified_layout_model` / `designer_prepared_async` / `designer_html` /
+    `chart_resolved` / `datatable_hardening` / `app_icon` /
+    `commercial_industrial_hardening` / `ecosystem_hardening` /
+    `game_render3d`）全绿。
 - 关联：`Zan.Game.Debug`（`docs/ECOSYSTEM_ROADMAP.md` §1.29）。
-  `packages/Zan.Gui/**` 在并发会话的在途区域，本轮未动。
 
 ### [ ] A489 GPU 3D 片元着色器把光照写死成固定键光——没有材质与光源 uniform 通路
 
