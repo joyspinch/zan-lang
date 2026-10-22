@@ -1,0 +1,263 @@
+using System;
+using System.Collections.Generic;
+using System.Json;
+using Gui;
+using Gui.Backend;
+using Gui.Component;
+using Gui.Widget;
+
+/* 通知中心页：左栏分类（全部 / 未读 / 派工 / 提及），右栏通知列表。
+ *
+ * 页面范式（运行期文档 + 模型宿主）：
+ *   - 骨架与样式在 WxPageNotify.html（运行期装载：样式随装载并进
+ *     appCss、作用域类自动混入，不与别的文档互串，也不必再把各文档
+ *     的 Css 手工拼进同一次 UseAppCss）；
+ *   - 数据在模型（JsonValue）：列表走 <template data-for>，行内
+ *     data-bind 取行作用域，data-if 做条件显隐（未读圆点、空态、
+ *     「去工作台」钮）；
+ *   - 事件由 ModelBinder 的处理器表按名字接线：行点击走 sender 槽
+ *     （行内的处理器只知道"点了某一行"，是谁靠控件的行作用域反查）。
+ *
+ * 数据源是服务端 /api/notify/items（只返回本人收件的通知）。点一行
+ * 即标记该条已读（角标同步减一），底栏显示该条正文；流程类通知给
+ * 一个「去工作台」的跳转——跳转回调由 App 注入，页面不直接依赖主窗
+ * 类（页面可独立复用）。 */
+public class WxPageNotify : Control {
+    ModelBinder binder;
+    JsonValue model;
+    App host;
+    ListView<string> filters;
+    List<string> names;
+    List<WxNotifyItem> all;
+    int cur;
+    // 通知角标（叠在导航栏「通知」按钮右上角，由 App 装配时交进来）。
+    public Badge badge;
+    // 跳工作台（App 注入的回调；空则不显示跳转钮）。
+    public Action onGoWork;
+
+    WxPageNotify() {
+        this.InitControl("wxPageNotify", 5);
+        this.Class = "wxmain";
+        names = new List<string>();
+        names.Add("全部");
+        names.Add("未读");
+        names.Add("派工");
+        names.Add("提及");
+        all = new List<WxNotifyItem>();
+        cur = 0;
+        // 模型 = 界面的唯一数据源：标题、搜索词、列表、空态、底栏
+        // 全在这里，控件只负责呈现。
+        model = JsonValue.NewObject();
+        model.Set("title", JsonValue.NewStr("全部"));
+        model.Set("keyword", JsonValue.NewStr(""));
+        model.Set("empty", JsonValue.NewBool(false));
+        model.Set("showGoWork", JsonValue.NewBool(false));
+        model.Set("footText", JsonValue.NewStr(""));
+        model.Set("items", JsonValue.NewArray());
+    }
+
+    // 装载页面：运行期文档建树 + 模型宿主挂上（绑定声明由此生效）。
+    // 装载器不带处理器表——事件统一由 binder 的 Wire 接线，否则同一
+    // 个控件两条订阅，一次点击触发两遍。
+    void Build(App app) {
+        this.host = app;
+        Control ui = app.LoadHtmlWith(WxPageNotifyHtml.Doc, null, "");
+        if (ui == null) { return; }
+        ui.DockFill();
+        this.Add(ui);
+
+        // 左栏分类（标准库 ListView；行模板是代码建的控件，不吃文档
+        // 作用域类，样式留在皮肤层）。
+        Control filterHost = ui.Find("NotifyFilterHost");
+        if (filterHost != null) {
+            filters = new ListView<string>(WxFilterRow.Of);
+            filters.Class = "wxlist grow";
+            filters.Bind(names);
+            filters.OnSelect(() => { this.SwitchTab(filters.SelectedIndex()); });
+            filterHost.Add(filters);
+        }
+
+        binder = new ModelBinder();
+        binder.Handle("notify-readall", () => { this.ReadAll(); });
+        binder.Handle("notify-search", () => { this.Refilter(); });
+        binder.Handle("notify-work", () => {
+            if (this.onGoWork != null) { this.onGoWork(); }
+        });
+        binder.HandleSender("notify-open", (Control c) => { this.OpenRow(c); });
+        binder.SetRoot(ui, model);
+        binder.Wire();
+        ModelHosts.Register(app, binder);
+    }
+
+    // 进页重拉：通知是别人推给我的数据，进页面就是最新的。
+    void OnShow() {
+        this.Load();
+    }
+
+    // 角标轮询：轻量端点只回未读数与最近几条——实时事件通道未就位时
+    // 的兜底，与会话刷新同款节奏（聊天的 1.5s 太密，通知 5s 足够）。
+    void Beat() {
+        if (!WxNet.LoggedIn()) { return; }
+        WxNetReq r = WxNet.NewReq();
+        WxNet.ApiGet(r, "/api/notify/unread", () => {
+            try {
+                if (!WxNet.OkOf(r)) { return; }
+                JsonValue d = WxNet.DataOf(r);
+                if (d == null) { return; }
+                this.SetBadge(Convert.ToInt32(d.Str("count", "0")));
+            } catch (Exception ex) {
+                // 轮询失败静默：网络抖动不该在界面上刷错误。
+            }
+        });
+    }
+
+    // 拉整页通知（上限 100 条——内部工具的通知量级，够用且省往返）。
+    void Load() {
+        if (!WxNet.LoggedIn()) { return; }
+        WxNetReq r = WxNet.NewReq();
+        WxNet.ApiGet(r, "/api/notify/items?limit=100", () => {
+            try {
+                if (!WxNet.OkOf(r)) {
+                    this.Foot("加载失败：" + WxNet.ErrOf(r));
+                    return;
+                }
+                JsonValue d = WxNet.DataOf(r);
+                if (d == null) {
+                    this.Foot("加载失败：应答里没有数据");
+                    return;
+                }
+                all.Clear();
+                JsonValue items = d.Get("items");
+                int n = items == null ? 0 : items.Count();
+                for (int i = 0; i < n; i = i + 1) {
+                    all.Add(WxNotifyItem.FromJson(items.At(i)));
+                }
+                this.SetBadge(Convert.ToInt32(d.Str("unread", "0")));
+                this.Refilter();
+            } catch (Exception ex) { this.Foot(ex.Message); }
+        });
+    }
+
+    // 分类切换：全部 / 未读 / 派工 / 提及（在拉回的这一页里过）。
+    void SwitchTab(int i) {
+        if (i < 0 || i >= names.Count) { i = 0; }
+        cur = i;
+        this.Refilter();
+    }
+
+    // 过滤 + 回填模型：分类 + 搜索词，结果写回模型，列表由绑定展开。
+    void Refilter() {
+        string kw = model.Str("keyword", "");
+        JsonValue arr = JsonValue.NewArray();
+        int n = 0;
+        for (int k = 0; k < all.Count; k = k + 1) {
+            WxNotifyItem it = all[k];
+            if (!this.Hit(cur, it)) { continue; }
+            if (kw != "" && it.title.IndexOf(kw) < 0
+                && it.content.IndexOf(kw) < 0) { continue; }
+            JsonValue o = JsonValue.NewObject();
+            o.Set("id", JsonValue.NewStr(it.id));
+            o.Set("title", JsonValue.NewStr(it.title));
+            o.Set("content", JsonValue.NewStr(it.content));
+            o.Set("time", JsonValue.NewStr(WxIm.ClockOf(it.at)));
+            o.Set("unread", JsonValue.NewBool(it.unread));
+            arr.Append(o);
+            n = n + 1;
+        }
+        model.Set("items", arr);
+        model.Set("empty", JsonValue.NewBool(n == 0));
+        model.Set("title", JsonValue.NewStr(names[cur] + "（"
+            + Convert.ToString(n) + "）"));
+        this.Redraw();
+    }
+
+    // 分类命中：未读 / 派工 / 提及各自过滤，其余（全部）不滤。
+    bool Hit(int tab, WxNotifyItem it) {
+        if (tab == 1) { return it.unread; }
+        if (tab == 2) { return it.kind == "assign"; }
+        if (tab == 3) { return it.kind == "mention"; }
+        return true;
+    }
+
+    // 点行：标记该条已读 + 底栏显示正文。sender 槽拿到的控件带行
+    // 作用域（模型项），据此认出是哪一条。
+    void OpenRow(Control c) {
+        if (binder == null || c == null) { return; }
+        JsonValue row = binder.ScopeOf(c);
+        if (row == null) { return; }
+        WxNotifyItem it = this.FindById(row.Str("id", ""));
+        if (it == null) { return; }
+        this.ShowDetail(it);
+        if (!it.unread) { return; }
+        WxNetReq r = WxNet.NewReq();
+        WxNet.ApiPost(r, "/api/notify/read", "id=" + it.id, () => {
+            try {
+                if (!WxNet.OkOf(r)) { return; }
+                JsonValue d = WxNet.DataOf(r);
+                if (d == null) { return; }
+                if (it == null) { return; }
+                it.unread = false;
+                this.SetBadge(Convert.ToInt32(d.Str("unread", "0")));
+                this.Refilter();
+            } catch (Exception ex) { this.Foot(ex.Message); }
+        });
+    }
+
+    // 按 id 找回条目（行模型只带展示字段，操作要用完整条目）。
+    WxNotifyItem FindById(string id) {
+        if (id == "") { return null; }
+        for (int i = 0; i < all.Count; i = i + 1) {
+            if (all[i].id == id) { return all[i]; }
+        }
+        return null;
+    }
+
+    // 全部已读：一次清空，角标归零。
+    void ReadAll() {
+        WxNetReq r = WxNet.NewReq();
+        WxNet.ApiPost(r, "/api/notify/read", "id=0", () => {
+            try {
+                if (!WxNet.OkOf(r)) {
+                    this.Foot("标记失败：" + WxNet.ErrOf(r));
+                    return;
+                }
+                for (int i = 0; i < all.Count; i = i + 1) {
+                    all[i].unread = false;
+                }
+                this.SetBadge(0);
+                this.Refilter();
+                this.Foot("已全部标记为已读");
+            } catch (Exception ex) { this.Foot(ex.Message); }
+        });
+    }
+
+    // 底栏：正文 + 流程类通知的「去工作台」（按条件插拔）。
+    void ShowDetail(WxNotifyItem it) {
+        model.Set("footText", JsonValue.NewStr(it.content));
+        model.Set("showGoWork", JsonValue.NewBool(it.module == "flow"
+            && this.onGoWork != null));
+        this.Redraw();
+    }
+
+    // 底栏单行文案（错误/提示共用一行）。
+    void Foot(string msg) {
+        model.Set("footText", JsonValue.NewStr(msg));
+        this.Redraw();
+    }
+
+    // 角标：计数胶囊（零未读藏起来）。
+    void SetBadge(int n) {
+        if (this.badge == null) { return; }
+        this.badge.Count = n;
+        this.badge.visible = n > 0;
+        if (this.host != null && n > 0) { this.host.RequestRedraw(); }
+    }
+
+    // 模型改了要出一帧才看得见（帧泵每帧同步模型→界面，但窗口静止
+    // 时不会自己出帧）。
+    void Redraw() {
+        if (this.host != null) { this.host.RequestRedraw(); }
+    }
+
+    override string Kind() { return "WxPageNotify"; }
+}

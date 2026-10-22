@@ -9,10 +9,10 @@ using Gui.Component;
  * GenHtml 编译期生成 {{NAME}}Html 建树类（类名 = 文件基名帕斯卡化
  * + Html；脚手架把 App.html 改名为 <NAME>.html，引用必须走
  * {{NAME}}Html）；业务在下面）：
- *   左侧  RailHost   图标导航栏（聊天 / 通讯录 / 收藏 / 朋友圈 / 工作台
- *                    + 底部设置）
- *   右侧  ChatHost / ContactsHost / FavsHost / MomHost / WorkHost
- *                    五页叠在同一块矩形里，只让当前页可见
+ *   左侧  RailHost   图标导航栏（聊天 / 通讯录 / 收藏 / 朋友圈 / 工作台 /
+ *                    通知 + 底部设置）
+ *   右侧  ChatHost / ContactsHost / FavsHost / MomHost / WorkHost /
+ *                    NotifyHost 六页叠在同一块矩形里，只让当前页可见
  *   设置  由 WxSettingsWindow 打开的一扇独立子窗口
  *
  * 组件全部来自标准库：会话/联系人/收藏/筛选项四种列表行是自定义
@@ -26,6 +26,11 @@ partial class {{NAME}} {
     static WxPageFavorites favsPage;
     static WxPageMoments momPage;
     static WxPageWork workPage;
+    static WxPageNotify notifyPage;
+
+    // 主窗口骨架的模型宿主：骨架文档里的 @click="nav-*" 按名字接到这里
+    // （运行期装载的文档，事件由宿主统一接线）。
+    static ModelBinder appBinder;
 
     // HTML 文档建树出来的骨架节点（Pick 翻页用）。
     static Control RailHost;
@@ -34,11 +39,13 @@ partial class {{NAME}} {
     static Control FavsHost;
     static Control MomHost;
     static Control WorkHost;
+    static Control NotifyHost;
     static Button RailChat;
     static Button RailContacts;
     static Button RailFavs;
     static Button RailMoments;
     static Button RailWork;
+    static Button RailNotify;
 
     static void OnLoad(Form form) {
         App app = form.GetApp();
@@ -56,6 +63,9 @@ partial class {{NAME}} {
         MomHost.Add(momPage);
         workPage = new WxPageWork();
         WorkHost.Add(workPage);
+        notifyPage = new WxPageNotify();
+        notifyPage.Build(app);
+        NotifyHost.Add(notifyPage);
 
         // 登录门：登录小窗在主窗口 Show 之前运行（见 WxLoginWindow.Run）
         // ——返回 true 才继续往下走，主窗口才会打开；用户关窗则安全退出。
@@ -98,6 +108,25 @@ partial class {{NAME}} {
         WxIm.OnBadge(() => { SyncBadge(hostForm); });
         contactsPage.RefreshServerContacts();
 
+        // 通知角标：叠在导航栏「通知」图标右上角的计数胶囊（零未读
+        // 藏起来）。徽标挂在按钮里——按钮自身 position:relative，
+        // 角标 absolute 才落在这个按钮的角上（聊天角标挂在栏里，
+        // 落在栏的右上角，两处互不干扰）。
+        notifyBadge = new Badge(0);
+        notifyBadge.AddClass("wxrailbadge");
+        notifyBadge.NoOverlapCheck();
+        notifyBadge.visible = false;
+        RailNotify.Add(notifyBadge);
+        notifyPage.badge = notifyBadge;
+        // 流程类通知的「去工作台」跳转：回调注入，页面不依赖主窗类。
+        notifyPage.onGoWork = () => { Pick(4); };
+
+        // 通知角标轮询：通知是别人推给我的数据，5s 一拍拉未读数
+        // （实时事件通道未就位时的兜底，与聊天的 1.5s 拍同源）。
+        form.Every(5000, () => {
+            if (notifyPage != null) { notifyPage.Beat(); }
+        });
+
         Pick(0);
     }
 
@@ -119,35 +148,48 @@ partial class {{NAME}} {
         return form;
     }
 
-    // 把 HTML 骨架接上窗口：UseAppCss（文档 <style> + 皮肤）→
-    // 建树接线 → 找回挂点补行为配置 → OnLoad 装配业务页。GenForm
+    // 把 HTML 骨架接上窗口：装载运行期文档（样式随装载并进 appCss）
+    // → 建树接线 → 找回挂点补行为配置 → OnLoad 装配业务页。GenForm
     // 时代这段由生成器发射（__BuildForm + __WireForm + OnLoad 调用），
     // 现在收拢成一个显式函数。
     static Control Root(Form form) {
         App app = form.GetApp();
+        // 运行期装载文档（app.LoadHtmlWith）需要声明层已安装：装载后端
+        // 由 Html.Install 注册。走 GenHtml 建树入口时编译器会自动装，
+        // 这里只做运行时装载——不装则 LoadHtmlWith 静默返回 null。
+        Html.Install();
         // UseAppCss 是"整表替换"语义（appCss = css），所有样式必须
         // 先拼成一整份再装——两次调用会让后一次把前面的整个冲掉。
-        // 五个运行期文档的 <style> 各只在自己那份里；装进 app 的只有
-        // 这里拼的这一张表，漏拼哪份，那份的骨架样式（flex、栏宽、
-        // 渐变封面）就整体失效、页面塌成纵向块流。
-        // 主窗文档类名必须走 {{NAME}}Html（脚手架会把 App.html 改名
-        // 成 <NAME>.html，生成类名跟文件基名走）。
-        app.UseAppCss({{NAME}}Html.Css + "\n" + WxPageChatHtml.Css + "\n"
-            + WxPageContactsHtml.Css + "\n" + WxPageFavoritesHtml.Css + "\n"
-            + WxPageMomentsHtml.Css + "\n" + WxPageWorkHtml.Css + "\n"
-            + WxSkin.Css());
-        HtmlHandlers hs = new HtmlHandlers();
-        hs.Add("nav-chat", () => { Pick(0); });
-        hs.Add("nav-contacts", () => { Pick(1); });
-        hs.Add("nav-favs", () => { Pick(2); });
-        hs.Add("nav-moments", () => { Pick(3); });
-        hs.Add("nav-work", () => { Pick(4); });
-        hs.Add("nav-settings", () => { WxSettingsWindow.Open(app); });
-        Control main = {{NAME}}Html.Build(hs);
-        // 的根做客户区填充（GenForm 时代这句由 __BuildForm 发射），
-        // runtime 文档必须 code-behind 补上，否则整棵树缩在左上角
-        // 按内容尺寸排版。
+        // 走运行期通道的文档（主窗骨架、通知页）在装载时把各自的
+        // <style> 自动追加进 appCss，不必手工拼；尚未迁移的页面仍由
+        // GenHtml 通道提供样式，这里拼进去——漏拼哪份，那份的骨架样式
+        // （flex、栏宽、渐变封面）就整体失效、页面塌成纵向块流。
+        app.UseAppCss(WxPageChatHtml.Css + "\n" + WxPageContactsHtml.Css + "\n"
+            + WxPageFavoritesHtml.Css + "\n" + WxPageMomentsHtml.Css + "\n"
+            + WxPageWorkHtml.Css + "\n" + WxSkin.Css());
+        // 主窗骨架：运行期装载文档（样式自动并入，作用域类自动混入），
+        // 事件按名字接线——导航钮在文档里写 @click="nav-chat" 等。
+        appBinder = new ModelBinder();
+        appBinder.Handle("nav-chat", () => { Pick(0); });
+        appBinder.Handle("nav-contacts", () => { Pick(1); });
+        appBinder.Handle("nav-favs", () => { Pick(2); });
+        appBinder.Handle("nav-moments", () => { Pick(3); });
+        appBinder.Handle("nav-work", () => { Pick(4); });
+        appBinder.Handle("nav-notify", () => { Pick(5); });
+        appBinder.Handle("nav-settings", () => { WxSettingsWindow.Open(app); });
+        Control main = app.LoadHtmlWith({{NAME}}Html.Doc, null, "");
+        if (main == null) {
+            // 装载失败（声明层没装 / 文档为空）：给一棵空树，别把 null
+            // 挂进窗口——后面的 Find 全是空指针。
+            Console.WriteLine("WX_APP: 主窗文档装载失败");
+            return new Panel();
+        }
+        // runtime 文档必须 code-behind 补上客户区填充（GenForm 时代
+        // 这句由 __BuildForm 发射），否则整棵树缩在左上角按内容尺寸
+        // 排版。
         main.DockFill();
+        appBinder.SetRoot(main, null);
+        appBinder.Wire();
 
         RailHost = main.Find("RailHost");
         ChatHost = main.Find("ChatHost");
@@ -155,16 +197,19 @@ partial class {{NAME}} {
         FavsHost = main.Find("FavsHost");
         MomHost = main.Find("MomHost");
         WorkHost = main.Find("WorkHost");
+        NotifyHost = main.Find("NotifyHost");
         RailChat = (Button)main.Find("RailChat");
         RailContacts = (Button)main.Find("RailContacts");
         RailFavs = (Button)main.Find("RailFavs");
         RailMoments = (Button)main.Find("RailMoments");
         RailWork = (Button)main.Find("RailWork");
+        RailNotify = (Button)main.Find("RailNotify");
 
         {{NAME}}.OnLoad(form);
         return main;
     }
     static Badge railBadge;
+    static Badge notifyBadge;
 
     // 未读徽标同步（WxIm 每拉到新的 total 调一次）。徽标挂在 RailHost
     // 里、absolute 落位（.wxrailbadge 的 top/right），右缘贴导航栏
@@ -179,7 +224,7 @@ partial class {{NAME}} {
         }
     }
 
-    // 切换内容页：五个宿主叠在同一个矩形里，只让当前那一页可见——
+    // 切换内容页：六个宿主叠在同一个矩形里，只让当前那一页可见——
     // 隐藏的宿主不参与排版、命中与绘制，也不会被布局自检报成重叠。
     static void Pick(int n) {
         ChatHost.visible = n == 0;
@@ -187,17 +232,30 @@ partial class {{NAME}} {
         FavsHost.visible = n == 2;
         MomHost.visible = n == 3;
         WorkHost.visible = n == 4;
-        RailChat.Class = RailCls(n == 0);
-        RailContacts.Class = RailCls(n == 1);
-        RailFavs.Class = RailCls(n == 2);
-        RailMoments.Class = RailCls(n == 3);
-        RailWork.Class = RailCls(n == 4);
+        NotifyHost.visible = n == 5;
+        SetRailCls(RailChat, n == 0);
+        SetRailCls(RailContacts, n == 1);
+        SetRailCls(RailFavs, n == 2);
+        SetRailCls(RailMoments, n == 3);
+        SetRailCls(RailWork, n == 4);
+        SetRailCls(RailNotify, n == 5);
         // 工作台是别人也会动的数据：每次进页都重拉（首次顺带取 me）。
         if (n == 4 && workPage != null) { workPage.OnShow(); }
+        // 通知同理：进页重拉整页通知（角标另有 5s 拍轮询）。
+        if (n == 5 && notifyPage != null) { notifyPage.OnShow(); }
     }
 
     // 导航按钮的类名：当前页那个带状态类，皮肤里 `button.rail-btn.wxon`
     // 一条规则就把它点亮。
+    //
+    // 注意只能换「导航态」这一组类（SetClassIn）：Class 是整体替换，
+    // 会把文档作用域类（zs-load-<序>）一起冲掉——作用域选择器随之
+    // 失配，按钮高度退回尺寸档、悬停底色与选中底色全部失效。
+    static void SetRailCls(Button btn, bool on) {
+        if (btn == null) { return; }
+        btn.SetClassIn("rail-btn wxon", RailCls(on));
+    }
+
     static string RailCls(bool on) {
         if (on) { return "rail-btn wxon"; }
         return "rail-btn";

@@ -14,12 +14,20 @@
 - **编译期运行期文档（GenHtml）**：body **不带** `data-zan-design`
   的普通 .html 作为编译输入，GenHtml 展开成
   `class <文件基名帕斯卡化>Html { public static string Css;
-  public static Control Build(HtmlHandlers); }`——类名来自**文件基名**
-  （App.html → `AppHtml`），不是 body id 也不是 `{{NAME}}`；成员只有
-  静态字段 `Css`（无括号）与静态方法 `Build`。**不发射 Main、不发射
+  public static string Doc; public static Control Build(HtmlHandlers); }`
+  ——类名来自**文件基名**（App.html → `AppHtml`），不是 body id 也不是
+  `{{NAME}}`；成员是静态字段 `Css`（样式，无括号）、`Doc`（**文档原文**
+  ，供运行期装载）与静态方法 `Build`。**不发射 Main、不发射
   字段、不管 dock**：`data-win-*` 是 GenForm 专属，dock/图标/Tip 等
   行为配置在 code-behind 里 `Find(id)` 后补。适合"文档=结构快照、
   行为=代码"的窗口。
+  - **`Doc` 原文成员**：同一份 .html 既能编译期建树（`Build`），也能在
+    运行期重新装载（`app.LoadHtmlWith(XxxHtml.Doc, null, dir)`）——
+    文档文本随 exe 走（发布不依赖外部文件），运行期那棵树的样式自动
+    并进 appCss、作用域类自动混入、可挂模型宿主。
+  - **成员名不能叫 `Html`**：生成代码里用 `Html.AddChild(...)` 调
+    `Gui.Html` 的静态方法，同名成员会把那个名字解析成字符串字段
+    （编译报 `type 'string' has no method 'AddChild'`）。
 - **运行时**：`App.LoadHtml(...)` 同一解析器动态建树（html 文本可来自
   文件/网络/字符串）。切页出口里装每页内容时用这条。**运行时装载 +
   `ModelBinder` = 主窗口内的数据驱动页面**：文档负责结构与样式，
@@ -170,6 +178,44 @@
 在编辑，这期间模型不抢控件；帧末回写把用户值落模型后两边又一致。
 少了这条，每帧同步会把用户正在敲的字吞掉（模型→UI 与 UI→模型之间
 隔着整整一帧，输入在下一帧就被模型旧值盖回去）。
+
+## 页面范式：.html 文档 + .zan code-behind + 模型宿主
+
+一个页面 = 一份文档（结构与样式）+ 一段 code-behind（数据与事件）+
+一个模型（JsonValue）。**不是"GenHtml 建树 + 命令式填值"**——那样
+样式要手工拼进 `UseAppCss`、列表要手搭行模板、判断与绑定都写不进
+声明面。主窗口里的页面分区同样适用（不必把页面做成独立子窗口）：
+
+```zan
+// 1) 装载文档（样式随装载并进 appCss，作用域类自动混入）
+Html.Install();                       // 运行时装载必须先装声明层
+Control ui = app.LoadHtmlWith(MyPageHtml.Doc, null, "");
+// 2) 挂模型宿主：事件按名字接线 + 绑定声明从此生效
+ModelBinder b = new ModelBinder();
+b.Handle("save", () => { ... });          // 无参
+b.HandleArg("pick", (string s) => { });   // 带参（data-arg）
+b.HandleSender("open-row", (Control c) => {
+    JsonValue row = b.ScopeOf(c);         // 行内控件 → 行模型项
+});
+b.SetRoot(ui, model);
+b.Wire();
+ModelHosts.Register(app, b);            // 主窗口的每帧泵驱动它
+```
+
+- **装载器不带处理器表**（`LoadHtmlWith(html, null, dir)`）：事件统一
+  由 binder 的 `Wire()` 接线。装载时若也传 handlers，同一个控件会有两
+  条订阅，一次点击触发两遍。
+- **`Html.Install()` 必做**：只走 `app.LoadHtml` 的宿主不会自动装声明层，
+  装载后端没注册时 `LoadHtmlWith` **静默返回 null**（页面一片空白，
+  只有一行日志能看出）。
+- **行点击要拿"是哪一行"**：用 sender 槽（`HandleSender`）+ binder 的
+  `ScopeOf(control)`（取行模型项）；`data-arg` 只支持字面量，行内用不了。
+- **列表用 `<template data-for>` + `data-key`**：行内 `data-bind` 以本项
+  为第一作用域、回落根模型；`data-key` 走增量 Diffing（无 key 按长度
+  整组重建）。要标准库组件的虚拟化/滚动就别用 data-for，改用 ListView
+  绑数据 + 行模板（行模板是代码建的控件，样式只能放皮肤层）。
+- **改模型后要出一帧**：帧泵每帧同步模型→界面，但窗口静止时不会自己
+  出帧——改完模型记得 `app.RequestRedraw()`。
 
 代码内实时绑定是另一层：`Binding<T>`（stdlib 规范 §6.1），
 编译期字段直绑；字符串 bindPath 是"对话框 ↔ 状态实体"通道，
