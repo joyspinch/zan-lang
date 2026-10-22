@@ -256,6 +256,20 @@ public class JsonValue {
             vals[idx] = v;
             return;
         }
+        // 大对象先补建索引（与 Get 同口径，首键胜），否则下面的线性扫描
+        // 让"循环 Set 建 N 键"退化成 O(n²)：TomlParser 逐表 Set 曾因此把
+        // 100k 表的配置解析挂到分钟级（P2-27）。
+        if (keys.Count > 8) {
+            this.EnsureKeyIndex();
+            if (this.keyIndex.ContainsKey(key)) {
+                vals[this.keyIndex[key]] = v;
+            } else {
+                this.keyIndex[key] = keys.Count;
+                keys.Add(key);
+                vals.Add(v);
+            }
+            return;
+        }
         for (int i = 0; i < keys.Count; i = i + 1) {
             if (keys[i] == key) {
                 vals[i] = v;
@@ -268,6 +282,18 @@ public class JsonValue {
         }
         keys.Add(key);
         vals.Add(v);
+    }
+
+    // 惰性构建键哈希索引（键数量 > 8 时才值得建）。首键胜，与
+    // Get 的线性扫描同语义；RemoveAt 会整体失效重建（见该处注释）。
+    void EnsureKeyIndex() {
+        if (this.keyIndex != null) { return; }
+        Dict<string, int> ki = new Dict<string, int>();
+        int n = keys.Count;
+        for (int i = 0; i < n; i = i + 1) {
+            if (!ki.ContainsKey(keys[i])) { ki[keys[i]] = i; }
+        }
+        this.keyIndex = ki;
     }
 
     // 从对象中移除指定键（存在则删除并返回 true；不存在或非对象返回 false）。
@@ -337,7 +363,7 @@ public class JsonValue {
         if (path == null) { return; }
         if (!this.IsObject()) {
             throw new JsonException(
-                "PathSetValue: root is not an object, path: " + path);
+            "PathSetValue: root is not an object, path: " + path);
         }
         JsonValue cur = this;
         int start = 0;
@@ -451,8 +477,18 @@ public class JsonValue {
         return 0;
     }
 
-    // 第 i 个数组元素。
-    public JsonValue At(int i) { return items[i]; }
+    // 第 i 个数组元素。非数组或越界抛 JsonException——历史版本此处是
+    // 裸 items[i]：把 At 用在对象（items=null）上直接段崩 0xC0000005
+    // 且无任何诊断（P2-17）。
+    public JsonValue At(int i) {
+        if (kind != 4 || items == null) {
+            throw new JsonException("At(" + Convert.ToString(i) + ") on non-array value (kind=" + Convert.ToString(kind) + ")");
+        }
+        if (i < 0 || i >= items.Count) {
+            throw new JsonException("At(" + Convert.ToString(i) + ") out of range (count=" + Convert.ToString(items.Count) + ")");
+        }
+        return items[i];
+    }
 
     // 替换第 i 个数组元素（kind 4）。
     public void SetAt(int i, JsonValue val) {
@@ -461,10 +497,27 @@ public class JsonValue {
         }
     }
 
-    // 第 i 个对象的 key（用于遍历对象）。
-    public string KeyAt(int i) { return keys[i]; }
-    // 第 i 个对象的值（与 KeyAt 配对遍历）。
-    public JsonValue ValAt(int i) { return vals[i]; }
+    // 第 i 个对象的 key（用于遍历对象）。非对象或越界抛 JsonException
+    // （与 At 同族：历史版本裸 keys[i]，对象外调用段崩）。
+    public string KeyAt(int i) {
+        if (kind != 5 || keys == null) {
+            throw new JsonException("KeyAt(" + Convert.ToString(i) + ") on non-object value (kind=" + Convert.ToString(kind) + ")");
+        }
+        if (i < 0 || i >= keys.Count) {
+            throw new JsonException("KeyAt(" + Convert.ToString(i) + ") out of range (count=" + Convert.ToString(keys.Count) + ")");
+        }
+        return keys[i];
+    }
+    // 第 i 个对象的值（与 KeyAt 配对遍历）。非对象或越界抛 JsonException。
+    public JsonValue ValAt(int i) {
+        if (kind != 5 || vals == null) {
+            throw new JsonException("ValAt(" + Convert.ToString(i) + ") on non-object value (kind=" + Convert.ToString(kind) + ")");
+        }
+        if (i < 0 || i >= vals.Count) {
+            throw new JsonException("ValAt(" + Convert.ToString(i) + ") out of range (count=" + Convert.ToString(vals.Count) + ")");
+        }
+        return vals[i];
+    }
 
     // ---- 带默认值的标量读取器 -----------------------------------------
 
@@ -887,7 +940,7 @@ public class JsonValue {
             v = null;
             r = null;
             throw new JsonException("Malformed JSON at position "
-                + Convert.ToString(errPos));
+            + Convert.ToString(errPos));
         }
         return v;
     }
