@@ -1749,6 +1749,18 @@ static void bind_members(zan_binder_t *b, zan_ast_node_t *type_node) {
             check_member_name_clash(b, type_sym, ctor_sym);
             break;
         }
+        case AST_DESTRUCTOR_DECL:
+            /* A517：`~X()` 曾是死语法——解析/检查全过、从不发射、从不调用，
+             * 依赖确定性清理的迁移代码静默失效。ARC 释放链上没有析构钩子，
+             * 实现是独立战线；在那之前当场拒绝，不能停在"静默吞掉"。
+             * 确定性清理用 using / 显式 Close()/Dispose() 形状改写。 */
+            zan_diag_emit(b->diag, DIAG_ERROR, member->loc,
+                "destructors ('~%.*s()') are not supported: the ARC runtime "
+                "has no destructor hook on release -- do deterministic "
+                "cleanup explicitly (using statement or a Close/Dispose "
+                "method) instead of relying on '~X()'",
+                member->method_decl.name.len, member->method_decl.name.str);
+            break;
         case AST_ENUM_MEMBER: {
             if (member->enum_member.value) {
                 int64_t v;

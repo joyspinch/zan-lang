@@ -122,12 +122,17 @@
 - 根因落点：`src/compiler/irgen_emit.c` 构造器 prologue 顺序（非 irgen.c）。
 - 探针：`_scratch/csaudit/objectmodel/{p02_ctor_chain,p03_ctor_virtual}.zan`。
 
-### [ ] A517 析构器 `~X()` 是死语法：解析/检查过、从不发射、从不调用
-- `~Node()`/`~Solo()` 编译通过、运行无任何析构输出；IR 里 `__zan_release_*` 只逐字段 release，析构体内容不存在。依赖确定性清理的迁移代码静默失效。
-- 根因链：parser.c:3639 解析 ✓ → checker.c:5022 检查 ✓ → **binder.c 无 `AST_DESTRUCTOR_DECL` 分支**（grep 全文件 0 命中）→ irgen 无处理。
-- SPEC §4.4（L297-300、L532-539）宣称 "Destructor (called when refcount reaches 0)" 与实现不符。
-- 方向：binder/irgen 补分支（refcount 归零调析构体再释放），或编译期拒绝 + SPEC 改口径——不能停在"静默吞掉"。
-- 探针：`_scratch/csaudit/objectmodel/p10_cycle_leak.zan`。
+### [~] A517 析构器 `~X()` 是死语法：解析/检查过、从不发射、从不调用
+- **宿主侧已修（2026-10-23，口径=编译期拒绝）**：binder 补
+  `AST_DESTRUCTOR_DECL` 分支——声明析构器当场报错（"ARC runtime has no
+  destructor hook on release ... do deterministic cleanup explicitly"）。
+  SPEC 同步改口径：§6.2 删 "refcount 0 → destructor called" 示例、正文声明
+  析构器不支持，§4.4 类成员示例删掉 `~Window()`。死语法不再静默吞掉。
+- 待办：ARC 释放链补析构钩子（refcount 归零调析构体再释放）是独立战线，
+  实现后再放开语法；自举半边（selfhost 无此分支时同类声明会漏报）。
+- 原始实测：`~Node()`/`~Solo()` 编译通过、运行无任何析构输出；IR 里 `__zan_release_*` 只逐字段 release，析构体内容不存在。依赖确定性清理的迁移代码静默失效。
+- 根因链：parser.c 解析 ✓ → checker.c 检查 ✓ → **binder.c 无 `AST_DESTRUCTOR_DECL` 分支** → irgen 无处理。
+- 探针：`_scratch/csaudit/objectmodel/p10_cycle_leak.zan`、`_scratch/csaudit/types/v_dtor.zan`（复验：当场报错）。
 
 ### [~] A518 泛型方法调用点不检查 where 约束
 - **宿主侧已修（2026-10-23）**：checker 新增调用点约束检查——符号解析后按显式

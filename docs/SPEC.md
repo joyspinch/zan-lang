@@ -294,11 +294,6 @@ public class Window {
         _height = height;
     }
 
-    // Destructor (called when refcount reaches 0)
-    ~Window() {
-        NativeDestroyWindow(_handle);
-    }
-
     // Properties
     public string Title {
         get { return _title; }
@@ -525,20 +520,19 @@ b.X = 99;                            // a.X is still 1
 
 ### 6.2 Reference Types — ARC
 
-Reference types (classes) are heap-allocated and managed by ARC. The compiler automatically inserts `retain` (increment refcount) and `release` (decrement refcount) calls.
+Reference types (classes) are heap-allocated and managed by ARC. The compiler automatically inserts `retain` (increment refcount) and `release` (decrement refcount) calls. Destructors (`~X()`) are **not supported**: the ARC release path has no destructor hook, so declarations are rejected at compile time — do deterministic cleanup explicitly (a `using` statement or a `Close()`/`Dispose()` method).
 
 ```csharp
 class Buffer {
     private byte[] data;
     public Buffer(int size) { data = new byte[size]; }
-    ~Buffer() { Console.WriteLine("Buffer freed"); }
 }
 
 void Example() {
     var buf = new Buffer(1024);     // refcount = 1
     var alias = buf;                 // refcount = 2
     // alias goes out of scope       // refcount = 1
-    // buf goes out of scope         // refcount = 0 → destructor called
+    // buf goes out of scope         // refcount = 0 → object released
 }
 ```
 
