@@ -1601,7 +1601,8 @@ static void checker_check_assignable(zan_checker_t *c, zan_type_t *target,
 }
 
 static zan_type_t *check_member_access(zan_checker_t *c, zan_ast_node_t *expr,
-                                       zan_type_t *obj_type, bool in_call_callee);
+                                       zan_type_t *obj_type, bool in_call_callee,
+                                       zan_ast_node_t *call);
 static void checker_reject_null_receiver(zan_checker_t *c, zan_ast_node_t *expr);
 
 static bool method_arity(zan_symbol_t *m, int *min, int *max) {
@@ -2806,7 +2807,8 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
                 /* 标量原语（string/int/…）也要走成员检查：调用一个不存在
                  * 的方法应该在类型检查阶段就报出来，而不是拖到发码阶段
                  * 变成 "code generation failed"（A476）。 */
-                callee_type = check_member_access(c, expr->call.callee, recv, true);
+                callee_type = check_member_access(c, expr->call.callee, recv, true,
+                                                 expr);
             }
         } else {
             callee_type = zan_checker_check_expr(c, expr->call.callee);
@@ -2974,7 +2976,7 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
     case AST_MEMBER_ACCESS:
         return check_member_access(c, expr,
                                    zan_checker_check_expr(c, expr->member.object),
-                                   false);
+                                   false, NULL);
 
     case AST_INDEX: {
         zan_type_t *obj = zan_checker_check_expr(c, expr->index.object);
@@ -4376,9 +4378,13 @@ static bool checker_type_mentions_type_param(zan_type_t *t, int depth) {
 
 /* 这个调用是不是要到运行期才落到真正的成员上。
  *
- * 开放泛型模板（类/结构体带类型形参）的方法体是"擦除模板"：真身由
- * 泛型基类特化（zan_parser_specialize_generic_bases）在派生类里补出，
- * 模板体本身只留一个运行期转发桩。ORM 的泛型基类就是这个形状：
+ * 判据是**两条同时成立**：
+ *   ① 所在类/结构体是开放泛型模板（带类型形参）；
+ *   ② 这个调用的类型实参里带类型形参。
+ *
+ * 为什么是"擦除模板"：开放泛型模板（类/结构体带类型形参）的方法体是
+ * 模板，真身由泛型基类特化（zan_parser_specialize_generic_bases）在派生
+ * 类里补出，模板体本身只留一个运行期转发桩。ORM 的泛型基类就是这个形状：
  *
  *     public class BaseDao<T> {
  *         IDbConnection db;
@@ -4388,15 +4394,45 @@ static bool checker_type_mentions_type_param(zan_type_t *t, int depth) {
  * `IDbConnection` 上并没有 Select —— 编译期 ORM 代码生成器（GenDb）
  * 只改写类型实参是具体实体类的调用（db.Select<Blog>()），模板里的 T
  * 不是具体实体，改写不了。irgen 对这种调用不报错：解析不到就发运行期
- * 转发桩（见 irgen_call.c 的 call_receiver_is_open_generic）。checker
- * 必须同口径，否则 BaseDao<T> / BaseRepository<T> 直接编不过。 */
-static bool checker_call_is_runtime_dispatched(zan_checker_t *c, zan_type_t *recv) {
-    if (c->current_type_sym && c->current_type_sym->decl &&
-        (c->current_type_sym->decl->kind == AST_CLASS_DECL ||
-         c->current_type_sym->decl->kind == AST_STRUCT_DECL) &&
-        c->current_type_sym->decl->type_decl.type_params.count > 0)
-        return true;
-    return checker_type_mentions_type_param(recv, 0);
+ * 转发桩（见 irgen_call.c 的 call_receiver_is_open_generic，它的判据
+ * 与此同口径）。checker 必须同口径，否则 BaseDao<T> / BaseRepository<T>
+ * 直接编不过。
+ *
+ * 为什么 ② 不可省：**只按 ① 放行，等于把整个泛型类的成员存在性检查
+ * 关掉**——模板里调一个谁都没有的方法（repo.NoSuchMethod()）照样编得
+ * 过，一路跑到运行期才炸。带类型实参的调用才是"真身要等类型定了才
+ * 落得到成员上"的那一类（db.Select<T>() 的 Select 由 GenDb 改写、
+ * 由特化补真身），不带类型实参的调用（shape.NoSuchMethod()）成员集
+ * 是定死的，该报就报。
+ *
+ * 为什么 ① 不可省：模板体之外（普通类里的泛型方法、非泛型类），
+ * 成员集判不出来只是"这个成员压根不存在"——那是真错。缺了 ①，
+ * `class P { void Use<T>(Helper h) { h.Missing<T>(); } }` 会被放过，
+ * 错误一路滑到发码阶段只剩一句 "code generation failed"，比 checker
+ * 直接点名差得多。
+ *
+ * 接收者是类型形参本身（T.Foo()）或没有符号的泛型容器（List<T>）时，
+ * 成员集同样判不出来，但那是 checker_call_target_member_state 里
+ * 返回 -1 的既有路径，不归这里管。 */
+static bool checker_call_is_runtime_dispatched(zan_checker_t *c,
+                                               zan_ast_node_t *call) {
+    /* ① 所在类型必须是开放泛型模板 */
+    if (!c->current_type_sym || !c->current_type_sym->decl) return false;
+    if (c->current_type_sym->decl->kind != AST_CLASS_DECL &&
+        c->current_type_sym->decl->kind != AST_STRUCT_DECL)
+        return false;
+    if (c->current_type_sym->decl->type_decl.type_params.count == 0)
+        return false;
+    /* ② 这个调用还带着类型形参 */
+    if (!call || call->kind != AST_CALL) return false;
+    if (call->call.type_args.count == 0) return false;
+    for (int i = 0; i < call->call.type_args.count; i++) {
+        zan_type_t *ta = zan_binder_resolve_type(
+            c->binder, call->call.type_args.items[i]);
+        /* 解析不出来（type_error）也算"带类型形参"：宁可放行，不可误报。 */
+        if (checker_type_mentions_type_param(ta, 0)) return true;
+    }
+    return false;
 }
 
 /* 调用目标上有没有这个成员。
@@ -4407,12 +4443,13 @@ static bool checker_call_is_runtime_dispatched(zan_checker_t *c, zan_type_t *rec
  * 所以扩展方法（接收者类型上查不到成员，但 recv.Foo() 合法）必须算进去；
  * 运行期才落地的调用（开放泛型模板）同样判不了成员集，也得放行。 */
 static int checker_call_target_member_state(zan_checker_t *c, zan_type_t *t,
-                                            zan_istr_t name) {
+                                            zan_istr_t name,
+                                            zan_ast_node_t *call) {
     if (!t || t == c->binder->type_error) return -1;
     if (!name.str || name.len == 0) return -1;
     if (zan_binder_has_extension_method(c->binder, t, name)) return 1;
     /* 运行期才落地的调用：成员集编译期根本判不出来 —— 判不了就不报。 */
-    if (checker_call_is_runtime_dispatched(c, t)) return -1;
+    if (checker_call_is_runtime_dispatched(c, call)) return -1;
     switch (t->kind) {
     case TYPE_CLASS:
     case TYPE_STRUCT:
@@ -4441,7 +4478,8 @@ static int checker_call_target_member_state(zan_checker_t *c, zan_type_t *t,
 }
 
 static zan_type_t *check_member_access(zan_checker_t *c, zan_ast_node_t *expr,
-                                       zan_type_t *obj_type, bool in_call_callee) {
+                                       zan_type_t *obj_type, bool in_call_callee,
+                                       zan_ast_node_t *call) {
     checker_reject_null_receiver(c, expr);
     if (expr->member.object) {
         zan_symbol_t *mg = expr_method_group(c, expr->member.object);
@@ -4581,7 +4619,8 @@ static zan_type_t *check_member_access(zan_checker_t *c, zan_ast_node_t *expr,
         /* 调用位置：内建标量的成员集是定死的（builtin_api 表），
          * 表里没有这个名字 = 这个方法不存在，当场报。扩展方法
          * （`this string` 接收者）不在内建表里，由统一判定一并算进去。 */
-        if (checker_call_target_member_state(c, obj_type, expr->member.name) == 0) {
+        if (checker_call_target_member_state(c, obj_type, expr->member.name,
+                                             call) == 0) {
             zan_diag_emit(c->diag, DIAG_ERROR, expr->loc,
                           "type '%s' has no method '%.*s'",
                           type_name(obj_type),
@@ -4598,7 +4637,8 @@ static zan_type_t *check_member_access(zan_checker_t *c, zan_ast_node_t *expr,
         }
         /* 调用位置：这个类型上根本没有这个名字的方法 —— 当场报，
          * 不用拖到发码阶段变成 "code generation failed"（A476）。 */
-        if (checker_call_target_member_state(c, obj_type, expr->member.name) == 0)
+        if (checker_call_target_member_state(c, obj_type, expr->member.name,
+                                             call) == 0)
             checker_report_no_member(c, expr, obj_type, expr->member.name, true);
         return c->binder->type_error;
     }

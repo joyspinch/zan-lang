@@ -1,0 +1,70 @@
+using System;
+using System.Collections.Generic;
+using System.Data;
+
+// 泛型基类里的 ORM 调用必须继续编得过。
+//
+// `db.Select<T>()` 里的 T 是类型形参，`IDbConnection` 上并没有 Select——
+// 编译期 ORM 代码生成器（GenDb）只改写类型实参是具体实体类的调用，模板里
+// 的 T 不是具体实体，改写不了。所以 checker 对"调用还带着类型形参"这类调用
+// 放行（成员集编译期判不出来），由 irgen 发运行期转发桩。
+//
+// 收窄豁免时最容易踩的坑：把放行条件写成"所在类是泛型类"（那等于把整个
+// 泛型类的成员检查关掉，调不存在的方法能编得过、运行期才炸）。正确判据是
+// "这个调用的类型实参里带类型形参"——于是同一个泛型类里：
+//   * db.Select<T>()   → 类型实参带 T → 放行，编得过（就是本用例）
+//   * db.NoSuchMethod() → 没有类型实参 → 当场报"没有这个方法"
+// 后者由 diag 用例 generic_class_unknown_method 钉住。
+//
+// 运行时验证：SysUserDao 继承 BaseDao<SysUser>，泛型基类特化把模板方法
+// 补进派生类，走的是真实 SQL，不是转发桩。
+
+[Table("sys_users")]
+public class SysUser {
+    [Id]
+    public int id;
+    public string username;
+}
+
+public class BaseDao<T> {
+    protected IDbConnection db;
+
+    public BaseDao(IDbConnection db) {
+        this.db = db;
+    }
+
+    public T FindById(int id) {
+        return this.db.Select<T>().WhereEq("t.id", id).First();
+    }
+
+    public int Insert(T entity) {
+        return this.db.Insert<T>(entity).ExecuteAffrows();
+    }
+
+    public List<T> All() {
+        return this.db.Select<T>().ToList();
+    }
+}
+
+public class SysUserDao : BaseDao<SysUser> {
+    public SysUserDao(IDbConnection db) : base(db) {}
+}
+
+class Program {
+    static void Main() {
+        IDbConnection db = SqliteConnection.Open(":memory:");
+        db.Execute("CREATE TABLE sys_users (id INTEGER PRIMARY KEY, username TEXT);");
+
+        SysUserDao dao = new SysUserDao(db);
+        dao.Insert(new SysUser { id = 1, username = "admin" });
+        dao.Insert(new SysUser { id = 2, username = "bob" });
+
+        List<SysUser> all = dao.All();
+        if (all.Count != 2) { Console.WriteLine("FAIL count"); return; }
+
+        SysUser u = dao.FindById(1);
+        if (u == null || u.username != "admin") { Console.WriteLine("FAIL find"); return; }
+
+        Console.WriteLine("PASS");
+    }
+}

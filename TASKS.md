@@ -2261,4 +2261,44 @@
 - 方向：给自举的 `ToCStr` 补可空分支，判据与宿主一致（可空先拆箱再取串；
   拆不出来就报诊断，不生成非法 IR）。
 - 关联：A492（同一族取串路径的宽度/类型判据）、A454（自举缺真装箱原语）。
+### [x] A497 泛型类体内的成员存在性检查被**整类放行**——调不存在的方法能编得过
+
+- 现象（2026-10-22 收窄 ORM 泛型豁免时撞到）：宿主 checker 的
+  `checker_call_is_runtime_dispatched` 只要发现"所在类是泛型类"就跳过调用位置的
+  成员存在性检查，于是泛型类里调一个谁都没有的方法（`shape.NoSuchMethod()`）照样
+  编得过，一路跑到运行期才炸。
+- 根因：豁免的**正当理由只有一条**——ORM 泛型基类模板体里的 `db.Select<T>()`
+  成员集编译期判不出来（`IDbConnection` 上并没有 `Select`；编译期 ORM 代码生成器
+  `GenDb` 只改写"类型实参是具体实体类"的调用，模板里的 `T` 不是具体实体，改写
+  不了；真身由泛型基类特化在派生类里补出，模板体只留一个运行期转发桩）。但当时的
+  实现把"所在类泛型"整类当成豁免条件，而不是"**这个调用自己的类型实参里带类型
+  形参**"——豁免面比理由大了整整一层。
+- 修法（2026-10-22 闭账）：豁免判据收窄成两条**同时成立**——① 所在类/结构体是
+  开放泛型模板（`type_decl.type_params.count > 0`）；② 该调用的类型实参里带类型
+  形参（`call.type_args` 解析后含 `TYPE_TYPE_PARAM`）。实现上把
+  `checker_call_is_runtime_dispatched` 的入参从"接收者类型"改成"调用 AST 节点"
+  （`check_member_access` 增 `call` 形参：AST_CALL 分支传 `expr`、AST_MEMBER_ACCESS
+  分支传 `NULL`），判据才看得到调用自身的类型实参。
+  - 只留 ② 的坑（第一版实测）：非泛型类里的泛型方法 `h.Missing<T>()` 会被放过，
+    错误滑到发码阶段只剩 `'Helper' has no member 'Missing'` + `code generation
+    failed`，比 checker 直接点名差得多，且与 irgen 口径分歧 → ① 不可省。
+  - 收窄后的豁免集合 **⊆** irgen `call_receiver_is_open_generic` 的豁免集合
+    （后者三条：所在类泛型 / 接收者含形参 / 实参含形参），所以不会出现"checker
+    放行、irgen 报错"的两侧口径分歧（这正是 skill 第 10 条要求的）。
+- 验证（2026-10-22）：
+  - 新增 `tests/diag/generic_class_unknown_method.zan`：泛型类里对接口/类/自身
+    三类接收者各调一次不存在的方法，用 `EXPECT_ERROR_COUNT=3` 钉住——豁免一旦
+    改回整类放行就变 0 error，用例必红。
+  - 新增 `tests/conformance/generic_open_call_template.zan`（+ `.out`）：ORM 泛型
+    模板最小复刻（`BaseDao<T>` 模板体 `db.Select<T>()` + `SysUserDao :
+    BaseDao<SysUser>`），运行输出 `PASS`——收窄后模板体仍要编得过。
+  - 回归：`generic_base_dao_orm`（56 files，PASS）、`orm_zansql`（79 files，输出
+    逐项一致）、`server_mvc/readonly_action_lease`（432 files）、全部 36 条
+    `generic*` conformance 用例逐个编译（0 失败）、自举源 36 文件（64 files）、
+    `scripts/pkg_sweep.ps1` 全包 sweep 零 RED（含 Zan.Sdk.Wechat 5619 files）。
+- 关联：A491（ORM 那条不是"接口缺方法"的缺口，接口一个方法都不用补；成因是
+  `b95f0a97d` 之前的过宽豁免，本条是沿同一方向的进一步收紧）；A494
+  （`BaseRepository<T>` 直接实例化静默返回默认值，仍开）；宿主与自举仍有分叉——
+  自举侧 `src/selfhost/checker.zan` 的 `CheckCall` **完全没有泛型豁免**（自举还
+  编不了 ORM 泛型基类），本条只改宿主。
 

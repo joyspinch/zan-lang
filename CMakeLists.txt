@@ -2042,6 +2042,24 @@ add_test(NAME diag_member_call_qualifies_type
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_member_call_qualifies_type PROPERTIES TIMEOUT 60)
 
+# A generic class body used to be exempted from the call-position member
+# existence check as a whole ("the enclosing class has type params -> let it
+# pass"). That turned the exemption into a blanket: calling a method nobody
+# has inside a generic class compiled fine and only blew up at run time.
+# The exemption is now scoped to what actually needs it -- a call that still
+# carries a type parameter (ORM's `db.Select<T>()`, whose member set GenDb
+# can only resolve once the entity type is concrete). Everything else is
+# judged as usual, so all three known receivers here must be diagnosed.
+add_test(NAME diag_generic_class_unknown_method
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/generic_class_unknown_method.zan
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/diag_generic_class_unknown_method${_exe_ext}
+    "-DEXPECT_REGEX=type .Diag\\.IShape. has no method .NoSuchMethod."
+    "-DEXPECT_ERROR_COUNT=3"
+    -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
+set_tests_properties(diag_generic_class_unknown_method PROPERTIES TIMEOUT 60)
+
 # B-ID24 (user-adjudicated): a decimal literal in [2^31, 2^32] written into an
 # int slot used to wrap two's-complement (the uint32-bit-pattern exemption);
 # it now narrows with a CS0031-style error. Hex keeps the ARGB bit-pattern
