@@ -168,8 +168,14 @@ partial class Irgen {
             string ti = NT();
             string iop = e.op == TK.PlusPlus() ? "add" : "sub";
             L("  " + ti + " = " + iop + " i64 " + v.op + ", 1");
+            // the host increments in the PLACE's width: an int counter wraps
+            // at 32 bits, a long one does not
+            int pw = ValWidth(v);
+            if (pw > 0 && pw < 64) { ti = WrapArith(ti, pw, false); }
             StoreTo(e.a, new ExprVal(ti, MkType("int")));
-            return new ExprVal(ti, MkType("int"));
+            ExprVal pr = new ExprVal(ti, MkType("int"));
+            pr.wbits = pw;
+            return pr;
         }
         if (e.op == TK.Bang()) {
             string c = NT();
@@ -181,7 +187,9 @@ partial class Irgen {
         if (e.op == TK.Tilde()) {
             string c = NT();
             L("  " + c + " = xor i64 " + v.op + ", -1");
-            return new ExprVal(c, v.ty);
+            ExprVal r = new ExprVal(c, v.ty);
+            r.wbits = ValWidth(v);
+            return r;
         }
         if (e.op == TK.Minus()) {
             if (IsDbl(v.ty)) {
@@ -191,7 +199,13 @@ partial class Irgen {
             }
             string t = NT();
             L("  " + t + " = sub i64 0, " + v.op);
-            return new ExprVal(t, MkType("int"));
+            // the host negates in the OPERAND's width: negating the most
+            // negative int wraps back to it
+            int nw = ValWidth(v);
+            if (nw > 0 && nw < 64) { t = WrapArith(t, nw, false); }
+            ExprVal r = new ExprVal(t, MkType("int"));
+            r.wbits = nw;
+            return r;
         }
         return v;
     }
@@ -373,6 +387,19 @@ partial class Irgen {
         return 0;
     }
 
+    // The width in bits of a value's carrier -- the C host's LLVM storage
+    // width. The type-level type does not record it: an arithmetic RESULT
+    // keeps the width of the operation that produced it (the host's
+    // coerce_int_pair widens the narrower operand and the result keeps that
+    // width), so `int a; a * 3` has the type `int` but the host computes it
+    // in 64 bits. `wbits` carries that width; 0 means "take it from the
+    // type".
+    int ValWidth(ExprVal v) {
+        if (v == null) { return 0; }
+        if (v.wbits > 0) { return v.wbits; }
+        return HostIntWidth(v.ty);
+    }
+
     // The C host's operand width: an int VARIABLE (a local, a field, a cast
     // result) keeps its storage width in the host, while an int LITERAL --
     // and every constant expression the host folds -- is an i64. The
@@ -381,7 +408,7 @@ partial class Irgen {
     bool IsWidthedInt(Node en, ExprVal v) {
         if (v == null || v.ty == null) { return false; }
         if (v.ty.ival != 0) { return false; }
-        if (HostIntWidth(v.ty) == 0) { return false; }
+        if (ValWidth(v) == 0) { return false; }
         if (en == null) { return false; }
         if (en.kind == AK.IntLit()) { return false; }
         if (IsConstInt(en)) { return false; }
@@ -405,8 +432,8 @@ partial class Irgen {
     // i64 in the host, so the whole operation widens).
     int ArithWidth(Node an, ExprVal av, Node bn, ExprVal bv) {
         if (!IsWidthedInt(an, av) || !IsWidthedInt(bn, bv)) { return 64; }
-        int wa = HostIntWidth(av.ty);
-        int wb = HostIntWidth(bv.ty);
+        int wa = ValWidth(av);
+        int wb = ValWidth(bv);
         if (wa == 0 || wb == 0) { return 64; }
         if (wa > wb) { return wa; }
         return wb;
@@ -440,6 +467,16 @@ partial class Irgen {
         string s2 = NT();
         L("  " + s2 + " = ashr i64 " + s1 + ", " + (64 - w));
         return s2;
+    }
+
+    // The result of an integer arithmetic operation: the type-level type is
+    // `int` (the host's checker types it that way), but the VALUE keeps the
+    // width of the operation -- the parent operation sees that width, not
+    // the 32-bit type.
+    ExprVal ArithResult(string v, int aw, bool uns) {
+        ExprVal r = new ExprVal(v, MkType(uns ? "ulong" : "int"));
+        r.wbits = aw;
+        return r;
     }
 
     // The C host's integer division guard (src/compiler/irgen_expr.c): a zero
@@ -490,7 +527,10 @@ partial class Irgen {
         int op = e.op;
         // constant folding: collapse pure integer-constant subtrees to a literal
         if (IsConstInt(e)) {
-            return new ExprVal("" + EvalConstInt(e), MkType("int"));
+            // the host folds an integer constant to an i64
+            ExprVal r = new ExprVal("" + EvalConstInt(e), MkType("int"));
+            r.wbits = 64;
+            return r;
         }
         if (op == TK.AmpAmp() || op == TK.PipePipe()) {
             List<string> svT = stmtTemps; List<Node> svTT = stmtTempTypes;
@@ -619,8 +659,7 @@ partial class Irgen {
             // 32 bits and wrap there
             int aw = ArithWidth(e.a, a, e.b, b);
             if (aw < 64) { t = WrapArith(t, aw, ArithUnsigned(e.a, a, e.b, b)); }
-            if (uns) { return new ExprVal(t, MkType("ulong")); }
-            return new ExprVal(t, MkType("int"));
+            return ArithResult(t, aw, uns);
         }
         if (op == TK.EqEq() || op == TK.BangEq()) {
             if (IsStr(a.ty) && IsStr(b.ty)) {
@@ -722,8 +761,7 @@ partial class Irgen {
             }
             L("  " + t + " = " + ar + " i64 " + a.op + ", " + bs);
             if (aw < 64) { t = WrapArith(t, aw, awu); }
-            if (uns) { return new ExprVal(t, MkType("ulong")); }
-            return new ExprVal(t, MkType("int"));
+            return ArithResult(t, aw, uns);
         }
         string cp = CmpOp(op);
         if (uns) { cp = UCmpOp(op); }
