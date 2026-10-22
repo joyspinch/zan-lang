@@ -115,6 +115,16 @@ Without MCP the same index is a file: `knowledge/symbols.json` next to the SDK
   的原因"就写成 `LastError()` 方法，实现类里**同时**留一个 `lastError`
   字段给"直接用这个类"的调用方——仓库既有约定（`IRetriever` /
   `IReranker` 都是这么写的）。
+* **构造函数不能 `this()` 链式调用**（实证，2026-10-27）：在构造函数体里
+  写 `this();` 报 "this call could not be resolved to any callable (no
+  method, delegate, operator or builtin matches)"。想复用初始化只能
+  **把初始化抄一遍**，或抽成静态工厂方法。想省事就别设计成"一个构造函数
+  调另一个构造函数"的形状。
+* **`string.IndexOf(needle, startIndex)` 的第二参是起始下标**（编译器内建，
+  实证，2026-10-27）：从 `startIndex` 起找，返回**绝对下标**（找不到 -1）。
+  自己写"查找第一个匹配位置"的辅助函数时**别写成"找到就继续往后找"**——
+  那样只要找到过一次，函数最后仍会走到"没有更多匹配"那条分支，把已经
+  找到的位置返回成 -1，"存在吗"这个问题永远得到"不存在"的答案。
 * **跨包 namespace 免声明**：`zanc --package-project <repo>` 会扫所有
   `packages/*/src/`，跨包 `using` 直接可用，**不需要在 `zan.pkg` 里声明
   依赖**（`Zan.Ai` 一直用 `Zan.Net` 的 `System.Net.Http.Client`，从没声明

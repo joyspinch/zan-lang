@@ -318,7 +318,7 @@ public class AiClient : IDisposable, IChat {
 
         StringBuilder sb = new StringBuilder();
         // 半行缓冲：一次到达的字节可能把一行切成两半，跨次拼接。
-        string pending = "";
+        SseLineReader reader = new SseLineReader();
         bool stopped = false;
         // 流内错误帧（provider 在 SSE 数据里报错）。它**不是**调用方
         // 叫停，所以不能被"主动停止不算失败"那条规则吞掉。
@@ -326,11 +326,9 @@ public class AiClient : IDisposable, IChat {
         while (true) {
             SseDelivery d = await sink.TakeCo();
             if (d.data.Length > 0) {
-                pending = pending + d.data;
-                int nl = pending.IndexOf("\n");
-                while (nl >= 0) {
-                    string line = pending.Substring(0, nl).Trim();
-                    pending = pending.Substring(nl + 1);
+                reader.Feed(d.data);
+                string line = reader.Next();
+                while (line.Length > 0) {
                     int r = this.OnStreamLine(line, sb, onDelta);
                     if (r == 0) {
                         // 调用方要求停止。
@@ -344,7 +342,7 @@ public class AiClient : IDisposable, IChat {
                         stopped = true;
                         break;
                     }
-                    nl = pending.IndexOf("\n");
+                    line = reader.Next();
                 }
             }
             if (stopped) {
@@ -360,8 +358,11 @@ public class AiClient : IDisposable, IChat {
         // （SSE 允许这样收尾，最后一个事件不必有空行）。这半行要按
         // 完整的一行处理，否则最后一个分片会被**静默丢掉**——收流
         // 正常结束、内容却少一截，且没有任何错误提示。
-        if (!stopped && pending.Trim().Length > 0) {
-            this.OnStreamLine(pending.Trim(), sb, onDelta);
+        if (!stopped) {
+            string rest = reader.Flush();
+            if (rest.Length > 0) {
+                this.OnStreamLine(rest, sb, onDelta);
+            }
         }
 
         // 传输结果：ok / err: ...
@@ -386,6 +387,56 @@ public class AiClient : IDisposable, IChat {
             if (sb.Length == 0) { return null; }
         }
         return sb.ToString();
+    }
+
+    // 流式补全（带工具）。
+    //
+    // 逐**事件**推给 onEvent：文本增量、工具调用的增量、用量、结束。
+    // 工具调用由流里的增量**拼装**成完整的 `AiToolCall`——服务方把参数
+    // 分段发，靠序号归位（不靠到达顺序）。
+    //
+    // 回调返回 false → 调用方主动停止（中止上游），**不算失败**。
+    //
+    // 返回这一轮的结果（文本 + 工具调用 + 用量 + 结束原因）。**永远不
+    // 返回 null**：失败看结果里的 `error`——半截内容仍然有用，丢掉它等于
+    // 把已经付过费的 token 白扔。
+    public async AiStreamResult StreamWithTools(List<AiMessage> messages,
+    List<AiTool> tools, double temperature, AiStreamFn onEvent) {
+        this.lastError = "";
+        AiEndpoint ep = AiEndpoint.Parse(this.config.baseUrl);
+        if (ep == null) {
+            this.lastError = "服务地址不合法: " + this.config.baseUrl;
+            return null;
+        }
+        if (this.config.model.Length == 0) {
+            this.lastError = "没有指定模型";
+            return null;
+        }
+        JsonValue body = JsonValue.NewObject();
+        body.PutStr("model", this.config.model);
+        if (temperature >= 0.0) {
+            body.PutDouble("temperature", temperature);
+        }
+        body.PutBool("stream", true);
+        body.PutJson("messages", AiClient.MessagesJson(messages));
+        if (tools != null && tools.Count > 0) {
+            body.PutJson("tools", AiClient.DeclarationsJson(tools));
+            // 让模型在需要时自己决定不调（有些服务方默认不许不调）。
+            body.PutStr("tool_choice", "auto");
+        }
+        string payload = body.ToJson();
+        if (payload.Length > this.config.requestLimitBytes) {
+            this.lastError = "请求体超过上限（"
+            + Convert.ToString(this.config.requestLimitBytes) + " 字节）";
+            return null;
+        }
+        HttpClient http = this.StreamClient(ep);
+        AiStreamResult res = await AiStream.Pump(http, ep.Path() + "/chat/completions",
+            payload, onEvent, AiStream.OpenAiEvents);
+        if (res == null) { return null; }
+        if (res.error.Length > 0) { this.lastError = res.error; }
+        this.lastUsage = res.usage;
+        return res;
     }
 
     // 解析一行 SSE。返回：

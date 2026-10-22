@@ -819,7 +819,8 @@ server-dev-standards；数据建模见 data-modeling；SQL 细则见 server-db-d
   这条坑在同一个功能里往往**同时存在**三个形态（抛异常 / 静默跳过 /
   收尾丢半行），修的时候要一次看全，别只修撞见的那一个。
 - **同一个协议解析逻辑在多处重复时，改一处要找出全部**：AI 客户端与
-  Web 框架各有一份 SSE 解析。修好一份不代表另一份也好了——同样的三个
+  Web 框架各有一份 SSE 解析（AI 客户端内部两个入口现已共用一个内核，
+  跨包仍是两份）。修好一份不代表另一份也好了——同样的三个
   缺陷在两边都存在，只是被各自的用例覆盖与否不同。找齐的方式是搜协议
   关键词（`data:` / `SseSink` / `event-stream`），不是搜类名。
 - **「解析外部输入」不只指上游响应，**客户端**传来的字段同样算**：
@@ -832,6 +833,41 @@ server-dev-standards；数据建模见 data-modeling；SQL 细则见 server-db-d
   还是抛异常。
   排查手法：grep 出所有解析调用，逐个看**输入来源**——凡是来自
   网络/客户端/文件的，外面都得包 try/catch。
+
+### 自己做 SSE 流：生产端的最小配方与失败语义（流式实现沉淀）
+
+- **在 Zan 里做真流式，配方是三件套**（网络包自带，不用自己写 socket）：
+  1. `SseSink sink = SseSink.ToMemory();` —— 内存 sink，带事件门；
+  2. `long producer = Task.Spawn(http.PostSseToSinkAsync(path, body, sink));`
+     —— 传输在后台跑，响应体**边到边**写进 sink；
+  3. 消费侧 `SseDelivery d = await sink.TakeCo();` —— 有数据才醒，不轮询。
+
+  `PostSseToSinkAsync` **不抛异常**，失败写进 sink 的结果标记
+  （`sink.Attempt()`）：正常是 `"ok"`，失败是 `"err: ..."`——非 2xx 是
+  `"err: HTTP 404: <错误正文摘要>"`，对端提前关是 `"err: connection closed"`，
+  空闲超时是 `"err: timeout"`，消费者主动放弃是 `"err: cancelled"`。
+  所以调用方**必须自己判前缀**：`Attempt().StartsWith("err:")` 才是失败。
+- **"消费者主动放弃"与"上游失败"在标记里长得不一样，要分开处理**：
+  `sink.Abort()` 之后传输层必然报 `"err: cancelled"`——那是**我们自己**
+  叫停的，报成错误会让调用方以为流挂了。判据是"调用方是不是主动叫停的"，
+  不是标记文本。
+- **释放 sink 要等 producer 结束**：`SseSink.Dispose()` 会销毁互斥量，而
+  producer 可能还在往 sink 里写（中止上游后它要等传输层才发现）。提前
+  Dispose = 写入打到已释放的互斥量上，是崩溃不是泄漏。等不到就**别释放**
+  （漏一个句柄好过崩）。
+- **流式协议的失败语义通常与非流式不同**：非流式失败就返回 null；流式可能
+  **只拿到一半**（上游报错、连接被掐断、调用方叫停）。半截内容是**已经
+  付过费的**（token 已花掉），丢掉它等于让用户白等白花钱——所以流式的
+  结果对象**永远存在**，失败原因放在结果里（`error` 字段），而不是"返回
+  null"。写契约时要把这两种语义**分别写清楚**，别让调用方猜。
+- **LLM 流的工具参数是分片到达的**（OpenAI 兼容：`delta.tool_calls[].
+  function.arguments`；Anthropic：`content_block_delta` 的
+  `input_json_delta.partial_json`）。拼装要**按服务方给的序号归位**
+  （`index`），**不能靠到达顺序**——服务方完全可能先发第 2 个工具的片段。
+  参数片段是 JSON 文本的片段，拼完才是完整 JSON。
+- **用量在流里可能分几帧发**（Anthropic：输入 token 在 `message_start`，
+  输出 token 在 `message_delta`）——收到用量帧要**合并**，覆盖会把先到的
+  那一半抹掉。
 
 ### 几何检测：单次测量有偏，要按整簇聚合并用稳健统计（图像/定位类算法沉淀）
 

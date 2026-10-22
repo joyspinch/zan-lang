@@ -133,6 +133,68 @@ public class AnthropicClient : IChat {
         return await this.Send(messages, tools, temperature, "");
     }
 
+    // 流式补全（带工具）。
+    //
+    // 逐**事件**推给 onEvent：文本增量、工具调用的增量、用量、结束。
+    // Anthropic 的工具参数是 `input_json_delta` 的**分片**（`partial_json`），
+    // 靠内容块的 `index` 归位拼成完整 JSON。
+    //
+    // 回调返回 false → 调用方主动停止（中止上游），**不算失败**。
+    //
+    // 返回这一轮的结果。**永远不返回 null**：失败看结果里的 `error`
+    // ——半截内容仍然有用。
+    public async AiStreamResult StreamWithTools(List<AiMessage> messages,
+    List<AiTool> tools, double temperature, AiStreamFn onEvent) {
+        this.lastError = "";
+        AiEndpoint ep = AiEndpoint.Parse(this.config.baseUrl);
+        if (ep == null) {
+            this.lastError = "服务地址不合法: " + this.config.baseUrl;
+            return null;
+        }
+        if (this.config.model.Length == 0) {
+            this.lastError = "没有指定模型";
+            return null;
+        }
+        if (messages == null) {
+            this.lastError = "没有消息";
+            return null;
+        }
+        JsonValue body = JsonValue.NewObject();
+        body.PutStr("model", this.config.model);
+        // `max_tokens` 在 Anthropic 是**必填**。
+        body.PutInt("max_tokens", this.config.maxTokens);
+        if (temperature >= 0.0) {
+            body.PutDouble("temperature", temperature);
+        }
+        body.PutBool("stream", true);
+        // 系统提示：Anthropic 是**顶层字段**，不是 messages 里的一条。
+        string system = AnthropicClient.SystemText(messages);
+        if (system.Length > 0) {
+            body.PutStr("system", system);
+        }
+        body.Put("messages", AnthropicClient.MessagesJson(messages));
+        if (tools != null && tools.Count > 0) {
+            body.Put("tools", AnthropicClient.ToolsJson(tools));
+            JsonValue choice = JsonValue.NewObject();
+            choice.PutStr("type", "auto");
+            body.Put("tool_choice", choice);
+        }
+        string payload = body.ToJson();
+        if (payload.Length > this.config.requestLimitBytes) {
+            this.lastError = "请求体超过上限（"
+            + Convert.ToString(this.config.requestLimitBytes) + " 字节）";
+            return null;
+        }
+        HttpClient http = this.StreamClient(ep);
+        AiStreamResult res = await AiStream.Pump(http,
+            AnthropicClient.MessagesPath(ep), payload, onEvent,
+            AiStream.AnthropicEvents);
+        if (res == null) { return null; }
+        if (res.error.Length > 0) { this.lastError = res.error; }
+        this.lastUsage = res.usage;
+        return res;
+    }
+
     // ------------------------------------------------------------------
     // 内部：一次请求
     // ------------------------------------------------------------------
@@ -276,6 +338,32 @@ public class AnthropicClient : IChat {
         http.SetCallPolicy(this.Policy(ep));
         http.SetHeader("Content-Type", "application/json");
         http.SetHeader("Accept", "application/json");
+        if (this.apiVersion.Length > 0) {
+            http.SetHeader("anthropic-version", this.apiVersion);
+        }
+        if (this.config.apiKey.Length > 0) {
+            http.SetHeader("x-api-key", this.config.apiKey);
+        }
+        this.clients[key] = http;
+        return http;
+    }
+
+    // 流式专用的客户端：Accept 必须是 text/event-stream，读取超时按
+    // **空闲窗口**算（每收到一个分片就重新计时），否则长回答会被读超时
+    // 掐断——读超时要的是"对端沉默一段时间"，不是"总共读多久"。
+    private HttpClient StreamClient(AiEndpoint ep) {
+        string key = ep.Canonical() + "|sse";
+        if (this.clients.ContainsKey(key)) { return this.clients[key]; }
+        HttpClient http = null;
+        if (ep.Tls()) {
+            http = HttpClient.CreateHttps(ep.Host(), ep.Port());
+        } else {
+            http = new HttpClient(ep.Host(), ep.Port());
+        }
+        ExternalCallPolicy p = this.Policy(ep).IdleTimeout(this.config.readTimeoutMs);
+        http.SetCallPolicy(p);
+        http.SetHeader("Content-Type", "application/json");
+        http.SetHeader("Accept", "text/event-stream");
         if (this.apiVersion.Length > 0) {
             http.SetHeader("anthropic-version", this.apiVersion);
         }

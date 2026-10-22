@@ -125,6 +125,17 @@ Without MCP the same index is a file: `knowledge/symbols.json` next to the SDK
   `LastError()` method and keep a `lastError` field on the implementing
   class as well, for callers holding the concrete type — that is the
   existing convention (`IRetriever` / `IReranker` do exactly this).
+* **Constructors cannot chain with `this()`**: writing `this();` inside a
+  constructor body fails with "this call could not be resolved to any
+  callable (no method, delegate, operator or builtin matches)". To share
+  initialization, **copy it** or move it into a static factory — do not
+  shape the class around constructor-to-constructor calls.
+* **`string.IndexOf(needle, startIndex)` takes a start offset** (compiler
+  builtin): it searches from `startIndex` and returns the **absolute**
+  index (-1 when absent). When hand-writing a "find the first match"
+  helper, do **not** write "keep searching after a hit" — the helper then
+  walks into the "no more matches" branch and returns -1 even though it
+  found one, so "does it exist?" always answers "no".
 * **Cross-package namespaces need no manifest dependency**: compiling with
   `--package-project <repo>` scans every `packages/*/src/`, so a cross-package
   `using` resolves directly — nothing has to be declared in `zan.pkg`. A new

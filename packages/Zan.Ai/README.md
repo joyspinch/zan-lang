@@ -18,6 +18,9 @@ HNSW 向量索引、`Zan.Net` 的 `HttpClient`），但没有把它们串成"文
   实体，线格式由各协议客户端自己渲染）+ `AnthropicClient`（Anthropic
   Messages API：`/v1/messages`、`x-api-key`、内容块数组、`tool_use`/
   `tool_result` 块）
+- `System.Ai` — `AiStream` / `AiStreamEvent` / `AiStreamResult`（流式的
+  公共内核：SSE 收流、帧翻译、**工具调用的增量拼装**；事件是实体，种类
+  在 `kind` 字段里）
 - `System.Ai` — `Embeddings`（OpenAI 兼容 `/v1/embeddings`：批量、
   按 index 归位、向量归一化、维度校验）
 - `System.Ai` — `Chunking`（文档分块：递归字符分割 / token 窗口 /
@@ -442,6 +445,67 @@ Anthropic 要求 user 与 assistant 交替，而 OpenAI 的工具结果是一条
 **API 变动**：`AiClient.CompleteWithTools` 现在收 `List<AiTool>`（实体），
 原来收线格式 JSON 串的那一版改名叫 `CompleteWithToolsJson`（行为不变）。
 
+## 流式：真流式 + 流式工具调用
+
+流式有两层：**投递**（增量是不是真的一到就送）与**内容**（送的是什么）。
+`AiClient.Stream` 只做前者（文本增量）；`StreamWithTools` 两层都做。
+
+```zan
+using System.Ai;
+
+// onEvent 收到一个事件就返回一个 bool：false = 调用方主动停止。
+static bool OnEvent(AiStreamEvent e) {
+    if (e.kind == "delta") { ui.Append(e.text); }        // 增量文本
+    if (e.kind == "tool") { ShowTool(e.toolName, e.args); }  // 工具调用的增量
+    return true;                                          // ← false 主动停止
+}
+
+AiClient client = new AiClient("https://api.openai.com/v1", "sk-...", "gpt-4o");
+AiStreamResult r = await client.StreamWithTools(messages, tools, 0.0, OnEvent);
+// r.text      —— 完整正文
+// r.toolCalls —— 拼装好的工具调用（按序号归位）
+// r.stopped   —— 调用方主动叫停了？
+// r.error     —— 失败原因（空串 = 没失败）
+```
+
+`AnthropicClient.StreamWithTools` 同一套签名（`IChat` 契约里的方法）。
+
+### 工具参数是**分片**到达的
+
+服务方不会一次把工具参数发完，而是拆成几段 JSON 文本增量发。OpenAI 兼容
+协议靠 `tool_calls[].index` 归位，Anthropic 靠内容块的 `index` 归位。
+**靠到达顺序拼是错的**——服务方完全可能先发第 2 个工具的参数片段，再发第 1
+个的。所以本包按序号归位，最后按序号排序输出。
+
+| | OpenAI 兼容 | Anthropic |
+|---|---|---|
+| 工具调用增量 | `delta.tool_calls[].function.arguments` | `content_block_delta` 的 `input_json_delta.partial_json` |
+| 归位键 | `tool_calls[].index` | 内容块的 `index` |
+| 名字与 id | 第一段带 `id` / `function.name` | `content_block_start` 的 `tool_use` 块带 |
+
+### 流的四种结局
+
+| 结局 | `error` | `stopped` | 内容 |
+|---|---|---|---|
+| 正常结束 | 空 | false | 完整 |
+| 流内错误帧（provider 在 SSE 数据里报错，HTTP 仍是 200） | 有原因 | false | **错误之前收到的仍然交回** |
+| 传输层失败 | 有原因 | false | 已收到的仍然交回 |
+| 调用方叫停（回调返回 false） | **空** | true | 已收到的仍然交回 |
+
+**主动停止不算失败**：中止上游必然让传输层报 "err: cancelled"，那是我们
+自己叫停的，报成错误会让调用方以为流挂了。
+
+**半截内容要交回**：内容是**已经付过费**的（token 已经花掉），丢掉它等于
+让用户白等白花钱。所以流式的结果对象**永远存在**，失败看 `error` 而不是
+"返回 null"——这与非流式的 `Complete`（失败返回 null）是**不同的约定**，
+`IChat` 的注释里写明了。
+
+### 事件是实体，不是"魔法字符串"
+
+事件种类放在 `kind` 字段里（`delta` / `tool` / `usage` / `done` /
+`error`），不用 `"tool:"` 这种前缀让调用方靠 `StartsWith` 猜——前缀拼错的
+分支永远不会命中，也没人会发现。
+
 ## 设计要点
 
 - **实体化，不用平行数组**：向量、分块、请求/响应、检索命中都是具名
@@ -530,10 +594,10 @@ Anthropic 要求 user 与 assistant 交替，而 OpenAI 的工具结果是一条
   块）；不做各厂商的私有函数调用协议（Gemini 的 `functionDeclarations` 等）。
   远端 MCP 工具可以接进来（`McpTools.RegisterAll`），但 MCP 自己的协议
   在 `Zan.Mcp` 包里。
-- **Anthropic 侧只做非流式**。Anthropic 的 SSE 事件（`content_block_start`
-  / `content_block_delta` / `message_delta`）与 OpenAI 兼容那套帧格式不同，
-  流式与流式工具调用是另一件事（`AiClient.Stream` 走的是 OpenAI 兼容的
-  帧）。
+- **Anthropic 侧也有流式**（`AnthropicClient.StreamWithTools`）：Anthropic 的
+  SSE 事件（`content_block_start` / `content_block_delta` / `message_delta`）
+  与 OpenAI 兼容那套帧格式不同，翻译在 `AiStream.AnthropicEvents` 里，
+  工具参数按内容块的 `index` 归位。
 - 工具返回值是**纯文本**（不传结构化 JSON 给模型）——省一次解析，但
   模型要用结构化结果时得自己从文本里读。
 - 工具是**同步或异步的单个委托**——不支持"需要确认才执行"这类多步
@@ -566,3 +630,7 @@ Anthropic 要求 user 与 assistant 交替，而 OpenAI 的工具结果是一条
   （HTTP 状态码仍是 200）。这种帧被跳过的话，调用方拿到的是半截
   内容 + 空 `lastError`，看起来像"正常结束"，实际是上游炸了。错误
   之前收到的内容仍然交回（内容有用），但 `lastError` 一定有原因。
+- 流式的**用量**看服务方有没有回报：OpenAI 兼容要开
+  `stream_options.include_usage` 才给，本包**不主动开**（有些兼容服务方
+  见到不认识的字段会直接 400），没回报时用估算值并把 `usage.estimated`
+  标成 true。

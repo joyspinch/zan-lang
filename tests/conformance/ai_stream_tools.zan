@@ -1,0 +1,729 @@
+// AI 流式工具调用——SSE 增量里的工具调用怎么拼装成完整的一次调用。
+//
+// 覆盖：
+// - **真流式**：服务端发完第一帧后**等客户端确认收到**才发第二帧。
+//   缓冲式客户端（收完整条响应再回调）的确认永远到不了，服务端等超时，
+//   用例直接看到"没增量"。判定是确定性的，不依赖墙钟阈值。
+// - **工具调用拼装**：服务方把工具参数**分片**发（JSON 文本的一段），
+//   要按序号归位拼成完整的 `AiToolCall`。
+// - **多个工具按序号归位**（服务方先发第 2 个工具的增量，再发第 1 个的）。
+// - **请求形状**：`stream: true`、工具声明的两种形状、路径。
+// - **回调返回 false** → 调用方主动停止（**不算失败**）。
+// - **流内错误帧** → 报进 `error`，但错误之前收到的内容仍然交回。
+// - Anthropic 的用量**拆两帧**发 → 合并而不是覆盖。
+// - 坏帧跳过，不让整条流断掉。
+//
+// 假端点是本进程内起的裸 TCP 服务（按 SSE 的分块帧写），这样能精确控制
+// "什么时候发下一帧"。
+using System;
+using System.Ai;
+using System.Collections.Generic;
+using System.Json;
+using System.Net.Sockets;
+using System.Threading;
+
+namespace Conf;
+
+class Prog {
+    // 假端点的端口（与其他 AI 用例错开，避免并行跑时撞端口）。
+    static int PORT = 19930;
+
+    // 「第一帧已收到」的确认计数。**必须用互斥量保护**：服务端与
+    // 客户端在不同线程上读写。
+    public static Mutex AckLock = new Mutex();
+    // 「服务端已 listen」的计数。用它替掉固定 sleep——固定 sleep 在
+    // 机器繁忙时不够（客户端先连、连接进了 backlog 没人 accept），
+    // 变成偶发失败。
+    public static int ReadyCount = 0;
+    public static int AckCount = 0;
+    // 服务端等不到确认而超时的标记。
+    public static bool ServerTimedOut = false;
+
+    // 要发的帧（每帧一整段文本）。
+    public static List<string> Frames = new List<string>();
+    // 发完第几帧后等确认（-1 = 不等）。
+    public static int AckAfterFrame = -1;
+
+    // 收到的请求。
+    public static string ReqHead = "";
+    public static string ReqPath = "";
+    public static string ReqBody = "";
+    public static string ReqAccept = "";
+
+    // 客户端收到的事件。
+    public static List<AiStreamEvent> Events = new List<AiStreamEvent>();
+    // 回调返回 false（主动停止）。
+    public static bool StopOnFirst = false;
+
+    // ------------------------------------------------------------------
+    // 假端点
+    // ------------------------------------------------------------------
+
+    static async void Serve(int port) {
+        try {
+            TcpListener listener = new TcpListener("127.0.0.1", port);
+            listener.Start();
+            Prog.SignalReady();
+            nint c = await listener.AcceptAsync();
+            // 读请求头与请求体。
+            //
+            // 头可能**分多次到达**（一次 recv 未必拿到整个头）——所以要
+            // 一直读到 "\r\n\r\n" 为止。
+            string raw = "";
+            int hb = -1;
+            while (hb < 0) {
+                string piece = await Socket.RecvAsync(c, 8192);
+                if (piece.Length == 0) { break; }
+                raw = raw + piece;
+                hb = Prog.Find(raw, "\r\n\r\n");
+            }
+            Prog.ReqHead = "";
+            if (hb >= 0) {
+                string headOnly = raw.Substring(0, hb);
+                int cl = Prog.ContentLengthOf(headOnly);
+                string body = raw.Substring(hb + 4, raw.Length - hb - 4);
+                while (body.Length < cl) {
+                    string piece = await Socket.RecvAsync(c, 8192);
+                    if (piece.Length == 0) { break; }
+                    body = body + piece;
+                }
+                Prog.ReqHead = headOnly;
+                Prog.ReqPath = Prog.PathOf(headOnly);
+                Prog.ReqAccept = Prog.HeaderOf(headOnly, "accept");
+                Prog.ReqBody = body;
+            }
+            int _h = await Socket.SendStringAsync(c,
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
+                + "Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n");
+            for (int i = 0; i < Prog.Frames.Count; i = i + 1) {
+                string f = Prog.Frames[i];
+                int _c = await Socket.SendStringAsync(c,
+                    Prog.Hex(f.Length) + "\r\n" + f + "\r\n");
+                if (i == Prog.AckAfterFrame) {
+                    // 等客户端确认收到了这一帧。**确认不到就是没有增量投递**。
+                    if (!await Prog.WaitAck(3000)) {
+                        Prog.ServerTimedOut = true;
+                    }
+                }
+            }
+            int _e = await Socket.SendStringAsync(c, "0\r\n\r\n");
+            Socket.Close(c);
+            listener.Stop();
+        } catch (Exception e) {
+            // 客户端主动停止时连接被拆掉，后面的写会失败——那正是预期。
+        }
+    }
+
+    // 客户端回调：收到第一个事件就**立刻**确认服务端。
+    public static bool OnEvent(AiStreamEvent e) {
+        Prog.Events.Add(e);
+        if (Prog.Events.Count == 1) {
+            Prog.SignalAck();
+        }
+        return !Prog.StopOnFirst;
+    }
+
+    // ------------------------------------------------------------------
+    // 帧构造
+    // ------------------------------------------------------------------
+
+    // 造一帧 OpenAI 兼容的 SSE 数据。
+    //
+    // toolIndex < 0 表示这一帧不带工具调用；args 是参数的**片段**。
+    static string OpenAiFrame(string content, int toolIndex, string toolId,
+    string toolName, string args, string finish) {
+        JsonValue delta = JsonValue.NewObject();
+        if (content.Length > 0) { delta.PutStr("content", content); }
+        if (toolIndex >= 0) {
+            JsonValue fn = JsonValue.NewObject();
+            if (toolName.Length > 0) { fn.PutStr("name", toolName); }
+            if (args.Length > 0) { fn.PutStr("arguments", args); }
+            JsonValue call = JsonValue.NewObject();
+            call.PutInt("index", toolIndex);
+            if (toolId.Length > 0) { call.PutStr("id", toolId); }
+            call.Put("function", fn);
+            JsonValue calls = JsonValue.NewArray();
+            calls.Append(call);
+            delta.Put("tool_calls", calls);
+        }
+        JsonValue choice = JsonValue.NewObject();
+        choice.Put("delta", delta);
+        if (finish.Length > 0) { choice.PutStr("finish_reason", finish); }
+        JsonValue choices = JsonValue.NewArray();
+        choices.Append(choice);
+        JsonValue root = JsonValue.NewObject();
+        root.Put("choices", choices);
+        return "data: " + root.ToJson() + "\n\n";
+    }
+
+    static string AnthropicMessageStart(int inputTokens) {
+        JsonValue usage = JsonValue.NewObject();
+        usage.PutInt("input_tokens", inputTokens);
+        JsonValue message = JsonValue.NewObject();
+        message.Put("usage", usage);
+        JsonValue root = JsonValue.NewObject();
+        root.PutStr("type", "message_start");
+        root.Put("message", message);
+        return "data: " + root.ToJson() + "\n\n";
+    }
+
+    static string AnthropicToolStart(int index, string id, string name) {
+        JsonValue block = JsonValue.NewObject();
+        block.PutStr("type", "tool_use");
+        block.PutStr("id", id);
+        block.PutStr("name", name);
+        JsonValue root = JsonValue.NewObject();
+        root.PutStr("type", "content_block_start");
+        root.PutInt("index", index);
+        root.Put("content_block", block);
+        return "data: " + root.ToJson() + "\n\n";
+    }
+
+    static string AnthropicTextDelta(int index, string text) {
+        JsonValue delta = JsonValue.NewObject();
+        delta.PutStr("type", "text_delta");
+        delta.PutStr("text", text);
+        JsonValue root = JsonValue.NewObject();
+        root.PutStr("type", "content_block_delta");
+        root.PutInt("index", index);
+        root.Put("delta", delta);
+        return "data: " + root.ToJson() + "\n\n";
+    }
+
+    static string AnthropicInputJsonDelta(int index, string partial) {
+        JsonValue delta = JsonValue.NewObject();
+        delta.PutStr("type", "input_json_delta");
+        delta.PutStr("partial_json", partial);
+        JsonValue root = JsonValue.NewObject();
+        root.PutStr("type", "content_block_delta");
+        root.PutInt("index", index);
+        root.Put("delta", delta);
+        return "data: " + root.ToJson() + "\n\n";
+    }
+
+    static string AnthropicMessageDelta(string stopReason, int outputTokens) {
+        JsonValue delta = JsonValue.NewObject();
+        delta.PutStr("stop_reason", stopReason);
+        JsonValue usage = JsonValue.NewObject();
+        usage.PutInt("output_tokens", outputTokens);
+        JsonValue root = JsonValue.NewObject();
+        root.PutStr("type", "message_delta");
+        root.Put("delta", delta);
+        root.Put("usage", usage);
+        return "data: " + root.ToJson() + "\n\n";
+    }
+
+    static string AnthropicError(string message) {
+        JsonValue err = JsonValue.NewObject();
+        err.PutStr("type", "overloaded_error");
+        err.PutStr("message", message);
+        JsonValue root = JsonValue.NewObject();
+        root.PutStr("type", "error");
+        root.Put("error", err);
+        return "data: " + root.ToJson() + "\n\n";
+    }
+
+    // 一个工具声明。
+    static AiTool MakeTool() {
+        JsonValue props = JsonValue.NewObject();
+        JsonValue orderId = JsonValue.NewObject();
+        orderId.PutStr("type", "string");
+        orderId.PutStr("description", "订单号");
+        props.Put("order_id", orderId);
+        JsonValue params = JsonValue.NewObject();
+        params.PutStr("type", "object");
+        params.Put("properties", props);
+        JsonValue required = JsonValue.NewArray();
+        required.AppendStr("order_id");
+        params.Put("required", required);
+        return new AiTool("查订单", "按订单号查订单状态与物流进度", params);
+    }
+
+    static List<AiTool> Tools() {
+        List<AiTool> one = new List<AiTool>();
+        one.Add(Prog.MakeTool());
+        return one;
+    }
+
+    static List<AiMessage> Messages() {
+        List<AiMessage> msgs = new List<AiMessage>();
+        msgs.Add(AiMessage.User("查一下订单 A100"));
+        return msgs;
+    }
+
+    static AiConfig Config(int port) {
+        AiConfig cfg = new AiConfig("http://127.0.0.1:" + Convert.ToString(port),
+            "fake-key", "fake-model");
+        cfg.connectTimeoutMs = 3000;
+        cfg.readTimeoutMs = 5000;
+        cfg.totalTimeoutMs = 10000;
+        cfg.maxAttempts = 1;
+        return cfg;
+    }
+
+    static void Reset() {
+        Prog.AckLock.WaitOne();
+        Prog.AckCount = 0;
+        Prog.ReadyCount = 0;
+        Prog.ServerTimedOut = false;
+        Prog.AckLock.ReleaseMutex();
+        Prog.Events.Clear();
+        Prog.StopOnFirst = false;
+        Prog.Frames.Clear();
+        Prog.AckAfterFrame = -1;
+        Prog.ReqHead = "";
+        Prog.ReqPath = "";
+        Prog.ReqBody = "";
+        Prog.ReqAccept = "";
+    }
+
+    static async int Main() {
+        int bad = 0;
+        Socket.Initialize();
+
+        // ---- 1. OpenAI 兼容：流式工具调用拼装 + 真流式 ----
+        {
+            Prog.Reset();
+            Prog.Frames.Add(Prog.OpenAiFrame("我查一下", -1, "", "", "", ""));
+            Prog.Frames.Add(Prog.OpenAiFrame("", 0, "call_1", "查订单", "", ""));
+            Prog.Frames.Add(Prog.OpenAiFrame("", 0, "", "", "{\"order_id\":", ""));
+            Prog.Frames.Add(Prog.OpenAiFrame("", 0, "", "", "\"A100\"}", ""));
+            Prog.Frames.Add(Prog.OpenAiFrame("", -1, "", "", "", "tool_calls"));
+            Prog.Frames.Add("data: [DONE]\n\n");
+            // 第一帧发完就等确认：缓冲式客户端的确认永远到不了。
+            Prog.AckAfterFrame = 0;
+            Task.Spawn(Prog.Serve(Prog.PORT));
+            if (!Prog.WaitReady(5000)) {
+                Console.WriteLine("server not ready");
+                return 1;
+            }
+            AiClient client = new AiClient(Prog.Config(Prog.PORT));
+            AiStreamResult res = await client.StreamWithTools(Prog.Messages(),
+                Prog.Tools(), 0.0, Prog.OnEvent);
+            if (res == null) {
+                Console.WriteLine("stream.null");
+                bad = bad + 1;
+            } else {
+                if (res.text != "我查一下") {
+                    Console.WriteLine("stream.text=" + res.text);
+                    bad = bad + 1;
+                }
+                // 工具调用：分片拼装成完整的一次调用。
+                if (res.toolCalls.Count != 1) {
+                    Console.WriteLine("stream.calls=" + Convert.ToString(res.toolCalls.Count));
+                    bad = bad + 1;
+                } else {
+                    AiToolCall call = res.toolCalls[0];
+                    if (call.id != "call_1") {
+                        Console.WriteLine("stream.id=" + call.id);
+                        bad = bad + 1;
+                    }
+                    if (call.name != "查订单") {
+                        Console.WriteLine("stream.name=" + call.name);
+                        bad = bad + 1;
+                    }
+                    if (call.arguments != "{\"order_id\":\"A100\"}") {
+                        Console.WriteLine("stream.args=" + call.arguments);
+                        bad = bad + 1;
+                    }
+                }
+                if (res.finishReason != "tool_calls") {
+                    Console.WriteLine("stream.finish=" + res.finishReason);
+                    bad = bad + 1;
+                }
+                if (!res.Ok()) {
+                    Console.WriteLine("stream.err=" + res.error);
+                    bad = bad + 1;
+                }
+                if (res.stopped) { bad = bad + 1; }
+                // 服务端没等到确认 → 客户端不是增量投递。
+                if (Prog.ServerTimedOut) {
+                    Console.WriteLine("stream.notIncremental");
+                    bad = bad + 1;
+                }
+                // 回调确实拿到了工具事件。
+                int toolEvents = 0;
+                for (int i = 0; i < Prog.Events.Count; i = i + 1) {
+                    if (Prog.Events[i].kind == "tool") { toolEvents = toolEvents + 1; }
+                }
+                if (toolEvents != 3) {
+                    Console.WriteLine("stream.toolEvents=" + Convert.ToString(toolEvents));
+                    bad = bad + 1;
+                }
+            }
+            // 请求形状：stream=true、工具声明是 OpenAI 形状、路径。
+            JsonValue body = JsonValue.Parse(Prog.ReqBody);
+            JsonValue streamFlag = body.Get("stream");
+            if (streamFlag == null || streamFlag.AsBool(false) == false) {
+                bad = bad + 1;
+            }
+            if (Prog.ReqPath != "/chat/completions") {
+                Console.WriteLine("stream.path=" + Prog.ReqPath);
+                bad = bad + 1;
+            }
+            if (Prog.ReqAccept.IndexOf("text/event-stream") < 0) {
+                Console.WriteLine("stream.accept=" + Prog.ReqAccept);
+                bad = bad + 1;
+            }
+            JsonValue tools = body.Get("tools");
+            if (tools == null || tools.Count() != 1) {
+                bad = bad + 1;
+            } else {
+                JsonValue t0 = tools.At(0);
+                if (t0.Str("type", "") != "function") { bad = bad + 1; }
+                JsonValue fn = t0.Get("function");
+                if (fn == null || fn.Str("name", "") != "查订单") { bad = bad + 1; }
+                if (fn.Get("parameters") == null) { bad = bad + 1; }
+            }
+            if (body.Str("tool_choice", "") != "auto") { bad = bad + 1; }
+            Console.WriteLine("openai text=" + (res == null ? "" : res.text)
+                + " calls=" + Convert.ToString(res == null ? 0 : res.toolCalls.Count)
+                + " args=" + (res == null || res.toolCalls.Count == 0
+                    ? "" : res.toolCalls[0].arguments)
+                + " events=" + Convert.ToString(Prog.Events.Count)
+                + " timeout=" + Convert.ToString(Prog.ServerTimedOut));
+            client.Close();
+        }
+
+        // ---- 2. 多个工具按序号归位（先发第 2 个的增量） ----
+        {
+            Prog.Reset();
+            Prog.Frames.Add(Prog.OpenAiFrame("", 1, "call_b", "查天气", "{\"city\":\"杭州\"}", ""));
+            Prog.Frames.Add(Prog.OpenAiFrame("", 0, "call_a", "查订单", "{\"order_id\":\"A1\"}", ""));
+            Prog.Frames.Add(Prog.OpenAiFrame("", -1, "", "", "", "tool_calls"));
+            Task.Spawn(Prog.Serve(Prog.PORT + 1));
+            if (!Prog.WaitReady(5000)) {
+                Console.WriteLine("server2 not ready");
+                return 1;
+            }
+            AiClient client = new AiClient(Prog.Config(Prog.PORT + 1));
+            AiStreamResult res = await client.StreamWithTools(Prog.Messages(),
+                Prog.Tools(), 0.0, Prog.OnEvent);
+            if (res == null || res.toolCalls.Count != 2) {
+                Console.WriteLine("order.count=" + Convert.ToString(
+                    res == null ? 0 : res.toolCalls.Count));
+                bad = bad + 1;
+            } else {
+                // 按序号归位：先到的第 2 个排在后面。
+                if (res.toolCalls[0].id != "call_a") {
+                    Console.WriteLine("order.0=" + res.toolCalls[0].id);
+                    bad = bad + 1;
+                }
+                if (res.toolCalls[1].id != "call_b") {
+                    Console.WriteLine("order.1=" + res.toolCalls[1].id);
+                    bad = bad + 1;
+                }
+            }
+            Console.WriteLine("order calls=" + Convert.ToString(
+                res == null ? 0 : res.toolCalls.Count));
+            client.Close();
+        }
+
+        // ---- 3. Anthropic：流式工具调用 + 用量拆两帧合并 ----
+        {
+            Prog.Reset();
+            Prog.Frames.Add(Prog.AnthropicMessageStart(25));
+            Prog.Frames.Add(Prog.AnthropicToolStart(0, "toolu_1", "查订单"));
+            Prog.Frames.Add(Prog.AnthropicInputJsonDelta(0, "{\"x\":"));
+            Prog.Frames.Add(Prog.AnthropicInputJsonDelta(0, "2}"));
+            Prog.Frames.Add(Prog.AnthropicMessageDelta("tool_use", 7));
+            Task.Spawn(Prog.Serve(Prog.PORT + 2));
+            if (!Prog.WaitReady(5000)) {
+                Console.WriteLine("server3 not ready");
+                return 1;
+            }
+            AnthropicClient client = new AnthropicClient(Prog.Config(Prog.PORT + 2));
+            AiStreamResult res = await client.StreamWithTools(Prog.Messages(),
+                Prog.Tools(), 0.0, Prog.OnEvent);
+            if (res == null) {
+                Console.WriteLine("anthropic.null");
+                bad = bad + 1;
+            } else {
+                if (res.toolCalls.Count != 1) {
+                    Console.WriteLine("anthropic.calls=" + Convert.ToString(res.toolCalls.Count));
+                    bad = bad + 1;
+                } else {
+                    AiToolCall call = res.toolCalls[0];
+                    if (call.id != "toolu_1") {
+                        Console.WriteLine("anthropic.id=" + call.id);
+                        bad = bad + 1;
+                    }
+                    if (call.name != "查订单") {
+                        Console.WriteLine("anthropic.name=" + call.name);
+                        bad = bad + 1;
+                    }
+                    if (call.arguments != "{\"x\":2}") {
+                        Console.WriteLine("anthropic.args=" + call.arguments);
+                        bad = bad + 1;
+                    }
+                }
+                if (res.finishReason != "tool_use") {
+                    Console.WriteLine("anthropic.finish=" + res.finishReason);
+                    bad = bad + 1;
+                }
+                // 用量拆两帧发（输入 token 在 message_start，输出 token 在
+                // message_delta）→ **合并**，不能是覆盖。
+                if (res.usage.promptTokens != 25) {
+                    Console.WriteLine("anthropic.prompt=" + Convert.ToString(res.usage.promptTokens));
+                    bad = bad + 1;
+                }
+                if (res.usage.completionTokens != 7) {
+                    Console.WriteLine("anthropic.completion=" + Convert.ToString(res.usage.completionTokens));
+                    bad = bad + 1;
+                }
+                if (res.usage.estimated) { bad = bad + 1; }
+            }
+            // 请求形状：Anthropic 的工具声明形状 + 路径。
+            JsonValue body = JsonValue.Parse(Prog.ReqBody);
+            JsonValue streamFlag = body.Get("stream");
+            if (streamFlag == null || streamFlag.AsBool(false) == false) {
+                bad = bad + 1;
+            }
+            if (Prog.ReqPath != "/v1/messages") {
+                Console.WriteLine("anthropic.path=" + Prog.ReqPath);
+                bad = bad + 1;
+            }
+            JsonValue tools = body.Get("tools");
+            if (tools == null || tools.Count() != 1) {
+                bad = bad + 1;
+            } else {
+                JsonValue t0 = tools.At(0);
+                if (t0.Str("name", "") != "查订单") { bad = bad + 1; }
+                if (t0.Has("function")) { bad = bad + 1; }
+                if (t0.Get("input_schema") == null) { bad = bad + 1; }
+            }
+            Console.WriteLine("anthropic calls=" + Convert.ToString(
+                res == null ? 0 : res.toolCalls.Count)
+                + " args=" + (res == null || res.toolCalls.Count == 0
+                    ? "" : res.toolCalls[0].arguments)
+                + " usage=" + Convert.ToString(res == null ? 0 : res.usage.promptTokens)
+                + "/" + Convert.ToString(res == null ? 0 : res.usage.completionTokens));
+            client.Close();
+        }
+
+        // ---- 4. 回调返回 false → 主动停止（不算失败） ----
+        {
+            Prog.Reset();
+            Prog.StopOnFirst = true;
+            Prog.Frames.Add(Prog.OpenAiFrame("第一段", -1, "", "", "", ""));
+            Prog.Frames.Add(Prog.OpenAiFrame("第二段", -1, "", "", "", ""));
+            Prog.AckAfterFrame = 0;
+            Task.Spawn(Prog.Serve(Prog.PORT + 3));
+            if (!Prog.WaitReady(5000)) {
+                Console.WriteLine("server4 not ready");
+                return 1;
+            }
+            AiClient client = new AiClient(Prog.Config(Prog.PORT + 3));
+            AiStreamResult res = await client.StreamWithTools(Prog.Messages(),
+                Prog.Tools(), 0.0, Prog.OnEvent);
+            if (res == null) {
+                bad = bad + 1;
+            } else {
+                // 停在第一段。
+                if (res.text != "第一段") {
+                    Console.WriteLine("stop.text=" + res.text);
+                    bad = bad + 1;
+                }
+                if (!res.stopped) { bad = bad + 1; }
+                // 主动停止**不算失败**：error 必须为空。
+                if (res.error.Length > 0) {
+                    Console.WriteLine("stop.err=" + res.error);
+                    bad = bad + 1;
+                }
+            }
+            if (client.lastError.Length > 0) {
+                Console.WriteLine("stop.lastError=" + client.lastError);
+                bad = bad + 1;
+            }
+            Console.WriteLine("stop text=" + (res == null ? "" : res.text)
+                + " stopped=" + Convert.ToString(res == null ? false : res.stopped));
+            client.Close();
+        }
+
+        // ---- 5. 流内错误帧 ----
+        {
+            Prog.Reset();
+            Prog.Frames.Add(Prog.OpenAiFrame("半截内容", -1, "", "", "", ""));
+            Prog.Frames.Add("data: {\"error\":{\"message\":\"upstream exploded\"}}\n\n");
+            Task.Spawn(Prog.Serve(Prog.PORT + 4));
+            if (!Prog.WaitReady(5000)) {
+                Console.WriteLine("server5 not ready");
+                return 1;
+            }
+            AiClient client = new AiClient(Prog.Config(Prog.PORT + 4));
+            AiStreamResult res = await client.StreamWithTools(Prog.Messages(),
+                Prog.Tools(), 0.0, Prog.OnEvent);
+            if (res == null) {
+                bad = bad + 1;
+            } else {
+                // 错误之前收到的内容仍然交回。
+                if (res.text != "半截内容") {
+                    Console.WriteLine("err.text=" + res.text);
+                    bad = bad + 1;
+                }
+                // 但必须有原因。
+                if (res.error.IndexOf("upstream exploded") < 0) {
+                    Console.WriteLine("err.reason=" + res.error);
+                    bad = bad + 1;
+                }
+                if (res.Ok()) { bad = bad + 1; }
+            }
+            Console.WriteLine("err text=" + (res == null ? "" : res.text)
+                + " reason=" + (res == null ? "" : res.error));
+            client.Close();
+        }
+
+        // ---- 6. 静态翻译函数（不经网络） ----
+        {
+            // 坏帧跳过，不让整条流断掉。
+            if (AiStream.OpenAiEvents("{不是 JSON").Count != 0) { bad = bad + 1; }
+            if (AiStream.AnthropicEvents("{不是 JSON").Count != 0) { bad = bad + 1; }
+            // OpenAI 帧的四种事件。
+            List<AiStreamEvent> evs = AiStream.OpenAiEvents(
+                "{\"choices\":[{\"delta\":{\"content\":\"Hi\"},\"finish_reason\":\"stop\"}]}");
+            if (evs.Count != 2) { bad = bad + 1; }
+            else {
+                if (evs[0].kind != "delta" || evs[0].text != "Hi") { bad = bad + 1; }
+                if (evs[1].kind != "done" || evs[1].finishReason != "stop") { bad = bad + 1; }
+            }
+            // Anthropic 的文本增量。
+            List<AiStreamEvent> ae = AiStream.AnthropicEvents(
+                "{\"type\":\"content_block_delta\",\"index\":0,"
+                + "\"delta\":{\"type\":\"text_delta\",\"text\":\"你好\"}}");
+            if (ae.Count != 1 || ae[0].kind != "delta" || ae[0].text != "你好") {
+                bad = bad + 1;
+            }
+            // Anthropic 的错误帧。
+            List<AiStreamEvent> ee = AiStream.AnthropicEvents(
+                "{\"type\":\"error\",\"error\":{\"message\":\"overloaded\"}}");
+            if (ee.Count != 1 || ee[0].kind != "error" || ee[0].error != "overloaded") {
+                bad = bad + 1;
+            }
+            // 行分帧：半行跨次拼接 + 残留半行按完整的一行交出来。
+            SseLineReader reader = new SseLineReader();
+            reader.Feed("data: a\n\ndata: b");
+            if (reader.Next() != "data: a") { bad = bad + 1; }
+            if (reader.Next().Length != 0) { bad = bad + 1; }
+            if (reader.Flush() != "data: b") { bad = bad + 1; }
+            Console.WriteLine("static ok");
+        }
+
+        Console.WriteLine("ai-stream-tools-ok: " + Convert.ToString(bad == 0 ? 1 : 0));
+        return bad == 0 ? 0 : 1;
+    }
+
+    // ------------------------------------------------------------------
+    // 工具
+    // ------------------------------------------------------------------
+
+    // 记一次"服务端已就绪"。
+    static void SignalReady() {
+        Prog.AckLock.WaitOne();
+        Prog.ReadyCount = Prog.ReadyCount + 1;
+        Prog.AckLock.ReleaseMutex();
+    }
+
+    // 等服务端就绪（至多 timeoutMs 毫秒）。
+    static async bool WaitReady(int timeoutMs) {
+        Stopwatch sw = new Stopwatch();
+        sw.Restart();
+        while (true) {
+            Prog.AckLock.WaitOne();
+            int n = Prog.ReadyCount;
+            Prog.AckLock.ReleaseMutex();
+            if (n > 0) { return true; }
+            if (sw.ElapsedMilliseconds() > (double)timeoutMs) { return false; }
+            await Task.Delay(10);
+        }
+    }
+
+    // 记一次确认。
+    static void SignalAck() {
+        Prog.AckLock.WaitOne();
+        Prog.AckCount = Prog.AckCount + 1;
+        Prog.AckLock.ReleaseMutex();
+    }
+
+    // 等确认到达（至多 timeoutMs 毫秒）。返回 false 表示超时。
+    static async bool WaitAck(int timeoutMs) {
+        Stopwatch sw = new Stopwatch();
+        sw.Restart();
+        while (true) {
+            Prog.AckLock.WaitOne();
+            int n = Prog.AckCount;
+            Prog.AckLock.ReleaseMutex();
+            if (n > 0) { return true; }
+            if (sw.ElapsedMilliseconds() > (double)timeoutMs) { return false; }
+            await Task.Delay(20);
+        }
+    }
+
+    // 第一个匹配的位置（没有则 -1）。
+    //
+    // **别写成"找到就继续往后找"**：那样只要找到过一次，函数最后仍会走到
+    // "没有更多匹配"那条分支，把已经找到的位置返回成 -1——"存在吗"这个
+    // 问题因此永远得到"不存在"的答案（头因此被当成没收到，请求体也从
+    // 来没被读出来）。
+    static int Find(string s, string needle) {
+        if (s == null || needle == null) { return -1; }
+        return s.IndexOf(needle, 0);
+    }
+
+    // 请求行里的路径。
+    static string PathOf(string head) {
+        int sp = head.IndexOf(" ", 0);
+        if (sp < 0) { return ""; }
+        string rest = head.Substring(sp + 1, head.Length - sp - 1);
+        int sp2 = rest.IndexOf(" ", 0);
+        if (sp2 < 0) { return rest; }
+        return rest.Substring(0, sp2);
+    }
+
+    // 请求头里的某个值（大小写不敏感）。
+    static string HeaderOf(string head, string name) {
+        string lower = name.ToLower();
+        int at = 0;
+        while (at < head.Length) {
+            int eol = head.IndexOf("\r\n", at);
+            if (eol < 0) { eol = head.Length; }
+            string line = head.Substring(at, eol - at);
+            int colon = line.IndexOf(":", 0);
+            if (colon > 0) {
+                string key = line.Substring(0, colon).Trim().ToLower();
+                if (key == lower) {
+                    return line.Substring(colon + 1, line.Length - colon - 1).Trim();
+                }
+            }
+            at = eol + 2;
+        }
+        return "";
+    }
+
+    static int ContentLengthOf(string head) {
+        int at = head.IndexOf("Content-Length:", 0);
+        if (at < 0) { return 0; }
+        int from = at + 15;
+        while (from < head.Length && head.Substring(from, 1) == " ") {
+            from = from + 1;
+        }
+        int to = from;
+        while (to < head.Length) {
+            string c = head.Substring(to, 1);
+            if (c < "0" || c > "9") { break; }
+            to = to + 1;
+        }
+        if (to == from) { return 0; }
+        return Convert.ToInt32(head.Substring(from, to - from));
+    }
+
+    static string Hex(int n) {
+        string d = "0123456789abcdef";
+        if (n == 0) { return "0"; }
+        string acc = "";
+        while (n > 0) {
+            acc = d.Substring(n % 16, 1) + acc;
+            n = n / 16;
+        }
+        return acc;
+    }
+}

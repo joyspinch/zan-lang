@@ -1,0 +1,498 @@
+using System;
+using System.Collections.Generic;
+using System.Json;
+using System.Net.Http.Client;
+using System.Text;
+
+namespace System.Ai;
+
+// 流式回调：收到一个事件。返回 false 表示**调用方主动停止**。
+//
+// 返回 false 与"出错"是两件事：主动停止不算失败（上游被中止是预期
+// 行为），出错走事件里的 `kind = "error"`。
+public delegate bool AiStreamFn(AiStreamEvent e);
+
+// 协议解析器：把一帧 SSE 数据翻译成事件列表。
+//
+// 公开是为了能单独测（协议翻译是最容易错的地方）。解析不了就返回空
+// 列表——**坏帧跳过，不让整条流断掉**。
+public delegate List<AiStreamEvent> AiStreamParserFn(string payload);
+
+// SSE 行分帧：把到达的字节切成一行行完整的数据行。
+//
+// ## 为什么需要它
+//
+// 一次到达的字节可能把一行切成两半（"data: {\"a\":" + "1}\n\n"）。
+// 所以要有半个行的缓冲，跨次拼接。
+//
+// ## 收尾要**补处理**残留的半行
+//
+// SSE 允许最后一个事件不带空行收尾。客户端若只在遇到 "\n" 时才处理行，
+// 流结束时缓冲区里剩下的那半行就会被**静默丢掉**——收流正常结束、内容
+// 却少一截，而且**没有任何错误提示**。所以 `Flush` 把残留半行按完整的
+// 一行交出来。
+public class SseLineReader {
+    // 还没凑齐一行的残留字节。
+    string pending;
+
+    public SseLineReader() {
+        this.pending = "";
+    }
+
+    // 喂进新到的字节。
+    public void Feed(string data) {
+        if (data == null || data.Length == 0) { return; }
+        this.pending = this.pending + data;
+    }
+
+    // 取下一行**非空**行（空行是 SSE 的事件分隔符，没有内容，直接跳过）。
+    //
+    // 没有完整的一行时返回空串。跳过空行不是偷懒：调用方拿"空串"当"没有
+    // 更多行了"的信号，若把空行也交出去，调用方就会把"这一批处理完了"
+    //误当成"整个缓冲处理完了"，把后面还没读的行留在缓冲里。
+    public string Next() {
+        while (true) {
+            int nl = this.pending.IndexOf("\n");
+            if (nl < 0) { return ""; }
+            string line = this.pending.Substring(0, nl).Trim();
+            this.pending = this.pending.Substring(nl + 1);
+            if (line.Length > 0) { return line; }
+        }
+    }
+
+    // 流结束时把残留的半行按完整的一行交出来（没有则返回空串）。
+    public string Flush() {
+        string rest = this.pending.Trim();
+        this.pending = "";
+        return rest;
+    }
+}
+
+// 工具调用的拼装槽位（按服务方的序号归位）。
+class AiToolSlot {
+    public int index;
+    public string id;
+    public string name;
+    public string args;
+
+    public AiToolSlot(int index) {
+        this.index = index;
+        this.id = "";
+        this.name = "";
+        this.args = "";
+    }
+}
+
+// 流式的公共内核：SSE 收流、帧翻译、工具调用拼装。
+//
+// ## 一条流有四种结局
+//
+// | 结局 | 结果 |
+// |---|---|
+// | 正常结束 | `error` 空，`text` 与 `toolCalls` 是这一轮的完整内容 |
+// | 流内错误帧 | `error` 有原因；**错误之前收到的内容仍然交回** |
+// | 传输层失败 | `error` 有原因；已收到的内容仍然交回 |
+// | 调用方叫停 | `stopped` 为 true，`error` **为空**（主动停止不算失败） |
+//
+// ## 为什么"半截内容"要交回
+//
+// 内容是**已经付过费**的（token 已经花掉了）。丢掉它等于让用户白等、
+// 白花钱。调用方拿到 `error` 就知道这一轮不完整，可以决定是重试还是
+// 把半截内容先用上。
+public class AiStream {
+    // ------------------------------------------------------------------
+    // 驱动一条流
+    // ------------------------------------------------------------------
+
+    // 驱动一条 SSE 流：把帧翻译成事件，边到边回调，顺手把工具调用拼装好。
+    //
+    // http 必须是已经配好 `Accept: text/event-stream` 与空闲超时的客户端。
+    // parse 是协议翻译（`OpenAiEvents` / `AnthropicEvents`）。
+    //
+    // 返回这一轮的结果（**永远不返回 null**：失败看 `error`）。
+    public static async AiStreamResult Pump(HttpClient http, string path, string body,
+    AiStreamFn onEvent, AiStreamParserFn parse) {
+        AiStreamResult res = new AiStreamResult();
+        SseSink sink = SseSink.ToMemory();
+        // 传输与消费分离：producer 把字节推进 sink（内存缓冲 + 事件门），
+        // consumer 用 TakeCo 真挂起地等数据——有数据才醒，不靠轮询。
+        long producer = Task.Spawn(http.PostSseToSinkAsync(path, body, sink));
+
+        StringBuilder text = new StringBuilder();
+        List<AiToolSlot> slots = new List<AiToolSlot>();
+        SseLineReader reader = new SseLineReader();
+        bool stopped = false;
+        bool failed = false;
+        while (true) {
+            SseDelivery d = await sink.TakeCo();
+            if (d.data.Length > 0) {
+                reader.Feed(d.data);
+                string line = reader.Next();
+                while (line.Length > 0) {
+                    int r = AiStream.HandleLine(line, text, slots, res, onEvent, parse);
+                    if (r == 0) {
+                        // 调用方要求停止。
+                        stopped = true;
+                        break;
+                    }
+                    if (r < 0) {
+                        // 流内错误帧：不是调用方叫停（错误已记进 res.error，
+                        // 不能被"主动停止不算失败"那条规则吞掉）。
+                        failed = true;
+                        break;
+                    }
+                    line = reader.Next();
+                }
+            }
+            if (stopped || failed) {
+                // 中止上游：provider 报了错之后还可能继续吐数据（或者干脆
+                // 把连接挂着不关），不中止的话下面会一直等到超时上限才返回，
+                // 白白占着这条连接。
+                sink.Abort();
+                break;
+            }
+            if (d.finished) { break; }
+        }
+
+        // 流结束时可能还剩半行：对端把最后一帧发了但**没以换行收尾**
+        // （SSE 允许这样收尾）。这半行要按完整的一行处理，否则最后一个
+        // 分片会被**静默丢掉**。
+        if (!stopped && !failed) {
+            string rest = reader.Flush();
+            if (rest.Length > 0) {
+                AiStream.HandleLine(rest, text, slots, res, onEvent, parse);
+            }
+        }
+
+        res.text = text.ToString();
+        res.toolCalls = AiStream.FinishSlots(slots);
+        res.stopped = stopped;
+
+        // 传输层结果：ok / err: ...
+        //
+        // **调用方主动停止不算失败**：中止上游必然让传输层报
+        // "err: cancelled"，那是我们自己叫停的，报成错误会让调用方以为
+        // 流挂了。
+        //
+        // 但**流内错误帧**要报：那不是我们叫停的，res.error 已经被填好了，
+        // 这里不能覆盖也不能吞掉。
+        if (!stopped && !failed) {
+            string attempt = sink.Attempt();
+            if (attempt.Length > 0 && attempt.StartsWith("err:")) {
+                string reason = attempt.Substring(4).Trim();
+                res.error = "流式请求失败：" + reason;
+            }
+        }
+        if (!res.usageReported) {
+            // 服务方没回报用量 → 估算（标出来，别让调用方当真值用）。
+            res.usage = new AiUsage(AiClient.EstimateTokens(body),
+                AiClient.EstimateTokens(res.text), true);
+        }
+        await AiStream.ReleaseSink(producer, sink);
+        return res;
+    }
+
+    // 等 producer 结束再释放 sink。
+    //
+    // producer 可能还在往 sink 里写（中止上游后它要等传输层发现），提前
+    // Dispose 会让它的写入打到**已释放的互斥量**上——那是崩溃，不是泄漏。
+    // 等不到（上游赖着不走）就不释放：漏一个互斥量句柄好过崩。
+    static async void ReleaseSink(long producer, SseSink sink) {
+        int ticks = 2500;
+        while (Task.IsDone(producer) == 0 && ticks > 0) {
+            await Task.Delay(4);
+            ticks = ticks - 1;
+        }
+        if (Task.IsDone(producer) != 0) {
+            sink.Dispose();
+        }
+    }
+
+    // 处理一行 SSE。返回：
+    //   1  = 继续读下一行
+    //   0  = 调用方要求停止（回调返回了 false）
+    //  -1  = 流内错误帧（错误已记进 res.error）
+    static int HandleLine(string line, StringBuilder text, List<AiToolSlot> slots,
+    AiStreamResult res, AiStreamFn onEvent, AiStreamParserFn parse) {
+        if (line.Length == 0) { return 1; }
+        if (!line.StartsWith("data:")) { return 1; }
+        string payload = line.Substring(5).Trim();
+        if (payload.Length == 0 || payload == "[DONE]") { return 1; }
+        List<AiStreamEvent> events = parse(payload);
+        if (events == null) { return 1; }
+        for (int i = 0; i < events.Count; i = i + 1) {
+            AiStreamEvent e = events[i];
+            if (e == null) { continue; }
+            if (e.kind == "error") {
+                res.error = e.error;
+                return -1;
+            }
+            if (e.kind == "delta") {
+                text.Append(e.text);
+            }
+            if (e.kind == "tool") {
+                AiStream.ApplyTool(slots, e);
+            }
+            if (e.kind == "usage") {
+                // 合并而不是覆盖：Anthropic 把用量拆成两帧发
+                // （`message_start` 给输入 token，`message_delta` 给输出
+                // token），覆盖会把先到的那一半抹掉。
+                if (e.inputTokens > 0) { res.usage.promptTokens = e.inputTokens; }
+                if (e.outputTokens > 0) { res.usage.completionTokens = e.outputTokens; }
+                res.usage.totalTokens = res.usage.promptTokens + res.usage.completionTokens;
+                res.usage.estimated = false;
+                res.usageReported = true;
+            }
+            if (e.kind == "done" && e.finishReason.Length > 0) {
+                res.finishReason = e.finishReason;
+            }
+            if (onEvent != null) {
+                if (!onEvent(e)) { return 0; }
+            }
+        }
+        return 1;
+    }
+
+    // 把一段工具调用的增量并进槽位。
+    //
+    // **有值才覆盖**：id 与名字只在第一段里带，后续片段不带——每段都
+    // 赋值会把前面拿到的真名字抹成空串。
+    static void ApplyTool(List<AiToolSlot> slots, AiStreamEvent e) {
+        AiToolSlot slot = null;
+        for (int i = 0; i < slots.Count; i = i + 1) {
+            if (slots[i].index == e.toolIndex) {
+                slot = slots[i];
+                break;
+            }
+        }
+        if (slot == null) {
+            slot = new AiToolSlot(e.toolIndex);
+            slots.Add(slot);
+        }
+        if (e.toolId.Length > 0) { slot.id = e.toolId; }
+        if (e.toolName.Length > 0) { slot.name = e.toolName; }
+        if (e.args.Length > 0) { slot.args = slot.args + e.args; }
+    }
+
+    // 槽位 → 工具调用列表（**按序号排序**，不按到达顺序）。
+    static List<AiToolCall> FinishSlots(List<AiToolSlot> slots) {
+        for (int i = 0; i < slots.Count; i = i + 1) {
+            for (int j = i + 1; j < slots.Count; j = j + 1) {
+                if (slots[j].index < slots[i].index) {
+                    AiToolSlot t = slots[i];
+                    slots[i] = slots[j];
+                    slots[j] = t;
+                }
+            }
+        }
+        List<AiToolCall> calls = new List<AiToolCall>();
+        for (int i = 0; i < slots.Count; i = i + 1) {
+            calls.Add(new AiToolCall(slots[i].id, slots[i].name, slots[i].args));
+        }
+        return calls;
+    }
+
+    // ------------------------------------------------------------------
+    // 协议翻译
+    // ------------------------------------------------------------------
+
+    // OpenAI 兼容协议的一帧 → 事件。
+    //
+    // 帧的形状：
+    //
+    //     data: {"choices":[{"delta":{"content":"增量文本"}}]}
+    //     data: {"choices":[{"delta":{"tool_calls":[
+    //              {"index":0,"id":"call_1","function":{"name":"f",
+    //               "arguments":"{\"a\":"}}]}}]}
+    //     data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}
+    //     data: {"choices":[],"usage":{"prompt_tokens":9,"completion_tokens":4}}
+    //     data: [DONE]
+    //
+    // **工具调用的参数是分片**：`arguments` 只是 JSON 文本的一段，要按
+    // `index` 归位拼起来才是完整参数。
+    public static List<AiStreamEvent> OpenAiEvents(string payload) {
+        List<AiStreamEvent> events = new List<AiStreamEvent>();
+        JsonValue frame = null;
+        try {
+            frame = JsonValue.Parse(payload);
+        } catch (Exception e) {
+            frame = null;
+        }
+        if (frame == null || !frame.IsObject()) { return events; }
+
+        // 流内错误帧：provider 可以在 SSE **数据里**报错（HTTP 状态码仍是
+        // 200）。这种帧必须报给调用方——否则调用方拿到的是半截内容 + 空
+        // 错误，看起来像"正常结束"，实际是上游炸了。
+        JsonValue frameError = frame.Get("error");
+        if (frameError != null && !frameError.IsNull()) {
+            AiStreamEvent e = new AiStreamEvent("error");
+            string reason = frameError.Str("message", "");
+            if (reason.Length == 0) { reason = "流内错误帧"; }
+            e.error = reason;
+            events.Add(e);
+            return events;
+        }
+
+        // 用量（有的服务方在流末尾单独发一帧）。
+        JsonValue usage = frame.Get("usage");
+        if (usage != null && usage.IsObject()) {
+            AiStreamEvent e = new AiStreamEvent("usage");
+            e.inputTokens = usage.Int("prompt_tokens", 0);
+            e.outputTokens = usage.Int("completion_tokens", 0);
+            events.Add(e);
+        }
+
+        JsonValue choices = frame.Get("choices");
+        if (choices == null || !choices.IsArray() || choices.Count() == 0) {
+            return events;
+        }
+        JsonValue choice = choices.At(0);
+        if (choice == null) { return events; }
+
+        JsonValue delta = choice.Get("delta");
+        if (delta != null) {
+            string piece = delta.Str("content", "");
+            if (piece.Length > 0) {
+                AiStreamEvent e = new AiStreamEvent("delta");
+                e.text = piece;
+                events.Add(e);
+            }
+            JsonValue calls = delta.Get("tool_calls");
+            if (calls != null && calls.IsArray()) {
+                for (int i = 0; i < calls.Count(); i = i + 1) {
+                    JsonValue one = calls.At(i);
+                    if (one == null) { continue; }
+                    AiStreamEvent e = new AiStreamEvent("tool");
+                    // 序号是服务方给的**归位键**——不靠到达顺序。
+                    e.toolIndex = one.Int("index", i);
+                    e.toolId = one.Str("id", "");
+                    JsonValue fn = one.Get("function");
+                    if (fn != null) {
+                        e.toolName = fn.Str("name", "");
+                        e.args = fn.Str("arguments", "");
+                    }
+                    events.Add(e);
+                }
+            }
+        }
+
+        // 结束事件放在**最后**：正文与工具调用的增量先到，"结束了"是
+        // 收尾消息。顺序反了会让"先看到结束、后收到正文"的消费者
+        // 提前收摊。
+        string finish = choice.Str("finish_reason", "");
+        if (finish.Length > 0) {
+            AiStreamEvent e = new AiStreamEvent("done");
+            e.finishReason = finish;
+            events.Add(e);
+        }
+        return events;
+    }
+
+    // Anthropic 协议的一帧 → 事件。
+    //
+    // 帧的形状（`type` 在 JSON 里，不在 SSE 的 `event:` 字段上）：
+    //
+    //     data: {"type":"message_start","message":{"usage":{"input_tokens":9}}}
+    //     data: {"type":"content_block_start","index":0,
+    //             "content_block":{"type":"tool_use","id":"toolu_1","name":"f"}}
+    //     data: {"type":"content_block_delta","index":0,
+    //             "delta":{"type":"input_json_delta","partial_json":"{\"a\":"}}
+    //     data: {"type":"content_block_delta","index":0,
+    //             "delta":{"type":"text_delta","text":"你好"}}
+    //     data: {"type":"message_delta","delta":{"stop_reason":"tool_use"},
+    //             "usage":{"output_tokens":4}}
+    //     data: {"type":"message_stop"}
+    //
+    // **工具参数的片段靠内容块的 `index` 归位**——注意这里的 index 是
+    // **内容块**的下标（有文本块时工具块的下标会往后挪），不是工具序号。
+    // 归位用同一个键就行，顺序由内容块的下标保证。
+    public static List<AiStreamEvent> AnthropicEvents(string payload) {
+        List<AiStreamEvent> events = new List<AiStreamEvent>();
+        JsonValue frame = null;
+        try {
+            frame = JsonValue.Parse(payload);
+        } catch (Exception e) {
+            frame = null;
+        }
+        if (frame == null || !frame.IsObject()) { return events; }
+        string type = frame.Str("type", "");
+
+        if (type == "error") {
+            AiStreamEvent e = new AiStreamEvent("error");
+            JsonValue frameError = frame.Get("error");
+            string reason = frameError == null ? "" : frameError.Str("message", "");
+            if (reason.Length == 0) { reason = "流内错误帧"; }
+            e.error = reason;
+            events.Add(e);
+            return events;
+        }
+
+        if (type == "message_start") {
+            JsonValue message = frame.Get("message");
+            JsonValue usage = message == null ? null : message.Get("usage");
+            if (usage != null && usage.IsObject()) {
+                AiStreamEvent e = new AiStreamEvent("usage");
+                e.inputTokens = usage.Int("input_tokens", 0);
+                events.Add(e);
+            }
+            return events;
+        }
+
+        if (type == "content_block_start") {
+            int index = frame.Int("index", 0);
+            JsonValue block = frame.Get("content_block");
+            if (block != null && block.Str("type", "") == "tool_use") {
+                AiStreamEvent e = new AiStreamEvent("tool");
+                e.toolIndex = index;
+                e.toolId = block.Str("id", "");
+                e.toolName = block.Str("name", "");
+                events.Add(e);
+            }
+            return events;
+        }
+
+        if (type == "content_block_delta") {
+            int index = frame.Int("index", 0);
+            JsonValue delta = frame.Get("delta");
+            if (delta == null) { return events; }
+            string deltaType = delta.Str("type", "");
+            if (deltaType == "text_delta") {
+                string piece = delta.Str("text", "");
+                if (piece.Length > 0) {
+                    AiStreamEvent e = new AiStreamEvent("delta");
+                    e.text = piece;
+                    events.Add(e);
+                }
+            } else if (deltaType == "input_json_delta") {
+                AiStreamEvent e = new AiStreamEvent("tool");
+                e.toolIndex = index;
+                e.args = delta.Str("partial_json", "");
+                events.Add(e);
+            }
+            return events;
+        }
+
+        if (type == "message_delta") {
+            JsonValue usage = frame.Get("usage");
+            if (usage != null && usage.IsObject()) {
+                AiStreamEvent e = new AiStreamEvent("usage");
+                e.outputTokens = usage.Int("output_tokens", 0);
+                events.Add(e);
+            }
+            JsonValue delta = frame.Get("delta");
+            string stop = delta == null ? "" : delta.Str("stop_reason", "");
+            if (stop.Length > 0) {
+                AiStreamEvent e = new AiStreamEvent("done");
+                e.finishReason = stop;
+                events.Add(e);
+            }
+            return events;
+        }
+
+        if (type == "message_stop") {
+            events.Add(new AiStreamEvent("done"));
+            return events;
+        }
+        return events;
+    }
+}
