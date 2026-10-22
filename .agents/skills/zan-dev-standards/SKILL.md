@@ -1319,6 +1319,13 @@ description: Zan 开发规范总纲——可落地的标准与纪律，供 AI �
   坑出处：rail 任务为抓一个 40 帧红色闪光反复调采样间隔（0.12s→0.1s），296K
   token 花在代码逻辑里已写明的结论上——"分支走了 → flashTimer 被赋值 → 闪光
   没画出来"，问题是渲染不是采样。
+- **写像素断言前先把"不变量是什么"想清楚，方向别写反**：右对齐的语义是
+  "锚点是文字右边界"，所以**换锚点时整块墨迹跟着平移**（左右缘一起动），
+  而不是"右缘钉死不动"。我一度把断言写成"右缘不变"，用例立刻报
+  `got -20 want 0`——是断言错了，不是实现错了。
+  可观测的定义要选**与锚点无关**的那一个：右对齐 = 同一锚点下，比左对齐
+  整块左移恰好一个文字宽度（`WidthPx`），换锚点时左右缘位移相同。
+  坑出处：给 `CText.DrawRightPx` / `DrawRightShadowPx` 补 conformance 时踩的。
 - **模板/技能里写了"怎么用"，不等于包里真有这个 API**：写用法的人不会顺手
   把实现补进包，于是模板引着一个**从未存在过**的方法，编译直接失败。落地前
   先查它到底有没有过：
@@ -1358,6 +1365,22 @@ description: Zan 开发规范总纲——可落地的标准与纪律，供 AI �
     把约束挂到 ctest 自己身上；副本靠"记得删"必然删不干净（worktree 副本被
     删两次又被重建两次），所以回收要自动 + **有证明才删**（干净 + HEAD 是
     main 的祖先才动，独有提交/未提交改动一律保留并报出来）。
+- **共享工作树里提交自己的文件：临时索引 + 部分提交之后必须把真实索引刷回来**。
+  做法：`$env:GIT_INDEX_FILE=<临时索引>` → `git read-tree HEAD` →
+  `git add <自己的路径>` → `git commit -F <msg文件> -- <自己的路径>` →
+  **把 `GIT_INDEX_FILE` 置回空** → `git add <自己的路径>`。
+  原因：**部分提交（`git commit -- <paths>`）之后真实索引不会自动跟 HEAD 对齐**，
+  索引里留的还是旧 blob，`git status` 显示 `MM`；下一个会话一提交，你的改动
+  就"凭空消失"（别人以为是自己误删的）。所以刷回不是可选项。
+  - **`git add` 可能失败，必须复核**：`fatal: unable to write new index file`
+    是别人正在写索引时的真实报错（共享工作树里很常见）。失败那一刻
+    `git status --porcelain` 会打出怪状态（同一路径既"已暂存删除"又"未跟踪"），
+    过一会儿自愈。**别假设 add 成功**——刷回后立刻
+    `git status --porcelain -- <路径>`，要求输出为空；不空就重跑 `git add`。
+  - 提交消息文件放 `_scratch/`，用 `-F` 传（`-m` 必须在 `--` 之前）。
+  坑出处：提交 `CText.DrawRightShadowPx` 时 `git add` 被并发写索引打断，
+    `git status` 一度显示 `D`/`??` 打架；只看提交是否成功就收工的话，
+    真实索引会带着旧 blob 留在那儿。
 
 ### PowerShell 脚本协作的几个坑（脚本纪律）
 
@@ -1654,9 +1677,10 @@ description: Zan 开发规范总纲——可落地的标准与纪律，供 AI �
   `git stash push -- <自己的文件>` 复跑一次即证明与己无关，TASKS A368）。
   同产物"ctest 挂死、手动跑通"先手动复跑再怀疑代码。编译器本身被并发
   改动搞崩时（zanc 段错误/未改源也 Access violation），不碰 build/ 与
-  对方文件：`git worktree add _scratch/<名> HEAD` 后用主缓存同款编译参数
+  对方文件：用 `_scratch` 下的**普通目录拷贝**（不是 git worktree 副本——
+  上面那条"worktree 副本一律不再建"是硬规矩）配主缓存同款编译参数
   （clang/ninja/LLVM_DIR 见 build/CMakeCache.txt）自建干净 zanc 验证
-  自己的改动（表格修复验证即此法，用完 `git worktree remove`）。
+  自己的改动（表格修复验证即此法）。
   进程静默死亡（无日志、无 WER 事件）同样先怀疑并行会话清场：按映像名的
   `taskkill /IM` 扫荡会波及同名的演示实例——重启同一二进制若稳定存活即坐实
   外部干扰，别急着改代码；可预配 WER LocalDumps（DumpFolder/DumpType/
