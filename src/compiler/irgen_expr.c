@@ -6444,7 +6444,24 @@ static LLVMValueRef emit_expr_string_interp(zan_irgen_t *g, zan_ast_node_t *expr
                 LLVMTypeRef vt = LLVMTypeOf(val);
                 LLVMTypeKind vtk = LLVMGetTypeKind(vt);
 
-                if (vtk == LLVMPointerTypeKind) {
+                /* bool 的**语义类型**优先于 LLVM 宽度：泛型方法返回值
+                   （List<T>.Contains 这类）被提升成 i64，按宽度判会掉进整数
+                   分支渲染成 "1"（C# 的口径是 true/false）。 */
+                LLVMValueRef bcond = (vtk == LLVMIntegerTypeKind)
+                    ? emit_bool_cond(g, val, part, locals) : NULL;
+
+                if (bcond) {
+                    LLVMValueRef btrue = emit_string_literal_rc(g,
+                        (zan_istr_t){ "true", 4 });
+                    LLVMValueRef bfalse = emit_string_literal_rc(g,
+                        (zan_istr_t){ "false", 5 });
+                    strs[i] = LLVMBuildSelect(g->builder, bcond, btrue, bfalse,
+                        "bstr");
+                    lens[i] = LLVMBuildSelect(g->builder, bcond,
+                        LLVMConstInt(i64, 4, 0), LLVMConstInt(i64, 5, 0),
+                        "blen");
+                    owns[i] = 0;
+                } else if (vtk == LLVMPointerTypeKind) {
                     strs[i] = emit_str_nonnull(g, val);
                     lens[i] = emit_string_length(g, strs[i], expr->loc);
                     owns[i] = expr_yields_owned_rc_value(g, part, locals) ? 1 : 0;

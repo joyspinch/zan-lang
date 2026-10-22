@@ -2042,6 +2042,23 @@ LLVMValueRef emit_bool_to_cstr(zan_irgen_t *g, LLVMValueRef v) {
         emit_string_literal_rc(g, t), emit_string_literal_rc(g, f), "b2s");
 }
 
+/* bool 的**语义类型**优先于 LLVM 值的宽度。泛型实例化的方法返回值
+   （List<T>.Contains 这类）被提升成 i64，按宽度判就掉进 itoa，渲染成 "1"——
+   同一个 bool 在不同上下文里长得不一样（插值 -> "1"，而 b.ToString() -> "true"）。
+   C# 的口径是 true/false，所有取串路径都要按语义类型判。
+   返回 i1 条件（非零为真）；这个值不是 bool 就返回 NULL。 */
+static LLVMValueRef emit_bool_cond(zan_irgen_t *g, LLVMValueRef val,
+                                    zan_ast_node_t *ast, local_scope_t *locals) {
+    if (!ast || !val) return NULL;
+    zan_type_t *bt = infer_expr_type(g, ast, locals);
+    if (!bt || bt->kind != TYPE_BOOL) return NULL;
+    LLVMTypeRef vk = LLVMTypeOf(val);
+    if (LLVMGetTypeKind(vk) != LLVMIntegerTypeKind) return NULL;
+    if (LLVMGetIntTypeWidth(vk) == 1) return val;
+    return LLVMBuildICmp(g->builder, LLVMIntNE, val,
+                         LLVMConstInt(vk, 0, 0), "bcond");
+}
+
 static LLVMValueRef emit_value_as_cstr(zan_irgen_t *g, LLVMValueRef v) {
     LLVMTypeRef vt = LLVMTypeOf(v);
     if (LLVMGetTypeKind(vt) == LLVMPointerTypeKind) return v;
@@ -2503,16 +2520,8 @@ static LLVMValueRef emit_to_cstr_of(zan_irgen_t *g, LLVMValueRef val,
        渲染成 "1"——同一个 bool 在不同上下文里长得不一样（"x" + b -> "x1"，
        而 b.ToString() -> "true"）。C# 的口径是 true/false，两边都得是它。 */
     if (ast && val) {
-        zan_type_t *bt = infer_expr_type(g, ast, locals);
-        if (bt && bt->kind == TYPE_BOOL) {
-            LLVMTypeRef vk = LLVMTypeOf(val);
-            if (LLVMGetTypeKind(vk) == LLVMIntegerTypeKind) {
-                if (LLVMGetIntTypeWidth(vk) == 1) return emit_bool_to_cstr(g, val);
-                LLVMValueRef nz = LLVMBuildICmp(g->builder, LLVMIntNE, val,
-                                               LLVMConstInt(vk, 0, 0), "b2s.nz");
-                return emit_bool_to_cstr(g, nz);
-            }
-        }
+        LLVMValueRef bc = emit_bool_cond(g, val, ast, locals);
+        if (bc) return emit_bool_to_cstr(g, bc);
     }
     if (ast && val && LLVMGetTypeKind(LLVMTypeOf(val)) == LLVMPointerTypeKind) {
         zan_type_t *t = infer_expr_type(g, ast, locals);

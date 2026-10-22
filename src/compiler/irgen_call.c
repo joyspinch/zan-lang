@@ -2034,10 +2034,14 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                             return emit_to_cstr_u(g, arg, uns ? 1 : 0);
                         }
                         /* bool 渲染成 "true"/"false"（不是 itoa 的 "1"）——
-                           与 b.ToString() / Console.WriteLine / 插值同口径 */
-                        if (LLVMGetTypeKind(LLVMTypeOf(arg)) == LLVMIntegerTypeKind &&
-                            LLVMGetIntTypeWidth(LLVMTypeOf(arg)) == 1) {
-                            return emit_bool_to_cstr(g, arg);
+                           与 b.ToString() / Console.WriteLine / 插值同口径。
+                           判据是**语义类型**不是 LLVM 宽度：泛型方法返回值
+                           （List<T>.Contains 这类）被提升成 i64，按宽度判会
+                           掉进 itoa 渲染成 "1"。 */
+                        {
+                            LLVMValueRef bc = emit_bool_cond(g, arg,
+                                expr->call.args.items[0], locals);
+                            if (bc) return emit_bool_to_cstr(g, bc);
                         }
                         /* 双精度浮点数最短往返格式化缓冲区 (40 字节容量) */
                         LLVMValueRef buf_size = LLVMConstInt(i64, 40, 0);
@@ -2530,13 +2534,12 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                     LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
                     LLVMValueRef v = emit_expr(g, sc->member.object, locals);
                     LLVMTypeKind vk = LLVMGetTypeKind(LLVMTypeOf(v));
-                    if (rt_ty->kind == TYPE_BOOL && vk == LLVMIntegerTypeKind &&
-                        LLVMGetIntTypeWidth(LLVMTypeOf(v)) == 1) {
-                        LLVMValueRef t = emit_string_literal_rc(g,
-                            (zan_istr_t){ "true", 4 });
-                        LLVMValueRef f = emit_string_literal_rc(g,
-                            (zan_istr_t){ "false", 5 });
-                        return LLVMBuildSelect(g->builder, v, t, f, "bstr");
+                    if (rt_ty->kind == TYPE_BOOL && vk == LLVMIntegerTypeKind) {
+                        /* 语义类型是 bool 就渲染成 "true"/"false"：泛型方法
+                           返回值被提升成 i64 时也要认（按宽度判会渲染成 "1"） */
+                        LLVMValueRef bc = emit_bool_cond(g, v,
+                            sc->member.object, locals);
+                        if (bc) return emit_bool_to_cstr(g, bc);
                     }
                     if (vk == LLVMPointerTypeKind) {
                         LLVMTypeRef strlen_ty = LLVMFunctionType(i64,
