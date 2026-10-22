@@ -189,6 +189,15 @@ server-dev-standards；数据建模见 data-modeling；SQL 细则见 server-db-d
   有描述的公开端点曾被类描述隐式默认刷进侧栏，而监控类控制器的非根动作
   上已标注的 `[Custom(IsMenu=true)]` 又被反向吞掉（GenRoute
   改约定后两端同时修复，一致性用例锁定）。
+- **Zan 的父类构造默认不自动调用——基类字段初始化在子类实例上不生效**。
+  子类要显式写 `: base(...)`；不写就等于没跑基类构造。症状很有迷惑性：
+  "直接 new 基类一切正常，new 子类就 null reference"——因为前者跑了基类
+  构造，后者没有。修法二选一：子类显式 `: base(...)`，或基类把那个对象
+  改成**惰性获取**（首次用到时补建，基类访问器统一走它）。坑出处：把
+  ChildWindow 的模型绑定逻辑抽成 `Gui.ModelBinder` 后，`binder = new
+  ModelBinder()` 写在基类构造里，所有 ChildWindow 子类（设置窗、聊天窗、
+  NavWindow）拿到的 binder 全是 null——`SetRoot`/`Wire`/`Handle` 一律
+  null reference；改成基类惰性访问器后全绿。
 - **把专用特性换成通用名值对时，构造默认值不会跟着走——默认值要迁到消费方**。
   `[Custom(...)]` 早期是带构造参数的专用特性（`icon = "mdi:antenna"` 这类默认），
   泛化成 `CustomAttribute(name, value)` 后按 key 存值，"某个 key 的默认值"就

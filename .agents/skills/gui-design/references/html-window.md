@@ -21,7 +21,10 @@
   行为配置在 code-behind 里 `Find(id)` 后补。适合"文档=结构快照、
   行为=代码"的窗口。
 - **运行时**：`App.LoadHtml(...)` 同一解析器动态建树（html 文本可来自
-  文件/网络/字符串）。切页出口里装每页内容时用这条。
+  文件/网络/字符串）。切页出口里装每页内容时用这条。**运行时装载 +
+  `ModelBinder` = 主窗口内的数据驱动页面**：文档负责结构与样式，
+  code-behind 负责数据与事件，`data-bind`/`data-if`/`data-for` 照常
+  生效（不再需要把页面做成独立子窗口）。
 
 **GenHtml 通道的树根坑（实机踩过）**：`Build` 返回的 body 元素 dock=0
 （Manual）——窗口只对 dock=Fill 的根做客户区填充，**code-behind 必须
@@ -108,11 +111,11 @@
 |---|---|---|
 | `data-on-click="名字"` | 事件 → 处理器注册表 | 设计稿只落名字；逻辑在 code-behind |
 | `data-arg="字面量"` | 带参事件（列表行共用处理器区分来源） | 只支持字面量，不求值表达式 |
-| `data-bind="路径"` | 绑 JsonValue 模型字段（ChildWindow 每帧双向同步，见下节选路） | Element 缺省绑 text；真控件缺省 value；**只在挂模型宿主生效**（主窗口 LoadHtmlWith 树上惰性） |
+| `data-bind="路径"` | 绑 JsonValue 模型字段（模型宿主每帧双向同步，见下节选路） | Element 缺省绑 text；真控件缺省 value；**只在挂模型宿主生效**（主窗口内的页面用 `ModelBinder` + `ModelHosts` 挂，见下节） |
 | `data-if="路径"` | 显隐插拔 | **只认路径真值**（null/假/"false" 为隐），不支持 `a==b` 比较表达式 |
 | `<template data-for="路径">` | 数组行克隆 | 嵌套模板不支持；行内 bind/bindIf 以本项为第一作用域、回落根模型 |
 
-坑出处：data-if 的真值语义见 ChildWindow.Truthy——想按 `page=="bag"`
+坑出处：data-if 的真值语义见 `ModelBinder.Truthy`——想按 `page=="bag"`
 切面板的人都在这里撞墙，解法见下节。模板原型子树靠 UA 样式
 `template{display:none}` 隐藏；克隆行撤除走文档序表防幽灵占位。
 
@@ -130,10 +133,20 @@
 
 ## 动态绑定：改模型，还是改树（选路）
 
-绑定通道是 ChildWindow 的每帧同步（`SetRoot(tree, model)` 挂
-JsonValue 状态实体）：帧前模型→UI（`SyncFromModel`，值变才写）、
-帧后 UI→模型（`SyncChangedNode`，快照变了就回写，**没有来源
-过滤**——程序化 `SetProp` 同样落模型）。由此三条选路规则：
+绑定通道是**模型宿主**（`Gui.ModelBinder`）的每帧同步：帧前模型→UI
+（`SyncFromModel`，值变才写）、帧后 UI→模型（`SyncChangedNode`，
+快照变了就回写，**没有来源过滤**——程序化 `SetProp` 同样落模型）。
+宿主有两种挂法：
+
+- **子窗口**：`ChildWindow.SetRoot(tree, model)` + `Wire()`，子窗口
+  自己的渲染循环每帧驱动（`ChildWindow` 内部持有一个 ModelBinder）。
+- **主窗口里的页面**：`new ModelBinder()` → `SetRoot(tree, model)` →
+  `Wire()` → `ModelHosts.Register(app, binder)`；主窗口的 `Form` 帧
+  循环在测量前 `ModelHosts.SyncAll()`、渲染后
+  `ModelHosts.WriteBackAll()`。页面不必自己写帧钩子；换页时
+  `ModelHosts.Unregister(binder)`。
+
+由此三条选路规则：
 
 - **值/显隐/列表内容 → 改模型**：`model.Set("title", ...)` /
   `Set("showBag", ...)` / `Set("items", ...)`，末尾
@@ -146,8 +159,17 @@ JsonValue 状态实体）：帧前模型→UI（`SyncFromModel`，值变才写�
   的控件不在新文档里）；命令式行内 style 只吃视觉键、布局键走
   类规则；没有"改第 N 行"助手——列表局部高频更新留在模型通道
   （data-for 长度变了整组重建）。
-- **主窗口 `LoadHtmlWith` 装的树没有模型**：data-bind/data-if/
-  data-for 全部惰性，动态绑定内容必须放进 ChildWindow 宿主。
+- **模型宿主与窗口无关**：任何一棵控件树（`LoadHtmlWith` 装出的
+  运行期文档、GenForm/GenHtml 生成树、手搭树）挂上 ModelBinder
+  即生效。此前只有 ChildWindow 带这层驱动——主窗口里的页面写了
+  绑定也不生效，于是「一个 .html 文档 + 一个 .zan code-behind」这种
+  页面写法在主窗口内拿不到判断与双向绑定。
+
+**每帧同步与用户输入的分工（坑）**：模型→UI 同步**不覆盖"用户改过、
+还没回写"的控件**——控件现值与上次模型确认值（快照）不同就说明用户
+在编辑，这期间模型不抢控件；帧末回写把用户值落模型后两边又一致。
+少了这条，每帧同步会把用户正在敲的字吞掉（模型→UI 与 UI→模型之间
+隔着整整一帧，输入在下一帧就被模型旧值盖回去）。
 
 代码内实时绑定是另一层：`Binding<T>`（stdlib 规范 §6.1），
 编译期字段直绑；字符串 bindPath 是"对话框 ↔ 状态实体"通道，
@@ -523,7 +545,7 @@ STANDARDS.md §6.7）。
    - **密码输入与扩展属性双向对称性（GetExtra/SetExtra）**：`<input type="password">` 统一通过 `v.SetProp("password", "true")` 声明，且控件层在 `GetExtra` 与 `SetExtra` 中形成完整读写闭环，确保属性获取与状态同步双向对称。
 
 16. **动态模型数组驱动选项绑定与双向值同步规范（`:options` 与 `<option value="...">` JIT/AOT 同构）**：
-   - **JSON 模型数组动态绑定（`:options` / `v-bind:options`）**：在 `ChildWindow.ResolveOperandStr` 中，当绑定表达式求值结果为 JSON 数组（`v.IsArray`）时，自动序列化为标准 JSON 字符串（`v.ToJson`），使高阶选择组件（`SelectBox`、`ChoiceGroup`、`RadioGroup`、`Tabs` 等）能够无缝响应由模型数组驱动的动态选项变更。
+   - **JSON 模型数组动态绑定（`:options` / `v-bind:options`）**：在 `ModelBinder.ResolveOperandStr` 中，当绑定表达式求值结果为 JSON 数组（`v.IsArray`）时，自动序列化为标准 JSON 字符串（`v.ToJson`），使高阶选择组件（`SelectBox`、`ChoiceGroup`、`RadioGroup`、`Tabs` 等）能够无缝响应由模型数组驱动的动态选项变更。
    - **选项反序列化多格式兼容与元数据映射**：组件的 `SetOptionsText` / `SetItemsText` 原生兼容经典竖线分隔字符串（`"A|B|C"`）与结构化 JSON 数组（`"[{\"label\":\"北京\",\"value\":\"bj\"}, ...]"`）。解析 JSON 数组时，标签键优先读取 `label` / `title` / `name` / `text`，值键读取 `value` / `id`，并支持 `disabled` 与 `closable` 元数据映射。
    - **帧渲染缓存幂等防抖（`optionsRaw` / `itemsSpec`）**：在组件内部维护 `optionsRaw` 原始字符串缓存；当每帧数据同步写入的选项文本与当前缓存一致时立即跳过重新解析与重建子项，彻底避免动画帧循环中重复反序列化造成的性能损耗以及弹窗滚动条、焦点和选中态被意外重置的问题。
    - **双向绑定语义值与下标自适应（Two-Way Binding Type Adaptability）**：

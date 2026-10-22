@@ -1,0 +1,76 @@
+using System;
+using System.Collections.Generic;
+using Gui;
+using Gui.Widget;
+
+namespace Gui;
+
+// 主窗口内的模型宿主注册表。
+//
+// 为什么需要：子窗口（ChildWindow）自带渲染循环，每帧把模型推入
+// 控件、再把控件回写模型——绑定声明（data-bind / data-if /
+// <template data-for>）在子窗口里是活的。主窗口（Form）没有这一层：
+// 它的页面分区是同一棵树里的子树，没人替它做每帧同步，于是绑定声明
+// 在主窗口内全部惰性（写得出来、不生效）。
+//
+// 这个注册表就是主窗口的那一层：宿主把页面用的 ModelBinder 注册进来，
+// Form 每帧在测量前同步模型、渲染后回写控件，绑定声明与子窗口里
+// 同样有效。
+//
+// 用法：
+//   Control tree = app.LoadHtmlWith(html, handlers, baseDir);
+//   ModelBinder b = new ModelBinder();
+//   b.SetRoot(tree, model);
+//   b.Wire();
+//   ModelHosts.Register(app, b);
+//   // 页面换掉时
+//   ModelHosts.Unregister(b);
+//
+// 坑出处：模型改了但窗口静止，屏幕不会自己动——改完模型记得让宿主
+// 重绘（app.RequestRedraw()），或者让宿主在每帧都跑（轮询型页面
+// 通常本来就在跑）。
+public class ModelHosts {
+    static List<ModelBinder> hosts;
+
+    // 注册一个模型宿主（同时把宿主 App 交给它：AutoLink 扫描与
+    // .lazy 绑定的获焦判定都要它）。重复注册同一实例是空操作。
+    static void Register(App app, ModelBinder b) {
+        if (b == null) { return; }
+        if (hosts == null) { hosts = new List<ModelBinder>(); }
+        if (hosts.Contains(b)) { return; }
+        if (app != null) { b.SetApp(app); }
+        hosts.Add(b);
+    }
+
+    // 注销（页面被换掉/窗口关闭时）：之后不再参与每帧同步。
+    static void Unregister(ModelBinder b) {
+        if (hosts == null || b == null) { return; }
+        hosts.Remove(b);
+    }
+
+    // 已注册的宿主数（诊断用）。
+    static int Count() {
+        if (hosts == null) { return 0; }
+        return hosts.Count;
+    }
+
+    // 每帧第一步：模型 → 控件（含模板行展开与 data-if 插拔）。
+    static void SyncAll() {
+        if (hosts == null) { return; }
+        for (int i = 0; i < hosts.Count; i = i + 1) {
+            ModelBinder b = hosts[i];
+            if (b != null) { b.SyncFromModel(); }
+        }
+    }
+
+    // 每帧最后一步：控件 → 模型（用户改过的值回写状态实体）。
+    static void WriteBackAll() {
+        if (hosts == null) { return; }
+        for (int i = 0; i < hosts.Count; i = i + 1) {
+            ModelBinder b = hosts[i];
+            if (b == null) { continue; }
+            Control root = b.Root();
+            if (root != null) { b.SyncChangedNode(root); }
+        }
+    }
+}

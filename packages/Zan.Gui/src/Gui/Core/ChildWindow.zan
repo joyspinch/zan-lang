@@ -10,8 +10,10 @@ namespace Gui;
 public class ChildWindow {
     App host;
     Control root;
-    HandlerRegistry handlers;
-    JsonValue model;
+    // 模型宿主：绑定逻辑（模型→UI 同步、UI→模型回写、模板行展开）
+    // 住在 ModelBinder 里，不住在窗口类里——主窗口（Form）里的页面
+    // 分区也要挂模型，那条路没有窗口，只能共用同一个宿主。
+    ModelBinder binder;
     bool open;
     bool destroyed;
     int idBase;
@@ -20,30 +22,16 @@ public class ChildWindow {
     // ChildWindows 的单帧预算按它累计：超预算就把剩下的子窗留给
     // 下一帧，别让子窗把主帧顶死。
     long lastRenderUs = 0;
-    // 绑定快照旁表：SyncFromNode 记录"模型侧确认的控件值"，
-    // SyncChangedNode 据此判断用户是否编辑过。
-    List<ChildBoundSnapshot> boundSnapshots;
-    // `<template data-for>` 原型展开状态列表。
-    List<ChildTemplateMeta> tmplMetas;
-    // 已展开的行根（原型子项克隆）及其归属模板。
-    List<ChildExpandedRow> expandedRows;
-    // 行内绑定作用域（行内声明了 bind/bindIf 的控件 → 本项 JsonValue）。
-    List<ChildScopeBinding> scopeBindings;
 
     // 构造：全部字段置空/默认（idBase 基线 900000）。
     ChildWindow() {
         host = null;
         root = null;
-        handlers = null;
-        model = null;
+        binder = new ModelBinder();
         open = false;
         destroyed = false;
         idBase = 900000;
         renderCb = null;
-        boundSnapshots = null;
-        tmplMetas = null;
-        expandedRows = null;
-        scopeBindings = null;
     }
 
     virtual string Title() { return "Zan"; }
@@ -70,24 +58,29 @@ public class ChildWindow {
         renderCb = a;
     }
 
+    // 模型宿主（惰性建）：Zan 的子类构造不跑父构造，父构造里的字段
+    // 初始化在子类实例上不生效——首次用到时再补，否则 binder 是 null。
+    ModelBinder Binder() {
+        if (binder == null) { binder = new ModelBinder(); }
+        return binder;
+    }
+
+    // 挂树与模型。模型为 null 时绑定声明惰性（纯命令式子窗口照旧）。
     void SetRoot(Control tree, JsonValue m) {
         root = tree;
-        model = m;
-        handlers = new HandlerRegistry();
+        this.Binder().SetRoot(tree, m);
         // 独立泵的窗口不经过 Control.Run（那里登记驱动根），这里补
         // 登记：ZAN_UI_SCRIPT 会话才能 dump tree 这棵保留树。
         UiDriver.SetRoot(tree);
     }
 
     void Handle(string name, Action a) {
-        if (handlers == null) { handlers = new HandlerRegistry(); }
-        handlers.Set(name, a);
+        this.Binder().Handle(name, a);
     }
 
     // passed as the argument (Html.WireArg / WireNode 闭包捕获)。
     void HandleArg(string name, Action<string> a) {
-        if (handlers == null) { handlers = new HandlerRegistry(); }
-        handlers.SetArg(name, a);
+        this.Binder().HandleArg(name, a);
     }
 
     // 注册绑定到 `name` 的带 sender 处理器（平行通道）：Wire() 解析到
@@ -95,738 +88,24 @@ public class ChildWindow {
     // 可以服务整棵树上的多个绑定，处理器按 sender 区分来源。
     // 与 Handle 相互独立；同名两槽都注册时各建一条订阅（多播）。
     void HandleSender(string name, ControlEvent a) {
-        if (handlers == null) { handlers = new HandlerRegistry(); }
-        handlers.SetSender(name, a);
+        this.Binder().HandleSender(name, a);
     }
 
     void Wire() {
-        if (root == null) { return; }
-        WireNode(root);
-        RegisterTemplates(root);
-        SyncFromModel();
+        this.Binder().SetApp(host);
+        this.Binder().Wire();
     }
 
-    // 递归解析控件树上的 `on<Event>` 处理器名并绑定到已注册的 Action。
-    // sender 槽（HandleSender）绑定闭包捕获被接线控件；带 `data-arg`
-    // 声明的控件优先走带参槽（实参闭包捕获 = 值快照）；带参槽未注册
-    // 时回落无参解析。各槽独立成订阅，同名多槽注册时多播。
-    void WireNode(Control c) {
-        for (int i = 0; i < c.events.Count; i = i + 1) {
-            string evt = c.events[i].key;
-            string hname = c.events[i].val;
-            if (hname == "" || handlers == null) { continue; }
-            ControlEvent sa = handlers.GetSender(hname);
-            if (sa != null) {
-                Control sc = c;
-                c.BindEvent(evt, () => { sa(sc); });
-            }
-            if (c.handlerArg != "") {
-                Action<string> aa = handlers.GetArg(hname);
-                if (aa != null) {
-                    string arg = c.handlerArg;
-                    c.BindEvent(evt, () => { aa(arg); });
-                    continue;
-                }
-            }
-            Action a = handlers.Get(hname);
-            if (a != null) {
-                c.BindEvent(evt, a);
-            }
-        }
-        // <a href> 的缺省导航（P5 链接语义）：模板行克隆等二次接线
-        // 的元素在这里补上；已有 Click 监听即宿主接管（AutoLink
-        // 内部幂等）。编译通道生成的树挂在子窗口时也走这条补齐。
-        // 扫描实现在 Gui.Html（未安装 = 空操作），App 编译图不背它。
-        App.AutoLinkTree(c, host);
-        for (int j = 0; j < c.children.Count; j = j + 1) {
-            WireNode(c.children[j]);
-        }
-    }
-
-
-    // 把绑定的状态实体值推入每个声明了 `bind` 路径的控件
-    // （state -> UI）。不通过 SetProp 暴露 “value”/“text” 的控件
-    // 会忽略写入，因此对所有控件类型都安全。
+    // 模型同步转发（绑定实现见 ModelBinder）：窗口每帧在渲染前把
+    // 模型推入控件、渲染后把控件回写模型；这两个入口也供宿主手动
+    // 驱动（离屏渲染、自定义帧循环）。
     void SyncFromModel() {
-        if (model == null || root == null) { return; }
-        this.EnsureExpanded();
-        SyncFromNode(root);
+        this.Binder().SyncFromModel();
     }
 
-    // 递归把模型值推入声明了 bind 路径的控件（值变化才写），
-    // 按 bindIf 声明插拔显示，并记录绑定快照。`template` 原型子树
-    // 不参与同步/回写（它是克隆底版，不是活界面）。
-    void SyncFromNode(Control c) {
-        if (c.Kind() == "template") { return; }
-        if (c.bindIf != "") {
-            c.SetShown(this.EvalExpr(c, c.bindIf));
-        }
-        if (c.bindDisabled != "") {
-            bool dis = this.EvalExpr(c, c.bindDisabled);
-            if (c.Disabled.Get() != dis) { c.Disabled = dis; }
-        }
-        if (c.bindClass != "") {
-            string dyn = this.EvalClassExpr(c, c.bindClass).Trim();
-            string full = dyn;
-            if (c.baseClass != "") {
-                if (dyn != "") { full = c.baseClass + " " + dyn; }
-                else { full = c.baseClass; }
-            }
-            if (c.Class != full) {
-                c.Class = full;
-                c.computedStyle = null;
-            }
-        }
-        if (c.bindProps != null) {
-            for (int pi = 0; pi < c.bindProps.Count; pi = pi + 1) {
-                BindPropEntry bp = c.bindProps[pi];
-                string pv = this.EvalAttrExpr(c, bp.expr);
-                if (c.GetProp(bp.prop) != pv) {
-                    c.SetProp(bp.prop, pv);
-                }
-            }
-        }
-        if (c.bindTpl != "") {
-            string interpolated = this.EvalInterpolation(c, c.bindTpl);
-            string curText = c.GetProp("text");
-            if (curText == "") { curText = c.GetProp("value"); }
-            if (interpolated != curText) {
-                c.SetProp("text", interpolated);
-                c.computedStyle = null;
-            }
-        }
-        if (c.bindPath != "") {
-            JsonValue v = this.ValueFor(c, c.bindPath);
-            if (v != null) {
-                string s = v.AsString("");
-                // 只在值真的变了才写：文本框收到一次写入就把光标收到末尾
-                // （SetText 的语义），而这段每帧都跑——无条件写下去的话，
-                // 方向键刚把光标挪开，下一帧就被同一个值弹回行尾。
-                // Element 的缺省绑定属性是 text（SetText 通道），不是
-                // value——后者对元素是"非空值当样式类"的基类兜底。
-                string prop = c.bindProp;
-                if (prop == "") {
-                    prop = "value";
-                    if (c is Element) { prop = "text"; }
-                }
-                if (c.GetProp(prop) != s) { c.SetProp(prop, s); }
-            }
-            RecordSnapshot(c, BoundValue(c));
-        }
-        for (int j = 0; j < c.children.Count; j = j + 1) {
-            SyncFromNode(c.children[j]);
-        }
-    }
-
-    // 把每个绑定控件的当前值读回状态实体（UI -> state）。
     void SyncChangedNode(Control c) {
-        if (c.Kind() == "template") { return; }
-        if (c.bindPath != "") {
-            if (c.bindLazy && host != null && c.HasFocus(host)) {
-                // .lazy 修饰符：获焦输入期间暂不回写模型，等失去焦点或失活时才写回
-            } else {
-                string s = BoundValue(c);
-                if (s != SnapshotOf(c)) { WriteBoundValue(c, s); }
-            }
-        }
-        for (int i = 0; i < c.children.Count; i = i + 1) {
-            SyncChangedNode(c.children[i]);
-        }
+        this.Binder().SyncChangedNode(c);
     }
-
-    // 绑定路径取值：控件在模板行作用域里（scopeKeys 有登记）先查
-    // 本项 JsonValue，未命中回落根模型——行内相对路径（"name"）与
-    // 绝对路径（"vm.title"）因此可以在同一行混用。
-    JsonValue ValueFor(Control c, string path) {
-        JsonValue item = this.ScopeOf(c);
-        if (item != null) {
-            JsonValue v = item.PathGet(path);
-            if (v != null) { return v; }
-        }
-        return model.PathGet(path);
-    }
-
-    // 记录（或更新）控件绑定属性的模型侧确认值——上次由模型
-    // 写入/确认时 `BoundValue` 的读数，作为"用户是否编辑过"的基准。
-    void RecordSnapshot(Control c, string v) {
-        if (boundSnapshots == null) {
-            boundSnapshots = new List<ChildBoundSnapshot>();
-        }
-        for (int i = 0; i < boundSnapshots.Count; i = i + 1) {
-            if (boundSnapshots[i].control == c) {
-                boundSnapshots[i].snapshot = v;
-                return;
-            }
-        }
-        boundSnapshots.Add(new ChildBoundSnapshot(c, v));
-    }
-
-    // 控件的上一次模型侧确认值；从未记录（新绑定控件首次回写
-    // 前的防御路径）按被拆字段的原初始值语义返回 ""。
-    string SnapshotOf(Control c) {
-        if (boundSnapshots == null) { return ""; }
-        for (int i = 0; i < boundSnapshots.Count; i = i + 1) {
-            if (boundSnapshots[i].control == c) {
-                return boundSnapshots[i].snapshot;
-            }
-        }
-        return "";
-    }
-
-    // 控件绑定属性的当前值：显式 bindProp 优先，否则取 value、
-    // 再取 text。
-    string BoundValue(Control c) {
-        if (c.bindProp != "") { return c.GetProp(c.bindProp); }
-        string k = c.Kind();
-        if (k == "SelectBox") {
-            JsonValue scope = this.ScopeOf(c);
-            if (scope != null) {
-                JsonValue cur = scope.PathGet(c.bindPath);
-                if (cur != null && cur.IsNumber()) {
-                    return c.GetProp("value");
-                }
-            }
-            string sv = c.GetProp("selectedValue");
-            if (sv != "") { return sv; }
-            string txt = c.GetProp("text");
-            if (txt != "") { return txt; }
-        }
-        string s = c.GetProp("value");
-        if (s == "") { s = c.GetProp("text"); }
-        return s;
-    }
-
-    // 把字符串值写回模型节点：按现有节点的类型转换为
-    // bool / 数值 / 字符串，保持模型原有的形状。行作用域控件写到
-    // 本项 JsonValue（数组元素的引用，就地生效）。
-    void WriteBoundValue(Control c, string s) {
-        if (c.bindTrim) {
-            s = s.Trim();
-        }
-        string k = c.Kind();
-        bool isBoolCtrl = (k == "Checkbox" || k == "Switch");
-        bool isNumCtrl = (k == "Slider" || k == "InputNumber" || k == "Progress" || k == "Rate" || c.bindNumber);
-
-        JsonValue scope = this.ScopeOf(c);
-        if (scope != null) {
-            JsonValue cur = scope.PathGet(c.bindPath);
-            if (isNumCtrl || (cur != null && cur.IsNumber())) {
-                string ns = s.Trim();
-                if (ns == "") { ns = "0"; }
-                scope.PathSetValue(c.bindPath, JsonValue.NewNum(ns));
-            } else if (isBoolCtrl || (cur != null && cur.IsBool())) {
-                scope.PathSetValue(c.bindPath, JsonValue.NewBool(s == "true"));
-            } else {
-                scope.PathSet(c.bindPath, s);
-            }
-            RecordSnapshot(c, s);
-            return;
-        }
-        JsonValue cur0 = model.PathGet(c.bindPath);
-        if (isNumCtrl || (cur0 != null && cur0.IsNumber())) {
-            string ns0 = s.Trim();
-            if (ns0 == "") { ns0 = "0"; }
-            model.PathSetValue(c.bindPath, JsonValue.NewNum(ns0));
-        } else if (isBoolCtrl || (cur0 != null && cur0.IsBool())) {
-            model.PathSetValue(c.bindPath, JsonValue.NewBool(s == "true"));
-        } else {
-            model.PathSet(c.bindPath, s);
-        }
-        RecordSnapshot(c, s);
-    }
-
-    // ---- <template data-for> 行展开 ---------------------------------------
-    // 原型被 UA 样式表 display:none；挂模型的窗口每帧（SyncFromModel
-    // 开头）核对源数组长度，变了才整组重建：逐原型子项 Html.Clone 成
-    // 行，普通 InsertAt 插在模板紧后（不走 Element.AddKid——克隆行
-    // 不进原型父的文档序表，撤除也不留幽灵占位）。行内 bind/bindIf
-    // 以本项 JsonValue 为第一作用域。
-
-    // Wire 期登记静态树上的模板原型（v1 不支持嵌套模板：原型子树
-    // 不再下扫）。未挂模型时登记了也惰性——展开只发生在
-    // SyncFromModel。
-    void RegisterTemplates(Control c) {
-        if (c.Kind() == "template") {
-            if (tmplMetas == null) {
-                tmplMetas = new List<ChildTemplateMeta>();
-            }
-            bool known = false;
-            for (int i = 0; i < tmplMetas.Count; i = i + 1) {
-                if (tmplMetas[i].template == c) { known = true; break; }
-            }
-            if (!known) {
-                tmplMetas.Add(new ChildTemplateMeta(c, 0 - 1));  // 强制首帧展开
-            }
-            return;
-        }
-        for (int j = 0; j < c.children.Count; j = j + 1) {
-            RegisterTemplates(c.children[j]);
-        }
-    }
-
-    // 每帧核对各模板的源数组；若声明了 data-key 则走增量 Diffing 复用，
-    // 未声明则按长度变动重建。
-    void EnsureExpanded() {
-        if (tmplMetas == null) { return; }
-        for (int i = 0; i < tmplMetas.Count; i = i + 1) {
-            Control t = tmplMetas[i].template;
-            string path = t.CssAttr("data-for");
-            if (path == "" || t.children.Count == 0) { continue; }
-            JsonValue arr = model.PathGet(path);
-            int n = (arr != null && arr.IsArray()) ? arr.Count() : 0;
-            string keyAttr = t.CssAttr("data-key");
-
-            if (keyAttr != "") {
-                this.EnsureExpandedKeyed(t, arr, n, keyAttr, tmplMetas[i]);
-            } else {
-                if (tmplMetas[i].lastCount == n) { continue; }
-                this.RemoveRows(t);
-                tmplMetas[i].lastCount = n;
-                if (n == 0) { continue; }
-                Control p = t.parent;
-                if (p == null) { continue; }
-                int cur = p.IndexOf(t) + 1;
-                for (int k = 0; k < n; k = k + 1) {
-                    JsonValue item = arr.At(k);
-                    for (int j = 0; j < t.children.Count; j = j + 1) {
-                        Control row = App.CloneTree(t.children[j]);
-                        if (row == null) { continue; }
-                        p.InsertAt(cur, row);
-                        cur = cur + 1;
-                        WireNode(row);
-                        this.ScopeRow(row, item);
-                        if (expandedRows == null) {
-                            expandedRows = new List<ChildExpandedRow>();
-                        }
-                        expandedRows.Add(new ChildExpandedRow(row, t));
-                    }
-                }
-            }
-        }
-    }
-
-    // 基于 data-key 的增量 Diffing：复用已有节点，按需增删与刷新作用域
-    void EnsureExpandedKeyed(Control t, JsonValue arr, int n, string keyAttr, ChildTemplateMeta meta) {
-        Control p = t.parent;
-        if (p == null) { return; }
-        meta.lastCount = n;
-
-        // 收集当前模板下已有的展开行
-        List<ChildExpandedRow> oldRows = new List<ChildExpandedRow>();
-        if (expandedRows != null) {
-            for (int i = 0; i < expandedRows.Count; i = i + 1) {
-                if (expandedRows[i].template == t) {
-                    oldRows.Add(expandedRows[i]);
-                }
-            }
-        }
-
-        // 收集新列表中所有的 key
-        List<string> newKeys = new List<string>();
-        for (int k = 0; k < n; k = k + 1) {
-            JsonValue item = arr.At(k);
-            string keyVal = "";
-            if (item != null) {
-                JsonValue kv = item.PathGet(keyAttr);
-                if (kv != null) { keyVal = kv.AsString(""); }
-            }
-            if (keyVal == "") { keyVal = k.ToString(); }
-            newKeys.Add(keyVal);
-        }
-
-        // 1. 删除在 newKeys 中不存在的旧行
-        for (int i = oldRows.Count - 1; i >= 0; i = i - 1) {
-            string oldKey = oldRows[i].key;
-            bool existsInNew = false;
-            for (int k = 0; k < newKeys.Count; k = k + 1) {
-                if (newKeys[k] == oldKey) {
-                    existsInNew = true;
-                    break;
-                }
-            }
-            if (!existsInNew) {
-                Control row = oldRows[i].rowRoot;
-                this.DetachRow(row);
-                this.ScopeDropRow(row);
-                this.RemoveExpandedRowEntry(oldRows[i]);
-                oldRows.RemoveAt(i);
-            }
-        }
-
-        // 2. 按顺序对齐或插入新行，并刷新数据作用域
-        int insertPos = p.IndexOf(t) + 1;
-        for (int k = 0; k < n; k = k + 1) {
-            JsonValue item = arr.At(k);
-            string keyVal = newKeys[k];
-
-            // 查找是否已有该 key 的行
-            ChildExpandedRow matched = null;
-            for (int r = 0; r < oldRows.Count; r = r + 1) {
-                if (oldRows[r].key == keyVal) {
-                    matched = oldRows[r];
-                    break;
-                }
-            }
-
-            if (matched != null) {
-                // 复用节点：更新作用域
-                this.ScopeRow(matched.rowRoot, item);
-                insertPos = insertPos + 1;
-            } else {
-                // 新建节点克隆插入
-                for (int j = 0; j < t.children.Count; j = j + 1) {
-                    Control row = App.CloneTree(t.children[j]);
-                    if (row == null) { continue; }
-                    p.InsertAt(insertPos, row);
-                    insertPos = insertPos + 1;
-                    WireNode(row);
-                    this.ScopeRow(row, item);
-                    ChildExpandedRow entry = new ChildExpandedRow(row, t, keyVal);
-                    if (expandedRows == null) {
-                        expandedRows = new List<ChildExpandedRow>();
-                    }
-                    expandedRows.Add(entry);
-                    oldRows.Add(entry);
-                }
-            }
-        }
-    }
-
-    void RemoveExpandedRowEntry(ChildExpandedRow entry) {
-        if (expandedRows == null) { return; }
-        for (int i = 0; i < expandedRows.Count; i = i + 1) {
-            if (expandedRows[i] == entry) {
-                expandedRows.RemoveAt(i);
-                return;
-            }
-        }
-    }
-
-    // 撤除模板 `t` 的全部行（数组重建前调）：从各自的父节点摘下
-    // 并清掉行内控件的作用域登记。
-    void RemoveRows(Control t) {
-        if (expandedRows == null) { return; }
-        for (int i = expandedRows.Count - 1; i >= 0; i = i - 1) {
-            if (expandedRows[i].template != t) { continue; }
-            Control row = expandedRows[i].rowRoot;
-            this.DetachRow(row);
-            this.ScopeDropRow(row);
-            expandedRows.RemoveAt(i);
-        }
-    }
-
-    // 行根脱父：Element 父走 DropKid（文档序表一并清，不留幽灵
-    // 占位），控件父走普通 Remove。
-    void DetachRow(Control row) {
-        Control p = row.parent;
-        if (p == null) { return; }
-        if (p is Element) {
-            ((Element)p).DropKid(row);
-        } else {
-            p.Remove(row);
-        }
-    }
-
-    // 登记行子树里所有声明了 bind/bindIf 的控件的作用域（本项
-    // JsonValue）。只登记声明了绑定的控件——表按引用线性查，登记
-    // 面越小每帧越便宜。
-    void ScopeRow(Control c, JsonValue item) {
-        if (c.bindPath != "" || c.bindIf != "" || c.bindClass != "" || c.bindDisabled != "" || c.bindTpl != "" || (c.bindProps != null && c.bindProps.Count > 0)) { this.ScopePut(c, item); }
-        for (int j = 0; j < c.children.Count; j = j + 1) {
-            this.ScopeRow(c.children[j], item);
-        }
-    }
-
-    void ScopePut(Control c, JsonValue item) {
-        if (scopeBindings == null) {
-            scopeBindings = new List<ChildScopeBinding>();
-        }
-        for (int i = 0; i < scopeBindings.Count; i = i + 1) {
-            if (scopeBindings[i].control == c) {
-                scopeBindings[i].item = item;
-                return;
-            }
-        }
-        scopeBindings.Add(new ChildScopeBinding(c, item));
-    }
-
-    // 控件的行作用域；不在任何行里返回 null。
-    JsonValue ScopeOf(Control c) {
-        if (scopeBindings == null) { return null; }
-        for (int i = 0; i < scopeBindings.Count; i = i + 1) {
-            if (scopeBindings[i].control == c) {
-                return scopeBindings[i].item;
-            }
-        }
-        return null;
-    }
-
-    // 撤行时清作用域登记：行子树里声明了绑定的控件逐个摘除（就地
-    // 压缩，尾部截断）。残留条目永不命中（键是引用），但数组频繁
-    // 重建的窗口靠这一步封住增长。
-    void ScopeDropRow(Control c) {
-        if (c.bindPath != "" || c.bindIf != "" || c.bindClass != "" || c.bindDisabled != "" || c.bindTpl != "" || (c.bindProps != null && c.bindProps.Count > 0)) { this.ScopeDropOne(c); }
-        for (int j = 0; j < c.children.Count; j = j + 1) {
-            this.ScopeDropRow(c.children[j]);
-        }
-    }
-
-    void ScopeDropOne(Control c) {
-        if (scopeBindings == null) { return; }
-        int keep = 0;
-        for (int i = 0; i < scopeBindings.Count; i = i + 1) {
-            if (scopeBindings[i].control == c) { continue; }
-            scopeBindings[keep] = scopeBindings[i];
-            keep = keep + 1;
-        }
-        if (keep == scopeBindings.Count) { return; }
-        while (scopeBindings.Count > keep) {
-            scopeBindings.RemoveAt(scopeBindings.Count - 1);
-        }
-    }
-
-    // data-if 路径取值的真值裁决：null 假；布尔原样；数字非 0；
-    // 字符串非空且不为 "false"。比 AsBool 的严格 "true" 宽——HTML
-    // 侧路径值多是字符串状态名（"on"/"done"）。
-    static bool Truthy(JsonValue v) {
-        if (v == null) { return false; }
-        if (v.IsBool()) { return v.AsBool(false); }
-        if (v.IsNumber()) { return v.AsInt(0) != 0; }
-        string s = v.AsString("");
-        return s != "" && s != "false";
-    }
-
-    // 行内条件表达式求值（支持 ==, !=, >, <, >=, <=, &&, ||, ! 及路径属性/字面量）
-    bool EvalExpr(Control c, string expr) {
-        if (expr == "") { return false; }
-        string s = expr.Trim();
-        if (s == "") { return false; }
-
-        // 顶层 || 拆分
-        int orIdx = s.IndexOf("||");
-        if (orIdx >= 0) {
-            string left = s.Substring(0, orIdx);
-            string right = s.Substring(orIdx + 2);
-            return this.EvalExpr(c, left) || this.EvalExpr(c, right);
-        }
-
-        // 顶层 && 拆分
-        int andIdx = s.IndexOf("&&");
-        if (andIdx >= 0) {
-            string left = s.Substring(0, andIdx);
-            string right = s.Substring(andIdx + 2);
-            return this.EvalExpr(c, left) && this.EvalExpr(c, right);
-        }
-
-        // 逻辑非 ! 前缀
-        if (s.StartsWith("!")) {
-            return !this.EvalExpr(c, s.Substring(1));
-        }
-
-        // 比较运算符查找
-        string op = "";
-        int opIdx = -1;
-        int opLen = 0;
-
-        int idx = s.IndexOf("==");
-        if (idx >= 0) { op = "=="; opIdx = idx; opLen = 2; }
-        else {
-            idx = s.IndexOf("!=");
-            if (idx >= 0) { op = "!="; opIdx = idx; opLen = 2; }
-            else {
-                idx = s.IndexOf(">=");
-                if (idx >= 0) { op = ">="; opIdx = idx; opLen = 2; }
-                else {
-                    idx = s.IndexOf("<=");
-                    if (idx >= 0) { op = "<="; opIdx = idx; opLen = 2; }
-                    else {
-                        idx = s.IndexOf(">");
-                        if (idx >= 0) { op = ">"; opIdx = idx; opLen = 1; }
-                        else {
-                            idx = s.IndexOf("<");
-                            if (idx >= 0) { op = "<"; opIdx = idx; opLen = 1; }
-                        }
-                    }
-                }
-            }
-        }
-
-        if (op != "") {
-            string leftStr = s.Substring(0, opIdx).Trim();
-            string rightStr = s.Substring(opIdx + opLen).Trim();
-            return this.EvalCompare(c, leftStr, op, rightStr);
-        }
-
-        // 单操作数真值判定（原生路径）
-        return ChildWindow.Truthy(this.ValueFor(c, s));
-    }
-
-    bool EvalCompare(Control c, string leftStr, string op, string rightStr) {
-        // 先按数值解析比较
-        bool isLeftNum = false;
-        bool isRightNum = false;
-        double leftNum = this.ParseOperandNum(c, leftStr, out isLeftNum);
-        double rightNum = this.ParseOperandNum(c, rightStr, out isRightNum);
-
-        if (isLeftNum && isRightNum) {
-            switch (op) {
-                case "==": return leftNum == rightNum;
-                case "!=": return leftNum != rightNum;
-                case ">":  return leftNum > rightNum;
-                case "<":  return leftNum < rightNum;
-                case ">=": return leftNum >= rightNum;
-                case "<=": return leftNum <= rightNum;
-                default:   return false;
-            }
-        }
-
-        // 字符串比较
-        string leftVal = this.ResolveOperandStr(c, leftStr);
-        string rightVal = this.ResolveOperandStr(c, rightStr);
-        switch (op) {
-            case "==": return leftVal == rightVal;
-            case "!=": return leftVal != rightVal;
-            case ">":  return leftVal > rightVal;
-            case "<":  return leftVal < rightVal;
-            case ">=": return leftVal >= rightVal;
-            case "<=": return leftVal <= rightVal;
-            default:   return false;
-        }
-    }
-
-    double ParseOperandNum(Control c, string operand, out bool isNum) {
-        isNum = false;
-        if (operand == "") { return 0.0; }
-        if (operand.StartsWith("'") || operand.StartsWith("\"")) {
-            return 0.0;
-        }
-        if (operand == "true" || operand == "false") {
-            return 0.0;
-        }
-        // 尝试解析纯数字字面量
-        if (IsNumericLiteral(operand)) {
-            isNum = true;
-            return operand.ToDouble();
-        }
-        // 尝试解析为模型/作用域路径取值
-        JsonValue v = this.ValueFor(c, operand);
-        if (v != null && v.IsNumber()) {
-            isNum = true;
-            return v.AsDouble(0.0);
-        }
-        return 0.0;
-    }
-
-    static bool IsNumericLiteral(string s) {
-        if (s == "") { return false; }
-        int start = 0;
-        if (s.StartsWith("-") || s.StartsWith("+")) {
-            start = 1;
-            if (s.Length <= 1) { return false; }
-        }
-        bool hasDot = false;
-        for (int i = start; i < s.Length; i = i + 1) {
-            int ch = (int)s[i];
-            if (ch == 46) { // '.'
-                if (hasDot) { return false; }
-                hasDot = true;
-            } else if (ch < 48 || ch > 57) { // '0' ~ '9'
-                return false;
-            }
-        }
-        return true;
-    }
-
-    string ResolveOperandStr(Control c, string operand) {
-        if (operand == "") { return ""; }
-        // 引号包裹字面量
-        if ((operand.StartsWith("'") && operand.EndsWith("'")) ||
-            (operand.StartsWith("\"") && operand.EndsWith("\""))) {
-            if (operand.Length >= 2) {
-                return operand.Substring(1, operand.Length - 2);
-            }
-            return "";
-        }
-        if (operand == "true") { return "true"; }
-        if (operand == "false") { return "false"; }
-        if (operand == "null") { return ""; }
-        // 模型/作用域中取值
-        JsonValue v = this.ValueFor(c, operand);
-        if (v == null) { return ""; }
-        if (v.IsArray()) { return v.ToJson(); }
-        return v.AsString("");
-    }
-
-    // 动态属性表达式求值（支持三元表达式 cond ? 'a' : 'b' 与模型/作用域路径）
-    string EvalAttrExpr(Control c, string expr) {
-        if (expr == "") { return ""; }
-        string s = expr.Trim();
-        if (s == "") { return ""; }
-        int qIdx = 0 - 1;
-        int colonIdx = 0 - 1;
-        bool inQuote = false;
-        int quoteChar = 0;
-        for (int i = 0; i < s.Length; i = i + 1) {
-            int ch = (int)s[i];
-            if (ch == 39 || ch == 34) { // '\'' or '"'
-                if (!inQuote) {
-                    inQuote = true;
-                    quoteChar = ch;
-                } else if (quoteChar == ch) {
-                    inQuote = false;
-                }
-            } else if (!inQuote) {
-                if (ch == 63 && qIdx < 0) { // '?'
-                    qIdx = i;
-                } else if (ch == 58 && qIdx >= 0 && colonIdx < 0) { // ':'
-                    colonIdx = i;
-                    break;
-                }
-            }
-        }
-        if (qIdx >= 0 && colonIdx > qIdx) {
-            string cond = s.Substring(0, qIdx).Trim();
-            string trueBranch = s.Substring(qIdx + 1, colonIdx - (qIdx + 1)).Trim();
-            string falseBranch = s.Substring(colonIdx + 1).Trim();
-            bool condVal = this.EvalExpr(c, cond);
-            string chosen = condVal ? trueBranch : falseBranch;
-            return this.ResolveOperandStr(c, chosen);
-        }
-        return this.ResolveOperandStr(c, s);
-    }
-
-    // 动态样式类表达式求值（复用 EvalAttrExpr）
-    string EvalClassExpr(Control c, string expr) {
-        return this.EvalAttrExpr(c, expr);
-    }
-
-    // 动态文本胡子插值表达式求值（{{ expr }} 替换）
-    string EvalInterpolation(Control c, string tpl) {
-        if (tpl == "" || tpl.IndexOf("{{") < 0) { return tpl; }
-        StringBuilder sb = new StringBuilder();
-        int cur = 0;
-        while (cur < tpl.Length) {
-            int open = tpl.IndexOf("{{", cur);
-            if (open < 0) {
-                sb.Append(tpl.Substring(cur));
-                break;
-            }
-            if (open > cur) {
-                sb.Append(tpl.Substring(cur, open - cur));
-            }
-            int close = tpl.IndexOf("}}", open + 2);
-            if (close < 0) {
-                sb.Append(tpl.Substring(open));
-                break;
-            }
-            string expr = tpl.Substring(open + 2, close - (open + 2)).Trim();
-            string val = this.EvalAttrExpr(c, expr);
-            sb.Append(val);
-            cur = close + 2;
-        }
-        return sb.ToString();
-    }
-
     virtual bool Pending() { return false; }
 
     virtual void AfterFrame() { }

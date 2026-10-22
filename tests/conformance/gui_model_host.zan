@@ -1,0 +1,151 @@
+// 主窗口内的模型宿主（Gui.ModelBinder + Gui.ModelHosts）。
+//
+// 背景：绑定原语（data-bind / data-if / <template data-for>）在编译期
+// 只落成 Control 上的声明字段，真正把它们兑现的是「宿主每帧把模型
+// 推入控件、再把控件回写模型」。此前只有 ChildWindow（子窗口）带这层
+// 驱动——主窗口（Form）里的页面分区挂不上模型，声明面写得出来、
+// 运行期不生效。
+//
+// 本用例断言两件事：
+//   1) 模型宿主与窗口解耦：binder 单独就能兑现全部绑定声明；
+//   2) 主窗口的每帧泵接线：注册进 ModelHosts 后，Form 出一帧即完成
+//      「模型→控件」与「控件→模型」，页面不需要自己写帧钩子。
+using System;
+using System.Json;
+using Gui;
+using Gui.Widget;
+
+class ModelHostProbe {
+    static int fails;
+
+    static void Eq(string what, string got, string want) {
+        if (got == want) { return; }
+        fails = fails + 1;
+        Console.WriteLine("FAIL " + what + ": got '" + got + "' want '" + want + "'");
+    }
+
+    static string Str(JsonValue o, string key) {
+        if (o == null) { return "?"; }
+        JsonValue v = o.Get(key);
+        if (v == null) { return "?"; }
+        return v.AsString("");
+    }
+
+    // 取控件：找不到记一条失败并回一个空壳，让后续断言自然失败而不是
+    // 空指针（编译器的空安全硬检查也不允许直接解引用 Find 的结果）。
+    static Control Pick(Control root, string id) {
+        Control c = root.Find(id);
+        if (c == null) {
+            fails = fails + 1;
+            Console.WriteLine("FAIL find '" + id + "'");
+            return new Panel();
+        }
+        return c;
+    }
+
+    static void Main() {
+        fails = 0;
+        // 模板行展开经 App 克隆槽（Gui.Html.Install 注册）；行内控件
+        // 克隆走 ControlFactory kind 重建（ControlBootstrap.Install）。
+        Html.Install();
+        ControlBootstrap.Install();
+
+        // ---- 1) 宿主与窗口解耦 ----------------------------------------
+        HtmlDoc doc = Html.Parse(
+            "<div id=\"page\">"
+            + "<template data-for=\"items\">"
+            + "<li><span data-bind=\"name\"></span></li>"
+            + "</template>"
+            + "<input id=\"q\" data-bind=\"keyword\" data-if=\"showSearch\" />"
+            + "<p id=\"cnt\" data-bind=\"count\"></p>"
+            + "<button id=\"ok\" data-on-click=\"save\" data-arg=\"apple\">Save</button>"
+            + "</div>", "", null);
+        Control page = doc.root.children[0];
+        JsonValue model = JsonValue.Parse(
+            "{\"showSearch\":true,\"keyword\":\"wx\",\"count\":3,"
+            + "\"items\":[{\"name\":\"a\"},{\"name\":\"b\"}]}");
+
+        ModelBinder b = new ModelBinder();
+        b.SetRoot(page, model);
+        b.Wire();
+
+        // data-for：原型 + 2 个克隆行。
+        Eq("page kids", Convert.ToString(page.ChildCount()), "6");
+        Control tpl = page.children[0];
+        Eq("tpl kind", tpl.Kind(), "template");
+        Eq("tpl for", tpl.CssAttr("data-for"), "items");
+        Control row0 = page.children[1];
+        Control row1 = page.children[2];
+        Eq("row0 kind", row0.Kind(), "li");
+        Eq("row0 name", row0.children[0].GetProp("text"), "a");
+        Eq("row1 name", row1.children[0].GetProp("text"), "b");
+
+        // data-bind：Input 缺省绑 value，Element 缺省绑 text。
+        Control q = Pick(page, "q");
+        Eq("input value", q.GetProp("value"), "wx");
+        Control cnt = Pick(page, "cnt");
+        Eq("elem text", cnt.GetProp("text"), "3");
+
+        // data-if：路径真值 → 插拔。
+        Eq("input visible", Convert.ToString(q.visible), "true");
+
+        // 事件接线：运行时装载的页面在宿主里按名字派发。
+        string got = "";
+        b.HandleArg("save", (string s) => { got = s; });
+        b.Wire();
+        Control ok = Pick(page, "ok");
+        ((Button)ok).Click.Raise();
+        Eq("host wired arg", got, "apple");
+
+        // 插拔：模型翻转 → 再同步。
+        model.PathSet("showSearch", "false");
+        b.SyncFromModel();
+        Eq("input hidden", Convert.ToString(q.visible), "false");
+
+        // 回写：控件改值 → 模型。
+        q.SetProp("value", "typed");
+        b.SyncChangedNode(page);
+        Eq("model keyword", Str(model, "keyword"), "typed");
+
+        // ---- 2) 主窗口的每帧泵接线 ------------------------------------
+        HtmlDoc doc2 = Html.Parse(
+            "<div id=\"page2\">"
+            + "<input id=\"q2\" data-bind=\"keyword\" />"
+            + "<span id=\"c2\" data-bind=\"count\"></span>"
+            + "</div>", "", null);
+        Control page2 = doc2.root.children[0];
+        JsonValue model2 = JsonValue.Parse("{\"keyword\":\"init\",\"count\":1}");
+
+        ModelBinder b2 = new ModelBinder();
+        b2.SetRoot(page2, model2);
+        b2.Wire();
+
+        Form form = Form.CreateOffscreen("probe", 420, 260);
+        form.Add(page2);
+        ModelHosts.Register(form.GetApp(), b2);
+
+        Control q2 = Pick(page2, "q2");
+        Eq("before frame", q2.GetProp("value"), "init");
+
+        // 改模型，不碰控件：出一帧后控件值应跟上（帧泵生效）。
+        model2.PathSet("keyword", "pumped");
+        form.CaptureSnapshot();
+        Eq("frame pump value", q2.GetProp("value"), "pumped");
+        Control c2 = Pick(page2, "c2");
+        Eq("frame pump text", c2.GetProp("text"), "1");
+
+        // 改控件，不碰模型：出一帧后模型应跟上（回写生效）。
+        q2.SetProp("value", "back");
+        form.CaptureSnapshot();
+        Eq("frame writeback", Str(model2, "keyword"), "back");
+
+        ModelHosts.Unregister(b2);
+
+        // 注销后不再被泵：改模型 + 出帧，控件值保持旧值。
+        model2.PathSet("keyword", "ignored");
+        form.CaptureSnapshot();
+        Eq("after unregister", q2.GetProp("value"), "back");
+
+        if (fails == 0) { Console.WriteLine("GUI_MODEL_HOST_OK"); }
+    }
+}
