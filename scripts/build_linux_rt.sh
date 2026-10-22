@@ -38,10 +38,27 @@ for pair in linux-musl:x86_64 linux-arm64:aarch64 linux-riscv64:riscv64; do
     # that touches System.IO.File.
     "$ZIG" cc -target "$arch-linux-musl" -g0 -std=c11 -fPIC \
         -I "$RT" -O2 -c "$RT/rt_file.c" -o "$out/zanrt_file.o"
+    # 128-bit Decimal runtime: anything that reaches System.Numerics (and
+    # therefore NativeMemory) references it, so the cross link injects it for
+    # those programs -- without it the link dies on a missing object.
+    "$ZIG" cc -target "$arch-linux-musl" -g0 -std=c11 -fPIC \
+        -I "$RT" -O2 -c "$RT/rt_decimal.c" -o "$out/zanrt_decimal.o"
     # Every emitted program calls zan_timer_* from its inline coroutine driver,
     # so a cross-link needs this object unconditionally (see main.c).
     "$ZIG" cc -target "$arch-linux-musl" -g0 -std=c11 -fPIC \
         -I "$RT" -O2 -c "$RT/rt_timer.c" -o "$out/zanrt_timer.o"
+    # Hardware-accelerated crypto, shipped as an ARCHIVE member and not as a
+    # bare object: a bare .o on the link line is loaded whole, so every
+    # program carried the entire SHA/AES/SM3/SM4 block even when it used none
+    # of it. As an archive member the linker pulls it only when the program
+    # really references a zan_hw_* symbol.
+    # Rebuild this together with zanrt_timer.o: both derive from the same
+    # rt_hw_accel.c, and mixing generations would define the same symbol
+    # twice (TASKS.md A493).
+    "$ZIG" cc -target "$arch-linux-musl" -g0 -std=c11 -fPIC \
+        -I "$RT" -O2 -c "$RT/rt_hw_accel.c" -o "$out/zan_crypto.o"
+    rm -f "$out/libzancrypto.a"
+    "$ZIG" ar rcs "$out/libzancrypto.a" "$out/zan_crypto.o"
     # Embedded-resource API + compressed-resource decoder: GUI programs pull
     # skins/icons through the auto-embed path, so the cross link injects these
     # two objects (same flags as the ZAN_INFLATE_OBJ recipe in CMakeLists.txt).
@@ -52,5 +69,5 @@ for pair in linux-musl:x86_64 linux-arm64:aarch64 linux-riscv64:riscv64; do
         -DMINIZ_NO_TIME -DMINIZ_NO_ARCHIVE_WRITERS \
         -I "$ROOT/src/common" \
         -c "$RT/zan_inflate.c" -o "$out/zan_inflate.o"
-    echo "built toolchain/$sub: zanrt_io.o zanrt_io_mt.o zanrt_sync.o zanrt_file.o zanrt_timer.o zan_embed_api.o zan_inflate.o"
+    echo "built toolchain/$sub: zanrt_io.o zanrt_io_mt.o zanrt_sync.o zanrt_file.o zanrt_decimal.o zanrt_timer.o libzancrypto.a zan_embed_api.o zan_inflate.o"
 done

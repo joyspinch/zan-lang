@@ -31,6 +31,17 @@ mkdir -p "$OUT"
 # Every emitted program calls zan_timer_* from its inline coroutine driver, so a
 # cross-link needs this object unconditionally (see main.c).
 "$CC" -O2 -g0 -std=c11 -I "$RT" -c "$RT/rt_timer.c" -o "$OUT/zanrt_timer.o"
+# Hardware-accelerated crypto, shipped as an ARCHIVE member and not as a bare
+# object: a bare .o on the link line is loaded whole, so every program carried
+# the entire SHA/AES/SM3/SM4 block even when it used none of it. As an archive
+# member the linker pulls it only when the program really references a
+# zan_hw_* symbol.
+# Rebuild this together with zanrt_timer.o: both derive from the same
+# rt_hw_accel.c, and mixing generations would define the same symbol twice
+# (TASKS.md A493).
+"$CC" -O2 -g0 -std=c11 -I "$RT" -c "$RT/rt_hw_accel.c" -o "$OUT/zan_crypto.o"
+rm -f "$OUT/libzancrypto.a"
+"${AR:-ar}" rcs "$OUT/libzancrypto.a" "$OUT/zan_crypto.o"
 # Embedded-resource API + compressed-resource decoder: GUI programs pull
 # skins/icons through the auto-embed path, so the cross link injects these two
 # objects (same flags as the ZAN_INFLATE_OBJ recipe in CMakeLists.txt).
@@ -39,4 +50,4 @@ mkdir -p "$OUT"
     -DMINIZ_NO_ARCHIVE_APIS -DMINIZ_NO_ZIP_APIS -DMINIZ_NO_STDIO \
     -DMINIZ_NO_TIME -DMINIZ_NO_ARCHIVE_WRITERS \
     -I "$ROOT/src/common" -c "$RT/zan_inflate.c" -o "$OUT/zan_inflate.o"
-echo "built toolchain/$SUB: zanrt_io.o zanrt_io_mt.o zanrt_sync.o zanrt_file.o zanrt_timer.o zan_embed_api.o zan_inflate.o"
+echo "built toolchain/$SUB: zanrt_io.o zanrt_io_mt.o zanrt_sync.o zanrt_file.o zanrt_timer.o libzancrypto.a zan_embed_api.o zan_inflate.o"

@@ -36,7 +36,10 @@ os.chdir(ROOT)
 RT_IO = ["src/runtime/rt_io.c", "src/runtime/rt_sched.c"]
 RT_SYNC = ["src/runtime/rt_sync.c"]
 RT_FILE = ["src/runtime/rt_file.c"]
-RT_TIMER = ["src/runtime/rt_timer.c"]
+RT_DECIMAL = ["src/runtime/rt_decimal.c", "src/runtime/rt_decimal.h"]
+RT_TIMER = ["src/runtime/rt_timer.c", "src/runtime/rt_timer.h",
+            "src/runtime/rt_crash.h"]
+RT_CRYPTO = ["src/runtime/rt_hw_accel.c", "src/runtime/rt_hw_accel.h"]
 RT_WASM = ["src/runtime/rt_wasm.c"]   # zanrt_wasm.o compiles rt_wasm.c only; rt_file.c
                                      # links alongside as its own object (build_cross_rt.cmd)
 RT_GUI_MAC = ["src/runtime/gui_compat_mac.c"]
@@ -79,25 +82,31 @@ ARTIFACTS = [
     ("toolchain/linux-musl/zanrt_io_mt.o", RT_IO, "runtime"),
     ("toolchain/linux-musl/zanrt_sync.o", RT_SYNC, "runtime"),
     ("toolchain/linux-musl/zanrt_file.o", RT_FILE, "runtime"),
+    ("toolchain/linux-musl/zanrt_decimal.o", RT_DECIMAL, "runtime"),
     ("toolchain/linux-arm64/zanrt_io.o", RT_IO, "runtime"),
     ("toolchain/linux-arm64/zanrt_io_mt.o", RT_IO, "runtime"),
     ("toolchain/linux-arm64/zanrt_sync.o", RT_SYNC, "runtime"),
     ("toolchain/linux-arm64/zanrt_file.o", RT_FILE, "runtime"),
+    ("toolchain/linux-arm64/zanrt_decimal.o", RT_DECIMAL, "runtime"),
     ("toolchain/linux-riscv64/zanrt_io.o", RT_IO, "runtime"),
     ("toolchain/linux-riscv64/zanrt_io_mt.o", RT_IO, "runtime"),
     ("toolchain/linux-riscv64/zanrt_sync.o", RT_SYNC, "runtime"),
     ("toolchain/linux-riscv64/zanrt_file.o", RT_FILE, "runtime"),
+    ("toolchain/linux-riscv64/zanrt_decimal.o", RT_DECIMAL, "runtime"),
     # The rest of each linux bundle (build_cross_rt.cmd's zig block): the timer
     # object every program links, the embedded-resource pair, and --fast-alloc's
     # allocator object (musl-only so far).
     ("toolchain/linux-musl/zanrt_timer.o", RT_TIMER, "runtime"),
+    ("toolchain/linux-musl/libzancrypto.a", RT_CRYPTO, "runtime"),
     ("toolchain/linux-musl/zan_embed_api.o", EMBED, "runtime"),
     ("toolchain/linux-musl/zan_inflate.o", INFLATE, "runtime"),
     ("toolchain/linux-musl/zanrt_mem.o", RT_MEM, "runtime"),
     ("toolchain/linux-arm64/zanrt_timer.o", RT_TIMER, "runtime"),
+    ("toolchain/linux-arm64/libzancrypto.a", RT_CRYPTO, "runtime"),
     ("toolchain/linux-arm64/zan_embed_api.o", EMBED, "runtime"),
     ("toolchain/linux-arm64/zan_inflate.o", INFLATE, "runtime"),
     ("toolchain/linux-riscv64/zanrt_timer.o", RT_TIMER, "runtime"),
+    ("toolchain/linux-riscv64/libzancrypto.a", RT_CRYPTO, "runtime"),
     ("toolchain/linux-riscv64/zan_embed_api.o", EMBED, "runtime"),
     ("toolchain/linux-riscv64/zan_inflate.o", INFLATE, "runtime"),
     # musl sysroot subset (crt + libc.a; libgcc.a on arm64/riscv64) tracks the
@@ -130,12 +139,14 @@ ARTIFACTS = [
     ("toolchain/macos/arm64/zanrt_sync.o", RT_SYNC, "runtime"),
     ("toolchain/macos/arm64/zanrt_file.o", RT_FILE, "runtime"),
     ("toolchain/macos/arm64/zanrt_timer.o", RT_TIMER, "runtime"),
+    ("toolchain/macos/arm64/libzancrypto.a", RT_CRYPTO, "runtime"),
     ("toolchain/macos/arm64/zanrt_gui.o", RT_GUI_MAC, "runtime"),
     ("toolchain/macos/x64/zanrt_io.o", RT_IO, "runtime"),
     ("toolchain/macos/x64/zanrt_io_mt.o", RT_IO, "runtime"),
     ("toolchain/macos/x64/zanrt_sync.o", RT_SYNC, "runtime"),
     ("toolchain/macos/x64/zanrt_file.o", RT_FILE, "runtime"),
     ("toolchain/macos/x64/zanrt_timer.o", RT_TIMER, "runtime"),
+    ("toolchain/macos/x64/libzancrypto.a", RT_CRYPTO, "runtime"),
     ("toolchain/macos/x64/zanrt_gui.o", RT_GUI_MAC, "runtime"),
     ("toolchain/macos/arm64/zan_embed_api.o", EMBED, "runtime"),
     ("toolchain/macos/arm64/zan_inflate.o", INFLATE, "runtime"),
@@ -156,6 +167,7 @@ ARTIFACTS = [
     ("toolchain/wasm32/zanrt_wasm.o", RT_WASM, "runtime"),
     ("toolchain/wasm32/zanrt_file.o", RT_FILE, "runtime"),
     ("toolchain/wasm32/zanrt_timer.o", RT_TIMER, "runtime"),
+    ("toolchain/wasm32/libzancrypto.a", RT_CRYPTO, "runtime"),
     ("toolchain/wasm32/zan_inflate.o", INFLATE, "runtime"),
     # Built with mozbuild clang -fexceptions -mllvm -wasm-enable-eh (zig's
     # clang cannot emit the tag); source lives beside the object. The commit
@@ -182,10 +194,12 @@ ARTIFACTS = [
     ("toolchain/android-x64/zanrt_sync.o", RT_SYNC, "manual"),
     ("toolchain/android-x64/zanrt_file.o", RT_FILE, "manual"),
     ("toolchain/android-x64/zanrt_timer.o", RT_TIMER, "manual"),
+    ("toolchain/android-x64/libzancrypto.a", RT_CRYPTO, "manual"),
     ("toolchain/android-arm64/zanrt_io.o", RT_IO, "manual"),
     ("toolchain/android-arm64/zanrt_sync.o", RT_SYNC, "manual"),
     ("toolchain/android-arm64/zanrt_file.o", RT_FILE, "manual"),
     ("toolchain/android-arm64/zanrt_timer.o", RT_TIMER, "manual"),
+    ("toolchain/android-arm64/libzancrypto.a", RT_CRYPTO, "manual"),
     # Embedded-resource pair, NDK clang recipe (same block as above).
     ("toolchain/android-x64/zan_embed_api.o", EMBED, "manual"),
     ("toolchain/android-x64/zan_inflate.o", INFLATE, "manual"),
@@ -219,6 +233,7 @@ ARTIFACTS = [
     ("toolchain/win-arm64/zanrt_sync.o", RT_SYNC, "manual"),
     ("toolchain/win-arm64/zanrt_file.o", RT_FILE, "manual"),
     ("toolchain/win-arm64/zanrt_timer.o", RT_TIMER, "manual"),
+    ("toolchain/win-arm64/libzancrypto.a", RT_CRYPTO, "manual"),
     ("toolchain/win-arm64/zan_embed_api.o", EMBED, "manual"),
     ("toolchain/win-arm64/zan_inflate.o", INFLATE, "manual"),
     ("toolchain/win-x64/zanrt_io.o", RT_IO, "manual"),
@@ -226,6 +241,7 @@ ARTIFACTS = [
     ("toolchain/win-x64/zanrt_sync.o", RT_SYNC, "manual"),
     ("toolchain/win-x64/zanrt_file.o", RT_FILE, "manual"),
     ("toolchain/win-x64/zanrt_timer.o", RT_TIMER, "manual"),
+    ("toolchain/win-x64/libzancrypto.a", RT_CRYPTO, "manual"),
     ("toolchain/win-x64/zan_embed_api.o", EMBED, "manual"),
     ("toolchain/win-x64/zan_inflate.o", INFLATE, "manual"),
     # The NDK sysroot subset (crt + libc/libm/libdl + compiler-rt builtins)
@@ -251,6 +267,7 @@ ARTIFACTS = [
     ("toolchain/ohos-arm64/zanrt_sync.o", RT_SYNC, "runtime"),
     ("toolchain/ohos-arm64/zanrt_file.o", RT_FILE, "runtime"),
     ("toolchain/ohos-arm64/zanrt_timer.o", RT_TIMER, "runtime"),
+    ("toolchain/ohos-arm64/libzancrypto.a", RT_CRYPTO, "runtime"),
     ("toolchain/ohos-arm64/zan_embed_api.o",
      ["src/runtime/zan_embed_api.c", "src/runtime/rt_timer.h"], "runtime"),
     ("toolchain/ohos-arm64/zan_inflate.o",
@@ -262,6 +279,7 @@ ARTIFACTS = [
     ("toolchain/ohos-x64/zanrt_sync.o", RT_SYNC, "runtime"),
     ("toolchain/ohos-x64/zanrt_file.o", RT_FILE, "runtime"),
     ("toolchain/ohos-x64/zanrt_timer.o", RT_TIMER, "runtime"),
+    ("toolchain/ohos-x64/libzancrypto.a", RT_CRYPTO, "runtime"),
     ("toolchain/ohos-x64/zan_embed_api.o",
      ["src/runtime/zan_embed_api.c", "src/runtime/rt_timer.h"], "runtime"),
     ("toolchain/ohos-x64/zan_inflate.o",

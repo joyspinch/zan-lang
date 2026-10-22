@@ -738,7 +738,7 @@
   `DrawMesh3D`。
 - 关联：`Zan.Game.Render3D`（`docs/ECOSYSTEM_ROADMAP.md` §1.30）。
 
-### [ ] A493 发布的 hello world 有 84% 的 .text 是运行时——而"补 `-ffunction-sections`"这条处方已被实测推翻
+### [ ] A493 发布的 hello world 有 84% 的 .text 是运行时——已改归档成员收口大半，win/android 交叉待工具链
 
 - 现象（2026-10-22 重定体积预算时撞到）：`size_budget_publish_host` 实测
   `.text = 199,752`，而这份 hello world 只打印一行字。linux-x64 侧
@@ -746,87 +746,84 @@
 - 载荷构成（实测）：宿主运行时对象（`build/zanrt_*.obj`，CMake 现场编）的
   `.text` 合计 **167,488**——占 hello world 总 `.text` 的 **84%**；程序自身的
   代码只有 ~32 KB。所以要瘦的是**运行时**，不是生成的代码。
-- **已被推翻的处方**（2026-10-22 在构建闸内重编 9 个运行时对象后实测）：
-  - 文档"2026-09-07 更新 2"写的"差值收口依赖运行时对象补
-    `-ffunction-sections`"**不成立**：加 `-ffunction-sections -fdata-sections`
-    后 `.text` 是 **199,736**（几乎不变）——运行时里的函数**全都可达**，链接器
-    无从剪：① 编译器把 `NativeMemory.*` / `Cpu.*` 降级成对 `zan_hw_*` 的
-    **直接调用**，这些符号必须由一个"永远被链上"的对象携带（定时器对象就是
-    那个载体）；② 硬件加速内部按 CPU 特性**函数指针分派**，且启动要跑 KAT
-    自检（`zan_hw_gate` → `zan_aes_kat` …），于是 AES-NI / 软件回退等**每个
-    变体都被表引用**，全活。
-  - `-fdata-sections` 更是**地雷**：它把多 worker 协程驱动里 1.4 MB 的
-    `.bss` 静态表搬进 `.data`，发布产物从 **245,248 → 1,821,184 字节（×7.4）**
-    ——文件体积暴涨而 `.text` 纹丝不动。**别加这两个开关。**
-- 真正的候选杠杆（按体量排，都得先实测再落地）：
-  - **定时器 TU 里混进了整个硬件加速**：`src/runtime/rt_timer.c` 全文 1443 行，
-    **最后一行**是 `#include "rt_hw_accel.c"`（4558 行），而 rt_timer.c 里
-    **一处 `zan_hw_*` 调用都没有**——纯文本包含。`rt_hw_accel.c` 单独编出来
-    `.text` = **53,408**，占定时器对象 74,128 的 **72%**。定时器对象是
-    **每个程序都要链**的（内联协程驱动调 `zan_timer_*`），所以每个发布产物
-    都背着这 53 KB 的 SHA/AES/AVX2。
-  - 拆它要**按特性拆**（sha / aes / pixel 各自成对象或归档），单纯"拆成独立
-    对象"不够：hello world 已经拉进 63 个 `zan_hw_*` + 17 个 `zan_aes_*`
-    符号（它用到了其中一族），只有拆到特性粒度、让链接器按符号缺时才拉，
-    才可能让"不碰加密的程序"少背 AES。
-  - 其余大头待逐项量：定时器本体（74 KB − 53 KB ≈ 21 KB）、io（24 KB）、
-    sync（22 KB）。
-- **根因已钉死（2026-10-23 继续追查）——不是"函数全可达"，是"链接的是
-  裸 .o 而不是归档"**：
-  - 反汇编 + 重定位表取证：`rt_hw_accel.c` 内部用**函数指针分派**（`zan_hw_gate`
-    → `zan_aes_kat` …）+ `.rdata` 里一张 92 槽的函数指针表（48 槽
-    `zan_hw_aes_keygenassist_ni`、24 槽 `zan_cpu_feature`、12 槽 `zan_hw_kat_state`
-    8 槽 `zan__crash_write_record`）把**整簇**互根。hello world 产物里
-    `zan_hw_*` 63 个 + `zan_aes_*` 17 个符号**全在**，且**没有一个来自程序自身**
-    ——程序只调 `Console.WriteLine`。
+- 根因（2026-10-23 钉死）：**不是"函数全可达"，是"链接的是裸 .o 而不是归档"**。
+  - `src/runtime/rt_timer.c` 末行是 `#include "rt_hw_accel.c"`（**文本包含**），
+    而 rt_timer.c 里 **0 处 `zan_hw_*` 调用**。文本包含 ⇒ crypto 与定时器同 TU
+    ⇒ 必然整体进 `.o` ⇒ 必然整体进每个产物。`rt_hw_accel.c` 单独编出来
+    `.text` = **53,408**，占定时器对象 74,128 的 **72%**。
   - 关键对照（同一 TDM gcc / 同一 `--gc-sections`）：
     | 链接方式 | 结果 |
     |---|---|
     | crypto 作为**裸 .o** 直接进链接行 | `zan_hw_=63` 全留，`.text=156,640` |
     | crypto 打进**静态库** `libcrypto.a` | `zan_hw_=0`，`.text=103,232` |
     | 裸 .o + `--gc-sections` + `-ffunction-sections` | 仍 `zan_hw_=63` |
-    → **裸 .o 进链接行 = 整体载入，section GC 对它无效**；归档里的成员才按
-    "符号缺才拉"。这解释了上一条"补 `-ffunction-sections` 无效"——那个实验
-    是在**裸 .o** 上做的，方向从一开始就错了。
-  - 端到端收益（同沙箱 zanc、同 stdlib、同 `--publish --no-icon`）：
-    带 crypto `.text=200,728 / file=244,476`；去掉 crypto `.text=147,320 /
-    file=180,836` ⇒ **crypto 独占 53,408 B（.text 的 26.6%，文件的 26.0%）**。
-  - **因此处方不是"加编译开关"，而是"把 crypto 从裸 .o 变成归档成员"**：
-    按特性（sha / aes / sm3-sm4 / rsa-x25519 / pixel / crc）拆成独立 .o，
-    打进 `libzancrypto.a`，链接行只给归档。链接器即可按符号缺才拉。
-    注意 `rt_timer.c` 末行的 `#include "rt_hw_accel.c"` 必须先拆掉
-    （它是文本包含 ⇒ 必然与定时器同 TU ⇒ 必然整体进 .o）。
-  - 一个已知坑：把 crypto 单独编成归档后，**只要程序用到其中任何一个符号，
-    整簇 63 个 `zan_hw_*` 仍会被拉进来**（`libcrypto.a` 只有一个成员
-    `crypto_sep.obj`）⇒ 必须**按特性再切**到成员粒度，否则只是把体积挪个地方。
-  - 该结论在**交叉侧同样成立**（2026-10-23 复测，纠正上一轮"本机无交叉环境"
-    的错误说法——**本机交叉环境是齐的**）：
-    - 交叉**链接**本机完全可跑：`zanc --target linux-x64 --publish` 出
-      `.text=189,074`，与提交的 `build/size_budget/hello_linux_x64` 逐字节一致；
-      `toolchain/` 下 13 个目标目录（linux-musl / linux-arm64 / linux-riscv64 /
-      win-x64 / win-arm64 / macos / ohos-* / android-* / wasm32 / ios）齐全，
-      `build/ld.lld.exe` 在位。**缺的不是交叉环境，是"重出预编译对象"所需的
-      目标 libc 头**——仓库只提交了 `.o`/`.a`，不带 include（zig cc 现场提供
-      musl 头，本机无 zig；win 侧需要 MSYS2 mingw clang，本机无）。
-    - 交叉产物里 crypto 一样一个没剪：linux-x64 交叉产物 `zan_hw_=63` +
-      `zan_aes_=32` 全在，crypto 符号占 `.text` 约 **37,941 B（19.8%）**；
-      交叉定时器对象 `toolchain/linux-musl/zanrt_timer.o`（`.text` 68,894，
-      单一 `.text` 段未按函数切）里带着同样 63 个 `zan_hw_*`。
-    - **且交叉链接本来就带 `--gc-sections`**（`ld.lld -static ... -s
-      --gc-sections`）——**带了照样剪不掉**，正好反证"是裸 .o 整体载入"这个
-      根因，而不是"缺 GC 开关"。
-    - 结论：宿主与交叉**同因同解**，处方（改归档成员）对两侧都成立；落地时
-      5 个 `scripts/build_*_rt.sh` 配方要同步（`build_win_rt.sh` /
-      `build_cross_rt.cmd` / `build_linux_rt.sh` / `build_macos_rt.sh` /
-      `build_ohos_rt_zig.sh`），但**重出对象这一步本机做不了**（缺目标 libc
-      头 + 缺 zig / MSYS2 mingw clang），要么上 CI，要么先只做宿主侧并把
-      交叉侧标为"待工具链"。
-- 影响：体积预算只能靠"抬高阈值"来容纳，预算的**分辨力**随之下降——阈值
-  取 1.5× 于基线时，一次 +64 KB 的固定表回归不会被抓到（这正是这条预算
-  最初要抓的东西）。
+    → **裸 .o 进链接行 = 整体载入，section GC 对它无效**；只有归档成员才按
+    "符号缺才拉"。这也推翻了"补 `-ffunction-sections`"那条处方——那个实验做在
+    **裸 .o** 上，前提就不成立。`-fdata-sections` 更是**地雷**：1.4 MB 的
+    `.bss` 静态表被搬进 `.data`，发布产物 **245,248 → 1,821,184 字节（×7.4）**。
+    **这两个开关都别加。**
+  - 交叉侧同因同解：交叉链接本来就带 `--gc-sections`（`ld.lld -static ... -s
+    --gc-sections`），**带了照样剪不掉**，反证根因不是"缺 GC 开关"。
+- 落地（2026-10-22 收口）：
+  - 宿主：`rt_timer.c` 去掉文本包含；crypto 由 CMake 编成 `libzancrypto.a`
+    （`zanrt_crypto` 规则），zanc 在 **13 处**链接点注入该归档（原生 / 交叉 /
+    dylib / DLL / wasm 全覆盖）。
+  - 交叉：5 份配方（`build_linux_rt.sh` / `build_macos_rt.sh` /
+    `build_ohos_rt_zig.sh` / `build_win_rt.sh` / `build_cross_rt.cmd`）统一改成
+    "编 timer + 编 crypto + 打归档"；linux/macos/ohos/wasm32 的 timer 与
+    `libzancrypto.a` 已用 zig 0.15.1 重出并提交。
+  - **顺序纪律**：归档必须排在 timer 对象**之后**进链接行——归档成员只为"仍然
+    未定义"的符号解引用，timer 若已定义同名符号则成员不会被拉进来（不会重复
+    定义）；反过来排则同一符号被定义两次。
+  - 归档与 timer 对象必须**同一代**重出：旧的 timer（内含 crypto）+ 新的归档
+    同链接会重复定义，新 timer + 旧归档则会缺符号。
+- 实测收益：
+  | 产物 | 改动前 .text | 改动后 .text | 差 |
+  |---|---|---|---|
+  | 宿主发布 hello（`--publish --no-icon`） | 199,752 | **146,344** | −53,408 |
+  | 交叉 linux-x64 hello | 189,074 | **137,458** | −51,616 |
+  - 按需拉取（**不剥符号**的链接实测：`--publish` 会剥掉符号表，数符号必须用
+    未发布产物）：hello 的 `zan_hw_*`/`zan_aes_*` = **0**；用 crypto 的程序 =
+    **95**（含 `zan_hw_sha256`）——归档成员按需拉取成立。macOS arm64/x64 与
+    wasm32 同样成立（hello 0 / crypto 83~95）。
+  - WSL 实跑交叉产物：hello 输出 `hi`；crypto 输出 SHA-256("abc") 标准向量
+    `ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad`。
+  - 回归：`ctest -R crypto` **14/14** 通过（含 determinism 孪生）；
+    `ctest -R "timer|decimal|async_await|case_hello"` **32/32** 通过。
+- 顺带修掉的三个真缺陷（都在本条落地时撞到，根因各自独立）：
+  - `src/runtime/rt_crash.h`：musl 目标缺 `sigaltstack` / `SS_DISABLE` 声明
+    （musl 把它们藏在 `_BSD_SOURCE/_XOPEN_SOURCE/_GNU_SOURCE` 后面），配方在
+    现代 zig 下**根本编不过 `rt_timer.c`** —— 交叉对象因此长期停在旧代码
+    （已提交的 linux timer 对象里连 altstack 代码都没有）。
+  - `toolchain/linux-musl/` 缺 compiler-rt 内建（`__udivti3` / `__umodti3`）：
+    128 位除法链不过，交叉 linux 任何用到 `System.Decimal` 的程序都断（已用
+    zig 的 `lib/compiler_rt` 补出 `libgcc.a` 装进工具链）。
+  - `toolchain/linux-*/` 缺 `zanrt_decimal.o`（decimal 运行时只补了 macOS/Android）。
+- 剩余（未闭）：
+  - **win-x64 / win-arm64 / android-\*** 的 timer 与归档待各自的工具链
+    （MSYS2 clang / Android NDK）重出——本机没有这两个工具链，配方已改好，
+    CI/持工具链的人跑一次即可。
+  - 归档目前**只有一个成员**（整块 crypto）：用到任一符号仍拉进全部 63+ 个
+    `zan_hw_*`——按特性再切见 A499。
 - 关联：`docs/archive/embedded_runtime_assessment.md`（同一条，文档里"补
-  `-ffunction-sections`"那句已被本次实测推翻，需一并更正）、
-  A491（预算重新定基线的直接原因）。
+  `-ffunction-sections`"那句已被本次实测推翻，已一并更正）、A491（预算重新定
+  基线的直接原因）、A499（归档按特性再切的后续）。
+
+### [ ] A499 crypto 归档只有一个成员——用到任一族仍拉进全部 63+ 个 `zan_hw_*`
+
+- 现象（2026-10-22 A493 落地时留的尾巴）：`libzancrypto.a` 现在**只有一个成员**
+  （整块 `rt_hw_accel.c`）。归档机制本身按"符号缺才拉"生效，但粒度只到"整块
+  crypto"：程序只要用到其中一个符号（如 `zan_hw_sha256`），整簇 **63+ 个**
+  `zan_hw_*` / `zan_aes_*` 仍被拉进来（实测交叉产物 95 个符号）。
+- 切分可行性已量：29 个外部入口，族分 = aes 26 / cpu 探测 23 / 其他 84 /
+  pixel 4 / sm3-sm4 3 / sha 3 / base64 3 / rsa-x25519 3 / json 2 / ghash 2 /
+  crc32 1；**族间仅 aes↔ghash 5 条交叉调用边**（core 依赖：aes→core 15 /
+  sha 6 / sm 4 / crc 2 / ghash 2）⇒ 几乎正交，可以按族切成员。
+- 方向：把 `rt_hw_accel.c` 按族拆成多个 .o 打进同一个归档（sha / aes /
+  sm3-sm4 / rsa-x25519 / pixel / crc / base64 / json / cpu 探测），让"只算
+  CRC32 的程序"不必背 AES。切分要保证同族内部互根的函数仍在同一成员里
+  （`zan_hw_gate` 的函数指针分派表按族分组，别把 aes↔ghash 拆散）。
+- 关联：A493（归档成员机制的落地，本条的直接来源）。
 
 ### [ ] A494 `BaseRepository<T>` 直接实例化会**静默**返回默认值——只有继承才能用
 

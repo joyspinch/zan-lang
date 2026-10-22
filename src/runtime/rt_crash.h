@@ -1178,8 +1178,16 @@ static void zan__crash_install(void) {
 #if defined(__linux__) && !defined(SA_ONSTACK)
 #define SA_ONSTACK 0x08000000
 #endif
-#if defined(__OHOS__) && !defined(SS_DISABLE)
+#if defined(__OHOS__) || (defined(__linux__) && !defined(__GLIBC__))
+/* musl hides sigaltstack() behind _BSD_SOURCE/_XOPEN_SOURCE/_GNU_SOURCE, and
+   the cross recipes compile with a plain -std=c11 (no feature macros), so on
+   musl targets the declaration -- and SS_DISABLE -- are simply missing.
+   Declare them here. musl's prototype is exactly the one below; glibc's own
+   declaration puts the const on the other argument, so re-declaring it there
+   would be a conflicting-type error -- hence the __GLIBC__ guard. */
+#if !defined(SS_DISABLE)
 #define SS_DISABLE 2
+#endif
 int sigaltstack(const stack_t *__restrict, stack_t *__restrict);
 #endif
     {

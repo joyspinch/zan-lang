@@ -6243,6 +6243,7 @@ int main(int argc, char **argv) {
         char rt_embed_buf[1200];
         char rt_inflate_buf[1200];
         char rt_timer_buf[1200];
+        char rt_crypto_buf[1200];
         char rt_mem_buf[1200];
 
         const char *rt_io_obj = NULL;
@@ -6308,6 +6309,18 @@ int main(int argc, char **argv) {
             rt_timer_obj = rt_timer_buf;
         }
 #endif
+        /* Hardware-accelerated crypto: an ARCHIVE, not a bare object. A bare
+           .o is loaded whole (section GC cannot trim it), so every program
+           used to carry the whole SHA/AES/SM3/SM4/AVX2 block even when it
+           called none of it. As an archive member the linker pulls it only
+           when the program actually references a zan_hw_* symbol. Always
+           injected -- which symbols are needed is only known at link time. */
+        const char *rt_crypto_archive = NULL;
+#ifdef ZAN_RT_CRYPTO_ARCHIVE
+        snprintf(rt_crypto_buf, sizeof(rt_crypto_buf), "%s/%s",
+                 link_exe_dir, zan_path_basename(ZAN_RT_CRYPTO_ARCHIVE));
+        if (zan_file_exists(rt_crypto_buf)) rt_crypto_archive = rt_crypto_buf;
+#endif
         /* 小对象内存分配器管理池 */
         bool fast_alloc = fast_alloc_opt >= 0;
         const char *rt_mem_obj = NULL;
@@ -6365,6 +6378,13 @@ int main(int argc, char **argv) {
                 }
                 rt_timer_obj = rt_timer_buf;
                 target_rt_sub = tsub;
+                /* The crypto archive follows the same layout: one per
+                   cross target, next to the target's other runtime objects
+                   (toolchain/<tsub>/libzancrypto.a, staged into
+                   <exe_dir>/<tsub>/ by CMake and publish_ide.ps1). */
+                snprintf(rt_crypto_buf, sizeof(rt_crypto_buf), "%s/%s/libzancrypto.a",
+                         link_exe_dir, tsub);
+                if (zan_file_exists(rt_crypto_buf)) rt_crypto_archive = rt_crypto_buf;
             }
         }
         if (cross_compiling && rt_sync_obj && target.os != ZAN_OS_LINUX
@@ -6719,6 +6739,7 @@ int main(int argc, char **argv) {
                     if (rt_embed_obj) argv[a++] = rt_embed_obj;
                     if (rt_inflate_obj) argv[a++] = rt_inflate_obj;
                     if (rt_timer_obj) argv[a++] = rt_timer_obj;
+                    if (rt_crypto_archive) argv[a++] = rt_crypto_archive;
                     argv[a++] = "-out-implib";
                     argv[a++] = implib;
                     char ldirbufs[ZAN_LINK_MAX_DIRS * 2 + 4][520]; int nld = 0;
@@ -6879,6 +6900,10 @@ int main(int argc, char **argv) {
                         cmd_appendf(cmd, sizeof(cmd), " \"%s\"",
                                  rt_timer_obj);
                     }
+                    if (rt_crypto_archive) {
+                        cmd_appendf(cmd, sizeof(cmd), " \"%s\"",
+                                 rt_crypto_archive);
+                    }
                 } else if (target.os == ZAN_OS_MACOS) {
                     const char *march = (target.arch == ZAN_ARCH_AARCH64)
                                         ? "arm64" : "x86_64";
@@ -6929,6 +6954,10 @@ int main(int argc, char **argv) {
                     if (rt_timer_obj) {
                         cmd_appendf(cmd, sizeof(cmd), " \"%s\"",
                                  rt_timer_obj);
+                    }
+                    if (rt_crypto_archive) {
+                        cmd_appendf(cmd, sizeof(cmd), " \"%s\"",
+                                 rt_crypto_archive);
                     }
                 } else if (cross_compiling &&
                            target.os == ZAN_OS_ANDROID) {
@@ -6995,6 +7024,10 @@ int main(int argc, char **argv) {
                         cmd_appendf(cmd, sizeof(cmd), " \"%s\"",
                                  rt_timer_obj);
                     }
+                    if (rt_crypto_archive) {
+                        cmd_appendf(cmd, sizeof(cmd), " \"%s\"",
+                                 rt_crypto_archive);
+                    }
                     for (int li = 0; li < static_driver_lib_count; li++) {
                         cmd_appendf(cmd, sizeof(cmd), " %s",
                                  static_driver_libs[li]);
@@ -7058,6 +7091,10 @@ int main(int argc, char **argv) {
                     if (rt_timer_obj) {
                         cmd_appendf(cmd, sizeof(cmd), " \"%s\"",
                                  rt_timer_obj);
+                    }
+                    if (rt_crypto_archive) {
+                        cmd_appendf(cmd, sizeof(cmd), " \"%s\"",
+                                 rt_crypto_archive);
                     }
                     if (irgen.uses_socket_async) {
                         cmd_appendf(cmd, sizeof(cmd),
@@ -7163,6 +7200,9 @@ int main(int argc, char **argv) {
             if (rt_timer_obj) {
                 cmd_appendf(cmd, sizeof(cmd), " \"%s\"", rt_timer_obj);
             }
+            if (rt_crypto_archive) {
+                cmd_appendf(cmd, sizeof(cmd), " \"%s\"", rt_crypto_archive);
+            }
             if (rt_io_obj || irgen.uses_socket_async || external_async_executor) {
                 const char *ioname = external_async_executor ? "zanrt_io_mt.o" : "zanrt_io.o";
                 char rt_io_path[1400];
@@ -7263,6 +7303,9 @@ int main(int argc, char **argv) {
             if (rt_timer_obj) {
                 cmd_appendf(cmd, sizeof(cmd), " \"%s\"", rt_timer_obj);
             }
+            if (rt_crypto_archive) {
+                cmd_appendf(cmd, sizeof(cmd), " \"%s\"", rt_crypto_archive);
+            }
             if (irgen.uses_socket_async) {
                 cmd_appendf(cmd, sizeof(cmd), " \"%s/zanrt_io.o\"", sys);
             }
@@ -7346,6 +7389,9 @@ int main(int argc, char **argv) {
             }
             if (rt_timer_obj) {
                 cmd_appendf(cmd, sizeof(cmd), " \"%s\"", rt_timer_obj);
+            }
+            if (rt_crypto_archive) {
+                cmd_appendf(cmd, sizeof(cmd), " \"%s\"", rt_crypto_archive);
             }
             if (irgen.uses_socket_async) {
                 cmd_appendf(cmd, sizeof(cmd), " \"%s/zanrt_io.o\"", sys);
@@ -7493,6 +7539,9 @@ int main(int argc, char **argv) {
             if (rt_timer_obj) {
                 cmd_appendf(cmd, sizeof(cmd), " \"%s\"", rt_timer_obj);
             }
+            if (rt_crypto_archive) {
+                cmd_appendf(cmd, sizeof(cmd), " \"%s\"", rt_crypto_archive);
+            }
             if (winrt_io[0]) {
                 cmd_appendf(cmd, sizeof(cmd), " \"%s\"", winrt_io);
             }
@@ -7622,6 +7671,21 @@ int main(int argc, char **argv) {
             { cmd_appendf(cmd, sizeof(cmd),
                        " \"%s/zanrt_timer.o\" \"%s/zanrt_wasm.o\"",
                        sys, sys); }
+            /* The crypto archive rides along with the timer object: rt_timer.c
+               no longer text-includes rt_hw_accel.c, so the SHA/AES/SM3/SM4
+               block lives in an archive member and the linker only pulls it
+               when the program really references a zan_hw_* symbol. It must
+               come after zanrt_timer.o on the link line -- an archive member
+               is extracted only for symbols that are still undefined, so a
+               timer object that still carries the block would define them
+               first and the member would stay out (no duplicate symbol). */
+            {
+                char cryptoarc[1300];
+                snprintf(cryptoarc, sizeof(cryptoarc), "%s/libzancrypto.a", sys);
+                if (zan_file_exists(cryptoarc)) {
+                    cmd_appendf(cmd, sizeof(cmd), " \"%s\"", cryptoarc);
+                }
+            }
             {
                 static const char *const gui_pre[] = { "zan_gui_", NULL };
                 static const char *const image_pre[] = { "zan_image_", NULL };
@@ -7802,6 +7866,9 @@ int main(int argc, char **argv) {
             }
             if (rt_timer_obj) {
                 cmd_appendf(cmd, sizeof(cmd), " \"%s\"", rt_timer_obj);
+            }
+            if (rt_crypto_archive) {
+                cmd_appendf(cmd, sizeof(cmd), " \"%s\"", rt_crypto_archive);
             }
             if (macrt_io[0]) {
                 cmd_appendf(cmd, sizeof(cmd), " \"%s\"", macrt_io);
@@ -8039,6 +8106,7 @@ int main(int argc, char **argv) {
             if (rt_embed_obj) argv[a++] = rt_embed_obj;
             if (rt_inflate_obj) argv[a++] = rt_inflate_obj;
             if (rt_timer_obj) argv[a++] = rt_timer_obj;
+            if (rt_crypto_archive) argv[a++] = rt_crypto_archive;
             if (rt_mem_obj) {
                 argv[a++] = rt_mem_obj;
                 argv[a++] = "--wrap=malloc";  argv[a++] = "--wrap=free";
@@ -8128,6 +8196,9 @@ int main(int argc, char **argv) {
             if (rt_timer_obj) {
                 cmd_appendf(link_cmd, sizeof(link_cmd), " \"%s\"", rt_timer_obj);
             }
+            if (rt_crypto_archive) {
+                cmd_appendf(link_cmd, sizeof(link_cmd), " \"%s\"", rt_crypto_archive);
+            }
             if (rt_mem_obj) {
                 cmd_appendf(link_cmd, sizeof(link_cmd),
                          " \"%s\" -Wl,--wrap=malloc -Wl,--wrap=free"
@@ -8214,6 +8285,9 @@ int main(int argc, char **argv) {
             cmd_appendf(link_cmd, sizeof(link_cmd),
                      " \"%s\" -pthread -lrt", rt_timer_obj);
 #endif
+        }
+        if (rt_crypto_archive) {
+            cmd_appendf(link_cmd, sizeof(link_cmd), " \"%s\"", rt_crypto_archive);
         }
         if (rt_mem_obj) {
 #ifdef __APPLE__

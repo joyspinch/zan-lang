@@ -46,6 +46,19 @@ for pair in arm64:aarch64 x64:x86_64; do
         -c "$RT/rt_file.c" -o "$out/zanrt_file.o"
     "$ZIG" cc -target "$arch-linux-musl" -D__OHOS__ -g0 -std=c11 -fPIC $march -I "$RT" -O2 \
         -c "$RT/rt_timer.c" -o "$out/zanrt_timer.o"
+    # Hardware-accelerated crypto, shipped as an ARCHIVE member and not as a
+    # bare object: a bare .o on the link line is loaded whole, so every
+    # program carried the entire SHA/AES/SM3/SM4 block even when it used none
+    # of it. As an archive member the linker pulls it only when the program
+    # really references a zan_hw_* symbol.
+    # Rebuild this together with zanrt_timer.o: both derive from the same
+    # rt_hw_accel.c, and mixing generations would define the same symbol
+    # twice (TASKS.md A493). $march is the same crypto feature macro the
+    # timer object above uses, so both stay in step.
+    "$ZIG" cc -target "$arch-linux-musl" -D__OHOS__ -g0 -std=c11 -fPIC $march -I "$RT" \
+        -O2 -c "$RT/rt_hw_accel.c" -o "$out/zan_crypto.o"
+    rm -f "$out/libzancrypto.a"
+    "$ZIG" ar rcs "$out/libzancrypto.a" "$out/zan_crypto.o"
     "$ZIG" cc -target "$arch-linux-musl" -D__OHOS__ -g0 -std=c11 -fPIC -I "$RT" \
         -I "$ROOT/src/common" -O2 -c "$RT/zan_embed_api.c" -o "$out/zan_embed_api.o"
     "$ZIG" cc -target "$arch-linux-musl" -D__OHOS__ -g0 -std=c11 -fPIC \
@@ -55,5 +68,5 @@ for pair in arm64:aarch64 x64:x86_64; do
     # link; the source is arch-independent and lives next to the x64 subset.
     "$ZIG" cc -target "$arch-linux-musl" -g0 -std=c11 -fPIC -O2 \
         -c "$ROOT/toolchain/ohos-x64/zap_main.c" -o "$out/zap_main.o"
-    echo "built $out"
+    echo "built $out (zanrt_*.o + libzancrypto.a)"
 done

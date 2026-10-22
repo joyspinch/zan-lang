@@ -258,7 +258,6 @@ add_custom_command(
             -c ${CMAKE_SOURCE_DIR}/src/runtime/rt_timer.c -o ${ZAN_RT_TIMER_OBJ}
     DEPENDS ${CMAKE_SOURCE_DIR}/src/runtime/rt_timer.c
             ${CMAKE_SOURCE_DIR}/src/runtime/rt_timer.h
-            ${CMAKE_SOURCE_DIR}/src/runtime/rt_hw_accel.c
             ${CMAKE_SOURCE_DIR}/src/runtime/rt_hw_accel.h
             ${CMAKE_SOURCE_DIR}/src/common/host_oom.h
             ${CMAKE_SOURCE_DIR}/src/runtime/rt_crash.h
@@ -270,6 +269,42 @@ target_compile_definitions(zanc PRIVATE ZAN_RT_TIMER_OBJ="${ZAN_RT_TIMER_OBJ}")
 add_custom_command(TARGET zanc POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
             ${ZAN_RT_TIMER_OBJ} $<TARGET_FILE_DIR:zanc>/zanrt_timer${CMAKE_C_OUTPUT_EXTENSION}
+    VERBATIM)
+
+# ---- Hardware-accelerated crypto runtime (archive, not a bare object) ----
+#
+# rt_hw_accel.c used to be #included at the end of rt_timer.c, so every
+# program linked the whole SHA/AES/SM3/SM4/AVX2 block (53,408 B of .text)
+# even when it used none of it. A bare .o on the link line is loaded whole --
+# section GC cannot trim it -- so the fix is to ship the code as an *archive
+# member*: the linker then pulls it only when a program actually references a
+# zan_hw_* symbol.
+#
+# The archive currently holds ONE member (the whole crypto TU). That already
+# removes the crypto from programs that never touch it; programs that use a
+# single family still drag the whole block in, so splitting the members per
+# feature family is the follow-up (TASKS.md A493).
+set(ZAN_RT_CRYPTO_OBJ "${CMAKE_BINARY_DIR}/zan_crypto${CMAKE_C_OUTPUT_EXTENSION}")
+set(ZAN_RT_CRYPTO_ARCHIVE "${CMAKE_BINARY_DIR}/libzancrypto${CMAKE_C_STATIC_LIBRARY_SUFFIX}")
+add_custom_command(
+    OUTPUT ${ZAN_RT_CRYPTO_ARCHIVE}
+    COMMAND ${ZAN_RT_IO_CC} ${ZAN_RT_OBJ_DEFS} -std=c11
+            -I ${CMAKE_SOURCE_DIR}/src/runtime -O2
+            -c ${CMAKE_SOURCE_DIR}/src/runtime/rt_hw_accel.c
+            -o ${ZAN_RT_CRYPTO_OBJ}
+    COMMAND ${CMAKE_AR} qc ${ZAN_RT_CRYPTO_ARCHIVE} ${ZAN_RT_CRYPTO_OBJ}
+    COMMAND ${CMAKE_RANLIB} ${ZAN_RT_CRYPTO_ARCHIVE}
+    DEPENDS ${CMAKE_SOURCE_DIR}/src/runtime/rt_hw_accel.c
+            ${CMAKE_SOURCE_DIR}/src/runtime/rt_hw_accel.h
+    COMMENT "Building hardware-accelerated crypto archive (libzancrypto)"
+    VERBATIM)
+add_custom_target(zanrt_crypto ALL DEPENDS ${ZAN_RT_CRYPTO_ARCHIVE})
+add_dependencies(zanc zanrt_crypto)
+target_compile_definitions(zanc PRIVATE ZAN_RT_CRYPTO_ARCHIVE="${ZAN_RT_CRYPTO_ARCHIVE}")
+add_custom_command(TARGET zanc POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            ${ZAN_RT_CRYPTO_ARCHIVE}
+            $<TARGET_FILE_DIR:zanc>/libzancrypto${CMAKE_C_STATIC_LIBRARY_SUFFIX}
     VERBATIM)
 
 # Generic embedded-resource read API (src/runtime/zan_embed_api.c). The data
@@ -491,8 +526,10 @@ foreach(_linux_sub linux-musl linux-arm64 linux-riscv64)
                     "${_linux_sys}/zanrt_io.o" "${_linux_sys}/zanrt_sync.o"
                     "${_linux_sys}/zanrt_timer.o"
                     ${CMAKE_BINARY_DIR}/${_linux_sub}/)
-        foreach(_linux_opt zanrt_file.o zanrt_io_mt.o zanrt_mem.o libgcc.a
-                libfreetype.a libfontconfig.a libexpat.a)
+        foreach(_linux_opt zanrt_file.o zanrt_io_mt.o zanrt_mem.o
+                zanrt_decimal.o libgcc.a
+                libfreetype.a libfontconfig.a libexpat.a
+                libzancrypto.a)
             if(EXISTS "${_linux_sys}/${_linux_opt}")
                 list(APPEND _cross_sysroot_cmds
                     COMMAND ${CMAKE_COMMAND} -E copy_if_different

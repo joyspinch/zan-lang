@@ -145,7 +145,7 @@ foreach ($sub in @("linux-musl", "linux-arm64", "linux-riscv64", "win-x64",
 
 # runtime objects the IDE links explicitly (ZanIDE.RtSyncArg and friends)
 foreach ($rt in (Get-ChildItem -LiteralPath $Build -File -ErrorAction SilentlyContinue |
-                 Where-Object { ($_.Name -like 'zanrt_*' -or $_.Name -like 'zan_inflate*' -or $_.Name -like 'zan_embed_api*') -and $_.Extension -in '.o', '.obj' })) {
+                 Where-Object { ($_.Name -like 'zanrt_*' -or $_.Name -like 'zan_inflate*' -or $_.Name -like 'zan_embed_api*' -or $_.Name -like 'libzancrypto*') -and $_.Extension -in '.o', '.obj', '.a' })) {
     Stage-File $rt.FullName $rt.Name | Out-Null
 }
 
