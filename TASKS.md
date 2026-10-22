@@ -78,8 +78,15 @@
   ② checker 对 decimal↔float/double 混合算术当场报错（CS0019 口径，promote_numeric
   的静默 type_error 不再放行）；③ WriteLine 分派补 decimal 分支（`emit_to_cstr_u`
   转托管串后按字符串打印）。三探针复验通过；12 平台 `zanrt_decimal.o` 已同代重建。
-- 待办：自举半边（除法运行时是同一份 C 对象、天然对齐；②③的自举侧待
-  `src/selfhost/irgen_expr.zan`/`checker.zan` 在途窗口）。
+- 待办：自举半边收口见下（除法运行时是同一份 C 对象、天然对齐——但自举的
+  m 字面量算术根本不走它，见模型限制）。
+- **自举半边（2026-10-23，模型内对齐）**：② checker 补字面量形态混算拒收
+  （`0.5m + 0.5`，五算术符，宿主同措辞同行列；声明 decimal 槽位在自举
+  "decimal→double" 映射（parser.zan）下已擦除成 double，`decimal d = 0.5m;
+  d + 0.5` 不可分辨——**模型级已知限制**）；③ 自举 decimal 即 double，
+  WriteLine 走 double 文本，正常打印（探针 0.5/2.1/2.5 全对）；① 精度差异
+  是同一模型限制的直接后果（`1m/3m` 自举 16 位 vs 宿主 28 位）——真 decimal
+  支持（%Decimal 结构体 + stdlib Decimal 方法路由）是独立战线，维持台账。
 - ① 除法恒 18 位截断：`1m/3m`→"0.333333333333333333"（C# 28 位且末位进位）、scale 恒 18（`10m/4m`→"2.500000000000000000"）；加/乘精确。
 - ② decimal+double 混算被接受且产出垃圾：`0.5m+0.5`→"19768355002338416264795389952"、`0.1m+2.0`→"19807040628566225135759764102"（C# CS0019 拒绝）。`Decimal.FromDouble` 本身正确——坏的只是混合算术的隐式转换 lowering（checker.c:1280-1285 对赋值路径已有拒绝，算术实参路径放行）。
 - ③ `Console.WriteLine(decimal)` 直接编译失败：LLVM 校验错——`%Decimal` 结构体传给 `zan_rt_print_int(i64)`（亲验复现）。C# 正常打印。
@@ -107,7 +114,12 @@
   挪到基类构造链调用之前（this 链仍由链目标构造器统一发）。探针复验：
   `d-init → b-init → base-ctor → derived-ctor`（原 `b-init / base-ctor / d-init /
   derived-ctor`）；基类构造器里的虚调用读到派生内联字段 42（原 0）。
-- 待办：自举半边（`src/selfhost/irgen.zan` 在途窗口）。
+- **自举半边已修（2026-10-23）**：`irgen_async.zan` GenCtor 把 `EmitFieldInits`
+  挪到基类构造链调用之前（this 链不变：由链目标构造器统一发；兜底基类链初始化
+  保持在其后，d-init → b-init 同宿主 prologue）。探针 `p02_ctor_chain`/
+  `p03_ctor_virtual` 自举与宿主逐行一致（d-init 先、虚调用读 42）。分配点的
+  链式助手（隐式构造器替身）维持根优先——与宿主 `emit_implicit_field_initializers`
+  的递归顺序一致，A516 未动该路径。
 - 实测曾为 `b-init / base-ctor / d-init / derived-ctor`；C# 是**派生字段初始化器最先**（d-init → b-init → base-ctor → derived-ctor）。直接后果：基类构造器里的虚调用读派生内联字段得默认值（实测 `derived:0`，C# `derived:42`）。静默错值。
 - 根因落点：`src/compiler/irgen_emit.c` 构造器 prologue 顺序（非 irgen.c）。
 - 探针：`_scratch/csaudit/objectmodel/{p02_ctor_chain,p03_ctor_virtual}.zan`。
