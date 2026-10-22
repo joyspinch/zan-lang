@@ -6,10 +6,10 @@
 >
 > 平账纪律：闭账条目当批移出
 >
-> 2026-10-22 平账：移出 46 条已闭账条目（A390/A393/A394/A395/A396/A397/A399/
+> 2026-10-22 平账：移出 47 条已闭账条目（A390/A393/A394/A395/A396/A397/A399/
 > A400/A401/A402/A403/A404/A405/A406/A407/A413/A415/A416/A428/A431/A432/A437/
 > A441/A442/A445/A447/A448/A449/A463/A473/A474/A475/A476/A477/A478/A479/A480/
-> A481/A483/A484/A485/A488/A491/A492/A497/A500）。编号不复用，结论与验证见 git 历史。
+> A481/A483/A484/A485/A488/A491/A492/A497/A500/A505）。编号不复用，结论与验证见 git 历史。
 
 ## 未完成
 
@@ -1012,8 +1012,6 @@
 - 关联：A502（android 的具体症状）、A503（ohos 的具体症状）、A493（归档拆分
   后 win 变胖的根因）、A501。
 
-
-
 ### [ ] A506 语言服务冷启动 11~13 秒——`initialize` 同步索引了整座包仓库
 
 - 现象（2026-10-22 修 IDE 崩溃时顺带测出）：IDE 打开工程后状态栏长时间停在
@@ -1043,33 +1041,3 @@
   显示出来并给一键重连）。
 - 坑出处：探针的等待时长必须按被测服务端的**实测**耗时定——本轮最初按 10 s
   等，真实冷启动 13 s，直接判成假失败。
-
-### [ ] A505 自举门的运行时对象集缺 `rt_hw_accel.c`——crypto 拆成独立 TU 后两条门链接红
-
-- 现象（2026-10-22 随 A500 复跑自举门浮出）：ctest 的 `selfhost_diff` 与
-  `selfhost_fixed_point` 两条门**在链接期**就红（`LNK2019`），门根本没跑到
-  比对阶段。宿主程序本身不受影响——只有这两条自举门。
-- 根因：`ce1041cf9` 把硬件加速 crypto 从 `rt_timer.c` 里拆成独立 TU
-  （`src/runtime/rt_hw_accel.c` + 归档 `libzancrypto.a`，`CMakeLists.txt:288-299`），
-  自举门的两套运行时对象集没跟着改：
-  - `CMakeLists.txt:3184` `_sh_rt_srcs`（固定点门）
-  - `CMakeLists.txt:3259` `_shd_rt_srcs`（差分门）
-  两处仍只有 `rt_file.c rt_io.c rt_sched.c rt_timer.c rt_decimal.c rt_sync.c
-  zan_embed_api.c`——既没有 `rt_hw_accel.c`，也没链 `libzancrypto.a`。
-  于是 `zan_hw_base64_encode/decode`（现在住在 `src/runtime/rt_hw_accel.c:3700`
-  与 `:3768`）在门的链接行上**根本不存在**。
-- 为什么门一定会引用它：自举编译器把 base64 降成对 `zan_hw_base64_encode` 的
-  extern 调用（`src/selfhost/irgen.zan:802-833`），而 stdlib 的
-  `System.Convert.ToBase64String` / `FromBase64String`（`stdlib/System/Convert.zan:19`）
-  走 `NativeMemory.Base64Encode` → 门链的编译器二进制里就有这个未定义符号。
-- 证据（2026-10-22 实测）：用 committed 的那套对象集链接固定点门的 g2.ll →
-  `LNK2019 无法解析的外部符号 zan_hw_base64_encode，函数 Convert_ToBase64String
-  中引用了该符号`（decode 同理）；对象集里补进一份用 clang 编的
-  `rt_hw_accel.obj` → 链接通过（exit 0），两条门随之跑绿。
-- 方向：把 `rt_hw_accel.c` 加进两处对象集——**必须用 `SELFHOST_CLANG` 编**
-  （与同一行里的其它对象一致；链 MSVC `ar` 产出的 `libzancrypto.a` 会撞 C
-  运行时），或者另建一个门专用归档（成员也得是 clang 编的）。
-- 关联：A499（crypto 归档成员的收口）、A500（本轮正是靠门才复验得动）。
-- 坑出处已记在 `.agents/skills/zan-compiler-internals/references/selfhost-closure.md`
-  §140「差分门的链接集必须覆盖自举 IR 引用的全部硬件助手」。
-

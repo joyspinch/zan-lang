@@ -3273,7 +3273,7 @@ if(SELFHOST_CLANG)
   # emitted fallback). The gate therefore compares *compiler* behaviour --
   # the stdout a program produces -- not runtime internals.
   set(_shd_rt_srcs rt_file.c rt_io.c rt_sched.c rt_timer.c rt_decimal.c
-                    rt_sync.c zan_embed_api.c)
+                    rt_sync.c zan_embed_api.c rt_hw_accel.c)
   set(_shd_rt_objs)
   foreach(_shd_src IN LISTS _shd_rt_srcs)
     get_filename_component(_shd_stem ${_shd_src} NAME_WE)
