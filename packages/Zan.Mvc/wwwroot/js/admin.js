@@ -452,9 +452,16 @@
       head.appendChild(node('span', 'title', opts.title || ''));
       var ops = node('span', 'ops');
       if (!opts.drawer && !opts.bare) {
-        var max = node('button', 'wbtn', '□');
+        var max = node('button', 'wbtn');
         max.type = 'button';
         max.title = '最大化 / 还原';
+        max.setAttribute('aria-label', '最大化或还原');
+        /* 内联 SVG 而不是字符：'□' 在多数中文字体里是个缺字方框，
+           看起来像禁用/坏图。描边跟随 currentColor，暗色自动适配。 */
+        max.innerHTML = '<svg width="12" height="12" viewBox="0 0 12 12" fill="none"'
+          + ' stroke="currentColor" stroke-width="1.3" stroke-linejoin="round">'
+          + '<rect x="1.6" y="1.6" width="6.6" height="6.6" rx="1"/>'
+          + '<path d="M4 10.4h5.4a1 1 0 0 0 1-1V4"/></svg>';
         max.onclick = function () {
           box.classList.toggle('max');
           if (!box.classList.contains('max')) { place(box, opts); }
