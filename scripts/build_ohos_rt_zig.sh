@@ -13,7 +13,7 @@
 #
 #   scripts/build_ohos_rt_zig.sh [path-to-zig]
 #
-# Outputs toolchain/ohos-{arm64,x64}/zanrt_{io,sync,file,timer}.o,
+# Outputs toolchain/ohos-{arm64,x64}/zanrt_{io,sync,file,decimal,timer}.o,
 # zan_embed_api.o, zan_inflate.o, zap_main.o. Committed after review (our own
 # code; *.o is gitignored, so `git add -f` them).
 # -g0: DWARF in an object that is only ever statically linked is dead weight,
@@ -44,6 +44,10 @@ for pair in arm64:aarch64 x64:x86_64; do
         -c "$RT/rt_sync.c" -o "$out/zanrt_sync.o"
     "$ZIG" cc -target "$arch-linux-musl" -D__OHOS__ -g0 -std=c11 -fPIC -I "$RT" -O2 \
         -c "$RT/rt_file.c" -o "$out/zanrt_file.o"
+    # 128-bit Decimal runtime: programs that reach System.Numerics reference
+    # __zan_decimal_* and the cross link injects this object for them.
+    "$ZIG" cc -target "$arch-linux-musl" -D__OHOS__ -g0 -std=c11 -fPIC -I "$RT" -O2 \
+        -c "$RT/rt_decimal.c" -o "$out/zanrt_decimal.o"
     "$ZIG" cc -target "$arch-linux-musl" -D__OHOS__ -g0 -std=c11 -fPIC $march -I "$RT" -O2 \
         -c "$RT/rt_timer.c" -o "$out/zanrt_timer.o"
     # Hardware-accelerated crypto, shipped as an ARCHIVE member and not as a

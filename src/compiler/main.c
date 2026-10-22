@@ -4721,7 +4721,8 @@ int main(int argc, char **argv) {
     zan_target_t target;
     if (target_name) {
         if (!zan_target_parse(target_name, &target)) {
-            fprintf(stderr, "error: unknown target '%s' (see --list-targets)\n", target_name);
+            fprintf(stderr, "error: target '%s' is not available in this build "
+                            "(see --list-targets)\n", target_name);
             return 1;
         }
     } else {
@@ -6317,9 +6318,11 @@ int main(int argc, char **argv) {
            injected -- which symbols are needed is only known at link time. */
         const char *rt_crypto_archive = NULL;
 #ifdef ZAN_RT_CRYPTO_ARCHIVE
-        snprintf(rt_crypto_buf, sizeof(rt_crypto_buf), "%s/%s",
-                 link_exe_dir, zan_path_basename(ZAN_RT_CRYPTO_ARCHIVE));
-        if (zan_file_exists(rt_crypto_buf)) rt_crypto_archive = rt_crypto_buf;
+        if (!cross_compiling) {
+            snprintf(rt_crypto_buf, sizeof(rt_crypto_buf), "%s/%s",
+                     link_exe_dir, zan_path_basename(ZAN_RT_CRYPTO_ARCHIVE));
+            if (zan_file_exists(rt_crypto_buf)) rt_crypto_archive = rt_crypto_buf;
+        }
 #endif
         /* 小对象内存分配器管理池 */
         bool fast_alloc = fast_alloc_opt >= 0;
@@ -6381,10 +6384,14 @@ int main(int argc, char **argv) {
                 /* The crypto archive follows the same layout: one per
                    cross target, next to the target's other runtime objects
                    (toolchain/<tsub>/libzancrypto.a, staged into
-                   <exe_dir>/<tsub>/ by CMake and publish_ide.ps1). */
+                   <exe_dir>/<tsub>/ by CMake and publish_ide.ps1).
+                   Assign unconditionally: rt_crypto_buf is shared with the
+                   native path above, so leaving the old pointer in place would
+                   hand the linker a stale path (and, for a target without an
+                   archive, a path that does not exist at all). */
                 snprintf(rt_crypto_buf, sizeof(rt_crypto_buf), "%s/%s/libzancrypto.a",
                          link_exe_dir, tsub);
-                if (zan_file_exists(rt_crypto_buf)) rt_crypto_archive = rt_crypto_buf;
+                rt_crypto_archive = zan_file_exists(rt_crypto_buf) ? rt_crypto_buf : NULL;
             }
         }
         if (cross_compiling && rt_sync_obj && target.os != ZAN_OS_LINUX
@@ -7671,6 +7678,33 @@ int main(int argc, char **argv) {
             { cmd_appendf(cmd, sizeof(cmd),
                        " \"%s/zanrt_timer.o\" \"%s/zanrt_wasm.o\"",
                        sys, sys); }
+
+            /* The 128-bit Decimal runtime: programs that reach System.Numerics
+               reference __zan_decimal_*, and the wasm link has to supply them
+               like every other target does. The object sits next to the other
+               wasm runtime objects (toolchain/wasm32/zanrt_decimal.o, built by
+               scripts\\build_cross_rt.cmd). It goes in BEFORE the crypto
+               archive below: an archive member is extracted only for symbols
+               that are still undefined, so the archive has to see the
+               decimal symbols already resolved. */
+            if (irgen.uses_decimal_runtime) {
+                char decobj[1300];
+                snprintf(decobj, sizeof(decobj), "%s/zanrt_decimal.o", sys);
+                if (!zan_file_exists(decobj)) {
+                    fprintf(stderr,
+                            "error: wasm32 program needs the decimal runtime "
+                            "object at '%s'; rebuild it with "
+                            "scripts\\build_cross_rt.cmd\n", decobj);
+                    generated_object_vec_remove(&generated_objects, obj_tmp);
+                    zan_diag_free_buffers(irgen.diag);
+                    zan_irgen_destroy(&irgen);
+                    zan_arena_free(ir_arena);
+                    zan_arena_free(arena);
+                    free(source);
+                    return 1;
+                }
+                cmd_appendf(cmd, sizeof(cmd), " \"%s\"", decobj);
+            }
             /* The crypto archive rides along with the timer object: rt_timer.c
                no longer text-includes rt_hw_accel.c, so the SHA/AES/SM3/SM4
                block lives in an archive member and the linker only pulls it

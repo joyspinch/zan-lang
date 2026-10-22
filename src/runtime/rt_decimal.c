@@ -471,10 +471,15 @@ double __zan_decimal_to_double(const zan_decimal_t *a) {
     return a ? zan_decimal_to_double(*a) : 0.0;
 }
 
-int32_t __zan_decimal_to_string(const zan_decimal_t *a, char *buf, size_t buf_size) {
-    return a ? zan_decimal_to_string(*a, buf, buf_size) : 0;
+/* The two entry points below take their length/size as int64_t, NOT size_t:
+   the compiler backend emits the matching call with Zan's `long` (always
+   64-bit), while size_t is 32-bit on wasm32 -- a mismatch wasm-ld reports as
+   "function signature mismatch" and that would break the call at run time.
+   Every other __zan_decimal_* entry point is fixed-width for the same reason. */
+int32_t __zan_decimal_to_string(const zan_decimal_t *a, char *buf, int64_t buf_size) {
+    return a ? zan_decimal_to_string(*a, buf, (size_t)buf_size) : 0;
 }
 
-bool __zan_decimal_parse(const char *str, size_t len, zan_decimal_t *out) {
-    return zan_decimal_parse(str, len, out);
+bool __zan_decimal_parse(const char *str, int64_t len, zan_decimal_t *out) {
+    return zan_decimal_parse(str, (size_t)len, out);
 }

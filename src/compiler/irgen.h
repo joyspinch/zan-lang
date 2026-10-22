@@ -732,6 +732,9 @@ int zan_irgen_shard_run(zan_irgen_t *g, const zan_cg_manifest_t *m,
 
 void zan_irgen_bind_target(zan_irgen_t *g);
 zan_status_t zan_irgen_create_target_machine(zan_irgen_t *g, LLVMTargetMachineRef *out_tm);
+/* 注册本机构建链接进来的 LLVM 后端。crosscomp.c 查"这个 triple 能不能发码"
+   之前必须先调它：后端没注册时 LLVMGetTargetFromTriple 对所有目标都返回失败。 */
+void zan_irgen_init_llvm_targets(void);
 
 /* DllImport 外部库符号列表（用于跨平台链接检测） */
 int zan_irgen_stub_extern_lib(zan_irgen_t *g, const char *lib, int lib_len);

@@ -56,7 +56,9 @@ bool          zan_decimal_lte(zan_decimal_t a, zan_decimal_t b);
 bool          zan_decimal_gt(zan_decimal_t a, zan_decimal_t b);
 bool          zan_decimal_gte(zan_decimal_t a, zan_decimal_t b);
 
-/* 导出给编译器后端生成的运行时外部符号（指针形参规避全平台 16 字节结构体传参 ABI 歧义） */
+/* 导出给编译器后端生成的运行时外部符号（指针形参规避全平台 16 字节结构体传参 ABI 歧义）。
+   长度/容量一律用 int64_t：编译器后端按 Zan 的 long（恒 64 位）发出调用，而 size_t
+   在 wasm32 上是 32 位，会造成签名不匹配（wasm-ld: function signature mismatch）。 */
 void          __zan_decimal_add(const zan_decimal_t *a, const zan_decimal_t *b, zan_decimal_t *out);
 void          __zan_decimal_sub(const zan_decimal_t *a, const zan_decimal_t *b, zan_decimal_t *out);
 void          __zan_decimal_mul(const zan_decimal_t *a, const zan_decimal_t *b, zan_decimal_t *out);
@@ -69,8 +71,8 @@ void          __zan_decimal_from_uint64(uint64_t val, zan_decimal_t *out);
 void          __zan_decimal_from_double(double val, zan_decimal_t *out);
 int64_t       __zan_decimal_to_int64(const zan_decimal_t *a);
 double        __zan_decimal_to_double(const zan_decimal_t *a);
-int32_t       __zan_decimal_to_string(const zan_decimal_t *a, char *buf, size_t buf_size);
-bool          __zan_decimal_parse(const char *str, size_t len, zan_decimal_t *out);
+int32_t       __zan_decimal_to_string(const zan_decimal_t *a, char *buf, int64_t buf_size);
+bool          __zan_decimal_parse(const char *str, int64_t len, zan_decimal_t *out);
 
 #ifdef __cplusplus
 }

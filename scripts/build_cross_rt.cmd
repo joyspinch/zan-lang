@@ -81,6 +81,9 @@ set IOSHDR=%ZROOT%lib\libc\include\any-macos-any
 "%ZIG%" cc -target aarch64-ios.14.0 -I "%IOSHDR%" -g0 -DZAN_IO_STACKLESS_ONLY -DZAN_CO_DRIVER -fPIC -I %RT% -O2 -c %RT%\rt_io.c -o toolchain\ios\arm64\zanrt_io_mt.o || exit /b 1
 "%ZIG%" cc -target aarch64-ios.14.0 -I "%IOSHDR%" -g0 -std=c11 -fPIC -I %RT% -O2 -c %RT%\rt_sync.c  -o toolchain\ios\arm64\zanrt_sync.o  || exit /b 1
 "%ZIG%" cc -target aarch64-ios.14.0 -I "%IOSHDR%" -g0 -std=c11 -fPIC -I %RT% -O2 -c %RT%\rt_file.c  -o toolchain\ios\arm64\zanrt_file.o  || exit /b 1
+rem 128-bit Decimal runtime: programs that reach System.Numerics reference
+rem __zan_decimal_*, and the iOS link injects this object for them.
+"%ZIG%" cc -target aarch64-ios.14.0 -I "%IOSHDR%" -g0 -std=c11 -fPIC -I %RT% -O2 -c %RT%\rt_decimal.c -o toolchain\ios\arm64\zanrt_decimal.o || exit /b 1
 "%ZIG%" cc -target aarch64-ios.14.0 -I "%IOSHDR%" -g0 -std=c11 -fPIC -I %RT% -O2 -c %RT%\rt_timer.c -o toolchain\ios\arm64\zanrt_timer.o || exit /b 1
 rem Crypto as an archive member -- see the linux block above for why.
 "%ZIG%" cc -target aarch64-ios.14.0 -I "%IOSHDR%" -g0 -std=c11 -fPIC -I %RT% -O2 -c %RT%\rt_hw_accel.c -o toolchain\ios\arm64\zan_crypto.o || exit /b 1
@@ -106,6 +109,9 @@ rem It defines the __cpp_exception tag and __cxa_throw for try/catch programs
 rem (main.c links it only when wasm_eh_used).
 if not exist toolchain\wasm32 mkdir toolchain\wasm32
 "%ZIG%" cc -target wasm32-wasi -g0 -std=c11 -I %RT% -O2 -c %RT%\rt_file.c  -o toolchain\wasm32\zanrt_file.o  || exit /b 1
+rem 128-bit Decimal runtime: programs that reach System.Numerics reference
+rem __zan_decimal_*, and the wasm link injects this object for them.
+"%ZIG%" cc -target wasm32-wasi -g0 -std=c11 -I %RT% -O2 -c %RT%\rt_decimal.c -o toolchain\wasm32\zanrt_decimal.o || exit /b 1
 "%ZIG%" cc -target wasm32-wasi -g0 -std=c11 -I %RT% -O2 -c %RT%\rt_timer.c -o toolchain\wasm32\zanrt_timer.o || exit /b 1
 rem Crypto as an archive member -- see the linux block above for why.
 "%ZIG%" cc -target wasm32-wasi -g0 -std=c11 -I %RT% -O2 -c %RT%\rt_hw_accel.c -o toolchain\wasm32\zan_crypto.o || exit /b 1

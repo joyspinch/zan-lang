@@ -1,5 +1,6 @@
 
 #include "crosscomp.h"
+#include "irgen.h"
 #include <llvm-c/Core.h>
 #include <llvm-c/Target.h>
 #include <llvm-c/TargetMachine.h>
@@ -28,9 +29,32 @@ static const zan_target_info_t s_targets[] = {
 
 #define NUM_TARGETS (int)(sizeof(s_targets) / sizeof(s_targets[0]))
 
+/* 这个 zanc 链接进来的 LLVM 只带一部分后端（mozbuild 的 clang 没有 RISC-V
+   后端），而 s_targets 是写死的表。表里有、但本机构建发码不了的目标不能出现在
+   --list-targets 里，也不能接下 --target：否则用户拿到的错误是一句笼统的
+   "code generation failed"，根因（缺 LLVM 后端）被埋在后面。
+   判定用 LLVM 自己那张注册表，链接了带 RISC-V 后端的 LLVM 时这些目标照旧可用。 */
+static bool target_supported(const char *triple) {
+    /* 后端没注册时 LLVMGetTargetFromTriple 对所有 triple 都失败，注册先做。 */
+    zan_irgen_init_llvm_targets();
+    LLVMTargetRef t = NULL;
+    char *error = NULL;
+    if (LLVMGetTargetFromTriple(triple, &t, &error) != 0) {
+        if (error) LLVMDisposeMessage(error);
+        return false;
+    }
+    return true;
+}
+
 int zan_target_list(const zan_target_info_t **out) {
-    *out = s_targets;
-    return NUM_TARGETS;
+    static zan_target_info_t filtered[NUM_TARGETS];
+    int n = 0;
+    for (int i = 0; i < NUM_TARGETS; i++) {
+        if (!target_supported(s_targets[i].triple)) continue;
+        filtered[n++] = s_targets[i];
+    }
+    *out = filtered;
+    return n;
 }
 
 static zan_arch_t parse_arch(const char *s) {
@@ -66,6 +90,9 @@ static zan_abi_t parse_abi(const char *s, zan_os_t os) {
 bool zan_target_parse(const char *triple_str, zan_target_t *out) {
     memset(out, 0, sizeof(*out));
 
+    char asked[64];
+    snprintf(asked, sizeof(asked), "%s", triple_str);
+
     for (int i = 0; i < NUM_TARGETS; i++) {
         if (strcmp(triple_str, s_targets[i].name) == 0) {
             triple_str = s_targets[i].triple;
@@ -75,6 +102,13 @@ bool zan_target_parse(const char *triple_str, zan_target_t *out) {
 
     strncpy(out->triple, triple_str, sizeof(out->triple) - 1);
     out->triple[sizeof(out->triple) - 1] = '\0';
+    if (!target_supported(out->triple)) {
+        fprintf(stderr,
+                "error: this zanc build has no LLVM backend for target '%s' "
+                "(triple '%s'); it cannot emit code for it\n",
+                asked, out->triple);
+        return false;
+    }
     out->arch = parse_arch(triple_str);
     out->os = parse_os(triple_str);
     out->abi = parse_abi(triple_str, out->os);

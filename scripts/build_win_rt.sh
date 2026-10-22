@@ -4,8 +4,8 @@
 #
 # The objects zanc builds for itself are host-arch, so a cross-link needs the
 # target's own copies; they sit next to the bundled mingw runtime, at
-# toolchain/win-<arch>/zanrt_{io,io_mt,sync,timer}.o, and are staged beside zanc by
-# CMake (build/win-<arch>/) and by scripts/publish_ide.ps1.
+# toolchain/win-<arch>/zanrt_{io,io_mt,sync,file,decimal,timer}.o, and are staged
+# beside zanc by CMake (build/win-<arch>/) and by scripts/publish_ide.ps1.
 #
 #   scripts/build_win_rt.sh <win-arm64|win-x64> [cc]
 #
@@ -28,6 +28,9 @@ mkdir -p "$OUT"
     -o "$OUT/zanrt_io_mt.o"
 "$CC" -O2 -g0 -std=c11 -I "$RT" -c "$RT/rt_sync.c" -o "$OUT/zanrt_sync.o"
 "$CC" -O2 -g0 -std=c11 -I "$RT" -c "$RT/rt_file.c" -o "$OUT/zanrt_file.o"
+# 128-bit Decimal runtime: programs that reach System.Numerics reference
+# __zan_decimal_* and the cross link injects this object for them.
+"$CC" -O2 -g0 -std=c11 -I "$RT" -c "$RT/rt_decimal.c" -o "$OUT/zanrt_decimal.o"
 # Every emitted program calls zan_timer_* from its inline coroutine driver, so a
 # cross-link needs this object unconditionally (see main.c).
 "$CC" -O2 -g0 -std=c11 -I "$RT" -c "$RT/rt_timer.c" -o "$OUT/zanrt_timer.o"
@@ -50,4 +53,4 @@ rm -f "$OUT/libzancrypto.a"
     -DMINIZ_NO_ARCHIVE_APIS -DMINIZ_NO_ZIP_APIS -DMINIZ_NO_STDIO \
     -DMINIZ_NO_TIME -DMINIZ_NO_ARCHIVE_WRITERS \
     -I "$ROOT/src/common" -c "$RT/zan_inflate.c" -o "$OUT/zan_inflate.o"
-echo "built toolchain/$SUB: zanrt_io.o zanrt_io_mt.o zanrt_sync.o zanrt_file.o zanrt_timer.o libzancrypto.a zan_embed_api.o zan_inflate.o"
+echo "built toolchain/$SUB: zanrt_io.o zanrt_io_mt.o zanrt_sync.o zanrt_file.o zanrt_decimal.o zanrt_timer.o libzancrypto.a zan_embed_api.o zan_inflate.o"

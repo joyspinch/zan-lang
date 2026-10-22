@@ -903,3 +903,83 @@
   （保持宽松）。修好之后固定点门恢复，A445 才能拿到"自举侧自举一致"的背书。
 - 关联：A445（本轮 A445 的验证被这条挡在固定点门外，差分门已过）。
 
+### [~] A501 跨目标全量扫描：13 个目标的 console 与 GUI 交叉链接体检
+
+- 起因（2026-10-22）：被问"跨平台交叉编译现在都是全绿的吗"。此前只逐个目标试过
+  单个程序，没有**全目标 × 多特性**的扫描，于是漏掉的东西整整一批。
+- 扫描装置（`_scratch/xsweep/`，一次性）：3 个 console 探针（hello / crypto /
+  decimal）+ 1 个 GUI 探针（GUI + decimal）× 13~16 个目标，逐个记录链接返回码、
+  `.text` 与 `zan_hw_*` 符号数。**探针必须按特性选**：只跑 console 探针的话，
+  iOS（GUI-only）与 GUI 目标专属的注入路径一条都照不到。
+- 扫描暴露并已修掉的缺陷（五个，各有独立根因）：
+  - `src/compiler/main.c`：交叉路径复用 `rt_crypto_buf` 这块**共享缓冲区**，
+    归档找不到时仍留着指向它的指针 → 链接器拿到一个不存在的交叉路径
+    （android/ios 直接报错）。改为交叉分支**无条件赋值**
+    （`zan_file_exists(...) ? buf : NULL`），原生分支加 `if (!cross_compiling)`。
+  - **wasm32 的链接分支根本没注入 decimal 运行时**：别的目标都有
+    `if (irgen.uses_decimal_runtime)` 注入 `zanrt_decimal.o`，wasm 没有 →
+    任何用 `System.Decimal` 的 wasm 程序链接期报一串
+    `undefined symbol: __zan_decimal_*`。已补注入 + 补对象
+    （`toolchain/wasm32/zanrt_decimal.o`）。
+  - `src/runtime/rt_decimal.{c,h}`：对外 ABI 用了 `size_t`（长度/容量），
+    而编译器后端按 Zan 的 `long`（**恒 64 位**）发调用 → wasm32 上 `size_t` 是
+    32 位，`wasm-ld` 报 *function signature mismatch*（链接过了，模块运行时坏）。
+    改为定宽 `int64_t`（其余 `__zan_decimal_*` 早就是定宽的）。
+  - **ohos / win / ios / wasm 目标缺 `zanrt_decimal.o`**：decimal 运行时当初只补了
+    macOS/Android/linux，用 `System.Decimal` 的交叉程序在这些目标上链接红。
+  - `toolchain/ohos-{x64,arm64}/zanrt_sync.o` 停在 **10-05**，比 `rt_sync.c` 老，
+    缺 `zan_ui_thread_set` → OHOS 的 **GUI** 程序链接红（console 程序照不到）。
+    已用 zig 按 `build_ohos_rt_zig.sh` 的配方重出。
+- 顺带修掉的**自相矛盾**：`zanc --list-targets` 是一张写死的表，把本机构建
+  **发不了码**的目标也 advertise 出去（mozbuild LLVM 没有 RISC-V 后端，
+  `zanc --target riscv64` 只会得到一句笼统的 "code generation failed"）。
+  现在按 **LLVM 自己的注册表**过滤：目标表里没有的 triple 不出现在列表里，
+  `--target` 直接点名"这个构建没有该 triple 的 LLVM 后端"（链接了带 RISC-V
+  后端的 LLVM 时这些目标照旧可用）。后端注册要先做
+  （`zan_irgen_init_llvm_targets()` 从 irgen_emit.c 提成对外函数），
+  否则查表时注册表是空的，会把**所有**目标都判成不可用。
+- 现在的体检结论：13 个目标 × console 全绿；GUI 探针 9 绿 4 红（红的是
+  android-x64 与 ohos 两个平台，原因见 A502 / A503）。
+- 关联：A493（归档成员机制）、A502、A503、A499。
+
+### [ ] A502 `toolchain/android-x64/zanrt_sync.o` 停在 10-05——GUI 交叉链接缺 `zan_ui_thread_set`
+
+- 现象（2026-10-22 A501 扫描）：`--target android-x64` 链接 GUI 程序报
+  `undefined symbol: zan_ui_thread_set`（引用方是用户对象里的
+  `Gui_Dispatcher_Init`）。同一目标 android-arm64 **是绿的**。
+- 根因：两个 arch 的 `zanrt_sync.o` 不是同一代——arm64 是 10-12 重出的（有
+  `zan_ui_thread_set`），**x64 还是 10-05 的旧对象**（只有 `zan_dispatch_*`）。
+  `zan_ui_thread_set` 是后来加进 `rt_sync.c` 的，旧对象里没有。
+- 为什么本机修不了：android 的运行时对象要用 **Android NDK** 的 clang 编
+  （bionic），zig 没有 bionic target，本机也没有 NDK
+  （`toolchain/android-*/` 只提交了 sysroot 的**库**子集，bionic 头文件没提交）。
+  `build_cross_rt.cmd` 的 android 块已经把 `rt_sync.c` 排在重建序列里，
+  有 NDK 的人跑一次即可。
+- 方向：在有 NDK 的机器上跑 `scripts\build_cross_rt.cmd` 重出 android-x64 的
+  `zanrt_sync.o`（连同 `zanrt_timer.o` / `libzancrypto.a`，见 A493 的尾巴）。
+- 关联：A501（A501 扫描发现的第一个"对象比源码旧"的实例）、A493。
+
+### [ ] A503 OHOS 的 GUI 交叉链接缺 EGL/GLES 符号——预编译驱动直连 GL，静态链接无处可解
+
+- 现象（2026-10-22 A501 扫描）：`--target ohos-x64` / `ohos-arm64` 链接 GUI
+  程序报一串 `undefined symbol: eglMakeCurrent / eglDestroySurface /
+  glCreateShader / glShaderSource / glCompileShader ...`，引用方是
+  `packages/Zan.Gui/src/Gui/drivers/ohos-<arch>/static/libzan_gui.a` 里的
+  `zan_gui_present`。
+- 根因：OHOS 的 GUI 驱动是**预编译产物**（仓库里只有 `.a`/`.so`，没有源码），
+  它**直接调用** EGL/GLES 的函数；而 OHOS 的链接是**全静态**
+  （`ld.lld -static ... libc.a libunwind.a libclang_rt.builtins.a`），
+  链上**根本没有** `libEGL` / `libGLESv3`。
+  `toolchain/ohos-*/libEGL.so` / `libGLESv3.so` 是两个**空壳**（只记录
+  DT_NEEDED，导出 0 个符号），而且它们**不在** OHOS 的静态链接行上
+  （只在 android 的 `-shared` 分支里被引用）——原设计假设驱动是 `dlopen` 出来
+  的，这个假设与实际产物不符。
+- 为什么本机修不了：要么改驱动（改成 dlopen 解析 EGL/GLES）——**没有源码**；
+  要么在链接侧提供 GL 符号（让空壳导出 egl*/gl*）——那会让空壳在真机上**顶替**
+  系统的真库（除非真机侧不把空壳打进包里），是运行时正确性的取舍，不该顺手定。
+- 方向：① 找回 OHOS GUI 驱动的源码并改成 dlopen 路径（与空壳的原设计一致）；
+  ② 或让 OHOS 链接带上真机 SDK 的 EGL/GLES 静态库。二者都需要 OHOS 侧资产，
+  本机没有。
+- 关联：A501（A501 扫描发现的第二个"设计假设与产物不符"的实例）、A502。
+
+

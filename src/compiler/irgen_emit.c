@@ -3018,7 +3018,7 @@ static LLVMValueRef w32_build_adapter(zan_irgen_t *g, const char *name,
 }
 
 /* 初始化every target family the build links (see CMakeLists */
-static void zan_init_llvm_targets(void) {
+void zan_irgen_init_llvm_targets(void) {
     LLVMInitializeX86TargetInfo();
     LLVMInitializeX86Target();
     LLVMInitializeX86TargetMC();
@@ -3144,12 +3144,12 @@ static zan_status_t zan_bind_target_layout(zan_irgen_t *g,
 }
 
 void zan_irgen_bind_target(zan_irgen_t *g) {
-    zan_init_llvm_targets();
+    zan_irgen_init_llvm_targets();
     zan_bind_target_layout(g, NULL);
 }
 
 zan_status_t zan_irgen_create_target_machine(zan_irgen_t *g, LLVMTargetMachineRef *out_tm) {
-    zan_init_llvm_targets();
+    zan_irgen_init_llvm_targets();
     return zan_bind_target_layout(g, out_tm);
 }
 
@@ -3304,7 +3304,7 @@ zan_status_t zan_irgen_write_obj(zan_irgen_t *g, const char *path) {
             LLVMSetValueName2(mainf, "zan_user_main", strlen("zan_user_main"));
         }
     }
-    zan_init_llvm_targets();
+    zan_irgen_init_llvm_targets();
 
     if (g->obfuscate_strings /* publish */ && !g->target_is_macos && !g->target_is_ios && !g->target_is_wasm) {
         for (LLVMValueRef fn = LLVMGetFirstFunction(g->mod); fn;
