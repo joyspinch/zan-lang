@@ -1724,6 +1724,17 @@ static void emit_user_method_bodies(zan_irgen_t *g, method_body_work_t *work,
                        type_sym->type->base_type->sym) {
                 target_sym = type_sym->type->base_type->sym;
             }
+            /* C# 顺序（A516）：派生字段初始化器先于基类构造链——
+             * 基类构造器里的虚调用因此能读到派生内联字段（C# 42，曾 0）。
+             * this 链（: this(...)）不在此发：由链目标那个构造器统一发。 */
+            if (!this_init) {
+                LLVMValueRef thisv_f = LLVMBuildLoad2(
+                    g->builder, param_types[0], this_alloca, "this.fields");
+                zan_type_t *recv_type_f =
+                    g->cur_inst ? g->cur_inst : type_sym->type;
+                emit_decl_field_initializers(
+                    g, type_sym, recv_type_f, thisv_f, locals);
+            }
             if (target_sym) {
                 zan_ast_list_t *init_args = zan_ast_method_base_args(member);
                 struct zan_ctor_entry *target = find_ctor(
@@ -1789,15 +1800,14 @@ static void emit_user_method_bodies(zan_irgen_t *g, method_body_work_t *work,
             if (!this_init) {
                 LLVMValueRef thisv = LLVMBuildLoad2(
                     g->builder, param_types[0], this_alloca, "this.fields");
-                zan_type_t *recv_type = g->cur_inst ? g->cur_inst : type_sym->type;
                 zan_type_t *base_type = type_sym->type
                     ? type_sym->type->base_type : NULL;
                 if (base_type && base_type->sym && !initializer_target_called) {
+                    /* 基类构造链没接上（没找到可调的基类构造器）时兜底发
+                     * 基类字段初始化；正常路径基类构造器自己的 prologue 会发。 */
                     emit_implicit_field_initializers(
                         g, base_type->sym, base_type, thisv, locals);
                 }
-                emit_decl_field_initializers(
-                    g, type_sym, recv_type, thisv, locals);
             }
         }
 

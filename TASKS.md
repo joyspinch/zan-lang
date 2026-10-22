@@ -105,9 +105,14 @@
 - 方向：cond-br + phi 合流。
 - 探针：`_scratch/csaudit/operators/p08_nullish.zan`。
 
-### [ ] A516 构造顺序与 C# 分叉：基类构造先于派生字段初始化器
-- 实测 `b-init / base-ctor / d-init / derived-ctor`；C# 是**派生字段初始化器最先**（d-init → b-init → base-ctor → derived-ctor）。直接后果：基类构造器里的虚调用读派生内联字段得默认值（实测 `derived:0`，C# `derived:42`）。静默错值。
-- 根因落点：`src/compiler/irgen.c` 构造器发射顺序。
+### [~] A516 构造顺序与 C# 分叉：基类构造先于派生字段初始化器
+- **宿主侧已修（2026-10-23）**：构造器 prologue（irgen_emit.c）把本类字段初始化器
+  挪到基类构造链调用之前（this 链仍由链目标构造器统一发）。探针复验：
+  `d-init → b-init → base-ctor → derived-ctor`（原 `b-init / base-ctor / d-init /
+  derived-ctor`）；基类构造器里的虚调用读到派生内联字段 42（原 0）。
+- 待办：自举半边（`src/selfhost/irgen.zan` 在途窗口）。
+- 实测曾为 `b-init / base-ctor / d-init / derived-ctor`；C# 是**派生字段初始化器最先**（d-init → b-init → base-ctor → derived-ctor）。直接后果：基类构造器里的虚调用读派生内联字段得默认值（实测 `derived:0`，C# `derived:42`）。静默错值。
+- 根因落点：`src/compiler/irgen_emit.c` 构造器 prologue 顺序（非 irgen.c）。
 - 探针：`_scratch/csaudit/objectmodel/{p02_ctor_chain,p03_ctor_virtual}.zan`。
 
 ### [ ] A517 析构器 `~X()` 是死语法：解析/检查过、从不发射、从不调用
@@ -1255,3 +1260,26 @@
   显示出来并给一键重连）。
 - 坑出处：探针的等待时长必须按被测服务端的**实测**耗时定——本轮最初按 10 s
   等，真实冷启动 13 s，直接判成假失败。
+
+### [ ] A528 结构体构造函数抛异常时，结构体里 RC 字段的引用没人释放
+
+- 现象：`struct` 的构造函数把拥有型对象存进字段后抛异常，`--check-leaks` 报
+  「2 object(s) leaked, allocated at ... [List<int>]」——字段持有的引用既没被
+  结构体释放（结构体没有析构），也没被展开器释放。
+- 判据（最小复现 `_scratch/struct_field_probe.zan`）：
+  - 构造函数在**写字段之前**抛 → 干净（实参里的临时量由展开器释放，这条已修）；
+  - 构造函数在**写字段之后**抛 → 每个字段漏一个对象；
+  - 类路径同样形状 → 干净（类的对象析构会释放字段）。
+- 根因：类构造路径（`src/compiler/irgen_expr.c` 的 `emit_expr_new_expr`）把
+  对象推进 EH 临时栈，展开器释放对象时连带释放它的字段；结构体构造路径
+  （`src/compiler/irgen_stmt.c`）只在栈上分配结构体（alloca），EH 栈里
+  **没有**这个结构体的位置——展开器无从知道该释放哪些字段。
+- 方向：展开器的槽类型目前只有 OBJ / STR / DLG / ARR（`ZAN_EH_SLOT_*`），
+  都是"释放一个对象"。要兜住结构体字段，得加一种"释放一组字段引用"的槽
+  （或让结构体构造路径在栈上留一条展开器认得的清理记录）。这是展开器协议
+  级的改动，比实参临时量那一条大不少，单独立项。
+- 关联：本轮已修的邻近缺口——构造函数**实参**里的拥有型临时量没登记进 EH
+  临时栈，构造函数一抛就泄漏（类路径 `irgen_expr.c` 与结构体路径
+  `irgen_stmt.c` 两条都修，conformance `arc_throw_owned_ctor_arg`）。
+- 坑出处：结构体没有析构这件事，被类路径"对象析构顺带释放字段"盖住了——
+  同一个形状换个载体就漏，测的时候必须把类与结构体分开测。
