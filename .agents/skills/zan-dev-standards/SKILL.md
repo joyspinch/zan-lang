@@ -1292,7 +1292,7 @@ description: Zan 开发规范总纲——可落地的标准与纪律，供 AI �
   而且公共包一改副本就漂移——副本没有让共享状态消失，只是把它藏起来了，漂移
   照旧。**共享资源冲突时的正确动作是等，不是复制一份。**
   坑出处：一次 15 worker 并发，多出 2.7 GB 重复构建树 + 一个 247 MB 仓库副本
-  （`D:\project\games\goldminer\build\zan-pkgs`，detached HEAD 停在旧 commit），
+  （某游戏仓的 `build/zan-pkgs`，detached HEAD 停在旧 commit），
   而公共包仍旧不同步。
 - **公共包不要用 worktree 副本**（`git worktree add` 出来的"干净副本"）：它与主
   仓库天然漂移，且规则 9 禁分支。直接用主仓库 `packages/`，编译时
