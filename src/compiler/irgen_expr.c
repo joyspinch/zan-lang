@@ -10847,6 +10847,10 @@ static LLVMValueRef emit_wasm_cb_thunk(zan_irgen_t *g, LLVMValueRef fn) {
     return thunk;
 }
 
+static int type_is_or_derives(zan_type_t *s, zan_type_t *t);
+static LLVMValueRef emit_runtime_is_check_name(zan_irgen_t *g, LLVMValueRef x,
+                                               zan_type_t *tt);
+
 static LLVMValueRef emit_expr_cast_expr(zan_irgen_t *g, zan_ast_node_t *expr,
         local_scope_t *locals) {
         zan_type_t *tt0 = resolve_type_ctx(g, expr->cast.type);
@@ -10923,6 +10927,52 @@ static LLVMValueRef emit_expr_cast_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                 break;
             }
         }
+        /* 引用下转的运行时类型检查（TASKS.md A509）：引用→引用曾直接返回
+         * 原值——失败的下转把 string 指针当 User 用（静默类型混淆）。
+         * 必须放在 `src == target` 早退之前：LLVM 不透明指针下所有指针
+         * 同型（ptr），那道等值检查对引用恒真。
+         * C# 抛 InvalidCastException（可 catch）；catchable 通道落地前
+         * （A507 族）用软诊断 + 安全值 null：stderr 一次、值变 null、继续，
+         * --strict-runtime 下 exit 70。静态可证安全的上转/同型/object 不查。 */
+        if (LLVMGetTypeKind(src) == LLVMPointerTypeKind &&
+            LLVMGetTypeKind(target) == LLVMPointerTypeKind && tt) {
+            bool ref_target = tt->kind == TYPE_CLASS ||
+                tt->kind == TYPE_INTERFACE || tt->kind == TYPE_STRING ||
+                tt->kind == TYPE_ARRAY || tt->kind == TYPE_OBJECT;
+            if (ref_target) {
+                zan_type_t *st2 = infer_expr_type(g, expr->cast.expr, locals);
+                bool static_ok = !st2 || st2->kind == TYPE_ERROR ||
+                    types_equal(st2, tt) || type_is_or_derives(st2, tt) ||
+                    tt->kind == TYPE_OBJECT;
+                if (!static_ok) {
+                    LLVMValueRef cfn = LLVMGetBasicBlockParent(
+                        LLVMGetInsertBlock(g->builder));
+                    LLVMValueRef ok = emit_runtime_is_check_name(g, val, tt);
+                    LLVMBasicBlockRef cast_ok = LLVMGetInsertBlock(g->builder);
+                    LLVMBasicBlockRef cast_bad = LLVMAppendBasicBlockInContext(
+                        g->ctx, cfn, "cast.bad");
+                    LLVMBasicBlockRef cast_m = LLVMAppendBasicBlockInContext(
+                        g->ctx, cfn, "cast.m");
+                    LLVMBuildCondBr(g->builder, ok, cast_m, cast_bad);
+                    LLVMPositionBuilderAtEnd(g->builder, cast_bad);
+                    emit_runtime_check(g,
+                        LLVMConstInt(LLVMInt1TypeInContext(g->ctx), 1, 0),
+                        expr->loc,
+                        "InvalidCastException: object is not an instance of the target type");
+                    LLVMBasicBlockRef cast_bad_end =
+                        LLVMGetInsertBlock(g->builder);
+                    LLVMBuildBr(g->builder, cast_m);
+                    LLVMPositionBuilderAtEnd(g->builder, cast_m);
+                    LLVMValueRef rphi = LLVMBuildPhi(g->builder, target,
+                                                     "cast.r");
+                    LLVMValueRef rvals[] = { val, LLVMConstNull(target) };
+                    LLVMBasicBlockRef rbbs[] = { cast_ok, cast_bad_end };
+                    LLVMAddIncoming(rphi, rvals, rbbs, 2);
+                    return rphi;
+                }
+            }
+        }
+
         if (src == target) return val;
 
         /* decimal 显式强转支持（整型与浮点型互转） */

@@ -39,11 +39,18 @@
 - 根因落点：`src/compiler/irgen_expr.c` ~7571-7596（Dict 索引读取 miss 直接走零值路径）。TryGetValue/ContainsKey 是正确出口。
 - 探针：`_scratch/csaudit/collections/p06_dict_missing.zan`、`exceptions/p11_dictmiss.zan`。
 
-### [ ] A509 失败下转静默类型混淆（无 InvalidCastException）
-- 现象：`(string)userObj`（object 装 User）得**空字符串**；`(User)"x"`（object 装 string）得**非 null 的 User 槽**（实为 string 指针）——两边都"成功"，exit=0。C# 抛 InvalidCastException（可 catch）。
-- 根因落点：`src/compiler/irgen_expr.c` `emit_expr_cast_expr`（:10723）对引用→引用无运行时检查分支（:10850-10876 落到 `return val`）；`is` 已有 `emit_runtime_is_check`（:10894）可复用。
-- 方向：引用下转补运行时类型检查，失败走响亮失败/异常路径。
-- 探针：`_scratch/csaudit/types/p09_object_cast.zan`（F6–F10）。
+### [~] A509 失败下转静默类型混淆（无 InvalidCastException）
+- **宿主侧已修最小语义（2026-10-23）**：`emit_expr_cast_expr` 引用→引用且静态
+  判不出安全（同型/上转/object 目标之外）时，复用 `is` 的运行时类型判定
+  （`emit_runtime_is_check_name`）——失败走 `emit_runtime_check` 软诊断
+  （stderr 一次 + 安全值 null + 继续；`--strict-runtime` 下 exit 70）。
+  关键坑：LLVM 不透明指针下 `%User*` 与 `%string*` 同型，检查必须放在
+  `src == target` 早退**之前**，否则永远到不了。
+- 待办：可 catch 的 InvalidCastException 通道（A507 族，deferred）——探针
+  F7/F10 的 throw/catch 断言要等通道落地才能全绿；自举半边。
+- 原始现象：`(string)userObj`（object 装 User）得**空字符串**；`(User)"x"`（object 装 string）得**非 null 的 User 槽**（实为 string 指针）——两边都"成功"，exit=0。C# 抛 InvalidCastException（可 catch）。
+- 根因落点：`src/compiler/irgen_expr.c` `emit_expr_cast_expr` 对引用→引用无运行时检查分支（落到 `return val`）；`is` 已有 `emit_runtime_is_check` 可复用。
+- 探针：`_scratch/csaudit/types/p09_object_cast.zan`（F6–F10）、`v_cast_min.zan`（最小复现：两方向都 null-res + 软诊断 + exit 0）。
 
 ### [ ] A510 整数表达式按 64 位计算、不按声明类型收窄（表达式级溢出不环绕）
 - 现象：`int a=int.MaxValue; WriteLine(a+1)`→2147483648、`a*2`→4294967294、`0u-1u`→18446744073709551615、`long j=i+1`→2147483648、`-8>>>1`→9223372036854775804。C# 全按 32 位环绕。存回 int 变量才截断——传参/打印/加宽路径不收窄。
