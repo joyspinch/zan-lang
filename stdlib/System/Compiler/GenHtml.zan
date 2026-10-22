@@ -45,7 +45,7 @@ public class GenHtml {
             if (DesignerHtml.IsDesignDoc(text)) { continue; }
             WDoc wd = HtmlParser.Parse(text, "");
             StringBuilder outp = new StringBuilder();
-            if (!Emit(name, wd, outp)) {
+            if (!Emit(name, wd, text, outp)) {
                 GenCommon.Fail(reply, "GenHtml: cannot emit '" + name + "'");
                 return;
             }
@@ -53,7 +53,7 @@ public class GenHtml {
         }
     }
 
-    public static bool Emit(string path, WDoc wd, StringBuilder outp) {
+    public static bool Emit(string path, WDoc wd, string text, StringBuilder outp) {
         string cls = ClassName(path);
         if (cls == "") { return false; }
         // 行内 style 预扫：合成 .zgen-N 规则并进 Css 字面量（与运行时
@@ -106,6 +106,25 @@ public class GenHtml {
         if (cssLit == "") { cssLit = "\"\""; }
         GenCommon.Line(b, 1, "public static string Css = " + cssLit + ";");
         GenCommon.Line(b, 1, "");
+        // 文档原文（运行期装载通道用）：同一份 .html 既能编译期建树，
+        // 也能在运行期经 app.LoadHtmlWith(XxxHtml.Doc, null, dir) 重新
+        // 装载——运行期那棵树的样式自动并进 appCss（不必再手工把各
+        // 文档的 Css 拼进同一次 UseAppCss），且能挂模型宿主，绑定
+        // 声明（data-bind / data-if / data-for）照常生效。
+        // 成员名不叫 Html：生成代码里用 `Html.AddChild(...)` 调
+        // Gui.Html 的静态方法，同名成员会把那个名字解析成字符串
+        // 字段（"type 'string' has no method 'AddChild'"）。
+        GenCommon.Line(b, 1, "/// 文档原文（运行期装载通道用）："
+                           + "app.LoadHtmlWith(" + cls + ".Doc, null, baseDir)。");
+        string docLit = "";
+        List<string> chunks = GenHtml.Chunks(text, 3000);
+        for (int i = 0; i < chunks.Count; i = i + 1) {
+            if (i > 0) { docLit = docLit + " + "; }
+            docLit = docLit + "\"" + GenCommon.Esc(chunks[i]) + "\"";
+        }
+        if (docLit == "") { docLit = "\"\""; }
+        GenCommon.Line(b, 1, "public static string Doc = " + docLit + ";");
+        GenCommon.Line(b, 1, "");
         GenCommon.Line(b, 1, "/// 构建树。handlers：data-on-* 注册表"
                            + "（可 null）。\n"
                            + "    public static Control Build("
@@ -126,6 +145,34 @@ public class GenHtml {
         GenCommon.Line(b, 0, "}");
         outp.Append(b.ToString());
         return true;
+    }
+
+    // 按 UTF-8 字符边界把文本切成若干段（每段 <= limit 字节）。
+    // 切点必须落在字符的起始字节上：Zan 的 string 是 UTF-8 字节序列，
+    // 从续字节（10xxxxxx）切开会产出非法片段——中文被劈成两半，装载后
+    // 整段解析失真（看起来像"文档莫名其妙少了几行"）。
+    static List<string> Chunks(string s, int limit) {
+        List<string> parts = new List<string>();
+        if (s == null || s.Length == 0) { return parts; }
+        int n = s.Length;
+        int start = 0;
+        while (start < n) {
+            int end = start + limit;
+            if (end >= n) {
+                end = n;
+            } else {
+                while (end > start && GenHtml.IsContinuation(s[end])) { end = end - 1; }
+            }
+            parts.Add(s.Substring(start, end - start));
+            start = end;
+        }
+        return parts;
+    }
+
+    // UTF-8 续字节（10xxxxxx）。
+    static bool IsContinuation(int b) {
+        int c = b & 255;
+        return c >= 128 && c <= 191;
     }
 
     // 一条记录 = 一个变量的声明 + 属性协议（构造；文本与挂树在
