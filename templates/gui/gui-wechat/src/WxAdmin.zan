@@ -1,0 +1,97 @@
+using System;
+using Gui;
+using Gui.Widget;
+using Gui.Component;
+using Gui.Component.WebView;
+
+/* 管理后台页：把服务端的后台网页（/admin）内嵌进客户端右区。
+ *
+ * 为什么内嵌而不是再做一套原生页：后台是服务端渲染的网页（工作台、
+ * 系统管理、文档中心、备份恢复、AI 助手…），功能面比客户端原生页大
+ * 得多，也不需要两套实现。客户端这边只提供「一个能装下网页的地方」
+ * ——工具条（后退 / 刷新 / 当前地址）+ 铺满余下区域的网页视图。
+ * 网页自己的登录态由后台自己管（后台有独立的 /admin/login）。
+ *
+ * 页面结构在 WxAdmin.html（运行期装载的文档），这里只做三件事：
+ * 装载文档 → 把原生网页视图挂进 #WebHost → 按名字接住工具条事件。
+ *
+ * 降级：机器没装 WebView2 运行时时原生视图造不出来
+ * （WebView.IsSupported false），此时显出一行提示，不留一块黑屏。
+ */
+public class WxAdmin : Control {
+    WebViewBox box;
+    Control addr;
+    Control tip;
+    ModelBinder binder;
+    string url;
+
+    WxAdmin() {
+        this.InitControl("wxadmin", 5);
+        this.Class = "wxmain";
+    }
+
+    // 装配页面（需要 App 才能装载运行期文档）。
+    void Build(App app) {
+        url = WxAdmin.Home();
+        Control ui = app.LoadHtmlWith(WxAdminHtml.Doc, null, "");
+        if (ui == null) {
+            // 装载失败（声明层没装 / 文档为空）：给一棵空树，别把 null
+            // 挂进窗口——后面的 Find 全是空指针。
+            Console.WriteLine("WX_ADMIN: 后台页文档装载失败");
+            return;
+        }
+        ui.DockFill();
+        this.Add(ui);
+
+        // 工具条事件：文档里的 @click="admin-*" 按名字接到这里。
+        binder = new ModelBinder();
+        binder.Handle("admin-back", () => { this.GoBack(); });
+        binder.Handle("admin-reload", () => { this.Reload(); });
+        binder.SetRoot(ui, null);
+        binder.Wire();
+
+        addr = ui.Find("AdminAddr");
+        if (addr != null) { addr.SetProp("text", url); }
+        tip = ui.Find("AdminTip");
+
+        // 网页视图：铺满余下区域（文档里 #WebHost 是 flex-grow 的列）。
+        // 导航在原生视图建出来之前会挂在 WebView 内部（pendingUrl），
+        // 首帧创建时自动消费。
+        Control webHost = ui.Find("WebHost");
+        if (webHost == null) { webHost = ui; }
+        box = new WebViewBox();
+        box.Class = "wxadminweb grow";
+        webHost.Add(box);
+        box.Navigate(url);
+
+        ModelHosts.Register(app, binder);
+    }
+
+    // 后台首页：跟服务端同一个连接目标（登录页可改主机/端口）。
+    static string Home() {
+        return "http://" + WxNet.Host() + ":" + Convert.ToString(WxNet.Port())
+            + "/admin";
+    }
+
+    // 进页：原生视图第一帧才建（IsSupported 在那之后才准），因此这里
+    // 决定「显示网页还是显示提示」，地址条也跟着真实 URL 走。
+    void OnShow() {
+        if (box == null) { return; }
+        bool ok = box.View().IsSupported();
+        box.visible = ok;
+        if (tip != null) { tip.visible = !ok; }
+        if (addr == null) { return; }
+        string u = box.CurrentUrl();
+        if (u != "") { addr.SetProp("text", u); }
+    }
+
+    void GoBack() {
+        if (box == null) { return; }
+        box.Back();
+    }
+
+    void Reload() {
+        if (box == null) { return; }
+        box.Reload();
+    }
+}
