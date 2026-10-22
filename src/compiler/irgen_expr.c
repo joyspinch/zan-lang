@@ -12870,6 +12870,16 @@ static LLVMValueRef emit_lambda_typed(zan_irgen_t *g, zan_ast_node_t *expr,
             result = emit_boundary_coerce(g, result, ret_type);
             LLVMBuildRet(g->builder, result);
         } else {
+            /* 未传期望类型的 lambda（作为实参经 emit_expr 发射，expected=NULL）
+             * 返回契约仍然是「向调用方移交 +1 强引用」：调用点按拥有临时对待
+             * 委托返回值（用完即释放），这里不补 retain 的话，共享捕获的
+             * 字符串/集合会被过度释放——引用计数打穿到不朽标记 -1 掩蔽成
+             * 静默腐败，后续堆块复用后读侧崩溃（for_loopvar_capture 的
+             * 0xC0000005 teardown 即此因）。ret_type 已知时上面的分支已覆盖。 */
+            if (is_rc_managed_type(bty) &&
+                !expr_yields_owned_rc_value(g, expr->lambda.body, &lambda_locals)) {
+                emit_rc_retain_for_type(g, bty, result);
+            }
             result = coerce_to_i64(g, result);
             LLVMBuildRet(g->builder, result);
         }

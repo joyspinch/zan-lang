@@ -1844,8 +1844,10 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
     case AST_FOR_STMT: {
         int for_start = locals->count;
         if (stmt->for_stmt.init) emit_stmt(g, stmt->for_stmt.init, locals);
-        for (int i = for_start; i < locals->count; i++)
-            locals->vars[i].per_iteration = 1;
+        /* C# 的 for 头变量是【共享单变量】：闭包捕获共享同一个存储，循环里
+         * 的写入对先前创建的闭包可见（TASKS.md A519）。曾给捕获打
+         * per_iteration=1（每次迭代快照）——那是 foreach 的 C#5 语义，
+         * 用在 for 上让经典"共享循环计数"模式迁移即错。 */
         int for_body_start = locals->count;
 
         LLVMBasicBlockRef cond_bb = LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "for.cond");
@@ -2898,6 +2900,31 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
         g->finally_loop_base = g->finally_count;
         g->eh_armed_loop_base = g->eh_armed_count;
 
+        /* 计数快照（A521）：C# 在枚举中改动集合抛 InvalidOperationException。
+         * 先把起始计数拍下来，cond 处检测活计数是否变化——变了就软诊断一次
+         * 并终止枚举（--strict-runtime 下 exit 70）。曾每次迭代重读计数：
+         * Add 跟着长（死循环）、Remove 后索引跳元素。 */
+        LLVMValueRef fe_snap_alloc = NULL;
+        if (!fe_enum_ty) {
+            fe_snap_alloc = emit_entry_alloca(g, i64, "fe.snap");
+            LLVMValueRef col0 = col_slot
+                ? LLVMBuildBitCast(g->builder,
+                      LLVMBuildLoad2(g->builder,
+                          LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0),
+                          col_slot, "fe.col"),
+                      list_ptr_ty, "fe.col0")
+                : collection;
+            LLVMValueRef c0;
+            if (fe_array || fe_string) {
+                c0 = fe_len;
+            } else {
+                LLVMValueRef cnt_ptr0 = LLVMBuildStructGEP2(g->builder,
+                    g->list_struct_type, col0, 0, "cnt_ptr");
+                c0 = LLVMBuildLoad2(g->builder, i64, cnt_ptr0, "cnt0");
+            }
+            zan_store_fit(g, c0, fe_snap_alloc);
+        }
+
         LLVMBuildBr(g->builder, cond_bb);
         LLVMPositionBuilderAtEnd(g->builder, cond_bb);
 
@@ -2999,9 +3026,28 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                 count = fe_len;
             }
         } else {
+            /* A521：活计数 != 快照 → 枚举期间集合被改。软诊断一次后终止
+             * 枚举（br end）；--strict-runtime 下 emit_runtime_check 直接
+             * exit 70。计数取快照，Add 不再跟随、Remove 不再跳元素。 */
             LLVMValueRef cnt_ptr = LLVMBuildStructGEP2(g->builder, g->list_struct_type,
                 col_cond, 0, "cnt_ptr");
-            count = LLVMBuildLoad2(g->builder, i64, cnt_ptr, "cnt");
+            LLVMValueRef live = LLVMBuildLoad2(g->builder, i64, cnt_ptr, "cnt");
+            LLVMValueRef snap = LLVMBuildLoad2(g->builder, i64, fe_snap_alloc,
+                                               "fe.snap");
+            LLVMValueRef mutated = zan_icmp(g->builder, LLVMIntNE, live, snap,
+                                            "fe.mut");
+            LLVMBasicBlockRef mut_bb = LLVMAppendBasicBlockInContext(g->ctx, fn,
+                                                                     "fe.mut");
+            LLVMBasicBlockRef iter_bb = LLVMAppendBasicBlockInContext(g->ctx, fn,
+                                                                      "fe.iter");
+            LLVMBuildCondBr(g->builder, mutated, mut_bb, iter_bb);
+            LLVMPositionBuilderAtEnd(g->builder, mut_bb);
+            emit_runtime_check(g,
+                LLVMConstInt(LLVMInt1TypeInContext(g->ctx), 1, 0), stmt->loc,
+                "Collection was modified; enumeration operation may not execute");
+            LLVMBuildBr(g->builder, end_bb);
+            LLVMPositionBuilderAtEnd(g->builder, iter_bb);
+            count = snap;
         }
         LLVMValueRef idx_val = LLVMBuildLoad2(g->builder, i64, idx_alloc, "i");
         LLVMValueRef cmp = zan_icmp(g->builder, LLVMIntSLT, idx_val, count, "fcmp");

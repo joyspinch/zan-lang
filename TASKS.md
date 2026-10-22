@@ -196,9 +196,23 @@
 - 根因落点：checker.c `check_generic_constraints`（:776）只挂 new 表达式（:3194）/var 声明（:3716）/返回类型（:4686）三处，调用解析路径缺失。
 - 探针：`_scratch/csaudit/types/{p12_compile_rejects,p14_method_constraint}.zan`。
 
-### [ ] A519 for 循环变量逐迭代新建（C# 的 for 头变量是共享单变量）
-- 实测 `for:0/1/2`（C# 3/3/3）、闭包内赋值 `10/11/12`（C# 13/23/33）；foreach 每迭代新建与 C#5+ 一致、普通局部捕获一致（plain:9）。比 C# 安全但属未声明差异，C# 经典"共享循环计数"模式迁移即错。
-- 根因落点：irgen for 语句发射（每次迭代实例化循环变量）。
+### [~] A519 for 循环变量逐迭代新建（C# 的 for 头变量是共享单变量）
+- **宿主侧已修（2026-10-23）**：irgen_stmt.c for 发射去掉 `per_iteration=1`
+  ——for 头变量改为整个循环共享一个变量（装箱共享 cell），与 C# 一致；
+  foreach 迭代变量保持每迭代新建（C#5+ 语义）不变。实测：for 闭包 3/3/3、
+  闭包内赋值 13/23/33、foreach a/b/c、读捕获+外部写 plain:9（全对齐 C#）。
+- 金档随语义更新：`for_loopvar_capture.out` 重生成（3/3/3、30/30/30、16、6、
+  aaaa×3、7/8/9），旧金档是逐迭代语义（0/1/2、0/10/20、a/aa/aaa）。
+- 收口用例：`tests/conformance/for_loopvar_write_shared.{zan,out}`
+  （共享变量 + 闭包内赋值 + foreach 对照 + 读捕获对照，stdout 锁 C# 地面真值）。
+- 修复牵出的真 bug（已修，irgen_expr.c）：表达式体 lambda 经 emit_expr 发射时
+  `expected=NULL`，返回契约（向调用方移交 +1 强引用）缺 retain——`() => w`
+  借用返回共享盒里的字符串被调用方过度释放，rc 打穿到 -1（运行时"不朽"
+  标记）掩蔽成静默腐败，后续堆块复用后 0xC0000005 teardown 崩溃
+  （for_loopvar_capture D+E 段最小复现，`_scratch/p_de.zan`）。旧编译器
+  同样有洞，只是分配顺序未踩中；A519 改动扰动堆布局使其现形。修后带守卫
+  构建（-g=check-leaks+arc-guard）stderr 干净。
+- 自举半边待办：selfhost 侧 for 循环变量捕获语义 + lambda 返回契约对齐。
 - 附带文档漂移：SPEC §4.7"只读捕获创建时复制值"与实测（按引用共享）不符。
 - 探针：`_scratch/csaudit/objectmodel/p06_for_capture.zan`。
 
@@ -207,9 +221,20 @@
 - 根因落点：irgen 静态初始化发射（全量前置）。
 - 探针：`_scratch/csaudit/objectmodel/p09_static_init.zan`。
 
-### [ ] A521 foreach 枚举中修改集合静默放行（无失效检测）
-- List 枚举中 Add：跟随 Count 增长继续枚举（真实程序=死循环，实测 count=103/guard=101）；Dict 枚举中 Remove：**静默跳元素**（k1,k2,k3 逐个 Remove → 只访到 k1;k3）。C# 两类都抛 InvalidOperationException。
-- 根因落点：`irgen_stmt.c` foreach 发射（索引式枚举器，无版本号检查）。
+### [~] A521 foreach 枚举中修改集合静默放行（无失效检测）
+- **宿主侧已修（2026-10-23）**：irgen_stmt.c foreach 发射进入循环前把 Count
+  快照进 entry alloca（`fe.snap`），每轮比较活 Count——不一致即打
+  "Collection was modified; enumeration operation may not execute"
+  stderr 诊断（带 file:line）并终止该次枚举（soft 模式继续执行不崩，
+  `--strict-runtime` exit=70），不再跟随 Count 增长死循环/静默跳元素。
+  实测：list 枚举中 Add count=4/guard=1/acc=10；dict 枚举中 Remove
+  count=2/guard=1/acc=k1（旧行为 count=103/guard=101 与静默跳元素）。
+- 收口用例：`tests/conformance/foreach_mutation_guard.{zan,out}`
+  （List/数组/Dict 正向枚举 + 两类变更守卫；金档只锁 stdout，诊断走 stderr）。
+- C# 语义差异保留说明：C# 抛 InvalidOperationException 并回滚枚举位置；
+  Zan 软口径打印诊断后终止该次枚举继续走（strict 口径 fail-fast），行为
+  已声明、防死循环优先。
+- 自举半边待办：selfhost foreach 发射同步补 Count 快照守卫。
 - 探针：`_scratch/csaudit/collections/p07_foreach.zan`。
 
 ### [~] A522 C# 硬错误的三个构造 Zan 放行
