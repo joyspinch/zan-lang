@@ -2431,23 +2431,60 @@ function(zan_uses_gui_driver _src _out)
   endif()
 endfunction()
 
-# 用例不走通用 glob 的三个名字（各自有专属档）。这份名单是 glob 跳过逻辑
+# 用例不走通用 glob 的名字（各自有专属 harness）。这份名单是 glob 跳过逻辑
 # 与"基准文件存在性"守卫的共同真相源：少一处同步，守卫就会误报或漏报。
-set(_conf_skip_cases arc_net_publish genform_click_test embed_compress)
+set(_conf_skip_cases arc_net_publish embed_compress)
+
+# 已知会漏的用例：泄漏是**既有的**（stdlib 层的 ARC 欠账，见 TASKS.md A495），
+# 旧世界里它们只红在 full 档的 leakcheck 孪生档上——那条档是发布门控，没人
+# 常规跑，于是泄漏一直藏着没人看见。合并成一条后泄漏结论进了 standard 档，
+# 所以按仓库既有机制（孪生档的 WILL_FAIL）登记成"预期泄漏"：泄漏报告必须
+# 出现，修好了就翻红提醒把它从名单里拿掉。
+set(_known_leaky
+  closure_cycle_warning
+  designer_html
+  designer_prepared_async
+  game_data_table
+  gui_declarative_html_modern_test
+  null_guard_order
+  oss_storage
+  sse_sink_take_co
+)
+# golden 必须取未插桩普通版的用例：泄漏报告打在 stdout 上，插桩版多一行报告
+# 就比不过 golden（已知会漏的那八条 + arc_leak_site_label），另有插桩自己会改
+# 输出的（它量的是进程内存，插桩的记账把它测的东西搅了——A495 的
+# array_local_free）。
+set(_plain_golden ${_known_leaky} array_local_free arc_leak_site_label)
 
 foreach(_src ${_conf_srcs})
   get_filename_component(_name ${_src} NAME_WE)
-  # arc_net_publish 有专属档（run_arcnet.cmake，--publish + 网静默
-  # 契约，见 3691 行的手工登记），四个 GLOB 孪生档全部跳过它，
-  # 否则 add_test 撞名配置失败。
-  # embed_compress 同理（run_embed_compress.cmake：--embed 压缩烘焙 +
-  # 明文断言 + 净目录运行，手工登记在 arc net 之后）。
-  # genform_click_test 同理：期望输出是 genform_click.out（与
-  # <名>_test.zan 同目录不同名），3043 行的手工登记按真实文件名注册。
+  # arc_net_publish has a hand-written harness (run_arcnet.cmake: --publish
+  # plus the net-silence contract) and embed_compress its own
+  # (run_embed_compress.cmake: --embed baking plus a clean-directory run).
+  # Both are registered further down, and a glob entry would collide with
+  # them.
   if(_name IN_LIST _conf_skip_cases)
     continue()
   endif()
   zan_uses_gui_driver(${_src} _needs_gui_driver)
+  set(_expected ${CMAKE_SOURCE_DIR}/tests/conformance/${_name}.out)
+  # A case that keeps an object alive on purpose needs the leak report to
+  # name its site -- and the report goes to stdout, so such a case takes its
+  # golden from an uninstrumented build (PLAIN_OUT_EXE) and the instrumented
+  # run only supplies the leak verdict.
+  set(_expect_leak_site "")
+  set(_expect_leak "")
+  set(_plain_out_exe "")
+  set(_plain_args "")
+  set(_plain_args_set FALSE)
+  # 泄漏报告打在 stdout 上：这几条用例的 golden 只能取未插桩的普通版。
+  if(_name IN_LIST _plain_golden)
+    set(_plain_out_exe ${CMAKE_BINARY_DIR}/cases/case_plain_${_name}${_exe_ext})
+  endif()
+  # 已知会漏的用例：泄漏结论反过来判（必须有报告）。
+  if(_name IN_LIST _known_leaky)
+    set(_expect_leak TRUE)
+  endif()
   if(_name STREQUAL "server_mvc_timezone")
     set(_extra_args
       "${CMAKE_SOURCE_DIR}/packages/Zan.Mvc/src/ZanWeb/Framework/Fmt.zan")
@@ -2491,6 +2528,35 @@ foreach(_src ${_conf_srcs})
     # 驱动参数要一起给）。
     set(_extra_args
       "--embed;${CMAKE_SOURCE_DIR}/tests/conformance/game_ckit_backdrop_assets=ckitfx${_gui_driver_tail}")
+  elseif(_name STREQUAL "game_ckit_slice")
+    # 九宫格夹具是 20x20 PNG（四角 2x2 异色 + 中央 12x12 青 + 边条紫），
+    # 内嵌为 "ckitslicefx/src.png"：盘上没有这个路径，用例走 File.ReadAllBytes
+    # 的内嵌兜底。必须排在 _needs_gui_driver 前面——elseif 链互斥，--embed 与
+    # GUI 驱动参数要一起给（tail 形式：空 list 元素会被 zanc 当成空参数）。
+    set(_extra_args
+      "--embed;${CMAKE_SOURCE_DIR}/tests/conformance/game_ckit_slice_assets=ckitslicefx${_gui_driver_tail}")
+  elseif(_name STREQUAL "genform_click_test")
+    # GenForm declarative column click events: columns[i].click must desugar
+    # into one HitField-filtered CellClick binding; columns without click stay
+    # binding-free. The case resolves the stdlib on its own, so --auto-stdlib
+    # comes next to the GUI driver tail.
+    set(_extra_args "--auto-stdlib${_gui_driver_tail}")
+  elseif(_name STREQUAL "arc_leak_site_label")
+    # Pins leak-report site attribution (A64b): the case keeps one object
+    # alive on purpose and asserts the report names THAT site's own
+    # file:line. -g gives sites their (file, line) key; without it sites
+    # would alias by shape onto the last same-shape allocation again.
+    set(_extra_args "-g")
+    # 站点是那个被有意保活的 Box 的分配点（`Box keep = new Box("keep")`），
+    # 不是保活它的 Task.Spawn 调用点。5cba3586 删掉了用例顶部的模板注释，
+    # 分配点从 20 行挪到 15 行——期望串跟着行号走，别写死成别的行。
+    set(_expect_leak_site "arc_leak_site_label.zan:15:")
+    # The leak report lands on stdout, so the golden has to come from a build
+    # without the instruments -- see _plain_golden above. That build must also
+    # drop -g: the golden was produced without it, and -g changes the report
+    # shape (the site attribution is what -g buys).
+    set(_plain_args "")
+    set(_plain_args_set TRUE)
   elseif(_name STREQUAL "static_publish_tls_stub")
     # The case pins the Windows static-publish stub: DllImport libraries
     # (here ssl/crypto) that resolve to no archive and no shared DLL are
@@ -2513,17 +2579,39 @@ foreach(_src ${_conf_srcs})
   else()
     set(_run_args "")
   endif()
-  add_test(NAME conformance_${_name}
-    COMMAND ${CMAKE_COMMAND}
-      -DZANC=$<TARGET_FILE:zanc>
-      -DSRC=${_src}
-      -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/${_name}.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_${_name}${_exe_ext}
-      -DSTDLIB_STAMP=${_stdlib_stamp}
-      "-DZANC_ARGS=${_extra_args}"
-      "-DRUN_ARGS=${_run_args}"
-      -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
-  # A program and its leakcheck twin are built from the same source, so any
+  # The uninstrumented build that supplies the golden uses the same compile
+  # arguments -- only the instruments are dropped. A case that needs different
+  # ones says so (see arc_leak_site_label above).
+  if(_plain_out_exe AND NOT _plain_args_set)
+    set(_plain_args "${_extra_args}")
+  endif()
+  # One entry, one binary, three verdicts.
+  #
+  # The case used to be registered four times over -- conformance,
+  # determinism, leakcheck, arcguard -- which meant three compiles (plain,
+  # --check-leaks, --arc-guard) and three runs of the same program, and left
+  # three executables behind for every case. The four lenses all read the
+  # same program, so they now share one instrumented build and one run: the
+  # instruments print nothing extra while the program is clean, so the
+  # instrumented stdout is at once the golden comparison, the leak verdict
+  # and the ARC verdict.
+  #
+  # --check-leaks tracks every rc-managed allocation and reports any object
+  # still reachable at exit; --arc-guard stamps a freed object's refcount slot
+  # with a marker instead of letting the block be recycled, and traps any
+  # later retain/release that reaches it. The guard catches the one bug
+  # class refcounting cannot notice on its own: a *missing* retain, where the
+  # counts balance but a reference outlives its object -- the mirror image of
+  # the leak checker's retain-without-release. This is why the pair earns its
+  # runtime: the A53 heap corruption (an RC-managed parameter reassigned in
+  # the callee released the caller's object) ran the plain conformance suite
+  # to a bare STATUS_HEAP_CORRUPTION exit with no output, and in the field
+  # showed up only as misordered `orderby` results. Under the guard the same
+  # program names the fault: "retain through a stale reference (object was
+  # freed: missing retain when stored)", with the object address and the
+  # releasing site.
+  #
+  # A program and its siblings are built from the same source, so any
   # hardcoded listen port (e.g. the async networking conformance tests) is
   # shared between them. Serialize the runnable variants of one source via a
   # per-source resource lock so parallel ctest can't collide on that port.
@@ -2531,8 +2619,37 @@ foreach(_src ${_conf_srcs})
   # milliseconds, so anything past two minutes is a hang (a coroutine parked on
   # a dead socket, a server that never stops). Without it ctest waits out its
   # 1500s default and one hung case alone costs 25 minutes.
-  set_tests_properties(conformance_${_name} PROPERTIES
-    RESOURCE_LOCK src_${_name} TIMEOUT 120)
+  add_test(NAME case_${_name}
+    COMMAND ${CMAKE_COMMAND}
+      -DZANC=$<TARGET_FILE:zanc>
+      -DSRC=${_src}
+      -DEXPECTED=${_expected}
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/case_${_name}${_exe_ext}
+      -DSTDLIB_STAMP=${_stdlib_stamp}
+      "-DZANC_ARGS=${_extra_args}"
+      "-DRUN_ARGS=${_run_args}"
+      "-DEXPECT_LEAK_SITE=${_expect_leak_site}"
+      "-DEXPECT_LEAK=${_expect_leak}"
+      "-DPLAIN_OUT_EXE=${_plain_out_exe}"
+      "-DPLAIN_ZANC_ARGS=${_plain_args}"
+      -P ${CMAKE_SOURCE_DIR}/tests/run_case_modes.cmake)
+  set_tests_properties(case_${_name} PROPERTIES
+    RESOURCE_LOCK src_${_name} TIMEOUT 180)
+  # The determinism lens needs a *second* codegen to compare against, so it
+  # cannot share the run above -- but it shares the source, the arguments and
+  # the stamp directory, and it produces no executable: the verdict is
+  # memoised in a small stamp, so an unchanged (source, compiler, stdlib,
+  # args) tuple is verified once and never again. It stays in the full tier
+  # because verifying it costs two compiles.
+  add_test(NAME case_det_${_name}
+    COMMAND ${CMAKE_COMMAND}
+      -DZANC=$<TARGET_FILE:zanc>
+      -DSRC=${_src}
+      -DSTDLIB_STAMP=${_stdlib_stamp}
+      -DDET_STAMP=${CMAKE_BINARY_DIR}/cases/det/${_name}.stamp
+      "-DZANC_ARGS=${_extra_args}"
+      -P ${CMAKE_SOURCE_DIR}/tests/run_case_modes.cmake)
+  set_tests_properties(case_det_${_name} PROPERTIES TIMEOUT 180)
 endforeach()
 
 # Every globbed conformance case needs its golden <name>.out committed. A
@@ -2585,14 +2702,14 @@ set_tests_properties(conformance_async_finally_ir_scaling PROPERTIES TIMEOUT 360
 # Delay sibling share ONE worker: with the default pool the sibling runs on
 # another worker regardless. Pin the pool down for this one case; every other
 # case keeps the machine-default pool.
-set_tests_properties(conformance_async_preempt_hotloop PROPERTIES
+set_tests_properties(case_async_preempt_hotloop PROPERTIES
   ENVIRONMENT "ZAN_CO_WORKERS=1")
 
 # A470: a synchronous `await Task.Delay` inside an async coroutine occupies
 # the worker thread it runs on. With ONE worker the other coroutine's timer
 # cannot be dispatched until the sync wait ends -- so the case is only
 # observable with a single worker. Pin the pool down for this one case.
-set_tests_properties(conformance_async_sync_delay_timer PROPERTIES
+set_tests_properties(case_async_sync_delay_timer PROPERTIES
   ENVIRONMENT "ZAN_CO_WORKERS=1")
 
 # A470 follow-up: the sync wait runs ready tasks from inside the coroutine,
@@ -2602,14 +2719,14 @@ set_tests_properties(conformance_async_sync_delay_timer PROPERTIES
 # Clobbering it turns Task.Yield into a no-op: the yielder grabs the LIFO
 # cell and queued coroutines stay stuck. The nested run only happens on a
 # worker thread, so pin the pool down to make the case observable.
-set_tests_properties(conformance_async_nested_yield PROPERTIES
+set_tests_properties(case_async_nested_yield PROPERTIES
   ENVIRONMENT "ZAN_CO_WORKERS=1")
 
 # ---- wasm32 try/catch: cross-compile to a linked module --------------------
 # try/catch on wasm32 lowers to WebAssembly exception handling (catchswitch /
 # invoke / __cxa_throw + zanrt_ehtag.o). The suite cannot RUN a wasm module, so
 # this case compiles AND links the program with --target wasm32 and asserts
-# zanc succeeds; runtime semantics are covered by conformance_try_catch running
+# zanc succeeds; runtime semantics are covered by case_try_catch running
 # natively (identical lowering contract, different unwind engine). Guarded on
 # the sysroot being present (fresh clones ship it under toolchain/wasm32).
 if(EXISTS "${CMAKE_SOURCE_DIR}/toolchain/wasm32/libc.a"
@@ -2674,51 +2791,6 @@ if(ZAN_LLVM_OBJDUMP)
   set_tests_properties(codegen_android_x64_baseline PROPERTIES TIMEOUT 120)
 endif()
 
-# ---- Determinism: codegen must be a pure function of the source ----
-# Compiling the same program twice must yield byte-identical LLVM IR
-# (reproducible-build / correctness net).
-foreach(_src ${_conf_srcs})
-  get_filename_component(_name ${_src} NAME_WE)
-  # arc_net_publish 只挂手工档（3696 行），GLOB 孪生档跳过。
-  # embed_compress 同理（run_embed_compress.cmake：--embed 压缩烘焙 + 净目录）。
-  if(_name STREQUAL "arc_net_publish" OR _name STREQUAL "embed_compress")
-    continue()
-  endif()
-  set(_extra_args "")
-  if(_name STREQUAL "server_mvc_timezone")
-    set(_extra_args
-      "${CMAKE_SOURCE_DIR}/packages/Zan.Mvc/src/ZanWeb/Framework/Fmt.zan")
-  elseif(_name STREQUAL "security_cryptography_suite")
-    file(GLOB _sec_crypto_srcs "${CMAKE_SOURCE_DIR}/packages/Zan.Security/src/System/Security/Cryptography/*.zan")
-    set(_extra_args "${_sec_crypto_srcs};--auto-stdlib")
-  elseif(_name STREQUAL "ns_conflict_generic_arity")
-    set(_extra_args
-      "${CMAKE_SOURCE_DIR}/tests/conformance/helpers/ns_conflict_other_action.zan")
-  elseif(_name STREQUAL "file_embed_bytes")
-    set(_extra_args
-      "--embed;${CMAKE_SOURCE_DIR}/tests/conformance/embed_assets=assets")
-  elseif(_name STREQUAL "file_embed_subdir")
-    set(_extra_args
-      "--embed;${CMAKE_SOURCE_DIR}/tests/conformance/embed_subdir_assets=embedfx")
-  elseif(_name STREQUAL "game_cdraw_blit_src")
-    # 同 conformance 循环：夹具只经内嵌资源 API 存在，--embed 必须带上。
-    set(_extra_args
-      "--embed;${CMAKE_SOURCE_DIR}/tests/conformance/game_cdraw_blit_src_assets=cdrawfx")
-  elseif(_name STREQUAL "game_ckit_backdrop")
-    # 同 conformance 循环：夹具只经内嵌资源 API 存在，--embed 必须带上。
-    set(_extra_args
-      "--embed;${CMAKE_SOURCE_DIR}/tests/conformance/game_ckit_backdrop_assets=ckitfx")
-  endif()
-  add_test(NAME determinism_${_name}
-    COMMAND ${CMAKE_COMMAND}
-      -DZANC=$<TARGET_FILE:zanc>
-      -DSRC=${_src}
-      -DSTDLIB_STAMP=${_stdlib_stamp}
-      -DSTAMP=${CMAKE_BINARY_DIR}/det_${_name}.stamp
-      "-DZANC_ARGS=${_extra_args}"
-      -P ${CMAKE_SOURCE_DIR}/tests/run_determinism.cmake)
-  set_tests_properties(determinism_${_name} PROPERTIES TIMEOUT 120)
-endforeach()
 
 # ---- Generator suite: drive the Zan-scripted generators through zanc and
 #      assert on the reply (rewrite directives + generated sources) ----
@@ -2783,158 +2855,7 @@ set_tests_properties(compiler_dead_method_pre_ir PROPERTIES
   TIMEOUT 120
   LABELS "full;standard;smoke")
 
-# ---- Leak detection: run each program under --check-leaks, fail on leaks ----
-# The --check-leaks build tracks rc-managed allocations and reports any object
-# still reachable at exit. Programs known to leak (rc objects owned by arrays,
-# List/Dict or object fields are not yet released when their owner dies -- a
-# documented ARC follow-up) are marked WILL_FAIL so this gate stays green while
-# still catching *new* leaks; fixing such a leak flips its test to failing, a
-# reminder to drop it from the allow-list below.
-set(_known_leaky
-)
-foreach(_src ${_conf_srcs})
-  get_filename_component(_name ${_src} NAME_WE)
-  # arc_net_publish 只挂手工档（3702 行），GLOB 孪生档跳过。
-  # embed_compress 同理（run_embed_compress.cmake：--embed 压缩烘焙 + 净目录）。
-  if(_name STREQUAL "arc_net_publish" OR _name STREQUAL "embed_compress")
-    continue()
-  endif()
-  zan_uses_gui_driver(${_src} _needs_gui_driver)
-  set(_expect_leak_site "")
-  if(_name STREQUAL "server_mvc_timezone")
-    set(_extra_args
-      "${CMAKE_SOURCE_DIR}/packages/Zan.Mvc/src/ZanWeb/Framework/Fmt.zan")
-  elseif(_name STREQUAL "security_cryptography_suite")
-    file(GLOB _sec_crypto_srcs "${CMAKE_SOURCE_DIR}/packages/Zan.Security/src/System/Security/Cryptography/*.zan")
-    set(_extra_args "${_sec_crypto_srcs};--auto-stdlib")
-  elseif(_name STREQUAL "ns_conflict_generic_arity")
-    # The case needs a same-simple-name delegate in a second namespace so
-    # nsresolve sees the cross-namespace collision it locks in.
-    set(_extra_args
-      "${CMAKE_SOURCE_DIR}/tests/conformance/helpers/ns_conflict_other_action.zan")
-  elseif(_name STREQUAL "file_embed_bytes")
-    # Same branch as the conformance/arcguard loops: the fixtures only exist
-    # through the embedded-resource API, registered via --embed.
-    set(_extra_args
-      "--embed;${CMAKE_SOURCE_DIR}/tests/conformance/embed_assets=assets")
-  elseif(_name STREQUAL "file_embed_subdir")
-    # Subdir-only embedded tree (see the conformance loop above): the
-    # regression target of the skin-pack filter scope fix.
-    set(_extra_args
-      "--embed;${CMAKE_SOURCE_DIR}/tests/conformance/embed_subdir_assets=embedfx")
-  elseif(_name STREQUAL "game_cdraw_blit_src")
-    # 同 conformance 循环：夹具只经内嵌资源 API 存在。这个分支必须排在
-    # _needs_gui_driver 前面——elseif 链互斥，--embed 与 GUI 驱动参数要一起给。
-    set(_extra_args
-      "--embed;${CMAKE_SOURCE_DIR}/tests/conformance/game_cdraw_blit_src_assets=cdrawfx${_gui_driver_tail}")
-  elseif(_name STREQUAL "game_ckit_backdrop")
-    # 同 conformance 循环：夹具只经内嵌资源 API 存在。这个分支必须排在
-    # _needs_gui_driver 前面——elseif 链互斥，--embed 与 GUI 驱动参数要一起给。
-    set(_extra_args
-      "--embed;${CMAKE_SOURCE_DIR}/tests/conformance/game_ckit_backdrop_assets=ckitfx${_gui_driver_tail}")
-  elseif(_needs_gui_driver)
-    set(_extra_args "${_gui_driver_args}")
-  elseif(_name STREQUAL "arc_leak_site_label")
-    # Pins leak-report site attribution (A64b): the case keeps one object
-    # alive on purpose and asserts the report names THAT site's own
-    # file:line. -g gives sites their (file, line) key; without it sites
-    # would alias by shape onto the last same-shape allocation again.
-    set(_extra_args "-g")
-    # 站点是那个被有意保活的 Box 的分配点（`Box keep = new Box("keep")`），
-    # 不是保活它的 Task.Spawn 调用点。5cba3586 删掉了用例顶部的模板注释，
-    # 分配点从 20 行挪到 15 行——期望串跟着行号走，别写死成别的行。
-    set(_expect_leak_site "arc_leak_site_label.zan:15:")
-  else()
-    set(_extra_args "")
-  endif()
-  add_test(NAME leakcheck_${_name}
-    COMMAND ${CMAKE_COMMAND}
-      -DZANC=$<TARGET_FILE:zanc>
-      -DSRC=${_src}
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/leak_${_name}${_exe_ext}
-      -DSTDLIB_STAMP=${_stdlib_stamp}
-      "-DZANC_ARGS=${_extra_args}"
-      "-DEXPECT_LEAK_SITE=${_expect_leak_site}"
-      -P ${CMAKE_SOURCE_DIR}/tests/run_leakcheck.cmake)
-  set_tests_properties(leakcheck_${_name} PROPERTIES
-    RESOURCE_LOCK src_${_name} TIMEOUT 120)
-  if(_name IN_LIST _known_leaky)
-    set_tests_properties(leakcheck_${_name} PROPERTIES WILL_FAIL TRUE)
-  endif()
-endforeach()
 
-# ---- ARC guard: every conformance program, with freed objects quarantined ----
-# --arc-guard stamps a freed object's refcount slot with a marker instead of
-# letting the block be recycled, and traps any later retain/release that reaches
-# it. That is the one bug class refcounting cannot notice on its own: a
-# *missing* retain, where the counts balance but a reference outlives its
-# object. The leakcheck twin above is the mirror image (a retain with no
-# release), so the two together bracket ARC ownership from both sides.
-#
-# This tier is why it earns its runtime: the A53 heap corruption (an
-# RC-managed parameter reassigned in the callee released the caller's object)
-# ran the plain conformance suite to a bare STATUS_HEAP_CORRUPTION exit with no
-# output, and in the field showed up only as misordered `orderby` results.
-# Under the guard the same program names the fault: "retain through a stale
-# reference (object was freed: missing retain when stored)", with the object
-# address and the releasing site.
-foreach(_src ${_conf_srcs})
-  get_filename_component(_name ${_src} NAME_WE)
-  # arc_net_publish 只挂手工档（3711 行），GLOB 孪生档跳过。
-  # embed_compress 同理（run_embed_compress.cmake：--embed 压缩烘焙 + 净目录）。
-  if(_name STREQUAL "arc_net_publish" OR _name STREQUAL "embed_compress")
-    continue()
-  endif()
-  zan_uses_gui_driver(${_src} _needs_gui_driver)
-  if(_name STREQUAL "server_mvc_timezone")
-    set(_extra_args
-      "${CMAKE_SOURCE_DIR}/packages/Zan.Mvc/src/ZanWeb/Framework/Fmt.zan")
-  elseif(_name STREQUAL "security_cryptography_suite")
-    file(GLOB _sec_crypto_srcs "${CMAKE_SOURCE_DIR}/packages/Zan.Security/src/System/Security/Cryptography/*.zan")
-    set(_extra_args "${_sec_crypto_srcs};--auto-stdlib")
-  elseif(_name STREQUAL "ns_conflict_generic_arity")
-    # The case needs a same-simple-name delegate in a second namespace so
-    # nsresolve sees the cross-namespace collision it locks in.
-    set(_extra_args
-      "${CMAKE_SOURCE_DIR}/tests/conformance/helpers/ns_conflict_other_action.zan")
-  elseif(_name STREQUAL "file_embed_bytes")
-    # The case reads its fixtures back through the embedded-resource API;
-    # they are registered under "assets/..." via --embed. (Same branch as the
-    # conformance loop above -- without it the arcguard twin fails on the
-    # first File.Exists before any ARC property is exercised.)
-    set(_extra_args
-      "--embed;${CMAKE_SOURCE_DIR}/tests/conformance/embed_assets=assets")
-  elseif(_name STREQUAL "file_embed_subdir")
-    # Subdir-only embedded tree (see the conformance loop above): the
-    # regression target of the skin-pack filter scope fix.
-    set(_extra_args
-      "--embed;${CMAKE_SOURCE_DIR}/tests/conformance/embed_subdir_assets=embedfx")
-  elseif(_name STREQUAL "game_cdraw_blit_src")
-    # 同 conformance 循环：夹具只经内嵌资源 API 存在。这个分支必须排在
-    # _needs_gui_driver 前面——elseif 链互斥，--embed 与 GUI 驱动参数要一起给。
-    set(_extra_args
-      "--embed;${CMAKE_SOURCE_DIR}/tests/conformance/game_cdraw_blit_src_assets=cdrawfx${_gui_driver_tail}")
-  elseif(_name STREQUAL "game_ckit_backdrop")
-    # 同 conformance 循环：夹具只经内嵌资源 API 存在。这个分支必须排在
-    # _needs_gui_driver 前面——elseif 链互斥，--embed 与 GUI 驱动参数要一起给。
-    set(_extra_args
-      "--embed;${CMAKE_SOURCE_DIR}/tests/conformance/game_ckit_backdrop_assets=ckitfx${_gui_driver_tail}")
-  elseif(_needs_gui_driver)
-    set(_extra_args "${_gui_driver_args}")
-  else()
-    set(_extra_args "")
-  endif()
-  add_test(NAME arcguard_${_name}
-    COMMAND ${CMAKE_COMMAND}
-      -DZANC=$<TARGET_FILE:zanc>
-      -DSRC=${_src}
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/arc_${_name}${_exe_ext}
-      -DSTDLIB_STAMP=${_stdlib_stamp}
-      "-DZANC_ARGS=${_extra_args}"
-      -P ${CMAKE_SOURCE_DIR}/tests/run_arcguard.cmake)
-  set_tests_properties(arcguard_${_name} PROPERTIES
-    RESOURCE_LOCK src_${_name} TIMEOUT 120)
-endforeach()
 
 # ---- Multi-file compilation: compile several .zan files into one program ----
 # Sources live in a subdirectory so the single-file glob above ignores them.
@@ -4763,18 +4684,6 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
   set_tests_properties(conformance_gui_sender_channel PROPERTIES TIMEOUT 120)
 
-  # GenForm declarative column click events: columns[i].click must desugar
-  # into one HitField-filtered CellClick binding; columns without click stay
-  # binding-free.
-  add_test(NAME conformance_genform_click
-    COMMAND ${CMAKE_COMMAND}
-      -DZANC=$<TARGET_FILE:zanc>
-      -DSRC=${CMAKE_SOURCE_DIR}/tests/conformance/genform_click_test.zan
-      "-DZANC_ARGS=--auto-stdlib${_gui_driver_tail}"
-      -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/genform_click.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_genform_click${_exe_ext}
-      -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
-  set_tests_properties(conformance_genform_click PROPERTIES TIMEOUT 120)
 
   # Designer-component dogfood, composed like the "批量任务进度窗" ask: a
   # saved component (BatchJobProgress.zcomp) declares title/percent/status
@@ -6179,7 +6088,9 @@ foreach(_t ${_all_tests})
   set(_labels "full")
   if(_t MATCHES "^(golden_|diag_|abi_|cross_|runtime_|tool_|policy_|unit_)" OR _t MATCHES "^conformance_gui_")
     list(APPEND _labels "standard" "smoke")
-  elseif(_t MATCHES "^(conformance_|emit_lib_|dap_)")
+  elseif(_t MATCHES "^case_det_")
+    # The determinism lens costs two compiles per case: full tier only.
+  elseif(_t MATCHES "^(conformance_|emit_lib_|dap_|case_)")
     list(APPEND _labels "standard")
   endif()
   set_property(TEST ${_t} APPEND PROPERTY LABELS ${_labels})

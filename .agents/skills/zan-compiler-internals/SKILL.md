@@ -544,8 +544,8 @@ description: zanc 编译器内部（parser/checker/irgen/runtime/ABI）设计契
    - 理由：判一半就会崩。字符串 retain 与动态释放都判了哨兵，唯独通用
      retain/release 漏了；而"字面量存进 `object` 槽"走的正是通用 retain
      （槽的静态类型是 object 不是 string），于是对只读段做原子加一 → 0xC0000005。
-     实例：`conformance_ternary_is_type` / `conformance_cast_string_object` /
-     `conformance_cs_b05_pattern_var` 三条同时崩，根因同一（见 TASKS.md A412）。
+     实例：`case_ternary_is_type` / `case_cast_string_object` /
+     `case_cs_b05_pattern_var` 三条同时崩，根因同一（见 TASKS.md A412）。
    - 排查手法：访问冲突先看**写入目标地址落在哪个映像段**——写 exe 的只读段
      = 在改静态对象；再看寄存器里的对象指针是不是"目标地址 + 16"（那就是 ARC
      计数头）。崩溃现场在 `<exe_dir>/zan_crash.log`（含 fault/rip/rax/raw stack），
@@ -606,14 +606,14 @@ description: zanc 编译器内部（parser/checker/irgen/runtime/ABI）设计契
 
 43. **内建成员表签名必须与实际发射的返回类型一致**：
    - 动作：`src/compiler/builtin_api.c` 的成员表（`members_*`）里声明的返回类型，必须与 `irgen_call.c` / `irgen_builtins.c` 中该成员实际发射的 LLVM 返回类型逐个对齐；改实现语义必须同改表里的签名（或反之）。
-   - 理由：类型检查只认成员表，代码生成只认发射代码，两边脱节时**类型检查先拒绝合法用法**，而运行期其实是对的——症状是"明明实现了却编不过"，极难定位。实例：`Dict.Remove` 表里写 `void Remove(K key)`，实现却返回 0/1 标志（`irgen_call.c` 命中置 1、落空置 0），于是 C# 惯用法 `bool rm = d.Remove(k)` 被判 `cannot convert 'void' to 'bool'`，`conformance_arc_lookup_owned_arg` 连带它的 leakcheck 孪生一起红。
+   - 理由：类型检查只认成员表，代码生成只认发射代码，两边脱节时**类型检查先拒绝合法用法**，而运行期其实是对的——症状是"明明实现了却编不过"，极难定位。实例：`Dict.Remove` 表里写 `void Remove(K key)`，实现却返回 0/1 标志（`irgen_call.c` 命中置 1、落空置 0），于是 C# 惯用法 `bool rm = d.Remove(k)` 被判 `cannot convert 'void' to 'bool'`，`case_arc_lookup_owned_arg` 连带它的泄漏断言（同一次运行）一起红。
    - 边界：内建集合方法（`Dict` / `List`）的"命中/落空"一律用 0/1 标志返回，对齐 C# `Dictionary.Remove` 的 bool 语义；不要把槽位下标当返回值暴露出去。
 44. **内建表就是公开面，改它等于改 API**：
    - 动作：内建成员表同时是 IDE 补全与 LSP 的数据源（`zanc --emit-symbols` 写出的类型/成员索引），改签名后必须同步 `docs/STDLIB.md` 对应节，并留一条 conformance 用例钉住语义。
    - 理由：表里的签名直接进 IDE 补全与类型检查；声明与实现不一致时，IDE 补出来的用法与编译器的判定会互相打架，用户看到的是"补全说能写、编译器说不能写"。
 45. **批量改可见性（`private` / `public`）属于跨边界公共面改动**：
    - 动作：把成员改成 `private` 或补 `public` 之前，先查它的跨包调用方（`tools/agent/impact.ps1` / `map.ps1 -Callers`），并定向跑受影响的用例。
-   - 理由：可见性一改，**外部调用点立刻编译不过**，而这类破坏不会自己暴露——实例：`Socket.ResolveIpv4` 被规范成 `private` 后，`conformance_async_dns` / `conformance_async_mt` 两个用例从那天起一直红，直到有人手工重跑才发现（档位日志停在改动前一天）。
+   - 理由：可见性一改，**外部调用点立刻编译不过**，而这类破坏不会自己暴露——实例：`Socket.ResolveIpv4` 被规范成 `private` 后，`case_async_dns` / `case_async_mt` 两个用例从那天起一直红，直到有人手工重跑才发现（档位日志停在改动前一天）。
    - 边界：默认可见性是 public（无修饰符即 public），显式 `private` 才是收窄；规范化的目的是让可见性**显式可读**，不是顺手收紧 API。
 46. **内建静态调用的返回类型必须按实参形态定型，并与 irgen 的分支一一对应**：
    - 动作：同一个内建静态成员（`Task.Run` / `Task.Spawn` 这类）传不同形态的实参时，若 irgen 会走**不同的帧/所有权分支**，检查器就必须给不同的返回类型（无类型实参的"无结果类型" vs 带类型实参的 `Task<T>`）；检查器不得对内建调用的返回类型一律宽松放行（`type_error` 对一切可赋值），也不得把"结果类型"一律写成 `long`。

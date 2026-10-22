@@ -267,15 +267,21 @@ positive, stated in the commit message.
     模板自带的构建/测试脚本常常从没跑通过（wuwei 的 `build.ps1` 只枚举
     `src/*.zan` 顶层，漏掉 `src/Model/` 下的源码，`test.ps1` 又漏带设计稿
     导致 `Menu` 解析错位），搬迁正好逼它们面对——先修根因再搬。
-16. **测试产物必须收口，不许散着堆。** 每个 conformance / leak / arc 用例都
-    把自己的可执行文件编到 `build\` 下——历史上全编在 `build\` 根目录，几百轮
-    测试之后根目录堆了 **1884 个一次性 exe / 6 GB**，真产物只剩 4 个，
-    `ctest` 每跑一次还留一个 `LastTest.log.tmpXXXXXX`。规矩：
+16. **测试产物必须收口，不许散着堆。** 每个 conformance 用例都把自己的可执行
+    文件编到 `build\` 下——历史上全编在 `build\` 根目录，几百轮测试之后根目录
+    堆了 **1884 个一次性 exe / 6 GB**，真产物只剩 4 个，`ctest` 每跑一次还留
+    一个 `LastTest.log.tmpXXXXXX`。规矩：
+    - **一个用例 = 一条 ctest 条目 = 一个可执行文件**：conformance / 泄漏 /
+      ARC 三个结论共用同一份插桩产物（`build\cases\case_*.exe`），determinism
+      另立一条 `case_det_*`（它要比两次代码生成，多半不产可执行文件，只留一枚
+      stamp）。**别再把同一个源编成多个 exe**——孪生档的老写法是同一份源码编
+      三遍（普通版 / `--check-leaks` / `--arc-guard`）跑三遍，一轮全量下来是
+      3500+ 个 exe、4700 个一次性文件，而每个程序本身只跑几毫秒。
     - **用例产物只有一个去处**：`build\cases\`（`CMakeLists.txt` 里所有
       `OUT_EXE=${CMAKE_BINARY_DIR}/...` 都指向那里）。`build\` 根只留真产物
       与工具链。新增用例时不要另开目录，也不要写回根目录。
-    - **它是缓存，不是垃圾**：`run_case.cmake` 靠"源文件/编译器/stdlib stamp
-      没变就复用旧 exe"加速。全删等于每轮重编一千多个程序，所以按
+    - **它是缓存，不是垃圾**：`run_case_modes.cmake` 靠"源文件/编译器/stdlib
+      stamp 没变就复用旧 exe"加速。全删等于每轮重编一千多个程序，所以按
       **最近使用 + 体积上限** 清扫，别一把删光——`scripts\clean_build.ps1`
       干这件事（`-KeepDays` / `-MaxCacheMB`）。
     - **日志合并成一份**：`ctest` 的完整输出归档到

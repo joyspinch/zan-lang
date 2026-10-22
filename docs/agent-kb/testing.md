@@ -34,13 +34,13 @@ scripts\test.ps1 full -ReleaseGate      # 完整集 + 确定性/泄漏/自举（
   会让毫无关系的用例失败。`scripts\test.ps1` 的注释里明确写了这条。
 - **gallery 与 IDE 构建互斥**：两者都会重写 `packages\Zan.Gui\src\Gui\CustomComponents.zan`
   （组件扫描产物）。串行跑。
-- **桌面资源类用例互斥**：托盘/屏幕/输入/自动化（`conformance_win_tray_screen_smoke`、
+- **桌面资源类用例互斥**：托盘/屏幕/输入/自动化（`case_win_tray_screen_smoke`、
   `*_win_automation_*`、`*_win_uielement_*` 等）会抢真实桌面资源，`-j` 并发下偶发失败。
   **判断规则**：并发跑失败 → 单独重跑那一个；单跑通过就是资源争用，不是功能回归；
   单跑仍失败才是真问题。
 
 ```powershell
-ctest --test-dir build -R conformance_win_tray_screen_smoke --output-on-failure
+ctest --test-dir build -R case_win_tray_screen_smoke --output-on-failure
 ```
 
 ## 目录与断言方式
@@ -49,9 +49,9 @@ ctest --test-dir build -R conformance_win_tray_screen_smoke --output-on-failure
 | --- | --- | --- |
 | `tests/conformance/` (≈650) | 编译并运行，比对期望输出 | `run_case.cmake` |
 | `tests/diag/` (26) | **编译期必须报错**，正则断言错误文本 | `run_compile_error.cmake` |
-| `tests/golden/` | 输出/IR 黄金文件比对 | `run_determinism.cmake` 等 |
+| `tests/golden/` | 输出/IR 黄金文件比对 | `run_case_modes.cmake` 等 |
 | `tests/gui/` | GUI 相关 | 见 `CMakeLists.txt` |
-| `tests/leakprobe/`, `leak_*` 用例 | ARC 泄漏 | `run_leakcheck.cmake` |
+| `tests/leakprobe/`, `leak_*` 用例 | ARC 泄漏 | `run_case_modes.cmake`（与 conformance 同一次运行） |
 | `tests/abi/`, `tests/emit_lib/` | ABI / 库发射 | `run_abi_case.cmake`, `run_emit_lib.cmake` |
 | `tests/dap/`, `tests/fmt/`, `tests/doc/`, `tests/selfhost/` | 调试器、格式化、文档、自举 | 各自 `run_*.cmake` |
 | `tests/fuzz/`, `tests/_probe/`, `tests/_scratch/` | 模糊测试与探针 | — |

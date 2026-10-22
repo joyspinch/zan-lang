@@ -101,7 +101,7 @@ int total = endpoint.Handle(new OrderPlaced { customer = "李四", amount = 21 }
 查询端点（值类型结果完整保留、字符串结果、接总线后中间件照样生效）、
 参数校验（null 通道 / 中间件 / 错误处理器 / 消息各自报可区分错误码）。
 
-ARC 守卫（`run_arcguard`）干净，`--check-leaks` 无泄漏。
+ARC 守卫（`run_case_modes.cmake`）干净，`--check-leaks` 无泄漏。
 
 ## 已知边界
 

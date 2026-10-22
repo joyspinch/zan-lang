@@ -136,14 +136,17 @@ runnable examples.
 `ctest` runs three regression families over every build configuration:
 
 - **conformance** — each `tests/conformance/*.zan` is compiled, run, and its
-  stdout diffed against a golden `.out`.
+  stdout diffed against a golden `.out`. The same instrumented binary
+  (`--check-leaks --arc-guard`) also answers the leak and ARC questions, so
+  one case is one ctest entry and one executable.
 - **selfhost** — the C host compiles the entire self-hosted compiler
   (`src/selfhost/*.zan`) into gen1, which then lowers a real program
   (`tests/selfhost/prog1.zan`) to LLVM IR (`tests/run_selfhost.cmake`).
 - **determinism** — every conformance and self-host program is compiled to LLVM
   IR *twice*, and the two emissions must be byte-for-byte identical.
 
-The determinism check (`tests/run_determinism.cmake`) is the reproducible-build
+The determinism check (`tests/run_case_modes.cmake`, the `case_det_*` entries)
+is the reproducible-build
 correctness net: because `zanc` is written in C rather than in Zan, a classic
 self-hosting `gen2 == gen3` diff does not apply, so instead we assert that
 codegen is a pure function of the source. It catches nondeterminism and

@@ -147,7 +147,7 @@ List<string> unmatched = GenMapping.UnmatchedByConvention(entities, "Order", "Or
 成员）、目标类型没有无参构造器时报错、源类型不在元数据里时报错、非法规格抛
 `InvalidSpec`。
 
-ARC 守卫（`run_arcguard`）干净，`--check-leaks` 无泄漏。
+ARC 守卫（`run_case_modes.cmake`）干净，`--check-leaks` 无泄漏。
 
 ## 已知边界
 

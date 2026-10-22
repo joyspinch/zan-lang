@@ -96,7 +96,8 @@ _scratch\probe.exe
   "还活着"就是在等这个框）。检查 exe 旁/`build\` 里的驱动 DLL，以及运行时是不是用
   `LoadLibrary` 动态加载（那时搜索路径是**工作目录**，不是 exe 目录）。
 - **ARC 相关（重复释放/泄漏）**：`irgen_arc.c` + `tests/leakprobe`、`leak_*` 测试。
-  泄漏用 `run_leakcheck.cmake` 那套断言，不要靠肉眼看。
+  泄漏用 `run_case_modes.cmake` 那套断言（`case_*` 用例一次运行同时给泄漏与
+  ARC 两个结论），不要靠肉眼看。
 - **async/协程**：`irgen_async.c`；先用 `tests/conformance/conf_async_*` 里最接近的
   用例做对照，改一行看行为差异。
 - **崩栈但无信息**：IDE 的未处理异常会写到 `<exe 目录>/cache/ide_error.log`
