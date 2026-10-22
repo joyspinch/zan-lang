@@ -458,6 +458,12 @@ Without MCP the same index is a file: `knowledge/symbols.json` next to the SDK
   `[+-]?digits[.digits][(e|E)[+-]?digits]`，失败判失败（由调用方决定"跳过并
   计数"还是"报错"）。坑出处：DataValues 的严格数值解析记过一次，
   `Zan.Game.Profiler` 的账单解析又踩一次。
+  **推论：`try { Convert.ToInt32(v) } catch { 回落默认值 }` 永远不会进 catch**
+  ——坏输入不抛异常、直接给 0，于是"解析失败就回落默认值"的语义实际变成"坏值
+  被读成 0"，而那圈 try/catch 是死代码。配置项、命令行参数这类"读进来再解析"
+  的地方要回落默认值，就得自己逐字符严格解析（逐位校验 + 失败返回 false），
+  别指望 catch。坑出处：标准库配置子系统的 `GetInt` 一直挂着这样的 try/catch，
+  坏配置被读成 0 而不是调用方给的默认值。
 * **`JsonValue.SetAt(i, v)` 只替换已有元素，不追加**（实证，2026-10-21）：它内部
   是 `if (i < items.Count) items[i] = v;`——对 `NewArray()` 建出来的空数组调
   `SetAt(0, ...)` **静默什么也不做**，序列化出来是 `[]`。追加元素要用
