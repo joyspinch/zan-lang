@@ -1,0 +1,196 @@
+using System;
+using System.Collections.Generic;
+using System.Text;
+
+namespace System.Text.CodePage;
+
+// CP936（GBK）编解码：遗留中文系统的文件、数据库字段、HTTP 响应体常用它。
+//
+// ## 与 Python 的对应
+//
+//   bytes.decode('gbk')   → Gbk.Decode（严格）/ Gbk.DecodeLenient（替换）
+//   str.encode('gbk')     → Gbk.Encode（严格）/ Gbk.EncodeLenient（'?' 替换）
+//
+// ## 严格 vs 宽松
+//
+// 严格模式遇到非法字节序列直接抛错（消息带字节偏移），与 Python 默认行为一致；
+// 宽松模式把非法序列换成 U+FFFD（解码）或 '?'（编码），与 errors='replace' 一致。
+//
+// ## 非法序列的粒度
+//
+// 一个非法的前导字节**只吃它自己**：后面那个字节重新当独立字节处理。这与
+// Python 一致（b"\x8130" 宽松解码得到 "�0"，而不是把 "30" 一起丢掉）。
+//
+// ## 编码表
+//
+// 映射表在 GbkTable.zan（数据），本文件是算法。两张表（正向槽位→码点、
+// 反向码点→槽位）都在**首次使用时**建一次，之后复用。
+public class Gbk {
+    // 槽位 → Unicode 码点（懒建一次）。
+    static int[] codes;
+    // Unicode 码点 → 槽位（懒建一次；CP936 的映射是一一对应的）。
+    static Dictionary<int, int> reverse;
+
+    // 整表码点：把表字符串按码点切开。表里每个槽位一个码点，U+FFFD 表示
+    // 该槽位未映射（CP936 本身不映射任何字符到 U+FFFD）。
+    static int[] Codes() {
+        if (Gbk.codes == null) {
+            string t = GbkTable.All();
+            int[] arr = new int[GbkTable.SlotCount];
+            int[] one = new int[1];
+            int bi = 0;
+            for (int i = 0; i < GbkTable.SlotCount; i = i + 1) {
+                int used = Encoding.DecodeCodePoint(t, bi, one);
+                if (used <= 0) { break; }
+                arr[i] = one[0];
+                bi = bi + used;
+            }
+            Gbk.codes = arr;
+        }
+        return Gbk.codes;
+    }
+
+    // 反查表：码点 → 槽位。
+    static Dictionary<int, int> Reverse() {
+        if (Gbk.reverse == null) {
+            Dictionary<int, int> d = new Dictionary<int, int>();
+            int[] cs = Gbk.Codes();
+            for (int i = 0; i < cs.Length; i = i + 1) {
+                if (cs[i] != GbkTable.Unmapped) { d[cs[i]] = i; }
+            }
+            Gbk.reverse = d;
+        }
+        return Gbk.reverse;
+    }
+
+    // 后继字节 → 表里的列号：trail 取 0x40..0xFE 去掉 0x7F，所以
+    // 0x40..0x7E 是第 (trail-0x40) 列，0x80..0xFE 是第 (trail-0x41) 列。
+    public static int TrailIndex(int trail) {
+        if (trail < 0x40 || trail > 0xFE || trail == 0x7F) { return -1; }
+        if (trail > 0x7F) { return trail - 0x41; }
+        return trail - 0x40;
+    }
+
+    // 解码（严格）：遇到非法字节序列抛错。
+    public static string Decode(byte[] data) {
+        return Gbk.DecodeCore(data, false);
+    }
+
+    // 解码（宽松）：非法字节序列换成 U+FFFD。
+    public static string DecodeLenient(byte[] data) {
+        return Gbk.DecodeCore(data, true);
+    }
+
+    static string DecodeCore(byte[] data, bool lenient) {
+        if (data == null) { return ""; }
+        int n = data.Length;
+        if (n == 0) { return ""; }
+        // 纯 ASCII 快进。
+        if (data.IsAscii(0, n)) { return data.ToStr(0, n); }
+
+        int[] cs = Gbk.Codes();
+        StringBuilder sb = new StringBuilder();
+        int i = 0;
+        while (i < n) {
+            int b0 = data[i] & 255;
+            if (b0 < 0x80) {
+                // ASCII 批量快进，避免逐字节分配中间字符串。
+                int start = i;
+                i = i + 1;
+                while (i < n && (data[i] & 255) < 0x80) { i = i + 1; }
+                sb.Append(data.ToStr(start, i - start));
+                continue;
+            }
+            int cp = 0;
+            string why = "";
+            if (b0 > 0xFE) {
+                why = "非法前导字节 0x" + Encoding.ByteToHex(b0);
+            } else if (i + 1 >= n) {
+                why = "序列被截断（缺后继字节 0x" + Encoding.ByteToHex(b0) + "）";
+            } else {
+                int b1 = data[i + 1] & 255;
+                int col = Gbk.TrailIndex(b1);
+                if (col < 0) {
+                    why = "非法后继字节 0x" + Encoding.ByteToHex(b1);
+                } else {
+                    int slot = (b0 - 0x80) * GbkTable.TrailCount + col;
+                    cp = cs[slot];
+                    if (cp == GbkTable.Unmapped) {
+                        why = "未映射的字节对 0x" + Encoding.ByteToHex(b0) +
+                              " 0x" + Encoding.ByteToHex(b1);
+                    }
+                }
+            }
+            if (why.Length > 0) {
+                if (!lenient) {
+                    throw new Exception("GBK 非法字节序列（偏移 " +
+                        Convert.ToString(i) + "）：" + why);
+                }
+                sb.Append(Encoding.Utf8FromCodePoint(65533));
+                i = i + 1;
+                continue;
+            }
+            sb.Append(Encoding.Utf8FromCodePoint(cp));
+            i = i + 2;
+        }
+        return sb.ToString();
+    }
+
+    // 编码（严格）：GBK 映射不到的字符抛错。
+    public static byte[] Encode(string text) {
+        return Gbk.EncodeCore(text, false);
+    }
+
+    // 编码（宽松）：GBK 映射不到的字符写成 '?'（与 Python errors='replace' 一致）。
+    public static byte[] EncodeLenient(string text) {
+        return Gbk.EncodeCore(text, true);
+    }
+
+    // 这个码点能不能用 GBK 表示。
+    public static bool CanEncode(int codePoint) {
+        if (codePoint < 0) { return false; }
+        if (codePoint < 0x80) { return true; }
+        int slot;
+        Dictionary<int, int> rev = Gbk.Reverse();
+        return rev.TryGetValue(codePoint, out slot);
+    }
+
+    static byte[] EncodeCore(string text, bool lenient) {
+        if (text == null || text.Length == 0) { return new byte[0]; }
+        Dictionary<int, int> rev = Gbk.Reverse();
+        List<byte> outBytes = new List<byte>();
+        int[] one = new int[1];
+        int bi = 0;
+        int n = text.Length;
+        while (bi < n) {
+            int used = Encoding.DecodeCodePoint(text, bi, one);
+            if (used <= 0) { break; }
+            int cp = one[0];
+            bi = bi + used;
+            if (cp < 0x80) {
+                outBytes.Add((byte)cp);
+                continue;
+            }
+            int slot;
+            if (rev.TryGetValue(cp, out slot)) {
+                outBytes.Add((byte)((slot / GbkTable.TrailCount) + 0x80));
+                outBytes.Add((byte)(Gbk.TrailByte(slot % GbkTable.TrailCount)));
+                continue;
+            }
+            if (!lenient) {
+                throw new Exception("GBK 无法表示字符 U+" +
+                    Encoding.Utf8FromCodePoint(cp) + "（偏移 " +
+                    Convert.ToString(bi - used) + "）");
+            }
+            outBytes.Add((byte)63);
+        }
+        return outBytes.ToArray();
+    }
+
+    // 列号 → 后继字节：0x40..0x7E 是 (col+0x40)，0x80..0xFE 是 (col+0x41)。
+    public static int TrailByte(int col) {
+        if (col < 0) { return -1; }
+        if (col < 63) { return col + 0x40; }
+        return col + 0x41;
+    }
+}

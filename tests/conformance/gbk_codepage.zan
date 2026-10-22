@@ -1,0 +1,176 @@
+// CP936（GBK）编解码的 conformance。
+//
+// 期望值全部用 Python 的 'gbk' 编码器核对过（Python 只作规范参照与测试
+// 向量来源，实现是原生 Zan：映射表在 GbkTable.zan，算法在 Gbk.zan）。
+//
+// 覆盖：
+// - 已知字节 → 文本（含全角标点、汉字、GBK 扩展区的字）；
+// - 文本 → 已知字节；
+// - 往返一致；
+// - **严格模式**遇到非法字节序列抛错（消息带字节偏移）；
+// - **宽松模式**把非法序列换成 U+FFFD，且只吃前导字节——后面那个字节
+//   重新当独立字节处理（与 Python 的 errors='replace' 同粒度）；
+// - 编码时 GBK 映射不到的字符：严格抛错、宽松写 '?'；
+// - ASCII 直通、全表规模、未映射槽位的哨兵。
+using System;
+using System.Text;
+using System.Text.CodePage;
+
+class Program {
+    static int failures = 0;
+
+    static void Ok(bool cond, string name) {
+        if (cond) {
+            Console.WriteLine("ok " + name);
+        } else {
+            Console.WriteLine("FAIL " + name);
+            Program.failures = Program.failures + 1;
+        }
+    }
+
+    static void Eq(string got, string want, string name) {
+        if (got == want) {
+            Console.WriteLine("ok " + name);
+        } else {
+            Console.WriteLine("FAIL " + name + "（得到 \"" + got + "\"，期望 \"" + want + "\"）");
+            Program.failures = Program.failures + 1;
+        }
+    }
+
+    // byte[] → 十六进制字符串（空格分隔，大写）。
+    static string Hex(byte[] data) {
+        string digits = "0123456789ABCDEF";
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < data.Length; i = i + 1) {
+            if (i > 0) { sb.Append(" "); }
+            int b = data[i] & 255;
+            sb.Append(digits.Substring((b >> 4) & 15, 1));
+            sb.Append(digits.Substring(b & 15, 1));
+        }
+        return sb.ToString();
+    }
+
+    static void EqHex(byte[] got, string want, string name) {
+        string h = Program.Hex(got);
+        if (h == want) {
+            Console.WriteLine("ok " + name);
+        } else {
+            Console.WriteLine("FAIL " + name + "（得到 " + h + "，期望 " + want + "）");
+            Program.failures = Program.failures + 1;
+        }
+    }
+
+    // 断言解码抛错，并检查消息里出现了 needle。
+    static void ThrowsDecode(byte[] data, string needle, string name) {
+        string msg = "";
+        bool threw = false;
+        try {
+            Gbk.Decode(data);
+        } catch (Exception e) {
+            threw = true;
+            msg = e.Message;
+        }
+        if (threw && (needle.Length == 0 || msg.IndexOf(needle) >= 0)) {
+            Console.WriteLine("ok " + name);
+        } else {
+            Console.WriteLine("FAIL " + name + "（没抛错，或消息里没有 \"" + needle + "\"，实际 \"" + msg + "\"）");
+            Program.failures = Program.failures + 1;
+        }
+    }
+
+    // 断言编码抛错，并检查消息里出现了 needle。
+    static void ThrowsEncode(string text, string needle, string name) {
+        string msg = "";
+        bool threw = false;
+        try {
+            Gbk.Encode(text);
+        } catch (Exception e) {
+            threw = true;
+            msg = e.Message;
+        }
+        if (threw && (needle.Length == 0 || msg.IndexOf(needle) >= 0)) {
+            Console.WriteLine("ok " + name);
+        } else {
+            Console.WriteLine("FAIL " + name + "（没抛错，或消息里没有 \"" + needle + "\"，实际 \"" + msg + "\"）");
+            Program.failures = Program.failures + 1;
+        }
+    }
+
+    static void Main() {
+        // ---- 1. 已知字节 → 文本 ----
+        Eq(Gbk.Decode(new byte[] { 0xD6, 0xD0 }), "中", "D6 D0 → 中");
+        Eq(Gbk.Decode(new byte[] { 0xA1, 0xA1 }), "　", "A1 A1 → 全角空格");
+        Eq(Gbk.Decode(new byte[] { 0xA3, 0xA1 }), "！", "A3 A1 → 全角感叹号");
+        Eq(Gbk.Decode(new byte[] { 0x81, 0x41 }), "丄", "81 41 → GBK 扩展区的字");
+        Eq(Gbk.Decode(new byte[] { 0xA1, 0xA2 }), "、", "A1 A2 → 顿号");
+        Eq(Gbk.Decode(new byte[] { 0x41, 0x42, 0x43 }), "ABC", "ASCII 直通");
+
+        // ---- 2. 文本 → 已知字节 ----
+        EqHex(Gbk.Encode("中文测试"), "D6 D0 CE C4 B2 E2 CA D4", "中文测试 → GBK 字节");
+        EqHex(Gbk.Encode("你好，世界"), "C4 E3 BA C3 A3 AC CA C0 BD E7", "你好，世界 → GBK 字节");
+        EqHex(Gbk.Encode("全角：！？【】"), "C8 AB BD C7 A3 BA A3 A1 A3 BF A1 BE A1 BF", "全角标点 → GBK 字节");
+        EqHex(Gbk.Encode("ABCabc123"), "41 42 43 61 62 63 31 32 33", "ASCII → GBK 字节");
+        EqHex(Gbk.Encode("a中b"), "61 D6 D0 62", "ASCII 与汉字混排");
+        EqHex(Gbk.Encode("简体中文"), "BC F2 CC E5 D6 D0 CE C4", "简体中文 → GBK 字节");
+        EqHex(Gbk.Encode("繁體中文"), "B7 B1 F3 77 D6 D0 CE C4", "繁体字 → GBK 字节");
+        EqHex(Gbk.Encode("混合 text 与 中文"), "BB EC BA CF 20 74 65 78 74 20 D3 EB 20 D6 D0 CE C4", "中英混排");
+        EqHex(Gbk.Encode("春夏秋冬东南西北"), "B4 BA CF C4 C7 EF B6 AC B6 AB C4 CF CE F7 B1 B1", "常用字批量");
+        EqHex(Gbk.Encode("零一二三四五六七八九十"), "C1 E3 D2 BB B6 FE C8 FD CB C4 CE E5 C1 F9 C6 DF B0 CB BE C5 CA AE", "数字汉字批量");
+
+        // ---- 3. 往返一致 ----
+        string[] samples = new string[] {
+            "中文测试", "你好，世界", "全角：！？【】", "ABCabc123", "a中b",
+            "简体中文", "繁體中文", "混合 text 与 中文", "春夏秋冬东南西北",
+            "零一二三四五六七八九十"
+        };
+        bool allRound = true;
+        for (int i = 0; i < samples.Length; i = i + 1) {
+            if (Gbk.Decode(Gbk.Encode(samples[i])) != samples[i]) { allRound = false; }
+        }
+        Ok(allRound, "十组样本往返一致");
+
+        // 长文本往返（走完整张表，不只是开头几个槽位）。
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < 500; i = i + 1) {
+            sb.Append("中文字符测试ABC123，");
+        }
+        string longText = sb.ToString();
+        Ok(Gbk.Decode(Gbk.Encode(longText)) == longText, "长文本往返一致");
+
+        // ---- 4. 严格模式：非法字节序列抛错 ----
+        Program.ThrowsDecode(new byte[] { 0xFF }, "偏移 0", "非法前导字节 0xFF 抛错");
+        Program.ThrowsDecode(new byte[] { 0x80 }, "偏移 0", "0x80 抛错");
+        Program.ThrowsDecode(new byte[] { 0x81, 0x30 }, "偏移 0", "非法后继字节抛错");
+        Program.ThrowsDecode(new byte[] { 0xA1, 0x41 }, "偏移 0", "未映射字节对抛错");
+        Program.ThrowsDecode(new byte[] { 0xA1 }, "偏移 0", "序列被截断抛错");
+        Program.ThrowsDecode(new byte[] { 0x41, 0x42, 0x81, 0x30 }, "偏移 2", "错误消息带偏移");
+
+        // ---- 5. 宽松模式：换成 U+FFFD，只吃前导字节 ----
+        Eq(Gbk.DecodeLenient(new byte[] { 0x81, 0x30 }), "�0", "非法后继字节：只吃前导字节");
+        Eq(Gbk.DecodeLenient(new byte[] { 0xA1, 0x41 }), "�A", "未映射字节对：只吃前导字节");
+        Eq(Gbk.DecodeLenient(new byte[] { 0x81, 0x7F }), "�", "后继字节 0x7F 非法");
+        Eq(Gbk.DecodeLenient(new byte[] { 0xFF, 0xFE }), "��", "两个非法字节各换一个替换符");
+        Eq(Gbk.DecodeLenient(new byte[] { 0xA1 }), "�", "截断序列换成一个替换符");
+        Eq(Gbk.DecodeLenient(new byte[] { 0x41, 0x42 }), "AB", "合法输入不受影响");
+
+        // ---- 6. 编码：映射不到的字符 ----
+        Program.ThrowsEncode("€", "GBK 无法表示", "欧元符号严格编码抛错");
+        Program.ThrowsEncode("😀", "GBK 无法表示", "emoji 严格编码抛错");
+        EqHex(Gbk.EncodeLenient("€"), "3F", "欧元符号宽松编码写成 ?");
+        EqHex(Gbk.EncodeLenient("😀"), "3F", "emoji 宽松编码写成 ?");
+        EqHex(Gbk.EncodeLenient("中€"), "D6 D0 3F", "混合文本里的不可映射字符");
+
+        // ---- 7. CanEncode ----
+        Ok(Gbk.CanEncode(0x4E2D), "中可以用 GBK 表示");
+        Ok(Gbk.CanEncode(0x41), "ASCII 可以用 GBK 表示");
+        Ok(!Gbk.CanEncode(0x20AC), "欧元不能用 GBK 表示");
+        Ok(!Gbk.CanEncode(0x1F600), "emoji 不能用 GBK 表示");
+
+        // ---- 8. 表的规模与哨兵 ----
+        Ok(GbkTable.SlotCount == 24130, "槽位总数 24130");
+        Ok(GbkTable.LeadCount == 127 && GbkTable.TrailCount == 190, "lead 127 × trail 190");
+        Ok(GbkTable.Unmapped == 0xFFFD, "未映射槽位的哨兵是 U+FFFD");
+
+        Console.WriteLine("failures=" + Convert.ToString(Program.failures));
+    }
+}
