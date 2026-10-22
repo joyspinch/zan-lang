@@ -6,10 +6,10 @@
 >
 > 平账纪律：闭账条目当批移出
 >
-> 2026-10-22 平账：移出 44 条已闭账条目（A390/A393/A394/A395/A396/A397/A399/
+> 2026-10-22 平账：移出 45 条已闭账条目（A390/A393/A394/A395/A396/A397/A399/
 > A400/A401/A402/A403/A404/A405/A406/A407/A413/A415/A416/A428/A431/A432/A437/
-> A441/A442/A447/A448/A449/A463/A473/A474/A475/A476/A477/A478/A479/A480/A481/
-> A483/A484/A485/A488/A491/A492/A497）。编号不复用，结论与验证见 git 历史。
+> A441/A442/A445/A447/A448/A449/A463/A473/A474/A475/A476/A477/A478/A479/A480/
+> A481/A483/A484/A485/A488/A491/A492/A497）。编号不复用，结论与验证见 git 历史。
 
 ## 未完成
 
@@ -193,30 +193,6 @@
   静默恒等。
 - ⚠ `src/selfhost/irgen_expr.zan` 此刻正被另一会话在途修改，本轮无法同一次
   提交落地，等窗口。
-
-### [ ] A445 自举后端 `Math.*` / `Convert.ToInt32` / `Convert.ToDouble` 与 C 宿主同款缺陷
-
-- 现象（2026-10-21 随 C 宿主的类型守卫一并查实）：
-  - `src/selfhost/irgen_expr.zan:3884` `ToDbl`：实参不是 double 就一律
-    `sitofp i64 <v> to double`。类实例是**指针** → 造出 `sitofp i64 i8*`，
-    LLVM 校验失败（非法 IR）。`GenMathCall`（同文件 `:3897`）的所有分支
-    （Sin/Cos/Tan/Log/Exp/Atan/Asin/Acos/Sqrt、Pow/Atan2、Floor/Ceiling、
-    Abs、Max/Min）都走 `ToDbl` → `Math.Sqrt(<类实例>)` 在自举后端同样是非法 IR。
-  - 同文件 `:4094` `Convert.ToDouble`：实参既不是 string 也不是 double 时，
-    同样落到 `sitofp i64 <v> to double` → 同款非法 IR。
-  - 同文件 `:4107` `Convert.ToInt32` / `ToInt`：无条件
-    `call i64 @atoi(i8* <a.op>)` —— 类实例的**对象指针**被当成 C 字符串交给
-    `atoi`，运行期读对象字节当文本，静默得到 0（与 C 宿主修复前
-    `strtoll` 读对象首字节同款）。
-- 影响：同一份源码，C 宿主现在给人话诊断，自举后端仍是编译期 LLVM 校验失败
-  或运行期读对象内存。差分门（`tests/selfhost/diff_cases.txt`）目前是绿的——
-  现有用例没有覆盖"给 Math/Convert 喂类实例"。
-- 方向：与 C 宿主同款守卫，按**静态类型**分流：类 / 结构体 / 数组 / 委托 →
-  报与宿主一致的诊断；字符串 / 数值走原有路径。守卫要落在 `ToDbl` 与
-  `Convert.*` 的**分派入口**，不要只补 `GenMathCall` 的某一个分支。
-- ⚠ `src/selfhost/irgen_expr.zan` 此刻正被另一个会话在途修改，本轮无法同一次
-  提交落地，等窗口。
-- 相关：A443（`Math` / `Convert` 公开面缺失）、A444（`Convert.ToString(object)` 残留）。
 
 ### [ ] A444 `Convert.ToString(object)` 仍按 C 字符串读——object 里装类实例时依然越界读
 
@@ -672,6 +648,12 @@
   前者更彻底，但会牵动 irgen 的类型判定。
 - 关联：A485（本次的漏报清单）、A463（诊断里类型名不渲染可空标志，同属
   "自举的类型名比宿主粗"这一类）。
+- A445 的连带影响（2026-10-22 补记）：宿主把 `decimal` 降成 struct，所以
+  `Math.Sqrt(2.5m)` 被宿主拒绝（"requires an int or floating-point argument"）、
+  `Convert.ToInt32(2.5m)` 宿主给 0；自举因为把 decimal 折叠成 double，
+  `Math.Sqrt(2.5m)` **照收**、`Convert.ToInt32(2.5m)` 给 2。A445 只在自举侧
+  补了"按静态类型分流"的守卫，这两条 decimal 差异要等本条目把 decimal
+  还原成独立类型才会消失。
 ### [ ] A482 自举把「void 臂的三元表达式」降成非法 IR（`phi void`）
 
 - 现象（2026-10-21 修 A481 时被差分门照出来，用例
@@ -868,4 +850,56 @@
 - 方向：给自举的 `ToCStr` 补可空分支，判据与宿主一致（可空先拆箱再取串；
   拆不出来就报诊断，不生成非法 IR）。
 - 关联：A492（同一族取串路径的宽度/类型判据）、A454（自举缺真装箱原语）。
+
+### [ ] A498 宿主把 `bool` 当**有符号**整数用——`Math.Sqrt(true)` 得 NaN、`Convert.ToInt32(true)` 得 -1
+
+- 现象（2026-10-22 随 A445 补自举侧守卫时实测，宿主 `build/zanc.exe`）：
+  - `src/compiler/irgen_call.c:701` `math_arg_is_numeric` 判的是**降级后的
+    LLVM 值类型**：`bool` 降成 `i1`，`LLVMIntegerTypeKind` → 算"数值"；
+    紧接着 `math_arg_to_double` 对 i1 做 `LLVMBuildSIToFP`（**符号扩展**），
+    `true` 被当成 -1 → `Math.Sqrt(true)` = `sqrt(-1.0)` = **NaN**。
+  - `src/compiler/irgen_call.c:1974` `Convert.ToInt32/ToInt64/ToInt` 对整数
+    实参做 `LLVMBuildSExt`（**符号扩展**），`i1` 的 1 被扩成 -1 →
+    `Convert.ToInt32(true)` = **-1**。
+  - C# 的口径：`Convert.ToInt32(true)` = 1（bool→0/1 是有定义的转换）；
+    `Math.Sqrt(true)` 则是编译错误（bool 没有到 double 的隐式转换）。
+- 影响：两条路径都把 `false`/`true` 当成 0/-1 或 0/NaN，静默给出与 C# 不同的
+  值。**自举侧没有这个毛病**：`src/selfhost/irgen_expr.zan` 的
+  `ConvertIsIntegral` 按 0/1 处理、`MathNumBadType` 也放行 bool，
+  `Math.Sqrt(true)` = 1.0、`Convert.ToInt32(true)` = 1 —— 是宿主错、自举对，
+  两侧在这里分叉。
+- 方向（宿主侧修，两侧同步）：
+  ① `Convert.*` 数值路径对 `i1` 改**零扩展**（`LLVMBuildZExt`）或显式
+     bool→0/1，得到 1（贴 C#）；② `Math.*` 把 `i1` 逐出数值白名单，报
+     "Math.Sqrt requires an int or floating-point argument"（也贴 C#）。
+  宿主改 ① 之后自举不用动（自举本来就是 0/1）；改 ② 之后自举的
+  `MathNumBadType` 要同步把 `bool` 逐出白名单。
+- 关联：A445（自举侧的同款守卫已补齐）、A444（`object` 的同类白名单问题）。
+
+### [ ] A500 自举 checker 不给条件表达式定型——`int + (c ? "a" : "b")` 被误判成 `int`
+
+- 编号说明：登记时拟用 A499，与另一会话已提交的「crypto 归档成员」A499 撞号，
+  改为 A500（编号不复用）。
+- 现象（2026-10-22 随 A445 跑固定点门时浮出）：`selfhost_fixed_point` 门在
+  **gen1 → g2.ll** 这一步就断，自举编译器拒绝编译自举源码本身：
+  ```
+  src/selfhost/ngen_binding.zan:74:9: error: cannot convert 'int' to 'string'
+     in initializer: no implicit conversion
+     74 |         string key = off + (isSet ? "#s" : "#g");
+  ```
+- 根因：`src/selfhost/checker.zan` 的 `InferType` **没有 `AK.Conditional()` 分支**，
+  条件表达式的类型恒为 `null`。于是 `checker.zan:372` 的 `AK.Binary()` 分支里
+  `rt = InferType(e.b)` 拿到 `null`，`IsStr(lt) || IsStr(rt)` 落空 → 整式按
+  **左操作数**定型成 `int`，`string key = ...` 随即被可赋值性检查拒掉。
+  宿主（`src/compiler/checker.c:3343` `AST_CONDITIONAL` → `merge_conditional_types`）
+  正确合并两支的类型 → 宿主**接受**这段代码（实测 `off=7` → 输出 `7#s`）。
+- **与 A445 无关**：用 HEAD 版 `irgen_expr.zan` 重建的基线 gen1 报**同一个错**
+  （`_scratch/a445/fixedpoint/gen1_head.exe`），所以这条在 A445 之前就断着。
+- 影响：`selfhost_fixed_point` 门**整条不绿**（gen2 链接与 g2.ll==g3.ll 的
+  比较都跑不到）；自举源码里凡是「`int + (条件 ? 字符串 : 字符串)`」的写法
+  都会被自举编译器误拒。
+- 方向：在 `InferType` 里补 `AK.Conditional()` 分支——两支类型同名取该名；
+  一支为 null 取另一支；一支是数值另一支是数值按提升取宽的；其余取 null
+  （保持宽松）。修好之后固定点门恢复，A445 才能拿到"自举侧自举一致"的背书。
+- 关联：A445（本轮 A445 的验证被这条挡在固定点门外，差分门已过）。
 

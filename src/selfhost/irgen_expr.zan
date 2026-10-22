@@ -316,6 +316,103 @@ partial class Irgen {
         if (d.kind == AK.EnumDecl()) { return ""; }
         return n;                              // class / struct
     }
+    // True for an enum: it rides an i64 slot, so it converts like an integer
+    // (the C host lowers an enum to an integer too).
+    bool IsEnumTy(Node ty) {
+        if (ty == null) { return false; }
+        if (ty.ival >= 1) { return false; }
+        Node d = binder.FindType(ty.sval);
+        return d != null && d.kind == AK.EnumDecl();
+    }
+    // The type name a Convert.ToInt32 / ToInt64 / ToInt / ToDouble argument
+    // must NOT have, or "" when the value may be converted.
+    //
+    // The C host (irgen_call.c type_is_textual_or_numeric) accepts the
+    // textual and the numeric types, the enums, `object` and the type
+    // parameters; a class instance, a struct, an array and a delegate are
+    // refused. The self-host used to hand the pointer to strtoll/strtod,
+    // which reads the OBJECT's bytes as text -- a silent out-of-bounds read
+    // that answers 0, while the very same program is refused by the host.
+    //
+    // `object` stays on the whitelist for the same reason as on the host: the
+    // compiler cannot see what it holds (TASKS.md A444). The host reads the
+    // object pointer as a C string too -- both sides are wrong in the same
+    // way until the object gets a general ToString.
+    //
+    // A nullable keeps the ELEMENT's name in `sval` (the C host recurses into
+    // element_type for TYPE_NULLABLE) and an array names its element with
+    // the rank in `ival` -- so the name printed here is the element's, the
+    // same name the C host prints (at->name).
+    string ConvertNumberBadType(Node ty) {
+        if (ty == null) { return ""; }
+        if (ty.ival >= 1) { return ty.sval; }   // an array names its element
+        return ConvertNumberBadName(ty.sval);
+    }
+    // The same judgement by NAME ("" means the value may be converted).
+    string ConvertNumberBadName(string n) {
+        if (n == "" || n == "var" || n == "string" || n == "bool" || n == "char" ||
+            n == "object") { return ""; }
+        if (n == "int" || n == "long" || n == "short" || n == "byte" ||
+            n == "sbyte" || n == "uint" || n == "ushort" || n == "ulong" ||
+            n == "float" || n == "double" || n == "decimal" || n == "nint") {
+            return "";
+        }
+        if (binder.IsTypeParam(n)) { return ""; }
+        // A delegate is refused too, and the binder keeps it OUT of `types`
+        // (it lives in `delegates`), so FindType would not see it.
+        if (binder.IsDelegateName(n)) { return n; }
+        Node d = binder.FindType(n);
+        if (d == null) { return ""; }          // unknown: stay permissive
+        if (d.kind == AK.EnumDecl()) { return ""; }
+        return n;                              // class / struct
+    }
+    // True for a value the Convert.* paths read as an integer: every integer
+    // type, `bool` and an enum -- they all ride an i64 slot.
+    bool ConvertIsIntegral(ExprVal a) {
+        if (a.ty == null) { return false; }
+        if (IsIntLike(a.ty)) { return true; }
+        if (a.ty.sval == "bool") { return true; }
+        return IsEnumTy(a.ty);
+    }
+    // Convert.ToInt32 / ToInt / ToInt64: a string is parsed with strtoll, a
+    // float is truncated towards zero and an integer is kept -- exactly what
+    // the C host does (irgen_call.c:1937). Every other value answers 0 (the
+    // host's fallback branch). A nullable lowers to a struct on the host, so
+    // the value never reaches the parser there either.
+    string ConvertIntOperand(ExprVal a) {
+        if (IsNullable(a.ty)) { return "0"; }
+        if (IsStr(a.ty)) {
+            if (!ExternSeen("strtoll")) { externDecls.Add("strtoll"); H("declare i64 @strtoll(i8*, i8**, i32)"); }
+            string r = NT();
+            L("  " + r + " = call i64 @strtoll(i8* " + a.op + ", i8** null, i32 10)");
+            return r;
+        }
+        if (IsDbl(a.ty)) {
+            string r = NT();
+            L("  " + r + " = fptosi double " + a.op + " to i64");
+            return r;
+        }
+        if (ConvertIsIntegral(a)) { return a.op; }
+        return "0";
+    }
+    // Convert.ToDouble: a string is parsed as text, an integer is converted
+    // and a float is kept -- the C host does the same (irgen_call.c:1679).
+    string ConvertDoubleOperand(ExprVal a) {
+        if (IsNullable(a.ty)) { return "0.0"; }
+        if (IsStr(a.ty)) {
+            if (!ExternSeen("strtod")) { externDecls.Add("strtod"); H("declare double @strtod(i8*, i8**)"); }
+            string r = NT();
+            L("  " + r + " = call double @strtod(i8* " + a.op + ", i8** null)");
+            return r;
+        }
+        if (IsDbl(a.ty)) { return a.op; }
+        if (ConvertIsIntegral(a)) {
+            string r = NT();
+            L("  " + r + " = sitofp i64 " + a.op + " to double");
+            return r;
+        }
+        return "0.0";
+    }
     // ulong is the one integer type whose value can set the high bit of the i64
     // slot, so it selects unsigned division/remainder/shift/compare and %llu.
     bool IsUlong(Node ty) { if (ty == null) { return false; } return ty.sval == "ulong" && ty.ival == 0; }
@@ -5043,9 +5140,55 @@ partial class Irgen {
         return mname;
     }
 
-    // the value as a double (an int argument is converted, like the C host)
-    string ToDbl(ExprVal v) {
+    // The type name a Math.* argument must NOT have, or "" when the value may
+    // be used as a number.
+    //
+    // The C host (irgen_call.c math_arg_is_numeric) judges the LOWERCED value:
+    // an integer, a float or a double is numeric, everything else -- a class
+    // instance, an array, a delegate, a string (all of them pointers) -- is
+    // not. The self-host only has the static type here, so the same set is
+    // reproduced by name: the integral types, the floating types, `char` and
+    // `bool` lower to numbers, a string lowers to a pointer.
+    //
+    // The self-host used to lower every argument with `sitofp i64 <ptr>`,
+    // which is invalid IR ("'x' defined with type 'ptr' but expected 'i64'")
+    // -- the compile died in the LLVM verifier instead of telling the user
+    // what was wrong.
+    string MathNumBadType(Node ty) {
+        if (ty == null) { return ""; }               // unknown: stay permissive
+        if (ty.op == 1) { return ty.sval; }          // a nullable lowers to a struct
+        if (ty.ival >= 1) { return ty.sval; }        // an array is a pointer
+        string n = ty.sval;
+        if (n == "" || n == "var") { return ""; }
+        if (IsIntLike(ty)) { return ""; }            // every integer rides an i64
+        if (n == "double" || n == "float") { return ""; }
+        if (n == "char" || n == "bool") { return ""; }
+        if (n == "string") { return "string"; }      // a string is a pointer
+        if (n == "object") { return "object"; }      // `object` is a pointer
+        if (n == "decimal") { return "decimal"; }    // the host lowers it to a struct
+        if (binder.IsTypeParam(n)) { return ""; }    // known only at instantiation
+        if (binder.IsDelegateName(n)) { return n; }
+        Node d = binder.FindType(n);
+        if (d == null) { return ""; }                // unknown: stay permissive
+        if (d.kind == AK.EnumDecl()) { return ""; }  // an enum rides an i64
+        return n;                                    // class / struct
+    }
+
+    // The value as a double (an int argument is converted, like the C host)
+    //
+    // `fname` is the Math function being lowered and `at` the CALL itself:
+    // the C host reports the refusal at the call (irgen_call.c
+    // math_require_numeric, expr->loc). A value that is not a number is
+    // refused with the C host's wording instead of being lowered into
+    // invalid IR; the call then answers 0.0.
+    string ToDbl(ExprVal v, string fname, Node at) {
         if (IsDbl(v.ty)) { return v.op; }
+        string bad = MathNumBadType(v.ty);
+        if (bad != "") {
+            diags.Error("Math." + fname + " requires an int or floating-point argument",
+                at.line, at.col);
+            return "0.0";
+        }
         string c = NT();
         L("  " + c + " = sitofp i64 " + v.op + " to double");
         return c;
@@ -5071,7 +5214,7 @@ partial class Irgen {
         else if (name == "Sqrt") { f1 = "sqrt"; }
         if (f1 != "" && argc == 1) {
             ExprVal a = GenExpr(e.kids[0]);
-            string av = ToDbl(a);
+            string av = ToDbl(a, name, e);
             if (!ExternSeen(f1)) { externDecls.Add(f1); H("declare double @" + f1 + "(double)"); }
             string r = NT();
             L("  " + r + " = call double @" + f1 + "(double " + av + ")");
@@ -5082,8 +5225,8 @@ partial class Irgen {
             if (name == "Atan2") { fn = "atan2"; }
             ExprVal a = GenExpr(e.kids[0]);
             ExprVal b = GenExpr(e.kids[1]);
-            string av = ToDbl(a);
-            string bv = ToDbl(b);
+            string av = ToDbl(a, name, e);
+            string bv = ToDbl(b, name, e);
             if (!ExternSeen(fn)) { externDecls.Add(fn); H("declare double @" + fn + "(double, double)"); }
             string r = NT();
             L("  " + r + " = call double @" + fn + "(double " + av + ", double " + bv + ")");
@@ -5093,7 +5236,7 @@ partial class Irgen {
             string fn = "floor";
             if (name == "Ceiling") { fn = "ceil"; }
             ExprVal a = GenExpr(e.kids[0]);
-            string av = ToDbl(a);
+            string av = ToDbl(a, name, e);
             if (!ExternSeen(fn)) { externDecls.Add(fn); H("declare double @" + fn + "(double)"); }
             string r = NT();
             L("  " + r + " = call double @" + fn + "(double " + av + ")");
@@ -5101,6 +5244,14 @@ partial class Irgen {
         }
         if (name == "Abs" && argc == 1) {
             ExprVal a = GenExpr(e.kids[0]);
+            // The integer path lowers `ashr i64 <op>` -- a class instance (a
+            // pointer) would make that invalid IR. Refuse it the way the C
+            // host does (irgen_call.c math_require_numeric).
+            if (MathNumBadType(a.ty) != "") {
+                diags.Error("Math.Abs requires an int or floating-point argument",
+                    e.line, e.col);
+                return new ExprVal("0", MkType("int"));
+            }
             if (IsDbl(a.ty)) {
                 if (!ExternSeen("fabs")) { externDecls.Add("fabs"); H("declare double @fabs(double)"); }
                 string r = NT();
@@ -5119,10 +5270,21 @@ partial class Irgen {
         if ((name == "Max" || name == "Min") && argc == 2) {
             ExprVal a = GenExpr(e.kids[0]);
             ExprVal b = GenExpr(e.kids[1]);
+            // Both arguments are judged separately: the C host does the same
+            // (irgen_call.c math_arg_is_numeric on each side) -- a pointer
+            // next to an integer used to slip through and then be sitofp'd
+            // into invalid IR.
+            string badA = MathNumBadType(a.ty);
+            string badB = MathNumBadType(b.ty);
+            if (badA != "" || badB != "") {
+                diags.Error("Math." + name + " requires numeric arguments",
+                    e.line, e.col);
+                return new ExprVal("0", MkType("int"));
+            }
             bool dbl = IsDbl(a.ty) || IsDbl(b.ty);
             if (dbl) {
-                string av = ToDbl(a);
-                string bv = ToDbl(b);
+                string av = ToDbl(a, name, e);
+                string bv = ToDbl(b, name, e);
                 string an = NT();
                 L("  " + an + " = fcmp uno double " + av + ", " + av);
                 string bn = NT();
@@ -5293,46 +5455,38 @@ partial class Irgen {
             }
             if (callee.sval == "ToDouble" && e.kids.Count == 1) {
                 ExprVal a = GenExpr(e.kids[0]);
-                if (IsStr(a.ty)) {
-                    if (!ExternSeen("strtod")) { externDecls.Add("strtod"); H("declare double @strtod(i8*, i8**)"); }
-                    string r = NT();
-                    L("  " + r + " = call double @strtod(i8* " + a.op + ", i8** null)");
-                    return new ExprVal(r, MkType("double"));
+                // The C host refuses a class instance / struct / array /
+                // delegate (irgen_call.c type_is_textual_or_numeric): the
+                // pointer would be read as a C string, which walks off into
+                // the image. The self-host used to sitofp that pointer --
+                // invalid IR, and the program the host refuses compiled here.
+                string bad = ConvertNumberBadType(a.ty);
+                if (bad != "") {
+                    diags.Error("Convert.ToDouble: cannot convert '" + bad
+                        + "' to a number -- pass a string or a numeric value",
+                        e.line, e.col);
+                    return new ExprVal("0.0", MkType("double"));
                 }
-                if (IsDbl(a.ty)) { return a; }
-                string c = NT();
-                L("  " + c + " = sitofp i64 " + a.op + " to double");
-                return new ExprVal(c, MkType("double"));
+                return new ExprVal(ConvertDoubleOperand(a), MkType("double"));
             }
-            if ((callee.sval == "ToInt32" || callee.sval == "ToInt") && e.kids.Count == 1) {
+            if ((callee.sval == "ToInt32" || callee.sval == "ToInt" ||
+                 callee.sval == "ToInt64") && e.kids.Count == 1) {
                 // the C host (irgen_call.c:1937) parses the text with strtoll,
                 // truncates a float towards zero and keeps an integer as it
                 // is. The 32-bit narrowing is NOT part of the call: it
                 // happens where the value enters a typed location (an int
                 // slot is an i32), so the value travels as an i64 here.
                 ExprVal a = GenExpr(e.kids[0]);
-                string parsed = "0";
-                if (IsStr(a.ty)) {
-                    if (!ExternSeen("strtoll")) { externDecls.Add("strtoll"); H("declare i64 @strtoll(i8*, i8**, i32)"); }
-                    parsed = NT();
-                    L("  " + parsed + " = call i64 @strtoll(i8* " + a.op + ", i8** null, i32 10)");
-                } else if (IsDbl(a.ty)) {
-                    parsed = NT();
-                    L("  " + parsed + " = fptosi double " + a.op + " to i64");
-                } else if (IsIntLike(a.ty)) {
-                    parsed = a.op;
+                string rt = "int";
+                if (callee.sval == "ToInt64") { rt = "long"; }
+                string bad = ConvertNumberBadType(a.ty);
+                if (bad != "") {
+                    diags.Error("Convert." + callee.sval + ": cannot convert '" + bad
+                        + "' to a number -- pass a string or a numeric value",
+                        e.line, e.col);
+                    return new ExprVal("0", MkType(rt));
                 }
-                return new ExprVal(parsed, MkType("int"));
-            }
-            if (callee.sval == "ToInt64" && e.kids.Count == 1) {
-                ExprVal a = GenExpr(e.kids[0]);
-                if (IsStr(a.ty)) {
-                    if (!ExternSeen("strtoll")) { externDecls.Add("strtoll"); H("declare i64 @strtoll(i8*, i8**, i32)"); }
-                    string r = NT();
-                    L("  " + r + " = call i64 @strtoll(i8* " + a.op + ", i8** null, i32 10)");
-                    return new ExprVal(r, MkType("long"));
-                }
-                return a;
+                return new ExprVal(ConvertIntOperand(a), MkType(rt));
             }
         }
         // int/long.Parse(s), double/float.Parse(s) and matching
@@ -5418,8 +5572,7 @@ partial class Irgen {
             && callee.sval == "Round" && e.kids.Count >= 1 && e.kids.Count <= 2) {
             if (!ExternSeen("round")) { externDecls.Add("round"); H("declare double @round(double)"); }
             ExprVal a = GenExpr(e.kids[0]);
-            string av = a.op;
-            if (!IsDbl(a.ty)) { string c = NT(); L("  " + c + " = sitofp i64 " + av + " to double"); av = c; }
+            string av = ToDbl(a, "Round", e);
             if (e.kids.Count == 1) {
                 string r = NT();
                 L("  " + r + " = call double @round(double " + av + ")");
@@ -5427,8 +5580,7 @@ partial class Irgen {
             }
             if (!ExternSeen("pow")) { externDecls.Add("pow"); H("declare double @pow(double, double)"); }
             ExprVal d = GenExpr(e.kids[1]);
-            string dv = d.op;
-            if (!IsDbl(d.ty)) { string dc = NT(); L("  " + dc + " = sitofp i64 " + dv + " to double"); dv = dc; }
+            string dv = ToDbl(d, "Round", e);
             string sc = NT();
             L("  " + sc + " = call double @pow(double 1.0e1, double " + dv + ")");
             string sd = NT();

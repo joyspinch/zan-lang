@@ -2700,3 +2700,36 @@ kernel32、shell32、user32、advapi32、version）。
 - 通用教训：**同一个后端里"谁拥有一个值"的约定必须前后一致**。宿主是
   "弱读 +1、存进槽不再 retain"，自举是"读不 retain、存进槽才 retain"；
   两套约定混用就会多一次或少一次 retain，表现为对象死活与预期不同。
+
+## 138. 数值转换的守卫：判据要**分两套**，守卫要落在**分派入口**
+
+- 坑（2026-10-22 实测）：自举的 `ToDbl` 对任何非 double 实参一律
+  `sitofp i64 <v> to double`——类实例是**指针**，造出 `sitofp i64 i8*`，
+  LLVM 校验失败（非法 IR）；`Convert.ToInt32/ToInt` 更狠，无条件
+  `call i64 @atoi(i8* <a.op>)`，把**对象指针**当 C 字符串读，静默得到 0。
+  宿主侧早已 fail-closed 报人话诊断，两边同款缺陷。
+- 关键：**宿主的两个转换入口判的不是同一件事**，照抄时不能混成一张表：
+  - `Math.*` 判的是**降级后的值类型**（`math_arg_is_numeric`：整数/浮点算
+    数值，字符串/类实例/数组/委托都是指针 → 不算）；
+  - `Convert.ToInt32/ToInt64/ToInt/ToDouble` 判的是**静态类型白名单**
+    （`type_is_textual_or_numeric`：文本/数值/枚举/`object`/类型参数放行，
+    类/结构体/数组/委托拒绝）。
+  自举侧只有静态类型，于是 `Math.*` 那套要**按"降级后是什么"重写一张表**
+  （可空→struct、数组/字符串/`object`→指针、`decimal`→struct），不能直接
+  复用 `Convert.*` 的白名单——`object` 在 `Convert.*` 放行、在 `Math.*` 拒绝。
+- 做法：守卫落在**分派入口**（`ToDbl` 与 `Convert.*` 的分派处），不要在
+  `GenMathCall` 的每个分支各判一次；诊断**逐字**照抄宿主
+  （`Math.<名> requires an int or floating-point argument`、
+  `Convert.<名>: cannot convert '<T>' to a number -- pass a string or a
+  numeric value`），位置指向**调用点**。
+- 坑：枚举走 i64 槽，转换语义与整数相同——按"是不是类/结构体"判会把枚举
+  误拒（宿主放行，`Color.Green` → 1）。
+- 坑：可空值在 `Convert.*` 路径上宿主给 0（整型路径），自举也必须给 0；
+  `ToDouble` 路径宿主会读装箱单元给出垃圾值（实测 2.12e-314），自举给 0.0
+  即可——真装箱语义归 A454，别在这条路上"对齐"到宿主的垃圾值。
+- 通用教训：**判据不同的两个入口，白名单不能共用一张表**。共用会同时错两次：
+  放行了不该放行的，又拒掉了不该拒的。判据先分清，守卫再落。
+- 通用教训：**"两边都错"要分清谁对谁错**：宿主把 `bool` 当**有符号**整数
+  用（i1 符号扩展），`Math.Sqrt(true)` = NaN、`Convert.ToInt32(true)` = -1；
+  自举给 1.0 / 1 才是对的。这种分叉**不要照抄宿主**——照抄会把一个宿主缺陷
+  复制成两份，该另立条目在宿主侧修。
