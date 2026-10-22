@@ -1,0 +1,235 @@
+using System;
+using System.Collections.Generic;
+
+namespace System.Json;
+
+// JSON Patch 失败时抛出（路径不存在、操作不支持、test 不通过）。
+public class JsonPatchException : Exception {
+    public JsonPatchException(string message) {
+        Message = message;
+    }
+}
+
+// JSON Patch（RFC 6902）应用器。
+//
+// 支持 add / remove / replace / move / copy / test 六种操作，路径用
+// JSON Pointer（"/a/b/0"，"-" 表示数组末尾追加）。
+//
+// 语义取舍：
+//   - 应用到**副本**上并返回新文档，原文档不动（RFC 6902 允许原地，
+//     但返回值更不容易误用）；
+//   - move 的 from 若是 path 的前缀，报错（RFC 要求这种移动无效）；
+//   - 数组插入没有"插入"原语，只能重建数组（顺序保持）。
+public class JsonPatch {
+    // 应用补丁（返回新文档）。
+    public static JsonValue Apply(JsonValue doc, JsonValue patch) {
+        if (patch == null || !patch.IsArray()) {
+            throw new JsonPatchException("JSON Patch must be an array of operations");
+        }
+        JsonValue work = (doc == null) ? JsonValue.NewObject() : doc.Clone();
+        int n = patch.Count();
+        for (int i = 0; i < n; i = i + 1) {
+            JsonValue op = patch.At(i);
+            if (op == null || !op.IsObject()) {
+                throw new JsonPatchException("patch operation must be an object");
+            }
+            string name = op.Str("op", "");
+            string path = op.Str("path", "");
+            if (name == "add") {
+                JsonValue v = op.Get("value");
+                if (v == null) { throw new JsonPatchException("add operation requires 'value'"); }
+                JsonPatch.Add(work, path, v);
+            } else if (name == "remove") {
+                JsonPatch.Remove(work, path);
+            } else if (name == "replace") {
+                JsonValue v = op.Get("value");
+                if (v == null) { throw new JsonPatchException("replace operation requires 'value'"); }
+                JsonPatch.Replace(work, path, v);
+            } else if (name == "move") {
+                JsonPatch.Move(work, op.Str("from", ""), path);
+            } else if (name == "copy") {
+                JsonPatch.Copy(work, op.Str("from", ""), path);
+            } else if (name == "test") {
+                JsonValue v = op.Get("value");
+                if (!JsonEqual.DeepEquals(JsonPatch.Get(work, path), v)) {
+                    throw new JsonPatchException("test failed at " + path);
+                }
+            } else {
+                throw new JsonPatchException("unknown patch operation '" + name + "'");
+            }
+        }
+        return work;
+    }
+
+    // 应用补丁（从 JSON 文本读）。
+    public static JsonValue Apply(JsonValue doc, string patchJson) {
+        return JsonPatch.Apply(doc, JsonValue.Parse(patchJson));
+    }
+
+    // 取指针指向的值（不存在返回 null）。
+    public static JsonValue Get(JsonValue doc, string pointer) {
+        List<string> parts = JsonPointer.Split(pointer);
+        JsonValue cur = doc;
+        for (int i = 0; i < parts.Count; i = i + 1) {
+            if (cur == null) { return null; }
+            string p = parts[i];
+            if (cur.IsObject()) {
+                cur = cur.Get(p);
+            } else if (cur.IsArray()) {
+                int idx = JsonPatch.IndexOf(p);
+                if (idx < 0) { idx = cur.Count() + idx; }
+                if (idx < 0 || idx >= cur.Count()) { return null; }
+                cur = cur.At(idx);
+            } else {
+                return null;
+            }
+        }
+        return cur;
+    }
+
+    // add：对象按键写入（存在则替换），数组按下标插入，"-" 追加到末尾。
+    static void Add(JsonValue doc, string pointer, JsonValue value) {
+        if (pointer.Length == 0) { throw new JsonPatchException("cannot add at the document root"); }
+        JsonValue parent = null;
+        string last = "";
+        if (!JsonPatch.ParentOf(doc, pointer, out parent, out last)) {
+            throw new JsonPatchException("no such path: " + pointer);
+        }
+        if (parent.IsObject()) {
+            parent.Set(last, value);
+            return;
+        }
+        if (parent.IsArray()) {
+            if (last == "-") { parent.Append(value); return; }
+            int idx = JsonPatch.IndexOf(last);
+            if (idx < 0 || idx > parent.Count()) {
+                throw new JsonPatchException("bad array index in path: " + pointer);
+            }
+            JsonPatch.InsertAt(parent, idx, value);
+            return;
+        }
+        throw new JsonPatchException("cannot add to a scalar at: " + pointer);
+    }
+
+    // remove：删掉对象键或数组元素。
+    static void Remove(JsonValue doc, string pointer) {
+        JsonValue parent = null;
+        string last = "";
+        if (!JsonPatch.ParentOf(doc, pointer, out parent, out last)) {
+            throw new JsonPatchException("no such path: " + pointer);
+        }
+        if (parent.IsObject()) {
+            if (!parent.Remove(last)) {
+                throw new JsonPatchException("no such property: " + last);
+            }
+            return;
+        }
+        if (parent.IsArray()) {
+            int idx = JsonPatch.IndexOf(last);
+            if (idx < 0) { idx = parent.Count() + idx; }
+            if (idx < 0 || idx >= parent.Count()) {
+                throw new JsonPatchException("no such array index: " + last);
+            }
+            parent.RemoveAt(idx);
+            return;
+        }
+        throw new JsonPatchException("cannot remove from a scalar at: " + pointer);
+    }
+
+    // replace：目标必须存在。
+    static void Replace(JsonValue doc, string pointer, JsonValue value) {
+        JsonValue parent = null;
+        string last = "";
+        if (!JsonPatch.ParentOf(doc, pointer, out parent, out last)) {
+            throw new JsonPatchException("no such path: " + pointer);
+        }
+        if (parent.IsObject()) {
+            if (!parent.Has(last)) { throw new JsonPatchException("no such property: " + last); }
+            parent.Set(last, value);
+            return;
+        }
+        if (parent.IsArray()) {
+            int idx = JsonPatch.IndexOf(last);
+            if (idx < 0) { idx = parent.Count() + idx; }
+            if (idx < 0 || idx >= parent.Count()) {
+                throw new JsonPatchException("no such array index: " + last);
+            }
+            parent.SetAt(idx, value);
+            return;
+        }
+        throw new JsonPatchException("cannot replace a scalar at: " + pointer);
+    }
+
+    // move：先删 from，再加到 path。
+    static void Move(JsonValue doc, string from, string path) {
+        if (from == path) { return; }
+        if (path.StartsWith(from + "/")) {
+            throw new JsonPatchException("cannot move a location into its own child: " + from);
+        }
+        JsonValue v = JsonPatch.Get(doc, from);
+        if (v == null) { throw new JsonPatchException("no such path: " + from); }
+        JsonPatch.Remove(doc, from);
+        JsonPatch.Add(doc, path, v);
+    }
+
+    // copy：把 from 的值复制一份加到 path。
+    static void Copy(JsonValue doc, string from, string path) {
+        JsonValue v = JsonPatch.Get(doc, from);
+        if (v == null) { throw new JsonPatchException("no such path: " + from); }
+        JsonPatch.Add(doc, path, v.Clone());
+    }
+
+    // 取父节点与最后一段；路径不存在时返回 false。
+    static bool ParentOf(JsonValue doc, string pointer, out JsonValue parent, out string last) {
+        parent = null;
+        last = "";
+        List<string> parts = JsonPointer.Split(pointer);
+        if (parts.Count == 0) { return false; }
+        last = parts[parts.Count - 1];
+        JsonValue cur = doc;
+        for (int i = 0; i < parts.Count - 1; i = i + 1) {
+            if (cur == null) { return false; }
+            string p = parts[i];
+            if (cur.IsObject()) {
+                cur = cur.Get(p);
+            } else if (cur.IsArray()) {
+                int idx = JsonPatch.IndexOf(p);
+                if (idx < 0) { idx = cur.Count() + idx; }
+                if (idx < 0 || idx >= cur.Count()) { return false; }
+                cur = cur.At(idx);
+            } else {
+                return false;
+            }
+        }
+        parent = cur;
+        return parent != null;
+    }
+
+    // 数组插入（JsonValue 没有 insert 原语，只能重建）。
+    static void InsertAt(JsonValue arr, int index, JsonValue value) {
+        int n = arr.Count();
+        List<JsonValue> items = new List<JsonValue>();
+        for (int i = 0; i < n; i = i + 1) { items.Add(arr.At(i)); }
+        for (int i = 0; i < n; i = i + 1) { arr.RemoveAt(0); }
+        for (int i = 0; i < index && i < items.Count; i = i + 1) { arr.Append(items[i]); }
+        arr.Append(value);
+        for (int i = index; i < items.Count; i = i + 1) { arr.Append(items[i]); }
+    }
+
+    // 解析数组下标；不是整数返回 -1。
+    static int IndexOf(string s) {
+        if (s == null || s.Length == 0) { return -1; }
+        int i = 0;
+        int sign = 1;
+        int c = s[0] & 255;
+        if (c == 45) { sign = -1; i = 1; }
+        if (i >= s.Length) { return -1; }
+        int v = 0;
+        for (; i < s.Length; i = i + 1) {
+            int d = s[i] & 255;
+            if (d < 48 || d > 57) { return -1; }
+            v = v * 10 + (d - 48);
+        }
+        return sign * v;
+    }
+}

@@ -1,0 +1,473 @@
+using System;
+using System.Collections.Generic;
+
+namespace System.Json;
+
+// JSONPath 的一段。
+public class JsonPathSegment {
+    // 段类型：1 子节点名、2 通配、3 下标、4 递归下降、5 过滤、6 切片。
+    public const int Child = 1;
+    public const int Wildcard = 2;
+    public const int Index = 3;
+    public const int Recurse = 4;
+    public const int Filter = 5;
+    public const int Slice = 6;
+
+    public int kind;
+    // 子节点名 / 递归下降的目标名（"*" 表示全部）。
+    public string name;
+    // 下标。
+    public int index;
+    // 切片：起、止、步长（步长 0 视为 1）。
+    public int from;
+    public int to;
+    public int step;
+    // 过滤表达式原文。
+    public string filter;
+
+    public JsonPathSegment() {
+        this.kind = 0;
+        this.name = "";
+        this.index = 0;
+        this.from = 0;
+        this.to = 0;
+        this.step = 1;
+        this.filter = "";
+    }
+}
+
+// JSONPath 查询。
+//
+// 支持：$ 根、.name 与 ['name'] 子节点、[*] 通配、[0] / [-1] 下标、
+// [start:end] 切片、..name 与 ..* 递归下降、[?(条件)] 过滤、
+// 逗号并接多段路径。条件支持 @.field 存在性，以及 == != > >= < <=
+// （数字与字符串）。不支持：过滤里的函数调用、脚本表达式、多层
+// 括号嵌套过滤。
+//
+// 路径写错时抛 ArgumentException（不静默返回空表）。
+public class JsonPath {
+    string src;
+    int pos;
+
+    public JsonPath() {
+        this.src = "";
+        this.pos = 0;
+    }
+
+    // 查询（按文档顺序返回命中的值）。
+    //
+    // 路径可以是用逗号并接的多条选择器（"$.a, $.b"），结果按路径顺序
+    // 拼接，不去重。
+    public static List<JsonValue> Query(JsonValue root, string path) {
+        List<JsonValue> out2 = new List<JsonValue>();
+        List<string> parts = JsonPath.SplitGroup(path);
+        for (int i = 0; i < parts.Count; i = i + 1) {
+            string one = parts[i].Trim();
+            if (one.Length == 0) { continue; }
+            JsonPath p = new JsonPath();
+            p.src = one;
+            p.pos = 0;
+            List<JsonPathSegment> segs = p.Parse();
+            List<JsonValue> cur = new List<JsonValue>();
+            if (root != null) { cur.Add(root); }
+            List<JsonValue> hits = p.Eval(cur, segs, 0);
+            for (int k = 0; k < hits.Count; k = k + 1) { out2.Add(hits[k]); }
+        }
+        return out2;
+    }
+
+    // 按顶层逗号拆成多条选择器（方括号内、圆括号内与引号内的逗号不算）。
+    static List<string> SplitGroup(string path) {
+        List<string> parts = new List<string>();
+        if (path == null) { return parts; }
+        int n = path.Length;
+        int depth = 0;
+        int start = 0;
+        for (int i = 0; i < n; i = i + 1) {
+            int c = path[i] & 255;
+            if (c == 91 || c == 40) { depth = depth + 1; continue; }
+            if (c == 93 || c == 41) { depth = depth - 1; continue; }
+            if (c == 39 || c == 34) {
+                i = i + 1;
+                while (i < n && (path[i] & 255) != c) { i = i + 1; }
+                continue;
+            }
+            if (c == 44 && depth == 0) {
+                parts.Add(path.Substring(start, i - start));
+                start = i + 1;
+            }
+        }
+        parts.Add(path.Substring(start, n - start));
+        return parts;
+    }
+
+    // 路径是否命中（至少一个结果）。
+    public static bool Exists(JsonValue root, string path) {
+        return JsonPath.Query(root, path).Count > 0;
+    }
+
+    // 取第一个命中值（没有返回 dflt）。
+    public static JsonValue First(JsonValue root, string path, JsonValue dflt) {
+        List<JsonValue> hits = JsonPath.Query(root, path);
+        if (hits.Count == 0) { return dflt; }
+        return hits[0];
+    }
+
+    // ---- 解析 ----
+
+    List<JsonPathSegment> Parse() {
+        List<JsonPathSegment> segs = new List<JsonPathSegment>();
+        this.SkipSpace();
+        if (this.pos < this.src.Length && (this.src[this.pos] & 255) == 36) { this.pos = this.pos + 1; }
+        while (true) {
+            this.SkipSpace();
+            if (this.pos >= this.src.Length) { break; }
+            int c = this.src[this.pos] & 255;
+            if (c == 46) {           // '.'
+                this.pos = this.pos + 1;
+                if (this.pos < this.src.Length && (this.src[this.pos] & 255) == 46) {
+                    this.pos = this.pos + 1;    // '..' 递归下降
+                    string name = this.ReadName();
+                    JsonPathSegment s = new JsonPathSegment();
+                    s.kind = JsonPathSegment.Recurse;
+                    s.name = name.Length == 0 ? "*" : name;
+                    segs.Add(s);
+                    continue;
+                }
+                string key = this.ReadName();
+                if (key.Length == 0) {
+                    throw new ArgumentException("invalid JSONPath at " + Convert.ToString(this.pos));
+                }
+                JsonPathSegment seg = new JsonPathSegment();
+                if (key == "*") {
+                    seg.kind = JsonPathSegment.Wildcard;
+                } else {
+                    seg.kind = JsonPathSegment.Child;
+                    seg.name = key;
+                }
+                segs.Add(seg);
+                continue;
+            }
+            if (c == 91) {           // '['
+                segs.Add(this.ParseBracket());
+                continue;
+            }
+            throw new ArgumentException("invalid JSONPath at " + Convert.ToString(this.pos));
+        }
+        return segs;
+    }
+
+    JsonPathSegment ParseBracket() {
+        JsonPathSegment s = new JsonPathSegment();
+        this.pos = this.pos + 1;    // '['
+        this.SkipSpace();
+        if (this.pos >= this.src.Length) {
+            throw new ArgumentException("unterminated JSONPath bracket");
+        }
+        int c = this.src[this.pos] & 255;
+        if (c == 42) {              // '*'
+            this.pos = this.pos + 1;
+            this.Expect(']');
+            s.kind = JsonPathSegment.Wildcard;
+            return s;
+        }
+        if (c == 63) {              // '?'
+            int close = this.src.IndexOf("]", this.pos);
+            if (close < 0) { throw new ArgumentException("unterminated JSONPath filter"); }
+            s.kind = JsonPathSegment.Filter;
+            s.filter = this.src.Substring(this.pos + 1, close - this.pos - 1).Trim();
+            // 过滤条件写作 "[?(...)]"，外层括号是语法的一部分，要剥掉。
+            if (s.filter.Length >= 2
+                && (s.filter[0] & 255) == 40
+                && (s.filter[s.filter.Length - 1] & 255) == 41) {
+                s.filter = s.filter.Substring(1, s.filter.Length - 2).Trim();
+            }
+            this.pos = close + 1;
+            return s;
+        }
+        if (c == 39 || c == 34) {   // '\'' or '"'
+            string quote = this.src.Substring(this.pos, 1);
+            int end = this.src.IndexOf(quote, this.pos + 1);
+            if (end < 0) { throw new ArgumentException("unterminated JSONPath name"); }
+            s.kind = JsonPathSegment.Child;
+            s.name = this.src.Substring(this.pos + 1, end - this.pos - 1);
+            this.pos = end + 1;
+            this.Expect(']');
+            return s;
+        }
+        int close2 = this.src.IndexOf("]", this.pos);
+        if (close2 < 0) { throw new ArgumentException("unterminated JSONPath bracket"); }
+        string body = this.src.Substring(this.pos, close2 - this.pos).Trim();
+        this.pos = close2 + 1;
+        if (body.IndexOf(":") >= 0) {
+            s.kind = JsonPathSegment.Slice;
+            this.ParseSlice(body, s);
+            return s;
+        }
+        int idx = 0;
+        if (JsonPath.TryIndex(body, out idx)) {
+            s.kind = JsonPathSegment.Index;
+            s.index = idx;
+            return s;
+        }
+        s.kind = JsonPathSegment.Child;
+        s.name = body;
+        return s;
+    }
+
+    void ParseSlice(string body, JsonPathSegment s) {
+        List<string> parts = body.Split(":");
+        s.from = 0;
+        s.to = 0;
+        s.step = 1;
+        int v = 0;
+        if (parts.Count >= 1 && parts[0].Length > 0) {
+            if (JsonPath.TryIndex(parts[0], out v)) { s.from = v; }
+        }
+        if (parts.Count >= 2 && parts[1].Length > 0) {
+            if (JsonPath.TryIndex(parts[1], out v)) { s.to = v; }
+        }
+        if (parts.Count >= 3 && parts[2].Length > 0) {
+            if (JsonPath.TryIndex(parts[2], out v) && v != 0) { s.step = v; }
+            if (s.step < 0) { s.step = -s.step; }
+        }
+        if (s.step == 0) { s.step = 1; }
+    }
+
+    void Expect(int ch) {
+        this.SkipSpace();
+        if (this.pos >= this.src.Length || (this.src[this.pos] & 255) != ch) {
+            throw new ArgumentException("expected '" + Convert.ToString(ch) + "' in JSONPath at "
+                + Convert.ToString(this.pos));
+        }
+        this.pos = this.pos + 1;
+    }
+
+    string ReadName() {
+        int start = this.pos;
+        while (this.pos < this.src.Length) {
+            int c = this.src[this.pos] & 255;
+            if (c == 46 || c == 91 || c == 93 || c == 32 || c == 9) { break; }
+            this.pos = this.pos + 1;
+        }
+        return this.src.Substring(start, this.pos - start);
+    }
+
+    void SkipSpace() {
+        while (this.pos < this.src.Length) {
+            int c = this.src[this.pos] & 255;
+            if (c != 32 && c != 9) { break; }
+            this.pos = this.pos + 1;
+        }
+    }
+
+    // ---- 求值 ----
+
+    List<JsonValue> Eval(List<JsonValue> cur, List<JsonPathSegment> segs, int si) {
+        if (si >= segs.Count) { return cur; }
+        JsonPathSegment s = segs[si];
+        List<JsonValue> next = new List<JsonValue>();
+        for (int i = 0; i < cur.Count; i = i + 1) {
+            JsonValue node = cur[i];
+            if (s.kind == JsonPathSegment.Child) {
+                if (node.IsObject()) {
+                    JsonValue v = node.Get(s.name);
+                    if (v != null) { next.Add(v); }
+                }
+            } else if (s.kind == JsonPathSegment.Wildcard) {
+                if (node.IsArray()) {
+                    int n = node.Count();
+                    for (int k = 0; k < n; k = k + 1) { next.Add(node.At(k)); }
+                } else if (node.IsObject()) {
+                    int n = node.Count();
+                    for (int k = 0; k < n; k = k + 1) { next.Add(node.ValAt(k)); }
+                }
+            } else if (s.kind == JsonPathSegment.Index) {
+                if (node.IsArray()) {
+                    int idx = s.index;
+                    if (idx < 0) { idx = node.Count() + idx; }
+                    if (idx >= 0 && idx < node.Count()) { next.Add(node.At(idx)); }
+                }
+            } else if (s.kind == JsonPathSegment.Slice) {
+                if (node.IsArray()) { this.CollectSlice(node, s, next); }
+            } else if (s.kind == JsonPathSegment.Recurse) {
+                this.CollectRecursive(node, s.name, next);
+            } else if (s.kind == JsonPathSegment.Filter) {
+                if (node.IsArray()) {
+                    int n = node.Count();
+                    for (int k = 0; k < n; k = k + 1) {
+                        if (this.FilterMatch(node.At(k), s.filter)) { next.Add(node.At(k)); }
+                    }
+                } else if (node.IsObject()) {
+                    int n = node.Count();
+                    for (int k = 0; k < n; k = k + 1) {
+                        if (this.FilterMatch(node.ValAt(k), s.filter)) { next.Add(node.ValAt(k)); }
+                    }
+                }
+            }
+        }
+        return this.Eval(next, segs, si + 1);
+    }
+
+    void CollectSlice(JsonValue arr, JsonPathSegment s, List<JsonValue> out2) {
+        int n = arr.Count();
+        int from = s.from;
+        int to = s.to;
+        if (from < 0) { from = n + from; }
+        if (to < 0) { to = n + to; }
+        if (from < 0) { from = 0; }
+        if (to > n) { to = n; }
+        int step = s.step;
+        if (step <= 0) { step = 1; }
+        for (int i = from; i < to; i = i + step) {
+            if (i >= 0 && i < n) { out2.Add(arr.At(i)); }
+        }
+    }
+
+    // 递归下降：收集所有（后代里）名字匹配的成员。
+    void CollectRecursive(JsonValue node, string name, List<JsonValue> out2) {
+        if (node.IsObject()) {
+            int n = node.Count();
+            for (int i = 0; i < n; i = i + 1) {
+                string k = node.KeyAt(i);
+                JsonValue v = node.ValAt(i);
+                if (name == "*" || k == name) { out2.Add(v); }
+                this.CollectRecursive(v, name, out2);
+            }
+        } else if (node.IsArray()) {
+            int n = node.Count();
+            for (int i = 0; i < n; i = i + 1) {
+                JsonValue v = node.At(i);
+                if (name == "*") { out2.Add(v); }
+                this.CollectRecursive(v, name, out2);
+            }
+        }
+    }
+
+    // ---- 过滤条件 ----
+
+    bool FilterMatch(JsonValue node, string expr) {
+        string e = expr == null ? "" : expr.Trim();
+        if (e.Length == 0 || (e[0] & 255) != 64) { return false; }   // 必须以 '@' 开头
+        string[] ops = new string[] { "==", "!=", ">=", "<=", ">", "<" };
+        int opAt = -1;
+        string op = "";
+        for (int i = 0; i < ops.Length; i = i + 1) {
+            int at = e.IndexOf(ops[i]);
+            if (at > 0) { opAt = at; op = ops[i]; break; }
+        }
+        string left = (opAt < 0) ? e : e.Substring(0, opAt);
+        JsonValue lv = this.FilterValue(node, left.Trim());
+        if (opAt < 0) {
+            return lv != null && !lv.IsNull();
+        }
+        string right = e.Substring(opAt + op.Length).Trim();
+        return this.Compare(lv, this.ParseLiteral(right), op);
+    }
+
+    // 解析 "@.a.b" / "@['a']" 形式的取值路径。
+    JsonValue FilterValue(JsonValue node, string path) {
+        if (path == "@") { return node; }
+        int n = path.Length;
+        int i = 1;
+        JsonValue cur = node;
+        while (i < n) {
+            if (cur == null) { return null; }
+            int c = path[i] & 255;
+            if (c == 46) {                    // '.'
+                i = i + 1;
+                int start = i;
+                while (i < n) {
+                    int cc = path[i] & 255;
+                    if (cc == 46 || cc == 91) { break; }
+                    i = i + 1;
+                }
+                string name = path.Substring(start, i - start);
+                if (!cur.IsObject()) { return null; }
+                cur = cur.Get(name);
+                continue;
+            }
+            if (c == 91) {                    // '['
+                i = i + 1;
+                int start = i;
+                while (i < n && (path[i] & 255) != 93) { i = i + 1; }
+                string raw = path.Substring(start, i - start).Trim();
+                if (raw.Length >= 2 && ((raw[0] & 255) == 39 || (raw[0] & 255) == 34)) {
+                    raw = raw.Substring(1, raw.Length - 2);
+                }
+                if (i < n) { i = i + 1; }
+                if (!cur.IsObject()) { return null; }
+                cur = cur.Get(raw);
+                continue;
+            }
+            return null;
+        }
+        return cur;
+    }
+
+    JsonValue ParseLiteral(string text) {
+        string t = text == null ? "" : text.Trim();
+        if (t.Length == 0) { return null; }
+        int c = t[0] & 255;
+        if (t.Length >= 2 && (c == 39 || c == 34)) {
+            return JsonValue.NewStr(t.Substring(1, t.Length - 2));
+        }
+        if (t == "true") { return JsonValue.NewBool(true); }
+        if (t == "false") { return JsonValue.NewBool(false); }
+        if (t == "null") { return JsonValue.NewNull(); }
+        return JsonValue.ParseNumberToken(t, 0, t.Length);
+    }
+
+    bool Compare(JsonValue lv, JsonValue rv, string op) {
+        if (lv == null || rv == null) { return false; }
+        if (op == "==") { return JsonEqual.DeepEquals(lv, rv); }
+        if (op == "!=") { return !JsonEqual.DeepEquals(lv, rv); }
+        if (lv.IsNumber() && rv.IsNumber()) {
+            double a = lv.AsDouble(0.0);
+            double b = rv.AsDouble(0.0);
+            if (op == ">") { return a > b; }
+            if (op == ">=") { return a >= b; }
+            if (op == "<") { return a < b; }
+            if (op == "<=") { return a <= b; }
+            return false;
+        }
+        if (lv.IsString() && rv.IsString()) {
+            string a = lv.AsString("");
+            string b = rv.AsString("");
+            if (op == ">") { return a > b; }
+            if (op == ">=") { return a >= b; }
+            if (op == "<") { return a < b; }
+            if (op == "<=") { return a <= b; }
+        }
+        return false;
+    }
+
+    // 解析整数（可带负号）。
+    static int IndexOf(string s) {
+        int v = 0;
+        if (JsonPath.TryIndex(s, out v)) { return v; }
+        return -1;
+    }
+
+    // 解析整数（可带负号）；不是整数返回 false。
+    //
+    // 单独一个 Try 是因为"下标 -1"是合法值：用 -1 同时表示"不是数字"
+    // 和"最后一个元素"，两件事会混在一起。
+    static bool TryIndex(string s, out int value) {
+        value = 0;
+        if (s == null || s.Length == 0) { return false; }
+        int i = 0;
+        int sign = 1;
+        int c = s[0] & 255;
+        if (c == 45) { sign = -1; i = 1; }
+        if (i >= s.Length) { return false; }
+        int v = 0;
+        for (; i < s.Length; i = i + 1) {
+            int d = s[i] & 255;
+            if (d < 48 || d > 57) { return false; }
+            v = v * 10 + (d - 48);
+        }
+        value = sign * v;
+        return true;
+    }
+}

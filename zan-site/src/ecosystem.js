@@ -131,6 +131,7 @@ export const ecosystemGroups = [
       'Zan.MsgPack',
       'Zan.Cbor',
       'Zan.Bson',
+      'Zan.Json',
       'Zan.Text',
       'Zan.Image',
     ],
@@ -366,6 +367,15 @@ export const ecosystemPackages = [
     description: '编解码文档、数组、对象标识与日期，检查长度；二进制字段按文本尽力处理。',
     icon: 'box',
     tags: ['BSON', 'JSON 值树', 'UTF-8 二进制限制'],
+    status: '源码可用',
+  },
+  {
+    name: 'Zan.Json',
+    category: 'data',
+    title: 'JSON 契约层',
+    description: '按 JSON Schema 校验数据、用 JSONPath 查询、用 JSON Patch 变换 JSON 文档。',
+    icon: 'code',
+    tags: ['JSON Schema', 'JSONPath', 'JSON Patch'],
     status: '源码可用',
   },
   {

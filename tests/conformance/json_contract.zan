@@ -1,0 +1,219 @@
+using System;
+using System.Collections.Generic;
+using System.Json;
+
+// JSON 契约层：
+// 1. JSON Schema（draft 2020-12 子集）——类型、必填、白名单、属性模式、
+//    枚举/常量、长度、范围、数组、组合关键字、$ref（含递归）、布尔 schema；
+// 2. JSONPath——根/子节点/通配/下标/负下标/切片/递归下降/过滤/选择器组；
+// 3. JSON Patch（RFC 6902）——add/remove/replace/move/copy/test 与路径转义。
+class Program {
+    static int failures = 0;
+
+    static void Check(bool cond, string name) {
+        if (cond) {
+            Console.WriteLine("ok " + name);
+        } else {
+            Console.WriteLine("FAIL " + name);
+            failures = failures + 1;
+        }
+    }
+
+    static string N(List<JsonValue> nodes) {
+        return "" + nodes.Count;
+    }
+
+    // 取子对象的 JSON 文本（取不到就返回一个可见的标记）。
+    static string Sub(JsonValue v, string key) {
+        JsonValue sub = v.Get(key);
+        if (sub == null) { return "<null>"; }
+        return sub.ToJson();
+    }
+
+    static void Main(string[] args) {
+        Schema();
+        Path();
+        Patch();
+        Console.WriteLine("failures=" + failures);
+    }
+
+    // ---- JSON Schema ----
+
+    static void Schema() {
+        JsonSchema sch = JsonSchema.Parse(
+            "{\"type\":\"object\",\"required\":[\"name\"],\"properties\":{"
+            + "\"name\":{\"type\":\"string\",\"minLength\":2,\"maxLength\":8},"
+            + "\"age\":{\"type\":\"integer\",\"minimum\":0,\"maximum\":150},"
+            + "\"tags\":{\"type\":\"array\",\"items\":{\"type\":\"string\"},\"minItems\":1},"
+            + "\"role\":{\"enum\":[\"admin\",\"user\"]},"
+            + "\"kind\":{\"const\":\"person\"},"
+            + "\"home\":{\"type\":\"object\",\"properties\":{\"city\":{\"type\":\"string\"}},"
+            + "\"required\":[\"city\"],\"additionalProperties\":false},"
+            + "\"score\":{\"type\":\"number\",\"exclusiveMinimum\":0}},"
+            + "\"additionalProperties\":false}");
+        Check(sch.IsValid(JsonValue.Parse("{\"name\":\"ann\",\"age\":30}")), "schema accepts");
+        Check(sch.IsValid(JsonValue.Parse("{\"name\":\"ann\",\"role\":\"admin\",\"kind\":\"person\"}")),
+            "schema accepts optional fields");
+        Check(!sch.IsValid(JsonValue.Parse("{}")), "schema rejects missing required");
+        Check(!sch.IsValid(JsonValue.Parse("{\"name\":\"a\"}")), "schema rejects minLength");
+        Check(!sch.IsValid(JsonValue.Parse("{\"name\":\"ann\",\"age\":-1}")), "schema rejects minimum");
+        Check(!sch.IsValid(JsonValue.Parse("{\"name\":\"ann\",\"age\":200}")), "schema rejects maximum");
+        Check(!sch.IsValid(JsonValue.Parse("{\"name\":\"ann\",\"role\":\"root\"}")), "schema rejects enum");
+        Check(!sch.IsValid(JsonValue.Parse("{\"name\":\"ann\",\"kind\":\"robot\"}")), "schema rejects const");
+        Check(!sch.IsValid(JsonValue.Parse("{\"name\":\"ann\",\"tags\":[]}")), "schema rejects minItems");
+        Check(!sch.IsValid(JsonValue.Parse("{\"name\":\"ann\",\"tags\":[1]}")), "schema rejects item type");
+        Check(!sch.IsValid(JsonValue.Parse("{\"name\":\"ann\",\"home\":{}}")), "schema rejects nested required");
+        Check(!sch.IsValid(JsonValue.Parse("{\"name\":\"ann\",\"home\":{\"city\":\"x\",\"zip\":1}}")),
+            "schema rejects nested additional property");
+        Check(!sch.IsValid(JsonValue.Parse("{\"name\":\"ann\",\"extra\":1}")), "schema rejects additional property");
+        Check(!sch.IsValid(JsonValue.Parse("{\"name\":\"ann\",\"score\":0}")), "schema rejects exclusiveMinimum");
+        Check(sch.IsValid(JsonValue.Parse("{\"name\":\"ann\",\"score\":0.5}")), "schema accepts exclusiveMinimum");
+
+        JsonSchemaResult r = sch.Validate(JsonValue.Parse("{\"name\":\"a\",\"age\":900}"));
+        Check(r.Count() == 2, "schema reports every error");
+        JsonSchemaError first = r.First();
+        Check(first != null && first.path == "/name", "schema error carries instance path");
+        Check(first != null && first.keyword == "minLength", "schema error carries keyword");
+
+        JsonSchema types = JsonSchema.Parse("{\"type\":[\"string\",\"null\"]}");
+        Check(types.IsValid(JsonValue.Parse("\"x\"")), "schema accepts union type");
+        Check(types.IsValid(JsonValue.Parse("null")), "schema accepts null in union");
+        Check(!types.IsValid(JsonValue.Parse("1")), "schema rejects union mismatch");
+
+        JsonSchema patterns = JsonSchema.Parse(
+            "{\"type\":\"object\",\"patternProperties\":{\"^x-\":{\"type\":\"integer\"}}}");
+        Check(patterns.IsValid(JsonValue.Parse("{\"x-a\":1}")), "schema patternProperties matches");
+        Check(!patterns.IsValid(JsonValue.Parse("{\"x-a\":\"s\"}")), "schema patternProperties enforces");
+
+        JsonSchema lengths = JsonSchema.Parse("{\"type\":\"string\",\"pattern\":\"^a+\"}");
+        Check(lengths.IsValid(JsonValue.Parse("\"aaa\"")), "schema pattern accepts");
+        Check(!lengths.IsValid(JsonValue.Parse("\"bbb\"")), "schema pattern rejects");
+        Check(JsonSchema.Parse("{\"type\":\"string\",\"maxLength\":1}")
+            .IsValid(JsonValue.Parse("\"a\"")), "schema maxLength accepts inside bound");
+        Check(!JsonSchema.Parse("{\"type\":\"string\",\"maxLength\":1}")
+            .IsValid(JsonValue.Parse("\"ab\"")), "schema maxLength rejects past bound");
+
+        JsonSchema combos = JsonSchema.Parse(
+            "{\"oneOf\":[{\"type\":\"integer\"},{\"type\":\"string\",\"minLength\":2}]}");
+        Check(combos.IsValid(JsonValue.Parse("5")), "schema oneOf accepts first branch");
+        Check(combos.IsValid(JsonValue.Parse("\"ab\"")), "schema oneOf accepts second branch");
+        Check(!combos.IsValid(JsonValue.Parse("\"a\"")), "schema oneOf rejects both branches");
+        Check(JsonSchema.Parse("{\"anyOf\":[{\"type\":\"integer\"},{\"type\":\"string\"}]}")
+            .IsValid(JsonValue.Parse("\"a\"")), "schema anyOf accepts");
+        Check(!JsonSchema.Parse("{\"allOf\":[{\"type\":\"integer\"},{\"minimum\":5}]}")
+            .IsValid(JsonValue.Parse("1")), "schema allOf enforces every branch");
+        Check(!JsonSchema.Parse("{\"not\":{\"type\":\"integer\"}}")
+            .IsValid(JsonValue.Parse("1")), "schema not rejects");
+
+        JsonSchema refs = JsonSchema.Parse(
+            "{\"$defs\":{\"pos\":{\"type\":\"integer\",\"minimum\":1}},"
+            + "\"type\":\"object\",\"properties\":{\"n\":{\"$ref\":\"#/$defs/pos\"}}}");
+        Check(refs.IsValid(JsonValue.Parse("{\"n\":5}")), "schema $ref resolves local pointer");
+        Check(!refs.IsValid(JsonValue.Parse("{\"n\":0}")), "schema $ref enforces the target");
+
+        JsonSchema defs = JsonSchema.Parse(
+            "{\"definitions\":{\"pos\":{\"type\":\"integer\"}},\"$ref\":\"#/definitions/pos\"}");
+        Check(defs.IsValid(JsonValue.Parse("3")), "schema $ref resolves definitions");
+
+        JsonSchema tree = JsonSchema.Parse(
+            "{\"$defs\":{\"node\":{\"type\":\"object\",\"properties\":{"
+            + "\"kids\":{\"type\":\"array\",\"items\":{\"$ref\":\"#/$defs/node\"}}}}},"
+            + "\"$ref\":\"#/$defs/node\"}");
+        Check(tree.IsValid(JsonValue.Parse("{\"kids\":[{\"kids\":[]}]}")), "schema recursive $ref validates");
+
+        Check(!JsonSchema.Parse("false").IsValid(JsonValue.Parse("1")), "schema false rejects everything");
+        Check(JsonSchema.Parse("true").IsValid(JsonValue.Parse("1")), "schema true accepts everything");
+    }
+
+    // ---- JSONPath ----
+
+    static void Path() {
+        JsonValue doc = JsonValue.Parse(
+            "{\"store\":{\"book\":[{\"title\":\"a\",\"price\":8,\"tags\":[\"x\"]},"
+            + "{\"title\":\"b\",\"price\":12,\"tags\":[\"y\",\"z\"]}]},"
+            + "\"bike\":{\"color\":\"red\"},\"n\":3}");
+
+        Check(N(JsonPath.Query(doc, "$.store.book[*].title")) == "2", "path wildcard");
+        Check(N(JsonPath.Query(doc, "$.store.book[0].title")) == "1", "path index");
+        Check(N(JsonPath.Query(doc, "$.store.book[-1].title")) == "1", "path negative index");
+        Check(N(JsonPath.Query(doc, "$.store.book[0:1].title")) == "1", "path slice");
+        Check(N(JsonPath.Query(doc, "$.store.book[0:2].title")) == "2", "path slice end");
+        Check(N(JsonPath.Query(doc, "$..title")) == "2", "path recursive descent");
+        Check(N(JsonPath.Query(doc, "$..tags[*]")) == "3", "path recursive wildcard");
+        Check(N(JsonPath.Query(doc, "$['store']['book'][0]['title']")) == "1", "path bracket names");
+        Check(N(JsonPath.Query(doc, "$.store.book[?(@.price > 10)].title")) == "1", "path filter greater");
+        Check(N(JsonPath.Query(doc, "$.store.book[?(@.price == 8)].title")) == "1", "path filter equals");
+        Check(N(JsonPath.Query(doc, "$.store.book[?(@.price != 8)].title")) == "1", "path filter not equals");
+        Check(N(JsonPath.Query(doc, "$.store.book[?(@.price)].title")) == "2", "path filter existence");
+        Check(N(JsonPath.Query(doc, "$.store.book[?(@.title == 'b')].price")) == "1", "path filter string literal");
+        Check(N(JsonPath.Query(doc, "$.bike.color, $.n")) == "2", "path selector group");
+        Check(JsonPath.Exists(doc, "$.bike.color"), "path exists");
+        Check(!JsonPath.Exists(doc, "$.bike.size"), "path missing");
+        JsonValue first = JsonPath.First(doc, "$.store.book[*].price", null);
+        Check(first != null && first.AsInt(0) == 8, "path first");
+        Check(JsonPath.First(doc, "$.nope", null) == null, "path first fallback");
+
+        bool threw = false;
+        try {
+            JsonPath.Query(doc, "$.store.book[");
+        } catch (Exception e) {
+            threw = true;
+        }
+        Check(threw, "path invalid raises");
+    }
+
+    // ---- JSON Patch ----
+
+    static void Patch() {
+        JsonValue doc = JsonValue.Parse("{\"a\":1,\"b\":[1,2,3],\"c\":{\"d\":\"x\"}}");
+
+        Check(JsonPatch.Apply(doc, "[{\"op\":\"replace\",\"path\":\"/a\",\"value\":9}]").ToJson()
+            == "{\"a\":9,\"b\":[1,2,3],\"c\":{\"d\":\"x\"}}", "patch replace");
+        Check(JsonPatch.Apply(doc, "[{\"op\":\"add\",\"path\":\"/e\",\"value\":5}]").ToJson()
+            == "{\"a\":1,\"b\":[1,2,3],\"c\":{\"d\":\"x\"},\"e\":5}", "patch add object key");
+        Check(Sub(JsonPatch.Apply(doc, "[{\"op\":\"add\",\"path\":\"/b/1\",\"value\":7}]"), "b")
+            == "[1,7,2,3]", "patch add array index");
+        Check(Sub(JsonPatch.Apply(doc, "[{\"op\":\"add\",\"path\":\"/b/-\",\"value\":7}]"), "b")
+            == "[1,2,3,7]", "patch add array tail");
+        Check(Sub(JsonPatch.Apply(doc, "[{\"op\":\"remove\",\"path\":\"/c/d\"}]"), "c")
+            == "{}", "patch remove object key");
+        Check(Sub(JsonPatch.Apply(doc, "[{\"op\":\"remove\",\"path\":\"/b/0\"}]"), "b")
+            == "[2,3]", "patch remove array index");
+        Check(Sub(JsonPatch.Apply(doc, "[{\"op\":\"move\",\"from\":\"/a\",\"path\":\"/c/a\"}]"), "c")
+            == "{\"d\":\"x\",\"a\":1}", "patch move");
+        Check(Sub(JsonPatch.Apply(doc, "[{\"op\":\"copy\",\"from\":\"/a\",\"path\":\"/c/a\"}]"), "c")
+            == "{\"d\":\"x\",\"a\":1}", "patch copy");
+        Check(JsonPatch.Apply(doc, "[{\"op\":\"test\",\"path\":\"/a\",\"value\":1}]").ToJson()
+            == doc.ToJson(), "patch test passes");
+
+        Check(doc.ToJson() == "{\"a\":1,\"b\":[1,2,3],\"c\":{\"d\":\"x\"}}", "patch leaves source alone");
+
+        JsonValue escaped = JsonPatch.Apply(JsonValue.Parse("{\"a/b\":1,\"c~d\":2}"),
+            "[{\"op\":\"replace\",\"path\":\"/a~1b\",\"value\":9}]");
+        Check(escaped.ToJson() == "{\"a/b\":9,\"c~d\":2}", "patch pointer escaping");
+
+        bool threw = false;
+        try {
+            JsonPatch.Apply(doc, "[{\"op\":\"test\",\"path\":\"/a\",\"value\":2}]");
+        } catch (Exception e) {
+            threw = true;
+        }
+        Check(threw, "patch failed test raises");
+
+        threw = false;
+        try {
+            JsonPatch.Apply(doc, "[{\"op\":\"remove\",\"path\":\"/nope\"}]");
+        } catch (Exception e) {
+            threw = true;
+        }
+        Check(threw, "patch missing path raises");
+
+        threw = false;
+        try {
+            JsonPatch.Apply(doc, "[{\"op\":\"frobnicate\",\"path\":\"/a\"}]");
+        } catch (Exception e) {
+            threw = true;
+        }
+        Check(threw, "patch unknown op raises");
+    }
+}
