@@ -75,6 +75,10 @@ tools/agent/verify.ps1 -Paths tests/conformance/aes_gcm.zan -RunTests
   `core.autocrlf` 把 `.zan` 变成 CRLF，而 `.gitattributes` 规定提交 LF，
   于是原样比较全仓 100% 假红（实测 8356/8356）。工具内部改为
   "归一化行尾后比较 `--stdout` 结果"，只差换行不算不格式。
+  **门禁失败别用 `zanfmt <file>` 就地清格式债**：就地模式与 `--stdout`
+  不是一套口径——实测对一个 394 行的文件就地跑出 622 行重排 churn
+  （续行缩进/空行口径都变了），而 `--stdout` 只报 1 行差异。正确动作：
+  `zanfmt --stdout <file>` 与现文件逐行比对，把差异行手工改到位。
 - **compile**：单文件编译失败会自动回退到**模块整体编译**（`packages/<Pkg>`、
   `tools/<Tool>`）；多文件项目因此不再假红。**不用 `--deny-warnings`**：
   基线不干净时它会把 stdlib 既有告警升成错误（实测 stdlib/System/Threading
