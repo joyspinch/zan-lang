@@ -226,11 +226,21 @@ if(NOT WIN32)
 else()
     set(ZAN_RT_OBJ_DEFS)
 endif()
+# -ffunction-sections: the publish link carries --gc-sections, which can only
+# prune sections that are already split per function. Without it these runtime
+# objects enter the link whole, so every program carries the runtime in full
+# (measured on the linux-musl set: .text 139,378 -> 93,202, -33%). MSVC has
+# no such flag (its equivalent is /Gy), hence the guard.
+if(MSVC)
+    set(ZAN_RT_OBJ_SECTIONS)
+else()
+    set(ZAN_RT_OBJ_SECTIONS -ffunction-sections)
+endif()
 set(ZAN_RT_IO_OBJ "${CMAKE_BINARY_DIR}/zanrt_io${CMAKE_C_OUTPUT_EXTENSION}")
 add_custom_command(
     OUTPUT ${ZAN_RT_IO_OBJ}
     COMMAND ${ZAN_RT_IO_CC} ${ZAN_RT_OBJ_DEFS} -DZAN_IO_STACKLESS_ONLY
-            -I ${CMAKE_SOURCE_DIR}/src/runtime -O2
+            -I ${CMAKE_SOURCE_DIR}/src/runtime -O2 ${ZAN_RT_OBJ_SECTIONS}
             -c ${CMAKE_SOURCE_DIR}/src/runtime/rt_io.c -o ${ZAN_RT_IO_OBJ}
     DEPENDS ${CMAKE_SOURCE_DIR}/src/runtime/rt_io.c
             ${CMAKE_SOURCE_DIR}/src/runtime/rt_io.h
@@ -254,7 +264,7 @@ set(ZAN_RT_TIMER_OBJ "${CMAKE_BINARY_DIR}/zanrt_timer${CMAKE_C_OUTPUT_EXTENSION}
 add_custom_command(
     OUTPUT ${ZAN_RT_TIMER_OBJ}
     COMMAND ${ZAN_RT_IO_CC} ${ZAN_RT_OBJ_DEFS} -std=c11
-            -I ${CMAKE_SOURCE_DIR}/src/runtime -O2
+            -I ${CMAKE_SOURCE_DIR}/src/runtime -O2 ${ZAN_RT_OBJ_SECTIONS}
             -c ${CMAKE_SOURCE_DIR}/src/runtime/rt_timer.c -o ${ZAN_RT_TIMER_OBJ}
     DEPENDS ${CMAKE_SOURCE_DIR}/src/runtime/rt_timer.c
             ${CMAKE_SOURCE_DIR}/src/runtime/rt_timer.h
@@ -289,7 +299,7 @@ set(ZAN_RT_CRYPTO_ARCHIVE "${CMAKE_BINARY_DIR}/libzancrypto${CMAKE_C_STATIC_LIBR
 add_custom_command(
     OUTPUT ${ZAN_RT_CRYPTO_ARCHIVE}
     COMMAND ${ZAN_RT_IO_CC} ${ZAN_RT_OBJ_DEFS} -std=c11
-            -I ${CMAKE_SOURCE_DIR}/src/runtime -O2
+            -I ${CMAKE_SOURCE_DIR}/src/runtime -O2 ${ZAN_RT_OBJ_SECTIONS}
             -c ${CMAKE_SOURCE_DIR}/src/runtime/rt_hw_accel.c
             -o ${ZAN_RT_CRYPTO_OBJ}
     COMMAND ${CMAKE_AR} qc ${ZAN_RT_CRYPTO_ARCHIVE} ${ZAN_RT_CRYPTO_OBJ}
@@ -317,7 +327,7 @@ add_custom_command(TARGET zanc POST_BUILD
 set(ZAN_EMBED_OBJ "${CMAKE_BINARY_DIR}/zan_embed_api${CMAKE_C_OUTPUT_EXTENSION}")
 add_custom_command(
     OUTPUT ${ZAN_EMBED_OBJ}
-    COMMAND ${ZAN_RT_IO_CC} -O2
+    COMMAND ${ZAN_RT_IO_CC} -O2 ${ZAN_RT_OBJ_SECTIONS}
             -c ${CMAKE_SOURCE_DIR}/src/runtime/zan_embed_api.c
             -o ${ZAN_EMBED_OBJ}
     DEPENDS ${CMAKE_SOURCE_DIR}/src/runtime/zan_embed_api.c
@@ -337,7 +347,7 @@ target_compile_definitions(zanc PRIVATE ZAN_EMBED_OBJ="${ZAN_EMBED_OBJ}")
 set(ZAN_INFLATE_OBJ "${CMAKE_BINARY_DIR}/zan_inflate${CMAKE_C_OUTPUT_EXTENSION}")
 add_custom_command(
     OUTPUT ${ZAN_INFLATE_OBJ}
-    COMMAND ${ZAN_RT_IO_CC} -O2
+    COMMAND ${ZAN_RT_IO_CC} -O2 ${ZAN_RT_OBJ_SECTIONS}
             -DMINIZ_NO_ARCHIVE_APIS -DMINIZ_NO_ZIP_APIS -DMINIZ_NO_STDIO
             -DMINIZ_NO_TIME -DMINIZ_NO_ARCHIVE_WRITERS
             -I ${CMAKE_SOURCE_DIR}/src/common
@@ -369,7 +379,7 @@ set(ZAN_RT_IO_MT_OBJ "${CMAKE_BINARY_DIR}/zanrt_io_mt${CMAKE_C_OUTPUT_EXTENSION}
 add_custom_command(
     OUTPUT ${ZAN_RT_IO_MT_OBJ}
     COMMAND ${ZAN_RT_IO_CC} ${ZAN_RT_OBJ_DEFS} -DZAN_IO_STACKLESS_ONLY -DZAN_CO_DRIVER
-            -I ${CMAKE_SOURCE_DIR}/src/runtime -O2
+            -I ${CMAKE_SOURCE_DIR}/src/runtime -O2 ${ZAN_RT_OBJ_SECTIONS}
             -c ${CMAKE_SOURCE_DIR}/src/runtime/rt_io.c -o ${ZAN_RT_IO_MT_OBJ}
     DEPENDS ${CMAKE_SOURCE_DIR}/src/runtime/rt_io.c
             ${CMAKE_SOURCE_DIR}/src/runtime/rt_io.h
@@ -401,7 +411,7 @@ set(ZAN_RT_MEM_OBJ "${CMAKE_BINARY_DIR}/zanrt_mem${CMAKE_C_OUTPUT_EXTENSION}")
 add_custom_command(
     OUTPUT ${ZAN_RT_MEM_OBJ}
     COMMAND ${ZAN_RT_IO_CC} ${ZAN_RT_OBJ_DEFS} -std=c11
-            -I ${CMAKE_SOURCE_DIR}/src/runtime -O2
+            -I ${CMAKE_SOURCE_DIR}/src/runtime -O2 ${ZAN_RT_OBJ_SECTIONS}
             -c ${CMAKE_SOURCE_DIR}/src/runtime/rt_mem.c -o ${ZAN_RT_MEM_OBJ}
     DEPENDS ${CMAKE_SOURCE_DIR}/src/runtime/rt_mem.c
     COMMENT "Building small-object allocator object (zanrt_mem)"
@@ -419,7 +429,7 @@ set(ZAN_RT_SYNC_OBJ "${CMAKE_BINARY_DIR}/zanrt_sync${CMAKE_C_OUTPUT_EXTENSION}")
 add_custom_command(
     OUTPUT ${ZAN_RT_SYNC_OBJ}
     COMMAND ${ZAN_RT_IO_CC} -std=c11
-            -I ${CMAKE_SOURCE_DIR}/src/runtime -O2
+            -I ${CMAKE_SOURCE_DIR}/src/runtime -O2 ${ZAN_RT_OBJ_SECTIONS}
             -c ${CMAKE_SOURCE_DIR}/src/runtime/rt_sync.c -o ${ZAN_RT_SYNC_OBJ}
     DEPENDS ${CMAKE_SOURCE_DIR}/src/runtime/rt_sync.c
             ${CMAKE_SOURCE_DIR}/src/runtime/rt_sync.h
@@ -443,7 +453,7 @@ set(ZAN_RT_FILE_OBJ "${CMAKE_BINARY_DIR}/zanrt_file${CMAKE_C_OUTPUT_EXTENSION}")
 add_custom_command(
     OUTPUT ${ZAN_RT_FILE_OBJ}
     COMMAND ${ZAN_RT_IO_CC} -std=c11
-            -I ${CMAKE_SOURCE_DIR}/src/runtime -O2
+            -I ${CMAKE_SOURCE_DIR}/src/runtime -O2 ${ZAN_RT_OBJ_SECTIONS}
             -c ${CMAKE_SOURCE_DIR}/src/runtime/rt_file.c -o ${ZAN_RT_FILE_OBJ}
     DEPENDS ${CMAKE_SOURCE_DIR}/src/runtime/rt_file.c
     COMMENT "Building file IO runtime object (zanrt_file)"
@@ -461,7 +471,7 @@ set(ZAN_RT_DECIMAL_OBJ "${CMAKE_BINARY_DIR}/zanrt_decimal${CMAKE_C_OUTPUT_EXTENS
 add_custom_command(
     OUTPUT ${ZAN_RT_DECIMAL_OBJ}
     COMMAND ${ZAN_RT_IO_CC} -std=c11
-            -I ${CMAKE_SOURCE_DIR}/src/runtime -O2
+            -I ${CMAKE_SOURCE_DIR}/src/runtime -O2 ${ZAN_RT_OBJ_SECTIONS}
             -c ${CMAKE_SOURCE_DIR}/src/runtime/rt_decimal.c -o ${ZAN_RT_DECIMAL_OBJ}
     DEPENDS ${CMAKE_SOURCE_DIR}/src/runtime/rt_decimal.c
             ${CMAKE_SOURCE_DIR}/src/runtime/rt_decimal.h

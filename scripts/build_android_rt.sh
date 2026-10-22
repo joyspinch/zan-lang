@@ -83,30 +83,30 @@ for pair in android-x64:x86_64 android-arm64:aarch64; do
     mkdir -p "$out"
 
     "$CC" --sysroot="$SYSROOT" -target "$triple" -g0 -DZAN_IO_STACKLESS_ONLY \
-        -fPIC -I "$RT" -O2 -c "$RT/rt_io.c" -o "$out/zanrt_io.o"
+        -fPIC -I "$RT" -O2 -ffunction-sections -c "$RT/rt_io.c" -o "$out/zanrt_io.o"
     "$CC" --sysroot="$SYSROOT" -target "$triple" -g0 -std=c11 -fPIC \
-        -I "$RT" -O2 -c "$RT/rt_sync.c" -o "$out/zanrt_sync.o"
+        -I "$RT" -O2 -ffunction-sections -c "$RT/rt_sync.c" -o "$out/zanrt_sync.o"
     "$CC" --sysroot="$SYSROOT" -target "$triple" -g0 -std=c11 -fPIC \
-        -I "$RT" -O2 -c "$RT/rt_file.c" -o "$out/zanrt_file.o"
+        -I "$RT" -O2 -ffunction-sections -c "$RT/rt_file.c" -o "$out/zanrt_file.o"
     # 128-bit Decimal runtime: programs that reach System.Numerics reference
     # __zan_decimal_*, and the cross link injects this object for them.
     "$CC" --sysroot="$SYSROOT" -target "$triple" -g0 -std=c11 -fPIC \
-        -I "$RT" -O2 -c "$RT/rt_decimal.c" -o "$out/zanrt_decimal.o"
+        -I "$RT" -O2 -ffunction-sections -c "$RT/rt_decimal.c" -o "$out/zanrt_decimal.o"
     "$CC" --sysroot="$SYSROOT" -target "$triple" -g0 -std=c11 -fPIC \
-        -I "$RT" -O2 -c "$RT/rt_timer.c" -o "$out/zanrt_timer.o"
+        -I "$RT" -O2 -ffunction-sections -c "$RT/rt_timer.c" -o "$out/zanrt_timer.o"
     # Crypto as an archive member -- see scripts/build_linux_rt.sh for why a
     # bare .o on the link line is wrong here.
     "$CC" --sysroot="$SYSROOT" -target "$triple" -g0 -std=c11 -fPIC \
-        -I "$RT" -O2 -c "$RT/rt_hw_accel.c" -o "$out/zan_crypto.o"
+        -I "$RT" -O2 -ffunction-sections -c "$RT/rt_hw_accel.c" -o "$out/zan_crypto.o"
     rm -f "$out/libzancrypto.a"
     "$AR" rcs "$out/libzancrypto.a" "$out/zan_crypto.o"
     "$CC" --sysroot="$SYSROOT" -target "$triple" -g0 -std=c11 -fPIC \
-        -I "$RT" -I "$ROOT/src/common" -O2 -c "$RT/zan_embed_api.c" \
+        -I "$RT" -I "$ROOT/src/common" -O2 -ffunction-sections -c "$RT/zan_embed_api.c" \
         -o "$out/zan_embed_api.o"
     "$CC" --sysroot="$SYSROOT" -target "$triple" -g0 -std=c11 -fPIC \
         -DMINIZ_NO_ARCHIVE_APIS -DMINIZ_NO_ZIP_APIS -DMINIZ_NO_STDIO \
         -DMINIZ_NO_TIME -DMINIZ_NO_ARCHIVE_WRITERS \
-        -I "$RT" -I "$ROOT/src/common" -O2 -c "$RT/zan_inflate.c" \
+        -I "$RT" -I "$ROOT/src/common" -O2 -ffunction-sections -c "$RT/zan_inflate.c" \
         -o "$out/zan_inflate.o"
 
     # ---- the NDK sysroot subset the cross link needs ----------------------
