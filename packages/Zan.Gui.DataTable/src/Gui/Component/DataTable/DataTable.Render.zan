@@ -817,16 +817,25 @@ public partial class DataTable {
     // 列头被拖动期间 `headerDrag` 为 true，条带
     // 可标示自己为放置目标。
     // 模态浮层（行右键菜单/表头右键菜单/列选择器/条件格式清除/
-    // 编辑器弹窗）打开期间，表格交互面归浮层所有：内容阶段的事件
+    // 编辑器弹窗/列筛选弹窗）打开期间，表格交互面归浮层所有：内容阶段的事件
     // 种类就地清零。表头 chrome（全选框/排序/列菜单/筛选钮/手柄）、
     // 分组与筛选芯片条、表格体一样都是几何命中——读的是原始事件，
     // 弹层的全窗阻挡拦不住几何命中；菜单比表格高时会被钳到表格
     // 顶部，菜单项正好盖住表头，点菜单项就点穿到全选框上，选中行
     // 被改成点击位置的行（2026-09 用户实测）。浮层自身的内容在
     // 覆盖层阶段绘制，仍读原始事件，不受此抑制影响。
+    // 列筛选弹窗（openMenu）同样在清单里：它锚在表头下方、盖住大
+    // 半张表格体，而遮罩要到覆盖层阶段才注册——内容阶段（表头/
+    // 表格体/芯片条都在这一阶段跑）先于遮罩执行，遮罩拦不住它，
+    // 于是弹窗上的点击会落回表格：勾选框被点掉、选区被改写
+    // （2026-10 用户复报）。筛选钮是弹窗自己的开关，用原始事件
+    // 种类单独放行（见表头图标分支）。
+    // 图表浮层与导出进度弹层是居中模态（全视口遮罩），同样不在
+    // 清单里就会让点击落回表格（勾选框被点掉、选区被改写）。
     public static int ModalEvt(App app, DataTableState st) {
         if (st.ctxOpen || st.hdrCtxOpen || st.colChooserOpen
-            || st.cfClearOpen || st.edPopHot) { return 0; }
+            || st.cfClearOpen || st.edPopHot || st.openMenu >= 0
+            || st.chartOpen || st.ExportUiOpen()) { return 0; }
         return app.EventKind();
     }
 
@@ -1195,6 +1204,10 @@ public partial class DataTable {
         // 模态浮层打开期间整表（表头 chrome + 分组面板 + 表格体）
         // 的事件种类清零，见 ModalEvt。
         int evt = DataTable.ModalEvt(app, st);
+        // 帧首的列筛选弹窗状态：弹窗可能就在这一帧的表头点击里
+        // 才打开（筛选钮，或表头右键菜单的"筛选…"项），那不是
+        // "点别处关弹窗"——表头行上的关闭判定用它区分。
+        int openMenuAtStart = st.openMenu;
 
         // 透视视图：整表切换为交叉投影。此后的管线
         // （EnsureInit/Recompute/表头/单元格/汇总/菜单）看到的
@@ -1527,9 +1540,17 @@ public partial class DataTable {
                     if (app.focus.IsHovered(menuId)) { mColor = sIconHover.FgOr(0); }
                     c.DrawGlyphIn("filter", mIx, effTitleTop, menuIconW, effTitleH, app.Scale(10), mColor);
                     app.hitTester.RegisterRect(menuId, mIx, effTitleTop, menuIconW, effTitleH, 0);
-                    if (!st.dragColMoved && evt == 3 && app.window.EventButton() == 0
+                    // 筛选钮是列筛选弹窗自己的开关：弹窗开着时
+                    // 再点该列图标关闭它、点另一列图标切到那一列。
+                    // 弹窗期间整表事件种类被模态清零（ModalEvt），
+                    // 这一支用原始事件种类单独放行；ClickFrameCurrent
+                    // 把这次释放钉在处理它的那一帧——动画帧里
+                    // EventKind 会回读上一次的旧释放，不钉住会重复触发。
+                    int iconEvt = st.openMenu >= 0 ? app.EventKind() : evt;
+                    if (!st.dragColMoved && iconEvt == 3 && app.window.EventButton() == 0
                         && !app.LongPressFired()
-                        && app.hitTester.HitTest(app.mouseX, app.mouseY) == menuId) {
+                        && app.hitTester.HitTest(app.mouseX, app.mouseY) == menuId
+                        && app.ClickFrameCurrent()) {
                         // LongPressFired：长按图标开过列菜单的那次
                         // 收尾释放不再当图标点击——否则触摸长按一
                         // 松手筛选菜单跟着弹出，一次手势开两个菜单。
@@ -1695,6 +1716,23 @@ public partial class DataTable {
             }
         }
         if (hBand >= 0) { c.PopClip(); }
+        // 弹窗开着时表头 chrome 被模态清零（ModalEvt）：点表头
+        // 标题不排序、点全选框不勾选。但"点别处关弹窗"仍要成立
+        // ——落在表头行上的释放即关闭弹窗。筛选钮自己管开关
+        // （关闭当前列 / 切到另一列），它改动了 openMenu，这里
+        // 不再插手；本帧才打开的弹窗（表头右键菜单的"筛选…"项）
+        // 也不是"点别处关"。ClickFrameCurrent 把这次释放钉在处理
+        // 它的同一帧：动画帧里 EventKind 会回读上一次的旧释放，
+        // 不钉住会把刚打开的弹窗立刻关掉。
+        if (st.openMenu >= 0 && openMenuAtStart >= 0
+            && st.openMenu == openMenuAtStart
+            && app.EventKind() == 3 && app.ClickFrameCurrent()
+            && app.window.EventButton() == 0
+            && !st.dragColMoved
+            && app.mouseY >= y && app.mouseY < y + headerH) {
+            st.openMenu = -1;
+            app.RequestRedraw();
+        }
         c.FillRect(x, y + headerH - 1, viewW, 1, gridColor);
 
         // 列拖拽反馈与放置：双三角对齐线标记插入边界，浮动半透明幽灵芯片跟随指针
@@ -3636,6 +3674,8 @@ public partial class DataTable {
         // ---------------- 鼠标滚轮滚动表格体 ----------------
         // 指针位于表格体上时接管滚轮，
         // 避免外层页面被滚动，然后推进虚拟行窗口。
+        // 居中模态浮层（图表/导出进度）铺了全视口遮罩并接管滚轮，
+        // 核心按上一帧的认领把滚轮路由给浮层，表体自然收不到。
         bool ownsBodyWheel = false;
         if (visRows > 0) {
             ownsBodyWheel = app.CaptureWheel(x, bodyTop, viewW, bodyH);

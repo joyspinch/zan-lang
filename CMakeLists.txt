@@ -4339,6 +4339,19 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_datatable_ctxmenu_selection${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
+  # Column filter popup must not let mouse input fall through to the
+  # grid: the popup is a modal overlay (ModalEvt), so clicks inside or
+  # outside it leave the selection untouched, while the popup's own
+  # controls and the header filter button keep working.
+  add_test(NAME conformance_gui_datatable_filter_penetration
+    COMMAND ${CMAKE_COMMAND}
+      -DZANC=$<TARGET_FILE:zanc>
+      -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/datatable_filter_penetration_test.zan
+      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/packages/Zan.Gui.DataTable/src/Gui/Component/DataTable/DataTable.zan;--auto-stdlib${_gui_driver_tail}"
+      -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_datatable_filter_penetration.out
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_datatable_filter_penetration${_exe_ext}
+      -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+
   # Hit-region semantic labels (a11y projection): DataTable registers
   # select-all/select-row boxes and header titles with readable names via
   # RegisterRectL; a real frame must expose them to dump hitregions.

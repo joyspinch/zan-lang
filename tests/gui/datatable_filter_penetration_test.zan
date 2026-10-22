@@ -1,0 +1,254 @@
+using System;
+using Gui;
+using Gui.Widget;
+using Gui.Component.DataTable;
+
+// datatable: 列筛选弹窗不得把鼠标操作穿透到表格（真实 App + 注入事件）。
+// // 用户报告「datatable 的下拉面板又出现鼠标操作穿透到表格」：弹窗
+// // 打开后，点击弹窗内部或弹窗外都会把表格的选区/勾选改掉。
+// // 根因：列筛选弹窗（st.openMenu）没有进 ModalEvt 的模态清单。
+// // 弹层的遮罩是覆盖层阶段才注册的，而表格内容阶段（表头 chrome、
+// // 表格体、芯片条）先于遮罩执行，遮罩拦不住内容阶段的几何命中，
+// // 于是弹窗上的点击原样落回表格：勾选框被点掉、选区被改写。
+// // 本用例把这条语义锁进 conformance：
+// // 弹窗开着时点弹窗内/弹窗外都不动选择（弹窗外只关弹窗），
+// // 弹窗自身的控件照常可用，筛选钮仍是弹窗的开关（关闭/切列），
+// // 弹窗开着时点表头标题只关闭弹窗（表头 chrome 被模态清零），
+// // 没有弹窗时表头排序照常。
+// // 几何纪律（踩过的坑）：弹窗锚在列下方、宽 Scale(256)、高
+// // Scale(348)，会盖住大半个表体——"弹窗外"的取点必须落在弹窗
+// // 左缘之外的行号列窄带里，否则点到的是弹窗自己的控件。
+// // harness 纪律（踩过的坑）：Body 里不要再调 app.BeginFrame()——
+// // SafeFrame 已经调过；双重置会把 inputBlockPrevious 链打断。
+class Program {
+    static App app;
+    static List<DataColumn> cols;
+    static DataSource src;
+    static DataTableState st;
+
+    static void Body() {
+        WidgetId.ResetFrame();
+        if (st != null && cols != null && src != null) {
+            DataTable.RenderSource(app, 20, 20, 560, 300, cols, src, st);
+        }
+        app.RunOverlays();
+    }
+
+    static void PumpFrame() {
+        app.RequestRedraw();
+        app.PumpGuarded();
+        app.FrameGuarded(Body);
+    }
+
+    static void MoveTo(int x, int y) {
+        app.window.InjectEvent(1, x, y, 0, 0, 0);
+        PumpFrame();
+    }
+
+    static void Press(int x, int y, int button, int mods) {
+        app.window.InjectEvent(2, x, y, button, 0, mods);
+        PumpFrame();
+    }
+
+    static void Release(int x, int y, int button, int mods) {
+        app.window.InjectEvent(3, x, y, button, 0, mods);
+        PumpFrame();
+    }
+
+    static void Click(int x, int y) {
+        MoveTo(x, y);
+        Press(x, y, 0, 0);
+        Release(x, y, 0, 0);
+    }
+
+    // 滚轮一格（delta 在键码位，与 GUI 事件约定一致）。
+    static void Wheel(int x, int y) {
+        MoveTo(x, y);
+        app.window.InjectEvent(13, x, y, 0, -120, 0);
+        PumpFrame();
+    }
+
+    static int RowY(int row) {
+        return 20 + app.theme.heightMedium + row * app.theme.heightMedium
+            + app.theme.heightMedium / 2;
+    }
+
+    // 选择签名：勾选行数 + 活动单元格 + 矩形选区
+    static string Sig() {
+        int n = 0;
+        for (int i = 0; i < st.selected.Count; i = i + 1) {
+            if (st.selected[i]) { n = n + 1; }
+        }
+        return Convert.ToString(n) + "|" + Convert.ToString(st.hitOrder)
+            + "|" + Convert.ToString(st.hitCol) + "|"
+            + Convert.ToString(st.rangeR0) + "," + Convert.ToString(st.rangeR1)
+            + "," + Convert.ToString(st.rangeC0) + "," + Convert.ToString(st.rangeC1);
+    }
+
+    static List<DataRow> Rows() {
+        List<DataRow> rows = new List<DataRow>();
+        string[] names = new string[] { "a", "b", "c", "d", "e", "f" };
+        // 行数够多，表体才滚得动（滚轮穿透用例需要）。
+        for (int i = 0; i < 60; i = i + 1) {
+            DataRow r = new DataRow();
+            r.Push(names[i % names.Length]);
+            r.Push(Convert.ToString(i * 10));
+            rows.Add(r);
+        }
+        return rows;
+    }
+
+    static void Reset() {
+        src = new RowListSource(Rows());
+        st = new DataTableState();
+        st.showSelect = true;
+        st.showRowNum = true;
+        cols = new List<DataColumn>();
+        cols.Add(DataColumn.Field(DataColumn.Text("Name", 140), "name"));
+        cols.Add(DataColumn.Field(DataColumn.Numeric("Qty", 90), "qty"));
+        PumpFrame();
+    }
+
+    // 弹窗几何（复刻 RenderMenu 的锚点/钳位算法）
+    static int PopupX() {
+        int numW = app.Scale(46);
+        int selW = app.Scale(40);
+        int mx = 20 + numW + selW - st.scrollX;
+        if (mx + app.Scale(256) > 20 + 560) { mx = 20 + 560 - app.Scale(256); }
+        if (mx < 20) { mx = 20; }
+        return mx;
+    }
+
+    static int PopupY() {
+        int my = 20 + app.theme.heightMedium;
+        int canH = app.canvas.Height();
+        if (my + app.Scale(348) > canH) { my = canH - app.Scale(348) - app.Scale(6); }
+        if (my < app.titlebarH) { my = app.titlebarH; }
+        return my;
+    }
+
+    static void Main() {
+        app = new App("dt-filterpen", 900, 900);
+        app.Show();
+        app.window.InjectEvent(1, 200, 200, 0, 0, 0);
+        PumpFrame();
+
+        Reset();
+
+        int numW = app.Scale(46);
+        int selW = app.Scale(40);
+        int mx = PopupX();
+        int my = PopupY();
+
+        // 第 0 行勾选，建立一个可观测的选择基线
+        Click(20 + numW + selW / 2, RowY(0));
+        string sig0 = Sig();
+
+        // ---- 1. 弹窗开着时点弹窗内部（标题行空白处）：不动选择 ----
+        DataTable.OpenFilterMenu(st, cols, src, 0);
+        PumpFrame();
+        Click(mx + app.Scale(24), my + app.Scale(16));
+        bool insideKept = Sig() == sig0 && st.openMenu == 0;
+        Console.WriteLine("filterPopupClickInsideKeepsSelection="
+            + (insideKept ? 1 : 0));
+
+        // ---- 2. 弹窗开着时点弹窗外的表格体：只关弹窗，不动选择 ----
+        // 弹窗左缘之外是行号列的窄带——表格体内、弹窗外。
+        int bx = 20 + numW / 2;
+        Click(bx, RowY(3));
+        bool outsideKept = Sig() == sig0;
+        bool outsideClosed = st.openMenu < 0;
+        Console.WriteLine("filterPopupClickOutsideKeepsSelection="
+            + (outsideKept ? 1 : 0));
+        Console.WriteLine("filterPopupClickOutsideClosesPopup="
+            + (outsideClosed ? 1 : 0));
+
+        // ---- 3. 筛选钮仍是弹窗的开关（开 / 再点关） ----
+        int firstDataX = 20 + numW + selW;
+        int iconX = firstDataX + st.dispW[0] - app.Scale(14) - app.Scale(1)
+                    + app.Scale(7);
+        int iconY = 20 + app.theme.heightMedium / 2;
+        Click(iconX, iconY);
+        bool iconOpened = st.openMenu == 0;
+        Click(iconX, iconY);
+        bool iconClosed = st.openMenu < 0;
+        Console.WriteLine("filterIconOpensPopup=" + (iconOpened ? 1 : 0));
+        Console.WriteLine("filterIconClosesPopup=" + (iconClosed ? 1 : 0));
+
+        // ---- 4. 弹窗自身的控件照常可用（点"Text"标签页） ----
+        DataTable.OpenFilterMenu(st, cols, src, 0);
+        PumpFrame();
+        int tabW = (app.Scale(256) - app.Scale(10) * 2) / 4;
+        int tabY = my + app.Scale(8) + app.Scale(28) + app.Scale(6)
+                   + app.Scale(28) / 2;
+        int tabX = mx + app.Scale(10) + tabW + tabW / 2;
+        Click(tabX, tabY);
+        Console.WriteLine("filterPopupOwnControlWorks="
+            + (st.filterTab == 1 ? 1 : 0));
+
+        // ---- 5. 弹窗开着时点表头标题：只关闭弹窗（表头 chrome
+        //         被模态清零，这一手势不排序） ----
+        DataTable.OpenFilterMenu(st, cols, src, 0);
+        PumpFrame();
+        int titleX = firstDataX + app.Scale(40);
+        int titleY = 20 + app.theme.heightMedium / 2;
+        Click(titleX, titleY);
+        Console.WriteLine("filterPopupHeaderTitleDismisses="
+            + (st.openMenu < 0 ? 1 : 0));
+
+        // ---- 6. 没有弹窗时表头排序照常 ----
+        st.sortCol = -1;
+        st.sortDir = 0;
+        st.sortKeys.Clear();
+        Click(titleX, titleY);
+        Console.WriteLine("headerSortWithoutPopup="
+            + (st.sortCol == 0 ? 1 : 0));
+
+        // ---- 7. 图表浮层（居中模态）同样不得穿透 ----
+        Reset();
+        string chartBase = Sig();
+        st.chartOpen = true;
+        st.chartTitle = "t";
+        PumpFrame();
+        Click(20 + numW + selW / 2, RowY(0));
+        bool chartKept = Sig() == chartBase;
+        Click(20 + numW + selW + 40, RowY(2));
+        Console.WriteLine("chartOverlayKeepsSelection="
+            + (chartKept && Sig() == chartBase ? 1 : 0));
+
+        // ---- 8. 导出进度弹层（居中模态）同样不得穿透 ----
+        Reset();
+        string exportBase = Sig();
+        st.exportUi = new DataTableExportUi();
+        st.exportUi.visible = true;
+        st.exportUi.total = 100;
+        st.exportUi.done = 10;
+        PumpFrame();
+        Click(20 + numW + selW / 2, RowY(0));
+        bool exportKept = Sig() == exportBase;
+        Click(20 + numW + selW + 40, RowY(2));
+        Console.WriteLine("exportOverlayKeepsSelection="
+            + (exportKept && Sig() == exportBase ? 1 : 0));
+
+        // ---- 9. 居中模态开着时表体不滚轮（滚轮归浮层） ----
+        int wheelX = 20 + numW + selW + 40;
+        int wheelY = RowY(1);
+        Reset();
+        st.chartOpen = true;
+        st.chartTitle = "t";
+        PumpFrame();
+        Wheel(wheelX, wheelY);
+        Console.WriteLine("chartOverlayBlocksWheel="
+            + (st.scrollRow == 0 ? 1 : 0));
+
+        Reset();
+        st.exportUi = new DataTableExportUi();
+        st.exportUi.visible = true;
+        st.exportUi.total = 100;
+        st.exportUi.done = 10;
+        PumpFrame();
+        Wheel(wheelX, wheelY);
+        Console.WriteLine("exportOverlayBlocksWheel="
+            + (st.scrollRow == 0 ? 1 : 0));
+    }
+}
