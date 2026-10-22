@@ -1,0 +1,245 @@
+using System;
+using System.Collections.Generic;
+
+namespace System.Tensor;
+
+// 一个权重张量的描述（两种格式共用）。
+public class WeightTensorInfo {
+    public string name;
+    // 形状（第一维在最外层）。
+    public List<int> shape;
+    // dtype 名："F32" / "F16" / "BF16" / "Q4_0" ……（safetensors 用它自己的
+    // 字符串："I8" / "U16" / "F64" / "BOOL" ……）。
+    public string dtype;
+    // GGUF 的 ggml 类型编号；safetensors 为 -1。
+    public int ggmlType;
+    // 数据区内的字节偏移。
+    public long offset;
+    // 数据区内的字节长度。
+    public long byteLength;
+    // 元素总数。
+    public long count;
+}
+
+// 权重文件：GGUF 与 safetensors 的统一入口。
+//
+// 打开后会读完整份文件的字节、解析出元数据与张量目录；张量数据在需要时
+// 才解（Materialize / Find / Require），避免为了看一眼目录就把几个 GB
+// 的权重全解一遍。
+//
+// 两种格式的 dtype 名汇到同一张表上，所以"解成一个 f32 张量"这件事
+// 两种格式走同一条路。
+public class WeightFile {
+    public string format;
+    public Dictionary<string, string> metadata;
+    public Dictionary<string, List<string>> metadataArrays;
+    public List<WeightTensorInfo> tensors;
+
+    private byte[] file;
+    private long dataStart;
+
+    public static WeightFile Open(string path) {
+        return Load(File.ReadAllBytes(path));
+    }
+
+    // 从字节解析（测试与内存场景用；真实文件走 Open）。
+    public static WeightFile Load(byte[] bytes) {
+        WeightFile w = new WeightFile();
+        w.file = bytes;
+        w.metadata = new Dictionary<string, string>();
+        w.metadataArrays = new Dictionary<string, List<string>>();
+        w.tensors = new List<WeightTensorInfo>();
+
+        if (bytes.Length >= 4 && bytes[0] == 71 && bytes[1] == 71
+            && bytes[2] == 85 && bytes[3] == 70) {
+            GgufReader g = GgufReader.Parse(bytes);
+            w.format = "gguf";
+            w.metadata = g.metadata;
+            w.metadataArrays = g.metadataArrays;
+            w.tensors = g.tensors;
+            w.dataStart = g.dataStart;
+            return w;
+        }
+        // safetensors：8 字节小端头长 + JSON 头。JSON 头一定以 '{' 开头。
+        if (bytes.Length >= 9 && bytes[8] == 123) {
+            SafeTensorsReader s = SafeTensorsReader.Parse(bytes);
+            w.format = "safetensors";
+            w.metadata = s.metadata;
+            w.metadataArrays = s.metadataArrays;
+            w.tensors = s.tensors;
+            w.dataStart = s.dataStart;
+            return w;
+        }
+        throw new Exception("unrecognized weight file format (not GGUF, not safetensors)");
+    }
+
+    // 有没有这个张量。
+    public bool Has(string name) {
+        for (int i = 0; i < this.tensors.Count; i = i + 1) {
+            if (this.tensors[i].name == name) { return true; }
+        }
+        return false;
+    }
+
+    // 张量目录（没有返回 null）。
+    public WeightTensorInfo Info(string name) {
+        for (int i = 0; i < this.tensors.Count; i = i + 1) {
+            if (this.tensors[i].name == name) { return this.tensors[i]; }
+        }
+        return null;
+    }
+
+    // 张量名字列表（按文件里的顺序）。
+    public List<string> Names() {
+        List<string> names = new List<string>();
+        for (int i = 0; i < this.tensors.Count; i = i + 1) {
+            names.Add(this.tensors[i].name);
+        }
+        return names;
+    }
+
+    // 解出一个张量（没有返回 null）。
+    public Tensor Find(string name) {
+        WeightTensorInfo info = this.Info(name);
+        if (info == null) { return null; }
+        return this.Materialize(info);
+    }
+
+    // 解出一个张量（没有就抛）。
+    public Tensor Require(string name) {
+        WeightTensorInfo info = this.Info(name);
+        if (info == null) {
+            throw new ArgumentException("no tensor named '" + name + "'");
+        }
+        return this.Materialize(info);
+    }
+
+    // 把一段权重数据解成 f32 张量。
+    public Tensor Materialize(WeightTensorInfo info) {
+        int n = (int)info.count;
+        float[] out2 = new float[n];
+        string dt = info.dtype;
+
+        if (dt == "F32") {
+            BinaryReader r = this.ReaderAt(info.offset, info.byteLength);
+            for (int i = 0; i < n; i = i + 1) { out2[i] = r.F32(); }
+            return new Tensor(info.shape, out2);
+        }
+        if (dt == "F16") {
+            BinaryReader r = this.ReaderAt(info.offset, info.byteLength);
+            for (int i = 0; i < n; i = i + 1) {
+                out2[i] = FloatBits.FromF16Bits(r.U16());
+            }
+            return new Tensor(info.shape, out2);
+        }
+        if (dt == "BF16") {
+            BinaryReader r = this.ReaderAt(info.offset, info.byteLength);
+            for (int i = 0; i < n; i = i + 1) {
+                out2[i] = FloatBits.FromBF16Bits(r.U16());
+            }
+            return new Tensor(info.shape, out2);
+        }
+        if (dt == "F64") {
+            BinaryReader r = this.ReaderAt(info.offset, info.byteLength);
+            for (int i = 0; i < n; i = i + 1) { out2[i] = (float)r.F64(); }
+            return new Tensor(info.shape, out2);
+        }
+        if (dt == "I8" || dt == "U8" || dt == "BOOL") {
+            BinaryReader r = this.ReaderAt(info.offset, info.byteLength);
+            for (int i = 0; i < n; i = i + 1) { out2[i] = (float)r.U8(); }
+            return new Tensor(info.shape, out2);
+        }
+        if (dt == "I16" || dt == "U16") {
+            BinaryReader r = this.ReaderAt(info.offset, info.byteLength);
+            for (int i = 0; i < n; i = i + 1) { out2[i] = (float)r.I16(); }
+            return new Tensor(info.shape, out2);
+        }
+        if (dt == "I32" || dt == "U32") {
+            BinaryReader r = this.ReaderAt(info.offset, info.byteLength);
+            for (int i = 0; i < n; i = i + 1) { out2[i] = (float)r.I32(); }
+            return new Tensor(info.shape, out2);
+        }
+        if (dt == "I64" || dt == "U64") {
+            BinaryReader r = this.ReaderAt(info.offset, info.byteLength);
+            for (int i = 0; i < n; i = i + 1) { out2[i] = (float)r.I64(); }
+            return new Tensor(info.shape, out2);
+        }
+        if (dt == "Q4_0" || dt == "Q4_1" || dt == "Q5_0" || dt == "Q5_1"
+            || dt == "Q8_0") {
+            this.DecodeQuant(info, out2);
+            return new Tensor(info.shape, out2);
+        }
+        throw new ArgumentException("unsupported weight dtype '" + dt
+            + "' for tensor '" + info.name + "'");
+    }
+
+    // 数据区里某一段的读取器。
+    BinaryReader ReaderAt(long offset, long length) {
+        long start = this.dataStart + offset;
+        if (start < 0 || length < 0 || start + length > this.file.Length) {
+            throw new ArgumentException("weight tensor data out of file bounds");
+        }
+        return new BinaryReader(this.file, (int)start, (int)length);
+    }
+
+    // 块量化解码（ggml 的老量化：Q4_0 / Q4_1 / Q5_0 / Q5_1 / Q8_0）。
+    //
+    // 布局（每个 32 元素一块）：
+    //   Q4_0: fp16 d | 16 字节 nibble
+    //   Q4_1: fp16 d | fp16 m | 16 字节 nibble
+    //   Q5_0: fp16 d | 4 字节高位掩码 | 16 字节 nibble
+    //   Q5_1: fp16 d | fp16 m | 4 字节高位掩码 | 16 字节 nibble
+    //   Q8_0: fp16 d | 32 字节 int8
+    //
+    // nibble 的排布是**前后两半交错**：第 j 字节的低 4 位是第 j 个元素，
+    // 高 4 位是第 j+16 个元素（Q5 还要把掩码里的第 5 位并进去）。
+    void DecodeQuant(WeightTensorInfo info, float[] out2) {
+        string dt = info.dtype;
+        int n = (int)info.count;
+        int blocks = n / 32;
+        BinaryReader r = this.ReaderAt(info.offset, info.byteLength);
+        for (int b = 0; b < blocks; b = b + 1) {
+            int base2 = b * 32;
+            if (dt == "Q8_0") {
+                float d = FloatBits.FromF16Bits(r.U16());
+                for (int i = 0; i < 32; i = i + 1) {
+                    out2[base2 + i] = (float)r.I8() * d;
+                }
+                continue;
+            }
+            float scale = FloatBits.FromF16Bits(r.U16());
+            float minv = 0.0f;
+            if (dt == "Q4_1" || dt == "Q5_1") {
+                minv = FloatBits.FromF16Bits(r.U16());
+            }
+            long mask = 0;
+            if (dt == "Q5_0" || dt == "Q5_1") {
+                mask = r.U32();
+            }
+            for (int j = 0; j < 16; j = j + 1) {
+                int qs = r.U8();
+                int lo = qs & 15;
+                int hi = (qs >> 4) & 15;
+                if (dt == "Q4_0") {
+                    out2[base2 + j] = (float)(lo - 8) * scale;
+                    out2[base2 + j + 16] = (float)(hi - 8) * scale;
+                } else if (dt == "Q4_1") {
+                    out2[base2 + j] = (float)lo * scale + minv;
+                    out2[base2 + j + 16] = (float)hi * scale + minv;
+                } else {
+                    int xh0 = (int)(((mask >> j) << 4) & 16);
+                    int xh1 = (int)((mask >> (j + 12)) & 16);
+                    int q0 = (lo | xh0);
+                    int q1 = (hi | xh1);
+                    if (dt == "Q5_0") {
+                        out2[base2 + j] = (float)(q0 - 16) * scale;
+                        out2[base2 + j + 16] = (float)(q1 - 16) * scale;
+                    } else {
+                        out2[base2 + j] = (float)q0 * scale + minv;
+                        out2[base2 + j + 16] = (float)q1 * scale + minv;
+                    }
+                }
+            }
+        }
+    }
+}

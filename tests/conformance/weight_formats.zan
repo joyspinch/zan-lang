@@ -1,0 +1,329 @@
+// 权重格式读取（Zan.Tensor）：GGUF + safetensors。
+//
+// 用例不依赖外部权重文件：自己在内存里**造**一份 GGUF 与一份 safetensors
+// （连量化块的字节都是按位摆好的），再读回来逐项比对。这么做的理由：
+// 真实权重文件几百 MB 到几 GB，不进仓库；手造的夹具能把"字节摆在哪"这件事
+// 钉死——位级错一位，数值就悄悄不对，而数值对不对只有断言知道。
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Text;
+using System.Tensor;
+
+// 字节写入器：造夹具用。
+public class ByteWriter {
+    public byte[] buf;
+    public int len;
+
+    public ByteWriter() {
+        buf = new byte[256];
+        len = 0;
+    }
+
+    public void Ensure(int extra) {
+        if (len + extra <= buf.Length) { return; }
+        int cap = buf.Length * 2;
+        while (cap < len + extra) { cap = cap * 2; }
+        byte[] grown = new byte[cap];
+        NativeMemory.Copy((nint)grown, (nint)buf, len);
+        buf = grown;
+    }
+
+    public void U8(int v) {
+        Ensure(1);
+        buf[len] = (byte)v;
+        len = len + 1;
+    }
+
+    public void U16(int v) {
+        Ensure(2);
+        buf[len] = (byte)v;
+        buf[len + 1] = (byte)(v >> 8);
+        len = len + 2;
+    }
+
+    public void U32(long v) {
+        Ensure(4);
+        buf[len] = (byte)v;
+        buf[len + 1] = (byte)(v >> 8);
+        buf[len + 2] = (byte)(v >> 16);
+        buf[len + 3] = (byte)(v >> 24);
+        len = len + 4;
+    }
+
+    public void U64(long v) {
+        Ensure(8);
+        for (int i = 0; i < 8; i = i + 1) {
+            buf[len + i] = (byte)(v >> (i * 8));
+        }
+        len = len + 8;
+    }
+
+    // GGUF 的长度前缀字符串。
+    public void Str(string s) {
+        byte[] raw = Encoding.GetBytes(s);
+        U64(raw.Length);
+        Ensure(raw.Length);
+        NativeMemory.Copy((nint)buf + len, (nint)raw, raw.Length);
+        len = len + raw.Length;
+    }
+
+    public void Bytes(byte[] raw) {
+        Ensure(raw.Length);
+        NativeMemory.Copy((nint)buf + len, (nint)raw, raw.Length);
+        len = len + raw.Length;
+    }
+
+    // 补齐到 alignment 的整数倍（数据区起点要对齐）。
+    public void PadTo(int alignment) {
+        int pad = alignment - (len % alignment);
+        if (pad == alignment) { return; }
+        Ensure(pad);
+        for (int i = 0; i < pad; i = i + 1) { buf[len + i] = 0; }
+        len = len + pad;
+    }
+
+    public byte[] ToArray() {
+        byte[] out2 = new byte[len];
+        NativeMemory.Copy((nint)out2, (nint)buf, len);
+        return out2;
+    }
+}
+
+class Program {
+    static int failures = 0;
+
+    static void Ok(bool cond, string name) {
+        if (cond) {
+            Console.WriteLine("ok " + name);
+        } else {
+            Console.WriteLine("FAIL " + name);
+            failures = failures + 1;
+        }
+    }
+
+    static void Near(float actual, float expected, string name) {
+        float diff = actual - expected;
+        if (diff < 0.0f) { diff = -diff; }
+        if (diff < 0.0001f) {
+            Console.WriteLine("ok " + name + " = " + Convert.ToString((double)actual));
+        } else {
+            Console.WriteLine("FAIL " + name + " expected=" + Convert.ToString((double)expected)
+                + " actual=" + Convert.ToString((double)actual));
+            failures = failures + 1;
+        }
+    }
+
+    // ---- 夹具：GGUF ----
+
+    // 一份 GGUF：两个张量（F32 的 2x3、F16 的 2x2）+ 三条元数据。
+    static byte[] MakeGguf() {
+        ByteWriter w = new ByteWriter();
+        w.Bytes(Encoding.GetBytes("GGUF"));
+        w.U32(3);          // version
+        w.U64(2);          // tensor count
+        w.U64(3);          // metadata kv count
+
+        // KV: general.architecture = "llama"（字符串）
+        w.Str("general.architecture");
+        w.U32(8);
+        w.Str("llama");
+        // KV: general.name = "unit-test"（字符串）
+        w.Str("general.name");
+        w.U32(8);
+        w.Str("unit-test");
+        // KV: block_count = 2（u32）
+        w.Str("block_count");
+        w.U32(4);
+        w.U32(2);
+
+        // 张量 1: tok_embd.weight  F32  [2,3]  偏移 0
+        w.Str("tok_embd.weight");
+        w.U32(2);
+        w.U64(2);
+        w.U64(3);
+        w.U32(0);          // ggml type F32
+        w.U64(0);          // offset
+        // 张量 2: norm.weight  F16  [2,2]  偏移 24（F32 张量占 6*4=24 字节）
+        w.Str("norm.weight");
+        w.U32(2);
+        w.U64(2);
+        w.U64(2);
+        w.U32(1);          // ggml type F16
+        w.U64(24);
+
+        // 数据区起点按 32 对齐
+        w.PadTo(32);
+
+        // F32 张量：1.0 2.0 3.0 4.0 5.0 6.0（位型直接写，钉死字节布局）
+        w.U32(1065353216);  // 0x3F800000 = 1.0f
+        w.U32(1073741824);  // 0x40000000 = 2.0f
+        w.U32(1077936128);  // 0x40400000 = 3.0f
+        w.U32(1082130432);  // 0x40800000 = 4.0f
+        w.U32(1084227584);  // 0x40A00000 = 5.0f
+        w.U32(1086324736);  // 0x40C00000 = 6.0f
+        // F16 张量：1.0 2.0 -2.5 0.5
+        w.U16(15360);       // 0x3C00 = 1.0h
+        w.U16(16384);       // 0x4000 = 2.0h
+        w.U16(49408);       // 0xC100 = -2.5h
+        w.U16(14336);       // 0x3800 = 0.5h
+        return w.ToArray();
+    }
+
+    // 一份 GGUF：单个 Q4_0 张量（32 元素），用来钉住块量化解码。
+    static byte[] MakeGgufQ40() {
+        ByteWriter w = new ByteWriter();
+        w.Bytes(Encoding.GetBytes("GGUF"));
+        w.U32(3);
+        w.U64(1);
+        w.U64(0);
+        w.Str("q.weight");
+        w.U32(1);
+        w.U64(32);
+        w.U32(2);           // ggml type Q4_0
+        w.U64(0);
+        w.PadTo(32);
+        // 块：fp16 d = 0.5（0x3800），16 字节 nibble 全 0x89
+        w.U16(14336);
+        for (int i = 0; i < 16; i = i + 1) { w.U8(137); }
+        return w.ToArray();
+    }
+
+    // ---- 夹具：safetensors ----
+
+    static byte[] MakeSafeTensors() {
+        // 数据区：F32 两个（8 字节）、F16 两个（4 字节）、I32 一个（4 字节）
+        ByteWriter data = new ByteWriter();
+        data.U32(1065353216);  // 1.0f
+        data.U32(1073741824);  // 2.0f
+        data.U16(15360);       // 1.0h
+        data.U16(49408);       // -2.5h
+        data.U32(42);          // I32 42
+        byte[] payload = data.ToArray();
+
+        // JSON 头（data_offsets 相对数据区起点）
+        string json = "{"
+            + "\"w\":{\"dtype\":\"F32\",\"shape\":[1,2],\"data_offsets\":[0,8]},"
+            + "\"h\":{\"dtype\":\"F16\",\"shape\":[1,2],\"data_offsets\":[8,12]},"
+            + "\"i\":{\"dtype\":\"I32\",\"shape\":[1],\"data_offsets\":[12,16]},"
+            + "\"__metadata__\":{\"format\":\"pt\",\"note\":\"unit\"}"
+            + "}";
+        byte[] head = Encoding.GetBytes(json);
+
+        ByteWriter w = new ByteWriter();
+        w.U64(head.Length);
+        w.Bytes(head);
+        w.Bytes(payload);
+        return w.ToArray();
+    }
+
+    static void Main() {
+        // ---- 1. GGUF ----
+        {
+            WeightFile wf = WeightFile.Load(MakeGguf());
+            Ok(wf.format == "gguf", "GGUF 格式识别");
+            Ok(wf.tensors.Count == 2, "GGUF 张量数");
+            Ok(wf.metadata["general.architecture"] == "llama", "GGUF 字符串元数据");
+            Ok(wf.metadata["general.name"] == "unit-test", "GGUF 第二条字符串元数据");
+            Ok(wf.metadata["block_count"] == "2", "GGUF 整数元数据");
+            Ok(wf.Has("tok_embd.weight"), "GGUF 按名命中张量");
+            Ok(!wf.Has("nope"), "GGUF 未命中的张量");
+
+            WeightTensorInfo info = wf.Info("tok_embd.weight");
+            Ok(info != null, "GGUF 取到张量描述");
+            if (info != null) {
+                Ok(info.dtype == "F32", "GGUF 张量 dtype");
+                Ok(info.shape.Count == 2 && info.shape[0] == 2 && info.shape[1] == 3, "GGUF 张量形状");
+            }
+
+            Tensor t = wf.Require("tok_embd.weight");
+            Ok(t.Count() == 6, "F32 张量元素数");
+            Near(t.At(0), 1.0f, "F32 [0]");
+            Near(t.At(1), 2.0f, "F32 [1]");
+            Near(t.At(2), 3.0f, "F32 [2]");
+            Near(t.At(3), 4.0f, "F32 [3]");
+            Near(t.At(4), 5.0f, "F32 [4]");
+            Near(t.At(5), 6.0f, "F32 [5]");
+
+            Tensor h = wf.Require("norm.weight");
+            Ok(h.Count() == 4, "F16 张量元素数");
+            Near(h.At(0), 1.0f, "F16 [0]");
+            Near(h.At(1), 2.0f, "F16 [1]");
+            Near(h.At(2), -2.5f, "F16 [2]");
+            Near(h.At(3), 0.5f, "F16 [3]");
+
+            bool threw = false;
+            try {
+                wf.Require("missing");
+            } catch (Exception e) {
+                threw = true;
+            }
+            Ok(threw, "取不存在的张量抛错");
+        }
+
+        // ---- 2. GGUF 的 Q4_0 块量化 ----
+        {
+            WeightFile wf = WeightFile.Load(MakeGgufQ40());
+            Tensor q = wf.Require("q.weight");
+            Ok(q.Count() == 32, "Q4_0 张量元素数");
+            Near(q.At(0), 0.5f, "Q4_0 低半部首元素");
+            Near(q.At(15), 0.5f, "Q4_0 低半部末元素");
+            Near(q.At(16), 0.0f, "Q4_0 高半部首元素");
+            Near(q.At(31), 0.0f, "Q4_0 高半部末元素");
+        }
+
+        // ---- 3. safetensors ----
+        {
+            WeightFile wf = WeightFile.Load(MakeSafeTensors());
+            Ok(wf.format == "safetensors", "safetensors 格式识别");
+            Ok(wf.tensors.Count == 3, "safetensors 张量数");
+            Ok(wf.metadata["format"] == "pt", "safetensors 元数据");
+            Ok(wf.metadata["note"] == "unit", "safetensors 第二条元数据");
+
+            Tensor t = wf.Require("w");
+            Ok(t.Count() == 2, "safetensors F32 元素数");
+            Near(t.At(0), 1.0f, "safetensors F32 [0]");
+            Near(t.At(1), 2.0f, "safetensors F32 [1]");
+
+            Tensor h = wf.Require("h");
+            Near(h.At(0), 1.0f, "safetensors F16 [0]");
+            Near(h.At(1), -2.5f, "safetensors F16 [1]");
+
+            Tensor i = wf.Require("i");
+            Near(i.At(0), 42.0f, "safetensors I32 [0]");
+        }
+
+        // ---- 4. 从文件读 ----
+        {
+            string path = Path.Combine(Path.GetTempPath(), "zan_weight_formats_test.gguf");
+            File.WriteAllBytes(path, MakeGguf());
+            WeightFile wf = WeightFile.Open(path);
+            Ok(wf.format == "gguf", "从文件打开 GGUF");
+            Near(wf.Require("tok_embd.weight").At(0), 1.0f, "从文件打开后的数值");
+            File.Delete(path);
+        }
+
+        // ---- 5. 出错路径 ----
+        {
+            bool threw = false;
+            try {
+                WeightFile.Load(Encoding.GetBytes("NOT-A-WEIGHT-FILE-AT-ALL"));
+            } catch (Exception e) {
+                threw = true;
+            }
+            Ok(threw, "不认识的格式抛错");
+
+            threw = false;
+            try {
+                byte[] truncated = new byte[10];
+                NativeMemory.Copy((nint)truncated, (nint)MakeGguf(), 10);
+                WeightFile.Load(truncated);
+            } catch (Exception e) {
+                threw = true;
+            }
+            Ok(threw, "截断的 GGUF 抛错");
+        }
+
+        Console.WriteLine("failures=" + Convert.ToString(failures));
+    }
+}

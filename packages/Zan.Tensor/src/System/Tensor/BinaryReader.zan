@@ -1,0 +1,140 @@
+using System;
+using System.Text;
+
+namespace System.Tensor;
+
+// 小端二进制游标：权重文件（GGUF / safetensors）都是小端。
+//
+// 为什么自己写：stdlib 里没有 BitConverter，也没有"byte[] + 偏移 + 长度"
+// 的读取器；Zan.Cbor 的大端游标是包内私有的，跨包不可见。自己写一份小端
+// 的，两种格式共用一份。
+//
+// 越界一律当场抛：截断的输入如果读出垃圾值再往下走，症状会漂到很远的地方
+// （形状对不上、数值全是 NaN），比当场报错难查得多。
+public class BinaryReader {
+    public byte[] buf;
+    public int pos;
+    public int len;
+
+    public BinaryReader(byte[] data) {
+        buf = data;
+        pos = 0;
+        len = data.Length;
+    }
+
+    // 包装切片 [offset, offset+count)。
+    public BinaryReader(byte[] data, int offset, int count) {
+        buf = data;
+        pos = offset;
+        len = offset + count;
+    }
+
+    public bool Eof() {
+        return pos >= len;
+    }
+
+    // 剩余字节数。
+    public int Remaining() {
+        return len - pos;
+    }
+
+    // 边界检查。
+    public void Need(long n) {
+        if (n < 0 || pos + n > len) {
+            throw new Exception("truncated at byte " + Convert.ToString(pos)
+                + " (need " + Convert.ToString(n) + " of " + Convert.ToString(len) + ")");
+        }
+    }
+
+    public int U8() {
+        Need(1);
+        int b = buf[pos] & 255;
+        pos = pos + 1;
+        return b;
+    }
+
+    public int I8() {
+        int b = U8();
+        if (b > 127) { return b - 256; }
+        return b;
+    }
+
+    public int U16() {
+        Need(2);
+        int v = buf[pos] & 255;
+        v = v | ((buf[pos + 1] & 255) << 8);
+        pos = pos + 2;
+        return v;
+    }
+
+    public int I16() {
+        int v = U16();
+        if (v > 32767) { return v - 65536; }
+        return v;
+    }
+
+    public long U32() {
+        Need(4);
+        long v = 0;
+        for (int i = 3; i >= 0; i = i - 1) {
+            v = (v << 8) | (long)(buf[pos + i] & 255);
+        }
+        pos = pos + 4;
+        return v;
+    }
+
+    public long I32() {
+        long v = U32();
+        if (v > 2147483647) { return v - 4294967296; }
+        return v;
+    }
+
+    public long U64() {
+        Need(8);
+        long v = 0;
+        for (int i = 7; i >= 0; i = i - 1) {
+            v = (v << 8) | (long)(buf[pos + i] & 255);
+        }
+        pos = pos + 8;
+        return v;
+    }
+
+    public long I64() {
+        return U64();
+    }
+
+    public float F32() {
+        long bits = U32();
+        return FloatBits.FromF32Bits(bits);
+    }
+
+    public double F64() {
+        long bits = U64();
+        return NativeMemory.AsF64(bits);
+    }
+
+    // GGUF 风格的长度前缀字符串：u64 长度 + UTF-8 字节（无终止符）。
+    public string Str() {
+        long n = U64();
+        if (n < 0 || n > len - pos) {
+            throw new Exception("bad string length " + Convert.ToString(n)
+                + " at byte " + Convert.ToString(pos));
+        }
+        string s = Encoding.GetString(buf, pos, (int)n);
+        pos = pos + (int)n;
+        return s;
+    }
+
+    public byte[] Take(int n) {
+        Need(n);
+        byte[] out2 = new byte[n];
+        NativeMemory.Copy((nint)out2, (nint)buf + pos, n);
+        pos = pos + n;
+        return out2;
+    }
+
+    public void Skip(long n) {
+        Need(n);
+        pos = pos + (int)n;
+    }
+}

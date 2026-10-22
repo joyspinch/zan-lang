@@ -1,0 +1,163 @@
+using System;
+using System.Collections.Generic;
+
+namespace System.Tensor;
+
+// GGUF 权重文件读取（llama.cpp 的权重格式）。
+//
+// 布局：
+//   magic "GGUF" (u32) · version (u32) · 张量数 (u64) · 元数据条数 (u64)
+//   元数据 KV × N：键（u64 长度 + UTF-8）· 类型 (u32) · 值
+//   张量描述 × M：名（u64 长度 + UTF-8）· 维数 (u32) · 各维 (u64 × n)
+//                 · ggml 类型 (u32) · 数据区内偏移 (u64)
+//   （按 general.alignment 对齐，默认 32）→ 数据区：各张量按偏移摆放
+//
+// 全是小端。元数据类型编号：0 u8 / 1 i8 / 2 u16 / 3 i16 / 4 u32 / 5 i32 /
+// 6 f32 / 7 bool / 8 string / 9 array / 10 u64 / 11 i64 / 12 f64。
+public class GgufReader {
+    public int version;
+    public long tensorCount;
+    public Dictionary<string, string> metadata;
+    public Dictionary<string, List<string>> metadataArrays;
+    public List<WeightTensorInfo> tensors;
+    // 数据区起点（文件内绝对偏移）。
+    public long dataStart;
+
+    public static GgufReader Parse(byte[] file) {
+        BinaryReader r = new BinaryReader(file);
+        // 魔数直接比字节："GGUF" 四个字符（比一个算出来的 u32 常量更不容易
+        // 算错——常量的每一位都得手推）。
+        int m0 = r.U8();
+        int m1 = r.U8();
+        int m2 = r.U8();
+        int m3 = r.U8();
+        if (m0 != 71 || m1 != 71 || m2 != 85 || m3 != 70) {
+            throw new Exception("not a GGUF file (magic mismatch)");
+        }
+        GgufReader g = new GgufReader();
+        g.version = (int)r.U32();
+        if (g.version < 2 || g.version > 3) {
+            throw new Exception("unsupported GGUF version "
+                + Convert.ToString(g.version));
+        }
+        g.tensorCount = r.U64();
+        long kvCount = r.U64();
+        g.metadata = new Dictionary<string, string>();
+        g.metadataArrays = new Dictionary<string, List<string>>();
+        g.tensors = new List<WeightTensorInfo>();
+
+        for (long i = 0; i < kvCount; i = i + 1) {
+            g.ReadMetadata(r);
+        }
+
+        for (long i = 0; i < g.tensorCount; i = i + 1) {
+            g.tensors.Add(g.ReadTensorInfo(r));
+        }
+
+        // 数据区起点：按 general.alignment（默认 32）对齐。
+        int alignment = 32;
+        string alignText = null;
+        if (g.metadata.TryGetValue("general.alignment", out alignText)) {
+            alignment = Convert.ToInt32(alignText);
+            if (alignment <= 0) { alignment = 32; }
+        }
+        long start = r.pos;
+        long pad = alignment - (start % alignment);
+        if (pad != alignment) { start = start + pad; }
+        g.dataStart = start;
+        return g;
+    }
+
+    // 一条元数据：键 + 类型 + 值。
+    void ReadMetadata(BinaryReader r) {
+        string key = r.Str();
+        int type = (int)r.U32();
+        if (type == 8) {
+            // 字符串。
+            metadata[key] = r.Str();
+            return;
+        }
+        if (type == 9) {
+            // 数组：元素类型 + 个数 + 元素。只有字符串数组值得留着
+            // （分词器的 token 表就是它），其余数组读完就丢。
+            int elemType = (int)r.U32();
+            long count = r.U64();
+            List<string> strs = new List<string>();
+            bool keep = elemType == 8;
+            for (long i = 0; i < count; i = i + 1) {
+                if (elemType == 8) {
+                    string s = r.Str();
+                    if (keep) { strs.Add(s); }
+                } else {
+                    SkipValue(r, elemType);
+                }
+            }
+            if (keep) { metadataArrays[key] = strs; }
+            return;
+        }
+        // 标量：统一渲染成字符串（键值对语义上都是"文本化"的元数据）。
+        if (type == 0 || type == 1 || type == 2 || type == 3 || type == 4
+            || type == 5 || type == 10 || type == 11) {
+            long v = ReadInt(r, type);
+            metadata[key] = Convert.ToString(v);
+            return;
+        }
+        if (type == 7) {
+            int v = r.U8();
+            metadata[key] = v != 0 ? "true" : "false";
+            return;
+        }
+        if (type == 6) {
+            metadata[key] = Convert.ToString((double)r.F32());
+            return;
+        }
+        if (type == 12) {
+            metadata[key] = Convert.ToString(r.F64());
+            return;
+        }
+        throw new Exception("unknown GGUF metadata type " + Convert.ToString(type)
+            + " for key '" + key + "'");
+    }
+
+    long ReadInt(BinaryReader r, int type) {
+        if (type == 0) { return r.U8(); }
+        if (type == 1) { return r.I8(); }
+        if (type == 2) { return r.U16(); }
+        if (type == 3) { return r.I16(); }
+        if (type == 4) { return r.U32(); }
+        if (type == 5) { return r.I32(); }
+        if (type == 10) { return r.U64(); }
+        return r.I64();
+    }
+
+    void SkipValue(BinaryReader r, int type) {
+        ReadInt(r, type);
+    }
+
+    WeightTensorInfo ReadTensorInfo(BinaryReader r) {
+        WeightTensorInfo info = new WeightTensorInfo();
+        info.name = r.Str();
+        int nDims = (int)r.U32();
+        if (nDims > 8) {
+            throw new Exception("GGUF tensor '" + info.name + "' has "
+                + Convert.ToString(nDims) + " dims");
+        }
+        info.shape = new List<int>();
+        long count = 1;
+        for (int i = 0; i < nDims; i = i + 1) {
+            long d = r.U64();
+            if (d <= 0 || d > 2147483647) {
+                throw new Exception("GGUF tensor '" + info.name
+                    + "' has invalid dim");
+            }
+            info.shape.Add((int)d);
+            count = count * d;
+        }
+        info.count = count;
+        info.ggmlType = (int)r.U32();
+        info.dtype = GgmlType.Name(info.ggmlType);
+        info.offset = r.U64();
+        info.byteLength = GgmlType.ByteLength(info.ggmlType, count);
+        return info;
+    }
+}

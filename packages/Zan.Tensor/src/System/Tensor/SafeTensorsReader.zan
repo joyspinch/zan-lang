@@ -1,0 +1,103 @@
+using System;
+using System.Collections.Generic;
+using System.Text;
+
+namespace System.Tensor;
+
+// safetensors 权重文件读取（HuggingFace 的格式）。
+//
+// 布局：8 字节小端头长 (u64) · JSON 头（该长度字节，末尾可能用空格补齐）
+//       · 数据区（各张量按 data_offsets 摆放，偏移相对数据区起点）。
+//
+// JSON 头形如：
+//   {"weight": {"dtype":"F16","shape":[2,3],"data_offsets":[0,12]},
+//    "__metadata__": {"format":"pt"}}
+//
+// 与 GGUF 不同：这里没有"量化类型"，dtype 是字符串。张量维度是**行主序**
+// 的常规顺序（与 GGUF 相同），不需要转置。
+public class SafeTensorsReader {
+    public Dictionary<string, string> metadata;
+    public Dictionary<string, List<string>> metadataArrays;
+    public List<WeightTensorInfo> tensors;
+    // 数据区起点（文件内绝对偏移）。
+    public long dataStart;
+    public long dataLength;
+
+    public static SafeTensorsReader Parse(byte[] file) {
+        if (file.Length < 8) {
+            throw new Exception("safetensors file too short");
+        }
+        BinaryReader r = new BinaryReader(file);
+        long headerLen = r.U64();
+        if (headerLen <= 0 || headerLen > file.Length - 8) {
+            throw new Exception("safetensors header length out of range: "
+                + Convert.ToString(headerLen));
+        }
+        string headerText = Encoding.GetString(file, 8, (int)headerLen);
+        JsonValue root = JsonValue.Parse(headerText);
+        if (root == null || root.kind != 5) {
+            throw new Exception("safetensors header is not a JSON object");
+        }
+
+        SafeTensorsReader s = new SafeTensorsReader();
+        s.metadata = new Dictionary<string, string>();
+        s.metadataArrays = new Dictionary<string, List<string>>();
+        s.tensors = new List<WeightTensorInfo>();
+        s.dataStart = 8 + headerLen;
+        s.dataLength = file.Length - s.dataStart;
+
+        for (int i = 0; i < root.keys.Count; i = i + 1) {
+            string key = root.keys[i];
+            JsonValue entry = root.Get(key);
+            if (key == "__metadata__") {
+                if (entry != null && entry.keys != null) {
+                    for (int j = 0; j < entry.keys.Count; j = j + 1) {
+                        s.metadata[entry.keys[j]] = entry.Str(entry.keys[j], "");
+                    }
+                }
+                continue;
+            }
+            if (entry == null) { continue; }
+            s.tensors.Add(s.ReadTensor(key, entry));
+        }
+        return s;
+    }
+
+    WeightTensorInfo ReadTensor(string name, JsonValue entry) {
+        WeightTensorInfo info = new WeightTensorInfo();
+        info.name = name;
+        info.dtype = entry.Str("dtype", "");
+        info.ggmlType = -1;
+
+        JsonValue shape = entry.Get("shape");
+        info.shape = new List<int>();
+        long count = 1;
+        if (shape != null && shape.items != null) {
+            for (int i = 0; i < shape.items.Count; i = i + 1) {
+                long d = shape.items[i].numI;
+                if (d <= 0 || d > 2147483647) {
+                    throw new Exception("safetensors tensor '" + name
+                        + "' has invalid dim");
+                }
+                info.shape.Add((int)d);
+                count = count * d;
+            }
+        }
+        info.count = count;
+
+        JsonValue offs = entry.Get("data_offsets");
+        if (offs == null || offs.items == null || offs.items.Count < 2) {
+            throw new Exception("safetensors tensor '" + name
+                + "' has no data_offsets");
+        }
+        long start = offs.items[0].numI;
+        long end = offs.items[1].numI;
+        if (start < 0 || end < start || end > dataLength) {
+            throw new Exception("safetensors tensor '" + name
+                + "' has out-of-range data_offsets");
+        }
+        info.offset = start;
+        info.byteLength = end - start;
+        return info;
+    }
+}

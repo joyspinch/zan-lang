@@ -1,0 +1,120 @@
+using System;
+
+namespace System.Tensor;
+
+// 浮点位型 ↔ 数值的精确换算：f32 / f16 / bf16。
+//
+// stdlib 的 NativeMemory 只有 AsI64 / AsF64（f64 位型），没有 f32 版本；
+// 而 GGUF 的权重一半是 f32、一半是 f16，safetensors 还有 bf16。这里补齐。
+//
+// 为什么不用"逐位累加尾数"那种写法（Zan.Cbor 的 BitsSingle 那样）：那要
+// 每个元素循环 23 次，几千万个元素的权重会慢到不可用。这里的写法是
+// "查表 × 一次乘加"——2 的幂用乘 2 / 除 2 递推（精确，无舍入），尾数用
+// 2^-23 的精确常数缩放。
+//
+// 精确性：次正规数、±∞、NaN、-0.0 都按 IEEE-754 还原。f16 / bf16 的
+// 每一个值都能被 f32 精确表示，所以转成 f32 无损。
+public class FloatBits {
+    // double 的 +∞ / NaN 位型（借 NativeMemory 的 f64 bitcast 造出来）。
+    private static long infBits = 9214364837600034816;
+    private static long nanBits = 9218868437227405312;
+
+    private static double[] f32Pow2;
+    private static double[] f16Pow2;
+
+    // 2^(exp-127)，exp ∈ [0,255]。
+    public static double[] F32Pow2() {
+        if (f32Pow2 == null) {
+            double[] t = new double[256];
+            double v = 1.0;
+            int i = 0;
+            // 2^-127：连续除 2，每次都精确（只是减一档指数）。
+            while (i < 127) {
+                v = v * 0.5;
+                i = i + 1;
+            }
+            t[0] = v;
+            i = 1;
+            // 逐档乘 2，同样精确（2^128 仍在 double 的范围内）。
+            while (i < 256) {
+                t[i] = t[i - 1] * 2.0;
+                i = i + 1;
+            }
+            f32Pow2 = t;
+        }
+        return f32Pow2;
+    }
+
+    // 2^(exp-15)，exp ∈ [0,31]。
+    public static double[] F16Pow2() {
+        if (f16Pow2 == null) {
+            double[] t = new double[32];
+            double v = 1.0;
+            int i = 0;
+            while (i < 15) {
+                v = v * 0.5;
+                i = i + 1;
+            }
+            t[0] = v;
+            i = 1;
+            while (i < 32) {
+                t[i] = t[i - 1] * 2.0;
+                i = i + 1;
+            }
+            f16Pow2 = t;
+        }
+        return f16Pow2;
+    }
+
+    // 32 位 IEEE-754 位型 → float。
+    public static float FromF32Bits(long bits) {
+        int b = (int)(bits & 4294967295);
+        int sign = (b >> 31) & 1;
+        int exp = (b >> 23) & 255;
+        int mant = b & 8388607;
+        if (exp == 255) {
+            if (mant == 0) {
+                double inf = NativeMemory.AsF64(infBits);
+                return sign == 1 ? (float)(0.0 - inf) : (float)inf;
+            }
+            return (float)NativeMemory.AsF64(nanBits);
+        }
+        double v;
+        if (exp == 0) {
+            // 次正规：mant × 2^-149（尾数前导位是 0）。
+            v = (double)mant * 1.401298464324817e-45;
+        } else {
+            v = (1.0 + (double)mant * 1.1920928955078125e-7) * F32Pow2()[exp];
+        }
+        if (sign == 1) { return (float)(0.0 - v); }
+        return (float)v;
+    }
+
+    // 16 位 IEEE-754（半精度）位型 → float。
+    public static float FromF16Bits(int bits) {
+        int sign = (bits >> 15) & 1;
+        int exp = (bits >> 10) & 31;
+        int mant = bits & 1023;
+        if (exp == 31) {
+            if (mant == 0) {
+                double inf = NativeMemory.AsF64(infBits);
+                return sign == 1 ? (float)(0.0 - inf) : (float)inf;
+            }
+            return (float)NativeMemory.AsF64(nanBits);
+        }
+        double v;
+        if (exp == 0) {
+            // 次正规：mant × 2^-24。
+            v = (double)mant * 5.960464477539063e-8;
+        } else {
+            v = (1.0 + (double)mant * 0.0009765625) * F16Pow2()[exp];
+        }
+        if (sign == 1) { return (float)(0.0 - v); }
+        return (float)v;
+    }
+
+    // bfloat16：位型就是 f32 的高 16 位（左移 16 位即得 f32 位型）。
+    public static float FromBF16Bits(int bits) {
+        return FromF32Bits(((long)bits) << 16);
+    }
+}
