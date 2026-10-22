@@ -89,6 +89,25 @@ description: zanc 编译器内部（parser/checker/irgen/runtime/ABI）设计契
      代价大——"不误杀实现类"正是那行 continue 的本意，只是它连"实参就是接口"
      这种能精确比对的情况也一并放过了）。
      回归用例：`tests/conformance/overload_interface_param.zan`。
+   - 边界（**lambda 实参**）：lambda **没有自身类型**（Zan 是目标类型驱动的），
+     所以实参是 lambda 时，判别依据只能是**形参声明的委托类型**：形参不是委托
+     → 该候选判为不兼容；形参委托的形参个数与 lambda 显式形参个数不符 → 判为
+     不兼容；类型一致 → 候选加分。
+     两侧都要按这个口径：checker（`checker_find_method_typed`）与 irgen
+     （`irgen_expr_core.c` 的 `method_args_score`）各取形参的委托类型来判。
+     **判不出就放过是最坏的选择**：所有候选同分 → 决议退化成"取成员表里第一个
+     同名方法"，而 partial 类跨文件合并时**调用点自己声明的重载排在前面**，
+     于是 lambda 被绑到不相干的重载上。
+     症状示例：`LspSession.StartAsync(App, ...)` 绑到了 `App` 重载而不是
+     `Action<Action>` 重载 → **无限自我递归** → 异常处理临时栈耗尽
+     （top ≥ 262144）→ 进程 `exit(1)`。整个 IDE 一开工程就崩，而调用点
+     在源码上完全看不出异常。
+     边界：`TYPE_TYPE_PARAM` / 类型形参这类"判不出委托类型"的形参**放过**
+     （不能因判不出就误杀）；`void` 委托接"有返回值的表达式体 lambda"
+     **不判死**（丢弃返回值是合法的），只有块体里显式 `return <value>;`
+     才判死。
+     回归用例：`tests/conformance/overload_lambda_target.zan`（跨文件 partial，
+     干扰重载在调用点声明）。
    - 手法（确认编译器实际选了哪个重载）：在**每个**候选重载里各放一句
      `throw new Exception("PICKED-<签名>")`，跑一次看抛的是哪一句——比读评分
      逻辑快得多。最小复现要按真实调用形状写：**Zan 不接受顶层函数**（顶层只
@@ -527,6 +546,29 @@ description: zanc 编译器内部（parser/checker/irgen/runtime/ABI）设计契
      类型参数也要换；只换顶层会漏掉 `Func<List<T>>` 这类形态。
    - 判定器：`tests/conformance/mapping_profile.zan`（结构体目标）、
      `tests/conformance/mapping_gen.zan`。
+31. **惰性构建的辅助函数会清掉"当前调试位置"——调用点必须兜底补 `!dbg`**：
+   - 动作：`di_set_loc` 记下最近一次设置的位置（连同它属于哪个函数）；
+     统一发调用的入口（`zan_call2`）在发码前检查"当前调试位置是否为空"，
+     为空且**当前函数确实带 subprogram**、且那个位置**属于当前函数**时补回去。
+   - 理由：类的释放体、集合的释放体这类辅助函数是在**用户代码中间**被惰性
+     构建出来的（`irgen_arc.c` 的 `build_class_release_body` /
+     `build_collection_release_body`），构建入口 `di_clear` 把"当前调试位置"
+     清掉且不恢复——于是**同一函数里后面那个调用就没了 `!dbg`**。LLVM 校验器
+     对"带调试信息的函数里位置缺失的调用"直接报
+     `inlinable function call in a function with debug info must have a !dbg location`，
+     整个 `-g` 构建失败。
+     症状落在**离病灶很远的地方**：报错说的是某个标准库的类型（如
+     `LuaValue_op_call`），真因却是宿主编译器在它之前清了位置。带调试信息
+     的构建（IDE 的调试版、崩溃排查）因此整个起不来。
+   - 边界：只补在**确实带 subprogram** 的函数里（运行时辅助函数没有
+     subprogram，塞位置反而触发 LLVM 另一条校验）；位置属于别的函数时**不补**
+     （挪位置到别的函数同样是校验错误）。补的位置必须与"被清之前"同属一个函数。
+   - 手法（找出真凶，别猜）：在 `di_clear` 里加一行诊断，打印"清位置时正在
+     构建哪个函数、清之前的行号"，编一次就知道是哪个辅助函数在作祟。
+     猜形状是没用的——"实参求值期间释放对象"这类触发条件可以有很多写法，
+     逐个试要试十几次。
+   - 判定器：一条带 `-g` 编译的 conformance 用例（普通构建不产生调试信息，
+     踩不到这条路径）。
 
 ---
 
