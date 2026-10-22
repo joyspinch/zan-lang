@@ -685,6 +685,20 @@ else()
     # json.c uses floor(); libm is separate from libc on most Unix toolchains.
     target_link_libraries(zan-lsp PRIVATE m)
 endif()
+if(WIN32)
+    # zan-lsp embeds the same front-end sources as zanc (lexer/parser/binder/
+    # checker), and untrusted project files hit the same deep-nesting paths —
+    # the default 1MB reserve overflows mid-analysis exactly like zanc did.
+    # Give it zanc's 32MB budget (same /STACK vs --stack linker split, P1-3).
+    execute_process(COMMAND ${CMAKE_C_COMPILER} -print-target-triple
+                    OUTPUT_VARIABLE _zanlsp_triple
+                    OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+    if(_zanlsp_triple MATCHES "msvc")
+        target_link_options(zan-lsp PRIVATE -Xlinker;/STACK:33554432)
+    else()
+        target_link_options(zan-lsp PRIVATE -Wl,--stack,33554432)
+    endif()
+endif()
 
 # ---- Debug Adapter (M9) ----
 # Exposes the IDE debugger engine over the Debug Adapter Protocol (stdio).
