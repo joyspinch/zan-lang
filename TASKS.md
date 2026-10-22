@@ -37,6 +37,14 @@
     未覆盖：多维数组 store（emit_mdarray_elem_ptr 内部仍钳位）、字段/成员
     链形状的部分位点，见待办。
 - 待办：① 全线可 catch 异常通道（对齐 C#，最终口径）；② 多维数组与剩余
+- **自举半边·null 接收者方法调用已修（2026-10-23，goal round 5）**：
+  selfhost 实例方法分派点补 guard——`icmp eq null` → EmitRuntimeCheckIf
+  软诊断（点名接收者，`<unknown>:行:列`，自举无按节点文件名与宿主 A508
+  同口径）+ `select` 换 64 字节 `@__zan_soft_scratch` 零垫底（字段读返零
+  值不 SIGSEGV），`--strict-runtime` 走同一 exit 70 通道。复验：gen1 编
+  `Widget w = null; w.Get()` 通过、IR 恰一张 scratch 全局 + select 分派、
+  诊断常量 `<unknown>:12:17: runtime error: null reference: receiver
+  'w' is null` 在位。**越界写跳写（②）自举侧仍待办**。
   成员链 store 位点的跳写；③ 读路径的钳位返回 0 值语义未动（软值兜底）；
   ④ 自举半边。
 - 现象（2026-10-23 八域审计交叉证实，全部亲验复现）：

@@ -6239,6 +6239,29 @@ partial class Irgen {
                         return EmitDelegateCall(callee, fdty, e);
                     }
                 }
+                // A507 自举半边：null 接收者的实例方法调用曾一路进方法体读
+                // 字段 SIGSEGV 且无任何诊断。与宿主 irgen_call.c 局部变量快
+                // 速路径同口径：软诊断（点名接收者位置）+ 软基址 scratch——
+                // 字段读落在 scratch 上返零值，程序继续（--strict-runtime
+                // 下 exit 70）。
+                string rt0 = MapType(recv.ty);
+                if (IsPtrLL(rt0)) {
+                    string rn = NT();
+                    L("  " + rn + " = icmp eq " + rt0 + " " + recv.op + ", null");
+                    string rnm = obj != null && obj.kind == AK.Ident() && obj.sval != ""
+                        ? obj.sval : mname;
+                    EmitRuntimeCheckIf(e, rn,
+                        "null reference: receiver '" + rnm + "' is null");
+                    if (!ExternSeen("__zan_soft_scratch")) {
+                        externDecls.Add("__zan_soft_scratch");
+                        H("@__zan_soft_scratch = internal global [64 x i8] zeroinitializer");
+                    }
+                    string sb = NT();
+                    L("  " + sb + " = getelementptr inbounds [64 x i8], [64 x i8]* @__zan_soft_scratch, i64 0, i64 0");
+                    string sel = NT();
+                    L("  " + sel + " = select i1 " + rn + ", i8* " + sb + ", i8* " + recv.op);
+                    recv = new ExprVal(sel, recv.ty);
+                }
                 return EmitInstanceCall(recv, cls.sval, mname, e);
             }
             // The receiver's type is not one the self-host can call methods
