@@ -30,7 +30,11 @@
 - 探针：`_scratch/csaudit/{collections/{p03,p09},exceptions/{p08,p09,p10},numeric/p02,string/p06}`。
 - 关联：A508（Dict 缺 key 连 soft error 都没有）、A526（TOOLING.md 文档失真）。
 
-### [ ] A508 Dict 缺 key 读完全静默返回默认值（连 soft error 都没有）
+### [~] A508 Dict 缺 key 读完全静默返回默认值（连 soft error 都没有）
+- **宿主侧已修（2026-10-23）**：`irgen_expr.c` Dict 索引读取 miss 改走 `emit_runtime_check`
+  软诊断（"Dict key not found in indexer read"，stderr 一次 + 安全零值 + 继续，
+  `--strict-runtime` 下 exit 70）。探针 `p06_dict_missing.zan` 复验通过。
+- 待办：自举半边（`src/selfhost/irgen_expr.zan` 在途窗口过了之后对齐同款诊断）。
 - 现象：`d["missing"]` 返回 0，无 stderr、无 zan_crash.log、exit=0。C# 抛 KeyNotFoundException。越界读尚有一行 runtime error，这条连一行都没有。
 - 根因落点：`src/compiler/irgen_expr.c` ~7571-7596（Dict 索引读取 miss 直接走零值路径）。TryGetValue/ContainsKey 是正确出口。
 - 探针：`_scratch/csaudit/collections/p06_dict_missing.zan`、`exceptions/p11_dictmiss.zan`。
@@ -48,7 +52,14 @@
 - 附带：`>>>` 宿主支持但 SPEC §2.6 运算符表未声明（→A526）。
 - 探针：`_scratch/csaudit/numeric/{p03,p04,p12}`。
 
-### [ ] A511 decimal 三处语义缺口：除法截断、与 double 混算垃圾、WriteLine(decimal) 编译崩溃
+### [~] A511 decimal 三处语义缺口：除法截断、与 double 混算垃圾、WriteLine(decimal) 编译崩溃
+- **宿主侧已修（2026-10-23）**：① `rt_decimal.c` 除法重写——精度目标 28 位 scale +
+  末位四舍五入（远离零）+ 精确商去尾零（`1m/3m`=28 位、`2m/3m`尾位…6667、`10m/4m`=2.5）；
+  ② checker 对 decimal↔float/double 混合算术当场报错（CS0019 口径，promote_numeric
+  的静默 type_error 不再放行）；③ WriteLine 分派补 decimal 分支（`emit_to_cstr_u`
+  转托管串后按字符串打印）。三探针复验通过；12 平台 `zanrt_decimal.o` 已同代重建。
+- 待办：自举半边（除法运行时是同一份 C 对象、天然对齐；②③的自举侧待
+  `src/selfhost/irgen_expr.zan`/`checker.zan` 在途窗口）。
 - ① 除法恒 18 位截断：`1m/3m`→"0.333333333333333333"（C# 28 位且末位进位）、scale 恒 18（`10m/4m`→"2.500000000000000000"）；加/乘精确。
 - ② decimal+double 混算被接受且产出垃圾：`0.5m+0.5`→"19768355002338416264795389952"、`0.1m+2.0`→"19807040628566225135759764102"（C# CS0019 拒绝）。`Decimal.FromDouble` 本身正确——坏的只是混合算术的隐式转换 lowering（checker.c:1280-1285 对赋值路径已有拒绝，算术实参路径放行）。
 - ③ `Console.WriteLine(decimal)` 直接编译失败：LLVM 校验错——`%Decimal` 结构体传给 `zan_rt_print_int(i64)`（亲验复现）。C# 正常打印。
@@ -61,17 +72,34 @@
 - 根因落点：同 A507（runtime 无异常通道，Convert/Parse 失败分支返 0）。
 - 探针：`_scratch/csaudit/numeric/p11_convert_fail.zan`。
 
-### [ ] A513 舍入语义偏离：Math.Round 远离零、Convert.ToInt32(double) 截断
+### [~] A513 舍入语义偏离：Math.Round 远离零、Convert.ToInt32(double) 截断
+- **宿主侧已修（2026-10-23）**：`Math.Round` 1/2 参改 `rint`（银行家，2.5→2、0.5→0、
+  2.345→2.35）；`Convert.ToInt32/64(double)` 先 `rint` 再 FPToSI（3.9→4）；
+  `Decimal.ToInt64/ToInt32`（`rt_decimal.c`）改一次取商余的银行家舍入（2.9m→3、
+  2.5m→2、-2.5m→-2）。探针复验通过。
+- 待办：自举半边（stdlib `Decimal.zan` 两后端共用、天然对齐；`rint` 特判的自举侧
+  待 `src/selfhost/irgen_expr.zan` 窗口）。
 - `Math.Round(2.5)`=3、`Round(-2.5)`=-3、`Round(0.5)`=1（C# 银行家：2/-2/0）；无 MidpointRounding 重载。`Convert.ToInt32(3.9)`=3（C# 舍入=4）；`Decimal.ToInt64(2.9m)`=2（C# 3）。Floor/Ceiling 正确。
 - 根因落点：`irgen_call.c` Math/Convert 分支舍入模式（C 运行时 away-from-zero）；stdlib `System/Decimal.zan` ToInt64。
 - 探针：`_scratch/csaudit/numeric/{p09,p12}`。
 
-### [ ] A514 三元类型合并两侧各选一遍：checker 有提升阶梯、irgen 按 then 臂定型
+### [~] A514 三元类型合并两侧各选一遍：checker 有提升阶梯、irgen 按 then 臂定型
+- **宿主侧已修（2026-10-23）**：两层同修——`expr_family`（AST_CONDITIONAL）改两臂
+  数值提升合并（float/double/decimal 赢整数，与 checker 阶梯同口径；奇异混合维持
+  then 臂旧行为）；`infer_expr_type`（AST_CONDITIONAL）新增 `irgen_promote_pair`
+  按 checker promote_numeric 同阶梯合一定型。`(t?1:2.0)/2`=0.5、`(t?1:2L)/2`、
+  右结合、臂惰性全部复验通过。
+- 待办：自举半边（`src/selfhost/irgen_expr.zan` 在途窗口）。
 - 现象：`(t?1:2.0)/2`→**0**（整数除法截断）、`(t?1:2L)/2`→0；double 在前才对；赋值语境靠隐式转换掩盖（`double v=(t?1:2.0); v/2`=0.5）。C# 公共类型=double。
 - 根因：checker 的 `merge_conditional_types`（checker.c:1212-1214）有数值提升阶梯，但 irgen 的 `expr_family`（irgen_expr_core.c:1076-1080）对 AST_CONDITIONAL **先取 then 臂 family**，未共用同一份合并——与重载分解同病（skill §10）。
 - 探针：`_scratch/csaudit/operators/p07_ternary.zan`。
 
-### [ ] A515 ?? 的右支总是求值（短路缺失）
+### [~] A515 ?? 的右支总是求值（短路缺失）
+- **宿主侧已修（2026-10-23）**：新增 `emit_null_coalesce`（cond_br + phi，skill 二.2
+  口径）——右支只在左支为 null 时求值；只覆盖三种干净形态（指针同型、双可空聚合、
+  可空左+裸负载同型），形态覆盖不了在**发码前**回退旧急切路径（绝不发码中途放弃，
+  避免悬空块/二次求值）。探针 `p08_nullish.zan`：`nn ?? Side()` 后 calls=0 复验通过。
+- 待办：自举半边（`src/selfhost/irgen_expr.zan` 在途窗口）。
 - `nn ?? Side()`：返回值对但 Side() 被调用（C# 非 null 时 calls=0）。日志/计数/惰性初始化全受影响。
 - 根因：`irgen_expr.c:4320-4329`（可空路径）与 :4132（主路径）两臂无条件求值后 `LLVMBuildSelect`——skill 二.2 明令禁止的形态（带副作用的死臂）。
 - 方向：cond-br + phi 合流。
@@ -135,13 +163,6 @@
 - foreach-over-Dict 枚举变量是键 K 而非 KeyValuePair（取值需再 `d[k]`）；Dict 保插入序（比 C# 强的保证，未声明）。
 - 特点：全部编译期显性（除 object== 与 foreach-dict 形状），不产生静默错值；按需求频度逐个补。
 - 探针：`_scratch/csaudit/{string,collections,objectmodel}/` 各探针。
-
-### [ ] A526 文档与诊断文案失真五条（本轮审计顺带查实）
-- SPEC L174"decimal 是保留关键字，尚无对应类型"已过期——宿主已实现 m 字面量/四则/比较/System.Decimal。
-- SPEC §2.6 运算符表漏 `>>>`（宿主支持；移位宽度语义归 A510）。
-- SPEC §4.7"只读捕获创建时复制值"与实测不符（按引用共享——见 A519）。
-- TOOLING.md「Runtime diagnostics」称默认 trap+exit 70——实测默认软模式继续（见 A507）。
-- A380 的拒绝文案指向不存在的 `.Wait()`（checker.c:1593-1594；句柄 API 无 Wait，实际出口=await WhenAll/JoinWait）。另 `--api` 对内建成员覆盖不全（`List.Remove` 查不到但存在），与 A443 同族。
 
 ### [ ] A527 发布产物体积的大头是运行时（未按函数分节）与内嵌默认图标，不是标准库
 - 实测（宿主 Windows，hello 的 `--publish` 产物 287,232 字节）：`.text` 146,432 + `.rsrc` 106,496 + 导入表/重定位/pdata 等约 35 KB。`.rsrc` 那一块就是内嵌的默认图标——`assets/zan.ico`（105,903 字节）由 CMake 编译进 zanc 的字节数组，每产一个 Windows exe 都带一份（`CMakeLists.txt` 的 `ZAN_DEFAULT_ICON`），占发布体积 37%。开发构建 703,679 字节，多出的 416 KB 是 DWARF 调试信息（约 317 KB）与符号表。
@@ -358,7 +379,9 @@
   `int.Parse` 系列的类型守卫同样**放行 `object`**——`object` 装类实例时，
   这些内建仍会把对象指针当 C 文本去 `strtoll`/`strtod` 解析，静默得到 0。
   与本条同源：object 没有通用 ToString / 值语义就没法正确分流。
-### [ ] A443 `Convert.ToString` 是编译器自造的接口——公开面（stdlib / 内建成员表）里根本没有它
+### [~] A443 `Convert.ToString` 是编译器自造的接口——公开面（stdlib / 内建成员表）里根本没有它
+- 追加（2026-10-23，自 A526 移入）：`--api`/`--emit-symbols` 对内建成员覆盖不全——
+  `List.Remove` 查不到但存在，与 Convert.ToString 同族（特判实现了、成员表没登记）。
 
 - 现象：
   - `stdlib/System/Convert.zan` 里**没有** `ToString`（只有 Base64 / Hex 那几个）；
@@ -993,7 +1016,12 @@
   拆不出来就报诊断，不生成非法 IR）。
 - 关联：A492（同一族取串路径的宽度/类型判据）、A454（自举缺真装箱原语）。
 
-### [ ] A498 宿主把 `bool` 当**有符号**整数用——`Math.Sqrt(true)` 得 NaN、`Convert.ToInt32(true)` 得 -1
+### [~] A498 宿主把 `bool` 当**有符号**整数用——`Math.Sqrt(true)` 得 NaN、`Convert.ToInt32(true)` 得 -1
+- **宿主侧已修（2026-10-23）**：① `Convert.ToInt32/64/ToInt` 整数路径对 i1 改零扩展
+  （`Convert.ToInt32(true)`=1）；② `math_arg_is_numeric` 把 i1 逐出白名单
+  （`Math.Sqrt(true)` 编译期拒绝）。两探针复验通过。
+- 待办：自举半边——`src/selfhost/irgen_expr.zan` 的 `MathNumBadType` 要同步把 bool
+  逐出白名单（自举侧现在 `Math.Sqrt(true)`=1.0，与宿主新行为分叉）；在途窗口过后补。
 
 - 现象（2026-10-22 随 A445 补自举侧守卫时实测，宿主 `build/zanc.exe`）：
   - `src/compiler/irgen_call.c:701` `math_arg_is_numeric` 判的是**降级后的

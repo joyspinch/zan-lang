@@ -89,15 +89,18 @@ heap allocations so leaks are reported at program exit.
 
 | `zanc` flag           | Effect                                                            |
 |-----------------------|-------------------------------------------------------------------|
-| *(default)*           | Runtime guards on: integer division/modulo by zero traps with a source location. |
+| *(default)*           | Runtime guards on: failing guards print `file:line:col` once per site, substitute a safe value, and **continue** (exit code 0). Guarded today: integer division/modulo by zero, array/List/string index out of bounds, null-receiver *field access*. **Not guarded**: Dict missing-key read, null-receiver *method call*. |
+| `--strict-runtime` / env `ZAN_RT_HARD=1` | Failing guards terminate with exit code `70` (still not catchable as exceptions). `--publish` does not enable this. |
 | `--no-runtime-checks` | Disable the guards (no div-by-zero check) for maximum throughput. |
 | `--check-leaks`       | Register an at-exit report of ARC objects still live at shutdown. |
 
 ### Source-located runtime errors
 
 Class instances are heap-allocated through the ARC runtime, and dangerous
-operations are guarded. A failing guard prints the offending
-`file:line:col` plus the specific error, then exits with status `70`:
+operations are guarded. In the default (soft) mode a failing guard prints the
+offending `file:line:col` plus the specific error and continues; under
+`--strict-runtime` it exits with status `70`. Runtime errors are **not**
+catchable as exceptions in either mode (see TASKS.md A507):
 
 ```
 $ zanc app.zan -o app && ./app

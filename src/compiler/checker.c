@@ -1591,7 +1591,7 @@ static void checker_check_assignable(zan_checker_t *c, zan_type_t *target,
         zan_diag_emit(c->diag, DIAG_ERROR, loc,
                       "cannot convert '%s' to '%s' in %s: a task started from a "
                       "lambda/Action carries no result; declare 'Task' (not "
-                      "'Task<T>') and wait with .Wait()",
+                      "'Task<T>') and await it or join with Task.WhenAll/JoinWait",
                       type_name(value), type_name(target), what);
         return;
     }
@@ -2543,6 +2543,20 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
                 return c->binder->type_string;
             }
         case TK_MINUS: case TK_STAR: case TK_SLASH: case TK_PERCENT:
+            /* decimal 与 float/double 的混合算术是 C# CS0019 编译错——
+             * 不能静默放行到发码侧（double 位模式被按 decimal 结构重解读，
+             * 产出 30 位垃圾数；TASKS.md A511②）。 */
+            if ((left->kind == TYPE_DECIMAL &&
+                 (right->kind == TYPE_FLOAT || right->kind == TYPE_DOUBLE)) ||
+                (right->kind == TYPE_DECIMAL &&
+                 (left->kind == TYPE_FLOAT || left->kind == TYPE_DOUBLE))) {
+                zan_diag_emit(c->diag, DIAG_ERROR, expr->loc,
+                              "cannot apply operator to 'decimal' and '%s' -- "
+                              "convert explicitly (e.g. Decimal.FromDouble)",
+                              right->kind == TYPE_DECIMAL ? type_name(left)
+                                                          : type_name(right));
+                return c->binder->type_error;
+            }
             if (left->kind == TYPE_DELEGATE || right->kind == TYPE_DELEGATE) {
                 if (expr->binary.op == TK_PLUS || expr->binary.op == TK_MINUS)
                     zan_diag_emit(c->diag, DIAG_ERROR, expr->loc,

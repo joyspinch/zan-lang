@@ -3,6 +3,12 @@
 static LLVMValueRef get_async_result_ptr(zan_irgen_t *g);
 static LLVMValueRef get_async_sub_slot_ptr(zan_irgen_t *g);
 
+/* 实参里"拥有型临时量"的 EH 临时槽登记（定义在 irgen_call.c，晚于本文件
+   被包含）：普通方法调用路径用它保证"调用抛异常时由展开器释放临时量"，
+   构造路径此前漏了这一步，构造函数一抛，实参里的临时量就泄漏了。 */
+static int emit_call_arg_eh_push(zan_irgen_t *g, zan_ast_node_t *arg,
+                                 LLVMValueRef val, local_scope_t *locals);
+
 /* NativeMemory 原语：堆外内存操作，地址使用 nint (i64)，不计入 ARC */
 
 /* 将实例接收者绑定至方法组闭包记录；recv 为 NULL 时生成静态方法组 */
@@ -3549,6 +3555,11 @@ static LLVMValueRef emit_nullable_binary(zan_irgen_t *g, zan_ast_node_t *expr,
                                          LLVMValueRef left, LLVMValueRef right,
                                          local_scope_t *locals);
 
+/* ?? 的短路求值（C# 语义）：右支只在左支为 null 时求值。
+ * 返回 NULL 表示形态覆盖不了，调用方回退旧的急切两臂路径。 */
+static LLVMValueRef emit_null_coalesce(zan_irgen_t *g, zan_ast_node_t *expr,
+                                       local_scope_t *locals);
+
 static LLVMValueRef coerce_to_decimal(zan_irgen_t *g, LLVMValueRef val) {
     LLVMTypeRef dec_ty = get_decimal_type(g);
     if (!val || LLVMTypeOf(val) == dec_ty) return val;
@@ -3677,6 +3688,14 @@ static LLVMValueRef emit_expr_binary(zan_irgen_t *g, zan_ast_node_t *expr,
             (is_str_concat_node(g, expr->binary.left, locals) ||
              is_str_concat_node(g, expr->binary.right, locals))) {
             return emit_str_concat_n(g, expr, locals);
+        }
+
+        /* ?? 短路求值：右支只在左支为 null 时求值（C# 语义）。旧实现对两臂
+         * 无条件求值后再 select——带副作用的右支（日志/计数/惰性初始化）被
+         * 错误触发，是 skill 二.2 禁止的 select 死臂形态（TASKS.md A515）。 */
+        if (expr->binary.op == TK_QUESTION_QUESTION) {
+            LLVMValueRef coal = emit_null_coalesce(g, expr, locals);
+            if (coal) return coal;
         }
 
         LLVMValueRef left = emit_expr(g, expr->binary.left, locals);
@@ -4293,6 +4312,91 @@ static zan_ast_node_t *binary_with_op(zan_irgen_t *g, zan_ast_node_t *expr,
     n->binary.left = expr->binary.left;
     n->binary.right = expr->binary.right;
     return n;
+}
+
+/* ?? 的短路求值：右支只在左支为 null 时求值（C# 语义，TASKS.md A515）。
+ * 旧实现对两臂无条件求值后再 select——带副作用的右支（日志/计数/惰性初始化）
+ * 被错误触发，是 skill 二.2 禁止的 select 死臂形态。
+ * 只对三种干净形态走惰性路径（指针同型 / 双可空聚合 / 可空左+裸负载同型）；
+ * 形态覆盖不了在**发码前**返回 NULL，调用方回退旧的急切两臂路径——
+ * 绝不在发码中途放弃，避免悬空块与二次求值。 */
+static LLVMValueRef emit_null_coalesce(zan_irgen_t *g, zan_ast_node_t *expr,
+                                       local_scope_t *locals) {
+    if (!g->current_fn || !expr || !expr->binary.left || !expr->binary.right)
+        return NULL;
+    zan_type_t *lst = infer_expr_type(g, expr->binary.left, locals);
+    zan_type_t *rst = infer_expr_type(g, expr->binary.right, locals);
+    if (!lst || !rst || expr->binary.left->kind == AST_NULL_LITERAL ||
+        expr->binary.right->kind == AST_NULL_LITERAL)
+        return NULL;
+    LLVMTypeRef llt_static = map_type(g, lst);
+    LLVMTypeRef rlt_static = rst ? map_type(g, rst) : NULL;
+    if (!llt_static || !rlt_static) return NULL;
+    bool l_nullable = llvm_is_nullable(llt_static) != 0;
+    bool l_ptr = LLVMGetTypeKind(llt_static) == LLVMPointerTypeKind;
+    if (!l_ptr && !l_nullable) return NULL;
+
+    if (l_ptr) {
+        /* 指针左支：右支静态类型必须映射到同一 LLVM 指针型 */
+        if (LLVMGetTypeKind(rlt_static) != LLVMPointerTypeKind ||
+            rlt_static != llt_static)
+            return NULL;
+    } else {
+        bool r_nullable = llvm_is_nullable(rlt_static) != 0;
+        if (r_nullable) {
+            /* T? ?? T?：聚合体直取，要求两臂聚合 LLVM 型一致 */
+            if (rlt_static != llt_static) return NULL;
+        } else {
+            /* T? ?? T：结果取负载型，要求右支静态 LLVM 型 == 左负载型 */
+            if (!lst->element_type) return NULL;
+            LLVMTypeRef payload_ty = map_type(g, lst->element_type);
+            if (!payload_ty || payload_ty != rlt_static) return NULL;
+        }
+    }
+
+    LLVMValueRef fn = LLVMGetBasicBlockParent(LLVMGetInsertBlock(g->builder));
+    LLVMValueRef left = emit_expr(g, expr->binary.left, locals);
+    LLVMTypeRef lt = LLVMTypeOf(left);
+    l_nullable = llvm_is_nullable(lt) != 0;
+    LLVMValueRef is_null;
+    if (l_nullable)
+        is_null = LLVMBuildNot(g->builder, nullable_has_value(g, left),
+                               "coal.lnull");
+    else
+        is_null = zan_icmp(g->builder, LLVMIntEQ, left, LLVMConstNull(lt),
+                           "coal.lnull");
+
+    LLVMBasicBlockRef left_bb = LLVMGetInsertBlock(g->builder);
+    LLVMBasicBlockRef rhs_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "coal.rhs");
+    LLVMBasicBlockRef merge = LLVMAppendBasicBlockInContext(g->ctx, fn, "coal.end");
+    LLVMBuildCondBr(g->builder, is_null, rhs_bb, merge);
+
+    LLVMPositionBuilderAtEnd(g->builder, rhs_bb);
+    LLVMValueRef right = emit_expr(g, expr->binary.right, locals);
+    LLVMBasicBlockRef rhs_end = LLVMGetInsertBlock(g->builder);
+    LLVMBuildBr(g->builder, merge);
+
+    LLVMPositionBuilderAtEnd(g->builder, merge);
+    LLVMTypeRef res_ty = lt;
+    LLVMValueRef lres = left;
+    LLVMValueRef rres = right;
+    if (l_nullable) {
+        bool r_nullable = llvm_is_nullable(LLVMTypeOf(right)) != 0;
+        if (r_nullable) {
+            /* T? ?? T? → 聚合体直取 */
+        } else {
+            /* T? ?? T → 结果取负载（静态已保证同型，此处仅防御性归一） */
+            res_ty = LLVMTypeOf(nullable_get_payload(g, left));
+            lres = nullable_get_payload(g, left);
+            if (LLVMTypeOf(right) != res_ty)
+                rres = coerce_int_to(g, right, res_ty);
+        }
+    }
+    LLVMValueRef phi = LLVMBuildPhi(g->builder, res_ty, "coal");
+    LLVMValueRef vals[] = { lres, rres };
+    LLVMBasicBlockRef bbs[] = { left_bb, rhs_end };
+    LLVMAddIncoming(phi, vals, bbs, 2);
+    return phi;
 }
 
 static LLVMValueRef emit_nullable_binary(zan_irgen_t *g, zan_ast_node_t *expr,
@@ -7580,8 +7684,15 @@ static LLVMValueRef emit_expr_index(zan_irgen_t *g, zan_ast_node_t *expr,
             LLVMValueRef hit = zan_icmp(g->builder, LLVMIntSGE, found,
                 LLVMConstInt(i64, 0, 0), "dihit");
             LLVMBasicBlockRef hit_bb = LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "di.hit");
+            LLVMBasicBlockRef miss_bb = LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "di.miss");
             LLVMBasicBlockRef done_bb = LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "di.done");
-            LLVMBuildCondBr(g->builder, hit, hit_bb, done_bb);
+            LLVMBuildCondBr(g->builder, hit, hit_bb, miss_bb);
+            /* 缺 key 读取不能静默返回默认值：至少走 soft runtime error 通道
+             * （C# 语义是抛 KeyNotFoundException，见 TASKS.md A508）。 */
+            LLVMPositionBuilderAtEnd(g->builder, miss_bb);
+            emit_runtime_check(g, LLVMConstInt(LLVMInt1TypeInContext(g->ctx), 1, 0),
+                expr->loc, "Dict key not found in indexer read");
+            LLVMBuildBr(g->builder, done_bb);
             LLVMPositionBuilderAtEnd(g->builder, hit_bb);
             LLVMValueRef word = zan_mul(g->builder, found,
                 load_dict_value_words(g, arr_ptr), "di.word");
@@ -9267,6 +9378,9 @@ static LLVMValueRef emit_expr_new_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                             emit_eh_tmp_push(g, alloca);
                             obj_eh_pushed = 1;
                         }
+                        /* 实参槽：构造函数抛异常时由展开器释放实参里的拥有型
+                         * 临时量（与普通方法调用路径同源判定）。 */
+                        int *arg_eh_pushed = (int *)calloc((size_t)argc, sizeof(int));
                         for (int k = 0; k < ctor_arg_list.count; k++) {
                             zan_ast_node_t *param =
                                 ctor->decl->method_decl.params.items[k];
@@ -9277,14 +9391,27 @@ static LLVMValueRef emit_expr_new_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                                 pt = subst_delegate_sig(g, pt, new_inst);
                             call_args[k + 1] = emit_arg_typed(
                                 g, ctor_arg_list.items[k], pt, locals);
+                            /* 实参里的拥有型临时量（new 出来的对象/集合）归
+                             * 调用方所有：正常返回后由下面的
+                             * emit_release_owned_call_temp 释放；构造函数
+                             * 抛异常时必须先进 EH 临时栈交给展开器，否则
+                             * 这些临时量没人释放（泄漏）。普通方法调用路径
+                             * 一直这么做，构造路径此前漏了。 */
+                            arg_eh_pushed[k + 1] = emit_call_arg_eh_push(
+                                g, ctor_arg_list.items[k], call_args[k + 1],
+                                locals);
                         }
                         coerce_args_to_params(g, ctor_ft, call_args, argc);
                         zan_call2(g->builder, ctor_ft, ctor_fn, call_args, (unsigned)argc, "");
+                        /* 逆序弹出：实参槽先进后进（后进先出），对象槽最后弹 */
+                        for (int k = argc - 1; k >= 0; k--)
+                            if (arg_eh_pushed[k]) emit_eh_tmp_pop(g);
                         if (obj_eh_pushed) emit_eh_tmp_pop(g);
                         for (int k = 0; k < ctor_arg_list.count; k++) {
                             emit_release_owned_call_temp(g, ctor_arg_list.items[k],
                                 call_args[k + 1], locals);
                         }
+                        free(arg_eh_pushed);
                         free(call_args);
                     } else {
                         if (sym->type->kind == TYPE_CLASS &&

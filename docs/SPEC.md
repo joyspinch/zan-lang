@@ -115,7 +115,7 @@ Escape sequences: `\n \r \t \\ \" \' \0`（不支持 `\x` / `\u` / `\U` 十六�
 | 2 | `+x` `-x` `!x` `~x` `++x` `--x` `(T)x` | Right | Unary, cast |
 | 3 | `*` `/` `%` | Left | Multiplicative |
 | 4 | `+` `-` | Left | Additive |
-| 5 | `<<` `>>` | Left | Shift |
+| 5 | `<<` `>>` `>>>` | Left | Shift（`>>` 算术移位、`>>>` 无符号移位） |
 | 6 | `<` `>` `<=` `>=` `is` `as` | Left | Relational, type test |
 | 7 | `==` `!=` | Left | Equality |
 | 8 | `&` | Left | Bitwise AND |
@@ -125,7 +125,7 @@ Escape sequences: `\n \r \t \\ \" \' \0`（不支持 `\x` / `\u` / `\U` 十六�
 | 12 | `\|\|` | Left | Logical OR |
 | 13 | `??` | Right | Null coalescing |
 | 14 | `? :` | Right | Conditional |
-| 15 | `=` `+=` `-=` `*=` `/=` `%=` `&=` `\|=` `^=` `<<=` `>>=` | Right | Assignment |
+| 15 | `=` `+=` `-=` `*=` `/=` `%=` `&=` `\|=` `^=` `<<=` `>>=` `>>>=` | Right | Assignment |
 | 16 | `=>` | Right | Lambda |
 
 Note: `?.`（null-conditional）**已实现**（2026-08-27 实测更正，此前本节写"未实现"）：
@@ -171,7 +171,7 @@ Type
     └── T?                 (nullable wrapper)
 ```
 
-`nint` 是普通有符号整数类型（指针宽度），原生内存访问通过 `NativeMemory` / `[DllImport]` 完成，见 §7。`decimal` 是保留关键字，尚无对应类型。
+`nint` 是普通有符号整数类型（指针宽度），原生内存访问通过 `NativeMemory` / `[DllImport]` 完成，见 §7。`decimal` 有独立类型（`m` 后缀字面量、四则与比较运算，公开面在 `System.Decimal`；已知缺口见 TASKS.md A511——除法 scale、与 double 混算、打印路径）。
 
 ### 3.2 Type Inference
 
@@ -369,9 +369,11 @@ public delegate TResult Func<T, TResult>(T arg);
 
 委托值是**一个指针两种形态**：静态方法组与无捕获 lambda 是裸函数指针
 （可直接交给 C 当回调）；实例方法组与捕获 lambda 是带 tag 的堆闭包记录，
-调用形式为 `fn(record, args...)`。捕获语义：只读捕获在创建闭包时把值复制
-进记录（此后外层的写入不可见）；被闭包**赋值**的局部变量提升为共享单元，
-闭包内外的修改互相可见。runtime 若要把委托留存到下一次调用之后，必须
+调用形式为 `fn(record, args...)`。捕获语义：被捕获的局部变量**提升为共享
+单元**，闭包内外的修改互相可见——无论闭包内是否对它赋值（实测
+`_scratch/csaudit/objectmodel/p06_for_capture.zan` 的 plain:9）。`for` 头
+声明的循环变量**每次迭代新建**（各迭代闭包各拿各的）；`foreach` 迭代变量
+同样每迭代新建，与 C# 5+ 一致。runtime 若要把委托留存到下一次调用之后，必须
 retain（见 `docs/ABI.md` §3.6）。
 
 ### 4.8 Access Control

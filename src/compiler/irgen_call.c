@@ -700,6 +700,12 @@ static bool type_is_text_arg(zan_type_t *t) {
    死在代码生成阶段，用户看到的是内部错误而不是人话诊断。 */
 static bool math_arg_is_numeric(LLVMValueRef v) {
     LLVMTypeKind k = LLVMGetTypeKind(LLVMTypeOf(v));
+    /* bool 降成 i1：C# 里 bool 没有到 double 的隐式转换，Math.Sqrt(true)
+     * 应编译期拒绝（i1 的 SIToFP 是符号扩展，true 曾被当成 -1.0 →
+     * Sqrt 得 NaN，TASKS.md A498）。 */
+    if (k == LLVMIntegerTypeKind &&
+        LLVMGetIntTypeWidth(LLVMTypeOf(v)) == 1)
+        return false;
     return k == LLVMIntegerTypeKind || k == LLVMDoubleTypeKind ||
            k == LLVMFloatTypeKind;
 }
@@ -1168,6 +1174,16 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                         LLVMFunctionType(LLVMVoidTypeInContext(g->ctx),
                                          (LLVMTypeRef[]){ i8p }, 1, 0),
                         g->rt_println, &bs, 1, "");
+                } else if (arg_type == get_decimal_type(g)) {
+                    /* decimal 结构体不能掉进 print_int（曾触发 LLVM 校验失败，
+                     * TASKS.md A511③）：转托管串后按字符串打印。 */
+                    LLVMValueRef ds = emit_to_cstr_u(g, arg, false);
+                    LLVMTypeRef i8p = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+                    zan_call2(g->builder,
+                        LLVMFunctionType(LLVMVoidTypeInContext(g->ctx),
+                                         (LLVMTypeRef[]){ i8p }, 1, 0),
+                        g->rt_println, &ds, 1, "");
+                    emit_string_release(g, ds);
                 } else {
                     bool print_unsigned = expr_is_unsigned_int(g, arg_ast, locals);
                     if (print_unsigned) {
@@ -1656,10 +1672,13 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
             if (!math_require_numeric(g, expr, arg, "Round"))
                 return LLVMConstReal(dbl, 0.0);
             arg = math_arg_to_double(g, arg);
-            LLVMValueRef round_fn = get_libc_fn(g, "round", d1_ty);
+            /* C# Math.Round 是银行家舍入（to-even）——libc rint 按默认 FP
+             * 舍入模式（最近偶数）实现；libc round 是远离零，曾与 C# 分叉
+             * （Round(2.5) 得 3，C# 是 2；TASKS.md A513）。 */
+            LLVMValueRef round_fn = get_libc_fn(g, "rint", d1_ty);
             if (expr->call.args.count == 1)
-                return zan_call2(g->builder, d1_ty, round_fn, &arg, 1, "round");
-            /* digits: round(x * 10^d) / 10^d */
+                return zan_call2(g->builder, d1_ty, round_fn, &arg, 1, "rint");
+            /* digits: rint(x * 10^d) / 10^d（同样银行家） */
             LLVMValueRef digits = emit_expr(g, expr->call.args.items[1], locals);
             if (!math_require_numeric(g, expr, digits, "Round"))
                 return LLVMConstReal(dbl, 0.0);
@@ -1669,7 +1688,7 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
             LLVMValueRef scale = zan_call2(g->builder, d2_ty, pow_fn,
                 (LLVMValueRef[]){ LLVMConstReal(dbl, 10.0), digits }, 2, "scale");
             LLVMValueRef scaled = LLVMBuildFMul(g->builder, arg, scale, "scaled");
-            LLVMValueRef r = zan_call2(g->builder, d1_ty, round_fn, &scaled, 1, "round");
+            LLVMValueRef r = zan_call2(g->builder, d1_ty, round_fn, &scaled, 1, "rint");
             return LLVMBuildFDiv(g->builder, r, scale, "rdig");
         }
 
@@ -1970,10 +1989,25 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                                 (LLVMValueRef[]){ arg, LLVMConstNull(i8pp),
                                                   LLVMConstInt(i32t, 10, 0) }, 3, "toint");
                         } else if (ak == LLVMDoubleTypeKind || ak == LLVMFloatTypeKind) {
-                            parsed = LLVMBuildFPToSI(g->builder, arg, i64t, "toint");
+                            /* C# Convert.ToInt32(double) 是舍入到最近（银行家），
+                             * 不是截断——先 rint 再转整（曾 ToInt32(3.9)=3，
+                             * C# 是 4；TASKS.md A513）。 */
+                            LLVMTypeRef dbl = LLVMDoubleTypeInContext(g->ctx);
+                            LLVMTypeRef d1_ty = LLVMFunctionType(dbl, (LLVMTypeRef[]){ dbl }, 1, 0);
+                            LLVMValueRef as_dbl = (ak == LLVMDoubleTypeKind)
+                                ? arg : LLVMBuildFPExt(g->builder, arg, dbl, "toint.ext");
+                            LLVMValueRef r = zan_call2(g->builder, d1_ty,
+                                get_libc_fn(g, "rint", d1_ty), &as_dbl, 1, "toint.rint");
+                            parsed = LLVMBuildFPToSI(g->builder, r, i64t, "toint");
                         } else if (ak == LLVMIntegerTypeKind) {
-                            parsed = (LLVMTypeOf(arg) == i64t) ? arg
-                                : LLVMBuildSExt(g->builder, arg, i64t, "toint");
+                            if (LLVMTypeOf(arg) == i64t)
+                                parsed = arg;
+                            else if (LLVMGetIntTypeWidth(LLVMTypeOf(arg)) == 1)
+                                /* bool 按 0/1 零扩展——C# Convert.ToInt32(true)=1；
+                                 * 符号扩展曾得 -1（TASKS.md A498）。 */
+                                parsed = LLVMBuildZExt(g->builder, arg, i64t, "toint.zext");
+                            else
+                                parsed = LLVMBuildSExt(g->builder, arg, i64t, "toint");
                         } else {
                             parsed = LLVMConstInt(i64t, 0, 0);
                         }

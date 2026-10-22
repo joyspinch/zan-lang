@@ -1074,9 +1074,25 @@ static int expr_family(zan_irgen_t *g, zan_ast_node_t *e, local_scope_t *locals)
     case AST_POSTFIX_UNARY:
         return expr_family(g, e->unary.operand, locals);
     case AST_CONDITIONAL: {
+        /* 两支家族合并：一边未知取另一边；数值家族按提升阶梯统一
+         * （float/double、decimal 赢整数）——与 checker 的
+         * merge_conditional_types 同口径。曾按 then 臂定型：
+         * (t?1:2.0)/2 因此做整数除法得 0，C# 是 0.5（TASKS.md A514）。 */
         int tf = expr_family(g, e->conditional.then_expr, locals);
-        if (tf != FAM_UNKNOWN) return tf;
-        return expr_family(g, e->conditional.else_expr, locals);
+        int ef = expr_family(g, e->conditional.else_expr, locals);
+        if (tf == FAM_UNKNOWN) return ef;
+        if (ef == FAM_UNKNOWN) return tf;
+        if (tf == ef) return tf;
+        if ((tf == FAM_INT && ef == FAM_FLOAT) ||
+            (tf == FAM_FLOAT && ef == FAM_INT))
+            return FAM_FLOAT;
+        if ((tf == FAM_INT && ef == FAM_DECIMAL) ||
+            (tf == FAM_DECIMAL && ef == FAM_INT) ||
+            (tf == FAM_FLOAT && ef == FAM_DECIMAL) ||
+            (tf == FAM_DECIMAL && ef == FAM_FLOAT))
+            return FAM_DECIMAL;
+        /* 其余混合（STRING/REF/BOOL 之间）维持 then 臂——与旧行为一致 */
+        return tf;
     }
     case AST_BINARY:
         switch (e->binary.op) {
@@ -1614,6 +1630,24 @@ static zan_type_t *infer_expr_type(zan_irgen_t *g, zan_ast_node_t *e,
         slot->type = t;
     }
     return t;
+}
+
+/* 两支数值提升（infer 侧）：与 checker 的 promote_numeric 同口径——
+ * double > float > ulong > long > int，decimal 只与整数合。曾按 then 臂
+ * 返回类型，(t?1:2.0)/2 被推成 int 除法得 0（C# 0.5，TASKS.md A514）。 */
+static zan_type_t *irgen_promote_pair(zan_irgen_t *g, zan_type_t *a,
+                                      zan_type_t *b) {
+    if (!a) return b;
+    if (!b) return a;
+    if (a->kind == TYPE_DECIMAL) return (b->kind == TYPE_FLOAT ||
+        b->kind == TYPE_DOUBLE) ? NULL : g->binder->type_decimal;
+    if (b->kind == TYPE_DECIMAL) return (a->kind == TYPE_FLOAT ||
+        a->kind == TYPE_DOUBLE) ? NULL : g->binder->type_decimal;
+    if (a->kind == TYPE_DOUBLE || b->kind == TYPE_DOUBLE) return g->binder->type_double;
+    if (a->kind == TYPE_FLOAT  || b->kind == TYPE_FLOAT)  return g->binder->type_float;
+    if (a->kind == TYPE_ULONG  || b->kind == TYPE_ULONG)  return g->binder->type_ulong;
+    if (a->kind == TYPE_LONG   || b->kind == TYPE_LONG)   return g->binder->type_long;
+    return a;
 }
 
 static zan_type_t *infer_expr_type_raw(zan_irgen_t *g, zan_ast_node_t *e,
@@ -2169,8 +2203,18 @@ static zan_type_t *infer_expr_type_raw(zan_irgen_t *g, zan_ast_node_t *e,
         return g->binder->type_string;
     case AST_CAST_EXPR:
         return resolve_type_ctx(g, e->cast.type);
-    case AST_CONDITIONAL:
-        return infer_expr_type(g, e->conditional.then_expr, locals);
+    case AST_CONDITIONAL: {
+        /* 两支提升合一定型（C# ?: 取公共提升型），不是 then 臂——
+         * infer 与家族合并（expr_family）同口径，TASKS.md A514。 */
+        zan_type_t *lt = infer_expr_type(g, e->conditional.then_expr, locals);
+        zan_type_t *rt = infer_expr_type(g, e->conditional.else_expr, locals);
+        if (!lt) return rt;
+        if (!rt) return lt;
+        if (lt == rt) return lt;
+        zan_type_t *m = irgen_promote_pair(g, lt, rt);
+        if (m) return m;
+        return lt; /* 非数值混合维持旧行为（then 臂） */
+    }
     case AST_TUPLE_EXPR: {
         /* (a, b, */
         if (!g->binder) return NULL;

@@ -116,14 +116,19 @@ zan_decimal_t zan_decimal_from_double(double val) {
 
 int64_t zan_decimal_to_int64(zan_decimal_t d) {
     uint8_t scale = dec_scale(d);
+    if (scale > MAX_SCALE) scale = MAX_SCALE;
 #if defined(__SIZEOF_INT128__)
     uint128_t m = ((uint128_t)d.hi32 << 64) | (uint128_t)d.lo64;
-    while (scale > 0) {
-        m /= 10;
-        scale--;
-    }
-    int64_t res = (int64_t)(m & 0xFFFFFFFFFFFFFFFFULL);
-    return dec_is_neg(d) ? -res : res;
+    /* C# 的 decimal→整数显式转换是舍入到最近、半数到偶（银行家）——
+     * 2.9m→3、2.5m→2。曾按逐位截断：ToInt64(2.9m)=2（TASKS.md A513）。
+     * 一次取商余再判定，不逐位舍入（逐位会把 2.49 滚成 3）。 */
+    if (scale == 0)
+        return dec_is_neg(d) ? -(int64_t)m : (int64_t)m;
+    uint128_t div = 1;
+    for (uint8_t i = 0; i < scale; i++) div *= 10;
+    uint128_t q = m / div, r = m % div;
+    if (r * 2 > div || (r * 2 == div && (q % 2 == 1))) q += 1;
+    return dec_is_neg(d) ? -(int64_t)q : (int64_t)q;
 #else
     uint64_t res = d.lo64;
     return dec_is_neg(d) ? -(int64_t)res : (int64_t)res;
@@ -255,8 +260,9 @@ zan_decimal_t zan_decimal_div(zan_decimal_t a, zan_decimal_t b) {
     uint128_t ma = get_m128(a);
     int scale = (int)dec_scale(a) - (int)dec_scale(b);
 
-    /* 提高被除数精度 */
-    while (scale < 18 && ma <= (MANTISSA_96_MAX / 10)) {
+    /* 精度目标提到 28 位 scale（.NET 的目标精度）——曾停在 18，
+     * 1m/3m 只有 18 位（C# 28 位，TASKS.md A511①）。 */
+    while (scale < MAX_SCALE && ma <= (MANTISSA_96_MAX / 10)) {
         ma *= 10;
         scale++;
     }
@@ -266,6 +272,22 @@ zan_decimal_t zan_decimal_div(zan_decimal_t a, zan_decimal_t b) {
     }
 
     uint128_t quo = ma / mb;
+    uint128_t rem = ma % mb;
+    bool rounded = false;
+    if (rem != 0 && rem * 2 >= mb && quo < MANTISSA_96_MAX) {
+        /* 末位四舍五入（远离零）——精度已用尽，2m/3m 尾位 …6667 不是截断 …666 */
+        quo++;
+        rounded = true;
+    }
+
+    /* 精确商去尾零：10m/4m 应得 2.5（scale 1），不是 2.5000…。
+     * 舍入出来的不精确商不去零——尾位是补出来的。 */
+    if (!rounded) {
+        while (scale > 0 && quo % 10 == 0) {
+            quo /= 10;
+            scale--;
+        }
+    }
     return from_m128(quo, neg, (uint8_t)scale);
 }
 
