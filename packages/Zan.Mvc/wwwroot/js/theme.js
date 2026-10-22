@@ -8,6 +8,7 @@
  */
 (function () {
   var KEY = 'zan-theme';
+  var DENSITY_KEY = 'zan-density';
   var root = document.documentElement;
 
   function stored() {
@@ -26,7 +27,23 @@
   var picked = stored();
   apply(picked || (prefersDark() ? 'dark' : 'light'), false);
 
+  /* 密度：默认紧凑（工作后台一屏放更多行）；显式选过舒适才加属性。 */
+  try {
+    if (localStorage.getItem(DENSITY_KEY) === 'comfortable') {
+      root.setAttribute('data-density', 'comfortable');
+    }
+  } catch (e) { /* 隐私模式：用默认紧凑 */ }
+
   document.addEventListener('click', function (ev) {
+    var dbtn = ev.target.closest ? ev.target.closest('[data-density-toggle]') : null;
+    if (dbtn) {
+      var loose = root.getAttribute('data-density') === 'comfortable';
+      if (loose) { root.removeAttribute('data-density'); }
+      else { root.setAttribute('data-density', 'comfortable'); }
+      try { localStorage.setItem(DENSITY_KEY, loose ? 'compact' : 'comfortable'); } catch (e) { }
+      dbtn.setAttribute('aria-pressed', loose ? 'false' : 'true');
+      return;
+    }
     var btn = ev.target.closest ? ev.target.closest('[data-theme-toggle]') : null;
     if (!btn) { return; }
     var next = root.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';
