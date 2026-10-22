@@ -1,0 +1,469 @@
+using System;
+using System.Collections.Generic;
+
+namespace System.Cli;
+
+// 命令行应用：命令树 + 解析 + 执行。
+//
+// 用法：
+//   CliApp app = new CliApp("mytool");
+//   app.Describe("A tool that does things");
+//   CliCommand build = new CliCommand("build").Describe("Build the project");
+//   build.AddOption(new CliOption("target", CliType.String).Short("t")
+//       .Help("Target platform"));
+//   build.On((CliResult r) => { ...; return 0; });
+//   app.Add(build);
+//   Environment.Exit(app.Run(args));
+//
+// 解析模型（与 click 一致）：**选项属于它前面那个命令**。全局选项写
+// 在子命令名前面（"app --verbose db migrate"），子命令自己的选项写在
+// 它后面（"app db migrate --count 3"）。
+//
+// 退出码：0 = 成功或显示帮助，2 = 用法错误（未知命令/选项、缺必填、
+// 类型不对），动作自己返回的码原样透传。
+public class CliApp {
+    // 程序名（帮助与错误提示里用）。
+    public string name;
+    // 一句话描述。
+    public string description;
+    // 版本号（帮助里显示）。
+    public string version;
+    // 根命令。
+    public CliCommand root;
+
+    public CliApp(string name) {
+        this.name = name == null ? "" : name;
+        this.description = "";
+        this.version = "";
+        this.root = new CliCommand(this.name);
+    }
+
+    // 程序描述。
+    public CliApp Describe(string d) {
+        this.description = d == null ? "" : d;
+        this.root.Describe(d);
+        return this;
+    }
+
+    // 版本号。
+    public CliApp Version(string v) {
+        this.version = v == null ? "" : v;
+        return this;
+    }
+
+    // 加一个子命令。
+    public CliCommand Add(CliCommand cmd) {
+        this.root.AddCommand(cmd);
+        return cmd;
+    }
+
+    // 加一个全局选项（属于根命令）。
+    public CliOption Option(CliOption opt) {
+        this.root.AddOption(opt);
+        return opt;
+    }
+
+    // 解析命令行。不抛错：用法错误落在 result.error 里。
+    public CliResult Parse(string[] args) {
+        CliResult result = new CliResult();
+        if (args == null) { args = new string[0]; }
+
+        CliCommand cmd = this.root;
+        int i = 0;
+
+        // 1) 沿命令树下降。每降一级之前，先把当前命令的选项吃掉——
+        //    全局选项因此可以写在子命令名前面。
+        while (true) {
+            i = this.ParseOptions(cmd, args, i, result);
+            if (result.error.Length > 0 || result.help) {
+                // 帮助/出错也可能发生在下降途中（"db migrate --help"）：
+                // 这时命中的命令已经确定，要记下来——否则打印的是根帮助，
+                // 用户问的是子命令的帮助。
+                result.command = cmd;
+                return result;
+            }
+            if (i >= args.Length) { break; }
+            string token = args[i];
+            if (token == "--") { break; }
+            CliCommand child = cmd.Find(token);
+            if (child == null) { break; }
+            cmd = child;
+            i = i + 1;
+        }
+        result.command = cmd;
+
+        // 2) 剩下的 token 是当前命令的选项与位置参数。
+        List<string> positionals = new List<string>();
+        bool endOfOptions = false;
+        while (i < args.Length) {
+            string arg = args[i];
+            if (endOfOptions) {
+                positionals.Add(arg);
+                i = i + 1;
+                continue;
+            }
+            if (arg == "--") {
+                endOfOptions = true;
+                i = i + 1;
+                continue;
+            }
+            if (arg.Length >= 2 && arg[0] == '-') {
+                if (arg[1] == '-') {
+                    i = this.ParseLongOption(cmd, args, i, result);
+                } else {
+                    i = this.ParseShortOptions(cmd, args, i, result);
+                }
+                if (result.error.Length > 0 || result.help) { return result; }
+                continue;
+            }
+            positionals.Add(arg);
+            i = i + 1;
+        }
+        result.positionals = positionals;
+
+        // 3) 有子命令却来了个不认识的词 → 那是敲错的子命令名，不是位置
+        //    参数（命令自己也声明了位置参数时才当位置参数看）。
+        if (cmd.children.Count > 0 && positionals.Count > 0
+            && cmd.Positionals().Count == 0) {
+            result.error = "unknown command '" + positionals[0] + "'";
+            return result;
+        }
+
+        // 4) 位置参数按声明顺序绑定。
+        List<CliOption> pos = cmd.Positionals();
+        int consumed = 0;
+        for (int k = 0; k < pos.Count; k = k + 1) {
+            CliOption p = pos[k];
+            if (p.variadic) {
+                List<string> got = new List<string>();
+                while (consumed < positionals.Count) {
+                    got.Add(positionals[consumed]);
+                    consumed = consumed + 1;
+                }
+                if (got.Count == 0) {
+                    if (p.required) {
+                        result.error = "missing required argument <" + p.name + ">";
+                        return result;
+                    }
+                } else {
+                    result.multi[p.name] = got;
+                    result.values[p.name] = got[0];
+                }
+                continue;
+            }
+            if (consumed < positionals.Count) {
+                result.values[p.name] = positionals[consumed];
+                consumed = consumed + 1;
+            } else if (p.required) {
+                result.error = "missing required argument <" + p.name + ">";
+                return result;
+            }
+        }
+        if (consumed < positionals.Count) {
+            result.error = "unexpected argument '" + positionals[consumed] + "'";
+            return result;
+        }
+
+        // 5) 选项校验：必填、类型、默认值。
+        for (int k = 0; k < cmd.options.Count; k = k + 1) {
+            CliOption o = cmd.options[k];
+            if (o.positional) { continue; }
+            if (!result.Has(o.name)) {
+                if (o.required) {
+                    result.error = "missing required option --" + o.name;
+                    return result;
+                }
+                if (o.hasDefault) { result.values[o.name] = o.defaultValue; }
+                continue;
+            }
+            string v = result.Get(o.name, "");
+            if (o.type == CliType.Int) {
+                int parsed;
+                if (!CliValue.TryInt(v, out parsed)) {
+                    result.error = "option --" + o.name
+                        + " expects an integer, got '" + v + "'";
+                    return result;
+                }
+            } else if (o.type == CliType.Float) {
+                double parsed;
+                if (!CliValue.TryFloat(v, out parsed)) {
+                    result.error = "option --" + o.name
+                        + " expects a number, got '" + v + "'";
+                    return result;
+                }
+            } else if (o.type == CliType.Bool) {
+                bool parsed;
+                if (!CliValue.TryBool(v, out parsed)) {
+                    result.error = "option --" + o.name
+                        + " expects a boolean, got '" + v + "'";
+                    return result;
+                }
+            }
+        }
+        return result;
+    }
+
+    // 解析当前位置起的一串选项，遇到非选项 token 或数组末尾就停。
+    int ParseOptions(CliCommand cmd, string[] args, int i, CliResult result) {
+        while (i < args.Length) {
+            string arg = args[i];
+            if (arg == "--") { return i; }
+            if (arg.Length < 2 || arg[0] != '-') { return i; }
+            if (arg[1] == '-') {
+                i = this.ParseLongOption(cmd, args, i, result);
+            } else {
+                i = this.ParseShortOptions(cmd, args, i, result);
+            }
+            if (result.error.Length > 0 || result.help) { return i; }
+        }
+        return i;
+    }
+
+    // 长选项："--name value" / "--name=value" / "--flag"。
+    int ParseLongOption(CliCommand cmd, string[] args, int i, CliResult result) {
+        string body = args[i].Substring(2);
+        int eq = body.IndexOf("=");
+        string name = eq < 0 ? body : body.Substring(0, eq);
+        bool hasInline = eq >= 0;
+        string inline = hasInline ? body.Substring(eq + 1) : "";
+        CliOption opt = cmd.FindOption(name);
+        if (opt == null) {
+            if (name == "help") {
+                result.help = true;
+                return i + 1;
+            }
+            result.error = "unknown option --" + name;
+            return i + 1;
+        }
+        string value = "";
+        if (opt.type == CliType.Bool) {
+            value = hasInline ? inline : "true";
+        } else if (hasInline) {
+            value = inline;
+        } else {
+            int next = i + 1;
+            if (next >= args.Length) {
+                result.error = "option --" + name + " requires a value";
+                return next;
+            }
+            value = args[next];
+            i = next;
+        }
+        this.StoreValue(result, opt, value);
+        return i + 1;
+    }
+
+    // 短选项："-v" / "-v value" / "-vvalue" / "-abc"（多个布尔选项）。
+    int ParseShortOptions(CliCommand cmd, string[] args, int i, CliResult result) {
+        string body = args[i].Substring(1);
+        int pos = 0;
+        while (pos < body.Length) {
+            string ch = body.Substring(pos, 1);
+            CliOption opt = cmd.FindShort(ch);
+            if (opt == null) {
+                if (ch == "h") {
+                    result.help = true;
+                    pos = pos + 1;
+                    continue;
+                }
+                result.error = "unknown option -" + ch;
+                return i + 1;
+            }
+            if (opt.type == CliType.Bool) {
+                this.StoreValue(result, opt, "true");
+                pos = pos + 1;
+                continue;
+            }
+            string value = "";
+            if (pos + 1 < body.Length) {
+                value = body.Substring(pos + 1);
+                pos = body.Length;
+            } else {
+                int next = i + 1;
+                if (next >= args.Length) {
+                    result.error = "option -" + ch + " requires a value";
+                    return next;
+                }
+                value = args[next];
+                i = next;
+                pos = pos + 1;
+            }
+            this.StoreValue(result, opt, value);
+        }
+        return i + 1;
+    }
+
+    // 记下一个取值（同名重复出现时收进 multi）。
+    void StoreValue(CliResult result, CliOption opt, string value) {
+        if (opt.name.Length == 0) { return; }
+        result.values[opt.name] = value;
+        List<string> all;
+        if (!result.multi.TryGetValue(opt.name, out all)) {
+            all = new List<string>();
+            result.multi[opt.name] = all;
+        }
+        all.Add(value);
+    }
+
+    // 解析并执行。返回进程退出码。
+    public int Run(string[] args) {
+        CliResult result = this.Parse(args);
+        if (result.error.Length > 0) {
+            Cli.Error(result.error);
+            Cli.Info("Run '" + this.name + " --help' for usage.");
+            return 2;
+        }
+        if (result.help) {
+            Cli.WriteLine(this.HelpFor(result.command));
+            return 0;
+        }
+        CliCommand cmd = result.command;
+        if (cmd.action == null) {
+            // 只有分组没有动作：打印帮助（不当作错误——用户只是想看看
+            // 这个分组下面有什么）。
+            Cli.WriteLine(this.HelpFor(cmd));
+            return 0;
+        }
+        return cmd.action(result);
+    }
+
+    // 根命令的帮助文本。
+    public string Help() {
+        return this.HelpFor(this.root);
+    }
+
+    // 某个命令的帮助文本。
+    public string HelpFor(CliCommand cmd) {
+        if (cmd == null) { cmd = this.root; }
+        StringBuilder sb = new StringBuilder();
+
+        string usage = cmd.usageText;
+        if (usage.Length == 0) { usage = this.UsageLine(cmd); }
+        sb.Append("Usage: ");
+        sb.Append(usage);
+        sb.Append("\n");
+
+        if (this.version.Length > 0 && cmd == this.root) {
+            sb.Append("\n");
+            sb.Append("Version: ");
+            sb.Append(this.version);
+            sb.Append("\n");
+        }
+        if (cmd.description.Length > 0) {
+            sb.Append("\n");
+            sb.Append(cmd.description);
+            sb.Append("\n");
+        }
+
+        // 选项：先把标签拼好，算出最大宽度再对齐说明文字。
+        List<string> labels = new List<string>();
+        List<string> helps = new List<string>();
+        for (int i = 0; i < cmd.options.Count; i = i + 1) {
+            CliOption o = cmd.options[i];
+            if (o.positional) { continue; }
+            labels.Add(this.OptionLabel(o));
+            helps.Add(this.OptionHelp(o));
+        }
+        labels.Add("    -h, --help");
+        helps.Add("Show this help");
+
+        if (labels.Count > 0) {
+            sb.Append("\n");
+            sb.Append("Options:\n");
+            int width = 0;
+            for (int i = 0; i < labels.Count; i = i + 1) {
+                if (labels[i].Length > width) { width = labels[i].Length; }
+            }
+            for (int i = 0; i < labels.Count; i = i + 1) {
+                sb.Append("  ");
+                sb.Append(labels[i]);
+                for (int k = labels[i].Length; k < width; k = k + 1) {
+                    sb.Append(" ");
+                }
+                sb.Append("  ");
+                sb.Append(helps[i]);
+                sb.Append("\n");
+            }
+        }
+
+        if (cmd.children.Count > 0) {
+            sb.Append("\n");
+            sb.Append("Commands:\n");
+            int width = 0;
+            for (int i = 0; i < cmd.children.Count; i = i + 1) {
+                string n = cmd.children[i].name;
+                if (n.Length > width) { width = n.Length; }
+            }
+            for (int i = 0; i < cmd.children.Count; i = i + 1) {
+                CliCommand c = cmd.children[i];
+                sb.Append("  ");
+                sb.Append(c.name);
+                for (int k = c.name.Length; k < width; k = k + 1) {
+                    sb.Append(" ");
+                }
+                sb.Append("  ");
+                sb.Append(c.description);
+                sb.Append("\n");
+            }
+        }
+        return sb.ToString();
+    }
+
+    // 用法行（没有自定义 Usage 时按选项与子命令自动生成）。
+    string UsageLine(CliCommand cmd) {
+        StringBuilder sb = new StringBuilder();
+        sb.Append(cmd.Path());
+        List<CliOption> pos = cmd.Positionals();
+        if (pos.Count > 0) { sb.Append(" [options]"); }
+        for (int i = 0; i < pos.Count; i = i + 1) {
+            CliOption p = pos[i];
+            if (p.required) {
+                sb.Append(" <");
+                sb.Append(p.name);
+                sb.Append(">");
+            } else {
+                sb.Append(" [");
+                sb.Append(p.name);
+                sb.Append("]");
+            }
+            if (p.variadic) { sb.Append("..."); }
+        }
+        if (cmd.children.Count > 0) { sb.Append(" <command>"); }
+        return sb.ToString();
+    }
+
+    // 选项标签："-v, --verbose" / "--count <int>"。
+    string OptionLabel(CliOption o) {
+        StringBuilder sb = new StringBuilder();
+        if (o.shortName.Length > 0) {
+            sb.Append("-");
+            sb.Append(o.shortName);
+            sb.Append(", ");
+        } else {
+            sb.Append("    ");
+        }
+        sb.Append("--");
+        sb.Append(o.name);
+        string t = CliType.Name(o.type);
+        if (t.Length > 0) {
+            sb.Append(" <");
+            sb.Append(t);
+            sb.Append(">");
+        }
+        return sb.ToString();
+    }
+
+    // 选项说明（附默认值与必填标记）。
+    string OptionHelp(CliOption o) {
+        string h = o.helpText;
+        if (o.required) {
+            if (h.Length > 0) { h = h + " "; }
+            h = h + "(required)";
+        }
+        if (o.hasDefault) {
+            if (h.Length > 0) { h = h + " "; }
+            h = h + "(default: " + o.defaultValue + ")";
+        }
+        return h;
+    }
+}

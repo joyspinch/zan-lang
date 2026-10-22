@@ -1,0 +1,316 @@
+using System;
+using System.Collections.Generic;
+
+namespace System.Cli;
+
+// 命令行参数的值类型。
+public class CliType {
+    public const int String = 0;
+    public const int Int = 1;
+    public const int Float = 2;
+    public const int Bool = 3;
+
+    // 类型名（帮助文本里显示）。
+    public static string Name(int type) {
+        if (type == CliType.Int) { return "int"; }
+        if (type == CliType.Float) { return "float"; }
+        if (type == CliType.Bool) { return ""; }
+        return "string";
+    }
+}
+
+// 一个选项或位置参数的声明。
+//
+// 选项（--name）：命令行里写成 "--name value" 或 "--name=value"；
+// 布尔选项写成 "--flag"（等价 true），也可显式 "--flag=false"。
+// 短选项（-n）：只给单字母，可与长选项并存。
+//
+// 位置参数：按出现顺序填入，帮助文本里显示它的名字与类型。
+public class CliOption {
+    // 长名（"verbose"）；位置参数也用它做键。
+    public string name;
+    // 短名（"v"）；空串表示没有。
+    public string shortName;
+    // 帮助文本。
+    public string helpText;
+    // 值类型（CliType.*）。
+    public int type;
+    // 是否必填。
+    public bool required;
+    // 是否位置参数。
+    public bool positional;
+    // 位置参数是否可重复（收集成一个列表）。
+    public bool variadic;
+    // 默认值（hasDefault 为真时生效）。
+    public string defaultValue;
+    public bool hasDefault;
+
+    public CliOption(string name, int type) {
+        this.name = name == null ? "" : name;
+        this.shortName = "";
+        this.helpText = "";
+        this.type = type;
+        this.required = false;
+        this.positional = false;
+        this.variadic = false;
+        this.defaultValue = "";
+        this.hasDefault = false;
+    }
+
+    // 绑一个短名（"-v"）。
+    public CliOption Short(string s) {
+        this.shortName = s == null ? "" : s;
+        return this;
+    }
+
+    // 帮助文本。
+    public CliOption Help(string h) {
+        this.helpText = h == null ? "" : h;
+        return this;
+    }
+
+    // 必填：缺了就报用法错误。
+    public CliOption Required() {
+        this.required = true;
+        return this;
+    }
+
+    // 位置参数（按出现顺序填）。
+    public CliOption AsPositional() {
+        this.positional = true;
+        return this;
+    }
+
+    // 位置参数可重复（"files a b c"）。
+    public CliOption Variadic() {
+        this.positional = true;
+        this.variadic = true;
+        return this;
+    }
+
+    // 默认值。
+    public CliOption Default(string v) {
+        this.defaultValue = v == null ? "" : v;
+        this.hasDefault = true;
+        return this;
+    }
+}
+
+// 命令的动作：拿到解析结果，返回进程退出码（0 = 成功）。
+public delegate int CliAction(CliResult result);
+
+// 解析结果：选项取值 + 位置参数。
+//
+// 选项与位置参数都落在 values 里（键是选项名），位置参数另有一份
+// 顺序列表（At(i)）——两种取法给同一件事准备了两种视角：按名字取
+// 语义，按顺序取顺序。
+public class CliResult {
+    // 选项/位置参数的取值（键是选项名）。
+    public Dictionary<string, string> values;
+    // 重复出现的选项（"--tag a --tag b"）。
+    public Dictionary<string, List<string>> multi;
+    // 位置参数（按出现顺序）。
+    public List<string> positionals;
+    // 命中的命令。
+    public CliCommand command;
+    // 用法错误（空串 = 无错）。
+    public string error;
+    // 是否要显示帮助（--help / -h）。
+    public bool help;
+
+    public CliResult() {
+        this.values = new Dictionary<string, string>();
+        this.multi = new Dictionary<string, List<string>>();
+        this.positionals = new List<string>();
+        this.command = null;
+        this.error = "";
+        this.help = false;
+    }
+
+    // 该选项是否出现过。
+    public bool Has(string name) {
+        if (name == null) { return false; }
+        return this.values.ContainsKey(name);
+    }
+
+    // 取值（没给过返回 fallback）。
+    public string Get(string name, string fallback) {
+        if (name == null) { return fallback; }
+        string v;
+        if (this.values.TryGetValue(name, out v)) { return v; }
+        return fallback;
+    }
+
+    // 取整数值（没给过或不是数字返回 fallback）。
+    public int GetInt(string name, int fallback) {
+        string v = this.Get(name, "");
+        if (v.Length == 0) { return fallback; }
+        int parsed;
+        if (!CliValue.TryInt(v, out parsed)) { return fallback; }
+        return parsed;
+    }
+
+    // 取浮点值（没给过或不是数字返回 fallback）。
+    public double GetFloat(string name, double fallback) {
+        string v = this.Get(name, "");
+        if (v.Length == 0) { return fallback; }
+        double parsed;
+        if (!CliValue.TryFloat(v, out parsed)) { return fallback; }
+        return parsed;
+    }
+
+    // 取布尔值（"true"/"1"/"yes"/"on" 为真；没给过返回 false）。
+    public bool GetBool(string name) {
+        return CliValue.IsTrue(this.Get(name, ""));
+    }
+
+    // 取重复出现的选项的全部取值（没出现过返回空列表）。
+    public List<string> GetAll(string name) {
+        if (name == null) { return new List<string>(); }
+        List<string> v;
+        if (this.multi.TryGetValue(name, out v)) { return v; }
+        return new List<string>();
+    }
+
+    // 位置参数个数。
+    public int Count() {
+        return this.positionals.Count;
+    }
+
+    // 第 i 个位置参数（越界返回空串）。
+    public string At(int index) {
+        if (index < 0 || index >= this.positionals.Count) { return ""; }
+        return this.positionals[index];
+    }
+}
+
+// 一个命令：名字、别名、描述、选项、子命令、动作。
+//
+// 命令树靠"子命令"表达：`app db migrate` 里 db 是 migrate 的父命令。
+// 父命令自己也可以带选项与动作（既是分组又是可执行命令）。
+public class CliCommand {
+    public string name;
+    // 别名（"mig" 之于 "migrate"）。
+    public List<string> aliases;
+    public string description;
+    // 用法行（不给就按选项自动生成）。
+    public string usageText;
+    public List<CliOption> options;
+    public List<CliCommand> children;
+    // 动作（null = 只做分组，执行时打印帮助）。
+    public CliAction action;
+    // 从根到这个命令的路径（"mytool db migrate"）。
+    //
+    // 这里存**字符串**而不是父命令指针：父子互指会构成引用环，ARC
+    // 收不掉，进程退出时整棵命令树会被报成"仍可达"的泄漏。路径在
+    // 挂到父命令时一次性算好，用不着回头找爹。
+    public string path;
+
+    public CliCommand(string name) {
+        this.name = name == null ? "" : name;
+        this.aliases = new List<string>();
+        this.description = "";
+        this.usageText = "";
+        this.options = new List<CliOption>();
+        this.children = new List<CliCommand>();
+        this.action = null;
+        this.path = this.name;
+    }
+
+    // 加一个别名。
+    public CliCommand Alias(string a) {
+        if (a != null && a.Length > 0) { this.aliases.Add(a); }
+        return this;
+    }
+
+    // 一句话描述（帮助里显示）。
+    public CliCommand Describe(string d) {
+        this.description = d == null ? "" : d;
+        return this;
+    }
+
+    // 自定义用法行。
+    public CliCommand Usage(string u) {
+        this.usageText = u == null ? "" : u;
+        return this;
+    }
+
+    // 加一个选项。
+    public CliCommand AddOption(CliOption opt) {
+        if (opt != null) { this.options.Add(opt); }
+        return this;
+    }
+
+    // 加一个子命令。
+    public CliCommand AddCommand(CliCommand child) {
+        if (child == null) { return this; }
+        this.children.Add(child);
+        child.path = this.path + " " + child.name;
+        // 整棵子树的路径要重算：子命令可能先在自己的父下建好（那时
+        // 父还没挂到根上，路径是 "db migrate"），等父挂上去时前缀才变。
+        child.RebuildPaths();
+        return this;
+    }
+
+    // 重算自己下面所有子命令的路径。
+    void RebuildPaths() {
+        for (int i = 0; i < this.children.Count; i = i + 1) {
+            CliCommand c = this.children[i];
+            c.path = this.path + " " + c.name;
+            c.RebuildPaths();
+        }
+    }
+
+    // 绑动作。
+    public CliCommand On(CliAction fn) {
+        this.action = fn;
+        return this;
+    }
+
+    // 按名字或别名找子命令。
+    public CliCommand Find(string nameOrAlias) {
+        if (nameOrAlias == null) { return null; }
+        for (int i = 0; i < this.children.Count; i = i + 1) {
+            CliCommand c = this.children[i];
+            if (c.name == nameOrAlias) { return c; }
+            for (int k = 0; k < c.aliases.Count; k = k + 1) {
+                if (c.aliases[k] == nameOrAlias) { return c; }
+            }
+        }
+        return null;
+    }
+
+    // 按长名找选项（只找非位置参数）。
+    public CliOption FindOption(string name) {
+        if (name == null) { return null; }
+        for (int i = 0; i < this.options.Count; i = i + 1) {
+            CliOption o = this.options[i];
+            if (!o.positional && o.name == name) { return o; }
+        }
+        return null;
+    }
+
+    // 按短名找选项。
+    public CliOption FindShort(string shortName) {
+        if (shortName == null || shortName.Length == 0) { return null; }
+        for (int i = 0; i < this.options.Count; i = i + 1) {
+            CliOption o = this.options[i];
+            if (!o.positional && o.shortName == shortName) { return o; }
+        }
+        return null;
+    }
+
+    // 位置参数（按声明顺序）。
+    public List<CliOption> Positionals() {
+        List<CliOption> out2 = new List<CliOption>();
+        for (int i = 0; i < this.options.Count; i = i + 1) {
+            if (this.options[i].positional) { out2.Add(this.options[i]); }
+        }
+        return out2;
+    }
+
+    // 从根到这个命令的路径（"app db migrate"）。
+    public string Path() {
+        return this.path;
+    }
+}

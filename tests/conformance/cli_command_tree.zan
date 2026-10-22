@@ -1,0 +1,181 @@
+using System;
+using System.Collections.Generic;
+using System.Cli;
+
+// 命令行命令树：
+// 1. 子命令树与别名；
+// 2. 类型化取值（int / string / bool）、默认值、必填；
+// 3. 长选项两种写法（"--name value" / "--name=value"）、短选项
+//    （"-c 5" / "-c5" / 合并布尔）；
+// 4. 全局选项写在子命令名之前；
+// 5. 变长位置参数、重复选项、"--" 结束选项；
+// 6. 用法错误一律退出码 2 且说清错在哪（未知命令/选项、类型不对、
+//    缺必填、多余参数）；
+// 7. 帮助文本与退出码（--help → 0，动作自己的码原样透传）。
+class Program {
+    static int failures = 0;
+
+    static void Check(bool cond, string name) {
+        if (cond) {
+            Console.WriteLine("ok " + name);
+        } else {
+            Console.WriteLine("FAIL " + name);
+            failures = failures + 1;
+        }
+    }
+
+    static CliApp BuildApp() {
+        CliApp app = new CliApp("mytool");
+        app.Describe("A test CLI");
+        app.Version("1.2.3");
+        app.Option(new CliOption("verbose", CliType.Bool).Short("v")
+            .Help("Verbose output"));
+
+        CliCommand db = new CliCommand("db").Describe("Database commands");
+        CliCommand migrate = new CliCommand("migrate").Alias("mig")
+            .Describe("Apply pending migrations");
+        migrate.AddOption(new CliOption("count", CliType.Int).Short("c")
+            .Help("How many to apply").Default("10"));
+        migrate.AddOption(new CliOption("target", CliType.String).Short("t")
+            .Help("Target platform"));
+        migrate.AddOption(new CliOption("name", CliType.String).AsPositional()
+            .Required().Help("Migration name"));
+        migrate.On((CliResult r) => {
+            Console.WriteLine("action migrate count="
+                + Convert.ToString(r.GetInt("count", -1))
+                + " target=" + r.Get("target", "-")
+                + " name=" + r.Get("name", "-")
+                + " verbose=" + Convert.ToString(r.GetBool("verbose")));
+            return 0;
+        });
+        db.AddCommand(migrate);
+        app.Add(db);
+
+        CliCommand echo = new CliCommand("echo").Describe("Echo the arguments");
+        echo.AddOption(new CliOption("tag", CliType.String).Help("Repeatable tag"));
+        echo.AddOption(new CliOption("files", CliType.String).Variadic()
+            .Help("Input files"));
+        echo.On((CliResult r) => {
+            Console.WriteLine("action echo tags="
+                + Convert.ToString(r.GetAll("tag").Count)
+                + " files=" + Convert.ToString(r.GetAll("files").Count));
+            return 7;
+        });
+        app.Add(echo);
+        return app;
+    }
+
+    static int Run() {
+        CliApp app = Program.BuildApp();
+
+        // 1. 子命令树、默认值、必填位置参数。
+        {
+            CliResult r = app.Parse(new string[] { "db", "migrate", "init" });
+            Check(r.error.Length == 0
+                && r.command.Path() == "mytool db migrate"
+                && r.GetInt("count", -1) == 10
+                && r.Get("target", "-") == "-"
+                && r.Get("name", "-") == "init",
+                "subcommand tree, default value and positional");
+        }
+        // 2. 命令别名。
+        {
+            CliResult r = app.Parse(new string[] { "db", "mig", "init" });
+            Check(r.error.Length == 0 && r.command.Path() == "mytool db migrate",
+                "command alias");
+        }
+        // 3. 长选项的两种写法。
+        {
+            CliResult r = app.Parse(new string[] {
+                "db", "migrate", "--count", "5", "--target=win", "init" });
+            Check(r.error.Length == 0 && r.GetInt("count", -1) == 5
+                && r.Get("target", "") == "win",
+                "long option forms");
+        }
+        // 4. 短选项：分离值与贴着写。
+        {
+            CliResult r = app.Parse(new string[] {
+                "db", "migrate", "-c", "7", "-t", "linux", "init" });
+            Check(r.error.Length == 0 && r.GetInt("count", -1) == 7
+                && r.Get("target", "") == "linux",
+                "short option with separate value");
+            CliResult s = app.Parse(new string[] { "db", "migrate", "-c9", "init" });
+            Check(s.error.Length == 0 && s.GetInt("count", -1) == 9,
+                "short option with attached value");
+        }
+        // 5. 全局选项写在子命令名之前。
+        {
+            CliResult r = app.Parse(new string[] {
+                "--verbose", "db", "migrate", "init" });
+            Check(r.error.Length == 0 && r.GetBool("verbose"),
+                "global option before subcommand");
+        }
+        // 6. 重复选项与变长位置参数。
+        {
+            CliResult r = app.Parse(new string[] {
+                "echo", "--tag", "a", "--tag", "b", "x", "y", "z" });
+            Check(r.error.Length == 0 && r.GetAll("tag").Count == 2
+                && r.GetAll("files").Count == 3
+                && r.At(0) == "x",
+                "repeated option and variadic positional");
+        }
+        // 7. "--" 之后的 token 都是位置参数。
+        {
+            CliResult r = app.Parse(new string[] { "echo", "--", "--tag" });
+            Check(r.error.Length == 0 && r.Count() == 1 && r.At(0) == "--tag",
+                "double dash ends option parsing");
+        }
+        // 8. 未知选项 / 未知命令 / 类型不对 / 缺必填 / 多余参数。
+        {
+            CliResult a = app.Parse(new string[] { "db", "migrate", "--nope" });
+            Check(a.error == "unknown option --nope", "unknown option is rejected");
+
+            CliResult b = app.Parse(new string[] { "nope" });
+            Check(b.error == "unknown command 'nope'", "unknown command is rejected");
+
+            CliResult c = app.Parse(new string[] {
+                "db", "migrate", "--count", "abc", "init" });
+            Check(c.error == "option --count expects an integer, got 'abc'",
+                "wrong option type is rejected");
+
+            CliResult d = app.Parse(new string[] { "db", "migrate" });
+            Check(d.error == "missing required argument <name>",
+                "missing required positional is rejected");
+
+            CliResult e = app.Parse(new string[] {
+                "db", "migrate", "init", "extra" });
+            Check(e.error == "unexpected argument 'extra'",
+                "unexpected positional is rejected");
+        }
+        // 9. 缺值的选项。
+        {
+            CliResult r = app.Parse(new string[] { "db", "migrate", "--count" });
+            Check(r.error == "option --count requires a value",
+                "option without value is rejected");
+        }
+
+        // 10. 帮助文本（格式钉死）。
+        CliCommand dbCmd = app.root.Find("db");
+        CliCommand migCmd = dbCmd == null ? null : dbCmd.Find("migrate");
+        Console.WriteLine("--- help ---");
+        Console.Write(app.HelpFor(migCmd));
+        Console.WriteLine("--- end ---");
+
+        // 11. 退出码：--help → 0；用法错误 → 2；动作的码原样透传。
+        {
+            int helpCode = app.Run(new string[] { "db", "migrate", "--help" });
+            Check(helpCode == 0, "help exits with 0");
+            int badCode = app.Run(new string[] { "db", "migrate", "--nope" });
+            Check(badCode == 2, "usage error exits with 2");
+            int actionCode = app.Run(new string[] { "echo", "a" });
+            Check(actionCode == 7, "action exit code is passed through");
+        }
+
+        Console.WriteLine("failures=" + Convert.ToString(Program.failures));
+        return 0;
+    }
+
+    static void Main() {
+        int r = await Program.Run();
+    }
+}
