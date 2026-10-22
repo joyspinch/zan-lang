@@ -115,6 +115,16 @@ Without MCP the same index is a file: `knowledge/symbols.json` next to the SDK
   result faults at runtime"). Store it, check for null, or use `?.`. When
   writing parsing code, **wrap it in a null-safe field accessor** — a long
   chain of `Get(...).Str(...)` produces dozens of compile errors.
+* **`JsonValue.PutJson(key, string)` only takes JSON text**; to place an
+  already-built `JsonValue` use `Put(key, value)`. Passing a `JsonValue` to
+  `PutJson` fails with "cannot convert 'JsonValue' to 'string'" —
+  `PutJson`/`AppendJson` parse *text* into the document, `Put`/`Append`
+  store a value.
+* **Interfaces cannot have fields** (a Zan interface has methods only). To
+  expose "the reason for the last failure" in a contract, declare a
+  `LastError()` method and keep a `lastError` field on the implementing
+  class as well, for callers holding the concrete type — that is the
+  existing convention (`IRetriever` / `IReranker` do exactly this).
 * **Cross-package namespaces need no manifest dependency**: compiling with
   `--package-project <repo>` scans every `packages/*/src/`, so a cross-package
   `using` resolves directly — nothing has to be declared in `zan.pkg`. A new

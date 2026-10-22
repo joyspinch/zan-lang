@@ -36,7 +36,7 @@ namespace System.Ai;
 // `Stream` 用 SSE 逐块推给回调。回调返回 false 表示**调用方主动停止**
 // （客户端断开），此时不再继续读流。
 
-public class AiClient : IDisposable {
+public class AiClient : IDisposable, IChat {
     public AiConfig config;
 
     // 端点 → HttpClient（**按端点复用**，不是每次请求新建）。
@@ -162,11 +162,26 @@ public class AiClient : IDisposable {
     // 补全（带工具）。返回这一轮的结果——模型可能给了答案，也可能
     // 请求调工具。
     //
-    // toolsJson 是工具声明的 JSON 数组（`ToolRegistry.DeclarationsJson`
-    // 给）。为空串表示不带工具。
+    // tools 是工具声明（**实体**，协议无关）——本客户端渲染成 OpenAI
+    // 兼容的线格式（`{"type":"function","function":{...}}`）。
     //
     // 返回 null 表示调用失败（原因在 lastError）。
     public async AiToolTurn CompleteWithTools(List<AiMessage> messages,
+    List<AiTool> tools, double temperature) {
+        return await this.CompleteWithToolsJson(messages,
+            AiClient.DeclarationsJson(tools), temperature);
+    }
+
+    // 补全（带工具），工具声明**已经是 OpenAI 兼容的线格式 JSON**。
+    //
+    // 与 `CompleteWithTools` 的差别只是工具声明的形态：实体 vs 串。
+    // 串这一版给已经自己拼好 JSON 的调用方（不想为了传工具声明先造
+    // 一遍 `AiTool` 实体）。
+    //
+    // toolsJson 是工具声明的 JSON 数组；为空串表示不带工具。
+    //
+    // 返回 null 表示调用失败（原因在 lastError）。
+    public async AiToolTurn CompleteWithToolsJson(List<AiMessage> messages,
             string toolsJson, double temperature) {
         this.lastError = "";
         AiEndpoint ep = AiEndpoint.Parse(this.config.baseUrl);
@@ -530,6 +545,21 @@ public class AiClient : IDisposable {
     // 静态辅助
     // ------------------------------------------------------------------
 
+    // 工具声明（实体）→ OpenAI 兼容的线格式 JSON 数组。
+    //
+    // 与 `ToolRegistry.DeclarationsJson` 同一形状——放在这里是为了让
+    // 客户端不依赖注册表（注册表只是"声明 + 实现"的一个来源）。
+    public static string DeclarationsJson(List<AiTool> tools) {
+        JsonValue arr = JsonValue.NewArray();
+        if (tools == null) { return arr.ToJson(); }
+        for (int i = 0; i < tools.Count; i = i + 1) {
+            AiTool t = tools[i];
+            if (t == null) { continue; }
+            arr.Append(t.ToJson());
+        }
+        return arr.ToJson();
+    }
+
     // 消息列表 → JSON 数组文本。
     public static string MessagesJson(List<AiMessage> messages) {
         JsonValue arr = JsonValue.NewArray();
@@ -628,6 +658,12 @@ public class AiClient : IDisposable {
     public string lastError;
     // 上一次调用的用量。
     public AiUsage lastUsage;
+
+    // 上一次失败的原因（成功时为空串）——`IChat` 契约的读法。
+    //
+    // 与 `lastError` 字段是同一份内容：字段给"直接用这个客户端"的调用方，
+    // 方法给"只拿到接口"的调用方。
+    public string LastError() { return this.lastError; }
 }
 
 // 流式增量回调：返回 false 表示停止。

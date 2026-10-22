@@ -107,6 +107,14 @@ Without MCP the same index is a file: `knowledge/symbols.json` next to the SDK
   runtime"）。存到局部变量判空、或用 `?.`。写解析类代码时**包一层
   null 安全的取字段辅助函数**最省事（一串 `Get(...).Str(...)` 会炸出几十
   个编译错误）。
+* **`JsonValue.PutJson(key, string)` 只收 JSON 串**；要塞一个已经建好的
+  `JsonValue` 得用 `Put(key, value)`。把 `JsonValue` 传给 `PutJson` 报
+  "cannot convert 'JsonValue' to 'string'"——`PutJson`/`AppendJson` 是
+  "把一段**文本**解析进文档"，`Put`/`Append` 才是"放一个值"。
+* **接口里不能有字段**（Zan 的接口只有方法）。契约要暴露"上一次失败
+  的原因"就写成 `LastError()` 方法，实现类里**同时**留一个 `lastError`
+  字段给"直接用这个类"的调用方——仓库既有约定（`IRetriever` /
+  `IReranker` 都是这么写的）。
 * **跨包 namespace 免声明**：`zanc --package-project <repo>` 会扫所有
   `packages/*/src/`，跨包 `using` 直接可用，**不需要在 `zan.pkg` 里声明
   依赖**（`Zan.Ai` 一直用 `Zan.Net` 的 `System.Net.Http.Client`，从没声明

@@ -1,0 +1,58 @@
+using System;
+using System.Collections.Generic;
+
+namespace System.Ai;
+
+// 对话后端的**统一契约**——让工具调用循环不绑定具体协议。
+//
+// ## 为什么需要这层
+//
+// 工具调用循环（`ToolAgent`）要的是"发消息 + 声明工具 → 拿回这一轮"。
+// 这件事有两种**线格式完全不同**的实现：
+//
+// - **OpenAI 兼容**（`/chat/completions`）：正文是字符串，工具调用在
+//   `tool_calls[]` 独立字段，工具结果是 `role:tool` 的独立消息。
+// - **Anthropic**（`/v1/messages`）：正文是**内容块数组**，工具调用是
+//   `content` 里的 `tool_use` **块**，工具结果是 **user 消息**里的
+//   `tool_result` **块**。
+//
+// 上层循环不该知道这些差别——所以抽一层契约。
+//
+// ## 契约里为什么是**实体**而不是线格式字符串
+//
+// 工具声明的实体是 `AiTool`（名字 + 描述 + 参数 schema），它**与协议无关**。
+// 各协议客户端自己把它渲染成自己的线格式（OpenAI 兼容的
+// `{"type":"function","function":{...}}`、Anthropic 的
+// `{"name":...,"input_schema":{...}}`）。传字符串就等于把"某协议的线格式"
+// 写进公共契约——换个协议就得改契约。
+//
+// 消息同理：内部模型是 `AiMessage`（角色 + 内容 + 工具调用列表），各家
+// 怎么落到线上由各自的客户端负责。
+//
+// ## 失败语义
+//
+// 与本包一致：**失败用返回值不用异常**。返回 null，原因在 `LastError()`。
+public interface IChat {
+    // 多轮补全（不带工具）。
+    //
+    // messages 是**初始消息**（会被复制，不改调用方的）。返回模型的正文。
+    //
+    // 失败返回 null（原因在 `LastError()`）。
+    async string CompleteMessages(List<AiMessage> messages, double temperature,
+    string stop);
+
+    // 带工具的补全：模型可能给答案，也可能请求调工具。
+    //
+    // tools 是工具声明（实体，协议无关）。返回这一轮的结果
+    // （`AiToolTurn`：正文 + 工具调用列表）。
+    //
+    // 失败返回 null（原因在 `LastError()`）。
+    async AiToolTurn CompleteWithTools(List<AiMessage> messages, List<AiTool> tools,
+    double temperature);
+
+    // 上一次失败的原因（成功时为空串）。
+    string LastError();
+
+    // 关掉出网连接（进程退出前或长寿命客户端空闲时调用）。
+    void Close();
+}

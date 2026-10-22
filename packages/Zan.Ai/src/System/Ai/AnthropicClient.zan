@@ -1,0 +1,513 @@
+using System;
+using System.Collections.Generic;
+using System.Json;
+using System.Net.External;
+using System.Net.Http;
+using System.Net.Http.Client;
+
+namespace System.Ai;
+
+// Anthropic Messages API 的客户端。
+//
+// ## 和 OpenAI 兼容协议差在哪（这些就是要翻译的全部）
+//
+// | | OpenAI 兼容 | Anthropic |
+// |---|---|---|
+// | 路径 | `/chat/completions` | `/v1/messages` |
+// | 鉴权 | `Authorization: Bearer` | `x-api-key` |
+// | 系统提示 | `messages` 里的一条 `role:system` | **顶层 `system` 字段** |
+// | 正文 | `content` 是**字符串** | `content` 是**内容块数组** |
+// | 工具声明 | `{"type":"function","function":{...}}` | `{"name":...,"input_schema":{...}}` |
+// | 工具调用 | `tool_calls[]`（独立字段） | `content` 里的 `tool_use` **块** |
+// | 工具结果 | `role:tool` 的独立消息 | **user 消息**里的 `tool_result` **块** |
+// | 停止原因 | `finish_reason` | `stop_reason`（值是 `tool_use`） |
+// | 用量 | `prompt_tokens`/`completion_tokens` | `input_tokens`/`output_tokens` |
+//
+// 内部模型（`AiMessage` / `AiTool`）**与协议无关**——翻译只发生在这一层。
+//
+// ## 一个必须做对的细节：**连续的工具结果要合并**
+//
+// Anthropic 要求 user 与 assistant 交替，而 OpenAI 的工具结果是一条独立
+// 消息（`role:tool`）。一轮里调了三个工具就有三条连续的工具结果消息——
+// 照搬会变成三条连续的 user 消息，而 Anthropic 的 `tool_result` **必须**
+// 出现在"紧跟着带 `tool_use` 的那条 assistant 消息"之后的 user 消息里，
+// 且必须是该消息的第一个块。分成三条，第二条的 `tool_result` 就找不到
+// 对应的 `tool_use`（400）。
+//
+// 所以本客户端把**连续的工具结果消息合并成一条 user 消息**（多个
+// `tool_result` 块）。
+//
+// ## 失败用返回值不用异常
+//
+// 与 `AiClient` 一致：网络失败 / 服务端报错 / 响应坏了，一律返回 null，
+// 原因在 `lastError`。
+public class AnthropicClient : IChat {
+    // 配置（baseUrl / apiKey / model / 超时预算 / maxTokens）。
+    public AiConfig config;
+
+    // 端点 → HttpClient（**按端点复用**，与 `AiClient` 同一纪律：每次
+    // 请求新建 HttpClient 等于每次丢掉连接池里的 keep-alive 连接）。
+    private Dictionary<string, HttpClient> clients;
+
+    // Anthropic API 版本头（`anthropic-version`）。
+    private string apiVersion;
+
+    // 上一次失败的原因。
+    public string lastError;
+
+    // 上一次调用的用量。
+    public AiUsage lastUsage;
+
+    public AnthropicClient(AiConfig config) {
+        this.config = config == null ? new AiConfig("", "", "") : config;
+        this.clients = new Dictionary<string, HttpClient>();
+        this.apiVersion = AnthropicClient.DefaultApiVersion();
+        this.lastError = "";
+        this.lastUsage = new AiUsage();
+    }
+
+    public AnthropicClient(string baseUrl, string apiKey, string model) {
+        this.config = new AiConfig(baseUrl, apiKey, model);
+        this.clients = new Dictionary<string, HttpClient>();
+        this.apiVersion = AnthropicClient.DefaultApiVersion();
+        this.lastError = "";
+        this.lastUsage = new AiUsage();
+    }
+
+    // 默认的 API 版本（Anthropic 用版本头挑行为，不是路径版本）。
+    public static string DefaultApiVersion() { return "2023-06-01"; }
+
+    // 改 API 版本头。
+    public void SetApiVersion(string version) {
+        this.apiVersion = version == null ? "" : version;
+    }
+
+    // 关掉出网连接（进程退出前或长寿命客户端空闲时调用）。
+    public void Close() {
+        List<string> keys = this.clients.Keys;
+        for (int i = 0; i < keys.Count; i = i + 1) {
+            this.clients[keys[i]].Close();
+        }
+        this.clients.Clear();
+    }
+
+    public void Dispose() { this.Close(); }
+
+    // 上一次失败的原因（成功时为空串）。
+    public string LastError() { return this.lastError; }
+
+    // ------------------------------------------------------------------
+    // 公开 API
+    // ------------------------------------------------------------------
+
+    // 补全（单条消息）。systemPrompt 可为空串。
+    //
+    // 失败返回 null（原因在 `lastError`）——与 `AiClient` 同一约定。
+    public async string Complete(string systemPrompt, string userPrompt) {
+        List<AiMessage> msgs = new List<AiMessage>();
+        if (systemPrompt != null && systemPrompt.Length > 0) {
+            msgs.Add(AiMessage.System(systemPrompt));
+        }
+        msgs.Add(AiMessage.User(userPrompt));
+        return await this.CompleteMessages(msgs, 0.0, "");
+    }
+
+    // 补全（多轮消息）。temperature < 0 表示用服务端的默认值。
+    // stop 非空时作为停止序列。
+    public async string CompleteMessages(List<AiMessage> messages, double temperature,
+    string stop) {
+        AiToolTurn turn = await this.Send(messages, null, temperature, stop);
+        if (turn == null) { return null; }
+        return turn.content;
+    }
+
+    // 带工具的补全。
+    //
+    // tools 是工具声明（实体）——本客户端渲染成 Anthropic 的
+    // `{"name":...,"input_schema":{...}}` 形状。
+    //
+    // 返回这一轮的结果：模型可能给了答案，也可能请求调工具。失败返回
+    // null（原因在 `lastError`）。
+    public async AiToolTurn CompleteWithTools(List<AiMessage> messages,
+    List<AiTool> tools, double temperature) {
+        return await this.Send(messages, tools, temperature, "");
+    }
+
+    // ------------------------------------------------------------------
+    // 内部：一次请求
+    // ------------------------------------------------------------------
+
+    async AiToolTurn Send(List<AiMessage> messages, List<AiTool> tools,
+    double temperature, string stop) {
+        this.lastError = "";
+        AiEndpoint ep = AiEndpoint.Parse(this.config.baseUrl);
+        if (ep == null) {
+            this.lastError = "服务地址不合法: " + this.config.baseUrl;
+            return null;
+        }
+        if (this.config.model.Length == 0) {
+            this.lastError = "没有指定模型";
+            return null;
+        }
+        if (messages == null) {
+            this.lastError = "没有消息";
+            return null;
+        }
+        JsonValue body = JsonValue.NewObject();
+        body.PutStr("model", this.config.model);
+        // `max_tokens` 在 Anthropic 是**必填**（OpenAI 兼容那边是可选的
+        // `max_completion_tokens`）。不给就直接 400。
+        body.PutInt("max_tokens", this.config.maxTokens);
+        if (temperature >= 0.0) {
+            body.PutDouble("temperature", temperature);
+        }
+        body.PutBool("stream", false);
+        // 系统提示：Anthropic 是**顶层字段**，不是 messages 里的一条。
+        string system = AnthropicClient.SystemText(messages);
+        if (system.Length > 0) {
+            body.PutStr("system", system);
+        }
+        if (stop != null && stop.Length > 0) {
+            JsonValue seqs = JsonValue.NewArray();
+            seqs.AppendStr(stop);
+            body.Put("stop_sequences", seqs);
+        }
+        body.Put("messages", AnthropicClient.MessagesJson(messages));
+        if (tools != null && tools.Count > 0) {
+            body.Put("tools", AnthropicClient.ToolsJson(tools));
+            JsonValue choice = JsonValue.NewObject();
+            choice.PutStr("type", "auto");
+            body.Put("tool_choice", choice);
+        }
+
+        string raw = await this.PostJson(ep, body);
+        if (raw == null) { return null; }
+        JsonValue root = null;
+        try {
+            root = JsonValue.Parse(raw);
+        } catch (Exception e) {
+            root = null;
+        }
+        if (root == null) {
+            this.lastError = "Anthropic 服务返回的内容无法解析";
+            return null;
+        }
+        // 错误体形状与 OpenAI 兼容一样（{"error":{"message":...}}）。
+        string errMsg = AiClient.ErrorMessage(root);
+        if (errMsg.Length > 0) {
+            this.lastError = errMsg;
+            return null;
+        }
+        AiToolTurn turn = AnthropicClient.ParseTurn(root);
+        if (turn == null) {
+            this.lastError = "Anthropic 服务返回的内容无法解析";
+            return null;
+        }
+        this.CaptureUsage(root);
+        return turn;
+    }
+
+    // 发起一次 POST（带重试）。失败返回 null，原因在 lastError。
+    //
+    // 4xx 不重试（请求本身有问题：key 错、参数错、额度不足）。5xx 与网络
+    // 错误才重试（指数退避，上限 2 秒）。默认不重试（补全没有幂等键，
+    // 重试可能重复计费）。
+    public async string PostJson(AiEndpoint ep, JsonValue body) {
+        string payload = body.ToJson();
+        if (payload.Length > this.config.requestLimitBytes) {
+            this.lastError = "请求体超过上限（"
+            + Convert.ToString(this.config.requestLimitBytes) + " 字节）";
+            return null;
+        }
+        int attempts = this.config.maxAttempts;
+        if (attempts < 1) { attempts = 1; }
+        string lastReason = "";
+        for (int attempt = 0; attempt < attempts; attempt = attempt + 1) {
+            if (attempt > 0) {
+                int wait = 100 * (1 << (attempt - 1));
+                if (wait > 2000) { wait = 2000; }
+                await Task.Delay(wait);
+            }
+            HttpClient http = null;
+            try {
+                http = this.Client(ep);
+                HttpResponse resp = await http.SendAsync("POST",
+                    AnthropicClient.MessagesPath(ep), payload);
+                int status = resp.statusCode;
+                string bodyText = resp.body;
+                if (status >= 200 && status < 300) {
+                    return bodyText;
+                }
+                if (status < 500) {
+                    this.lastError = AnthropicClient.HttpErrorMessage(status, bodyText);
+                    return null;
+                }
+                lastReason = "Anthropic 服务返回 " + Convert.ToString(status);
+            } catch (Exception e) {
+                lastReason = "请求 Anthropic 服务失败：" + e.Message;
+            }
+        }
+        this.lastError = lastReason;
+        return null;
+    }
+
+    // 请求路径。
+    //
+    // baseUrl 是**根地址**（"https://api.anthropic.com"）→ 拼
+    // "/v1/messages"。用户如果写了 ".../v1"（有些 SDK 那样写），就只拼
+    // "/messages"——否则会变成 "/v1/v1/messages"。
+    public static string MessagesPath(AiEndpoint ep) {
+        string p = ep.Path();
+        if (p.EndsWith("/v1")) { return p + "/messages"; }
+        return p + "/v1/messages";
+    }
+
+    // 取（或建）该端点的 `HttpClient`。同一端点复用同一个客户端，连接池
+    // 才能生效；换端点就换客户端（池是按 host/port 建的）。
+    private HttpClient Client(AiEndpoint ep) {
+        string key = ep.Canonical();
+        if (this.clients.ContainsKey(key)) { return this.clients[key]; }
+        HttpClient http = null;
+        if (ep.Tls()) {
+            http = HttpClient.CreateHttps(ep.Host(), ep.Port());
+        } else {
+            http = new HttpClient(ep.Host(), ep.Port());
+        }
+        http.SetCallPolicy(this.Policy(ep));
+        http.SetHeader("Content-Type", "application/json");
+        http.SetHeader("Accept", "application/json");
+        if (this.apiVersion.Length > 0) {
+            http.SetHeader("anthropic-version", this.apiVersion);
+        }
+        if (this.config.apiKey.Length > 0) {
+            http.SetHeader("x-api-key", this.config.apiKey);
+        }
+        this.clients[key] = http;
+        return http;
+    }
+
+    // 出网预算。响应与请求体都有上限，超限的响应不会进内存。
+    private ExternalCallPolicy Policy(AiEndpoint ep) {
+        ExternalCallPolicy p = ExternalCallPolicy.Default()
+            .ConnectTimeout(this.config.connectTimeoutMs)
+            .ReadTimeout(this.config.readTimeoutMs)
+            .TotalTimeout(this.config.totalTimeoutMs)
+            .RequestLimit(this.config.requestLimitBytes)
+            .ResponseLimit(this.config.responseLimitBytes)
+            .ErrorLimit(128 * 1024)
+            .Redirects(0)
+            .RetryNetwork(false)
+            .RetryAttempts(0);
+        if (ep.Local()) { p.AllowLocalHttp(); }
+        return p;
+    }
+
+    // ------------------------------------------------------------------
+    // 静态：协议翻译（公开是为了能单独测）
+    // ------------------------------------------------------------------
+
+    // 系统提示（所有 system 消息拼起来）。
+    //
+    // Anthropic 的 `system` 是**一个字符串**，不是消息数组。内部模型允许
+    // 多条 system 消息，所以这里按顺序用空行拼成一段——**顺序不变**，
+    // 规则不丢。
+    public static string SystemText(List<AiMessage> messages) {
+        if (messages == null) { return ""; }
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < messages.Count; i = i + 1) {
+            AiMessage m = messages[i];
+            if (m == null) { continue; }
+            if (m.role != "system") { continue; }
+            if (sb.Length > 0) { sb.Append("\n\n"); }
+            sb.Append(m.content == null ? "" : m.content);
+        }
+        return sb.ToString();
+    }
+
+    // 消息列表 → Anthropic 的 `messages` 数组。
+    //
+    // 三处翻译：
+    // 1. **system 消息被摘走**（去顶层 `system` 字段），不进 messages。
+    // 2. **连续的工具结果消息合并成一条 user 消息**（多个 `tool_result`
+    //    块）——见类注释里那段"必须做对的细节"。
+    // 3. 正文从字符串变成**内容块数组**；assistant 的工具调用变成
+    //    `tool_use` 块。
+    public static JsonValue MessagesJson(List<AiMessage> messages) {
+        JsonValue arr = JsonValue.NewArray();
+        if (messages == null) { return arr; }
+        // 待合并的 tool_result 块（连续的工具结果共用一条 user 消息）。
+        JsonValue pending = null;
+        for (int i = 0; i < messages.Count; i = i + 1) {
+            AiMessage m = messages[i];
+            if (m == null) { continue; }
+            if (m.role == "system") { continue; }
+            if (m.role == "tool") {
+                JsonValue block = JsonValue.NewObject();
+                block.PutStr("type", "tool_result");
+                block.PutStr("tool_use_id", m.toolCallId);
+                block.PutStr("content", m.content == null ? "" : m.content);
+                if (pending == null) {
+                    pending = JsonValue.NewArray();
+                    JsonValue um = JsonValue.NewObject();
+                    um.PutStr("role", "user");
+                    um.Put("content", pending);
+                    arr.Append(um);
+                }
+                pending.Append(block);
+                continue;
+            }
+            // 别的角色打断了工具结果的连续性。
+            pending = null;
+            JsonValue msg = JsonValue.NewObject();
+            msg.PutStr("role", m.role);
+            JsonValue blocks = JsonValue.NewArray();
+            if (m.role == "assistant") {
+                if (m.content != null && m.content.Length > 0) {
+                    JsonValue t = JsonValue.NewObject();
+                    t.PutStr("type", "text");
+                    t.PutStr("text", m.content);
+                    blocks.Append(t);
+                }
+                for (int j = 0; j < m.toolCalls.Count; j = j + 1) {
+                    AiToolCall c = m.toolCalls[j];
+                    JsonValue use = JsonValue.NewObject();
+                    use.PutStr("type", "tool_use");
+                    use.PutStr("id", c.id);
+                    use.PutStr("name", c.name);
+                    use.Put("input", AnthropicClient.InputOf(c.arguments));
+                    blocks.Append(use);
+                }
+            } else {
+                JsonValue t = JsonValue.NewObject();
+                t.PutStr("type", "text");
+                t.PutStr("text", m.content == null ? "" : m.content);
+                blocks.Append(t);
+            }
+            msg.Put("content", blocks);
+            arr.Append(msg);
+        }
+        return arr;
+    }
+
+    // 工具声明（实体）→ Anthropic 的 `tools` 数组。
+    //
+    // 形状差异只在壳上：OpenAI 兼容是
+    // `{"type":"function","function":{name,description,parameters}}`，
+    // Anthropic 是 `{"name":...,"description":...,"input_schema":{...}}`。
+    // 参数 schema 本身**原样搬**——两边都是 JSON Schema。
+    public static JsonValue ToolsJson(List<AiTool> tools) {
+        JsonValue arr = JsonValue.NewArray();
+        if (tools == null) { return arr; }
+        for (int i = 0; i < tools.Count; i = i + 1) {
+            AiTool t = tools[i];
+            if (t == null) { continue; }
+            JsonValue one = JsonValue.NewObject();
+            one.PutStr("name", t.name);
+            one.PutStr("description", t.description);
+            if (t.parameters != null) {
+                one.Put("input_schema", t.parameters);
+            } else {
+                JsonValue p = JsonValue.NewObject();
+                p.PutStr("type", "object");
+                one.Put("input_schema", p);
+            }
+            arr.Append(one);
+        }
+        return arr;
+    }
+
+    // 工具参数（JSON 串）→ Anthropic 的 `input` 对象。
+    //
+    // 解析不了就用空对象——参数坏掉时这次调用本来也执行不了，**不能因为
+    // 解析失败把整个请求打回去**（那会让对话直接断掉）。
+    public static JsonValue InputOf(string arguments) {
+        if (arguments == null || arguments.Length == 0) {
+            return JsonValue.NewObject();
+        }
+        JsonValue v = null;
+        try {
+            v = JsonValue.Parse(arguments);
+        } catch (Exception e) {
+            v = null;
+        }
+        if (v == null || !v.IsObject()) { return JsonValue.NewObject(); }
+        return v;
+    }
+
+    // 解析 Anthropic 的响应（公开是为了能单独测）。
+    //
+    // 坏 JSON → 返回 null。**错误响应也返回 null**（错误文案由调用方从
+    // 响应里取——静态方法碰不到实例的 lastError）。
+    public static AiToolTurn ParseTurn(string raw) {
+        JsonValue root = null;
+        try {
+            root = JsonValue.Parse(raw);
+        } catch (Exception e) {
+            root = null;
+        }
+        if (root == null) { return null; }
+        return AnthropicClient.ParseTurn(root);
+    }
+
+    // 解析 Anthropic 的响应体。
+    //
+    // `content` 是内容块数组：文本块拼成正文，`tool_use` 块变成工具调用
+    // （`input` 对象转回 JSON 串——`AiToolCall.arguments` 的约定是
+    // "JSON 串"）。
+    public static AiToolTurn ParseTurn(JsonValue root) {
+        if (root == null || !root.IsObject()) { return null; }
+        JsonValue content = root.Get("content");
+        if (content == null || !content.IsArray()) { return null; }
+        AiToolTurn turn = new AiToolTurn();
+        turn.finishReason = root.Str("stop_reason", "");
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < content.Count(); i = i + 1) {
+            JsonValue block = content.At(i);
+            if (block == null || !block.IsObject()) { continue; }
+            string type = block.Str("type", "");
+            if (type == "text") {
+                string t = block.Str("text", "");
+                if (sb.Length > 0) { sb.Append("\n"); }
+                sb.Append(t);
+            } else if (type == "tool_use") {
+                JsonValue input = block.Get("input");
+                string args = input == null ? "{}" : input.ToJson();
+                turn.toolCalls.Add(new AiToolCall(block.Str("id", ""),
+                    block.Str("name", ""), args));
+            }
+        }
+        turn.content = sb.ToString();
+        return turn;
+    }
+
+    // 从 HTTP 响应里提错误文案（4xx 时的解释）。
+    private static string HttpErrorMessage(int status, string body) {
+        string detail = "";
+        if (body != null && body.Length > 0) {
+            JsonValue root = null;
+            try {
+                root = JsonValue.Parse(body);
+            } catch (Exception e) {
+                root = null;
+            }
+            if (root != null) {
+                detail = AiClient.ErrorMessage(root);
+            }
+        }
+        if (detail.Length == 0) {
+            detail = "Anthropic 服务返回 " + Convert.ToString(status);
+        }
+        return detail;
+    }
+
+    // 记录用量（Anthropic 的字段名是 input_tokens / output_tokens）。
+    private void CaptureUsage(JsonValue root) {
+        if (root == null) { return; }
+        JsonValue usage = root.Get("usage");
+        if (usage == null || !usage.IsObject()) { return; }
+        int p = usage.Int("input_tokens", 0);
+        int c = usage.Int("output_tokens", 0);
+        if (p <= 0 && c <= 0) { return; }
+        this.lastUsage = new AiUsage(p, c, false);
+    }
+}

@@ -14,6 +14,10 @@ HNSW 向量索引、`Zan.Net` 的 `HttpClient`），但没有把它们串成"文
 
 - `System.Ai` — `AiClient`（统一 LLM 客户端：多厂商端点、流式/非流式、
   重试、超时预算、Token 计数与成本核算）
+- `System.Ai` — `IChat`（对话后端的**统一契约**：工具声明是实体、消息是
+  实体，线格式由各协议客户端自己渲染）+ `AnthropicClient`（Anthropic
+  Messages API：`/v1/messages`、`x-api-key`、内容块数组、`tool_use`/
+  `tool_result` 块）
 - `System.Ai` — `Embeddings`（OpenAI 兼容 `/v1/embeddings`：批量、
   按 index 归位、向量归一化、维度校验）
 - `System.Ai` — `Chunking`（文档分块：递归字符分割 / token 窗口 /
@@ -271,7 +275,6 @@ for (int i = 0; i < hits.Count; i = i + 1) {
   写重。所以 `NextRequestId` 要在重试循环**外面**取一次。
 
 ## 工具调用：让模型调外部函数
-
 检索是"模型想查数据库"的特例。工具调用把它**泛化**成任意工具：查订单、
 查天气、算账、翻数据库——都由模型自己决定要不要调、调什么、参数是什么。
 
@@ -390,6 +393,55 @@ await McpTools.RegisterAll(clientB, reg, "b_");
 变成一条**错误结果**——`isError` 为 true，内容是**远端给的具体原因**，
 不是泛化文案。模型看到原因能自己纠正。
 
+## Anthropic 协议：同一套工具循环，换个线格式
+
+OpenAI 兼容只是**一种**线格式。Anthropic 的 Messages API 差得不少——正文
+是内容块数组而不是字符串，工具调用是 `content` 里的 `tool_use` **块**，
+工具结果是 **user 消息**里的 `tool_result` **块**，系统提示是**顶层字段**，
+鉴权走 `x-api-key` 头。
+
+上层循环不该知道这些差别，所以抽了一层契约 `IChat`：
+
+```zan
+using System.Ai;
+
+AnthropicClient client = new AnthropicClient(
+    "https://api.anthropic.com", "sk-ant-...", "claude-sonnet-4-5");
+client.config.maxTokens = 4096;      // Anthropic 的 max_tokens 是必填
+
+ToolRegistry reg = new ToolRegistry();
+reg.RegisterSync(orderTool, QueryOrder);
+
+ToolAgent agent = new ToolAgent(client, reg);   // ← 同一个循环
+List<AiMessage> history = await agent.Run(questions);
+```
+
+`AiClient` 与 `AnthropicClient` 都实现 `IChat`，所以 `ToolAgent` 一行不用
+改就能换协议。契约里传的是**实体**（`AiMessage` / `AiTool`）——**线格式由
+各自的客户端渲染**：
+
+| | OpenAI 兼容 | Anthropic |
+|---|---|---|
+| 路径 | `/chat/completions` | `/v1/messages` |
+| 鉴权 | `Authorization: Bearer` | `x-api-key` |
+| 系统提示 | `messages` 里一条 `role:system` | **顶层 `system` 字段** |
+| 正文 | `content` 是字符串 | `content` 是**内容块数组** |
+| 工具声明 | `{"type":"function","function":{...}}` | `{"name":...,"input_schema":{...}}` |
+| 工具调用 | `tool_calls[]` | `content` 里的 `tool_use` 块 |
+| 工具结果 | `role:tool` 消息 | **user 消息**里的 `tool_result` 块 |
+| 停止原因 | `finish_reason` | `stop_reason`（值是 `tool_use`） |
+| 用量 | `prompt_tokens`/`completion_tokens` | `input_tokens`/`output_tokens` |
+
+**一个必须做对的细节：连续的工具结果要合并成一条 user 消息。**
+Anthropic 要求 user 与 assistant 交替，而 OpenAI 的工具结果是一条独立
+消息（`role:tool`）。一轮里调了三个工具就有三条连续的工具结果——照搬会
+变成三条连续的 user 消息，第二条的 `tool_result` 就找不到对应的
+`tool_use`（400）。所以 `AnthropicClient.MessagesJson` 把**连续的工具
+结果消息合并成一条 user 消息**（多个 `tool_result` 块）。
+
+**API 变动**：`AiClient.CompleteWithTools` 现在收 `List<AiTool>`（实体），
+原来收线格式 JSON 串的那一版改名叫 `CompleteWithToolsJson`（行为不变）。
+
 ## 设计要点
 
 - **实体化，不用平行数组**：向量、分块、请求/响应、检索命中都是具名
@@ -474,9 +526,14 @@ await McpTools.RegisterAll(clientB, reg, "b_");
   内置落盘/多端同步——`ToJson`/`FromJson` 给了钩子，存哪儿调用方自己
   定（那会绑死部署形态）。
 - 工具调用只接 **OpenAI 兼容的 tool-calling 协议**（`tools` 声明 +
-  `tool_calls` 响应）；不做各厂商的私有函数调用协议（Anthropic 的
-  `tool_use`、Gemini 的 `functionDeclarations` 等）。远端 MCP 工具可以
-  接进来（`McpTools.RegisterAll`），但 MCP 自己的协议在 `Zan.Mcp` 包里。
+  `tool_calls` 响应）与 **Anthropic Messages API**（`tool_use`/`tool_result`
+  块）；不做各厂商的私有函数调用协议（Gemini 的 `functionDeclarations` 等）。
+  远端 MCP 工具可以接进来（`McpTools.RegisterAll`），但 MCP 自己的协议
+  在 `Zan.Mcp` 包里。
+- **Anthropic 侧只做非流式**。Anthropic 的 SSE 事件（`content_block_start`
+  / `content_block_delta` / `message_delta`）与 OpenAI 兼容那套帧格式不同，
+  流式与流式工具调用是另一件事（`AiClient.Stream` 走的是 OpenAI 兼容的
+  帧）。
 - 工具返回值是**纯文本**（不传结构化 JSON 给模型）——省一次解析，但
   模型要用结构化结果时得自己从文本里读。
 - 工具是**同步或异步的单个委托**——不支持"需要确认才执行"这类多步

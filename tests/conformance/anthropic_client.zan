@@ -1,0 +1,423 @@
+// Anthropic Messages API 客户端——协议翻译与工具循环。
+//
+// 覆盖：
+// - **请求形状**：路径 /v1/messages、`x-api-key` 与 `anthropic-version`
+//   头、`max_tokens` 必填、**顶层 `system` 字段**、正文是**内容块数组**、
+//   工具声明是 Anthropic 形状（`input_schema`）、`tool_choice`。
+// - **响应解析**：文本块 → 正文，`tool_use` 块 → 工具调用（`input` 对象
+//   转回 JSON 串），`stop_reason` → finishReason，用量字段是
+//   `input_tokens`/`output_tokens`。
+// - **连续的工具结果合并成一条 user 消息**（Anthropic 的硬要求：连续的
+//   user 消息会让第二个 `tool_result` 找不到对应的 `tool_use`）。
+// - **工具循环**：Anthropic 客户端驱动 `ToolAgent` 跑完一轮"调工具 →
+//   回传结果 → 再问"的往返。
+// - **错误**：Anthropic 的错误体（`{"type":"error","error":{"message":...}}`）
+//   → lastError。
+//
+// 用例**在本进程内起一个真的 HTTP 服务**当假 Anthropic 端点。
+using System;
+using System.Collections.Generic;
+using System.Ai;
+using System.IO;
+using System.Json;
+using System.Net.Http;
+
+namespace Conf;
+
+class Prog {
+    // 假端点的端口。
+    static int PORT = 19897;
+
+    // 第几次请求（用来脚本化模型的反应）。
+    static int callIndex;
+
+    // 收到的请求（路径 / 头 / 正文）。
+    static List<string> paths;
+    static List<string> keys;
+    static List<string> versions;
+    static List<string> bodies;
+
+    // 模型这一轮直接说的话。
+    static string scriptText;
+
+    // 模型这一轮要调的工具。
+    static List<List<AiToolCall>> script;
+
+    // 假端点要回的状态码（0 = 200）。
+    static int failStatus;
+
+    static int Main() {
+        try {
+            return Prog.Run();
+        } catch (Exception e) {
+            Console.WriteLine("threw: " + e.ToString());
+            return 1;
+        }
+    }
+
+    // 假端点。
+    static async HttpResponse Handle(HttpRequest req) {
+        HttpResponse res = new HttpResponse();
+        res.statusCode = 200;
+        res.statusText = "OK";
+        res.contentType = "application/json";
+        res.keepAlive = true;
+        Prog.paths.Add(req.path);
+        Prog.keys.Add(req.GetHeader("x-api-key"));
+        Prog.versions.Add(req.GetHeader("anthropic-version"));
+        Prog.bodies.Add(req.body);
+        if (Prog.failStatus != 0) {
+            res.statusCode = Prog.failStatus;
+            res.body = "{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\","
+                + "\"message\":\"max_tokens: required\"}}";
+            return res;
+        }
+        res.body = Prog.Reply();
+        return res;
+    }
+
+    // 脚本化的补全响应。
+    static string Reply() {
+        int idx = Prog.callIndex;
+        Prog.callIndex = Prog.callIndex + 1;
+        if (idx < Prog.script.Count) {
+            // 这一轮要调工具。
+            StringBuilder sb = new StringBuilder();
+            sb.Append("{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",");
+            sb.Append("\"content\":[");
+            List<AiToolCall> calls = Prog.script[idx];
+            for (int i = 0; i < calls.Count; i = i + 1) {
+                if (i > 0) { sb.Append(","); }
+                sb.Append("{\"type\":\"tool_use\",\"id\":\"");
+                sb.Append(calls[i].id);
+                sb.Append("\",\"name\":\"");
+                sb.Append(calls[i].name);
+                sb.Append("\",\"input\":");
+                sb.Append(calls[i].arguments);
+                sb.Append("}");
+            }
+            sb.Append("],\"model\":\"claude-x\",\"stop_reason\":\"tool_use\",");
+            sb.Append("\"usage\":{\"input_tokens\":11,\"output_tokens\":7}}");
+            return sb.ToString();
+        }
+        // 最后一轮：直接给答案。
+        StringBuilder sb2 = new StringBuilder();
+        sb2.Append("{\"id\":\"msg_2\",\"type\":\"message\",\"role\":\"assistant\",");
+        sb2.Append("\"content\":[{\"type\":\"text\",\"text\":\"");
+        sb2.Append(Prog.scriptText);
+        sb2.Append("\"}],\"model\":\"claude-x\",\"stop_reason\":\"end_turn\",");
+        sb2.Append("\"usage\":{\"input_tokens\":20,\"output_tokens\":5}}");
+        return sb2.ToString();
+    }
+
+    // 造一条"模型要调的工具"脚本。
+    static AiToolCall Call(string id, string name, string args) {
+        return new AiToolCall(id, name, args);
+    }
+
+    static List<AiToolCall> One(AiToolCall call) {
+        List<AiToolCall> one = new List<AiToolCall>();
+        one.Add(call);
+        return one;
+    }
+
+    static AnthropicClient MakeClient() {
+        AiConfig cfg = new AiConfig("http://127.0.0.1:" + Convert.ToString(Prog.PORT),
+            "sk-ant-test", "claude-x");
+        cfg.connectTimeoutMs = 3000;
+        cfg.readTimeoutMs = 5000;
+        cfg.totalTimeoutMs = 8000;
+        cfg.maxAttempts = 1;
+        cfg.maxTokens = 1024;
+        return new AnthropicClient(cfg);
+    }
+
+    // 一个查订单的工具（实现是具名静态方法——Zan 没有 lambda）。
+    static string LookupOrder(JsonValue args) {
+        JsonValue id = args.Get("order_id");
+        return "订单 " + (id == null ? "" : id.AsString("")) + " 在派送中";
+    }
+
+    static ToolRegistry MakeRegistry() {
+        ToolRegistry reg = new ToolRegistry();
+        JsonValue props = JsonValue.NewObject();
+        JsonValue orderId = JsonValue.NewObject();
+        orderId.PutStr("type", "string");
+        orderId.PutStr("description", "订单号");
+        props.Put("order_id", orderId);
+        JsonValue params = JsonValue.NewObject();
+        params.PutStr("type", "object");
+        params.Put("properties", props);
+        JsonValue required = JsonValue.NewArray();
+        required.AppendStr("order_id");
+        params.Put("required", required);
+        reg.RegisterSync(new AiTool("查订单", "按订单号查订单状态与物流进度", params),
+            Prog.LookupOrder);
+        return reg;
+    }
+
+    static int Run() {
+        int bad = 0;
+        Directory.CreateDirectory("_scratch");
+        Prog.paths = new List<string>();
+        Prog.keys = new List<string>();
+        Prog.versions = new List<string>();
+        Prog.bodies = new List<string>();
+        Prog.script = new List<List<AiToolCall>>();
+        Prog.scriptText = "";
+        Prog.callIndex = 0;
+        Prog.failStatus = 0;
+
+        HttpServer api = new HttpServer("127.0.0.1", PORT);
+        api.OnRequest(Prog.Handle);
+        Task.Spawn(api.Start());
+        await Task.Delay(100);
+
+        // ---- 1. 请求形状 ----
+        {
+            AnthropicClient client = Prog.MakeClient();
+            List<AiMessage> msgs = new List<AiMessage>();
+            msgs.Add(AiMessage.System("你是助手"));
+            msgs.Add(AiMessage.User("查一下订单 A100"));
+            Prog.scriptText = "这是答案";
+            string reply = await client.CompleteMessages(msgs, 0.5, "停");
+            if (reply == null) {
+                Console.WriteLine("shape.reply=null err=" + client.lastError);
+                bad = bad + 1;
+            } else {
+                if (reply != "这是答案") {
+                    Console.WriteLine("shape.reply=" + reply);
+                    bad = bad + 1;
+                }
+            }
+            if (Prog.paths.Count != 1) {
+                Console.WriteLine("shape.reqs=" + Convert.ToString(Prog.paths.Count));
+                bad = bad + 1;
+            } else {
+                if (Prog.paths[0] != "/v1/messages") {
+                    Console.WriteLine("path=" + Prog.paths[0]);
+                    bad = bad + 1;
+                }
+                if (Prog.keys[0] != "sk-ant-test") { bad = bad + 1; }
+                if (Prog.versions[0] != "2023-06-01") { bad = bad + 1; }
+            }
+            JsonValue body = JsonValue.Parse(Prog.bodies[0]);
+            JsonValue reqMsgs = body.Get("messages");
+            if (body.Str("model", "") != "claude-x") { bad = bad + 1; }
+            if (body.Int("max_tokens", 0) != 1024) { bad = bad + 1; }
+            if (body.Has("stream") == false) { bad = bad + 1; }
+            if (body.Has("system") == false) { bad = bad + 1; }
+            if (body.Str("system", "") != "你是助手") { bad = bad + 1; }
+            JsonValue seqs = body.Get("stop_sequences");
+            if (seqs == null || seqs.Count() != 1 || seqs.At(0).AsString("") != "停") {
+                bad = bad + 1;
+            }
+            // 正文是**内容块数组**，不是字符串。
+            JsonValue m0 = reqMsgs == null ? null : reqMsgs.At(0);
+            if (m0 == null || m0.Str("role", "") != "user") { bad = bad + 1; }
+            JsonValue blocks = m0 == null ? null : m0.Get("content");
+            if (blocks == null || !blocks.IsArray() || blocks.Count() != 1) {
+                bad = bad + 1;
+            } else {
+                if (blocks.At(0).Str("type", "") != "text") { bad = bad + 1; }
+                if (blocks.At(0).Str("text", "") != "查一下订单 A100") { bad = bad + 1; }
+            }
+            // system 不进 messages。
+            if (reqMsgs == null || reqMsgs.Count() != 1) { bad = bad + 1; }
+            // 用量字段是 Anthropic 那套。
+            if (client.lastUsage.promptTokens != 20) { bad = bad + 1; }
+            if (client.lastUsage.completionTokens != 5) { bad = bad + 1; }
+            Console.WriteLine("shape path=" + Prog.paths[0]
+                + " key=" + Prog.keys[0]
+                + " version=" + Prog.versions[0]
+                + " maxTokens=" + Convert.ToString(body.Int("max_tokens", 0))
+                + " sys=" + body.Str("system", "")
+                + " msgs=" + Convert.ToString(reqMsgs == null ? 0 : reqMsgs.Count())
+                + " blocks=" + Convert.ToString(blocks == null ? 0 : blocks.Count())
+                + " usage=" + Convert.ToString(client.lastUsage.promptTokens)
+                + "/" + Convert.ToString(client.lastUsage.completionTokens));
+            client.Close();
+        }
+
+        // ---- 2. 工具声明的线格式 + 工具循环 ----
+        {
+            AnthropicClient client = Prog.MakeClient();
+            ToolRegistry reg = Prog.MakeRegistry();
+            ToolAgent agent = new ToolAgent(client, reg);
+            List<AiMessage> msgs = new List<AiMessage>();
+            msgs.Add(AiMessage.User("查三个订单"));
+            Prog.callIndex = 0;
+            Prog.script = new List<List<AiToolCall>>();
+            List<AiToolCall> many = new List<AiToolCall>();
+            many.Add(Prog.Call("toolu_1", "查订单", "{\"order_id\":\"A1\"}"));
+            many.Add(Prog.Call("toolu_2", "查订单", "{\"order_id\":\"A2\"}"));
+            Prog.script.Add(many);
+            Prog.scriptText = "三个订单都查完了";
+
+            List<AiMessage> outp = await agent.Run(msgs);
+            if (outp == null) {
+                Console.WriteLine("loop.null=" + agent.lastError);
+                bad = bad + 1;
+            } else {
+                // user → assistant(tool_calls) → tool → tool → assistant = 5 条。
+                if (outp.Count != 5) {
+                    Console.WriteLine("loop.msgs=" + Convert.ToString(outp.Count));
+                    bad = bad + 1;
+                }
+                if (outp[outp.Count - 1].content != "三个订单都查完了") { bad = bad + 1; }
+                if (agent.Events().Count != 3) { bad = bad + 1; }
+                if (agent.Events()[0].name != "查订单") { bad = bad + 1; }
+            }
+
+            // 第二次请求（bodies[0] 是上面那轮，bodies[1] 是 agent 的第一轮，
+            // bodies[2] 才是带着工具结果回来的那一轮）：工具声明是 Anthropic 形状。
+            JsonValue body2 = JsonValue.Parse(Prog.bodies[2]);
+            JsonValue tools = body2.Get("tools");
+            if (tools == null || tools.Count() != 1) {
+                bad = bad + 1;
+            } else {
+                JsonValue t0 = tools.At(0);
+                if (t0.Str("name", "") != "查订单") { bad = bad + 1; }
+                if (t0.Has("type")) { bad = bad + 1; }
+                if (t0.Has("function")) { bad = bad + 1; }
+                JsonValue schema = t0.Get("input_schema");
+                if (schema == null || !schema.IsObject()) { bad = bad + 1; }
+                if (schema.Str("type", "") != "object") { bad = bad + 1; }
+            }
+            JsonValue choice = body2.Get("tool_choice");
+            if (choice == null || choice.Str("type", "") != "auto") { bad = bad + 1; }
+
+            // **连续的工具结果合并成一条 user 消息**（两个 tool_result 块）。
+            JsonValue msgs2 = body2.Get("messages");
+            int n = msgs2 == null ? 0 : msgs2.Count();
+            JsonValue blocks2 = null;
+            if (n != 3) {
+                Console.WriteLine("loop.reqMsgs=" + Convert.ToString(n));
+                bad = bad + 1;
+            } else {
+                // 消息序列：user（问题）→ assistant（tool_use 块）→
+                // user（**合并后**的 tool_result 块）。
+                if (msgs2.At(0).Str("role", "") != "user") { bad = bad + 1; }
+                // assistant 消息里的工具调用是 tool_use 块。
+                JsonValue am = msgs2.At(1);
+                if (am.Str("role", "") != "assistant") {
+                    Console.WriteLine("loop.role=" + am.Str("role", ""));
+                    bad = bad + 1;
+                }
+                JsonValue ablocks = am.Get("content");
+                if (ablocks == null || ablocks.Count() != 2) { bad = bad + 1; }
+                else {
+                    if (ablocks.At(0).Str("type", "") != "tool_use") { bad = bad + 1; }
+                    if (ablocks.At(0).Str("id", "") != "toolu_1") { bad = bad + 1; }
+                    JsonValue input = ablocks.At(0).Get("input");
+                    if (input == null || input.Str("order_id", "") != "A1") { bad = bad + 1; }
+                }
+                // **连续的工具结果合并成一条 user 消息**（两个 tool_result 块）。
+                JsonValue um = msgs2.At(2);
+                if (um.Str("role", "") != "user") {
+                    Console.WriteLine("loop.role2=" + um.Str("role", ""));
+                    bad = bad + 1;
+                }
+                blocks2 = um.Get("content");
+                if (blocks2 == null || !blocks2.IsArray() || blocks2.Count() != 2) {
+                    bad = bad + 1;
+                } else {
+                    if (blocks2.At(0).Str("type", "") != "tool_result") { bad = bad + 1; }
+                    if (blocks2.At(0).Str("tool_use_id", "") != "toolu_1") { bad = bad + 1; }
+                    if (blocks2.At(1).Str("tool_use_id", "") != "toolu_2") { bad = bad + 1; }
+                    if (blocks2.At(0).Str("content", "") != "订单 A1 在派送中") {
+                        bad = bad + 1;
+                    }
+                }
+            }
+            Console.WriteLine("loop reqMsgs=" + Convert.ToString(n)
+                + " toolBlocks=" + Convert.ToString(blocks2 == null ? 0 : blocks2.Count())
+                + " tools=" + Convert.ToString(tools == null ? 0 : tools.Count())
+                + " final=" + outp[outp.Count - 1].content);
+            client.Close();
+        }
+
+        // ---- 3. 错误体 ----
+        {
+            AnthropicClient client = Prog.MakeClient();
+            Prog.failStatus = 400;
+            List<AiMessage> msgs = new List<AiMessage>();
+            msgs.Add(AiMessage.User("hi"));
+            string reply = await client.CompleteMessages(msgs, 0.0, "");
+            Prog.failStatus = 0;
+            if (reply != null) {
+                Console.WriteLine("err.reply=" + reply);
+                bad = bad + 1;
+            }
+            if (client.lastError.IndexOf("max_tokens") < 0) {
+                Console.WriteLine("err.msg=" + client.lastError);
+                bad = bad + 1;
+            }
+            Console.WriteLine("err=" + client.lastError);
+            client.Close();
+        }
+
+        // ---- 4. 静态翻译函数（不经网络） ----
+        {
+            // 两条 system 消息拼成一段（顺序不变）。
+            List<AiMessage> msgs = new List<AiMessage>();
+            msgs.Add(AiMessage.System("规则一"));
+            msgs.Add(AiMessage.System("规则二"));
+            msgs.Add(AiMessage.User("问题"));
+            if (AnthropicClient.SystemText(msgs) != "规则一\n\n规则二") { bad = bad + 1; }
+
+            // 连续的工具结果 → 一条 user 消息、两个块。
+            List<AiMessage> m2 = new List<AiMessage>();
+            m2.Add(AiMessage.AssistantCalls(Prog.One(
+                Prog.Call("toolu_1", "f", "{}"))));
+            m2.Add(AiMessage.Tool("toolu_1", "结果一"));
+            m2.Add(AiMessage.Tool("toolu_1", "结果二"));
+            JsonValue arr = AnthropicClient.MessagesJson(m2);
+            if (arr.Count() != 2) { bad = bad + 1; }
+            else {
+                JsonValue um = arr.At(1);
+                if (um.Str("role", "") != "user") { bad = bad + 1; }
+                JsonValue blocks = um.Get("content");
+                if (blocks == null || blocks.Count() != 2) { bad = bad + 1; }
+            }
+
+            // 坏参数 → 空 input（不让解析失败把整个请求打回去）。
+            JsonValue bad1 = AnthropicClient.InputOf("{不是 JSON");
+            if (bad1 == null || !bad1.IsObject() || bad1.Count() != 0) { bad = bad + 1; }
+            JsonValue good = AnthropicClient.InputOf("{\"a\":1}");
+            if (good.Int("a", 0) != 1) { bad = bad + 1; }
+
+            // 解析响应：文本块 + tool_use 块。
+            string raw = "{\"content\":[{\"type\":\"text\",\"text\":\"先说一句\"},"
+                + "{\"type\":\"tool_use\",\"id\":\"toolu_9\",\"name\":\"f\","
+                + "\"input\":{\"x\":2}}],\"stop_reason\":\"tool_use\"}";
+            AiToolTurn turn = AnthropicClient.ParseTurn(raw);
+            if (turn == null) { bad = bad + 1; }
+            else {
+                if (turn.content != "先说一句") { bad = bad + 1; }
+                if (turn.toolCalls.Count != 1) { bad = bad + 1; }
+                else {
+                    if (turn.toolCalls[0].id != "toolu_9") { bad = bad + 1; }
+                    if (turn.toolCalls[0].name != "f") { bad = bad + 1; }
+                    if (turn.toolCalls[0].arguments != "{\"x\":2}") { bad = bad + 1; }
+                }
+                if (turn.finishReason != "tool_use") { bad = bad + 1; }
+                if (!turn.WantsTools()) { bad = bad + 1; }
+            }
+            // 坏 JSON → null。
+            if (AnthropicClient.ParseTurn("{不是 JSON") != null) { bad = bad + 1; }
+            // 路径：baseUrl 带 /v1 时不重复拼。
+            AiEndpoint ep1 = AiEndpoint.Parse("https://api.anthropic.com");
+            AiEndpoint ep2 = AiEndpoint.Parse("https://api.anthropic.com/v1");
+            if (AnthropicClient.MessagesPath(ep1) != "/v1/messages") { bad = bad + 1; }
+            if (AnthropicClient.MessagesPath(ep2) != "/v1/messages") { bad = bad + 1; }
+            Console.WriteLine("static ok");
+        }
+
+        api.Stop();
+        for (int w = 0; w < 20; w = w + 1) { await Task.Delay(10); }
+
+        Console.WriteLine("anthropic-ok: " + (bad == 0 ? 1 : 0));
+        return bad == 0 ? 0 : 1;
+    }
+}
