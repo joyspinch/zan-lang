@@ -938,6 +938,26 @@
   -DZAN_GUI_FREETYPE`）+ freetype 源码编出来（用 DevEco Studio 自带的 OHOS
   SDK），再 `llvm-ar` 成 `static/libzan_gui.a`、编成 `libzan_gui.so`。
   **源码就在仓库里**，只是要一台装了 DevEco 的机器。
+- **再更正一处（同日）**：本条上一版写着"**本机没有 DevEco**，这一支只能在那台
+  机器上跑"——**也是错的**。DevEco Studio 就在这台机器上
+  （`C:\Program Files\Huawei\DevEco Studio`，带
+  `sdk/default/openharmony/native/{llvm,sysroot}`，sysroot 里有
+  `x86_64-linux-ohos` / `aarch64-linux-ohos` 两套 `libEGL.so`/`libGLESv3.so`），
+  freetype 源码也在（`D:/project/firefox/modules/freetype2`）。于是
+  `scripts/build_gui_ohos.sh all` **在这台机器上跑通了**（2026-10-22 实跑）：
+  两个架构的 GUI/image/audio/game 驱动全部重出。
+  **教训：判"这台机器补不了"之前，先把常见安装位置查一遍**——凭印象下结论会
+  把"能补"误写成"补不了"。
+- 重出后暴露的两处**仓库缺口**（2026-10-22 实跑）：
+  ① **committed 的 `libzan_gui.so` 是拆分前的旧产物**：它还带着 nanosvg / libwebp
+     的符号（`nsvgCreateRasterizer` / `kVP8Log2Range` / `IsValidColorspace`），
+     而当前代码已把图像解码拆到独立的 image 驱动（重出的 GUI 驱动导出 673 个
+     符号，旧的 1005 个，多出来的正是那批解码符号），并且**缺**新加的
+     `zan_gui_gpu_*` / `zan_gui_blit_*` 入口 ⇒ 仓库里那个 .so 是**陈旧**的。
+  ② **image / game 驱动的二进制从来没进过仓库**：只跟踪了 `.libs` 与
+     `.bundle`，而 `.bundle` 里写着 `libzan_image.so` / `libzan_game.so`
+     ⇒ **发布出去的 OHOS 应用会缺这两个驱动**（audio 驱动的 .so/.a 是跟踪着的，
+     image/game 不是）。
 - 正确的形态（2026-10-22 实测）：OHOS 的 GUI 程序应当产出 **HAP**
   （`zanc --target ohos-x64 --emit-lib`）——**实测链接成功**：HAP 本身不调用
   EGL/GLES（那是驱动 .so 的事），驱动 .so 随应用进 bundle
@@ -947,17 +967,23 @@
   ① **静态 exe 带 GUI 驱动时给明确错误**（已改 `src/compiler/main.c`）：说明
      "静态链接装不下驱动要的 EGL/GLES、OHOS 的 GUI 请用 `--emit-lib`（HAP
      形态）"，不再吐 60 多个 undefined symbol 的瀑布。
-  ② **HAP 形态按需链 EGL/GLES/FreeType**（同上）：`<sys>`（=toolchain/ohos-
-     <arch>/）里有就链上（记 DT_NEEDED），没有就点名缺哪个、去哪拷。
+  ② **HAP 形态按需链 EGL/GLES**（同上）：`<sys>`（=toolchain/ohos-<arch>/）里有
+     就链上（记 DT_NEEDED），没有就点名缺哪个、去哪拷。**只列 EGL/GLES 两项**：
+     OHOS 的 FreeType 是**静态**链进驱动的，设备上不存在 `libfreetype.so`
+     ——列进去只会让人去找一个哪都没有的文件。
   ③ **配方改成拷真库**（`scripts/build_cross_rt.cmd` 的 OHOS NDK 块）：从
      `<OHOS_NDK>/native/sysroot/usr/lib/<triple>/` 拷 `libEGL.so` /
-     `libGLESv3.so` / `libfreetype.so` 到 `toolchain/ohos-<arch>/`；原先那
-     两个**空壳**（导不出任何符号，只记录 DT_NEEDED，连同 `scripts/ohos_stub.c`）
-     已删——**空壳比缺库更坏**：它让人以为支持着这个目标。
+     `libGLESv3.so` 到 `toolchain/ohos-<arch>/`；原先那两个**空壳**（导不出任何
+     符号，只记录 DT_NEEDED，连同 `scripts/ohos_stub.c`）已删——**空壳比缺库
+     更坏**：它让人以为支持着这个目标。
   ④ **让 OHOS 的对象别再停在旧代码**：`toolchain.yml` 新增 `ohos-objects`
      job（zig 路径，`scripts/build_ohos_rt_zig.sh`），源码一改就重出并提交。
-- 剩下的：**驱动 .so 本身**要用 DevEco 的 OHOS SDK 编（`build_gui_ohos.sh`），
-  本机没有 DevEco，这一支只能在那台机器上跑；真机验证同样需要设备。
+  ⑤ **驱动本身重出并补齐跟踪**（2026-10-22，本机有 DevEco）：GUI 驱动的 .so/.a
+     重出（旧产物是拆分前的形态），image / game 驱动的 .so/.a **补进仓库**
+     （`.bundle` 指着它们，仓库里却没有）。
+- 剩下的：**真机 / 模拟器上的运行验证**（DevEco 模拟器装在这台机器上，
+  `C:\Users\QQ\AppData\Local\Huawei\Emulator26.0`；仓库历史里也有 DevEco 模拟器
+  跑通 GUI 画廊的记录 `e59be75a`）。**构建这一环已经不再是缺口。**
 - 关联：A501、A502、A504。
 
 ### [~] A504 CI 的"配方产出"与"提交清单/触发路径"必须一一对应——漏一处，对象就永远停在旧代

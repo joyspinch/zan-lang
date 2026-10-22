@@ -7097,10 +7097,14 @@ int main(int argc, char **argv) {
                        "记录 DT_NEEDED 的空壳"，**导不出任何符号**——拿它们去链
                        接 GUI 程序只会得到一串 undefined symbol（eglMakeCurrent /
                        glCreateShader / FT_*）。空壳已删（scripts\ohos_stub.c 一并
-                       删掉）；这里改成：有就链上，没有就说清楚缺哪个、去哪拷。 */
+                       删掉）；这里改成：有就链上，没有就说清楚缺哪个、去哪拷。
+                       只有 EGL/GLES 两项：OHOS 的 FreeType 是**静态**链进驱动
+                       的（scripts/build_gui_ohos.sh 从源码编出 libfreetype_*.a
+                       再归档），设备上并不存在 libfreetype.so 可链——把它列进来
+                       只会让人去找一个哪都没有的文件。 */
                     {
                         static const char *const ohos_gl_libs[] = {
-                            "libEGL.so", "libGLESv3.so", "libfreetype.so"
+                            "libEGL.so", "libGLESv3.so"
                         };
                         for (size_t gi = 0; gi < sizeof(ohos_gl_libs) / sizeof(ohos_gl_libs[0]); gi++) {
                             char gl[1400];
@@ -7111,8 +7115,10 @@ int main(int argc, char **argv) {
                             }
                             fprintf(stderr,
                                     "note: %s is not in the bundled %s subset ('%s'); "
-                                    "copy it out of <OHOS_NDK>/native/sysroot/usr/lib/"
-                                    "<triple>/ with scripts\\build_cross_rt.cmd "
+                                    "copy it out of an OHOS sysroot's "
+                                    "usr/lib/<triple>/ (an OHOS NDK, or DevEco "
+                                    "Studio's sdk/default/openharmony/native/sysroot)"
+                                    " with scripts\\build_cross_rt.cmd "
                                     "(TASKS.md A503)\n",
                                     ohos_gl_libs[gi], osub, gl);
                         }
