@@ -122,7 +122,19 @@ public class PostsController : AppController {
         if (page < pages) {
             d.Set("next", PageLink(kw, slug, tag, page + 1));
         }
-        this.View(d);
+        /* GEO 元信息：列表页讲什么、有几个分页变体——规范地址带上筛选
+           条件，分页与标签页才不会互相抢归因。 */
+        string siteTitle = await Geo.SiteTitle();
+        string desc = "最新文章与专栏";
+        if (categoryName.Length > 0) { desc = categoryName + " 专栏文章"; }
+        if (tag.Length > 0) { desc = "标签 " + tag + " 下的文章"; }
+        string root = await Geo.SiteUrl();
+        this.Geo()
+            .SetTitle(heading + " · " + siteTitle)
+            .SetDescription(desc)
+            .SetCanonical(await Geo.Canonical(CanonicalPath(kw, slug, tag, page)))
+            .SetSiteName(siteTitle);
+        this.SmartView(d, PostsController.ListMarkdown(rows, heading, desc, root));
     }
 
     [HttpGet]
@@ -145,13 +157,8 @@ public class PostsController : AppController {
         /* 文章页自带 meta/OG：描述取摘要，缺摘要截正文；链接用绝对地址。 */
         string desc = post.summary;
         if (desc.Length == 0) { desc = Prose.Excerpt(post.body, 120); }
-        d.Set("pageDescription", desc);
-        d.Set("ogTitle", post.title);
-        string root = await BaseUrl(this.Ctx());
-        d.Set("ogUrl", root + "/blog/" + Convert.ToString(id));
-        if (post.cover.Length > 0) {
-            d.Set("ogImage", Absolute(root, post.cover));
-        }
+        string root = await Geo.SiteUrl();
+        string canonical = await Geo.Canonical("/blog/" + Convert.ToString(id));
         d.Set("title", post.title);
         d.Set("navBlog", "page");
         d.Set("id", Convert.ToString(id));
@@ -202,7 +209,22 @@ public class PostsController : AppController {
         if (comments.Count == 0) { d.Set("noComments", "1"); }
         /* 关闭评论时表单消失，已通过的评论仍可读——结束讨论不是删除它。 */
         if (await Settings.On(SettingKeys.CommentEnabled, true)) { d.Set("canComment", "1"); }
-        this.View(d);
+        /* GEO：文章页是 AI 引用最密集的页面——标题、摘要、规范地址、
+           作者与封面图交给协议层的元渲染器，文章体裁成结构化数据，
+           正文另备一份 Markdown，协商 Markdown 的爬虫直接拿纯文本。 */
+        string siteTitle = await Geo.SiteTitle();
+        GeoMeta meta = this.Geo();
+        meta.SetTitle(post.title + " · " + siteTitle)
+            .SetDescription(desc)
+            .SetCanonical(canonical)
+            .SetSiteName(siteTitle)
+            .SetAuthor(Author(post))
+            .SetOgType("article")
+            .AddSchema(GeoSchema.Article(post.title, desc, Author(post), Day(post.createdAt)));
+        if (post.cover.Length > 0) {
+            meta.SetImage(Absolute(root, post.cover));
+        }
+        this.SmartView(d, PostsController.ArticleMarkdown(post, canonical, desc));
     }
 
     /* 接收读者评论：以未发布存储——一个能直接发布的开放表单是垃圾的靶子。 */
@@ -292,63 +314,17 @@ public class PostsController : AppController {
         this.Ctx().Binary("application/rss+xml; charset=utf-8", bytes, bytes.Length);
     }
 
-    /* sitemap 协议：首页、博客列表与每篇已发布文章，lastmod 取更新日期。 */
-    [HttpGet]
-    [Route("/sitemap.xml")]
-    [Description("站点地图")]
-    public async void Sitemap() {
-        if (!this.DbReady()) {
-            this.Fail(503, "2001", "服务暂时不可用，请稍后再试");
-        }
-        string root = await BaseUrl(this.Ctx());
-        if (root.Length == 0) { this.Fail(503, "0503", "站点尚未配置公开地址"); }
-        List<Post> rows = await this.Post
-            .Where(a => a.published == 1)
-            .OrderByDescending(a => a.top).OrderByDescending(a => a.id)
-            .ToListAsync();
-        StringBuilder sb = new StringBuilder();
-        sb.Append("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
-        sb.Append("<urlset xmlns=\"http://www.sitemaps.org/schemas/sitemap/0.9\">\n");
-        sb.Append("<url><loc>" + Esc(root) + "/</loc></url>\n");
-        sb.Append("<url><loc>" + Esc(root) + "/blog</loc></url>\n");
-        for (int i = 0; i < rows.Count; i = i + 1) {
-            string lastmod = "";
-            string day = Day(rows[i].updatedAt);
-            if (day.Length > 0) { lastmod = "<lastmod>" + day + "</lastmod>"; }
-            sb.Append("<url><loc>" + Esc(root) + "/blog/"
-                + Convert.ToString(rows[i].id) + "</loc>" + lastmod + "</url>\n");
-        }
-        sb.Append("</urlset>\n");
-        byte[] bytes = Encoding.GetBytes(sb.ToString());
-        this.Ctx().Binary("application/xml; charset=utf-8", bytes, bytes.Length);
-    }
-
-    /* robots.txt：公开面放行、后台拒绝，给爬虫指路 sitemap。无 DB 依赖。 */
-    [HttpGet]
-    [Route("/robots.txt")]
-    [Description("爬虫协议")]
-    public async void Robots() {
-        string root = await BaseUrl(this.Ctx());
-        StringBuilder sb = new StringBuilder();
-        sb.Append("User-agent: *\n");
-        sb.Append("Allow: /\n");
-        sb.Append("Disallow: /admin/\n");
-        if (root.Length > 0) { sb.Append("Sitemap: " + root + "/sitemap.xml\n"); }
-        this.Ctx().Text(sb.ToString());
-    }
+    /* sitemap / robots.txt / llms.txt 由协议层（System.Web）挂载，内容由
+       应用层产出：站点级内容见 Framework/Services/Geo.zan，文章内容由
+       Modules/Sys/Services/BlogGeo.zan 贡献。此处不再手写同名端点——
+       同一路径挂两次会让爬虫拿到哪一份取决于注册顺序。 */
 
     public static async string BaseUrl(HttpContext ctx) {
-        return CanonicalUrl(await Settings.Get(SettingKeys.SiteUrl, ""));
+        return await Geo.SiteUrl();
     }
 
     public static string CanonicalUrl(string configured) {
-        configured = configured.Trim();
-        if (Boot.HttpOrigin(configured).Length == 0
-                || configured.Contains("?") || configured.Contains("#")) { return ""; }
-        while (configured.Length > 0 && configured.EndsWith("/")) {
-            configured = configured.Substring(0, configured.Length - 1);
-        }
-        return configured;
+        return Geo.CanonicalUrl(configured);
     }
 
     /* 相对路径补绝对前缀，已是绝对的原样返回。 */
@@ -391,6 +367,53 @@ public class PostsController : AppController {
         if (slug.Length > 0) { q = q + "&cat=" + Encoding.UrlEncode(slug); }
         if (tag.Length > 0) { q = q + "&tag=" + Encoding.UrlEncode(tag); }
         return q;
+    }
+
+    /* 列表页规范地址：带筛选条件与页码。第一页与无筛选时就是 /blog。 */
+    private static string CanonicalPath(string kw, string slug, string tag, int page) {
+        string q = "/blog";
+        string sep = "?";
+        if (page > 1) { q = q + sep + "page=" + Convert.ToString(page); sep = "&"; }
+        if (kw.Length > 0) { q = q + sep + "kw=" + Encoding.UrlEncode(kw); sep = "&"; }
+        if (slug.Length > 0) { q = q + sep + "cat=" + Encoding.UrlEncode(slug); sep = "&"; }
+        if (tag.Length > 0) { q = q + sep + "tag=" + Encoding.UrlEncode(tag); }
+        return q;
+    }
+
+    /* 列表页的 Markdown 视图：AI 爬虫与协商 Markdown 的客户端拿到的
+       是标题、摘要与文章链接，不是一堆 HTML 标签。 */
+    private static string ListMarkdown(List<Post> rows, string heading, string desc, string root) {
+        StringBuilder sb = new StringBuilder();
+        sb.Append("# " + heading + "\n\n");
+        sb.Append(desc + "\n\n");
+        if (root.Length > 0) { sb.Append("- 地址: " + root + "/blog\n"); }
+        sb.Append("- 文章数: " + Convert.ToString(rows.Count) + "\n\n");
+        if (rows.Count == 0) { sb.Append("（暂无已发布文章）\n"); return sb.ToString(); }
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            Post p = rows[i];
+            sb.Append("## " + p.title + "\n\n");
+            sb.Append(Summary(p) + "\n\n");
+            sb.Append("- 地址: " + root + "/blog/" + Convert.ToString(p.id) + "\n");
+            sb.Append("- 作者: " + Author(p) + "\n");
+            sb.Append("- 发布: " + Day(p.createdAt) + "\n\n");
+        }
+        return sb.ToString();
+    }
+
+    /* 文章页的 Markdown 视图：正文按段落还原，AI 引用时不必解析页面。 */
+    private static string ArticleMarkdown(Post p, string url, string desc) {
+        StringBuilder sb = new StringBuilder();
+        sb.Append("# " + p.title + "\n\n");
+        sb.Append(desc + "\n\n");
+        sb.Append("- 地址: " + url + "\n");
+        sb.Append("- 作者: " + Author(p) + "\n");
+        sb.Append("- 发布: " + Day(p.createdAt) + "\n\n");
+        List<string> paras = Prose.Paragraphs(p.body);
+        for (int i = 0; i < paras.Count; i = i + 1) {
+            sb.Append(paras[i]);
+            sb.Append("\n\n");
+        }
+        return sb.ToString();
     }
 
     private static string Summary(Post p) {

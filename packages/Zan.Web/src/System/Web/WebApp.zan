@@ -39,6 +39,14 @@ public class WebApp : IDisposable {
     LlmsTxt llmsTxt;
     RobotsTxt robotsTxt;
     Sitemap sitemap;
+    /* 应用层 GEO 内容源：内容由应用层每次请求求值，协议层只渲染。 */
+    SitemapSource sitemapSource;
+    RobotsSource robotsSource;
+    LlmsSource llmsSource;
+    /* 挂载幂等标记：静态对象与内容源共用挂载点，同一路径只挂一次。 */
+    bool sitemapMounted;
+    bool robotsMounted;
+    bool llmsMounted;
 
     // 内存请求体上限（字节），超出回答 413。
     int maxBodyBytes;  // in-memory request body cap (413 above this)
@@ -89,6 +97,9 @@ public class WebApp : IDisposable {
         // 共享内存表在 Worker 派生前由 InitShared 创建。
         this.limiter = null;
         this.locks = null;
+        this.sitemapMounted = false;
+        this.robotsMounted = false;
+        this.llmsMounted = false;
     }
 
     // ---- configuration ----
@@ -186,72 +197,159 @@ public class WebApp : IDisposable {
     // 启用 GEO 大模型站点友好规范，自动挂载 /.well-known/llms.txt 与 /llms.txt。
     WebApp UseLlmsTxt(LlmsTxt llms) {
         this.llmsTxt = llms;
-        if (llms != null) {
+        if (llms != null) { this.MountLlms(); }
+        return this;
+    }
+
+    // 应用层接管 llms.txt 内容：委托每次请求求值，返回 null 时回退静态对象。
+    WebApp UseLlmsSource(LlmsSource source) {
+        this.llmsSource = source;
+        if (source != null) { this.MountLlms(); }
+        return this;
+    }
+
+    // llms.txt 挂载点：静态对象与内容源共用，三条路径只挂一次。
+    void MountLlms() {
+        if (!this.llmsMounted) {
+            this.llmsMounted = true;
             this.router.Get("/.well-known/llms.txt", WebApp.HandleLlmsTxt);
             this.router.Get("/.well-known/llms-full.txt", WebApp.HandleLlmsFullTxt);
             this.router.Get("/llms.txt", WebApp.HandleLlmsTxt);
-            /* 如果未显式定制 robots.txt，自动挂载默认放行 AI 爬虫并声明 llms.txt 的 robots.txt */
-            if (this.robotsTxt == null) {
-                this.UseRobotsTxt(RobotsTxt.Create());
-            }
         }
-        return this;
+        /* 如果未显式定制 robots.txt，自动挂载默认放行 AI 爬虫并声明 llms.txt 的 robots.txt */
+        if (this.robotsTxt == null && this.robotsSource == null) {
+            this.UseRobotsTxt(RobotsTxt.Create());
+        }
     }
 
     // 启用搜索引擎与 AI 爬虫协议规则 robots.txt。
     WebApp UseRobotsTxt(RobotsTxt robots) {
         this.robotsTxt = robots;
-        if (robots != null) {
-            this.router.Get("/robots.txt", WebApp.HandleRobotsTxt);
-        }
+        if (robots != null) { this.MountRobots(); }
         return this;
+    }
+
+    // 应用层接管 robots.txt 内容：委托每次请求求值，返回 null 时回退静态对象。
+    WebApp UseRobotsSource(RobotsSource source) {
+        this.robotsSource = source;
+        if (source != null) { this.MountRobots(); }
+        return this;
+    }
+
+    // robots.txt 挂载点：静态对象与内容源共用，同一路径只挂一次。
+    void MountRobots() {
+        if (this.robotsMounted) { return; }
+        this.robotsMounted = true;
+        this.router.Get("/robots.txt", WebApp.HandleRobotsTxt);
     }
 
     // 启用 XML 站点地图 sitemap.xml。
     WebApp UseSitemap(Sitemap sm) {
         this.sitemap = sm;
-        if (sm != null) {
-            this.router.Get("/sitemap.xml", WebApp.HandleSitemapXml);
-        }
+        if (sm != null) { this.MountSitemap(); }
         return this;
+    }
+
+    // 应用层接管 sitemap.xml 内容：委托每次请求求值，返回 null 时回退静态对象。
+    WebApp UseSitemapSource(SitemapSource source) {
+        this.sitemapSource = source;
+        if (source != null) { this.MountSitemap(); }
+        return this;
+    }
+
+    // sitemap.xml 挂载点：静态对象与内容源共用，同一路径只挂一次。
+    void MountSitemap() {
+        if (this.sitemapMounted) { return; }
+        this.sitemapMounted = true;
+        this.router.Get("/sitemap.xml", WebApp.HandleSitemapXml);
     }
 
     LlmsTxt Llms() { return this.llmsTxt; }
     RobotsTxt Robots() { return this.robotsTxt; }
     Sitemap SiteMap() { return this.sitemap; }
+    // 是否已启用 llms.txt（静态对象或应用层内容源任一）。
+    bool HasLlms() { return this.llmsTxt != null || this.llmsSource != null; }
+    // 是否已启用 robots.txt（静态对象或应用层内容源任一）。
+    bool HasRobots() { return this.robotsTxt != null || this.robotsSource != null; }
+    // 是否已启用 sitemap.xml（静态对象或应用层内容源任一）。
+    bool HasSitemap() { return this.sitemap != null || this.sitemapSource != null; }
 
+    // llms.txt 处理器：内容源优先，其次静态对象，都没有则给出未配置提示。
     static async void HandleLlmsTxt(HttpContext ctx) {
         WebApp app = WebHost.Current();
-        if (app != null && app.llmsTxt != null) {
-            ctx.Markdown(app.llmsTxt.ToMarkdown());
-            return;
+        if (app != null) {
+            LlmsSource source = app.llmsSource;
+            if (source != null) {
+                LlmsTxt content = await source();
+                if (content != null) {
+                    ctx.Markdown(content.ToMarkdown());
+                    return;
+                }
+            }
+            if (app.llmsTxt != null) {
+                ctx.Markdown(app.llmsTxt.ToMarkdown());
+                return;
+            }
         }
         ctx.Text("# llms.txt not configured\n");
     }
 
+    // llms-full.txt 处理器：与 llms.txt 同源，长文本聚合版。
     static async void HandleLlmsFullTxt(HttpContext ctx) {
         WebApp app = WebHost.Current();
-        if (app != null && app.llmsTxt != null) {
-            ctx.Markdown(app.llmsTxt.ToFullMarkdown());
-            return;
+        if (app != null) {
+            LlmsSource source = app.llmsSource;
+            if (source != null) {
+                LlmsTxt content = await source();
+                if (content != null) {
+                    ctx.Markdown(content.ToFullMarkdown());
+                    return;
+                }
+            }
+            if (app.llmsTxt != null) {
+                ctx.Markdown(app.llmsTxt.ToFullMarkdown());
+                return;
+            }
         }
         ctx.Text("# llms-full.txt not configured\n");
     }
 
+    // robots.txt 处理器：内容源优先，其次静态对象，都没有则全站放行。
     static async void HandleRobotsTxt(HttpContext ctx) {
         WebApp app = WebHost.Current();
-        if (app != null && app.robotsTxt != null) {
-            ctx.Text(app.robotsTxt.ToText());
-            return;
+        if (app != null) {
+            RobotsSource source = app.robotsSource;
+            if (source != null) {
+                RobotsTxt content = await source();
+                if (content != null) {
+                    ctx.Text(content.ToText());
+                    return;
+                }
+            }
+            if (app.robotsTxt != null) {
+                ctx.Text(app.robotsTxt.ToText());
+                return;
+            }
         }
         ctx.Text("User-agent: *\nAllow: /\n");
     }
 
+    // sitemap.xml 处理器：内容源优先，其次静态对象，都没有则给空站点地图。
     static async void HandleSitemapXml(HttpContext ctx) {
         WebApp app = WebHost.Current();
-        if (app != null && app.sitemap != null) {
-            ctx.Xml(app.sitemap.ToXml());
-            return;
+        if (app != null) {
+            SitemapSource source = app.sitemapSource;
+            if (source != null) {
+                Sitemap content = await source();
+                if (content != null) {
+                    ctx.Xml(content.ToXml());
+                    return;
+                }
+            }
+            if (app.sitemap != null) {
+                ctx.Xml(app.sitemap.ToXml());
+                return;
+            }
         }
         ctx.Xml("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<urlset xmlns=\"http://www.sitemaps.org/schemas/sitemap/0.9\"></urlset>\n");
     }

@@ -89,12 +89,17 @@ class Program {
         Settings.Forget();
         HttpContext poison = new HttpContext(HttpRequest.Parse("GET /robots.txt HTTP/1.1\r\nHost: attacker.test\r\nX-Forwarded-Host: evil.test\r\n\r\n"), "127.0.0.1");
         Program.Check(await ZanWeb.Blog.PostsController.BaseUrl(poison) == "", "unconfigured canonical never trusts Host");
-        ZanWeb.Blog.PostsController blog = new ZanWeb.Blog.PostsController();
-        blog.__Bind(poison);
-        await blog.Robots();
+        /* robots 内容归应用层：应用层 GEO 服务产出内容，协议层只挂载与渲染，
+           同一路径只挂一次，Host 污染不进入响应。 */
+        WebApp geoApp = new WebApp("127.0.0.1", 0);
+        WebHost.Use(geoApp);
+        ZanWeb.Services.Geo.Register(geoApp);
+        Route geoHit = geoApp.router.Match(poison);
+        if (geoHit != null) { await geoHit.handler(poison); }
         string robots = poison.BuildResponse(false);
         Program.Check(robots.Contains("Allow: /\n") && !robots.Contains("attacker.test")
-            && !robots.Contains("evil.test") && !robots.Contains("Sitemap:"), "robots remains public without poisoned discovery link");
+            && !robots.Contains("evil.test") && !robots.Contains("Sitemap:")
+            && !robots.Contains("llms.txt:"), "robots remains public without poisoned discovery link");
         Console.WriteLine("failures=" + Convert.ToString(Program.failures));
         if (Program.failures != 0) { throw new Exception("HTTP policy regression"); }
     }

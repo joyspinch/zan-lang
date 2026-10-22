@@ -1,0 +1,165 @@
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Web;
+using ZanWeb.Core;
+using ZanWeb.Security;
+
+namespace ZanWeb.Services;
+
+/* GEO 内容汇集器：模块把自家内容写进来（站点地图条目 + llms.txt 链接），
+   框架汇总后交给协议层渲染。模块只依赖框架方向——框架不认识博客，
+   博客认识框架。 */
+public class GeoBuilder {
+    Sitemap sitemap;
+    LlmsTxt llms;
+
+    public GeoBuilder(Sitemap sm, LlmsTxt ll) {
+        this.sitemap = sm;
+        this.llms = ll;
+    }
+
+    /* 加一条站点地图条目（loc 须为绝对地址；未配置公开地址时框架不产出
+       条目，故 loc 为空会被 Sitemap.Add 忽略）。 */
+    public void Url(string loc, string lastMod = "", string changeFreq = "weekly", string priority = "0.8") {
+        if (this.sitemap == null) { return; }
+        this.sitemap.Add(loc, lastMod, changeFreq, priority);
+    }
+
+    /* 加一条 llms.txt 链接；分节名相同归入同一节。fullContent 非空时进入
+       llms-full.txt 的聚合正文。 */
+    public void Link(string section, string title, string url, string desc, string fullContent = "") {
+        if (this.llms == null) { return; }
+        if (fullContent.Length > 0) {
+            this.llms.AddFullLink(section, title, url, desc, fullContent);
+        } else {
+            this.llms.AddLink(section, title, url, desc);
+        }
+    }
+}
+
+/* GEO 内容贡献者：模块注册自己的内容，框架生成 sitemap / llms.txt 时统一
+   汇总。异步——模块内容多来自数据库（已发布文章等），需要等待读取。 */
+public async delegate bool GeoContributor(GeoBuilder builder);
+
+/* 站点级 GEO 服务：产出 sitemap / robots.txt / llms.txt 三件套的内容。
+   协议层（System.Web）只负责协议形状——路由挂载与 XML/文本渲染；内容
+   全部由本层产出，应用层接管内容、协议层只出形状。 */
+public class Geo {
+    /* 模块内容贡献者注册表（多槽位：各模块各自注册，互不覆盖）。 */
+    static List<GeoContributor> contributors;
+
+    /* 注册模块内容贡献者；组合根在 Boot.Run() 之前调用一次。 */
+    public static void AddContributor(GeoContributor fn) {
+        if (fn == null) { return; }
+        if (contributors == null) { contributors = new List<GeoContributor>(); }
+        contributors.Add(fn);
+    }
+
+    /* 站点公开地址：只认受信任的 site.url 设置，非法或未配置时为空。
+       绝不回退 Host 头——那会让任何人伪造站点归因。 */
+    public static async string SiteUrl() {
+        return Geo.CanonicalUrl(await Settings.Get(SettingKeys.SiteUrl, ""));
+    }
+
+    /* 规范地址校验：只接受 http/https 绝对地址并去尾斜杠；带查询串或
+       片段一律拒绝（归因来源须唯一）。 */
+    public static string CanonicalUrl(string configured) {
+        configured = configured.Trim();
+        if (Boot.HttpOrigin(configured).Length == 0
+                || configured.Contains("?") || configured.Contains("#")) { return ""; }
+        while (configured.Length > 0 && configured.EndsWith("/")) {
+            configured = configured.Substring(0, configured.Length - 1);
+        }
+        return configured;
+    }
+
+    /* 站点标题（站点设置，未配置时用默认名）。 */
+    public static async string SiteTitle() {
+        return await Settings.Get(SettingKeys.SiteTitle, "Zan");
+    }
+
+    /* 规范地址：已知公开地址时补绝对前缀，否则保持相对——相对地址由
+       客户端按请求地址解析，不会把可能被伪造的 Host 写进页面。 */
+    public static async string Canonical(string path) {
+        string root = await Geo.SiteUrl();
+        if (root.Length == 0) { return path; }
+        return root + path;
+    }
+
+    /* 站点地图：首页与博客列表（站点级）+ 模块贡献（文章等）。
+       未配置公开地址时产出空站点地图——sitemap 规范要求绝对地址，
+       宁可空表也不发相对路径。 */
+    public static async Sitemap BuildSitemap() {
+        Sitemap sm = Sitemap.Create();
+        string root = await Geo.SiteUrl();
+        if (root.Length > 0) {
+            sm.Add(root + "/", "", "daily", "1.0");
+            sm.Add(root + "/blog", "", "daily", "0.8");
+        }
+        await Geo.Contribute(sm, null);
+        return sm;
+    }
+
+    /* 爬虫协议：公开面放行、后台拒绝，并声明 sitemap 与 llms.txt 位置。
+       AI 爬虫的显式放行由 RobotsTxt 自身输出（GPTBot/PerplexityBot 等）。 */
+    public static async RobotsTxt BuildRobots() {
+        RobotsTxt robots = RobotsTxt.Create();
+        robots.Allow("/");
+        robots.Disallow("/admin/");
+        robots.Disallow("/api/admin/");
+        string root = await Geo.SiteUrl();
+        if (root.Length > 0) {
+            robots.SetSitemap(root + "/sitemap.xml");
+            robots.SetLlmsTxt(root + "/.well-known/llms.txt");
+        } else {
+            /* 未配置公开地址：不给发现链接。sitemap 规范要求绝对地址，
+               相对链接会被解析到请求 Host 上（可被伪造），宁可不说。 */
+            robots.SetSitemap("");
+            robots.SetLlmsTxt("");
+        }
+        return robots;
+    }
+
+    /* llms.txt：站点概览 + 站点导航 + 模块贡献（文章等）。 */
+    public static async LlmsTxt BuildLlms() {
+        string title = await Settings.Get(SettingKeys.SiteTitle, "Zan");
+        string summary = await Settings.Get(SettingKeys.SiteDescription, "");
+        if (summary.Length == 0) {
+            summary = await Settings.Get(SettingKeys.SiteSubtitle, "");
+        }
+        LlmsTxt llms = LlmsTxt.Create(title, summary);
+        string root = await Geo.SiteUrl();
+        if (root.Length > 0) {
+            llms.AddLink("站点导航", "首页", root + "/", summary);
+            llms.AddLink("站点导航", "博客", root + "/blog", "最新文章与专栏");
+        }
+        await Geo.Contribute(null, llms);
+        return llms;
+    }
+
+    /* 汇总模块贡献：逐个调用贡献者。单个贡献者失败只记账不阻断——爬虫
+       看到半张站点地图好过看到 500。 */
+    static async bool Contribute(Sitemap sm, LlmsTxt llms) {
+        if (contributors == null) { return true; }
+        GeoBuilder builder = new GeoBuilder(sm, llms);
+        for (int i = 0; i < contributors.Count; i = i + 1) {
+            GeoContributor fn = contributors[i];
+            if (fn == null) { continue; }
+            try {
+                await fn(builder);
+            } catch (Exception e) {
+                Log.Warn("[geo] content contributor failed: " + e.Message);
+            }
+        }
+        return true;
+    }
+
+    /* 把站点级 GEO 内容挂到协议层：内容由本层产出，协议层只渲染与挂载。 */
+    public static void Register(WebApp app) {
+        if (app == null) { return; }
+        app.UseSitemapSource(Geo.BuildSitemap);
+        app.UseRobotsSource(Geo.BuildRobots);
+        app.UseLlmsSource(Geo.BuildLlms);
+    }
+}

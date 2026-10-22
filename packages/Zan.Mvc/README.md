@@ -17,7 +17,9 @@ structure, an external config file, and the ORM and cache wired in by default.
   `AdminController`），以及管理台与前台控制器、随包视图与静态资产。
 - **`System.Web` 标准库** — Web 内核：`WebApp`、`Router`、`HttpContext`、
   `Controller`、`View`、`WebServer`，与 `RouteTable` / `RouteStats` /
-  `PermTable`。
+  `PermTable`；GEO 协议件（`GeoMeta` / `GeoSchema` / `Sitemap` /
+  `RobotsTxt` / `LlmsTxt`）与内容源委托（`SitemapSource` /
+  `RobotsSource` / `LlmsSource`）。
 
 应用侧只保留业务：组合根（main.zan）、业务控制器/模型/DAO、种子、应用自有
 配置。框架修复落在包里——拉新包版本即完成更新。
@@ -31,7 +33,7 @@ src/ZanWeb/             包源码。目录是工程组织（Framework/Modules �
   Framework/              框架层：所有模块共享的件；业务模块只依赖它
     Core/                   基建：Boot 引导 · Cfg 配置 · Db/DbContext · Schema
     Services/               业务支撑：JobHost 任务宿主 · Cache/CacheContext · Metrics ·
-                            Mailer · ClusterBus/Presence · Settings
+                            Mailer · ClusterBus/Presence · Settings · Geo（GEO 内容）
     Security/               横切·安全：Auth · Perm/PermTable · DataScope · Keys ·
                             LoginThrottle · VerifyCode
     Ai/                     横切·AI：AI 助手注册与端点策略
@@ -44,8 +46,8 @@ src/ZanWeb/             包源码。目录是工程组织（Framework/Modules �
       Model/  Dao/          数据层：sys_* 实体与 DAO；DAO 统一封装实体业务操作，
                             与普通查询共用实体访问器，见「DB 访问规范」；
                             Model/Blog/、Dao/Blog/ 为示例模块
-      Services/             模块内非控制器业务件（业务种子 BlogSeed 等），
-                            不进 Controller/，见「Controller/ 纯净与端点纪律」
+      Services/             模块内非控制器业务件（业务种子 BlogSeed · GEO 内容源
+                            BlogGeo 等），不进 Controller/，见「Controller/ 纯净与端点纪律」
     Crud/                   CRUD 模块：声明式 CRUD 引擎、配置驱动管理屏与表单设计器
       Engine/               引擎件：CrudOps 写网关 · FormPage 声明式表单页与校验 ·
                             ListPage 声明式列表页与表格配置 · Gen 表设计器与代码生成引擎
@@ -665,7 +667,7 @@ logged at the `[log].slowSqlMs` / `[log].slowMs` thresholds.
 
 应用不复制本包代码：源文件按层 `using`，zanc 自动发现并拉入包源（发现顺序：
 应用 `packages/` → 应用 `.zan-packages/` → 编译器旁 `packages/` → 全局包库）。
-组合根只声明菜单分组、路由挂点与业务种子：
+组合根只声明菜单分组、路由挂点、业务种子与 GEO 内容源注册：
 
 ```zan
 using System;
@@ -682,6 +684,7 @@ class Program {
 
         Boot.OnRoutes(Program.RegisterRoutes);
         BlogSeed.Register();   /* 业务种子：内置管理员与演示文章（幂等） */
+        BlogGeo.Register();    /* GEO 内容源：已发布文章进 sitemap / llms.txt（幂等） */
         int _r = await Boot.Run();
     }
     static void RegisterRoutes(WebApp app) {
@@ -760,8 +763,10 @@ every sign-in "wrong password").
 - `GET /blog`, `GET /blog/{id}`, `POST /blog/create` — server-rendered blog (author = signed-in account)
 - `GET /blog?tag=X` — tag archive (whole-tag match, not substring)
 - `GET /rss.xml` — RSS 2.0 feed of the latest 20 published posts
-- `GET /sitemap.xml` — home, blog index and every published post
-- `GET /robots.txt` — allows the public site, denies `/admin/`, points at the sitemap
+- `GET /sitemap.xml` — home, blog index and every published post (absolute URLs only; empty until `site.url` is set)
+- `GET /robots.txt` — allows the public site, denies `/admin/` and `/api/admin/`, points at the sitemap and llms.txt
+- `GET /llms.txt`, `GET /.well-known/llms.txt` — LLM-readable site guide (site summary + navigation + published posts)
+- `GET /.well-known/llms-full.txt` — same source in aggregated long form (article bodies included)
 - `GET /admin/login`, `POST /admin/login`, `GET /admin/logout` — admin sign-in (seed: `admin` / `admin1234`)
 - `GET /admin` — admin dashboard (uptime, requests, CPU/RSS, slow requests, pool/cache)
 - `GET /admin/system/users`, `POST /admin/system/users/status`, `POST /admin/system/users/logout` — account administration
@@ -958,34 +963,69 @@ Streamed file uploads with a deny-by-default extension whitelist.
 - The admin page's 上传文件 button posts the raw bytes with
   `?name=` (`data-upload` in `admin.js`) — no multipart machinery needed.
 
-## Public site discoverability (RSS / sitemap / robots / tags)
+## Public site discoverability (RSS / sitemap / robots / llms.txt / tags)
 
-Three machine-facing surfaces served by `Blog/Posts.zan` next to the human
-pages, all built from published posts only:
+Five machine-facing surfaces served next to the human pages. **The protocol
+layer owns the shape, the application layer owns the content**: `System.Web`
+mounts the routes and renders the XML / text; `ZanWeb.Services.Geo` produces the
+content and hands it over through the `SitemapSource` / `RobotsSource` /
+`LlmsSource` async delegates. A module that wants its own content in the
+sitemap joins the aggregation — it does not write a route.
 
 - **`GET /rss.xml`** — RSS 2.0, latest 20 published posts (`application/rss+xml`).
   Item links and GUIDs are absolute; `<pubDate>`/`<lastBuildDate>` are RFC-822
   in the site timezone (`site.timezone`, the same offset the page views use).
-  Every text is XML-escaped and control characters are folded to spaces.
+  Every text is XML-escaped and control characters are folded to spaces. It
+  answers 503 while the public address is unset (absolute links need one).
 - **`GET /sitemap.xml`** — the sitemap-protocol URL set: `/`, `/blog`, and one
   `<url>` per published post with `<lastmod>` from the row's update date.
 - **`GET /robots.txt`** — `User-agent: *` / `Allow: /` / `Disallow: /admin/` /
-  `Sitemap: <base>/sitemap.xml`. No database involved, so it answers even when
-  the DB is down.
-- **Absolute base** — `site.url` (`站点地址` in 站点设置) is the source of truth
-  when configured (the only reliable choice behind a reverse proxy or custom
-  domain); left empty the base falls back to the request's `Host` header,
-  restricted to URL-safe characters. Saving the setting takes effect on the
-  next request (the settings cache is dropped per worker).
+  `Disallow: /api/admin/`, explicit allow rules for the AI crawlers (GPTBot,
+  PerplexityBot, ClaudeBot, Google-Extended, Bytespider) and — when the public
+  address is known — the `Sitemap:` and `llms.txt:` pointers.
+- **`GET /llms.txt`** and **`GET /.well-known/llms.txt`** — the LLM-readable
+  site guide: site title and summary, a `## 站点导航` section (home, blog) and
+  a `## 博客文章` section with one link per published post (the excerpt as
+  description). **`GET /.well-known/llms-full.txt`** is the same source in
+  aggregated long form, with the article bodies included.
+- **Who owns what** — `System.Web` only mounts and renders.
+  `WebApp.UseSitemapSource()` / `UseRobotsSource()` / `UseLlmsSource()` take an
+  async delegate and share the mount point with the static-object form
+  (`UseSitemap()` / `UseRobotsTxt()` / `UseLlmsTxt()`), so a path is mounted
+  once — never twice, no route collision. The content comes from
+  `ZanWeb.Services.Geo` (site level) plus the module contributors registered
+  through `Geo.AddContributor()`; `ZanWeb.Blog.BlogGeo` contributes the
+  published posts. `Boot.Run()` wires the site-level service automatically;
+  a module registers its own content in the composition root
+  (`BlogGeo.Register()`).
+- **Absolute base** — `site.url` (`站点地址` in 站点设置) is the **only** source
+  of absolute URLs, because the sitemap / robots / llms.txt specs require
+  absolute addresses. When it is unset the framework emits an **empty**
+  sitemap and a robots.txt with **no** `Sitemap:` / `llms.txt:` pointer: a
+  relative link would be resolved against the request's `Host` header, which
+  anyone can forge, so saying nothing beats saying something false. Page
+  canonical links degrade to relative paths for the same reason. Saving the
+  setting takes effect on the next request (the settings cache is dropped per
+  worker).
 - **Tag archive** — post tags are plain comma text, so a tag link is a
   whole-word match over the split list (`Prose.HasTag`), never a SQL `LIKE`:
   a search for `ar` must not surface the `arc` post. `/blog?tag=X` filters,
   paginates and feeds the pager; tag chips on a post page link into the
   archive.
-- **Head metadata** — the public layout renders an `<link rel="alternate">`
-  for the feed on every page; a post page overrides `<meta name="description">`
-  with its summary (body excerpt as fallback) and emits Open Graph tags
-  (`og:title` / `og:description` / `og:url` / `og:image` when a cover exists).
+- **Head metadata** — the public layout renders the GEO head block
+  (`{{{geo_head}}}`) built by `Controller.Geo()`: `<title>`, `description`,
+  `canonical`, the `og:*` / `twitter:*` tags and the JSON-LD schema. A post
+  page sets `og:type=article` and emits `GeoSchema.Article`; the home page
+  emits `GeoSchema.Organization`. The layout still renders an
+  `<link rel="alternate">` for the feed on every page, and falls back to the
+  plain `<meta name="description">` when a page sets no GEO metadata.
+- **Markdown for agents** — `Controller.SmartView(data, markdown)` serves a
+  markdown twin of the page when the request looks agent-ish (`?format=md`,
+  `Accept: text/markdown`, or an AI crawler UA); otherwise it renders the
+  normal HTML view. The home page and the blog list use it, so one URL serves
+  both. The `Link: <...>; rel="canonical"` and
+  `Link: </.well-known/llms.txt>; rel="llms-txt"` response headers are sent
+  once per response.
 
 ## Multi-language UI (`site.language` / `i18n`)
 

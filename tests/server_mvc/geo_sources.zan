@@ -1,0 +1,158 @@
+using System;
+using System.Collections.Generic;
+using System.Web;
+using ZanWeb.Blog;
+using ZanWeb.Core;
+using ZanWeb.Security;
+using ZanWeb.Services;
+using ZanWeb.Web;
+
+/* GEO 内容源回归：协议层（System.Web）只出形状——挂载路径与渲染内容；
+   内容由应用层产出。本例钉住四件事——同一路径只挂一次、内容随站点设置
+   变化、规范地址不信任 Host、模块贡献者在数据库不可用时安静降级。 */
+class ProbeController : Controller {
+    public void Render(HttpContext ctx, ViewData d) {
+        this.__Bind(ctx);
+        this.Geo()
+            .SetTitle("探针文章")
+            .SetDescription("探针描述")
+            .SetCanonical("https://blog.test/blog/1")
+            .SetSiteName("Probe Blog")
+            .SetAuthor("编辑部")
+            .SetOgType("article")
+            .SetImage("https://blog.test/cover.png")
+            .AddSchema(GeoSchema.Article("探针文章", "探针描述", "编辑部", "2026-01-01"));
+        this.SmartView(d, "");
+    }
+}
+
+class Program {
+    static int failures;
+    static void Check(bool ok, string label) {
+        if (!ok) { Program.failures = Program.failures + 1; Console.WriteLine("FAIL " + label); }
+    }
+    static HttpContext Ctx(string target, string headers) {
+        HttpRequest req = HttpRequest.Parse("GET " + target + " HTTP/1.1\r\nHost: blog.test\r\n"
+            + headers + "\r\n");
+        return new HttpContext(req, "127.0.0.1");
+    }
+    static async string Fetch(WebApp app, string target) {
+        HttpContext ctx = Program.Ctx(target, "");
+        Route hit = app.router.Match(ctx);
+        if (hit != null) { await hit.handler(ctx); }
+        return ctx.BuildResponse(false);
+    }
+    static int CountOf(string hay, string needle) {
+        int n = 0;
+        int i = 0;
+        while (i <= hay.Length - needle.Length) {
+            int at = hay.IndexOf(needle, i);
+            if (at < 0) { break; }
+            n = n + 1;
+            i = at + needle.Length;
+        }
+        return n;
+    }
+    /* 直接顶掉设置缓存：站点地址是本例要切换的唯一变量。 */
+    static void PrimeSettings(string url, string title, string desc) {
+        StrMap m = new StrMap();
+        m.Set("site.url", url);
+        m.Set("site.title", title);
+        m.Set("site.description", desc);
+        Settings.values = m;
+        long now = WebApp.NowSeconds();
+        Settings.expires = now + 60;
+    }
+    static async void Main() {
+        AppServices.Use(null);
+        Settings.Forget();
+
+        WebApp app = new WebApp("127.0.0.1", 0);
+        WebHost.Use(app);
+        Geo.Register(app);
+        /* 重复注册不叠加：协议层的挂载点是幂等的。 */
+        Geo.Register(app);
+
+        /* ---- 未配置公开地址：只说该说的，绝不给相对地址 ---- */
+        string sitemap = await Program.Fetch(app, "/sitemap.xml");
+        Program.Check(sitemap.Contains("Content-Type: application/xml")
+            && sitemap.Contains("<urlset") && !sitemap.Contains("<loc>"),
+            "sitemap without a public address carries no relative loc");
+        string robots = await Program.Fetch(app, "/robots.txt");
+        Program.Check(robots.Contains("Content-Type: text/plain")
+            && robots.Contains("User-agent: *") && robots.Contains("Allow: /")
+            && robots.Contains("Disallow: /admin/") && robots.Contains("Disallow: /api/admin/")
+            && robots.Contains("User-agent: GPTBot")
+            && !robots.Contains("Sitemap:") && !robots.Contains("llms.txt:"),
+            "robots allows the public surface, denies admin, and keeps quiet without an address");
+        string llms = await Program.Fetch(app, "/llms.txt");
+        Program.Check(llms.Contains("Content-Type: text/markdown") && llms.Contains("# Zan"),
+            "llms.txt answers as markdown and names the site");
+        string wellKnown = await Program.Fetch(app, "/.well-known/llms.txt");
+        Program.Check(wellKnown.Contains("# Zan"), "well-known llms.txt mirrors llms.txt");
+        string llmsFull = await Program.Fetch(app, "/.well-known/llms-full.txt");
+        Program.Check(llmsFull.Contains("Content-Type: text/markdown"),
+            "llms-full.txt answers as markdown");
+
+        /* ---- 配好公开地址：绝对地址与导航都跟着变 ---- */
+        Program.PrimeSettings("https://blog.test", "Probe Blog", "probe site");
+        sitemap = await Program.Fetch(app, "/sitemap.xml");
+        Program.Check(sitemap.Contains("<loc>https://blog.test/</loc>")
+            && sitemap.Contains("<loc>https://blog.test/blog</loc>"),
+            "sitemap lists home and blog with absolute addresses");
+        robots = await Program.Fetch(app, "/robots.txt");
+        Program.Check(robots.Contains("Sitemap: https://blog.test/sitemap.xml")
+            && robots.Contains("llms.txt: https://blog.test/.well-known/llms.txt"),
+            "robots points at the absolute sitemap and llms.txt");
+        llms = await Program.Fetch(app, "/llms.txt");
+        Program.Check(llms.Contains("# Probe Blog") && llms.Contains("> probe site")
+            && llms.Contains("## 站点导航") && llms.Contains("[博客](https://blog.test/blog)"),
+            "llms.txt carries the site summary and its navigation");
+
+        /* ---- 规范地址：只认受信任的设置，绝不回退 Host ---- */
+        Program.Check(Geo.CanonicalUrl("https://blog.test/base///") == "https://blog.test/base"
+            && Geo.CanonicalUrl("javascript:evil") == ""
+            && Geo.CanonicalUrl("https://user@evil.test") == ""
+            && Geo.CanonicalUrl("https://blog.test/?q=x") == "",
+            "canonical rejects anything but a plain public address");
+        Program.Check(await Geo.Canonical("/blog") == "https://blog.test/blog",
+            "canonical is absolute once the public address is known");
+        Settings.Forget();
+        Program.Check(await Geo.Canonical("/blog") == "/blog",
+            "canonical falls back to a relative path, never the Host header");
+
+        /* ---- 模块贡献者：数据库不可用时安静降级，不拖垮整张站点地图 ---- */
+        Program.PrimeSettings("https://blog.test", "Probe Blog", "probe site");
+        BlogGeo.Register();
+        sitemap = await Program.Fetch(app, "/sitemap.xml");
+        Program.Check(sitemap.Contains("<loc>https://blog.test/</loc>")
+            && sitemap.Contains("<loc>https://blog.test/blog</loc>"),
+            "blog contributor degrades quietly without a database");
+
+        /* ---- 路由只挂一次 ---- */
+        int robotsRoutes = 0;
+        int sitemapRoutes = 0;
+        int llmsRoutes = 0;
+        List<Route> all = app.router.All();
+        for (int i = 0; i < all.Count; i = i + 1) {
+            if (all[i].pattern == "/robots.txt") { robotsRoutes = robotsRoutes + 1; }
+            if (all[i].pattern == "/sitemap.xml") { sitemapRoutes = sitemapRoutes + 1; }
+            if (all[i].pattern == "/llms.txt") { llmsRoutes = llmsRoutes + 1; }
+        }
+        Program.Check(robotsRoutes == 1 && sitemapRoutes == 1 && llmsRoutes == 1,
+            "each GEO surface is mounted exactly once");
+
+        /* ---- GEO 响应头每条只下发一次 ---- */
+        HttpContext head = Program.Ctx("/blog/1", "");
+        ProbeController probe = new ProbeController();
+        probe.Render(head, new ViewData());
+        string page = head.BuildResponse(false);
+        Program.Check(Program.CountOf(page, "rel=\"canonical\"") == 1
+            && page.Contains("<https://blog.test/blog/1>; rel=\"canonical\"")
+            && Program.CountOf(page, "rel=\"llms-txt\"") == 1,
+            "canonical and llms-txt links are emitted once per response");
+
+        Console.WriteLine("failures=" + Convert.ToString(Program.failures));
+        if (Program.failures != 0) { throw new Exception("GEO content source regression"); }
+    }
+}

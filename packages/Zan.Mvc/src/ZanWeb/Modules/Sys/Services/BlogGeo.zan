@@ -1,0 +1,61 @@
+using System;
+using System.Collections.Generic;
+using System.Data;
+using ZanWeb.Core;
+using ZanWeb.Dao.Blog;
+using ZanWeb.Model.Blog;
+using ZanWeb.Services;
+using ZanWeb.Web;
+
+namespace ZanWeb.Blog;
+
+/* 博客模块的 GEO 内容源：把已发布文章喂给站点的 sitemap 与 llms.txt。
+   模块层 → 框架层单向依赖：框架不认识博客，博客认识框架；框架只提供
+   GeoBuilder 汇集器与注册缝，文章内容由本模块产出。 */
+public class BlogGeo {
+    /* 注册进框架的 GEO 汇集器；组合根在 Boot.Run() 之前调用一次。 */
+    static bool registered;
+
+    public static void Register() {
+        if (registered) { return; }
+        registered = true;
+        Geo.AddContributor(Contribute);
+    }
+
+    /* 贡献已发布文章：站点地图条目 + llms.txt 链接（带正文，喂
+       llms-full.txt 的聚合长文本）。 */
+    public static async bool Contribute(GeoBuilder builder) {
+        string root = await Geo.SiteUrl();
+        if (root.Length == 0) { return false; }
+        List<Post> rows = await BlogGeo.Published();
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            Post p = rows[i];
+            string loc = root + "/blog/" + Convert.ToString(p.id);
+            string summary = p.summary;
+            if (summary.Length == 0) { summary = Prose.Excerpt(p.body, 120); }
+            string day = p.updatedAt > 0 ? Fmt.DayInput(p.updatedAt) : "";
+            builder.Url(loc, day, "weekly", "0.6");
+            builder.Link("博客文章", p.title, loc, summary, p.body);
+        }
+        return true;
+    }
+
+    /* 已发布文章：控制器之外取数，自借自还只读连接——请求作用域的租约
+       是控制器的事，这里没有控制器。 */
+    static async List<Post> Published() {
+        List<Post> rows = new List<Post>();
+        AppServices services = AppServices.Current();
+        if (services == null) { return rows; }
+        DbContext db = services.Db();
+        if (db == null) { return rows; }
+        IDbConnection conn = await db.AcquireRead();
+        if (conn == null) { return rows; }
+        try {
+            PostDao dao = new PostDao(conn);
+            rows = await dao.PublishedAll();
+        } finally {
+            db.ReleaseRead(conn);
+        }
+        return rows;
+    }
+}
