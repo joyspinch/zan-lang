@@ -79,6 +79,19 @@
 - 同根：`TryParse(...)` 调用表达式直接打印得 "1"，存 bool 变量再打印得 "true"（调用结果表达式未按声明类型定型）。
 - 根因落点：irgen 整数运算一律 64 位寄存器、仅写回 int 槽时截断；表达式定型与收窄缺失。
 - 附带：`>>>` 宿主支持但 SPEC §2.6 运算符表未声明（→A526）。
+- **宿主侧已修（2026-10-23，goal round 3）**：`emit_binary_op_values` 在
+  `coerce_int_pair` 之后按表达式定型补 32 位收窄——定型为 int/uint 且两臂
+  均为 >32 位整数时截到 i32 再运算，结果保持 i32（比较运算定型是 bool
+  天然不走这条；臂内层 int 表达式已各自包回）。加/减/乘/除/移位/位运算
+  全部落 32 位环绕；除法 INT32_MIN/-1 防护与 checked 检查随位宽自适应。
+- 复验：p03 七条全对（-2 / 2147483647 / 4294967295 / 2147483644）、p04
+  提升全对（`long j = i+1` 先按 int 环绕再提升 -2147483648；long 算术
+  2147483648 不变；'a'+1=98）；六域 60+ 探针批次复跑零回归（编译失败面
+  =既有预期失败 14 条负探针）。同提交顺带落 A536（emit_null_coalesce
+  存量 phi 分组缺陷，批次回归照出——路径限定提交按文件取工作树，两修
+  同文件同车，台账分记）。
+- 待办：自举半边（ngen 整数运算位宽同口径）；short/byte 的 C# 提升到
+  int（现也 64 位）留观。
 - 探针：`_scratch/csaudit/numeric/{p03,p04,p12}`。
 
 ### [~] A511 decimal 三处语义缺口：除法截断、与 double 混算垃圾、WriteLine(decimal) 编译崩溃
@@ -1460,3 +1473,18 @@
 - **P1-8 RFC3161：查无此码**。全仓（src/packages/stdlib/tools/模板）
   无任何 RFC3161/TimeStampReq 实现——原发现指向的代码已不在仓库
   （随模板出仓或在 691 提交中重构掉）；无原始审计上下文不再追。
+
+### [~] A536 `T? ?? T` 在 merge 块先发负载提取再建 phi——LLVM 校验失败（存量缺陷，批次回归照出）
+- 现象：`types/p07_nullable.zan`（`int y = x ?? 5;`）报 "LLVM verification
+  failed in main: PHI nodes not grouped at top of basic block!"——批次回归
+  （A510 的六域全扫）照出；用 A482 前后的 irgen_expr.c 双向对拍确认是
+  **存量缺陷**（与 A510 收窄无关）。
+- 根因：`emit_null_coalesce` 的 `T? ?? T` 分支在定位到 merge 块**之后**才调
+  `nullable_get_payload`——提取指令（gep/load）落在 coal.end 块顶、phi 之前，
+  违反 phi 分组约束。
+- 修法（同 commit 356a15882）：负载提取上提到 left_bb（分支前，左值必然
+  在场）；merge 块只建 phi，右臂宽度差用 coerce_int_to（静态门槛已保证
+  同型，防御路径实际不可达）。
+- 复验：p07 全断言通过（"OK p07"）；p03/p04 不受影响。
+- 待办：自举半边（selfhost 的 ?? 降级路径同查）；`bool?`/`T? ?? T?` 聚合
+  路径同样只建 phi 未动，留观。
