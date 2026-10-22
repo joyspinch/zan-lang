@@ -2786,6 +2786,13 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                             return phi;
                         }
                     }
+                    if (rt_ty->kind == TYPE_CHAR &&
+                        LLVMGetTypeKind(LLVMTypeOf(v)) == LLVMIntegerTypeKind) {
+                        /* A523：char.ToString() 曾落通用 itoa 返回码点数字
+                         * "65"（C# "A"）；WriteLine(char) 与拼接路径早就是
+                         * 字符渲染——两条路对齐到同一个 UTF-8 编码帮手。 */
+                        return emit_char_to_cstr(g, v);
+                    }
                     LLVMValueRef buf = emit_string_alloc_rc(g,
                         LLVMConstInt(i64, 40, 0));
                     if (vk == LLVMDoubleTypeKind || vk == LLVMFloatTypeKind) {

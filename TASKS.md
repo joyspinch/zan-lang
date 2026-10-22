@@ -178,7 +178,13 @@
 - 待办：自举半边（③的错误判定在 selfhost checker 对齐）。
 - 原始记录：① C# CS0157；Zan 接受且语义=覆盖 try 返回值（override-result=2），无警告。② switch 非空 case 隐式贯穿：C# CS0163；Zan 接受且语义=**隐式 break**（隔离探针亲验：case 1 不落入 case 2）——Go 风格，C# 直觉漏写 break 静默变行为。③ `if (x = 1)`：C# CS0029 硬错；Zan 仅警告，运行 C 风格真假（x=1 进分支，亲验）。
 - 探针：`_scratch/csaudit/exceptions/{p03_finally_override,p13_implicit_fallthrough}.zan`、`operators/p13_assign_cond.zan`、`operators/v_assign_cond.zan`（复验：当场报错）。
-### [ ] A523 渲染与诊断输出口径族（与 .NET 不一致的小偏差集合）
+### [~] A523 渲染与诊断输出口径族（与 .NET 不一致的小偏差集合）
+- **宿主侧已修一件（2026-10-23）**：`char.ToString()` 曾落通用 itoa 返回码点
+  数字 "65"（C# "A"；WriteLine(char) 与拼接路径早就是字符渲染——两条路互
+  相不一致）。ToString lowering 补 TYPE_CHAR 分支，对齐 emit_char_to_cstr
+  （UTF-8 编码）。探针 v_chartost 复验："A" + Length 1。
+- 待办：其余件（bool 大小写=A441 已闭的统一口径、-0.0 符号、float 按精度
+  打印、未捕获异常的 stdout/无 Message/无栈）按需逐件；自举半边。
 - bool 全路径小写 true/false（五条渲染路径内部一致；C# True/False——A441 闭账口径=统一，非 .NET 口径，协议/日志大小写敏感场景有实害）。
 - `char.ToString()` 返回码点数字 "65"（C# "A"；WriteLine(char) 与拼接却正确——渲染路径互相不一致）。
 - `-0.0` 打印丢符号（C# "-0"）；float 打印按 double 展开（0.1f+0.2f→"0.30000001192092896"，C# "0.3"）。
