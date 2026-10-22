@@ -16,7 +16,12 @@ to zanc (project `packages/`, `.zan-packages/`, or a toolchain-relative
   children of a parent row — the reverse relation is *derived* from the
   child's navigation declaration (foreign key column = `<navField>Id`, the
   same convention as the join's ON clause), so callers never spell the
-  foreign key column by hand.
+  foreign key column by hand. `IUnitOfWork` also offers **savepoints**
+  (`CreateSavepoint` / `RollbackToSavepoint` / `ReleaseSavepoint`, plus async
+  twins) so a transaction can carve out a rollback-able sub-section; the
+  dialect follows the backend (SQL Server uses `SAVE TRANSACTION`, the Oracle
+  family has no `RELEASE`), and savepoint names are validated as identifiers
+  because they land in the SQL text.
 - Wire-protocol drivers (no ODBC needed): `System.Data.MySql`,
   `System.Data.Postgres` (native `pq` driver bundle under `drivers/`),
   `System.Data.SqlServer` (TDS), `System.Data.Sqlite` (embedded),

@@ -1,0 +1,129 @@
+using System;
+using System.Data;
+
+namespace System.Data.Orm;
+
+// 事务内的**保存点**（savepoint）：在一条事务里划出可回滚的子段。
+//
+// ## 为什么需要它
+//
+// 事务只有"全提交 / 全回滚"两档：一次业务做十件事，第 9 件失败了，前 8 件
+// 只能跟着回滚——可前 8 件是**已经做完、也不打算撤销**的（比如记一条审计
+// 日志）。没有保存点就只能把它们拆到事务外写，原子性也就没了。
+//
+// ## 三条语句
+//
+// - 建立：`SAVEPOINT n`
+// - 回滚到：`ROLLBACK TO [SAVEPOINT] n`——**保存点本身仍然活着**，可以再回滚
+// - 释放：`RELEASE [SAVEPOINT] n`——销毁这个保存点，之后不能再回滚到它
+//
+// ## 方言差异（各家不是一套写法）
+//
+// - **标准族**（SQLite / MySQL / MariaDB / PostgreSQL / Kingbase /
+//   OpenGauss / DuckDB / ODBC）：三条齐全。
+// - **SQL Server**：`SAVE TRANSACTION n` / `ROLLBACK TRANSACTION n`，而且
+//   **没有 RELEASE**——保存点随事务结束一起消失。
+// - **Oracle 家族**（Oracle / 达梦 / Firebird）：只有 SAVEPOINT 与
+//   ROLLBACK TO，没有 RELEASE。
+// - **不支持事务的后端**（ClickHouse / QuestDB / TDengine）：直接抛错，
+//   而不是发一句必然失败的 SQL 让服务端报一句费解的错。
+//
+// 后两族的"释放"只做**本地记账**（把它从我们的账本上划掉）：服务端那个
+// 保存点还在，但 API 不再允许回滚到它，对调用方来说语义等价。
+//
+// ## 名字必须自己校验
+//
+// 保存点名会**直接进 SQL 文本**，所以名字只能是合法标识符
+// （字母/下划线开头，后接字母/数字/下划线）——不能让调用方拼出注入。
+public class Savepoint {
+    // 方言种类。
+    public static int Standard    = 0;  // SAVEPOINT / ROLLBACK TO SAVEPOINT / RELEASE SAVEPOINT
+    public static int SqlServer   = 1;  // SAVE TRANSACTION / ROLLBACK TRANSACTION（无 RELEASE）
+    public static int OracleLike  = 2;  // SAVEPOINT / ROLLBACK TO SAVEPOINT（无 RELEASE）
+    public static int Unsupported = 3;  // 没有事务，更没有保存点
+
+    // 该后端属于哪套方言。
+    public static int Dialect(int p) {
+        if (p == DbProvider.SQLite || p == DbProvider.MySQL
+            || p == DbProvider.MariaDB || p == DbProvider.PostgreSQL
+            || p == DbProvider.Kingbase || p == DbProvider.OpenGauss
+            || p == DbProvider.DuckDB || p == DbProvider.ODBC) {
+            return Savepoint.Standard;
+        }
+        if (p == DbProvider.SqlServer) {
+            return Savepoint.SqlServer;
+        }
+        if (p == DbProvider.Oracle || p == DbProvider.DM
+            || p == DbProvider.Firebird) {
+            return Savepoint.OracleLike;
+        }
+        return Savepoint.Unsupported;
+    }
+
+    // 该后端支不支持保存点。
+    public static bool Supported(int p) {
+        return Savepoint.Dialect(p) != Savepoint.Unsupported;
+    }
+
+    // 校验并返回保存点名。名字会进 SQL 文本，所以只放行合法标识符。
+    public static string Name(string name) {
+        if (name == null || name.Length == 0) {
+            throw new Exception("保存点名不能为空");
+        }
+        if (name.Length > 63) {
+            throw new Exception("保存点名过长（最多 63 字符）：" + name.Length + " 字符");
+        }
+        char first = name[0];
+        bool head = (first >= 'a' && first <= 'z') || (first >= 'A' && first <= 'Z')
+                 || first == '_';
+        if (!head) {
+            throw new Exception("保存点名必须以字母或下划线开头：" + name);
+        }
+        for (int i = 1; i < name.Length; i = i + 1) {
+            char c = name[i];
+            bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+                   || (c >= '0' && c <= '9') || c == '_';
+            if (!ok) {
+                throw new Exception("保存点名只能含字母、数字与下划线：" + name);
+            }
+        }
+        return name;
+    }
+
+    // 建立保存点的 SQL。
+    public static string CreateSql(int p, string n) {
+        int d = Savepoint.Dialect(p);
+        if (d == Savepoint.Unsupported) {
+            throw new Exception("该后端不支持保存点（provider=" + Convert.ToString(p) + "）");
+        }
+        if (d == Savepoint.SqlServer) {
+            return "SAVE TRANSACTION " + n;
+        }
+        return "SAVEPOINT " + n;
+    }
+
+    // 回滚到保存点的 SQL。
+    public static string RollbackSql(int p, string n) {
+        int d = Savepoint.Dialect(p);
+        if (d == Savepoint.Unsupported) {
+            throw new Exception("该后端不支持保存点（provider=" + Convert.ToString(p) + "）");
+        }
+        if (d == Savepoint.SqlServer) {
+            return "ROLLBACK TRANSACTION " + n;
+        }
+        return "ROLLBACK TO SAVEPOINT " + n;
+    }
+
+    // 释放保存点的 SQL；返回空串表示**该后端没有释放语句**，调用方只做
+    // 本地记账（见文件头的说明）。
+    public static string ReleaseSql(int p, string n) {
+        int d = Savepoint.Dialect(p);
+        if (d == Savepoint.Unsupported) {
+            throw new Exception("该后端不支持保存点（provider=" + Convert.ToString(p) + "）");
+        }
+        if (d == Savepoint.Standard) {
+            return "RELEASE SAVEPOINT " + n;
+        }
+        return "";
+    }
+}
