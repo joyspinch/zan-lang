@@ -88,8 +88,18 @@
 - 根因落点：① `src/runtime/rt_decimal.c` 除法 scale 策略；② checker 算术实参 decimal 提升 + irgen 转换 lowering；③ irgen 打印分派缺 decimal 分支。
 - 探针：`_scratch/csaudit/numeric/{p07,p08,p13}`。
 
-### [ ] A512 字符串解析失败/溢出静默返 0 继续执行
-- `Convert.ToInt32("abc")`、`int.Parse("abc")`、`Convert.ToDouble("xyz")` 全返 0 继续；`"2147483648"` 溢出静默接受（还借 A510 打出 64 位值）。C#：FormatException/OverflowException。
+### [~] A512 字符串解析失败/溢出静默返 0 继续执行
+- **宿主侧已修（2026-10-23，软诊断口径）**：`int.Parse`/`double.Parse`/
+  `Convert.ToInt32/64/ToInt/ToDouble` 的字符串路径全部补 endptr 失败检查
+  （没消费任何字符 / 残留非空白字符 / null 串 / int 范围溢出 / double inf
+  溢出）→ `emit_runtime_check` 软诊断（stderr 一次 + file:line）+ 安全值 0
+  继续；`--strict-runtime` exit 70。null 串先 guard（曾 strtoll(null) 直接
+  UB）。失败语义与 TryParse 对齐。
+- 探针复验：p11 五条失败形状全点名；正例 42/123/2.5/3.25/2147483647 与
+  TryParse true/77、false/0 全对。
+- 待办：可 catch 的 FormatException/OverflowException 通道（A507 族）；
+  自举半边。
+- 原始实测：`Convert.ToInt32("abc")`、`int.Parse("abc")`、`Convert.ToDouble("xyz")` 全返 0 继续；`"2147483648"` 溢出静默接受（还借 A510 打出 64 位值）。C#：FormatException/OverflowException。
 - `int.TryParse` 存在且正常——失败语义应与它对齐或补异常通道。
 - 根因落点：同 A507（runtime 无异常通道，Convert/Parse 失败分支返 0）。
 - 探针：`_scratch/csaudit/numeric/p11_convert_fail.zan`。
@@ -1316,3 +1326,12 @@
   `irgen_stmt.c` 两条都修，conformance `arc_throw_owned_ctor_arg`）。
 - 坑出处：结构体没有析构这件事，被类路径"对象析构顺带释放字段"盖住了——
   同一个形状换个载体就漏，测的时候必须把类与结构体分开测。
+
+### [ ] A529 内建静态调用结果上的链式成员解析失败（checker）
+- 实测：`Five().ToString()`（自定义静态方法）正常；`int.Parse("123").ToString()`、
+  `Convert.ToInt32("42").ToString()` 报 "this call could not be resolved to any
+  callable"——buitin/Parse 型调用的结果作为接收者再取成员时 checker 解析不了。
+- 根因落点：checker 的成员访问解析对「实参已是内建 lowering 的静态调用」没有
+  类型可挂（`int.Parse` 的返回类型在 checker 侧没有符号化），成员链断在第一步。
+  避开写法：先存局部变量再 `.ToString()`（迁移手册注记）。
+- 探针：`_scratch/csaudit/numeric/{v_chain,v_chain2}.zan`（隔离复验：前者过、后者挂）。

@@ -743,6 +743,41 @@ static bool math_require_numeric(zan_irgen_t *g, zan_ast_node_t *expr,
                   "Math.%s requires an int or floating-point argument", name);
     return false;
 }
+
+/* A512：解析型转换的失败检查帮手（TASKS.md）。X.Parse 曾用 NULL endptr
+ * 直落 strtoll/strtod——"abc" 返 0 静默继续，"2147483648" 溢出静默接受。
+ * 失败语义与 TryParse 对齐：软诊断（stderr 一次 + file:line）+ 安全值 0，
+ * --strict-runtime 下 exit 70。 */
+static LLVMValueRef emit_parse_bad_pred(zan_irgen_t *g, LLVMValueRef s,
+                                        LLVMValueRef ep) {
+    if (!g->runtime_checks || !g->current_fn)
+        return LLVMConstInt(LLVMInt1TypeInContext(g->ctx), 0, 0);
+    LLVMTypeRef i8 = LLVMInt8TypeInContext(g->ctx);
+    LLVMValueRef ep_null = zan_icmp(g->builder, LLVMIntEQ, ep,
+        LLVMConstNull(LLVMTypeOf(ep)), "parse.epnull");
+    LLVMValueRef empty = zan_irgen_intern_string(g, "");
+    LLVMValueRef ep_safe = LLVMBuildSelect(g->builder, ep_null,
+        empty, ep, "parse.epsafe");
+    LLVMValueRef ch = LLVMBuildLoad2(g->builder, i8, ep_safe, "parse.c");
+    LLVMValueRef trailing = zan_icmp(g->builder, LLVMIntNE, ch,
+        LLVMConstInt(i8, 0, 0), "parse.trail");
+    LLVMValueRef none = zan_icmp(g->builder, LLVMIntEQ, ep, s,
+        "parse.none");
+    LLVMValueRef b1 = LLVMBuildOr(g->builder, ep_null, trailing, "parse.b1");
+    return LLVMBuildOr(g->builder, b1, none, "parse.bad");
+}
+
+/* null 串进 strtoll 是 UB：先 guard（软诊断 + 空串替身） */
+static LLVMValueRef emit_parse_str_guard(zan_irgen_t *g, LLVMValueRef s,
+                                         zan_loc_t loc) {
+    if (!g->runtime_checks || !g->current_fn) return s;
+    LLVMValueRef isnull = zan_icmp(g->builder, LLVMIntEQ, s,
+        LLVMConstNull(LLVMTypeOf(s)), "parse.snull");
+    emit_runtime_check(g, isnull, loc,
+        "null string passed to a parse function");
+    return LLVMBuildSelect(g->builder, isnull,
+        zan_irgen_intern_string(g, ""), s, "parse.ssafe");
+}
 static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
         local_scope_t *locals) {
         if (expr->call.callee && expr->call.callee->kind == AST_IDENTIFIER &&
@@ -1730,8 +1765,18 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                     (LLVMTypeRef[]){ i8ptr, LLVMPointerType(i8ptr, 0) }, 2, 0);
                 LLVMValueRef f = LLVMGetNamedFunction(g->mod, "zan_rt_dbl_parse");
                 if (!f) f = LLVMAddFunction(g->mod, "zan_rt_dbl_parse", strtod_ty);
+                /* A512：失败/残留 → 软诊断 + 安全值 0（曾静默返 0 继续执行） */
+                LLVMValueRef endp = emit_entry_alloca(g, i8ptr, "todbl.endp");
+                LLVMBuildStore(g->builder, LLVMConstNull(i8ptr), endp);
+                LLVMValueRef s_safe = emit_parse_str_guard(g, arg, expr->loc);
                 LLVMValueRef r = zan_call2(g->builder, strtod_ty, f,
-                    (LLVMValueRef[]){ arg, LLVMConstNull(LLVMPointerType(i8ptr, 0)) }, 2, "todbl");
+                    (LLVMValueRef[]){ s_safe, endp }, 2, "todbl");
+                LLVMValueRef ep = LLVMBuildLoad2(g->builder, i8ptr, endp, "todbl.ep");
+                LLVMValueRef bad = emit_parse_bad_pred(g, s_safe, ep);
+                emit_runtime_check(g, bad, expr->loc,
+                    "Convert.ToDouble: input is not a valid number");
+                r = LLVMBuildSelect(g->builder, bad,
+                    LLVMConstReal(dbl, 0.0), r, "todbl.safe");
                 emit_release_owned_call_temp(g, expr->call.args.items[0], arg, locals);
                 return r;
             }
@@ -1758,8 +1803,7 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                            (rn.len == 6 && memcmp(rn.str, "Single", 6) == 0);
             if ((int_recv || dbl_recv) &&
                 pm.len == 5 && memcmp(pm.str, "Parse", 5) == 0 &&
-                expr->call.args.count == 1) {
-                LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+                expr->call.args.count == 1) {                LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
                 LLVMTypeRef i8pp = LLVMPointerType(i8ptr, 0);
                 LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
                 LLVMTypeRef dbl = LLVMDoubleTypeInContext(g->ctx);
@@ -1778,16 +1822,53 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                     LLVMTypeRef strtoll_ty = LLVMFunctionType(i64,
                         (LLVMTypeRef[]){ i8ptr, i8pp, i32t }, 3, 0);
                     LLVMValueRef f = get_libc_fn(g, "strtoll", strtoll_ty);
+                    LLVMValueRef endp = emit_entry_alloca(g, i8ptr, "parse.endp");
+                    LLVMBuildStore(g->builder, LLVMConstNull(i8ptr), endp);
+                    LLVMValueRef s_safe = emit_parse_str_guard(g, s, expr->loc);
                     r = zan_call2(g->builder, strtoll_ty, f,
-                        (LLVMValueRef[]){ s, LLVMConstNull(i8pp),
+                        (LLVMValueRef[]){ s_safe, endp,
                                           LLVMConstInt(i32t, 10, 0) }, 3, "parse");
+                    LLVMValueRef ep = LLVMBuildLoad2(g->builder, i8ptr, endp, "parse.ep");
+                    LLVMValueRef bad = emit_parse_bad_pred(g, s_safe, ep);
+                    /* C# int.Parse 超出 int 范围抛 OverflowException：
+                     * strtoll 会静默吃下 64 位值，这里同样判坏。 */
+                    LLVMValueRef over = LLVMBuildOr(g->builder,
+                        zan_icmp(g->builder, LLVMIntSLT, r,
+                            LLVMConstInt(i64, (int64_t)INT32_MIN, 0), "parse.lo"),
+                        zan_icmp(g->builder, LLVMIntSGT, r,
+                            LLVMConstInt(i64, INT32_MAX, 0), "parse.hi"),
+                        "parse.over");
+                    bad = LLVMBuildOr(g->builder, bad, over, "parse.bad2");
+                    emit_runtime_check(g, bad, expr->loc,
+                        "int.Parse: input is not a valid integer (or out of range)");
+                    r = LLVMBuildSelect(g->builder, bad,
+                        LLVMConstInt(i64, 0, 0), r, "parse.safe");
                 } else {
                     LLVMTypeRef strtod_ty = LLVMFunctionType(dbl,
                         (LLVMTypeRef[]){ i8ptr, i8pp }, 2, 0);
                     LLVMValueRef f = LLVMGetNamedFunction(g->mod, "zan_rt_dbl_parse");
                     if (!f) f = LLVMAddFunction(g->mod, "zan_rt_dbl_parse", strtod_ty);
+                    LLVMValueRef endp = emit_entry_alloca(g, i8ptr, "parse.endp");
+                    LLVMBuildStore(g->builder, LLVMConstNull(i8ptr), endp);
+                    LLVMValueRef s_safe = emit_parse_str_guard(g, s, expr->loc);
                     r = zan_call2(g->builder, strtod_ty, f,
-                        (LLVMValueRef[]){ s, LLVMConstNull(i8pp) }, 2, "parse");
+                        (LLVMValueRef[]){ s_safe, endp }, 2, "parse");
+                    LLVMValueRef ep = LLVMBuildLoad2(g->builder, i8ptr, endp, "parse.ep");
+                    LLVMValueRef bad = emit_parse_bad_pred(g, s_safe, ep);
+                    /* C# double.Parse 溢出抛 OverflowException：strtod 返
+                     * ±HUGE_VAL（inf），判坏返 0。 */
+                    LLVMTypeRef fabs_ty = LLVMFunctionType(dbl,
+                        (LLVMTypeRef[]){ dbl }, 1, 0);
+                    LLVMValueRef av = zan_call2(g->builder, fabs_ty,
+                        get_libc_fn(g, "fabs", fabs_ty), &r, 1, "parse.fabs");
+                    LLVMValueRef isinf = LLVMBuildFCmp(g->builder,
+                        LLVMRealOEQ, av,
+                        LLVMConstReal(dbl, 1.7976931348623157e308 * 2.0), "parse.inf");
+                    bad = LLVMBuildOr(g->builder, bad, isinf, "parse.bad2");
+                    emit_runtime_check(g, bad, expr->loc,
+                        "double.Parse: input is not a valid number (or out of range)");
+                    r = LLVMBuildSelect(g->builder, bad,
+                        LLVMConstReal(dbl, 0.0), r, "parse.safe");
                 }
                 emit_release_owned_call_temp(g, expr->call.args.items[0], s, locals);
                 return r;
@@ -1995,16 +2076,37 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                         LLVMTypeKind ak = LLVMGetTypeKind(LLVMTypeOf(arg));
                         LLVMValueRef parsed;
                         if (ak == LLVMPointerTypeKind) {
-                            /* 字符串转 64 位有符号整数 (strtoll 规避 atoi 的 32 位截断) */
+                            /* 字符串转 64 位有符号整数 (strtoll 规避 atoi 的 32 位截断)；
+                             * A512：失败/残留/溢 int 范围 → 软诊断 + 安全值 0 */
                             LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
                             LLVMTypeRef i8pp = LLVMPointerType(i8ptr, 0);
                             LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
                             LLVMTypeRef strtoll_ty = LLVMFunctionType(i64t,
                                 (LLVMTypeRef[]){ i8ptr, i8pp, i32t }, 3, 0);
                             LLVMValueRef f = get_libc_fn(g, "strtoll", strtoll_ty);
+                            LLVMValueRef endp = emit_entry_alloca(g, i8ptr, "toint.endp");
+                            LLVMBuildStore(g->builder, LLVMConstNull(i8ptr), endp);
+                            LLVMValueRef s_safe = emit_parse_str_guard(g, arg, expr->loc);
                             parsed = zan_call2(g->builder, strtoll_ty, f,
-                                (LLVMValueRef[]){ arg, LLVMConstNull(i8pp),
+                                (LLVMValueRef[]){ s_safe, endp,
                                                   LLVMConstInt(i32t, 10, 0) }, 3, "toint");
+                            LLVMValueRef ep = LLVMBuildLoad2(g->builder, i8ptr,
+                                endp, "toint.ep");
+                            LLVMValueRef bad = emit_parse_bad_pred(g, s_safe, ep);
+                            if (method_name.str[6] != '4') {
+                                /* ToInt32/ToInt：C# 超出 int 范围抛 OverflowException */
+                                bad = LLVMBuildOr(g->builder, bad, LLVMBuildOr(
+                                    g->builder,
+                                    zan_icmp(g->builder, LLVMIntSLT, parsed,
+                                        LLVMConstInt(i64t, (int64_t)INT32_MIN, 0), "toint.lo"),
+                                    zan_icmp(g->builder, LLVMIntSGT, parsed,
+                                        LLVMConstInt(i64t, INT32_MAX, 0), "toint.hi"),
+                                    "toint.over"), "toint.bad2");
+                            }
+                            emit_runtime_check(g, bad, expr->loc,
+                                "Convert.ToInt*: input is not a valid integer (or out of range)");
+                            parsed = LLVMBuildSelect(g->builder, bad,
+                                LLVMConstInt(i64t, 0, 0), parsed, "toint.safe");
                         } else if (ak == LLVMDoubleTypeKind || ak == LLVMFloatTypeKind) {
                             /* C# Convert.ToInt32(double) 是舍入到最近（银行家），
                              * 不是截断——先 rint 再转整（曾 ToInt32(3.9)=3，
