@@ -2500,6 +2500,20 @@ server-dev-standards；数据建模见 data-modeling；SQL 细则见 server-db-d
   失效、空态提示居中、图标过大、注释报错上各咬一次——**四条都不报明确
   的错**，只能靠"点一下看有没有反应"和读报错行号反推。
 
+### 服务端新端点必须标 Perm 位（服务端沉淀）
+
+- **未标注 Perm 的受控 action 一律拒绝授权**：框架启动时打
+  `[rbac] N 个受控 action 未标注 Perm，已拒绝授权: …`；请求期的判定是
+  `AuthUser.Allow → PermTable.RolesAllow(roleIds, action)`——未标注的
+  action 位为 0，普通角色**一律被拒**，只有超级管理员（roleIds="*"）
+  用得着。所以"接口写完了、用超管跑通了"**不等于**"普通账号能用"。
+- **读标 View、写标 Update/Create/Delete**：与既有 API 控制器一致
+  （`[Custom(Perm = PermBit.View)]` / `PermBit.Update`）。新增的屏还要
+  管理员在「系统管理 → 角色」里显式授权出去，存量部署不会自动补。
+- 坑出处：一次给桌面端加多维表格与智能体端点时漏标 Perm——用超级管理员
+  冒烟全绿，客户端换普通账号登录后整页"加载失败"，看起来像接口根本没
+  实现。
+
 ## 四、经验沉淀纪律（skill 的准入标准）
 
 - 沉淀的是**通用可落地的规则**：动作 + 理由 + 适用边界。三样缺一的
