@@ -1744,6 +1744,63 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
             return LLVMBuildFDiv(g->builder, r, scale, "rdig");
         }
 
+        /* char 的静态类（A525）：char.IsDigit('5') 等。谓词走 <ctype.h>
+         * （ASCII 口径；非 ASCII 字符与 C# 的 Unicode 类目有偏差）。 */
+        if (expr->call.callee && expr->call.callee->kind == AST_MEMBER_ACCESS &&
+            expr->call.callee->member.object->kind == AST_IDENTIFIER &&
+            !local_find(locals, expr->call.callee->member.object->ident.name) &&
+            expr->call.args.count == 1) {
+            zan_istr_t cn = expr->call.callee->member.object->ident.name;
+            int char_cls = (cn.len == 4 &&
+                            (memcmp(cn.str, "char", 4) == 0 ||
+                             memcmp(cn.str, "Char", 4) == 0));
+            if (char_cls) {
+                zan_istr_t cm = expr->call.callee->member.name;
+                static const struct { const char *name; const char *libc; } preds[] = {
+                    { "IsDigit", "isdigit" }, { "IsLetter", "isalpha" },
+                    { "IsLetterOrDigit", "isalnum" }, { "IsUpper", "isupper" },
+                    { "IsLower", "islower" }, { "IsWhiteSpace", "isspace" },
+                };
+                static const struct { const char *name; const char *libc; } mappers[] = {
+                    { "ToUpper", "toupper" }, { "ToLower", "tolower" },
+                };
+                LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
+                LLVMValueRef arg = emit_expr(g, expr->call.args.items[0], locals);
+                LLVMTypeRef aty = LLVMFunctionType(i32t,
+                    (LLVMTypeRef[]){ i32t }, 1, 0);
+                LLVMValueRef cp = arg;
+                if (LLVMGetTypeKind(LLVMTypeOf(arg)) == LLVMIntegerTypeKind &&
+                    LLVMGetIntTypeWidth(LLVMTypeOf(arg)) > 32)
+                    cp = LLVMBuildTrunc(g->builder, arg, i32t, "ch.cp32");
+                for (size_t pi = 0; pi < sizeof(preds) / sizeof(preds[0]); pi++) {
+                    size_t nl = strlen(preds[pi].name);
+                    if (cm.len != (int)nl || memcmp(cm.str, preds[pi].name, nl) != 0)
+                        continue;
+                    LLVMValueRef r = zan_call2(g->builder, aty,
+                        get_libc_fn(g, preds[pi].libc, aty), &cp, 1, "ch.pred");
+                    LLVMValueRef nz = zan_icmp(g->builder, LLVMIntNE, r,
+                        LLVMConstInt(i32t, 0, 0), "ch.nz");
+                    emit_release_owned_call_temp(g, expr->call.args.items[0],
+                                                 arg, locals);
+                    return nz;
+                }
+                for (size_t mi = 0; mi < sizeof(mappers) / sizeof(mappers[0]); mi++) {
+                    size_t nl = strlen(mappers[mi].name);
+                    if (cm.len != (int)nl || memcmp(cm.str, mappers[mi].name, nl) != 0)
+                        continue;
+                    LLVMValueRef r = zan_call2(g->builder, aty,
+                        get_libc_fn(g, mappers[mi].libc, aty), &cp, 1, "ch.map");
+                    if (LLVMGetTypeKind(LLVMTypeOf(arg)) == LLVMIntegerTypeKind &&
+                        LLVMGetIntTypeWidth(LLVMTypeOf(arg)) > 32)
+                        r = LLVMBuildSExt(g->builder, r, LLVMTypeOf(arg), "ch.map.w");
+                    emit_release_owned_call_temp(g, expr->call.args.items[0],
+                                                 arg, locals);
+                    return r;
+                }
+                /* 未命中的 char.* 成员落回通用路径（会得到相应的未解析诊断） */
+            }
+        }
+
         /* Convert.ToDouble(x) */
         if (!zan_type_defines(g, "Convert", "ToDouble") &&
             is_call_to(expr, "Convert", "ToDouble") && expr->call.args.count == 1) {

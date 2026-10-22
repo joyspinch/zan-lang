@@ -102,6 +102,19 @@ static const zan_builtin_member_t members_stringcls[] = {
     { "CompareOrdinal",   'M', "int CompareOrdinal(string a, string b)" },
 };
 
+/* char 的静态类（System.Char）：A525 补的 API 面。谓词走 <ctype.h>
+ * （ASCII 口径，非 ASCII 与 C# 的 Unicode 类目有偏差，TASKS.md 有注）。 */
+static const zan_builtin_member_t members_charcls[] = {
+    { "IsDigit",         'M', "bool IsDigit(char c)" },
+    { "IsLetter",        'M', "bool IsLetter(char c)" },
+    { "IsLetterOrDigit", 'M', "bool IsLetterOrDigit(char c)" },
+    { "IsUpper",         'M', "bool IsUpper(char c)" },
+    { "IsLower",         'M', "bool IsLower(char c)" },
+    { "IsWhiteSpace",    'M', "bool IsWhiteSpace(char c)" },
+    { "ToUpper",         'M', "char ToUpper(char c)" },
+    { "ToLower",         'M', "char ToLower(char c)" },
+};
+
 static const zan_builtin_member_t members_file[] = {
     { "Exists",        'M', "bool Exists(string path)" },
     { "ReadAllText",   'M', "string ReadAllText(string path)" },
@@ -361,6 +374,7 @@ static const zan_builtin_type_t builtin_types[] = {
     BT("Math", "Math", "Math", 1, members_math),
     BT("Convert", "Convert", "Convert", 1, members_convert),
     BT("String", "String", "String", 1, members_stringcls),
+    BT("Char", "Char", "char", 1, members_charcls),
     BT("File", "File", "File", 1, members_file),
     BT("Directory", "Directory", "Directory", 1, members_dir),
     BT("Path", "Path", "Path", 1, members_path),
@@ -457,7 +471,7 @@ int zan_builtin_member_params(const char *type, const char *name, int name_len,
 const char *zan_builtin_member_result(const char *type, const char *name,
                                       int name_len) {
     static const char *results[] = {
-        "string", "int", "long", "double", "bool", "void", "nint",
+        "string", "int", "long", "double", "bool", "void", "nint", "char",
         "List<string>", "List<K>", "List<V>", "ConsoleColor", "T[]",
         "Vector128", "Vector256",
     };

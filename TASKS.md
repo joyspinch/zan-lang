@@ -204,7 +204,23 @@
 - 方向：先补 SPEC 口径声明（廉价）；C# 口径需引入 UTF-16 语义或 per-codepoint API——独立战线。
 - 探针：`_scratch/csaudit/string/p07_index.zan`。
 
-### [ ] A525 API 面小缺口族（编译期显性暴露，迁移时需改写）
+### [~] A525 API 面小缺口族（编译期显性暴露，迁移时需改写）
+- **宿主侧已补一件（2026-10-23）**：char 静态类（`char.IsDigit/IsLetter/
+  IsLetterOrDigit/IsUpper/IsLower/IsWhiteSpace/ToUpper/ToLower`）——照
+  String 静态类的既有路径实现：builtin_api.c 新增 BT("Char") 静态表 +
+  `zan_builtin_member_result` 结果名补 "char"；irgen 侧
+  `builtin_static_class_for("char")→"Char"` + 发射分派（谓词/映射走
+  <ctype.h>，ASCII 口径——非 ASCII 与 C# 的 Unicode 类目有偏差，已知）。
+  踩坑：irgen 的 string 实例方法启发式（Substring/ToString/Trim/Replace/
+  ToUpper/ToLower 按名先吞）会抢走 char 静态成员——char/Char 接收者跳过
+  该启发式。
+- 复验：8 成员全对（谓词 true/false、ToUpper→A/ToLower→z、var/定类型/
+  拼接/条件全路径 char 渲染）；string 实例方法回归 ABC/abc/3、
+  `c.IsDigit()` 实例调用仍正确拒绝。
+- 探针：`_scratch/csaudit/string/v_charcls{,2,4,5}.zan`。
+- 待办：其余件（StringSplitOptions、格式串、operator++、multicast、
+  Array 静态类、Count 属性化、object== 引用比较、foreach-Dict 形状）
+  按需求频度逐个；自举半边。
 - 无 `StringSplitOptions`（Split 单参）；无 char 静态类（IsDigit/ToUpper）；`double.ToString("F2")` 无格式串；`"a"+null` 字面量拒绝（string null 变量可拼）；无 operator++/--（自定义类型）；`new` 隐藏修饰符解析拒绝（隐藏语义本身正确）；委托无 multicast（`d+=h` 拒绝、诊断已指路 UiEvent/List 替代）；无 Array 静态类（Sort/CopyTo）；Stack/Queue/HashSet 的 Count 是方法非属性；object==string 按值比较（C# 引用比较，引用同一性不可表达）。
 - foreach-over-Dict 枚举变量是键 K 而非 KeyValuePair（取值需再 `d[k]`）；Dict 保插入序（比 C# 强的保证，未声明）。
 - 特点：全部编译期显性（除 object== 与 foreach-dict 形状），不产生静默错值；按需求频度逐个补。

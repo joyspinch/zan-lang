@@ -1536,6 +1536,7 @@ static zan_type_t *builtin_member_result_type(zan_irgen_t *g, zan_type_t *rt,
  * a member of the static String class, not of the instance string type. */
 static const char *builtin_static_class_for(const char *name) {
     if (strcmp(name, "string") == 0) return "String";
+    if (strcmp(name, "char") == 0) return "Char";
     return NULL;
 }
 
@@ -1986,12 +1987,20 @@ static zan_type_t *infer_expr_type_raw(zan_irgen_t *g, zan_ast_node_t *e,
                 zan_type_t *bot = infer_expr_type(g, callee->member.object, locals);
                 if (bot && bot->kind == TYPE_ARRAY) return g->binder->type_string;
             }
-            if ((mm.len == 9 && memcmp(mm.str, "Substring", 9) == 0) ||
+            /* string 实例方法启发式——char/Char 的静态类（char.ToUpper 等，
+             * A525）成员名与之相撞（ToUpper/ToLower），先跳过让它落到
+             * 下面的静态内建分支按 Char 表解析。 */
+            int recv_is_char_cls = callee->member.object->kind == AST_IDENTIFIER &&
+                callee->member.object->ident.name.len == 4 &&
+                (memcmp(callee->member.object->ident.name.str, "char", 4) == 0 ||
+                 memcmp(callee->member.object->ident.name.str, "Char", 4) == 0);
+            if (!recv_is_char_cls &&
+                ((mm.len == 9 && memcmp(mm.str, "Substring", 9) == 0) ||
                 (mm.len == 8 && memcmp(mm.str, "ToString", 8) == 0) ||
                 (mm.len == 4 && memcmp(mm.str, "Trim", 4) == 0) ||
                 (mm.len == 7 && memcmp(mm.str, "Replace", 7) == 0) ||
                 (mm.len == 7 && memcmp(mm.str, "ToUpper", 7) == 0) ||
-                (mm.len == 7 && memcmp(mm.str, "ToLower", 7) == 0))
+                (mm.len == 7 && memcmp(mm.str, "ToLower", 7) == 0)))
                 return g->binder->type_string;
             if (mm.len == 5 && memcmp(mm.str, "Split", 5) == 0) {
                 zan_type_t *ot = infer_expr_type(g, callee->member.object, locals);
@@ -2062,6 +2071,7 @@ static zan_type_t *infer_expr_type_raw(zan_irgen_t *g, zan_ast_node_t *e,
                         if (strcmp(res, "long") == 0) return g->binder->type_long;
                         if (strcmp(res, "double") == 0) return g->binder->type_double;
                         if (strcmp(res, "bool") == 0) return g->binder->type_bool;
+                        if (strcmp(res, "char") == 0) return g->binder->type_char;
                         if (strcmp(res, "List<string>") == 0)
                             return zan_binder_make_list_type(g->binder,
                                                              g->binder->type_string);
