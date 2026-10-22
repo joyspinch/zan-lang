@@ -1,0 +1,179 @@
+using System;
+using System.Data.Orm;
+using System.Json;
+using System.Web;
+using ZanWeb.Model.Oa;
+using ZanWeb.Model;
+
+namespace ZanWeb.Api;
+
+/* 桌面客户端通知接口（gui-wechat）：管理端通知中心（/admin/oa/notifies 一族）
+   走后台会话 + 页面渲染，桌面端持 Bearer 令牌只吃 JSON，故在 sys_notify
+   的归属域（Oa）另开一组同源端点：
+     GET  /api/notify/items   通知列表（分页 + 只看未读 + 业务域筛选）
+     GET  /api/notify/unread  铃铛数据源（未读数 + 最近若干条未读）
+     POST /api/notify/read    标记已读（id=0 为全部）
+     POST /api/notify/mute    免打扰开关（按业务模块）
+   口径：
+     - 读写两侧同补 tenantId 闸（与管理端一致，防跨租户死信泄漏）；
+     - 可见范围只限「本人收件」，不开他人通知的读口；
+     - 正文原样取 sys_notify——业务语义在写入侧收口（Flow Engine →
+       Notify.Send），读面不二次解释；
+     - 免打扰只落 sys_notify_pref，判定在发送侧（Notify.Muted）。 */
+[Route("api/notify/[action]")]
+[Custom(Authorization = CustomAuthorization.ApiAuth)]
+[Description("通知")]
+public class NotifyApi : ApiController {
+
+    /* 通知列表：按 id 倒序（新在前）。筛选用 WhereIf：条件不成立时
+       片段与参数都不落到 SQL——避免把可选条件写成 OR 分支。 */
+    [HttpGet]
+    [Description("通知列表")]
+    [Custom(Perm = PermBit.View)]
+    async void Items() {
+        SysUser me = await this.Me();
+        ListQuery q = this.Paged("id", 20);
+        string module = this.In("module");
+        bool onlyUnread = this.InInt("unread", 0) > 0;
+        int uid = me.id;
+        List<SysNotify> rows = await this.SysNotify
+            .Where(a => a.tenantId == Tenant.Cur() && a.userId == uid)
+            .WhereIf(onlyUnread, a => a.isRead == 0)
+            .WhereIf(module.Length > 0, a => a.module == module)
+            .OrderByDescending(a => a.id)
+            .Skip(q.Skip()).Take(q.Limit()).ToListAsync();
+        int total = await this.SysNotify
+            .Where(a => a.tenantId == Tenant.Cur() && a.userId == uid)
+            .WhereIf(onlyUnread, a => a.isRead == 0)
+            .WhereIf(module.Length > 0, a => a.module == module)
+            .CountAsync();
+        int unread = await this.UnreadOf(uid);
+        JsonValue items = JsonValue.NewArray();
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            items.Append(NotifyApi.Shape(rows[i]));
+        }
+        JsonValue body = JsonValue.NewObject();
+        body.Put("total", JsonValue.NewStr(Convert.ToString(total)));
+        body.Put("unread", JsonValue.NewStr(Convert.ToString(unread)));
+        body.Put("items", items);
+        this.Ok(body.ToJson());
+    }
+
+    /* 铃铛数据源：未读数 + 最近 8 条未读。桌面端定时拉这个轻量端点
+       更新角标（实时通道未就位时，轮询兜底与 WxIm 的会话刷新同款）。 */
+    [HttpGet]
+    [Description("未读通知")]
+    [Custom(Perm = PermBit.View)]
+    async void Unread() {
+        SysUser me = await this.Me();
+        int uid = me.id;
+        List<SysNotify> rows = await this.SysNotify
+            .Where(a => a.tenantId == Tenant.Cur() && a.userId == uid
+                && a.isRead == 0)
+            .OrderByDescending(a => a.id).Take(8).ToListAsync();
+        int total = await this.UnreadOf(uid);
+        JsonValue items = JsonValue.NewArray();
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            items.Append(NotifyApi.Shape(rows[i]));
+        }
+        JsonValue body = JsonValue.NewObject();
+        body.Put("count", JsonValue.NewStr(Convert.ToString(total)));
+        body.Put("items", items);
+        this.Ok(body.ToJson());
+    }
+
+    /* 标记已读：id>0 标单条，id=0 标全部（本人 + 本租户双闸，
+       不影响他人的行，也不复活脏数据行）。 */
+    [HttpPost]
+    [Description("标记已读")]
+    [Custom(Perm = PermBit.Update)]
+    async void Read() {
+        SysUser me = await this.Me();
+        int id = this.InInt("id", 0);
+        int uid = me.id;
+        if (id > 0) {
+            int _n = await this.SysNotify.Update()
+                .Set(a => a.isRead, 1)
+                .Where(a => a.id == id && a.tenantId == Tenant.Cur()
+                    && a.userId == uid).ExecuteAffrowsAsync();
+        } else {
+            int _n = await this.SysNotify.Update()
+                .Set(a => a.isRead, 1)
+                .Where(a => a.tenantId == Tenant.Cur() && a.userId == uid)
+                .ExecuteAffrowsAsync();
+        }
+        int unread = await this.UnreadOf(uid);
+        JsonValue body = JsonValue.NewObject();
+        body.Put("ok", JsonValue.NewStr("1"));
+        body.Put("unread", JsonValue.NewStr(Convert.ToString(unread)));
+        this.Ok(body.ToJson());
+    }
+
+    /* 免打扰开关：按 module 逐个控制（一期暴露 flow）。行存在改 muted，
+       不存在插行——偏好是稀疏数据，查无即默认放行，无需预建全模块行。 */
+    [HttpPost]
+    [Description("免打扰开关")]
+    [Custom(Perm = PermBit.Update)]
+    async void Mute() {
+        SysUser me = await this.Me();
+        string module = Fmt.Text(this.In("module"), "flow");
+        int on = this.InInt("on", 0);
+        int uid = me.id;
+        long now = WebApp.NowSeconds();
+        SysNotifyPref pref = await this.SysNotifyPref
+            .Where(a => a.tenantId == Tenant.Cur() && a.userId == uid
+                && a.module == module).FirstAsync();
+        if (pref != null) {
+            int _u = await this.SysNotifyPref.Update()
+                .Set(a => a.muted, on)
+                .Set(a => a.updatedAt, now)
+                .Where(a => a.id == pref.id).ExecuteAffrowsAsync();
+        } else {
+            SysNotifyPref p = new SysNotifyPref();
+            p.tenantId = Tenant.Cur();
+            p.userId = uid;
+            p.module = module;
+            p.muted = on;
+            p.updatedAt = now;
+            int _i = await this.SysNotifyPref.Insert(p).ExecuteIdentityAsync();
+        }
+        JsonValue body = JsonValue.NewObject();
+        body.Put("ok", JsonValue.NewStr("1"));
+        body.Put("muted", JsonValue.NewStr(on == 1 ? "1" : "0"));
+        this.Ok(body.ToJson());
+    }
+
+    /* ---- helpers ---- */
+
+    /* 当前登录账号（ApiAuth 下 uid 必在；查不到即 401——token 版本失效等）。
+       与 FlowApi.Me 同款（基类无此件，各 Api 控制器自带）。 */
+    private async SysUser Me() {
+        SysUser me = await this.SysUser
+            .Where(a => a.id == Filter.ToInt(this.uid, 0)).FirstAsync();
+        if (me == null || me.status != 1) {
+            this.Fail(401, "1001", "账号不可用，请重新登录");
+        }
+        return me;
+    }
+
+    /* 未读数（铃铛角标数据源；读写两侧同补租户闸）。 */
+    private async int UnreadOf(int uid) {
+        return await this.SysNotify
+            .Where(a => a.tenantId == Tenant.Cur() && a.userId == uid
+                && a.isRead == 0).CountAsync();
+    }
+
+    /* 行装组：{id,module,kind,title,content,link,unread,at}。 */
+    private static JsonValue Shape(SysNotify n) {
+        JsonValue o = JsonValue.NewObject();
+        o.Put("id", JsonValue.NewStr(Convert.ToString(n.id)));
+        o.Put("module", JsonValue.NewStr(n.module));
+        o.Put("kind", JsonValue.NewStr(n.kind));
+        o.Put("title", JsonValue.NewStr(n.title));
+        o.Put("content", JsonValue.NewStr(n.content));
+        o.Put("link", JsonValue.NewStr(n.link));
+        o.Put("unread", JsonValue.NewStr(n.isRead == 0 ? "1" : "0"));
+        o.Put("at", JsonValue.NewStr(Convert.ToString(n.createdAt)));
+        return o;
+    }
+}
