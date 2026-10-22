@@ -717,6 +717,18 @@ partial class CodeEditor {
         RenderAcPopup(app, area, lineH, textX, fontSize, focused, visLines);
 
         // ---- 光标所在调用的参数信息 ----
+        // 上一帧画出的重载箭头矩形先取一份快照：气泡可能在本帧已经
+        // 收起（焦点被别处抢走、补全弹窗打开），但用户点的是刚看见
+        // 的那个箭头，命中判定要用看见时的那份几何——和核心按上一帧
+        // 命中快照解析点击是同一个道理。
+        int arrowPrevX = this.sigPrevX;
+        int arrowPrevY = this.sigPrevY;
+        int arrowPrevW = this.sigPrevW;
+        int arrowPrevH = this.sigPrevH;
+        int arrowNextX = this.sigNextX;
+        int arrowNextY = this.sigNextY;
+        int arrowNextW = this.sigNextW;
+        int arrowNextH = this.sigNextH;
         RenderSigHelp(app, area, lineH, textX, fontSize, focused, visLines);
 
         // ---- 右键上下文菜单 ----
@@ -793,12 +805,21 @@ partial class CodeEditor {
 
         // ---- 按下左键：放置光标 / 开始拖选 ----
         // 点击落在自动补全弹窗上时跳过（松开时处理）。
+        // 弹窗有三块几何：候选列表、种类过滤条、右侧说明面板；
+        // 签名帮助还有一个气泡。漏掉哪一块，点它就穿透到文本区
+        // （光标跳行、浮层被顺带关掉）。
         bool overPopup = acActive && popShown > 0
             && app.mouseX >= popX && app.mouseX < popX + popW
             && app.mouseY >= popY && app.mouseY < popY + popH;
+        bool overDesc = acActive && descW > 0
+            && app.mouseX >= descX && app.mouseX < descX + descW
+            && app.mouseY >= descY && app.mouseY < descY + descH;
         bool overFilter = acActive && filtW > 0
             && app.mouseX >= filtX && app.mouseX < filtX + filtW
             && app.mouseY >= filtY && app.mouseY < filtY + filtH;
+        bool overSig = sigGW > 0
+            && app.mouseX >= sigGX && app.mouseX < sigGX + sigGW
+            && app.mouseY >= sigGY && app.mouseY < sigGY + sigGH;
         bool overCodeLens = false;
         for (int cli = 0; cli < codeLens.Count; cli = cli + 1) {
             CodeLensRef cl = codeLens[cli];
@@ -821,20 +842,25 @@ partial class CodeEditor {
                 app.RequestRedraw();
                 return id;
             }
+            // 点外部关闭：这次点击属于「关弹窗」这一个手势，不能
+            // 顺手落到文本区（光标跳行 + 选区被改写）。提前返回，
+            // 文本区的按下路径就不会再处理这次按下。
             refPopOpen = false;
             app.RequestRedraw();
+            return id;
         }
 
         // 签名条上的重载箭头（VS 的「◀ 2/3 ▶」）：点击即切换重载，
-        // 光标不动——箭头在浮层里，不在文本行上。
+        // 光标不动——箭头在浮层里，不在文本行上。命中用上一帧画出
+        // 的那份矩形（见上方快照），气泡本帧收起也照样认。
         if (app.EventKind() == 2 && app.window.EventButton() == 0 && ptrFree
-                && this.sigPrevW > 0) {
+                && arrowPrevW > 0) {
             int sigDelta = 0;
-            if (app.mouseX >= this.sigPrevX && app.mouseX < this.sigPrevX + this.sigPrevW
-                && app.mouseY >= this.sigPrevY && app.mouseY < this.sigPrevY + this.sigPrevH) {
+            if (app.mouseX >= arrowPrevX && app.mouseX < arrowPrevX + arrowPrevW
+                && app.mouseY >= arrowPrevY && app.mouseY < arrowPrevY + arrowPrevH) {
                 sigDelta = -1;
-            } else if (app.mouseX >= this.sigNextX && app.mouseX < this.sigNextX + this.sigNextW
-                && app.mouseY >= this.sigNextY && app.mouseY < this.sigNextY + this.sigNextH) {
+            } else if (app.mouseX >= arrowNextX && app.mouseX < arrowNextX + arrowNextW
+                && app.mouseY >= arrowNextY && app.mouseY < arrowNextY + arrowNextH) {
                 sigDelta = 1;
             }
             if (sigDelta != 0) {
@@ -851,7 +877,8 @@ partial class CodeEditor {
         int diagStripW = minimapW + scrollBarW;
         int diagStripX = area.x + area.width - diagStripW;
         if (app.EventKind() == 2 && app.window.EventButton() == 0 && ptrFree
-            && !ctxOpen && !overPopup && !overFilter && !overCodeLens
+            && !ctxOpen && !overPopup && !overDesc && !overFilter && !overCodeLens
+            && !overSig
             && app.mouseX >= diagStripX && app.mouseX < area.x + area.width
             && app.mouseY >= area.y && app.mouseY < area.y + area.height) {
             int dtotal = lines.Count;
@@ -887,7 +914,8 @@ partial class CodeEditor {
             return id;
         }
         if (app.EventKind() == 2 && app.window.EventButton() == 0 && ptrFree
-            && !ctxOpen && !overPopup && !overFilter && !overCodeLens) {
+            && !ctxOpen && !overPopup && !overDesc && !overFilter && !overCodeLens
+            && !overSig) {
             bool overText = app.mouseX >= area.x + gutterW && app.mouseX < diagStripX
                             && app.mouseY >= area.y && app.mouseY < area.y + area.height;
             if (overText) {
@@ -1724,6 +1752,9 @@ partial class CodeEditor {
             acActive = false;
             acDot = false;
         }
+        // 描述面板的命中矩形每帧重算：弹窗没开时清零，免得上一帧
+        // 的矩形继续被当成浮层区域（那时点它本该落在文本区）。
+        descW = 0;
         if (acActive && focused && acAllCandidates.Count > 0
             && LineTopY(curLine) >= 0) {
             int pRowY = LineTopY(curLine);
@@ -1930,6 +1961,10 @@ partial class CodeEditor {
 
                 c.FillRoundRect(dx + 2, dy + 2, dw, dh, app.Scale(4), pal.shadowSoft);
                 c.SurfaceRoundRect(dx, dy, dw, dh, app.Scale(4), pal.panelBg, pal.border, 1);
+                // 落库命中矩形：描述面板在列表本体之外，命中判定
+                // 必须把它算作弹窗的一部分，否则点它会穿透到文本区
+                // （光标跳行、补全弹窗被顺带关掉）。
+                descX = dx; descY = dy; descW = dw; descH = dh;
                 int ty = dy + dpad;
                 for (int sl = 0; sl < siglines.Count; sl = sl + 1) {
                     c.DrawText(dx + dpad, ty, siglines[sl], pal.signature, fontSize);
@@ -1960,6 +1995,17 @@ partial class CodeEditor {
     // 光标行的一次从右到左扫描加一次记忆化签名查找。
     void RenderSigHelp(App app, Rect area, int lineH, int textX, int fontSize,
                        bool focused, int visLines) {
+        // 气泡本体的命中矩形每帧重算：不画的时候清零，免得上一帧
+        // 的矩形继续被当成浮层区域（那时点它本该落在文本区）。
+        sigGW = 0;
+        // 两个重载箭头的矩形另有一层讲究：被别的浮层盖住时必须清
+        // （补全弹窗打开后旧箭头会把点击整个吞掉）；只是焦点不在
+        // 时不清——焦点可能被别处抢走，此时气泡确实不再绘制，但
+        // 用户刚看见的那个箭头仍要点得动。
+        if (acActive || ctxOpen || refPopOpen) {
+            sigPrevW = 0;
+            sigNextW = 0;
+        }
         if (acActive || !focused || ctxOpen || refPopOpen) { return; }
         if (LineTopY(curLine) < 0) { return; }
         // 声明不是调用：输入其自身参数列表不应
@@ -2052,6 +2098,10 @@ partial class CodeEditor {
         c.FillRoundRect(px + 2, py + 2, boxW, boxH, app.Scale(4), pal.shadowSoft);
         c.SurfaceRoundRect(px, py, boxW, boxH, app.Scale(4), pal.popupBg,
             pal.border, 1);
+        // 落库命中矩形：气泡画在光标行上方、直接压着文本，命中
+        // 判定必须把它算作浮层的一部分，否则点气泡正文会穿透到
+        // 文本区（光标跳行、签名帮助随之消失）。
+        sigGX = px; sigGY = py; sigGW = boxW; sigGH = boxH;
 
         // 活动参数用强调色，签名其余部分用柔和的签名色，长实参列表保持可读。
         List<int> span = new List<int>();

@@ -1,0 +1,212 @@
+using System;
+using Gui;
+using Gui.Widget;
+
+// 浮层点击穿透回归（核心防线 + 保留模式的 Modal/Drawer）。
+//
+// 1. 「按外部关闭」的浮层在**按下帧**关掉自己，遮罩随之不在该帧的
+//    命中快照里；同一次手势的释放若照常解析成点击目标，就会点穿到
+//    下层控件（下拉/菜单/抽屉/layer 的「点击穿透」）。
+//    核心防线两件套：pressOnBlocker 必须认「按下命中的区域就是遮罩」
+//    （AnchorAt 不跳过 wtype==-1 的区域，按在遮罩上 hitId 是遮罩自己
+//    的 id，旧的 `hitId < 0` 判据恒为假），且 Ui.Clicked 必须拒绝
+//    投递这次释放。
+// 2. 保留模式（声明式）的 Modal/Drawer 遮罩此前只画不拦：点遮罩的
+//    点击原样落到下层按钮。遮罩必须同时注册命中阻挡区。
+// 3. 防线不粘滞：之后的普通点击照常触发。
+class OverlayPenetrationCoreTest {
+    static int fails;
+
+    // ---- 核心防线用（真实窗口 App）----
+    static App app;
+    static Button underBtn;
+    static int underClicks;
+    static bool maskOn;
+    static bool claimOnPress;
+
+    static void True(string what, bool got) {
+        if (got) {
+            Console.WriteLine(what + "=1");
+            return;
+        }
+        fails = fails + 1;
+        Console.WriteLine(what + "=0");
+        Console.WriteLine("FAIL " + what);
+    }
+
+    static void EqInt(string what, int got, int want) {
+        if (got == want) {
+            Console.WriteLine(what + "=1");
+            return;
+        }
+        fails = fails + 1;
+        Console.WriteLine(what + "=0");
+        Console.WriteLine("FAIL " + what + ": got "
+            + Convert.ToString(got) + " want " + Convert.ToString(want));
+    }
+
+    // 帧体只画内容：BeginFrame/PresentFrame 由 FrameGuarded 完成。
+    static void Body() {
+        int id = underBtn.Render(app, 40, 40, 120);
+        if (Ui.Clicked(app, id)) { underClicks = underClicks + 1; }
+        // 浮层仍在：铺全窗遮罩。
+        if (maskOn) { app.BlockHitsBelow(); }
+        // 「按外部关闭」的标准手势：认领这次点击并关掉浮层。
+        if (claimOnPress && app.EventKind() == 2) { app.ClaimClick(); }
+    }
+
+    static void PumpAndFrame() {
+        app.PumpGuarded();
+        app.FrameGuarded(OverlayPenetrationCoreTest.Body);
+    }
+
+    static void MoveTo(int x, int y) {
+        app.window.InjectEvent(1, x, y, 0, 0, 0);
+        OverlayPenetrationCoreTest.PumpAndFrame();
+    }
+
+    static void Press(int x, int y) {
+        app.window.InjectEvent(2, x, y, 0, 0, 0);
+        OverlayPenetrationCoreTest.PumpAndFrame();
+    }
+
+    static void Release(int x, int y) {
+        app.window.InjectEvent(3, x, y, 0, 0, 0);
+        OverlayPenetrationCoreTest.PumpAndFrame();
+    }
+
+    // 核心防线：浮层开着 → 按下下层按钮 → 浮层在按下帧关闭 → 松手。
+    static void CoreBarrier() {
+        app = new App("overlay-core-penetrate", 400, 300);
+        app.Show();
+        app.RequestAnimationFrame(16);
+        underBtn = new Button("Under");
+        underClicks = 0;
+        app.mouseX = 300;
+        app.mouseY = 250;
+
+        // 基线帧：控件注册进快照。
+        OverlayPenetrationCoreTest.MoveTo(300, 250);
+
+        // 浮层开着（遮罩进快照）→ 遮罩在按下帧缺席（浮层此刻关闭）
+        // → 按下落在下层按钮上 → 松手。
+        maskOn = true;
+        OverlayPenetrationCoreTest.MoveTo(300, 250);
+        claimOnPress = true;
+        maskOn = false;
+        OverlayPenetrationCoreTest.Press(60, 55);
+        OverlayPenetrationCoreTest.Release(60, 55);
+        EqInt("coreReleaseAfterPressUnderOverlayNoFire",
+              underClicks, 0);
+
+        // 浮层仍在时按下+松手：同样不得穿透。
+        maskOn = true;
+        claimOnPress = false;
+        OverlayPenetrationCoreTest.MoveTo(300, 250);
+        OverlayPenetrationCoreTest.Press(60, 55);
+        OverlayPenetrationCoreTest.Release(60, 55);
+        EqInt("corePressReleaseUnderOpenOverlayNoFire",
+              underClicks, 0);
+
+        // 防线不粘滞：之后的普通点击照常触发。
+        maskOn = false;
+        OverlayPenetrationCoreTest.MoveTo(60, 55);
+        OverlayPenetrationCoreTest.Press(60, 55);
+        OverlayPenetrationCoreTest.Release(60, 55);
+        EqInt("coreNormalClickAfterBarrierStillFires", underClicks, 1);
+    }
+
+    // ---- 保留模式的 Modal / Drawer（离屏 Form）----
+    static Form form;
+    static App off;
+    static Button formBtn;
+    static int formClicks;
+    static Button modalBtn;
+    static int modalClicks;
+
+    static void OffFrame() {
+        off.BeginOffscreenFrame();
+        form.RenderFrame(off);
+        off.EndOffscreenFrame();
+        off.DrainPosts();
+    }
+
+    static void OffInput(int kind, int x, int y) {
+        off.BeginOffscreenFrame();
+        off.ProcessOffscreenInput(kind, x, y, 0, 0, 0, 0);
+        form.RenderFrame(off);
+        off.EndOffscreenFrame();
+        // 离屏路径没有事件循环，控件的 Click 投递要自己排队执行。
+        off.DrainPosts();
+    }
+
+    static void RetainedMask() {
+        form = Form.CreateOffscreen("overlay-retained", 800, 600);
+        off = form.GetApp();
+        formBtn = new Button("Under");
+        formBtn.Click += () => { formClicks = formClicks + 1; };
+        formClicks = 0;
+        form.Add(formBtn);
+        // 按钮摆在左上角：模态/抽屉打开时它落在遮罩底下。
+        formBtn.Float(40, 40);
+        formBtn.Width(120);
+        formBtn.Height(32);
+        OverlayPenetrationCoreTest.OffFrame();
+        // 表单有标题栏偏移，按钮的实际矩形要排版后才准。
+        int bx = formBtn.bx + 8;
+        int by = formBtn.by + 8;
+
+        // ---- Modal：遮罩必须挡住下层按钮 ----
+        Modal modal = Modal.Create("edit");
+        modal.Width(500);
+        modalBtn = new Button("Ok");
+        modalBtn.Click += () => { modalClicks = modalClicks + 1; };
+        modal.Box().With(modalBtn);
+        form.Add(modal);
+        modal.Show();
+        OverlayPenetrationCoreTest.OffFrame();
+
+        // 点遮罩（按钮所在处）：下层按钮不得被触发。
+        OverlayPenetrationCoreTest.OffInput(2, bx, by);
+        OverlayPenetrationCoreTest.OffInput(3, bx, by);
+        EqInt("modalMaskBlocksContentBelow", formClicks, 0);
+
+        // 模态自己的按钮仍可点。
+        int mbx = modalBtn.bx + 8;
+        int mby = modalBtn.by + 8;
+        OverlayPenetrationCoreTest.OffInput(2, mbx, mby);
+        OverlayPenetrationCoreTest.OffInput(3, mbx, mby);
+        EqInt("modalOwnButtonStillClickable", modalClicks, 1);
+
+        modal.Hide();
+        OverlayPenetrationCoreTest.OffFrame();
+
+        // ---- Drawer：遮罩必须挡住下层按钮 ----
+        Drawer drawer = Drawer.Create("side");
+        drawer.Placement("right");
+        drawer.Width(300);
+        form.Add(drawer);
+        drawer.Show();
+        OverlayPenetrationCoreTest.OffFrame();
+
+        OverlayPenetrationCoreTest.OffInput(2, bx, by);
+        OverlayPenetrationCoreTest.OffInput(3, bx, by);
+        EqInt("drawerMaskBlocksContentBelow", formClicks, 0);
+
+        drawer.Hide();
+        OverlayPenetrationCoreTest.OffFrame();
+
+        // 遮罩撤掉后，普通点击照常触发下层按钮（防线不粘滞）。
+        OverlayPenetrationCoreTest.OffInput(2, bx, by);
+        OverlayPenetrationCoreTest.OffInput(3, bx, by);
+        EqInt("retainedNormalClickAfterMaskRemoved", formClicks, 1);
+    }
+
+    static void Main() {
+        fails = 0;
+        OverlayPenetrationCoreTest.CoreBarrier();
+        OverlayPenetrationCoreTest.RetainedMask();
+        Console.WriteLine(fails == 0 ? "OVERLAY PENETRATION CORE PASS"
+            : "OVERLAY PENETRATION CORE FAIL " + Convert.ToString(fails));
+    }
+}

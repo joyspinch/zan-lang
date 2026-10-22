@@ -3565,6 +3565,22 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_overlay_penetrate${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
+  # 浮层点击穿透核心回归（用户报告“所有 GUI 组件的下拉框/弹出层/抽屉/
+  # 右键菜单都会穿透到下层”）：(1) 核心防线——pressOnBlocker 必须认
+  # “按下命中的区域就是遮罩”（AnchorAt 不跳过 wtype==-1 的区域，按在
+  # 遮罩上 hitId 是遮罩自己的 id，旧的 `hitId < 0` 判据恒为假），且
+  # Ui.Clicked 必须拒绝投递这次释放：浮层在按下帧关掉自己后，同一次
+  # 手势的释放不得点穿到下层控件；(2) 保留模式的 Modal/Drawer 遮罩
+  # 此前只画不拦，遮罩上的点击原样落到下层按钮。
+  add_test(NAME conformance_gui_overlay_penetration_core
+    COMMAND ${CMAKE_COMMAND}
+      -DZANC=$<TARGET_FILE:zanc>
+      -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/overlay_penetration_core_test.zan
+      "-DZANC_ARGS=--auto-stdlib${_gui_driver_tail}"
+      -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_overlay_penetration_core.out
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_overlay_penetration_core${_exe_ext}
+      -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+
   # ScrollView 拖拽重锚定回归（用户报告“滚动条滚动时界面卡死/页面自
   # 己跑”）：拖拽期间内容高度变化（自动量高、图片加载）时旧锚点公式
   # off = dragOffset0 + dyPix*mo/travel 用新 mo 配旧锚点 —— 按住不动
