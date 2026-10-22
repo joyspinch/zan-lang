@@ -1822,13 +1822,12 @@ partial class Irgen {
     // pop the innermost handler and longjmp into its try (the exception
     // object/tid globals already hold the in-flight exception).
     void EmitRaise() {
-        if (curAsync) {
-            // the longjmp may skip suspended coroutine frames: persist this
-            // frame's locals (the handler reloads them) and release/free the
-            // frames the jump bypasses (stops at the first armed handler).
-            EmitAsyncSaveSlots();
-            L("  call void @__zan_async_unwind(i8* %fp)");
-        }
+        // The exception never crosses a coroutine frame: a coroutine that
+        // has no handler for it puts the exception into its frame and the
+        // awaiter re-throws it in its own context (the C host does the
+        // same, irgen_async.c: emit_async_exc_epilogue). So there is no
+        // cross-frame unwind here any more -- walking the awaiter chain
+        // would free frames that are still alive.
         string sp = NT();
         L("  " + sp + " = load i64, i64* @__exc_sp");
         string sp1 = NT();
@@ -1934,7 +1933,9 @@ partial class Irgen {
         finBodies.Add(s.c);
         finLive.Add(1);
         Label(ltry);
+        if (curAsync) { asyncTryLbl.Add(lcatch); }
         GenStmt(s.a);
+        if (curAsync) { asyncTryLbl.RemoveAt(asyncTryLbl.Count - 1); }
         if (!term) {
             EmitExcPop();
             if (curAsync) { EmitAsyncHcAdd(-1); }
@@ -1953,12 +1954,13 @@ partial class Irgen {
         // the throw popped this try's EH frame on its way here
         finLive[mark] = 0;
         if (curAsync) {
-            // disarm, then reload frame-resident locals: if the throw crossed
-            // a suspension this invocation's stack allocas are stale -- the
-            // frame (saved at try entry, every suspension and every async
-            // throw) is the authoritative copy.
+            // disarm. The locals are NOT reloaded from the frame here: the
+            // handler is always reached in the invocation that is running
+            // now (a suspension re-arms it, see EmitAsyncRearm), so the
+            // stack slots hold the current values -- reloading would
+            // overwrite an assignment made after the last suspension with
+            // the frame's older copy.
             EmitAsyncHcAdd(-1);
-            EmitAsyncReloadSlots();
         }
         // handler already popped by throw; dispatch to the first clause whose
         // type matches the thrown tid (walking the base chain), rethrowing to

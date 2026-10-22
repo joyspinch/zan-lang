@@ -2606,3 +2606,49 @@ kernel32、shell32、user32、advapi32、version）。
 - 通用教训：**生成器里的"当前临时表"是隐式状态**：每进入一个独立的作用域
   （lambda 体、委托体、嵌套块）就要成对地保存-重置-恢复，不能只靠"我记得
   这里要重置"。
+## 136. 协程的异常：异常不跨帧，处理器要重新武装
+
+- 坑（2026-10-22 实测）：`try { await X(); } catch (E e) { }` 在自举里
+  直接崩（退出码 0xC0000028），宿主正常输出 "caught boom / done"。
+  这一个症状底下叠了**五个**独立的缺陷，逐个拆：
+  1. **longjmp 打进已返回的 invocation**：try 的 setjmp 装在挂起前那次
+     调用上，那次调用早已返回，栈是死的。宿主不这么干：它在**每次 resume
+     入口**重新武装处理器（`src/compiler/irgen_async.c` 的
+     `emit_async_eh_prologue`），挂起时把 EH 深度还原（`emit_async_eh_unarm`），
+     于是 longjmp 落点永远在当前还活着的帧里。
+  2. **异常不能跨帧**：协程自己没有处理者时，把异常放进**帧**里（宿主：
+     `ASYNC_FRAME_EXC`），awaiter 恢复时在自己的上下文里**重抛**。自举原来
+     让异常一路 longjmp 穿过挂起的帧 → 必死。
+  3. **`_setjmp` 声明缺 `returns_twice`**：longjmp 回来后，跨 setjmp 存活的
+     SSA 值在 caller-saved 寄存器里就是垃圾。宿主给 `_setjmp` 挂了
+     `returns_twice`（`irgen_builtins.c: add_enum_attr`），自举没挂。
+  4. **catch 路径不能从帧里 reload 局部变量**：挂起点之后赋的新值只在栈上，
+     帧里是旧副本；reload 会把新值覆盖掉（探针里 `tag = "t"` 变空）。
+     宿主没有这个问题，因为它的 async 局部变量**就住在帧里**
+     （`emit_async_finalize_slots` 把 alloca 换成帧槽地址）。
+  5. **async 方法的 `return` 不跑 finally**：`try { return X; } finally { Y; }`
+     在 async 里 Y 从不执行 → 锁没释放 → 下一个 await 永远等不到 →
+     调度器空转退出（表现为"输出到一半就没了"，退出码还是 0）。
+     非 async 的 return 路径有 `EmitExitFins(0)`，async 的 `GenAsyncReturn`
+     漏了。
+- 做法（自举侧）：
+  - 帧头加两个槽：11=exc_val、12=exc_tid（异常带着走）。
+  - resume 入口装**蹦床**处理器（协程的最后一道防线）：异常从蹦床落地时
+    写进帧、释放帧持有的引用、唤醒 awaiter。
+  - 每个挂起点：还原 EH 深度到本次 resume 的起点（蹦床也随之失效）。
+  - 每个恢复点：把**词法上包围该点**的 try 处理器**重新武装**（外层在前，
+    内层在栈顶），恢复点因此 longjmp 得到的是当前帧里的活蹦床。
+  - await 恢复后检查被等待帧的 exc 槽，非空就在 awaiter 自己的上下文重抛。
+  - `_setjmp` 声明加 `#0` + `attributes #0 = { returns_twice }`。
+  - async 的 `return` 补上 `EmitExitFins(0)`。
+- 验证：p_ae（跨协程）/ p_ae2（同协程、嵌套 try、finally、逃逸异常）两个
+  探针与宿主**逐字一致**；`async_generic_method`、`zandb_async_errors`、
+  `async_struct_return` 三个用例过门。
+- 通用教训：**"异常传播"是三件事**：异常对象去哪、处理器在哪、跳转落点是否
+  还活着。少做一件就表现为"随机崩溃"，而不是"catch 没接住"。
+- 通用教训：**挂起会杀死调用帧**。任何"在帧上装了状态"的东西（setjmp、
+  栈上的局部、锁）都要问一句：帧回来时它还在吗？宿主用"帧住在堆上 + 每次
+  resume 重新武装"回答；自举照抄了这个答案。
+- 通用教训：**finally 是语义的一部分，不是善后**。漏跑 finally 的表现往往
+  不是"少做一件事"，而是"后面某处永远等不到"——症状离病因十万八千里。
+  定位这类问题要先怀疑"资源没释放"，再去查释放点。

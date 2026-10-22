@@ -57,6 +57,88 @@ partial class Irgen {
         L("  " + p + " = getelementptr i64, i64* " + bp + ", i64 " + idx);
         return p;
     }
+    // ---- the coroutine's exception plumbing ----
+    //
+    // The exception-handler stack (@__exc_sp / @__exc_stack / @__exc_bufs)
+    // is global, but a handler may only be longjmp-ed into while the
+    // invocation that armed it is still on the stack: a coroutine that
+    // suspends kills its invocation, and a longjmp into that dead frame
+    // is what made `try { await X(); } catch` die with 0xC0000028.
+    //
+    // The C host solves this the same way (src/compiler/irgen_async.c:
+    // emit_async_eh_prologue / emit_async_eh_unarm): every resume
+    // invocation
+    //   - remembers the handler-stack depth it started at,
+    //   - arms a trampoline handler on top of it. The trampoline is the
+    //     coroutine's last resort: an exception that no try block of the
+    //     coroutine catches leaves the coroutine through the frame (the
+    //     awaiter re-throws it in its own context),
+    //   - restores the depth when it suspends, so the next coroutine
+    //     starts from a clean stack.
+    // A try block inside the coroutine arms its handler above the
+    // trampoline. After a suspension that handler has to be armed again:
+    // the setjmp that armed it ran in an invocation whose stack is dead.
+    void EmitAsyncEhPrologue() {
+        string ed = NT();
+        L("  " + ed + " = alloca i64");
+        string sp0 = NT(); L("  " + sp0 + " = load i64, i64* @__exc_sp");
+        L("  store i64 " + sp0 + ", i64* " + ed);
+        asyncEhDepth = ed;
+        string sp = NT(); L("  " + sp + " = load i64, i64* @__exc_sp");
+        string bufe = NT(); L("  " + bufe + " = getelementptr [64 x [32 x i64]], [64 x [32 x i64]]* @__exc_bufs, i64 0, i64 " + sp);
+        string bufp = NT(); L("  " + bufp + " = bitcast [32 x i64]* " + bufe + " to i8*");
+        string slot = NT(); L("  " + slot + " = getelementptr [64 x i8*], [64 x i8*]* @__exc_stack, i64 0, i64 " + sp);
+        L("  store i8* " + bufp + ", i8** " + slot);
+        string sp1 = NT(); L("  " + sp1 + " = add i64 " + sp + ", 1");
+        L("  store i64 " + sp1 + ", i64* @__exc_sp");
+        string fp = NT(); L("  " + fp + " = call i8* @llvm.frameaddress.p0(i32 0)");
+        string r = NT(); L("  " + r + " = call i32 @_setjmp(i8* " + bufp + ", i8* " + fp + ")");
+        string c = NT(); L("  " + c + " = icmp ne i32 " + r + ", 0");
+        int ltr = NL();
+        L("  br i1 " + c + ", label %L" + ltr + ", label %co.pre");
+        asyncTrampLbl = ltr;
+        L("co.pre:");
+        term = false; curLbl = "co.pre";
+    }
+    // The invocation suspends: drop every handler it armed (the trampoline
+    // included) so the next coroutine starts from a clean stack. The
+    // handlers are armed again when the coroutine resumes.
+    void EmitAsyncSuspend() {
+        if (!curAsync) { return; }
+        if (asyncEhDepth == "") { return; }
+        string edv = NT(); L("  " + edv + " = load i64, i64* " + asyncEhDepth);
+        L("  store i64 " + edv + ", i64* @__exc_sp");
+    }
+    // Arm the handlers of the try blocks that enclose this point again.
+    // The setjmp that armed them ran in an invocation that has returned
+    // (the coroutine suspended inside the try body), so a longjmp into it
+    // would land in a dead frame.
+    void EmitAsyncRearm() {
+        if (!curAsync) { return; }
+        if (asyncEhDepth == "") { return; }
+        // only the trampoline stays armed; the try handlers are pushed again
+        string edv = NT(); L("  " + edv + " = load i64, i64* " + asyncEhDepth);
+        string ed1 = NT(); L("  " + ed1 + " = add i64 " + edv + ", 1");
+        L("  store i64 " + ed1 + ", i64* @__exc_sp");
+        int i = 0;
+        while (i < asyncTryLbl.Count) {
+            int lbl = asyncTryLbl[i];
+            string sp = NT(); L("  " + sp + " = load i64, i64* @__exc_sp");
+            string bufe = NT(); L("  " + bufe + " = getelementptr [64 x [32 x i64]], [64 x [32 x i64]]* @__exc_bufs, i64 0, i64 " + sp);
+            string bufp = NT(); L("  " + bufp + " = bitcast [32 x i64]* " + bufe + " to i8*");
+            string slot = NT(); L("  " + slot + " = getelementptr [64 x i8*], [64 x i8*]* @__exc_stack, i64 0, i64 " + sp);
+            L("  store i8* " + bufp + ", i8** " + slot);
+            string sp1 = NT(); L("  " + sp1 + " = add i64 " + sp + ", 1");
+            L("  store i64 " + sp1 + ", i64* @__exc_sp");
+            string fp = NT(); L("  " + fp + " = call i8* @llvm.frameaddress.p0(i32 0)");
+            string r = NT(); L("  " + r + " = call i32 @_setjmp(i8* " + bufp + ", i8* " + fp + ")");
+            string c = NT(); L("  " + c + " = icmp ne i32 " + r + ", 0");
+            int lnext = NL();
+            L("  br i1 " + c + ", label %L" + lbl + ", label %L" + lnext);
+            Label(lnext);
+            i = i + 1;
+        }
+    }
     // An async method called as a statement (fire-and-forget): the call itself
     // only allocates the frame -- the body runs from $resume. Hand the frame
     // to the cooperative scheduler, or the body never runs at all (the C host
@@ -517,10 +599,12 @@ partial class Irgen {
             EmitAsyncSaveSlots();
             L("  store i64 " + st + ", i64* " + FrameGep("%ff", 2));
             L("  call void @zan_co_delay(i64 " + ms + ", i8* %fp, void(i8*)* @" + curResumeSym + ")");
+            EmitAsyncSuspend();
             L("  ret void");
             L("resume_" + st + ":");
             term = false; curLbl = "resume_" + st;
             EmitAsyncReloadSlots();
+            EmitAsyncRearm();
             return new ExprVal("0", MkType("int"));
         }
         if (cn == "Gate" && mn == "Park") {
@@ -529,10 +613,12 @@ partial class Irgen {
             EmitAsyncSaveSlots();
             L("  store i64 " + st + ", i64* " + FrameGep("%ff", 2));
             L("  call void @zan_gate_park(i64 " + gh + ", i8* %fp, void(i8*)* @" + curResumeSym + ")");
+            EmitAsyncSuspend();
             L("  ret void");
             L("resume_" + st + ":");
             term = false; curLbl = "resume_" + st;
             EmitAsyncReloadSlots();
+            EmitAsyncRearm();
             return new ExprVal("0", MkType("int"));
         }
         if (mn == "ReadReady" || mn == "WriteReady") {
@@ -541,10 +627,12 @@ partial class Irgen {
             EmitAsyncSaveSlots();
             L("  store i64 " + st + ", i64* " + FrameGep("%ff", 2));
             L("  call void @zan_io_wait_co(i64 " + fd + ", i32 " + interest + ", i8* %fp, void(i8*)* @" + curResumeSym + ")");
+            EmitAsyncSuspend();
             L("  ret void");
             L("resume_" + st + ":");
             term = false; curLbl = "resume_" + st;
             EmitAsyncReloadSlots();
+            EmitAsyncRearm();
             return new ExprVal("0", MkType("int"));
         }
         if (mn == "RecvOv") {
@@ -560,10 +648,12 @@ partial class Irgen {
             EmitAsyncSaveSlots();
             L("  store i64 " + st + ", i64* " + FrameGep("%ff", 2));
             L("  call void @zan_io_recv_co(i64 " + fd + ", i8* " + buf + ", i32 " + len32 + ", i8* %fp, void(i8*)* @" + curResumeSym + ", i64* " + outn + ")");
+            EmitAsyncSuspend();
             L("  ret void");
             L("resume_" + st + ":");
             term = false; curLbl = "resume_" + st;
             EmitAsyncReloadSlots();
+            EmitAsyncRearm();
             string rs = FrameGep("%ff", 6);
             string rv = NT(); L("  " + rv + " = load i64, i64* " + rs);
             return new ExprVal(rv, MkType("int"));
@@ -585,10 +675,12 @@ partial class Irgen {
             EmitAsyncSaveSlots();
             L("  store i64 " + st + ", i64* " + FrameGep("%ff", 2));
             L("  call void @zan_io_recv_to_co(i64 " + fd + ", i8* " + buf + ", i32 " + len32 + ", i64 " + tmo + ", i8* %fp, void(i8*)* @" + curResumeSym + ", i64* " + outn + ")");
+            EmitAsyncSuspend();
             L("  ret void");
             L("resume_" + st + ":");
             term = false; curLbl = "resume_" + st;
             EmitAsyncReloadSlots();
+            EmitAsyncRearm();
             string rs = FrameGep("%ff", 6);
             string rv = NT(); L("  " + rv + " = load i64, i64* " + rs);
             return new ExprVal(rv, MkType("int"));
@@ -600,10 +692,12 @@ partial class Irgen {
             EmitAsyncSaveSlots();
             L("  store i64 " + st + ", i64* " + FrameGep("%ff", 2));
             L("  call void @zan_io_accept_co(i64 " + fd2 + ", i8* %fp, void(i8*)* @" + curResumeSym + ", i64* " + outfd + ")");
+            EmitAsyncSuspend();
             L("  ret void");
             L("resume_" + st + ":");
             term = false; curLbl = "resume_" + st;
             EmitAsyncReloadSlots();
+            EmitAsyncRearm();
             string rs2 = FrameGep("%ff", 6);
             string rv2 = NT(); L("  " + rv2 + " = load i64, i64* " + rs2);
             return new ExprVal(rv2, MkType("int"));
@@ -632,10 +726,12 @@ partial class Irgen {
             EmitAsyncSaveSlots();
             L("  store i64 " + st + ", i64* " + FrameGep("%ff", 2));
             L("  call void @zan_io_resolve_sa_co(i8* " + nm + ", i32 " + port32 + ", i8* " + buf + ", i32 " + cap32 + ", i8* %fp, void(i8*)* @" + curResumeSym + ", i32* " + out32 + ")");
+            EmitAsyncSuspend();
             L("  ret void");
             L("resume_" + st + ":");
             term = false; curLbl = "resume_" + st;
             EmitAsyncReloadSlots();
+            EmitAsyncRearm();
             string rs = FrameGep("%ff", 6);
             string rs32 = NT(); L("  " + rs32 + " = bitcast i64* " + rs + " to i32*");
             string rv = NT(); L("  " + rv + " = load i32, i32* " + rs32);
@@ -655,10 +751,12 @@ partial class Irgen {
             EmitAsyncSaveSlots();
             L("  store i64 " + st + ", i64* " + FrameGep("%ff", 2));
             L("  call void @zan_io_resolve_co(i8* " + host + ", i8* %fp, void(i8*)* @" + curResumeSym + ", i32* " + out32 + ")");
+            EmitAsyncSuspend();
             L("  ret void");
             L("resume_" + st + ":");
             term = false; curLbl = "resume_" + st;
             EmitAsyncReloadSlots();
+            EmitAsyncRearm();
             string rs = FrameGep("%ff", 6);
             string rs32 = NT(); L("  " + rs32 + " = bitcast i64* " + rs + " to i32*");
             string rv = NT(); L("  " + rv + " = load i32, i32* " + rs32);
@@ -741,14 +839,20 @@ partial class Irgen {
             EmitAsyncSaveSlots();
             string stp = FrameGep("%ff", 2);
             L("  store i64 " + st + ", i64* " + stp);
+            EmitAsyncSuspend();
             L("  ret void");
             L("resume_" + st + ":");
             term = false; curLbl = "resume_" + st;
             EmitAsyncReloadSlots();
+            EmitAsyncRearm();
             string ssp2 = FrameGep("%ff", curSubBase + seq);
             string subi2 = NT(); L("  " + subi2 + " = load i64, i64* " + ssp2);
             string subh2 = NT(); L("  " + subh2 + " = inttoptr i64 " + subi2 + " to i64*");
             string fv = NT(); L("  " + fv + " = inttoptr i64 " + subi2 + " to i8*");
+            // the awaited coroutine may have failed: its exception is
+            // re-thrown HERE, in the awaiter's own context, where the
+            // awaiter's try blocks are armed again.
+            EmitAwaitCheckExc(subh2);
             string lt = MapType(resTy);
             if (lt == "void") {
                 L("  call void @__zan_co_frame_free(i8* " + fv + ")");
@@ -762,6 +866,8 @@ partial class Irgen {
         }
         L("  call void @zan_co_ready(i8* " + subv + ", void(i8*)* " + orfn + ")");
         L("  call void @zan_co_sched_run()");
+        // the awaited coroutine may have failed: re-throw its exception here
+        EmitAwaitCheckExc(subh);
         string lt2 = MapType(resTy);
         if (lt2 == "void") {
             L("  call void @__zan_co_frame_free(i8* " + subv + ")");
@@ -772,6 +878,26 @@ partial class Irgen {
         string rvv2 = FromI64(resi2, lt2);
         L("  call void @__zan_co_frame_free(i8* " + subv + ")");
         return new ExprVal(rvv2, resTy);
+    }
+    // The awaited coroutine may have failed: it left its exception in the
+    // frame. Re-throw it HERE, in the awaiter's own context, so the
+    // awaiter's try blocks can catch it (the C host does the same,
+    // irgen_async.c: emit_async_check_sub_exc).
+    void EmitAwaitCheckExc(string subh) {
+        string excp = FrameGep(subh, 11);
+        string excv = NT(); L("  " + excv + " = load i64, i64* " + excp);
+        string hasx = NT(); L("  " + hasx + " = icmp ne i64 " + excv + ", 0");
+        int lx = NL(); int lok = NL();
+        L("  br i1 " + hasx + ", label %L" + lx + ", label %L" + lok);
+        Label(lx);
+        string exp = NT(); L("  " + exp + " = inttoptr i64 " + excv + " to i8*");
+        L("  store i8* " + exp + ", i8** @__exc_val");
+        string tidp = FrameGep(subh, 12);
+        string tidv = NT(); L("  " + tidv + " = load i64, i64* " + tidp);
+        string tidp2 = NT(); L("  " + tidp2 + " = inttoptr i64 " + tidv + " to i8*");
+        L("  store i8* " + tidp2 + ", i8** @__exc_tid");
+        EmitRaise();
+        Label(lok);
     }
     // An await that does NOT suspend: the awaited value is already there (the
     // host awaits nothing and hands the value on) or the task handle was
@@ -805,6 +931,8 @@ partial class Irgen {
             fp = p;
         }
         EmitTaskWait(fp);
+        string fph = TaskFrameHeader(fp);
+        EmitAwaitCheckExc(fph);
         string lt = MapType(resTy);
         if (lt == "void") {
             L("  call void @__zan_co_frame_free(i8* " + fp + ")");
@@ -857,9 +985,16 @@ partial class Irgen {
             string lt = MapType(v.ty);
             string rv = v.op;
             EmitArcRetain(rv, v.ty);
+            // the finallys of the try statements this return leaves run
+            // BEFORE the locals are released: they may use them (and they
+            // release what the try held -- a lock, a file handle).
+            EmitExitFins(0);
+            if (term) { return; }
             EmitAsyncEpilogue();
             EmitAsyncComplete(ToI64(rv, lt));
         } else {
+            EmitExitFins(0);
+            if (term) { return; }
             EmitAsyncEpilogue();
             EmitAsyncComplete("0");
         }
@@ -983,9 +1118,10 @@ partial class Irgen {
         List<Node> ltypes = new List<Node>();
         if (m.d != null) { PrescanAsyncLocals(m.d, lnames, ltypes); }
         int awaitCount = 0; if (m.d != null) { awaitCount = CountAwaits(m.d); }
-        int header = 11;
+        int header = 13;
         // 0=sched 1=sched_step 2=state 3=done 4=awaiter 5=awaiter_step
         // 6=result 7=cleanup 8=hcount 9=own_resume 10=cancel
+        // 11=exc_val 12=exc_tid (the exception the coroutine carries out)
         int thisSlot = header;
         int paramBase = header + thisExtra;
         int localBase = paramBase + pn.Count;
@@ -1116,6 +1252,11 @@ partial class Irgen {
             }
             j = j + 1;
         }
+        // The coroutine's trampoline handler: it catches what no try block
+        // of the coroutine catches and lets the exception leave through the
+        // frame (the awaiter re-throws it in its own context).
+        asyncTryLbl = new List<int>();
+        EmitAsyncEhPrologue();
         string st = NT();
         L("  " + st + " = load i64, i64* " + FrameGep("%ff", 2));
         // A CANCELLED frame aborts at its next resume: the C host sets the
@@ -1139,6 +1280,22 @@ partial class Irgen {
         EmitAsyncReloadSlots();
         if (m.d != null) { GenStmt(m.d); }
         if (!term) { EmitAsyncEpilogue(); EmitAsyncComplete("0"); }
+        // the trampoline's landing: the exception leaves the coroutine
+        // through the frame -- the awaiter reads it and re-throws it in its
+        // own context, where its own try blocks can catch it.
+        Label(asyncTrampLbl);
+        {
+            string ev = NT(); L("  " + ev + " = load i8*, i8** @__exc_val");
+            string evi = NT(); L("  " + evi + " = ptrtoint i8* " + ev + " to i64");
+            L("  store i64 " + evi + ", i64* " + FrameGep("%ff", 11));
+            string et = NT(); L("  " + et + " = load i8*, i8** @__exc_tid");
+            string eti = NT(); L("  " + eti + " = ptrtoint i8* " + et + " to i64");
+            L("  store i64 " + eti + ", i64* " + FrameGep("%ff", 12));
+            L("  store i8* null, i8** @__exc_val");
+            L("  store i8* null, i8** @__exc_tid");
+            EmitAsyncEpilogue();
+            EmitAsyncComplete("0");
+        }
         // the cancelled path: the body does not run -- the frame releases what
         // it owns, marks itself done and wakes its awaiter. The frame itself
         // is NOT freed here: the awaiter reads the result and frees it.
