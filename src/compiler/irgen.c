@@ -284,6 +284,11 @@ static void di_set_loc(zan_irgen_t *g, zan_loc_t loc) {
     LLVMMetadataRef dl = LLVMDIBuilderCreateDebugLocation(
         g->ctx, line, loc.col, sp, NULL);
     LLVMSetCurrentDebugLocation2(g->builder, dl);
+    /* 记住这个位置：惰性构建的辅助函数会 di_clear 掉"当前"位置且不
+       恢复，之后同一表达式里的调用就没了 !dbg（LLVM 校验器直接拒绝
+       整个模块）。di_ensure_loc 靠它把位置补回去。 */
+    g->di_last_loc = dl;
+    g->di_last_loc_fn = g->current_fn;
 }
 
 static LLVMMetadataRef di_type_from_llvm(zan_irgen_t *g, LLVMTypeRef ty) {
@@ -867,6 +872,30 @@ static void emit_weak_runtime(zan_irgen_t *g);
 
 static zan_irgen_t *s_current_irgen = NULL;
 
+/* 补一个调试位置。
+   惰性构建的辅助函数（类的释放体、集合/数组的释放体……）会在用户
+   代码中间被建出来，入口 di_clear 把"当前"调试位置清掉后不恢复——
+   同一表达式里后面的调用就丢了 !dbg。LLVM 校验器对这种"带调试信息
+   的函数里位置缺失的调用"直接报
+     inlinable function call in a function with debug info must have a !dbg location
+   整个 -g 构建因此失败（Zan.Scripting 的 LuaValue.op_call 就是这么
+   把 IDE 的调试构建顶掉的）。
+   这里用最近一次设置过的位置补回去；只补在真正带调试信息的函数里
+   （运行时辅助函数没有 subprogram，塞位置反而会触发另一条校验），
+   而且只在该位置本就属于这个函数时才补。 */
+static void di_ensure_loc(LLVMBuilderRef b) {
+    zan_irgen_t *g = s_current_irgen;
+    if (!g || !g->emit_debug || !g->di_last_loc) return;
+    if (LLVMGetCurrentDebugLocation2(b)) return;
+    LLVMBasicBlockRef bb = LLVMGetInsertBlock(b);
+    if (!bb) return;
+    LLVMValueRef parent = LLVMGetBasicBlockParent(bb);
+    if (!parent) return;
+    if (g->di_last_loc_fn && g->di_last_loc_fn != parent) return;
+    if (!LLVMGetSubprogram(parent)) return;
+    LLVMSetCurrentDebugLocation2(b, g->di_last_loc);
+}
+
 static LLVMValueRef zan_hdr_is_string(zan_irgen_t *g, LLVMValueRef word,
                                      const char *nm) {
     LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
@@ -1056,6 +1085,7 @@ static LLVMValueRef arc_site_arg(zan_irgen_t *g, int site_idx) {
 
 static LLVMValueRef zan_call2(LLVMBuilderRef b, LLVMTypeRef ty, LLVMValueRef fn,
                               LLVMValueRef *args, unsigned n, const char *nm) {
+    di_ensure_loc(b);
     LLVMValueRef callee = fn;
     if (fn && LLVMIsAFunction(fn) && LLVMGlobalGetValueType(fn) != ty) {
         fn = LLVMConstBitCast(fn, LLVMPointerType(ty, 0));

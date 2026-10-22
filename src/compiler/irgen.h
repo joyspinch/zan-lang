@@ -624,6 +624,14 @@ struct zan_irgen {
     int              di_file_cap;
     uint32_t         di_cur_line;
     uint32_t         di_cur_file;
+    /* 最近一次设置过的调试位置（di_clear 只清"当前"位置，不动这两个）。
+       惰性构建的辅助函数——类的释放体、集合/数组的释放体——会在用户
+       代码中间被建出来，入口 di_clear 把当前位置清掉后不恢复，于是同
+       一表达式里后面的调用就丢了 !dbg。di_ensure_loc 用它把位置补回
+       去；di_last_loc_fn 记着这个位置属于哪个函数，免得挪到别的函数
+       里去（那会触发 LLVM 另一条校验）。 */
+    LLVMMetadataRef  di_last_loc;
+    LLVMValueRef     di_last_loc_fn;
 
     /* ARC 语句控制流作用域嵌套深度 */
     int arc_stmt_depth;
