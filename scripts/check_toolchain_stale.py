@@ -13,6 +13,17 @@ per-platform build there.
 Staleness is decided by git history, not mtimes: an artifact is stale when a
 source it is built from has a newer last commit.
 
+The "runtime" group is decided by OWNERSHIP, not by dates (see ci_legs below):
+the date rule cannot be the gate for an artifact a CI leg rebuilds, because a
+rebuild that comes out byte-identical (a comment-only source edit) leaves the
+tree unchanged, so the artifact keeps its old commit date forever and the rule
+would report it stale for good -- and because the check job checks out the push
+while the refresh leg commits afterwards, the race is structural. What is
+decidable from the repository alone is: does a CI leg rebuild this artifact,
+and do that leg's trigger paths cover every source the artifact is built from?
+That is the same "four sets must agree" rule the recipes, the commit lists and
+the trigger paths already have to satisfy (TASKS.md A504).
+
     python3 scripts/check_toolchain_stale.py
 
 Exits non-zero when anything is stale. Rebuild on the target platform
@@ -24,6 +35,7 @@ actually rebuilt and byte-compared: an identical rebuild proves the committed
 content is already current (downgrades to ok), a differing one is real
 staleness. Artifacts with no local builder stay reported as stale.
 """
+import re
 import subprocess
 import sys
 import os
@@ -750,6 +762,145 @@ def do_rebuild():
     return 0
 
 
+# ---------------------------------------------------------------------
+# CI ownership audit
+#
+# A CI leg "owns" an artifact when its commit list (`git add -f ...`) names
+# it, and it "covers" a source when one of its trigger paths matches that
+# source.  An artifact stays up to date exactly when some owning leg covers
+# all of its sources: that leg re-runs on every source change, rebuilds the
+# artifact and commits the result.  A recipe product missing from a commit
+# list is built by CI and then thrown away -- the committed object keeps its
+# old generation while the build stays green (TASKS.md A501/A504).
+# ---------------------------------------------------------------------
+
+
+def _read_text(path):
+    with open(path, "r", encoding="utf-8", errors="ignore") as f:
+        return f.read()
+
+
+def _pattern_to_regex(pattern):
+    """GitHub path filter -> regex: '**' spans directories, '*' does not."""
+    out = []
+    i = 0
+    while i < len(pattern):
+        c = pattern[i]
+        if c == "*":
+            if pattern[i:i + 2] == "**":
+                if pattern[i:i + 3] == "**/":
+                    out.append("(?:.*/)?")
+                    i += 3
+                else:
+                    out.append(".*")
+                    i += 2
+                continue
+            out.append("[^/]*")
+            i += 1
+            continue
+        if c == "?":
+            out.append("[^/]")
+            i += 1
+            continue
+        out.append(re.escape(c))
+        i += 1
+    return re.compile("^" + "".join(out) + "$")
+
+
+def _extract_trigger_paths(text):
+    """Every path filter declared under a `paths:` key (push and pull_request)."""
+    patterns = []
+    lines = text.splitlines()
+    i = 0
+    while i < len(lines):
+        m = re.match(r"^(\s*)paths:\s*(.*)$", lines[i])
+        if not m:
+            i += 1
+            continue
+        indent = len(m.group(1))
+        rest = m.group(2).strip()
+        if rest.startswith("["):
+            patterns.extend(re.findall(r"['\"]([^'\"]+)['\"]", rest))
+            i += 1
+            continue
+        i += 1
+        while i < len(lines):
+            item = lines[i]
+            if not item.strip():
+                i += 1
+                continue
+            if len(item) - len(item.lstrip()) <= indent:
+                break
+            m2 = re.match(r"^\s*-\s*(.+?)\s*$", item)
+            if m2:
+                patterns.append(m2.group(1).strip().strip("'\""))
+            i += 1
+    return patterns
+
+
+def _extract_shell_vars(text):
+    return {m.group(1): m.group(2)
+            for m in re.finditer(r"\$\{?(\w+)\}?\s*=\s*['\"]([^'\"]+)['\"]", text)}
+
+
+def _extract_add_patterns(text):
+    """Path tokens handed to `git add` anywhere in the workflow."""
+    patterns = []
+    lines = text.splitlines()
+    for i, line in enumerate(lines):
+        if "git add" not in line:
+            continue
+        chunk = line
+        j = i
+        # A commit list continues with a backslash (sh) or a backtick (PowerShell).
+        while j + 1 < len(lines) and chunk.rstrip().endswith(("\\", "`")):
+            j += 1
+            chunk = chunk.rstrip()[:-1] + " " + lines[j].strip()
+        body = chunk[chunk.find("git add") + len("git add"):]
+        body = re.split(r"[;|]", body)[0]
+        body = re.sub(r"(?:^|\s)(?:-f|--force)(?=\s|$)", " ", body)
+        for quoted, single, bare in re.findall(r'"([^"]*)"|\'([^\']*)\'|(\S+)', body):
+            token = quoted or single or bare
+            if token and "/" in token:
+                patterns.append(token)
+    return patterns
+
+
+def _expand_add_pattern(pattern, variables):
+    def sub_var(m):
+        return variables.get(m.group(1), m.group(0))
+    pattern = re.sub(r"\$\{(\w+)\}", sub_var, pattern)
+    pattern = re.sub(r"\$(\w+)", sub_var, pattern)
+    pattern = re.sub(r"\$\{\{[^}]*\}\}", "*", pattern)
+    if any(ch in pattern for ch in "*?["):
+        return [p.replace("\\", "/") for p in glob.glob(pattern)]
+    return [pattern.replace("\\", "/")] if os.path.exists(pattern) else []
+
+
+def ci_legs():
+    """The CI legs that rebuild committed artifacts, with their trigger paths."""
+    legs = []
+    for wf in sorted(glob.glob(".github/workflows/*.yml") +
+                     glob.glob(".github/workflows/*.yaml")):
+        text = _read_text(wf)
+        variables = _extract_shell_vars(text)
+        adds = set()
+        for pattern in _extract_add_patterns(text):
+            adds.update(_expand_add_pattern(pattern, variables))
+        if not adds:
+            continue
+        legs.append({
+            "workflow": os.path.basename(wf),
+            "triggers": [_pattern_to_regex(p) for p in _extract_trigger_paths(text)],
+            "adds": adds,
+        })
+    return legs
+
+
+def _leg_covers(leg, source):
+    return any(rx.match(source) for rx in leg["triggers"])
+
+
 def main():
     if "--rebuild" in sys.argv:
         return do_rebuild()
@@ -773,6 +924,11 @@ def main():
 
     stale = 0
     stale_list = []
+    legs = ci_legs()
+    owners = {}
+    for leg in legs:
+        for artifact in leg["adds"]:
+            owners.setdefault(artifact, []).append(leg)
     for artifact, sources, kind in ARTIFACTS:
         if group != "all" and kind != group:
             continue
@@ -782,6 +938,30 @@ def main():
             continue
         newer = {s: t for s in sources
                  for t in [last_commit(s)] if t and t > built}
+        if kind == "runtime":
+            # A CI-owned artifact is kept current by its leg, not by dates:
+            # the leg rebuilds it on every source change and commits the
+            # result, so the commit date is not evidence of anything.
+            owning = owners.get(artifact, [])
+            if not owning:
+                stale += 1
+                print(f"STALE {artifact}")
+                print("        no CI leg rebuilds it: add it to a leg's commit list")
+                continue
+            uncovered = [s for s in sources
+                         if not any(_leg_covers(leg, s) for leg in owning)]
+            if uncovered:
+                stale += 1
+                print(f"STALE {artifact}")
+                print(f"        owner leg ({', '.join(l['workflow'] for l in owning)}) "
+                      f"does not re-trigger on: {', '.join(uncovered)}")
+                continue
+            names = ", ".join(sorted({leg["workflow"] for leg in owning}))
+            print(f"ok    {artifact} (owned by {names})")
+            if newer:
+                print(f"        {len(newer)} source(s) newer than the artifact commit; "
+                      f"that leg rebuilds it")
+            continue
         if not newer:
             print(f"ok    {artifact}")
             continue
