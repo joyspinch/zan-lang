@@ -730,6 +730,8 @@ public class HttpClient : IDisposable {
         HttpClient current = this;
         string currentMethod = method;
         string currentBody = body;
+        // 最近一次请求的实际路径（不含 origin），相对 Location 按它解析。
+        string currentPath = path;
         int hops = 0;
         while (true) {
             HttpResponse response = HttpResponse.Parse(raw);
@@ -741,21 +743,26 @@ public class HttpClient : IDisposable {
                 throw new HttpRequestException(
                     "redirect Location header injection rejected");
             }
-            ExternalTarget target = ExternalTarget.Parse(location);
+            // Location 可能是相对引用（RFC 3986 §4.2）：按当前请求
+            // 的 URL 解析成绝对地址再走同一套目标校验。
+            string resolved = HttpClient.ResolveLocation(currentPath, location,
+                current.useTls, current.host, current.port);
+            ExternalTarget target = ExternalTarget.Parse(resolved);
             if (target == null || visited.Contains(target.Canonical())) {
                 current.DropAlive();
                 throw new HttpRequestException(
                     "redirect target is invalid or repeated");
             }
             visited.Add(target.Canonical());
-            string nextMethod = "";
-            if (!current.RedirectReplay(currentMethod, code, out nextMethod)) {
-                current.DropAlive();
-                throw new HttpRequestException("unsafe redirect replay");
-            }
             bool sameOrigin = current.RedirectHost() == target.Host()
                 && current.port == target.Port()
                 && current.useTls == target.IsTls();
+            string nextMethod = "";
+            if (!current.RedirectReplay(currentMethod, code, sameOrigin,
+                    out nextMethod)) {
+                current.DropAlive();
+                throw new HttpRequestException("unsafe redirect replay");
+            }
             bool dropEntityHeaders = nextMethod != currentMethod;
             if (current == this) { current.DropAlive(); }
             HttpClient next = current.RedirectNextClient(current, target,
@@ -767,8 +774,49 @@ public class HttpClient : IDisposable {
             current = next;
             currentMethod = nextMethod;
             currentBody = nextBody;
+            currentPath = target.Path() + target.Query();
             hops = hops + 1;
         }
+    }
+
+    // RFC 3986 §5.3：把 Location 按"当前请求 URL"解析成绝对 URL。
+    // basePath 是最近一次请求的路径（含 query），scheme/host/port 取自
+    // 当前客户端。片段（#）不随请求发送，先剥掉。
+    //
+    // 绝对地址原样返回；其余按引用类型拼接：
+    //   //host/path  → scheme 相对（继承 scheme，换 authority）
+    //   /path        → 同 origin 的绝对路径
+    //   ?query       → 同 path，换 query
+    //   path         → 相对当前 path 的最后一段之前拼接
+    // 解析结果仍要过 ExternalTarget.Parse 的同一套校验（scheme 白名单、
+    // 主机名合法性、端口范围），所以这里不放松任何安全边界。
+    static string ResolveLocation(string basePath, string location,
+            bool useTls, string host, int port) {
+        if (location == null) { return null; }
+        string loc = location;
+        int hash = loc.IndexOf("#");
+        if (hash >= 0) { loc = loc.Substring(0, hash); }
+        if (loc.Length == 0) { return null; }
+        if (loc.StartsWith("http://") || loc.StartsWith("https://")) {
+            return loc;
+        }
+        string scheme = useTls ? "https" : "http";
+        string authority = host;
+        int defaultPort = useTls ? 443 : 80;
+        if (port != defaultPort) {
+            authority = authority + ":" + Convert.ToString(port);
+        }
+        if (loc.StartsWith("//")) { return scheme + ":" + loc; }
+        string origin = scheme + "://" + authority;
+        if (loc.StartsWith("/")) { return origin + loc; }
+        string baseUri = basePath == null || basePath.Length == 0 ? "/" : basePath;
+        int bq = baseUri.IndexOf("?");
+        if (bq >= 0) { baseUri = baseUri.Substring(0, bq); }
+        if (loc.StartsWith("?")) { return origin + baseUri + loc; }
+        // 相对路径：取 base 最后一个 "/" 之前的目录做前缀。
+        int cut = baseUri.LastIndexOf("/");
+        string dir = cut >= 0 ? baseUri.Substring(0, cut + 1) : "/";
+        return origin + dir + loc;
     }
 
     // 本客户端 host 的小写形式，剥掉 IPv6 字面量的方括号；
@@ -847,7 +895,13 @@ public class HttpClient : IDisposable {
     // 3xx 响应里的 307/308 重放守卫与 301/302/303 动作改写。
     // nextMethod 为改写结果；返回 false 表示该响应不允许自动重放
     // （调用方原样返回 3xx）。
-    bool RedirectReplay(string method, int code, out string nextMethod) {
+    //
+    // sameOrigin 只影响 307/308：这两种码按 RFC 9110 保留方法与请求
+    // 正文，而重放正文等于把请求体再送一次——同源是同一个站点，跨源
+    // 就是把数据交给另一个站点，与 Authorization/Cookie 跨源剥离是
+    // 同一道防线，所以跨源的 307/308 仍然拒绝。
+    bool RedirectReplay(string method, int code, bool sameOrigin,
+            out string nextMethod) {
         nextMethod = method;
         if (code == 303) {
             if (method == "POST") {
@@ -861,7 +915,7 @@ public class HttpClient : IDisposable {
             nextMethod = "GET";
         } else if ((code == 307 || code == 308)
             && method != "GET" && method != "HEAD") {
-            return false;
+            if (!sameOrigin) { return false; }
         }
         return true;
     }
@@ -918,6 +972,8 @@ public class HttpClient : IDisposable {
         if (initial.Length > 0) { visited.Add(initial); }
         HttpClient current = this;
         string currentMethod = method;
+        // 最近一次请求的实际路径（不含 origin），相对 Location 按它解析。
+        string currentPath = path;
         int hops = 0;
         while (current.RedirectWanted(resp, hops)) {
             int code = resp.statusCode;
@@ -927,21 +983,25 @@ public class HttpClient : IDisposable {
                 throw new HttpRequestException(
                     "redirect Location header injection rejected");
             }
-            ExternalTarget target = ExternalTarget.Parse(location);
+            // 相对引用按当前请求 URL 解析（与文本通道同一套规则）。
+            string resolved = HttpClient.ResolveLocation(currentPath, location,
+                current.useTls, current.host, current.port);
+            ExternalTarget target = ExternalTarget.Parse(resolved);
             if (target == null || visited.Contains(target.Canonical())) {
                 current.DropAlive();
                 throw new HttpRequestException(
                     "redirect target is invalid or repeated");
             }
             visited.Add(target.Canonical());
-            string nextMethod = "";
-            if (!current.RedirectReplay(currentMethod, code, out nextMethod)) {
-                current.DropAlive();
-                throw new HttpRequestException("unsafe redirect replay");
-            }
             bool sameOrigin = current.RedirectHost() == target.Host()
                 && current.port == target.Port()
                 && current.useTls == target.IsTls();
+            string nextMethod = "";
+            if (!current.RedirectReplay(currentMethod, code, sameOrigin,
+                    out nextMethod)) {
+                current.DropAlive();
+                throw new HttpRequestException("unsafe redirect replay");
+            }
             bool dropEntityHeaders = nextMethod != currentMethod;
             if (current == this) { current.DropAlive(); }
             HttpClient next = current.RedirectNextClient(current, target,
@@ -955,6 +1015,7 @@ public class HttpClient : IDisposable {
                 target.Path() + target.Query(), nextReq);
             current = next;
             currentMethod = nextMethod;
+            currentPath = target.Path() + target.Query();
             hops = hops + 1;
         }
         return resp;
@@ -3410,7 +3471,10 @@ public class HttpClient : IDisposable {
                 else { conn.Close(); }
                 return 0 - 1;
             }
-            ExternalTarget target = ExternalTarget.Parse(location);
+            // 相对引用按当前请求路径解析（下载通道同样是 GET 幂等重放）。
+            ExternalTarget target = ExternalTarget.Parse(
+                HttpClient.ResolveLocation(path, location, this.useTls,
+                    this.host, this.port));
             string canonical = target != null ? target.Canonical() : "";
             if (target == null || canonical.Length == 0
                 || visited.Contains(canonical)) {
@@ -3794,7 +3858,10 @@ public class HttpClient : IDisposable {
                 else { conn.Close(); }
                 return 0 - 1;
             }
-            ExternalTarget target = ExternalTarget.Parse(location);
+            // 相对引用按当前请求路径解析（下载通道同样是 GET 幂等重放）。
+            ExternalTarget target = ExternalTarget.Parse(
+                HttpClient.ResolveLocation(path, location, this.useTls,
+                    this.host, this.port));
             string canonical = target != null ? target.Canonical() : "";
             if (target == null || canonical.Length == 0
                 || visited.Contains(canonical)) {
