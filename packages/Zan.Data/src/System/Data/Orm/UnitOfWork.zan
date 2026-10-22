@@ -9,12 +9,16 @@ public class UnitOfWork : IUnitOfWork {
     public bool rolledBack;
     public bool closeOnDispose;
 
+    // 活着的保存点（按建立顺序）。事务结束时一并作废。
+    public List<string> savepoints;
+
     public UnitOfWork(IDbConnection conn, bool closeOnDispose) {
         this.conn = conn;
         this.pool = null;
         this.committed = false;
         this.rolledBack = false;
         this.closeOnDispose = closeOnDispose;
+        this.savepoints = new List<string>();
         if (this.conn != null) {
             this.conn.BeginTransaction();
         }
@@ -26,6 +30,7 @@ public class UnitOfWork : IUnitOfWork {
         this.committed = false;
         this.rolledBack = false;
         this.closeOnDispose = closeOnDispose;
+        this.savepoints = new List<string>();
         if (this.conn != null) {
             this.conn.BeginTransaction();
         }
@@ -65,10 +70,113 @@ public class UnitOfWork : IUnitOfWork {
         return this.conn;
     }
 
+    // ---- 保存点（savepoint）----
+    //
+    // 在一条事务里划出可回滚的子段：建立 →（写入）→ 回滚到 / 释放。
+    // 语义与 SQL 一致，见 Savepoint 与 ISavepointScope。
+
+    // 事务还没结束、连接还在，才能操作保存点。
+    void SpCheckLive() {
+        if (this.conn == null) {
+            throw new Exception("没有连接，不能操作保存点");
+        }
+        if (this.committed || this.rolledBack) {
+            throw new Exception("事务已结束，不能再操作保存点");
+        }
+    }
+
+    // 该连接的后端（决定保存点方言）。
+    int SpProvider() {
+        if (this.conn == null) { return DbProvider.Unknown; }
+        return this.conn.GetProvider();
+    }
+
+    // 账本里有没有这个保存点。
+    bool SpHas(string n) {
+        for (int i = 0; i < this.savepoints.Count; i = i + 1) {
+            if (this.savepoints[i] == n) { return true; }
+        }
+        return false;
+    }
+
+    // 建立保存点。
+    public void CreateSavepoint(string name) {
+        string n = Savepoint.Name(name);
+        this.SpCheckLive();
+        if (this.SpHas(n)) {
+            throw new Exception("保存点 " + n + " 已经存在");
+        }
+        this.conn.Execute(Savepoint.CreateSql(this.SpProvider(), n));
+        this.savepoints.Add(n);
+    }
+
+    // 回滚到保存点：该点之后的写入撤销，保存点本身仍然活着（还能再回滚一次）。
+    public void RollbackToSavepoint(string name) {
+        string n = Savepoint.Name(name);
+        this.SpCheckLive();
+        if (!this.SpHas(n)) {
+            throw new Exception("没有名为 " + n + " 的保存点");
+        }
+        this.conn.Execute(Savepoint.RollbackSql(this.SpProvider(), n));
+    }
+
+    // 释放保存点：之后不能再回滚到它。
+    public void ReleaseSavepoint(string name) {
+        string n = Savepoint.Name(name);
+        this.SpCheckLive();
+        if (!this.SpHas(n)) {
+            throw new Exception("没有名为 " + n + " 的保存点");
+        }
+        string sql = Savepoint.ReleaseSql(this.SpProvider(), n);
+        // 该后端没有释放语句时（SQL Server / Oracle 家族）只做本地记账。
+        if (sql.Length > 0) {
+            this.conn.Execute(sql);
+        }
+        this.savepoints.Remove(n);
+    }
+
+    // 异步版本。
+    public async bool CreateSavepointAsync(string name) {
+        string n = Savepoint.Name(name);
+        this.SpCheckLive();
+        if (this.SpHas(n)) {
+            throw new Exception("保存点 " + n + " 已经存在");
+        }
+        await this.conn.ExecuteAsync(Savepoint.CreateSql(this.SpProvider(), n));
+        this.savepoints.Add(n);
+        return true;
+    }
+
+    public async bool RollbackToSavepointAsync(string name) {
+        string n = Savepoint.Name(name);
+        this.SpCheckLive();
+        if (!this.SpHas(n)) {
+            throw new Exception("没有名为 " + n + " 的保存点");
+        }
+        await this.conn.ExecuteAsync(Savepoint.RollbackSql(this.SpProvider(), n));
+        return true;
+    }
+
+    public async bool ReleaseSavepointAsync(string name) {
+        string n = Savepoint.Name(name);
+        this.SpCheckLive();
+        if (!this.SpHas(n)) {
+            throw new Exception("没有名为 " + n + " 的保存点");
+        }
+        string sql = Savepoint.ReleaseSql(this.SpProvider(), n);
+        if (sql.Length > 0) {
+            await this.conn.ExecuteAsync(sql);
+        }
+        this.savepoints.Remove(n);
+        return true;
+    }
+
     public void Commit() {
         if (!this.committed && !this.rolledBack && this.conn != null) {
             this.conn.Commit();
             this.committed = true;
+            // 事务结束，保存点随之全部作废。
+            this.savepoints = new List<string>();
         }
     }
 
@@ -81,6 +189,7 @@ public class UnitOfWork : IUnitOfWork {
                 // 捕获避免破坏 Dispose 清理流程。
             }
             this.rolledBack = true;
+            this.savepoints = new List<string>();
         }
     }
 
@@ -88,6 +197,7 @@ public class UnitOfWork : IUnitOfWork {
         if (!this.committed && !this.rolledBack && this.conn != null) {
             bool ok = await this.conn.CommitAsync();
             this.committed = true;
+            this.savepoints = new List<string>();
             return ok;
         }
         return false;
@@ -97,6 +207,7 @@ public class UnitOfWork : IUnitOfWork {
         if (!this.committed && !this.rolledBack && this.conn != null) {
             bool ok = await this.conn.RollbackAsync();
             this.rolledBack = true;
+            this.savepoints = new List<string>();
             return ok;
         }
         return false;
