@@ -1,0 +1,114 @@
+using System;
+using System.Net.External;
+using System.Net.Http;
+using System.Net.Http.Client;
+using System.Net.Sockets;
+using System.Threading;
+
+// HTTP 客户端重试接线：ExternalCallPolicy 声明的 retryAttempts /
+// retryNetworkErrors / 幂等门禁必须真的生效，且重试次数有上限。
+//
+// 覆盖：默认不重试、GET 遇 5xx 重试、次数上限、POST 无幂等键不重试、
+// POST 带幂等键重试（且 Idempotency-Key 真的发到了对端）、4xx 不重试。
+class Program {
+    static int PORT = 9681;
+    static int hits = 0;
+    static int failUntil = 0;
+    static string seenIdem = "";
+
+    static async HttpResponse Handle(HttpRequest req) {
+        Program.hits = Program.hits + 1;
+        Program.seenIdem = req.GetHeader("Idempotency-Key");
+        if (Program.hits <= Program.failUntil) {
+            return HttpResponse.WithStatus(503, "Service Unavailable", "busy");
+        }
+        if (req.path == "/missing") {
+            return HttpResponse.NotFound();
+        }
+        return HttpResponse.Text("ok");
+    }
+
+    static ExternalCallPolicy RetryPolicy(int attempts) {
+        return ExternalCallPolicy.Default().AllowLocalHttp()
+            .RetryNetwork(true).RetryAttempts(attempts).RetryBackoff(1);
+    }
+
+    static async int Run() {
+        Socket.Initialize();
+        HttpServer server = new HttpServer("127.0.0.1", Program.PORT);
+        server.OnRequest(Program.Handle);
+        Task.Spawn(server.Start());
+        await Task.Delay(100);
+
+        // 1) 默认策略不重试：503 原样返回，只打一次。
+        Program.hits = 0;
+        Program.failUntil = 99;
+        HttpClient plain = new HttpClient("127.0.0.1", Program.PORT);
+        HttpResponse r0 = await plain.SendAsync("GET", "/x", "");
+        Console.WriteLine("defaultStatus=" + Convert.ToString(r0.statusCode));
+        Console.WriteLine("defaultHits=" + Convert.ToString(Program.hits));
+
+        // 2) GET 遇 503 重试：第一次 503，第二次 200。
+        Program.hits = 0;
+        Program.failUntil = 1;
+        HttpClient getter = new HttpClient("127.0.0.1", Program.PORT);
+        getter.SetCallPolicy(Program.RetryPolicy(2));
+        HttpResponse r1 = await getter.SendAsync("GET", "/x", "");
+        Console.WriteLine("getStatus=" + Convert.ToString(r1.statusCode));
+        Console.WriteLine("getHits=" + Convert.ToString(Program.hits));
+
+        // 3) 重试次数有上限：attempts=2 → 最多 1+2=3 次请求。
+        Program.hits = 0;
+        Program.failUntil = 99;
+        HttpClient bounded = new HttpClient("127.0.0.1", Program.PORT);
+        bounded.SetCallPolicy(Program.RetryPolicy(2));
+        HttpResponse r2 = await bounded.SendAsync("GET", "/x", "");
+        Console.WriteLine("boundedStatus=" + Convert.ToString(r2.statusCode));
+        Console.WriteLine("boundedHits=" + Convert.ToString(Program.hits));
+
+        // 4) POST 无幂等键不重试（可能有副作用）。
+        Program.hits = 0;
+        Program.failUntil = 99;
+        HttpClient post = new HttpClient("127.0.0.1", Program.PORT);
+        post.SetCallPolicy(Program.RetryPolicy(2));
+        HttpResponse r3 = await post.SendAsync("POST", "/x", "payload");
+        Console.WriteLine("postStatus=" + Convert.ToString(r3.statusCode));
+        Console.WriteLine("postHits=" + Convert.ToString(Program.hits));
+
+        // 5) POST 带幂等键可重试，且幂等键真的发到了对端。
+        Program.hits = 0;
+        Program.failUntil = 1;
+        Program.seenIdem = "";
+        HttpClient idem = new HttpClient("127.0.0.1", Program.PORT);
+        idem.SetCallPolicy(Program.RetryPolicy(2).Idempotent("key-1"));
+        HttpResponse r4 = await idem.SendAsync("POST", "/x", "payload");
+        Console.WriteLine("idemStatus=" + Convert.ToString(r4.statusCode));
+        Console.WriteLine("idemHits=" + Convert.ToString(Program.hits));
+        Console.WriteLine("idemKey=" + Program.seenIdem);
+
+        // 6) 4xx 不是可重试状态：只打一次。
+        Program.hits = 0;
+        Program.failUntil = 0;
+        HttpClient notFound = new HttpClient("127.0.0.1", Program.PORT);
+        notFound.SetCallPolicy(Program.RetryPolicy(2));
+        HttpResponse r5 = await notFound.SendAsync("GET", "/missing", "");
+        Console.WriteLine("notFoundStatus=" + Convert.ToString(r5.statusCode));
+        Console.WriteLine("notFoundHits=" + Convert.ToString(Program.hits));
+
+        server.Stop();
+        // 进程退出前关掉池中的 keep-alive 连接：否则对端停在
+        // RecvAsync 的协程带着未完成事件挂起，调度器永不静止。
+        plain.Close();
+        getter.Close();
+        bounded.Close();
+        post.Close();
+        idem.Close();
+        notFound.Close();
+        for (int i = 0; i < 20; i = i + 1) { await Task.Delay(10); }
+        return 0;
+    }
+
+    static async void Main() {
+        int _rc = await Program.Run();
+    }
+}

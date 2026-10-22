@@ -607,6 +607,16 @@ public class HttpClient : IDisposable {
             sb.Append("\r\n");
         }
 
+        // 策略声明了幂等键、而调用方没自己设置该头时，把它发出去。
+        // 不发出去的话服务端无从按键去重，"可重试"也就没有幂等前提
+        // ——策略里的键只是本地的一个标记。
+        if (this.callPolicy != null && this.callPolicy.IsIdempotent()
+            && !this.HasHeaderName("Idempotency-Key")) {
+            sb.Append("Idempotency-Key: ");
+            sb.Append(this.callPolicy.IdempotencyKey());
+            sb.Append("\r\n");
+        }
+
         if (bodyLen > 0) {
             sb.Append("Content-Length: ");
             sb.Append(Convert.ToString(bodyLen));
@@ -710,7 +720,7 @@ public class HttpClient : IDisposable {
     // 动作改写/下一跳派生）与字节通道共用同一组 helper
     async string RequestAsync(string method, string path, string body) {
         this.ResetTotalBudget();
-        string raw = await this.RequestOnceAsync(method, path, body);
+        string raw = await this.RequestOnceWithRetry(method, path, body);
         if (this.callPolicy == null || this.callPolicy.MaxRedirects() <= 0) {
             return raw;
         }
@@ -752,7 +762,7 @@ public class HttpClient : IDisposable {
                 sameOrigin, dropEntityHeaders);
             // 动作改写（301/302/303 → GET）后请求正文一律丢弃。
             string nextBody = nextMethod == currentMethod ? currentBody : "";
-            raw = await next.RequestOnceAsync(nextMethod,
+            raw = await next.RequestOnceWithRetry(nextMethod,
                 target.Path() + target.Query(), nextBody);
             current = next;
             currentMethod = nextMethod;
@@ -988,6 +998,59 @@ public class HttpClient : IDisposable {
             return alive;
         }
         return await this.RequestUnpooledAsync(method, path, body);
+    }
+
+    // 一次请求（含策略允许的重试）。
+    //
+    // 默认策略 retryAttempts=0，直接透传给 RequestOnceAsync；开启
+    // RetryNetwork + RetryAttempts 后，是否重试一律由
+    // ExternalCallPolicy.CanRetry 判定（幂等门禁 + 状态码白名单），
+    // 退避随尝试次数线性递增。
+    //
+    // 只捕获 HttpRequestException：传输层的连接失败、超时、对端关闭、
+    // 帧格式错都归这一种，而编程错误（空引用之类）不会被误当成网络
+    // 抖动重试。
+    async string RequestOnceWithRetry(string method, string path, string body) {
+        ExternalCallPolicy policy = this.callPolicy;
+        if (policy == null || policy.RetryAttempts() <= 0) {
+            return await this.RequestOnceAsync(method, path, body);
+        }
+        // requestStarted 的口径：GET/HEAD 无副作用；声明过幂等键的
+        // 方法重放安全；其余方法保守视为可能已产生副作用，不重试。
+        bool requestStarted = !HttpClient.SideEffectFreeMethod(method)
+            && !policy.IsIdempotent();
+        int maxAttempts = policy.RetryAttempts();
+        int attempt = 0;
+        while (true) {
+            string raw = "";
+            int status = 0;
+            HttpRequestException failure = null;
+            try {
+                raw = await this.RequestOnceAsync(method, path, body);
+                status = HttpResponse.Parse(raw).statusCode;
+            } catch (HttpRequestException ex) {
+                failure = ex;
+                status = 0;
+            }
+            if (attempt < maxAttempts
+                && policy.CanRetry(method, requestStarted, status)) {
+                attempt = attempt + 1;
+                // 退避时间算在总预算里：totalDeadlineUs 由外层统一
+                // 约束，不因为重试而延长。
+                int wait = policy.RetryBackoffMs() * attempt;
+                if (wait > 0) { await Task.Delay(wait); }
+                continue;
+            }
+            if (failure != null) { throw failure; }
+            return raw;
+        }
+    }
+
+    // GET/HEAD 不产生副作用，可安全重放。
+    static bool SideEffectFreeMethod(string method) {
+        if (method == null) { return false; }
+        string m = method.ToUpper();
+        return m == "GET" || m == "HEAD";
     }
 
     async string RequestUnpooledAsync(string method, string path, string body) {

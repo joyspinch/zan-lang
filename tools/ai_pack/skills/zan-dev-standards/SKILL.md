@@ -958,6 +958,21 @@ server-dev-standards；数据建模见 data-modeling；SQL 细则见 server-db-d
   只说明编译器知道这个类型的成员签名，不代表它在你的文件里可见。同包的
   另一个文件早就写了那行 `using`，这类"同一个包里一半文件能编一半不能编"
   的报错，先比 `using` 行再怀疑编译器。
+- **包与包之间没有依赖清单，A 包 `using` 了 B 包就等于废掉 A 的独立性**：
+  `zan.pkg` 的 `dependencies` 段**当前没有任何包在用**（各包清单只有
+  name/version/description/author/license）；编译期的可见性来自
+  `zan_collect_package_source_roots()` 把**工程里所有**包源根并进来
+  （`src/compiler/main.c`）。于是 A 包源码里 `using` 了 B 包的命名空间时，
+  在"整仓一起用"（`--package-project zan-lang`、SDK 发布）下能编；一旦用户
+  只装了 A 包，A 包自身就编不过。已有先例：`Zan.Ai` 依赖 `Zan.Net`、
+  `Zan.Mvc` 依赖 `Zan.Data`。
+  **对策**：给包加能力前先问「这个能力在 stdlib 里吗」——**stdlib 是所有包
+  都看得见的底座**；非要跨包拿，就走注入（调用方传回调/策略），别让基础包
+  硬依赖可选包；真需要共享就评估把最小必要的那部分下沉到 stdlib。
+  坑出处：给 `Zan.Net` 接 HTTP 自动解压时，gzip/deflate 编解码器在
+  `packages/Zan.IO/src/System/IO/Compression/`，`Zan.Net` 全树零引用；直接
+  `using System.IO.Compression;` 就把网络包绑死在压缩包上，压缩包一旦不装，
+  网络包连带编译不过。
 - **同名类跨命名空间时，裸名按"成员命中"消歧，落在歧义上要显式限定**：编译器
   解析裸名的顺序是 当前命名空间 → 祖先命名空间 → **本文件**的 `using` →
   成员命中消歧 → 歧义诊断。同名类型多于一个时，`X.M` 这种成员访问先用"谁声明了
