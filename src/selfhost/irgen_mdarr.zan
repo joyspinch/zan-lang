@@ -1,0 +1,211 @@
+using System;
+using System.Collections.Generic;
+namespace Zan;
+
+// Irgen part: rectangular arrays (the C host's B8 support).
+//
+// A multi-dimensional array (`int[,]`, `int[,,]`) and the jagged-of-
+// rectangular shape (`int[][,]`) put their dimensions into the array's
+// header:
+//
+//     [dim0][dim1]...[dim(r-1)][count][elements]
+//
+// The count is the LAST word before the elements -- the same place a plain
+// array keeps its length -- so `arr.Length` reads it the same way, and the
+// dimension d sits (rank+1-d) words in front of it.
+//
+// The shape travels with the TYPE: an array type carries its rank list in
+// `sval2` ("2" for `int[,]`, "1,2" for `int[][,]`) -- see Node.ArrRankAt.
+// The C host models the same information as a nested type with a per-level
+// array_rank (`int[,]` is ONE type of rank 2; `int[][,]` is an array of
+// `int[,]`), so the rank list plays the role of that nesting.
+partial class Irgen {
+    // The rank of the OUTERMOST bracket group of an array type (1 for a
+    // plain `T[]`).
+    int ArrRankOf(Node t) {
+        if (t == null) { return 1; }
+        return Node.ArrRankAt(t.arrRanks, 0);
+    }
+
+    // The dimension `d` of a rectangular array: the word (rank+1-d) slots
+    // in front of the elements (the count is the last one).
+    string MdDim(string arrOp, int rank, int d) {
+        string p = NT();
+        L("  " + p + " = getelementptr i64, i64* " + arrOp + ", i64 " + (d - rank - 1));
+        string v = NT();
+        L("  " + v + " = load i64, i64* " + p);
+        return v;
+    }
+
+    // A subscript clamped into [0, dim): an out-of-range subscript is
+    // reported ("array index out of bounds" -- the C host's message) and
+    // the access continues with 0.
+    string MdIdxSafe(string idx, string dim, Node e) {
+        string neg = NT();
+        L("  " + neg + " = icmp slt i64 " + idx + ", 0");
+        string hi = NT();
+        L("  " + hi + " = icmp sge i64 " + idx + ", " + dim);
+        string bad = NT();
+        L("  " + bad + " = or i1 " + neg + ", " + hi);
+        GuardFail(bad, "array index out of bounds", e);
+        string safe = NT();
+        L("  " + safe + " = select i1 " + bad + ", i64 0, i64 " + idx);
+        return safe;
+    }
+
+    // The flat element offset of a rectangular access `a[i, j, ...]`: the
+    // row-major fold flat = ((i0*d1 + i1)*d2 + i2)... The dimensions live
+    // in the array's header, so the fold reads them from the array.
+    string MdFlatIndex(Node e, string arrOp, int rank, string firstIdx) {
+        string flat = MdIdxSafe(firstIdx, MdDim(arrOp, rank, 0), e);
+        int d = 1;
+        while (d < rank) {
+            ExprVal ix = GenExpr(e.kids[d - 1]);
+            string dim = MdDim(arrOp, rank, d);
+            string safe = MdIdxSafe(ix.op, dim, e);
+            string mul = NT();
+            L("  " + mul + " = mul i64 " + flat + ", " + dim);
+            string add = NT();
+            L("  " + add + " = add i64 " + mul + ", " + safe);
+            flat = add;
+            d = d + 1;
+        }
+        return flat;
+    }
+
+    // arr.GetLength(d): the length of the dimension d. The C host
+    // (irgen_call.c) reads the dimension out of the array's header; a
+    // dimension out of range is reported ("GetLength dimension out of
+    // range") and the read continues with the first dimension.
+    ExprVal EmitGetLength(ExprVal recv, Node e) {
+        int rk = ArrRankOf(recv.ty);
+        if (e.kids.Count != 1) {
+            diags.Error("GetLength takes one dimension", e.line, e.col);
+            return new ExprVal("0", MkType("int"));
+        }
+        ExprVal d = GenExpr(e.kids[0]);
+        string oob = NT();
+        L("  " + oob + " = icmp uge i64 " + d.op + ", " + rk);
+        GuardFail(oob, "GetLength dimension out of range", e);
+        string dim = NT();
+        L("  " + dim + " = select i1 " + oob + ", i64 0, i64 " + d.op);
+        string off = NT();
+        L("  " + off + " = add i64 " + dim + ", " + (0 - rk - 1));
+        string p = NT();
+        L("  " + p + " = getelementptr i64, i64* " + recv.op + ", i64 " + off);
+        string v = NT();
+        L("  " + v + " = load i64, i64* " + p);
+        return new ExprVal(v, MkType("int"));
+    }
+
+    // A rectangular array creation: `new int[2,3]`. The dimensions are
+    // evaluated once each, the element count is their product (a wrapped
+    // product is an overflow), and the initializer items land in the
+    // elements in row-major order.
+    ExprVal GenMdArrNew(Node e, Node ty, Node at, Node elemTy, int esz,
+            int rank, int ndimkids, int nitems) {
+        if (e.b == null) {
+            diags.Error("a rectangular array creation needs its dimensions",
+                e.line, e.col);
+            return new ExprVal("0", MkType("int"));
+        }
+        // the dimensions: each one is evaluated exactly once
+        List<string> dims = new List<string>();
+        dims.Add(GenExpr(e.b).op);
+        int dd = 1;
+        while (dd < rank) {
+            dims.Add(GenExpr(e.kids[dd - 1]).op);
+            dd = dd + 1;
+        }
+        // the element count: the product of the dimensions
+        string total = "1";
+        dd = 0;
+        while (dd < rank) {
+            string mul = NT();
+            L("  " + mul + " = mul i64 " + total + ", " + dims[dd]);
+            total = mul;
+            dd = dd + 1;
+        }
+        // a wrapped product is an overflow (the C host folds it to 0 after
+        // the report)
+        string neg = NT();
+        L("  " + neg + " = icmp slt i64 " + total + ", 0");
+        GuardFail(neg, "array allocation overflow", e);
+        string safe = NT();
+        L("  " + safe + " = select i1 " + neg + ", i64 0, i64 " + total);
+        total = safe;
+        // the allocation: the header plus the elements
+        string bytes = NT();
+        if (esz == 1) { L("  " + bytes + " = add i64 " + total + ", 0"); }
+        else { L("  " + bytes + " = mul i64 " + total + ", 8"); }
+        string tot = NT();
+        L("  " + tot + " = add i64 " + bytes + ", " + (8 * (rank + 2)));
+        string raw = NT();
+        L("  " + raw + " = call i8* @calloc(i64 1, i64 " + tot + ")");
+        string hdr = NT();
+        L("  " + hdr + " = bitcast i8* " + raw + " to i64*");
+        // the dimensions at hdr+1..hdr+rank, the count at hdr+rank+1
+        dd = 0;
+        while (dd < rank) {
+            string dp = NT();
+            L("  " + dp + " = getelementptr i64, i64* " + hdr + ", i64 " + (dd + 1));
+            L("  store i64 " + dims[dd] + ", i64* " + dp);
+            dd = dd + 1;
+        }
+        string cntp = NT();
+        L("  " + cntp + " = getelementptr i64, i64* " + hdr + ", i64 " + (rank + 1));
+        L("  store i64 " + total + ", i64* " + cntp);
+        string arr = NT();
+        L("  " + arr + " = getelementptr i64, i64* " + hdr + ", i64 " + (rank + 2));
+        // the initializer items land in row-major order
+        if (nitems > 0) {
+            Node et = elemTy;
+            if (et == null) { et = MkType(ty.sval); }
+            int jn = 0;
+            while (jn < nitems) {
+                ExprVal iv = GenExpr(e.kids[ndimkids + jn]);
+                string sv = "";
+                if (IsNullableValue(et)) {
+                    // a nullable element is a pointer slot: box the value
+                    string bx = BoxFor(iv, et);
+                    string bi = NT();
+                    L("  " + bi + " = ptrtoint i8* " + bx + " to i64");
+                    sv = bi;
+                } else {
+                    sv = StructElemSlot(iv, et);
+                }
+                if (esz == 1) {
+                    string ab = NT();
+                    L("  " + ab + " = bitcast i64* " + arr + " to i8*");
+                    string ep = NT();
+                    L("  " + ep + " = getelementptr i8, i8* " + ab + ", i64 " + jn);
+                    ArrElemStore(ep, 1, sv);
+                } else {
+                    string ep = NT();
+                    L("  " + ep + " = getelementptr i64, i64* " + hdr + ", i64 " + (jn + rank + 2));
+                    L("  store i64 " + sv + ", i64* " + ep);
+                }
+                jn = jn + 1;
+            }
+        }
+        return new ExprVal(arr, at);
+    }
+
+    // The runtime report (the C host's emit_runtime_check): the message is
+    // printed with the position and the program keeps going.
+    void GuardFail(string cond, string msg, Node e) {
+        int lbad = NL(); int lcont = NL();
+        L("  br i1 " + cond + ", label %L" + lbad + ", label %L" + lcont);
+        Label(lbad);
+        ExprVal fs = GenStr(diags.FileOfLine(e.line));
+        ExprVal ms = GenStr(msg);
+        if (!ExternSeen("zan_rt_guard_fail3")) {
+            externDecls.Add("zan_rt_guard_fail3");
+            H("declare void @zan_rt_guard_fail3(i8*, i32, i32, i8*)");
+        }
+        L("  call void @zan_rt_guard_fail3(i8* " + fs.op + ", i32 "
+            + diags.LineInFile(e.line) + ", i32 " + e.col + ", i8* " + ms.op + ")");
+        L("  br label %L" + lcont);
+        Label(lcont);
+    }
+}

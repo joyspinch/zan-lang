@@ -381,6 +381,15 @@ public class Checker {
             if (lt != null) { return lt; }
             return rt;
         }
+        if (k == AK.Conditional()) {
+            // `c ? a : b` -- the type of the whole expression is what the
+            // two arms agree on. Without this branch the arms came out as
+            // "unknown" (null), so the enclosing expression took the LEFT
+            // operand's type: `off + (c ? "#s" : "#g")` typed as `int` and
+            // the checker rejected the program with "cannot convert 'int'
+            // to 'string' in initializer".
+            return MergeConditionalTypes(InferType(e.b), InferType(e.c));
+        }
         if (k == AK.Index()) {
             Node ot = InferType(e.a);
             if (ot != null) {
@@ -388,11 +397,22 @@ public class Checker {
                 // `List<string>`, not the list's own element type -- the
                 // array rank (ival) decides, the element name does not.
                 if (ot.ival >= 1) {
+                    // the subscripts must match the rank of the group: the
+                    // C host's "rank-%d array indexed with %d indices"
+                    int rk = Node.ArrRankAt(ot.arrRanks, 0);
+                    int given = 1 + e.kids.Count;
+                    if (given != rk) {
+                        diags.Error("rank-" + rk + " array indexed with "
+                            + given + " indices", e.line, e.col);
+                    }
                     Node el = MkType(ot.sval); el.kids = ot.kids;
                     el.ival = ot.ival - 1;
                     // the element of a `T?[]` is nullable: the flag rides on
                     // the array type
                     el.op = ot.op;
+                    // the inner ranks travel down: the element of `int[,]`
+                    // is `int`, the element of `int[][,]` is `int[,]`
+                    el.arrRanks = Node.ArrRankDrop(ot.arrRanks);
                     return el;
                 }
                 if (ot.sval == "List" && ot.kids.Count > 0) { return ot.kids[0]; }
@@ -442,6 +462,149 @@ public class Checker {
     }
 
     bool IsStr(Node t) { return t != null && t.sval == "string"; }
+
+    // ---- the type of a conditional expression ----
+    //
+    // The C host merges the two arms (src/compiler/checker.c:1201,
+    // merge_conditional_types) and, when they have nothing in common,
+    // reports
+    //   cannot apply '?:' operator to operands of type 'X' and 'Y':
+    //   neither converts to the other and they share no common type
+    // The self-host's type model is coarse, so the merge stays
+    // PERMISSIVE: an arm pair it cannot merge yields the UNKNOWN type
+    // (null) and no diagnostic. Rejecting code the host accepts would
+    // break the self-hosting fixed point, and the self-host cannot name
+    // the host's operand types faithfully anyway (the difference is
+    // recorded in TASKS.md, A500).
+    Node MergeConditionalTypes(Node a, Node b) {
+        if (a == null) { return b; }
+        if (b == null) { return a; }
+        // a type parameter is replaced by the concrete type at the
+        // instantiation -- the host keeps the parameter's side
+        if (binder.IsTypeParam(a.sval) || binder.IsTypeParam(b.sval)) { return a; }
+        // the same shape: the same name, the same type arguments, the same
+        // nullable flag, the same array rank
+        if (SameTypeShape(a, b)) { return a; }
+        // two numeric arms promote to the wider one
+        if (IsMergeNumeric(a) && IsMergeNumeric(b)) { return PromoteNumericType(a, b); }
+        // two reference arms: the common base type, or nothing
+        if (IsMergeRef(a) && IsMergeRef(b)) {
+            Node common = CommonBaseType(a, b);
+            if (common != null) { return common; }
+            return null;
+        }
+        // an enum arm: the host keeps the enum side
+        if (PrimCat(a.sval) == 6 || PrimCat(b.sval) == 6) { return a; }
+        return null;
+    }
+
+    // The same shape: the name, the type arguments, the nullable flag and
+    // the array rank all match. The host compares the type kinds and the
+    // names (checker_type_equal); the self-host has no type kinds, so the
+    // name stands in for the kind.
+    bool SameTypeShape(Node a, Node b) {
+        if (a == null || b == null) { return false; }
+        if (a.sval != b.sval) { return false; }
+        if (a.op != b.op) { return false; }
+        if (a.ival != b.ival) { return false; }
+        if (a.kids.Count != b.kids.Count) { return false; }
+        int i = 0;
+        while (i < a.kids.Count) {
+            if (!SameTypeShape(a.kids[i], b.kids[i])) { return false; }
+            i = i + 1;
+        }
+        return true;
+    }
+
+    // A numeric arm: a primitive number or a char, and NOT nullable (the
+    // host promotes the arms' value kinds; a nullable arm is a different
+    // type and the host does not promote it).
+    bool IsMergeNumeric(Node t) {
+        if (t == null) { return false; }
+        if (t.op != 0) { return false; }
+        if (t.ival >= 1) { return false; }
+        return IsNumericTypeName(t.sval);
+    }
+
+    // The host's promote_numeric (src/compiler/checker.c:1066): the ladder
+    // is double > float > ulong > long > int. Everything else (byte, short,
+    // uint, char, nint) falls to int. A decimal arm wins over an integral
+    // arm; a decimal mixed with a float or a double is an error in the
+    // host, which the self-host cannot express -- it stays unknown.
+    Node PromoteNumericType(Node a, Node b) {
+        string an = a.sval;
+        string bn = b.sval;
+        if (an == "decimal" || bn == "decimal") {
+            if (an == "decimal" && bn == "decimal") { return MkType("decimal"); }
+            string other = an;
+            if (an == "decimal") { other = bn; }
+            if (other == "float" || other == "double") { return null; }
+            return MkType("decimal");
+        }
+        if (an == "double" || bn == "double") { return MkType("double"); }
+        if (an == "float" || bn == "float") { return MkType("float"); }
+        if (an == "ulong" || bn == "ulong") { return MkType("ulong"); }
+        if (an == "long" || bn == "long") { return MkType("long"); }
+        return MkType("int");
+    }
+
+    // A reference-typed arm: the host's checker_type_is_ref
+    // (src/compiler/checker.c:1190) covers object, interface, string,
+    // class, array, delegate and task -- a struct is a VALUE type and is
+    // not one of them.
+    bool IsMergeRef(Node t) {
+        if (t == null) { return false; }
+        if (t.ival >= 1) { return true; }        // an array
+        string n = t.sval;
+        if (n == "string" || n == "object") { return true; }
+        if (IsTaskTy(t)) { return true; }
+        if (binder.IsDelegateName(n)) { return true; }
+        Node d = binder.FindType(n);
+        if (d != null && d.kind == AK.ClassDecl()) { return true; }
+        return false;
+    }
+
+    // The common base of two reference arms: the host walks the base chain
+    // (merge_conditional_types: `b is-a a` -> a, `a is-a b` -> b, then the
+    // first base of `a` that `b` derives from).
+    Node CommonBaseType(Node a, Node b) {
+        if (DerivesFromName(b.sval, a.sval)) { return a; }
+        if (DerivesFromName(a.sval, b.sval)) { return b; }
+        string cur = a.sval;
+        int guard = 0;
+        while (guard < 64) {
+            Node d = binder.FindType(cur);
+            if (d == null) { return null; }
+            string baseName = d.sval2;
+            if (baseName == "" || baseName == cur) { return null; }
+            Node bt = binder.FindType(baseName);
+            if (bt == null) { return null; }
+            if (DerivesFromName(b.sval, baseName)) { return bt; }
+            cur = baseName;
+            guard = guard + 1;
+        }
+        return null;
+    }
+
+    // Does the type named `sub` derive from the type named `sup`? The host
+    // walks the base chain AND the interface list (checker_type_derives_
+    // from); the self-host has the base chain only (a class declaration's
+    // sval2 holds the base name).
+    bool DerivesFromName(string sub, string sup) {
+        if (sub == sup) { return true; }
+        string cur = sub;
+        int guard = 0;
+        while (guard < 64) {
+            Node d = binder.FindType(cur);
+            if (d == null) { return false; }
+            string baseName = d.sval2;
+            if (baseName == "" || baseName == cur) { return false; }
+            if (baseName == sup) { return true; }
+            cur = baseName;
+            guard = guard + 1;
+        }
+        return false;
+    }
 
     // The literal's own type follows its suffix: `5` is an int, `5L` a long,
     // `5u` a uint, `5UL` a ulong, `0x1FL` a long (the parser folds the radix
@@ -1354,7 +1517,13 @@ public class Checker {
         }
         if (k == AK.Unary()) { CheckExpr(n.a); CheckUnaryOperand(n); return; }
         if (k == AK.PostfixUnary()) { CheckExpr(n.a); return; }
-        if (k == AK.Index()) { CheckExpr(n.a); CheckExpr(n.b); return; }
+        if (k == AK.Index()) {
+            CheckExpr(n.a); CheckExpr(n.b);
+            // the extra subscripts of a rectangular access (`a[i, j]`)
+            int ki = 0;
+            while (ki < n.kids.Count) { CheckExpr(n.kids[ki]); ki = ki + 1; }
+            return;
+        }
         if (k == AK.CallInit()) { CheckCallInitItems(n); return; }
         if (k == AK.NewExpr()) {
             // anonymous new has no type node: it only appears inside db

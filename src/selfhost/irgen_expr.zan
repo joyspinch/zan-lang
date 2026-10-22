@@ -2055,12 +2055,16 @@ partial class Irgen {
             // array of i64 slots; pointer/double values are packed into the slot
             Node elemTy = ArrElemOf(obj.ty);
             int esz = ArrElemSize(elemTy);
+            // a rectangular array folds its subscripts into a flat offset
+            string sflat = idx.op;
+            int srk = ArrRankOf(obj.ty);
+            if (srk > 1) { sflat = MdFlatIndex(lhs, obj.op, srk, idx.op); }
             string p = NT();
             if (esz == 1) {
                 // a byte array: one byte per element
                 string ab = NT();
                 L("  " + ab + " = bitcast i64* " + obj.op + " to i8*");
-                L("  " + p + " = getelementptr i8, i8* " + ab + ", i64 " + idx.op);
+                L("  " + p + " = getelementptr i8, i8* " + ab + ", i64 " + sflat);
                 if (IsStructTy(v.ty)) {
                     ExprVal c = CopyStructValue(v);
                     ArrElemStore(p, 1, ToI64(c.op, MapType(c.ty)));
@@ -2069,7 +2073,7 @@ partial class Irgen {
                 ArrElemStore(p, 1, ToI64(v.op, MapType(v.ty)));
                 return;
             }
-            L("  " + p + " = getelementptr i64, i64* " + obj.op + ", i64 " + idx.op);
+            L("  " + p + " = getelementptr i64, i64* " + obj.op + ", i64 " + sflat);
             // a struct element is a value: the array holds its own copy
             if (IsStructTy(v.ty)) {
                 ExprVal c = CopyStructValue(v);
@@ -3351,11 +3355,15 @@ partial class Irgen {
         string p2 = NT();
         Node elemTy2 = ArrElemOf(obj.ty);
         int esz2 = ArrElemSize(elemTy2);
+        // a rectangular array folds its subscripts into a flat offset
+        string flat = idx.op;
+        int rk2 = ArrRankOf(obj.ty);
+        if (rk2 > 1) { flat = MdFlatIndex(e, obj.op, rk2, idx.op); }
         if (esz2 == 1) {
             // a byte array: one byte per element
             string ab = NT();
             L("  " + ab + " = bitcast i64* " + obj.op + " to i8*");
-            L("  " + p2 + " = getelementptr i8, i8* " + ab + ", i64 " + idx.op);
+            L("  " + p2 + " = getelementptr i8, i8* " + ab + ", i64 " + flat);
             string bv = NT();
             L("  " + bv + " = load i8, i8* " + p2);
             string z = NT();
@@ -3363,7 +3371,7 @@ partial class Irgen {
             if (elemTy2 != null) { return FromSlot(z, elemTy2); }
             return new ExprVal(z, MkType("int"));
         }
-        L("  " + p2 + " = getelementptr i64, i64* " + obj.op + ", i64 " + idx.op);
+        L("  " + p2 + " = getelementptr i64, i64* " + obj.op + ", i64 " + flat);
         string v = NT();
         L("  " + v + " = load i64, i64* " + p2);
         // T[] element: unpack the i64 slot to the declared element type
@@ -3376,6 +3384,9 @@ partial class Irgen {
             // the element of a `T?[]` is a NULLABLE value: the flag rides on
             // the array type, so it has to travel down to the element
             et2.op = obj.ty.op;
+            // the inner ranks travel down as well: the element of `int[,]`
+            // is `int`, the element of `int[][,]` is `int[,]`
+            et2.arrRanks = Node.ArrRankDrop(obj.ty.arrRanks);
             return FromSlot(v, et2);
         }
         return new ExprVal(v, MkType("int"));
@@ -3395,22 +3406,39 @@ partial class Irgen {
         if (e.ival == 1) {
             // array new: T[n] as i64* (the elements follow the i64 length
             // header; a byte-sized element type takes one byte per element)
-            ExprVal nsz = new ExprVal("0", MkType("int"));
-            bool init = e.kids.Count > 0;
-            if (e.b != null) { nsz = GenExpr(e.b); }
-            else if (init) {
-                // array initializer `new T[] { a, b, c }`: the element count
-                // is the number of initializer expressions
-                nsz = new ExprVal("" + e.kids.Count, MkType("int"));
-            }
+            // The RANK LIST of the created array (the parser records it):
+            // the dims group's rank first, then the trailing groups. The
+            // rank decides the shape: a rank of 1 is the plain array, a
+            // higher rank is a rectangular one.
+            string rkl = e.arrRanks;
+            if (rkl == null) { rkl = ""; }
+            int rank = Node.ArrRankAt(rkl, 0);
+            int ndimkids = rank - 1;
+            int nitems = e.kids.Count - ndimkids;
+            if (nitems < 0) { nitems = 0; }
+            bool init = nitems > 0;
             // the array type of the result: the element name with the rank
             // (the declared type of `new T[n]` does not carry the rank yet)
             // the element's NULLABLE flag rides along: `new int?[3]` is an
             // array of nullable ints, not a nullable array of ints
-            Node at = MkType(ty.sval); at.ival = 1 + e.op; at.op = ty.op;
+            // the rank list rides along too: it is what tells the codegen
+            // that the array is rectangular (and how many dimensions it has)
+            Node at = MkType(ty.sval); at.ival = Node.ArrRankCount(rkl); at.op = ty.op;
             at.kids = ty.kids;
+            at.arrRanks = rkl;
             Node elemTy = ArrElemOf(at);
             int esz = ArrElemSize(elemTy);
+            if (rank > 1) {
+                // a rectangular array: the header carries the dimensions
+                return GenMdArrNew(e, ty, at, elemTy, esz, rank, ndimkids, nitems);
+            }
+            ExprVal nsz = new ExprVal("0", MkType("int"));
+            if (e.b != null) { nsz = GenExpr(e.b); }
+            else if (init) {
+                // array initializer `new T[] { a, b, c }`: the element count
+                // is the number of initializer expressions
+                nsz = new ExprVal("" + nitems, MkType("int"));
+            }
             string bytes = NT();
             if (esz == 1) { L("  " + bytes + " = add i64 " + nsz.op + ", 0"); }
             else { L("  " + bytes + " = mul i64 " + nsz.op + ", 8"); }
@@ -5774,6 +5802,11 @@ partial class Irgen {
             if (IsDictType(recv.ty)) { return EmitDictMethod(recv, mname, e); }
             // string-builder methods
             if (IsSbType(recv.ty)) { return EmitSbMethod(recv, mname, e); }
+            // array methods: GetLength on a rectangular array (the C host's
+            // irgen_call.c reads the dimension out of the array's header)
+            if (mname == "GetLength" && ArrRankOf(recv.ty) > 1) {
+                return EmitGetLength(recv, e);
+            }
             // instance method
             Node cls = ClassOf(recv.ty);
             if (cls != null) {
@@ -6100,7 +6133,9 @@ partial class Irgen {
         et.sval = t.sval;
         et.ival = t.ival - 1;
         et.op = t.op;
-        et.sval2 = t.sval2;
+        // the element of a rectangular array keeps the INNER ranks: the
+        // outermost group is the one the index consumes
+        et.arrRanks = Node.ArrRankDrop(t.arrRanks);
         // the type arguments travel with the element: the element of a
         // `List<string>[]` is a `List<string>`, not a bare `List`
         et.kids = t.kids;
@@ -6238,6 +6273,7 @@ partial class Irgen {
         tr.op = pty.op;
         tr.ival = pty.ival;
         tr.sval2 = pty.sval2;
+        tr.arrRanks = pty.arrRanks;
         tr.line = pty.line; tr.col = pty.col;
         tr.a = pty.a;
         int i = 0;
@@ -6726,6 +6762,7 @@ partial class Irgen {
         if (t == null) { return null; }
         Node n = new Node(t.kind);
         n.sval = t.sval; n.op = t.op; n.ival = t.ival; n.sval2 = t.sval2;
+        n.arrRanks = t.arrRanks;
         n.mods = t.mods; n.line = t.line; n.col = t.col;
         int i = 0;
         while (i < t.kids.Count) { n.Add(CopyType(t.kids[i])); i = i + 1; }
@@ -6744,6 +6781,7 @@ partial class Irgen {
             if (se == null) { return t; }
             se.ival = t.ival;
             se.sval2 = t.sval2;
+            se.arrRanks = t.arrRanks;
             se.op = t.op;
             se.line = t.line; se.col = t.col; se.mods = t.mods;
             return se;
@@ -6758,6 +6796,7 @@ partial class Irgen {
         }
         Node n = new Node(t.kind);
         n.sval = t.sval; n.op = t.op; n.ival = t.ival; n.sval2 = t.sval2;
+        n.arrRanks = t.arrRanks;
         int i = 0;
         while (i < t.kids.Count) { n.Add(SubstTP(t.kids[i], names, reps)); i = i + 1; }
         return n;

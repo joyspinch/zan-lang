@@ -697,6 +697,15 @@ public class Parser {
             }
             Expect(TK.RBracket());
             t.ival = t.ival + 1;
+            // The RANK LIST: one entry per bracket group, outer to inner --
+            // "2" for `int[,]`, "1,2" for `int[][,]`. The rank travels with
+            // the type so the shape survives past the binder (the C host
+            // keeps the same information as a nested type with a per-level
+            // array_rank).
+            string rk = Convert.ToString(commas + 1);
+            t.arrRanks = (t.arrRanks == null || t.arrRanks == "") ? rk : t.arrRanks + "," + rk;
+            // sval2 keeps its old meaning: the comma count of the rank
+            // specifier (the native backend renders the type name from it)
             if (commas > 0) { t.sval2 = Convert.ToString(commas + (t.sval2 != null && t.sval2 != "" ? (int)Convert.ToInt64(t.sval2) : 0)); }
         }
         return t;
@@ -4106,17 +4115,23 @@ public class Parser {
             n.ival = 1; // array
             if (!At(TK.RBracket())) { n.b = ParseExpr(); }
             // rectangular ranks: `new int[2,3]` -- the extra sizes ride in
-            // kids BEFORE any brace initializer items, and sval2 records the
-            // full dim count so codegen can split dims from items
+            // kids BEFORE any brace initializer items; the dim count (the
+            // rank of the dims group) is what codegen uses to split the
+            // dims from the items
+            int ndims = 1;
             if (At(TK.Comma())) {
-                while (Eat(TK.Comma())) { n.Add(ParseExpr()); }
-                n.sval2 = Convert.ToString(n.kids.Count + 1);
+                while (Eat(TK.Comma())) { n.Add(ParseExpr()); ndims = ndims + 1; }
+                // sval2 keeps its old meaning: the dim count (the native
+                // backend reads it to pick the rectangular path)
+                n.sval2 = Convert.ToString(ndims);
             }
             Expect(TK.RBracket());
-            // jagged trailing ranks: `new int[3][]` allocates the outer
-            // array only; op counts how many empty ranks followed. Rank
-            // specifiers with commas (`new int[2][,]` -- rows of int[,])
-            // allocate the same outer ref array, so they only need eating
+            // The RANK LIST of the created array, outer to inner: the dims
+            // group first, then the trailing groups (`new int[2][,]` is an
+            // array of `int[,]` -> "1,2"). A trailing group only names the
+            // shape of the elements -- the outer array is allocated, the
+            // inner ones stay null until they are assigned.
+            string rk = Convert.ToString(ndims);
             while (At(TK.LBracket())) {
                 int commas = 0;
                 while (!At(TK.RBracket()) && !At(TK.Eof())) {
@@ -4125,7 +4140,9 @@ public class Parser {
                 }
                 Expect(TK.RBracket());
                 if (commas == 0) { n.op = n.op + 1; }
+                rk = rk + "," + Convert.ToString(commas + 1);
             }
+            n.arrRanks = rk;
         } else if (At(TK.LParen())) {
             int k0 = n.kids.Count;
             ParseArgs(n);
@@ -4140,10 +4157,32 @@ public class Parser {
         // An array keeps ival == 1 with the elements as kids: `new T[] { a, b }`
         // is an array initializer, and array-new also carries no args node.
         if (At(TK.LBrace())) {
-            if (n.ival != 1) { n.ival = 2; }
-            ParseBraceItems(n);
+            if (n.ival != 1) { n.ival = 2; ParseBraceItems(n); }
+            else { ParseArrayInitItems(n); }
         }
         return n;
+    }
+
+    // The items of an ARRAY initializer: `new T[] { a, b }`. A nested brace
+    // group is flattened into the item list -- the C host does the same
+    // (`new int[2,2] { {1,2},{3,4} }` is four row-major items).
+    void ParseArrayInitItems(Node n) {
+        Expect(TK.LBrace());
+        while (!At(TK.RBrace()) && !At(TK.Eof())) {
+            if (At(TK.LBrace())) {
+                // a nested group: its items join the flat item list
+                Next();
+                while (!At(TK.RBrace()) && !At(TK.Eof())) {
+                    n.Add(ParseExpr());
+                    if (!Eat(TK.Comma())) { break; }
+                }
+                Expect(TK.RBrace());
+            } else {
+                n.Add(ParseExpr());
+            }
+            if (!Eat(TK.Comma())) { break; }
+        }
+        Expect(TK.RBrace());
     }
 
     // brace-initializer items between `{ }`: plain expressions (list items,
