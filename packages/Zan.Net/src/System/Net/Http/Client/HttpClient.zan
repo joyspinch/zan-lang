@@ -18,6 +18,11 @@ public delegate bool HttpCancelFn();
 // 见 <see cref="HttpClient.SetUploadProbe"/>。
 public delegate void HttpUploadProgressFn(int sentBytes, int totalBytes);
 
+// 内容编码解码器：按 Content-Encoding 的值解码响应正文（gzip /
+// deflate 等）。返回 null 表示解码失败或不支持该编码。
+// 见 <see cref="HttpClient.SetContentDecoder"/>。
+public delegate byte[] HttpContentDecoder(string encoding, byte[] data);
+
 // 字节通道的重定向驱动：在给定客户端上以指定方法发出一次
 // 请求并返回响应。HttpClient 的字节重定向循环以它为回调在当前/下一跳
 // 客户端上重放；方法由循环按 301/302/303 改写规则传入。
@@ -76,6 +81,11 @@ public class HttpClient : IDisposable {
     HttpCancelFn cancelProbe;
     // 上传进度探针；null = 不报进度（见 SetUploadProbe）。
     HttpUploadProgressFn uploadProbe;
+    // 内容解码器；null = 不解码（见 SetContentDecoder）。没装解码器又
+    // 碰上带 Content-Encoding 的响应时直接报错，不把压缩字节当正文。
+    HttpContentDecoder contentDecoder;
+    // 全局默认的内容解码器：逐个客户端装配太啰嗦时装一次。
+    static HttpContentDecoder defaultContentDecoder;
     // 共享外部调用预算；null 使用兼容的客户端 timeout 行为。
     ExternalCallPolicy callPolicy;
     string lastDownloadError;
@@ -226,6 +236,106 @@ public class HttpClient : IDisposable {
     public HttpClient SetUploadProbe(HttpUploadProgressFn f) {
         this.uploadProbe = f;
         return this;
+    }
+
+    // 装上内容解码器：响应带 Content-Encoding（gzip / deflate 等）时，
+    // 客户端把正文解码后再交给调用方，解码后的正文长度与内容才是
+    // 调用方看到的那一份。
+    //
+    // 解码器是**注入**的：gzip/deflate 的编解码实现住在压缩包里，
+    // 网络包不能硬依赖压缩包——压缩包不装，网络包就连带编译不过。
+    // 压缩包提供现成的桥，装上即可：
+    //     http.SetContentDecoder(System.IO.Compression.ContentCoding.Decode);
+    //
+    // 没装解码器又碰上带编码的响应时**直接报错**，不把压缩字节当正文
+    // 悄悄返回——那样调用方拿到的是一堆乱码，却没有任何提示。
+    public HttpClient SetContentDecoder(HttpContentDecoder fn) {
+        this.contentDecoder = fn;
+        return this;
+    }
+
+    // 全局默认的内容解码器：应用里客户端很多、逐个装配太啰嗦时在这里
+    // 装一次，没有单独设置解码器的客户端都用它。单个客户端的
+    // SetContentDecoder 优先。
+    public static void SetDefaultContentDecoder(HttpContentDecoder fn) {
+        HttpClient.defaultContentDecoder = fn;
+    }
+
+    // 本客户端实际使用的解码器（自己的优先，其次全局默认）。
+    HttpContentDecoder Decoder() {
+        if (this.contentDecoder != null) { return this.contentDecoder; }
+        return HttpClient.defaultContentDecoder;
+    }
+
+    // 拆分 Content-Encoding 的取值：可能是逗号分隔的多段
+    // （"gzip, br"——按发送顺序逐层编码）。空段丢掉。
+    static List<string> SplitCodings(string header) {
+        List<string> out2 = new List<string>();
+        if (header == null) { return out2; }
+        int pos = 0;
+        int len = header.Length;
+        while (pos <= len) {
+            int comma = header.IndexOf(",", pos);
+            int stop = comma < 0 ? len : comma;
+            string one = header.Substring(pos, stop - pos).Trim().ToLower();
+            if (one.Length > 0) { out2.Add(one); }
+            if (comma < 0) { break; }
+            pos = comma + 1;
+        }
+        return out2;
+    }
+
+    // 按 Content-Encoding 解码响应正文。没有编码、或响应本来就没有
+    // 正文（1xx/204/304）时原样返回。
+    //
+    // 编码是**按发送顺序逐层套上去**的，解码要反过来：先解最后一层。
+    // 解码器没装 → 报错并说清缺什么；解码失败（返回 null）→ 报错。
+    // 两种情况都不把压缩字节当正文交出去。
+    HttpResponse ApplyContentEncoding(HttpResponse resp) {
+        if (resp == null) { return resp; }
+        int status = resp.statusCode;
+        if (status >= 100 && status < 200) { return resp; }
+        if (status == 204 || status == 304) { return resp; }
+        string header = resp.GetHeader("Content-Encoding");
+        List<string> codings = HttpClient.SplitCodings(header);
+        if (codings.Count == 0) { return resp; }
+        bool identityOnly = true;
+        for (int i = 0; i < codings.Count; i = i + 1) {
+            if (codings[i] != "identity") { identityOnly = false; }
+        }
+        if (identityOnly) { return resp; }
+        // 没有正文就没有可解码的东西（HEAD 响应、空正文 200 都属这类）。
+        // 此时不报错——一个"空的 gzip 正文"和"根本没发正文"在线路上
+        // 分不开，硬解只会得到一个假失败。
+        if (resp.body == null || resp.body.Length == 0) { return resp; }
+        HttpContentDecoder decoder = this.Decoder();
+        if (decoder == null) {
+            throw new HttpRequestException("response is " + header
+                + "-encoded but no content decoder is configured");
+        }
+        bool wasBinary = resp.IsBinary();
+        byte[] cur = resp.body.ToBytes();
+        for (int i = codings.Count - 1; i >= 0; i = i - 1) {
+            string coding = codings[i];
+            if (coding == "identity") { continue; }
+            byte[] decoded = decoder(coding, cur);
+            if (decoded == null) {
+                throw new HttpRequestException("failed to decode "
+                    + coding + "-encoded response body");
+            }
+            cur = decoded;
+        }
+        resp.body = cur.ToStr(0, cur.Length);
+        if (wasBinary) {
+            resp.bodyBytes = cur;
+            resp.bodyBytesLen = cur.Length;
+        } else {
+            resp.bodyBytes = null;
+            resp.bodyBytesLen = 0;
+        }
+        resp.contentDecoded = true;
+        resp.contentEncoding = header.Trim().ToLower();
+        return resp;
     }
 
     // 探针非空时上报一次进度；装探针的调用点在发送循环里，成本只有
@@ -1852,7 +1962,7 @@ public class HttpClient : IDisposable {
     // 与一个负载古怪的 200 响应本来无法区分。
     async HttpResponse SendAsync(string method, string path, string body) {
         string raw = await RequestAsync(method, path, body);
-        return HttpResponse.Parse(raw);
+        return this.ApplyContentEncoding(HttpResponse.Parse(raw));
     }
 
     // 二进制安全的一次性请求。通道与 <see cref="SendAsync"/>
@@ -1878,10 +1988,11 @@ public class HttpClient : IDisposable {
         if (this.callPolicy == null || this.callPolicy.MaxRedirects() <= 0) {
             HttpResponse direct = await HttpClient.SendBytesOnceWithLenAsync(this,
                 method, path, body, bodyLen);
-            return direct;
+            return this.ApplyContentEncoding(direct);
         }
-        return await this.FollowBytesRedirects(method, path, body,
+        HttpResponse followed = await this.FollowBytesRedirects(method, path, body,
             HttpClient.SendBytesOnceAsync);
+        return this.ApplyContentEncoding(followed);
     }
 
     // 发送原始字节数组（带显式字节长度，二进制安全，零中转字符串拷贝）。
@@ -1891,7 +2002,7 @@ public class HttpClient : IDisposable {
         this.CheckTargetPolicy();
         HttpResponse direct = await HttpClient.SendBytesOnceWithRawBytesAsync(this,
             method, path, body, bodyLen);
-        return direct;
+        return this.ApplyContentEncoding(direct);
     }
 
     // 流式上传本地文件作为请求正文（适用于 PUT / POST 原始文件上传，如 WebDAV、对象存储等），
@@ -3436,6 +3547,20 @@ public class HttpClient : IDisposable {
         // 下面的 Range 解析仍需要头部文本。
         head = headOnly;
 
+        // 下载通道不解码内容编码：落盘的是服务器给的字节，若那是一段
+        // gzip，存下来的文件就是压缩过的。明确报错，不让调用方拿到
+        // 一个"看着下完了、其实解不开"的文件。
+        string downloadEnc = HttpClient.HeadHeader(head, "Content-Encoding");
+        if (downloadEnc != null && downloadEnc.Length > 0
+            && downloadEnc.Trim().ToLower() != "identity") {
+            HttpDeadline.Disarm(watch);
+            if (this.useTls) { stream.Close(); conn.Close(); ctx.Free(); }
+            else { conn.Close(); }
+            this.SetDownloadError("下载响应带 " + downloadEnc
+                + " 内容编码，下载通道不解码");
+            return 0 - 1;
+        }
+
         if (status == 416) {
             bool complete = HttpClient.RangeAlreadyComplete(head, have);
             HttpDeadline.Disarm(watch);
@@ -3814,6 +3939,18 @@ public class HttpClient : IDisposable {
         int status = HttpClient.HeadStatus(headText);
         if (HttpClient.HeadIsChunked(headText)) {
             this.SetDownloadError("响应使用了不支持的 chunked 传输");
+            HttpDeadline.Disarm(watch);
+            if (this.useTls) { stream.Close(); conn.Close(); ctx.Free(); }
+            else { conn.Close(); }
+            return 0 - 1;
+        }
+        // 下载通道不解码内容编码（与 Range 通道同一口径）：落盘的要是
+        // 一段 gzip，调用方拿到的就是压缩过的文件。明确报错。
+        string downloadEnc = HttpClient.HeadHeader(headText, "Content-Encoding");
+        if (downloadEnc != null && downloadEnc.Length > 0
+            && downloadEnc.Trim().ToLower() != "identity") {
+            this.SetDownloadError("下载响应带 " + downloadEnc
+                + " 内容编码，下载通道不解码");
             HttpDeadline.Disarm(watch);
             if (this.useTls) { stream.Close(); conn.Close(); ctx.Free(); }
             else { conn.Close(); }

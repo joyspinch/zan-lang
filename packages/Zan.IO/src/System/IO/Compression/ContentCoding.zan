@@ -1,0 +1,43 @@
+using System;
+
+namespace System.IO.Compression;
+
+// HTTP 内容编码的解码桥：把 Content-Encoding 头指名的编码映射到本包
+// 的编解码实现。装到 HTTP 客户端上，客户端就自动解压：
+//
+//     http.SetContentDecoder(System.IO.Compression.ContentCoding.Decode);
+//
+// 为什么是"注入"而不是客户端直接调用：gzip/deflate 的实现在压缩包里，
+// 网络包不能硬依赖压缩包——压缩包不装，网络包就连带编译不过。压缩包
+// 提供实现，调用方把解码器注入给客户端，两边都不绑死。
+public class ContentCoding {
+    // 按 Content-Encoding 解码响应正文。gzip / x-gzip / deflate；
+    // 其它编码或解码失败返回 null（调用方据此报错，不把压缩字节当正文）。
+    public static byte[] Decode(string encoding, byte[] data) {
+        if (encoding == null || data == null) { return null; }
+        string enc = encoding.Trim().ToLower();
+        if (enc == "gzip" || enc == "x-gzip") {
+            return GZip.Decompress(data);
+        }
+        if (enc == "deflate") {
+            return ContentCoding.InflateDeflate(data);
+        }
+        return null;
+    }
+
+    // deflate 在 HTTP 里有两种线上形态：RFC 1950 的 zlib 包装（2 字节头
+    // + deflate 流 + adler32 尾）和裸 DEFLATE 流，服务器两种都发过。
+    // 按 zlib 头判定（CM=8，且 (CMF<<8|FLG) 是 31 的倍数）决定要不要
+    // 跳过那 2 字节——猜错就会解出一堆垃圾或直接失败。
+    static byte[] InflateDeflate(byte[] data) {
+        if (data.Length >= 2) {
+            int cmf = data[0] & 255;
+            int flg = data[1] & 255;
+            bool zlib = (cmf & 15) == 8 && ((cmf * 256 + flg) % 31) == 0;
+            if (zlib) {
+                return Deflate.Inflate(data, 2, data.Length - 2, 0);
+            }
+        }
+        return Deflate.Inflate(data, 0, data.Length, 0);
+    }
+}

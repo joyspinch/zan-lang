@@ -1,0 +1,166 @@
+using System;
+using System.IO;
+using System.IO.Compression;
+using System.Net.Sockets;
+using System.Net.Http;
+using System.Net.Http.Client;
+using System.Threading;
+
+// HTTP 内容编码（Content-Encoding）解码：
+// 1. 装了解码器，gzip 响应自动解压，正文是原文；
+// 2. 没装解码器且响应带编码 → 报错，不把压缩字节当正文；
+// 3. deflate 的两种线上形态（裸流 / zlib 包装）都能解；
+// 4. identity 不解码、不报错；未知编码报错；
+// 5. 二进制通道解码后 bodyBytes 仍是解码后的字节；
+// 6. 下载通道不解码 —— 带编码的响应明确报错，不落一个压缩过的文件。
+class Program {
+    static int PORT = 9693;
+    static int failures = 0;
+    static string plain =
+        "hello gzip world, a compressible payload for the content encoding test.";
+
+    static void Check(bool cond, string name) {
+        if (cond) {
+            Console.WriteLine("ok " + name);
+        } else {
+            Console.WriteLine("FAIL " + name);
+            failures = failures + 1;
+        }
+    }
+
+    static async HttpResponse Handle(HttpRequest req) {
+        string path = req.path;
+        if (path == "/gzip") {
+            byte[] gz = GZip.Compress(Program.plain.ToBytes(), 6);
+            HttpResponse r = HttpResponse.Bytes(gz, gz.Length, "text/plain");
+            return r.SetHeader("Content-Encoding", "gzip");
+        }
+        if (path == "/deflate") {
+            byte[] df = Deflate.Deflate(Program.plain.ToBytes(), 6);
+            HttpResponse r = HttpResponse.Bytes(df, df.Length, "text/plain");
+            return r.SetHeader("Content-Encoding", "deflate");
+        }
+        if (path == "/zlib") {
+            byte[] zl = Deflate.ZlibCompress(Program.plain.ToBytes(), 6);
+            HttpResponse r = HttpResponse.Bytes(zl, zl.Length, "text/plain");
+            return r.SetHeader("Content-Encoding", "deflate");
+        }
+        if (path == "/identity") {
+            HttpResponse r = HttpResponse.Text(Program.plain);
+            return r.SetHeader("Content-Encoding", "identity");
+        }
+        if (path == "/br") {
+            HttpResponse r = HttpResponse.Text(Program.plain);
+            return r.SetHeader("Content-Encoding", "br");
+        }
+        if (path == "/plain") {
+            return HttpResponse.Text(Program.plain);
+        }
+        return HttpResponse.NotFound();
+    }
+
+    static async int Run() {
+        Socket.Initialize();
+        HttpServer server = new HttpServer("127.0.0.1", PORT);
+        server.OnRequest(Program.Handle);
+        Task.Spawn(server.Start());
+        await Task.Delay(80);
+
+        // 1. 没装解码器：带编码的响应必须报错，不能把压缩字节当正文。
+        {
+            HttpClient bare = new HttpClient("127.0.0.1", PORT);
+            bare.SetTimeout(5000);
+            bool threw = false;
+            string msg = "";
+            try {
+                HttpResponse r = await bare.SendAsync("GET", "/gzip", "");
+                msg = "body=" + r.body;
+            } catch (HttpRequestException e) {
+                threw = true;
+                msg = e.Message;
+            }
+            Check(threw && msg.IndexOf("no content decoder") >= 0,
+                "missing decoder is an error");
+            bare.Close();
+        }
+
+        // 2. 装了解码器：gzip 自动解压。
+        HttpClient c = new HttpClient("127.0.0.1", PORT);
+        c.SetTimeout(5000);
+        c.SetContentDecoder(ContentCoding.Decode);
+        {
+            HttpResponse gz = await c.SendAsync("GET", "/gzip", "");
+            Check(gz.statusCode == 200 && gz.body == Program.plain
+                && gz.contentDecoded && gz.contentEncoding == "gzip",
+                "gzip response is decoded");
+        }
+
+        // 3. deflate：裸流与 zlib 包装两种形态。
+        {
+            HttpResponse df = await c.SendAsync("GET", "/deflate", "");
+            Check(df.body == Program.plain, "raw deflate response is decoded");
+            HttpResponse zl = await c.SendAsync("GET", "/zlib", "");
+            Check(zl.body == Program.plain, "zlib deflate response is decoded");
+        }
+
+        // 4. identity：不解码也不报错；没有编码头：正文原样。
+        {
+            HttpResponse id = await c.SendAsync("GET", "/identity", "");
+            Check(id.body == Program.plain && !id.contentDecoded,
+                "identity encoding is left alone");
+            HttpResponse pl = await c.SendAsync("GET", "/plain", "");
+            Check(pl.body == Program.plain && !pl.contentDecoded,
+                "unencoded response is left alone");
+        }
+
+        // 5. 未知编码：解码器返回 null → 报错，不返回乱码正文。
+        {
+            bool threw = false;
+            string msg = "";
+            try {
+                HttpResponse br = await c.SendAsync("GET", "/br", "");
+                msg = "body=" + br.body;
+            } catch (HttpRequestException e) {
+                threw = true;
+                msg = e.Message;
+            }
+            Check(threw && msg.IndexOf("failed to decode") >= 0,
+                "unknown encoding is an error");
+        }
+
+        // 6. 二进制通道：解码后 bodyBytes 是解码后的字节。
+        {
+            HttpResponse bin = await c.SendBytesAsync("GET", "/gzip", "");
+            byte[] bytes = bin.bodyBytes;
+            Check(bin.statusCode == 200 && bin.contentDecoded
+                && bytes != null && bytes.Length == Program.plain.Length
+                && (bytes[0] & 255) == 104,
+                "binary channel decodes content encoding");
+        }
+
+        // 7. 下载通道不解码：带编码的响应明确报错，不落压缩过的文件。
+        {
+            string path = Path.Combine(Path.GetTempPath(),
+                "zan_http_content_encoding.bin");
+            if (File.Exists(path)) { File.Delete(path); }
+            HttpClient dl = new HttpClient("127.0.0.1", PORT);
+            dl.SetTimeout(5000);
+            long rc = await dl.DownloadBinaryToFileAsync("/gzip", path);
+            string err = dl.LastDownloadError();
+            Check(rc < 0 && err.IndexOf("内容编码") >= 0,
+                "download refuses encoded response");
+            dl.Close();
+            if (File.Exists(path)) { File.Delete(path); }
+        }
+
+        c.Close();
+        server.Stop();
+        for (int i = 0; i < 20; i = i + 1) { await Task.Delay(10); }
+        Console.WriteLine("failures=" + Convert.ToString(Program.failures));
+        return 0;
+    }
+
+    static void Main() {
+        int r = await Program.Run();
+    }
+}
