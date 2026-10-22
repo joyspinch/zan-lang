@@ -1,0 +1,433 @@
+using System;
+using System.Collections.Generic;
+using System.Data.Orm;
+using System.Json;
+using System.Web;
+using ZanWeb.Model.Flow;
+using ZanWeb.Model;
+using ZanWeb.Ai;
+using ZanWeb.Modules.Flow;
+
+namespace ZanWeb.Api;
+
+/* 工作流程的 AI 工具分配管理（桌面端「AI 分配」页 + 流程引擎的 AI 节点）。
+   一件事两件事：
+     - **分配**：流程的 AI 节点（flow_node.kind=ai）可以绑多个智能体
+       （工具），priority 定高可用顺序（数字小优先），随时停用/启用、
+       调序、解绑。
+     - **高可用派发**：节点执行时按 priority 依次试这些工具，第一个失败
+       自动降级到下一个；连续失败达阈值的工具转 degraded 并进入冷却，
+       冷却期内不再被选中；成功一次即归零回 healthy。全部工具都不可用
+       才报错，并把降级链如实回给调用方（用了哪个、跳过了谁、为什么）。
+
+   口径：
+     - 模型与密钥都在服务端（ZanWeb.Ai），客户端只管分配与查看；
+     - 租户闸：分配与健康表读写两侧同补 tenantId == Tenant.Cur()；
+     - 节点本身没有 tenantId，租户归属经父流程（flow_def）判定；
+     - 健康状态落库而不是放内存：服务端多 worker，内存视图各 worker
+       不共享，降级决策会各说各话。 */
+[Route("api/flowagent/[action]")]
+[Custom(Authorization = CustomAuthorization.ApiAuth)]
+[Description("流程 AI 工具分配")]
+public class FlowAgentApi : ApiController {
+
+    /* 连续失败到多少次算降级（进冷却）。 */
+    public static const int FailThreshold = 3;
+
+    /* 降级后的冷却秒数：冷却期内不优先选它，但全挂了仍会试。 */
+    public static const int CooldownSec = 60;
+
+    /* ---- 读 ---- */
+
+    /* 流程清单（启用中的）：附 AI 节点数与已分配的工具数——分配页左栏
+       的数据源，一眼看出哪些流程还没配 AI 工具。 */
+    [HttpGet]
+    [Description("流程清单")]
+    [Custom(Perm = PermBit.View)]
+    async void Defs() {
+        List<FlowDef> defs = await this.FlowDef
+            .Where(a => a.tenantId == Tenant.Cur() && a.status == 1)
+            .OrderBy(a => a.id).ToListAsync();
+        List<FlowNode> nodes = await this.FlowNode.Where(a => a.defId > 0).ToListAsync();
+        List<FlowNodeAgent> binds = await this.FlowNodeAgent
+            .Where(a => a.tenantId == Tenant.Cur()).ToListAsync();
+        JsonValue items = JsonValue.NewArray();
+        for (int i = 0; i < defs.Count; i = i + 1) {
+            FlowDef d = defs[i];
+            int aiNodes = 0;
+            int tools = 0;
+            for (int k = 0; k < nodes.Count; k = k + 1) {
+                if (nodes[k].defId != d.id) { continue; }
+                if (nodes[k].kind != "ai") { continue; }
+                aiNodes = aiNodes + 1;
+                for (int b = 0; b < binds.Count; b = b + 1) {
+                    if (binds[b].nodeId == nodes[k].id && binds[b].enabled == 1) {
+                        tools = tools + 1;
+                    }
+                }
+            }
+            JsonValue o = JsonValue.NewObject();
+            o.Put("id", JsonValue.NewStr(Convert.ToString(d.id)));
+            o.Put("name", JsonValue.NewStr(d.name));
+            o.Put("description", JsonValue.NewStr(d.description));
+            o.Put("aiNodes", JsonValue.NewStr(Convert.ToString(aiNodes)));
+            o.Put("tools", JsonValue.NewStr(Convert.ToString(tools)));
+            items.Append(o);
+        }
+        JsonValue body = JsonValue.NewObject();
+        body.Put("defs", items);
+        this.Ok(body.ToJson());
+    }
+
+    /* 节点分配视图：某流程的节点链（AI 节点带已绑工具与健康）+
+       助手清单（供客户端列"可绑定"的工具）。 */
+    [HttpGet]
+    [Description("节点分配视图")]
+    [Custom(Perm = PermBit.View)]
+    async void Nodes() {
+        int defId = this.InInt("defId", 0);
+        FlowDef def = await this.FlowDef
+            .Where(a => a.id == defId && a.tenantId == Tenant.Cur()).FirstAsync();
+        if (def == null) { this.Fail(404, "流程不存在"); return; }
+        List<FlowNode> nodes = await this.FlowNode.Where(a => a.defId == defId).ToListAsync();
+        List<FlowNode> ordered = Engine.SortNodes(nodes);
+        List<FlowNodeAgent> binds = await this.FlowNodeAgent
+            .Where(a => a.tenantId == Tenant.Cur() && a.defId == defId)
+            .OrderBy(a => a.priority).ToListAsync();
+        long now = WebApp.NowSeconds();
+        JsonValue items = JsonValue.NewArray();
+        for (int i = 0; i < ordered.Count; i = i + 1) {
+            FlowNode n = ordered[i];
+            JsonValue o = JsonValue.NewObject();
+            o.Put("id", JsonValue.NewStr(Convert.ToString(n.id)));
+            o.Put("name", JsonValue.NewStr(n.name));
+            o.Put("sort", JsonValue.NewStr(Convert.ToString(n.sort)));
+            o.Put("kind", JsonValue.NewStr(n.kind));
+            o.Put("aiPrompt", JsonValue.NewStr(n.aiPrompt));
+            JsonValue arr = JsonValue.NewArray();
+            for (int b = 0; b < binds.Count; b = b + 1) {
+                FlowNodeAgent a = binds[b];
+                if (a.nodeId != n.id) { continue; }
+                FlowAgentHealth h = await this.HealthOf(a.agentCode);
+                arr.Append(FlowAgentApi.BindJson(a, h, now));
+            }
+            o.Put("agents", arr);
+            items.Append(o);
+        }
+        /* 助手清单：客户端据此列"可绑定"的工具（code/name/hint/icon）。 */
+        JsonValue cats = JsonValue.NewArray();
+        List<AiAgent> all = Ai.Agents();
+        for (int i = 0; i < all.Count; i = i + 1) {
+            AiAgent a = all[i];
+            FlowAgentHealth h = await this.HealthOf(a.code);
+            JsonValue o = JsonValue.NewObject();
+            o.Put("code", JsonValue.NewStr(a.code));
+            o.Put("name", JsonValue.NewStr(a.name));
+            o.Put("hint", JsonValue.NewStr(a.hint));
+            o.Put("icon", JsonValue.NewStr(a.icon));
+            o.Put("state", JsonValue.NewStr(h == null ? "healthy" : h.state));
+            o.Put("failures", JsonValue.NewStr(Convert.ToString(h == null ? 0 : h.failures)));
+            o.Put("lastError", JsonValue.NewStr(h == null ? "" : h.lastError));
+            cats.Append(o);
+        }
+        JsonValue body = JsonValue.NewObject();
+        body.Put("id", JsonValue.NewStr(Convert.ToString(def.id)));
+        body.Put("name", JsonValue.NewStr(def.name));
+        body.Put("nodes", items);
+        body.Put("catalog", cats);
+        this.Ok(body.ToJson());
+    }
+
+    /* 健康清单：各工具的可用性（客户端顶部健康条用）。 */
+    [HttpGet]
+    [Description("AI 工具健康")]
+    [Custom(Perm = PermBit.View)]
+    async void Health() {
+        long now = WebApp.NowSeconds();
+        JsonValue items = JsonValue.NewArray();
+        List<AiAgent> all = Ai.Agents();
+        for (int i = 0; i < all.Count; i = i + 1) {
+            AiAgent a = all[i];
+            FlowAgentHealth h = await this.HealthOf(a.code);
+            JsonValue o = JsonValue.NewObject();
+            o.Put("agentCode", JsonValue.NewStr(a.code));
+            o.Put("name", JsonValue.NewStr(a.name));
+            o.Put("state", JsonValue.NewStr(h == null ? "healthy" : h.state));
+            o.Put("failures", JsonValue.NewStr(Convert.ToString(h == null ? 0 : h.failures)));
+            o.Put("lastError", JsonValue.NewStr(h == null ? "" : h.lastError));
+            o.Put("lastOkAt", JsonValue.NewStr(Convert.ToString(h == null ? 0 : h.lastOkAt)));
+            o.Put("lastFailAt", JsonValue.NewStr(Convert.ToString(h == null ? 0 : h.lastFailAt)));
+            o.Put("cooldownUntil", JsonValue.NewStr(Convert.ToString(h == null ? 0 : h.cooldownUntil)));
+            o.Put("cooling", JsonValue.NewStr(h != null && h.cooldownUntil > now ? "1" : "0"));
+            items.Append(o);
+        }
+        JsonValue body = JsonValue.NewObject();
+        body.Put("items", items);
+        this.Ok(body.ToJson());
+    }
+
+    /* ---- 写 ---- */
+
+    /* 绑定一个工具到节点：nodeId + agentCode；priority 缺省按当前最大 +1
+       （新工具排在最后）。同一节点同一工具不重复绑。 */
+    [HttpPost]
+    [Description("绑定 AI 工具")]
+    [Custom(Perm = PermBit.Update)]
+    async void Bind() {
+        int nodeId = this.InInt("nodeId", 0);
+        string code = this.Need("agentCode", "工具");
+        FlowNode node = await this.FlowNode.Where(a => a.id == nodeId).FirstAsync();
+        if (node == null) { this.Fail(404, "节点不存在"); return; }
+        FlowDef def = await this.FlowDef
+            .Where(a => a.id == node.defId && a.tenantId == Tenant.Cur()).FirstAsync();
+        if (def == null) { this.Fail(404, "流程不存在"); return; }
+        if (node.kind != "ai") { this.Fail(400, "只有 AI 节点能分配工具"); return; }
+        List<AiAgent> all = Ai.Agents();
+        bool known = false;
+        for (int i = 0; i < all.Count; i = i + 1) {
+            if (all[i].code == code) { known = true; }
+        }
+        if (!known) { this.Fail(400, "工具不存在"); return; }
+        FlowNodeAgent has = await this.FlowNodeAgent
+            .Where(a => a.tenantId == Tenant.Cur() && a.nodeId == nodeId
+                && a.agentCode == code).FirstAsync();
+        if (has != null) { this.Fail(409, "该工具已绑定"); return; }
+        int priority = this.InInt("priority", 0);
+        if (priority <= 0) {
+            int max = 0;
+            List<FlowNodeAgent> rows = await this.FlowNodeAgent
+                .Where(a => a.tenantId == Tenant.Cur() && a.nodeId == nodeId).ToListAsync();
+            for (int i = 0; i < rows.Count; i = i + 1) {
+                if (rows[i].priority > max) { max = rows[i].priority; }
+            }
+            priority = max + 1;
+        }
+        long now = WebApp.NowSeconds();
+        FlowNodeAgent a2 = new FlowNodeAgent();
+        a2.tenantId = Tenant.Cur();
+        a2.defId = def.id;
+        a2.nodeId = nodeId;
+        a2.agentCode = code;
+        a2.priority = priority;
+        a2.enabled = 1;
+        a2.note = this.In("note");
+        a2.createdBy = Filter.ToInt(this.uid, 0);
+        a2.createdAt = now;
+        a2.updatedAt = now;
+        int id = await this.FlowNodeAgent.Insert(a2).ExecuteIdentityAsync();
+        JsonValue body = JsonValue.NewObject();
+        body.Put("id", JsonValue.NewStr(Convert.ToString(id)));
+        this.Ok(body.ToJson());
+    }
+
+    /* 解绑：配置行删除（历史健康记录留着，不影响工具本身）。 */
+    [HttpPost]
+    [Description("解绑 AI 工具")]
+    [Custom(Perm = PermBit.Update)]
+    async void Unbind() {
+        int id = this.InInt("id", 0);
+        int n = await this.FlowNodeAgent.Delete()
+            .Where(a => a.id == id && a.tenantId == Tenant.Cur())
+            .ExecuteAffrowsAsync();
+        if (n < 1) { this.Fail(404, "分配不存在"); return; }
+        JsonValue body = JsonValue.NewObject();
+        body.Put("ok", JsonValue.NewStr("1"));
+        this.Ok(body.ToJson());
+    }
+
+    /* 启用/停用：停用不删配置（工具临时下线，随时可开）。 */
+    [HttpPost]
+    [Description("启停 AI 工具")]
+    [Custom(Perm = PermBit.Update)]
+    async void Toggle() {
+        int id = this.InInt("id", 0);
+        int on = this.InInt("enabled", 1);
+        int n = await this.FlowNodeAgent.Update()
+            .Set(a => a.enabled, on)
+            .Set(a => a.updatedAt, WebApp.NowSeconds())
+            .Where(a => a.id == id && a.tenantId == Tenant.Cur())
+            .ExecuteAffrowsAsync();
+        if (n < 1) { this.Fail(404, "分配不存在"); return; }
+        JsonValue body = JsonValue.NewObject();
+        body.Put("ok", JsonValue.NewStr("1"));
+        this.Ok(body.ToJson());
+    }
+
+    /* 调优先级：数字小优先（1 是首选）。改完不重排别人的号——同号按
+       id 次序稳定排序，客户端按号显示即可。 */
+    [HttpPost]
+    [Description("调整 AI 工具优先级")]
+    [Custom(Perm = PermBit.Update)]
+    async void Priority() {
+        int id = this.InInt("id", 0);
+        int priority = this.InInt("priority", 1);
+        if (priority < 1) { priority = 1; }
+        int n = await this.FlowNodeAgent.Update()
+            .Set(a => a.priority, priority)
+            .Set(a => a.updatedAt, WebApp.NowSeconds())
+            .Where(a => a.id == id && a.tenantId == Tenant.Cur())
+            .ExecuteAffrowsAsync();
+        if (n < 1) { this.Fail(404, "分配不存在"); return; }
+        JsonValue body = JsonValue.NewObject();
+        body.Put("ok", JsonValue.NewStr("1"));
+        this.Ok(body.ToJson());
+    }
+
+    /* 高可用派发：按 priority 依次试节点绑定的工具，失败自动降级到下一个。
+       返回用了哪个工具、降级链（谁失败、失败原因）与尝试次数；全部不
+       可用才报错——降级链照样回给调用方，便于定位。 */
+    [HttpPost]
+    [Description("按高可用顺序派发给 AI 工具")]
+    [Custom(Perm = PermBit.Update)]
+    async void Dispatch() {
+        int nodeId = this.InInt("nodeId", 0);
+        string q = this.Need("q", "内容");
+        string history = this.In("history");
+        if (history.Length == 0) { history = "[]"; }
+        FlowNode node = await this.FlowNode.Where(a => a.id == nodeId).FirstAsync();
+        if (node == null) { this.Fail(404, "节点不存在"); return; }
+        FlowDef def = await this.FlowDef
+            .Where(a => a.id == node.defId && a.tenantId == Tenant.Cur()).FirstAsync();
+        if (def == null) { this.Fail(404, "流程不存在"); return; }
+        List<FlowNodeAgent> binds = await this.FlowNodeAgent
+            .Where(a => a.tenantId == Tenant.Cur() && a.nodeId == nodeId
+                && a.enabled == 1)
+            .OrderBy(a => a.priority).ToListAsync();
+        if (binds.Count == 0) {
+            this.Fail(400, "该节点没有可用的 AI 工具");
+            return;
+        }
+        long now = WebApp.NowSeconds();
+        JsonValue degraded = JsonValue.NewArray();
+        int attempts = 0;
+        for (int i = 0; i < binds.Count; i = i + 1) {
+            FlowNodeAgent bind = binds[i];
+            FlowAgentHealth h = await this.HealthOf(bind.agentCode);
+            bool cooling = h != null && h.cooldownUntil > now;
+            /* 冷却中的工具先跳过（还有别的可试时）；都冷却了就照试——
+               宁可慢，也不能因为"在冷却"就一个都不试。 */
+            if (cooling && binds.Count > 1) {
+                JsonValue d = JsonValue.NewObject();
+                d.Put("agent", JsonValue.NewStr(bind.agentCode));
+                d.Put("error", JsonValue.NewStr("冷却中，跳过"));
+                degraded.Append(d);
+                continue;
+            }
+            attempts = attempts + 1;
+            AiReply rep = await Ai.AskConv(bind.agentCode, history, q);
+            if (rep.ok) {
+                await this.MarkOk(bind.agentCode);
+                JsonValue body = JsonValue.NewObject();
+                body.Put("agent", JsonValue.NewStr(bind.agentCode));
+                body.Put("text", JsonValue.NewStr(rep.text));
+                body.Put("attempts", JsonValue.NewStr(Convert.ToString(attempts)));
+                body.Put("degraded", degraded);
+                this.Ok(body.ToJson());
+                return;
+            }
+            await this.MarkFail(bind.agentCode, rep.text);
+            JsonValue d2 = JsonValue.NewObject();
+            d2.Put("agent", JsonValue.NewStr(bind.agentCode));
+            d2.Put("error", JsonValue.NewStr(rep.text));
+            degraded.Append(d2);
+        }
+        /* 全挂了：把降级链如实写进错误文案（"工具: 原因"），调用方一眼
+           看出是哪个工具先挂的、为什么挂。 */
+        string chain = "";
+        for (int i = 0; i < degraded.Count(); i = i + 1) {
+            if (i > 0) { chain = chain + "；"; }
+            JsonValue d = degraded.At(i);
+            if (d == null) { continue; }
+            chain = chain + d.Str("agent", "") + ": " + d.Str("error", "");
+        }
+        this.Fail(502, "所有 AI 工具都不可用（" + chain + "）");
+    }
+
+    /* ---- helpers ---- */
+
+    /* 读一条健康记录（没有则 null = 没出过事，按 healthy 算）。 */
+    private async FlowAgentHealth HealthOf(string code) {
+        if (code == null || code.Length == 0) { return null; }
+        return await this.FlowAgentHealth
+            .Where(a => a.tenantId == Tenant.Cur() && a.agentCode == code)
+            .FirstAsync();
+    }
+
+    /* 成功一次：失败数归零、回 healthy、清冷却。 */
+    private async void MarkOk(string code) {
+        long now = WebApp.NowSeconds();
+        FlowAgentHealth h = await this.HealthOf(code);
+        if (h == null) {
+            FlowAgentHealth n = new FlowAgentHealth();
+            n.tenantId = Tenant.Cur();
+            n.agentCode = code;
+            n.state = "healthy";
+            n.failures = 0;
+            n.lastError = "";
+            n.lastOkAt = now;
+            n.lastFailAt = 0;
+            n.cooldownUntil = 0;
+            n.updatedAt = now;
+            int _i = await this.FlowAgentHealth.Insert(n).ExecuteIdentityAsync();
+            return;
+        }
+        int _u = await this.FlowAgentHealth.Update()
+            .Set(a => a.state, "healthy")
+            .Set(a => a.failures, 0)
+            .Set(a => a.lastError, "")
+            .Set(a => a.lastOkAt, now)
+            .Set(a => a.cooldownUntil, 0)
+            .Set(a => a.updatedAt, now)
+            .Where(a => a.id == h.id).ExecuteAffrowsAsync();
+    }
+
+    /* 失败一次：累加失败数；达阈值转 degraded 并进冷却。 */
+    private async void MarkFail(string code, string err) {
+        long now = WebApp.NowSeconds();
+        FlowAgentHealth h = await this.HealthOf(code);
+        if (h == null) {
+            FlowAgentHealth n = new FlowAgentHealth();
+            n.tenantId = Tenant.Cur();
+            n.agentCode = code;
+            n.state = "healthy";
+            n.failures = 1;
+            n.lastError = err;
+            n.lastOkAt = 0;
+            n.lastFailAt = now;
+            n.cooldownUntil = 0;
+            n.updatedAt = now;
+            int _i = await this.FlowAgentHealth.Insert(n).ExecuteIdentityAsync();
+            return;
+        }
+        int fails = h.failures + 1;
+        string state = h.state;
+        long cooldown = h.cooldownUntil;
+        if (fails >= FlowAgentApi.FailThreshold) {
+            state = "degraded";
+            cooldown = now + FlowAgentApi.CooldownSec;
+        }
+        int _u = await this.FlowAgentHealth.Update()
+            .Set(a => a.state, state)
+            .Set(a => a.failures, fails)
+            .Set(a => a.lastError, err)
+            .Set(a => a.lastFailAt, now)
+            .Set(a => a.cooldownUntil, cooldown)
+            .Set(a => a.updatedAt, now)
+            .Where(a => a.id == h.id).ExecuteAffrowsAsync();
+    }
+
+    /* 一条分配 + 其健康状态的 JSON 形态。 */
+    private static JsonValue BindJson(FlowNodeAgent a, FlowAgentHealth h, long now) {
+        JsonValue o = JsonValue.NewObject();
+        o.Put("id", JsonValue.NewStr(Convert.ToString(a.id)));
+        o.Put("agentCode", JsonValue.NewStr(a.agentCode));
+        o.Put("priority", JsonValue.NewStr(Convert.ToString(a.priority)));
+        o.Put("enabled", JsonValue.NewStr(Convert.ToString(a.enabled)));
+        o.Put("note", JsonValue.NewStr(a.note));
+        o.Put("state", JsonValue.NewStr(h == null ? "healthy" : h.state));
+        o.Put("failures", JsonValue.NewStr(Convert.ToString(h == null ? 0 : h.failures)));
+        o.Put("lastError", JsonValue.NewStr(h == null ? "" : h.lastError));
+        o.Put("cooling", JsonValue.NewStr(h != null && h.cooldownUntil > now ? "1" : "0"));
+        return o;
+    }
+}

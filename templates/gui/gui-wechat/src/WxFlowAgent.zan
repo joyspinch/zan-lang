@@ -1,0 +1,529 @@
+using System;
+using System.Collections.Generic;
+using System.Json;
+using System.Text;
+using Gui;
+using Gui.Component;
+using Gui.Widget;
+
+/* AI 分配页：给工作流程的 AI 节点分配 / 管理 AI 工具（智能体）。
+ *
+ * 三段：左栏流程清单（/api/flowagent/defs）、中栏该流程的节点链
+ * （/api/flowagent/nodes?defId=）、右栏工具面板（绑定 / 解绑 / 启停 /
+ * 调优先级 + 试跑）。
+ *
+ * 高可用口径（与服务端 FlowAgentApi 严格一致，客户端不自己另发明）：
+ *   - priority 数字小优先；派发时按序试，第一个失败自动降级到下一个；
+ *   - 连续失败达阈值的工具由服务端记为 degraded 并进入冷却，冷却期
+ *     不再被优先选中（全挂时仍会试——宁慢不空）；
+ *   - 健康状态由服务端落库记账（多 worker 共享），客户端只如实显示。
+ *
+ * 工具与模型都在服务端，客户端只管分配与查看——密钥永不下发。
+ * 页骨架在 WxFlowAgent.html（运行期装载），代码建的控件（ListView /
+ * 工具面板）不带文档作用域类，外观规则在皮肤层。
+ */
+public class WxFlowAgent : Control {
+    ModelBinder binder;
+    App host;
+    ListView<WxFlowDefItem> defList;
+    ListView<WxFlowAgentNode> nodeList;
+    Panel toolBody;
+    Control title;
+    Control summary;
+    Control foot;
+    Control toolTitle;
+
+    List<WxFlowDefItem> defs;
+    List<WxFlowAgentNode> nodes;
+    List<WxFlowTool> catalog;
+    string curDef;
+    string curNode;
+    // 上次试跑的结果（重建面板后还在，别一改配置就丢）。
+    string lastRun;
+
+    WxFlowAgent() {
+        this.InitControl("wxFlowAgent", 5);
+        this.Class = "wxmain";
+        defs = new List<WxFlowDefItem>();
+        nodes = new List<WxFlowAgentNode>();
+        catalog = new List<WxFlowTool>();
+        curDef = "";
+        curNode = "";
+        lastRun = "";
+    }
+
+    // 装载页面：运行期文档建树 → 挂清单与工具面板 → 按名字接事件。
+    void Build(App app) {
+        host = app;
+        Control ui = app.LoadHtmlWith(WxFlowAgentHtml.Doc, null, "");
+        if (ui == null) {
+            // 装载失败（声明层没装 / 文档为空）：给一棵空树，别把 null
+            // 挂进窗口——后面的 Find 全是空指针。
+            Console.WriteLine("WX_FLOWAGENT: AI 分配页文档装载失败");
+            return;
+        }
+        ui.DockFill();
+        this.Add(ui);
+
+        // 左栏流程清单（标准库 ListView；行模板是代码建的控件）。
+        Control defHost = ui.Find("FlowListHost");
+        if (defHost != null) {
+            defList = new ListView<WxFlowDefItem>(WxFlowDefRow.Of);
+            defList.Class = "wxlist grow";
+            defList.Bind(defs);
+            defList.OnSelect(() => { this.PickDef(defList.SelectedIndex()); });
+            defHost.Add(defList);
+        }
+
+        // 中栏节点链（标准库 ListView）。
+        Control nodeHost = ui.Find("FlowNodeHost");
+        if (nodeHost != null) {
+            nodeList = new ListView<WxFlowAgentNode>(WxFlowAgentNodeRow.Of);
+            nodeList.Class = "wxlist grow";
+            nodeList.Bind(nodes);
+            nodeList.OnSelect(() => { this.PickNode(nodeList.SelectedIndex()); });
+            nodeHost.Add(nodeList);
+        }
+
+        // 右栏工具面板：面板本体在代码里建（要按选中节点反复重建），
+        // 文档只给一个宿主。
+        Control toolHost = ui.Find("FlowToolBody");
+        if (toolHost != null) {
+            toolBody = Panel.Column();
+            // grow 类让面板在流式宿主里吃满高度（宿主是 flex 列）：
+            // 面板高度由内容测出来的话，最后一行会被挤扁——内容测量
+            // 发生在子项定高之前，面板比内容矮，剩下的都压给末行。
+            toolBody.Class = "wxflowtoolbody grow";
+            toolBody.Grow();
+            toolHost.Add(toolBody);
+        }
+
+        title = ui.Find("FlowTitle");
+        summary = ui.Find("FlowSummary");
+        foot = ui.Find("FlowFoot");
+        toolTitle = ui.Find("FlowToolTitle");
+
+        binder = new ModelBinder();
+        binder.Handle("flowagent-reload", () => { this.LoadDefs(); });
+        binder.SetRoot(ui, null);
+        binder.Wire();
+        ModelHosts.Register(app, binder);
+    }
+
+    // 进页重拉：分配是别人也会改的配置，进页面就是最新的。
+    void OnShow() {
+        this.LoadDefs();
+    }
+
+    // 拉流程清单。
+    void LoadDefs() {
+        if (!WxNet.LoggedIn()) { return; }
+        WxNetReq r = WxNet.NewReq();
+        WxNet.ApiGet(r, "/api/flowagent/defs", () => {
+            try {
+                if (!WxNet.OkOf(r)) {
+                    this.Foot("加载失败：" + WxNet.ErrOf(r));
+                    return;
+                }
+                JsonValue d = WxNet.DataOf(r);
+                if (d == null) {
+                    this.Foot("加载失败：应答里没有数据");
+                    return;
+                }
+                defs.Clear();
+                JsonValue arr = d.Get("defs");
+                int n = arr == null ? 0 : arr.Count();
+                for (int i = 0; i < n; i = i + 1) {
+                    defs.Add(WxFlowDefItem.FromJson(arr.At(i)));
+                }
+                if (defList != null) { defList.Bind(defs); }
+                // 原来选中的流程还在就接着用（流程可能被删了）。
+                if (this.FindDef(curDef) != null) {
+                    this.OpenDef(curDef);
+                } else if (n > 0) {
+                    this.PickDef(0);
+                } else {
+                    this.ClearAll("这个租户还没有流程");
+                    this.Foot("没有可分配的流程");
+                }
+            } catch (Exception ex) { this.Foot(ex.Message); }
+        });
+    }
+
+    // 点左栏一个流程：拉它的节点链。
+    void PickDef(int index) {
+        if (index < 0 || index >= defs.Count) { return; }
+        this.OpenDef(defs[index].id);
+    }
+
+    void OpenDef(string id) {
+        if (id == "") { return; }
+        curDef = id;
+        WxNetReq r = WxNet.NewReq();
+        WxNet.ApiGet(r, "/api/flowagent/nodes?defId=" + Encoding.UrlEncode(id), () => {
+            try {
+                if (!WxNet.OkOf(r)) {
+                    this.Foot("加载节点失败：" + WxNet.ErrOf(r));
+                    return;
+                }
+                JsonValue d = WxNet.DataOf(r);
+                if (d == null) {
+                    this.Foot("加载节点失败：应答里没有数据");
+                    return;
+                }
+                this.ApplyNodes(d);
+            } catch (Exception ex) { this.Foot(ex.Message); }
+        });
+    }
+
+    // 把节点链铺进中栏，并选一个节点（优先 AI 节点——只有它们能分配工具）。
+    void ApplyNodes(JsonValue d) {
+        nodes.Clear();
+        JsonValue arr = d.Get("nodes");
+        int n = arr == null ? 0 : arr.Count();
+        int ai = 0;
+        for (int i = 0; i < n; i = i + 1) {
+            WxFlowAgentNode it = WxFlowAgentNode.FromJson(arr.At(i));
+            nodes.Add(it);
+            if (it.kind == "ai") { ai = ai + 1; }
+        }
+        catalog.Clear();
+        JsonValue cat = d.Get("catalog");
+        int cn = cat == null ? 0 : cat.Count();
+        for (int i = 0; i < cn; i = i + 1) {
+            catalog.Add(WxFlowTool.FromJson(cat.At(i)));
+        }
+        if (nodeList != null) { nodeList.Bind(nodes); }
+        if (title != null) { title.SetProp("text", d.Str("name", "未命名流程")); }
+        if (summary != null) {
+            summary.SetProp("text", Convert.ToString(n) + " 节点 · "
+                + Convert.ToString(ai) + " AI · 健康 "
+                + Convert.ToString(this.HealthyCount()) + "/"
+                + Convert.ToString(catalog.Count));
+        }
+        // 原来选中的节点还在就接着用；否则先落在一个 AI 节点上。
+        if (this.FindNode(curNode) != null) {
+            this.SelectNode(curNode);
+        } else {
+            curNode = "";
+            for (int i = 0; i < nodes.Count; i = i + 1) {
+                if (nodes[i].kind == "ai") {
+                    curNode = nodes[i].id;
+                    break;
+                }
+            }
+            if (curNode == "" && nodes.Count > 0) { curNode = nodes[0].id; }
+            this.SelectNode(curNode);
+        }
+        this.Foot("就绪");
+        this.Redraw();
+    }
+
+    // 点中栏一个节点：换右栏面板。
+    void PickNode(int index) {
+        if (index < 0 || index >= nodes.Count) { return; }
+        this.SelectNode(nodes[index].id);
+    }
+
+    void SelectNode(string id) {
+        curNode = id;
+        this.BuildPanel();
+        this.Redraw();
+    }
+
+    // ---- 右栏工具面板 ---------------------------------------------------
+
+    // 重建工具面板：选中节点的已分配工具 + 可绑定工具 + 试跑。
+    //
+    // 注意：面板是流式容器（Panel.Column），子项必须走 With()——它会把
+    // 非 grow 的子项归一化成沿流式轴停靠（列里 = 顶部）。Add() 不做这
+    // 步，Flex 行会保留自己的 fill 停靠，结果几行叠在同一个矩形上
+    // （布局自检直接报重叠）。
+    void BuildPanel() {
+        if (toolBody == null) { return; }
+        toolBody.RemoveAll();
+        WxFlowAgentNode node = this.FindNode(curNode);
+        if (node == null) {
+            this.SetToolTitle("工具分配");
+            toolBody.With(Wx.Lbl("先在中间选一个节点", "wxflowhint"));
+            return;
+        }
+        this.SetToolTitle(node.name);
+        if (node.kind != "ai") {
+            toolBody.With(Wx.Lbl("「" + node.name + "」是人工节点，不分配 AI 工具",
+                "wxflowhint"));
+            return;
+        }
+        toolBody.With(Wx.Lbl("已分配工具（按优先级依次尝试，失败自动降级）", "wxflowsec"));
+        if (node.agents.Count == 0) {
+            toolBody.With(Wx.Lbl("还没分配工具", "wxflowhint"));
+        } else {
+            for (int i = 0; i < node.agents.Count; i = i + 1) {
+                toolBody.With(this.BindRow(node, node.agents[i]));
+            }
+        }
+        toolBody.With(Wx.Lbl("可绑定工具", "wxflowsec"));
+        int free = 0;
+        for (int i = 0; i < catalog.Count; i = i + 1) {
+            WxFlowTool t = catalog[i];
+            if (this.IsBound(node, t.code)) { continue; }
+            free = free + 1;
+            toolBody.With(this.CatalogRow(node, t));
+        }
+        if (free == 0) {
+            toolBody.With(Wx.Lbl("目录里的工具都绑上了", "wxflowhint"));
+        }
+        // 试跑：把问题丢给服务端走高可用派发，命中谁、降级链是什么，
+        // 都由服务端如实回传。
+        toolBody.With(Wx.Lbl("试跑（走高可用派发）", "wxflowsec"));
+        TextArea box = new TextArea();
+        box.Class = "wxflowtest";
+        toolBody.With(box);
+        Flex brow = Wx.Row("wxflowrow");
+        Button run = new Button("试跑");
+        run.Class = "primary small";
+        run.OnClick(() => { this.Dispatch(node, box); });
+        brow.Add(run);
+        toolBody.With(brow);
+        if (lastRun.Length > 0) {
+            // 结果按行拆成多个标签：Label 不换行（默认一行，超出即裁），
+            // 一整段塞进一个标签会被截断。
+            List<string> lines = lastRun.Split("\n");
+            for (int i = 0; i < lines.Count; i = i + 1) {
+                if (lines[i].Length == 0) { continue; }
+                toolBody.With(Wx.Lbl(lines[i], "wxflowresult"));
+            }
+        }
+    }
+
+    // 一个已分配工具的一行：优先级 + 名称 + 健康状态 + 四个动作钮。
+    Flex BindRow(WxFlowAgentNode node, WxFlowBind bind) {
+        Flex row = Wx.Row("wxflowrow");
+        row.Add(Wx.Lbl("#" + Convert.ToString(bind.priority), "wxflowpri"));
+        row.Add(Wx.Lbl(this.ToolName(bind.agentCode), "wxflowname"));
+        row.Add(Wx.Lbl(bind.StateZh(), "wxflowstate " + bind.StateCls()));
+        if (!bind.On()) {
+            row.Add(Wx.Lbl("已停用", "wxflowhint"));
+        }
+        Button up = Wx.MiniBtn("↑");
+        up.OnClick(() => { this.SetPriority(bind, bind.priority - 1); });
+        row.Add(up);
+        Button down = Wx.MiniBtn("↓");
+        down.OnClick(() => { this.SetPriority(bind, bind.priority + 1); });
+        row.Add(down);
+        Button tog = Wx.MiniBtn(bind.On() ? "停用" : "启用");
+        tog.OnClick(() => { this.Toggle(bind); });
+        row.Add(tog);
+        Button un = Wx.MiniBtn("解绑");
+        un.Class = "text small error";
+        un.OnClick(() => { this.Unbind(bind); });
+        row.Add(un);
+        return row;
+    }
+
+    // 可绑定工具的一行：名称 + 说明 + 绑定钮。
+    Flex CatalogRow(WxFlowAgentNode node, WxFlowTool t) {
+        Flex row = Wx.Row("wxflowrow");
+        row.Add(Wx.Lbl(t.name, "wxflowname"));
+        row.Add(Wx.Lbl(t.hint, "wxflowhint"));
+        Button b = new Button("绑定");
+        b.Class = "primary small";
+        b.OnClick(() => { this.Bind(node, t.code); });
+        row.Add(b);
+        return row;
+    }
+
+    // ---- 动作 -----------------------------------------------------------
+
+    // 绑定一个工具到节点（服务端按当前最大优先级 +1 排到末位）。
+    void Bind(WxFlowAgentNode node, string code) {
+        WxNetReq r = WxNet.NewReq();
+        WxNet.ApiPost(r, "/api/flowagent/bind",
+            "nodeId=" + Encoding.UrlEncode(node.id)
+            + "&agentCode=" + Encoding.UrlEncode(code), () => {
+                try {
+                    if (!WxNet.OkOf(r)) {
+                        this.Foot("绑定失败：" + WxNet.ErrOf(r));
+                        return;
+                    }
+                    this.Foot("已绑定 " + this.ToolName(code));
+                    this.OpenDef(curDef);
+                } catch (Exception ex) { this.Foot(ex.Message); }
+            });
+    }
+
+    // 解绑：删掉这条分配（工具本身与它的健康记录留着）。
+    void Unbind(WxFlowBind bind) {
+        WxNetReq r = WxNet.NewReq();
+        WxNet.ApiPost(r, "/api/flowagent/unbind",
+            "id=" + Encoding.UrlEncode(bind.id), () => {
+                try {
+                    if (!WxNet.OkOf(r)) {
+                        this.Foot("解绑失败：" + WxNet.ErrOf(r));
+                        return;
+                    }
+                    this.Foot("已解绑 " + this.ToolName(bind.agentCode));
+                    this.OpenDef(curDef);
+                } catch (Exception ex) { this.Foot(ex.Message); }
+            });
+    }
+
+    // 启停：停用不删配置，工具下线随时能开回来。
+    void Toggle(WxFlowBind bind) {
+        int on = bind.On() ? 0 : 1;
+        WxNetReq r = WxNet.NewReq();
+        WxNet.ApiPost(r, "/api/flowagent/toggle",
+            "id=" + Encoding.UrlEncode(bind.id)
+            + "&enabled=" + Convert.ToString(on), () => {
+                try {
+                    if (!WxNet.OkOf(r)) {
+                        this.Foot("操作失败：" + WxNet.ErrOf(r));
+                        return;
+                    }
+                    this.Foot(on == 1 ? "已启用" : "已停用");
+                    this.OpenDef(curDef);
+                } catch (Exception ex) { this.Foot(ex.Message); }
+            });
+    }
+
+    // 调优先级：数字小优先，最小 1。
+    void SetPriority(WxFlowBind bind, int p) {
+        if (p < 1) { p = 1; }
+        WxNetReq r = WxNet.NewReq();
+        WxNet.ApiPost(r, "/api/flowagent/priority",
+            "id=" + Encoding.UrlEncode(bind.id)
+            + "&priority=" + Convert.ToString(p), () => {
+                try {
+                    if (!WxNet.OkOf(r)) {
+                        this.Foot("调序失败：" + WxNet.ErrOf(r));
+                        return;
+                    }
+                    this.Foot("优先级已设为 " + Convert.ToString(p));
+                    this.OpenDef(curDef);
+                } catch (Exception ex) { this.Foot(ex.Message); }
+            });
+    }
+
+    // 试跑：走高可用派发，回传命中工具、尝试次数与降级链。
+    void Dispatch(WxFlowAgentNode node, TextArea box) {
+        string q = box.GetText();
+        if (q == null || q.Length == 0) {
+            this.Foot("先写一句要问的");
+            return;
+        }
+        WxNetReq r = WxNet.NewReq();
+        WxNet.ApiPost(r, "/api/flowagent/dispatch",
+            "nodeId=" + Encoding.UrlEncode(node.id)
+            + "&q=" + Encoding.UrlEncode(q), () => {
+                try {
+                    if (!WxNet.OkOf(r)) {
+                        // 全部工具都挂了：服务端把降级链写在错误文案里。
+                        lastRun = "派发失败：" + WxNet.ErrOf(r);
+                        this.Foot(lastRun);
+                        this.BuildPanel();
+                        this.Redraw();
+                        return;
+                    }
+                    JsonValue d = WxNet.DataOf(r);
+                    if (d == null) {
+                        this.Foot("派发失败：应答里没有数据");
+                        return;
+                    }
+                    string who = d.Str("agent", "");
+                    string att = d.Str("attempts", "1");
+                    string text = d.Str("text", "");
+                    string chain = "";
+                    JsonValue deg = d.Get("degraded");
+                    int dn = deg == null ? 0 : deg.Count();
+                    for (int i = 0; i < dn; i = i + 1) {
+                        JsonValue it = deg.At(i);
+                        if (it == null) { continue; }
+                        if (chain.Length > 0) { chain = chain + "；"; }
+                        chain = chain + it.Str("agent", "") + ": " + it.Str("error", "");
+                    }
+                    lastRun = "命中 " + this.ToolName(who) + "（试了 " + att + " 次）";
+                    if (chain.Length > 0) {
+                        lastRun = lastRun + "\n降级链：" + chain;
+                    }
+                    if (text.Length > 0) {
+                        lastRun = lastRun + "\n" + text;
+                    }
+                    this.Foot("试跑完成");
+                    this.BuildPanel();
+                    this.Redraw();
+                } catch (Exception ex) { this.Foot(ex.Message); }
+            });
+    }
+
+    // ---- helpers --------------------------------------------------------
+
+    WxFlowDefItem FindDef(string id) {
+        if (id == "") { return null; }
+        for (int i = 0; i < defs.Count; i = i + 1) {
+            if (defs[i].id == id) { return defs[i]; }
+        }
+        return null;
+    }
+
+    WxFlowAgentNode FindNode(string id) {
+        if (id == "") { return null; }
+        for (int i = 0; i < nodes.Count; i = i + 1) {
+            if (nodes[i].id == id) { return nodes[i]; }
+        }
+        return null;
+    }
+
+    // 这个节点上是否已经绑了某个工具。
+    bool IsBound(WxFlowAgentNode node, string code) {
+        for (int i = 0; i < node.agents.Count; i = i + 1) {
+            if (node.agents[i].agentCode == code) { return true; }
+        }
+        return false;
+    }
+
+    // 工具 code → 显示名（目录里查；查不到就显示 code 本身）。
+    string ToolName(string code) {
+        for (int i = 0; i < catalog.Count; i = i + 1) {
+            if (catalog[i].code == code) { return catalog[i].name; }
+        }
+        return code;
+    }
+
+    // 目录里健康的工具数（摘要条上「工具健康 x/y」的分子）。
+    int HealthyCount() {
+        int n = 0;
+        for (int i = 0; i < catalog.Count; i = i + 1) {
+            if (catalog[i].state == "healthy") { n = n + 1; }
+        }
+        return n;
+    }
+
+    void SetToolTitle(string t) {
+        if (toolTitle != null) { toolTitle.SetProp("text", t); }
+    }
+
+    // 清空中栏与右栏（没有流程时）。
+    void ClearAll(string msg) {
+        curNode = "";
+        nodes.Clear();
+        if (nodeList != null) { nodeList.Bind(nodes); }
+        if (title != null) { title.SetProp("text", "未选择流程"); }
+        if (summary != null) { summary.SetProp("text", ""); }
+        if (toolBody == null) { return; }
+        toolBody.RemoveAll();
+        toolBody.With(Wx.Lbl(msg, "wxflowhint"));
+        this.SetToolTitle("工具分配");
+    }
+
+    // 状态行（错误/提示共用一行）。
+    void Foot(string msg) {
+        if (foot != null) { foot.SetProp("text", msg); }
+        this.Redraw();
+    }
+
+    void Redraw() {
+        if (host != null) { host.RequestRedraw(); }
+    }
+
+    override string Kind() { return "WxFlowAgent"; }
+}

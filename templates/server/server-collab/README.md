@@ -445,6 +445,9 @@ every sign-in "wrong password").
   `delete`），契约见下节「多维表格域契约」
 - `/api/agent/*` — 智能体：`list`（清单与服务端就绪态）/ `chat`（转发模型，
   密钥不出服务器）
+- `/api/flowagent/*` — 流程的 AI 工具分配：`defs` / `nodes?defId=` / `health` /
+  `bind` / `unbind` / `toggle` / `priority` / `dispatch`（高可用派发），
+  契约见下节「流程 AI 工具分配契约」
 
 ## 协作域契约（会话/成员/消息/实时事件/附件/任务已落地，其余端点未实现）
 
@@ -612,6 +615,65 @@ bitable_record  id, tenantId, appId, cells(JSON 数组文本), createdBy,
   即时回写 `/api/bitable/record`）。
 - 客户端页 `templates/gui/gui-wechat/src/WxAgent.*`：左栏智能体清单，右栏
   `ChatView` 气泡对话；历史按 `[{role,content}]` 回传（服务端最多留 20 轮）。
+
+## 流程 AI 工具分配契约（flowagent）
+
+给工作流程的 **AI 节点**（`flow_node.kind = "ai"`）分配 / 管理 AI 工具
+（智能体），并提供**高可用派发**：多个工具按优先级依次尝试，第一个失败
+自动降级到下一个。
+
+### 表结构（CodeFirst，缺表自动建）
+
+```text
+flow_node_agent  id, tenantId, defId, nodeId, agentCode, priority,
+                 enabled(1 启用|0 停用), note, createdBy, createdAt, updatedAt
+flow_agent_health id, tenantId, agentCode, state(healthy|degraded|down),
+                 failures, lastError, lastOkAt, lastFailAt, cooldownUntil,
+                 updatedAt
+```
+
+- **健康状态落库而不是放内存**：服务端是多 worker 进程，内存里的健康视图
+  各 worker 不共享，降级决策会各说各话。
+- `flow_node` 本身没有 `tenantId`，租户归属经父流程（`flow_def`）判定；
+  分配表与健康表都直接带 `tenantId` 闸。
+
+### 端点（Bearer 令牌，路由属性派生）
+
+| 端点 | 方法 | 说明 |
+|---|---|---|
+| `/api/flowagent/defs` | GET | 流程清单：`{defs:[{id,name,description,aiNodes,tools}]}`（附 AI 节点数与已配工具数） |
+| `/api/flowagent/nodes?defId=` | GET | 节点分配视图：`{id,name,nodes:[{id,name,sort,kind,aiPrompt,agents[]}],catalog:[{code,name,hint,icon,state,failures,lastError}]}` |
+| `/api/flowagent/health` | GET | 工具健康清单：`{items:[{agentCode,name,state,failures,lastError,lastOkAt,lastFailAt,cooldownUntil,cooling}]}` |
+| `/api/flowagent/bind` | POST | 绑定工具（`nodeId`、`agentCode`，可选 `priority`），同一节点同一工具不重复绑 |
+| `/api/flowagent/unbind` | POST | 解绑（`id`）：删分配行，工具的健康记录留着 |
+| `/api/flowagent/toggle` | POST | 启停（`id`、`enabled`）：停用不删配置，随时开回来 |
+| `/api/flowagent/priority` | POST | 调优先级（`id`、`priority`）：数字小优先，最小 1 |
+| `/api/flowagent/dispatch` | POST | 高可用派发（`nodeId`、`q`，可选 `history`） |
+
+### 高可用派发口径
+
+- **顺序**：按 `priority` 升序（数字小优先）依次尝试已启用且已绑定的工具。
+- **降级**：某个工具失败就自动试下一个，降级链如实回传
+  `{agent, text, attempts, degraded:[{agent,error}]}`。
+- **冷却**：连续失败达 3 次（`FailThreshold`）的工具转 `degraded` 并冷却
+  60 秒（`CooldownSec`）；冷却期不再被优先选中——但**全部工具都在冷却时
+  仍会照试**（宁可慢，也不能因为"在冷却"就一个都不试）。
+- **归零**：任一工具成功一次即 `failures` 归零、回 `healthy`、清冷却。
+- **全挂**：答 502，错误文案里带完整降级链（`工具: 原因`），便于定位是
+  哪个工具先挂的、为什么挂。
+
+### 权限口径
+
+- 读端点（`defs` / `nodes` / `health`）标 `PermBit.View`，写端点
+  （`bind` / `unbind` / `toggle` / `priority` / `dispatch`）标
+  `PermBit.Update`——**新端点必须标 Perm 位**，否则框架对受控 action
+  一律拒绝授权，只有超管用得着。
+
+### 客户端对接
+
+客户端页 `templates/gui/gui-wechat/src/WxFlowAgent.*`：左栏流程清单，
+中栏节点链，右栏工具面板（绑定 / 解绑 / 启停 / ↑↓ 调序 + 试跑）。
+试跑走 `/api/flowagent/dispatch`，命中工具、尝试次数与降级链原样显示。
 
 ## 已知行为说明（T17 回归观察项，非缺陷）
 
