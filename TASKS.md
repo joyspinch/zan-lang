@@ -2125,27 +2125,44 @@
   - 顺带修掉脚本的**误标**：失败文案把**当前实测值**印成 `(baseline: …)`，
     读起来像"和基线一样却还超预算"；改成 `(measured: …)`。
 
-### [ ] A493 运行时对象没编 `-ffunction-sections`——`--gc-sections` 剪不掉单个未用函数，hello world 背上整个运行时的 .text
+### [ ] A493 发布的 hello world 有 84% 的 .text 是运行时——而"补 `-ffunction-sections`"这条处方已被实测推翻
 
 - 现象（2026-10-22 重定体积预算时撞到）：`size_budget_publish_host` 实测
   `.text = 199,752`，而这份 hello world 只打印一行字。linux-x64 侧
   `.text = 189,074`——两侧同步，说明是**通用运行时载荷**，不是平台特有。
-- 根因：`irgen_emit.c` 的 publish 模式已经"每函数一个 `.text.<fn>` 段"，
-  链接也传了 `--gc-sections`，但**运行时自身的 C 对象没编
-  `-ffunction-sections`**（`src/runtime/*.c`）——没有函数段，链接器就无法在
-  对象内部剪掉未用函数，于是整个运行时（ARC / 字符串 / 集合 / IO / 调度 /
-  网络 / JSON…）的代码全部进 `.text`。
-  `docs/archive/embedded_runtime_assessment.md` 的"2026-09-07 更新 2"早就
-  点出这一条（"剩余的交叉/native 差值收口依赖运行时对象补
-  `-ffunction-sections`（需 CI 重出提交对象，另案）"），至今未做。
+- 载荷构成（实测）：宿主运行时对象（`build/zanrt_*.obj`，CMake 现场编）的
+  `.text` 合计 **167,488**——占 hello world 总 `.text` 的 **84%**；程序自身的
+  代码只有 ~32 KB。所以要瘦的是**运行时**，不是生成的代码。
+- **已被推翻的处方**（2026-10-22 在构建闸内重编 9 个运行时对象后实测）：
+  - 文档"2026-09-07 更新 2"写的"差值收口依赖运行时对象补
+    `-ffunction-sections`"**不成立**：加 `-ffunction-sections -fdata-sections`
+    后 `.text` 是 **199,736**（几乎不变）——运行时里的函数**全都可达**，链接器
+    无从剪：① 编译器把 `NativeMemory.*` / `Cpu.*` 降级成对 `zan_hw_*` 的
+    **直接调用**，这些符号必须由一个"永远被链上"的对象携带（定时器对象就是
+    那个载体）；② 硬件加速内部按 CPU 特性**函数指针分派**，且启动要跑 KAT
+    自检（`zan_hw_gate` → `zan_aes_kat` …），于是 AES-NI / 软件回退等**每个
+    变体都被表引用**，全活。
+  - `-fdata-sections` 更是**地雷**：它把多 worker 协程驱动里 1.4 MB 的
+    `.bss` 静态表搬进 `.data`，发布产物从 **245,248 → 1,821,184 字节（×7.4）**
+    ——文件体积暴涨而 `.text` 纹丝不动。**别加这两个开关。**
+- 真正的候选杠杆（按体量排，都得先实测再落地）：
+  - **定时器 TU 里混进了整个硬件加速**：`src/runtime/rt_timer.c` 全文 1443 行，
+    **最后一行**是 `#include "rt_hw_accel.c"`（4558 行），而 rt_timer.c 里
+    **一处 `zan_hw_*` 调用都没有**——纯文本包含。`rt_hw_accel.c` 单独编出来
+    `.text` = **53,408**，占定时器对象 74,128 的 **72%**。定时器对象是
+    **每个程序都要链**的（内联协程驱动调 `zan_timer_*`），所以每个发布产物
+    都背着这 53 KB 的 SHA/AES/AVX2。
+  - 拆它要**按特性拆**（sha / aes / pixel 各自成对象或归档），单纯"拆成独立
+    对象"不够：hello world 已经拉进 63 个 `zan_hw_*` + 17 个 `zan_aes_*`
+    符号（它用到了其中一族），只有拆到特性粒度、让链接器按符号缺时才拉，
+    才可能让"不碰加密的程序"少背 AES。
+  - 其余大头待逐项量：定时器本体（74 KB − 53 KB ≈ 21 KB）、io（24 KB）、
+    sync（22 KB）。
 - 影响：体积预算只能靠"抬高阈值"来容纳，预算的**分辨力**随之下降——阈值
   取 1.5× 于基线时，一次 +64 KB 的固定表回归不会被抓到（这正是这条预算
   最初要抓的东西）。
-- 方向：给 `src/runtime/*.c`（以及会被链接进产物的驱动对象）加
-  `-ffunction-sections -fdata-sections`，重出提交对象；再把两个预算的基线
-  压回十万级。**注意**：跨平台预编译对象（`toolchain/**`、
-  `packages/**/drivers/**`）要一起重出，否则交叉产物不受益。
-- 关联：`docs/archive/embedded_runtime_assessment.md`（同一条，另案）、
+- 关联：`docs/archive/embedded_runtime_assessment.md`（同一条，文档里"补
+  `-ffunction-sections`"那句已被本次实测推翻，需一并更正）、
   A491（预算重新定基线的直接原因）。
 
 ### [ ] A494 `BaseRepository<T>` 直接实例化会**静默**返回默认值——只有继承才能用

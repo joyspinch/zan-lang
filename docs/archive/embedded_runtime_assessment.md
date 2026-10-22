@@ -143,9 +143,17 @@
 > linux .text 189,074 → 预算 284,000、file 220,992 → 预算 332,000。
 > 脚本的失败文案也修了：原来把**当前实测值**印成 "(baseline: …)"，读起来像
 > "和基线一样却还超预算"；现在印的是 "(measured: …)"。
-> 遗留（另案）：运行时对象仍**没编 `-ffunction-sections`**，所以 `--gc-sections`
-> 剪不掉单个未用函数，hello world 得背上整个运行时的 .text——这才是把载荷
-> 压回十万级的钥匙，见 `TASKS.md` A493。
+> 遗留（另案）：运行时对象的 `.text` 占发布产物 84%（167,488 / 199,752），
+> 但**"补 `-ffunction-sections`"这条路已被实测推翻**——闸内给 9 个宿主运行时
+> 对象加上 `-ffunction-sections -fdata-sections` 后 `.text` 是 199,736（几乎
+> 不变）：运行时里的函数全都可达（编译器把 intrinsics 降级成对 `zan_hw_*` 的
+> 直接调用，这些符号必须由永远被链上的定时器对象携带；硬件加速内部按 CPU
+> 特性函数指针分派 + 启动 KAT 自检，每个变体都被表引用）。而且
+> `-fdata-sections` 会把 1.4 MB 的 `.bss` 静态表搬进 `.data`，产物从 245 KB
+> 涨到 1.8 MB——**别加这两个开关**。真正的杠杆是 `src/runtime/rt_timer.c`
+> 最后一行 `#include "rt_hw_accel.c"`（4558 行，单独编 `.text` 53,408，占
+> 定时器对象 72%）：定时器对象每个程序都要链，于是每个产物都背着整块
+> SHA/AES/AVX2。详见 `TASKS.md` A493。
 
 ## 1. 实测：一个 hello world 的成本
 
