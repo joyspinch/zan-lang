@@ -1537,9 +1537,18 @@ description: Zan 开发规范总纲——可落地的标准与纪律，供 AI �
   判据：**凡是要重复用第二次的量具，就是脚本的候选**。仓库里现成的：
   - `scripts\ab_compiler.ps1 -Ref <git ref>`：从任意 ref 编一份独立的
     zanc 做 A/B 对照（`build\ab\<ref>\build\zanc.exe`），同 ref 再跑是
-    增量空跑，**4 秒**。
+    增量空跑（秒级）。
   - `scripts\build_ide_debug.ps1`：调试版 IDE 编到 `build\ZanIDE.debug.exe`，
     发布版原样留在 `build\ZanIDE.exe`。
+- **量具自己也会坏——比没有量具更坏**：它给出一个**看着有数字、其实没量到
+  任何东西**的结果。头一次用就撞上：A/B 编译器的 cmake 配置漏了 `-S`，
+  源码目录取的是当前目录，于是"改动之前"编出来的其实是**当前工作树**——
+  量多少次都是同一个编译器，前后"对比"永远一致，看着像"改动没影响"。
+  判据：**量具产出后必须自证**：产物 `CMakeCache.txt` 的
+  `CMAKE_HOME_DIRECTORY` 要指向那个 ref 的 worktree，不是主仓。
+  做法：量具末尾**把源码目录打出来**（`AB_SRC` 那一行），差异常常就摆在那。
+  推论：**量具的"结论"和量具本身要分开验**——先拿一件已知有差异的事去量它，
+  量出"没差异"就说明量具有病，而不是那件事真的没差异。
 - **量具的落点要选对，否则会被回收**：`build\ab\` 不会被清；`_scratch\` 会被
   `clean_scratch.ps1`（7 天以上）与 `sched.ps1 reap` 当一次性产物回收，仓库外
   的 worktree 副本也会被 reap 清掉——放在那里的量具下一轮就没了，又得重造。
