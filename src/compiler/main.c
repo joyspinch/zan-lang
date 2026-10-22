@@ -7088,9 +7088,35 @@ int main(int argc, char **argv) {
                     }
                     snprintf(cmd, sizeof(cmd),
                              "ld.lld -shared -o \"%s\" \"%s/zap_main.o\""
-                             " \"%s\" \"%s/libclang_rt.builtins.a\""
-                             " \"%s/libEGL.so\" \"%s/libGLESv3.so\"",
-                             obj_path, sys4, obj_tmp, sys4, sys4, sys4);
+                             " \"%s\" \"%s/libclang_rt.builtins.a\"",
+                             obj_path, sys4, obj_tmp, sys4, sys4);
+                    /* OHOS 的 GUI 驱动是**预编译产物**（仓库里只有 .a/.so，没有
+                       源码），它直接调用 EGL/GLES 与 FreeType。链接期要的是
+                       **OHOS NDK 里的同名库**（设备系统提供真库，链接只需要它们
+                       满足符号、并把 DT_NEEDED 记进 HAP）。仓库里原先放的是两个
+                       "记录 DT_NEEDED 的空壳"，**导不出任何符号**——拿它们去链
+                       接 GUI 程序只会得到一串 undefined symbol（eglMakeCurrent /
+                       glCreateShader / FT_*）。空壳已删（scripts\ohos_stub.c 一并
+                       删掉）；这里改成：有就链上，没有就说清楚缺哪个、去哪拷。 */
+                    {
+                        static const char *const ohos_gl_libs[] = {
+                            "libEGL.so", "libGLESv3.so", "libfreetype.so"
+                        };
+                        for (size_t gi = 0; gi < sizeof(ohos_gl_libs) / sizeof(ohos_gl_libs[0]); gi++) {
+                            char gl[1400];
+                            snprintf(gl, sizeof(gl), "%s/%s", sys4, ohos_gl_libs[gi]);
+                            if (zan_file_exists(gl)) {
+                                cmd_appendf(cmd, sizeof(cmd), " \"%s\"", gl);
+                                continue;
+                            }
+                            fprintf(stderr,
+                                    "note: %s is not in the bundled %s subset ('%s'); "
+                                    "copy it out of <OHOS_NDK>/native/sysroot/usr/lib/"
+                                    "<triple>/ with scripts\\build_cross_rt.cmd "
+                                    "(TASKS.md A503)\n",
+                                    ohos_gl_libs[gi], osub, gl);
+                        }
+                    }
                     for (int d = 0; d < cross_archive_count; d++) {
                         cmd_appendf(cmd, sizeof(cmd), " \"%s\"",
                                  cross_archives[d]);
@@ -7295,6 +7321,48 @@ int main(int argc, char **argv) {
                 return 1;
             }
             char cmd[8192];
+            /* OHOS 的 exe 走**全静态**链接（musl 的 libc.a + 静态 libunwind 与
+               compiler-rt），静态模型里没有 EGL/GLES/FreeType 的位置，而预编译
+               的 OHOS GUI 驱动直接调用它们 ⇒ 任何 GUI 程序在这条路上都链不过
+               （一串 undefined symbol：eglMakeCurrent / glCreateShader / FT_*）。
+               与其让用户去猜，直接说清楚：OHOS 的 GUI 走 HAP 形态（--emit-lib），
+               exe 形态要等驱动改成运行时 dlopen 才通得过。 */
+            {
+                /* 判断"这个程序带 GUI 驱动"：驱动静态库进链接行的路径不止一条
+                   （跨目标的 cross_archives、目标自己的 static_driver_libs、
+                   used_drivers 清单），逐个扫一遍，别只盯 extern_libs——GUI 程序
+                   可能一个 DllImport 都不写。 */
+                int needs_gui = 0;
+                for (int d = 0; d < cross_archive_count && !needs_gui; d++) {
+                    if (strstr(cross_archives[d], "libzan_gui")) needs_gui = 1;
+                }
+                for (int li = 0; li < static_driver_lib_count && !needs_gui; li++) {
+                    if (strstr(static_driver_libs[li], "libzan_gui")) needs_gui = 1;
+                }
+                for (int d = 0; d < used_driver_count && !needs_gui; d++) {
+                    if (used_driver_len[d] == 7 &&
+                        strncmp(used_drivers[d], "zan_gui", 7) == 0) {
+                        needs_gui = 1;
+                    }
+                }
+                if (needs_gui) {
+                    fprintf(stderr,
+                            "error: an OHOS GUI program cannot be linked into a "
+                            "static executable: the OHOS GUI driver calls EGL/GLES "
+                            "and FreeType directly, and the static link has no place "
+                            "for them.\n"
+                            "  use --emit-lib (the HAP shape) for OHOS GUI, or wait "
+                            "for the driver to resolve them at run time (dlopen).\n"
+                            "  see TASKS.md A503\n");
+                    generated_object_vec_remove(&generated_objects, obj_tmp);
+                    zan_diag_free_buffers(irgen.diag);
+                    zan_irgen_destroy(&irgen);
+                    zan_arena_free(ir_arena);
+                    zan_arena_free(arena);
+                    free(source);
+                    return 1;
+                }
+            }
             snprintf(cmd, sizeof(cmd),
                      "ld.lld -static%s -o \"%s\" \"%s/crt1.o\" \"%s/crti.o\""
                      " \"%s/clang_rt.crtbegin.o\" \"%s\"",

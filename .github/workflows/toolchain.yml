@@ -8,6 +8,12 @@ name: toolchain
 # The runtime objects need no native runner at all: zig cc carries the musl and
 # Darwin headers, so one Linux job produces all five targets.
 #
+# Two more targets are covered here as well:
+#   - OHOS: same zig trick against the OHOS musl headers (-D__OHOS__), so the
+#     OHOS objects stop depending on whoever happened to run the recipe.
+#   - Android: bionic has no zig target, so this one downloads the real NDK
+#     (see scripts/build_android_rt.sh).
+#
 # The GUI drivers are deliberately not here. The committed linux-x64 archive is
 # a fat one -- our gui_runtime objects plus every member of the platform's
 # libX11/libxcb/libXau -- and nothing in the tree records how it was produced.
@@ -24,13 +30,20 @@ on:
       - 'src/runtime/rt_sched.c'
       - 'src/runtime/rt_sync.c'
       - 'src/runtime/rt_sync.h'
+      - 'src/runtime/rt_file.c'
+      - 'src/runtime/rt_decimal.c'
+      - 'src/runtime/rt_decimal.h'
       - 'src/runtime/rt_timer.c'
       - 'src/runtime/rt_timer.h'
       - 'src/runtime/rt_crash.h'
       - 'src/runtime/rt_hw_accel.c'
       - 'src/runtime/rt_hw_accel.h'
+      - 'src/runtime/zan_embed_api.c'
+      - 'src/runtime/zan_inflate.c'
       - 'scripts/build_linux_rt.sh'
       - 'scripts/build_macos_rt.sh'
+      - 'scripts/build_ohos_rt_zig.sh'
+      - 'scripts/build_android_rt.sh'
       - '.github/workflows/toolchain.yml'
   workflow_dispatch:
 
@@ -71,29 +84,54 @@ jobs:
           path: |
             toolchain/linux-musl/zanrt_*.o
             toolchain/linux-musl/libzancrypto.a
+            toolchain/linux-musl/zan_embed_api.o
+            toolchain/linux-musl/zan_inflate.o
             toolchain/linux-arm64/zanrt_*.o
             toolchain/linux-arm64/libzancrypto.a
+            toolchain/linux-arm64/zan_embed_api.o
+            toolchain/linux-arm64/zan_inflate.o
             toolchain/linux-riscv64/zanrt_*.o
             toolchain/linux-riscv64/libzancrypto.a
+            toolchain/linux-riscv64/zan_embed_api.o
+            toolchain/linux-riscv64/zan_inflate.o
             toolchain/macos/arm64/zanrt_*.o
             toolchain/macos/arm64/libzancrypto.a
+            toolchain/macos/arm64/zan_embed_api.o
+            toolchain/macos/arm64/zan_inflate.o
             toolchain/macos/x64/zanrt_*.o
             toolchain/macos/x64/libzancrypto.a
+            toolchain/macos/x64/zan_embed_api.o
+            toolchain/macos/x64/zan_inflate.o
 
+      # Every artifact the recipes produce has to be listed here: a product
+      # the recipe builds but the commit list misses is built by CI and then
+      # thrown away -- the committed object stays at its old generation while
+      # the build is green. That is how the embedded-resource pair and the
+      # crypto archive went stale in the first place.
       - name: Commit if changed
         run: |
           git config user.name  'zan-toolchain-bot'
           git config user.email 'zan-toolchain-bot@users.noreply.github.com'
           git add -f toolchain/linux-musl/zanrt_*.o \
                      toolchain/linux-musl/libzancrypto.a \
+                     toolchain/linux-musl/zan_embed_api.o \
+                     toolchain/linux-musl/zan_inflate.o \
                      toolchain/linux-arm64/zanrt_*.o \
                      toolchain/linux-arm64/libzancrypto.a \
+                     toolchain/linux-arm64/zan_embed_api.o \
+                     toolchain/linux-arm64/zan_inflate.o \
                      toolchain/linux-riscv64/zanrt_*.o \
                      toolchain/linux-riscv64/libzancrypto.a \
+                     toolchain/linux-riscv64/zan_embed_api.o \
+                     toolchain/linux-riscv64/zan_inflate.o \
                      toolchain/macos/arm64/zanrt_*.o \
                      toolchain/macos/arm64/libzancrypto.a \
+                     toolchain/macos/arm64/zan_embed_api.o \
+                     toolchain/macos/arm64/zan_inflate.o \
                      toolchain/macos/x64/zanrt_*.o \
-                     toolchain/macos/x64/libzancrypto.a
+                     toolchain/macos/x64/libzancrypto.a \
+                     toolchain/macos/x64/zan_embed_api.o \
+                     toolchain/macos/x64/zan_inflate.o
           git diff --cached --quiet && { echo 'up to date'; exit 0; }
           git commit -m 'toolchain: rebuild the cross runtime objects'
           git pull --rebase --autostash origin "${GITHUB_REF_NAME}"
@@ -101,7 +139,7 @@ jobs:
 
   stale-check:
     name: nothing left stale
-    needs: [runtime-objects]
+    needs: [runtime-objects, ohos-objects]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -110,3 +148,116 @@ jobs:
       - run: python3 scripts/check_toolchain_stale.py --group=runtime
       - name: GUI drivers (report only)
         run: python3 scripts/check_toolchain_stale.py --group=gui || true
+
+  # ---------------------------------------------------------------------
+  # OHOS: the same objects as linux/macos, but built against the OHOS musl
+  # headers with -D__OHOS__ (zig's bundled musl stands in for the OHOS NDK
+  # sysroot). Until this job existed, nothing rebuilt the OHOS objects: they
+  # sat at whatever generation they had when someone happened to run the
+  # recipe by hand -- the OHOS zanrt_sync.o was missing zan_ui_thread_set
+  # for weeks, which broke every OHOS GUI cross link (TASKS.md A502).
+  ohos-objects:
+    name: zanrt_*.o (OHOS x64/arm64)
+    runs-on: ubuntu-latest
+    environment: auto-commit
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - uses: mlugg/setup-zig@53fc45b17fe98b52f92ee5ea08ff48a85a3e7eb7 # v1
+        with:
+          version: 0.13.0
+
+      - name: Build
+        run: sh scripts/build_ohos_rt_zig.sh zig
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ohos-runtime-objects
+          path: |
+            toolchain/ohos-x64/zanrt_*.o
+            toolchain/ohos-x64/libzancrypto.a
+            toolchain/ohos-x64/zan_embed_api.o
+            toolchain/ohos-x64/zan_inflate.o
+            toolchain/ohos-arm64/zanrt_*.o
+            toolchain/ohos-arm64/libzancrypto.a
+            toolchain/ohos-arm64/zan_embed_api.o
+            toolchain/ohos-arm64/zan_inflate.o
+
+      - name: Commit if changed
+        run: |
+          git config user.name  'zan-toolchain-bot'
+          git config user.email 'zan-toolchain-bot@users.noreply.github.com'
+          git add -f toolchain/ohos-x64/zanrt_*.o \
+                     toolchain/ohos-x64/libzancrypto.a \
+                     toolchain/ohos-x64/zan_embed_api.o \
+                     toolchain/ohos-x64/zan_inflate.o \
+                     toolchain/ohos-arm64/zanrt_*.o \
+                     toolchain/ohos-arm64/libzancrypto.a \
+                     toolchain/ohos-arm64/zan_embed_api.o \
+                     toolchain/ohos-arm64/zan_inflate.o
+          git diff --cached --quiet && { echo 'up to date'; exit 0; }
+          git commit -m 'toolchain: rebuild the OHOS cross runtime objects'
+          git pull --rebase --autostash origin "${GITHUB_REF_NAME}"
+          git push origin "HEAD:${GITHUB_REF_NAME}"
+
+  # ---------------------------------------------------------------------
+  # Android: bionic has no zig target, so this one needs the real NDK.
+  # The job downloads it (no third-party action -- this repo pins actions by
+  # SHA) and runs scripts/build_android_rt.sh.
+  #
+  # continue-on-error: the recipe was written on a machine without an NDK, so
+  # the first run in CI is the first execution of the script at all. A
+  # failure here must not turn the whole pipeline red; read this job's log
+  # to see whether the script or the NDK layout needs fixing.
+  android-objects:
+    name: zanrt_*.o (Android x64/arm64)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    environment: auto-commit
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Fetch the Android NDK
+        run: |
+          set -eux
+          curl -fsSL -o ndk.zip \
+            https://dl.google.com/android/repository/android-ndk-r27b-linux.zip
+          unzip -q ndk.zip
+          echo "ANDROID_NDK=$PWD/android-ndk-r27b" >> "$GITHUB_ENV"
+
+      - name: Build
+        run: sh scripts/build_android_rt.sh "$ANDROID_NDK"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: android-runtime-objects
+          path: |
+            toolchain/android-x64/zanrt_*.o
+            toolchain/android-x64/libzancrypto.a
+            toolchain/android-x64/zan_embed_api.o
+            toolchain/android-x64/zan_inflate.o
+            toolchain/android-arm64/zanrt_*.o
+            toolchain/android-arm64/libzancrypto.a
+            toolchain/android-arm64/zan_embed_api.o
+            toolchain/android-arm64/zan_inflate.o
+
+      - name: Commit if changed
+        run: |
+          git config user.name  'zan-toolchain-bot'
+          git config user.email 'zan-toolchain-bot@users.noreply.github.com'
+          git add -f toolchain/android-x64/zanrt_*.o \
+                     toolchain/android-x64/libzancrypto.a \
+                     toolchain/android-x64/zan_embed_api.o \
+                     toolchain/android-x64/zan_inflate.o \
+                     toolchain/android-arm64/zanrt_*.o \
+                     toolchain/android-arm64/libzancrypto.a \
+                     toolchain/android-arm64/zan_embed_api.o \
+                     toolchain/android-arm64/zan_inflate.o
+          git diff --cached --quiet && { echo 'up to date'; exit 0; }
+          git commit -m 'toolchain: rebuild the Android cross runtime objects'
+          git pull --rebase --autostash origin "${GITHUB_REF_NAME}"
+          git push origin "HEAD:${GITHUB_REF_NAME}"

@@ -938,11 +938,14 @@
   后端的 LLVM 时这些目标照旧可用）。后端注册要先做
   （`zan_irgen_init_llvm_targets()` 从 irgen_emit.c 提成对外函数），
   否则查表时注册表是空的，会把**所有**目标都判成不可用。
-- 现在的体检结论：13 个目标 × console 全绿；GUI 探针 9 绿 4 红（红的是
-  android-x64 与 ohos 两个平台，原因见 A502 / A503）。
+- 现在的体检结论：13 个目标 × console 全绿；GUI 探针 10 绿 3 红（红的是
+  android-x64 与 ohos 两个平台，原因见 A502 / A503）。**OHOS 的 GUI exe 现在
+  给的是一句"为什么 + 怎么办"**（静态链接装不下驱动要的 EGL/GLES/FreeType，
+  GUI 请用 `--emit-lib`），不是一串 undefined symbol；OHOS 的 GUI 走
+  `--emit-lib` 实测**链接成功**。
 - 关联：A493（归档成员机制）、A502、A503、A499。
 
-### [ ] A502 `toolchain/android-x64/zanrt_sync.o` 停在 10-05——GUI 交叉链接缺 `zan_ui_thread_set`
+### [~] A502 `toolchain/android-x64/zanrt_sync.o` 停在 10-05——GUI 交叉链接缺 `zan_ui_thread_set`
 
 - 现象（2026-10-22 A501 扫描）：`--target android-x64` 链接 GUI 程序报
   `undefined symbol: zan_ui_thread_set`（引用方是用户对象里的
@@ -950,36 +953,90 @@
 - 根因：两个 arch 的 `zanrt_sync.o` 不是同一代——arm64 是 10-12 重出的（有
   `zan_ui_thread_set`），**x64 还是 10-05 的旧对象**（只有 `zan_dispatch_*`）。
   `zan_ui_thread_set` 是后来加进 `rt_sync.c` 的，旧对象里没有。
-- 为什么本机修不了：android 的运行时对象要用 **Android NDK** 的 clang 编
-  （bionic），zig 没有 bionic target，本机也没有 NDK
-  （`toolchain/android-*/` 只提交了 sysroot 的**库**子集，bionic 头文件没提交）。
-  `build_cross_rt.cmd` 的 android 块已经把 `rt_sync.c` 排在重建序列里，
-  有 NDK 的人跑一次即可。
-- 方向：在有 NDK 的机器上跑 `scripts\build_cross_rt.cmd` 重出 android-x64 的
-  `zanrt_sync.o`（连同 `zanrt_timer.o` / `libzancrypto.a`，见 A493 的尾巴）。
-- 关联：A501（A501 扫描发现的第一个"对象比源码旧"的实例）、A493。
+- 真正的根因不是"这个对象旧了"，是**没有任何机制会重出 android 的对象**：
+  `.github/workflows/` 里**没有任何一处**重建它们（toolchain.yml 只管
+  linux×3 + macos×2，drivers.yml 只管 win×2），全靠"谁记得手跑一次配方"。
+  症状只是这条的一个侧面。
+- 补法（2026-10-22 已落地前两步）：
+  ① **一条命令**：`scripts/build_android_rt.sh [ndk-root]`（新增，NDK 版配方，
+     与 `build_cross_rt.cmd` 的 android 块同旗标同顺序；顺带把 NDK sysroot
+     子集的拷贝也写进脚本——那一步此前只存在于注释里，没人做）。
+  ② **CI 自动重出**：toolchain.yml 新增 `android-objects` job（下载 NDK r27b
+     → 跑上面的脚本 → 提交 `toolchain/android-*/` 的产物）。该 job 标了
+     `continue-on-error`：脚本是在**没有 NDK 的机器**上写的，第一次在 CI 跑
+     就是它的第一次执行，失败不该把整条流水线染红，看日志修即可。
+  ③ 剩下的**产物**要等一台有 NDK 的机器（或那个 CI job）跑一次。
+- 未验证：`build_android_rt.sh` 在写它的机器上没有 NDK，**没实跑过**（脚本每
+  步都有存在性检查，缺文件会点名而不是静默跳过）。
+- 关联：A501（A501 扫描发现的第一个"对象比源码旧"的实例）、A493、A504。
 
-### [ ] A503 OHOS 的 GUI 交叉链接缺 EGL/GLES 符号——预编译驱动直连 GL，静态链接无处可解
+### [~] A503 OHOS 的 GUI 交叉链接缺 EGL/GLES——静态 exe 形态装不下预编译驱动的 GL 依赖
 
 - 现象（2026-10-22 A501 扫描）：`--target ohos-x64` / `ohos-arm64` 链接 GUI
   程序报一串 `undefined symbol: eglMakeCurrent / eglDestroySurface /
-  glCreateShader / glShaderSource / glCompileShader ...`，引用方是
+  glCreateShader / glShaderSource / glCompileShader ...`（外加 20 多个
+  `FT_*`），引用方是
   `packages/Zan.Gui/src/Gui/drivers/ohos-<arch>/static/libzan_gui.a` 里的
   `zan_gui_present`。
-- 根因：OHOS 的 GUI 驱动是**预编译产物**（仓库里只有 `.a`/`.so`，没有源码），
-  它**直接调用** EGL/GLES 的函数；而 OHOS 的链接是**全静态**
-  （`ld.lld -static ... libc.a libunwind.a libclang_rt.builtins.a`），
-  链上**根本没有** `libEGL` / `libGLESv3`。
-  `toolchain/ohos-*/libEGL.so` / `libGLESv3.so` 是两个**空壳**（只记录
-  DT_NEEDED，导出 0 个符号），而且它们**不在** OHOS 的静态链接行上
-  （只在 android 的 `-shared` 分支里被引用）——原设计假设驱动是 `dlopen` 出来
-  的，这个假设与实际产物不符。
-- 为什么本机修不了：要么改驱动（改成 dlopen 解析 EGL/GLES）——**没有源码**；
-  要么在链接侧提供 GL 符号（让空壳导出 egl*/gl*）——那会让空壳在真机上**顶替**
-  系统的真库（除非真机侧不把空壳打进包里），是运行时正确性的取舍，不该顺手定。
-- 方向：① 找回 OHOS GUI 驱动的源码并改成 dlopen 路径（与空壳的原设计一致）；
-  ② 或让 OHOS 链接带上真机 SDK 的 EGL/GLES 静态库。二者都需要 OHOS 侧资产，
-  本机没有。
-- 关联：A501（A501 扫描发现的第二个"设计假设与产物不符"的实例）、A502。
+- 根因（2026-10-22 钉死）：**OHOS 的 exe 走全静态链接**
+  （`ld.lld -static ... libc.a libunwind.a libclang_rt.builtins.a`），静态模型里
+  没有 EGL/GLES/FreeType 的位置；而 OHOS 的 GUI 驱动直连 EGL/GLES
+  （实测需要 10 个 `egl*` + 34 个 `gl*`；`FT_*` 是编进驱动归档的，所以不报
+  undefined）。⇒ 任何 OHOS GUI 程序走 **exe** 这条路都链不过，**不是配置问题，
+  是链接形态选错了**。
+- 更正一处此前的误判（2026-10-22 复核 `scripts/build_gui_ohos.sh` 时发现）：
+  "驱动是预编译产物、没有源码" —— **不对**。OHOS 驱动由
+  `scripts/build_gui_ohos.sh` 从 `src/runtime/gui_runtime.c`（`-DZAN_GUI_OHOS
+  -DZAN_GUI_FREETYPE`）+ freetype 源码编出来（用 DevEco Studio 自带的 OHOS
+  SDK），再 `llvm-ar` 成 `static/libzan_gui.a`、编成 `libzan_gui.so`。
+  **源码就在仓库里**，只是要一台装了 DevEco 的机器。
+- 正确的形态（2026-10-22 实测）：OHOS 的 GUI 程序应当产出 **HAP**
+  （`zanc --target ohos-x64 --emit-lib`）——**实测链接成功**：HAP 本身不调用
+  EGL/GLES（那是驱动 .so 的事），驱动 .so 随应用进 bundle
+  （`zan_gui.bundle` 里列了 `libzan_gui.so`），设备系统提供 EGL/GLES 真库。
+  **静态 exe + GUI 驱动**这个组合在 OHOS 上本来就不成立。
+- 补法（2026-10-22 已落地）：
+  ① **静态 exe 带 GUI 驱动时给明确错误**（已改 `src/compiler/main.c`）：说明
+     "静态链接装不下驱动要的 EGL/GLES、OHOS 的 GUI 请用 `--emit-lib`（HAP
+     形态）"，不再吐 60 多个 undefined symbol 的瀑布。
+  ② **HAP 形态按需链 EGL/GLES/FreeType**（同上）：`<sys>`（=toolchain/ohos-
+     <arch>/）里有就链上（记 DT_NEEDED），没有就点名缺哪个、去哪拷。
+  ③ **配方改成拷真库**（`scripts/build_cross_rt.cmd` 的 OHOS NDK 块）：从
+     `<OHOS_NDK>/native/sysroot/usr/lib/<triple>/` 拷 `libEGL.so` /
+     `libGLESv3.so` / `libfreetype.so` 到 `toolchain/ohos-<arch>/`；原先那
+     两个**空壳**（导不出任何符号，只记录 DT_NEEDED，连同 `scripts/ohos_stub.c`）
+     已删——**空壳比缺库更坏**：它让人以为支持着这个目标。
+  ④ **让 OHOS 的对象别再停在旧代码**：`toolchain.yml` 新增 `ohos-objects`
+     job（zig 路径，`scripts/build_ohos_rt_zig.sh`），源码一改就重出并提交。
+- 剩下的：**驱动 .so 本身**要用 DevEco 的 OHOS SDK 编（`build_gui_ohos.sh`），
+  本机没有 DevEco，这一支只能在那台机器上跑；真机验证同样需要设备。
+- 关联：A501、A502、A504。
+
+### [~] A504 CI 的"配方产出"与"提交清单/触发路径"必须一一对应——漏一处，对象就永远停在旧代
+
+- 现象（2026-10-22 查 A502 时顺着查出来的）：`.github/workflows/` 里重建
+  交叉运行时对象的 job 有三处**清单与配方脱节**：
+  - `drivers.yml` 的 win job：配方产出 `zanrt_decimal.o` / `libzancrypto.a` /
+    `zan_embed_api.o` / `zan_inflate.o`，**提交清单一个都没有** ⇒ CI 每次把它们
+    编出来又丢掉，仓库里的对象永远停在旧代（这正是 A493 之后 win 的 timer
+    仍然背着一整块 crypto 的原因）。
+  - `toolchain.yml` 的 linux/macos job：清单只有 `zanrt_*.o` +
+    `libzancrypto.a`，**漏了 `zan_embed_api.o` / `zan_inflate.o`**（配方产出，
+    清单不提交）。
+  - `toolchain.yml` 的**触发路径**：只列了 `rt_io.c` / `rt_sched.c` /
+    `rt_sync.c` / `rt_timer.c` / `rt_hw_accel.c`，**漏了 `rt_file.c`、
+    `rt_decimal.c/h`、`zan_embed_api.c`、`zan_inflate.c`** ⇒ 改了这些源，CI
+    根本不触发重建，交叉对象照旧是旧的。
+- 另一头：**没有任何 job 重建 android / ohos / wasm32 / ios 的对象**（只有
+  linux×3 + macos×2 + win×2 有）。ohos 已接上（zig 路径，`ohos-objects`
+  job）；android 已在 `android-objects` job 里接上（NDK 路径）；wasm32 与 ios
+  还没（wasm32 的配方是 .cmd、GUI 那一支还依赖外部 freetype checkout）。
+- 补法（2026-10-22 落地）：三份清单补齐 + 触发路径补齐（20 条）+ 新增
+  `ohos-objects` / `android-objects` 两个 job + `stale-check` 依赖 ohos job。
+- 留下的纪律（比清单本身更重要）：**"配方产出的东西"与"CI 提交的东西"是同一
+  个集合**。加一条配方产物时，提交清单与过时检查的 ARTIFACTS 表要同步加，
+  否则它会静默停在旧代，而且**构建是绿的**。
+- 关联：A502（android 的具体症状）、A503（ohos 的具体症状）、A493（归档拆分
+  后 win 变胖的根因）、A501。
 
 

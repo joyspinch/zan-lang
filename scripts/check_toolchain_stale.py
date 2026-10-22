@@ -278,8 +278,6 @@ ARTIFACTS = [
     ("toolchain/ohos-arm64/zan_inflate.o",
      ["src/runtime/zan_inflate.c", "src/common/miniz_tinfl.c"], "runtime"),
     ("toolchain/ohos-arm64/zap_main.o", ["toolchain/ohos-x64/zap_main.c"], "runtime"),
-    ("toolchain/ohos-arm64/libEGL.so", ["scripts/ohos_stub.c"], "manual"),
-    ("toolchain/ohos-arm64/libGLESv3.so", ["scripts/ohos_stub.c"], "manual"),
     ("toolchain/ohos-x64/zanrt_io.o", RT_IO, "runtime"),
     ("toolchain/ohos-x64/zanrt_sync.o", RT_SYNC, "runtime"),
     ("toolchain/ohos-x64/zanrt_file.o", RT_FILE, "runtime"),
@@ -291,8 +289,6 @@ ARTIFACTS = [
     ("toolchain/ohos-x64/zan_inflate.o",
      ["src/runtime/zan_inflate.c", "src/common/miniz_tinfl.c"], "runtime"),
     ("toolchain/ohos-x64/zap_main.o", ["toolchain/ohos-x64/zap_main.c"], "runtime"),
-    ("toolchain/ohos-x64/libEGL.so", ["scripts/ohos_stub.c"], "manual"),
-    ("toolchain/ohos-x64/libGLESv3.so", ["scripts/ohos_stub.c"], "manual"),
     # The OHOS NDK sysroot subset (crt + libc.a + compiler-rt builtins/unwind)
     # tracks the SDK itself, not repo sources -- report-only, refreshed by
     # hand. libm.a/libdl.a are empty archives in the OHOS sysroot and are not
@@ -526,7 +522,8 @@ def rebuild_cmd(artifact, zig, ndk):
                         "-c", f"{rt}/zan_inflate.c"]),
         }
         if name not in table:
-            return None  # stub libEGL.so/libGLESv3.so: NDK-built by hand
+            return None  # the OHOS NDK's libEGL/libGLESv3/libfreetype: copied
+                         # out of the SDK by build_cross_rt.cmd, not repo-built
         return ([zig, "cc", "-target", f"{arch}-linux-musl", "-D__OHOS__",
                  "-g0", "-fPIC", "-O2"] + table[name])
     elif d.startswith("ios/"):

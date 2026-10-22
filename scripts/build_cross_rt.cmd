@@ -211,9 +211,12 @@ rem llvm\lib\clang\<ver>\lib\<triple>\, libunwind.a from
 rem llvm\lib\<triple>\) is copied into toolchain\ohos-<arch>\; libm.a and
 rem libdl.a in the OHOS sysroot are empty 8-byte archives (math/dl symbols
 rem live in libc.a), so they are not committed. zap_main.o, zan_inflate.o
-rem and the libEGL/libGLESv3 stub .so are built here but also stay
-rem uncommitted (zanc needs them in toolchain\ohos-<arch> at cross-link
-rem time; rerun this script on a fresh checkout).
+rem and the NDK's libEGL.so/libGLESv3.so/libfreetype.so are produced here but
+rem also stay uncommitted (zanc needs them in toolchain\ohos-<arch> at
+rem cross-link time; rerun this script on a fresh checkout). The GL/FreeType
+rem set is what the prebuilt OHOS GUI driver links against -- the old empty
+rem stubs (scripts\ohos_stub.c) satisfied none of its symbols, so they are
+rem gone (TASKS.md A503).
 rem NDK-free fallback (automated below): without OHOS_NDK the build delegates
 rem to scripts\build_ohos_rt_zig.sh, which rebuilds the same objects with zig
 rem (its bundled musl supplies the headers; -D__OHOS__ re-adds the OS
@@ -257,11 +260,21 @@ for %%P in (ohos-x64:x86_64-unknown-linux-ohos ohos-arm64:aarch64-unknown-linux-
     rem of every ohos -shared link; the source is arch-independent and lives
     rem next to the x64 subset (the first arch that shipped it).
     "%OHOSBIN%\clang.exe" --sysroot="%OHOSSYS%" -target %%B -g0 -std=c11 -fPIC -O2 -c toolchain\ohos-x64\zap_main.c -o toolchain\%%A\zap_main.o || exit /b 1
-    rem Empty stub .so for the GUI driver's EGL present path: they exist so
-    rem the link records the DT_NEEDED dependency; the app process supplies
-    rem the real libraries at run time. See scripts\ohos_stub.c.
-    "%OHOSBIN%\clang.exe" --sysroot="%OHOSSYS%" -target %%B -g0 -std=c11 -fPIC -shared -Wl,-soname,libEGL.so -O2 -o toolchain\%%A\libEGL.so scripts\ohos_stub.c || exit /b 1
-    "%OHOSBIN%\clang.exe" --sysroot="%OHOSSYS%" -target %%B -g0 -std=c11 -fPIC -shared -Wl,-soname,libGLESv3.so -O2 -o toolchain\%%A\libGLESv3.so scripts\ohos_stub.c || exit /b 1
+    rem The OHOS GUI driver is a prebuilt archive that calls EGL/GLES and
+    rem FreeType directly, so the link needs the NDK's own libraries. Copy
+    rem them out of the sysroot -- the device supplies the real ones at run
+    rem time, the link only needs them to satisfy the symbols. The old
+    rem "empty stub" .so files (scripts\ohos_stub.c) exported nothing and
+    rem could not satisfy a single one of them (TASKS.md A503).
+    for %%L in (libEGL.so libGLESv3.so libfreetype.so) do (
+      if exist "%OHOSSYS%\usr\lib\%%B\%%L" (
+        copy /y "%OHOSSYS%\usr\lib\%%B\%%L" toolchain\%%A\%%L >nul || exit /b 1
+      ) else (
+        echo note: %OHOSSYS%\usr\lib\%%B\%%L not in the OHOS NDK -- the OHOS GUI
+        echo       cross link will refuse to run without it (scripts\ohos_stub.c
+        echo       is gone; see TASKS.md A503)
+      )
+    )
     echo built toolchain\%%A
   )
 )
