@@ -66,9 +66,13 @@ Get-ChildItem -LiteralPath (Join-Path $buildDir 'Testing\Temporary') -File -Filt
 # 退出码经临时文件回传：`& $gate` 在子作用域里跑，$script: 变量穿不过去
 # （各自的 script scope），而闭包里的 $LASTEXITCODE 同样出不来。
 $gate = Join-Path $PSScriptRoot 'build_gate.ps1'
+$schedPath = Join-Path $PSScriptRoot 'sched.ps1'
 $codeFile = Join-Path $env:TEMP "zan_ctest_code_$PID.txt"
 $logFile  = Join-Path $env:TEMP "zan_ctest_log_$PID.txt"
 & $gate -Name 'build' -Script {
+    # 顺手回收上一轮留下的副本（过期任务租约 + 没人引用的仓库外 worktree）。
+    # 在闸里跑，与编译互斥。
+    if (Test-Path $schedPath) { & $schedPath reap -Apply | Out-Null }
     & ctest @ctestArgs 2>&1 | Tee-Object -FilePath $logFile
     $ct = $LASTEXITCODE
     # ctest 遇到"没匹配到任何用例"时返回 0，但那不是"验证通过"，是

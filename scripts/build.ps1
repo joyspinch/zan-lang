@@ -94,8 +94,12 @@ if ($SkipGate) {
 # 退出码经临时文件回传：`& $gate` 在子作用域里跑，$script: 变量穿不过去
 # （各自的 script scope），闭包里的 $LASTEXITCODE 同样出不来。
 $gate = Join-Path $PSScriptRoot 'build_gate.ps1'
+$schedPath = Join-Path $PSScriptRoot 'sched.ps1'
 $codeFile = Join-Path $env:TEMP "zan_build_code_$PID.txt"
 & $gate -Name 'build' -Script {
+    # 顺手回收上一轮留下的副本：过期任务租约、没人引用的仓库外 worktree。
+    # 放在闸里跑，跟编译/测试互斥，不会跟别人的构建抢同一个目录。
+    if (Test-Path $schedPath) { & $schedPath reap -Apply | Out-Null }
     if ($Configure) { & $doConfigure }
     & $doBuild
     Set-Content -Path $codeFile -Value $LASTEXITCODE -Encoding ASCII

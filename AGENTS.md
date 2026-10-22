@@ -289,6 +289,25 @@ positive, stated in the commit message.
       `repomap.exe`、`zan-mcp.exe` 等真工具链，**按名字猜着删会踩到它们**，
       所以保留清单写死在 `clean_build.ps1` 里，不按通配符删。
 
+17. **多任务并行靠调度器，不靠"复制一份躲开"。** 仓库里已经有自动协调机制，
+    用它，别手抄、别另开一份：
+    - **共享构建资源**：`scripts/build.ps1`、`scripts/test.ps1`、**裸 `ctest`**
+      都走同一把锁（`scripts/sched.ps1` 的租约）。裸 ctest 也自动排队——钩子
+      挂在 CMake 生成的 `CTestCustom.cmake` 上（`scripts/ctest_gate.ps1`），
+      谁跑都一样，**绕不过去**。拿不到就排队等（默认 30 分钟，超时报错，
+      不静默绕过）。
+    - **任务准入**：派 worker 前先
+      `pwsh -File scripts/sched.ps1 register -Title "<任务名>"`——**同题已在跑
+      直接拒**（exit=2，点名是谁在跑），并发超上限就排队（默认 4）。长任务
+      用 `heartbeat -Id <lease>` 续租，结束时 `finish -Id <lease>`（顺手清掉
+      它登记的副本）。派发前先 `status` 看一眼有几条在跑。
+    - **副本自动回收**：`scripts/sched.ps1 reap`（每次 build/test 跑完自动
+      执行）清掉过期任务租约，以及**没人引用的仓库外 worktree 副本**——删前
+      先证明"内容已在主仓"（工作树干净 + HEAD 是 main 的祖先）；有独有提交
+      或未提交改动的会保留并报出来，不硬删。
+    - 机制细节与踩过的坑见 `.agents/skills/zan-dev-standards/SKILL.md` 的
+      「并发会话的串行纪律」与「PowerShell 脚本协作的几个坑」两节。
+
 ## Build / dev quickstart
 
 **The toolchain of each platform is fixed — see [`docs/BUILD_TOOLCHAIN.md`](docs/BUILD_TOOLCHAIN.md).**

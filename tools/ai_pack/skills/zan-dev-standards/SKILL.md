@@ -1204,6 +1204,43 @@ server-dev-standards；数据建模见 data-modeling；SQL 细则见 server-db-d
   坑出处：一次 26 个 worker 子会话的并发里，有两个任务各被重复派发了一份，
   两个副本都是零消息空壳——纯白烧 token，还让"有几条任务在跑"更难数清。
 
+- **调度器是并行的唯一入口**：`scripts/sched.ps1` 管三件事——**任务准入**
+  （同题重复派发直接拒、并发超上限排队）、**共享资源锁**（租约 + 进程存活
+  判定：持锁进程崩了锁自动失效、PID 被复用能认出来、别的进程也能替它
+  解锁）、**副本自动回收**（过期租约 + 没人引用的仓库外 worktree 副本，
+  删前先证明"内容已在主仓"）。
+  - 派 worker 前：`pwsh -File scripts/sched.ps1 register -Title "<任务名>"`
+    ——同题已在跑会直接拒（exit=2，点名是谁在跑），并发超上限排队（默认 4）。
+    长任务 `heartbeat -Id <lease>` 续租，结束 `finish -Id <lease>`（顺手清掉
+    它登记的副本）。派发前先 `status`。
+  - 拿构建资源：`scripts/build.ps1` / `scripts/test.ps1` / **裸 ctest** 都走
+    同一把锁。裸 ctest 也自动排队——钩子挂在 CMake 生成的 `CTestCustom.cmake`
+    上（`scripts/ctest_gate.ps1`），谁跑都一样，绕不过去；`scripts/test.ps1`
+    持锁在先再拉起 ctest 时，钩子认出"持锁者是 ctest 的祖先"，不重复加锁、
+    也不提前解锁（否则父进程还在跑锁却没了）。
+  - 坑出处：约束只写在 AGENTS.md 里必然被漏——裸跑一次 `ctest` 就漏了，所以
+    把约束挂到 ctest 自己身上；副本靠"记得删"必然删不干净（worktree 副本被
+    删两次又被重建两次），所以回收要自动 + **有证明才删**（干净 + HEAD 是
+    main 的祖先才动，独有提交/未提交改动一律保留并报出来）。
+
+### PowerShell 脚本协作的几个坑（脚本纪律）
+
+- **租约/心跳的时间戳存 epoch 数字，别存 ISO 字符串**：`ConvertFrom-Json`
+  会把 ISO 字符串转成 DateTime，再转回字符串就不是原来的字面量（时区还会
+  被折一次）——比对必然失配，症状是"刚写的租约瞬间过期""持锁者明明活着却
+  被判成已死"，于是什么都拦不住。epoch 秒/毫秒是数字，过 JSON 不变形。
+- **命名参数只能用哈希表 splat**：`& $cmd @array` 是**纯位置**的，传
+  `-Name` 会被当成位置参数，报"找不到接受该实参的位置参数"；要用
+  `& $cmd @hashtable`。
+- **`Start-Process -ArgumentList` 按空格拼接**：传
+  `-Command "Start-Sleep -Seconds 120"` 会被拆成 pwsh 自己的参数，进程秒退
+  ——于是"常驻持锁进程"当场死掉，锁被判成自动失效，测试看着像闸没生效。
+  带空格的命令串用 `-EncodedCommand`（Base64，没有空格）。
+- **`Write-Host` 走信息流（3），不是成功流**：抓脚本输出要 `*>&1`；只写
+  `2>&1` 抓不到，脚本自测会"什么都没收到"却显示 PASS。
+- **后台辅助进程要把 stdout/stderr 重定向到文件**：否则它攥着管道不放，
+  调用方看着像卡死。
+
 ### 测试产物要收口，别散着堆（构建产物纪律）
 
 - **用例产物只有一个去处**：所有 conformance / leak / arc 用例的可执行文件都

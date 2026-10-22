@@ -847,6 +847,28 @@ enable_testing()
 # 6 GB），真正的产物只剩 4 个。用例产物从此只有一个去处：build\cases\；
 # 根目录留给真产物与工具链。缓存的保质期与体积上限由 scripts\clean_build.ps1 管。
 file(MAKE_DIRECTORY ${CMAKE_BINARY_DIR}/cases)
+# ---- 任何 ctest 调用都先拿共享构建锁 --------------------------------------
+# 裸跑 `ctest -R foo` 绕过了 scripts\test.ps1 的闸：一个会话在测，另一个
+# 会话重编编译器，测试便成片假红，而两边都以为自己没错。这里把约束挂到
+# ctest 自己身上——谁跑都一样，绕不过去；拿不到锁就在原地排队，不另开一棵
+# 构建树。钩子实现见 scripts\ctest_gate.ps1，锁的实现见 scripts\sched.ps1。
+find_program(_zan_pwsh pwsh)
+if(_zan_pwsh)
+  set(ZAN_PWSH "${_zan_pwsh}")
+  configure_file(${CMAKE_SOURCE_DIR}/scripts/CTestCustom.cmake.in
+                 ${CMAKE_BINARY_DIR}/CTestCustom.cmake @ONLY)
+else()
+  message(STATUS "zan: 未找到 pwsh——ctest 自动排队钩子未启用")
+endif()
+
+# 调度器自测：锁的互斥/排队/崩溃自愈、任务准入（同题重复、并发上限）、
+# 副本回收（过期租约、仓库外 worktree）。跑它要先有 pwsh。
+if(_zan_pwsh)
+  add_test(NAME tool_sched_selftest
+    COMMAND ${_zan_pwsh} -NoProfile -ExecutionPolicy Bypass
+            -File ${CMAKE_SOURCE_DIR}/tests/sched_selftest.ps1)
+  set_tests_properties(tool_sched_selftest PROPERTIES TIMEOUT 300)
+endif()
 
 add_executable(zanrt_sync_test
     tests/runtime/rt_sync_test.c

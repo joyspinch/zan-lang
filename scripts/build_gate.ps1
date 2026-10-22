@@ -14,21 +14,30 @@
 #   正确的做法是**串行等待**：拿不到共享资源就排队等，而不是另开一份。
 #   这把闸就是那个等待点。
 #
+# 机制（现在由 scripts\sched.ps1 统一实现，闸只是它的命令行外壳）：
+#   锁 = 一份**租约**（%LOCALAPPDATA%\Zan\sched\locks\），记着持锁者的
+#   PID 与进程启动时刻。判定"锁着吗"看**持锁进程是否还活着**：
+#     - 持锁进程崩了/被杀了 → 租约自动失效，下一个来的人直接接手；
+#     - PID 被复用 → 启动时刻对不上，判定为已死；
+#     - 别的进程也能替它解锁（这正是 ctest 钩子需要的：钩子进程自己会
+#       退出，锁却要活到整轮测试结束）。
+#   旧的实现是 Windows 命名 Mutex（内核对象，进程死了内核自动释放）。
+#   换成租约不是为了放弃内核的自动释放，而是为了**支持"由别的进程释放"**
+#   ——否则 ctest 的 PRE/POST 钩子没法把锁活到整轮测试结束。
+#   租约的"检查+写入"仍在命名 Mutex 里做，保证两个进程不会同时抢到。
+#
+#   锁名带仓库路径的哈希，因此不同仓库互不干扰，同一仓库的所有会话共享一把。
+#
+# 超时：
+#   默认 30 分钟。超时后**报错退出**，不静默绕过——静默绕过等于没有闸。
+#   排队时每 5 秒打印一次持锁者，让等待者知道是在等谁。
+#
 # 用法（PowerShell）：
 #   # 包一段需要独占共享构建资源的操作
 #   .\scripts\build_gate.ps1 -Name "my-build" -Script { cmake --build build }
 #
 #   # 只看当前谁占着闸
 #   .\scripts\build_gate.ps1 -Status
-#
-# 跨进程语义：
-#   用 Windows 命名 Mutex（内核对象）。持锁进程崩溃/被杀时内核自动释放，
-#   不会有"死进程留下永久锁"的坑——这是选 Mutex 而不是锁文件的关键理由。
-#   锁名带仓库路径的哈希，因此不同仓库互不干扰，同一仓库的所有会话共享一把。
-#
-# 超时：
-#   默认 30 分钟。超时后**报错退出**，不静默绕过——静默绕过等于没有闸。
-#   排队时每 5 秒打印一次持锁者，让等待者知道是在等谁。
 
 param(
     [string]$Name = 'build',
@@ -39,47 +48,11 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$root = Split-Path -Parent $PSScriptRoot
-
-# 锁名：仓库绝对路径的 SHA256 前 16 位 + 用途名。
-# 同一仓库 = 同一把锁（不同会话共享）；不同仓库 = 不同锁（互不阻塞）。
-$repoKey = [System.IO.Path]::GetFullPath($root)
-$sha = [System.Security.Cryptography.SHA256]::Create()
-try {
-    $hashBytes = $sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($repoKey))
-    $repoHash = ([System.BitConverter]::ToString($hashBytes) -replace '-', '').Substring(0, 16)
-} finally {
-    $sha.Dispose()
-}
-$mutexName = "Local\ZanBuildGate_${repoHash}_$Name"
-
-# 持锁者信息写在这里，供等待者显示（Mutex 本身查不出持有者）。
-$holderFile = Join-Path $env:TEMP "zan_build_gate_${repoHash}_${Name}.holder"
-
-function Show-Holder {
-    if (Test-Path $holderFile) {
-        try {
-            $h = Get-Content $holderFile -Raw -ErrorAction Stop
-            if ($h.Trim()) { return $h.Trim() }
-        } catch { }
-    }
-    return '<未知>'
-}
+$sched = Join-Path $PSScriptRoot 'sched.ps1'
 
 if ($Status) {
-    $created = $false
-    $m = New-Object System.Threading.Mutex($false, $mutexName, [ref]$created)
-    try {
-        if ($m.WaitOne(0)) {
-            Write-Host "[gate] '$Name' 当前空闲（$mutexName）"
-            $m.ReleaseMutex()
-        } else {
-            Write-Host "[gate] '$Name' 正被占用：$(Show-Holder)"
-        }
-    } finally {
-        $m.Dispose()
-    }
-    exit 0
+    & $sched lock-status -Name $Name
+    exit $LASTEXITCODE
 }
 
 if (-not $Script -and -not $Command) {
@@ -93,50 +66,25 @@ if (-not $Script -and $Command) {
     $Script = [scriptblock]::Create($Command)
 }
 
-$mutex = New-Object System.Threading.Mutex($false, $mutexName)
-$acquired = $false
-try {
-    $deadline = (Get-Date).AddSeconds($TimeoutSec)
-    $lastReport = [DateTime]::MinValue
-
-    while (-not $acquired) {
-        # WaitOne(0) 试探；拿不到就退避重试，不忙等。
-        $acquired = $mutex.WaitOne(0)
-        if ($acquired) { break }
-
-        if ((Get-Date) -gt $deadline) {
-            Write-Host "[gate] 等待 '$Name' 超时（${TimeoutSec}s）。当前持锁者：$(Show-Holder)" -ForegroundColor Red
-            Write-Host "[gate] 这说明另一个会话长时间占着共享构建资源。" -ForegroundColor Yellow
-            Write-Host "[gate] 处理：确认那个会话是否还活着；活的就等它做完，别再另开一棵构建树。" -ForegroundColor Yellow
-            exit 1
-        }
-
-        if (((Get-Date) - $lastReport).TotalSeconds -ge 5) {
-            $lastReport = Get-Date
-            Write-Host "[gate] 排队等待 '$Name'（持锁者：$(Show-Holder)）..." -ForegroundColor DarkGray
-        }
-        Start-Sleep -Milliseconds 500
+# 租约的持锁者是**本进程**（$PID）：闸活着锁就活着，闸死了锁自动失效。
+& $sched lock -Name $Name -OwnerPid $PID -Wait -TimeoutSec $TimeoutSec -Note "build_gate pid=$PID"
+$gateCode = $LASTEXITCODE
+if ($gateCode -ne 0) {
+    if ($gateCode -eq 1) {
+        Write-Host "[gate] 等待 '$Name' 超时（${TimeoutSec}s）。" -ForegroundColor Red
+        Write-Host "[gate] 处理：确认那个会话是否还活着；活的就等它做完，别再另开一棵构建树。" -ForegroundColor Yellow
     }
-
-    # 记录持锁者，供后来的等待者显示。
-    $who = "pid=$PID host=$env:COMPUTERNAME at=$((Get-Date).ToString('HH:mm:ss'))"
-    try {
-        Set-Content -Path $holderFile -Value $who -Encoding UTF8
-    } catch { }
-
-    Write-Host "[gate] 已获得 '$Name' 锁" -ForegroundColor Green
-    try {
-        & $Script
-        $code = if ($LASTEXITCODE -ne $null) { $LASTEXITCODE } else { 0 }
-    } catch {
-        Write-Host "[gate] '$Name' 执行出错：$_" -ForegroundColor Red
-        $code = 1
-    }
-    exit $code
-} finally {
-    if ($acquired) {
-        try { $mutex.ReleaseMutex() } catch { }
-        try { Remove-Item $holderFile -ErrorAction SilentlyContinue } catch { }
-    }
-    $mutex.Dispose()
+    exit $gateCode
 }
+
+$code = 0
+try {
+    & $Script
+    $code = if ($LASTEXITCODE -ne $null) { $LASTEXITCODE } else { 0 }
+} catch {
+    Write-Host "[gate] '$Name' 执行出错：$_" -ForegroundColor Red
+    $code = 1
+} finally {
+    & $sched unlock -Name $Name -OwnerPid $PID | Out-Null
+}
+exit $code
