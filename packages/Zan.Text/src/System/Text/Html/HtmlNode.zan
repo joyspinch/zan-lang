@@ -1,0 +1,279 @@
+using System;
+using System.Collections.Generic;
+
+namespace System.Text.Html;
+
+// 节点种类。
+public class HtmlNodeType {
+    public const int Document = 0;
+    public const int Element = 1;
+    public const int Text = 2;
+    public const int Comment = 3;
+}
+
+// HTML 文档里的一种节点。
+//
+// **父指针是弱引用**：父持有子（children 强引用）、子只弱引用父。父子
+// 双向强引用会构成 ARC 引用环，引用计数永远降不到 0，进程退出时整棵
+// 树会被报成"仍可达"的泄漏（父指针 + children 互指就是这个环）。
+// 弱引用下父节点被回收后 Parent() 返回 null，语义正好。
+public class HtmlNode {
+    // 节点种类（HtmlNodeType.*）。
+    public int type;
+    // 元素：小写标签名；文本/注释：空串。
+    public string tag;
+    // 文本/注释内容。
+    public string text;
+    // 属性（名字小写 → 值）。同名属性取第一个（HTML 规则）。
+    public Dictionary<string, string> attrs;
+    // 子节点。
+    public List<HtmlNode> children;
+    // 父节点（弱引用，见上面的说明）。
+    private weak HtmlNode parentNode;
+    // 在父节点的 children 里的下标。
+    public int index;
+
+    public HtmlNode(int type) {
+        this.type = type;
+        this.tag = "";
+        this.text = "";
+        this.attrs = new Dictionary<string, string>();
+        this.children = new List<HtmlNode>();
+        this.parentNode = null;
+        this.index = 0;
+    }
+
+    // 建一个元素节点。
+    public static HtmlNode Element(string tag) {
+        HtmlNode n = new HtmlNode(HtmlNodeType.Element);
+        n.tag = tag == null ? "" : tag;
+        return n;
+    }
+
+    // 建一个文本节点。
+    public static HtmlNode TextNode(string text) {
+        HtmlNode n = new HtmlNode(HtmlNodeType.Text);
+        n.text = text == null ? "" : text;
+        return n;
+    }
+
+    // 建一个注释节点。
+    public static HtmlNode CommentNode(string text) {
+        HtmlNode n = new HtmlNode(HtmlNodeType.Comment);
+        n.text = text == null ? "" : text;
+        return n;
+    }
+
+    public bool IsElement() {
+        return this.type == HtmlNodeType.Element;
+    }
+
+    // 直接父节点（顶层节点返回文档根；父已被回收时返回 null）。
+    public HtmlNode Parent() {
+        return this.parentNode;
+    }
+
+    // 最近的元素祖先（顶层节点返回 null）。
+    public HtmlNode ElementParent() {
+        HtmlNode p = this.parentNode;
+        while (p != null) {
+            if (p.IsElement()) { return p; }
+            p = p.parentNode;
+        }
+        return null;
+    }
+
+    // 元素祖先的个数（顶层元素是 0）。
+    public int ElementAncestorCount() {
+        int n = 0;
+        HtmlNode p = this.parentNode;
+        while (p != null) {
+            if (p.IsElement()) { n = n + 1; }
+            p = p.parentNode;
+        }
+        return n;
+    }
+
+    // 挂一个子节点（同时维护父指针与 index）。
+    public void AppendChild(HtmlNode child) {
+        if (child == null) { return; }
+        child.index = this.children.Count;
+        this.children.Add(child);
+        child.parentNode = this;
+    }
+
+    // 删掉第 i 个子节点（后面兄弟的 index 顺移）。
+    public void RemoveChildAt(int i) {
+        if (i < 0 || i >= this.children.Count) { return; }
+        this.children.RemoveAt(i);
+        for (int k = i; k < this.children.Count; k = k + 1) {
+            this.children[k].index = k;
+        }
+    }
+
+    // 取属性值（没有返回 fallback）。
+    public string Get(string name, string fallback) {
+        if (name == null) { return fallback; }
+        string v;
+        if (this.attrs.TryGetValue(name, out v)) { return v; }
+        return fallback;
+    }
+
+    // 是否带这个属性。
+    public bool Has(string name) {
+        if (name == null) { return false; }
+        return this.attrs.ContainsKey(name);
+    }
+
+    // 设置属性（值为 null 等于删除）。
+    public void SetAttr(string name, string value) {
+        if (name == null) { return; }
+        if (value == null) {
+            this.attrs.Remove(name);
+            return;
+        }
+        this.attrs[name] = value;
+    }
+
+    // class 属性拆成的类名列表。
+    public List<string> ClassList() {
+        List<string> out2 = new List<string>();
+        string raw = this.Get("class", "");
+        int n = raw.Length;
+        int i = 0;
+        while (i < n) {
+            while (i < n && HtmlUtil.IsSpace(raw[i] & 255)) { i = i + 1; }
+            int start = i;
+            while (i < n && !HtmlUtil.IsSpace(raw[i] & 255)) { i = i + 1; }
+            if (i > start) { out2.Add(raw.Substring(start, i - start)); }
+        }
+        return out2;
+    }
+
+    // 是否带这个类名。
+    public bool HasClass(string name) {
+        if (name == null || name.Length == 0) { return false; }
+        List<string> classes = this.ClassList();
+        for (int i = 0; i < classes.Count; i = i + 1) {
+            if (classes[i] == name) { return true; }
+        }
+        return false;
+    }
+
+    // 子节点里的元素（不含文本/注释）。
+    public List<HtmlNode> ElementChildren() {
+        List<HtmlNode> out2 = new List<HtmlNode>();
+        for (int i = 0; i < this.children.Count; i = i + 1) {
+            if (this.children[i].IsElement()) { out2.Add(this.children[i]); }
+        }
+        return out2;
+    }
+
+    // 全部后代文本（拼接）。
+    public string TextContent() {
+        StringBuilder sb = new StringBuilder();
+        HtmlNode.CollectText(this, sb);
+        return sb.ToString();
+    }
+
+    static void CollectText(HtmlNode node, StringBuilder sb) {
+        for (int i = 0; i < node.children.Count; i = i + 1) {
+            HtmlNode c = node.children[i];
+            if (c.type == HtmlNodeType.Text) { sb.Append(c.text); }
+            else if (c.type == HtmlNodeType.Element) { HtmlNode.CollectText(c, sb); }
+        }
+    }
+
+    // 子节点序列化（HTML 源码形态）。
+    public string InnerHtml() {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < this.children.Count; i = i + 1) {
+            HtmlNode.WriteOuter(this.children[i], sb);
+        }
+        return sb.ToString();
+    }
+
+    // 本节点序列化（HTML 源码形态）。
+    public string OuterHtml() {
+        StringBuilder sb = new StringBuilder();
+        HtmlNode.WriteOuter(this, sb);
+        return sb.ToString();
+    }
+
+    // 序列化一个节点。
+    public static void WriteOuter(HtmlNode node, StringBuilder sb) {
+        if (node.type == HtmlNodeType.Text) {
+            sb.Append(HtmlUtil.EscapeText(node.text));
+            return;
+        }
+        if (node.type == HtmlNodeType.Comment) {
+            sb.Append("<!--");
+            sb.Append(node.text);
+            sb.Append("-->");
+            return;
+        }
+        sb.Append("<");
+        sb.Append(node.tag);
+        List<string> keys = node.attrs.Keys;
+        for (int i = 0; i < keys.Count; i = i + 1) {
+            sb.Append(" ");
+            sb.Append(keys[i]);
+            sb.Append("=\"");
+            sb.Append(HtmlUtil.EscapeAttr(node.attrs[keys[i]]));
+            sb.Append("\"");
+        }
+        sb.Append(">");
+        if (HtmlUtil.IsVoidTag(node.tag)) { return; }
+        for (int i = 0; i < node.children.Count; i = i + 1) {
+            HtmlNode.WriteOuter(node.children[i], sb);
+        }
+        sb.Append("</");
+        sb.Append(node.tag);
+        sb.Append(">");
+    }
+
+    // 在本节点的子树里按 CSS 选择器查询（不含本节点）。
+    public List<HtmlNode> Query(string selector) {
+        return CssSelector.Query(this, selector);
+    }
+
+    // 在本节点的子树里按 CSS 选择器查第一个（没有返回 null）。
+    public HtmlNode Find(string selector) {
+        return CssSelector.Find(this, selector);
+    }
+}
+
+// 一份 HTML 文档（根是一个 Document 节点）。
+public class HtmlDocument {
+    // 文档根（HtmlNodeType.Document）。
+    public HtmlNode root;
+
+    public HtmlDocument() {
+        this.root = new HtmlNode(HtmlNodeType.Document);
+    }
+
+    // 解析 HTML 片段。
+    public static HtmlDocument Parse(string html) {
+        return HtmlParser.Parse(html);
+    }
+
+    // 按 CSS 选择器查询（文档顺序）。
+    public List<HtmlNode> Query(string selector) {
+        return CssSelector.Query(this.root, selector);
+    }
+
+    // 按 CSS 选择器查第一个（没有返回 null）。
+    public HtmlNode Find(string selector) {
+        return CssSelector.Find(this.root, selector);
+    }
+
+    // 文档的 HTML 源码形态。
+    public string InnerHtml() {
+        return this.root.InnerHtml();
+    }
+
+    // 文档的全部文本。
+    public string TextContent() {
+        return this.root.TextContent();
+    }
+}

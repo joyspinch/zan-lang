@@ -1,0 +1,280 @@
+using System;
+using System.Collections.Generic;
+
+namespace System.Text.Html;
+
+// 容错的 HTML 解析器。
+//
+// 目标是"够用且安全"，不是完整实现 HTML5 树构造：
+//   - 标签与属性按 HTML 规则解析：属性名小写、同名属性取第一个、
+//     无引号的值到空白或 '>' 为止；
+//   - 空元素不压栈；script/style 的内容按原始文本处理（里面的 '<'
+//     不是标签），textarea/title 的内容解实体；
+//   - 隐式闭合覆盖 p / li / dt / dd / option / tr / td / th /
+//     thead / tbody / tfoot；
+//   - 结束标签找到匹配就一路关到它，找不到就忽略；
+//   - 畸形输入不抛异常：孤立的 '<' 当文本，属性名不合法就跳过。
+public class HtmlParser {
+    string src;
+    int len;
+    int pos;
+    List<HtmlNode> open;
+
+    public HtmlParser() {
+        this.src = "";
+        this.len = 0;
+        this.pos = 0;
+        this.open = new List<HtmlNode>();
+    }
+
+    // 解析 HTML 片段。
+    public static HtmlDocument Parse(string html) {
+        HtmlParser p = new HtmlParser();
+        p.src = html == null ? "" : html;
+        p.len = p.src.Length;
+        p.pos = 0;
+        HtmlDocument doc = new HtmlDocument();
+        p.open.Add(doc.root);
+        p.Run();
+        return doc;
+    }
+
+    void Run() {
+        while (this.pos < this.len) {
+            int c = this.src[this.pos] & 255;
+            if (c != 60) {
+                int start = this.pos;
+                while (this.pos < this.len && (this.src[this.pos] & 255) != 60) { this.pos = this.pos + 1; }
+                this.AddText(HtmlUtil.DecodeEntities(this.src.Substring(start, this.pos - start)));
+                continue;
+            }
+            if (this.Has("<!--")) { this.ParseComment(); continue; }
+            if (this.Has("<!")) { this.SkipBogus(); continue; }
+            if (this.Has("</")) { this.ParseEndTag(); continue; }
+            if (this.pos + 1 < this.len && HtmlUtil.IsNameStart(this.src[this.pos + 1] & 255)) {
+                this.ParseStartTag();
+                continue;
+            }
+            // 孤立的 '<'：当普通文本。
+            this.AddText("<");
+            this.pos = this.pos + 1;
+        }
+    }
+
+    // 当前所在的容器（栈顶）。
+    HtmlNode Current() {
+        return this.open[this.open.Count - 1];
+    }
+
+    void AddText(string text) {
+        if (text.Length == 0) { return; }
+        this.Current().AppendChild(HtmlNode.TextNode(text));
+    }
+
+    // 当前位置是否以 prefix 开头。
+    bool Has(string prefix) {
+        if (this.pos + prefix.Length > this.len) { return false; }
+        return this.MatchAt(prefix, this.pos);
+    }
+
+    // 大小写不敏感地比较 src[at..] 与 needle。
+    bool MatchAt(string needle, int at) {
+        if (at + needle.Length > this.len) { return false; }
+        for (int k = 0; k < needle.Length; k = k + 1) {
+            int a = this.src[at + k] & 255;
+            int b = needle[k] & 255;
+            if (a >= 65 && a <= 90) { a = a + 32; }
+            if (b >= 65 && b <= 90) { b = b + 32; }
+            if (a != b) { return false; }
+        }
+        return true;
+    }
+
+    // 从 from 起大小写不敏感地找 needle，找不到返回 -1。
+    int FindIgnoreCase(string needle, int from) {
+        int m = needle.Length;
+        if (m == 0) { return -1; }
+        for (int i = from; i + m <= this.len; i = i + 1) {
+            if (this.MatchAt(needle, i)) { return i; }
+        }
+        return -1;
+    }
+
+    void ParseComment() {
+        int end = this.src.IndexOf("-->", this.pos + 4);
+        string body;
+        if (end < 0) {
+            body = this.src.Substring(this.pos + 4, this.len - this.pos - 4);
+            this.pos = this.len;
+        } else {
+            body = this.src.Substring(this.pos + 4, end - this.pos - 4);
+            this.pos = end + 3;
+        }
+        this.Current().AppendChild(HtmlNode.CommentNode(body));
+    }
+
+    // doctype 之类的声明：整段丢掉。
+    void SkipBogus() {
+        int end = this.src.IndexOf(">", this.pos + 2);
+        if (end < 0) { this.pos = this.len; } else { this.pos = end + 1; }
+    }
+
+    void ParseEndTag() {
+        int j = this.pos + 2;
+        int nameStart = j;
+        while (j < this.len && HtmlUtil.IsNameChar(this.src[j] & 255)) { j = j + 1; }
+        string name = this.src.Substring(nameStart, j - nameStart).ToLower();
+        while (j < this.len && (this.src[j] & 255) != 62) { j = j + 1; }
+        this.pos = j < this.len ? j + 1 : this.len;
+        if (name.Length > 0) { this.CloseTag(name); }
+    }
+
+    void ParseStartTag() {
+        int j = this.pos + 1;
+        int nameStart = j;
+        while (j < this.len && HtmlUtil.IsNameChar(this.src[j] & 255)) { j = j + 1; }
+        string name = this.src.Substring(nameStart, j - nameStart).ToLower();
+        HtmlNode node = HtmlNode.Element(name);
+
+        while (j < this.len) {
+            while (j < this.len && HtmlUtil.IsSpace(this.src[j] & 255)) { j = j + 1; }
+            if (j >= this.len) { break; }
+            int c = this.src[j] & 255;
+            if (c == 62) { j = j + 1; break; }                                   // '>'
+            if (c == 47 && j + 1 < this.len && (this.src[j + 1] & 255) == 62) { j = j + 2; break; }  // '/>'
+            int attrStart = j;
+            while (j < this.len) {
+                int cc = this.src[j] & 255;
+                if (HtmlUtil.IsSpace(cc) || cc == 61 || cc == 62 || cc == 34 || cc == 39 || cc == 60) { break; }
+                j = j + 1;
+            }
+            if (j == attrStart) { j = j + 1; continue; }
+            string attrName = this.src.Substring(attrStart, j - attrStart).ToLower();
+            string value = "";
+            int k = j;
+            while (k < this.len && HtmlUtil.IsSpace(this.src[k] & 255)) { k = k + 1; }
+            if (k < this.len && (this.src[k] & 255) == 61) {
+                k = k + 1;
+                while (k < this.len && HtmlUtil.IsSpace(this.src[k] & 255)) { k = k + 1; }
+                if (k < this.len) {
+                    int q = this.src[k] & 255;
+                    if (q == 34 || q == 39) {
+                        k = k + 1;
+                        int vs = k;
+                        while (k < this.len && (this.src[k] & 255) != q) { k = k + 1; }
+                        value = this.src.Substring(vs, k - vs);
+                        if (k < this.len) { k = k + 1; }
+                    } else {
+                        int vs = k;
+                        while (k < this.len) {
+                            int cc = this.src[k] & 255;
+                            if (HtmlUtil.IsSpace(cc) || cc == 62) { break; }
+                            k = k + 1;
+                        }
+                        value = this.src.Substring(vs, k - vs);
+                    }
+                }
+                j = k;
+            }
+            // HTML 规则：同名属性取第一个。
+            // 属性值里的实体要解码——不解码的话 "javascript&colon;alert(1)"
+            // 这种写法会被当成相对地址放过去，浏览器却是当成 javascript:
+            // 执行的。
+            if (!node.attrs.ContainsKey(attrName)) { node.attrs.Add(attrName, HtmlUtil.DecodeEntities(value)); }
+        }
+        this.pos = j;
+
+        this.ApplyImpliedEndTags(name);
+        this.Current().AppendChild(node);
+        if (HtmlUtil.IsVoidTag(name)) { return; }
+        if (HtmlUtil.IsRawTextTag(name) || HtmlUtil.IsEscapableRawTextTag(name)) {
+            this.ReadRawText(node, name);
+            return;
+        }
+        this.open.Add(node);
+    }
+
+    // 原始文本元素的内容：到对应的结束标签为止。
+    void ReadRawText(HtmlNode node, string name) {
+        string closeTag = "</" + name;
+        int at = this.FindIgnoreCase(closeTag, this.pos);
+        string raw;
+        if (at < 0) {
+            raw = this.src.Substring(this.pos, this.len - this.pos);
+            this.pos = this.len;
+        } else {
+            raw = this.src.Substring(this.pos, at - this.pos);
+            this.pos = at;
+        }
+        if (raw.Length > 0) {
+            string text = raw;
+            if (HtmlUtil.IsEscapableRawTextTag(name)) { text = HtmlUtil.DecodeEntities(raw); }
+            node.AppendChild(HtmlNode.TextNode(text));
+        }
+        if (this.Has(closeTag)) {
+            int j = this.pos + closeTag.Length;
+            while (j < this.len && (this.src[j] & 255) != 62) { j = j + 1; }
+            this.pos = j < this.len ? j + 1 : this.len;
+        }
+    }
+
+    // 开始标签带来的隐式闭合。
+    void ApplyImpliedEndTags(string name) {
+        if (HtmlParser.ClosesParagraph(name)) { this.CloseTopOf("p"); }
+        if (name == "li") {
+            this.CloseTopOf("li");
+        } else if (name == "dt" || name == "dd") {
+            this.CloseTopOf("dt");
+            this.CloseTopOf("dd");
+        } else if (name == "option") {
+            this.CloseTopOf("option");
+        } else if (name == "optgroup") {
+            this.CloseTopOf("option");
+            this.CloseTopOf("optgroup");
+        } else if (name == "tr") {
+            this.CloseTopOf("td");
+            this.CloseTopOf("th");
+            this.CloseTopOf("tr");
+        } else if (name == "td" || name == "th") {
+            this.CloseTopOf("td");
+            this.CloseTopOf("th");
+        } else if (name == "thead" || name == "tbody" || name == "tfoot") {
+            this.CloseTopOf("td");
+            this.CloseTopOf("th");
+            this.CloseTopOf("tr");
+            this.CloseTopOf("thead");
+            this.CloseTopOf("tbody");
+            this.CloseTopOf("tfoot");
+        }
+    }
+
+    // 这些块级标签开始时会关掉还开着的 <p>。
+    static bool ClosesParagraph(string name) {
+        return name == "address" || name == "article" || name == "aside"
+            || name == "blockquote" || name == "details" || name == "dialog"
+            || name == "div" || name == "dl" || name == "fieldset"
+            || name == "figcaption" || name == "figure" || name == "footer"
+            || name == "form" || name == "h1" || name == "h2" || name == "h3"
+            || name == "h4" || name == "h5" || name == "h6" || name == "header"
+            || name == "hgroup" || name == "hr" || name == "main" || name == "menu"
+            || name == "nav" || name == "ol" || name == "p" || name == "pre"
+            || name == "section" || name == "table" || name == "ul";
+    }
+
+    // 栈顶是这个标签就关掉它。
+    void CloseTopOf(string tag) {
+        if (this.open.Count <= 1) { return; }
+        HtmlNode top = this.open[this.open.Count - 1];
+        if (top.tag == tag) { this.open.RemoveAt(this.open.Count - 1); }
+    }
+
+    // 结束标签：找到匹配就一路关到它，找不到忽略。
+    void CloseTag(string name) {
+        for (int i = this.open.Count - 1; i >= 1; i = i - 1) {
+            if (this.open[i].tag == name) {
+                while (this.open.Count > i) { this.open.RemoveAt(this.open.Count - 1); }
+                return;
+            }
+        }
+    }
+}

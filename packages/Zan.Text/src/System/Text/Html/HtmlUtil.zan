@@ -1,0 +1,301 @@
+using System;
+
+namespace System.Text.Html;
+
+// HTML 文本处理的小工具：转义、实体解码、名字规范化、空元素判定。
+//
+// 全部按**字节**处理：Zan 的 string 索引取的是 UTF-8 字节
+// （string.Length 就是字节数），所以扫描标签与转义都按字节走，
+// 非 ASCII 的多字节序列原样透传，不会被拆坏。
+public class HtmlUtil {
+    // 空白字符（空格、制表、CR、LF）。
+    public static bool IsSpace(int c) {
+        return c == 32 || c == 9 || c == 13 || c == 10;
+    }
+
+    // 名字的首字符：字母。
+    public static bool IsNameStart(int c) {
+        return (c >= 97 && c <= 122) || (c >= 65 && c <= 90);
+    }
+
+    // 名字的后续字符：字母、数字、'-'、'_'，以及非 ASCII 字节。
+    public static bool IsNameChar(int c) {
+        if (c >= 97 && c <= 122) { return true; }
+        if (c >= 65 && c <= 90) { return true; }
+        if (c >= 48 && c <= 57) { return true; }
+        if (c == 45 || c == 95) { return true; }
+        if (c >= 128) { return true; }
+        return false;
+    }
+
+    // 空元素（没有结束标签，也没有内容）。
+    public static bool IsVoidTag(string tag) {
+        if (tag == null || tag.Length == 0) { return false; }
+        return tag == "area" || tag == "base" || tag == "br" || tag == "col"
+            || tag == "embed" || tag == "hr" || tag == "img" || tag == "input"
+            || tag == "link" || tag == "meta" || tag == "param" || tag == "source"
+            || tag == "track" || tag == "wbr";
+    }
+
+    // 原始文本元素：内容按纯文本处理（不解析标签）。
+    //
+    // script/style 是 RAWTEXT（内容里的实体也不解码）；textarea/title
+    // 是 RCDATA（标签照旧解析，实体照旧解码）。
+    public static bool IsRawTextTag(string tag) {
+        return tag == "script" || tag == "style";
+    }
+
+    public static bool IsEscapableRawTextTag(string tag) {
+        return tag == "textarea" || tag == "title";
+    }
+
+    // 转义文本内容：& < > 。
+    //
+    // 文本节点里出现这三个字符就必须转义，否则用户内容会被当成标记
+    // 解析——这是消毒器最关键的一步。
+    public static string EscapeText(string text) {
+        if (text == null) { return ""; }
+        int n = text.Length;
+        StringBuilder sb = new StringBuilder();
+        int start = 0;
+        for (int i = 0; i < n; i = i + 1) {
+            int c = text[i] & 255;
+            string rep = "";
+            if (c == 38) { rep = "&amp;"; }
+            else if (c == 60) { rep = "&lt;"; }
+            else if (c == 62) { rep = "&gt;"; }
+            if (rep.Length > 0) {
+                sb.Append(text.Substring(start, i - start));
+                sb.Append(rep);
+                start = i + 1;
+            }
+        }
+        if (start < n) { sb.Append(text.Substring(start, n - start)); }
+        return sb.ToString();
+    }
+
+    // 转义属性值：& < > " 。
+    //
+    // 双引号必须转义（属性值用双引号包），单引号不用。
+    public static string EscapeAttr(string text) {
+        if (text == null) { return ""; }
+        int n = text.Length;
+        StringBuilder sb = new StringBuilder();
+        int start = 0;
+        for (int i = 0; i < n; i = i + 1) {
+            int c = text[i] & 255;
+            string rep = "";
+            if (c == 38) { rep = "&amp;"; }
+            else if (c == 60) { rep = "&lt;"; }
+            else if (c == 62) { rep = "&gt;"; }
+            else if (c == 34) { rep = "&quot;"; }
+            if (rep.Length > 0) {
+                sb.Append(text.Substring(start, i - start));
+                sb.Append(rep);
+                start = i + 1;
+            }
+        }
+        if (start < n) { sb.Append(text.Substring(start, n - start)); }
+        return sb.ToString();
+    }
+
+    // 解码 HTML 实体：命名实体（&amp; &lt; …）与数字实体（&#65; &#x41;）。
+    //
+    // 未知实体原样保留（HTML 的行为），不做"猜测式"替换。
+    public static string DecodeEntities(string text) {
+        if (text == null) { return ""; }
+        int n = text.Length;
+        StringBuilder sb = new StringBuilder();
+        int start = 0;
+        int i = 0;
+        while (i < n) {
+            if ((text[i] & 255) != 38) { i = i + 1; continue; }
+            string rep = "";
+            int used = 0;
+            if (HtmlUtil.TryEntity(text, i, out rep, out used)) {
+                sb.Append(text.Substring(start, i - start));
+                sb.Append(rep);
+                i = i + used;
+                start = i;
+                continue;
+            }
+            i = i + 1;
+        }
+        if (start < n) { sb.Append(text.Substring(start, n - start)); }
+        return sb.ToString();
+    }
+
+    // 尝试从 at 处解析一个实体。成功时 rep 是替换文本、used 是消耗的
+    // 字节数；失败时两者都不动（调用方保留原文）。
+    public static bool TryEntity(string text, int at, out string rep, out int used) {
+        rep = "";
+        used = 0;
+        int n = text.Length;
+        if (at + 1 >= n) { return false; }
+        int c = text[at + 1] & 255;
+        if (c == 35) {   // '#'
+            int p = at + 2;
+            int radix = 10;
+            if (p < n && (text[p] & 255) == 120) { radix = 16; p = p + 1; }
+            else if (p < n && (text[p] & 255) == 88) { radix = 16; p = p + 1; }
+            int digits = 0;
+            int value = 0;
+            while (p < n && digits < 8) {
+                int d = text[p] & 255;
+                int v = HtmlUtil.HexDigit(d);
+                if (v < 0) { break; }
+                if (radix == 10 && v > 9) { break; }
+                value = value * radix + v;
+                digits = digits + 1;
+                p = p + 1;
+            }
+            if (digits == 0 || p >= n || (text[p] & 255) != 59) { return false; }
+            rep = System.Text.Encoding.Utf8FromCodePoint(value);
+            used = p + 1 - at;
+            return true;
+        }
+        // 命名实体：字母数字，最长 32 个字符，必须以 ';' 收尾。
+        int q = at + 1;
+        int len = 0;
+        while (q < n && len < 32) {
+            int d = text[q] & 255;
+            if (!HtmlUtil.IsEntityChar(d)) { break; }
+            q = q + 1;
+            len = len + 1;
+        }
+        if (len == 0 || q >= n || (text[q] & 255) != 59) { return false; }
+        string name = text.Substring(at + 1, len);
+        int cp = HtmlUtil.EntityCodePoint(name);
+        if (cp < 0) { return false; }
+        rep = System.Text.Encoding.Utf8FromCodePoint(cp);
+        used = q + 1 - at;
+        return true;
+    }
+
+    // 实体名里允许的字符：字母、数字。
+    public static bool IsEntityChar(int c) {
+        return (c >= 97 && c <= 122) || (c >= 65 && c <= 90) || (c >= 48 && c <= 57);
+    }
+
+    // 十六进制数字的值（0-9 a-f A-F），非法返回 -1。
+    public static int HexDigit(int c) {
+        if (c >= 48 && c <= 57) { return c - 48; }
+        if (c >= 97 && c <= 102) { return c - 87; }
+        if (c >= 65 && c <= 70) { return c - 55; }
+        return -1;
+    }
+
+    // 常见命名实体对应的码点；未知实体返回 -1。
+    public static int EntityCodePoint(string name) {
+        if (name == "amp") { return 38; }
+        if (name == "lt") { return 60; }
+        if (name == "gt") { return 62; }
+        if (name == "quot") { return 34; }
+        if (name == "apos") { return 39; }
+        if (name == "colon") { return 58; }
+        if (name == "sol") { return 47; }
+        if (name == "Tab") { return 9; }
+        if (name == "NewLine") { return 10; }
+        if (name == "nbsp") { return 160; }
+        if (name == "iexcl") { return 161; }
+        if (name == "cent") { return 162; }
+        if (name == "pound") { return 163; }
+        if (name == "curren") { return 164; }
+        if (name == "yen") { return 165; }
+        if (name == "brvbar") { return 166; }
+        if (name == "sect") { return 167; }
+        if (name == "uml") { return 168; }
+        if (name == "copy") { return 169; }
+        if (name == "ordf") { return 170; }
+        if (name == "laquo") { return 171; }
+        if (name == "not") { return 172; }
+        if (name == "shy") { return 173; }
+        if (name == "reg") { return 174; }
+        if (name == "macr") { return 175; }
+        if (name == "deg") { return 176; }
+        if (name == "plusmn") { return 177; }
+        if (name == "sup2") { return 178; }
+        if (name == "sup3") { return 179; }
+        if (name == "acute") { return 180; }
+        if (name == "micro") { return 181; }
+        if (name == "para") { return 182; }
+        if (name == "middot") { return 183; }
+        if (name == "cedil") { return 184; }
+        if (name == "sup1") { return 185; }
+        if (name == "ordm") { return 186; }
+        if (name == "raquo") { return 187; }
+        if (name == "frac14") { return 188; }
+        if (name == "frac12") { return 189; }
+        if (name == "frac34") { return 190; }
+        if (name == "iquest") { return 191; }
+        if (name == "times") { return 215; }
+        if (name == "divide") { return 247; }
+        if (name == "ndash") { return 8211; }
+        if (name == "mdash") { return 8212; }
+        if (name == "lsquo") { return 8216; }
+        if (name == "rsquo") { return 8217; }
+        if (name == "sbquo") { return 8218; }
+        if (name == "ldquo") { return 8220; }
+        if (name == "rdquo") { return 8221; }
+        if (name == "bdquo") { return 8222; }
+        if (name == "dagger") { return 8224; }
+        if (name == "bull") { return 8226; }
+        if (name == "hellip") { return 8230; }
+        if (name == "permil") { return 8240; }
+        if (name == "prime") { return 8242; }
+        if (name == "lsaquo") { return 8249; }
+        if (name == "rsaquo") { return 8250; }
+        if (name == "oline") { return 8254; }
+        if (name == "frasl") { return 8260; }
+        if (name == "euro") { return 8364; }
+        if (name == "trade") { return 8482; }
+        if (name == "larr") { return 8592; }
+        if (name == "uarr") { return 8593; }
+        if (name == "rarr") { return 8594; }
+        if (name == "darr") { return 8595; }
+        if (name == "harr") { return 8596; }
+        if (name == "minus") { return 8722; }
+        if (name == "ne") { return 8800; }
+        if (name == "le") { return 8804; }
+        if (name == "ge") { return 8805; }
+        if (name == "nequiv") { return 8801; }
+        if (name == "alpha") { return 945; }
+        if (name == "beta") { return 946; }
+        if (name == "gamma") { return 947; }
+        if (name == "delta") { return 948; }
+        if (name == "pi") { return 960; }
+        if (name == "sigma") { return 963; }
+        if (name == "omega") { return 969; }
+        if (name == "agrave") { return 224; }
+        if (name == "aacute") { return 225; }
+        if (name == "acirc") { return 226; }
+        if (name == "atilde") { return 227; }
+        if (name == "auml") { return 228; }
+        if (name == "aring") { return 229; }
+        if (name == "aelig") { return 230; }
+        if (name == "ccedil") { return 231; }
+        if (name == "egrave") { return 232; }
+        if (name == "eacute") { return 233; }
+        if (name == "ecirc") { return 234; }
+        if (name == "euml") { return 235; }
+        if (name == "igrave") { return 236; }
+        if (name == "iacute") { return 237; }
+        if (name == "icirc") { return 238; }
+        if (name == "iuml") { return 239; }
+        if (name == "ntilde") { return 241; }
+        if (name == "ograve") { return 242; }
+        if (name == "oacute") { return 243; }
+        if (name == "ocirc") { return 244; }
+        if (name == "otilde") { return 245; }
+        if (name == "ouml") { return 246; }
+        if (name == "oslash") { return 248; }
+        if (name == "ugrave") { return 249; }
+        if (name == "uacute") { return 250; }
+        if (name == "ucirc") { return 251; }
+        if (name == "uuml") { return 252; }
+        if (name == "yacute") { return 253; }
+        if (name == "yuml") { return 255; }
+        if (name == "szlig") { return 223; }
+        return -1;
+    }
+}

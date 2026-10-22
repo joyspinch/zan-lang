@@ -1,0 +1,161 @@
+using System;
+using System.Collections.Generic;
+using System.Text.Html;
+
+// HTML 消毒器 + CSS 选择器查询层：
+// 1. 容错解析：属性三种引号、属性名小写、空元素、原始文本、隐式闭合、
+//    无匹配结束标签、实体解码、注释；
+// 2. CSS 选择器：类型/id/类/通配、属性六种操作符、四种组合符、
+//    选择器组、伪类、不支持的伪类不误匹配、非法选择器报错；
+// 3. 消毒器：标签白名单、事件属性、URL 协议（含实体绕过）、文本与
+//    属性转义、strip 两种模式、注释开关。
+class Program {
+    static int failures = 0;
+
+    static void Check(bool cond, string name) {
+        if (cond) {
+            Console.WriteLine("ok " + name);
+        } else {
+            Console.WriteLine("FAIL " + name);
+            failures = failures + 1;
+        }
+    }
+
+    static string N(List<HtmlNode> nodes) {
+        return "" + nodes.Count;
+    }
+
+    static void Main(string[] args) {
+        Parse();
+        Selectors();
+        Sanitize();
+        Console.WriteLine("failures=" + failures);
+    }
+
+    // ---- 解析 ----
+
+    static void Parse() {
+        HtmlDocument d = HtmlDocument.Parse("<p>hi</p>");
+        Check(d.Query("p").Count == 1, "parse tag and text");
+        Check(d.Find("p").TextContent() == "hi", "parse text content");
+
+        HtmlDocument a = HtmlDocument.Parse("<a href='x' title=\"y\" rel=z>q</a>");
+        HtmlNode link = a.Find("a");
+        Check(link.Get("href", "") == "x" && link.Get("title", "") == "y" && link.Get("rel", "") == "z",
+            "parse attribute quoting styles");
+
+        HtmlDocument b = HtmlDocument.Parse("<a HREF=\"1\" href=\"2\">q</a>");
+        Check(b.Find("a").Get("href", "") == "1", "parse lowercases name and keeps first duplicate");
+
+        HtmlDocument c = HtmlDocument.Parse("<br><p>x</p>");
+        Check(c.Query("br").Count == 1 && c.Query("p").Count == 1 && c.Find("p").ElementParent() == null,
+            "parse void element does not nest");
+
+        HtmlDocument s = HtmlDocument.Parse("<script>if (a<b) { x(); }</script>");
+        Check(s.Find("script").TextContent() == "if (a<b) { x(); }", "parse raw text element");
+
+        HtmlDocument p = HtmlDocument.Parse("<p>a<p>b");
+        List<HtmlNode> ps = p.Query("p");
+        Check(ps.Count == 2 && ps[0].TextContent() == "a" && ps[1].TextContent() == "b",
+            "parse implies paragraph end");
+
+        HtmlDocument l = HtmlDocument.Parse("<ul><li>a<li>b</ul>");
+        Check(l.Query("li").Count == 2, "parse implies list item end");
+
+        HtmlDocument e = HtmlDocument.Parse("<p>a</div>");
+        Check(e.Query("p").Count == 1 && e.Find("p").TextContent() == "a", "parse ignores unmatched end tag");
+
+        HtmlDocument t = HtmlDocument.Parse("<p>&amp;&lt;&#65;&#x42;</p>");
+        Check(t.Find("p").TextContent() == "&<AB", "parse decodes entities");
+
+        HtmlDocument cm = HtmlDocument.Parse("<p>a<!--c--></p>");
+        Check(cm.Find("p").children.Count == 2, "parse keeps comment node");
+    }
+
+    // ---- 选择器 ----
+
+    static void Selectors() {
+        HtmlDocument d = HtmlDocument.Parse(
+            "<ul class=\"list\" id=\"top\"><li class=\"it a\" data-k=\"x y\">1</li>"
+            + "<li class=\"it\">2</li><li>3</li></ul><p>tail</p>");
+
+        Check(N(d.Query("li")) == "3", "selector type");
+        Check(N(d.Query("#top")) == "1", "selector id");
+        Check(N(d.Query(".it")) == "2", "selector class");
+        Check(N(d.Query("*")) == "5", "selector universal");
+
+        Check(N(d.Query("[class]")) == "3", "selector attribute exists");
+        Check(N(d.Query("[data-k=\"x y\"]")) == "1", "selector attribute equals");
+        Check(N(d.Query("[data-k~=x]")) == "1", "selector attribute word");
+        Check(N(d.Query("[data-k|=x]")) == "0", "selector attribute dash");
+        Check(N(d.Query("[class^=it]")) == "2", "selector attribute prefix");
+        Check(N(d.Query("[class$=it]")) == "1", "selector attribute suffix");
+        Check(N(d.Query("[class*=i]")) == "3", "selector attribute contains");
+
+        Check(N(d.Query("ul li")) == "3", "selector descendant");
+        Check(N(d.Query("ul > li")) == "3", "selector child");
+        Check(N(d.Query("li + li")) == "2", "selector adjacent sibling");
+        Check(N(d.Query("li ~ li")) == "2", "selector general sibling");
+        Check(N(d.Query("ul, p")) == "2", "selector group");
+
+        Check(N(d.Query("li:first-child")) == "1", "selector first-child");
+        Check(N(d.Query("li:last-child")) == "1", "selector last-child");
+        Check(N(d.Query("li:only-child")) == "0", "selector only-child");
+        Check(N(d.Query(":empty")) == "0", "selector empty");
+        Check(N(d.Query(":root")) == "2", "selector root");
+        Check(N(d.Query("li:not(.it)")) == "1", "selector not");
+        Check(N(d.Query("li:nth-child(2)")) == "1", "selector nth-child number");
+        Check(N(d.Query("li:nth-child(2n+1)")) == "2", "selector nth-child an+b");
+        Check(N(d.Query("li:nth-child(odd)")) == "2", "selector nth-child odd");
+        Check(N(d.Query("li:hover")) == "0", "selector unsupported pseudo never matches");
+
+        bool threw = false;
+        try {
+            d.Query("###");
+        } catch (Exception ex) {
+            threw = true;
+        }
+        Check(threw, "selector invalid raises");
+    }
+
+    // ---- 消毒器 ----
+
+    static void Sanitize() {
+        HtmlPolicy rich = HtmlPolicy.Rich();
+
+        Check(HtmlSanitizer.Clean("<script>alert(1)</script>", rich) == "",
+            "sanitize drops script with content");
+        Check(HtmlSanitizer.Clean("<p onclick=\"evil()\">ok</p>", rich) == "<p>ok</p>",
+            "sanitize drops event handler");
+        Check(HtmlSanitizer.Clean("<a href=\"javascript:alert(1)\">x</a>", rich) == "<a>x</a>",
+            "sanitize drops javascript url");
+        Check(HtmlSanitizer.Clean("<a href=\"data:text/html,x\">y</a>", rich) == "<a>y</a>",
+            "sanitize drops data url");
+        Check(HtmlSanitizer.Clean("<a href=\"java&#9;script:alert(1)\">z</a>", rich) == "<a>z</a>",
+            "sanitize drops tab obfuscated url");
+        Check(HtmlSanitizer.Clean("<a href=\"javascript&colon;alert(1)\">w</a>", rich) == "<a>w</a>",
+            "sanitize drops entity obfuscated url");
+        Check(HtmlSanitizer.Clean("<a href=\"/rel\">r</a>", rich) == "<a href=\"/rel\">r</a>",
+            "sanitize keeps relative url");
+        Check(HtmlSanitizer.Clean("<a href=\"mailto:a@b.c\">m</a>", rich) == "<a href=\"mailto:a@b.c\">m</a>",
+            "sanitize keeps mailto url");
+
+        Check(HtmlSanitizer.Clean("<p>a & b < c</p>", rich) == "<p>a &amp; b &lt; c</p>",
+            "sanitize escapes text");
+        Check(HtmlSanitizer.Clean("<a title=\"x&quot;y\">t</a>", rich) == "<a title=\"x&quot;y\">t</a>",
+            "sanitize escapes attribute value");
+        Check(HtmlSanitizer.Clean("<p>&amp;lt;</p>", rich) == "<p>&amp;lt;</p>",
+            "sanitize does not double decode");
+
+        Check(HtmlSanitizer.Clean("<section><span>x</span></section>", HtmlPolicy.Default()) == "<span>x</span>",
+            "sanitize strips disallowed tag keeps content");
+        Check(HtmlSanitizer.Clean("<section><span>x</span></section>", HtmlPolicy.Default().Strip(false))
+            == "&lt;section&gt;<span>x</span>&lt;/section&gt;",
+            "sanitize escapes disallowed tag when not stripping");
+
+        Check(HtmlSanitizer.Clean("<p>a<!--c--></p>", rich) == "<p>a</p>",
+            "sanitize strips comment");
+        Check(HtmlSanitizer.Clean("<p>a<!--c--></p>", rich.KeepComments(true)) == "<p>a<!--c--></p>",
+            "sanitize keeps comment when asked");
+    }
+}

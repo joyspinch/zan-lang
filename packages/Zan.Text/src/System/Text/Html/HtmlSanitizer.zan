@@ -1,0 +1,370 @@
+using System;
+using System.Collections.Generic;
+
+namespace System.Text.Html;
+
+// 消毒策略：哪些标签、属性、URL 协议可以留。
+//
+// 语义（三种模式互斥）：
+//   - 标签在白名单里 → 留下，属性按属性白名单过滤；
+//   - 标签在 dropContentTags 里 → **连内容一起丢**（script/style/iframe
+//     这类，代码留在正文里既没意义又容易被误读成标记）；
+//   - 其余标签 → stripDisallowedTags 为 true 时只丢标签留内容，为
+//     false 时把标签本身转义成可见文本。
+//
+// 属性过滤永远先砍掉事件处理属性（on*），URL 属性还要过协议白名单。
+public class HtmlPolicy {
+    // 允许的标签（小写）。
+    public HashSet<string> allowedTags;
+    // 全局允许的属性（小写）。
+    public HashSet<string> allowedAttributes;
+    // 按标签额外允许的属性。
+    public Dictionary<string, List<string>> tagAttributes;
+    // 允许的 URL 协议（小写，不带冒号）。
+    public HashSet<string> allowedSchemes;
+    // 需要检查协议的属性。
+    public HashSet<string> urlAttributes;
+    // 连内容一起丢的标签。
+    public HashSet<string> dropContentTags;
+    // 注释是否丢掉。
+    public bool stripComments;
+    // 不允许的标签：true = 丢标签留内容；false = 标签转义成文本。
+    public bool stripDisallowedTags;
+
+    public HtmlPolicy() {
+        this.allowedTags = new HashSet<string>();
+        this.allowedAttributes = new HashSet<string>();
+        this.tagAttributes = new Dictionary<string, List<string>>();
+        this.allowedSchemes = new HashSet<string>();
+        this.urlAttributes = new HashSet<string>();
+        this.dropContentTags = new HashSet<string>();
+        this.stripComments = true;
+        this.stripDisallowedTags = true;
+    }
+
+    // 默认策略：贴近 bleach 的默认——标签很少，属性一个都不放行。
+    public static HtmlPolicy Default() {
+        HtmlPolicy p = new HtmlPolicy();
+        p.allowedTags.Add("a");
+        p.allowedTags.Add("abbr");
+        p.allowedTags.Add("acronym");
+        p.allowedTags.Add("b");
+        p.allowedTags.Add("blockquote");
+        p.allowedTags.Add("code");
+        p.allowedTags.Add("em");
+        p.allowedTags.Add("i");
+        p.allowedTags.Add("li");
+        p.allowedTags.Add("ol");
+        p.allowedTags.Add("strong");
+        p.allowedTags.Add("ul");
+        p.allowedTags.Add("p");
+        p.allowedTags.Add("br");
+        p.allowedTags.Add("pre");
+        p.allowedTags.Add("span");
+        p.allowedTags.Add("div");
+        p.allowedTags.Add("h1");
+        p.allowedTags.Add("h2");
+        p.allowedTags.Add("h3");
+        p.allowedTags.Add("h4");
+        p.allowedTags.Add("h5");
+        p.allowedTags.Add("h6");
+        p.allowedTags.Add("hr");
+        p.allowedSchemes.Add("http");
+        p.allowedSchemes.Add("https");
+        p.allowedSchemes.Add("mailto");
+        p.urlAttributes.Add("href");
+        p.urlAttributes.Add("src");
+        p.urlAttributes.Add("action");
+        p.urlAttributes.Add("formaction");
+        p.urlAttributes.Add("cite");
+        p.urlAttributes.Add("poster");
+        p.urlAttributes.Add("background");
+        p.urlAttributes.Add("longdesc");
+        p.urlAttributes.Add("data");
+        p.urlAttributes.Add("xlink:href");
+        HtmlPolicy.AddDropContentTags(p);
+        return p;
+    }
+
+    // 常用策略：在默认之上放开排版标签与一批安全属性。
+    public static HtmlPolicy Rich() {
+        HtmlPolicy p = HtmlPolicy.Default();
+        p.allowedTags.Add("img");
+        p.allowedTags.Add("table");
+        p.allowedTags.Add("thead");
+        p.allowedTags.Add("tbody");
+        p.allowedTags.Add("tfoot");
+        p.allowedTags.Add("tr");
+        p.allowedTags.Add("td");
+        p.allowedTags.Add("th");
+        p.allowedTags.Add("caption");
+        p.allowedTags.Add("colgroup");
+        p.allowedTags.Add("col");
+        p.allowedTags.Add("dl");
+        p.allowedTags.Add("dt");
+        p.allowedTags.Add("dd");
+        p.allowedTags.Add("figure");
+        p.allowedTags.Add("figcaption");
+        p.allowedTags.Add("section");
+        p.allowedTags.Add("article");
+        p.allowedTags.Add("aside");
+        p.allowedTags.Add("header");
+        p.allowedTags.Add("footer");
+        p.allowedTags.Add("nav");
+        p.allowedTags.Add("main");
+        p.allowedTags.Add("blockquote");
+        p.allowedTags.Add("q");
+        p.allowedTags.Add("cite");
+        p.allowedTags.Add("time");
+        p.allowedTags.Add("mark");
+        p.allowedTags.Add("small");
+        p.allowedTags.Add("s");
+        p.allowedTags.Add("u");
+        p.allowedTags.Add("del");
+        p.allowedTags.Add("ins");
+        p.allowedTags.Add("sub");
+        p.allowedTags.Add("sup");
+        p.allowedTags.Add("kbd");
+        p.allowedTags.Add("samp");
+        p.allowedTags.Add("var");
+        p.AllowAttribute("title");
+        p.AllowAttribute("class");
+        p.AllowAttribute("id");
+        p.AllowAttribute("dir");
+        p.AllowAttribute("lang");
+        p.AllowAttributeFor("a", "href");
+        p.AllowAttributeFor("a", "target");
+        p.AllowAttributeFor("a", "rel");
+        p.AllowAttributeFor("img", "src");
+        p.AllowAttributeFor("img", "alt");
+        p.AllowAttributeFor("img", "width");
+        p.AllowAttributeFor("img", "height");
+        p.AllowAttributeFor("td", "colspan");
+        p.AllowAttributeFor("td", "rowspan");
+        p.AllowAttributeFor("th", "colspan");
+        p.AllowAttributeFor("th", "rowspan");
+        p.AllowAttributeFor("ol", "start");
+        p.allowedSchemes.Add("ftp");
+        p.allowedSchemes.Add("tel");
+        return p;
+    }
+
+    static void AddDropContentTags(HtmlPolicy p) {
+        p.dropContentTags.Add("script");
+        p.dropContentTags.Add("style");
+        p.dropContentTags.Add("iframe");
+        p.dropContentTags.Add("object");
+        p.dropContentTags.Add("embed");
+        p.dropContentTags.Add("applet");
+        p.dropContentTags.Add("noscript");
+        p.dropContentTags.Add("template");
+        p.dropContentTags.Add("svg");
+        p.dropContentTags.Add("math");
+        p.dropContentTags.Add("frame");
+        p.dropContentTags.Add("frameset");
+        p.dropContentTags.Add("xmp");
+    }
+
+    // 放开一个标签。
+    public HtmlPolicy AllowTag(string tag) {
+        if (tag != null && tag.Length > 0) { this.allowedTags.Add(tag.ToLower()); }
+        return this;
+    }
+
+    // 放开一个全局属性。
+    public HtmlPolicy AllowAttribute(string attr) {
+        if (attr != null && attr.Length > 0) { this.allowedAttributes.Add(attr.ToLower()); }
+        return this;
+    }
+
+    // 只给某个标签放开一个属性。
+    public HtmlPolicy AllowAttributeFor(string tag, string attr) {
+        if (tag == null || attr == null) { return this; }
+        string t = tag.ToLower();
+        string a = attr.ToLower();
+        List<string> extra;
+        if (!this.tagAttributes.TryGetValue(t, out extra)) {
+            extra = new List<string>();
+            this.tagAttributes.Add(t, extra);
+        }
+        if (!extra.Contains(a)) { extra.Add(a); }
+        return this;
+    }
+
+    // 放开一个 URL 协议（"https"，不带冒号）。
+    public HtmlPolicy AllowScheme(string scheme) {
+        if (scheme != null && scheme.Length > 0) { this.allowedSchemes.Add(scheme.ToLower()); }
+        return this;
+    }
+
+    // 注释是否保留。
+    public HtmlPolicy KeepComments(bool keep) {
+        this.stripComments = !keep;
+        return this;
+    }
+
+    // 不允许的标签：true = 只丢标签；false = 标签转义成文本。
+    public HtmlPolicy Strip(bool strip) {
+        this.stripDisallowedTags = strip;
+        return this;
+    }
+
+    // 这个标签允许吗。
+    public bool TagAllowed(string tag) {
+        if (tag == null) { return false; }
+        return this.allowedTags.Contains(tag);
+    }
+
+    // 这个属性允许吗（事件处理属性永远不允许）。
+    public bool AttributeAllowed(string tag, string attr) {
+        if (attr == null || attr.Length == 0) { return false; }
+        if (attr.StartsWith("on")) { return false; }
+        if (this.allowedAttributes.Contains(attr)) { return true; }
+        List<string> extra = new List<string>();
+        if (tag != null && this.tagAttributes.TryGetValue(tag, out extra)) {
+            for (int i = 0; i < extra.Count; i = i + 1) {
+                if (extra[i] == attr) { return true; }
+            }
+        }
+        return false;
+    }
+}
+
+// HTML 消毒器。
+public class HtmlSanitizer {
+    // 用默认策略消毒。
+    public static string Clean(string html) {
+        return HtmlSanitizer.Clean(html, HtmlPolicy.Default());
+    }
+
+    // 用给定策略消毒。
+    public static string Clean(string html, HtmlPolicy policy) {
+        if (policy == null) { policy = HtmlPolicy.Default(); }
+        HtmlDocument doc = HtmlParser.Parse(html);
+        StringBuilder sb = new StringBuilder();
+        HtmlSanitizer.WriteChildren(doc.root, policy, sb);
+        return sb.ToString();
+    }
+
+    // URL 是否安全：没有协议（相对地址）算安全；有协议就看白名单。
+    //
+    // 判定前先按浏览器的做法清理 URL：去掉制表/换行（"java&#9;script:" 这
+    // 种绕过就是这么来的），再去掉首尾空白与控制字符。
+    public static bool IsSafeUrl(string url, HtmlPolicy policy) {
+        if (url == null) { return true; }
+        if (policy == null) { policy = HtmlPolicy.Default(); }
+        string s = HtmlSanitizer.CleanUrl(url);
+        int n = s.Length;
+        int cut = -1;
+        for (int i = 0; i < n; i = i + 1) {
+            int c = s[i] & 255;
+            if (c == 58) { cut = i; break; }                    // ':'
+            if (c == 47 || c == 63 || c == 35) { break; }       // '/' '?' '#'
+        }
+        if (cut <= 0) { return true; }                          // 相对地址
+        for (int i = 0; i < cut; i = i + 1) {
+            int c = s[i] & 255;
+            bool alpha = (c >= 97 && c <= 122) || (c >= 65 && c <= 90);
+            bool digit = c >= 48 && c <= 57;
+            if (i == 0) { if (!alpha) { return false; } continue; }
+            if (!alpha && !digit && c != 43 && c != 45 && c != 46) { return false; }
+        }
+        string scheme = s.Substring(0, cut).ToLower();
+        return policy.allowedSchemes.Contains(scheme);
+    }
+
+    // 按浏览器的规则清理 URL（去制表/换行、去首尾空白与控制字符）。
+    public static string CleanUrl(string url) {
+        if (url == null) { return ""; }
+        int n = url.Length;
+        int start = 0;
+        int end = n;
+        while (start < end && (url[start] & 255) <= 32) { start = start + 1; }
+        while (end > start && (url[end - 1] & 255) <= 32) { end = end - 1; }
+        StringBuilder sb = new StringBuilder();
+        int segStart = start;
+        for (int i = start; i < end; i = i + 1) {
+            int c = url[i] & 255;
+            if (c == 9 || c == 10 || c == 13) {
+                if (i > segStart) { sb.Append(url.Substring(segStart, i - segStart)); }
+                segStart = i + 1;
+            }
+        }
+        if (end > segStart) { sb.Append(url.Substring(segStart, end - segStart)); }
+        return sb.ToString();
+    }
+
+    static void WriteChildren(HtmlNode parent, HtmlPolicy policy, StringBuilder sb) {
+        for (int i = 0; i < parent.children.Count; i = i + 1) {
+            HtmlSanitizer.WriteNode(parent.children[i], policy, sb);
+        }
+    }
+
+    static void WriteNode(HtmlNode node, HtmlPolicy policy, StringBuilder sb) {
+        if (node.type == HtmlNodeType.Text) {
+            sb.Append(HtmlUtil.EscapeText(node.text));
+            return;
+        }
+        if (node.type == HtmlNodeType.Comment) {
+            if (!policy.stripComments) {
+                sb.Append("<!--");
+                sb.Append(node.text);
+                sb.Append("-->");
+            }
+            return;
+        }
+        string tag = node.tag;
+        if (!policy.TagAllowed(tag)) {
+            if (policy.dropContentTags.Contains(tag)) { return; }
+            if (policy.stripDisallowedTags) {
+                HtmlSanitizer.WriteChildren(node, policy, sb);
+                return;
+            }
+            sb.Append(HtmlUtil.EscapeText(HtmlSanitizer.OpenTagMarkup(node)));
+            HtmlSanitizer.WriteChildren(node, policy, sb);
+            sb.Append(HtmlUtil.EscapeText("</" + tag + ">"));
+            return;
+        }
+        sb.Append("<");
+        sb.Append(tag);
+        HtmlSanitizer.WriteAttrs(node, policy, sb);
+        sb.Append(">");
+        if (HtmlUtil.IsVoidTag(tag)) { return; }
+        HtmlSanitizer.WriteChildren(node, policy, sb);
+        sb.Append("</");
+        sb.Append(tag);
+        sb.Append(">");
+    }
+
+    static void WriteAttrs(HtmlNode node, HtmlPolicy policy, StringBuilder sb) {
+        List<string> keys = node.attrs.Keys;
+        for (int i = 0; i < keys.Count; i = i + 1) {
+            string name = keys[i];
+            if (!policy.AttributeAllowed(node.tag, name)) { continue; }
+            string value = node.attrs[name];
+            if (policy.urlAttributes.Contains(name) && !HtmlSanitizer.IsSafeUrl(value, policy)) { continue; }
+            sb.Append(" ");
+            sb.Append(name);
+            sb.Append("=\"");
+            sb.Append(HtmlUtil.EscapeAttr(value));
+            sb.Append("\"");
+        }
+    }
+
+    // 还原元素的开始标记（给"标签转义成文本"的模式用）。
+    static string OpenTagMarkup(HtmlNode node) {
+        StringBuilder sb = new StringBuilder();
+        sb.Append("<");
+        sb.Append(node.tag);
+        List<string> keys = node.attrs.Keys;
+        for (int i = 0; i < keys.Count; i = i + 1) {
+            sb.Append(" ");
+            sb.Append(keys[i]);
+            sb.Append("=\"");
+            sb.Append(node.attrs[keys[i]]);
+            sb.Append("\"");
+        }
+        sb.Append(">");
+        return sb.ToString();
+    }
+}

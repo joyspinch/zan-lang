@@ -1,7 +1,8 @@
 # Zan.Text
 
 文本处理（纯 Zan，无原生依赖）。`using System.Text;` /
-`using System.Text.RegularExpressions;` 按需拉入，命名空间保留零破坏。
+`using System.Text.RegularExpressions;` / `using System.Text.Html;` 按需拉入，
+命名空间保留零破坏。
 
 ## 内容（stdlib/System/Text 迁入，Encoding 留 stdlib）
 
@@ -14,6 +15,7 @@
 | `Template.zan` | 文本模板（占位符展开） |
 | `TextTable.zan` | 等宽文本表格 |
 | `RegularExpressions/` | 正则引擎（Regex/Match/RegexProgram，`System.Text.RegularExpressions`） |
+| `Html/` | HTML 容错解析 + CSS 选择器查询 + HTML 消毒器（`System.Text.Html`） |
 
 ## 不在包内
 
