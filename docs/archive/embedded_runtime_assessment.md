@@ -143,17 +143,29 @@
 > linux .text 189,074 → 预算 284,000、file 220,992 → 预算 332,000。
 > 脚本的失败文案也修了：原来把**当前实测值**印成 "(baseline: …)"，读起来像
 > "和基线一样却还超预算"；现在印的是 "(measured: …)"。
-> 遗留（另案）：运行时对象的 `.text` 占发布产物 84%（167,488 / 199,752），
-> 但**"补 `-ffunction-sections`"这条路已被实测推翻**——闸内给 9 个宿主运行时
-> 对象加上 `-ffunction-sections -fdata-sections` 后 `.text` 是 199,736（几乎
-> 不变）：运行时里的函数全都可达（编译器把 intrinsics 降级成对 `zan_hw_*` 的
-> 直接调用，这些符号必须由永远被链上的定时器对象携带；硬件加速内部按 CPU
-> 特性函数指针分派 + 启动 KAT 自检，每个变体都被表引用）。而且
-> `-fdata-sections` 会把 1.4 MB 的 `.bss` 静态表搬进 `.data`，产物从 245 KB
-> 涨到 1.8 MB——**别加这两个开关**。真正的杠杆是 `src/runtime/rt_timer.c`
-> 最后一行 `#include "rt_hw_accel.c"`（4558 行，单独编 `.text` 53,408，占
-> 定时器对象 72%）：定时器对象每个程序都要链，于是每个产物都背着整块
-> SHA/AES/AVX2。详见 `TASKS.md` A493。
+> 遗留（另案）：运行时对象的 `.text` 占发布产物 84%（167,488 / 199,752）。
+> **2026-10-23 更正**：上一轮"补 `-ffunction-sections` 这条路已被实测推翻"
+> 的结论**方向本身就错了**——那个实验是在**裸 `.o`** 上做的，而**裸 `.o` 进
+> 链接行就是整体载入，section GC 对它无效**。同条件对照（同一 TDM gcc、同一
+> `--gc-sections`）：
+>
+> | 链接方式 | 留下的 `zan_hw_*` | `.text` |
+> |---|---|---|
+> | crypto 作为裸 `.o` 直接进链接行 | 63（全留） | 156,640 |
+> | crypto 打进静态库 `libcrypto.a` | **0** | **103,232** |
+> | 裸 `.o` + `--gc-sections` + `-ffunction-sections` | 63（仍全留） | — |
+>
+> 所以真正的杠杆是**把 crypto 从裸 `.o` 变成归档成员**（按特性 sha / aes /
+> sm3-sm4 / rsa-x25519 / pixel / crc 拆成员，链接行只给归档），而不是加编译
+> 开关。端到端收益（同沙箱 zanc、同 stdlib、同 `--publish --no-icon`）：
+> 带 crypto `.text=200,728 / file=244,476`；去掉 crypto `.text=147,320 /
+> file=180,836` ⇒ **crypto 独占 53,408 B（.text 的 26.6%）**。
+> 前提是先拆掉 `src/runtime/rt_timer.c` 最后一行 `#include "rt_hw_accel.c"`
+> （4558 行，文本包含 ⇒ 必然与定时器同 TU ⇒ 必然整体进 .o）——定时器对象
+> 每个程序都要链，于是每个产物都背着整块 SHA/AES/AVX2。详见 `TASKS.md` A493。
+>
+> 另外 `-fdata-sections` 仍是地雷：它把 1.4 MB 的 `.bss` 静态表搬进 `.data`，
+> 产物从 245 KB 涨到 1.8 MB——**别加这个开关**。
 
 ## 1. 实测：一个 hello world 的成本
 
@@ -232,9 +244,14 @@ wasm32-wasi、riscv64-linux-musl。
    （`ZAN_TABLE_MAX_STRING`、`ZAN_PLAT_TEXT_MAX`、`ZAN_FH_CAP`、eh 表按线程数），
    嵌入式 profile 下取小值或改为单线程静态单槽。**这一项单独就能砍掉 ~200 KB RAM，
    而且对桌面也是纯收益**（现在这些内存是白占的）。
-3. **函数级死代码消除**。`-ffunction-sections -fdata-sections` + `--gc-sections`
-   （链接器脚本已有的话确认打开），配合 stdlib 按引用裁剪：现在一个 hello world
-   编译了 80 个 stdlib 文件。
+3. **函数级死代码消除**（2026-10-23 更正处方）。`--gc-sections` **只对归档成员
+   生效**——裸 `.o` 进链接行就是整体载入，section GC 对它无效。所以要做的不是
+   加 `-ffunction-sections`（实测无效），而是把可选子系统（硬件加速 crypto、
+   图像编解码等）从**文本包含**改成**独立归档成员**，链接行只给归档，让链接器
+   按符号缺才拉。已实测：crypto 从裸 `.o` 改成 `libcrypto.a` 后，不碰加密的
+   程序 `.text` 从 156,640 降到 103,232（宿主 hello world 端到端省 53,408 B）。
+   另外 stdlib 目前一个 hello world 编译了 80 个 stdlib 文件，同样应走归档
+   按需拉。注意 `-fdata-sections` 不可加：会把 1.4 MB `.bss` 静态表搬进 `.data`。
 4. **裸机适配层**（约 300 行）：`Console` → UART 写；`malloc/free` → ESP-IDF heap 或自带
    bump/TLSF 分配器；时间 → `esp_timer`；无线程（协程用单栈软调度）；无异常展开时
    `throw` 退化为错误码或 abort（需要产品决策）。
@@ -248,7 +265,7 @@ wasm32-wasi、riscv64-linux-musl。
 | 步 | 内容 | 估计 | 单独收益 |
 |---|---|---|---|
 | 1 | 消灭固定大表（7 个符号可配/按需） | 1 会话 | 桌面也立刻省 ~200 KB RAM |
-| 2 | 运行时分层 core/os/net/async/diag + gc-sections | 1–2 会话 | 所有目标体积下降 |
+| 2 | 运行时分层 core/os/net/async/diag + 改归档按需拉 | 1–2 会话 | 所有目标体积下降 |
 | 3 | riscv32 裸机目标 + 适配层（UART/heap/timer/单线程） | 2 会话 | ESP32-C3 能跑 |
 | 4 | ESP-IDF 集成样例 + qemu CI + 体积预算测试 | 1 会话 | 防回退 |
 | （可选） | Xtensa（ESP32/S3）经 esp-clang 或上游后端 | 2+ 会话，风险高 | 覆盖老型号 |

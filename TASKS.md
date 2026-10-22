@@ -771,6 +771,36 @@
     才可能让"不碰加密的程序"少背 AES。
   - 其余大头待逐项量：定时器本体（74 KB − 53 KB ≈ 21 KB）、io（24 KB）、
     sync（22 KB）。
+- **根因已钉死（2026-10-23 继续追查）——不是"函数全可达"，是"链接的是
+  裸 .o 而不是归档"**：
+  - 反汇编 + 重定位表取证：`rt_hw_accel.c` 内部用**函数指针分派**（`zan_hw_gate`
+    → `zan_aes_kat` …）+ `.rdata` 里一张 92 槽的函数指针表（48 槽
+    `zan_hw_aes_keygenassist_ni`、24 槽 `zan_cpu_feature`、12 槽 `zan_hw_kat_state`
+    8 槽 `zan__crash_write_record`）把**整簇**互根。hello world 产物里
+    `zan_hw_*` 63 个 + `zan_aes_*` 17 个符号**全在**，且**没有一个来自程序自身**
+    ——程序只调 `Console.WriteLine`。
+  - 关键对照（同一 TDM gcc / 同一 `--gc-sections`）：
+    | 链接方式 | 结果 |
+    |---|---|
+    | crypto 作为**裸 .o** 直接进链接行 | `zan_hw_=63` 全留，`.text=156,640` |
+    | crypto 打进**静态库** `libcrypto.a` | `zan_hw_=0`，`.text=103,232` |
+    | 裸 .o + `--gc-sections` + `-ffunction-sections` | 仍 `zan_hw_=63` |
+    → **裸 .o 进链接行 = 整体载入，section GC 对它无效**；归档里的成员才按
+    "符号缺才拉"。这解释了上一条"补 `-ffunction-sections` 无效"——那个实验
+    是在**裸 .o** 上做的，方向从一开始就错了。
+  - 端到端收益（同沙箱 zanc、同 stdlib、同 `--publish --no-icon`）：
+    带 crypto `.text=200,728 / file=244,476`；去掉 crypto `.text=147,320 /
+    file=180,836` ⇒ **crypto 独占 53,408 B（.text 的 26.6%，文件的 26.0%）**。
+  - **因此处方不是"加编译开关"，而是"把 crypto 从裸 .o 变成归档成员"**：
+    按特性（sha / aes / sm3-sm4 / rsa-x25519 / pixel / crc）拆成独立 .o，
+    打进 `libzancrypto.a`，链接行只给归档。链接器即可按符号缺才拉。
+    注意 `rt_timer.c` 末行的 `#include "rt_hw_accel.c"` 必须先拆掉
+    （它是文本包含 ⇒ 必然与定时器同 TU ⇒ 必然整体进 .o）。
+  - 一个已知坑：把 crypto 单独编成归档后，**只要程序用到其中任何一个符号，
+    整簇 63 个 `zan_hw_*` 仍会被拉进来**（`libcrypto.a` 只有一个成员
+    `crypto_sep.obj`）⇒ 必须**按特性再切**到成员粒度，否则只是把体积挪个地方。
+  - 该结论只在**宿主 native 路径**验证过；交叉侧（linux/OHOS/Android）用的是
+    `ld.lld -static` 且已带 `--gc-sections`，行为需另行复测。
 - 影响：体积预算只能靠"抬高阈值"来容纳，预算的**分辨力**随之下降——阈值
   取 1.5× 于基线时，一次 +64 KB 的固定表回归不会被抓到（这正是这条预算
   最初要抓的东西）。
