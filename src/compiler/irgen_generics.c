@@ -575,6 +575,25 @@ static int expr_member_of_owned_temp(zan_irgen_t *g, zan_ast_node_t *e,
     return ft && is_rc_managed_type(ft);
 }
 
+/* 调用实参是不是"调用方拥有、用完要释放"的临时量。
+ *
+ * 正常路径在调用返回后由 emit_release_owned_call_temp 释放它；异常路径必须
+ * 释放同一批临时量，否则调用抛异常时实参会整个留在堆上。lambda 实参尤其
+ * 要紧：闭包连同它捕获的局部（堆 cell）一起漏，泄漏检查会把它报成
+ * "captured local / closure"两个对象。
+ *
+ * 委托值不能拿 at（实参的推断类型）当前提：裸 lambda 没有自然类型，推断
+ * 出来是空的，所以正常路径才改用 expr_yields_delegate_value 认它。这里跟
+ * 正常路径同源判定，两边一致，异常路径才不会漏。 */
+static int call_arg_is_owned_temp(zan_irgen_t *g, zan_ast_node_t *arg,
+                                  zan_type_t *at, local_scope_t *locals) {
+    if (!arg) return 0;
+    if (expr_is_local_ident(arg, locals)) return 0;
+    if (expr_yields_delegate_value(g, arg, locals)) return 1;
+    if (!at || !is_rc_managed_type(at)) return 0;
+    return expr_yields_owned_rc_value(g, arg, locals);
+}
+
 static void emit_release_owned_call_temp(zan_irgen_t *g, zan_ast_node_t *arg,
                                          LLVMValueRef val, local_scope_t *locals) {
     if (!arg || !locals || !val) return;

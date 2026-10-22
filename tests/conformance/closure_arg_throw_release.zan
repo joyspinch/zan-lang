@@ -1,0 +1,63 @@
+using System;
+
+// 调用实参里的闭包：所有权在调用方，调用返回后释放、调用抛异常时由展开
+// 器释放。两条路径的判定必须同源——早先异常路径不认 lambda（裸 lambda
+// 推断不出类型），于是闭包连同它捕获的局部（堆 cell）一起留在堆上，
+// 泄漏检查会报成 "captured local / closure" 两个对象。
+//
+// 同时钉住另一半：callee 存下来的那个引用必须还活着，不能被多释放一次。
+class Box {
+    public Factory saved;
+
+    public Box() {
+        this.saved = null;
+    }
+}
+
+delegate object Factory();
+
+class Program {
+    static Box box = new Box();
+
+    // 什么都不存，直接抛：调用方那份临时量由展开器释放。
+    static void ThrowNow(string name, Factory f) {
+        throw new Exception("boom");
+    }
+
+    // 存下实参再抛：存下来的引用要活着，调用方那份临时量由展开器释放。
+    static void KeepThenThrow(string name, Factory f) {
+        Program.box.saved = f;
+        throw new Exception("boom2");
+    }
+
+    // 正常返回：调用方释放临时量，callee 存的那份要活着。
+    static void Keep(string name, Factory f) {
+        Program.box.saved = f;
+    }
+
+    static void Main() {
+        // 1. 正常路径：闭包存下来后仍可调用
+        Program.Keep("a", () => { return (object)"kept"; });
+        object v = Program.box.saved();
+        Console.WriteLine("kept:" + (string)v);
+
+        // 2. 异常路径：闭包与它捕获的局部都要被释放（泄漏检查盯这条）
+        try {
+            Program.ThrowNow("b", () => {
+                object captured = "x";
+                return (object)captured;
+            });
+        } catch (Exception e) {
+            Console.WriteLine("caught1:" + e.Message);
+        }
+
+        // 3. 异常路径：callee 存过实参再抛，存下来的引用不能被多释放
+        try {
+            Program.KeepThenThrow("c", () => { return (object)"kept2"; });
+        } catch (Exception e) {
+            Console.WriteLine("caught2:" + e.Message);
+        }
+        object v2 = Program.box.saved();
+        Console.WriteLine("kept2:" + (string)v2);
+    }
+}

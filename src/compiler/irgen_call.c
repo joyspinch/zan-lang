@@ -397,6 +397,10 @@ static int try_method_spec(zan_irgen_t *g, zan_symbol_t *msym,
     return get_or_create_method_spec(g, msym, bind, tps->count, owner_inst);
 }
 
+/* 实参入异常展开栈（临时量的所有权在调用方，调用抛异常时要释放） */
+static int emit_call_arg_eh_push(zan_irgen_t *g, zan_ast_node_t *arg,
+                                 LLVMValueRef val, local_scope_t *locals);
+
 static LLVMValueRef emit_method_spec_call(zan_irgen_t *g, int idx,
                                           zan_ast_node_t *call,
                                           zan_ast_node_t *recv_expr,
@@ -445,22 +449,8 @@ static LLVMValueRef emit_method_spec_call(zan_irgen_t *g, int idx,
         call_args[j + this_off] =
             emit_arg_typed(g, aexprs[j + this_off], pt, locals);
         zan_ast_node_t *arg = aexprs[j + this_off];
-        zan_type_t *at = infer_expr_type(g, arg, locals);
-        if (at && is_rc_managed_type(at) &&
-            !expr_is_local_ident(arg, locals) &&
-            expr_yields_owned_rc_value(g, arg, locals) &&
-            LLVMGetTypeKind(LLVMTypeOf(call_args[j + this_off])) == LLVMPointerTypeKind) {
-            int ehk = eh_slot_kind_of(at);
-            if (ehk != ZAN_EH_SLOT_OBJ) {
-                LLVMValueRef slot = emit_entry_alloca(g,
-                    LLVMTypeOf(call_args[j + this_off]), "arg.eh");
-                LLVMBuildStore(g->builder, call_args[j + this_off], slot);
-                emit_eh_tmp_push_slot(g, slot, ehk);
-            } else {
-                emit_eh_tmp_push(g, call_args[j + this_off]);
-            }
-            arg_eh_pushed[j + this_off] = 1;
-        }
+        arg_eh_pushed[j + this_off] = emit_call_arg_eh_push(g, arg,
+            call_args[j + this_off], locals);
     }
     coerce_args_to_params(g, sp.fn_type, call_args, total);
     const char *cn = (LLVMGetTypeKind(LLVMGetReturnType(sp.fn_type)) ==
@@ -602,10 +592,18 @@ static void emit_intrinsic_drop_recv(zan_irgen_t *g, zan_ast_node_t *lobj,
 static int emit_call_arg_eh_push(zan_irgen_t *g, zan_ast_node_t *arg,
                                  LLVMValueRef val, local_scope_t *locals) {
     zan_type_t *at = infer_expr_type(g, arg, locals);
-    if (!at || !is_rc_managed_type(at) ||
-        expr_is_local_ident(arg, locals) ||
-        !expr_yields_owned_rc_value(g, arg, locals) ||
+    if (!call_arg_is_owned_temp(g, arg, at, locals) ||
         LLVMGetTypeKind(LLVMTypeOf(val)) != LLVMPointerTypeKind) return 0;
+    if (expr_yields_delegate_value(g, arg, locals)) {
+        /* 委托实参：闭包在 IR 里是函数指针，而展开器按 i8ptr 取回闭包
+           指针来跑它的析构，所以槽里存的是位转换后的 i8ptr。 */
+        LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+        LLVMValueRef slot = emit_entry_alloca(g, i8ptr, "arg.eh");
+        LLVMBuildStore(g->builder,
+            LLVMBuildBitCast(g->builder, val, i8ptr, "arg.dlg"), slot);
+        emit_eh_tmp_push_slot(g, slot, ZAN_EH_SLOT_DLG);
+        return 1;
+    }
     int ehk = eh_slot_kind_of(at);
     if (ehk != ZAN_EH_SLOT_OBJ) {
         LLVMValueRef slot = emit_entry_alloca(g,
@@ -4709,22 +4707,8 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                                     zan_ast_node_t *arg = expr->call.args.items[k];
                                     call_args[k] = emit_arg_typed(g, arg,
                                         method_param_type_at(g, method_sym, k, expr, NULL, locals), locals);
-                                    zan_type_t *at = infer_expr_type(g, arg, locals);
-                                    if (at && is_rc_managed_type(at) &&
-                                        !expr_is_local_ident(arg, locals) &&
-                                        expr_yields_owned_rc_value(g, arg, locals) &&
-                                        LLVMGetTypeKind(LLVMTypeOf(call_args[k])) == LLVMPointerTypeKind) {
-                                        int ehk = eh_slot_kind_of(at);
-                                        if (ehk != ZAN_EH_SLOT_OBJ) {
-                                            LLVMValueRef slot = emit_entry_alloca(g,
-                                                LLVMTypeOf(call_args[k]), "arg.eh");
-                                            LLVMBuildStore(g->builder, call_args[k], slot);
-                                            emit_eh_tmp_push_slot(g, slot, ehk);
-                                        } else {
-                                            emit_eh_tmp_push(g, call_args[k]);
-                                        }
-                                        arg_eh_pushed[k] = 1;
-                                    }
+                                    arg_eh_pushed[k] = emit_call_arg_eh_push(g, arg,
+                                        call_args[k], locals);
                                 }
                                 /* `Box<int> */
                                 LLVMTypeRef sft = g->functions[fi].fn_type;

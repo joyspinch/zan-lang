@@ -190,3 +190,33 @@
 - **动作**：注释里要写 NUL 就写**转义** `\0`（两个字符），不要写真字节；
   怀疑文件被当二进制时用 `rg -a` / `grep -a` 复核；写完源码后顺手扫一遍
   裸 NUL 再提交。
+
+## 11. 调用实参的所有权：正常路径与异常路径必须用同一套判定
+
+- **契约**：调用实参里的"拥有型临时量"（`new` 出来的对象、lambda 闭包、
+  临时集合……）归**调用方**所有——调用正常返回后由调用方释放
+  （`emit_release_owned_call_temp`），调用**抛异常**时由异常展开器释放
+  （入栈的 EH 临时槽）。两条路径判定的是**同一批对象**：判定不同源，
+  就会有一边漏放，表现为 `zanc --check-leaks` 报
+  "captured local / closure" 或 "N object(s) still reachable at exit"。
+- **坑**：早先实参的 EH 入栈判定要求 `infer_expr_type(arg)` 非空
+  （`at && is_rc_managed_type(at) && … expr_yields_owned_rc_value(…)`），
+  而**裸 lambda 没有自然类型**——推断出来是空的，于是 lambda 实参在异常
+  路径上根本没入栈：调用一抛，闭包连同它捕获的局部（堆 cell）一起留在
+  堆上。正常路径却认它（`emit_release_owned_call_temp` 先判
+  `expr_yields_delegate_value`），两边判定不同源。
+  - 坑出处：写一个"注册回调、重名注册时报错"的测试辅助层时，把捕获了局部
+    变量的 lambda 交给注册函数，注册函数在重名时抛异常——conformance 的
+    leak 轮当场报出 2 个对象泄漏（`captured local` + `closure`），最小复现
+    只要 6 行：把捕获了局部变量的 lambda 传给一个会抛的方法即可。
+- **动作**：判定收口到一个共用谓词（`call_arg_is_owned_temp`），正常路径与
+  EH 路径都调它；委托值**不能**拿推断类型当前提（裸 lambda 推不出类型），
+  要走 `expr_yields_delegate_value`。
+- **委托实参的 EH 槽**：委托在 IR 里是函数指针，而展开器按 **i8ptr** 取回
+  闭包指针再跑它的析构，所以入栈的槽必须是 i8ptr（位转换后存），槽种类用
+  `ZAN_EH_SLOT_DLG`。存成函数指针类型会让展开器的 `load i8ptr` 类型不符
+  （非法 IR）；存成 `ZAN_EH_SLOT_OBJ` 更糟——`zan_rt_release_dyn` 会把闭包
+  头字当成 site 下标去查析构表，读坏内存。
+- **展开顺序**：EH 临时栈是 LIFO。被捕获局部的 cell 由作用域绑定持有
+  （`own_box_cell`，先入栈），闭包实参后入栈 → 展开时先放闭包（闭包析构
+  释放它对 cell 的引用）再放 cell，计数刚好归零；反过来就会多释放一次。
