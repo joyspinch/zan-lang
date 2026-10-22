@@ -2,6 +2,13 @@ using System;
 
 namespace System.Net.Http;
 
+// 分块传输的正文来源：服务器发出响应头后反复调用它取下一段正文，
+// 返回 null 或空数组表示正文结束（服务器随后写结束块收尾）。
+//
+// 逐段产出而不是先拼出整个正文，是"长度未知也能开流"的前提：
+// SSE、大文件下载、逐 token 的模型输出都能在第一段到达时就发出去。
+public async delegate byte[] HttpChunkSource();
+
 // HTTP 响应的构建器与解析器。
 public class HttpResponse : IDisposable {
     public int statusCode;
@@ -16,7 +23,12 @@ public class HttpResponse : IDisposable {
     public bool keepAlive;
     public int framingLength;
     public bool framingHasLength;
+    // 正文是否按分块传输编码定界。客户端解析时由 ParseFraming 置位，
+    // 服务端发送时由 SetChunked 置位——同一个字段在两端是同一件事：
+    // "这份响应的正文是分块framed的"。
     public bool framingChunked;
+    // 分块正文来源（非 null 时以分块传输编码发送正文）。
+    public HttpChunkSource chunkSource;
 
     // 默认构造：200 / keep-alive 的默认状态，由各静态工厂使用。
     public HttpResponse() {
@@ -31,6 +43,7 @@ public class HttpResponse : IDisposable {
         this.framingLength = 0;
         this.framingHasLength = false;
         this.framingChunked = false;
+        this.chunkSource = null;
     }
 
     // 用给定正文创建 200 OK 响应。
@@ -190,6 +203,7 @@ public class HttpResponse : IDisposable {
         }
         this.bodyBytes = null;
         this.bodyBytesLen = 0;
+        this.chunkSource = null;
     }
 
     ~HttpResponse() {
@@ -234,6 +248,27 @@ public class HttpResponse : IDisposable {
         return this;
     }
 
+    // 改用分块传输编码发送正文：正文由 source 逐段产出，服务器在
+    // 发出响应头（Transfer-Encoding: chunked，不带 Content-Length）
+    // 之后反复取下一段并按块写出。source 为 null 时只发一个空正文
+    // （立即写结束块）。source 返回空数组同样表示正文结束。
+    //
+    // 之前设在 body / bodyBytes 上的正文会被忽略——分块路径只认 source。
+    //
+    // 分块传输与 Content-Length 互斥（RFC 9112 §6.1）：两者同时出现
+    // 的响应客户端必须拒收，所以这里由服务器独占定界方式的决定权，
+    // SetHeader 也拒收外部塞进来的 transfer-encoding。
+    public HttpResponse SetChunked(HttpChunkSource source) {
+        this.chunkSource = source;
+        this.framingChunked = true;
+        return this;
+    }
+
+    // 空的分块正文：只发响应头与结束块（正文长度为零，但仍走分块定界）。
+    public HttpResponse SetChunked() {
+        return this.SetChunked(null);
+    }
+
     // 构建包含状态行与所有头部的 StringBuilder（含结尾空行 CRLF）。
     StringBuilder BuildHeadersSb() {
         StringBuilder sb = new StringBuilder();
@@ -253,7 +288,11 @@ public class HttpResponse : IDisposable {
 
         bool statusForbidsContentLength = (this.statusCode >= 100 && this.statusCode < 200)
             || this.statusCode == 204;
-        if (!statusForbidsContentLength) {
+        // 分块传输与 Content-Length 互斥：只发其中一个。1xx/204/304
+        // 既不能有正文也不能有传输编码，两个头都不发。
+        if (this.framingChunked && !statusForbidsContentLength) {
+            sb.Append("Transfer-Encoding: chunked\r\n");
+        } else if (!statusForbidsContentLength) {
             sb.Append("Content-Length: ");
             sb.Append(Convert.ToString(this.BodyLength()));
             sb.Append("\r\n");
@@ -286,6 +325,13 @@ public class HttpResponse : IDisposable {
     // 头部与正文在同一个 StringBuilder 内完成拼装，消除二次大内存分配。
     // 二进制正文请用 <see cref="BuildHeaders"/> + <c>bodyBytes</c>。
     public string Build() {
+        if (this.framingChunked) {
+            // 分块定界的正文只能由分块路径按帧写出。Build 拼出来的
+            // "头 + 裸正文"是一份没有分帧的报文，客户端按 chunked 解析
+            // 必然错位——这里只给头部，宁可让对端等到超时，也不能发一份
+            // 会被误解析的正文。
+            return this.BuildHeaders();
+        }
         if (this.body == null || this.body.Length == 0) {
             return this.BuildHeaders();
         }

@@ -198,6 +198,41 @@ public class HttpsServer {
                 if (omitBody) {
                     string head = response.BuildHeaders();
                     int _h0 = await stream.SendAsync(head, head.Length);
+                } else if (response.framingChunked) {
+                    // 分块传输：头部带 Transfer-Encoding: chunked（不带
+                    // Content-Length），正文按 "<长度>\r\n<数据>\r\n" 逐块
+                    // 写出，末尾写 "0\r\n\r\n"。正文来源抛异常时头部已经
+                    // 发出，只能断开连接——不写结束块即为截断标记。
+                    // 空正文同样走这条路径（发完头部写结束块）。
+                    string head = response.BuildHeaders();
+                    int _h3 = await stream.SendAsync(head, head.Length);
+                    bool complete = true;
+                    while (true) {
+                        byte[] piece = null;
+                        if (response.chunkSource != null) {
+                            try {
+                                piece = await response.chunkSource();
+                            } catch (Exception e) {
+                                Console.WriteLine("[https] chunk source exception on "
+                                    + request.method + " " + request.path + ": "
+                                    + e.Message);
+                                complete = false;
+                                break;
+                            }
+                        }
+                        if (piece == null || piece.Length == 0) { break; }
+                        byte[] prefix = HttpChunkWriter.FramePrefix(piece.Length);
+                        int _p1 = await stream.SendBytesAsync(prefix, 0, prefix.Length);
+                        int _p2 = await stream.SendBytesAsync(piece, 0, piece.Length);
+                        byte[] suffix = HttpChunkWriter.FrameSuffix();
+                        int _p3 = await stream.SendBytesAsync(suffix, 0, suffix.Length);
+                    }
+                    if (complete) {
+                        byte[] term = HttpChunkWriter.Terminator();
+                        int _t = await stream.SendBytesAsync(term, 0, term.Length);
+                    } else {
+                        keepAlive = false;
+                    }
                 } else if (response.IsBinary()) {
                     string head = response.BuildHeaders();
                     int _h2 = await stream.SendAsync(head, head.Length);

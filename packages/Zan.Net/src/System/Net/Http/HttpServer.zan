@@ -366,6 +366,50 @@ public class HttpServer : IDisposable {
             if (omitBody) {
                 string head = response.BuildHeaders();
                 int _h0 = await client.SendBytesAsync(head, head.Length);
+            } else if (response.framingChunked) {
+                // 分块传输：先发头部（Transfer-Encoding: chunked，不带
+                // Content-Length），再逐块取正文写出。块边界必须在线路
+                // 上一致，所以长度前缀、数据、分隔符分三次写出——
+                // Socket.SendAsync 是"写完"语义，不会短写，拼一次发
+                // 反而多一次拷贝。
+                // 分支条件是 framingChunked 而不是"有正文来源"：空正文
+                // 也要走这条路径（发完头部写结束块），否则客户端会一直
+                // 等一个永远不来的结束块。
+                string head = response.BuildHeaders();
+                int _h3 = await client.SendBytesAsync(head, head.Length);
+                bool complete = true;
+                while (true) {
+                    byte[] piece = null;
+                    if (response.chunkSource != null) {
+                        try {
+                            piece = await response.chunkSource();
+                        } catch (Exception e) {
+                            // 头部已经发出，改不了状态码：只能断开连接。
+                            // 不写结束块就是明确的"正文被截断"标记，客户端
+                            // 读到没有结束块的流会报错，不会把半截正文当成
+                            // 完整响应。
+                            Console.WriteLine("[http] chunk source exception on "
+                                + request.method + " " + request.path + ": "
+                                + e.Message);
+                            complete = false;
+                            break;
+                        }
+                    }
+                    if (piece == null || piece.Length == 0) { break; }
+                    byte[] prefix = HttpChunkWriter.FramePrefix(piece.Length);
+                    int _p1 = await client.SendBytesAsync(prefix, 0, prefix.Length);
+                    int _p2 = await client.SendBytesAsync(piece, 0, piece.Length);
+                    byte[] suffix = HttpChunkWriter.FrameSuffix();
+                    int _p3 = await client.SendBytesAsync(suffix, 0, suffix.Length);
+                }
+                if (complete) {
+                    byte[] term = HttpChunkWriter.Terminator();
+                    int _t = await client.SendBytesAsync(term, 0, term.Length);
+                } else {
+                    // 连接不能复用：客户端还等着结束块，下一轮请求的
+                    // 字节会被当成这一响应的正文。
+                    keepAlive = false;
+                }
             } else if (response.IsBinary()) {
                 string head = response.BuildHeaders();
                 int _h2 = await client.SendBytesAsync(head, head.Length);

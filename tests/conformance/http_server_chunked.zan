@@ -1,0 +1,199 @@
+using System;
+using System.Net.Sockets;
+using System.Net.Http;
+using System.Net.Http.Client;
+using System.Threading;
+
+// 服务端分块传输响应（Transfer-Encoding: chunked）：
+// 1. 客户端能解码多段正文；
+// 2. 线路格式正确（带 TE、不带 Content-Length、帧边界与结束块）；
+// 3. 含 NUL 的二进制分块不被截断；
+// 4. 空正文分块只有结束块；
+// 5. 分块响应之后连接仍可复用；
+// 6. 正文来源抛异常时客户端看到"正文被截断"，而不是半截正文。
+class Program {
+    static int PORT = 9691;
+    static int failures = 0;
+    static int chunkIndex = 0;
+    static bool boom = false;
+
+    static void Check(bool cond, string name) {
+        if (cond) {
+            Console.WriteLine("ok " + name);
+        } else {
+            Console.WriteLine("FAIL " + name);
+            failures = failures + 1;
+        }
+    }
+
+    // 分块正文来源：依次产出 alpha / beta / gamma，再返回 null 表示结束。
+    static async byte[] NextPiece() {
+        chunkIndex = chunkIndex + 1;
+        if (chunkIndex == 1) { return "alpha".ToBytes(); }
+        if (chunkIndex == 2) {
+            if (Program.boom) {
+                throw new Exception("chunk source failed");
+            }
+            return "beta".ToBytes();
+        }
+        if (chunkIndex == 3) { return "gamma".ToBytes(); }
+        return null;
+    }
+
+    // 二进制分块：0..255 一段。第 0 字节是 NUL，strlen 语义会在这里截断。
+    static async byte[] NextBytes() {
+        chunkIndex = chunkIndex + 1;
+        if (chunkIndex != 1) { return null; }
+        byte[] b = new byte[256];
+        for (int i = 0; i < 256; i = i + 1) {
+            b[i] = (byte)i;
+        }
+        return b;
+    }
+
+    static async HttpResponse Handle(HttpRequest req) {
+        chunkIndex = 0;
+        Program.boom = false;
+        if (req.path == "/text") {
+            HttpResponse r = HttpResponse.Text("");
+            return r.SetChunked(Program.NextPiece);
+        }
+        if (req.path == "/binary") {
+            HttpResponse r = HttpResponse.Text("");
+            r.contentType = "application/octet-stream";
+            return r.SetChunked(Program.NextBytes);
+        }
+        if (req.path == "/empty") {
+            HttpResponse r = HttpResponse.Text("");
+            return r.SetChunked();
+        }
+        if (req.path == "/boom") {
+            Program.boom = true;
+            HttpResponse r = HttpResponse.Text("");
+            return r.SetChunked(Program.NextPiece);
+        }
+        return HttpResponse.NotFound();
+    }
+
+    // 读到分块正文结束为止。结束标记用 "\r\n0\r\n\r\n"：单用
+    // "0\r\n\r\n" 会误命中响应头里的 "Server: Zan/1.0\r\n\r\n"。
+    static async string ReadUntil(TcpClient c, string marker, int limit) {
+        string acc = "";
+        while (acc.Length < limit) {
+            string part = await c.RecvAsync(4096);
+            if (part.Length == 0) { break; }
+            acc = acc + part;
+            if (acc.IndexOf(marker) >= 0) { break; }
+        }
+        return acc;
+    }
+
+    static async int Run() {
+        Socket.Initialize();
+        HttpServer server = new HttpServer("127.0.0.1", PORT);
+        server.OnRequest(Program.Handle);
+        Task.Spawn(server.Start());
+        await Task.Delay(80);
+
+        HttpClient c = new HttpClient("127.0.0.1", PORT);
+        c.SetTimeout(5000);
+
+        // 1. 客户端解码多段正文。
+        HttpResponse text = await c.SendAsync("GET", "/text", "");
+        Check(text.statusCode == 200 && text.body == "alphabetagamma",
+            "client decodes chunked body");
+
+        // 2. 线路格式：带 Transfer-Encoding、不带 Content-Length、帧与结束块。
+        {
+            TcpClient raw = await TcpClient.ConnectAsync("127.0.0.1", PORT, 3000);
+            int _h = await raw.SendAsync(
+                "GET /text HTTP/1.1\r\nHost: t\r\n\r\n");
+            string wire = await Program.ReadUntil(raw, "\r\n0\r\n\r\n", 8192);
+            Check(wire.IndexOf("Transfer-Encoding: chunked") >= 0,
+                "wire has chunked transfer-encoding");
+            Check(wire.IndexOf("Content-Length") < 0,
+                "wire has no content-length");
+            Check(wire.IndexOf("5\r\nalpha\r\n") >= 0
+                && wire.IndexOf("4\r\nbeta\r\n") >= 0
+                && wire.IndexOf("5\r\ngamma\r\n") >= 0,
+                "wire chunk frames");
+            Check(wire.Length >= 5
+                && wire.Substring(wire.Length - 5, 5) == "0\r\n\r\n",
+                "wire terminator");
+            raw.Close();
+        }
+
+        // 3. 含 NUL 的二进制分块不被截断。
+        {
+            HttpResponse bin = await c.SendBytesAsync("GET", "/binary", "");
+            byte[] bytes = bin.bodyBytes;
+            // 客户端把解码后的正文复制进 bodyBytes（多一个 NUL 终止位），
+            // 字节数看 BodyLength()。
+            bool ok = bin.statusCode == 200 && bin.BodyLength() == 256
+                && bytes != null && bytes.Length >= 256
+                && (bytes[0] & 255) == 0 && (bytes[255] & 255) == 255;
+            Check(ok, "binary chunk keeps NUL bytes");
+        }
+
+        // 4. 空正文分块：只有结束块。
+        {
+            HttpResponse empty = await c.SendAsync("GET", "/empty", "");
+            Check(empty.statusCode == 200 && empty.body.Length == 0,
+                "empty chunked body");
+        }
+
+        // 5. HEAD：只回头部，不发正文。
+        {
+            HttpResponse head = await c.SendAsync("HEAD", "/text", "");
+            Check(head.statusCode == 200 && head.body.Length == 0,
+                "HEAD sends no chunk body");
+        }
+
+        // 6. 分块响应之后连接仍可复用。
+        {
+            TcpClient raw = await TcpClient.ConnectAsync("127.0.0.1", PORT, 3000);
+            int _h1 = await raw.SendAsync(
+                "GET /text HTTP/1.1\r\nHost: t\r\n\r\n");
+            string w1 = await Program.ReadUntil(raw, "\r\n0\r\n\r\n", 8192);
+            int _h2 = await raw.SendAsync(
+                "GET /text HTTP/1.1\r\nHost: t\r\n\r\n");
+            string w2 = await Program.ReadUntil(raw, "\r\n0\r\n\r\n", 8192);
+            // 线路上的正文是被分帧隔开的（"alpha\r\n4\r\nbeta..."），
+            // 不能按连续正文来查；查帧与状态行。
+            Check(w1.IndexOf("5\r\nalpha\r\n") >= 0
+                && w2.IndexOf("HTTP/1.1 200") >= 0
+                && w2.IndexOf("5\r\nalpha\r\n") >= 0
+                && w2.IndexOf("5\r\ngamma\r\n") >= 0,
+                "keep-alive reuse after chunked");
+            raw.Close();
+        }
+
+        // 7. 正文来源抛异常：头部已发出，只能断开连接；客户端必须看到
+        //    "正文被截断"，不能把半截正文当成完整响应。
+        {
+            bool threw = false;
+            string msg = "";
+            try {
+                HttpResponse bad = await c.SendAsync("GET", "/boom", "");
+                msg = "body=" + bad.body;
+            } catch (HttpRequestException e) {
+                threw = true;
+                msg = e.Message;
+            } catch (Exception e) {
+                msg = e.Message;
+            }
+            Check(threw && msg.IndexOf("middle of the response body") >= 0,
+                "chunk source failure truncates response");
+        }
+
+        c.Close();
+        server.Stop();
+        for (int i = 0; i < 20; i = i + 1) { await Task.Delay(10); }
+        Console.WriteLine("failures=" + Convert.ToString(Program.failures));
+        return 0;
+    }
+
+    static void Main() {
+        int r = await Program.Run();
+    }
+}
