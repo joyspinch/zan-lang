@@ -91,6 +91,14 @@
   存量 phi 分组缺陷，批次回归照出——路径限定提交按文件取工作树，两修
   同文件同车，台账分记）。
 - 待办：自举半边（ngen 整数运算位宽同口径）；short/byte 的 C# 提升到
+- **自举 IR 后端半边已修（2026-10-23，goal round 5）**：selfhost
+  `ArithWidth` 曾"有字面量参与就放宽到 64"——`int.Parse("2147483647")+1`
+  打 2147483648。改为按臂静态类型定宽（int/uint→32，字面量臂随另一臂，
+  L 字面量仍是 long）：`(i+1)` 与 `m*2` 的产物 IR 现在有 shl/ashr 32 位
+  回绕序列，`2147483647L+1` 与 `long.Parse(...)+1` 仍 64 位。gen1 重编
+  66 源 + stdlib 拉入全过。**ngen（机器码后端）位宽口径仍待办**；宿主
+  infer 提升修复（be142bb4c）同样惠及自举（gen1 由宿主编译，其 lexer
+  累加曾同被截断——见该提交正文）。
 - **收窄的前置推断缺口已修（2026-10-23，goal round 4）**：`infer_expr_type`
   的混合位宽二元（long+int）曾返回 NULL（不提升）——发射端 coerce_int_pair
   把臂对齐到 64 位所以数值碰巧没错，但外层表达式（`(long子式)/int`）会取
@@ -171,14 +179,19 @@
 
 ### [~] A517 析构器 `~X()` 是死语法：解析/检查过、从不发射、从不调用
 - **宿主侧已修（2026-10-23，口径=编译期拒绝）**：binder 补
-- **自举半边已补（2026-10-23，goal round 2）**：selfhost parser.zan 的析构分支
-  （At(TK.Bang())/At(TK.Tilde())）加同文案 diags.Error——gen1 实测 `~Widget()`
-  当场拒绝（同文案 + 非零退出）；selfhost 自身 66 源无析构、gen1 构建通过
-  （全仓 29 处 ~X() 已在 274938124 迁移删除）。
   `AST_DESTRUCTOR_DECL` 分支——声明析构器当场报错（"ARC runtime has no
   destructor hook on release ... do deterministic cleanup explicitly"）。
   SPEC 同步改口径：§6.2 删 "refcount 0 → destructor called" 示例、正文声明
   析构器不支持，§4.4 类成员示例删掉 `~Window()`。死语法不再静默吞掉。
+- **stdlib/packages 迁移批已补（2026-10-23）**：274938124 删掉 packages/ide
+  侧 29 处后，本批再删 stdlib 24 文件 + packages（Zan.Data/Zan.Web/Zan.IO/
+  Zan.Gui.Browser）19 文件共 **43 处 ~X() 声明**（含各文件残留的"析构兜底"
+  失效注释）；全仓 ~X() 至此清零。带守卫编译
+  （Timer/Gate/BlockingQueue 探针）+ 泄漏检查通过。
+- **自举半边已补（2026-10-23，goal round 2）**：selfhost parser.zan 的析构分支
+  （At(TK.Bang())/At(TK.Tilde())）加同文案 diags.Error——gen1 实测 `~Widget()`
+  当场拒绝（同文案 + 非零退出）；selfhost 自身 66 源无析构、gen1 构建通过
+  （全仓 ~X() 已分两批迁移删除：274938124 + 本批）。
 - 待办：ARC 释放链补析构钩子（refcount 归零调析构体再释放）是独立战线，
   实现后再放开语法；自举半边（selfhost 无此分支时同类声明会漏报）。
 - 原始实测：`~Node()`/`~Solo()` 编译通过、运行无任何析构输出；IR 里 `__zan_release_*` 只逐字段 release，析构体内容不存在。依赖确定性清理的迁移代码静默失效。
