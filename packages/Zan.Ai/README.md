@@ -46,6 +46,9 @@ HNSW 向量索引、`Zan.Net` 的 `HttpClient`），但没有把它们串成"文
   结果回传 → 再问，直到给出答案）
 - `System.Ai` — `AiTool` / `AiToolCall` / `AiToolResult` / `AiToolTurn`
   / `ToolEvent`（工具调用的实体：声明、调用、结果、回合、事件）
+- `System.Ai` — `McpToolBinding` / `McpTools`（把**远端 MCP 工具**接进
+  本地工具注册表：远端 schema → 本地声明，本地调用 → 远端 `tools/call`。
+  MCP 协议本身在 `Zan.Mcp` 包里）
 - `System.Ai` — `VectorStoreWriter`（内存档的写入适配器，把
   `VectorStore` 包成 `IIndexWriter` 契约）
 - `System.Ai` — 实体（`src/System/Ai/Models/`）：`AiConfig` /
@@ -332,6 +335,61 @@ List<AiMessage> history = await agent.Run(questions);
 文本里——**别把 `JsonValue` 直接当工具返回值**（那是跨边界的裸结构，
 调用方还得再解析一次）。
 
+### 三种实现，三种注册入口
+
+| 实现 | 委托类型 | 注册方法 | 什么时候用 |
+|---|---|---|---|
+| 异步（碰 IO：查库、调 HTTP、读文件） | `public async delegate string AiToolFn(JsonValue args);` | `reg.Register(tool, fn)` | 大多数工具 |
+| 同步（不碰 IO：算一下、查内存字典） | `public delegate string AiToolSyncFn(JsonValue args);` | `reg.RegisterSync(tool, fn)` | 少一层 await 噪声 |
+| 结果版（**自己知道失败的具体原因**） | `public async delegate AiToolResult AiToolResultFn(JsonValue args);` | `reg.RegisterResult(tool, fn)` | 远端工具、要报具体错因 |
+
+不是重载，是**三个名字**——同名重载会先选中异步那版，方法组转换的
+诊断要到 irgen 阶段才报，位置离病因太远。
+
+**结果版为什么存在**：前两版只能回一个字符串，"失败"只能用 `null` 表示，
+于是注册表只能给一句**泛化文案**（"工具执行失败：<名字>"）。实现自己
+知道的具体原因（远端返回的错误正文、缺哪个参数）就丢了——模型看不到
+原因就只会编一个答案。结果版让实现**自己给出结果**：成功内容、是不是
+错误、错的具体原因都它说了算，注册表只补上调用 id。
+
+## MCP：把远端工具接进工具循环
+
+MCP（Model Context Protocol）是"让程序去用**别的程序**的工具"的一套
+约定。协议本身在 `Zan.Mcp` 包（`System.Mcp`），本包提供**接进工具循环
+的那一段翻译**：
+
+```zan
+using System.Mcp;
+
+McpClient client = new McpClient("http://127.0.0.1:8080/mcp", "token");
+if (!await client.Initialize()) {
+    Console.WriteLine(client.lastError);
+    return;
+}
+
+// 远端工具接进本地注册表——模型看到的是**本地**工具。
+ToolRegistry reg = new ToolRegistry();
+int n = await McpTools.RegisterAll(client, reg, "");
+```
+
+接完之后，模型完全不需要知道那些工具住在另一台机器上：声明照发
+（远端的 `inputSchema` 直接当本地 `parameters` 用——两者是同一份
+JSON Schema），调用照落（本地调用 → 远端 `tools/call` → 结果回到
+模型）。
+
+**多个 MCP 服务端共用一个注册表时必须加前缀**（第二个参数）：同名
+工具互相覆盖，后注册的顶掉先注册的——用户以为装了两个服务端，其实
+只有一个的工具有效。
+
+```zan
+await McpTools.RegisterAll(clientA, reg, "a_");
+await McpTools.RegisterAll(clientB, reg, "b_");
+```
+
+**远端工具失败怎么表现**：远端回 `isError: true` 时，结果版实现把它
+变成一条**错误结果**——`isError` 为 true，内容是**远端给的具体原因**，
+不是泛化文案。模型看到原因能自己纠正。
+
 ## 设计要点
 
 - **实体化，不用平行数组**：向量、分块、请求/响应、检索命中都是具名
@@ -417,11 +475,15 @@ List<AiMessage> history = await agent.Run(questions);
   定（那会绑死部署形态）。
 - 工具调用只接 **OpenAI 兼容的 tool-calling 协议**（`tools` 声明 +
   `tool_calls` 响应）；不做各厂商的私有函数调用协议（Anthropic 的
-  `tool_use`、Gemini 的 `functionDeclarations` 等）。
+  `tool_use`、Gemini 的 `functionDeclarations` 等）。远端 MCP 工具可以
+  接进来（`McpTools.RegisterAll`），但 MCP 自己的协议在 `Zan.Mcp` 包里。
 - 工具返回值是**纯文本**（不传结构化 JSON 给模型）——省一次解析，但
   模型要用结构化结果时得自己从文本里读。
 - 工具是**同步或异步的单个委托**——不支持"需要确认才执行"这类多步
   人工介入的流程。
+- 导入 `System.Ai` 会连带解析 `System.Mcp`（本包的 `McpToolBinding` 要
+  用它）——**单独裁剪包文件**时要把 `Zan.Mcp` 一起带上。SDK 里两者是
+  一起发布的，正常用不着管。
 - 无评估与可观测——这是后续的档位。
 - 远端档的**同步接口会报错**（`Search` / `TextOf`）——阻塞等待网络会
   停掉 worker 的事件循环，把并发限制在 worker 数量上。这是有意的：

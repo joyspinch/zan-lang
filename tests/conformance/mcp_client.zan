@@ -1,0 +1,268 @@
+using System;
+using System.Collections.Generic;
+using System.Json;
+using System.Ai;
+using System.Mcp;
+
+// 假传输：把请求按顺序记下来，按队列返回响应。
+//
+// 为什么用假传输而不是真服务器：协议测试要钉的是**请求形状**与
+// **响应处理**——真服务器一次往返就把这些全糊过去了，而且用例还得
+// 依赖一个跑着的服务。假传输让每一步都可断言、可复现。
+public class FakeMcp {
+    // 收到的请求（按顺序）。
+    public List<string> requests;
+
+    // 排队等待返回的响应正文（按顺序取用）。
+    public List<string> bodies;
+
+    // 每个响应的状态码（与 bodies 同序）。
+    public List<int> codes;
+
+    // 取到第几个。
+    public int cursor;
+
+    // true = 传输直接失败（返回 null）。
+    public bool fail;
+
+    public FakeMcp() {
+        this.requests = new List<string>();
+        this.bodies = new List<string>();
+        this.codes = new List<int>();
+        this.cursor = 0;
+        this.fail = false;
+    }
+
+    public void Reply(string body) {
+        this.ReplyWith(200, body);
+    }
+
+    public void ReplyWith(int code, string body) {
+        this.bodies.Add(body);
+        this.codes.Add(code);
+    }
+
+    public async McpTransportResult Send(string requestJson) {
+        this.requests.Add(requestJson);
+        if (this.fail) { return null; }
+        if (this.cursor < this.bodies.Count) {
+            string b = this.bodies[this.cursor];
+            int c = this.codes[this.cursor];
+            this.cursor = this.cursor + 1;
+            return new McpTransportResult(c, b);
+        }
+        return new McpTransportResult(200, "");
+    }
+
+    // 第 i 个请求（解析成 JSON）。越界返回 null。
+    public JsonValue At(int i) {
+        if (i < 0 || i >= this.requests.Count) { return null; }
+        return JsonValue.Parse(this.requests[i]);
+    }
+
+    public int Count() { return this.requests.Count; }
+}
+
+public class P {
+    static string YN(bool b) { return b ? "yes" : "no"; }
+
+    // 空值安全的取字段（外部 JSON 随时可能缺字段，测试不该因此崩）。
+    static string S(JsonValue v, string key) {
+        if (v == null) { return ""; }
+        return v.Str(key, "");
+    }
+
+    static int I(JsonValue v, string key) {
+        if (v == null) { return -1; }
+        return v.Int(key, -1);
+    }
+
+    static JsonValue G(JsonValue v, string key) {
+        if (v == null) { return null; }
+        return v.Get(key);
+    }
+
+    static bool H(JsonValue v, string key) {
+        if (v == null) { return false; }
+        return v.Has(key);
+    }
+
+    // 握手 + 工具 + 资源 + ping 的完整一轮。
+    static async Task Main() {
+        FakeMcp fake = new FakeMcp();
+        fake.Reply("{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2025-06-18\",\"capabilities\":{\"tools\":{},\"resources\":{\"listChanged\":false}},\"serverInfo\":{\"name\":\"fake-mcp\",\"version\":\"9.9\"},\"instructions\":\"先调 echo\"}}");
+        fake.ReplyWith(202, "");
+        fake.Reply("{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[{\"name\":\"echo\",\"description\":\"回声工具\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"text\":{\"type\":\"string\"}},\"required\":[\"text\"]}},{\"name\":\"boom\",\"description\":\"必炸工具\",\"inputSchema\":{\"type\":\"object\",\"properties\":{},\"required\":[]}}]}}");
+        fake.Reply("{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"第一段\"},{\"type\":\"text\",\"text\":\"第二段\"}],\"isError\":false}}");
+        fake.Reply("{\"jsonrpc\":\"2.0\",\"id\":4,\"result\":{\"resources\":[{\"uri\":\"repo://map\",\"name\":\"map\",\"description\":\"地图\",\"mimeType\":\"text/plain\"}]}}");
+        fake.Reply("{\"jsonrpc\":\"2.0\",\"id\":5,\"result\":{\"contents\":[{\"uri\":\"repo://map\",\"mimeType\":\"text/plain\",\"text\":\"地图内容\"}]}}");
+        fake.Reply("{\"jsonrpc\":\"2.0\",\"id\":6,\"result\":{}}");
+
+        McpClient client = new McpClient(fake.Send);
+        Console.WriteLine("== 握手 ==");
+        Console.WriteLine("init=" + YN(await client.Initialize()));
+        JsonValue initReq = fake.At(0);
+        Console.WriteLine("req.method=" + S(initReq, "method"));
+        Console.WriteLine("req.id=" + Convert.ToString(I(initReq, "id")));
+        Console.WriteLine("req.rpc=" + S(initReq, "jsonrpc"));
+        JsonValue initParams = G(initReq, "params");
+        Console.WriteLine("params.proto=" + S(initParams, "protocolVersion"));
+        Console.WriteLine("params.client=" + S(G(initParams, "clientInfo"), "name"));
+        Console.WriteLine("params.hasCaps=" + YN(H(initParams, "capabilities")));
+        McpServerInfo info = client.serverInfo;
+        Console.WriteLine("server.name=" + info.name);
+        Console.WriteLine("server.version=" + info.version);
+        Console.WriteLine("server.proto=" + info.protocolVersion);
+        Console.WriteLine("server.instructions=" + info.instructions);
+        Console.WriteLine("caps.tools=" + YN(info.hasTools));
+        Console.WriteLine("caps.resources=" + YN(info.hasResources));
+        Console.WriteLine("caps.prompts=" + YN(info.hasPrompts));
+
+        JsonValue notify = fake.At(1);
+        Console.WriteLine("notify.method=" + S(notify, "method"));
+        Console.WriteLine("notify.hasId=" + YN(H(notify, "id")));
+        Console.WriteLine("notify.rpc=" + S(notify, "jsonrpc"));
+
+        Console.WriteLine("== 工具 ==");
+        List<McpTool> tools = await client.ListTools();
+        Console.WriteLine("tools.count=" + Convert.ToString(tools.Count));
+        Console.WriteLine("tools[0].name=" + tools[0].name);
+        Console.WriteLine("tools[0].desc=" + tools[0].description);
+        Console.WriteLine("tools[0].schema=" + tools[0].SchemaText());
+        Console.WriteLine("tools[1].name=" + tools[1].name);
+        JsonValue listReq = fake.At(2);
+        Console.WriteLine("listReq.method=" + S(listReq, "method"));
+        Console.WriteLine("listReq.id=" + Convert.ToString(I(listReq, "id")));
+
+        JsonValue args = JsonValue.NewObject();
+        args.PutStr("text", "hi");
+        McpToolResult res = await client.CallTool("echo", args);
+        Console.WriteLine("call.isError=" + YN(res.isError));
+        Console.WriteLine("call.text=" + res.text);
+        JsonValue contents = res.contents;
+        Console.WriteLine("call.contents=" + Convert.ToString(contents == null ? 0 : contents.Count()));
+        JsonValue callReq = fake.At(3);
+        JsonValue callParams = G(callReq, "params");
+        Console.WriteLine("callReq.method=" + S(callReq, "method"));
+        Console.WriteLine("callReq.name=" + S(callParams, "name"));
+        Console.WriteLine("callReq.arg=" + S(G(callParams, "arguments"), "text"));
+
+        Console.WriteLine("== 资源 ==");
+        List<McpResource> resources = await client.ListResources();
+        Console.WriteLine("res.count=" + Convert.ToString(resources.Count));
+        Console.WriteLine("res[0].uri=" + resources[0].uri);
+        Console.WriteLine("res[0].mime=" + resources[0].mimeType);
+        Console.WriteLine("res[0].desc=" + resources[0].description);
+        string text = await client.ReadResource("repo://map");
+        Console.WriteLine("res.text=" + text);
+        JsonValue readReq = fake.At(5);
+        Console.WriteLine("readReq.method=" + S(readReq, "method"));
+        Console.WriteLine("readReq.uri=" + S(G(readReq, "params"), "uri"));
+
+        Console.WriteLine("== ping ==");
+        Console.WriteLine("ping=" + YN(await client.Ping()));
+        Console.WriteLine("reqs=" + Convert.ToString(fake.Count()));
+
+        await ErrorCases();
+        await BridgeCase();
+    }
+
+    // 七条错误路径：每条都要给出**可读**的原因，不是静默失败。
+    static async Task ErrorCases() {
+        Console.WriteLine("== 错误 ==");
+
+        // (a) 没握手就调 tools/list
+        FakeMcp f1 = new FakeMcp();
+        McpClient c1 = new McpClient(f1.Send);
+        List<McpTool> none = await c1.ListTools();
+        Console.WriteLine("noInit.null=" + YN(none == null));
+        Console.WriteLine("noInit.err=" + c1.lastError);
+
+        // (b) 服务端回 JSON-RPC error
+        FakeMcp f2 = new FakeMcp();
+        f2.Reply("{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32601,\"message\":\"method not found: tools/list\"}}");
+        McpClient c2 = new McpClient(f2.Send);
+        bool ok2 = await c2.Initialize();
+        Console.WriteLine("rpcErr.ok=" + YN(ok2));
+        Console.WriteLine("rpcErr.err=" + c2.lastError);
+
+        // (c) HTTP 5xx
+        FakeMcp f3 = new FakeMcp();
+        f3.ReplyWith(500, "boom");
+        McpClient c3 = new McpClient(f3.Send);
+        bool ok3 = await c3.Initialize();
+        Console.WriteLine("http5xx.ok=" + YN(ok3));
+        Console.WriteLine("http5xx.err=" + c3.lastError);
+
+        // (d) 响应不是 JSON
+        FakeMcp f4 = new FakeMcp();
+        f4.Reply("<html>not json</html>");
+        McpClient c4 = new McpClient(f4.Send);
+        bool ok4 = await c4.Initialize();
+        Console.WriteLine("notJson.ok=" + YN(ok4));
+        Console.WriteLine("notJson.err=" + c4.lastError);
+
+        // (e) 响应的 id 对不上
+        FakeMcp f5 = new FakeMcp();
+        f5.Reply("{\"jsonrpc\":\"2.0\",\"id\":99,\"result\":{}}");
+        McpClient c5 = new McpClient(f5.Send);
+        bool ok5 = await c5.Initialize();
+        Console.WriteLine("badId.ok=" + YN(ok5));
+        Console.WriteLine("badId.err=" + c5.lastError);
+
+        // (f) 传输失败（连不上）
+        FakeMcp f6 = new FakeMcp();
+        f6.fail = true;
+        McpClient c6 = new McpClient(f6.Send);
+        bool ok6 = await c6.Initialize();
+        Console.WriteLine("netErr.ok=" + YN(ok6));
+        Console.WriteLine("netErr.err=" + c6.lastError);
+
+        // (g) 结果里没有 result
+        FakeMcp f7 = new FakeMcp();
+        f7.Reply("{\"jsonrpc\":\"2.0\",\"id\":1}");
+        McpClient c7 = new McpClient(f7.Send);
+        bool ok7 = await c7.Initialize();
+        Console.WriteLine("noResult.ok=" + YN(ok7));
+        Console.WriteLine("noResult.err=" + c7.lastError);
+    }
+
+    // 远端工具接进本地 ToolRegistry：模型看的是本地工具，调用落到远端。
+    static async Task BridgeCase() {
+        Console.WriteLine("== 接进注册表 ==");
+        FakeMcp fake = new FakeMcp();
+        fake.Reply("{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2025-06-18\",\"capabilities\":{\"tools\":{}},\"serverInfo\":{\"name\":\"fake-mcp\",\"version\":\"9.9\"}}}");
+        fake.ReplyWith(202, "");
+        fake.Reply("{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[{\"name\":\"echo\",\"description\":\"回声工具\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"text\":{\"type\":\"string\"}},\"required\":[\"text\"]}}]}}");
+        fake.Reply("{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"远端说：hi\"}],\"isError\":false}}");
+        fake.Reply("{\"jsonrpc\":\"2.0\",\"id\":4,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"炸了\"}],\"isError\":true}}");
+
+        McpClient client = new McpClient(fake.Send);
+        await client.Initialize();
+        ToolRegistry reg = new ToolRegistry();
+        int added = await McpTools.RegisterAll(client, reg, "");
+        Console.WriteLine("added=" + Convert.ToString(added));
+        Console.WriteLine("reg.count=" + Convert.ToString(reg.Count()));
+        Console.WriteLine("reg.has=" + YN(reg.Has("echo")));
+
+        JsonValue callArgs = JsonValue.NewObject();
+        callArgs.PutStr("text", "hi");
+        AiToolResult ok = await reg.Call(new AiToolCall("c1", "echo", callArgs.ToJson()));
+        Console.WriteLine("reg.call.isError=" + YN(ok.isError));
+        Console.WriteLine("reg.call.content=" + ok.content);
+        Console.WriteLine("reg.call.id=" + ok.id);
+        JsonValue req = fake.At(3);
+        Console.WriteLine("reg.call.method=" + S(req, "method"));
+        Console.WriteLine("reg.call.name=" + S(G(req, "params"), "name"));
+
+        // 远端工具报失败 → 回一条**具体原因**给模型，不抛异常，
+        // 而且在注册表里标成错误（不是一次"成功"的失败）。
+        JsonValue badArgs = JsonValue.NewObject();
+        badArgs.PutStr("text", "boom");
+        AiToolResult bad = await reg.Call(new AiToolCall("c2", "echo", badArgs.ToJson()));
+        Console.WriteLine("reg.bad.isError=" + YN(bad.isError));
+        Console.WriteLine("reg.bad.content=" + bad.content);
+        Console.WriteLine("reg.bad.id=" + bad.id);
+        Console.WriteLine("reg.lastError=" + reg.lastError);
+    }
+}

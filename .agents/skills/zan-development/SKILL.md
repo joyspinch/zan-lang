@@ -90,6 +90,30 @@ Without MCP the same index is a file: `knowledge/symbols.json` next to the SDK
 * **委托不能装进 `object` 变量再比 null**：`object f = someDelegate;` 之后
   `f == null` 会直接 access violation 崩掉。委托要留在类型化字段里
   （`public delegate object Factory();` 这类具名委托类型可以直接用）。
+* **lambda 不能是 async；异步委托只能用方法组**：`async (JsonValue a) =>
+  {...}` 连解析都过不去（"unexpected token 'async' in expression"）。异步
+  委托的正规写法是**具名方法 + 方法组**：`MyFn f = h.Handle;`（`Handle` 是
+  `public async string Handle(JsonValue)`）——编译、运行都对。**最坑的是
+  同步 lambda 赋给 async 委托**：不报错，但**调用返回空串**（实测
+  `r3=` 空），静默错、还看不出错。所以异步委托一律用具名方法。
+* **字符串方法是编译器内建，不在 stdlib 里**：`Trim` / `ToLower` /
+  `ToUpper` / `StartsWith` / `EndsWith` / `Substring` / `IndexOf` /
+  `LastIndexOf` / `Split` / `Replace` / `Contains` / `Equals` 定义在
+  `src/compiler/builtin_api.c` 的 `members_string`——grep `stdlib/**/*.zan`
+  找不到**不等于没有**。（同理 `StringBuilder`、`Task`、`Convert`、
+  `Console` 也都是内建类型。）
+* **`JsonValue.Get` / `At` 的返回值可空**：`.Str(...)` 直接串上去会被编译器
+  拒绝（"'At' can return null; accessing 'Str' on its result faults at
+  runtime"）。存到局部变量判空、或用 `?.`。写解析类代码时**包一层
+  null 安全的取字段辅助函数**最省事（一串 `Get(...).Str(...)` 会炸出几十
+  个编译错误）。
+* **跨包 namespace 免声明**：`zanc --package-project <repo>` 会扫所有
+  `packages/*/src/`，跨包 `using` 直接可用，**不需要在 `zan.pkg` 里声明
+  依赖**（`Zan.Ai` 一直用 `Zan.Net` 的 `System.Net.Http.Client`，从没声明
+  过）。新加一个包只要 `packages/<Name>/src/<Ns>/...` + `zan.pkg`，
+  编译器就能解析到它的命名空间——不必先想好包名再改一堆引用。
+* **`Convert.ToString` 支持 int/long/double/bool**（编译器合成，stdlib 的
+  `Convert` 类里只写了 base64/hex 那套）——拼字符串时不用手写 `"" + n`。
 * Never list attribute names with `*/` inside a `/* ... */` comment —
   `data-on-*/data-if` closes the comment mid-sentence and the rest becomes
   code (209 cascading errors). Separate with `、` or spaces.
@@ -499,9 +523,9 @@ zan_compile(content)           # one snippet in an isolated dir
 Direct:
 
 ```
-D:\project\zan-lang/toolchain/zanc <entry.zan> --auto-stdlib -o build/app
-D:\project\zan-lang/toolchain/zanc <entry.zan> --auto-stdlib --publish -o app   # release
-D:\project\zan-lang/toolchain/zanc <entry.zan> --auto-stdlib --check-leaks -o build/app
+build/zanc.exe <entry.zan> --auto-stdlib -o build/app
+build/zanc.exe <entry.zan> --auto-stdlib --publish -o app   # release
+build/zanc.exe <entry.zan> --auto-stdlib --check-leaks -o build/app
 ```
 
 **多文件项目必须枚举全部 .zan 源**（实证）：`--auto-stdlib` 只自动

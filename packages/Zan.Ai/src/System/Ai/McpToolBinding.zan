@@ -1,0 +1,109 @@
+using System;
+using System.Collections.Generic;
+using System.Json;
+using System.Mcp;
+
+namespace System.Ai;
+
+// 一个远端 MCP 工具在本地 `ToolRegistry` 里的**绑定**。
+//
+// ## 为什么是"一个工具一个对象"
+//
+// `ToolRegistry` 按名字找实现。远端工具的实现住在**另一台机器**上，
+// 本地没有函数——但注册表只认委托。而 Zan 的 lambda **不能是 async**
+// （`async (JsonValue a) => {...}` 连解析都过不去），`AiToolFn` 却是
+// 异步委托。所以只能用**具名方法**：每个远端工具配一个绑定对象记住
+// "哪个客户端 + 哪个工具名"，用方法组（`binding.InvokeResult`）注册
+// 进去。
+//
+// ## 失败不抛异常
+//
+// 远端工具失败时回一条 "error: ..." 文本。模型看到错误能自己纠正；
+// 异常会把整个工具循环打断（与 `ToolRegistry` 的失败语义一致：工具
+// 失败不是对话失败）。
+public class McpToolBinding {
+    // 远端 MCP 客户端。
+    private McpClient client;
+
+    // 远端工具名（**远端的名字**，不是本地注册表里的名字）。
+    private string name;
+
+    public McpToolBinding(McpClient client, string name) {
+        this.client = client;
+        this.name = name == null ? "" : name;
+    }
+
+    // 远端工具名。
+    public string Name() { return this.name; }
+
+    // 工具实现：吃一份参数 JSON，吐一份结果文本。
+    //
+    // 远端报"这个工具失败"时也走这里——回一条 "error: ..." 文本，
+    // 不抛异常。模型看到错误会自己纠正（换个参数重试）；看不到的话
+    // 它只会以为自己已经查过了，然后编一个答案。
+    //
+    // **这个版本不区分成功与失败**（注册表看到的是一次成功调用）。要
+    // 让失败在注册表里也标成失败，用 `InvokeResult`。
+    public async string Invoke(JsonValue args) {
+        AiToolResult r = await this.InvokeResult(args);
+        if (r.isError) { return "error: " + r.content; }
+        return r.content;
+    }
+
+    // 工具实现（结果版）：**自己给出结果**。
+    //
+    // 远端失败时返回 `isError` 为 true 的结果，内容是**远端给的原因**
+    // ——不是一句"工具执行失败：<名字>"的泛化文案。模型看到具体原因
+    // 才能自己纠正。
+    public async AiToolResult InvokeResult(JsonValue args) {
+        if (this.client == null) {
+            return AiToolResult.Error("", "没有 MCP 客户端");
+        }
+        McpToolResult r = await this.client.CallTool(this.name, args);
+        if (r == null) {
+            return AiToolResult.Error("", this.client.lastError);
+        }
+        if (r.isError) {
+            return AiToolResult.Error("", r.text);
+        }
+        return AiToolResult.Ok("", r.text);
+    }
+}
+
+// 把远端 MCP 工具接进本地 `ToolRegistry` 的辅助入口。
+//
+// ## 这一步是"接进来"与"能跑起来"之间那一段
+//
+// MCP 工具在**远端**，模型要调的是**本地**注册表里的工具。中间这段
+// 翻译（远端 schema → 本地声明、本地调用 → 远端调用）就是本类做的。
+// 做完之后，模型完全不需要知道那些工具住在另一台机器上。
+public class McpTools {
+    // 拉远端工具并注册进注册表。返回新增了几条。
+    //
+    // prefix 非空时本地工具名 = prefix + 远端名——多个 MCP 服务端共用
+    // 一个注册表时**必须**加前缀，否则同名工具互相覆盖（后注册的顶掉
+    // 先注册的，用户以为装了两个服务端，其实只有一个的工具有效）。
+    //
+    // 远端工具的 `inputSchema` 直接当本地 `AiTool.parameters` 用：
+    // 两者是同一份 JSON Schema（只是字段名不同）。
+    //
+    // 远端没有工具 / 拉取失败都返回 0（原因在 `client.lastError`）。
+    public static async int RegisterAll(McpClient client, ToolRegistry registry,
+                                        string prefix) {
+        if (client == null || registry == null) { return 0; }
+        List<McpTool> tools = await client.ListTools();
+        if (tools == null) { return 0; }
+        int before = registry.Count();
+        for (int i = 0; i < tools.Count; i = i + 1) {
+            McpTool t = tools[i];
+            string local = t.name;
+            if (prefix != null && prefix.Length > 0) { local = prefix + t.name; }
+            AiTool decl = new AiTool(local, t.description, t.inputSchema);
+            McpToolBinding binding = new McpToolBinding(client, t.name);
+            // 用**结果版**注册：远端失败时结果里带的是**远端给的原因**，
+            // 注册表标成 isError，模型看到的是具体原因而不是泛化文案。
+            registry.RegisterResult(decl, binding.InvokeResult);
+        }
+        return registry.Count() - before;
+    }
+}

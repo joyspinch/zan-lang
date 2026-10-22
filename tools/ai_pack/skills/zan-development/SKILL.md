@@ -96,6 +96,31 @@ Without MCP the same index is a file: `knowledge/symbols.json` next to the SDK
   `object f = someDelegate;` followed by `f == null` crashes with an access
   violation. Keep delegates in typed fields (a named delegate type such as
   `public delegate object Factory();` works directly).
+* **A lambda cannot be async; an async delegate needs a method group**:
+  `async (JsonValue a) => {...}` does not even parse ("unexpected token
+  'async' in expression"). The supported form is a **named method +
+  method group**: `MyFn f = h.Handle;` where `Handle` is
+  `public async string Handle(JsonValue)` — it compiles and runs. The worst
+  trap is a **sync lambda assigned to an async delegate**: no error, but the
+  call **returns an empty string** (measured: `r3=` empty) — a silent
+  failure. Always use a named method for async delegates.
+* **String methods are compiler builtins, not stdlib code**: `Trim`,
+  `ToLower`, `ToUpper`, `StartsWith`, `EndsWith`, `Substring`, `IndexOf`,
+  `LastIndexOf`, `Split`, `Replace`, `Contains`, `Equals` live in the
+  compiler's builtin member table, not in the stdlib sources — grepping the
+  stdlib for them finds nothing, which does **not** mean they are missing.
+  (Same for the `StringBuilder`, `Task`, `Convert` and `Console` types.)
+* **`JsonValue.Get` / `At` may return null**: chaining `.Str(...)` straight
+  onto them is rejected ("'At' can return null; accessing 'Str' on its
+  result faults at runtime"). Store it, check for null, or use `?.`. When
+  writing parsing code, **wrap it in a null-safe field accessor** — a long
+  chain of `Get(...).Str(...)` produces dozens of compile errors.
+* **Cross-package namespaces need no manifest dependency**: compiling with
+  `--package-project <repo>` scans every `packages/*/src/`, so a cross-package
+  `using` resolves directly — nothing has to be declared in `zan.pkg`. A new
+  package only needs `packages/<Name>/src/<Ns>/...` plus a `zan.pkg`.
+* **`Convert.ToString` covers int/long/double/bool** (synthesized by the
+  compiler) — no need to hand-roll `"" + n`.
 * Never list attribute names with `*/` inside a `/* ... */` comment —
   `data-on-*/data-if` closes the comment mid-sentence and the rest becomes
   code (209 cascading errors). Separate with `、` or spaces.

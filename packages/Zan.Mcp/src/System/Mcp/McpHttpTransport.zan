@@ -1,0 +1,99 @@
+using System;
+using System.Net.External;
+using System.Net.Http;
+using System.Net.Http.Client;
+
+namespace System.Mcp;
+
+// MCP 的 HTTP 传输（Streamable HTTP 那一半：POST 一段 JSON-RPC）。
+//
+// ## 为什么只有 HTTP
+//
+// MCP 有两种传输：HTTP 与 stdio。stdio 传输要**起一个子进程**并读写
+// 它的 stdin/stdout——仓库里目前**没有进程 API**（`System.AppPath
+// .GetCurrentProcessId` 是唯一沾边的），起不来也读不了。所以客户端
+// 先落 HTTP；stdio 留到进程 API 落地后再补。协议层不受影响：传输
+// 是可插拔的，换一个 `McpTransportFn` 就行。
+//
+// ## 出网预算
+//
+// 与 `AiClient` 同一套纪律：连接/读/总超时都有限额，请求与响应有
+// 体积上限，**不重试**——`tools/call` 不是幂等的，重试可能把一个
+// 有副作用的工具执行两遍。本机端点放行（MCP 服务端通常跑在本机）。
+//
+// ## 鉴权
+//
+// 两种都发：`Authorization: Bearer <token>` 是标准写法，`X-Api-Key`
+// 是很多 MCP 网关的写法。服务端认哪个是服务端的事；两边都发最多是
+// 多一个头。token 为空就都不发（本地无鉴权的服务端）。
+public class McpHttpTransport {
+    private HttpClient http;
+    private string path;
+    private int connectMs;
+    private int readMs;
+    private int totalMs;
+
+    public McpHttpTransport(McpEndpoint ep, string token) {
+        this.connectMs = 10000;
+        this.readMs = 30000;
+        this.totalMs = 60000;
+        if (ep.Tls()) {
+            this.http = HttpClient.CreateHttps(ep.Host(), ep.Port());
+        } else {
+            this.http = new HttpClient(ep.Host(), ep.Port());
+        }
+        this.path = ep.RequestPath();
+        this.http.SetHeader("Content-Type", "application/json");
+        this.http.SetHeader("Accept", "application/json");
+        // 协议版本头：MCP 2025-06-18 要求握手之后的每个请求都带上它。
+        this.http.SetHeader("MCP-Protocol-Version", McpClient.ProtocolVersion());
+        if (token != null && token.Length > 0) {
+            this.http.SetHeader("Authorization", "Bearer " + token);
+            this.http.SetHeader("X-Api-Key", token);
+        }
+        this.ApplyPolicy(ep);
+    }
+
+    // 改超时（毫秒）。连接/读/总三个都要给。
+    //
+    // 改完要重新装一次 policy——`SetCallPolicy` 会重置武装中的总截止
+    // 时间，下一次请求按新的 total 重新算。
+    public void SetTimeouts(int connectMs, int readMs, int totalMs) {
+        this.connectMs = connectMs;
+        this.readMs = readMs;
+        this.totalMs = totalMs;
+        this.ApplyPolicy(null);
+    }
+
+    // 装出网预算。ep 非空时按端点决定要不要放行本机 http。
+    void ApplyPolicy(McpEndpoint ep) {
+        ExternalCallPolicy p = ExternalCallPolicy.Default()
+            .ConnectTimeout(this.connectMs)
+            .ReadTimeout(this.readMs)
+            .TotalTimeout(this.totalMs)
+            .RequestLimit(4 * 1024 * 1024)
+            .ResponseLimit(8 * 1024 * 1024)
+            .ErrorLimit(64 * 1024)
+            .Redirects(0)
+            .RetryNetwork(false)
+            .RetryAttempts(0);
+        if (ep != null && ep.Local()) { p.AllowLocalHttp(); }
+        this.http.SetCallPolicy(p);
+    }
+
+    // 发一次 JSON-RPC 请求。
+    //
+    // 传输层失败（连不上、超时）**抛异常**——`HttpClient` 就是这个
+    // 约定（`HttpRequestException`）。客户端那一层会兜住并转成
+    // `lastError`，不会让异常飞到调用方。
+    public async McpTransportResult Send(string requestJson) {
+        HttpResponse resp = await this.http.SendAsync("POST", this.path, requestJson);
+        return new McpTransportResult(resp.statusCode, resp.body);
+    }
+
+    // 关掉连接（关不掉 keep-alive 连接，池子里的连接会一直挂到进程
+    // 退出——服务端那边也是）。
+    public void Close() {
+        this.http.Close();
+    }
+}

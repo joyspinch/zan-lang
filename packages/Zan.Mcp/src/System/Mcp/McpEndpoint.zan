@@ -1,0 +1,103 @@
+using System;
+
+namespace System.Mcp;
+
+// MCP 服务地址：把 base URL 拆成 scheme/host/port/path。
+//
+// ## 为什么不直接用 `System.Ai.AiEndpoint`
+//
+// 那是对的，但**依赖方向不对**：`Zan.Mcp` 是协议层，不该为了拆一个
+// URL 就依赖整个 AI 栈（`Zan.Ai` 反过来要用 MCP 工具，那是另一个方
+// 向）。两份小解析器各管一段，比拉一条环依赖便宜。
+//
+// ## 为什么不带白名单
+//
+// 白名单是**出网策略**（谁允许连哪里），属于部署方的决定。本包只做
+// 解析；本地端点单独标出来，让传输层知道"这是本机服务"。
+public class McpEndpoint {
+    public string host;
+    public int port;
+    public string path;
+    public bool tls;
+
+    public McpEndpoint() {
+        this.host = "";
+        this.port = 0;
+        this.path = "";
+        this.tls = false;
+    }
+
+    public string Host() { return this.host; }
+    public int Port() { return this.port; }
+    public string Path() { return this.path; }
+    public bool Tls() { return this.tls; }
+
+    // 是否本机端点（127.0.0.1 / localhost / ::1）。MCP 服务端通常就跑
+    // 在本机，所以这条要认。
+    public bool Local() {
+        return this.host == "127.0.0.1" || this.host == "localhost"
+        || this.host == "::1";
+    }
+
+    // 请求路径：空路径补成 "/"（MCP 服务端的 JSON-RPC 入口在根）。
+    public string RequestPath() {
+        if (this.path.Length == 0) { return "/"; }
+        return this.path;
+    }
+
+    // 解析 base URL。失败返回 null。
+    //
+    // 失败的情形：没有 scheme、host 为空、路径里有 userinfo（@）或
+    // fragment（#）——后两者能骗过朴素的字符串拼接（把凭据或片段拼
+    // 进请求行）。
+    public static McpEndpoint Parse(string url) {
+        if (url == null) { return null; }
+        McpEndpoint e = new McpEndpoint();
+        string rest = url.Trim();
+        e.tls = true;
+        e.port = 443;
+        if (rest.StartsWith("https://")) {
+            rest = rest.Substring(8);
+        } else if (rest.StartsWith("http://")) {
+            rest = rest.Substring(7);
+            e.tls = false;
+            e.port = 80;
+        } else {
+            return null;
+        }
+        if (rest.IndexOf("#") >= 0) { return null; }
+        int slash = rest.IndexOf("/");
+        string hostPort = rest;
+        e.path = "";
+        if (slash >= 0) {
+            hostPort = rest.Substring(0, slash);
+            e.path = rest.Substring(slash);
+        }
+        while (e.path.Length > 0 && e.path.EndsWith("/")) {
+            e.path = e.path.Substring(0, e.path.Length - 1);
+        }
+        // userinfo（"user:pass@host"）不合法——凭据走请求头，不进 URL。
+        if (hostPort.IndexOf("@") >= 0) { return null; }
+        int colon = hostPort.IndexOf(":");
+        if (colon > 0) {
+            e.host = hostPort.Substring(0, colon);
+            e.port = McpEndpoint.ParsePort(hostPort.Substring(colon + 1), e.port);
+        } else {
+            e.host = hostPort;
+        }
+        if (e.host.Length == 0) { return null; }
+        return e;
+    }
+
+    // 端口解析：全数字才认，否则用默认值。
+    private static int ParsePort(string text, int dflt) {
+        if (text.Length == 0) { return dflt; }
+        for (int i = 0; i < text.Length; i = i + 1) {
+            int c = text[i] & 255;
+            if (c < 48 || c > 57) { return dflt; }
+        }
+        long p = text.ToInt64();
+        if (p < 1 || p > 65535) { return dflt; }
+        return (int)p;
+    }
+}

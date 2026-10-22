@@ -1,0 +1,391 @@
+using System;
+using System.Collections.Generic;
+using System.Json;
+
+namespace System.Mcp;
+
+// MCP（Model Context Protocol）客户端——说 JSON-RPC 2.0 的那一半。
+//
+// ## 这层在做什么
+//
+// MCP 是"让程序去用**别的程序**的工具"的一套约定：客户端握手，
+// 列出服务端有哪些工具与资源，然后按名字调用。这个类把这条链路
+// 走完了：
+//
+//   initialize（握手）→ notifications/initialized（告知就绪）
+//   → tools/list（有哪些工具）→ tools/call（调一个）
+//   → resources/list（有哪些资源）→ resources/read（读一个）
+//
+// ## 失败用返回值不用异常
+//
+// 与 `Zan.Ai` 的 `AiClient` 同一套约定：网络失败、服务端报错、响应
+// 坏了，一律返回 null（或 false / 空列表）并把原因写进 `lastError`。
+// MCP 服务端是**外部依赖**——连不上是常态，不是异常情况。
+//
+// ## 握手是**前置条件**
+//
+// 协议规定：客户端必须先 `initialize`，服务端回 `initialized` 通知
+// 之后才能发别的请求。所以除 `Initialize` 外的公开方法在没握手时
+// 直接失败（"还没有握手"），不偷偷把握手补上——那会让调用方看不出
+// 握手当初失败了。
+//
+// ## 一次一条请求
+//
+// 协议 2025-06-18 已经**取消了 JSON-RPC 批处理**，所以本客户端一次
+// 发一条请求、收一条响应，id 严格自增。
+public class McpClient : IDisposable {
+    // 传输（自建 HTTP 传输或调用方注入的）。
+    private McpTransportFn transport;
+
+    // 自建的 HTTP 传输（非 null 才由本客户端负责关）。
+    private McpHttpTransport http;
+
+    // 请求 id 计数器（自增，从 1 开始）。
+    private int nextId;
+
+    // 是否已完成握手。
+    private bool initialized;
+
+    // 客户端身份（握手上报给服务端）。
+    private string clientName;
+    private string clientVersion;
+
+    // 上一次失败的原因。
+    public string lastError;
+
+    // 握手拿到的服务端信息（没握手时是 null）。
+    public McpServerInfo serverInfo;
+
+    // 本客户端支持的协议版本。
+    public static string ProtocolVersion() { return "2025-06-18"; }
+
+    // 构造（走 HTTP 传输）。
+    //
+    // url 是服务端地址（`http://127.0.0.1:8080/mcp` 这样）；token 非空
+    // 时带鉴权头。地址不合法时构造成功但 `lastError` 有原因，握手
+    // 会失败——**构造器不抛异常**（调用方多半在一堆配置里拼这个地址，
+    // 让它抛会把整个启动流程打断）。
+    public McpClient(string url, string token) {
+        this.nextId = 1;
+        this.initialized = false;
+        this.clientName = "zan";
+        this.clientVersion = "1.0.0";
+        this.lastError = "";
+        this.serverInfo = null;
+        this.transport = null;
+        this.http = null;
+        McpEndpoint ep = McpEndpoint.Parse(url);
+        if (ep == null) {
+            this.lastError = "MCP 服务地址不合法: " + url;
+            return;
+        }
+        this.http = new McpHttpTransport(ep, token);
+        this.transport = this.http.Send;
+    }
+
+    // 构造（注入传输）。
+    //
+    // 这是**测试与自定义传输**的入口：协议逻辑（握手、枚举、错误语义）
+    // 不该只能拿真服务器验证。注入的传输**不由本客户端负责关**。
+    public McpClient(McpTransportFn transport) {
+        this.nextId = 1;
+        this.initialized = false;
+        this.clientName = "zan";
+        this.clientVersion = "1.0.0";
+        this.lastError = "";
+        this.serverInfo = null;
+        this.http = null;
+        this.transport = transport;
+        if (transport == null) {
+            this.lastError = "没有传输";
+        }
+    }
+
+    // 设置握手时上报的客户端身份（服务端会记在日志里）。
+    public void SetClientInfo(string name, string version) {
+        this.clientName = name == null ? "" : name;
+        this.clientVersion = version == null ? "" : version;
+    }
+
+    // 改超时（毫秒）。只对自建的 HTTP 传输有效。
+    public void SetTimeouts(int connectMs, int readMs, int totalMs) {
+        if (this.http == null) { return; }
+        this.http.SetTimeouts(connectMs, readMs, totalMs);
+    }
+
+    // 是否已握手。
+    public bool Initialized() { return this.initialized; }
+
+    // 关掉连接（只关自建的 HTTP 传输）。
+    public void Close() {
+        if (this.http != null) {
+            this.http.Close();
+        }
+    }
+
+    public void Dispose() { this.Close(); }
+
+    // ------------------------------------------------------------------
+    // 公开 API
+    // ------------------------------------------------------------------
+
+    // 握手：发 `initialize`，再发 `notifications/initialized` 通知。
+    //
+    // 成功返回 true（服务端信息在 `serverInfo`）；失败返回 false，原因
+    // 在 `lastError`。
+    public async bool Initialize() {
+        this.lastError = "";
+        this.initialized = false;
+        if (this.transport == null) {
+            if (this.lastError.Length == 0) { this.lastError = "没有传输"; }
+            return false;
+        }
+        JsonValue params = JsonValue.NewObject();
+        params.PutStr("protocolVersion", McpClient.ProtocolVersion());
+        params.Put("capabilities", JsonValue.NewObject());
+        JsonValue info = JsonValue.NewObject();
+        info.PutStr("name", this.clientName);
+        info.PutStr("version", this.clientVersion);
+        params.Put("clientInfo", info);
+
+        JsonValue result = await this.Request("initialize", params);
+        if (result == null) { return false; }
+        McpServerInfo info2 = McpServerInfo.FromResult(result);
+        if (info2 == null) {
+            this.lastError = "MCP 握手结果无法解析";
+            return false;
+        }
+        this.serverInfo = info2;
+        // `initialized` 是**通知**：没有 id，服务端回 202/空正文。
+        if (!await this.Notify("notifications/initialized", null)) { return false; }
+        this.initialized = true;
+        return true;
+    }
+
+    // 工具列表。失败返回 null（原因在 `lastError`）。
+    public async List<McpTool> ListTools() {
+        this.lastError = "";
+        if (!this.RequireInit()) { return null; }
+        JsonValue result = await this.Request("tools/list", null);
+        if (result == null) { return null; }
+        JsonValue arr = result.Get("tools");
+        if (arr == null || !arr.IsArray()) {
+            this.lastError = "tools/list 的结果里没有 tools 数组";
+            return null;
+        }
+        List<McpTool> outp = new List<McpTool>();
+        for (int i = 0; i < arr.Count(); i = i + 1) {
+            McpTool t = McpTool.FromJson(arr.At(i));
+            if (t != null) { outp.Add(t); }
+        }
+        return outp;
+    }
+
+    // 调一个远端工具。
+    //
+    // args 是参数对象（`null` 视为空对象）。成功返回结果；**远端报
+    // 的错也返回结果**（`isError` 为 true）——那是工具的失败，不是
+    // 调用的失败。传输失败/协议失败才返回 null。
+    public async McpToolResult CallTool(string name, JsonValue args) {
+        this.lastError = "";
+        if (!this.RequireInit()) { return null; }
+        if (name == null || name.Length == 0) {
+            this.lastError = "工具名不能为空";
+            return null;
+        }
+        JsonValue params = JsonValue.NewObject();
+        params.PutStr("name", name);
+        if (args == null) {
+            params.Put("arguments", JsonValue.NewObject());
+        } else {
+            params.Put("arguments", args);
+        }
+        JsonValue result = await this.Request("tools/call", params);
+        if (result == null) { return null; }
+        McpToolResult r = McpToolResult.FromResult(result);
+        if (r == null) {
+            this.lastError = "tools/call 的结果无法解析";
+            return null;
+        }
+        return r;
+    }
+
+    // 资源列表。失败返回 null。
+    public async List<McpResource> ListResources() {
+        this.lastError = "";
+        if (!this.RequireInit()) { return null; }
+        JsonValue result = await this.Request("resources/list", null);
+        if (result == null) { return null; }
+        JsonValue arr = result.Get("resources");
+        if (arr == null || !arr.IsArray()) {
+            this.lastError = "resources/list 的结果里没有 resources 数组";
+            return null;
+        }
+        List<McpResource> outp = new List<McpResource>();
+        for (int i = 0; i < arr.Count(); i = i + 1) {
+            McpResource r = McpResource.FromJson(arr.At(i));
+            if (r != null) { outp.Add(r); }
+        }
+        return outp;
+    }
+
+    // 读一个资源，返回文本内容。
+    //
+    // 服务端回的是 `contents` 数组（可能多项）。本方法取**第一项**的
+    // `text`；没有 `text` 就取 `blob`（base64 的二进制资源）。失败
+    // 返回 null（原因在 `lastError`）。
+    public async string ReadResource(string uri) {
+        this.lastError = "";
+        if (!this.RequireInit()) { return null; }
+        if (uri == null || uri.Length == 0) {
+            this.lastError = "资源 uri 不能为空";
+            return null;
+        }
+        JsonValue params = JsonValue.NewObject();
+        params.PutStr("uri", uri);
+        JsonValue result = await this.Request("resources/read", params);
+        if (result == null) { return null; }
+        JsonValue contents = result.Get("contents");
+        if (contents == null || !contents.IsArray() || contents.Count() == 0) {
+            this.lastError = "resources/read 的结果里没有 contents";
+            return null;
+        }
+        JsonValue first = contents.At(0);
+        if (first == null || !first.IsObject()) {
+            this.lastError = "resources/read 的 contents 项不是对象";
+            return null;
+        }
+        string text = first.Str("text", "");
+        if (text.Length == 0) {
+            text = first.Str("blob", "");
+        }
+        return text;
+    }
+
+    // ping：连通性探针。成功返回 true。
+    public async bool Ping() {
+        this.lastError = "";
+        if (!this.RequireInit()) { return false; }
+        JsonValue result = await this.Request("ping", null);
+        return result != null;
+    }
+
+    // ------------------------------------------------------------------
+    // 内部：JSON-RPC
+    // ------------------------------------------------------------------
+
+    // 没握手就失败。返回 false 表示"没资格发这个请求"。
+    bool RequireInit() {
+        if (this.initialized) { return true; }
+        if (this.lastError.Length == 0) {
+            this.lastError = "还没有握手";
+        }
+        return false;
+    }
+
+    // 发一条带 id 的请求，返回 `result`。失败返回 null。
+    async JsonValue Request(string method, JsonValue params) {
+        int id = this.nextId;
+        this.nextId = id + 1;
+        JsonValue req = JsonValue.NewObject();
+        req.PutStr("jsonrpc", "2.0");
+        req.PutInt("id", id);
+        req.PutStr("method", method);
+        if (params != null) { req.Put("params", params); }
+
+        McpTransportResult resp = await this.Send(req);
+        if (resp == null) { return null; }
+        if (resp.status < 200 || resp.status >= 300) {
+            this.lastError = "MCP 服务返回 " + Convert.ToString(resp.status)
+                + McpClient.Snippet(resp.body);
+            return null;
+        }
+        string text = resp.body == null ? "" : resp.body.Trim();
+        if (text.Length == 0) {
+            this.lastError = "MCP 服务返回了空响应";
+            return null;
+        }
+        JsonValue doc = null;
+        try {
+            doc = JsonValue.Parse(text);
+        } catch (Exception e) {
+            this.lastError = "MCP 响应不是合法 JSON";
+            return null;
+        }
+        if (doc == null || !doc.IsObject()) {
+            this.lastError = "MCP 响应不是 JSON-RPC 对象";
+            return null;
+        }
+        // id 必须对上：串了号说明这个响应不是这次请求的（代理串了、
+        // 服务端有 bug）。宁可报错也不要拿一份对不上的结果当答案。
+        if (!McpClient.SameId(doc.Get("id"), id)) {
+            this.lastError = "MCP 响应的 id 对不上";
+            return null;
+        }
+        JsonValue err = doc.Get("error");
+        if (err != null && !err.IsNull()) {
+            this.lastError = "MCP 错误 " + Convert.ToString(err.Int("code", 0))
+                + "：" + err.Str("message", "未知错误");
+            return null;
+        }
+        JsonValue result = doc.Get("result");
+        if (result == null || result.IsNull()) {
+            this.lastError = "MCP 响应缺少 result";
+            return null;
+        }
+        return result;
+    }
+
+    // 发一条通知（**没有 id**）。服务端不回复内容，成功返回 true。
+    async bool Notify(string method, JsonValue params) {
+        JsonValue req = JsonValue.NewObject();
+        req.PutStr("jsonrpc", "2.0");
+        req.PutStr("method", method);
+        if (params != null) { req.Put("params", params); }
+        McpTransportResult resp = await this.Send(req);
+        if (resp == null) { return false; }
+        if (resp.status < 200 || resp.status >= 300) {
+            this.lastError = "MCP 服务返回 " + Convert.ToString(resp.status)
+                + McpClient.Snippet(resp.body);
+            return false;
+        }
+        return true;
+    }
+
+    // 把一段请求送出去。传输失败返回 null（原因写进 `lastError`）。
+    async McpTransportResult Send(JsonValue req) {
+        if (this.transport == null) {
+            if (this.lastError.Length == 0) { this.lastError = "没有传输"; }
+            return null;
+        }
+        McpTransportResult r = null;
+        try {
+            r = await this.transport(req.ToJson());
+        } catch (Exception e) {
+            this.lastError = "MCP 传输失败：" + e.Message;
+            return null;
+        }
+        if (r == null) {
+            this.lastError = "MCP 传输失败";
+            return null;
+        }
+        return r;
+    }
+
+    // 两个 id 是否同一个。数字按数值比，字符串按文本比。
+    static bool SameId(JsonValue got, int want) {
+        if (got == null || got.IsNull()) { return false; }
+        if (got.IsNumber()) { return got.AsLong(0 - 1) == want; }
+        if (got.IsString()) { return got.AsString("") == Convert.ToString(want); }
+        return false;
+    }
+
+    // 错误信息里带一小段正文（服务端常把原因写在正文里）。
+    static string Snippet(string body) {
+        if (body == null) { return ""; }
+        string t = body.Trim();
+        if (t.Length == 0) { return ""; }
+        if (t.Length > 200) { t = t.Substring(0, 200); }
+        return "：" + t;
+    }
+}

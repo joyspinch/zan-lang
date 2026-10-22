@@ -34,6 +34,19 @@ public async delegate string AiToolFn(JsonValue args);
 // 同步实现会停掉事件循环，把并发限制在 worker 数量上。
 public delegate string AiToolSyncFn(JsonValue args);
 
+// 工具实现：**直接给出结果**的那一版。
+//
+// ## 为什么要有第三版
+//
+// 前两版（异步 / 同步）都只能回一个**字符串**，"失败"只能用 null
+// 表示——于是 `Call` 只能给出一句**泛化文案**（"工具执行失败：<名字>"）。
+// 实现自己知道的具体原因（远端返回的错误正文、缺哪个参数）就丢了。
+// 模型看到泛化文案没法纠正，只能编一个答案。
+//
+// 这一版让实现**自己给出结果**：成功内容、是不是错误、错误的具体原因
+// 都由实现说了算，`Call` 只补上调用 id（实现不知道调用 id）。
+public async delegate AiToolResult AiToolResultFn(JsonValue args);
+
 // 一个工具的**实现**（声明 + 代码）。
 public class AiToolImpl {
     // 声明（发给服务方）。
@@ -45,16 +58,21 @@ public class AiToolImpl {
     // 实现（同步版）。两者只有一个非 null。
     public AiToolSyncFn syncFn;
 
+    // 实现（结果版）。三者只有一个非 null。
+    public AiToolResultFn resultFn;
+
     public AiToolImpl() {
         this.tool = null;
         this.fn = null;
         this.syncFn = null;
+        this.resultFn = null;
     }
 
     public AiToolImpl(AiTool tool, AiToolFn fn) {
         this.tool = tool;
         this.fn = fn;
         this.syncFn = null;
+        this.resultFn = null;
     }
 
     // 同步实现的构造器**另起一个名字**——不是重载：同名重载会先选中
@@ -66,6 +84,18 @@ public class AiToolImpl {
         impl.tool = tool;
         impl.fn = null;
         impl.syncFn = fn;
+        impl.resultFn = null;
+        return impl;
+    }
+
+    // 结果版的构造器，同样**另起一个名字**（理由同 ForSync：三个重载
+    // 的实参类型都是委托，同名重载会挑错那一个）。
+    public static AiToolImpl ForResult(AiTool tool, AiToolResultFn fn) {
+        AiToolImpl impl = new AiToolImpl();
+        impl.tool = tool;
+        impl.fn = null;
+        impl.syncFn = null;
+        impl.resultFn = fn;
         return impl;
     }
 
@@ -136,6 +166,27 @@ public class ToolRegistry {
         this.tools[tool.name] = AiToolImpl.ForSync(tool, fn);
     }
 
+    // 注册一个工具（**结果版**实现）。
+    //
+    // 什么时候用这个：实现**自己知道失败的具体原因**时（远端服务返回
+    // 的错误正文、缺哪个参数）。前两版只能回字符串，失败只能用 null
+    // 表示，于是 `Call` 只能给一句"工具执行失败：<名字>"的泛化文案，
+    // 具体原因丢了——模型看不到原因就只会编一个答案。
+    //
+    // 实现返回的结果里的 `id` 会被 `Call` 覆盖成调用 id（实现不知道
+    // 调用 id）。
+    public void RegisterResult(AiTool tool, AiToolResultFn fn) {
+        if (tool == null || tool.name == null || tool.name.Length == 0) {
+            this.lastError = "工具名不能为空";
+            return;
+        }
+        if (fn == null) {
+            this.lastError = "工具没有实现：" + tool.name;
+            return;
+        }
+        this.tools[tool.name] = AiToolImpl.ForResult(tool, fn);
+    }
+
     // 有没有这个工具。
     public bool Has(string name) {
         return name != null && this.tools.ContainsKey(name);
@@ -197,6 +248,18 @@ public class ToolRegistry {
             return AiToolResult.Error(call.id, this.lastError);
         }
         AiToolImpl impl = this.tools[call.name];
+        // 结果版：实现自己给结果（成功内容 / 是不是错 / 错的具体原因）。
+        if (impl.resultFn != null) {
+            AiToolResult r = await impl.resultFn(args);
+            if (r == null) {
+                this.lastError = "工具执行失败：" + call.name;
+                return AiToolResult.Error(call.id, this.lastError);
+            }
+            // 调用 id 由 `Call` 补（实现不知道调用 id）。
+            r.id = call.id;
+            if (r.isError) { this.lastError = r.content; }
+            return r;
+        }
         string outp = "";
         if (impl.syncFn != null) {
             outp = impl.syncFn(args);
