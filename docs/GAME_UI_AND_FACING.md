@@ -111,10 +111,35 @@
 - **`UseSkin` 必须在 `UseSkin("dark")` 之后**：否则被默认皮肤盖回去。
 - **皮肤目录必须与 exe 同级**：`build/<game>/skins/<game>/skin.css`，
   放 `assets/` 下不会被 `Skin.Roots` 找到（除非 exe 同级也有 `assets/skins/`）。
-- **九宫格与精灵表取帧走 `Canvas.BlitImage(key, dx, dy, dw, dh, sx, sy, sw, sh)`**：
-  **源矩形在最后**，`sw=0,sh=0` 表示整幅。key 用 `CDraw.BlitSource(c, path)` 换
-  内存键；`CDraw.BlitImage` 只能贴整幅（且自带视口映射），要裁源矩形得自己调
-  `Canvas.BlitImage` 并自己做视口映射——现成样板见
-  `voxel/client/src/VoxelPaint.zan` 的 `BlitSrc` / `NineSlice`。
+- **九宫格与精灵表取帧用 `CDraw.BlitImageSrc(c, path, dx, dy, dw, dh, sx, sy, sw, sh)`**：
+  **源矩形在最后**，`sw=0,sh=0` 表示整幅。目标矩形走视口映射、源矩形按源图像素
+  裁，两组坐标单位不同（最容易搞错）。底层是
+  `Canvas.BlitImage(key, dx, dy, dw, dh, sx, sy, sw, sh)`，key 用
+  `CDraw.BlitSource(c, path)` 换内存键。**别再各项目自己写一份 BlitSrc**——
+  `voxel/client/src/VoxelPaint.zan` 等三处旧样板应收敛到包里的这一个。
+- **`CDraw.BlitImageSrc` 是 2026-10-22 补进包的，此前该方法在本文件里从未
+  存在过**——属**包 API 缺失**，不是被并发会话删掉。取证命令（输出为空）：
+  ```
+  git log -S 'BlitImageSrc' 6b1ef3803^ -- packages/Zan.Game/src/Game/Kit/CDraw.zan
+  ```
+  若属"被删"，这条命令会命中删除它的那次提交。它此前只在**文档与 snake
+  模板**里当"用法说明"出现过（模板直接调它 → 模板编译不过），于是一批 worker
+  把一个不存在的函数当成真 API 抄了下去。
 - **精灵表取帧的源坐标是原图像素**，不是显示像素——帧宽按入库图的实际宽度算。
+- **视差背景用 `CKitBackdrop.Draw(c, path, dx, dy, dw, dh, offsetX, offsetY, coverPercent)`**：
+  背景图按 `coverPercent` 放大（125 = 放大到 125%，于是一定盖住视口），视口
+  窗口折算回源图像素（`sw = dw*100/pct`），相机偏移同样折算回源图像素后
+  **夹取**到 `[0, iw-sw]`——取景永远落在图内。一次 blit，不拼接，没有竖直接缝。
+  取景算术单独拆成纯函数 `CKitBackdrop.SourceRect(...)`，可被 conformance 逐值钉住。
+  素材缺失直接跳过不抛异常（矢量兜底由调用方铺底色负责）。
+- **`CKitBackdrop` 也是 2026-10-22 补进包的，此前从未存在过**——与
+  `CDraw.BlitImageSrc` 同源：`df6d0a642` 那次"共享美术层"把**怎么用**写进了
+  模板与技能，却没把**用什么**写进包。取证命令（输出为空）：
+  ```
+  git log --all -S 'CKitBackdrop' -- packages/
+  ```
+  后果是 platformer 模板编译不过（`unresolved call 'CKitBackdrop.Draw'`）。
+- **模板门禁要分清两个数**：`game-template check: N template(s), 0 finding(s)`
+  是**规则检查**（样式/规范违规），`templates=N failed=M` 才是**编译结果**——
+  只看前一个数会漏掉"模板引用了包里根本没有的 API"这类编译失败。
 - **旋转帧会让画布变脏**：旋转后要重新抠 alpha（旋转会带出黑边）。

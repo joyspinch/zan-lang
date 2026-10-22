@@ -1,0 +1,83 @@
+using System;
+using System.IO;
+using Gui;
+
+namespace Game.Kit;
+
+// 视差背景的 cover 取景（裁源，不拼接）。
+//
+// 为什么在包里补这一条：`df6d0a642` 那次"共享美术层"把**怎么用**写进了
+// 模板与技能——templates/game/platformer 直接调 `CKitBackdrop.Draw`，
+// game-dev 技能里也写着 `CDraw.BlitImageSrc / CKitBackdrop.Draw`——却没把
+// **用什么**写进包：这个类从未在 packages/ 里出现过
+// （`git log --all -S 'CKitBackdrop' -- packages/` 是空输出；连仓库对象
+// 库里那个不在 main 上的旧 commit 里也没有）。结果 platformer 模板编译
+// 不过：`unresolved call 'CKitBackdrop.Draw': 'CKitBackdrop' is not a known
+// variable, type, or namespace`。同一批提交还带出了 `CDraw.BlitImageSrc`
+// 的同类缺口（那是模板直接调的另一个不存在的方法）。
+//
+// 取景算法（与技能里"背景图放大到比视口宽后按相机偏移裁源"的描述一致）：
+//   1. 源图按 coverPercent 放大（125 = 放大到 125%），它因此一定盖住视口；
+//   2. 视口在放大后的图上看到的窗口，折算回**源图像素**是
+//      sw = dw*100/pct、sh = dh*100/pct；
+//   3. 相机偏移（视差系数由调用方自己乘好再传进来）同样折算回源图像素，
+//      再**夹取**到 [0, iw-sw] / [0, ih-sh]——取景永远落在图内；
+//   4. 把这块源矩形一次贴到目标矩形。一次 blit，不拼接，没有竖直接缝。
+//
+// 素材缺失：直接跳过，不抛异常——矢量兜底由调用方（先铺底色）负责，
+// 模板被拷到新项目后素材不一定在原位，游戏逻辑不该因为缺图就崩。
+public class CKitBackdrop {
+    // 纯函数：算出 cover 取景的源矩形（单位是**源图像素**）。
+    // 单独拆出来是为了能被 conformance 用例逐值钉住——取景算错时
+    // 从像素反推很费劲（背景本来就是渐变/纹理，肉眼分不出偏了几个像素）。
+    public static void SourceRect(int iw, int ih, int dw, int dh, int coverPercent,
+                                  int offsetX, int offsetY,
+                                  out int sx, out int sy, out int sw, out int sh) {
+        sx = 0; sy = 0; sw = 0; sh = 0;
+        if (iw <= 0 || ih <= 0 || dw <= 0 || dh <= 0) { return; }
+        int hundred = 100;
+        int pct = coverPercent;
+        if (pct <= 0) { pct = hundred; }
+        // 视口窗口折算回源图像素（放大倍率越大，看到的源像素越少）。
+        int winW = dw * hundred / pct;
+        int winH = dh * hundred / pct;
+        if (winW > iw) { winW = iw; }
+        if (winH > ih) { winH = ih; }
+        if (winW <= 0) { winW = iw; }
+        if (winH <= 0) { winH = ih; }
+        sw = winW;
+        sh = winH;
+        // 偏移折算回源图像素后夹取，保证取景落在图内。
+        int ox = offsetX * hundred / pct;
+        int oy = offsetY * hundred / pct;
+        int maxX = iw - sw;
+        int maxY = ih - sh;
+        sx = ox;
+        if (sx < 0) { sx = 0; }
+        if (sx > maxX) { sx = maxX; }
+        sy = oy;
+        if (sy < 0) { sy = 0; }
+        if (sy > maxY) { sy = maxY; }
+    }
+
+    // 画一张 cover 取景的背景。
+    // offsetX/offsetY 是**逻辑坐标**的相机偏移；视差系数由调用方乘好再传。
+    public static void Draw(Canvas c, string path, int dx, int dy, int dw, int dh,
+                            int offsetX, int offsetY, int coverPercent) {
+        if (c == null || path == null) { return; }
+        if (dw <= 0 || dh <= 0) { return; }
+        // 素材缺失：跳过（调用方铺矢量底兜底）。
+        if (!File.Exists(path)) { return; }
+        string src = CDraw.BlitSource(c, path);
+        if (src == null) { return; }
+        int iw = Canvas.ImageWidth(src);
+        int ih = Canvas.ImageHeight(src);
+        int sx; int sy; int sw; int sh;
+        CKitBackdrop.SourceRect(iw, ih, dw, dh, coverPercent, offsetX, offsetY,
+                                out sx, out sy, out sw, out sh);
+        if (sw <= 0 || sh <= 0) { return; }
+        c.BlitImage(src, CDraw.MapX(dx + CDraw.originX),
+                    CDraw.MapY(dy + CDraw.originY),
+                    CDraw.MapW(dw), CDraw.MapW(dh), sx, sy, sw, sh);
+    }
+}

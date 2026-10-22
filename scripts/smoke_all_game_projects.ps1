@@ -19,8 +19,9 @@ param(
         'platformer', 'powder', 'racekart', 'rail', 'voxel'),
     # zan-lang 仓库根（编译器与公共包在它下面）
     [string]$ZanHome = 'D:\project\zan-lang',
-    # 公共包解析根（默认 = zan-lang 仓库根；公共包正被并行改动时，
-    # 可指向一个干净的 git worktree，避免用半改动的包树编译）
+    # 公共包解析根（默认 = zan-lang 仓库根；公共包一律用主仓、只读）。
+    # 公共包正被并行改动时，把主仓的 packages/ **拷**一份到别处再指过去——
+    # 不要用 git worktree 副本：它与主仓天然漂移，公共包一改就落后。
     [string]$PackageProject = '',
     [switch]$Json
 )

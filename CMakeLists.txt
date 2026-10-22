@@ -2461,6 +2461,14 @@ foreach(_src ${_conf_srcs})
     # GUI 驱动参数要一起给（tail 形式：空 list 元素会被 zanc 当成空参数）。
     set(_extra_args
       "--embed;${CMAKE_SOURCE_DIR}/tests/conformance/game_cdraw_blit_src_assets=cdrawfx${_gui_driver_tail}")
+  elseif(_name STREQUAL "game_ckit_backdrop")
+    # 夹具是一张 4x4 PNG（四象限各一色），内嵌为 "ckitfx/src.png"：
+    # 盘上没有这个路径，用例走 File.ReadAllBytes 的内嵌兜底——File.Exists
+    # 也带内嵌兜底，所以"素材缺失就跳过"那条守卫不会误伤内嵌夹具。
+    # 同样必须排在 _needs_gui_driver 前面（elseif 链互斥，--embed 与 GUI
+    # 驱动参数要一起给）。
+    set(_extra_args
+      "--embed;${CMAKE_SOURCE_DIR}/tests/conformance/game_ckit_backdrop_assets=ckitfx${_gui_driver_tail}")
   elseif(_name STREQUAL "static_publish_tls_stub")
     # The case pins the Windows static-publish stub: DllImport libraries
     # (here ssl/crypto) that resolve to no archive and no shared DLL are
@@ -2674,6 +2682,10 @@ foreach(_src ${_conf_srcs})
     # 同 conformance 循环：夹具只经内嵌资源 API 存在，--embed 必须带上。
     set(_extra_args
       "--embed;${CMAKE_SOURCE_DIR}/tests/conformance/game_cdraw_blit_src_assets=cdrawfx")
+  elseif(_name STREQUAL "game_ckit_backdrop")
+    # 同 conformance 循环：夹具只经内嵌资源 API 存在，--embed 必须带上。
+    set(_extra_args
+      "--embed;${CMAKE_SOURCE_DIR}/tests/conformance/game_ckit_backdrop_assets=ckitfx")
   endif()
   add_test(NAME determinism_${_name}
     COMMAND ${CMAKE_COMMAND}
@@ -2793,6 +2805,11 @@ foreach(_src ${_conf_srcs})
     # _needs_gui_driver 前面——elseif 链互斥，--embed 与 GUI 驱动参数要一起给。
     set(_extra_args
       "--embed;${CMAKE_SOURCE_DIR}/tests/conformance/game_cdraw_blit_src_assets=cdrawfx${_gui_driver_tail}")
+  elseif(_name STREQUAL "game_ckit_backdrop")
+    # 同 conformance 循环：夹具只经内嵌资源 API 存在。这个分支必须排在
+    # _needs_gui_driver 前面——elseif 链互斥，--embed 与 GUI 驱动参数要一起给。
+    set(_extra_args
+      "--embed;${CMAKE_SOURCE_DIR}/tests/conformance/game_ckit_backdrop_assets=ckitfx${_gui_driver_tail}")
   elseif(_needs_gui_driver)
     set(_extra_args "${_gui_driver_args}")
   elseif(_name STREQUAL "arc_leak_site_label")
@@ -2875,6 +2892,11 @@ foreach(_src ${_conf_srcs})
     # _needs_gui_driver 前面——elseif 链互斥，--embed 与 GUI 驱动参数要一起给。
     set(_extra_args
       "--embed;${CMAKE_SOURCE_DIR}/tests/conformance/game_cdraw_blit_src_assets=cdrawfx${_gui_driver_tail}")
+  elseif(_name STREQUAL "game_ckit_backdrop")
+    # 同 conformance 循环：夹具只经内嵌资源 API 存在。这个分支必须排在
+    # _needs_gui_driver 前面——elseif 链互斥，--embed 与 GUI 驱动参数要一起给。
+    set(_extra_args
+      "--embed;${CMAKE_SOURCE_DIR}/tests/conformance/game_ckit_backdrop_assets=ckitfx${_gui_driver_tail}")
   elseif(_needs_gui_driver)
     set(_extra_args "${_gui_driver_args}")
   else()
