@@ -1237,7 +1237,41 @@ static int method_args_score(zan_irgen_t *g, zan_symbol_t *m,
             }
             continue;
         }
-        if (pt->kind == TYPE_INTERFACE) continue;
+        if (pt->kind == TYPE_INTERFACE) {
+            /* 接口形参的匹配判定：
+             *   - null 字面量：按"接不接得住 null"判（与 checker、concrete_arg_score
+             *     同一条规则 zan_null_arg_score）。
+             *   - 实参静态类型**也是接口** → 精确比对：同一个接口 = 精确匹配（+4）；
+             *     实参接口派生自形参接口 = 可赋值（+1）；毫无关系 = 不加分。
+             *   - 实参是**类** → 实现了该接口 = 可赋值（+1）；没实现就不加分，
+             *     但不判死（实现关系可能经由泛型实例化等路径看不出来，误杀代价大）。
+             *
+             * 踩过的坑：这里原来一律 0 分（continue），理由是"打分看不出实现
+             * 列表"。但"只靠接口类型区分"的一组重载于是**全部同分**，第一个永远
+             * 赢：`TransactionScope.Create(fsql)`（fsql 是 IZanSql）被发到
+             * `Create(IUnitOfWork)` 上——字段里装的是错类型，后面调用保存点方法
+             * 时才炸，错误消息完全指不到病根。 */
+            if (a && a->kind == AST_NULL_LITERAL) {
+                int ns = zan_null_arg_score(pt);
+                if (ns < 0) return -1;
+                score += ns;
+                continue;
+            }
+            zan_type_t *at = infer_expr_type(g, a, locals);
+            if (at && at->sym && pt->sym && pt->type_arg_count == 0 &&
+                at->type_arg_count == 0) {
+                if (at->kind == TYPE_INTERFACE) {
+                    if (at->sym == pt->sym) { score += 4; continue; }
+                    if (zan_binder_class_implements_iface(at->sym, pt->sym))
+                        score += 1;
+                    continue;
+                }
+                if (at->kind == TYPE_CLASS &&
+                    zan_binder_class_implements_iface(at->sym, pt->sym))
+                    score += 1;
+            }
+            continue;
+        }
         int s = concrete_arg_score(g, pt, a, locals);
         if (s < 0) return -1;
         score += s;
