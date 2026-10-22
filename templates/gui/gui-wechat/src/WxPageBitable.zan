@@ -1,0 +1,360 @@
+using System;
+using System.Collections.Generic;
+using System.Json;
+using System.Text;
+using Gui;
+using Gui.Component;
+using Gui.Component.DataTable;
+using Gui.Widget;
+
+/* 多维表格页：左栏是本租户的多维表格清单，右栏是选中表的记录网格。
+ *
+ * 数据源是服务端 /api/bitable 端点：表清单、列定义、行数据都是 JSON。
+ * 网格用标准库 DataGrid（DataTable 家族）：多维表格的列是运行期
+ * 才知道的动态列，因此列访问器按「列下标」取值——服务端把每行的
+ * 单元格摊平成一个与列一一对应的字符串数组（DataRow.cells），两端
+ * 靠下标对齐，不必再约定字段名。
+ *
+ * 页面范式与通知页一致：骨架在 WxPageBitable.html（运行期装载，
+ * 样式随装载并进 appCss）；代码建的控件（ListView / DataGrid）
+ * 不带文档作用域类，它们的规则在皮肤层（.wxbitrow/.wxbitgrid）。
+ *
+ * 写回：网格里直接改单元格 → CellEdit 事件拿到行列与新值 → 整行
+ * POST 回服务端（/api/bitable/record）；新增行/列走各自的端点。
+ * 行权限（谁能写哪张表）在服务端判定，客户端只在被拒时显示原因。
+ */
+public class WxPageBitable : Control {
+    ModelBinder binder;
+    App host;
+    ListView<WxBitableItem> list;
+    DataGrid<DataRow> grid;
+    Control title;
+    Control count;
+    Control foot;
+
+    // 表清单（左栏）与当前表的列/行（右侧网格）。
+    List<WxBitableItem> apps;
+    List<string> colNames;
+    List<string> recIds;
+    List<DataRow> rows;
+    string curId;
+
+    WxPageBitable() {
+        this.InitControl("wxPageBitable", 5);
+        this.Class = "wxmain";
+        apps = new List<WxBitableItem>();
+        colNames = new List<string>();
+        recIds = new List<string>();
+        rows = new List<DataRow>();
+        curId = "";
+    }
+
+    // 装载页面：运行期文档建树 → 挂两个原生控件 → 按名字接事件。
+    void Build(App app) {
+        host = app;
+        Control ui = app.LoadHtmlWith(WxPageBitableHtml.Doc, null, "");
+        if (ui == null) {
+            // 装载失败（声明层没装 / 文档为空）：给一棵空树，别把 null
+            // 挂进窗口——后面的 Find 全是空指针。
+            Console.WriteLine("WX_BITABLE: 多维表格页文档装载失败");
+            return;
+        }
+        ui.DockFill();
+        this.Add(ui);
+
+        // 左栏表清单（标准库 ListView；行模板是代码建的控件，样式在
+        // 皮肤层）。
+        Control listHost = ui.Find("BitableListHost");
+        if (listHost != null) {
+            list = new ListView<WxBitableItem>(WxBitableRow.Of);
+            list.Class = "wxlist grow";
+            list.Bind(apps);
+            list.OnSelect(() => { this.OpenApp(list.SelectedIndex()); });
+            listHost.Add(list);
+        }
+
+        // 右侧网格（标准库 DataGrid；外观规则在皮肤层）。
+        Control gridHost = ui.Find("BitableGridHost");
+        if (gridHost != null) {
+            grid = new DataGrid<DataRow>();
+            grid.Class = "wxbitgrid";
+            grid.RowNumbers(true).Striped(true).RowHeight(34);
+            grid.Bind(rows);
+            grid.OnCellEdit(() => { this.SaveCell(); });
+            gridHost.Add(grid);
+        }
+
+        title = ui.Find("BitableTitle");
+        count = ui.Find("BitableCount");
+        foot = ui.Find("BitableFoot");
+
+        binder = new ModelBinder();
+        binder.Handle("bitable-reload", () => { this.LoadApps(); });
+        binder.Handle("bitable-create", () => { this.CreateApp(); });
+        binder.Handle("bitable-addrow", () => { this.AddRow(); });
+        binder.Handle("bitable-addcol", () => { this.AddCol(); });
+        binder.SetRoot(ui, null);
+        binder.Wire();
+        ModelHosts.Register(app, binder);
+    }
+
+    // 进页重拉：多维表格是别人也会改的共享数据，进页就是最新的。
+    void OnShow() {
+        this.LoadApps();
+    }
+
+    // 拉表清单。
+    void LoadApps() {
+        if (!WxNet.LoggedIn()) { return; }
+        WxNetReq r = WxNet.NewReq();
+        WxNet.ApiGet(r, "/api/bitable/apps", () => {
+            try {
+                if (!WxNet.OkOf(r)) {
+                    this.Foot("加载失败：" + WxNet.ErrOf(r));
+                    return;
+                }
+                JsonValue d = WxNet.DataOf(r);
+                if (d == null) {
+                    this.Foot("加载失败：应答里没有数据");
+                    return;
+                }
+                apps.Clear();
+                JsonValue items = d.Get("items");
+                int n = items == null ? 0 : items.Count();
+                for (int i = 0; i < n; i = i + 1) {
+                    apps.Add(WxBitableItem.FromJson(items.At(i)));
+                }
+                if (list != null) { list.Bind(apps); }
+                this.Foot("共 " + Convert.ToString(n) + " 张表");
+                // 原来选中的表还在就接着显示（表可能被删了）。
+                if (this.FindApp(curId) != null) {
+                    this.OpenAppById(curId);
+                } else if (n > 0) {
+                    this.OpenApp(0);
+                }
+            } catch (Exception ex) { this.Foot(ex.Message); }
+        });
+    }
+
+    // 点左栏一行：拉那张表的列与行。
+    void OpenApp(int index) {
+        if (index < 0 || index >= apps.Count) { return; }
+        this.OpenAppById(apps[index].id);
+    }
+
+    void OpenAppById(string id) {
+        if (id == "") { return; }
+        curId = id;
+        WxNetReq r = WxNet.NewReq();
+        WxNet.ApiGet(r, "/api/bitable/app?id=" + Encoding.UrlEncode(id), () => {
+            try {
+                if (!WxNet.OkOf(r)) {
+                    this.Foot("打开失败：" + WxNet.ErrOf(r));
+                    return;
+                }
+                JsonValue d = WxNet.DataOf(r);
+                if (d == null) { this.Foot("打开失败：应答里没有数据"); return; }
+                this.ApplyTable(d);
+            } catch (Exception ex) { this.Foot(ex.Message); }
+        });
+    }
+
+    // 把服务端的表详情铺进网格：列定义 → 列，行 → DataRow.cells。
+    void ApplyTable(JsonValue d) {
+        colNames.Clear();
+        JsonValue fs = d.Get("fields");
+        int fn = fs == null ? 0 : fs.Count();
+        for (int i = 0; i < fn; i = i + 1) {
+            JsonValue f = fs.At(i);
+            if (f == null) { continue; }
+            colNames.Add(f.Str("name", "列" + Convert.ToString(i + 1)));
+        }
+        recIds.Clear();
+        rows.Clear();
+        JsonValue rec = d.Get("records");
+        JsonValue items = rec == null ? null : rec.Get("items");
+        int rn = items == null ? 0 : items.Count();
+        for (int i = 0; i < rn; i = i + 1) {
+            JsonValue it = items.At(i);
+            if (it == null) { continue; }
+            recIds.Add(it.Str("id", ""));
+            DataRow row = new DataRow();
+            JsonValue cells = it.Get("cells");
+            int cn = cells == null ? 0 : cells.Count();
+            for (int k = 0; k < colNames.Count; k = k + 1) {
+                string v = "";
+                if (k < cn) {
+                    JsonValue c = cells.At(k);
+                    if (c != null) { v = c.AsString(""); }
+                }
+                row.Push(v);
+            }
+            rows.Add(row);
+        }
+        this.BuildGrid();
+        JsonValue app = d.Get("app");
+        string name = app == null ? "" : app.Str("name", "");
+        if (title != null) { title.SetProp("text", name); }
+        if (count != null) {
+            count.SetProp("text", Convert.ToString(colNames.Count) + " 列 · "
+                + Convert.ToString(rows.Count) + " 行");
+        }
+        this.Foot("就绪");
+        this.Redraw();
+    }
+
+    // 重建网格的列（换表时列全变了）：清掉旧列描述再按新列铺一遍。
+    // descs 是引擎的列描述缓存——它按「数量相同就跳过」同步，列数
+    // 恰好没变而标题变了时会留着旧列，所以这里显式清空再 SyncDescs。
+    void BuildGrid() {
+        if (grid == null) { return; }
+        grid.gcols.Clear();
+        for (int i = 0; i < colNames.Count; i = i + 1) {
+            int idx = i;
+            string title = colNames[i];
+            GridText<DataRow> read = (DataRow r) => { return r.At(idx); };
+            grid.Col(title, 160, read);
+        }
+        grid.descs = new List<DataColumn>();
+        grid.SyncDescs();
+        grid.Bind(rows);
+        grid.st.dirty = true;
+    }
+
+    // 新增一行：整行空值交给服务端（列数由服务端校验）。
+    void AddRow() {
+        if (curId == "") { this.Foot("先选一张表"); return; }
+        List<string> empty = new List<string>();
+        for (int i = 0; i < colNames.Count; i = i + 1) { empty.Add(""); }
+        WxNetReq r = WxNet.NewReq();
+        WxNet.ApiPost(r, "/api/bitable/records",
+            "appId=" + Encoding.UrlEncode(curId)
+            + "&cells=" + Encoding.UrlEncode(WxPageBitable.CellsJson(empty)),
+            () => {
+                try {
+                    if (!WxNet.OkOf(r)) {
+                        this.Foot("新增失败：" + WxNet.ErrOf(r));
+                        return;
+                    }
+                    this.Foot("已新增一行");
+                    this.OpenAppById(curId);
+                } catch (Exception ex) { this.Foot(ex.Message); }
+            });
+    }
+
+    // 新增一列：默认文本列（列名按当前列数顺延）。
+    void AddCol() {
+        if (curId == "") { this.Foot("先选一张表"); return; }
+        string name = "新列 " + Convert.ToString(colNames.Count + 1);
+        WxNetReq r = WxNet.NewReq();
+        WxNet.ApiPost(r, "/api/bitable/fields",
+            "appId=" + Encoding.UrlEncode(curId)
+            + "&name=" + Encoding.UrlEncode(name)
+            + "&type=text&width=160", () => {
+                try {
+                    if (!WxNet.OkOf(r)) {
+                        this.Foot("新增列失败：" + WxNet.ErrOf(r));
+                        return;
+                    }
+                    this.Foot("已新增一列：" + name);
+                    this.OpenAppById(curId);
+                } catch (Exception ex) { this.Foot(ex.Message); }
+            });
+    }
+
+    // 新建一张表（默认名按现有张数顺延；改名/删表留给后续迭代）。
+    void CreateApp() {
+        string name = "新建表格 " + Convert.ToString(apps.Count + 1);
+        WxNetReq r = WxNet.NewReq();
+        WxNet.ApiPost(r, "/api/bitable/create",
+            "name=" + Encoding.UrlEncode(name) + "&icon=table", () => {
+                try {
+                    if (!WxNet.OkOf(r)) {
+                        this.Foot("新建失败：" + WxNet.ErrOf(r));
+                        return;
+                    }
+                    JsonValue d = WxNet.DataOf(r);
+                    string id = d == null ? "" : d.Str("id", "");
+                    this.Foot("已新建：" + name);
+                    this.LoadApps();
+                    if (id != "") { this.OpenAppById(id); }
+                } catch (Exception ex) { this.Foot(ex.Message); }
+            });
+    }
+
+    // 网格里改了单元格：把整行写回服务端（服务端按行覆盖）。
+    void SaveCell() {
+        if (grid == null) { return; }
+        DataTableState st = grid.State();
+        int r = st.EditRow();
+        int c = st.HitCol();
+        string v = st.EditValue();
+        if (r < 0 || r >= rows.Count || c < 0 || c >= colNames.Count) { return; }
+        string id = recIds[r];
+        if (id == "") { return; }
+        DataRow row = rows[r];
+        row.Set(c, v);
+        List<string> cells = new List<string>();
+        for (int i = 0; i < row.Count(); i = i + 1) { cells.Add(row.At(i)); }
+        WxNetReq req = WxNet.NewReq();
+        WxNet.ApiPost(req, "/api/bitable/record",
+            "id=" + Encoding.UrlEncode(id)
+            + "&cells=" + Encoding.UrlEncode(WxPageBitable.CellsJson(cells)),
+            () => {
+                try {
+                    if (!WxNet.OkOf(req)) {
+                        this.Foot("保存失败：" + WxNet.ErrOf(req));
+                        return;
+                    }
+                    this.Foot("已保存");
+                } catch (Exception ex) { this.Foot(ex.Message); }
+            });
+    }
+
+    // 找一张表（按 id）。
+    WxBitableItem FindApp(string id) {
+        if (id == "") { return null; }
+        for (int i = 0; i < apps.Count; i = i + 1) {
+            if (apps[i].id == id) { return apps[i]; }
+        }
+        return null;
+    }
+
+    // 单元格数组 → JSON 数组文本（服务端按 JSON 数组收）。
+    static string CellsJson(List<string> cells) {
+        StringBuilder b = new StringBuilder();
+        b.Append("[");
+        for (int i = 0; i < cells.Count; i = i + 1) {
+            if (i > 0) { b.Append(","); }
+            b.Append("\"");
+            b.Append(WxPageBitable.Escape(cells[i]));
+            b.Append("\"");
+        }
+        b.Append("]");
+        return b.ToString();
+    }
+
+    // JSON 字符串里的引号与反斜杠要转义，否则一行里有引号就整行废掉。
+    static string Escape(string s) {
+        if (s == null) { return ""; }
+        StringBuilder b = new StringBuilder();
+        for (int i = 0; i < s.Length; i = i + 1) {
+            string ch = s.Substring(i, 1);
+            if (ch == "\\" || ch == "\"") { b.Append("\\"); }
+            b.Append(ch);
+        }
+        return b.ToString();
+    }
+
+    // 状态行（错误/提示共用一行）。
+    void Foot(string msg) {
+        if (foot != null) { foot.SetProp("text", msg); }
+        this.Redraw();
+    }
+
+    void Redraw() {
+        if (host != null) { host.RequestRedraw(); }
+    }
+
+    override string Kind() { return "WxPageBitable"; }
+}

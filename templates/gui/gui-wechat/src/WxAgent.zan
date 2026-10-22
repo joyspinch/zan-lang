@@ -1,0 +1,247 @@
+using System;
+using System.Collections.Generic;
+using System.Json;
+using System.Text;
+using Gui;
+using Gui.Component;
+using Gui.Widget;
+
+/* 智能体页：左栏智能体清单，右栏与它的对话。
+ *
+ * 数据源是服务端 /api/agent/list 与 /api/agent/chat：模型与密钥都
+ * 在服务端（AI 助手的设置存在服务端，key 永不下发），客户端只发
+ * 问题、收回答——内部工具不该把模型凭据散到每台机器上。
+ *
+ * 对话区用标准库 ChatView（气泡模式，右我左助手），与聊天页同一件
+ * 组件；页骨架在 WxAgent.html（运行期装载），代码建的控件不带文档
+ * 作用域类，外观规则在皮肤层。
+ */
+public class WxAgent : Control {
+    ModelBinder binder;
+    App host;
+    ListView<WxAgentItem> list;
+    ChatView chat;
+    TextArea box;
+    Control title;
+    Control hint;
+    Control foot;
+
+    List<WxAgentItem> agents;
+    List<ChatMessage> msgs;
+    // 历史（每项是一条现成的 JSON 对象文本）：服务端按 role/content
+    // 收，客户端只保留最近 20 轮。
+    List<string> hist;
+    string cur;
+
+    WxAgent() {
+        this.InitControl("wxAgent", 5);
+        this.Class = "wxmain";
+        agents = new List<WxAgentItem>();
+        msgs = new List<ChatMessage>();
+        hist = new List<string>();
+        cur = "";
+    }
+
+    // 装载页面：运行期文档建树 → 挂清单与对话控件 → 按名字接事件。
+    void Build(App app) {
+        host = app;
+        Control ui = app.LoadHtmlWith(WxAgentHtml.Doc, null, "");
+        if (ui == null) {
+            // 装载失败（声明层没装 / 文档为空）：给一棵空树，别把 null
+            // 挂进窗口——后面的 Find 全是空指针。
+            Console.WriteLine("WX_AGENT: 智能体页文档装载失败");
+            return;
+        }
+        ui.DockFill();
+        this.Add(ui);
+
+        // 左栏清单（标准库 ListView；行模板是代码建的控件）。
+        Control listHost = ui.Find("AgentListHost");
+        if (listHost != null) {
+            list = new ListView<WxAgentItem>(WxAgentRow.Of);
+            list.Class = "wxlist grow";
+            list.Bind(agents);
+            list.OnSelect(() => { this.Pick(list.SelectedIndex()); });
+            listHost.Add(list);
+        }
+
+        // 对话区（标准库 ChatView，气泡模式）。
+        Control chatHost = ui.Find("AgentChatHost");
+        if (chatHost != null) {
+            chat = new ChatView();
+            chat.Class = "wxchat grow";
+            chat.WithStyle(ChatStyle.Bubble());
+            chat.WithBubbleWidth(620);
+            chatHost.Add(chat);
+            chat.Bind(msgs);
+        }
+
+        Control input = ui.Find("AgentInput");
+        if (input != null) { box = (TextArea)input; }
+        title = ui.Find("AgentTitle");
+        hint = ui.Find("AgentHint");
+        foot = ui.Find("AgentFoot");
+
+        binder = new ModelBinder();
+        binder.Handle("agent-reload", () => { this.LoadAgents(); });
+        binder.Handle("agent-send", () => { this.Send(); });
+        binder.SetRoot(ui, null);
+        binder.Wire();
+        ModelHosts.Register(app, binder);
+    }
+
+    // 进页重拉：智能体清单取决于服务端配置，可能刚被改过。
+    void OnShow() {
+        this.LoadAgents();
+    }
+
+    // 拉智能体清单。
+    void LoadAgents() {
+        if (!WxNet.LoggedIn()) { return; }
+        WxNetReq r = WxNet.NewReq();
+        WxNet.ApiGet(r, "/api/agent/list", () => {
+            try {
+                if (!WxNet.OkOf(r)) {
+                    this.Foot("加载失败：" + WxNet.ErrOf(r));
+                    return;
+                }
+                JsonValue d = WxNet.DataOf(r);
+                if (d == null) {
+                    this.Foot("加载失败：应答里没有数据");
+                    return;
+                }
+                agents.Clear();
+                JsonValue arr = d.Get("agents");
+                int n = arr == null ? 0 : arr.Count();
+                for (int i = 0; i < n; i = i + 1) {
+                    agents.Add(WxAgentItem.FromJson(arr.At(i)));
+                }
+                if (list != null) { list.Bind(agents); }
+                bool ready = d.Str("ready", "") == "true";
+                if (!ready) {
+                    this.Foot("服务端尚未配置 AI 助手（管理后台 → AI 助手）");
+                } else if (n == 0) {
+                    this.Foot("服务端没有可用的智能体");
+                } else {
+                    this.Foot("共 " + Convert.ToString(n) + " 个智能体");
+                }
+                // 原来选中的还在就接着用。
+                if (this.FindAgent(cur) != null) {
+                    this.PickAgent(cur);
+                } else if (n > 0) {
+                    this.Pick(0);
+                }
+            } catch (Exception ex) { this.Foot(ex.Message); }
+        });
+    }
+
+    // 点左栏一项：切智能体，清空上一段的对话（不同智能体不同上下文）。
+    void Pick(int index) {
+        if (index < 0 || index >= agents.Count) { return; }
+        this.PickAgent(agents[index].code);
+    }
+
+    void PickAgent(string code) {
+        if (code == "") { return; }
+        cur = code;
+        msgs.Clear();
+        hist.Clear();
+        if (chat != null) { chat.Bind(msgs); }
+        WxAgentItem it = this.FindAgent(code);
+        if (it != null) {
+            if (title != null) { title.SetProp("text", it.name); }
+            if (hint != null) { hint.SetProp("text", it.hint); }
+        }
+        this.Foot("就绪");
+        this.Redraw();
+    }
+
+    WxAgentItem FindAgent(string code) {
+        if (code == "") { return null; }
+        for (int i = 0; i < agents.Count; i = i + 1) {
+            if (agents[i].code == code) { return agents[i]; }
+        }
+        return null;
+    }
+
+    // 发送：问题 + 最近 20 轮历史 → 服务端 → 回答进对话区。
+    void Send() {
+        if (box == null) { return; }
+        string q = box.GetText();
+        if (q == null || q.Length == 0) { return; }
+        if (cur == "") { this.Foot("先选一个智能体"); return; }
+        // 历史要先取再把自己这句追加进去——服务端会自己补当前问题，
+        // 两边都补就成了同一句问两遍。
+        string past = this.HistoryJson();
+        box.SetText("");
+        this.Append("user", q);
+        WxNetReq r = WxNet.NewReq();
+        WxNet.ApiPost(r, "/api/agent/chat",
+            "agent=" + Encoding.UrlEncode(cur)
+            + "&q=" + Encoding.UrlEncode(q)
+            + "&history=" + Encoding.UrlEncode(past), () => {
+                try {
+                    if (!WxNet.OkOf(r)) {
+                        this.Foot("发送失败：" + WxNet.ErrOf(r));
+                        return;
+                    }
+                    JsonValue d = WxNet.DataOf(r);
+                    if (d == null) {
+                        this.Foot("发送失败：应答里没有数据");
+                        return;
+                    }
+                    string text = d.Str("text", "");
+                    if (text.Length == 0) { text = "（智能体没有回答）"; }
+                    this.Append("assistant", text);
+                    this.Foot("就绪");
+                } catch (Exception ex) { this.Foot(ex.Message); }
+            });
+    }
+
+    // 追加一条消息到对话区，并记进历史。
+    void Append(string role, string text) {
+        ChatMessage m = ChatMessage.Create(role, text);
+        msgs.Add(m);
+        if (chat != null) { chat.Bind(msgs); }
+        hist.Add("{\"role\":\"" + role + "\",\"content\":\""
+            + WxAgent.Escape(text) + "\"}");
+        while (hist.Count > 20) { hist.RemoveAt(0); }
+        this.Redraw();
+    }
+
+    // 历史 → JSON 数组文本（服务端按 role/content 收）。
+    string HistoryJson() {
+        StringBuilder b = new StringBuilder();
+        b.Append("[");
+        for (int i = 0; i < hist.Count; i = i + 1) {
+            if (i > 0) { b.Append(","); }
+            b.Append(hist[i]);
+        }
+        b.Append("]");
+        return b.ToString();
+    }
+
+    // JSON 字符串里的引号与反斜杠要转义。
+    static string Escape(string s) {
+        if (s == null) { return ""; }
+        StringBuilder b = new StringBuilder();
+        for (int i = 0; i < s.Length; i = i + 1) {
+            string ch = s.Substring(i, 1);
+            if (ch == "\\" || ch == "\"") { b.Append("\\"); }
+            b.Append(ch);
+        }
+        return b.ToString();
+    }
+
+    // 状态行（错误/提示共用一行）。
+    void Foot(string msg) {
+        if (foot != null) { foot.SetProp("text", msg); }
+        this.Redraw();
+    }
+
+    void Redraw() {
+        if (host != null) { host.RequestRedraw(); }
+    }
+
+    override string Kind() { return "WxAgent"; }
+}
