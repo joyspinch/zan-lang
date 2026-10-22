@@ -1040,3 +1040,33 @@
   后 win 变胖的根因）、A501。
 
 
+
+### [ ] A506 语言服务冷启动 11~13 秒——`initialize` 同步索引了整座包仓库
+
+- 现象（2026-10-22 修 IDE 崩溃时顺带测出）：IDE 打开工程后状态栏长时间停在
+  「语言服务：连接中」，实测冷启动 **10292 ms**，点重连再 **12260 ms**；
+  独立跑 `build\zan-lsp.exe` 走一次 initialize 应答要 **10803 ms**（默认
+  stdlib 11068 ms，热了再跑 11842 ms）。
+- 判据：把 `zan-lsp.exe` 单独复制到一个没有 `../stdlib`、没有 `../packages`
+  的空目录里，同样的握手只要 **5 ms**。差值全花在"索引"上，不是协议开销。
+- 根因（`src/lsp/lsp_main.c`）：
+  - `handle_initialize()`（:954）在应答 initialize **之前同步**调
+    `ensure_project_indexed(s)`（:1135）；
+  - `ensure_stdlib_indexed(s)`（:1108）调 `zan_pkg_all_source_roots(project_dir, ...)`
+    （`src/compiler/package.c:1427`），这个函数按 **zan-lsp.exe 所在目录**解析
+    包仓库——`build/../packages` 就是仓库的 `packages/`；
+  - 于是仓库里 **8491 个 .zan** 全被 `intel_index_project()`
+    （`src/lsp/intellisense.c:2911`）索引，只有 `Zan.Sdk.*` 被排除。
+    stdlib 才 167 个 .zan，约 2 秒；包仓库吃掉剩下 10.8 秒。
+- 已做的部分：IDE 侧握手预算本来就够（`d.waitBudget = 240` ×
+  `RecvTimeoutMs() = 250` = 60 秒），不是客户端超时问题；已把连接超时从
+  20 s 放宽到 60 s（按实测冷启动留 4 倍余量），并把实际耗时暴露成探针
+  字段 `lsp.connectMs`。
+- 方向（推荐）：**只索引工程实际依赖的包**——从工程文件/源码的 import 出发
+  推出依赖闭包，`zan_pkg_all_source_roots` 换成"按需解析"而不是"扫全仓库"，
+  启动快与补全不缺才能同时成立。备选：initialize 先应答、索引转后台并发
+  进度通知（要处理 C 端线程安全）；或持久化索引缓存（要处理失效判定）。
+- 关联：本轮已提交的 `feat(ide): 语言服务状态常驻状态栏`（把"连接中"如实
+  显示出来并给一键重连）。
+- 坑出处：探针的等待时长必须按被测服务端的**实测**耗时定——本轮最初按 10 s
+  等，真实冷启动 13 s，直接判成假失败。
