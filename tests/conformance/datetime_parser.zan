@@ -1,0 +1,173 @@
+// 宽松日期解析 + 模式格式化的 conformance。
+//
+// 覆盖：
+// - ISO 与数字日期的各种写法（- / . 分隔、一位或两位月日、基本格式、只有年、
+//   只有年月）；
+// - 时间（时:分、时:分:秒、毫秒），跟在日期后面或单独给；
+// - 时区换算（Z / +08:00 / -05:00）；
+// - 英文月名（三种顺序）；
+// - 中文年月日；
+// - 相对词（today / tomorrow / yesterday）；
+// - **歧义处的取法**：三段数字按月/日/年读，第一段大于 12 时按日/月/年读；
+//   两位年份按 POSIX 规则补世纪；
+// - 非法输入返回 null（TryParse）或抛错（Parse）；
+// - 模式串格式化与精确解析（含字面量与转义）。
+using System;
+using System.Globalization;
+
+class Program {
+    static int failures = 0;
+
+    static void Ok(bool cond, string name) {
+        if (cond) {
+            Console.WriteLine("ok " + name);
+        } else {
+            Console.WriteLine("FAIL " + name);
+            Program.failures = Program.failures + 1;
+        }
+    }
+
+    static void Eq(string got, string want, string name) {
+        if (got == want) {
+            Console.WriteLine("ok " + name);
+        } else {
+            Console.WriteLine("FAIL " + name + "（得到 \"" + got + "\"，期望 \"" + want + "\"）");
+            Program.failures = Program.failures + 1;
+        }
+    }
+
+    // 解析后的规范文本（"YYYY-MM-DD HH:MM:SS"）。
+    static string P(string text) {
+        DateTime d = DateParser.TryParse(text);
+        if (d == null) { return "(null)"; }
+        return d.ToString();
+    }
+
+    // 带毫秒的规范文本。
+    static string PM(string text) {
+        DateTime d = DateParser.TryParse(text);
+        if (d == null) { return "(null)"; }
+        return d.ToStringWithMillis();
+    }
+
+    static void Main() {
+        // ---- 1. ISO 与数字日期 ----
+        Eq(P("2024-01-02"), "2024-01-02 00:00:00", "ISO 日期");
+        Eq(P("2024/01/02"), "2024-01-02 00:00:00", "斜杠日期");
+        Eq(P("2024.01.02"), "2024-01-02 00:00:00", "点号日期");
+        Eq(P("2024-1-2"), "2024-01-02 00:00:00", "一位月日");
+        Eq(P("20240102"), "2024-01-02 00:00:00", "基本格式（无分隔）");
+        Eq(P("2024-01"), "2024-01-01 00:00:00", "只有年月 → 当月 1 号");
+        Eq(P("2024"), "2024-01-01 00:00:00", "只有年 → 1 月 1 号");
+        Eq(P("  2024-01-02  "), "2024-01-02 00:00:00", "两端空白被裁掉");
+
+        // ---- 2. 时间 ----
+        Eq(P("2024-01-02T15:04:05"), "2024-01-02 15:04:05", "ISO 的 T 分隔");
+        Eq(P("2024-01-02 15:04:05"), "2024-01-02 15:04:05", "空格分隔");
+        Eq(P("2024-01-02 15:04"), "2024-01-02 15:04:00", "只有时与分");
+        Eq(PM("2024-01-02 15:04:05.123"), "2024-01-02 15:04:05.123", "毫秒");
+        Eq(PM("2024-01-02 15:04:05.5"), "2024-01-02 15:04:05.500", "一位小数按毫秒补齐");
+        Eq(PM("2024-01-02 15:04:05.05"), "2024-01-02 15:04:05.050", "两位小数按毫秒补齐");
+
+        // ---- 3. 时区（统一换算成 UTC） ----
+        Eq(P("2024-01-02T15:04:05Z"), "2024-01-02 15:04:05", "Z 就是 UTC");
+        Eq(P("2024-01-02T15:04:05+08:00"), "2024-01-02 07:04:05", "东八区减 8 小时");
+        Eq(P("2024-01-02T15:04:05-05:00"), "2024-01-02 20:04:05", "西五区加 5 小时");
+        Eq(P("2024-01-02T15:04:05+0800"), "2024-01-02 07:04:05", "没有冒号的时区偏移");
+
+        // ---- 4. 英文月名 ----
+        Eq(P("Jan 2, 2024"), "2024-01-02 00:00:00", "月名在前");
+        Eq(P("2 Jan 2024"), "2024-01-02 00:00:00", "月名在中间");
+        Eq(P("January 2 2024"), "2024-01-02 00:00:00", "全称月名");
+        Eq(P("02-Jan-2024"), "2024-01-02 00:00:00", "短横线分隔的月名");
+        Eq(P("December 25, 2023"), "2023-12-25 00:00:00", "十二月");
+
+        // ---- 5. 中文 ----
+        Eq(P("2024年1月2日"), "2024-01-02 00:00:00", "中文年月日");
+        Eq(P("2024年1月2日 15:04:05"), "2024-01-02 15:04:05", "中文年月日加时间");
+        Eq(P("2024年12月31日"), "2024-12-31 00:00:00", "中文年末");
+
+        // ---- 6. 相对词 ----
+        DateTime now = DateTime.UtcNow();
+        string today = DateTime.FromDate(now.year, now.month, now.day).ToString();
+        Eq(P("today"), today, "today");
+        Eq(P("TODAY"), today, "大小写不敏感");
+        Eq(P("tomorrow"), DateTime.FromDate(now.year, now.month, now.day).AddDays(1).ToString(), "tomorrow");
+        Eq(P("yesterday"), DateTime.FromDate(now.year, now.month, now.day).AddDays(-1).ToString(), "yesterday");
+        Ok(DateParser.TryParse("now") != null, "now");
+
+        // ---- 7. 歧义处的取法 ----
+        Eq(P("01/02/2024"), "2024-01-02 00:00:00", "三段数字按月/日/年");
+        Eq(P("13/02/2024"), "2024-02-13 00:00:00", "第一段大于 12 时按日/月/年");
+        Eq(P("01/02/24"), "2024-01-02 00:00:00", "两位年份按 POSIX 规则补世纪");
+        Eq(P("01/02/99"), "1999-01-02 00:00:00", "99 → 19xx");
+
+        // ---- 8. 非法输入 ----
+        Ok(DateParser.TryParse(null) == null, "null → null");
+        Ok(DateParser.TryParse("") == null, "空串 → null");
+        Ok(DateParser.TryParse("   ") == null, "空白 → null");
+        Ok(DateParser.TryParse("not a date") == null, "乱文 → null");
+        Ok(DateParser.TryParse("2024-13-02") == null, "月份 13 → null");
+        Ok(DateParser.TryParse("2024-02-30") == null, "2 月 30 日 → null");
+        Ok(DateParser.TryParse("2023-02-29") == null, "平年 2 月 29 日 → null");
+        Ok(DateParser.TryParse("2024-01-02 25:00:00") == null, "小时 25 → null");
+        Ok(DateParser.TryParse("2024-01-02 10:70:00") == null, "分钟 70 → null");
+        bool threw = false;
+        try {
+            DateParser.Parse("not a date");
+        } catch (Exception e) {
+            threw = true;
+        }
+        Ok(threw, "Parse 遇到非法输入抛错");
+
+        // ---- 9. 只有时间 → 今天的日期 ----
+        DateTime t = DateParser.TryParse("15:04");
+        Ok(t != null && t.year == now.year && t.month == now.month && t.day == now.day &&
+           t.hour == 15 && t.minute == 4, "只有时间补今天的日期");
+
+        // ---- 10. 模式串格式化 ----
+        DateTime v = DateParser.Parse("2024-03-04 05:06:07");
+        Eq(DateParser.Format(v, "yyyy-MM-dd HH:mm:ss"), "2024-03-04 05:06:07", "完整模式");
+        Eq(DateParser.Format(v, "yy/M/d h:mm:ss tt"), "24/3/4 5:06:07 AM", "不补零 + 12 小时制");
+        Eq(DateParser.Format(v, "QQQ"), "QQQ", "未知的记号按字面量");
+        Eq(DateParser.Format(v, "yyyy年MM月dd日"), "2024年03月04日", "中文字面量");
+        Eq(DateParser.Format(v, "'y'yyyy"), "y2024", "单引号转义");
+        Eq(DateParser.Format(DateParser.Parse("2024-03-04 13:06:07"), "hh:mm tt"), "01:06 PM", "下午的 12 小时制");
+        Eq(DateParser.Format(DateParser.Parse("2024-03-04 00:06:07"), "hh:mm tt"), "12:06 AM", "午夜的 12 小时制");
+        Eq(DateParser.Format(DateParser.Parse("2024-03-04 05:06:07.250"), "HH:mm:ss.fff"), "05:06:07.250", "毫秒");
+
+        // ---- 11. 模式串精确解析 ----
+        DateTime e = DateParser.ParseExact("2024-03-04 05:06:07", "yyyy-MM-dd HH:mm:ss");
+        Eq(e.ToString(), "2024-03-04 05:06:07", "精确解析");
+        Ok(DateParser.TryParseExact("2024-03-04", "yyyy-MM-dd") != null, "只有日期的精确解析");
+        Ok(DateParser.TryParseExact("2024-03-04 05:06:07", "yyyy/MM/dd HH:mm:ss") == null, "分隔符不符 → null");
+        Ok(DateParser.TryParseExact("2024-03-04 05:06:07 extra", "yyyy-MM-dd HH:mm:ss") == null, "多出文本 → null");
+        Ok(DateParser.TryParseExact("24-03-04", "yyyy-MM-dd") == null, "位数不足 → null");
+        Ok(DateParser.TryParseExact("2024-13-04", "yyyy-MM-dd") == null, "非法月 → null");
+        bool threw2 = false;
+        try {
+            DateParser.ParseExact("2024-13-04", "yyyy-MM-dd");
+        } catch (Exception e2) {
+            threw2 = true;
+        }
+        Ok(threw2, "ParseExact 遇到非法输入抛错");
+
+        // ---- 12. 格式化与精确解析互为逆运算 ----
+        string[] patterns = new string[] {
+            "yyyy-MM-dd", "yyyy/MM/dd HH:mm:ss", "dd.MM.yyyy", "MM-dd-yyyy HH:mm:ss"
+        };
+        bool roundTrip = true;
+        for (int i = 0; i < patterns.Length; i = i + 1) {
+            // 模式里没有的字段（只有日期的模式不带时分）不比，只比模式承载的
+            // 那部分：再格式化一次，结果应当一模一样。
+            string s = DateParser.Format(v, patterns[i]);
+            DateTime back = DateParser.TryParseExact(s, patterns[i]);
+            if (back == null || DateParser.Format(back, patterns[i]) != s) {
+                roundTrip = false;
+            }
+        }
+        Ok(roundTrip, "四种模式往返一致");
+
+        Console.WriteLine("failures=" + Convert.ToString(Program.failures));
+    }
+}

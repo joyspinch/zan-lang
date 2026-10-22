@@ -1,0 +1,603 @@
+using System;
+
+namespace System.Globalization;
+
+// 宽松日期解析 + 模式格式化。
+//
+// ## 对应的 Python 能力
+//
+// - `dateutil.parser.parse` / `datetime.fromisoformat` 的宽松性 →
+//   <see cref="TryParse"/> / <see cref="Parse"/>
+// - `strftime` / `strptime` 的格式串 → <see cref="Format"/> /
+//   <see cref="ParseExact"/>
+//
+// ## 宽松解析认得的写法
+//
+// - ISO 与数字日期：`2024-01-02`、`2024/1/2`、`2024.01.02`、`20240102`、
+//   `2024-01`（月 1 号）、`2024`（1 月 1 号）；
+// - 时间：`15:04`、`15:04:05`、`15:04:05.123`，可跟在日期后面
+//   （空格或 `T` 分隔），也可以单独给（补今天的日期）；
+// - 时区：`Z`、`+08:00`、`-0500`（按 UTC 换算成 UTC 时刻）；
+// - 英文月名：`Jan 2, 2024`、`2 Jan 2024`、`January 2 2024`、
+//   `02-Jan-2024`；
+// - 中文：`2024年1月2日`、`2024年1月2日 15:04:05`；
+// - 相对词：`today`、`tomorrow`、`yesterday`、`now`（按当前 UTC 日期算）。
+//
+// ## 不猜的地方
+//
+// - 三段数字且第一段不是 4 位时，按**月/日/年**读（`01/02/2024` → 1 月 2 日），
+//   第一段大于 12 时改按**日/月/年**读（`13/02/2024` → 13 日 2 月）。这是
+//   dateutil 的口径；真的分不清时它也只给一个默认值。
+// - 两位年份按 POSIX 规则补世纪：`00..68` → 20xx，`69..99` → 19xx。
+// - 日期与时间都缺 → 解析失败（不猜"今天"）。只有时间时用今天的日期。
+//
+// ## 模式串（Format / ParseExact）
+//
+// | 记号 | 含义 |
+// |---|---|
+// | `yyyy` / `yy` | 四位年 / 两位年 |
+// | `MM` / `M` | 两位月 / 不补零的月 |
+// | `dd` / `d` | 两位日 / 不补零的日 |
+// | `HH` / `H` | 24 小时制的时 |
+// | `hh` / `h` | 12 小时制的时 |
+// | `mm` / `m` | 分 |
+// | `ss` / `s` | 秒 |
+// | `fff` | 毫秒 |
+// | `tt` | AM / PM |
+//
+// 大小写有区别：`MM` 是月、`mm` 是分（与 .NET 一致）。其余字符按字面量处理，
+// 单引号 `'` 转义下一个字符（`''` 是一个字面量单引号）。
+public class DateParser {
+    // ---- 宽松解析 ---------------------------------------------------
+
+    // 宽松解析日期文本；失败返回 null。
+    public static DateTime TryParse(string text) {
+        if (text == null) { return null; }
+        string s = text.Trim();
+        if (s.Length == 0) { return null; }
+        DateTime now = DateTime.UtcNow();
+
+        string low = s.ToLower();
+        if (low == "now") { return now; }
+        if (low == "today") { return DateTime.FromDate(now.year, now.month, now.day); }
+        if (low == "tomorrow") {
+            return DateTime.FromDate(now.year, now.month, now.day).AddDays(1);
+        }
+        if (low == "yesterday") {
+            return DateTime.FromDate(now.year, now.month, now.day).AddDays(-1);
+        }
+        return DateParser.ParseGeneral(s, now);
+    }
+
+    // 宽松解析日期文本；失败抛错。
+    public static DateTime Parse(string text) {
+        DateTime r = DateParser.TryParse(text);
+        if (r == null) {
+            throw new Exception("无法解析日期：" + (text == null ? "(null)" : text));
+        }
+        return r;
+    }
+
+    // 宽松解析的核心。now 提供"没有年份时用哪一年"与"只有时间时用哪一天"。
+    static DateTime ParseGeneral(string s, DateTime now) {
+        int n = s.Length;
+        int i = 0;
+
+        int year = 0; int month = 0; int day = 0;
+        bool haveYear = false; bool haveMonth = false; bool haveDay = false;
+        int hour = 0; int minute = 0; int second = 0; int ms = 0;
+        bool haveTime = false;
+        int offsetMinutes = 0; bool haveOffset = false;
+        bool pm = false; bool haveAmPm = false;
+
+        // 还没有角色的数字（最多三个：年/月/日）。
+        int nv1 = 0; int nd1 = 0;
+        int nv2 = 0; int nd2 = 0;
+        int nv3 = 0; int nd3 = 0;
+        int nums = 0;
+
+        while (i < n) {
+            int c = s[i] & 255;
+            if (c == 32 || c == 9) { i = i + 1; continue; }
+
+            if (c >= 48 && c <= 57) {
+                int v = 0; int digits = 0;
+                while (i < n) {
+                    int d = s[i] & 255;
+                    if (d < 48 || d > 57) { break; }
+                    v = v * 10 + (d - 48);
+                    digits = digits + 1;
+                    i = i + 1;
+                }
+                // 后面是 ':' → 这是时间的小时，后面继续读分秒。
+                if (i < n && (s[i] & 255) == 58) {
+                    hour = v;
+                    i = i + 1;
+                    int mv = 0; int md = 0;
+                    while (i < n) {
+                        int d = s[i] & 255;
+                        if (d < 48 || d > 57) { break; }
+                        mv = mv * 10 + (d - 48); md = md + 1; i = i + 1;
+                    }
+                    if (md == 0) { return null; }
+                    minute = mv;
+                    if (i < n && (s[i] & 255) == 58) {
+                        i = i + 1;
+                        int sv = 0; int sd = 0;
+                        while (i < n) {
+                            int d = s[i] & 255;
+                            if (d < 48 || d > 57) { break; }
+                            sv = sv * 10 + (d - 48); sd = sd + 1; i = i + 1;
+                        }
+                        if (sd == 0) { return null; }
+                        second = sv;
+                        if (i < n && (s[i] & 255) == 46) {
+                            i = i + 1;
+                            int f = 0; int fd = 0;
+                            while (i < n) {
+                                int d = s[i] & 255;
+                                if (d < 48 || d > 57) { break; }
+                                f = f * 10 + (d - 48); fd = fd + 1; i = i + 1;
+                                if (fd >= 3) { break; }
+                            }
+                            if (fd == 0) { return null; }
+                            while (fd < 3) { f = f * 10; fd = fd + 1; }
+                            ms = f;
+                        }
+                    }
+                    haveTime = true;
+                    continue;
+                }
+                // 后面是中文标记 → 角色确定。
+                int mark = DateParser.ChineseMarker(s, i);
+                if (mark == 1) { year = v; haveYear = true; i = i + 3; continue; }
+                if (mark == 2) { month = v; haveMonth = true; i = i + 3; continue; }
+                if (mark == 3) { day = v; haveDay = true; i = i + 3; continue; }
+                // 普通数字：按出现顺序存起来，等会儿按规则定角色。
+                if (nums == 0) { nv1 = v; nd1 = digits; }
+                else if (nums == 1) { nv2 = v; nd2 = digits; }
+                else if (nums == 2) { nv3 = v; nd3 = digits; }
+                nums = nums + 1;
+                continue;
+            }
+
+            if ((c >= 65 && c <= 90) || (c >= 97 && c <= 122)) {
+                int start = i;
+                while (i < n) {
+                    int d = s[i] & 255;
+                    if (!((d >= 65 && d <= 90) || (d >= 97 && d <= 122))) { break; }
+                    i = i + 1;
+                }
+                string word = s.Substring(start, i - start).ToLower();
+                int m = DateParser.MonthFromName(word);
+                if (m > 0) {
+                    month = m; haveMonth = true;
+                    continue;
+                }
+                if (word == "z") { offsetMinutes = 0; haveOffset = true; continue; }
+                if (word == "am") { haveAmPm = true; pm = false; continue; }
+                if (word == "pm") { haveAmPm = true; pm = true; continue; }
+                // 单个 'T'/'t' 是日期与时间之间的分隔符；其余字母不接受。
+                if (word == "t") { continue; }
+                return null;
+            }
+
+            // 时区符号（只在有时间部分时才是时区，否则是日期分隔符）。
+            if ((c == 43 || c == 45) && haveTime) {
+                int sign = c == 45 ? -1 : 1;
+                int oi = i + 1;
+                int ov = 0; int od = 0;
+                while (oi < n) {
+                    int d = s[oi] & 255;
+                    if (d < 48 || d > 57) { break; }
+                    ov = ov * 10 + (d - 48);
+                    od = od + 1;
+                    oi = oi + 1;
+                }
+                if (od == 0) { return null; }
+                int oh = 0; int om = 0;
+                if (oi < n && (s[oi] & 255) == 58) {
+                    oi = oi + 1;
+                    int mv = 0;
+                    while (oi < n) {
+                        int d = s[oi] & 255;
+                        if (d < 48 || d > 57) { break; }
+                        mv = mv * 10 + (d - 48);
+                        oi = oi + 1;
+                    }
+                    oh = ov; om = mv;
+                } else if (od == 4 || od == 3) {
+                    // 没有冒号：HHMM（或 HMM）。
+                    oh = ov / 100; om = ov % 100;
+                } else {
+                    oh = ov; om = 0;
+                }
+                offsetMinutes = sign * (oh * 60 + om);
+                haveOffset = true;
+                i = oi;
+                continue;
+            }
+
+            // 其余标点：日期分隔符（'-' '/' '.' ','）与中文标记之外的一律拒绝。
+            if (c == 45 || c == 47 || c == 46 || c == 44) { i = i + 1; continue; }
+            if (DateParser.ChineseMarker(s, i) > 0) { i = i + 3; continue; }
+            return null;
+        }
+
+        // ---- 给还没有角色的数字定角色 ----
+        if (!haveYear && !haveMonth && !haveDay) {
+            if (nums == 3) {
+                if (nd1 >= 4 || nv1 >= 1000) {
+                    // 第一段是年份：后面两段固定是月、日（ISO 顺序，不换位——
+                    // "2024-13-02" 的月就是 13，非法就判失败）。
+                    year = nv1; haveYear = true;
+                    month = nv2; day = nv3;
+                    haveMonth = true; haveDay = true;
+                } else {
+                    // 月/日/年（dateutil 口径）：第一段大于 12 时改读日/月/年。
+                    if (nv1 >= 1 && nv1 <= 12) { month = nv1; day = nv2; }
+                    else { day = nv1; month = nv2; }
+                    haveMonth = true; haveDay = true;
+                    if (nd3 >= 4 || nv3 >= 1000) { year = nv3; }
+                    else { year = DateParser.TwoDigitYear(nv3); }
+                    haveYear = true;
+                }
+            } else if (nums == 2) {
+                if (nd1 >= 4 || nv1 >= 1000) {
+                    year = nv1; haveYear = true;
+                    month = nv2; haveMonth = true;
+                    day = 1; haveDay = true;
+                } else {
+                    month = nv1; haveMonth = true;
+                    day = nv2; haveDay = true;
+                    year = now.year; haveYear = true;
+                }
+            } else if (nums == 1) {
+                if (nd1 == 8) {
+                    // 基本格式：YYYYMMDD。
+                    year = nv1 / 10000;
+                    month = (nv1 / 100) % 100;
+                    day = nv1 % 100;
+                    haveYear = true; haveMonth = true; haveDay = true;
+                } else if (nd1 == 6) {
+                    // 基本格式：YYYYMM。
+                    year = nv1 / 100;
+                    month = nv1 % 100;
+                    day = 1;
+                    haveYear = true; haveMonth = true; haveDay = true;
+                } else if (nd1 >= 4 || nv1 >= 1000) {
+                    year = nv1; haveYear = true;
+                    month = 1; haveMonth = true;
+                    day = 1; haveDay = true;
+                } else {
+                    return null;   // 光一个两位数：猜不出来
+                }
+            } else {
+                if (!haveTime) { return null; }
+                year = now.year; month = now.month; day = now.day;
+                haveYear = true; haveMonth = true; haveDay = true;
+            }
+        } else if (!haveMonth) {
+            // 年或日已知，月还没定：剩下的数字当月/日。
+            if (nums == 2) {
+                if (nv1 >= 1 && nv1 <= 12) { month = nv1; day = nv2; }
+                else { day = nv1; month = nv2; }
+                haveMonth = true; haveDay = true;
+            } else if (nums == 1) {
+                month = nv1; haveMonth = true;
+                if (!haveDay) { day = 1; haveDay = true; }
+            } else {
+                if (!haveDay) { day = 1; haveDay = true; }
+                if (!haveMonth) { return null; }
+            }
+            if (!haveYear) { year = now.year; haveYear = true; }
+        } else {
+            // 月已知（英文月名或中文月）：剩下的数字是日与年。
+            if (nums == 2) {
+                if (nd1 >= 4 || nv1 >= 1000) { year = nv1; day = nv2; }
+                else { day = nv1; year = nv2; }
+                haveYear = true; haveDay = true;
+            } else if (nums == 1) {
+                if (nd1 >= 4 || nv1 >= 1000) { year = nv1; day = 1; }
+                else { day = nv1; year = now.year; }
+                haveYear = true; haveDay = true;
+            } else {
+                if (!haveDay) { day = 1; haveDay = true; }
+                if (!haveYear) { year = now.year; haveYear = true; }
+            }
+        }
+
+        if (!haveYear || !haveMonth || !haveDay) { return null; }
+
+        // 12 小时制 + AM/PM。
+        if (haveAmPm) {
+            if (hour < 1 || hour > 12) { return null; }
+            if (pm) { if (hour != 12) { hour = hour + 12; } }
+            else { if (hour == 12) { hour = 0; } }
+        }
+
+        if (month < 1 || month > 12) { return null; }
+        if (day < 1 || day > DateTime.DaysInMonth(year, month)) { return null; }
+        if (hour < 0 || hour > 23) { return null; }
+        if (minute < 0 || minute > 59) { return null; }
+        if (second < 0 || second > 60) { return null; }
+
+        long e = DateTime.FromParts(year, month, day, hour, minute, second).epoch;
+        if (haveOffset) { e = e - (long)offsetMinutes * 60; }
+        return DateTime.FromUnixMilliseconds(e * 1000 + ms);
+    }
+
+    // 两位年份补世纪（POSIX 规则：00..68 → 20xx，69..99 → 19xx）。
+    public static int TwoDigitYear(int y) {
+        if (y < 0) { return 0; }
+        if (y < 69) { return 2000 + y; }
+        return 1900 + y;
+    }
+
+    // 英文月名 → 月份；不是月名返回 0。
+    public static int MonthFromName(string name) {
+        if (name == null) { return 0; }
+        string n = name.ToLower();
+        if (n == "jan" || n == "january") { return 1; }
+        if (n == "feb" || n == "february") { return 2; }
+        if (n == "mar" || n == "march") { return 3; }
+        if (n == "apr" || n == "april") { return 4; }
+        if (n == "may") { return 5; }
+        if (n == "jun" || n == "june") { return 6; }
+        if (n == "jul" || n == "july") { return 7; }
+        if (n == "aug" || n == "august") { return 8; }
+        if (n == "sep" || n == "sept" || n == "september") { return 9; }
+        if (n == "oct" || n == "october") { return 10; }
+        if (n == "nov" || n == "november") { return 11; }
+        if (n == "dec" || n == "december") { return 12; }
+        return 0;
+    }
+
+    // 中文标记：年(1) / 月(2) / 日(3)；不是则返回 0。
+    public static int ChineseMarker(string s, int i) {
+        if (s == null || i + 3 > s.Length) { return 0; }
+        int b0 = s[i] & 255;
+        int b1 = s[i + 1] & 255;
+        int b2 = s[i + 2] & 255;
+        if (b0 == 0xE5 && b1 == 0xB9 && b2 == 0xB4) { return 1; }  // 年
+        if (b0 == 0xE6 && b1 == 0x9C && b2 == 0x88) { return 2; }  // 月
+        if (b0 == 0xE6 && b1 == 0x97 && b2 == 0xA5) { return 3; }  // 日
+        return 0;
+    }
+
+    // ---- 模式格式化与精确解析 ---------------------------------------
+
+    // 按模式串格式化时刻。
+    public static string Format(DateTime value, string pattern) {
+        if (value == null) { return ""; }
+        if (pattern == null) { return ""; }
+        StringBuilder sb = new StringBuilder();
+        int n = pattern.Length;
+        int i = 0;
+        bool inQuote = false;
+        while (i < n) {
+            int c = pattern[i] & 255;
+            if (c == 39) {   // '\''：引号段（段内两个单引号 = 一个字面量单引号）
+                if (inQuote) {
+                    if (i + 1 < n && (pattern[i + 1] & 255) == 39) {
+                        sb.Append("'");
+                        i = i + 2;
+                        continue;
+                    }
+                    inQuote = false;
+                    i = i + 1;
+                    continue;
+                }
+                inQuote = true;
+                i = i + 1;
+                continue;
+            }
+            if (inQuote) {
+                sb.Append(pattern.Substring(i, 1));
+                i = i + 1;
+                continue;
+            }
+            int j = i + 1;
+            while (j < n && (pattern[j] & 255) == c) { j = j + 1; }
+            int len = j - i;
+            if (c == 121) {          // y
+                if (len >= 4) { sb.Append(DateParser.Pad4(value.year)); }
+                else { sb.Append(DateParser.Pad2(value.year % 100)); }
+            } else if (c == 77) {    // M 月
+                if (len >= 2) { sb.Append(DateParser.Pad2(value.month)); }
+                else { sb.Append(value.month); }
+            } else if (c == 100) {   // d 日
+                if (len >= 2) { sb.Append(DateParser.Pad2(value.day)); }
+                else { sb.Append(value.day); }
+            } else if (c == 72) {    // H 24 小时
+                if (len >= 2) { sb.Append(DateParser.Pad2(value.hour)); }
+                else { sb.Append(value.hour); }
+            } else if (c == 104) {   // h 12 小时
+                int h12 = value.hour % 12;
+                if (h12 == 0) { h12 = 12; }
+                if (len >= 2) { sb.Append(DateParser.Pad2(h12)); }
+                else { sb.Append(h12); }
+            } else if (c == 109) {   // m 分
+                if (len >= 2) { sb.Append(DateParser.Pad2(value.minute)); }
+                else { sb.Append(value.minute); }
+            } else if (c == 115) {   // s 秒
+                if (len >= 2) { sb.Append(DateParser.Pad2(value.second)); }
+                else { sb.Append(value.second); }
+            } else if (c == 102) {   // f 毫秒
+                if (len >= 3) { sb.Append(DateParser.Pad3(value.millisecond)); }
+                else { sb.Append(value.millisecond); }
+            } else if (c == 116) {   // t AM/PM
+                if (value.hour < 12) { sb.Append("AM"); } else { sb.Append("PM"); }
+            } else {
+                sb.Append(pattern.Substring(i, len));
+            }
+            i = j;
+        }
+        return sb.ToString();
+    }
+
+    // 按模式串精确解析；失败返回 null。
+    public static DateTime TryParseExact(string text, string pattern) {
+        if (text == null || pattern == null) { return null; }
+        int year = 0; int month = 1; int day = 1;
+        int hour = 0; int minute = 0; int second = 0; int ms = 0;
+        bool pm = false; bool haveAmPm = false;
+        bool haveDate = false;
+
+        int ti = 0; int tn = text.Length;
+        int pi = 0; int pn = pattern.Length;
+        bool inQuote = false;
+        while (pi < pn) {
+            int c = pattern[pi] & 255;
+            if (c == 39) {
+                if (inQuote) {
+                    if (pi + 1 < pn && (pattern[pi + 1] & 255) == 39) {
+                        if (ti >= tn || (text[ti] & 255) != 39) { return null; }
+                        ti = ti + 1;
+                        pi = pi + 2;
+                        continue;
+                    }
+                    inQuote = false;
+                    pi = pi + 1;
+                    continue;
+                }
+                inQuote = true;
+                pi = pi + 1;
+                continue;
+            }
+            if (inQuote) {
+                if (ti >= tn || (text[ti] & 255) != c) { return null; }
+                ti = ti + 1;
+                pi = pi + 1;
+                continue;
+            }
+            int pj = pi + 1;
+            while (pj < pn && (pattern[pj] & 255) == c) { pj = pj + 1; }
+            int len = pj - pi;
+            if (c == 121) {          // y
+                if (len >= 4) {
+                    int v = DateParser.ReadNum(text, ti, 4, tn);
+                    if (v < 0) { return null; }
+                    year = v; ti = ti + 4;
+                } else {
+                    int v = DateParser.ReadNum(text, ti, 2, tn);
+                    if (v < 0) { return null; }
+                    year = DateParser.TwoDigitYear(v); ti = ti + 2;
+                }
+                haveDate = true;
+            } else if (c == 77) {    // M
+                int w = len >= 2 ? 2 : 1;
+                int v = DateParser.ReadNum(text, ti, w, tn);
+                if (v < 0) { return null; }
+                month = v; ti = ti + w;
+                haveDate = true;
+            } else if (c == 100) {   // d
+                int w = len >= 2 ? 2 : 1;
+                int v = DateParser.ReadNum(text, ti, w, tn);
+                if (v < 0) { return null; }
+                day = v; ti = ti + w;
+                haveDate = true;
+            } else if (c == 72) {    // H
+                int w = len >= 2 ? 2 : 1;
+                int v = DateParser.ReadNum(text, ti, w, tn);
+                if (v < 0) { return null; }
+                hour = v; ti = ti + w;
+            } else if (c == 104) {   // h
+                int w = len >= 2 ? 2 : 1;
+                int v = DateParser.ReadNum(text, ti, w, tn);
+                if (v < 0) { return null; }
+                hour = v; ti = ti + w;
+            } else if (c == 109) {   // m 分
+                int w = len >= 2 ? 2 : 1;
+                int v = DateParser.ReadNum(text, ti, w, tn);
+                if (v < 0) { return null; }
+                minute = v; ti = ti + w;
+            } else if (c == 115) {   // s 秒
+                int w = len >= 2 ? 2 : 1;
+                int v = DateParser.ReadNum(text, ti, w, tn);
+                if (v < 0) { return null; }
+                second = v; ti = ti + w;
+            } else if (c == 102) {   // f 毫秒
+                int w = len >= 3 ? 3 : 1;
+                int v = DateParser.ReadNum(text, ti, w, tn);
+                if (v < 0) { return null; }
+                ms = v; ti = ti + w;
+            } else if (c == 116) {   // t AM/PM
+                if (ti + 2 > tn) { return null; }
+                string ap = text.Substring(ti, 2).ToUpper();
+                if (ap != "AM" && ap != "PM") { return null; }
+                pm = ap == "PM";
+                haveAmPm = true;
+                ti = ti + 2;
+            } else {
+                // 字面量：逐字符比对。
+                for (int k = 0; k < len; k = k + 1) {
+                    if (ti >= tn || (text[ti] & 255) != (pattern[pi + k] & 255)) { return null; }
+                    ti = ti + 1;
+                }
+            }
+            pi = pj;
+        }
+        if (ti != tn) { return null; }
+        if (!haveDate) { return null; }
+        if (haveAmPm) {
+            if (hour < 1 || hour > 12) { return null; }
+            if (pm) { if (hour != 12) { hour = hour + 12; } }
+            else { if (hour == 12) { hour = 0; } }
+        }
+        if (month < 1 || month > 12) { return null; }
+        if (day < 1 || day > DateTime.DaysInMonth(year, month)) { return null; }
+        if (hour < 0 || hour > 23) { return null; }
+        if (minute < 0 || minute > 59) { return null; }
+        if (second < 0 || second > 60) { return null; }
+        long e = DateTime.FromParts(year, month, day, hour, minute, second).epoch;
+        return DateTime.FromUnixMilliseconds(e * 1000 + ms);
+    }
+
+    // 按模式串精确解析；失败抛错。
+    public static DateTime ParseExact(string text, string pattern) {
+        DateTime r = DateParser.TryParseExact(text, pattern);
+        if (r == null) {
+            throw new Exception("无法按模式解析日期：" +
+                (text == null ? "(null)" : text) + " / " +
+                (pattern == null ? "(null)" : pattern));
+        }
+        return r;
+    }
+
+    // 读 count 位十进制数字；不是数字返回 -1。
+    static int ReadNum(string s, int at, int count, int n) {
+        if (at + count > n) { return -1; }
+        int v = 0;
+        for (int i = 0; i < count; i = i + 1) {
+            int c = s[at + i] & 255;
+            if (c < 48 || c > 57) { return -1; }
+            v = v * 10 + (c - 48);
+        }
+        return v;
+    }
+
+    // 补零到两位。
+    public static string Pad2(int v) {
+        if (v < 0) { return "0" + (0 - v); }
+        if (v < 10) { return "0" + v; }
+        return "" + v;
+    }
+
+    // 补零到三位。
+    public static string Pad3(int v) {
+        if (v < 0) { return "000"; }
+        if (v < 10) { return "00" + v; }
+        if (v < 100) { return "0" + v; }
+        return "" + v;
+    }
+
+    // 补零到四位。
+    public static string Pad4(int v) {
+        if (v < 0) { return "0000"; }
+        if (v < 10) { return "000" + v; }
+        if (v < 100) { return "00" + v; }
+        if (v < 1000) { return "0" + v; }
+        return "" + v;
+    }
+}
