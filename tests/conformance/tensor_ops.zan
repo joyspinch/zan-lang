@@ -1,0 +1,319 @@
+// 张量核心（Zan.Tensor）——形状、逐元素、矩阵乘、归一化/激活、结构操作，
+// 以及计算后端的调度路径。
+//
+// 数值期望值来自 numpy（float32）对照，本用例用 1e-4 容差比对；
+// 同时把算出来的值按 6 位小数写进 golden，数值本身也被钉住。
+using System;
+using System.Collections.Generic;
+using System.Tensor;
+
+// 假后端：用另一套循环序（m,n,p）算矩阵乘，并记录被调了几次，
+// 用来证明"登记的后端真的接管了矩阵乘"而不是碰巧算对。
+class FakeBackend : IComputeBackend {
+    public int calls;
+
+    public string Name() {
+        return "fake";
+    }
+
+    public bool IsAvailable() {
+        return true;
+    }
+
+    public void MatMul(Tensor a, Tensor b, Tensor res) {
+        this.calls = this.calls + 1;
+        int m = a.Dim(0);
+        int k = a.Dim(1);
+        int n = b.Dim(1);
+        for (int i = 0; i < m; i = i + 1) {
+            for (int j = 0; j < n; j = j + 1) {
+                float acc = 0.0f;
+                for (int p = 0; p < k; p = p + 1) {
+                    acc = acc + a.data[i * k + p] * b.data[p * n + j];
+                }
+                res.data[i * n + j] = acc;
+            }
+        }
+    }
+}
+
+// 不可用的后端：IsAvailable() 为假，调度必须回退到 CPU 参考实现。
+class OfflineBackend : IComputeBackend {
+    public int calls;
+
+    public string Name() {
+        return "offline";
+    }
+
+    public bool IsAvailable() {
+        return false;
+    }
+
+    public void MatMul(Tensor a, Tensor b, Tensor res) {
+        this.calls = this.calls + 1;
+    }
+}
+
+class Program {
+    static int failures = 0;
+
+    static void Ok(bool cond, string name) {
+        if (cond) {
+            Console.WriteLine("ok " + name);
+        } else {
+            Console.WriteLine("FAIL " + name);
+            Program.failures = Program.failures + 1;
+        }
+    }
+
+    // 数值断言：1e-4 容差，并把值按 6 位小数写进 golden。
+    static void Near(float actual, float expected, string name) {
+        float diff = actual - expected;
+        if (diff < 0.0f) { diff = -diff; }
+        if (diff < 0.0001f) {
+            Console.WriteLine("ok " + name + " = " + Program.Round6(actual));
+        } else {
+            Console.WriteLine("FAIL " + name + " expected=" + Convert.ToString((double)expected)
+                + " actual=" + Convert.ToString((double)actual));
+            Program.failures = Program.failures + 1;
+        }
+    }
+
+    // 保留 6 位小数。
+    static string Round6(float v) {
+        double scaled = (double)v * 1000000.0;
+        return Convert.ToString(Math.Round(scaled) / 1000000.0);
+    }
+
+    static List<int> Shape2(int a, int b) {
+        List<int> s = new List<int>();
+        s.Add(a);
+        s.Add(b);
+        return s;
+    }
+
+    static List<float> Floats(float[] vs) {
+        List<float> list = new List<float>();
+        for (int i = 0; i < vs.Length; i = i + 1) { list.Add(vs[i]); }
+        return list;
+    }
+
+    static Tensor Matrix2x3() {
+        return Tensor.FromList(Floats(new float[] { 1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f })).Reshape(Shape2(2, 3));
+    }
+
+    static Tensor Matrix3x2() {
+        return Tensor.FromList(Floats(new float[] { 1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f })).Reshape(Shape2(3, 2));
+    }
+
+    static void Main() {
+        // ---- 1. 构造与形状 ----
+        {
+            Tensor t = Tensor.Zeros(Shape2(2, 3));
+            Ok(t.Count() == 6, "零张量元素数");
+            Ok(t.Rank() == 2, "零张量维数");
+            Ok(t.Dim(0) == 2 && t.Dim(1) == 3, "零张量各维长度");
+            Ok(t.At(0) == 0.0f, "零张量初值为 0");
+
+            Tensor a = Matrix2x3();
+            Ok(a.Count() == 6, "构造后的元素数");
+            List<int> coord = new List<int>();
+            coord.Add(1);
+            coord.Add(2);
+            Ok(a.OffsetOf(coord) == 5, "多维下标换算成行主序下标");
+
+            Tensor copy = a.Clone();
+            copy.Set(0, 99.0f);
+            Ok(a.At(0) == 1.0f, "Clone 与原张量互不影响");
+            Ok(copy.At(0) == 99.0f, "Clone 的写入生效");
+
+            bool threw = false;
+            try {
+                Tensor bad = new Tensor(Shape2(2, 3), new float[5]);
+            } catch (Exception e) {
+                threw = true;
+            }
+            Ok(threw, "数据长度与形状不符时抛错");
+        }
+
+        // ---- 2. 逐元素 ----
+        {
+            Tensor x = Tensor.FromList(Floats(new float[] { 1.0f, 2.0f, 3.0f }));
+            Tensor y = Tensor.FromList(Floats(new float[] { 4.0f, 5.0f, 6.0f }));
+            Tensor sum = TensorMath.Add(x, y);
+            Near(sum.At(0), 5.0f, "逐元素加");
+            Near(TensorMath.Sub(y, x).At(2), 3.0f, "逐元素减");
+            Near(TensorMath.Mul(x, y).At(1), 10.0f, "逐元素乘");
+            Near(TensorMath.Div(y, x).At(2), 2.0f, "逐元素除");
+            Near(TensorMath.Scale(x, 3.0f).At(1), 6.0f, "逐元素乘标量");
+            Near(TensorMath.Neg(x).At(0), -1.0f, "逐元素取负");
+            Near(TensorMath.Clamp(x, 2.0f, 2.5f).At(0), 2.0f, "逐元素夹取下界");
+            Near(TensorMath.Clamp(x, 2.0f, 2.5f).At(2), 2.5f, "逐元素夹取上界");
+
+            Tensor acc = x.Clone();
+            TensorMath.AddInto(acc, y);
+            Near(acc.At(0), 5.0f, "原地累加");
+
+            bool threw = false;
+            try {
+                Tensor bad = TensorMath.Add(x, Matrix2x3());
+            } catch (Exception e) {
+                threw = true;
+            }
+            Ok(threw, "元素数不同的逐元素运算抛错");
+        }
+
+        // ---- 3. 矩阵运算 ----
+        {
+            Tensor a = Matrix2x3();
+            Tensor b = Matrix3x2();
+            Tensor c = TensorMath.MatMul(a, b);
+            Ok(c.Dim(0) == 2 && c.Dim(1) == 2, "矩阵乘的结果形状");
+            Near(c.At(0), 22.0f, "矩阵乘 [0,0]");
+            Near(c.At(1), 28.0f, "矩阵乘 [0,1]");
+            Near(c.At(2), 49.0f, "矩阵乘 [1,0]");
+            Near(c.At(3), 64.0f, "矩阵乘 [1,1]");
+
+            Tensor v = Tensor.FromList(Floats(new float[] { 1.0f, 2.0f, 3.0f }));
+            Tensor mv = TensorMath.MatVec(a, v);
+            Near(mv.At(0), 14.0f, "矩阵乘向量 [0]");
+            Near(mv.At(1), 32.0f, "矩阵乘向量 [1]");
+
+            Near(TensorMath.Dot(v, v), 14.0f, "一维点积");
+
+            // 右操作数转置：q[m,k] · k[n,k]ᵀ
+            Tensor q = Tensor.FromList(Floats(new float[] { 1.0f, 2.0f, 3.0f })).Reshape(Shape2(1, 3));
+            Tensor kk = Tensor.FromList(Floats(new float[] { 4.0f, 5.0f, 6.0f, 7.0f, 8.0f, 9.0f })).Reshape(Shape2(2, 3));
+            Tensor attn = TensorMath.MatMulRightTransposed(q, kk);
+            Ok(attn.Dim(0) == 1 && attn.Dim(1) == 2, "转置右乘的结果形状");
+            Near(attn.At(0), 32.0f, "转置右乘 [0,0]");
+            Near(attn.At(1), 50.0f, "转置右乘 [0,1]");
+
+            bool threw = false;
+            try {
+                Tensor bad = TensorMath.MatMul(a, a);
+            } catch (Exception e) {
+                threw = true;
+            }
+            Ok(threw, "内维不匹配的矩阵乘抛错");
+        }
+
+        // ---- 4. 归一化与激活 ----
+        {
+            Tensor x = Tensor.FromList(Floats(new float[] { 1.0f, 2.0f, 3.0f }));
+
+            Tensor sm = TensorMath.Softmax(x);
+            Near(sm.At(0), 0.090031f, "softmax [0]");
+            Near(sm.At(1), 0.244728f, "softmax [1]");
+            Near(sm.At(2), 0.665241f, "softmax [2]");
+
+            // 大数值不溢出（减去最大值后再取 exp）
+            Tensor big = Tensor.FromList(Floats(new float[] { 1000.0f, 1001.0f, 1002.0f }));
+            Tensor smb = TensorMath.Softmax(big);
+            Near(smb.At(0), 0.090031f, "大数值 softmax 不溢出 [0]");
+            Near(smb.At(2), 0.665241f, "大数值 softmax 不溢出 [2]");
+
+            // 因果 softmax：3x3，第 i 行只看前 i+1 个
+            Tensor scores = Tensor.FromList(Floats(new float[] {
+                1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f, 7.0f, 8.0f, 9.0f })).Reshape(Shape2(3, 3));
+            Tensor cs = TensorMath.SoftmaxCausal(scores);
+            Near(cs.At(0), 1.0f, "因果 softmax 第 0 行");
+            Near(cs.At(1), 0.0f, "因果 softmax 屏蔽未来位置");
+            Near(cs.At(3), 0.268941f, "因果 softmax 第 1 行");
+            Near(cs.At(4), 0.731059f, "因果 softmax 第 1 行末位");
+            Near(cs.At(8), 0.665241f, "因果 softmax 末行");
+
+            Tensor rms = TensorMath.RMSNorm(x, 0.000001f, null);
+            Near(rms.At(0), 0.462910f, "RMSNorm [0]");
+            Near(rms.At(2), 1.388730f, "RMSNorm [2]");
+
+            Tensor w = Tensor.FromList(Floats(new float[] { 1.0f, 2.0f, 3.0f }));
+            Tensor rmsw = TensorMath.RMSNorm(x, 0.000001f, w);
+            Near(rmsw.At(1), 1.851640f, "RMSNorm 带权重 [1]");
+            Near(rmsw.At(2), 4.166190f, "RMSNorm 带权重 [2]");
+
+            Tensor ln = TensorMath.LayerNorm(x, 0.000001f, null, null);
+            Near(ln.At(0), -1.224745f, "LayerNorm [0]");
+            Near(ln.At(1), 0.0f, "LayerNorm [1]");
+            Near(ln.At(2), 1.224745f, "LayerNorm [2]");
+
+            Tensor silu = TensorMath.SiLU(x);
+            Near(silu.At(0), 0.731059f, "SiLU [0]");
+            Near(silu.At(2), 2.857722f, "SiLU [2]");
+
+            Tensor gelu = TensorMath.GELU(x);
+            Near(gelu.At(0), 0.841192f, "GELU [0]");
+            Near(gelu.At(1), 1.954598f, "GELU [1]");
+            Near(gelu.At(2), 2.996363f, "GELU [2]");
+
+            Tensor gate = Tensor.FromList(Floats(new float[] { 0.5f, -1.0f, 2.0f }));
+            Tensor up = Tensor.FromList(Floats(new float[] { 2.0f, 3.0f, -1.0f }));
+            Tensor swiglu = TensorMath.SwiGLU(gate, up);
+            Near(swiglu.At(0), 0.622459f, "SwiGLU [0]");
+            Near(swiglu.At(1), -0.806824f, "SwiGLU [1]");
+            Near(swiglu.At(2), -1.761594f, "SwiGLU [2]");
+        }
+
+        // ---- 5. 结构操作 ----
+        {
+            Tensor a = Matrix2x3();
+            Tensor t = a.Transpose2D();
+            Ok(t.Dim(0) == 3 && t.Dim(1) == 2, "转置后的形状");
+            Near(t.At(0), 1.0f, "转置 [0,0]");
+            Near(t.At(1), 4.0f, "转置 [1,0]");
+            Near(t.At(3), 5.0f, "转置 [1,1]");
+
+            Tensor s = a.Slice(1, 1, 2);
+            Ok(s.Dim(0) == 2 && s.Dim(1) == 2, "切片的形状");
+            Near(s.At(0), 2.0f, "切片 [0,0]");
+            Near(s.At(3), 6.0f, "切片 [1,1]");
+
+            List<int> rows = new List<int>();
+            rows.Add(1);
+            rows.Add(0);
+            Tensor g = TensorMath.GatherRows(a, rows);
+            Ok(g.Dim(0) == 2 && g.Dim(1) == 3, "按行取表的形状");
+            Near(g.At(0), 4.0f, "按行取表 [0,0]");
+            Near(g.At(3), 1.0f, "按行取表 [1,0]");
+
+            Tensor c = TensorMath.ConcatRows(a, a);
+            Ok(c.Dim(0) == 4, "沿第 0 维拼接后的行数");
+            Near(c.At(6), 1.0f, "拼接后第二块的首元素");
+        }
+
+        // ---- 6. 归约 ----
+        {
+            Tensor x = Tensor.FromList(Floats(new float[] { 1.0f, 3.0f, 2.0f }));
+            Ok(TensorMath.ArgMax(x) == 1, "最大值下标");
+            List<int> top = TensorMath.TopK(x, 2);
+            Ok(top.Count == 2, "TopK 的个数");
+            Ok(top[0] == 1 && top[1] == 2, "TopK 的顺序");
+            Near(TensorMath.Sum(x), 6.0f, "元素和");
+            Near(TensorMath.Mean(x), 2.0f, "元素均值");
+        }
+
+        // ---- 7. 计算后端调度 ----
+        {
+            Ok(ComputeBackendRegistry.ActiveName() == "cpu", "默认走 CPU 参考实现");
+
+            FakeBackend fake = new FakeBackend();
+            ComputeBackendRegistry.Use(fake);
+            Ok(ComputeBackendRegistry.ActiveName() == "fake", "登记后端后生效");
+            Tensor c = TensorMath.MatMul(Matrix2x3(), Matrix3x2());
+            Ok(fake.calls == 1, "登记的后端接管了矩阵乘");
+            Near(c.At(0), 22.0f, "后端算出的矩阵乘结果一致");
+            Near(c.At(3), 64.0f, "后端算出的矩阵乘结果一致 [1,1]");
+
+            OfflineBackend off = new OfflineBackend();
+            ComputeBackendRegistry.Use(off);
+            Tensor c2 = TensorMath.MatMul(Matrix2x3(), Matrix3x2());
+            Ok(off.calls == 0, "不可用的后端不被调用");
+            Near(c2.At(0), 22.0f, "不可用时回退到 CPU 参考实现");
+
+            ComputeBackendRegistry.Clear();
+            Ok(ComputeBackendRegistry.ActiveName() == "cpu", "卸掉后端后回到 CPU");
+        }
+
+        Console.WriteLine("failures=" + Convert.ToString(Program.failures));
+    }
+}

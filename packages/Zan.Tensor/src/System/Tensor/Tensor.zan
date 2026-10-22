@@ -1,0 +1,209 @@
+using System;
+using System.Collections.Generic;
+using System.Text;
+
+namespace System.Tensor;
+
+// 多维张量：行主序（row-major）存储，最后一维连续。
+//
+// 存储统一用 f32（float[]）。权重在加载时从 f16 / bf16 / 量化格式转成 f32，
+// 换来的是算子实现与数值一致性上的简化（一份实现、一套语义）；存储精度
+// 的进一步优化（f16 存储 + 算子直读）留给后续，需要时按 dtype 分派。
+//
+// 形状约定：shape 的长度是维数，shape 的乘积是元素总数，空 shape（标量）
+// 的元素总数按 1 计。
+public class Tensor {
+    // 各维长度（第一维在最外层）。
+    public List<int> shape;
+    // 行主序数据，长度 = 元素总数。
+    public float[] data;
+
+    public Tensor(List<int> shape, float[] data) {
+        this.shape = new List<int>();
+        int total = 1;
+        if (shape != null) {
+            for (int i = 0; i < shape.Count; i = i + 1) {
+                int d = shape[i];
+                if (d < 0) { throw new ArgumentException("Tensor: negative dimension " + Convert.ToString(d)); }
+                this.shape.Add(d);
+                total = total * d;
+            }
+        }
+        if (data == null || data.Length != total) {
+            throw new ArgumentException("Tensor: data length " + Convert.ToString(data == null ? -1 : data.Length)
+                + " does not match shape product " + Convert.ToString(total));
+        }
+        this.data = data;
+    }
+
+    // 全零张量。
+    public static Tensor Zeros(List<int> shape) {
+        int total = 1;
+        if (shape != null) {
+            for (int i = 0; i < shape.Count; i = i + 1) { total = total * shape[i]; }
+        }
+        float[] buf = new float[total];
+        return new Tensor(shape, buf);
+    }
+
+    // 用已有数据构造张量（数据直接被引用，不复制）。
+    public static Tensor FromArray(float[] values, List<int> shape) {
+        return new Tensor(shape, values);
+    }
+
+    // 一维张量。
+    public static Tensor FromList(List<float> values) {
+        int n = values == null ? 0 : values.Count;
+        float[] buf = new float[n];
+        for (int i = 0; i < n; i = i + 1) { buf[i] = values[i]; }
+        List<int> shape = new List<int>();
+        shape.Add(n);
+        return new Tensor(shape, buf);
+    }
+
+    // 标量（0 维，元素数 1）。
+    public static Tensor Scalar(float v) {
+        float[] buf = new float[1];
+        buf[0] = v;
+        return new Tensor(new List<int>(), buf);
+    }
+
+    // 维数。
+    public int Rank() {
+        return this.shape.Count;
+    }
+
+    // 某一维的长度。
+    public int Dim(int axis) {
+        if (axis < 0 || axis >= this.shape.Count) {
+            throw new ArgumentException("Tensor: axis " + Convert.ToString(axis) + " res of range");
+        }
+        return this.shape[axis];
+    }
+
+    // 元素总数。
+    public int Count() {
+        return this.data.Length;
+    }
+
+    // 形状副本。
+    public List<int> Shape() {
+        List<int> copy = new List<int>();
+        for (int i = 0; i < this.shape.Count; i = i + 1) { copy.Add(this.shape[i]); }
+        return copy;
+    }
+
+    // 按行主序读元素。
+    public float At(int index) {
+        return this.data[index];
+    }
+
+    // 按行主序写元素。
+    public void Set(int index, float value) {
+        this.data[index] = value;
+    }
+
+    // 多维下标 → 行主序下标。idx 的长度要等于维数。
+    public int OffsetOf(List<int> idx) {
+        if (idx == null || idx.Count != this.shape.Count) {
+            throw new ArgumentException("Tensor: index rank does not match tensor rank");
+        }
+        int offset = 0;
+        int stride = 1;
+        for (int i = this.shape.Count - 1; i >= 0; i = i - 1) {
+            int k = idx[i];
+            if (k < 0 || k >= this.shape[i]) {
+                throw new ArgumentException("Tensor: index res of range at axis " + Convert.ToString(i));
+            }
+            offset = offset + k * stride;
+            stride = stride * this.shape[i];
+        }
+        return offset;
+    }
+
+    // 深拷贝。
+    public Tensor Clone() {
+        int n = this.data.Length;
+        float[] buf = new float[n];
+        for (int i = 0; i < n; i = i + 1) { buf[i] = this.data[i]; }
+        return new Tensor(this.Shape(), buf);
+    }
+
+    // 改形状：元素总数必须一致。**共享底层数据**（视图语义），
+    // 改一边另一边跟着变。
+    public Tensor Reshape(List<int> newShape) {
+        return new Tensor(newShape, this.data);
+    }
+
+    // 二维转置：返回新张量（拷贝），形状 (m,n) → (n,m)。
+    public Tensor Transpose2D() {
+        if (this.shape.Count != 2) {
+            throw new ArgumentException("Tensor.Transpose2D: rank " + Convert.ToString(this.shape.Count) + " != 2");
+        }
+        int m = this.shape[0];
+        int n = this.shape[1];
+        List<int> outShape = new List<int>();
+        outShape.Add(n);
+        outShape.Add(m);
+        float[] res = new float[m * n];
+        for (int i = 0; i < m; i = i + 1) {
+            for (int j = 0; j < n; j = j + 1) {
+                res[j * m + i] = this.data[i * n + j];
+            }
+        }
+        return new Tensor(outShape, res);
+    }
+
+    // 沿某一维切一段（拷贝）。start 允许为负（从末尾数）。
+    public Tensor Slice(int axis, int start, int len) {
+        if (axis < 0 || axis >= this.shape.Count) {
+            throw new ArgumentException("Tensor.Slice: axis res of range");
+        }
+        int dim = this.shape[axis];
+        if (start < 0) { start = start + dim; }
+        if (start < 0 || len < 0 || start + len > dim) {
+            throw new ArgumentException("Tensor.Slice: range res of bounds");
+        }
+        int outer = 1;
+        for (int i = 0; i < axis; i = i + 1) { outer = outer * this.shape[i]; }
+        int inner = 1;
+        for (int i = axis + 1; i < this.shape.Count; i = i + 1) { inner = inner * this.shape[i]; }
+        List<int> outShape = this.Shape();
+        outShape[axis] = len;
+        float[] res = new float[outer * len * inner];
+        for (int o = 0; o < outer; o = o + 1) {
+            int srcBase = o * dim * inner + start * inner;
+            int dstBase = o * len * inner;
+            for (int k = 0; k < len * inner; k = k + 1) {
+                res[dstBase + k] = this.data[srcBase + k];
+            }
+        }
+        return new Tensor(outShape, res);
+    }
+
+    // 可读摘要："shape[2,3] = [1, 2, 3, ...]"（元素多时截断）。
+    public string ToString() {
+        StringBuilder sb = new StringBuilder();
+        sb.Append("shape[");
+        for (int i = 0; i < this.shape.Count; i = i + 1) {
+            if (i > 0) { sb.Append(","); }
+            sb.Append(Convert.ToString(this.shape[i]));
+        }
+        sb.Append("] = [");
+        int n = this.data.Length;
+        int shown = n < 8 ? n : 8;
+        for (int i = 0; i < shown; i = i + 1) {
+            if (i > 0) { sb.Append(", "); }
+            sb.Append(Tensor.FormatFloat(this.data[i]));
+        }
+        if (shown < n) { sb.Append(", ..."); }
+        sb.Append("]");
+        return sb.ToString();
+    }
+
+    // 浮点格式化：保留 6 位小数并去掉多余的 0。
+    public static string FormatFloat(float v) {
+        string s = Convert.ToString((double)v);
+        return s;
+    }
+}

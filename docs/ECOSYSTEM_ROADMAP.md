@@ -1752,6 +1752,54 @@ conformance `game_render3d`（53 项断言，纯逻辑层）：相机（默认�
 剩下的一半（原生侧多光源 uniform、后处理 pass、Android/OHOS 的 GL 后端）
 依赖硬件路径，本机没有可对拍的环境，单开条目跟进，不混进纯逻辑交付里。
 
+### 1.31 推理后端：`Zan.Tensor`（本地推理的算子底座）
+
+C# 生态里这一层是 `System.Numerics.Tensors` 加上 ML.NET / TorchSharp 的底座：
+多维张量、矩阵乘、归一化、激活。本仓库实测**一个都没有**——`System.Numerics`
+只有 `Vector2/3/4` 与 `Matrix4x4`（定长向量与定长矩阵），没有可变长形状的张量；
+`Zan.Ai` 管的是**调用别人的模型**（OpenAI / Anthropic 协议那套），不涉及本地
+推理。所以"在本地跑一个 GGUF 模型"这件事在 Zan 里连第一步都缺：权重读不成
+张量，矩阵乘也没有地方算。
+
+**M1（本次落地）**：`packages/Zan.Tensor`（命名空间 `System.Tensor`），纯 Zan、
+零原生依赖：
+
+- `Tensor`：行主序 `float[]` + `List<int>` 形状；`Zeros` / `FromList` /
+  `FromArray` / `Scalar` / `OffsetOf` / `Clone` / `Reshape` / `Transpose2D` /
+  `Slice`。
+- `TensorMath`：逐元素（`Add` / `Sub` / `Mul` / `Div` / `Scale` / `Neg` /
+  `Clamp` / `AddInto`）· 矩阵乘（`MatMul` / `MatMulRightTransposed` / `MatVec` /
+  `Dot`）· 归一化与激活（`Softmax` / `SoftmaxCausal` / `RMSNorm` /
+  `LayerNorm` / `SiLU` / `GELU` / `SwiGLU`）· 结构（`GatherRows` /
+  `ConcatRows`）· 归约（`ArgMax` / `TopK` / `Sum` / `Mean`）。
+- `ComputeBackend`：后端契约 `IComputeBackend` + 登记处
+  `ComputeBackendRegistry`。
+
+**四条硬取舍**：
+
+1. **张量放包，不进 stdlib**。语言级闭包要改编译器与运行时，而张量是可选
+   能力——按 §0 的铁律进 `packages/`，`using System.Tensor;` 按需拉入。
+2. **存储统一 f32**。f16 / bf16 / 量化在**加载时**转成 f32，换来一份实现、
+   一套语义；存储精度优化（f16 存储 + 算子直读）留到真有显存压力时再做。
+3. **归一化与激活沿最后一维**（Transformer 的习惯）。
+4. **矩阵乘走登记的后端**，后端不可用时回退包内 CPU 参考实现——调用方不必
+   区分两条路径。
+
+conformance `tensor_ops`（82 项断言）：形状与下标换算 · 逐元素 · 矩阵乘与
+转置右乘 · softmax（含大数值不溢出）与因果遮蔽 · RMSNorm / LayerNorm ·
+三种激活 · 结构操作 · 归约 · **后端调度**（登记的后端真的接管了矩阵乘；
+不可用的后端不被调用且回退 CPU）。数值期望由 numpy（float32）对照，容差
+1e-4。
+
+**GPU compute：仓库里没有可用设施**。`zan_gui` / `zan_game` 是外部预编译的
+驱动（`src/runtime/` 里没有 D3D / Vulkan / Metal 代码），所以 M1 只落**契约 +
+调度路径 + CPU 参考实现**：原生 GPU 后端按平台另立里程碑（M5），算子不用改，
+后端挂上来即可。
+
+**后续里程碑**（按依赖顺序）：M2 权重读取（GGUF + safetensors 都读）·
+M3 采样器（temperature / top-p / top-k / repetition）· M4 推理引擎与本地
+OpenAI 兼容服务 · M5 GPU compute 原生后端。
+
 ---
 
 ---
