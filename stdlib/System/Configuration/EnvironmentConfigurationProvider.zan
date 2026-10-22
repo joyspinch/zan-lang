@@ -5,6 +5,15 @@ using System.Threading;
 namespace System.Configuration;
 
 // 环境变量配置提供程序，支持前缀过滤与分隔符映射（如 APP__DATABASE__PORT 映射为 Database:Port）。
+//
+// 命名约定：环境变量名 = 前缀 + "__" + 段（大写），段之间用 "__" 连接；
+// 配置键的段用 ':' 连接，两种分隔符等价。所以
+//   前缀 "APP" + 配置键 "Database:Port" → 环境变量 APP__DATABASE__PORT
+//   环境变量 APP__DATABASE__PORT         → 配置键 Database:Port
+// 前缀结尾的下划线会被规范化掉（"APP" / "APP_" / "APP__" 等价）。
+//
+// 已知限制：环境变量没有跨平台的枚举原语（stdlib 只有 getenv 点查），
+// 所以本 provider 只能按键点查，GetKeys() 不会列出环境里的键。
 public class EnvironmentConfigurationProvider : ConfigurationProvider {
     public string prefix;
 
@@ -12,7 +21,29 @@ public class EnvironmentConfigurationProvider : ConfigurationProvider {
         this.prefix = prefix != null ? prefix : "";
     }
 
+    // 点查：配置键 → 环境变量名 → 取环境变量值。
+    // 显式 Set 进来的内存值优先（环境变量不可写时也能覆盖）。
+    public override bool TryGet(string key, out string value) {
+        if (key == null) { value = null; return false; }
+        string canonical = ConfigurationKeys.Canonical(key);
+        if (canonical.Length == 0) { value = null; return false; }
+        if (this.data.ContainsKey(canonical)) {
+            value = this.data[canonical];
+            return true;
+        }
+        string envName = ConfigurationKeys.ToEnvironmentName(canonical, this.prefix);
+        string v = Environment.GetEnvironmentVariable(envName);
+        // 空串按"没设"处理：stdlib 的 EnvVar 对"未设置"也返回空串，
+        // 两者在这里无法区分。
+        if (v != null && v.Length > 0) {
+            value = v;
+            return true;
+        }
+        value = null;
+        return false;
+    }
+
+    // 环境变量无法跨平台枚举，保持现有配置（外部注入的值按需生效）。
     public override void Load() {
-        // 保持现有配置，若有外部注入按需生效
     }
 }

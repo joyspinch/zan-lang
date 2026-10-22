@@ -1,0 +1,109 @@
+using System;
+using System.Collections.Generic;
+using System.Text;
+
+namespace System.Configuration;
+
+// dotenv 风格的配置文件提供程序：一行一条 "KEY=VALUE"。
+//
+// 解析规则：
+//   - 空行与以 '#' 开头的行忽略；
+//   - 允许 "export " 前缀；
+//   - 值用双引号包裹时按转义展开（\n \t \r \\ \"），用单引号包裹时取字面量；
+//   - 未加引号的值去掉行尾注释（' #' 之后的部分，'#' 前必须有空白，
+//     这样 "a#b" 里的 '#' 不会被当成注释起点）；
+//   - 没有 '=' 的行忽略；
+//   - 键里的 '__' 与 ':' 等价，所以 "DATABASE__PORT" 与 "Database:Port"
+//     落到同一个配置键。
+public class EnvFileConfigurationProvider : ConfigurationProvider {
+    public string path;
+    public bool optional;
+
+    public EnvFileConfigurationProvider(string path) : base() {
+        this.path = path;
+        this.optional = false;
+    }
+
+    public EnvFileConfigurationProvider(string path, bool optional) : base() {
+        this.path = path;
+        this.optional = optional;
+    }
+
+    // 读文件并重建内容。文件不存在时：optional 为真则跳过，
+    // 否则抛 FileNotFoundException（配置缺文件是启动期错误，不该静默）。
+    public override void Load() {
+        if (this.path == null || this.path.Length == 0) { return; }
+        if (!File.Exists(this.path)) {
+            if (this.optional) { return; }
+            throw new FileNotFoundException("Configuration file not found: " + this.path);
+        }
+        string text = File.ReadAllText(this.path);
+        this.data.Clear();
+        List<string> lines = text.Split("\n");
+        for (int i = 0; i < lines.Count; i = i + 1) {
+            this.ParseLine(lines[i]);
+        }
+    }
+
+    // 解析一行 "KEY=VALUE"。
+    protected void ParseLine(string rawLine) {
+        string line = rawLine.Trim();
+        if (line.Length == 0) { return; }
+        if (line.StartsWith("#")) { return; }
+        if (line.StartsWith("export ")) { line = line.Substring(7).Trim(); }
+        int eq = line.IndexOf("=");
+        if (eq < 0) { return; }
+        string rawKey = line.Substring(0, eq).Trim();
+        if (rawKey.Length == 0) { return; }
+        string value = EnvFileConfigurationProvider.ParseValue(line.Substring(eq + 1).Trim());
+        this.Set(rawKey, value);
+    }
+
+    // 取值的字面形式：双引号解转义、单引号取字面量、其余去行尾注释。
+    public static string ParseValue(string raw) {
+        if (raw == null || raw.Length < 2) { return raw; }
+        string first = raw.Substring(0, 1);
+        string last = raw.Substring(raw.Length - 1, 1);
+        if (first == "\"" && last == "\"") {
+            return EnvFileConfigurationProvider.Unescape(raw.Substring(1, raw.Length - 2));
+        }
+        if (first == "'" && last == "'") {
+            return raw.Substring(1, raw.Length - 2);
+        }
+        return EnvFileConfigurationProvider.StripInlineComment(raw);
+    }
+
+    // 去掉未加引号值里的行尾注释：'#' 前有空白才算注释起点。
+    public static string StripInlineComment(string raw) {
+        int hash = -1;
+        for (int i = 1; i < raw.Length; i = i + 1) {
+            if ((raw[i] & 255) == 35) {     // '#'
+                int prev = raw[i - 1] & 255;
+                if (prev == 32 || prev == 9) { hash = i; break; }
+            }
+        }
+        if (hash < 0) { return raw; }
+        return raw.Substring(0, hash).Trim();
+    }
+
+    // 双引号里的转义展开：\n \t \r \\ \"，其余反斜杠原样保留。
+    public static string Unescape(string text) {
+        if (text == null) { return ""; }
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < text.Length; i = i + 1) {
+            int c = text[i] & 255;
+            if (c == 92 && i + 1 < text.Length) {      // 反斜杠
+                int n = text[i + 1] & 255;
+                if (n == 110) { sb.Append("\n"); i = i + 1; continue; }   // \n
+                if (n == 116) { sb.Append("\t"); i = i + 1; continue; }   // \t
+                if (n == 114) { sb.Append("\r"); i = i + 1; continue; }   // \r
+                if (n == 92) { sb.Append("\\"); i = i + 1; continue; }
+                if (n == 34) { sb.Append("\""); i = i + 1; continue; }
+                sb.Append("\\");
+                continue;
+            }
+            sb.Append(text.Substring(i, 1));
+        }
+        return sb.ToString();
+    }
+}

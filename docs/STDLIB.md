@@ -689,6 +689,69 @@ Windows: one readiness/completion reactor (`src/runtime/rt_io.c`) with `epoll`
 backends; `Socket.*Async` / `AsyncSocket` / `TcpClient` / `TcpListener` /
 `UdpClient` suspend on it. Lowering details: `docs/ASYNC_CPS_DESIGN.md`.
 
+### 3.8 System.Configuration — 配置 provider 体系
+
+`System.Configuration` lives in `stdlib/System/Configuration/`. A
+configuration is a **chain of providers**; the root reads them in reverse
+order (the **last added wins**) and every provider answers
+`TryGet(key) / Set(key, value) / Load() / GetKeys()`.
+
+**Key space (one rule for every source).** A key is a sequence of segments.
+`:` and `__` are equivalent separators, and each segment is normalized to
+"first letter upper case, the rest lower case":
+
+| written as | canonical |
+|---|---|
+| `database:port` | `Database:Port` |
+| `DATABASE__PORT` | `Database:Port` |
+| `Database:Port` | `Database:Port` |
+| `myKey` | `Mykey` |
+
+Canonicalization is idempotent and is applied on **both** write and read, so
+`Get("database:port")`, `Get("DATABASE__PORT")` and `Get("Database:Port")`
+all hit the same entry. `ConfigurationKeys.Canonical` / `ToEnvironmentName` /
+`FromEnvironmentName` expose the mapping.
+
+**Providers.**
+
+| provider | source |
+|---|---|
+| `MemoryConfigurationProvider` | an in-process dictionary (`AddInMemory` / `AddInMemoryValue`) |
+| `EnvironmentConfigurationProvider` | process environment variables |
+| `JsonFileConfigurationProvider` | a JSON file (`AddJsonFile`) |
+| `EnvFileConfigurationProvider` | a dotenv-style file (`AddEnvFile`) |
+
+**Environment variables.** The variable name is `prefix` + `__` + the
+upper-cased segments joined by `__`; a trailing `_` on the prefix is
+normalized away (`APP` / `APP_` / `APP__` are the same prefix). So with
+prefix `APP`, the key `Database:Port` reads `APP__DATABASE__PORT`, and
+`APP__DATABASE__PORT` maps back to `Database:Port`. Only prefixed variables
+are visible to a prefixed provider. Known limit: the standard library has
+no cross-platform way to *enumerate* environment variables (only `getenv`
+point lookups), so this provider answers by key only and `GetKeys()` does
+not list environment-backed keys.
+
+**JSON files.** The document is flattened into keys: objects become
+`Section:Key`, arrays become `Section:0`, `Section:1`, and scalars keep
+their text form (numbers as decimal text, booleans as `true`/`false`);
+`null` does not produce a key. `AddJsonFile(path, optional, rootSection)`
+puts every key of the file under `rootSection`.
+
+**dotenv files.** One `KEY=VALUE` per line; `#` comments, an optional
+`export ` prefix, double-quoted values with `\n`/`\t`/`\r`/`\\`/`\"`
+escapes, single-quoted values taken literally, and trailing comments
+(` # ...`) stripped from unquoted values. `__` in a key means a section
+separator, so `DATABASE__PORT=5432` is the key `Database:Port`.
+
+**Typed reads are strict.** `GetInt` / `GetLong` / `GetBool` parse the text
+themselves and fall back to the caller's default when the text is not a
+valid value — `Convert.ToInt32` is deliberately *not* used here, because it
+returns `0` for `"abc"` instead of failing, which would silently turn a
+typo in a config file into a zero.
+
+**Missing files.** A file provider throws `FileNotFoundException` when the
+file is missing unless it was added with `optional: true`.
+
 ## 4. Module Resolution Rules
 
 ### 4.1 Search Order

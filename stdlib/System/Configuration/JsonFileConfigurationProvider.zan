@@ -1,0 +1,89 @@
+using System;
+using System.Collections.Generic;
+using System.Json;
+
+namespace System.Configuration;
+
+// JSON 配置文件提供程序。
+//
+// 摊平规则：对象按层级摊成 "节:键"，数组摊成 "节:下标"，标量取其文本形式
+// （字符串原样、数字取十进制文本、布尔取 true/false、null 不落键）。
+// 于是
+//   {"Database": {"Port": 5432}, "Servers": ["a", "b"]}
+// 摊成 Database:Port / Servers:0 / Servers:1 三条配置。
+// rootSection 非空时，所有键都挂在该节下面（"App:Database:Port"）。
+public class JsonFileConfigurationProvider : ConfigurationProvider {
+    public string path;
+    public bool optional;
+    public string rootSection;
+
+    public JsonFileConfigurationProvider(string path) : base() {
+        this.path = path;
+        this.optional = false;
+        this.rootSection = "";
+    }
+
+    public JsonFileConfigurationProvider(string path, bool optional) : base() {
+        this.path = path;
+        this.optional = optional;
+        this.rootSection = "";
+    }
+
+    public JsonFileConfigurationProvider(string path, bool optional, string rootSection) : base() {
+        this.path = path;
+        this.optional = optional;
+        this.rootSection = rootSection != null ? rootSection : "";
+    }
+
+    // 读文件、解析 JSON、重建内容。文件缺失：optional 为真则跳过，
+    // 否则抛 FileNotFoundException；JSON 格式错误由 JsonValue.Parse 抛
+    // JsonException（配置写错是启动期错误，不该静默）。
+    public override void Load() {
+        if (this.path == null || this.path.Length == 0) { return; }
+        if (!File.Exists(this.path)) {
+            if (this.optional) { return; }
+            throw new FileNotFoundException("Configuration file not found: " + this.path);
+        }
+        string text = File.ReadAllText(this.path);
+        JsonValue root = JsonValue.Parse(text);
+        this.data.Clear();
+        string basePrefix = "";
+        if (this.rootSection != null && this.rootSection.Length > 0) {
+            basePrefix = ConfigurationKeys.Canonical(this.rootSection);
+        }
+        this.Flatten(basePrefix, root);
+    }
+
+    // 把 JSON 树摊平成配置键。
+    protected void Flatten(string prefix, JsonValue node) {
+        if (node == null) { return; }
+        if (node.IsObject()) {
+            for (int i = 0; i < node.Count(); i = i + 1) {
+                string child = prefix.Length > 0 ? prefix + ":" + node.KeyAt(i) : node.KeyAt(i);
+                this.Flatten(child, node.ValAt(i));
+            }
+            return;
+        }
+        if (node.IsArray()) {
+            for (int i = 0; i < node.Count(); i = i + 1) {
+                string idx = Convert.ToString(i);
+                string child = prefix.Length > 0 ? prefix + ":" + idx : idx;
+                this.Flatten(child, node.At(i));
+            }
+            return;
+        }
+        string text = JsonFileConfigurationProvider.ScalarText(node);
+        if (text == null) { return; }
+        this.Set(prefix, text);
+    }
+
+    // 标量取值：字符串原样、数字取十进制文本、布尔取 true/false；
+    // null（以及未知类别）返回 null，表示"这一项没有值"。
+    public static string ScalarText(JsonValue node) {
+        if (node == null) { return null; }
+        if (node.IsString()) { return node.strVal; }
+        if (node.IsNumber()) { return JsonValue.NumText(node); }
+        if (node.IsBool()) { return node.boolVal ? "true" : "false"; }
+        return null;
+    }
+}

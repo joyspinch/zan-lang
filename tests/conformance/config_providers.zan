@@ -1,0 +1,240 @@
+// 配置 provider 体系（System.Configuration）——键空间、环境变量映射、
+// 文件型 provider 与类型化取值。
+//
+// 覆盖：
+// - **键规范化**：':' 与 '__' 等价，大小写归一，于是 "database:port"、
+//   "DATABASE__PORT"、"Database:Port" 命中同一条配置。
+// - **环境变量映射**：前缀 + 分隔符（前缀 "APP" + 键 "Database:Port"
+//   → APP__DATABASE__PORT），前缀末尾的下划线会被规范化掉；别的前缀
+//   的变量看不见。
+// - **类型化取值**：非法整数不再被静默读成 0，而是回落到默认值。
+// - **JSON 文件 provider**：对象摊成 "节:键"、数组摊成 "节:下标"、
+//   布尔/数字/null 的处理、缺文件时 optional 与非 optional 的差别。
+// - **dotenv 文件 provider**：注释、export 前缀、引号与转义、行尾注释。
+// - **provider 优先级**：后添加的 provider 赢。
+// - **节视图**与**占位符**。
+using System;
+using System.Collections.Generic;
+using System.Configuration;
+
+class Program {
+    static int failures = 0;
+
+    static void Ok(bool cond, string name) {
+        if (cond) {
+            Console.WriteLine("ok " + name);
+        } else {
+            Console.WriteLine("FAIL " + name);
+            Program.failures = Program.failures + 1;
+        }
+    }
+
+    static void Eq(string actual, string expected, string name) {
+        if (actual == expected) {
+            Console.WriteLine("ok " + name);
+        } else {
+            Console.WriteLine("FAIL " + name);
+            Console.WriteLine("  expected: " + expected);
+            Console.WriteLine("  actual:   " + actual);
+            Program.failures = Program.failures + 1;
+        }
+    }
+
+    static void Main() {
+        // ---- 1. 键规范化 ----
+        Eq(ConfigurationKeys.Canonical("database:port"), "Database:Port", "冒号分段规范化");
+        Eq(ConfigurationKeys.Canonical("DATABASE__PORT"), "Database:Port", "双下划线分段规范化");
+        Eq(ConfigurationKeys.Canonical("Database:Port"), "Database:Port", "规范形式幂等");
+        Eq(ConfigurationKeys.Canonical("myKey"), "Mykey", "段内其余字符归一为小写");
+        Eq(ConfigurationKeys.Canonical(""), "", "空键规范化为空");
+        Eq(ConfigurationKeys.Canonical(null), "", "null 键规范化为空");
+
+        // ---- 2. 环境变量名映射 ----
+        Eq(ConfigurationKeys.ToEnvironmentName("Database:Port", "APP"), "APP__DATABASE__PORT", "前缀加分隔符映射");
+        Eq(ConfigurationKeys.ToEnvironmentName("Database:Port", "APP_"), "APP__DATABASE__PORT", "前缀末尾下划线被规范化");
+        Eq(ConfigurationKeys.ToEnvironmentName("Database:Port", "APP__"), "APP__DATABASE__PORT", "前缀末尾双下划线被规范化");
+        Eq(ConfigurationKeys.ToEnvironmentName("Database:Port", ""), "DATABASE__PORT", "空前缀不加前缀段");
+        Eq(ConfigurationKeys.FromEnvironmentName("APP__DATABASE__PORT", "APP"), "Database:Port", "环境变量名反向映射");
+        Eq(ConfigurationKeys.FromEnvironmentName("APP__DATABASE__PORT", "OTHER"), "App:Database:Port", "前缀不匹配时不剥前缀");
+
+        // ---- 3. 内存 provider ----
+        {
+            ConfigurationBuilder builder = new ConfigurationBuilder();
+            builder.AddInMemoryValue("Database:Port", "5432");
+            builder.AddInMemoryValue("Feature:Enabled", "true");
+            builder.AddInMemoryValue("Feature:Broken", "abc");
+            IConfiguration cfg = builder.Build();
+            Eq(cfg.Get("Database:Port"), "5432", "内存 provider 取值");
+            Eq(cfg.Get("database:port"), "5432", "大小写不同的键命中同一条");
+            Eq(cfg.Get("DATABASE__PORT"), "5432", "下划线写法的键命中同一条");
+            Ok(cfg.Get("Missing:Key") == null, "不存在的键返回 null");
+            Eq(Convert.ToString(cfg.GetInt("Database:Port", -1)), "5432", "整型取值");
+            Ok(cfg.GetInt("Feature:Broken", -1) == -1, "非法整数回落到默认值而不是 0");
+            Ok(cfg.GetBool("Feature:Enabled", false), "布尔取值");
+            Ok(cfg.GetInt("Missing:Key", 7) == 7, "缺失键的整型取值回落到默认值");
+            Ok(cfg.GetBool("Feature:Broken", true), "非法布尔回落到默认值");
+        }
+
+        // ---- 4. 环境变量 provider ----
+        {
+            Environment.SetEnvironmentVariable("ZANCONF__DATABASE__PORT", "6000");
+            Environment.SetEnvironmentVariable("ZANCONF__DATABASE__HOST", "localhost");
+            Environment.SetEnvironmentVariable("ZANCONFOTHER__DATABASE__PORT", "9999");
+            Environment.SetEnvironmentVariable("ZANCONF_SOLO", "solo");
+
+            ConfigurationBuilder builder = new ConfigurationBuilder();
+            builder.AddEnvironmentVariables("ZANCONF");
+            IConfiguration cfg = builder.Build();
+            Eq(cfg.Get("Database:Port"), "6000", "环境变量按前缀加分隔符映射到配置键");
+            Eq(cfg.Get("database:port"), "6000", "环境变量来源的大小写不敏感命中");
+            Eq(cfg.Get("Database:Host"), "localhost", "多段键的环境变量映射");
+            Ok(cfg.Get("Database:Missing") == null, "未设置的环境变量取不到");
+            Eq(Convert.ToString(cfg.GetInt("Database:Port", -1)), "6000", "环境变量取整型");
+
+            // 换前缀：ZANCONFOTHER__ 前缀的变量不该被 ZANCONF 前缀看见。
+            ConfigurationBuilder other = new ConfigurationBuilder();
+            other.AddEnvironmentVariables("ZANCONFOTHER");
+            IConfiguration otherCfg = other.Build();
+            Eq(otherCfg.Get("Database:Port"), "9999", "不同前缀读到各自的变量");
+
+            // 无前缀 provider：键直接映射成大写变量名。
+            ConfigurationBuilder bare = new ConfigurationBuilder();
+            bare.AddEnvironmentVariables("");
+            IConfiguration bareCfg = bare.Build();
+            Eq(bareCfg.Get("ZANCONF_SOLO"), "solo", "空前缀 provider 按大写变量名直查");
+        }
+
+        // ---- 5. JSON 文件 provider ----
+        string tmp = Path.GetTempPath();
+        string jsonPath = Path.Combine(tmp, "zan_conf_" + Guid.New() + ".json");
+        File.WriteAllText(jsonPath,
+            "{\"Database\":{\"Host\":\"db.local\",\"Port\":5432},\"Debug\":true,"
+            + "\"Ratio\":0.5,\"Servers\":[\"a\",\"b\"],\"Nothing\":null}");
+        {
+            ConfigurationBuilder builder = new ConfigurationBuilder();
+            builder.AddJsonFile(jsonPath);
+            IConfiguration cfg = builder.Build();
+            Eq(cfg.Get("Database:Host"), "db.local", "JSON 对象摊成节:键");
+            Eq(cfg.Get("Database:Port"), "5432", "JSON 数字取十进制文本");
+            Ok(cfg.GetInt("Database:Port", -1) == 5432, "JSON 数字可按整型读取");
+            Ok(cfg.GetBool("Debug", false), "JSON 布尔取值");
+            Eq(cfg.Get("Ratio"), "0.5", "JSON 小数取文本");
+            Eq(cfg.Get("Servers:0"), "a", "JSON 数组摊成节:下标");
+            Eq(cfg.Get("Servers:1"), "b", "JSON 数组第二项");
+            Ok(cfg.Get("Nothing") == null, "JSON null 不落键");
+            Eq(cfg.Get("database:host"), "db.local", "JSON 来源的大小写不敏感命中");
+        }
+
+        // 根节：文件里的键都挂到指定节下面。
+        {
+            ConfigurationBuilder builder = new ConfigurationBuilder();
+            builder.AddJsonFile(jsonPath, false, "App");
+            IConfiguration cfg = builder.Build();
+            Eq(cfg.Get("App:Database:Host"), "db.local", "根节前缀生效");
+            Ok(cfg.Get("Database:Host") == null, "根节之外读不到裸键");
+        }
+
+        // 缺文件：optional 与非 optional 的两种结果。
+        {
+            string missing = Path.Combine(tmp, "zan_conf_missing_" + Guid.New() + ".json");
+            ConfigurationBuilder optional = new ConfigurationBuilder();
+            optional.AddJsonFile(missing, true);
+            IConfiguration optionalCfg = optional.Build();
+            Ok(optionalCfg.Get("Anything") == null, "optional 文件缺失时不报错");
+
+            ConfigurationBuilder required = new ConfigurationBuilder();
+            required.AddJsonFile(missing);
+            bool threw = false;
+            try {
+                required.Build();
+            } catch (Exception e) {
+                threw = true;
+            }
+            Ok(threw, "非 optional 文件缺失时抛错");
+        }
+
+        // Reload：文件改了之后重新加载能读到新值。
+        {
+            string reloadPath = Path.Combine(tmp, "zan_conf_reload_" + Guid.New() + ".json");
+            File.WriteAllText(reloadPath, "{\"Level\":1}");
+            ConfigurationBuilder builder = new ConfigurationBuilder();
+            builder.AddJsonFile(reloadPath);
+            IConfiguration cfg = builder.Build();
+            Ok(cfg.GetInt("Level", -1) == 1, "重载前读到文件里的值");
+            File.WriteAllText(reloadPath, "{\"Level\":2}");
+            cfg.Reload();
+            Ok(cfg.GetInt("Level", -1) == 2, "Reload 后读到文件的新值");
+            File.Delete(reloadPath);
+        }
+
+        // ---- 6. dotenv 文件 provider ----
+        {
+            string envPath = Path.Combine(tmp, "zan_conf_" + Guid.New() + ".env");
+            File.WriteAllText(envPath,
+                "# 一行注释\n"
+                + "export DATABASE__PORT=6000\n"
+                + "NAME=zan\n"
+                + "QUOTED=\"a\\nb\"\n"
+                + "SINGLE='raw\\n'\n"
+                + "INLINE=keep # 行尾注释\n"
+                + "HASH=a#b\n"
+                + "NOEQUALS\n");
+            ConfigurationBuilder builder = new ConfigurationBuilder();
+            builder.AddEnvFile(envPath);
+            IConfiguration cfg = builder.Build();
+            Eq(cfg.Get("Database:Port"), "6000", "dotenv 的双下划线映射成节");
+            Eq(cfg.Get("Name"), "zan", "dotenv 取值");
+            Eq(cfg.Get("Quoted"), "a\nb", "dotenv 双引号里的转义展开");
+            Eq(cfg.Get("Single"), "raw\\n", "dotenv 单引号里是字面量");
+            Eq(cfg.Get("Inline"), "keep", "dotenv 去掉行尾注释");
+            Eq(cfg.Get("Hash"), "a#b", "dotenv 值里的 '#' 不是注释");
+            Ok(cfg.Get("Noequals") == null, "没有 '=' 的行被忽略");
+            File.Delete(envPath);
+        }
+
+        // ---- 7. provider 优先级：后添加的赢 ----
+        {
+            ConfigurationBuilder builder = new ConfigurationBuilder();
+            builder.AddJsonFile(jsonPath);
+            builder.AddInMemoryValue("Database:Host", "override");
+            IConfiguration cfg = builder.Build();
+            Eq(cfg.Get("Database:Host"), "override", "后添加的 provider 优先级更高");
+        }
+
+        // ---- 8. 节视图 ----
+        {
+            ConfigurationBuilder builder = new ConfigurationBuilder();
+            builder.AddJsonFile(jsonPath);
+            IConfiguration cfg = builder.Build();
+            IConfigurationSection section = cfg.GetSection("Database");
+            Eq(section.GetKey(), "Database", "节名");
+            Eq(section.GetPath(), "Database", "节路径");
+            Eq(section.Get("Host"), "db.local", "节里取值");
+            Ok(section.GetInt("Port", -1) == 5432, "节里取整型");
+            Ok(section.GetKeys().Count == 2, "节里列出直接子键");
+        }
+
+        // ---- 9. 占位符 ----
+        {
+            Environment.SetEnvironmentVariable("ZANCONF_PROBE", "from-env");
+            Eq(ConfigurationRoot.ResolvePlaceholders("${ZANCONF_PROBE:-fallback}"), "from-env", "占位符取环境变量");
+            Eq(ConfigurationRoot.ResolvePlaceholders("${ZANCONF_MISSING:-fallback}"), "fallback", "占位符取默认值");
+        }
+
+        // ---- 10. 写回 ----
+        {
+            ConfigurationBuilder builder = new ConfigurationBuilder();
+            builder.AddInMemoryValue("Runtime:Level", "1");
+            IConfiguration cfg = builder.Build();
+            cfg.Set("Runtime:Level", "9");
+            Eq(cfg.Get("Runtime:Level"), "9", "Set 写回生效");
+            IConfigurationSection section = cfg.GetSection("Runtime");
+            section.SetValue("11");
+            Eq(cfg.Get("Runtime"), "11", "节里 SetValue 写回本节的值");
+            Eq(cfg.Get("Runtime:Level"), "9", "SetValue 不影响节下的子键");
+        }
+
+        File.Delete(jsonPath);
+        Console.WriteLine("failures=" + Convert.ToString(Program.failures));
+    }
+}

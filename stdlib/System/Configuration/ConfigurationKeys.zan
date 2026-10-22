@@ -1,0 +1,87 @@
+using System;
+using System.Collections.Generic;
+
+namespace System.Configuration;
+
+// 配置键的规范化与映射规则。内存 / JSON / dotenv / 环境变量四种来源
+// 共用同一套键空间：查询时先规范化，存放时也存规范化后的键，
+// 于是 "database:port"、"DATABASE__PORT"、"Database:Port" 命中同一条配置。
+//
+// 规范形式：键由若干"段"组成，段分隔符在配置键里是 ':'，在环境变量里
+// 是 '__'，两者等价；每段规范化成"首字母大写、其余小写"。
+//   "database:port"  → "Database:Port"
+//   "DATABASE__PORT" → "Database:Port"
+//   "myKey"           → "Mykey"
+// 规范化是幂等的：Canonical(Canonical(k)) == Canonical(k)。
+public class ConfigurationKeys {
+    // 配置键形式的段分隔符。
+    public static string SectionSeparator = ":";
+
+    // 环境变量形式的段分隔符。
+    public static string EnvironmentSeparator = "__";
+
+    // 把任意写法的配置键规范化。
+    public static string Canonical(string key) {
+        if (key == null) { return ""; }
+        List<string> segs = SplitSegments(key);
+        List<string> outSegs = new List<string>();
+        for (int i = 0; i < segs.Count; i = i + 1) {
+            string s = NormalizeSegment(segs[i]);
+            if (s.Length > 0) { outSegs.Add(s); }
+        }
+        return string.Join(SectionSeparator, outSegs);
+    }
+
+    // 按分隔符切段：':' 与 '__' 等价。
+    public static List<string> SplitSegments(string key) {
+        if (key == null) { return new List<string>(); }
+        string norm = key.Replace(EnvironmentSeparator, SectionSeparator);
+        return norm.Split(SectionSeparator);
+    }
+
+    // 单段规范化：首字母大写、其余小写。
+    public static string NormalizeSegment(string seg) {
+        if (seg == null || seg.Length == 0) { return ""; }
+        string head = seg.Substring(0, 1).ToUpper();
+        string tail = "";
+        if (seg.Length > 1) { tail = seg.Substring(1).ToLower(); }
+        return head + tail;
+    }
+
+    // 前缀规范化：去掉结尾的下划线，"APP_" / "APP__" / "APP" 等价于 "APP"。
+    public static string NormalizePrefix(string prefix) {
+        if (prefix == null) { return ""; }
+        string p = prefix.Trim();
+        int end = p.Length;
+        while (end > 0 && p.Substring(end - 1, 1) == "_") { end = end - 1; }
+        return p.Substring(0, end);
+    }
+
+    // 配置键 → 环境变量名：段全部大写、用 '__' 连接、再加前缀。
+    //   "Database:Port" + 前缀 "APP" → "APP__DATABASE__PORT"
+    public static string ToEnvironmentName(string key, string prefix) {
+        string canonical = Canonical(key);
+        List<string> segs = canonical.Split(SectionSeparator);
+        List<string> upper = new List<string>();
+        for (int i = 0; i < segs.Count; i = i + 1) {
+            if (segs[i].Length > 0) { upper.Add(segs[i].ToUpper()); }
+        }
+        string body = string.Join(EnvironmentSeparator, upper);
+        string p = NormalizePrefix(prefix);
+        if (p.Length == 0) { return body; }
+        return p + EnvironmentSeparator + body;
+    }
+
+    // 环境变量名 → 配置键：先剥前缀再规范化。
+    //   "APP__DATABASE__PORT" + 前缀 "APP" → "Database:Port"
+    public static string FromEnvironmentName(string envName, string prefix) {
+        if (envName == null) { return ""; }
+        string rest = envName;
+        string p = NormalizePrefix(prefix);
+        if (p.Length > 0) {
+            string head = p + EnvironmentSeparator;
+            if (rest.StartsWith(head)) { rest = rest.Substring(head.Length); }
+        }
+        return Canonical(rest);
+    }
+}
