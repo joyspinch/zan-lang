@@ -3899,6 +3899,13 @@ void zan_checker_check_stmt(zan_checker_t *c, zan_ast_node_t *stmt) {
         break;
 
     case AST_IF_STMT: {
+        /* A522-③：`if (x = 1)` 曾仅警告、按 C 风格真假运行（C# CS0029 硬错）。
+         * 仓库 .zan 全量 4283 处裸标识符条件全是合法 bool——赋值入条件没有
+         * 任何合法用例，升级为编译错误。 */
+        if (stmt->if_stmt.cond && stmt->if_stmt.cond->kind == AST_ASSIGNMENT)
+            zan_diag_emit(c->diag, DIAG_ERROR, stmt->if_stmt.cond->loc,
+                          "assignment used as a condition (did you mean '=='? "
+                          "assignment (=) has no boolean value");
         zan_type_t *cond_type = zan_checker_check_expr(c, stmt->if_stmt.cond);
         if (cond_type->kind != TYPE_BOOL && cond_type->kind != TYPE_ERROR) {
             zan_diag_emit(c->diag, DIAG_WARNING, stmt->if_stmt.cond->loc,

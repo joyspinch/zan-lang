@@ -475,12 +475,42 @@ switch (value) {
 }
 ```
 
+// Switch
+switch (value) {
+    case 0:
+        ...
+        break;
+    case 1:
+    case 2:
+        ...                 // fallthrough is explicit
+        break;
+    default:
+        ...
+        break;
+}
+```
+
 switch 有语句与表达式两种形态（2026-08-27 复核更正，此前本节写"表达式形态与
 `when` 守卫未实现"）：语句形态支持常量 case、`case null:`、类型模式 `case T x:`
 与 `when` 守卫；表达式形态 `value switch { <模式> when <守卫> => <结果>, ... }`
 支持常量/类型模式、`_` discard、`default`，无匹配时取零值
 （`cs_b06_switch_expr.zan`、`cs_b05_pattern_var.zan`、`pattern_value_types.zan`）。
 值类型的类型模式按静态类型判定（`case int n:` 对 int 判别式成立）。
+
+**声明的语言差异（相对 C#）**：语句 switch 的非空 case **隐式 break**
+（Go 风格）——不写 `break` 不会落入下一个 case；只有空 case 标签显式
+贯穿（上面的 `case 1: case 2:`）。C# 直觉下漏写 `break` 的代码在 Zan 里
+是"每个 case 独立"，不是贯穿。
+
+**声明的语言差异（相对 C#）**：`finally` 块内允许 `return`（C# CS0157
+拒绝）——finally 的 return **覆盖** try/catch 已确定的返回值，语义以
+conformance `async_finally_branch_capacity.zan`、
+`async_finally_scope_transfers.zan` 钉定。迁移 C# 代码时，finally 里的
+return 是 Zan 的合法扩展，不是笔误。
+
+`if` / `while` / `do-while` / `for` 的条件必须是 bool；条件位置出现赋值
+（`if (x = 1)`）是编译错误（C# CS0029 同口径，Zan 曾仅警告，2026-10-23
+升级为错误）。
 
 ### 5.3 Exception Handling
 
