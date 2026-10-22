@@ -1341,3 +1341,59 @@
 - 探针：`_scratch/csaudit/numeric/{v_chain2,v_chain5,v_chain6}.zan`。
 - 待办：自举半边（selfhost 推断侧同缺口对齐）。
 - 探针：`_scratch/csaudit/numeric/{v_chain,v_chain2}.zan`（隔离复验：前者过、后者挂）。
+
+### [ ] A530 审计遗留：`--link-lib` 值原样拼进链接命令行（命令注入面）
+- 来源：2026-10-17/18 全仓审计 P1-9（实测复现，审计产物已被 _scratch 清扫）。
+  `--link-lib` 的值经 `" -l%s"` 拼进 link_cmd 后 `system()` 执行——传
+  `& calc` 一类元字符就是本机命令注入。该旗标只应接库名标识符。
+- 已落（**未验证**）：`src/compiler/main.c` 参数解析位点加
+  `zan_dllimport_name_is_safe` 白名单（[A-Za-z0-9._+-]，与 DllImport 同
+  口径），越界拒绝退出 1。待 zanc 重建后实测（编译器在途改动占着构建）。
+- 判定器：`zanc hello.zan --auto-stdlib --link-lib "& echo pwned" -o x.exe`
+  应报错退出 1 且不产出文件；`--link-lib ws2_32` 应照常通过。
+
+### [ ] A531 审计遗留：崩溃日志链在只读 exe 目录下静默失效
+- 来源：审计 P1-2。崩溃/软诊断日志路径 `<exe_dir>/zan_crash.log` → CWD
+  回退；两者都只读（Program Files、部署盘）时记录静默丢。体积轮转
+  （1MB → `.1`）已在场，DoS 面已消，剩写入可靠性。
+- 已落（**未验证**）：`rt_crash.h` 增 `%TEMP%` 第三档回退
+  （`zan__crash_temp_logpath`，note/write_record 两处接线）；
+  `rt_timer.c` 软诊断同形。待 zanc 重建后实测。
+- 判定器：把 exe 放只读目录跑崩溃探针，`%TEMP%\zan_crash.log` 应出现记录。
+
+### [ ] A532 审计遗留：zan-lsp 未设栈预算（前端深嵌套爆 1MB 栈）
+- 来源：审计 P1-3。zan-lsp 内嵌 lexer/parser/binder/checker（与 zanc 同
+  源），不可信项目文件走同样的深嵌套递归；zanc 已 32MB（CMakeLists
+  `/STACK:33554432`），zan-lsp 默认 1MB——IDE 补全请求就能踩爆。
+- 已落（**未验证**）：CMakeLists zan-lsp 复制 zanc 的 msvc/mingw 双分支
+  栈选项。待 zan-lsp 目标重建 + PE 头核对。
+- 判定器：PE optional header `SizeOfStackReserve == 0x2000000`。
+
+### [ ] A533 Yaml.ToYaml 对别名 DAG 指数放大（693B → 69MB）
+- 来源：审计 P2-28（实测）。YamlParser 把 `&a0`/`*a0` 还原成共享节点
+  实例；ToYaml 无共享检测，递归复制把 3^n 的 DAG 展开成字节——693 字节
+  别名炸弹 ToYaml 出 69,353,102 字节（内存/带宽 DoS）。
+- 方向：正确修法是锚点/别名感知输出——预扫各节点引用计数（预扫本身
+  要用"按对象引用为键"的集合防指数走），首访发 `&aN`、重访发 `*aN`。
+  前置：确认 `Dict<JsonValue,int>` 对引用键的哈希语义（identity），
+  或给序列化器建身份映射基建；不要用输出预算截断——那会拒掉 20 万键
+  的合法大文档。
+
+### [ ] A534 PoolCore<T> 值类型元素比较生成非法 IR（icmp eq ptr,i32）
+- 来源：审计 P2-31（实测）。`PoolCore<int>` 调 RemoveBorrowed
+  （`this.borrowed[i] == c`）→ LLVM verify 挂 "Both operands to ICmp
+  instruction are not of the same type!"（ptr vs i32）；`PoolCore<string>`
+  同代码 7 项不变量全过。编译期即炸（响亮），但泛型值类型池整个不可用。
+- 根因族：A418/A421 一族——类级类型参数驱动的 `List<T>` 元素访问在
+  "擦除/特化"两侧混形：元素加载按擦除 ptr 出、比较另一侧按特化 i32 出。
+- 方向：编译期把泛型值类型比较折叠到同形（对照 A507 家族的 IR 层折叠
+  先例），或让元素加载按实例化类型出值。修好留 conformance 用例。
+
+### [ ] A535 池归还回滚对异步单类驱动不成立（P2-29 余项）
+- 已落：Sqlite（:memory: 探针 6 断言全过）与 Pg（编译验证）的 inTxn
+  标志 + Release 回滚，ea664ae31。UnitOfWork 用户不受影响（本就先回滚）。
+- 余项：MySqlConnection / SqlServerConnection / FirebirdConnection 的
+  同步事务方法抛 `Sync()`（连接纯异步），TDengine 事务方法是空桩——
+  `Release` 是同步签名，回滚要么抛要么空转。真修需要 async Release
+  （破坏调用契约）或池级协程清理通道，先台账不动代码。
+- 判定器（网络库就位时）：借出 BEGIN+INSERT 不提交直接归还，二借不可见。
