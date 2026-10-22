@@ -1444,3 +1444,19 @@
   `Release` 是同步签名，回滚要么抛要么空转。真修需要 async Release
   （破坏调用契约）或池级协程清理通道，先台账不动代码。
 - 判定器（网络库就位时）：借出 BEGIN+INSERT 不提交直接归还，二借不可见。
+
+### 审计复查证伪（2026-10-23，随 A530-535 一批）
+
+- **P1-4 MergeText 二次方：证伪**。两条规模探针（`_scratch/audit/
+  mergetext_probe{,2}.zan`）：100k 交替文本/注释游程 81ms；单段文本
+  100k 个实体碎片合并 15ms、单节点 100k 字符——`last.text + piece`
+  在实测规模下线性，审计的 H 级怀疑不成立，不需要修。
+- **P1-5 XXE：证伪**。ReadDoctype 只跳过声明不取 DTD；ReadEntity 仅
+  5 个预定义实体 + 数字字符引用，未知实体报错；解析器零网络 I/O。
+- **P1-7 裸 AES 无完整性：正向确认 + 注释加固**。库内唯一通用消费方
+  AuthToken 用 AesGcm（带 AAD）；裸 CBC/ECB 消费方全部是微信线格式
+  互操作（协议层自带 SHA-1 签名）与 GCM 内部构件。Aes 类头补选用
+  指南（新代码保密+完整性一律 AesGcm）。
+- **P1-8 RFC3161：查无此码**。全仓（src/packages/stdlib/tools/模板）
+  无任何 RFC3161/TimeStampReq 实现——原发现指向的代码已不在仓库
+  （随模板出仓或在 691 提交中重构掉）；无原始审计上下文不再追。
