@@ -1694,12 +1694,131 @@ static bool checker_report_null_arg_mismatch(zan_checker_t *c,
     return true;
 }
 
+/* 方法类型参数的结构化合一（A518）：dp 形参类型里的 TYPE_TYPE_PARAM 按
+ * 名字绑到实参类型；容器/数组/可空递归进元素。推断不出留 NULL——
+ * 约束检查对未定绑定放行（与 skill 一.7 的"判不出不误杀"同口径）。 */
+static void checker_unify_method_tp(zan_type_t *dp, zan_type_t *at,
+                                    zan_ast_list_t *tps, zan_type_t **bind,
+                                    int ntp) {
+    if (!dp || !at) return;
+    if (dp->kind == TYPE_TYPE_PARAM) {
+        for (int i = 0; i < tps->count && i < ntp; i++) {
+            zan_ast_node_t *tp = tps->items[i];
+            if (tp->ident.name.len == dp->name.len &&
+                memcmp(tp->ident.name.str, dp->name.str,
+                       (size_t)dp->name.len) == 0) {
+                if (!bind[i] && at->kind != TYPE_TYPE_PARAM &&
+                    at->kind != TYPE_ERROR)
+                    bind[i] = at;
+                return;
+            }
+        }
+        return;
+    }
+    if (dp->type_arg_count > 0 && dp->type_arg_count == at->type_arg_count) {
+        for (int i = 0; i < dp->type_arg_count; i++)
+            checker_unify_method_tp(dp->type_args[i], at->type_args[i],
+                                    tps, bind, ntp);
+    } else if ((dp->kind == TYPE_ARRAY || dp->kind == TYPE_NULLABLE) &&
+               dp->element_type && at->element_type) {
+        checker_unify_method_tp(dp->element_type, at->element_type,
+                                tps, bind, ntp);
+    }
+}
+
+/* dp 的类型形状里是否出现 tps 中的任一方法类型参数（按名字） */
+static bool type_mentions_tp_checker(zan_type_t *t, zan_ast_list_t *tps) {
+    if (!t) return false;
+    if (t->kind == TYPE_TYPE_PARAM) {
+        for (int i = 0; i < tps->count; i++) {
+            zan_ast_node_t *tp = tps->items[i];
+            if (tp->ident.name.len == t->name.len &&
+                memcmp(tp->ident.name.str, t->name.str,
+                       (size_t)t->name.len) == 0)
+                return true;
+        }
+        return false;
+    }
+    if (t->type_arg_count > 0) {
+        for (int i = 0; i < t->type_arg_count; i++)
+            if (type_mentions_tp_checker(t->type_args[i], tps)) return true;
+    }
+    if (t->element_type && type_mentions_tp_checker(t->element_type, tps))
+        return true;
+    return false;
+}
+
+/* 泛型方法调用点的 where 约束检查（TASKS.md A518）：
+ * `static T FirstItem<T>(List<T> xs) where T : Entity` 传 List<int> 曾静默
+ * 通过——check_generic_constraints 只挂在 new/声明/返回类型三处，调用解析
+ * 路径缺失。这里按显式类型实参 + 形参形状合一推出绑定，再逐条 where 检查；
+ * 绑不出的参数放行。 */
+static void checker_check_method_call_constraints(zan_checker_t *c,
+                                                  zan_symbol_t *msym,
+                                                  zan_ast_node_t *call,
+                                                  zan_type_t **args) {
+    if (!msym || msym->kind != SYM_METHOD || !msym->decl ||
+        msym->decl->kind != AST_METHOD_DECL)
+        return;
+    zan_ast_node_t *m = msym->decl;
+    zan_ast_list_t *tps = &m->method_decl.type_params;
+    if (tps->count <= 0 || tps->count > 8) return;
+    zan_ast_list_t *wcs = zan_ast_method_where_clauses(m);
+    if (!wcs || wcs->count == 0) return;
+
+    zan_type_t *bind[8] = { 0 };
+    for (int i = 0; i < tps->count && i < call->call.type_args.count; i++)
+        bind[i] = zan_binder_resolve_type(c->binder, call->call.type_args.items[i]);
+    if (call->call.type_args.count == 0) {
+        zan_ast_list_t *ps = &m->method_decl.params;
+        for (int j = 0; j < ps->count && j < call->call.args.count; j++) {
+            zan_ast_node_t *a = call->call.args.items[j];
+            if (!a || a->kind == AST_LAMBDA || a->kind == AST_NAMED_ARG) continue;
+            zan_type_t *dp = zan_binder_resolve_type(c->binder,
+                ps->items[j]->param.type);
+            if (!dp || !type_mentions_tp_checker(dp, tps)) continue;
+            checker_unify_method_tp(dp, args ? args[j] : NULL, tps, bind,
+                                    tps->count);
+        }
+    }
+    for (int w = 0; w < wcs->count; w++) {
+        zan_ast_node_t *wc = wcs->items[w];
+        int idx = -1;
+        for (int i = 0; i < tps->count; i++) {
+            zan_ast_node_t *tp = tps->items[i];
+            if (tp->ident.name.len == wc->where_clause.param_name.len &&
+                memcmp(tp->ident.name.str, wc->where_clause.param_name.str,
+                       (size_t)wc->where_clause.param_name.len) == 0) {
+                idx = i;
+                break;
+            }
+        }
+        if (idx < 0 || idx >= tps->count) continue;
+        zan_type_t *arg = bind[idx];
+        if (!arg || arg->kind == TYPE_TYPE_PARAM || arg->kind == TYPE_ERROR)
+            continue; /* 未定绑定放行 */
+        for (int k = 0; k < wc->where_clause.constraints.count; k++) {
+            zan_ast_node_t *cons_ref = wc->where_clause.constraints.items[k];
+            zan_type_t *cons = zan_binder_resolve_type(c->binder, cons_ref);
+            if (!cons || cons->kind == TYPE_ERROR) continue;
+            if (!type_satisfies_constraint(arg, cons)) {
+                zan_diag_emit(c->diag, DIAG_ERROR, call->loc,
+                    "type '%s' does not satisfy constraint '%s' for type "
+                    "parameter '%.*s' of method '%.*s'",
+                    type_name(arg), type_name(cons),
+                    (int)wc->where_clause.param_name.len,
+                    wc->where_clause.param_name.str,
+                    (int)msym->name.len, msym->name.str);
+            }
+        }
+    }
+}
+
 static zan_symbol_t *checker_find_method_typed(zan_checker_t *c,
                                                 zan_symbol_t *type_sym,
                                                 zan_istr_t name,
                                                 zan_ast_node_t *call,
-                                                zan_type_t **args) {
-    zan_symbol_t *best = NULL;
+                                                zan_type_t **args) {    zan_symbol_t *best = NULL;
     int best_score = -1;
     /* null 实参把候选判死的现场：留一份用于报错（见函数末尾）。 */
     zan_type_t *null_bad_type = NULL;
@@ -2903,6 +3022,10 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
                 expr, arg_types);
             if (resolved) called_sym = resolved;
         }
+        /* 泛型方法调用点的 where 约束（A518）：符号定了就查，别等运行期 */
+        if (called_sym && called_sym->kind == SYM_METHOD)
+            checker_check_method_call_constraints(c, called_sym, expr,
+                                                  arg_types);
         c->last_call_node = expr;
         c->last_call_method = called_sym;
         check_call_arity(c, expr, recv);
