@@ -799,8 +799,28 @@
   - 一个已知坑：把 crypto 单独编成归档后，**只要程序用到其中任何一个符号，
     整簇 63 个 `zan_hw_*` 仍会被拉进来**（`libcrypto.a` 只有一个成员
     `crypto_sep.obj`）⇒ 必须**按特性再切**到成员粒度，否则只是把体积挪个地方。
-  - 该结论只在**宿主 native 路径**验证过；交叉侧（linux/OHOS/Android）用的是
-    `ld.lld -static` 且已带 `--gc-sections`，行为需另行复测。
+  - 该结论在**交叉侧同样成立**（2026-10-23 复测，纠正上一轮"本机无交叉环境"
+    的错误说法——**本机交叉环境是齐的**）：
+    - 交叉**链接**本机完全可跑：`zanc --target linux-x64 --publish` 出
+      `.text=189,074`，与提交的 `build/size_budget/hello_linux_x64` 逐字节一致；
+      `toolchain/` 下 13 个目标目录（linux-musl / linux-arm64 / linux-riscv64 /
+      win-x64 / win-arm64 / macos / ohos-* / android-* / wasm32 / ios）齐全，
+      `build/ld.lld.exe` 在位。**缺的不是交叉环境，是"重出预编译对象"所需的
+      目标 libc 头**——仓库只提交了 `.o`/`.a`，不带 include（zig cc 现场提供
+      musl 头，本机无 zig；win 侧需要 MSYS2 mingw clang，本机无）。
+    - 交叉产物里 crypto 一样一个没剪：linux-x64 交叉产物 `zan_hw_=63` +
+      `zan_aes_=32` 全在，crypto 符号占 `.text` 约 **37,941 B（19.8%）**；
+      交叉定时器对象 `toolchain/linux-musl/zanrt_timer.o`（`.text` 68,894，
+      单一 `.text` 段未按函数切）里带着同样 63 个 `zan_hw_*`。
+    - **且交叉链接本来就带 `--gc-sections`**（`ld.lld -static ... -s
+      --gc-sections`）——**带了照样剪不掉**，正好反证"是裸 .o 整体载入"这个
+      根因，而不是"缺 GC 开关"。
+    - 结论：宿主与交叉**同因同解**，处方（改归档成员）对两侧都成立；落地时
+      5 个 `scripts/build_*_rt.sh` 配方要同步（`build_win_rt.sh` /
+      `build_cross_rt.cmd` / `build_linux_rt.sh` / `build_macos_rt.sh` /
+      `build_ohos_rt_zig.sh`），但**重出对象这一步本机做不了**（缺目标 libc
+      头 + 缺 zig / MSYS2 mingw clang），要么上 CI，要么先只做宿主侧并把
+      交叉侧标为"待工具链"。
 - 影响：体积预算只能靠"抬高阈值"来容纳，预算的**分辨力**随之下降——阈值
   取 1.5× 于基线时，一次 +64 KB 的固定表回归不会被抓到（这正是这条预算
   最初要抓的东西）。
