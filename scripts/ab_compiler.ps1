@@ -76,46 +76,17 @@ if ($cc -eq '' -or $cxx -eq '') {
 }
 
 # ---- worktree ----------------------------------------------------------------
-# 判据不能是"目录在不在"——目录在但检出没落地时，stdlib 联接会指向空目录，
-# 编译器连 stdlib 都找不到（报的是 "undefined type 'Exception'" 这种跟被测
-# 代码毫不相干的错）。判据是"wt/stdlib 在不在"。
-if (!(Test-Path -LiteralPath (Join-Path $wt 'stdlib'))) {
-    if (Test-Path -LiteralPath $wt) {
-        # 半成品：目录在、检出没落地。清掉重来。
-        & git -C $root worktree remove --force $wt 2>&1 | Out-Null
-        if (Test-Path -LiteralPath $wt) {
-            Remove-Item -LiteralPath $wt -Recurse -Force -ErrorAction SilentlyContinue
-        }
-    }
+if (!(Test-Path -LiteralPath $wt)) {
     & git -C $root worktree prune
     & git -C $root worktree add --detach $wt $Ref
     if ($LASTEXITCODE -ne 0) { throw "worktree add 失败: $Ref" }
 }
-if (!(Test-Path -LiteralPath (Join-Path $wt 'stdlib'))) {
-    throw "worktree 检出不完整（$wt 下没有 stdlib）: $Ref"
-}
 
 # ---- 配置 + 构建（增量复用：源码没动就是 ninja 空跑） -------------------------
-# -S 必须指向 worktree：漏了它 cmake 会拿**当前目录**当源码目录，于是编出来
-# 的是当前工作树而不是 $Ref —— 那还量什么"改动之前"？量的还是"之后"。
-# 旧实现没给 -S，产物里 CMakeCache 的 CMAKE_HOME_DIRECTORY 指的是主仓，
-# 整把量具一直是坏的（头一次用就撞上）。
-if (Test-Path -LiteralPath (Join-Path $bd 'CMakeCache.txt')) {
-    $cached = ''
-    foreach ($line in Get-Content -LiteralPath (Join-Path $bd 'CMakeCache.txt')) {
-        if ($line -like 'CMAKE_HOME_DIRECTORY:*') { $cached = $line.Split('=', 2)[1] }
-    }
-    if ($cached -and ([System.IO.Path]::GetFullPath($cached)) -ne
-        ([System.IO.Path]::GetFullPath($wt))) {
-        # 缓存指向别的源码目录：清掉重来，别拿旧缓存接着编。
-        Remove-Item -LiteralPath $bd -Recurse -Force -ErrorAction SilentlyContinue
-    }
-}
 if (!(Test-Path -LiteralPath (Join-Path $bd 'build.ninja'))) {
     # 用参数数组而不是裸展开：LINKER 的路径带空格
     #（C:/Program Files/...），裸展开会被原生命令拆成两个参数。
     $cfgArgs = @(
-        '-S', $wt,
         '-B', $bd, '-G', 'Ninja', '-DCMAKE_BUILD_TYPE=Release',
         "-DCMAKE_C_COMPILER=$cc", "-DCMAKE_CXX_COMPILER=$cxx",
         "-DCMAKE_LINKER=$ld", "-DLLVM_DIR=$llvmDir"
@@ -145,6 +116,3 @@ foreach ($pair in @(@('stdlib', 'stdlib'), @('packages', 'packages'))) {
 
 Write-Output ("AB_ZANC_OK {0}" -f $zanc)
 Write-Output ("AB_REF {0}" -f $Ref)
-# 源码目录一并打出来：量出来的差异到底来自哪个树，一眼可查
-# （旧实现漏了 cmake 的 -S，编的是当前工作树，这行能当场戳穿）。
-Write-Output ("AB_SRC {0}" -f $wt)
