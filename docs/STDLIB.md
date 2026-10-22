@@ -303,7 +303,7 @@ There is no `Capacity`, `Find`, `FindAll`, `Map`, `Aggregate`, `ToArray` or
 - `System.ListExtensions` (`stdlib/System/ListExtensions.zan`):
   `Remove(item)`, `GetRange(start, count)`, and `Sort()` overloads for
   `List<int>`, `List<double>` and `List<string>`.
-- `System.Linq.Enumerable` (`stdlib/System/Linq/Enumerable.zan`, see §3.6):
+- `System.Linq.Enumerable` (`packages/Zan.Linq/src/System/Linq/Enumerable.zan`, see §3.6):
   `Where`, `Select`, `SelectMany`, `Any`, `All`, `Count`, `First(OrDefault)`,
   `Last(OrDefault)`, `Single(OrDefault)`, `Take`, `Skip`, `Reverse`,
   `OrderBy*`, `GroupBy`, `Contains`, `Distinct`, `In`, `Like`, `Aggregate`,

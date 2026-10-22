@@ -13,21 +13,21 @@ down with the session. If no config exists in this project yet, write it
 yourself — no human needed:
 
 ```
-D:\project\zan-lang\tools\zan-mcp.exe --init-agent .    # writes .mcp.json / .cursor\mcp.json / .vscode\mcp.json
+tools/zan-mcp.exe --init-agent .    # writes .mcp.json / .cursor\mcp.json / .vscode\mcp.json
                             # (+ AGENTS.md, .agents\skills\) into the project;
                             # existing files are kept; --force overwrites
 ```
 
 Then reopen the project and the client starts the server itself. Diagnostics
 why a session did not come up: the config's `command` must be the **expanded**
-SDK path (`D:\project\zan-lang\tools\zan-mcp.exe` placeholders are only valid inside the SDK's own `ai\`
+SDK path (`tools/zan-mcp.exe` placeholders are only valid inside the SDK's own `ai\`
 templates), and the trailing argument is the workspace root (`.` = the launch
 directory).
 
 For a one-off probe you can still run it yourself:
 
 ```
-D:\project\zan-lang\tools\zan-mcp.exe --stdio .         # newline-delimited JSON-RPC 2.0 on stdin/stdout
+tools/zan-mcp.exe --stdio .         # newline-delimited JSON-RPC 2.0 on stdin/stdout
 ```
 
 stdout carries protocol messages only — one JSON object per line, no banner —
@@ -35,15 +35,15 @@ so anything you want logged must go to stderr.
 
 Config templates ship in the SDK under `ai\`: `.mcp.json` (Claude Code and
 most clients), `.cursor\mcp.json`, `.vscode\mcp.json` — install them with
-`--init-agent`, not by hand-copying (the `D:\project\zan-lang\tools\zan-mcp.exe` placeholder would stay
+`--init-agent`, not by hand-copying (the `tools/zan-mcp.exe` placeholder would stay
 literal and the client would fail to launch the server). Full guide:
 `docs\AI_ONBOARDING.md`.
 
 HTTP is the same API on `POST /`, `/mcp` or `/rpc`:
 
 ```
-D:\project\zan-lang\tools\zan-mcp.exe . --port 18848
-D:\project\zan-lang\tools\zan-mcp.exe . --host 0.0.0.0 --token-env ZAN_MCP_TOKEN
+tools/zan-mcp.exe . --port 18848
+tools/zan-mcp.exe . --host 0.0.0.0 --token-env ZAN_MCP_TOKEN
 ```
 
 A non-loopback host without a token is refused a clean bill of health for good

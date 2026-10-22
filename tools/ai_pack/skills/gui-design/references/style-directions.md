@@ -12,7 +12,7 @@
    - 随应用发布(推荐给用户):在应用工程根放 `skins/<风格名>/skin.css`
      (应用自带皮肤优先于 stdlib 内置皮肤,按 `Skin.zan` 的 Roots 顺序)。
    - 作为 Zan 内置皮肤贡献(在 zan-lang 仓库内):新建
-     `stdlib/Gui/skins/<风格名>/skin.css`,会被自动发现;可选配
+     `packages/Zan.Gui/src/Gui/skins/<风格名>/skin.css`,会被自动发现;可选配
      `banner.png`(皮肤选择器预览图,fortune 有先例)。
 3. **验收**:每张卡末尾 2-3 条 + SKILL.md 的 12 条自查;在 zan-lang 仓库内
    用 gallery 深链 `./gui_gallery <组件名> <皮肤名>` 逐皮肤看。

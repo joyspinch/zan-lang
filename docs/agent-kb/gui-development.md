@@ -291,7 +291,7 @@ IDE 见 `src/ide_zan/src/components/IdeBootstrap.zan`，画廊在 `gui_gallery.z
   界限是「有没有在重画一个已经存在的控件」。
 - 审过一遍的结论（2026-08）：`examples/`、`templates/` 里没有 HMI/图表自绘，
   gallery 的仪表演示全是 `ChartSeries.Gauge(...)` 配置。所以仪表画错要去
-  `packages/Zan.Gui.Charts/src/Gui/Component/Chart/ChartViewPie.zan` 的 `DrawGauge` 查，别改 demo。
+  `packages/Zan.Gui.Charts/src/Gui/Component/Chart/ChartView.Pie.zan`（仪表标度走 `ChartView.GaugeScalar`，指针/刻度模型在同包 `Models/Gauge*.zan`）里查，别改 demo。
 
 ## 设计器窗体（`.html` 设计稿）的数据流
 
@@ -301,7 +301,7 @@ IDE 见 `src/ide_zan/src/components/IdeBootstrap.zan`，画廊在 `gui_gallery.z
 手写逻辑 <Name>.zan / App.zan --------------------------------+
 ```
 
-- 文档模型在 `src/ide_zan/ZanIDE.CodeNav.zan`：`FormDoc { name, winW, winH, winTitle,
+- 文档模型在 `src/ide_zan/src/editor/ZanIDE.CodeNav.zan`：`FormDoc { name, winW, winH, winTitle,
   winCenter, layoutMode, winZoom, fields }`、`FormFieldDoc { type, label, name,
   required, wrap, span, fx, fy, fw, fh }`（`fx/fy/fw/fh` 是自由布局的绝对坐标）。
 - 生成器在 `stdlib/System/Compiler/GenForm.zan`（编译期）与 IDE 侧的生成代码路径。

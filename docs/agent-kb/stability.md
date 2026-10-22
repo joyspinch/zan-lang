@@ -34,7 +34,7 @@ try/catch 只兜住**已经发生**的错误；能修的根因必须修掉，否
 | 症状 | 真正的根因 | 修法 |
 | --- | --- | --- |
 | 拖入某个控件立刻退出，日志只有 `exception unwind stack exhausted` | 编译器的 typed overload 只在当前类里找候选，派生类的 `Add(string)` 遮蔽了继承来的 `Add(T)`，于是自己调自己无限递归 | 沿继承链解析重载（`resolve_overload_typed`，`src/compiler/irgen_expr_core.c`）；回归：`tests/conformance/overload_inherited_arity.zan` |
-| 读一个未赋值的字符串局部变量就 0xC0000005 | 未赋值的 `string` 局部是空指针，任何读取（`== ""`、`.Length`、拼接）都在解引用 null | 未赋值的字符串局部默认空串，回归：`tests/conformance/string_default_empty.zan` |
+| 读一个未赋值的字符串局部变量就 0xC0000005 | 未赋值的 `string` 局部是空指针，任何读取（`== ""`、`.Length`、拼接）都在解引用 null | **现在直接编译期报错**：定赋分析（`src/compiler/definite.c`）判定该局部在所有路径上都没被赋值，回归：`tests/diag/unassigned_local_string.zan`（运行时仍以空串兜底，但"读未赋值局部"不再合法） |
 | 读一个没在构造函数里赋值的 `string` 字段就 0xC0000005 | **字段保留 null 作为"未设置"**（ORM 靠它把未设置的字符串列绑成 SQL NULL，见 `tests/conformance/mysql_async_nonblocking.zan`），所以字段不会自动变空串 | 构造函数里显式赋 `""`（或声明处 `= ""`）。这是规约，不是编译器会替你做的事 |
 | 界面元素画不出来 / 尺寸为 0 | 缩放因子字段没初始化（`pvScale == 0`），所有几何乘 0 | 构造函数里给全部缩放/DPI 字段赋初值；任何"比例"字段的默认值必须是恒等值 |
 | 运行时才崩，编译期没报 | 编译器把"读不存在的成员"静默折成 0 | 补诊断（`tests/diag/`），不要在调用侧绕开 |

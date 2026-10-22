@@ -5,7 +5,7 @@
 Zan 采用 C# 风格的现代语法体系，初衷是让开发者拥有与 C# 相当的优雅表达力与高生产力，同时彻底剔除 CLR 虚拟机沉重的运行时包袱，获得原生 AOT 毫秒级启动、超低内存与确定性 ARC 原生性能。
 
 经过深入代码探查（`stdlib/`、`src/compiler/`、`src/lsp/`、`src/ide_zan/`），Zan 目前已经具备了非常扎实的基础：
-1. **语法与查询**：已原生支持完整 LINQ 查询语法糖（`from ... in ... where ... select ... join ... group ... by`）以及 `stdlib/System/Linq/Enumerable.zan` 丰富扩展方法。
+1. **语法与查询**：已原生支持完整 LINQ 查询语法糖（`from ... in ... where ... select ... join ... group ... by`）以及 `packages/Zan.Linq/src/System/Linq/Enumerable.zan` 丰富扩展方法。
 2. **序列化**：已拥有编译期 Source Generator 机制（`GenJson.zan` + AST 元数据重写），零运行时反射、高性能静态绑定。
 3. **工具链**：已拥有完整的自研 LSP (`zan-lsp`)、DAP (`zan-dap`) 和纯标准库组件自举的 `ZanIDE`。
 
@@ -33,7 +33,7 @@ Zan 采用 C# 风格的现代语法体系，初衷是让开发者拥有与 C# �
 * **现状痛点**：目前 Zan 的 LINQ 扩展方法（如 `Where`、`Select`）通过直接返回新的 `List<T>` 实现。虽然直观，但在多段链式调用（如 `.Where(...).Select(...).Take(...)`）中会产生多次中间临时 `List` 分配与释放。
 * **演进方案**：
   1. **基于值的轻量迭代器切片（ValueEnumerable / Struct Iterator）**：
-     - 在 `stdlib/System/Linq/` 中补充轻量级值结构体（`ValueWhereIterator<T>`, `ValueSelectIterator<T, R>`）。
+     - 在 `packages/Zan.Linq/src/System/Linq/` 中补充轻量级值结构体（`ValueWhereIterator<T>`, `ValueSelectIterator<T, R>`）。
      - 支持 `foreach` 鸭子类型（`MoveNext()` / `Current()`）直接消费，使得链式过滤与转换零额外堆分配，内联至等同于手写 `for` 循环。
   2. **Array / List 高性能切片（Span/ReadOnlySpan 心智）**：
      - 扩展 `Slice<T>` 与 `ArraySegment<T>`，提供零拷贝只读切片及常用字符串/集合分词操作，彻底对齐现代 C# 的 `Span<T>` 体验。
@@ -69,7 +69,7 @@ Zan 采用 C# 风格的现代语法体系，初衷是让开发者拥有与 C# �
 | 阶段 | 目标与里程碑 | 核心产出物 | 验证方式 |
 | :--- | :--- | :--- | :--- |
 | **Phase 1: ARC 防护与闭包预警** | 在编译器与 LSP 建立循环引用预警体系，彻底消除初学者从 C# 转 Zan 的泄漏恐慌 | 1. `checker.c` 闭包循环捕获检测与警告<br>2. `zan-lsp` 对应警告与诊断发布<br>3. 典型 GUI 事件回调防漏用例 | 增加 `tests/conformance/arc_cycle_warn.zan`，运行 `scripts/test.ps1 smoke` 验证 |
-| **Phase 2: Zero-Alloc 流式计算与切片** | 提供类似 C# LINQ 链式手感但无中间堆分配的流式结构体操作 | 1. `stdlib/System/Linq/ValueEnumerable.zan`<br>2. `List`/`Array` 零分配流式扩展方法 | 编写针对内存分配的性能探查测试，验证中间分配为 0 |
+| **Phase 2: Zero-Alloc 流式计算与切片** | 提供类似 C# LINQ 链式手感但无中间堆分配的流式结构体操作 | 1. `packages/Zan.Linq/src/System/Linq/ValueEnumerable.zan`<br>2. `List`/`Array` 零分配流式扩展方法 | 编写针对内存分配的性能探查测试，验证中间分配为 0 |
 | **Phase 3: 编译期实体映射升级 (JSON+DB)** | 让日常业务开发中 JSON 处理与数据库 CRUD 像 C# Dapper 一样丝滑 | 1. `GenJson.zan` 支持 `[JsonProperty]` 等丰富注解<br>2. 轻量编译期 SQLite 实体绑定扩展 | 编写实体自动解析测试用例，验证编译期展开无反射性能 |
 | **Phase 4: ZanIDE 与表单设计器极速体验** | 提升界面开发生产力，巩固轻量原生响应护城河 | 1. 表单设计器体验微调与对齐辅助<br>2. 虚拟化大列表控件<br>3. 局部布局快速预览能力 | 运行 ZanIDE 实际体验表单可视化排版与大列表加载 |
 

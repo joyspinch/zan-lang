@@ -872,9 +872,10 @@ if(ZAN_BUILD_CEF)
 endif()
 
 # ---- IDE ----
-# The IDE is built from src/ide_zan/ZanIDE.zan using the Zan compiler (zanc).
-# It is compiled separately: zanc src/ide_zan/ZanIDE.zan -o build/ZanIDE.exe
-# The old C-based zan-ide target has been removed in favour of ZanIDE.
+# The IDE is a normal zan.proj project (src/ide_zan/zan.proj, entry
+# src/IdeForm.html); it is built separately by scripts/build_ide.ps1, which
+# drives zanc over the project's sources and links the static native GUI
+# runtime. The old C-based zan-ide target has been removed in favour of it.
 
 # ---- Tests ----
 enable_testing()

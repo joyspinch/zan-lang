@@ -2,7 +2,7 @@
 
 > 引擎认什么、不认什么，改皮肤/CSS 前先查本册；正文只保留排版规范。
 
-皮肤/CSS 走 `stdlib/Gui/Css.zan` + `StyleSheet.zan`,它是 CSS 的**子集**,
+皮肤/CSS 走 `packages/Zan.Gui/src/Gui/Styling/Css.zan` + `StyleSheet.zan`,它是 CSS 的**子集**,
 写超出子集的写法会被静默丢掉(以前连"丢了多少"都看不见)。
 
 - **八位十六进制是 `AARRGGBB`,alpha 在前**(`#22c9962f` = alpha 0x22 的金色)。

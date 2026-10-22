@@ -13,7 +13,7 @@ description: 在 zan-lang 源仓库里用配套工具干活：查地图定位、
 
 1. **定位不读文件，查地图。** 读文件只为了改它。
 2. **改动必有判定器。** 说不出跑哪条命令验证的改动，不做。
-3. **日常只跑 target 化测试。** `standard`/`full` 是发布门（AGENTS.md Rule 8），全套 3904 条，日常跑会占满所有核且与本改动无关。
+3. **日常只跑 target 化测试。** `standard`/`full` 是发布门（AGENTS.md Rule 8），全套几千条用例，日常跑会占满所有核且与本改动无关。
 4. **多文件项目必须枚举全部源。** zanc 不自动拉取同项目兄弟 `.zan`，单入口编译必报 `undefined type`。
 
 ## 1. 定向：地图三问（毫秒级）
@@ -77,7 +77,7 @@ tools/agent/verify.ps1 -Paths tests/conformance/aes_gcm.zan -RunTests
   "归一化行尾后比较 `--stdout` 结果"，只差换行不算不格式。
 - **compile**：单文件编译失败会自动回退到**模块整体编译**（`packages/<Pkg>`、
   `tools/<Tool>`）；多文件项目因此不再假红。**不用 `--deny-warnings`**：
-  基线不干净时它会把 stdlib 既有告警升成错误（实测 Zan.Net
+  基线不干净时它会把 stdlib 既有告警升成错误（实测 stdlib/System/Threading
   `TaskCompletionSource.zan:101`），与本次改动无关。告警只报不拦。
 - **ctest**：正则不写死命中数，工具用 `ctest -N` 现场验证；命中 0 就报"映射失效"。
   已验证的前缀见 `tools/agent/verify.rules.json`。

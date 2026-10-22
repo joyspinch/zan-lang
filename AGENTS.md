@@ -42,7 +42,7 @@ short, enforceable summary.
 | `src/common/`   | Shared C utilities (json, rpc, host_oom)                        |
 | `src/lsp/`      | Language server (`zan-lsp`) + `intellisense.{c,h}` engine       |
 | `src/dap/`      | Debug adapter (`zan-dap`) + `debugger.{c,h}` engine             |
-| `src/ide_zan/`  | The IDE — self-hosted, written in Zan (`ZanIDE.zan` + components) |
+| `src/ide_zan/`  | The IDE — self-hosted, written in Zan (`src/shell/ZanIDE.zan` + `src/` 分层) |
 | `src/fmt/`, `src/doc/` | Formatter, doc generator   |
 | `src/selfhost/` | Self-hosted compiler sources (`.zan`)                           |
 | `stdlib/`       | Standard library (`.zan` source + native driver bundles)        |
@@ -216,9 +216,11 @@ positive, stated in the commit message.
     Full text: `docs/WORKSPACE_CONVENTIONS.md` §10.
 
 13. **经验沉淀纪律：验证过的教训必须进 skill，且持续增删迭代。** 项目级
-    skills 在 `.agents/skills/`（当前清单与准入标准见
-    `.agents/skills/SKILLS_GOVERNANCE.md`，已收敛为 8 个通用规范类；
-    项目专属的 game-online/app-migration/testing-* 已删，历史在 git）。规则：
+    skills 在 `.agents/skills/`（当前 13 个：通用规范类 9 + SDK 使用面 3 +
+    仓库专属 1；清单与准入标准见
+    `.agents/skills/SKILLS_GOVERNANCE.md`。发布变体
+    `tools/ai_pack/skills/` 12 个，随 SDK 进 `dist/ai/skills/`；
+    项目专属的 game-online/testing-* 已删，历史在 git）。规则：
     - 会话中**验证过**的新经验（踩坑后成立的解法）当天并入对应 skill，
       与功能同一提交；跨项目可复用的写通用节，项目专属写项目节。
     - 被**推翻**的旧经验在同一提交里删除——skill 里不留"可能也对"的
@@ -324,7 +326,7 @@ up TDM-GCC from PATH cannot link zanc, and the failed link deletes
 ```bash
 cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 pwsh -File scripts/build.ps1        # 构建（受串行闸保护，多会话时用这个）
-# IDE (self-hosted) is built from src/ide_zan/ZanIDE.zan by zanc.
+# IDE (self-hosted) is a zan.proj project: scripts/build_ide.ps1 (entry src/IdeForm.html).
 ```
 
 **并发时不要裸跑 `cmake --build build`** —— 它没有闸，多会话会互踩 `build\zanc.exe`，

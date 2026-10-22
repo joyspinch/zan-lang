@@ -1,4 +1,4 @@
-﻿# Zan Compiler Development Standards
+# Zan Compiler Development Standards
 
 ## 1. Language & Tooling
 
@@ -246,7 +246,7 @@ programs with golden-file expectations:
   expected diagnostics.
 - `tests/runtime/*.c` — C-level runtime tests.
 
-Example (`tests/conformance/hello.zan`):
+Example（最小用例长这样：`<name>.zan` + 同名 `<name>.out` 放期望输出）：
 
 ```csharp
 using System;

@@ -53,7 +53,7 @@ Notes:
 - The **CLIs** (`zanc`, `zan-lsp`, `zan-dap`, `zanfmt`, `zandoc`) build
   natively on all three OSes today — `CMakeLists.txt` already has the non-Windows
   link path (`stdc++ m pthread`). Only the **IDE build recipe** (native GUI runtime
-  + linking `ZanIDE.zan`) is currently Windows-only and must be ported.
+  + linking the IDE project) is currently Windows-only and must be ported.
 - `zanc` cross-compiles **user programs** (distinct from IDE distribution above)
   from any host to Linux (`linux-x64`/`linux-musl`/`linux-arm64`/`linux-riscv64`,
   static musl ELF — full runtime), Windows (`win-x64`/`win-arm64`) and macOS
@@ -133,7 +133,7 @@ cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release `
       -DCMAKE_LINKER=lld-link -DLLVM_DIR=<llvm>/lib/cmake/llvm `
       -DZAN_MINGW_ROOT=C:/TDM-GCC-64
 cmake --build build
-# 2. IDE (zanc compiles ZanIDE.zan; GUI runtime statically linked in; also compiles the app icon)
+# 2. IDE (scripts\build_ide.ps1: zan.proj project, entry src/IdeForm.html; GUI runtime statically linked in; also compiles the app icon)
 powershell -ExecutionPolicy Bypass -File scripts\build_ide.ps1
 # 3. assemble the self-contained bundle into dist\win-x64 (bumps VERSION unless -NoBump)
 powershell -ExecutionPolicy Bypass -File scripts\publish_ide.ps1 -SkipBuild
@@ -148,7 +148,7 @@ TDM-GCC (bundled ld).
    LLVM → builds `zanc`, `zan-lsp`, `zan-dap`, `zanfmt`, `zandoc`.
 2. Build the native GUI runtime for the platform shell (X11 / Cocoa) →
    `zan_gui.a`.
-3. `zanc src/ide_zan/ZanIDE.zan -o build/ZanIDE` linking `zan_gui.a`.
+3. Build the IDE project (`src/ide_zan/zan.proj`, entry `src/IdeForm.html`) linking `zan_gui.a`.
 4. A `publish_ide.sh` mirroring `publish_ide.ps1` assembles `dist/` with the
    POSIX file names from §3.
 

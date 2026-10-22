@@ -82,7 +82,7 @@ _scratch\probe.exe
 
 | 位置 | 错误写法 | 正确写法 | 说明 |
 | --- | --- | --- | --- |
-| `packages/Zan.Gui/src/Gui/Widget/CodeBlock.zan` | `app.theme.surface` | `app.theme.bgSecondary` | Theme 没有 `surface` |
+| `packages/Zan.Gui.CodeEditor/src/Gui/Widget/CodeBlock.zan` | `app.theme.surface` | `app.theme.bgSecondary` | Theme 没有 `surface` |
 | `packages/Zan.Gui/src/Gui/Widget/Label.zan` | `app.theme.windowW` | `app.canvas.Width()` | 窗口宽度不在 Theme 上 |
 | `packages/Zan.Gui.DataTable/src/Gui/Component/DataTable/DataTable.Compute.zan` | `dispRows[i].level` | 经 `groups[gi].level` 查 | 层级在分组行上，不在显示行上 |
 | `templates/server/server-iot/.../Routes.gen.zan` | `.Group("iot")` / `.Rank(9)` | `.Meta("Group","iot")` / `.Meta("Rank","9")` | `Route` 没有这两个方法，元数据走 `Meta` |

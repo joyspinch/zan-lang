@@ -169,7 +169,7 @@
 
 ## 七、 自动化素材管线工具链 (`AssetPipeline`)
 
-引擎提供了完整的 CLI 素材工具 `packages/Zan.Game/tools/game_asset_tool.zan` 与辅助脚本 `scripts/game_asset_tool.ps1`：
+引擎提供了完整的 CLI 素材工具 `scripts/game_asset_tool.ps1`（命令：`atlas` / `mirror5` / `paperdoll`）：
 
 1. **图集尺寸与 UV 自动计算**：
    - 给定精灵帧尺寸与帧数，自动计算最佳紧凑二次幂（POT: 256/512/1024/2048/4096）贴图尺寸，导出标准图集 JSON 元数据。

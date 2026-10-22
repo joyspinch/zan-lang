@@ -82,7 +82,7 @@ templates/<group>/<id>/template.manifest
 - 设备尺寸行只在 `selTpl != null && selTpl.sizeable && sizeSel != null` 时出现——
   控制台/类库/服务端模板不显示无意义的控件。
 - IDE 侧状态：`pSizeSel` / `pSizeWIn` / `pSizeHIn` / `pSizeSeededFor`
-  （`ZanIDE.State.zan`，初始化在 `ZanIDE.zan` 的 `InitDialogState` 附近）。
+  （`src/ide_zan/src/shell/ZanIDE.State.zan`，初始化在 `src/ide_zan/src/shell/ZanIDE.Startup.zan` 的 `InitDialogState` 附近）。
   选中模板变化时用模板自身 `size` **种子填充**输入框，保证"直接点创建"= 预览所见。
 
 ## 脚手架要点（`ZanIDE.Workspace.zan`）

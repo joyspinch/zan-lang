@@ -15,7 +15,7 @@
 | `src/fmt/`, `src/doc/` | C | `zanfmt` 格式化、`zandoc` 文档抽取 |
 | `src/selfhost/` | Zan | 自举相关 |
 | `src/ide_zan/` | **Zan** | 自举 IDE（编辑器、设计器、面板、AI 助手、市场客户端） |
-| `stdlib/` | **Zan** | 标准库：`System`（核心/IO/网络/DB/文本）、`Gui`、`Game`、`Platform`、`Sdk` |
+| `stdlib/` | **Zan** | 标准库核心：只有 `System`（核心类型/集合/IO/Json/Text/线程/编译器） |
 | `templates/` | 混合 | IDE"新建项目"模板（`console/ gui/ library/ server/`） |
 | `tests/` | 混合 | 测试用例（见 [testing.md](testing.md)） |
 | `examples/` | Zan | 示例与真实项目 |
@@ -46,22 +46,25 @@
 
 ## IDE（Zan 自举）
 
-`src/ide_zan/` 是一个 `partial class ZanIDE` 切成多个文件：
+`src/ide_zan/` 是自举 IDE：一个 `zan.proj` 工程（`src/ide_zan/zan.proj`，入口
+`src/IdeForm.html`），源码在 `src/ide_zan/src/` 下按职责分层（`shell/`
+`panels/` `editor/` `dialogs/` `pages/` `services/` `models/` `components/`
+`views/`），是一个 `partial class ZanIDE` 切成多个文件：
 
 | 文件 | 职责 | grep 入口 |
 | --- | --- | --- |
-| `ZanIDE.zan` (310K) | `Main`、`Run` 主循环、初始化、Ribbon/菜单命令分发 | `static void Main`, `void Run()`, `Init...(` |
-| `ZanIDE.State.zan` | 所有 UI 状态字段声明（信号、输入框、选择项） | 字段名 |
-| `ZanIDE.Shell.zan` | 子窗口泵：向导/发布/文件选择器的每帧处理与结果落地 | `PumpWizardWindow` |
-| `ZanIDE.Workspace.zan` | 项目/文件系统：模板目录扫描、脚手架、`zan.proj`、模板另存 | `BuildCatalog`, `CreateProjectT`, `CreateFile` |
-| `ZanIDE.CodeNav.zan` | 代码导航、大纲、窗体文档模型（`FormDoc`/`FormFieldDoc`）与代码生成 | `class FormDoc`, `FreeFormBody` |
-| `ZanIDE.Panels.zan` | 面板（输出、问题、终端、Git、资源…）渲染与命令 | 面板标题字符串 |
-| `ZanIDE.Docs.zan`, `views/DocsData.zan`, `views/DocsPage.zan` | 内置文档/示例浏览器 | `DocsData` |
-| `LspSession.zan`, `DebugSession.zan`, `ZanIDE.Dap.zan` | 连接 `src/lsp`、`src/dap` | `LspSession`, `DebugSession` |
-| `AiAgent.zan`, `AiTeam.zan`, `AiNet.zan` | 内置 AI 助手（会话、工具调用、多角色） | `AiAgent` |
-| `Marketplace*.zan` | 插件/组件市场客户端（已有骨架） | `Marketplace` |
-| `AssetManager.zan` | 资源管理 | `AssetManager` |
-| `IdeVersion.zan` | 版本与 commit（构建时生成/校验） | `IdeVersion` |
+| `shell/ZanIDE.zan` (40K) | `Main`、`Run` 主循环、初始化、Ribbon/菜单命令分发 | `static void Main`, `void Run()`, `Init...(` |
+| `shell/ZanIDE.State.zan` | 所有 UI 状态字段声明（信号、输入框、选择项） | 字段名 |
+| `shell/ZanIDE.Shell.zan` | 子窗口泵：向导/发布/文件选择器的每帧处理与结果落地 | `PumpWizardWindow` |
+| `shell/ZanIDE.Workspace.zan` | 项目/文件系统：模板目录扫描、脚手架、`zan.proj`、模板另存 | `BuildCatalog`, `CreateProjectT`, `CreateFile` |
+| `editor/ZanIDE.CodeNav.zan` | 代码导航、大纲、窗体文档模型（`FormDoc`/`FormFieldDoc`）与代码生成 | `class FormDoc`, `FreeFormBody` |
+| `panels/*Panel.zan`（18 个） | 面板（输出、问题、终端、Git、资源…）渲染与命令 | 面板标题字符串 |
+| `views/DocsData.zan`, `pages/DocsPage.zan` | 内置文档/示例浏览器 | `DocsData` |
+| `services/LspSession.zan`, `services/DebugSession.zan`, `editor/ZanIDE.Dap.zan` | 连接 `src/lsp`、`src/dap` | `LspSession`, `DebugSession` |
+| `services/AiAgent.zan`, `services/AiTeam.zan`, `services/AiNet.zan` | 内置 AI 助手（会话、工具调用、多角色） | `AiAgent` |
+| `models/marketplace/` | 插件/组件市场客户端（已有骨架） | `Marketplace` |
+| `views/AssetManager.zan` | 资源管理 | `AssetManager` |
+| `services/IdeVersion.zan` | 版本与 commit（构建时生成/校验） | `IdeVersion` |
 
 **IDE 是 Zan 写的**：改 IDE 就是写 Zan 代码，会同时受编译器能力约束。IDE 编不过时，
 先分清是"IDE 代码写错"还是"编译器缺陷"（见 [debugging-playbook.md](debugging-playbook.md)）。
@@ -70,14 +73,14 @@
 
 | 路径 | 内容 |
 | --- | --- |
-| `stdlib/System/` | 核心类型、集合、IO、Json、Text（含 Regex）、Net（Http/Ws/Mqtt/Tls/Rpc/Sse）、Data/DB、Web（Router/ApiDocs/…） |
+| `stdlib/System/` | 核心类型、集合、IO、Json、Text、线程、编译器（`System/Compiler/` 放 GenForm/GenRoute 等生成器） |
 | `packages/Zan.Gui/src/Gui/` | GUI 框架，见 [gui-development.md](gui-development.md) |
 | `packages/Zan.Gui/src/Gui/Widget/` (58 个) | 基础控件：Button/Input/Table/Tabs/Ribbon/ToolStrip/StatusBar/SplitPanel/Wizard… |
 | `packages/Zan.Gui/src/Gui/Component/` | 复合组件：Chart、DataTable、CodeEditor、WebView、Dock、FilePicker、PivotTable… |
 | `packages/Zan.Gui/src/Gui/Hmi/` | 工控：`IoTag`、`Indicator`(LED/数显)、`Gauge`、`Trend`、`Alarm`、`NumPad`、`EquipPanel` |
 | `packages/Zan.Gui/src/Gui/Designer/` | 表单设计器（`Designer.zan`、`Designer.Form.zan`、`Designer.Inspector.zan`） |
 | `packages/Zan.Gui/src/Gui/skins/`, `drivers/`, `Backend/` | 皮肤资源、原生驱动绑定、后端 |
-| `stdlib/Game/`, `stdlib/Platform/`, `stdlib/Sdk/` | 游戏引擎、平台 API（Windows 托盘/打印/服务/自动化…）、第三方 SDK |
+| `packages/Zan.Game*/`、`packages/Zan.Sdk.*`、`packages/Zan.Platform.Compat` | 游戏引擎族、第三方 SDK、平台 API 兼容层 |
 
 ## 常见需求 → 落点
 
@@ -90,10 +93,10 @@
 | 主题/皮肤 | `packages/Zan.Gui/src/Gui/Styling/Theme.zan`, `Skin.zan`, `Style*.zan`, `skins/` |
 | 设计器行为 | `packages/Zan.Gui/src/Gui/Designer/*` + `stdlib/System/Compiler/GenForm.zan`（`.html` 设计稿 → 代码） |
 | 新建项目模板 | `templates/**/template.manifest` + `ZanIDE.Workspace.zan`（见 [templates-and-wizard.md](templates-and-wizard.md)） |
-| IDE 面板/命令 | `ZanIDE.Panels.zan` + `ZanIDE.zan`（命令分发）+ `ZanIDE.State.zan`（状态） |
+| IDE 面板/命令 | `panels/*Panel.zan` + `shell/ZanIDE.zan`（命令分发）+ `shell/ZanIDE.State.zan`（状态） |
 | 补全/跳转/悬停 | `src/lsp/` + `LspSession.zan` |
 | 调试器 | `src/dap/` + `DebugSession.zan`, `ZanIDE.Dap.zan` |
-| Web 路由/接口文档 | `stdlib/System/Web/Router.zan`, `ApiDocs.zan` + `stdlib/System/Compiler/GenRoute.zan` |
+| Web 路由/接口文档 | `packages/Zan.Web/src/System/Web/Router.zan`, `ApiDocs.zan` + `stdlib/System/Compiler/GenRoute.zan` |
 
 ## 工具链命令（都在仓库根执行）
 

@@ -1,11 +1,11 @@
 ---
 name: gui-design
-description: Zan GUI (stdlib/Gui) 审美与排版规范——对齐、间距、尺寸档位统一、层级与克制，常用风格配方，截图还原流程，以及排版原语纪律。用 stdlib/Gui 写界面、做皮肤换风格、用户提到 好看/美观/对齐/间距/风格/审美 时使用；界面出现 控件重叠/排版混乱/尺寸忽大忽小/毛边锯齿、画图表斜线曲线、HTML+CSS 写窗口、游戏中用 Gui 组件做 HUD/菜单/面板或控件与游戏美术风格不搭 时也用它。
+description: Zan GUI (Zan.Gui 包) 审美与排版规范——对齐、间距、尺寸档位统一、层级与克制，常用风格配方，截图还原流程，以及排版原语纪律。用 Zan.Gui 组件写界面、做皮肤换风格、用户提到 好看/美观/对齐/间距/风格/审美 时使用；界面出现 控件重叠/排版混乱/尺寸忽大忽小/毛边锯齿、画图表斜线曲线、HTML+CSS 写窗口、游戏中用 Gui 组件做 HUD/菜单/面板或控件与游戏美术风格不搭 时也用它。
 ---
 
 # Zan GUI 界面审美规范
 
-**精美 = 一致 + 克制 + 有方向。** 一致靠档位:stdlib/Gui 内置了字号、高度、
+**精美 = 一致 + 克制 + 有方向。** 一致靠档位:Zan.Gui 内置了字号、高度、
 间距三套全库统一的阶梯 token,永远从档位里取值,界面就自动"齐";克制靠取舍:
 一个画面只有一个视觉重心;方向靠配方:选定风格方向后,一切从那张配方卡推导。
 
@@ -442,13 +442,13 @@ description: Zan GUI (stdlib/Gui) 审美与排版规范——对齐、间距、�
   标志),下一帧才认选择。
 - **提示气泡会盖住弹出的菜单**:菜单开着时撤掉触发按钮的气泡(宿主告知组件
   "菜单开着",如 `SetOverflowMenuOpen`),气泡画在菜单之上,会挡住菜单第一项。
-- 觉得某控件"不精美"→ 修 `stdlib/Gui/Widget/` 或 `skins/base.css` 里的规则,
+- 觉得某控件"不精美"→ 修 `packages/Zan.Gui/src/Gui/Widget/` 或 `skins/base.css` 里的规则,
   让所有使用处一起变好;新皮肤值写进皮肤包的 `:root`,不散落。
 - **新增 Gui 类先查重名**:历史上有在 `Gui.Component` 下新增
   彩带动画组件 `Ribbon`,把 SceneDesigner 等只 `using Gui.Component` 的文件里
   裸写的 `Gui.Widget.Ribbon`(功能区控件)整体劫持到新类上,调用点报
   "no member",离肇因提交很远——Zan 的名字解析按 using 就近绑定,同名类不警告。
-  新增类落名前 `grep -rn "class <Name>" stdlib/Gui/`;撞名要么改名、要么调用点限定名。
+  新增类落名前 `grep -rn "class <Name>" packages/Zan.Gui/src/Gui/`;撞名要么改名、要么调用点限定名。
 - **纯几何消费点击的控件必须自己注册命中区**(Tabs 页签条教训):不走
   On 通用事件包、按几何自己判点击的区域,要 `app.hitTester.RegisterRect`
   自己的条带——FireCommon 只给 `On.Any` 的控件注册命中区,宿主只用
@@ -1402,9 +1402,9 @@ ScreenToClient 与应用鼠标坐标同帧对照,不用注入式 SetCursorPos
   棘轮;新组件必带 conformance 测试(`docs/STDLIB_COMPONENT_STANDARDS.md`)。
 - 构建回归:`scripts\build_gallery.ps1` + `scripts\build_ide.ps1` 必须过;
   视觉检查用 gallery 深链(组件名+皮肤直达,如 `./gui_gallery Slider
-  liquidglass zh`),完整构建/启动流程见仓库文档;
-  像素级改动参照 `tests/conformance/conformance_gui_chart_symbol` 加离屏回归。
-- 新增内置皮肤:在 `stdlib/Gui/skins/<name>/skin.css` 建包即可自动发现
+  dark zh`),完整构建/启动流程见仓库文档;
+  像素级改动参照 `tests/gui/chart_symbol_test.zan`（ctest 用例 `conformance_gui_chart_symbol`） 加离屏回归。
+- 新增内置皮肤:在 `packages/Zan.Gui/src/Gui/skins/<name>/skin.css` 建包即可自动发现
   (可选 `banner.png` 预览图)。
 - 留白(间距/圆角/字号)与动效时长守门:`scripts\style_audit.py` 扫描
   `packages/Zan.Gui/src/Gui/skins/base.css` 与 `src/ide_zan/assets/ide.css`
