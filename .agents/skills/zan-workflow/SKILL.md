@@ -183,6 +183,19 @@ description: 版本提交与任务管理规范——提交信息格式（scope: 
     是提交前的旧内容；`git diff --cached` 显示自己刚提交的改动被反向撤销。
     后续任何提交若不先 reset，那 5 个文件都会被按旧内容提交——功能"凭空变回
     去"。发现时工作区内容是对的，reset 一下即修好。
+- **判"这条红灯是不是我造成的"：先比 exe 与源文件的时间戳**。共享工作树里
+  别的会话改了编译器源码并**重新链接了 `build/zanc.exe`**，你随后跑测试看到
+  的行为就**包含他们未提交的改动**——红灯可能是他们的，不是你的。
+  - 动作：比 `build/zanc.exe` 与被改源文件的 mtime——exe 更新 ⇒ exe 里含
+    未提交改动；再用 `git status` 确认那个文件确实在途。判完再决定是自己的
+    锅还是别人的。
+  - 坑出处（2026-10-22）：清掉 `Zan.Gui` 的 97 处无效 `using`（A488）后跑
+    受影响用例，`conformance_gui_inputnumber` 红了（golden 写
+    `ex unknown 0`、实际输出 `ex unknown false`）。查下来是并发会话**未提交**
+    的 A492 改动（`src/compiler/irgen_call.c` 让 `Convert.ToString(bool)`
+    改渲染 "true"/"false"），`zanc.exe` 比该文件新两分钟——那条 golden 要跟
+    着他们那条线一起更新。没查时间戳就改 golden，等于替别人的在途改动背锅，
+    还可能把 golden 改成错的方向。
 
 ## 三、任务台账（TASKS.md）：挂账有据，清账移单
 

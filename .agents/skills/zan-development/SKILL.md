@@ -419,6 +419,24 @@ Without MCP the same index is a file: `knowledge/symbols.json` next to the SDK
   `OrderBy` / `MergeSort*` 每次调用都新分配一组 `T[]` + 键数组 + 结果 `List`
   ——放在"每帧重建一次"的渲染计划这类热路径上就是纯 GC 压力。包内自带一份
   **复用缓冲**的归并排序更合适（`List<T>` 没有 `Sort`，见上面那条）。
+* **`using` 指向不存在的命名空间是纯 no-op——只打一条 `ZANPKG_MISSING`
+  警告，不引入任何名字**（实证，2026-10-30）：编译器按"命名空间 = 目录"找包
+  （`src/compiler/main.c` 的 `auto_include_namespace` →
+  `zan_pkg_source_index_visit` → `pkg_index_find_namespace`），而包索引是按
+  文件**声明的命名空间**建桶的——`packages/Zan.Gui/src/Gui/Rendering/` 里的
+  文件声明的是 `namespace Gui;`，所以既没有 `namespace Gui.Rendering;` 可供
+  索引，那个目录**也不会**被当命名空间导入。找不到 = 只打警告。
+  - 两条推论：① 写 `using` 指向不存在的命名空间**不会编译失败**，只留一条
+    噪声——所以"能编过"不等于"写对了"；② 删掉这类 `using` **不改变任何名字
+    解析**，可以放心清。仓库里曾有 97 处这样的 `using`（三个 GUI 包），已清。
+* **命名空间与目录是解耦的**（实证，2026-10-30）：`packages/*/src/A/B/C/`
+  里的文件可以声明 `namespace A;`——目录只用来"给命名空间找包"，不决定
+  命名空间本身。写 `using A.B.C;` 之前先确认**真有这么个命名空间**
+  （`grep -rn '^namespace A.B.C' packages/ stdlib/`），别看着目录名就写。
+* **子命名空间的类型要显式 `using`**（实证，2026-10-30）：`using System;`
+  会把 `stdlib/System` 整棵子树拉进来，靠它"顺便"解析到 `System.Json` 的
+  `JsonValue` 是**依赖副作用**——要 `JsonValue` 就写 `using System.Json;`
+  （仓库里 6700+ 个文件都这么写），别指望父命名空间兜底。
 ## 4. Edit
 
 `edit_file(path, old, new)` (MCP) replaces an exact snippet in place — the
