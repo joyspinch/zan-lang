@@ -8,6 +8,33 @@
 
 ## 未完成
 
+### [ ] A495 八条 conformance 用例在 `--check-leaks` 下报泄漏——所有权欠账浮出
+
+- 现象（2026-10-22 合并测试孪生档时浮出）：这八条用例在 `--check-leaks` 下报
+  "memory leak detected"，对象在退出时仍可达——
+  `closure_cycle_warning`（4 个）、`null_guard_order`（1 个，
+  `conformance/null_guard_order.zan:10`）、`oss_storage`（27 个）、
+  `designer_html`（5256 个，JsonValue / PropertyGrid / Designer 一片）、
+  `designer_prepared_async`、`game_data_table`、
+  `gui_declarative_html_modern_test`、`sse_sink_take_co`。
+- **不是插桩带来的假阳性**：`--check-leaks` 单独编译也报同样的数，
+  `--arc-guard` 单独编译不报（`oss_storage` 在 `--check-leaks` 单独编译下还会
+  崩，0xC0000005；双插桩下不崩）。普通版（无插桩）输出与 golden 逐字节一致
+  ——功能面是好的，漏的是所有权。
+- 为什么现在才看见：旧世界里这八条只红在 `leakcheck_*` 孪生档上，而那条档属于
+  full 档，是发布门控、没人常规跑（AGENTS.md 规则 8）。2026-10-22 把四个孪生
+  档合成一条 `case_*`（一次插桩编译、一次运行同时给 conformance/泄漏/ARC 三
+  个结论）后，泄漏结论进了 standard 档，这八条当场浮出来。
+- 现状：这八条按仓库既有机制（孪生档的 `_known_leaky` + WILL_FAIL）登记成
+  "预期泄漏"——泄漏报告必须出现，修好了就翻红提醒把它从名单里拿掉；golden
+  走未插桩的普通版（泄漏报告打在 stdout 上，插桩版比不过 golden）。
+- 方向：这是所有权欠账，可能一半在 stdlib 容器/组件（闭包环、JsonValue 与
+  Dictionary 的字段持有、Designer 的对象图、SseSink 的缓冲），一半在代码生成
+  侧漏了释放，要逐条看站哪边。`closure_cycle_warning` 是**用例故意造环**，
+  它的正确归宿是"预期泄漏"而不是"修好"；其余七条该修。
+- 关联：`array_local_free` 是另一类——它量的是进程内存，插桩自己的记账
+  （几十 MB）把它测的东西搅了（普通版 "sync ok"，插桩版 "sync leaked 25492KB"）。
+  它的 golden 也走普通版，泄漏结论照常在插桩版上判。
 ### [ ] A468 宿主与自举在「`await` 一个非协程操作数」上分叉
 
 - 现象：宿主把 `await <非协程>` **降级成普通求值**
@@ -1585,7 +1612,7 @@
   - 原生成员表（`builtin_api`）必须与发码侧分派点**逐条对齐**——漏一条不是"少报
     一个错"，而是整个标准库都编不过。
 - 验证（2026-10-22）：`ctest -R '^diag_'` 156/156 通过；
-  `ctest -R conformance_native_member_call` 通过（原生成员 `int/long/double.Parse`、
+  `ctest -R case_native_member_call` 通过（原生成员 `int/long/double.Parse`、
   `string.ToBytes`、`string.AsSpan` 可正常调用）；19 个外部 GUI 项目整包编译
   OK=19 FAIL=0（6189 个文件零错误）。新增用例：`tests/diag/call_unknown_method.zan`、
   `call_unknown_method_name.zan`、`call_unknown_method_name_lib_{a,b}.zan`、
@@ -1776,7 +1803,7 @@
     三元表达式（简单名与限定名开头都不被误判成声明）→ 单跑通过；
   - `pkg_sweep` 62 个包全绿；`diag` 153/153 通过；模板门 37 个模板 0 finding；
   - `conformance` smoke 150 个用例：8 条失败全是 `conformance_gui_*`——其中 7 条
-    与改前**同一批**既有 GUI 用例；新增的 `conformance_gui_qrcode` 归因于另一会话
+    与改前**同一批**既有 GUI 用例；新增的 `case_gui_qrcode` 归因于另一会话
     新加的 `Zan.Barcode` 包与 `Zan.Gui` 的 `QrMatrix` 同名
     （`ambiguous type 'QrMatrix'`），该用例里没有任何 `?` / `[]` 类型声明，
     与本次前瞻改动无关；
@@ -2043,7 +2070,7 @@
   `DrawMesh3D`。
 - 关联：`Zan.Game.Render3D`（`docs/ECOSYSTEM_ROADMAP.md` §1.30）。
 
-### [ ] A491 三条与"测试产物路径"无关的既有红灯——ORM 调用了接口上不存在的方法
+### [x] A491 三条与"测试产物路径"无关的既有红灯——ORM 调用了接口上不存在的方法
 
 - 现象（2026-10-22 收口测试产物路径时撞到）：把 277 处用例产物路径改到
   `build\cases\` 之后，逐家族各跑一个用例，`standard` 层有 4 条红。这 4 条
@@ -2066,8 +2093,90 @@
   还小，或预算比较用的不是同一个量。
 - 关联：A490（同为"跑出来的红要先分清是不是自己造成的"）；本次路径收口的
   提交正文里记了同一份判据（先分宿主/自举/golden，再看是不是路径类）。
+- 修法（2026-10-22 闭账）：**三条都不是"接口缺方法"**，逐条查清后各归其位——
+  - **ORM 那条已经不是缺口**：编译期 ORM **不是接口方法**，而是编译器的
+    **代码生成器**（`stdlib/System/Compiler/GenDb.zan`）按调用点改写成
+    `__DbQ_<E>` / `__DbI_<E>` 类型化门面（`GenDbEmit.zan`）——接口上当然
+    没有 `Insert`；生成器只在**类型实参是具体实体类**时才改写
+    （`GenDb.IsRoot` 要求 `ClassGet(targ) != null`），`BaseRepository<T>` 里的
+    `T` 是类型形参 → 改写不了 → 才报"没有这个方法"。成因是 `b95f0a97d`
+    （2026-10-22 08:35，"成员存在性检查对齐发码口径"）之前检查器把
+    "所在类是泛型类"当放行理由。**`b95f0a97d` 已修**，本轮实测
+    `policy_server_mvc_ai_endpoint` / `server_mvc_readonly_action_lease`
+    **两个用例都 PASS**（7.67 s / 9.94 s）。**接口一个方法都不用补**——
+    补了反而多一份要同步的空契约（ORM 的真身是生成的门面，不在接口上）。
+  - **脚本判定 bug**：真凶是**写死的源文件计数 121**（MVC 包已长到 163），
+    不是"集合差异"——文案 `163 -> 163` 是文案本身误导（它只印计数，不印
+    判据）。改法：去掉写死的计数，改成**按相对路径逐个核对**（每个源文件
+    在安装目录都有对应文件 + 两侧计数相等 ⇒ 双射），既能抓丢失也能抓重复，
+    且不再随包增长而过期。
+  - **体积预算那条**：不是"预算比基线小"，而是**预算该重定基线**。查清：
+    ① `file 351744` 里 **106,360 B 是 `.rsrc`**——Windows publish 会把内置
+    默认图标 `assets/zan.ico` 塞进 PE（2026-10-20 从 28,752 B 换成合规的
+    105,903 B，旧文件在 48×48 之后是截断的坏条目，那次是修它）；图标是产品
+    资产不是运行时载荷，而这条预算的用途是抓固定大表 / 抓丢 `--gc-sections`
+    → 测量改用 `--no-icon`。② `.text` 实测 199,752（预算 200,000，只剩
+    248 B 余量）——这一个月 `src/runtime` +140 提交 / 净增 ~8.8K 行，
+    运行时载荷整体长大（linux 侧 .text 189,074 同步长高，排除平台特有），
+    预算自 2026-09-20 起没重定过基线。改法：按脚本头注的 ~1.5× 余量重新
+    定基线（宿主 .text 300,000 / file 368,000；linux .text 284,000 /
+    file 332,000），并把基线数写回
+    `docs/archive/embedded_runtime_assessment.md`。
+  - 顺带修掉脚本的**误标**：失败文案把**当前实测值**印成 `(baseline: …)`，
+    读起来像"和基线一样却还超预算"；改成 `(measured: …)`。
 
-### [ ] A492 bool 的「按静态类型渲染」只补了拼接路径——插值与 `Convert.ToString` 仍按 i1 宽度判
+### [ ] A493 运行时对象没编 `-ffunction-sections`——`--gc-sections` 剪不掉单个未用函数，hello world 背上整个运行时的 .text
+
+- 现象（2026-10-22 重定体积预算时撞到）：`size_budget_publish_host` 实测
+  `.text = 199,752`，而这份 hello world 只打印一行字。linux-x64 侧
+  `.text = 189,074`——两侧同步，说明是**通用运行时载荷**，不是平台特有。
+- 根因：`irgen_emit.c` 的 publish 模式已经"每函数一个 `.text.<fn>` 段"，
+  链接也传了 `--gc-sections`，但**运行时自身的 C 对象没编
+  `-ffunction-sections`**（`src/runtime/*.c`）——没有函数段，链接器就无法在
+  对象内部剪掉未用函数，于是整个运行时（ARC / 字符串 / 集合 / IO / 调度 /
+  网络 / JSON…）的代码全部进 `.text`。
+  `docs/archive/embedded_runtime_assessment.md` 的"2026-09-07 更新 2"早就
+  点出这一条（"剩余的交叉/native 差值收口依赖运行时对象补
+  `-ffunction-sections`（需 CI 重出提交对象，另案）"），至今未做。
+- 影响：体积预算只能靠"抬高阈值"来容纳，预算的**分辨力**随之下降——阈值
+  取 1.5× 于基线时，一次 +64 KB 的固定表回归不会被抓到（这正是这条预算
+  最初要抓的东西）。
+- 方向：给 `src/runtime/*.c`（以及会被链接进产物的驱动对象）加
+  `-ffunction-sections -fdata-sections`，重出提交对象；再把两个预算的基线
+  压回十万级。**注意**：跨平台预编译对象（`toolchain/**`、
+  `packages/**/drivers/**`）要一起重出，否则交叉产物不受益。
+- 关联：`docs/archive/embedded_runtime_assessment.md`（同一条，另案）、
+  A491（预算重新定基线的直接原因）。
+
+### [ ] A494 `BaseRepository<T>` 直接实例化会**静默**返回默认值——只有继承才能用
+
+- 现象（2026-10-22 查 A491 时撞到）：`packages/Zan.Data/src/System/Data/Orm/BaseRepository.zan`
+  是公开 API，`Orm/Models/ModelColumn.zan` 的用法注释也写着"使用
+  `BaseRepository<T>` 泛型仓储"。但**直接实例化**它（`new BaseRepository<U>(zsql)`）
+  时，编译通过、运行不报错，结果全是默认值：`Insert` 返回 0、`FindById` 返回
+  null、`SelectAll` 返回 null（后续访问直接空引用崩）、`Count` 0、`Any` false、
+  `DeleteById` 0。改成**继承**再用（`class UserRepo : BaseRepository<U>`）则
+  完全正常：`insert=1` / `found=alice` / `all=1` / `count=1` / `any=true`。
+- 根因：`BaseRepository<T>` 是**开放泛型模板**——编译器只在派生类里特化出
+  真身（`zan_parser_specialize_generic_bases`），模板体本身只留**运行期转发
+  桩**（见 `src/compiler/irgen_call.c` 的 `call_receiver_is_open_generic`）。
+  而编译期 ORM 代码生成器只在**类型实参是具体实体类**时才改写
+  `Insert<T>` / `Select<T>`；模板里的 `T` 是类型形参 → 改写不了 → 落到桩上
+  → **默认值**。真身里 `T` 已换成具体实体 → 改写成功 → 一切正常。
+  所以"接口该不该补 `Insert`/`Select`"这个问题本身是错的：**它们从来不是
+  接口方法**，补接口只会多一份要同步的空契约。
+- 影响：任何按文档"直接 new 一个仓储"的用户会拿到**静默的错误结果**
+  （写入 0 行、查不到数据），且没有一行报错——比编译失败更危险。
+- 方向（按代价排序）：
+  ① **运行期响亮失败**：转发桩在"没有被特化"时抛异常，而不是返回默认值
+    （落点：`src/compiler/irgen_call.c` 的桩发射 + `src/runtime/` 的桩实现）；
+  ② **让 `BaseRepository<T>` 不能被直接实例化**（抽象类 / 私有构造），把
+    "必须继承"这条契约写进类型系统；
+  ③ 至少在包文档与 `ModelColumn.zan` 的用法注释里写明"必须继承使用"。
+- 关联：A491（同一处代码的另一面：A491 问"接口要不要补方法"，答案是不要）；
+  `packages/Zan.Data/src/System/Data/Orm/BaseRepository.zan`。
+
+### [x] A492 bool 的「按静态类型渲染」只补了拼接路径——插值与 `Convert.ToString` 仍按 i1 宽度判
 
 - 现象（2026-10-22 探针 `_scratch/a442_bool_path.zan`，宿主 `build/zanc.exe` 实测）：
   ```zan
@@ -2097,3 +2206,26 @@
   `tests/conformance/list_wide_struct_ops.out` 的在途更新也在等这个修）——
   动手前先对齐，别两边各改一半。
 - 关联：A441（bool→字符串的口径统一，这条是它的余账）。
+- 现状（2026-10-22 已闭账）：宿主侧抽出一个共用助手
+  `emit_bool_cond`（`src/compiler/irgen_generics.c`，紧跟 `emit_bool_to_cstr`），
+  判据是**语义类型**而不是 LLVM 宽度——`infer_expr_type` 说是 bool 就认：i1 直接
+  用，宽化过的 i64 先 `icmp ne 0` 再渲染。四条取串路径全部改用它：拼接
+  （`emit_to_cstr_of`）、插值（`src/compiler/irgen_expr.c`）、`Convert.ToString`
+  与标量 `ToString()`（`src/compiler/irgen_call.c`）。**自举侧不用改**——
+  它的 `ToCStr` 本来就按 `v.ty.sval == "bool"` 判语义类型。
+- 回归：`tests/conformance/bool_widened_rendering.zan` 覆盖七条路径（变量、拼接、
+  插值、`string.Format`、`Convert.ToString`、`ToString()`、`Console.WriteLine`），
+  全部渲染成 true/false；该用例进了自举差分门清单（`tests/selfhost/diff_cases.txt`）。
+- golden：9 份按宿主当前实际输出重写（dict_remove_churn、json_entity_mapping、
+  linq_csharp_overloads、linq_equality、missing_values、nested_delegate_decl、
+  orm_zansql、regex、stream_io）；`web_cookie_headers.zan` 源码里写死的旧口径
+  `"1"` 改成 `"true"`。**原先以为要改 11 份**——`chart_axis_breaks` 与
+  `directory_paths` 里根本没有 bool（`prct=1` 是百分比、`dirs=1` 是计数），
+  上轮重写只动了行尾（HEAD 里那两份带 CR CR LF），已还原成 HEAD 原字节，
+  不进本次提交。
+- 教训：**宽度不是类型**。判据取 LLVM 值的宽度时，同一个 bool 在不同上下文里
+  长得不一样（插值/`Convert.ToString`/`ToString` 渲染 "1"，拼接渲染 "true"）。
+  凡是把值转成字符串的地方，判据都该取语义类型。另一条：golden 里的 bool
+  常是**连着几个**（`"plus=" + IsMatch() + IsMatch()` 渲染成 "10"），按词边界
+  判会漏——重写 golden 必须按**逐位**对齐（老侧一个 0/1 对新侧一个 true/false），
+  这是 A441 漏判 123 份的同一个坑。

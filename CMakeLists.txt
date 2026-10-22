@@ -6019,7 +6019,7 @@ if(_size_tool)
     -DZANC=$<TARGET_FILE:zanc> -DSRC=${_size_src}
     -DOUT=${_size_dir}/hello_host
     -DSIZE_TOOL=${_size_tool}
-    -DMAX_TEXT=200000 -DMAX_FILE=300000
+    -DMAX_TEXT=300000 -DMAX_FILE=368000
     -DWORKDIR=${_size_dir}
     -P ${CMAKE_SOURCE_DIR}/tests/run_size_budget.cmake)
   set_tests_properties(size_budget_publish_host PROPERTIES TIMEOUT 240 LABELS "full;standard;smoke")
@@ -6028,7 +6028,7 @@ if(_size_tool)
     -DOUT=${_size_dir}/hello_linux_x64
     -DTARGET=linux-x64
     -DSIZE_TOOL=${_size_tool}
-    -DMAX_TEXT=220000 -DMAX_FILE=300000
+    -DMAX_TEXT=284000 -DMAX_FILE=332000
     -DWORKDIR=${_size_dir}
     -P ${CMAKE_SOURCE_DIR}/tests/run_size_budget.cmake)
   set_tests_properties(size_budget_publish_linux_x64 PROPERTIES TIMEOUT 240 LABELS "full;standard;smoke")

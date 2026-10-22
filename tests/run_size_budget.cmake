@@ -25,8 +25,12 @@ if(TARGET)
   set(_target_args --target ${TARGET})
 endif()
 
+# --no-icon: the built-in Windows icon is a shipped product asset (~106 KB
+# since the 2026-10-20 icon fix), not runtime payload. This budget exists to
+# catch a reintroduced fixed static table or a lost --gc-sections, so the
+# measurement must not move when the icon is regenerated.
 execute_process(
-  COMMAND ${ZANC} ${SRC} --auto-stdlib --publish ${_target_args} -o ${OUT}
+  COMMAND ${ZANC} ${SRC} --auto-stdlib --publish --no-icon ${_target_args} -o ${OUT}
   RESULT_VARIABLE _rc
   OUTPUT_VARIABLE _out
   ERROR_VARIABLE _err)
@@ -58,6 +62,6 @@ if(_file_size GREATER MAX_FILE)
   string(APPEND _verdict "  file ${_file_size} > budget ${MAX_FILE}\n")
 endif()
 if(NOT _verdict STREQUAL "")
-  message(FATAL_ERROR "size_budget: ${OUT} over budget\n${_verdict}(baseline: .text=${_text_size} file=${_file_size})")
+  message(FATAL_ERROR "size_budget: ${OUT} over budget\n${_verdict}(measured: .text=${_text_size} file=${_file_size}; icon excluded via --no-icon)")
 endif()
 message(STATUS "size_budget ok: ${OUT} .text=${_text_size} file=${_file_size}")

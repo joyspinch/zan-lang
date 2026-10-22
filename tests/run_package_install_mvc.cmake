@@ -33,11 +33,26 @@ file(SHA256 "${_installed}/src/ZanWeb/Framework/Ai/AiEndpointPolicy.zan" _instal
 if(NOT _source_hash STREQUAL _installed_hash)
   message(FATAL_ERROR "installed MVC source differs from source package")
 endif()
+# The install must carry every MVC source exactly once. Verify the two sets
+# match by relative path instead of pinning a source count: the package grows,
+# and the pinned number went stale (121 -> 163) while the message below kept
+# printing "163 -> 163", which reads like a duplication bug but was a stale
+# pin. Every source present plus equal counts proves a bijection, so this
+# catches both loss and duplication without a magic number.
 file(GLOB_RECURSE _source_files "${SRC}/src/*.zan")
 file(GLOB_RECURSE _installed_files "${_installed}/src/*.zan")
 list(LENGTH _source_files _source_count)
 list(LENGTH _installed_files _installed_count)
-if(NOT _source_count EQUAL 121 OR NOT _installed_count EQUAL _source_count)
+if(_source_count LESS 1)
+  message(FATAL_ERROR "MVC source glob found nothing under ${SRC}/src")
+endif()
+foreach(_f IN LISTS _source_files)
+  file(RELATIVE_PATH _rel "${SRC}/src" "${_f}")
+  if(NOT EXISTS "${_installed}/src/${_rel}")
+    message(FATAL_ERROR "MVC install lost ${_rel}")
+  endif()
+endforeach()
+if(NOT _installed_count EQUAL _source_count)
   message(FATAL_ERROR "MVC sources were duplicated or lost: ${_source_count} -> ${_installed_count}")
 endif()
 
