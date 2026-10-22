@@ -10,7 +10,12 @@ partial class Irgen {
         if (e == null) { return new ExprVal("0", MkType("int")); }
         int k = e.kind;
         if (k == AK.IntLit()) { return new ExprVal("" + e.IntLitValue(), MkType(e.IntLitTypeName())); }
-        if (k == AK.FloatLit()) { return new ExprVal(FloatConst(e.sval), MkType("double")); }
+        if (k == AK.FloatLit()) {
+            // an f/F literal is a float: the host emits it as an LLVM float,
+            // so its value is the text rounded to single precision
+            if (e.suffix == 1) { return new ExprVal(F32Const(e.sval), MkType("float")); }
+            return new ExprVal(FloatConst(e.sval), MkType("double"));
+        }
         if (k == AK.BoolLit()) { return new ExprVal("" + e.ival, MkType("bool")); }
         if (k == AK.CharLit()) { return new ExprVal("" + e.ival, MkType("char")); }
         if (k == AK.StringLit()) { return GenStr(e.sval); }
@@ -353,6 +358,43 @@ partial class Irgen {
         return t;
     }
 
+    // Is the type the host's `float` (an IEEE single)? The self-host keeps
+    // every float in a double slot, so the single precision shows up as an
+    // explicit round trip (the native backend's NarrowF32).
+    bool IsFloatTy(Node ty) {
+        if (ty == null) { return false; }
+        return ty.sval == "float" && ty.ival == 0;
+    }
+
+    // The single-precision rounding of a double value: double -> float ->
+    // double. A float-typed value carries only 24 bits of mantissa, exactly
+    // like the host's f32; rounding an already-narrowed value is idempotent.
+    string F32Round(string v) {
+        string t = NT();
+        L("  " + t + " = fptrunc double " + v + " to float");
+        string u = NT();
+        L("  " + u + " = fpext float " + t + " to double");
+        return u;
+    }
+
+    // An f/F literal is a float in the host: the text is rounded to single
+    // precision. LLVM's IR only accepts an exactly-representable `float`
+    // constant, so the rounding goes through the runtime's fptrunc.
+    string F32Const(string text) {
+        return F32Round(FloatConst(text));
+    }
+
+    // The result type of a floating-point operation, the C host's rule: two
+    // floats (or a float and an integer) stay in single precision; a double
+    // operand promotes the whole expression to double.
+    Node FloatResultTy(Node at, Node bt) {
+        bool ad = at != null && at.sval == "double" && at.ival == 0;
+        bool bd = bt != null && bt.sval == "double" && bt.ival == 0;
+        if (ad || bd) { return MkType("double"); }
+        if (IsFloatTy(at) || IsFloatTy(bt)) { return MkType("float"); }
+        return MkType("double");
+    }
+
     bool IsFoldOp(int op) {
         return op == TK.Plus() || op == TK.Minus() || op == TK.Star() || op == TK.Slash() || op == TK.Percent();
     }
@@ -637,7 +679,14 @@ partial class Irgen {
             if (fop != "") {
                 string t = NT();
                 L("  " + t + " = " + fop + " double " + da + ", " + db);
-                return new ExprVal(t, MkType("double"));
+                // a float-typed result carries single precision: the host
+                // computes it in f32
+                Node rty = FloatResultTy(a.ty, b.ty);
+                if (IsFloatTy(rty)) {
+                    t = F32Round(t);
+                    return new ExprVal(t, rty);
+                }
+                return new ExprVal(t, rty);
             }
             string fcp = FCmpOp(op);
             if (fcp != "") {
@@ -1940,6 +1989,10 @@ partial class Irgen {
                 return;
             }
             if (ArcManaged(v.ty)) { EmitArcRetain(v.op, v.ty); }
+            // a float element carries single precision: the host stores an f32
+            if (IsFloatTy(elemTy) && v.ty != null && IsDbl(v.ty)) {
+                v = new ExprVal(F32Round(v.op), v.ty);
+            }
             L("  store i64 " + ToI64(v.op, MapType(v.ty)) + ", i64* " + p);
             return;
         }
@@ -3574,6 +3627,9 @@ partial class Irgen {
         if (toD && !fromD && MapType(v.ty) == "i64") {
             string t = NT();
             L("  " + t + " = sitofp i64 " + v.op + " to double");
+            // a float target carries single precision: the host converts the
+            // integer to an f32
+            if (IsFloatTy(tgt)) { t = F32Round(t); }
             return new ExprVal(t, tgt);
         }
         // double -> int (truncating toward zero)
@@ -3581,6 +3637,10 @@ partial class Irgen {
             string t = NT();
             L("  " + t + " = fptosi double " + v.op + " to i64");
             return new ExprVal(t, tgt);
+        }
+        // -> float: the single-precision rounding (the host narrows to f32)
+        if (IsFloatTy(tgt) && fromD) {
+            return new ExprVal(F32Round(v.op), tgt);
         }
         // unsigned / small-width targets share the i64 slot, so their cast is a
         // wrap-to-width mask (zero-extend for uint/ushort, sign-extend from 8
@@ -3677,6 +3737,18 @@ partial class Irgen {
     // integer carriers are narrowed: a pointer, a double, a boxed nullable,
     // an erased type parameter or an array slot keeps its value.
     ExprVal NarrowToDeclared(ExprVal v, Node declTy) {
+        // a float-typed slot carries single precision: the host narrows the
+        // value to an f32 there (an integer is converted, then rounded)
+        if (IsFloatTy(declTy) && v != null && v.ty != null) {
+            if (IsDbl(v.ty)) {
+                return new ExprVal(F32Round(v.op), declTy);
+            }
+            if (MapType(v.ty) == "i64") {
+                string t = NT();
+                L("  " + t + " = sitofp i64 " + v.op + " to double");
+                return new ExprVal(F32Round(t), declTy);
+            }
+        }
         int bits = IntBits(declTy);
         if (bits == 0 || v == null || v.ty == null) { return v; }
         if (declTy.ival >= 1) { return v; }
