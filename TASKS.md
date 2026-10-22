@@ -91,6 +91,19 @@
   存量 phi 分组缺陷，批次回归照出——路径限定提交按文件取工作树，两修
   同文件同车，台账分记）。
 - 待办：自举半边（ngen 整数运算位宽同口径）；short/byte 的 C# 提升到
+- **收窄的前置推断缺口已修（2026-10-23，goal round 4）**：`infer_expr_type`
+  的混合位宽二元（long+int）曾返回 NULL（不提升）——发射端 coerce_int_pair
+  把臂对齐到 64 位所以数值碰巧没错，但外层表达式（`(long子式)/int`）会取
+  另一臂的 int 当整个表达式的类型，A510 收窄按它把 long 臂截回 i32：
+  `(9223372036854775807L - d)/10` 得 0、NumDigit 累加 2147483648 回绕成
+  -2147483648。修法：混合臂走 A514 同一条 `irgen_promote_pair`。
+  复验：numdig（2147483648/false）、divty 四条（922337203685477579 等）
+  全对；p03/p04 全绿。
+- **此缺口同时是自举字面量分叉的真因**：gen1（自举编译器）由宿主编译，
+  其 lexer 的字面量累加同被截断，`long h = 2147483648;` 被误报
+  "narrowing conversion from 'ulong'"、stdlib/System/Text/Encoding.zan
+  整个编不过（gen1 拉入即炸）。宿主 infer 修复后 gen1 重编即通过——
+  未改自举一行。
   int（现也 64 位）留观。
 - 探针：`_scratch/csaudit/numeric/{p03,p04,p12}`。
 

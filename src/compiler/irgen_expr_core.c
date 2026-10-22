@@ -2210,6 +2210,17 @@ static zan_type_t *infer_expr_type_raw(zan_irgen_t *g, zan_ast_node_t *e,
             if ((lt && lt->kind == TYPE_ULONG) || (rt && rt->kind == TYPE_ULONG))
                 return g->binder->type_ulong;
             if (lt && rt && lt->kind == rt->kind) return lt;
+            if (lt && rt) {
+                /* A510 收窄的前置：混合位宽数值要按 C# 提升定型
+                 * （long+int → long）。曾返回 NULL——发射端 coerce_int_pair
+                 * 会把臂对齐到 64 位所以数值碰巧没错，但定型为 NULL 后外层
+                 * 表达式（如 `(long子式)/int`）会取另一臂的 int 当整个表达
+                 * 式的类型；A510 的 32 位收窄按这个错误定型截断 long 臂，
+                 * 2147483648 被截回 -2147483648（numdig/Encoding.zan 一线）。
+                 * 用 A514 同一条 irgen_promote_pair。 */
+                zan_type_t *m = irgen_promote_pair(g, lt, rt);
+                if (m) return m;
+            }
             if (lt && !rt) return lt;
             if (rt && !lt) return rt;
             return NULL;
