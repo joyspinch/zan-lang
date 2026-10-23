@@ -1564,6 +1564,16 @@
   同型，防御路径实际不可达）。
 - 复验：p07 全断言通过（"OK p07"）；p03/p04 不受影响。
 - 待办：自举半边（selfhost 的 ?? 降级路径同查）；`bool?`/`T? ?? T?` 聚合
+- **自举半边·T? ?? T 解包已修（2026-10-23，goal round 6）**：同族排查
+  发现自举的真缺口不在 phi 分组（其 QQ 路径本就在分支内惰性求值、merge
+  只建 phi）而在**定型**：checker 无 QQ 分支，InferType 退化取左支 int?，
+  `int y = x ?? 5;` 被 assignability 当场拒收（宿主 p07 一线）。修法：
+  checker InferType 补 QQ 分支——T? ?? T 返回负载类型并在节点 e.ival 钉
+  负载形态标记；发射端按标记走解箱 phi（非空臂 bitcast+load 负载，空臂
+  右支惰性求值，phi 按负载型）。`T? ?? T?` 聚合形态维持原 phi（两臂都是
+  i8* 盒，定型左支，天然正确）。复验：gen1 编 `x??5`（x=null→5）、
+  `z??5`（z=7→7 走 malloc 盒+解箱）、链式 `z ?? (x ?? 3)` 全过，IR 为
+  惰性分支 + 负载 phi。
   路径同样只建 phi 未动，留观。
 
 ### [ ] A538 自举 parser 不支持多字节字符字面量 `'中'`（词法层 unexpected）

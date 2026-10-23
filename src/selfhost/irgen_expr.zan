@@ -759,6 +759,40 @@ partial class Irgen {
         // normalised to a single owned (+1) temp so ARC release is balanced in
         // both branches (no leak, no double-free); no-op retains for non-ARC types.
         if (op == TK.QQ()) {
+            // T? ?? T（checker 在 e.ival 钉了负载形态标记）：左支解箱取负载，
+            // 右支在分支内惰性求值，phi 按负载型。checker 同步定型为负载
+            // 类型（A536 家族，宿主 emit_null_coalesce 同口径）。曾走聚合
+            // phi 且定型 int?，`int y = x ?? 5;` 编不过。
+            if (e.ival == 1) {
+                ExprVal qa = GenExpr(e.a);
+                int ulb = NL(); int ula = NL(); int ulend = NL();
+                string uisn = NT();
+                L("  " + uisn + " = icmp eq i8* " + qa.op + ", null");
+                L("  br i1 " + uisn + ", label %L" + ulb + ", label %L" + ula);
+                Label(ula);
+                string uult = UnderLL(qa.ty);
+                string up = NT();
+                L("  " + up + " = bitcast i8* " + qa.op + " to " + uult + "*");
+                string upv = NT();
+                L("  " + upv + " = load " + uult + ", " + uult + "* " + up);
+                L("  br label %L" + ulend);
+                string uapost = curLbl;
+                Label(ulb);
+                List<string> svT3 = stmtTemps; List<Node> svTT3 = stmtTempTypes;
+                stmtTemps = new List<string>(); stmtTempTypes = new List<Node>();
+                ExprVal ub = GenExpr(e.b);
+                string ubc = Coerce(ub, uult);
+                EmitTempReleases();
+                stmtTemps = svT3; stmtTempTypes = svTT3;
+                string ubpost = curLbl;
+                L("  br label %L" + ulend);
+                Label(ulend);
+                string ur = NT();
+                L("  " + ur + " = phi " + uult + " [ " + upv + ", %" + uapost + " ], [ " + ubc + ", %" + ubpost + " ]");
+                Node uuty = MkType(qa.ty.sval);
+                AddTemp(ur, uuty);
+                return new ExprVal(ur, uuty);
+            }
             ExprVal a = GenExpr(e.a);
             string at = MapType(a.ty);
             int lb = NL(); int la = NL(); int lend = NL();
