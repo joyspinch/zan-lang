@@ -516,6 +516,11 @@ static int resolve_stdlib_dir(const char *stdlib_root, const char *subdir,
 #endif
 
 static int stdlib_has_dir(const char *stdlib_root, const char *subdir) {
+    if (!subdir) return 0;
+    if (strncmp(subdir, "System", 6) == 0 &&
+        (subdir[6] == '\0' || subdir[6] == '/' || subdir[6] == '\\' || subdir[6] == '.')) {
+        return 1;
+    }
 #ifdef _WIN32
     char p[1024];
     if (snprintf(p, sizeof(p), "%s\\%s", stdlib_root, subdir) >= (int)sizeof(p)) return 0;
@@ -1733,6 +1738,7 @@ static void pi_scan_file(pi_file_t *f) {
                 if ((next.str_val.len == 5 && memcmp(next.str_val.str, "Route", 5) == 0) ||
                     (next.str_val.len == 13 && memcmp(next.str_val.str, "ApiController", 13) == 0) ||
                     (next.str_val.len == 5 && memcmp(next.str_val.str, "Table", 5) == 0) ||
+                    (next.str_val.len == 6 && memcmp(next.str_val.str, "Custom", 6) == 0) ||
                     (next.str_val.len == 7 && memcmp(next.str_val.str, "HttpGet", 7) == 0) ||
                     (next.str_val.len == 8 && memcmp(next.str_val.str, "HttpPost", 8) == 0) ||
                     (next.str_val.len == 7 && memcmp(next.str_val.str, "HttpPut", 7) == 0) ||
@@ -1771,6 +1777,14 @@ static void pi_scan_file(pi_file_t *f) {
                 zan_token_t next = zan_lexer_peek(&lex);
                 if (next.kind == TK_IDENT) {
                     tok = zan_lexer_next(&lex);
+                    if (tok.str_val.len >= 10 &&
+                        memcmp(tok.str_val.str + tok.str_val.len - 10, "Controller", 10) == 0) {
+                        f->has_controller = 1;
+                    }
+                    if (tok.str_val.len >= 3 &&
+                        memcmp(tok.str_val.str + tok.str_val.len - 3, "Dao", 3) == 0) {
+                        f->has_controller = 1;
+                    }
                     pi_name_t *name = pi_intern(tok.str_val.str,
                                                 tok.str_val.len);
                     if (name &&
@@ -1839,10 +1853,10 @@ static void pi_scan_file(pi_file_t *f) {
             pi_name_t *cur_id = pi_intern(tok.str_val.str,
                                           tok.str_val.len);
             if (prev == TK_COLON) {
-                if ((tok.str_val.len == 10 && memcmp(tok.str_val.str, "Controller", 10) == 0) ||
-                    (tok.str_val.len == 13 && memcmp(tok.str_val.str, "ApiController", 13) == 0) ||
-                    (tok.str_val.len == 13 && memcmp(tok.str_val.str, "AppController", 13) == 0) ||
-                    (tok.str_val.len == 15 && memcmp(tok.str_val.str, "AdminController", 15) == 0)) {
+                if ((tok.str_val.len >= 10 &&
+                     memcmp(tok.str_val.str + tok.str_val.len - 10, "Controller", 10) == 0) ||
+                    (tok.str_val.len == 14 && memcmp(tok.str_val.str, "BaseRepository", 14) == 0) ||
+                    (tok.str_val.len == 7 && memcmp(tok.str_val.str, "BaseDao", 7) == 0)) {
                     f->has_controller = 1;
                 }
             }
@@ -2335,17 +2349,31 @@ static void pi_seed_chain(const zan_ast_node_t *n, int in_chain) {
             else
                 pi_flag_istr(n->member.name);
         }
-        if (obj && obj->kind == AST_IDENTIFIER) {
-            /* `Root */
-            pi_flag_istr(obj->ident.name);
-            if (obj->ident.name.len == 4 &&
-                memcmp(obj->ident.name.str, "Task", 4) == 0) {
-                zan_istr_t m = n->member.name;
-                if (m.str && m.len == 7 &&
-                    (memcmp(m.str, "WhenAll", 7) == 0 ||
-                     memcmp(m.str, "WhenAny", 7) == 0)) {
-                    pi_name_t *tj = pi_intern("TaskJoin", 8);
-                    if (tj) { tj->flagged = 1; if (pi_seeding_stdlib) tj->flagged_stdlib = 1; }
+        if (obj && (obj->kind == AST_IDENTIFIER || obj->kind == AST_THIS_EXPR)) {
+            if (obj->kind == AST_IDENTIFIER) {
+                pi_flag_istr(obj->ident.name);
+                if (obj->ident.name.len == 4 &&
+                    memcmp(obj->ident.name.str, "Task", 4) == 0) {
+                    zan_istr_t m = n->member.name;
+                    if (m.str && m.len == 7 &&
+                        (memcmp(m.str, "WhenAll", 7) == 0 ||
+                         memcmp(m.str, "WhenAny", 7) == 0)) {
+                        pi_name_t *tj = pi_intern("TaskJoin", 8);
+                        if (tj) { tj->flagged = 1; if (pi_seeding_stdlib) tj->flagged_stdlib = 1; }
+                    }
+                }
+            }
+            pi_flag_istr(n->member.name);
+            /* Also flag <Name>Dao for ORM entity member access (e.g. this.SysDepartment -> SysDepartmentDao) */
+            if (n->member.name.len > 0 && n->member.name.len < 100 &&
+                n->member.name.str[0] >= 'A' && n->member.name.str[0] <= 'Z') {
+                char dao_buf[128];
+                memcpy(dao_buf, n->member.name.str, (size_t)n->member.name.len);
+                memcpy(dao_buf + n->member.name.len, "Dao", 4);
+                pi_name_t *dao = pi_intern(dao_buf, (size_t)n->member.name.len + 3);
+                if (dao && !dao->user_decl) {
+                    dao->flagged = 1;
+                    if (pi_seeding_stdlib) dao->flagged_stdlib = 1;
                 }
             }
         }

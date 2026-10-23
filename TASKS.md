@@ -46,7 +46,11 @@
 > 与泛型通路（MySqlDbPool，工厂改指向）归还挂 `Task.Spawn` 清理协程——事务未收尾的
 > 连接 ROLLBACK 落地后才回池；判定器 `pool_async_reset`（二借等清理落地，拿到即已
 > 回滚、标志已清；干净归还直通不触发回滚）2/2 绿；TDengine 事务即空桩无残留，
-> Redis 无事务 API，均无需处理。
+> Redis 无事务 API，均无需处理。2026-10-23 补账：当时的"工厂改指向"只覆盖
+> MySql——Sqlite/Postgres 的工厂仍返回通用 DbPool，其 Release 读不到 inTxn，
+> 事务中归还的连接会带脏事务回池。本日补 SqliteDbPool/PgDbPool（覆写 Release：
+> Rollback+清标志后调 base.Release），SqliteConnector/PgConnector 工厂改指向，
+> 判定器 pool_async_reset 同口径覆盖。
 > A441/A442/A445/A447/A448/A449/A463/A473/A474/A475/A476/A477/A478/A479/A480/
 > A481/A483/A484/A485/A488/A491/A492/A497/A500/A502/A505）。编号不复用，结论与验证见 git 历史。
 
@@ -1720,7 +1724,7 @@
   全局表与二分查找助手（首次调用才发射，不用的程序零开销）；conformance
   `case_char_case_unicode` 全过。
 
-### [ ] A540 编译器 pull-in live-name 闭包：包内控制器不进编译图 → 路由静默 404
+### [x] A540 编译器 pull-in live-name 闭包：包内控制器不进编译图 → 路由静默 404（已闭环，2026-10-23）
 - 现象：server-collab 模板按 README 配方（`zanc src/main.zan src/**/*.zan
   --auto-stdlib`）编译，程序能编译、能启动、静态资产正常，但**管理后台的
   系统管理屏全部 404**：`/admin/system/users|roles|departments|dicts|logs|
@@ -1738,22 +1742,38 @@
   → DAO 不进图 → 访问器缺失 → 控制器报「has no member 'SysDepartment'」。
   同理 `JobsController` 的基类 `CrudScreenController`（在 `ZanWeb.Admin`
   命名空间）不在图里，报「undefined base type」。
-- 方向：编译器侧补 live-name 闭包——命名空间目录被访问时把该命名空间下的
-  包文件整体纳入编译图。`pi_file_t.gate_live` 已在 `src/compiler/main.c`
-  里被赋值却从未被读，疑似就是这个未完成的机制；同时让表访问器按模型类型
-  触发对应 DAO 的拉入。修好后纯 `using` 即可，模板与 IDE 都不必列包源。
+- 闭环方案（2026-10-23）：
+  1. `src/compiler/main.c` 中 `stdlib_has_dir` 对 `System` 前缀命名空间直接返回 1，
+     修复 `System.Data` 迁出 stdlib 导致其被误判为层级包的问题，保证 `using System.Data;`
+     精确匹配、绝不层级拖入 Postgres/Firebird/ssl 驱动；
+  2. `src/compiler/package.c` 中 SDK 包店（`exe_dir/../packages`）在 `zan_pkg_source_index_create`
+     中标记为 `project_owned = 1`，使 SDK 包（如 `Zan.Mvc`）天然支持祖先命名空间登记，
+     全局店保持 `project_owned = 0` 以维系全局包隔离测试契约；
+  3. `src/compiler/main.c` 中 `pi_scan_file` 扩充控制器与代码生成目标识别：属性识别新增
+     `[Custom]`；类名/结构体结尾为 `Controller` 或 `Dao` 识别为生成器实体；基类以
+     `Controller` 结尾或为 `BaseRepository`/`BaseDao` 均识别为控制器；
+  4. `src/compiler/main.c` 中 `pi_seed_chain` 支持 `AST_THIS_EXPR` 并在识别到大写实体访问时
+     （`this.SysDepartment`）自动 flag 对应的 `<Name>Dao`，使 GenDb 生成器与 DAO 闭环；
+  5. 验证：`server-collab` 纯目录编译 `build\zanc.exe templates/server/server-collab/src --auto-stdlib`
+     全量编出 626 文件且路由与代码生成器全部上线；`unit_package_lock` 与 `unit_package_namespace`
+     单元测试 100% 通过；`using System.Data;` 探针仅编译 33 文件，零驱动泄露。
 - 现状绕法（本次已落地）：模板 README 的构建配方改为显式列出 MVC 包源
   （`packages/Zan.Mvc/src/ZanWeb/**/*.zan`）。实测系统管理屏全部上线：路由
   表出现 /admin/system/* 全族，账号可建可登录、角色可授。
 
-### [ ] A541 IDE smart inputs 每个命名空间只取一个文件 → IDE 构建的 MVC 应用路由不全
+### [x] A541 IDE smart inputs 每个命名空间只取一个文件 → IDE 构建的 MVC 应用路由不全（已闭环，2026-10-23）
 - 现象（按 `src/ide_zan/src/shell/ZanIDE.Workspace.zan` 的代码读）：IDE 的
   SmartInputs 对每个 `using` 命名空间只找一个声明该命名空间的文件
   （`FindNamespaceFile` 返回首个命中即停），包里同一命名空间有多个控制器
   时只进了一个 → IDE 构建的 MVC 应用只有部分管理台路由，而命令行显式列
   包源构建则齐全（同一份源码，两种构建产物行为不同）。
-- 方向：IDE 侧对包命名空间取全部候选（而非首个命中），或直接采纳编译器
-  的包源发现结果作为构建输入。
+- 闭环方案（2026-10-23）：
+  1. `src/ide_zan/src/shell/ZanIDE.Workspace.zan` 将 `FindNamespaceFile` 改为
+     `FindNamespaceFiles(dir, ns, entry, skip, outp)`，向候选列表收集该层级下声明
+     目标命名空间的所有非 Main 文件，而非单文件即停；
+  2. `WithUsedModules` 循环遍历 `FindNamespaceFiles` 收集到的全部文件，逐个追加到构建入参
+     并递归收集其 `using` 依赖（安全上限从 32 放宽到 64）；
+  3. 验证：`pwsh -File scripts/build_ide.ps1` 编译构建通过（生成 `build\ZanIDE.exe`）。
 
 ### [ ] A542 Panel.Column/Row 的流式轴只对 With() 生效：Add() 的子项全叠在容器原点
 - 现象：代码建的纵向面板（资料卡、设置页导航列、工作台详情卡、聊天抽屉、

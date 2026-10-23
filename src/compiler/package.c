@@ -1280,16 +1280,16 @@ zan_pkg_source_index_t *zan_pkg_source_index_create(
     if (GetModuleFileNameA(NULL, exe_dir, sizeof(exe_dir))) {
         char *sep = strrchr(exe_dir, '\\'); if (sep) *sep = 0;
         snprintf(store, sizeof(store), "%s\\..\\packages", exe_dir);
-        pkg_index_store(index, store, probe, &seen, 0);
+        pkg_index_store(index, store, probe, &seen, 1);
         snprintf(store, sizeof(store), "%s\\packages", exe_dir);
-        pkg_index_store(index, store, probe, &seen, 0);
+        pkg_index_store(index, store, probe, &seen, 1);
     }
 #elif defined(__APPLE__)
     uint32_t size = sizeof(exe_dir);
     if (_NSGetExecutablePath(exe_dir, &size) == 0) {
         char *sep = strrchr(exe_dir, '/'); if (sep) *sep = 0;
         snprintf(store, sizeof(store), "%s/../packages", exe_dir);
-        pkg_index_store(index, store, probe, &seen, 0);
+        pkg_index_store(index, store, probe, &seen, 1);
     }
 #else
     ssize_t len = readlink("/proc/self/exe", exe_dir, sizeof(exe_dir) - 1);
@@ -1297,7 +1297,7 @@ zan_pkg_source_index_t *zan_pkg_source_index_create(
         exe_dir[len] = 0;
         char *sep = strrchr(exe_dir, '/'); if (sep) *sep = 0;
         snprintf(store, sizeof(store), "%s/../packages", exe_dir);
-        pkg_index_store(index, store, probe, &seen, 0);
+        pkg_index_store(index, store, probe, &seen, 1);
     }
 #endif
     if (zan_pkg_global_store(store, sizeof(store)))
