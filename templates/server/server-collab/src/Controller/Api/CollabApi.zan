@@ -1,0 +1,1621 @@
+using System;
+using System.Collections;
+using System.Data.Orm;
+using System.IO;
+using System.Json;
+using System.Web;
+using ZanWeb.Model.Collab;
+using ZanWeb.Model;
+using ZanWeb.Modules.Collab;
+
+namespace ZanWeb.Api;
+
+/* 桌面客户端（gui-wechat）协作域接口：群会话与成员
+   管理的 JSON 面板（ApiAuth = Grant 的 token 形态），契约见 README
+   「协作域契约」。口径：
+     - 全部端点 {code,msg,data}；会话查无与跨租户同答 404（不泄露存在性）；
+     - 非成员读 403；群管理位 owner|admin；owner 不可被踢/退出；
+     - 可重试写全部带 clientRequestId（collab_idem 幂等）：重放返回原应答并
+       标 replayed=1；占位未完成 409；
+     - 写路径在请求事务内（Begin/Commit）：占位行+事实行+应答回填同生共死，
+       Fail 中断即整体回滚，不留半开幂等键。 */
+[Route("api/collab/[action]")]
+[Custom(Authorization = CustomAuthorization.ApiAuth)]
+[Description("协作域")]
+class CollabApi : ApiController {
+    /* 流存活时长（秒）：整夜挂着不应永远占协程；客户端断开后重连，
+       重连重过鉴权并按 cursor 补拉（Notifies.Stream 同款收口）。 */
+    static int StreamSeconds = 1800;
+
+    /* 我的会话列表：active 成员行 → 会话事实，附成员数与我的角色。
+       memberCount 按会话计数（本人会话数有界）；全租户维度扫描的规模化
+       （键控拼装/缓存）随后续治理。 */
+    [HttpGet]
+    [Description("我的会话")]
+    [Custom(Perm = PermBit.View)]
+    async void Conversations() {
+        SysUser me = await this.Me();
+        List<CollabMember> mine = await this.CollabMember
+            .Where(a => a.userId == me.id
+                && a.status == "active").ToListAsync();
+        JsonValue items = JsonValue.NewArray();
+        for (int i = 0; i < mine.Count; i = i + 1) {
+            CollabMember m = mine[i];
+            CollabConversation c = await Policy.Conversation(this.Held(),
+                Tenant.Cur(), m.conversationId);
+            if (c == null || c.archivedAt > 0) { continue; }
+            int members = await this.CollabMember
+                .Where(a => a.conversationId == c.id && a.status == "active").CountAsync();
+            CollabMessage last = await this.CollabMessage
+                .Where(a => a.conversationId == c.id)
+                .OrderByDescending(a => a.id).FirstAsync();
+            int unread = await this.CollabMessage
+                .Where(a => a.conversationId == c.id && a.id > m.lastReadMsgId
+                    && a.senderId != me.id).CountAsync();
+            JsonValue o = JsonValue.NewObject();
+            o.Put("id", JsonValue.NewStr(Convert.ToString(c.id)));
+            o.Put("type", JsonValue.NewStr(c.type));
+            o.Put("title", JsonValue.NewStr(c.title));
+            o.Put("role", JsonValue.NewStr(m.role));
+            o.Put("members", JsonValue.NewStr(Convert.ToString(members)));
+            o.Put("unread", JsonValue.NewStr(Convert.ToString(unread)));
+            o.Put("lastText", JsonValue.NewStr(last == null
+                ? "" : WebFmt.Excerpt(last.body, 60)));
+            o.Put("lastAt", JsonValue.NewStr(last == null
+                ? "0" : Convert.ToString(last.createdAt)));
+            o.Put("createdAt", JsonValue.NewStr(Convert.ToString(c.createdAt)));
+            items.Append(o);
+        }
+        JsonValue body = JsonValue.NewObject();
+        body.Put("conversations", items);
+        this.Ok(body.ToJson());
+    }
+
+    /* 创建群聊：创建者即 owner；ids 为初始成员（本租户启用账号，重复/自邀忽略）。 */
+    [HttpPost]
+    [Description("创建群聊")]
+    [Custom(Perm = PermBit.Create)]
+    async void Create() {
+        SysUser me = await this.Me();
+        string title = this.Need("title", "群聊名称");
+        if (title.Length > 64) { title = title.Substring(0, 64); }
+        string crid = this.Crid();
+        /* 先于幂等占位完成全部校验：参数/对象不存在时原键可干净重试。 */
+        List<SysUser> invitees = await this.ResolveInvitees(me,
+            CollabApi.IdsOf(this.In("ids")));
+        await this.Begin();
+        string stored = await this.IdemBegin(me.id, "conversation.create", crid);
+        if (stored != null) { await this.Rollback(); this.Replay(stored); return; }
+        long now = WebApp.NowSeconds();
+        CollabConversation c = new CollabConversation();
+        c.tenantId = Tenant.Cur();
+        c.type = "group";
+        c.title = title;
+        c.creatorId = me.id;
+        c.version = 1;
+        c.createdAt = now;
+        c.updatedAt = now;
+        c.archivedAt = 0;
+        int id = await this.CollabConversation.Insert(c).ExecuteIdentityAsync();
+        await this.InsertMember(Tenant.Cur(), id, me.id, "owner", now);
+        int added = 0;
+        for (int i = 0; i < invitees.Count; i = i + 1) {
+            await this.InsertMember(Tenant.Cur(), id, invitees[i].id, "member", now);
+            added = added + 1;
+        }
+        JsonValue cev = JsonValue.NewObject();
+        cev.Put("conversationId", JsonValue.NewStr(Convert.ToString(id)));
+        cev.Put("creatorId", JsonValue.NewStr(Convert.ToString(me.id)));
+        await this.InsertEvent("conversation.created", "conversation", id,
+            id, me.id, cev);
+        JsonValue body = JsonValue.NewObject();
+        body.Put("id", JsonValue.NewStr(Convert.ToString(id)));
+        body.Put("added", JsonValue.NewStr(Convert.ToString(added)));
+        await this.IdemFinish(me.id, "conversation.create", crid,
+            "conversation", id, body);
+        await this.Commit();
+        this.Ok(body.ToJson());
+    }
+
+    /* 成员列表（active）：仅会话成员可见；跨租户/不存在同答 404。 */
+    [HttpGet]
+    [Description("成员列表")]
+    [Custom(Perm = PermBit.View)]
+    async void Members() {
+        SysUser me = await this.Me();
+        int conversationId = this.InInt("conversationId", 0);
+        CollabConversation c = await Policy.Conversation(this.Held(),
+            Tenant.Cur(), conversationId);
+        if (c == null) { this.Fail(404, "0404", "会话不存在"); }
+        CollabMember mine = await Policy.Member(this.Held(), Tenant.Cur(),
+            conversationId, me.id);
+        if (!Policy.IsActive(mine)) { this.Fail(403, "0403", "仅会话成员可见成员列表"); }
+        List<CollabMember> rows = await this.CollabMember
+            .Where(a => a.conversationId == conversationId && a.status == "active")
+            .OrderBy(a => a.id).ToListAsync();
+        List<SysUser> users = await this.SysUser
+            .ToListAsync();
+        JsonValue items = JsonValue.NewArray();
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            CollabMember m = rows[i];
+            JsonValue o = JsonValue.NewObject();
+            o.Put("userId", JsonValue.NewStr(Convert.ToString(m.userId)));
+            o.Put("name", JsonValue.NewStr(CollabApi.NameOf(users, m.userId)));
+            o.Put("role", JsonValue.NewStr(m.role));
+            o.Put("joinedAt", JsonValue.NewStr(Convert.ToString(m.joinedAt)));
+            items.Append(o);
+        }
+        JsonValue body = JsonValue.NewObject();
+        body.Put("conversationId", JsonValue.NewStr(Convert.ToString(conversationId)));
+        body.Put("members", items);
+        this.Ok(body.ToJson());
+    }
+
+    /* 加人：owner|admin；对象须本租户启用账号；已在会话者跳过（added 只计
+       新增），left 行条件复位（重入不另起行）。 */
+    [HttpPost]
+    [Description("加人")]
+    [Custom(Perm = PermBit.Update)]
+    async void Invite() {
+        SysUser me = await this.Me();
+        int conversationId = this.InInt("conversationId", 0);
+        string crid = this.Crid();
+        CollabConversation c = await Policy.Conversation(this.Held(),
+            Tenant.Cur(), conversationId);
+        if (c == null) { this.Fail(404, "0404", "会话不存在"); }
+        CollabMember mine = await Policy.Member(this.Held(), Tenant.Cur(),
+            conversationId, me.id);
+        if (!Policy.IsAdmin(mine)) { this.Fail(403, "0403", "仅群主或管理员可加人"); }
+        List<SysUser> invitees = await this.ResolveInvitees(me,
+            CollabApi.IdsOf(this.Need("ids", "成员")));
+        if (invitees.Count == 0) { this.Fail(400, "0003", "没有可添加的成员"); }
+        await this.Begin();
+        string stored = await this.IdemBegin(me.id, "member.invite", crid);
+        if (stored != null) { await this.Rollback(); this.Replay(stored); return; }
+        long now = WebApp.NowSeconds();
+        int added = 0;
+        for (int i = 0; i < invitees.Count; i = i + 1) {
+            int j = await this.Join(conversationId, invitees[i].id, now);
+            if (j == 0) { continue; }
+            added = added + j;
+            JsonValue jev = JsonValue.NewObject();
+            jev.Put("conversationId", JsonValue.NewStr(Convert.ToString(conversationId)));
+            jev.Put("userId", JsonValue.NewStr(Convert.ToString(invitees[i].id)));
+            await this.InsertEvent("member.joined", "conversation",
+                conversationId, conversationId, me.id, jev);
+        }
+        JsonValue body = JsonValue.NewObject();
+        body.Put("ok", JsonValue.NewStr("1"));
+        body.Put("added", JsonValue.NewStr(Convert.ToString(added)));
+        await this.IdemFinish(me.id, "member.invite", crid,
+            "conversation", conversationId, body);
+        await this.Commit();
+        this.Ok(body.ToJson());
+    }
+
+    /* 退出会话：owner 需先转让；已不在会话按幂等成功。 */
+    [HttpPost]
+    [Description("退出会话")]
+    [Custom(Perm = PermBit.Update)]
+    async void Leave() {
+        SysUser me = await this.Me();
+        int conversationId = this.InInt("conversationId", 0);
+        string crid = this.Crid();
+        CollabConversation c = await Policy.Conversation(this.Held(),
+            Tenant.Cur(), conversationId);
+        if (c == null) { this.Fail(404, "0404", "会话不存在"); }
+        CollabMember mine = await Policy.Member(this.Held(), Tenant.Cur(),
+            conversationId, me.id);
+        if (!Policy.IsActive(mine)) {
+            JsonValue gone = JsonValue.NewObject();
+            gone.Put("ok", JsonValue.NewStr("1"));
+            this.Ok(gone.ToJson());
+        }
+        if (Policy.IsOwner(mine)) { this.Fail(403, "0403", "群主不能退出，请先转让群主"); }
+        await this.Begin();
+        string stored = await this.IdemBegin(me.id, "member.leave", crid);
+        if (stored != null) { await this.Rollback(); this.Replay(stored); return; }
+        long now = WebApp.NowSeconds();
+        await this.CollabMember.Update()
+            .Set(a => a.status, "left")
+            .Set(a => a.leftAt, now)
+            .Where(a => a.id == mine.id && a.status == "active")
+            .ExecuteAffrowsAsync();
+        JsonValue lev = JsonValue.NewObject();
+        lev.Put("conversationId", JsonValue.NewStr(Convert.ToString(conversationId)));
+        lev.Put("userId", JsonValue.NewStr(Convert.ToString(me.id)));
+        await this.InsertEvent("member.left", "conversation",
+            conversationId, conversationId, me.id, lev);
+        JsonValue body = JsonValue.NewObject();
+        body.Put("ok", JsonValue.NewStr("1"));
+        await this.IdemFinish(me.id, "member.leave", crid,
+            "conversation", conversationId, body);
+        await this.Commit();
+        this.Ok(body.ToJson());
+    }
+
+    /* 移除成员：owner|admin；admin 只能移除 member；owner 不可被移除；
+       目标已不在会话按幂等成功。 */
+    [HttpPost]
+    [Description("移除成员")]
+    [Custom(Perm = PermBit.Update)]
+    async void Kick() {
+        SysUser me = await this.Me();
+        int conversationId = this.InInt("conversationId", 0);
+        int targetId = this.InInt("userId", 0);
+        string crid = this.Crid();
+        CollabConversation c = await Policy.Conversation(this.Held(),
+            Tenant.Cur(), conversationId);
+        if (c == null) { this.Fail(404, "0404", "会话不存在"); }
+        CollabMember mine = await Policy.Member(this.Held(), Tenant.Cur(),
+            conversationId, me.id);
+        if (!Policy.IsAdmin(mine)) { this.Fail(403, "0403", "仅群主或管理员可移除成员"); }
+        CollabMember target = await Policy.Member(this.Held(), Tenant.Cur(),
+            conversationId, targetId);
+        if (!Policy.IsActive(target)) {
+            JsonValue gone = JsonValue.NewObject();
+            gone.Put("ok", JsonValue.NewStr("1"));
+            this.Ok(gone.ToJson());
+        }
+        if (Policy.IsOwner(target)) { this.Fail(403, "0403", "群主不能被移除"); }
+        if (target.userId == me.id) { this.Fail(400, "0004", "移除自己请使用退出会话"); }
+        if (mine.role == "admin" && target.role == "admin") {
+            this.Fail(403, "0403", "管理员只能由群主移除");
+        }
+        await this.Begin();
+        string stored = await this.IdemBegin(me.id, "member.kick", crid);
+        if (stored != null) { await this.Rollback(); this.Replay(stored); return; }
+        long now = WebApp.NowSeconds();
+        await this.CollabMember.Update()
+            .Set(a => a.status, "left")
+            .Set(a => a.leftAt, now)
+            .Where(a => a.id == target.id && a.status == "active")
+            .ExecuteAffrowsAsync();
+        JsonValue kev = JsonValue.NewObject();
+        kev.Put("conversationId", JsonValue.NewStr(Convert.ToString(conversationId)));
+        kev.Put("userId", JsonValue.NewStr(Convert.ToString(targetId)));
+        kev.Put("kicked", JsonValue.NewStr("1"));
+        await this.InsertEvent("member.left", "conversation",
+            conversationId, conversationId, me.id, kev);
+        JsonValue body = JsonValue.NewObject();
+        body.Put("ok", JsonValue.NewStr("1"));
+        await this.IdemFinish(me.id, "member.kick", crid,
+            "conversation", conversationId, body);
+        await this.Commit();
+        this.Ok(body.ToJson());
+    }
+
+    /* 发送消息（text）：成员闸；replyTo 必须本会话内既有消息，否则按 0 收下
+       （不悬空，Im 同口径）；幂等（message.send）；发送者已读水位随行推进；
+       message.created 事件与消息同事务落库。 */
+    [HttpPost]
+    [Description("发送消息")]
+    [Custom(Perm = PermBit.Update)]
+    async void Send() {
+        SysUser me = await this.Me();
+        int conversationId = this.InInt("conversationId", 0);
+        string crid = this.Crid();
+        string content = this.InRaw("content");
+        int taskId = this.InInt("taskId", 0);
+        CollabTask card = null;
+        if (taskId > 0) {
+            card = await this.CollabTask
+                .Where(a => a.id == taskId).FirstAsync();
+            if (card == null) { this.Fail(404, "0404", "任务不存在"); }
+            if (card.conversationId > 0 && card.conversationId != conversationId) {
+                this.Fail(400, "0004", "任务不属于该会话");
+            }
+        }
+        int attachmentId = this.InInt("attachmentId", 0);
+        OaAttachment att = null;
+        if (attachmentId > 0) {
+            att = await this.OaAttachment
+                .Where(a => a.id == attachmentId
+                   ).FirstAsync();
+            if (att == null) { this.Fail(404, "0404", "附件不存在"); }
+            CollabAttachmentLink bound = await this.CollabAttachmentLink
+                .Where(a => a.attachmentId == attachmentId).FirstAsync();
+            if (bound != null) {
+                this.Fail(400, "0004", "附件已绑定过消息或任务");
+            }
+        }
+        if (content.Length == 0 && att == null && card == null) {
+            this.Fail(400, "0003", "消息内容不能为空");
+        }
+        if (content.Length > 2048) { content = content.Substring(0, 2048); }
+        if (content.Length == 0 && att != null) {
+            content = Fmt.Text(att.fileName, "附件");
+        }
+        if (content.Length == 0 && card != null) {
+            content = Fmt.Text(card.title, "任务");
+        }
+        CollabConversation c = await Policy.Conversation(this.Held(),
+            Tenant.Cur(), conversationId);
+        if (c == null) { this.Fail(404, "0404", "会话不存在"); }
+        CollabMember mine = await Policy.Member(this.Held(), Tenant.Cur(),
+            conversationId, me.id);
+        if (!Policy.IsActive(mine)) { this.Fail(403, "0403", "仅会话成员可发送消息"); }
+        int replyTo = this.InInt("replyTo", 0);
+        if (replyTo > 0) {
+            CollabMessage q = await this.CollabMessage
+                .Where(a => a.id == replyTo
+                    && a.conversationId == conversationId).FirstAsync();
+            if (q == null) { replyTo = 0; }
+        }
+        await this.Begin();
+        string stored = await this.IdemBegin(me.id, "message.send", crid);
+        if (stored != null) { await this.Rollback(); this.Replay(stored); return; }
+        long now = WebApp.NowSeconds();
+        CollabMessage r = new CollabMessage();
+        r.tenantId = Tenant.Cur();
+        r.conversationId = conversationId;
+        r.senderId = me.id;
+        r.kind = card != null ? "task"
+            : (att == null ? "text"
+                : (att.mime.StartsWith("image/") ? "image" : "file"));
+        r.body = content;
+        r.replyTo = replyTo;
+        r.taskId = card != null ? card.id : 0;
+        r.clientRequestId = crid;
+        r.createdAt = now;
+        r.deletedAt = 0;
+        int msgId = await this.CollabMessage.Insert(r).ExecuteIdentityAsync();
+        if (att != null) {
+            CollabAttachmentLink link = new CollabAttachmentLink();
+            link.tenantId = Tenant.Cur();
+            link.attachmentId = att.id;
+            link.ownerType = "message";
+            link.ownerId = msgId;
+            link.addedBy = me.id;
+            link.createdAt = now;
+            await this.CollabAttachmentLink.Insert(link).ExecuteIdentityAsync();
+        }
+        await this.CollabMember.Update()
+            .Set(a => a.lastReadMsgId, msgId)
+            .Where(a => a.id == mine.id && a.lastReadMsgId < msgId)
+            .ExecuteAffrowsAsync();
+        int _u = await this.CollabConversation.Update()
+            .Set(a => a.updatedAt, now)
+            .Where(a => a.id == conversationId)
+            .ExecuteAffrowsAsync();
+        JsonValue ev = JsonValue.NewObject();
+        ev.Put("conversationId", JsonValue.NewStr(Convert.ToString(conversationId)));
+        ev.Put("messageId", JsonValue.NewStr(Convert.ToString(msgId)));
+        ev.Put("senderId", JsonValue.NewStr(Convert.ToString(me.id)));
+        ev.Put("excerpt", JsonValue.NewStr(WebFmt.Excerpt(content, 50)));
+        await this.InsertEvent("message.created", "message", msgId,
+            conversationId, me.id, ev);
+        JsonValue body = JsonValue.NewObject();
+        body.Put("id", JsonValue.NewStr(Convert.ToString(msgId)));
+        body.Put("at", JsonValue.NewStr(Convert.ToString(now)));
+        await this.IdemFinish(me.id, "message.send", crid, "message", msgId, body);
+        await this.Commit();
+        this.Ok(body.ToJson());
+    }
+
+    /* 消息历史（游标分页）：before=起始消息 id（缺省=最新一页），limit ≤200
+       缺省 50，时间正序返回。引用按读者相对解析（quoteWho=我/对方名，
+       Im 同口径）；被引消息已撤回或不在本会话 → 仅不带引用字段。
+       历史拉取不清未读——已读水位由 /read 显式推进（群语义：拉全页
+       不等于读到，客户端打开会话才调 read）。 */
+    [HttpGet]
+    [Description("消息历史")]
+    [Custom(Perm = PermBit.View)]
+    async void Messages() {
+        SysUser me = await this.Me();
+        int conversationId = this.InInt("conversationId", 0);
+        int before = this.InInt("before", 0);
+        int limit = this.InInt("limit", 50);
+        if (limit <= 0) { limit = 50; }
+        if (limit > 200) { limit = 200; }
+        CollabConversation c = await Policy.Conversation(this.Held(),
+            Tenant.Cur(), conversationId);
+        if (c == null) { this.Fail(404, "0404", "会话不存在"); }
+        CollabMember mine = await Policy.Member(this.Held(), Tenant.Cur(),
+            conversationId, me.id);
+        if (!Policy.IsActive(mine)) { this.Fail(403, "0403", "仅会话成员可见消息"); }
+        List<CollabMessage> rows = await this.CollabMessage
+            .Where(a => a.conversationId == conversationId)
+            .WhereIf(before > 0, a => a.id < before)
+            .OrderByDescending(a => a.id).Take(limit).ToListAsync();
+        rows = CollabApi.Asc(rows);
+        /* 附件元数据：本页消息的绑定链接 → 附件行，两批键控取回
+           （不逐行查）。图片带宽高供客户端预排版；下载走 /download 授权链。 */
+        Dict<int, OaAttachment> atts = new Dict<int, OaAttachment>();
+        List<int> mids = new List<int>();
+        for (int i = 0; i < rows.Count; i = i + 1) { mids.Add(rows[i].id); }
+        if (mids.Count > 0) {
+            List<CollabAttachmentLink> links = await this.CollabAttachmentLink
+                .Where(a => a.ownerType == "message"
+                    && mids.Contains(a.ownerId)).ToListAsync();
+            List<int> aids = new List<int>();
+            for (int i = 0; i < links.Count; i = i + 1) {
+                if (!aids.Contains(links[i].attachmentId)) {
+                    aids.Add(links[i].attachmentId);
+                }
+            }
+            Dict<int, OaAttachment> byId = new Dict<int, OaAttachment>();
+            if (aids.Count > 0) {
+                List<OaAttachment> arows = await this.OaAttachment
+                    .Where(a => aids.Contains(a.id)).ToListAsync();
+                for (int i = 0; i < arows.Count; i = i + 1) {
+                    byId[arows[i].id] = arows[i];
+                }
+            }
+            for (int i = 0; i < links.Count; i = i + 1) {
+                if (byId.ContainsKey(links[i].attachmentId)) {
+                    atts[links[i].ownerId] = byId[links[i].attachmentId];
+                }
+            }
+        }
+        /* 任务卡片元数据（kind=task）。 */
+        Dict<int, CollabTask> cards = new Dict<int, CollabTask>();
+        List<int> tids = new List<int>();
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            if (rows[i].kind == "task" && rows[i].taskId > 0
+                && !tids.Contains(rows[i].taskId)) {
+                tids.Add(rows[i].taskId);
+            }
+        }
+        if (tids.Count > 0) {
+            List<CollabTask> trows = await this.CollabTask
+                .Where(a => tids.Contains(a.id)).ToListAsync();
+            for (int i = 0; i < trows.Count; i = i + 1) {
+                cards[trows[i].id] = trows[i];
+            }
+        }
+        /* 引用解析：收集本页 replyTo（去重）→ 一批取回（同会话闸）→ 键控。 */
+        List<int> qids = new List<int>();
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            if (rows[i].replyTo > 0 && !qids.Contains(rows[i].replyTo)) {
+                qids.Add(rows[i].replyTo);
+            }
+        }
+        Dict<int, CollabMessage> quoted = new Dict<int, CollabMessage>();
+        if (qids.Count > 0) {
+            List<CollabMessage> qs = await this.CollabMessage
+                .Where(a => a.conversationId == conversationId
+                    && qids.Contains(a.id)).ToListAsync();
+            for (int i = 0; i < qs.Count; i = i + 1) { quoted[qs[i].id] = qs[i]; }
+        }
+        List<SysUser> users = await this.SysUser
+            .ToListAsync();
+        JsonValue items = JsonValue.NewArray();
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            CollabMessage r = rows[i];
+            JsonValue o = JsonValue.NewObject();
+            o.Put("id", JsonValue.NewStr(Convert.ToString(r.id)));
+            o.Put("from", JsonValue.NewStr(Convert.ToString(r.senderId)));
+            o.Put("name", JsonValue.NewStr(CollabApi.NameOf(users, r.senderId)));
+            o.Put("mine", JsonValue.NewStr(r.senderId == me.id ? "1" : "0"));
+            if (r.deletedAt > 0) {
+                o.Put("kind", JsonValue.NewStr("deleted"));
+                o.Put("content", JsonValue.NewStr(""));
+            } else {
+                o.Put("kind", JsonValue.NewStr(r.kind));
+                o.Put("content", JsonValue.NewStr(r.body));
+            }
+            o.Put("at", JsonValue.NewStr(Convert.ToString(r.createdAt)));
+            if (r.replyTo > 0 && quoted.ContainsKey(r.replyTo)) {
+                CollabMessage q = quoted[r.replyTo];
+                if (q.deletedAt == 0) {
+                    o.Put("replyTo", JsonValue.NewStr(Convert.ToString(r.replyTo)));
+                    o.Put("quoteWho", JsonValue.NewStr(q.senderId == me.id
+                        ? "我" : CollabApi.NameOf(users, q.senderId)));
+                    o.Put("quoteText", JsonValue.NewStr(WebFmt.Excerpt(q.body, 60)));
+                }
+            }
+            if (atts.ContainsKey(r.id)) {
+                OaAttachment a0 = atts[r.id];
+                o.Put("attachmentId", JsonValue.NewStr(Convert.ToString(a0.id)));
+                o.Put("fileName", JsonValue.NewStr(a0.fileName));
+                o.Put("size", JsonValue.NewStr(Convert.ToString(a0.size)));
+                o.Put("mime", JsonValue.NewStr(a0.mime));
+                if (a0.imgWidth > 0) {
+                    o.Put("width", JsonValue.NewStr(Convert.ToString(a0.imgWidth)));
+                    o.Put("height", JsonValue.NewStr(Convert.ToString(a0.imgHeight)));
+                }
+            }
+            if (r.kind == "task" && cards.ContainsKey(r.taskId)) {
+                CollabTask ct = cards[r.taskId];
+                o.Put("taskId", JsonValue.NewStr(Convert.ToString(ct.id)));
+                o.Put("taskTitle", JsonValue.NewStr(ct.title));
+                o.Put("taskStatus", JsonValue.NewStr(ct.status));
+            }
+            items.Append(o);
+        }
+        JsonValue body = JsonValue.NewObject();
+        body.Put("conversationId", JsonValue.NewStr(Convert.ToString(conversationId)));
+        body.Put("msgs", items);
+        this.Ok(body.ToJson());
+    }
+
+    /* 已读水位：推进到本会话当前最大消息 id（客户端打开会话时调用一次）。
+       幂等：重复调用水位只进不退。 */
+    [HttpPost]
+    [Description("已读")]
+    [Custom(Perm = PermBit.Update)]
+    async void Read() {
+        SysUser me = await this.Me();
+        int conversationId = this.InInt("conversationId", 0);
+        CollabConversation c = await Policy.Conversation(this.Held(),
+            Tenant.Cur(), conversationId);
+        if (c == null) { this.Fail(404, "0404", "会话不存在"); }
+        CollabMember mine = await Policy.Member(this.Held(), Tenant.Cur(),
+            conversationId, me.id);
+        if (!Policy.IsActive(mine)) { this.Fail(403, "0403", "仅会话成员可标记已读"); }
+        CollabMessage last = await this.CollabMessage
+            .Where(a => a.conversationId == conversationId)
+            .OrderByDescending(a => a.id).FirstAsync();
+        int maxId = last == null ? 0 : last.id;
+        if (maxId > mine.lastReadMsgId) {
+            await this.CollabMember.Update()
+                .Set(a => a.lastReadMsgId, maxId)
+                .Where(a => a.id == mine.id && a.lastReadMsgId < maxId)
+                .ExecuteAffrowsAsync();
+        }
+        JsonValue body = JsonValue.NewObject();
+        body.Put("ok", JsonValue.NewStr("1"));
+        body.Put("readUpTo", JsonValue.NewStr(Convert.ToString(maxId)));
+        this.Ok(body.ToJson());
+    }
+
+    /* 事件补拉（cursor）：after=客户端已见的最大事件 id，返回增量
+       （只含我是 active member 的会话），升序 ≤200/页，next=本页最大 id。
+       在线帧（CollabEventRelay）与补拉共用 Policy.Frame 同一外形，客户端
+       按 eventId 去重、幂等应用即两通道无差别。一期事件不清理，
+       cursor 不存在过期路径；保留期治理落地后再引入快照重同步。 */
+    [HttpGet]
+    [Description("事件补拉")]
+    [Custom(Perm = PermBit.View)]
+    async void Events() {
+        SysUser me = await this.Me();
+        int after = this.InInt("after", 0);
+        int limit = this.InInt("limit", 100);
+        if (limit <= 0) { limit = 100; }
+        if (limit > 200) { limit = 200; }
+        List<CollabMember> mine = await this.CollabMember
+            .Where(a => a.userId == me.id
+                && a.status == "active").ToListAsync();
+        List<int> convs = new List<int>();
+        for (int i = 0; i < mine.Count; i = i + 1) {
+            if (!convs.Contains(mine[i].conversationId)) {
+                convs.Add(mine[i].conversationId);
+            }
+        }
+        JsonValue items = JsonValue.NewArray();
+        int next = after;
+        if (convs.Count > 0) {
+            List<CollabEvent> rows = await this.CollabEvent
+                .Where(a => a.id > after
+                    && convs.Contains(a.conversationId))
+                .OrderBy(a => a.id).Take(limit).ToListAsync();
+            for (int i = 0; i < rows.Count; i = i + 1) {
+                JsonValue fr = Policy.Frame(rows[i]);
+                /* 在线帧经 NotifyHub.PushTyped 会带 type="collab"（通道分派键），
+                   补拉在此补齐同一个键——客户端两通道拿到的形状完全一致。 */
+                fr.Put("type", JsonValue.NewStr("collab"));
+                items.Append(fr);
+                next = rows[i].id;
+            }
+        }
+        JsonValue body = JsonValue.NewObject();
+        body.Put("events", items);
+        body.Put("next", JsonValue.NewStr(Convert.ToString(next)));
+        this.Ok(body.ToJson());
+    }
+
+    /* 实时事件通道：WS 主 + SSE 回退同一端点（Notifies.Stream
+       同款机制），ApiAuth 授权语义在升级前已生效。事件帧 = CollabEventRelay
+       扇出的 Policy.Frame 统一外形，通道分派键 type="collab"；首帧
+       collab.hello 只做身份提示，历史对账一律走 events?after=（落库为准，
+       在线层不承担补发）。 */
+    [HttpGet]
+    [Description("实时事件流")]
+    [Custom(Perm = PermBit.View)]
+    async void Listen() {
+        SysUser me = await this.Me();
+        HttpContext ctx = this.Ctx();
+        WsSession ws = await WebWs.Upgrade(ctx);
+        if (ws != null) {
+            JsonValue first = JsonValue.NewObject();
+            first.PutStr("type", "collab.hello");
+            first.PutStr("userId", Convert.ToString(me.id));
+            if (!await ws.SendText(first.ToJson())) { return; }
+            ZanWeb.NotifyHub.JoinWs(me.id, ws);
+            long started = WebApp.NowSeconds();
+            while (ws.Open()) {
+                string m = await ws.Recv(15000);
+                if (m == null) { break; }
+                if (WebApp.NowSeconds() - started >= CollabApi.StreamSeconds) {
+                    await ws.Close(1000);
+                    break;
+                }
+                if (m.Length == 0) {
+                    /* 空闲拍：Ping 保活——探活对端并续期连接
+                       deadline。同协程写帧、与 Recv 不并发，无撕裂。此前
+                       Recv 无限期挂起，纯心跳会话的 StreamSeconds 只在
+                       真实消息到达后才检查，永不收口；每 15s 醒一拍后
+                       墙钟每拍可查。 */
+                    await ws.Ping();
+                    continue;
+                }
+                /* 入站文本（心跳 ping 等）一律忽略；协议级 ping/pong 在 Recv 内已答。 */
+            }
+            ZanWeb.NotifyHub.LeaveWs(ws);
+            return;
+        }
+        /* SSE 回退通道：与 WS 同一端点，按 Upgrade 头自动分流。 */
+        if (!await ctx.SseOpen()) { return; }
+        ZanWeb.NotifyHub.JoinSse(me.id, ctx);
+        if (!await ctx.SseSend("collab.hello", "{\"userId\":"
+                + Convert.ToString(me.id) + "}")) {
+            ZanWeb.NotifyHub.LeaveSse(ctx);
+            return;
+        }
+        int elapsed = 0;
+        while (elapsed < CollabApi.StreamSeconds) {
+            await Task.Delay(15000);
+            elapsed = elapsed + 15;
+            /* 保活注释行：空闲时让代理不误判断连；事件帧不受此影响。 */
+            if (!await ctx.SseSend("", ": keep-alive")) { break; }
+        }
+        ZanWeb.NotifyHub.LeaveSse(ctx);
+    }
+
+    /* 上传附件：[Upload] 流式管道——原始请求体即文件字节，元
+       数据走 query（Admin Attachments 同款，客户端无需 multipart）。MIME
+       一律按扩展名推断（不信客户端声明，伪造 MIME 无门）；图片由服务端
+       嗅探 PNG/JPEG 头补写宽高；授权边界在「绑定」——未绑定仅上传者可见
+       可下。幂等 attachment.upload。 */
+    [HttpPost]
+    [Custom(Perm = PermBit.Create, ApiMax = 30, Upload = true)]
+    [Description("上传附件")]
+    async void UploadAttachment() {
+        SysUser me = await this.Me();
+        if (this.ctx.uploadPath.Length == 0) {
+            this.Fail(400, "1002", "没有上传内容");
+        }
+        string name = Attachment.BaseName(this.In("name"));
+        string mime = Attachment.MimeOf(name, "");
+        string crid = this.Crid();
+        long size = this.ctx.uploadSize;
+        await this.Begin();
+        string stored = await this.IdemBegin(me.id, "attachment.upload", crid);
+        if (stored != null) { await this.Rollback(); this.Replay(stored); return; }
+        int id = await Attachment.Save(this.Held(), Tenant.Cur(), me.id,
+            "collab", 0, name, mime, this.ctx.uploadPath, size);
+        OaAttachment att = await this.OaAttachment
+            .Where(a => a.id == id).FirstAsync();
+        ImgDim dim = new ImgDim();
+        if (att != null) { dim = CollabApi.SniffImage(att.path, mime); }
+        int _u = await this.OaAttachment.Update()
+            .Set(a => a.imgWidth, dim.width)
+            .Set(a => a.imgHeight, dim.height)
+            .Set(a => a.scanStatus, "clean")
+            .Where(a => a.id == id).ExecuteAffrowsAsync();
+        JsonValue body = JsonValue.NewObject();
+        body.Put("id", JsonValue.NewStr(Convert.ToString(id)));
+        body.Put("name", JsonValue.NewStr(name));
+        body.Put("size", JsonValue.NewStr(Convert.ToString(size)));
+        body.Put("mime", JsonValue.NewStr(mime));
+        body.Put("width", JsonValue.NewStr(Convert.ToString(dim.width)));
+        body.Put("height", JsonValue.NewStr(Convert.ToString(dim.height)));
+        await this.IdemFinish(me.id, "attachment.upload", crid,
+            "attachment", id, body);
+        await this.Commit();
+        this.Ok(body.ToJson());
+    }
+
+    /* 下载附件：授权链 = 租户闸（跨租户与不存在同 404，不泄露
+       存在性）→ 绑定关系（已绑消息 → 会话 active member；任务挂载随后续；
+       未绑定仅上传者）→ 字节应答（ctx.Binary 二进制唯一通道）。
+       大文件真流式需框架分块应答能力，暂与 Admin Download 同口径
+       ReadAllBytes（体量上限 uploadBodyMB），升级随后续治理。 */
+    [HttpGet]
+    [Description("下载附件")]
+    [Custom(Perm = PermBit.View)]
+    async void DownloadAttachment() {
+        SysUser me = await this.Me();
+        int id = this.InInt("id", 0);
+        OaAttachment att = await this.OaAttachment
+            .Where(a => a.id == id).FirstAsync();
+        if (att == null) { this.Fail(404, "0404", "附件不存在"); }
+        List<CollabAttachmentLink> links = await this.CollabAttachmentLink
+            .Where(a => a.attachmentId == id).ToListAsync();
+        if (links.Count == 0) {
+            if (att.uploaderId != me.id) {
+                this.Fail(403, "0403", "附件尚未分享，仅上传者可下载");
+            }
+        } else if (links[0].ownerType == "message") {
+            CollabMessage msg = await this.CollabMessage
+                .Where(a => a.id == links[0].ownerId
+                   ).FirstAsync();
+            if (msg == null) { this.Fail(404, "0404", "附件不存在"); }
+            CollabMember mine = await Policy.Member(this.Held(),
+                Tenant.Cur(), msg.conversationId, me.id);
+            if (!Policy.IsActive(mine)) {
+                this.Fail(403, "0403", "仅会话成员可下载");
+            }
+        } else if (links[0].ownerType == "task") {
+            CollabTask t = await this.CollabTask
+                .Where(a => a.id == links[0].ownerId
+                   ).FirstAsync();
+            if (t == null) { this.Fail(404, "0404", "任务不存在"); }
+            if (!await this.TaskSees(t, me)) {
+                this.Fail(403, "0403", "仅任务参与者可下载");
+            }
+        } else {
+            this.Fail(403, "0403", "该挂载类型暂未开放下载");
+        }
+        if (!File.Exists(att.path)) { this.Fail(404, "0404", "附件文件已丢失"); }
+        byte[] data = File.ReadAllBytes(att.path);
+        this.Ctx().SetHeader("Content-Disposition",
+            "attachment; filename=\"" + Attachment.BaseName(att.fileName) + "\"");
+        this.Ctx().Binary(att.mime, data, data.Length);
+    }
+
+    /* ---- 协作任务：状态机 unassigned→claimed→in_progress→
+       review→done；in_progress⇄blocked；除 done 外可 cancelled。所有迁移
+       CAS 条件 UPDATE（version 闸）+ collab_task_event 追加，幂等键全带。 ---- */
+
+    /* 单步迁移公共体（start/unblock/submit）：执行人闸 + CAS + 事件 +
+       幂等。 */
+    private async  void Transition(string op, string eventType, string fromStatus,
+                          string toStatus) {
+        SysUser me = await this.Me();
+        CollabTask t = await this.LoadTask(this.InInt("id", 0));
+        string crid = this.Crid();
+        if (t.assigneeId != me.id) {
+            this.Fail(403, "0403", "仅执行人可执行该动作");
+        }
+        if (t.status != fromStatus) {
+            this.Fail(409, "0409", "任务当前为 " + t.status + "，不可执行该迁移");
+        }
+        await this.Begin();
+        string stored = await this.IdemBegin(me.id, op, crid);
+        if (stored != null) { await this.Rollback(); this.Replay(stored); return; }
+        long now = WebApp.NowSeconds();
+        int n = await this.CollabTask.Update()
+            .Set(a => a.status, toStatus)
+            .Set(a => a.version, t.version + 1)
+            .Set(a => a.updatedAt, now)
+            .Where(a => a.id == t.id
+                && a.version == t.version && a.status == fromStatus)
+            .ExecuteAffrowsAsync();
+        if (n == 0) { this.Fail(409, "0409", "任务状态已变化，请刷新后重试"); }
+        await this.TaskLog(t, t.id, eventType, me.id, toStatus, t.assigneeId,
+            t.ownerId, t.progress, "", this.In("content"), crid);
+        JsonValue body = JsonValue.NewObject();
+        body.Put("ok", JsonValue.NewStr("1"));
+        body.Put("status", JsonValue.NewStr(toStatus));
+        await this.IdemFinish(me.id, op, crid, "task", t.id, body);
+        await this.Commit();
+        this.Ok(body.ToJson());
+    }
+
+    /* 任务事件追加（只增不改）：from* 从迁移前快照取。 */
+    private async  void TaskLog(CollabTask t, int taskId, string eventType, int actorId,
+                       string toStatus, int toAssigneeId, int toOwnerId,
+                       int toProgress, string reason, string content,
+                       string crid) {
+        CollabTaskEvent e = new CollabTaskEvent();
+        e.tenantId = Tenant.Cur();
+        e.taskId = taskId;
+        e.actorId = actorId;
+        e.eventType = eventType;
+        e.fromStatus = t.status;
+        e.toStatus = toStatus;
+        e.fromOwnerId = t.ownerId;
+        e.toOwnerId = toOwnerId;
+        e.fromAssigneeId = t.assigneeId;
+        e.toAssigneeId = toAssigneeId;
+        e.fromProgress = t.progress;
+        e.toProgress = toProgress;
+        e.reason = reason == null ? "" : reason;
+        e.content = content == null ? "" : content;
+        e.clientRequestId = crid;
+        e.createdAt = WebApp.NowSeconds();
+        await this.CollabTaskEvent.Insert(e).ExecuteIdentityAsync();
+    }
+
+    /* 任务载入（租户闸在先，查无与跨租户同 404）。 */
+    private async  CollabTask LoadTask(int id) {
+        CollabTask t = await this.CollabTask
+            .Where(a => a.id == id).FirstAsync();
+        if (t == null) { this.Fail(404, "0404", "任务不存在"); }
+        return t;
+    }
+
+    /* 责任侧：owner 或 creator（验收/驳回/转交/取消）。 */
+    static bool TaskOwns(CollabTask t, SysUser me) {
+        return t.ownerId == me.id || t.createdBy == me.id;
+    }
+
+    /* 可见/参与：责任侧或执行人，或任务所属会话成员。 */
+    private async bool TaskSees(CollabTask t, SysUser me) {
+        if (CollabApi.TaskOwns(t, me) || t.assigneeId == me.id) { return true; }
+        if (t.conversationId <= 0) { return false; }
+        CollabMember m = await Policy.Member(this.Held(), Tenant.Cur(),
+            t.conversationId, me.id);
+        return Policy.IsActive(m);
+    }
+
+    [HttpPost]
+    [Description("创建任务")]
+    [Custom(Perm = PermBit.Create)]
+    async void TaskCreate() {
+        SysUser me = await this.Me();
+        string title = this.Need("title", "任务标题");
+        if (title.Length > 128) { title = title.Substring(0, 128); }
+        string crid = this.Crid();
+        int conversationId = this.InInt("conversationId", 0);
+        if (conversationId > 0) {
+            CollabConversation c = await Policy.Conversation(this.Held(),
+                Tenant.Cur(), conversationId);
+            if (c == null) { this.Fail(404, "0404", "会话不存在"); }
+            CollabMember mine = await Policy.Member(this.Held(), Tenant.Cur(),
+                conversationId, me.id);
+            if (!Policy.IsActive(mine)) { this.Fail(403, "0403", "仅会话成员可建任务"); }
+        }
+        int assigneeId = this.InInt("assigneeId", 0);
+        SysUser assignee = null;
+        if (assigneeId > 0) {
+            assignee = await this.SysUser
+                .Where(a => a.id == assigneeId
+                    && a.status == 1).FirstAsync();
+            if (assignee == null) { this.Fail(404, "0404", "执行人不存在或已停用"); }
+        }
+        int priority = this.InInt("priority", 0);
+        if (priority < 0) { priority = 0; }
+        if (priority > 3) { priority = 3; }
+        await this.Begin();
+        string stored = await this.IdemBegin(me.id, "task.create", crid);
+        if (stored != null) { await this.Rollback(); this.Replay(stored); return; }
+        long now = WebApp.NowSeconds();
+        CollabTask t = new CollabTask();
+        t.tenantId = Tenant.Cur();
+        t.conversationId = conversationId;
+        t.createdBy = me.id;
+        t.ownerId = me.id;
+        t.assigneeId = assignee == null ? 0 : assignee.id;
+        t.title = title;
+        t.description = this.In("description");
+        t.status = assignee == null ? "unassigned" : "claimed";
+        t.priority = priority;
+        t.progress = 0;
+        t.dueAt = this.InInt("dueAt", 0);
+        t.blockedReason = "";
+        t.flowInstId = 0;
+        t.version = 1;
+        t.createdAt = now;
+        t.updatedAt = now;
+        t.completedAt = 0;
+        int id = await this.CollabTask.Insert(t).ExecuteIdentityAsync();
+        await this.TaskLog(t, id, "created", me.id, t.status, t.assigneeId,
+            t.ownerId, 0, "", "", crid);
+        JsonValue body = JsonValue.NewObject();
+        body.Put("id", JsonValue.NewStr(Convert.ToString(id)));
+        body.Put("status", JsonValue.NewStr(t.status));
+        await this.IdemFinish(me.id, "task.create", crid, "task", id, body);
+        await this.Commit();
+        this.Ok(body.ToJson());
+    }
+
+    /* 我的任务：执行人或责任侧；status 过滤（缺省全部）；overdue 由 dueAt
+       派生（视图），不落状态列。 */
+    [HttpGet]
+    [Description("我的任务")]
+    [Custom(Perm = PermBit.View)]
+    async void TasksMine() {
+        SysUser me = await this.Me();
+        string status = this.In("status");
+        long now = WebApp.NowSeconds();
+        List<CollabTask> rows = await this.CollabTask
+            .Where(a => (a.assigneeId == me.id || a.ownerId == me.id))
+            .WhereIf(status.Length > 0 && status != "all", a => a.status == status)
+            .OrderBy(a => a.id).Take(100).ToListAsync();
+        JsonValue items = JsonValue.NewArray();
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            CollabTask t = rows[i];
+            JsonValue o = JsonValue.NewObject();
+            o.Put("id", JsonValue.NewStr(Convert.ToString(t.id)));
+            o.Put("title", JsonValue.NewStr(t.title));
+            o.Put("status", JsonValue.NewStr(t.status));
+            o.Put("priority", JsonValue.NewStr(Convert.ToString(t.priority)));
+            o.Put("progress", JsonValue.NewStr(Convert.ToString(t.progress)));
+            o.Put("ownerId", JsonValue.NewStr(Convert.ToString(t.ownerId)));
+            o.Put("assigneeId", JsonValue.NewStr(Convert.ToString(t.assigneeId)));
+            o.Put("mine", JsonValue.NewStr(t.assigneeId == me.id ? "1" : "0"));
+            o.Put("overdue", JsonValue.NewStr(
+                t.dueAt > 0 && t.dueAt < now && t.status != "done"
+                    && t.status != "cancelled" ? "1" : "0"));
+            o.Put("dueAt", JsonValue.NewStr(Convert.ToString(t.dueAt)));
+            o.Put("version", JsonValue.NewStr(Convert.ToString(t.version)));
+            items.Append(o);
+        }
+        JsonValue body = JsonValue.NewObject();
+        body.Put("tasks", items);
+        this.Ok(body.ToJson());
+    }
+
+    /* 任务池：未分配任务（可按会话过滤），认领入口。 */
+    [HttpGet]
+    [Description("任务池")]
+    [Custom(Perm = PermBit.View)]
+    async void TasksPool() {
+        SysUser me = await this.Me();
+        int conversationId = this.InInt("conversationId", 0);
+        List<CollabTask> rows = await this.CollabTask
+            .Where(a => a.status == "unassigned")
+            .WhereIf(conversationId > 0, a => a.conversationId == conversationId)
+            .OrderBy(a => a.id).Take(100).ToListAsync();
+        JsonValue items = JsonValue.NewArray();
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            CollabTask t = rows[i];
+            JsonValue o = JsonValue.NewObject();
+            o.Put("id", JsonValue.NewStr(Convert.ToString(t.id)));
+            o.Put("title", JsonValue.NewStr(t.title));
+            o.Put("conversationId", JsonValue.NewStr(Convert.ToString(t.conversationId)));
+            o.Put("priority", JsonValue.NewStr(Convert.ToString(t.priority)));
+            o.Put("dueAt", JsonValue.NewStr(Convert.ToString(t.dueAt)));
+            items.Append(o);
+        }
+        JsonValue body = JsonValue.NewObject();
+        body.Put("tasks", items);
+        this.Ok(body.ToJson());
+    }
+
+    /* 任务详情 + 不可变时间线（最近 100 条，升序）。参与可见：责任侧/
+       执行人/会话成员；跨租户同 404。 */
+    [HttpGet]
+    [Description("任务详情")]
+    [Custom(Perm = PermBit.View)]
+    async void TaskDetail() {
+        SysUser me = await this.Me();
+        CollabTask t = await this.LoadTask(this.InInt("id", 0));
+        if (!await this.TaskSees(t, me)) { this.Fail(403, "0403", "无权查看该任务"); }
+        List<CollabTaskEvent> evs = await this.CollabTaskEvent
+            .Where(a => a.taskId == t.id)
+            .OrderBy(a => a.id).Take(100).ToListAsync();
+        JsonValue items = JsonValue.NewArray();
+        for (int i = 0; i < evs.Count; i = i + 1) {
+            CollabTaskEvent e = evs[i];
+            JsonValue o = JsonValue.NewObject();
+            o.Put("id", JsonValue.NewStr(Convert.ToString(e.id)));
+            o.Put("event", JsonValue.NewStr(e.eventType));
+            o.Put("actorId", JsonValue.NewStr(Convert.ToString(e.actorId)));
+            o.Put("fromStatus", JsonValue.NewStr(e.fromStatus));
+            o.Put("toStatus", JsonValue.NewStr(e.toStatus));
+            o.Put("fromAssigneeId", JsonValue.NewStr(Convert.ToString(e.fromAssigneeId)));
+            o.Put("toAssigneeId", JsonValue.NewStr(Convert.ToString(e.toAssigneeId)));
+            o.Put("fromProgress", JsonValue.NewStr(Convert.ToString(e.fromProgress)));
+            o.Put("toProgress", JsonValue.NewStr(Convert.ToString(e.toProgress)));
+            o.Put("reason", JsonValue.NewStr(e.reason));
+            o.Put("content", JsonValue.NewStr(e.content));
+            o.Put("at", JsonValue.NewStr(Convert.ToString(e.createdAt)));
+            items.Append(o);
+        }
+        JsonValue body = JsonValue.NewObject();
+        body.Put("id", JsonValue.NewStr(Convert.ToString(t.id)));
+        body.Put("title", JsonValue.NewStr(t.title));
+        body.Put("description", JsonValue.NewStr(t.description));
+        body.Put("status", JsonValue.NewStr(t.status));
+        body.Put("progress", JsonValue.NewStr(Convert.ToString(t.progress)));
+        body.Put("ownerId", JsonValue.NewStr(Convert.ToString(t.ownerId)));
+        body.Put("assigneeId", JsonValue.NewStr(Convert.ToString(t.assigneeId)));
+        body.Put("blockedReason", JsonValue.NewStr(t.blockedReason));
+        body.Put("dueAt", JsonValue.NewStr(Convert.ToString(t.dueAt)));
+        body.Put("version", JsonValue.NewStr(Convert.ToString(t.version)));
+        /* 任务附件：task 绑定的附件行，与消息附件同字段形态。 */
+        List<CollabAttachmentLink> tlinks = await this.CollabAttachmentLink
+            .Where(a => a.ownerType == "task"
+                && a.ownerId == t.id).ToListAsync();
+        List<int> taids = new List<int>();
+        for (int i = 0; i < tlinks.Count; i = i + 1) {
+            taids.Add(tlinks[i].attachmentId);
+        }
+        JsonValue atts2 = JsonValue.NewArray();
+        if (taids.Count > 0) {
+            List<OaAttachment> trows = await this.OaAttachment
+                .Where(a => taids.Contains(a.id)).ToListAsync();
+            for (int i = 0; i < trows.Count; i = i + 1) {
+                OaAttachment a1 = trows[i];
+                JsonValue o2 = JsonValue.NewObject();
+                o2.Put("attachmentId", JsonValue.NewStr(Convert.ToString(a1.id)));
+                o2.Put("fileName", JsonValue.NewStr(a1.fileName));
+                o2.Put("size", JsonValue.NewStr(Convert.ToString(a1.size)));
+                o2.Put("mime", JsonValue.NewStr(a1.mime));
+                if (a1.imgWidth > 0) {
+                    o2.Put("width", JsonValue.NewStr(Convert.ToString(a1.imgWidth)));
+                    o2.Put("height", JsonValue.NewStr(Convert.ToString(a1.imgHeight)));
+                }
+                atts2.Append(o2);
+            }
+        }
+        body.Put("attachments", atts2);
+        body.Put("events", items);
+        this.Ok(body.ToJson());
+    }
+
+    /* 认领：CAS——unassigned 且 assignee=0 且 version 相符才生效，
+       affected=0 即他人抢先（409）。 */
+    [HttpPost]
+    [Description("认领任务")]
+    [Custom(Perm = PermBit.Update)]
+    async void TaskClaim() {
+        SysUser me = await this.Me();
+        CollabTask t = await this.LoadTask(this.InInt("id", 0));
+        string crid = this.Crid();
+        if (t.conversationId > 0) {
+            CollabMember mine = await Policy.Member(this.Held(), Tenant.Cur(),
+                t.conversationId, me.id);
+            if (!Policy.IsActive(mine)) { this.Fail(403, "0403", "仅会话成员可认领"); }
+        }
+        await this.Begin();
+        string stored = await this.IdemBegin(me.id, "task.claim", crid);
+        if (stored != null) { await this.Rollback(); this.Replay(stored); return; }
+        long now = WebApp.NowSeconds();
+        int n = await this.CollabTask.Update()
+            .Set(a => a.assigneeId, me.id)
+            .Set(a => a.status, "claimed")
+            .Set(a => a.version, t.version + 1)
+            .Set(a => a.updatedAt, now)
+            .Where(a => a.id == t.id
+                && a.status == "unassigned" && a.assigneeId == 0
+                && a.version == t.version)
+            .ExecuteAffrowsAsync();
+        if (n == 0) { this.Fail(409, "0409", "任务已被他人认领或状态已变化"); }
+        await this.TaskLog(t, t.id, "claimed", me.id, "claimed", me.id,
+            t.ownerId, t.progress, "", "", crid);
+        JsonValue body = JsonValue.NewObject();
+        body.Put("ok", JsonValue.NewStr("1"));
+        body.Put("status", JsonValue.NewStr("claimed"));
+        await this.IdemFinish(me.id, "task.claim", crid, "task", t.id, body);
+        await this.Commit();
+        this.Ok(body.ToJson());
+    }
+
+    /* 分配（unassigned→claimed）或转交（claimed/in_progress/blocked 内换人，
+       必填理由）：owner/creator；CAS 同认领。 */
+    [HttpPost]
+    [Description("分配或转交任务")]
+    [Custom(Perm = PermBit.Update)]
+    async void TaskAssign() {
+        SysUser me = await this.Me();
+        CollabTask t = await this.LoadTask(this.InInt("id", 0));
+        string crid = this.Crid();
+        if (!CollabApi.TaskOwns(t, me)) { this.Fail(403, "0403", "仅责任人可分配或转交"); }
+        int userId = this.InInt("userId", 0);
+        SysUser target = await this.SysUser
+            .Where(a => a.id == userId
+                && a.status == 1).FirstAsync();
+        if (target == null) { this.Fail(404, "0404", "执行人不存在或已停用"); }
+        bool isAssign = t.status == "unassigned";
+        string reason = "";
+        if (!isAssign) {
+            reason = this.Need("reason", "转交理由");
+            if (t.status != "claimed" && t.status != "in_progress"
+                && t.status != "blocked") {
+                this.Fail(409, "0409", "当前状态不可转交");
+            }
+        }
+        string toStatus = isAssign ? "claimed" : t.status;
+        await this.Begin();
+        string stored = await this.IdemBegin(me.id, "task.assign", crid);
+        if (stored != null) { await this.Rollback(); this.Replay(stored); return; }
+        long now = WebApp.NowSeconds();
+        int n = await this.CollabTask.Update()
+            .Set(a => a.assigneeId, target.id)
+            .Set(a => a.status, toStatus)
+            .Set(a => a.version, t.version + 1)
+            .Set(a => a.updatedAt, now)
+            .Where(a => a.id == t.id
+                && a.version == t.version
+                && a.status == (isAssign ? "unassigned" : t.status))
+            .ExecuteAffrowsAsync();
+        if (n == 0) { this.Fail(409, "0409", "任务状态已变化，请刷新后重试"); }
+        await this.TaskLog(t, t.id, isAssign ? "assigned" : "transferred", me.id,
+            toStatus, target.id, t.ownerId, t.progress, reason, "", crid);
+        JsonValue body = JsonValue.NewObject();
+        body.Put("ok", JsonValue.NewStr("1"));
+        body.Put("assigneeId", JsonValue.NewStr(Convert.ToString(target.id)));
+        await this.IdemFinish(me.id, "task.assign", crid, "task", t.id, body);
+        await this.Commit();
+        this.Ok(body.ToJson());
+    }
+
+    /* 开始：claimed→in_progress（执行人）。 */
+    [HttpPost]
+    [Description("开始任务")]
+    [Custom(Perm = PermBit.Update)]
+    async void TaskStart() {
+        await this.Transition("task.start", "started", "claimed", "in_progress");
+    }
+
+    /* 更新进度（0..100，追加事件不覆盖）：in_progress（执行人）。 */
+    [HttpPost]
+    [Description("更新进度")]
+    [Custom(Perm = PermBit.Update)]
+    async void TaskProgress() {
+        SysUser me = await this.Me();
+        CollabTask t = await this.LoadTask(this.InInt("id", 0));
+        string crid = this.Crid();
+        if (t.assigneeId != me.id) { this.Fail(403, "0403", "仅执行人可更新进度"); }
+        int progress = this.InInt("progress", -1);
+        if (progress < 0 || progress > 100) { this.Fail(400, "0003", "进度需在 0..100"); }
+        await this.Begin();
+        string stored = await this.IdemBegin(me.id, "task.progress", crid);
+        if (stored != null) { await this.Rollback(); this.Replay(stored); return; }
+        long now = WebApp.NowSeconds();
+        int n = await this.CollabTask.Update()
+            .Set(a => a.progress, progress)
+            .Set(a => a.version, t.version + 1)
+            .Set(a => a.updatedAt, now)
+            .Where(a => a.id == t.id
+                && a.version == t.version && a.status == "in_progress"
+                && a.assigneeId == me.id)
+            .ExecuteAffrowsAsync();
+        if (n == 0) { this.Fail(409, "0409", "任务状态已变化，请刷新后重试"); }
+        await this.TaskLog(t, t.id, "progress", me.id, "in_progress", me.id,
+            t.ownerId, progress, "", this.In("content"), crid);
+        JsonValue body = JsonValue.NewObject();
+        body.Put("ok", JsonValue.NewStr("1"));
+        body.Put("progress", JsonValue.NewStr(Convert.ToString(progress)));
+        await this.IdemFinish(me.id, "task.progress", crid, "task", t.id, body);
+        await this.Commit();
+        this.Ok(body.ToJson());
+    }
+
+    /* 阻塞（必填原因）/解除阻塞：in_progress→blocked→in_progress
+       （执行人或责任人）。 */
+    [HttpPost]
+    [Description("标记阻塞")]
+    [Custom(Perm = PermBit.Update)]
+    async void TaskBlock() {
+        SysUser me = await this.Me();
+        CollabTask t = await this.LoadTask(this.InInt("id", 0));
+        string crid = this.Crid();
+        if (!CollabApi.TaskOwns(t, me) && t.assigneeId != me.id) {
+            this.Fail(403, "0403", "仅执行人或责任人可标记阻塞");
+        }
+        string reason = this.Need("reason", "阻塞原因");
+        if (t.status != "in_progress") { this.Fail(409, "0409", "仅进行中任务可标记阻塞"); }
+        await this.Begin();
+        string stored = await this.IdemBegin(me.id, "task.block", crid);
+        if (stored != null) { await this.Rollback(); this.Replay(stored); return; }
+        long now = WebApp.NowSeconds();
+        int n = await this.CollabTask.Update()
+            .Set(a => a.status, "blocked")
+            .Set(a => a.blockedReason, reason)
+            .Set(a => a.version, t.version + 1)
+            .Set(a => a.updatedAt, now)
+            .Where(a => a.id == t.id
+                && a.version == t.version && a.status == "in_progress")
+            .ExecuteAffrowsAsync();
+        if (n == 0) { this.Fail(409, "0409", "任务状态已变化，请刷新后重试"); }
+        await this.TaskLog(t, t.id, "blocked", me.id, "blocked", t.assigneeId,
+            t.ownerId, t.progress, reason, "", crid);
+        JsonValue body = JsonValue.NewObject();
+        body.Put("ok", JsonValue.NewStr("1"));
+        body.Put("status", JsonValue.NewStr("blocked"));
+        await this.IdemFinish(me.id, "task.block", crid, "task", t.id, body);
+        await this.Commit();
+        this.Ok(body.ToJson());
+    }
+
+    [HttpPost]
+    [Description("解除阻塞")]
+    [Custom(Perm = PermBit.Update)]
+    async void TaskUnblock() {
+        await this.Transition("task.unblock", "unblocked", "blocked", "in_progress");
+    }
+
+    /* 提交验收：in_progress→review（执行人）。 */
+    [HttpPost]
+    [Description("提交验收")]
+    [Custom(Perm = PermBit.Update)]
+    async void TaskSubmit() {
+        await this.Transition("task.submit", "submitted", "in_progress", "review");
+    }
+
+    /* 验收通过：review→done（owner/creator），落 completedAt。 */
+    [HttpPost]
+    [Description("验收通过")]
+    [Custom(Perm = PermBit.Update)]
+    async void TaskApprove() {
+        SysUser me = await this.Me();
+        CollabTask t = await this.LoadTask(this.InInt("id", 0));
+        string crid = this.Crid();
+        if (!CollabApi.TaskOwns(t, me)) { this.Fail(403, "0403", "仅责任人可验收"); }
+        if (t.status != "review") { this.Fail(409, "0409", "仅待验收任务可通过"); }
+        await this.Begin();
+        string stored = await this.IdemBegin(me.id, "task.approve", crid);
+        if (stored != null) { await this.Rollback(); this.Replay(stored); return; }
+        long now = WebApp.NowSeconds();
+        int n = await this.CollabTask.Update()
+            .Set(a => a.status, "done")
+            .Set(a => a.progress, 100)
+            .Set(a => a.completedAt, now)
+            .Set(a => a.version, t.version + 1)
+            .Set(a => a.updatedAt, now)
+            .Where(a => a.id == t.id
+                && a.version == t.version && a.status == "review")
+            .ExecuteAffrowsAsync();
+        if (n == 0) { this.Fail(409, "0409", "任务状态已变化，请刷新后重试"); }
+        await this.TaskLog(t, t.id, "approved", me.id, "done", t.assigneeId,
+            t.ownerId, 100, "", this.In("content"), crid);
+        JsonValue body = JsonValue.NewObject();
+        body.Put("ok", JsonValue.NewStr("1"));
+        body.Put("status", JsonValue.NewStr("done"));
+        await this.IdemFinish(me.id, "task.approve", crid, "task", t.id, body);
+        await this.Commit();
+        this.Ok(body.ToJson());
+    }
+
+    /* 驳回返工（必填理由）：review→in_progress（owner/creator）。 */
+    [HttpPost]
+    [Description("驳回返工")]
+    [Custom(Perm = PermBit.Update)]
+    async void TaskReject() {
+        SysUser me = await this.Me();
+        CollabTask t = await this.LoadTask(this.InInt("id", 0));
+        string crid = this.Crid();
+        if (!CollabApi.TaskOwns(t, me)) { this.Fail(403, "0403", "仅责任人可驳回"); }
+        string reason = this.Need("reason", "驳回理由");
+        if (t.status != "review") { this.Fail(409, "0409", "仅待验收任务可驳回"); }
+        await this.Begin();
+        string stored = await this.IdemBegin(me.id, "task.reject", crid);
+        if (stored != null) { await this.Rollback(); this.Replay(stored); return; }
+        long now = WebApp.NowSeconds();
+        int n = await this.CollabTask.Update()
+            .Set(a => a.status, "in_progress")
+            .Set(a => a.version, t.version + 1)
+            .Set(a => a.updatedAt, now)
+            .Where(a => a.id == t.id
+                && a.version == t.version && a.status == "review")
+            .ExecuteAffrowsAsync();
+        if (n == 0) { this.Fail(409, "0409", "任务状态已变化，请刷新后重试"); }
+        await this.TaskLog(t, t.id, "rejected", me.id, "in_progress", t.assigneeId,
+            t.ownerId, t.progress, reason, "", crid);
+        JsonValue body = JsonValue.NewObject();
+        body.Put("ok", JsonValue.NewStr("1"));
+        body.Put("status", JsonValue.NewStr("in_progress"));
+        await this.IdemFinish(me.id, "task.reject", crid, "task", t.id, body);
+        await this.Commit();
+        this.Ok(body.ToJson());
+    }
+
+    /* 取消（owner/creator；done/cancelled 不可取消）：删除=取消+事件，
+       不抹行。 */
+    [HttpPost]
+    [Description("取消任务")]
+    [Custom(Perm = PermBit.Update)]
+    async void TaskCancel() {
+        SysUser me = await this.Me();
+        CollabTask t = await this.LoadTask(this.InInt("id", 0));
+        string crid = this.Crid();
+        if (!CollabApi.TaskOwns(t, me)) { this.Fail(403, "0403", "仅责任人可取消"); }
+        string reason = this.Need("reason", "取消理由");
+        if (t.status == "done" || t.status == "cancelled") {
+            this.Fail(409, "0409", "任务已终结，不可取消");
+        }
+        await this.Begin();
+        string stored = await this.IdemBegin(me.id, "task.cancel", crid);
+        if (stored != null) { await this.Rollback(); this.Replay(stored); return; }
+        long now = WebApp.NowSeconds();
+        int n = await this.CollabTask.Update()
+            .Set(a => a.status, "cancelled")
+            .Set(a => a.version, t.version + 1)
+            .Set(a => a.updatedAt, now)
+            .Where(a => a.id == t.id
+                && a.version == t.version && a.status == t.status)
+            .ExecuteAffrowsAsync();
+        if (n == 0) { this.Fail(409, "0409", "任务状态已变化，请刷新后重试"); }
+        await this.TaskLog(t, t.id, "cancelled", me.id, "cancelled", t.assigneeId,
+            t.ownerId, t.progress, reason, "", crid);
+        JsonValue body = JsonValue.NewObject();
+        body.Put("ok", JsonValue.NewStr("1"));
+        body.Put("status", JsonValue.NewStr("cancelled"));
+        await this.IdemFinish(me.id, "task.cancel", crid, "task", t.id, body);
+        await this.Commit();
+        this.Ok(body.ToJson());
+    }
+
+    /* 任务附件：上传在 /uploadattachment（先传后绑，一字节
+       文件至多一个绑定——attachmentId 唯一约束），本端点把未绑定附件
+       挂到任务上（ownerType=task）。责任人或执行人可挂；下载走
+       /downloadattachment 的 task 分支（任务参与者可见）。 */
+    [HttpPost]
+    [Description("任务挂附件")]
+    [Custom(Perm = PermBit.Update)]
+    async void TaskAttach() {
+        SysUser me = await this.Me();
+        CollabTask t = await this.LoadTask(this.InInt("id", 0));
+        if (!CollabApi.TaskOwns(t, me) && t.assigneeId != me.id) {
+            this.Fail(403, "0403", "仅责任人或执行人可挂附件");
+        }
+        int attachmentId = this.InInt("attachmentId", 0);
+        OaAttachment att = await this.OaAttachment
+            .Where(a => a.id == attachmentId
+               ).FirstAsync();
+        if (att == null) { this.Fail(404, "0404", "附件不存在"); }
+        List<CollabAttachmentLink> bound = await this.CollabAttachmentLink
+            .Where(a => a.attachmentId == attachmentId).ToListAsync();
+        if (bound.Count > 0) { this.Fail(409, "0409", "附件已绑定其他资源"); }
+        string crid = this.Crid();
+        await this.Begin();
+        string stored = await this.IdemBegin(me.id, "task.attach", crid);
+        if (stored != null) { await this.Rollback(); this.Replay(stored); return; }
+        CollabAttachmentLink link = new CollabAttachmentLink();
+        link.tenantId = Tenant.Cur();
+        link.attachmentId = att.id;
+        link.ownerType = "task";
+        link.ownerId = t.id;
+        link.addedBy = me.id;
+        link.createdAt = WebApp.NowSeconds();
+        await this.CollabAttachmentLink.Insert(link).ExecuteIdentityAsync();
+        await this.TaskLog(t, t.id, "attached", me.id, t.status, t.assigneeId,
+            t.ownerId, t.progress, "", att.fileName, crid);
+        JsonValue body = JsonValue.NewObject();
+        body.Put("ok", JsonValue.NewStr("1"));
+        await this.IdemFinish(me.id, "task.attach", crid, "task", t.id, body);
+        await this.Commit();
+        this.Ok(body.ToJson());
+    }
+
+    /* 撤回：仅发送者本人；deletedAt 置时不抹行，历史按
+       deleted 形态呈现；message.recalled 事件同事务；已撤回按幂等成功。 */
+    [HttpPost]
+    [Description("撤回消息")]
+    [Custom(Perm = PermBit.Update)]
+    async void Recall() {
+        SysUser me = await this.Me();
+        string crid = this.Crid();
+        CollabMessage r = await this.CollabMessage
+            .Where(a => a.id == this.InInt("id", 0)
+               ).FirstAsync();
+        if (r == null) { this.Fail(404, "0404", "消息不存在"); }
+        if (r.senderId != me.id) { this.Fail(403, "0403", "仅发送者可撤回"); }
+        CollabMember mine = await Policy.Member(this.Held(), Tenant.Cur(),
+            r.conversationId, me.id);
+        if (!Policy.IsActive(mine)) { this.Fail(403, "0403", "仅会话成员可撤回"); }
+        if (r.deletedAt > 0) {
+            JsonValue gone = JsonValue.NewObject();
+            gone.Put("ok", JsonValue.NewStr("1"));
+            this.Ok(gone.ToJson());
+        }
+        await this.Begin();
+        string stored = await this.IdemBegin(me.id, "message.recall", crid);
+        if (stored != null) { await this.Rollback(); this.Replay(stored); return; }
+        long now = WebApp.NowSeconds();
+        int n = await this.CollabMessage.Update()
+            .Set(a => a.deletedAt, now)
+            .Where(a => a.id == r.id && a.deletedAt == 0)
+            .ExecuteAffrowsAsync();
+        if (n == 0) { this.Fail(409, "0409", "消息状态已变化"); }
+        JsonValue ev = JsonValue.NewObject();
+        ev.Put("conversationId", JsonValue.NewStr(Convert.ToString(r.conversationId)));
+        ev.Put("messageId", JsonValue.NewStr(Convert.ToString(r.id)));
+        await this.InsertEvent("message.recalled", "message", r.id,
+            r.conversationId, me.id, ev);
+        JsonValue body = JsonValue.NewObject();
+        body.Put("ok", JsonValue.NewStr("1"));
+        await this.IdemFinish(me.id, "message.recall", crid, "message", r.id, body);
+        await this.Commit();
+        this.Ok(body.ToJson());
+    }
+
+    /* ---- helpers ---- */
+
+    /* 当前登录账号（ApiAuth 下 uid 必在；查不到即 401——token 版本失效等）。 */
+    private async  SysUser Me() {
+        SysUser me = await this.SysUser
+            .Where(a => a.id == Filter.ToInt(this.uid, 0)).FirstAsync();
+        if (me == null || me.status != 1) {
+            this.Fail(401, "1001", "账号不可用，请重新登录");
+        }
+        return me;
+    }
+
+    /* 邀请对象校验：全部必须是本租户启用账号（先于幂等占位判定，
+       失败不留键、原键可重试）；自邀与重复 id 在此静默忽略。 */
+    private async  List<SysUser> ResolveInvitees(SysUser me, List<int> ids) {
+        List<SysUser> users = new List<SysUser>();
+        for (int i = 0; i < ids.Count; i = i + 1) {
+            if (ids[i] == me.id) { continue; }
+            bool dup = false;
+            for (int j = 0; j < users.Count; j = j + 1) {
+                if (users[j].id == ids[i]) { dup = true; break; }
+            }
+            if (dup) { continue; }
+            SysUser u = await this.SysUser
+                .Where(a => a.id == ids[i]
+                    && a.status == 1).FirstAsync();
+            if (u == null) { this.Fail(404, "0404", "邀请对象不存在或已停用"); }
+            users.Add(u);
+        }
+        return users;
+    }
+
+    /* 加入/重入：无行插入；left 行条件复位（并发重入仅一方生效，CAS 口径）。
+       返回本次实际新增/复活的行数。 */
+    private async int Join(int conversationId, int userId, long now) {
+        CollabMember exist = await Policy.Member(this.Held(), Tenant.Cur(),
+            conversationId, userId);
+        if (exist == null) {
+            await this.InsertMember(Tenant.Cur(), conversationId, userId, "member", now);
+            return 1;
+        }
+        if (exist.status == "active") { return 0; }
+        int n = await this.CollabMember.Update()
+            .Set(a => a.status, "active")
+            .Set(a => a.leftAt, 0)
+            .Set(a => a.joinedAt, now)
+            .Where(a => a.id == exist.id && a.status == "left")
+            .ExecuteAffrowsAsync();
+        return n;
+    }
+
+    private async  void InsertMember(int tenantId, int conversationId, int userId,
+                            string role, long now) {
+        CollabMember m = new CollabMember();
+        m.tenantId = tenantId;
+        m.conversationId = conversationId;
+        m.userId = userId;
+        m.role = role;
+        m.status = "active";
+        m.lastReadMsgId = 0;
+        m.joinedAt = now;
+        m.leftAt = 0;
+        await this.CollabMember.Insert(m).ExecuteIdentityAsync();
+    }
+
+    /* ---- 幂等（collab_idem） ---- */
+
+    /* clientRequestId 必填（可重试写契约），超长截断。 */
+    private string Crid() {
+        string crid = this.Need("clientRequestId", "clientRequestId");
+        if (crid.Length > 64) { crid = crid.Substring(0, 64); }
+        return crid;
+    }
+
+    /* 必须在请求事务内调用。返回 null = 首次（占位行已插入，收尾必须
+       IdemFinish）；非空 = 已有应答（空串 = 上次仍在处理，Replay 答 409）。
+       并发同键：占位行唯一索引裁决，后到者随事务整体回滚，原键重试即得。 */
+    private async string IdemBegin(int actorId, string operation, string crid) {
+        List<CollabIdem> prev = await this.CollabIdem
+            .Where(a => a.actorId == actorId
+                && a.operation == operation && a.clientRequestId == crid)
+            .ToListAsync();
+        if (prev.Count > 0) { return prev[0].response; }
+        CollabIdem k = new CollabIdem();
+        k.tenantId = Tenant.Cur();
+        k.actorId = actorId;
+        k.operation = operation;
+        k.clientRequestId = crid;
+        k.resourceType = "";
+        k.resourceId = 0;
+        k.response = "";
+        k.createdAt = WebApp.NowSeconds();
+        await this.CollabIdem.Insert(k).ExecuteIdentityAsync();
+        return null;
+    }
+
+    /* 事务收尾：回填应答与资源回链（提交前，与事实行同生共死）。 */
+    private async  void IdemFinish(int actorId, string operation, string crid,
+                          string resourceType, int resourceId, JsonValue body) {
+        await this.CollabIdem.Update()
+            .Set(a => a.response, body.ToJson())
+            .Set(a => a.resourceType, resourceType)
+            .Set(a => a.resourceId, resourceId)
+            .Where(a => a.actorId == actorId
+                && a.operation == operation && a.clientRequestId == crid)
+            .ExecuteAffrowsAsync();
+    }
+
+    /* 重放收尾：原应答 + replayed=1；空串 = 占位未完成 → 409。
+       Set 非 Put（Put 追加不去重）。 */
+    private void Replay(string stored) {
+        if (stored.Length == 0) {
+            this.Fail(409, "0009", "上次请求仍在处理，请稍后重试");
+        }
+        JsonValue body = JsonValue.ParseLenient(stored);
+        if (body == null) { body = JsonValue.NewObject(); }
+        body.Set("replayed", JsonValue.NewStr("1"));
+        this.Ok(body.ToJson());
+    }
+
+    /* "1,2,3" → 去重正整数表；空/脏片段忽略。 */
+    private static List<int> IdsOf(string csv) {
+        List<int> ids = new List<int>();
+        if (csv == null || csv.Length == 0) { return ids; }
+        List<string> parts = csv.Split(",");
+        for (int i = 0; i < parts.Count; i = i + 1) {
+            int v = Filter.ToInt(parts[i].Trim(), 0);
+            if (v <= 0) { continue; }
+            bool dup = false;
+            for (int j = 0; j < ids.Count; j = j + 1) {
+                if (ids[j] == v) { dup = true; break; }
+            }
+            if (!dup) { ids.Add(v); }
+        }
+        return ids;
+    }
+
+    static string NameOf(List<SysUser> users, int id) {
+        for (int i = 0; i < users.Count; i = i + 1) {
+            if (users[i].id == id) { return Fmt.Text(users[i].nickname, users[i].username); }
+        }
+        return "用户" + Convert.ToString(id);
+    }
+
+    /* 领域事件落库：必须在事实所在请求事务内调用，
+       同生共死；payload 只放紧凑摘要；conversationId 供补拉与扇出做
+       成员资格过滤。 */
+    private async  void InsertEvent(string type, string aggregateType, int aggregateId,
+                           int conversationId, int actorId, JsonValue payload) {
+        CollabEvent e = new CollabEvent();
+        e.tenantId = Tenant.Cur();
+        e.type = type;
+        e.aggregateType = aggregateType;
+        e.aggregateId = aggregateId;
+        e.conversationId = conversationId;
+        e.actorId = actorId;
+        e.payload = payload.ToJson();
+        e.createdAt = WebApp.NowSeconds();
+        await this.CollabEvent.Insert(e).ExecuteIdentityAsync();
+    }
+
+    /* 倒序取页 → 时间正序输出（重建列表，不依赖原地反转）。 */
+    private static List<CollabMessage> Asc(List<CollabMessage> desc) {
+        List<CollabMessage> asc = new List<CollabMessage>();
+        for (int i = desc.Count - 1; i >= 0; i = i - 1) { asc.Add(desc[i]); }
+        return asc;
+    }
+
+    /* PNG/JPEG 头嗅探宽高：只看前 64KB；解析不出返回 0/0（非图
+       或变体格式），不影响上传。PNG 宽高在 16..24（大端）；JPEG 扫
+       SOF0..SOF15 段标记取高宽。缩略图一期不生成——桌面客户端本地图形栈
+       自行缩放（微信式），服务端无头环境不引图像编解码依赖。 */
+    private static ImgDim SniffImage(string path, string mime) {
+        ImgDim d = new ImgDim();
+        if (mime != "image/png" && mime != "image/jpeg") { return d; }
+        try {
+            byte[] b = File.ReadAllBytes(path);
+            if (mime == "image/png") {
+                if (b.Length >= 24 && b[0] == 0x89 && b[1] == 0x50
+                    && b[2] == 0x4E && b[3] == 0x47) {
+                    d.width = (b[16] & 255) * 16777216 + (b[17] & 255) * 65536
+                        + (b[18] & 255) * 256 + (b[19] & 255);
+                    d.height = (b[20] & 255) * 16777216 + (b[21] & 255) * 65536
+                        + (b[22] & 255) * 256 + (b[23] & 255);
+                }
+                return d;
+            }
+            if (b.Length >= 4 && b[0] == 0xFF && b[1] == 0xD8) {
+                int i = 2;
+                while (i + 9 < b.Length) {
+                    if (b[i] != 0xFF) { break; }
+                    int mark = b[i + 1] & 255;
+                    if (mark >= 0xC0 && mark <= 0xCF && mark != 0xC4
+                        && mark != 0xC8 && mark != 0xCC) {
+                        d.height = (b[i + 5] & 255) * 256 + (b[i + 6] & 255);
+                        d.width = (b[i + 7] & 255) * 256 + (b[i + 8] & 255);
+                        break;
+                    }
+                    i = i + 2 + (b[i + 2] & 255) * 256 + (b[i + 3] & 255);
+                }
+            }
+        } catch (Exception) {
+            /* 读不到/解析不了按 0/0 处理，上传主流程不受影响。 */
+        }
+        return d;
+    }
+
+    /* 图片尺寸嗅探结果。 */
+    class ImgDim {
+        int width;
+        int height;
+    }
+}
