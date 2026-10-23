@@ -1105,6 +1105,272 @@ static bool lsp_stdlib_root(char *out, size_t cap) {
 #endif
 }
 
+/* A506 冷启动：包仓库"扫全仓"改为"按 using 闭包按需解析"。此前
+ * zan_pkg_all_source_roots（旧路径）把 packages/ 里 8491 个 .zan 全喂给
+ * intel_index_project，冷启动 11~13 秒里 10.8 秒花在这；stdlib 才
+ * 167 个文件约 2 秒。这里收集工作区与已解析包源码里的 using 子句，
+ * 逐命名空间解析出包源目录，只索引闭包
+ * （Zan.Sdk.* 的特判随之自然消失：没人 using 就不索引）。 */
+
+static void scan_text_usings(const char *text, size_t len,
+                             char (*out_ns)[128], int *ns_count, int max_ns) {
+    (void)len;
+    bool line_start = true;
+    for (const char *p = text; *p; p++) {
+        if (*p == '\n') { line_start = true; continue; }
+        if (!line_start) continue;
+        const char *q = p;
+        while (*q == ' ' || *q == '\t') q++;
+        if (strncmp(q, "using ", 6) != 0) { line_start = false; continue; }
+        const char *s = q + 6;
+        while (*s == ' ' || *s == '\t') s++;
+        const char *e = s;
+        while ((*e >= 'A' && *e <= 'Z') || (*e >= 'a' && *e <= 'z') ||
+               (*e >= '0' && *e <= '9') || *e == '_' || *e == '.') e++;
+        const char *semi = e;
+        while (*semi == ' ' || *semi == '\t') semi++;
+        size_t n = (size_t)(e - s);
+        if (*semi == ';' && n > 0 && n < sizeof(out_ns[0])) {
+            char ns[128];
+            memcpy(ns, s, n);
+            ns[n] = '\0';
+            bool dup = false;
+            for (int i = 0; i < *ns_count; i++) {
+                if (strcmp(out_ns[i], ns) == 0) { dup = true; break; }
+            }
+            if (!dup && *ns_count < max_ns) {
+                memcpy(out_ns[*ns_count], ns, n + 1);
+                (*ns_count)++;
+            }
+        }
+        line_start = false;
+    }
+}
+
+/* 扫一个目录树下 .zan 文件的 using 子句（不动 intel 符号表）。 */
+static void scan_dir_usings(const char *dir_path,
+                            char (*out_ns)[128], int *ns_count, int max_ns) {
+    if (!dir_path || !dir_path[0] || intel_cancel_flag) return;
+#ifdef _WIN32
+    char search_path[1024];
+    snprintf(search_path, sizeof(search_path), "%s\\*", dir_path);
+    wchar_t wsearch[1024];
+    if (MultiByteToWideChar(CP_UTF8, 0, search_path, -1, wsearch, 1024) <= 0) return;
+    WIN32_FIND_DATAW fd;
+    HANDLE hFind = FindFirstFileW(wsearch, &fd);
+    if (hFind == INVALID_HANDLE_VALUE) return;
+    do {
+        if (intel_cancel_flag) break;
+        if (fd.cFileName[0] == L'.') continue;
+        char name_utf8[512];
+        if (WideCharToMultiByte(CP_UTF8, 0, fd.cFileName, -1, name_utf8,
+                                sizeof(name_utf8), NULL, NULL) <= 0) continue;
+        char full_path[1024];
+        snprintf(full_path, sizeof(full_path), "%s\\%s", dir_path, name_utf8);
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+            if (strcmp(name_utf8, "bin") != 0 && strcmp(name_utf8, "obj") != 0 &&
+                strcmp(name_utf8, "drivers") != 0)
+                scan_dir_usings(full_path, out_ns, ns_count, max_ns);
+        } else {
+            size_t nl = strlen(name_utf8);
+            if (nl > 4 && strcmp(name_utf8 + nl - 4, ".zan") == 0) {
+                wchar_t wfull[1024];
+                if (MultiByteToWideChar(CP_UTF8, 0, full_path, -1, wfull, 1024) > 0) {
+                    HANDLE hFile = CreateFileW(wfull, GENERIC_READ, FILE_SHARE_READ,
+                                               NULL, OPEN_EXISTING, 0, NULL);
+                    if (hFile != INVALID_HANDLE_VALUE) {
+                        DWORD size = GetFileSize(hFile, NULL);
+                        if (size > 0 && size < 2 * 1024 * 1024) {
+                            char *content = (char *)malloc(size + 1);
+                            if (content) {
+                                DWORD got = 0;
+                                ReadFile(hFile, content, size, &got, NULL);
+                                content[got] = '\0';
+                                scan_text_usings(content, got, out_ns, ns_count, max_ns);
+                                free(content);
+                            }
+                        }
+                        CloseHandle(hFile);
+                    }
+                }
+            }
+        }
+    } while (FindNextFileW(hFind, &fd));
+    FindClose(hFind);
+#else
+    DIR *dir = opendir(dir_path);
+    if (!dir) return;
+    struct dirent *ent;
+    while ((ent = readdir(dir)) != NULL && !intel_cancel_flag) {
+        if (ent->d_name[0] == '.') continue;
+        char full_path[1024];
+        snprintf(full_path, sizeof(full_path), "%s/%s", dir_path, ent->d_name);
+        struct stat st;
+        if (stat(full_path, &st) != 0) continue;
+        if (S_ISDIR(st.st_mode)) {
+            if (strcmp(ent->d_name, "bin") != 0 && strcmp(ent->d_name, "obj") != 0 &&
+                strcmp(ent->d_name, "drivers") != 0)
+                scan_dir_usings(full_path, out_ns, ns_count, max_ns);
+        } else {
+            size_t nl = strlen(ent->d_name);
+            if (nl > 4 && strcmp(ent->d_name + nl - 4, ".zan") == 0 &&
+                st.st_size > 0 && st.st_size < 2 * 1024 * 1024) {
+                FILE *f = fopen(full_path, "rb");
+                if (f) {
+                    char *content = (char *)malloc((size_t)st.st_size + 1);
+                    if (content) {
+                        size_t got = fread(content, 1, (size_t)st.st_size, f);
+                        content[got] = '\0';
+                        scan_text_usings(content, got, out_ns, ns_count, max_ns);
+                        free(content);
+                    }
+                    fclose(f);
+                }
+            }
+        }
+    }
+    closedir(dir);
+#endif
+}
+
+/* 从包源文件路径反推包根（…/Zan.X/src 或 …/Zan.X/stdlib 的上一级）。 */
+static void pkg_root_from_file(const char *path, char *out, size_t cap) {
+    const char *best = NULL;
+    for (const char *p = path; *p; p++) {
+        if ((p[0] == '\\' || p[0] == '/') &&
+            (strncmp(p + 1, "src\\", 4) == 0 || strncmp(p + 1, "src/", 4) == 0 ||
+             strncmp(p + 1, "stdlib\\", 7) == 0 || strncmp(p + 1, "stdlib/", 7) == 0))
+            best = p;
+    }
+    if (!best) {
+        /* 不在包布局里：退回文件所在目录 */
+        const char *slash = NULL;
+        for (const char *p = path; *p; p++)
+            if (*p == '\\' || *p == '/') slash = p;
+        size_t n = slash ? (size_t)(slash - path) : strlen(path);
+        if (n >= cap) n = cap - 1;
+        memcpy(out, path, n);
+        out[n] = '\0';
+        return;
+    }
+    size_t n = (size_t)(best - path);
+    if (n >= cap) n = cap - 1;
+    memcpy(out, path, n);
+    out[n] = '\0';
+}
+
+/* 索引建包用的命名空间探针：读文件头（去注释/字符串），取 `namespace X;`。
+ * 与编译器 main.c 的 probe_file_namespace 同口径——声明优先，目录布局兜底
+ * 由 pkg_index_source_tree 自己做。 */
+static int lsp_probe_file_namespace(const char *path, char *out_ns, size_t cap) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return 0;
+    char buf[1024];
+    size_t nr = fread(buf, 1, sizeof(buf) - 1, f);
+    fclose(f);
+    if (nr == 0) return 0;
+    buf[nr] = '\0';
+    const char *p = buf;
+    while (*p) {
+        if (p[0] == '/' && p[1] == '/') {
+            p += 2;
+            while (*p && *p != '\n' && *p != '\r') p++;
+            continue;
+        }
+        if (p[0] == '/' && p[1] == '*') {
+            p += 2;
+            while (*p && !(p[0] == '*' && p[1] == '/')) p++;
+            if (*p) p += 2;
+            continue;
+        }
+        if (*p == '"') {
+            p++;
+            while (*p && *p != '"') {
+                if (*p == '\\' && p[1]) p += 2;
+                else p++;
+            }
+            if (*p) p++;
+            continue;
+        }
+        if (strncmp(p, "namespace", 9) == 0 &&
+            (p[9] == ' ' || p[9] == '\t')) {
+            const char *s = p + 9;
+            while (*s == ' ' || *s == '\t') s++;
+            const char *e = s;
+            while ((*e >= 'A' && *e <= 'Z') || (*e >= 'a' && *e <= 'z') ||
+                   (*e >= '0' && *e <= '9') || *e == '_' || *e == '.') e++;
+            size_t n = (size_t)(e - s);
+            if (n > 0 && n < cap) {
+                memcpy(out_ns, s, n);
+                out_ns[n] = '\0';
+                return 1;
+            }
+            return 0;
+        }
+        p++;
+    }
+    return 0;
+}
+
+typedef struct {
+    char roots[64][1024];
+    int n;
+} pkg_root_set_t;
+
+static void pkg_root_visitor(const char *path, void *context) {
+    pkg_root_set_t *rs = (pkg_root_set_t *)context;
+    if (!rs || rs->n >= 64) return;
+    char root[1024];
+    pkg_root_from_file(path, root, sizeof(root));
+    if (!root[0]) return;
+    for (int i = 0; i < rs->n; i++) {
+        if (strcmp(rs->roots[i], root) == 0) return;
+    }
+    memcpy(rs->roots[rs->n], root, strlen(root) + 1);
+    rs->n++;
+}
+
+/* 索引工程 using 闭包覆盖到的包源目录（不动点传导，上限 4 轮）。命名空间
+ * 解析走编译器同款源索引（zan_pkg_source_index_*：按文件**声明**的
+ * namespace 建档，点号两级命名空间如 System.Json 才解析得到——
+ * zan_pkg_find_namespace 的 pkg_scan_store 只拼单段目录，两级永远 0）。 */
+static void index_needed_packages(lsp_server_t *s) {
+    if (!s->workspace_root[0]) return;
+    static char used[256][128];
+    static char done[64][1024];
+    int used_n = 0;
+    int done_n = 0;
+    scan_dir_usings(s->workspace_root, used, &used_n, 256);
+    if (used_n == 0) return;
+    zan_pkg_source_index_t *idx =
+        zan_pkg_source_index_create(s->workspace_root, lsp_probe_file_namespace);
+    if (!idx) return;
+    for (int round = 0; round < 4; round++) {
+        int before = used_n;
+        for (int i = 0; i < used_n && !intel_cancel_flag; i++) {
+            pkg_root_set_t rs;
+            rs.n = 0;
+            zan_pkg_source_index_visit(idx, used[i], pkg_root_visitor, &rs, 1);
+            for (int k = 0; k < rs.n; k++) {
+                bool seen = false;
+                for (int d = 0; d < done_n; d++) {
+                    if (strcmp(done[d], rs.roots[k]) == 0) { seen = true; break; }
+                }
+                if (seen) continue;
+                if (done_n < 64) {
+                    memcpy(done[done_n], rs.roots[k], strlen(rs.roots[k]) + 1);
+                    done_n++;
+                }
+                intel_index_project(g_project_intel, rs.roots[k]);
+                /* 包自己的 using 也要能解析（传导依赖） */
+                scan_dir_usings(rs.roots[k], used, &used_n, 256);
+            }
+        }
+        if (used_n == before) break;
+    }
+    zan_pkg_source_index_destroy(idx);
+}
+
 static void ensure_stdlib_indexed(lsp_server_t *s) {
     static bool stdlib_indexed = false;
     if (stdlib_indexed) { return; }
@@ -1114,22 +1380,18 @@ static void ensure_stdlib_indexed(lsp_server_t *s) {
     if (lsp_stdlib_root(root, sizeof(root))) {
         intel_index_project(g_project_intel, root);
     }
+}
 
-    const char *project_dir = s->workspace_root[0] ? s->workspace_root : ".";
-    char pkg_roots[32][1024];
-    int pkg_n = zan_pkg_all_source_roots(project_dir, pkg_roots, 32);
-    for (int i = 0; i < pkg_n; i++) {
-        if (!intel_cancel_flag) {
-            /* 跳过非项目工作区直接依赖的海量大型第三方 SDK（如 Zan.Sdk.Wechat 5600+ 文件、Zan.Sdk.Jd 680+ 文件等），
-             * 避免全局启动索引卡死数百秒引发客户端握手与请求超时。若工作区明确包含/安装了该包则正常索引。 */
-            if (strstr(pkg_roots[i], "Zan.Sdk.") != NULL) {
-                if (!s->workspace_root[0] || strncmp(pkg_roots[i], s->workspace_root, strlen(s->workspace_root)) != 0) {
-                    continue;
-                }
-            }
-            intel_index_project(g_project_intel, pkg_roots[i]);
-        }
-    }
+/* A506：包闭包索引。源索引要探遍包仓库每个 .zan 的声明命名空间
+ * （~15k 文件、数秒），不能塞进 initialize 同步路径——initialize 只带
+ * stdlib+工作区（亚秒应答），这里由首个 didOpen/completion 惰性触发。 */
+static void ensure_packages_indexed(lsp_server_t *s) {
+    static bool packages_indexed = false;
+    if (packages_indexed || intel_cancel_flag) { return; }
+    packages_indexed = true;
+    if (!g_project_intel) { return; }
+    if (!s->workspace_root[0]) { return; }
+    index_needed_packages(s);
 }
 
 static void ensure_project_indexed(lsp_server_t *s) {
@@ -1174,6 +1436,7 @@ static void handle_did_open(lsp_server_t *s, json_value *params) {
 
     ensure_project_indexed(s);
     update_project_index(s, uri, text);
+    ensure_packages_indexed(s);
 
     publish_diagnostics(s, uri, text);
 }
@@ -1257,6 +1520,7 @@ static long g_doc_intel_version = -1;
 static intellisense_t *doc_intel_for(lsp_server_t *s, const char *uri) {
     lsp_doc_t *doc = lsp_find_doc(s, uri);
     if (!doc) return NULL;
+    ensure_packages_indexed(s);
     if (g_doc_intel && strcmp(g_doc_intel_uri, uri) == 0 &&
         g_doc_intel_version == doc->version)
         return g_doc_intel;

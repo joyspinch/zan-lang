@@ -784,7 +784,33 @@
 - 关联：A502（android 的具体症状）、A503（ohos 的具体症状）、A493（归档拆分
   后 win 变胖的根因）、A501。
 
-### [ ] A506 语言服务冷启动 11~13 秒——`initialize` 同步索引了整座包仓库
+### [x] A506 语言服务冷启动 11~13 秒——`initialize` 同步索引了整座包仓库
+
+- **已修（2026-10-24）**：按推荐方向落地，另拆一刀握手。实测：initialize
+  **11~13 s → 239~254 ms**；包闭包挪到首个 intel 请求一次性吸收（ws506 实测
+  首次补全 5985 ms、后续 20 ms）；只 import stdlib 的工程全程亚秒。
+  两处关键发现：
+  - **`zan_pkg_find_namespace` 解析不了两级命名空间**——它走
+    `pkg_scan_store`，把命名空间当单段目录拼 `src\<ns>`，`System.Json`
+    拼成 `src\System.Json` 永远 miss（实测 Gui/System 一级能中、
+    System.Json/System.IO 全 0）。正确原语是编译器同款
+    `zan_pkg_source_index_create` + `source_index_visit`：按每个 .zan
+    **声明的** namespace 建档（probe 读文件头去注释/字符串取
+    `namespace X;`），点号两级才解析得到；visit 返回源文件，LSP 侧
+    `pkg_root_from_file` 反推包根去重后整根索引。Zan.Json 就是反例——
+    包名 Zan.Json、命名空间 System.Json，还**扩展** stdlib 的
+    System/Json（JsonDoc/JsonReader），按"stdlib 已覆盖就跳过"会丢
+    包类型补全，不能走捷径。
+  - **源索引构建本身要探遍包仓库**（~15k 文件 fread+扫声明，实测 ~6 s），
+    不能塞进 initialize 同步路径——握手只带 stdlib+工作区，
+    `ensure_packages_indexed` 挂在 doc_intel_for/didOpen 首次触发
+    （一次性，后续 20 ms）。`Zan.Sdk.*` 特判随闭包自然消失（没人 using
+    就不索引）。
+  - using 收集：自写 `scan_dir_usings`/`scan_text_usings`（行首 `using X;`，
+    Win32/POSIX 双实现），工作区做种子，包根做传导，4 轮不动点。
+  - 遗留：`lsp_session_editor` ctest 在**不带本改动**时同样红
+    （`LspSession.Open` 签名漂移，测试客户端 2 参调用 3~4 参 API +
+    可空告警，出自 21712161c）——与 A506 无关，待 LSP/IDE 家族跟进。
 
 - 现象（2026-10-22 修 IDE 崩溃时顺带测出）：IDE 打开工程后状态栏长时间停在
   「语言服务：连接中」，实测冷启动 **10292 ms**，点重连再 **12260 ms**；
