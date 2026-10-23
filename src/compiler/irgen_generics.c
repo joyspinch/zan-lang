@@ -1,5 +1,7 @@
 /* irgen_generics */
 
+static void emit_eh_tmp_push_slot(zan_irgen_t *g, LLVMValueRef slot, int kind);
+
 static bool sym_declares_extern(zan_symbol_t *sym);
 static LLVMValueRef emit_soft_scratch_cached(zan_irgen_t *g);
 static zan_symbol_t *extern_check_callee_sym(zan_irgen_t *g,
@@ -1109,6 +1111,16 @@ static void emit_rc_store_field(zan_irgen_t *g, zan_type_t *type,
     if (!expr_yields_owned_rc_value(g, rhs, locals)) emit_rc_retain_for_type(g, type, v);
     LLVMBuildStore(g->builder, v, field_ptr);
     emit_rc_release_for_type(g, type, old);
+    /* A528：结构体构造函数体内写拥有型字段——把字段槽注册进 EH 临时栈，
+     * 构造中途抛异常时展开器按槽地址取当前引用释放（字段重赋值安全：
+     * 展开侧 load-and-null 使重复 push 无害）。类路径不需要：对象本身
+     * 已注册，对象释放级联释放字段。正常返回由 ctor 入口的裸武装标记
+     * 经 disarm 免释放回退（所有权移交调用方）。 */
+    if (g->current_fn_is_ctor && !g->current_async_frame &&
+        g->current_type_sym && g->current_type_sym->type &&
+        g->current_type_sym->type->kind == TYPE_STRUCT && !is_weak) {
+        emit_eh_tmp_push_slot(g, field_ptr, eh_slot_kind_of(type));
+    }
 }
 
 #define ZAN_RT_FAULT_MESSAGE 0xE0A2C010u

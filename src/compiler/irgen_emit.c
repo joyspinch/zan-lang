@@ -1715,6 +1715,24 @@ static void emit_user_method_bodies(zan_irgen_t *g, method_body_work_t *work,
         g->current_fn_no_runtime = zan_ast_has_attr(member, "NoRuntime");
 
         if (member->kind == AST_CONSTRUCTOR_DECL && !is_static) {
+            /* A528：结构体构造函数体内写拥有型字段后抛异常，字段引用没人
+             * 释放（类路径靠对象析构级联，结构体没有析构）。入口处裸武装
+             * 一个 EH 标记：字段写（emit_rc_store_field 的 ctor 分支）把
+             * 字段槽推上 EH 临时栈，正常返回走既有 disarm（免释放回退，
+             * 所有权交给调用方），抛出走 unwind 按字段类型释放。 */
+            if (type_sym->type && type_sym->type->kind == TYPE_STRUCT &&
+                !g->current_async_frame &&
+                g->eh_armed_count < ZAN_MAX_ARMED_TRY) {
+                LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
+                LLVMValueRef tt = get_eh_tmp_top_global(g);
+                LLVMValueRef base = LLVMBuildLoad2(g->builder, i32t, tt,
+                    "ctor.eh.base");
+                LLVMValueRef base_slot = emit_entry_alloca(g, i32t,
+                    "ctor.eh.base.slot");
+                zan_store_fit(g, base, base_slot);
+                g->eh_armed[g->eh_armed_count].old_top_slot = base_slot;
+                g->eh_armed_count++;
+            }
             bool this_init = member->method_decl.has_this_init;
             bool initializer_target_called = false;
             zan_symbol_t *target_sym = NULL;
@@ -1841,6 +1859,11 @@ static void emit_user_method_bodies(zan_irgen_t *g, method_body_work_t *work,
         LLVMBasicBlockRef cur_bb = LLVMGetInsertBlock(g->builder);
         if (!LLVMGetBasicBlockTerminator(cur_bb)) {
             emit_release_owned_locals(g, locals);
+            /* A528：隐式落到函数尾的返回与显式 return 同口径解除武装
+             * （无 try/无裸武装时 eh_armed_count == base，是无害 no-op）。
+             * 必须在局部变量 EH 出栈之后——disarm 只改栈顶指针，先做会把
+             * 尚未出栈的局部槽位闷在栈里，随后 pop 反而下溢冲掉调用方帧。 */
+            emit_eh_disarm_from(g, 0);
             if (ret_type->kind == TYPE_VOID) {
                 LLVMBuildRetVoid(g->builder);
             } else {
