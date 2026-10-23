@@ -226,7 +226,7 @@
   并加入自举差分门 `tests/selfhost/diff_cases.txt`，两端全绿闭账。
 - 探针：`_scratch/csaudit/objectmodel/{p02_ctor_chain,p03_ctor_virtual}.zan`。
 
-### [~] A517 析构器 `~X()` 是死语法：解析/检查过、从不发射、从不调用
+### [x] A517 析构器 `~X()` 是死语法：解析/检查过、从不发射、从不调用
 - **宿主侧已修（2026-10-23，口径=编译期拒绝）**：binder 补
   `AST_DESTRUCTOR_DECL` 分支——声明析构器当场报错（"ARC runtime has no
   destructor hook on release ... do deterministic cleanup explicitly"）。
@@ -237,12 +237,10 @@
   Zan.Gui.Browser）19 文件共 **43 处 ~X() 声明**（含各文件残留的"析构兜底"
   失效注释）；全仓 ~X() 至此清零。带守卫编译
   （Timer/Gate/BlockingQueue 探针）+ 泄漏检查通过。
-- **自举半边已补（2026-10-23，goal round 2）**：selfhost parser.zan 的析构分支
-  （At(TK.Bang())/At(TK.Tilde())）加同文案 diags.Error——gen1 实测 `~Widget()`
-  当场拒绝（同文案 + 非零退出）；selfhost 自身 66 源无析构、gen1 构建通过
-  （全仓 ~X() 已分两批迁移删除：274938124 + 本批）。
-- 待办：ARC 释放链补析构钩子（refcount 归零调析构体再释放）是独立战线，
-  实现后再放开语法；自举半边（selfhost 无此分支时同类声明会漏报）。
+- **自举半边已补（2026-10-23，goal round 2/13）**：selfhost parser.zan 的析构分支
+  （At(TK.Bang())/At(TK.Tilde())）加逐字同文案 diags.Error，提取析构器标识符；
+  新增差分门负向用例 `tests/selfhost/reject/destructor_declaration.zan`，
+  并在 `tests/selfhost/reject_cases.txt` 锁定双端错误文案，宿主与自举双端闭环。
 - 原始实测：`~Node()`/`~Solo()` 编译通过、运行无任何析构输出；IR 里 `__zan_release_*` 只逐字段 release，析构体内容不存在。依赖确定性清理的迁移代码静默失效。
 - 根因链：parser.c 解析 ✓ → checker.c 检查 ✓ → **binder.c 无 `AST_DESTRUCTOR_DECL` 分支** → irgen 无处理。
 - 探针：`_scratch/csaudit/objectmodel/p10_cycle_leak.zan`、`_scratch/csaudit/types/v_dtor.zan`（复验：当场报错）。

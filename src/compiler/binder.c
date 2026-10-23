@@ -1758,7 +1758,8 @@ static void bind_members(zan_binder_t *b, zan_ast_node_t *type_node) {
                 "destructors ('~%.*s()') are not supported: the ARC runtime "
                 "has no destructor hook on release -- do deterministic "
                 "cleanup explicitly (using statement or a Close/Dispose "
-                "method) instead of relying on '~X()'",
+                "method) instead of relying on '~%.*s()'",
+                member->method_decl.name.len, member->method_decl.name.str,
                 member->method_decl.name.len, member->method_decl.name.str);
             break;
         case AST_ENUM_MEMBER: {
