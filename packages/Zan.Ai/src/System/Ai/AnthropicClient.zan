@@ -149,15 +149,15 @@ public class AnthropicClient : IChat {
         AiEndpoint ep = AiEndpoint.Parse(this.config.baseUrl);
         if (ep == null) {
             this.lastError = "服务地址不合法: " + this.config.baseUrl;
-            return null;
+            return AiStreamResult.Failure(this.lastError);
         }
         if (this.config.model.Length == 0) {
             this.lastError = "没有指定模型";
-            return null;
+            return AiStreamResult.Failure(this.lastError);
         }
         if (messages == null) {
             this.lastError = "没有消息";
-            return null;
+            return AiStreamResult.Failure(this.lastError);
         }
         JsonValue body = JsonValue.NewObject();
         body.PutStr("model", this.config.model);
@@ -183,13 +183,15 @@ public class AnthropicClient : IChat {
         if (payload.Length > this.config.requestLimitBytes) {
             this.lastError = "请求体超过上限（"
             + Convert.ToString(this.config.requestLimitBytes) + " 字节）";
-            return null;
+            return AiStreamResult.Failure(this.lastError);
         }
         HttpClient http = this.StreamClient(ep);
         AiStreamResult res = await AiStream.Pump(http,
             AnthropicClient.MessagesPath(ep), payload, onEvent,
             AiStream.AnthropicEvents);
-        if (res == null) { return null; }
+        if (res == null) {
+            return AiStreamResult.Failure("流式传输未返回结果");
+        }
         if (res.error.Length > 0) { this.lastError = res.error; }
         this.lastUsage = res.usage;
         return res;
@@ -360,7 +362,12 @@ public class AnthropicClient : IChat {
         } else {
             http = new HttpClient(ep.Host(), ep.Port());
         }
-        ExternalCallPolicy p = this.Policy(ep).IdleTimeout(this.config.readTimeoutMs);
+        // 流式通路的总预算同样撤销（长流会被 totalTimeout 的墙钟掐断，
+        // 停滞判据交给 IdleTimeout）；流上限显式给到响应上限，不让传输
+        // 层回落到 64MiB 的默认值。
+        ExternalCallPolicy p = this.Policy(ep).IdleTimeout(this.config.readTimeoutMs)
+            .NoTotalTimeout()
+            .StreamLimit(this.config.responseLimitBytes);
         http.SetCallPolicy(p);
         http.SetHeader("Content-Type", "application/json");
         http.SetHeader("Accept", "text/event-stream");
