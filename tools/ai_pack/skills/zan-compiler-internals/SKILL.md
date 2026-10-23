@@ -56,51 +56,58 @@ description: zanc 编译器内部（parser/checker/irgen/runtime/ABI）设计契
      0xC0000005。症状落在业务代码里，根因却在编译器，定位成本极高。
    - 边界：判据是"路径前缀与类型所在命名空间必须互为祖先"（按命名空间段边界
      比），外加"路径首段是类 → 嵌套成员"这条例外——少了它
-     `Widget.Tooltip.Flush` 这类嵌套访问会被误杀。回归用例：一条必须编译失败的
-     诊断用例（限定名指向不存在的命名空间）+ 一条正向用例（合法限定名仍能解析）。
-7. **重载分解只有一处规则：语义检查与代码生成必须共用**：
-   - 动作：重载候选的打分与取舍规则抽到**共享**位置（binder 层的
-     `zan_null_arg_score`），语义检查（`checker_find_method_typed`）与代码
-     生成（`concrete_arg_score`）都调它；null 字面量只能绑到引用类型/可空
-     类型形参，值类型形参判为不兼容。
-   - 理由：两侧各自分解一次、规则还不一致时，**静默走错重载**：一个带
-     int/long/double/bool/string 五个重载的 `Text`，`Text(null)` 会走到
-     `Text(int)`——检查器侧按 null 的静态类型（object）打分、代码生成侧对
-     null 推断不出类型一律给 0 分，于是"第一个重载"（值类型）赢了，null
+     `Widget.Tooltip.Flush` 这类嵌套访问会被误杀。回归用例：
+     `tests/diag/qualified_name_wrong_namespace.zan`（必须编译失败）+
+     `tests/conformance/qualified_name_namespace.zan`（合法限定名仍能解析）。
+7. **重载分解只有一处规则：checker 与 irgen 必须共用**：
+   - 动作：重载候选的打分与取舍规则抽到**共享**位置
+     （`src/compiler/binder.c` 的 `zan_null_arg_score`），checker
+     （`checker_find_method_typed`）与 irgen（`irgen_expr_core.c` 的
+     `concrete_arg_score`）都调它；null 字面量只能绑到引用类型/可空类型
+     形参，值类型形参判为不兼容。
+   - 理由：两侧各自分解一次、规则还不一致时，**静默走错重载**：
+     `Arg.Text(null)`（Text 有 int/long/double/bool/string 五个重载）以前会
+     走到 `Text(int)`——checker 侧按 null 的静态类型（object）打分、irgen 侧
+     对 null 推断不出类型一律给 0 分，于是"第一个重载"（值类型）赢了，null
      被当成 0 传下去。调用点看不出任何异常，断言却永远对不上。
-   - 边界：null 的静态类型是 `object`，所以判据是"**形参能不能接住 null**"，
-     不是实参的静态类型；值类型形参接 null 必须在编译期报错，不能等到运行期
-     变成 0。`object` / `T?` 形参接得住 null。
+   - 边界：null 的静态类型是 `object`（`checker.c` 的 `AST_NULL_LITERAL`
+     分支），所以判据是"**形参能不能接住 null**"，不是实参的静态类型；
+     值类型形参接 null 必须在编译期报错（`tests/diag/null_to_value_type.zan`），
+     不能等到运行期变成 0。`object` / `T?` 形参接得住 null。
+     实例：`Arg.Text(null)` 与 `Overloads.Of(null)` 两条曾同时走错
+     （`tests/conformance/null_overload_resolution.zan` 钉住正解）。
    - 边界（**接口形参**）：语义检查与代码生成**各选一遍**，而代码生成侧曾把
-     接口形参一律当 0 分（代码生成层的 `method_args_score`：
+     接口形参一律当 0 分（`irgen_expr_core.c` 的 `method_args_score`：
      `if (pt->kind == TYPE_INTERFACE) continue;`，理由是"打分看不出实现列表"）——
      于是**只靠接口类型区分**的一组重载全部同分，**第一个永远赢**：
-     一个"从数据门面开事务作用域"的重载（实参是 `IZanSql`）被发到
+     `TransactionScope.Create(fsql)`（`IZanSql` 实参）被发到
      `Create(IUnitOfWork)` 上。字段里装的是错类型（类型混淆），等后面调用保存点
      方法才炸，报的还是"事务已结束"，完全指不到病根。
-     现在的口径：null 字面量走共享的 null 打分；实参也是接口 → 同一个接口
+     现在的口径：null 字面量走 `zan_null_arg_score`；实参也是接口 → 同一个接口
      +4（精确匹配）、派生自它 +1（可赋值）；实参是类 → 实现了该接口 +1，
      没实现**不加分也不判死**（实现关系可能经由泛型实例化等路径看不出来，误杀
      代价大——"不误杀实现类"正是那行 continue 的本意，只是它连"实参就是接口"
      这种能精确比对的情况也一并放过了）。
-     回归用例：一条覆盖"接口实参选同名接口重载、派生接口选自己、类实参选它
-     实现的接口、接口重载与类重载并存时类实参选类"的 conformance 用例。
+     回归用例：`tests/conformance/overload_interface_param.zan`。
    - 边界（**lambda 实参**）：lambda **没有自身类型**（Zan 是目标类型驱动的），
      所以实参是 lambda 时，判别依据只能是**形参声明的委托类型**：形参不是委托
      → 该候选判为不兼容；形参委托的形参个数与 lambda 显式形参个数不符 → 判为
-     不兼容；类型一致 → 候选加分。语义检查与代码生成两侧都要按这个口径，
-     各自取形参的委托类型来判。
+     不兼容；类型一致 → 候选加分。
+     两侧都要按这个口径：checker（`checker_find_method_typed`）与 irgen
+     （`irgen_expr_core.c` 的 `method_args_score`）各取形参的委托类型来判。
      **判不出就放过是最坏的选择**：所有候选同分 → 决议退化成"取成员表里第一个
      同名方法"，而 partial 类跨文件合并时**调用点自己声明的重载排在前面**，
      于是 lambda 被绑到不相干的重载上。
-     症状示例：一次"启动会话"的调用绑到了同名但签名不同的另一个重载 →
-     **无限自我递归** → 异常处理临时栈耗尽 → 进程直接 `exit(1)`。
-     整个 IDE 一开工程就崩，而调用点在源码上完全看不出异常。
-     边界：类型形参这类"判不出委托类型"的形参**放过**（不能因判不出就误杀）；
-     `void` 委托接"有返回值的表达式体 lambda"**不判死**（丢弃返回值是合法的），
-     只有块体里显式 `return <value>;` 才判死。
-     回归用例：一条覆盖"lambda 实参按目标委托形参选重载、跨文件 partial 场景"的
-     conformance 用例。
+     症状示例：`LspSession.StartAsync(App, ...)` 绑到了 `App` 重载而不是
+     `Action<Action>` 重载 → **无限自我递归** → 异常处理临时栈耗尽
+     （top ≥ 262144）→ 进程 `exit(1)`。整个 IDE 一开工程就崩，而调用点
+     在源码上完全看不出异常。
+     边界：`TYPE_TYPE_PARAM` / 类型形参这类"判不出委托类型"的形参**放过**
+     （不能因判不出就误杀）；`void` 委托接"有返回值的表达式体 lambda"
+     **不判死**（丢弃返回值是合法的），只有块体里显式 `return <value>;`
+     才判死。
+     回归用例：`tests/conformance/overload_lambda_target.zan`（跨文件 partial，
+     干扰重载在调用点声明）。
    - 手法（确认编译器实际选了哪个重载）：在**每个**候选重载里各放一句
      `throw new Exception("PICKED-<签名>")`，跑一次看抛的是哪一句——比读评分
      逻辑快得多。最小复现要按真实调用形状写：**Zan 不接受顶层函数**（顶层只
@@ -108,25 +115,27 @@ description: zanc 编译器内部（parser/checker/irgen/runtime/ABI）设计契
      与主编译单元的解析路径可能不同，同形代码换到主编译单元就正常。
 8. **裸名的导入作用域按文件隔离，歧义必须显式化**：
    - 动作：声明（class/struct/interface/enum）可见的 `using` 集合只能是
-     **它自己那个文件**的导入——名字解析层要给每个文件**快照**一份自己的
-     using 列表，不许把多个文件的 using 合并成一个列表再把指针存进每个
-     声明。裸名类型解析顺序固定为 当前命名空间 → 祖先命名空间 → 本文件
-     `using` → 成员命中消歧 → 歧义诊断；同名类型多于一个时，**按被访问的成员
-     筛候选**（唯一命中就用它），仍然多命中就报
-     `ambiguous type 'X'; qualify it with its namespace`。
-   - 理由：编译驱动把所有编译输入——用户文件 + 各包源码——的 using 合并进
-     同一个 compilation unit 的列表，而声明里存的是**列表指针**：合并后每个
-     文件的声明都看得见全工程的 using，于是"别的包文件 import 了什么"决定
-     了本文件的裸名绑到哪个类。`Window` 在 `Gui.Backend` / `System.Data` /
-     `System.Automation` 三处同名，数据框包新增 `System.Data.Window` 之后，
-     多个外部项目集体编不过——症状是"加一行 using 就编不过"。
-   - 边界：成员命中消歧只看**声明**了该成员的候选，命中零个就不猜（交给
-     后续诊断），命中多个才报歧义；显式 `using Ns;` 命中的候选永远优先于成员
-     命中。回归用例：一条同名类分处两个命名空间、裸名按本文件 using 解析的
-     正向用例 + 一条"本文件没导入 → 必须报歧义"的诊断用例。
+     **它自己那个文件**的导入——`nsresolve.c` 的 `zan_nsresolve_stamp` 要给每个
+     文件**快照**一份自己的 using 列表（`snapshot_usings`），不许把多个文件的
+     using 合并成一个列表再把指针存进每个声明。裸名类型解析顺序固定为
+     当前命名空间 → 祖先命名空间 → 本文件 `using` → 成员命中消歧 →
+     歧义诊断；同名类型多于一个时，**按被访问的成员筛候选**（唯一命中就用它），
+     仍然多命中就报 `ambiguous type 'X'; qualify it with its namespace`。
+   - 理由：驱动层（`main.c`）把所有编译输入——用户文件 + 各包源码——的 using
+     合并进同一个 compilation unit 的 `usings` 列表，而声明里存的是**列表指针**：
+     合并后每个文件的声明都看得见全工程的 using，于是"别的包文件 import 了什么"
+     决定了本文件的裸名绑到哪个类。`Window` 在 `Gui.Backend` /
+     `System.Data` / `System.Automation` 三处同名，Zan.DataFrame 新增
+     `System.Data.Window` 之后，仓库外 5 个项目（breakout / goldminer /
+     gomoku / weiqi / xiangqi）集体编不过——症状是"加一行 using 就编不过"。
+   - 边界：成员命中消歧只看**声明**了该成员的候选（`decl_has_member`），命中
+     零个就不猜（交给后续诊断），命中多个才报歧义；显式 `using Ns;` 命中的候选
+     永远优先于成员命中。回归用例：`tests/conformance/nsusing/`（同名类分处两个
+     命名空间，裸名按本文件 using 解析）+ `tests/diag/ns_using_scope_leak.zan`
+     （本文件没导入 → 必须报歧义）。
 
 9. **调用不存在的成员方法必须在类型检查阶段点名报出**：
-   - 动作：语义检查在**调用上下文**里也要判定接收者上有没有这个方法，没有就当场报
+   - 动作：checker 在**调用上下文**里也要判定接收者上有没有这个方法，没有就当场报
      `type 'Ns.Name' has no method 'X'`；取值位置仍报 `has no member`——两句话不要混，
      "方法名写错了"和"字段名写错了"必须分得开。判定口径要与发码口径一致，三类都得
      算进"这个类型上有什么"：扩展方法（首参带 `this` 的方法）、接口方法（含接口
@@ -155,57 +164,62 @@ description: zanc 编译器内部（parser/checker/irgen/runtime/ABI）设计契
      - 为什么 ② 不够：模板体之外（普通类里的泛型方法）成员集判不出来，只说明"这个
        成员压根不存在"——那是真错。缺了 ①，`class P { void Use<T>(Helper h)
        { h.Missing<T>(); } }` 会被放过，错误一路滑到发码阶段只剩一句
-       `code generation failed`，比语义检查直接点名差得多。
-     - 放行的正当理由：模板体是"擦除模板"，真身由泛型基类特化在派生类里补出，
-       模板体只留一个运行期转发桩。ORM 泛型基类就是这个形状——
+       `code generation failed`，比 checker 直接点名差得多。
+     - 放行的正当理由：模板体是"擦除模板"，真身由泛型基类特化
+       （`zan_parser_specialize_generic_bases`）在派生类里补出，模板体只留一个
+       运行期转发桩。ORM 泛型基类就是这个形状——
        `class BaseDao<T> { IDbConnection db;
        List<T> All() { return this.db.Select<T>().ToList(); } }`——`IDbConnection`
        上并没有 `Select`（编译期 ORM 代码生成器只改写"类型实参是具体实体类"的调用，
        模板里的 T 不是具体实体，改写不了），发码侧对这种调用是放行并发运行期桩的
-       （代码生成侧的 `call_receiver_is_open_generic`），语义检查必须同口径，
-       否则泛型 ORM 基类整包编不过。
-     回归用例：一条"调用不存在的成员
-     方法必须点名报出方法名"的诊断用例 + 一条"同名类型显示原始名而不是内部
-     mangle 名"的诊断用例 + 一条"原生成员必须能正常调用"的正向用例 +
-     一条"泛型类里调不存在的方法当场报错（接口/类/自身三类接收者各一次）"的
-     诊断用例 + 一条"泛型基类里的 ORM 调用仍要编得过"的正向用例。
-10. **语义检查与代码生成对"这个类型上有什么"必须共用同一份判定**：
+       （`irgen_call.c` 的 `call_receiver_is_open_generic`），checker 必须同口径，
+       否则 `BaseDao<T>` / `BaseRepository<T>` 整包编不过。
+     回归用例：
+     `tests/diag/call_unknown_method.zan`（必须点名报出方法名）+
+     `tests/diag/call_unknown_method_name.zan`（同名类型显示原始名）+
+     `tests/conformance/native_member_call.zan`（原生成员必须能正常调用）+
+     `tests/diag/generic_class_unknown_method.zan`（泛型类里调不存在的方法当场
+     报错，接口/类/自身三类接收者各一次）+
+     `tests/conformance/generic_open_call_template.zan`（泛型基类里的 ORM 调用
+     仍要编得过）。
+10. **checker 与 irgen 对"这个类型上有什么"必须共用同一份判定**：
    - 动作：凡是"某类型是否实现了某接口""某扩展方法能否作用于某接收者"这类判定，
-     必须落在**一个共享位置**（绑定层），语义检查与代码生成都调它，不许各写一份
+     必须落在**一个共享位置**（binder 层），语义检查与代码生成都调它，不许各写一份
      遍历。
-   - 理由：两份遍历只要有一处漏（少一层接口继承、少一类接收者），语义检查就会把
-     合法调用判成"没有这个方法"，而代码生成又能把同一个调用发出去——诊断与实际
-     行为互相矛盾：要么合法代码被误报卡住，要么错误被悄悄放过去。
+   - 理由：两份遍历只要有一处漏（少一层接口继承、少一类接收者），checker 就会把
+     合法调用判成"没有这个方法"，而 irgen 又能把同一个调用发出去——诊断与实际行为
+     互相矛盾：要么合法代码被误报卡住，要么错误被悄悄放过去。
    - 边界：共享判定要覆盖扩展方法的三类接收者——类型参数（适用任意类型）、接口
      接收者（看实现关系）、其余按 kind + 符号相等；扩展方法的登记时机放在绑定阶段
      （那时方法自己的类型参还在作用域内，首参 `this` 的类型能解析成正确形状），
      登记口径与发码口径逐字对齐（只看首参是不是 `this`，不额外要求 static）。
 11. **类型的"显示名"与"身份名"必须分开**：
    - 动作：诊断里显示的类型名必须由**一个渲染器**按类型形状现算（可空 `T?`、
-     数组 `T[]`、泛型 `List<T>`）；类型结构里的 `name` 字段只当身份用（散列、
-     mangle、类型相等判定），**一个字都不许改**。所有诊断共用这一份渲染器
-     （绑定层的 `zan_type_display`）。
-   - 理由：类型结构里的 `name` 对可空类型存的是**元素类型**的名字（`bool?` 的 name
+     数组 `T[]`、泛型 `List<T>`）；`zan_type_t.name` 只当身份用（散列、mangle、
+     类型相等判定），**一个字都不许改**。所有诊断共用这一份渲染器
+     （`src/compiler/binder.c` 的 `zan_type_display`）。
+   - 理由：`zan_type_t.name` 对可空类型存的是**元素类型**的名字（`bool?` 的 name
      就是 `bool`），`?` 没有任何字段承载 → 所有诊断把 `bool?` 说成 `bool`，用户
      看不出自己写的是可空类型。同一个字段被"身份"和"显示"两种语义共用，是这类
      失真的通用根因——发现一个字段被两种语义共用，就该拆开，而不是给它打补丁。
-   - 边界：渲染只影响面向用户的显示：tuple 身份、typeof 反射元数据、调试符号、
-     运行时反射字段名、"这是哪个类型"的原始名轴都不许被形状污染。共享渲染入口的
-     结果要用**线程局部轮转池**承载（语言服务有诊断线程与工作线程两线程），不能让
-     多个诊断的临时缓冲互相踩。
+   - 边界：渲染只影响面向用户的显示：tuple 身份（`tuple_sig_type`）、typeof 反射
+     元数据（`render_type_full`）、调试符号（`di_type_name`）、运行时反射字段名
+     （`refl_field_type_name`）、"这是哪个类型"的原始名轴（`checker_type_simple_name`）
+     都不许被形状污染。共享渲染入口的结果要用**线程局部轮转池**承载（语言服务有
+     诊断线程与工作线程两线程），不能让多个诊断的临时缓冲互相踩。
 12. **改公共诊断措辞要改共用入口，不要逐个诊断点手改；宿主与自举必须同一提交改**：
-   - 动作：一个措辞被几十个诊断点共用时（语义检查器的 `type_name()` 有 45 个
-     调用点），改措辞要**换掉共用入口的实现**（签名不变 → 调用点零改动）；同时
-     **宿主与自举实现必须同一提交改**。
+   - 动作：一个措辞被几十个诊断点共用时（`src/compiler/checker.c` 的 `type_name()`
+     有 45 个调用点），改措辞要**换掉共用入口的实现**（签名不变 → 调用点零改动）；
+     同时**宿主与自举（`src/selfhost/`）必须同一提交改**。
    - 理由：逐个手改必然漏——漏一处，宿主与自举就分叉，对拍门的三字段用例（宿主与
      自举必须同措辞）会红，而分叉的措辞让用户看到"两个编译器说法不一样"。实测 45 个
      调用点共用一个 `type_name()`，改它的实现比改 45 处措辞更省也更安全。
-   - 边界：新增措辞要配一条诊断用例钉住；自举侧对应措辞在 reject 用例清单里钉住
-     （两字段钉自举侧，三字段再钉宿主侧）。
+   - 边界：新增措辞要配一条 `tests/diag/` 用例钉住；自举侧对应措辞在
+     `tests/selfhost/reject_cases.txt` 里钉住（两字段钉自举侧，三字段再钉宿主侧）。
 13. **隔离构建目录必须让 `--auto-stdlib` 找得到 stdlib**：
    - 动作：Windows 下 `--auto-stdlib` 只找 `zanc.exe` 同级的 `stdlib/`，或 exe 目录
-     **上一级**的 `stdlib/`（编译器入口的 stdlib 解析段）。用隔离 build 目录
-     （形如 `_scratch/build-*`）做定向验证时，build 目录要**在源码根下一层**
+     **上一级**的 `stdlib/`（`src/compiler/main.c`）。用隔离 build 目录
+     （`_scratch/build-*`）做定向验证时，build 目录要**在源码根下一层**
      （`repo/build` → 命中 `repo/stdlib`）；放到更深处（`repo/_scratch/build-x`）就
      自己补一个指向源码根 `stdlib/` 的目录联接（junction）。
    - 理由：找不到 stdlib 时 `--auto-stdlib` 只打一条 warning，但**凡是用到 `using`
@@ -341,7 +355,27 @@ description: zanc 编译器内部（parser/checker/irgen/runtime/ABI）设计契
    - 边界：可用的替代形态：类型实参留在**类级**（`class Base<T> { Inner<T>
      inner; }` 正常）、具体实例化的基类（`class X : Base<Signup>` 正常）、
      用 `FuncT<T,V>` 形参代替按 V 实例化。
-16. **泛型类的 `this.field` 必须按当前实例替换类型实参**：
+16. **泛型实参的实参类型必须被检查（`List<int>.Add("x")` 曾一路放行）**：
+   - 动作：给泛型容器/泛型类加成员时，实参类型要按**接收者的类型实参**
+     替换后再比：内建泛型从 `builtin_api.c` 的签名表取形参类型（T/K/V），
+     按 `recv->type_args` 替换；用户泛型类用 `zan_binder_subst_named` 替换
+     形参里的 T。两条路都要落到 `checker_arg_type_mismatch`。
+   - 理由：形参类型是**类型参数**时，旧的 `checker_arg_type_mismatch`
+     开头就 `return false`（"含类型参数就放行"）——于是
+     `List<int>.Add("字符串")` 编译通过，运行时把字符串指针存进 int
+     列表，读出来是**垃圾指针**（静默损坏，不是崩，比报错难查得多）。
+   - 根因（两条路都绕开了实参类型检查）：
+     - 内建泛型：`List`/`Dict` 没有 `sym`（成员签名在 `builtin_api.c` 的
+       表里，不是源码声明）→ `call_arg_signature` 拿不到签名 →
+       `check_call_arg_type` 从没被调用。
+     - 用户泛型类：`call_arg_signature` 看到 `recv->type_arg_count` 非零
+       就直接返回 NULL（怕泛型形参匹配不上）→ 实参检查整段被跳过。
+   - 边界：`checker_arg_type_mismatch` 本身对"值类型形参 + 引用类型实参"
+     这一格是放行的（只查"引用 ↔ 引用"）。所以泛型路径要**自己**补这一格，
+     别指望通用函数兜住——通用函数一收紧就会误伤 stdlib 里的 extern
+     原生调用（`NativeMemory.Base64Encode(nint, long)` 实参传 `byte[]`，
+     靠 irgen 侧的 `nm_arg` 转换）。
+17. **泛型类的 `this.field` 必须按当前实例替换类型实参**：
    - 动作：`member_access_field_type`（`src/compiler/irgen_expr_core.c`）在
      `this.x` / `base.x` 分支上要按 `g->cur_inst` 调
      `subst_type_param_deep`，不能直接返回字段的**声明**类型。
@@ -351,7 +385,7 @@ description: zanc 编译器内部（parser/checker/irgen/runtime/ABI）设计契
    - 边界：**字段布局**是另一处（泛型类的结构体布局不随实例特化，值类型
      字段仍会算错槽位大小，见 TASKS.md A421）——本条只管**表达式类型**，
      两处要一起修才算彻底。
-17. **泛型类的字段布局不随实例特化（已知缺口，A421）**：
+18. **泛型类的字段布局不随实例特化（已知缺口，A421）**：
    - 动作：写"泛型类持有值类型字段"（`class Box<T> { T value; }`）之前要知道
      当前不支持：布局按声明处的字段类型算（类型参数 → 指针大小），具体实例
      化时没有重算槽位大小 → 写超 → 堆损坏。
@@ -359,7 +393,7 @@ description: zanc 编译器内部（parser/checker/irgen/runtime/ABI）设计契
      定位成本极高。
    - 边界：替代形态——把值类型放进 `List<T>`（元素类型走已替换的路径），
      或让泛型类只持有引用类型字段。
-18. **运算符重载必须参与类型推导**：
+19. **运算符重载必须参与类型推导**：
    - 动作：`infer_expr_type`（`src/compiler/irgen_expr_core.c`）的 `AST_BINARY`
      分支，在走数值运算前先查有没有对应的 `op_*` 重载（`op_add` / `op_sub` /
      `op_mul` / `op_div` / `op_mod` / `op_eq` / `op_neq` / `op_lt` / `op_gt` /
@@ -370,7 +404,7 @@ description: zanc 编译器内部（parser/checker/irgen/runtime/ABI）设计契
    - 边界：运算符结果**再参与下一次运算**时最容易踩（`a * b + a`：第一
      次的结果类型是 NULL，第二次运算就彻底失去类型信息）——推导必须能
      链式传递。
-19. **运算符调用的实参形态要按期望类型归一化**：
+20. **运算符调用的实参形态要按期望类型归一化**：
    - 动作：运算符调用路径（`src/compiler/irgen_expr.c`）拿接收者与第二个
      实参时，若参数类型是 struct 而实参是指针槽位（`new 结构体(...)` 的
      返回值），补一次 `LLVMBuildLoad2`；常规调用走 `coerce_args_to_params`，
@@ -380,7 +414,7 @@ description: zanc 编译器内部（parser/checker/irgen/runtime/ABI）设计契
    - 边界：标量与结构体的混合重载**只能标量在右**（`v * 2.0` 合法，
      `2.0 * v` 编译器直接报 "cannot apply operator to 'double' and 'V'"）——
      这是语言限制，不是缺陷，不要靠改编译器放宽。
-20. **跨编译单元的 struct 字段布局必须按需注册后取值**：
+21. **跨编译单元的 struct 字段布局必须按需注册后取值**：
    - 动作：`map_type`（`src/compiler/irgen.c`）的 `TYPE_STRUCT` / `TYPE_CLASS`
      分支，在该类型尚未注册时按「有 `decl` 则先 `register_struct_type`」
      再取字段类型——class 取**指针**，struct 取**值**；`map_tuple_struct`
@@ -392,7 +426,7 @@ description: zanc 编译器内部（parser/checker/irgen/runtime/ABI）设计契
    - 边界：判定器是**跨文件**用例——结构体定义文件必须排在引用它的用户文件
      **之后**编译，才命中旧的文件序缺陷（见
      `tests/conformance/struct_field_layout/`）。
-21. **结构体类型注册表的条目指针在递归注册后失效**：
+22. **结构体类型注册表的条目指针在递归注册后失效**：
    - 动作：`register_struct_type` 登记完自己就立刻记下
      `int my_index = g->struct_type_count - 1;`，递归注册**之后**再用
      `&g->struct_types[my_index]` 取条目取字段数据。
@@ -402,67 +436,70 @@ description: zanc 编译器内部（parser/checker/irgen/runtime/ABI）设计契
      份代码 10 次编译崩 1 次）。
    - 边界：任何"先记下元素指针、递归之后再解引用"的写法都要复查；**间歇性**
      崩溃（同样输入时好时坏）优先怀疑缓存/表条目的生命周期，而不是随机性。
-22. **类布局的 vptr 槽必须整条继承链统一**：
-   - 动作：`class_vptr_offset` 对**所有类**一律返回 1（0 号槽留指针位），
-     结构体返回 0，显式布局类型自己给偏移也不留；虚表仍然只在"本类或祖先
-     多态"时才发，但**布局**不再看多态。自举实现同步（`FieldBase` 与
-     `EmitStruct` 同样按"类一律留槽"改）。
+23. **类布局的 vptr 槽必须整条继承链统一**：
+   - 动作：`class_vptr_offset`（`src/compiler/irgen.c`）对**所有类**一律返回
+     1（0 号槽留指针位），结构体返回 0，显式布局类型自己给偏移也不留；
+     虚表仍然只在"本类或祖先多态"时才发（`class_has_virtual_methods`），
+     但**布局**不再看多态。自举侧同步：`src/selfhost/irgen.zan` 的
+     `FieldBase` 与 `EmitStruct` 同样按"类一律留槽"改。
    - 理由：vptr 槽以前只在多态类里留，于是 `Base`（无接口无虚方法）与
      `Derived : Base, IFace`（实现了接口）给**同一个字段**两套下标
      （0 vs 1）：基类构造器把字段写进了派生对象的 vptr 槽，派生类读到的
      却是垃圾（实测 `d.count=-724564432`），ARC 释放也漏掉基类那份字段
      （泄漏报告指向基类的 `new`）。派生类一继承基类就坏。
    - 边界：字段下标只能有一个来源（`get_field_index` / `class_vptr_offset`），
-     结构体类型注册、调试信息、ARC 释放函数、反射都必须跟着它走；漏一处
-     就又是一处错位。判定器：一条"基类字段在派生实例上的读写 + 基类方法 +
-     接口分派"的用例，泄漏档与 arcguard 档同源覆盖。
-23. **泛型类的每个实例化必须有自己的 vtable**：
-   - 动作：泛型类不能只发一张共享 vtable。按实例实参生成
-     `__zan_vtable_<Class>$<token>`，槽位指向该实例化的**特化版**方法体；
-     `new` 表达式按实例化取表。表**创建即填**（虚表发射在部分路径上早于
-     方法体发射，晚填会拿到全 null 的表）。**特化版与擦除版的 LLVM 签名
-     不一致时退回擦除版**（值类型类型实参会改签名）。
+     结构体类型注册（`register_struct_type`）、调试信息、ARC 释放函数
+     （`irgen_arc.c`）、反射（`irgen_reflect.c`）都必须跟着它走；漏一处
+     就又是一处错位。判定器：`tests/conformance/inherit_interface_layout.zan`
+     （基类字段在派生实例上的读写 + 基类方法 + 接口分派），泄漏档与
+     arcguard 档同源覆盖。
+24. **泛型类的每个实例化必须有自己的 vtable**：
+   - 动作：泛型类不能只发一张共享 vtable。`get_vtable_global_inst`
+     （`src/compiler/irgen_arc.c`）按实例实参生成 `__zan_vtable_<Class>$<token>`，
+     槽位指向该实例化的**特化版**方法体；`new` 表达式按实例化取表
+     （`src/compiler/irgen_expr.c`）。表**创建即填**（`emit_vtables` 在部分路径
+     上早于方法体发射，晚填会拿到全 null 的表）。**特化版与擦除版的 LLVM
+     签名不一致时退回擦除版**（值类型类型实参会改签名）。
    - 理由：整类共享一张表时，槽位指向**擦除版**方法体 → 虚方法体里的 `is T`
      拿不到类型实参 → 判定恒 false（**静默错值**，不报错）。特化版方法体早
      就发射出来了，只是没被挂上——只看"方法体对不对"会误判成已修好。
-   - 边界：只管**虚调用槽**；非虚调用走类级实例化路由。判定器：一条覆盖
-     "覆写体认自己的类型 / 两个实例互不干扰"的用例。
-24. **形参↔实参映射口径：接收者不是第 0 个形参**：
-   - 动作：泛型方法的类型实参推断里，`arg_base` 必须与发射端同口径：
-     `(recv_expr && m_static) ? 1 : 0`——只有"静态方法经实例表达式调用"时
-     接收者才占第 0 个实参；**实例方法的接收者是 `this`**，不是声明形参
-     之一。`try_method_spec` / `emit_method_spec_call` 本来就是这个口径。
+   - 边界：只管**虚调用槽**；非虚调用走类级实例化路由（`route_generic_method`）。
+     判定器 `tests/conformance/generic_virtual_dispatch.zan`。
+25. **形参↔实参映射口径：接收者不是第 0 个形参**：
+   - 动作：`infer_method_tp_bindings`（`src/compiler/irgen_expr.c`）的 `arg_base`
+     必须与发射端同口径：`(recv_expr && m_static) ? 1 : 0`——只有"静态方法经
+     实例表达式调用"时接收者才占第 0 个实参；**实例方法的接收者是 `this`**，
+     不是声明形参之一。`try_method_spec` / `emit_method_spec_call` 本来就是
+     这个口径。
    - 理由：写成 `recv_expr ? 1 : 0` 时，实例泛型方法拿**接收者**去和形参类型
      合一（形参 `Chan<T>` vs 接收者类，类型实参数对不上 → 一个都绑不上）→
-     绑定保持空 → `get_or_create_method_spec` 的
+     `bind[0]` 保持 NULL → `get_or_create_method_spec` 的
      `if (!bind[i] || !type_is_concrete(bind[i])) return -1` 拦下 → 调用退化成
      **擦除版** → 体内 `is T` 折成常量 false（静默错值）。
    - 边界：静态方法按推断调用本来就是对的（`recv_expr` 为 NULL）——别把"泛型
      方法推断"整族当坏的，**实例/静态要分开看**；显式类型实参永远对。
-     判定器：一条覆盖"实例推断 / 实例显式 / 静态推断 / 静态显式 / 两次推断
-     互不干扰"的用例。
-25. **没有装箱设施：值类型↔引用类型的转换必须报错**：
+     判定器 `tests/conformance/generic_method_inference.zan`。
+26. **没有装箱设施：值类型↔引用类型的转换必须报错**：
    - 动作：Zan **没有装箱**，`object` 只能装引用。值类型 → `object` 的三条
      路径都要拦：① checker 的 `checker_cast_is_valid`（`dst->kind == TYPE_OBJECT`
      时来源必须是引用类型）；② lambda 体类型 vs 委托返回类型
      （`check_no_boxing_conversion`，表达式体在 `emit_lambda_typed`，块体的
-     `return` 在 return 语句发射处且只在 `g->lambda_depth > 0` 时查）；
-     ③ 泛型特化里的强转（`emit_expr_cast_expr`——checker 阶段类型参数还
-     看不出来）。
+     `return` 在 `irgen_stmt.c` 且只在 `g->lambda_depth > 0` 时查）；③ 泛型
+     特化里的强转（`emit_expr_cast_expr`——checker 阶段类型参数还看不出来）。
    - 理由：没拦住就是 `LLVMBuildIntToPtr`——`42` 变成指针 `0x2A`，之后任何
      对象操作（ARC release 读头 / `is` 读 site 字）都在 `0x2A-16` 处读 →
      **当场 access violation**（0xC0000005），退出时 ARC 再回收一次假对象 →
      二次崩。lambda 那条还会先给出一个"非 null 的垃圾指针"，更难查。
    - 边界：checker **不给 lambda 形参建类型**，也**不检查块形 lambda 的语句**
-     （lambda 分支直接 `return type_error`；`zan_checker_check_expr` 没有
+     （`AST_LAMBDA` 分支直接 `return type_error`；`zan_checker_check_expr` 没有
      `AST_BLOCK` 分支）——所以 lambda 的返回类型检查只能在 irgen 做。
      `object → 具体类` 的下转照旧放行；真装箱（分配带类型描述符的堆对象）是
-
-     独立战线。
-26. **泛型值类型与 null 的比较必须在 IR 层折叠，不能直接发 `icmp`**：
+ 
+    独立战线，见 TASKS.md A454。
+27. **泛型值类型与 null 的比较必须在 IR 层折叠，不能直接发 `icmp`**：
    - 动作：`emit_expr_binary` 里，当一侧是空指针常量、另一侧是**值类型**
      （struct / int / float）时，`==` 折叠成 false、`!=` 折叠成 true——值类型
-     永远不是 null。两侧都要释放 owned 临时对象。
+     永远不是 null。两侧都要 `emit_release_owned_call_temp` 释放 owned 临时。
      可空聚合体（`zan.nullable.*`）**不按值类型折叠**：它的"是否为 null"由
      has-value 标记决定。
    - 理由：泛型形参 `T` 特化成结构体后，`v == null` 的左侧是**聚合值**、
@@ -470,22 +507,24 @@ description: zanc 编译器内部（parser/checker/irgen/runtime/ABI）设计契
      （Both operands to ICmp instruction are not of the same type）→ 编译期
      崩，且诊断信息指向用户代码而不是编译器缺陷。
    - 边界：折叠只对**一侧为空指针常量**成立；两个值类型之间的比较照常走
-     值比较路径。语义口径：值类型 `v == null` 恒 false、`v != null` 恒 true；
-     引用类型仍按指针比较。
+     `emit_binary_op_values`。语义口径：值类型 `v == null` 恒 false、
+     `v != null` 恒 true；引用类型仍按指针比较。
    - 判定器：`tests/conformance/generic_value_null_compare.zan`。
-27. **表达式体 Lambda 返回结构体必须按值取出，不能直接 `ret` 求值地址**：
+28. **表达式体 Lambda 返回结构体必须按值取出，不能直接 `ret` 求值地址**：
    - 动作：`emit_lambda_typed` 的表达式体路径，当返回类型是 struct 且不是
-     nullable 聚合时，先按值取出（`coerce_struct_value_arg`）再 `LLVMBuildRet`。
+     nullable 聚合时，先 `coerce_struct_value_arg(g, result, ret_type)` 按值
+     取出再 `LLVMBuildRet`。
    - 理由：表达式体求值出的是结构体对象的**地址**，与"按值返回结构体"的
      签名不符 → `ret ptr %new` 与 `%struct.Point` 不匹配 → LLVM 校验失败
      （Function return type does not match operand type of return inst）。
-     块体 lambda 因为走按值路径已经正确，**只有表达式体漏**。
+     块体 lambda 因为走 `emit_struct_value` 已经按值，**只有表达式体漏**。
    - 边界：nullable 聚合（`zan.nullable.*`）是另一种形态，跳过。
    - 判定器：`tests/conformance/lambda_struct_return.zan`。
-28. **catch 退出路径必须先释放异常对象、再释放局部变量；eh_slot 按 LIFO 弹**：
+29. **catch 退出路径必须先释放异常对象、再释放局部变量；eh_slot 按 LIFO 弹**：
    - 动作：所有从 catch 块退出的路径（return 带值 / return 无值 / break /
-     continue / goto）都改成**先释放活动 catch 异常、再释放局部变量**；
-     `emit_release_owned_locals_except` 弹 eh_slot 标记时按**逆序（LIFO）**。
+     continue / goto）都改成**先 `emit_release_active_catch_excs`、再
+     `emit_release_owned_locals`**；`emit_release_owned_locals_except` 弹
+     eh_slot 标记时按**逆序（LIFO）**。
    - 理由：catch 进入时异常对象压在**异常临时栈顶**（`exc.push`）。原顺序先
      释放局部变量——弹 eh_slot 标记时弹掉的其实是栈顶那个**异常**——于是
      局部变量的标记滞留在栈上、栈深错位；后续异常展开二次释放同一个对象，
@@ -494,72 +533,74 @@ description: zanc 编译器内部（parser/checker/irgen/runtime/ABI）设计契
    - 边界：catch 块内**正常执行到底**的路径不走这套释放；只有"从 catch
      里跳出"的路径要成对释放异常与局部变量。
    - 判定器：`tests/conformance/catch_return_release.zan`。
-29. **委托调用点必须按当前实例替换类型参数，否则与 lambda 的实际签名不一致**：
-   - 动作：`emit_delegate_call` 里，若当前实例非空且委托类型是
-     `TYPE_DELEGATE`，先深替换类型参数（`subst_type_param_deep` +
-     `g->cur_inst`），再用替换后的类型算形参/返回的 LLVM 类型；结构体实参按值
-     规整（`coerce_struct_value_arg`）。
+30. **委托调用点必须按当前实例替换类型参数，否则与 lambda 的实际签名不一致**：
+   - 动作：`emit_delegate_call` 里，若 `g->cur_inst` 非空且委托类型是
+     `TYPE_DELEGATE`，先 `subst_type_param_deep(g, delegate_type, g->cur_inst)`
+     替换类型参数，再用替换后的类型算形参/返回的 LLVM 类型；结构体实参走
+     `coerce_struct_value_arg` 规整。
    - 理由：泛型实例里委托字段的类型是 `Func<TTarget>`。调用点若按**未替换**
      的类型算签名，得到的是擦除形态（指针）；而实际 lambda 是按**已替换**类型
      发射的（按值返回结构体）→ 调用点把返回值当指针再 load → 读到 null/垃圾
      → `mov (%rcx),%eax` 崩溃（rcx=0）。
-   - 边界：替换要**深替换**，嵌套在泛型实参里的类型参数也要换；只换顶层会
-     漏掉 `Func<List<T>>` 这类形态。
+   - 边界：替换要**深替换**（`subst_type_param_deep`），嵌套在泛型实参里的
+     类型参数也要换；只换顶层会漏掉 `Func<List<T>>` 这类形态。
    - 判定器：`tests/conformance/mapping_profile.zan`（结构体目标）、
      `tests/conformance/mapping_gen.zan`。
-30. **惰性构建的辅助函数会清掉"当前调试位置"——调用点必须兜底补 `!dbg`**：
-   - 动作：设置调试位置时记下"最近一次的位置"（连同它属于哪个函数）；
-     统一发调用的入口在发码前检查"当前调试位置是否为空"，为空且**当前函数
-     确实带 subprogram**、且那个位置**属于当前函数**时补回去。
+31. **惰性构建的辅助函数会清掉"当前调试位置"——调用点必须兜底补 `!dbg`**：
+   - 动作：`di_set_loc` 记下最近一次设置的位置（连同它属于哪个函数）；
+     统一发调用的入口（`zan_call2`）在发码前检查"当前调试位置是否为空"，
+     为空且**当前函数确实带 subprogram**、且那个位置**属于当前函数**时补回去。
    - 理由：类的释放体、集合的释放体这类辅助函数是在**用户代码中间**被惰性
-     构建出来的，构建入口把"当前调试位置"清掉且不恢复——于是**同一函数里
-     后面那个调用就没了 `!dbg`**。LLVM 校验器对"带调试信息的函数里位置缺失
-     的调用"直接报 `inlinable function call in a function with debug info must
-     have a !dbg location`，整个带调试信息的构建失败。
-     症状落在**离病灶很远的地方**：报错说的是某个标准库的类型，真因却是
-     宿主编译器在它之前清了位置。带调试信息的构建（IDE 的调试版、崩溃排查）
-     因此整个起不来。
+     构建出来的（`irgen_arc.c` 的 `build_class_release_body` /
+     `build_collection_release_body`），构建入口 `di_clear` 把"当前调试位置"
+     清掉且不恢复——于是**同一函数里后面那个调用就没了 `!dbg`**。LLVM 校验器
+     对"带调试信息的函数里位置缺失的调用"直接报
+     `inlinable function call in a function with debug info must have a !dbg location`，
+     整个 `-g` 构建失败。
+     症状落在**离病灶很远的地方**：报错说的是某个标准库的类型（如
+     `LuaValue_op_call`），真因却是宿主编译器在它之前清了位置。带调试信息
+     的构建（IDE 的调试版、崩溃排查）因此整个起不来。
    - 边界：只补在**确实带 subprogram** 的函数里（运行时辅助函数没有
      subprogram，塞位置反而触发 LLVM 另一条校验）；位置属于别的函数时**不补**
      （挪位置到别的函数同样是校验错误）。补的位置必须与"被清之前"同属一个函数。
-   - 手法（找出真凶，别猜）：在清位置的那处加一行诊断，打印"清位置时正在
+   - 手法（找出真凶，别猜）：在 `di_clear` 里加一行诊断，打印"清位置时正在
      构建哪个函数、清之前的行号"，编一次就知道是哪个辅助函数在作祟。
      猜形状是没用的——"实参求值期间释放对象"这类触发条件可以有很多写法，
      逐个试要试十几次。
-   - 判定器：一条带调试信息编译的 conformance 用例（普通构建不产生调试信息，
+   - 判定器：一条带 `-g` 编译的 conformance 用例（普通构建不产生调试信息，
      踩不到这条路径）。
 
 ---
 
 ## 三、运行时数据布局与内存所有权（Runtime / ARC）
 
-1. **Dict 内建内存布局与保序约束**：
+27. **Dict 内建内存布局与保序约束**：
    - 动作：Dict 的 keys/values 并行缓冲区必须严格保持插入顺序；元素删除（Remove）使用 memmove 整体向前搬移并置 `indexed_count = 0` 使索引表整体失效。
    - 理由：枚举顺序与析构顺序依赖插入序；防止增量哈希索引修复引发探测链死循环。
-2. **FFI 外部指针借用与内建所有权白名单**：
+28. **FFI 外部指针借用与内建所有权白名单**：
    - 动作：从 `DllImport` 外部返回的字符串是借用指针，运行时不释放、不下标；内建 API 若返回借用或托管字符串必须显式在借用白名单中登记。
    - 理由：防止跨 FFI 边界的野指针析构或托管堆内存泄漏。
-3. **临时所有权实参自动回收（Lookup Builtins）**：
+29. **临时所有权实参自动回收（Lookup Builtins）**：
    - 动作：在集合查找类内建（如 `Contains`, `IndexOf`, `Dict.Remove`, `d[key]`）计算完成后，必须调用 `emit_release_owned_call_temp` 释放内联求值的临时对象。
    - 理由：防止查找表达式内部求值的临时字符串或对象在每次执行时泄露。
-4. **异常展开栈与实参临时平衡注册（EH Unwind）**：
+30. **异常展开栈与实参临时平衡注册（EH Unwind）**：
    - 动作：调用函数时若求值产生托管临时对象，必须在压栈前注册至每线程 unwind 栈；调用返回后 pop 次数必须与 push 次数严格相等。
    - 理由：保证被调方发生 setjmp/longjmp 展开时临时对象被完整释放，且展开栈深度平衡。
-5. **委托双形态与闭包捕获保活**：
+31. **委托双形态与闭包捕获保活**：
    - 动作：区分纯函数指针与携带上下文环境的闭包（Tagged Closure）；闭包跨调用帧逃逸或传递至异步线程时必须调用 ARC retain，并在执行入口校验 `ZAN_CLOSURE_TAG`。
    - 理由：确保被捕获的上下文变量在异步或脱钩执行期间生命周期完整。
-6. **协程帧只许被 reap 一次（帧所有权契约）**：
+32. **协程帧只许被 reap 一次（帧所有权契约）**：
    - 动作：给帧设置"自 awaiter"（`ASYNC_FRAME_AWAITER = 自身`、`AWAITER_STEP = __zan_co_reap`，即"任务完成即释放"）之前，必须确认没有第二条路径会再释放同一帧；带结果（keep_result）的帧不设自 awaiter，由用户侧 `reap` 释放，**两类帧的所有权契约不可混用**。
    - 理由：运行时 `__zan_co_frame_free` 的幂等守卫读帧首 8 字节的 `CO_DEAD` 位，但小对象分配器回收时把用户块首 8 字节写成 freelist 指针，守卫读到的已是垃圾 → 二次释放直接 double free（进程 abort）。实例：lambda 形态的 `Task.Run` 走 action 帧并自 reap，用户再读 `.Result`/`.Wait()` 又 reap 一次（该缺陷已按类型侧收口闭账，运行时仍缺幂等兜底，见 TASKS.md A380）。
    - 边界：运行时的守卫位不要放在分配器会回写的槽位（帧首 8 字节）；若要让 reap 幂等，标记必须落在分配器不覆盖的字段上。
-7. **释放路径上的"已释放"标记不能放在分配器会回写的槽位**：
+33. **释放路径上的"已释放"标记不能放在分配器会回写的槽位**：
    - 动作：给任何"释放后仍要能被识别"的对象加幂等标记时，标记位必须放在**分配器不会覆盖**的字段上；小对象分配器回收时把用户块首 8 字节写成 freelist 指针（`src/runtime/rt_mem.c`），块首的任何标记在 free 之后立刻变成垃圾。
    - 理由：把守卫放在块首 → 二次释放读到的不是"已释放"而是 freelist 指针 → 幂等判断失效 → double free abort；`__wrap_free` 自己的双释放检测（块头 magic）才是真正兜底，它一命中就 fatal。
    - 边界：真要让 reap 幂等，用**注册表仲裁**（活协程表 `zan_co_live_del` 返回"本次是否真的摘掉了这个帧"），别指望对象里的标记位。
-8. **同一块内存有两条释放路径时，先定单一所有者，再谈幂等**：
+34. **同一块内存有两条释放路径时，先定单一所有者，再谈幂等**：
    - 动作：动手改帧/缓冲区的释放协议前，先把"谁拥有它、什么时候交棒"写在纸上：完成路径与用户路径同时存在时，必须选一个做唯一 owner，另一个改成只观测（等状态、不释放）。把"两边都释放但加了守卫"当解决方案，等于把 double free 换成偶发 UAF。
    - 理由：`Task.Run(lambda)` 的 action 帧此前"完成路径 reap 一次 + 用户侧 reap 一次"，靠时序侥幸没炸；真正的收口是让类型区分两种帧（无结果 action 帧 vs 带结果 keep_result 帧），使误用在编译期被拒。
-9. **集合元素槽位按「字」而非「个」计**：
+35. **集合元素槽位按「字」而非「个」计**：
    - 动作：`List<T>` 的元素槽步长是 `elem_slot_words(T)` 个 8 字节字（值结构体 >1 字，
      指针/整型/浮点为 1 字）；任何走槽下标的路径（索引读、Add/Insert/RemoveAt、
      AddRange、ToArray、Dict.Keys/Values、数组元素赋值）都必须用
@@ -568,7 +609,7 @@ description: zanc 编译器内部（parser/checker/irgen/runtime/ABI）设计契
      读出来是全零（`List<Vector3>.AddRange` 的元素全 0），且缓冲区会越界写。
    - 边界：`elem_slot_words` 由结构体的 LLVM 布局算出；布局算不出来时
      （`llvm_scalar_size` 为 0）必须报错拒绝，而不是悄悄退化成 1 字。
-10. **静态（immortal）对象与堆对象共用头部布局时，哨兵判定必须覆盖每一条 ARC 路径**：
+36. **静态（immortal）对象与堆对象共用头部布局时，哨兵判定必须覆盖每一条 ARC 路径**：
    - 动作：字符串字面量等编译期常量不是堆对象，它们的引用计数用哨兵值
      `ZAN_STRING_SENTINEL_RC`（不参与计数）。凡是会读写"对象前 16 字节计数头"
      （`ZAN_OBJ_RC_OFF = -16`）的 ARC 路径——通用 retain / 通用 release、字符串
@@ -577,8 +618,8 @@ description: zanc 编译器内部（parser/checker/irgen/runtime/ABI）设计契
    - 理由：判一半就会崩。字符串 retain 与动态释放都判了哨兵，唯独通用
      retain/release 漏了；而"字面量存进 `object` 槽"走的正是通用 retain
      （槽的静态类型是 object 不是 string），于是对只读段做原子加一 → 0xC0000005。
-     实例：三条 conformance 用例（类型三元 / 字符串转 object / 模式变量）
-     同时崩，根因同一。
+     实例：`case_ternary_is_type` / `case_cast_string_object` /
+     `case_cs_b05_pattern_var` 三条同时崩，根因同一（见 TASKS.md A412）。
    - 排查手法：访问冲突先看**写入目标地址落在哪个映像段**——写 exe 的只读段
      = 在改静态对象；再看寄存器里的对象指针是不是"目标地址 + 16"（那就是 ARC
      计数头）。崩溃现场在 `<exe_dir>/zan_crash.log`（含 fault/rip/rax/raw stack），
@@ -590,67 +631,69 @@ description: zanc 编译器内部（parser/checker/irgen/runtime/ABI）设计契
 
 ## 四、编译发布与驱动链接（Packaging & Cross-Linking）
 
-1. **驱动运行时打包与 LLVM 模块生命周期顺序**：
+37. **驱动运行时打包与 LLVM 模块生命周期顺序**：
    - 动作：驱动 manifest 中的条件依赖符号前缀（如 `WebView`, `Cef` 等）必须在释放 LLVM 模块前预缓存至 `prefix_cache`，禁止在 `zan_irgen_release_llvm` 后调用模块遍历 API。
    - 理由：LLVM 模块销毁后指针置空，再次遍历会导致进程异常崩溃。
-2. **按需拉入与运行时依赖前缀触发**：
+38. **按需拉入与运行时依赖前缀触发**：
    - 动作：标准库与驱动的按需拉入应基于符号消费触发，避免无条件的粗粒度导入引入沉重的多线程或特定平台运行时依赖。
    - 理由：减少单执行文件的发布体积，避免无用依赖拖慢启动性能。
-3. **iOS Mach-O 交叉编译平台标记与原生外壳驱动内嵌**：
+39. **iOS Mach-O 交叉编译平台标记与原生外壳驱动内嵌**：
    - 动作：交叉编译生成 iOS ARM64 运行时对象时，必须指定 `-target aarch64-ios`（严禁使用 `aarch64-macos` 代替），避免 `ld64.lld` 因平台头标识不符（`has platform macOS, which is different from target platform iOS`）拒绝合流。针对 iOS 上的 `zan_gui` 与 `zan_image` 驱动，编译器禁止生成桩函数，而是直接静态内嵌 `zanrt_gui.o` 与 `zanrt_image.o`。
    - 理由：iOS 设备禁止动态加载未签名的第三方 dylib，所有 GUI 视图生命周期、Retina 触控、2D 软件光栅与图像解码器（PNG/WebP/SVG）驱动均以静态目标文件合流进可执行 Mach-O，确保输出的标准 `.ipa` 即装即用。
-4. **iOS CoreText 字体生命周期、主线程呈现与触控事件流纪律**：
+40. **iOS CoreText 字体生命周期、主线程呈现与触控事件流纪律**：
    - 动作：(1) 通过 UIKit `[UIFont systemFontOfSize:]` 桥接获取系统字体后，必须显式 `CFRetain` 并常驻全局字号索引表（`g_font_table[128]`），其 ascent/height 度量必须持久化缓存，禁止在文本测量或光栅化完成时直接调用 `CFRelease` 释放系统单例，防止内部度量数据归零引发排版坍塌；(2) CoreText 绘制采用正向坐标系光栅化，基线锚定 `descent + 1.0`，内存行索引直接按 `mask[py * tw]` 正向写入 Zan 软件表面，严禁在写入时做垂直翻转（`th - 1 - py`），否则会导致字形 180 度上下倒置；(3) iOS CALayer 的 `setContents:` 与 `CATransaction` 提交必须通过 `dispatch_sync_f` 派发至主线程（`_dispatch_main_q`）执行，禁止在后台工作线程直接 flush；(4) 触控滑动判定阈值（slop）设定为 `6.0f * scale`（6pt），滚轮事件在队列中实施增量合并（coalescing），并在拖拽释放时标记 `flag = 1` 抑制误触。
    - 理由：UIFont 在 iOS 内部由 UIKit 统一管理引用计数，过度释放破坏单例内存引发度量归零与中文降级回退（问号乱码/像素风）；CGBitmapContext 在 iOS 内存布局中第 0 行为顶部，反向 blit 会造成字形上下颠倒；CoreAnimation 事务在非主线程提交会被系统延迟至未知主循环周期，导致拖动画面延迟极高（卡顿迟钝）。
-5. **批量构建不要把文件列表摊在命令行上**：
+41. **批量构建不要把文件列表摊在命令行上**：
    - 动作：编译"一个目录/一个包"的全部源文件时，把**目录**交给编译器
      （`zanc <dir>`，编译器自己递归展开 `*.zan`），或用 `@响应文件`；不要在
      调用方枚举出成千上万个路径再拼进命令行。
-   - 理由：Windows 命令行长度上限约 32K。几千个文件的包把路径摊上去，
+   - 理由：Windows 命令行长度上限约 32K。5618 个文件的包把路径摊上去，
      **进程根本起不来**——而这个失败是**静默的**：报错文本里没有任何编译
      诊断，调用方只看"输出里没有 error"就判成编译成功，于是一个从没被编译
-     的包看起来是健康的（全包扫描脚本长期这样误报，包内缺类型的缺陷因此
-     藏了很久）。
+     的包看起来是健康的（`scripts/pkg_sweep.ps1` 长期这样误报，微信 SDK 缺
+     枚举的缺陷因此藏了很久）。
    - 边界：目录展开必须**按路径字典序排序**——目录遍历的原始顺序在 Windows
      上不确定，而输入顺序影响合并单元里 decl 的先后，可复现构建与差分门都
      要求稳定。
 
-6. **await 的目标必须先判「异步 / 普通」再取帧**：
-   - 动作：代码生成层在取子协程帧之前，先判一次 await 的目标是**异步**还是
-     **普通值**：目标是普通值就原样返回，不进协程帧那套。判定要覆盖六种
-     形态——`Task`/`ValueTask` 类型、async **方法**（看方法原型上的 async
-     标记）、async **委托**（对象是委托 / 被调者本身是委托 / 字段是委托）、
-     **接口方法**（签名在接口上声明）、**类名静态接收者**（类名不是值，
-     类型推断给不出结果，要按名字查符号）。
+42. **await 的目标必须先判「异步 / 普通」再取帧**：
+   - 动作：`emit_expr_await_expr`（`src/compiler/irgen_expr.c`）在取子协程帧
+     之前，先用 `await_target_is_async()` 判一次：目标是**普通值**就原样返回，
+     不进协程帧那套。判定要覆盖六种形态——`Task`/`ValueTask` 类型、async
+     **方法**（看 `MOD_ASYNC`）、async **委托**（对象是委托 / 被调者本身是
+     委托 / 字段是委托）、**接口方法**（签名在接口上声明）、**类名静态接收者**
+     （`Socket.SendStringAsync(...)`，类名不是值，`infer` 给不出类型，要按名
+     查符号）。
    - 理由：普通值往往也是 i8 指针（字符串就是），与子协程帧的指针**同型**，
      被当成帧去读就静默读出垃圾——不报错，只是结果为空或乱码。实测两种症状：
      `await` 一个 async 方法拿到空结果（协程帧从没建立），`await` 一个同步
-     委托同样拿到空。网络请求的 await 被误判成普通值时，报的是
+     委托同样拿到空。HTTP 请求的 await 被误判成普通值时，报的是
      `request write failed`——离根因十万八千里。
-   - 边界：**不要靠类型推断单独判**。async 方法的返回类型是它的真实返回
-     类型，不是 `Task`——类型上看不出来，只能看方法原型上的 async 标记。
-     同理接口方法、类名静态接收者也都推不出来，必须各自走一条路。
+   - 边界：**不要靠 `infer_expr_type` 单独判**。async 方法的返回类型是它的
+     真实返回类型（`List<AiMessage>`），不是 `Task`——类型上看不出来，只能
+     看方法原型上的 `MOD_ASYNC`。同理接口方法、类名静态接收者也都推不出来，
+     必须各自走一条路。
 
 ---
 
 ## 五、内建类型成员表与代码生成的一致性契约
 
-1. **内建成员表签名必须与实际发射的返回类型一致**：
+43. **内建成员表签名必须与实际发射的返回类型一致**：
    - 动作：`src/compiler/builtin_api.c` 的成员表（`members_*`）里声明的返回类型，必须与 `irgen_call.c` / `irgen_builtins.c` 中该成员实际发射的 LLVM 返回类型逐个对齐；改实现语义必须同改表里的签名（或反之）。
    - 理由：类型检查只认成员表，代码生成只认发射代码，两边脱节时**类型检查先拒绝合法用法**，而运行期其实是对的——症状是"明明实现了却编不过"，极难定位。实例：`Dict.Remove` 表里写 `void Remove(K key)`，实现却返回 0/1 标志（`irgen_call.c` 命中置 1、落空置 0），于是 C# 惯用法 `bool rm = d.Remove(k)` 被判 `cannot convert 'void' to 'bool'`，`case_arc_lookup_owned_arg` 连带它的泄漏断言（同一次运行）一起红。
    - 边界：内建集合方法（`Dict` / `List`）的"命中/落空"一律用 0/1 标志返回，对齐 C# `Dictionary.Remove` 的 bool 语义；不要把槽位下标当返回值暴露出去。
-2. **内建表就是公开面，改它等于改 API**：
+44. **内建表就是公开面，改它等于改 API**：
    - 动作：内建成员表同时是 IDE 补全与 LSP 的数据源（`zanc --emit-symbols` 写出的类型/成员索引），改签名后必须同步 `docs/STDLIB.md` 对应节，并留一条 conformance 用例钉住语义。
    - 理由：表里的签名直接进 IDE 补全与类型检查；声明与实现不一致时，IDE 补出来的用法与编译器的判定会互相打架，用户看到的是"补全说能写、编译器说不能写"。
-3. **批量改可见性（`private` / `public`）属于跨边界公共面改动**：
+45. **批量改可见性（`private` / `public`）属于跨边界公共面改动**：
    - 动作：把成员改成 `private` 或补 `public` 之前，先查它的跨包调用方（`tools/agent/impact.ps1` / `map.ps1 -Callers`），并定向跑受影响的用例。
    - 理由：可见性一改，**外部调用点立刻编译不过**，而这类破坏不会自己暴露——实例：`Socket.ResolveIpv4` 被规范成 `private` 后，`case_async_dns` / `case_async_mt` 两个用例从那天起一直红，直到有人手工重跑才发现（档位日志停在改动前一天）。
    - 边界：默认可见性是 public（无修饰符即 public），显式 `private` 才是收窄；规范化的目的是让可见性**显式可读**，不是顺手收紧 API。
-4. **内建静态调用的返回类型必须按实参形态定型，并与 irgen 的分支一一对应**：
+46. **内建静态调用的返回类型必须按实参形态定型，并与 irgen 的分支一一对应**：
    - 动作：同一个内建静态成员（`Task.Run` / `Task.Spawn` 这类）传不同形态的实参时，若 irgen 会走**不同的帧/所有权分支**，检查器就必须给不同的返回类型（无类型实参的"无结果类型" vs 带类型实参的 `Task<T>`）；检查器不得对内建调用的返回类型一律宽松放行（`type_error` 对一切可赋值），也不得把"结果类型"一律写成 `long`。
    - 理由：宽松放行会让"把无结果句柄当 `Task<T>` 用"一路通到 IR 与运行期，直到帧被释放两次才 abort；类型侧收口后，误用在编译期就被拒绝，运行期那条 double free 路径根本不可达。实例：`Task.Run(lambda)` 产出的是无结果 action 帧，把它声明成 `Task<int>` 去读 `.Result` 曾经是运行期 double free（已闭账，见 TASKS.md A380 的残留项）。
    - 边界：改检查器的定型前，先读 irgen 里同一调用的分支（哪个实参形态走 keep_result、哪个走 action 帧），两边必须对得上；类型说 A、代码生成做 B 是最难查的一类 bug。
-5. **内建成员表里的类型名不是可见符号，跨命名空间引用仍要显式 `using`**：
+47. **内建成员表里的类型名不是可见符号，跨命名空间引用仍要显式 `using`**：
    - 动作：`src/compiler/builtin_api.c` 的类型表（`BT("Aes", "Aes", ...)`）只服务于
      **成员签名的类型定型**（`Aes.Encrypt` 的返回类型是 `Vector128`），不参与名字
      解析；引用某个类必须让它的命名空间真正进入作用域（文件头的 `using`）。
@@ -662,7 +705,7 @@ description: zanc 编译器内部（parser/checker/irgen/runtime/ABI）设计契
      文件早就写了这一行。
    - 边界：同名类分处不同命名空间时，先确认 import 的是哪一个；内建表的签名
      按硬件原语那份算，名字解析归 `using`，两套机制不要互相推断。
-6. **改动成员可见性、或把实现搬去别处之前，先按"族"核对公开面**：
+48. **改动成员可见性、或把实现搬去别处之前，先按"族"核对公开面**：
    - 动作：可见性规范化（批量补显式修饰符）收窄成员时，判定基准是
      **同族成员**（同一类里其它同角色成员）＋**用例的静态直调**；凡是用例以
      `Cls.Member(...)` 形式直接调用、且该成员是自足工具（不依赖外部状态）的，
@@ -684,9 +727,10 @@ description: zanc 编译器内部（parser/checker/irgen/runtime/ABI）设计契
      有没有对外服务的义务"，而不是"它原来有没有 public 关键字"。搬迁后的兼容面
      只转发**纯函数**（无表、无共享状态），规格表与算法留在新包、用**全限定名**
      可达——全限定名不撞名，同时导入两个命名空间时裸名才会歧义。
-7. **只查不声明 = 静默跳过**：
+
+49. **只查不声明 = 静默跳过**：
    - 动作：编译器要调用**外部符号**（libc / Win32 API）时，必须用
-     `LLVMAddFunction(mod, "名字", 类型)` **声明**进模块；
+     `LLVMAddFunction(g->mod, "名字", 类型)` **声明**进模块；
      `LLVMGetNamedFunction` 只是**查**（查不到返回 NULL），拿它当"要不要
      发射调用"的条件就等于"符号不在模块里就整段跳过"。
      正确写法是「先查后声明」：`Get` 命中就复用，没命中就 `Add`。
@@ -695,19 +739,22 @@ description: zanc 编译器内部（parser/checker/irgen/runtime/ABI）设计契
      `await Task.Delay(ms)` 分支里只 `Get` 不 `Add`，于是整段等待被
      **静默跳过**——`await Task.Delay(500)` 编译成一条 `ret`，方法立刻
      返回。实测请求 500ms、实际耗时 0.0002ms，而**编译无警告、运行无
-     异常**。同类正确写法在超时泵里已有（`Add` 之后再调用），两处不一致
-     正是缺陷的来源。
+     异常**。同类正确写法在 `irgen.c` 的 `zan_io_pump_timeout` 里已有
+     （`Add` 之后再调用），两处不一致正是缺陷的来源。
    - 边界：这条的代价是"漏发一个调用"而不是"发错一个调用"，所以症状
      是**时间/时序不对**（等没等、睡没睡），不是崩溃——排查时先怀疑
-     "这段代码是不是压根没生成"（看 IR 里有没有那个调用），而不是先怀疑
-     参数算错。**新增外部符号时优先复用已有的运行时包装**（`zan_*`）而不是
-     裸 libc 调用，否则每个交叉工具链的 `zanrt_*.o` 都要跟着重建。
+     "这段代码是不是压根没生成"（`--emit-ir` 看 IR 里有没有那个调用），
+     而不是先怀疑参数算错。**新增外部符号时优先复用已有的运行时
+     包装**（`zan_*`）而不是裸 libc 调用，否则每个交叉工具链的
+     `zanrt_*.o` 都要跟着重建。
+
+---
 
 ---
 
 ## 六、await 语义、协程调度与工具链时效
 
-1. **同步上下文里的 `await` 是阻塞式根驱动，不是让出、也不是丢弃**：
+50. **同步上下文里的 `await` 是阻塞式根驱动，不是让出、也不是丢弃**：
    - 动作：判断同步方法里 `await` 的行为时，先分清**操作数是不是协程帧**：操作数是
      async 调用 → 代码生成走**根驱动**分支，自己把子协程推进到完成再取结果（同步方法里
      `int r = await AsyncCall(21)` 拿到 `r=42`）；操作数是需要帧的原语（`Task.Delay` /
@@ -716,38 +763,51 @@ description: zanc 编译器内部（parser/checker/irgen/runtime/ABI）设计契
      async 方法（不写 `await`）→ 只创建帧并入队，协程体不在调用点执行（宿主平台上
      照样会跑完，见本节「宿主平台的协程调度是多 worker 池」）。
    - 理由：把「同步方法里的 await 一律拒绝」写成语义检查规则，会把全仓上百个合法文件一次
-     判死（实测 150 个受检文件里判死 146 个：测试 109 / 示例 20 / 模板 7 / 源码 6 /
-     包 4），而它与仓库既有约定直接冲突——自举固定点里就有 `static void Main()` 里的
-     `await`，自举检查器明写 an `await` in a *synchronous* method is fine。**判据只能是
-     「操作数是不是帧」，不是「方法是不是 async」**。
+     判死（实测 150 个受检文件里判死 146 个：tests 109 / examples 20 / templates 7 /
+     src 6 / packages 4），而它与仓库既有约定直接冲突——自举固定点 `tests/selfhost/prog1.zan`
+     的 `static void Main()` 里就有 `await P.AsTwice(21)`，`src/selfhost/checker.zan` 的
+     CheckAwaits 明写同步方法里的 await 是合法的。**判据只能是「操作数是不是帧」，不是
+     「方法是不是 async」**。
    - 边界：这条只讲语义，不讲「可不可以写」——同步方法里写 `await` 完全合法，代价是
      **占住调用线程直到子协程跑完**。要并发不阻塞就把方法声明成 `async`，那时 `await`
      才是挂起/恢复。判断同步方法里的 `await` 是否合理，看的是「我愿不愿意在这里阻塞」。
    - 判定器：`tests/conformance/async_sync_delay.zan`（同步等待真的等了、结果取对）、
      `tests/conformance/async_void_call.zan`（裸调 async void 的语义）。
 
-2. **宿主平台的协程调度是多 worker 池，不是 M:1 协作式单线程**：
-   - 动作：写「协程怎么被推进」的注释或文档前，先确认**目标平台**：宿主平台链的是多
-     worker 驱动那份运行时——**多个 worker 线程**各自跑协程；M:1 协作式就绪队列那份实现
-     **只在交叉目标**用，普通宿主程序的链接集里根本没有它。裸调用 async 方法的协程照样
-     会跑完，**不需要**主循环泵调度器。可验证的指纹：生成的 exe 里有 `co_worker` /
-     `co_worker_thunk` / `g_co_workers` 符号。
+51. **宿主平台的协程调度是多 worker 池，不是 M:1 协作式单线程**：
+   - 动作：写「协程怎么被推进」的注释或文档前，先确认**目标平台**：宿主平台（Windows /
+     Linux / macOS，x86_64 / aarch64）链的是多 worker 池那份运行时（`zanrt_io_mt.o`，
+     `ZAN_CO_DRIVER` 变体），多个 worker 线程各自跑协程；M:1 协作式就绪队列那份实现
+     （`rt_co.c`）**只在交叉目标**用，普通宿主程序的链接集里根本没有它。裸调用 async
+     方法的协程照样会跑完，**不需要**主循环泵调度器。
    - 理由：「协程是 M:1，await 挂起后由调度器在同一个线程上恢复」「裸线程里 await 既
      等不到也占着线程不放」这两句一旦写进包注释，就会误导后来人按它改形状或给 GUI 主
      循环额外加泵。改法（裸调 async void）实测是对的，**理由是错的**。
-   - 边界：这条讲的是**宿主平台**。交叉目标（嵌入式 / wasm 等）走的是另一套，就绪队列
-     没有 worker 线程，必须由程序自己泵——两种平台的结论相反，别把一边的话抄到另一边。
+   - 边界：这条讲的是**宿主平台**。交叉目标（esp32 / wasm32 等）走另一套：就绪队列没有
+     worker 线程，必须由程序自己泵——两边的结论相反，别把一边的话抄到另一边。
    - 判定器：`tests/conformance/async_runtime_workers.zan`（worker 数可配）、
-     `tests/conformance/async_mt_pool.zan`；二进制指纹同上。
+     `tests/conformance/async_mt_pool.zan`；二进制指纹：生成的 exe 里有 `co_worker` /
+     `co_worker_thunk` / `g_co_workers` 符号。
 
-3. **改了源码 ≠ 消费者用到的二进制变了**：
+52. **改了源码 ≠ 消费者用到的二进制变了**：
    - 动作：面向仓库外消费者（外部项目、已发布 SDK）的编译器改动，必须**显式重建消费者
-     实际使用的那份二进制**（PATH 上的 `zanc`、或 SDK 目录里那一份）再验证；汇报
-     「我改了编译器」之前先核对它的**时间戳**。断言「某行为存在/不存在」时，用**两个
-     不同时间戳的二进制**跑同一个未改动文件对照，才能把「源码差异」和「二进制差异」分开。
+     实际使用的那份二进制**再验证；汇报「我改了编译器」之前先核对那个二进制的
+     **时间戳**。断言「某行为存在/不存在」时，用**两个不同时间戳的二进制**跑同一个
+     未改动文件对照，才能把「源码差异」和「二进制差异」分开。
    - 理由：一条只在工作区存在过、从未进 git 的「await 只能在 async 方法里」诊断，随
      **过期**的编译器二进制漏到仓库外的全部项目（实测 19 个 GUI 项目整包编译失败）——
      看起来像项目代码坏了，实际是二进制没重建；重建后同一批项目立刻通过。
-   - 边界：这条与 `references/selfhost-closure.md` 第 40 条「没有差分门 ≠ 没有检查」末尾那句提醒
-     （先看编译器二进制的时间戳）是同一条坑的两个面——那条讲差分门，这条讲外部消费者。
+   - 边界：这条与 `references/selfhost-closure.md` 第 40 条「没有差分门 ≠ 没有检查」末尾那句
+     「门禁失败先看 `build\zanc.exe` 的时间戳」是同一条坑的两个面——那条讲差分门，这条讲外部消费者。
      **「源码改了」和「用到的二进制变了」是两件事**。
+53. **LLVMAddGlobal/LLVMAddFunction 的第一参是模块，不是上下文**：
+    - 动作：发射全局与函数一律 `LLVMAddGlobal(g->mod, ...)` /
+      `LLVMAddFunction(g->mod, ...)`；LLVM C API 形参全是 void*，把
+      `LLVMContextRef` 误当模块传入**编译不报错**，首次解引用才段崩
+      （0xC0000005）。
+    - 理由：纯类型混淆，无任何编译期诊断；段崩点离出错点远（崩在
+      LLVMSetInitializer/LLVMSetGlobalConstant 等后续调用），肉眼 review
+      很难看出 c 与 mod 之差。坑出处：char 大小写映射发射（A525 闭环的
+      charcase 表）首版误传 context，一编译就崩。
+    - 边界：发射路径的段崩用 fprintf 进度标记二分（表构造前/后、函数创建
+      前后各一个），两轮内必中崩点；比事件日志解析或盲二分快。

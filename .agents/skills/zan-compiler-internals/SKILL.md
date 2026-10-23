@@ -800,3 +800,14 @@ description: zanc 编译器内部（parser/checker/irgen/runtime/ABI）设计契
    - 边界：这条与 `references/selfhost-closure.md` 第 40 条「没有差分门 ≠ 没有检查」末尾那句
      「门禁失败先看 `build\zanc.exe` 的时间戳」是同一条坑的两个面——那条讲差分门，这条讲外部消费者。
      **「源码改了」和「用到的二进制变了」是两件事**。
+53. **LLVMAddGlobal/LLVMAddFunction 的第一参是模块，不是上下文**：
+    - 动作：发射全局与函数一律 `LLVMAddGlobal(g->mod, ...)` /
+      `LLVMAddFunction(g->mod, ...)`；LLVM C API 形参全是 void*，把
+      `LLVMContextRef` 误当模块传入**编译不报错**，首次解引用才段崩
+      （0xC0000005）。
+    - 理由：纯类型混淆，无任何编译期诊断；段崩点离出错点远（崩在
+      LLVMSetInitializer/LLVMSetGlobalConstant 等后续调用），肉眼 review
+      很难看出 c 与 mod 之差。坑出处：char 大小写映射发射（A525 闭环的
+      charcase 表）首版误传 context，一编译就崩。
+    - 边界：发射路径的段崩用 fprintf 进度标记二分（表构造前/后、函数创建
+      前后各一个），两轮内必中崩点；比事件日志解析或盲二分快。
