@@ -1614,7 +1614,7 @@
 - 坑出处：结构体没有析构这件事，被类路径"对象析构顺带释放字段"盖住了——
   同一个形状换个载体就漏，测的时候必须把类与结构体分开测。
 
-### [~] A529 内建静态调用结果上的链式成员解析失败（irgen 推断侧）
+### [x] A529 内建静态调用结果上的链式成员解析失败（irgen 推断侧）
 - **宿主侧已修（2026-10-23）**：`int.Parse("123").ToString()` 曾报 "this call
   could not be resolved to any callable"。根因在 irgen 的 `infer_expr_type_raw`
   对 AST_CALL 的静态内建分支：标量类型（int/long/double/float）是实例内建，
@@ -1624,14 +1624,15 @@
 - 修法：推断分支补 native 成员判定（`zan_builtin_has_native_member`），
   返回标量自身类型，与 irgen_call.c 的原生分派点同口径。
 - 实测复验：`int.Parse("123").ToString()`→123、`double.Parse("2.5")`→2.5、
+  `long.Parse("77")`→77；`Convert.ToInt32("42").ToString()` 本来就能跑
+  （42，Convert 是静态内建有成员表——本条登记时误写它也挂，更正）；
+  正例回归 p11/v_parse_ok 全绿。
 - **自举半边平账（2026-10-23，goal round 5，实测）**：selfhost 的 Parse
   发射本就返回 `MkType("int")`（irgen_expr.zan Parse 分支），链上 ToString
   正常——gen1 编 `int.Parse("123").ToString()`、`(int.Parse("2147483647")
   + 1).ToString()`（A510 自举半边修后按 32 位回绕）全过，无需改动。
   A512 守卫套件（endptr/越界/软通道）也已在位（另一会话 fe2b8f143）。
-  `long.Parse("77")`→77；`Convert.ToInt32("42").ToString()` 本来就能跑
-  （42，Convert 是静态内建有成员表——本条登记时误写它也挂，更正）；
-  正例回归 p11/v_parse_ok 全绿。
+- **用例与差分门双闭（2026-10-23）**：新增 conformance 用例 `tests/conformance/builtin_parse_chain.{zan,out}`（验证 int/double/long.Parse 后链式 ToString 正常返回格式化字符串），并入自举差分门 `tests/selfhost/diff_cases.txt`，两端单测与差分双绿闭账。
 - 探针：`_scratch/csaudit/numeric/{v_chain2,v_chain5,v_chain6}.zan`。
 
 ### 审计复查证伪（2026-10-23，随 A530-535 一批）
