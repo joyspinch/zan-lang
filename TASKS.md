@@ -1345,7 +1345,7 @@
   拆不出来就报诊断，不生成非法 IR）。
 - 关联：A492（同一族取串路径的宽度/类型判据）、A454（自举缺真装箱原语）。
 
-### [~] A498 宿主把 `bool` 当**有符号**整数用——`Math.Sqrt(true)` 得 NaN、`Convert.ToInt32(true)` 得 -1
+### [x] A498 宿主把 `bool` 当**有符号**整数用——`Math.Sqrt(true)` 得 NaN、`Convert.ToInt32(true)` 得 -1
 - **宿主侧已修（2026-10-23）**：① `Convert.ToInt32/64/ToInt` 整数路径对 i1 改零扩展
   （`Convert.ToInt32(true)`=1）；② `math_arg_is_numeric` 把 i1 逐出白名单
   （`Math.Sqrt(true)` 编译期拒绝）。两探针复验通过。
@@ -1354,6 +1354,9 @@
   路径按 bool 零扩展（`Convert.ToInt32(true)`=1）。复验：`Math.Sqrt(true)`
   两侧同报 "Math.Sqrt requires an int or floating-point argument"（列差为
   已知 call-anchor 惯例）、`Convert.ToInt32(true)` 两侧均 1。
+- **用例与差分门双闭（2026-10-23）**：
+  新增正向 conformance 用例 `tests/conformance/convert_bool_to_int.{zan,out}`（覆写 Convert.ToInt32/64 对 bool 变量与字面量准确输出 0/1），并入自举差分门 `tests/selfhost/diff_cases.txt`；
+  新增双端逐字一致负向测试 `tests/selfhost/reject/math_sqrt_bool.zan`，并入 `tests/selfhost/reject_cases.txt`。单测与双端差分门全绿闭账。
 
 - 现象（2026-10-22 随 A445 补自举侧守卫时实测，宿主 `build/zanc.exe`）：
   - `src/compiler/irgen_call.c:701` `math_arg_is_numeric` 判的是**降级后的
