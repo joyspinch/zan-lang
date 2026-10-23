@@ -1910,3 +1910,25 @@
 - 前置：`packages/Zan.Gui/src/Gui/drivers/win-x64/*` 的驱动二进制当前是**另一会话的
   在途改动**，这轮不重建驱动；模板侧先用 `<div>` 顶上（登录窗已改，见提交）。
 
+### [ ] A547 框架：HTML 只能整树装载，行模板（ListView 的行）没法走 html
+- 现象：列表行想改成 html+css（每行一份文档片段，按数据灌文字），但公开的
+  运行期入口只有 `app.LoadHtmlWith(html, handlers, baseDir)`——**每次装载都会把
+  文档的样式表按作用域类追加进 appCss 并整表重铺**（`App.ApplyScopedTree`：
+  `merged = appCss + "\n" + scopedCss; UseAppCss(merged)`，作用域类
+  `zs-load-<序>` 每次装载唯一）。于是「一行一次装载」= 每行往 appCss 里塞一份
+  作用域 CSS + 整表样式表重解析，列表一绑就是 O(n) 份 CSS 副本，越滚越大。
+- 为什么不能「解析一次、按行建树」：`Html.Parse` 返回的 `HtmlDoc` 只暴露
+  `Get(id)`，**不暴露 WDoc/WNode**，`Html.Build(wd, node, doc, handlers)` 要的
+  两个入参拿不到（`HtmlDoc` 的字段 root/css/gen 是私有的）——公开 API 里没有
+  「按已解析文档批量建行」这条路。
+- 候选修法（需专门一轮）：① 给 `HtmlDoc` 加公开的「按文档建一棵新树」入口
+  （`Html.Build` 的薄封装），让行模板能「解析一次、每行建一棵」；② 或者给
+  `Html.LoadForApp` 加一个「样式只装一次」的开关（同一份片段重复装载不重复
+  并 CSS）。有了 ①，行模板就能声明式化：结构与样式进文档，code-behind 只灌
+  数据与事件。
+- 本轮取舍：行模板（8 个）与弹出面板（4 个）**保持命令式**——行的外观本来就由
+  皮肤的 CSS 类驱动（样式单一来源已成立），而 html 化在当前 API 下要么每次装载
+  重复并 CSS，要么等框架补 API；窗口骨架（设置/通讯录管理/聊天记录/独立聊天）
+  已全部改完 html+css。
+
+
