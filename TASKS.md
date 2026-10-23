@@ -1672,3 +1672,15 @@
   已按 UTF-8 透传）。
 - 方向：selfhost lexer 的 CharLit 分支按 UTF-8 解码多点序列取首码点；
   CharToStr 的编码帮手已就绪，只差词法。
+
+### [x] A539 Convert.ToInt32/ToInt 整数实参溢出静默回绕（审计 P1-12）
+- 现象：字符串路径 A512 已有越界软诊断，整数路径漏了——`Convert.ToInt32(2147483648L)`
+  静默截断回绕成 -2147483648（C# 语义：OverflowException）。
+- 修复（irgen_call.c ToInt* 内建整数分支）：i64 实参 + ToInt32/ToInt 时
+  补与字符串路径同判的范围谓词（<INT32_MIN || > INT32_MAX）→
+  emit_runtime_check 软诊断 + 安全值 0（--strict-runtime 下 exit 70）；
+  ToInt64 全宽不查；窄整型 sext 后必在范围不查。
+- 复验：四值探针（上越界/下越界/int 上下边界/ToInt64 宽值）ALL-OK，
+  软诊断两行 stderr；conformance `case_convert_overflow` 过。
+- ToUpper/ToLower 非 ASCII 原样返回：A525 已声明 ASCII 口径（已知偏差），
+  Unicode 简单大小写映射留待独立件（大表，C# 复刻线）。
