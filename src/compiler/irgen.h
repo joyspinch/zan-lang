@@ -133,6 +133,7 @@ typedef struct zan_goto_fixup {
     LLVMBasicBlockRef break_target, continue_target;
     int throw_locals_base, throw_catch_base;
     int loop_locals_base, loop_catch_base;
+    int break_locals_base;
     int finally_loop_base, eh_armed_loop_base;
     int checked_depth;
 } zan_goto_fixup_t;
@@ -221,8 +222,10 @@ struct zan_irgen {
 
     LLVMBasicBlockRef break_target;
     LLVMBasicBlockRef continue_target;
-    /* 最内层循环首个局部变量索引：break/continue 据此释放局部变量 */
+    /* 最内层循环首个局部变量索引：continue 据此释放局部变量 */
     int loop_locals_base;
+    /* 最内层循环或 switch 首个局部变量索引：break 据此释放局部变量 */
+    int break_locals_base;
     int throw_locals_base;
     zan_irgen_catch_cleanup_t *catch_cleanups;
     int catch_cleanup_count;

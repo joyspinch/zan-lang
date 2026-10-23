@@ -93,34 +93,6 @@
 - 探针：`_scratch/fsect/`（A/B 两组对象 + `main2.c` + 两个链接产物），`_scratch/sizeprobe/`（hello/bare 的 dev 与 publish 四份产物）。
 - 关联：A499（crypto 归档按族再切）、A493（crypto 已归档化）。
 
-### [ ] A495 八条 conformance 用例在 `--check-leaks` 下报泄漏——所有权欠账浮出
-
-- 现象（2026-10-22 合并测试孪生档时浮出）：这八条用例在 `--check-leaks` 下报
-  "memory leak detected"，对象在退出时仍可达——
-  `closure_cycle_warning`（4 个）、`null_guard_order`（1 个，
-  `conformance/null_guard_order.zan:10`）、`oss_storage`（27 个）、
-  `designer_html`（5256 个，JsonValue / PropertyGrid / Designer 一片）、
-  `designer_prepared_async`、`game_data_table`、
-  `gui_declarative_html_modern_test`、`sse_sink_take_co`。
-- **不是插桩带来的假阳性**：`--check-leaks` 单独编译也报同样的数，
-  `--arc-guard` 单独编译不报（`oss_storage` 在 `--check-leaks` 单独编译下还会
-  崩，0xC0000005；双插桩下不崩）。普通版（无插桩）输出与 golden 逐字节一致
-  ——功能面是好的，漏的是所有权。
-- 为什么现在才看见：旧世界里这八条只红在 `leakcheck_*` 孪生档上，而那条档属于
-  full 档，是发布门控、没人常规跑（AGENTS.md 规则 8）。2026-10-22 把四个孪生
-  档合成一条 `case_*`（一次插桩编译、一次运行同时给 conformance/泄漏/ARC 三
-  个结论）后，泄漏结论进了 standard 档，这八条当场浮出来。
-- 现状：这八条按仓库既有机制（孪生档的 `_known_leaky` + WILL_FAIL）登记成
-  "预期泄漏"——泄漏报告必须出现，修好了就翻红提醒把它从名单里拿掉；golden
-  走未插桩的普通版（泄漏报告打在 stdout 上，插桩版比不过 golden）。
-- 方向：这是所有权欠账，可能一半在 stdlib 容器/组件（闭包环、JsonValue 与
-  Dictionary 的字段持有、Designer 的对象图、SseSink 的缓冲），一半在代码生成
-  侧漏了释放，要逐条看站哪边。`closure_cycle_warning` 是**用例故意造环**，
-  它的正确归宿是"预期泄漏"而不是"修好"；其余七条该修。
-- 关联：`array_local_free` 是另一类——它量的是进程内存，插桩自己的记账
-  （几十 MB）把它测的东西搅了（普通版 "sync ok"，插桩版 "sync leaked 25492KB"）。
-  它的 golden 也走普通版，泄漏结论照常在插桩版上判。
-
 ### [ ] A464 运行期分配量统计缺失——托管分配没有可读的计数入口
 
 - 现象（2026-10-21 落地 Zan.Bench 时撞到）：基准测试要报"这次操作分配了

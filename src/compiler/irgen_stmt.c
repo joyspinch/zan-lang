@@ -1794,6 +1794,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
         LLVMBasicBlockRef saved_break = g->break_target;
         LLVMBasicBlockRef saved_cont = g->continue_target;
         int saved_loop_base = g->loop_locals_base;
+        int saved_break_base = g->break_locals_base;
         int saved_loop_cbase = g->loop_catch_base;
         int saved_loop_fbase = g->finally_loop_base;
         g->pending.break_scope = g->pending.scope;
@@ -1801,6 +1802,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
         g->break_target = end_bb;
         g->continue_target = cond_bb;
         g->loop_locals_base = body_start;
+        g->break_locals_base = body_start;
         g->loop_catch_base = g->catch_cleanup_count;
         g->finally_loop_base = g->finally_count;
         int saved_loop_ehbase = g->eh_armed_loop_base;
@@ -1827,6 +1829,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
         g->break_target = saved_break;
         g->continue_target = saved_cont;
         g->loop_locals_base = saved_loop_base;
+        g->break_locals_base = saved_break_base;
         g->loop_catch_base = saved_loop_cbase;
         g->finally_loop_base = saved_loop_fbase;
         g->eh_armed_loop_base = saved_loop_ehbase;
@@ -1853,6 +1856,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
         LLVMBasicBlockRef saved_break = g->break_target;
         LLVMBasicBlockRef saved_cont = g->continue_target;
         int saved_loop_base = g->loop_locals_base;
+        int saved_break_base = g->break_locals_base;
         int saved_loop_cbase = g->loop_catch_base;
         int saved_loop_fbase = g->finally_loop_base;
         g->pending.break_scope = g->pending.scope;
@@ -1860,6 +1864,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
         g->break_target = end_bb;
         g->continue_target = step_bb;
         g->loop_locals_base = for_body_start;
+        g->break_locals_base = for_body_start;
         g->loop_catch_base = g->catch_cleanup_count;
         g->finally_loop_base = g->finally_count;
         int saved_loop_ehbase = g->eh_armed_loop_base;
@@ -1901,6 +1906,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
         g->break_target = saved_break;
         g->continue_target = saved_cont;
         g->loop_locals_base = saved_loop_base;
+        g->break_locals_base = saved_break_base;
         g->loop_catch_base = saved_loop_cbase;
         g->finally_loop_base = saved_loop_fbase;
         g->eh_armed_loop_base = saved_loop_ehbase;
@@ -1917,7 +1923,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                 break;
             /* 同上：catch 异常先出栈，局部变量后出栈 */
             emit_release_active_catch_excs(g, g->loop_catch_base);
-            emit_release_owned_locals_range(g, locals, g->loop_locals_base);
+            emit_release_owned_locals_range(g, locals, g->break_locals_base);
             emit_eh_disarm_from(g, g->eh_armed_loop_base);
             emit_pending_scope_exit(g, g->pending.break_scope, false);
             LLVMBuildBr(g->builder, g->break_target);
@@ -1963,8 +1969,8 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
         g->pending.break_scope = g->pending.scope;
         LLVMBasicBlockRef sw_saved_break = g->break_target;
         g->break_target = end_bb;
-        int sw_saved_loop_base = g->loop_locals_base;
-        g->loop_locals_base = switch_start;
+        int sw_saved_break_base = g->break_locals_base;
+        g->break_locals_base = switch_start;
 
         bool has_patterns = false;
         for (int i = 0; i < stmt->switch_stmt.cases.count && !has_patterns; i++) {
@@ -2109,7 +2115,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
 
             g->pending.break_scope = sw_saved_pending_break;
             g->break_target = sw_saved_break;
-            g->loop_locals_base = sw_saved_loop_base;
+            g->break_locals_base = sw_saved_break_base;
             LLVMPositionBuilderAtEnd(g->builder, end_bb);
             break;
         }
@@ -2189,7 +2195,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
 
             g->pending.break_scope = sw_saved_pending_break;
             g->break_target = sw_saved_break;
-            g->loop_locals_base = sw_saved_loop_base;
+            g->break_locals_base = sw_saved_break_base;
             LLVMPositionBuilderAtEnd(g->builder, end_bb);
             break;
         }
@@ -2279,8 +2285,8 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
         }
 
         g->pending.break_scope = sw_saved_pending_break;
-            g->break_target = sw_saved_break;
-        g->loop_locals_base = sw_saved_loop_base;
+        g->break_target = sw_saved_break;
+        g->break_locals_base = sw_saved_break_base;
         LLVMPositionBuilderAtEnd(g->builder, end_bb);
         break;
     }
@@ -2666,6 +2672,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
         LLVMBasicBlockRef saved_break = g->break_target;
         LLVMBasicBlockRef saved_cont = g->continue_target;
         int saved_loop_base = g->loop_locals_base;
+        int saved_break_base = g->break_locals_base;
         int saved_loop_cbase = g->loop_catch_base;
         int saved_loop_fbase = g->finally_loop_base;
         int saved_loop_ehbase = g->eh_armed_loop_base;
@@ -2674,6 +2681,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
         g->break_target = end_bb;
         g->continue_target = cond_bb;
         g->loop_locals_base = body_start;
+        g->break_locals_base = body_start;
         g->loop_catch_base = g->catch_cleanup_count;
         g->finally_loop_base = g->finally_count;
         g->eh_armed_loop_base = g->eh_armed_count;
@@ -2717,6 +2725,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
         g->break_target = saved_break;
         g->continue_target = saved_cont;
         g->loop_locals_base = saved_loop_base;
+        g->break_locals_base = saved_break_base;
         g->loop_catch_base = saved_loop_cbase;
         g->finally_loop_base = saved_loop_fbase;
         g->eh_armed_loop_base = saved_loop_ehbase;
@@ -2882,6 +2891,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
         LLVMBasicBlockRef fe_saved_break = g->break_target;
         LLVMBasicBlockRef fe_saved_cont = g->continue_target;
         int fe_saved_loop_base = g->loop_locals_base;
+        int fe_saved_break_base = g->break_locals_base;
         int fe_saved_loop_cbase = g->loop_catch_base;
         int fe_saved_loop_fbase = g->finally_loop_base;
         int fe_saved_loop_ehbase = g->eh_armed_loop_base;
@@ -2890,6 +2900,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
         g->break_target = end_bb;
         g->continue_target = step_bb;
         g->loop_locals_base = fe_start;
+        g->break_locals_base = fe_start;
         g->loop_catch_base = g->catch_cleanup_count;
         g->finally_loop_base = g->finally_count;
         g->eh_armed_loop_base = g->eh_armed_count;
@@ -2984,6 +2995,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
             g->break_target = fe_saved_break;
             g->continue_target = fe_saved_cont;
             g->loop_locals_base = fe_saved_loop_base;
+            g->break_locals_base = fe_saved_break_base;
             g->loop_catch_base = fe_saved_loop_cbase;
             g->finally_loop_base = fe_saved_loop_fbase;
             g->eh_armed_loop_base = fe_saved_loop_ehbase;
@@ -3081,6 +3093,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
             g->break_target = fe_saved_break;
             g->continue_target = fe_saved_cont;
             g->loop_locals_base = fe_saved_loop_base;
+            g->break_locals_base = fe_saved_break_base;
             g->loop_catch_base = fe_saved_loop_cbase;
             g->finally_loop_base = fe_saved_loop_fbase;
             g->eh_armed_loop_base = fe_saved_loop_ehbase;
@@ -3145,6 +3158,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
         g->break_target = fe_saved_break;
         g->continue_target = fe_saved_cont;
         g->loop_locals_base = fe_saved_loop_base;
+        g->break_locals_base = fe_saved_break_base;
         g->loop_catch_base = fe_saved_loop_cbase;
         g->finally_loop_base = fe_saved_loop_fbase;
         g->eh_armed_loop_base = fe_saved_loop_ehbase;
@@ -3279,6 +3293,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                     int saved_throw_base = g->throw_locals_base;
                     int saved_throw_cbase = g->throw_catch_base;
                     int saved_loop_base = g->loop_locals_base;
+                    int saved_break_base = g->break_locals_base;
                     int saved_loop_cbase = g->loop_catch_base;
                     int saved_fin_lb = g->finally_loop_base;
                     int saved_eh_lb = g->eh_armed_loop_base;
@@ -3291,6 +3306,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                     g->throw_locals_base = f->throw_locals_base;
                     g->throw_catch_base = f->throw_catch_base;
                     g->loop_locals_base = f->loop_locals_base;
+                    g->break_locals_base = f->break_locals_base;
                     g->loop_catch_base = f->loop_catch_base;
                     g->finally_loop_base = f->finally_loop_base;
                     g->eh_armed_loop_base = f->eh_armed_loop_base;
@@ -3361,6 +3377,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                     g->throw_locals_base = saved_throw_base;
                     g->throw_catch_base = saved_throw_cbase;
                     g->loop_locals_base = saved_loop_base;
+                    g->break_locals_base = saved_break_base;
                     g->loop_catch_base = saved_loop_cbase;
                     g->finally_loop_base = saved_fin_lb;
                     g->eh_armed_loop_base = saved_eh_lb;
@@ -3416,6 +3433,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                 f->throw_locals_base = g->throw_locals_base;
                 f->throw_catch_base = g->throw_catch_base;
                 f->loop_locals_base = g->loop_locals_base;
+                f->break_locals_base = g->break_locals_base;
                 f->loop_catch_base = g->loop_catch_base;
                 f->finally_loop_base = g->finally_loop_base;
                 f->eh_armed_loop_base = g->eh_armed_loop_base;

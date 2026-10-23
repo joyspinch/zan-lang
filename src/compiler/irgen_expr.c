@@ -4396,21 +4396,36 @@ static LLVMValueRef emit_null_coalesce(zan_irgen_t *g, zan_ast_node_t *expr,
 
     LLVMBasicBlockRef left_bb = LLVMGetInsertBlock(g->builder);
     LLVMBasicBlockRef rhs_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "coal.rhs");
+    LLVMBasicBlockRef lhs_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "coal.lhs");
     LLVMBasicBlockRef merge = LLVMAppendBasicBlockInContext(g->ctx, fn, "coal.end");
-    LLVMBuildCondBr(g->builder, is_null, rhs_bb, merge);
+    LLVMBuildCondBr(g->builder, is_null, rhs_bb, lhs_bb);
+
+    LLVMPositionBuilderAtEnd(g->builder, lhs_bb);
+    int left_owned = expr_yields_owned_rc_value(g, expr->binary.left, locals);
+    int right_owned = expr_yields_owned_rc_value(g, expr->binary.right, locals);
+    zan_type_t *coal_type = infer_expr_type(g, expr, locals);
+    if (!coal_type) coal_type = lst;
+    if (coal_type && is_rc_managed_type(coal_type) && !left_owned && right_owned) {
+        emit_rc_retain_for_type(g, coal_type, lres);
+    }
+    LLVMBasicBlockRef lhs_end = LLVMGetInsertBlock(g->builder);
+    LLVMBuildBr(g->builder, merge);
 
     LLVMPositionBuilderAtEnd(g->builder, rhs_bb);
     LLVMValueRef right = emit_expr(g, expr->binary.right, locals);
     LLVMBasicBlockRef rhs_end = LLVMGetInsertBlock(g->builder);
-    LLVMBuildBr(g->builder, merge);
-
-    LLVMPositionBuilderAtEnd(g->builder, merge);
     LLVMValueRef rres = right;
     if (l_nullable && LLVMTypeOf(right) != res_ty)
         rres = coerce_int_to(g, right, res_ty);
+    if (coal_type && is_rc_managed_type(coal_type) && left_owned && !right_owned) {
+        emit_rc_retain_for_type(g, coal_type, rres);
+    }
+    LLVMBuildBr(g->builder, merge);
+
+    LLVMPositionBuilderAtEnd(g->builder, merge);
     LLVMValueRef phi = LLVMBuildPhi(g->builder, res_ty, "coal");
     LLVMValueRef vals[] = { lres, rres };
-    LLVMBasicBlockRef bbs[] = { left_bb, rhs_end };
+    LLVMBasicBlockRef bbs[] = { lhs_end, rhs_end };
     LLVMAddIncoming(phi, vals, bbs, 2);
     return phi;
 }
@@ -7228,7 +7243,9 @@ static LLVMValueRef emit_expr_member_access(zan_irgen_t *g, zan_ast_node_t *expr
                     arr = emit_soft_base_select(g, arr, isnull,
                                                 expr->member.object->loc);
                 }
-                return zan_array_len(g, arr);
+                LLVMValueRef len = zan_array_len(g, arr);
+                emit_release_owned_call_temp(g, expr->member.object, arr, locals);
+                return len;
             }
         }
         if (expr->member.name.len == 6 &&
@@ -7244,7 +7261,9 @@ static LLVMValueRef emit_expr_member_access(zan_irgen_t *g, zan_ast_node_t *expr
                     arr = emit_soft_base_select(g, arr, isnull,
                                                 expr->member.object->loc);
                 }
-                return zan_array_len(g, arr);
+                LLVMValueRef len = zan_array_len(g, arr);
+                emit_release_owned_call_temp(g, expr->member.object, arr, locals);
+                return len;
             }
         }
 
@@ -12815,6 +12834,7 @@ static LLVMValueRef emit_lambda_typed(zan_irgen_t *g, zan_ast_node_t *expr,
     LLVMBasicBlockRef saved_break = g->break_target;
     LLVMBasicBlockRef saved_continue = g->continue_target;
     int saved_loop_base = g->loop_locals_base;
+    int saved_break_base = g->break_locals_base;
     int saved_loop_cbase = g->loop_catch_base;
     zan_irgen_finally_entry_t *saved_finallys = NULL;
     zan_irgen_catch_cleanup_t *saved_catches = NULL;
@@ -12840,6 +12860,7 @@ static LLVMValueRef emit_lambda_typed(zan_irgen_t *g, zan_ast_node_t *expr,
     g->break_target = NULL;
     g->continue_target = NULL;
     g->loop_locals_base = 0;
+    g->break_locals_base = 0;
     g->loop_catch_base = 0;
     g->eh_armed_base = g->eh_armed_count;
     g->eh_armed_loop_base = g->eh_armed_count;
@@ -12963,6 +12984,7 @@ static LLVMValueRef emit_lambda_typed(zan_irgen_t *g, zan_ast_node_t *expr,
     g->break_target = saved_break;
     g->continue_target = saved_continue;
     g->loop_locals_base = saved_loop_base;
+    g->break_locals_base = saved_break_base;
     g->loop_catch_base = saved_loop_cbase;
     if (saved_fin_c && saved_finallys) {
         memcpy(g->finallys, saved_finallys,

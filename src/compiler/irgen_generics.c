@@ -502,6 +502,10 @@ static int expr_yields_owned_rc_value(zan_irgen_t *g, zan_ast_node_t *e,
         }
     }
     if (e->kind == AST_BINARY) {
+        if (e->binary.op == TK_QUESTION_QUESTION) {
+            return expr_yields_owned_rc_value(g, e->binary.left, locals) ||
+                   expr_yields_owned_rc_value(g, e->binary.right, locals);
+        }
         if (e->binary.op == TK_PLUS && is_string_expr(g, e, locals)) {
             return 1;
         }
