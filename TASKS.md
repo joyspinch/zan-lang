@@ -1865,3 +1865,21 @@
   自然尺寸的最小值——图标钮按图标尺寸、文本钮按文字宽度）；③ 停靠子项不再被
   `FitSize` 裁到 0 宽（不足时溢出或隐藏，而不是 0 宽）。
 - 模板侧已用等价的全局规则绕开（gui-wechat 皮肤层 `.shrink-0`），修法见 A544。
+
+### [ ] A546 框架：普通 HTML 里的 `<label>` 是元素，静态文字排不出来
+- 现象：微聊模板的**登录窗**实机渲染缺字——标题「微 聊」与三个入口
+  （注册账号/修改密码/忘记密码）全是 `<label>` 元素，**一个字都不画**；同文档里
+  的 `<div>` 文字（头像里的「微」）正常。复现：把登录文档建进宿主窗再 dump 像素
+  （`_scratch/probe_host.ps1 -Mode loginhtml`）。
+- 根因：`Style.UaCss()` 的 UA 表只给「纯布局/排版 tag」声明 display，`label` 因为
+  与真控件 `Label` 撞名被**故意排除**（注释写明「避免改变现有控件的 display 归类」）。
+  于是普通 HTML 路径里的 `<label>` 建成 `Gui.Element`（Kind()="label"），没有 display
+  归类 → 它的块流文字排不出来（元素高度 0、字不画）。设计器路径把 label 映射成
+  `Label` 控件，两条路径对同一个标签的语义不一致。
+- 候选修法（需专门一轮 + 重建 Gui 驱动）：① `Html.Build` 与 GenHtml 都把 `label`
+  映射成 `Label` 控件（与设计器路径对齐，文字照常画，`data-on-click` 照常接）；
+  ② UA 表补 `label { display: block; }`——但它会连带改 `Label` **控件**的 display
+  归类（这正是 UA 注释顾虑的点），要先在 IDE 里验一遍。
+- 前置：`packages/Zan.Gui/src/Gui/drivers/win-x64/*` 的驱动二进制当前是**另一会话的
+  在途改动**，这轮不重建驱动；模板侧先用 `<div>` 顶上（登录窗已改，见提交）。
+
