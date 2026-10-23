@@ -1374,21 +1374,28 @@ int32_t zan_async_cfg_io_shards(void) { return (int32_t)__atomic_load_n(&g_cfg_i
 int32_t zan_async_cfg_sync_fast(void) { return (int32_t)__atomic_load_n(&g_cfg_sync_fast, __ATOMIC_ACQUIRE); }
 
 void zan_rt_dbl_str(char *buf, unsigned long long cap, double v) {
-    if (v != v) { snprintf(buf, (size_t)cap, "NaN"); return; }
-    if (v == 0.0) { snprintf(buf, (size_t)cap, signbit(v) ? "-0" : "0"); return; }
-    const char *sign = (v < 0.0) ? "-" : "";
+    int is_flt = (cap & 0x8000000000000000ULL) != 0;
+    size_t actual_cap = (size_t)(cap & ~0x8000000000000000ULL);
+    if (v != v) { snprintf(buf, actual_cap, "NaN"); return; }
+    if (v == 0.0) { snprintf(buf, actual_cap, signbit(v) ? "-0" : "0"); return; }
+    const char *sign = signbit(v) ? "-" : "";
     double a = (v < 0.0) ? -v : v;
-    if (a > 1.7976931348623157e308) {
-        snprintf(buf, (size_t)cap, "%sInfinity", sign);
+    if (is_flt ? (a > 3.402823466e+38) : (a > 1.7976931348623157e308)) {
+        snprintf(buf, actual_cap, "%sInfinity", sign);
         return;
     }
     char m[40];
     int p;
-    for (p = 1; p < 17; p++) {
+    int max_p = is_flt ? 10 : 17;
+    for (p = 1; p < max_p; p++) {
         snprintf(m, sizeof m, "%.*e", p - 1, v);
-        if (strtod(m, NULL) == v) break;
+        if (is_flt) {
+            if (strtof(m, NULL) == (float)v) break;
+        } else {
+            if (strtod(m, NULL) == v) break;
+        }
     }
-    if (p == 17) snprintf(m, sizeof m, "%.16e", v);
+    if (p == max_p) snprintf(m, sizeof m, is_flt ? "%.9e" : "%.16e", v);
 
     /* split "-d */
     char *q = (*m == '-') ? m + 1 : m;
@@ -1409,13 +1416,13 @@ void zan_rt_dbl_str(char *buf, unsigned long long cap, double v) {
             memset(zeros, '0', (size_t)z);
             zeros[z] = 0;
             snprintf(out, sizeof out, "%s%s%s", sign, sig, zeros);
-    } else if (e10 >= 0) {
-        int h = e10 + 1;
-        if (sig[h])
-            snprintf(out, sizeof out, "%s%.*s.%s", sign, h, sig, sig + h);
-        else
-            snprintf(out, sizeof out, "%s%.*s", sign, h, sig);
-    } else {
+        } else if (e10 >= 0) {
+            int h = e10 + 1;
+            if (sig[h])
+                snprintf(out, sizeof out, "%s%.*s.%s", sign, h, sig, sig + h);
+            else
+                snprintf(out, sizeof out, "%s%.*s", sign, h, sig);
+        } else {
             /* |v| < 1: 0. + (-e10-1) zeros + digits */
             char zeros[8];
             int z = -e10 - 1;
@@ -1431,7 +1438,11 @@ void zan_rt_dbl_str(char *buf, unsigned long long cap, double v) {
         else
             snprintf(out, sizeof out, "%s%sE%+03d", sign, sig, e10);
     }
-    snprintf(buf, (size_t)cap, "%s", out);
+    snprintf(buf, actual_cap, "%s", out);
+}
+
+void zan_rt_flt_str(char *buf, unsigned long long cap, float v) {
+    zan_rt_dbl_str(buf, cap | 0x8000000000000000ULL, (double)v);
 }
 
 double zan_rt_dbl_parse(const char *s, char **endp) {

@@ -1181,11 +1181,15 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                         (LLVMTypeRef[]){ LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0) },
                         1, 0);
                     zan_call2(g->builder, fn_type, g->rt_println, &arg, 1, "");
-                } else if (LLVMGetTypeKind(arg_type) == LLVMDoubleTypeKind ||
-                           LLVMGetTypeKind(arg_type) == LLVMFloatTypeKind) {
+                } else if (LLVMGetTypeKind(arg_type) == LLVMFloatTypeKind) {
+                    LLVMTypeRef flt = LLVMFloatTypeInContext(g->ctx);
+                    LLVMTypeRef fn_type = LLVMFunctionType(
+                        LLVMVoidTypeInContext(g->ctx),
+                        (LLVMTypeRef[]){ flt },
+                        1, 0);
+                    zan_call2(g->builder, fn_type, g->rt_print_float, &arg, 1, "");
+                } else if (LLVMGetTypeKind(arg_type) == LLVMDoubleTypeKind) {
                     LLVMTypeRef dbl = LLVMDoubleTypeInContext(g->ctx);
-                    if (LLVMGetTypeKind(arg_type) == LLVMFloatTypeKind)
-                        arg = LLVMBuildFPExt(g->builder, arg, dbl, "print.ext");
                     LLVMTypeRef fn_type = LLVMFunctionType(
                         LLVMVoidTypeInContext(g->ctx),
                         (LLVMTypeRef[]){ dbl },

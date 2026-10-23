@@ -4097,6 +4097,7 @@ static void zan_prepare_static_runtime(zan_irgen_t *g,
 
     LLVMValueRef helpers[] = {
         g->rt_println, g->rt_print_int, g->rt_print_uint, g->rt_print_double,
+        g->rt_print_float,
         g->rt_retain, g->rt_release, g->rt_release_dyn, g->rt_alloc,
         g->rt_str_retain, g->rt_str_release, g->rt_str_alloc,
         g->rt_arr_retain, g->rt_arr_release,

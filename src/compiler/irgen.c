@@ -1775,6 +1775,35 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
     }
     LLVMBuildRetVoid(g->builder);
 
+    LLVMTypeRef pflt_args[] = { LLVMFloatTypeInContext(g->ctx) };
+    LLVMTypeRef pflt_type = LLVMFunctionType(
+        LLVMVoidTypeInContext(g->ctx), pflt_args, 1, 0);
+    g->rt_print_float = LLVMAddFunction(g->mod, "zan_rt_print_float", pflt_type);
+
+    LLVMBasicBlockRef pflt_entry = LLVMAppendBasicBlockInContext(g->ctx, g->rt_print_float, "entry");
+    LLVMPositionBuilderAtEnd(g->builder, pflt_entry);
+    {
+        LLVMTypeRef i8p_t = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+        LLVMTypeRef i64_t = LLVMInt64TypeInContext(g->ctx);
+        LLVMTypeRef ds_fn_ty = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx),
+            (LLVMTypeRef[]){ i8p_t, i64_t, LLVMDoubleTypeInContext(g->ctx) }, 3, 0);
+        LLVMValueRef ds_fn = LLVMGetNamedFunction(g->mod, "zan_rt_dbl_str");
+        if (!ds_fn) ds_fn = LLVMAddFunction(g->mod, "zan_rt_dbl_str", ds_fn_ty);
+        LLVMValueRef ds_buf = LLVMBuildAlloca(g->builder,
+            LLVMArrayType(LLVMInt8TypeInContext(g->ctx), 40), "pflt.buf");
+        LLVMValueRef ds_bufp = LLVMBuildBitCast(g->builder, ds_buf, i8p_t,
+                                                "pflt.bufp");
+        LLVMValueRef ext_arg = LLVMBuildFPExt(g->builder,
+            LLVMGetParam(g->rt_print_float, 0), LLVMDoubleTypeInContext(g->ctx), "flt.ext");
+        LLVMValueRef ds_args[] = { ds_bufp,
+            LLVMConstInt(i64_t, 40ULL | 0x8000000000000000ULL, 0), ext_arg };
+        zan_call2(g->builder, ds_fn_ty, ds_fn, ds_args, 3, "");
+        LLVMValueRef nl_fmt = zan_irgen_intern_string(g, "%s\n");
+        LLVMValueRef dargs[] = { nl_fmt, ds_bufp };
+        zan_call2(g->builder, printf_type, printf_fn, dargs, 2, "");
+    }
+    LLVMBuildRetVoid(g->builder);
+
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
     LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
     LLVMTypeRef i32 = LLVMInt32TypeInContext(g->ctx);
@@ -4208,9 +4237,13 @@ static void emit_dbl_str(zan_irgen_t *g, LLVMValueRef buf, LLVMValueRef cap,
     LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "zan_rt_dbl_str");
     if (!fn) fn = LLVMAddFunction(g->mod, "zan_rt_dbl_str", fn_ty);
     LLVMValueRef arg = v;
-    if (LLVMGetTypeKind(LLVMTypeOf(v)) == LLVMFloatTypeKind)
+    LLVMValueRef cap_val = cap;
+    if (LLVMGetTypeKind(LLVMTypeOf(v)) == LLVMFloatTypeKind) {
         arg = LLVMBuildFPExt(g->builder, v, dbl, "dbl.ext");
-    LLVMValueRef args[] = { buf, cap, arg };
+        cap_val = LLVMBuildOr(g->builder, cap,
+            LLVMConstInt(i64t, 0x8000000000000000ULL, 0), "cap.flt");
+    }
+    LLVMValueRef args[] = { buf, cap_val, arg };
     zan_call2(g->builder, fn_ty, fn, args, 3, "");
 }
 

@@ -28,6 +28,7 @@ void zan_rt_set_fatal_handler(zan_fatal_fn fn);
 void zan_rt_fatal(const char *category, const char *message);
 unsigned char *zan_rt_soft_scratch(void);
 void zan_rt_dbl_str(char *buf, unsigned long long cap, double v);
+void zan_rt_flt_str(char *buf, unsigned long long cap, float v);
 /* double */
 double zan_rt_dbl_parse(const char *s, char **endp);
 int zan_utf8_argv(int *argc, char ***argv);

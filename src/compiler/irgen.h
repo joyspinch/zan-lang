@@ -168,6 +168,7 @@ struct zan_irgen {
     LLVMValueRef rt_print_int; /* zan_rt_print_int(int64) */
     LLVMValueRef rt_print_uint; /* zan_rt_print_uint(uint64) */
     LLVMValueRef rt_print_double; /* zan_rt_print_double(double) */
+    LLVMValueRef rt_print_float; /* zan_rt_print_float(float) */
 
     LLVMValueRef fn_snprintf;
     LLVMValueRef fn_malloc;

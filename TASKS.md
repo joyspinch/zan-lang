@@ -367,7 +367,12 @@
   在 `v == 0.0` 时通过 `signbit(v)` 判定符号位，对 `-0.0` 准确输出 `"-0"`（C# .NET 8 口径），
   双端（宿主 zanc 与自举 DblToStr）经运行时共用同一份实现自动生效。
   新增 conformance 用例 `tests/conformance/double_print_format.{zan,out}` 并入差分门。
-- 待办：其余件（float 按单精度展开、未捕获异常输出格式）按需逐件；自举半边。
+- **单精度 float 格式化与负零保持已修（2026-10-23）**：
+  - 运行时 `src/runtime/rt_timer.c`（`zan_rt_dbl_str`/`zan_rt_flt_str`）支持单精度最短往返展开（`strtof` 搜索 `p=1..9` 精度，`0.1f + 0.2f` 输出 `"0.3"`，`-0.0f` 准确输出 `"-0"`）；
+  - 宿主 `zanc`（`irgen.c`/`irgen_call.c`/`main.c`）为 `Console.WriteLine` 补齐 `g->rt_print_float`，`emit_dbl_str` 自动标记单精度符号位，使得 `float.ToString()`、`Console.Write/WriteLine`、字符串插值与拼接均遵循单精度 C# .NET 8 shortest-round-trip 规范；
+  - 自举编译器（`src/selfhost/irgen_expr.zan`）同步支持 `FltToStr`，双端生成一致语义；
+  - conformance 用例 `tests/conformance/double_print_format.{zan,out}` 扩充单精度覆盖，差分门通过。
+- 待办：其余件（未捕获异常输出格式）按需逐件。
 - bool 全路径小写 true/false（五条渲染路径内部一致；C# True/False——A441 闭账口径=统一，非 .NET 口径，协议/日志大小写敏感场景有实害）。
 - `char.ToString()` 返回码点数字 "65"（C# "A"；WriteLine(char) 与拼接却正确——渲染路径互相不一致）。
 - `-0.0` 打印丢符号（C# "-0"）；float 打印按 double 展开（0.1f+0.2f→"0.30000001192092896"，C# "0.3"）。
