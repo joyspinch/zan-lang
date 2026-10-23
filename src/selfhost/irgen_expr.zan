@@ -2294,25 +2294,54 @@ partial class Irgen {
             string sflat = idx.op;
             int srk = ArrRankOf(obj.ty);
             if (srk > 1) { sflat = MdFlatIndex(lhs, obj.op, srk, idx.op); }
+            // A507② 自举半边：越界元素 store 曾完全无界——直接写穿真实内
+            // 存（宿主至少钳位槽 0）。补软诊断 + 软基址：OOB 时元素地址换
+            // scratch 槽，写落 scratch 不伤真实元素（诊断 + 数据保住，与宿
+            // 主同口径）。
+            string lp2s = NT();
+            L("  " + lp2s + " = getelementptr i64, i64* " + obj.op + ", i64 -1");
+            string ln2s = NT();
+            L("  " + ln2s + " = load i64, i64* " + lp2s);
+            string inegs = NT();
+            L("  " + inegs + " = icmp slt i64 " + sflat + ", 0");
+            string iges = NT();
+            L("  " + iges + " = icmp sge i64 " + sflat + ", " + ln2s);
+            string oobs = NT();
+            L("  " + oobs + " = or i1 " + inegs + ", " + iges);
+            EmitRuntimeCheckIf(lhs, oobs, "index out of bounds: array store");
+            if (!ExternSeen("__zan_soft_scratch")) {
+                externDecls.Add("__zan_soft_scratch");
+                H("@__zan_soft_scratch = internal global [64 x i8] zeroinitializer");
+            }
+            string scrb = NT();
+            L("  " + scrb + " = getelementptr inbounds [64 x i8], [64 x i8]* @__zan_soft_scratch, i64 0, i64 0");
             string p = NT();
             if (esz == 1) {
                 // a byte array: one byte per element
                 string ab = NT();
                 L("  " + ab + " = bitcast i64* " + obj.op + " to i8*");
                 L("  " + p + " = getelementptr i8, i8* " + ab + ", i64 " + sflat);
+                string psel = NT();
+                L("  " + psel + " = select i1 " + oobs + ", i8* " + scrb + ", i8* " + p);
                 if (IsStructTy(v.ty)) {
                     ExprVal c = CopyStructValue(v);
-                    ArrElemStore(p, 1, ToI64(c.op, MapType(c.ty)));
+                    ArrElemStore(psel, 1, ToI64(c.op, MapType(c.ty)));
                     return;
                 }
-                ArrElemStore(p, 1, ToI64(v.op, MapType(v.ty)));
+                ArrElemStore(psel, 1, ToI64(v.op, MapType(v.ty)));
                 return;
             }
             L("  " + p + " = getelementptr i64, i64* " + obj.op + ", i64 " + sflat);
+            string p64s = NT();
+            {
+                string p64b = NT();
+                L("  " + p64b + " = bitcast i8* " + scrb + " to i64*");
+                L("  " + p64s + " = select i1 " + oobs + ", i64* " + p64b + ", i64* " + p);
+            }
             // a struct element is a value: the array holds its own copy
             if (IsStructTy(v.ty)) {
                 ExprVal c = CopyStructValue(v);
-                L("  store i64 " + ToI64(c.op, MapType(c.ty)) + ", i64* " + p);
+                L("  store i64 " + ToI64(c.op, MapType(c.ty)) + ", i64* " + p64s);
                 return;
             }
             // a NULLABLE element is a pointer slot: the value is boxed
@@ -2321,7 +2350,7 @@ partial class Irgen {
                 string bx = BoxFor(v, elemTy);
                 string bi = NT();
                 L("  " + bi + " = ptrtoint i8* " + bx + " to i64");
-                L("  store i64 " + bi + ", i64* " + p);
+                L("  store i64 " + bi + ", i64* " + p64s);
                 return;
             }
             if (ArcManaged(v.ty)) { EmitArcRetain(v.op, v.ty); }
@@ -2340,7 +2369,7 @@ partial class Irgen {
                     v = new ExprVal(F32Round(v.op), v.ty);
                 }
             }
-            L("  store i64 " + ToI64(v.op, MapType(v.ty)) + ", i64* " + p);
+            L("  store i64 " + ToI64(v.op, MapType(v.ty)) + ", i64* " + p64s);
             return;
         }
     }

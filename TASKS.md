@@ -37,6 +37,17 @@
     未覆盖：多维数组 store（emit_mdarray_elem_ptr 内部仍钳位）、字段/成员
     链形状的部分位点，见待办。
 - 待办：① 全线可 catch 异常通道（对齐 C#，最终口径）；② 多维数组与剩余
+- **自举半边·越界写跳写已修（2026-10-23，goal round 8）**：selfhost 的数
+  组元素 store 曾**完全无界**（比宿主钳位更糟——直接写穿真实内存）。在
+  StoreTo 的数组分支（含字节/struct/可空盒/浮点槽四形状）补：长度槽
+  （-1）读出 + `idx<0 || idx>=len` 谓词 → EmitRuntimeCheckIf 软诊断
+  （`index out of bounds: array store`，once-per-text + strict exit 70）
+  + 软基址 select（OOB 时元素指针换 @__zan_soft_scratch 64 字节零槽）。
+  复验：`a[9]=99`、`b[7]=250` 经 gen1 出 IR——两条诊断常量各在调用点
+  行:列、i64 与 i8 两条 select 分派齐全、clang -c 过；OOB 写落 scratch、
+  a[0..2] 与 b[0] 保住。多维数组走同一 flat 谓词（flat 空间受同一计数
+  约束）；List/Span/string 的 store 走 zlist_set/SpanElemPtr/glyph 写，
+  未在本件（登记见待办）。
 - **自举半边·null 接收者方法调用已修（2026-10-23，goal round 5）**：
   selfhost 实例方法分派点补 guard——`icmp eq null` → EmitRuntimeCheckIf
   软诊断（点名接收者，`<unknown>:行:列`，自举无按节点文件名与宿主 A508
