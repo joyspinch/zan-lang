@@ -90,6 +90,13 @@
 - 复验：`l[9]=99`、`s[7]=c` 经 gen1 出 IR——List 跳过分支与 string
   select 齐全、诊断常量在位（once-per-text 由 zan_rt_soft_note 承担）、
   clang -c 过；正常写 `l[1]=5`、`s[1]=X` 不受影响。
+- **自举半边·二维+矩形数组越界写跳写补齐（2026-10-23，7e9234a83）**：
+  一维 store 的总长谓词对二维失效——MdFlatIndex 的 MdIdxSafe 把越界下标
+  **钳到 0** 再折叠，`a[1,5]` 的扁平值 9 落在总长 12 之内，检查永假、
+  写进合法邻居单元 a[1,0]（诊断报了、数据照脏）。修法：MdFlatIndex 在
+  折叠时按 MdTrackOob 门控逐维累计越界 OR（读路径不置位、IR 逐字节不
+  变），StoreTo 二维+ 分支用逐维真谓词并入 scratch 选择——宿主
+  emit_index_oob_pred 逐维 or 合并同款。array_oob_store_safe 全绿。
 - **自举半边·越界写跳写已修（2026-10-23，goal round 8）**：selfhost 的数
   组元素 store 曾**完全无界**（比宿主钳位更糟——直接写穿真实内存）。在
   StoreTo 的数组分支（含字节/struct/可空盒/浮点槽四形状）补：长度槽
@@ -240,6 +247,14 @@
   改走 `zan_rt_dbl_parse`（strtod + C# NaN/Infinity 字面量，同宿主）。17 形
   探针 stdout 两侧逐行一致（含 long.Parse 的 int32 钳制与 Convert.ToInt64
   的不钳制），TryParse 路径不动（正确出口）。
+- **自举半边·整型实参范围与 ERANGE 补齐（2026-10-23，7e9234a83）**：
+  ①整型实参路径（`ConvertIsIntegral` 直通分支）对 ValWidth≥64 的实参补
+  int 范围软诊断（宿主 irgen_call.c:2232 同款）——ToInt32(2147483648L)
+  曾静默回绕成 -2147483648；②字符串路径补 errno=ERANGE 判定（_errno
+  先清零、strtoll 后读回比对 34，宿主 2160 同款）——ToInt64 的超 long
+  数字串曾静默饱和成 INT64_MAX/MIN，与恰好极值字面量同形、唯 errno
+  可分辨。convert_overflow 用例（2^31 上下侧、ToInt64 双向饱和、极值
+  不误杀）逐字对齐黄金。
 - **用例收口（2026-10-23）**：新增 conformance 用例 `tests/conformance/convert_overflow.{zan,out}`
   （验证 ToInt32 溢出 2^31 软诊断置 0、全宽 ToInt64 放行、边界值准确性），并入自举差分门 `tests/selfhost/diff_cases.txt`。
 - 待办：可 catch 的 FormatException/OverflowException 通道（A507 族）。
