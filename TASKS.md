@@ -205,6 +205,8 @@
   改走 `zan_rt_dbl_parse`（strtod + C# NaN/Infinity 字面量，同宿主）。17 形
   探针 stdout 两侧逐行一致（含 long.Parse 的 int32 钳制与 Convert.ToInt64
   的不钳制），TryParse 路径不动（正确出口）。
+- **用例收口（2026-10-23）**：新增 conformance 用例 `tests/conformance/convert_overflow.{zan,out}`
+  （验证 ToInt32 溢出 2^31 软诊断置 0、全宽 ToInt64 放行、边界值准确性），并入自举差分门 `tests/selfhost/diff_cases.txt`。
 - 待办：可 catch 的 FormatException/OverflowException 通道（A507 族）。
 - 原始实测：`Convert.ToInt32("abc")`、`int.Parse("abc")`、`Convert.ToDouble("xyz")` 全返 0 继续；`"2147483648"` 溢出静默接受（还借 A510 打出 64 位值）。C#：FormatException/OverflowException。
 - `int.TryParse` 存在且正常——失败语义应与它对齐或补异常通道。
