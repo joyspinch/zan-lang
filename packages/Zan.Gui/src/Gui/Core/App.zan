@@ -6810,6 +6810,30 @@ public class App {
         this.holdEvArmed = true;
     }
 
+    // ---- 键盘事件的「一次性消费」 -------------------------------------
+    // 原生事件槽里的键盘事件（kind 4 按下 / 5 抬起 / 6 字符）一直留到
+    // 下一次轮询为止；这段时间里窗口可能渲染多帧（子窗几乎每帧都脏，
+    // 一次按键会引发「输入框变了 → 标脏 → 再渲染」），于是同一个字符
+    // 被反复投递给输入框：输一个 "4" 得 "44"，退格一次删两个字符。
+    //
+    // 修法：控件真正吃下这个键时记下事件序号，EventKind() 之后不再
+    // 把它投递出去——一个键只归一个消费者（与 ClaimClick 同思路，
+    // 但按事件序号而不是按帧：跨帧的重复渲染也要挡住）。
+    bool keyClaimed;
+    long keyClaimSeq;
+
+    // 标记当前键盘事件已被本窗口的控件消费。
+    void ClaimKey() {
+        this.keyClaimed = true;
+        this.keyClaimSeq = Window.EventSeqGlobal();
+    }
+
+    // 当前键盘事件是否已被消费（同一件事件序号才算）。
+    bool KeyConsumed() {
+        return this.keyClaimed &&
+            this.keyClaimSeq == Window.EventSeqGlobal();
+    }
+
     // 正在处理的 OS 事件类型；当事件属于
     // 其他窗口时为 0（"无事件"）。原生事件状态是
     // 进程全局的：直接读取 window.EventKind() 的表面也会看到
@@ -6818,8 +6842,17 @@ public class App {
     // 都必须询问其 App，而非共享的原生状态。
     // 原生状态已被清（排空后的空轮询）且宿主挂住了本帧事件时，
     // 回退到挂住值（见 HoldEventKind）。
+    // 键盘事件是否已被控件消费掉（只有 kind 4/5/6 受此闸门约束；
+    // 鼠标/滚轮事件另有 ClaimClick 之类的闸门）。
+    bool KeyBlocked(int kind) {
+        return (kind == 4 || kind == 5 || kind == 6) && this.KeyConsumed();
+    }
+
     int EventKind() {
-        if (window.GetHandle() == 0) { return this.NormalizedKind(); }
+        if (window.GetHandle() == 0) {
+            int kind0 = this.NormalizedKind();
+            return this.KeyBlocked(kind0) ? 0 : kind0;
+        }
         nint evh = Window.EventHwnd();
         if (evh != window.GetHandle()) {
             if (evh == 0 && this.holdEvArmed
@@ -6828,7 +6861,9 @@ public class App {
             }
             return 0;
         }
-        return this.NormalizedKind();
+        int kind = this.NormalizedKind();
+        /* 已被控件消费掉的键盘事件不再重复投递（见 ClaimKey）。 */
+        return this.KeyBlocked(kind) ? 0 : kind;
     }
 
     // 当正在处理的事件投递到了本 App 的窗口时为真。
