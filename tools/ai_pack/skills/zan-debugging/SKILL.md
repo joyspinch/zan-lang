@@ -160,3 +160,25 @@ one.
   永远不来的回复——双端死锁且无任何报错。定式：长度域先 `put32(0)`
   占位，消息体写完后把总长（含长度域自身）回填 `buf[0..3]`
   （PG StartupMessage 实测：估算 79、实际 77，两字节之差=互等挂死）。
+
+## 服务端 HTTP 全被 RST、访问日志无记录：先查控制端口被谁占着（Zan.Net master/worker 实测）
+
+- 症状：master 打印 `Start success`、路由表有 N 条，但每个 HTTP 请求发出去
+  就被 RST（"Connection was aborted"），**服务端访问日志里根本没有这次
+  请求**；换成单 worker 模式一样失败。这时查业务代码没有意义——请求压根
+  没进到应用层。
+- 先看端口归属：控制端口默认是业务端口 + 10000。用
+  `Get-NetTCPConnection -LocalPort <ctlPort>` 找出 Established 连接的
+  `OwningProcess`，再 `Get-CimInstance Win32_Process -Filter "ProcessId=<pid>"`
+  看是哪个 exe 占着——实测是**另一个项目**两天前残留的服务进程。
+- 机制：master 认领控制端口前先探测一次，"连上了但应答不是本应用的
+  PING/PONG 协议"**不是"空闲"**。旧实现把它判成空闲，于是用
+  `SO_REUSEADDR` 再绑一次同一端口——Windows 允许与在监听的端口并存
+  绑定，于是本应用的 worker 把 HELLO/CHAN 握手发给外来的占用者，
+  master 永远等不到通道，master 受理的每个请求都被直接 RST。
+- 定式：控制端口上"连得上但应答不是 PONG" = **被占** → 改用邻近端口，
+  绝不复用（实现在 Zan.Net 包的 `Worker.zan` 控制端口探测里；仓库的
+  conformance 目录有钉住这条语义的回归用例）。
+- 这类故障没有别的证据面：服务端没有日志、客户端只见 RST，靠
+  `ZAN_WORKER_DEBUG=1` 打 master/worker 交接轨迹（ctl accepted /
+  ctl handshake / worker sent CHAN）才定位得到。

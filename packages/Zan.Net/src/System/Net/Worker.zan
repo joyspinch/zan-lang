@@ -132,7 +132,8 @@ public class Worker {
     private static extern long strlen(string str);
     static bool debugLog = false;
     // 调试跟踪输出：SetDebug(true) 时打印 master/worker 交接与握手轨迹。
-    private static void Dbg(string msg) {
+    // public：HTTP/WS 分片（不同命名空间）也要打同一条轨迹。
+    public static void Dbg(string msg) {
         if (!debugLog) { return; }
         Console.WriteLine("[dbg] " + msg);
         #if WINDOWS
@@ -145,6 +146,17 @@ public class Worker {
     #endif
     private static void SetDebug(bool on) {
         debugLog = on;
+    }
+
+    // 环境变量开关：ZAN_WORKER_DEBUG=1 时打开交接轨迹。Windows 的
+    // master→worker 套接字移交一旦断在半路（客户端只看到 RST、服务端
+    // 访问日志里没有这次请求），没有轨迹就无从定位——这条日志是唯一的
+    // 证据面。默认关闭（不影响生产路径的输出量）。
+    private static void InitDebugFromEnv() {
+        string v = Environment.GetEnvironmentVariable("ZAN_WORKER_DEBUG");
+        if (v == null || v.Length == 0) { return; }
+        if (v == "0") { return; }
+        debugLog = true;
     }
 
     #if !WINDOWS
@@ -616,6 +628,7 @@ public class Worker {
     // count is 1.
     public static async void RunAll() {
         Socket.Initialize();
+        InitDebugFromEnv();
 
         if (ProcessHost.IsWorker()) {
             await RunAsWorkerProcess();
@@ -960,7 +973,15 @@ public class Worker {
         string reply = await probe.RecvAsync(64, ctlProbeMs);
         probe.Close();
         if (reply.Length < 4 || reply.Substring(0, 4) != "PONG") {
-            return Worker.CTL_FREE;
+            // 端口上有人在监听，但不是本应用的 master（别的服务占着同一
+            // 个控制端口）。这**不是空闲**：认领流程会再用
+            // SO_REUSEADDR 绑一次同一端口，而 Windows 的
+            // SO_REUSEADDR 允许与在监听的端口并存——之后进来的连接会
+            // 分流，worker 的 HELLO/CHAN 握手被对方吃掉，master 永远
+            // 等不到通道，master 受理的每个 HTTP 请求都被直接 RST
+            // （客户端只看到连接被中止，服务端连访问日志都没有）。
+            // 判成 FOREIGN → 认领时改用邻近端口，两边彻底分开。
+            return Worker.CTL_FOREIGN;
         }
         List<string> f = SplitWords(reply);
         if (f.Count < 3) { return Worker.CTL_UNKNOWN; }
@@ -968,6 +989,19 @@ public class Worker {
         if (mine != "" && f[2] == mine) { return Worker.CTL_OURS; }
         if (ctlToken != "" && f[2] == ctlToken) { return Worker.CTL_OURS; }
         return Worker.CTL_FOREIGN;
+    }
+
+    // 诊断口：探当前控制端口被谁占着。
+    //   0 = 空闲（连不上，谁都没在监听）
+    //   1 = 本应用的 master 在监听
+    //   2 = 外来进程在监听（应答不是本应用的 PING/PONG 协议）
+    //   3 = 状态不明（应答像本应用的协议，但字段不足）
+    // 「连得上但应答不是 PONG」必须报 2 而不是 0：Windows 的
+    // SO_REUSEADDR 允许与在监听的端口并存绑定，报 0 会让认领流程
+    // 抢同一个端口，worker 的握手被对方吃掉，master 受理的每个
+    // HTTP 请求都被 RST（详见 ProbeControlPort 里的注释）。
+    public static async int ProbeControlPortStatus() {
+        return await ProbeControlPort();
     }
 
     // master 主流程：先认领控制端口（fork 炸弹防护），再绑定监听、建统计表、派生并监督 procs 个 worker。
@@ -1010,6 +1044,7 @@ public class Worker {
             nint sock = await Socket.AcceptAsync(ctlSock);
             if (sock < 0) { continue; }
             Socket.SetNonBlocking(sock);
+            Dbg("ctl accepted sock=" + Convert.ToString(sock));
             Task.Spawn(HandleWorkerControl(sock));
         }
     }
@@ -1092,6 +1127,7 @@ public class Worker {
         if (!ok) { conn.Close(); return; }
 
         List<string> f = SplitWords(line);
+        Dbg("ctl handshake line=" + line);
         if (f.Count == 0) { conn.Close(); return; }
 
         if (f[0] == "PING" || f[0] == "STOP" || f[0] == "RELOAD"
@@ -1428,6 +1464,9 @@ public class Worker {
                 }
                 int _c = await ch.SendAsync("CHAN " + Convert.ToString(ProcessHost.Pid())
                     + " " + Convert.ToString(i) + "\n");
+                Dbg("worker sent CHAN pid=" + Convert.ToString(ProcessHost.Pid())
+                    + " idx=" + Convert.ToString(i)
+                    + " sent=" + Convert.ToString(_c));
                 wkChannels.Add(ch);
                 Task.Spawn(ChannelLoop(ch, workers[i]));
             }

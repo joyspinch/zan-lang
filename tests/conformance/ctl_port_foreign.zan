@@ -1,0 +1,69 @@
+using System;
+using System.Net;
+using System.Net.Sockets;
+
+// 控制端口探测：端口上有人在监听、但应答不是本应用的 PING/PONG 协议时，
+// 必须报「被占」（2），不能报「空闲」（0）。
+//
+// 坑出处：认领流程判定「空闲」后会用 SO_REUSEADDR 再绑一次同一端口，而
+// Windows 的 SO_REUSEADDR 允许与在监听的端口并存绑定——于是本应用的 worker
+// 把 HELLO/CHAN 握手发给外来的占用者，master 永远拿不到通道，master 受理的
+// 每个 HTTP 请求都被直接 RST（客户端只看到连接被中止，服务端连访问日志都
+// 没有）。这类故障没有别的证据面，只能靠这条语义钉住。
+class Program {
+    static int BASE = 29731;
+    static nint listener = -1;
+    static bool served = false;
+
+    // 外来服务：接了连接就回一句不是 PONG 的话。
+    static async void ForeignServer() {
+        while (true) {
+            nint c = await Socket.AcceptAsync(listener);
+            if (c < 0) { return; }
+            Socket.SendString(c, "HELLO\n");
+            served = true;
+            Socket.Close(c);
+        }
+    }
+
+    static async int Run() {
+        Socket.Initialize();
+
+        int port = 0;
+        for (int i = 0; i < 16; i = i + 1) {
+            nint s = Socket.CreateTcp();
+            if (Socket.Bind(s, "127.0.0.1", BASE + i) != 0) {
+                Socket.Close(s);
+                continue;
+            }
+            listener = s;
+            port = BASE + i;
+            break;
+        }
+        if (listener < 0) {
+            Console.WriteLine("no free port");
+            return 1;
+        }
+
+        // 只 bind 未 listen：连不上 ⇒ 空闲（0）
+        Worker.SetControlPort(port);
+        int idle = await Worker.ProbeControlPortStatus();
+        Console.WriteLine("idle=" + Convert.ToString(idle));
+
+        // listen 且应答非 PONG ⇒ 外来占用（2）
+        Socket.Listen(listener, 8);
+        Task.Spawn(Program.ForeignServer());
+        int foreign = await Worker.ProbeControlPortStatus();
+        Console.WriteLine("foreign=" + Convert.ToString(foreign));
+        // served=1 证明探测真的连上了外来监听并拿到了它的应答——
+        // 否则 foreign=2 可能只是超时走空应答分支，这条用例就空转了。
+        Console.WriteLine("served=" + Convert.ToString(served ? "1" : "0"));
+
+        Socket.Close(listener);
+        return 0;
+    }
+
+    static async int Main() {
+        return await Run();
+    }
+}
