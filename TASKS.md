@@ -162,6 +162,16 @@
   整个编不过（gen1 拉入即炸）。宿主 infer 修复后 gen1 重编即通过——
   未改自举一行。
   int（现也 64 位）留观。
+- **自举算术位宽继承修复（2026-10-23，随 ca0b3502d 落地）**：自举
+  `ArithWidth`/`ArithUnsigned` 曾直接读臂的**类型名**宽度，而算术子式的
+  类型恒为 int（真宽度在 `wbits`，见 ValWidth 注释）——嵌套 long 算术再进
+  除法被按 32 位截断（sdiv 后 shl/ashr 32）：`(9223372036854775807L-d)/10`
+  截成负数、`v > 截断值` 误判真。这正是固定点门爆
+  "integer literal is too large for 'long'" 的根因——gen2 的 lexer
+  `NumDigit` 同形状，`1L` 都报超界。修法：两处改读 `ValWidth`（认 wbits）。
+  **留观**：修后三代链的 gen2 步仍异常——同一 66 源编译 gen1 约 10s、
+  gen2 超 17 分钟 CPU 未完（单文件失败路径 139ms vs 18749ms，134 倍），
+  A510 位宽口径在更深处仍有一层 gen1/gen2 分歧未定位，固定点门本树仍红。
 - 探针：`_scratch/csaudit/numeric/{p03,p04,p12}`。
 
 ### [~] A511 decimal 三处语义缺口：除法截断、与 double 混算垃圾、WriteLine(decimal) 编译崩溃
@@ -312,7 +322,7 @@
   迭代中修改 List 触发标准运行时诊断并优雅终止枚举。
 - 探针：`_scratch/csaudit/collections/p07_foreach.zan`。
 
-### [~] A522 C# 硬错误的三个构造 Zan 放行
+### [x] A522 C# 硬错误的三个构造 Zan 放行
 - **宿主侧已处理（2026-10-23，三口径分流）**：
   - ③ `if (x = 1)`：**升级为编译错误**（checker 对条件位置的 AST_ASSIGNMENT
     报 "assignment used as a condition (did you mean '=='? ..."）。升级前
@@ -324,7 +334,9 @@
     override-result；SPEC §5.2 已补声明（覆盖 try 返回值 + conformance 指针）。
   - ② switch 隐式贯穿：**保留 Go 语义 + SPEC §5.2 补声明**（非空 case 隐式
     break、空 case 标签显式贯穿；C# 直觉漏写 break 是"每个 case 独立"）。
-- 自举半边已补（2026-10-23，goal round 2）：selfhost checker.zan 的 IfStmt/WhileStmt/DoWhileStmt 对条件位置 AK.Assignment() 报同文案错误；gen1 实测——if (x = 1) 当场拒绝（同文案 + 非零退出），合法 bool 条件/while/do-while 正控通过。
+- **自举半边与差分门闭合（2026-10-23）**：selfhost checker.zan 的 IfStmt/WhileStmt/DoWhileStmt
+  对条件位置 AK.Assignment() 报同文案错误；新增差分门负向用例 `tests/selfhost/reject/assign_in_condition.zan`，
+  并在 `tests/selfhost/reject_cases.txt` 锁定双端一致诊断。全项闭账。
 - 原始记录：① C# CS0157；Zan 接受且语义=覆盖 try 返回值（override-result=2），无警告。② switch 非空 case 隐式贯穿：C# CS0163；Zan 接受且语义=**隐式 break**（隔离探针亲验：case 1 不落入 case 2）——Go 风格，C# 直觉漏写 break 静默变行为。③ `if (x = 1)`：C# CS0029 硬错；Zan 仅警告，运行 C 风格真假（x=1 进分支，亲验）。
 - 探针：`_scratch/csaudit/exceptions/{p03_finally_override,p13_implicit_fallthrough}.zan`、`operators/p13_assign_cond.zan`、`operators/v_assign_cond.zan`（复验：当场报错）。
 ### [~] A523 渲染与诊断输出口径族（与 .NET 不一致的小偏差集合）
