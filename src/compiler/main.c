@@ -4621,6 +4621,18 @@ int main(int argc, char **argv) {
             if (extra_link_input_count < ZAN_MAX_LINK_INPUTS) extra_link_inputs[extra_link_input_count++] = argv[++i];
             else { fprintf(stderr, "error: too many --link-input (max %d)\n", ZAN_MAX_LINK_INPUTS); return 1; }
         } else if (strcmp(argv[i], "--link-lib") == 0 && i + 1 < argc) {
+            /* 该值会被原样拼进链接命令行（-l<lib>）后经 system() 执行：
+             * 引号/空格/&/| 等元字符就是命令注入面（审计 P1-9）。库名
+             * 本来就只能是标识符形态——与 DllImport 同一字符集白名单，
+             * 越界一律拒绝；要传路径用 --libpath / -L。 */
+            if (!zan_dllimport_name_is_safe(argv[i + 1], (int)strlen(argv[i + 1]))) {
+                fprintf(stderr,
+                        "error: --link-lib value '%s' may only contain "
+                        "[A-Za-z0-9._+-] (it is passed to the linker as "
+                        "-l<name>; use --libpath for search paths)\n",
+                        argv[i + 1]);
+                return 1;
+            }
             if (extra_link_lib_count < ZAN_LINK_MAX_LIBS)
                 extra_link_libs[extra_link_lib_count++] = argv[++i];
             else { fprintf(stderr, "error: too many --link-lib (max %d)\n",

@@ -254,6 +254,18 @@ static void zan_soft_append(const char *text) {
     char path[4096];
     zan_soft_log_path(path, sizeof path);
     FILE *f = fopen(path, "ab");
+    if (!f) {
+#if defined(_WIN32)
+        /* exe 目录只读（Program Files / 部署盘）时的最后一档：用户临时
+         * 目录。软诊断宁可落进 %TEMP% 也不要静默丢（审计 P1-2）。 */
+        char tmp[MAX_PATH];
+        DWORD tn = GetTempPathA((DWORD)sizeof tmp, tmp);
+        if (tn > 0 && tn < sizeof tmp) {
+            snprintf(path, sizeof path, "%szan_crash.log", tmp);
+            f = fopen(path, "ab");
+        }
+#endif
+    }
     if (!f) return;
     fseek(f, 0, SEEK_END);
     long size = ftell(f);

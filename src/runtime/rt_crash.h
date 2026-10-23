@@ -248,6 +248,15 @@ static void zan__crash_logpath(char *logpath, size_t cap, char *exe_dir) {
     strncat(logpath, "zan_crash.log", cap - strlen(logpath) - 1);
 }
 
+/* exe 目录与当前目录都不可写时（Program Files、只读部署盘）的最后一档：
+ * 用户临时目录。真崩溃的记录宁可落进 %TEMP% 也不要静默丢（审计 P1-2）。 */
+static void zan__crash_temp_logpath(char *logpath, size_t cap) {
+    char tmp[MAX_PATH];
+    DWORD n = GetTempPathA((DWORD)sizeof tmp, tmp);
+    if (n == 0 || n >= sizeof tmp) { logpath[0] = '\0'; return; }
+    snprintf(logpath, cap, "%szan_crash.log", tmp);
+}
+
 /* 崩溃兜底日志的大小上限。
  * 日志随每次进程启动/退出各追加一行（run/exit），一次全量门禁能写进几千行、
  * 几 MB，真崩的那条记录会淹没在噪声里。超过上限就把旧文件轮转成 <name>.1，
@@ -278,6 +287,11 @@ static void zan__crash_note(const char *what, const char *detail) {
     zan__crash_logpath(logpath, sizeof logpath, exe_dir);
     FILE *f = zan__crash_open_log(logpath);
     if (!f) f = zan__crash_open_log("zan_crash.log");
+    if (!f) {
+        char tpath[MAX_PATH];
+        zan__crash_temp_logpath(tpath, sizeof tpath);
+        if (tpath[0]) f = zan__crash_open_log(tpath);
+    }
     if (!f) return;
     SYSTEMTIME st;
     GetLocalTime(&st);
@@ -472,6 +486,11 @@ static void zan__crash_write_record(EXCEPTION_POINTERS *ep,
 
     FILE *f = zan__crash_open_log(logpath);
     if (!f) f = zan__crash_open_log("zan_crash.log");
+    if (!f) {
+        char tpath[MAX_PATH];
+        zan__crash_temp_logpath(tpath, sizeof tpath);
+        if (tpath[0]) f = zan__crash_open_log(tpath);
+    }
     if (f) {
         SYSTEMTIME st;
         GetLocalTime(&st);
