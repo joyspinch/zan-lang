@@ -1,0 +1,42 @@
+using System;
+using System.Data;
+using System.Threading;
+
+namespace System.Data.MySql;
+
+// DbPool 的协程化 MySQL 形态，与 <see cref="MySqlAsyncConnector.Pool"/> 工厂
+// 配对。通用 DbPool 只认 IDbConnection：异步单类连接的同步 Rollback()
+// 抛 Sync()，归还路径读不到也回滚不了残留事务（A535，P2-29 的异步驱动
+// 半边）。这里覆写 Release：连接带着未收尾事务归来时挂清理协程，
+// ROLLBACK 落地后才入池；协程由调度器泵动——异步驱动的使用方必然
+// 运行在协程环境里。UnitOfWork 用户不受影响（Dispose 本就先走回滚）。
+public class MySqlDbPool : DbPool {
+    public MySqlDbPool(IDbConnector connector, int maxSize)
+            : base(connector, maxSize) {
+    }
+
+    // 归还前把没收尾的事务交给清理协程（A535）。回滚失败也放行——
+    // 连接仍可用，下一位使用者的显式 BEGIN 会撞上残留事务报错，可定位
+    // （与 SqliteDbPool.Release 同一取舍）。
+    public override void Release(IDbConnection c) {
+        if (c is MySqlConnection) {
+            MySqlConnection mc = (MySqlConnection)c;
+            if (mc.inTxn) {
+                Task.Spawn(this.Cleanup(mc));
+                return;
+            }
+        }
+        base.Release(c);
+    }
+
+    // 清理协程体：ROLLBACK 落地后按基类同规入池/丢弃。
+    private async bool Cleanup(MySqlConnection mc) {
+        try {
+            await mc.RollbackAsync();
+        } catch (Exception) {
+        }
+        mc.inTxn = false;
+        base.Release(mc);
+        return true;
+    }
+}

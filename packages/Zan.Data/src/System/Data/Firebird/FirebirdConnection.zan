@@ -35,6 +35,10 @@ public class FirebirdConnection : IDbConnection {
     FbError lastStatus;
     bool busy;
     List<AsyncGate> waiters;
+    // A535：事务携带未收尾写时为 true。Fb 协议在 COMMIT/ROLLBACK 后会
+    // 自动续开一个空事务（无用户写入，非残留），故成功落地即清零；
+    // 落地失败保持 true，由连接池归还路径的清理协程再试 ROLLBACK。
+    public bool inTxn;
 
     private async bool AcquireLock() {
         while (this.busy) {
@@ -760,7 +764,9 @@ public class FirebirdConnection : IDbConnection {
     public void Rollback() { throw FirebirdConnection.Sync(); }
 
     public async bool BeginTransactionAsync() {
-        return await this.beginTransaction();
+        bool ok = await this.beginTransaction();
+        if (ok) { this.inTxn = true; }
+        return ok;
     }
 
     // 提交当前事务并开启新事务。内部通过 AsyncGate 门控保证单连接事务互斥，杜绝并发调用数据串号。
@@ -777,6 +783,9 @@ public class FirebirdConnection : IDbConnection {
             resp.Release();
             this.transHandle = 0 - 1;
             if (!ok) { return false; }
+            // 提交已落地，未收尾写清零（随后的 beginTransaction 是驱动
+            // 基线的空事务，不携带用户写入）。
+            this.inTxn = false;
             return await this.beginTransaction();
         } finally {
             this.ReleaseLock();
@@ -797,6 +806,9 @@ public class FirebirdConnection : IDbConnection {
             resp.Release();
             this.transHandle = 0 - 1;
             if (!ok) { return false; }
+            // 回滚已落地，未收尾写清零（随后的 beginTransaction 是驱动
+            // 基线的空事务，不携带用户写入）。
+            this.inTxn = false;
             return await this.beginTransaction();
         } finally {
             this.ReleaseLock();

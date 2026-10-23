@@ -116,7 +116,10 @@ public class MySqlPool : IDisposable {
     }
 
     // 将连接归还连接池。损坏的或 Close() 之后的
-    // 连接会被关闭丢弃，不再入池。
+    // 连接会被关闭丢弃，不再入池。归还时事务未收尾的连接
+    // 不直接入池：挂清理协程把残留事务 ROLLBACK 掉后再回池
+    // （A535，P2-29 的异步驱动半边；协程由调度器泵动——异步
+    // 驱动的使用方必然运行在协程环境里）。
     public void Release(MySqlConnection c) {
         if (c == null) {
             return;
@@ -126,7 +129,29 @@ public class MySqlPool : IDisposable {
             this.core.Drop(c);
             return;
         }
+        if (c.inTxn) {
+            Task.Spawn(this.Cleanup(c));
+            return;
+        }
         this.core.Pool(c);
+    }
+
+    // 清理协程体：ROLLBACK 落地后连接才回池；回滚失败也放行——连接
+    // 仍可用，下一位使用者的显式 BEGIN 会撞上残留事务报错，可定位
+    // （与 SqliteDbPool.Release 同一取舍）。池已关闭或连接失效则丢弃。
+    private async bool Cleanup(MySqlConnection c) {
+        try {
+            await c.RollbackAsync();
+        } catch (Exception) {
+        }
+        c.inTxn = false;
+        if (this.core.IsClosed() || !c.IsConnected()) {
+            c.Close();
+            this.core.Drop(c);
+            return true;
+        }
+        this.core.Pool(c);
+        return true;
     }
 
     // 空闲（已入池、可直接使用）连接数。

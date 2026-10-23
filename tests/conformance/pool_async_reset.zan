@@ -1,0 +1,169 @@
+// A535 判定器：连接池归还清理通道（P2-29 的异步驱动半边）。
+// 异步单类驱动（协程化 MySQL/SqlServer/Firebird）的同步 Rollback() 抛
+// Sync()，同步 Release 无法回滚残留事务——机制改为池级协程清理通道：
+// 归还时事务未收尾的连接不直接入池，挂 Task.Spawn 清理协程，ROLLBACK
+// 落地后才回池。本用例用假异步连接按与 MySqlPool.Release 同构的形状
+// 钉住机制不变量：借出 BEGIN 不提交直接归还，二借必须等回滚落地，
+// 拿到即已回滚、事务标志已清；干净归还直通、不触发回滚。
+using System;
+using System.Data;
+using System.Threading;
+
+class FakeAsyncConnection : IDbConnection {
+    public bool inTxn;
+    public int rollbackCount;
+    bool connected;
+
+    DbResult Empty() {
+        DbResult r = new DbResult();
+        r.SetColumnCount(0);
+        return r;
+    }
+
+    public DbResult Query(string sql) { return this.Empty(); }
+    public DbResult Query(string sql, DbParams prms) { return this.Empty(); }
+    public int Execute(string sql) { return 0; }
+    public int Execute(string sql, DbParams prms) { return 0; }
+    public string ExecuteScalar(string sql) { return ""; }
+    public string ExecuteScalar(string sql, DbParams prms) { return ""; }
+    public async DbResult QueryAsync(string sql) { return this.Empty(); }
+    public async DbResult QueryAsync(string sql, DbParams prms) { return this.Empty(); }
+    public async int ExecuteAsync(string sql) { return 0; }
+    public async int ExecuteAsync(string sql, DbParams prms) { return 0; }
+    public async string ExecuteScalarAsync(string sql) { return ""; }
+    public async string ExecuteScalarAsync(string sql, DbParams prms) { return ""; }
+
+    public void BeginTransaction() { this.inTxn = true; }
+    public void Commit() { this.inTxn = false; }
+    public void Rollback() { this.inTxn = false; }
+
+    public async bool BeginTransactionAsync() {
+        await Task.Delay(1);
+        this.inTxn = true;
+        return true;
+    }
+
+    public async bool CommitAsync() {
+        await Task.Delay(1);
+        this.inTxn = false;
+        return true;
+    }
+
+    public async bool RollbackAsync() {
+        // 模拟真实回滚的 IO 延迟：二借若不等清理落地就会看到旧状态
+        await Task.Delay(2);
+        this.rollbackCount = this.rollbackCount + 1;
+        this.inTxn = false;
+        return true;
+    }
+
+    public bool IsConnected() { return this.connected; }
+    public void Close() { this.connected = false; }
+    public void Dispose() { this.Close(); }
+    public int GetProvider() { return 0; }
+}
+
+// 与 MySqlPool.Release/Cleanup 同构的机制载体（typed pool 样板）。
+class FakeAsyncPool {
+    PoolCore<FakeAsyncConnection> core;
+
+    public FakeAsyncPool(int maxSize) {
+        this.core = new PoolCore<FakeAsyncConnection>(maxSize);
+    }
+
+    public async FakeAsyncConnection AcquireAsync() {
+        PoolWait wait = new PoolWait();
+        while (true) {
+            if (this.core.IsClosed()) { return null; }
+            FakeAsyncConnection pooled = this.core.TakeIdle();
+            while (pooled != null) {
+                if (pooled.IsConnected()) { return pooled; }
+                this.core.Drop(pooled);
+                pooled = this.core.TakeIdle();
+            }
+            if (this.core.TryReserve()) {
+                await Task.Delay(1);
+                FakeAsyncConnection opened = new FakeAsyncConnection();
+                opened.connected = true;
+                this.core.Borrow(opened);
+                return opened;
+            }
+            if (!await this.core.WaitForRelease(wait)) { return null; }
+        }
+        return null;
+    }
+
+    public void Release(FakeAsyncConnection c) {
+        if (c == null) { return; }
+        if (this.core.IsClosed() || !c.IsConnected()) {
+            c.Close();
+            this.core.Drop(c);
+            return;
+        }
+        if (c.inTxn) {
+            Task.Spawn(this.Cleanup(c));
+            return;
+        }
+        this.core.Pool(c);
+    }
+
+    private async bool Cleanup(FakeAsyncConnection c) {
+        try {
+            await c.RollbackAsync();
+        } catch (Exception) {
+        }
+        c.inTxn = false;
+        if (this.core.IsClosed() || !c.IsConnected()) {
+            c.Close();
+            this.core.Drop(c);
+            return true;
+        }
+        this.core.Pool(c);
+        return true;
+    }
+
+    public int IdleCount() { return this.core.IdleCount(); }
+}
+
+public class PoolAsyncResetCase {
+    static int bad = 0;
+
+    static void Chk(string label, bool ok) {
+        if (!ok) {
+            bad = bad + 1;
+            Console.WriteLine("FAIL " + label);
+        }
+    }
+
+    static async int Run() {
+        FakeAsyncPool pool = new FakeAsyncPool(1);
+
+        // 一借：开事务（未收尾写），不提交直接归还——连接挂清理协程
+        FakeAsyncConnection c1 = await pool.AcquireAsync();
+        Chk("acquire one", c1 != null);
+        await c1.BeginTransactionAsync();
+        Chk("in txn", c1.inTxn);
+        pool.Release(c1);
+
+        // 二借：容量 1 且连接未回池，本调用必须等清理协程把 ROLLBACK
+        // 落地并回池后才能拿到——拿到即已回滚、事务标志已清
+        FakeAsyncConnection c2 = await pool.AcquireAsync();
+        Chk("second acquire after cleanup", c2 != null);
+        Chk("same connection reused", c2 == c1);
+        Chk("rollback ran once", c2.rollbackCount == 1);
+        Chk("txn flag cleared", !c2.inTxn);
+
+        // 干净归还直通：不开事务，归还后立即可取，回滚计数不变
+        pool.Release(c2);
+        FakeAsyncConnection c3 = await pool.AcquireAsync();
+        Chk("clean return direct", c3 == c2 && c3.rollbackCount == 1);
+        pool.Release(c3);
+
+        Console.WriteLine("pool-async-reset-ok: " + Convert.ToString(bad == 0 ? 1 : 0));
+        return 0;
+    }
+
+    static void Main() {
+        int r = await PoolAsyncResetCase.Run();
+    }
+}

@@ -42,6 +42,11 @@
 > ToUpper/ToLower 仅 ASCII 系 A525 已声明口径，Unicode 简单映射留独立件；
 > convert_overflow 用例扩 ToInt64 四腿，ctest 2/2 绿。
 > A400/A401/A402/A403/A404/A405/A406/A407/A413/A415/A416/A428/A431/A432/A437/
+> A535 池级协程清理通道落地：inTxn 记账（MySql/SqlServer/Firebird 三连接）+ 三类型池
+> 与泛型通路（MySqlDbPool，工厂改指向）归还挂 `Task.Spawn` 清理协程——事务未收尾的
+> 连接 ROLLBACK 落地后才回池；判定器 `pool_async_reset`（二借等清理落地，拿到即已
+> 回滚、标志已清；干净归还直通不触发回滚）2/2 绿；TDengine 事务即空桩无残留，
+> Redis 无事务 API，均无需处理。
 > A441/A442/A445/A447/A448/A449/A463/A473/A474/A475/A476/A477/A478/A479/A480/
 > A481/A483/A484/A485/A488/A491/A492/A497/A500/A502/A505）。编号不复用，结论与验证见 git 历史。
 
@@ -1625,15 +1630,6 @@
   （42，Convert 是静态内建有成员表——本条登记时误写它也挂，更正）；
   正例回归 p11/v_parse_ok 全绿。
 - 探针：`_scratch/csaudit/numeric/{v_chain2,v_chain5,v_chain6}.zan`。
-
-### [ ] A535 池归还回滚对异步单类驱动不成立（P2-29 余项）
-- 已落：Sqlite（:memory: 探针 6 断言全过）与 Pg（编译验证）的 inTxn
-  标志 + Release 回滚，ea664ae31。UnitOfWork 用户不受影响（本就先回滚）。
-- 余项：MySqlConnection / SqlServerConnection / FirebirdConnection 的
-  同步事务方法抛 `Sync()`（连接纯异步），TDengine 事务方法是空桩——
-  `Release` 是同步签名，回滚要么抛要么空转。真修需要 async Release
-  （破坏调用契约）或池级协程清理通道，先台账不动代码。
-- 判定器（网络库就位时）：借出 BEGIN+INSERT 不提交直接归还，二借不可见。
 
 ### 审计复查证伪（2026-10-23，随 A530-535 一批）
 
