@@ -248,7 +248,7 @@
 - 根因落点：checker.c `check_generic_constraints`（:776）只挂 new 表达式（:3194）/var 声明（:3716）/返回类型（:4686）三处，调用解析路径缺失。
 - 探针：`_scratch/csaudit/types/{p12_compile_rejects,p14_method_constraint}.zan`。
 
-### [~] A519 for 循环变量逐迭代新建（C# 的 for 头变量是共享单变量）
+### [x] A519 for 循环变量逐迭代新建（C# 的 for 头变量是共享单变量）
 - **宿主侧已修（2026-10-23）**：irgen_stmt.c for 发射去掉 `per_iteration=1`
   ——for 头变量改为整个循环共享一个变量（装箱共享 cell），与 C# 一致；
   foreach 迭代变量保持每迭代新建（C#5+ 语义）不变。实测：for 闭包 3/3/3、
@@ -264,7 +264,10 @@
   （for_loopvar_capture D+E 段最小复现，`_scratch/p_de.zan`）。旧编译器
   同样有洞，只是分配顺序未踩中；A519 改动扰动堆布局使其现形。修后带守卫
   构建（-g=check-leaks+arc-guard）stderr 干净。
-- 自举半边待办：selfhost 侧 for 循环变量捕获语义 + lambda 返回契约对齐。
+- **自举侧已对齐（2026-10-23）**：`src/selfhost/irgen_stmt.zan` GenFor 移除
+  `locIter[fi] = true;`，for 头变量与 foreach 区分开，整个循环共享同一盒化 cell。
+  自举差分门 `selfhost_diff` 中的 `for_loopvar_capture` 以及 `for_loopvar_write_shared`
+  经 `gen1` 编译运行输出与宿主金档 100% 逐行逐字节一致。
 - 附带文档漂移：SPEC §4.7"只读捕获创建时复制值"与实测（按引用共享）不符。
 - 探针：`_scratch/csaudit/objectmodel/p06_for_capture.zan`。
 
@@ -273,7 +276,7 @@
 - 根因落点：irgen 静态初始化发射（全量前置）。
 - 探针：`_scratch/csaudit/objectmodel/p09_static_init.zan`。
 
-### [~] A521 foreach 枚举中修改集合静默放行（无失效检测）
+### [x] A521 foreach 枚举中修改集合静默放行（无失效检测）
 - **宿主侧已修（2026-10-23）**：irgen_stmt.c foreach 发射进入循环前把 Count
   快照进 entry alloca（`fe.snap`），每轮比较活 Count——不一致即打
   "Collection was modified; enumeration operation may not execute"
@@ -286,7 +289,13 @@
 - C# 语义差异保留说明：C# 抛 InvalidOperationException 并回滚枚举位置；
   Zan 软口径打印诊断后终止该次枚举继续走（strict 口径 fail-fast），行为
   已声明、防死循环优先。
-- 自举半边待办：selfhost foreach 发射同步补 Count 快照守卫。
+- **自举侧已对齐（2026-10-23）**：`src/selfhost/irgen_stmt.zan` GenForeach
+  循环入口处增加 `feSnap` 元素数快照（List 取 `zlist_count`，数组读 `-1` 偏移长度，
+  字符串取 `zstr_len`），循环头增加活数量与快照比对，不一致时
+  `EmitSoftRuntimeError("Collection was modified; enumeration operation may not execute")`
+  并跳到循环终点 `lend`；`src/selfhost/irgen_async.zan` 中将协程状态机每个 foreach 的
+  堆帧槽由 3 扩为 4（容纳跨挂起点的 Count 快照）。实测通过 `gen1` 编译探针验证：
+  迭代中修改 List 触发标准运行时诊断并优雅终止枚举。
 - 探针：`_scratch/csaudit/collections/p07_foreach.zan`。
 
 ### [~] A522 C# 硬错误的三个构造 Zan 放行

@@ -1375,10 +1375,10 @@ partial class Irgen {
     void GenFor(Node s) {
         int forScope = locName.Count;
         if (s.a != null) { GenStmt(s.a); }
-        // a for-statement's init variables are per-iteration captures: every
-        // closure made in the body keeps its own iteration's value
-        int fi = forScope;
-        while (fi < locName.Count) { locIter[fi] = true; fi = fi + 1; }
+        // A519: a for-statement's header variable is ONE variable shared by
+        // the whole loop (C# semantics): every closure made in the body
+        // captures that single variable and sees the final value. Only the
+        // foreach element variable is snapshotted per iteration (C#5+).
         int lc = NL(); int lb = NL(); int linc = NL(); int lend = NL();
         int sb = brkTarget; int sc = contTarget;
         int sbf = brkFinBase; int scf = contFinBase;
@@ -1586,6 +1586,29 @@ partial class Irgen {
             asyncSlotReg.Add(ereg); asyncSlotTy.Add(elemTy); asyncSlotIdx.Add(s.ival + 2);
         }
         if (ArcManaged(elemTy)) { L("  store " + elt + " null, " + elt + "* " + ereg); }
+        // A521: snapshot the collection's element count once at loop entry.
+        // The walk compares the live count each round; a mutation inside the
+        // body reports and terminates the enumeration (the C host's fail-fast
+        // foreach, irgen_stmt.c fe.snap) instead of following the grown count
+        // into a dead loop or silently skipping elements. The snapshot lives
+        // in the coroutine frame for async bodies (it must survive awaits).
+        string feSnap = NT();
+        string cnt0 = NT();
+        if (feList) {
+            L("  " + cnt0 + " = call i64 @zlist_count(i8* " + coll.op + ")");
+        } else if (feArr) {
+            string lp0 = NT();
+            L("  " + lp0 + " = getelementptr i64, i64* " + coll.op + ", i64 -1");
+            L("  " + cnt0 + " = load i64, i64* " + lp0);
+        } else {
+            L("  " + cnt0 + " = call i64 @zstr_len(i8* " + coll.op + ")");
+        }
+        if (curAsync) {
+            L("  store i64 " + cnt0 + ", i64* " + FrameGep("%ff", s.ival + 3));
+        } else {
+            EA(feSnap, "i64");
+            L("  store i64 " + cnt0 + ", i64* " + feSnap);
+        }
         int lc = NL(); int lb = NL(); int linc = NL(); int lend = NL();
         int sb = brkTarget; int sc = contTarget;
         int sbf = brkFinBase; int scf = contFinBase;
@@ -1618,6 +1641,26 @@ partial class Irgen {
         } else {
             L("  " + cnt + " = call i64 @zstr_len(i8* " + cv + ")");
         }
+        // A521 mutation guard: the live count against the entry snapshot.
+        // On mismatch the soft diagnostic prints once and this enumeration
+        // ends (the report path rejoins here, then the walk jumps to the end
+        // label). For async bodies the snapshot pointer is re-derived: a
+        // pointer computed before the loop does not dominate the header once
+        // the body can be re-entered from a resume block.
+        string sn = NT();
+        if (curAsync) {
+            L("  " + sn + " = load i64, i64* " + FrameGep("%ff", s.ival + 3));
+        } else {
+            L("  " + sn + " = load i64, i64* " + feSnap);
+        }
+        string mut = NT();
+        L("  " + mut + " = icmp ne i64 " + cnt + ", " + sn);
+        int lmut = NL(); int lgo = NL();
+        L("  br i1 " + mut + ", label %L" + lmut + ", label %L" + lgo);
+        Label(lmut);
+        EmitSoftRuntimeError(s, "Collection was modified; enumeration operation may not execute");
+        L("  br label %L" + lend);
+        Label(lgo);
         string c = NT();
         L("  " + c + " = icmp slt i64 " + iv + ", " + cnt);
         L("  br i1 " + c + ", label %L" + lb + ", label %L" + lend);
