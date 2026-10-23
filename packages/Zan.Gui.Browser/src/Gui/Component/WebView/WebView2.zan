@@ -126,6 +126,11 @@ public class WebView2 {
     public Gate evalGate;
     public Gate cookieGate;
     public string pendingInitUrl;
+    // 引擎就绪前挂起的 HTML 载荷：控制器是异步创建的，core 未就绪时
+    // 直接 NavigateToString 会被静默丢掉（页面停在 about:blank，正文
+    // 空白且不报任何错）。这里挂起到就绪回调里再导航。
+    public string pendingHtml;
+    public string pendingHtmlBase;
     // 最近下发的位置/裁剪/可见性。put_Bounds 与 SetWindowRgn 每帧
     // 重复下发既浪费又会让网页闪烁，因此只在真的变化时才调用。
     public int fx;
@@ -381,6 +386,8 @@ public class WebView2 {
         w.evalGate = new Gate();
         w.cookieGate = new Gate();
         w.pendingInitUrl = "";
+        w.pendingHtml = "";
+        w.pendingHtmlBase = "";
 
         List<WebView2> all = WebView2.All();
         all.Add(w);
@@ -496,6 +503,15 @@ public class WebView2 {
         if (pendingInitUrl != "") {
             this.Navigate(pendingInitUrl);
             pendingInitUrl = "";
+        }
+        // 执行就绪前 pending 的 HTML 载荷（HTML 优先于 URL：两者都挂起
+        // 时以最后挂起的那个为准，HTML 是「就地装载」）。
+        if (pendingHtml != "") {
+            string h = pendingHtml;
+            string b = pendingHtmlBase;
+            pendingHtml = "";
+            pendingHtmlBase = "";
+            this.LoadHtml(h, b);
         }
     }
 
@@ -1013,9 +1029,15 @@ public class WebView2 {
     }
 
     // WebView2 没有带 base-url 的 NavigateToString 形式，因此 `baseUrl`
-    // 被接受但忽略。
+    // 被接受但忽略。控制器（core）是异步创建的：core 未就绪时把载荷挂起，
+    // 等就绪回调里再导航——直接丢掉的话页面会停在 about:blank（正文空白
+    // 且不报任何错）。
     public void LoadHtml(string html, string baseUrl) {
-        if (core == 0) { return; }
+        if (core == 0) {
+            pendingHtml = html;
+            pendingHtmlBase = baseUrl;
+            return;
+        }
         nint h = Wide.Of(html);
         Com.Call1(core, WebView2.SlotNavigateToString(), h);
         Wide.Free(h);
