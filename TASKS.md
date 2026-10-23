@@ -58,12 +58,17 @@
     split/finish 三帮手，数组/List/Span/string 的元素 **store** 位点在诊断
     之后用 cond_br 跳过写入（连配套 retain/release 一起跳，ARC 平衡保持）。
     曾 `a[9]=99` 钳位写进 a[0]（静默覆盖）；现在元素保住（11 22 33）。
-    未覆盖：多维数组 store（emit_mdarray_elem_ptr 内部仍钳位）、字段/成员
-    链形状的部分位点，见待办。
+  - **多维矩形数组、对象字段与自增自减越界写已补齐跳写（2026-10-23）**：
+    `emit_mdarray_elem_ptr` 扩展 `out_oob` 参数，多维各轴越界谓词经 `or` 合并产出整体 OOB 谓词；
+    宿主 `irgen_expr.c` 对局部/字段/成员链的多维矩形数组 store、`this` 字段 1D 数组 store、
+    `obj.arr` 成员 1D 数组 store，以及 `a[9]++`/`m[9,9]++`/`a[9]+=5` 自增自减与复合赋值位点
+    全线接入 `emit_oob_store_split`/`finish` 守卫，越界写跳过存储，彻底杜绝槽 0 静默覆盖与数据损坏。
+    新增 conformance 用例 `tests/conformance/array_oob_store_safe.{zan,out}`（覆写防腐、复合算符、
+    负数索引全覆盖），并入自举差分门 `tests/selfhost/diff_cases.txt`，单测与差分双绿。
 - **软失败取值实测（2026-10-23，A531 判定器顺带）**：数组远越界**读**软失败
   返 0 继续；整数**除零**软失败返回**被除数**（`123456/0` 打出 123456，非 0
   非抛）——软失败槽位的取值口径尚未统一，收口①时一并定。
-- 待办：① 全线可 catch 异常通道（对齐 C#，最终口径）；② 多维数组与剩余
+- 待办：① 全线可 catch 异常通道（对齐 C#，最终口径）；② 读路径与除零软失败取值统一。
 - **自举半边·List/string 越界写补齐（2026-10-23，goal round 9）**：
   List 的 zlist_set 曾无界（OOB 直接写数据区 + 对垃圾值做 retain/release）
   ——调用点守卫（行:列在此才可知）：软诊断 `index out of bounds: List

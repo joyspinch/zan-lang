@@ -5137,7 +5137,8 @@ static LLVMValueRef emit_user_conversion(zan_irgen_t *g, zan_type_t *from_type,
 
 /* 多维矩形数组元素寻址：结合各维度形状计算一维平铺偏移 */
 static LLVMValueRef emit_mdarray_elem_ptr(zan_irgen_t *g, LLVMValueRef arr_ptr,
-        zan_ast_node_t *expr, LLVMTypeRef elem_llvm, local_scope_t *locals) {
+        zan_ast_node_t *expr, LLVMTypeRef elem_llvm, local_scope_t *locals,
+        LLVMValueRef *out_oob) {
     LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
     LLVMTypeRef i8 = LLVMInt8TypeInContext(g->ctx);
     zan_type_t *at = infer_expr_type(g, expr->index.object, locals);
@@ -5149,6 +5150,7 @@ static LLVMValueRef emit_mdarray_elem_ptr(zan_irgen_t *g, LLVMValueRef arr_ptr,
     idx = emit_index_i64(g, idx, "md.i0");
     LLVMValueRef dim0 = LLVMBuildLoad2(g->builder, i64,
         LLVMBuildGEP2(g->builder, i64, dim_ptr, &zero, 1, "md.d0"), "md.dim0");
+    LLVMValueRef total_oob = emit_index_oob_pred(g, idx, dim0);
     emit_index_bounds_check(g, idx, dim0, expr->loc, "array");
     idx = emit_index_safe_bounds(g, idx, dim0, expr->loc, "array");
     LLVMValueRef flat = idx;
@@ -5156,12 +5158,19 @@ static LLVMValueRef emit_mdarray_elem_ptr(zan_irgen_t *g, LLVMValueRef arr_ptr,
         LLVMValueRef off = LLVMConstInt(i64, (unsigned long long)d, 0);
         LLVMValueRef dimv = LLVMBuildLoad2(g->builder, i64,
             LLVMBuildGEP2(g->builder, i64, dim_ptr, &off, 1, "md.dd"), "md.dim");
-        LLVMValueRef ix = emit_expr(g, expr->index.extra.items[d - 1], locals);
+        zan_ast_node_t *extra_node = (d - 1 < expr->index.extra.count)
+            ? expr->index.extra.items[d - 1] : NULL;
+        LLVMValueRef ix = extra_node ? emit_expr(g, extra_node, locals) : LLVMConstInt(i64, 0, 0);
         ix = emit_index_i64(g, ix, "md.ix");
+        LLVMValueRef cur_oob = emit_index_oob_pred(g, ix, dimv);
+        total_oob = LLVMBuildOr(g->builder, total_oob, cur_oob, "md.oob");
         emit_index_bounds_check(g, ix, dimv, expr->loc, "array");
         ix = emit_index_safe_bounds(g, ix, dimv, expr->loc, "array");
         flat = zan_mul(g->builder, flat, dimv, "md.fm");
         flat = zan_add(g->builder, flat, ix, "md.fa");
+    }
+    if (out_oob) {
+        *out_oob = total_oob;
     }
     LLVMValueRef data_off = LLVMConstInt(i64,
         (unsigned long long)rank * 8, 0);
@@ -5672,7 +5681,7 @@ binding_lowered:
                             local->type->array_rank > 1) {
                             /* 多维矩形数组槽位：多维越界检查与行优先平铺寻址 */
                             elem_ptr = emit_mdarray_elem_ptr(g, arr_ptr,
-                                expr->binary.left, elem_llvm, locals);
+                                expr->binary.left, elem_llvm, locals, &ar_oob);
                         } else {
                             LLVMValueRef idx = emit_expr(g, expr->binary.left->index.index, locals);
                             if (local->type && local->type->kind == TYPE_ARRAY) {
@@ -5728,7 +5737,9 @@ binding_lowered:
                     zan_symbol_t *fsym = get_field_sym(g->current_type_sym, arr_expr->ident.name);
                     if (fsym) {
                         LLVMValueRef arr_ptr = emit_expr(g, arr_expr, locals);
-                        LLVMValueRef idx = emit_expr(g, expr->binary.left->index.index, locals);
+                        LLVMValueRef ar_oob = LLVMConstInt(LLVMInt1TypeInContext(g->ctx), 0, 0);
+                        LLVMValueRef idx = (fsym->type && fsym->type->kind == TYPE_ARRAY && fsym->type->array_rank > 1)
+                            ? NULL : emit_expr(g, expr->binary.left->index.index, locals);
                         /* 类内部裸字段访问的字符串引用计数管理 */
                         if (fsym->type && fsym->type->kind == TYPE_STRING &&
                             expr_has_reliable_string_bounds(arr_expr, locals)) {
@@ -5740,6 +5751,7 @@ binding_lowered:
                             idx = emit_string_elem_guard(g, arr_ptr, idx, expr->loc, &arr_ptr);
                         } else if (fsym->type && fsym->type->kind == TYPE_ARRAY &&
                                    fsym->type->array_rank <= 1) {
+                            ar_oob = emit_index_oob_pred(g, idx, zan_array_len(g, arr_ptr));
                             emit_index_bounds_check(g, idx, zan_array_len(g, arr_ptr),
                                 expr->loc, "array");
                             idx = emit_index_safe_bounds(g, idx,
@@ -5807,12 +5819,14 @@ binding_lowered:
                         if (fsym->type && fsym->type->kind == TYPE_ARRAY &&
                             fsym->type->array_rank > 1) {
                             elem_ptr = emit_mdarray_elem_ptr(g, arr_ptr,
-                                expr->binary.left, elem_llvm, locals);
+                                expr->binary.left, elem_llvm, locals, &ar_oob);
                         } else {
                             LLVMValueRef typed_arr = LLVMBuildBitCast(g->builder, arr_ptr,
                                 LLVMPointerType(elem_llvm, 0), "arrp");
                             elem_ptr = LLVMBuildGEP2(g->builder, elem_llvm, typed_arr, &idx, 1, "eidx");
                         }
+                        LLVMBasicBlockRef ar_do = NULL, ar_end = NULL;
+                        emit_oob_store_split(g, ar_oob, &ar_do, &ar_end);
                         zan_type_t *et = fsym->type ? fsym->type->element_type : NULL;
                         LLVMValueRef stored = right;
                         /* 可空数组元素槽写入：封装标量值为可空对象 */
@@ -5849,6 +5863,7 @@ binding_lowered:
                             }
                             zan_store_fit(g, stored, elem_ptr);
                         }
+                        emit_oob_store_finish(g, ar_do, ar_end);
                         }
                     }
                 }
@@ -5856,7 +5871,8 @@ binding_lowered:
                 zan_type_t *at = member_access_field_type(g, locals, arr_expr);
                 if (at) {
                     LLVMValueRef arr_ptr = emit_expr(g, arr_expr, locals);
-                    LLVMValueRef idx = emit_expr(g, expr->binary.left->index.index, locals);
+                    LLVMValueRef idx = (at->kind == TYPE_ARRAY && at->array_rank > 1)
+                        ? NULL : emit_expr(g, expr->binary.left->index.index, locals);
                     if (type_named(at, "List", 4)) {
                         LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
                         LLVMValueRef list_ptr = LLVMBuildBitCast(g->builder, arr_ptr,
@@ -5917,12 +5933,7 @@ binding_lowered:
                         zan_store_fit(g, val8, elem_ptr);
                         emit_string_len_invalidate(g, arr_ptr);
                         } else {
-                        if (at->kind == TYPE_ARRAY && at->array_rank == 1) {
-                            emit_index_bounds_check(g, idx,
-                                zan_array_len(g, arr_ptr), expr->loc, "array");
-                            idx = emit_index_safe_bounds(g, idx,
-                                zan_array_len(g, arr_ptr), expr->loc, "array");
-                        }
+                        LLVMValueRef ar_oob = LLVMConstInt(LLVMInt1TypeInContext(g->ctx), 0, 0);
                         LLVMTypeRef elem_llvm = LLVMInt32TypeInContext(g->ctx);
                         if (at->element_type) {
                             elem_llvm = map_type(g, at->element_type);
@@ -5930,12 +5941,22 @@ binding_lowered:
                         LLVMValueRef elem_ptr;
                         if (at->kind == TYPE_ARRAY && at->array_rank > 1) {
                             elem_ptr = emit_mdarray_elem_ptr(g, arr_ptr,
-                                expr->binary.left, elem_llvm, locals);
+                                expr->binary.left, elem_llvm, locals, &ar_oob);
                         } else {
+                            if (at->kind == TYPE_ARRAY && at->array_rank == 1) {
+                                ar_oob = emit_index_oob_pred(g, idx,
+                                    zan_array_len(g, arr_ptr));
+                                emit_index_bounds_check(g, idx,
+                                    zan_array_len(g, arr_ptr), expr->loc, "array");
+                                idx = emit_index_safe_bounds(g, idx,
+                                    zan_array_len(g, arr_ptr), expr->loc, "array");
+                            }
                             LLVMValueRef typed_arr = LLVMBuildBitCast(g->builder, arr_ptr,
                                 LLVMPointerType(elem_llvm, 0), "arrp");
                             elem_ptr = LLVMBuildGEP2(g->builder, elem_llvm, typed_arr, &idx, 1, "eidx");
                         }
+                        LLVMBasicBlockRef ar_do = NULL, ar_end = NULL;
+                        emit_oob_store_split(g, ar_oob, &ar_do, &ar_end);
                         zan_type_t *et = at->element_type;
                         LLVMValueRef stored = right;
                         if (et && et->kind == TYPE_NULLABLE)
@@ -5968,6 +5989,7 @@ binding_lowered:
                             }
                             zan_store_fit(g, stored, elem_ptr);
                         }
+                        emit_oob_store_finish(g, ar_do, ar_end);
                     }
                 }
             } else {
@@ -6024,11 +6046,13 @@ binding_lowered:
                         : LLVMInt64TypeInContext(g->ctx);
                     LLVMValueRef arr_ptr = emit_expr(g, arr_expr, locals);
                     LLVMValueRef elem_ptr;
+                    LLVMValueRef ar_oob = LLVMConstInt(LLVMInt1TypeInContext(g->ctx), 0, 0);
                     if (at->array_rank > 1) {
                         elem_ptr = emit_mdarray_elem_ptr(g, arr_ptr,
-                            expr->binary.left, elem_llvm, locals);
+                            expr->binary.left, elem_llvm, locals, &ar_oob);
                     } else {
                         LLVMValueRef idx = emit_expr(g, expr->binary.left->index.index, locals);
+                        ar_oob = emit_index_oob_pred(g, idx, zan_array_len(g, arr_ptr));
                         emit_index_bounds_check(g, idx, zan_array_len(g, arr_ptr),
                             expr->loc, "array");
                         idx = emit_index_safe_bounds(g, idx,
@@ -6038,6 +6062,8 @@ binding_lowered:
                         elem_ptr = LLVMBuildGEP2(g->builder, elem_llvm,
                             typed_arr, &idx, 1, "eidx");
                     }
+                    LLVMBasicBlockRef ar_do = NULL, ar_end = NULL;
+                    emit_oob_store_split(g, ar_oob, &ar_do, &ar_end);
                     LLVMValueRef stored = right;
                     LLVMTypeKind slot_k = LLVMGetTypeKind(elem_llvm);
                     LLVMTypeKind val_k = LLVMGetTypeKind(LLVMTypeOf(stored));
@@ -6061,6 +6087,7 @@ binding_lowered:
                             stored = coerce_int_to(g, stored, elem_llvm);
                         zan_store_fit(g, stored, elem_ptr);
                     }
+                    emit_oob_store_finish(g, ar_do, ar_end);
                     emit_release_owned_call_temp(g, arr_expr, arr_ptr, locals);
                 } else {
                     zan_diag_emit(g->diag, DIAG_ERROR, expr->binary.left->loc,
@@ -6289,6 +6316,7 @@ static LLVMValueRef emit_incdec_expr(zan_irgen_t *g, zan_ast_node_t *expr,
     LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
     LLVMValueRef slot_ptr = NULL;
     LLVMValueRef slot_str_base = NULL;
+    LLVMValueRef slot_oob = NULL;
     LLVMTypeRef slot_ty = NULL;
     zan_symbol_t *prop_getter = NULL;
     zan_symbol_t *prop_setter = NULL;
@@ -6411,9 +6439,10 @@ static LLVMValueRef emit_incdec_expr(zan_irgen_t *g, zan_ast_node_t *expr,
             LLVMValueRef arr_ptr = emit_expr(g, arr_expr, locals);
             if (at->array_rank > 1) {
                 slot_ptr = emit_mdarray_elem_ptr(g, arr_ptr, operand,
-                                                  elem_llvm, locals);
+                                                  elem_llvm, locals, &slot_oob);
             } else {
                 LLVMValueRef idx = emit_expr(g, operand->index.index, locals);
+                slot_oob = emit_index_oob_pred(g, idx, zan_array_len(g, arr_ptr));
                 emit_index_bounds_check(g, idx, zan_array_len(g, arr_ptr),
                     operand->loc, "array");
                 idx = emit_index_safe_bounds(g, idx, zan_array_len(g, arr_ptr),
@@ -6429,6 +6458,7 @@ static LLVMValueRef emit_incdec_expr(zan_irgen_t *g, zan_ast_node_t *expr,
             if (expr_has_reliable_string_bounds(arr_expr, locals)) {
                 arr_ptr = emit_string_base_guard(g, arr_ptr, operand->loc);
                 LLVMValueRef str_len = emit_string_buffer_len(g, arr_ptr, operand->loc);
+                slot_oob = emit_index_oob_pred(g, idx, str_len);
                 emit_index_bounds_check(g, idx, str_len, operand->loc, "string");
                 idx = emit_index_safe_bounds(g, idx, str_len, operand->loc, "string");
             } else {
@@ -6488,7 +6518,10 @@ static LLVMValueRef emit_incdec_expr(zan_irgen_t *g, zan_ast_node_t *expr,
             if (uov) {
                 LLVMValueRef old_v = LLVMBuildLoad2(g->builder, slot_ty,
                                                     slot_ptr, "inc.old");
+                LLVMBasicBlockRef inc_do = NULL, inc_end = NULL;
+                if (slot_oob) emit_oob_store_split(g, slot_oob, &inc_do, &inc_end);
                 zan_store_fit(g, uov, slot_ptr);
+                if (slot_oob) emit_oob_store_finish(g, inc_do, inc_end);
                 if (slot_str_base)
                     emit_string_len_invalidate(g, slot_str_base);
                 return is_prefix ? uov : old_v;
@@ -6511,7 +6544,10 @@ static LLVMValueRef emit_incdec_expr(zan_irgen_t *g, zan_ast_node_t *expr,
             ? zan_add(g->builder, old_val, one, "inc")
             : zan_sub(g->builder, old_val, one, "dec");
     }
+    LLVMBasicBlockRef inc_do = NULL, inc_end = NULL;
+    if (slot_oob) emit_oob_store_split(g, slot_oob, &inc_do, &inc_end);
     zan_store_fit(g, new_val, slot_ptr);
+    if (slot_oob) emit_oob_store_finish(g, inc_do, inc_end);
     if (slot_str_base) emit_string_len_invalidate(g, slot_str_base);
     return is_prefix ? new_val : old_val;
 }
@@ -7809,7 +7845,7 @@ static LLVMValueRef emit_expr_index(zan_irgen_t *g, zan_ast_node_t *expr,
             LLVMValueRef elem_ptr;
             if (arr_type->array_rank > 1) {
                 elem_ptr = emit_mdarray_elem_ptr(g, arr_ptr, expr,
-                                                 elem_llvm, locals);
+                                                 elem_llvm, locals, NULL);
             } else {
                 LLVMValueRef idx = emit_expr(g, expr->index.index, locals);
                 LLVMValueRef arr_len = zan_array_len(g, arr_ptr);
