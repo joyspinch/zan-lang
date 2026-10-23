@@ -247,15 +247,19 @@
 - 根因链：parser.c 解析 ✓ → checker.c 检查 ✓ → **binder.c 无 `AST_DESTRUCTOR_DECL` 分支** → irgen 无处理。
 - 探针：`_scratch/csaudit/objectmodel/p10_cycle_leak.zan`、`_scratch/csaudit/types/v_dtor.zan`（复验：当场报错）。
 
-### [~] A518 泛型方法调用点不检查 where 约束
+### [x] A518 泛型方法调用点不检查 where 约束
 - **宿主侧已修（2026-10-23）**：checker 新增调用点约束检查——符号解析后按显式
   类型实参 + 形参形状合一（容器/数组/可空递归）推绑定，再逐条 where 检查；
   绑不出的参数放行（skill 一.7"判不出不误杀"）。探针复验：
   `FirstItem(List<int>)` where T : Entity 当场报错；`FirstItem(List<Item>)` 正常。
-- 待办：① 类泛型 `new Repo<int>()` 检查重复报两次（美容级）；② 自举半边。
-- 原始实测：`static T FirstItem<T>(List<T> xs) where T : Entity` 传 `List<int>` **静默编译运行通过**（隔离探针亲验）；方法体用到约束成员时报错落在方法体解析（措辞/位置误导）。类泛型 `new Repo<int>()` 有检查但**重复报两次**。
-- `static T FirstItem<T>(List<T> xs) where T : Entity` 传 `List<int>` **静默编译运行通过**（隔离探针亲验）；方法体用到约束成员时报错落在方法体解析（措辞/位置误导）。类泛型 `new Repo<int>()` 有检查但**重复报两次**。
-- 根因落点：checker.c `check_generic_constraints`（:776）只挂 new 表达式（:3194）/var 声明（:3716）/返回类型（:4686）三处，调用解析路径缺失。
+- **自举侧已对齐（2026-10-23）**：`src/selfhost/checker.zan` 在方法调用分派点
+  （普通调用与成员调用两路径）加入 `CheckMethodConstraints`，结构化合一形参和实参
+  （`UnifyMethodTp` 支持单类型参数、嵌套泛型容器及数组），对绑定的类型实参
+  通过 `DerivesFromName` 校验基类约束链；不满足时报出与宿主逐字一致的错误：
+  `type '<arg>' does not satisfy constraint '<cn>' for type parameter '<tp>' of method '<m>'`。
+- **用例收口**：新增 conformance 正向测试 `tests/conformance/generic_method_where_constraint.{zan,out}`
+  与自举差分负向用例 `tests/selfhost/reject/generic_method_constraint.zan`（`reject_cases.txt`
+  双端错误文案锁定）。
 - 探针：`_scratch/csaudit/types/{p12_compile_rejects,p14_method_constraint}.zan`。
 
 ### [x] A519 for 循环变量逐迭代新建（C# 的 for 头变量是共享单变量）

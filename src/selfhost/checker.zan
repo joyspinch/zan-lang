@@ -1724,6 +1724,7 @@ public class Checker {
                 diags.Error("no overload of '" + callee.sval + "' takes " + argc + " argument(s)", n.line, n.col);
             }
             if (!hasNamed) { CheckTaskArgs(cands, n); }
+            CheckMethodConstraints(cands, n);
             return;
         }
         if (callee != null && callee.kind == AK.MemberAccess()) {
@@ -1731,18 +1732,109 @@ public class Checker {
             Node ot = InferType(callee.a);
             Node cls = ClassOf(ot);
             if (cls != null) {
+                Node mm = null;
                 if (!HasMember(cls, callee.sval) && !HasExt(cls.sval, callee.sval)) {
                     if (!IsReflInstName(callee.sval)) {
                         diags.Error("type '" + cls.sval + "' has no member '" + callee.sval + "'", n.line, n.col);
                     }
-                } else if (MethodUp(cls, callee.sval) != null && !hasNamed && !AcceptsArgc(cls, callee.sval, argc)) {
+                } else if ((mm = MethodUp(cls, callee.sval)) != null && !hasNamed && !AcceptsArgc(cls, callee.sval, argc)) {
                     diags.Error("no overload of '" + callee.sval + "' takes " + argc + " argument(s)", n.line, n.col);
                 }
-                if (!hasNamed) { CheckTaskArgs(MethodUp(cls, callee.sval), n); }
+                if (mm == null) { mm = MethodUp(cls, callee.sval); }
+                if (!hasNamed) { CheckTaskArgs(mm, n); }
+                CheckMethodConstraints(mm, n);
             }
             return;
         }
         CheckObj(callee);
+    }
+
+    // A518: method-call-site where-constraint check, mirroring the C host's
+    // checker_check_method_call_constraints (checker.c ~1757). A generic
+    // method's `where T : Entity` clauses parse onto the method's TypeParam
+    // kids (parser.zan ParseWhereClauses on the member node); the call site
+    // must verify the type arguments actually satisfy them. The C host also
+    // reads explicit call type args; the self-host strips those before
+    // binding (parser StripTypeArgs), so bindings come from parameter-shape
+    // unification only -- List<T> vs List<int> binds T=int. Unresolvable
+    // bindings pass (the "don't kill on what you can't judge" rule); the
+    // satisfaction walk has the base chain only (DerivesFromName), so an
+    // interface constraint binds nothing and passes -- the declared model
+    // limit, same as the assignment-compatibility walk.
+    void CheckMethodConstraints(Node m, Node call) {
+        if (m == null || m.kind != AK.MethodDecl()) { return; }
+        List<Node> tps = new List<Node>();
+        int i = 0;
+        while (i < m.kids.Count) {
+            if (m.kids[i].kind == AK.TypeParam()) { tps.Add(m.kids[i]); }
+            i = i + 1;
+        }
+        if (tps.Count <= 0 || tps.Count > 8) { return; }
+        bool anyCons = false;
+        int w = 0;
+        while (w < tps.Count) { if (tps[w].b != null) { anyCons = true; } w = w + 1; }
+        if (!anyCons) { return; }
+        Node[] bind = new Node[tps.Count];
+        int j = 0;
+        int ai = 0;
+        while (j < m.kids.Count && ai < call.kids.Count) {
+            Node p = m.kids[j];
+            if (p.kind == AK.Param()) {
+                Node a = call.kids[ai];
+                if (a != null) { UnifyMethodTp(p.type, InferType(a), tps, bind); }
+                ai = ai + 1;
+            }
+            j = j + 1;
+        }
+        i = 0;
+        while (i < tps.Count) {
+            Node tp = tps[i];
+            Node arg = bind[i];
+            if (tp.b != null && arg != null && !binder.IsTypeParam(arg.sval)) {
+                string cn = tp.b.sval;
+                if (cn != "" && !DerivesFromName(arg.sval, cn)) {
+                    diags.Error("type '" + arg.sval + "' does not satisfy constraint '" + cn + "' for type parameter '" + tp.sval + "' of method '" + m.sval + "'", call.line, call.col);
+                }
+            }
+            i = i + 1;
+        }
+    }
+
+    // structural unification of a declared parameter type against an
+    // argument type (the host's checker_unify_method_tp on Node types):
+    // a type-parameter mention binds to the argument; containers recurse
+    // pairwise when arities match; arrays recurse into the element (the
+    // element lives in sval with the rank decremented); a nullable param
+    // binds only from a nullable argument (the op flag marks nullability,
+    // there is no separate element node to descend into)
+    void UnifyMethodTp(Node dp, Node at, List<Node> tps, Node[] bind) {
+        if (dp == null || at == null) { return; }
+        if (dp.ival < 1 && dp.op != 1 && binder.IsTypeParam(dp.sval)) {
+            int i = 0;
+            while (i < tps.Count) {
+                if (tps[i].sval == dp.sval) {
+                    if (bind[i] == null && at.ival < 1 && at.op != 1 && !binder.IsTypeParam(at.sval)) {
+                        bind[i] = at;
+                    }
+                    return;
+                }
+                i = i + 1;
+            }
+            return;
+        }
+        if (dp.kids.Count > 0 && dp.kids.Count == at.kids.Count) {
+            int i = 0;
+            while (i < dp.kids.Count) {
+                UnifyMethodTp(dp.kids[i], at.kids[i], tps, bind);
+                i = i + 1;
+            }
+            return;
+        }
+        if (dp.ival >= 1 && at.ival == dp.ival) {
+            Node de = MkType(dp.sval); de.ival = dp.ival - 1;
+            Node ae = MkType(at.sval); ae.ival = at.ival - 1;
+            UnifyMethodTp(de, ae, tps, bind);
+        }
     }
 
     // A no-result handle passed where a Task<T> is expected: the same rule as
