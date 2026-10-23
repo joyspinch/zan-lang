@@ -275,7 +275,23 @@
   这些内建仍会把对象指针当 C 文本去 `strtoll`/`strtod` 解析，静默得到 0。
   与本条同源：object 没有通用 ToString / 值语义就没法正确分流。
 
-### [~] A443 `Convert.ToString` 是编译器自造的接口——公开面（stdlib / 内建成员表）里根本没有它
+### [x] A443 `Convert.ToString` 是编译器自造的接口——公开面（stdlib / 内建成员表）里根本没有它
+- **已修（2026-10-24，a0304a3c3）**：十三重载真方法进 `stdlib/System/Convert.zan`
+  （string/char/bool/int/long/short/byte/sbyte/ushort/uint/ulong/double/float，
+  体内委托实例 `x.ToString()`），`--emit-symbols` 的 `System.Convert` 下全量
+  可见，IDE 补全补得出。bool 小写渲染（A441）随实例 ToString 一次定死。
+  两侧各收一个口：
+  - 宿主 `resolve_overload_typed`：Convert+ToString 只认**精确同型**（分=4）
+    的重载，宽容分与无匹配静默返 NULL 交还内建——宽容分会把可空 box 指针
+    当 i64 送进 ToString(int)（LLVM verify 炸）；无匹配曾报死 "no overload
+    matches"、顶掉 A463 措辞（四个 convert_to_string_* reject 用例齐红）。
+    内建守卫从「类型定义了就整体关内建」改为「实参与某重载形参精确同型
+    才让路」（`zan_convert_tostring_exact_decl`）。
+  - 自举 GenCall 内建特判先于方法解析（真方法不参与分派），补内建形状
+    缺口：ToCStr 可空分支（cond_br+phi 同宿主 emit_to_cstr_u，null 出 ""）
+    与 Convert.ToString 位点的 object 指针分支（strlen+memcpy 同宿主 2274）。
+  - object/枚举/数组形状维持既有行为（object 指针拷贝、枚举出数值、数组
+    A463 拒绝），真方法的参数表表达不了这些，**没有**给 object 加重载。
 - 追加（2026-10-23，自 A526 移入）：`--api`/`--emit-symbols` 对内建成员覆盖不全——
   `List.Remove` 查不到但存在，与 Convert.ToString 同族（特判实现了、成员表没登记）。
 
