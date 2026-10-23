@@ -667,13 +667,7 @@ static void emit_eh_propagate_tail(zan_irgen_t *g) {
                 LLVMAppendBasicBlockInContext(g->ctx, fn, "reh.anon");
             LLVMBuildCondBr(g->builder, found, named_bb, anon_bb);
             LLVMPositionBuilderAtEnd(g->builder, named_bb);
-            {
-                LLVMValueRef cfmt2 = zan_irgen_intern_string(g,
-                    "Unhandled exception: %s\n");
-                LLVMValueRef cargs[2] = { cfmt2, cname };
-                zan_call2(g->builder, printf_ty, printf_fn, cargs, 2, "");
-            }
-            LLVMBuildBr(g->builder, reh_cont_bb);
+            emit_unhandled_class_exc_print(g, fn, printf_ty, printf_fn, cname, exc, tid, reh_cont_bb);
             LLVMPositionBuilderAtEnd(g->builder, anon_bb);
             LLVMValueRef cfmt = zan_irgen_intern_string(g,
                 "Unhandled exception (class object)\n");
@@ -3620,13 +3614,7 @@ throw_unwind:
                         LLVMAppendBasicBlockInContext(g->ctx, fn2, "die.anon");
                     LLVMBuildCondBr(g->builder, found, named_bb, anon_bb);
                     LLVMPositionBuilderAtEnd(g->builder, named_bb);
-                    {
-                        LLVMValueRef fmt2 = zan_irgen_intern_string(g,
-                            "Unhandled exception: %s\n");
-                        LLVMValueRef args2[] = { fmt2, cname };
-                        zan_call2(g->builder, printf_ty, printf_fn, args2, 2, "");
-                    }
-                    LLVMBuildBr(g->builder, die_cont_bb);
+                    emit_unhandled_class_exc_print(g, fn2, printf_ty, printf_fn, cname, dexc, dtid, die_cont_bb);
                     LLVMPositionBuilderAtEnd(g->builder, anon_bb);
                     LLVMValueRef fmt = zan_irgen_intern_string(g,
                         "Unhandled exception (class object)\n");

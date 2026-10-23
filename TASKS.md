@@ -372,11 +372,16 @@
   - 宿主 `zanc`（`irgen.c`/`irgen_call.c`/`main.c`）为 `Console.WriteLine` 补齐 `g->rt_print_float`，`emit_dbl_str` 自动标记单精度符号位，使得 `float.ToString()`、`Console.Write/WriteLine`、字符串插值与拼接均遵循单精度 C# .NET 8 shortest-round-trip 规范；
   - 自举编译器（`src/selfhost/irgen_expr.zan`）同步支持 `FltToStr`，双端生成一致语义；
   - conformance 用例 `tests/conformance/double_print_format.{zan,out}` 扩充单精度覆盖，差分门通过。
-- 待办：其余件（未捕获异常输出格式）按需逐件。
+- **未捕获类异常诊断输出附带 Message 已修（2026-10-23）**：
+  - 编译器代码生成（`src/compiler/irgen_stmt.c` 与 `src/compiler/irgen_async.c`）：未捕获类异常经 `emit_unhandled_class_exc_print` 动态校验是否派生自 `Exception`；若是且 `Message` 非空，输出 `Unhandled exception: <ClassName>: <Message>\n`（对齐 C# .NET 8 规范），空消息或普通对象优雅回退为 `Unhandled exception: <ClassName>\n`；
+  - 同步抛出栈展开终点（`die_cls_bb`）、主线程/未捕获异常出口（`reh_cls_bb`）与异步协程顶层出口（`cls_bb`）三处统一口径；
+  - 标准库 `stdlib/System/Exception.zan` 补齐无参构造器 `Exception()`，并将 `ToString()` 标记为 `virtual`；
+  - conformance 用例 `tests/conformance/exc_uncaught_name.{zan,out}` 扩充 `ToString()`、内部异常级联与无参构造覆盖，单测闭环通过。
+- 待办：其余件按需逐件。
 - bool 全路径小写 true/false（五条渲染路径内部一致；C# True/False——A441 闭账口径=统一，非 .NET 口径，协议/日志大小写敏感场景有实害）。
 - `char.ToString()` 返回码点数字 "65"（C# "A"；WriteLine(char) 与拼接却正确——渲染路径互相不一致）。
 - `-0.0` 打印丢符号（C# "-0"）；float 打印按 double 展开（0.1f+0.2f→"0.30000001192092896"，C# "0.3"）。
-- 未捕获异常：exit=1（C# 0xE0434352）、消息打 **stdout** 且不含异常 Message（C# stderr+Message+栈）；`e.ToString()` 裸 Message；无 `Exception.StackTrace`（编译期拒绝）。
+- 未捕获异常：exit=1（C# 0xE0434352）、无 `Exception.StackTrace`（编译期拒绝）。
 - 探针：`_scratch/csaudit/{string/p08,numeric/p05,exceptions/,operators/p00}`。
 
 ### [x] A524 多字节字符串的索引与 Length 按 UTF-8 字节（SPEC 未声明口径）

@@ -1940,6 +1940,66 @@ static void emit_async_exc_epilogue(zan_irgen_t *g, local_scope_t *locals) {
     emit_async_complete(g, locals, NULL);
 }
 
+static void emit_unhandled_class_exc_print(zan_irgen_t *g, LLVMValueRef fn,
+                                           LLVMTypeRef printf_ty,
+                                           LLVMValueRef printf_fn,
+                                           LLVMValueRef cname,
+                                           LLVMValueRef exc,
+                                           LLVMValueRef tid,
+                                           LLVMBasicBlockRef cont_bb) {
+    LLVMTypeRef i8t = LLVMInt8TypeInContext(g->ctx);
+    LLVMTypeRef i8ptr = LLVMPointerType(i8t, 0);
+    LLVMTypeRef i1t = LLVMInt1TypeInContext(g->ctx);
+
+    LLVMBasicBlockRef no_msg_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "uexc.nomsg");
+
+    /* 检查抛出的类是否继承自 Exception（或本身就是 Exception） */
+    zan_symbol_t *exc_sym = zan_binder_lookup(g->binder, (zan_istr_t){ (char *)"Exception", 9 });
+    if (!exc_sym) exc_sym = zan_binder_lookup(g->binder, (zan_istr_t){ (char *)"System.Exception", 16 });
+
+    if (exc_sym && exc_sym->type && exc_sym->type->kind == TYPE_CLASS && exc && tid) {
+        LLVMValueRef match_fn = get_eh_tid_match_fn(g);
+        LLVMTypeRef match_ty = LLVMFunctionType(i1t, (LLVMTypeRef[]){ i8ptr, i8ptr }, 2, 0);
+        LLVMValueRef want_tid = LLVMBuildBitCast(g->builder,
+            get_class_tid_global(g, exc_sym), i8ptr, "uexc.want_tid");
+        LLVMValueRef is_exc = zan_call2(g->builder, match_ty, match_fn,
+            (LLVMValueRef[]){ tid, want_tid }, 2, "uexc.is_exc");
+
+        LLVMBasicBlockRef chk_msg_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "uexc.chkmsg");
+        LLVMBuildCondBr(g->builder, is_exc, chk_msg_bb, no_msg_bb);
+
+        LLVMPositionBuilderAtEnd(g->builder, chk_msg_bb);
+        LLVMValueRef obj = LLVMBuildBitCast(g->builder, exc, LLVMPointerType(i8ptr, 0), "uexc.obj");
+        LLVMValueRef msg_p = LLVMBuildGEP2(g->builder, i8ptr, obj,
+            (LLVMValueRef[]){ LLVMConstInt(LLVMInt64TypeInContext(g->ctx), 1, 0) }, 1, "uexc.msgp");
+        LLVMValueRef msg = LLVMBuildLoad2(g->builder, i8ptr, msg_p, "uexc.msg");
+        LLVMValueRef has_msg = zan_icmp(g->builder, LLVMIntNE, msg, LLVMConstNull(i8ptr), "uexc.hasmsg");
+
+        LLVMBasicBlockRef with_msg_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "uexc.withmsg");
+        LLVMBuildCondBr(g->builder, has_msg, with_msg_bb, no_msg_bb);
+
+        LLVMPositionBuilderAtEnd(g->builder, with_msg_bb);
+        LLVMValueRef ch0 = LLVMBuildLoad2(g->builder, i8t, msg, "uexc.ch0");
+        LLVMValueRef not_empty = zan_icmp(g->builder, LLVMIntNE, ch0, LLVMConstInt(i8t, 0, 0), "uexc.ne");
+        LLVMBasicBlockRef print_msg_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "uexc.pmsg");
+        LLVMBuildCondBr(g->builder, not_empty, print_msg_bb, no_msg_bb);
+
+        LLVMPositionBuilderAtEnd(g->builder, print_msg_bb);
+        LLVMValueRef fmt_msg = zan_irgen_intern_string(g, "Unhandled exception: %s: %s\n");
+        LLVMValueRef args3[3] = { fmt_msg, cname, msg };
+        zan_call2(g->builder, printf_ty, printf_fn, args3, 3, "");
+        LLVMBuildBr(g->builder, cont_bb);
+    } else {
+        LLVMBuildBr(g->builder, no_msg_bb);
+    }
+
+    LLVMPositionBuilderAtEnd(g->builder, no_msg_bb);
+    LLVMValueRef cfmt2 = zan_irgen_intern_string(g, "Unhandled exception: %s\n");
+    LLVMValueRef cargs[2] = { cfmt2, cname };
+    zan_call2(g->builder, printf_ty, printf_fn, cargs, 2, "");
+    LLVMBuildBr(g->builder, cont_bb);
+}
+
 /* 重抛全局异常：跳转至最近挂载的处理器或终止进程 */
 static void emit_eh_rethrow_current(zan_irgen_t *g) {
     LLVMTypeRef i32 = LLVMInt32TypeInContext(g->ctx);
@@ -2017,11 +2077,7 @@ static void emit_eh_rethrow_current(zan_irgen_t *g) {
                 LLVMValueRef use = LLVMBuildSelect(g->builder, empty,
                     zan_irgen_intern_string(g, "unknown"),
                     cname, "aeh.use");
-                LLVMValueRef cfmt = zan_irgen_intern_string(g,
-                    "Unhandled exception: %s\n");
-                LLVMValueRef cargs[2] = { cfmt, use };
-                zan_call2(g->builder, printf_ty, printf_fn, cargs, 2, "");
-                LLVMBuildBr(g->builder, done_bb);
+                emit_unhandled_class_exc_print(g, fn, printf_ty, printf_fn, use, exc, tid, done_bb);
             }
             LLVMPositionBuilderAtEnd(g->builder, done_bb);
         }
