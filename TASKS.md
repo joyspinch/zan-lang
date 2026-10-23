@@ -201,27 +201,6 @@
   这类用例后再对齐。
 - 关联：A438（已修，结论在 git 历史）。
 
-### [ ] A451 自举后端没有一元运算符重载派发——同一份源码两个后端语义不同
-
-- 现象（2026-10-21 实测，用例 `tests/conformance/unary_plus_overload.zan`，
-  自举 gen1 按差分门同款流程编+链+跑）：
-  - C 宿主：输出 `6 / 8 / 10`——一元 `operator +` 被**派发**，重载把值 +1。
-  - 自举后端：输出 `5 / 7 / 9`——重载**根本没被调用**，操作数原样返回。
-- 根因：`src/selfhost/irgen_expr.zan:156-196` `GenUnary` 只处理 `++/--`、`!`、
-  `~`、`-`（内建），`TK.Plus()` 落到末尾 `return v`（恒等）；自举后端**没有**
-  一元重载派发这一层（C 宿主是 `src/compiler/irgen_expr.c:4352`
-  `emit_unary_op_overload`，按形参个数 1 区分一元）。一元 `-` 打在类/结构体上
-  更糟：`sub i64 0, <指针>` → 非法 IR。
-- 影响：两后端对同一份源码给出不同结果；`operator_unary_overload`（A438 落的
-  用例）与 `unary_plus_overload` 都没进差分门清单，正是因为它们会分叉——
-  差分门目前**看不见**这个缺口。
-- 方向：自举 `GenUnary` 增派发：操作数是类 / 结构体时查 static `op_add` /
-  `op_sub` 且形参个数为 1 的重载，找到就 `call`，找不到就报与宿主同款诊断
-  （`type 'X' does not define a unary '+' operator overload`），两者都不许
-  静默恒等。
-- ⚠ `src/selfhost/irgen_expr.zan` 此刻正被另一会话在途修改，本轮无法同一次
-  提交落地，等窗口。
-
 ### [ ] A444 `Convert.ToString(object)` 仍按 C 字符串读——object 里装类实例时依然越界读
 
 - 现象：A4xx 那条修复（`Convert.ToString` 按静态类型分流）把类 / 结构体 /

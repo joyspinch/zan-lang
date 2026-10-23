@@ -163,21 +163,52 @@ partial class Irgen {
     // declaration op_inc/op_dec; the dispatch looks it up on the operand's
     // class chain and calls the static method. Returns null when the operand
     // is not a class or declares no such operator (numeric paths proceed).
+    // The 1-parameter overload of `mn` among `cls`'s own members. Unary and
+    // binary forms share the name (op_add/op_sub); the unary dispatch must
+    // not land on the binary one (A451, host resolve_op_overload distinguishes
+    // by param count).
+    int OpParamCount(Node m) {
+        int n = 0; int i = 0;
+        while (i < m.kids.Count) {
+            if (m.kids[i].kind == AK.Param()) { n = n + 1; }
+            i = i + 1;
+        }
+        return n;
+    }
+
+    Node OpMethod1(Node cls, string mn) {
+        int i = 0;
+        while (i < cls.kids.Count) {
+            Node m = cls.kids[i];
+            if (m.kind == AK.MethodDecl() && m.sval == mn && OpParamCount(m) == 1) {
+                return m;
+            }
+            i = i + 1;
+        }
+        return null;
+    }
+
     ExprVal TryUnaryOpOverload(Node e, ExprVal v) {
         if (v.ty == null || v.ty.ival != 0) { return null; }
         Node ucls = ClassOf(v.ty);
         if (ucls == null) { return null; }
-        string unm = e.op == TK.PlusPlus() ? "op_inc" : "op_dec";
+        string unm = null;
+        string usign = null;
+        if (e.op == TK.PlusPlus()) { unm = "op_inc"; usign = "++"; }
+        else if (e.op == TK.MinusMinus()) { unm = "op_dec"; usign = "--"; }
+        else if (e.op == TK.Plus()) { unm = "op_add"; usign = "+"; }
+        else if (e.op == TK.Minus()) { unm = "op_sub"; usign = "-"; }
+        if (unm == null) { return null; }
         Node declCls = OpDeclClass(ucls, unm);
         if (declCls == null) { return null; }
-        Node um = FindMethodUp(declCls, unm);
+        Node um = OpMethod1(declCls, unm);
         if (um == null || !HasMod(um, MOD.Static())) { return null; }
         Node p0 = ParamTypeNode(um, 0);
         if (p0 == null) { return null; }
         string rt = MapType(um.type);
         if (rt == "void") {
-            diags.Error("operator " + (e.op == TK.PlusPlus() ? "++" : "--")
-                + " must return a value", e.line, e.col);
+            diags.Error("operator " + usign + " must return a value",
+                e.line, e.col);
             return null;
         }
         string args = MapType(p0) + " " + CallArg(v, p0, false);
@@ -185,6 +216,13 @@ partial class Irgen {
         string t = NT();
         L("  " + t + " = call " + rt + " @" + sym + "(" + args + ")");
         return new ExprVal(t, um.type);
+    }
+
+    // class/struct operand: nominal type whose declaration is a class or
+    // struct (numerics, string, enums, arrays fall through to builtins)
+    bool UnaryOperandIsNamedComposite(ExprVal v) {
+        if (v.ty == null || v.ty.ival != 0) { return false; }
+        return ClassOf(v.ty) != null;
     }
 
     ExprVal GenUnary(Node e) {
@@ -232,7 +270,30 @@ partial class Irgen {
             r.wbits = ValWidth(v);
             return r;
         }
+        if (e.op == TK.Plus()) {
+            // unary plus on a class/struct dispatches the 1-param op_add;
+            // a missing overload is a compile error, never a silent identity
+            // (A451, host emit_unary_op_overload)
+            if (UnaryOperandIsNamedComposite(v)) {
+                ExprVal uov = TryUnaryOpOverload(e, v);
+                if (uov != null) { return uov; }
+                diags.Error("type '" + v.ty.sval
+                    + "' does not define a unary '+' operator overload",
+                    e.line, e.col);
+            }
+            return v;
+        }
         if (e.op == TK.Minus()) {
+            if (UnaryOperandIsNamedComposite(v)) {
+                // the builtin path would emit `sub i64 0, <ptr>` -- invalid
+                // IR on a struct/class operand; dispatch or diagnose (A451)
+                ExprVal uov = TryUnaryOpOverload(e, v);
+                if (uov != null) { return uov; }
+                diags.Error("type '" + v.ty.sval
+                    + "' does not define a unary '-' operator overload",
+                    e.line, e.col);
+                return v;
+            }
             if (IsDbl(v.ty)) {
                 string t = NT();
                 L("  " + t + " = fneg double " + v.op);
