@@ -1801,3 +1801,21 @@
   `Get()` 调用（而不是常量槽），让读与渲染同源；需要确认这条隐式降解在
   类型检查（`checker_type_assignable` 允许 `Binding<T>` 赋给 `T`）与 irgen
   两侧的落点一致，并补一条 conformance。
+### [ ] A544 子窗口（聊天记录窗/独立聊天窗/设置窗）在本会话无法像素验收
+- 现象：`ZAN_UI_SCRIPT` 的 `dump pixels` 只抓**主 App** 的窗口；子窗口
+  （`Gui.ChildWindow`：聊天记录窗、独立聊天窗、设置窗、通讯录管理窗）是
+  各自的顶层窗口，抓不到。改用屏幕抓取（CopyFromScreen）在本会话拿到的是
+  全黑桌面——没有可交互的桌面会话。
+- 绕法（已落地）：把窗口**内容**（视图）塞进独立宿主 Form 再抓像素。设置窗
+  （`WxSettingsView`）与通讯录管理窗（`WxContactManagerView`）用这招验过，
+  像素正常（导航列、正文、底栏各归各位）。聊天记录窗与独立聊天窗把 root
+  建在 ChildWindow 类内部，视图接口没暴露，暂用这招。
+- 待查（从聊天记录窗那次运行的 `ZAN_GUI_LAYOUTLINT=1` 日志里冒出来的 6 条
+  「裁剪」命中）：`ToolStrip` 里的 `Button[506,201 0x28]`（宽度 0，装不下
+  28x28 图标）与 `Button[759,301 0x42]`，以及聊天页骨架里的图标钮
+  `Button[453,46 23x28]`、`Button[484,46 24x28]`、`Button[679,69 35x42]`、
+  `Button[726,69 36x42]`。图标钮按 skill 规矩应挂 `.FreeLayout` 免检；
+  ToolStrip 的 0 宽项要确认是「ToolStrip 自绘、按钮只是代理」的误报还是
+  真缺陷（聊天页输入区工具条同样是 ToolStrip，十页重跑时 0 命中）。
+- 前提：要有可交互的桌面会话（锁屏/远程会话会拿到黑屏），或让子窗口支持
+  把 root 暴露给宿主驱动。
