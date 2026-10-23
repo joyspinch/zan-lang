@@ -211,7 +211,7 @@
 - 根因落点：同 A507（runtime 无异常通道，Convert/Parse 失败分支返 0）。
 - 探针：`_scratch/csaudit/numeric/p11_convert_fail.zan`。
 
-### [~] A516 构造顺序与 C# 分叉：基类构造先于派生字段初始化器
+### [x] A516 构造顺序与 C# 分叉：基类构造先于派生字段初始化器
 - **宿主侧已修（2026-10-23）**：构造器 prologue（irgen_emit.c）把本类字段初始化器
   挪到基类构造链调用之前（this 链仍由链目标构造器统一发）。探针复验：
   `d-init → b-init → base-ctor → derived-ctor`（原 `b-init / base-ctor / d-init /
@@ -222,8 +222,8 @@
   `p03_ctor_virtual` 自举与宿主逐行一致（d-init 先、虚调用读 42）。分配点的
   链式助手（隐式构造器替身）维持根优先——与宿主 `emit_implicit_field_initializers`
   的递归顺序一致，A516 未动该路径。
-- 实测曾为 `b-init / base-ctor / d-init / derived-ctor`；C# 是**派生字段初始化器最先**（d-init → b-init → base-ctor → derived-ctor）。直接后果：基类构造器里的虚调用读派生内联字段得默认值（实测 `derived:0`，C# `derived:42`）。静默错值。
-- 根因落点：`src/compiler/irgen_emit.c` 构造器 prologue 顺序（非 irgen.c）。
+- **用例收口**：新增 conformance 用例 `tests/conformance/ctor_derived_field_init_order.{zan,out}`
+  并加入自举差分门 `tests/selfhost/diff_cases.txt`，两端全绿闭账。
 - 探针：`_scratch/csaudit/objectmodel/{p02_ctor_chain,p03_ctor_virtual}.zan`。
 
 ### [~] A517 析构器 `~X()` 是死语法：解析/检查过、从不发射、从不调用
