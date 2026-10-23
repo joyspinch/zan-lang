@@ -326,6 +326,7 @@ Classes:
 - ARC managed (automatic retain/release)
 - Support single inheritance + multiple interfaces
 - Support virtual methods and override
+- **声明的语言差异（静态构造器与静态初始化）**：静态字段初始化器与静态构造器（`static ClassName()`）遵循原生 AOT 编译模型——在程序启动进入 `Main` 之前按声明顺序预先全量执行（类似于 Go `init()` 或 C++ 全局对象初始化），而非 C# 基于 JIT 运行时的首次访问惰性触发。静态字段初始化器先于该类的静态构造器执行。
 
 ### 4.5 Interface Declaration
 

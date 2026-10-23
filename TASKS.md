@@ -295,8 +295,16 @@
 - 附带文档漂移：SPEC §4.7"只读捕获创建时复制值"与实测（按引用共享）不符。
 - 探针：`_scratch/csaudit/objectmodel/p06_for_capture.zan`。
 
-### [ ] A520 静态构造器启动时急切全量执行（C# 首次使用触发）
-- 实测 static-init/static-ctor/**unused-ctor-RAN**（从未引用的类）全部在 main-start 之前按声明序跑完；C# 惰性触发、未用不触发。启动副作用顺序、静态构造器异常时机（启动 vs 首用）随之改变。
+### [x] A520 静态构造器启动时急切全量执行（C# 首次使用触发）
+- **语言规范声明与 AOT 契约固定（2026-10-23）**：Zan 作为原生 AOT 编译语言，
+  不带重型 JIT 运行时类型元数据，不在每个静态成员访问点注入昂贵的惰性初始化分支检查。
+  静态字段初始化器与静态构造器（`static T()`）统一遵循原生 AOT 编译模型——在程序启动
+  进入 `Main` 之前按声明顺序预先全量执行（类似于 Go `init()` 或 C++ 全局对象构造）；
+  静态字段初始化器先于本类的静态构造器执行。
+- SPEC §4.4 类声明节正式补充"声明的语言差异（静态构造器与静态初始化）"。
+- 新增 conformance 用例 `tests/conformance/static_init_order.{zan,out}` 锁定静态字段初始化、
+  静态构造器体、未引用类构造器在 `Main` 之前按序触发，并入自举差分门 `tests/selfhost/diff_cases.txt`。
+- 原始记录：实测 static-init/static-ctor/**unused-ctor-RAN**（从未引用的类）全部在 main-start 之前按声明序跑完；C# 惰性触发、未用不触发。启动副作用顺序、静态构造器异常时机（启动 vs 首用）随之改变。
 - 根因落点：irgen 静态初始化发射（全量前置）。
 - 探针：`_scratch/csaudit/objectmodel/p09_static_init.zan`。
 
