@@ -96,6 +96,10 @@ public class PiDir {
 }
 
 public class Program {
+    [DllImport("crt")] static extern long fopen(string path, string mode);
+    [DllImport("crt")] static extern long fread(byte[] buf, long size, long count, long f);
+    [DllImport("crt")] static extern long fclose(long f);
+
     static string stdlibRoot;
     static List<string> inclPaths;
     static List<string> inclSrcs;
@@ -211,11 +215,6 @@ public class Program {
                         PiGlobDir(d, root + "/src/" + d.subdir);
                         PiGlobDir(d, root + "/stdlib/" + d.subdir);
                         PiGlobDir(d, root + "/" + d.subdir);
-                        // the package sources that DECLARE this namespace (or
-                        // one of its descendants) join the pull as well -- the
-                        // physical layout of a package says nothing about the
-                        // namespace it provides
-                        PiGlobPkgNs(d, d.subdir);
                         if (d.files.Count == f0 && seg0 == "ZanWeb") {
                             if (d.subdir == "ZanWeb" || d.subdir == "ZanWeb/Web") {
                                 PiGlobFiles(d, root + "/src/ZanWeb/Framework");
@@ -287,6 +286,7 @@ public class Program {
         PiGlobStore(d, pkgProjectRoot + "/.zan-packages");
         PiGlobStore(d, pkgExeStore);
         PiGlobStore(d, pkgGlobalStore);
+        PiGlobPkgNs(d, d.subdir);
     }
 
     // ---- package sources keyed by their DECLARED namespace ----
@@ -353,12 +353,14 @@ public class Program {
         }
     }
 
+    static List<string> pkgSeenNames;
     // index every package source once (the C host builds the same index
     // once and answers every namespace query from it)
     static void PiPkgIdxEnsure() {
         if (pkgNsIdxBuilt) { return; }
         pkgNsIdxBuilt = true;
         pkgNsIdx = new List<PiFile>();
+        pkgSeenNames = new List<string>();
         PiPkgIdxStore(pkgProjectRoot + "/packages");
         PiPkgIdxStore(pkgProjectRoot + "/.zan-packages");
         PiPkgIdxStore(pkgExeStore);
@@ -375,9 +377,18 @@ public class Program {
             string nm = parts[i];
             nm = nm.Trim();
             if (nm != "" && nm.Substring(0, 1) != ".") {
-                string root = store + "/" + nm;
-                PiPkgIdxAdd(root + "/src");
-                PiPkgIdxAdd(root + "/stdlib");
+                bool seen = false;
+                int j = 0;
+                while (j < pkgSeenNames.Count) {
+                    if (pkgSeenNames[j] == nm) { seen = true; break; }
+                    j = j + 1;
+                }
+                if (!seen) {
+                    pkgSeenNames.Add(nm);
+                    string root = store + "/" + nm;
+                    PiPkgIdxAdd(root + "/src");
+                    PiPkgIdxAdd(root + "/stdlib");
+                }
             }
             i = i + 1;
         }
@@ -938,26 +949,57 @@ public class Program {
         }
     }
 
-    // Minimal namespace probe: lex the file, return the first depth-0
+    // Minimal namespace probe: fast header scan, return first depth-0
     // `namespace X.Y` declaration in subdir form (null when none).
     static string PiProbeNs(string path) {
-        if (!File.Exists(path)) { return null; }
-        string src = File.ReadAllText(path);
-        Lexer lx = new Lexer(src);
-        List<Token> toks = lx.Run();
-        int depth = 0;
-        int i = 0;
-        int n = toks.Count;
-        while (i < n) {
-            Token t = toks[i];
-            int k = t.kind;
-            if (k == TK.LBrace()) { depth = depth + 1; }
-            else if (k == TK.RBrace()) { if (depth > 0) { depth = depth - 1; } }
-            else if (k == TK.Namespace() && depth == 0) {
-                PiReadDotted(toks, i + 1);
-                return piDotName;
+        long fp = fopen(path, "rb");
+        if (fp == 0) { return null; }
+        byte[] buf = new byte[1024];
+        long nr = fread(buf, 1, 1024, fp);
+        fclose(fp);
+        if (nr <= 0) { return null; }
+        int n = (int)nr;
+        int p = 0;
+        while (p < n) {
+            if (p + 1 < n && buf[p] == 47 && buf[p + 1] == 47) {
+                p = p + 2;
+                while (p < n && buf[p] != 10 && buf[p] != 13) { p = p + 1; }
+                continue;
             }
-            i = i + 1;
+            if (p + 1 < n && buf[p] == 47 && buf[p + 1] == 42) {
+                p = p + 2;
+                while (p + 1 < n && !(buf[p] == 42 && buf[p + 1] == 47)) { p = p + 1; }
+                if (p + 1 < n) { p = p + 2; }
+                continue;
+            }
+            if (buf[p] == 34) {
+                p = p + 1;
+                while (p < n && buf[p] != 34) {
+                    if (buf[p] == 92 && p + 1 < n) { p = p + 2; }
+                    else { p = p + 1; }
+                }
+                if (p < n) { p = p + 1; }
+                continue;
+            }
+            if (p + 9 <= n
+                && buf[p] == 110 && buf[p + 1] == 97 && buf[p + 2] == 109 && buf[p + 3] == 101
+                && buf[p + 4] == 115 && buf[p + 5] == 112 && buf[p + 6] == 97 && buf[p + 7] == 99
+                && buf[p + 8] == 101) {
+                bool preOk = (p == 0 || buf[p - 1] <= 32 || buf[p - 1] == 59);
+                bool postOk = (p + 9 < n && buf[p + 9] <= 32);
+                if (preOk && postOk) {
+                    p = p + 9;
+                    while (p < n && buf[p] <= 32) { p = p + 1; }
+                    string res = "";
+                    while (p < n && buf[p] > 32 && buf[p] != 59 && buf[p] != 123) {
+                        if (buf[p] == 46) { res = res + "/"; }
+                        else { res = res + (char)buf[p]; }
+                        p = p + 1;
+                    }
+                    if (res != "") { return res; }
+                }
+            }
+            p = p + 1;
         }
         return null;
     }

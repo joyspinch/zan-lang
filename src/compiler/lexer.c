@@ -1153,6 +1153,43 @@ static zan_token_t lexer_string(zan_lexer_t *lex) {
 }
 
 
+static int64_t lexer_next_utf8_cp(zan_lexer_t *lex) {
+    int b0 = (unsigned char)lexer_advance(lex);
+    if (b0 < 0x80) return b0;
+    if ((b0 & 0xE0) == 0xC0) {
+        int b1 = (unsigned char)lexer_peek_ch(lex);
+        if ((b1 & 0xC0) == 0x80) {
+            lexer_advance(lex);
+            return ((int64_t)(b0 & 0x1F) << 6) | (b1 & 0x3F);
+        }
+    } else if ((b0 & 0xF0) == 0xE0) {
+        int b1 = (unsigned char)lexer_peek_ch(lex);
+        if ((b1 & 0xC0) == 0x80) {
+            lexer_advance(lex);
+            int b2 = (unsigned char)lexer_peek_ch(lex);
+            if ((b2 & 0xC0) == 0x80) {
+                lexer_advance(lex);
+                return ((int64_t)(b0 & 0x0F) << 12) | ((int64_t)(b1 & 0x3F) << 6) | (b2 & 0x3F);
+            }
+        }
+    } else if ((b0 & 0xF8) == 0xF0) {
+        int b1 = (unsigned char)lexer_peek_ch(lex);
+        if ((b1 & 0xC0) == 0x80) {
+            lexer_advance(lex);
+            int b2 = (unsigned char)lexer_peek_ch(lex);
+            if ((b2 & 0xC0) == 0x80) {
+                lexer_advance(lex);
+                int b3 = (unsigned char)lexer_peek_ch(lex);
+                if ((b3 & 0xC0) == 0x80) {
+                    lexer_advance(lex);
+                    return ((int64_t)(b0 & 0x07) << 18) | ((int64_t)(b1 & 0x3F) << 12) | ((int64_t)(b2 & 0x3F) << 6) | (b3 & 0x3F);
+                }
+            }
+        }
+    }
+    return b0;
+}
+
 static zan_token_t lexer_char(zan_lexer_t *lex) {
     zan_loc_t loc = lexer_loc(lex);
     lexer_advance(lex); /* opening ' */
@@ -1162,7 +1199,7 @@ static zan_token_t lexer_char(zan_lexer_t *lex) {
         lexer_advance(lex); /* \ */
         cp = lexer_escape_char_cp(lex);
     } else {
-        cp = (int64_t)(unsigned char)lexer_advance(lex);
+        cp = lexer_next_utf8_cp(lex);
     }
 
     if (lexer_peek_ch(lex) != '\'') {

@@ -781,62 +781,66 @@ partial class Irgen {
         // payloads operate and the result reboxes. `x = x + 3` on an int?
         // used to feed the BOX POINTER into `add i64` -- clang rejected the
         // module ("'%t45' defined with type 'ptr' but expected 'i64'").
+        ExprVal la = null;
         if (op == TK.Plus() || op == TK.Minus() || op == TK.Star()
             || op == TK.Slash() || op == TK.Percent()) {
-            ExprVal la = GenExpr(e.a);
-            if (IsNullableValue(la.ty)) {
-                int lnb = NL(); int lrhs = NL(); int ldone = NL();
-                string aisn = NT();
-                L("  " + aisn + " = icmp eq i8* " + la.op + ", null");
-                L("  br i1 " + aisn + ", label %L" + lnb + ", label %L" + lrhs);
-                Label(lnb);
-                L("  br label %L" + ldone);
-                string anullLbl = curLbl;
-                Label(lrhs);
-                List<string> svT4 = stmtTemps; List<Node> svTT4 = stmtTempTypes;
-                stmtTemps = new List<string>(); stmtTempTypes = new List<Node>();
-                ExprVal lb = GenExpr(e.b);
-                string bnullLbl = "";
-                if (lb.ty != null && IsNullable(lb.ty)) {
-                    // right arm null propagates too: branch to the merge null
-                    int lbnull = NL();
-                    string bisn = NT();
-                    L("  " + bisn + " = icmp eq i8* " + lb.op + ", null");
-                    L("  br i1 " + bisn + ", label %L" + lbnull + ", label %L" + ldone);
-                    Label(lbnull);
+            Node lat = ArgTypeNode(e.a);
+            if (lat == null || IsNullableValue(lat)) {
+                la = GenExpr(e.a);
+                if (IsNullableValue(la.ty)) {
+                    int lnb = NL(); int lrhs = NL(); int ldone = NL();
+                    string aisn = NT();
+                    L("  " + aisn + " = icmp eq i8* " + la.op + ", null");
+                    L("  br i1 " + aisn + ", label %L" + lnb + ", label %L" + lrhs);
+                    Label(lnb);
                     L("  br label %L" + ldone);
-                    bnullLbl = curLbl;
+                    string anullLbl = curLbl;
+                    Label(lrhs);
+                    List<string> svT4 = stmtTemps; List<Node> svTT4 = stmtTempTypes;
+                    stmtTemps = new List<string>(); stmtTempTypes = new List<Node>();
+                    ExprVal lb = GenExpr(e.b);
+                    string bnullLbl = "";
+                    if (lb.ty != null && IsNullable(lb.ty)) {
+                        // right arm null propagates too: branch to the merge null
+                        int lbnull = NL();
+                        string bisn = NT();
+                        L("  " + bisn + " = icmp eq i8* " + lb.op + ", null");
+                        L("  br i1 " + bisn + ", label %L" + lbnull + ", label %L" + ldone);
+                        Label(lbnull);
+                        L("  br label %L" + ldone);
+                        bnullLbl = curLbl;
+                    }
+                    string ault = UnderLL(la.ty);
+                    string ap = NT();
+                    L("  " + ap + " = bitcast i8* " + la.op + " to " + ault + "*");
+                    string av = NT();
+                    L("  " + av + " = load " + ault + ", " + ault + "* " + ap);
+                    string bv = Coerce(lb, ault);
+                    bool isF = ault == "double";
+                    string opn2 = "add";
+                    if (op == TK.Minus()) { opn2 = isF ? "fsub" : "sub"; }
+                    else if (op == TK.Star()) { opn2 = isF ? "fmul" : "mul"; }
+                    else if (op == TK.Slash()) { opn2 = isF ? "fdiv" : "sdiv"; }
+                    else if (op == TK.Percent()) { opn2 = isF ? "frem" : "srem"; }
+                    else { opn2 = isF ? "fadd" : "add"; }
+                    string rv = NT();
+                    L("  " + rv + " = " + opn2 + " " + ault + " " + av + ", " + bv);
+                    ExprVal rvx = new ExprVal(rv, MkType(la.ty.sval));
+                    string rbox = BoxVal(rvx, la.ty);
+                    EmitTempReleases();
+                    stmtTemps = svT4; stmtTempTypes = svTT4;
+                    L("  br label %L" + ldone);
+                    string bvalLbl = curLbl;
+                    Label(ldone);
+                    string rr = NT();
+                    if (bnullLbl != "") {
+                        L("  " + rr + " = phi i8* [ null, %" + anullLbl + " ], [ null, %" + bnullLbl + " ], [ " + rbox + ", %" + bvalLbl + " ]");
+                    } else {
+                        L("  " + rr + " = phi i8* [ null, %" + anullLbl + " ], [ " + rbox + ", %" + bvalLbl + " ]");
+                    }
+                    AddTemp(rr, la.ty);
+                    return new ExprVal(rr, la.ty);
                 }
-                string ault = UnderLL(la.ty);
-                string ap = NT();
-                L("  " + ap + " = bitcast i8* " + la.op + " to " + ault + "*");
-                string av = NT();
-                L("  " + av + " = load " + ault + ", " + ault + "* " + ap);
-                string bv = Coerce(lb, ault);
-                bool isF = ault == "double";
-                string opn2 = "add";
-                if (op == TK.Minus()) { opn2 = isF ? "fsub" : "sub"; }
-                else if (op == TK.Star()) { opn2 = isF ? "fmul" : "mul"; }
-                else if (op == TK.Slash()) { opn2 = isF ? "fdiv" : "sdiv"; }
-                else if (op == TK.Percent()) { opn2 = isF ? "frem" : "srem"; }
-                else { opn2 = isF ? "fadd" : "add"; }
-                string rv = NT();
-                L("  " + rv + " = " + opn2 + " " + ault + " " + av + ", " + bv);
-                ExprVal rvx = new ExprVal(rv, MkType(la.ty.sval));
-                string rbox = BoxVal(rvx, la.ty);
-                EmitTempReleases();
-                stmtTemps = svT4; stmtTempTypes = svTT4;
-                L("  br label %L" + ldone);
-                string bvalLbl = curLbl;
-                Label(ldone);
-                string rr = NT();
-                if (bnullLbl != "") {
-                    L("  " + rr + " = phi i8* [ null, %" + anullLbl + " ], [ null, %" + bnullLbl + " ], [ " + rbox + ", %" + bvalLbl + " ]");
-                } else {
-                    L("  " + rr + " = phi i8* [ null, %" + anullLbl + " ], [ " + rbox + ", %" + bvalLbl + " ]");
-                }
-                AddTemp(rr, la.ty);
-                return new ExprVal(rr, la.ty);
             }
         }
         if (op == TK.AmpAmp() || op == TK.PipePipe()) {
@@ -962,7 +966,8 @@ partial class Irgen {
             CollectConcat(e, parts);
             if (parts.Count > 2) { return StrConcatN(parts); }
         }
-        ExprVal a = GenExpr(e.a);
+        ExprVal a;
+        if (la != null) { a = la; } else { a = GenExpr(e.a); }
         ExprVal b = GenExpr(e.b);
         // ulong operands select unsigned div/rem/shift/compare and carry the
         // unsigned type through so results print with %llu.
