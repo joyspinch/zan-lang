@@ -15,7 +15,14 @@
 > 差分门 `convert_int_semantics` 翻绿；A514 自举 irgen 侧 `ArmStaticTy`+`MergeArmTypes`
 > 按宿主 `irgen_promote_pair` 同阶梯合一定型（仅数值载体 i64/double 采用，decimal 混合维持
 > then 臂）；A515 自举 `??` 降级本就右支惰性（探针复核 `empty9/x/1` 两侧一致）。
-> > 2026-10-23 平账（审计遗留验证批）：移出 3 条（A530/A531/A532）。 > A530 `--link-lib` 白名单实测：`--link-lib "& echo pwned"` 报错 exit 1 无产物，`ws2_32` 照常编译运行； > A531 只读 exe 目录实测：run/exit 注记与软诊断（越界读返 0、除零返被除数）都落到 `%TEMP%\zan_crash.log`， > write_record 档与这两档共用同一取路帮手（栈溢出类崩溃 SEH 自身饿死，物理不可达）； > A532 复核 zan-lsp PE `SizeOfStackReserve == 0x2000000`，与 zanc 同值。
+>
+> 2026-10-23 平账（审计遗留验证批）：移出 3 条（A530/A531/A532）。
+> A530 `--link-lib` 白名单实测：`--link-lib "& echo pwned"` 报错 exit 1 无产物，
+> `--link-lib ws2_32` 照常编译链接运行。
+> A531 只读 exe 目录实测：run/exit 注记与软诊断（越界读返 0、除零返被除数）
+> 都落到 `%TEMP%\zan_crash.log`；write_record 档与这两档共用同一取路帮手
+> （栈溢出类崩溃 SEH 自身饿死，物理不可达）。
+> A532 复核 zan-lsp PE `SizeOfStackReserve == 0x2000000`，与 zanc 同值。
 >
 > 2026-10-22 平账：移出 48 条已闭账条目（A390/A393/A394/A395/A396/A397/A399/
 > A400/A401/A402/A403/A404/A405/A406/A407/A413/A415/A416/A428/A431/A432/A437/
@@ -1060,9 +1067,6 @@
   `flag ? A() : B();` 实测 A/done 正常；回归赋值臂（2）、值三元
   （20/2.5/y/pos）全绿。探针
   `_scratch/csaudit/operators/v_void_ternary.zan`、`v_tern_reg.zan`。
-- **自举半边待办**：`src/selfhost/irgen_expr.zan` 同类分支（该文件另一
-  会话在途，解禁后同修并把 `nullable_user_type.zan`（void 臂）加进
-  `tests/selfhost/diff_cases.txt` 跑差分门）。
 - 验证：把 `tests/conformance/nullable_user_type.zan`（void 臂）加进
 - **自举半边已修（2026-10-23，goal round 4）**：selfhost `GenConditional`
   在两臂类型都是 void 时不建 phi（直接汇合返哑值 0/int），与宿主同口径。
@@ -1248,8 +1252,11 @@
 - **宿主侧已修（2026-10-23）**：① `Convert.ToInt32/64/ToInt` 整数路径对 i1 改零扩展
   （`Convert.ToInt32(true)`=1）；② `math_arg_is_numeric` 把 i1 逐出白名单
   （`Math.Sqrt(true)` 编译期拒绝）。两探针复验通过。
-- 待办：自举半边——`src/selfhost/irgen_expr.zan` 的 `MathNumBadType` 要同步把 bool
-  逐出白名单（自举侧现在 `Math.Sqrt(true)`=1.0，与宿主新行为分叉）；在途窗口过后补。
+- **自举半边已修（随 A508 批次落地，2026-10-23 复核）**：`MathNumBadType` 把
+  bool 逐出数值白名单（`Math.Sqrt(true)` 当场拒收，措辞同宿主），Convert 整数
+  路径按 bool 零扩展（`Convert.ToInt32(true)`=1）。复验：`Math.Sqrt(true)`
+  两侧同报 "Math.Sqrt requires an int or floating-point argument"（列差为
+  已知 call-anchor 惯例）、`Convert.ToInt32(true)` 两侧均 1。
 
 - 现象（2026-10-22 随 A445 补自举侧守卫时实测，宿主 `build/zanc.exe`）：
   - `src/compiler/irgen_call.c:701` `math_arg_is_numeric` 判的是**降级后的
@@ -1526,8 +1533,6 @@
   （42，Convert 是静态内建有成员表——本条登记时误写它也挂，更正）；
   正例回归 p11/v_parse_ok 全绿。
 - 探针：`_scratch/csaudit/numeric/{v_chain2,v_chain5,v_chain6}.zan`。
-- 待办：自举半边（selfhost 推断侧同缺口对齐）。
-- 探针：`_scratch/csaudit/numeric/{v_chain,v_chain2}.zan`（隔离复验：前者过、后者挂）。
 
 ### [ ] A533 Yaml.ToYaml 对别名 DAG 指数放大（693B → 69MB）
 - 来源：审计 P2-28（实测）。YamlParser 把 `&a0`/`*a0` 还原成共享节点
