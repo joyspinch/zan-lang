@@ -1121,7 +1121,11 @@
 - 已落地的项目侧绕行（不算修复，只是把 coreforge 摆正）：`client/src/
   main.zan` 把 HUD 根改成 flex 列 + Overlay `flex-grow:1`。
 - 关联：coreforge 外部项目 `D:/project/games/coreforge`（仓库外）。
-### [ ] A486 自举不判「枚举目标」的通用可赋值性——`Color c = "x";` 在自举里编译通过
+### [x] A486 自举不判「枚举目标」的通用可赋值性——`Color c = "x";` 在自举里编译通过（已闭环，2026-10-23）
+- **自举侧已修（2026-10-23）**：
+  `src/selfhost/checker.zan` 的 `CheckAssignable` 解除对枚举目标（`tcat == 6`）的提前跳过（仅对无类型或类/结构体返回）；在不可隐式转换路径判定枚举目标槽对 string/bool/类对象等非法赋值报 `cannot convert '<val>' to '<enum>' in <what>: no implicit conversion`；同时兼容宿主窄化与常量例外（`double`/`float` 走既有 `CheckNarrowing` 判定，整数常量/成员/`decimal` 正常放行，可空枚举兼容 `null`）。
+- **用例与拒收清单双闭（2026-10-23）**：
+  新增负向测试 `tests/selfhost/reject/enum_assign_string.zan` 和 `tests/selfhost/reject/enum_assign_bool.zan`，并在 `tests/selfhost/reject_cases.txt` 注册双端逐字一致断言。自举与宿主双端输出逐字一致，全部拦截通过。
 
 - 现象：宿主报
   `cannot convert 'string' to 'Color' in initializer: no implicit conversion`；
