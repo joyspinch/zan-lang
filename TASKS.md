@@ -31,6 +31,11 @@
 > 全 API 不变量过（新耐久用例 `pool_value_t`：值相等命中/重复归还拒绝/槽位记账/
 > Pool-TakeIdle 往返/空池默认值/引用 T 回归），icmp eq ptr,i32 不复现。
 >
+> P1-11 同批加固：--embed/--icon 复核不上 shell（对象期烘焙，审计点的注入面已不在）；
+> 同族 --link-input/--libpath/-L 落解析期校验（拒双引号与控制字符——无捆绑 ld 回退档与
+> POSIX cc 路径仍以引号包裹进 system()，值带双引号可破引号注入）；顺带根修
+> zan_utf8_spawnv：msvcrt _wspawnv 不给含空格实参加引号，--libpath 带空格会被 ld
+> 劈成多参换语义——按 CommandLineToArgvW 逆规则自拼命令行直发 CreateProcessW。
 > 2026-10-22 平账：移出 48 条已闭账条目（A390/A393/A394/A395/A396/A397/A399/
 > A400/A401/A402/A403/A404/A405/A406/A407/A413/A415/A416/A428/A431/A432/A437/
 > A441/A442/A445/A447/A448/A449/A463/A473/A474/A475/A476/A477/A478/A479/A480/

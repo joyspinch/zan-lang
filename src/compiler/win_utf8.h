@@ -112,33 +112,90 @@ static inline int zan_utf8_full_path(const char *path, char *out, size_t out_siz
     return 1;
 }
 
+/* _wspawnv 的命令行拼接由 msvcrt 完成，含空格的实参不会被可靠地加引号
+ * ——实测 `--libpath "D:\dir with space"` 到 ld.exe 被按空格劈成三个
+ * 实参（"cannot find with/space"），链接静默换语义。这里按
+ * CommandLineToArgvW 的拆分规则自行拼接命令行（含空格/tab/引号/空串
+ * 的实参加引号，实参内引号翻倍、引号前反斜杠翻倍、结尾反斜杠翻倍）
+ * 并直接 CreateProcessW：与子进程 CRT 的拆分规则严格互逆，任何实参
+ * 都原样到达。调用点全部是 _P_WAIT，返回退出码（_P_NOWAIT 兼容路径
+ * 返回进程句柄，当前无人使用）。 */
 static inline intptr_t zan_utf8_spawnv(int mode, const char *path,
                                        const char *const *argv) {
+    (void)path; /* 程序名以 argv[0] 进命令行首 token，见下方 CreateProcessW */
     int count = 0;
     while (argv[count]) count++;
-    wchar_t *wide_path = zan_utf8_to_wide_alloc(path);
-    wchar_t **wide_argv = (wchar_t **)calloc((size_t)count + 1,
-                                             sizeof(wchar_t *));
-    if (!wide_path || !wide_argv) {
-        free(wide_path);
-        free(wide_argv);
+    /* 最坏情形：每个字节翻倍（引号/反斜杠）+ 每实参一对引号 + 分隔符 */
+    size_t cap = 8;
+    for (int i = 0; i < count; i++) {
+        cap += strlen(argv[i]) * 2 + 4;
+    }
+    char *cl = (char *)malloc(cap);
+    if (!cl) return -1;
+    size_t pos = 0;
+    for (int i = 0; i < count; i++) {
+        const char *a = argv[i];
+        int needs_quote = (a[0] == '\0') ||
+                          strpbrk(a, " \t\"") != NULL;
+        if (needs_quote) cl[pos++] = '"';
+        size_t backslashes = 0;
+        for (const char *p = a; *p; p++) {
+            if (*p == '\\') {
+                backslashes++;
+                continue;
+            }
+            if (*p == '"') {
+                /* 引号前的反斜杠翻倍，引号本身翻倍 */
+                for (size_t k = 0; k < backslashes * 2; k++) cl[pos++] = '\\';
+                backslashes = 0;
+                cl[pos++] = '"';
+                cl[pos++] = '"';
+                continue;
+            }
+            for (size_t k = 0; k < backslashes; k++) cl[pos++] = '\\';
+            backslashes = 0;
+            cl[pos++] = *p;
+        }
+        if (needs_quote) {
+            /* 引号包裹的实参，结尾反斜杠也要翻倍（防吃掉收尾引号） */
+            for (size_t k = 0; k < backslashes * 2; k++) cl[pos++] = '\\';
+            cl[pos++] = '"';
+        } else {
+            for (size_t k = 0; k < backslashes; k++) cl[pos++] = '\\';
+        }
+        if (i + 1 < count) cl[pos++] = ' ';
+    }
+    cl[pos] = '\0';
+    wchar_t *wide_cl = zan_utf8_to_wide_alloc(cl);
+    free(cl);
+    if (!wide_cl) {
+        free(wide_cl);
         return -1;
     }
-    for (int i = 0; i < count; i++) {
-        wide_argv[i] = zan_utf8_to_wide_alloc(argv[i]);
-        if (!wide_argv[i]) {
-            for (int j = 0; j < i; j++) free(wide_argv[j]);
-            free(wide_argv);
-            free(wide_path);
-            return -1;
-        }
+    STARTUPINFOW si;
+    PROCESS_INFORMATION pi;
+    memset(&si, 0, sizeof(si));
+    si.cb = sizeof(si);
+    memset(&pi, 0, sizeof(pi));
+    /* lpApplicationName 必须留 NULL：程序名以命令行首 token 传递
+     * （argv[0]，调用点已设置）——裸名（如 "ld.lld"）才会走 PATH
+     * 搜索与 .exe 补全，与 _wspawnv 的语义一致；给 lpApplicationName
+     * 传裸名会直接 CreateProcess 失败。 */
+    if (!CreateProcessW(NULL, wide_cl, NULL, NULL, FALSE, 0,
+                        NULL, NULL, &si, &pi)) {
+        free(wide_cl);
+        return -1;
     }
-    intptr_t rc = _wspawnv(mode, wide_path,
-                            (const wchar_t *const *)wide_argv);
-    for (int i = 0; i < count; i++) free(wide_argv[i]);
-    free(wide_argv);
-    free(wide_path);
-    return rc;
+    free(wide_cl);
+    CloseHandle(pi.hThread);
+    if (mode == _P_WAIT) {
+        WaitForSingleObject(pi.hProcess, INFINITE);
+        DWORD code = 0;
+        GetExitCodeProcess(pi.hProcess, &code);
+        CloseHandle(pi.hProcess);
+        return (intptr_t)code;
+    }
+    return (intptr_t)pi.hProcess;
 }
 
 static inline int zan_utf8_system(const char *command) {

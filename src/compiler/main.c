@@ -4390,6 +4390,22 @@ static void expand_arg_files(int *argc, char ***argv) {
     *argv = out.items;
 }
 
+/* 链接器参数值（--link-input / --libpath / -L）的最低限度校验：
+ * 主路径走 spawnv 的 argv 数组（无 shell，任何字节都安全）；但无捆绑
+ * ld 的回退档与 POSIX 分支仍以引号包裹拼进 system() 命令行——值里出现
+ * 双引号会破引号逃逸成命令注入（审计 P1-11）。合法路径不携带双引号
+ * （Windows 文件名非法字符；POSIX 上也从未必要——参数经 argv 传递，
+ * 空格无需引号包裹），控制字符同理一律拒绝。不做转义：转义层要同时
+ * 伺候 cmd 与 /bin/sh 两套规则，漏一条就是注入。 */
+static bool zan_link_path_is_safe(const char *v) {
+    for (const char *p = v; *p; p++) {
+        if (*p == '"' || (unsigned char)*p < 0x20) {
+            return false;
+        }
+    }
+    return true;
+}
+
 int main(int argc, char **argv) {
 #ifdef _WIN32
     char **utf8_argv = zan_utf8_command_line_argv(&argc);
@@ -4618,6 +4634,12 @@ int main(int argc, char **argv) {
             if (embed_spec_count < ZAN_MAX_EMBED_SPECS) embed_specs[embed_spec_count++] = argv[++i];
             else { fprintf(stderr, "error: too many --embed (max %d)\n", ZAN_MAX_EMBED_SPECS); return 1; }
         } else if (strcmp(argv[i], "--link-input") == 0 && i + 1 < argc) {
+            if (!zan_link_path_is_safe(argv[i + 1])) {
+                fprintf(stderr,
+                        "error: --link-input value may not contain double"
+                        " quotes or control characters\n");
+                return 1;
+            }
             if (extra_link_input_count < ZAN_MAX_LINK_INPUTS) extra_link_inputs[extra_link_input_count++] = argv[++i];
             else { fprintf(stderr, "error: too many --link-input (max %d)\n", ZAN_MAX_LINK_INPUTS); return 1; }
         } else if (strcmp(argv[i], "--link-lib") == 0 && i + 1 < argc) {
@@ -4638,11 +4660,23 @@ int main(int argc, char **argv) {
             else { fprintf(stderr, "error: too many --link-lib (max %d)\n",
                            ZAN_LINK_MAX_LIBS); return 1; }
         } else if (strcmp(argv[i], "--libpath") == 0 && i + 1 < argc) {
+            if (!zan_link_path_is_safe(argv[i + 1])) {
+                fprintf(stderr,
+                        "error: --libpath value may not contain double"
+                        " quotes or control characters\n");
+                return 1;
+            }
             if (extra_lib_path_count < ZAN_LINK_MAX_DIRS)
                 extra_lib_paths[extra_lib_path_count++] = argv[++i];
             else { fprintf(stderr, "error: too many --libpath (max %d)\n",
                            ZAN_LINK_MAX_DIRS); return 1; }
         } else if (strncmp(argv[i], "-L", 2) == 0 && argv[i][2] != '\0') {
+            if (!zan_link_path_is_safe(argv[i] + 2)) {
+                fprintf(stderr,
+                        "error: -L value may not contain double quotes"
+                        " or control characters\n");
+                return 1;
+            }
             if (extra_lib_path_count < ZAN_LINK_MAX_DIRS)
                 extra_lib_paths[extra_lib_path_count++] = argv[i] + 2;
             else { fprintf(stderr, "error: too many -L dirs (max %d)\n",
