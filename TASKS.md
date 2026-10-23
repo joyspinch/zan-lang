@@ -130,7 +130,10 @@
 - 根因落点：`src/compiler/irgen_expr.c` `emit_expr_cast_expr` 对引用→引用无运行时检查分支（落到 `return val`）；`is` 已有 `emit_runtime_is_check` 可复用。
 - 探针：`_scratch/csaudit/types/p09_object_cast.zan`（F6–F10）、`v_cast_min.zan`（最小复现：两方向都 null-res + 软诊断 + exit 0）。
 
-### [ ] A510 整数表达式按 64 位计算、不按声明类型收窄（表达式级溢出不环绕）
+### [~] A510 整数表达式按 64 位计算、不按声明类型收窄（表达式级溢出不环绕）
+- **用例收口（2026-10-23）**：新增 conformance 用例 `tests/conformance/int_overflow_wrapping.{zan,out}`
+  （覆盖 32 位加减乘、无符号减、显式强转、无符号右移 `>>>` 及 long 提升溢出环绕），并入自举差分门 `tests/selfhost/diff_cases.txt`，
+  宿主与自举 LLVM IR 双端对齐通过。
 - 现象：`int a=int.MaxValue; WriteLine(a+1)`→2147483648、`a*2`→4294967294、`0u-1u`→18446744073709551615、`long j=i+1`→2147483648、`-8>>>1`→9223372036854775804。C# 全按 32 位环绕。存回 int 变量才截断——传参/打印/加宽路径不收窄。
 - 同根：`TryParse(...)` 调用表达式直接打印得 "1"，存 bool 变量再打印得 "true"（调用结果表达式未按声明类型定型）。
 - 根因落点：irgen 整数运算一律 64 位寄存器、仅写回 int 槽时截断；表达式定型与收窄缺失。
