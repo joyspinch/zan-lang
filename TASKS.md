@@ -37,6 +37,10 @@
 > zan_utf8_spawnv：msvcrt _wspawnv 不给含空格实参加引号，--libpath 带空格会被 ld
 > 劈成多参换语义——按 CommandLineToArgvW 逆规则自拼命令行直发 CreateProcessW。
 > 2026-10-22 平账：移出 48 条已闭账条目（A390/A393/A394/A395/A396/A397/A399/
+> P1-12 收尾：ToInt64 字符串溢出曾静默饱和成 INT64_MAX/MIN（strtoll 只在 i32 档补了
+> 范围谓词，i64 档无 ERANGE 检查）——补 errno 清零+ERANGE 比对，恰好极值不误杀；
+> ToUpper/ToLower 仅 ASCII 系 A525 已声明口径，Unicode 简单映射留独立件；
+> convert_overflow 用例扩 ToInt64 四腿，ctest 2/2 绿。
 > A400/A401/A402/A403/A404/A405/A406/A407/A413/A415/A416/A428/A431/A432/A437/
 > A441/A442/A445/A447/A448/A449/A463/A473/A474/A475/A476/A477/A478/A479/A480/
 > A481/A483/A484/A485/A488/A491/A492/A497/A500/A502/A505）。编号不复用，结论与验证见 git 历史。

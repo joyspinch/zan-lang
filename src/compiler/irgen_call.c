@@ -2144,6 +2144,24 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                             LLVMValueRef endp = emit_entry_alloca(g, i8ptr, "toint.endp");
                             LLVMBuildStore(g->builder, LLVMConstNull(i8ptr), endp);
                             LLVMValueRef s_safe = emit_parse_str_guard(g, arg, expr->loc);
+                            /* 审计 P1-12 余项：strtoll 对超出 long 范围的
+                             * 输入饱和返回 INT64_MAX/MIN 并置 errno=ERANGE
+                             * ——只看返回值分不清「输入恰好是极值」与「饱和」
+                             * （ToInt64("99999999999999999999") 曾静默钳成
+                             * INT64_MAX，C# 语义是 OverflowException）。
+                             * 先清零 errno，调用后读回比对 34（ERANGE）。 */
+                            LLVMTypeRef errno_ty = LLVMFunctionType(
+                                LLVMPointerType(i32t, 0), NULL, 0, 0);
+#if defined(_WIN32)
+                            const char *errno_sym = "_errno";
+#else
+                            const char *errno_sym = "__errno_location";
+#endif
+                            LLVMValueRef errno_fn = get_libc_fn(g, errno_sym, errno_ty);
+                            LLVMValueRef errnop = zan_call2(g->builder, errno_ty,
+                                errno_fn, NULL, 0, "toint.errnop");
+                            LLVMBuildStore(g->builder, LLVMConstInt(i32t, 0, 0),
+                                errnop);
                             parsed = zan_call2(g->builder, strtoll_ty, f,
                                 (LLVMValueRef[]){ s_safe, endp,
                                                   LLVMConstInt(i32t, 10, 0) }, 3, "toint");
@@ -2160,6 +2178,15 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                                         LLVMConstInt(i64t, INT32_MAX, 0), "toint.hi"),
                                     "toint.over"), "toint.bad2");
                             }
+                            /* ERANGE 兜底：两档共用（i32 越界必然先饱和到
+                             * i64 边缘再置 ERANGE，与上面的范围谓词等价；
+                             * i64 档只有它能抓到）。 */
+                            LLVMValueRef er = LLVMBuildLoad2(g->builder, i32t,
+                                errnop, "toint.errno");
+                            bad = LLVMBuildOr(g->builder, bad,
+                                zan_icmp(g->builder, LLVMIntEQ, er,
+                                    LLVMConstInt(i32t, 34, 0), "toint.erange"),
+                                "toint.bad3");
                             emit_runtime_check(g, bad, expr->loc,
                                 "Convert.ToInt*: input is not a valid integer (or out of range)");
                             parsed = LLVMBuildSelect(g->builder, bad,
