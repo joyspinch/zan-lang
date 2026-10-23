@@ -2863,6 +2863,69 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
             }
         }
 
+        /* A525 一件：标量 ToString("F2"/"D5"/"X4"/"E2"/"G3") 格式串——复用
+         * 插值路径的 interp_format_to_printf（同一 spec→printf 映射，同一
+         * 口径，含 D/X/F/E/G 与 0/# 形状）。数值接收者之外（bool/char/
+         * 枚举的自定义格式）或不认识的说明符编译期显性拒绝，不静默。 */
+        if (expr->call.callee && expr->call.callee->kind == AST_MEMBER_ACCESS &&
+            expr->call.args.count == 1 &&
+            expr->call.args.items[0]->kind == AST_STRING_LITERAL) {
+            zan_ast_node_t *scf = expr->call.callee;
+            zan_istr_t smf = scf->member.name;
+            if (smf.len == 8 && memcmp(smf.str, "ToString", 8) == 0) {
+                zan_type_t *rf_ty = infer_expr_type(g, scf->member.object, locals);
+                int numeric_kind = rf_ty &&
+                    (rf_ty->kind == TYPE_BYTE ||
+                     rf_ty->kind == TYPE_SHORT || rf_ty->kind == TYPE_INT ||
+                     rf_ty->kind == TYPE_LONG || rf_ty->kind == TYPE_SBYTE ||
+                     rf_ty->kind == TYPE_USHORT || rf_ty->kind == TYPE_UINT ||
+                     rf_ty->kind == TYPE_ULONG || rf_ty->kind == TYPE_FLOAT ||
+                     rf_ty->kind == TYPE_DOUBLE);
+                if (numeric_kind) {
+                    zan_istr_t spec = expr->call.args.items[0]->str_val;
+                    bool want_float = false;
+                    bool is_f = rf_ty->kind == TYPE_FLOAT ||
+                                rf_ty->kind == TYPE_DOUBLE;
+                    bool is_ul = rf_ty->kind == TYPE_ULONG;
+                    char pfmt[64];
+                    if (interp_format_to_printf(&spec, is_f, is_ul,
+                                                &want_float, pfmt,
+                                                sizeof(pfmt)) == 0) {
+                        zan_diag_emit(g->diag, DIAG_ERROR, expr->loc,
+                            "unsupported format specifier '%.*s' for numeric "
+                            "ToString() (supported: D, X, F, E, G, 0/# shapes)",
+                            (int)spec.len, spec.str);
+                        return LLVMConstNull(LLVMPointerType(
+                            LLVMInt8TypeInContext(g->ctx), 0));
+                    }
+                    LLVMValueRef vf = emit_expr(g, scf->member.object, locals);
+                    LLVMValueRef arg = vf;
+                    if (want_float) {
+                        if (LLVMGetTypeKind(LLVMTypeOf(vf)) ==
+                            LLVMFloatTypeKind)
+                            arg = LLVMBuildFPExt(g->builder, vf,
+                                                 LLVMDoubleTypeInContext(g->ctx),
+                                                 "tos.f64");
+                    } else {
+                        arg = emit_widen_i64_for_print(g, vf);
+                    }
+                    LLVMTypeRef i8t = LLVMInt8TypeInContext(g->ctx);
+                    LLVMTypeRef i8pt = LLVMPointerType(i8t, 0);
+                    LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
+                    LLVMValueRef pfmt_lit = zan_irgen_intern_string(g, pfmt);
+                    LLVMValueRef buf = emit_string_alloc_rc(g,
+                        LLVMConstInt(i64t, 640, 0));
+                    LLVMValueRef snp_args[] = { buf,
+                        LLVMConstInt(i64t, 640, 0), pfmt_lit, arg };
+                    LLVMTypeRef snp_ty = LLVMFunctionType(i8pt,
+                        (LLVMTypeRef[]){ i8pt, i64t, i8pt }, 3, 1);
+                    zan_call2(g->builder, snp_ty, g->fn_snprintf, snp_args,
+                              4, "");
+                    return buf;
+                }
+            }
+        }
+
         /* Environment */
         if (!zan_type_defines(g, "Environment", "ArgCount") &&
             is_call_to(expr, "Environment", "ArgCount") && expr->call.args.count == 0) {

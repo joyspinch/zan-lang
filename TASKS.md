@@ -321,6 +321,21 @@
   `c.IsDigit()` 实例调用仍正确拒绝。
 - 探针：`_scratch/csaudit/string/v_charcls{,2,4,5}.zan`。
 - 待办：其余件（StringSplitOptions、格式串、operator++、multicast、
+- **宿主侧已补一件（2026-10-23，goal round 7）**：标量 ToString 格式串
+  `d.ToString("F2"/"D5"/"X4"/"E2"/"G3"/"0.00")`——复用插值路径的
+  `interp_format_to_printf`（从 static 提升为 irgen.h 共享声明，同一
+  spec→printf 映射同一口径：D 前导零、X 十六进制、F/E/G 定点/科学/通用、
+  0/# 自定义形状）。发射在 irgen_call.c 无参 ToString 块旁加 1 参分支：
+  数值接收者 + 字面量 spec → interp 映射 + `zan_irgen_intern_string`
+  装 pfmt + snprintf(640 字节 RC 串)。不认识的 spec 编译期显性拒绝。
+  踩坑：pfmt 是栈缓冲，曾走 emit_string_literal_rc——其缓存按指针存
+  istr，第二次调用同栈槽死指针误判内容相同（F4 吞了 F1 的格式串，F0 吞
+  F2 的）；换 zan_irgen_intern_string（arena 拷贝 + strcmp 判重）后正确。
+  D 负数前导零位含符号（"%05lld" → -0042，C# 为 -00042）——与插值路径
+  共用的既有偏差，随该 helper 一起另项。
+- 复验：F0/F1/F2/F4/D5/X4 与插值 `$"{d:F0}"`/`$"{d:F2}"`/`$"{n:D5}"` 全
+  对；`"Q3"` 编译期拒绝（点名受支持集合）；变量 spec 仍拒绝（非常量
+  spec 需运行期解释器，按需登记）。
   Array 静态类、Count 属性化、object== 引用比较、foreach-Dict 形状）
   按需求频度逐个；自举半边。
 - 无 `StringSplitOptions`（Split 单参）；无 char 静态类（IsDigit/ToUpper）；`double.ToString("F2")` 无格式串；`"a"+null` 字面量拒绝（string null 变量可拼）；无 operator++/--（自定义类型）；`new` 隐藏修饰符解析拒绝（隐藏语义本身正确）；委托无 multicast（`d+=h` 拒绝、诊断已指路 UiEvent/List 替代）；无 Array 静态类（Sort/CopyTo）；Stack/Queue/HashSet 的 Count 是方法非属性；object==string 按值比较（C# 引用比较，引用同一性不可表达）。

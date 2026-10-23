@@ -6491,10 +6491,11 @@ static LLVMValueRef emit_incdec_expr(zan_irgen_t *g, zan_ast_node_t *expr,
     return is_prefix ? new_val : old_val;
 }
 
-/* 转换字符串插值格式化说明符（如冒号后的格式标记） */
-static int interp_format_to_printf(const zan_istr_t *spec, bool is_float,
-                                   bool is_ulong, bool *want_float,
-                                   char *out, size_t outcap) {
+/* 转换字符串插值格式化说明符（如冒号后的格式标记）。插值与标量
+ * ToString("F2") 调用两条路共用（irgen.h 声明，irgen_call.c 也用）。 */
+int interp_format_to_printf(const zan_istr_t *spec, bool is_float,
+                            bool is_ulong, bool *want_float,
+                            char *out, size_t outcap) {
     if (want_float) *want_float = false;
     if (!spec || spec->len == 0) return 0;
     const char *s = spec->str;
