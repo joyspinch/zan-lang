@@ -1707,6 +1707,11 @@
   软诊断两行 stderr；conformance `case_convert_overflow` 过。
 - ToUpper/ToLower 非 ASCII 原样返回：A525 已声明 ASCII 口径（已知偏差），
   Unicode 简单大小写映射留待独立件（大表，C# 复刻线）。
+- **ToUpper/ToLower Unicode 简单映射已补齐（2026-10-23，A525 闭环）**：
+  按 .NET Invariant 生成 1:1 简单映射表（1406 上转对，1389 下转对，覆盖 BMP
+  与 astral 域如 Deseret，扩张型 ß 与无映射码点原样返回）；irgen 惰性发射模块内
+  全局表与二分查找助手（首次调用才发射，不用的程序零开销）；conformance
+  `case_char_case_unicode` 全过。
 
 ### [ ] A540 编译器 pull-in live-name 闭包：包内控制器不进编译图 → 路由静默 404
 - 现象：server-collab 模板按 README 配方（`zanc src/main.zan src/**/*.zan

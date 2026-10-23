@@ -1749,7 +1749,8 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
         }
 
         /* char 的静态类（A525）：char.IsDigit('5') 等。谓词走 <ctype.h>
-         * （ASCII 口径；非 ASCII 字符与 C# 的 Unicode 类目有偏差）。 */
+         * （ASCII 口径；非 ASCII 字符与 C# 的 Unicode 类目有偏差）。
+         * ToUpper/ToLower 走 Unicode 简单映射表（见 get_char_case_fn）。 */
         if (expr->call.callee && expr->call.callee->kind == AST_MEMBER_ACCESS &&
             expr->call.callee->member.object->kind == AST_IDENTIFIER &&
             !local_find(locals, expr->call.callee->member.object->ident.name) &&
@@ -1792,8 +1793,16 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                     size_t nl = strlen(mappers[mi].name);
                     if (cm.len != (int)nl || memcmp(cm.str, mappers[mi].name, nl) != 0)
                         continue;
-                    LLVMValueRef r = zan_call2(g->builder, aty,
-                        get_libc_fn(g, mappers[mi].libc, aty), &cp, 1, "ch.map");
+                    /* Unicode 简单大小写映射（审计 P1-12 / A525 后续）：
+                     * libc toupper/tolower 是 C locale ASCII 口径，非 ASCII
+                     * 原样返回；表助手覆盖全 Unicode 1:1 简单映射。 */
+                    LLVMTypeRef case_ty = LLVMFunctionType(i32t,
+                        (LLVMTypeRef[]){ i32t, i32t }, 2, 0);
+                    LLVMValueRef upc = LLVMConstInt(i32t,
+                        strcmp(mappers[mi].name, "ToUpper") == 0 ? 1 : 0, 0);
+                    LLVMValueRef args2[2] = { cp, upc };
+                    LLVMValueRef r = zan_call2(g->builder, case_ty,
+                        get_char_case_fn(g), args2, 2, "ch.map");
                     if (LLVMGetTypeKind(LLVMTypeOf(arg)) == LLVMIntegerTypeKind &&
                         LLVMGetIntTypeWidth(LLVMTypeOf(arg)) > 32)
                         r = LLVMBuildSExt(g->builder, r, LLVMTypeOf(arg), "ch.map.w");

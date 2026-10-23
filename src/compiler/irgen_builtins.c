@@ -1,5 +1,105 @@
 /* irgen_builtins */
 
+#include "charcase_table.h"
+
+/* char 大小写映射（审计 P1-12 / A525 后续）：libc toupper/tolower 在 C
+ * locale 下只翻 ASCII，与 C# 的 Unicode 不变文化语义不符。改为惰性发射
+ * 模块内映射表 + 二分助手（首次用到 ToUpper/ToLower 才发，不用的程序
+ * 零开销）。表由 .NET Invariant 生成（charcase_table.h），只收 1:1
+ * 简单映射——扩张型（ß→SS）与无映射码点原样返回，同 C# char 语义。 */
+static LLVMValueRef get_char_case_fn(zan_irgen_t *g) {
+    LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "__zan_case_map");
+    if (fn) return fn;
+    LLVMContextRef c = g->ctx;
+    LLVMTypeRef i32t = LLVMInt32TypeInContext(c);
+    LLVMTypeRef i64t = LLVMInt64TypeInContext(c);
+    LLVMTypeRef i64ptr = LLVMPointerType(i64t, 0);
+    /* 两个只读全局表：槽位打包 (from<<32)|to，按 from 升序 */
+    LLVMValueRef tabs[2];
+    const uint64_t *data[2];
+    int counts[2] = { ZAN_CASE_UP_N, ZAN_CASE_DOWN_N };
+    data[0] = zan_case_up;
+    data[1] = zan_case_down;
+    for (int ti = 0; ti < 2; ti++) {
+        LLVMValueRef ev[2048];
+        for (int i = 0; i < counts[ti]; i++) {
+            ev[i] = LLVMConstInt(i64t, data[ti][i], 0);
+        }
+        tabs[ti] = LLVMAddGlobal(g->mod, LLVMArrayType(i64t, counts[ti]),
+                                 ti == 0 ? "zan.case.up" : "zan.case.down");
+        LLVMSetGlobalConstant(tabs[ti], 1);
+        LLVMSetLinkage(tabs[ti], LLVMPrivateLinkage);
+        LLVMSetInitializer(tabs[ti], LLVMConstArray(i64t, ev, counts[ti]));
+    }
+    LLVMTypeRef fnty = LLVMFunctionType(i32t,
+        (LLVMTypeRef[]){ i32t, i32t }, 2, 0);
+    fn = LLVMAddFunction(g->mod, "__zan_case_map", fnty);
+    LLVMSetLinkage(fn, LLVMInternalLinkage);
+    LLVMBasicBlockRef saved = LLVMGetInsertBlock(g->builder);
+    LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(c, fn, "entry");
+    LLVMBasicBlockRef loop = LLVMAppendBasicBlockInContext(c, fn, "loop");
+    LLVMBasicBlockRef body = LLVMAppendBasicBlockInContext(c, fn, "body");
+    LLVMBasicBlockRef advance = LLVMAppendBasicBlockInContext(c, fn, "advance");
+    LLVMBasicBlockRef hit = LLVMAppendBasicBlockInContext(c, fn, "hit");
+    LLVMBasicBlockRef miss = LLVMAppendBasicBlockInContext(c, fn, "miss");
+
+    LLVMPositionBuilderAtEnd(g->builder, entry);
+    LLVMValueRef cp = LLVMGetParam(fn, 0);
+    LLVMValueRef is_up = LLVMGetParam(fn, 1);
+    LLVMValueRef is_up_cond = zan_icmp(g->builder, LLVMIntNE, is_up, LLVMConstInt(i32t, 0, 0), "cc.is_up");
+    LLVMValueRef p0 = LLVMBuildBitCast(g->builder, tabs[0], i64ptr, "cc.p0");
+    LLVMValueRef p1 = LLVMBuildBitCast(g->builder, tabs[1], i64ptr, "cc.p1");
+    LLVMValueRef tabp = LLVMBuildSelect(g->builder, is_up_cond, p0, p1, "cc.tab");
+    LLVMValueRef hi_init = LLVMBuildSelect(g->builder, is_up_cond,
+        LLVMConstInt(i32t, ZAN_CASE_UP_N, 0),
+        LLVMConstInt(i32t, ZAN_CASE_DOWN_N, 0), "cc.hi_init");
+    LLVMValueRef lo_a = LLVMBuildAlloca(g->builder, i32t, "cc.lo");
+    LLVMValueRef hi_a = LLVMBuildAlloca(g->builder, i32t, "cc.hi");
+    LLVMBuildStore(g->builder, LLVMConstInt(i32t, 0, 0), lo_a);
+    LLVMBuildStore(g->builder, hi_init, hi_a);
+    LLVMBuildBr(g->builder, loop);
+
+    /* loop: lo/hi 复查；空 → miss */
+    LLVMPositionBuilderAtEnd(g->builder, loop);
+    LLVMValueRef lo = LLVMBuildLoad2(g->builder, i32t, lo_a, "cc.lo");
+    LLVMValueRef hi = LLVMBuildLoad2(g->builder, i32t, hi_a, "cc.hi");
+    LLVMValueRef empty = zan_icmp(g->builder, LLVMIntUGE, lo, hi, "cc.ge");
+    LLVMBuildCondBr(g->builder, empty, miss, body);
+
+    /* body: mid 槽位取打包值；命中 → hit，未中 → advance */
+    LLVMPositionBuilderAtEnd(g->builder, body);
+    LLVMValueRef mid = LLVMBuildLShr(g->builder,
+        LLVMBuildAdd(g->builder, lo, hi, "cc.sum"),
+        LLVMConstInt(i32t, 1, 0), "cc.mid");
+    LLVMValueRef slot = LLVMBuildInBoundsGEP2(g->builder, i64t, tabp,
+        &mid, 1, "cc.slot");
+    LLVMValueRef v = LLVMBuildLoad2(g->builder, i64t, slot, "cc.v");
+    LLVMValueRef from64 = LLVMBuildLShr(g->builder, v,
+        LLVMConstInt(i64t, 32, 0), "cc.from");
+    LLVMValueRef from = LLVMBuildTrunc(g->builder, from64, i32t, "cc.from32");
+    LLVMValueRef to = LLVMBuildTrunc(g->builder, v, i32t, "cc.to");
+    LLVMValueRef eq = zan_icmp(g->builder, LLVMIntEQ, cp, from, "cc.eq");
+    LLVMBuildCondBr(g->builder, eq, hit, advance);
+
+    /* advance: cp<from → hi=mid（左半），否则 lo=mid+1（右半）；回 loop */
+    LLVMPositionBuilderAtEnd(g->builder, advance);
+    LLVMValueRef lt = zan_icmp(g->builder, LLVMIntULT, cp, from, "cc.lt");
+    LLVMValueRef newhi = LLVMBuildSelect(g->builder, lt, mid, hi, "cc.nh");
+    LLVMValueRef newlo = LLVMBuildSelect(g->builder, lt, lo,
+        LLVMBuildAdd(g->builder, mid, LLVMConstInt(i32t, 1, 0), "cc.lo1"),
+        "cc.nl");
+    LLVMBuildStore(g->builder, newlo, lo_a);
+    LLVMBuildStore(g->builder, newhi, hi_a);
+    LLVMBuildBr(g->builder, loop);
+
+    /* hit / miss */
+    LLVMPositionBuilderAtEnd(g->builder, hit);
+    LLVMBuildRet(g->builder, to);
+    LLVMPositionBuilderAtEnd(g->builder, miss);
+    LLVMBuildRet(g->builder, cp);
+    if (saved) LLVMPositionBuilderAtEnd(g->builder, saved);
+    return fn;
+}
 
 static LLVMValueRef get_libc_fn(zan_irgen_t *g, const char *name, LLVMTypeRef ty) {
     LLVMValueRef f = LLVMGetNamedFunction(g->mod, name);
