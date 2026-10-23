@@ -437,11 +437,26 @@ partial class Irgen {
             string endp = NT();
             EA(endp, "i8*");
             L("  store i8* null, i8** " + endp);
+            // A512（审计 P1-12 余项，宿主 irgen_call.c:2160 同款）：strtoll 对
+            // 超 long 范围的输入饱和返回 INT64_MAX/MIN 并置 errno=ERANGE——
+            // 只看返回值分不清「输入恰好是极值」与「饱和」。先清零 errno，
+            // 调用后读回比对 34。
+            if (!ExternSeen("_errno")) { externDecls.Add("_errno"); H("declare i32* @_errno()"); }
+            string errp = NT();
+            L("  " + errp + " = call i32* @_errno()");
+            L("  store i32 0, i32* " + errp);
             string r = NT();
             L("  " + r + " = call i64 @strtoll(i8* " + s + ", i8** " + endp + ", i32 10)");
             string ep = NT();
             L("  " + ep + " = load i8*, i8** " + endp);
             string bad = ParseBadPred(s, ep);
+            string erl = NT();
+            L("  " + erl + " = load i32, i32* " + errp);
+            string erb = NT();
+            L("  " + erb + " = icmp eq i32 " + erl + ", 34");
+            string ber = NT();
+            L("  " + ber + " = or i1 " + bad + ", " + erb);
+            bad = ber;
             if (!int64) {
                 string lo = NT();
                 L("  " + lo + " = icmp slt i64 " + r + ", -2147483648");
@@ -467,7 +482,27 @@ partial class Irgen {
             L("  " + r + " = fptosi double " + rn + " to i64");
             return r;
         }
-        if (ConvertIsIntegral(a)) { return a.op; }
+        if (ConvertIsIntegral(a)) {
+            // A512（审计 P1-12，宿主 irgen_call.c:2232 同款）：i64 实参超 int
+            // 范围曾静默截断回绕（ToInt32(2147483648L) = -2147483648）——
+            // C# 语义是 OverflowException。软诊断 + 0；ToInt64 全宽不查。
+            // 位宽按 ValWidth（算术子式类型名恒 int、真宽度在 wbits，见
+            // ArithWidth 注释）——窄整型 sext 后必在范围内，不用查。
+            if (!int64 && ValWidth(a) >= 64) {
+                string ilo = NT();
+                L("  " + ilo + " = icmp slt i64 " + a.op + ", -2147483648");
+                string ihi = NT();
+                L("  " + ihi + " = icmp sgt i64 " + a.op + ", 2147483647");
+                string iov = NT();
+                L("  " + iov + " = or i1 " + ilo + ", " + ihi);
+                EmitRuntimeCheckIf(at, iov,
+                    "Convert.ToInt*: value is outside the range of int");
+                string isafe = NT();
+                L("  " + isafe + " = select i1 " + iov + ", i64 0, i64 " + a.op);
+                return isafe;
+            }
+            return a.op;
+        }
         return "0";
     }
     // Convert.ToDouble: a string is parsed as text, an integer is converted
@@ -1189,6 +1224,23 @@ partial class Irgen {
                 bs = GuardDivisor(a, b, op, e, aw, awu);
             }
             L("  " + t + " = " + ar + " i64 " + a.op + ", " + bs);
+            // >>>（逻辑右移）按声明宽度做**真**位移（宿主 irgen_expr.c：int
+            // 操作数 trunc i32 → lshr i32 → zext，long 直接 lshr i64）——
+            // 不能用「lshr i64 再 WrapArith(32)」模拟：-16 >>> 2 的 64 位
+            // 逻辑值 0x3FFF…FC 截低 32 位是 0xFFFFFFFC，而真 32 位位移是
+            // 0x3FFFFFFC（1073741820）。>> / << 维持 ashr/shl + WrapArith
+            // （算术移位与符号扩回等价、shl 低 32 位不受高位进位影响）。
+            if (op == TK.GreaterGreaterGreater() && aw > 0 && aw < 64) {
+                string a32 = NT();
+                L("  " + a32 + " = trunc i64 " + a.op + " to i32");
+                string c32 = NT();
+                L("  " + c32 + " = trunc i64 " + bs + " to i32");
+                string s32 = NT();
+                L("  " + s32 + " = lshr i32 " + a32 + ", " + c32);
+                string z64 = NT();
+                L("  " + z64 + " = zext i32 " + s32 + " to i64");
+                return ArithResult(z64, aw, uns);
+            }
             if (aw < 64) { t = WrapArith(t, aw, awu); }
             return ArithResult(t, aw, uns);
         }
@@ -2180,6 +2232,25 @@ partial class Irgen {
             int dw = ArithWidth(e.a, cur, e.b, r);
             rs = GuardDivisor(cur, r, dop, e, dw, ArithUnsigned(e.a, cur, e.b, r));
         }
+        // >>>=（逻辑右移复合赋值）按声明宽度做**真**位移（与 >>> 同款，见
+        // GenBinary）——lshr i64 后经 NarrowToDeclared 的 sext 收窄会变成
+        // 算术移位结果（neg >>>= 2 曾得 -4，宿主 1073741820）。
+        if (e.op == TK.GreaterGreaterGreaterEq()) {
+            int cb2 = IntBits(cur.ty);
+            if (cb2 > 0 && cb2 < 64) {
+                string a32c = NT();
+                L("  " + a32c + " = trunc i64 " + cur.op + " to i32");
+                string c32c = NT();
+                L("  " + c32c + " = trunc i64 " + rs + " to i32");
+                string s32c = NT();
+                L("  " + s32c + " = lshr i32 " + a32c + ", " + c32c);
+                string z64c = NT();
+                L("  " + z64c + " = zext i32 " + s32c + " to i64");
+                ExprVal nvc = new ExprVal(z64c, MkType("int"));
+                StoreTo(e.a, nvc);
+                return nvc;
+            }
+        }
         L("  " + t + " = " + opn + " i64 " + cur.op + ", " + rs);
         ExprVal nv = new ExprVal(t, MkType("int"));
         StoreTo(e.a, nv);
@@ -2398,7 +2469,17 @@ partial class Irgen {
             // a rectangular array folds its subscripts into a flat offset
             string sflat = idx.op;
             int srk = ArrRankOf(obj.ty);
-            if (srk > 1) { sflat = MdFlatIndex(lhs, obj.op, srk, idx.op); }
+            string mdOob = null;
+            if (srk > 1) {
+                // A507② 自举半边（二维+）：折叠同时取逐维越界 OR——钳位扁平
+                // 值永远落进 [0,total)，对总长的检查形同虚设；OOB 判定要按
+                // 维度来（宿主 emit_index_oob_pred 逐维同款），命中走 scratch。
+                MdTrackOob = true;
+                MdOobAll = null;
+                sflat = MdFlatIndex(lhs, obj.op, srk, idx.op);
+                MdTrackOob = false;
+                mdOob = MdOobAll;
+            }
             // A507② 自举半边：越界元素 store 曾完全无界——直接写穿真实内
             // 存（宿主至少钳位槽 0）。补软诊断 + 软基址：OOB 时元素地址换
             // scratch 槽，写落 scratch 不伤真实元素（诊断 + 数据保住，与宿
@@ -2413,6 +2494,13 @@ partial class Irgen {
             L("  " + iges + " = icmp sge i64 " + sflat + ", " + ln2s);
             string oobs = NT();
             L("  " + oobs + " = or i1 " + inegs + ", " + iges);
+            if (mdOob != null) {
+                // 二维+：逐维真谓词覆盖总长检查（钳位值必在界内，总长检查
+                // 永假）；一维维持原判定（一维无钳位，sflat 是裸下标）。
+                string oobm = NT();
+                L("  " + oobm + " = or i1 " + oobs + ", " + mdOob);
+                oobs = oobm;
+            }
             EmitRuntimeCheckIf(lhs, oobs, "index out of bounds: array store");
             if (!ExternSeen("__zan_soft_scratch")) {
                 externDecls.Add("__zan_soft_scratch");
