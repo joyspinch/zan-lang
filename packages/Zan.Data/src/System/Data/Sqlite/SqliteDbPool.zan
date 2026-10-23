@@ -1,0 +1,29 @@
+using System;
+using System.Data;
+
+namespace System.Data.Sqlite;
+
+// DbPool 的 SQLite 形态，与 <see cref="SqliteConnector.Pool"/> 工厂配对。
+// 官方工厂返回的是通用 DbPool，而类型化 <see cref="SqlitePool"/> 在归还时
+// 清残留事务（P2-29）的收尾对通用池不生效——通用池只认 IDbConnection，
+// 读不到 inTxn。这里覆写 Release 补齐同款清理，两个通路行为一致。
+public class SqliteDbPool : DbPool {
+    public SqliteDbPool(string filename, int maxSize)
+            : base(new SqliteConnector(filename), maxSize) {
+    }
+
+    // 归还前把没收尾的事务回滚掉再入池（P2-29，与 SqlitePool.Release
+    // 同规）。UnitOfWork 用户不受影响（它本来就先 Rollback）；回滚失败
+    // 也放行——连接仍可用，下一位使用者的显式 BEGIN 会撞上残留事务
+    // 报错，可定位。
+    public override void Release(IDbConnection c) {
+        if (c is SqliteConnection) {
+            SqliteConnection sc = (SqliteConnection)c;
+            if (sc.inTxn) {
+                try { sc.Rollback(); } catch (DbException e) { }
+                sc.inTxn = false;
+            }
+        }
+        base.Release(c);
+    }
+}

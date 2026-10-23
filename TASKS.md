@@ -1830,12 +1830,38 @@
   （`WxSettingsView`）与通讯录管理窗（`WxContactManagerView`）用这招验过，
   像素正常（导航列、正文、底栏各归各位）。聊天记录窗与独立聊天窗把 root
   建在 ChildWindow 类内部，视图接口没暴露，暂用这招。
-- 待查（从聊天记录窗那次运行的 `ZAN_GUI_LAYOUTLINT=1` 日志里冒出来的 6 条
-  「裁剪」命中）：`ToolStrip` 里的 `Button[506,201 0x28]`（宽度 0，装不下
-  28x28 图标）与 `Button[759,301 0x42]`，以及聊天页骨架里的图标钮
-  `Button[453,46 23x28]`、`Button[484,46 24x28]`、`Button[679,69 35x42]`、
-  `Button[726,69 36x42]`。图标钮按 skill 规矩应挂 `.FreeLayout` 免检；
-  ToolStrip 的 0 宽项要确认是「ToolStrip 自绘、按钮只是代理」的误报还是
-  真缺陷（聊天页输入区工具条同样是 ToolStrip，十页重跑时 0 命中）。
+- 已定性（2026-10-23 19:0x，闭掉「待查」那半）：那 6 条「裁剪」命中**不是误报**，
+  是真缺陷——**flex 收缩没有 min-content 下限**（CSS 的 `min-width:auto` 未实现），
+  行一旦放不下，子项按比例缩：图标钮被切掉几像素，工具条项被压成 **0 宽**（按钮
+  看不见也点不着）。复现：把客户端主窗口改窄（探针副本里 `Form.Create("微聊",
+  520, 600)`，只改副本不动模板）后跑聊天页，`ZAN_GUI_LAYOUTLINT=1` 稳定命中 4 条：
+  `Button[675,69 34x42]`/`[721,69 35x42]`（标题行图标钮，42→34/35 被切）、
+  `Button[717,661 36x42]`/`[753,661 0x42]`（输入区工具条末项被压成 0 宽）。
+  单独开聊天记录窗/独立聊天窗（宿主窗）各跑一遍都是 **0 命中**——子窗本身干净。
+- 模板侧已修（gui-wechat）：皮肤层补全局工具类 `.shrink-0 { flex-shrink: 0; }`；
+  标题行图标钮与各页工具条按钮挂 `shrink-0`；聊天页 `#ToolsHost` 改 `display:
+  flex`（ToolStrip 是块级子项时宽度=宿主宽，窄窗口下项被压成 0 宽；做成 flex
+  行后工具条是 flex 项，shrink-0 即可保持自然尺寸）。修后同一窄窗探针 **0 命中**，
+  像素复验：标题行两个图标钮与工具条图标完整不再缺块（见 `_scratch/probe/
+  narrow3.png`）；正常宽度十页重跑仍 0 命中、像素无变化。
+- 框架侧缺口另记 A545（`base.css` 烤进驱动，模板改不动）。
 - 前提：要有可交互的桌面会话（锁屏/远程会话会拿到黑屏），或让子窗口支持
   把 root 暴露给宿主驱动。
+
+### [ ] A545 框架：flex 收缩没有 min-content 下限 + base.css 缺 `shrink-0` 工具类
+- 现象一：`packages/Zan.Gui/src/Gui/Widget/Flex.zan` 的类注释承诺子项可用
+  `shrink-0`（「溢出时不让位」），但全仓搜不到 `shrink-0` 的定义——
+  `packages/Zan.Gui/src/Gui/skins/base.css` 里没有这条规则（`flex-shrink` 属性
+  本身在 `StyleSheet.zan:1369` 是支持的，只是没有这个工具类）。base.css 是烤进
+  驱动的（`src/runtime/main.c` 把皮肤包嵌进 exe），改它要重建 Gui 驱动。
+- 现象二：`Control.zan` 的 flex 收缩段（`free < 0` 分支，约 3527-3564 行）按比例
+  收缩子项，**没有 min-content 下限**（CSS 里 flex 项默认 `min-width:auto`，
+  即 min-content，图标钮不该被缩到图标以下）。停靠子项更极端：`Control.zan`
+  约 2890 行的 `FitSize(c.DockSize(availW, true), availW)` 把停靠子项裁到「剩余
+  宽」，剩余宽不足时直接给 **0 宽**——0 宽按钮既看不见也点不着（WinForms 的
+  ToolStrip 是溢出而不是压扁）。
+- 候选修法（需专门一轮，带 IDE 截图验证）：① base.css 补 `.shrink-0 { flex-shrink:
+  0; }`（与 Flex 注释对齐）+ 重建驱动；② flex 收缩加 min-content 下限（近似取子项
+  自然尺寸的最小值——图标钮按图标尺寸、文本钮按文字宽度）；③ 停靠子项不再被
+  `FitSize` 裁到 0 宽（不足时溢出或隐藏，而不是 0 宽）。
+- 模板侧已用等价的全局规则绕开（gui-wechat 皮肤层 `.shrink-0`），修法见 A544。
