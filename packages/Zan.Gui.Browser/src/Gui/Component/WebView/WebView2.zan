@@ -126,6 +126,9 @@ public class WebView2 {
     public Gate evalGate;
     public Gate cookieGate;
     public string pendingInitUrl;
+    // 引擎就绪前挂起的 Cookie 写入：core 未就绪时 Cookie 罐还没有
+    // 实体可写，先排队，就绪时在首次导航之前落罐（登录态随首屏带过去）。
+    public List<PendingCookieItem> pendingCookies;
     // 引擎就绪前挂起的 HTML 载荷：控制器是异步创建的，core 未就绪时
     // 直接 NavigateToString 会被静默丢掉（页面停在 about:blank，正文
     // 空白且不报任何错）。这里挂起到就绪回调里再导航。
@@ -193,12 +196,21 @@ public class WebView2 {
     public static int SlotStop() { return 43; }
     // 槽 48：get_DocumentTitle，读取页面标题。
     public static int SlotGetDocumentTitle() { return 48; }
-    // ICoreWebView2_2 接口虚函数 add_WebResourceResponseReceived（槽位 66）。
-    public static int SlotAddWebResourceResponseReceived() { return 66; }
-    // ICoreWebView2_2 接口虚函数 remove_WebResourceResponseReceived（槽位 67）。
-    public static int SlotRemoveWebResourceResponseReceived() { return 67; }
-    // ICoreWebView2_2 接口虚函数 get_CookieManager（继承 ICoreWebView2，槽位 71）。
-    public static int SlotGetCookieManager() { return 71; }
+    /* ICoreWebView2_2 的自有虚函数槽位。
+     *
+     * 槽位从 61 起算：ICoreWebView2 本体有 58 个方法（vtable 槽 3..60，
+     * 0..2 是 IUnknown），_2 接口的新方法接在后面。这三个槽位原来写成
+     * 66/67/71 —— 比真实位置各多 5，get_CookieManager 直接读到了 vtable
+     * 之外的内存（返回 E_INVALIDARG），于是「往网页视图里种 Cookie」
+     * 这条路从来没通：客户端登录了，后台网页仍落到登录页。槽位以
+     * WebView2.h（NuGet microsoft.web.webview2）为准。
+     */
+    // ICoreWebView2_2 接口虚函数 add_WebResourceResponseReceived（槽位 61）。
+    public static int SlotAddWebResourceResponseReceived() { return 61; }
+    // ICoreWebView2_2 接口虚函数 remove_WebResourceResponseReceived（槽位 62）。
+    public static int SlotRemoveWebResourceResponseReceived() { return 62; }
+    // ICoreWebView2_2 接口虚函数 get_CookieManager（槽位 66）。
+    public static int SlotGetCookieManager() { return 66; }
     // ICoreWebView2_2 的接口 IID，QueryInterface 取 Cookie 管理器时使用。
     public static string IidWebView2_2() {
         return "9E8F0CF8-E670-4B5E-B2BC-73E061E3184C";
@@ -388,6 +400,7 @@ public class WebView2 {
         w.pendingInitUrl = "";
         w.pendingHtml = "";
         w.pendingHtmlBase = "";
+        w.pendingCookies = new List<PendingCookieItem>();
 
         List<WebView2> all = WebView2.All();
         all.Add(w);
@@ -496,6 +509,17 @@ public class WebView2 {
         if (handlers != null && handlers.Count > 0) {
             for (int i = 0; i < handlers.Count; i = i + 1) {
                 this.AddDocScript(WebView2.ShimScript(handlers[i].name));
+            }
+        }
+
+        // 先把排队的 Cookie 落罐，再消费挂起的导航：首屏必须带着
+        // 登录态（网页视图只能靠 Cookie 认证，没有请求头可继承）。
+        if (pendingCookies != null && pendingCookies.Count > 0) {
+            List<PendingCookieItem> cookies = pendingCookies;
+            pendingCookies = new List<PendingCookieItem>();
+            for (int i = 0; i < cookies.Count; i = i + 1) {
+                PendingCookieItem pc = cookies[i];
+                this.WriteCookie(pc.url, pc.name, pc.value);
             }
         }
 
@@ -1018,29 +1042,53 @@ public class WebView2 {
     }
 
     // 导航到 target；core 未就绪时记入 pendingInitUrl 等就绪后自动导航。
+    //
+    // WebView2 的入口有 UI 线程亲和：async 体由后台协程池驱动，不在 GUI
+    // 线程上，跨线程调用直接回 UI_E_WRONG_THREAD（0x802A000C）——导航
+    // 静默失败，页面停在 about:blank。经 Dispatcher 投回 UI 线程发起。
     public void Navigate(string target) {
         if (core == 0) {
             pendingInitUrl = target;
             return;
         }
-        nint u = Wide.Of(target);
-        Com.Call1(core, WebView2.SlotNavigate(), u);
-        Wide.Free(u);
+        WebView2.IssueOnUi(() => {
+            if (core == 0) { return; }
+            nint u = Wide.Of(target);
+            int hr = Com.Call1(core, WebView2.SlotNavigate(), u);
+            if (!Com.Ok(hr)) {
+                Console.WriteLine("[WV2] Navigate failed hr="
+                    + Convert.ToString(hr) + " url=" + target);
+            }
+            Wide.Free(u);
+        });
     }
 
     // WebView2 没有带 base-url 的 NavigateToString 形式，因此 `baseUrl`
     // 被接受但忽略。控制器（core）是异步创建的：core 未就绪时把载荷挂起，
     // 等就绪回调里再导航——直接丢掉的话页面会停在 about:blank（正文空白
     // 且不报任何错）。
+    //
+    // 同 Navigate：入口有 UI 线程亲和，跨线程发起会被拒（UI_E_WRONG_THREAD），
+    // 正文因此永远是空白——投回 UI 线程再发起。
     public void LoadHtml(string html, string baseUrl) {
         if (core == 0) {
             pendingHtml = html;
             pendingHtmlBase = baseUrl;
             return;
         }
-        nint h = Wide.Of(html);
-        Com.Call1(core, WebView2.SlotNavigateToString(), h);
-        Wide.Free(h);
+        WebView2.IssueOnUi(() => {
+            if (core == 0) { return; }
+            nint h = Wide.Of(html);
+            int hr = Com.Call1(core, WebView2.SlotNavigateToString(), h);
+            if (!Com.Ok(hr)) {
+                // 以前这里吞掉 HRESULT：正文没装上时页面停在 about:blank，
+                // 宿主只看到"空白"，看不到任何原因。
+                Console.WriteLine("[WV2] NavigateToString failed hr="
+                    + Convert.ToString(hr) + " bytes="
+                    + Convert.ToString(html == null ? 0 : html.Length));
+            }
+            Wide.Free(h);
+        });
     }
 
     // 映射虚拟域名到本地虚拟资产目录（像 Tauri 一样通过 https://app.local/* 访问，无需开放任何 TCP 端口）。
@@ -1514,9 +1562,31 @@ public class WebView2 {
 
     // WebView2 按主机和路径而非 URL 存储 Cookie，因此
     // 从 `forUrl` 提取主机，并把 Cookie 写到站点根路径。
+    //
+    // core 未就绪（控制器还在环境创建回调里）时先排队：Cookie 罐随
+    // core 一起才有，落罐后首屏导航才带得上登录态。
     public void SetCookie(string forUrl, string cookieName, string cookieValue) {
+        if (core == 0) {
+            if (pendingCookies == null) {
+                pendingCookies = new List<PendingCookieItem>();
+            }
+            pendingCookies.Add(new PendingCookieItem(forUrl, cookieName, cookieValue));
+            return;
+        }
+        if (!this.WriteCookie(forUrl, cookieName, cookieValue)) {
+            // Cookie 管理器同样有 UI 线程亲和：跨线程调用拿不到管理器
+            // （get_CookieManager 回 UI_E_WRONG_THREAD），投回 UI 线程再试。
+            WebView2.IssueOnUi(() => {
+                this.WriteCookie(forUrl, cookieName, cookieValue);
+            });
+        }
+    }
+
+    // 把一枚 Cookie 写进 Cookie 罐（主机取自 forUrl，路径固定 "/"）。
+    // 写入成功返回 true；拿不到 Cookie 管理器时返回 false。
+    public bool WriteCookie(string forUrl, string cookieName, string cookieValue) {
         nint cm = this.Cookies();
-        if (cm == 0) { return; }
+        if (cm == 0) { return false; }
         string host = WebView2.HostOf(forUrl);
         if (host != "") {
             nint n = Wide.Of(cookieName);
@@ -1538,6 +1608,7 @@ public class WebView2 {
             Wide.Free(p);
         }
         Com.Release(cm);
+        return true;
     }
 
     // 清空该 profile 数据仓的全部 Cookie（运行时无 Cookie 管理器

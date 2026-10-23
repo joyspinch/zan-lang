@@ -257,6 +257,43 @@ STANDARDS.md §6.7）。
   （交叉轴对齐失效、标题块量到 0 宽）。共享给"代码建的控制"的类放
   皮肤，页面独占的类放文档，**一份类只出现在一处**。
 
+## 内嵌真网页（WebView）：三道坎（都真踩过，症状全是"静默失效"）
+
+`.html` 设计稿是**引擎自己的控件树**，不是网页；只有两处用真浏览器引擎：
+服务端渲染好的正文（`LoadHtml`）与后端管理台（`Navigate` 到服务端页面）。
+这条路上的坑没有一条会自己报错——界面正常、零日志、功能没生效。
+
+- **WebView2 的 COM 入口有 UI 线程亲和**：跨线程调用回
+  `UI_E_WRONG_THREAD`（0x802A000C）。Zan 的 `async` 体由后台协程池驱动，
+  不在 GUI 线程上——在协程里发 `NavigateToString`，正文永远装不上，页面
+  停在 `about:blank` 且不报任何错。解法是包里的 `WebView2.IssueOnUi`
+  （Dispatcher 投回 UI 线程），`Navigate`/`LoadHtml`/`ExecuteScript`
+  都要走它。坑出处：文档页正文空白只能降级纯文本；内嵌后台网页永远要
+  再登录一次。
+- **vtable 槽位按 SDK 头文件数，别凭印象**：`ICoreWebView2` 本体 58 个
+  方法（槽 3..60，0..2 是 IUnknown），`ICoreWebView2_2` 的自有方法从 61
+  起——`add_WebResourceResponseReceived`=61、`remove_`=62、
+  `get_CookieManager`=66。槽位写错就是读到 vtable 之外的内存，HRESULT
+  报 `E_INVALIDARG`（0x80070057），症状是"某个功能从来没生效过"。
+  核对来源：NuGet `microsoft.web.webview2` 的
+  `build/native/include/WebView2.h`（方法按声明顺序就是槽位顺序）。
+- **客户端已登录 ≠ 网页已登录**：API 走 `Authorization: Bearer <令牌>`，
+  后台网页认的是 `zsession` 会话 Cookie；网页视图是**独立的浏览器
+  上下文**，不继承客户端的请求头。令牌两边通用（服务端 API 登录落的
+  `zsession` 就是这枚令牌）→ 客户端把令牌种成 `zsession` Cookie 即可。
+  种 Cookie 的**唯一时机是首屏导航之前**（原生视图还没建出来），
+  `SetCookie` 必须能排队到"创建完成、首次导航之前"再落罐。
+- **别吞 COM 的 HRESULT**：正文没装上时宿主只看到"空白"，看不到原因。
+  `Navigate`/`LoadHtml` 失败要打出来，否则这类问题只能靠猜。
+
+取证与验收（网页内容抓不到像素——它画在独立子 HWND 上，压在画布之上）：
+① 控件树**分支判定**（网页容器可见 / 纯文本降级容器不可见）；
+② **地址条**（原生 label，显示真实 URL）——落在 `/admin/login` 还是
+`/admin/dashboard` 一眼分明。A/B 对照时注意 WebView2 的 Cookie 存在磁盘
+（默认 `%LOCALAPPDATA%\ZanGui\WebView2\default`），用
+`WEBVIEW2_USER_DATA_FOLDER` 换一个干净目录，否则第二次跑继承第一次的
+Cookie，"对照组"就不成立了。
+
 ## 多按钮控制中间区（切页三路）
 
 1. **推荐：Nav.Embed 做骨架 + 每页 .html 内容**。`Gui/Nav.zan` 的

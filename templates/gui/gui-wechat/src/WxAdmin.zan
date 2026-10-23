@@ -10,10 +10,15 @@ using Gui.Component.WebView;
  * 系统管理、文档中心、备份恢复、AI 助手…），功能面比客户端原生页大
  * 得多，也不需要两套实现。客户端这边只提供「一个能装下网页的地方」
  * ——工具条（后退 / 刷新 / 当前地址）+ 铺满余下区域的网页视图。
- * 网页自己的登录态由后台自己管（后台有独立的 /admin/login）。
  *
  * 页面结构在 WxAdmin.html（运行期装载的文档），这里只做三件事：
  * 装载文档 → 把原生网页视图挂进 #WebHost → 按名字接住工具条事件。
+ *
+ * 登录态：客户端的 API 用 Authorization: Bearer 令牌认证，后台网页认
+ * 的是 zsession 会话 Cookie；网页视图是独立的浏览器上下文，不继承
+ * 请求头。服务端两套都认同一枚令牌（见服务端 Boot.zan 的认证解析），
+ * 所以进页时把令牌种成 zsession Cookie 再导航——后台网页就是"已登录"
+ * 的，不必再登一次（见 OnShow）。
  *
  * 降级：机器没装 WebView2 运行时时原生视图造不出来
  * （WebView.IsSupported false），此时显出一行提示，不留一块黑屏。
@@ -24,6 +29,10 @@ public class WxAdmin : Control {
     Control tip;
     ModelBinder binder;
     string url;
+    // 已经种进网页视图的会话令牌（"" = 还没种）。
+    string seededToken;
+    // 是否已经发起过导航。
+    bool navigated;
 
     WxAdmin() {
         this.InitControl("wxadmin", 5);
@@ -55,14 +64,16 @@ public class WxAdmin : Control {
         tip = ui.Find("AdminTip");
 
         // 网页视图：铺满余下区域（文档里 #WebHost 是 flex-grow 的列）。
-        // 导航在原生视图建出来之前会挂在 WebView 内部（pendingUrl），
-        // 首帧创建时自动消费。
+        // 导航不在这里发——本方法跑在登录门之前，那时还没有令牌，
+        // 首屏会落到后台登录页；进页时（OnShow）种上会话 Cookie 再导航。
         Control webHost = ui.Find("WebHost");
         if (webHost == null) { webHost = ui; }
         box = new WebViewBox();
         box.Class = "wxadminweb grow";
         webHost.Add(box);
-        box.Navigate(url);
+        // 地址条跟着真实 URL 走：页面里点链接、后退都会改地址，
+        // 导航完成后同步一次（NavComplete 在绘制帧里抛，UI 线程）。
+        box.View().NavComplete.Add(() => { this.SyncAddr(); });
 
         ModelHosts.Register(app, binder);
     }
@@ -76,14 +87,40 @@ public class WxAdmin : Control {
             + "/admin/dashboard";
     }
 
-    // 进页：原生视图第一帧才建（IsSupported 在那之后才准），因此这里
-    // 决定「显示网页还是显示提示」，地址条也跟着真实 URL 走。
+    // 进页：把客户端的会话令牌种进网页视图的 Cookie 罐，然后导航。
+    //
+    // 为什么要这一步：客户端的 API 走 Authorization: Bearer 令牌，后台
+    // 网页认的是 zsession 会话 Cookie，两者是服务端认证的两条入口但
+    // 各认各的；网页视图又是独立的浏览器上下文，不继承客户端的请求头。
+    // 令牌本身两边通用（服务端 /api/auth/login 落的 zsession 就是这枚
+    // 令牌），所以种一枚 zsession 即可，后台网页不必再登一次。
+    //
+    // 原生视图是异步建的：SetCookie 在视图建出来之前会排队，创建流程
+    // 在首屏导航之前补上，因此这里种完就能直接导航。
     void OnShow() {
         if (box == null) { return; }
+        string tok = WxNet.Token();
+        if (tok != "" && tok != seededToken) {
+            box.View().SetCookie(url, "zsession", tok);
+            seededToken = tok;
+            // 令牌换过（重新登录）：原先那次导航可能停在登录页，重导一次。
+            navigated = false;
+        }
+        if (!navigated) {
+            navigated = true;
+            box.Navigate(url);
+        }
+        // 原生视图第一帧才建（IsSupported 在那之后才准），因此这里
+        // 决定「显示网页还是显示提示」，地址条也跟着真实 URL 走。
         bool ok = box.View().IsSupported();
         box.visible = ok;
         if (tip != null) { tip.visible = !ok; }
-        if (addr == null) { return; }
+        this.SyncAddr();
+    }
+
+    // 地址条同步真实 URL（没导航完时保持原值，别闪一个空地址）。
+    void SyncAddr() {
+        if (addr == null || box == null) { return; }
         string u = box.CurrentUrl();
         if (u != "") { addr.SetProp("text", u); }
     }

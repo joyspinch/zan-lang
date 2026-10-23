@@ -45,6 +45,8 @@ public class WebView : IDisposable {
     public List<string> pendingHandlers;
     public List<PendingScriptItem> pendingScripts;
     public List<string> pendingStyles;
+    // 挂起的 Cookie 写入（原生视图创建前登记，创建后补上）。
+    public List<PendingCookieItem> pendingCookies;
     public bool pendingDevTools;
     public bool devToolsEnabled;
     public bool devToolsExplicit;
@@ -88,6 +90,7 @@ public class WebView : IDisposable {
         this.pendingHandlers = new List<string>();
         this.pendingScripts = new List<PendingScriptItem>();
         this.pendingStyles = new List<string>();
+        this.pendingCookies = new List<PendingCookieItem>();
         this.pendingDevTools = false;
         this.devToolsEnabled = true;
         this.devToolsExplicit = false;
@@ -137,6 +140,15 @@ public class WebView : IDisposable {
             WebViewBackend.AddStyle(handle, pendingStyles[i]);
         }
         pendingStyles = new List<string>();
+        // 补上创建前登记的 Cookie：必须排在挂起的导航之前，否则首次
+        // 打开的页面拿不到登录态（网页视图这边只有 Cookie 一条认证路）。
+        if (pendingCookies.Count > 0) {
+            for (int i = 0; i < pendingCookies.Count; i = i + 1) {
+                PendingCookieItem pc = pendingCookies[i];
+                WebViewBackend.SetCookie(handle, pc.url, pc.name, pc.value);
+            }
+            pendingCookies = new List<PendingCookieItem>();
+        }
         if (pendingUrl != "") {
             WebViewBackend.Navigate(handle, pendingUrl);
             pendingUrl = "";
@@ -370,10 +382,17 @@ public class WebView : IDisposable {
         return res;
     }
     // 为 `url` 的主机在存储中设置 Cookie（路径默认为 "/"）。
+    //
+    // 原生视图尚未创建时登记到 pendingCookies，创建流程会在首次导航
+    // 之前补上——否则"先把登录态种进网页、再打开页面"这条用法直接失效
+    // （后台网页看不到登录态，落到登录页）。
     public void SetCookie(string forUrl, string cookieName, string cookieValue) {
-        if (supported && handle != 0) {
-            WebViewBackend.SetCookie(handle, forUrl, cookieName, cookieValue);
+        if (!supported) { return; }
+        if (handle == 0) {
+            pendingCookies.Add(new PendingCookieItem(forUrl, cookieName, cookieValue));
+            return;
         }
+        WebViewBackend.SetCookie(handle, forUrl, cookieName, cookieValue);
     }
     // 清除共享存储中的所有 Cookie。
     public void ClearCookies() {

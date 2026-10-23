@@ -5210,11 +5210,13 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
   # The Zan-side COM interop the WebView2 backend is built from (GUID
   # marshalling, vtable objects, slot dispatch, URL/profile helpers) is pure
   # computation; embedding a live browser is covered by the smoke test.
+  # WebView.zan joins the list so the case can also pin the WebView2_2 slot
+  # numbers and the "cookie queued until the native view exists" contract.
   add_test(NAME conformance_gui_webview_interop
     COMMAND ${CMAKE_COMMAND}
       -DZANC=$<TARGET_FILE:zanc>
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/webview_interop_test.zan
-      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/packages/Zan.Gui.Browser/src/Gui/Component/WebView/WebView2.zan;--auto-stdlib${_gui_driver_tail}"
+      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/packages/Zan.Gui.Browser/src/Gui/Component/WebView/WebView.zan;${CMAKE_SOURCE_DIR}/packages/Zan.Gui.Browser/src/Gui/Component/WebView/WebView2.zan;--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_webview_interop.out
       -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_webview_interop${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
