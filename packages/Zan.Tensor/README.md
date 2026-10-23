@@ -9,6 +9,11 @@
 | `Tensor.zan` | 多维张量：行主序存储、形状与下标换算（`OffsetOf`）、`Reshape` / `Transpose2D` / `Slice` / `Clone` |
 | `TensorMath.zan` | 逐元素算子、矩阵乘、Softmax / 因果 Softmax / RMSNorm / LayerNorm、SiLU / GELU / SwiGLU、按行取表、沿第 0 维拼接、归约（`ArgMax` / `TopK` / `Sum` / `Mean`） |
 | `ComputeBackend.zan` | 计算后端契约（GPU 加速的挂载点）与登记处 `ComputeBackendRegistry` |
+| `WeightFile.zan` | 权重文件入口 `Load`：按魔数分发 GGUF / safetensors，`Require` / `Info` / `Has` 按名取张量（数据区整体驻内存，>2GB 的单文件不支持） |
+| `GgufReader.zan` | GGUF 目录解析：元数据 KV（字符串数组保留为 `metadataArrays`）与张量描述（形状 / ggml 类型 / 数据区偏移），对齐值取 `general.alignment` |
+| `SafeTensorsReader.zan` | safetensors 头解析：dtype / shape / `data_offsets`（相对数据区起点）与 `__metadata__` |
+| `BinaryReader.zan` | 内存字节流的小端读取原语（`U8..U64` / `F16` / `F32` / `F64` / 长度前缀字符串）与越界守卫 `Need` |
+| `FloatBits.zan` | 位级互转：f16 / bf16 → f32（次正规、±∞、NaN、−0 精确保真） |
 
 ## 约定
 
@@ -32,8 +37,6 @@
 
 ## 不在包内
 
-- **权重格式读取**（GGUF / safetensors）：在后续里程碑里做，落地时挂到这里
-  的 `Tensor` 上。
 - **GPU 后端的原生实现**：仓库里的 GPU 能力都在外部预编译的 `zan_gui` /
   `zan_game` 驱动里（`src/runtime/` 没有 D3D / Vulkan / Metal 代码），所以
   这里只留契约与调度路径；原生后端按平台补齐后 `Use(...)` 挂上即可，

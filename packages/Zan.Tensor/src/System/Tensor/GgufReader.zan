@@ -127,11 +127,30 @@ public class GgufReader {
         if (type == 4) { return r.U32(); }
         if (type == 5) { return r.I32(); }
         if (type == 10) { return r.U64(); }
-        return r.I64();
+        if (type == 11) { return r.I64(); }
+        // 表外类型绝不落到 I64 兜底：宽度错了后面所有条目全部错位，
+        // 还不如当场报清楚（f32/bool 曾经在这里被按 8 字节跳过）。
+        throw new Exception("GGUF metadata type " + Convert.ToString(type)
+            + " is not an integer");
     }
 
+    // 数组元素的按类型跳过：宽度必须与真实存储一致，错一个字节，
+    // 后面所有张量描述全部错位。真实 llama.cpp BPE 权重的
+    // tokenizer.ggml.scores 是 f32 数组（宽 4），曾被 I64 兜底按 8 字节
+    // 跳过导致整表错位。
     void SkipValue(BinaryReader r, int type) {
-        ReadInt(r, type);
+        if (type == 0 || type == 1 || type == 7) { r.U8(); return; }     // u8/i8/bool: 1
+        if (type == 2 || type == 3) { r.U16(); return; }                 // u16/i16: 2
+        if (type == 4 || type == 5 || type == 6) { r.U32(); return; }    // u32/i32/f32: 4
+        if (type == 10 || type == 11 || type == 12) { r.U64(); return; } // u64/i64/f64: 8
+        if (type == 8) { r.Str(); return; }
+        if (type == 9) {
+            // GGUF 不允许元数据数组嵌数组（llama.cpp 读写两侧都不产），
+            // 见到了就是坏文件，报错而不是静默错位。
+            throw new Exception("nested GGUF metadata arrays are not supported");
+        }
+        throw new Exception("unknown GGUF metadata element type "
+            + Convert.ToString(type));
     }
 
     WeightTensorInfo ReadTensorInfo(BinaryReader r) {
