@@ -1,0 +1,75 @@
+// A534 判定器：PoolCore<T> 值类型类型实参的整池不变量。
+// 曾：PoolCore<int> 调 RemoveBorrowed（this.borrowed[i] == c）→
+// LLVM verify 挂 "Both operands to ICmp instruction are not of the same
+// type!"（ptr vs i32，元素加载按擦除形出、比较另一侧按特化形出），
+// 值类型池整个不可用（审计 P2-31）。A418/A421 族修复后编译通过——
+// 本用例把"编译过"与"行为对"一起钉住：值相等命中、重复归还拒绝、
+// TryReserve/Borrow/Drop 槽位记账、Pool/TakeIdle 先进后出、
+// 空池 TakeIdle 取默认值不崩、引用类型 T 同接口回归。
+using System;
+using System.Data;
+
+class PoolValueTCase {
+    static int bad = 0;
+
+    static void Chk(string label, bool ok) {
+        if (!ok) {
+            bad = bad + 1;
+            Console.WriteLine("FAIL " + label);
+        }
+    }
+
+    static void Main() {
+        // 值相等命中与重复归还拒绝
+        PoolCore<int> p = new PoolCore<int>(4);
+        p.Borrow(7);
+        p.Borrow(9);
+        Chk("remove by value", p.RemoveBorrowed(7));
+        Chk("remove missing", !p.RemoveBorrowed(8));
+        Chk("double return rejected", !p.RemoveBorrowed(7));
+        Chk("remove remaining", p.RemoveBorrowed(9));
+        Chk("borrowed drained", !p.RemoveBorrowed(9));
+
+        // 槽位记账：TryReserve/Borrow/Drop；重复 Drop 不得多扣
+        Chk("reserve ok", p.TryReserve());
+        Chk("reserve ok2", p.TryReserve());
+        p.Borrow(1);
+        p.Borrow(2);
+        Chk("live two", p.LiveCount() == 2);
+        p.Drop(1);
+        Chk("live after drop", p.LiveCount() == 1);
+        p.Drop(1);
+        Chk("double drop no over-decrement", p.LiveCount() == 1);
+        p.Drop(2);
+        Chk("live zero", p.LiveCount() == 0);
+
+        // 归还→空闲→取回（后进先出），取回即回到借出侧
+        Chk("reserve again", p.TryReserve());
+        p.Borrow(42);
+        p.Pool(42);
+        Chk("idle one", p.IdleCount() == 1);
+        int c = p.TakeIdle();
+        Chk("take returns pooled", c == 42);
+        Chk("idle drained", p.IdleCount() == 0);
+        Chk("take moves to borrowed", p.RemoveBorrowed(42));
+
+        // 空池 TakeIdle 取默认值（T=int → 0），不崩
+        int empty = p.TakeIdle();
+        Chk("empty take default", empty == 0);
+
+        // 引用类型 T 回归（审计基线：PoolCore<string> 不变量已过）
+        PoolCore<string> ps = new PoolCore<string>(2);
+        ps.Borrow("a");
+        Chk("ref remove", ps.RemoveBorrowed("a"));
+        Chk("ref double return rejected", !ps.RemoveBorrowed("a"));
+        ps.Borrow("b");
+        Chk("ref remove missing", !ps.RemoveBorrowed("x"));
+
+        // 上限守卫
+        PoolCore<int> small = new PoolCore<int>(1);
+        Chk("small reserve ok", small.TryReserve());
+        Chk("small reserve blocked", !small.TryReserve());
+
+        Console.WriteLine("pool-value-t-ok: " + Convert.ToString(bad == 0 ? 1 : 0));
+    }
+}

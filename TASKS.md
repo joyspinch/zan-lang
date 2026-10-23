@@ -27,6 +27,9 @@
 > （内建字典非字符串键即指针哈希），首访发 `&aN`、重访发 `*aN`；447 字符 12 层三叉
 > 炸弹输出 442 字符且幂等往返；空容器复制、环显式报错（读侧锚点节点收尾才登记，
 > 前向引用读不回）。
+> A534 复核证伪：A418/A421 族修复已覆盖值类型池——`PoolCore<int>` 编译运行、
+> 全 API 不变量过（新耐久用例 `pool_value_t`：值相等命中/重复归还拒绝/槽位记账/
+> Pool-TakeIdle 往返/空池默认值/引用 T 回归），icmp eq ptr,i32 不复现。
 >
 > 2026-10-22 平账：移出 48 条已闭账条目（A390/A393/A394/A395/A396/A397/A399/
 > A400/A401/A402/A403/A404/A405/A406/A407/A413/A415/A416/A428/A431/A432/A437/
@@ -1567,16 +1570,6 @@
   （42，Convert 是静态内建有成员表——本条登记时误写它也挂，更正）；
   正例回归 p11/v_parse_ok 全绿。
 - 探针：`_scratch/csaudit/numeric/{v_chain2,v_chain5,v_chain6}.zan`。
-
-### [ ] A534 PoolCore<T> 值类型元素比较生成非法 IR（icmp eq ptr,i32）
-- 来源：审计 P2-31（实测）。`PoolCore<int>` 调 RemoveBorrowed
-  （`this.borrowed[i] == c`）→ LLVM verify 挂 "Both operands to ICmp
-  instruction are not of the same type!"（ptr vs i32）；`PoolCore<string>`
-  同代码 7 项不变量全过。编译期即炸（响亮），但泛型值类型池整个不可用。
-- 根因族：A418/A421 一族——类级类型参数驱动的 `List<T>` 元素访问在
-  "擦除/特化"两侧混形：元素加载按擦除 ptr 出、比较另一侧按特化 i32 出。
-- 方向：编译期把泛型值类型比较折叠到同形（对照 A507 家族的 IR 层折叠
-  先例），或让元素加载按实例化类型出值。修好留 conformance 用例。
 
 ### [ ] A535 池归还回滚对异步单类驱动不成立（P2-29 余项）
 - 已落：Sqlite（:memory: 探针 6 断言全过）与 Pg（编译验证）的 inTxn
