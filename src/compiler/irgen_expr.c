@@ -4102,8 +4102,9 @@ static LLVMValueRef emit_binary_op_values(zan_irgen_t *g, zan_ast_node_t *expr,
                 }
                 LLVMValueRef divisor = LLVMBuildSelect(g->builder, unsafe,
                     one, right, "divz.safe");
-                return is_unsigned ? zan_udiv(g->builder, left, divisor, "div")
-                                   : zan_sdiv(g->builder, left, divisor, "div");
+                LLVMValueRef div_res = is_unsigned ? zan_udiv(g->builder, left, divisor, "div")
+                                                   : zan_sdiv(g->builder, left, divisor, "div");
+                return LLVMBuildSelect(g->builder, unsafe, zero, div_res, "divz.res");
             }
         case TK_PERCENT:
             if (is_float) return LLVMBuildFRem(g->builder, left, right, "rem");
@@ -4126,8 +4127,9 @@ static LLVMValueRef emit_binary_op_values(zan_irgen_t *g, zan_ast_node_t *expr,
                 }
                 LLVMValueRef divisor = LLVMBuildSelect(g->builder, unsafe,
                     one, right, "remz.safe");
-                return is_unsigned ? zan_urem(g->builder, left, divisor, "rem")
-                                   : zan_srem(g->builder, left, divisor, "rem");
+                LLVMValueRef rem_res = is_unsigned ? zan_urem(g->builder, left, divisor, "rem")
+                                                   : zan_srem(g->builder, left, divisor, "rem");
+                return LLVMBuildSelect(g->builder, unsafe, zero, rem_res, "remz.res");
             }
         case TK_AMP:
             return zan_and(g->builder, left, right, "and");
@@ -11357,6 +11359,7 @@ static LLVMValueRef emit_runtime_is_check(zan_irgen_t *g, LLVMValueRef x,
 
 static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_t *locals) {
     if (!expr) return LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 0, 0);
+    if (locals) g->current_locals = locals;
 
     if (expr->kind == AST_REF_ARG) {
         return emit_ref_arg(g, expr, locals); }

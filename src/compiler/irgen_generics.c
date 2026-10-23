@@ -1,5 +1,15 @@
 /* irgen_generics */
 
+static void get_eh_globals(zan_irgen_t *g, LLVMValueRef *top, LLVMValueRef *bufs, LLVMValueRef *exc);
+static LLVMValueRef get_eh_exc_owned_global(zan_irgen_t *g);
+static LLVMValueRef get_eh_exc_tid_global(zan_irgen_t *g);
+static LLVMValueRef get_class_tid_global(zan_irgen_t *g, zan_symbol_t *sym);
+static LLVMValueRef emit_eh_buf_ptr(zan_irgen_t *g, LLVMValueRef idx);
+static void emit_eh_unwind_to_handler(zan_irgen_t *g, LLVMValueRef top);
+static void emit_eh_longjmp(zan_irgen_t *g, LLVMValueRef bufp);
+static void emit_finallys_left_by_throw(zan_irgen_t *g, local_scope_t *locals);
+static LLVMValueRef emit_string_literal_rc(zan_irgen_t *g, zan_istr_t text);
+
 static void emit_eh_tmp_push_slot(zan_irgen_t *g, LLVMValueRef slot, int kind);
 
 static bool sym_declares_extern(zan_symbol_t *sym);
@@ -1304,16 +1314,117 @@ static LLVMValueRef emit_expect_false(zan_irgen_t *g, LLVMValueRef cond) {
                           g->expect_false_fn, args, 2, "guard.expect");
 }
 
+static zan_symbol_t *lookup_sys_class(zan_irgen_t *g, const char *short_name, const char *full_name) {
+    if (!g->binder) return NULL;
+    zan_symbol_t *sym = zan_binder_lookup(g->binder, (zan_istr_t){ (char *)short_name, (int)strlen(short_name) });
+    if (!sym) {
+        sym = zan_binder_lookup(g->binder, (zan_istr_t){ (char *)full_name, (int)strlen(full_name) });
+    }
+    return sym;
+}
+
+static zan_symbol_t *infer_guard_exception_sym(zan_irgen_t *g, const char *msg) {
+    zan_symbol_t *sym = NULL;
+    if (strstr(msg, "division by zero")) {
+        sym = lookup_sys_class(g, "DivideByZeroException", "System.DivideByZeroException");
+    } else if (strstr(msg, "out of bounds") || strstr(msg, "index") || strstr(msg, "range")) {
+        sym = lookup_sys_class(g, "IndexOutOfRangeException", "System.IndexOutOfRangeException");
+    } else if (strstr(msg, "null reference")) {
+        sym = lookup_sys_class(g, "NullReferenceException", "System.NullReferenceException");
+    } else if (strstr(msg, "overflow")) {
+        sym = lookup_sys_class(g, "OverflowException", "System.OverflowException");
+    }
+    if (!sym) {
+        sym = lookup_sys_class(g, "Exception", "System.Exception");
+    }
+    return sym;
+}
+
+static void emit_throw_guard_exception(zan_irgen_t *g, zan_symbol_t *sym,
+                                       const char *msg, LLVMValueRef top_val) {
+    LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
+    LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
+    LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+
+    /* Allocate 24-byte Exception object (vtable, Message, InnerException) */
+    LLVMTypeRef alloc_ty = LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i64, i64, i8ptr }, 3, 0);
+    LLVMValueRef site_val = LLVMConstInt(i64, 0, 0);
+    LLVMValueRef site_name = zan_irgen_intern_string(g, "runtime_exception");
+    LLVMValueRef raw = zan_call2(g->builder, alloc_ty, g->rt_alloc,
+        (LLVMValueRef[]){ LLVMConstInt(i64, 24, 0), site_val, site_name }, 3, "rt.exc");
+    LLVMValueRef obj_arr = LLVMBuildBitCast(g->builder, raw, LLVMPointerType(i8ptr, 0), "rt.fields");
+
+    /* Slot 0: vtable */
+    LLVMValueRef vtg = get_vtable_global(g, sym);
+    LLVMValueRef vtg_ptr = vtg ? LLVMBuildBitCast(g->builder, vtg, i8ptr, "vtg.ptr") : LLVMConstNull(i8ptr);
+    LLVMValueRef f0 = LLVMBuildGEP2(g->builder, i8ptr, obj_arr, (LLVMValueRef[]){ LLVMConstInt(i64, 0, 0) }, 1, "f0");
+    LLVMBuildStore(g->builder, vtg_ptr, f0);
+
+    /* Slot 1: Message */
+    LLVMValueRef msg_str = emit_string_literal_rc(g, (zan_istr_t){ (char *)msg, (int)strlen(msg) });
+    LLVMValueRef f1 = LLVMBuildGEP2(g->builder, i8ptr, obj_arr, (LLVMValueRef[]){ LLVMConstInt(i64, 1, 0) }, 1, "f1");
+    LLVMBuildStore(g->builder, msg_str, f1);
+
+    /* Slot 2: InnerException = null */
+    LLVMValueRef f2 = LLVMBuildGEP2(g->builder, i8ptr, obj_arr, (LLVMValueRef[]){ LLVMConstInt(i64, 2, 0) }, 1, "f2");
+    LLVMBuildStore(g->builder, LLVMConstNull(i8ptr), f2);
+
+    /* Store to EH globals */
+    LLVMValueRef top_g, bufs_g, exc_g;
+    get_eh_globals(g, &top_g, &bufs_g, &exc_g);
+    LLVMValueRef owned_g = get_eh_exc_owned_global(g);
+    LLVMValueRef tid_g = get_eh_exc_tid_global(g);
+
+    zan_store_fit(g, raw, exc_g);
+    zan_store_fit(g, LLVMConstInt(i32t, 1, 0), owned_g);
+    LLVMValueRef tid = get_class_tid_global(g, sym);
+    LLVMValueRef tid_ptr = LLVMBuildBitCast(g->builder, tid, i8ptr, "tid.ptr");
+    zan_store_fit(g, tid_ptr, tid_g);
+
+    /* Unwind finally blocks if any */
+    if (g->finally_count > 0 && g->current_locals) {
+        emit_finallys_left_by_throw(g, (local_scope_t *)g->current_locals);
+        if (LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(g->builder))) return;
+    }
+
+    /* Unwind temporary allocations and jump to handler */
+    if (!g->current_async_frame) {
+        emit_eh_unwind_to_handler(g, top_val);
+    }
+    emit_eh_longjmp(g, emit_eh_buf_ptr(g, top_val));
+    LLVMBuildUnreachable(g->builder);
+}
+
 static void emit_runtime_check(zan_irgen_t *g, LLVMValueRef is_error,
                                zan_loc_t loc, const char *msg) {
     if (!g->runtime_checks || !g->current_fn) return;
     is_error = emit_expect_false(g, is_error);
 
+    LLVMBasicBlockRef bad_bb  = LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "rt.bad");
+    LLVMBasicBlockRef cont_bb = LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "rt.cont");
+    LLVMBuildCondBr(g->builder, is_error, bad_bb, cont_bb);
+    LLVMPositionBuilderAtEnd(g->builder, bad_bb);
+
+    zan_symbol_t *sym = infer_guard_exception_sym(g, msg);
+    if (sym && !g->target_is_wasm) {
+        LLVMValueRef top_g, bufs_g, exc_g;
+        get_eh_globals(g, &top_g, &bufs_g, &exc_g);
+        LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
+        LLVMValueRef top_val = LLVMBuildLoad2(g->builder, i32t, top_g, "rt.top");
+        LLVMValueRef in_try = zan_icmp(g->builder, LLVMIntSGE, top_val,
+            LLVMConstInt(i32t, 0, 0), "rt.intry");
+
+        LLVMBasicBlockRef throw_bb = LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "rt.throw");
+        LLVMBasicBlockRef nothrow_bb = LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "rt.nothrow");
+        LLVMBuildCondBr(g->builder, in_try, throw_bb, nothrow_bb);
+
+        LLVMPositionBuilderAtEnd(g->builder, throw_bb);
+        emit_throw_guard_exception(g, sym, msg, top_val);
+
+        LLVMPositionBuilderAtEnd(g->builder, nothrow_bb);
+    }
+
     if (!g->rt_guard_split) {
-        LLVMBasicBlockRef bad_bb  = LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "rt.bad");
-        LLVMBasicBlockRef cont_bb = LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "rt.cont");
-        LLVMBuildCondBr(g->builder, is_error, bad_bb, cont_bb);
-        LLVMPositionBuilderAtEnd(g->builder, bad_bb);
         char buf[640];
         const char *file0 = loc_site_file(g, loc);
         if (g->hide_diagnostics) {
@@ -1326,23 +1437,16 @@ static void emit_runtime_check(zan_irgen_t *g, LLVMValueRef is_error,
         LLVMValueRef text0 = zan_irgen_intern_string(g, buf);
         emit_guard_report_merged(g, text0);
         LLVMBuildBr(g->builder, cont_bb);
-        LLVMPositionBuilderAtEnd(g->builder, cont_bb);
-        return;
+    } else {
+        LLVMValueRef file_gv = zan_irgen_intern_string(g, loc_site_file(g, loc));
+        char mbuf[320];
+        snprintf(mbuf, sizeof(mbuf), "%s\n", msg);
+        LLVMValueRef msg_gv = zan_irgen_intern_string(g, mbuf);
+        uint32_t line_arg = g->hide_diagnostics ? 0 : loc.line;
+        uint32_t col_arg = g->hide_diagnostics ? 0 : loc.col;
+        emit_guard_report3(g, file_gv, line_arg, col_arg, msg_gv);
+        LLVMBuildBr(g->builder, cont_bb);
     }
-
-    LLVMBasicBlockRef bad_bb  = LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "rt.bad");
-    LLVMBasicBlockRef cont_bb = LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "rt.cont");
-    LLVMBuildCondBr(g->builder, is_error, bad_bb, cont_bb);
-
-    LLVMPositionBuilderAtEnd(g->builder, bad_bb);
-    LLVMValueRef file_gv = zan_irgen_intern_string(g, loc_site_file(g, loc));
-    char mbuf[320];
-    snprintf(mbuf, sizeof(mbuf), "%s\n", msg);
-    LLVMValueRef msg_gv = zan_irgen_intern_string(g, mbuf);
-    uint32_t line_arg = g->hide_diagnostics ? 0 : loc.line;
-    uint32_t col_arg = g->hide_diagnostics ? 0 : loc.col;
-    emit_guard_report3(g, file_gv, line_arg, col_arg, msg_gv);
-    LLVMBuildBr(g->builder, cont_bb);
 
     LLVMPositionBuilderAtEnd(g->builder, cont_bb);
 }

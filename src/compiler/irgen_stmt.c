@@ -807,6 +807,7 @@ static LLVMValueRef emit_foreach_call0(zan_irgen_t *g, zan_type_t *recv_ty,
 
 static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *locals) {
     if (!stmt) return;
+    if (locals) g->current_locals = locals;
 
     LLVMBasicBlockRef cur_bb = LLVMGetInsertBlock(g->builder);
     if (cur_bb && LLVMGetBasicBlockTerminator(cur_bb)) {

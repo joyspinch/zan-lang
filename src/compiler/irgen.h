@@ -240,6 +240,7 @@ struct zan_irgen {
     int finally_count;
     int finally_loop_base;
     zan_irgen_pending_context_t pending;
+    void *current_locals;
 
     /* 算术溢出检测嵌套深度：大于 0 时在 checked 块内发射溢出检测 */
     int irgen_checked_depth;
