@@ -2184,6 +2184,23 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                                 parsed = LLVMBuildZExt(g->builder, arg, i64t, "toint.zext");
                             else
                                 parsed = LLVMBuildSExt(g->builder, arg, i64t, "toint");
+                            /* 审计 P1-12：i64 实参超 int 范围曾静默截断回绕
+                             * （ToInt32(2147483648L) = -2147483648）——C# 语义是
+                             * OverflowException。与字符串路径同判：软诊断 + 0
+                             * （--strict-runtime 下 exit 70）。ToInt64 不需要
+                             * （全宽）。窄整型 sext 后必在范围内，不用查。 */
+                            if (LLVMTypeOf(arg) == i64t && method_name.str[6] != '4') {
+                                LLVMValueRef over = LLVMBuildOr(g->builder,
+                                    zan_icmp(g->builder, LLVMIntSLT, parsed,
+                                        LLVMConstInt(i64t, (int64_t)INT32_MIN, 0), "tointi.lo"),
+                                    zan_icmp(g->builder, LLVMIntSGT, parsed,
+                                        LLVMConstInt(i64t, INT32_MAX, 0), "tointi.hi"),
+                                    "tointi.over");
+                                emit_runtime_check(g, over, expr->loc,
+                                    "Convert.ToInt*: value is outside the range of int");
+                                parsed = LLVMBuildSelect(g->builder, over,
+                                    LLVMConstInt(i64t, 0, 0), parsed, "tointi.safe");
+                            }
                         } else {
                             parsed = LLVMConstInt(i64t, 0, 0);
                         }
@@ -2612,7 +2629,7 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
 
         /* str */
         if (expr->call.callee && expr->call.callee->kind == AST_MEMBER_ACCESS &&
-            expr->call.args.count == 1) {
+            (expr->call.args.count == 1 || expr->call.args.count == 2)) {
             zan_ast_node_t *sc = expr->call.callee;
             zan_istr_t sm = sc->member.name;
             if (sm.len == 5 && memcmp(sm.str, "Split", 5) == 0 &&
@@ -2622,9 +2639,14 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                 int sep_owned;
                 LLVMValueRef sep = emit_string_like_arg(g, expr->call.args.items[0],
                                                         locals, &sep_owned);
+                LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
+                LLVMValueRef opt = LLVMConstInt(i64, 0, 0);
+                if (expr->call.args.count == 2) {
+                    LLVMValueRef raw_opt = emit_expr(g, expr->call.args.items[1], locals);
+                    opt = coerce_int_to(g, raw_opt, i64);
+                }
                 LLVMValueRef lst = emit_alloc_rc_collection(g, expr, 24, 1,
                                                             g->binder->type_string);
-                LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
                 LLVMValueRef lp = LLVMBuildBitCast(g->builder, lst,
                     LLVMPointerType(g->list_struct_type, 0), "lp");
                 LLVMBuildStore(g->builder, LLVMConstInt(i64, 0, 0),
@@ -2635,7 +2657,7 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                     LLVMBuildStructGEP2(g->builder, g->list_struct_type, lp, 2, "df"));
                 LLVMValueRef hf = get_str_split_fn(g);
                 zan_call2(g->builder, LLVMGlobalGetValueType(hf), hf,
-                    (LLVMValueRef[]){ s, sep, lst }, 3, "");
+                    (LLVMValueRef[]){ s, sep, lst, opt }, 4, "");
                 emit_release_owned_call_temp(g, sc->member.object, s, locals);
                 release_string_like_arg(g, expr->call.args.items[0], sep,
                                         sep_owned, locals);

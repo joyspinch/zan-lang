@@ -2133,6 +2133,11 @@ static zan_type_t *checker_builtin_param_type(zan_checker_t *c,
     if (strcmp(name, "string") == 0) return b->type_string;
     if (strcmp(name, "object") == 0) return b->type_object;
     if (strcmp(name, "nint") == 0) return b->type_nint;
+    zan_istr_t in = {(char *)name, (int)strlen(name)};
+    zan_symbol_t *sym = zan_binder_lookup(b, in);
+    if (sym && (sym->kind == SYM_CLASS || sym->kind == SYM_STRUCT ||
+                sym->kind == SYM_ENUM || sym->kind == SYM_INTERFACE))
+        return sym->type;
     return NULL;
 }
 

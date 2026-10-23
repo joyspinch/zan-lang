@@ -16,7 +16,7 @@ static const zan_builtin_member_t members_string[] = {
     { "Trim",        'M', "string Trim()" },
     { "ToUpper",     'M', "string ToUpper()" },
     { "ToLower",     'M', "string ToLower()" },
-    { "Split",       'M', "List<string> Split(string separator)" },
+    { "Split",       'M', "List<string> Split(string separator[, StringSplitOptions options])" },
     { "Equals",      'M', "bool Equals(string other)" },
     { "ToString",    'M', "string ToString()" },
 };

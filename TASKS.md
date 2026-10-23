@@ -392,8 +392,13 @@
   提供对齐 C# System.Array 的高频静态 API：`Array.Empty<T>()`、`Array.Copy`（支持区间与全量复制、边界检查与异常抛出）、
   `Array.Reverse<T>`、`Array.Clear<T>`、`Array.IndexOf<T>`、`Array.Sort(int[])`（快速排序）。
   宿主与自举均通过用例 `tests/conformance/array_static_methods.{zan,out}` 验证通过，加入差分门 `diff_cases.txt`。
-- 待办：其余件（StringSplitOptions、
-  object== 引用比较、foreach-Dict 形状）按需逐个；
+- **两侧与标准库补齐（2026-10-23，goal round 12）**：补齐 `System.StringSplitOptions`（stdlib/System/StringSplitOptions.zan）。
+  支持 `string.Split(separator, options)` 重载及 `StringSplitOptions.RemoveEmptyEntries` 与 `None` 选项。
+  宿主侧 `checker.c` 允许内建成员参数通过符号表解析枚举类型、`irgen_call.c` 与 `irgen_builtins.c`
+  （`__zan_str_split`）支持 `opt` 参数并在 `RemoveEmptyEntries` 时自动过滤空子串；
+  自举侧 `irgen_expr.zan` 与 `irgen.zan`（`zstr_split`）同步对齐二参重载与过滤逻辑；
+  conformance 用例 `string_split_options.{zan,out}` 双绿，并入 `diff_cases.txt`。
+- 待办：其余件（object== 引用比较、foreach-Dict 形状）按需逐个；
   Stack/Queue/HashSet 的 Count 属性化经评估**搁置**（Zan 语法规则禁止带 `()` 调用属性，
   全仓含大量 conformance 用例存在 1,725 处 `.Count()` 调用，直接改为属性会引起大面积断裂；
   须待属性兼任方法调用或统一引入 LINQ 扩展方法后再议）。

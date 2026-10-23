@@ -365,7 +365,7 @@ static LLVMValueRef get_str_split_fn(zan_irgen_t *g) {
     LLVMTypeRef i8ptr = LLVMPointerType(i8, 0);
     LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
     LLVMTypeRef fnty = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx),
-        (LLVMTypeRef[]){ i8ptr, i8ptr, i8ptr }, 3, 0);
+        (LLVMTypeRef[]){ i8ptr, i8ptr, i8ptr, i64 }, 4, 0);
     fn = LLVMAddFunction(g->mod, "__zan_str_split", fnty);
     LLVMSetLinkage(fn, LLVMInternalLinkage);
     LLVMTypeRef strlen_ty = LLVMFunctionType(i64, (LLVMTypeRef[]){ i8ptr }, 1, 0);
@@ -383,6 +383,7 @@ static LLVMValueRef get_str_split_fn(zan_irgen_t *g) {
     LLVMValueRef s = LLVMGetParam(fn, 0);
     LLVMValueRef sep = LLVMGetParam(fn, 1);
     LLVMValueRef lst = LLVMGetParam(fn, 2);
+    LLVMValueRef opt = LLVMGetParam(fn, 3);
     LLVMValueRef seplen = zan_call2(g->builder, strlen_ty, g->fn_strlen, &sep, 1, "seplen");
     LLVMValueRef pvar = LLVMBuildAlloca(g->builder, i8ptr, "pvar");
     LLVMBuildStore(g->builder, s, pvar);
@@ -400,16 +401,41 @@ static LLVMValueRef get_str_split_fn(zan_irgen_t *g) {
     LLVMValueRef seg = zan_sub(g->builder,
         LLVMBuildPtrToInt(g->builder, hit, i64, "hi"),
         LLVMBuildPtrToInt(g->builder, cur, i64, "ci"), "seg");
+    LLVMValueRef skip_push = LLVMBuildAnd(g->builder,
+        LLVMBuildTrunc(g->builder, opt, LLVMInt1TypeInContext(g->ctx), "rm_empty"),
+        zan_icmp(g->builder, LLVMIntEQ, seg, LLVMConstInt(i64, 0, 0), "seg_zero"),
+        "skip_empty");
+    LLVMBasicBlockRef do_push_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "do_push");
+    LLVMBasicBlockRef next_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "next_seg");
+    LLVMBuildCondBr(g->builder, skip_push, next_bb, do_push_bb);
+
+    LLVMPositionBuilderAtEnd(g->builder, do_push_bb);
     zan_call2(g->builder, push_ty, push_fn,
         (LLVMValueRef[]){ lst, cur, seg }, 3, "");
+    LLVMBuildBr(g->builder, next_bb);
+
+    LLVMPositionBuilderAtEnd(g->builder, next_bb);
     LLVMValueRef next = LLVMBuildGEP2(g->builder, i8, hit, &seplen, 1, "next");
     LLVMBuildStore(g->builder, next, pvar);
     LLVMBuildBr(g->builder, loop_bb);
+
     LLVMPositionBuilderAtEnd(g->builder, last_bb);
     LLVMValueRef tp = LLVMBuildLoad2(g->builder, i8ptr, pvar, "tp");
     LLVMValueRef rest = zan_call2(g->builder, strlen_ty, g->fn_strlen, &tp, 1, "rest");
+    LLVMValueRef skip_last = LLVMBuildAnd(g->builder,
+        LLVMBuildTrunc(g->builder, opt, LLVMInt1TypeInContext(g->ctx), "rm_empty_last"),
+        zan_icmp(g->builder, LLVMIntEQ, rest, LLVMConstInt(i64, 0, 0), "rest_zero"),
+        "skip_last_empty");
+    LLVMBasicBlockRef do_last_push_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "do_last_push");
+    LLVMBasicBlockRef end_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "end_split");
+    LLVMBuildCondBr(g->builder, skip_last, end_bb, do_last_push_bb);
+
+    LLVMPositionBuilderAtEnd(g->builder, do_last_push_bb);
     zan_call2(g->builder, push_ty, push_fn,
         (LLVMValueRef[]){ lst, tp, rest }, 3, "");
+    LLVMBuildBr(g->builder, end_bb);
+
+    LLVMPositionBuilderAtEnd(g->builder, end_bb);
     LLVMBuildRetVoid(g->builder);
     if (saved) LLVMPositionBuilderAtEnd(g->builder, saved);
     return fn;
