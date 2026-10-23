@@ -1564,6 +1564,16 @@
   同型，防御路径实际不可达）。
 - 复验：p07 全断言通过（"OK p07"）；p03/p04 不受影响。
 - 待办：自举半边（selfhost 的 ?? 降级路径同查）；`bool?`/`T? ?? T?` 聚合
+- **自举半边·提升运算/提升相等补齐（2026-10-23，goal round 6 续）**：QQ
+  解包放开编译后，p07 全套经 gen1 暴露出**被挡住多年的两段缺口**：
+  `x = x + 3`（int? 提升算术）曾把盒指针喂给 `add i64`（clang
+  "'%t45' defined with type 'ptr' but expected 'i64'"）；`bool? == true`
+  曾把盒指针喂给 `icmp eq i64`。补齐 GenBinary 顶部提升算术（null 传播
+  分支 + 负载运算 + BoxVal 重装箱）与 EqEq/BangEq 提升相等（null 字面量
+  快径：`b == null`→!Has、`b != null`→Has；双可空：Has∧Has→负载比较）。
+  修三处自伤（Node/string 类型、icmp 第二操作数带类型前缀、phi 前驱写成
+  merge 块自身致 LLVM ISel 0xC0000005）。复验：p07 全套 + qq1 经 gen1 出
+  IR、clang -c 全过（obj 落盘）。
 - **自举半边·T? ?? T 解包已修（2026-10-23，goal round 6）**：同族排查
   发现自举的真缺口不在 phi 分组（其 QQ 路径本就在分支内惰性求值、merge
   只建 phi）而在**定型**：checker 无 QQ 分支，InferType 退化取左支 int?，

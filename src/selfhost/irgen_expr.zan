@@ -733,6 +733,69 @@ partial class Irgen {
             r.wbits = 64;
             return r;
         }
+        // lifted operators on a nullable left arm (C# lifted semantics, the
+        // host's emit_nullable_binary): either arm null -> null; else the
+        // payloads operate and the result reboxes. `x = x + 3` on an int?
+        // used to feed the BOX POINTER into `add i64` -- clang rejected the
+        // module ("'%t45' defined with type 'ptr' but expected 'i64'").
+        if (op == TK.Plus() || op == TK.Minus() || op == TK.Star()
+            || op == TK.Slash() || op == TK.Percent()) {
+            ExprVal la = GenExpr(e.a);
+            if (IsNullableValue(la.ty)) {
+                int lnb = NL(); int lrhs = NL(); int ldone = NL();
+                string aisn = NT();
+                L("  " + aisn + " = icmp eq i8* " + la.op + ", null");
+                L("  br i1 " + aisn + ", label %L" + lnb + ", label %L" + lrhs);
+                Label(lnb);
+                L("  br label %L" + ldone);
+                string anullLbl = curLbl;
+                Label(lrhs);
+                List<string> svT4 = stmtTemps; List<Node> svTT4 = stmtTempTypes;
+                stmtTemps = new List<string>(); stmtTempTypes = new List<Node>();
+                ExprVal lb = GenExpr(e.b);
+                string bnullLbl = "";
+                if (lb.ty != null && IsNullable(lb.ty)) {
+                    // right arm null propagates too: branch to the merge null
+                    int lbnull = NL();
+                    string bisn = NT();
+                    L("  " + bisn + " = icmp eq i8* " + lb.op + ", null");
+                    L("  br i1 " + bisn + ", label %L" + lbnull + ", label %L" + ldone);
+                    Label(lbnull);
+                    L("  br label %L" + ldone);
+                    bnullLbl = curLbl;
+                }
+                string ault = UnderLL(la.ty);
+                string ap = NT();
+                L("  " + ap + " = bitcast i8* " + la.op + " to " + ault + "*");
+                string av = NT();
+                L("  " + av + " = load " + ault + ", " + ault + "* " + ap);
+                string bv = Coerce(lb, ault);
+                bool isF = ault == "double";
+                string opn2 = "add";
+                if (op == TK.Minus()) { opn2 = isF ? "fsub" : "sub"; }
+                else if (op == TK.Star()) { opn2 = isF ? "fmul" : "mul"; }
+                else if (op == TK.Slash()) { opn2 = isF ? "fdiv" : "sdiv"; }
+                else if (op == TK.Percent()) { opn2 = isF ? "frem" : "srem"; }
+                else { opn2 = isF ? "fadd" : "add"; }
+                string rv = NT();
+                L("  " + rv + " = " + opn2 + " " + ault + " " + av + ", " + bv);
+                ExprVal rvx = new ExprVal(rv, MkType(la.ty.sval));
+                string rbox = BoxVal(rvx, la.ty);
+                EmitTempReleases();
+                stmtTemps = svT4; stmtTempTypes = svTT4;
+                L("  br label %L" + ldone);
+                string bvalLbl = curLbl;
+                Label(ldone);
+                string rr = NT();
+                if (bnullLbl != "") {
+                    L("  " + rr + " = phi i8* [ null, %" + anullLbl + " ], [ null, %" + bnullLbl + " ], [ " + rbox + ", %" + bvalLbl + " ]");
+                } else {
+                    L("  " + rr + " = phi i8* [ null, %" + anullLbl + " ], [ " + rbox + ", %" + bvalLbl + " ]");
+                }
+                AddTemp(rr, la.ty);
+                return new ExprVal(rr, la.ty);
+            }
+        }
         if (op == TK.AmpAmp() || op == TK.PipePipe()) {
             List<string> svT = stmtTemps; List<Node> svTT = stmtTempTypes;
             stmtTemps = new List<string>(); stmtTempTypes = new List<Node>();
@@ -904,6 +967,82 @@ partial class Irgen {
             return ArithResult(t, aw, uns);
         }
         if (op == TK.EqEq() || op == TK.BangEq()) {
+            // lifted equality on nullable value arms (C# lifted operators):
+            // `b == null` -> !Has, `b != null` -> Has; both nullable -> both
+            // have value AND the payloads compare (the host's
+            // emit_nullable_binary). The generic path used to feed the BOX
+            // POINTER into `icmp eq i64 ..., 1` (bool? == true).
+            if ((a.ty != null && IsNullableValue(a.ty)) || (b.ty != null && IsNullableValue(b.ty))) {
+                bool aN = e.a.kind == AK.NullLit();
+                bool bN = e.b.kind == AK.NullLit();
+                if (aN || bN) {
+                    ExprVal other = aN ? b : a;
+                    Node otherTy = other.ty;
+                    string has;
+                    if (otherTy != null && IsNullableValue(otherTy)) {
+                        string hc = NT();
+                        L("  " + hc + " = icmp ne i8* " + other.op + ", null");
+                        has = hc;
+                    } else {
+                        has = aN && bN ? "0" : "1";
+                    }
+                    if (op == TK.BangEq()) {
+                        string z0 = NT();
+                        L("  " + z0 + " = zext i1 " + has + " to i64");
+                        return new ExprVal(z0, MkType("bool"));
+                    }
+                    string hn = NT();
+                    L("  " + hn + " = xor i1 " + has + ", 1");
+                    string z1 = NT();
+                    L("  " + z1 + " = zext i1 " + hn + " to i64");
+                    return new ExprVal(z1, MkType("bool"));
+                }
+                string hasA;
+                string hasB;
+                if (IsNullableValue(a.ty)) {
+                    string ha = NT();
+                    L("  " + ha + " = icmp ne i8* " + a.op + ", null");
+                    hasA = ha;
+                } else { hasA = "1"; }
+                if (IsNullableValue(b.ty)) {
+                    string hb = NT();
+                    L("  " + hb + " = icmp ne i8* " + b.op + ", null");
+                    hasB = hb;
+                } else { hasB = "1"; }
+                string bothH = NT();
+                L("  " + bothH + " = and i1 " + hasA + ", " + hasB);
+                int lcmp2 = NL(); int lmerge2 = NL();
+                string preLbl = curLbl;
+                L("  br i1 " + bothH + ", label %L" + lcmp2 + ", label %L" + lmerge2);
+                Label(lcmp2);
+                string aUlt = (a.ty != null && IsNullableValue(a.ty)) ? UnderLL(a.ty) : MapType(a.ty);
+                string bUlt = (b.ty != null && IsNullableValue(b.ty)) ? UnderLL(b.ty) : MapType(b.ty);
+                string aPl = a.op;
+                if (IsNullableValue(a.ty)) {
+                    string ap2 = NT();
+                    L("  " + ap2 + " = bitcast i8* " + a.op + " to " + aUlt + "*");
+                    string av2 = NT();
+                    L("  " + av2 + " = load " + aUlt + ", " + aUlt + "* " + ap2);
+                    aPl = av2;
+                }
+                string bPl = b.op;
+                if (IsNullableValue(b.ty)) {
+                    string bp2 = NT();
+                    L("  " + bp2 + " = bitcast i8* " + b.op + " to " + bUlt + "*");
+                    string bv2 = NT();
+                    L("  " + bv2 + " = load " + bUlt + ", " + bUlt + "* " + bp2);
+                    bPl = bv2;
+                }
+                string cmp2 = NT();
+                L("  " + cmp2 + " = icmp " + (op == TK.EqEq() ? "eq" : "ne") + " " + aUlt + " " + aPl + ", " + bPl);
+                string cv = NT();
+                L("  " + cv + " = zext i1 " + cmp2 + " to i64");
+                L("  br label %L" + lmerge2);
+                Label(lmerge2);
+                string mrg = NT();
+                L("  " + mrg + " = phi i64 [ 0, %" + preLbl + " ], [ " + cv + ", %L" + lcmp2 + " ]");
+                return new ExprVal(mrg, MkType("bool"));
+            }
             if (IsStr(a.ty) && IsStr(b.ty)) {
                 string r = NT();
                 L("  " + r + " = call i32 @__zan_strcmp0(i8* " + a.op + ", i8* " + b.op + ")");
