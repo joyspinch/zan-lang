@@ -122,6 +122,8 @@
   判 false（与 C# 不同，宿主是规格）；struct 载体、数组目标（ival≥1，自举无
   数组运行时身份件，暂回退旧行为）与 i64 擦除载体不查。探针 `(string)o`/
   `(Admin)o` 失败两侧同 stderr、`(User)o` 上转不报、`u2.name` 值不变。
+- **用例收口（2026-10-23）**：新增 conformance 用例 `tests/conformance/invalid_downcast_soft_check.{zan,out}`
+  （覆盖 User 下转 string 失败置 null、string 下转 User 失败置 null、合法下转正常保持），并入自举差分门 `tests/selfhost/diff_cases.txt`。
 - 待办：可 catch 的 InvalidCastException 通道（A507 族，deferred）——探针
   F7/F10 的 throw/catch 断言要等通道落地才能全绿。
 - 原始现象：`(string)userObj`（object 装 User）得**空字符串**；`(User)"x"`（object 装 string）得**非 null 的 User 槽**（实为 string 指针）——两边都"成功"，exit=0。C# 抛 InvalidCastException（可 catch）。
