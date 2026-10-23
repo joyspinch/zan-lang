@@ -1375,7 +1375,7 @@ int32_t zan_async_cfg_sync_fast(void) { return (int32_t)__atomic_load_n(&g_cfg_s
 
 void zan_rt_dbl_str(char *buf, unsigned long long cap, double v) {
     if (v != v) { snprintf(buf, (size_t)cap, "NaN"); return; }
-    if (v == 0.0) { snprintf(buf, (size_t)cap, "0"); return; }
+    if (v == 0.0) { snprintf(buf, (size_t)cap, signbit(v) ? "-0" : "0"); return; }
     const char *sign = (v < 0.0) ? "-" : "";
     double a = (v < 0.0) ? -v : v;
     if (a > 1.7976931348623157e308) {

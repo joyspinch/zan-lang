@@ -359,15 +359,11 @@
   （UTF-8 编码）。探针 v_chartost 复验："A" + Length 1。
 - **用例收口（2026-10-23）**：新增 conformance 用例 `tests/conformance/char_to_string.{zan,out}`
   验证 `char.ToString()` 字符串产物及 Length 为 1，并入差分门 `tests/selfhost/diff_cases.txt`。
-- 待办：其余件（bool 大小写=A441 已闭的统一口径、-0.0 符号、float 按精度
-- **自举半边已修（2026-10-23，goal round 4）**：selfhost 无参 scalar
-  ToString 的 char 接收者分支接 `CharToStr`（WriteLine(char) 与拼接路径
-  早就在用的 UTF-8 编码帮手），与宿主 09dbfbc5d 同口径。复验：gen1 编
-  `char c = 'A'; string s = c.ToString(); c.ToString().Length` 通过，IR
-  两处调用点都是 `and i64 …, 2097151` + `< 128` 的 UTF-8 编码序列（非
-  itoa）。'中' 多字节**字符字面量**自举 parser 尚不支持（词法层报
-  unexpected，另登记 A538 留观——宿主正常）。
-  打印、未捕获异常的 stdout/无 Message/无栈）按需逐件；自举半边。
+- **负零符号保持已修（2026-10-23）**：`src/runtime/rt_timer.c` 的 `zan_rt_dbl_str`
+  在 `v == 0.0` 时通过 `signbit(v)` 判定符号位，对 `-0.0` 准确输出 `"-0"`（C# .NET 8 口径），
+  双端（宿主 zanc 与自举 DblToStr）经运行时共用同一份实现自动生效。
+  新增 conformance 用例 `tests/conformance/double_print_format.{zan,out}` 并入差分门。
+- 待办：其余件（float 按单精度展开、未捕获异常输出格式）按需逐件；自举半边。
 - bool 全路径小写 true/false（五条渲染路径内部一致；C# True/False——A441 闭账口径=统一，非 .NET 口径，协议/日志大小写敏感场景有实害）。
 - `char.ToString()` 返回码点数字 "65"（C# "A"；WriteLine(char) 与拼接却正确——渲染路径互相不一致）。
 - `-0.0` 打印丢符号（C# "-0"）；float 打印按 double 展开（0.1f+0.2f→"0.30000001192092896"，C# "0.3"）。
