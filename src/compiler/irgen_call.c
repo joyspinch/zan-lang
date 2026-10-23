@@ -2249,7 +2249,9 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                         return parsed;
                     }
                     if (method_name.len == 8 && memcmp(method_name.str, "ToString", 8) == 0 &&
-                        !zan_type_defines(g, "Convert", "ToString") &&
+                        (!zan_type_defines(g, "Convert", "ToString") ||
+                         !zan_convert_tostring_exact_decl(g, expr->call.args.items[0],
+                                                          locals)) &&
                         expr->call.args.count == 1) {
                         LLVMValueRef arg = emit_expr(g, expr->call.args.items[0], locals);
                         LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);

@@ -1784,6 +1784,36 @@ partial class Irgen {
             ExprVal es = GenStr("");
             return es.op;
         }
+        // 可空值类型：宿主 emit_to_cstr_u（irgen_generics.c:2429）——null
+        // 出 ""，有值出值的渲染。盒子是 8 字节槽（double/float 装 double，
+        // 其余 i64），有值即指针非空；渲染只在 some 块里做（cond_br + phi，
+        // 与宿主同构，none 侧不分配、some 侧不白渲）。此前可空实参掉进
+        // 整数分支，box 指针被当 i64 喂 snprintf——LLVM verify 当场炸。
+        if (v.ty != null && IsNullableValue(v.ty)) {
+            string hz = NT();
+            L("  " + hz + " = icmp ne i8* " + v.op + ", null");
+            int lSome = NL(); int lNone = NL(); int lEnd = NL();
+            L("  br i1 " + hz + ", label %L" + lSome + ", label %L" + lNone);
+            Label(lSome);
+            string ult = (v.ty.sval == "double" || v.ty.sval == "float")
+                ? "double" : "i64";
+            string p2 = NT();
+            L("  " + p2 + " = bitcast i8* " + v.op + " to " + ult + "*");
+            string uv = NT();
+            L("  " + uv + " = load " + ult + ", " + ult + "* " + p2);
+            ExprVal iv = new ExprVal(uv, MkType(v.ty.sval));
+            string rendered = ToCStr(iv);
+            string someEnd = curLbl;
+            L("  br label %L" + lEnd);
+            Label(lNone);
+            ExprVal emp = GenStr("");
+            L("  br label %L" + lEnd);
+            Label(lEnd);
+            string r = NT();
+            L("  " + r + " = phi i8* [ " + rendered + ", %" + someEnd
+                + " ], [ " + emp.op + ", %L" + lNone + " ]");
+            return r;
+        }
         if (IsStr(v.ty)) { return v.op; }
         // double / float -> string (the runtime's shortest round-trip form)
         if (IsDbl(v.ty)) {
@@ -6255,7 +6285,26 @@ partial class Irgen {
                         e.kids[0].line, e.kids[0].col);
                     return new ExprVal("0", MkType("string"));
                 }
-                string s = ToCStr(a);
+                string s;
+                if (IsStr(a.ty)) { s = a.op; }
+                else if (IsNullableValue(a.ty)) { s = ToCStr(a); }
+                else if (MapType(a.ty) == "i8*") {
+                    // object 实参：宿主指针分支（irgen_call.c:2274，pointer-kind
+                    // → strlen+memcpy）把指针当 C 字符串——对象装着字符串时打印
+                    // 内容（两侧一直一致的「指针拷贝」语义）。曾掉进 itoa 分支、
+                    // 指针被当 i64 喂 snprintf（无效 IR）。收在 Convert.ToString
+                    // 位点内，不动 ToCStr 的其它 15 个调用点（拼接/插值对 object
+                    // 在宿主是 type_is_concatable 拒绝的，不走到这里）。
+                    string n2 = NT();
+                    L("  " + n2 + " = call i64 @strlen(i8* " + a.op + ")");
+                    string b2 = NT();
+                    L("  " + b2 + " = add i64 " + n2 + ", 1");
+                    string bf2 = NT();
+                    L("  " + bf2 + " = call i8* @malloc(i64 " + b2 + ")");
+                    L("  call i8* @memcpy(i8* " + bf2 + ", i8* " + a.op + ", i64 " + b2 + ")");
+                    s = WrapManaged(bf2);
+                }
+                else { s = ToCStr(a); }
                 return new ExprVal(s, MkType("string"));
             }
             if (callee.sval == "ToDouble" && e.kids.Count == 1) {

@@ -1422,8 +1422,33 @@ static zan_symbol_t *resolve_overload_typed(zan_irgen_t *g,
             ? cls->type->base_type->sym : NULL;
         cls = (base && base != cls) ? base : NULL;
     }
-    if (best && best_score >= 0) return best;
+    if (best && best_score >= 0) {
+        /* A443：Convert.ToString 的真重载进了 stdlib，但内建特判覆盖的形状
+         * 面更宽。宽容分曾把不该进的实参送进真方法：可空→标量 0 分
+         * （type_family(可空)=UNKNOWN 走"宽容放过"），box 指针当 i64 传，
+         * LLVM verify 当场炸；枚举/数值协变 2 分虽然能传，但内建对它们的
+         * 渲染才是被 reject/golden 锁住的既有行为。收敛口径：只有精确
+         * 类型匹配（分=4）才解析到真方法，其余形状静默交还调用方——
+         * 与「候选一个都没有」的旧路径同一落点（object 指针拷贝、可空
+         * emit_to_cstr_u、class/struct/array/delegate 的 A463 拒绝措辞
+         * 全部原样保留）。 */
+        if (best_score < 4 && name.len == 8 &&
+            memcmp(name.str, "ToString", 8) == 0 &&
+            type_sym->name.len == 7 &&
+            memcmp(type_sym->name.str, "Convert", 7) == 0) {
+            return NULL;
+        }
+        return best;
+    }
     if (arity_matches > 0) {
+        /* 无类型匹配的形状（int[]/object/class/struct/delegate）同理回落
+         * 内建——曾在这里报死 "no overload matches"，顶掉 A463 措辞，
+         * 四个 convert_to_string_* reject 用例齐红。 */
+        if (name.len == 8 && memcmp(name.str, "ToString", 8) == 0 &&
+            type_sym->name.len == 7 &&
+            memcmp(type_sym->name.str, "Convert", 7) == 0) {
+            return NULL;
+        }
         zan_diag_emit(g->diag, DIAG_ERROR,
                       call ? call->loc : (zan_loc_t){0},
                       "no overload of '%.*s.%.*s' matches argument type(s)",
@@ -2229,6 +2254,20 @@ static zan_type_t *infer_expr_type_raw(zan_irgen_t *g, zan_ast_node_t *e,
         case TK_LESS_EQ: case TK_GREATER: case TK_GREATER_EQ:
         case TK_AMP_AMP: case TK_PIPE_PIPE:
             return g->binder ? g->binder->type_bool : NULL;
+        case TK_QUESTION_QUESTION: {
+            zan_type_t *lt = infer_expr_type(g, e->binary.left, locals);
+            zan_type_t *rt = infer_expr_type(g, e->binary.right, locals);
+            if (lt && lt->kind == TYPE_NULLABLE && lt->element_type) {
+                if (rt && rt->kind == TYPE_NULLABLE) return rt;
+                return lt->element_type;
+            }
+            if (!lt) return rt;
+            if (!rt) return lt;
+            if (lt == rt) return lt;
+            zan_type_t *m = irgen_promote_pair(g, lt, rt);
+            if (m) return m;
+            return lt;
+        }
         default:
             return NULL;
         }
@@ -2424,6 +2463,37 @@ static bool zan_type_defines(zan_irgen_t *g, const char *type_name,
         return false;
     zan_istr_t mn = { (char *)method, (uint32_t)strlen(method) };
     return get_method_sym(sym, mn) != NULL;
+}
+
+/* A443：Convert.ToString 的真重载进 stdlib 后，内建特判只该在「实参与
+ * 某个 ToString 重载的形参**精确同型**」时让路——精确匹配的实参由静态
+ * 解析（irgen_call.c 的 resolve_overload_typed 路径）发真方法；其余形状
+ * （可空/object/枚举/数组/协变数值）继续走内建：内建的形状覆盖面
+ * （可空 emit_to_cstr_u、object 指针拷贝、class/struct/array/delegate 的
+ * A463 拒绝措辞）是 reject/golden 锁住的既有行为，真方法的参数表表达
+ * 不了，宽容打分更会把可空的 box 指针当 i64 送进真方法（LLVM verify 炸）。 */
+static bool zan_convert_tostring_exact_decl(zan_irgen_t *g,
+                                            zan_ast_node_t *arg,
+                                            local_scope_t *locals) {
+    if (!g || !g->binder || !arg) return false;
+    zan_istr_t tn = { "Convert", 7 };
+    zan_symbol_t *sym = zan_binder_lookup(g->binder, tn);
+    if (!sym || !sym->type ||
+        (sym->type->kind != TYPE_CLASS && sym->type->kind != TYPE_STRUCT))
+        return false;
+    zan_type_t *at = infer_expr_type(g, arg, locals);
+    if (!at || type_mentions_tp(at)) return false;
+    for (int i = 0; i < sym->member_count; i++) {
+        zan_symbol_t *m = sym->members[i];
+        if (m->kind != SYM_METHOD || !m->decl ||
+            m->decl->kind != AST_METHOD_DECL) continue;
+        if (m->name.len != 8 || memcmp(m->name.str, "ToString", 8) != 0)
+            continue;
+        if (m->decl->method_decl.params.count != 1) continue;
+        zan_type_t *pt = method_param_type(g, m, 0);
+        if (pt && types_concrete_equal(pt, at)) return true;
+    }
+    return false;
 }
 
 
