@@ -1691,3 +1691,38 @@
   软诊断两行 stderr；conformance `case_convert_overflow` 过。
 - ToUpper/ToLower 非 ASCII 原样返回：A525 已声明 ASCII 口径（已知偏差），
   Unicode 简单大小写映射留待独立件（大表，C# 复刻线）。
+
+### [ ] A540 编译器 pull-in live-name 闭包：包内控制器不进编译图 → 路由静默 404
+- 现象：server-collab 模板按 README 配方（`zanc src/main.zan src/**/*.zan
+  --auto-stdlib`）编译，程序能编译、能启动、静态资产正常，但**管理后台的
+  系统管理屏全部 404**：`/admin/system/users|roles|departments|dicts|logs|
+  settings|docs` 既不在路由表里，`/api/docs.json` 也没有这些端点；侧栏里
+  没有入口，看起来像「屏没做」。
+- 根因：属性路由与代码生成器只扫描**显式列出的**源文件。纯 `using` 拉入
+  路径下，包文件要进编译单元元数据得同时满足两个条件——命名空间目录被
+  访问（`pi_reach` 只由 `using` 触发）、类型名被按名引用（`pi_flag_istr`）。
+  MVC 包的控制器恰是靠属性发现、从不被按名引用：`ZanWeb.Admin.System` 命名
+  空间没有任何文件 using，目录没被访问，控制器连候选都不是。
+  `packages/Zan.Mvc/README.md`「在应用中使用本包（组合根）」已写明同一件事
+  与当前配方（包源与应用源一起显式列出）。
+- 连带缺口：ORM 表访问器（`this.SysDepartment` 这类）按 DAO 类型是否存在
+  合成，而 `SysDepartmentDao` / `SysDictTypeDao` 等 DAO 在全仓无人按名引用
+  → DAO 不进图 → 访问器缺失 → 控制器报「has no member 'SysDepartment'」。
+  同理 `JobsController` 的基类 `CrudScreenController`（在 `ZanWeb.Admin`
+  命名空间）不在图里，报「undefined base type」。
+- 方向：编译器侧补 live-name 闭包——命名空间目录被访问时把该命名空间下的
+  包文件整体纳入编译图。`pi_file_t.gate_live` 已在 `src/compiler/main.c`
+  里被赋值却从未被读，疑似就是这个未完成的机制；同时让表访问器按模型类型
+  触发对应 DAO 的拉入。修好后纯 `using` 即可，模板与 IDE 都不必列包源。
+- 现状绕法（本次已落地）：模板 README 的构建配方改为显式列出 MVC 包源
+  （`packages/Zan.Mvc/src/ZanWeb/**/*.zan`）。实测系统管理屏全部上线：路由
+  表出现 /admin/system/* 全族，账号可建可登录、角色可授。
+
+### [ ] A541 IDE smart inputs 每个命名空间只取一个文件 → IDE 构建的 MVC 应用路由不全
+- 现象（按 `src/ide_zan/src/shell/ZanIDE.Workspace.zan` 的代码读）：IDE 的
+  SmartInputs 对每个 `using` 命名空间只找一个声明该命名空间的文件
+  （`FindNamespaceFile` 返回首个命中即停），包里同一命名空间有多个控制器
+  时只进了一个 → IDE 构建的 MVC 应用只有部分管理台路由，而命令行显式列
+  包源构建则齐全（同一份源码，两种构建产物行为不同）。
+- 方向：IDE 侧对包命名空间取全部候选（而非首个命中），或直接采纳编译器
+  的包源发现结果作为构建输入。

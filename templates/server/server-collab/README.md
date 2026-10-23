@@ -330,12 +330,28 @@ Build & run from the IDE (output streams into the terminal panel), or from a
 shell — **build into `build/`, run from the project root**:
 
 ```
-zanc src/main.zan src/**/*.zan --auto-stdlib -o build/app.exe
+zanc src/main.zan src/**/*.zan \
+     packages/Zan.Mvc/src/ZanWeb/**/*.zan \
+     --auto-stdlib -o build/app.exe
 build/app.exe          # cwd = project root, so ./config/app.json and ./wwwroot resolve
 ```
 
-全量编译约 295 个文件（129 业务源 + stdlib 缓存）；编译器从控制器属性与
-`In*`/`Need*` 调用派生路由表与 API 文档数据，无生成文件需要维护。
+**包源要与业务源一起显式列出**：属性路由与代码生成器只扫描显式列出的源
+文件。纯 `using` 拉入路径下，包里那些「靠属性发现、从不被按名引用」的
+控制器不会进编译单元元数据——程序照样编译、启动、静态资产正常，但**控制器
+路由静默缺失（404）**，`/api/docs.json` 里也看不到那些端点，侧栏没有入口，
+看起来像「屏没做」。`Zan.Mvc` 包的 README「在应用中使用本包（组合根）」写
+的是同一件事与同一份配方。
+
+上例的 `packages/Zan.Mvc/...` 指包库根：本仓库内是仓库根的 `packages/`；
+独立项目里是随包安装到项目 `packages/`（或 `.zan-packages/`）的那份。
+
+> IDE 构建目前每个 `using` 命名空间只纳入一个文件，MVC 应用的管理台路由会
+> 不全（见 TASKS.md A541）；命令行按上面的配方构建才是准的。
+
+全量编译约 620 个文件（163 业务源 + MVC 包 168 源 + stdlib 缓存）；编译器
+从控制器属性与 `In*`/`Need*` 调用派生路由表与 API 文档数据，无生成文件需要
+维护。
 
 **种子账号**（首次启动 `Schema.SeedAdmin` 写入，仅当 sys_user 空表时）：
 
@@ -408,7 +424,9 @@ every sign-in "wrong password").
 - `GET /` — HTML 落地页
 - `GET|POST /admin/login`, `GET /admin/logout` — 后台登录（种子 `admin` / `admin1234`）
 - `POST /api/auth/login`, `GET /api/auth/me` — 令牌登录 / 当前身份
-- `GET /admin` — 工作台（聚合待办 + 公告卡片 + 运行指标）
+- `GET /admin/dashboard` — 仪表盘（账号 / 文章 / 评论 / 运行指标）；管理区
+  **不提供** `/admin` 区根路由——落地页按账号可达菜单动态解析
+  （`MenuBuilder.LandingFor`），内嵌网页直接用 `/admin/dashboard`
 - `GET /admin/system/users|roles|departments|dicts|logs|settings` — 系统管理
 - `GET /admin/system/docs` — 接口文档页（分组/检索/参数/应答）
 - `GET /admin/system/backup`, `POST /admin/system/backup/create`,
