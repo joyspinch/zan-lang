@@ -811,3 +811,15 @@ description: zanc 编译器内部（parser/checker/irgen/runtime/ABI）设计契
       charcase 表）首版误传 context，一编译就崩。
     - 边界：发射路径的段崩用 fprintf 进度标记二分（表构造前/后、函数创建
       前后各一个），两轮内必中崩点；比事件日志解析或盲二分快。
+54. **EH 临时栈的协议三件事（写泄漏修复前必读）**：
+    - 槽是**地址**不是值：mit_eh_tmp_push_slot 推的是带 kind 标签的
+      槽地址，展开器 load-and-null 后按 kind 释放**当前**引用——字段重
+      赋值、循环内重复 push 同一槽都天然安全（第二次读到 null 是 no-op）。
+      坑出处：A528 结构体 ctor 字段泄漏的修复就是靠把字段槽推上栈收口。
+    - disarm 只改栈顶指针，**必须**在局部变量 EH 出栈之后：先 disarm 把
+      尚未出栈的局部槽位闷在栈里，随后的 pop 按计数递减，下溢冲掉调用方
+      帧。显式 return 路径的顺序（catch 异常→局部→disarm）是既定口径。
+    - **裸武装**（无 handler 的纯深度快照）+ 既有 disarm/unwind 就能兜住
+      新的泄漏类别，不必加运行时函数或新槽类型：入口存 old_top，正常返回
+      走 disarm 免释放回退，抛出走 unwind 按槽 kind 释放。A528（结构体
+      ctor 字段）零运行时改动闭环即此模式。
