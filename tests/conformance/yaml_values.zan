@@ -207,6 +207,54 @@ class Prog {
         JsonValue xw = Yaml.Parse(Yaml.ToYaml(xb));
         ChkS("crlf-doc roundtrip", xw.ToJson(), xb.ToJson());
 
+        // --- 14. 写出侧锚点/别名（A533）：共享节点发 &aN/*aN ---
+        JsonValue am = Yaml.Parse("base: &b\n  x: 1\nuse: *b\nsame: *b\n");
+        ChkS("write alias map", Yaml.ToYaml(am),
+            "base: &a0\n  x: 1\nuse: *a0\nsame: *a0\n");
+        ChkS("write alias map roundtrip",
+            Yaml.ToYaml(Yaml.Parse(Yaml.ToYaml(am))),
+            "base: &a0\n  x: 1\nuse: *a0\nsame: *a0\n");
+        JsonValue asq = Yaml.Parse("a: &p\n  - 1\n  - 2\nb: *p\nc:\n  - *p\n");
+        ChkS("write alias seq", Yaml.ToYaml(asq),
+            "a: &a0\n  - 1\n  - 2\nb: *a0\nc:\n  - *a0\n");
+        ChkS("write alias seq roundtrip",
+            Yaml.ToYaml(Yaml.Parse(Yaml.ToYaml(asq))),
+            "a: &a0\n  - 1\n  - 2\nb: *a0\nc:\n  - *a0\n");
+
+        // --- 15. 别名炸弹有界：12 层三叉 DAG 解析后 3^12 条路径，写出不得展开 ---
+        StringBuilder bb = new StringBuilder();
+        bb.Append("a0: &a0\n  v: 1\n");
+        int layer = 1;
+        while (layer <= 12) {
+            string ln = Convert.ToString(layer);
+            string pv = Convert.ToString(layer - 1);
+            bb.Append("a" + ln + ": &a" + ln + "\n");
+            bb.Append("  x: *a" + pv + "\n");
+            bb.Append("  y: *a" + pv + "\n");
+            bb.Append("  z: *a" + pv + "\n");
+            layer = layer + 1;
+        }
+        JsonValue bombRoot = Yaml.Parse(bb.ToString());
+        string bombOut = Yaml.ToYaml(bombRoot);
+        ChkB("write bomb bounded", bombOut.Length > 0 && bombOut.Length < 4096);
+        ChkS("write bomb idempotent", Yaml.ToYaml(Yaml.Parse(bombOut)), bombOut);
+
+        // --- 16. 共享空容器复制（无放大）；环状结构显式报错不栈溢出 ---
+        JsonValue em = Yaml.Parse("a: &x {}\nb: *x\n");
+        ChkS("write shared empty", Yaml.ToYaml(em), "a: {}\nb: {}\n");
+        JsonValue cyc = JsonValue.NewObject();
+        cyc.Put("self", cyc);
+        bool cycThrew = false;
+        try {
+            Yaml.ToYaml(cyc);
+        } catch (YamlException) {
+            cycThrew = true;
+        }
+        ChkB("write cycle throws", cycThrew);
+        // ARC 无环回收：自环节点留着会作为泄漏被 --check-leaks 报出，
+        // 断言完立刻解开。
+        cyc.Set("self", JsonValue.NewNull());
+
         Console.WriteLine("yaml-ok: " + Convert.ToString(bad == 0 ? 1 : 0));
     }
 }
