@@ -1646,7 +1646,7 @@
   无任何 RFC3161/TimeStampReq 实现——原发现指向的代码已不在仓库
   （随模板出仓或在 691 提交中重构掉）；无原始审计上下文不再追。
 
-### [~] A536 `T? ?? T` 在 merge 块先发负载提取再建 phi——LLVM 校验失败（存量缺陷，批次回归照出）
+### [x] A536 `T? ?? T` 在 merge 块先发负载提取再建 phi——LLVM 校验失败（存量缺陷，批次回归照出）
 - 现象：`types/p07_nullable.zan`（`int y = x ?? 5;`）报 "LLVM verification
   failed in main: PHI nodes not grouped at top of basic block!"——批次回归
   （A510 的六域全扫）照出；用 A482 前后的 irgen_expr.c 双向对拍确认是
@@ -1687,14 +1687,16 @@
   惰性分支 + 负载 phi。
   路径同样只建 phi 未动，留观。
 
-### [ ] A538 自举 parser 不支持多字节字符字面量 `'中'`（词法层 unexpected）
+### [x] A538 自举 parser 不支持多字节字符字面量 `'中'`（词法层 unexpected）
 - 现象：gen1 编 `char z = '中';` 报两行 "syntax error: unexpected ''"——
   源文件是 UTF-8，自举 lexer 按字节扫描把多字节序列当非法字符。宿主
   zanc 同文件正常（A523 探针含 '中' 编码路径）。
 - 影响：含中文/emoji 字符字面量的程序自举编不过（字符串字面量不受影响，
   已按 UTF-8 透传）。
-- 方向：selfhost lexer 的 CharLit 分支按 UTF-8 解码多点序列取首码点；
-  CharToStr 的编码帮手已就绪，只差词法。
+- 修复（2026-10-23，commit e85426638）：C 宿主 lexer.c 与自举 lexer.zan 同步
+  支持 1~4 字节 UTF-8 序列解码为 Unicode 标量码点；顺带修复自举 irgen_expr.zan
+  二元加减重复求值致 fixedpoint 超时假死；conformance `case_lexer_char_multibyte`
+  与 `selfhost_fixed_point` 全过。
 
 ### [x] A539 Convert.ToInt32/ToInt 整数实参溢出静默回绕（审计 P1-12）
 - 现象：字符串路径 A512 已有越界软诊断，整数路径漏了——`Convert.ToInt32(2147483648L)`
