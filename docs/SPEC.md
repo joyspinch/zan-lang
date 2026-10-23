@@ -462,7 +462,7 @@ for (int i = 0; i < 10; i++) {
     ...
 }
 
-// Foreach
+// Foreach（List<T> 产出 T；数组产出元素；Dictionary<K,V> 产出键 K）
 foreach (var item in collection) {
     ...
 }

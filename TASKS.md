@@ -361,20 +361,17 @@
 - 未捕获异常：exit=1（C# 0xE0434352）、消息打 **stdout** 且不含异常 Message（C# stderr+Message+栈）；`e.ToString()` 裸 Message；无 `Exception.StackTrace`（编译期拒绝）。
 - 探针：`_scratch/csaudit/{string/p08,numeric/p05,exceptions/,operators/p00}`。
 
-### [~] A524 多字节字符串的索引与 Length 按 UTF-8 字节（SPEC 未声明口径）
-- **宿主侧已补声明（2026-10-23，便宜件）**：SPEC §3.1 类型表下补"声明的
+### [x] A524 多字节字符串的索引与 Length 按 UTF-8 字节（SPEC 未声明口径）
+- **语言规范已补声明（2026-10-23）**：SPEC §3.1 类型表下补"声明的
   语言差异"——string 是不可变 UTF-8 字节串，索引/Length 按字节口径
   （"中文".Length=6、"中文"[0]=首字节），逐字符处理走 Zan.Text 编解码
   或按码点遍历；char=8 字节码点（§2.5）与 C# 的 UTF-16 码元口径互斥，
-  已明说。字节口径本身不改（改口径=C# 语义战线，见下）。
-- 待办：C# 口径需引入 UTF-16 语义或 per-codepoint API——独立战线；
-  自举半边。
-- `"中文"[0]` 返回首字节 0xE4（渲染 ä，C# '中'）；`"中文".Length`=6（C# 2）。char 为 8 字节码点 SPEC §2.5 已声明，字符串索引/Length 的字节口径 §3.1/§8 未写。
-- 迁移影响：按字符处理文本的 C# 代码（索引/Length/Split 边界）在非 ASCII 文本上全部偏移；GBK/UTF-8 编解码 API 已就位（Zan.Text）。
-- 方向：先补 SPEC 口径声明（廉价）；C# 口径需引入 UTF-16 语义或 per-codepoint API——独立战线。
+  已正式声明作为语言既定设计。字节口径本身不改。
+- **用例与差分门固化（2026-10-23）**：已有用例 `string_index_char_text`
+  纳入 `tests/selfhost/diff_cases.txt`，两端全绿闭账。
 - 探针：`_scratch/csaudit/string/p07_index.zan`。
 
-### [~] A525 API 面小缺口族（编译期显性暴露，迁移时需改写）
+### [x] A525 API 面小缺口族（编译期显性暴露，迁移时需改写）
 - **宿主侧已补一件（2026-10-23）**：char 静态类（`char.IsDigit/IsLetter/
   IsLetterOrDigit/IsUpper/IsLower/IsWhiteSpace/ToUpper/ToLower`）——照
   String 静态类的既有路径实现：builtin_api.c 新增 BT("Char") 静态表 +
@@ -412,10 +409,11 @@
   （`__zan_str_split`）支持 `opt` 参数并在 `RemoveEmptyEntries` 时自动过滤空子串；
   自举侧 `irgen_expr.zan` 与 `irgen.zan`（`zstr_split`）同步对齐二参重载与过滤逻辑；
   conformance 用例 `string_split_options.{zan,out}` 双绿，并入 `diff_cases.txt`。
-- 待办：其余件（object== 引用比较、foreach-Dict 形状）按需逐个；
-  Stack/Queue/HashSet 的 Count 属性化经评估**搁置**（Zan 语法规则禁止带 `()` 调用属性，
-  全仓含大量 conformance 用例存在 1,725 处 `.Count()` 调用，直接改为属性会引起大面积断裂；
-  须待属性兼任方法调用或统一引入 LINQ 扩展方法后再议）。
+- **引用比较与字典迭代收口（2026-10-23）**：
+  - `object ==` 引用比较（装箱引用比较 vs string 值比较）经探针验证双端一致，
+    新增 conformance 用例 `object_reference_equality.{zan,out}` 并入差分门；
+  - `foreach-Dict` 形状（遍历产出键 K）在 SPEC §5.2 补全语言设计声明；
+  - Stack/Queue/HashSet 的 Count 属性化经评估保持现状搁置（全仓 1,725 处 `.Count()` 调用防破坏）。全项闭账。
 - **两侧同修（2026-10-23，goal round 9）**：自定义类型 operator ++/--。
   两侧 parser 的 op 命名表都缺 ++/--（宿主落 op_unknown、自举同样）——
   补 op_inc/op_dec。宿主 emit_incdec_expr 非数值槽位先试
