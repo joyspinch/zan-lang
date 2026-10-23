@@ -5,6 +5,8 @@ using System.Json;
 // 1. 负整数在文档非开头处被解析错（{"x":-7} 读成 0、[1,-2] 读成 -1）；
 // 2. 数组的 RemoveAt 删错了列表（vals 是对象的值列表，数组元素在
 //    items 里），结果是静默空操作——删完元素还在。
+// 以及 RenameKey 的契约：改名牌会失效 keyIndex（>8 键先建索引再改名，
+// 裸写 keys[i] 会让按名 Get 命中旧下标）、越界抛错、撞名首键胜。
 class Program {
     static int failures = 0;
 
@@ -54,6 +56,41 @@ class Program {
         objm.RemoveAt(0);
         Check(objm.Count() == 1 && objm.KeyAt(0) == "b", "object remove shifts keys and values");
         Check(objm.Remove("b") && objm.Count() == 0, "object remove by key");
+
+        // RenameKey：原位改名并失效 keyIndex。特意用 >8 键的对象先 Get
+        // 一次（触发懒建索引）再改名——裸写 keys[i] 的老写法在索引在册
+        // 后按名 Get 会命中旧下标（Designer 属性改名面板踩过）。
+        JsonValue big = JsonValue.NewObject();
+        for (int i = 1; i <= 10; i = i + 1) {
+            big.Put("k" + Convert.ToString(i), JsonValue.NewInt(i));
+        }
+        JsonValue k3 = big.Get("k3");
+        Check(k3 != null && k3.AsInt(0) == 3, "big object get builds the index");
+        big.RenameKey(2, "renamed");
+        JsonValue rn = big.Get("renamed");
+        Check(rn != null && rn.AsInt(0) == 3, "rename is visible to Get");
+        Check(big.Get("k3") == null, "old name is gone after rename");
+        Check(big.KeyAt(2) == "renamed", "rename keeps position");
+        Check(big.KeyAt(0) == "k1" && big.KeyAt(9) == "k10", "rename keeps key order");
+        JsonValue k10 = big.Get("k10");
+        Check(k10 != null && k10.AsInt(0) == 10, "other keys still resolve after rename");
+
+        JsonValue small = JsonValue.Parse("{\"a\":1,\"b\":2}");
+        small.RenameKey(0, "z");
+        JsonValue z = small.Get("z");
+        Check(z != null && z.AsInt(0) == 1 && small.Get("a") == null
+            && small.KeyAt(0) == "z", "small object rename");
+
+        bool threw = false;
+        try { small.RenameKey(9, "nope"); }
+        catch (JsonException e) { threw = true; }
+        Check(threw, "rename out of range throws");
+
+        JsonValue dup = JsonValue.Parse("{\"a\":1,\"b\":2}");
+        dup.RenameKey(1, "a");
+        JsonValue dupA = dup.Get("a");
+        Check(dupA != null && dupA.AsInt(0) == 1, "rename onto existing key: first wins");
+        Check(dup.KeyAt(0) == "a" && dup.KeyAt(1) == "a", "rename onto existing key keeps both");
 
         Console.WriteLine("failures=" + failures);
     }
