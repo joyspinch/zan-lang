@@ -388,8 +388,12 @@
   回归数值/bool/char 拼接无误）；自举 `gen1` 产物 IR 合法、`clang -c`
   通过；conformance 闸门新增 `string_concat_null`（case_string_concat_null
   与 determinism 双绿）。
+- **标准库补齐（2026-10-23，goal round 11）**：补齐 `System.Array` 静态类（stdlib/System/Array.zan）。
+  提供对齐 C# System.Array 的高频静态 API：`Array.Empty<T>()`、`Array.Copy`（支持区间与全量复制、边界检查与异常抛出）、
+  `Array.Reverse<T>`、`Array.Clear<T>`、`Array.IndexOf<T>`、`Array.Sort(int[])`（快速排序）。
+  宿主与自举均通过用例 `tests/conformance/array_static_methods.{zan,out}` 验证通过，加入差分门 `diff_cases.txt`。
 - 待办：其余件（StringSplitOptions、
-  Array 静态类、object== 引用比较、foreach-Dict 形状）按需逐个；
+  object== 引用比较、foreach-Dict 形状）按需逐个；
   Stack/Queue/HashSet 的 Count 属性化经评估**搁置**（Zan 语法规则禁止带 `()` 调用属性，
   全仓含大量 conformance 用例存在 1,725 处 `.Count()` 调用，直接改为属性会引起大面积断裂；
   须待属性兼任方法调用或统一引入 LINQ 扩展方法后再议）。
