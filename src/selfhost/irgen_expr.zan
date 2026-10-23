@@ -2229,8 +2229,25 @@ partial class Irgen {
             ExprVal obj = GenExpr(lhs.a);
             ExprVal idx = GenExpr(lhs.b);
             if (IsListType(obj.ty)) {
-                string sv = StructElemSlot(v, ListElem(obj.ty));
-                L("  call void @zlist_set(i8* " + obj.op + ", i64 " + idx.op + ", i64 " + sv + ")");
+                // A507② 自举半边（List）：zlist_set 曾无界——OOB 直接写穿
+                // 数据区。调用点守卫（这里才知道行:列）：软诊断 + 跳过调用
+                // （ARC 平衡保持：不进入 zlist_set 就不 retain/release）。
+                string lc2 = NT();
+                L("  " + lc2 + " = call i64 @zlist_count(i8* " + obj.op + ")");
+                string lneg2 = NT();
+                L("  " + lneg2 + " = icmp slt i64 " + idx.op + ", 0");
+                string lge2 = NT();
+                L("  " + lge2 + " = icmp sge i64 " + idx.op + ", " + lc2);
+                string loob2 = NT();
+                L("  " + loob2 + " = or i1 " + lneg2 + ", " + lge2);
+                EmitRuntimeCheckIf(lhs, loob2, "index out of bounds: List store");
+                string sv0 = StructElemSlot(v, ListElem(obj.ty));
+                int ldo2 = NL(); int lskip2 = NL();
+                L("  br i1 " + loob2 + ", label %L" + lskip2 + ", label %L" + ldo2);
+                Label(ldo2);
+                L("  call void @zlist_set(i8* " + obj.op + ", i64 " + idx.op + ", i64 " + sv0 + ")");
+                L("  br label %L" + lskip2);
+                Label(lskip2);
                 return;
             }
             if (IsDictType(obj.ty)) {
@@ -2268,11 +2285,30 @@ partial class Irgen {
                 return;
             }
             if (IsStr(obj.ty)) {
+                // A507② 自举半边（string）：字符写曾无界——OOB 改写字符串
+                // 后面的内存。软诊断 + 软基址 select（OOB 时落 scratch 字节）。
+                string sln = NT();
+                L("  " + sln + " = call i64 @zstr_len(i8* " + obj.op + ")");
+                string sneg = NT();
+                L("  " + sneg + " = icmp slt i64 " + idx.op + ", 0");
+                string sge = NT();
+                L("  " + sge + " = icmp sge i64 " + idx.op + ", " + sln);
+                string soob = NT();
+                L("  " + soob + " = or i1 " + sneg + ", " + sge);
+                EmitRuntimeCheckIf(lhs, soob, "index out of bounds: string store");
                 string sp = NT();
                 L("  " + sp + " = getelementptr i8, i8* " + obj.op + ", i64 " + idx.op);
+                if (!ExternSeen("__zan_soft_scratch")) {
+                    externDecls.Add("__zan_soft_scratch");
+                    H("@__zan_soft_scratch = internal global [64 x i8] zeroinitializer");
+                }
+                string scrs = NT();
+                L("  " + scrs + " = getelementptr inbounds [64 x i8], [64 x i8]* @__zan_soft_scratch, i64 0, i64 0");
+                string spsel = NT();
+                L("  " + spsel + " = select i1 " + soob + ", i8* " + scrs + ", i8* " + sp);
                 string sb = NT();
                 L("  " + sb + " = trunc i64 " + v.op + " to i8");
-                L("  store i8 " + sb + ", i8* " + sp);
+                L("  store i8 " + sb + ", i8* " + spsel);
                 return;
             }
             // A user class indexer: `obj[idx] = v` -> Owner_op_index_set(...).

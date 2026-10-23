@@ -37,6 +37,18 @@
     未覆盖：多维数组 store（emit_mdarray_elem_ptr 内部仍钳位）、字段/成员
     链形状的部分位点，见待办。
 - 待办：① 全线可 catch 异常通道（对齐 C#，最终口径）；② 多维数组与剩余
+- **自举半边·List/string 越界写补齐（2026-10-23，goal round 9）**：
+  List 的 zlist_set 曾无界（OOB 直接写数据区 + 对垃圾值做 retain/release）
+  ——调用点守卫（行:列在此才可知）：软诊断 `index out of bounds: List
+  store` + cond_br 跳过调用（ARC 平衡：不进入即不 retain/release）。
+  string 字符写曾无界（改写字符串后内存）——软诊断 + 软基址 select
+  （OOB 落 scratch 字节），与数组 store 同款。**Span store 无法守卫**：
+  selfhost 的 Span 只携带基址（`{base,len}` 聚合在自举后端没有表示，
+  MapType 注释明言 spans never bounds-checked）——宿主守卫、自举受表示
+  约束守不了，登记为已知表示性差异（要守得先改 Span 载体，另项）。
+- 复验：`l[9]=99`、`s[7]=c` 经 gen1 出 IR——List 跳过分支与 string
+  select 齐全、诊断常量在位（once-per-text 由 zan_rt_soft_note 承担）、
+  clang -c 过；正常写 `l[1]=5`、`s[1]=X` 不受影响。
 - **自举半边·越界写跳写已修（2026-10-23，goal round 8）**：selfhost 的数
   组元素 store 曾**完全无界**（比宿主钳位更糟——直接写穿真实内存）。在
   StoreTo 的数组分支（含字节/struct/可空盒/浮点槽四形状）补：长度槽
