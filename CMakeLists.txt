@@ -4406,6 +4406,20 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_datatable_filter_penetration${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
+  # Row context menu (RichMenu overlay) must not let the closing click
+  # fall through to the grid: pressing outside the open menu closes it
+  # only (the release is suppressed by pressOnBlocker), clicking a menu
+  # item dispatches the action without re-selecting the row beneath,
+  # and plain row/checkbox clicks work again once the menu is closed.
+  add_test(NAME conformance_gui_datatable_ctxmenu_penetration
+    COMMAND ${CMAKE_COMMAND}
+      -DZANC=$<TARGET_FILE:zanc>
+      -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/datatable_ctxmenu_penetration_test.zan
+      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/packages/Zan.Gui.DataTable/src/Gui/Component/DataTable/DataTable.zan;--auto-stdlib${_gui_driver_tail}"
+      -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_datatable_ctxmenu_penetration.out
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_datatable_ctxmenu_penetration${_exe_ext}
+      -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+
   # Hit-region semantic labels (a11y projection): DataTable registers
   # select-all/select-row boxes and header titles with readable names via
   # RegisterRectL; a real frame must expose them to dump hitregions.

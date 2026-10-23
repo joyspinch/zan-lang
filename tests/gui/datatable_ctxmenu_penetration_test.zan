@@ -1,0 +1,188 @@
+using System;
+using Gui;
+using Gui.Widget;
+using Gui.Component.DataTable;
+
+// datatable: 行右键菜单不得把点击穿透到表格（真实 App + 注入事件）。
+// 用户报告「datatable 的菜单穿透到表格」：右键打开行菜单后，点菜单
+// 外的另一行，关菜单的那一下把那一行也选中/改选了。
+// 防线（41ca5a93d）：菜单开着时 RichMenu 铺全窗拦截区，按在拦截区上
+// pressOnBlocker 成立，同一次手势的释放被 App 侧抑制（发布保持 -1），
+// 表格看不到点击——菜单外点击只关菜单。本用例把这条语义锁进回归：
+//   右键开菜单，点菜单外的行：只关菜单，不动选择；
+//   再开菜单，点菜单项（复制）：动作照常派发，其下行不被顺带改选；
+//   菜单关掉后普通行点击照常选中（防线不粘滞）。
+// 几何纪律（踩过的坑）：菜单锚在右键点 (ctxX,ctxY)、宽 Scale(190)、
+// 高 RichHeight(items)，超界向左/上钳——「菜单外」取点横向越过
+// mx + Scale(190) 再核对纵向范围，否则点到的是菜单自己的行。
+// harness 纪律（踩过的坑）：Body 里不要再调 app.BeginFrame()——
+// SafeFrame 已经调过；双重置会把 inputBlockPrevious 链打断。
+class Program {
+    static App app;
+    static List<DataColumn> cols;
+    static DataSource src;
+    static DataTableState st;
+
+    static void Body() {
+        WidgetId.ResetFrame();
+        if (st != null && cols != null && src != null) {
+            DataTable.RenderSource(app, 20, 20, 560, 420, cols, src, st);
+        }
+        app.RunOverlays();
+    }
+
+    static void PumpFrame() {
+        app.RequestRedraw();
+        app.PumpGuarded();
+        app.FrameGuarded(Body);
+    }
+
+    static void MoveTo(int x, int y) {
+        app.window.InjectEvent(1, x, y, 0, 0, 0);
+        PumpFrame();
+    }
+
+    static void Press(int x, int y, int button, int mods) {
+        app.window.InjectEvent(2, x, y, button, 0, mods);
+        PumpFrame();
+    }
+
+    static void Release(int x, int y, int button, int mods) {
+        app.window.InjectEvent(3, x, y, button, 0, mods);
+        PumpFrame();
+    }
+
+    static void Click(int x, int y) {
+        MoveTo(x, y);
+        Press(x, y, 0, 0);
+        Release(x, y, 0, 0);
+    }
+
+    static void RightClick(int x, int y) {
+        MoveTo(x, y);
+        Press(x, y, 1, 0);
+        Release(x, y, 1, 0);
+    }
+
+    static int RowY(int row) {
+        return 20 + app.theme.heightMedium + row * app.theme.heightMedium
+            + app.theme.heightMedium / 2;
+    }
+
+    // 选择签名：勾选行数 + 活动单元格 + 矩形选区
+    static string Sig() {
+        int n = 0;
+        for (int i = 0; i < st.selected.Count; i = i + 1) {
+            if (st.selected[i]) { n = n + 1; }
+        }
+        return Convert.ToString(n) + "|" + Convert.ToString(st.hitOrder)
+            + "|" + Convert.ToString(st.hitCol) + "|"
+            + Convert.ToString(st.rangeR0) + "," + Convert.ToString(st.rangeR1)
+            + "," + Convert.ToString(st.rangeC0) + "," + Convert.ToString(st.rangeC1);
+    }
+
+    static bool RowSelected(int row) {
+        return row < st.selected.Count && st.selected[row];
+    }
+
+    static List<DataRow> Rows() {
+        List<DataRow> rows = new List<DataRow>();
+        string[] names = new string[] { "a", "b", "c", "d", "e", "f" };
+        for (int i = 0; i < 6; i = i + 1) {
+            DataRow r = new DataRow();
+            r.Push(names[i]);
+            r.Push(Convert.ToString(i * 10));
+            rows.Add(r);
+        }
+        return rows;
+    }
+
+    static void Reset() {
+        src = new RowListSource(Rows());
+        st = new DataTableState();
+        st.showSelect = true;
+        st.showRowNum = true;
+        cols = new List<DataColumn>();
+        cols.Add(DataColumn.Field(DataColumn.Text("Name", 140), "name"));
+        cols.Add(DataColumn.Field(DataColumn.Numeric("Qty", 90), "qty"));
+        PumpFrame();
+    }
+
+    // 行右键菜单几何（复刻 RenderContextMenu 的锚点/钳位算法）
+    static int MenuMh() {
+        return OverlayPopup.RichHeight(app, DataTable.BuildRowMenuItems(st, cols, src));
+    }
+
+    static int MenuX() {
+        int mw = app.Scale(190);
+        int mx = st.ctxX;
+        if (mx + mw > 20 + 560) { mx = 20 + 560 - mw - app.Scale(2); }
+        if (mx < 20) { mx = 20; }
+        return mx;
+    }
+
+    static int MenuY() {
+        int mh = MenuMh();
+        int my = st.ctxY;
+        if (my + mh > 20 + 420) { my = 20 + 420 - mh - app.Scale(2); }
+        if (my < 20) { my = 20; }
+        return my;
+    }
+
+    static void Main() {
+        app = new App("dt-ctxpen", 900, 900);
+        app.Show();
+        app.window.InjectEvent(1, 200, 200, 0, 0, 0);
+        PumpFrame();
+
+        Reset();
+
+        // ---- 1. 右键行打开菜单；无选择时右键选中该行 ----
+        RightClick(200, RowY(5));
+        bool opened = st.ctxOpen;
+        bool rcSelected = RowSelected(5);
+        Console.WriteLine("ctxMenuOpensOnRightClick=" + (opened ? 1 : 0));
+        Console.WriteLine("rightClickSelectsRow=" + (rcSelected ? 1 : 0));
+
+        // ---- 2. 菜单开着时点菜单外的行：只关菜单，不动选择 ----
+        // 菜单锚在 (ctxX,ctxY)、宽 Scale(190)；「菜单外」取点横向
+        // 越过菜单右缘（面板是矩形，横向在外即在外），纵向保持在
+        // 表体内。
+        string sig1 = Sig();
+        int mw = app.Scale(190);
+        int mx = MenuX();
+        int ox = mx + mw + 30;
+        if (ox > 20 + 560 - 6) { ox = 20 + 560 - 6; }
+        Click(ox, RowY(0));
+        bool outsideClosed = !st.ctxOpen;
+        bool outsideKept = Sig() == sig1;
+        Console.WriteLine("ctxMenuOutsideClickCloses=" + (outsideClosed ? 1 : 0));
+        Console.WriteLine("ctxMenuOutsideClickKeepsSelection=" + (outsideKept ? 1 : 0));
+
+        // ---- 3. 菜单开着时点菜单项（复制）：动作派发，其下行不被改选 ----
+        RightClick(200, RowY(4));
+        string sig2 = Sig();
+        int mx2 = MenuX();
+        int my2 = MenuY();
+        List<MenuItem> items = DataTable.BuildRowMenuItems(st, cols, src);
+        int rowH = OverlayPopup.MenuRowH(app);
+        int itemY = my2 + OverlayPopup.MenuPadV(app) + rowH / 2;
+        Click(mx2 + mw / 2, itemY);
+        PumpFrame();
+        bool itemClosed = !st.ctxOpen;
+        bool itemKept = Sig() == sig2;
+        Console.WriteLine("ctxMenuItemClickCloses=" + (itemClosed ? 1 : 0));
+        Console.WriteLine("ctxMenuItemClickKeepsSelection=" + (itemKept ? 1 : 0));
+
+        // ---- 4. 菜单关掉后表格点击照常（防线不粘滞）：行点击移动
+        //         活动单元格，勾选框照常可勾 ----
+        int numW = app.Scale(46);
+        int selW = app.Scale(40);
+        Click(200, RowY(1));
+        bool cellMoved = st.hitOrder == 1;
+        Click(20 + numW + selW / 2, RowY(3));
+        bool checkWorks = RowSelected(3);
+        Console.WriteLine("rowClickAfterMenuStillWorks="
+            + ((cellMoved && checkWorks) ? 1 : 0));
+    }
+}
