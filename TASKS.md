@@ -684,34 +684,6 @@
   （`zan_hw_gate` 的函数指针分派表按族分组，别把 aes↔ghash 拆散）。
 - 关联：A493（归档成员机制的落地，本条的直接来源）。
 
-### [ ] A494 `BaseRepository<T>` 直接实例化会**静默**返回默认值——只有继承才能用
-
-- 现象（2026-10-22 查 A491 时撞到）：`packages/Zan.Data/src/System/Data/Orm/BaseRepository.zan`
-  是公开 API，`Orm/Models/ModelColumn.zan` 的用法注释也写着"使用
-  `BaseRepository<T>` 泛型仓储"。但**直接实例化**它（`new BaseRepository<U>(zsql)`）
-  时，编译通过、运行不报错，结果全是默认值：`Insert` 返回 0、`FindById` 返回
-  null、`SelectAll` 返回 null（后续访问直接空引用崩）、`Count` 0、`Any` false、
-  `DeleteById` 0。改成**继承**再用（`class UserRepo : BaseRepository<U>`）则
-  完全正常：`insert=1` / `found=alice` / `all=1` / `count=1` / `any=true`。
-- 根因：`BaseRepository<T>` 是**开放泛型模板**——编译器只在派生类里特化出
-  真身（`zan_parser_specialize_generic_bases`），模板体本身只留**运行期转发
-  桩**（见 `src/compiler/irgen_call.c` 的 `call_receiver_is_open_generic`）。
-  而编译期 ORM 代码生成器只在**类型实参是具体实体类**时才改写
-  `Insert<T>` / `Select<T>`；模板里的 `T` 是类型形参 → 改写不了 → 落到桩上
-  → **默认值**。真身里 `T` 已换成具体实体 → 改写成功 → 一切正常。
-  所以"接口该不该补 `Insert`/`Select`"这个问题本身是错的：**它们从来不是
-  接口方法**，补接口只会多一份要同步的空契约。
-- 影响：任何按文档"直接 new 一个仓储"的用户会拿到**静默的错误结果**
-  （写入 0 行、查不到数据），且没有一行报错——比编译失败更危险。
-- 方向（按代价排序）：
-  ① **运行期响亮失败**：转发桩在"没有被特化"时抛异常，而不是返回默认值
-    （落点：`src/compiler/irgen_call.c` 的桩发射 + `src/runtime/` 的桩实现）；
-  ② **让 `BaseRepository<T>` 不能被直接实例化**（抽象类 / 私有构造），把
-    "必须继承"这条契约写进类型系统；
-  ③ 至少在包文档与 `ModelColumn.zan` 的用法注释里写明"必须继承使用"。
-- 关联：A491（同一处代码的另一面：A491 问"接口要不要补方法"，答案是不要）；
-  `packages/Zan.Data/src/System/Data/Orm/BaseRepository.zan`。
-
 ### [ ] A496 自举的 `ToCStr` 不认可空值——可空 bool 走拼接路径生成非法 IR
 
 - 现象（2026-10-22 随 A492 修复时查实，自举后端 `src/selfhost/irgen_expr.zan`）：

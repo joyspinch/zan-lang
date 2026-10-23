@@ -5891,11 +5891,64 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
         if (expr->call.callee && expr->call.callee->kind == AST_MEMBER_ACCESS)
             diagnose_unresolved_static_chain(g, expr->call.callee->member.object);
 
-        if (!zan_diag_has_errors(g->diag) &&
-            !call_receiver_is_open_generic(g, expr, locals))
-            zan_diag_emit(g->diag, DIAG_ERROR, expr->loc,
-                          "this call could not be resolved to any callable "
-                          "(no method, delegate, operator or builtin matches)");
+        if (!zan_diag_has_errors(g->diag)) {
+            if (!call_receiver_is_open_generic(g, expr, locals))
+                zan_diag_emit(g->diag, DIAG_ERROR, expr->loc,
+                              "this call could not be resolved to any callable "
+                              "(no method, delegate, operator or builtin matches)");
+            else if (g->runtime_checks && g->current_fn) {
+                /* A494：这个调用点只在"直接实例化开放泛型模板"时才会执行
+                 * （真身由派生类特化补出，模板体没有运行期实现）。原行为
+                 * 是静默返回默认值——写库 0 行、查表 null，比编译失败更
+                 * 危险。这里响亮报告：软诊断口径（每位点一次，
+                 * --strict-runtime exit 70），返回值仍走同型默认值，
+                 * 特化出的真身不经过这里。 */
+                zan_istr_t cname = { NULL, 0 };
+                if (expr->call.callee) {
+                    if (expr->call.callee->kind == AST_MEMBER_ACCESS)
+                        cname = expr->call.callee->member.name;
+                    else if (expr->call.callee->kind == AST_IDENTIFIER)
+                        cname = expr->call.callee->ident.name;
+                }
+                char msg[280];
+                if (cname.str && cname.len > 0)
+                    snprintf(msg, sizeof(msg),
+                             "call '%.*s' has no runtime body: resolvable "
+                             "only after generic specialization; instantiate "
+                             "the template via a derived class "
+                             "(default value returned)",
+                             (int)cname.len, cname.str);
+                else
+                    snprintf(msg, sizeof(msg),
+                             "call has no runtime body: resolvable only "
+                             "after generic specialization; instantiate the "
+                             "template via a derived class (default value "
+                             "returned)");
+                if (!g->rt_guard_split) {
+                    char buf[420];
+                    const char *file0 = loc_site_file(g, expr->loc);
+                    if (g->hide_diagnostics)
+                        snprintf(buf, sizeof(buf), "%s: runtime error: %s\n",
+                                 file0, msg);
+                    else
+                        snprintf(buf, sizeof(buf),
+                                 "%s:%u:%u: runtime error: %s\n",
+                                 file0, expr->loc.line, expr->loc.col, msg);
+                    emit_guard_report_merged(g,
+                        zan_irgen_intern_string(g, buf));
+                } else {
+                    LLVMValueRef file_gv = zan_irgen_intern_string(g,
+                        loc_site_file(g, expr->loc));
+                    char mbuf[300];
+                    snprintf(mbuf, sizeof(mbuf), "%s\n", msg);
+                    LLVMValueRef msg_gv = zan_irgen_intern_string(g, mbuf);
+                    emit_guard_report3(g, file_gv,
+                        g->hide_diagnostics ? 0 : (uint32_t)expr->loc.line,
+                        g->hide_diagnostics ? 0 : (uint32_t)expr->loc.col,
+                        msg_gv);
+                }
+            }
+        }
         return emit_unresolved_call_result(g, expr, locals);
     return LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 0, 0);
 }
