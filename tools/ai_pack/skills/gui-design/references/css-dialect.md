@@ -231,7 +231,14 @@
 7. **Zan 字符串按字节索引,`Substring(0, 1)` 对中文切出半个字**(渲染
    成「?」)。头像首字/缩写一律由数据显式给出(发言人注册表带 ini
    字段),代码里不要对中文切片(微信模板群成员格「过客云飞」头像
-   变「?」,。需要**字数**时同样别用 `s.Length`——它是
+   变「?」,。实在要在代码里现算首字/摘要,就按**字符边界**切:
+   `Text.NextCharEnd(s,0)` 找字符末位 + `Text.Left(s,end)` 取首字
+   (Gui.Text),截断用 `Text.ClampCharStart(s,bytes)` 把切点回退到
+   字符起点;纯 stdlib 口径是 `Encoding.RuneAt(s,0)`。
+   坑出处:某协作客户端的会话行头像用 `Substring(0,1)` 取「冰冰」的
+   首字,渲染成 U+FFFD 菱形问号——同一时刻画布直画中文、Avatar 控件
+   都正常,唯独这条切法坏,先怀疑切法别怀疑渲染。
+   需要**字数**时同样别用 `s.Length`——它是
    UTF-8 **字节**数;直接用 stdlib 的 `Encoding.CodePointCount(s)`
    (按 UTF-8 首字节声明的宽度前进,非法序列按 1 码点计),别自己手搓
    字节宽度表——那种循环依赖 `QrEncoder.SeqByteLen` 这类会随抽包
