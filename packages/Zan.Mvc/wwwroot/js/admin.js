@@ -954,13 +954,14 @@
                  errors: p.errors || 0, avg_us: p.avg_us || 0,
                  max_us: p.max_us || 0 };
       });
+    // 序列色与图例 i.c-* 同源（见 paintSeries 里的 themeVar 约定）。
     draw('chart-day-req', [
-      { color: '#1f6feb', label: '请求', values: pts.map(function (p) { return p.calls; }) },
-      { color: '#b42318', label: '错误', values: pts.map(function (p) { return p.errors; }) }
+      { color: themeVar('--viz-1', '#18a058'), cls: 'c-blue', label: '请求', values: pts.map(function (p) { return p.calls; }) },
+      { color: themeVar('--danger', '#d03050'), cls: 'c-red', label: '错误', values: pts.map(function (p) { return p.errors; }) }
     ], pts, '');
     draw('chart-day-lat', [
-      { color: '#7c3aed', label: '平均', values: pts.map(function (p) { return ms(p.avg_us); }) },
-      { color: '#d97706', label: '最慢', values: pts.map(function (p) { return ms(p.max_us); }) }
+      { color: themeVar('--viz-4', '#d03050'), cls: 'c-violet', label: '平均', values: pts.map(function (p) { return ms(p.avg_us); }) },
+      { color: themeVar('--viz-3', '#f0a020'), cls: 'c-amber', label: '最慢', values: pts.map(function (p) { return ms(p.max_us); }) }
     ], pts, ' ms');
 
     topTotal = d.calls || 0;
@@ -1189,23 +1190,42 @@
     });
   }
 
+  // 主题变量读取：canvas 不吃 class，图表颜色一律在绘制时从 tokens 取，
+  // 浅/暗切换后的下一次刷新自动跟随。变量缺失时回退浅色 primitive，
+  // 保证画布永远可画（旧缓存的 tokens.css 不至于画出看不见的线）。
+  function themeVar(name, fallback) {
+    var v = getComputedStyle(document.documentElement).getPropertyValue(name);
+    v = (v || '').trim();
+    return v.length ? v : fallback;
+  }
+
   function paintSeries(s) {
     var pts = s.points || [];
+    // 一批曲线共用一次变量读取；序列色与 HTML 图例的 i.c-* 一一对应。
+    var pal = {
+      req: themeVar('--viz-1', '#18a058'),
+      err: themeVar('--danger', '#d03050'),
+      avg: themeVar('--viz-4', '#d03050'),
+      p95: themeVar('--viz-3', '#f0a020'),
+      q: themeVar('--viz-2', '#2080f0'),
+      cpu: themeVar('--success', '#18a058'),
+      mem: themeVar('--text-tertiary', '#767c82')
+    };
     draw('chart-req', [
-      { color: '#1f6feb', label: '请求', values: pts.map(function (p) { return p.req; }) },
-      { color: '#b42318', label: '错误', values: pts.map(function (p) { return p.err; }) }
+      { color: pal.req, cls: 'c-blue', label: '请求', values: pts.map(function (p) { return p.req; }) },
+      { color: pal.err, cls: 'c-red', label: '错误', values: pts.map(function (p) { return p.err; }) }
     ], pts, '');
     draw('chart-lat', [
-      { color: '#7c3aed', label: '平均', values: pts.map(function (p) { return ms(p.avg_us); }) },
-      { color: '#d97706', label: 'P95', values: pts.map(function (p) { return ms(p.p95_us); }) }
+      { color: pal.avg, cls: 'c-violet', label: '平均', values: pts.map(function (p) { return ms(p.avg_us); }) },
+      { color: pal.p95, cls: 'c-amber', label: 'P95', values: pts.map(function (p) { return ms(p.p95_us); }) }
     ], pts, ' ms');
     draw('chart-db', [
-      { color: '#0f766e', label: '查询数', values: pts.map(function (p) { return p.queries; }) },
-      { color: '#0891b2', label: '平均 ms', values: pts.map(function (p) { return ms(p.query_avg_us); }) }
+      { color: pal.q, cls: 'c-teal', label: '查询数', values: pts.map(function (p) { return p.queries; }) },
+      { color: pal.p95, cls: 'c-amber', label: '平均 ms', values: pts.map(function (p) { return ms(p.query_avg_us); }) }
     ], pts, '');
     draw('chart-sys', [
-      { color: '#15803d', label: 'CPU %', values: pts.map(function (p) { return Math.max(p.cpu_percent, 0); }) },
-      { color: '#6b7280', label: '内存 MB', values: pts.map(function (p) {
+      { color: pal.cpu, cls: 'c-green', label: 'CPU %', values: pts.map(function (p) { return Math.max(p.cpu_percent, 0); }) },
+      { color: pal.mem, cls: 'c-gray', label: '内存 MB', values: pts.map(function (p) {
           return Math.round(Math.max(p.mem_rss_bytes, 0) / 1048576); }) }
     ], pts, '');
   }
@@ -1288,26 +1308,30 @@
     // Redraws the whole chart; `hover` >= 0 overlays a guide line and a dot on
     // each series at that sample, so the tooltip has a visible anchor.
     function render(hover) {
+      // 画布配色与 tokens 同源（浅/暗切换后下一次刷新跟随）。
+      var grid = themeVar('--viz-grid', '#efeff5');
+      var axis = themeVar('--border-strong', '#e0e0e6');
+      var tick = themeVar('--text-tertiary', '#767c82');
       g.setTransform(dpr, 0, 0, dpr, 0, 0);
       g.clearRect(0, 0, w, h);
       g.font = font;
       g.lineWidth = 1;
-      g.fillStyle = '#98a1b2';
+      g.fillStyle = tick;
       for (var i = 0; i <= 4; i++) {
         var gy = Math.round(padT + (plotH * i) / 4) + .5;
-        g.strokeStyle = i === 4 ? '#d9dee6' : '#eef0f3';
+        g.strokeStyle = i === 4 ? axis : grid;
         g.beginPath(); g.moveTo(padL, gy); g.lineTo(w - padR, gy); g.stroke();
         g.textAlign = 'right';
         g.fillText(fmtAxis(max - (max * i) / 4), padL - 5, gy + 3.5);
       }
-      g.strokeStyle = '#d9dee6';
+      g.strokeStyle = axis;
       g.beginPath();
       g.moveTo(padL + .5, padT);
       g.lineTo(padL + .5, padT + plotH);
       g.stroke();
       var n0 = pts ? pts.length : 0;
       if (n0 >= 2) {
-        g.fillStyle = '#98a1b2';
+        g.fillStyle = tick;
         var ends = [0, Math.round((n0 - 1) / 2), n0 - 1];
         for (var k = 0; k < ends.length; k++) {
           g.textAlign = k === 0 ? 'left' : (k === 2 ? 'right' : 'center');
@@ -1330,7 +1354,7 @@
       var nn = series[0] ? series[0].values.length : 0;
       if (hover >= 0 && nn >= 2) {
         var hx = px(hover, nn);
-        g.strokeStyle = '#94a3b8';
+        g.strokeStyle = tick;
         g.lineWidth = 1;
         g.beginPath(); g.moveTo(hx + .5, padT); g.lineTo(hx + .5, padT + plotH); g.stroke();
         series.forEach(function (s) {
@@ -1367,8 +1391,8 @@
               ? (sp[idx].t === 0 ? '现在' : (-sp[idx].t) + ' 秒前') : '');
         var html = when ? '<b>' + when + '</b>' : '';
         sv.forEach(function (s) {
-          html += '<div><i style="display:inline-block;width:8px;height:8px;'
-            + 'border-radius:2px;margin-right:6px;background:' + s.color + '"></i>'
+          // 色点走图例同款类：CSP 会剥掉内联 style 属性，class 不受影响。
+          html += '<div><i class="' + (s.cls || 'c-gray') + '"></i>'
             + esc(s.label || '') + ' ' + s.values[idx] + un + '</div>';
         });
         var tip = monTip();
@@ -2318,45 +2342,8 @@
       return state.agents[0] || null;
     }
 
-    // The one and only <style> and dock, injected once so nothing here depends
-    // on admin.css.
-    function styles() {
-      if (document.getElementById('ai-dock-css')) { return; }
-      var s = document.createElement('style');
-      s.id = 'ai-dock-css';
-      s.textContent =
-        '.ai-dock{position:fixed;right:20px;bottom:84px;width:720px;max-width:calc(100vw - 40px);'
-        + 'height:520px;max-height:calc(100vh - 120px);display:none;flex-direction:column;'
-        + 'background:#fff;border:1px solid #e5e7eb;border-radius:12px;box-shadow:0 18px 48px rgba(0,0,0,.22);'
-        + 'z-index:1200;overflow:hidden}'
-        + '.ai-dock.on{display:flex}'
-        + '.ai-dock-top{display:flex;align-items:center;gap:8px;padding:10px 12px;border-bottom:1px solid #eee;background:#f7f8fa}'
-        + '.ai-dock-top b{font-size:14px}.ai-dock-top .sp{flex:1}'
-        + '.ai-dock-top button{border:0;background:transparent;cursor:pointer;font-size:16px;color:#6b7280;padding:2px 6px;border-radius:6px}'
-        + '.ai-dock-top button:hover{background:#eceef1;color:#111}'
-        + '.ai-dock-body{flex:1;display:flex;min-height:0}'
-        + '.ai-side{width:190px;border-right:1px solid #eee;overflow:auto;background:#fafbfc}'
-        + '.ai-agent{display:flex;flex-direction:column;gap:2px;padding:10px 12px;cursor:pointer;border-bottom:1px solid #f1f2f4}'
-        + '.ai-agent:hover{background:#f0f2f5}.ai-agent.on{background:#e7f0ff}'
-        + '.ai-agent .n{font-size:13px;font-weight:600;color:#1f2937}'
-        + '.ai-agent .h{font-size:11px;color:#8a94a6;line-height:1.4}'
-        + '.ai-main{flex:1;display:flex;flex-direction:column;min-width:0}'
-        + '.ai-log{flex:1;overflow:auto;padding:14px;background:#f2f3f5}'
-        + '.ai-row{display:flex;margin-bottom:12px}.ai-row.me{justify-content:flex-end}'
-        + '.ai-bubble{max-width:78%;padding:8px 11px;border-radius:10px;font-size:13px;line-height:1.55;'
-        + 'white-space:pre-wrap;word-break:break-word;background:#fff;border:1px solid #e6e8eb;color:#1f2937}'
-        + '.ai-row.me .ai-bubble{background:#95ec69;border-color:#86df5c}'
-        + '.ai-bubble.bad{background:#fde8e8;border-color:#f5c2c2;color:#b42318}'
-        + '.ai-apply{margin-top:8px}'
-        + '.ai-apply button{border:1px solid #2563eb;background:#2563eb;color:#fff;border-radius:6px;'
-        + 'padding:4px 10px;font-size:12px;cursor:pointer}'
-        + '.ai-apply button:disabled{opacity:.6;cursor:default}'
-        + '.ai-send{display:flex;gap:8px;padding:10px;border-top:1px solid #eee;background:#fff}'
-        + '.ai-send textarea{flex:1;resize:none;border:1px solid #d7dbe0;border-radius:8px;padding:8px 10px;font-size:13px;font-family:inherit}'
-        + '.ai-send button{border:0;background:#2563eb;color:#fff;border-radius:8px;padding:0 16px;cursor:pointer;font-size:13px}'
-        + '.ai-empty{color:#9aa3b2;font-size:12px;text-align:center;margin-top:40px}';
-      document.head.appendChild(s);
-    }
+    // The dock markup only; its styles live in admin.css (CSP 禁内联 <style>，
+    // 主题色也必须跟着 tokens 走，注入字符串做不到)。
 
     function esc(t) {
       return String(t).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
@@ -2372,7 +2359,6 @@
     }
 
     function build() {
-      styles();
       var dock = document.createElement('div');
       dock.className = 'ai-dock';
       dock.innerHTML =

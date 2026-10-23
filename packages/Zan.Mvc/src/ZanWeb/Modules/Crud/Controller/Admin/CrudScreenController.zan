@@ -304,7 +304,11 @@ public class CrudScreenController : AdminController {
             string col = u.Get("col");
             string val = this.In(col);
             if (val.Length == 0) { continue; }
-            DbResult ur = await t.Query().WhereEq(col, val).ToResultAsync(onlyId);
+            /* 唯一性检查并入域：与域外行同值不报"重复"（当作不存在），
+               否则受域账号能用 400 探测域外有没有某值——存在性泄露，
+               破坏"越权与不存在同答"的口径。域内 DB 级唯一约束兜底。 */
+            DbTableQuery uq = await this.Scoped(t.Query(), conf);
+            DbResult ur = await uq.WhereEq(col, val).ToResultAsync(onlyId);
             if (ur == null) { continue; }
             for (int j = 0; j < ur.RowCount(); j = j + 1) {
                 if (ur.GetLong(j, 0) != id) { this.Fail(400, "0004", u.Get("msg")); }
@@ -417,6 +421,17 @@ public class CrudScreenController : AdminController {
         if (!await this.RowAllowed(conf, r)) { this.Fail(404, "0404", "记录不存在"); }
         string bad = this.CheckValue(conf, field, value);
         if (bad.Length > 0) { this.Fail(400, "0004", bad); }
+        /* 归属列行内改与保存同规：新值必须落在域内，防止把行迁出域
+           （横向越权写）——BindScope 在保存通道的承诺，行内通道同样成立。 */
+        if (field == conf.scopeCol && conf.scopeKey.Length > 0) {
+            RowScope fsc = await this.ScopeRow(conf);
+            if (fsc != null && !fsc.all) {
+                long sid = Filter.ToLong(value.Trim(), 0);
+                if (sid <= 0 || !fsc.Allows(sid)) {
+                    this.Fail(403, "0403", "数据权限不允许操作该" + DataGrant.Label(conf.scopeKey));
+                }
+            }
+        }
         List<int> allowed = new List<int>();
         allowed.Add(id);
         await CrudOps.Field(this, lp, conf.title, field, value, allowed);
