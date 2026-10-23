@@ -344,6 +344,8 @@
   数字 "65"（C# "A"；WriteLine(char) 与拼接路径早就是字符渲染——两条路互
   相不一致）。ToString lowering 补 TYPE_CHAR 分支，对齐 emit_char_to_cstr
   （UTF-8 编码）。探针 v_chartost 复验："A" + Length 1。
+- **用例收口（2026-10-23）**：新增 conformance 用例 `tests/conformance/char_to_string.{zan,out}`
+  验证 `char.ToString()` 字符串产物及 Length 为 1，并入差分门 `tests/selfhost/diff_cases.txt`。
 - 待办：其余件（bool 大小写=A441 已闭的统一口径、-0.0 符号、float 按精度
 - **自举半边已修（2026-10-23，goal round 4）**：selfhost 无参 scalar
   ToString 的 char 接收者分支接 `CharToStr`（WriteLine(char) 与拼接路径
