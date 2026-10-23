@@ -1,0 +1,251 @@
+// 炸弹矩阵回归（审计 40 向量的常驻重建版）：八个解析器各喂有界对抗输入，
+// 断言 ① 在时间预算内完成（旧缺陷是分钟级/死循环/指数放大）② 行为正确
+// ③ 截断/损坏输入干净报异常不段崩。输出只含确定性判定，不含计时值。
+// 向量与历史缺陷对应：
+//   json_deep/json_escapes   —— 未终止转义曾死循环 O(n²)（修复见用例注释）
+//   json_dupkeys             —— Set 线性回退 O(n²)（P2-27 同族）
+//   toml_tables              —— 25k 表曾 4.1s（P2-27，EnsureKeyIndex）
+//   yaml_diamond             —— 别名 DAG 曾 693B→69MB（A533，锚点写出）
+//   yaml_deep                —— 块嵌套深度
+//   xml_runs/xml_entities    —— MergeText 合并路径规模（P1-4 复核）
+//   xml_dupattr              —— 曾静默双写（P1-6）
+//   csv_scale                —— 大表行数
+//   msgpack/bson/proto_trunc —— 截断缓冲干净拒绝
+// 注意：StringBuilder.Append 返回 void，禁止链式调用（本用例曾因此编不过）。
+using System;
+using System.Text;
+using System.Json;
+using System.Toml;
+using System.Xml;
+using System.Csv;
+using System.Yaml;
+using System.MsgPack;
+using System.Bson;
+using System.Protobuf;
+
+public class ParserBombMatrix {
+    static long t0;
+    static int budgetMs = 10000;
+
+    static bool InBudget() {
+        return (double)(DateTime.Now().epochMs - t0) < (double)budgetMs;
+    }
+
+    static void Main() {
+        int bad = 0;
+        bool ok = false;
+        StringBuilder sb = new StringBuilder();
+
+        // 1. JSON 深嵌套 5k 层数组：解析成功或干净拒绝（深度上限）都算过，
+        //    判据是预算内完成且不段崩（P1-1 时代的行为是运行时段崩）。
+        t0 = DateTime.Now().epochMs;
+        for (int i = 0; i < 5000; i = i + 1) { sb.Append("["); }
+        for (int i = 0; i < 5000; i = i + 1) { sb.Append("]"); }
+        bool done1 = false;
+        try {
+            JsonValue jd = JsonValue.Parse(sb.ToString());
+            done1 = jd != null;
+        } catch (JsonException e) {
+            done1 = true;  // 干净的深度/格式拒绝
+        }
+        bool ok1 = done1 && InBudget();
+        Console.WriteLine("json_deep: " + Convert.ToString(ok1 ? 1 : 0));
+        if (!ok1) { bad = bad + 1; }
+
+        // 2. JSON 20 万个转义
+        t0 = DateTime.Now().epochMs;
+        sb = new StringBuilder();
+        sb.Append("\"");
+        for (int i = 0; i < 100000; i = i + 1) { sb.Append("\\\""); }
+        sb.Append("\"");
+        JsonValue je = JsonValue.Parse(sb.ToString());
+        ok = je != null && InBudget();
+        Console.WriteLine("json_escapes: " + Convert.ToString(ok ? 1 : 0));
+        if (!ok) { bad = bad + 1; }
+
+        // 3. JSON 5 万重复键：解析器不折叠重复键（count=50001 是现行为），
+        //    Get 读首个匹配；判据是大对象键路径在预算内完成（P2-27 同族）。
+        t0 = DateTime.Now().epochMs;
+        sb = new StringBuilder();
+        sb.Append("{");
+        for (int i = 0; i < 50000; i = i + 1) {
+            sb.Append("\"k\":");
+            sb.Append(Convert.ToString(i));
+            sb.Append(",");
+        }
+        sb.Append("\"z\":\"YES\"}");
+        JsonValue jk = JsonValue.Parse(sb.ToString());
+        JsonValue zval = jk == null ? null : jk.Get("z");
+        ok = zval != null && zval.strVal == "YES" && InBudget();
+        Console.WriteLine("json_dupkeys: " + Convert.ToString(ok ? 1 : 0));
+        if (!ok) { bad = bad + 1; }
+
+        // 4. TOML 2.5 万表（P2-27 判据）
+        t0 = DateTime.Now().epochMs;
+        sb = new StringBuilder();
+        for (int i = 0; i < 25000; i = i + 1) {
+            sb.Append("[t");
+            sb.Append(Convert.ToString(i));
+            sb.Append("]\nv=");
+            sb.Append(Convert.ToString(i));
+            sb.Append("\n");
+        }
+        JsonValue tv = Toml.Parse(sb.ToString());
+        ok = tv != null && InBudget();
+        Console.WriteLine("toml_tables: " + Convert.ToString(ok ? 1 : 0));
+        if (!ok) { bad = bad + 1; }
+
+        // 5. YAML 3^7 别名菱形：ToYaml 有界 + 幂等（A533 判据）
+        t0 = DateTime.Now().epochMs;
+        sb = new StringBuilder();
+        sb.Append("leaf: &n1\n  v: 1\n");
+        for (int i = 2; i <= 7; i = i + 1) {
+            string pad = "";
+            for (int k = 0; k < i - 2; k = k + 1) { pad = pad + "  "; }
+            sb.Append("l");
+            sb.Append(Convert.ToString(i));
+            sb.Append(": &n");
+            sb.Append(Convert.ToString(i));
+            sb.Append("\n");
+            sb.Append(pad);
+            sb.Append("  x1: *n");
+            sb.Append(Convert.ToString(i - 1));
+            sb.Append("\n");
+            sb.Append(pad);
+            sb.Append("  x2: *n");
+            sb.Append(Convert.ToString(i - 1));
+            sb.Append("\n");
+            sb.Append(pad);
+            sb.Append("  x3: *n");
+            sb.Append(Convert.ToString(i - 1));
+            sb.Append("\n");
+        }
+        sb.Append("root: *n7\n");
+        JsonValue yv = Yaml.Parse(sb.ToString());
+        string oy = Yaml.ToYaml(yv);
+        string oy2 = Yaml.ToYaml(Yaml.Parse(oy));
+        ok = oy.Length < 5000 && oy == oy2 && InBudget();
+        Console.WriteLine("yaml_diamond: " + Convert.ToString(ok ? 1 : 0));
+        if (!ok) { bad = bad + 1; }
+
+        // 6. YAML 2k 层块嵌套
+        t0 = DateTime.Now().epochMs;
+        sb = new StringBuilder();
+        for (int i = 0; i < 2000; i = i + 1) {
+            for (int k = 0; k < i; k = k + 1) { sb.Append(" "); }
+            sb.Append("k");
+            sb.Append(Convert.ToString(i));
+            sb.Append(":\n");
+        }
+        for (int k = 0; k < 2000; k = k + 1) { sb.Append(" "); }
+        sb.Append("v: 1\n");
+        bool done6 = false;
+        try {
+            JsonValue yd = Yaml.Parse(sb.ToString());
+            done6 = yd != null;
+        } catch (YamlException e) {
+            done6 = true;  // 干净的深度/格式拒绝
+        }
+        bool ok6 = done6 && InBudget();
+        Console.WriteLine("yaml_deep: " + Convert.ToString(ok6 ? 1 : 0));
+        if (!ok6) { bad = bad + 1; }
+
+        // 7. XML 5 万交替文本/注释游程（MergeText 加子节点路径）
+        t0 = DateTime.Now().epochMs;
+        sb = new StringBuilder();
+        sb.Append("<a>");
+        for (int i = 0; i < 50000; i = i + 1) { sb.Append("x<!--c-->"); }
+        sb.Append("</a>");
+        XmlDocument xd = XmlDocument.Parse(sb.ToString());
+        ok = xd != null && InBudget();
+        Console.WriteLine("xml_runs: " + Convert.ToString(ok ? 1 : 0));
+        if (!ok) { bad = bad + 1; }
+
+        // 8. XML 单文本 5 万实体碎片（MergeText 合并路径）
+        t0 = DateTime.Now().epochMs;
+        sb = new StringBuilder();
+        sb.Append("<a>");
+        string amp = Encoding.Utf8FromCodePoint(38);
+        string ent = amp + "amp;";
+        for (int i = 0; i < 50000; i = i + 1) { sb.Append(ent); }
+        sb.Append("</a>");
+        XmlDocument xe = XmlDocument.Parse(sb.ToString());
+        ok = xe != null && InBudget();
+        Console.WriteLine("xml_entities: " + Convert.ToString(ok ? 1 : 0));
+        if (!ok) { bad = bad + 1; }
+
+        // 9. XML 重复属性：必须报错（P1-6 判据）
+        t0 = DateTime.Now().epochMs;
+        bool threw9 = false;
+        try {
+            XmlDocument.Parse("<a k=\"1\" k=\"2\"/>");
+        } catch (XmlException e) {
+            threw9 = true;
+        }
+        ok = threw9 && InBudget();
+        Console.WriteLine("xml_dupattr: " + Convert.ToString(ok ? 1 : 0));
+        if (!ok) { bad = bad + 1; }
+
+        // 10. CSV 20 万行 × 3 列
+        t0 = DateTime.Now().epochMs;
+        sb = new StringBuilder();
+        sb.Append("a,b,c\n");
+        for (int i = 0; i < 200000; i = i + 1) {
+            sb.Append(Convert.ToString(i));
+            sb.Append(",x,\"y,z\"\n");
+        }
+        CsvTable ct = Csv.Parse(sb.ToString());
+        ok = ct != null && ct.RowCount() == 200000 && InBudget();
+        Console.WriteLine("csv_scale: " + Convert.ToString(ok ? 1 : 0));
+        if (!ok) { bad = bad + 1; }
+
+        // 11. MsgPack 截断缓冲：干净拒绝
+        t0 = DateTime.Now().epochMs;
+        JsonValue md = JsonValue.Parse("{\"a\":1,\"b\":\"xy\"}");
+        byte[] mp = MsgPack.Pack(md);
+        bool threw11 = false;
+        try {
+            byte[] cut = new byte[mp.Length - 2];
+            for (int i = 0; i < cut.Length; i = i + 1) { cut[i] = mp[i]; }
+            MsgPack.Unpack(cut);
+        } catch (MsgPackException e) {
+            threw11 = true;
+        }
+        ok = threw11 && InBudget();
+        Console.WriteLine("msgpack_trunc: " + Convert.ToString(ok ? 1 : 0));
+        if (!ok) { bad = bad + 1; }
+
+        // 12. BSON 截断缓冲：干净拒绝
+        t0 = DateTime.Now().epochMs;
+        byte[] bb = Bson.Pack(md);
+        bool threw12 = false;
+        try {
+            byte[] cut = new byte[bb.Length - 3];
+            for (int i = 0; i < cut.Length; i = i + 1) { cut[i] = bb[i]; }
+            Bson.Unpack(cut);
+        } catch (BsonException e) {
+            threw12 = true;
+        }
+        ok = threw12 && InBudget();
+        Console.WriteLine("bson_trunc: " + Convert.ToString(ok ? 1 : 0));
+        if (!ok) { bad = bad + 1; }
+
+        // 13. Protobuf 截断 varint：干净拒绝
+        t0 = DateTime.Now().epochMs;
+        byte[] pb = new byte[] { 8, 172, 152, 152 };  // 字段1 varint 被截断（无终止字节）
+        bool threw13 = false;
+        try {
+            ProtoReader pr = new ProtoReader(pb);
+            while (pr.Next()) {
+                pr.ReadVarintField();
+            }
+        } catch (ProtoException e) {
+            threw13 = true;
+        }
+        ok = threw13 && InBudget();
+        Console.WriteLine("proto_trunc: " + Convert.ToString(ok ? 1 : 0));
+        if (!ok) { bad = bad + 1; }
+
+        Console.WriteLine("bomb-matrix-ok: " + Convert.ToString(bad == 0 ? 1 : 0));
+    }
+}
