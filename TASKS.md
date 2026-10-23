@@ -15,6 +15,7 @@
 > 差分门 `convert_int_semantics` 翻绿；A514 自举 irgen 侧 `ArmStaticTy`+`MergeArmTypes`
 > 按宿主 `irgen_promote_pair` 同阶梯合一定型（仅数值载体 i64/double 采用，decimal 混合维持
 > then 臂）；A515 自举 `??` 降级本就右支惰性（探针复核 `empty9/x/1` 两侧一致）。
+> > 2026-10-23 平账（审计遗留验证批）：移出 3 条（A530/A531/A532）。 > A530 `--link-lib` 白名单实测：`--link-lib "& echo pwned"` 报错 exit 1 无产物，`ws2_32` 照常编译运行； > A531 只读 exe 目录实测：run/exit 注记与软诊断（越界读返 0、除零返被除数）都落到 `%TEMP%\zan_crash.log`， > write_record 档与这两档共用同一取路帮手（栈溢出类崩溃 SEH 自身饿死，物理不可达）； > A532 复核 zan-lsp PE `SizeOfStackReserve == 0x2000000`，与 zanc 同值。
 >
 > 2026-10-22 平账：移出 48 条已闭账条目（A390/A393/A394/A395/A396/A397/A399/
 > A400/A401/A402/A403/A404/A405/A406/A407/A413/A415/A416/A428/A431/A432/A437/
@@ -344,6 +345,17 @@
   `c.IsDigit()` 实例调用仍正确拒绝。
 - 探针：`_scratch/csaudit/string/v_charcls{,2,4,5}.zan`。
 - 待办：其余件（StringSplitOptions、格式串、operator++、multicast、
+- **两侧同修（2026-10-23，goal round 9）**：自定义类型 operator ++/--。
+  两侧 parser 的 op 命名表都缺 ++/--（宿主落 op_unknown、自举同样）——
+  补 op_inc/op_dec。宿主 emit_incdec_expr 非数值槽位先试
+  emit_unary_op_overload（扩展映射 + ++/-- 无重载时静默返 NULL 维持原
+  拒绝口径；属性路径暂不走用户算符）；自举 GenUnary/GenPostfix 各加分
+  派 + TryUnaryOpOverload 帮手（FindMethodUp/OpDeclClass/MethodSym 与
+  二元运算符同机制，op_inc 必须有返回值）。C# 口径：前缀后缀都调同一
+  算符，后缀返回旧值。
+- 复验：后缀 c++（c=11,d=10）、前缀 ++c（c=p=11）、c--（c=10,q=11）、
+  数值 x++ 回归 6 全对；自举 gen1 出 IR `call %Counter* @Counter_op_inc`
+  且 clang -c 过。
 - **宿主侧已补一件（2026-10-23，goal round 7）**：标量 ToString 格式串
   `d.ToString("F2"/"D5"/"X4"/"E2"/"G3"/"0.00")`——复用插值路径的
   `interp_format_to_printf`（从 static 提升为 irgen.h 共享声明，同一
@@ -1516,33 +1528,6 @@
 - 探针：`_scratch/csaudit/numeric/{v_chain2,v_chain5,v_chain6}.zan`。
 - 待办：自举半边（selfhost 推断侧同缺口对齐）。
 - 探针：`_scratch/csaudit/numeric/{v_chain,v_chain2}.zan`（隔离复验：前者过、后者挂）。
-
-### [ ] A530 审计遗留：`--link-lib` 值原样拼进链接命令行（命令注入面）
-- 来源：2026-10-17/18 全仓审计 P1-9（实测复现，审计产物已被 _scratch 清扫）。
-  `--link-lib` 的值经 `" -l%s"` 拼进 link_cmd 后 `system()` 执行——传
-  `& calc` 一类元字符就是本机命令注入。该旗标只应接库名标识符。
-- 已落（**未验证**）：`src/compiler/main.c` 参数解析位点加
-  `zan_dllimport_name_is_safe` 白名单（[A-Za-z0-9._+-]，与 DllImport 同
-  口径），越界拒绝退出 1。待 zanc 重建后实测（编译器在途改动占着构建）。
-- 判定器：`zanc hello.zan --auto-stdlib --link-lib "& echo pwned" -o x.exe`
-  应报错退出 1 且不产出文件；`--link-lib ws2_32` 应照常通过。
-
-### [ ] A531 审计遗留：崩溃日志链在只读 exe 目录下静默失效
-- 来源：审计 P1-2。崩溃/软诊断日志路径 `<exe_dir>/zan_crash.log` → CWD
-  回退；两者都只读（Program Files、部署盘）时记录静默丢。体积轮转
-  （1MB → `.1`）已在场，DoS 面已消，剩写入可靠性。
-- 已落（**未验证**）：`rt_crash.h` 增 `%TEMP%` 第三档回退
-  （`zan__crash_temp_logpath`，note/write_record 两处接线）；
-  `rt_timer.c` 软诊断同形。待 zanc 重建后实测。
-- 判定器：把 exe 放只读目录跑崩溃探针，`%TEMP%\zan_crash.log` 应出现记录。
-
-### [ ] A532 审计遗留：zan-lsp 未设栈预算（前端深嵌套爆 1MB 栈）
-- 来源：审计 P1-3。zan-lsp 内嵌 lexer/parser/binder/checker（与 zanc 同
-  源），不可信项目文件走同样的深嵌套递归；zanc 已 32MB（CMakeLists
-  `/STACK:33554432`），zan-lsp 默认 1MB——IDE 补全请求就能踩爆。
-- 已落（**未验证**）：CMakeLists zan-lsp 复制 zanc 的 msvc/mingw 双分支
-  栈选项。待 zan-lsp 目标重建 + PE 头核对。
-- 判定器：PE optional header `SizeOfStackReserve == 0x2000000`。
 
 ### [ ] A533 Yaml.ToYaml 对别名 DAG 指数放大（693B → 69MB）
 - 来源：审计 P2-28（实测）。YamlParser 把 `&a0`/`*a0` 还原成共享节点

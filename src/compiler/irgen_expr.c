@@ -4506,8 +4506,14 @@ static LLVMValueRef emit_unary_op_overload(zan_irgen_t *g, zan_ast_node_t *expr,
         (ot->kind != TYPE_CLASS && ot->kind != TYPE_STRUCT))
         return NULL;
 
-    const char *op_name = (expr->unary.op == TK_MINUS) ? "op_sub" : "op_add";
-    const char *op_sign = (expr->unary.op == TK_MINUS) ? "-" : "+";
+    const char *op_name =
+        (expr->unary.op == TK_MINUS) ? "op_sub" :
+        (expr->unary.op == TK_PLUS) ? "op_add" :
+        (expr->unary.op == TK_PLUS_PLUS) ? "op_inc" : "op_dec";
+    const char *op_sign =
+        (expr->unary.op == TK_MINUS) ? "-" :
+        (expr->unary.op == TK_PLUS) ? "+" :
+        (expr->unary.op == TK_PLUS_PLUS) ? "++" : "--";
     zan_istr_t op_istr = { (char *)op_name, (int)strlen(op_name) };
 
     zan_ast_node_t *probe = zan_ast_new(g->arena, AST_CALL, expr->loc);
@@ -4517,6 +4523,10 @@ static LLVMValueRef emit_unary_op_overload(zan_irgen_t *g, zan_ast_node_t *expr,
     /* 一元重载：探针不带显式实参 */
     zan_symbol_t *op_sym = resolve_op_overload(g, ot->sym, op_istr, probe, locals);
     if (!op_sym) {
+        /* ++/-- 的调用方（emit_incdec_expr）负责自己的诊断：这里静默
+         * 返回 NULL，让"requires a numeric operand"维持原口径。 */
+        if (expr->unary.op == TK_PLUS_PLUS || expr->unary.op == TK_MINUS_MINUS)
+            return NULL;
         zan_diag_emit(g->diag, DIAG_ERROR, expr->loc,
                       "type '%s' does not define a unary '%s' operator overload",
                       ot->name.str ? ot->name.str : "<unknown>", op_sign);
@@ -6469,6 +6479,21 @@ static LLVMValueRef emit_incdec_expr(zan_irgen_t *g, zan_ast_node_t *expr,
     LLVMTypeKind k = LLVMGetTypeKind(slot_ty);
     if (k != LLVMIntegerTypeKind && k != LLVMFloatTypeKind &&
         k != LLVMDoubleTypeKind) {
+        /* A525 一件：非数值槽位先试用户 operator ++/--（parser 命名
+         * op_inc/op_dec；emit_unary_op_overload 自带 struct 槽位解引用）。
+         * C# 口径：前缀后缀都调同一算符，后缀返回旧值。无重载才维持
+         * 原拒绝。属性路径（prop_getter）暂不走用户算符。 */
+        if (expr->unary.op == TK_PLUS_PLUS || expr->unary.op == TK_MINUS_MINUS) {
+            LLVMValueRef uov = emit_unary_op_overload(g, expr, locals);
+            if (uov) {
+                LLVMValueRef old_v = LLVMBuildLoad2(g->builder, slot_ty,
+                                                    slot_ptr, "inc.old");
+                zan_store_fit(g, uov, slot_ptr);
+                if (slot_str_base)
+                    emit_string_len_invalidate(g, slot_str_base);
+                return is_prefix ? uov : old_v;
+            }
+        }
         zan_diag_emit(g->diag, DIAG_ERROR, operand->loc,
             "++/-- requires a numeric operand");
         return LLVMConstInt(i64, 0, 0);

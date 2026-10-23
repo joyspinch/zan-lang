@@ -159,9 +159,45 @@ partial class Irgen {
         return new ExprVal(t, vty);
     }
 
+    // User-defined operator ++/-- (A525 一件自举半边)：the parser names the
+    // declaration op_inc/op_dec; the dispatch looks it up on the operand's
+    // class chain and calls the static method. Returns null when the operand
+    // is not a class or declares no such operator (numeric paths proceed).
+    ExprVal TryUnaryOpOverload(Node e, ExprVal v) {
+        if (v.ty == null || v.ty.ival != 0) { return null; }
+        Node ucls = ClassOf(v.ty);
+        if (ucls == null) { return null; }
+        string unm = e.op == TK.PlusPlus() ? "op_inc" : "op_dec";
+        Node declCls = OpDeclClass(ucls, unm);
+        if (declCls == null) { return null; }
+        Node um = FindMethodUp(declCls, unm);
+        if (um == null || !HasMod(um, MOD.Static())) { return null; }
+        Node p0 = ParamTypeNode(um, 0);
+        if (p0 == null) { return null; }
+        string rt = MapType(um.type);
+        if (rt == "void") {
+            diags.Error("operator " + (e.op == TK.PlusPlus() ? "++" : "--")
+                + " must return a value", e.line, e.col);
+            return null;
+        }
+        string args = MapType(p0) + " " + CallArg(v, p0, false);
+        string sym = MethodSym(declCls.sval, um);
+        string t = NT();
+        L("  " + t + " = call " + rt + " @" + sym + "(" + args + ")");
+        return new ExprVal(t, um.type);
+    }
+
     ExprVal GenUnary(Node e) {
         ExprVal v = GenExpr(e.a);
         if (e.op == TK.PlusPlus() || e.op == TK.MinusMinus()) {
+            // user-defined operator ++/-- (parser names it op_inc/op_dec):
+            // a static method of the operand's class taking and returning
+            // the operand's type. C#: prefix and postfix BOTH call it.
+            ExprVal uov = TryUnaryOpOverload(e, v);
+            if (uov != null) {
+                StoreTo(e.a, uov);
+                return uov;
+            }
             // prefix ++/--: store the new value and yield it
             if (IsDbl(v.ty)) {
                 string t = NT();
@@ -218,6 +254,13 @@ partial class Irgen {
     ExprVal GenPostfix(Node e) {
         // x++ / x-- : return old value, update slot
         ExprVal cur = GenExpr(e.a);
+        // user-defined operator ++/--: same call as prefix, postfix yields
+        // the OLD value (cur is already the pre-call value)
+        ExprVal uovp = TryUnaryOpOverload(e, cur);
+        if (uovp != null) {
+            StoreTo(e.a, uovp);
+            return cur;
+        }
         if (IsDbl(cur.ty)) {
             string t = NT();
             string opn = "fadd";

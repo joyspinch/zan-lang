@@ -3745,6 +3745,8 @@ ordinary_member:
         case TK_GREATER: snprintf(op_name, sizeof(op_name), "op_gt"); break;
         case TK_LESS_EQ: snprintf(op_name, sizeof(op_name), "op_le"); break;
         case TK_GREATER_EQ: snprintf(op_name, sizeof(op_name), "op_ge"); break;
+        case TK_PLUS_PLUS:  snprintf(op_name, sizeof(op_name), "op_inc"); break;
+        case TK_MINUS_MINUS: snprintf(op_name, sizeof(op_name), "op_dec"); break;
         default:         snprintf(op_name, sizeof(op_name), "op_unknown"); break;
         }
         parser_advance(p);
