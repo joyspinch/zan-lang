@@ -183,9 +183,11 @@
   截成负数、`v > 截断值` 误判真。这正是固定点门爆
   "integer literal is too large for 'long'" 的根因——gen2 的 lexer
   `NumDigit` 同形状，`1L` 都报超界。修法：两处改读 `ValWidth`（认 wbits）。
-  **留观**：修后三代链的 gen2 步仍异常——同一 66 源编译 gen1 约 10s、
-  gen2 超 17 分钟 CPU 未完（单文件失败路径 139ms vs 18749ms，134 倍），
-  A510 位宽口径在更深处仍有一层 gen1/gen2 分歧未定位，固定点门本树仍红。
+  **留观已闭（2026-10-23 晚）**：位宽修后 gen2 仍病态慢（同 66 源 gen1 约
+  10s、gen2 >17min CPU 未完；最小两文件 stdlib 树也要 488s，脱离仓库则
+  141ms）——复现锚点在 pull-in 包扫描。真根因是自举二元表达式重复求值
+  假死（A538，e85426638 修）：重复求值把扫描循环放大成天文数字。修复后
+  固定点门 73s 全绿（test #2286）。
 - 探针：`_scratch/csaudit/numeric/{p03,p04,p12}`。
 
 ### [x] A511 decimal 三处语义缺口：除法截断、与 double 混算垃圾、WriteLine(decimal) 编译崩溃
