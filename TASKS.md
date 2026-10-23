@@ -1,4 +1,4 @@
-﻿# zan-lang 全仓审计 · 可执行任务清单
+# zan-lang 全仓审计 · 可执行任务清单
 
 > 2026-07-27 起建立。发现缺陷、缺口或未决设计先登记编号；完成时必须有代码、conformance 用例和对应验证。状态：[ ] 未完成 · [~] 进行中 · [-] 已作废。
 >
@@ -120,31 +120,6 @@
 - 关联：`array_local_free` 是另一类——它量的是进程内存，插桩自己的记账
   （几十 MB）把它测的东西搅了（普通版 "sync ok"，插桩版 "sync leaked 25492KB"）。
   它的 golden 也走普通版，泄漏结论照常在插桩版上判。
-
-### [ ] A468 宿主与自举在「`await` 一个非协程操作数」上分叉
-
-- 现象：宿主把 `await <非协程>` **降级成普通求值**
-  （`src/compiler/irgen_expr.c:10350-10358`，注释写明"不是帧就原样返回"——
-  普通值往往也是 i8 指针，当成帧去读会读出面元指针的垃圾值，而且不报错）；
-  自举则**直接报错**：`'await' expects an async call in the self-hosted
-  compiler -- this operand is not lowered as a coroutine frame`
-  （`src/selfhost/irgen_async.zan:618-632`）。
-- 这**不是**宿主缺陷（2026-10-22 复核确认）：判据是"**这个 await 目标需不需要
-  真挂起**"，不是"外层方法是不是 async"。await 一个普通值属于**能同步降级**的
-  那一类，原样求值就是正确语义；宿主的行为被 golden 用例钉住
-  （`tests/conformance/async_await_sync_delegate.zan:23` await 一个**同步委托**，
-  文件头注释明写"await 的目标分两类——异步目标与普通目标"）。判据的完整说明见
-  `docs/ASYNC_CPS_DESIGN.md` 的 "Where `await` may appear (the criterion)"。
-  缺的是自举侧的**表达能力**：自举目前只能降级 async 调用，碰到普通值没有
-  对应的"原样求值"形态。
-- 方向（择一）：
-  1. 自举补上"await 一个普通值 → 原样求值"这条降级路径（与宿主一致，差分门
-     才不需要给这类程序开缺口）；
-  2. 或者把这条分歧写进 `tests/selfhost/diff_known_gaps.txt` 并注明理由——
-     但差分门只比"能编且 stdout 一致"的用例，"宿主能编、自举不能编"这类要
-     另开一个 reject 清单条目才看得见。
-- 关联：A467（已闭账：宿主补上「await 写在 lambda 里」的诊断）、
-  `docs/ASYNC_CPS_DESIGN.md` §"Where `await` may appear (the criterion)"。
 
 ### [ ] A464 运行期分配量统计缺失——托管分配没有可读的计数入口
 

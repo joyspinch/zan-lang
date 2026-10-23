@@ -5767,11 +5767,22 @@ partial class Irgen {
         return SubstTP(dty, tps, curInstArgs);
     }
 
+    bool IsAsyncDelegate(Node dty) {
+        if (dty == null || dty.sval == null) { return false; }
+        if (dty.sval == "Func" || dty.sval == "Action") { return false; }
+        Node d = binder.FindDelegate(dty.sval);
+        if (d != null) { return IsAsync(d); }
+        return false;
+    }
+
     // invoke an already-evaluated delegate value
     ExprVal EmitDelegateCallVal(ExprVal clo, Node dty, Node e) {
         dty = InstDelegateType(dty);
         List<Node> pt = DelegParams(dty);
         Node retTy = DelegRet(dty);
+        bool isAsyncDeleg = IsAsyncDelegate(dty);
+        Node callRetTy = retTy;
+        if (isAsyncDeleg) { callRetTy = MkType("object"); }
         // The arguments are evaluated ONCE, before the closure/bare split.
         // Evaluating them inside the arms nests one call's branch-and-phi
         // inside the other arm's block, and that shape crashes the X86
@@ -5822,8 +5833,8 @@ partial class Irgen {
             ptypesB = ptypesB + (ib == 0 ? "" : ", ") + argTypes[ib];
             ib = ib + 1;
         }
-        string rt = MapType(retTy);
-        string fnt = LamFnType(retTy, pt);
+        string rt = MapType(callRetTy);
+        string fnt = LamFnType(callRetTy, pt);
         // strip the trailing '*' of the pointer type: opaque-pointer LLVM
         // rejects `call rt (args)* %ptr(...)`; the modern form is
         // `call (args) %ptr(...)` where the fn type carries ret+params
@@ -5861,6 +5872,11 @@ partial class Irgen {
         string t = NT();
         L("  " + t + " = phi " + rt + " [ " + rClo + ", %L" + lClo + " ], [ " + rBare + ", %L" + lBare + " ]");
         AddTemp(t, retTy);
+        if (isAsyncDeleg) {
+            Node tt = MkType("__task");
+            tt.a = retTy;
+            return AsyncFrame(t, tt);
+        }
         return new ExprVal(t, retTy);
     }
 
