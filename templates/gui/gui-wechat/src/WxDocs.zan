@@ -1,0 +1,617 @@
+using System;
+using System.Collections.Generic;
+using System.Json;
+using System.Text;
+using Gui;
+using Gui.Component;
+using Gui.Component.WebView;
+using Gui.Widget;
+
+/* 文档页：资源文档协同的客户端一侧。
+ *
+ * 三段：左栏空间清单 + 该空间的文档清单（/api/oa/docs/spaces、/list），
+ * 中间正文（阅读态用网页视图显示服务端渲染好的 HTML，编辑态用文本域
+ * 编辑块语法原文），右栏版本历史（/api/oa/docs/versions）。
+ *
+ * 协同口径（与服务端 DocsApi 严格一致，客户端不自己另发明）：
+ *   - 正文渲染在服务端（Blocks：escape-first + 链接白名单），客户端只
+ *     显示；不在客户端重做一套块语法渲染——两套渲染迟早分叉。
+ *   - 编辑提交的是块语法原文；正文是多行语义，提交必须整段 URL 编码
+ *     （换行编成 %0A，服务端 InRaw 保留原始换行）。
+ *   - 保存带乐观锁基准 baseVersion：服务端发现库里版本已经变了就 409
+ *     拒写，客户端保留草稿并把话说明白（双标签对敲场景）。
+ *   - 回滚不改历史：把旧快照作为新版本写进去（服务端 revert 端点）。
+ *
+ * 网页视图不可用时（机器没装 WebView2 运行时）降级成纯文本正文，
+ * 不留一块黑屏——与后台页同一套降级纪律。
+ *
+ * 页骨架在 WxDocs.html（运行期装载），代码建的控件（三个列表、网页
+ * 视图、纯文本回退）不带文档作用域类，外观规则在皮肤层。
+ */
+public class WxDocs : Control {
+    ModelBinder binder;
+    App host;
+    ListView<WxDocSpace> spaceList;
+    ListView<WxDocItem> docList;
+    ListView<WxDocVersion> verList;
+    WebViewBox webBox;
+    TextArea fallback;
+    Input titleBox;
+    TextArea editor;
+    Control title;
+    Control meta;
+    Control foot;
+    Control btnEdit;
+    Control btnSave;
+    Control btnCancel;
+    Control btnRevert;
+    Control btnDelete;
+    Control webHost;
+    Control textHost;
+
+    List<WxDocSpace> spaces;
+    List<WxDocItem> docs;
+    List<WxDocVersion> versions;
+
+    string curSpace;
+    string curDoc;
+    // 乐观锁基准：打开文档时的版本号，保存时回传给服务端比对。
+    int baseVersion;
+    // 编辑态？
+    bool editing;
+    // 当前是「还没落库的新文档」（保存走新建路径）。
+    bool draft;
+    // 当前文档的正文（服务端渲染好的 HTML 与纯文本摘要）。
+    string curHtml;
+    string curText;
+    // 当前文档标题（拼网页包装时用）。
+    string curTitle;
+    // 正文装载的序号：网页视图装完后的体检用它作废过期结果。
+    int bodySeq;
+
+    WxDocs() {
+        this.InitControl("wxdocs", 5);
+        this.Class = "wxmain";
+        spaces = new List<WxDocSpace>();
+        docs = new List<WxDocItem>();
+        versions = new List<WxDocVersion>();
+        curSpace = "";
+        curDoc = "";
+        baseVersion = 0;
+        editing = false;
+        draft = false;
+        curHtml = "";
+        curText = "";
+        curTitle = "";
+        bodySeq = 0;
+    }
+
+    // 装载页面：运行期文档建树 → 挂清单与正文视图 → 按名字接事件。
+    void Build(App app) {
+        host = app;
+        Control ui = app.LoadHtmlWith(WxDocsHtml.Doc, null, "");
+        if (ui == null) {
+            // 装载失败（声明层没装 / 文档为空）：给一棵空树，别把 null
+            // 挂进窗口——后面的 Find 全是空指针。
+            Console.WriteLine("WX_DOCS: 文档页文档装载失败");
+            return;
+        }
+        ui.DockFill();
+        this.Add(ui);
+
+        // 左栏空间清单（标准库 ListView；行模板是代码建的控件）。
+        Control spaceHost = ui.Find("DocSpaceHost");
+        if (spaceHost != null) {
+            spaceList = new ListView<WxDocSpace>(WxDocSpaceRow.Of);
+            spaceList.Class = "wxlist grow";
+            spaceList.Bind(spaces);
+            spaceList.OnSelect(() => { this.PickSpace(spaceList.SelectedIndex()); });
+            spaceHost.Add(spaceList);
+        }
+
+        // 左栏文档清单。
+        Control listHost = ui.Find("DocListHost");
+        if (listHost != null) {
+            docList = new ListView<WxDocItem>(WxDocRow.Of);
+            docList.Class = "wxlist grow";
+            docList.Bind(docs);
+            docList.OnSelect(() => { this.PickDoc(docList.SelectedIndex()); });
+            listHost.Add(docList);
+        }
+
+        // 右栏版本历史。
+        Control verHost = ui.Find("DocVerHost");
+        if (verHost != null) {
+            verList = new ListView<WxDocVersion>(WxDocVersionRow.Of);
+            verList.Class = "wxlist grow";
+            verList.Bind(versions);
+            // 选中版本只提示，不自动回滚——回滚是写操作，得用户点「回滚」。
+            verList.OnSelect(() => {
+                int idx = verList.SelectedIndex();
+                if (idx < 0 || idx >= versions.Count) { return; }
+                this.Foot("已选 v" + versions[idx].version
+                    + "（回滚会写成一个新版本）");
+            });
+            verHost.Add(verList);
+        }
+
+        // 正文：网页视图（服务端渲染的 HTML）。
+        webHost = ui.Find("DocWebHost");
+        if (webHost != null) {
+            webBox = new WebViewBox();
+            webBox.Class = "wxdocweb grow";
+            webHost.Add(webBox);
+        }
+
+        // 正文降级：纯文本（网页视图不可用时用）。
+        textHost = ui.Find("DocTextHost");
+        if (textHost != null) {
+            fallback = new TextArea();
+            fallback.Class = "wxdoctext grow";
+            fallback.ReadOnly(true);
+            textHost.Add(fallback);
+        }
+
+        title = ui.Find("DocTitle");
+        meta = ui.Find("DocMeta");
+        foot = ui.Find("DocFoot");
+        btnEdit = ui.Find("DocEditBtn");
+        btnSave = ui.Find("DocSaveBtn");
+        btnCancel = ui.Find("DocCancelBtn");
+        btnRevert = ui.Find("DocRevertBtn");
+        btnDelete = ui.Find("DocDeleteBtn");
+        titleBox = (Input)ui.Find("DocTitleBox");
+        editor = (TextArea)ui.Find("DocEditor");
+
+        binder = new ModelBinder();
+        binder.Handle("doc-reload", () => { this.LoadSpaces(); });
+        binder.Handle("doc-new", () => { this.NewDoc(); });
+        binder.Handle("doc-edit", () => { this.Edit(); });
+        binder.Handle("doc-save", () => { this.Save(); });
+        binder.Handle("doc-cancel", () => { this.CancelEdit(); });
+        binder.Handle("doc-revert", () => { this.Revert(); });
+        binder.Handle("doc-delete", () => { this.Delete(); });
+        binder.SetRoot(ui, null);
+        binder.Wire();
+        ModelHosts.Register(app, binder);
+
+        this.SetMode(false);
+    }
+
+    // 进页重拉：文档是别人也会改的内容，进页面就是最新的。
+    void OnShow() {
+        this.LoadSpaces();
+    }
+
+    // ---- 数据 -----------------------------------------------------------
+
+    // 拉空间清单；顺带把第一个空间选中（原来选中的还在就接着用）。
+    void LoadSpaces() {
+        if (!WxNet.LoggedIn()) { return; }
+        WxNetReq r = WxNet.NewReq();
+        WxNet.ApiGet(r, "/api/oa/docs/spaces", () => {
+            try {
+                if (!WxNet.OkOf(r)) {
+                    this.Foot("加载空间失败：" + WxNet.ErrOf(r));
+                    return;
+                }
+                JsonValue d = WxNet.DataOf(r);
+                if (d == null) {
+                    this.Foot("加载空间失败：应答里没有数据");
+                    return;
+                }
+                spaces.Clear();
+                JsonValue arr = d.Get("spaces");
+                int n = arr == null ? 0 : arr.Count();
+                for (int i = 0; i < n; i = i + 1) {
+                    spaces.Add(WxDocSpace.FromJson(arr.At(i)));
+                }
+                if (spaceList != null) { spaceList.Bind(spaces); }
+                if (this.FindSpace(curSpace) != null) {
+                    this.OpenSpace(curSpace);
+                } else if (n > 0) {
+                    this.PickSpace(0);
+                } else {
+                    curSpace = "";
+                    curDoc = "";
+                    docs.Clear();
+                    versions.Clear();
+                    if (docList != null) { docList.Bind(docs); }
+                    if (verList != null) { verList.Bind(versions); }
+                    this.SetMode(false);
+                    if (title != null) { title.SetProp("text", "还没有文档空间"); }
+                    if (meta != null) { meta.SetProp("text", ""); }
+                    this.Foot("没有可看的空间");
+                }
+            } catch (Exception ex) { this.Foot(ex.Message); }
+        });
+    }
+
+    // 点左栏一个空间：拉它的文档清单。
+    void PickSpace(int index) {
+        if (index < 0 || index >= spaces.Count) { return; }
+        this.OpenSpace(spaces[index].id);
+    }
+
+    void OpenSpace(string id) {
+        if (id == "") { return; }
+        curSpace = id;
+        WxNetReq r = WxNet.NewReq();
+        WxNet.ApiGet(r, "/api/oa/docs/list?spaceId=" + Encoding.UrlEncode(id), () => {
+            try {
+                if (!WxNet.OkOf(r)) {
+                    this.Foot("加载文档失败：" + WxNet.ErrOf(r));
+                    return;
+                }
+                JsonValue d = WxNet.DataOf(r);
+                if (d == null) {
+                    this.Foot("加载文档失败：应答里没有数据");
+                    return;
+                }
+                docs.Clear();
+                JsonValue arr = d.Get("items");
+                int n = arr == null ? 0 : arr.Count();
+                for (int i = 0; i < n; i = i + 1) {
+                    docs.Add(WxDocItem.FromJson(arr.At(i)));
+                }
+                if (docList != null) { docList.Bind(docs); }
+                // 原来选中的文档还在就接着用（可能被别人删了）。
+                if (this.FindDoc(curDoc) != null) {
+                    this.OpenDoc(curDoc);
+                } else if (n > 0) {
+                    this.PickDoc(0);
+                } else {
+                    curDoc = "";
+                    versions.Clear();
+                    if (verList != null) { verList.Bind(versions); }
+                    this.SetMode(false);
+                    if (title != null) { title.SetProp("text", "这个空间还没有文档"); }
+                    if (meta != null) { meta.SetProp("text", ""); }
+                    this.Foot("点「新建」写一篇");
+                }
+            } catch (Exception ex) { this.Foot(ex.Message); }
+        });
+    }
+
+    // 点左栏一篇文档：拉正文与版本。
+    void PickDoc(int index) {
+        if (index < 0 || index >= docs.Count) { return; }
+        this.OpenDoc(docs[index].id);
+    }
+
+    void OpenDoc(string id) {
+        if (id == "") { return; }
+        curDoc = id;
+        draft = false;
+        WxNetReq r = WxNet.NewReq();
+        WxNet.ApiGet(r, "/api/oa/docs/doc?id=" + Encoding.UrlEncode(id), () => {
+            try {
+                if (!WxNet.OkOf(r)) {
+                    this.Foot("打开文档失败：" + WxNet.ErrOf(r));
+                    return;
+                }
+                JsonValue d = WxNet.DataOf(r);
+                if (d == null) {
+                    this.Foot("打开文档失败：应答里没有数据");
+                    return;
+                }
+                baseVersion = Convert.ToInt32(d.Str("version", "0"));
+                curHtml = d.Str("html", "");
+                curText = d.Str("text", "");
+                curTitle = d.Str("title", "未命名文档");
+                if (title != null) { title.SetProp("text", curTitle); }
+                if (meta != null) {
+                    meta.SetProp("text", "v" + d.Str("version", "0")
+                        + " · " + d.Str("editor", "")
+                        + " · " + d.Str("updatedAt", "")
+                        + " · " + d.Str("spaceName", ""));
+                }
+                if (editor != null) { editor.SetText(d.Str("content", "")); }
+                if (titleBox != null) { titleBox.SetText(d.Str("title", "")); }
+                this.SetMode(false);
+                this.ShowBody();
+                this.LoadVersions(id);
+                this.Foot("就绪");
+            } catch (Exception ex) { this.Foot(ex.Message); }
+        });
+    }
+
+    // 拉版本历史。
+    void LoadVersions(string id) {
+        WxNetReq r = WxNet.NewReq();
+        WxNet.ApiGet(r, "/api/oa/docs/versions?id=" + Encoding.UrlEncode(id), () => {
+            try {
+                if (!WxNet.OkOf(r)) {
+                    this.Foot("加载版本失败：" + WxNet.ErrOf(r));
+                    return;
+                }
+                JsonValue d = WxNet.DataOf(r);
+                if (d == null) { return; }
+                versions.Clear();
+                JsonValue arr = d.Get("items");
+                int n = arr == null ? 0 : arr.Count();
+                for (int i = 0; i < n; i = i + 1) {
+                    versions.Add(WxDocVersion.FromJson(arr.At(i)));
+                }
+                if (verList != null) { verList.Bind(versions); }
+            } catch (Exception ex) { this.Foot(ex.Message); }
+        });
+    }
+
+    // ---- 正文显示 -------------------------------------------------------
+
+    // 显示正文：网页视图能跑就显示服务端渲染的 HTML，否则降级成纯文本。
+    void ShowBody() {
+        if (webBox == null) { this.ShowText(); return; }
+        webBox.visible = true;
+        if (textHost != null) { textHost.visible = false; }
+        this.LoadBodyAsync();
+    }
+
+    // 装载正文到网页视图。
+    //
+    // 踩过的坑：网页视图的原生控制器（core）是**异步**创建的——视图建好
+    // ≠ 引擎就绪。引擎没就绪时直接 LoadHtml 会被静默丢掉（页面停在
+    // about:blank，正文区一片空白且不报任何错，只能靠 Eval 读
+    // location.href 才看出来）。库侧已改成把就绪前的 HTML 载荷挂起、
+    // 就绪后再导航；这里再显式等一次就绪，顺带判定引擎是不是彻底不可用
+    // （机器没装 WebView2 运行时）——那种情况降级成纯文本，不留黑屏。
+    async void LoadBodyAsync() {
+        if (webBox == null) { return; }
+        WebView v = webBox.View();
+        if (!v.IsSupported()) {
+            // 视图还没建（首帧之前）：先建出来（幂等，首帧 Render 也会建）。
+            if (host == null) { return; }
+            v.EnsureCreated(host);
+            if (!v.IsSupported()) { this.ShowText(); return; }
+        }
+        bool ready = await v.EnsureReadyAsync(8000);
+        if (!ready) { this.ShowText(); return; }
+        bodySeq = bodySeq + 1;
+        int seq = bodySeq;
+        v.LoadHtml(WxDocs.Page(curTitle, curHtml), "");
+        this.CheckBodyAsync(seq);
+    }
+
+    // 装载后的体检：网页视图有时「引擎就绪但正文没装上」——文档还是空的
+    // （导航没生效，或被运行环境挡了）。此时降级成纯文本，别让用户对着
+    // 一片空白发呆。seq 用来作废过期检查（用户连点几篇文档时）。
+    async void CheckBodyAsync(int seq) {
+        await Task.Delay(900);
+        if (seq != bodySeq) { return; }
+        if (webBox == null) { return; }
+        string r = await webBox.View().EvalWithResultAsync(
+            "document.body ? document.body.childElementCount : 0", 2000);
+        if (r == null || r.Length == 0) { return; }
+        JsonValue v = JsonValue.ParseLenient(r);
+        if (v == null) { return; }
+        if (v.AsInt(0) > 0) { return; }
+        this.ShowText();
+    }
+
+    // 纯文本降级（网页视图不可用时）。
+    void ShowText() {
+        if (webBox != null) { webBox.visible = false; }
+        if (textHost != null) { textHost.visible = true; }
+        if (fallback != null) { fallback.SetText(curText); }
+    }
+
+    // 把服务端渲染好的正文包成一份完整网页（网页视图是独立文档，
+    // 拿不到应用的皮肤变量与样式表，版式在这里自给）。
+    static string Page(string title, string body) {
+        string t = title == null ? "" : title;
+        if (t.Length == 0) { t = "文档"; }
+        return "<!doctype html><html><head><meta charset=\"utf-8\">"
+            + "<title>" + WxDocs.Escape(t) + "</title>"
+            + "<style>body{font-family:\"Microsoft YaHei\",sans-serif;font-size:14px;"
+            + "line-height:1.75;color:#222;margin:0;padding:24px 28px;"
+            + "background:#fff;word-break:break-word}"
+            + "h1{font-size:22px;margin:0 0 12px 0;}"
+            + "h2{font-size:18px;margin:20px 0 8px 0;}"
+            + "h3{font-size:16px;margin:16px 0 6px 0;}"
+            + "p{margin:8px 0;}"
+            + "ul,ol{margin:8px 0;padding-left:24px;}"
+            + "li{margin:4px 0;}"
+            + "blockquote{margin:8px 0;padding:6px 12px;border-left:3px solid #d0d0d0;"
+            + "color:#555;background:#f7f7f7;}"
+            + "pre{background:#f5f5f5;border:1px solid #e5e5e5;padding:10px 12px;"
+            + "overflow-x:auto;border-radius:4px;}"
+            + "code{background:#f0f0f0;padding:1px 4px;border-radius:3px;"
+            + "font-family:Consolas,monospace;}"
+            + "pre code{background:none;padding:0;}"
+            + "hr{border:none;border-top:1px solid #e0e0e0;margin:16px 0;}"
+            + "a{color:#1a6fd4;}"
+            + "img{max-width:100%;}"
+            + "</style></head><body>"
+            + (body == null ? "" : body)
+            + "</body></html>";
+    }
+
+    // ---- 编辑态 ---------------------------------------------------------
+
+    // 新建一篇文档：先在本地起一份草稿（还没落库），保存时走新建路径。
+    void NewDoc() {
+        if (curSpace == "") {
+            this.Foot("先在左边选一个空间");
+            return;
+        }
+        curDoc = "";
+        draft = true;
+        baseVersion = 0;
+        if (titleBox != null) { titleBox.SetText(""); }
+        if (editor != null) { editor.SetText(""); }
+        if (title != null) { title.SetProp("text", "新建文档"); }
+        if (meta != null) { meta.SetProp("text", "保存后落库"); }
+        versions.Clear();
+        if (verList != null) { verList.Bind(versions); }
+        this.SetMode(true);
+        this.Foot("写完点保存");
+    }
+
+    // 进编辑态：把正文原文放进文本域（块语法原文，不是渲染结果）。
+    void Edit() {
+        if (curDoc == "" && !draft) {
+            this.Foot("先选一篇文档");
+            return;
+        }
+        this.SetMode(true);
+        this.Foot("编辑中");
+    }
+
+    // 取消编辑：回到阅读态，正文回到打开时的样子。
+    void CancelEdit() {
+        this.SetMode(false);
+        if (draft) {
+            // 草稿没落库：取消等于放弃，回到空态。
+            curDoc = "";
+            draft = false;
+            if (title != null) { title.SetProp("text", "未选择文档"); }
+            if (meta != null) { meta.SetProp("text", ""); }
+            if (webHost != null) { webHost.visible = false; }
+            if (textHost != null) { textHost.visible = false; }
+            this.Foot("已放弃草稿");
+            return;
+        }
+        this.ShowBody();
+        this.Foot("已取消");
+    }
+
+    // 保存：新建走 id=0，编辑走 id=curDoc + 乐观锁基准 baseVersion。
+    void Save() {
+        if (!editing) { return; }
+        string t = titleBox == null ? "" : titleBox.GetText();
+        if (t == null || t.Length == 0) {
+            this.Foot("先写个标题");
+            return;
+        }
+        string content = editor == null ? "" : editor.GetText();
+        string body = "id=" + (draft ? "0" : Encoding.UrlEncode(curDoc))
+            + "&spaceId=" + Encoding.UrlEncode(curSpace)
+            + "&title=" + Encoding.UrlEncode(t)
+            + "&content=" + Encoding.UrlEncode(content)
+            + "&baseVersion=" + Convert.ToString(baseVersion);
+        WxNetReq r = WxNet.NewReq();
+        WxNet.ApiPost(r, "/api/oa/docs/save", body, () => {
+            try {
+                if (!WxNet.OkOf(r)) {
+                    // 409 = 别人先改了：草稿留着，让用户刷新对比后重试。
+                    this.Foot("保存失败：" + WxNet.ErrOf(r));
+                    return;
+                }
+                JsonValue d = WxNet.DataOf(r);
+                string id = d == null ? "" : d.Str("id", "");
+                string ver = d == null ? "" : d.Str("version", "");
+                draft = false;
+                this.SetMode(false);
+                this.Foot("已保存 v" + ver);
+                this.OpenSpace(curSpace);
+                if (id != "") { this.OpenDoc(id); }
+            } catch (Exception ex) { this.Foot(ex.Message); }
+        });
+    }
+
+    // 回滚到选中的历史版本：历史不改写，服务端把它作为新版本写进去。
+    void Revert() {
+        if (curDoc == "") {
+            this.Foot("先选一篇文档");
+            return;
+        }
+        int idx = verList == null ? -1 : verList.SelectedIndex();
+        if (idx < 0 || idx >= versions.Count) {
+            this.Foot("先在右边选一个版本");
+            return;
+        }
+        WxDocVersion v = versions[idx];
+        string body = "id=" + Encoding.UrlEncode(curDoc)
+            + "&version=" + Encoding.UrlEncode(v.version)
+            + "&baseVersion=" + Convert.ToString(baseVersion);
+        WxNetReq r = WxNet.NewReq();
+        WxNet.ApiPost(r, "/api/oa/docs/revert", body, () => {
+            try {
+                if (!WxNet.OkOf(r)) {
+                    this.Foot("回滚失败：" + WxNet.ErrOf(r));
+                    return;
+                }
+                JsonValue d = WxNet.DataOf(r);
+                string ver = d == null ? "" : d.Str("version", "");
+                this.Foot("已回滚为新版本 v" + ver);
+                this.OpenSpace(curSpace);
+                this.OpenDoc(curDoc);
+            } catch (Exception ex) { this.Foot(ex.Message); }
+        });
+    }
+
+    // 删除当前文档。
+    void Delete() {
+        if (curDoc == "") {
+            this.Foot("先选一篇文档");
+            return;
+        }
+        WxNetReq r = WxNet.NewReq();
+        WxNet.ApiPost(r, "/api/oa/docs/delete", "id=" + Encoding.UrlEncode(curDoc), () => {
+            try {
+                if (!WxNet.OkOf(r)) {
+                    this.Foot("删除失败：" + WxNet.ErrOf(r));
+                    return;
+                }
+                curDoc = "";
+                versions.Clear();
+                if (verList != null) { verList.Bind(versions); }
+                if (title != null) { title.SetProp("text", "已删除"); }
+                if (meta != null) { meta.SetProp("text", ""); }
+                if (webHost != null) { webHost.visible = false; }
+                if (textHost != null) { textHost.visible = false; }
+                this.Foot("已删除");
+                this.OpenSpace(curSpace);
+            } catch (Exception ex) { this.Foot(ex.Message); }
+        });
+    }
+
+    // ---- helpers --------------------------------------------------------
+
+    // 读态 / 编辑态的界面切换：按钮、标题输入框、文本域、正文区。
+    // 读态下正文区默认只留网页视图——纯文本回退由 ShowBody 按网页视图
+    // 能不能跑来决定（两个都摆着会在正文区里上下叠两段）。
+    void SetMode(bool edit) {
+        editing = edit;
+        if (btnEdit != null) { btnEdit.visible = !edit; }
+        if (btnSave != null) { btnSave.visible = edit; }
+        if (btnCancel != null) { btnCancel.visible = edit; }
+        if (btnRevert != null) { btnRevert.visible = !edit; }
+        if (btnDelete != null) { btnDelete.visible = !edit; }
+        if (titleBox != null) { titleBox.visible = edit; }
+        if (editor != null) { editor.visible = edit; }
+        if (webHost != null) { webHost.visible = !edit; }
+        if (textHost != null) { textHost.visible = false; }
+    }
+
+    // HTML 文本转义（拼网页包装的 <title> 用）。
+    static string Escape(string s) {
+        if (s == null) { return ""; }
+        return Encoding.HtmlEncode(s);
+    }
+
+    WxDocSpace FindSpace(string id) {
+        if (id == "") { return null; }
+        for (int i = 0; i < spaces.Count; i = i + 1) {
+            if (spaces[i].id == id) { return spaces[i]; }
+        }
+        return null;
+    }
+
+    WxDocItem FindDoc(string id) {
+        if (id == "") { return null; }
+        for (int i = 0; i < docs.Count; i = i + 1) {
+            if (docs[i].id == id) { return docs[i]; }
+        }
+        return null;
+    }
+
+    // 状态行（错误/提示共用一行）。
+    void Foot(string msg) {
+        if (foot != null) { foot.SetProp("text", msg); }
+        if (host != null) { host.RequestRedraw(); }
+    }
+
+    override string Kind() { return "WxDocs"; }
+}

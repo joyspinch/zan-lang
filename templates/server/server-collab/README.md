@@ -448,6 +448,8 @@ every sign-in "wrong password").
 - `/api/flowagent/*` — 流程的 AI 工具分配：`defs` / `nodes?defId=` / `health` /
   `bind` / `unbind` / `toggle` / `priority` / `dispatch`（高可用派发），
   契约见下节「流程 AI 工具分配契约」
+- `/api/oa/docs/*` — 资源文档协同：`spaces` / `list?spaceId=` / `doc?id=` /
+  `versions?id=` / `save` / `revert` / `delete`，契约见下节「资源文档协同契约」
 
 ## 协作域契约（会话/成员/消息/实时事件/附件/任务已落地，其余端点未实现）
 
@@ -674,6 +676,57 @@ flow_agent_health id, tenantId, agentCode, state(healthy|degraded|down),
 客户端页 `templates/gui/gui-wechat/src/WxFlowAgent.*`：左栏流程清单，
 中栏节点链，右栏工具面板（绑定 / 解绑 / 启停 / ↑↓ 调序 + 试跑）。
 试跑走 `/api/flowagent/dispatch`，命中工具、尝试次数与降级链原样显示。
+
+## 资源文档协同契约（oaddocs）
+
+桌面客户端「文档」页（`templates/gui/gui-wechat/src/WxDocs.*`）与服务端
+文档中心（`oa_space` / `oa_doc` / `oa_doc_rev` 三表 + `Blocks` 块语法渲染）
+的对接口径。管理后台的文档中心是网页壳（`/admin/oa/docs`），桌面端不再
+做一套块语法渲染——**正文渲染只在服务端做一次**，客户端显示服务端给的
+HTML，编辑时提交块语法原文。
+
+### 端点（Bearer 令牌，路由属性派生）
+
+| 端点 | 方法 | 说明 |
+|---|---|---|
+| `/api/oa/docs/spaces` | GET | 空间清单：`{spaces:[{id,name,description,docCount}]}` |
+| `/api/oa/docs/list?spaceId=` | GET | 文档清单（`spaceId` 缺省=本租户全部）：`{total, items:[{id,spaceId,title,version,updatedAt,editor,excerpt}]}` |
+| `/api/oa/docs/doc?id=` | GET | 文档详情：`{id,spaceId,spaceName,title,content,text,version,updatedAt,editor,html}`（`content` 原文、`text` 纯文本摘要、`html` 服务端渲染结果） |
+| `/api/oa/docs/versions?id=` | GET | 版本历史：`{docId,title,current, items:[{version,title,editor,createdAt,current}]}` |
+| `/api/oa/docs/save` | POST | 保存（`id`=0 新建、`spaceId`；否则改，带 `baseVersion` 乐观锁） |
+| `/api/oa/docs/revert` | POST | 回滚（`id`、`version`、`baseVersion`）：把旧快照作为**新版本**写进去 |
+| `/api/oa/docs/delete` | POST | 删除（`id`）：受控级联删版本行 |
+
+### 协同口径
+
+- **租户闸**：读写两侧同补 `tenantId == Tenant.Cur()`。后台文档中心的读
+  路径原先只按 id 查（跨租户可见），已一并补齐。
+- **乐观锁**：`save` / `revert` 都要带 `baseVersion`（客户端打开文档时的
+  版本号），与库内 `version` 不一致就 409 拒写——客户端保留草稿并把话
+  说明白，让用户刷新对比后重试（双标签对敲场景）。
+- **版本只增不改**：每次写 `version+1` 并落一行 `oa_doc_rev` 快照；
+  `revert` 不改历史。
+- **正文是多行语义**：块语法按 `\n` 分块，读入必须走 `InRaw`（`In` 的
+  `Filter.Clean` 会剥净换行，入库即坍缩单行）；客户端提交时整段 URL
+  编码（换行编成 `%0A`）。
+- **渲染经 `Blocks`**（escape-first + 链接白名单），正文 HTML 由服务端
+  出；30KB 软上限在 `Blocks.Validate` 里。
+
+### 权限口径
+
+- 读端点（`spaces` / `list` / `doc` / `versions`）标 `PermBit.View`，
+  `save` 标 `PermBit.Create | PermBit.Update`，`revert` 标
+  `PermBit.Update`，`delete` 标 `PermBit.Delete`——**新端点必须标 Perm
+  位**，否则框架对受控 action 一律拒绝授权，只有超管用得着。
+- 角色授权的屏名是 `Api.DocsApi`（路由 action = `Api.DocsApi.<方法>`，
+  屏名取末段之前的一段）：存量部署需在「系统管理 → 角色」里显式授权。
+
+### 客户端对接
+
+客户端页 `templates/gui/gui-wechat/src/WxDocs.*`：左栏空间清单 + 该空间的
+文档清单，中间正文（读态是网页视图显示服务端 HTML，编辑态是标题输入 +
+块语法原文文本域），右栏版本历史。网页视图不可用（机器没装 WebView2
+运行时）时降级成纯文本正文，不留黑屏。
 
 ## 已知行为说明（T17 回归观察项，非缺陷）
 

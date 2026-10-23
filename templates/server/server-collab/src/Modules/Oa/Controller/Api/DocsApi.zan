@@ -1,0 +1,329 @@
+using System;
+using System.Collections.Generic;
+using System.Data.Orm;
+using System.Json;
+using System.Web;
+using ZanWeb.Model.Oa;
+using ZanWeb.Model;
+
+namespace ZanWeb.Api;
+
+/* 桌面客户端资源文档接口（gui-wechat「文档」页）：空间 / 文档 / 版本的
+   令牌端点。管理后台的文档中心（/admin/oa/docs）是网页壳，正文渲染、
+   校验、乐观锁与版本快照都是服务端这一份实现——桌面端不再做一套块语法
+   渲染：它拿服务端渲染好的 HTML 显示，编辑时提交原文。
+
+   口径：
+     - **租户闸**：读写两侧同补 tenantId == Tenant.Cur()。管理后台的读
+       路径（Docs.Read/Edit/History/Delete）没补这一层，这组端点自己补齐
+       ——客户端 API 不能靠后台那套的闸。
+     - **乐观锁**：save / revert 都要带 baseVersion（页面载入时的版本
+       号），与库内 version 不一致就 409 拒写；客户端保留草稿，让用户
+       刷新对比后重试（双标签对敲场景）。
+     - **版本只增不改**：每次写 version+1 并落一行 oa_doc_rev 快照；
+       revert 不改历史——把旧快照的内容作为**新版本**写进去。
+     - **渲染经 Blocks**（escape-first + 链接白名单），正文 html 由服务端
+       出，客户端只显示；正文是行式块语法（多行语义），读入必须走 InRaw
+       （In 会剥掉换行，入库即坍缩成一行）。 */
+[Route("api/oa/docs/[action]")]
+[Custom(Authorization = CustomAuthorization.ApiAuth)]
+[Description("资源文档")]
+public class DocsApi : ApiController {
+
+    /* ---- 读 ---- */
+
+    /* 空间清单：文档的分组容器，附每个空间的文档数。 */
+    [HttpGet]
+    [Description("空间清单")]
+    [Custom(Perm = PermBit.View)]
+    async void Spaces() {
+        List<OaSpace> spaces = await this.OaSpace
+            .Where(a => a.tenantId == Tenant.Cur())
+            .OrderBy(a => a.id).ToListAsync();
+        JsonValue items = JsonValue.NewArray();
+        for (int i = 0; i < spaces.Count; i = i + 1) {
+            OaSpace s = spaces[i];
+            int docs = await this.OaDoc
+                .Where(a => a.tenantId == Tenant.Cur() && a.spaceId == s.id)
+                .CountAsync();
+            JsonValue o = JsonValue.NewObject();
+            o.Put("id", JsonValue.NewStr(Convert.ToString(s.id)));
+            o.Put("name", JsonValue.NewStr(s.name));
+            o.Put("description", JsonValue.NewStr(s.description));
+            o.Put("docCount", JsonValue.NewStr(Convert.ToString(docs)));
+            items.Append(o);
+        }
+        JsonValue body = JsonValue.NewObject();
+        body.Put("spaces", items);
+        this.Ok(body.ToJson());
+    }
+
+    /* 文档清单：spaceId > 0 取该空间的，否则取本租户全部（按最近更新
+       排序，新改的在前）。列表只给摘要，正文走 doc 端点单独取。 */
+    [HttpGet]
+    [Description("文档清单")]
+    [Custom(Perm = PermBit.View)]
+    async void List() {
+        int spaceId = this.InInt("spaceId", 0);
+        List<OaDoc> docs;
+        if (spaceId > 0) {
+            docs = await this.OaDoc
+                .Where(a => a.tenantId == Tenant.Cur() && a.spaceId == spaceId)
+                .OrderByDescending(a => a.updatedAt).ToListAsync();
+        } else {
+            docs = await this.OaDoc
+                .Where(a => a.tenantId == Tenant.Cur())
+                .OrderByDescending(a => a.updatedAt).ToListAsync();
+        }
+        List<SysUser> users = await this.SysUser.ToListAsync();
+        JsonValue items = JsonValue.NewArray();
+        for (int i = 0; i < docs.Count; i = i + 1) {
+            OaDoc doc = docs[i];
+            JsonValue o = JsonValue.NewObject();
+            o.Put("id", JsonValue.NewStr(Convert.ToString(doc.id)));
+            o.Put("spaceId", JsonValue.NewStr(Convert.ToString(doc.spaceId)));
+            o.Put("title", JsonValue.NewStr(doc.title));
+            o.Put("version", JsonValue.NewStr(Convert.ToString(doc.version)));
+            o.Put("updatedAt", JsonValue.NewStr(Fmt.Stamp(doc.updatedAt)));
+            o.Put("editor", JsonValue.NewStr(DocsApi.NameOf(users, doc.updatedBy)));
+            o.Put("excerpt", JsonValue.NewStr(Prose.Excerpt(doc.contentText, 60)));
+            items.Append(o);
+        }
+        JsonValue body = JsonValue.NewObject();
+        body.Put("total", JsonValue.NewStr(Convert.ToString(docs.Count)));
+        body.Put("items", items);
+        this.Ok(body.ToJson());
+    }
+
+    /* 文档详情：正文原文（编辑用）+ 纯文本摘要（降级显示用）+ 服务端
+       渲染好的 HTML（阅读用）。 */
+    [HttpGet]
+    [Description("文档详情")]
+    [Custom(Perm = PermBit.View)]
+    async void Doc() {
+        int id = this.InInt("id", 0);
+        OaDoc doc = await this.OaDoc
+            .Where(a => a.id == id && a.tenantId == Tenant.Cur()).FirstAsync();
+        if (doc == null) { this.Fail(404, "文档不存在"); return; }
+        OaSpace sp = await this.OaSpace
+            .Where(a => a.id == doc.spaceId && a.tenantId == Tenant.Cur())
+            .FirstAsync();
+        List<SysUser> users = await this.SysUser.ToListAsync();
+        JsonValue body = JsonValue.NewObject();
+        body.Put("id", JsonValue.NewStr(Convert.ToString(doc.id)));
+        body.Put("spaceId", JsonValue.NewStr(Convert.ToString(doc.spaceId)));
+        body.Put("spaceName", JsonValue.NewStr(sp == null ? "" : sp.name));
+        body.Put("title", JsonValue.NewStr(doc.title));
+        body.Put("content", JsonValue.NewStr(doc.content));
+        body.Put("text", JsonValue.NewStr(doc.contentText));
+        body.Put("version", JsonValue.NewStr(Convert.ToString(doc.version)));
+        body.Put("updatedAt", JsonValue.NewStr(Fmt.Stamp(doc.updatedAt)));
+        body.Put("editor", JsonValue.NewStr(DocsApi.NameOf(users, doc.updatedBy)));
+        body.Put("html", JsonValue.NewStr(Blocks.Render(doc.content)));
+        this.Ok(body.ToJson());
+    }
+
+    /* 版本历史：按 version 倒序；当前版本标 current。只增不改。 */
+    [HttpGet]
+    [Description("版本历史")]
+    [Custom(Perm = PermBit.View)]
+    async void Versions() {
+        int id = this.InInt("id", 0);
+        OaDoc doc = await this.OaDoc
+            .Where(a => a.id == id && a.tenantId == Tenant.Cur()).FirstAsync();
+        if (doc == null) { this.Fail(404, "文档不存在"); return; }
+        List<OaDocRev> revs = await this.OaDocRev
+            .Where(a => a.docId == doc.id && a.tenantId == Tenant.Cur())
+            .OrderByDescending(a => a.version).ToListAsync();
+        List<SysUser> users = await this.SysUser.ToListAsync();
+        JsonValue items = JsonValue.NewArray();
+        for (int i = 0; i < revs.Count; i = i + 1) {
+            OaDocRev rev = revs[i];
+            JsonValue o = JsonValue.NewObject();
+            o.Put("version", JsonValue.NewStr(Convert.ToString(rev.version)));
+            o.Put("title", JsonValue.NewStr(rev.title));
+            o.Put("editor", JsonValue.NewStr(DocsApi.NameOf(users, rev.editorId)));
+            o.Put("createdAt", JsonValue.NewStr(Fmt.Stamp(rev.createdAt)));
+            o.Put("current", JsonValue.NewStr(rev.version == doc.version ? "1" : ""));
+            items.Append(o);
+        }
+        JsonValue body = JsonValue.NewObject();
+        body.Put("docId", JsonValue.NewStr(Convert.ToString(doc.id)));
+        body.Put("title", JsonValue.NewStr(doc.title));
+        body.Put("current", JsonValue.NewStr(Convert.ToString(doc.version)));
+        body.Put("items", items);
+        this.Ok(body.ToJson());
+    }
+
+    /* ---- 写 ---- */
+
+    /* 保存文档：id > 0 是改（乐观锁），id = 0 是新建（要 spaceId）。
+       每次写 version+1 并落一条版本快照。 */
+    [HttpPost]
+    [Description("保存文档")]
+    [Custom(Perm = PermBit.Create | PermBit.Update)]
+    async void Save() {
+        int id = this.InInt("id", 0);
+        int baseVersion = this.InInt("baseVersion", 0);
+        int spaceId = this.InInt("spaceId", 0);
+        string title = this.Need("title", "文档标题");
+        if (title.Length == 0) { this.Fail(400, "请填写文档标题"); return; }
+        /* 正文是多行语义（行式块语法按 \n 分块）：In 的 Filter.Clean 会
+           剥净 \r\n，入库即坍缩单行——必须走 InRaw 保留原始换行。 */
+        string content = this.InRaw("content");
+        string err = Blocks.Validate(content);
+        if (err.Length > 0) { this.Fail(400, err); return; }
+        string norm = Blocks.Normalize(content);
+        string text = Blocks.TextOf(norm);
+        SysUser me = await this.Me();
+        long now = WebApp.NowSeconds();
+        if (id > 0) {
+            OaDoc doc = await this.OaDoc
+                .Where(a => a.id == id && a.tenantId == Tenant.Cur()).FirstAsync();
+            if (doc == null) { this.Fail(404, "文档不存在"); return; }
+            /* 乐观锁：版本不一致 = 别人的改动已在库里落地，本提交作废。 */
+            if (doc.version != baseVersion) {
+                this.Fail(409, "文档已被他人修改（当前 v"
+                    + Convert.ToString(doc.version) + "），请刷新对比后重试");
+                return;
+            }
+            int ver = doc.version + 1;
+            int n = await this.OaDoc.Update()
+                .Set(a => a.title, title)
+                .Set(a => a.content, norm)
+                .Set(a => a.contentText, text)
+                .Set(a => a.version, ver)
+                .Set(a => a.updatedBy, me.id)
+                .Set(a => a.updatedAt, now)
+                .Where(a => a.id == id && a.tenantId == Tenant.Cur())
+                .ExecuteAffrowsAsync();
+            if (n <= 0) { this.Fail(404, "文档不存在"); return; }
+            await this.Snapshot(id, ver, title, norm, me.id, now);
+            JsonValue body = JsonValue.NewObject();
+            body.Put("id", JsonValue.NewStr(Convert.ToString(id)));
+            body.Put("version", JsonValue.NewStr(Convert.ToString(ver)));
+            body.Put("title", JsonValue.NewStr(title));
+            this.Ok(body.ToJson());
+            return;
+        }
+        OaSpace sp = await this.OaSpace
+            .Where(a => a.id == spaceId && a.tenantId == Tenant.Cur()).FirstAsync();
+        if (sp == null) { this.Fail(400, "请选择有效空间"); return; }
+        OaDoc nd = new OaDoc();
+        nd.tenantId = Tenant.Cur();
+        nd.spaceId = spaceId;
+        nd.title = title;
+        nd.content = norm;
+        nd.contentText = text;
+        nd.version = 1;
+        nd.updatedBy = me.id;
+        nd.createdAt = now;
+        nd.updatedAt = now;
+        int newId = await this.OaDoc.Insert(nd).ExecuteIdentityAsync();
+        if (newId <= 0) { this.Fail(400, "保存失败"); return; }
+        await this.Snapshot(newId, 1, title, norm, me.id, now);
+        JsonValue body2 = JsonValue.NewObject();
+        body2.Put("id", JsonValue.NewStr(Convert.ToString(newId)));
+        body2.Put("version", JsonValue.NewStr("1"));
+        body2.Put("title", JsonValue.NewStr(title));
+        this.Ok(body2.ToJson());
+    }
+
+    /* 回滚到某个历史版本：历史不改写——把旧快照的内容作为新版本写进去
+       （version+1，并再落一条快照）。同样带乐观锁（baseVersion）。 */
+    [HttpPost]
+    [Description("回滚文档版本")]
+    [Custom(Perm = PermBit.Update)]
+    async void Revert() {
+        int id = this.InInt("id", 0);
+        int version = this.InInt("version", 0);
+        int baseVersion = this.InInt("baseVersion", 0);
+        OaDoc doc = await this.OaDoc
+            .Where(a => a.id == id && a.tenantId == Tenant.Cur()).FirstAsync();
+        if (doc == null) { this.Fail(404, "文档不存在"); return; }
+        if (doc.version != baseVersion) {
+            this.Fail(409, "文档已被他人修改（当前 v"
+                + Convert.ToString(doc.version) + "），请刷新对比后重试");
+            return;
+        }
+        OaDocRev rev = await this.OaDocRev
+            .Where(a => a.docId == doc.id && a.tenantId == Tenant.Cur()
+                && a.version == version).FirstAsync();
+        if (rev == null) { this.Fail(404, "该版本不存在"); return; }
+        SysUser me = await this.Me();
+        long now = WebApp.NowSeconds();
+        int ver = doc.version + 1;
+        int n = await this.OaDoc.Update()
+            .Set(a => a.title, rev.title)
+            .Set(a => a.content, rev.content)
+            .Set(a => a.contentText, Blocks.TextOf(rev.content))
+            .Set(a => a.version, ver)
+            .Set(a => a.updatedBy, me.id)
+            .Set(a => a.updatedAt, now)
+            .Where(a => a.id == id && a.tenantId == Tenant.Cur())
+            .ExecuteAffrowsAsync();
+        if (n <= 0) { this.Fail(404, "文档不存在"); return; }
+        await this.Snapshot(id, ver, rev.title, rev.content, me.id, now);
+        JsonValue body = JsonValue.NewObject();
+        body.Put("id", JsonValue.NewStr(Convert.ToString(id)));
+        body.Put("version", JsonValue.NewStr(Convert.ToString(ver)));
+        body.Put("title", JsonValue.NewStr(rev.title));
+        this.Ok(body.ToJson());
+    }
+
+    /* 删除文档：闸后显式受控级联删版本行（不靠数据库外键）。 */
+    [HttpPost]
+    [Description("删除文档")]
+    [Custom(Perm = PermBit.Delete)]
+    async void Delete() {
+        int id = this.InInt("id", 0);
+        OaDoc doc = await this.OaDoc
+            .Where(a => a.id == id && a.tenantId == Tenant.Cur()).FirstAsync();
+        if (doc == null) { this.Fail(404, "文档不存在"); return; }
+        int _r = await this.OaDocRev.Delete()
+            .Where(a => a.docId == doc.id && a.tenantId == Tenant.Cur())
+            .ExecuteAffrowsAsync();
+        int n = await this.OaDoc.Delete()
+            .Where(a => a.id == doc.id && a.tenantId == Tenant.Cur())
+            .ExecuteAffrowsAsync();
+        if (n <= 0) { this.Fail(404, "文档不存在"); return; }
+        JsonValue body = JsonValue.NewObject();
+        body.Put("ok", JsonValue.NewStr("1"));
+        this.Ok(body.ToJson());
+    }
+
+    /* ---- helpers ---- */
+
+    /* 当前登录账号（ApiAuth 下 uid 必在；查不到即 401——token 失效等）。
+       与 NotifyApi.Me 同款（基类无此件，各 Api 控制器自带）。 */
+    private async SysUser Me() {
+        SysUser me = await this.SysUser
+            .Where(a => a.id == Filter.ToInt(this.uid, 0)).FirstAsync();
+        if (me == null || me.status != 1) {
+            this.Fail(401, "1001", "账号不可用，请重新登录");
+        }
+        return me;
+    }
+
+    /* 落一条版本快照（oa_doc_rev）。 */
+    private async void Snapshot(int docId, int version, string title,
+            string content, int editorId, long now) {
+        OaDocRev rev = new OaDocRev();
+        rev.tenantId = Tenant.Cur();
+        rev.docId = docId;
+        rev.version = version;
+        rev.title = title;
+        rev.content = content;
+        rev.editorId = editorId;
+        rev.createdAt = now;
+        int _i = await this.OaDocRev.Insert(rev).ExecuteIdentityAsync();
+    }
+
+    /* 编辑人昵称：本租户用户表整表取回循环匹配（模板规模小，免 join）。 */
+    private static string NameOf(List<SysUser> users, int id) {
+        for (int i = 0; i < users.Count; i = i + 1) {
+            if (users[i].id == id) { return users[i].nickname; }
+        }
+        return "";
+    }
+}
