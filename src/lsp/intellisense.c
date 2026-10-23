@@ -892,6 +892,10 @@ static void intel_ast_callable(intel_ast_ctx_t *c, const zan_ast_node_t *n,
         intel_ast_text(pname, sizeof(pname), p->param.name);
         if (i) intel_ast_append(sig, sizeof(sig), ", ");
         intel_ast_append(sig, sizeof(sig), p->param.by_ref == 1 ? "ref " : p->param.by_ref == 2 ? "out " : p->param.is_params ? "params " : "");
+        /* A443 族：扩展方法的 `this T` 接收者要进签名——否则悬停/签名帮助
+         * 与 --emit-symbols 的口径（`bool Remove(this List<T> src, T item)`）
+         * 对不上，补全侧也认不出这是个扩展方法。 */
+        intel_ast_append(sig, sizeof(sig), p->param.is_this ? "this " : "");
         intel_ast_append(sig, sizeof(sig), ptype);
         intel_ast_append(sig, sizeof(sig), " ");
         intel_ast_append(sig, sizeof(sig), pname);
@@ -1764,6 +1768,57 @@ int intel_complete_members_pos_ex(intellisense_t *is, intellisense_t *project,
                     break;
                 }
             }
+        }
+    }
+
+    /* A443 族：扩展方法（`this T` 接收者）的声明类是扩展类
+     * （ListExtensions），上面的成员走查按 `parent == 接收者类名` 过滤，
+     * 永远轮不到它们——List.Remove/List.Sort 编译器接受、运行正确，
+     * 补全却补不出。按签名首参（"this <Type>"）匹配接收者类型补齐。
+     * 口径与 binder 的 ext_receiver_match 一致取基名（泛型实参参与匹配，
+     * 基名兜底）。 */
+    for (int pass = 0; pass < 2 && is->completion_count < INTEL_MAX_COMPLETIONS; pass++) {
+        intellisense_t *tab = pass == 0 ? is : project;
+        if (!tab) continue;
+        for (int i = 0; i < tab->symbol_count && is->completion_count < INTEL_MAX_COMPLETIONS; i++) {
+            isym_t *sym = &tab->symbols[i];
+            if (sym->kind != ISYM_METHOD || !sym->is_static) continue;
+            /* signature 是完整签名（"static bool ListExtensions.Remove(this
+             * List<T> src, T item)"），参数表段以 "(this " 开头才认扩展。 */
+            const char *params = strstr(sym->signature, "(this ");
+            if (!params) continue;
+            char ext_recv[128];
+            {
+                const char *p = params + 6;
+                const char *e = strchr(p, ' ');
+                size_t n = e ? (size_t)(e - p) : strlen(p);
+                if (n >= sizeof(ext_recv)) n = sizeof(ext_recv) - 1;
+                memcpy(ext_recv, p, n);
+                ext_recv[n] = '\0';
+            }
+            { char *lt = strchr(ext_recv, '<'); if (lt) *lt = '\0'; }
+            if (!ext_recv[0]) continue;
+            /* 基名匹配：接收者 `List<int>` 与首参 `this List<T>` /
+             * `this List<int>` 都命中（泛型实参的精确过滤交给编译器）。 */
+            if (_strnicmp(ext_recv, bare_type, strlen(bare_type)) != 0) continue;
+            if (plen > 0 && _strnicmp(sym->name, prefix, plen) != 0) continue;
+
+            bool dup = false;
+            for (int k = 0; k < is->completion_count; k++) {
+                if (strcmp(is->completions[k].label, sym->name) == 0) { dup = true; break; }
+            }
+            if (dup) continue;
+
+            completion_t *c = &is->completions[is->completion_count++];
+            strncpy(c->label, sym->name, sizeof(c->label) - 1);
+            snprintf(c->insert_text, sizeof(c->insert_text), "%s(", sym->name);
+            if (sym->signature[0])
+                strncpy(c->detail, sym->signature, sizeof(c->detail) - 1);
+            else
+                snprintf(c->detail, sizeof(c->detail), "%s.%s", sym->parent, sym->name);
+            strncpy(c->doc, sym->doc, sizeof(c->doc) - 1);
+            c->kind = ISYM_METHOD;
+            c->sort_priority = 1;   /* 扩展方法排在自有成员之后 */
         }
     }
 

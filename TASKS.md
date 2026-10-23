@@ -294,6 +294,19 @@
     A463 拒绝），真方法的参数表表达不了这些，**没有**给 object 加重载。
 - 追加（2026-10-23，自 A526 移入）：`--api`/`--emit-symbols` 对内建成员覆盖不全——
   `List.Remove` 查不到但存在，与 Convert.ToString 同族（特判实现了、成员表没登记）。
+  **已修（2026-10-24，同日）**：定位与预想不同——`List.Remove`/`Sort`/`GetRange`
+  是 `stdlib/System/ListExtensions.zan` 的**扩展方法**（真声明、编译器走
+  `find_extension_method` 常规路径，不是特判），`--emit-symbols` 本来就有。
+  缺口在 **LSP 成员补全**：走查按 `parent == 接收者类名` 过滤，扩展方法的
+  parent 是 `ListExtensions`，永远轮不到。修法（src/lsp/intellisense.c 两处）：
+  ① `intel_ast_callable` 给签名补 `this ` 前缀（`p->param.is_this` 旗标早就在，
+  只是没吐，悬停/签名帮助口径与 emit-symbols 对齐）；②
+  `intel_complete_members_pos_ex` 尾部加扩展 pass——static 方法、参数表段
+  `strstr("(this ")`、首参类型剥泛型后与接收者基名匹配（口径同 binder 的
+  ext_receiver_match 基名兜底），去重后排序在自有成员之后。验证：直连引擎
+  驱动（_scratch/intel_ext_test.c）`List<int>.` 补全 15 项（12 内建 +
+  Remove/GetRange/Sort 3 扩展）、前缀 "Rem" 过滤正确；lsp_integration_utf16
+  单测绿。
 
 - 现象：
   - `stdlib/System/Convert.zan` 里**没有** `ToString`（只有 Base64 / Hex 那几个）；
