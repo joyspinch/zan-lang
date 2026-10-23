@@ -23,6 +23,10 @@
 > 都落到 `%TEMP%\zan_crash.log`；write_record 档与这两档共用同一取路帮手
 > （栈溢出类崩溃 SEH 自身饿死，物理不可达）。
 > A532 复核 zan-lsp PE `SizeOfStackReserve == 0x2000000`，与 zanc 同值。
+> A533 同批闭环（代码+conformance+README）：ToYaml 锚点/别名感知写出——身份引用计数预扫
+> （内建字典非字符串键即指针哈希），首访发 `&aN`、重访发 `*aN`；447 字符 12 层三叉
+> 炸弹输出 442 字符且幂等往返；空容器复制、环显式报错（读侧锚点节点收尾才登记，
+> 前向引用读不回）。
 >
 > 2026-10-22 平账：移出 48 条已闭账条目（A390/A393/A394/A395/A396/A397/A399/
 > A400/A401/A402/A403/A404/A405/A406/A407/A413/A415/A416/A428/A431/A432/A437/
@@ -44,6 +48,9 @@
     曾 `a[9]=99` 钳位写进 a[0]（静默覆盖）；现在元素保住（11 22 33）。
     未覆盖：多维数组 store（emit_mdarray_elem_ptr 内部仍钳位）、字段/成员
     链形状的部分位点，见待办。
+- **软失败取值实测（2026-10-23，A531 判定器顺带）**：数组远越界**读**软失败
+  返 0 继续；整数**除零**软失败返回**被除数**（`123456/0` 打出 123456，非 0
+  非抛）——软失败槽位的取值口径尚未统一，收口①时一并定。
 - 待办：① 全线可 catch 异常通道（对齐 C#，最终口径）；② 多维数组与剩余
 - **自举半边·List/string 越界写补齐（2026-10-23，goal round 9）**：
   List 的 zlist_set 曾无界（OOB 直接写数据区 + 对垃圾值做 retain/release）
@@ -360,7 +367,25 @@
   拼接/条件全路径 char 渲染）；string 实例方法回归 ABC/abc/3、
   `c.IsDigit()` 实例调用仍正确拒绝。
 - 探针：`_scratch/csaudit/string/v_charcls{,2,4,5}.zan`。
-- 待办：其余件（StringSplitOptions、格式串、operator++、multicast、
+- **两侧同修（2026-10-23，goal round 10）**：`"a" + null`、`null + "b"` 与 `$"x{null}y"` 字符串拼接/插值 null 字面量。
+  此前宿主 checker 判 null 字面量为 object，在二元 `+` 与插值时按
+  `!type_is_concatable` 当场拒绝（而运行时/发射端早已有 `emit_str_nonnull`
+  把 null 视为 `""`）；自举 checker 未阻拦，但 irgen 的 `ToCStr` 把
+  `v.op == "null"` 漏进整数 itoa 分支产出非法 IR（`snprintf(..., i64 null)`
+  过不了 clang）。两端对齐：宿主 checker 对 `+`（一侧为 string、另一侧为
+  null 字面量或其强转）及插值部件中的 null 字面量放行；自举 `ToCStr`
+  在 `v.op == "null"` 时返回空串字面量 `@.s...`（长度 0）。`null + null`
+  和非 string 对象的拼接（`new object() + "a"`）两端维持正确报错。
+- 复验：宿主探针 `"a" + null`→"a"、`null + "b"`→"b"、`"a" + null + "c"`→"ac"、
+  `$"x{null}y"`→"xy"、`"start_" + (null) + "_end"`→"start__end"（长度全对，
+  回归数值/bool/char 拼接无误）；自举 `gen1` 产物 IR 合法、`clang -c`
+  通过；conformance 闸门新增 `string_concat_null`（case_string_concat_null
+  与 determinism 双绿）。
+- 待办：其余件（StringSplitOptions、
+  Array 静态类、object== 引用比较、foreach-Dict 形状）按需逐个；
+  Stack/Queue/HashSet 的 Count 属性化经评估**搁置**（Zan 语法规则禁止带 `()` 调用属性，
+  全仓含大量 conformance 用例存在 1,725 处 `.Count()` 调用，直接改为属性会引起大面积断裂；
+  须待属性兼任方法调用或统一引入 LINQ 扩展方法后再议）。
 - **两侧同修（2026-10-23，goal round 9）**：自定义类型 operator ++/--。
   两侧 parser 的 op 命名表都缺 ++/--（宿主落 op_unknown、自举同样）——
   补 op_inc/op_dec。宿主 emit_incdec_expr 非数值槽位先试
@@ -1047,7 +1072,7 @@
   `Math.Sqrt(2.5m)` **照收**、`Convert.ToInt32(2.5m)` 给 2。A445 只在自举侧
   补了"按静态类型分流"的守卫，这两条 decimal 差异要等本条目把 decimal
   还原成独立类型才会消失。
-### [ ] A482 「void 臂的三元表达式」两后端都降成非法 IR（`phi void`）——2026-10-23 更正：宿主同病
+### [x] A482 「void 臂的三元表达式」两后端都降成非法 IR（`phi void`）——2026-10-23 更正：宿主同病
 
 - 现象（2026-10-21 修 A481 时被差分门照出来，用例
   `tests/conformance/nullable_user_type.zan`）：宿主编译运行正常；自举 gen1
@@ -1542,16 +1567,6 @@
   （42，Convert 是静态内建有成员表——本条登记时误写它也挂，更正）；
   正例回归 p11/v_parse_ok 全绿。
 - 探针：`_scratch/csaudit/numeric/{v_chain2,v_chain5,v_chain6}.zan`。
-
-### [ ] A533 Yaml.ToYaml 对别名 DAG 指数放大（693B → 69MB）
-- 来源：审计 P2-28（实测）。YamlParser 把 `&a0`/`*a0` 还原成共享节点
-  实例；ToYaml 无共享检测，递归复制把 3^n 的 DAG 展开成字节——693 字节
-  别名炸弹 ToYaml 出 69,353,102 字节（内存/带宽 DoS）。
-- 方向：正确修法是锚点/别名感知输出——预扫各节点引用计数（预扫本身
-  要用"按对象引用为键"的集合防指数走），首访发 `&aN`、重访发 `*aN`。
-  前置：确认 `Dict<JsonValue,int>` 对引用键的哈希语义（identity），
-  或给序列化器建身份映射基建；不要用输出预算截断——那会拒掉 20 万键
-  的合法大文档。
 
 ### [ ] A534 PoolCore<T> 值类型元素比较生成非法 IR（icmp eq ptr,i32）
 - 来源：审计 P2-31（实测）。`PoolCore<int>` 调 RemoveBorrowed

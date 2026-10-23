@@ -2652,6 +2652,14 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
         switch (expr->binary.op) {
         case TK_PLUS:
             if (left->kind == TYPE_STRING || right->kind == TYPE_STRING) {
+                zan_ast_node_t *other_node = left->kind == TYPE_STRING ? expr->binary.right : expr->binary.left;
+                zan_ast_node_t *raw_other = other_node;
+                while (raw_other && raw_other->kind == AST_CAST_EXPR)
+                    raw_other = raw_other->cast.expr;
+                if (raw_other && raw_other->kind == AST_NULL_LITERAL) {
+                    no_runtime_reject(c, expr->loc, "string concatenation");
+                    return c->binder->type_string;
+                }
                 zan_type_t *other = left->kind == TYPE_STRING ? right : left;
                 if (!type_is_concatable(other)) {
                     zan_diag_emit(c->diag, DIAG_ERROR, expr->loc,
@@ -3129,7 +3137,13 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
     case AST_STRING_INTERP: {
         no_runtime_reject(c, expr->loc, "string interpolation");
         for (int i = 0; i < expr->string_interp.parts.count; i++) {
-            zan_type_t *pt = zan_checker_check_expr(c, expr->string_interp.parts.items[i]);
+            zan_ast_node_t *part = expr->string_interp.parts.items[i];
+            zan_ast_node_t *raw_part = part;
+            while (raw_part && raw_part->kind == AST_CAST_EXPR)
+                raw_part = raw_part->cast.expr;
+            zan_type_t *pt = zan_checker_check_expr(c, part);
+            if (raw_part && raw_part->kind == AST_NULL_LITERAL)
+                continue;
             if (!type_is_concatable(pt)) {
                 zan_diag_emit(c->diag, DIAG_ERROR, expr->loc,
                               "cannot interpolate '%s' -- convert the operand explicitly instead of formatting the reference",
