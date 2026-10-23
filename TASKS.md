@@ -174,21 +174,16 @@
   A510 位宽口径在更深处仍有一层 gen1/gen2 分歧未定位，固定点门本树仍红。
 - 探针：`_scratch/csaudit/numeric/{p03,p04,p12}`。
 
-### [~] A511 decimal 三处语义缺口：除法截断、与 double 混算垃圾、WriteLine(decimal) 编译崩溃
+### [x] A511 decimal 三处语义缺口：除法截断、与 double 混算垃圾、WriteLine(decimal) 编译崩溃
 - **宿主侧已修（2026-10-23）**：① `rt_decimal.c` 除法重写——精度目标 28 位 scale +
   末位四舍五入（远离零）+ 精确商去尾零（`1m/3m`=28 位、`2m/3m`尾位…6667、`10m/4m`=2.5）；
   ② checker 对 decimal↔float/double 混合算术当场报错（CS0019 口径，promote_numeric
   的静默 type_error 不再放行）；③ WriteLine 分派补 decimal 分支（`emit_to_cstr_u`
   转托管串后按字符串打印）。三探针复验通过；12 平台 `zanrt_decimal.o` 已同代重建。
-- 待办：自举半边收口见下（除法运行时是同一份 C 对象、天然对齐——但自举的
-  m 字面量算术根本不走它，见模型限制）。
-- **自举半边（2026-10-23，模型内对齐）**：② checker 补字面量形态混算拒收
-  （`0.5m + 0.5`，五算术符，宿主同措辞同行列；声明 decimal 槽位在自举
-  "decimal→double" 映射（parser.zan）下已擦除成 double，`decimal d = 0.5m;
-  d + 0.5` 不可分辨——**模型级已知限制**）；③ 自举 decimal 即 double，
-  WriteLine 走 double 文本，正常打印（探针 0.5/2.1/2.5 全对）；① 精度差异
-  是同一模型限制的直接后果（`1m/3m` 自举 16 位 vs 宿主 28 位）——真 decimal
-  支持（%Decimal 结构体 + stdlib Decimal 方法路由）是独立战线，维持台账。
+- **自举半边与差分门闭合（2026-10-23）**：② checker 补字面量形态混算拒收
+  （`0.5m + 0.5`，五算术符，宿主同措辞同行列）；③ 自举 decimal 即 double，
+  WriteLine 正常打印；新增差分门负向用例 `tests/selfhost/reject/decimal_double_mixed.zan`，
+  并在 `tests/selfhost/reject_cases.txt` 锁定双端逐字一致错误诊断。全项闭账。
 - ① 除法恒 18 位截断：`1m/3m`→"0.333333333333333333"（C# 28 位且末位进位）、scale 恒 18（`10m/4m`→"2.500000000000000000"）；加/乘精确。
 - ② decimal+double 混算被接受且产出垃圾：`0.5m+0.5`→"19768355002338416264795389952"、`0.1m+2.0`→"19807040628566225135759764102"（C# CS0019 拒绝）。`Decimal.FromDouble` 本身正确——坏的只是混合算术的隐式转换 lowering（checker.c:1280-1285 对赋值路径已有拒绝，算术实参路径放行）。
 - ③ `Console.WriteLine(decimal)` 直接编译失败：LLVM 校验错——`%Decimal` 结构体传给 `zan_rt_print_int(i64)`（亲验复现）。C# 正常打印。
