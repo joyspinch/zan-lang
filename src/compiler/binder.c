@@ -1118,6 +1118,29 @@ static zan_type_kind_t ast_kind_to_type_kind(zan_ast_kind_t kind) {
     }
 }
 
+/* A551：resolve_type 里这些名字**硬编码短路**到内建类型，永远轮不到 scope
+ * 查找——用户声明同名类型会被静默顶掉，成员解析落空报"has no member"把人
+ * 引向无关方向。在声明处直接报重名。名单必须与 resolve_type 的内建短路表
+ * 保持一致。 */
+static bool builtin_type_name(zan_istr_t name) {
+    if (istr_eq(name, "void", 4) || istr_eq(name, "bool", 4) ||
+        istr_eq(name, "byte", 4) || istr_eq(name, "short", 5) ||
+        istr_eq(name, "int", 3) || istr_eq(name, "long", 4) ||
+        istr_eq(name, "sbyte", 5) || istr_eq(name, "ushort", 6) ||
+        istr_eq(name, "uint", 4) || istr_eq(name, "ulong", 5) ||
+        istr_eq(name, "float", 5) || istr_eq(name, "double", 6) ||
+        istr_eq(name, "decimal", 7) || istr_eq(name, "char", 4) ||
+        istr_eq(name, "string", 6) || istr_eq(name, "object", 6) ||
+        istr_eq(name, "nint", 4) || istr_eq(name, "List", 4) ||
+        istr_eq(name, "Dict", 4) || istr_eq(name, "Dictionary", 10) ||
+        istr_eq(name, "StringBuilder", 13) || istr_eq(name, "Span", 4) ||
+        istr_eq(name, "ReadOnlySpan", 12) || istr_eq(name, "TypeInfo", 8) ||
+        istr_eq(name, "Task", 4) || istr_eq(name, "Func", 4) ||
+        istr_eq(name, "Action", 6))
+        return true;
+    return false;
+}
+
 static void bind_type_decls(zan_binder_t *b, zan_ast_list_t *decls) {
     zan_symbol_t **syms = (zan_symbol_t **)zan_arena_alloc(
         b->arena, sizeof(zan_symbol_t *) *
@@ -1128,6 +1151,12 @@ static void bind_type_decls(zan_binder_t *b, zan_ast_list_t *decls) {
 
         if (node->kind == AST_DELEGATE_DECL) {
             zan_istr_t name = node->method_decl.name;
+            if (builtin_type_name(name)) {
+                zan_diag_emit(b->diag, DIAG_ERROR, node->loc,
+                              "type declaration '%.*s' collides with a built-in type name",
+                              name.len, name.str);
+                continue;
+            }
             zan_symbol_t *existing = scope_find(b->current_scope, name);
             if (existing) {
                 zan_diag_emit(b->diag, DIAG_ERROR, node->loc,
@@ -1146,6 +1175,13 @@ static void bind_type_decls(zan_binder_t *b, zan_ast_list_t *decls) {
             node->kind == AST_INTERFACE_DECL || node->kind == AST_ENUM_DECL) {
 
             zan_istr_t name = node->type_decl.name;
+
+            if (builtin_type_name(name)) {
+                zan_diag_emit(b->diag, DIAG_ERROR, node->loc,
+                              "type declaration '%.*s' collides with a built-in type name",
+                              name.len, name.str);
+                continue;
+            }
 
             zan_symbol_t *existing = scope_find(b->current_scope, name);
             if (existing) {

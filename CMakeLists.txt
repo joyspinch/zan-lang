@@ -1281,6 +1281,29 @@ add_test(NAME diag_unary_minus_string
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_unary_minus_string PROPERTIES TIMEOUT 60)
 
+# A551: a user type named after a built-in (Dict/List/Span/Task/primitives are
+# hard-short-circuited in resolve_type) used to be silently shadowed -- member
+# lookups fell through to the built-in and reported a misleading "has no
+# member". Both the class and the delegate declaration paths must reject it
+# at the declaration site.
+add_test(NAME diag_builtin_name_shadow_class
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/builtin_name_shadow_class.zan
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/diag_builtin_name_shadow_class${_exe_ext}
+    "-DEXPECT_REGEX=type declaration 'Dict' collides with a built-in type name"
+    -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
+set_tests_properties(diag_builtin_name_shadow_class PROPERTIES TIMEOUT 60)
+
+add_test(NAME diag_builtin_name_shadow_delegate
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/builtin_name_shadow_delegate.zan
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/diag_builtin_name_shadow_delegate${_exe_ext}
+    "-DEXPECT_REGEX=type declaration 'Action' collides with a built-in type name"
+    -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
+set_tests_properties(diag_builtin_name_shadow_delegate PROPERTIES TIMEOUT 60)
+
 add_test(NAME diag_unary_tilde_string
   COMMAND ${CMAKE_COMMAND}
     -DZANC=$<TARGET_FILE:zanc>
