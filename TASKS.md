@@ -680,10 +680,14 @@
   于是普通 HTML 路径里的 `<label>` 建成 `Gui.Element`（Kind()="label"），没有 display
   归类 → 它的块流文字排不出来（元素高度 0、字不画）。设计器路径把 label 映射成
   `Label` 控件，两条路径对同一个标签的语义不一致。
-- 候选修法（需专门一轮 + 重建 Gui 驱动）：① `Html.Build` 与 GenHtml 都把 `label`
-  映射成 `Label` 控件（与设计器路径对齐，文字照常画，`data-on-click` 照常接）；
-  ② UA 表补 `label { display: block; }`——但它会连带改 `Label` **控件**的 display
-  归类（这正是 UA 注释顾虑的点），要先在 IDE 里验一遍。
+- ①已落地（2026-10-25）：`Html.Build` 加 `case "label"` 直接建 `Label` 控件
+  （文本三通道：设计稿 `data-label` / 精确文本 `data-text` / 元素正文），GenHtml
+  同步发射 `Gui.Widget.Label.InitLabel` 并把 label 入 IsWidgetTag；与设计器导入
+  路径 `TagKind("label")→Label`（DesignerHtml.zan）同语义。Gui 包 661 文件
+  lib 编译过。②仍待（需重建驱动 + IDE 验证）。
+- 候选修法（需专门一轮 + 重建 Gui 驱动）：② UA 表补 `label { display: block; }`
+  ——但它会连带改 `Label` **控件**的 display 归类（这正是 UA 注释顾虑的点），
+  要先在 IDE 里验一遍。
 - 前置：`packages/Zan.Gui/src/Gui/drivers/win-x64/*` 的驱动二进制当前是**另一会话的
   在途改动**，这轮不重建驱动；模板侧先用 `<div>` 顶上（登录窗已改，见提交）。
 
