@@ -482,8 +482,7 @@ ZAN_IMAGE_EXPORT int32_t zan_image_load_svg(const char *key, const char *text,
 
 ZAN_IMAGE_EXPORT int32_t zan_image_register_argb(const char *key,
                                                 const uint32_t *pixels,
-                                                int w, int h, int stride) {
-    uint32_t *copy;
+                                                int w, int h, int stride) {    uint32_t *copy;
     zan_img_t *e;
     int row;
     if (!zan_img_is_mem_key(key) || !pixels || !zan_img_dimensions_ok(w, h)
@@ -511,4 +510,34 @@ ZAN_IMAGE_EXPORT int32_t zan_image_register_argb(const char *key,
     }
     img_unlock();
     return w;
+}
+
+/* 把已解码图像的像素复制到调用方的缓冲区。
+ *
+ * 像素是 0xAARRGGBB，一行一行地复制，行跨度按位图的跨度算。返回复制的
+ * 像素数，图像不存在或缓冲区不够时返回 0。
+ *
+ * 这个接口给那些要把图片的像素拿回自己程序里的场合：把一张贴图放大成
+ * 更大的贴图，或者把它的像素改一改再注册回去。 */
+ZAN_IMAGE_EXPORT int32_t zan_image_copy_argb(const char *key, uint32_t *dst,
+                                             int32_t max) {
+    const zan_bitmap *bitmap;
+    int64_t total, i;
+    int row, col;
+    if (!dst || max <= 0) return 0;
+    bitmap = zan_image_get(key);
+    if (!bitmap || !bitmap->pixels || bitmap->width <= 0 || bitmap->height <= 0)
+        return 0;
+    total = (int64_t)bitmap->width * (int64_t)bitmap->height;
+    if (total > (int64_t)max) total = max;
+    for (row = 0; row < bitmap->height; ++row) {
+        const uint32_t *src = bitmap->pixels + (size_t)row * (size_t)bitmap->stride;
+        for (col = 0; col < bitmap->width; ++col) {
+            int64_t at = (int64_t)row * bitmap->width + col;
+            if (at >= total) break;
+            dst[at] = src[col];
+        }
+        if ((int64_t)(row + 1) * bitmap->width >= total) break;
+    }
+    return (int32_t)total;
 }

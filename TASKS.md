@@ -171,29 +171,6 @@
 - ⚠ 不要用"先 `opt -O2` 再 llc"绕过：`opt -O2` 后能过，是因为优化器把死函数与
   冗余结构一起干掉了，编译器自己产出的 IR 仍然过不了自己的后端。
 
-### [x] A433 宿主有 `Binding<T>` 双向绑定原语降解，自举没有——赋给 `Binding<T>` 槽位的值没被包成 Binding
-
-- **已闭（2026-10-24 复核实证）**：整层已在，且 const 与 live **都**实现了——
-  `src/selfhost/irgen_binding.zan`（302 行，镜像宿主 emit_binding_value）：
-  - `IsBindingTy`/`SlotTypeOf`/`GenBindingValue`：赋值目标类型是
-    `Binding<T>` 且 RHS 不是 Binding 实例/null 时包盒；
-  - **const 绑定**（165）：值进 `constVal`（擦除 i64 槽，指针 ptrtoint /
-    double bitcast），托管值 ARC retain（170），`live=0`；
-  - **live 绑定**（148）：字段左值（含裸字段名 = `this.field`）→ 合成
-    `__zbind_get/set_<n>` 访问器对（delegate invoke ABI：env + target [+ v]，
-    字段字进出擦除槽，231-261）+ `{fn, env}` 闭包（195），`live=1`；
-    `target` 按非拥有引用存（model<->view 循环防 RC 环，151）；owned 临时
-    接收者（Call/New/Await/属性读）按宿主规则降解成 const 快照（82-105）；
-  - 接线全断面：赋值（irgen_expr 2241）、对象初始化器（4439）、局部声明
-    带初始化（irgen_stmt 1251）、字段初始化（irgen 4713），native 后端
-    （ngen_binding + ngen 七处）同步。
-- 实证（双后端对拍，输出逐字一致）：const 形状四种（局部声明带初始化 /
-  普通赋值 / 对象初始化器字段 / 普通字段赋值）+ `Set`/`Version` 语义；
-  live 形状 `Binding<string> lb = m.name` → `IsLive()`=live、改模型字段
-  `Get()` 跟着变、`Set` 回写模型——v1/live/v2/v3/done 两侧一致，无崩溃。
-- 原登记的崩（0xC0000005）是降解层落地前的状态；宿主侧原语见
-  `irgen_expr.c` 的 `type_is_binding`/`emit_binding_value`。
-
 ### [~] A435 控件的 `Kind()` 与"kind 名单"三处副本要对得上
 
 - 现象（2026-10-20 实测更正）：先前记的"十九个控件没有 `Kind()`"不是
@@ -298,34 +275,6 @@
 - 影响：没有它，`object` 只能装引用——`Zan.Messaging` 的"统一请求-响应 + 擦除
   结果"做不了，结果类型必须由泛型端点一路保留（`QueryEndpoint<T, TResult>`）。
 - 关联：A449、A434。
-
-### [x] A487 自举把 `decimal` 类型映射成 `double`——目标侧无法区分 `decimal` 与 `double`
-
-- **已修（2026-10-24）**：走"保留类型名"路线——parser 不再折叠，发射仍按
-  double：
-  1. `parser.zan` TypeKeywordName：`TK.Decimal()` 现在返回 `"decimal"`；
-  2. `irgen.zan` MapType：`"decimal"` → `"double"`（载荷与调用面不变）；
-  3. `irgen_expr.zan` IsDbl 纳入 decimal（二元算术按 double 发射），但
-     `ToDbl`（Math 家族）**先查 MathNumBadType 再走 IsDbl 捷径**——否则
-     `Math.Sqrt(2.5m)` 会被 IsDbl 放行，宿主是拒的（Abs 分支本来就是
-     bad-type 在前，无需动）；
-  4. `checker.zan` CheckAssignable 按宿主语义收紧：float/double 槽不收
-     decimal 值；decimal 槽收整型/char/decimal（新臂，nullable 同）；char 槽
-     与 enum 槽不再收 decimal 值。checker 侧的 decimal 判定臂（二元混算、
-     `5.0m` suffix、Convert/Math 守卫名单）早已预埋，此前只是被 parser 折叠
-     掐死——解冻即生效。
-- 实证（双后端对拍）：`double x = 5.0m` 与 `decimal d = 5.0` 两侧**同文同位**
-  报 `cannot convert 'decimal' to 'double'` / `'double' to 'decimal'`（A485
-  的 12 条漏报由此解锁）；`Math.Sqrt(decimal)` 两侧同拒（列号漂移 4:9 vs
-  4:18，化妆品残留同 A455 记录）；`decimal + int == 10.5m` 自举侧编译运行
-  正确。selfhost_fixed_point（97.6s）与 selfhost_diff（484s，200+ 用例）全绿。
-- 残差（登记不闭）：`Convert.ToInt32(2.5m)` 宿主给 0（宿主 decimal 是
-  struct，白名单**收** decimal——irgen_call.c:674 TYPE_DECIMAL 在
-  type_is_textual_or_numeric 里——但 struct 载荷的降级层给 0），自举按
-  double 载荷给 2。这是**双端 decimal 表示差异**（struct vs double 载荷），
-  要等真 decimal 结构体发射（与 A454 装箱同族）才会消失，不是名字层问题。
-- 宿主侧新发现（另立条目）：宿主自己的 struct-decimal **算术算错**——
-  `decimal f = 5.5m; decimal e = 5; f + e == 10.5m` 打印 no。见 A545。
 
 ### [ ] A489 GPU 3D 片元着色器把光照写死成固定键光——没有材质与光源 uniform 通路
 

@@ -1462,6 +1462,36 @@ static void gl_drop_tex(unsigned int tex) {
 
 #define ZGL_BITMAP_CAP 256
 #define ZGL_BITMAP_BYTES (64u * 1024u * 1024u)
+
+// The budget of the picture cache.  An application that draws pictures much
+// bigger than the default budget -- a tileset of a high definition game, for
+// instance -- raises it with the environment variable ZAN_GUI_BITMAP_MB.  A
+// picture that does not fit into the budget is still drawn, but it leaves no
+// room for the other pictures and the cache starts to load them again and
+// again.
+//
+// The variable is read through the system of the platform first: a program
+// that sets it while it runs (through SetEnvironmentVariable of the runtime,
+// which changes the environment of the process but not the copy the C library
+// keeps) is only seen there.  The C library is the second try.
+static size_t zgl_bitmap_budget(void) {
+    static size_t budget = 0;
+    if (budget == 0) {
+        budget = ZGL_BITMAP_BYTES;
+        long v = 0;
+#if defined(_WIN32)
+        char envbuf[32];
+        DWORD r = GetEnvironmentVariableA("ZAN_GUI_BITMAP_MB", envbuf, (DWORD)sizeof(envbuf));
+        if (r > 0 && r < sizeof(envbuf)) v = strtol(envbuf, NULL, 10);
+#endif
+        if (v <= 0) {
+            const char *mb = getenv("ZAN_GUI_BITMAP_MB");
+            if (mb && *mb) v = strtol(mb, NULL, 10);
+        }
+        if (v > 0) budget = (size_t)v * 1024u * 1024u;
+    }
+    return budget;
+}
 typedef struct {
     uint64_t serial, last_use;
     zgl_uint tex;
@@ -1493,7 +1523,7 @@ static zgl_uint zgl_bitmap_tex(const zan_bitmap *img) {
     }
     if (slot < 0) { slot = oldest; zgl_bitmap_drop(slot); }
     size_t bytes = (size_t)img->width * (size_t)img->height * 4;
-    while (g_bitmap_bytes && g_bitmap_bytes + bytes > ZGL_BITMAP_BYTES) {
+    while (g_bitmap_bytes && g_bitmap_bytes + bytes > zgl_bitmap_budget()) {
         int victim = -1;
         for (int i = 0; i < ZGL_BITMAP_CAP; i++)
             if (g_bitmap_textures[i].tex && (victim < 0 ||

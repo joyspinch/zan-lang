@@ -31,6 +31,10 @@ extern ZAN_IMAGE_EXPORT const zan_bitmap *zan_image_get(const char *key);
 extern ZAN_IMAGE_EXPORT int32_t zan_image_register_argb(const char *key, const uint32_t *pixels,
                                       int w, int h, int stride);
 
+/* 把已解码图像的像素复制到调用方的缓冲区（0xAARRGGBB），返回复制的像素数 */
+extern ZAN_IMAGE_EXPORT int32_t zan_image_copy_argb(const char *key, uint32_t *dst,
+                                      int32_t max);
+
 #ifdef __cplusplus
 }
 #endif
