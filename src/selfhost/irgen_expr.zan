@@ -6356,13 +6356,57 @@ partial class Irgen {
                     // 指针被当 i64 喂 snprintf（无效 IR）。收在 Convert.ToString
                     // 位点内，不动 ToCStr 的其它 15 个调用点（拼接/插值对 object
                     // 在宿主是 type_is_concatable 拒绝的，不走到这里）。
+                    //
+                    // A444 安全栏（与宿主同形，irgen_call.c 用
+                    // zan_obj_slot_is_string）：object 负载可能是类实例——原先
+                    // 拿 strlen 量对象指针 → 越界读 + 内存信息泄露。自举串头
+                    // 24 字节：[-24]=cid（字符串为 null，类实例是类 tid 地址）、
+                    // [-16]=len、[-8]=magic 0x5A4E5354（GenStr 字面量与
+                    // zstr_new 动态串同形，zstr_len 已用同一 magic 判别）。
+                    // 非字符串/null → 软运行时错（与解析家族同形，strict 模式
+                    // exit 70）+ 空串兜底，不再读对象指针。
+                    string isn2 = NT();
+                    L("  " + isn2 + " = icmp eq i8* " + a.op + ", null");
+                    int lnull = NL(); int lprobe = NL(); int lmerge = NL();
+                    L("  br i1 " + isn2 + ", label %L" + lnull + ", label %L" + lprobe);
+                    Label(lnull);
+                    L("  br label %L" + lmerge);
+                    Label(lprobe);
+                    string hp = NT();
+                    L("  " + hp + " = bitcast i8* " + a.op + " to i64*");
+                    string cp2 = NT();
+                    L("  " + cp2 + " = getelementptr i64, i64* " + hp + ", i64 -3");
+                    string cv2 = NT();
+                    L("  " + cv2 + " = load i64, i64* " + cp2);
+                    string mp2 = NT();
+                    L("  " + mp2 + " = getelementptr i64, i64* " + hp + ", i64 -1");
+                    string mv2 = NT();
+                    L("  " + mv2 + " = load i64, i64* " + mp2);
+                    string cok = NT();
+                    L("  " + cok + " = icmp eq i64 " + cv2 + ", 0");
+                    string mok = NT();
+                    L("  " + mok + " = icmp eq i64 " + mv2 + ", 1515082580");
+                    string sok = NT();
+                    L("  " + sok + " = and i1 " + cok + ", " + mok);
+                    L("  br label %L" + lmerge);
+                    Label(lmerge);
+                    string pred = NT();
+                    L("  " + pred + " = phi i1 [ 0, %L" + lnull + " ], [ " + sok + ", %L" + lprobe + " ]");
+                    string badv = NT();
+                    L("  " + badv + " = xor i1 " + pred + ", 1");
+                    EmitRuntimeCheckIf(e.kids[0], badv,
+                        "Convert.ToString: object holds a non-string value -- "
+                        + "call .ToString() on the concrete value instead");
+                    string empty2 = RawCString("");
+                    string safe2 = NT();
+                    L("  " + safe2 + " = select i1 " + pred + ", i8* " + a.op + ", i8* " + empty2);
                     string n2 = NT();
-                    L("  " + n2 + " = call i64 @strlen(i8* " + a.op + ")");
+                    L("  " + n2 + " = call i64 @strlen(i8* " + safe2 + ")");
                     string b2 = NT();
                     L("  " + b2 + " = add i64 " + n2 + ", 1");
                     string bf2 = NT();
                     L("  " + bf2 + " = call i8* @malloc(i64 " + b2 + ")");
-                    L("  call i8* @memcpy(i8* " + bf2 + ", i8* " + a.op + ", i64 " + b2 + ")");
+                    L("  call i8* @memcpy(i8* " + bf2 + ", i8* " + safe2 + ", i64 " + b2 + ")");
                     s = WrapManaged(bf2);
                 }
                 else { s = ToCStr(a); }

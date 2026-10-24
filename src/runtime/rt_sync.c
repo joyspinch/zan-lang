@@ -1134,6 +1134,19 @@ static void zan_delegate_release(void *d) {
     if (dtor) ((void (*)(void *))dtor)(rec);
 }
 
+/* A444 安全栏：object 槽里的堆值是不是字符串负载。
+ * C 宿主的字符串，[-8] 高 32 位恒为 ZAN_STRING_TAG（"ZANS"）：静态字面量
+ * (TAG<<32)|len、动态拼接/字符串集合 TAG<<32 + 长度另存、嵌入资源 MAGIC
+ * 高位同样是 ZANS。类实例的 [-8] 是 ARC 站点/析构指针，用户态地址高
+ * 32 位远到不了 0x5a414e53，不会误判。判不出的（野指针）按非字符串
+ * 处理，调用方 fail-closed。自举后端的串头形状不同（[-24]=0、[-8]=
+ * 低位 ZNST），自举在自己内部内联判别，不走这个 helper。 */
+int zan_obj_slot_is_string(const void *p) {
+    if (!p) return 0;
+    const uint64_t *w = (const uint64_t *)((const char *)p + ZAN_OBJ_RC_OFF);
+    return (w[1] >> 32) == ZAN_STRING_TAG;
+}
+
 static int zan_dispatch_grow(void) {
     if ((unsigned)g_dispatch_cap >= ZAN_DISPATCH_CAP_MAX) return 0;
     int ncap = g_dispatch_cap * 2;

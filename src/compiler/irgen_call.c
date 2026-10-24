@@ -2275,17 +2275,57 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                             return LLVMConstNull(i8ptr);
                         }
                         if (LLVMGetTypeKind(LLVMTypeOf(arg)) == LLVMPointerTypeKind) {
+                            /* A444 安全栏：静态类型是 object 时负载可能是类
+                             * 实例——运行期判别，字符串才 strlen+memcpy，
+                             * 非字符串走软运行时错（可 catch、strict 模式
+                             * exit 70）+ 空串兜底。原先拿 strlen 量对象
+                             * 指针 → 越界读 + 内存信息泄露。判别器在
+                             * rt_sync.c：字符串 [-8] 高 32 位恒为 ZANS
+                             * 标签，类实例的 ARC 站点指针撞不上；null
+                             * 一并判为非字符串（顺带修掉 null 的 strlen UB）。 */
+                            LLVMValueRef safe_arg = arg;
+                            if (at && at->kind == TYPE_OBJECT) {
+                                /* 判别器在 rt_sync.c：把 sync 运行时拉进链接集 */
+                                g->uses_sync_runtime = true;
+                                LLVMTypeRef isstr_ty = LLVMFunctionType(
+                                    LLVMInt32TypeInContext(g->ctx),
+                                    (LLVMTypeRef[]){ i8ptr }, 1, 0);
+                                LLVMValueRef isstr_fn =
+                                    LLVMGetNamedFunction(g->mod, "zan_obj_slot_is_string");
+                                if (!isstr_fn)
+                                    isstr_fn = LLVMAddFunction(g->mod,
+                                        "zan_obj_slot_is_string", isstr_ty);
+                                LLVMValueRef is_str = zan_call2(g->builder,
+                                    isstr_ty, isstr_fn, &arg, 1, "is.str");
+                                LLVMValueRef bad = zan_icmp(g->builder,
+                                    LLVMIntEQ, is_str,
+                                    LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 0, 0),
+                                    "str.bad");
+                                emit_runtime_check(g, bad,
+                                    expr->call.args.items[0]->loc,
+                                    "Convert.ToString: object holds a "
+                                    "non-string value -- call .ToString() "
+                                    "on the concrete value instead");
+                                LLVMValueRef empty =
+                                    zan_irgen_intern_string(g, "");
+                                LLVMValueRef hit = zan_icmp(g->builder,
+                                    LLVMIntNE, is_str,
+                                    LLVMConstInt(LLVMInt32TypeInContext(g->ctx),
+                                        0, 0), "str.hit");
+                                safe_arg = LLVMBuildSelect(g->builder, hit,
+                                    arg, empty, "str.safe");
+                            }
                             LLVMTypeRef strlen_ty = LLVMFunctionType(i64,
                                 (LLVMTypeRef[]){ i8ptr }, 1, 0);
                             LLVMTypeRef memcpy_ty = LLVMFunctionType(i8ptr,
                                 (LLVMTypeRef[]){ i8ptr, i8ptr, i64 }, 3, 0);
                             LLVMValueRef memcpy_fn = get_libc_fn(g, "memcpy", memcpy_ty);
                             LLVMValueRef n = zan_call2(g->builder, strlen_ty,
-                                g->fn_strlen, &arg, 1, "n");
+                                g->fn_strlen, &safe_arg, 1, "n");
                             LLVMValueRef bufsz = zan_add(g->builder, n,
                                 LLVMConstInt(i64, 1, 0), "bsz");
                             LLVMValueRef buf = emit_string_alloc_rc(g, bufsz);
-                            LLVMValueRef mcargs[] = { buf, arg, bufsz };
+                            LLVMValueRef mcargs[] = { buf, safe_arg, bufsz };
                             zan_call2(g->builder, memcpy_ty, memcpy_fn, mcargs, 3, "");
                             emit_release_owned_call_temp(
                                 g, expr->call.args.items[0], arg, locals);

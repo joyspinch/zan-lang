@@ -27,7 +27,28 @@
   这类用例后再对齐。
 - 关联：A438（已修，结论在 git 历史）。
 
-### [ ] A444 `Convert.ToString(object)` 仍按 C 字符串读——object 里装类实例时依然越界读
+### [x] A444 `Convert.ToString(object)` 仍按 C 字符串读——object 里装类实例时依然越界读
+
+- **修复（2026-10-24，安全栏先行）**：`Convert.ToString(object)` 运行期判别
+  负载，字符串照旧拷贝；null 与类实例走**软运行时错**（与解析家族同形：
+  可 catch、strict 模式 exit 70、每处一次）+ 空串兜底，不再 strlen 对象
+  指针（越界读 + 内存信息泄露收敛）。
+  - 判别器（两侧形状不同，各自实现、行为对齐）：
+    - C 宿主：`rt_sync.c zan_obj_slot_is_string`——字符串 `[-8]` 高 32 位
+      恒为 `ZAN_STRING_TAG`（"ZANS"：静态字面量 `(TAG<<32)|len`、动态拼接
+      `TAG<<32`、嵌入资源 MAGIC 高位同 ZANS）；类实例的 ARC 站点指针是
+      用户态地址，高 32 位到不了 0x5a414e53。`irgen_call.c` 的 object
+      位点调它 + `emit_runtime_check` + `select` 空串；`uses_sync_runtime`
+      就地拉起（rt_sync 是按需链接的）。
+    - 自举：串头 24 字节 `[-24]=cid(字符串 null，类实例是类 tid 地址)、
+      [-16]=len、[-8]=magic 0x5A4E5354`（GenStr 字面量与 `zstr_new` 动态串
+      同形，`zstr_len` 早已用同一 magic 判别）——`irgen_expr.zan` 位点内联
+      判别（null 分支先走，load 只在非空路径），`EmitRuntimeCheckIf` +
+      select 空串，复用原 strlen+memcpy。
+  - 验证：宿主/自举双探针一致（"hello" 照旧、null/类实例 → stderr 软错
+    + `[]`、程序继续）；`selfhost_fixed_point` + `selfhost_diff` 2/2；
+    新用例 `tests/conformance/convert_tostring_object_runtime.zan`（含
+    determinism 孪生）2/2；compile-time 拒绝用例不变。
 
 - 现象：A4xx 那条修复（`Convert.ToString` 按静态类型分流）把类 / 结构体 /
   数组 / 委托都改成 fail-closed 诊断，但 **`object` 只能放行**：
