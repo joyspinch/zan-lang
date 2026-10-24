@@ -1,0 +1,72 @@
+using System;
+using System.Collections.Generic;
+using System.Json;
+
+namespace Gui.Component.Chart;
+
+// A383 第一步：未知/未实现 option 键的告警（廉价可见层）。
+//
+// 口径与 scripts/chart_gap_audit.py 同源：注册表 = 引擎源码里
+// .Get/.Int/.Str/.Bool/.Num/.Double/.Has 访问器读到的全部键名
+// （访问器字面量按键名收集，与审计的 read 集同一 blind spot——
+// 经变量间接取的键审计看不见，这里也看不见），外加 GeoJson 的
+// UTF8Encoding/UTF8Scale 与数据载荷子树键。用户 option 里出现
+// 注册表之外的键 = 引擎没有任何代码读过它 = 静默丢弃——本类在
+// 解析后走树对账，Console.ErrorWriteLine 到 stderr（不进 stdout
+// 黄金），同名键去重只报一次。
+public class ChartOptionWarn {
+    // 与 DATA_STOP 同名单的载荷子树：不下钻（里面是点，不是 option）。
+    static bool IsPayload(string k) {
+        return k == "data" || k == "children" || k == "nodes"
+            || k == "links" || k == "edges" || k == "source"
+            || k == "target" || k == "coords" || k == "regions"
+            || k == "styleJson" || k == "stylers" || k == "features"
+            || k == "geometry" || k == "coordinates" || k == "matrix"
+            || k == "points" || k == "nameMap" || k == "colorStops";
+    }
+
+    static string KNOWN = "|align|alignTicks|alignTo|alignWithLabel|anchor|and|angleAxis|areaColor|areaStyle|autoPlay|axisIndex|axisLabel|axisLine|axisName|axisPointer|axisTick|backgroundColor|backgroundStyle|barCategoryGap|barGap|barHeight|barMaxWidth|barMinAngle|barMinHeight|barMinWidth|barWidth|baseOption|body|borderColor|borderColor0|borderColorSaturation|borderRadius|borderWidth|bottom|boundIQR|boundaryGap|boxes|breakArea|breaks|brushSelect|bubbles|calculable|calendar|calendarIndex|candles|categories|category|cellSize|center|children|chord|clockWise|clockwise|close|clusterCount|collapsed|color|color0|colorMappingBy|colorSaturation|colorStops|config|connectGroup|containLabel|coord|coordinateSystem|coordinates|coords|corner|curveness|custom|data|dataBackground|dataIndex|dataRange|dataView|dataZoom|dataset|datasetId|datasetIndex|dayLabel|detail|dim|dimension|dimensions|distance|distanceToLabelLine|duration|dx|dy|edgeDistance|edgeLength|edgeSymbol|edges|elements|emphasis|encode|encodeOffsets|end|endAngle|endLabel|endValue|eq|err|errors|events|expandAndCollapse|feature|features|fill|fillerColor|firstDay|focus|font|fontFamily|fontSize|fontStyle|fontWeight|force|forceCurveness|formatter|from|fromDatasetId|fromDatasetIndex|fromTransformResult|funnelAlign|funnelGap|funnelLabelOut|funnelPercent|gap|gapWidth|geo|geoIndex|geometry|graphic|gravity|grid|gridIndex|groupBy|gt|gte|handleIcon|handleSize|hbar|height|hidden|hideOverlap|high|hole|hoverLink|id|inRange|indicator|initialTreeDepth|innerPct|inside|interval|inverse|isExpanded|itemName|itemNameFormatter|itemStyle|keyframeAnimation|kind|label|labelFormatter|labelLayout|labelLine|labelShow|labels|large|largeThreshold|layout|leafDepth|left|legend|length|length2|levelSize|levels|lineHeight|lineStyle|lineWidth|linkStyle|linkSymbol|links|low|lt|lte|magicType|map|mapType|margin|markArea|markLabel|markLine|markPoint|matrix|max|maxInterval|maxRadius|maxSize|maxSizePct|media|method|min|minInterval|minRadius|minSpan|minValueSpan|minorSplitLine|minorTick|monthLabel|moveOverlap|name|nameGap|nameLocation|nameMap|nameTextStyle|ne|nodeStyle|nodes|normal|offset|offsetCenter|onZero|opacity|open|option|options|or|order|orient|outerBounds|overlap|padAngle|padding|parallel|parallelAxis|pieLabels|pieces|playInterval|pointer|points|polar|polarIndex|position|precision|progress|properties|query|r|r0|radar|radarIndex|radius|radiusAxis|range|regions|repulsion|restore|resultDimensions|ribbonType|rich|right|ringWidth|rings|roam|roamWheelMode|roseType|rotate|roundCap|saveAsImage|scale|scaling|selected|selectedDataBackground|selectedMode|selectedOffset|series|seriesIndex|seriesLayoutBy|shadowBlur|shadowColor|shape|show|showAbove|showAllSymbol|showBackground|showDataShadow|showDetail|showSymbol|silent|size|sizeRange|smooth|sort|sortSub|source|splitArea|splitLine|splitNumber|stack|stackStrategy|start|startAngle|startValue|step|stops|stroke|style|subtext|subtextStyle|symbol|symbolBoundingData|symbolClip|symbolOffset|symbolPosition|symbolRepeat|symbolSize|symbolSizeFn|target|text|textBorderColor|textBorderWidth|textRotation|textShadowBlur|textShadowColor|textShadowOffsetX|textShadowOffsetY|textStyle|title|to|toolbox|tooltip|top|transform|trigger|triggerOn|type|upperLabel|val|value|valueIndex|values|visibleMin|visualDimension|visualMap|visualMax|visualMin|weight|width|x|xAxis|xAxisId|xAxisIndex|xValue|y|y2|yAxis|yAxisId|yAxisIndex|yValue|yearLabel|z|zigzagAmplitude|zlevel|zoomLock|UTF8Encoding|UTF8Scale|data|children|nodes|links|edges|source|target|coords|regions|styleJson|stylers|features|geometry|coordinates|matrix|points|nameMap|colorStops|";
+
+    static bool Known(string k) {
+        return KNOWN.IndexOf("|" + k + "|") >= 0;
+    }
+
+    static HashSet<string> warned = new HashSet<string>();
+
+    // 对账入口：从 ChartOption.FromJsonValue 顶部调用（在分支之前，
+    // 覆盖 timeline/baseOption 的全部提前返回路径；嵌套解析会重复进
+    // 来，warned 集合去重）。
+    public static void WarnUnknown(JsonValue v) {
+        if (v == null) { return; }
+        Walk(v, "", 0);
+    }
+
+    static void Walk(JsonValue v, string path, int depth) {
+        if (v == null || depth > 24) { return; }
+        if (v.IsArray()) {
+            int n = v.Count();
+            for (int i = 0; i < n; i = i + 1) {
+                Walk(v.At(i), path, depth + 1);
+            }
+            return;
+        }
+        if (!v.IsObject()) { return; }
+        List<string> ks = v.keys;
+        if (ks == null) { return; }
+        int ki = 0;
+        while (ki < ks.Count) {
+            string k = ks[ki];
+            string sub = path.Length > 0 ? path + "." + k : k;
+            if (!Known(k) && !warned.Contains(k)) {
+                warned.Add(k);
+                Console.ErrorWriteLine("chart option: key '" + sub
+                    + "' is never read by the engine (silently dropped)"
+                    + " -- see docs/archive/CHART_CODE_GAP_LEDGER.md");
+            }
+            if (!IsPayload(k)) {
+                Walk(v.Get(k), sub, depth + 1);
+            }
+            ki = ki + 1;
+        }
+    }
+}

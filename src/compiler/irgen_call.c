@@ -1272,6 +1272,32 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
             return LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 0, 0);
         }
 
+        /* Console.ErrorWriteLine：stderr 行输出（A383——图表引擎的未知
+         * option 键告警走 stderr，不污染 stdout 黄金）。收窄成 string 单
+         * 签名：告警都是预拼好的文本，非串实参请先 Convert.ToString
+         * （C# 的多态重载在 Zan 面上按内建收窄先例处理）。 */
+        if (!zan_type_defines(g, "Console", "ErrorWriteLine") &&
+            is_call_to(expr, "Console", "ErrorWriteLine")) {
+            if (expr->call.args.count > 0) {
+                zan_ast_node_t *arg_ast = expr->call.args.items[0];
+                LLVMValueRef arg = emit_expr(g, arg_ast, locals);
+                if (LLVMGetTypeKind(LLVMTypeOf(arg)) != LLVMPointerTypeKind) {
+                    zan_diag_emit(g->diag, DIAG_ERROR, expr->loc,
+                        "Console.ErrorWriteLine takes a string: format the "
+                        "value with Convert.ToString first");
+                    return emit_unresolved_call_result(g, expr, locals);
+                }
+                LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+                LLVMTypeRef fn_type = LLVMFunctionType(
+                    LLVMVoidTypeInContext(g->ctx), (LLVMTypeRef[]){ i8ptr }, 1, 0);
+                LLVMValueRef efn = LLVMGetNamedFunction(g->mod, "zan_rt_eprint_line");
+                if (!efn) efn = LLVMAddFunction(g->mod, "zan_rt_eprint_line", fn_type);
+                zan_call2(g->builder, fn_type, efn, &arg, 1, "");
+                emit_release_owned_call_temp(g, arg_ast, arg, locals);
+            }
+            return LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 0, 0);
+        }
+
         /* Console.Write (no newline) */
         if (!zan_type_defines(g, "Console", "Write") &&
             is_call_to(expr, "Console", "Write")) {

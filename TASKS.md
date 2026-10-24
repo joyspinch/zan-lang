@@ -97,8 +97,25 @@
 - ⚠ 跨后端约束：自举后端自己发诊断（`src/selfhost/*.zan`），编号表要**两个
   后端同一次落地**，否则固定点门/差分门会不绿；所以这条不能只改 C 侧。
 
-### [ ] A383 图表引擎整代语义差：官方 470 个 option 键里 278 个（59%）从不读取
+### [~] A383 图表引擎整代语义差：官方 470 个 option 键里 278 个（59%）从不读取
 
+- **第一步已落地（2026-10-24）：未知 option 键告警进引擎。**
+  `ChartOptionWarn.WarnUnknown`（Models/ChartOptionWarn.zan）挂在
+  `ChartOption.FromJsonValue` 顶部，解析前走树对账：注册表 = 引擎源码
+  访问器字面量（.Get/.Int/.Str/.Bool/.Num/.Double/.Has）读到的 368 个键名
+  （与 `scripts/chart_gap_audit.py` 的 read 集同源同 blind spot）+ GeoJson
+  的 UTF8Encoding/UTF8Scale + 数据载荷子树键；载荷子树（data/children/
+  nodes/…）不下钻。注册表外的键 = 静默丢弃，`Console.ErrorWriteLine`
+  打到 stderr（同名键去重只报一次，不污染 stdout 黄金）。
+  - 配套内建：`Console.ErrorWriteLine(string)`——builtin_api.c 成员表 +
+    irgen_call.c 发射（收窄成 string 单签名，非串实参当场报错）+
+    `zan_rt_eprint_line`（rt_io.c；wasm 运行时集不含此符号，wasm 侧
+    待需要时补）。
+  - 生成坑（已修）：本环境 ugrep 对 CRLF 源文件 `-o` 捕获会把行尾 \r
+    粘进每个键——首版注册表 368 个键全是 `key\r`，除 echo 追加的载荷键
+    外全部误报；生成管道必须 `tr -d '\r'`。
+  - 验证：探针（title.text 已知静默、title.shou/axsiX/series.wat 各报
+    一条、stdout 干净）；图表 conformance 全量回归见同批提交。
 - 事实（`docs/archive/CHART_CODE_GAP_LEDGER.md`）：对照 ECharts 6.1 的 596 个
   `.ts` 源，官方 option 用到的 470 个配置键里，引擎**从不读取**的有 278 个（59%）。
 - 表现：用户照官方示例写 option，键被静默丢弃——不报错、不告警，图形少一块也

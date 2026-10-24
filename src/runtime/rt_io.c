@@ -5106,3 +5106,12 @@ void zan_gate_free(long long handle) {
     zan_gate_lock_free(g);
     free(g);
 }
+
+/* Console.ErrorWriteLine：stderr 行输出（A383）。引擎/工具的告警通道——
+ * 与 stdout 的 WriteLine 分流，黄金比对（stdout）不受告警影响。
+ * wasm 目标的运行时集不含本符号，调用前见 irgen_call.c 的收窄说明。 */
+void zan_rt_eprint_line(const char *text) {
+    if (text && text[0]) { fputs(text, stderr); }
+    fputc('\n', stderr);
+    fflush(stderr);
+}

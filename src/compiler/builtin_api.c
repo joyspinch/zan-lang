@@ -57,6 +57,7 @@ static const zan_builtin_member_t members_sb[] = {
 
 static const zan_builtin_member_t members_console[] = {
     { "WriteLine",       'M', "void WriteLine(object value)" },
+    { "ErrorWriteLine",  'M', "void ErrorWriteLine(string value)" },
     { "Write",           'M', "void Write(object value)" },
     { "PrintLine",       'M', "void PrintLine(object value)" },
     { "ReadLine",        'M', "string ReadLine()" },
