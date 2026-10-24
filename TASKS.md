@@ -202,31 +202,6 @@
 - ⚠ 不要用"先 `opt -O2` 再 llc"绕过：`opt -O2` 后能过，是因为优化器把死函数与
   冗余结构一起干掉了，编译器自己产出的 IR 仍然过不了自己的后端。
 
-### [~] A435 控件的 `Kind()` 与"kind 名单"三处副本要对得上
-
-- 现象（2026-10-20 实测更正）：先前记的"十九个控件没有 `Kind()`"不是
-  主要问题——那十九个（`BoxContent` / `ChoiceGroup` / `Column` /
-  `ContextMenu` / `Ellipsis` / `FormBuilder` / `Layer` / `Menu` /
-  `Message` / `Popover` / `Prompt` / `QrEncoder` / `Ribbon` / `Scrollbar` /
-  `ScrollView` / `Split` / `Table` / `Tooltip` / `WidgetDelegates`）是
-  设计器与代码内部件，设计稿里的 kind 由设计器模型给
-  （`FormField.KindForType`），不依赖 `Control.Kind()`。真正对不上的是
-  **声明了 `Kind()` 却在名单外**的控件：`ButtonGroup` / `Center` /
-  `Field` / `IconView` / `ListItem` / `RadioButton` / `RichText` /
-  `StyledText` / `Typography` / `Wizard` / `GraphView` / `BandGrid` /
-  `PropertyGrid`。
-- 后果：编译期限定名单（`GenForm`）不认这些 kind → 生成代码发裸名，
-  用户项目的同名全局类压过 stdlib（探针实证）；反向也一样——注册表里有
-  而编译期不认的 kind（`Row` / `Spacer` / `FormGroup` / `FormItem` /
-  `Modal` / `Drawer`）同样发裸名。
-- **已修**（2026-10-20）：两处名单补齐——12 个库控件 + 6 个容器件进编译期
-  名单；`Field` 进不可实例化名单（它是设计器的字段记录，没有零参构造，
-  `new FormField()` 编译不过）。门禁：`scripts/component_audit.py` 的 R1
-  规则（注册表 ↔ 编译期名单 ↔ 控件 `Kind()` 三处对齐）。
-- 剩余：运行期按 kind 重建仍不支持那 12 个库控件（注册表会把它们拖进
-  每个宿主，不注册是刻意的）；代码搭的树导出设计稿后能生成代码，但
-  `Serialize` / `Html` 克隆会丢掉它们——真需要时再逐个开注册。
-
 ### [ ] A453 类型参数按名字全局注册——同名 `T` 先到先得，跨文件行为可能不同
 
 - 现象（2026-10-21 修 A448 时顺带查出，未修）：类型参数在 binder 里是**按名字、
@@ -557,6 +532,12 @@
   还没（wasm32 的配方是 .cmd、GUI 那一支还依赖外部 freetype checkout）。
 - 补法（2026-10-22 落地）：三份清单补齐 + 触发路径补齐（21 条）+ 新增
   `ohos-objects` / `android-objects` 两个 job + `stale-check` 依赖 ohos job。
+- 2026-10-25 复核：清单/触发路径修复确认在位（drivers.yml 提交清单含
+  decimal/crypto/embed_api/inflate；toolchain.yml 触发路径含 embed_api/inflate）；
+  **macOS 死腿已救活**（3b47a5587 修符号检查器、a3c50cafd 补齐
+  `toolchain/macos/arm64/zanrt_decimal.o`）。剩 wasm32 / ios 两平台的对象
+  job 未接（wasm32 配方是 .cmd、GUI 依赖外部 freetype checkout；ios 无配方
+  工具链）——工具链受阻，维持 [~]。
 - **macOS 这条腿整个是死的**（2026-10-22 顺着查 macOS 的 decimal 查出来的）：
   - `runtime-objects` job 的检查步骤 `python3 scripts/check_macos_rt.py` 从
     **2026-09-20**（`e35521ad7` 让 `gui_compat_mac.c` 开始 import
