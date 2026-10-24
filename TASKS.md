@@ -8,27 +8,6 @@
 
 ## 未完成
 
-### [x] A455 自举后端没有命名空间/`using` 解析层——裸名按"第一个同名类型"命中
-
-- **已闭（2026-10-24 复核实证）**：A438/A457 的 nsresolve 工作已把整层建成——
-  不在 binder 查找侧，而在 **parser 侧的重写层**：`ParseTypeDecl` 给每个顶层
-  声明盖 `nsName`/`nsUsings` 戳（parser.zan:1753）；跨命名空间同简名冲突进
-  冲突表按声明序 mangle 成唯一名（qFinals）；所有类型引用（TypeRef/基类/
-  静态接收者，带成员名影子集）按引用所在声明自己的上下文重写到 final 名
-  （`ResolveQualifiedName`/`ResolveSimpleName`，parser.zan:1049/1070，顺序
-  同宿主：本命名空间 → using 按序 → 收窄回退）；歧义诊断与宿主同文
-  （parser.zan:1128）。binder 的线性扫描因此吃到的都是已消歧的名字。
-- 实证（双后端三文件探针，`NS.A.Marker` + `NS.B.Marker`）：
-  - using 选择胜过声明顺序（B 先声明、using 指向 A → 两侧都打印 "A"）；
-  - 无 using 裸引用 → 两侧同文报错 `ambiguous type 'Marker'; qualify it
-    with its namespace`。
-  - 化妆品残留：诊断列号两侧不同（宿主指声明位 5:9，自举指引用位
-    5:24），同一诊断家族，文本一致；stderr 不进 golden，不影响对拍。
-- 原现象（重写层落地前成立，登记留档）：C 宿主有完整命名空间解析层
-  （nsresolve.c：本命名空间 → 祖先 → 本文件 using → 歧义诊断）；自举
-  binder 的 `FindType` 按简单名线性扫，命中第一个——多包同名类的绑定
-  取决于声明顺序。
-
 ### [ ] A380 协程帧的释放仍只在类型侧收口——运行时没有幂等保护
 
 - 现状（A379 已闭）：`Task.Run(lambda)` 的句柄被检查器定型成"无结果任务"，
