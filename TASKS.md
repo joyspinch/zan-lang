@@ -67,18 +67,27 @@
   `toolchain/*/zanrt_io.o`（各平台预编译运行时）要跟着重出，非本机平台
   重建不了。
 
-### [ ] A381 SPEC 的"尚未实现"清单剩余 5 项
+### [ ] A381 SPEC 的"尚未实现"清单剩余 4 项
 
 - lazy iterators：`yield` 物化成 list，没有 `IEnumerable<T>` 协议
 - tagged union 枚举（代数数据类型）
-- `params` 之后的可选实参组合未系统验证
-- `$` 与三引号的组合（插值原始字符串）—— 普通三引号原始字符串已实现（本次）
+- `$` 与三引号的组合（插值原始字符串）——普通三引号原始字符串已实现；
+  组合形态评估（2026-10-25）：多行缩进剥离要跨"文本段/插值洞"分段记账，
+  分段式 lexer（interp segment）表达不了，需要 parse 级把整个字面量当整体
+  处理，且自举侧 lexer.zan 还欠 $@ 与三引号两轮同步——单独立项，不做半截
 - COW 集合：`List` 赋值是引用共享，修改即共享
 - `[CImport]`、`project.zan` 项目文件、`zan` CLI（实际是 `zanc`）
 
-- 已清（SPEC 同步改）：`checked` / `unchecked` 整型溢出检查——802607e72 落地，
+- 已清：`checked` / `unchecked` 整型溢出检查——802607e72 落地，
   C# 兼容语义（checked 报点后回绕值继续流动，`ZAN_RT_HARD=1` 硬陷阱 exit 70；
   用例 `tests/conformance/cs_b14_checked.zan` 与 runtime_error 套件）。
+- 已清（2026-10-25，5433bf761）：`params` 与可选实参的组合——此前
+  `fill_default_args` 对 params 方法整体跳过默认填充、`method_accepts_arity`
+  把 params 当固定 arity，`(int a, int b = 10, params int[] rest)` 以 1 个
+  实参调用直接解析失败。修：arity 接受 `fixed = pc-1` 且只校验尾参前形参的
+  默认值；fill 只填到 params 之前，params 数组仍由 pack_params_args 收
+  （0 个收空数组）。全形状探针过；conformance
+  `tests/conformance/params_optional_combination.zan` 锁形。
 
 - 方向：逐项单独立项实现，每项带 conformance 用例；不做半截实现。
 

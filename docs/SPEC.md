@@ -765,7 +765,10 @@ type_args       = "<" type { "," type } ">" ;
 type_list       = type { "," type } ;
 
 param_list      = [ param { "," param } ] ;
-param           = { "ref" | "out" | "in" } type IDENT [ "=" expr ] ;
+param           = [ "params" ] { "ref" | "out" | "in" } type IDENT [ "=" expr ] ;
+// `params` 只能修饰尾参数组；尾参之前的形参可带 `=` 默认值，缺省调用按
+// 默认填充、params 数组收剩余实参（0 个收空数组）——组合已验证
+// （`tests/conformance/params_optional_combination.zan`）。
 
 modifier        = "public" | "private" | "protected" | "internal"
                 | "static" | "virtual" | "override" | "abstract"
@@ -804,7 +807,6 @@ qualified_name  = IDENT { "." IDENT } ;
 
 - lazy iterators (`IEnumerable<T>` protocol) — `yield` currently materializes a list
 - tagged union 枚举（代数数据类型）
-- 命名实参之外的实参特性：`params` 之后的可选实参组合未系统验证
 - `$` 与 `"""` 的组合（插值原始字符串）—— 普通三引号原始字符串已实现（三引号定界、内容零转义、多行按闭合行缩进剥离；`tests/conformance/raw_string.zan`）
 - COW（copy-on-write）集合——`List` 赋值是引用共享，修改即共享
 - `[CImport]`、`project.zan` 项目文件、`zan` CLI（实际为 `zanc`）
