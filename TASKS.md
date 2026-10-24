@@ -8,7 +8,20 @@
 
 ## 未完成
 
-### [ ] A527 发布产物体积的大头是运行时（未按函数分节）与内嵌默认图标，不是标准库
+### [ ] A527 发布产物体积——分节与 gc 已落地并验证，宿主 .text 的大头已让给 MinGW 地板，剩最大杠杆是内嵌默认图标
+- **2026-10-24 实测校准（结论大改，原测量作历史保留在下方）**：
+  - `ZAN_RT_OBJ_SECTIONS`（`-ffunction-sections -fdata-sections`，非 MSVC 分支）
+    已生效：`build/zanrt_timer.obj` 实测 **79 个 `.text$函数` 分节**；发布链接带
+    `--gc-sections`；捆绑 GNU ld 在 PE 上 gc 实测有效（`ld -m i386pep --gc-sections`
+    最小 A/B：.text 0x78 → 0x28，死函数真被裁）。
+  - **发布 hello 的 .text = 147,160 B，其中 Zan 运行时仅 ~62 KB**（io_mt 37,984 +
+    timer 21,312 + mem 2,992），**crypto 53,408 B 一个符号都没进**（归档按引用拉取
+    生效，`zan_hw_*` 符号计数 0）。其余 ~85 KB 是 MinGW CRT/静态库（mingwex/
+    msvcrt 等）的地板——不是 Zan 能裁的；再往下要换 CRT/链接器形态，属产品决策。
+  - 剩余真杠杆只剩**内嵌默认图标**（`.rsrc` 105 KB，`--no-icon` 已有）：换多尺寸
+    小图标或发布默认不嵌，省约 78 KB，仍待拍板。
+  - 遗留小项：宿主 .text 里 io/timer 是否还有未用函数可裁，需带符号链接
+    （不 -s + `--print-gc-sections` 走查）复测，本轮未做。
 - 实测（宿主 Windows，hello 的 `--publish` 产物 287,232 字节）：`.text` 146,432 + `.rsrc` 106,496 + 导入表/重定位/pdata 等约 35 KB。`.rsrc` 那一块就是内嵌的默认图标——`assets/zan.ico`（105,903 字节）由 CMake 编译进 zanc 的字节数组，每产一个 Windows exe 都带一份（`CMakeLists.txt` 的 `ZAN_DEFAULT_ICON`），占发布体积 37%。开发构建 703,679 字节，多出的 416 KB 是 DWARF 调试信息（约 317 KB）与符号表。
 - **标准库不是体积杠杆**：`stdlib/` 源码 1.25 MB / 171 个 `.zan`，但 `using System` + `Console.WriteLine` 的程序比空程序只多 7,680 字节 `.text`（156,160 vs 148,480）——编译器只拉 `using` 到的命名空间，发布时 `--gc-sections` 再裁一遍。**别把力气花在标准库上。**
 - 真杠杆一：运行时对象没按函数分节，链接期 `--gc-sections` 裁不到函数级，空程序也要背走 io/sync/timer/decimal 四个对象的全部 `.text`。实测同样 6 个 linux-musl 运行时对象（sync/file/decimal/timer/embed/inflate）+ 同一个 main：A（现状）`.text` 140,298 字节，B（加 `-ffunction-sections -fdata-sections`）**48,479 字节（-65%）**。
@@ -574,6 +587,11 @@
 
 ### [ ] A499 crypto 归档只有一个成员——用到任一族仍拉进全部 63+ 个 `zan_hw_*`
 
+- **2026-10-24 实测校准（缩小口径）**：归档按符号缺才拉的机制已验证兑现——
+  hello 的 `--publish` 产物符号表里 `zan_hw_*` 计数 **0**（完全不拉）。
+  本条对**发布体积**的诉求已由 A493 归档化 + 发布 `--gc-sections` 兜底实现；
+  剩余价值仅剩**开发构建**（无 gc，任何一个 `zan_hw_*` 引用仍拉整块 53 KB）
+  与不跑 gc 的消费方。按族拆成员（下）仍值得做，但优先级降为开发体验项。
 - 现象（2026-10-22 A493 落地时留的尾巴）：`libzancrypto.a` 现在**只有一个成员**
   （整块 `rt_hw_accel.c`）。归档机制本身按"符号缺才拉"生效，但粒度只到"整块
   crypto"：程序只要用到其中一个符号（如 `zan_hw_sha256`），整簇 **63+ 个**
