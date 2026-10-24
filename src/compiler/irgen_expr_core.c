@@ -2419,9 +2419,10 @@ static void emit_weak_read_guard(zan_irgen_t *g, zan_ast_node_t *read_expr,
     emit_runtime_check(g, is_null, loc, msg);
 }
 
-static LLVMValueRef emit_guarded_member_object(zan_irgen_t *g,
-                                               zan_ast_node_t *member,
-                                               local_scope_t *locals) {
+static LLVMValueRef emit_guarded_member_object_ex(zan_irgen_t *g,
+                                                  zan_ast_node_t *member,
+                                                  local_scope_t *locals,
+                                                  bool async_gate) {
     LLVMValueRef value = emit_expr(g, member->member.object, locals);
     if (member && !member->member.null_cond)
         emit_weak_read_guard(g, member->member.object, value,
@@ -2437,11 +2438,40 @@ static LLVMValueRef emit_guarded_member_object(zan_irgen_t *g,
             LLVMValueRef isnull = zan_icmp(g->builder, LLVMIntEQ, value,
                                            LLVMConstNull(LLVMTypeOf(value)),
                                            "recv.null");
+            /* A550：async 被调者 + null 接收者不能走软基址——scratch 会被
+             * 当协程帧调度，协程序言的虚表派发/retain 读哨兵字节。走到这里
+             * = 不在 try（在 try 的 emit_weak_read_guard 已 longjmp 转
+             * NRE），async 调用没有有效续延，响亮中止；同步调用维持软基址
+             * （成员访问触发软诊断，报告后继续）。 */
+            if (async_gate) {
+                LLVMValueRef gfn = LLVMGetBasicBlockParent(
+                    LLVMGetInsertBlock(g->builder));
+                LLVMBasicBlockRef live_bb = LLVMAppendBasicBlockInContext(
+                    g->ctx, gfn, "recv.live");
+                LLVMBasicBlockRef dead_bb = LLVMAppendBasicBlockInContext(
+                    g->ctx, gfn, "recv.dead");
+                LLVMBuildCondBr(g->builder, isnull, dead_bb, live_bb);
+                LLVMPositionBuilderAtEnd(g->builder, dead_bb);
+                LLVMTypeRef abty = LLVMFunctionType(
+                    LLVMVoidTypeInContext(g->ctx), NULL, 0, 0);
+                zan_call2(g->builder, abty,
+                    get_libc_fn(g, "abort", abty), NULL, 0, "");
+                LLVMBuildUnreachable(g->builder);
+                LLVMPositionBuilderAtEnd(g->builder, live_bb);
+                return value;
+            }
             value = emit_soft_base_select(g, value, isnull,
                                           member->member.object->loc);
         }
     }
     return value;
+}
+
+/* 读路径（字段/下标/属性等）维持原口径：软基址替换，报告后继续。 */
+static LLVMValueRef emit_guarded_member_object(zan_irgen_t *g,
+                                               zan_ast_node_t *member,
+                                               local_scope_t *locals) {
+    return emit_guarded_member_object_ex(g, member, locals, false);
 }
 
 static bool class_implements_iface(zan_symbol_t *cls, zan_symbol_t *iface) {

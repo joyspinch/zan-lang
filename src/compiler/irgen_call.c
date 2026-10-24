@@ -2,6 +2,9 @@
 /* bool -> 托管串（irgen_generics.c）："true" / "false" */
 LLVMValueRef emit_bool_to_cstr(zan_irgen_t *g, LLVMValueRef v);
 
+/* A550：定义在 irgen_stmt.c（unity 排序在其后），这里前置声明。 */
+static bool call_is_async_callee(zan_irgen_t *g, zan_ast_node_t *call, local_scope_t *locals);
+
 static LLVMValueRef emit_detach_async_call(zan_irgen_t *g, LLVMValueRef sub,
                                            bool keep_result, bool is_explicit_spawn) {
     if (!sub || LLVMGetTypeKind(LLVMTypeOf(sub)) != LLVMPointerTypeKind)
@@ -423,7 +426,15 @@ static LLVMValueRef emit_method_spec_call(zan_irgen_t *g, int idx,
         LLVMTypeRef this_ty = LLVMTypeOf(LLVMGetParam(sp.fn, 0));
         LLVMValueRef self;
         if (recv_expr) {
-            self = emit_expr(g, recv_expr, locals);
+            bool is_async = (sp.msym && sp.msym->decl &&
+                             sp.msym->decl->kind == AST_METHOD_DECL &&
+                             (sp.msym->decl->method_decl.modifiers & MOD_ASYNC) != 0);
+            if (call && call->kind == AST_CALL && call->call.callee &&
+                call->call.callee->kind == AST_MEMBER_ACCESS) {
+                self = emit_guarded_member_object_ex(g, call->call.callee, locals, is_async);
+            } else {
+                self = emit_expr(g, recv_expr, locals);
+            }
         } else {
             self = LLVMBuildLoad2(g->builder,
                 LLVMGetAllocatedType(g->current_this), g->current_this, "self");
@@ -5087,6 +5098,28 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                                                 callee->member.object->ident.name.str);
                                             emit_runtime_check(g, isnull,
                                                 callee->member.object->loc, nm);
+                                            /* A550：async 被调者 + null 接收者
+                                             * 不能"报告后继续"——软基址会把
+                                             * scratch 当协程帧调度，协程序言
+                                             * 虚表派发读哨兵字节。走到这里 =
+                                             * 不在 try（在 try 的已 longjmp
+                                             * 转 NRE），无有效续延，响亮中止。 */
+                                            if (call_is_async_callee(g, expr, locals)) {
+                                                LLVMValueRef gfn = LLVMGetBasicBlockParent(
+                                                    LLVMGetInsertBlock(g->builder));
+                                                LLVMBasicBlockRef live_bb =
+                                                    LLVMAppendBasicBlockInContext(g->ctx, gfn, "recv.live");
+                                                LLVMBasicBlockRef dead_bb =
+                                                    LLVMAppendBasicBlockInContext(g->ctx, gfn, "recv.dead");
+                                                LLVMBuildCondBr(g->builder, isnull, dead_bb, live_bb);
+                                                LLVMPositionBuilderAtEnd(g->builder, dead_bb);
+                                                LLVMTypeRef abty = LLVMFunctionType(
+                                                    LLVMVoidTypeInContext(g->ctx), NULL, 0, 0);
+                                                zan_call2(g->builder, abty,
+                                                    get_libc_fn(g, "abort", abty), NULL, 0, "");
+                                                LLVMBuildUnreachable(g->builder);
+                                                LLVMPositionBuilderAtEnd(g->builder, live_bb);
+                                            }
                                             call_args[0] = emit_soft_base_select(
                                                 g, call_args[0], isnull,
                                                 callee->member.object->loc);
@@ -5228,8 +5261,9 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                             LLVMValueRef recv_val = NULL;
                             int recv_eh_pushed = 0;
                             if (!callee_static) {
-                                recv_val = emit_guarded_member_object(
-                                    g, callee, locals);
+                                recv_val = emit_guarded_member_object_ex(
+                                    g, callee, locals,
+                                    call_is_async_callee(g, expr, locals));
                                 call_args[0] = recv_val;
                                 if (LLVMGetTypeKind(LLVMTypeOf(recv_val)) == LLVMStructTypeKind) {
                                     LLVMValueRef rslot = emit_entry_alloca(g, LLVMTypeOf(recv_val), "recv.tmp");
@@ -5320,7 +5354,8 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
 
                     int uargc = expr->call.args.count;
                     int n_eh_args = 0;
-                    LLVMValueRef recv = emit_guarded_member_object(g, callee, locals);
+                    LLVMValueRef recv = emit_guarded_member_object_ex(
+                        g, callee, locals, m_async != 0);
                     LLVMValueRef *avals = (LLVMValueRef *)calloc((size_t)(uargc > 0 ? uargc : 1),
                                                                 sizeof(LLVMValueRef));
                     for (int k = 0; k < uargc; k++) {
