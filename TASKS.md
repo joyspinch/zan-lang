@@ -280,25 +280,33 @@
   结果"做不了，结果类型必须由泛型端点一路保留（`QueryEndpoint<T, TResult>`）。
 - 关联：A449、A434。
 
-### [ ] A487 自举把 `decimal` 类型映射成 `double`——目标侧无法区分 `decimal` 与 `double`
+### [x] A487 自举把 `decimal` 类型映射成 `double`——目标侧无法区分 `decimal` 与 `double`
 
-- 现象：宿主有真正的 `decimal` 类型，与 `double` **互不隐式转换**
-  （`double d = 5.0m` 报 *cannot convert*，`decimal d = 5.0` 也报）；
-  自举的 `parser.zan` 把 `TK.Decimal()` 映射成 `"double"`，AST 里 `decimal`
-  目标与 `double` 目标**是同一个东西**。
-- 影响：A485 的 16 条漏报里有 12 条来自这里：目标侧一旦涉及 decimal，自举就
-  分不清该按 `double` 规则（拒 decimal 值）还是按 `decimal` 规则（收 decimal 值）。
-- 方向：要么让自举保留 `decimal` 这个类型名（parser 不再映射，irgen 侧仍按
-  double 发射但类型名留着），要么明确接受"decimal 目标侧一律放行"这条边界。
-  前者更彻底，但会牵动 irgen 的类型判定。
-- 关联：A485（本次的漏报清单）、A463（诊断里类型名不渲染可空标志，同属
-  "自举的类型名比宿主粗"这一类）。
-- A445 的连带影响（2026-10-22 补记）：宿主把 `decimal` 降成 struct，所以
-  `Math.Sqrt(2.5m)` 被宿主拒绝（"requires an int or floating-point argument"）、
-  `Convert.ToInt32(2.5m)` 宿主给 0；自举因为把 decimal 折叠成 double，
-  `Math.Sqrt(2.5m)` **照收**、`Convert.ToInt32(2.5m)` 给 2。A445 只在自举侧
-  补了"按静态类型分流"的守卫，这两条 decimal 差异要等本条目把 decimal
-  还原成独立类型才会消失。
+- **已修（2026-10-24）**：走"保留类型名"路线——parser 不再折叠，发射仍按
+  double：
+  1. `parser.zan` TypeKeywordName：`TK.Decimal()` 现在返回 `"decimal"`；
+  2. `irgen.zan` MapType：`"decimal"` → `"double"`（载荷与调用面不变）；
+  3. `irgen_expr.zan` IsDbl 纳入 decimal（二元算术按 double 发射），但
+     `ToDbl`（Math 家族）**先查 MathNumBadType 再走 IsDbl 捷径**——否则
+     `Math.Sqrt(2.5m)` 会被 IsDbl 放行，宿主是拒的（Abs 分支本来就是
+     bad-type 在前，无需动）；
+  4. `checker.zan` CheckAssignable 按宿主语义收紧：float/double 槽不收
+     decimal 值；decimal 槽收整型/char/decimal（新臂，nullable 同）；char 槽
+     与 enum 槽不再收 decimal 值。checker 侧的 decimal 判定臂（二元混算、
+     `5.0m` suffix、Convert/Math 守卫名单）早已预埋，此前只是被 parser 折叠
+     掐死——解冻即生效。
+- 实证（双后端对拍）：`double x = 5.0m` 与 `decimal d = 5.0` 两侧**同文同位**
+  报 `cannot convert 'decimal' to 'double'` / `'double' to 'decimal'`（A485
+  的 12 条漏报由此解锁）；`Math.Sqrt(decimal)` 两侧同拒（列号漂移 4:9 vs
+  4:18，化妆品残留同 A455 记录）；`decimal + int == 10.5m` 自举侧编译运行
+  正确。selfhost_fixed_point（97.6s）与 selfhost_diff（484s，200+ 用例）全绿。
+- 残差（登记不闭）：`Convert.ToInt32(2.5m)` 宿主给 0（宿主 decimal 是
+  struct，白名单**收** decimal——irgen_call.c:674 TYPE_DECIMAL 在
+  type_is_textual_or_numeric 里——但 struct 载荷的降级层给 0），自举按
+  double 载荷给 2。这是**双端 decimal 表示差异**（struct vs double 载荷），
+  要等真 decimal 结构体发射（与 A454 装箱同族）才会消失，不是名字层问题。
+- 宿主侧新发现（另立条目）：宿主自己的 struct-decimal **算术算错**——
+  `decimal f = 5.5m; decimal e = 5; f + e == 10.5m` 打印 no。见 A545。
 
 ### [ ] A489 GPU 3D 片元着色器把光照写死成固定键光——没有材质与光源 uniform 通路
 
@@ -740,3 +748,20 @@
   类驱动（样式单一来源成立），html 化要么丢 ListView 语义、要么把行样式拆到
   两个地方；窗口骨架（设置/通讯录管理/聊天记录/独立聊天）与十页已全部
   html+css。
+
+### [ ] A548 宿主 struct-decimal 算术算错：`5.5m + 5 == 10.5m` 打印 no
+
+- 现象（2026-10-24 修 A487 时顺手撞见）：C 宿主（`build\zanc.exe`，2026-10-24
+  版）编译 `decimal f = 5.5m; decimal e = 5; f = d + e;`（`f == 10.5m ? "yes"
+  : "no"`）**打印 no**——`decimal` 在宿主是 struct（rt_decimal），`+` 走的
+  通用 struct/操作符路径给出的值与字面量 `10.5m` 的内部表示不相等。
+- 对照：自举侧（decimal 折叠成 double 载荷，A487 修后名字保留、载荷仍
+  double）同一程序打印 **yes**。
+- 影响：宿主侧 decimal 一旦参与算术，结果不可信——`decimal` 作为"精确十进制"
+  类型的卖点在宿主上不成立。A487 闭账时记录的 `Convert.ToInt32(2.5m)` 残差
+  （宿主 0 / 自举 2）同根：宿主 struct-decimal 的**降级层**（算术/转换/
+  ToString）没有一条按 rt_decimal 语义实现的通路。
+- 方向：要么在宿主 irgen 给 decimal 补真实现（载荷按 rt_decimal 的
+  scale/尾数布局走运行时调用，算术/比较/转换/ToString 四面），要么宿主也
+  把 decimal 显式降为 double（放弃精确十进制，双端语义对齐——A487 后自举
+  已经是这条路线）。两者取一，别停在"编译过但算错"。
