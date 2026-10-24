@@ -34,6 +34,7 @@ typedef struct {
     int brace;
     int paren;
     int bracket;
+    bool verbatim;
 } zan_interp_level_t;
 
 struct zan_lexer {

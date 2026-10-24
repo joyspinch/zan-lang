@@ -75,7 +75,7 @@
 - lazy iterators：`yield` 物化成 list，没有 `IEnumerable<T>` 协议
 - tagged union 枚举（代数数据类型）
 - `params` 之后的可选实参组合未系统验证
-- `$@"..."` 组合字符串、`"""` 原始字符串
+- `$@"..."` / `@$"..."` 逐字插值字符串已实现（带 `tests/conformance/verbatim_interpolated_string.zan` 用例）；`"""` 原始字符串
 - COW 集合：`List` 赋值是引用共享，修改即共享
 - `[CImport]`、`project.zan` 项目文件、`zan` CLI（实际是 `zanc`）
 

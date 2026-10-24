@@ -805,12 +805,13 @@ qualified_name  = IDENT { "." IDENT } ;
 - lazy iterators (`IEnumerable<T>` protocol) — `yield` currently materializes a list
 - tagged union 枚举（代数数据类型）
 - 命名实参之外的实参特性：`params` 之后的可选实参组合未系统验证
-- `$@"..."` 组合字符串、`"""` 原始字符串
+- `"""` 原始字符串（多行/单行三引号 raw string literal；`$@"..."`/`@$"..."` 逐字插值字符串已实现）
 - COW（copy-on-write）集合——`List` 赋值是引用共享，修改即共享
 - `[CImport]`、`project.zan` 项目文件、`zan` CLI（实际为 `zanc`）
 
 以下曾列为未实现、实测已可用（各带 conformance 用例）：
 
+- `$@"..."` 与 `@$"..."` 逐字插值字符串（双引号 `""` 转义、反斜杠无转义、`{{`/`}}` 转义、支持换行与格式化说明符，`verbatim_interpolated_string.zan`）
 - `using (res) { }` 确定性释放（`cs_b02_using.zan`）
 - `init` 只写访问器（`cs_b18_init.zan`）
 - 元组 `(int, string)` 与 `var (a, b) = ...` 解构（`cs_b03_tuple.zan`；嵌套解构仍未实现）

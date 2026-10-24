@@ -227,6 +227,11 @@ static inline char lexer_peek_ch2(zan_lexer_t *lex) {
     return lex->source[lex->pos + 1];
 }
 
+static inline char lexer_peek_ch3(zan_lexer_t *lex) {
+    if (lex->pos + 2 >= lex->source_len) return '\0';
+    return lex->source[lex->pos + 2];
+}
+
 static inline char lexer_advance(zan_lexer_t *lex) {
     if (lexer_at_end(lex)) return '\0';
     char ch = lex->source[lex->pos++];
@@ -1259,6 +1264,7 @@ static zan_token_t lexer_interp_string_segment(zan_lexer_t *lex, zan_token_kind_
             lex->interp_stack[lex->interp_depth].brace = 0;
             lex->interp_stack[lex->interp_depth].paren = 0;
             lex->interp_stack[lex->interp_depth].bracket = 0;
+            lex->interp_stack[lex->interp_depth].verbatim = false;
             lex->interp_depth++;
         }
         kind = start_kind;
@@ -1298,6 +1304,65 @@ static zan_token_t lexer_interp_format(zan_lexer_t *lex, zan_loc_t loc) {
     }
     zan_token_t tok = lexer_make(lex, TK_INTERP_FMT, loc);
     tok.str_val.str = zan_arena_strdup(lex->arena, buf, bi);
+    tok.str_val.len = (uint32_t)bi;
+    return tok;
+}
+
+static zan_token_t lexer_interp_verbatim_segment(zan_lexer_t *lex, zan_token_kind_t start_kind) {
+    zan_loc_t loc = lexer_loc(lex);
+    zan_lex_strbuf_t sb;
+    zan_lex_strbuf_init(&sb);
+
+    while (!lexer_at_end(lex)) {
+        char ch = lexer_peek_ch(lex);
+        if (ch == '"') {
+            if (lexer_peek_ch2(lex) == '"') {
+                lexer_advance(lex);
+                lexer_advance(lex);
+                zan_lex_strbuf_push(&sb, '"');
+            } else {
+                break;
+            }
+        } else if ((ch == '{' || ch == '}') && lexer_peek_ch2(lex) == ch) {
+            lexer_advance(lex);
+            lexer_advance(lex);
+            zan_lex_strbuf_push(&sb, ch);
+        } else if (ch == '{') {
+            break;
+        } else {
+            zan_lex_strbuf_push(&sb, lexer_advance(lex));
+        }
+    }
+
+    zan_token_kind_t kind;
+    if (lexer_peek_ch(lex) == '{') {
+        lexer_advance(lex); /* { */
+        if (lex->interp_depth >= ZAN_MAX_INTERP_DEPTH) {
+            zan_diag_emit(lex->diag, DIAG_ERROR, loc,
+                          "interpolated strings nested more than %d deep",
+                          ZAN_MAX_INTERP_DEPTH);
+        } else {
+            lex->interp_stack[lex->interp_depth].brace = 0;
+            lex->interp_stack[lex->interp_depth].paren = 0;
+            lex->interp_stack[lex->interp_depth].bracket = 0;
+            lex->interp_stack[lex->interp_depth].verbatim = true;
+            lex->interp_depth++;
+        }
+        kind = start_kind;
+    } else {
+        if (!lexer_at_end(lex)) {
+            lexer_advance(lex); /* closing " */
+        } else {
+            zan_diag_emit(lex->diag, DIAG_ERROR, loc,
+                          "unterminated verbatim interpolated string");
+        }
+        kind = (start_kind == TK_INTERP_START) ? TK_STRING_LIT : TK_INTERP_END;
+    }
+
+    size_t bi = 0;
+    char *text = zan_lex_strbuf_take(lex, &sb, &bi);
+    zan_token_t tok = lexer_make(lex, kind, loc);
+    tok.str_val.str = text;
     tok.str_val.len = (uint32_t)bi;
     return tok;
 }
@@ -1381,6 +1446,14 @@ pp_retry:
         return lexer_char(lex);
     }
 
+    if ((ch == '$' && lexer_peek_ch2(lex) == '@' && lexer_peek_ch3(lex) == '"') ||
+        (ch == '@' && lexer_peek_ch2(lex) == '$' && lexer_peek_ch3(lex) == '"')) {
+        lexer_advance(lex); /* $ or @ */
+        lexer_advance(lex); /* @ or $ */
+        lexer_advance(lex); /* " */
+        return lexer_interp_verbatim_segment(lex, TK_INTERP_START);
+    }
+
     if (ch == '@' && lexer_peek_ch2(lex) == '"') {
         return lexer_verbatim_string(lex);
     }
@@ -1406,7 +1479,10 @@ pp_retry:
         return lexer_make(lex, TK_LBRACE, loc);
     case '}':
         if (lexer_interp_top(lex) && lexer_interp_top(lex)->brace == 0) {
+            bool is_verb = lexer_interp_top(lex)->verbatim;
             lex->interp_depth--;
+            if (is_verb)
+                return lexer_interp_verbatim_segment(lex, TK_INTERP_MID);
             return lexer_interp_string_segment(lex, TK_INTERP_MID);
         }
         if (lexer_interp_top(lex)) lexer_interp_top(lex)->brace--;
