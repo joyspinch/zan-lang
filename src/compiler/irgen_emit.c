@@ -468,7 +468,17 @@ static void declare_async_method(zan_irgen_t *g, method_body_work_t *w,
         w->alocal_count = scan.local_count;
         w->fin_depth_max = scan.fin_depth_max;
         w->try_count = scan.try_count;
-        w->handler_cap = scan.try_count > 0 ? scan.try_count : 1;
+        /* A549：处理器数组（HSTACK/HPENDING/CEXC*）的容量必须覆盖"发射点数"
+         * 而不是"源码 try 数"。finally 体按提前离开的转移语句内联复制
+         * （emit_finally_body），每个副本里的 try 都领新的 handler id；路由
+         * 生成代码这类 try+catch+finally+转移 的形状实测 14 个发射点 vs 容量
+         * 7，hid≥7 的 GEP 越界写进帧内相邻字段，把 __c 的高 32 位踩成
+         * pending 计数 → 恢复后 retain 垃圾指针段错误。
+         * 上限 = try_count × (1 + 转移语句数 × finally 嵌套深)。 */
+        int xfer_count = async_count_transfers(member->method_decl.body);
+        int fin_nest = scan.fin_depth_max > 0 ? scan.fin_depth_max : 1;
+        w->handler_cap = scan.try_count * (1 + xfer_count * fin_nest);
+        if (w->handler_cap < 1) w->handler_cap = 1;
 
         int locals_base = ASYNC_FRAME_FIRST_PARAM + total_params;
         w->sub_base = locals_base + w->alocal_count;

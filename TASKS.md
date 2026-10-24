@@ -20,8 +20,9 @@
     帧压力打穿 FIFO 不崩。
   - **默认路径改道被证伪**：把 `zan_emit_frame_free` 的默认分支也改走守卫
     释放，`async_catch_ownership_route` / `web_route_async_teardown` 等 3
-    条当场 AV（但该 3 条在基线同样失败，见 A549——改道是否有罪未定，
-    默认路径先行还原，irgen.c 留复盘注释）。剩余工程 = 先把默认驱动的帧
+    条当场 AV（后经 A549 闭账证明该 3 条是存量账、与改道无关，但改道仍
+    需先摸清默认驱动的帧生命周期协议才能定安全，默认路径先行还原，
+    irgen.c 留复盘注释）。剩余工程 = 先把默认驱动的帧
     生命周期协议摸清（帧头是否随模式存在、释放时序与泵的交错），再谈
     统一释放口。
   - **附产（A464 存量破坏修复）**：wasm32 的运行时对象自 A464 落地起就
@@ -737,23 +738,18 @@
   两个地方；窗口骨架（设置/通讯录管理/聊天记录/独立聊天）与十页已全部
   html+css。
 
-### [ ] A549 async 套件两条 AV——A507 异常通道落地后 catch/ownership/teardown 路径崩
+### [ ] A550 软空接收者对 async 成员调用会崩：null 接收者换 scratch 后照常调度协程
 
-- 现象（2026-10-24 跑 async 全量对照时发现，**基线亲验**）：`ctest -R async`
-  201 条里 3 条失败——`case_async_catch_ownership_route`（30/201）与
-  `case_web_route_async_teardown`（182/201）**Access violation、stdout 空**；
-  第三条疑似负载性超时（两次全量均 3 条失败、具名完全一致，其中一次伴随
-  并行构建的负载）。**与 A380 的帧检疫改动无关**：把 irgen/rt_io/rt_wasm
-  的在途改动全部 stash 掉、用落盘工具链重建后，两条 AV 照旧。
-- 嫌疑：`5aaed3513`（A507 异常通道，2026-10-24 落地）——catch/所有权/
-  teardown 正是异常通道的敏感面；该批落地后没人常规跑过 async 全量
-  （full 档条目，规则 8 的 opt-in 盲区再现：A464 的 wasm 存量破坏同日
-  才被发现，见 A380 的附产记录）。
-- 影响：async + catch 的组合面（业务代码的常态形状）在宿主上崩。
-- 方向：从 5aaed3513 的 diff 里找 catch 清理路径与帧释放的交互；两条
-  失败用例本身即最小复现（stdout 空 = main 第一段 async 就崩）。
-- 探针：`ctest -R "^case_async_catch_ownership_route$"`（秒级）。
-- 关联：A507（嫌疑提交）、A380（发现时的对照实验）。
+- 现象（2026-10-24 修 A549 顺带发现，未单独复现用例）：`recv.method()` 在
+  recv 为 null 时，编译器把接收者换成 `zan_rt_soft_scratch` 静态缓冲再调用
+  （本意：方法体内的成员访问触发软诊断 → 可捕获 NRE）。同步方法成立；
+  **async 方法不成立**——`call @M(ptr scratch)` 会把 scratch 当协程帧头
+  挂进调度器，协程序言 `retain(this=scratch)` 及虚表派发读到的都是
+  scratch 头部的 rc 哨兵字节，行为未定义。
+- 影响：`null 对象.异步方法()` 这类写法本应得到可捕获 NRE，实际可能段错误。
+- 方向：async 成员调用的软接收者替换应在**调度前**拦下——recv 为 null 且
+  方法为 async 时直接走软诊断抛 NRE，不进入 co_ready。
+- 关联：A507（软诊断协议）、A549（同一次调查的顺带发现）。
 
 ### [x] A548 宿主 struct-decimal 算术算错：`5.5m + 5 == 10.5m` 打印 no（2026-10-24 闭账）
 

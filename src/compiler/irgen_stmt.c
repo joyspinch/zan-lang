@@ -2328,6 +2328,15 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
             zan_store_fit(g, zan_add(g->builder, hc,
                 LLVMConstInt(i32t, 1, 0), "eh.hc1"), hc_ptr);
             async_hid = g->current_async_handler_next++;
+            /* A549：hid 是编译期常量索引，超容量就是帧布局账目错了——
+             * 编译期报错而不是让 GEP 静默越界（容量由 irgen_emit 按发射
+             * 上限定，正常永远走不到）。 */
+            if (async_hid >= g->current_async_handler_cap) {
+                zan_diag_emit(g->diag, DIAG_ERROR, stmt->loc,
+                              "internal: async handler id %d exceeds frame "
+                              "handler capacity %d", async_hid,
+                              g->current_async_handler_cap);
+            }
             if (LLVMGetArrayLength(LLVMStructGetTypeAtIndex(
                     g->current_async_frame_type, ASYNC_FRAME_PENDING))) {
                 LLVMTypeRef hp_type = LLVMStructGetTypeAtIndex(
@@ -2344,6 +2353,27 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
             }
             if (g->current_async_rearm_switch) {
                 int hid = async_hid;
+                /* A549：hc 是运行时值，压栈前按容量硬守卫——越界宁可响亮
+                 * abort 也不写进帧内相邻字段（对齐 pending.push 的 overflow
+                 * 模式；landing 侧迭代早有 select 封顶，这里补齐 push 侧）。 */
+                LLVMValueRef hs_cap = LLVMConstInt(i32t,
+                    (unsigned)g->current_async_handler_cap, 0);
+                LLVMValueRef hsf = LLVMGetBasicBlockParent(
+                    LLVMGetInsertBlock(g->builder));
+                LLVMBasicBlockRef hs_ok = LLVMAppendBasicBlockInContext(g->ctx,
+                    hsf, "eh.hs.ok");
+                LLVMBasicBlockRef hs_ovf = LLVMAppendBasicBlockInContext(g->ctx,
+                    hsf, "eh.hs.overflow");
+                LLVMBuildCondBr(g->builder,
+                    zan_icmp(g->builder, LLVMIntULT, hc, hs_cap, "eh.hs.fits"),
+                    hs_ok, hs_ovf);
+                LLVMPositionBuilderAtEnd(g->builder, hs_ovf);
+                LLVMTypeRef abrt_ty = LLVMFunctionType(
+                    LLVMVoidTypeInContext(g->ctx), NULL, 0, 0);
+                zan_call2(g->builder, abrt_ty,
+                    get_libc_fn(g, "abort", abrt_ty), NULL, 0, "");
+                LLVMBuildUnreachable(g->builder);
+                LLVMPositionBuilderAtEnd(g->builder, hs_ok);
                 LLVMValueRef hs = LLVMBuildStructGEP2(g->builder,
                     g->current_async_frame_type, g->current_async_frame,
                     ASYNC_FRAME_HSTACK, "eh.hs");
