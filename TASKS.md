@@ -10,6 +10,26 @@
 
 ### [ ] A380 协程帧的释放仍只在类型侧收口——运行时没有幂等保护
 
+- **2026-10-24 进度（部分落地 + 一次被证伪的尝试）**：
+  - **检疫区已落地**（rt_io.c，mt 驱动的 `__zan_co_frame_free`）：释放的帧
+    进 FIFO 检疫区（SRWLOCK/PTHREAD_MUTEX 静态初始化锁——帧释放可能早于
+    `zan_co_sched_init`，不能依赖调度器初始化时序；封顶 1024 帧，超限按
+    FIFO 真放前一半）——external_async_executor 路径的守卫从此可靠：free
+    后块首 CO_DEAD 位不再被分配器 freelist 覆盖，二次释放稳定读到 DEAD
+    并返回。C 级探针验证：双释放存活、CO_DEAD 位在首次释放后仍在、3000
+    帧压力打穿 FIFO 不崩。
+  - **默认路径改道被证伪**：把 `zan_emit_frame_free` 的默认分支也改走守卫
+    释放，`async_catch_ownership_route` / `web_route_async_teardown` 等 3
+    条当场 AV（但该 3 条在基线同样失败，见 A549——改道是否有罪未定，
+    默认路径先行还原，irgen.c 留复盘注释）。剩余工程 = 先把默认驱动的帧
+    生命周期协议摸清（帧头是否随模式存在、释放时序与泵的交错），再谈
+    统一释放口。
+  - **附产（A464 存量破坏修复）**：wasm32 的运行时对象自 A464 落地起就
+    过期——`zan_rt_alloc_add`（A464 加进 rt_timer.c）不在
+    toolchain/wasm32/zanrt_timer.o 里，任何带分配的 wasm 程序链接即挂
+    （conformance_wasm32_async_yield 红了没人看见）。本批补齐
+    `__zan_co_frame_free` 的 wasm 定义（rt_wasm.c，裸 free——wasm 单线程
+    无调度头）+ wasm 全部对象 zig cc 刷新 + 分段重跑，wasm32 四条全绿。
 - 现状（A379 已闭）：`Task.Run(lambda)` 的句柄被检查器定型成"无结果任务"，
   把 lambda 句柄当 `Task<T>` 用去读 `.Result`/`.Wait()` 会在**编译期**被拒绝
   （`tests/diag/task_run_action_result_type.zan`），那条运行期 double free 路径
@@ -716,6 +736,24 @@
   类驱动（样式单一来源成立），html 化要么丢 ListView 语义、要么把行样式拆到
   两个地方；窗口骨架（设置/通讯录管理/聊天记录/独立聊天）与十页已全部
   html+css。
+
+### [ ] A549 async 套件两条 AV——A507 异常通道落地后 catch/ownership/teardown 路径崩
+
+- 现象（2026-10-24 跑 async 全量对照时发现，**基线亲验**）：`ctest -R async`
+  201 条里 3 条失败——`case_async_catch_ownership_route`（30/201）与
+  `case_web_route_async_teardown`（182/201）**Access violation、stdout 空**；
+  第三条疑似负载性超时（两次全量均 3 条失败、具名完全一致，其中一次伴随
+  并行构建的负载）。**与 A380 的帧检疫改动无关**：把 irgen/rt_io/rt_wasm
+  的在途改动全部 stash 掉、用落盘工具链重建后，两条 AV 照旧。
+- 嫌疑：`5aaed3513`（A507 异常通道，2026-10-24 落地）——catch/所有权/
+  teardown 正是异常通道的敏感面；该批落地后没人常规跑过 async 全量
+  （full 档条目，规则 8 的 opt-in 盲区再现：A464 的 wasm 存量破坏同日
+  才被发现，见 A380 的附产记录）。
+- 影响：async + catch 的组合面（业务代码的常态形状）在宿主上崩。
+- 方向：从 5aaed3513 的 diff 里找 catch 清理路径与帧释放的交互；两条
+  失败用例本身即最小复现（stdout 空 = main 第一段 async 就崩）。
+- 探针：`ctest -R "^case_async_catch_ownership_route$"`（秒级）。
+- 关联：A507（嫌疑提交）、A380（发现时的对照实验）。
 
 ### [ ] A548 宿主 struct-decimal 算术算错：`5.5m + 5 == 10.5m` 打印 no
 

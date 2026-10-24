@@ -1157,6 +1157,12 @@ static LLVMValueRef zan_call2(LLVMBuilderRef b, LLVMTypeRef ty, LLVMValueRef fn,
 }
 
 static void zan_emit_frame_free(zan_irgen_t *g, LLVMValueRef frame_i8) {
+    /* A380 复盘（2026-10-24）：曾试过把默认路径也改走 __zan_co_frame_free
+     * （CO_DEAD 守卫 + 检疫区），async_catch_ownership_route /
+     * web_route_async_teardown 等 3 条用例当场 Access violation——默认
+     * 进程内驱动的帧释放时序/所有权与 mt 守卫释放的协议不匹配（守卫的
+     * QUEUED/RUNNING 分支会把活帧标记 DEAD 或把 CO_DEAD 写进非头部字节），
+     * 缓解前不能改道。检疫区仍服务于 external_async_executor 路径。 */
     if (g->external_async_executor && g->rt_co_frame_free) {
         zan_call2(g->builder, g->rt_co_frame_free_type, g->rt_co_frame_free,
                   &frame_i8, 1, "");
