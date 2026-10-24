@@ -171,26 +171,28 @@
 - ⚠ 不要用"先 `opt -O2` 再 llc"绕过：`opt -O2` 后能过，是因为优化器把死函数与
   冗余结构一起干掉了，编译器自己产出的 IR 仍然过不了自己的后端。
 
-### [ ] A433 宿主有 `Binding<T>` 双向绑定原语降解，自举没有——赋给 `Binding<T>` 槽位的值没被包成 Binding
+### [x] A433 宿主有 `Binding<T>` 双向绑定原语降解，自举没有——赋给 `Binding<T>` 槽位的值没被包成 Binding
 
-- 现象（2026-10-20 实测，`objinit_ctor_field_overwrite.zan`）：自举**崩**
-  （0xC0000005）。看起来像"对象初始化器覆盖 RC 字段"的锅，其实不是——
-  把该用例里的对象初始化器去掉（`new Card()`），自举照样崩。
-- 根因：`Binding<T>` 是**泛型类**，字段 `Binding<string> title` 的槽位在自举
-  里是"一个指针"。宿主有一条专门的原语降解：往 `Binding<T>` 槽位赋值时，
-  - 赋的是**字段左值** → 合成一个 **live 绑定**（getter/setter 委托指向那个
-    字段，读走 getter、写回 setter）；
-  - 赋的是**其它表达式** → 合成一个 **const 绑定**（`constVal` 存该值）。
-  宿主实现见 `irgen_expr.c` 的 `type_is_binding` / `emit_binding_value` /
-  `emit_binding_acc_delegate`；检查器侧 `checker.c` 允许把 `T` 直接赋给
-  `Binding<T>` 槽位。
-  自举没有这一层：`title = seed`（seed 是 string）把**字符串指针**直接写进
-  那个槽位，随后 `title.Get()` 把它当 Binding 解引用 → 崩。
-- 关联：A421（泛型类字段布局）——live 绑定要合成 `BindGet<T>`/`BindSet<T>`
-  委托（泛型委托的签名特化），与泛型实例化模型是同一件事。
-- 方向：先做 **const 绑定**（赋值时合成一个 `Binding<T>` 实例，`constVal` 存
-  值），再做 live 绑定（合成委托）。
-- 现状规避：自举产物里不要用 `Binding<T>` 字段。
+- **已闭（2026-10-24 复核实证）**：整层已在，且 const 与 live **都**实现了——
+  `src/selfhost/irgen_binding.zan`（302 行，镜像宿主 emit_binding_value）：
+  - `IsBindingTy`/`SlotTypeOf`/`GenBindingValue`：赋值目标类型是
+    `Binding<T>` 且 RHS 不是 Binding 实例/null 时包盒；
+  - **const 绑定**（165）：值进 `constVal`（擦除 i64 槽，指针 ptrtoint /
+    double bitcast），托管值 ARC retain（170），`live=0`；
+  - **live 绑定**（148）：字段左值（含裸字段名 = `this.field`）→ 合成
+    `__zbind_get/set_<n>` 访问器对（delegate invoke ABI：env + target [+ v]，
+    字段字进出擦除槽，231-261）+ `{fn, env}` 闭包（195），`live=1`；
+    `target` 按非拥有引用存（model<->view 循环防 RC 环，151）；owned 临时
+    接收者（Call/New/Await/属性读）按宿主规则降解成 const 快照（82-105）；
+  - 接线全断面：赋值（irgen_expr 2241）、对象初始化器（4439）、局部声明
+    带初始化（irgen_stmt 1251）、字段初始化（irgen 4713），native 后端
+    （ngen_binding + ngen 七处）同步。
+- 实证（双后端对拍，输出逐字一致）：const 形状四种（局部声明带初始化 /
+  普通赋值 / 对象初始化器字段 / 普通字段赋值）+ `Set`/`Version` 语义；
+  live 形状 `Binding<string> lb = m.name` → `IsLive()`=live、改模型字段
+  `Get()` 跟着变、`Set` 回写模型——v1/live/v2/v3/done 两侧一致，无崩溃。
+- 原登记的崩（0xC0000005）是降解层落地前的状态；宿主侧原语见
+  `irgen_expr.c` 的 `type_is_binding`/`emit_binding_value`。
 
 ### [~] A435 控件的 `Kind()` 与"kind 名单"三处副本要对得上
 
