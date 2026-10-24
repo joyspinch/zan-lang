@@ -695,23 +695,3 @@
 - 前置：`packages/Zan.Gui/src/Gui/drivers/win-x64/*` 的驱动二进制当前是**另一会话的
   在途改动**，这轮不重建驱动；模板侧先用 `<div>` 顶上（登录窗已改，见提交）。
 
-### [ ] A547 框架：ListView 行模板走 html 的真实门槛（编译期通道本就能按行建树）
-- 更正（2026-10-23 实测）：先前记的「HTML 只能整树装载」只对**运行期**
-  `app.LoadHtmlWith` 成立——它每次装载都把作用域 CSS 追加进 appCss 并整表
-  重铺。**编译期 GenHtml 通道（`XxxHtml.Build()`）每次调用建一棵新树**，
-  `Css` 是静态串、启动时并一次 → 行片段本来就能「按行建树」，不必等框架
-  补 API。（`HtmlDoc` 不暴露 WDoc/WNode 那条只卡运行期通道。）
-- 真正的门槛是 ListView 的行工厂契约：`RowOf<T>` 要的是代码建的 Control，
-  框架规范也写明「运行期挂载件（行模板等）不携作用域类，样式放皮肤层」；
-  声明式行只有 `<template data-for>` 一路，代价是丢掉 ListView 的
-  虚拟化/滚动/选中语义。
-- 本轮在这条路上撞到一个真缺陷并已修：`<template data-for>` 展开的行，
-  **行根（@click 的宿主）没有作用域**——早期只给声明了绑定的控件登记，
-  `ScopeOf(行根)` 返回 null → 行点击静默失灵（界面正常、点击毫无反应，
-  服务端一个请求都没发）。已修 `ModelBinder.ScopeRow`：行根无条件登记一次
-  （撤行时对称摘除）；conformance 用例 `gui_html_dynamic` 钉住（行根
-  `ScopeOf` 命中行模型项）。
-- 本轮取舍：行模板（ListView 行）与弹出面板**保持命令式**——外观由皮肤 CSS
-  类驱动（样式单一来源成立），html 化要么丢 ListView 语义、要么把行样式拆到
-  两个地方；窗口骨架（设置/通讯录管理/聊天记录/独立聊天）与十页已全部
-  html+css。
