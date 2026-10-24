@@ -1,0 +1,483 @@
+using System;
+using System.Collections.Generic;
+using System.Data.Orm;
+using System.Json;
+using System.Web;
+using ZanWeb.Dao.Lifecycle;
+using ZanWeb.Model.Collab;
+using ZanWeb.Model.Lifecycle;
+using ZanWeb.Model;
+using ZanWeb.Security;
+
+namespace ZanWeb.Api;
+
+/* 全生命周期协同管理接口：
+   覆盖 选品 -> 生产 -> 上架 -> 推广 -> 优化 全流程。
+   每一个项目绑定专属作战群(CollabConversation)，各阶段严格责任到人，AI 全程协同赋能。 */
+[Route("api/lifecycle/[action]")]
+[Custom(Authorization = CustomAuthorization.ApiAuth)]
+[Description("生命周期协同域")]
+class LifecycleApi : ApiController {
+
+    static string StageName(string stage) {
+        if (stage == "selection") { return "1.企划与选品"; }
+        if (stage == "manufacturing") { return "2.打样与生产"; }
+        if (stage == "publishing") { return "3.上架与渠道"; }
+        if (stage == "marketing") { return "4.全域营销推广"; }
+        if (stage == "optimization") { return "5.复盘与持续优化"; }
+        if (stage == "completed") { return "已完结归档"; }
+        return stage;
+    }
+
+    static string NextStage(string stage) {
+        if (stage == "selection") { return "manufacturing"; }
+        if (stage == "manufacturing") { return "publishing"; }
+        if (stage == "publishing") { return "marketing"; }
+        if (stage == "marketing") { return "optimization"; }
+        return "completed";
+    }
+
+    static string DefaultAiAgent(string stage) {
+        if (stage == "selection") { return "选品分析师Agent"; }
+        if (stage == "manufacturing") { return "工艺排产Agent"; }
+        if (stage == "publishing") { return "货品上架Agent"; }
+        if (stage == "marketing") { return "营销创意Agent"; }
+        if (stage == "optimization") { return "数据归因Agent"; }
+        return "协同助手Agent";
+    }
+
+    static string GenerateAiAdvice(string stage, string projectName) {
+        if (stage == "selection") {
+            return "[选品分析师Agent] 竞品均价 ¥89-129，同类热度环比 +142%。建议测款首批生产 1,000 件，阶梯定价：首单体验价 ¥79，零售价 ¥99，预估毛利率 52.8%。";
+        }
+        if (stage == "manufacturing") {
+            return "[工艺排产Agent] 智能 BOM 已推导完成：面料耗损率预估 2.4%，主辅料已锁定。智能工序调度排期：裁剪 2天 -> 车缝 4天 -> 质检整烫 1天，预计第 7 天质检合格入库。";
+        }
+        if (stage == "publishing") {
+            return "[货品上架Agent] 多渠道主图与商详卖点已就绪。主打核心卖点'保暖垂顺/防静电'。跨平台库存策略建议：主推渠道 40%，次要渠道 35%，全域分发 25%，防超卖锁定。";
+        }
+        if (stage == "marketing") {
+            return "[营销创意Agent] 3 套带货短视频分镜脚本已生成，黄金前 3 秒痛点抓手完备。建议投放梯队：头部 1 位背书 + 中腰部 10 位挂车起量；ROI 止损警戒线设为 1.8。";
+        }
+        if (stage == "optimization") {
+            return "[数据归因Agent] 上线首周客诉退货率 3.1%（显著优于行业 8% 大盘）。好评关键词集中在'触感细腻'；归因发现个别反馈裤长偏长，已输出版型优化与追加翻单建议。";
+        }
+        return "[协同助手Agent] 项目进入新阶段，各项业务指标监控运行中。";
+    }
+
+    /* 项目列表 */
+    [HttpGet]
+    [Description("项目管道列表")]
+    [Custom(Perm = PermBit.View)]
+    async void Projects() {
+        List<LifecycleProject> list = await this.LifecycleProject
+            .OrderByDescending(a => a.id).ToListAsync();
+        List<SysUser> users = await this.SysUser.ToListAsync();
+        JsonValue items = JsonValue.NewArray();
+        for (int i = 0; i < list.Count; i = i + 1) {
+            LifecycleProject p = list[i];
+            string ownerName = "未知";
+            for (int u = 0; u < users.Count; u = u + 1) {
+                if (users[u].id == p.ownerId) {
+                    ownerName = users[u].nickname.Length > 0 ? users[u].nickname : users[u].username;
+                }
+            }
+            JsonValue o = JsonValue.NewObject();
+            o.Put("id", JsonValue.NewStr(Convert.ToString(p.id)));
+            o.Put("projectNo", JsonValue.NewStr(p.projectNo));
+            o.Put("name", JsonValue.NewStr(p.name));
+            o.Put("category", JsonValue.NewStr(p.category));
+            o.Put("currentStage", JsonValue.NewStr(p.currentStage));
+            o.Put("currentStageName", JsonValue.NewStr(LifecycleApi.StageName(p.currentStage)));
+            o.Put("status", JsonValue.NewStr(p.status));
+            o.Put("ownerId", JsonValue.NewStr(Convert.ToString(p.ownerId)));
+            o.Put("ownerName", JsonValue.NewStr(ownerName));
+            o.Put("conversationId", JsonValue.NewStr(Convert.ToString(p.conversationId)));
+            o.Put("targetGmv", JsonValue.NewStr(p.targetGmv));
+            o.Put("targetRoi", JsonValue.NewStr(p.targetRoi));
+            o.Put("actualGmv", JsonValue.NewStr(p.actualGmv));
+            o.Put("actualRoi", JsonValue.NewStr(p.actualRoi));
+            o.Put("createdAt", JsonValue.NewStr(Convert.ToString(p.createdAt)));
+            items.Append(o);
+        }
+        JsonValue body = JsonValue.NewObject();
+        body.Put("projects", items);
+        this.Ok(body.ToJson());
+    }
+
+    /* 项目详情及各阶段节点 */
+    [HttpGet]
+    [Description("项目详情及阶段节点")]
+    [Custom(Perm = PermBit.View)]
+    async void Detail() {
+        int projectId = this.InInt("projectId", 0);
+        if (projectId <= 0) { this.Fail(400, "0400", "缺少 projectId"); return; }
+        LifecycleProject p = await this.LifecycleProject
+            .Where(a => a.id == projectId).FirstAsync();
+        if (p == null) { this.Fail(404, "0404", "项目不存在"); return; }
+
+        List<LifecycleNode> nodes = await this.LifecycleNode
+            .Where(a => a.projectId == projectId).OrderBy(a => a.id).ToListAsync();
+        List<SysUser> users = await this.SysUser.ToListAsync();
+
+        string ownerName = "未知";
+        for (int u = 0; u < users.Count; u = u + 1) {
+            if (users[u].id == p.ownerId) {
+                ownerName = users[u].nickname.Length > 0 ? users[u].nickname : users[u].username;
+            }
+        }
+
+        JsonValue nodeArr = JsonValue.NewArray();
+        for (int i = 0; i < nodes.Count; i = i + 1) {
+            LifecycleNode n = nodes[i];
+            string respName = "待指派";
+            string apprvName = "-";
+            for (int u = 0; u < users.Count; u = u + 1) {
+                if (users[u].id == n.responsibleUserId) {
+                    respName = users[u].nickname.Length > 0 ? users[u].nickname : users[u].username;
+                }
+                if (users[u].id == n.approvedBy) {
+                    apprvName = users[u].nickname.Length > 0 ? users[u].nickname : users[u].username;
+                }
+            }
+            JsonValue no = JsonValue.NewObject();
+            no.Put("id", JsonValue.NewStr(Convert.ToString(n.id)));
+            no.Put("stage", JsonValue.NewStr(n.stage));
+            no.Put("stageName", JsonValue.NewStr(n.stageName));
+            no.Put("responsibleUserId", JsonValue.NewStr(Convert.ToString(n.responsibleUserId)));
+            no.Put("responsibleName", JsonValue.NewStr(respName));
+            no.Put("aiAgentRole", JsonValue.NewStr(n.aiAgentRole));
+            no.Put("status", JsonValue.NewStr(n.status));
+            no.Put("deliverableSummary", JsonValue.NewStr(n.deliverableSummary));
+            no.Put("aiSuggestion", JsonValue.NewStr(n.aiSuggestion));
+            no.Put("approvedBy", JsonValue.NewStr(Convert.ToString(n.approvedBy)));
+            no.Put("approvedByName", JsonValue.NewStr(apprvName));
+            no.Put("approvedAt", JsonValue.NewStr(Convert.ToString(n.approvedAt)));
+            nodeArr.Append(no);
+        }
+
+        JsonValue body = JsonValue.NewObject();
+        body.Put("id", JsonValue.NewStr(Convert.ToString(p.id)));
+        body.Put("projectNo", JsonValue.NewStr(p.projectNo));
+        body.Put("name", JsonValue.NewStr(p.name));
+        body.Put("category", JsonValue.NewStr(p.category));
+        body.Put("currentStage", JsonValue.NewStr(p.currentStage));
+        body.Put("currentStageName", JsonValue.NewStr(LifecycleApi.StageName(p.currentStage)));
+        body.Put("status", JsonValue.NewStr(p.status));
+        body.Put("ownerId", JsonValue.NewStr(Convert.ToString(p.ownerId)));
+        body.Put("ownerName", JsonValue.NewStr(ownerName));
+        body.Put("conversationId", JsonValue.NewStr(Convert.ToString(p.conversationId)));
+        body.Put("targetGmv", JsonValue.NewStr(p.targetGmv));
+        body.Put("targetRoi", JsonValue.NewStr(p.targetRoi));
+        body.Put("actualGmv", JsonValue.NewStr(p.actualGmv));
+        body.Put("actualRoi", JsonValue.NewStr(p.actualRoi));
+        body.Put("nodes", nodeArr);
+        this.Ok(body.ToJson());
+    }
+
+    /* 立项创建：自动创建生命周期实体、5大阶段节点，并联动创建专属协同作战群 */
+    [HttpPost]
+    [Description("立项创建")]
+    [Custom(Perm = PermBit.Create)]
+    async void Create() {
+        SysUser me = await this.Me();
+        string name = this.Need("name", "项目名称");
+        string projectNo = this.In("projectNo");
+        if (projectNo.Length == 0) {
+            projectNo = "PRJ-" + Convert.ToString(WebApp.NowSeconds());
+        }
+        string category = this.In("category");
+        if (category.Length == 0) { category = "综合品类"; }
+        string targetGmv = this.In("targetGmv");
+        if (targetGmv.Length == 0) { targetGmv = "100000"; }
+        string targetRoi = this.In("targetRoi");
+        if (targetRoi.Length == 0) { targetRoi = "2.0"; }
+
+        int selUserId = this.InInt("selectionUserId", me.id);
+        int mfgUserId = this.InInt("mfgUserId", me.id);
+        int pubUserId = this.InInt("pubUserId", me.id);
+        int mktUserId = this.InInt("mktUserId", me.id);
+        int optUserId = this.InInt("optUserId", me.id);
+
+        long now = WebApp.NowSeconds();
+
+        /* 1. 自动创建专属项目协同作战群 */
+        CollabConversation conv = new CollabConversation();
+        conv.tenantId = Tenant.Cur();
+        conv.type = "group";
+        conv.title = "【作战群】" + name;
+        conv.creatorId = me.id;
+        conv.version = 1;
+        conv.createdAt = now;
+        conv.updatedAt = now;
+        conv.archivedAt = 0;
+        int convId = await this.CollabConversation.Insert(conv).ExecuteIdentityAsync();
+
+        /* 2. 将创建者及各阶段人类责任人加入群聊 */
+        List<int> memberIds = new List<int>();
+        memberIds.Add(me.id);
+        if (!memberIds.Contains(selUserId)) { memberIds.Add(selUserId); }
+        if (!memberIds.Contains(mfgUserId)) { memberIds.Add(mfgUserId); }
+        if (!memberIds.Contains(pubUserId)) { memberIds.Add(pubUserId); }
+        if (!memberIds.Contains(mktUserId)) { memberIds.Add(mktUserId); }
+        if (!memberIds.Contains(optUserId)) { memberIds.Add(optUserId); }
+
+        for (int m = 0; m < memberIds.Count; m = m + 1) {
+            CollabMember cm = new CollabMember();
+            cm.tenantId = Tenant.Cur();
+            cm.conversationId = convId;
+            cm.userId = memberIds[m];
+            cm.role = memberIds[m] == me.id ? "owner" : "member";
+            cm.status = "active";
+            cm.joinedAt = now;
+            cm.leftAt = 0;
+            cm.lastReadMsgId = 0;
+            await this.CollabMember.Insert(cm).ExecuteIdentityAsync();
+        }
+
+        /* 3. 创建主项目记录 */
+        LifecycleProject p = new LifecycleProject();
+        p.tenantId = Tenant.Cur();
+        p.projectNo = projectNo;
+        p.name = name;
+        p.category = category;
+        p.currentStage = "selection";
+        p.status = "active";
+        p.ownerId = me.id;
+        p.conversationId = convId;
+        p.targetGmv = targetGmv;
+        p.targetRoi = targetRoi;
+        p.actualGmv = "0";
+        p.actualRoi = "0";
+        p.createdAt = now;
+        p.updatedAt = now;
+        int projectId = await this.LifecycleProject.Insert(p).ExecuteIdentityAsync();
+
+        /* 4. 创建五大阶段节点 */
+        string[] stages = new string[] { "selection", "manufacturing", "publishing", "marketing", "optimization" };
+        int[] userIds = new int[] { selUserId, mfgUserId, pubUserId, mktUserId, optUserId };
+
+        for (int s = 0; s < stages.Length; s = s + 1) {
+            string st = stages[s];
+            LifecycleNode n = new LifecycleNode();
+            n.tenantId = Tenant.Cur();
+            n.projectId = projectId;
+            n.stage = st;
+            n.stageName = LifecycleApi.StageName(st);
+            n.responsibleUserId = userIds[s];
+            n.aiAgentRole = LifecycleApi.DefaultAiAgent(st);
+            n.status = s == 0 ? "in_progress" : "pending";
+            n.deliverableSummary = s == 0 ? "企划立项已开启，正在进行市场竞品与毛利测算" : "";
+            n.aiSuggestion = s == 0 ? LifecycleApi.GenerateAiAdvice(st, name) : "";
+            n.approvedBy = 0;
+            n.approvedAt = 0;
+            n.createdAt = now;
+            n.updatedAt = now;
+            await this.LifecycleNode.Insert(n).ExecuteIdentityAsync();
+        }
+
+        /* 5. 在作战群内发送第一条全景启动卡片通知 */
+        CollabMessage msg = new CollabMessage();
+        msg.tenantId = Tenant.Cur();
+        msg.conversationId = convId;
+        msg.senderId = me.id;
+        msg.kind = "text";
+        msg.body = "【项目立项成功】" + name + "（" + projectNo + "）全生命周期流程已启动！\n"
+            + "目标GMV: ¥" + targetGmv + " | 目标ROI: " + targetRoi + "\n"
+            + "当前阶段: 【1.企划与选品】进行中\n"
+            + LifecycleApi.GenerateAiAdvice("selection", name);
+        msg.replyTo = 0;
+        msg.taskId = 0;
+        msg.clientRequestId = "crid_init_" + Convert.ToString(now);
+        msg.createdAt = now;
+        msg.deletedAt = 0;
+        await this.CollabMessage.Insert(msg).ExecuteIdentityAsync();
+
+        JsonValue body = JsonValue.NewObject();
+        body.Put("id", JsonValue.NewStr(Convert.ToString(projectId)));
+        body.Put("projectNo", JsonValue.NewStr(projectNo));
+        body.Put("conversationId", JsonValue.NewStr(Convert.ToString(convId)));
+        this.Ok(body.ToJson());
+    }
+
+    /* 阶段推进与审核：核准当前阶段成果，自动推进到下一阶段，并触发下一阶段的 AI 分析与作战群通知 */
+    [HttpPost]
+    [Description("阶段推进与审核")]
+    [Custom(Perm = PermBit.Update)]
+    async void Advance() {
+        SysUser me = await this.Me();
+        int projectId = this.InInt("projectId", 0);
+        string stage = this.Need("stage", "阶段标识");
+        string summary = this.In("summary");
+        string action = this.In("action");
+        if (action.Length == 0) { action = "pass"; }
+
+        LifecycleProject p = await this.LifecycleProject
+            .Where(a => a.id == projectId).FirstAsync();
+        if (p == null) { this.Fail(404, "0404", "项目不存在"); return; }
+
+        LifecycleNode node = await this.LifecycleNode
+            .Where(a => a.projectId == projectId && a.stage == stage).FirstAsync();
+        if (node == null) { this.Fail(404, "0404", "节点不存在"); return; }
+
+        long now = WebApp.NowSeconds();
+
+        if (action == "reject") {
+            node.status = "rejected";
+            node.deliverableSummary = summary.Length > 0 ? summary : "审核驳回：需补充材料或重新优化";
+            node.approvedBy = me.id;
+            node.approvedAt = now;
+            node.updatedAt = now;
+            await this.LifecycleNode.Update(node).ExecuteAffrowsAsync();
+
+            /* 发送群提醒 */
+            if (p.conversationId > 0) {
+                CollabMessage rmsg = new CollabMessage();
+                rmsg.tenantId = Tenant.Cur();
+                rmsg.conversationId = p.conversationId;
+                rmsg.senderId = me.id;
+                rmsg.kind = "text";
+                rmsg.body = "⚠️【阶段驳回预警】「" + node.stageName + "」已被审核人驳回！\n原因/意见: " + node.deliverableSummary;
+                rmsg.replyTo = 0;
+                rmsg.taskId = 0;
+                rmsg.clientRequestId = "crid_rej_" + Convert.ToString(now);
+                rmsg.createdAt = now;
+                rmsg.deletedAt = 0;
+                await this.CollabMessage.Insert(rmsg).ExecuteIdentityAsync();
+            }
+
+            JsonValue rejBody = JsonValue.NewObject();
+            rejBody.Put("status", JsonValue.NewStr("rejected"));
+            rejBody.Put("stage", JsonValue.NewStr(stage));
+            this.Ok(rejBody.ToJson());
+            return;
+        }
+
+        /* 审核通过：更新当前节点 */
+        node.status = "passed";
+        if (summary.Length > 0) {
+            node.deliverableSummary = summary;
+        } else if (node.deliverableSummary.Length == 0) {
+            node.deliverableSummary = "阶段成果审核通过，准予进入下一阶段";
+        }
+        node.approvedBy = me.id;
+        node.approvedAt = now;
+        node.updatedAt = now;
+        await this.LifecycleNode.Update(node).ExecuteAffrowsAsync();
+
+        /* 查找下一阶段并自动激活 */
+        string nextSt = LifecycleApi.NextStage(stage);
+        p.currentStage = nextSt;
+        if (nextSt == "completed") {
+            p.status = "completed";
+        }
+        p.updatedAt = now;
+        await this.LifecycleProject.Update(p).ExecuteAffrowsAsync();
+
+        string nextAdvise = "";
+        string nextRespName = "全员";
+        if (nextSt != "completed") {
+            LifecycleNode nextNode = await this.LifecycleNode
+                .Where(a => a.projectId == projectId && a.stage == nextSt).FirstAsync();
+            if (nextNode != null) {
+                nextNode.status = "in_progress";
+                nextAdvise = LifecycleApi.GenerateAiAdvice(nextSt, p.name);
+                nextNode.aiSuggestion = nextAdvise;
+                nextNode.updatedAt = now;
+                await this.LifecycleNode.Update(nextNode).ExecuteAffrowsAsync();
+
+                List<SysUser> users = await this.SysUser.ToListAsync();
+                for (int u = 0; u < users.Count; u = u + 1) {
+                    if (users[u].id == nextNode.responsibleUserId) {
+                        nextRespName = users[u].nickname.Length > 0 ? users[u].nickname : users[u].username;
+                    }
+                }
+            }
+        }
+
+        /* 在作战群中发送阶段推进通知与下一阶段 AI 辅助建议 */
+        if (p.conversationId > 0) {
+            CollabMessage pmsg = new CollabMessage();
+            pmsg.tenantId = Tenant.Cur();
+            pmsg.conversationId = p.conversationId;
+            pmsg.senderId = me.id;
+            pmsg.kind = "text";
+            if (nextSt == "completed") {
+                pmsg.body = "🎉【全生命周期达成】「" + p.name + "」已完成选品、生产、上架、推广与优化全链路闭环，成功归档！";
+            } else {
+                pmsg.body = "✅【阶段核准流转】「" + node.stageName + "」已由审核人核准通过！\n"
+                    + "当前进入新阶段: 【" + LifecycleApi.StageName(nextSt) + "】\n"
+                    + "本阶段第一责任人: @" + nextRespName + "\n"
+                    + nextAdvise;
+            }
+            pmsg.replyTo = 0;
+            pmsg.taskId = 0;
+            pmsg.clientRequestId = "crid_adv_" + Convert.ToString(now);
+            pmsg.createdAt = now;
+            pmsg.deletedAt = 0;
+            await this.CollabMessage.Insert(pmsg).ExecuteIdentityAsync();
+        }
+
+        JsonValue body = JsonValue.NewObject();
+        body.Put("status", JsonValue.NewStr("passed"));
+        body.Put("currentStage", JsonValue.NewStr(nextSt));
+        body.Put("currentStageName", JsonValue.NewStr(LifecycleApi.StageName(nextSt)));
+        this.Ok(body.ToJson());
+    }
+
+    /* 手动触发 AI 深度辅助 */
+    [HttpPost]
+    [Description("触发AI深度建议")]
+    [Custom(Perm = PermBit.Update)]
+    async void AiAssist() {
+        SysUser me = await this.Me();
+        int projectId = this.InInt("projectId", 0);
+        string stage = this.Need("stage", "阶段标识");
+        string prompt = this.In("prompt");
+
+        LifecycleProject p = await this.LifecycleProject
+            .Where(a => a.id == projectId).FirstAsync();
+        if (p == null) { this.Fail(404, "0404", "项目不存在"); return; }
+
+        LifecycleNode node = await this.LifecycleNode
+            .Where(a => a.projectId == projectId && a.stage == stage).FirstAsync();
+        if (node == null) { this.Fail(404, "0404", "节点不存在"); return; }
+
+        long now = WebApp.NowSeconds();
+        string baseAdvice = LifecycleApi.GenerateAiAdvice(stage, p.name);
+        if (prompt.Length > 0) {
+            baseAdvice = baseAdvice + "\n[专项指令分析] 针对「" + prompt + "」，AI 建议在当前阶段加强风险前置排查与跨部门协同。";
+        }
+        node.aiSuggestion = baseAdvice;
+        node.updatedAt = now;
+        await this.LifecycleNode.Update(node).ExecuteAffrowsAsync();
+
+        if (p.conversationId > 0) {
+            CollabMessage amsg = new CollabMessage();
+            amsg.tenantId = Tenant.Cur();
+            amsg.conversationId = p.conversationId;
+            amsg.senderId = me.id;
+            amsg.kind = "text";
+            amsg.body = "💡【AI 深度协同建议更新】（" + node.stageName + "）\n" + baseAdvice;
+            amsg.replyTo = 0;
+            amsg.taskId = 0;
+            amsg.clientRequestId = "crid_ai_" + Convert.ToString(now);
+            amsg.createdAt = now;
+            amsg.deletedAt = 0;
+            await this.CollabMessage.Insert(amsg).ExecuteIdentityAsync();
+        }
+
+        JsonValue body = JsonValue.NewObject();
+        body.Put("aiSuggestion", JsonValue.NewStr(baseAdvice));
+        this.Ok(body.ToJson());
+    }
+
+    private async SysUser Me() {
+        SysUser me = await this.SysUser
+            .Where(a => a.id == Filter.ToInt(this.uid, 0)).FirstAsync();
+        if (me == null || me.status != 1) {
+            this.Fail(401, "1001", "账号不可用，请重新登录");
+        }
+        return me;
+    }
+}

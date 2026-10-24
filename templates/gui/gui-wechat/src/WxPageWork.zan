@@ -24,8 +24,9 @@ public class WxPageWork : Control {
     List<WxWorkItem> pool;
     List<WxWorkItem> accept;
     List<WxWorkItem> tpls;
+    List<WxWorkItem> lifecycles;
     List<WxWorkItem> shown;
-    // 当前 tab：0 我的待办 / 1 待认领 / 2 待我验收 / 3 模板。
+    // 当前 tab：0 我的待办 / 1 待认领 / 2 待我验收 / 3 模板 / 4 全链路项目。
     int tab;
     // 选中行（动作按钮的上下文：哪个 tab、哪个任务/模板）。
     WxWorkItem picked;
@@ -36,6 +37,8 @@ public class WxPageWork : Control {
     // 联系人缓存（选负责人用，懒拉一次）。
     List<WxDept> contacts;
 
+    public Action<string, string> onStartConv;
+
     WxPageWork() {
         this.InitControl("wxPageWork", 5);
         this.Class = "wxmain";
@@ -43,6 +46,7 @@ public class WxPageWork : Control {
         pool = new List<WxWorkItem>();
         accept = new List<WxWorkItem>();
         tpls = new List<WxWorkItem>();
+        lifecycles = new List<WxWorkItem>();
         shown = new List<WxWorkItem>();
         depts = new List<WxDept>();
         contacts = new List<WxDept>();
@@ -54,11 +58,15 @@ public class WxPageWork : Control {
         HtmlHandlers hs = new HtmlHandlers();
         hs.Add("work-new", () => {
             try {
-                editDefId = "0";
-                edName = "";
-                edDesc = "";
-                stages = new List<WxStageData>();
-                this.BuildEditor();
+                if (this.tab == 4) {
+                    this.CreateSampleLifecycleProject();
+                } else {
+                    editDefId = "0";
+                    edName = "";
+                    edDesc = "";
+                    stages = new List<WxStageData>();
+                    this.BuildEditor();
+                }
             }
             catch (Exception ex) { this.Note(ex.Message); }
         });
@@ -73,6 +81,7 @@ public class WxPageWork : Control {
         names.Add("待认领");
         names.Add("待我验收");
         names.Add("模板");
+        names.Add("全链路项目");
         tabs = new ListView<string>(WxFilterRow.Of);
         tabs.Class = "wxlist grow";
         tabs.Bind(names);
@@ -172,11 +181,25 @@ public class WxPageWork : Control {
                     }
                 }
             } catch (Exception ex) { this.Note(ex.Message); }
+            this.LoadLifecycleProjects();
+        });
+    }
+
+    void LoadLifecycleProjects() {
+        WxNetReq c = WxNet.NewReq();
+        WxNet.ApiGet(c, "/api/lifecycle/projects", () => {
+            try {
+                lifecycles.Clear();
+                JsonValue cData = WxNet.DataOf(c);
+                if (WxNet.OkOf(c) && cData != null) {
+                    this.Fill(lifecycles, cData.Get("projects"), 2);
+                }
+            } catch (Exception ex) { this.Note(ex.Message); }
             this.Rebind();
         });
     }
 
-    // 行数组 → 模型（kind 0 任务行 / 1 模板行）。
+    // 行数组 → 模型（kind 0 任务行 / 1 模板行 / 2 全生命周期项目）。
     void Fill(List<WxWorkItem> into, JsonValue rows, int kind) {
         int n = rows == null ? 0 : rows.Count();
         for (int i = 0; i < n; i = i + 1) {
@@ -190,9 +213,10 @@ public class WxPageWork : Control {
         if (tab == 0) { shown = mine; }
         else if (tab == 1) { shown = pool; }
         else if (tab == 2) { shown = accept; }
-        else { shown = tpls; }
+        else if (tab == 3) { shown = tpls; }
+        else { shown = lifecycles; }
         string label = tab == 0 ? "我的待办" : tab == 1 ? "待认领"
-            : tab == 2 ? "待我验收" : "模板";
+            : tab == 2 ? "待我验收" : tab == 3 ? "模板" : "全链路项目";
         if (titleEl != null) {
             titleEl.SetProp("text", label
                 + "（" + Convert.ToString(shown.Count) + "）");
@@ -201,7 +225,7 @@ public class WxPageWork : Control {
     }
 
     void SwitchTab(int i) {
-        if (i < 0 || i > 3) { i = 0; }
+        if (i < 0 || i > 4) { i = 0; }
         tab = i;
         this.CloseDetail();
         this.Rebind();
@@ -210,7 +234,8 @@ public class WxPageWork : Control {
     void OpenRow(int idx) {
         if (idx < 0 || idx >= shown.Count) { return; }
         picked = shown[idx];
-        if (picked.kind == 1) { this.FetchTemplate(picked.id); }
+        if (picked.kind == 2) { this.FetchLifecycleDetail(picked.id); }
+        else if (picked.kind == 1) { this.FetchTemplate(picked.id); }
         else { this.FetchInst(picked.instId); }
     }
 
@@ -705,6 +730,164 @@ public class WxPageWork : Control {
             if (depts[i].id == id) { return "部门池：" + depts[i].name; }
         }
         return "部门认领";
+    }
+
+    /* ---- 形态三：全生命周期项目作战面板 (选品-生产-上架-推广-优化) ---- */
+
+    void FetchLifecycleDetail(string projectId) {
+        WxNetReq r = WxNet.NewReq();
+        WxNet.ApiGet(r, "/api/lifecycle/detail?projectId="
+            + Encoding.UrlEncode(projectId), () => {
+                try {
+                    if (!WxNet.OkOf(r) || WxNet.DataOf(r) == null) {
+                        this.Note("项目详情拉取失败：" + WxNet.ErrOf(r));
+                        return;
+                    }
+                    this.BuildLifecycleDetail(WxNet.DataOf(r));
+                } catch (Exception ex) { this.Note(ex.Message); }
+            });
+    }
+
+    void BuildLifecycleDetail(JsonValue d) {
+        this.EnsureDetailBody();
+        detailBody.RemoveAll();
+        statusLbl = null;
+
+        Flex card = Flex.Column();
+        card.name = "wxworkcard";
+        card.AddClass("grow");
+        string pName = d.Str("name", "全生命周期项目");
+        Flex body = this.CardHead(pName, card);
+
+        string pId = d.Str("id", "");
+        string pNo = d.Str("projectNo", "");
+        string pCat = d.Str("category", "");
+        string pOwner = d.Str("ownerName", "");
+        string pStageName = d.Str("currentStageName", "");
+        string pGmv = d.Str("targetGmv", "0");
+        string pRoi = d.Str("targetRoi", "0");
+        string convId = d.Str("conversationId", "0");
+
+        body.Add(Wx.Lbl("编号: " + pNo + " · 品类: " + pCat + " · 操盘总负责人: " + pOwner, "wxpsub"));
+        body.Add(Wx.Lbl("当前阶段: " + pStageName + " | 目标GMV: ¥" + pGmv + " | 目标ROI: " + pRoi, "wxfavname"));
+
+        Flex btnRow = Wx.Row("wxpactrow");
+        if (convId != "0" && convId.Length > 0) {
+            Button convBtn = new Button("进入项目协同作战群");
+            convBtn.OnClick(() => {
+                if (this.onStartConv != null) {
+                    this.onStartConv(convId, "【作战群】" + pName);
+                }
+            });
+            btnRow.Add(convBtn);
+        }
+        body.Add(btnRow);
+        body.Add(Wx.Line());
+
+        JsonValue nodes = d.Get("nodes");
+        int count = nodes == null ? 0 : nodes.Count();
+        for (int i = 0; i < count; i = i + 1) {
+            JsonValue n = nodes.At(i);
+            string st = n.Str("stage", "");
+            string stName = n.Str("stageName", "");
+            string rName = n.Str("responsibleName", "待指派");
+            string aiRole = n.Str("aiAgentRole", "");
+            string nStatus = n.Str("status", "pending");
+            string aiAdvice = n.Str("aiSuggestion", "");
+            string summary = n.Str("deliverableSummary", "");
+
+            string statusZh = nStatus == "passed" ? "【已核准通过】"
+                : (nStatus == "in_progress" ? "【正在推进中】"
+                : (nStatus == "rejected" ? "【已驳回】" : "【待开始】"));
+
+            body.Add(Wx.Lbl(stName + "  " + statusZh, "wxfavname"));
+            body.Add(Wx.Lbl("人类第一责任人: " + rName + " | 专属协同角色: " + aiRole, "wxworksub"));
+
+            if (aiAdvice.Length > 0) {
+                body.Add(Wx.Lbl("AI 赋能建议: " + aiAdvice, "wxpsub"));
+            }
+            if (summary.Length > 0) {
+                body.Add(Wx.Lbl("阶段成果/审核结论: " + summary, "wxpsub"));
+            }
+
+            if (nStatus == "in_progress") {
+                Flex actRow = Wx.Row("wxpactrow");
+                Button advBtn = new Button("核准并推进下一阶段");
+                advBtn.OnClick(() => {
+                    this.AdvanceStage(pId, st, "阶段成果审核确认，推进至下一阶段", "pass");
+                });
+                actRow.Add(advBtn);
+
+                Button aiBtn = new Button("AI 深度推演与作战群同步");
+                aiBtn.OnClick(() => {
+                    this.TriggerAiAssist(pId, st, "深度多维数据复盘与风险对齐");
+                });
+                actRow.Add(aiBtn);
+                body.Add(actRow);
+            }
+            body.Add(Wx.Line());
+        }
+
+        statusLbl = Wx.Lbl("", "wxpsub");
+        body.Add(statusLbl);
+        detailBody.Add(card);
+        if (detailCol != null) { detailCol.visible = true; }
+        this.RequestRedrawHost();
+    }
+
+    void AdvanceStage(string projectId, string stage, string summary, string action) {
+        WxNetReq r = WxNet.NewReq();
+        string body = "projectId=" + Encoding.UrlEncode(projectId)
+            + "&stage=" + Encoding.UrlEncode(stage)
+            + "&summary=" + Encoding.UrlEncode(summary)
+            + "&action=" + Encoding.UrlEncode(action);
+        WxNet.ApiPost(r, "/api/lifecycle/advance", body, () => {
+            try {
+                if (!WxNet.OkOf(r)) {
+                    this.Note("推进失败：" + WxNet.ErrOf(r));
+                    return;
+                }
+                this.FetchLifecycleDetail(projectId);
+                this.LoadAll();
+            } catch (Exception ex) { this.Note(ex.Message); }
+        });
+    }
+
+    void TriggerAiAssist(string projectId, string stage, string prompt) {
+        WxNetReq r = WxNet.NewReq();
+        string body = "projectId=" + Encoding.UrlEncode(projectId)
+            + "&stage=" + Encoding.UrlEncode(stage)
+            + "&prompt=" + Encoding.UrlEncode(prompt);
+        WxNet.ApiPost(r, "/api/lifecycle/aiassist", body, () => {
+            try {
+                if (!WxNet.OkOf(r)) {
+                    this.Note("AI 辅助失败：" + WxNet.ErrOf(r));
+                    return;
+                }
+                this.FetchLifecycleDetail(projectId);
+            } catch (Exception ex) { this.Note(ex.Message); }
+        });
+    }
+
+    void CreateSampleLifecycleProject() {
+        this.CreateLifecycleProject("2026秋冬加绒休闲裤", "服装鞋包", "200000", "2.8");
+    }
+
+    void CreateLifecycleProject(string name, string category, string gmv, string roi) {
+        WxNetReq r = WxNet.NewReq();
+        string body = "name=" + Encoding.UrlEncode(name)
+            + "&category=" + Encoding.UrlEncode(category)
+            + "&targetGmv=" + Encoding.UrlEncode(gmv)
+            + "&targetRoi=" + Encoding.UrlEncode(roi);
+        WxNet.ApiPost(r, "/api/lifecycle/create", body, () => {
+            try {
+                if (!WxNet.OkOf(r)) {
+                    this.Note("立项失败：" + WxNet.ErrOf(r));
+                    return;
+                }
+                this.LoadAll();
+            } catch (Exception ex) { this.Note(ex.Message); }
+        });
     }
 
     override string Kind() { return "WxPageWork"; }
