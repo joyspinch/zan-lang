@@ -826,9 +826,18 @@
     就不索引）。
   - using 收集：自写 `scan_dir_usings`/`scan_text_usings`（行首 `using X;`，
     Win32/POSIX 双实现），工作区做种子，包根做传导，4 轮不动点。
-  - 遗留：`lsp_session_editor` ctest 在**不带本改动**时同样红
-    （`LspSession.Open` 签名漂移，测试客户端 2 参调用 3~4 参 API +
-    可空告警，出自 21712161c）——与 A506 无关，待 LSP/IDE 家族跟进。
+  - 遗留：`lsp_session_editor` ctest 在**不带本改动**时同样红——与 A506
+    无关，是 21712161c 的 `LspSession.Open` 签名漂移连环账。修复面（本轮
+    试到一半的实证）：① 测试客户端三处 `Open(port, root)` 要补第三参
+    `new LspStartReport()`；② lambda 捕获的 session 要在 lambda 内重判空
+    （检查器的可空收窄不过 lambda 边界，外面 throw 也没用）；③ 测试源清单
+    （run_lsp_session_test.py）缺 `LspSession.Diagnostics.zan`
+    （WireConnectionDiagnostics）；④ 真正的坎：`LspSession.Start()` 引用
+    `ZanIDE.getenv/ToolchainDir/ExeDir/ExeSuffix`，测试源集没有完整
+    ZanIDE——垫片类声明与检查器为未定义引用**自动合成的桩类**（连被调
+    方法都合成）撞 duplicate type declaration，测试侧无解，只能要么补全
+    ZanIDE 源闭包（拖 TabRecord/T() 整棵 IDE），要么把 Start 的找 exe
+    逻辑抽到 ZanIDE 之外。
 
 - 现象（2026-10-22 修 IDE 崩溃时顺带测出）：IDE 打开工程后状态栏长时间停在
   「语言服务：连接中」，实测冷启动 **10292 ms**，点重连再 **12260 ms**；
