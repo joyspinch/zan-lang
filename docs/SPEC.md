@@ -64,7 +64,8 @@ ushort     using      var        virtual    void       weak
 when       where      while
 ```
 
-`checked` / `unchecked` 为 no-op（溢出检查始终关闭，见附录 A）。
+`checked` / `unchecked`：checked 上下文里整型 + - * 溢出报软运行时错误
+（报点后回绕值继续流动；`ZAN_RT_HARD=1` 时硬陷阱退出），默认上下文环绕。
 `value` 是上下文关键字：仅在属性 setter 体内表示隐式传入值，其余位置可作普通标识符。
 
 ### 2.5 Literals
@@ -801,7 +802,6 @@ qualified_name  = IDENT { "." IDENT } ;
 
 以下 C# 特性**尚未实现**，不要在 Zan 代码中使用：
 
-- `checked` / `unchecked` — 关键字存在但均为 **no-op**：溢出检查始终关闭（环绕语义），`checked(x + 1)` 与 `x + 1` 行为相同（`tests/conformance/cs_b14_checked.zan`）
 - lazy iterators (`IEnumerable<T>` protocol) — `yield` currently materializes a list
 - tagged union 枚举（代数数据类型）
 - 命名实参之外的实参特性：`params` 之后的可选实参组合未系统验证

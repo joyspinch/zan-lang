@@ -67,17 +67,18 @@
   `toolchain/*/zanrt_io.o`（各平台预编译运行时）要跟着重出，非本机平台
   重建不了。
 
-### [ ] A381 SPEC 的"尚未实现"清单 7 项一项没动
+### [ ] A381 SPEC 的"尚未实现"清单剩余 5 项
 
-`docs/SPEC.md:766-776` 明列、实测仍不可用的：
-
-- `checked` / `unchecked` 关键字是 **no-op**（溢出检查恒关，环绕语义）
 - lazy iterators：`yield` 物化成 list，没有 `IEnumerable<T>` 协议
 - tagged union 枚举（代数数据类型）
 - `params` 之后的可选实参组合未系统验证
-- `$@"..."` / `@$"..."` 逐字插值字符串已实现（带 `tests/conformance/verbatim_interpolated_string.zan` 用例）；`"""` 原始字符串
+- 原始字符串（三引号；`$@"..."` / `@$"..."` 逐字插值已实现，03c996abe）
 - COW 集合：`List` 赋值是引用共享，修改即共享
 - `[CImport]`、`project.zan` 项目文件、`zan` CLI（实际是 `zanc`）
+
+- 已清（SPEC 同步改）：`checked` / `unchecked` 整型溢出检查——802607e72 落地，
+  C# 兼容语义（checked 报点后回绕值继续流动，`ZAN_RT_HARD=1` 硬陷阱 exit 70；
+  用例 `tests/conformance/cs_b14_checked.zan` 与 runtime_error 套件）。
 
 - 方向：逐项单独立项实现，每项带 conformance 用例；不做半截实现。
 
