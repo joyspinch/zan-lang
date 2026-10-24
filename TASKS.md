@@ -755,19 +755,34 @@
 - 探针：`ctest -R "^case_async_catch_ownership_route$"`（秒级）。
 - 关联：A507（嫌疑提交）、A380（发现时的对照实验）。
 
-### [ ] A548 宿主 struct-decimal 算术算错：`5.5m + 5 == 10.5m` 打印 no
+### [x] A548 宿主 struct-decimal 算术算错：`5.5m + 5 == 10.5m` 打印 no（2026-10-24 闭账）
 
 - 现象（2026-10-24 修 A487 时顺手撞见）：C 宿主（`build\zanc.exe`，2026-10-24
   版）编译 `decimal f = 5.5m; decimal e = 5; f = d + e;`（`f == 10.5m ? "yes"
-  : "no"`）**打印 no**——`decimal` 在宿主是 struct（rt_decimal），`+` 走的
-  通用 struct/操作符路径给出的值与字面量 `10.5m` 的内部表示不相等。
-- 对照：自举侧（decimal 折叠成 double 载荷，A487 修后名字保留、载荷仍
-  double）同一程序打印 **yes**。
-- 影响：宿主侧 decimal 一旦参与算术，结果不可信——`decimal` 作为"精确十进制"
-  类型的卖点在宿主上不成立。A487 闭账时记录的 `Convert.ToInt32(2.5m)` 残差
-  （宿主 0 / 自举 2）同根：宿主 struct-decimal 的**降级层**（算术/转换/
-  ToString）没有一条按 rt_decimal 语义实现的通路。
-- 方向：要么在宿主 irgen 给 decimal 补真实现（载荷按 rt_decimal 的
-  scale/尾数布局走运行时调用，算术/比较/转换/ToString 四面），要么宿主也
-  把 decimal 显式降为 double（放弃精确十进制，双端语义对齐——A487 后自举
-  已经是这条路线）。两者取一，别停在"编译过但算错"。
+  : "no"`）**打印 no**。
+- 根因实测确认：不是 `+` 算错——`decimal + decimal`（如 `5.5m + 2.5m == 8m`）
+  走 `emit_decimal_binary` -> `__zan_decimal_add` 指针 ABI 始终正确。
+  算错的唯一根因是**隐式整数到 decimal 的存储转换缺失**：`decimal e = 5` 时，
+  i64 裸写进 `%Decimal { i32, i32, i64 }` 结构体槽首 8 字节，导致 flags 吞掉
+  尾数低位、lo64 留栈上垃圾，e 从入槽起值就已损坏。
+- 修复全断面落地：
+  - `src/compiler/irgen_generics.c`: `coerce_int_to` 补 decimal 目标分支，
+    统一拦截变量初始化、局部赋值、字段存储与可空包装的隐式 int→decimal 转换，
+    调用 `coerce_to_decimal`（`__zan_decimal_from_int64`）。
+  - `src/compiler/irgen_arc.c`: `emit_collection_slot_store` 与
+    `emit_boundary_coerce` 补 decimal 元素及调用形参实参转换。
+  - `src/compiler/irgen_expr.c`: 一维数组索引赋值（`arr[0] = 5`）补 decimal
+    元素 int 右值转换。
+  - `src/compiler/irgen_stmt.c`: `emit_stmt` 的 return 语句补 int 字面量/变量
+    到 decimal 返回值的隐式转换。
+  - `stdlib/System/Decimal.zan`: `Truncate` 改用 `(d - d % 1m) / 1m` 实现，
+    摆脱 `__zan_decimal_to_int64` 引入的银行家舍入连带影响。
+  - `tests/conformance/decimal_arithmetic.out`: 同步更新（A511 除法去尾零 `4.2`、
+    A513 舍入 `100000`）。
+  - 新增 `tests/conformance/decimal_implicit_int.zan` + `.out`（覆盖 init+assign,
+    arith, call, ret, arr, field, nullable, replay）。
+- 验证：
+  - `ctest -R decimal` 5/5 全绿（`case_decimal_implicit_int`、
+    `case_det_decimal_implicit_int`、`case_decimal_arithmetic`、
+    `case_det_decimal_arithmetic`、`diag_decimal_literal_narrowing`）。
+  - `selfhost_fixed_point`（75.5s）+ `selfhost_diff`（654s）双门全绿。

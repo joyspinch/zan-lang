@@ -2101,6 +2101,8 @@ static void coerce_int_pair(zan_irgen_t *g, LLVMValueRef *a, LLVMValueRef *b) {
     else         *b = zan_iwiden(g->builder, *b, ta);
 }
 
+static LLVMValueRef coerce_to_decimal(zan_irgen_t *g, LLVMValueRef val);
+
 static LLVMValueRef coerce_int_to(zan_irgen_t *g, LLVMValueRef v, LLVMTypeRef target) {
     if (!v || !target) return v;
     LLVMTypeRef vt = LLVMTypeOf(v);
@@ -2121,6 +2123,14 @@ static LLVMValueRef coerce_int_to(zan_irgen_t *g, LLVMValueRef v, LLVMTypeRef ta
         return wrapped ? wrapped : v;
     }
     if (LLVMIsNull(v)) return LLVMConstNull(target);
+    /* decimal 目标 + 整数来源：变量初始化 / 赋值 / 字段与可空包装的隐式
+     * int→decimal 转换走运行时构造（__zan_decimal_from_int64）。此前整数值
+     * 穿透到下方放行分支，i64 原样写进 Decimal 槽首 8 字节——flags 吞掉
+     * 尾数低位、lo64 留栈上垃圾，值静默变成 0 或乱数（A548）。 */
+    if (LLVMGetTypeKind(target) == LLVMStructTypeKind &&
+        LLVMGetTypeKind(vt) == LLVMIntegerTypeKind &&
+        target == get_decimal_type(g))
+        return coerce_to_decimal(g, v);
     if (LLVMGetTypeKind(vt) == LLVMPointerTypeKind &&
         LLVMGetTypeKind(target) == LLVMIntegerTypeKind)
         return LLVMBuildPtrToInt(g->builder, v, target, "p2i");

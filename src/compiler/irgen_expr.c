@@ -5717,6 +5717,12 @@ binding_lowered:
                         emit_oob_store_split(g, ar_oob, &ar_do, &ar_end);
                         zan_type_t *et = local->type ? local->type->element_type : NULL;
                         LLVMValueRef stored = right;
+                        /* decimal 元素 + 整数右值：先走运行时构造转成 decimal
+                         * 再进槽（A548）。一维元素 GEP 进不了 zan_store_fit 的
+                         * 槽型识别（那只认多维双下标 GEP），整数会裸写进结构体槽。 */
+                        if (et && et->kind == TYPE_DECIMAL &&
+                            LLVMGetTypeKind(LLVMTypeOf(stored)) == LLVMIntegerTypeKind)
+                            stored = coerce_to_decimal(g, stored);
                         /* 可空元素槽写入：将标量值封装为可空结构体 */
                         if (et && et->kind == TYPE_NULLABLE)
                             stored = coerce_int_to(g, stored, elem_llvm);

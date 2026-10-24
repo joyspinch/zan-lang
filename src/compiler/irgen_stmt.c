@@ -1716,6 +1716,12 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                     } else if (fn_bits < val_bits) {
                         val = LLVMBuildTrunc(g->builder, val, fn_ret, "rettrunc");
                     }
+                } else if (fn_ret == get_decimal_type(g) &&
+                           LLVMGetTypeKind(val_t) == LLVMIntegerTypeKind) {
+                    /* int 字面量/变量 → decimal 返回值：隐式转换走运行时
+                     * 构造，漏掉就是 LLVM 校验失败（ret i64 7 对 %Decimal
+                     * 返回型，A548）。 */
+                    val = coerce_to_decimal(g, val);
                 } else if (LLVMGetTypeKind(fn_ret) == LLVMStructTypeKind &&
                            LLVMGetTypeKind(val_t) == LLVMPointerTypeKind) {
                     val = LLVMBuildLoad2(g->builder, fn_ret, val, "ret.struct");

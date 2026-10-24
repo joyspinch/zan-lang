@@ -369,6 +369,9 @@ static LLVMValueRef load_dict_value_words(zan_irgen_t *g, LLVMValueRef raw) {
     return LLVMBuildLoad2(g->builder, i64, words_ptr, "dvw");
 }
 
+/* irgen_expr.c 定义（TU 靠后）：int→decimal 的运行时构造转换（A548） */
+static LLVMValueRef coerce_to_decimal(zan_irgen_t *g, LLVMValueRef val);
+
 /* 结构体按值语义归整。
  *
  * 表达式若是构造临时对象（new T(...)），emit_expr 返回的是该临时对象的
@@ -394,6 +397,11 @@ static void emit_collection_slot_store(zan_irgen_t *g, zan_type_t *elem_type,
     LLVMTypeKind elem_kind = LLVMGetTypeKind(elem_llvm);
     /* 结构体元素按值存槽：实参是构造临时对象时先按值取出 */
     value = coerce_struct_value(g, value, elem_type);
+    /* decimal 元素槽 + 整数右值：先走运行时构造转成 decimal，
+     * 否则 i64 落进兜底裸 store，元素读回是 0/垃圾（A548）。 */
+    if (elem_type && elem_type->kind == TYPE_DECIMAL &&
+        LLVMGetTypeKind(LLVMTypeOf(value)) == LLVMIntegerTypeKind)
+        value = coerce_to_decimal(g, value);
     LLVMValueRef old = NULL;
     if (overwrite_old) {
         old = elem_kind == LLVMStructTypeKind
@@ -1390,6 +1398,13 @@ static LLVMValueRef emit_boundary_coerce(zan_irgen_t *g, LLVMValueRef v,
     LLVMContextRef c = g->ctx;
     LLVMTypeRef i32 = LLVMInt32TypeInContext(c);
     LLVMTypeRef i64 = LLVMInt64TypeInContext(c);
+
+    /* decimal 目标 + 整数来源：调用实参 / 返回值 / 数组元素这三类边界的
+     * 隐式 int→decimal 转换。漏掉时 i64 原样穿透，LLVM 校验当场失败
+     * （i64 传给 %Decimal 形参）。 */
+    if (tk == LLVMStructTypeKind && target == get_decimal_type(g) &&
+        vk == LLVMIntegerTypeKind)
+        return coerce_to_decimal(g, v);
 
     if (tk == LLVMPointerTypeKind) {
         if (vk == LLVMPointerTypeKind)
