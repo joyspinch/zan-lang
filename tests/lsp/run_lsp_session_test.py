@@ -263,6 +263,7 @@ def main():
                    root / "src/ide_zan/src/services/LspSession.zan",
                    root / "src/ide_zan/src/services/LspSession.Transport.zan",
                    root / "src/ide_zan/src/services/LspSession.Protocol.zan",
+                   root / "src/ide_zan/src/services/LspSession.Diagnostics.zan",
                    root / "src/ide_zan/src/editor/LspSession.Editor.zan",
                    root / "src/ide_zan/src/services/DebugSession.zan"]
         compiled = subprocess.run([str(args.zanc.resolve()), *map(str, sources),
