@@ -1,4 +1,6 @@
 using System;
+using System.Json;
+using System.Text;
 using Gui;
 using Gui.Backend;
 using Gui.Component;
@@ -73,6 +75,8 @@ public class WxPageChat : Control {
     WxProfilePanel prof;
     // 点任务卡片弹出的详情卡（与抽屉/名片互斥）。
     WxTaskSheet taskSheet;
+    // 点击全生命周期卡片直达全链路工作台回调 (projectId, stage)
+    public Action<string, string> onOpenLifecycle;
 
     WxPageChat() {
         this.InitControl("wxPageChat", 5);
@@ -308,6 +312,57 @@ public class WxPageChat : Control {
         if (idx < 0 || idx >= data[current].msgs.Count) { return; }
         ChatMessage m = data[current].msgs[idx];
         if (!m.card || m.taskId == null || m.taskId.Length == 0) { return; }
+
+        if (m.taskId.StartsWith("prj:")) {
+            this.ClosePopups();
+            drawer.visible = false;
+            string pId = m.taskId.Substring(4);
+            int colon = pId.IndexOf(":");
+            string stage = "";
+            if (colon >= 0) {
+                stage = pId.Substring(colon + 1);
+                pId = pId.Substring(0, colon);
+            }
+
+            JsonValue cj = null;
+            if (m.call != null && m.call.Length > 0) {
+                cj = JsonValue.Parse(m.call);
+            }
+            if (cj == null) {
+                cj = JsonValue.NewObject();
+            }
+
+            string pNo = cj.Str("projectNo", "PRJ-" + pId);
+            string pName = cj.Str("projectName", "全生命周期项目");
+            string st = stage.Length > 0 ? stage : cj.Str("stage", "selection");
+            string stName = cj.Str("stageName", "阶段节点");
+            string rName = cj.Str("responsibleName", "责任人");
+            string aiRole = cj.Str("aiAgentRole", "协同AI");
+            string cStatus = cj.Str("status", "in_progress");
+            string m1 = cj.Str("metric1", "-");
+            string m2 = cj.Str("metric2", "-");
+            string m3 = cj.Str("metric3", "-");
+            string aiAdvice = cj.Str("aiAdvice", "");
+            string summary = cj.Str("summary", "");
+
+            taskSheet.ShowLifecycleCard(pId, pNo, pName, st, stName, rName, aiRole,
+                cStatus, m1, m2, m3, aiAdvice, summary,
+                () => {
+                    this.AdvanceLifecycleFromChat(pId, st);
+                },
+                () => {
+                    this.AiAssistLifecycleFromChat(pId, st);
+                },
+                () => {
+                    taskSheet.Hide();
+                    if (this.onOpenLifecycle != null) {
+                        this.onOpenLifecycle(pId, st);
+                    }
+                });
+            { if (app != null) { app.RequestRedraw(); } }
+            return;
+        }
+
         this.ClosePopups();
         drawer.visible = false;
         taskSheet.ShowLoading();
@@ -319,6 +374,48 @@ public class WxPageChat : Control {
             taskSheet.ShowDetail(td);
         });
         { if (app != null) { app.RequestRedraw(); } }
+    }
+
+    void AdvanceLifecycleFromChat(string projectId, string stage) {
+        WxNetReq r = WxNet.NewReq();
+        string body = "projectId=" + Encoding.UrlEncode(projectId)
+            + "&stage=" + Encoding.UrlEncode(stage)
+            + "&summary=" + Encoding.UrlEncode("群聊内快捷核准通过，自动推进到下一阶段")
+            + "&action=pass";
+        WxNet.ApiPost(r, "/api/lifecycle/advance", body, () => {
+            try {
+                if (!WxNet.OkOf(r)) {
+                    taskSheet.ShowError("推进失败: " + WxNet.ErrOf(r));
+                    return;
+                }
+                taskSheet.Hide();
+                if (current >= 0 && current < data.Count) {
+                    WxIm.Open(data[current]);
+                }
+            } catch (Exception ex) {
+                taskSheet.ShowError(ex.Message);
+            }
+        });
+    }
+
+    void AiAssistLifecycleFromChat(string projectId, string stage) {
+        WxNetReq r = WxNet.NewReq();
+        string body = "projectId=" + Encoding.UrlEncode(projectId)
+            + "&stage=" + Encoding.UrlEncode(stage)
+            + "&prompt=" + Encoding.UrlEncode("群聊内触发AI多维推演");
+        WxNet.ApiPost(r, "/api/lifecycle/aiassist", body, () => {
+            try {
+                if (!WxNet.OkOf(r)) {
+                    taskSheet.ShowError("AI推演失败: " + WxNet.ErrOf(r));
+                    return;
+                }
+                if (current >= 0 && current < data.Count) {
+                    WxIm.Open(data[current]);
+                }
+            } catch (Exception ex) {
+                taskSheet.ShowError(ex.Message);
+            }
+        });
     }
 
 

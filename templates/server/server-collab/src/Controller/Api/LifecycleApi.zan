@@ -37,6 +37,58 @@ class LifecycleApi : ApiController {
         return "completed";
     }
 
+    static string StageCardJson(int projectId, string projectNo, string projectName,
+                                string stage, string stageName, string respName, int respUserId,
+                                string aiRole, string status, string m1, string m2, string m3,
+                                string aiAdvice, string summary) {
+        JsonValue o = JsonValue.NewObject();
+        o.Put("cardType", JsonValue.NewStr("lifecycle_stage"));
+        o.Put("projectId", JsonValue.NewStr(Convert.ToString(projectId)));
+        o.Put("projectNo", JsonValue.NewStr(projectNo));
+        o.Put("projectName", JsonValue.NewStr(projectName));
+        o.Put("stage", JsonValue.NewStr(stage));
+        o.Put("stageName", JsonValue.NewStr(stageName));
+        o.Put("responsibleName", JsonValue.NewStr(respName));
+        o.Put("responsibleUserId", JsonValue.NewStr(Convert.ToString(respUserId)));
+        o.Put("aiAgentRole", JsonValue.NewStr(aiRole));
+        o.Put("status", JsonValue.NewStr(status));
+        o.Put("metric1", JsonValue.NewStr(m1));
+        o.Put("metric2", JsonValue.NewStr(m2));
+        o.Put("metric3", JsonValue.NewStr(m3));
+        o.Put("aiAdvice", JsonValue.NewStr(aiAdvice));
+        o.Put("summary", JsonValue.NewStr(summary));
+        return o.ToJson();
+    }
+
+    static string StageMetrics(string stage, int index) {
+        if (stage == "selection") {
+            if (index == 1) { return "零售价 ¥99"; }
+            if (index == 2) { return "BOM成本 ¥46.8"; }
+            return "首批试产 1,000件";
+        }
+        if (stage == "manufacturing") {
+            if (index == 1) { return "工期 7 天"; }
+            if (index == 2) { return "计划良品率 98.5%"; }
+            return "面料耗损率 2.4%";
+        }
+        if (stage == "publishing") {
+            if (index == 1) { return "主推渠道 抖音/天猫"; }
+            if (index == 2) { return "库存配比 40:35:25"; }
+            return "全域防超卖锁定";
+        }
+        if (stage == "marketing") {
+            if (index == 1) { return "投放预算 ¥30,000"; }
+            if (index == 2) { return "目标保底ROI 2.0"; }
+            return "1头部+10腰部达人";
+        }
+        if (stage == "optimization") {
+            if (index == 1) { return "客诉退货率 3.1%"; }
+            if (index == 2) { return "追加翻单 3,000件"; }
+            return "二代版型微调";
+        }
+        return "-";
+    }
+
     static string DefaultAiAgent(string stage) {
         if (stage == "selection") { return "选品分析师Agent"; }
         if (stage == "manufacturing") { return "工艺排产Agent"; }
@@ -118,6 +170,8 @@ class LifecycleApi : ApiController {
 
         List<LifecycleNode> nodes = await this.LifecycleNode
             .Where(a => a.projectId == projectId).OrderBy(a => a.id).ToListAsync();
+        List<LifecycleStageDetail> details = await this.LifecycleStageDetail
+            .Where(a => a.projectId == projectId).ToListAsync();
         List<SysUser> users = await this.SysUser.ToListAsync();
 
         string ownerName = "未知";
@@ -140,6 +194,19 @@ class LifecycleApi : ApiController {
                     apprvName = users[u].nickname.Length > 0 ? users[u].nickname : users[u].username;
                 }
             }
+            string m1 = "";
+            string m2 = "";
+            string m3 = "";
+            string extra = "";
+            for (int d = 0; d < details.Count; d = d + 1) {
+                if (details[d].nodeId == n.id || (details[d].stage == n.stage && details[d].projectId == projectId)) {
+                    m1 = details[d].metric1;
+                    m2 = details[d].metric2;
+                    m3 = details[d].metric3;
+                    extra = details[d].extraPayload;
+                }
+            }
+
             JsonValue no = JsonValue.NewObject();
             no.Put("id", JsonValue.NewStr(Convert.ToString(n.id)));
             no.Put("stage", JsonValue.NewStr(n.stage));
@@ -150,6 +217,10 @@ class LifecycleApi : ApiController {
             no.Put("status", JsonValue.NewStr(n.status));
             no.Put("deliverableSummary", JsonValue.NewStr(n.deliverableSummary));
             no.Put("aiSuggestion", JsonValue.NewStr(n.aiSuggestion));
+            no.Put("metric1", JsonValue.NewStr(m1));
+            no.Put("metric2", JsonValue.NewStr(m2));
+            no.Put("metric3", JsonValue.NewStr(m3));
+            no.Put("extraPayload", JsonValue.NewStr(extra));
             no.Put("approvedBy", JsonValue.NewStr(Convert.ToString(n.approvedBy)));
             no.Put("approvedByName", JsonValue.NewStr(apprvName));
             no.Put("approvedAt", JsonValue.NewStr(Convert.ToString(n.approvedAt)));
@@ -257,6 +328,14 @@ class LifecycleApi : ApiController {
         string[] stages = new string[] { "selection", "manufacturing", "publishing", "marketing", "optimization" };
         int[] userIds = new int[] { selUserId, mfgUserId, pubUserId, mktUserId, optUserId };
 
+        List<SysUser> allUsers = await this.SysUser.ToListAsync();
+        string selUserName = "责任人";
+        for (int u = 0; u < allUsers.Count; u = u + 1) {
+            if (allUsers[u].id == selUserId) {
+                selUserName = allUsers[u].nickname.Length > 0 ? allUsers[u].nickname : allUsers[u].username;
+            }
+        }
+
         for (int s = 0; s < stages.Length; s = s + 1) {
             string st = stages[s];
             LifecycleNode n = new LifecycleNode();
@@ -273,19 +352,36 @@ class LifecycleApi : ApiController {
             n.approvedAt = 0;
             n.createdAt = now;
             n.updatedAt = now;
-            await this.LifecycleNode.Insert(n).ExecuteIdentityAsync();
+            int nodeId = await this.LifecycleNode.Insert(n).ExecuteIdentityAsync();
+
+            LifecycleStageDetail dt = new LifecycleStageDetail();
+            dt.tenantId = Tenant.Cur();
+            dt.projectId = projectId;
+            dt.nodeId = nodeId;
+            dt.stage = st;
+            dt.metric1 = LifecycleApi.StageMetrics(st, 1);
+            dt.metric2 = LifecycleApi.StageMetrics(st, 2);
+            dt.metric3 = LifecycleApi.StageMetrics(st, 3);
+            dt.extraPayload = LifecycleApi.GenerateAiAdvice(st, name);
+            dt.createdAt = now;
+            dt.updatedAt = now;
+            await this.LifecycleStageDetail.Insert(dt).ExecuteIdentityAsync();
         }
 
         /* 5. 在作战群内发送第一条全景启动卡片通知 */
+        string cardJson = LifecycleApi.StageCardJson(projectId, projectNo, name,
+            "selection", LifecycleApi.StageName("selection"), selUserName, selUserId,
+            LifecycleApi.DefaultAiAgent("selection"), "in_progress",
+            LifecycleApi.StageMetrics("selection", 1), LifecycleApi.StageMetrics("selection", 2),
+            LifecycleApi.StageMetrics("selection", 3), LifecycleApi.GenerateAiAdvice("selection", name),
+            "企划立项已开启，目标GMV: ¥" + targetGmv + " | 目标ROI: " + targetRoi);
+
         CollabMessage msg = new CollabMessage();
         msg.tenantId = Tenant.Cur();
         msg.conversationId = convId;
         msg.senderId = me.id;
-        msg.kind = "text";
-        msg.body = "【项目立项成功】" + name + "（" + projectNo + "）全生命周期流程已启动！\n"
-            + "目标GMV: ¥" + targetGmv + " | 目标ROI: " + targetRoi + "\n"
-            + "当前阶段: 【1.企划与选品】进行中\n"
-            + LifecycleApi.GenerateAiAdvice("selection", name);
+        msg.kind = "lifecycle_card";
+        msg.body = cardJson;
         msg.replyTo = 0;
         msg.taskId = 0;
         msg.clientRequestId = "crid_init_" + Convert.ToString(now);
@@ -416,6 +512,34 @@ class LifecycleApi : ApiController {
             pmsg.createdAt = now;
             pmsg.deletedAt = 0;
             await this.CollabMessage.Insert(pmsg).ExecuteIdentityAsync();
+
+            /* 同时推送新阶段作战互动卡片 */
+            if (nextSt != "completed") {
+                int nextRespId = 0;
+                LifecycleNode nextN = await this.LifecycleNode
+                    .Where(a => a.projectId == projectId && a.stage == nextSt).FirstAsync();
+                if (nextN != null) { nextRespId = nextN.responsibleUserId; }
+
+                string cardJson = LifecycleApi.StageCardJson(projectId, p.projectNo, p.name,
+                    nextSt, LifecycleApi.StageName(nextSt), nextRespName, nextRespId,
+                    LifecycleApi.DefaultAiAgent(nextSt), "in_progress",
+                    LifecycleApi.StageMetrics(nextSt, 1), LifecycleApi.StageMetrics(nextSt, 2),
+                    LifecycleApi.StageMetrics(nextSt, 3), nextAdvise,
+                    "上阶段已审核通过，当前阶段已全面启动，请各协同角色就位执行");
+
+                CollabMessage cardMsg = new CollabMessage();
+                cardMsg.tenantId = Tenant.Cur();
+                cardMsg.conversationId = p.conversationId;
+                cardMsg.senderId = me.id;
+                cardMsg.kind = "lifecycle_card";
+                cardMsg.body = cardJson;
+                cardMsg.replyTo = 0;
+                cardMsg.taskId = 0;
+                cardMsg.clientRequestId = "crid_card_" + Convert.ToString(now);
+                cardMsg.createdAt = now + 1;
+                cardMsg.deletedAt = 0;
+                await this.CollabMessage.Insert(cardMsg).ExecuteIdentityAsync();
+            }
         }
 
         JsonValue body = JsonValue.NewObject();
