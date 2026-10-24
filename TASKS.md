@@ -782,19 +782,3 @@
     `case_det_decimal_implicit_int`、`case_decimal_arithmetic`、
     `case_det_decimal_arithmetic`、`diag_decimal_literal_narrowing`）。
   - `selfhost_fixed_point`（75.5s）+ `selfhost_diff`（654s）双门全绿。
-
-### [ ] A551 用户类与内建类型同名：被静默顶掉，成员解析落空报"has no member"
-
-- 现象（2026-10-25 修 A453 探针时撞出）：`class Dict<K,V> { ... }` 编译报
-  `Dict<K,V> has no member 'xxx'` 之类的成员解析错误，报错位置和内容看起来
-  像类型参数或绑定 bug，实际是 **`Dict` 是内建类型名**（`List`/`Dictionary`/
-  `Dict`/`Span` 等在 binder 里硬编码为内建，binder.c 的内建注册分支直接按名字
-  命中），用户类被静默顶掉，后续成员查找全落在内建 `Dict` 上。
-- 控制实验：同一份类体改名为 `P2<K2,V2>` 编译全绿——语法、类型参数、成员
-  绑定全部正确，差异只有类名撞了内建。
-- 影响：误报形态极具迷惑性（错误指向成员，不指向重名），用户排错会被引向
-  完全无关的方向；仓库自身的探针/示例也踩过（A453 排查时白花了一轮）。
-- 方向：绑定期对"用户类型声明名 == 内建类型名"出**重名诊断**（error：与内建
-  类型同名，请改名），不追求允许 shadow——内建名覆盖面是 reject/golden 锁住的
-  既有行为。落点在 binder 的类型注册路径，一处判定即可。
-- 关联：A453（排查时的坑出处）。
