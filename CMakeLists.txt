@@ -5597,6 +5597,15 @@ add_test(NAME diag_generic_constraint_unknown
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_generic_constraint_unknown PROPERTIES TIMEOUT 60)
 
+add_test(NAME diag_generic_new_constraint_no_default_ctor
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/generic_new_constraint_no_default_ctor.zan
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/diag_generic_new_constraint_no_default_ctor${_exe_ext}
+    "-DEXPECT_REGEX=must have a public parameterless constructor to satisfy 'new\\(\\)' constraint"
+    -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
+set_tests_properties(diag_generic_new_constraint_no_default_ctor PROPERTIES TIMEOUT 60)
+
 # sealed used to parse and vanish: deriving from a `sealed class` compiled
 # with zero diagnostics. C# makes sealed a hard derivation barrier (CS0709).
 add_test(NAME diag_sealed_derive

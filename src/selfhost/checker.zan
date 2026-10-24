@@ -28,6 +28,7 @@ public class Checker {
     public Diags diags;
 
     Node curClass;              // type declaration whose body is being checked
+    Node curMethodNode;
     Node curRet;                // return type of the current method (null=void)
     bool curStatic;             // is the current method static
     int infCount;
@@ -38,7 +39,7 @@ public class Checker {
     List<Node> scopeType;       // parallel declared/inferred types (may be null)
 
     public Checker(Binder b, Diags d) {
-        binder = b; diags = d; curClass = null; curRet = null;
+        binder = b; diags = d; curClass = null; curMethodNode = null; curRet = null;
         curStatic = false; loopDepth = 0; catchDepth = 0;
         scopeName = new List<string>(); scopeType = new List<Node>();
     }
@@ -1204,6 +1205,7 @@ public class Checker {
     }
 
     void CheckMethod(Node m, bool ctor) {
+        curMethodNode = m;
         if (m.type != null) { CheckSignatureType(m.type); }
         scopeName = new List<string>(); scopeType = new List<Node>();
         loopDepth = 0;
@@ -1232,6 +1234,7 @@ public class Checker {
         }
         CheckStmt(m.d);
         CheckAwaits(m);
+        curMethodNode = null;
         // The C host has no "not all code paths return a value" diagnostic:
         // a method whose body falls through is legal there (the body may end
         // in a `lock`/`fixed`/`using` block the checker does not model, and
@@ -1500,6 +1503,26 @@ public class Checker {
         CheckExpr(n);
     }
 
+    bool TypeParamHasNew(string name) {
+        if (curMethodNode != null) {
+            int i = 0;
+            while (i < curMethodNode.kids.Count) {
+                Node k = curMethodNode.kids[i];
+                if (k.kind == AK.TypeParam() && k.sval == name && k.ival == 1) { return true; }
+                i = i + 1;
+            }
+        }
+        if (curClass != null) {
+            int i = 0;
+            while (i < curClass.kids.Count) {
+                Node k = curClass.kids[i];
+                if (k.kind == AK.TypeParam() && k.sval == name && k.ival == 1) { return true; }
+                i = i + 1;
+            }
+        }
+        return false;
+    }
+
     void CheckExpr(Node n) {
         if (n == null) { return; }
         int k = n.kind;
@@ -1596,8 +1619,10 @@ public class Checker {
             // 数组形态 `new T[n]` 不在此列（ival == 1）：元素类型在实例化
             // 时被替换，是合法的。
             if (n.ival == 0 && binder.IsTypeParam(n.type.sval)) {
-                diags.Error("cannot instantiate a type parameter '" + n.type.sval + "'", n.line, n.col);
-                return;
+                if (!TypeParamHasNew(n.type.sval)) {
+                    diags.Error("cannot instantiate a type parameter '" + n.type.sval + "'", n.line, n.col);
+                    return;
+                }
             }
             CheckType(n.type);
             CheckExpr(n.b);

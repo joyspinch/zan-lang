@@ -397,6 +397,9 @@ struct zan_ast_node {
         struct {
             zan_istr_t param_name;
             zan_ast_list_t constraints;
+            bool has_new;
+            bool has_class;
+            bool has_struct;
         } where_clause;
 
         struct {

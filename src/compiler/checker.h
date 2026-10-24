@@ -20,6 +20,7 @@ struct zan_checker {
     zan_ast_node_t *last_call_node;
     zan_symbol_t *last_call_method;
     zan_ast_node_t *current_body;
+    zan_ast_node_t *current_method_decl;
     /* 已经报过"null 绑不上值类型形参"的实参位置：同一个实参只报一次
      * （唯一方法路径与重载路径会撞上同一处）。 */
     zan_loc_t null_arg_reported;

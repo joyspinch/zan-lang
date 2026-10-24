@@ -9396,9 +9396,26 @@ static LLVMValueRef emit_expr_new_expr(zan_irgen_t *g, zan_ast_node_t *expr,
             zan_store_fit(g, zero64, p64);
             return raw;
         }
-        if (type_name.str) {
-            zan_symbol_t *sym = zan_binder_lookup(g->binder, type_name);
-            if (sym && sym->type && (sym->type->kind == TYPE_STRUCT || sym->type->kind == TYPE_CLASS)) {
+        zan_type_t *actual_t = resolve_type_ctx(g, expr->new_expr.type);
+        if (actual_t && (actual_t->kind == TYPE_INT || actual_t->kind == TYPE_UINT ||
+                         actual_t->kind == TYPE_LONG || actual_t->kind == TYPE_ULONG ||
+                         actual_t->kind == TYPE_SHORT || actual_t->kind == TYPE_USHORT ||
+                         actual_t->kind == TYPE_BYTE || actual_t->kind == TYPE_SBYTE ||
+                         actual_t->kind == TYPE_BOOL || actual_t->kind == TYPE_FLOAT ||
+                         actual_t->kind == TYPE_DOUBLE || actual_t->kind == TYPE_CHAR ||
+                         actual_t->kind == TYPE_NINT)) {
+            LLVMTypeRef lt = map_type(g, actual_t);
+            return LLVMConstNull(lt);
+        }
+        zan_symbol_t *sym = NULL;
+        if (actual_t && actual_t->sym &&
+            (actual_t->sym->type->kind == TYPE_STRUCT || actual_t->sym->type->kind == TYPE_CLASS)) {
+            sym = actual_t->sym;
+        } else if (type_name.str) {
+            sym = zan_binder_lookup(g->binder, type_name);
+        }
+        if (sym) {
+            if (sym->type && (sym->type->kind == TYPE_STRUCT || sym->type->kind == TYPE_CLASS)) {
                 LLVMTypeRef st = get_struct_llvm_type(g, sym);
                 if (st) {
                     LLVMValueRef alloca;

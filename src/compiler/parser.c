@@ -3235,15 +3235,25 @@ static void parse_where_clauses(zan_parser_t *p, zan_ast_list_t *out) {
         zan_ast_node_t *n = zan_ast_new(p->arena, AST_WHERE_CLAUSE, loc);
         n->where_clause.param_name = pname;
         zan_ast_list_init(&n->where_clause.constraints);
+        n->where_clause.has_new = false;
+        n->where_clause.has_class = false;
+        n->where_clause.has_struct = false;
         do {
-            if (parser_check(p, TK_CLASS) || parser_check(p, TK_STRUCT)) {
+            if (parser_check(p, TK_CLASS)) {
                 parser_advance(p);
+                n->where_clause.has_class = true;
+                continue;
+            }
+            if (parser_check(p, TK_STRUCT)) {
+                parser_advance(p);
+                n->where_clause.has_struct = true;
                 continue;
             }
             if (parser_check(p, TK_NEW)) {
                 parser_advance(p);
                 parser_expect(p, TK_LPAREN);
                 parser_expect(p, TK_RPAREN);
+                n->where_clause.has_new = true;
                 continue;
             }
             zan_ast_node_t *cons = parse_type_ref(p);

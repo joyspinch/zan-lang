@@ -773,6 +773,56 @@ static bool type_satisfies_constraint(zan_type_t *arg, zan_type_t *cons) {
 }
 
 static const char *type_name(zan_type_t *t);
+static void ctor_arity(zan_ast_node_t *decl, int *min, int *max);
+
+static bool type_param_has_new_constraint(zan_checker_t *c, zan_type_t *tp) {
+    if (!tp || tp->kind != TYPE_TYPE_PARAM) return false;
+    zan_istr_t name = tp->name;
+    if (c->current_method_decl) {
+        zan_ast_list_t *mwcs = zan_ast_method_where_clauses(c->current_method_decl);
+        if (mwcs) {
+            for (int w = 0; w < mwcs->count; w++) {
+                zan_ast_node_t *wc = mwcs->items[w];
+                if (wc && wc->kind == AST_WHERE_CLAUSE &&
+                    wc->where_clause.param_name.len == name.len &&
+                    memcmp(wc->where_clause.param_name.str, name.str, (size_t)name.len) == 0) {
+                    if (wc->where_clause.has_new) return true;
+                }
+            }
+        }
+    }
+    if (c->current_type_sym && c->current_type_sym->decl) {
+        zan_ast_list_t *twcs = zan_ast_type_where_clauses(c->current_type_sym->decl);
+        if (twcs) {
+            for (int w = 0; w < twcs->count; w++) {
+                zan_ast_node_t *wc = twcs->items[w];
+                if (wc && wc->kind == AST_WHERE_CLAUSE &&
+                    wc->where_clause.param_name.len == name.len &&
+                    memcmp(wc->where_clause.param_name.str, name.str, (size_t)name.len) == 0) {
+                    if (wc->where_clause.has_new) return true;
+                }
+            }
+        }
+    }
+    return false;
+}
+
+static bool checker_has_default_ctor(zan_checker_t *c, zan_symbol_t *sym) {
+    if (!sym) return false;
+    int declared = 0;
+    for (int i = 0; i < sym->member_count; i++) {
+        zan_symbol_t *m = sym->members[i];
+        if (!m || m->kind != SYM_CONSTRUCTOR || !m->decl) continue;
+        if (m->decl->kind != AST_CONSTRUCTOR_DECL) continue;
+        declared++;
+        int lo = 0, hi = 0;
+        ctor_arity(m->decl, &lo, &hi);
+        if (0 >= lo && (hi < 0 || 0 <= hi)) {
+            if (access_member_allowed(c, m)) return true;
+        }
+    }
+    return declared == 0;
+}
 
 static void check_generic_constraints(zan_checker_t *c, zan_type_t *t,
                                       zan_loc_t loc) {
@@ -797,6 +847,28 @@ static void check_generic_constraints(zan_checker_t *c, zan_type_t *t,
         }
         if (idx < 0 || idx >= t->type_arg_count) continue;
         zan_type_t *arg = t->type_args[idx];
+        if (wc->where_clause.has_new) {
+            bool ok = false;
+            if (arg) {
+                if (arg->kind == TYPE_STRUCT) {
+                    ok = true;
+                } else if (arg->kind == TYPE_CLASS) {
+                    if (arg->sym && !checker_class_is_abstract(arg->sym)) {
+                        if (checker_has_default_ctor(c, arg->sym)) ok = true;
+                    }
+                } else if (arg->kind == TYPE_TYPE_PARAM) {
+                    if (type_param_has_new_constraint(c, arg)) ok = true;
+                }
+            }
+            if (!ok) {
+                zan_diag_emit(c->diag, DIAG_ERROR, loc,
+                    "'%s' must have a public parameterless constructor to satisfy 'new()' constraint for '%.*s' of '%s'",
+                    type_name(arg),
+                    (int)wc->where_clause.param_name.len,
+                    wc->where_clause.param_name.str,
+                    type_name(t));
+            }
+        }
         if (arg && arg->kind == TYPE_TYPE_PARAM) continue;
         for (int k = 0; k < wc->where_clause.constraints.count; k++) {
             zan_ast_node_t *cons_ref = wc->where_clause.constraints.items[k];
@@ -1796,6 +1868,24 @@ static void checker_check_method_call_constraints(zan_checker_t *c,
         }
         if (idx < 0 || idx >= tps->count) continue;
         zan_type_t *arg = bind[idx];
+        if (wc->where_clause.has_new && arg && arg->kind != TYPE_TYPE_PARAM && arg->kind != TYPE_ERROR) {
+            bool ok = false;
+            if (arg->kind == TYPE_STRUCT) {
+                ok = true;
+            } else if (arg->kind == TYPE_CLASS) {
+                if (arg->sym && !checker_class_is_abstract(arg->sym)) {
+                    if (checker_has_default_ctor(c, arg->sym)) ok = true;
+                }
+            }
+            if (!ok) {
+                zan_diag_emit(c->diag, DIAG_ERROR, call->loc,
+                    "type '%s' must have a public parameterless constructor to satisfy 'new()' constraint for type parameter '%.*s' of method '%.*s'",
+                    type_name(arg),
+                    (int)wc->where_clause.param_name.len,
+                    wc->where_clause.param_name.str,
+                    (int)msym->name.len, msym->name.str);
+            }
+        }
         if (!arg || arg->kind == TYPE_TYPE_PARAM || arg->kind == TYPE_ERROR)
             continue; /* 未定绑定放行 */
         for (int k = 0; k < wc->where_clause.constraints.count; k++) {
@@ -3344,9 +3434,11 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
                在实例化时被替换，是合法的（实测 `T[] buf = new T[3]` 正常）。
                真要"由类型参数造对象"，只能把工厂交给调用方。 */
             if (type && type->kind == TYPE_TYPE_PARAM) {
-                zan_diag_emit(c->diag, DIAG_ERROR, expr->loc,
-                              "cannot instantiate a type parameter '%s'",
-                              type_name(type));
+                if (!type_param_has_new_constraint(c, type)) {
+                    zan_diag_emit(c->diag, DIAG_ERROR, expr->loc,
+                                  "cannot instantiate a type parameter '%s'",
+                                  type_name(type));
+                }
             }
             check_generic_constraints(c, type, expr->loc);
             if (type && type->kind == TYPE_CLASS && type->sym &&
@@ -4842,6 +4934,8 @@ static void check_method_body(zan_checker_t *c, zan_ast_node_t *method) {
 
     bool saved_ctor = c->in_ctor;
     c->in_ctor = method->kind == AST_CONSTRUCTOR_DECL;
+    zan_ast_node_t *saved_method = c->current_method_decl;
+    c->current_method_decl = method;
     bool saved_nrt = c->in_no_runtime;
     c->in_no_runtime = zan_ast_has_attr(method, "NoRuntime");
     zan_type_t *saved = c->current_return_type;
@@ -4865,6 +4959,7 @@ static void check_method_body(zan_checker_t *c, zan_ast_node_t *method) {
     c->locals = saved_locals;
     c->current_return_type = saved;
     c->in_no_runtime = saved_nrt;
+    c->current_method_decl = saved_method;
     c->in_ctor = saved_ctor;
 }
 
