@@ -2847,7 +2847,19 @@ static void fill_default_args(zan_irgen_t *g, zan_ast_node_t *call,
     if (method_sym->decl->kind != AST_METHOD_DECL &&
         method_sym->decl->kind != AST_CONSTRUCTOR_DECL) return;
     reorder_named_args(g, call, method_sym);
-    if (method_is_params_variadic(method_sym)) return;
+    if (method_is_params_variadic(method_sym)) {
+        /* params 方法也填充尾参之前的可选形参（A381 params 组合）：
+         * "(int a, int b = 10, params int[] rest)" 的 b 在调用缺省时要填，
+         * params 数组本身留给 pack_params_args 收（0 个也收空数组）。 */
+        zan_ast_list_t *pps = &method_sym->decl->method_decl.params;
+        int fill_to = pps->count - 1;
+        for (int i = call->call.args.count; i < fill_to; i++) {
+            zan_ast_node_t *pp = pps->items[i];
+            if (!pp || pp->kind != AST_PARAM || !pp->param.default_val) return;
+            zan_ast_list_push(&call->call.args, pp->param.default_val, g->arena);
+        }
+        return;
+    }
     if (method_sym->name.len > 3 &&
         memcmp(method_sym->name.str, "op_", 3) == 0) return;
     zan_ast_list_t *ps = &method_sym->decl->method_decl.params;

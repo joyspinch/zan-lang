@@ -3497,9 +3497,15 @@ static int method_accepts_arity(zan_symbol_t *m, int argc) {
     int pc = m->decl->method_decl.params.count;
     if (pc == argc) return 1;
     if (m->decl->method_decl.is_variadic && argc > pc) return 1;
-    if (method_is_params_variadic(m) && argc >= pc - 1) return 1;
-    if (argc < pc) {
-        for (int i = argc; i < pc; i++) {
+    bool params_tail = method_is_params_variadic(m) != 0;
+    /* params 尾参本身可缺省（收 0..n 个实参）；它前面的可选形参按各自的
+     * 默认值逐个可省——"(int a, int b = 10, params int[] rest)" 在 argc=1
+     * 时合法（b 填默认、params 收空数组），此前被当成固定 arity 拒绝
+     * （A381 params 组合清单）。 */
+    int fixed = params_tail ? pc - 1 : pc;
+    if (params_tail && argc >= fixed) return 1;
+    if (argc < fixed) {
+        for (int i = argc; i < fixed; i++) {
             zan_ast_node_t *p = m->decl->method_decl.params.items[i];
             if (!p || p->kind != AST_PARAM || !p->param.default_val) return 0;
         }
