@@ -1267,6 +1267,20 @@ add_test(NAME diag_unary_plus_no_overload
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_unary_plus_no_overload PROPERTIES TIMEOUT 60)
 
+# A543: comparing a Binding<T> against the bound type falls through to the
+# object==object reference comparison and is silently always false (a live
+# binding re-reads the model each frame, so the refs never match). The
+# checker must reject it and point at .Get(); Binding == null (testing the
+# binding object itself) stays legal.
+add_test(NAME diag_binding_equality_read
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/binding_equality_read.zan
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/diag_binding_equality_read${_exe_ext}
+    "-DEXPECT_REGEX=cannot compare .Binding<string>. and .string."
+    -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
+set_tests_properties(diag_binding_equality_read PROPERTIES TIMEOUT 60)
+
 # A unary '-' / '~' on a string: the operand is neither numeric nor a type
 # with a matching overload. The checker used to return a bare `type_error`
 # sentinel -- which emits no diagnostic of its own -- so the error leaked

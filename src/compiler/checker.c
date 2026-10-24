@@ -1321,6 +1321,13 @@ static bool checker_is_byte_buffer(zan_type_t *t) {
 }
 
 
+/* Binding<T> 允许接收 T 值（降级成绑定对象）；按名字识别，
+ * 与 checker_type_assignable 里的放行规则保持同一口径。 */
+static bool checker_type_is_binding(zan_type_t *t) {
+    return t && t->kind == TYPE_CLASS && t->name.len == 7 &&
+           memcmp(t->name.str, "Binding", 7) == 0 && t->type_arg_count == 1;
+}
+
 static bool checker_type_assignable(zan_type_t *target, zan_type_t *value) {
     if (!target || !value) return true;
     if (target == value) return true;
@@ -2867,6 +2874,26 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
             if ((left->kind == TYPE_TYPE_PARAM && (right->kind == TYPE_OBJECT || expr_is_null_literal(expr->binary.right))) ||
                 (right->kind == TYPE_TYPE_PARAM && (left->kind == TYPE_OBJECT || expr_is_null_literal(expr->binary.left))))
                 return c->binder->type_bool;
+            /* 单侧 Binding<T> 的比较会落到 object==object 的引用比较，恒为
+             * false（live 绑定每次取值都是新对象语义）——当场拒绝并指引
+             * .Get()。Binding==null（判绑定对象本身）与 Binding==Binding
+             * 照常放行。 */
+            if (left->kind != TYPE_ERROR && right->kind != TYPE_ERROR &&
+                !expr_is_null_literal(expr->binary.left) &&
+                !expr_is_null_literal(expr->binary.right)) {
+                zan_type_t *bnd = checker_type_is_binding(left) ? left
+                                : checker_type_is_binding(right) ? right : NULL;
+                zan_type_t *oth = bnd == left ? right : left;
+                if (bnd && oth->kind != TYPE_OBJECT &&
+                    oth->kind != TYPE_TYPE_PARAM &&
+                    !checker_type_is_binding(oth)) {
+                    zan_diag_emit(c->diag, DIAG_ERROR, expr->loc,
+                                  "cannot compare '%s' and '%s' -- call .Get() "
+                                  "on the binding to compare the bound value",
+                                  type_name(left), type_name(right));
+                    return c->binder->type_error;
+                }
+            }
             if (checker_type_is_ref(left) && checker_type_is_ref(right) &&
                 (left->kind == TYPE_OBJECT || right->kind == TYPE_OBJECT ||
                  checker_type_assignable(left, right) ||

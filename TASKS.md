@@ -649,25 +649,6 @@
   ③ 无论走哪条，都要把 `Control.Add` 的注释与实现对齐（现在文档承诺「自动
      停靠」，实现只对 `With` 兑现），否则每个写代码建树的人都会踩同一个坑。
 
-### [ ] A543 读 Binding<T> 字段当 T 用：拿到的是常量槽，live 绑定的当前值读不出来
-- 现象：聊天抽屉里点头像弹出的「资料名片」没有名字（昵称位置空白，性别符
-  挨着头像），视频号名显示成「的分享」（= 空名 + "的分享"）。控件自己渲染
-  出来的文字却是对的（抽屉标题「冰冰」正常）。
-- 根因：`Label.Text` 是 `Binding<string>` 字段。赋模型字段左值
-  （`pName.Text = s.name;`）会被编译器降级成 **live 绑定**（每帧回读模型
-  字段），其余表达式降级成常量绑定（`stdlib/System/Binding.zan` 的 `Get()`：
-  live 走 getter，const 走 `constVal`）。控件渲染走 `Text.Get()`，拿到的是
-  live 的当前值；而把 `pName.Text` 直接当 `string` 读（隐式降解）拿到的是
-  绑定对象的**常量槽**——live 绑定没有常量，恒为空串。于是「读出来传给
-  回调」这一步把名字丢了。
-- 已落地绕法（本次）：取值改走控件的取值接口 `pName.GetText()`（或
-  `Str()`）；另外把会话字段先快照进局部量再赋给控件，避免 live 绑定在会话
-  对象被换掉后指向悬空。
-- 方向（候选）：编译器侧把「`Binding<T>` 字段读到 `T` 上下文」降解成
-  `Get()` 调用（而不是常量槽），让读与渲染同源；需要确认这条隐式降解在
-  类型检查（`checker_type_assignable` 允许 `Binding<T>` 赋给 `T`）与 irgen
-  两侧的落点一致，并补一条 conformance。
-
 ### [ ] A544 子窗口（聊天记录窗/独立聊天窗/设置窗）在本会话无法像素验收
 - 现象：`ZAN_UI_SCRIPT` 的 `dump pixels` 只抓**主 App** 的窗口；子窗口
   （`Gui.ChildWindow`：聊天记录窗、独立聊天窗、设置窗、通讯录管理窗）是
@@ -750,35 +731,3 @@
   类驱动（样式单一来源成立），html 化要么丢 ListView 语义、要么把行样式拆到
   两个地方；窗口骨架（设置/通讯录管理/聊天记录/独立聊天）与十页已全部
   html+css。
-
-### [x] A548 宿主 struct-decimal 算术算错：`5.5m + 5 == 10.5m` 打印 no（2026-10-24 闭账）
-
-- 现象（2026-10-24 修 A487 时顺手撞见）：C 宿主（`build\zanc.exe`，2026-10-24
-  版）编译 `decimal f = 5.5m; decimal e = 5; f = d + e;`（`f == 10.5m ? "yes"
-  : "no"`）**打印 no**。
-- 根因实测确认：不是 `+` 算错——`decimal + decimal`（如 `5.5m + 2.5m == 8m`）
-  走 `emit_decimal_binary` -> `__zan_decimal_add` 指针 ABI 始终正确。
-  算错的唯一根因是**隐式整数到 decimal 的存储转换缺失**：`decimal e = 5` 时，
-  i64 裸写进 `%Decimal { i32, i32, i64 }` 结构体槽首 8 字节，导致 flags 吞掉
-  尾数低位、lo64 留栈上垃圾，e 从入槽起值就已损坏。
-- 修复全断面落地：
-  - `src/compiler/irgen_generics.c`: `coerce_int_to` 补 decimal 目标分支，
-    统一拦截变量初始化、局部赋值、字段存储与可空包装的隐式 int→decimal 转换，
-    调用 `coerce_to_decimal`（`__zan_decimal_from_int64`）。
-  - `src/compiler/irgen_arc.c`: `emit_collection_slot_store` 与
-    `emit_boundary_coerce` 补 decimal 元素及调用形参实参转换。
-  - `src/compiler/irgen_expr.c`: 一维数组索引赋值（`arr[0] = 5`）补 decimal
-    元素 int 右值转换。
-  - `src/compiler/irgen_stmt.c`: `emit_stmt` 的 return 语句补 int 字面量/变量
-    到 decimal 返回值的隐式转换。
-  - `stdlib/System/Decimal.zan`: `Truncate` 改用 `(d - d % 1m) / 1m` 实现，
-    摆脱 `__zan_decimal_to_int64` 引入的银行家舍入连带影响。
-  - `tests/conformance/decimal_arithmetic.out`: 同步更新（A511 除法去尾零 `4.2`、
-    A513 舍入 `100000`）。
-  - 新增 `tests/conformance/decimal_implicit_int.zan` + `.out`（覆盖 init+assign,
-    arith, call, ret, arr, field, nullable, replay）。
-- 验证：
-  - `ctest -R decimal` 5/5 全绿（`case_decimal_implicit_int`、
-    `case_det_decimal_implicit_int`、`case_decimal_arithmetic`、
-    `case_det_decimal_arithmetic`、`diag_decimal_literal_narrowing`）。
-  - `selfhost_fixed_point`（75.5s）+ `selfhost_diff`（654s）双门全绿。
