@@ -3851,7 +3851,7 @@ static volatile LONG    g_co_stop;
 static int              g_co_inited;
 static int              g_co_workers;
 static DWORD            g_co_tls = TLS_OUT_OF_INDEXES;
-static zan_co_worker_t  g_wk[ZAN_CO_MAXW];
+static zan_co_worker_t *g_wk;
 
 static volatile LONG g_co_pool_live;
 static volatile LONG g_co_pool_fg;
@@ -4077,15 +4077,18 @@ static zan_co_fhdr *co_hdr(void *frame) { return (zan_co_fhdr *)frame; }
 
 #define ZAN_TR_RING 8192
 typedef struct { long long seq; unsigned long tid; const char* tag; const void* fp; } zan_tr_ent;
-static zan_tr_ent g_tr_ring[ZAN_TR_RING];
+static zan_tr_ent *g_tr_ring;
 static volatile long long g_tr_seq = -1;
 static int g_co_trace = -1;
 static void co_trace(const char *what, const void *fp) {
     if (g_co_trace < 0) {
         const char *e = getenv("ZAN_CO_TRACE");
         g_co_trace = (e && *e && strcmp(e, "0") != 0) ? 1 : 0;
+        if (g_co_trace && !g_tr_ring) {
+            g_tr_ring = (zan_tr_ent *)calloc(ZAN_TR_RING, sizeof(zan_tr_ent));
+        }
     }
-    if (!g_co_trace) return;
+    if (!g_co_trace || !g_tr_ring) return;
     long long i = InterlockedIncrement64(&g_tr_seq);
     zan_tr_ent *e = &g_tr_ring[i & (ZAN_TR_RING - 1)];
     e->seq = i;
@@ -4099,7 +4102,7 @@ static void co_trace_dump(long long live) {
         const char *e = getenv("ZAN_CO_TRACE");
         g_co_trace = (e && *e && strcmp(e, "0") != 0) ? 1 : 0;
     }
-    if (!g_co_trace) return;
+    if (!g_co_trace || !g_tr_ring) return;
     long long total = g_tr_seq;
     long long first = total - ZAN_TR_RING;
     if (first < 0) first = -1;
@@ -4255,6 +4258,9 @@ void zan_co_sched_init(void) {
         g_co_tls = TlsAlloc();
         atexit(co_stats_dump);
         g_co_inited = 1;
+    }
+    if (!g_wk) {
+        g_wk = (zan_co_worker_t *)calloc(ZAN_CO_MAXW, sizeof(zan_co_worker_t));
     }
     g_co_workers = co_worker_count();
     g_rq_head = g_rq_tail = NULL;

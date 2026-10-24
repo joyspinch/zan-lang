@@ -234,7 +234,7 @@ endif()
 if(MSVC)
     set(ZAN_RT_OBJ_SECTIONS)
 else()
-    set(ZAN_RT_OBJ_SECTIONS -ffunction-sections)
+    set(ZAN_RT_OBJ_SECTIONS -ffunction-sections -fdata-sections)
 endif()
 set(ZAN_RT_IO_OBJ "${CMAKE_BINARY_DIR}/zanrt_io${CMAKE_C_OUTPUT_EXTENSION}")
 add_custom_command(

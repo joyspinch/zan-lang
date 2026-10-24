@@ -1341,7 +1341,7 @@ static zan_symbol_t *infer_guard_exception_sym(zan_irgen_t *g, const char *msg) 
 }
 
 static void emit_throw_guard_exception(zan_irgen_t *g, zan_symbol_t *sym,
-                                       const char *msg, LLVMValueRef top_val) {
+                                       const char *msg) {
     LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
     LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
@@ -1387,6 +1387,8 @@ static void emit_throw_guard_exception(zan_irgen_t *g, zan_symbol_t *sym,
         if (LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(g->builder))) return;
     }
 
+    LLVMValueRef top_val = LLVMBuildLoad2(g->builder, i32t, top_g, "eh.top");
+
     /* Unwind temporary allocations and jump to handler */
     if (!g->current_async_frame) {
         emit_eh_unwind_to_handler(g, top_val);
@@ -1419,7 +1421,7 @@ static void emit_runtime_check(zan_irgen_t *g, LLVMValueRef is_error,
         LLVMBuildCondBr(g->builder, in_try, throw_bb, nothrow_bb);
 
         LLVMPositionBuilderAtEnd(g->builder, throw_bb);
-        emit_throw_guard_exception(g, sym, msg, top_val);
+        emit_throw_guard_exception(g, sym, msg);
 
         LLVMPositionBuilderAtEnd(g->builder, nothrow_bb);
     }

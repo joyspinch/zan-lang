@@ -39,16 +39,16 @@ for pair in arm64:aarch64 x64:x86_64; do
     march=""
     [ "$sub" = "arm64" ] && march="-mcpu=generic+sha2"
     "$ZIG" cc -target "$arch-linux-musl" -D__OHOS__ -g0 -DZAN_IO_STACKLESS_ONLY -fPIC \
-        -I "$RT" -O2 -ffunction-sections -c "$RT/rt_io.c" -o "$out/zanrt_io.o"
-    "$ZIG" cc -target "$arch-linux-musl" -D__OHOS__ -g0 -std=c11 -fPIC -I "$RT" -O2 -ffunction-sections \
+        -I "$RT" -O2 -ffunction-sections -fdata-sections -c "$RT/rt_io.c" -o "$out/zanrt_io.o"
+    "$ZIG" cc -target "$arch-linux-musl" -D__OHOS__ -g0 -std=c11 -fPIC -I "$RT" -O2 -ffunction-sections -fdata-sections \
         -c "$RT/rt_sync.c" -o "$out/zanrt_sync.o"
-    "$ZIG" cc -target "$arch-linux-musl" -D__OHOS__ -g0 -std=c11 -fPIC -I "$RT" -O2 -ffunction-sections \
+    "$ZIG" cc -target "$arch-linux-musl" -D__OHOS__ -g0 -std=c11 -fPIC -I "$RT" -O2 -ffunction-sections -fdata-sections \
         -c "$RT/rt_file.c" -o "$out/zanrt_file.o"
     # 128-bit Decimal runtime: programs that reach System.Numerics reference
     # __zan_decimal_* and the cross link injects this object for them.
-    "$ZIG" cc -target "$arch-linux-musl" -D__OHOS__ -g0 -std=c11 -fPIC -I "$RT" -O2 -ffunction-sections \
+    "$ZIG" cc -target "$arch-linux-musl" -D__OHOS__ -g0 -std=c11 -fPIC -I "$RT" -O2 -ffunction-sections -fdata-sections \
         -c "$RT/rt_decimal.c" -o "$out/zanrt_decimal.o"
-    "$ZIG" cc -target "$arch-linux-musl" -D__OHOS__ -g0 -std=c11 -fPIC $march -I "$RT" -O2 -ffunction-sections \
+    "$ZIG" cc -target "$arch-linux-musl" -D__OHOS__ -g0 -std=c11 -fPIC $march -I "$RT" -O2 -ffunction-sections -fdata-sections \
         -c "$RT/rt_timer.c" -o "$out/zanrt_timer.o"
     # Hardware-accelerated crypto, shipped as an ARCHIVE member and not as a
     # bare object: a bare .o on the link line is loaded whole, so every
@@ -60,17 +60,17 @@ for pair in arm64:aarch64 x64:x86_64; do
     # twice (TASKS.md A493). $march is the same crypto feature macro the
     # timer object above uses, so both stay in step.
     "$ZIG" cc -target "$arch-linux-musl" -D__OHOS__ -g0 -std=c11 -fPIC $march -I "$RT" \
-        -O2 -ffunction-sections -c "$RT/rt_hw_accel.c" -o "$out/zan_crypto.o"
+        -O2 -ffunction-sections -fdata-sections -c "$RT/rt_hw_accel.c" -o "$out/zan_crypto.o"
     rm -f "$out/libzancrypto.a"
     "$ZIG" ar rcs "$out/libzancrypto.a" "$out/zan_crypto.o"
     "$ZIG" cc -target "$arch-linux-musl" -D__OHOS__ -g0 -std=c11 -fPIC -I "$RT" \
-        -I "$ROOT/src/common" -O2 -ffunction-sections -c "$RT/zan_embed_api.c" -o "$out/zan_embed_api.o"
+        -I "$ROOT/src/common" -O2 -ffunction-sections -fdata-sections -c "$RT/zan_embed_api.c" -o "$out/zan_embed_api.o"
     "$ZIG" cc -target "$arch-linux-musl" -D__OHOS__ -g0 -std=c11 -fPIC \
         -DMINIZ_NO_ARCHIVE_APIS -DMINIZ_NO_ZIP_APIS -DMINIZ_NO_STDIO -DMINIZ_NO_TIME \
-        -I "$RT" -I "$ROOT/src/common" -O2 -ffunction-sections -c "$RT/zan_inflate.c" -o "$out/zan_inflate.o"
+        -I "$RT" -I "$ROOT/src/common" -O2 -ffunction-sections -fdata-sections -c "$RT/zan_inflate.c" -o "$out/zan_inflate.o"
     # HAP XComponent shell adapter zanc puts at the head of every ohos -shared
     # link; the source is arch-independent and lives next to the x64 subset.
-    "$ZIG" cc -target "$arch-linux-musl" -g0 -std=c11 -fPIC -O2 -ffunction-sections \
+    "$ZIG" cc -target "$arch-linux-musl" -g0 -std=c11 -fPIC -O2 -ffunction-sections -fdata-sections \
         -c "$ROOT/toolchain/ohos-x64/zap_main.c" -o "$out/zap_main.o"
     echo "built $out (zanrt_*.o + libzancrypto.a)"
 done

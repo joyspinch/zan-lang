@@ -1687,6 +1687,8 @@ static void async_scan_stmt(async_scan_t *s, zan_ast_node_t *st) {
         async_scan_add_storage_role(s, async_synth_name(s->g, "fe.c", fe_id),
             LLVMPointerType(LLVMInt8TypeInContext(s->g->ctx), 0), st,
             ASYNC_FOREACH_COLLECTION);
+        async_scan_add_storage_role(s, async_synth_name(s->g, "fe.s", fe_id),
+            LLVMInt64TypeInContext(s->g->ctx), st, ASYNC_FOREACH_SNAP);
         if (foreach_proto_enum_type(s->g,
                 infer_expr_type(s->g, st->foreach_stmt.collection, s->scope)))
             /* 枚举器对象在整个循环期间驻留帧槽位 */

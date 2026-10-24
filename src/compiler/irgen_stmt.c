@@ -2803,7 +2803,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
         }
 
         LLVMValueRef col_slot = NULL, idx_alloc = NULL, iter_alloc = NULL;
-        LLVMValueRef enum_slot = NULL, enum_alloc = NULL;
+        LLVMValueRef enum_slot = NULL, enum_alloc = NULL, snap_slot = NULL;
         if (g->current_async_frame) {
             if (fe_enum_ty) {
                 local_var_t *ev2 = local_find_async_role(locals, stmt,
@@ -2820,6 +2820,9 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
             local_var_t *iv = local_find_async_role(locals, stmt,
                 ASYNC_FOREACH_INDEX);
             if (iv) idx_alloc = iv->alloca;
+            local_var_t *sv = local_find_async_role(locals, stmt,
+                ASYNC_FOREACH_SNAP);
+            if (sv) snap_slot = sv->alloca;
             local_var_t *ev = local_find_async_decl(locals, stmt);
             if (ev && !ev->type && LLVMGetTypeKind(elem_llvm) ==
                     LLVMGetTypeKind(local_slot_type(g, ev)))
@@ -2912,7 +2915,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
          * Add 跟着长（死循环）、Remove 后索引跳元素。 */
         LLVMValueRef fe_snap_alloc = NULL;
         if (!fe_enum_ty) {
-            fe_snap_alloc = emit_entry_alloca(g, i64, "fe.snap");
+            fe_snap_alloc = snap_slot ? snap_slot : emit_entry_alloca(g, i64, "fe.snap");
             LLVMValueRef col0 = col_slot
                 ? LLVMBuildBitCast(g->builder,
                       LLVMBuildLoad2(g->builder,

@@ -4508,6 +4508,7 @@ int main(int argc, char **argv) {
     const char *link_subsystem = NULL;
     const char *icon_path = NULL;
     bool no_icon = false;
+    bool default_icon_explicit = false;
     bool emit_lib = false;
     bool lib_shared = false;
     const char *apk_path = NULL;
@@ -4657,6 +4658,8 @@ int main(int argc, char **argv) {
             ipa_name = argv[++i];
         } else if (strcmp(argv[i], "--no-icon") == 0) {
             no_icon = true;
+        } else if (strcmp(argv[i], "--default-icon") == 0) {
+            default_icon_explicit = true;
         } else if (strcmp(argv[i], "--icon") == 0 && i + 1 < argc) {
             icon_path = argv[++i];
         } else if (strcmp(argv[i], "--embed") == 0 && i + 1 < argc) {
@@ -6285,20 +6288,19 @@ int main(int argc, char **argv) {
         if (!no_icon && !emit_lib && target.os == ZAN_OS_WINDOWS) {
             int arm64 = target.arch == ZAN_ARCH_AARCH64;
             snprintf(icon_obj, sizeof(icon_obj), "%s.icon.o", obj_path);
-            int ires;
+            int ires = 1;
             if (icon_path) {
                 ires = zan_winres_icon_object(icon_path, icon_obj, arm64);
                 if (ires != 0)
                     fprintf(stderr, "warning: cannot embed icon '%s'; "
                                     "the executable gets the built-in one\n",
                             icon_path);
-            } else {
-                ires = 1;
             }
-            if (ires != 0)
+            if (ires != 0 && (!publish_mode || default_icon_explicit)) {
                 ires = zan_winres_icon_object_mem(zan_default_icon,
                                                   ZAN_DEFAULT_ICON_LEN,
                                                   icon_obj, arm64);
+            }
             if (ires != 0) {
                 icon_obj[0] = '\0';
             } else if (extra_link_input_count < ZAN_MAX_LINK_INPUTS) {
@@ -7301,8 +7303,8 @@ int main(int argc, char **argv) {
 
             char cmd[4096];
             snprintf(cmd, sizeof(cmd),
-                     "ld.lld -static%s -o \"%s\" \"%s/crt1.o\" \"%s/crti.o\" \"%s\"",
-                     (publish_mode || strip_symbols) ? " -s --gc-sections" : "", obj_path, sys, sys, obj_tmp);
+                     "ld.lld -static%s --gc-sections -o \"%s\" \"%s/crt1.o\" \"%s/crti.o\" \"%s\"",
+                     (publish_mode || strip_symbols) ? " -s" : "", obj_path, sys, sys, obj_tmp);
             for (int di = 0; di < zan_lib_ndirs; di++) {
                 cmd_appendf(cmd, sizeof(cmd), " -L\"%s\"",
                          zan_lib_dirs[di]);
@@ -7445,9 +7447,9 @@ int main(int argc, char **argv) {
                 }
             }
             snprintf(cmd, sizeof(cmd),
-                     "ld.lld -static%s -o \"%s\" \"%s/crt1.o\" \"%s/crti.o\""
+                     "ld.lld -static%s --gc-sections -o \"%s\" \"%s/crt1.o\" \"%s/crti.o\""
                      " \"%s/clang_rt.crtbegin.o\" \"%s\"",
-                     (publish_mode || strip_symbols) ? " -s --gc-sections" : "", obj_path, sys, sys, sys, obj_tmp);
+                     (publish_mode || strip_symbols) ? " -s" : "", obj_path, sys, sys, sys, obj_tmp);
             for (int di = 0; di < zan_lib_ndirs; di++) {
                 cmd_appendf(cmd, sizeof(cmd), " -L\"%s\"",
                          zan_lib_dirs[di]);
@@ -7526,14 +7528,14 @@ int main(int argc, char **argv) {
             char cmd[8192];
             if (drv_lib_count > 0) {
                 snprintf(cmd, sizeof(cmd),
-                         "ld.lld -pie%s -o \"%s\" \"%s/crtbegin_dynamic.o\""
+                         "ld.lld -pie%s --gc-sections -o \"%s\" \"%s/crtbegin_dynamic.o\""
                          " \"%s\"",
-                         (publish_mode || strip_symbols) ? " -s --gc-sections" : "", obj_path, sys, obj_tmp);
+                         (publish_mode || strip_symbols) ? " -s" : "", obj_path, sys, obj_tmp);
             } else {
                 snprintf(cmd, sizeof(cmd),
-                         "ld.lld -static%s -o \"%s\" \"%s/crtbegin_static.o\""
+                         "ld.lld -static%s --gc-sections -o \"%s\" \"%s/crtbegin_static.o\""
                          " \"%s\"",
-                         (publish_mode || strip_symbols) ? " -s --gc-sections" : "", obj_path, sys, obj_tmp);
+                         (publish_mode || strip_symbols) ? " -s" : "", obj_path, sys, obj_tmp);
             }
             for (int di = 0; di < zan_lib_ndirs; di++) {
                 cmd_appendf(cmd, sizeof(cmd), " -L\"%s\"",
@@ -7675,10 +7677,10 @@ int main(int argc, char **argv) {
 
             char cmd[8192];
             snprintf(cmd, sizeof(cmd),
-                     "ld.lld -m %s --stack 268435456%s%s -o \"%s\" "
+                     "ld.lld -m %s --stack 268435456%s --gc-sections%s -o \"%s\" "
                      "\"%s/crt2.o\" \"%s/crtbegin.o\"",
                      (target.arch == ZAN_ARCH_AARCH64) ? "arm64pe" : "i386pep",
-                     (publish_mode || strip_symbols) ? " -s --gc-sections" : "",
+                     (publish_mode || strip_symbols) ? " -s" : "",
                      (link_subsystem && strcmp(link_subsystem, "windows") == 0)
                          ? " --subsystem windows" : "",
                      obj_path, syslib, syslib);
@@ -7793,10 +7795,10 @@ int main(int argc, char **argv) {
             }
             char cmd[8192];
             snprintf(cmd, sizeof(cmd),
-                     "wasm-ld%s -z stack-size=4194304 --max-memory=536870912 "
+                     "wasm-ld%s --gc-sections -z stack-size=4194304 --max-memory=536870912 "
                      "--table-base=2 "
                      "-o \"%s\" \"%s/crt1.o\" \"%s\"",
-                     (publish_mode || strip_symbols) ? " -s --gc-sections" : "", obj_path, sys,
+                     (publish_mode || strip_symbols) ? " -s" : "", obj_path, sys,
                      obj_tmp);
             for (int ei = 0; ei < extra_link_input_count; ei++) {
                 cmd_appendf(cmd, sizeof(cmd), " \"%s\"",
@@ -8254,8 +8256,8 @@ int main(int argc, char **argv) {
             argv[a++] = "--stack"; argv[a++] = "268435456";
             if (publish_mode || strip_symbols) {
                 argv[a++] = "-s";
-                argv[a++] = "--gc-sections";
             }
+            argv[a++] = "--gc-sections";
             if (link_subsystem && strcmp(link_subsystem, "windows") == 0) {
                 argv[a++] = "--subsystem"; argv[a++] = "windows";
             }

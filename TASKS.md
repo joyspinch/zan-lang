@@ -8,29 +8,6 @@
 
 ## 未完成
 
-### [ ] A527 发布产物体积——分节与 gc 已落地并验证，宿主 .text 的大头已让给 MinGW 地板，剩最大杠杆是内嵌默认图标
-- **2026-10-24 实测校准（结论大改，原测量作历史保留在下方）**：
-  - `ZAN_RT_OBJ_SECTIONS`（`-ffunction-sections -fdata-sections`，非 MSVC 分支）
-    已生效：`build/zanrt_timer.obj` 实测 **79 个 `.text$函数` 分节**；发布链接带
-    `--gc-sections`；捆绑 GNU ld 在 PE 上 gc 实测有效（`ld -m i386pep --gc-sections`
-    最小 A/B：.text 0x78 → 0x28，死函数真被裁）。
-  - **发布 hello 的 .text = 147,160 B，其中 Zan 运行时仅 ~62 KB**（io_mt 37,984 +
-    timer 21,312 + mem 2,992），**crypto 53,408 B 一个符号都没进**（归档按引用拉取
-    生效，`zan_hw_*` 符号计数 0）。其余 ~85 KB 是 MinGW CRT/静态库（mingwex/
-    msvcrt 等）的地板——不是 Zan 能裁的；再往下要换 CRT/链接器形态，属产品决策。
-  - 剩余真杠杆只剩**内嵌默认图标**（`.rsrc` 105 KB，`--no-icon` 已有）：换多尺寸
-    小图标或发布默认不嵌，省约 78 KB，仍待拍板。
-  - 遗留小项：宿主 .text 里 io/timer 是否还有未用函数可裁，需带符号链接
-    （不 -s + `--print-gc-sections` 走查）复测，本轮未做。
-- 实测（宿主 Windows，hello 的 `--publish` 产物 287,232 字节）：`.text` 146,432 + `.rsrc` 106,496 + 导入表/重定位/pdata 等约 35 KB。`.rsrc` 那一块就是内嵌的默认图标——`assets/zan.ico`（105,903 字节）由 CMake 编译进 zanc 的字节数组，每产一个 Windows exe 都带一份（`CMakeLists.txt` 的 `ZAN_DEFAULT_ICON`），占发布体积 37%。开发构建 703,679 字节，多出的 416 KB 是 DWARF 调试信息（约 317 KB）与符号表。
-- **标准库不是体积杠杆**：`stdlib/` 源码 1.25 MB / 171 个 `.zan`，但 `using System` + `Console.WriteLine` 的程序比空程序只多 7,680 字节 `.text`（156,160 vs 148,480）——编译器只拉 `using` 到的命名空间，发布时 `--gc-sections` 再裁一遍。**别把力气花在标准库上。**
-- 真杠杆一：运行时对象没按函数分节，链接期 `--gc-sections` 裁不到函数级，空程序也要背走 io/sync/timer/decimal 四个对象的全部 `.text`。实测同样 6 个 linux-musl 运行时对象（sync/file/decimal/timer/embed/inflate）+ 同一个 main：A（现状）`.text` 140,298 字节，B（加 `-ffunction-sections -fdata-sections`）**48,479 字节（-65%）**。
-- 真杠杆二：默认图标 106 KB。`--no-icon` 已有；把 `assets/zan.ico` 换成多尺寸小图标、或让发布默认不嵌，可省约 78 KB。
-- 真杠杆三：`libzancrypto.a` 单成员 55.1 KB（见 A499 按族再切）。
-- 落点：`scripts/build_{linux,macos,win,android,ohos}_rt.sh` 的运行时编译加 `-ffunction-sections -fdata-sections`；宿主侧 `src/runtime/*.c` 的 CMake 编译同理；再确认 `--gc-sections` 在非 publish 构建上也开（现在只有 publish/strip 才开）。
-- 探针：`_scratch/fsect/`（A/B 两组对象 + `main2.c` + 两个链接产物），`_scratch/sizeprobe/`（hello/bare 的 dev 与 publish 四份产物）。
-- 关联：A499（crypto 归档按族再切）、A493（crypto 已归档化）。
-
 ### [ ] A464 运行期分配量统计缺失——托管分配没有可读的计数入口
 
 - 现象（2026-10-21 落地 Zan.Bench 时撞到）：基准测试要报"这次操作分配了

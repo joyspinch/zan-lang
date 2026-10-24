@@ -31,19 +31,19 @@ for pair in arm64:aarch64 x64:x86_64; do
     # -fPIC throughout: these objects are linked into dylibs as well as into
     # executables, and Mach-O shared output rejects the absolute relocations a
     # non-PIC object emits.
-    "$ZIG" cc -target "$arch-macos.11.0" -g0 -DZAN_IO_STACKLESS_ONLY -fPIC -I "$RT" -O2 -ffunction-sections \
+    "$ZIG" cc -target "$arch-macos.11.0" -g0 -DZAN_IO_STACKLESS_ONLY -fPIC -I "$RT" -O2 -ffunction-sections -fdata-sections \
         -c "$RT/rt_io.c" -o "$out/zanrt_io.o"
     "$ZIG" cc -target "$arch-macos.11.0" -g0 -DZAN_IO_STACKLESS_ONLY -DZAN_CO_DRIVER -fPIC \
-        -I "$RT" -O2 -ffunction-sections -c "$RT/rt_io.c" -o "$out/zanrt_io_mt.o"
-    "$ZIG" cc -target "$arch-macos.11.0" -g0 -std=c11 -fPIC -I "$RT" -O2 -ffunction-sections \
+        -I "$RT" -O2 -ffunction-sections -fdata-sections -c "$RT/rt_io.c" -o "$out/zanrt_io_mt.o"
+    "$ZIG" cc -target "$arch-macos.11.0" -g0 -std=c11 -fPIC -I "$RT" -O2 -ffunction-sections -fdata-sections \
         -c "$RT/rt_sync.c" -o "$out/zanrt_sync.o"
     # File metadata / stream IO runtime (zan_file_*), linked by any program
     # that touches System.IO.File.
-    "$ZIG" cc -target "$arch-macos.11.0" -g0 -std=c11 -fPIC -I "$RT" -O2 -ffunction-sections \
+    "$ZIG" cc -target "$arch-macos.11.0" -g0 -std=c11 -fPIC -I "$RT" -O2 -ffunction-sections -fdata-sections \
         -c "$RT/rt_file.c" -o "$out/zanrt_file.o"
     # Every emitted program calls zan_timer_* from its inline coroutine driver,
     # so a cross-link needs this object unconditionally (see main.c).
-    "$ZIG" cc -target "$arch-macos.11.0" -g0 -std=c11 -fPIC -I "$RT" -O2 -ffunction-sections \
+    "$ZIG" cc -target "$arch-macos.11.0" -g0 -std=c11 -fPIC -I "$RT" -O2 -ffunction-sections -fdata-sections \
         -c "$RT/rt_timer.c" -o "$out/zanrt_timer.o"
     # 128-bit Decimal runtime: programs that reach System.Numerics (and so
     # NativeMemory) reference __zan_decimal_*, and the cross link injects this
@@ -52,7 +52,7 @@ for pair in arm64:aarch64 x64:x86_64; do
     # "bundled macOS runtime objects not found" -- and the object is only
     # needed when the program actually uses decimal, so a plain console
     # program never notices it is missing.
-    "$ZIG" cc -target "$arch-macos.11.0" -g0 -std=c11 -fPIC -I "$RT" -O2 -ffunction-sections \
+    "$ZIG" cc -target "$arch-macos.11.0" -g0 -std=c11 -fPIC -I "$RT" -O2 -ffunction-sections -fdata-sections \
         -c "$RT/rt_decimal.c" -o "$out/zanrt_decimal.o"
     # Hardware-accelerated crypto, shipped as an ARCHIVE member and not as a
     # bare object: a bare .o on the link line is loaded whole, so every
@@ -62,20 +62,20 @@ for pair in arm64:aarch64 x64:x86_64; do
     # Rebuild this together with zanrt_timer.o: both derive from the same
     # rt_hw_accel.c, and mixing generations would define the same symbol
     # twice (TASKS.md A493).
-    "$ZIG" cc -target "$arch-macos.11.0" -g0 -std=c11 -fPIC -I "$RT" -O2 -ffunction-sections \
+    "$ZIG" cc -target "$arch-macos.11.0" -g0 -std=c11 -fPIC -I "$RT" -O2 -ffunction-sections -fdata-sections \
         -c "$RT/rt_hw_accel.c" -o "$out/zan_crypto.o"
     rm -f "$out/libzancrypto.a"
     "$ZIG" ar rcs "$out/libzancrypto.a" "$out/zan_crypto.o"
     # GUI compatibility stubs (event seq/flag, font ascent, full surface presentation).
-    "$ZIG" cc -target "$arch-macos.11.0" -g0 -std=c11 -fPIC -I "$RT" -O2 -ffunction-sections \
+    "$ZIG" cc -target "$arch-macos.11.0" -g0 -std=c11 -fPIC -I "$RT" -O2 -ffunction-sections -fdata-sections \
         -c "$RT/gui_compat_mac.c" -o "$out/zanrt_gui.o"
     # Embedded-resource API + compressed-resource decoder: GUI programs pull
     # skins/icons through the auto-embed path, so irgen sets uses_embed_api /
     # uses_inflate and the cross link injects these two objects (same flags as
     # the ZAN_EMBED_OBJ / ZAN_INFLATE_OBJ recipes in CMakeLists.txt).
-    "$ZIG" cc -target "$arch-macos.11.0" -g0 -std=c11 -fPIC -I "$RT" -O2 -ffunction-sections \
+    "$ZIG" cc -target "$arch-macos.11.0" -g0 -std=c11 -fPIC -I "$RT" -O2 -ffunction-sections -fdata-sections \
         -c "$RT/zan_embed_api.c" -o "$out/zan_embed_api.o"
-    "$ZIG" cc -target "$arch-macos.11.0" -g0 -std=c11 -fPIC -O2 -ffunction-sections \
+    "$ZIG" cc -target "$arch-macos.11.0" -g0 -std=c11 -fPIC -O2 -ffunction-sections -fdata-sections \
         -DMINIZ_NO_ARCHIVE_APIS -DMINIZ_NO_ZIP_APIS -DMINIZ_NO_STDIO \
         -DMINIZ_NO_TIME -DMINIZ_NO_ARCHIVE_WRITERS \
         -I "$ROOT/src/common" \
@@ -84,7 +84,7 @@ for pair in arm64:aarch64 x64:x86_64; do
 done
 
 mkdir -p "$ROOT/toolchain/ios/arm64"
-"$ZIG" cc -target aarch64-ios -g0 -std=c11 -fPIC -I "$RT" -O2 -ffunction-sections \
+"$ZIG" cc -target aarch64-ios -g0 -std=c11 -fPIC -I "$RT" -O2 -ffunction-sections -fdata-sections \
     -c "$RT/gui_compat_mac.c" -o "$ROOT/toolchain/ios/arm64/zanrt_gui.o"
 echo "built toolchain/ios/arm64: zanrt_gui.o"
 

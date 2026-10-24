@@ -136,7 +136,7 @@ trace 的事件序为准，不要顺着报表的站点名硬找。
 | `--publish` | 发布档：优化（默认 -Os）+ strip |
 | `-O0..-O3/-Os/-Oz` | 优化档；默认 O0，--publish 默认 Os；-Oz 极限体积（边缘/嵌入式） |
 | `-g, --debug` | DWARF 调试信息（强制 O0；自动开 --check-leaks/--arc-guard） |
-| `--icon <f.ico>` / `--no-icon` | 嵌入/跳过 Windows 图标 |
+| `--icon <f.ico>` / `--no-icon` / `--default-icon` | 嵌入/跳过 Windows 图标（--publish 默认不内嵌内置图标，可传 --default-icon 显式开启） |
 | `--embed <p[=n]>` | 把文件/目录烤进可执行资源（可重复）；GUI 程序自带 `skins/` 暂存时，仅当目录内含 base.css（完整替身）才跳过 stdlib 皮肤基线自动内嵌，pack-only 暂存照常内嵌基线且暂存包赢重名 |
 | `--emit-apk` | （未列入 help）Android APK 全链路打包；配 `--apk-package`/`--apk-label` |
 | `--emit-ipa` | iOS IPA 全链路打包；配 `--ipa-bundle-id`/`--ipa-name`（`-o <file.ipa>` 也自动开启） |

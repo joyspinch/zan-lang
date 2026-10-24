@@ -3874,7 +3874,8 @@ enum {
     ASYNC_LOCAL_VALUE = 0,
     ASYNC_FOREACH_INDEX,
     ASYNC_FOREACH_COLLECTION,
-    ASYNC_FOREACH_ENUMERATOR
+    ASYNC_FOREACH_ENUMERATOR,
+    ASYNC_FOREACH_SNAP
 };
 
 static local_var_t *local_find_async_role(local_scope_t *scope,
