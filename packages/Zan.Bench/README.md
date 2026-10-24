@@ -5,8 +5,8 @@
 
 对标 BenchmarkDotNet（11,512★）的**时间基准核心子集**：用例注册、预热与迭代
 控制、统计量、报告输出、与上次基线的对比。**不做** BenchmarkDotNet 的
-进程隔离、GC 收集、诊断器、内存/硬件计数器联动——那些依赖 .NET 运行时设施，
-Zan 侧没有对应物（详见「已知边界」里关于分配量统计的说明）。
+进程隔离、GC 停顿收集、诊断器、硬件计数器联动——那些依赖 .NET 运行时设施。
+分配量统计通过 `System.GC.GetAllocatedBytesForCurrentThread()` 支持。
 
 ## 设计取舍
 
@@ -164,23 +164,8 @@ conformance `bench_suite`（74 条断言）：统计原语（中位数奇偶取�
 
 ## 已知边界
 
-- **不提供分配量统计**。BenchmarkDotNet 的 `Allocated` 列在本包缺席，原因见下
-  一条。**这不是"暂未实现"，是当前语言与链接策略做不到**。
-- **为什么做不到**（详见 `TASKS.md` 的 **A464**）：
-  1. 托管分配的**唯一入口**是编译器生成的 `zan_rt_alloc`（`src/compiler/irgen.c`
-     里的 `emit_new_expr` / 装箱路径），它内部调 `malloc`；
-  2. 运行时虽然有 `zan_mem_get_stats`（`src/runtime/rt_mem.c`，统计 slab 数 /
-     slab 字节 / 小块分配次数）和 `__wrap_malloc/calloc/realloc`，但
-     **`stdlib` 完全没有暴露这组 API**；
-  3. 更关键的是，含 `--wrap=malloc` 的 `zanrt_mem.obj` **只在 `--fast-alloc`
-     程序里链接**（wrap 作用于整个 image，不能只对一部分 malloc 生效），普通
-     程序链接的是别的分配实现。
-
-  两个可行方向（都还没做）：
-  1. **编译器侧挂钩**：让 `zan_rt_alloc` 在编译产物里带一个可选的计数钩子，
-     配一个总是参与链接的运行时对象提供线程局部计数；
-  2. **链接策略侧调整**：让 `zanrt_mem` 总是参与链接并 wrap 掉 malloc，
-     再把 `zan_mem_get_stats` 通过 stdlib 暴露出来。
+- **单次操作分配量统计已支持**：基于 `System.GC.GetAllocatedBytesForCurrentThread()`（A464），文本表格（`allocated(B)` 列）和 JSON（`allocatedBytes` 属性）均记录单次操作平均分配的托管堆字节数。
+- **没有 GC 停顿度量**：Zan 基于 ARC（自动引用计数），对象生命周期确定性终结，不存在分代 GC 收集器的暂停时间。
 
   在这之前，**不要用本包的数字推断内存行为**——它只回答"多快"，不回答"占了
   多少"。

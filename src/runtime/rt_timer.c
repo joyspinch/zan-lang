@@ -1462,3 +1462,32 @@ double zan_rt_dbl_parse(const char *s, char **endp) {
     return strtod(s, endp);
 }
 
+/* 堆内存分配度量 (A464) */
+#if defined(__wasm__) || defined(ZAN_BARE_METAL)
+#define ZAN_ALLOC_TLS
+#else
+#define ZAN_ALLOC_TLS __thread
+#endif
+
+static ZAN_ALLOC_TLS int64_t g_thread_alloc_bytes;
+static volatile int64_t g_total_alloc_bytes;
+
+void zan_rt_alloc_add(int64_t bytes) {
+    if (bytes <= 0) return;
+    g_thread_alloc_bytes += bytes;
+    __atomic_fetch_add(&g_total_alloc_bytes, bytes, __ATOMIC_RELAXED);
+}
+
+int64_t zan_rt_alloc_bytes_thread(void) {
+    return g_thread_alloc_bytes;
+}
+
+int64_t zan_rt_alloc_bytes_total(void) {
+    return __atomic_load_n(&g_total_alloc_bytes, __ATOMIC_RELAXED);
+}
+
+__attribute__((weak))
+size_t zan_mem_slabs(void) {
+    return 0;
+}
+

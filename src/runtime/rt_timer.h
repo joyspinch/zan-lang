@@ -27,6 +27,11 @@ typedef void (*zan_fatal_fn)(const char *category, const char *message);
 void zan_rt_set_fatal_handler(zan_fatal_fn fn);
 void zan_rt_fatal(const char *category, const char *message);
 unsigned char *zan_rt_soft_scratch(void);
+/* 堆内存分配度量 (A464) */
+void zan_rt_alloc_add(int64_t bytes);
+int64_t zan_rt_alloc_bytes_thread(void);
+int64_t zan_rt_alloc_bytes_total(void);
+size_t zan_mem_slabs(void);
 void zan_rt_dbl_str(char *buf, unsigned long long cap, double v);
 void zan_rt_flt_str(char *buf, unsigned long long cap, float v);
 /* double */

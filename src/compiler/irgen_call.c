@@ -226,6 +226,7 @@ static LLVMValueRef emit_task_action_run(zan_irgen_t *g, LLVMValueRef lv,
     LLVMValueRef fsize = LLVMSizeOf(ft);
     LLVMValueRef raw = zan_call2(g->builder, malloc_ty, g->fn_malloc, &fsize, 1, "task.raw");
     zan_irgen_emit_oom_check(g, g->current_fn, raw);
+    emit_rt_alloc_add(g, fsize);
 
     {
         LLVMTypeRef memset_ty = LLVMFunctionType(i8ptr,

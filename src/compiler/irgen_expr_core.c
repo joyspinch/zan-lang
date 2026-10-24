@@ -2531,6 +2531,7 @@ static LLVMValueRef zan_array_alloc_impl(zan_irgen_t *g, LLVMValueRef total,
         get_calloc_fn(g), (LLVMValueRef[]){ bytes, LLVMConstInt(i64, 1, 0) }, 2, "arr.raw");
     LLVMValueRef null_raw = LLVMBuildIsNull(g->builder, raw, "arr.null");
     emit_runtime_check(g, null_raw, (zan_loc_t){0}, "array allocation failed");
+    emit_rt_alloc_add(g, bytes);
     zan_arr_hdr_store(g, raw, ZAN_ARR_HDR_SIZE + ZAN_ARR_RC_OFF,
                       LLVMConstInt(i64, 1, 0), "arr.rc");
     zan_arr_hdr_store(g, raw, ZAN_ARR_HDR_SIZE + ZAN_ARR_RC_MAGIC_OFF,
@@ -2596,6 +2597,7 @@ static LLVMValueRef zan_mdarray_alloc(zan_irgen_t *g, LLVMValueRef *dims,
         get_calloc_fn(g), (LLVMValueRef[]){ bytes, LLVMConstInt(i64, 1, 0) }, 2, "md.raw");
     LLVMValueRef null_raw = LLVMBuildIsNull(g->builder, raw, "md.null");
     emit_runtime_check(g, null_raw, (zan_loc_t){0}, "array allocation failed");
+    emit_rt_alloc_add(g, bytes);
     LLVMValueRef hdri64 = LLVMBuildBitCast(g->builder, raw,
         LLVMPointerType(i64, 0), "md.hdr");
     zan_arr_hdr_store(g, raw, ZAN_ARR_HDR_SIZE + ZAN_ARR_RC_OFF,

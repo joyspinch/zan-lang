@@ -86,6 +86,7 @@ stdlib/
 │   ├── TimeSpan.zan                 # Time span
 │   ├── Interop.zan                  # FFI helpers ([DllImport] wrappers)
 │   ├── NativeMemory.zan             # Low-level memory operations
+│   ├── GC.zan                       # Allocation tracking + memory metrics (A464)
 │   ├── Exception.zan                # Exception base types
 │   ├── Binding.zan                  # late binding / dynamic dispatch helpers
 │   ├── TaskJoin.zan                 # async task join helpers

@@ -609,6 +609,7 @@ static void emit_async_method_ir(zan_irgen_t *g, method_body_work_t *w) {
         LLVMValueRef fsize = LLVMSizeOf(frame_type);
         LLVMValueRef raw = zan_call2(g->builder, malloc_ty, g->fn_malloc, &fsize, 1, "frame.raw");
         zan_irgen_emit_oom_check(g, ramp_fn, raw);
+        emit_rt_alloc_add(g, fsize);
         {
             LLVMTypeRef i8ptr0 = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
             LLVMTypeRef memset_ty = LLVMFunctionType(i8ptr0,

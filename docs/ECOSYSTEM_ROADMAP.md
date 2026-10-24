@@ -1385,13 +1385,7 @@ JSON 能被自己解析回来）· 基线对比（变快 / 变慢 / 噪声 / 新
 数组）。判定器**只断言结构与关系，不断言具体耗时**——耗时依赖机器，绝对值不是
 契约。
 
-**已知边界**：**不提供分配量统计**（BenchmarkDotNet 的 `Allocated` 列缺席）——
-托管分配的唯一入口是编译器生成的 `zan_rt_alloc`，运行时的 malloc wrap 只在
-`--fast-alloc` 程序里链接、且 stdlib 完全没暴露 `zan_mem_get_stats`，当前语言与
-链接策略做不到，根因与两个方向登记在 `TASKS.md` 的 **A464**；本包只回答"多快"，
-不回答"占了多少"。此外不做进程隔离（用例之间会互相预热）、没有 GC 相关统计
-（Zan 是 ARC，**没有 GC**）、不做统计显著性检验、文本报告的浮点格式走
-`Convert.ToString`（机器比对请用 JSON）。
+**已知边界**：**单次操作分配量统计已支持**（基于 A464 与 `System.GC.GetAllocatedBytesForCurrentThread()`，文本报告与 JSON 均包含 `allocated(B)` 列）；不做进程隔离（用例之间会互相预热）、不做停顿型 GC 周期统计（Zan 基于 ARC，无停顿回收器）、不做统计显著性检验、文本报告的浮点格式走 `Convert.ToString`（机器比对请用 JSON）。
 
 ### 1.25 条码与二维码：`Zan.Barcode`
 
@@ -1833,7 +1827,7 @@ OpenAI 兼容服务 · M5 GPU compute 原生后端。
 | `Zan.Barcode` | ZXing.Net | 榜外 | ✅ 已落地 `packages/Zan.Barcode`（`System.Barcode`：完整 QR 模型 1-40 编解码器（ISO/IEC 18004：分段 + 自动选版本 + GF(256) RS 交织 + 八掩码罚分）+ 扫描器（二值化 → 定位图形 → 仿射/投影变换 → 采样 → 格式信息 BCH → 去掩码 → 反交织 → RS 纠错 → 分段解析），**任意角度旋转、缩放 2px 起、椒盐噪声 5% 内、遮挡靠纠错还原**；不做一维条码，见 §1.25） | — |
 | `Zan.Test.Fixtures` | AutoFixture / Bogus | 3,539 / 9,747 | ✅ 已落地 `packages/Zan.Test.Fixtures`（`System.Test.Fixtures`：定长种子随机源 + 语义化假数据（人名 / 邮箱 / 地址 / 句子 / 颜色 / 保留测试卡号）+ 集合假数据（唯一性有上限保证）+ 显式装配取值器，无反射，见 §1.17） | — |
 | `Zan.Test.Mocks` | Moq / NSubstitute | 6,410 | ✅ 已落地 `packages/Zan.Test.Mocks`（`System.Test.Mocks`：调用记录 + 六种参数匹配 + 次数期望 + 手写替身基类 + 桩件与异步桩，无反射无代码生成，见 §1.14） | — |
-| `Zan.Bench` | BenchmarkDotNet | 11,512 | ✅ 已落地 `packages/Zan.Bench`（`System.Bench`：预热 + 重复测量（单调时钟）+ 中位数主导统计 + 泛型参数化用例 + 文本/JSON 报告 + 基线对比（带噪声阈值）；**不提供分配量统计**（根因见 `TASKS.md` A464），见 §1.24） | — |
+| `Zan.Bench` | BenchmarkDotNet | 11,512 | ✅ 已落地 `packages/Zan.Bench`（`System.Bench`：预热 + 重复测量（单调时钟）+ 中位数主导统计 + 泛型参数化用例 + 文本/JSON 报告 + 基线对比（带噪声阈值）+ 单次操作分配量统计（A464）；见 §1.24） | — |
 
 > LiteDB（9,486★）**不做**：嵌入式文档库用现有 ZanDb 覆盖，
 > 不引入第二套持久化语义。

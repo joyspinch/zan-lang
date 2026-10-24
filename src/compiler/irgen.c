@@ -1166,6 +1166,23 @@ static void zan_emit_frame_free(zan_irgen_t *g, LLVMValueRef frame_i8) {
               &frame_i8, 1, "");
 }
 
+static void emit_rt_alloc_add(zan_irgen_t *g, LLVMValueRef bytes) {
+    if (!bytes || !g || !g->builder) return;
+    LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
+    LLVMTypeRef fn_ty = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), (LLVMTypeRef[]){ i64 }, 1, 0);
+    LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "zan_rt_alloc_add");
+    if (!fn) fn = LLVMAddFunction(g->mod, "zan_rt_alloc_add", fn_ty);
+    LLVMValueRef b_val = bytes;
+    if (LLVMTypeOf(b_val) != i64) {
+        if (LLVMGetTypeKind(LLVMTypeOf(b_val)) == LLVMPointerTypeKind) {
+            b_val = LLVMBuildPtrToInt(g->builder, b_val, i64, "alloc.bytes");
+        } else {
+            b_val = LLVMBuildZExtOrBitCast(g->builder, b_val, i64, "alloc.bytes");
+        }
+    }
+    zan_call2(g->builder, fn_ty, fn, &b_val, 1, "");
+}
+
 static void *irgen_grow(void *base, int *cap, int need, size_t elem) {
     if (need <= *cap) return base;
     int ncap = *cap ? *cap * 2 : 256;
@@ -2656,6 +2673,7 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
         LLVMTypeRef malloc_fn_type = LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i64 }, 1, 0);
         LLVMValueRef raw = zan_call2(g->builder, malloc_fn_type, g->fn_malloc, &total, 1, "raw");
         zan_irgen_emit_oom_check(g, g->rt_alloc, raw);
+        emit_rt_alloc_add(g, total);
         /* refcount = 1 at raw[0..7] */
         LLVMValueRef rc_ptr = LLVMBuildBitCast(g->builder, raw, LLVMPointerType(i64, 0), "rcptr");
         LLVMBuildStore(g->builder, LLVMConstInt(i64, 1, 0), rc_ptr);
@@ -2692,6 +2710,7 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
         LLVMTypeRef malloc_fn_type = LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i64 }, 1, 0);
         LLVMValueRef raw = zan_call2(g->builder, malloc_fn_type, g->fn_malloc, &total, 1, "raw");
         zan_irgen_emit_oom_check(g, g->rt_str_alloc, raw);
+        emit_rt_alloc_add(g, total);
         LLVMValueRef rc_ptr = LLVMBuildBitCast(g->builder, raw, LLVMPointerType(i64, 0), "rcptr");
         LLVMBuildStore(g->builder, LLVMConstInt(i64, 1, 0), rc_ptr);
         LLVMValueRef eight = LLVMConstInt(i64, (uint64_t)(-ZAN_OBJ_SITE_OFF), 0);
