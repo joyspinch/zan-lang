@@ -1,0 +1,93 @@
+using System;
+using System.Test;
+using System.Bson;
+
+// Zan.Bson 包的无头测试：Pack→Unpack 往返的值形还原、边界与嵌套。
+class BsonRoundTripTests {
+    static JsonValue Need(JsonValue v, string key) {
+        JsonValue x = v.Get(key);
+        if (x == null) { throw new Exception("missing key: " + key); }
+        return x;
+    }
+
+    static JsonValue NeedAt(JsonValue v, int i) {
+        JsonValue x = v.At(i);
+        if (x == null) { throw new Exception("missing index: " + Convert.ToString(i)); }
+        return x;
+    }
+
+    static JsonValue Sample() {
+        JsonValue root = JsonValue.NewObject();
+        root.PutStr("name", "张三");
+        root.PutInt("age", 30);
+        root.PutBool("vip", true);
+        root.PutNull("memo");
+        root.PutDouble("score", 97.5);
+        JsonValue tags = JsonValue.NewArray();
+        tags.AppendStr("x");
+        tags.AppendInt(7);
+        root.Put("tags", tags);
+        JsonValue inner = JsonValue.NewObject();
+        inner.PutStr("city", "上海");
+        root.Put("addr", inner);
+        return root;
+    }
+
+    static void Main() {
+        Test.Group("roundtrip");
+        Test.Run("scalars", () => {
+            JsonValue back = Bson.Unpack(Bson.Pack(Sample()));
+            Assert.Equal("张三", Need(back, "name").strVal, "name");
+            Assert.True(Need(back, "age").IsInt(), "age-stays-int");
+            Assert.Equal(30L, Need(back, "age").numI, "age");
+            Assert.Equal(true, Need(back, "vip").boolVal, "vip");
+            Assert.True(Need(back, "memo").IsNull(), "memo-null");
+            Assert.Nearly(97.5, Need(back, "score").numD, 0.000001, "score");
+        });
+
+        Test.Run("containers", () => {
+            JsonValue back = Bson.Unpack(Bson.Pack(Sample()));
+            JsonValue tags = Need(back, "tags");
+            Assert.True(tags.IsArray(), "tags-array");
+            Assert.Equal(2, tags.Count(), "tags-len");
+            Assert.Equal("x", NeedAt(tags, 0).strVal, "tag0");
+            Assert.Equal(7L, NeedAt(tags, 1).numI, "tag1");
+            Assert.Equal("上海", Need(Need(back, "addr"), "city").strVal, "city");
+        });
+
+        Test.Run("int64-beyond-double", () => {
+            JsonValue v = JsonValue.NewObject();
+            long big = 9007199254740993L;
+            v.PutInt("big", big);
+            v.PutInt("neg", -123);
+            JsonValue back = Bson.Unpack(Bson.Pack(v));
+            Assert.Equal(big, Need(back, "big").numI, "big-int64");
+            Assert.Equal(-123L, Need(back, "neg").numI, "negative");
+        });
+
+        Test.Group("edges");
+        Test.Run("empty-values", () => {
+            JsonValue v = JsonValue.NewObject();
+            v.PutStr("empty", "");
+            v.Put("arr", JsonValue.NewArray());
+            v.Put("obj", JsonValue.NewObject());
+            JsonValue back = Bson.Unpack(Bson.Pack(v));
+            Assert.Equal("", Need(back, "empty").strVal, "empty-str");
+            Assert.True(Need(back, "arr").IsArray(), "empty-arr");
+            Assert.Equal(0, Need(back, "arr").Count(), "arr-len");
+            Assert.True(Need(back, "obj").IsObject(), "empty-obj");
+        });
+
+        Test.Run("array-root-rejected", () => {
+            // BSON 规范约束：顶层只能是 document（对象），裸数组根非法——
+            // 必须响亮抛错，而不是静默包一层或返回垃圾。
+            JsonValue arr = JsonValue.NewArray();
+            arr.AppendInt(1);
+            bool threw = false;
+            try { Bson.Pack(arr); } catch { threw = true; }
+            Assert.True(threw, "array-root-throws");
+        });
+
+        Test.Finish();
+    }
+}
