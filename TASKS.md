@@ -624,6 +624,20 @@
      模板。
   ③（已落地 2026-10-25）`Control.Add` 的注释已与实现对齐：写明 Add 不做停靠
      归一化（子项保持手摆，流式容器里会叠在原点），要自动停靠用 `With()`。
+- 2026-10-25 补充排查（做 ① 的护栏实验，未落地）：
+  - 护栏形状本身可行：designFloat 子项（设计器自由画布 FormBuilder.zan:632、
+    GenForm 生成码；Serialize 还原路径可按 mx/my 补标）与显式 dock（ErrorList
+    dock=5、GraphView dock=4/3 都在 Add 前给定）都能精确豁免；无头探针
+    （Form.CreateOffscreen + CaptureSnapshot 后读 bx/by）可完整断言列/行流式。
+  - 但**控件出生默认 dock=Top**（Button/Label/Avatar 的 `InitControl(label,1)`，
+    `InitControl(n,d)` 第二参就是 dock）——护栏若把出生值当"未设置"归一化
+    （dock∈{0,1}→流式轴），行容器里"出生 dock=1"的尺寸声明子项会被改写成
+    dock=3，宽度计算随之改变；护栏若只豁免 dock=0 则对 widget 子项完全不生效。
+    即**出生 dock=Top 在流式容器里是承重契约**（conformance_gui_design_form_size
+    的尺寸档断言依赖它），①的"归一化"与它正面冲突，需要连同出生 dock 语义
+    一起重新设计。
+  - ②（Panel.Column/Row 变 flex 容器）是剩下没探的方向。这条维持"需专门
+    一轮 + IDE 截图验证"，不从批量清账里顺手做。
 
 ### [ ] A544 子窗口（聊天记录窗/独立聊天窗/设置窗）在本会话无法像素验收
 - 现象：`ZAN_UI_SCRIPT` 的 `dump pixels` 只抓**主 App** 的窗口；子窗口
