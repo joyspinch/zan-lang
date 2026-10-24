@@ -166,6 +166,21 @@
 - **推广**：凡是"宿主侧返回了一个半成品值"的分支，都是同一种病——检查器要在
   编译期把语义缺口堵住，而不是让运行期交出 null / 0 / 野指针。
 
+## 11. 限定名解析与类型身份比较（A457）
+
+- **坑（2026-10-21 / 2026-10-24 实测）**：
+  当限定名未命中真实类型时（如 `Gui.Action`），`nsresolve.c` 会退化提取简单名（`Action`）。
+  旧逻辑提取后直接 return，导致该简单名跳过了当前命名空间与 `using` 解析链，保留为裸名 `Action`；
+  而其它地方（如参数位置）被 mangle 的类型则是 `System_Action`。检查器（`checker.c` 的 `checker_type_equal`）
+  按名字字符串比较，导致同一类型在实参位是 `Action`、形参位是 `System_Action`，被误判为类型不匹配
+  （`cannot convert 'Action' to 'System_Action'`）。
+- **动作**：
+  1. `nsresolve.c` 在限定名未找到全名退化为简单名后，不能直接返回，必须继续执行 `using` 与上下文命名空间解析，
+     将其重写为目标类型的 `final` 名字（`System_Action`）；
+  2. 检查器 `checker_type_equal` 与 ARC `types_equal` 增加符号级同一性判定：
+     若 `a->sym && b->sym && a->sym == b->sym`，则类型身份一致；
+  3. 沉淀 conformance 测试 `tests/conformance/ns_fallback_mangled_type.zan`。
+
 ## 10. 数组的元素类型是**另一个**节点——每个遍历器都要下钻 `array_element`
 
 - **AST 形状**：`T[]` 在语法树里是**两层**——解析器把元素类型包进一个**合成的**

@@ -8,49 +8,6 @@
 
 ## 未完成
 
-### [ ] A457 类型身份按**名字**比较——限定名退化后的裸名与被 mangle 的真类型对不上
-
-- 现象（2026-10-21 修 A438 后编译 `examples/security_guard` 实测）：
-  `card.OnMouseDown(onMouseDownCard)` 报
-  `cannot convert 'Action' to 'System_Action' in argument 1 of 'OnMouseDown'`。
-  最小复现（两文件，各自都写了 `using System;`，与跨文件导入无关）：
-  ```zan
-  // p1.zan
-  using System;
-  public class P1 { public static void Hook(Action a) { } }
-  // p2.zan
-  using System;
-  using Gui;
-  public class P2 {
-      public static void Main() {
-          Gui.Action x = () => { };
-          P1.Hook(x);
-      }
-  }
-  ```
-  编译 `zanc p1.zan p2.zan --auto-stdlib --package-project .` → 同样报错。
-- 根因：`Gui.Action` **并不存在**（Gui 命名空间下没有 `Action` 委托），限定名
-  解析失败后退化成"取最后一段猜"（`nsresolve.c` 的 `resolve_ref` dotted 分支，
-  见 `zan-compiler-internals` 第 6 条），裸名 `Action` 交给 binder 软匹配到
-  `System.Action`；但真类型因为与 `System.Linq.Action` 同名而被 mangle 成
-  `System_Action`。于是**同一个类型**在参数位是 `System_Action`、在实参位是
-  `Action`，检查器按**名字**比类型（`checker.c` 的 `checker_type_equal` 走名字，
-  不比符号）→ 误判成两种类型。
-- 与 A438 的关系：**不是** A438 修复引入的——上面这个最小复现里两个文件都显式
-  写了 `using System;`，与"跨文件导入隔离"无关；限定名退化与 mangle 后按名字
-  比较这两条路径都没被 A438 的修复动过。A438 只让这类问题**更容易暴露**
-  （裸名不再被别的文件的导入抢走后，剩下的名字对不上的问题就显形了）。
-- 影响：`examples/security_guard` 这类用"不存在的限定名"写回调的地方直接编不过；
-  该示例不在任何 ctest 门禁里，所以一直没被发现。
-- 方向（择一）：
-  1. **类型相等按符号比**：检查器比较两个类型时用符号（`sym`）而不是显示名，
-     名字只是诊断用的字符串——这是根上的修法。
-  2. **限定名退化时同步改名**：退化到裸名后，把类型引用重写成目标类型的
-     mangle 名（`System_Action`），让两处名字一致。
-  3. 示例侧改成 `System.Action`（不存在的限定名本来就不该写）——只治这一处，
-     编译器仍然会骗人。
-- 关联：A438（裸名与同名类族）。
-
 ### [ ] A455 自举后端没有命名空间/`using` 解析层——裸名按"第一个同名类型"命中
 
 - 现象（2026-10-21 修 A438 时查实）：C 宿主 `src/compiler/nsresolve.c` 有完整的

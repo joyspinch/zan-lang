@@ -1166,9 +1166,12 @@ static bool checker_type_equal(zan_type_t *a, zan_type_t *b) {
             return false;
         return checker_type_equal(a->element_type, b->element_type);
     }
-    if (a->name.len != b->name.len ||
-        (a->name.len && memcmp(a->name.str, b->name.str, (size_t)a->name.len) != 0))
+    if (a->sym && b->sym && a->sym == b->sym) {
+        /* 同一符号，实参匹配即可 */
+    } else if (a->name.len != b->name.len ||
+        (a->name.len && memcmp(a->name.str, b->name.str, (size_t)a->name.len) != 0)) {
         return false;
+    }
     if (a->type_arg_count != b->type_arg_count) return false;
     for (int i = 0; i < a->type_arg_count; i++)
         if (!checker_type_equal(a->type_args[i], b->type_args[i])) return false;

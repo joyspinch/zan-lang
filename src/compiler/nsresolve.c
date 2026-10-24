@@ -408,10 +408,8 @@ static void resolve_ref(nr_ctx_t *c, zan_ast_node_t *tr,
         uint32_t last = 0;
         for (uint32_t i = 0; i < R.len; i++)
             if (R.str[i] == '.') last = i + 1;
-        tr->type_ref.name = mk_istr(c->arena, R.str + last, R.len - last);
-        if (c->refs)
-            zan_refs_add(c->refs, tr->type_ref.name, c->arena);
-        return;
+        R = mk_istr(c->arena, R.str + last, R.len - last);
+        tr->type_ref.name = R;
     }
 
     t = find_full_joined(c, ctx_ns, R);

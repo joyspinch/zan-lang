@@ -1535,9 +1535,12 @@ static bool types_equal(zan_type_t *a, zan_type_t *b) {
     if (a == b) return true;
     if (!a || !b) return false;
     if (a->kind != b->kind) return false;
-    if (a->name.len != b->name.len ||
-        (a->name.len && memcmp(a->name.str, b->name.str, (size_t)a->name.len) != 0))
+    if (a->sym && b->sym && a->sym == b->sym) {
+        /* 同一类型符号 */
+    } else if (a->name.len != b->name.len ||
+        (a->name.len && memcmp(a->name.str, b->name.str, (size_t)a->name.len) != 0)) {
         return false;
+    }
     if (a->kind == TYPE_ARRAY || a->kind == TYPE_NULLABLE) {
         if (a->kind == TYPE_ARRAY && a->array_rank != b->array_rank)
             return false;
