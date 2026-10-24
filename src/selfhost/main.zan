@@ -132,6 +132,108 @@ public class Program {
         inclSrcs.Add(File.ReadAllText(path));
     }
 
+    // ---- 输入参数展开：@响应文件 + 目录递归（对齐 C 宿主 main.c，A450） ----
+    // 宿主 808851f49 起 zanc 接受目录输入（递归 *.zan、跳过点开头/符号链接/
+    // 工程杂质目录、序数排序）与 @file（空白分词、# 注释、引号短语、可嵌套、
+    // 深度 ≤ 8）。自举驱动此前只认显式文件列表——编大项目同样会撞 Windows
+    // 命令行长度上限。排序用 List<string>.Sort()（CompareOrdinal），与宿主
+    // qsort(strcmp) 同序；路径拼接统一 '/'，排序序仅在分隔符字节边界上可能
+    // 与宿主不同（两侧各自确定即可，差分门比对的是程序 stdout）。
+    static void AddArgToken(string token, int depth) {
+        if (token.Length > 1 && (int)token[0] == 64) {  // '@'
+            ExpandArgFile(token.Substring(1), depth + 1);
+            return;
+        }
+        if (Directory.ExistsOnDisk(token)) {
+            List<string> files = new List<string>();
+            CollectDirSources(token, files);
+            if (files.Count == 0) {
+                Console.WriteLine("error: no .zan source files under '" + token + "'");
+                throw "zanc: no .zan source files under directory";
+            }
+            files.Sort();
+            int fi = 0;
+            while (fi < files.Count) {
+                AddInput(files[fi]);
+                fi = fi + 1;
+            }
+            return;
+        }
+        AddInput(token);
+    }
+
+    static void ExpandArgFile(string path, int depth) {
+        if (depth > 8) {
+            Console.WriteLine("error: argument file '" + path + "' nested too deeply");
+            throw "zanc: argument file nested too deeply";
+        }
+        string text = File.ReadAllText(path);
+        List<string> toks = new List<string>();
+        int i = 0;
+        if (text.Length >= 3 && (int)text[0] == 0xEF && (int)text[1] == 0xBB
+            && (int)text[2] == 0xBF) {
+            i = 3;  // UTF-8 BOM
+        }
+        while (i < text.Length) {
+            while (i < text.Length && (int)text[i] <= 32) { i = i + 1; }
+            if (i >= text.Length) { break; }
+            if ((int)text[i] == 35) {  // '#' comment runs to end of line
+                while (i < text.Length && (int)text[i] != 10) { i = i + 1; }
+                continue;
+            }
+            string tok = "";
+            bool quoted = false;
+            while (i < text.Length) {
+                int c = (int)text[i];
+                if (c == 34) { quoted = !quoted; i = i + 1; continue; }
+                if (!quoted && c <= 32) { break; }
+                tok = tok + text.Substring(i, 1);
+                i = i + 1;
+            }
+            toks.Add(tok);
+        }
+        int ti = 0;
+        while (ti < toks.Count) {
+            AddArgToken(toks[ti], depth);
+            ti = ti + 1;
+        }
+    }
+
+    // 与 C 宿主 skip_project_dir 同一名单（main.c:830）。
+    static bool SkipProjectDir(string name) {
+        if (name == ".zan-packages" || name == ".git" || name == ".svn"
+            || name == ".hg" || name == "build" || name == "publish"
+            || name == "bin" || name == "obj" || name == "node_modules"
+            || name == "_scratch" || name == "dist" || name == "out"
+            || name == "vendor") { return true; }
+        return false;
+    }
+
+    static void CollectDirSources(string dir, List<string> files) {
+        // GetFiles/GetDirectories 不递归、含隐藏；文件只按 .zan 后缀过滤
+        // （隐藏文件照收，与宿主一致），目录跳过点开头/杂质/符号链接。
+        List<string> names = Directory.GetFiles(dir);
+        int ni = 0;
+        while (ni < names.Count) {
+            string n = names[ni];
+            if (n.Length >= 5 && n.Substring(n.Length - 4) == ".zan") {
+                files.Add(dir + "/" + n);
+            }
+            ni = ni + 1;
+        }
+        List<string> dirs = Directory.GetDirectories(dir);
+        int di = 0;
+        while (di < dirs.Count) {
+            string d = dirs[di];
+            if ((int)d[0] == 46 || SkipProjectDir(d)) { di = di + 1; continue; }
+            // 符号链接/junction 目录无需在这里排除：stdlib 的枚举在两个
+            // 平台都把 reparse 目录按文件收（winList 的 0x400 位、posixList
+            // 的"符号链接一律按文件收"），不会出现在 GetDirectories 里。
+            CollectDirSources(dir + "/" + d, files);
+            di = di + 1;
+        }
+    }
+
     static string FindStdlibRoot() {
         string exe = Environment.ExeDir();
         string up = exe + "/../stdlib";
@@ -1113,7 +1215,7 @@ public class Program {
             return;
         }
         if (argc < 2) {
-            Console.WriteLine("usage: zanc <output.ll> <input.zan> [more.zan ...]");
+            Console.WriteLine("usage: zanc <output.ll> <input.zan|dir|@file> [more ...]");
             throw "zanc: no input files";
         } else {
             string outPath = Environment.ArgAt(0);
@@ -1121,7 +1223,7 @@ public class Program {
             inclSrcs = new List<string>();
             int i = 1;
             while (i < argc) {
-                AddInput(Environment.ArgAt(i));
+                AddArgToken(Environment.ArgAt(i), 0);
                 i = i + 1;
             }
 
