@@ -72,7 +72,7 @@
 - lazy iterators：`yield` 物化成 list，没有 `IEnumerable<T>` 协议
 - tagged union 枚举（代数数据类型）
 - `params` 之后的可选实参组合未系统验证
-- 原始字符串（三引号；`$@"..."` / `@$"..."` 逐字插值已实现，03c996abe）
+- `$` 与三引号的组合（插值原始字符串）—— 普通三引号原始字符串已实现（本次）
 - COW 集合：`List` 赋值是引用共享，修改即共享
 - `[CImport]`、`project.zan` 项目文件、`zan` CLI（实际是 `zanc`）
 

@@ -1402,6 +1402,89 @@ static zan_token_t lexer_verbatim_string(zan_lexer_t *lex) {
     return tok;
 }
 
+static zan_token_t lexer_raw_string(zan_lexer_t *lex) {
+    zan_loc_t loc = lexer_loc(lex);
+    lexer_advance(lex); /* " */
+    lexer_advance(lex); /* " */
+    lexer_advance(lex); /* " */
+
+    zan_lex_strbuf_t sb;
+    zan_lex_strbuf_init(&sb);
+
+    /* 内容零转义：反斜杠照抄；连续引号先持有——满 3 个是闭合定界
+     * （丢弃持有），不足 3 个遇非引号字符时落袋为内容。
+     * 多行形态首换行丢弃，闭合后按闭合行的缩进逐行剥离。 */
+    int qrun = 0;
+    while (!lexer_at_end(lex)) {
+        char c = lexer_peek_ch(lex);
+        if (c == '"') {
+            qrun++;
+            lexer_advance(lex);
+            if (qrun >= 3) {
+                while (lexer_peek_ch(lex) == '"') {
+                    qrun++;
+                    lexer_advance(lex);
+                }
+                if (qrun > 3) {
+                    zan_diag_emit(lex->diag, DIAG_ERROR, loc,
+                                  "too many closing quotes in raw string literal");
+                }
+                goto closed;
+            }
+            continue; /* 持有：等下一个字符判定是内容还是闭合 */
+        }
+        while (qrun > 0) { zan_lex_strbuf_push(&sb, '"'); qrun--; }
+        zan_lex_strbuf_push(&sb, lexer_advance(lex));
+    }
+    zan_diag_emit(lex->diag, DIAG_ERROR, loc,
+                  "unterminated raw string literal");
+closed: ;
+
+    size_t bi = 0;
+    char *text = zan_lex_strbuf_take(lex, &sb, &bi);
+
+    /* 多行形态：首字符是换行。末行若全为空白，视为闭合行的缩进 I，
+     * 丢掉首换行与闭合行，再逐行剥掉 I 列前导空白；非空行缩进不足
+     * I 直接报错（C# 口径，空行不剥不报）。 */
+    if (bi > 0 && text[0] == '\n') {
+        uint32_t strip = 0;
+        size_t end = bi - 1;
+        while (end > 0 && (text[end - 1] == ' ' || text[end - 1] == '\t'))
+            end--;
+        if (end > 0 && text[end - 1] == '\n') {
+            strip = (uint32_t)(bi - end);
+            bi = end >= 2 ? end - 2 : 0; /* 丢首换行与闭合行 */
+            memmove(text, text + 1, bi);
+            char *r = text, *w = text;
+            size_t remain = bi;
+            while (remain > 0) {
+                uint32_t lead = 0;
+                while (lead < remain && lead < strip &&
+                       (r[lead] == ' ' || r[lead] == '\t'))
+                    lead++;
+                if (lead < strip && r[lead] != '\n') {
+                    zan_diag_emit(lex->diag, DIAG_ERROR, loc,
+                                  "insufficient indentation for raw string literal");
+                }
+                r += lead;
+                remain -= lead;
+                while (remain > 0 && *r != '\n') { *w++ = *r++; remain--; }
+                if (remain > 0 && *r == '\n') { *w++ = '\n'; r++; remain--; }
+            }
+            bi = (size_t)(w - text);
+        } else {
+            text++;       /* 闭合与内容同行：仅丢首换行 */
+            bi--;
+            if (bi > 0 && text[bi - 1] == '\n') bi--;
+        }
+    }
+
+    zan_token_t tok = lexer_make(lex, TK_STRING_LIT, loc);
+    tok.str_val.str = text;
+    tok.str_val.len = (uint32_t)bi;
+    return tok;
+}
+
 zan_token_t zan_lexer_next(zan_lexer_t *lex) {
 pp_retry:
     lexer_skip_whitespace(lex);
@@ -1439,6 +1522,9 @@ pp_retry:
     }
 
     if (ch == '"') {
+        if (lexer_peek_ch2(lex) == '"' && lexer_peek_ch3(lex) == '"') {
+            return lexer_raw_string(lex);
+        }
         return lexer_string(lex);
     }
 
