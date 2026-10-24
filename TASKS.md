@@ -8,24 +8,26 @@
 
 ## 未完成
 
-### [ ] A455 自举后端没有命名空间/`using` 解析层——裸名按"第一个同名类型"命中
+### [x] A455 自举后端没有命名空间/`using` 解析层——裸名按"第一个同名类型"命中
 
-- 现象（2026-10-21 修 A438 时查实）：C 宿主 `src/compiler/nsresolve.c` 有完整的
-  命名空间解析层（`resolve_ref` / `resolve_static_receiver`，按当前命名空间 →
-  祖先命名空间 → 本文件 `using` → 歧义诊断的顺序解析裸名）；自举后端
-  `src/selfhost/binder.zan:68` 的 `FindType(name)` 只是**按简单名线性扫一遍**
-  `types` 列表，命中第一个就返回——既没有命名空间概念，也没有 `using` 概念。
-- 影响：自举后端编译多包同名类（`Window`、`Marker` 这类）时，谁赢取决于
-  **声明顺序**，不是导入关系；C 宿主修好的"按成员命中消歧 / 报歧义"在自举
-  侧没有对应物，两后端对同一份源码可能给出不同绑定。
-- 方向：自举侧补最小一层——按"声明所在命名空间 + 本文件 `using`"过滤候选，
-  多命中时报与 C 宿主同款 `ambiguous type 'X'; qualify it with its namespace`。
-  注意自举侧的文件模型与 C 宿主不同（`src/selfhost/parser.zan:1656` 的
-  `ParseUsing` 已经把 using 存进 AST，但 binder 还没消费它）。
-- ⚠ `src/selfhost/irgen_expr.zan` 此刻正被另一会话在途修改，本轮不碰；
-  A438 的 C 宿主修复已单独落地（见提交正文），两后端行为要等差分门能看见
-  这类用例后再对齐。
-- 关联：A438（已修，结论在 git 历史）。
+- **已闭（2026-10-24 复核实证）**：A438/A457 的 nsresolve 工作已把整层建成——
+  不在 binder 查找侧，而在 **parser 侧的重写层**：`ParseTypeDecl` 给每个顶层
+  声明盖 `nsName`/`nsUsings` 戳（parser.zan:1753）；跨命名空间同简名冲突进
+  冲突表按声明序 mangle 成唯一名（qFinals）；所有类型引用（TypeRef/基类/
+  静态接收者，带成员名影子集）按引用所在声明自己的上下文重写到 final 名
+  （`ResolveQualifiedName`/`ResolveSimpleName`，parser.zan:1049/1070，顺序
+  同宿主：本命名空间 → using 按序 → 收窄回退）；歧义诊断与宿主同文
+  （parser.zan:1128）。binder 的线性扫描因此吃到的都是已消歧的名字。
+- 实证（双后端三文件探针，`NS.A.Marker` + `NS.B.Marker`）：
+  - using 选择胜过声明顺序（B 先声明、using 指向 A → 两侧都打印 "A"）；
+  - 无 using 裸引用 → 两侧同文报错 `ambiguous type 'Marker'; qualify it
+    with its namespace`。
+  - 化妆品残留：诊断列号两侧不同（宿主指声明位 5:9，自举指引用位
+    5:24），同一诊断家族，文本一致；stderr 不进 golden，不影响对拍。
+- 原现象（重写层落地前成立，登记留档）：C 宿主有完整命名空间解析层
+  （nsresolve.c：本命名空间 → 祖先 → 本文件 using → 歧义诊断）；自举
+  binder 的 `FindType` 按简单名线性扫，命中第一个——多包同名类的绑定
+  取决于声明顺序。
 
 ### [ ] A380 协程帧的释放仍只在类型侧收口——运行时没有幂等保护
 
