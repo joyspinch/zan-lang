@@ -1,0 +1,212 @@
+using System;
+using Gui;
+using Gui.Component;
+using Gui.Widget;
+using System.Json;
+
+public class WxCreateGroupWindow : ChildWindow {
+    static WxCreateGroupWindow live;
+    App owner;
+    Action<string, string> onCreated;
+
+    Input titleBox;
+    Label countLbl;
+    Label statusLbl;
+    ListView<WxGroupCandidateItem> list;
+    List<WxGroupCandidateItem> candidates;
+
+    override string Title() { return "发起群聊"; }
+    override int Width() { return 460; }
+    override int Height() { return 580; }
+    override bool ShowMaximize() { return false; }
+    override int IdBase() { return 970000; }
+
+    public static void Open(App app, Action<string, string> onCreated) {
+        if (WxCreateGroupWindow.live != null && WxCreateGroupWindow.live.IsOpen()) {
+            WxCreateGroupWindow.live.RequestRedraw();
+            return;
+        }
+        WxCreateGroupWindow w = new WxCreateGroupWindow();
+        w.owner = app;
+        w.onCreated = onCreated;
+        w.candidates = new List<WxGroupCandidateItem>();
+        w.Build();
+        w.OpenHost(app);
+        w.host.UseAppCss(WxSkin.Css());
+        w.RequestRedraw();
+        WxCreateGroupWindow.live = w;
+    }
+
+    void Build() {
+        Flex root = Flex.Column();
+        root.Class = "grow";
+        root.Padding(16, 20, 16, 20);
+        root.Gap(12);
+
+        // 标题与输入
+        Flex top = Flex.Column();
+        top.Gap(6);
+        Label titleLbl = Wx.Lbl("发起群聊", "wxdtitle");
+        titleBox = new Input("请输入群聊名称（如：协同讨论组）");
+        titleBox.Class = "grow";
+        top.Add(titleLbl);
+        top.Add(titleBox);
+        root.Add(top);
+
+        // 选人区提示行（左侧：选择成员，右侧：已选计数）
+        Flex midHead = Wx.Row("");
+        Label tipLbl = Wx.Lbl("选择联系人", "wxmgcount grow");
+        countLbl = Wx.Lbl("已选择 0 人", "wxmgcount");
+        midHead.Add(tipLbl);
+        midHead.Add(countLbl);
+        root.Add(midHead);
+
+        // 候选联系人列表
+        list = new ListView<WxGroupCandidateItem>(WxGroupCandidateRow.Of);
+        list.Class = "wxlist grow";
+        list.Grow();
+        list.Bind(candidates);
+        list.OnSelect(() => {
+            int sel = list.SelectedIndex();
+            if (sel >= 0 && sel < candidates.Count) {
+                candidates[sel].picked = !candidates[sel].picked;
+                this.UpdateCount();
+                list.Refresh();
+                this.RequestRedraw();
+            }
+        });
+        root.Add(list);
+
+        // 状态行
+        statusLbl = Wx.Lbl("", "wxhint");
+        root.Add(statusLbl);
+
+        // 底部操作按钮
+        Flex btnRow = Wx.Row("");
+        btnRow.Justify("end");
+        btnRow.Gap(12);
+        Button cancelBtn = new Button("取消");
+        cancelBtn.Class = "secondary small";
+        cancelBtn.OnClick(() => {
+            this.Close();
+        });
+        Button okBtn = new Button("确定创建");
+        okBtn.Class = "primary small";
+        okBtn.OnClick(() => {
+            this.DoCreate();
+        });
+        btnRow.Add(cancelBtn);
+        btnRow.Add(okBtn);
+        root.Add(btnRow);
+
+        this.SetRoot(root, null);
+        this.Wire();
+
+        this.LoadCandidates();
+    }
+
+    void UpdateCount() {
+        int n = 0;
+        for (int i = 0; i < candidates.Count; i = i + 1) {
+            if (candidates[i].picked) { n = n + 1; }
+        }
+        countLbl.Text = "已选择 " + Convert.ToString(n) + " 人";
+    }
+
+    void LoadCandidates() {
+        candidates.Clear();
+        // 演示/离线数据兜底
+        List<WxContact> demo = WxData.Contacts();
+        for (int i = 0; i < demo.Count; i = i + 1) {
+            WxContact c = demo[i];
+            if (c.kind == 1) {
+                string cid = c.peerId.Length > 0 ? c.peerId : Convert.ToString(i + 1);
+                candidates.Add(new WxGroupCandidateItem(cid, c.name, c.wxid, c.initial, c.tint));
+            }
+        }
+        list.Refresh();
+        this.UpdateCount();
+
+        // 在线状态拉取服务端通讯录
+        if (WxNet.LoggedIn()) {
+            WxNetReq req = WxNet.NewReq();
+            WxNet.Get(req, "contacts", () => {
+                if (!WxNet.OkOf(req)) { return; }
+                JsonValue d = WxNet.DataOf(req);
+                if (d == null) { return; }
+                JsonValue items = d.Get("contacts");
+                if (items == null || items.Count() == 0) { return; }
+                candidates.Clear();
+                for (int ci = 0; ci < items.Count(); ci = ci + 1) {
+                    JsonValue o = items.At(ci);
+                    if (o != null) {
+                        string id = o.Str("id", "");
+                        string nm = o.Str("name", "?");
+                        string un = o.Str("username", id);
+                        string ini = StyledText.Initial(nm);
+                        candidates.Add(new WxGroupCandidateItem(id, nm, un, ini, WxData.TintOf(ci)));
+                    }
+                }
+                list.Refresh();
+                this.UpdateCount();
+                this.RequestRedraw();
+            });
+        }
+    }
+
+    void DoCreate() {
+        string title = titleBox.GetText().Trim();
+        List<string> ids = new List<string>();
+        for (int i = 0; i < candidates.Count; i = i + 1) {
+            if (candidates[i].picked) {
+                ids.Add(candidates[i].id);
+            }
+        }
+        if (ids.Count == 0) {
+            statusLbl.Text = "请至少选择一位群成员";
+            this.RequestRedraw();
+            return;
+        }
+        if (title.Length == 0) {
+            title = "协同群聊(" + Convert.ToString(ids.Count + 1) + "人)";
+        }
+        string sIds = "";
+        for (int j = 0; j < ids.Count; j = j + 1) {
+            if (sIds.Length > 0) { sIds = sIds + ","; }
+            sIds = sIds + ids[j];
+        }
+
+        if (!WxNet.LoggedIn()) {
+            string mockConvId = "c_mock_" + Convert.ToString(DateTime.UtcNow().ToUnixSeconds());
+            if (onCreated != null) {
+                onCreated(mockConvId, title);
+            }
+            this.Close();
+            return;
+        }
+
+        statusLbl.Text = "正在创建群聊...";
+        this.RequestRedraw();
+
+        string crid = "cg_" + Convert.ToString(DateTime.UtcNow().ToUnixSeconds());
+        string body = "title=" + Encoding.UrlEncode(title)
+            + "&ids=" + Encoding.UrlEncode(sIds)
+            + "&clientRequestId=" + Encoding.UrlEncode(crid);
+
+        WxNetReq req = WxNet.NewReq();
+        WxNet.ApiPost(req, "/api/collab/create", body, () => {
+            if (WxNet.OkOf(req)) {
+                JsonValue d = WxNet.DataOf(req);
+                string newId = d != null ? d.Str("id", "") : "";
+                WxIm.RefreshChats(null);
+                if (onCreated != null) {
+                    onCreated(newId, title);
+                }
+                this.Close();
+            } else {
+                statusLbl.Text = "创建失败：" + WxNet.ErrOf(req);
+                this.RequestRedraw();
+            }
+        });
+    }
+}
