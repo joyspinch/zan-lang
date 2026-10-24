@@ -64,6 +64,11 @@ ushort     using      var        virtual    void       weak
 when       where      while
 ```
 
+`"""` 原始字符串与 `$"""` / `$@"""` / `@$"""` 插值原始字符串已实现：
+内容零转义、多行按闭合行缩进剥离、插值洞 `{{`/`}}` 为字面量；洞内不得出现
+3 连引号（闭合定界按首个 3 连引号预扫）。用例
+`tests/conformance/raw_string.zan` 与 `tests/conformance/interpolated_raw_string.zan`。
+
 `checked` / `unchecked`：checked 上下文里整型 + - * 溢出报软运行时错误
 （报点后回绕值继续流动；`ZAN_RT_HARD=1` 时硬陷阱退出），默认上下文环绕。
 `value` 是上下文关键字：仅在属性 setter 体内表示隐式传入值，其余位置可作普通标识符。
@@ -807,7 +812,6 @@ qualified_name  = IDENT { "." IDENT } ;
 
 - lazy iterators (`IEnumerable<T>` protocol) — `yield` currently materializes a list
 - tagged union 枚举（代数数据类型）
-- `$` 与 `"""` 的组合（插值原始字符串）—— 普通三引号原始字符串已实现（三引号定界、内容零转义、多行按闭合行缩进剥离；`tests/conformance/raw_string.zan`）
 - COW（copy-on-write）集合——`List` 赋值是引用共享，修改即共享
 - `[CImport]`、`project.zan` 项目文件、`zan` CLI（实际为 `zanc`）
 

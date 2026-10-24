@@ -35,6 +35,8 @@ typedef struct {
     int paren;
     int bracket;
     bool verbatim;
+    bool raw;   /* $""" 插值原始串：恢复段走 raw 规则 */
+    int strip;  /* 多行闭合行缩进剥离列数 */
 } zan_interp_level_t;
 
 struct zan_lexer {

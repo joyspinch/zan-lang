@@ -232,6 +232,16 @@ static inline char lexer_peek_ch3(zan_lexer_t *lex) {
     return lex->source[lex->pos + 2];
 }
 
+static inline char lexer_peek_ch4(zan_lexer_t *lex) {
+    if (lex->pos + 3 >= lex->source_len) return '\0';
+    return lex->source[lex->pos + 3];
+}
+
+static inline char lexer_peek_ch5(zan_lexer_t *lex) {
+    if (lex->pos + 4 >= lex->source_len) return '\0';
+    return lex->source[lex->pos + 4];
+}
+
 static inline char lexer_advance(zan_lexer_t *lex) {
     if (lexer_at_end(lex)) return '\0';
     char ch = lex->source[lex->pos++];
@@ -1265,6 +1275,8 @@ static zan_token_t lexer_interp_string_segment(zan_lexer_t *lex, zan_token_kind_
             lex->interp_stack[lex->interp_depth].paren = 0;
             lex->interp_stack[lex->interp_depth].bracket = 0;
             lex->interp_stack[lex->interp_depth].verbatim = false;
+            lex->interp_stack[lex->interp_depth].raw = false;
+            lex->interp_stack[lex->interp_depth].strip = 0;
             lex->interp_depth++;
         }
         kind = start_kind;
@@ -1308,6 +1320,151 @@ static zan_token_t lexer_interp_format(zan_lexer_t *lex, zan_loc_t loc) {
     return tok;
 }
 
+/* 预扫闭合 """：从当前位置向后找第一个 3 连引号；若引号所在行首到
+ * 引号之间全是空白，返回该空白列数（多行缩进剥离量），否则 0。
+ * 洞内的嵌套 3 连引号会提前命中——已记为限制（C# 同类约束）。 */
+static int lexer_raw_interp_strip(const zan_lexer_t *lex) {
+    size_t i = lex->pos;
+    while (i < lex->source_len) {
+        if (lex->source[i] != '"') { i++; continue; }
+        size_t q = 0;
+        while (i + q < lex->source_len && lex->source[i + q] == '"') q++;
+        if (q >= 3) {
+            size_t j = i;
+            while (j > 0 && lex->source[j - 1] != '\n' &&
+                   (lex->source[j - 1] == ' ' || lex->source[j - 1] == '\t'))
+                j--;
+            if (j == 0 || lex->source[j - 1] == '\n') {
+                return (int)(i - j);
+            }
+            return 0;
+        }
+        i += q;
+    }
+    return 0;
+}
+
+/* $""" 开启：吃掉三引号，预扫剥离量，丢多行首换行。 */
+static zan_token_t lexer_interp_raw_open(zan_lexer_t *lex);
+
+static zan_token_t lexer_interp_raw_segment(zan_lexer_t *lex,
+                                            zan_token_kind_t start_kind,
+                                            int strip) {
+    zan_loc_t loc = lexer_loc(lex);
+    zan_lex_strbuf_t sb;
+    zan_lex_strbuf_init(&sb);
+
+    int qrun = 0;
+    while (!lexer_at_end(lex)) {
+        char ch = lexer_peek_ch(lex);
+        if (ch == '"') {
+            qrun++;
+            lexer_advance(lex);
+            if (qrun >= 3) {
+                while (lexer_peek_ch(lex) == '"') {
+                    qrun++;
+                    lexer_advance(lex);
+                }
+                if (qrun > 3) {
+                    zan_diag_emit(lex->diag, DIAG_ERROR, loc,
+                                  "too many closing quotes in raw string literal");
+                }
+                goto closed;
+            }
+            continue; /* 持有：等下一个字符判定是内容还是闭合 */
+        }
+        while (qrun > 0) { zan_lex_strbuf_push(&sb, '"'); qrun--; }
+        if ((ch == '{' || ch == '}') && lexer_peek_ch2(lex) == ch) {
+            lexer_advance(lex);
+            lexer_advance(lex);
+            zan_lex_strbuf_push(&sb, ch);
+        } else if (ch == '{') {
+            break; /* 洞 */
+        } else if (ch == '\n' && strip > 0) {
+            zan_lex_strbuf_push(&sb, lexer_advance(lex));
+            int k = 0;
+            while (k < strip && (lexer_peek_ch(lex) == ' ' ||
+                                 lexer_peek_ch(lex) == '\t')) {
+                lexer_advance(lex);
+                k++;
+            }
+            if (k < strip && lexer_peek_ch(lex) != '\n' && !lexer_at_end(lex)) {
+                zan_diag_emit(lex->diag, DIAG_ERROR, loc,
+                              "insufficient indentation for raw string literal");
+            }
+        } else {
+            zan_lex_strbuf_push(&sb, lexer_advance(lex));
+        }
+    }
+    if (lexer_at_end(lex)) {
+        zan_diag_emit(lex->diag, DIAG_ERROR, loc,
+                      "unterminated raw interpolated string");
+        goto closed;
+    }
+
+    /* 洞路径：停在 '{' */
+    lexer_advance(lex); /* { */
+    {
+        if (lex->interp_depth >= ZAN_MAX_INTERP_DEPTH) {
+            zan_diag_emit(lex->diag, DIAG_ERROR, loc,
+                          "interpolated strings nested more than %d deep",
+                          ZAN_MAX_INTERP_DEPTH);
+        } else {
+            lex->interp_stack[lex->interp_depth].brace = 0;
+            lex->interp_stack[lex->interp_depth].paren = 0;
+            lex->interp_stack[lex->interp_depth].bracket = 0;
+            lex->interp_stack[lex->interp_depth].verbatim = false;
+            lex->interp_stack[lex->interp_depth].raw = true;
+            lex->interp_stack[lex->interp_depth].strip = strip;
+            lex->interp_depth++;
+        }
+        size_t bi = 0;
+        char *text = zan_lex_strbuf_take(lex, &sb, &bi);
+        zan_token_t tok = lexer_make(lex, start_kind, loc);
+        tok.str_val.str = text;
+        tok.str_val.len = (uint32_t)bi;
+        return tok;
+    }
+
+closed: ;
+    /* 闭合路径：多行形态闭合行残留的换行随缓冲判落（单行内容不含换行） */
+    {
+        size_t bi0 = 0;
+        char *probe = zan_lex_strbuf_take(lex, &sb, &bi0);
+        if (bi0 > 0 && probe[bi0 - 1] == '\n') {
+            bi0--;
+        }
+        zan_token_kind_t kind = (start_kind == TK_INTERP_START) ? TK_STRING_LIT
+                                                                : TK_INTERP_END;
+        zan_token_t tok = lexer_make(lex, kind, loc);
+        tok.str_val.str = probe;
+        tok.str_val.len = (uint32_t)bi0;
+        return tok;
+    }
+}
+
+static zan_token_t lexer_interp_raw_open(zan_lexer_t *lex) {
+    lexer_advance(lex); /* " */
+    lexer_advance(lex); /* " */
+    lexer_advance(lex); /* " */
+    int strip = lexer_raw_interp_strip(lex);
+    if (lexer_peek_ch(lex) == '\n') {
+        lexer_advance(lex); /* 多行形态：丢首换行 */
+        /* 首行缩进同样剥 strip 列（不足报错，空行不报） */
+        int k = 0;
+        while (k < strip && (lexer_peek_ch(lex) == ' ' ||
+                             lexer_peek_ch(lex) == '\t')) {
+            lexer_advance(lex);
+            k++;
+        }
+        if (k < strip && lexer_peek_ch(lex) != '\n' && !lexer_at_end(lex)) {
+            zan_diag_emit(lex->diag, DIAG_ERROR, lexer_loc(lex),
+                          "insufficient indentation for raw string literal");
+        }
+    }
+    return lexer_interp_raw_segment(lex, TK_INTERP_START, strip);
+}
+
 static zan_token_t lexer_interp_verbatim_segment(zan_lexer_t *lex, zan_token_kind_t start_kind) {
     zan_loc_t loc = lexer_loc(lex);
     zan_lex_strbuf_t sb;
@@ -1346,6 +1503,8 @@ static zan_token_t lexer_interp_verbatim_segment(zan_lexer_t *lex, zan_token_kin
             lex->interp_stack[lex->interp_depth].paren = 0;
             lex->interp_stack[lex->interp_depth].bracket = 0;
             lex->interp_stack[lex->interp_depth].verbatim = true;
+            lex->interp_stack[lex->interp_depth].raw = false;
+            lex->interp_stack[lex->interp_depth].strip = 0;
             lex->interp_depth++;
         }
         kind = start_kind;
@@ -1532,6 +1691,19 @@ pp_retry:
         return lexer_char(lex);
     }
 
+    if (ch == '$' && lexer_peek_ch2(lex) == '"' &&
+        lexer_peek_ch3(lex) == '"') {
+        lexer_advance(lex); /* $ */
+        return lexer_interp_raw_open(lex);
+    }
+    if (((ch == '$' && lexer_peek_ch2(lex) == '@') ||
+         (ch == '@' && lexer_peek_ch2(lex) == '$')) &&
+        lexer_peek_ch3(lex) == '"' && lexer_peek_ch4(lex) == '"' &&
+        lexer_peek_ch5(lex) == '"') {
+        lexer_advance(lex); /* $ 或 @ */
+        lexer_advance(lex); /* @ 或 $ */
+        return lexer_interp_raw_open(lex);
+    }
     if ((ch == '$' && lexer_peek_ch2(lex) == '@' && lexer_peek_ch3(lex) == '"') ||
         (ch == '@' && lexer_peek_ch2(lex) == '$' && lexer_peek_ch3(lex) == '"')) {
         lexer_advance(lex); /* $ or @ */
@@ -1566,7 +1738,11 @@ pp_retry:
     case '}':
         if (lexer_interp_top(lex) && lexer_interp_top(lex)->brace == 0) {
             bool is_verb = lexer_interp_top(lex)->verbatim;
+            bool is_raw = lexer_interp_top(lex)->raw;
+            int rstrip = lexer_interp_top(lex)->strip;
             lex->interp_depth--;
+            if (is_raw)
+                return lexer_interp_raw_segment(lex, TK_INTERP_MID, rstrip);
             if (is_verb)
                 return lexer_interp_verbatim_segment(lex, TK_INTERP_MID);
             return lexer_interp_string_segment(lex, TK_INTERP_MID);
