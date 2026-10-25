@@ -102,11 +102,35 @@
 
 表中 `%s`/`%d` 等为文案里的格式占位符，非文档转义。
 
+### 名字/绑定（src/compiler/binder.c，段 1000–1999）
+
+| 号  | 级 | 消息 |
+|-----|----|------|
+| E1000 | E | '%.*s' is declared both as a %s and as a method in '%.*s'; give one of them a different name |
+| E1001 | E | duplicate '%.*s' in '%.*s': a %s with this name is already declared |
+| E1002 | E | duplicate enum member '%.*s' in '%.*s' |
+| E1003 | E | duplicate method '%.*s' in '%.*s': a method with the same parameter types is already declared |
+| E1004 | E | duplicate constructor in '%.*s': a constructor with the same parameter types is already declared |
+| E1005 | E | undefined type '%.*s' |
+| E1006 | E | using the generic type '%.*s' requires %d type arguments (got %d) |
+| E1007 | E | the non-generic type '%.*s' cannot be used with type arguments |
+| E1008 | E | 'Func' requires at least one type argument (the return type) |
+| E1009 | E | type declaration '%.*s' collides with a built-in type name |
+| E1010 | E | duplicate type declaration '%.*s' |
+| E1011 | E | cyclic inheritance involving '%.*s' |
+| E1012 | E | invalid base type |
+| E1013 | E | undefined base type '%.*s' |
+| E1014 | E | cannot derive from sealed type '%.*s' |
+| E1015 | E | type '%.*s' does not implement interface method '%.*s' |
+| E1016 | E | destructors ('~%.*s()') are not supported: the ARC runtime has no destructor hook on release -- do deterministic cleanup explicitly (using statement or a Close/Dispose method) instead of relying on '~%.*s()' |
+| E1017 | E | enum member '%.*s' value %lld does not fit in 'int' (enum members are 32-bit) |
+| E1018 | E | enum member '%.*s' initializer must be an integer constant expression |
+
 ### selfhost 侧现状
 
 selfhost 前端（`src/selfhost/lexer.zan` + `parser.zan`）不重放 C 前端的逐条
 报错：lexer 无诊断出口，parser 只有 16 个报错点且多为笼统的
 `syntax error: unexpected ...`。其中与 C 侧**逐字同文案**的 6 处已带同号：
 E0005 / E0006（整型溢出）、E0039 / E0040（join）、E0041（group）、
-E0043（select）。其余 selfhost 报错没有 C 侧孪生，不编号，留待其语义所属
-段次（名字/绑定、类型）落地时统一对齐。
+E0043（select）；E1016（析构器不支持）同号。其余 selfhost 报错没有 C 侧
+孪生，不编号，留待其语义所属段次（名字/绑定、类型）落地时统一对齐。

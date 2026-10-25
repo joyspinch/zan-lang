@@ -332,7 +332,7 @@ static bool member_clash_one(zan_binder_t *b, zan_symbol_t *type_sym,
     bool a_is_data = added->kind == SYM_FIELD || added->kind == SYM_PROPERTY;
     if ((m_is_code && a_is_data) || (m_is_data && a_is_code)) {
         zan_symbol_t *data = a_is_data ? added : m;
-        zan_diag_emit(b->diag, DIAG_ERROR, added->decl->loc,
+        zan_diag_emit_code(b->diag, DIAG_ERROR, added->decl->loc, 1000,
                       "'%.*s' is declared both as a %s and as a method in "
                       "'%.*s'; give one of them a different name",
                       added->name.len, added->name.str,
@@ -349,7 +349,7 @@ static bool member_clash_one(zan_binder_t *b, zan_symbol_t *type_sym,
             md->field_decl.indexer_params) {
             return false;
         }
-        zan_diag_emit(b->diag, DIAG_ERROR, added->decl->loc,
+        zan_diag_emit_code(b->diag, DIAG_ERROR, added->decl->loc, 1001,
                       "duplicate '%.*s' in '%.*s': a %s with this name "
                       "is already declared",
                       added->name.len, added->name.str,
@@ -358,7 +358,7 @@ static bool member_clash_one(zan_binder_t *b, zan_symbol_t *type_sym,
         return true;
     }
     if (m->kind == SYM_ENUM_MEMBER && added->kind == SYM_ENUM_MEMBER) {
-        zan_diag_emit(b->diag, DIAG_ERROR, added->decl->loc,
+        zan_diag_emit_code(b->diag, DIAG_ERROR, added->decl->loc, 1002,
                       "duplicate enum member '%.*s' in '%.*s'",
                       added->name.len, added->name.str,
                       type_sym->name.len, type_sym->name.str);
@@ -367,7 +367,7 @@ static bool member_clash_one(zan_binder_t *b, zan_symbol_t *type_sym,
     if ((m_is_code && a_is_code) &&
         binder_params_equiv(m, added) &&
         binder_type_params_equiv(m, added)) {
-        zan_diag_emit(b->diag, DIAG_ERROR, added->decl->loc,
+        zan_diag_emit_code(b->diag, DIAG_ERROR, added->decl->loc, 1003,
                       "duplicate method '%.*s' in '%.*s': a method with "
                       "the same parameter types is already declared",
                       added->name.len, added->name.str,
@@ -376,7 +376,7 @@ static bool member_clash_one(zan_binder_t *b, zan_symbol_t *type_sym,
     }
     if (m->kind == SYM_CONSTRUCTOR && added->kind == SYM_CONSTRUCTOR &&
         binder_params_equiv(m, added)) {
-        zan_diag_emit(b->diag, DIAG_ERROR, added->decl->loc,
+        zan_diag_emit_code(b->diag, DIAG_ERROR, added->decl->loc, 1004,
                       "duplicate constructor in '%.*s': a constructor "
                       "with the same parameter types is already declared",
                       type_sym->name.len, type_sym->name.str);
@@ -895,7 +895,7 @@ zan_type_t *zan_binder_resolve_type(zan_binder_t *b, zan_ast_node_t *type_ref) {
     }
 
     if (!base) {
-        zan_diag_emit(b->diag, DIAG_ERROR, type_ref->loc,
+        zan_diag_emit_code(b->diag, DIAG_ERROR, type_ref->loc, 1005,
                       "undefined type '%.*s'", name.len, name.str);
         return b->type_error;
     }
@@ -945,7 +945,7 @@ zan_type_t *zan_binder_resolve_type(zan_binder_t *b, zan_ast_node_t *type_ref) {
                 expected_tps = binder_decl_type_param_count(base->sym->decl);
 
             if (expected_tps >= 0 && nargs != expected_tps) {
-                zan_diag_emit(b->diag, DIAG_ERROR, type_ref->loc,
+                zan_diag_emit_code(b->diag, DIAG_ERROR, type_ref->loc, 1006,
                               "using the generic type '%.*s' requires %d type arguments (got %d)",
                               (int)name.len, name.str, expected_tps, nargs);
                 return b->type_error;
@@ -969,12 +969,12 @@ zan_type_t *zan_binder_resolve_type(zan_binder_t *b, zan_ast_node_t *type_ref) {
         } else if (base->sym && base->sym->decl) {
             int expected_tps = binder_decl_type_param_count(base->sym->decl);
             if (expected_tps == 0) {
-                zan_diag_emit(b->diag, DIAG_ERROR, type_ref->loc,
+                zan_diag_emit_code(b->diag, DIAG_ERROR, type_ref->loc, 1007,
                               "the non-generic type '%.*s' cannot be used with type arguments",
                               (int)name.len, name.str);
                 return b->type_error;
             } else if (type_ref->type_ref.type_args.count != expected_tps) {
-                zan_diag_emit(b->diag, DIAG_ERROR, type_ref->loc,
+                zan_diag_emit_code(b->diag, DIAG_ERROR, type_ref->loc, 1006,
                               "using the generic type '%.*s' requires %d type arguments (got %d)",
                               (int)name.len, name.str, expected_tps,
                               type_ref->type_ref.type_args.count);
@@ -987,7 +987,7 @@ zan_type_t *zan_binder_resolve_type(zan_binder_t *b, zan_ast_node_t *type_ref) {
     if (base && base->kind == TYPE_DELEGATE && base->name.len == 4 &&
         memcmp(base->name.str, "Func", 4) == 0) {
         if (type_ref->type_ref.type_args.count < 1) {
-            zan_diag_emit(b->diag, DIAG_ERROR, type_ref->loc,
+            zan_diag_emit_code(b->diag, DIAG_ERROR, type_ref->loc, 1008,
                           "'Func' requires at least one type argument "
                           "(the return type)");
             return b->type_error;
@@ -1152,14 +1152,14 @@ static void bind_type_decls(zan_binder_t *b, zan_ast_list_t *decls) {
         if (node->kind == AST_DELEGATE_DECL) {
             zan_istr_t name = node->method_decl.name;
             if (builtin_type_name(name)) {
-                zan_diag_emit(b->diag, DIAG_ERROR, node->loc,
+                zan_diag_emit_code(b->diag, DIAG_ERROR, node->loc, 1009,
                               "type declaration '%.*s' collides with a built-in type name",
                               name.len, name.str);
                 continue;
             }
             zan_symbol_t *existing = scope_find(b->current_scope, name);
             if (existing) {
-                zan_diag_emit(b->diag, DIAG_ERROR, node->loc,
+                zan_diag_emit_code(b->diag, DIAG_ERROR, node->loc, 1010,
                               "duplicate type declaration '%.*s'", name.len, name.str);
                 continue;
             }
@@ -1177,7 +1177,7 @@ static void bind_type_decls(zan_binder_t *b, zan_ast_list_t *decls) {
             zan_istr_t name = node->type_decl.name;
 
             if (builtin_type_name(name)) {
-                zan_diag_emit(b->diag, DIAG_ERROR, node->loc,
+                zan_diag_emit_code(b->diag, DIAG_ERROR, node->loc, 1009,
                               "type declaration '%.*s' collides with a built-in type name",
                               name.len, name.str);
                 continue;
@@ -1185,7 +1185,7 @@ static void bind_type_decls(zan_binder_t *b, zan_ast_list_t *decls) {
 
             zan_symbol_t *existing = scope_find(b->current_scope, name);
             if (existing) {
-                zan_diag_emit(b->diag, DIAG_ERROR, node->loc,
+                zan_diag_emit_code(b->diag, DIAG_ERROR, node->loc, 1010,
                               "duplicate type declaration '%.*s'", name.len, name.str);
                 continue;
             }
@@ -1275,7 +1275,7 @@ static void resolve_bases(zan_binder_t *b, zan_ast_node_t *type_node) {
     if (!type_sym || !type_sym->type || type_sym->decl != type_node) return;
     if (type_sym->type->bases_resolved == 2) return;   /* done */
     if (type_sym->type->bases_resolved == 1) {
-        zan_diag_emit(b->diag, DIAG_ERROR, type_node->loc,
+        zan_diag_emit_code(b->diag, DIAG_ERROR, type_node->loc, 1011,
                       "cyclic inheritance involving '%.*s'",
                       (int)type_node->type_decl.name.len,
                       type_node->type_decl.name.str);
@@ -1291,14 +1291,14 @@ static void resolve_bases(zan_binder_t *b, zan_ast_node_t *type_node) {
         for (int bx = 0; bx < nbases; bx++) {
             zan_ast_node_t *base_ref = type_node->type_decl.bases.items[bx];
             if (base_ref->kind != AST_TYPE_REF) {
-                zan_diag_emit(b->diag, DIAG_ERROR, base_ref->loc,
+                zan_diag_emit_code(b->diag, DIAG_ERROR, base_ref->loc, 1012,
                               "invalid base type");
                 continue;
             }
             zan_istr_t base_name = base_ref->type_ref.name;
             zan_symbol_t *base_sym = scope_find(b->current_scope, base_name);
             if (!base_sym) {
-                zan_diag_emit(b->diag, DIAG_ERROR, base_ref->loc,
+                zan_diag_emit_code(b->diag, DIAG_ERROR, base_ref->loc, 1013,
                               "undefined base type '%.*s'",
                               (int)base_name.len, base_name.str);
                 continue;
@@ -1306,7 +1306,7 @@ static void resolve_bases(zan_binder_t *b, zan_ast_node_t *type_node) {
             if ((base_sym->kind == SYM_CLASS || base_sym->kind == SYM_STRUCT) &&
                 !type_sym->type->base_type) {
                 if ((base_sym->modifiers & MOD_SEALED) != 0) {
-                    zan_diag_emit(b->diag, DIAG_ERROR, base_ref->loc,
+                    zan_diag_emit_code(b->diag, DIAG_ERROR, base_ref->loc, 1014,
                                   "cannot derive from sealed type '%.*s'",
                                   (int)base_name.len, base_name.str);
                     continue;
@@ -1587,7 +1587,7 @@ static void validate_interface_contract(zan_binder_t *b, zan_symbol_t *cls,
             im->method_decl.body)
             continue;
         if (!class_has_interface_method(b, cls, im, bind_tps, bind_args)) {
-            zan_diag_emit(b->diag, DIAG_ERROR, im->loc,
+            zan_diag_emit_code(b->diag, DIAG_ERROR, im->loc, 1015,
                           "type '%.*s' does not implement interface method '%.*s'",
                           (int)cls->name.len, cls->name.str,
                           (int)im->method_decl.name.len,
@@ -1790,7 +1790,7 @@ static void bind_members(zan_binder_t *b, zan_ast_node_t *type_node) {
              * 依赖确定性清理的迁移代码静默失效。ARC 释放链上没有析构钩子，
              * 实现是独立战线；在那之前当场拒绝，不能停在"静默吞掉"。
              * 确定性清理用 using / 显式 Close()/Dispose() 形状改写。 */
-            zan_diag_emit(b->diag, DIAG_ERROR, member->loc,
+            zan_diag_emit_code(b->diag, DIAG_ERROR, member->loc, 1016,
                 "destructors ('~%.*s()') are not supported: the ARC runtime "
                 "has no destructor hook on release -- do deterministic "
                 "cleanup explicitly (using statement or a Close/Dispose "
@@ -1804,7 +1804,7 @@ static void bind_members(zan_binder_t *b, zan_ast_node_t *type_node) {
                 if (fold_enum_member_value(b, type_sym,
                                            member->enum_member.value, &v)) {
                     if (!enum_value_fits_int(v)) {
-                        zan_diag_emit(b->diag, DIAG_ERROR, member->loc,
+                        zan_diag_emit_code(b->diag, DIAG_ERROR, member->loc, 1017,
                             "enum member '%.*s' value %lld does not fit in "
                             "'int' (enum members are 32-bit)",
                             member->enum_member.name.len,
@@ -1815,7 +1815,7 @@ static void bind_members(zan_binder_t *b, zan_ast_node_t *type_node) {
                     lit->int_val = v;
                     member->enum_member.value = lit;
                 } else {
-                    zan_diag_emit(b->diag, DIAG_ERROR, member->loc,
+                    zan_diag_emit_code(b->diag, DIAG_ERROR, member->loc, 1018,
                         "enum member '%.*s' initializer must be an integer "
                         "constant expression",
                         member->enum_member.name.len,
