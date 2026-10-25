@@ -841,9 +841,19 @@ qualified_name  = IDENT { "." IDENT } ;
 
 以下 C# 特性**尚未实现**，不要在 Zan 代码中使用：
 
-- lazy iterators (`IEnumerable<T>` protocol) — `yield` currently materializes a list（见 §8.1；C# 风格的 tagged union 采用 `[StructLayout(LayoutKind.Explicit)]` struct 实现，见 §4.5 与 `explicit_layout.zan`）
+（当前无——曾列的 lazy iterators 已实现，见下）
 
 以下曾列为未实现、实测已可用（各带 conformance 用例）：
+
+- lazy iterators（`IEnumerable<T>` 协议 + 状态机）：`IEnumerable<T>` 返回 +
+  `yield return`/`yield break` 编译为合成迭代器类（`__Iter_*` 实现
+  `IEnumerator<T>` + `IEnumerable<T>`，goto/label 状态机），调用不执行体、
+  MoveNext 逐个推进，foreach 直接驱动（接口分发）。`List<T>` 返回 + yield
+  维持急切物化（与旧语义一致）。v1 限制（违者报 [E0059]/[E0060]）：迭代器
+  方法须 static、局部须显式类型（不支持 `var`）、不支持 foreach/lock/catch
+  体内 yield、体内局部名全方法唯一、体内局部不得与外层类成员同名
+  （外层成员引用自动限定为 `Enclosing.member`）。
+  锁形：`yield_iterators.zan`、`iterator_lazy_semantics.zan`。
 
 - `$@"..."` 与 `@$"..."` 逐字插值字符串（双引号 `""` 转义、反斜杠无转义、`{{`/`}}` 转义、支持换行与格式化说明符，`verbatim_interpolated_string.zan`）
 - `using (res) { }` 确定性释放（`cs_b02_using.zan`）

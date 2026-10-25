@@ -24,6 +24,7 @@ struct zan_parser {
     bool chain_cap_reported;
     zan_ast_list_t pending_members;
     zan_ast_list_t pending_stmts;
+    zan_ast_node_t *cur_type_decl; /* 正在解析成员的外层类（yield 迭代器合成用） */
 };
 
 void zan_parser_init(zan_parser_t *p, zan_lexer_t *lex, zan_arena_t *arena,
