@@ -126,6 +126,109 @@
 | E1017 | E | enum member '%.*s' value %lld does not fit in 'int' (enum members are 32-bit) |
 | E1018 | E | enum member '%.*s' initializer must be an integer constant expression |
 
+### 类型/约束（src/compiler/checker.c，段 2000–2999）
+
+| 号  | 级 | 消息 |
+|-----|----|------|
+| E2000 | E | %s is not allowed in a [NoRuntime] method |
+| E2001 | W | call in a [NoRuntime] method returns an ARC-managed value with an owned +1 reference, but [NoRuntime] emits no ARC; the +1 will not be released and will leak. Move the call out of the [NoRuntime] method or use a non-owning return |
+| E2002 | E | '%.*s.%.*s' is private and cannot be accessed from '%.*s' |
+| E2003 | E | '%.*s.%.*s' is protected and cannot be accessed from '%.*s' |
+| E2004 | E | '%.*s.%.*s' is internal to '%.*s' and cannot be accessed from '%.*s' |
+| E2005 | E | cannot assign to indexing expression of ReadOnlySpan |
+| E2006 | E | property '%.*s' has no setter and cannot be assigned |
+| E2007 | E | property '%.*s' has an init accessor and can only be assigned in an object initializer or a constructor of '%.*s' |
+| E2008 | E | cannot assign to readonly field '%.*s' outside a constructor of '%.*s' |
+| E2009 | W | closure captures 'this' while assigned to a member of 'this'; this creates a potential strong reference cycle under ARC |
+| E2010 | E | '%s' must have a public parameterless constructor to satisfy 'new()' constraint for '%.*s' of '%s' |
+| E2011 | E | unknown constraint '%.*s' in 'where %.*s : ...' for '%s' |
+| E2012 | E | type '%s' does not satisfy constraint '%s' for type parameter '%.*s' of '%s' |
+| E2013 | E | extern method '%.*s' must be static; a native function has no receiver, so drop 'extern' or mark it 'static' |
+| E2014 | E | weak field '%.*s' inside value-type struct '%.*s' cannot be tracked safely; move it to a class or remove 'weak' |
+| E2015 | E | weak field '%.*s' has type '%s'; weak requires an ARC-managed class or interface reference, so use a class/interface type or remove 'weak' |
+| E2016 | E | the builtin type '%s' has no constructor -- use literals, casts or the conversion functions |
+| E2017 | E | no constructor of '%s' accepts %d arguments |
+| E2018 | E | no constructor of '%s' takes %d argument(s); a class that declares constructors has no implicit parameterless one |
+| E2019 | E | cannot apply unary '%c' to '%s' |
+| E2020 | E | operator cannot be applied to operands of type '%s' and '%s': mixed signed/unsigned comparison needs an explicit cast (C# rules) |
+| E2021 | E | cannot convert 'void' to '%s' in %s: no implicit conversion |
+| E2022 | E | narrowing conversion from '%s' to '%s' in %s needs an explicit cast (C# rules) |
+| E2023 | E | cannot convert '%s' to '%s' in %s: a task started from a lambda/Action carries no result; declare 'Task' (not 'Task<T>') and await it or join with Task.WhenAll/JoinWait |
+| E2024 | E | cannot convert '%s' to '%s' in %s: no implicit conversion |
+| E2025 | E | cannot convert 'null' to '%s' in argument %d of '%.*s': null cannot be assigned to a value type |
+| E2026 | E | type '%s' must have a public parameterless constructor to satisfy 'new()' constraint for type parameter '%.*s' of method '%.*s' |
+| E2027 | E | type '%s' does not satisfy constraint '%s' for type parameter '%.*s' of method '%.*s' |
+| E2028 | E | '%.*s.%.*s' takes at least %d argument%s, but %d given |
+| E2029 | E | no overload of '%.*s.%.*s' takes %d argument%s |
+| E2030 | E | '%.*s.%.*s' takes %d argument%s, but %d given |
+| E2031 | E | '%.*s.%.*s' takes %d to %d arguments, but %d given |
+| E2032 | E | cannot convert 'null' to '%s' in argument %d of '%s.%.*s': no implicit conversion |
+| E2033 | E | cannot convert '%s' to '%s' in argument %d of '%s.%.*s': no implicit conversion |
+| E2034 | E | cannot use a 'void' value in argument %d of '%.*s': a void call has no result |
+| E2035 | E | cannot convert '%s' to '%s' in argument %d of '%.*s': no implicit conversion |
+| E2036 | E | cannot use a 'void' value in argument %d of '%s' constructor: a void call has no result |
+| E2037 | E | cannot convert '%s' to '%s' in argument %d of '%s' constructor: no implicit conversion |
+| E2038 | E | no overload of constructor '%s' matches the given argument types |
+| E2039 | E | '%.*s' is a method, not a value; call it as '%.*s()' |
+| E2040 | E | cannot concatenate 'string' and '%s' -- convert the operand explicitly (e.g. call .ToStr()/read the field) instead of concatenating the reference |
+| E2041 | E | cannot apply operator to 'decimal' and '%s' -- convert explicitly (e.g. Decimal.FromDouble) |
+| E2042 | E | delegates are single-cast: '+='/'-=' combination is not supported -- assign directly (`d = h`) or subscribe on a multicast event type (`UiEvent`, `e += h`) |
+| E2043 | E | cannot apply operator to '%s' and '%s' |
+| E2044 | E | cannot compare '%s' and '%s' -- call .Get() on the binding to compare the bound value |
+| E2045 | E | cannot compare '%s' and '%s' |
+| E2046 | E | cannot compare '%s' and '%s' with a relational operator: no implicit numeric conversion |
+| E2047 | E | cannot apply logical operator to '%s' and '%s': both operands must be bool |
+| E2048 | E | cannot apply '?' '?' to '%s' and '%s' |
+| E2049 | E | cannot apply unary '!' to '%s': the operand must be a bool |
+| E2050 | E | nameof requires a single identifier or member access |
+| E2051 | E | cannot use a 'void' value in argument %d: a void call has no result |
+| E2052 | E | cannot interpolate '%s' -- convert the operand explicitly instead of formatting the reference |
+| E2053 | E | '%.*s' indexer takes %d index%s, but %d given |
+| E2054 | E | no '%.*s' indexer takes an index of type '%.*s' |
+| E2055 | E | rank-%d array indexed with %d indices |
+| E2056 | E | no '%.*s' indexer accepts this assignment |
+| E2057 | E | cannot instantiate a type parameter '%s' |
+| E2058 | E | cannot instantiate abstract class '%s' |
+| E2059 | E | an array creation with an initializer requires constant dimensions |
+| E2060 | E | array initializer has %d element%s but the dimensions describe %lld |
+| E2061 | E | '%s' has no member '%.*s' |
+| E2062 | E | type '%s' has no Add method for a collection initializer |
+| E2063 | E | cannot apply '?:' operator to operands of type '%s' and '%s': neither converts to the other and they share no common type |
+| E2064 | W | unreachable switch arm: previous discard arm '_' matches all remaining values |
+| E2065 | E | duplicate pattern in switch expression |
+| E2066 | E | duplicate discard arm '_' in switch expression |
+| E2067 | W | switch expression does not handle enum member '%.*s' of '%.*s'; add missing case or '_' discard arm |
+| E2068 | E | 'with' requires a record (class/struct) receiver, not '%s' |
+| E2069 | E | '%s' has no field '%.*s' for 'with' |
+| E2070 | E | cannot convert '%s' to 'object': value types cannot be boxed (Zan has no boxing facility) |
+| E2071 | E | cannot convert '%s' to '%s': no such conversion |
+| E2072 | W | returned closure captures 'this' and escapes method scope; ensure the caller does not retain it indefinitely to prevent ARC memory leaks |
+| E2073 | E | assignment used as a condition (did you mean '=='? assignment (=) has no boolean value |
+| E2074 | W | condition should be bool, got '%s' |
+| E2075 | W | switch expression has non-switchable type '%s' |
+| E2076 | W | unreachable switch case: previous default/catch-all case matches all remaining values |
+| E2077 | E | duplicate case label in switch statement |
+| E2078 | E | duplicate default label in switch statement |
+| E2079 | W | switch statement does not handle enum member '%.*s' of '%.*s'; add missing case or default label |
+| E2080 | W | switch statement on bool does not handle 'true' case; add missing case or default label |
+| E2081 | W | switch statement on bool does not handle 'false' case; add missing case or default label |
+| E2082 | E | cannot access member '%.*s' on 'null'; null reference dereference faults at runtime |
+| E2083 | E | '%.*s' can return null; accessing '%.*s' on its result faults at runtime -- use '?.', or store it and check for null first |
+| E2084 | E | type '%.*s.%.*s' %s '%.*s' |
+| E2085 | E | '%.*s' %s '%.*s' |
+| E2086 | E | enum type '%.*s' has no member '%.*s' |
+| E2087 | E | cannot access member '%.*s' directly on nullable type '%s'; access via '.Value' or check '.HasValue' first |
+| E2088 | E | '%.*s' is a static field of '%.*s'; qualify it with the type name ('%.*s.%.*s'), not an instance |
+| E2089 | E | type '%s' has no member '%.*s' |
+| E2090 | E | type '%s' has no method '%.*s' |
+| E2091 | E | struct '%.*s' exceeds maximum nesting depth |
+| E2092 | E | struct member '%.*s' of type '%.*s' causes a cycle in the struct layout (recursive struct has infinite size) |
+| E2093 | E | non-abstract class '%.*s' does not implement abstract method '%.*s' inherited from '%.*s' |
+| E2094 | E | an abstract method cannot be static: '%.*s' |
+| E2095 | E | an abstract method cannot be async: '%.*s' |
+| E2096 | E | class '%.*s' declares an abstract method and must be declared 'abstract' |
+| E2097 | W | '%.*s' is declared 'virtual' but hides an inherited virtual with the same name and arity; calls through base-class references will run the base implementation -- use 'override' to replace it |
+
 ### selfhost 侧现状
 
 selfhost 前端（`src/selfhost/lexer.zan` + `parser.zan`）不重放 C 前端的逐条

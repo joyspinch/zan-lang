@@ -151,7 +151,7 @@ static bool checker_class_is_abstract(zan_symbol_t *sym);
 
 static void no_runtime_reject(zan_checker_t *c, zan_loc_t loc, const char *what) {
     if (!c->in_no_runtime) return;
-    zan_diag_emit(c->diag, DIAG_ERROR, loc,
+    zan_diag_emit_code(c->diag, DIAG_ERROR, loc, 2000,
                   "%s is not allowed in a [NoRuntime] method", what);
 }
 
@@ -165,7 +165,7 @@ static void no_runtime_warn_arc_return(zan_checker_t *c,
                                        zan_ast_node_t *call,
                                        zan_type_t *type) {
     if (!c->in_no_runtime || !no_runtime_arc_return_type(type)) return;
-    zan_diag_emit(c->diag, DIAG_WARNING, call->loc,
+    zan_diag_emit_code(c->diag, DIAG_WARNING, call->loc, 2001,
                   "call in a [NoRuntime] method returns an ARC-managed value "
                   "with an owned +1 reference, but [NoRuntime] emits no ARC; "
                   "the +1 will not be released and will leak. Move the call "
@@ -248,7 +248,7 @@ static void report_inaccessible(zan_checker_t *c, zan_symbol_t *m,
     zan_istr_t owner_name = m->parent ? m->parent->name : m->name;
     if (!c->current_type_sym) return;
     if (m->modifiers & MOD_PRIVATE)
-        zan_diag_emit(c->diag, DIAG_ERROR, loc,
+        zan_diag_emit_code(c->diag, DIAG_ERROR, loc, 2002,
                       "'%.*s.%.*s' is private and cannot be accessed "
                       "from '%.*s'",
                       (int)owner_name.len, owner_name.str,
@@ -256,7 +256,7 @@ static void report_inaccessible(zan_checker_t *c, zan_symbol_t *m,
                       (int)c->current_type_sym->name.len,
                       c->current_type_sym->name.str);
     else if (m->modifiers & MOD_PROTECTED)
-        zan_diag_emit(c->diag, DIAG_ERROR, loc,
+        zan_diag_emit_code(c->diag, DIAG_ERROR, loc, 2003,
                       "'%.*s.%.*s' is protected and cannot be accessed "
                       "from '%.*s'",
                       (int)owner_name.len, owner_name.str,
@@ -268,7 +268,7 @@ static void report_inaccessible(zan_checker_t *c, zan_symbol_t *m,
         zan_ast_node_t *cur = access_current_decl(c);
         zan_istr_t cur_ns = cur ? zan_ast_ns_name(cur) : (zan_istr_t){0};
         zan_istr_t cur_name = cur_ns.len ? cur_ns : c->current_type_sym->name;
-        zan_diag_emit(c->diag, DIAG_ERROR, loc,
+        zan_diag_emit_code(c->diag, DIAG_ERROR, loc, 2004,
                       "'%.*s.%.*s' is internal to '%.*s' and cannot be "
                       "accessed from '%.*s'",
                       (int)owner_name.len, owner_name.str,
@@ -413,7 +413,7 @@ static void check_readonly_assignment(zan_checker_t *c, zan_ast_node_t *expr) {
         zan_type_t *obj = zan_checker_check_expr(c, expr->binary.left->index.object);
         if (obj && obj->kind == TYPE_STRUCT && obj->name.len == 12 &&
             memcmp(obj->name.str, "ReadOnlySpan", 12) == 0) {
-            zan_diag_emit(c->diag, DIAG_ERROR, expr->loc,
+            zan_diag_emit_code(c->diag, DIAG_ERROR, expr->loc, 2005,
                           "cannot assign to indexing expression of ReadOnlySpan");
             return;
         }
@@ -424,14 +424,14 @@ static void check_readonly_assignment(zan_checker_t *c, zan_ast_node_t *expr) {
     zan_symbol_t *owner = NULL;
     zan_symbol_t *field = assign_target_field(c, expr->binary.left, &owner);
     if (property_is_readonly(field)) {
-        zan_diag_emit(c->diag, DIAG_ERROR, expr->loc,
+        zan_diag_emit_code(c->diag, DIAG_ERROR, expr->loc, 2006,
                       "property '%.*s' has no setter and cannot be assigned",
                       (int)field->name.len, field->name.str);
         return;
     }
     if (property_is_init_only(field)) {
         if (c->in_ctor && field->parent == c->current_type_sym) return;
-        zan_diag_emit(c->diag, DIAG_ERROR, expr->loc,
+        zan_diag_emit_code(c->diag, DIAG_ERROR, expr->loc, 2007,
                       "property '%.*s' has an init accessor and can only be "
                       "assigned in an object initializer or a constructor of "
                       "'%.*s'",
@@ -444,7 +444,7 @@ static void check_readonly_assignment(zan_checker_t *c, zan_ast_node_t *expr) {
     /* 派生类构造函数不可初始化基类声明的 readonly 只读字段 */
     if (c->in_ctor && field->parent == c->current_type_sym) return;
     zan_symbol_t *decl_owner = field->parent ? field->parent : owner;
-    zan_diag_emit(c->diag, DIAG_ERROR, expr->loc,
+    zan_diag_emit_code(c->diag, DIAG_ERROR, expr->loc, 2008,
                   "cannot assign to readonly field '%.*s' outside a "
                   "constructor of '%.*s'",
                   (int)field->name.len, field->name.str,
@@ -474,7 +474,7 @@ static void check_readonly_incdec(zan_checker_t *c, zan_ast_node_t *expr) {
         field = checker_field_visible(c, ts, expr->loc, operand->member.name);
     }
     if (!property_is_readonly(field)) return;
-    zan_diag_emit(c->diag, DIAG_ERROR, expr->loc,
+    zan_diag_emit_code(c->diag, DIAG_ERROR, expr->loc, 2006,
                   "property '%.*s' has no setter and cannot be assigned",
                   (int)field->name.len, field->name.str);
 }
@@ -746,7 +746,7 @@ static void check_closure_cycle_warning(zan_checker_t *c, zan_ast_node_t *lhs,
     }
 
     if (targets_this && has_closure_capturing_this(c, rhs)) {
-        zan_diag_emit(c->diag, DIAG_WARNING, loc,
+        zan_diag_emit_code(c->diag, DIAG_WARNING, loc, 2009,
             "closure captures 'this' while assigned to a member of 'this'; "
             "this creates a potential strong reference cycle under ARC");
     }
@@ -861,7 +861,7 @@ static void check_generic_constraints(zan_checker_t *c, zan_type_t *t,
                 }
             }
             if (!ok) {
-                zan_diag_emit(c->diag, DIAG_ERROR, loc,
+                zan_diag_emit_code(c->diag, DIAG_ERROR, loc, 2010,
                     "'%s' must have a public parameterless constructor to satisfy 'new()' constraint for '%.*s' of '%s'",
                     type_name(arg),
                     (int)wc->where_clause.param_name.len,
@@ -874,7 +874,7 @@ static void check_generic_constraints(zan_checker_t *c, zan_type_t *t,
             zan_ast_node_t *cons_ref = wc->where_clause.constraints.items[k];
             zan_type_t *cons = zan_binder_resolve_type(c->binder, cons_ref);
             if (!cons || cons->kind == TYPE_ERROR) {
-                zan_diag_emit(c->diag, DIAG_ERROR, loc,
+                zan_diag_emit_code(c->diag, DIAG_ERROR, loc, 2011,
                     "unknown constraint '%.*s' in 'where %.*s : ...' for '%s'",
                     cons_ref->type_ref.name.len, cons_ref->type_ref.name.str,
                     wc->where_clause.param_name.len,
@@ -883,7 +883,7 @@ static void check_generic_constraints(zan_checker_t *c, zan_type_t *t,
                 continue;
             }
             if (!type_satisfies_constraint(arg, cons)) {
-                zan_diag_emit(c->diag, DIAG_ERROR, loc,
+                zan_diag_emit_code(c->diag, DIAG_ERROR, loc, 2012,
                     "type '%s' does not satisfy constraint '%s' for type parameter '%.*s' of '%s'",
                     type_name(arg), type_name(cons),
                     wc->where_clause.param_name.len,
@@ -924,7 +924,7 @@ static void check_extern_static(zan_checker_t *c, zan_ast_node_t *member) {
                      (member->method_decl.modifiers & MOD_EXTERN) != 0;
     if (!is_extern) return;
     if (member->method_decl.modifiers & MOD_STATIC) return;
-    zan_diag_emit(c->diag, DIAG_ERROR, member->loc,
+    zan_diag_emit_code(c->diag, DIAG_ERROR, member->loc, 2013,
                   "extern method '%.*s' must be static; a native function has "
                   "no receiver, so drop 'extern' or mark it 'static'",
                   (int)member->method_decl.name.len,
@@ -938,7 +938,7 @@ static void check_weak_member(zan_checker_t *c, zan_ast_node_t *owner,
         return;
 
     if (owner->kind == AST_STRUCT_DECL) {
-        zan_diag_emit(c->diag, DIAG_ERROR, member->loc,
+        zan_diag_emit_code(c->diag, DIAG_ERROR, member->loc, 2014,
                       "weak field '%.*s' inside value-type struct '%.*s' "
                       "cannot be tracked safely; move it to a class or remove "
                       "'weak'",
@@ -954,7 +954,7 @@ static void check_weak_member(zan_checker_t *c, zan_ast_node_t *owner,
     if (!type || type == c->binder->type_error) return;
     if (checker_weak_target_is_arc_ref(type)) return;
 
-    zan_diag_emit(c->diag, DIAG_ERROR, member->loc,
+    zan_diag_emit_code(c->diag, DIAG_ERROR, member->loc, 2015,
                   "weak field '%.*s' has type '%s'; weak requires an "
                   "ARC-managed class or interface reference, so use a "
                   "class/interface type or remove 'weak'",
@@ -1041,7 +1041,7 @@ static void check_ctor_available(zan_checker_t *c, zan_type_t *type,
                                  zan_ast_node_t *expr) {
     if (!type || expr->new_expr.is_array) return;
     if (type_is_scalar_primitive(type)) {
-        zan_diag_emit(c->diag, DIAG_ERROR, expr->loc,
+        zan_diag_emit_code(c->diag, DIAG_ERROR, expr->loc, 2016,
             "the builtin type '%s' has no constructor -- use literals, casts or the conversion functions",
             type_name(type));
         return;
@@ -1070,13 +1070,13 @@ static void check_ctor_available(zan_checker_t *c, zan_type_t *type,
     }
     if (declared == 0) {
         if (argc > 0) {
-            zan_diag_emit(c->diag, DIAG_ERROR, expr->loc,
+            zan_diag_emit_code(c->diag, DIAG_ERROR, expr->loc, 2017,
                 "no constructor of '%s' accepts %d arguments",
                 type_name(type), argc);
         }
         return;
     }
-    zan_diag_emit(c->diag, DIAG_ERROR, expr->loc,
+    zan_diag_emit_code(c->diag, DIAG_ERROR, expr->loc, 2018,
         "no constructor of '%s' takes %d argument(s); a class that declares "
         "constructors has no implicit parameterless one",
         type_name(type), argc);
@@ -1132,7 +1132,7 @@ static void check_unary_operand_type(zan_checker_t *c, zan_ast_node_t *expr,
     if (!operand) return;
     /* type_error 已经有别的诊断在报；类型参数会在实例化时被具体类型替换。 */
     if (operand->kind == TYPE_ERROR || operand->kind == TYPE_TYPE_PARAM) return;
-    zan_diag_emit(c->diag, DIAG_ERROR, expr->loc,
+    zan_diag_emit_code(c->diag, DIAG_ERROR, expr->loc, 2019,
                   "cannot apply unary '%c' to '%s'", sign, type_name(operand));
 }
 
@@ -1492,7 +1492,7 @@ static bool mixed_sign_compare_error(zan_binder_t *b, zan_diag_t *diag,
     zan_ast_node_t *se = lu ? expr->binary.right : expr->binary.left;
     int64_t constant = 0;
     if (const_integral_value(se, &constant) && constant >= 0) return false;
-    zan_diag_emit(diag, DIAG_ERROR, expr->loc,
+    zan_diag_emit_code(diag, DIAG_ERROR, expr->loc, 2020,
                   "operator cannot be applied to operands of type '%s' and "
                   "'%s': mixed signed/unsigned comparison needs an explicit "
                   "cast (C# rules)",
@@ -1627,7 +1627,7 @@ static void checker_check_assignable(zan_checker_t *c, zan_type_t *target,
     if (target == c->binder->type_error || value == c->binder->type_error)
         return;
     if (value == c->binder->type_void && target != c->binder->type_void) {
-        zan_diag_emit(c->diag, DIAG_ERROR, loc,
+        zan_diag_emit_code(c->diag, DIAG_ERROR, loc, 2021,
                       "cannot convert 'void' to '%s' in %s: no implicit "
                       "conversion",
                       type_name(target), what);
@@ -1639,7 +1639,7 @@ static void checker_check_assignable(zan_checker_t *c, zan_type_t *target,
                           value->kind == TYPE_ENUM;
     if (target_integral &&
         (value->kind == TYPE_FLOAT || value->kind == TYPE_DOUBLE)) {
-        zan_diag_emit(c->diag, DIAG_ERROR, loc,
+        zan_diag_emit_code(c->diag, DIAG_ERROR, loc, 2022,
                       "narrowing conversion from '%s' to '%s' in %s needs an "
                       "explicit cast (C# rules)",
                       type_name(value), type_name(target), what);
@@ -1660,7 +1660,7 @@ static void checker_check_assignable(zan_checker_t *c, zan_type_t *target,
         if (native_handle_narrowing ||
             (!uint32_bit_pattern && !ulong_literal && has_constant &&
              !integral_conversion_is_safe(target, value, expr))) {
-            zan_diag_emit(c->diag, DIAG_ERROR, loc,
+            zan_diag_emit_code(c->diag, DIAG_ERROR, loc, 2022,
                           "narrowing conversion from '%s' to '%s' in %s needs an "
                           "explicit cast (C# rules)",
                           type_name(value), type_name(target), what);
@@ -1671,14 +1671,14 @@ static void checker_check_assignable(zan_checker_t *c, zan_type_t *target,
     if (checker_has_user_conversion(c, target, value)) return;
     if (target->kind == TYPE_TASK && value->kind == TYPE_TASK &&
         target->type_arg_count == 1 && value->type_arg_count == 0) {
-        zan_diag_emit(c->diag, DIAG_ERROR, loc,
+        zan_diag_emit_code(c->diag, DIAG_ERROR, loc, 2023,
                       "cannot convert '%s' to '%s' in %s: a task started from a "
                       "lambda/Action carries no result; declare 'Task' (not "
                       "'Task<T>') and await it or join with Task.WhenAll/JoinWait",
                       type_name(value), type_name(target), what);
         return;
     }
-    zan_diag_emit(c->diag, DIAG_ERROR, loc,
+    zan_diag_emit_code(c->diag, DIAG_ERROR, loc, 2024,
                   "cannot convert '%s' to '%s' in %s: no implicit conversion",
                   type_name(value), type_name(target), what);
 }
@@ -1770,7 +1770,7 @@ static bool checker_report_null_arg_mismatch(zan_checker_t *c,
         return false;
     c->has_null_arg_reported = true;
     c->null_arg_reported = loc;
-    zan_diag_emit(c->diag, DIAG_ERROR, loc,
+    zan_diag_emit_code(c->diag, DIAG_ERROR, loc, 2025,
                   "cannot convert 'null' to '%s' in argument %d of '%.*s': "
                   "null cannot be assigned to a value type",
                   type_name(pt), index + 1, (int)sig_name.len, sig_name.str);
@@ -1888,7 +1888,7 @@ static void checker_check_method_call_constraints(zan_checker_t *c,
                 }
             }
             if (!ok) {
-                zan_diag_emit(c->diag, DIAG_ERROR, call->loc,
+                zan_diag_emit_code(c->diag, DIAG_ERROR, call->loc, 2026,
                     "type '%s' must have a public parameterless constructor to satisfy 'new()' constraint for type parameter '%.*s' of method '%.*s'",
                     type_name(arg),
                     (int)wc->where_clause.param_name.len,
@@ -1903,7 +1903,7 @@ static void checker_check_method_call_constraints(zan_checker_t *c,
             zan_type_t *cons = zan_binder_resolve_type(c->binder, cons_ref);
             if (!cons || cons->kind == TYPE_ERROR) continue;
             if (!type_satisfies_constraint(arg, cons)) {
-                zan_diag_emit(c->diag, DIAG_ERROR, call->loc,
+                zan_diag_emit_code(c->diag, DIAG_ERROR, call->loc, 2027,
                     "type '%s' does not satisfy constraint '%s' for type "
                     "parameter '%.*s' of method '%.*s'",
                     type_name(arg), type_name(cons),
@@ -2046,7 +2046,7 @@ static void check_call_arity(zan_checker_t *c, zan_ast_node_t *call,
                 if (candidates == 0 && m->decl->method_decl.is_variadic &&
                     argc < m->decl->method_decl.params.count) {
                     int floor = m->decl->method_decl.params.count;
-                    zan_diag_emit(c->diag, DIAG_ERROR, call->loc,
+                    zan_diag_emit_code(c->diag, DIAG_ERROR, call->loc, 2028,
                                   "'%.*s.%.*s' takes at least %d argument%s, "
                                   "but %d given",
                                   (int)recv->sym->name.len, recv->sym->name.str,
@@ -2062,21 +2062,21 @@ static void check_call_arity(zan_checker_t *c, zan_ast_node_t *call,
     }
     if (!candidates) return;
     if (candidates > 1) {
-        zan_diag_emit(c->diag, DIAG_ERROR, call->loc,
+        zan_diag_emit_code(c->diag, DIAG_ERROR, call->loc, 2029,
                       "no overload of '%.*s.%.*s' takes %d argument%s",
                       (int)recv->sym->name.len, recv->sym->name.str,
                       (int)name.len, name.str, argc, argc == 1 ? "" : "s");
         return;
     }
     if (want_min == want_max) {
-        zan_diag_emit(c->diag, DIAG_ERROR, call->loc,
+        zan_diag_emit_code(c->diag, DIAG_ERROR, call->loc, 2030,
                       "'%.*s.%.*s' takes %d argument%s, but %d given",
                       (int)recv->sym->name.len, recv->sym->name.str,
                       (int)name.len, name.str, want_min,
                       want_min == 1 ? "" : "s", argc);
         return;
     }
-    zan_diag_emit(c->diag, DIAG_ERROR, call->loc,
+    zan_diag_emit_code(c->diag, DIAG_ERROR, call->loc, 2031,
                   "'%.*s.%.*s' takes %d to %d arguments, but %d given",
                   (int)recv->sym->name.len, recv->sym->name.str,
                   (int)name.len, name.str, want_min, want_max, argc);
@@ -2295,7 +2295,7 @@ static void checker_user_generic_call_args(zan_checker_t *c,
         if (!at) continue;
         if (arg->kind == AST_NULL_LITERAL) {
             if (zan_null_arg_score(pt) < 0) {
-                zan_diag_emit(c->diag, DIAG_ERROR, arg->loc,
+                zan_diag_emit_code(c->diag, DIAG_ERROR, arg->loc, 2032,
                               "cannot convert 'null' to '%s' in argument %d of "
                               "'%s.%.*s': no implicit conversion",
                               type_name(pt), i + 1,
@@ -2310,7 +2310,7 @@ static void checker_user_generic_call_args(zan_checker_t *c,
             if (checker_type_assignable(pt, at)) continue;
             if (checker_has_user_conversion(c, pt, at)) continue;
         }
-        zan_diag_emit(c->diag, DIAG_ERROR, arg->loc,
+        zan_diag_emit_code(c->diag, DIAG_ERROR, arg->loc, 2033,
                       "cannot convert '%s' to '%s' in argument %d of "
                       "'%s.%.*s': no implicit conversion",
                       type_name(at), type_name(pt), i + 1,
@@ -2354,7 +2354,7 @@ static void check_builtin_generic_call_args(zan_checker_t *c,
         /* null 字面量按 irgen 的同一条规则处理。 */
         if (arg->kind == AST_NULL_LITERAL) {
             if (zan_null_arg_score(pt) < 0) {
-                zan_diag_emit(c->diag, DIAG_ERROR, arg->loc,
+                zan_diag_emit_code(c->diag, DIAG_ERROR, arg->loc, 2032,
                               "cannot convert 'null' to '%s' in argument %d of "
                               "'%s.%.*s': no implicit conversion",
                               type_name(pt), i + 1,
@@ -2374,7 +2374,7 @@ static void check_builtin_generic_call_args(zan_checker_t *c,
             if (checker_type_assignable(pt, at)) continue;
             if (checker_has_user_conversion(c, pt, at)) continue;
         }
-        zan_diag_emit(c->diag, DIAG_ERROR, arg->loc,
+        zan_diag_emit_code(c->diag, DIAG_ERROR, arg->loc, 2033,
                       "cannot convert '%s' to '%s' in argument %d of "
                       "'%s.%.*s': no implicit conversion",
                       type_name(at), type_name(pt), i + 1,
@@ -2390,7 +2390,7 @@ static void check_call_arg_type(zan_checker_t *c, zan_symbol_t *sig, int index,
                                              ps->items[index]->param.type);
     if (arg_type == c->binder->type_void) {
         if (!pt || pt->kind != TYPE_DELEGATE) {
-            zan_diag_emit(c->diag, DIAG_ERROR, arg->loc,
+            zan_diag_emit_code(c->diag, DIAG_ERROR, arg->loc, 2034,
                           "cannot use a 'void' value in argument %d of "
                           "'%.*s': a void call has no result",
                           index + 1, (int)sig->name.len, sig->name.str);
@@ -2404,7 +2404,7 @@ static void check_call_arg_type(zan_checker_t *c, zan_symbol_t *sig, int index,
         return;
     }
     if (!checker_arg_type_mismatch(c, pt, arg_type)) return;
-    zan_diag_emit(c->diag, DIAG_ERROR, arg->loc,
+    zan_diag_emit_code(c->diag, DIAG_ERROR, arg->loc, 2035,
                   "cannot convert '%s' to '%s' in argument %d of '%.*s': "
                   "no implicit conversion",
                   type_name(arg_type), type_name(pt), index + 1,
@@ -2517,12 +2517,12 @@ static void check_ctor_call_arguments(zan_checker_t *c, zan_type_t *type,
     if (arity_matches == 1 && mismatch_first_arg >= 0 && mismatch_target && mismatch_source) {
         zan_loc_t eloc = mismatch_node ? mismatch_node->loc : expr->loc;
         if (mismatch_source == c->binder->type_void) {
-            zan_diag_emit(c->diag, DIAG_ERROR, eloc,
+            zan_diag_emit_code(c->diag, DIAG_ERROR, eloc, 2036,
                           "cannot use a 'void' value in argument %d of '%s' "
                           "constructor: a void call has no result",
                           mismatch_first_arg + 1, type_name(type));
         } else {
-            zan_diag_emit(c->diag, DIAG_ERROR, eloc,
+            zan_diag_emit_code(c->diag, DIAG_ERROR, eloc, 2037,
                           "cannot convert '%s' to '%s' in argument %d of '%s' "
                           "constructor: no implicit conversion",
                           type_name(mismatch_source), type_name(mismatch_target),
@@ -2531,7 +2531,7 @@ static void check_ctor_call_arguments(zan_checker_t *c, zan_type_t *type,
         return;
     }
 
-    zan_diag_emit(c->diag, DIAG_ERROR, expr->loc,
+    zan_diag_emit_code(c->diag, DIAG_ERROR, expr->loc, 2038,
                   "no overload of constructor '%s' matches the given argument types",
                   type_name(type));
 }
@@ -2643,7 +2643,7 @@ static bool expr_is_this_call(zan_checker_t *c, zan_symbol_t *method,
 static void reject_method_group(zan_checker_t *c, zan_ast_node_t *e) {
     zan_symbol_t *m = expr_method_group(c, e);
     if (!m) return;
-    zan_diag_emit(c->diag, DIAG_ERROR, e->loc,
+    zan_diag_emit_code(c->diag, DIAG_ERROR, e->loc, 2039,
                   "'%.*s' is a method, not a value; call it as '%.*s()'",
                   (int)m->name.len, m->name.str,
                   (int)m->name.len, m->name.str);
@@ -2767,7 +2767,7 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
                 }
                 zan_type_t *other = left->kind == TYPE_STRING ? right : left;
                 if (!type_is_concatable(other)) {
-                    zan_diag_emit(c->diag, DIAG_ERROR, expr->loc,
+                    zan_diag_emit_code(c->diag, DIAG_ERROR, expr->loc, 2040,
                                   "cannot concatenate 'string' and '%s' -- convert the operand explicitly (e.g. call .ToStr()/read the field) instead of concatenating the reference",
                                   type_name(other));
                     return c->binder->type_error;
@@ -2783,7 +2783,7 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
                  (right->kind == TYPE_FLOAT || right->kind == TYPE_DOUBLE)) ||
                 (right->kind == TYPE_DECIMAL &&
                  (left->kind == TYPE_FLOAT || left->kind == TYPE_DOUBLE))) {
-                zan_diag_emit(c->diag, DIAG_ERROR, expr->loc,
+                zan_diag_emit_code(c->diag, DIAG_ERROR, expr->loc, 2041,
                               "cannot apply operator to 'decimal' and '%s' -- "
                               "convert explicitly (e.g. Decimal.FromDouble)",
                               right->kind == TYPE_DECIMAL ? type_name(left)
@@ -2792,10 +2792,10 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
             }
             if (left->kind == TYPE_DELEGATE || right->kind == TYPE_DELEGATE) {
                 if (expr->binary.op == TK_PLUS || expr->binary.op == TK_MINUS)
-                    zan_diag_emit(c->diag, DIAG_ERROR, expr->loc,
+                    zan_diag_emit_code(c->diag, DIAG_ERROR, expr->loc, 2042,
                                   "delegates are single-cast: '+='/'-=' combination is not supported -- assign directly (`d = h`) or subscribe on a multicast event type (`UiEvent`, `e += h`)");
                 else
-                    zan_diag_emit(c->diag, DIAG_ERROR, expr->loc,
+                    zan_diag_emit_code(c->diag, DIAG_ERROR, expr->loc, 2043,
                                   "cannot apply operator to '%s' and '%s'",
                                   left->kind == TYPE_ERROR ? "lambda"
                                                            : type_name(left),
@@ -2822,7 +2822,7 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
                 return left;
             }
             if (left->kind != TYPE_ERROR && right->kind != TYPE_ERROR) {
-                zan_diag_emit(c->diag, DIAG_ERROR, expr->loc,
+                zan_diag_emit_code(c->diag, DIAG_ERROR, expr->loc, 2043,
                               "cannot apply operator to '%s' and '%s'",
                               type_name(left), type_name(right));
             }
@@ -2887,7 +2887,7 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
                 if (bnd && oth->kind != TYPE_OBJECT &&
                     oth->kind != TYPE_TYPE_PARAM &&
                     !checker_type_is_binding(oth)) {
-                    zan_diag_emit(c->diag, DIAG_ERROR, expr->loc,
+                    zan_diag_emit_code(c->diag, DIAG_ERROR, expr->loc, 2044,
                                   "cannot compare '%s' and '%s' -- call .Get() "
                                   "on the binding to compare the bound value",
                                   type_name(left), type_name(right));
@@ -2902,7 +2902,7 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
             if (left->kind == TYPE_BOOL && right->kind == TYPE_BOOL)
                 return c->binder->type_bool;
             if (left->kind != TYPE_ERROR && right->kind != TYPE_ERROR)
-                zan_diag_emit(c->diag, DIAG_ERROR, expr->loc,
+                zan_diag_emit_code(c->diag, DIAG_ERROR, expr->loc, 2045,
                               "cannot compare '%s' and '%s'",
                               type_name(left), type_name(right));
             return c->binder->type_error;
@@ -2949,7 +2949,7 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
                 }
             }
             if (left->kind != TYPE_ERROR && right->kind != TYPE_ERROR)
-                zan_diag_emit(c->diag, DIAG_ERROR, expr->loc,
+                zan_diag_emit_code(c->diag, DIAG_ERROR, expr->loc, 2046,
                               "cannot compare '%s' and '%s' with a relational "
                               "operator: no implicit numeric conversion",
                               type_name(left), type_name(right));
@@ -2960,7 +2960,7 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
             if ((left->kind == TYPE_BOOL && right->kind == TYPE_BOOL) ||
                 left->kind == TYPE_ERROR || right->kind == TYPE_ERROR)
                 return c->binder->type_bool;
-            zan_diag_emit(c->diag, DIAG_ERROR, expr->loc,
+            zan_diag_emit_code(c->diag, DIAG_ERROR, expr->loc, 2047,
                           "cannot apply logical operator to '%s' and '%s': "
                           "both operands must be bool",
                           type_name(left), type_name(right));
@@ -2979,7 +2979,7 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
                 if (merged) return merged;
             }
             if (left->kind != TYPE_ERROR && right->kind != TYPE_ERROR)
-                zan_diag_emit(c->diag, DIAG_ERROR, expr->loc,
+                zan_diag_emit_code(c->diag, DIAG_ERROR, expr->loc, 2048,
                               "cannot apply '?' '?' to '%s' and '%s'",
                               type_name(left), type_name(right));
             return c->binder->type_error;
@@ -3018,7 +3018,7 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
             if (operand->kind == TYPE_BOOL) return c->binder->type_bool;
             if (operand->kind == TYPE_ERROR || operand->kind == TYPE_TYPE_PARAM)
                 return c->binder->type_bool;
-            zan_diag_emit(c->diag, DIAG_ERROR, expr->loc,
+            zan_diag_emit_code(c->diag, DIAG_ERROR, expr->loc, 2049,
                           "cannot apply unary '!' to '%s': the operand must be a bool",
                           type_name(operand));
             return c->binder->type_error;
@@ -3056,7 +3056,7 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
                 zan_checker_check_expr(c, na);
                 return c->binder->type_string;
             }
-            zan_diag_emit(c->diag, DIAG_ERROR, expr->loc,
+            zan_diag_emit_code(c->diag, DIAG_ERROR, expr->loc, 2050,
                 "nameof requires a single identifier or member access");
             return c->binder->type_error;
         }
@@ -3116,7 +3116,7 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
             arg_types[i] = arg_type;
             if (!arg_sig && arg && arg_type == c->binder->type_void &&
                 arg->kind != AST_REF_ARG && !arg_is_spawn_callee(expr)) {
-                zan_diag_emit(c->diag, DIAG_ERROR, arg->loc,
+                zan_diag_emit_code(c->diag, DIAG_ERROR, arg->loc, 2051,
                               "cannot use a 'void' value in argument %d: a "
                               "void call has no result",
                               i + 1);
@@ -3270,7 +3270,7 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
             if (raw_part && raw_part->kind == AST_NULL_LITERAL)
                 continue;
             if (!type_is_concatable(pt)) {
-                zan_diag_emit(c->diag, DIAG_ERROR, expr->loc,
+                zan_diag_emit_code(c->diag, DIAG_ERROR, expr->loc, 2052,
                               "cannot interpolate '%s' -- convert the operand explicitly instead of formatting the reference",
                               type_name(pt));
             }
@@ -3324,7 +3324,7 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
                     }
                 }
                 if (!any_generic && ps->count >= self_off && want != given) {
-                    zan_diag_emit(c->diag, DIAG_ERROR, expr->loc,
+                    zan_diag_emit_code(c->diag, DIAG_ERROR, expr->loc, 2053,
                         "'%.*s' indexer takes %d index%s, but %d given",
                         (int)obj->sym->name.len, obj->sym->name.str,
                         want, want == 1 ? "" : "es", given);
@@ -3338,7 +3338,7 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
                             zan_binder_resolve_type(c->binder, p0->param.type);
                         if (pt0 && !type_refs_type_param(pt0) &&
                             !checker_type_assignable(pt0, idx)) {
-                            zan_diag_emit(c->diag, DIAG_ERROR, expr->loc,
+                            zan_diag_emit_code(c->diag, DIAG_ERROR, expr->loc, 2054,
                                 "no '%.*s' indexer takes an index of type "
                                 "'%.*s'",
                                 (int)obj->sym->name.len, obj->sym->name.str,
@@ -3378,7 +3378,7 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
             int rank = obj->array_rank > 1 ? obj->array_rank : 1;
             int given = 1 + expr->index.extra.count;
             if (given != rank) {
-                zan_diag_emit(c->diag, DIAG_ERROR, expr->loc,
+                zan_diag_emit_code(c->diag, DIAG_ERROR, expr->loc, 2055,
                     "rank-%d array indexed with %d indices", rank, given);
             }
             for (int i = 0; i < expr->index.extra.count; i++)
@@ -3425,7 +3425,7 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
                         }
                     }
                     if (has_set) {
-                        zan_diag_emit(c->diag, DIAG_ERROR, expr->loc,
+                        zan_diag_emit_code(c->diag, DIAG_ERROR, expr->loc, 2056,
                             "no '%.*s' indexer accepts this assignment",
                             (int)iobj->sym->name.len, iobj->sym->name.str);
                     }
@@ -3465,7 +3465,7 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
                真要"由类型参数造对象"，只能把工厂交给调用方。 */
             if (type && type->kind == TYPE_TYPE_PARAM) {
                 if (!type_param_has_new_constraint(c, type)) {
-                    zan_diag_emit(c->diag, DIAG_ERROR, expr->loc,
+                    zan_diag_emit_code(c->diag, DIAG_ERROR, expr->loc, 2057,
                                   "cannot instantiate a type parameter '%s'",
                                   type_name(type));
                 }
@@ -3473,7 +3473,7 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
             check_generic_constraints(c, type, expr->loc);
             if (type && type->kind == TYPE_CLASS && type->sym &&
                 checker_class_is_abstract(type->sym)) {
-                zan_diag_emit(c->diag, DIAG_ERROR, expr->loc,
+                zan_diag_emit_code(c->diag, DIAG_ERROR, expr->loc, 2058,
                     "cannot instantiate abstract class '%s'",
                     type_name(type));
             }
@@ -3504,11 +3504,11 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
                         prod *= dv;
                 }
                 if (!const_dims)
-                    zan_diag_emit(c->diag, DIAG_ERROR, expr->loc,
+                    zan_diag_emit_code(c->diag, DIAG_ERROR, expr->loc, 2059,
                                   "an array creation with an initializer "
                                   "requires constant dimensions");
                 else if (prod != ninit)
-                    zan_diag_emit(c->diag, DIAG_ERROR, expr->loc,
+                    zan_diag_emit_code(c->diag, DIAG_ERROR, expr->loc, 2060,
                                   "array initializer has %d element%s but the "
                                   "dimensions describe %lld",
                                   ninit, ninit == 1 ? "" : "s",
@@ -3533,7 +3533,7 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
                     : arg->binary.left->ident.name;
                 zan_symbol_t *field = checker_find_field(type->sym, mname);
                 if (!field && factory_init) {
-                    zan_diag_emit(c->diag, DIAG_ERROR, arg->loc,
+                    zan_diag_emit_code(c->diag, DIAG_ERROR, arg->loc, 2061,
                                   "'%s' has no member '%.*s'",
                                   type_name(type), (int)mname.len, mname.str);
                     continue;
@@ -3541,7 +3541,7 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
                 if (field) {
                     if (property_is_readonly(field) &&
                         arg->kind != AST_COLL_INIT) {
-                        zan_diag_emit(c->diag, DIAG_ERROR, arg->loc,
+                        zan_diag_emit_code(c->diag, DIAG_ERROR, arg->loc, 2006,
                                       "property '%.*s' has no setter and "
                                       "cannot be assigned",
                                       (int)field->name.len, field->name.str);
@@ -3549,7 +3549,7 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
                 }
                 if (arg->kind == AST_COLL_INIT) {
                     if (!field || !field->type) {
-                        zan_diag_emit(c->diag, DIAG_ERROR, arg->loc,
+                        zan_diag_emit_code(c->diag, DIAG_ERROR, arg->loc, 2061,
                                       "'%s' has no member '%.*s'",
                                       type_name(type),
                                       (int)mname.len, mname.str);
@@ -3580,7 +3580,7 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
                         zan_type_t *elem2 = coll && coll->type_arg_count >= 2
                             ? coll->type_args[1] : NULL;
                         if (!add) {
-                            zan_diag_emit(c->diag, DIAG_ERROR, arg->loc,
+                            zan_diag_emit_code(c->diag, DIAG_ERROR, arg->loc, 2062,
                                           "type '%s' has no Add method for a "
                                           "collection initializer",
                                           type_name(coll));
@@ -3662,7 +3662,7 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
                 merged = else_type;
         }
         if (!merged) {
-            zan_diag_emit(c->diag, DIAG_ERROR, expr->loc,
+            zan_diag_emit_code(c->diag, DIAG_ERROR, expr->loc, 2063,
                 "cannot apply '?:' operator to operands of type '%s' and '%s': "
                 "neither converts to the other and they share no common type",
                 type_name(then_type), type_name(else_type));
@@ -3793,7 +3793,7 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
             struct checker_local *saved_locals = c->locals;
 
             if (seen_wildcard) {
-                zan_diag_emit(c->diag, DIAG_WARNING, arm->loc,
+                zan_diag_emit_code(c->diag, DIAG_WARNING, arm->loc, 2064,
                               "unreachable switch arm: previous discard arm '_' matches all remaining values");
             }
 
@@ -3805,7 +3805,7 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
                         if (prev_arm->switch_arm.when_cond == NULL &&
                             prev_arm->switch_arm.pattern != NULL &&
                             patterns_match_same(arm->switch_arm.pattern, prev_arm->switch_arm.pattern)) {
-                            zan_diag_emit(c->diag, DIAG_ERROR, arm->loc,
+                            zan_diag_emit_code(c->diag, DIAG_ERROR, arm->loc, 2065,
                                           "duplicate pattern in switch expression");
                             break;
                         }
@@ -3815,7 +3815,7 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
                 for (int prev = 0; prev < i; prev++) {
                     zan_ast_node_t *prev_arm = expr->switch_expr.arms.items[prev];
                     if (prev_arm->switch_arm.is_default) {
-                        zan_diag_emit(c->diag, DIAG_ERROR, arm->loc,
+                        zan_diag_emit_code(c->diag, DIAG_ERROR, arm->loc, 2066,
                                       "duplicate discard arm '_' in switch expression");
                         break;
                     }
@@ -3874,7 +3874,7 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
                     }
                 }
                 if (!handled) {
-                    zan_diag_emit(c->diag, DIAG_WARNING, expr->loc,
+                    zan_diag_emit_code(c->diag, DIAG_WARNING, expr->loc, 2067,
                                   "switch expression does not handle enum member '%.*s' of '%.*s'; add missing case or '_' discard arm",
                                   (int)em->name.len, em->name.str,
                                   (int)esym->name.len, esym->name.str);
@@ -3888,7 +3888,7 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
         zan_type_t *rt = zan_checker_check_expr(c, expr->with_expr.expr);
         if (!rt || (rt->kind != TYPE_CLASS && rt->kind != TYPE_STRUCT)) {
             if (rt && rt->kind != TYPE_ERROR)
-                zan_diag_emit(c->diag, DIAG_ERROR, expr->loc,
+                zan_diag_emit_code(c->diag, DIAG_ERROR, expr->loc, 2068,
                     "'with' requires a record (class/struct) receiver, "
                     "not '%s'", type_name(rt));
             return c->binder->type_error;
@@ -3900,7 +3900,7 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
             zan_symbol_t *field = rt->sym
                 ? checker_find_field(rt->sym, fname) : NULL;
             if (!field || !field->type) {
-                zan_diag_emit(c->diag, DIAG_ERROR, asg->loc,
+                zan_diag_emit_code(c->diag, DIAG_ERROR, asg->loc, 2069,
                     "'%s' has no field '%.*s' for 'with'",
                     type_name(rt),
                     (int)fname.len, fname.str);
@@ -3920,12 +3920,12 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
         if (!dst) return c->binder->type_error;
         if (!checker_cast_is_valid(c, dst, src)) {
             if (dst->kind == TYPE_OBJECT && !checker_type_is_ref(src))
-                zan_diag_emit(c->diag, DIAG_ERROR, expr->loc,
+                zan_diag_emit_code(c->diag, DIAG_ERROR, expr->loc, 2070,
                               "cannot convert '%s' to 'object': value types "
                               "cannot be boxed (Zan has no boxing facility)",
                               type_name(src));
             else
-                zan_diag_emit(c->diag, DIAG_ERROR, expr->loc,
+                zan_diag_emit_code(c->diag, DIAG_ERROR, expr->loc, 2071,
                               "cannot convert '%s' to '%s': no such conversion",
                               type_name(src), type_name(dst));
         }
@@ -4032,7 +4032,7 @@ void zan_checker_check_stmt(zan_checker_t *c, zan_ast_node_t *stmt) {
                                          "return statement");
             if (c->current_type_sym && c->current_type_sym->kind == SYM_CLASS) {
                 if (has_closure_capturing_this(c, stmt->ret.value)) {
-                    zan_diag_emit(c->diag, DIAG_WARNING, stmt->loc,
+                    zan_diag_emit_code(c->diag, DIAG_WARNING, stmt->loc, 2072,
                         "returned closure captures 'this' and escapes method scope; "
                         "ensure the caller does not retain it indefinitely to prevent ARC memory leaks");
                 }
@@ -4045,12 +4045,12 @@ void zan_checker_check_stmt(zan_checker_t *c, zan_ast_node_t *stmt) {
          * 仓库 .zan 全量 4283 处裸标识符条件全是合法 bool——赋值入条件没有
          * 任何合法用例，升级为编译错误。 */
         if (stmt->if_stmt.cond && stmt->if_stmt.cond->kind == AST_ASSIGNMENT)
-            zan_diag_emit(c->diag, DIAG_ERROR, stmt->if_stmt.cond->loc,
+            zan_diag_emit_code(c->diag, DIAG_ERROR, stmt->if_stmt.cond->loc, 2073,
                           "assignment used as a condition (did you mean '=='? "
                           "assignment (=) has no boolean value");
         zan_type_t *cond_type = zan_checker_check_expr(c, stmt->if_stmt.cond);
         if (cond_type->kind != TYPE_BOOL && cond_type->kind != TYPE_ERROR) {
-            zan_diag_emit(c->diag, DIAG_WARNING, stmt->if_stmt.cond->loc,
+            zan_diag_emit_code(c->diag, DIAG_WARNING, stmt->if_stmt.cond->loc, 2074,
                           "condition should be bool, got '%s'", type_name(cond_type));
         }
         zan_checker_check_stmt(c, stmt->if_stmt.then_body);
@@ -4171,7 +4171,7 @@ void zan_checker_check_stmt(zan_checker_t *c, zan_ast_node_t *stmt) {
             sw_type->kind != TYPE_STRING && sw_type->kind != TYPE_CHAR &&
             sw_type->kind != TYPE_ENUM && sw_type->kind != TYPE_BOOL &&
             sw_type->kind != TYPE_ERROR) {
-            zan_diag_emit(c->diag, DIAG_WARNING, stmt->loc,
+            zan_diag_emit_code(c->diag, DIAG_WARNING, stmt->loc, 2075,
                           "switch expression has non-switchable type '%s'", type_name(sw_type));
         }
 
@@ -4183,7 +4183,7 @@ void zan_checker_check_stmt(zan_checker_t *c, zan_ast_node_t *stmt) {
                                sc->switch_case.var_name.len == 0);
 
             if (seen_wildcard) {
-                zan_diag_emit(c->diag, DIAG_WARNING, sc->loc,
+                zan_diag_emit_code(c->diag, DIAG_WARNING, sc->loc, 2076,
                               "unreachable switch case: previous default/catch-all case matches all remaining values");
             }
 
@@ -4195,7 +4195,7 @@ void zan_checker_check_stmt(zan_checker_t *c, zan_ast_node_t *stmt) {
                         if (prev_sc->switch_case.when_cond == NULL &&
                             prev_sc->switch_case.pattern != NULL &&
                             patterns_match_same(sc->switch_case.pattern, prev_sc->switch_case.pattern)) {
-                            zan_diag_emit(c->diag, DIAG_ERROR, sc->loc,
+                            zan_diag_emit_code(c->diag, DIAG_ERROR, sc->loc, 2077,
                                           "duplicate case label in switch statement");
                             break;
                         }
@@ -4208,7 +4208,7 @@ void zan_checker_check_stmt(zan_checker_t *c, zan_ast_node_t *stmt) {
                                             prev_sc->switch_case.type_pattern == NULL &&
                                             prev_sc->switch_case.var_name.len == 0);
                     if (prev_is_default) {
-                        zan_diag_emit(c->diag, DIAG_ERROR, sc->loc,
+                        zan_diag_emit_code(c->diag, DIAG_ERROR, sc->loc, 2078,
                                       "duplicate default label in switch statement");
                         break;
                     }
@@ -4258,7 +4258,7 @@ void zan_checker_check_stmt(zan_checker_t *c, zan_ast_node_t *stmt) {
                     }
                 }
                 if (!handled) {
-                    zan_diag_emit(c->diag, DIAG_WARNING, stmt->loc,
+                    zan_diag_emit_code(c->diag, DIAG_WARNING, stmt->loc, 2079,
                                   "switch statement does not handle enum member '%.*s' of '%.*s'; add missing case or default label",
                                   (int)em->name.len, em->name.str,
                                   (int)esym->name.len, esym->name.str);
@@ -4281,11 +4281,11 @@ void zan_checker_check_stmt(zan_checker_t *c, zan_ast_node_t *stmt) {
                 }
             }
             if (!has_true) {
-                zan_diag_emit(c->diag, DIAG_WARNING, stmt->loc,
+                zan_diag_emit_code(c->diag, DIAG_WARNING, stmt->loc, 2080,
                               "switch statement on bool does not handle 'true' case; add missing case or default label");
             }
             if (!has_false) {
-                zan_diag_emit(c->diag, DIAG_WARNING, stmt->loc,
+                zan_diag_emit_code(c->diag, DIAG_WARNING, stmt->loc, 2081,
                               "switch statement on bool does not handle 'false' case; add missing case or default label");
             }
         }
@@ -4505,7 +4505,7 @@ static void checker_reject_null_receiver(zan_checker_t *c, zan_ast_node_t *expr)
     zan_ast_node_t *core_obj = obj;
     while (core_obj && core_obj->kind == AST_CAST_EXPR) core_obj = core_obj->cast.expr;
     if (core_obj && core_obj->kind == AST_NULL_LITERAL) {
-        zan_diag_emit(c->diag, DIAG_ERROR, expr->loc,
+        zan_diag_emit_code(c->diag, DIAG_ERROR, expr->loc, 2082,
                       "cannot access member '%.*s' on 'null'; null reference dereference faults at runtime",
                       (int)expr->member.name.len, expr->member.name.str);
         return;
@@ -4526,7 +4526,7 @@ static void checker_reject_null_receiver(zan_checker_t *c, zan_ast_node_t *expr)
         return;
     }
     if (!method_can_return_null(m)) return;
-    zan_diag_emit(c->diag, DIAG_ERROR, expr->loc,
+    zan_diag_emit_code(c->diag, DIAG_ERROR, expr->loc, 2083,
                   "'%.*s' can return null; accessing '%.*s' on its result "
                   "faults at runtime -- use '?.', or store it and check for "
                   "null first",
@@ -4584,14 +4584,14 @@ static void checker_report_no_member(zan_checker_t *c, zan_ast_node_t *expr,
     zan_istr_t simple = checker_type_simple_name(recv);
     if (recv && recv->sym) ns = access_symbol_ns(recv->sym);
     if (ns.len) {
-        zan_diag_emit(c->diag, DIAG_ERROR, expr->loc,
+        zan_diag_emit_code(c->diag, DIAG_ERROR, expr->loc, 2084,
                       "type '%.*s.%.*s' %s '%.*s'",
                       (int)ns.len, ns.str,
                       (int)simple.len, simple.str,
                       what,
                       (int)name.len, name.str);
     } else {
-        zan_diag_emit(c->diag, DIAG_ERROR, expr->loc,
+        zan_diag_emit_code(c->diag, DIAG_ERROR, expr->loc, 2085,
                       "'%.*s' %s '%.*s'",
                       (int)simple.len, simple.str,
                       what,
@@ -4821,7 +4821,7 @@ static zan_type_t *check_member_access(zan_checker_t *c, zan_ast_node_t *expr,
                 bool pseudo = mn.len == 8 &&
                     memcmp(mn.str, "TryParse", 8) == 0;
                 if (!pseudo) {
-                    zan_diag_emit(c->diag, DIAG_ERROR, expr->loc,
+                    zan_diag_emit_code(c->diag, DIAG_ERROR, expr->loc, 2086,
                                   "enum type '%.*s' has no member '%.*s'",
                                   (int)obj_type->sym->name.len,
                                   obj_type->sym->name.str,
@@ -4846,7 +4846,7 @@ static zan_type_t *check_member_access(zan_checker_t *c, zan_ast_node_t *expr,
         /* 可空类型整体渲染（自带 '?'），不再手写 '?' 拼在元素名后面——
          * 元素名本身也可能是带形状的（`bool?` 的元素是 `bool`，
          * 但嵌套形态要靠渲染器统一给）。 */
-        zan_diag_emit(c->diag, DIAG_ERROR, expr->loc,
+        zan_diag_emit_code(c->diag, DIAG_ERROR, expr->loc, 2087,
                       "cannot access member '%.*s' directly on nullable type '%s'; access via '.Value' or check '.HasValue' first",
                       (int)mn.len, mn.str, type_name(obj_type));
         return c->binder->type_error;
@@ -4868,7 +4868,7 @@ static zan_type_t *check_member_access(zan_checker_t *c, zan_ast_node_t *expr,
                     if (m->kind == SYM_FIELD && (m->modifiers & MOD_STATIC) &&
                         expr->member.object &&
                         receiver_is_value_expr(c, expr->member.object)) {
-                        zan_diag_emit(c->diag, DIAG_ERROR, expr->loc,
+                        zan_diag_emit_code(c->diag, DIAG_ERROR, expr->loc, 2088,
                                       "'%.*s' is a static field of '%.*s'; "
                                       "qualify it with the type name "
                                       "('%.*s.%.*s'), not an instance",
@@ -4924,7 +4924,7 @@ static zan_type_t *check_member_access(zan_checker_t *c, zan_ast_node_t *expr,
             return c->binder->type_int;
         }
         if (!in_call_callee) {
-            zan_diag_emit(c->diag, DIAG_ERROR, expr->loc,
+            zan_diag_emit_code(c->diag, DIAG_ERROR, expr->loc, 2089,
                           "type '%s' has no member '%.*s'",
                           type_name(obj_type),
                           (int)expr->member.name.len, expr->member.name.str);
@@ -4935,7 +4935,7 @@ static zan_type_t *check_member_access(zan_checker_t *c, zan_ast_node_t *expr,
          * （`this string` 接收者）不在内建表里，由统一判定一并算进去。 */
         if (checker_call_target_member_state(c, obj_type, expr->member.name,
                                              call) == 0) {
-            zan_diag_emit(c->diag, DIAG_ERROR, expr->loc,
+            zan_diag_emit_code(c->diag, DIAG_ERROR, expr->loc, 2090,
                           "type '%s' has no method '%.*s'",
                           type_name(obj_type),
                           (int)expr->member.name.len, expr->member.name.str);
@@ -5054,7 +5054,7 @@ static bool check_struct_cycle_dfs(zan_checker_t *c, zan_ast_node_t *struct_decl
                                    zan_struct_visited_t *visited) {
     if (!struct_decl || struct_decl->kind != AST_STRUCT_DECL) return false;
     if (depth >= 512) {
-        zan_diag_emit(c->diag, DIAG_ERROR, struct_decl->loc,
+        zan_diag_emit_code(c->diag, DIAG_ERROR, struct_decl->loc, 2091,
                       "struct '%.*s' exceeds maximum nesting depth",
                       (int)struct_decl->type_decl.name.len,
                       struct_decl->type_decl.name.str);
@@ -5078,7 +5078,7 @@ static bool check_struct_cycle_dfs(zan_checker_t *c, zan_ast_node_t *struct_decl
         if (fsym && fsym->decl && fsym->decl->kind == AST_STRUCT_DECL) {
             for (int k = 0; k <= depth; k++) {
                 if (stack[k] == fsym->decl) {
-                    zan_diag_emit(c->diag, DIAG_ERROR, member->loc,
+                    zan_diag_emit_code(c->diag, DIAG_ERROR, member->loc, 2092,
                                   "struct member '%.*s' of type '%.*s' causes a cycle in the struct layout (recursive struct has infinite size)",
                                   (int)member->field_decl.name.len,
                                   member->field_decl.name.str,
@@ -5208,8 +5208,8 @@ static void check_abstract_implementations(zan_checker_t *c,
         zan_symbol_t *owner = items[i].owner;
         if (checker_class_overrides(sym, m->name, checker_method_param_count(m), 0))
             continue;
-        zan_diag_emit(c->diag, DIAG_ERROR,
-            m->decl ? m->decl->loc : (zan_loc_t){0, 0, 0},
+        zan_diag_emit_code(c->diag, DIAG_ERROR,
+            m->decl ? m->decl->loc : (zan_loc_t){0, 0, 0}, 2093,
             "non-abstract class '%.*s' does not implement abstract method "
             "'%.*s' inherited from '%.*s'",
             (int)sym->name.len, sym->name.str,
@@ -5232,18 +5232,18 @@ static void check_abstract_members(zan_checker_t *c, zan_ast_node_t *decl) {
         if (!(member->method_decl.modifiers & MOD_ABSTRACT)) continue;
         has_abstract_method = true;
         if (member->method_decl.modifiers & MOD_STATIC) {
-            zan_diag_emit(c->diag, DIAG_ERROR, member->loc,
+            zan_diag_emit_code(c->diag, DIAG_ERROR, member->loc, 2094,
                 "an abstract method cannot be static: '%.*s'",
                 (int)member->method_decl.name.len, member->method_decl.name.str);
         }
         if (member->method_decl.modifiers & MOD_ASYNC) {
-            zan_diag_emit(c->diag, DIAG_ERROR, member->loc,
+            zan_diag_emit_code(c->diag, DIAG_ERROR, member->loc, 2095,
                 "an abstract method cannot be async: '%.*s'",
                 (int)member->method_decl.name.len, member->method_decl.name.str);
         }
     }
     if (has_abstract_method && !cls_abstract) {
-        zan_diag_emit(c->diag, DIAG_ERROR, decl->loc,
+        zan_diag_emit_code(c->diag, DIAG_ERROR, decl->loc, 2096,
             "class '%.*s' declares an abstract method and must be declared "
             "'abstract'", (int)ts->name.len, ts->name.str);
     }
@@ -5274,7 +5274,7 @@ static void check_virtual_shadows_base(zan_checker_t *c, zan_ast_node_t *decl) {
             continue;
         if (checker_base_has_virtual_slot(ts->type->base_type->sym,
                                           sym->name, want, 0)) {
-            zan_diag_emit(c->diag, DIAG_WARNING, member->loc,
+            zan_diag_emit_code(c->diag, DIAG_WARNING, member->loc, 2097,
                 "'%.*s' is declared 'virtual' but hides an inherited virtual "
                 "with the same name and arity; calls through base-class "
                 "references will run the base implementation -- "
