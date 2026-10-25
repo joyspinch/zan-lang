@@ -33,6 +33,15 @@
   `readOnly` / `sublink` / `realtime` / `shadowOffsetX` / `shadowOffsetY` /
   `textAlign` / `verticalAlign` 等 14 个高频配置键解析与结构化存储；
   未读键数从 183（39%）降至 169（36%）；ChartOptionWarn 注册表同步刷新。
+- **第三步已落地（2026-10-25）：批量补齐高频未读 option 键，未读率降至 19%（91 个）。**
+  针对 `scripts/chart_gap_audit.py` 识别出的广泛未读键实施系统化补齐：
+  1. 渐变反序列化盲点：`__grad`, `x1`, `y1`, `x2`, `y2`；
+  2. 仪表盘与数值动画：`pointer.icon`, `anchor.icon`, `detail.valueAnimation`, `label.valueAnimation`, `label.minMargin`；
+  3. 地理与交互缩放：`aspectScale`, `zoom`, `layoutCenter`, `layoutSize`, `filterMode`, `zoomOnMouseWheel`, `moveOnMouseMove`, `moveOnMouseWheel`, `throttle`；
+  4. 动画与样式：`bounding`, `loop`, `delay`, `easing`, `keyframes`, `percent`, `scaleX`, `scaleY`, `lineDash`, `lineDashOffset`；
+  5. 轴系与断轴：`gridId`, `axisPointer.snap`, `axisPointer.handle`, `breakArea.zigzagZ`, `zigzagMaxSpan`, `breakLabelLayout`, `showMinLabel`, `showMaxLabel`；
+  6. 组件级与系列控制：`tooltip`（`confine`, `transitionDuration`, `showDelay`, `hideDelay`）、`toolbox`（`feature.mark`）、`legend`（`itemGap`, `itemWidth`, `itemHeight`, `icon`）、`useUTC`, `blendMode`, `bmap`, `brush`（`toolbox`, `xAxisIndex`, `brushLink`, `outOfBrush`, `inBrush`）、`singleAxis`, `visualMap`（`outOfRange`, `controller`）、`series`（`universalTransition`, `effect`, `rippleEffect`, `leaves`, `progressive`, `progressiveThreshold`, `edgeSymbolSize`, `avoidLabelOverlap`, `clip`, `sampling`, `realtimeSort`, `legendHoverLink`, `nodeAlign`, `singleAxisIndex`, `polyline`, `showEffectOn`）；
+  7. 同步更新 `ChartOptionWarn.zan` 注册表；未读键从 169 个（36%）降至 91 个（19%），影响面 >3 文件的所有高频键全部清零。测试全绿无回归。
 - 事实（`docs/archive/CHART_CODE_GAP_LEDGER.md`）：对照 ECharts 6.1 的 596 个
   `.ts` 源，官方 option 用到的 470 个配置键里，引擎**从不读取**的有 278 个（59%）。
 - 表现：用户照官方示例写 option，键被静默丢弃——不报错、不告警，图形少一块也
