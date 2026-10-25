@@ -47,6 +47,27 @@
   - 撞出的既有缺陷单独立账 **A555**（泛型类实现的接口在泛型体内实例化
     后 tag 分发找不到实现），不阻塞本条。
   - 第二步（yield 状态机）按上面立项三落点推进。
+- **第二步 v1 设计勘误（2026-10-25 探针后）**：原定"合成嵌套类 + 零标识符
+  改写"不成立——嵌套类**不解析**外层成员（`class Outer { static int data;
+  class Inner { Get() { return data; } } }` 报 E3003 undeclared；且无 public
+  修饰时**静默绑成 0** 的假通过更危险，探针 y2/y3）。两条可行路线：
+  1. parser desugar 顶层类 + **名字改写**：desugar 手里有外层类的成员
+     AST，可枚举其字段/方法/属性名，把体内同名的无限定标识符改写成
+     `__outer.name`（实例）/`Enclosing.name`（静态）；形参、体 内声明、
+     内建名不动。形参+顶层局部提升为字段；`yield return` →
+     `{__cur=v; __state=N; return true;}` + `R_N:` 恢复标签（goto/label
+     状态机）。改写是词法级的，体内"局部名恰好撞外层成员名"会误伤
+     （记档限制）。foreach 侧还需第三处扩展：**接口型集合**
+     （`foreach (x in Nums())` 的集合静态类型是 IEnumerable<T> 接口），
+     GetEnumerator 也要走 emit_iface_call0——第一步已铺好该机制。
+  2. irgen 协程帧路线：复用 async 状态机骨架（irgen_emit.c:908-920 的
+     resume 分发 + `LLVMAddCase` 挂恢复点，await 怎么挂 yield 就怎么挂），
+     但 yield 迭代器需要**带 vtable 的真对象**实现 IEnumerator+IEnumerable
+     （async 帧是裸结构+函数指针，没有接口分发的 tag）——需要编译器合成
+     vtable 类的机制，成本高一档，语义最正。
+  先走路线 1（有界、可锁形），路线 2 作为语义完备化另立项。
+  非破坏前提不变：List<T> 返回 + yield 维持急切（desugar_yield_method
+  的 `rt->type_ref.name = "List"` 那行只对 List 形态保留）。
 - **第二步 v1 设计（2026-10-25 定稿，parser 级 desugar，零 irgen 改动）**：
   `IEnumerable<T> F(args) { body 带 yield }` 在 parser 期合成迭代器类：
   - 生成 `class __Iter_F : IEnumerator<T>`：字段 = `state:int` + `cur:T` +
