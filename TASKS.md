@@ -8,28 +8,6 @@
 
 ## 未完成
 
-### [ ] A555 泛型类实现的接口：实现类在泛型方法体内实例化后经接口调用，tag 分发找不到实现
-
-- 现象（2026-10-25，做 foreach 接口枚举器时撞出，**与 foreach 无关**）：
-  `class BoxEnum<T> : IEnumerator<T>`，在**非泛型上下文**直接
-  `new GEnum<int>(42)` 后经 `IEnumerator<int>` 形参调用 MoveNext ——
-  正常（take=1）；但实例化发生在**泛型方法体内**（`Box<T>.GetEnumerator`
-  里 `new BoxEnum<T>(items)`，或 Main 里经 `Box<int>` 实例取得）再经接口
-  调用，运行时 `interface dispatch has no implementation`（exit 3）。
-- 结构：接口分发按 tag 切换（`irgen_call.c` ~5424：遍历
-  `g->struct_types`，`class_implements_iface(cls, iface)` 命中后取
-  `get_vtable_global(g, cls)` 比对对象头 tag）。泛型类实例的 tag 与
-  泛型符号的 vtable global 在"泛型体内 new 出来的实例"这条路上对不上——
-  非泛型上下文直接 new 时对得上。疑似实例化体的 tag 注册与
-  class_implements_iface 的实例化感知有一侧缺失。
-- 探针：`_scratch/ie7.zan`（非泛型 new，过）/ `ie8.zan`（泛型体内经
-  Box<int> 取枚举器，rc=3）。ie8 形状在 foreach 接口枚举器
-  （A381 lazy iterators 第一步）里同样触发，先记独立缺陷。
-- 方向：在 `class_implements_iface` / `get_vtable_global` 里核对**实例化
-  类**（BoxEnum<int>）的注册路径：struct_types 是否为每个用到的实例化
-  建了条目与 vtable global；new 发射点在实例化方法里时 tag 取的是哪个
-  符号的 vtable。修完 ie7/ie8 双形状都要过。
-
 ### [~] A383 图表引擎整代语义差：官方 470 个 option 键里 278 个（59%）从不读取
 
 - **第一步已落地（2026-10-24）：未知 option 键告警进引擎。**

@@ -228,6 +228,13 @@ static void discover_generic_insts(zan_irgen_t *g, zan_ast_node_t *unit) {
     }
     zan_compile_trace("generic insts: %d after %d round(s)",
                       g->generic_inst_count, guard);
+    for (int i = 0; i < g->generic_inst_count; i++) {
+        zan_symbol_t *ts = g->generic_insts[i].type_sym;
+        zan_type_t *in = g->generic_insts[i].inst;
+        zan_compile_trace("  inst %d: %.*s<%d args>", i,
+                          ts ? (int)ts->name.len : 2, ts ? ts->name.str : "?",
+                          in ? in->type_arg_count : -1);
+    }
 }
 
 static zan_type_t *ident_inst_type(zan_irgen_t *g, zan_ast_node_t *e) {

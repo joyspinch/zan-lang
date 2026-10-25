@@ -7894,6 +7894,7 @@ static LLVMValueRef emit_expr_index(zan_irgen_t *g, zan_ast_node_t *expr,
                 }
             }
         }
+        arr_type = concretize(g, arr_type);
         if (arr_ptr && is_list) {
             LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
             LLVMValueRef list_ptr = LLVMBuildBitCast(g->builder, arr_ptr,

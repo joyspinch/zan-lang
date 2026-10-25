@@ -1586,7 +1586,7 @@ static bool type_is_concrete(zan_type_t *t) {
 
 static zan_type_t *concretize(zan_irgen_t *g, zan_type_t *t) {
     if (!g->cur_inst) return t;
-    return subst_type_param(t, g->cur_inst);
+    return subst_type_param_deep(g, t, g->cur_inst);
 }
 
 static bool is_user_generic_sym(zan_symbol_t *sym) {

@@ -790,6 +790,81 @@ static LLVMValueRef emit_parse_str_guard(zan_irgen_t *g, LLVMValueRef s,
     return LLVMBuildSelect(g->builder, isnull,
         zan_irgen_intern_string(g, ""), s, "parse.ssafe");
 }
+/* A555：检查类边是否与泛型实参匹配以实现目标接口 */
+static bool ifc_edge_matches_inst(zan_ast_node_t *edge_ref, zan_ast_list_t *tps,
+                                   zan_type_t **args, zan_type_t *sup) {
+    if (!edge_ref || edge_ref->kind != AST_TYPE_REF || !sup || !sup->sym)
+        return false;
+    zan_istr_t en = edge_ref->type_ref.name;
+    if (en.len != sup->sym->name.len ||
+        memcmp(en.str, sup->sym->name.str, (size_t)en.len) != 0)
+        return false;
+    zan_ast_list_t *eargs = &edge_ref->type_ref.type_args;
+    int want = sup->type_arg_count;
+    if (eargs->count != want) return false;
+    for (int j = 0; j < want; j++) {
+        zan_ast_node_t *ea = eargs->items[j];
+        if (!ea) return false;
+        if (ea->kind == AST_TYPE_REF && ea->type_ref.type_args.count > 0)
+            return false;
+        zan_istr_t ename;
+        if (ea->kind == AST_IDENTIFIER) ename = ea->ident.name;
+        else if (ea->kind == AST_TYPE_REF) ename = ea->type_ref.name;
+        else return false;
+        int k = 0;
+        int tps_count = tps ? tps->count : 0;
+        for (; k < tps_count; k++) {
+            zan_istr_t tn = tps->items[k]->ident.name;
+            if (tn.len == ename.len &&
+                memcmp(tn.str, ename.str, (size_t)tn.len) == 0)
+                break;
+        }
+        if (k < tps_count) {
+            if (!args || !args[k] || !types_equal(args[k], sup->type_args[j]))
+                return false;
+        } else {
+            zan_type_t *sa = sup->type_args[j];
+            if (!sa || ename.len != sa->name.len ||
+                memcmp(ename.str, sa->name.str, (size_t)sa->name.len) != 0)
+                return false;
+        }
+    }
+    return true;
+}
+
+static bool class_inst_implements_iface(zan_irgen_t *g, zan_symbol_t *cls,
+                                        zan_type_t *inst, zan_type_t *obj_ty) {
+    if (!cls || !obj_ty || !obj_ty->sym) return false;
+    if (!class_implements_iface(cls, obj_ty->sym)) return false;
+    if (obj_ty->type_arg_count == 0) return true;
+    if (cls->decl && (cls->decl->kind == AST_CLASS_DECL ||
+                      cls->decl->kind == AST_STRUCT_DECL ||
+                      cls->decl->kind == AST_INTERFACE_DECL)) {
+        zan_ast_list_t *tps = &cls->decl->type_decl.type_params;
+        zan_ast_list_t *bases = &cls->decl->type_decl.bases;
+        zan_type_t **args = inst ? inst->type_args : NULL;
+        for (int i = 0; i < bases->count; i++) {
+            if (ifc_edge_matches_inst(bases->items[i], tps, args, obj_ty))
+                return true;
+            if (bases->items[i] && bases->items[i]->kind == AST_TYPE_REF && g && g->binder) {
+                zan_symbol_t *isym = zan_binder_lookup(g->binder,
+                                                       bases->items[i]->type_ref.name);
+                if (isym && isym->kind == SYM_INTERFACE &&
+                    class_inst_implements_iface(g, isym, inst, obj_ty))
+                    return true;
+            }
+        }
+    }
+    if (cls->type && cls->type->base_type && cls->type->base_type->sym &&
+        cls->type->base_type->sym != cls) {
+        zan_type_t *binst = inst;
+        if (!binst && cls->type->base_type->type_arg_count > 0)
+            binst = cls->type->base_type;
+        return class_inst_implements_iface(g, cls->type->base_type->sym, binst, obj_ty);
+    }
+    return false;
+}
+
 static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
         local_scope_t *locals) {
         if (expr->call.callee && expr->call.callee->kind == AST_IDENTIFIER &&
@@ -5371,15 +5446,26 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                         n_eh_args += emit_call_arg_eh_push(g, expr->call.args.items[k],
                                                           avals[k], locals);
                     }
-                    int impl_count = 0;
-                    zan_symbol_t *single_cls = NULL;
-                    zan_symbol_t *single_m = NULL;
-                    LLVMValueRef single_fn = NULL;
-                    LLVMTypeRef single_fnty = NULL;
+                    typedef struct {
+                        zan_symbol_t *cls;
+                        zan_symbol_t *impl_m;
+                        LLVMValueRef  fn;
+                        LLVMTypeRef   fnty;
+                        LLVMValueRef  tagc;
+                    } ifc_candidate_t;
 
+                    int cand_cap = g->struct_type_count + g->generic_inst_count + 4;
+                    ifc_candidate_t *cands = (ifc_candidate_t *)calloc(
+                        (size_t)cand_cap, sizeof(ifc_candidate_t));
+                    int cand_count = 0;
+
+                    /* 1. 非泛型类候选 */
                     for (int si = 0; si < g->struct_type_count; si++) {
                         zan_symbol_t *cls = g->struct_types[si].sym;
-                        if (!cls || !class_implements_iface(cls, iface)) continue;
+                        if (!cls || is_user_generic_sym(cls)) continue;
+                        if (!class_implements_iface(cls, iface)) continue;
+                        if (obj_ty->type_arg_count > 0 &&
+                            !class_inst_implements_iface(g, cls, NULL, obj_ty)) continue;
                         zan_symbol_t *impl_m = resolve_overload(cls, callee->member.name, uargc, 0);
                         if (!impl_m) continue;
                         LLVMValueRef ifn = NULL; LLVMTypeRef ifnty = NULL;
@@ -5388,17 +5474,52 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                                 ifn = g->functions[fi].fn; ifnty = g->functions[fi].fn_type; break;
                             }
                         if (!ifn || !ifnty) continue;
-                        impl_count++;
-                        single_cls = cls;
-                        single_m = impl_m;
-                        single_fn = ifn;
-                        single_fnty = ifnty;
+                        cands[cand_count].cls = cls;
+                        cands[cand_count].impl_m = impl_m;
+                        cands[cand_count].fn = ifn;
+                        cands[cand_count].fnty = ifnty;
+                        cands[cand_count].tagc = LLVMConstBitCast(get_vtable_global(g, cls), i8ptr);
+                        cand_count++;
                     }
 
-                    if (impl_count == 1 && single_cls && single_m && single_fn && single_fnty) {
-                        unsigned npar = LLVMCountParamTypes(single_fnty);
+                    /* 2. 泛型实例化类候选 */
+                    for (int gi = 0; gi < g->generic_inst_count; gi++) {
+                        zan_symbol_t *cls = g->generic_insts[gi].type_sym;
+                        zan_type_t *inst = g->generic_insts[gi].inst;
+                        if (!cls || !inst || !is_user_generic_sym(cls)) continue;
+                        if (!class_inst_implements_iface(g, cls, inst, obj_ty)) continue;
+                        zan_symbol_t *impl_m = resolve_overload(cls, callee->member.name, uargc, 0);
+                        if (!impl_m) continue;
+                        zan_symbol_t *msym_owner = impl_m->parent ? impl_m->parent : cls;
+                        zan_type_t *owner = is_user_generic_sym(msym_owner) ? vtable_owner_inst(g, inst, msym_owner) : NULL;
+                        LLVMValueRef ifn = NULL; LLVMTypeRef ifnty = NULL;
+                        if (owner && owner->type_arg_count > 0) {
+                            ifn = find_generic_fn(g, impl_m, owner->type_args,
+                                                  owner->type_arg_count, &ifnty);
+                        } else if (!is_user_generic_sym(msym_owner)) {
+                            for (int fi = irgen_find_function(g, impl_m); fi >= 0; fi = -1)
+                                if (g->functions[fi].sym == impl_m) {
+                                    ifn = g->functions[fi].fn; ifnty = g->functions[fi].fn_type; break;
+                                }
+                        }
+                        if (!ifn || !ifnty) continue;
+                        cands[cand_count].cls = cls;
+                        cands[cand_count].impl_m = impl_m;
+                        cands[cand_count].fn = ifn;
+                        cands[cand_count].fnty = ifnty;
+                        cands[cand_count].tagc = LLVMConstBitCast(
+                            get_vtable_global_inst(g, cls, inst), i8ptr);
+                        cand_count++;
+                    }
+
+                    zan_compile_trace("ifc dispatch %.*s: cands=%d (structs=%d ginsts=%d)",
+                        (int)callee->member.name.len, callee->member.name.str,
+                        cand_count, g->struct_type_count, g->generic_inst_count);
+                    if (cand_count == 1 && cands[0].cls && cands[0].impl_m &&
+                        cands[0].fn && cands[0].fnty) {
+                        unsigned npar = LLVMCountParamTypes(cands[0].fnty);
                         LLVMTypeRef *pts = (LLVMTypeRef *)calloc((size_t)(npar > 0 ? npar : 1), sizeof(LLVMTypeRef));
-                        LLVMGetParamTypes(single_fnty, pts);
+                        LLVMGetParamTypes(cands[0].fnty, pts);
                         int cargc = uargc + 1;
                         LLVMValueRef *ca = (LLVMValueRef *)calloc((size_t)cargc, sizeof(LLVMValueRef));
                         ca[0] = (npar > 0) ? LLVMBuildBitCast(g->builder, recv, pts[0], "ifc.this") : recv;
@@ -5406,7 +5527,8 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                             ca[k + 1] = (k + 1 < (int)npar)
                                 ? emit_boundary_coerce(g, avals[k], pts[k + 1]) : avals[k];
                         const char *cn = has_res ? "ifccall" : "";
-                        LLVMValueRef r = emit_dispatch_call(g, single_cls, single_m, single_fn, single_fnty, ca, cargc, cn);
+                        LLVMValueRef r = emit_dispatch_call(g, cands[0].cls, cands[0].impl_m,
+                                                            cands[0].fn, cands[0].fnty, ca, cargc, cn);
                         if (has_res) {
                             r = emit_boundary_coerce(g, r, res_ty);
                         } else {
@@ -5417,7 +5539,7 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                         for (int k = 0; k < uargc; k++)
                             emit_release_owned_call_temp(g, expr->call.args.items[k], avals[k], locals);
                         emit_release_owned_call_temp(g, callee->member.object, recv, locals);
-                        free(ca); free(pts); free(avals);
+                        free(ca); free(pts); free(avals); free(cands);
                         return r;
                     }
 
@@ -5426,33 +5548,22 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                     LLVMValueRef tag = LLVMBuildLoad2(g->builder, i8ptr, recv_pp, "ifc.tag");
 
                     LLVMBasicBlockRef merge = LLVMAppendBasicBlockInContext(c, g->current_fn, "ifc.merge");
-                    int cap = g->struct_type_count + 1;
+                    int cap = cand_count + 1;
                     LLVMValueRef *phi_vals = (LLVMValueRef *)calloc((size_t)cap, sizeof(LLVMValueRef));
                     LLVMBasicBlockRef *phi_bbs = (LLVMBasicBlockRef *)calloc((size_t)cap, sizeof(LLVMBasicBlockRef));
                     int np = 0;
 
-                    for (int si = 0; si < g->struct_type_count; si++) {
-                        zan_symbol_t *cls = g->struct_types[si].sym;
-                        if (!cls || !class_implements_iface(cls, iface)) continue;
-                        zan_symbol_t *impl_m = resolve_overload(cls, callee->member.name, uargc, 0);
-                        if (!impl_m) continue;
-                        LLVMValueRef ifn = NULL; LLVMTypeRef ifnty = NULL;
-                        for (int fi = irgen_find_function(g, impl_m); fi >= 0; fi = -1)
-                            if (g->functions[fi].sym == impl_m) {
-                                ifn = g->functions[fi].fn; ifnty = g->functions[fi].fn_type; break;
-                            }
-                        if (!ifn || !ifnty) continue;
-
+                    for (int ci = 0; ci < cand_count; ci++) {
                         LLVMBasicBlockRef callbb = LLVMAppendBasicBlockInContext(c, g->current_fn, "ifc.call");
                         LLVMBasicBlockRef nextbb = LLVMAppendBasicBlockInContext(c, g->current_fn, "ifc.next");
-                        LLVMValueRef tagc = LLVMConstBitCast(get_vtable_global(g, cls), i8ptr);
+                        LLVMValueRef tagc = cands[ci].tagc;
                         LLVMValueRef cmp = zan_icmp(g->builder, LLVMIntEQ, tag, tagc, "ifc.eq");
                         LLVMBuildCondBr(g->builder, cmp, callbb, nextbb);
 
                         LLVMPositionBuilderAtEnd(g->builder, callbb);
-                        unsigned npar = LLVMCountParamTypes(ifnty);
+                        unsigned npar = LLVMCountParamTypes(cands[ci].fnty);
                         LLVMTypeRef *pts = (LLVMTypeRef *)calloc((size_t)(npar > 0 ? npar : 1), sizeof(LLVMTypeRef));
-                        LLVMGetParamTypes(ifnty, pts);
+                        LLVMGetParamTypes(cands[ci].fnty, pts);
                         int cargc = uargc + 1;
                         LLVMValueRef *ca = (LLVMValueRef *)calloc((size_t)cargc, sizeof(LLVMValueRef));
                         ca[0] = (npar > 0) ? LLVMBuildBitCast(g->builder, recv, pts[0], "ifc.this") : recv;
@@ -5460,7 +5571,7 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                             ca[k + 1] = (k + 1 < (int)npar)
                                 ? emit_boundary_coerce(g, avals[k], pts[k + 1]) : avals[k];
                         const char *cn = has_res ? "ifccall" : "";
-                        LLVMValueRef r = zan_call2(g->builder, ifnty, ifn, ca, (unsigned)cargc, cn);
+                        LLVMValueRef r = zan_call2(g->builder, cands[ci].fnty, cands[ci].fn, ca, (unsigned)cargc, cn);
                         if (has_res) {
                             r = emit_boundary_coerce(g, r, res_ty);
                             phi_vals[np] = r; phi_bbs[np] = LLVMGetInsertBlock(g->builder); np++;
@@ -5469,6 +5580,7 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                         free(ca); free(pts);
                         LLVMPositionBuilderAtEnd(g->builder, nextbb);
                     }
+                    free(cands);
 
                     emit_runtime_check(g, LLVMConstInt(LLVMInt1TypeInContext(c), 1, 0),
                                        expr->loc, "interface dispatch has no implementation");
