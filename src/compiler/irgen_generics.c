@@ -403,8 +403,19 @@ static int expr_yields_delegate_value(zan_irgen_t *g, zan_ast_node_t *e,
 static int expr_yields_owned_rc_value(zan_irgen_t *g, zan_ast_node_t *e,
                                       local_scope_t *locals) {
     if (!e) return 0;
-    if (e->kind == AST_CAST_EXPR)
+    if (e->kind == AST_CAST_EXPR) {
+        /* 装箱 cast（A454/A556-3）：`(object)structValue` 分配新堆箱，
+         * 结果是 fresh owned 指针——消费方（object 变量/字段捕获）不得
+         * 再对箱指针 retain（会顶成 rc=2，作用域释放只减到 1，箱泄漏）。
+         * 装箱内部的字段级 retain 由 emit_box_struct 按操作数的 owned
+         * 性单独判定，不走这里。 */
+        zan_type_t *ct = infer_expr_type(g, e, locals);
+        if (ct && ct->kind == TYPE_OBJECT) {
+            zan_type_t *stc = infer_expr_type(g, e->cast.expr, locals);
+            if (stc && stc->kind == TYPE_STRUCT) return 1;
+        }
         return expr_yields_owned_rc_value(g, e->cast.expr, locals);
+    }
     if (e->kind == AST_POSTFIX_UNARY && e->unary.op == TK_BANG)
         return expr_yields_owned_rc_value(g, e->unary.operand, locals);
     if (e->kind == AST_TUPLE_EXPR) return 1;

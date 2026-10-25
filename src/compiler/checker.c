@@ -1581,9 +1581,13 @@ static bool cast_is_scalar(zan_type_t *t) {
 /* 检查是否`(dst)src` is a conversion the language has */
 static bool checker_struct_boxable(zan_type_t *t, int depth);
 
-/* A454 装箱资格：用户声明的 struct，其字段（含嵌套 struct 字段）全部
- * 不含托管引用——载荷可原样写入堆对象，释放函数无需字段清理。
- * Span/Decimal/Nullable 这类内建值形状同样满足（视图/标量载荷）。 */
+/* A454 装箱资格：用户声明的 struct 即可装箱（A556 第 3 件放开托管
+ * 字段）：载荷原样写入堆对象，装箱时按捕获协议对托管字段 retain、
+ * 箱的释放函数按字段 walk 释放（build_class_release_body 对
+ * SYM_STRUCT 的偏移从 user_ptr+0 起，与载荷布局一致）。
+ * Span/Decimal/Nullable 这类内建值形状同样满足（视图/标量载荷）。
+ * 唯独 TYPE_TYPE_PARAM 字段仍拒：开泛形参载荷尺寸/释放按实例走，
+ * 资格判定在开型上做不可靠。 */
 static bool checker_struct_boxable(zan_type_t *t, int depth) {
     if (!t || t->kind != TYPE_STRUCT || !t->sym || depth > 32) return false;
     zan_symbol_t *sym = t->sym;
@@ -1599,11 +1603,7 @@ static bool checker_struct_boxable(zan_type_t *t, int depth) {
             if (!checker_struct_boxable(ft, depth + 1)) return false;
             continue;
         }
-        if (ft->kind == TYPE_CLASS || ft->kind == TYPE_INTERFACE ||
-            ft->kind == TYPE_STRING || ft->kind == TYPE_ARRAY ||
-            ft->kind == TYPE_DELEGATE || ft->kind == TYPE_TASK ||
-            ft->kind == TYPE_OBJECT || ft->kind == TYPE_TYPE_PARAM)
-            return false;
+        if (ft->kind == TYPE_TYPE_PARAM) return false;
     }
     return true;
 }

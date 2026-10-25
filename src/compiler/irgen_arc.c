@@ -960,6 +960,13 @@ static void build_class_release_body(zan_irgen_t *g, zan_symbol_t *sym,
             LLVMValueRef fp = LLVMBuildStructGEP2(b, structT, self, (unsigned)idx, "fp");
             LLVMValueRef cv = LLVMBuildLoad2(b, map_type(g, ft), fp, "fc");
             emit_arc_release_typed(g, ft, cv);
+        } else if (ft->kind == TYPE_STRUCT) {
+            /* 装箱结构体的嵌套结构体字段（A556-3）：内层托管叶子按值
+             * 递归释放（emit_collection_value_release 对聚合值逐字段
+             * 下钻），GEP 位移与载荷布局一致。 */
+            LLVMValueRef fp = LLVMBuildStructGEP2(b, structT, self, (unsigned)idx, "fp");
+            LLVMValueRef nv = LLVMBuildLoad2(b, map_type(g, ft), fp, "fn");
+            emit_collection_value_release(g, ft, nv, 0);
         } else if (ft->kind == TYPE_OBJECT) {
             LLVMValueRef fp = LLVMBuildStructGEP2(b, structT, self, (unsigned)idx, "fp");
             LLVMValueRef cv = LLVMBuildLoad2(b, i8ptr, fp, "fc");

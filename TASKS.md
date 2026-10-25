@@ -110,20 +110,49 @@
   双绿；探针族（box_probe/stress/min/c4/b5/c1/managed/cls）全过。
 - 关联：A449、A434、A556。
 
-### [ ] A556 装箱 v2：隐式装箱、装箱值方法分派、托管字段结构体装箱
+### [ ] A556 装箱 v2：隐式装箱、装箱值方法分派（v1 边界的剩余两件）
 
-- A454 闭环后的下一期（v1 只做了显式 cast 方向，见上）。缺口三件：
+- ~~含托管字段的结构体装箱~~ **已闭环（2026-10-26，A556-3）**：checker
+  `checker_struct_boxable` 放开托管字段（仅保留 TYPE_TYPE_PARAM 拒绝），
+  irgen 资格同步放宽；装箱按来源 owned 性决定字段级 retain（构造临时转移、
+  既有变量 `emit_collection_value_retain`），箱的释放函数补嵌套结构体字段
+  下钻（`build_class_release_body` 加 TYPE_STRUCT 分支，复用
+  `emit_collection_value_release`）；拆箱为 C# 同款拷贝语义（目的捕获协议
+  retain，箱保有自己的份）。关键配套修复：`expr_yields_owned_rc_value`
+  对装箱 cast（object 目标 + struct 操作数）返回 owned——箱是 fresh 堆
+  对象，消费方（object 变量/字段捕获）不得再对箱指针 retain（否则 rc=2、
+  作用域释放只减到 1，箱泄漏）；`emit_box_struct` 的字段 retain 改判
+  **操作数**的 owned 性。验证：`struct_boxing_managed`（+det 孪生）双绿，
+  探针 t2/t6/m6 leakcheck 干净。
+- 剩余两件：
   1. **隐式装箱**：值类型赋给 `object`/接口变量、作 object 形参传参时自动
      装箱（当前必须写 `(object)s`，少写即 E2070）；
   2. **装箱值的虚方法分派**：`object.ToString()`/`Equals` 在箱上应分发到
      结构体的重写（当前箱上只有 payload，没有方法表——引用型 object 的
-     vtable 槽位对结构体箱是空的）；
-  3. **含托管字段的结构体装箱**：`emit_box_struct` 目前仅适用无托管字段
-     结构体（释放函数空体只减 rc+free）；托管字段结构体装箱需要给箱挂
-     字段级释放析构（`build_class_release_body` 的字段 walk 已就位，缺的是
-     checker 放行 + E2070 收窄）。
+     vtable 槽位对结构体箱是空的）。
 - `Zan.Messaging` 的"统一请求-响应 + 擦除结果"（A449/A434 的原始诉求）在
   v1 的显式 cast 下已可用；v2 是体验补齐。
+
+### [ ] A557 object 局部变量赋值不释放旧值（含 `= null`）——连带守卫异常泄漏
+
+- 现象（2026-10-26，A556-3 装箱探针的 leakcheck 炸出来的，**与装箱无关，
+  纯类对象即复现**）：
+  - `object a = new List<int>(); a = null;` → 泄漏 List（t3）；
+  - `object a = new List<int>(); object c = new List<int>(); a = c;` →
+    泄漏 a 的旧 List（t8），且 a、c 共享 rc=1（assign 未 retain，作用域
+    退出两次 release_dyn，靠运行期 rc≤0 守卫兜住）；
+  - `object a = <箱或对象>; a = null;` 之后首个 try/catch → 被捕获的
+    守卫异常也泄漏 1 个（m7；无 `a = null` 的同构 g2/g3 干净）。
+- IR 证据（t3/t8 `--emit-ir`）：赋值语句发射形状是
+  `__zan_eh_tmp_push(slot(RHS 或目标 var)) → store → tmp_pop`——**没有旧值
+  release 分支**（对比 t6 的初始化路径有完整 obj.probe/srel/orel 旧值
+  释放链）。声明初始化（emit_obj_local_store）语义正确：释放旧值 + owns
+  标志 + 按需 retain；赋值语句没走它。
+- 修复方向：赋值语句对 dyn-obj 目标统一走 `emit_obj_local_store`（释放
+  旧值 + 转移/retain 新值 + owns 标志），并理清 tmp_push/push 的是目标槽
+  还是 RHS 槽（t8 推的是 RHS 变量槽——读局部变量被当成了 owned 临时），
+  以及 m7 的异常泄漏是否随赋值修复消失。影响面大（每个 object 赋值），
+  动手前先用 t3/t8/m7 + `arc_throw_*` 全族钉行为。
 
 ### [ ] A489 GPU 3D 片元着色器把光照写死成固定键光——没有材质与光源 uniform 通路
 

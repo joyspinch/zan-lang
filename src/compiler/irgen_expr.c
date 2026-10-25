@@ -11548,7 +11548,6 @@ static bool irgen_boxed_eligible_struct(zan_irgen_t *g, zan_type_t *t) {
     zan_symbol_t *sym = t->sym;
     if (!sym->decl || sym->decl->kind != AST_STRUCT_DECL) return false;
     if (decl_is_explicit_layout(sym)) return false;
-    if (type_contains_collection_rc(g, t, 0)) return false;
     return true;
 }
 
@@ -11558,8 +11557,8 @@ static bool irgen_boxed_eligible_struct(zan_irgen_t *g, zan_type_t *t) {
  * 装箱对象；`is`/拆箱的 tag 走描述符名表（装箱 site 的 tynames 首项
  * 就是结构体名，见 zan_irgen_emit_arc_desc_init 的继承链遍历）。
  * 头部由 zan_rt_alloc 统一布置：raw[0..7]=引用计数、raw[8..15]=site 字。
- * v1 资格排除托管字段结构体；这里的 retain 已按捕获协议写好，资格
- * 放开（managed-field struct）时语义自动成立。 */
+ * 托管字段结构体（A556-3）同一协议：来源非 owned 时对托管字段
+ * retain，箱的释放函数按字段 walk 释放（含嵌套结构体下钻）。 */
 static LLVMValueRef emit_box_struct(zan_irgen_t *g, zan_type_t *st,
                                     zan_ast_node_t *src_expr,
                                     LLVMValueRef val, local_scope_t *locals) {
@@ -11589,8 +11588,12 @@ static LLVMValueRef emit_box_struct(zan_irgen_t *g, zan_type_t *st,
             LLVMPointerType(lt, 0), "box.slot");
         LLVMBuildStore(g->builder, sval, slot);
         /* 载荷里的引用归堆对象所有；来源是既有变量（非构造临时）时
-         * 补 +1——与 emit_struct_local_capture 同一捕获协议。 */
-        if (!expr_yields_owned_rc_value(g, src_expr, locals))
+         * 补 +1——与 emit_struct_local_capture 同一捕获协议。注意这里
+         * 判定的是**操作数**的 owned 性（装箱 cast 本身在 helper 里
+         * 已定义为 owned，不能用它判字段来源）。 */
+        zan_ast_node_t *operand = (src_expr && src_expr->kind == AST_CAST_EXPR)
+                                      ? src_expr->cast.expr : src_expr;
+        if (!expr_yields_owned_rc_value(g, operand, locals))
             emit_collection_value_retain(g, st, sval, 0);
     }
     return raw;
@@ -11598,9 +11601,8 @@ static LLVMValueRef emit_box_struct(zan_irgen_t *g, zan_type_t *st,
 
 /* 拆箱：object → 装箱过的结构体。tag 检查复用 `is` 的描述符名表
  * 通路；失败按 A509 同款软失败（stderr 一次 + 零值继续，
- * --strict-runtime 下 exit 70）。v1 资格排除托管字段结构体，载荷
- * 拷出无需字段级 retain；放开资格时这里要补
- * emit_collection_value_retain（箱可能先于拷贝死亡）。 */
+ * --strict-runtime 下 exit 70）。C# 同款拷贝语义：载荷按值拷出，
+ * 目的地（局部捕获/赋值协议）对托管字段 retain，箱保有自己的份。 */
 static LLVMValueRef emit_unbox_struct(zan_irgen_t *g, zan_type_t *tt,
                                       LLVMValueRef val, zan_ast_node_t *expr) {
     LLVMTypeRef lt = map_type(g, tt);
