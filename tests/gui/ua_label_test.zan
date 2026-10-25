@@ -1,0 +1,142 @@
+using System;
+using Gui;
+using Gui.Widget;
+
+// UA 表 label{display:block}（A546②）无头回归：
+// 修复本体——块流文档里的 <label>（Html.Build 后是 Label 控件，
+// Kind 仍是 "label"）按块级排版；此前无 display 归类落在 legacy=0
+// （dock/手摆）通道，块流容器里高度 0、字不画。
+// 无回归——Label 控件在 dock 手摆、flex 行两种父布局里的几何在
+// 规则前后一致（UseAppCss 叠加同名规则做 A/B 对拍）。
+class UaLabelTest {
+    static int fails;
+
+    static void Eq(string what, int got, int want) {
+        if (got == want) { return; }
+        fails = fails + 1;
+        Console.WriteLine("FAIL " + what + ": got "
+            + Convert.ToString(got) + " want " + Convert.ToString(want));
+    }
+
+    static void Check(string what, bool ok) {
+        if (ok) { return; }
+        fails = fails + 1;
+        Console.WriteLine("FAIL " + what);
+    }
+
+    static void Rect(string tag, Control c) {
+        Console.WriteLine(tag + " " + Convert.ToString(c.bx) + ","
+            + Convert.ToString(c.by) + " " + Convert.ToString(c.bw)
+            + "x" + Convert.ToString(c.bh));
+    }
+
+    static void Layout(Control root, App app) {
+        root.MeasureTree(app);
+        root.Arrange(0, 0, app.canvas.Width(), app.canvas.Height());
+    }
+
+    // 块流文档：一个 <label> 与一个同字号的 <div>，块级排布下两者
+    // 行高一致、上下相邻不重叠。
+    static void BlockFlowDoc(Form f, App app) {
+        Console.WriteLine("--- block flow doc ---");
+        Control rt = app.LoadHtmlWith(
+            "<div id=\"doc\">"
+            + "<label id=\"L1\">账号</label>"
+            + "<div id=\"D1\">正文</div>"
+            + "</div>", null, "");
+        Check("doc loaded", rt != null);
+        if (rt == null) { return; }
+        Layout(rt, app);
+        Control l1 = rt.Find("L1");
+        Control d1 = rt.Find("D1");
+        Check("label node exists", l1 != null && d1 != null);
+        if (l1 == null || d1 == null) { return; }
+        Rect("label", l1);
+        Rect("div", d1);
+        // Html.Build（2026-10-25 起）把 <label> 建成 Label 控件
+        // （Kind 仍是 "label"），文本自测自绘，块流容器里照常排出来。
+        Check("label is the Label widget", l1 is Label);
+        Check("label kind is Label widget kind", l1.Kind() == "Label");
+        Check("label renders (bh>0)", l1.bh > 0);
+        Check("label renders (bw>0)", l1.bw > 0);
+        Check("label stacks above div", l1.by + l1.bh <= d1.by);
+    }
+
+    // Label 控件的三种父布局：dock 手摆（legacy 宿主）、flex 行、
+    // 块流容器。返回 12 个几何数（每件 bx,by,bw,bh）。
+    static List<int> WidgetMatrix(Form f, App app) {
+        Control rt = app.LoadHtmlWith(
+            "<myhost id=\"host\"></myhost>"
+            + "<flex id=\"row\"></flex>"
+            + "<div id=\"blk\"></div>", null, "");
+        Check("matrix doc loaded", rt != null);
+        if (rt == null) { return new List<int>(); }
+        Control host = rt.Find("host");
+        Control row = rt.Find("row");
+        Control blk = rt.Find("blk");
+        Check("hosts exist",
+            host != null && row != null && blk != null);
+        if (host == null || row == null || blk == null) {
+            return new List<int>();
+        }
+        Label a = new Label("手摆");
+        a.Place(10, 20);
+        host.Add(a);
+        Label b = new Label("弹性");
+        row.Add(b);
+        Label c = new Label("块流");
+        blk.Add(c);
+        Layout(rt, app);
+        List<int> g = new List<int>();
+        Control[] ws = new Control[] { a, b, c };
+        for (int i = 0; i < 3; i = i + 1) {
+            g.Add(ws[i].bx);
+            g.Add(ws[i].by);
+            g.Add(ws[i].bw);
+            g.Add(ws[i].bh);
+        }
+        return g;
+    }
+
+    static void Main() {
+        Html.Install();
+        ControlBootstrap.Install();
+        Form f = Form.CreateOffscreen("ua label", 400, 300);
+        App app = f.GetApp();
+
+        BlockFlowDoc(f, app);
+
+        Console.WriteLine("--- widget matrix A/B ---");
+        List<int> g0 = WidgetMatrix(f, app);
+        app.UseAppCss("label { display: block; }");
+        List<int> g1 = WidgetMatrix(f, app);
+        // dock 与 flex 里的 Label 控件不受该规则影响（停靠/弹性排布
+        // 不读 display）。块流容器里的 Label 控件则从 22 塌到 0：
+        // display=3 让它走 CSS 块流测量，而它的文本是控件内绘、不是
+        // 流内子节点——这就是 UA 表坚持不给 label 声明 display 的
+        // 实证依据（A546② 定性：该规则有害，不加）。此处把塌陷钉成
+        // 契约：谁改了块流测量让规则不再塌陷，这条就会响，届时连同
+        // UA 表一起重新评估。
+        string[] names = new string[] { "dock", "flex" };
+        for (int w = 0; w < 2; w = w + 1) {
+            for (int k = 0; k < 4; k = k + 1) {
+                Eq("widget '" + names[w] + "' stable field " + Convert.ToString(k),
+                   w * 4 + k < g1.Count && w * 4 + k < g0.Count
+                       ? g1[w * 4 + k] : 0 - 1,
+                   w * 4 + k < g0.Count ? g0[w * 4 + k] : 0 - 2);
+            }
+        }
+        Eq("block-flow label collapses under the UA rule (pinned)",
+           g1.Count > 11 ? g1[11] : 0 - 1, 0);
+
+        if (fails == 0) {
+            Console.WriteLine("UA_LABEL_TEST_OK");
+            Console.WriteLine("block label bh without rule: "
+                + Convert.ToString(g0.Count > 11 ? g0[11] : 0 - 1));
+        } else {
+            Console.WriteLine("UA_LABEL_TEST_FAIL (fails="
+                + Convert.ToString(fails) + ")");
+        }
+        app.canvas.Destroy();
+    }
+}
