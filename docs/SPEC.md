@@ -841,9 +841,7 @@ qualified_name  = IDENT { "." IDENT } ;
 
 以下 C# 特性**尚未实现**，不要在 Zan 代码中使用：
 
-- lazy iterators (`IEnumerable<T>` protocol) — `yield` currently materializes a list
-- tagged union 枚举（代数数据类型）
-- `[CImport]`、`project.zan` 项目文件、`zan` CLI（实际为 `zanc`）
+- lazy iterators (`IEnumerable<T>` protocol) — `yield` currently materializes a list（见 §8.1；C# 风格的 tagged union 采用 `[StructLayout(LayoutKind.Explicit)]` struct 实现，见 §4.5 与 `explicit_layout.zan`）
 
 以下曾列为未实现、实测已可用（各带 conformance 用例）：
 

@@ -8,38 +8,13 @@
 
 ## 未完成
 
-### [ ] A381 SPEC 的"尚未实现"清单剩余 2 项
+### [ ] A381 SPEC 尚未实现项：lazy iterators（IEnumerable<T> 协议与协程状态机）
 
-- lazy iterators：`yield` 物化成 list，没有 `IEnumerable<T>` 协议
-- tagged union 枚举（代数数据类型）
-- 已清（2026-10-25，77bc56e11 / 本次）：`$` 与三引号的组合（插值原始字符串）及逐字插值——
-  跨"文本段/插值洞"分段记账用 interp frame 携带 raw+strip 兑现（`}` 恢复段
-  续用闭合行预扫的剥离量），分段式 lexer 表达；自举侧 `lexer.zan` 已完成
-  $@/@$ 逐字插值（含转义花括号与格式说明符）与 `"""`/$""" 原始字符串完整对齐，
-  进差分门 `tests/selfhost/diff_cases.txt`，固定点与差分门全绿。
-
-- 已清：`checked` / `unchecked` 整型溢出检查——802607e72 落地，
-  C# 兼容语义（checked 报点后回绕值继续流动，`ZAN_RT_HARD=1` 硬陷阱 exit 70；
-  用例 `tests/conformance/cs_b14_checked.zan` 与 runtime_error 套件）。
-- 已清（2026-10-25，5433bf761）：`params` 与可选实参的组合——此前
-  `fill_default_args` 对 params 方法整体跳过默认填充、`method_accepts_arity`
-  把 params 当固定 arity，`(int a, int b = 10, params int[] rest)` 以 1 个
-  实参调用直接解析失败。修：arity 接受 `fixed = pc-1` 且只校验尾参前形参的
-  默认值；fill 只填到 params 之前，params 数组仍由 pack_params_args 收
-  （0 个收空数组）。全形状探针过；conformance
-  `tests/conformance/params_optional_combination.zan` 锁形。
-
-- 已清（2026-10-25，定性非缺口）：COW 集合——探针 + conformance 用例
-  `cs_list_aliasing` 钉死：Zan `List` 赋值就是引用共享、修改即共享，与 C#
-  `List<T>` 语义完全一致（C# 本就没有 COW List）。SPEC 把这行挂在"C# 特性
-  尚未实现"清单属归档错误：已从该清单移除，引用共享语义写入 §6.2。
-- 已清（2026-10-25，定性非缺口）：`[CImport]`/`project.zan`/`zan` CLI——
-  SPEC §7/§8 已如实记录不存在与替代路径（`[DllImport]` + `System.Interop`、
-  `zanc` 直接编），替代路径有全套 conformance 用例在跑（dllimport_variadic、
-  ffi_nint_handle、extern_raw_buffer、delegate_dispatch 等）。不是待实现缺口，
-  是已文档化的非特性。
-- 方向：逐项单独立项实现，每项带 conformance 用例；不做半截实现。
-- **lazy iterators 立项（2026-10-25 勘察）**：现状是 parser 期改写——
+- 现状：SPEC §8.3 原清单剩余 2 项，其中"tagged union 枚举"定性为归档错误
+  移出（C# 本无 payload enum，C# 与 Zan 均采用 `[StructLayout(LayoutKind.Explicit)]`
+  结构体表达，已有 `tests/conformance/explicit_layout.zan` 锁形）。
+  因此本项聚焦于 **lazy iterators** 协议与状态机实现。
+- 现状（2026-10-25 勘察）：当前是 parser 期改写——
   `rewrite_yield_stmt`（`src/compiler/parser.c:3369`）把 `yield return v`
   改写成 `__yield.Add(v)`、`yield break` 改写成 `return __yield`，**急切
   物化成 List**（探针实测可用，语义=立刻跑完整个方法）。真惰性迭代器的
@@ -543,8 +518,4 @@
   flex 收缩 min-content 下限；停靠 FitSize 裁 0 宽定性为 WinForms 同款不改）。
 - 前提：要有可交互的桌面会话（锁屏/远程会话会拿到黑屏），或让子窗口支持
   把 root 暴露给宿主驱动。
-
-### [x] A546 框架：普通 HTML 里的 `<label>` 是元素，静态文字排不出来（已闭 2026-10-25，9db8cb4c1，移出台账）
-- ① 即完整修复：Html.Build/GenHtml 两条通道都建 Label 控件（文本自测自绘），块流容器里照常排版，登录窗缺字不复存在。
-- ②（定性，不做）UA 表补 `label { display: block; }` 实证有害：块流容器里的 Label 控件从 22 塌到 0 高——display=3 让它走 CSS 块流测量，而它的文本是控件内绘、不是流内子节点，被空块测量。UA 注释已补依据；dock/flex 不受该规则影响、块流塌陷已由 `conformance_gui_ua_label` 钉成契约（谁让规则不再塌陷谁就连同 UA 表一起重新评估）。
 
