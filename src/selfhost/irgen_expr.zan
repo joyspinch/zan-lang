@@ -2519,14 +2519,32 @@ partial class Irgen {
             if (IsStr(obj.ty)) {
                 // A507② 自举半边（string）：字符写曾无界——OOB 改写字符串
                 // 后面的内存。软诊断 + 软基址 select（OOB 时落 scratch 字节）。
-                string sln = NT();
-                L("  " + sln + " = call i64 @zstr_len(i8* " + obj.op + ")");
-                string sneg = NT();
-                L("  " + sneg + " = icmp slt i64 " + idx.op + ", 0");
-                string sge = NT();
-                L("  " + sge + " = icmp sge i64 " + idx.op + ", " + sln);
-                string soob = NT();
-                L("  " + soob + " = or i1 " + sneg + ", " + sge);
+                bool isOpaque = false;
+                if (lhs.a != null && lhs.a.kind == AK.Ident()) {
+                    int li = LocalIdx(lhs.a.sval);
+                    if (li >= 0 && li < locOpaque.Count && locOpaque[li]) {
+                        isOpaque = true;
+                    }
+                }
+                string soob = "";
+                if (isOpaque) {
+                    // Opaque string（来自 extern 调用如 calloc/malloc，无托管上界）：
+                    // 对齐 C 宿主（irgen_expr.c:5671）与自举机器码后端（ngen_string.zan:110）：
+                    // 故意只检查 null/负数索引，不检查上界。
+                    string sneg = NT();
+                    L("  " + sneg + " = icmp slt i64 " + idx.op + ", 0");
+                    soob = sneg;
+                } else {
+                    string sln = NT();
+                    L("  " + sln + " = call i64 @zstr_len(i8* " + obj.op + ")");
+                    string sneg = NT();
+                    L("  " + sneg + " = icmp slt i64 " + idx.op + ", 0");
+                    string sge = NT();
+                    L("  " + sge + " = icmp sge i64 " + idx.op + ", " + sln);
+                    string oob = NT();
+                    L("  " + oob + " = or i1 " + sneg + ", " + sge);
+                    soob = oob;
+                }
                 EmitRuntimeCheckIf(lhs, soob, "index out of bounds: string store");
                 string sp = NT();
                 L("  " + sp + " = getelementptr i8, i8* " + obj.op + ", i64 " + idx.op);

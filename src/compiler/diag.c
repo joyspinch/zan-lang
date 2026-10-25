@@ -112,17 +112,37 @@ static zan_diag_entry_t *diag_capture_entry(zan_diag_t *diag, zan_diag_level_t l
     zan_diag_entry_t *e = &diag->entries[diag->entry_count++];
     e->level = level;
     e->loc = loc;
+    e->code = 0;
     e->message[0] = '\0';
     return e;
 }
 
+static void zan_diag_vemit(zan_diag_t *diag, zan_diag_level_t level,
+                           zan_loc_t loc, int code, const char *fmt,
+                           va_list args);
+
 void zan_diag_emit(zan_diag_t *diag, zan_diag_level_t level, zan_loc_t loc,
                    const char *fmt, ...) {
-    char msgbuf[512];
     va_list args;
     va_start(args, fmt);
-    vsnprintf(msgbuf, sizeof(msgbuf), fmt, args);
+    zan_diag_vemit(diag, level, loc, 0, fmt, args);
     va_end(args);
+}
+
+static void zan_diag_vemit(zan_diag_t *diag, zan_diag_level_t level,
+                           zan_loc_t loc, int code, const char *fmt,
+                           va_list args) {
+    char msgbuf[512];
+    char prefix[16];
+    if (code > 0) {
+        snprintf(prefix, sizeof(prefix), "[%c%04d] ",
+                 level == DIAG_WARNING ? 'W' : 'E', code);
+    } else {
+        prefix[0] = '\0';
+    }
+    int plen = (int)strlen(prefix);
+    memcpy(msgbuf, prefix, (size_t)plen);
+    vsnprintf(msgbuf + plen, sizeof(msgbuf) - (size_t)plen, fmt, args);
 
     if (level == DIAG_WARNING && diag->treat_warnings_as_errors) {
         level = DIAG_ERROR;
@@ -171,7 +191,10 @@ void zan_diag_emit(zan_diag_t *diag, zan_diag_level_t level, zan_loc_t loc,
 
     if (diag->capture) {
         zan_diag_entry_t *e = diag_capture_entry(diag, level, loc);
-        if (e) snprintf(e->message, sizeof(e->message), "%s", msgbuf);
+        if (e) {
+            e->code = code;
+            snprintf(e->message, sizeof(e->message), "%s", msgbuf);
+        }
         return;
     }
 
@@ -222,6 +245,14 @@ void zan_diag_emit(zan_diag_t *diag, zan_diag_level_t level, zan_loc_t loc,
 
 bool zan_diag_has_errors(zan_diag_t *diag) {
     return diag->error_count > 0;
+}
+
+void zan_diag_emit_code(zan_diag_t *diag, zan_diag_level_t level, zan_loc_t loc,
+                        int code, const char *fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
+    zan_diag_vemit(diag, level, loc, code, fmt, args);
+    va_end(args);
 }
 
 void zan_compile_trace(const char *fmt, ...) {

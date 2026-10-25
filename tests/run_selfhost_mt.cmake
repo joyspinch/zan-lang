@@ -139,6 +139,11 @@ foreach(_case ${_cases})
     continue()
   endif()
 
+  set(_crypto_lib "")
+  if(EXISTS "${RUNTIME_DIR}/libzancrypto.a")
+    set(_crypto_lib "${RUNTIME_DIR}/libzancrypto.a")
+  endif()
+
   # ---- link against the shipped runtime, the way the C host links win-x64 ----
   file(REMOVE ${_exe})
   execute_process(
@@ -147,6 +152,7 @@ foreach(_case ${_cases})
             "${RUNTIME_DIR}/zanrt_timer.o" "${RUNTIME_DIR}/zanrt_io_mt.o"
             "${RUNTIME_DIR}/zanrt_sync.o" "${RUNTIME_DIR}/zanrt_file.o"
             "${RUNTIME_DIR}/zan_inflate.o" "${RUNTIME_DIR}/zan_embed_api.o"
+            ${_crypto_lib}
             "-L${MINGW_LIB}"
             --start-group
             -lmingw32 -lmoldname -lmingwex -lmsvcrt
