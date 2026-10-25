@@ -37,6 +37,11 @@ struct zan_diag {
     /* 结构化诊断捕获（供 LSP 服务等工具消费） */
     bool              capture;
     bool              treat_warnings_as_errors;
+    /* A382②：--warn-level（0=none 1=default 2=error）与 --suppress 的过滤状态 */
+    int  warn_level;
+    int *suppress_codes;
+    int  suppress_count;
+    int  suppress_cap;
     zan_diag_entry_t *entries;
     int               entry_count;
     int               entry_cap;
@@ -51,6 +56,10 @@ struct zan_diag {
 
 zan_diag_t *zan_diag_new(zan_arena_t *arena);
 void zan_diag_set_deny_warnings(zan_diag_t *diag, bool enabled);
+/* A382②：告警级别开关。0=none（告警不打印不计数）1=default 2=error（升级为错） */
+void zan_diag_set_warn_level(zan_diag_t *diag, int level);
+/* 抑制指定编号的诊断（--suppress=W0003,E0030；按编号匹配，级别字母可省略） */
+void zan_diag_suppress_code(zan_diag_t *diag, int code);
 
 /* 诊断信息输出条数上限 */
 void zan_diag_set_max_errors(zan_diag_t *diag, int max_errors);

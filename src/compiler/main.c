@@ -4275,6 +4275,8 @@ static void print_usage(void) {
     fprintf(stderr, "  --no-runtime-checks  Disable runtime guards (e.g. division by zero)\n");
     fprintf(stderr, "  --strict-runtime  Guard failures exit(70) without ZAN_RT_HARD=1\n");
     fprintf(stderr, "  --deny-warnings   Treat compiler warnings as fatal errors\n");
+    fprintf(stderr, "  --warn-level <lv> none | default | error (error = --deny-warnings)\n");
+    fprintf(stderr, "  --suppress <list> Suppress diagnostics by code, e.g. W0003,E0030 (letter optional)\n");
     fprintf(stderr, "  --publish        Build optimized release binary (strip debug, optimize)\n");
     fprintf(stderr, "  --strip-symbols  Strip debug and non-exported symbols at link time\n");
     fprintf(stderr, "  --hide-diagnostics Suppress source file paths/lines in runtime guard reports\n");
@@ -4495,6 +4497,8 @@ int main(int argc, char **argv) {
     const char *package_project = NULL;
     bool package_list_missing = false;
     bool do_deny_warnings = false;
+    const char *warn_level_arg = NULL;   /* A382② --warn-level */
+    const char *suppress_arg = NULL;     /* A382② --suppress */
     zan_pkg_scope_t package_scope = ZAN_PKG_SCOPE_PROJECT;
     int opt_level = -1;
 #define ZAN_MAX_PP_DEFINES 1024
@@ -4558,6 +4562,14 @@ int main(int argc, char **argv) {
             strict_runtime = true;
         } else if (strcmp(argv[i], "--deny-warnings") == 0) {
             do_deny_warnings = true;
+        } else if (strncmp(argv[i], "--warn-level=", 13) == 0) {
+            warn_level_arg = argv[i] + 13;
+        } else if (strcmp(argv[i], "--warn-level") == 0 && i + 1 < argc) {
+            warn_level_arg = argv[++i];
+        } else if (strncmp(argv[i], "--suppress=", 11) == 0) {
+            suppress_arg = argv[i] + 11;
+        } else if (strcmp(argv[i], "--suppress") == 0 && i + 1 < argc) {
+            suppress_arg = argv[++i];
         } else if (strcmp(argv[i], "--publish") == 0) {
             publish_mode = true;
         } else if (strcmp(argv[i], "--obfuscate-strings") == 0) {
@@ -4945,6 +4957,40 @@ int main(int argc, char **argv) {
     g_main_arena = arena;
     zan_diag_t *diag = zan_diag_new(arena);
     zan_diag_set_deny_warnings(diag, do_deny_warnings);
+    /* A382②：--warn-level none|default|error（error 兼容 --deny-warnings）；
+     * --suppress 逗号分隔诊断编号（W0003 / 3 皆可，字母仅作文档）。 */
+    {
+        int warn_level = 1;
+        if (warn_level_arg) {
+            if (strcmp(warn_level_arg, "none") == 0) warn_level = 0;
+            else if (strcmp(warn_level_arg, "default") == 0) warn_level = 1;
+            else if (strcmp(warn_level_arg, "error") == 0) {
+                warn_level = 2;
+                do_deny_warnings = true;
+                zan_diag_set_deny_warnings(diag, true);
+            } else {
+                fprintf(stderr,
+                        "error: unknown --warn-level '%s' (none|default|error)\n",
+                        warn_level_arg);
+                return 2;
+            }
+        }
+        zan_diag_set_warn_level(diag, warn_level);
+        if (suppress_arg) {
+            const char *p = suppress_arg;
+            while (*p) {
+                while (*p == ',' || *p == ' ') p++;
+                if (!*p) break;
+                const char *tok = p;
+                while (*p && *p != ',' && *p != ' ') p++;
+                int code = 0;
+                for (const char *q = tok; q < p; q++) {
+                    if (*q >= '0' && *q <= '9') code = code * 10 + (*q - '0');
+                }
+                if (code > 0) zan_diag_suppress_code(diag, code);
+            }
+        }
+    }
     if (error_limit >= 0) zan_diag_set_max_errors(diag, error_limit);
 
     zan_ast_node_t *ast = NULL;

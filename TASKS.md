@@ -92,6 +92,18 @@
     （3000–3999）、互操作段（4000–4999）照同法推进；然后 ② `--warn-level`、
     ③ `#pragma warning`、④ `Marshal`。
 
+- **② 已落地（2026-10-25）——`--warn-level` 与 `--suppress`**：
+  - `--warn-level none|default|error`（`error` 兼容 `--deny-warnings`）；
+    `--suppress=W0003,E0030` 按诊断编号抑制（级别字母可省略，按编号匹配）。
+  - 机制：`zan_diag_set_warn_level` / `zan_diag_suppress_code`（diag.c/diag.h），
+    过滤在计数前丢弃、只作用于非 capture 路径（LSP 照常入表自行决定显示）；
+    抑制按编号匹配，未编号诊断（16 个 checker 告警待 2000 段编号）暂不受
+    影响，编号落地后自动被覆盖。
+  - 锁形用例 `diag_warn_level_error`（run_compile_error + ZANC_ARGS）。
+  - 验证：探针六发——default 打印、none 静默、error 升级 rc=1（升级标志
+    需直接置到 diag 上：set_deny_warnings 在参数解析后已先执行过一次）、
+    W0003/裸 3 两种抑制写法、非法级别报错退出 2。
+
 ### [~] A383 图表引擎整代语义差：官方 470 个 option 键里 278 个（59%）从不读取
 
 - **第一步已落地（2026-10-24）：未知 option 键告警进引擎。**
@@ -619,24 +631,6 @@
 - 框架侧缺口另记 A545（`base.css` 烤进驱动，模板改不动）。
 - 前提：要有可交互的桌面会话（锁屏/远程会话会拿到黑屏），或让子窗口支持
   把 root 暴露给宿主驱动。
-
-### [ ] A545 框架：flex 收缩没有 min-content 下限 + base.css 缺 `shrink-0` 工具类
-- 现象一：`packages/Zan.Gui/src/Gui/Widget/Flex.zan` 的类注释承诺子项可用
-  `shrink-0`（「溢出时不让位」），但全仓搜不到 `shrink-0` 的定义——
-  `packages/Zan.Gui/src/Gui/skins/base.css` 里没有这条规则（`flex-shrink` 属性
-  本身在 `StyleSheet.zan:1369` 是支持的，只是没有这个工具类）。base.css 是烤进
-  驱动的（`src/runtime/main.c` 把皮肤包嵌进 exe），改它要重建 Gui 驱动。
-- 现象二：`Control.zan` 的 flex 收缩段（`free < 0` 分支，约 3527-3564 行）按比例
-  收缩子项，**没有 min-content 下限**（CSS 里 flex 项默认 `min-width:auto`，
-  即 min-content，图标钮不该被缩到图标以下）。停靠子项更极端：`Control.zan`
-  约 2890 行的 `FitSize(c.DockSize(availW, true), availW)` 把停靠子项裁到「剩余
-  宽」，剩余宽不足时直接给 **0 宽**——0 宽按钮既看不见也点不着（WinForms 的
-  ToolStrip 是溢出而不是压扁）。
-- 候选修法（需专门一轮，带 IDE 截图验证）：① base.css 补 `.shrink-0 { flex-shrink:
-  0; }`（与 Flex 注释对齐）+ 重建驱动；② flex 收缩加 min-content 下限（近似取子项
-  自然尺寸的最小值——图标钮按图标尺寸、文本钮按文字宽度）；③ 停靠子项不再被
-  `FitSize` 裁到 0 宽（不足时溢出或隐藏，而不是 0 宽）。
-- 模板侧已用等价的全局规则绕开（gui-wechat 皮肤层 `.shrink-0`），修法见 A544。
 
 ### [ ] A546 框架：普通 HTML 里的 `<label>` 是元素，静态文字排不出来
 - 现象：微聊模板的**登录窗**实机渲染缺字——标题「微 聊」与三个入口

@@ -19,6 +19,10 @@ zan_diag_t *zan_diag_new(zan_arena_t *arena) {
     d->file_count = 0;
     d->capture = false;
     d->treat_warnings_as_errors = false;
+    d->warn_level = 1; /* default：告警照常打印（A382②） */
+    d->suppress_codes = NULL;
+    d->suppress_count = 0;
+    d->suppress_cap = 0;
     d->entries = NULL;
     d->entry_count = 0;
     d->entry_cap = 0;
@@ -78,6 +82,30 @@ void zan_diag_set_deny_warnings(zan_diag_t *diag, bool enabled) {
     if (diag) diag->treat_warnings_as_errors = enabled;
 }
 
+void zan_diag_set_warn_level(zan_diag_t *diag, int level) {
+    if (diag) diag->warn_level = level;
+}
+
+void zan_diag_suppress_code(zan_diag_t *diag, int code) {
+    if (!diag || code <= 0) return;
+    if (diag->suppress_count == diag->suppress_cap) {
+        int ncap = diag->suppress_cap ? diag->suppress_cap * 2 : 8;
+        int *grown = (int *)realloc(diag->suppress_codes,
+                                    sizeof(int) * (size_t)ncap);
+        if (!grown) return;
+        diag->suppress_codes = grown;
+        diag->suppress_cap = ncap;
+    }
+    diag->suppress_codes[diag->suppress_count++] = code;
+}
+
+static int zan_diag_code_suppressed(const zan_diag_t *diag, int code) {
+    for (int i = 0; i < diag->suppress_count; i++) {
+        if (diag->suppress_codes[i] == code) return 1;
+    }
+    return 0;
+}
+
 int zan_diag_entry_count(const zan_diag_t *diag) {
     return diag->entry_count;
 }
@@ -92,6 +120,10 @@ void zan_diag_free_buffers(zan_diag_t *diag) {
     diag->entries = NULL;
     diag->entry_count = 0;
     diag->entry_cap = 0;
+    free(diag->suppress_codes);
+    diag->suppress_codes = NULL;
+    diag->suppress_count = 0;
+    diag->suppress_cap = 0;
     free((void *)diag->file_names);
     free((void *)diag->file_sources);
     diag->file_names = NULL;
@@ -146,6 +178,13 @@ static void zan_diag_vemit(zan_diag_t *diag, zan_diag_level_t level,
 
     if (level == DIAG_WARNING && diag->treat_warnings_as_errors) {
         level = DIAG_ERROR;
+    }
+
+    /* A382②：--warn-level=none 与 --suppress 的告警过滤，在计数前丢弃。
+     * capture 模式（LSP）不受过滤，照常入表——过滤是 zanc 的打印/计数策略。 */
+    if (level == DIAG_WARNING && !diag->capture) {
+        if (diag->warn_level == 0) return;
+        if (code > 0 && zan_diag_code_suppressed(diag, code)) return;
     }
 
     if (level == DIAG_ERROR) {

@@ -1318,6 +1318,18 @@ add_test(NAME diag_builtin_name_shadow_delegate
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_builtin_name_shadow_delegate PROPERTIES TIMEOUT 60)
 
+# A382②: --warn-level=error must upgrade #warning to a fatal error (the
+# compile fails and the diagnostic keeps its original W-letter prefix).
+add_test(NAME diag_warn_level_error
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/warn_level_error.zan
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/diag_warn_level_error${_exe_ext}
+    -DZANC_ARGS=--warn-level=error
+    "-DEXPECT_REGEX=W0003. #warning hello"
+    -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
+set_tests_properties(diag_warn_level_error PROPERTIES TIMEOUT 60)
+
 add_test(NAME diag_unary_tilde_string
   COMMAND ${CMAKE_COMMAND}
     -DZANC=$<TARGET_FILE:zanc>
