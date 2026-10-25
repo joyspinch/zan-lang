@@ -400,9 +400,34 @@ static int expr_yields_delegate_value(zan_irgen_t *g, zan_ast_node_t *e,
            (ms->decl->method_decl.modifiers & MOD_STATIC) == 0;
 }
 
+/* A556-1：登记/查询发生过隐式装箱的表达式节点（zan_irgen_t::boxed_exprs，
+ * arena 分配——装箱本身就是低频路径，线性查表足够）。 */
+static void irgen_note_boxed_expr(zan_irgen_t *g, zan_ast_node_t *e) {
+    if (!g || !e) return;
+    if (g->boxed_expr_count >= g->boxed_expr_cap) {
+        int ncap = g->boxed_expr_cap ? g->boxed_expr_cap * 2 : 16;
+        zan_ast_node_t **nv = (zan_ast_node_t **)zan_arena_alloc(
+            g->arena, (size_t)ncap * sizeof(*nv));
+        for (int i = 0; i < g->boxed_expr_count; i++) nv[i] = g->boxed_exprs[i];
+        g->boxed_exprs = nv;
+        g->boxed_expr_cap = ncap;
+    }
+    g->boxed_exprs[g->boxed_expr_count++] = e;
+}
+
+static int irgen_expr_was_boxed(zan_irgen_t *g, zan_ast_node_t *e) {
+    if (!g || !e) return 0;
+    for (int i = 0; i < g->boxed_expr_count; i++)
+        if (g->boxed_exprs[i] == e) return 1;
+    return 0;
+}
+
 static int expr_yields_owned_rc_value(zan_irgen_t *g, zan_ast_node_t *e,
                                       local_scope_t *locals) {
     if (!e) return 0;
+    /* A556-1：隐式装箱过的表达式产出 fresh owned 堆箱——消费方不得再
+     * retain（与下面装箱 cast 的显式形态同一口径）。 */
+    if (irgen_expr_was_boxed(g, e)) return 1;
     if (e->kind == AST_CAST_EXPR) {
         /* 装箱 cast（A454/A556-3）：`(object)structValue` 分配新堆箱，
          * 结果是 fresh owned 指针——消费方（object 变量/字段捕获）不得
@@ -631,6 +656,13 @@ static int call_arg_is_owned_temp(zan_irgen_t *g, zan_ast_node_t *arg,
 static void emit_release_owned_call_temp(zan_irgen_t *g, zan_ast_node_t *arg,
                                          LLVMValueRef val, local_scope_t *locals) {
     if (!arg || !locals || !val) return;
+    /* A556-1：实参位置发生的隐式装箱——传出去的是 fresh 堆箱临时，
+     * 被调方按借用协议不释放参数，调用方在调用后释放。必须先于
+     * local-ident 早退（装箱的正是那个局部变量的临时箱）。 */
+    if (irgen_expr_was_boxed(g, arg)) {
+        emit_release_obj_value(g, val);
+        return;
+    }
     if (LLVMGetTypeKind(LLVMTypeOf(val)) == LLVMStructTypeKind) {
         zan_type_t *st = infer_expr_type(g, arg, locals);
         if (st && st->kind == TYPE_STRUCT &&
@@ -1108,6 +1140,9 @@ static void emit_rc_store_field(zan_irgen_t *g, zan_type_t *type,
                                 LLVMValueRef field_ptr, LLVMValueRef v,
                                 zan_ast_node_t *rhs, local_scope_t *locals,
                                 int is_weak) {
+    /* A556-1 隐式装箱：object/接口字段收值形状右值。箱 fresh owned
+     * （rhs 节点进 boxed 集合），字段捕获协议不再 retain。 */
+    v = emit_implicit_box(g, type, v, rhs, locals);
     LLVMTypeRef vt = LLVMTypeOf(v);
     LLVMTypeRef slot_t = LLVMTypeOf(field_ptr);
     LLVMTypeRef elem_t = vt;

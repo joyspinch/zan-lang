@@ -5451,6 +5451,30 @@ static LLVMValueRef emit_struct_elem_ptr(zan_irgen_t *g, zan_ast_node_t *expr,
 
 static LLVMValueRef emit_ref_lvalue_ptr(zan_irgen_t *g, zan_ast_node_t *tgt,
                                         local_scope_t *locals);
+static bool irgen_boxed_eligible_struct(zan_irgen_t *g, zan_type_t *t);
+static LLVMValueRef emit_box_struct(zan_irgen_t *g, zan_type_t *st,
+                                    zan_ast_node_t *src_expr,
+                                    LLVMValueRef val, local_scope_t *locals);
+
+/* A556-1 隐式装箱：值形状（struct 聚合）流向 object/接口槽时自动装箱。
+ * C# 同语义：隐式装箱等价一次隐藏的 (object) cast——箱是新堆对象
+ * （fresh owned），消费方不再 retain；箱内字段对来源 retain/转移的判定
+ * 由 emit_box_struct 按操作数 owned 性处理。目标不是引用槽或值已是
+ * 指针时原样返回。装箱发生后把 RHS 节点登记进 boxed 集合
+ * （irgen_note_boxed_expr），下游所有权判定按 owned 走。 */
+static LLVMValueRef emit_implicit_box(zan_irgen_t *g, zan_type_t *lt,
+                                      LLVMValueRef val, zan_ast_node_t *rhs,
+                                      local_scope_t *locals) {
+    if (!val || !lt || !rhs) return val;
+    if (lt->kind != TYPE_OBJECT && lt->kind != TYPE_INTERFACE) return val;
+    if (LLVMGetTypeKind(LLVMTypeOf(val)) == LLVMPointerTypeKind) return val;
+    zan_type_t *st = infer_expr_type(g, rhs, locals);
+    if (!st || st->kind != TYPE_STRUCT || !irgen_boxed_eligible_struct(g, st))
+        return val;
+    irgen_note_boxed_expr(g, rhs);
+    return emit_box_struct(g, st, rhs, val, locals);
+}
+
 
     static LLVMValueRef emit_expr_assignment(zan_irgen_t *g, zan_ast_node_t *expr,
             local_scope_t *locals) {
@@ -5516,6 +5540,11 @@ static LLVMValueRef emit_ref_lvalue_ptr(zan_irgen_t *g, zan_ast_node_t *tgt,
                     }
                 }
             }
+            /* A556-1 隐式装箱：值形状流向 object/接口槽（局部/静态字段/
+             * 裸名/索引目标统一在此收口）。箱是 fresh owned 堆对象——
+             * emit_implicit_box 会把 RHS 节点登记进 boxed 集合，下游
+             * 所有权判定按 owned 走，不再对箱 retain。 */
+            right = emit_implicit_box(g, lt, right, expr->binary.right, locals);
         }
 binding_lowered:
         if (expr->binary.left->kind == AST_IDENTIFIER) {
@@ -5865,6 +5894,9 @@ binding_lowered:
                         /* 可空元素槽写入：将标量值封装为可空结构体 */
                         if (et && et->kind == TYPE_NULLABLE)
                             stored = coerce_int_to(g, stored, elem_llvm);
+                        /* A556-1 隐式装箱：object/接口元素数组收值形状右值 */
+                        stored = emit_implicit_box(g, et, stored,
+                                                   expr->binary.right, locals);
                         LLVMTypeKind slot_k = LLVMGetTypeKind(elem_llvm);
                         LLVMTypeKind val_k = LLVMGetTypeKind(LLVMTypeOf(stored));
                         if (et && is_rc_managed_type(et)) {
@@ -11555,19 +11587,23 @@ static bool irgen_boxed_eligible_struct(zan_irgen_t *g, zan_type_t *t) {
     return true;
 }
 
-/* 装箱：值结构体 → 堆对象。布局契约：载荷从 user_ptr+0 原样存放——
- * build_class_release_body 对 SYM_STRUCT 的字段偏移正是
- * class_vptr_offset(sym)=0（即 user_ptr+0），释放函数零改动即可释放
- * 装箱对象；`is`/拆箱的 tag 走描述符名表（装箱 site 的 tynames 首项
- * 就是结构体名，见 zan_irgen_emit_arc_desc_init 的继承链遍历）。
- * 头部由 zan_rt_alloc 统一布置：raw[0..7]=引用计数、raw[8..15]=site 字。
- * 托管字段结构体（A556-3）同一协议：来源非 owned 时对托管字段
- * retain，箱的释放函数按字段 walk 释放（含嵌套结构体下钻）。 */
+/* 装箱：值结构体 → 堆对象。布局契约（A556-2 基座）：首字 = 结构体
+ * vtable 全局地址——接口分派按接收者首字做身份 tag 比对（类对象是
+ * vptr，箱此前没有这个字，tag 是载荷前 8 字节当指针，命中不了任何
+ * 候选）；载荷随之后移到 +8，拆箱与箱释放函数按 +8 取载荷
+ * （emit_unbox_struct / build_class_release_body 的 SYM_STRUCT 分支）。
+ * `is`/拆箱的 tag 走描述符名表（装箱 site 的 tynames 首项就是结构体名，
+ * 见 zan_irgen_emit_arc_desc_init 的继承链遍历），基于头部不受载荷
+ * 位移影响。头部由 zan_rt_alloc 统一布置：raw[0..7]=引用计数、
+ * raw[8..15]=site 字。托管字段结构体（A556-3）同一协议：来源非 owned
+ * 时对托管字段 retain，箱的释放函数按字段 walk 释放（含嵌套结构体
+ * 下钻）。 */
 static LLVMValueRef emit_box_struct(zan_irgen_t *g, zan_type_t *st,
                                     zan_ast_node_t *src_expr,
                                     LLVMValueRef val, local_scope_t *locals) {
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
     LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
+    LLVMTypeRef i8 = LLVMInt8TypeInContext(g->ctx);
     LLVMTypeRef lt = map_type(g, st);
     LLVMValueRef sval = coerce_struct_value(g, val, st);
     if (!lt || LLVMGetTypeKind(lt) != LLVMStructTypeKind ||
@@ -11583,12 +11619,18 @@ static LLVMValueRef emit_box_struct(zan_irgen_t *g, zan_type_t *st,
     snprintf(nbuf, sizeof(nbuf), "box:%.*s",
              (int)st->name.len, st->name.str ? st->name.str : "?");
     LLVMTypeRef alloc_ty = LLVMGlobalGetValueType(g->rt_alloc);
+    LLVMValueRef sz8 = LLVMConstAdd(LLVMSizeOf(lt), LLVMConstInt(i64, 8, 0));
     LLVMValueRef raw = zan_call2(g->builder, alloc_ty, g->rt_alloc,
-        (LLVMValueRef[]){ LLVMSizeOf(lt), arc_site_arg(g, site),
+        (LLVMValueRef[]){ sz8, arc_site_arg(g, site),
                           zan_irgen_intern_string(g, nbuf) }, 3, "box.alloc");
+    LLVMValueRef tag_slot = LLVMBuildBitCast(g->builder, raw,
+        LLVMPointerType(i8ptr, 0), "box.vps");
+    LLVMBuildStore(g->builder, get_vtable_global(g, st->sym), tag_slot);
+    LLVMValueRef eight = LLVMConstInt(i64, 8, 0);
     /* 空载荷结构体（{}）跳过 store：零大小 store 非法 */
     if (LLVMCountStructElementTypes(lt) > 0) {
-        LLVMValueRef slot = LLVMBuildBitCast(g->builder, raw,
+        LLVMValueRef p8 = LLVMBuildGEP2(g->builder, i8, raw, &eight, 1, "box.pl");
+        LLVMValueRef slot = LLVMBuildBitCast(g->builder, p8,
             LLVMPointerType(lt, 0), "box.slot");
         LLVMBuildStore(g->builder, sval, slot);
         /* 载荷里的引用归堆对象所有；来源是既有变量（非构造临时）时
@@ -11618,7 +11660,12 @@ static LLVMValueRef emit_unbox_struct(zan_irgen_t *g, zan_type_t *tt,
     LLVMBasicBlockRef m_bb = LLVMAppendBasicBlockInContext(g->ctx, cfn, "unbox.m");
     LLVMBuildCondBr(g->builder, ok, ok_bb, bad_bb);
     LLVMPositionBuilderAtEnd(g->builder, ok_bb);
-    LLVMValueRef slot = LLVMBuildBitCast(g->builder, val,
+    /* A556-2：箱首字是 vtable tag，载荷在 +8（emit_box_struct 布局契约） */
+    LLVMValueRef p8 = LLVMBuildGEP2(g->builder,
+        LLVMInt8TypeInContext(g->ctx), val,
+        (LLVMValueRef[]){ LLVMConstInt(LLVMInt64TypeInContext(g->ctx), 8, 0) },
+        1, "unbox.p8");
+    LLVMValueRef slot = LLVMBuildBitCast(g->builder, p8,
         LLVMPointerType(lt, 0), "unbox.p");
     LLVMValueRef good = LLVMBuildLoad2(g->builder, lt, slot, "unbox.v");
     LLVMBuildBr(g->builder, m_bb);
@@ -13647,6 +13694,8 @@ static LLVMValueRef emit_arg_typed(zan_irgen_t *g, zan_ast_node_t *arg,
     LLVMValueRef v = emit_expr(g, arg, locals);
     if (v && ptype && atype)
         v = emit_user_conversion(g, atype, ptype, "op_implicit", v, arg, locals);
+    /* A556-1 隐式装箱：值形状实参流向 object/接口形参 */
+    v = emit_implicit_box(g, ptype, v, arg, locals);
     if (v && ptype && (ptype->kind == TYPE_DOUBLE || ptype->kind == TYPE_FLOAT) &&
         LLVMGetTypeKind(LLVMTypeOf(v)) == LLVMIntegerTypeKind &&
         LLVMGetIntTypeWidth(LLVMTypeOf(v)) > 1)

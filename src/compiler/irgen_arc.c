@@ -402,6 +402,10 @@ static void emit_collection_slot_store(zan_irgen_t *g, zan_type_t *elem_type,
     if (elem_type && elem_type->kind == TYPE_DECIMAL &&
         LLVMGetTypeKind(LLVMTypeOf(value)) == LLVMIntegerTypeKind)
         value = coerce_to_decimal(g, value);
+    /* A556-1 隐式装箱：object/接口元素槽收值形状实参——List.Add/索引器/
+     * Dict 的内联快路径不经过 emit_arg_typed，在此统一收口。箱 fresh
+     * owned（rhs 节点进 boxed 集合），元素槽捕获协议不再 retain。 */
+    value = emit_implicit_box(g, elem_type, value, rhs, locals);
     LLVMValueRef old = NULL;
     if (overwrite_old) {
         old = elem_kind == LLVMStructTypeKind
@@ -918,6 +922,15 @@ static void build_class_release_body(zan_irgen_t *g, zan_symbol_t *sym,
     LLVMBuildCondBr(b, weak_ok, relf, ret);
     LLVMPositionBuilderAtEnd(b, relf);
     LLVMValueRef self = LLVMBuildBitCast(b, obj, LLVMPointerType(structT, 0), "self");
+    if (sym->kind == SYM_STRUCT) {
+        /* A556-2：箱首字是 vtable tag（emit_box_struct 布局契约），载荷
+         * 在 +8——字段 walk 先跳过 tag 字。类不走这里（class_vptr_offset
+         * 已把 vptr 计为 0 号字段）。 */
+        LLVMValueRef p8 = LLVMBuildGEP2(b, LLVMInt8TypeInContext(c), obj,
+            (LLVMValueRef[]){ LLVMConstInt(LLVMInt64TypeInContext(c), 8, 0) },
+            1, "box.p8");
+        self = LLVMBuildBitCast(b, p8, LLVMPointerType(structT, 0), "self.p8");
+    }
     int fi = class_vptr_offset(sym);
     for (int i = 0; i < sym->member_count; i++) {
         zan_symbol_t *m = sym->members[i];

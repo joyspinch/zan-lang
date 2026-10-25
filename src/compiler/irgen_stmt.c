@@ -776,6 +776,7 @@ static int emit_boxed_var_decl(zan_irgen_t *g, zan_ast_node_t *stmt,
              stmt->var_decl.initializer->kind == AST_LAMBDA)
                 ? emit_lambda_typed(g, stmt->var_decl.initializer, type, locals)
                 : emit_expr(g, stmt->var_decl.initializer, locals);
+        init = emit_implicit_box(g, type, init, stmt->var_decl.initializer, locals);
         if (rc)
             emit_rc_capture_local(g, type, slot, init,
                                   stmt->var_decl.initializer, locals);
@@ -1301,6 +1302,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                 LLVMTypeRef llvm_t = map_type(g, type);
                 LLVMValueRef slot = emit_entry_alloca(g, llvm_t, "var");
                 zan_store_fit(g, LLVMConstNull(llvm_t), slot);
+                init_val = emit_implicit_box(g, type, init_val, init, locals);
                 emit_rc_capture_local(g, type, slot, init_val, init, locals);
                 local_add(locals, stmt->var_decl.name, slot, type);
                 arc_own_local(g, locals);
@@ -1323,6 +1325,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                 LLVMTypeRef llvm_t = map_type(g, type);
                 LLVMValueRef slot = emit_entry_alloca(g, llvm_t, "var");
                 zan_store_fit(g, LLVMConstNull(llvm_t), slot);
+                init_val = emit_implicit_box(g, type, init_val, init, locals);
                 emit_rc_capture_local(g, type, slot, init_val, init, locals);
                 local_add(locals, stmt->var_decl.name, slot, type);
                 arc_own_local(g, locals);
@@ -1401,6 +1404,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                 }
             }
             if (arc_own) {
+                init_val = emit_implicit_box(g, type, init_val, init_src, locals);
                 emit_rc_capture_local(g, type, alloca, init_val,
                     (conv_owned || bind_owned)
                         ? owned_rhs_marker(g, init_src->loc) : init_src,
@@ -1659,7 +1663,15 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                 zan_type_t *value_type = concretize(g,
                     infer_expr_type(g, stmt->ret.value, locals));
                 if (!ret_type) ret_type = value_type;
-                if (type_contains_collection_rc(g, value_type, 0) &&
+                /* A556-1 隐式装箱：object/接口异步返回类型收值形状——箱是
+                 * fresh owned，跳过来源 retain（ARC 移交语义）。 */
+                LLVMValueRef boxed = g->current_async_ret_type
+                    ? emit_implicit_box(g, g->current_async_ret_type, rv,
+                                        stmt->ret.value, locals) : rv;
+                if (boxed != rv) {
+                    rv = boxed;
+                    ret_type = g->current_async_ret_type;
+                } else if (type_contains_collection_rc(g, value_type, 0) &&
                     !expr_yields_owned_rc_value(g, stmt->ret.value, locals))
                     emit_collection_value_retain(g, value_type, rv, 0);
                 rv = coerce_async_ret(g, rv);
@@ -1687,6 +1699,17 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                     val = emit_user_conversion(g, vty, g->current_fn_zan_ret_type,
                                                "op_implicit", val,
                                                stmt->ret.value, locals);
+                    conv_ret = true;
+                }
+            }
+            /* A556-1 隐式装箱：结构体值流向 object/接口返回类型——箱是
+             * fresh owned 堆对象，按 conv_ret 交 ARC 移交契约（不再对
+             * 返回值 retain）。 */
+            if (g->current_fn_zan_ret_type) {
+                LLVMValueRef boxed = emit_implicit_box(g,
+                    g->current_fn_zan_ret_type, val, stmt->ret.value, locals);
+                if (boxed != val) {
+                    val = boxed;
                     conv_ret = true;
                 }
             }

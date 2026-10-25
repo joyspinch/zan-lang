@@ -328,6 +328,15 @@ struct zan_irgen {
     zan_ast_list_t *cur_mtps;
     zan_type_t    **cur_mbind;
 
+    /* A556-1 隐式装箱：发生过装箱的表达式节点。箱是 fresh owned 堆
+     * 对象，但下游所有权判定（emit_rc_capture_local / 集合槽捕获 / 字段
+     * 捕获 / 实参释放协议）只能看 AST 的 owned 性——按 AST 判会当成
+     * 借用再 retain 一次，rc=2、释放只减 1，箱泄漏。登记后
+     * expr_yields_owned_rc_value 对这些节点直接判 owned。 */
+    zan_ast_node_t **boxed_exprs;
+    int boxed_expr_count;
+    int boxed_expr_cap;
+
     LLVMValueRef rt_retain;      /* zan_rt_retain(void*) */
     LLVMValueRef rt_release;     /* zan_rt_release(void*) */
     LLVMValueRef rt_release_dyn;

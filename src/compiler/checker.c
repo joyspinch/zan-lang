@@ -1328,6 +1328,8 @@ static bool checker_type_is_binding(zan_type_t *t) {
            memcmp(t->name.str, "Binding", 7) == 0 && t->type_arg_count == 1;
 }
 
+static bool checker_struct_boxable(zan_type_t *t, int depth);
+
 static bool checker_type_assignable(zan_type_t *target, zan_type_t *value) {
     if (!target || !value) return true;
     if (target == value) return true;
@@ -1433,7 +1435,11 @@ static bool checker_type_assignable(zan_type_t *target, zan_type_t *value) {
         return value->kind == TYPE_ARRAY &&
                checker_type_equal(target->element_type, value->element_type);
     case TYPE_OBJECT:
-        return checker_type_is_ref(value);
+        if (checker_type_is_ref(value)) return true;
+        /* A556-1 隐式装箱：boxable 结构体流向 object 自动装箱
+         * （irgen 在赋值/初始化/传参/返回/集合槽等流动点经
+         * emit_implicit_box 落地） */
+        return value->kind == TYPE_STRUCT && checker_struct_boxable(value, 0);
     default:
         return false;
     }

@@ -110,7 +110,7 @@
   双绿；探针族（box_probe/stress/min/c4/b5/c1/managed/cls）全过。
 - 关联：A449、A434、A556。
 
-### [ ] A556 装箱 v2：隐式装箱、装箱值方法分派（v1 边界的剩余两件）
+### [x] A556 装箱 v2：隐式装箱、装箱值方法分派（v1 边界的剩余两件）
 
 - ~~含托管字段的结构体装箱~~ **已闭环（2026-10-26，A556-3）**：checker
   `checker_struct_boxable` 放开托管字段（仅保留 TYPE_TYPE_PARAM 拒绝），
@@ -124,14 +124,52 @@
   作用域释放只减到 1，箱泄漏）；`emit_box_struct` 的字段 retain 改判
   **操作数**的 owned 性。验证：`struct_boxing_managed`（+det 孪生）双绿，
   探针 t2/t6/m6 leakcheck 干净。
-- 剩余两件：
-  1. **隐式装箱**：值类型赋给 `object`/接口变量、作 object 形参传参时自动
-     装箱（当前必须写 `(object)s`，少写即 E2070）；
-  2. **装箱值的虚方法分派**：`object.ToString()`/`Equals` 在箱上应分发到
-     结构体的重写（当前箱上只有 payload，没有方法表——引用型 object 的
-     vtable 槽位对结构体箱是空的）。
-- `Zan.Messaging` 的"统一请求-响应 + 擦除结果"（A449/A434 的原始诉求）在
-  v1 的显式 cast 下已可用；v2 是体验补齐。
+- ~~隐式装箱~~ **已闭环（2026-10-26，A556-1）**：checker
+  `checker_type_assignable` 的 TYPE_OBJECT 分支放行 boxable 结构体；
+  irgen 新增 `emit_implicit_box`（目标 object/接口 + 值形状 + boxable 才
+  落箱），挂在六类流动点：赋值分派器、声明初始化三路径（ptr-class/var/
+  通用 arc_own）、调用实参（emit_arg_typed）、集合元素槽
+  （emit_collection_slot_store——List.Add/索引器/Dict 内联快路径不经
+  emit_arg_typed，必须收在这）、字段写入（emit_rc_store_field）、普通与
+  异步返回（async 路径箱后 ret_type 收敛为声明类型）。配套所有权协议：
+  装箱节点登记进 `zan_irgen_t::boxed_exprs`，`expr_yields_owned_rc_value`
+  查表判 owned（箱 fresh，消费方不得再 retain）；装箱实参是堆临时——
+  `emit_release_owned_call_temp` 在 local-ident 早退**之前**查表并按
+  object 释放（被调方借用不释放参数）。
+- 箱布局升级（分派基座）：**首字 = 结构体 vtable 全局地址，载荷 +8**。
+  接口分派按接收者首字做身份 tag 比对，箱此前没有这个字（tag 是载荷前
+  8 字节当指针，永远命中不了候选）；tag 匹配后结构体方法的 this 指向
+  载荷（+8），接口分派单候选与链式两处都做了 SYM_STRUCT 校正。
+  `is`/拆箱 tag 走描述符名表（头部），不受载荷位移影响；拆箱读载荷改
+  +8，箱释放函数对 SYM_STRUCT 先 GEP 8 再按结构体布局下钻。
+  **修复了潜伏段错误**：checker 早已放行 struct→接口（derives_from），
+  但 irgen 把聚合值裸塞进指针槽、接口调用解引用垃圾——
+  `IShape f = s; f.Area()` 直接 crash（探针 i2 复现→修复后输出 9）。
+- 验证：`struct_boxing_implicit` 新用例（object/接口变量 + 接口分派 +
+  传参 + 返回 + 字段 + object[] 元素 + List<object>.Add + is + 拆箱，
+  含托管字段结构体）+det 孪生双绿；async 族 111 例全绿；
+  struct_boxing/struct_boxing_managed 孪生在新布局下依旧双绿；
+  13 个 `_scratch` 探针（含 arg/slot/field/array/async 返回逐语句二分）
+  leakcheck 全净。
+- 边界（记录）：整数/枚举/decimal 装箱仍拒（沿用 A454 v1 口径，检查器
+  报错不腐化）；三元无法把 struct 分支与 object 分支统一（E2063 明确
+  报错）；`object.ToString()`/`Equals` 方法族**对任何接收者都还不存在**
+  （纯类对象 `a.ToString()` 也 E3068，与装箱无关）——立 A558。
+
+### [ ] A558 System.Object 方法族：`object` 上无任何可调用成员——ToString/Equals/GetHashCode 连类接收者都绑不上
+
+- 现象（2026-10-26，A556 装箱 v2 收尾时实测）：`object a = new Q();
+  a.ToString()` → **E3068**（no method matches）——`object` 类型的成员
+  访问没有任何解析目标，纯类接收者同样报错，与装箱无关。
+- 影响：C# 的 object 作为通用基底的体验（打印、相等比较、哈希）在 Zan
+  不可用；接口分派所需的身份 tag 机制已就绪（箱首字 = vtable，A556），
+  缺的是 object 虚方法槽位的定义与解析。
+- 方向（动手前先定口径）：Object 内建方法族（ToString/Equals/
+  GetHashCode/GetType）作为 TYPE_OBJECT 的成员表进入 checker 解析；
+  类的 override 按既有 vtable 槽位机制分发（get_virtual_method_index）；
+  箱按 A556 的 vptr 基座参与同一分派；结构体未重写时回落 object 缺省
+  （ToString 返回类型名，C# 同款）。注意与 A443 的内建 Convert.ToString
+  特判让路口径一致（精确匹配让路，其余形状走内建）。
 
 ### [x] A557 object 局部变量赋值不释放旧值（含 `= null`）——连带守卫异常泄漏
 

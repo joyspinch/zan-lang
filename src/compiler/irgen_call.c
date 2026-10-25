@@ -5522,7 +5522,15 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                         LLVMGetParamTypes(cands[0].fnty, pts);
                         int cargc = uargc + 1;
                         LLVMValueRef *ca = (LLVMValueRef *)calloc((size_t)cargc, sizeof(LLVMValueRef));
-                        ca[0] = (npar > 0) ? LLVMBuildBitCast(g->builder, recv, pts[0], "ifc.this") : recv;
+                        /* A556-2：结构体箱的载荷在首字 vtable tag 之后（+8），
+                         * 结构体方法的 this 指向载荷。 */
+                        LLVMValueRef thisv = recv;
+                        if (cands[0].cls->kind == SYM_STRUCT)
+                            thisv = LLVMBuildGEP2(g->builder,
+                                LLVMInt8TypeInContext(c), recv,
+                                (LLVMValueRef[]){ LLVMConstInt(LLVMInt64TypeInContext(c), 8, 0) },
+                                1, "ifc.p8");
+                        ca[0] = (npar > 0) ? LLVMBuildBitCast(g->builder, thisv, pts[0], "ifc.this") : thisv;
                         for (int k = 0; k < uargc; k++)
                             ca[k + 1] = (k + 1 < (int)npar)
                                 ? emit_boundary_coerce(g, avals[k], pts[k + 1]) : avals[k];
@@ -5566,7 +5574,14 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                         LLVMGetParamTypes(cands[ci].fnty, pts);
                         int cargc = uargc + 1;
                         LLVMValueRef *ca = (LLVMValueRef *)calloc((size_t)cargc, sizeof(LLVMValueRef));
-                        ca[0] = (npar > 0) ? LLVMBuildBitCast(g->builder, recv, pts[0], "ifc.this") : recv;
+                        /* A556-2：结构体箱的 this 指向载荷（+8），见单候选分支 */
+                        LLVMValueRef thisv = recv;
+                        if (cands[ci].cls->kind == SYM_STRUCT)
+                            thisv = LLVMBuildGEP2(g->builder,
+                                LLVMInt8TypeInContext(c), recv,
+                                (LLVMValueRef[]){ LLVMConstInt(LLVMInt64TypeInContext(c), 8, 0) },
+                                1, "ifc.p8");
+                        ca[0] = (npar > 0) ? LLVMBuildBitCast(g->builder, thisv, pts[0], "ifc.this") : thisv;
                         for (int k = 0; k < uargc; k++)
                             ca[k + 1] = (k + 1 < (int)npar)
                                 ? emit_boundary_coerce(g, avals[k], pts[k + 1]) : avals[k];

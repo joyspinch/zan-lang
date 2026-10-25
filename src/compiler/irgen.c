@@ -4288,6 +4288,11 @@ static void zan_irgen_compact_completed(zan_irgen_t *g, LLVMValueRef fn) {
     }
 }
 
+/* A556-1 隐式装箱（定义在 irgen_expr.c）：值形状流向 object/接口槽 */
+static LLVMValueRef emit_implicit_box(zan_irgen_t *g, zan_type_t *lt,
+                                      LLVMValueRef val, zan_ast_node_t *rhs,
+                                      local_scope_t *locals);
+
 #include "irgen_expr_core.c"
 #include "irgen_weak.c"
 #include "irgen_arc.c"
