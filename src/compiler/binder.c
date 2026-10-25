@@ -1063,6 +1063,18 @@ zan_symbol_t *zan_binder_lookup(zan_binder_t *b, zan_istr_t name) {
     return scope_find(b->current_scope, name);
 }
 
+/* 类型参数按名字统一（A453 定性）：同名 T 在根作用域先到先得只保留一个
+ * 对象，但全部消费方（binder_type_params_equiv 只比 arity、
+ * checker_unify_method_tp / type_mentions_tp_checker / checker_type_equal
+ * 按 名字 memcmp + kind、irgen 的 di_subst_param 按名字）从不比对对象
+ * 指针，所以"谁的对象被留下"不可观测——文件解析顺序不改变行为
+ * （tests/conformance/type_param_same_name 钉形）。
+ * 这份根作用域注册是 checking 阶段的承重墙：checker 全程不设置
+ * current_scope，resolve_type 的 rt_scope 缓存守卫让方法体内新出现的
+ * 类型引用（局部变量、new、调用实参）全部落回根作用域解析——没有它，
+ * 泛型方法体一律 E1005。不要做"按层隔离"重构：那需要给 checker 全程
+ * 作用域感知，而同名类型参数在按名字统一架构下语义本就相同，隔离
+ * 不产生任何行为差异。 */
 static void register_type_param_list(zan_binder_t *b, zan_ast_list_t *tps) {
     for (int j = 0; j < tps->count; j++) {
         zan_ast_node_t *tp = tps->items[j];

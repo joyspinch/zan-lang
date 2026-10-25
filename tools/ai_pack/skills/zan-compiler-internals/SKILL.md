@@ -249,6 +249,19 @@ description: zanc 编译器内部（parser/checker/irgen/runtime/ABI）设计契
    - 边界：这类错位**必现编译错误**（字符串落进 int 形参），所以"改完必编译"
      就能全量兜住；但脚本层的回读校验能把发现点从"编译失败逐个排查"提前到
      "脚本当场报错"，批量改写一律两条都上。
+16. **类型参数按名字统一是有意架构，不要"按层隔离"重构**：
+   - 动作：遇到"同名 `T` 先到先得"（`register_type_param_list` 在根作用域只留
+     第一个同名对象）时，不要顺手把它改成"方法级注册进方法作用域"的分层隔离——
+     全部消费方（`binder_type_params_equiv` 比 arity、`checker_unify_method_tp` /
+     `checker_type_equal` / irgen `di_subst_param` 按名字 memcmp）从不比对对象
+     指针，同名即同义，谁的对象被留下不可观测。
+   - 理由：checker **全程不设置 `current_scope`**（零处赋值），`resolve_type` 的
+     `rt_scope` 缓存守卫令 checking 阶段方法体内新出现的类型引用全部落回
+     **根作用域**解析——根作用域那份注册是承重墙，拆掉或分层会让泛型方法体
+     一律 E1005（两轮探针 + 静态审计的结论；钉形 conformance 用例
+     type_param_same_name）。
+   - 边界：真正的同名冲突在内建类型层（`class Dict<K,V>` 被 builder 的内建
+     Dict 顶掉），那是内建同名顶掉的问题，与类型参数注册无关。
 ---
 
 ## 二、LLVM 代码生成与指令下沉（IRGen）
