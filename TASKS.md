@@ -74,24 +74,56 @@
   "按层隔离"或拆根注册的重构。
 - 关联：A448（真因不在这里，但同族）、A418、A551（内建同名顶掉，另一回事）。
 
-### [ ] A454 真装箱：值类型 → `object` 的堆对象（带类型描述符）
+### [x] A454 真装箱：值类型 → `object` 的堆对象（v1 闭环：显式 cast + is + 拆箱）
 
-- 背景（2026-10-21 A449 的遗留）：A449 走的是**编译期诊断**路线——值类型装不进
-  `object`，编译期就报错。要让"值类型进 object"成为**可用**能力，需要补装箱
-  设施。
-- 可行路径（已探明，未实施）：
-  - `rt_alloc(16 + payload_size, site_id, site_name)` 分配带头部的堆对象，载荷写在
-    头部之后；
-  - 为该**值类型**注册一个 site（`reserve_arc_site` + 名字写进
-    `__zan_site_names_tbl`）——`is T` 的运行期检查读对象头 `-8` 处的 site 字 →
-    查名字表，**天然可用**；
-  - ARC 回收走 `__zan_site_dtor_tbl`（标量无托管字段 → 空析构即可）；
-  - 需要新增的只有"为值类型注册 site"+"写载荷"+"取回时按类型读载荷"三件事。
-- 要动的面：运行期内存布局、ARC 析构表、反射 / `ToString` / 序列化对装箱值的
-  处理。属于独立战线，不与编译器缺陷修复混提。
-- 影响：没有它，`object` 只能装引用——`Zan.Messaging` 的"统一请求-响应 + 擦除
-  结果"做不了，结果类型必须由泛型端点一路保留（`QueryEndpoint<T, TResult>`）。
-- 关联：A449、A434。
+- **定性：已闭环（2026-10-26）**。无托管字段的结构体支持 `(object)s` 装箱、
+  `o is S` 判定、`(S)o` 显式拆箱；错型拆箱走运行期检查软失败（try 内可捕获，
+  捕获后 EH 状态完好、原有箱继续可用）；`--check-leaks` 干净；一万次装箱
+  拆箱循环正确（box_stress：0+1+…+9999=49995000）。
+- 实现（约定对齐 A449 探明路径）：
+  - checker：`checker_struct_boxable`（无 managed 字段、非 explicit layout、
+    递归校验子结构体）放行 `cast_is_valid` 的 OBJECT 分支；含托管字段的
+    结构体维持 E2070（证据链：box_managed 探针）。
+  - irgen：`emit_box_struct`（`rt_alloc(size_of_payload, desc_site, name)`
+    + 载荷顶格写入 + 托管来源 retain）、`emit_unbox_struct`（`is` 校验 →
+    载荷 load → 失败 `emit_runtime_check` 报
+    "InvalidCastException: object is not an instance of the target struct type"
+    并置零继续）、`emit_runtime_is_check_name` 增加 struct desc 分支。
+  - ARC：装箱结构体也走 `get_class_release_decl` 壳——
+    `emit_all_class_releases` 补第三循环，为非托管非泛型结构体 site 补
+    释放函数体（标量 → 空体，只剩 rc+free），消除 verify 期
+    "release 函数有声明无定义"。
+- **顺带修掉一个潜伏 EH 缺陷（box 探针炸出来的，规则 10 修根因）**：
+  A528 的结构体 ctor 裸武装把 **EH 临时栈深度** 存进 armed 槽，共享 disarm
+  却写回 **EH top**——ctor 正常返回一次就把 `top=-1` 冲成 `0`，此后第一个
+  失败的运行期检查误判"在 try 里"，`longjmp` 进从未 setjmp 的 `bufs[0]`
+  （全零 jmp_buf → rip=0 段错误）。此前未炸只是因为典型程序在第一个失败
+  检查前总跑过 EH 相关代码。修复：armed 条目加 `restore_tmps` 标志，
+  disarm 按类别写回各自的栈顶（irgen.h / irgen_emit.c / irgen_stmt.c）。
+  回归：`case_arc_throw_struct_field`（A528 本尊）仍绿。
+- v1 边界（挂账见 A556）：隐式装箱（赋值/传参自动装）、装箱值的虚方法
+  分派（ToString/Equals 重写）、反射/序列化对装箱值的处理——均不在本期；
+  含托管字段的结构体装箱需先给装箱对象挂"字段释放"析构（当前空体仅
+  适用于标量）。
+- 验证：`tests/conformance/struct_boxing.zan`（box→is→unbox→错型 try 捕获
+  →抛后 EH 完好→循环 5050），`case_struct_boxing` + `case_det_struct_boxing`
+  双绿；探针族（box_probe/stress/min/c4/b5/c1/managed/cls）全过。
+- 关联：A449、A434、A556。
+
+### [ ] A556 装箱 v2：隐式装箱、装箱值方法分派、托管字段结构体装箱
+
+- A454 闭环后的下一期（v1 只做了显式 cast 方向，见上）。缺口三件：
+  1. **隐式装箱**：值类型赋给 `object`/接口变量、作 object 形参传参时自动
+     装箱（当前必须写 `(object)s`，少写即 E2070）；
+  2. **装箱值的虚方法分派**：`object.ToString()`/`Equals` 在箱上应分发到
+     结构体的重写（当前箱上只有 payload，没有方法表——引用型 object 的
+     vtable 槽位对结构体箱是空的）；
+  3. **含托管字段的结构体装箱**：`emit_box_struct` 目前仅适用无托管字段
+     结构体（释放函数空体只减 rc+free）；托管字段结构体装箱需要给箱挂
+     字段级释放析构（`build_class_release_body` 的字段 walk 已就位，缺的是
+     checker 放行 + E2070 收窄）。
+- `Zan.Messaging` 的"统一请求-响应 + 擦除结果"（A449/A434 的原始诉求）在
+  v1 的显式 cast 下已可用；v2 是体验补齐。
 
 ### [ ] A489 GPU 3D 片元着色器把光照写死成固定键光——没有材质与光源 uniform 通路
 

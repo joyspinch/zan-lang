@@ -266,7 +266,10 @@ static void emit_eh_disarm_from(zan_irgen_t *g, int base) {
     } else {
         LLVMValueRef ot = LLVMBuildLoad2(g->builder, i32t,
             g->eh_armed[base].old_top_slot, "eh.old.exit");
-        zan_store_fit(g, ot, top_g);
+        if (g->eh_armed[base].restore_tmps)
+            zan_store_fit(g, ot, get_eh_tmp_top_global(g));
+        else
+            zan_store_fit(g, ot, top_g);
     }
 }
 
@@ -2495,6 +2498,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
         if (g->eh_armed_count < ZAN_MAX_ARMED_TRY) {
             armed_idx = g->eh_armed_count++;
             g->eh_armed[armed_idx].old_top_slot = old_top_slot;
+            g->eh_armed[armed_idx].restore_tmps = false;
         }
         emit_stmt(g, stmt->try_stmt.try_body, locals);
         if (armed_idx >= 0) g->eh_armed_count = armed_idx;

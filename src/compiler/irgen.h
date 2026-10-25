@@ -247,6 +247,11 @@ struct zan_irgen {
 
     struct {
         LLVMValueRef old_top_slot;
+        /* A528 ctor 裸武装与 try 武装共用此槽，但语义不同：try 存的是
+         * EH top（出口写回 top），ctor 存的是 EH 临时栈深度（出口写回
+         * tmps 栈顶）。错写会把无 try 时的 top=-1 冲成 0，之后失败的
+         * 运行期检查误判“在 try 里”而跳进从未 setjmp 的 bufs[0]。 */
+        bool restore_tmps;
     } eh_armed[ZAN_MAX_ARMED_TRY];
     int eh_armed_count;
     /* 当前函数体拥有的作用域清理项 */

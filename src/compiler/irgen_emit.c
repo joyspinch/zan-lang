@@ -1742,6 +1742,7 @@ static void emit_user_method_bodies(zan_irgen_t *g, method_body_work_t *work,
                     "ctor.eh.base.slot");
                 zan_store_fit(g, base, base_slot);
                 g->eh_armed[g->eh_armed_count].old_top_slot = base_slot;
+                g->eh_armed[g->eh_armed_count].restore_tmps = true;
                 g->eh_armed_count++;
             }
             bool this_init = member->method_decl.has_this_init;

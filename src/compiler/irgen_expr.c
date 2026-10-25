@@ -11152,6 +11152,17 @@ static int type_is_or_derives(zan_type_t *s, zan_type_t *t);
 static LLVMValueRef emit_runtime_is_check_name(zan_irgen_t *g, LLVMValueRef x,
                                                zan_type_t *tt);
 
+static LLVMValueRef emit_runtime_is_check_name(zan_irgen_t *g, LLVMValueRef x,
+                                               zan_type_t *tt);
+
+/* A454 装箱三助手（定义在 emit_runtime_is_check_name 之后） */
+static bool irgen_boxed_eligible_struct(zan_irgen_t *g, zan_type_t *t);
+static LLVMValueRef emit_box_struct(zan_irgen_t *g, zan_type_t *st,
+                                    zan_ast_node_t *src_expr,
+                                    LLVMValueRef val, local_scope_t *locals);
+static LLVMValueRef emit_unbox_struct(zan_irgen_t *g, zan_type_t *tt,
+                                      LLVMValueRef val, zan_ast_node_t *expr);
+
 static LLVMValueRef emit_expr_cast_expr(zan_irgen_t *g, zan_ast_node_t *expr,
         local_scope_t *locals) {
         zan_type_t *tt0 = resolve_type_ctx(g, expr->cast.type);
@@ -11179,16 +11190,29 @@ static LLVMValueRef emit_expr_cast_expr(zan_irgen_t *g, zan_ast_node_t *expr,
             if (st && find_user_conversion(g, st, tt, "op_explicit"))
                 return emit_user_conversion(g, st, tt, "op_explicit", val,
                                             expr->cast.expr, locals);
-            /* `(object)42`：值类型装不进 object。没有装箱设施时硬转只会把
-             * 整数值当成对象指针（下面走 IntToPtr），运行期拿野指针、退出
-             * 时 ARC 回收再崩。checker 已经拦了普通路径，这里兜住泛型特化
-             * （类型参数在 checker 阶段还看不出来）。 */
-            if (tt && tt->kind == TYPE_OBJECT && st &&
-                irgen_type_is_value_kind(st))
-                zan_diag_emit_code(g->diag, DIAG_ERROR, expr->loc, 3040,
+            /* `(object)` 对值形状的分流（A454）：无托管字段的 struct 走真
+             * 装箱（分配带头部堆对象、写载荷、site 注册三件事都在
+             * emit_box_struct）；其余值形状仍报错兜住泛型特化（类型参数
+             * 在 checker 阶段还看不出来）——硬转只会把整数值当成对象指针
+             * （下面走 IntToPtr），运行期拿野指针、退出时 ARC 回收再崩。 */
+            if (tt && tt->kind == TYPE_OBJECT && st) {
+                if (irgen_boxed_eligible_struct(g, st))
+                    return emit_box_struct(g, st, expr, val, locals);
+                if (irgen_type_is_value_kind(st))
+                    zan_diag_emit_code(g->diag, DIAG_ERROR, expr->loc, 3040,
                               "cannot convert '%s' to 'object': value types "
                               "cannot be boxed (Zan has no boxing facility)",
                               st->name.str ? st->name.str : "?");
+            }
+            /* 拆箱（A454）：object → 装箱过的结构体。来源不限于 OBJECT
+             * 形状（string / 接口 / 引用类都可能是箱的实际内容）；tag
+             * 检查走 `is` 的描述符名表通路（对 string magic 亦正确），
+             * 失败按 A509 软失败（stderr + 零值继续）。 */
+            if (tt && tt->kind == TYPE_STRUCT && st &&
+                st->kind != TYPE_STRUCT && st->kind != TYPE_NULLABLE &&
+                LLVMGetTypeKind(src) == LLVMPointerTypeKind &&
+                irgen_boxed_eligible_struct(g, tt))
+                return emit_unbox_struct(g, tt, val, expr);
         }
         if (llvm_is_nullable(src) && !llvm_is_nullable(target)) {
             emit_runtime_check(g,
@@ -11516,6 +11540,97 @@ static LLVMValueRef emit_runtime_is_check(zan_irgen_t *g, LLVMValueRef x,
     return res;
 }
 
+/* A454 装箱资格：用户声明的 struct、无显式布局、字段（含嵌套）不含
+ * 托管引用。判定与 checker 侧 checker_struct_boxable 同口径——irgen 侧
+ * 复用现成的 type_contains_collection_rc（含嵌套展开与 weak 跳过）。 */
+static bool irgen_boxed_eligible_struct(zan_irgen_t *g, zan_type_t *t) {
+    if (!t || t->kind != TYPE_STRUCT || !t->sym) return false;
+    zan_symbol_t *sym = t->sym;
+    if (!sym->decl || sym->decl->kind != AST_STRUCT_DECL) return false;
+    if (decl_is_explicit_layout(sym)) return false;
+    if (type_contains_collection_rc(g, t, 0)) return false;
+    return true;
+}
+
+/* 装箱：值结构体 → 堆对象。布局契约：载荷从 user_ptr+0 原样存放——
+ * build_class_release_body 对 SYM_STRUCT 的字段偏移正是
+ * class_vptr_offset(sym)=0（即 user_ptr+0），释放函数零改动即可释放
+ * 装箱对象；`is`/拆箱的 tag 走描述符名表（装箱 site 的 tynames 首项
+ * 就是结构体名，见 zan_irgen_emit_arc_desc_init 的继承链遍历）。
+ * 头部由 zan_rt_alloc 统一布置：raw[0..7]=引用计数、raw[8..15]=site 字。
+ * v1 资格排除托管字段结构体；这里的 retain 已按捕获协议写好，资格
+ * 放开（managed-field struct）时语义自动成立。 */
+static LLVMValueRef emit_box_struct(zan_irgen_t *g, zan_type_t *st,
+                                    zan_ast_node_t *src_expr,
+                                    LLVMValueRef val, local_scope_t *locals) {
+    LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
+    LLVMTypeRef lt = map_type(g, st);
+    LLVMValueRef sval = coerce_struct_value(g, val, st);
+    if (!lt || LLVMGetTypeKind(lt) != LLVMStructTypeKind ||
+        LLVMGetTypeKind(LLVMTypeOf(sval)) != LLVMStructTypeKind) {
+        zan_diag_emit_code(g->diag, DIAG_ERROR, src_expr->loc, 3040,
+                      "cannot convert '%s' to 'object': value types "
+                      "cannot be boxed (Zan has no boxing facility)",
+                      st->name.str ? st->name.str : "?");
+        return LLVMConstNull(i8ptr);
+    }
+    int site = reserve_arc_site(g, st->sym, st, 0, NULL);
+    char nbuf[320];
+    snprintf(nbuf, sizeof(nbuf), "box:%.*s",
+             (int)st->name.len, st->name.str ? st->name.str : "?");
+    LLVMTypeRef alloc_ty = LLVMGlobalGetValueType(g->rt_alloc);
+    LLVMValueRef raw = zan_call2(g->builder, alloc_ty, g->rt_alloc,
+        (LLVMValueRef[]){ LLVMSizeOf(lt), arc_site_arg(g, site),
+                          zan_irgen_intern_string(g, nbuf) }, 3, "box.alloc");
+    /* 空载荷结构体（{}）跳过 store：零大小 store 非法 */
+    if (LLVMCountStructElementTypes(lt) > 0) {
+        LLVMValueRef slot = LLVMBuildBitCast(g->builder, raw,
+            LLVMPointerType(lt, 0), "box.slot");
+        LLVMBuildStore(g->builder, sval, slot);
+        /* 载荷里的引用归堆对象所有；来源是既有变量（非构造临时）时
+         * 补 +1——与 emit_struct_local_capture 同一捕获协议。 */
+        if (!expr_yields_owned_rc_value(g, src_expr, locals))
+            emit_collection_value_retain(g, st, sval, 0);
+    }
+    return raw;
+}
+
+/* 拆箱：object → 装箱过的结构体。tag 检查复用 `is` 的描述符名表
+ * 通路；失败按 A509 同款软失败（stderr 一次 + 零值继续，
+ * --strict-runtime 下 exit 70）。v1 资格排除托管字段结构体，载荷
+ * 拷出无需字段级 retain；放开资格时这里要补
+ * emit_collection_value_retain（箱可能先于拷贝死亡）。 */
+static LLVMValueRef emit_unbox_struct(zan_irgen_t *g, zan_type_t *tt,
+                                      LLVMValueRef val, zan_ast_node_t *expr) {
+    LLVMTypeRef lt = map_type(g, tt);
+    if (!lt || LLVMGetTypeKind(lt) != LLVMStructTypeKind) return val;
+    LLVMValueRef ok = emit_runtime_is_check_name(g, val, tt);
+    LLVMValueRef cfn = LLVMGetBasicBlockParent(LLVMGetInsertBlock(g->builder));
+    LLVMBasicBlockRef ok_bb = LLVMAppendBasicBlockInContext(g->ctx, cfn, "unbox.ok");
+    LLVMBasicBlockRef bad_bb = LLVMAppendBasicBlockInContext(g->ctx, cfn, "unbox.bad");
+    LLVMBasicBlockRef m_bb = LLVMAppendBasicBlockInContext(g->ctx, cfn, "unbox.m");
+    LLVMBuildCondBr(g->builder, ok, ok_bb, bad_bb);
+    LLVMPositionBuilderAtEnd(g->builder, ok_bb);
+    LLVMValueRef slot = LLVMBuildBitCast(g->builder, val,
+        LLVMPointerType(lt, 0), "unbox.p");
+    LLVMValueRef good = LLVMBuildLoad2(g->builder, lt, slot, "unbox.v");
+    LLVMBuildBr(g->builder, m_bb);
+    LLVMPositionBuilderAtEnd(g->builder, bad_bb);
+    emit_runtime_check(g,
+        LLVMConstInt(LLVMInt1TypeInContext(g->ctx), 1, 0),
+        expr->loc,
+        "InvalidCastException: object is not an instance of the target struct type");
+    LLVMValueRef bad_end = LLVMGetInsertBlock(g->builder);
+    LLVMBuildBr(g->builder, m_bb);
+    LLVMPositionBuilderAtEnd(g->builder, m_bb);
+    LLVMValueRef phi = LLVMBuildPhi(g->builder, lt, "unbox.r");
+    LLVMValueRef vals[] = { good, LLVMConstNull(lt) };
+    LLVMBasicBlockRef bbs[] = { ok_bb, bad_end };
+    LLVMAddIncoming(phi, vals, bbs, 2);
+    return phi;
+}
+
 static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_t *locals) {
     if (!expr) return LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 0, 0);
     if (locals) g->current_locals = locals;
@@ -11644,8 +11759,16 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                 bool tt_ref = tt->kind == TYPE_OBJECT || tt->kind == TYPE_INTERFACE ||
                               tt->kind == TYPE_STRING || tt->kind == TYPE_CLASS;
                 if (!st_ref || !tt_ref) {
-                    test = LLVMConstInt(LLVMInt1TypeInContext(g->ctx),
-                                        types_equal(st, tt) ? 1 : 0, 0);
+                    /* A454：装箱结构体的运行期识别——接收者是引用形状、
+                     * 目标是装箱资格结构体时走描述符名表比对（静态
+                     * types_equal 对装箱值恒为假）。 */
+                    if (st_ref && tt && tt->kind == TYPE_STRUCT &&
+                        LLVMGetTypeKind(LLVMTypeOf(v)) == LLVMPointerTypeKind &&
+                        irgen_boxed_eligible_struct(g, tt))
+                        test = emit_runtime_is_check_name(g, v, tt);
+                    else
+                        test = LLVMConstInt(LLVMInt1TypeInContext(g->ctx),
+                                            types_equal(st, tt) ? 1 : 0, 0);
                 } else {
                     LLVMValueRef nn = zan_icmp(g->builder, LLVMIntNE, v,
                         LLVMConstNull(LLVMTypeOf(v)), "is.nonnull");

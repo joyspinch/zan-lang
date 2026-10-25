@@ -1092,6 +1092,19 @@ static void emit_all_class_releases(zan_irgen_t *g) {
         LLVMValueRef fn = get_class_release_decl(g, sym, inst);
         if (fn) build_class_release_body(g, sym, inst, fn);
     }
+    /* A454 装箱 site：非托管结构体被装箱时 desc-init 会为它建释放函数
+     * 壳（get_class_release_decl 把非泛型 inst 归一为 NULL，去重键与
+     * loop 1/2 都对不上）——这里补 body（无托管字段即空体，只剩
+     * 引用计数与 free 逻辑）。泛型实例化 site 已由上面的 loop 2 覆盖。 */
+    for (int i = 0; g->site_syms && i < g->leak_site_count; i++) {
+        zan_symbol_t *sym = g->site_syms[i];
+        if (!sym || sym->kind != SYM_STRUCT) continue;
+        if (!sym->type || is_arc_managed_type(sym->type)) continue;
+        zan_type_t *inst = g->site_inst ? g->site_inst[i] : NULL;
+        if (inst && inst->type_arg_count > 0) continue;
+        LLVMValueRef fn = get_class_release_decl(g, sym, inst);
+        if (fn) build_class_release_body(g, sym, NULL, fn);
+    }
 }
 
 static void emit_site_live_tables(zan_irgen_t *g) {

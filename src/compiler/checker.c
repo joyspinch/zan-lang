@@ -1579,6 +1579,35 @@ static bool cast_is_scalar(zan_type_t *t) {
 }
 
 /* 检查是否`(dst)src` is a conversion the language has */
+static bool checker_struct_boxable(zan_type_t *t, int depth);
+
+/* A454 装箱资格：用户声明的 struct，其字段（含嵌套 struct 字段）全部
+ * 不含托管引用——载荷可原样写入堆对象，释放函数无需字段清理。
+ * Span/Decimal/Nullable 这类内建值形状同样满足（视图/标量载荷）。 */
+static bool checker_struct_boxable(zan_type_t *t, int depth) {
+    if (!t || t->kind != TYPE_STRUCT || !t->sym || depth > 32) return false;
+    zan_symbol_t *sym = t->sym;
+    if (!sym->decl || sym->decl->kind != AST_STRUCT_DECL) return false;
+    if (sym->decl->type_decl.is_explicit_layout) return false;
+    for (int i = 0; i < sym->member_count; i++) {
+        zan_symbol_t *m = sym->members[i];
+        if (m->kind != SYM_FIELD && m->kind != SYM_PROPERTY) continue;
+        if (m->modifiers & (MOD_STATIC | MOD_WEAK)) continue;
+        zan_type_t *ft = m->type;
+        if (!ft) return false;
+        if (ft->kind == TYPE_STRUCT) {
+            if (!checker_struct_boxable(ft, depth + 1)) return false;
+            continue;
+        }
+        if (ft->kind == TYPE_CLASS || ft->kind == TYPE_INTERFACE ||
+            ft->kind == TYPE_STRING || ft->kind == TYPE_ARRAY ||
+            ft->kind == TYPE_DELEGATE || ft->kind == TYPE_TASK ||
+            ft->kind == TYPE_OBJECT || ft->kind == TYPE_TYPE_PARAM)
+            return false;
+    }
+    return true;
+}
+
 static bool checker_cast_is_valid(zan_checker_t *c, zan_type_t *dst,
                                   zan_type_t *src) {
     if (!dst || !src) return true;
@@ -1587,13 +1616,17 @@ static bool checker_cast_is_valid(zan_checker_t *c, zan_type_t *dst,
         return true;
     if (dst->kind == TYPE_TYPE_PARAM || src->kind == TYPE_TYPE_PARAM) return true;
     if (dst->kind == TYPE_OBJECT) {
-        /* 值类型没有装箱设施：`(object)42` 只会把整数值当成对象指针
+        /* 值类型没有装箱设施时，`(object)42` 只会把整数值当成对象指针
          * （irgen 走 IntToPtr），调用方拿到野指针，进程退出时 ARC 去回收
          * 这个假对象再崩一次（0xC0000005）。编译期就拦下来。
-         * 引用类型之间的转换照旧放行。 */
+         * 引用类型之间的转换照旧放行；无托管字段的 struct 走真装箱
+         * （A454），其余值形状仍拦。 */
         zan_type_t *sbase = src->kind == TYPE_NULLABLE
                                 ? checker_nullable_base(src) : src;
         if (sbase && sbase->kind == TYPE_OBJECT) return true;
+        if (sbase && sbase->kind == TYPE_STRUCT &&
+            checker_struct_boxable(sbase, 0))
+            return true;
         return checker_type_is_ref(sbase);
     }
     if (src->kind == TYPE_OBJECT) return true;
