@@ -227,6 +227,28 @@ description: zanc 编译器内部（parser/checker/irgen/runtime/ABI）设计契
      测试集体变红，看起来像改坏了编译器，其实是没 stdlib。
    - 边界：先看输出里有没有 `no stdlib directory found next to the compiler`；有就
      先补 stdlib，再看别的失败。
+14. **新增语言原语前先查 ast.h 的 AST 枚举与 lexer 的 TK_ 关键字**：
+   - 动作：想加 `sizeof(T)`/`typeof(T)`/`checked(...)` 这类表达式原语时，动手前先
+     grep `ast.h` 的 `AST_*` 枚举、`parser.c` 的 `case TK_*` 分支与 checker/irgen
+     的对应 case——`sizeof`/`typeof` 早已存在（`TK_SIZEOF` → `AST_SIZEOF_EXPR`
+     → irgen `LLVMSizeOf`），缺的往往只是 checker 校验这一小块。
+   - 理由：做 Marshal.SizeOf 时重复造轮子：新加枚举成员导致重定义编译错、
+     新加 parse 分支与既有 TK_SIZEOF 分支并存——全部回滚后真正要做的只有
+     checker 的尺寸校验一行路。
+   - 边界：既原语的返回形态以 irgen 现状为准（sizeof 返回 i64），wrapper（如
+     `Marshal.SizeOf<T>() { return sizeof(T); }`）用纯 Zan 泛型方法表达，不要
+     给原语再叠 irgen 拦截。
+15. **批量改写 C 源码的脚本必须把复合字面量的花括号计入嵌套深度**：
+   - 动作：用脚本给 `zan_diag_emit(...)` 这类调用**按逗号切实参、在指定槽位插
+     新实参**时，切分器必须同时跟踪 `()`、`[]`、`{}` 三种括号——`(zan_loc_t){0, 0, 0, 0}`
+     复合字面量里的逗号不是实参分隔符；并且回读校验：插完后的目标槽必须是
+     纯整数字面量（code 槽）、格式串槽必须以引号/标识符开头。
+   - 理由：只跟踪圆括号方括号的切分器把编号插进了 `{0, 0, 0, 0}` 内部，
+     fmt 串被挤进 int 槽——文案与代码整体错位；全量编号 300+ 站点时
+     checker.c 一处中招。
+   - 边界：这类错位**必现编译错误**（字符串落进 int 形参），所以"改完必编译"
+     就能全量兜住；但脚本层的回读校验能把发现点从"编译失败逐个排查"提前到
+     "脚本当场报错"，批量改写一律两条都上。
 ---
 
 ## 二、LLVM 代码生成与指令下沉（IRGen）
