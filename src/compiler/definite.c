@@ -101,7 +101,7 @@ static void da_use(struct da_ctx *c, zan_ast_node_t *n) {
     if (assigned || c->v[i].reported) return;
     c->v[i].reported = 1;
     if (!c->emit) return;
-    zan_diag_emit(c->diag, DIAG_ERROR, n->loc,
+    zan_diag_emit_code(c->diag, DIAG_ERROR, n->loc, 2098,
                   "use of unassigned local variable '%.*s'",
                   (int)n->ident.name.len, n->ident.name.str);
 }
@@ -113,7 +113,7 @@ static void da_check_out_params(struct da_ctx *c, zan_loc_t loc) {
         if (!c->v[i].is_out || assigned || c->v[i].reported) continue;
         c->v[i].reported = 1;
         if (!c->emit) continue;
-        zan_diag_emit(c->diag, DIAG_ERROR, loc,
+        zan_diag_emit_code(c->diag, DIAG_ERROR, loc, 2099,
                       "the out parameter '%.*s' must be assigned before "
                       "control leaves the method",
                       (int)c->v[i].name.len, c->v[i].name.str);

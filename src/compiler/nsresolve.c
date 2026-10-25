@@ -451,7 +451,7 @@ static void resolve_ref(nr_ctx_t *c, zan_ast_node_t *tr,
 
     if (count_simple_matching(c, R, tr) >= 2 && !find_full(c, R) && c->diag &&
         !c->quiet_ambiguity) {
-        zan_diag_emit(c->diag, DIAG_ERROR, tr->loc,
+        zan_diag_emit_code(c->diag, DIAG_ERROR, tr->loc, 1019,
                       "ambiguous type '%.*s'; qualify it with its namespace",
                       (int)R.len, R.str);
     }
@@ -546,7 +546,7 @@ static void resolve_static_receiver(nr_ctx_t *c, zan_ast_node_t *id,
         int hits = 0;
         t = pick_by_member(c, R, member, &hits);
         if (!t && hits > 1 && c->diag)
-            zan_diag_emit(c->diag, DIAG_ERROR, id->loc,
+            zan_diag_emit_code(c->diag, DIAG_ERROR, id->loc, 1019,
                           "ambiguous type '%.*s'; qualify it with its namespace",
                           (int)R.len, R.str);
     }

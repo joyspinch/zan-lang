@@ -305,10 +305,10 @@ static void check_implicit_narrowing(zan_irgen_t *g, zan_type_t *dst,
     if (!float_to_int_loss && !native_handle_loss && !narrow_warn_enabled())
         return;
 
-    zan_diag_emit(g->diag,
+    zan_diag_emit_code(g->diag,
                   (float_to_int_loss || native_handle_loss) ? DIAG_ERROR
                                                             : DIAG_WARNING,
-                  at->loc,
+                  at->loc, 2022,
                   "narrowing conversion from '%s' to '%s' in %s needs an "
                   "explicit cast (C# rules)",
                   src->name.str ? src->name.str : "?",
@@ -330,7 +330,7 @@ static void check_value_type_mismatch(zan_irgen_t *g, zan_type_t *dst, zan_type_
                       (dst_struct ? src->kind : dst->kind) == TYPE_DOUBLE ||
                       (dst_struct ? src->kind : dst->kind) == TYPE_BOOL;
     if (!other_prim) return;
-    zan_diag_emit(g->diag, DIAG_ERROR, at->loc,
+    zan_diag_emit_code(g->diag, DIAG_ERROR, at->loc, 2105,
                   "cannot convert '%s' to '%s' in %s: a value struct and a "
                   "primitive are unrelated types",
                   src->name.str ? src->name.str : "?",
@@ -394,12 +394,12 @@ static void check_no_boxing_conversion(zan_irgen_t *g, zan_type_t *dst,
     const char *sname = sbuf[0] ? sbuf : "?";
     const char *dname = dbuf[0] ? dbuf : "?";
     if (dst_ref) {
-        zan_diag_emit(g->diag, DIAG_ERROR, at->loc,
+        zan_diag_emit_code(g->diag, DIAG_ERROR, at->loc, 2106,
                       "cannot convert '%s' to '%s' in %s: value types cannot be "
                       "boxed into a reference type",
                       sname, dname, what);
     } else {
-        zan_diag_emit(g->diag, DIAG_ERROR, at->loc,
+        zan_diag_emit_code(g->diag, DIAG_ERROR, at->loc, 2107,
                       "cannot convert '%s' to '%s' in %s: a reference type cannot "
                       "be converted to a value type",
                       sname, dname, what);
@@ -479,7 +479,7 @@ static void check_generic_invariance(zan_irgen_t *g, zan_type_t *dst, zan_type_t
             char dbuf[128], sbuf[128];
             zan_type_display(dst, dbuf, sizeof(dbuf));
             zan_type_display(src, sbuf, sizeof(sbuf));
-            zan_diag_emit(g->diag, DIAG_ERROR, at->loc,
+            zan_diag_emit_code(g->diag, DIAG_ERROR, at->loc, 2108,
                           "cannot convert '%s' to '%s' in %s: generic type "
                           "arguments are invariant and must match exactly",
                           sbuf[0] ? sbuf : "?",
@@ -1381,7 +1381,7 @@ static void check_shared_table_width(zan_irgen_t *g, zan_symbol_t *type_sym,
     if (!arg || arg->kind != AST_INT_LITERAL) return;
     if (arg->int_val > 0 && arg->int_val <= limit) return;
 
-    zan_diag_emit(g->diag, DIAG_ERROR, arg->loc,
+    zan_diag_emit_code(g->diag, DIAG_ERROR, arg->loc, 4001,
                   "shared table %s width %lld is out of range: a width must be "
                   "between 1 and %lld bytes",
                   what, (long long)arg->int_val, limit);
@@ -1449,8 +1449,8 @@ static zan_symbol_t *resolve_overload_typed(zan_irgen_t *g,
             memcmp(type_sym->name.str, "Convert", 7) == 0) {
             return NULL;
         }
-        zan_diag_emit(g->diag, DIAG_ERROR,
-                      call ? call->loc : (zan_loc_t){0},
+        zan_diag_emit_code(g->diag, DIAG_ERROR,
+                      call ? call->loc : (zan_loc_t){0}, 2103,
                       "no overload of '%.*s.%.*s' matches argument type(s)",
                       (int)type_sym->name.len, type_sym->name.str,
                       (int)name.len, name.str);
@@ -1640,7 +1640,7 @@ static zan_type_t *infer_expr_type(zan_irgen_t *g, zan_ast_node_t *e,
     if (g_infer_depth >= ZAN_MAX_INFER_DEPTH) {
         if (!g_infer_bailed) {
             g_infer_bailed = true;
-            zan_diag_emit(g->diag, DIAG_ERROR, e->loc,
+            zan_diag_emit_code(g->diag, DIAG_ERROR, e->loc, 2104,
                           "expression is nested too deeply to type "
                           "(inference recursed %d levels); split it into "
                           "statements", ZAN_MAX_INFER_DEPTH);

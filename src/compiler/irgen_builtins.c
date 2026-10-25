@@ -2784,12 +2784,12 @@ static void reorder_named_args_impl(zan_irgen_t *g, zan_ast_list_t *args,
             }
         }
         if (found < 0) {
-            zan_diag_emit(g->diag, DIAG_ERROR, arg->loc,
+            zan_diag_emit_code(g->diag, DIAG_ERROR, arg->loc, 2100,
                           "no parameter named '%.*s'",
                           (int)arg->named_arg.name.len,
                           arg->named_arg.name.str);
         } else if (slot[found] >= 0) {
-            zan_diag_emit(g->diag, DIAG_ERROR, arg->loc,
+            zan_diag_emit_code(g->diag, DIAG_ERROR, arg->loc, 2101,
                           "parameter '%.*s' is already assigned",
                           (int)arg->named_arg.name.len,
                           arg->named_arg.name.str);
@@ -2815,7 +2815,7 @@ static void reorder_named_args_impl(zan_irgen_t *g, zan_ast_list_t *args,
     for (int p = 0; p < n; p++) {
         if (slot[p] < 0 || slot[p] >= n) {
             ok = 0;
-            zan_diag_emit(g->diag, DIAG_ERROR, loc,
+            zan_diag_emit_code(g->diag, DIAG_ERROR, loc, 2102,
                           "named arguments must bind to the leading "
                           "parameters in order");
             break;

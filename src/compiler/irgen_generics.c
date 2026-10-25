@@ -194,7 +194,7 @@ static void discover_generic_insts(zan_irgen_t *g, zan_ast_node_t *unit) {
     const int limit = 64;
     while (g->generic_inst_count != prev) {
         if (guard >= limit) {
-            zan_diag_emit(g->diag, DIAG_ERROR, unit->loc,
+            zan_diag_emit_code(g->diag, DIAG_ERROR, unit->loc, 3100,
                 "generic instantiation did not reach a fixed point within "
                 "%d iterations; the type graph may be recursively dependent "
                 "or too large", limit);
@@ -2347,7 +2347,7 @@ static LLVMValueRef emit_string_literal_rc(zan_irgen_t *g, zan_istr_t text) {
     if (obf && !ZAN_TAB_ENSURE(g->obf_literals, g->obf_literal_count,
                                g->obf_literal_cap, 256)) {
         zan_loc_t oloc = {0};
-        zan_diag_emit(g->diag, DIAG_ERROR, oloc,
+        zan_diag_emit_code(g->diag, DIAG_ERROR, oloc, 3101,
                       "out of memory recording obfuscated string literals "
                       "(%d recorded)", g->obf_literal_count);
         obf = false;

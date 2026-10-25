@@ -88,9 +88,14 @@
   - 验证：探针 `[E0019] unterminated string literal`、`[E0032] expected ';', got '}'`、
     `[W0003] #warning hello`（W 字母取升级前级别）三发全中；自举 67 文件编译干净；
     `test.ps1 -Match "diag_builtin_name_shadow|diag_ctor_missing"` 3 用例绿。
-  - ① 剩余：名字/绑定段（1000–1999）、类型段（2000–2999）、codegen 段
-    （3000–3999）、互操作段（4000–4999）照同法推进；然后 ② `--warn-level`、
-    ③ `#pragma warning`、④ `Marshal`。
+  - ① 全段已落地（2026-10-25）：1000–1999（binder.c 18 号 + nsresolve.c
+    E1019）、2000–2999（checker.c 98 号 + definite.c E2098/E2099 +
+    irgen_builtins.c E2100–E2102 + irgen_expr_core.c E2103–E2108，其中 E2022
+    为跨文件一号首例）、3000–3999（irgen_*.c + genrun.c 100 号 +
+    irgen_generics.c E3100/E3101）、4000–4999 首批（irgen_abi.c E4000 extern
+    按值结构体 + irgen_expr_core.c E4001 shared table 宽度契约）；自举孪生
+    随段对齐（散点轮新增 E1019）。全表见 `docs/DIAGNOSTIC_CODES.md`。
+    散点收口后 ① 无剩余站点；A382 剩 ④ `Marshal`。
 
 - **② 已落地（2026-10-25）——`--warn-level` 与 `--suppress`**：
   - `--warn-level none|default|error`（`error` 兼容 `--deny-warnings`）；

@@ -379,7 +379,7 @@ static void abi_pending_report(zan_irgen_t *g) {
                 if (!name || !name[0]) continue;
                 for (int i = 0; i < g->abi_pending_count; i++) {
                     if (strcmp(g->abi_pending[i], name) != 0) continue;
-                    zan_diag_emit(g->diag, DIAG_ERROR, zan_loc(0, 0, 0, 0),
+                    zan_diag_emit_code(g->diag, DIAG_ERROR, zan_loc(0, 0, 0, 0), 4000,
                                   "call to extern '%s' passes a struct by value, "
                                   "which has no C ABI classification for target '%s'",
                                   name,

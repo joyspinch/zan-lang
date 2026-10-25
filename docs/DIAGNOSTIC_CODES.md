@@ -102,7 +102,7 @@
 
 表中 `%s`/`%d` 等为文案里的格式占位符，非文档转义。
 
-### 名字/绑定（src/compiler/binder.c，段 1000–1999）
+### 名字/绑定（src/compiler/binder.c + nsresolve.c，段 1000–1999）
 
 | 号  | 级 | 消息 |
 |-----|----|------|
@@ -125,8 +125,9 @@
 | E1016 | E | destructors ('~%.*s()') are not supported: the ARC runtime has no destructor hook on release -- do deterministic cleanup explicitly (using statement or a Close/Dispose method) instead of relying on '~%.*s()' |
 | E1017 | E | enum member '%.*s' value %lld does not fit in 'int' (enum members are 32-bit) |
 | E1018 | E | enum member '%.*s' initializer must be an integer constant expression |
+| E1019 | E | ambiguous type '%.*s'; qualify it with its namespace |
 
-### 类型/约束（src/compiler/checker.c，段 2000–2999）
+### 类型/约束（src/compiler/checker.c + definite.c + irgen_builtins.c + irgen_expr_core.c，段 2000–2999）
 
 | 号  | 级 | 消息 |
 |-----|----|------|
@@ -228,6 +229,20 @@
 | E2095 | E | an abstract method cannot be async: '%.*s' |
 | E2096 | E | class '%.*s' declares an abstract method and must be declared 'abstract' |
 | E2097 | W | '%.*s' is declared 'virtual' but hides an inherited virtual with the same name and arity; calls through base-class references will run the base implementation -- use 'override' to replace it |
+| E2098 | E | use of unassigned local variable '%.*s' |
+| E2099 | E | the out parameter '%.*s' must be assigned before control leaves the method |
+| E2100 | E | no parameter named '%.*s' |
+| E2101 | E | parameter '%.*s' is already assigned |
+| E2102 | E | named arguments must bind to the leading parameters in order |
+| E2103 | E | no overload of '%.*s.%.*s' matches argument type(s) |
+| E2104 | E | expression is nested too deeply to type (inference recursed %d levels); split it into statements |
+| E2105 | E | cannot convert '%s' to '%s' in %s: a value struct and a primitive are unrelated types |
+| E2106 | E | cannot convert '%s' to '%s' in %s: value types cannot be boxed into a reference type |
+| E2107 | E | cannot convert '%s' to '%s' in %s: a reference type cannot be converted to a value type |
+| E2108 | E | cannot convert '%s' to '%s' in %s: generic type arguments are invariant and must match exactly |
+
+> E2022（窄化转换）为跨文件一号的首例：`checker.c` 与 `irgen_expr_core.c`
+> 的同文案站点共享同号（规则 3——号键在消息语义上，不在文件或站点上）。
 
 ### 代码生成/后端（src/compiler/irgen_*.c + genrun.c，段 3000–3999）
 
@@ -333,6 +348,15 @@
 | E3097 | E | LLVM function compaction failed: %s |
 | E3098 | E | async: an expression with side effects is evaluated before an await in the same expression; assign it to a local first |
 | E3099 | E | %s |
+| E3100 | E | generic instantiation did not reach a fixed point within %d iterations; the type graph may be recursively dependent or too large |
+| E3101 | E | out of memory recording obfuscated string literals (%d recorded) |
+
+### 互操作/运行时契约（src/compiler/irgen_abi.c + irgen_expr_core.c，段 4000–4999）
+
+| 号  | 级 | 消息 |
+|-----|----|------|
+| E4000 | E | call to extern '%s' passes a struct by value, which has no C ABI classification for target '%s' |
+| E4001 | E | shared table %s width %lld is out of range: a width must be between 1 and %lld bytes |
 
 ### selfhost 侧现状
 
@@ -342,8 +366,8 @@ selfhost 前端（`src/selfhost/lexer.zan` + `parser.zan`）不重放 C 前端�
 E0005 / E0006（整型溢出）、E0039 / E0040（join）、E0041（group）、
 E0043（select）；E1016（析构器不支持）同号。
 
-名字/绑定与类型段（1000/2000）落地时已对齐的孪生：E1016、E2017 / E2018 /
-E2019 / E2022 / E2041 / E2049 / E2057 / E2073。代码生成段（3000）落地时
+名字/绑定与类型段（1000/2000）落地时已对齐的孪生：E1016、E1019、E2017 /
+E2018 / E2019 / E2022 / E2041 / E2049 / E2057 / E2073。代码生成段（3000）落地时
 已对齐的孪生：E3012 / E3049 / E3052 / E3053 / E3060 / E3086。其余 selfhost
 报错没有 C 侧孪生（如 ngen 后端专属、笼统 syntax error），不编号，留待
 其语义所属段次落地时统一对齐。
