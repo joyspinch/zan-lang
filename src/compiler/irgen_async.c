@@ -1573,10 +1573,11 @@ static int async_count_transfers(zan_ast_node_t *st) {
 }
 
 /* foreach 迭代协议接口判断（GetEnumerator / MoveNext / Current）。
- * 枚举器返回类型允许具体类，也允许接口（A381 lazy iterators 第一步：
- * 接口形态经 tag 分发多态调用）。 */
+ * 枚举器返回类型允许具体类，也允许接口；集合本身也允许是接口
+ * （A381 lazy iterators：IEnumerable<T> 型集合/方法调用结果直接 foreach）。 */
 static zan_type_t *foreach_proto_enum_type(zan_irgen_t *g, zan_type_t *ct) {
-    if (!ct || ct->kind != TYPE_CLASS || !ct->sym) return NULL;
+    if (!ct || !ct->sym ||
+        (ct->kind != TYPE_CLASS && ct->kind != TYPE_INTERFACE)) return NULL;
     zan_istr_t gi = { (char *)"GetEnumerator", 13 };
     zan_symbol_t *gm = resolve_overload(ct->sym, gi, 0, 0);
     zan_type_t *et = NULL;

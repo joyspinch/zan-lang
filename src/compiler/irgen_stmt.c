@@ -2907,8 +2907,10 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
         LLVMTypeRef fe_enum_ll = fe_enum_ty ? map_type(g, fe_enum_ty) : NULL;
         if (fe_enum_ty) {
             if (!enum_slot) enum_alloc = emit_entry_alloca(g, fe_enum_ll, "fe.enum");
-            LLVMValueRef ev0 = emit_foreach_call0(g, col_type0, fe_get_m,
-                                                  collection);
+            LLVMValueRef ev0 = (col_type0->kind == TYPE_INTERFACE)
+                ? emit_iface_call0(g, col_type0, "GetEnumerator", collection,
+                                   locals, stmt->loc)
+                : emit_foreach_call0(g, col_type0, fe_get_m, collection);
             zan_store_fit(g, ev0, enum_slot ? enum_slot : enum_alloc);
         }
 
