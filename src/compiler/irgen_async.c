@@ -609,11 +609,14 @@ static LLVMValueRef get_co_cancel_fn(zan_irgen_t *g) {
 }
 
 /* 获取或声明模块内部的 `__zan_co_isdone(i8*)`（查询协程完成状态） */
+/* 帧首 sched 字段的 CO_DEAD 位（rt_io.c 同名宏的镜像，运行时拥有语义） */
+#define ZAN_CO_DEAD_BIT 8LL
 static LLVMValueRef get_co_isdone_fn(zan_irgen_t *g) {
     LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "__zan_co_isdone");
     if (fn) return fn;
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
     LLVMTypeRef i32 = LLVMInt32TypeInContext(g->ctx);
+    LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
     LLVMTypeRef hdr = g->co_header_type;
     fn = LLVMAddFunction(g->mod, "__zan_co_isdone",
         LLVMFunctionType(i32, &i8ptr, 1, 0));
@@ -625,6 +628,7 @@ static LLVMValueRef get_co_isdone_fn(zan_irgen_t *g) {
     LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(g->ctx, fn, "entry");
     LLVMBasicBlockRef live_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "id.live");
     LLVMBasicBlockRef gone_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "id.gone");
+    LLVMBasicBlockRef alive_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "id.alive");
     LLVMPositionBuilderAtEnd(g->builder, entry);
     di_clear(g);
     LLVMValueRef arg = LLVMGetParam(fn, 0);
@@ -634,6 +638,19 @@ static LLVMValueRef get_co_isdone_fn(zan_irgen_t *g) {
         live_bb, gone_bb);
 
     LLVMPositionBuilderAtEnd(g->builder, live_bb);
+    /* A552：mt 驱动下查完活表帧就可能被释放（检疫区里帧首 sched=DEAD 仍可
+     * 读）——先看守卫位，DEAD 视为已完成，跳过对已释放帧 DONE 字段的读；
+     * 默认驱动 sched 恒 0，恒走 alive 分支不受影响。 */
+    LLVMValueRef sv = LLVMBuildLoad2(g->builder, i64,
+        LLVMBuildStructGEP2(g->builder, hdr, arg, ASYNC_FRAME_SCHED, "id.sched.p"),
+        "id.sched");
+    LLVMBuildCondBr(g->builder,
+        zan_icmp(g->builder, LLVMIntNE,
+            LLVMBuildAnd(g->builder, sv, LLVMConstInt(i64, ZAN_CO_DEAD_BIT, 0), "id.dead"),
+            LLVMConstInt(i64, 0, 0), "id.isdead"),
+        gone_bb, alive_bb);
+
+    LLVMPositionBuilderAtEnd(g->builder, alive_bb);
     LLVMValueRef done = LLVMBuildLoad2(g->builder, i32,
         LLVMBuildStructGEP2(g->builder, hdr, arg, ASYNC_FRAME_DONE, "id.done.p"),
         "id.done");
