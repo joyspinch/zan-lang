@@ -547,29 +547,6 @@
 - 框架侧缺口 A545 已闭（2026-10-25，c059bba3c：base.css 补 `.shrink-0` +
   flex 收缩 min-content 下限；停靠 FitSize 裁 0 宽定性为 WinForms 同款不改）。
 - 前提：要有可交互的桌面会话（锁屏/远程会话会拿到黑屏），或让子窗口支持
-  把 root 暴露给宿主驱动。
+	  把 root 暴露给宿主驱动。
 
-### [ ] A554 按钮 medium（默认）档宽度塌到与 small 档同宽——`button.medium` 只有 height，默认档零 padding/font
-
-- 现象（2026-10-25 收口 A542② 时跑 gui 切片撞到）：`conformance_gui_design_form_size`
-  宽度断言（large > medium > small）红。十行最小复现（脱离表单管线）：
-  `Button("Scale")` 挂 `text` / `text small` / `text large` 三档实测 W =
-  68 / 54 / 54，medium 与 small 同宽（H = 40/32/28 正常递增）。
-- 根因：base.css 的尺寸档规则里 `button.tiny/.small/.large` 都带
-  `font-size` + 水平 padding，唯独 `button.medium` 只声明 height；基础
-  `button { }` 规则也不含 padding/font。于是默认档按钮 = 裸文本宽
-  （FontFallback("medium") 字号、零内边距），其总宽恰好等于 small 档
-  （更小字号 + 2×`--padding-medium`）——54 == 54 是数值巧合地相撞。
-  `Style.ApplySizeClass` 的默认绑定 `Size="medium"`（880eef441，10-20）
-  让默认按钮始终吃到这条 height-only 规则，档位分化从此缺一角。
-- 影响：`conformance_gui_design_form_size`（golden 2026-09-16 起未动）
-  红在标准/烟雾档；默认档按钮视觉上零水平内边距。
-- 排除项：与 A542② 的 Panel/StyleFlexDir 改动无关（按钮直测路径不含
-  flex 代码）；与表单生成管线无关（最小复现不经 GenForm）；CSS 两条
-  规则在 09-16 时代与今天逐字一致。
-- 方向（推荐前者）：① base.css 给 `button.medium` 补对称声明
-  （`font-size: var(--font-size-medium);` + 水平 padding token），一并
-  核对 tag/checkbox/radiobutton 的 medium 档是否同样缺角；② 或认定
-  默认档就该贴字排版，改 design_form_size 断言锁真实语义。改动牵动
-  全部模板的默认按钮几何，需模板门 + gui 家族过一遍。
 
