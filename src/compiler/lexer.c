@@ -502,7 +502,7 @@ static void pp_handle_directive(zan_lexer_t *lex) {
             lex->cond_seen_true[lex->cond_depth] = active;
             lex->cond_depth++;
         } else {
-            zan_diag_emit(lex->diag, DIAG_ERROR, lexer_loc(lex),
+            zan_diag_emit_code(lex->diag, DIAG_ERROR, lexer_loc(lex), 1,
                           "conditional-compilation nesting too deep (max %d)",
                           ZAN_PP_MAX_COND_DEPTH);
             lex->cond_overflow++;
@@ -515,7 +515,7 @@ static void pp_handle_directive(zan_lexer_t *lex) {
             lex->cond_seen_true[lex->cond_depth] = active;
             lex->cond_depth++;
         } else {
-            zan_diag_emit(lex->diag, DIAG_ERROR, lexer_loc(lex),
+            zan_diag_emit_code(lex->diag, DIAG_ERROR, lexer_loc(lex), 1,
                           "conditional-compilation nesting too deep (max %d)",
                           ZAN_PP_MAX_COND_DEPTH);
             lex->cond_overflow++;
@@ -529,7 +529,7 @@ static void pp_handle_directive(zan_lexer_t *lex) {
             lex->cond_seen_true[lex->cond_depth] = parent_active && val;
             lex->cond_depth++;
         } else {
-            zan_diag_emit(lex->diag, DIAG_ERROR, lexer_loc(lex),
+            zan_diag_emit_code(lex->diag, DIAG_ERROR, lexer_loc(lex), 1,
                           "conditional-compilation nesting too deep (max %d)",
                           ZAN_PP_MAX_COND_DEPTH);
             lex->cond_overflow++;
@@ -574,7 +574,7 @@ static void pp_handle_directive(zan_lexer_t *lex) {
             while (!lexer_at_end(lex) && lexer_peek_ch(lex) != '\n' && mi < 255)
                 msg[mi++] = lexer_advance(lex);
             msg[mi] = '\0';
-            zan_diag_emit(lex->diag, DIAG_ERROR, lexer_loc(lex), "#error %s", msg);
+            zan_diag_emit_code(lex->diag, DIAG_ERROR, lexer_loc(lex), 2, "#error %s", msg);
         }
     } else if (strcmp(dir, "warning") == 0) {
         if (pp_active(lex)) {
@@ -583,7 +583,7 @@ static void pp_handle_directive(zan_lexer_t *lex) {
             while (!lexer_at_end(lex) && lexer_peek_ch(lex) != '\n' && mi < 255)
                 msg[mi++] = lexer_advance(lex);
             msg[mi] = '\0';
-            zan_diag_emit(lex->diag, DIAG_WARNING, lexer_loc(lex), "#warning %s", msg);
+            zan_diag_emit_code(lex->diag, DIAG_WARNING, lexer_loc(lex), 3, "#warning %s", msg);
         }
     }
     int honor_conditional =
@@ -630,7 +630,7 @@ static void lexer_skip_whitespace(zan_lexer_t *lex) {
                 }
             }
             if (depth > 0) {
-                zan_diag_emit(lex->diag, DIAG_ERROR, start_loc,
+                zan_diag_emit_code(lex->diag, DIAG_ERROR, start_loc, 4,
                               "unterminated multi-line comment");
             }
             continue;
@@ -693,14 +693,14 @@ static int64_t lexer_radix_int_value(zan_lexer_t *lex, zan_loc_t loc,
     errno = 0;
     unsigned long long uv = strtoull(buf, NULL, radix);
     if (errno == ERANGE) {
-        zan_diag_emit(lex->diag, DIAG_ERROR, loc,
+        zan_diag_emit_code(lex->diag, DIAG_ERROR, loc, 5,
                       "integer literal is too large for 'ulong'");
         *lit_suffix = 0;
         return 0;
     }
     if (uv <= 0x7FFFFFFFFFFFFFFFULL) return (int64_t)uv;
     if (*lit_suffix == 1) {
-        zan_diag_emit(lex->diag, DIAG_ERROR, loc,
+        zan_diag_emit_code(lex->diag, DIAG_ERROR, loc, 6,
                       "integer literal is too large for 'long'");
         return (int64_t)uv;
     }
@@ -729,7 +729,7 @@ static zan_token_t lexer_number(zan_lexer_t *lex) {
                 }
             }
             if (!digit_seen) {
-                zan_diag_emit(lex->diag, DIAG_ERROR, loc,
+                zan_diag_emit_code(lex->diag, DIAG_ERROR, loc, 7,
                               "hexadecimal literal requires at least one digit after '0x'");
                 return lexer_make(lex, TK_INVALID, loc);
             }
@@ -749,7 +749,7 @@ static zan_token_t lexer_number(zan_lexer_t *lex) {
             }
             buf[bi] = '\0';
             if (lit_truncated)
-                zan_diag_emit(lex->diag, DIAG_ERROR, loc,
+                zan_diag_emit_code(lex->diag, DIAG_ERROR, loc, 8,
                               "integer literal is too long");
             tok.int_val = lexer_radix_int_value(lex, loc, buf, 16,
                                                 &tok.lit_suffix);
@@ -769,7 +769,7 @@ static zan_token_t lexer_number(zan_lexer_t *lex) {
                 }
             }
             if (!digit_seen) {
-                zan_diag_emit(lex->diag, DIAG_ERROR, loc,
+                zan_diag_emit_code(lex->diag, DIAG_ERROR, loc, 9,
                               "binary literal requires at least one digit after '0b'");
                 return lexer_make(lex, TK_INVALID, loc);
             }
@@ -789,7 +789,7 @@ static zan_token_t lexer_number(zan_lexer_t *lex) {
             }
             buf[bi] = '\0';
             if (lit_truncated)
-                zan_diag_emit(lex->diag, DIAG_ERROR, loc,
+                zan_diag_emit_code(lex->diag, DIAG_ERROR, loc, 8,
                               "integer literal is too long");
             tok.int_val = lexer_radix_int_value(lex, loc, buf, 2,
                                                 &tok.lit_suffix);
@@ -811,10 +811,10 @@ static zan_token_t lexer_number(zan_lexer_t *lex) {
             if (!digit_seen) {
                 char bad = lexer_peek_ch(lex);
                 if (bad >= '8' && bad <= '9')
-                    zan_diag_emit(lex->diag, DIAG_ERROR, loc,
+                    zan_diag_emit_code(lex->diag, DIAG_ERROR, loc, 10,
                                   "octal literal requires digits 0-7 after '0o'");
                 else
-                    zan_diag_emit(lex->diag, DIAG_ERROR, loc,
+                    zan_diag_emit_code(lex->diag, DIAG_ERROR, loc, 11,
                                   "octal literal requires at least one digit after '0o'");
                 return lexer_make(lex, TK_INVALID, loc);
             }
@@ -834,7 +834,7 @@ static zan_token_t lexer_number(zan_lexer_t *lex) {
             }
             buf[bi] = '\0';
             if (lit_truncated)
-                zan_diag_emit(lex->diag, DIAG_ERROR, loc,
+                zan_diag_emit_code(lex->diag, DIAG_ERROR, loc, 8,
                               "integer literal is too long");
             tok.int_val = lexer_radix_int_value(lex, loc, buf, 8,
                                                 &tok.lit_suffix);
@@ -876,7 +876,7 @@ static zan_token_t lexer_number(zan_lexer_t *lex) {
             exp_digit_seen = true;
         }
         if (!exp_digit_seen) {
-            zan_diag_emit(lex->diag, DIAG_ERROR, loc,
+            zan_diag_emit_code(lex->diag, DIAG_ERROR, loc, 12,
                           "exponent requires at least one digit after 'e'");
             return lexer_make(lex, TK_INVALID, loc);
         }
@@ -912,7 +912,7 @@ static zan_token_t lexer_number(zan_lexer_t *lex) {
     }
     buf[bi] = '\0';
     if (lit_truncated) {
-        zan_diag_emit(lex->diag, DIAG_ERROR, loc, is_float || is_decimal
+        zan_diag_emit_code(lex->diag, DIAG_ERROR, loc, 13, is_float || is_decimal
                       ? "floating-point/decimal literal is too long"
                       : "integer literal is too long");
     }
@@ -938,11 +938,11 @@ static zan_token_t lexer_number(zan_lexer_t *lex) {
             errno = 0;
             unsigned long long uv = strtoull(buf, NULL, 10);
             if (errno == ERANGE) {
-                zan_diag_emit(lex->diag, DIAG_ERROR, loc,
+                zan_diag_emit_code(lex->diag, DIAG_ERROR, loc, 5,
                               "integer literal is too large for 'ulong'");
                 tok.int_val = 0;
             } else if (lit_suffix == 1) {
-                zan_diag_emit(lex->diag, DIAG_ERROR, loc,
+                zan_diag_emit_code(lex->diag, DIAG_ERROR, loc, 6,
                               "integer literal is too large for 'long'");
                 tok.int_val = (int64_t)uv;
             } else {
@@ -999,7 +999,7 @@ static int32_t lexer_hex_escape(zan_lexer_t *lex, zan_loc_t loc, char kind,
             got++;
         }
         if (got == 0) {
-            zan_diag_emit(lex->diag, DIAG_ERROR, loc,
+            zan_diag_emit_code(lex->diag, DIAG_ERROR, loc, 14,
                           "'\\x' escape requires at least one hex digit");
             return -1;
         }
@@ -1007,7 +1007,7 @@ static int32_t lexer_hex_escape(zan_lexer_t *lex, zan_loc_t loc, char kind,
         for (int i = 0; i < ndigits; i++) {
             char ch = lexer_peek_ch(lex);
             if (!isxdigit((unsigned char)ch)) {
-                zan_diag_emit(lex->diag, DIAG_ERROR, loc,
+                zan_diag_emit_code(lex->diag, DIAG_ERROR, loc, 15,
                               "'\\u' escape requires %d hex digits", ndigits);
                 return -1;
             }
@@ -1018,7 +1018,7 @@ static int32_t lexer_hex_escape(zan_lexer_t *lex, zan_loc_t loc, char kind,
         }
     }
     if (val >= 0xD800 && val <= 0xDFFF) {
-        zan_diag_emit(lex->diag, DIAG_ERROR, loc,
+        zan_diag_emit_code(lex->diag, DIAG_ERROR, loc, 16,
                       "'\\%c' escape value 0x%X is a surrogate code point",
                       kind, val);
         return -1;
@@ -1047,7 +1047,7 @@ static int lexer_escape_seq(zan_lexer_t *lex, zan_loc_t loc, zan_esc_out_t *out)
         return zan_utf8_encode((uint32_t)cp, out);
     }
     default:
-        zan_diag_emit(lex->diag, DIAG_ERROR, loc,
+        zan_diag_emit_code(lex->diag, DIAG_ERROR, loc, 17,
                       "invalid escape sequence '\\%c'", ch);
         out->bytes[0] = ch;
         return 1;
@@ -1080,7 +1080,7 @@ static int64_t lexer_escape_char_cp(zan_lexer_t *lex) {
         return (int64_t)cp;
     }
     default:
-        zan_diag_emit(lex->diag, DIAG_ERROR, loc,
+        zan_diag_emit_code(lex->diag, DIAG_ERROR, loc, 17,
                       "invalid escape sequence '\\%c'", ch);
         return (int64_t)(unsigned char)ch;
     }
@@ -1116,7 +1116,7 @@ static void zan_lex_strbuf_push(zan_lex_strbuf_t *sb, char ch) {
 static char *zan_lex_strbuf_take(zan_lexer_t *lex, zan_lex_strbuf_t *sb,
                                  size_t *out_len) {
     if (sb->oom) {
-        zan_diag_emit(lex->diag, DIAG_ERROR, lexer_loc(lex),
+        zan_diag_emit_code(lex->diag, DIAG_ERROR, lexer_loc(lex), 18,
                       "out of memory while lexing string literal");
         free(sb->buf);
         sb->buf = NULL;
@@ -1146,7 +1146,7 @@ static zan_token_t lexer_string(zan_lexer_t *lex) {
                 zan_lex_strbuf_push(&sb, esc.bytes[i]);
             }
         } else if (lexer_peek_ch(lex) == '\n') {
-            zan_diag_emit(lex->diag, DIAG_ERROR, loc, "unterminated string literal");
+            zan_diag_emit_code(lex->diag, DIAG_ERROR, loc, 19, "unterminated string literal");
             break;
         } else {
             zan_lex_strbuf_push(&sb, lexer_advance(lex));
@@ -1156,7 +1156,7 @@ static zan_token_t lexer_string(zan_lexer_t *lex) {
     if (!lexer_at_end(lex)) {
         lexer_advance(lex); /* closing " */
     } else {
-        zan_diag_emit(lex->diag, DIAG_ERROR, loc, "unterminated string literal");
+        zan_diag_emit_code(lex->diag, DIAG_ERROR, loc, 19, "unterminated string literal");
     }
 
     size_t bi = 0;
@@ -1218,7 +1218,7 @@ static zan_token_t lexer_char(zan_lexer_t *lex) {
     }
 
     if (lexer_peek_ch(lex) != '\'') {
-        zan_diag_emit(lex->diag, DIAG_ERROR, loc, "unterminated character literal");
+        zan_diag_emit_code(lex->diag, DIAG_ERROR, loc, 20, "unterminated character literal");
     } else {
         lexer_advance(lex); /* closing ' */
     }
@@ -1256,7 +1256,7 @@ static zan_token_t lexer_interp_string_segment(zan_lexer_t *lex, zan_token_kind_
                 zan_lex_strbuf_push(&sb, esc.bytes[i]);
             }
         } else if (lexer_peek_ch(lex) == '\n') {
-            zan_diag_emit(lex->diag, DIAG_ERROR, loc, "unterminated interpolated string");
+            zan_diag_emit_code(lex->diag, DIAG_ERROR, loc, 21, "unterminated interpolated string");
             break;
         } else {
             zan_lex_strbuf_push(&sb, lexer_advance(lex));
@@ -1267,7 +1267,7 @@ static zan_token_t lexer_interp_string_segment(zan_lexer_t *lex, zan_token_kind_
     if (lexer_peek_ch(lex) == '{') {
         lexer_advance(lex); /* { */
         if (lex->interp_depth >= ZAN_MAX_INTERP_DEPTH) {
-            zan_diag_emit(lex->diag, DIAG_ERROR, loc,
+            zan_diag_emit_code(lex->diag, DIAG_ERROR, loc, 22,
                           "interpolated strings nested more than %d deep",
                           ZAN_MAX_INTERP_DEPTH);
         } else {
@@ -1284,7 +1284,7 @@ static zan_token_t lexer_interp_string_segment(zan_lexer_t *lex, zan_token_kind_
         if (!lexer_at_end(lex)) {
             lexer_advance(lex); /* " */
         } else {
-            zan_diag_emit(lex->diag, DIAG_ERROR, loc,
+            zan_diag_emit_code(lex->diag, DIAG_ERROR, loc, 21,
                           "unterminated interpolated string");
         }
         kind = (start_kind == TK_INTERP_START) ? TK_STRING_LIT : TK_INTERP_END;
@@ -1306,12 +1306,12 @@ static zan_token_t lexer_interp_format(zan_lexer_t *lex, zan_loc_t loc) {
         else lexer_advance(lex);
     }
     if (bi >= sizeof(buf) - 1) {
-        zan_diag_emit(lex->diag, DIAG_ERROR, loc,
+        zan_diag_emit_code(lex->diag, DIAG_ERROR, loc, 23,
                       "interpolation format specifier exceeds %d characters and was truncated",
                       (int)sizeof(buf) - 1);
     }
     if (lexer_at_end(lex)) {
-        zan_diag_emit(lex->diag, DIAG_ERROR, loc,
+        zan_diag_emit_code(lex->diag, DIAG_ERROR, loc, 21,
                       "unterminated interpolated string");
     }
     zan_token_t tok = lexer_make(lex, TK_INTERP_FMT, loc);
@@ -1366,7 +1366,7 @@ static zan_token_t lexer_interp_raw_segment(zan_lexer_t *lex,
                     lexer_advance(lex);
                 }
                 if (qrun > 3) {
-                    zan_diag_emit(lex->diag, DIAG_ERROR, loc,
+                    zan_diag_emit_code(lex->diag, DIAG_ERROR, loc, 24,
                                   "too many closing quotes in raw string literal");
                 }
                 goto closed;
@@ -1389,7 +1389,7 @@ static zan_token_t lexer_interp_raw_segment(zan_lexer_t *lex,
                 k++;
             }
             if (k < strip && lexer_peek_ch(lex) != '\n' && !lexer_at_end(lex)) {
-                zan_diag_emit(lex->diag, DIAG_ERROR, loc,
+                zan_diag_emit_code(lex->diag, DIAG_ERROR, loc, 25,
                               "insufficient indentation for raw string literal");
             }
         } else {
@@ -1397,7 +1397,7 @@ static zan_token_t lexer_interp_raw_segment(zan_lexer_t *lex,
         }
     }
     if (lexer_at_end(lex)) {
-        zan_diag_emit(lex->diag, DIAG_ERROR, loc,
+        zan_diag_emit_code(lex->diag, DIAG_ERROR, loc, 26,
                       "unterminated raw interpolated string");
         goto closed;
     }
@@ -1406,7 +1406,7 @@ static zan_token_t lexer_interp_raw_segment(zan_lexer_t *lex,
     lexer_advance(lex); /* { */
     {
         if (lex->interp_depth >= ZAN_MAX_INTERP_DEPTH) {
-            zan_diag_emit(lex->diag, DIAG_ERROR, loc,
+            zan_diag_emit_code(lex->diag, DIAG_ERROR, loc, 22,
                           "interpolated strings nested more than %d deep",
                           ZAN_MAX_INTERP_DEPTH);
         } else {
@@ -1458,7 +1458,7 @@ static zan_token_t lexer_interp_raw_open(zan_lexer_t *lex) {
             k++;
         }
         if (k < strip && lexer_peek_ch(lex) != '\n' && !lexer_at_end(lex)) {
-            zan_diag_emit(lex->diag, DIAG_ERROR, lexer_loc(lex),
+            zan_diag_emit_code(lex->diag, DIAG_ERROR, lexer_loc(lex), 25,
                           "insufficient indentation for raw string literal");
         }
     }
@@ -1495,7 +1495,7 @@ static zan_token_t lexer_interp_verbatim_segment(zan_lexer_t *lex, zan_token_kin
     if (lexer_peek_ch(lex) == '{') {
         lexer_advance(lex); /* { */
         if (lex->interp_depth >= ZAN_MAX_INTERP_DEPTH) {
-            zan_diag_emit(lex->diag, DIAG_ERROR, loc,
+            zan_diag_emit_code(lex->diag, DIAG_ERROR, loc, 22,
                           "interpolated strings nested more than %d deep",
                           ZAN_MAX_INTERP_DEPTH);
         } else {
@@ -1512,7 +1512,7 @@ static zan_token_t lexer_interp_verbatim_segment(zan_lexer_t *lex, zan_token_kin
         if (!lexer_at_end(lex)) {
             lexer_advance(lex); /* closing " */
         } else {
-            zan_diag_emit(lex->diag, DIAG_ERROR, loc,
+            zan_diag_emit_code(lex->diag, DIAG_ERROR, loc, 27,
                           "unterminated verbatim interpolated string");
         }
         kind = (start_kind == TK_INTERP_START) ? TK_STRING_LIT : TK_INTERP_END;
@@ -1549,7 +1549,7 @@ static zan_token_t lexer_verbatim_string(zan_lexer_t *lex) {
         }
     }
     if (lexer_at_end(lex)) {
-        zan_diag_emit(lex->diag, DIAG_ERROR, loc,
+        zan_diag_emit_code(lex->diag, DIAG_ERROR, loc, 28,
                       "unterminated verbatim string literal");
     }
 
@@ -1585,7 +1585,7 @@ static zan_token_t lexer_raw_string(zan_lexer_t *lex) {
                     lexer_advance(lex);
                 }
                 if (qrun > 3) {
-                    zan_diag_emit(lex->diag, DIAG_ERROR, loc,
+                    zan_diag_emit_code(lex->diag, DIAG_ERROR, loc, 24,
                                   "too many closing quotes in raw string literal");
                 }
                 goto closed;
@@ -1595,7 +1595,7 @@ static zan_token_t lexer_raw_string(zan_lexer_t *lex) {
         while (qrun > 0) { zan_lex_strbuf_push(&sb, '"'); qrun--; }
         zan_lex_strbuf_push(&sb, lexer_advance(lex));
     }
-    zan_diag_emit(lex->diag, DIAG_ERROR, loc,
+    zan_diag_emit_code(lex->diag, DIAG_ERROR, loc, 29,
                   "unterminated raw string literal");
 closed: ;
 
@@ -1622,7 +1622,7 @@ closed: ;
                        (r[lead] == ' ' || r[lead] == '\t'))
                     lead++;
                 if (lead < strip && r[lead] != '\n') {
-                    zan_diag_emit(lex->diag, DIAG_ERROR, loc,
+                    zan_diag_emit_code(lex->diag, DIAG_ERROR, loc, 25,
                                   "insufficient indentation for raw string literal");
                 }
                 r += lead;
@@ -1650,7 +1650,7 @@ pp_retry:
 
     if (lexer_at_end(lex)) {
         if (lex->cond_depth > 0) {
-            zan_diag_emit(lex->diag, DIAG_WARNING, lexer_loc(lex),
+            zan_diag_emit_code(lex->diag, DIAG_WARNING, lexer_loc(lex), 30,
                           "unterminated #if/#ifdef (missing #endif)");
         }
         return lexer_make(lex, TK_EOF, lexer_loc(lex));
@@ -1843,7 +1843,7 @@ pp_retry:
         return lexer_make(lex, TK_CARET, loc);
 
     default:
-        zan_diag_emit(lex->diag, DIAG_ERROR, loc,
+        zan_diag_emit_code(lex->diag, DIAG_ERROR, loc, 31,
                       "unexpected character '%c' (0x%02x)", ch, (unsigned char)ch);
         return lexer_make(lex, TK_INVALID, loc);
     }

@@ -31,7 +31,7 @@ static void parser_expect(zan_parser_t *p, zan_token_kind_t kind) {
         parser_advance(p);
         return;
     }
-    zan_diag_emit(p->diag, DIAG_ERROR, p->current.loc,
+    zan_diag_emit_code(p->diag, DIAG_ERROR, p->current.loc, 32,
                   "expected '%s', got '%s'",
                   zan_token_kind_name(kind),
                   zan_token_kind_name(p->current.kind));
@@ -55,7 +55,7 @@ static const char *const ZAN_RESERVED_WORD_MSG =
 static bool parser_take_reserved_word(zan_parser_t *p, zan_istr_t *name_out) {
     const char *word = zan_lexer_keyword_text(p->current.kind);
     if (!word) return false;
-    zan_diag_emit(p->diag, DIAG_ERROR, p->current.loc, ZAN_RESERVED_WORD_MSG, word);
+    zan_diag_emit_code(p->diag, DIAG_ERROR, p->current.loc, 33, ZAN_RESERVED_WORD_MSG, word);
     parser_advance(p);
     if (name_out) {
         name_out->str = (char *)word;
@@ -69,9 +69,9 @@ static bool parser_take_reserved_word(zan_parser_t *p, zan_istr_t *name_out) {
 static void parser_diag_expected_name(zan_parser_t *p, zan_loc_t loc, const char *generic) {
     const char *word = zan_lexer_keyword_text(p->current.kind);
     if (word) {
-        zan_diag_emit(p->diag, DIAG_ERROR, p->current.loc, ZAN_RESERVED_WORD_MSG, word);
+        zan_diag_emit_code(p->diag, DIAG_ERROR, p->current.loc, 33, ZAN_RESERVED_WORD_MSG, word);
     } else {
-        zan_diag_emit(p->diag, DIAG_ERROR, loc, "%s", generic);
+        zan_diag_emit_code(p->diag, DIAG_ERROR, loc, 34, "%s", generic);
     }
 }
 
@@ -97,7 +97,7 @@ static void parser_expect_gt(zan_parser_t *p) {
         p->current.loc.col += 1;
         return;
     default:
-        zan_diag_emit(p->diag, DIAG_ERROR, p->current.loc,
+        zan_diag_emit_code(p->diag, DIAG_ERROR, p->current.loc, 32,
                       "expected '%s', got '%s'",
                       zan_token_kind_name(TK_GREATER),
                       zan_token_kind_name(p->current.kind));
@@ -224,7 +224,7 @@ static bool parse_top_level_decl(zan_parser_t *p, zan_ast_node_t *unit) {
         zan_ast_list_push(&unit->comp_unit.decls, ddecl, p->arena);
         return true;
     }
-    zan_diag_emit(p->diag, DIAG_ERROR, p->current.loc,
+    zan_diag_emit_code(p->diag, DIAG_ERROR, p->current.loc, 35,
                   "expected type declaration (class, struct, interface, enum, or delegate)");
     return false;
 }
@@ -280,7 +280,7 @@ static zan_ast_node_t *parse_type_ref(zan_parser_t *p) {
     p->type_no_nullable = 0;
 
     if (++p->type_depth > ZAN_PARSER_MAX_TYPE_DEPTH) {
-        zan_diag_emit(p->diag, DIAG_ERROR, loc,
+        zan_diag_emit_code(p->diag, DIAG_ERROR, loc, 36,
                       "type nesting too deep (max %d)",
                       ZAN_PARSER_MAX_TYPE_DEPTH);
         p->type_depth--;
@@ -353,7 +353,7 @@ static zan_ast_node_t *parse_type_ref(zan_parser_t *p) {
             name.len = (uint32_t)qn;
         }
     } else {
-        zan_diag_emit(p->diag, DIAG_ERROR, loc, "expected type");
+        zan_diag_emit_code(p->diag, DIAG_ERROR, loc, 37, "expected type");
         p->type_depth--;
         return parser_error_node(p);
     }
@@ -395,7 +395,7 @@ static zan_ast_node_t *parse_type_ref(zan_parser_t *p) {
             if (rank <= 16 && nranks < 16) {
                 ranks[nranks++] = rank;
             } else {
-                zan_diag_emit(p->diag, DIAG_ERROR, loc,
+                zan_diag_emit_code(p->diag, DIAG_ERROR, loc, 38,
                               "array rank specifier is too deep (max 16)");
             }
             seen_array = true;
@@ -676,7 +676,7 @@ static zan_ast_node_t *parse_primary(zan_parser_t *p) {
                     if (!(p->current.kind == TK_IDENT &&
                           p->current.str_val.len == 2 &&
                           memcmp(p->current.str_val.str, "on", 2) == 0)) {
-                        zan_diag_emit(p->diag, DIAG_ERROR, p->current.loc,
+                        zan_diag_emit_code(p->diag, DIAG_ERROR, p->current.loc, 39,
                                       "expected 'on' in join clause");
                     } else {
                         parser_advance(p);
@@ -685,7 +685,7 @@ static zan_ast_node_t *parse_primary(zan_parser_t *p) {
                     if (!(p->current.kind == TK_IDENT &&
                           p->current.str_val.len == 6 &&
                           memcmp(p->current.str_val.str, "equals", 6) == 0)) {
-                        zan_diag_emit(p->diag, DIAG_ERROR, p->current.loc,
+                        zan_diag_emit_code(p->diag, DIAG_ERROR, p->current.loc, 40,
                                       "expected 'equals' in join clause");
                     } else {
                         parser_advance(p);
@@ -712,7 +712,7 @@ static zan_ast_node_t *parse_primary(zan_parser_t *p) {
                 if (!(p->current.kind == TK_IDENT &&
                       p->current.str_val.len == 2 &&
                       memcmp(p->current.str_val.str, "by", 2) == 0)) {
-                    zan_diag_emit(p->diag, DIAG_ERROR, p->current.loc,
+                    zan_diag_emit_code(p->diag, DIAG_ERROR, p->current.loc, 41,
                                   "expected 'by' in group clause");
                 } else {
                     parser_advance(p);
@@ -730,7 +730,7 @@ static zan_ast_node_t *parse_primary(zan_parser_t *p) {
                 memcmp(p->current.str_val.str, "select", 6) == 0) {
                 if (n->query.group_expr && n->query.group_into.len == 0) {
                     /* `group e by k` without `into` is terminal. */
-                    zan_diag_emit(p->diag, DIAG_ERROR, p->current.loc,
+                    zan_diag_emit_code(p->diag, DIAG_ERROR, p->current.loc, 42,
                                   "a group clause without 'into' must be the "
                                   "final clause of the query");
                 } else {
@@ -738,7 +738,7 @@ static zan_ast_node_t *parse_primary(zan_parser_t *p) {
                     n->query.select = parse_expression(p);
                 }
             } else if (!n->query.group_expr) {
-                zan_diag_emit(p->diag, DIAG_ERROR, p->current.loc,
+                zan_diag_emit_code(p->diag, DIAG_ERROR, p->current.loc, 43,
                               "expected 'select' in query expression");
                 n->query.select = parser_error_node(p);
             }
@@ -857,7 +857,7 @@ static zan_ast_node_t *parse_primary(zan_parser_t *p) {
                 name = arg->member.name;
             }
             if (!name.str) {
-                zan_diag_emit(p->diag, DIAG_ERROR, loc,
+                zan_diag_emit_code(p->diag, DIAG_ERROR, loc, 44,
                               "nameof argument must be an identifier or member access");
                 name.str = "";
                 name.len = 0;
@@ -1009,7 +1009,7 @@ static zan_ast_node_t *parse_primary(zan_parser_t *p) {
             while (!parser_check(p, TK_RBRACKET) && !parser_check(p, TK_EOF)) {
                 if (n->new_expr.array_rank >= 16) {
                     /* 多维数组维度上限校验 (最大支持 16 维) */
-                    zan_diag_emit(p->diag, DIAG_ERROR, p->current.loc,
+                    zan_diag_emit_code(p->diag, DIAG_ERROR, p->current.loc, 38,
                                   "array rank specifier is too deep (max 16)");
                 }
                 zan_ast_node_t *dim = parse_expression(p);
@@ -1025,7 +1025,7 @@ static zan_ast_node_t *parse_primary(zan_parser_t *p) {
                 for (int c = 1; c < rank; c++) parser_advance(p);
                 parser_advance(p);
                 if (rank > 16) {
-                    zan_diag_emit(p->diag, DIAG_ERROR, loc,
+                    zan_diag_emit_code(p->diag, DIAG_ERROR, loc, 38,
                                   "array rank specifier is too deep (max 16)");
                     continue;
                 }
@@ -1099,7 +1099,7 @@ static zan_ast_node_t *parse_primary(zan_parser_t *p) {
         return n;
     }
     default:
-        zan_diag_emit(p->diag, DIAG_ERROR, loc,
+        zan_diag_emit_code(p->diag, DIAG_ERROR, loc, 45,
                       "unexpected token '%s' in expression",
                       zan_token_kind_name(p->current.kind));
         parser_advance(p);
@@ -1614,7 +1614,7 @@ static zan_ast_node_t *parse_unary_inner(zan_parser_t *p);
 static zan_ast_node_t *parser_expr_too_deep(zan_parser_t *p) {
     if (!p->expr_depth_reported) {
         p->expr_depth_reported = true;
-        zan_diag_emit(p->diag, DIAG_ERROR, p->current.loc,
+        zan_diag_emit_code(p->diag, DIAG_ERROR, p->current.loc, 46,
                       "expression nesting too deep (max %d)",
                       ZAN_PARSER_MAX_EXPR_DEPTH);
     }
@@ -1750,7 +1750,7 @@ static zan_ast_node_t *parse_binary(zan_parser_t *p, int min_prec) {
 
         if (++chain > ZAN_PARSER_MAX_BINOP_CHAIN) {
             if (!p->chain_cap_reported) {
-                zan_diag_emit(p->diag, DIAG_ERROR, p->current.loc,
+                zan_diag_emit_code(p->diag, DIAG_ERROR, p->current.loc, 47,
                               "expression chain too long (max %d operators); "
                               "split it into statements",
                               ZAN_PARSER_MAX_BINOP_CHAIN);
@@ -1927,7 +1927,7 @@ static void parse_block_stmts(zan_parser_t *p, zan_ast_list_t *stmts_list) {
             zan_loc_t defer_loc = p->current.loc;
             parser_advance(p);
             if (p->stmt_depth >= ZAN_PARSER_MAX_STMT_DEPTH) {
-                zan_diag_emit(p->diag, DIAG_ERROR, defer_loc,
+                zan_diag_emit_code(p->diag, DIAG_ERROR, defer_loc, 48,
                               "statement nesting too deep (max %d)",
                               ZAN_PARSER_MAX_STMT_DEPTH);
                 if (!parser_check(p, TK_RBRACE) && !parser_check(p, TK_EOF))
@@ -1975,7 +1975,7 @@ static void parse_block_stmts(zan_parser_t *p, zan_ast_list_t *stmts_list) {
 
 static zan_ast_node_t *parse_block(zan_parser_t *p) {
     if (p->stmt_depth >= ZAN_PARSER_MAX_STMT_DEPTH) {
-        zan_diag_emit(p->diag, DIAG_ERROR, p->current.loc,
+        zan_diag_emit_code(p->diag, DIAG_ERROR, p->current.loc, 48,
                       "statement nesting too deep (max %d)",
                       ZAN_PARSER_MAX_STMT_DEPTH);
         while (!parser_check(p, TK_RBRACE) && !parser_check(p, TK_EOF))
@@ -2081,7 +2081,7 @@ static zan_ast_node_t *parse_tuple_decon_body(zan_parser_t *p, zan_loc_t loc,
                       type_prefix->type_ref.name.len == 3 &&
                       memcmp(type_prefix->type_ref.name.str, "var", 3) == 0;
         if (!is_var) {
-            zan_diag_emit(p->diag, DIAG_ERROR, loc,
+            zan_diag_emit_code(p->diag, DIAG_ERROR, loc, 49,
                           "unsupported tuple deconstruction form");
             return n;
         }
@@ -2139,7 +2139,7 @@ static zan_ast_node_t *parse_embedded_stmt(zan_parser_t *p) {
     }
 
     if (p->stmt_depth >= ZAN_PARSER_MAX_STMT_DEPTH) {
-        zan_diag_emit(p->diag, DIAG_ERROR, p->current.loc,
+        zan_diag_emit_code(p->diag, DIAG_ERROR, p->current.loc, 48,
                       "statement nesting too deep (max %d)",
                       ZAN_PARSER_MAX_STMT_DEPTH);
         parser_advance(p);
@@ -2152,7 +2152,7 @@ static zan_ast_node_t *parse_embedded_stmt(zan_parser_t *p) {
 
     zan_loc_t loc = p->current.loc;
     if (looks_like_var_decl(p)) {
-        zan_diag_emit(p->diag, DIAG_ERROR, loc,
+        zan_diag_emit_code(p->diag, DIAG_ERROR, loc, 50,
                       "a declaration cannot be used as a single-statement body; "
                       "enclose it in braces");
     }
@@ -2463,7 +2463,7 @@ static zan_ast_node_t *parse_if_stmt(zan_parser_t *p) {
     if (parser_match(p, TK_ELSE)) {
         if (parser_check(p, TK_IF)) {
             if (p->stmt_depth >= ZAN_PARSER_MAX_STMT_DEPTH) {
-                zan_diag_emit(p->diag, DIAG_ERROR, p->current.loc,
+                zan_diag_emit_code(p->diag, DIAG_ERROR, p->current.loc, 48,
                               "statement nesting too deep (max %d)",
                               ZAN_PARSER_MAX_STMT_DEPTH);
                 parser_advance(p);
@@ -2918,7 +2918,7 @@ static zan_ast_node_t *parse_local_func(zan_parser_t *p) {
         ret->ret.value = expr;
         zan_ast_list_push(&body->block.stmts, ret, p->arena);
     } else {
-        zan_diag_emit(p->diag, DIAG_ERROR, p->current.loc,
+        zan_diag_emit_code(p->diag, DIAG_ERROR, p->current.loc, 51,
                       "expected local function body");
         return parser_error_node(p);
     }
@@ -3022,7 +3022,7 @@ static zan_ast_node_t *parse_statement(zan_parser_t *p) {
     case TK_DEFER: {
         zan_loc_t loc = p->current.loc;
         if (p->stmt_depth >= ZAN_PARSER_MAX_STMT_DEPTH) {
-            zan_diag_emit(p->diag, DIAG_ERROR, loc,
+            zan_diag_emit_code(p->diag, DIAG_ERROR, loc, 48,
                           "statement nesting too deep (max %d)",
                           ZAN_PARSER_MAX_STMT_DEPTH);
             parser_advance(p);
@@ -3429,7 +3429,7 @@ static void desugar_yield_method(zan_parser_t *p, zan_ast_node_t *m) {
     if (!body || !stmt_contains_yield(body)) return;
     zan_ast_node_t *rt = m->method_decl.return_type;
     if (!rt || rt->kind != AST_TYPE_REF || rt->type_ref.type_args.count != 1) {
-        zan_diag_emit(p->diag, DIAG_ERROR, m->loc,
+        zan_diag_emit_code(p->diag, DIAG_ERROR, m->loc, 52,
                       "iterator method '%.*s' must return IEnumerable<T> or List<T>",
                       (int)m->method_decl.name.len, m->method_decl.name.str);
         return;
@@ -4133,7 +4133,7 @@ static zan_ast_node_t *parse_type_decl(zan_parser_t *p, uint32_t modifiers) {
     } else if (parser_match(p, TK_ENUM)) {
         kind = AST_ENUM_DECL;
     } else {
-        zan_diag_emit(p->diag, DIAG_ERROR, loc, "expected class, struct, interface, or enum");
+        zan_diag_emit_code(p->diag, DIAG_ERROR, loc, 53, "expected class, struct, interface, or enum");
         return parser_error_node(p);
     }
 
@@ -4292,7 +4292,7 @@ zan_ast_node_t *zan_parser_parse(zan_parser_t *p) {
             for (;;) {
                 if (parser_match(p, TK_RBRACE)) break;
                 if (parser_check(p, TK_EOF)) {
-                    zan_diag_emit(p->diag, DIAG_ERROR, p->current.loc,
+                    zan_diag_emit_code(p->diag, DIAG_ERROR, p->current.loc, 54,
                                   "unexpected end of file inside namespace block; missing '}'");
                     break;
                 }
@@ -4307,7 +4307,7 @@ zan_ast_node_t *zan_parser_parse(zan_parser_t *p) {
             parser_advance(p); /* skip to recover */
         if (parser_check(p, TK_RBRACE)) {
             /* 顶层游离右大括号容错：报告语法错误并跳过以继续解析后续声明 */
-            zan_diag_emit(p->diag, DIAG_ERROR, p->current.loc,
+            zan_diag_emit_code(p->diag, DIAG_ERROR, p->current.loc, 55,
                           "unexpected '}' at top level");
             parser_advance(p);
         }
@@ -4432,7 +4432,7 @@ static void gen_event_holder(zan_ast_node_t *unit, zan_ast_node_t *ddecl,
 
     if (n >= cap) {
         zan_loc_t loc = {0};
-        zan_diag_emit(diag, DIAG_ERROR, loc,
+        zan_diag_emit_code(diag, DIAG_ERROR, loc, 56,
                       "declaration too large to lower: generated source "
                       "exceeds %d bytes", cap);
         free(src);
@@ -4539,7 +4539,7 @@ static void gen_record_class(zan_ast_node_t *unit, zan_istr_t rname,
 
     if (n >= cap) {
         zan_loc_t loc = {0};
-        zan_diag_emit(diag, DIAG_ERROR, loc,
+        zan_diag_emit_code(diag, DIAG_ERROR, loc, 56,
                       "declaration too large to lower: generated source "
                       "exceeds %d bytes", cap);
         free(src);
@@ -4665,13 +4665,13 @@ void zan_parser_desugar_events(zan_ast_node_t *unit, zan_arena_t *arena,
                 continue;
             zan_ast_node_t *tr = m->field_decl.type;
             if (!tr || tr->kind != AST_TYPE_REF || tr->type_ref.type_args.count) {
-                zan_diag_emit(diag, DIAG_ERROR, m->loc,
+                zan_diag_emit_code(diag, DIAG_ERROR, m->loc, 57,
                               "event field requires a non-generic delegate type");
                 continue;
             }
             zan_ast_node_t *ddecl = find_delegate_decl(unit, tr->type_ref.name);
             if (!ddecl) {
-                zan_diag_emit(diag, DIAG_ERROR, m->loc,
+                zan_diag_emit_code(diag, DIAG_ERROR, m->loc, 58,
                               "event type '%.*s' is not a declared delegate",
                               (int)tr->type_ref.name.len, tr->type_ref.name.str);
                 continue;
