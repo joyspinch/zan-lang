@@ -1,0 +1,585 @@
+using System;
+using System.Collections.Generic;
+using System.Data.Orm;
+using System.Text;
+using System.Web;
+using ZanWeb.Api;
+using ZanWeb.Dao.Lifecycle;
+using ZanWeb.Model.Collab;
+using ZanWeb.Model.Lifecycle;
+using ZanWeb.Model;
+
+namespace ZanWeb.Admin.Lifecycle;
+
+/* 全生命周期协同大屏工作台：
+   遵循"网页优先、客户端配合快捷操作"架构设计，作为全链路大屏监控、项目复盘、多业务模板配置与审核工作台。
+   展示项目概览 KPI、全流程多阶段流转推进甘特图、阶段成果/审核驳回预警列表与在线核准流转。 */
+[Route("admin/lifecycle/workbench/[action]")]
+[Custom(Authorization = CustomAuthorization.Login)]
+[Description("全链路工作台")]
+public class Workbench : AdminController {
+
+    /* 大屏工作台主界面 */
+    [HttpGet]
+    [Route("/admin/lifecycle/workbench")]
+    [Custom(IsMenu = true, Icon = "mdi:view-dashboard", Perm = PermBit.View)]
+    [Description("全链路工作台")]
+    async void Index() {
+        ViewData d = await this.Layout("全链路大屏工作台");
+        if (!this.DbReady()) { d.Set("dbDown", "1"); this.Page(d); return; }
+
+        int tid = Tenant.Cur();
+        SysUser me = await this.Admin();
+
+        /* 拉取本租户全部全生命周期项目 */
+        List<LifecycleProject> projs = await this.LifecycleProject
+            .Where(a => a.tenantId == tid)
+            .OrderByDescending(a => a.id)
+            .ToListAsync();
+
+        int totalProjects = projs.Count;
+        int inProgressCount = 0;
+        int completedCount = 0;
+        int rejectedCount = 0;
+
+        for (int i = 0; i < projs.Count; i = i + 1) {
+            LifecycleProject p = projs[i];
+            if (p.status == "completed") {
+                completedCount = completedCount + 1;
+            } else if (p.status == "rejected") {
+                rejectedCount = rejectedCount + 1;
+            } else {
+                inProgressCount = inProgressCount + 1;
+            }
+        }
+
+        d.Set("totalProjects", Convert.ToString(totalProjects));
+        d.Set("inProgressCount", Convert.ToString(inProgressCount));
+        d.Set("completedCount", Convert.ToString(completedCount));
+        d.Set("rejectedCount", Convert.ToString(rejectedCount));
+
+        /* 选中项目解析 */
+        int selId = this.InInt("projectId", 0);
+        if (selId == 0 && projs.Count > 0) {
+            selId = projs[0].id;
+        }
+
+        List<StrMap> projRows = d.AddList("projects");
+        LifecycleProject curProj = null;
+
+        for (int i = 0; i < projs.Count; i = i + 1) {
+            LifecycleProject p = projs[i];
+            StrMap pm = new StrMap();
+            pm.Set("id", Convert.ToString(p.id));
+            pm.Set("projectNo", p.projectNo);
+            pm.Set("name", p.name);
+            pm.Set("category", p.category);
+            pm.Set("status", p.status);
+            pm.Set("currentStage", p.currentStage);
+            bool isSel = (p.id == selId);
+            pm.Set("isSelected", isSel ? "selected" : "");
+            projRows.Add(pm);
+            if (isSel) { curProj = p; }
+        }
+
+        if (curProj != null) {
+            d.Set("hasProject", "1");
+            d.Set("projId", Convert.ToString(curProj.id));
+            d.Set("projNo", curProj.projectNo);
+            d.Set("projName", curProj.name);
+            d.Set("projCategory", curProj.category);
+            d.Set("projGmv", curProj.targetGmv.Length > 0 ? curProj.targetGmv : "-");
+            d.Set("projRoi", curProj.targetRoi.Length > 0 ? curProj.targetRoi : "-");
+            d.Set("convId", Convert.ToString(curProj.conversationId));
+            d.Set("curStage", curProj.currentStage);
+
+            string stZh = curProj.status == "completed" ? "已结案闭环"
+                : (curProj.status == "rejected" ? "驳回重修中" : "推进中");
+            string stCls = curProj.status == "completed" ? "good"
+                : (curProj.status == "rejected" ? "bad" : "pri");
+            d.Set("projStatusZh", stZh);
+            d.Set("projTagClass", stCls);
+
+            /* 业务模板 */
+            LifecycleTemplate tmpl = await this.LifecycleTemplate
+                .Where(a => a.id == curProj.templateId).FirstAsync();
+            d.Set("tmplName", tmpl != null ? tmpl.name : "默认模板");
+
+            /* 全部阶段节点 (按 seq 排序) */
+            List<LifecycleNode> nodes = await this.LifecycleNode
+                .Where(a => a.projectId == curProj.id)
+                .OrderBy(a => a.seq)
+                .ToListAsync();
+
+            List<LifecycleStageDetail> details = await this.LifecycleStageDetail
+                .Where(a => a.projectId == curProj.id)
+                .ToListAsync();
+
+            List<SysUser> allUsers = await this.SysUser.ToListAsync();
+            List<StrMap> nodeRows = d.AddList("nodes");
+
+            for (int i = 0; i < nodes.Count; i = i + 1) {
+                LifecycleNode n = nodes[i];
+                StrMap nm = new StrMap();
+                nm.Set("id", Convert.ToString(n.id));
+                nm.Set("seq", Convert.ToString(n.seq));
+                nm.Set("stage", n.stage);
+                nm.Set("stageName", n.stageName);
+                nm.Set("aiRole", n.aiAgentRole);
+
+                string uName = "";
+                for (int u = 0; u < allUsers.Count; u = u + 1) {
+                    if (allUsers[u].id == n.responsibleUserId) {
+                        uName = allUsers[u].nickname.Length > 0 ? allUsers[u].nickname : allUsers[u].username;
+                    }
+                }
+                nm.Set("respName", uName.Length > 0 ? uName : "责任人");
+
+                string nStZh = n.status == "passed" ? "已核准通过"
+                    : (n.status == "rejected" ? "已驳回"
+                    : (n.status == "in_progress" ? "正在推进" : "待开始"));
+                string nStCls = n.status == "passed" ? "good"
+                    : (n.status == "rejected" ? "bad"
+                    : (n.status == "in_progress" ? "pri" : ""));
+                nm.Set("status", n.status);
+                nm.Set("statusZh", nStZh);
+                nm.Set("statusClass", nStCls);
+                nm.Set("isCurrent", n.stage == curProj.currentStage ? "1" : "");
+                nm.Set("canAdvance", (n.status == "in_progress" || n.status == "rejected") ? "1" : "");
+                nm.Set("isRejected", n.status == "rejected" ? "1" : "");
+                nm.Set("deliverableSummary", n.deliverableSummary.Length > 0 ? n.deliverableSummary : "（暂无阶段成果说明）");
+                nm.Set("aiSuggestion", n.aiSuggestion.Length > 0 ? n.aiSuggestion : "（暂无 AI 协同建议）");
+
+                /* 指标详情 */
+                string m1 = "-";
+                string m2 = "-";
+                string m3 = "-";
+                for (int dti = 0; dti < details.Count; dti = dti + 1) {
+                    if (details[dti].stage == n.stage) {
+                        m1 = details[dti].metric1;
+                        m2 = details[dti].metric2;
+                        m3 = details[dti].metric3;
+                    }
+                }
+                nm.Set("metric1", m1);
+                nm.Set("metric2", m2);
+                nm.Set("metric3", m3);
+                nodeRows.Add(nm);
+            }
+        } else {
+            d.Set("hasProject", "");
+        }
+
+        /* 可选业务模板列表 */
+        List<LifecycleTemplate> tmpls = await this.LifecycleTemplate
+            .Where(a => a.tenantId == tid)
+            .OrderBy(a => a.id)
+            .ToListAsync();
+        List<StrMap> tmplRows = d.AddList("templates");
+        for (int i = 0; i < tmpls.Count; i = i + 1) {
+            LifecycleTemplate t = tmpls[i];
+            StrMap tm = new StrMap();
+            tm.Set("id", Convert.ToString(t.id));
+            tm.Set("name", t.name);
+            tm.Set("industry", t.category);
+            tmplRows.Add(tm);
+        }
+
+        this.Page(d);
+    }
+
+    /* 阶段成果核准流转或审核驳回 */
+    [HttpPost]
+    [Description("阶段核准或驳回推进")]
+    async void Advance() {
+        int tid = Tenant.Cur();
+        SysUser me = await this.Admin();
+        int projectId = this.InInt("projectId", 0);
+        string stage = this.Need("stage", "阶段标识");
+        string summary = this.In("summary");
+        string action = this.In("action");
+        if (action.Length == 0) { action = "pass"; }
+
+        LifecycleProject p = await this.LifecycleProject
+            .Where(a => a.id == projectId && a.tenantId == tid).FirstAsync();
+        if (p == null) { this.Fail(404, "0404", "项目不存在"); return; }
+
+        LifecycleNode node = await this.LifecycleNode
+            .Where(a => a.projectId == projectId && a.stage == stage).FirstAsync();
+        if (node == null) { this.Fail(404, "0404", "阶段节点不存在"); return; }
+
+        long now = WebApp.NowSeconds();
+
+        /* 读取指标用于卡片 */
+        LifecycleStageDetail curDt = await this.LifecycleStageDetail
+            .Where(a => a.projectId == projectId && a.stage == stage).FirstAsync();
+        string curM1 = curDt != null ? curDt.metric1 : "-";
+        string curM2 = curDt != null ? curDt.metric2 : "-";
+        string curM3 = curDt != null ? curDt.metric3 : "-";
+
+        if (action == "reject") {
+            node.status = "rejected";
+            node.deliverableSummary = summary.Length > 0 ? summary : "Web工作台审核驳回：指标不达预期或材料需优化";
+            node.approvedBy = me.id;
+            node.approvedAt = now;
+            node.updatedAt = now;
+            await this.LifecycleNode.Update(node).ExecuteAffrowsAsync();
+
+            p.status = "rejected";
+            p.updatedAt = now;
+            await this.LifecycleProject.Update(p).ExecuteAffrowsAsync();
+
+            /* 发送群聊通知及驳回卡片 */
+            if (p.conversationId > 0) {
+                CollabMessage rmsg = new CollabMessage();
+                rmsg.tenantId = tid;
+                rmsg.conversationId = p.conversationId;
+                rmsg.senderId = me.id;
+                rmsg.kind = "text";
+                rmsg.body = "⚠️【阶段驳回预警】「" + node.stageName + "」已在 Web 工作台被审核人驳回！\n原因/意见: " + node.deliverableSummary;
+                rmsg.replyTo = 0;
+                rmsg.taskId = 0;
+                rmsg.clientRequestId = "crid_rej_web_" + Convert.ToString(now);
+                rmsg.createdAt = now;
+                rmsg.deletedAt = 0;
+                await this.CollabMessage.Insert(rmsg).ExecuteIdentityAsync();
+
+                string respName = "";
+                List<SysUser> users = await this.SysUser.ToListAsync();
+                for (int u = 0; u < users.Count; u = u + 1) {
+                    if (users[u].id == node.responsibleUserId) {
+                        respName = users[u].nickname.Length > 0 ? users[u].nickname : users[u].username;
+                    }
+                }
+                string rejCardJson = LifecycleApi.StageCardJson(projectId, p.projectNo, p.name,
+                    stage, node.stageName, respName, node.responsibleUserId,
+                    node.aiAgentRole, "rejected",
+                    curM1, curM2, curM3, node.aiSuggestion,
+                    "Web工作台审核驳回：" + node.deliverableSummary);
+
+                CollabMessage cardMsg = new CollabMessage();
+                cardMsg.tenantId = tid;
+                cardMsg.conversationId = p.conversationId;
+                cardMsg.senderId = me.id;
+                cardMsg.kind = "lifecycle_card";
+                cardMsg.body = rejCardJson;
+                cardMsg.replyTo = 0;
+                cardMsg.taskId = 0;
+                cardMsg.clientRequestId = "crid_rej_card_web_" + Convert.ToString(now);
+                cardMsg.createdAt = now;
+                cardMsg.deletedAt = 0;
+                await this.CollabMessage.Insert(cardMsg).ExecuteIdentityAsync();
+            }
+
+            this.Saved("阶段成果已驳回，并已下发作战群预警卡片");
+            return;
+        }
+
+        /* 审核通过，按 seq 排序查找下一个阶段 */
+        node.status = "passed";
+        node.deliverableSummary = summary.Length > 0 ? summary : "Web工作台审核核准通过";
+        node.approvedBy = me.id;
+        node.approvedAt = now;
+        node.updatedAt = now;
+        await this.LifecycleNode.Update(node).ExecuteAffrowsAsync();
+
+        List<LifecycleNode> allNodes = await this.LifecycleNode
+            .Where(a => a.projectId == projectId)
+            .OrderBy(a => a.seq)
+            .ToListAsync();
+
+        int curIndex = -1;
+        for (int i = 0; i < allNodes.Count; i = i + 1) {
+            if (allNodes[i].stage == stage) { curIndex = i; }
+        }
+
+        LifecycleNode nextNode = null;
+        if (curIndex >= 0 && curIndex + 1 < allNodes.Count) {
+            nextNode = allNodes[curIndex + 1];
+        }
+
+        string nextSt = nextNode != null ? nextNode.stage : "completed";
+        string nextStName = nextNode != null ? nextNode.stageName : "已完结归档";
+        p.currentStage = nextSt;
+        if (nextSt == "completed") {
+            p.status = "completed";
+        } else {
+            p.status = "in_progress";
+        }
+        p.updatedAt = now;
+        await this.LifecycleProject.Update(p).ExecuteAffrowsAsync();
+
+        string nextAdvise = "";
+        string nextRespName = "全员";
+        int nextRespId = 0;
+        string nextM1 = "-";
+        string nextM2 = "-";
+        string nextM3 = "-";
+
+        if (nextNode != null) {
+            nextNode.status = "in_progress";
+            LifecycleStageDef nextDef = await this.LifecycleStageDef
+                .Where(a => a.templateId == p.templateId && a.stageKey == nextSt).FirstAsync();
+            if (nextDef != null) {
+                nextAdvise = nextDef.aiPromptTemplate;
+            } else {
+                nextAdvise = "[" + nextNode.aiAgentRole + "] 项目进入新阶段，请各协同角色对齐目标并启动执行。";
+            }
+            nextNode.aiSuggestion = nextAdvise;
+            nextNode.updatedAt = now;
+            await this.LifecycleNode.Update(nextNode).ExecuteAffrowsAsync();
+
+            nextRespId = nextNode.responsibleUserId;
+            List<SysUser> nextUsers = await this.SysUser.ToListAsync();
+            for (int u = 0; u < nextUsers.Count; u = u + 1) {
+                if (nextUsers[u].id == nextNode.responsibleUserId) {
+                    nextRespName = nextUsers[u].nickname.Length > 0 ? nextUsers[u].nickname : nextUsers[u].username;
+                }
+            }
+
+            LifecycleStageDetail nextDt = await this.LifecycleStageDetail
+                .Where(a => a.projectId == projectId && a.stage == nextSt).FirstAsync();
+            if (nextDt != null) {
+                nextM1 = nextDt.metric1;
+                nextM2 = nextDt.metric2;
+                nextM3 = nextDt.metric3;
+            }
+        }
+
+        /* 广播到协同群 */
+        if (p.conversationId > 0) {
+            CollabMessage pmsg = new CollabMessage();
+            pmsg.tenantId = tid;
+            pmsg.conversationId = p.conversationId;
+            pmsg.senderId = me.id;
+            pmsg.kind = "text";
+            if (nextSt == "completed") {
+                pmsg.body = "🎉【全生命周期达成】「" + p.name + "」已完成全链路各阶段闭环核准，项目成功结案！";
+            } else {
+                pmsg.body = "✅【阶段核准流转】「" + node.stageName + "」已在 Web 工作台核准通过！\n"
+                    + "当前进入新阶段: 【" + nextStName + "】\n"
+                    + "本阶段责任人: @" + nextRespName + "\n"
+                    + nextAdvise;
+            }
+            pmsg.replyTo = 0;
+            pmsg.taskId = 0;
+            pmsg.clientRequestId = "crid_adv_web_" + Convert.ToString(now);
+            pmsg.createdAt = now;
+            pmsg.deletedAt = 0;
+            await this.CollabMessage.Insert(pmsg).ExecuteIdentityAsync();
+
+            if (nextNode != null) {
+                string cardJson = LifecycleApi.StageCardJson(projectId, p.projectNo, p.name,
+                    nextSt, nextStName, nextRespName, nextRespId,
+                    nextNode.aiAgentRole, "in_progress",
+                    nextM1, nextM2, nextM3, nextAdvise,
+                    "上阶段核准流转结论：" + node.deliverableSummary);
+
+                CollabMessage cardMsg = new CollabMessage();
+                cardMsg.tenantId = tid;
+                cardMsg.conversationId = p.conversationId;
+                cardMsg.senderId = me.id;
+                cardMsg.kind = "lifecycle_card";
+                cardMsg.body = cardJson;
+                cardMsg.replyTo = 0;
+                cardMsg.taskId = 0;
+                cardMsg.clientRequestId = "crid_card_web_" + Convert.ToString(now);
+                cardMsg.createdAt = now;
+                cardMsg.deletedAt = 0;
+                await this.CollabMessage.Insert(cardMsg).ExecuteIdentityAsync();
+            }
+        }
+
+        this.Saved(nextSt == "completed"
+            ? "全链路各阶段均已核准，项目顺利闭环结案！"
+            : "「" + node.stageName + "」已核准，已自动流转至「" + nextStName + "」");
+    }
+
+    /* AI 深度推演与作战群广播 */
+    [HttpPost]
+    [Description("AI 深度协同推演")]
+    async void AiAssist() {
+        int tid = Tenant.Cur();
+        SysUser me = await this.Admin();
+        int projectId = this.InInt("projectId", 0);
+        string stage = this.Need("stage", "阶段标识");
+        string prompt = this.In("prompt");
+        if (prompt.Length == 0) { prompt = "Web工作台触发 AI 深度多维推演"; }
+
+        LifecycleProject p = await this.LifecycleProject
+            .Where(a => a.id == projectId && a.tenantId == tid).FirstAsync();
+        if (p == null) { this.Fail(404, "0404", "项目不存在"); return; }
+
+        LifecycleNode node = await this.LifecycleNode
+            .Where(a => a.projectId == projectId && a.stage == stage).FirstAsync();
+        if (node == null) { this.Fail(404, "0404", "阶段节点不存在"); return; }
+
+        long now = WebApp.NowSeconds();
+        string advice = "[" + node.aiAgentRole + "] 基于 Web 工作台指标与历史快反数据深度推演：建议重点管控核心成本与进度窗口，全域对齐排期。";
+
+        node.aiSuggestion = advice;
+        node.updatedAt = now;
+        await this.LifecycleNode.Update(node).ExecuteAffrowsAsync();
+
+        if (p.conversationId > 0) {
+            CollabMessage pmsg = new CollabMessage();
+            pmsg.tenantId = tid;
+            pmsg.conversationId = p.conversationId;
+            pmsg.senderId = me.id;
+            pmsg.kind = "text";
+            pmsg.body = "💡【AI 协同赋能推演】（Web 工作台发起）\n"
+                + "阶段: 【" + node.stageName + "】\n"
+                + advice;
+            pmsg.replyTo = 0;
+            pmsg.taskId = 0;
+            pmsg.clientRequestId = "crid_ai_web_" + Convert.ToString(now);
+            pmsg.createdAt = now;
+            pmsg.deletedAt = 0;
+            await this.CollabMessage.Insert(pmsg).ExecuteIdentityAsync();
+        }
+
+        this.Saved("AI 协同推演完成，成果已沉淀并同步至作战群");
+    }
+
+    /* Web 端快速立项 */
+    [HttpPost]
+    [Description("新建全链路协同项目")]
+    async void Create() {
+        int tid = Tenant.Cur();
+        SysUser me = await this.Admin();
+        string name = this.Need("name", "项目名称");
+        string category = this.In("category");
+        if (category.Length == 0) { category = "服装鞋包"; }
+        string targetGmv = this.In("targetGmv");
+        if (targetGmv.Length == 0) { targetGmv = "100000"; }
+        string targetRoi = this.In("targetRoi");
+        if (targetRoi.Length == 0) { targetRoi = "2.5"; }
+        int templateId = this.InInt("templateId", 0);
+
+        long now = WebApp.NowSeconds();
+        string projectNo = "PRJ-" + Convert.ToString(now);
+
+        LifecycleTemplate tmpl = null;
+        if (templateId > 0) {
+            tmpl = await this.LifecycleTemplate.Where(a => a.id == templateId && a.tenantId == tid).FirstAsync();
+        }
+        if (tmpl == null) {
+            tmpl = await this.LifecycleTemplate.Where(a => a.tenantId == tid && a.isDefault == 1).FirstAsync();
+        }
+        if (tmpl == null) {
+            tmpl = await this.LifecycleTemplate.Where(a => a.tenantId == tid).FirstAsync();
+        }
+        if (tmpl == null) {
+            await LifecycleTemplateApi.SeedDefaultTemplates(this, tid);
+            tmpl = await this.LifecycleTemplate.Where(a => a.tenantId == tid).FirstAsync();
+        }
+        if (tmpl == null) { this.Fail(500, "0500", "无可用的生命周期业务模板"); return; }
+        templateId = tmpl.id;
+
+        List<LifecycleStageDef> stageDefs = await this.LifecycleStageDef
+            .Where(a => a.templateId == templateId)
+            .OrderBy(a => a.seq)
+            .ToListAsync();
+        if (stageDefs.Count == 0) { this.Fail(500, "0500", "该业务模板未配置任何阶段工序"); return; }
+
+        /* 1. 自动创建专属作战群 */
+        CollabConversation conv = new CollabConversation();
+        conv.tenantId = tid;
+        conv.type = "group";
+        conv.title = "【作战群】" + name;
+        conv.creatorId = me.id;
+        conv.version = 1;
+        conv.createdAt = now;
+        conv.updatedAt = now;
+        conv.archivedAt = 0;
+        int convId = await this.CollabConversation.Insert(conv).ExecuteIdentityAsync();
+
+        CollabMember cm = new CollabMember();
+        cm.tenantId = tid;
+        cm.conversationId = convId;
+        cm.userId = me.id;
+        cm.role = "owner";
+        cm.status = "active";
+        cm.joinedAt = now;
+        cm.leftAt = 0;
+        cm.lastReadMsgId = 0;
+        await this.CollabMember.Insert(cm).ExecuteIdentityAsync();
+
+        /* 2. 创建主项目记录 */
+        LifecycleProject p = new LifecycleProject();
+        p.tenantId = tid;
+        p.templateId = templateId;
+        p.projectNo = projectNo;
+        p.name = name;
+        p.category = category;
+        p.currentStage = stageDefs[0].stageKey;
+        p.status = "in_progress";
+        p.ownerId = me.id;
+        p.conversationId = convId;
+        p.targetGmv = targetGmv;
+        p.targetRoi = targetRoi;
+        p.actualGmv = "0";
+        p.actualRoi = "0";
+        p.createdAt = now;
+        p.updatedAt = now;
+        int projectId = await this.LifecycleProject.Insert(p).ExecuteIdentityAsync();
+
+        /* 3. 按模板阶段元数据实例化各阶段节点 */
+        for (int i = 0; i < stageDefs.Count; i = i + 1) {
+            LifecycleStageDef def = stageDefs[i];
+            LifecycleNode node = new LifecycleNode();
+            node.tenantId = tid;
+            node.projectId = projectId;
+            node.stage = def.stageKey;
+            node.stageName = def.stageName;
+            node.seq = def.seq;
+            node.responsibleUserId = me.id;
+            node.aiAgentRole = def.defaultAiAgentRole;
+            node.status = i == 0 ? "in_progress" : "pending";
+            node.deliverableSummary = "";
+            node.aiSuggestion = i == 0 ? def.aiPromptTemplate : "";
+            node.approvedBy = 0;
+            node.approvedAt = 0;
+            node.createdAt = now;
+            node.updatedAt = now;
+            int nodeId = await this.LifecycleNode.Insert(node).ExecuteIdentityAsync();
+
+            LifecycleStageDetail dt = new LifecycleStageDetail();
+            dt.tenantId = tid;
+            dt.projectId = projectId;
+            dt.nodeId = nodeId;
+            dt.stage = def.stageKey;
+            dt.metric1 = def.metric1Name + ": " + def.metric1Default;
+            dt.metric2 = def.metric2Name + ": " + def.metric2Default;
+            dt.metric3 = def.metric3Name + ": " + def.metric3Default;
+            dt.extraPayload = def.aiPromptTemplate;
+            dt.createdAt = now;
+            dt.updatedAt = now;
+            await this.LifecycleStageDetail.Insert(dt).ExecuteIdentityAsync();
+        }
+
+        /* 4. 发送作战群初始卡片 */
+        string cardJson = LifecycleApi.StageCardJson(projectId, projectNo, name,
+            stageDefs[0].stageKey, stageDefs[0].stageName, me.nickname.Length > 0 ? me.nickname : me.username, me.id,
+            stageDefs[0].defaultAiAgentRole, "in_progress",
+            stageDefs[0].metric1Name + ": " + stageDefs[0].metric1Default,
+            stageDefs[0].metric2Name + ": " + stageDefs[0].metric2Default,
+            stageDefs[0].metric3Name + ": " + stageDefs[0].metric3Default,
+            stageDefs[0].aiPromptTemplate, "项目刚刚立项，进入首阶段【" + stageDefs[0].stageName + "】");
+
+        CollabMessage msg = new CollabMessage();
+        msg.tenantId = tid;
+        msg.conversationId = convId;
+        msg.senderId = me.id;
+        msg.kind = "lifecycle_card";
+        msg.body = cardJson;
+        msg.replyTo = 0;
+        msg.taskId = 0;
+        msg.clientRequestId = "crid_init_web_" + Convert.ToString(now);
+        msg.createdAt = now;
+        msg.deletedAt = 0;
+        await this.CollabMessage.Insert(msg).ExecuteIdentityAsync();
+
+        this.Saved("项目立项成功，已派生全阶段工序节点与作战群");
+    }
+}

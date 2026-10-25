@@ -1,0 +1,215 @@
+using System;
+using System.Collections.Generic;
+using System.Data.Orm;
+using System.Text;
+using System.Web;
+using ZanWeb.Api;
+using ZanWeb.Dao.Lifecycle;
+using ZanWeb.Model.Lifecycle;
+using ZanWeb.Model;
+
+namespace ZanWeb.Admin.Lifecycle;
+
+/* 全生命周期业务配置模板管理：
+   元数据驱动的核心配置中心，彻底杜绝业务分支硬编码。
+   支持为不同行业/品类定制阶段工序、流转顺序(seq)、专属AI角色、关键考核指标定义与推演提示词。 */
+[Route("admin/lifecycle/templates/[action]")]
+[Custom(Authorization = CustomAuthorization.Login)]
+[Description("业务模板管理")]
+public class Templates : AdminController {
+
+    [HttpGet]
+    [Route("/admin/lifecycle/templates")]
+    [Custom(IsMenu = true, Icon = "mdi:shape-outline", Perm = PermBit.View)]
+    [Description("业务模板管理")]
+    async void Index() {
+        ViewData d = await this.Layout("业务流转模板配置中心");
+        if (!this.DbReady()) { d.Set("dbDown", "1"); this.Page(d); return; }
+
+        int tid = Tenant.Cur();
+
+        /* 拉取所有业务模板，若无则自动注入开箱即用默认模板 */
+        List<LifecycleTemplate> tmpls = await this.LifecycleTemplate
+            .Where(a => a.tenantId == tid)
+            .OrderBy(a => a.id)
+            .ToListAsync();
+
+        if (tmpls.Count == 0) {
+            await LifecycleTemplateApi.SeedDefaultTemplates(this, tid);
+            tmpls = await this.LifecycleTemplate
+                .Where(a => a.tenantId == tid)
+                .OrderBy(a => a.id)
+                .ToListAsync();
+        }
+
+        int selTmplId = this.InInt("templateId", 0);
+        if (selTmplId == 0 && tmpls.Count > 0) {
+            selTmplId = tmpls[0].id;
+        }
+
+        LifecycleTemplate curTmpl = null;
+        List<StrMap> tmplRows = d.AddList("templates");
+
+        for (int i = 0; i < tmpls.Count; i = i + 1) {
+            LifecycleTemplate t = tmpls[i];
+            StrMap tm = new StrMap();
+            tm.Set("id", Convert.ToString(t.id));
+            tm.Set("templateKey", t.templateKey);
+            tm.Set("name", t.name);
+            tm.Set("category", t.category);
+            tm.Set("description", t.description);
+            tm.Set("isDefault", t.isDefault == 1 ? "默认推荐" : "");
+            tm.Set("status", t.status);
+            bool isSel = (t.id == selTmplId);
+            tm.Set("isSelected", isSel ? "selected" : "");
+            tmplRows.Add(tm);
+            if (isSel) { curTmpl = t; }
+        }
+
+        if (curTmpl != null) {
+            d.Set("curTmplId", Convert.ToString(curTmpl.id));
+            d.Set("curTmplName", curTmpl.name);
+            d.Set("curTmplKey", curTmpl.templateKey);
+            d.Set("curTmplCategory", curTmpl.category);
+            d.Set("curTmplDesc", curTmpl.description);
+            d.Set("curTmplDefault", curTmpl.isDefault == 1 ? "1" : "0");
+
+            /* 加载该模板下按 seq 排序的全部阶段工序元数据定义 */
+            List<LifecycleStageDef> defs = await this.LifecycleStageDef
+                .Where(a => a.templateId == curTmpl.id)
+                .OrderBy(a => a.seq)
+                .ToListAsync();
+
+            List<StrMap> stageRows = d.AddList("stages");
+            for (int i = 0; i < defs.Count; i = i + 1) {
+                LifecycleStageDef s = defs[i];
+                StrMap sm = new StrMap();
+                sm.Set("id", Convert.ToString(s.id));
+                sm.Set("seq", Convert.ToString(s.seq));
+                sm.Set("stageKey", s.stageKey);
+                sm.Set("stageName", s.stageName);
+                sm.Set("aiRole", s.defaultAiAgentRole);
+                sm.Set("m1", s.metric1Name + " (" + s.metric1Default + ")");
+                sm.Set("m2", s.metric2Name + " (" + s.metric2Default + ")");
+                sm.Set("m3", s.metric3Name + " (" + s.metric3Default + ")");
+                sm.Set("prompt", s.aiPromptTemplate);
+                stageRows.Add(sm);
+            }
+            d.Set("stageCount", Convert.ToString(defs.Count));
+        }
+
+        this.Page(d);
+    }
+
+    /* 重新注入开箱即用官方模板 */
+    [HttpPost]
+    [Description("初始化官方模板")]
+    async void Seed() {
+        int tid = Tenant.Cur();
+        await LifecycleTemplateApi.SeedDefaultTemplates(this, tid);
+        this.Saved("官方标准全生命周期业务模板已成功注入！");
+    }
+
+    /* 新建或保存业务模板主表 */
+    [HttpPost]
+    [Description("保存业务模板")]
+    async void Save() {
+        int tid = Tenant.Cur();
+        int id = this.InInt("id", 0);
+        string name = this.Need("name", "模板名称");
+        string templateKey = this.Need("templateKey", "模板标识Key");
+        string category = this.In("category");
+        if (category.Length == 0) { category = "通用"; }
+        string description = this.In("description");
+        int isDefault = this.InInt("isDefault", 0);
+        long now = WebApp.NowSeconds();
+
+        if (id > 0) {
+            LifecycleTemplate tmpl = await this.LifecycleTemplate
+                .Where(a => a.id == id && a.tenantId == tid).FirstAsync();
+            if (tmpl == null) { this.Fail(404, "0404", "模板不存在"); return; }
+            tmpl.name = name;
+            tmpl.templateKey = templateKey;
+            tmpl.category = category;
+            tmpl.description = description;
+            tmpl.isDefault = isDefault;
+            tmpl.updatedAt = now;
+            await this.LifecycleTemplate.Update(tmpl).ExecuteAffrowsAsync();
+            this.Saved("业务模板已更新");
+        } else {
+            LifecycleTemplate tmpl = new LifecycleTemplate();
+            tmpl.tenantId = tid;
+            tmpl.name = name;
+            tmpl.templateKey = templateKey;
+            tmpl.category = category;
+            tmpl.description = description;
+            tmpl.isDefault = isDefault;
+            tmpl.status = "active";
+            tmpl.createdAt = now;
+            tmpl.updatedAt = now;
+            await this.LifecycleTemplate.Insert(tmpl).ExecuteIdentityAsync();
+            this.Saved("新业务模板创建成功");
+        }
+    }
+
+    /* 保存阶段工序元数据定义 */
+    [HttpPost]
+    [Description("保存阶段工序")]
+    async void SaveStage() {
+        int tid = Tenant.Cur();
+        int id = this.InInt("id", 0);
+        int templateId = this.NeedInt("templateId", "模板ID");
+        string stageKey = this.Need("stageKey", "阶段标识Key");
+        string stageName = this.Need("stageName", "阶段展示名");
+        int seq = this.InInt("seq", 10);
+        string aiRole = this.In("defaultAiAgentRole");
+        if (aiRole.Length == 0) { aiRole = "协同AI"; }
+        string m1Name = this.In("metric1Name");
+        string m1Def = this.In("metric1Default");
+        string m2Name = this.In("metric2Name");
+        string m2Def = this.In("metric2Default");
+        string m3Name = this.In("metric3Name");
+        string m3Def = this.In("metric3Default");
+        string prompt = this.In("aiPromptTemplate");
+        long now = WebApp.NowSeconds();
+
+        if (id > 0) {
+            LifecycleStageDef def = await this.LifecycleStageDef
+                .Where(a => a.id == id && a.templateId == templateId).FirstAsync();
+            if (def == null) { this.Fail(404, "0404", "阶段工序不存在"); return; }
+            def.stageKey = stageKey;
+            def.stageName = stageName;
+            def.seq = seq;
+            def.defaultAiAgentRole = aiRole;
+            def.metric1Name = m1Name;
+            def.metric1Default = m1Def;
+            def.metric2Name = m2Name;
+            def.metric2Default = m2Def;
+            def.metric3Name = m3Name;
+            def.metric3Default = m3Def;
+            def.aiPromptTemplate = prompt;
+            def.updatedAt = now;
+            await this.LifecycleStageDef.Update(def).ExecuteAffrowsAsync();
+            this.Saved("阶段工序定义已更新");
+        } else {
+            LifecycleStageDef def = new LifecycleStageDef();
+            def.tenantId = tid;
+            def.templateId = templateId;
+            def.stageKey = stageKey;
+            def.stageName = stageName;
+            def.seq = seq;
+            def.defaultAiAgentRole = aiRole;
+            def.metric1Name = m1Name;
+            def.metric1Default = m1Def;
+            def.metric2Name = m2Name;
+            def.metric2Default = m2Def;
+            def.metric3Name = m3Name;
+            def.metric3Default = m3Def;
+            def.aiPromptTemplate = prompt;
+            def.createdAt = now;
+            def.updatedAt = now;
+            await this.LifecycleStageDef.Insert(def).ExecuteIdentityAsync();
+            this.Saved("新阶段工序定义已追加");
+        }
+    }
+}
