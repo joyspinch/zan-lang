@@ -1930,26 +1930,60 @@ static bool emit_target_has_avx2(const zan_irgen_t *g)
     return emit_target_is_x86(g) && strstr(g->target_triple, "android") == NULL;
 }
 
-/* 跨平台 pmovmskb 实现：提取每个字节符号位组装为整型掩码 */
+/* 跨平台 pmovmskb 实现：提取每个字节符号位组装为整型掩码。
+ * 全程在 <lanes/8 x i64> 泳道向量上做 SWAR，不产生任何 i1 向量——
+ * <32 x i1> 这类非法宽度会在通用 CPU（无 AVX2）的合法化阶段触发
+ * "Do not know how to split this operator's operand"（A439）。 */
 static LLVMValueRef emit_pmovmskb_portable(zan_irgen_t *g, LLVMValueRef v,
                                            unsigned lanes)
 {
     LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
-    LLVMTypeRef vt = LLVMVectorType(LLVMInt8TypeInContext(g->ctx), lanes);
-    /* 符号位掩码提取逻辑 */
-    LLVMValueRef signs = LLVMBuildICmp(g->builder, LLVMIntSLT, v,
-        LLVMConstNull(vt), "vsigns");
+    LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
+    unsigned wl = lanes / 8;
+    LLVMTypeRef wv = LLVMVectorType(i64t, wl);
+    /* 只留各字节符号位：0x80 per 字节。 */
+    LLVMValueRef hi_elems[4];
+    for (unsigned k = 0; k < wl; k++) {
+        hi_elems[k] = LLVMConstInt(i64t, 0x8080808080808080ULL, 0);
+    }
+    LLVMValueRef hi = LLVMConstVector(hi_elems, wl);
+    LLVMValueRef wide = LLVMBuildBitCast(g->builder, v, wv, "vpmask.wide");
+    LLVMValueRef m = LLVMBuildAnd(g->builder, wide, hi, "vpmask.hi");
+    /* 每泳道：字节 k 的符号位右移 7(k+1) 恰好落到位 k（其余字节的
+     * 落点全在位 7 之外，末尾 0xFF 掩掉），8 次移位取或得 8 位掩码。 */
+    LLVMValueRef gathered = LLVMConstNull(wv);
+    for (unsigned k = 0; k < 8; k++) {
+        LLVMValueRef sh_elems[4];
+        for (unsigned j = 0; j < wl; j++) {
+            sh_elems[j] = LLVMConstInt(i64t, 7 * (k + 1), 0);
+        }
+        LLVMValueRef sh = LLVMConstVector(sh_elems, wl);
+        LLVMValueRef t = LLVMBuildLShr(g->builder, m, sh, "vpmask.sh");
+        if (k == 0) {
+            gathered = t;
+        } else {
+            gathered = LLVMBuildOr(g->builder, gathered, t, "vpmask.or");
+        }
+    }
+    LLVMValueRef ff_elems[4];
+    for (unsigned j = 0; j < wl; j++) {
+        ff_elems[j] = LLVMConstInt(i64t, 0xFF, 0);
+    }
+    gathered = LLVMBuildAnd(g->builder, gathered,
+                            LLVMConstVector(ff_elems, wl), "vpmask.ff");
+    /* 泳道收拢为 i32：位 [8k, 8k+8) ← 泳道 k 的低 8 位（纯标量）。 */
     LLVMValueRef acc = LLVMConstInt(i32t, 0, 0);
-    for (unsigned i = 0; i < lanes; i++) {
-        LLVMValueRef bit = LLVMBuildExtractElement(g->builder, signs,
-            LLVMConstInt(i32t, i, 0), "vbit");
-        LLVMValueRef ext = LLVMBuildZExt(g->builder, bit, i32t, "vbitz");
-        if (i == 0)
-            acc = ext;
-        else
-            acc = LLVMBuildOr(g->builder, acc,
-                LLVMBuildShl(g->builder, ext, LLVMConstInt(i32t, i, 0), "vbitsh"),
-                "vbits");
+    for (unsigned k = 0; k < wl; k++) {
+        LLVMValueRef lane = LLVMBuildExtractElement(g->builder, gathered,
+            LLVMConstInt(i32t, k, 0), "vpmask.lane");
+        LLVMValueRef b = LLVMBuildAnd(g->builder, lane,
+            LLVMConstInt(i64t, 0xFF, 0), "vpmask.b");
+        LLVMValueRef ext = LLVMBuildTrunc(g->builder, b, i32t, "vpmask.b32");
+        if (k > 0) {
+            ext = LLVMBuildShl(g->builder, ext,
+                LLVMConstInt(i32t, 8 * k, 0), "vpmask.bsh");
+        }
+        acc = k == 0 ? ext : LLVMBuildOr(g->builder, acc, ext, "vpmask.acc");
     }
     return acc;
 }
@@ -1996,6 +2030,111 @@ static LLVMValueRef emit_pavg_portable(zan_irgen_t *g, LLVMValueRef a,
     LLVMValueRef odd = LLVMBuildAnd(g->builder, xor_ab, ones_v, "pavg_odd");
     LLVMValueRef sum = LLVMBuildAdd(g->builder, and_ab, half, "pavg_sum");
     return LLVMBuildAdd(g->builder, sum, odd, "pavg_r");
+}
+
+/* 字节等值掩码的 SWAR 合成（A439）：全程在 <lanes/8 x i64> 泳道算子上
+ * 完成，返回 <lanes x i8>（等值字节 0xFF，不等 0x00），不产生任何
+ * i1 向量——<32 x i1> 这类非法宽度在通用 CPU（无 AVX2）的合法化阶段
+ * 会触发 "Do not know how to split this operator's operand"。
+ * 每泳道：x = a^b（等值字节为 0）；经典 haszero 掩码标出等值字节
+ * （0x80 per byte）；(t >> 7) * 0xFF 展开成字节掩码。 */
+static LLVMValueRef emit_byte_eq_mask_i64(zan_irgen_t *g, LLVMValueRef a,
+                                          LLVMValueRef b, unsigned lanes)
+{
+    LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
+    unsigned wl = lanes / 8;
+    LLVMTypeRef wv = LLVMVectorType(i64t, wl);
+    LLVMValueRef ones_elems[4];
+    LLVMValueRef hi_elems[4];
+    for (unsigned j = 0; j < wl; j++) {
+        ones_elems[j] = LLVMConstInt(i64t, 0x0101010101010101ULL, 0);
+        hi_elems[j] = LLVMConstInt(i64t, 0x8080808080808080ULL, 0);
+    }
+    LLVMValueRef ones = LLVMConstVector(ones_elems, wl);
+    LLVMValueRef his = LLVMConstVector(hi_elems, wl);
+    LLVMValueRef aw = LLVMBuildBitCast(g->builder, a, wv, "veq.a");
+    LLVMValueRef bw = LLVMBuildBitCast(g->builder, b, wv, "veq.b");
+    LLVMValueRef x = LLVMBuildXor(g->builder, aw, bw, "veq.xor");
+    LLVMValueRef t = LLVMBuildSub(g->builder, x, ones, "veq.sub");
+    t = LLVMBuildAnd(g->builder, t,
+                     LLVMBuildNot(g->builder, x, "veq.nx"), "veq.t1");
+    t = LLVMBuildAnd(g->builder, t, his, "veq.t2");
+    LLVMValueRef sh_elems[4];
+    LLVMValueRef ff_elems[4];
+    for (unsigned j = 0; j < wl; j++) {
+        sh_elems[j] = LLVMConstInt(i64t, 7, 0);
+        ff_elems[j] = LLVMConstInt(i64t, 0xFF, 0);
+    }
+    t = LLVMBuildLShr(g->builder, t, LLVMConstVector(sh_elems, wl), "veq.shr");
+    t = LLVMBuildMul(g->builder, t, LLVMConstVector(ff_elems, wl), "veq.m");
+    return LLVMBuildBitCast(g->builder, t,
+                            LLVMVectorType(LLVMInt8TypeInContext(g->ctx), lanes),
+                            "veq.mask");
+}
+
+/* 字节带符号大于掩码的 SWAR 合成（A439）：返回 <lanes x i8>（a > b 的
+ * 字节处 0xFF）。先异或 0x80 把带符号序偏成无符号序，再做无符号逐字节
+ * 大于：位 7 独大者直接胜（t1），位 7 相同者比低 7 位（ge7 & ~e7，e7
+ * 为低 7 位相等标志）。全程 <lanes/8 x i64> 泳道算子，不产生任何
+ * i1 向量（同 emit_byte_eq_mask_i64 的 A439 缘由）。 */
+static LLVMValueRef emit_byte_sgt_mask_i64(zan_irgen_t *g, LLVMValueRef a,
+                                           LLVMValueRef b, unsigned lanes)
+{
+    LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
+    unsigned wl = lanes / 8;
+    LLVMTypeRef wv = LLVMVectorType(i64t, wl);
+    LLVMValueRef ones_elems[4], hi_elems[4], l7_elems[4], sh_elems[4], ff_elems[4];
+    for (unsigned j = 0; j < wl; j++) {
+        ones_elems[j] = LLVMConstInt(i64t, 0x0101010101010101ULL, 0);
+        hi_elems[j] = LLVMConstInt(i64t, 0x8080808080808080ULL, 0);
+        l7_elems[j] = LLVMConstInt(i64t, 0x7F7F7F7F7F7F7F7FULL, 0);
+        sh_elems[j] = LLVMConstInt(i64t, 7, 0);
+        ff_elems[j] = LLVMConstInt(i64t, 0xFF, 0);
+    }
+    LLVMValueRef ones = LLVMConstVector(ones_elems, wl);
+    LLVMValueRef his = LLVMConstVector(hi_elems, wl);
+    LLVMValueRef l7 = LLVMConstVector(l7_elems, wl);
+    LLVMValueRef ffs = LLVMConstVector(ff_elems, wl);
+    LLVMValueRef sh7 = LLVMConstVector(sh_elems, wl);
+    LLVMValueRef aw = LLVMBuildBitCast(g->builder, a, wv, "vsgt.a");
+    LLVMValueRef bw = LLVMBuildBitCast(g->builder, b, wv, "vsgt.b");
+    /* 偏置成无符号序：翻转符号位。 */
+    LLVMValueRef au = LLVMBuildXor(g->builder, aw, his, "vsgt.au");
+    LLVMValueRef bu = LLVMBuildXor(g->builder, bw, his, "vsgt.bu");
+    /* 位 7 独大：直接胜。 */
+    LLVMValueRef t1 = LLVMBuildAnd(g->builder, au,
+        LLVMBuildAnd(g->builder,
+            LLVMBuildNot(g->builder, bu, "vsgt.nbu"), his, "vsgt.t1a"), "vsgt.t1");
+    /* 低 7 位相等标志：haszero((a^b) & 0x7F..)。 */
+    LLVMValueRef x7 = LLVMBuildAnd(g->builder,
+        LLVMBuildXor(g->builder, aw, bw, "vsgt.x"), l7, "vsgt.x7");
+    LLVMValueRef e7 = LLVMBuildAnd(g->builder,
+        LLVMBuildAnd(g->builder,
+            LLVMBuildSub(g->builder, x7, ones, "vsgt.sub"),
+            LLVMBuildNot(g->builder, x7, "vsgt.nx7"), "vsgt.e7a"),
+        his, "vsgt.e7");
+    /* 低 7 位 ge：((au|H) - (bu&L7)) 的每字节高位。 */
+    LLVMValueRef ge7 = LLVMBuildAnd(g->builder,
+        LLVMBuildSub(g->builder,
+            LLVMBuildOr(g->builder, au, his, "vsgt.auh"),
+            LLVMBuildAnd(g->builder, bu, l7, "vsgt.bul7"), "vsgt.gd"),
+        his, "vsgt.ge7");
+    /* 位 7 相同才轮到低 7 位。 */
+    LLVMValueRef eq7 = LLVMBuildAnd(g->builder,
+        LLVMBuildNot(g->builder,
+            LLVMBuildXor(g->builder, au, bu, "vsgt.abx"), "vsgt.nabx"),
+        his, "vsgt.eq7");
+    LLVMValueRef gt = LLVMBuildOr(g->builder, t1,
+        LLVMBuildAnd(g->builder,
+            LLVMBuildAnd(g->builder, ge7,
+                LLVMBuildNot(g->builder, e7, "vsgt.ne7"), "vsgt.g2"), eq7, "vsgt.g3"),
+        "vsgt.gt");
+    /* (t>>7)*0xFF：0x80 标志展开成 0xFF 字节掩码。 */
+    gt = LLVMBuildLShr(g->builder, gt, sh7, "vsgt.shr");
+    gt = LLVMBuildMul(g->builder, gt, ffs, "vsgt.m");
+    return LLVMBuildBitCast(g->builder, gt,
+                            LLVMVectorType(LLVMInt8TypeInContext(g->ctx), lanes),
+                            "vsgt.mask");
 }
 
 static bool emit_vector128_call(zan_irgen_t *g, zan_ast_node_t *expr,
@@ -2177,9 +2316,8 @@ static bool emit_vector128_call(zan_irgen_t *g, zan_ast_node_t *expr,
             (method.len == 12 && memcmp(method.str, "CompareEqual", 12) == 0)) {
             LLVMValueRef a16 = vec128_to_v16i8(g, emit_expr(g, expr->call.args.items[0], locals));
             LLVMValueRef b16 = vec128_to_v16i8(g, emit_expr(g, expr->call.args.items[1], locals));
-            LLVMValueRef cmp = LLVMBuildICmp(g->builder, LLVMIntEQ, a16, b16, "vcmpeq");
-            LLVMValueRef mask = LLVMBuildSExt(g->builder, cmp, v16i8, "vmask");
-            *out = v16i8_to_vec128(g, mask);
+            /* SWAR 等值掩码：不产生 <16 x i1>（A439）。 */
+            *out = v16i8_to_vec128(g, emit_byte_eq_mask_i64(g, a16, b16, 16));
             return true;
         }
         if (method.len == 7 && memcmp(method.str, "Shuffle", 7) == 0) {
@@ -2289,15 +2427,15 @@ static bool emit_vector128_call(zan_irgen_t *g, zan_ast_node_t *expr,
         if (method.len == 11 && memcmp(method.str, "GreaterThan", 11) == 0) {
             LLVMValueRef a16 = vec128_to_v16i8(g, emit_expr(g, expr->call.args.items[0], locals));
             LLVMValueRef b16 = vec128_to_v16i8(g, emit_expr(g, expr->call.args.items[1], locals));
-            LLVMValueRef cmp = LLVMBuildICmp(g->builder, LLVMIntSGT, a16, b16, "vcmpgt");
-            *out = v16i8_to_vec128(g, LLVMBuildSExt(g->builder, cmp, v16i8, "vmask"));
+            /* SWAR 带符号大于：不产生 <16 x i1>（A439）。 */
+            *out = v16i8_to_vec128(g, emit_byte_sgt_mask_i64(g, a16, b16, 16));
             return true;
         }
         if (method.len == 8 && memcmp(method.str, "LessThan", 8) == 0) {
             LLVMValueRef a16 = vec128_to_v16i8(g, emit_expr(g, expr->call.args.items[0], locals));
             LLVMValueRef b16 = vec128_to_v16i8(g, emit_expr(g, expr->call.args.items[1], locals));
-            LLVMValueRef cmp = LLVMBuildICmp(g->builder, LLVMIntSLT, a16, b16, "vcmplt");
-            *out = v16i8_to_vec128(g, LLVMBuildSExt(g->builder, cmp, v16i8, "vmask"));
+            /* SWAR 带符号小于 = 交换实参的大于。 */
+            *out = v16i8_to_vec128(g, emit_byte_sgt_mask_i64(g, b16, a16, 16));
             return true;
         }
         if (method.len == 8 && memcmp(method.str, "Multiply", 8) == 0) {
@@ -2637,9 +2775,8 @@ static bool emit_vector256_call(zan_irgen_t *g, zan_ast_node_t *expr,
         if (method.len == 6 && memcmp(method.str, "Equals", 6) == 0) {
             LLVMValueRef a32 = vec256_to_v32i8(g, emit_expr(g, expr->call.args.items[0], locals));
             LLVMValueRef b32 = vec256_to_v32i8(g, emit_expr(g, expr->call.args.items[1], locals));
-            LLVMValueRef cmp = LLVMBuildICmp(g->builder, LLVMIntEQ, a32, b32, "vcmpeq256");
-            LLVMValueRef mask = LLVMBuildSExt(g->builder, cmp, v32i8, "vmask256");
-            *out = v32i8_to_vec256(g, mask);
+            /* SWAR 等值掩码：不产生 <32 x i1>（A439）。 */
+            *out = v32i8_to_vec256(g, emit_byte_eq_mask_i64(g, a32, b32, 32));
             return true;
         }
         if (method.len == 3 && memcmp(method.str, "Add", 3) == 0) {
@@ -2765,14 +2902,9 @@ static bool emit_vector256_call(zan_irgen_t *g, zan_ast_node_t *expr,
 
     if (method.len == 26 && memcmp(method.str, "ExtractMostSignificantBits", 26) == 0 && argc == 1) {
         LLVMValueRef a32 = vec256_to_v32i8(g, emit_expr(g, expr->call.args.items[0], locals));
-        if (emit_target_has_avx2(g)) {
-            LLVMTypeRef fty = LLVMFunctionType(i32t, (LLVMTypeRef[]){ v32i8 }, 1, 0);
-            LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "llvm.x86.avx2.pmovmskb");
-            if (!fn) fn = LLVMAddFunction(g->mod, "llvm.x86.avx2.pmovmskb", fty);
-            *out = zan_call2(g->builder, fty, fn, &a32, 1, "vpmovmskb");
-        } else {
-            *out = emit_pmovmskb_portable(g, a32, 32);
-        }
+        /* 恒走 SWAR：llvm.x86.avx2.pmovmskb 在通用 CPU（无 AVX2）上
+         * 是不可合法化的调用，emit-ir 产物会因此过不了 llc（A439）。 */
+        *out = emit_pmovmskb_portable(g, a32, 32);
         return true;
     }
 
@@ -2839,12 +2971,10 @@ static bool emit_sse2_call(zan_irgen_t *g, zan_ast_node_t *expr,
         return true;
     }
     if (method.len == 12 && memcmp(method.str, "CompareEqual", 12) == 0 && argc == 2) {
-        LLVMTypeRef v16i8 = LLVMVectorType(LLVMInt8TypeInContext(g->ctx), 16);
         LLVMValueRef a16 = vec128_to_v16i8(g, emit_expr(g, expr->call.args.items[0], locals));
         LLVMValueRef b16 = vec128_to_v16i8(g, emit_expr(g, expr->call.args.items[1], locals));
-        LLVMValueRef cmp = LLVMBuildICmp(g->builder, LLVMIntEQ, a16, b16, "vcmpeq");
-        LLVMValueRef mask = LLVMBuildSExt(g->builder, cmp, v16i8, "vmask");
-        *out = v16i8_to_vec128(g, mask);
+        /* SWAR 等值掩码：不产生 <16 x i1>（A439）。 */
+        *out = v16i8_to_vec128(g, emit_byte_eq_mask_i64(g, a16, b16, 16));
         return true;
     }
     if (method.len == 8 && memcmp(method.str, "MoveMask", 8) == 0 && argc == 1) {

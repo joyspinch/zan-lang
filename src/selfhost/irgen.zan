@@ -1129,6 +1129,18 @@ partial class Irgen {
     string VecFT(int bits) { return "<" + (bits / 32) + " x float>"; }
     string VecName(int bits) { if (bits == 128) { return "Vector128"; } return "Vector256"; }
 
+    // <bits/64 x i64> 全泳道同值常量（SWAR 掩码用）。
+    string VecSplat64(int bits, string c) {
+        string s = "<";
+        int i = 0;
+        while (i < bits / 64) {
+            if (i > 0) { s = s + ", "; }
+            s = s + "i64 " + c;
+            i = i + 1;
+        }
+        return s + ">";
+    }
+
     // the byte view of a vector value
     string VecAsBytes(string v, int bits) {
         string r = NT();
@@ -1195,6 +1207,97 @@ partial class Irgen {
     }
     // a byte-wise comparison: every matching byte becomes 0xFF
     ExprVal VecByteCmp(Node e, string pred, int bits) {
+        if (pred == "eq") {
+            // SWAR 等值掩码（A439）：全程 <bits/64 x i64> 泳道算子，
+            // 不产生 i1 向量——<32 x i1> 这类非法宽度在通用 CPU（无
+            // AVX2）的合法化阶段致命（"Do not know how to split this
+            // operator's operand"）。每泳道：x = a^b（等值字节为 0）；
+            // 经典 haszero 掩码标出等值字节（0x80/byte）；(t>>7)*0xFF
+            // 展开成字节掩码 0xFF，与 C 主机的 emit_byte_eq_mask_i64
+            // 同一算式。
+            ExprVal a = GenExpr(e.kids[0]);
+            ExprVal b = GenExpr(e.kids[1]);
+            string wv = VecVT(bits);
+            string x = NT();
+            L("  " + x + " = xor " + wv + " " + a.op + ", " + b.op);
+            string nx = NT();
+            L("  " + nx + " = xor " + wv + " " + x + ", " + VecSplat64(bits, "-1"));
+            string sub = NT();
+            L("  " + sub + " = sub " + wv + " " + x + ", " + VecSplat64(bits, "72340172838076673"));
+            string t1 = NT();
+            L("  " + t1 + " = and " + wv + " " + sub + ", " + nx);
+            string t2 = NT();
+            L("  " + t2 + " = and " + wv + " " + t1 + ", " + VecSplat64(bits, "-9187201950435737472"));
+            string shr = NT();
+            L("  " + shr + " = lshr " + wv + " " + t2 + ", " + VecSplat64(bits, "7"));
+            string m = NT();
+            L("  " + m + " = mul " + wv + " " + shr + ", " + VecSplat64(bits, "255"));
+            string r8 = NT();
+            L("  " + r8 + " = bitcast " + wv + " " + m + " to " + VecV8(bits));
+            return new ExprVal(VecFromBytes(r8, bits), MkType(VecName(bits)));
+        }
+        if (pred == "sgt" || pred == "slt") {
+            // SWAR 带符号大于（A439，与 C 主机 emit_byte_sgt_mask_i64 同
+            // 算式）：异或 0x80 偏序后做无符号逐字节大于——位 7 独大者
+            // 直接胜，位 7 相同者比低 7 位。slt 交换实参。全程泳道算子，
+            // 不产生 i1 向量。
+            ExprVal a = GenExpr(e.kids[0]);
+            ExprVal b = GenExpr(e.kids[1]);
+            string wv = VecVT(bits);
+            string la = pred == "sgt" ? a.op : b.op;
+            string lb = pred == "sgt" ? b.op : a.op;
+            string au = NT();
+            L("  " + au + " = xor " + wv + " " + la + ", " + VecSplat64(bits, "-9187201950435737472"));
+            string bu = NT();
+            L("  " + bu + " = xor " + wv + " " + lb + ", " + VecSplat64(bits, "-9187201950435737472"));
+            string nbu = NT();
+            L("  " + nbu + " = xor " + wv + " " + bu + ", " + VecSplat64(bits, "-1"));
+            string t1 = NT();
+            L("  " + t1 + " = and " + wv + " " + au + ", " + nbu);
+            string t1h = NT();
+            L("  " + t1h + " = and " + wv + " " + t1 + ", " + VecSplat64(bits, "-9187201950435737472"));
+            string x = NT();
+            L("  " + x + " = xor " + wv + " " + la + ", " + lb);
+            string x7 = NT();
+            L("  " + x7 + " = and " + wv + " " + x + ", " + VecSplat64(bits, "9187201950435737471"));
+            string nx7 = NT();
+            L("  " + nx7 + " = xor " + wv + " " + x7 + ", " + VecSplat64(bits, "-1"));
+            string sub = NT();
+            L("  " + sub + " = sub " + wv + " " + x7 + ", " + VecSplat64(bits, "72340172838076673"));
+            string e7 = NT();
+            L("  " + e7 + " = and " + wv + " " + sub + ", " + nx7);
+            string e7h = NT();
+            L("  " + e7h + " = and " + wv + " " + e7 + ", " + VecSplat64(bits, "-9187201950435737472"));
+            string auh = NT();
+            L("  " + auh + " = or " + wv + " " + au + ", " + VecSplat64(bits, "-9187201950435737472"));
+            string bul7 = NT();
+            L("  " + bul7 + " = and " + wv + " " + bu + ", " + VecSplat64(bits, "9187201950435737471"));
+            string gd = NT();
+            L("  " + gd + " = sub " + wv + " " + auh + ", " + bul7);
+            string ge7 = NT();
+            L("  " + ge7 + " = and " + wv + " " + gd + ", " + VecSplat64(bits, "-9187201950435737472"));
+            string abx = NT();
+            L("  " + abx + " = xor " + wv + " " + au + ", " + bu);
+            string eq7 = NT();
+            L("  " + eq7 + " = xor " + wv + " " + abx + ", " + VecSplat64(bits, "-1"));
+            string eq7h = NT();
+            L("  " + eq7h + " = and " + wv + " " + eq7 + ", " + VecSplat64(bits, "-9187201950435737472"));
+            string ne7 = NT();
+            L("  " + ne7 + " = xor " + wv + " " + e7h + ", " + VecSplat64(bits, "-1"));
+            string g2 = NT();
+            L("  " + g2 + " = and " + wv + " " + ge7 + ", " + ne7);
+            string g3 = NT();
+            L("  " + g3 + " = and " + wv + " " + g2 + ", " + eq7h);
+            string gt = NT();
+            L("  " + gt + " = or " + wv + " " + t1h + ", " + g3);
+            string shr = NT();
+            L("  " + shr + " = lshr " + wv + " " + gt + ", " + VecSplat64(bits, "7"));
+            string m = NT();
+            L("  " + m + " = mul " + wv + " " + shr + ", " + VecSplat64(bits, "255"));
+            string r8 = NT();
+            L("  " + r8 + " = bitcast " + wv + " " + m + " to " + VecV8(bits));
+            return new ExprVal(VecFromBytes(r8, bits), MkType(VecName(bits)));
+        }
         ExprVal a = GenExpr(e.kids[0]);
         ExprVal b = GenExpr(e.kids[1]);
         string v8 = VecV8(bits);
