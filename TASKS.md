@@ -238,6 +238,19 @@
   sm3-sm4 / rsa-x25519 / pixel / crc / base64 / json / cpu 探测），让"只算
   CRC32 的程序"不必背 AES。切分要保证同族内部互根的函数仍在同一成员里
   （`zan_hw_gate` 的函数指针分派表按族分组，别把 aes↔ghash 拆散）。
+- **2026-10-25 免拆源方案实测（不采用，结论留档）**：不拆 .c 也能抽族——
+  全量编一份 `-ffunction-sections` 对象，按族
+  `gcc -r -Wl,--gc-sections -Wl,-u,<族入口...>` 抽**依赖闭包**成族成员
+  （crc 族实测只余 3 符号：crc32c_update + cpu_feature + kat_state，零污染；
+  58 个外部符号 9 族全覆盖，objcopy -L 本地化核心符号防跨成员重复定义）。
+  死于 binutils PE COFF 的边界：`ld -r --gc-sections` 会把**被丢弃函数的
+  .pdata 展开信息**留在成员里（sha 成员残留 `zd...sm4_set_key` 的 pdata
+  指向已丢弃的 .text），链接时报
+  `relocation truncated to fit: IMAGE_REL_AMD64_ADDR32NB`。绕开它只有
+  物理拆源（族边界插 #ifdef 分批编译，每族一个 TU，pdata 天然自洽）——
+  182 KB 文件 9 组边界 + gate 静态随族走，机械但重；发布面已被 A493+gc
+  兜住，本条维持开发体验项优先级。CMake 已回退单成员（crypto 套件
+  14/14 绿）。
 - 关联：A493（归档成员机制的落地，本条的直接来源）。
 ### [~] A501 跨目标全量扫描：13 个目标的 console 与 GUI 交叉链接体检
 
