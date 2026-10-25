@@ -200,7 +200,7 @@
   修复一并消失，与"修复方向"预判一致）；`scripts/test.ps1 standard
   -Match "arc_|boxing|object_|cast_string|throw|catch|eh_"` 45/45 全绿。
 
-### [ ] A489 GPU 3D 片元着色器把光照写死成固定键光——没有材质与光源 uniform 通路
+### [x] A489 GPU 3D 片元着色器把光照写死成固定键光——没有材质与光源 uniform 通路
 
 - 现象：`src/runtime/zan_game.c` 的 3D 片元着色器（四份：plain / color /
   inst / inst-color）里键光方向是**写死的常量**：
@@ -215,8 +215,36 @@
 - 方向：给 3D 管线补 uniform 通路（材质槽 + 有限盏灯的方向/位置/颜色/强度）。
   注意**实例化批次路径每实例只带 20 个 float**（mvp 16 + tint 4），光源只能
   走 uniform 数组或每批次一次的提交，塞不进实例属性。
-- 关联：`Zan.Game.Render3D`（`docs/ECOSYSTEM_ROADMAP.md` §1.30）。
-  `src/runtime/**` 在并发会话的在途区域，本轮未动。
+- 闭环（2026-10-26）：四份片元着色器共享宏拼装的 uniform 光照段——
+  `uLightDir[4]` / `uLightColor[4]` / `uLightCount` / `uAmbient`，环境光 +
+  至多 4 盏方向光半兰伯特累加；循环上界写常量 4、体内 break（GLSL ES 3.00
+  循环条件要求常量表达式）。状态在 CPU 侧（`g_game_light_*`），缺省 = 键光
+  dir(0.4,0.8,0.6) 贡献 0.45 + ambient 0.55，与历史固定光照**逐位一致**。
+  新导出 `zan_game_set_lights3d(count, dirs, colors, ambient)`；uniform 按全局
+  版本号在每个程序上惰性上传（程序间不共享 uniform 状态，批量通路中途
+  `set_lights3d` 下一次提交即生效——批次每实例 20 float 的约束下光源走
+  uniform，与方向预判一致）。`zan_gl_api` 补 `Uniform3fv`（唯一加载表
+  gui_gl_context.c，GL 3.3 / GLES 3.0 均必有）。Zan 面：`Canvas.SetLights3D`
+  （持久 NativeMemory 缓冲封送，null ambient 保留当前值）。Render3D 仍走
+  CPU 着色入 tint（其像素表现有验收口径，接入 GPU 光照是独立一档，见 A559）。
+- 验证：`runtime_gui_gl_3d` 直跑 "GL 3D: OK"——新增断言段覆盖：缺省逐位
+  重现历史基线 h0（改灯前后各验一次）、非法参数拒绝、纯环境光≈140、
+  正面灯≥240 / 背面灯≤20、双灯累加、批量实例吃同一份光照、**批中途换灯**、
+  恢复缺省逐位回 h0；`case_game_render3d` 10.5s 绿（Render3D 包压在新
+  着色器上无感）。
+- 关联：`Zan.Game.Render3D`（`docs/ECOSYSTEM_ROADMAP.md` §1.30）；
+  Render3D→GPU 光照接入立 A559。
+
+### [ ] A559 Zan.Game.Render3D 接入 GPU 光照 uniform 通路（A489 落地后的一档）
+
+- 背景：A489 已把 3D 管线的光照做成 uniform 通路（4 盏方向光 + 环境光，
+  `Canvas.SetLights3D`，单网格与批量实例共用）。Render3D 目前仍是
+  CPU 侧 `Lighting.Shade` 算完打包成 tint 传入，与 GPU 键光叠加成双重着色。
+- 方向：Renderer3D 提交前把场景灯推给 `SetLights3D`，材质输出改传反照率
+  （albedo）tint，让 GPU 做着色；CPU 兜底档（3D 不可用）保留现有 CPU
+  着色路径。改动会变像素表现，需按 gui-design/game-dev 的像素复核口径
+  验收（对照改前截图），不能只看编译过。
+
 
 ### [ ] A490 3D 实例化批次依赖 GL 3.3 / GLES 3.1 的 core 特性——移动端可用性未实测
 

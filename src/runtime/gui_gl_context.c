@@ -43,6 +43,7 @@ int zan_gl_api_load(zan_gl_api *api, void *(*getproc)(const char *name)) {
         E(GetAttribLocation, "glGetAttribLocation"),
         E(Uniform1i, "glUniform1i"),
         E(Uniform2f, "glUniform2f"),
+        E(Uniform3fv, "glUniform3fv"),
         E(Uniform4f, "glUniform4f"),
         E(UniformMatrix4fv, "glUniformMatrix4fv"),
         E(GenBuffers, "glGenBuffers"),

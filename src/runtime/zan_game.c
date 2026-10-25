@@ -127,10 +127,15 @@ typedef struct {
 } zan_game_depth;
 
 /* 着色器程序按 [colored][instanced] 惰性建，属性位置全部显式 layout，
- * 同一网格 VAO 可跨程序复用。u_mvp/u_color 仅非实例化程序使用。 */
+ * 同一网格 VAO 可跨程序复用。u_mvp/u_color 仅非实例化程序使用。
+ * 光照 uniform 全局共享（g_game_light_*），按版本号惰性上传：程序内
+ * uniform 状态跨调用保持，只有 set_lights3d 递增版本后才重传，批量
+ * 通路中途换光照也能在下一次提交时生效。 */
 typedef struct {
     zgl_uint program;
     zgl_int u_mvp, u_tex, u_color;
+    zgl_int u_light_dir, u_light_color, u_light_count, u_ambient;
+    uint32_t light_version;
 } zan_game_program;
 
 #define ZAN_GAME_LOC_POS 0
@@ -139,6 +144,22 @@ typedef struct {
 #define ZAN_GAME_LOC_COLOR 3
 #define ZAN_GAME_LOC_IMVP 4   /* mat4 占用 4..7 */
 #define ZAN_GAME_LOC_ITINT 8
+
+/* 3D 光照状态（A489）。缺省一盏键光还原历史固定光照：
+ * shade = ambient + color*halfLambert = 0.55 + 0.45*lam，方向
+ * (0.4,0.8,0.6) 与旧着色器常量逐位相同（着色器内归一化，这里不预归一）。 */
+#define ZAN_GAME_MAX_LIGHTS 4
+static float g_game_light_dir[ZAN_GAME_MAX_LIGHTS][3] = {
+    { 0.4f, 0.8f, 0.6f }, { 0.0f, 0.0f, 0.0f },
+    { 0.0f, 0.0f, 0.0f }, { 0.0f, 0.0f, 0.0f }
+};
+static float g_game_light_color[ZAN_GAME_MAX_LIGHTS][3] = {
+    { 0.45f, 0.45f, 0.45f }, { 0.0f, 0.0f, 0.0f },
+    { 0.0f, 0.0f, 0.0f }, { 0.0f, 0.0f, 0.0f }
+};
+static int g_game_light_count = 1;
+static float g_game_ambient[3] = { 0.55f, 0.55f, 0.55f };
+static uint32_t g_game_light_version = 1;
 
 static zan_game_mesh *g_game_meshes = NULL;
 static int g_game_mesh_cap = 0;
@@ -250,20 +271,43 @@ static const char *const ZAN_GAME_3D_VS_INST_COLOR =
 "    gl_Position = vec4(clip.x, -clip.y, clip.z, clip.w);\n"
 "}\n";
 
+/* 光照 uniform（A489）：四份片元着色器共享同一段光照计算——环境光 +
+ * 至多 4 盏方向光的半兰伯特贡献，方向与颜色走 uniform 数组（实例化
+ * 批次每实例只带 20 float，光源塞不进实例属性，只能每批次随程序提交）。
+ * 缺省值（g_game_light_* 初始化）恰好还原历史固定键光：
+ * 0.55 + 0.45 * halfLambert(normal, (0.4,0.8,0.6))，逐位一致。
+ * 循环上界写常量 4、体内 break——GLSL ES 3.00 的循环条件要求常量
+ * 表达式，动态盏数只能在体内截断。共享段以宏拼进各着色器字面量
+ * （C 不允许 char[] 变量参与字符串字面量拼接）。 */
+#define ZAN_GAME_3D_LIGHT_UNIFORMS \
+"uniform vec3 uLightDir[4];\n" \
+"uniform vec3 uLightColor[4];\n" \
+"uniform int uLightCount;\n" \
+"uniform vec3 uAmbient;\n"
+
+#define ZAN_GAME_3D_LIGHT_BODY \
+"    vec3 light = uAmbient;\n" \
+"    for (int i = 0; i < 4; ++i) {\n" \
+"        if (i >= uLightCount) break;\n" \
+"        float lam = clamp(dot(normalize(v_normal), normalize(uLightDir[i])) * 0.5 + 0.5, 0.0, 1.0);\n" \
+"        light += uLightColor[i] * lam;\n" \
+"    }\n"
+
 static const char *const ZAN_GAME_3D_FS_PLAIN =
+ZAN_GAME_3D_LIGHT_UNIFORMS
 "uniform sampler2D uTex;\n"
 "uniform vec4 uColor;\n"
 "in vec2 v_uv;\n"
 "in vec3 v_normal;\n"
 "out vec4 frag;\n"
 "void main() {\n"
-"    float lam = clamp(dot(normalize(v_normal), normalize(vec3(0.4, 0.8, 0.6))) * 0.5 + 0.5, 0.0, 1.0);\n"
-"    float shade = 0.55 + 0.45 * lam;\n"
+ZAN_GAME_3D_LIGHT_BODY
 "    vec4 tex = texture(uTex, v_uv);\n"
-"    frag = vec4(tex.rgb * uColor.rgb * shade, tex.a * uColor.a);\n"
+"    frag = vec4(tex.rgb * uColor.rgb * light, tex.a * uColor.a);\n"
 "}\n";
 
 static const char *const ZAN_GAME_3D_FS_COLOR =
+ZAN_GAME_3D_LIGHT_UNIFORMS
 "uniform sampler2D uTex;\n"
 "uniform vec4 uColor;\n"
 "in vec2 v_uv;\n"
@@ -271,27 +315,27 @@ static const char *const ZAN_GAME_3D_FS_COLOR =
 "in vec4 v_color;\n"
 "out vec4 frag;\n"
 "void main() {\n"
-"    float lam = clamp(dot(normalize(v_normal), normalize(vec3(0.4, 0.8, 0.6))) * 0.5 + 0.5, 0.0, 1.0);\n"
-"    float shade = 0.55 + 0.45 * lam;\n"
+ZAN_GAME_3D_LIGHT_BODY
 "    vec4 tex = texture(uTex, v_uv);\n"
-"    vec3 rgb = tex.rgb * uColor.rgb * v_color.rgb * shade;\n"
+"    vec3 rgb = tex.rgb * uColor.rgb * v_color.rgb * light;\n"
 "    frag = vec4(rgb, tex.a * uColor.a * v_color.a);\n"
 "}\n";
 
 static const char *const ZAN_GAME_3D_FS_INST =
+ZAN_GAME_3D_LIGHT_UNIFORMS
 "uniform sampler2D uTex;\n"
 "in vec2 v_uv;\n"
 "in vec3 v_normal;\n"
 "in vec4 v_tint;\n"
 "out vec4 frag;\n"
 "void main() {\n"
-"    float lam = clamp(dot(normalize(v_normal), normalize(vec3(0.4, 0.8, 0.6))) * 0.5 + 0.5, 0.0, 1.0);\n"
-"    float shade = 0.55 + 0.45 * lam;\n"
+ZAN_GAME_3D_LIGHT_BODY
 "    vec4 tex = texture(uTex, v_uv);\n"
-"    frag = vec4(tex.rgb * v_tint.rgb * shade, tex.a * v_tint.a);\n"
+"    frag = vec4(tex.rgb * v_tint.rgb * light, tex.a * v_tint.a);\n"
 "}\n";
 
 static const char *const ZAN_GAME_3D_FS_INST_COLOR =
+ZAN_GAME_3D_LIGHT_UNIFORMS
 "uniform sampler2D uTex;\n"
 "in vec2 v_uv;\n"
 "in vec3 v_normal;\n"
@@ -299,10 +343,9 @@ static const char *const ZAN_GAME_3D_FS_INST_COLOR =
 "in vec4 v_tint;\n"
 "out vec4 frag;\n"
 "void main() {\n"
-"    float lam = clamp(dot(normalize(v_normal), normalize(vec3(0.4, 0.8, 0.6))) * 0.5 + 0.5, 0.0, 1.0);\n"
-"    float shade = 0.55 + 0.45 * lam;\n"
+ZAN_GAME_3D_LIGHT_BODY
 "    vec4 tex = texture(uTex, v_uv);\n"
-"    vec3 rgb = tex.rgb * v_tint.rgb * v_color.rgb * shade;\n"
+"    vec3 rgb = tex.rgb * v_tint.rgb * v_color.rgb * light;\n"
 "    frag = vec4(rgb, tex.a * v_tint.a * v_color.a);\n"
 "}\n";
 
@@ -403,9 +446,16 @@ static zan_game_program *zan_game_program_get(int colored, int instanced) {
         : g_game_gl->GetUniformLocation(program, "uMVP");
     zgl_int color = instanced ? 0
         : g_game_gl->GetUniformLocation(program, "uColor");
+    zgl_int light_dir = g_game_gl->GetUniformLocation(program, "uLightDir[0]");
+    zgl_int light_color =
+        g_game_gl->GetUniformLocation(program, "uLightColor[0]");
+    zgl_int light_count = g_game_gl->GetUniformLocation(program, "uLightCount");
+    zgl_int ambient = g_game_gl->GetUniformLocation(program, "uAmbient");
     int ok = tex >= 0 && pos == ZAN_GAME_LOC_POS &&
         normal == ZAN_GAME_LOC_NORMAL && uv == ZAN_GAME_LOC_UV &&
         mvp >= 0 && color >= 0 &&
+        light_dir >= 0 && light_color >= 0 &&
+        light_count >= 0 && ambient >= 0 &&
         g_game_gl->GetError() == ZGL_NO_ERROR;
     if (ok && colored) {
         ok = g_game_gl->GetAttribLocation(program, "a_color") ==
@@ -425,7 +475,26 @@ static zan_game_program *zan_game_program_get(int colored, int instanced) {
     prog->u_mvp = mvp;
     prog->u_tex = tex;
     prog->u_color = color;
+    prog->u_light_dir = light_dir;
+    prog->u_light_color = light_color;
+    prog->u_light_count = light_count;
+    prog->u_ambient = ambient;
+    prog->light_version = 0;
     return prog;
+}
+
+/* 光照 uniform 上传：程序间 uniform 状态互不共享，每个程序按全局版本
+ * 号判重；版本只在 set_lights3d 递增，常态绘制零额外调用。 */
+static void zan_game_upload_lights(zan_game_program *prog) {
+    if (prog->light_version == g_game_light_version) return;
+    const zan_gl_api *gl = g_game_gl;
+    gl->Uniform3fv(prog->u_light_dir, ZAN_GAME_MAX_LIGHTS,
+        &g_game_light_dir[0][0]);
+    gl->Uniform3fv(prog->u_light_color, ZAN_GAME_MAX_LIGHTS,
+        &g_game_light_color[0][0]);
+    gl->Uniform1i(prog->u_light_count, g_game_light_count);
+    gl->Uniform3fv(prog->u_ambient, 1, g_game_ambient);
+    prog->light_version = g_game_light_version;
 }
 
 static zan_game_mesh *zan_game_mesh_alloc(void) {
@@ -620,6 +689,7 @@ ZAN_GAME_API int32_t zan_game_draw3d(int32_t surface_id, int32_t mesh_id,
     gl->DepthFunc(ZGL_LEQUAL);
     gl->Disable(ZGL_BLEND);
     gl->UseProgram(prog->program);
+    zan_game_upload_lights(prog);
     gl->UniformMatrix4fv(prog->u_mvp, 1, ZGL_FALSE, mvp);
     uint32_t argb = (uint32_t)color;
     gl->Uniform4f(prog->u_color,
@@ -754,9 +824,11 @@ ZAN_GAME_API int32_t zan_game_draw3d_batch(int32_t surface_id, int32_t mesh_id,
             sizeof(float)), instances);
     gl->BindBuffer(ZGL_ARRAY_BUFFER, 0);
     if (!zan_game_mesh_inst_ready(mesh, gl)) return 0;
-    if (prog->program != g_game_batch_prog) {
+    if (prog->program != g_game_batch_prog ||
+        prog->light_version != g_game_light_version) {
         gl->UseProgram(prog->program);
         gl->Uniform1i(prog->u_tex, 0);
+        zan_game_upload_lights(prog);
         g_game_batch_prog = prog->program;
     }
     if (tex != g_game_batch_tex) {
@@ -779,5 +851,21 @@ ZAN_GAME_API int32_t zan_game_draw3d_batch_end(int32_t surface_id) {
     g_game_batch_prog = 0;
     g_game_batch_tex = 0;
     zan_gui_gpu_end(surface_id);
+    return 1;
+}
+
+ZAN_GAME_API int32_t zan_game_set_lights3d(int32_t count, const float *dirs,
+    const float *colors, const float *ambient) {
+    if (count < 0 || count > ZAN_GAME_MAX_LIGHTS) return 0;
+    if (count > 0 && (!dirs || !colors)) return 0;
+    if (count > 0) {
+        memcpy(g_game_light_dir, dirs,
+            (size_t)count * 3 * sizeof(float));
+        memcpy(g_game_light_color, colors,
+            (size_t)count * 3 * sizeof(float));
+    }
+    g_game_light_count = count;
+    if (ambient) memcpy(g_game_ambient, ambient, 3 * sizeof(float));
+    g_game_light_version++;
     return 1;
 }

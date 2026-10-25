@@ -122,6 +122,7 @@ typedef struct zan_gl_api_s {
     zgl_int   (*GetAttribLocation)(zgl_uint, const zgl_char *);
     void      (*Uniform1i)(zgl_int, zgl_int);
     void      (*Uniform2f)(zgl_int, zgl_float, zgl_float);
+    void      (*Uniform3fv)(zgl_int, zgl_sizei, const zgl_float *);
     void      (*Uniform4f)(zgl_int, zgl_float, zgl_float, zgl_float, zgl_float);
     void      (*UniformMatrix4fv)(zgl_int, zgl_sizei, zgl_boolean,
                                   const zgl_float *);

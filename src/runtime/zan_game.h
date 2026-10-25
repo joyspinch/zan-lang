@@ -40,6 +40,15 @@ ZAN_GAME_API int32_t zan_game_draw3d_batch(int32_t surface_id, int32_t mesh,
     const char *texture, const float *instances, int32_t count);
 ZAN_GAME_API int32_t zan_game_draw3d_batch_end(int32_t surface_id);
 
+/* 3D 光照 uniform 通路（draw3d 与批量实例共用，A489）：count 为方向光
+ * 数量（0..4），dirs/colors 各 count*3 个 float——指向光源的方向（与
+ * 网格法线同空间，着色器内归一化）与 rgb 颜色贡献；ambient 为 3 个
+ * float（可 NULL 保留当前值）。缺省 = 一盏键光 dir(0.4,0.8,0.6)
+ * color 0.45 + ambient 0.55（半兰伯特），与历史固定光照逐位一致。
+ * 返回 1 = 已生效，0 = 参数非法。 */
+ZAN_GAME_API int32_t zan_game_set_lights3d(int32_t count, const float *dirs,
+    const float *colors, const float *ambient);
+
 #ifdef __cplusplus
 }
 #endif

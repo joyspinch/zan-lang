@@ -1322,6 +1322,10 @@ public class Canvas {
     [DllImport("zan_game")]
     static extern int zan_game_draw3d_batch_end(int surfaceId);
 
+    [DllImport("zan_game")]
+    static extern int zan_game_set_lights3d(int count, nint dirs,
+        nint colors, nint ambient);
+
     static nint meshUploadVertBuf;
     static int meshUploadVertCap;
     static nint meshUploadIdxBuf;
@@ -1364,10 +1368,17 @@ public class Canvas {
     }
 
     static nint cachedMvpPtr;
+    static nint lightDirsBuf;
+    static int lightDirsCap;
+    static nint lightColorsBuf;
+    static int lightColorsCap;
+    static nint lightAmbientBuf;
 
     // 按模型-视图-投影矩阵（Mat4.Mul(P, Mat4.Mul(V, M)).ToColumnMajor()
-    // 组出）把 mesh 画进画布的 3D 层：深度测试 + 纹理映射 + 半兰伯特
-    // 光照（法线着色，免配置）。texture 为图像路径或 ImageLoadMem 的
+    // 组出）把 mesh 画进画布的 3D 层：深度测试 + 纹理映射 + 法线光照。
+    // 光照缺省为一盏免配置键光（半兰伯特，dir(0.4,0.8,0.6) 贡献 0.45 +
+    // 环境光 0.55），<see cref="SetLights3D"/> 可换成多盏方向光与环境光，
+    // 对单网格与批量实例通路同时生效。texture 为图像路径或 ImageLoadMem 的
     // "mem:" key，null/"" 用 1x1 白纹理。返回 1 = 已画，0 = 当前
     // 后端不支持 3D（CPU 兜底档），调用方可换 2D 回退。
     public int DrawMesh3D(int mesh, float[] mvpColumnMajor, int color,
@@ -1398,6 +1409,58 @@ public class Canvas {
         ms[12] = m[3]; ms[13] = m[7]; ms[14] = m[11]; ms[15] = m[15];
         string texKey = texture == null ? "" : texture;
         return zan_game_draw3d(surfaceId, mesh, cachedMvpPtr, color, texKey);
+    }
+
+    // 配置 3D 光照（A489，GPU 档）：dirs/colors 每盏 3 个 float——指向
+    // 光源的方向（与网格法线同空间，着色器内归一化）与 rgb 颜色贡献，
+    // 最多 4 盏；count = dirs.Length/3，为 0 时只剩环境光。ambient 为
+    // 3 个 float，传 null 保留当前环境光。缺省状态 = 一盏键光
+    // dir(0.4,0.8,0.6) 贡献 0.45 + 环境光 0.55（半兰伯特），与免配置
+    // 历史光照一致。对 DrawMesh3D 与批量实例通路同时生效，下一次绘制
+    // 起按新光照渲染；配置是全局状态，不随画布销毁重置。CPU 兜底档
+    // 没有 GPU 光照，此配置不影响其行为。返回 1 = 已生效，0 = 参数
+    // 非法（超过 4 盏 / dirs 与 colors 数量不符）。
+    public int SetLights3D(float[] dirs, float[] colors, float[] ambient) {
+        int count = dirs == null ? 0 : dirs.Length / 3;
+        if (count > 4) { return 0; }
+        if (count > 0 &&
+            (colors == null || colors.Length < count * 3)) { return 0; }
+        int dirBytes = count * 3 * 4;
+        if (dirBytes > lightDirsCap) {
+            if (lightDirsBuf != 0) {
+                NativeMemory.Free(lightDirsBuf);
+            }
+            lightDirsBuf = NativeMemory.Alloc(dirBytes < 96 ? 96 : dirBytes * 2);
+            lightDirsCap = dirBytes < 96 ? 96 : dirBytes * 2;
+        }
+        if (count > 0) {
+            Span<float> ds = new Span<float>(lightDirsBuf, count * 3);
+            for (int i = 0; i < count * 3; i = i + 1) { ds[i] = dirs[i]; }
+            int colorBytes = colors.Length * 4;
+            if (colorBytes > lightColorsCap) {
+                if (lightColorsBuf != 0) {
+                    NativeMemory.Free(lightColorsBuf);
+                }
+                lightColorsBuf = NativeMemory.Alloc(
+                    colorBytes < 96 ? 96 : colorBytes * 2);
+                lightColorsCap = colorBytes < 96 ? 96 : colorBytes * 2;
+            }
+            Span<float> cs = new Span<float>(lightColorsBuf, colors.Length);
+            for (int i = 0; i < colors.Length; i = i + 1) { cs[i] = colors[i]; }
+        }
+        if (lightAmbientBuf == 0) {
+            lightAmbientBuf = NativeMemory.Alloc(12);
+        }
+        nint ambientPtr = 0;
+        if (ambient != null && ambient.Length >= 3) {
+            Span<float> ab = new Span<float>(lightAmbientBuf, 3);
+            ab[0] = ambient[0];
+            ab[1] = ambient[1];
+            ab[2] = ambient[2];
+            ambientPtr = lightAmbientBuf;
+        }
+        return zan_game_set_lights3d(count, lightDirsBuf, lightColorsBuf,
+                                     ambientPtr);
     }
 
     // 开始一批实例绘制：清一次深度缓冲、绑定深度/裁剪状态。之后可对

@@ -29,6 +29,7 @@ static int32_t (*mesh_create_ex)(int32_t,const float*,int32_t,const uint16_t*,in
 static void (*push_clip)(int32_t,int32_t,int32_t,int32_t,int32_t);
 static void (*pop_clip)(int32_t);
 static int32_t (*draw3d)(int32_t,int32_t,const float*,uint32_t,const char*);
+static int32_t (*set_lights)(int32_t,const float*,const float*,const float*);
 static int32_t (*batch_begin)(int32_t);
 static int32_t (*batch)(int32_t,int32_t,const char*,const float*,int32_t);
 static int32_t (*batch_end)(int32_t);
@@ -205,6 +206,7 @@ int main(int argc, char **argv) {
     LOAD(mesh_create, game, "zan_game_mesh_create");
     LOAD(mesh_create_ex, game, "zan_game_mesh_create_ex");
     LOAD(draw3d, game, "zan_game_draw3d");
+    LOAD(set_lights, game, "zan_game_set_lights3d");
     LOAD(batch_begin, game, "zan_game_draw3d_batch_begin");
     LOAD(batch, game, "zan_game_draw3d_batch");
     LOAD(batch_end, game, "zan_game_draw3d_batch_end");
@@ -435,6 +437,95 @@ int main(int argc, char **argv) {
     }
     CHECK(last_mesh > 0);
     CHECK(draw3d(s, last_mesh, cube_mvp(0.0f, 4.0f, 1.0f), 0xFFFFFFFF, NULL) == 1);
+
+    /* ---- 光照 uniform 通路（A489） --------------------------------
+     * 之前全部断言都在缺省键光下取得（缺省 = 历史"写死的"固定光照）。
+     * h0 是缺省光照 + cube_mvp(0.0f) 的画面基线。 */
+
+    /* 缺省状态必须重现历史基线：uniform 缺省值与旧着色器常量逐位一致 */
+    clear_rect(s, 0, 0, W, H, 0xFF203040);
+    CHECK(draw3d(s, last_mesh, cube_mvp(0.0f, 4.0f, 1.0f), 0xFFFFFFFF, NULL) == 1);
+    capture(s);
+    CHECK(frame_hash() == h0);
+
+    /* 非法参数拒绝（不改变光照状态） */
+    const float front[3] = { 0.0f, 0.0f, 1.0f };
+    const float back[3] = { 0.0f, 0.0f, -1.0f };
+    const float full[3] = { 1.0f, 1.0f, 1.0f };
+    const float dark[3] = { 0.0f, 0.0f, 0.0f };
+    CHECK(set_lights(5, NULL, NULL, NULL) == 0);
+    CHECK(set_lights(-1, NULL, NULL, NULL) == 0);
+    CHECK(set_lights(1, NULL, full, NULL) == 0);
+
+    /* 纯环境光（count=0，ambient 保留 0.55）：前脸中心 ≈ 140 */
+    CHECK(set_lights(0, NULL, NULL, NULL) == 1);
+    clear_rect(s, 0, 0, W, H, 0xFF203040);
+    CHECK(draw3d(s, last_mesh, cube_mvp(0.0f, 4.0f, 1.0f), 0xFFFFFFFF, NULL) == 1);
+    capture(s);
+    CHECK(center_r() >= 130 && center_r() <= 150);
+    CHECK(frame_hash() != h0);
+
+    /* 正面单灯满贡献（法线经 0.4 弧度俯仰后 dot≈0.92）：中心显著变亮 */
+    CHECK(set_lights(1, front, full, dark) == 1);
+    clear_rect(s, 0, 0, W, H, 0xFF203040);
+    CHECK(draw3d(s, last_mesh, cube_mvp(0.0f, 4.0f, 1.0f), 0xFFFFFFFF, NULL) == 1);
+    capture(s);
+    CHECK(center_r() >= 240);
+    uint32_t h_front = frame_hash();
+    CHECK(h_front != h0);
+
+    /* 背面单灯：前脸背光，只剩 0 贡献 → 近黑 */
+    CHECK(set_lights(1, back, full, dark) == 1);
+    clear_rect(s, 0, 0, W, H, 0xFF203040);
+    CHECK(draw3d(s, last_mesh, cube_mvp(0.0f, 4.0f, 1.0f), 0xFFFFFFFF, NULL) == 1);
+    capture(s);
+    CHECK(center_r() <= 20);
+    CHECK(frame_hash() != h_front);
+
+    /* 两盏灯累加（uLightCount=2 走数组循环）：介于背面与正面光之间 */
+    {
+        const float dirs[6] = { 0.0f, 0.0f, 1.0f, 0.4f, 0.8f, 0.6f };
+        const float cols[6] = { 0.2f, 0.2f, 0.2f, 0.25f, 0.25f, 0.25f };
+        CHECK(set_lights(2, dirs, cols, dark) == 1);
+    }
+    clear_rect(s, 0, 0, W, H, 0xFF203040);
+    CHECK(draw3d(s, last_mesh, cube_mvp(0.0f, 4.0f, 1.0f), 0xFFFFFFFF, NULL) == 1);
+    capture(s);
+    CHECK(center_r() >= 60 && center_r() <= 160);
+    CHECK(frame_hash() != h_front);
+
+    /* 批量实例通路吃同一份光照 uniform：正面光下白 tint 四边形全亮 */
+    {
+        float instl[20];
+        fill_instance(instl, inst_mvp(0.0f, 0.0f, -3.0f), 1, 1, 1, 1);
+        CHECK(set_lights(1, front, full, dark) == 1);
+        clear_rect(s, 0, 0, W, H, 0xFF203040);
+        CHECK(batch_begin(s) == 1);
+        CHECK(batch(s, sqmesh, NULL, instl, 1) == 1);
+        CHECK(batch_end(s) == 1);
+        capture(s);
+        CHECK(((frame[(H/2)*W + W/2] >> 16) & 255) >= 250);
+
+        /* 批中途换光照（begin 与 batch 之间 set）：下一次提交即生效 */
+        CHECK(batch_begin(s) == 1);
+        CHECK(set_lights(1, back, full, dark) == 1);
+        CHECK(batch(s, sqmesh, NULL, instl, 1) == 1);
+        CHECK(batch_end(s) == 1);
+        capture(s);
+        CHECK(((frame[(H/2)*W + W/2] >> 16) & 255) <= 10);
+    }
+
+    /* 恢复缺省参数（与历史常量相同的三元组）→ 画面逐位回到基线 h0 */
+    {
+        const float def_dir[3] = { 0.4f, 0.8f, 0.6f };
+        const float def_col[3] = { 0.45f, 0.45f, 0.45f };
+        const float def_amb[3] = { 0.55f, 0.55f, 0.55f };
+        CHECK(set_lights(1, def_dir, def_col, def_amb) == 1);
+    }
+    clear_rect(s, 0, 0, W, H, 0xFF203040);
+    CHECK(draw3d(s, last_mesh, cube_mvp(0.0f, 4.0f, 1.0f), 0xFFFFFFFF, NULL) == 1);
+    capture(s);
+    CHECK(frame_hash() == h0);
 
     destroy(s);
     fprintf(stderr, "GL 3D: OK\n");
