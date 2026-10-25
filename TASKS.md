@@ -27,6 +27,12 @@
     外全部误报；生成管道必须 `tr -d '\r'`。
   - 验证：探针（title.text 已知静默、title.shou/axsiX/series.wat 各报
     一条、stdout 干净）；图表 conformance 全量回归见同批提交。
+- **第二步已落地（2026-10-25）：高频 option 键下沉解析，未读率降至 36%。**
+  补齐 `animation` / `animationDuration` / `animationDurationUpdate` /
+  `animationEasing` / `animationEasingUpdate` / `animationThreshold` /
+  `readOnly` / `sublink` / `realtime` / `shadowOffsetX` / `shadowOffsetY` /
+  `textAlign` / `verticalAlign` 等 14 个高频配置键解析与结构化存储；
+  未读键数从 183（39%）降至 169（36%）；ChartOptionWarn 注册表同步刷新。
 - 事实（`docs/archive/CHART_CODE_GAP_LEDGER.md`）：对照 ECharts 6.1 的 596 个
   `.ts` 源，官方 option 用到的 470 个配置键里，引擎**从不读取**的有 278 个（59%）。
 - 表现：用户照官方示例写 option，键被静默丢弃——不报错、不告警，图形少一块也
