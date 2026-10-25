@@ -3673,7 +3673,7 @@ static void register_struct_type(zan_irgen_t *g, zan_symbol_t *sym) {
     unsigned long size = 0, align = 1;
     int slot = vptr;
     if (class_has_virtual_methods(sym)) {
-        zan_diag_emit(g->diag, DIAG_ERROR, sym->decl ? sym->decl->loc : zan_loc(0, 0, 0, 0),
+        zan_diag_emit_code(g->diag, DIAG_ERROR, sym->decl ? sym->decl->loc : zan_loc(0, 0, 0, 0), 3093,
                       "explicit-layout type '%.*s' cannot have virtual methods",
                       (int)sym->name.len, sym->name.str);
     }
@@ -3683,7 +3683,7 @@ static void register_struct_type(zan_irgen_t *g, zan_symbol_t *sym) {
             field_member_is_static(m)) continue;
         unsigned long off = 0;
         if (!field_offset_attr(m, &off)) {
-            zan_diag_emit(g->diag, DIAG_ERROR, m->decl ? m->decl->loc : sym->decl->loc,
+            zan_diag_emit_code(g->diag, DIAG_ERROR, m->decl ? m->decl->loc : sym->decl->loc, 3094,
                           "field '%.*s' of explicit-layout type '%.*s' needs [FieldOffset(n)]",
                           (int)m->name.len, m->name.str,
                           (int)sym->name.len, sym->name.str);
@@ -3691,7 +3691,7 @@ static void register_struct_type(zan_irgen_t *g, zan_symbol_t *sym) {
         entry->field_offsets[slot] = off;
         unsigned long fa = abi_align_of(field_types[slot]);
         if (off % fa != 0) {
-            zan_diag_emit(g->diag, DIAG_ERROR, m->decl ? m->decl->loc : sym->decl->loc,
+            zan_diag_emit_code(g->diag, DIAG_ERROR, m->decl ? m->decl->loc : sym->decl->loc, 3095,
                           "[FieldOffset(%lu)] on '%.*s' is not %lu-byte aligned",
                           off, (int)m->name.len, m->name.str, fa);
         }
@@ -4068,7 +4068,7 @@ static void check_struct_fits_slot(zan_irgen_t *g, LLVMTypeRef st, zan_ast_node_
     if (llvm_scalar_size(st)) return;
     zan_loc_t loc; memset(&loc, 0, sizeof(loc));
     if (at) loc = at->loc;
-    zan_diag_emit(g->diag, DIAG_ERROR, loc,
+    zan_diag_emit_code(g->diag, DIAG_ERROR, loc, 3096,
         "this value struct cannot be a collection element: the slot allocator "
         "cannot compute its layout; use a class instead");
 }
@@ -4283,7 +4283,7 @@ static void zan_irgen_compact_completed(zan_irgen_t *g, LLVMValueRef fn) {
     char error[4096];
     if (!zan_irgen_compactor_run((zan_irgen_compactor_t *)g->function_compactor,
                                  fn, error, sizeof(error))) {
-        zan_diag_emit(g->diag, DIAG_ERROR, zan_loc(0, 0, 0, 0),
+        zan_diag_emit_code(g->diag, DIAG_ERROR, zan_loc(0, 0, 0, 0), 3097,
                       "LLVM function compaction failed: %s", error);
     }
 }

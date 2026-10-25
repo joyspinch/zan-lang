@@ -318,7 +318,7 @@ static void diagnose_unresolved_static_chain(zan_irgen_t *g,
             zan_symbol_t *ts = zan_binder_lookup(g->binder, obj->ident.name);
             if (ts && (ts->kind == SYM_CLASS || ts->kind == SYM_STRUCT) &&
                 !get_method_sym(ts, callee->member.name)) {
-                zan_diag_emit(g->diag, DIAG_ERROR, recv->loc,
+                zan_diag_emit_code(g->diag, DIAG_ERROR, recv->loc, 3050,
                     "unresolved call '%.*s.%.*s': type '%.*s' has no method "
                     "'%.*s'",
                     (int)obj->ident.name.len, obj->ident.name.str,
@@ -751,7 +751,7 @@ static bool math_require_numeric(zan_irgen_t *g, zan_ast_node_t *expr,
                                   local_scope_t *locals, const char *name) {
     if (math_arg_is_numeric(v) && !math_arg_is_bool(g, arg_ast, locals))
         return true;
-    zan_diag_emit(g->diag, DIAG_ERROR, expr->loc,
+    zan_diag_emit_code(g->diag, DIAG_ERROR, expr->loc, 3051,
                   "Math.%s requires an int or floating-point argument", name);
     return false;
 }
@@ -904,7 +904,7 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                 if (is_wait || is_res || is_comp) {
                     LLVMTypeRef ti64 = LLVMInt64TypeInContext(g->ctx);
                     if (is_res && ot->type_arg_count != 1) {
-                        zan_diag_emit(g->diag, DIAG_ERROR, expr->loc,
+                        zan_diag_emit_code(g->diag, DIAG_ERROR, expr->loc, 3012,
                             "Task.Result requires a Task<T> value");
                         return LLVMConstInt(ti64, 0, 0);
                     }
@@ -938,7 +938,7 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                 if (sub_arg->kind == AST_LAMBDA) {
                     if (sub_arg->lambda.params.count != 0 ||
                         lambda_body_has_value_return(sub_arg->lambda.body)) {
-                        zan_diag_emit(g->diag, DIAG_ERROR, sub_arg->loc,
+                        zan_diag_emit_code(g->diag, DIAG_ERROR, sub_arg->loc, 3052,
                             "Task.Run delegate must be a parameterless void body "
                             "(an Action); pass an async call for results");
                         return LLVMConstInt(sp_i64, 0, 0);
@@ -954,7 +954,7 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                     lv = emit_lambda_typed(g, sub_arg, adt, locals);
                 } else {
                     if (sub_ty->delegate_param_count != 0) {
-                        zan_diag_emit(g->diag, DIAG_ERROR, sub_arg->loc,
+                        zan_diag_emit_code(g->diag, DIAG_ERROR, sub_arg->loc, 3053,
                             "Task.Run delegate must take no parameters");
                         return LLVMConstInt(sp_i64, 0, 0);
                     }
@@ -1293,7 +1293,7 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                 zan_ast_node_t *arg_ast = expr->call.args.items[0];
                 LLVMValueRef arg = emit_expr(g, arg_ast, locals);
                 if (LLVMGetTypeKind(LLVMTypeOf(arg)) != LLVMPointerTypeKind) {
-                    zan_diag_emit(g->diag, DIAG_ERROR, expr->loc,
+                    zan_diag_emit_code(g->diag, DIAG_ERROR, expr->loc, 3054,
                         "Console.ErrorWriteLine takes a string: format the "
                         "value with Convert.ToString first");
                     return emit_unresolved_call_result(g, expr, locals);
@@ -1666,7 +1666,7 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                遇到「一个指针 + 一个整数」就不报错了，pointer 随后被
                sitofp 成 double——生成非法 IR，编译死在代码生成阶段。 */
             if (!math_arg_is_numeric(a) || !math_arg_is_numeric(b)) {
-                zan_diag_emit(g->diag, DIAG_ERROR, expr->loc,
+                zan_diag_emit_code(g->diag, DIAG_ERROR, expr->loc, 3055,
                               "Math.%s requires numeric arguments",
                               want_max ? "Max" : "Min");
                 return LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 0, 0);
@@ -1860,7 +1860,7 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
             LLVMValueRef arg = emit_expr(g, expr->call.args.items[0], locals);
             zan_type_t *at = infer_expr_type(g, expr->call.args.items[0], locals);
             if (!type_is_textual_or_numeric(at)) {
-                zan_diag_emit(g->diag, DIAG_ERROR, expr->loc,
+                zan_diag_emit_code(g->diag, DIAG_ERROR, expr->loc, 3056,
                               "Convert.ToDouble: cannot convert '%.*s' to a "
                               "number -- pass a string or a numeric value",
                               at && at->name.len ? (int)at->name.len : 6,
@@ -1919,7 +1919,7 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                 LLVMValueRef s = emit_expr(g, expr->call.args.items[0], locals);
                 zan_type_t *at = infer_expr_type(g, expr->call.args.items[0], locals);
                 if (!type_is_text_arg(at)) {
-                    zan_diag_emit(g->diag, DIAG_ERROR, expr->loc,
+                    zan_diag_emit_code(g->diag, DIAG_ERROR, expr->loc, 3057,
                                   "%.*s.Parse requires a string argument",
                                   (int)rn.len, rn.str);
                     return int_recv ? LLVMConstInt(i64, 0, 0)
@@ -1993,7 +1993,7 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                 LLVMValueRef s = emit_expr(g, expr->call.args.items[0], locals);
                 zan_type_t *at = infer_expr_type(g, expr->call.args.items[0], locals);
                 if (!type_is_text_arg(at)) {
-                    zan_diag_emit(g->diag, DIAG_ERROR, expr->loc,
+                    zan_diag_emit_code(g->diag, DIAG_ERROR, expr->loc, 3058,
                                   "%.*s.TryParse requires a string argument",
                                   (int)rn.len, rn.str);
                     return LLVMConstInt(LLVMInt1TypeInContext(g->ctx), 0, 0);
@@ -2172,7 +2172,7 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                         LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
                         zan_type_t *at = infer_expr_type(g, expr->call.args.items[0], locals);
                         if (!type_is_textual_or_numeric(at)) {
-                            zan_diag_emit(g->diag, DIAG_ERROR, expr->loc,
+                            zan_diag_emit_code(g->diag, DIAG_ERROR, expr->loc, 3059,
                                           "Convert.%.*s: cannot convert '%.*s' "
                                           "to a number -- pass a string or a "
                                           "numeric value",
@@ -2304,8 +2304,8 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                             zan_type_display(at, tname, sizeof(tname));
                             if (!tname[0])
                                 snprintf(tname, sizeof(tname), "<value>");
-                            zan_diag_emit(g->diag, DIAG_ERROR,
-                                expr->call.args.items[0]->loc,
+                            zan_diag_emit_code(g->diag, DIAG_ERROR,
+                                expr->call.args.items[0]->loc, 3060,
                                 "Convert.ToString: cannot convert '%s' to a "
                                 "string -- call .ToString() on the value instead",
                                 tname);
@@ -3033,7 +3033,7 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                     if (interp_format_to_printf(&spec, is_f, is_ul,
                                                 &want_float, pfmt,
                                                 sizeof(pfmt)) == 0) {
-                        zan_diag_emit(g->diag, DIAG_ERROR, expr->loc,
+                        zan_diag_emit_code(g->diag, DIAG_ERROR, expr->loc, 3061,
                             "unsupported format specifier '%.*s' for numeric "
                             "ToString() (supported: D, X, F, E, G, 0/# shapes)",
                             (int)spec.len, spec.str);
@@ -5166,7 +5166,7 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                     if (method_sym) pack_params_args(g, expr, method_sym, locals);
                     if (method_sym) {
                         if ((method_sym->modifiers & MOD_STATIC) == 0) {
-                            zan_diag_emit(g->diag, DIAG_ERROR, expr->loc,
+                            zan_diag_emit_code(g->diag, DIAG_ERROR, expr->loc, 3062,
                                 "cannot call instance method '%.*s.%.*s' via "
                                 "the type name: call it on an instance",
                                 (int)type_sym->name.len, type_sym->name.str,
@@ -5858,7 +5858,7 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                     cur = (base && base != cur) ? base : NULL;
                 }
                 if (!member_found && !local_find(locals, expr->call.callee->ident.name)) {
-                    zan_diag_emit(g->diag, DIAG_ERROR, expr->loc,
+                    zan_diag_emit_code(g->diag, DIAG_ERROR, expr->loc, 3009,
                         "'%.*s' has no member '%.*s'",
                         (int)g->current_type_sym->name.len,
                         g->current_type_sym->name.str,
@@ -5894,13 +5894,13 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                     zan_istr_t ns = recv_cls->decl
                         ? zan_ast_ns_name(recv_cls->decl) : (zan_istr_t){0};
                     if (ns.len)
-                        zan_diag_emit(g->diag, DIAG_ERROR, expr->loc,
+                        zan_diag_emit_code(g->diag, DIAG_ERROR, expr->loc, 3063,
                             "type '%.*s.%.*s' has no member '%.*s'",
                             (int)ns.len, ns.str,
                             (int)recv_cls->name.len, recv_cls->name.str,
                             (int)mn.len, mn.str);
                     else
-                        zan_diag_emit(g->diag, DIAG_ERROR, expr->loc,
+                        zan_diag_emit_code(g->diag, DIAG_ERROR, expr->loc, 3009,
                             "'%.*s' has no member '%.*s'",
                             (int)recv_cls->name.len, recv_cls->name.str,
                             (int)mn.len, mn.str);
@@ -5948,7 +5948,7 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                     }
                 }
                 if (!osym && !enum_const_recv) {
-                    zan_diag_emit(g->diag, DIAG_ERROR, expr->loc,
+                    zan_diag_emit_code(g->diag, DIAG_ERROR, expr->loc, 3064,
                         "unresolved call '%.*s': '%.*s' is not a known variable, "
                         "type, or namespace (is the class imported and registered "
                         "in the stdlib map?)",
@@ -5956,7 +5956,7 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                 }
                 else if (osym && (osym->kind == SYM_CLASS || osym->kind == SYM_STRUCT) &&
                          !get_method_sym(osym, mn)) {
-                    zan_diag_emit(g->diag, DIAG_ERROR, expr->loc,
+                    zan_diag_emit_code(g->diag, DIAG_ERROR, expr->loc, 3065,
                         "unresolved call '%.*s': type '%.*s' has no method "
                         "'%.*s'",
                         plen, path, (int)on.len, on.str, (int)mn.len, mn.str);
@@ -5977,14 +5977,14 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                 brecv = "StringBuilder";
             if (brecv && !zan_builtin_has_member(brecv, bmn.str, (int)bmn.len)) {
                 const zan_builtin_type_t *bt = zan_builtin_find(brecv);
-                zan_diag_emit(g->diag, DIAG_ERROR, expr->loc,
+                zan_diag_emit_code(g->diag, DIAG_ERROR, expr->loc, 3066,
                     "'%s' has no member '%.*s'",
                     bt ? bt->display : brecv, (int)bmn.len, bmn.str);
             }
             else if (brecv &&
                      zan_builtin_member_kind(brecv, bmn.str, (int)bmn.len) == 'P') {
                 const zan_builtin_type_t *bt = zan_builtin_find(brecv);
-                zan_diag_emit(g->diag, DIAG_ERROR, expr->loc,
+                zan_diag_emit_code(g->diag, DIAG_ERROR, expr->loc, 3067,
                     "'%s.%.*s' is a property, not a method: drop the '()'",
                     bt ? bt->display : brecv, (int)bmn.len, bmn.str);
             }
@@ -5995,7 +5995,7 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
 
         if (!zan_diag_has_errors(g->diag)) {
             if (!call_receiver_is_open_generic(g, expr, locals))
-                zan_diag_emit(g->diag, DIAG_ERROR, expr->loc,
+                zan_diag_emit_code(g->diag, DIAG_ERROR, expr->loc, 3068,
                               "this call could not be resolved to any callable "
                               "(no method, delegate, operator or builtin matches)");
             else if (g->runtime_checks && g->current_fn) {

@@ -977,7 +977,7 @@ static void anf_spill_await_receiver(anf_ctx_t *c, zan_ast_node_t *aw);
 static void anf_check_order(anf_ctx_t *c, zan_ast_node_t *before, zan_ast_node_t *after) {
     if (after && before && anf_expr_contains_await(after) &&
         anf_expr_has_side_effect(before)) {
-        zan_diag_emit(c->g->diag, DIAG_ERROR, before->loc,
+        zan_diag_emit_code(c->g->diag, DIAG_ERROR, before->loc, 3098,
             "async: an expression with side effects is evaluated before an "
             "await in the same expression; assign it to a local first");
     }

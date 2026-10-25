@@ -3143,8 +3143,8 @@ static LLVMValueRef emit_property_getter_call(zan_irgen_t *g,
             LLVMValueRef rval = recv;
             /* 无接收者访问实例属性时默认补齐 this 隐式指针 */
             if (!is_static && !rval) {
-                zan_diag_emit(g->diag, DIAG_ERROR,
-                              obj_ast ? obj_ast->loc : zan_loc(0, 0, 0, 0),
+                zan_diag_emit_code(g->diag, DIAG_ERROR,
+                              obj_ast ? obj_ast->loc : zan_loc(0, 0, 0, 0), 3000,
                               "property getter requires a receiver");
                 return LLVMConstInt(LLVMInt64TypeInContext(g->ctx), 0, 0);
             }
@@ -3207,8 +3207,8 @@ static void emit_property_setter_call(zan_irgen_t *g, zan_symbol_t *setter,
             LLVMValueRef rval = recv;
             /* 实例 setter 空接收者防护：自动使用当前 this 指针 */
             if (!is_static && !rval) {
-                zan_diag_emit(g->diag, DIAG_ERROR,
-                              obj_ast ? obj_ast->loc : zan_loc(0, 0, 0, 0),
+                zan_diag_emit_code(g->diag, DIAG_ERROR,
+                              obj_ast ? obj_ast->loc : zan_loc(0, 0, 0, 0), 3001,
                               "property setter requires a receiver");
                 return;
             }
@@ -3319,7 +3319,7 @@ static LLVMValueRef emit_expr_identifier(zan_irgen_t *g, zan_ast_node_t *expr,
                         ? emit_method_group_closure(g, method_sym, self, expr->loc)
                         : NULL;
                     if (clo) return clo;
-                    zan_diag_emit(g->diag, DIAG_ERROR, expr->loc,
+                    zan_diag_emit_code(g->diag, DIAG_ERROR, expr->loc, 3002,
                         "instance method '%.*s' cannot be used as a value here: "
                         "no receiver is in scope",
                         (int)expr->ident.name.len, expr->ident.name.str);
@@ -3350,7 +3350,7 @@ static LLVMValueRef emit_expr_identifier(zan_irgen_t *g, zan_ast_node_t *expr,
         /* 静态检查已报错的未决符号占位返回 */
         /* 未解析标识符报错与诊断兜底 */
         if (!zan_binder_lookup(g->binder, expr->ident.name)) {
-            zan_diag_emit(g->diag, DIAG_ERROR, expr->loc,
+            zan_diag_emit_code(g->diag, DIAG_ERROR, expr->loc, 3003,
                 "use of undeclared identifier '%.*s'",
                 (int)expr->ident.name.len, expr->ident.name.str);
         }
@@ -4544,14 +4544,14 @@ static LLVMValueRef emit_unary_op_overload(zan_irgen_t *g, zan_ast_node_t *expr,
          * 返回 NULL，让"requires a numeric operand"维持原口径。 */
         if (expr->unary.op == TK_PLUS_PLUS || expr->unary.op == TK_MINUS_MINUS)
             return NULL;
-        zan_diag_emit(g->diag, DIAG_ERROR, expr->loc,
+        zan_diag_emit_code(g->diag, DIAG_ERROR, expr->loc, 3004,
                       "type '%s' does not define a unary '%s' operator overload",
                       ot->name.str ? ot->name.str : "<unknown>", op_sign);
         return LLVMGetUndef(map_type(g, ot));
     }
     int fi = irgen_find_function(g, op_sym);
     if (fi < 0) {
-        zan_diag_emit(g->diag, DIAG_ERROR, expr->loc,
+        zan_diag_emit_code(g->diag, DIAG_ERROR, expr->loc, 3005,
                       "unary '%s' operator overload of '%s' has no body to call",
                       op_sign, ot->name.str ? ot->name.str : "<unknown>");
         return LLVMGetUndef(map_type(g, ot));
@@ -5136,7 +5136,7 @@ static void check_readonly_store(zan_irgen_t *g, zan_ast_node_t *lhs,
     if (!f || !f->decl || f->decl->kind != AST_FIELD_DECL) return;
     if ((f->decl->field_decl.modifiers & MOD_READONLY) == 0) return;
     if (g->current_fn_is_ctor && g->current_type_sym == ot->sym) return;
-    zan_diag_emit(g->diag, DIAG_ERROR, lhs->loc,
+    zan_diag_emit_code(g->diag, DIAG_ERROR, lhs->loc, 3006,
                   "cannot assign to readonly field '%.*s' outside a "
                   "constructor of '%.*s'",
                   (int)lhs->member.name.len, lhs->member.name.str,
@@ -5327,7 +5327,7 @@ static LLVMValueRef emit_ref_lvalue_ptr(zan_irgen_t *g, zan_ast_node_t *tgt,
             LLVMValueRef right;
             /* 元组解构赋值降解处理 */
             if (expr->binary.left && expr->binary.left->kind == AST_TUPLE_EXPR) {
-                zan_diag_emit(g->diag, DIAG_ERROR, expr->loc,
+                zan_diag_emit_code(g->diag, DIAG_ERROR, expr->loc, 3007,
                     "tuple assignment is not supported; use `var (a, b) = rhs` "
                     "to declare the names");
                 return LLVMConstInt(LLVMInt64TypeInContext(g->ctx), 0, 0);
@@ -6113,7 +6113,7 @@ binding_lowered:
                     emit_oob_store_finish(g, ar_do, ar_end);
                     emit_release_owned_call_temp(g, arr_expr, arr_ptr, locals);
                 } else {
-                    zan_diag_emit(g->diag, DIAG_ERROR, expr->binary.left->loc,
+                    zan_diag_emit_code(g->diag, DIAG_ERROR, expr->binary.left->loc, 3008,
                         "cannot assign through this indexed expression");
                 }
             }
@@ -6306,7 +6306,7 @@ binding_lowered:
                 if (acls && (acls->kind == SYM_CLASS || acls->kind == SYM_STRUCT)) {
                     zan_istr_t an = expr->binary.left->member.name;
                     if (!type_declares_member(acls, an)) {
-                        zan_diag_emit(g->diag, DIAG_ERROR, expr->loc,
+                        zan_diag_emit_code(g->diag, DIAG_ERROR, expr->loc, 3009,
                             "'%.*s' has no member '%.*s'",
                             (int)acls->name.len, acls->name.str,
                             (int)an.len, an.str);
@@ -6319,7 +6319,7 @@ binding_lowered:
                     !(g->current_type_sym &&
                       (get_field_sym(g->current_type_sym, obj_expr->ident.name) ||
                        get_method_sym(g->current_type_sym, obj_expr->ident.name)))) {
-                    zan_diag_emit(g->diag, DIAG_ERROR, expr->loc,
+                    zan_diag_emit_code(g->diag, DIAG_ERROR, expr->loc, 3003,
                         "use of undeclared identifier '%.*s'",
                         (int)obj_expr->ident.name.len, obj_expr->ident.name.str);
                 }
@@ -6502,7 +6502,7 @@ static LLVMValueRef emit_incdec_expr(zan_irgen_t *g, zan_ast_node_t *expr,
         LLVMTypeKind pk = LLVMGetTypeKind(pty);
         if (pk != LLVMIntegerTypeKind && pk != LLVMFloatTypeKind &&
             pk != LLVMDoubleTypeKind) {
-            zan_diag_emit(g->diag, DIAG_ERROR, operand->loc,
+            zan_diag_emit_code(g->diag, DIAG_ERROR, operand->loc, 3010,
                 "++/-- requires a numeric operand");
             return LLVMConstInt(i64, 0, 0);
         }
@@ -6525,7 +6525,7 @@ static LLVMValueRef emit_incdec_expr(zan_irgen_t *g, zan_ast_node_t *expr,
         return is_prefix ? new_val : old_val;
     }
     if (!slot_ptr || !slot_ty) {
-        zan_diag_emit(g->diag, DIAG_ERROR, operand->loc,
+        zan_diag_emit_code(g->diag, DIAG_ERROR, operand->loc, 3011,
             "cannot apply ++/-- to this expression");
         return LLVMConstInt(i64, 0, 0);
     }
@@ -6550,7 +6550,7 @@ static LLVMValueRef emit_incdec_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                 return is_prefix ? uov : old_v;
             }
         }
-        zan_diag_emit(g->diag, DIAG_ERROR, operand->loc,
+        zan_diag_emit_code(g->diag, DIAG_ERROR, operand->loc, 3010,
             "++/-- requires a numeric operand");
         return LLVMConstInt(i64, 0, 0);
     }
@@ -6970,7 +6970,7 @@ static LLVMValueRef emit_expr_member_access(zan_irgen_t *g, zan_ast_node_t *expr
                 if (is_res || is_comp) {
                     LLVMTypeRef ti64 = LLVMInt64TypeInContext(g->ctx);
                     if (is_res && ot->type_arg_count != 1) {
-                        zan_diag_emit(g->diag, DIAG_ERROR, expr->loc,
+                        zan_diag_emit_code(g->diag, DIAG_ERROR, expr->loc, 3012,
                             "Task.Result requires a Task<T> value");
                         return LLVMConstInt(ti64, 0, 0);
                     }
@@ -7023,7 +7023,7 @@ static LLVMValueRef emit_expr_member_access(zan_irgen_t *g, zan_ast_node_t *expr
                 bool is_len = expr->member.name.len == 6 &&
                     memcmp(expr->member.name.str, "Length", 6) == 0;
                 if (!(mt->kind == TYPE_STRING && is_len)) {
-                    zan_diag_emit(g->diag, DIAG_ERROR, expr->loc,
+                    zan_diag_emit_code(g->diag, DIAG_ERROR, expr->loc, 3013,
                         "type '%s' has no member '%.*s'",
                         mt->name.str ? mt->name.str : "?",
                         (int)expr->member.name.len, expr->member.name.str);
@@ -7549,7 +7549,7 @@ static LLVMValueRef emit_expr_member_access(zan_irgen_t *g, zan_ast_node_t *expr
                             emit_rc_release_for_type(g, rct, recv);
                         return clo;
                     }
-                    zan_diag_emit(g->diag, DIAG_ERROR, expr->loc,
+                    zan_diag_emit_code(g->diag, DIAG_ERROR, expr->loc, 3014,
                         "instance method group '%.*s' cannot be used as a value",
                         (int)expr->member.name.len, expr->member.name.str);
                     return LLVMConstNull(
@@ -7569,14 +7569,14 @@ static LLVMValueRef emit_expr_member_access(zan_irgen_t *g, zan_ast_node_t *expr
             }
             if (rcls && (rcls->kind == SYM_CLASS || rcls->kind == SYM_STRUCT) &&
                 !type_declares_member(rcls, expr->member.name)) {
-                zan_diag_emit(g->diag, DIAG_ERROR, expr->loc,
+                zan_diag_emit_code(g->diag, DIAG_ERROR, expr->loc, 3009,
                     "'%.*s' has no member '%.*s'",
                     (int)rcls->name.len, rcls->name.str,
                     (int)expr->member.name.len, expr->member.name.str);
             } else if (!rcls) {
                 zan_type_t *rt = infer_expr_type(g, expr->member.object, locals);
                 if (rt && is_builtin_collection_type(rt))
-                    zan_diag_emit(g->diag, DIAG_ERROR, expr->loc,
+                    zan_diag_emit_code(g->diag, DIAG_ERROR, expr->loc, 3009,
                         "'%.*s' has no member '%.*s'",
                         (int)rt->name.len, rt->name.str,
                         (int)expr->member.name.len, expr->member.name.str);
@@ -7590,7 +7590,7 @@ static LLVMValueRef emit_expr_member_access(zan_irgen_t *g, zan_ast_node_t *expr
                     if (icls &&
                         (icls->kind == SYM_CLASS || icls->kind == SYM_STRUCT) &&
                         !type_declares_member(icls, inner->member.name))
-                        zan_diag_emit(g->diag, DIAG_ERROR, inner->loc,
+                        zan_diag_emit_code(g->diag, DIAG_ERROR, inner->loc, 3009,
                             "'%.*s' has no member '%.*s'",
                             (int)icls->name.len, icls->name.str,
                             (int)inner->member.name.len,
@@ -7601,12 +7601,12 @@ static LLVMValueRef emit_expr_member_access(zan_irgen_t *g, zan_ast_node_t *expr
         if (g->diag->error_count == 0) {
             zan_symbol_t *rcls = expr_class_sym(g, expr->member.object, locals);
             if (rcls) {
-                zan_diag_emit(g->diag, DIAG_ERROR, expr->loc,
+                zan_diag_emit_code(g->diag, DIAG_ERROR, expr->loc, 3009,
                     "'%.*s' has no member '%.*s'",
                     (int)rcls->name.len, rcls->name.str,
                     (int)expr->member.name.len, expr->member.name.str);
             } else {
-                zan_diag_emit(g->diag, DIAG_ERROR, expr->loc,
+                zan_diag_emit_code(g->diag, DIAG_ERROR, expr->loc, 3015,
                     "cannot resolve member '%.*s'",
                     (int)expr->member.name.len, expr->member.name.str);
             }
@@ -8171,7 +8171,7 @@ static void query_sort_by_key(zan_irgen_t *g, zan_ast_node_t *expr,
     if (!kt) kt = g->binder->type_int;
     int kind = query_key_kind(g, kt, false);
     if (kind < 0) {
-        zan_diag_emit(g->diag, DIAG_ERROR, key_expr->loc,
+        zan_diag_emit_code(g->diag, DIAG_ERROR, key_expr->loc, 3016,
                       "orderby key must be int, long, double or string");
         kind = 0;
     }
@@ -8350,7 +8350,7 @@ static void query_materialize_join(zan_irgen_t *g, zan_ast_node_t *expr,
                                           locals);
         if (!rkt) rkt = y_ty;
         if (query_key_kind(g, lkt, false) != query_key_kind(g, rkt, false))
-            zan_diag_emit(g->diag, DIAG_ERROR, loc,
+            zan_diag_emit_code(g->diag, DIAG_ERROR, loc, 3017,
                           "join key types must match (int, long, double or "
                           "string)");
         zan_istr_t rk_name = query_hold(g, locals, "rk", rkv, rkt);
@@ -8380,7 +8380,7 @@ static void query_materialize_join(zan_irgen_t *g, zan_ast_node_t *expr,
                                           locals);
         if (!rkt) rkt = y_ty;
         if (query_key_kind(g, lkt, false) != query_key_kind(g, rkt, false))
-            zan_diag_emit(g->diag, DIAG_ERROR, loc,
+            zan_diag_emit_code(g->diag, DIAG_ERROR, loc, 3017,
                           "join key types must match (int, long, double or "
                           "string)");
         zan_istr_t rk_name = query_hold(g, locals, "rk", rkv, rkt);
@@ -8468,7 +8468,7 @@ static LLVMValueRef query_do_group(zan_irgen_t *g, zan_ast_node_t *expr,
     if (!ge) ge = q->elem_type;
     int kind = query_key_kind(g, kt, true);
     if (kind < 0) {
-        zan_diag_emit(g->diag, DIAG_ERROR, expr->query.group_key->loc,
+        zan_diag_emit_code(g->diag, DIAG_ERROR, expr->query.group_key->loc, 3018,
                       "group key must be int or string");
         kind = 0;
     }
@@ -8627,7 +8627,7 @@ static void query_final_pass(zan_irgen_t *g, zan_ast_node_t *expr,
                                               locals);
             if (!rkt) rkt = y_ty;
             if (query_key_kind(g, lkt, false) != query_key_kind(g, rkt, false))
-                zan_diag_emit(g->diag, DIAG_ERROR, cl->loc,
+                zan_diag_emit_code(g->diag, DIAG_ERROR, cl->loc, 3017,
                               "join key types must match (int, long, double "
                               "or string)");
             zan_istr_t rk_name = query_hold(g, locals, "rk", rkv, rkt);
@@ -8645,7 +8645,7 @@ static void query_final_pass(zan_irgen_t *g, zan_ast_node_t *expr,
             {
                 int sd = *skip_depth - 1;
                 if (sd >= 16) {
-                    zan_diag_emit(g->diag, DIAG_ERROR, cl->loc,
+                    zan_diag_emit_code(g->diag, DIAG_ERROR, cl->loc, 3019,
                                   "query expression has too many join "
                                   "clauses (max 15)");
                     sd = 15;
@@ -8851,7 +8851,7 @@ static LLVMValueRef emit_expr_tuple(zan_irgen_t *g, zan_ast_node_t *expr,
                                     local_scope_t *locals) {
     zan_type_t *ttype = infer_expr_type(g, expr, locals);
     if (!ttype || ttype->kind != TYPE_STRUCT || !ttype->sym) {
-        zan_diag_emit(g->diag, DIAG_ERROR, expr->loc,
+        zan_diag_emit_code(g->diag, DIAG_ERROR, expr->loc, 3020,
                       "cannot form a tuple here");
         return LLVMConstNull(LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0));
     }
@@ -8867,7 +8867,7 @@ static LLVMValueRef emit_expr_tuple(zan_irgen_t *g, zan_ast_node_t *expr,
         zan_istr_t f_istr = { fname, (uint32_t)strlen(fname) };
         zan_symbol_t *fsym = ttype->sym ? get_field_sym(ttype->sym, f_istr) : NULL;
         if (!fsym) {
-            zan_diag_emit(g->diag, DIAG_ERROR, item->loc,
+            zan_diag_emit_code(g->diag, DIAG_ERROR, item->loc, 3021,
                           "tuple element %d has no field in its struct type",
                           i + 1);
             continue;
@@ -8903,7 +8903,7 @@ static LLVMValueRef emit_expr_new_expr(zan_irgen_t *g, zan_ast_node_t *expr,
             if (!otype || !otype->sym ||
                 (otype->sym->kind != SYM_CLASS &&
                  otype->sym->kind != SYM_STRUCT)) {
-                zan_diag_emit(g->diag, DIAG_ERROR, expr->loc,
+                zan_diag_emit_code(g->diag, DIAG_ERROR, expr->loc, 3022,
                     "object initializer can only continue a call that "
                     "returns a class instance");
                 return obj;
@@ -9009,7 +9009,7 @@ static LLVMValueRef emit_expr_new_expr(zan_irgen_t *g, zan_ast_node_t *expr,
         }
         /* 匿名对象字面量 new { ... } 校验与降解 */
         if (!expr->new_expr.type) {
-            zan_diag_emit(g->diag, DIAG_ERROR, expr->loc,
+            zan_diag_emit_code(g->diag, DIAG_ERROR, expr->loc, 3023,
                 "anonymous object `new { ... }` is only valid inside a typed "
                 "ORM query (GroupBy/ToList/ToAggregate)");
             return LLVMConstNull(LLVMInt8TypeInContext(g->ctx));
@@ -9567,7 +9567,7 @@ static LLVMValueRef emit_expr_new_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                     } else {
                         if (sym->type->kind == TYPE_CLASS &&
                             ctor_arg_list.count > 0)
-                            zan_diag_emit(g->diag, DIAG_ERROR, expr->loc,
+                            zan_diag_emit_code(g->diag, DIAG_ERROR, expr->loc, 3024,
                                 "no constructor of '%.*s' accepts %d argument%s",
                                 (int)sym->name.len, sym->name.str,
                                 ctor_arg_list.count,
@@ -9928,7 +9928,7 @@ static LLVMValueRef emit_expr_with_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                                                     locals));
     if (!rty || !rty->sym ||
         !get_method_sym(rty->sym, cm)) {
-        zan_diag_emit(g->diag, DIAG_ERROR, expr->loc,
+        zan_diag_emit_code(g->diag, DIAG_ERROR, expr->loc, 3025,
             "'with' requires a record receiver with a synthesized clone");
         return LLVMConstNull(LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0));
     }
@@ -10071,20 +10071,20 @@ static LLVMValueRef emit_await_blocking_extern(zan_irgen_t *g,
         : g->binder->type_void;
 
     if (strstr(g->target_triple, "wasm") != NULL) {
-        zan_diag_emit(g->diag, DIAG_ERROR, expr->loc,
+        zan_diag_emit_code(g->diag, DIAG_ERROR, expr->loc, 3026,
             "await native extern calls are not supported on wasm32: "
             "the blocking runtime requires native worker threads");
         return LLVMConstInt(i64, 0, 0);
     }
 
     if (!g->current_async_frame || !g->current_async_switch) {
-        zan_diag_emit(g->diag, DIAG_ERROR, expr->loc,
+        zan_diag_emit_code(g->diag, DIAG_ERROR, expr->loc, 3027,
             "await native extern calls are only supported inside an async "
             "method");
         return LLVMConstInt(i64, 0, 0);
     }
     if (argc > 4) {
-        zan_diag_emit(g->diag, DIAG_ERROR, expr->loc,
+        zan_diag_emit_code(g->diag, DIAG_ERROR, expr->loc, 3028,
             "await native extern call has %d arguments; at most four scalar "
             "arguments are supported (prepare data before suspension and "
             "await a handle-only operation)", argc);
@@ -10092,7 +10092,7 @@ static LLVMValueRef emit_await_blocking_extern(zan_irgen_t *g,
     }
     if (ret->kind != TYPE_VOID && ret->kind != TYPE_INT &&
         ret->kind != TYPE_LONG && ret->kind != TYPE_NINT) {
-        zan_diag_emit(g->diag, DIAG_ERROR, expr->loc,
+        zan_diag_emit_code(g->diag, DIAG_ERROR, expr->loc, 3029,
             "await native extern call returns '%s', but only int, long, nint, "
             "or void can cross a suspension safely; return a scalar handle "
             "instead", ret->name.str ? ret->name.str : "unsupported");
@@ -10104,7 +10104,7 @@ static LLVMValueRef emit_await_blocking_extern(zan_irgen_t *g,
         zan_type_t *pt = (p && p->kind == AST_PARAM)
             ? resolve_type_ctx(g, p->param.type) : NULL;
         if (!blocking_integer_type(pt)) {
-            zan_diag_emit(g->diag, DIAG_ERROR, call->call.args.items[k]->loc,
+            zan_diag_emit_code(g->diag, DIAG_ERROR, call->call.args.items[k]->loc, 3030,
                 "await native extern argument %d has type '%s'; only integer, "
                 "nint, bool, and enum scalars are safe across suspension "
                 "(prepare/bind managed data first, then await a handle-only "
@@ -10116,7 +10116,7 @@ static LLVMValueRef emit_await_blocking_extern(zan_irgen_t *g,
     int fi = irgen_find_function(g, sym);
     LLVMValueRef native = fi >= 0 ? g->functions[fi].fn : NULL;
     if (!native) {
-        zan_diag_emit(g->diag, DIAG_ERROR, expr->loc,
+        zan_diag_emit_code(g->diag, DIAG_ERROR, expr->loc, 3031,
             "cannot lower await native extern call: external function is not "
             "available in the generated module");
         return LLVMConstInt(i64, 0, 0);
@@ -10263,7 +10263,7 @@ static LLVMValueRef emit_expr_await_expr(zan_irgen_t *g, zan_ast_node_t *expr,
          * "Referring to a basic block in another function"）。这里报诊断，不落那条
          * 非法 IR。同步方法里的 lambda 没有外层协程，根驱动等得到，不算错。 */
         if (g->lambda_in_async_method) {
-            zan_diag_emit(g->diag, DIAG_ERROR, expr->loc,
+            zan_diag_emit_code(g->diag, DIAG_ERROR, expr->loc, 3032,
                           "'await' inside a lambda is not supported: "
                           "a lambda is not a coroutine");
             return LLVMConstInt(LLVMInt64TypeInContext(g->ctx), 0, 0);
@@ -10359,7 +10359,7 @@ static LLVMValueRef emit_expr_await_expr(zan_irgen_t *g, zan_ast_node_t *expr,
             LLVMTypeRef di32 = LLVMInt32TypeInContext(g->ctx);
             LLVMTypeRef di8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
             if (!(g->current_async_frame && g->current_async_switch)) {
-                zan_diag_emit(g->diag, DIAG_ERROR, expr->loc,
+                zan_diag_emit_code(g->diag, DIAG_ERROR, expr->loc, 3033,
                     "await Gate.Park is only supported inside an async method");
                 return LLVMConstInt(di64, 0, 0);
             }
@@ -10439,7 +10439,7 @@ static LLVMValueRef emit_expr_await_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                 LLVMTypeRef di32 = LLVMInt32TypeInContext(g->ctx);
                 LLVMTypeRef di8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
                 if (!(g->current_async_frame && g->current_async_switch)) {
-                    zan_diag_emit(g->diag, DIAG_ERROR, expr->loc,
+                    zan_diag_emit_code(g->diag, DIAG_ERROR, expr->loc, 3034,
                         "await Socket.%s is only supported inside an async method",
                         is_read ? "ReadReady" : "WriteReady");
                     return LLVMConstInt(di64, 0, 0);
@@ -10475,7 +10475,7 @@ static LLVMValueRef emit_expr_await_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                 LLVMTypeRef di32 = LLVMInt32TypeInContext(g->ctx);
                 LLVMTypeRef di8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
                 if (!(g->current_async_frame && g->current_async_switch)) {
-                    zan_diag_emit(g->diag, DIAG_ERROR, expr->loc,
+                    zan_diag_emit_code(g->diag, DIAG_ERROR, expr->loc, 3035,
                         "await Socket.RecvOv is only supported inside an async method");
                     return LLVMConstInt(di64, 0, 0);
                 }
@@ -10515,7 +10515,7 @@ static LLVMValueRef emit_expr_await_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                 LLVMTypeRef di32 = LLVMInt32TypeInContext(g->ctx);
                 LLVMTypeRef di8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
                 if (!(g->current_async_frame && g->current_async_switch)) {
-                    zan_diag_emit(g->diag, DIAG_ERROR, expr->loc,
+                    zan_diag_emit_code(g->diag, DIAG_ERROR, expr->loc, 3036,
                         "await Socket.RecvToOv is only supported inside an async method");
                     return LLVMConstInt(di64, 0, 0);
                 }
@@ -10558,7 +10558,7 @@ static LLVMValueRef emit_expr_await_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                 LLVMTypeRef di32 = LLVMInt32TypeInContext(g->ctx);
                 LLVMTypeRef di8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
                 if (!(g->current_async_frame && g->current_async_switch)) {
-                    zan_diag_emit(g->diag, DIAG_ERROR, expr->loc,
+                    zan_diag_emit_code(g->diag, DIAG_ERROR, expr->loc, 3037,
                         "await Socket.AcceptOv is only supported inside an async method");
                     return LLVMConstInt(di64, 0, 0);
                 }
@@ -10593,7 +10593,7 @@ static LLVMValueRef emit_expr_await_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                 LLVMTypeRef di32 = LLVMInt32TypeInContext(g->ctx);
                 LLVMTypeRef di8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
                 if (!(g->current_async_frame && g->current_async_switch)) {
-                    zan_diag_emit(g->diag, DIAG_ERROR, expr->loc,
+                    zan_diag_emit_code(g->diag, DIAG_ERROR, expr->loc, 3038,
                         "await Socket.ResolveAsync is only supported inside an async method");
                     return LLVMConstInt(di64, 0, 0);
                 }
@@ -10634,7 +10634,7 @@ static LLVMValueRef emit_expr_await_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                 LLVMTypeRef di32 = LLVMInt32TypeInContext(g->ctx);
                 LLVMTypeRef di8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
                 if (!(g->current_async_frame && g->current_async_switch)) {
-                    zan_diag_emit(g->diag, DIAG_ERROR, expr->loc,
+                    zan_diag_emit_code(g->diag, DIAG_ERROR, expr->loc, 3039,
                         "await Socket.ResolveSockAddr is only supported inside an async method");
                     return LLVMConstInt(di64, 0, 0);
                 }
@@ -11049,7 +11049,7 @@ static LLVMValueRef emit_expr_cast_expr(zan_irgen_t *g, zan_ast_node_t *expr,
              * （类型参数在 checker 阶段还看不出来）。 */
             if (tt && tt->kind == TYPE_OBJECT && st &&
                 irgen_type_is_value_kind(st))
-                zan_diag_emit(g->diag, DIAG_ERROR, expr->loc,
+                zan_diag_emit_code(g->diag, DIAG_ERROR, expr->loc, 3040,
                               "cannot convert '%s' to 'object': value types "
                               "cannot be boxed (Zan has no boxing facility)",
                               st->name.str ? st->name.str : "?");
@@ -11619,7 +11619,7 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                 g->current_this, "this");
         }
         /* 非捕获 Lambda 内部无隐式 this 绑定 */
-        zan_diag_emit(g->diag, DIAG_ERROR, expr->loc,
+        zan_diag_emit_code(g->diag, DIAG_ERROR, expr->loc, 3041,
             "cannot use 'this' here: %s has no receiver binding",
             g->lambda_depth > 0
                 ? "a lambda cannot capture 'this' (lambdas are non-capturing)"
@@ -11632,7 +11632,7 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
             return LLVMBuildLoad2(g->builder, LLVMGetAllocatedType(g->current_this),
                 g->current_this, "this");
         }
-        zan_diag_emit(g->diag, DIAG_ERROR, expr->loc,
+        zan_diag_emit_code(g->diag, DIAG_ERROR, expr->loc, 3042,
             "cannot use 'base' here: %s has no receiver binding",
             g->lambda_depth > 0
                 ? "a lambda cannot capture 'this' (lambdas are non-capturing)"
@@ -12583,12 +12583,12 @@ static void box_captured_parameter(zan_irgen_t *g, local_scope_t *locals,
     if (!locals || locals->count == 0 || !param ||
         !local_is_lambda_captured(g, locals, body, param)) return;
     if (param->param.by_ref) {
-        zan_diag_emit(g->diag, DIAG_ERROR, param->loc,
+        zan_diag_emit_code(g->diag, DIAG_ERROR, param->loc, 3043,
             "cannot capture a ref or out parameter in a lambda");
         return;
     }
     if (!type || type->kind == TYPE_OBJECT || type->kind == TYPE_TYPE_PARAM) {
-        zan_diag_emit(g->diag, DIAG_ERROR, param->loc,
+        zan_diag_emit_code(g->diag, DIAG_ERROR, param->loc, 3044,
             "cannot capture parameter '%.*s' of type '%.*s': its runtime ownership is not representable yet",
             (int)param->param.name.len, param->param.name.str,
             type ? (int)type->name.len : 0,
@@ -12601,7 +12601,7 @@ static void box_captured_parameter(zan_irgen_t *g, local_scope_t *locals,
         type_contains_collection_rc(g, type, 0);
     if (!rc && k != LLVMIntegerTypeKind && k != LLVMFloatTypeKind &&
         k != LLVMDoubleTypeKind && k != LLVMStructTypeKind) {
-        zan_diag_emit(g->diag, DIAG_ERROR, param->loc,
+        zan_diag_emit_code(g->diag, DIAG_ERROR, param->loc, 3045,
             "cannot capture parameter '%.*s': unsupported value representation",
             (int)param->param.name.len, param->param.name.str);
         return;
@@ -12777,7 +12777,7 @@ static LLVMValueRef emit_lambda_typed(zan_irgen_t *g, zan_ast_node_t *expr,
     cap_scan(&cs, expr->lambda.body);
     if (cs.needs_this && !g->current_this) cs.needs_this = 0;
     if (cs.overflow) {
-        zan_diag_emit(g->diag, DIAG_ERROR, expr->loc,
+        zan_diag_emit_code(g->diag, DIAG_ERROR, expr->loc, 3046,
             "out of memory collecting the variables this lambda captures");
         cs.count = 0;
         cs.needs_this = 0;
@@ -13308,7 +13308,7 @@ static void check_delegate_async_match(zan_irgen_t *g, zan_ast_node_t *e,
     if (!m || !m->decl || m->decl->kind != AST_METHOD_DECL) return;
     int m_async = (m->decl->method_decl.modifiers & MOD_ASYNC) != 0;
     if (m_async == (dt->delegate_is_async != 0)) return;
-    zan_diag_emit(g->diag, DIAG_ERROR, e->loc,
+    zan_diag_emit_code(g->diag, DIAG_ERROR, e->loc, 3047,
         "cannot convert %s method '%.*s' to %s delegate '%.*s'",
         m_async ? "async" : "non-async", m->name.len, m->name.str,
         dt->delegate_is_async ? "async" : "non-async",
@@ -13368,7 +13368,7 @@ static LLVMValueRef emit_arg_typed(zan_irgen_t *g, zan_ast_node_t *arg,
             wrap_implicit_ctor_arg(g, arg, ptype);
             return emit_expr(g, arg, locals);
         }
-        zan_diag_emit(g->diag, DIAG_ERROR, arg->loc,
+        zan_diag_emit_code(g->diag, DIAG_ERROR, arg->loc, 3048,
             "cannot convert '%s' to '%s' in argument: no matching constructor",
             atype->name.str ? atype->name.str : "?",
             ptype->name.str ? ptype->name.str : "?");
@@ -13501,7 +13501,7 @@ static LLVMValueRef emit_ref_arg(zan_irgen_t *g, zan_ast_node_t *arg,
                 LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0), "ref.ip");
         return place;
     }
-    zan_diag_emit(g->diag, DIAG_ERROR, arg->loc,
+    zan_diag_emit_code(g->diag, DIAG_ERROR, arg->loc, 3049,
         "ref/out argument must be a variable, a field, or an element");
     return emit_expr(g, tgt, locals);
 }

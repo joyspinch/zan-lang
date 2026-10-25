@@ -1199,8 +1199,8 @@ static void zan_report_diags(zan_diag_t *diag, json_value *arr, bool is_error) {
         int col = (int)json_get_num(json_obj_get(d, "col"), 0);
         const char *msg = json_get_str(json_obj_get(d, "msg"));
         if (!msg) continue;
-        zan_diag_emit(diag, is_error ? DIAG_ERROR : DIAG_WARNING,
-                      zan_loc((uint32_t)file, (uint32_t)line, (uint32_t)col, 0),
+        zan_diag_emit_code(diag, is_error ? DIAG_ERROR : DIAG_WARNING,
+                      zan_loc((uint32_t)file, (uint32_t)line, (uint32_t)col, 0), 3099,
                       "%s", msg);
     }
 }

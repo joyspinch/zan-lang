@@ -229,11 +229,121 @@
 | E2096 | E | class '%.*s' declares an abstract method and must be declared 'abstract' |
 | E2097 | W | '%.*s' is declared 'virtual' but hides an inherited virtual with the same name and arity; calls through base-class references will run the base implementation -- use 'override' to replace it |
 
+### 代码生成/后端（src/compiler/irgen_*.c + genrun.c，段 3000–3999）
+
+| 号  | 级 | 消息 |
+|-----|----|------|
+| E3000 | E | property getter requires a receiver |
+| E3001 | E | property setter requires a receiver |
+| E3002 | E | instance method '%.*s' cannot be used as a value here: no receiver is in scope |
+| E3003 | E | use of undeclared identifier '%.*s' |
+| E3004 | E | type '%s' does not define a unary '%s' operator overload |
+| E3005 | E | unary '%s' operator overload of '%s' has no body to call |
+| E3006 | E | cannot assign to readonly field '%.*s' outside a constructor of '%.*s' |
+| E3007 | E | tuple assignment is not supported; use `var (a, b) = rhs` to declare the names |
+| E3008 | E | cannot assign through this indexed expression |
+| E3009 | E | '%.*s' has no member '%.*s' |
+| E3010 | E | ++/-- requires a numeric operand |
+| E3011 | E | cannot apply ++/-- to this expression |
+| E3012 | E | Task.Result requires a Task<T> value |
+| E3013 | E | type '%s' has no member '%.*s' |
+| E3014 | E | instance method group '%.*s' cannot be used as a value |
+| E3015 | E | cannot resolve member '%.*s' |
+| E3016 | E | orderby key must be int, long, double or string |
+| E3017 | E | join key types must match (int, long, double or string) |
+| E3018 | E | group key must be int or string |
+| E3019 | E | query expression has too many join clauses (max 15) |
+| E3020 | E | cannot form a tuple here |
+| E3021 | E | tuple element %d has no field in its struct type |
+| E3022 | E | object initializer can only continue a call that returns a class instance |
+| E3023 | E | anonymous object `new { ... }` is only valid inside a typed ORM query (GroupBy/ToList/ToAggregate) |
+| E3024 | E | no constructor of '%.*s' accepts %d argument%s |
+| E3025 | E | 'with' requires a record receiver with a synthesized clone |
+| E3026 | E | await native extern calls are not supported on wasm32: the blocking runtime requires native worker threads |
+| E3027 | E | await native extern calls are only supported inside an async method |
+| E3028 | E | await native extern call has %d arguments; at most four scalar arguments are supported (prepare data before suspension and await a handle-only operation) |
+| E3029 | E | await native extern call returns '%s', but only int, long, nint, or void can cross a suspension safely; return a scalar handle instead |
+| E3030 | E | await native extern argument %d has type '%s'; only integer, nint, bool, and enum scalars are safe across suspension (prepare/bind managed data first, then await a handle-only operation) |
+| E3031 | E | cannot lower await native extern call: external function is not available in the generated module |
+| E3032 | E | 'await' inside a lambda is not supported: a lambda is not a coroutine |
+| E3033 | E | await Gate.Park is only supported inside an async method |
+| E3034 | E | await Socket.%s is only supported inside an async method |
+| E3035 | E | await Socket.RecvOv is only supported inside an async method |
+| E3036 | E | await Socket.RecvToOv is only supported inside an async method |
+| E3037 | E | await Socket.AcceptOv is only supported inside an async method |
+| E3038 | E | await Socket.ResolveAsync is only supported inside an async method |
+| E3039 | E | await Socket.ResolveSockAddr is only supported inside an async method |
+| E3040 | E | cannot convert '%s' to 'object': value types cannot be boxed (Zan has no boxing facility) |
+| E3041 | E | cannot use 'this' here: %s has no receiver binding |
+| E3042 | E | cannot use 'base' here: %s has no receiver binding |
+| E3043 | E | cannot capture a ref or out parameter in a lambda |
+| E3044 | E | cannot capture parameter '%.*s' of type '%.*s': its runtime ownership is not representable yet |
+| E3045 | E | cannot capture parameter '%.*s': unsupported value representation |
+| E3046 | E | out of memory collecting the variables this lambda captures |
+| E3047 | E | cannot convert %s method '%.*s' to %s delegate '%.*s' |
+| E3048 | E | cannot convert '%s' to '%s' in argument: no matching constructor |
+| E3049 | E | ref/out argument must be a variable, a field, or an element |
+| E3050 | E | unresolved call '%.*s.%.*s': type '%.*s' has no method '%.*s' |
+| E3051 | E | Math.%s requires an int or floating-point argument |
+| E3052 | E | Task.Run delegate must be a parameterless void body (an Action); pass an async call for results |
+| E3053 | E | Task.Run delegate must take no parameters |
+| E3054 | E | Console.ErrorWriteLine takes a string: format the value with Convert.ToString first |
+| E3055 | E | Math.%s requires numeric arguments |
+| E3056 | E | Convert.ToDouble: cannot convert '%.*s' to a number -- pass a string or a numeric value |
+| E3057 | E | %.*s.Parse requires a string argument |
+| E3058 | E | %.*s.TryParse requires a string argument |
+| E3059 | E | Convert.%.*s: cannot convert '%.*s' to a number -- pass a string or a numeric value |
+| E3060 | E | Convert.ToString: cannot convert '%s' to a string -- call .ToString() on the value instead |
+| E3061 | E | unsupported format specifier '%.*s' for numeric ToString() (supported: D, X, F, E, G, 0/# shapes) |
+| E3062 | E | cannot call instance method '%.*s.%.*s' via the type name: call it on an instance |
+| E3063 | E | type '%.*s.%.*s' has no member '%.*s' |
+| E3064 | E | unresolved call '%.*s': '%.*s' is not a known variable, type, or namespace (is the class imported and registered in the stdlib map?) |
+| E3065 | E | unresolved call '%.*s': type '%.*s' has no method '%.*s' |
+| E3066 | E | '%s' has no member '%.*s' |
+| E3067 | E | '%s.%.*s' is a property, not a method: drop the '()' |
+| E3068 | E | this call could not be resolved to any callable (no method, delegate, operator or builtin matches) |
+| E3069 | E | cannot capture pattern variable '%.*s' of type '%.*s': its runtime ownership is not representable yet |
+| E3070 | E | cannot capture local '%.*s' of type '%.*s': its runtime ownership is not representable yet |
+| E3071 | E | cannot capture local '%.*s': unsupported value representation |
+| E3072 | E | cannot initialize an array from '%.*s': declare the variable as '%.*s' instead |
+| E3073 | E | right-hand side of a deconstruction is not a tuple |
+| E3074 | E | case label must be a compile-time constant in an integer switch |
+| E3075 | E | internal: async handler id %d exceeds frame handler capacity %d |
+| E3076 | E | too many nested try/finally blocks in one function body |
+| E3077 | E | out of memory tracking nested catch handlers |
+| E3078 | E | foreach: GetEnumerator() returning interface '%.*s' is not supported yet; return the concrete enumerator type so the loop can call MoveNext/Current directly |
+| E3079 | E | foreach protocol enumerator missing an async frame slot |
+| E3080 | E | too many nested lock/try-finally blocks in one function body |
+| E3081 | E | duplicate label '%.*s' in this function |
+| E3082 | E | goto '%.*s' jumps into a try/catch/finally or lock block; C# forbids jumping into one -- restructure with break/return |
+| E3083 | E | goto '%.*s' leaves (or enters) a scope with owning locals; the abandoned references would leak -- restructure with break/return |
+| E3084 | E | goto '%.*s' leaves %d finally/lock region(s) whose exits cannot be run -- restructure with break/return |
+| E3085 | E | goto '%.*s' jumps into a finally body |
+| E3086 | E | a rethrow (`throw;`) is only valid inside a catch block |
+| E3087 | E | an async method cannot return an aggregate type: the coroutine result slot is one machine word |
+| E3088 | E | no matching %s constructor with %d argument(s) |
+| E3089 | E | LLVM function compactor initialization failed: %s |
+| E3090 | E | LLVM verification failed%s%s: %s |
+| E3091 | E | failed to get target: %s |
+| E3092 | E | failed to emit object file: %s |
+| E3093 | E | explicit-layout type '%.*s' cannot have virtual methods |
+| E3094 | E | field '%.*s' of explicit-layout type '%.*s' needs [FieldOffset(n)] |
+| E3095 | E | [FieldOffset(%lu)] on '%.*s' is not %lu-byte aligned |
+| E3096 | E | this value struct cannot be a collection element: the slot allocator cannot compute its layout; use a class instead |
+| E3097 | E | LLVM function compaction failed: %s |
+| E3098 | E | async: an expression with side effects is evaluated before an await in the same expression; assign it to a local first |
+| E3099 | E | %s |
+
 ### selfhost 侧现状
 
 selfhost 前端（`src/selfhost/lexer.zan` + `parser.zan`）不重放 C 前端的逐条
 报错：lexer 无诊断出口，parser 只有 16 个报错点且多为笼统的
 `syntax error: unexpected ...`。其中与 C 侧**逐字同文案**的 6 处已带同号：
 E0005 / E0006（整型溢出）、E0039 / E0040（join）、E0041（group）、
-E0043（select）；E1016（析构器不支持）同号。其余 selfhost 报错没有 C 侧
-孪生，不编号，留待其语义所属段次（名字/绑定、类型）落地时统一对齐。
+E0043（select）；E1016（析构器不支持）同号。
+
+名字/绑定与类型段（1000/2000）落地时已对齐的孪生：E1016、E2017 / E2018 /
+E2019 / E2022 / E2041 / E2049 / E2057 / E2073。代码生成段（3000）落地时
+已对齐的孪生：E3012 / E3049 / E3052 / E3053 / E3060 / E3086。其余 selfhost
+报错没有 C 侧孪生（如 ngen 后端专属、笼统 syntax error），不编号，留待
+其语义所属段次落地时统一对齐。

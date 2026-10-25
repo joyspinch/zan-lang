@@ -171,7 +171,7 @@ static void emit_switch_pattern_bind(zan_irgen_t *g, local_scope_t *locals,
 
     int captured = local_is_lambda_captured(g, locals, g->current_fn_body, sc);
     if (captured && (pt->kind == TYPE_OBJECT || pt->kind == TYPE_TYPE_PARAM)) {
-        zan_diag_emit(g->diag, DIAG_ERROR, sc->loc,
+        zan_diag_emit_code(g->diag, DIAG_ERROR, sc->loc, 3069,
             "cannot capture pattern variable '%.*s' of type '%.*s': "
             "its runtime ownership is not representable yet",
             (int)sc->switch_case.var_name.len, sc->switch_case.var_name.str,
@@ -729,7 +729,7 @@ static int emit_boxed_var_decl(zan_irgen_t *g, zan_ast_node_t *stmt,
         type_contains_collection_rc(g, type, 0);
     if (!local_is_lambda_captured(g, locals, body, stmt)) return 0;
     if (type->kind == TYPE_OBJECT || type->kind == TYPE_TYPE_PARAM) {
-        zan_diag_emit(g->diag, DIAG_ERROR, stmt->loc,
+        zan_diag_emit_code(g->diag, DIAG_ERROR, stmt->loc, 3070,
             "cannot capture local '%.*s' of type '%.*s': its runtime ownership is not representable yet",
             (int)stmt->var_decl.name.len, stmt->var_decl.name.str,
             (int)type->name.len, type->name.str ? type->name.str : "");
@@ -737,7 +737,7 @@ static int emit_boxed_var_decl(zan_irgen_t *g, zan_ast_node_t *stmt,
     }
     if (!rc && k != LLVMIntegerTypeKind && k != LLVMFloatTypeKind &&
         k != LLVMDoubleTypeKind && k != LLVMStructTypeKind) {
-        zan_diag_emit(g->diag, DIAG_ERROR, stmt->loc,
+        zan_diag_emit_code(g->diag, DIAG_ERROR, stmt->loc, 3071,
             "cannot capture local '%.*s': unsupported value representation",
             (int)stmt->var_decl.name.len, stmt->var_decl.name.str);
         return 0;
@@ -1394,7 +1394,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                 ((type_named(it, "List", 4)) ||
                  (type_named(it, "Dictionary", 10)) ||
                  (type_named(it, "Dict", 4))))
-                zan_diag_emit(g->diag, DIAG_ERROR, stmt->loc,
+                zan_diag_emit_code(g->diag, DIAG_ERROR, stmt->loc, 3072,
                     "cannot initialize an array from '%.*s': declare the "
                     "variable as '%.*s' instead",
                     (int)it->name.len, it->name.str,
@@ -1449,7 +1449,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
         zan_ast_node_t *init = stmt->tuple_decon.initializer;
         zan_type_t *ttype = infer_expr_type(g, init, locals);
         if (!ttype || ttype->kind != TYPE_STRUCT || !ttype->sym) {
-            zan_diag_emit(g->diag, DIAG_ERROR, stmt->loc,
+            zan_diag_emit_code(g->diag, DIAG_ERROR, stmt->loc, 3073,
                           "right-hand side of a deconstruction is not a tuple");
             break;
         }
@@ -2222,7 +2222,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
             LLVMBasicBlockRef entry_bb = LLVMGetInsertBlock(g->builder);
             LLVMValueRef case_val = emit_expr(g, sc->switch_case.pattern, locals);
             if (!case_val || !LLVMIsAConstantInt(case_val)) {
-                zan_diag_emit(g->diag, DIAG_ERROR, sc->loc,
+                zan_diag_emit_code(g->diag, DIAG_ERROR, sc->loc, 3074,
                               "case label must be a compile-time constant "
                               "in an integer switch");
                 LLVMPositionBuilderAtEnd(g->builder, case_bb);
@@ -2332,7 +2332,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
              * 编译期报错而不是让 GEP 静默越界（容量由 irgen_emit 按发射
              * 上限定，正常永远走不到）。 */
             if (async_hid >= g->current_async_handler_cap) {
-                zan_diag_emit(g->diag, DIAG_ERROR, stmt->loc,
+                zan_diag_emit_code(g->diag, DIAG_ERROR, stmt->loc, 3075,
                               "internal: async handler id %d exceeds frame "
                               "handler capacity %d", async_hid,
                               g->current_async_handler_cap);
@@ -2457,7 +2457,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
             }
             g->finallys[fin_idx].in_try_body = true;
         } else if (stmt->try_stmt.finally_body) {
-            zan_diag_emit(g->diag, DIAG_ERROR, stmt->loc,
+            zan_diag_emit_code(g->diag, DIAG_ERROR, stmt->loc, 3076,
                 "too many nested try/finally blocks in one function body");
         }
         int armed_idx = -1;
@@ -2636,7 +2636,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                         exc_tid_slot;
                     g->catch_cleanup_count++;
                 } else {
-                    zan_diag_emit(g->diag, DIAG_ERROR, stmt->loc,
+                    zan_diag_emit_code(g->diag, DIAG_ERROR, stmt->loc, 3077,
                         "out of memory tracking nested catch handlers");
                 }
                 int saved_cc = g->catch_cleanup_count;
@@ -2790,7 +2790,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                 zan_type_t *rt = resolve_type_ctx(g,
                     gm->decl->method_decl.return_type);
                 if (rt && rt->kind == TYPE_INTERFACE)
-                    zan_diag_emit(g->diag, DIAG_ERROR, stmt->loc,
+                    zan_diag_emit_code(g->diag, DIAG_ERROR, stmt->loc, 3078,
                         "foreach: GetEnumerator() returning interface '%.*s' "
                         "is not supported yet; return the concrete enumerator "
                         "type so the loop can call MoveNext/Current directly",
@@ -2846,7 +2846,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                     ASYNC_FOREACH_ENUMERATOR);
                 if (ev2) enum_slot = ev2->alloca;
                 if (!enum_slot)
-                    zan_diag_emit(g->diag, DIAG_ERROR, stmt->loc,
+                    zan_diag_emit_code(g->diag, DIAG_ERROR, stmt->loc, 3079,
                                   "foreach protocol enumerator missing an "
                                   "async frame slot");
             }
@@ -3263,7 +3263,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
             g->finallys[lock_fin].outer_throw_catch_base = g->throw_catch_base;
             g->finallys[lock_fin].in_try_body = false;
         } else {
-            zan_diag_emit(g->diag, DIAG_ERROR, stmt->loc,
+            zan_diag_emit_code(g->diag, DIAG_ERROR, stmt->loc, 3080,
                 "too many nested lock/try-finally blocks in one function body");
         }
         emit_stmt(g, stmt->lock_stmt.body, locals);
@@ -3279,7 +3279,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
         int li = irgen_goto_label_idx(g, stmt->ident.name);
         if (li < 0) break;
         if (g->goto_labels[li].defined) {
-            zan_diag_emit(g->diag, DIAG_ERROR, stmt->loc,
+            zan_diag_emit_code(g->diag, DIAG_ERROR, stmt->loc, 3081,
                 "duplicate label '%.*s' in this function",
                 (int)stmt->ident.name.len, stmt->ident.name.str);
         } else {
@@ -3311,7 +3311,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                         g->pending.scope ||
                     f->fin_depth < lab_fin || f->eh_armed_base < lab_eh ||
                     f->catch_base < lab_catch) {
-                    zan_diag_emit(g->diag, DIAG_ERROR, f->loc,
+                    zan_diag_emit_code(g->diag, DIAG_ERROR, f->loc, 3082,
                         "goto '%.*s' jumps into a try/catch/finally or lock "
                         "block; C# forbids jumping into one -- restructure "
                         "with break/return",
@@ -3319,7 +3319,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                 } else if (f->locals_base < locals->count ||
                            f->locals_owned !=
                                g->goto_labels[li].locals_owned) {
-                    zan_diag_emit(g->diag, DIAG_ERROR, f->loc,
+                    zan_diag_emit_code(g->diag, DIAG_ERROR, f->loc, 3083,
                         "goto '%.*s' leaves (or enters) a scope with owning "
                         "locals; the abandoned references would leak -- "
                         "restructure with break/return",
@@ -3373,7 +3373,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                         emit_pending_finallys(g, locals, lab_fin, false);
                         g->finally_count = lab_fin;
                     } else if (f->fin_depth > lab_fin) {
-                        zan_diag_emit(g->diag, DIAG_ERROR, f->loc,
+                        zan_diag_emit_code(g->diag, DIAG_ERROR, f->loc, 3084,
                             "goto '%.*s' leaves %d finally/lock region(s) "
                             "whose exits cannot be run -- restructure with "
                             "break/return",
@@ -3441,7 +3441,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
         if (g->goto_labels[li].defined) {
             if (pending_scope_common(g->pending.scope,
                     g->goto_labels[li].pending_scope) != g->goto_labels[li].pending_scope) {
-                zan_diag_emit(g->diag, DIAG_ERROR, stmt->loc,
+                zan_diag_emit_code(g->diag, DIAG_ERROR, stmt->loc, 3085,
                     "goto '%.*s' jumps into a finally body",
                     (int)stmt->ident.name.len, stmt->ident.name.str);
                 break;
@@ -3522,7 +3522,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
             LLVMBasicBlockRef hbb = hslot ? LLVMGetInstructionParent(hslot) : NULL;
             if (!hbb || LLVMGetBasicBlockParent(hbb) !=
                     LLVMGetBasicBlockParent(LLVMGetInsertBlock(g->builder))) {
-                zan_diag_emit(g->diag, DIAG_ERROR, stmt->loc,
+                zan_diag_emit_code(g->diag, DIAG_ERROR, stmt->loc, 3086,
                     "a rethrow (`throw;`) is only valid inside a catch block");
                 break;
             }

@@ -499,7 +499,7 @@ static void declare_async_method(zan_irgen_t *g, method_body_work_t *w,
         if (!is_task && raw_ret && raw_ret->kind != TYPE_VOID) {
             LLVMTypeRef art = map_type(g, raw_ret);
             if (art && LLVMGetTypeKind(art) == LLVMStructTypeKind) {
-                zan_diag_emit(g->diag, DIAG_ERROR, member->loc,
+                zan_diag_emit_code(g->diag, DIAG_ERROR, member->loc, 3087,
                               "an async method cannot return an aggregate type: "
                               "the coroutine result slot is one machine word");
             }
@@ -1790,7 +1790,7 @@ static void emit_user_method_bodies(zan_irgen_t *g, method_body_work_t *work,
                 }
                 if (!target) {
                     if (this_init || member->method_decl.has_base_init) {
-                        zan_diag_emit(g->diag, DIAG_ERROR, member->loc,
+                        zan_diag_emit_code(g->diag, DIAG_ERROR, member->loc, 3088,
                             "no matching %s constructor with %d argument(s)",
                             this_init ? "this" : "base", init_args->count);
                     }
@@ -2530,7 +2530,7 @@ zan_status_t zan_irgen_emit(zan_irgen_t *g, zan_ast_node_t *unit) {
         g->function_compactor = zan_irgen_compactor_create(
             g->mod, error, sizeof(error));
         if (!g->function_compactor) {
-            zan_diag_emit(g->diag, DIAG_ERROR, unit->loc,
+            zan_diag_emit_code(g->diag, DIAG_ERROR, unit->loc, 3089,
                           "LLVM function compactor initialization failed: %s", error);
             return ZAN_ERROR;
         }
@@ -2798,7 +2798,7 @@ done:
                 break;
             }
         }
-        zan_diag_emit(g->diag, DIAG_ERROR, zan_loc(0, 0, 0, 0),
+        zan_diag_emit_code(g->diag, DIAG_ERROR, zan_loc(0, 0, 0, 0), 3090,
                       "LLVM verification failed%s%s: %s",
                       culprit ? " in " : "", culprit ? culprit : "", error);
         if (getenv("ZANC_DUMP_BAD_IR")) {
@@ -3126,7 +3126,7 @@ static zan_status_t zan_bind_target_layout(zan_irgen_t *g,
     char *error = NULL;
 
     if (LLVMGetTargetFromTriple(triple, &target, &error)) {
-        zan_diag_emit(g->diag, DIAG_ERROR, zan_loc(0, 0, 0, 0),
+        zan_diag_emit_code(g->diag, DIAG_ERROR, zan_loc(0, 0, 0, 0), 3091,
                       "failed to get target: %s", error);
         LLVMDisposeMessage(error);
         LLVMDisposeMessage(triple);
@@ -3395,7 +3395,7 @@ zan_status_t zan_irgen_write_obj(zan_irgen_t *g, const char *path) {
     char *error = NULL;
     if (LLVMTargetMachineEmitToFile(tm, g->mod, (char *)path,
                                      LLVMObjectFile, &error)) {
-        zan_diag_emit(g->diag, DIAG_ERROR, zan_loc(0, 0, 0, 0),
+        zan_diag_emit_code(g->diag, DIAG_ERROR, zan_loc(0, 0, 0, 0), 3092,
                       "failed to emit object file: %s", error);
         LLVMDisposeMessage(error);
         LLVMDisposeTargetMachine(tm);
