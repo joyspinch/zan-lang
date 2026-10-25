@@ -351,12 +351,13 @@
 | E3100 | E | generic instantiation did not reach a fixed point within %d iterations; the type graph may be recursively dependent or too large |
 | E3101 | E | out of memory recording obfuscated string literals (%d recorded) |
 
-### 互操作/运行时契约（src/compiler/irgen_abi.c + irgen_expr_core.c，段 4000–4999）
+### 互操作/运行时契约（src/compiler/irgen_abi.c + irgen_expr_core.c + checker.c，段 4000–4999）
 
 | 号  | 级 | 消息 |
 |-----|----|------|
 | E4000 | E | call to extern '%s' passes a struct by value, which has no C ABI classification for target '%s' |
 | E4001 | E | shared table %s width %lld is out of range: a width must be between 1 and %lld bytes |
+| E4002 | E | sizeof: type '%s' has no fixed unmanaged size -- only value types (structs, primitives, enums) can be marshaled |
 
 ### selfhost 侧现状
 

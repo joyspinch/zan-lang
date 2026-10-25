@@ -662,6 +662,32 @@ delegate int CompareFunc(nint a, nint b);
 |----------|-------------|------------|
 | `string` | `const char*` | UTF-8, null-terminated, temporary |
 
+### 7.5 Marshal（值类型 ↔ 原生内存）
+
+`System.Marshal`（`stdlib/System/Marshal.zan`）+ 语言原语 `sizeof(T)`：
+值类型与离堆原生内存的互操作面。指针是普通 `nint`，不进 ARC，缓冲区的
+分配/释放配对由调用方负责（`NativeMemory.Alloc` / `Free`）。
+
+- `sizeof(T)`：T 在 Zan 内存形态中的字节数，编译期常量。T 必须是值类型
+  （结构体、基元类型、枚举、可空值类型）；string、类、委托、数组是引用
+  形态，编译报错 `[E4002]`（对齐 C# 对引用类型抛 `ArgumentException`）。
+  注意 Zan 的 char 是 8 字节码位、枚举底座是 long——尺寸按 Zan 的内存
+  形态计，不是 C# 的位数。
+- `Marshal.SizeOf<T>()`：`sizeof(T)` 的 C# 熟悉名包装（泛型方法体内的
+  `sizeof(T)` 在实例化点定型）。
+- `Marshal.PtrToStructure<T>(p)` / `Marshal.StructureToPtr<T>(v, p)`：
+  结构体与原生内存的按值往返（`Span<T>` 胖指针语义）。
+
+```csharp
+struct P { public int X; public long Y; }
+
+nint m = NativeMemory.Alloc(Marshal.SizeOf<P>());
+Marshal.StructureToPtr(new P { X = 1, Y = 2 }, m);
+P v = Marshal.PtrToStructure<P>(m);
+NativeMemory.Free(m);
+```
+
+
 `[CImport]` 不存在；C 头文件不能直接导入，通过 `[DllImport]` + `System.Interop` 加载。
 
 ---

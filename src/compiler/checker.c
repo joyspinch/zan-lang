@@ -3884,6 +3884,25 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
         return has_result ? merged : c->binder->type_error;
     }
 
+    case AST_SIZEOF_EXPR: {
+        /* sizeof(T)：值类型才有固定非托管尺寸；string、类、委托、数组是
+         * 引用形态，编译期拒绝（对齐 C# 对引用类型抛 ArgumentException）。
+         * 类型形参放行——泛型方法体内的 sizeof(T) 在实例化点定型。 */
+        zan_type_t *t = expr->cast.type
+            ? zan_binder_resolve_type(c->binder, expr->cast.type) : NULL;
+        if (!t || t->kind == TYPE_ERROR) return c->binder->type_int;
+        if (t->kind != TYPE_TYPE_PARAM &&
+            (t->kind == TYPE_VOID || t->kind == TYPE_STRING ||
+             t->kind == TYPE_CLASS || t->kind == TYPE_INTERFACE ||
+             t->kind == TYPE_DELEGATE || t->kind == TYPE_ARRAY ||
+             t->kind == TYPE_OBJECT || t->kind == TYPE_TASK)) {
+            zan_diag_emit_code(c->diag, DIAG_ERROR, expr->loc, 4002,
+                "sizeof: type '%s' has no fixed unmanaged size -- only value types (structs, primitives, enums) can be marshaled",
+                type_name(t));
+        }
+        return c->binder->type_int;
+    }
+
     case AST_WITH_EXPR: {
         zan_type_t *rt = zan_checker_check_expr(c, expr->with_expr.expr);
         if (!rt || (rt->kind != TYPE_CLASS && rt->kind != TYPE_STRUCT)) {

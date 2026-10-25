@@ -1330,6 +1330,20 @@ add_test(NAME diag_warn_level_error
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_warn_level_error PROPERTIES TIMEOUT 60)
 
+# A382④: sizeof(T) is the managed-size primitive of the interop surface.
+# Reference-shaped types (string/class/delegate/array) have no fixed
+# unmanaged size and must be rejected at check time, like C#'s
+# ArgumentException for Marshal.SizeOf of a reference type.
+add_test(NAME diag_sizeof_reference_type
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/sizeof_reference_type.zan
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/diag_sizeof_reference_type${_exe_ext}
+    "-DEXPECT_REGEX=E4002. sizeof: type 'string' has no fixed unmanaged size"
+    -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
+set_tests_properties(diag_sizeof_reference_type PROPERTIES TIMEOUT 60)
+
+
 # A382③: #pragma warning disable/restore scopes by source line. The silenced
 # #warning must not appear in the log; the restored one must, and the trailing
 # syntax error fails the compile so the harness can assert on both.
