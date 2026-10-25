@@ -5,11 +5,26 @@ namespace System;
 // C# System.Runtime.InteropServices.Marshal 的 Zan 形态：值类型与离堆
 // 原生内存之间的互操作面。Zan 没有装箱与 GC 句柄，这个面只覆盖非托管侧：
 // 结构体布局尺寸（SizeOf → 语言原语 sizeof(T)）、结构体与原生内存的
-// 按值往返（PtrToStructure / StructureToPtr，Span<T> 胖指针语义）。
-// 指针是普通 nint，不进 ARC；缓冲区的分配/释放配对由调用方负责
-// （NativeMemory.Alloc / Free）。字符串出原生内存走
-// NativeMemory.GetString / System.Wide（UTF-16 侧）。
+// 按值往返（PtrToStructure / StructureToPtr，Span<T> 胖指针语义）、
+// 堆外内存管理（AllocHGlobal / FreeHGlobal / ReAllocHGlobal）、
+// 标量读写（ReadByte / WriteInt32 / ReadIntPtr 等）、数组批量拷贝（Copy）、
+// 字符串封送（StringToHGlobalAnsi / PtrToStringUni 等）以及系统错误码。
+// 指针是普通 nint，不进 ARC；缓冲区的分配/释放配对由调用方负责。
 public class Marshal {
+#if WINDOWS
+    [DllImport("msvcrt", EntryPoint = "realloc")]
+    private static extern nint CrtRealloc(nint ptr, nint newSize);
+
+    [DllImport("kernel32", EntryPoint = "GetLastError")]
+    private static extern int WinGetLastError();
+
+    [DllImport("kernel32", EntryPoint = "SetLastError")]
+    private static extern void WinSetLastError(int dwErrCode);
+#else
+    [DllImport("crt", EntryPoint = "realloc")]
+    private static extern nint CrtRealloc(nint ptr, nint newSize);
+#endif
+
     // 返回 T 在 Zan 内存形态中的字节数。T 必须是值类型（结构体、基元
     // 类型、枚举、可空值类型）；string、类、委托、数组是引用形态，
     // sizeof(T) 编译报错（对齐 C# 对引用类型抛 ArgumentException）。
@@ -30,5 +45,239 @@ public class Marshal {
     // 引用并存，与局部结构体赋值同规）。
     public static void StructureToPtr<T>(T value, nint p) {
         new Span<T>(p, 1)[0] = value;
+    }
+
+    // 释放非托管结构体持有的资源（Zan 值类型无析构器，保留签名以对齐 C# 互操作面）。
+    public static void DestroyStructure<T>(nint p) {
+    }
+
+    // 从进程堆分配指定字节数的未托管内存。
+    public static nint AllocHGlobal(int cb) {
+        return NativeMemory.Alloc(cb);
+    }
+
+    // 从进程堆分配指定字节数的未托管内存。
+    public static nint AllocHGlobal(nint cb) {
+        return NativeMemory.Alloc((int)cb);
+    }
+
+    // 释放此前由 AllocHGlobal 分配的内存。
+    public static void FreeHGlobal(nint hglobal) {
+        if (hglobal != 0) {
+            NativeMemory.Free(hglobal);
+        }
+    }
+
+    // 重新调整堆外内存块大小。若 pv 为 0 则等同 Alloc；若 cb <= 0 则释放并返回 0。
+    public static nint ReAllocHGlobal(nint pv, nint cb) {
+        if (pv == 0) { return NativeMemory.Alloc((int)cb); }
+        if (cb <= 0) {
+            NativeMemory.Free(pv);
+            return 0;
+        }
+        return CrtRealloc(pv, cb);
+    }
+
+    // 标量读取
+    public static byte ReadByte(nint ptr) {
+        return new Span<byte>(ptr, 1)[0];
+    }
+    public static byte ReadByte(nint ptr, int ofs) {
+        return new Span<byte>(ptr + ofs, 1)[0];
+    }
+    public static void WriteByte(nint ptr, byte val) {
+        new Span<byte>(ptr, 1)[0] = val;
+    }
+    public static void WriteByte(nint ptr, int ofs, byte val) {
+        new Span<byte>(ptr + ofs, 1)[0] = val;
+    }
+
+    public static short ReadInt16(nint ptr) {
+        return new Span<short>(ptr, 1)[0];
+    }
+    public static short ReadInt16(nint ptr, int ofs) {
+        return new Span<short>(ptr + ofs, 1)[0];
+    }
+    public static void WriteInt16(nint ptr, short val) {
+        new Span<short>(ptr, 1)[0] = val;
+    }
+    public static void WriteInt16(nint ptr, int ofs, short val) {
+        new Span<short>(ptr + ofs, 1)[0] = val;
+    }
+
+    public static int ReadInt32(nint ptr) {
+        return new Span<int>(ptr, 1)[0];
+    }
+    public static int ReadInt32(nint ptr, int ofs) {
+        return new Span<int>(ptr + ofs, 1)[0];
+    }
+    public static void WriteInt32(nint ptr, int val) {
+        new Span<int>(ptr, 1)[0] = val;
+    }
+    public static void WriteInt32(nint ptr, int ofs, int val) {
+        new Span<int>(ptr + ofs, 1)[0] = val;
+    }
+
+    public static long ReadInt64(nint ptr) {
+        return new Span<long>(ptr, 1)[0];
+    }
+    public static long ReadInt64(nint ptr, int ofs) {
+        return new Span<long>(ptr + ofs, 1)[0];
+    }
+    public static void WriteInt64(nint ptr, long val) {
+        new Span<long>(ptr, 1)[0] = val;
+    }
+    public static void WriteInt64(nint ptr, int ofs, long val) {
+        new Span<long>(ptr + ofs, 1)[0] = val;
+    }
+
+    public static nint ReadIntPtr(nint ptr) {
+        return new Span<nint>(ptr, 1)[0];
+    }
+    public static nint ReadIntPtr(nint ptr, int ofs) {
+        return new Span<nint>(ptr + ofs, 1)[0];
+    }
+    public static void WriteIntPtr(nint ptr, nint val) {
+        new Span<nint>(ptr, 1)[0] = val;
+    }
+    public static void WriteIntPtr(nint ptr, int ofs, nint val) {
+        new Span<nint>(ptr + ofs, 1)[0] = val;
+    }
+
+    // 数组与非托管内存之间的批量拷贝
+    public static void Copy(byte[] source, int startIndex, nint destination, int length) {
+        if (source == null || destination == 0 || length <= 0) { return; }
+        Span<byte> dst = new Span<byte>(destination, length);
+        int i = 0;
+        while (i < length) {
+            dst[i] = source[startIndex + i];
+            i = i + 1;
+        }
+    }
+
+    public static void Copy(nint source, byte[] destination, int startIndex, int length) {
+        if (source == 0 || destination == null || length <= 0) { return; }
+        Span<byte> src = new Span<byte>(source, length);
+        int i = 0;
+        while (i < length) {
+            destination[startIndex + i] = src[i];
+            i = i + 1;
+        }
+    }
+
+    public static void Copy(int[] source, int startIndex, nint destination, int length) {
+        if (source == null || destination == 0 || length <= 0) { return; }
+        Span<int> dst = new Span<int>(destination, length);
+        int i = 0;
+        while (i < length) {
+            dst[i] = source[startIndex + i];
+            i = i + 1;
+        }
+    }
+
+    public static void Copy(nint source, int[] destination, int startIndex, int length) {
+        if (source == 0 || destination == null || length <= 0) { return; }
+        Span<int> src = new Span<int>(source, length);
+        int i = 0;
+        while (i < length) {
+            destination[startIndex + i] = src[i];
+            i = i + 1;
+        }
+    }
+
+    public static void Copy(long[] source, int startIndex, nint destination, int length) {
+        if (source == null || destination == 0 || length <= 0) { return; }
+        Span<long> dst = new Span<long>(destination, length);
+        int i = 0;
+        while (i < length) {
+            dst[i] = source[startIndex + i];
+            i = i + 1;
+        }
+    }
+
+    public static void Copy(nint source, long[] destination, int startIndex, int length) {
+        if (source == 0 || destination == null || length <= 0) { return; }
+        Span<long> src = new Span<long>(source, length);
+        int i = 0;
+        while (i < length) {
+            destination[startIndex + i] = src[i];
+            i = i + 1;
+        }
+    }
+
+    // 字符串封送：Ansi / UTF-8
+    public static nint StringToHGlobalAnsi(string s) {
+        if (s == null) { return 0; }
+        int bytes = s.Length;
+        nint ptr = NativeMemory.Alloc(bytes + 1);
+        NativeMemory.PutString(ptr, 0, s, bytes);
+        new Span<byte>(ptr + bytes, 1)[0] = 0;
+        return ptr;
+    }
+
+    public static nint StringToHGlobalUtf8(string s) {
+        return StringToHGlobalAnsi(s);
+    }
+
+    public static string PtrToStringAnsi(nint ptr) {
+        if (ptr == 0) { return null; }
+        int len = 0;
+        while (new Span<byte>(ptr + len, 1)[0] != 0) {
+            len = len + 1;
+        }
+        return NativeMemory.GetString(ptr, 0, len);
+    }
+
+    public static string PtrToStringAnsi(nint ptr, int len) {
+        if (ptr == 0) { return null; }
+        if (len <= 0) { return ""; }
+        return NativeMemory.GetString(ptr, 0, len);
+    }
+
+    public static string PtrToStringUtf8(nint ptr) {
+        return PtrToStringAnsi(ptr);
+    }
+
+    public static string PtrToStringUtf8(nint ptr, int len) {
+        return PtrToStringAnsi(ptr, len);
+    }
+
+    // 字符串封送：Unicode (UTF-16)
+    public static nint StringToHGlobalUni(string s) {
+        return Wide.Of(s);
+    }
+
+    public static string PtrToStringUni(nint ptr) {
+        return Wide.Read(ptr);
+    }
+
+    public static string PtrToStringUni(nint ptr, int len) {
+        if (ptr == 0) { return null; }
+        if (len <= 0) { return ""; }
+        nint tmp = NativeMemory.Alloc(len * 2 + 2);
+        NativeMemory.Copy(tmp, ptr, len * 2);
+        new Span<short>(tmp + len * 2, 1)[0] = 0;
+        string res = Wide.Read(tmp);
+        NativeMemory.Free(tmp);
+        return res;
+    }
+
+    public static void ZeroFreeGlobalAllocUnicode(nint s) {
+        Wide.Free(s);
+    }
+
+    // 平台错误码
+    public static int GetLastWin32Error() {
+#if WINDOWS
+        return WinGetLastError();
+#else
+        return 0;
+#endif
+    }
+
+    public static void SetLastWin32Error(int error) {
+#if WINDOWS
+        WinSetLastError(error);
+#endif
     }
 }

@@ -2384,7 +2384,7 @@ else()
   set(_exe_ext "")
 endif()
 
-file(GLOB _conf_srcs ${CMAKE_SOURCE_DIR}/tests/conformance/*.zan)
+file(GLOB _conf_srcs CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/tests/conformance/*.zan)
 
 # Every test program is a pure function of its source, zanc, the stdlib/packages
 # and any explicit Zan source arguments, so the suite reuses the binary it built
@@ -5023,6 +5023,19 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       "-DZANC_ARGS=--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_flex_shrink_floor.out
       -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_flex_shrink_floor${_exe_ext}
+      -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+
+  # Panel.Column/Row 工厂件是 flex 容器（A542②）：Add() 的子项沿主轴
+  # 流动（不再全部叠在容器原点），With()/Add() 同形，gap/grow 与
+  # "容器按子控件测量自身"的契约保持；设计器面板（无工厂旗标）维持
+  # 停靠流，手摆 mx/my 不受影响。全部关系式断言，钉死无窗口跑。
+  add_test(NAME conformance_gui_panel_flex
+    COMMAND ${CMAKE_COMMAND}
+      -DZANC=$<TARGET_FILE:zanc>
+      -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/panel_flex_test.zan
+      "-DZANC_ARGS=--auto-stdlib${_gui_driver_tail}"
+      -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_panel_flex.out
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_panel_flex${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
   # The Carousel's slide placement is pure geometry: horizontal slides along

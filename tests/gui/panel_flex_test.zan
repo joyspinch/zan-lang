@@ -1,0 +1,142 @@
+using System;
+using Gui;
+using Gui.Widget;
+
+// A542②：Panel.Column()/Row() 工厂件按 flex 排布子控件。Add() 的子项
+// 沿主轴顺序流动（不再全部叠在容器原点），With() 与 Add() 同形，
+// Gap()/`grow` 照常，容器仍按子控件测量自身；设计器面板（layout 由
+// 属性设置、无工厂旗标）维持停靠流，手摆 mx/my 的子项不动。
+// 断言全部是关系式（不依赖字体度量），输出确定性 PASS 行。
+class Program {
+    static int fails = 0;
+
+    static void Eq(string name, int got, int want) {
+        if (got == want) {
+            Console.WriteLine($"PASS {name}");
+        } else {
+            Console.WriteLine($"FAIL {name} got={got} want={want}");
+            fails = fails + 1;
+        }
+    }
+
+    static void True(string name, bool ok) {
+        if (ok) {
+            Console.WriteLine($"PASS {name}");
+        } else {
+            Console.WriteLine($"FAIL {name}");
+            fails = fails + 1;
+        }
+    }
+
+    static Button Btn(string t) { return new Button(t); }
+
+    static void Main() {
+        App app = App.CreateOffscreen("panel-flex", 400, 300);
+
+        // ---- 纵向：Add() 的子项按序流动，间距生效，未声明宽度的
+        // 子项撑满内容宽（与停靠流的满宽同形）。
+        Panel col = Panel.Column();
+        col.Gap(10);
+        col.Add(Program.Btn("one"));
+        col.Add(Program.Btn("two"));
+        col.Add(Program.Btn("three"));
+        col.MeasureTree(app);
+        col.Arrange(0, 0, 400, 300);
+        Control c0 = col.children[0];
+        Control c1 = col.children[1];
+        Control c2 = col.children[2];
+        Eq("col.flow.1", c1.by, c0.by + c0.bh + 10);
+        Eq("col.flow.2", c2.by, c1.by + c1.bh + 10);
+        Eq("col.x0", c0.bx, 0);
+        Eq("col.stretch.0", c0.bw, 400);
+        Eq("col.stretch.1", c1.bw, 400);
+        True("col.distinct", c0.by != c1.by && c1.by != c2.by);
+
+        // ---- 容器仍按子控件测量自身：prefH = 各子项自然高 + 间距。
+        Eq("col.measure.h", col.prefH,
+           c0.bh + c1.bh + c2.bh + 20);
+
+        // ---- 横向：x 递增，间距生效。
+        Panel row = Panel.Row();
+        row.Gap(8);
+        row.Add(Program.Btn("a"));
+        row.Add(Program.Btn("b"));
+        row.Add(Program.Btn("c"));
+        row.MeasureTree(app);
+        row.Arrange(0, 0, 400, 300);
+        Control r0 = row.children[0];
+        Control r1 = row.children[1];
+        Control r2 = row.children[2];
+        Eq("row.flow.1", r1.bx, r0.bx + r0.bw + 8);
+        Eq("row.flow.2", r2.bx, r1.bx + r1.bw + 8);
+        True("row.distinct", r0.bx != r1.bx && r1.bx != r2.bx);
+
+        // ---- With() 与 Add() 同形：同一容器同一批子项，几何一致。
+        Panel wa = Panel.Column();
+        wa.Gap(10);
+        wa.With(Program.Btn("one"));
+        wa.With(Program.Btn("two"));
+        wa.With(Program.Btn("three"));
+        wa.MeasureTree(app);
+        wa.Arrange(0, 0, 400, 300);
+        bool same = true;
+        for (int i = 0; i < 3; i = i + 1) {
+            Control x = col.children[i];
+            Control y = wa.children[i];
+            if (x.bx != y.bx || x.by != y.by || x.bw != y.bw
+                || x.bh != y.bh) { same = false; }
+        }
+        True("with.equals.add", same);
+
+        // ---- `grow` 类吃满剩余主轴：300 高里两个自然高按钮之外
+        // 全归 grow 子项（间距 0）。
+        Panel gr = Panel.Column();
+        gr.Add(Program.Btn("h1"));
+        gr.Add(Program.Btn("h2"));
+        Label g = new Label("fill");
+        g.AddClass("grow");
+        gr.Add(g);
+        gr.MeasureTree(app);
+        gr.Arrange(0, 0, 200, 300);
+        Control b0 = gr.children[0];
+        Control b1 = gr.children[1];
+        Control gc = gr.children[2];
+        Eq("grow.fill", gc.bh, 300 - b0.bh - b1.bh);
+        Eq("grow.pos", gc.by, b0.bh + b1.bh);
+
+        // ---- 设计器面板不受影响：设计器面板是 style=3（stack 类型，
+        // 无 display 规则 → 停靠流）且 layout 由属性设置、无工厂旗标
+        // ——手摆 mx/my 的子项停在原位（p2 摆得比 p1 高：Δby 为负，
+        // 任何流式排布都不可能产出这个形状）。
+        Panel dp = new Panel("d");
+        dp.Layout();
+        dp.layout = 1;
+        Label p1 = new Label("p1");
+        dp.Add(p1);
+        p1.dock = 0;
+        p1.mx = 17;
+        p1.my = 200;
+        Label p2 = new Label("p2");
+        dp.Add(p2);
+        p2.dock = 0;
+        p2.mx = 40;
+        p2.my = 120;
+        dp.MeasureTree(app);
+        dp.Arrange(0, 0, 400, 300);
+        Eq("design.hand.dx", p2.bx - p1.bx, 40 - 17);
+        Eq("design.hand.dy", p2.by - p1.by, 120 - 200);
+        True("design.hand.intact", p1.by >= 200);
+
+        // ---- 空工厂面板：测量与排布不塌、不炸。
+        Panel empty = Panel.Column();
+        empty.MeasureTree(app);
+        empty.Arrange(0, 0, 100, 100);
+        Eq("empty.h", empty.prefH, 0);
+
+        if (fails == 0) {
+            Console.WriteLine("ALL OK");
+        } else {
+            Console.WriteLine($"FAILURES {fails}");
+        }
+    }
+}
