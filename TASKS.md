@@ -47,6 +47,25 @@
   - 撞出的既有缺陷单独立账 **A555**（泛型类实现的接口在泛型体内实例化
     后 tag 分发找不到实现），不阻塞本条。
   - 第二步（yield 状态机）按上面立项三落点推进。
+- **第二步 v1 设计（2026-10-25 定稿，parser 级 desugar，零 irgen 改动）**：
+  `IEnumerable<T> F(args) { body 带 yield }` 在 parser 期合成迭代器类：
+  - 生成 `class __Iter_F : IEnumerator<T>`：字段 = `state:int` + `cur:T` +
+    **提升的局部**（形参 + 方法体顶层 var_decl；嵌套块内声明且跨 yield
+    存活的局部 v1 报诊断要求提到顶层——C# 编译器自动提升，v1 限制记档）；
+    `MoveNext()` = 原体改写：`yield return v` → `{ cur = v; state = N;
+    return true; }` + 恢复点标签 `R_N:`（Zan 有 goto/label，状态机用
+    `switch(state){case N: goto R_N;}` 前导；goto 进 try 的既有禁令
+    E3082-E3085 天然拦住 yield-in-try）；`Current()` 返回 `cur` 字段。
+  - 原方法体改写为 `return new __Iter_F(args);`——真惰性：GetEnumerator
+    才建实例，MoveNext 逐个推。
+  - foreach 侧由第一步接住（GetEnumerator 返回接口形态枚举器）；注意
+    A555：泛型方法里的 yield 迭代器会踩"泛型体内实例化"分发缺陷，
+    A555 修复前 v1 限定非泛型方法。
+  - **非破坏**：`List<T>` 返回 + yield 维持现状（急切，现网语义）；
+    仅 `IEnumerable<T>` 返回 + yield 改发状态机（现状是把返回类型**偷偷
+    改成 List**——`desugar_yield_method` 里 `rt->type_ref.name = "List"`，
+    这行就是本次要替换的行为）。selfhost parser 无 yield desugar，
+    固定点/差分门不受影响；selfhost 侧对齐另立项。
 
 ### [ ] A555 泛型类实现的接口：实现类在泛型方法体内实例化后经接口调用，tag 分发找不到实现
 
