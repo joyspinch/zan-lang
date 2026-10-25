@@ -39,6 +39,23 @@
   ffi_nint_handle、extern_raw_buffer、delegate_dispatch 等）。不是待实现缺口，
   是已文档化的非特性。
 - 方向：逐项单独立项实现，每项带 conformance 用例；不做半截实现。
+- **lazy iterators 立项（2026-10-25 勘察）**：现状是 parser 期改写——
+  `rewrite_yield_stmt`（`src/compiler/parser.c:3369`）把 `yield return v`
+  改写成 `__yield.Add(v)`、`yield break` 改写成 `return __yield`，**急切
+  物化成 List**（探针实测可用，语义=立刻跑完整个方法）。真惰性迭代器的
+  落点三件：
+  1. 对象模型：stdlib 定 `IEnumerator<T>` / `IEnumerable<T>` 接口
+     （MoveNext/Current/Reset + GetEnumerator），foreach 已有
+     GetEnumerator 协议探测（E3078 现在报"接口枚举器不支持"——就是给
+     这条铺的路），把接口形态接进 foreach 降级。
+  2. 状态机下沉：复用协程帧机制（A380 统一释放口 + A552 isdone 守卫位），
+     yield 方法编译成 MoveNext 状态机——await 怎么编 yield 就怎么编，
+     帧字段里多一个 Current 槽。
+  3. 改写开关：`rewrite_yield_stmt` 保留为无 IEnumerator 时的兜底（或
+     直接移除），方法带 yield 时改发状态机；`ast_stmt_triggers`（genrun.c
+     :912）等触发判定同步核对。
+  约束：ARC 语义按 await 同规（捕获的托管量随帧持有/释放）；两侧后端
+  一致（selfhost 的 gen.zan 也要能编 yield 方法，固定点/差分门才绿）。
 
 ### [~] A383 图表引擎整代语义差：官方 470 个 option 键里 278 个（59%）从不读取
 
@@ -498,48 +515,6 @@
      悄悄胖 53 KB。
 - 关联：A502（android 的具体症状）、A503（ohos 的具体症状）、A493（归档拆分
   后 win 变胖的根因）、A501。
-
-### [ ] A542 Panel.Column/Row 的流式轴只对 With() 生效：Add() 的子项全叠在容器原点
-- 现象：代码建的纵向面板（资料卡、设置页导航列、工作台详情卡、聊天抽屉、
-  资料名片）里，多个子项全部叠在容器左上角同一处——头像压在按钮上、六行
-  键值挤成一条、两个小节标题跑到卡片顶端。布局自检不报（重叠的兄弟矩形
-  相同但都在同一容器原点），只有像素截图看得出来。
-- 根因：`Panel.Column()`/`Panel.Row()` 的流式轴由 `With()` 兑现——`Control.With`
-  会把非 grow 的子项改成沿流式轴停靠（列→dock=1，行→dock=3），于是子项在
-  停靠排布里依次往下/往右排。`Control.Add()` 不做这层归一化：子项 dock 仍是
-  0（手摆），停靠排布里 dock==0 的子项一律排在容器原点（`Control.zan` 约
-  2924 行的 `c.Arrange(cx + c.mx + ml, cy + c.my + mt, ...)`），于是全部重叠。
-  `Control.Add` 的注释却写着「追加一个子节点（自动停靠）」，与实现不符——
-  `Children = { ... }` 集合初始化器走的也是 `With`（`ControlChildren.Add`
-  → `owner.With(c)`），只有显式 `Add` 落回手摆语义。
-- 已落地绕法（本次）：gui-wechat 模板的代码建树统一改用 `Flex.Column()`
-  （+ `AddClass`，`Class =` 会把方向类冲掉）+ CSS `grow` 类吃满剩余空间；
-  框架自带的 `Panel.Column` 仍保留（`With` 路径照旧可用）。
-- 方向（候选，需带 IDE 截图验证）：
-  ① 框架侧让 `Add()` 对流式容器（`layout != 0`）也归一化停靠——风险是设计
-     器自由画布：设计稿里的面板同样是 `layout=column/row`，子项靠 `mx/my`
-     手摆，一旦被自动停靠，设计器画布会散架；这条路要先给设计器容器单独
-     标记（例如 `style=layout` 且 `layout=column` 的语义区分）。
-  ② 或让 `Panel.Column/Row` 直接成为 flex 容器（`StyleDisplay()` 返回 1，
-     主轴方向取自 `layout`），但 `Control.zan` 里 `computedStyle.flexDir` 有
-     多处直读，需要新增可覆写的「主轴方向」取值再逐处替换，影响 IDE 与全部
-     模板。
-  ③（已落地 2026-10-25）`Control.Add` 的注释已与实现对齐：写明 Add 不做停靠
-     归一化（子项保持手摆，流式容器里会叠在原点），要自动停靠用 `With()`。
-- 2026-10-25 补充排查（做 ① 的护栏实验，未落地）：
-  - 护栏形状本身可行：designFloat 子项（设计器自由画布 FormBuilder.zan:632、
-    GenForm 生成码；Serialize 还原路径可按 mx/my 补标）与显式 dock（ErrorList
-    dock=5、GraphView dock=4/3 都在 Add 前给定）都能精确豁免；无头探针
-    （Form.CreateOffscreen + CaptureSnapshot 后读 bx/by）可完整断言列/行流式。
-  - 但**控件出生默认 dock=Top**（Button/Label/Avatar 的 `InitControl(label,1)`，
-    `InitControl(n,d)` 第二参就是 dock）——护栏若把出生值当"未设置"归一化
-    （dock∈{0,1}→流式轴），行容器里"出生 dock=1"的尺寸声明子项会被改写成
-    dock=3，宽度计算随之改变；护栏若只豁免 dock=0 则对 widget 子项完全不生效。
-    即**出生 dock=Top 在流式容器里是承重契约**（conformance_gui_design_form_size
-    的尺寸档断言依赖它），①的"归一化"与它正面冲突，需要连同出生 dock 语义
-    一起重新设计。
-  - ②（Panel.Column/Row 变 flex 容器）是剩下没探的方向。这条维持"需专门
-    一轮 + IDE 截图验证"，不从批量清账里顺手做。
 
 ### [ ] A544 子窗口（聊天记录窗/独立聊天窗/设置窗）在本会话无法像素验收
 - 现象：`ZAN_UI_SCRIPT` 的 `dump pixels` 只抓**主 App** 的窗口；子窗口
