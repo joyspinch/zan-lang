@@ -580,6 +580,11 @@ void Example() {
 }
 ```
 
+
+Collection types (`List<T>`, `Dictionary<K,V>`, arrays) are reference types as
+well: assignment aliases the same storage, so adds, removes and element writes
+through one variable are visible through every alias -- identical to C#. There
+is no copy-on-write collection mode (locked by `cs_list_aliasing`).
 ### 6.3 ARC Optimizations
 
 The compiler applies several optimizations to minimize ARC overhead:
@@ -812,7 +817,6 @@ qualified_name  = IDENT { "." IDENT } ;
 
 - lazy iterators (`IEnumerable<T>` protocol) — `yield` currently materializes a list
 - tagged union 枚举（代数数据类型）
-- COW（copy-on-write）集合——`List` 赋值是引用共享，修改即共享
 - `[CImport]`、`project.zan` 项目文件、`zan` CLI（实际为 `zanc`）
 
 以下曾列为未实现、实测已可用（各带 conformance 用例）：

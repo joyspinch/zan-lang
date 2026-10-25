@@ -8,7 +8,7 @@
 
 ## 未完成
 
-### [ ] A381 SPEC 的"尚未实现"清单剩余 4 项
+### [ ] A381 SPEC 的"尚未实现"清单剩余 2 项
 
 - lazy iterators：`yield` 物化成 list，没有 `IEnumerable<T>` 协议
 - tagged union 枚举（代数数据类型）
@@ -17,8 +17,6 @@
   续用闭合行预扫的剥离量），分段式 lexer 表达；自举侧 `lexer.zan` 已完成
   $@/@$ 逐字插值（含转义花括号与格式说明符）与 `"""`/$""" 原始字符串完整对齐，
   进差分门 `tests/selfhost/diff_cases.txt`，固定点与差分门全绿。
-- COW 集合：`List` 赋值是引用共享，修改即共享
-- `[CImport]`、`project.zan` 项目文件、`zan` CLI（实际是 `zanc`）
 
 - 已清：`checked` / `unchecked` 整型溢出检查——802607e72 落地，
   C# 兼容语义（checked 报点后回绕值继续流动，`ZAN_RT_HARD=1` 硬陷阱 exit 70；
@@ -31,6 +29,15 @@
   （0 个收空数组）。全形状探针过；conformance
   `tests/conformance/params_optional_combination.zan` 锁形。
 
+- 已清（2026-10-25，定性非缺口）：COW 集合——探针 + conformance 用例
+  `cs_list_aliasing` 钉死：Zan `List` 赋值就是引用共享、修改即共享，与 C#
+  `List<T>` 语义完全一致（C# 本就没有 COW List）。SPEC 把这行挂在"C# 特性
+  尚未实现"清单属归档错误：已从该清单移除，引用共享语义写入 §6.2。
+- 已清（2026-10-25，定性非缺口）：`[CImport]`/`project.zan`/`zan` CLI——
+  SPEC §7/§8 已如实记录不存在与替代路径（`[DllImport]` + `System.Interop`、
+  `zanc` 直接编），替代路径有全套 conformance 用例在跑（dllimport_variadic、
+  ffi_nint_handle、extern_raw_buffer、delegate_dispatch 等）。不是待实现缺口，
+  是已文档化的非特性。
 - 方向：逐项单独立项实现，每项带 conformance 用例；不做半截实现。
 
 ### [ ] A382 编译器缺三件基础能力：诊断编号体系、告警级别开关、Marshal
