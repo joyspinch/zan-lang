@@ -805,6 +805,37 @@ static LLVMValueRef emit_foreach_call0(zan_irgen_t *g, zan_type_t *recv_ty,
     return LLVMConstInt(LLVMInt64TypeInContext(g->ctx), 0, 0);
 }
 
+/* 经接口引用调用零参成员（foreach 协议的 GetEnumerator/MoveNext/Current，
+ * A381 第一步：枚举器接口形态）。把接收者值存进临时槽并以接口类型注册为
+ * 隐藏局部，合成成员调用走常规调用路径——tag 分发、空接收者守卫、ARC
+ * 全部复用既有成员调用降级，不另写一份接口分发。 */
+static LLVMValueRef emit_iface_call0(zan_irgen_t *g, zan_type_t *iface_ty,
+                                     const char *mname, LLVMValueRef recv,
+                                     local_scope_t *locals, zan_loc_t loc) {
+    int saved = locals->count;
+    LLVMTypeRef slot_ll = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    LLVMValueRef slot = emit_entry_alloca(g, slot_ll, "fe.ifc");
+    zan_store_fit(g, LLVMBuildBitCast(g->builder, recv, slot_ll, "fe.ifc.b"),
+                  slot);
+    char nm[16];
+    snprintf(nm, sizeof(nm), "$fe.ifc");
+    zan_istr_t ni = { nm, (uint32_t)strlen(nm) };
+    local_add(locals, ni, slot, iface_ty);
+    zan_ast_node_t *id = zan_ast_new(g->arena, AST_IDENTIFIER, loc);
+    id->ident.name = ni;
+    zan_ast_node_t *mem = zan_ast_new(g->arena, AST_MEMBER_ACCESS, loc);
+    mem->member.object = id;
+    mem->member.name = (zan_istr_t){ (char *)mname, (uint32_t)strlen(mname) };
+    mem->member.null_cond = 0;
+    zan_ast_node_t *call = zan_ast_new(g->arena, AST_CALL, loc);
+    call->call.callee = mem;
+    zan_ast_list_init(&call->call.args);
+    zan_ast_list_init(&call->call.type_args);
+    LLVMValueRef r = emit_expr(g, call, locals);
+    locals->count = saved;
+    return r;
+}
+
 static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *locals) {
     if (!stmt) return;
     if (locals) g->current_locals = locals;
@@ -2789,6 +2820,9 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                 gm->decl->method_decl.return_type) {
                 zan_type_t *rt = resolve_type_ctx(g,
                     gm->decl->method_decl.return_type);
+                /* 协议齐备的接口枚举器（MoveNext/Current 都有）已被
+                 * foreach_proto_enum_type 收下；走到这里说明接口缺协议成员，
+                 * foreach 无法直接驱动，才报不支持。 */
                 if (rt && rt->kind == TYPE_INTERFACE)
                     zan_diag_emit_code(g->diag, DIAG_ERROR, stmt->loc, 3078,
                         "foreach: GetEnumerator() returning interface '%.*s' "
@@ -2981,7 +3015,10 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                           enum_slot, "fe.ens"),
                       fe_enum_ll, "fe.env")
                 : LLVMBuildLoad2(g->builder, fe_enum_ll, enum_alloc, "fe.env");
-            LLVMValueRef mr = emit_foreach_call0(g, fe_enum_ty, fe_next_m, fev);
+            LLVMValueRef mr = (fe_enum_ty->kind == TYPE_INTERFACE)
+                ? emit_iface_call0(g, fe_enum_ty, "MoveNext", fev, locals,
+                                   stmt->loc)
+                : emit_foreach_call0(g, fe_enum_ty, fe_next_m, fev);
             LLVMTypeRef mrt = LLVMTypeOf(mr);
             LLVMValueRef more =
                 (LLVMGetTypeKind(mrt) == LLVMIntegerTypeKind &&
@@ -3001,7 +3038,10 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                 : LLVMBuildLoad2(g->builder, fe_enum_ll, enum_alloc, "fe.bev");
             LLVMValueRef cur;
             if (fe_cur_m)
-                cur = emit_foreach_call0(g, fe_enum_ty, fe_cur_m, fev);
+                cur = (fe_enum_ty->kind == TYPE_INTERFACE)
+                    ? emit_iface_call0(g, fe_enum_ty, "Current", fev, locals,
+                                       stmt->loc)
+                    : emit_foreach_call0(g, fe_enum_ty, fe_cur_m, fev);
             else
                 cur = emit_property_getter_call(g, fe_cur_getter, fe_enum_ty,
                                                 fev, NULL, locals);

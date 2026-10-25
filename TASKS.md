@@ -31,6 +31,44 @@
      :912）等触发判定同步核对。
   约束：ARC 语义按 await 同规（捕获的托管量随帧持有/释放）；两侧后端
   一致（selfhost 的 gen.zan 也要能编 yield 方法，固定点/差分门才绿）。
+- **第一步已落地（2026-10-25）——foreach 驱动接口形态枚举器**：
+  stdlib 的 `IEnumerator<T>` / `IEnumerable<T>` 协议本来就在；foreach 降级器
+  此前只认具体类枚举器（E3078 拒收接口返回）。改三处：
+  1. `foreach_proto_enum_type`（irgen_async.c）收下 `TYPE_INTERFACE` 形态
+     （要求 MoveNext + Current 协议齐备，缺了才落 E3078）；
+  2. MoveNext/Current 降级新增 `emit_iface_call0`（irgen_stmt.c）：把枚举器
+     值存进临时槽、以接口类型注册为隐藏局部、合成成员调用走**常规调用
+     路径**——tag 分发/空接收者守卫/ARC 全部复用既有降级，不另写一份
+     接口分发；GetEnumerator 本就是具体类方法直调，无需改；
+  3. async 侧枚举器帧槽（E3079 路径）天然兼容（i8ptr）。
+  - 锁形：`foreach_iface_enumerator`（int 求和 15 / break 拉 3 个 /
+    string 元素 chars=6）；验证：foreach 子集 22/22、async+接口 foreach
+    探针 c=4、自举 67 文件绿。
+  - 撞出的既有缺陷单独立账 **A555**（泛型类实现的接口在泛型体内实例化
+    后 tag 分发找不到实现），不阻塞本条。
+  - 第二步（yield 状态机）按上面立项三落点推进。
+
+### [ ] A555 泛型类实现的接口：实现类在泛型方法体内实例化后经接口调用，tag 分发找不到实现
+
+- 现象（2026-10-25，做 foreach 接口枚举器时撞出，**与 foreach 无关**）：
+  `class BoxEnum<T> : IEnumerator<T>`，在**非泛型上下文**直接
+  `new GEnum<int>(42)` 后经 `IEnumerator<int>` 形参调用 MoveNext ——
+  正常（take=1）；但实例化发生在**泛型方法体内**（`Box<T>.GetEnumerator`
+  里 `new BoxEnum<T>(items)`，或 Main 里经 `Box<int>` 实例取得）再经接口
+  调用，运行时 `interface dispatch has no implementation`（exit 3）。
+- 结构：接口分发按 tag 切换（`irgen_call.c` ~5424：遍历
+  `g->struct_types`，`class_implements_iface(cls, iface)` 命中后取
+  `get_vtable_global(g, cls)` 比对对象头 tag）。泛型类实例的 tag 与
+  泛型符号的 vtable global 在"泛型体内 new 出来的实例"这条路上对不上——
+  非泛型上下文直接 new 时对得上。疑似实例化体的 tag 注册与
+  class_implements_iface 的实例化感知有一侧缺失。
+- 探针：`_scratch/ie7.zan`（非泛型 new，过）/ `ie8.zan`（泛型体内经
+  Box<int> 取枚举器，rc=3）。ie8 形状在 foreach 接口枚举器
+  （A381 lazy iterators 第一步）里同样触发，先记独立缺陷。
+- 方向：在 `class_implements_iface` / `get_vtable_global` 里核对**实例化
+  类**（BoxEnum<int>）的注册路径：struct_types 是否为每个用到的实例化
+  建了条目与 vtable global；new 发射点在实例化方法里时 tag 取的是哪个
+  符号的 vtable。修完 ie7/ie8 双形状都要过。
 
 ### [~] A383 图表引擎整代语义差：官方 470 个 option 键里 278 个（59%）从不读取
 
