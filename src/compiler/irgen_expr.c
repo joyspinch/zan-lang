@@ -5598,8 +5598,13 @@ binding_lowered:
                     idx = emit_index_safe_bounds(g, idx, span_len, expr->loc, "span");
                     LLVMValueRef ep = LLVMBuildGEP2(g->builder, elem_llvm, typed, &idx, 1, "sps.ep");
                     LLVMValueRef sv = right;
-                    if (LLVMTypeOf(sv) != elem_llvm)
-                        sv = coerce_int_to(g, sv, elem_llvm);
+                    if (LLVMTypeOf(sv) != elem_llvm) {
+                        if (LLVMGetTypeKind(elem_llvm) == LLVMStructTypeKind &&
+                            LLVMGetTypeKind(LLVMTypeOf(sv)) == LLVMPointerTypeKind)
+                            sv = LLVMBuildLoad2(g->builder, elem_llvm, sv, "sps.deref");
+                        else
+                            sv = coerce_int_to(g, sv, elem_llvm);
+                    }
                     /* 非对齐内存跨度 (Span) 内存读写支持 */
                     LLVMSetAlignment(LLVMBuildStore(g->builder, sv, ep), 1);
                     emit_oob_store_finish(g, sp_do, sp_end);

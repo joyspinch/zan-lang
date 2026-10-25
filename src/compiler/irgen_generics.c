@@ -2170,6 +2170,12 @@ static LLVMValueRef zan_store_fit(zan_irgen_t *g, LLVMValueRef val, LLVMValueRef
             if (LLVMIsAConstantInt(idx))
                 target = LLVMStructGetTypeAtIndex(
                     src, (unsigned)LLVMConstIntGetZExtValue(idx));
+        } else if (src && LLVMGetTypeKind(src) == LLVMStructTypeKind &&
+                   LLVMGetNumOperands(ptr) == 2) {
+            /* 一维数组元素槽：GEP(结构体元素类型, 基址, 下标)——指针形
+             * 结构体右值（new T{...}）进槽前必须取值，否则指针 8 字节
+             * 裸写进槽（与 A548 decimal 同族坑） */
+            target = src;
         } else if (src && (LLVMGetTypeKind(src) == LLVMFloatTypeKind ||
                            LLVMGetTypeKind(src) == LLVMDoubleTypeKind)) {
             target = src;
