@@ -1157,13 +1157,12 @@ static LLVMValueRef zan_call2(LLVMBuilderRef b, LLVMTypeRef ty, LLVMValueRef fn,
 }
 
 static void zan_emit_frame_free(zan_irgen_t *g, LLVMValueRef frame_i8) {
-    /* A380 复盘（2026-10-24）：曾试过把默认路径也改走 __zan_co_frame_free
-     * （CO_DEAD 守卫 + 检疫区），async_catch_ownership_route /
-     * web_route_async_teardown 等 3 条用例当场 Access violation——默认
-     * 进程内驱动的帧释放时序/所有权与 mt 守卫释放的协议不匹配（守卫的
-     * QUEUED/RUNNING 分支会把活帧标记 DEAD 或把 CO_DEAD 写进非头部字节），
-     * 缓解前不能改道。检疫区仍服务于 external_async_executor 路径。 */
-    if (g->external_async_executor && g->rt_co_frame_free) {
+    /* A380 统一释放口：两种驱动一律走运行时 __zan_co_frame_free（帧首 CO_DEAD
+     * 幂等守卫 + 检疫区）。2026-10-24 曾把默认路径还原回裸 free——那 3 条 AV
+     * 后经 A549 证明是存量账，且自举后端九个发射点本来就无条件走守卫释放、
+     * 自举门长期全绿，"默认驱动 + 守卫释放"组合早有在证；此处与自举协议归一。
+     * 无守卫运行时的平台（rt_io.c #else 支）该符号即裸 free，退化为旧行为。 */
+    if (g->rt_co_frame_free) {
         zan_call2(g->builder, g->rt_co_frame_free_type, g->rt_co_frame_free,
                   &frame_i8, 1, "");
         return;

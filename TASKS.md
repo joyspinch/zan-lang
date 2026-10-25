@@ -8,65 +8,6 @@
 
 ## 未完成
 
-### [ ] A380 协程帧的释放仍只在类型侧收口——运行时没有幂等保护
-
-- **2026-10-24 进度（部分落地 + 一次被证伪的尝试）**：
-  - **检疫区已落地**（rt_io.c，mt 驱动的 `__zan_co_frame_free`）：释放的帧
-    进 FIFO 检疫区（SRWLOCK/PTHREAD_MUTEX 静态初始化锁——帧释放可能早于
-    `zan_co_sched_init`，不能依赖调度器初始化时序；封顶 1024 帧，超限按
-    FIFO 真放前一半）——external_async_executor 路径的守卫从此可靠：free
-    后块首 CO_DEAD 位不再被分配器 freelist 覆盖，二次释放稳定读到 DEAD
-    并返回。C 级探针验证：双释放存活、CO_DEAD 位在首次释放后仍在、3000
-    帧压力打穿 FIFO 不崩。
-  - **默认路径改道被证伪**：把 `zan_emit_frame_free` 的默认分支也改走守卫
-    释放，`async_catch_ownership_route` / `web_route_async_teardown` 等 3
-    条当场 AV（后经 A549 闭账证明该 3 条是存量账、与改道无关，但改道仍
-    需先摸清默认驱动的帧生命周期协议才能定安全，默认路径先行还原，
-    irgen.c 留复盘注释）。剩余工程 = 先把默认驱动的帧
-    生命周期协议摸清（帧头是否随模式存在、释放时序与泵的交错），再谈
-    统一释放口。
-  - **附产（A464 存量破坏修复）**：wasm32 的运行时对象自 A464 落地起就
-    过期——`zan_rt_alloc_add`（A464 加进 rt_timer.c）不在
-    toolchain/wasm32/zanrt_timer.o 里，任何带分配的 wasm 程序链接即挂
-    （conformance_wasm32_async_yield 红了没人看见）。本批补齐
-    `__zan_co_frame_free` 的 wasm 定义（rt_wasm.c，裸 free——wasm 单线程
-    无调度头）+ wasm 全部对象 zig cc 刷新 + 分段重跑，wasm32 四条全绿。
-- 现状（A379 已闭）：`Task.Run(lambda)` 的句柄被检查器定型成"无结果任务"，
-  把 lambda 句柄当 `Task<T>` 用去读 `.Result`/`.Wait()` 会在**编译期**被拒绝
-  （`tests/diag/task_run_action_result_type.zan`），那条运行期 double free 路径
-  因此不可达。**当前没有可从用户代码复现的触发路径**（5 种探针形状都试过）。
-- **2026-10-20 复核更正（原登记的前提只对了一半）**：
-  - **默认路径根本没有守卫**。`src/compiler/irgen.c:1128 zan_emit_frame_free`：
-    只有 `g->external_async_executor`（即 `--async-workers`）才调运行时的
-    `__zan_co_frame_free`（`src/runtime/rt_io.c:4164`，在 `#ifdef ZAN_CO_DRIVER`
-    段里，用帧首 8 字节的 `CO_DEAD` 位做幂等守卫）；**默认的进程内协程驱动
-    走的是裸 `free(frame)`**（同文件 1134 行），连守卫都没有。
-  - 即便有守卫也不可靠：小对象分配器回收时把用户块首 8 字节写成 freelist
-    指针（`src/runtime/rt_mem.c:448`），守卫读到的已是垃圾 → 二次释放直接
-    abort（`double free of block`）。
-  - **原方向 a（活协程表仲裁）与当前协议不符**：活协程表里**摘掉**帧的是协程
-    自己的完成路径（`__zan_co_untrack` → `zan_co_live_del`），而**释放**帧的是
-    读结果的一方（读完 `.Result` 后 `zan_emit_frame_free`）。"谁摘掉谁负责 free"
-    会在读者读结果之前就把帧释放掉 → UAF。仲裁必须是**独立于活协程表的所有权
-    凭据**，不能拿活协程表当仲裁器。
-- 方向（二选一，都要求 **C 后端与自举后端同一次改动**）：
-  - **a. 所有权句柄**：每个帧配一个稳定的句柄单元（帧指针 + released 标志），
-    所有释放点走 `handle_release()`，天然 exactly-once。代价：每帧多一次分配，
-    句柄本身要么泄漏、要么再加一层引用计数。
-  - **b. 隔离的帧分配器**：帧由运行时分配，释放后进隔离区（地址不还给通用分配
-    器）→ `CO_DEAD` 位不被覆盖 → 第二次释放读到 DEAD → 直接返回。代价：内存
-    延迟回收。
-  - **不要用"指针 → 已释放集合"**：地址复用后无法区分陈旧指针与新帧——要么跳过
-    一次合法释放（泄漏），要么释放一个活帧（内存损坏）。指针身份本身不够。
-- 连带：`__zan_co_isdone` 在帧已被完成路径释放后仍会读它的 DONE 字段（先查活
-  协程表、再读帧字段，中间有窗口）——4 字节 UAF 读，通常不炸但语义不严。
-- ⚠ 为什么不能只改 C 侧：自举后端发的是同一套协议
-  （`src/selfhost/irgen_async.zan:667/673/680/686/1037/1195/1645/2028/2035`
-  都是 `call void @__zan_co_frame_free`），帧布局也各写一份；固定点门比的是
-  两个后端的产物，单改 C 侧会让 `selfhost_fixed_point` 直接不绿。另外
-  `toolchain/*/zanrt_io.o`（各平台预编译运行时）要跟着重出，非本机平台
-  重建不了。
-
 ### [ ] A381 SPEC 的"尚未实现"清单剩余 4 项
 
 - lazy iterators：`yield` 物化成 list，没有 `IEnumerable<T>` 协议
@@ -718,3 +659,11 @@
 - 前置：`packages/Zan.Gui/src/Gui/drivers/win-x64/*` 的驱动二进制当前是**另一会话的
   在途改动**，这轮不重建驱动；模板侧先用 `<div>` 顶上（登录窗已改，见提交）。
 
+
+### [ ] A552 `__zan_co_isdone` 先查活协程表再读帧字段，中间有窗口——4 字节 UAF 读
+
+- 帧被读结果方释放后（`zan_emit_frame_free` → 守卫/检疫区），仍有人调
+  `__zan_co_isdone(frame)` 时：先查活协程表确认活着、再读帧 DONE 字段，
+  两步之间帧可能已被释放——4 字节 UAF 读，通常不炸但语义不严。
+- 修法方向：isdone 改为只依赖活协程表/所有权凭据，或读帧前走守卫状态位。
+- 出处：A380 闭账时留的连带项（原 A380 条目"连带"节）。
