@@ -4960,6 +4960,18 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_flex${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
+  # Flex 收缩的 min-content 下限（A545）：溢出行的比例收缩不把内容
+  # 测得的叶子压扁，缺口转摊给可重排的子项；作者声明尺寸（Prefer）
+  # 与 `flex-shrink: 0` 的老行为不变。纯几何，无窗口对拍矩形。
+  add_test(NAME conformance_gui_flex_shrink_floor
+    COMMAND ${CMAKE_COMMAND}
+      -DZANC=$<TARGET_FILE:zanc>
+      -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/flex_shrink_floor_test.zan
+      "-DZANC_ARGS=--auto-stdlib${_gui_driver_tail}"
+      -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_flex_shrink_floor.out
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_flex_shrink_floor${_exe_ext}
+      -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+
   # The Carousel's slide placement is pure geometry: horizontal slides along
   # x, vertical along y (Direction("vertical")); the chrome overlay must stay
   # the LAST child -- lazily mounted on first Arrange and re-appended when a

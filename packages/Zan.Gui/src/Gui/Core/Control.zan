@@ -1008,6 +1008,21 @@ public class Control {
         return computedStyle.shrink;
     }
 
+    // flex 收缩的 min-content 下限（A545，CSS `min-width:auto` 的近似）：
+    // 溢出行按比例收缩时，内容不可重排的控件不被压扁——按钮/图标以
+    // 测量偏好（内容尺寸）为下限，非折行文本以整段文本宽为下限
+    // （Label 覆写）。作者声明的尺寸（Prefer/SetSize/文档宽高，
+    // prefSet）是"指定尺寸"而非内容下限——CSS 里它照样向
+    // min-content 收缩，这里没有单独的内容测量可依，按可协商处理，
+    // 返回 0 照旧按比例收缩。由流内容定尺寸的容器（fillW/fillH，
+    // 宽度随槽重排）同样无内在下限。声明了的 min/max 由调用方经
+    // StyleClampW/H 套上。
+    virtual int MinContentMain(bool row) {
+        if (this.prefSet) { return 0; }
+        if (row) { return this.fillW ? 0 : this.prefW; }
+        return this.fillH ? 0 : this.prefH;
+    }
+
     // CSS `flex-basis` 在 `avail` 像素主轴包含块内的值，
     // 未声明时返回 -1。
     int StyleBasisIn(int avail) {
@@ -3541,7 +3556,6 @@ public class Control {
                 int marTotal = 0;
                 int fixedMain = 0;
                 int flexMain = 0;
-                int last = 0 - 1;
                 i = 0;
                 while (i < n) {
                     marTotal = marTotal + items[start + i].MarMain(row);
@@ -3549,24 +3563,68 @@ public class Control {
                         fixedMain = fixedMain + sizes[i];
                     } else {
                         flexMain = flexMain + sizes[i];
-                        last = i;
                     }
                     i = i + 1;
                 }
                 int room = mainBox - gaps - marTotal - fixedMain;
                 if (room < 0) { room = 0; }
                 if (flexMain > 0) {
-                    int placedSize = 0;
+                    // min-content 下限（CSS 的 min-width:auto，A545）：收缩
+                    // 不把内容不可重排的子项压扁——下限由 MinContentMain
+                    // 逐件给出，声明了的 min/max 经 StyleClampW/H 套上，
+                    // 再钳到基准尺寸内（flex-basis:0 的子项按 CSS 的
+                    // specified-size 建议钳到 0）。顶到下限的子项冻结，
+                    // 缺口按「可让空间」（尺寸-下限）转摊给还能让位的
+                    // 子项，每轮至少冻结一件故至多 n 轮收敛；全都顶住时
+                    // 整行按自然尺寸溢出——溢出可见好过压成 0 宽（看不
+                    // 见也点不着）。
+                    List<int> floors = new List<int>();
+                    int give = room;
                     i = 0;
                     while (i < n) {
+                        int f = 0;
                         if (items[start + i].StyleShrink() != 0) {
-                            int sz = sizes[i] * room / flexMain;
-                            if (i == last) { sz = room - placedSize; }
-                            if (sz < 0) { sz = 0; }
-                            placedSize = placedSize + sz;
-                            sizes[i] = sz;
+                            if (row) { f = items[start + i].StyleClampW(cw, items[start + i].MinContentMain(row)); }
+                            else { f = items[start + i].StyleClampH(ch, items[start + i].MinContentMain(row)); }
+                            if (f > sizes[i]) { f = sizes[i]; }
+                            give = give - sizes[i];
                         }
+                        floors.Add(f);
                         i = i + 1;
+                    }
+                    int guard = 0;
+                    while (give < 0 && guard <= n) {
+                        guard = guard + 1;
+                        int pool = 0;
+                        i = 0;
+                        while (i < n) {
+                            if (items[start + i].StyleShrink() != 0
+                                && sizes[i] - floors[i] > 0) { pool = pool + sizes[i] - floors[i]; }
+                            i = i + 1;
+                        }
+                        if (pool <= 0) { break; }
+                        int taken = 0;
+                        int lastGive = 0 - 1;
+                        i = 0;
+                        while (i < n) {
+                            if (items[start + i].StyleShrink() != 0
+                                && sizes[i] - floors[i] > 0) { lastGive = i; }
+                            i = i + 1;
+                        }
+                        i = 0;
+                        while (i < n) {
+                            if (items[start + i].StyleShrink() != 0
+                                && sizes[i] - floors[i] > 0) {
+                                int cut = give * (sizes[i] - floors[i]) / pool;
+                                if (i == lastGive) { cut = give + taken; }
+                                int want = sizes[i] + cut;
+                                if (want < floors[i]) { want = floors[i]; }
+                                taken = taken + sizes[i] - want;
+                                sizes[i] = want;
+                            }
+                            i = i + 1;
+                        }
+                        give = give + taken;
                     }
                 }
             }
