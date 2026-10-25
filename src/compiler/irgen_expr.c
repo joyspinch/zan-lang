@@ -5520,7 +5520,11 @@ static LLVMValueRef emit_ref_lvalue_ptr(zan_irgen_t *g, zan_ast_node_t *tgt,
 binding_lowered:
         if (expr->binary.left->kind == AST_IDENTIFIER) {
             local_var_t *local = local_find(locals, expr->binary.left->ident.name);
-            if (local && local_is_dyn_obj(g, local)) {
+            if (local && local->obj_rc_flag && local_is_dyn_obj(g, local)) {
+                /* 异步帧/闭包槽：所有权运行期可变（obj_rc_flag 存在才走
+                 * 动态派发）。普通 object 局部量没有该档案（owns=0 时
+                 * obj 路径从不建档，抢到这里只会退化成裸 store——既不
+                 * retain 也不释放旧值，每次重赋值泄漏旧对象，A557）。 */
                 emit_obj_local_store(g, local, right,
                     infer_expr_type(g, expr->binary.right, locals),
                     expr->binary.right, locals);

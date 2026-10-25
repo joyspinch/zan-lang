@@ -133,7 +133,7 @@
 - `Zan.Messaging` 的"统一请求-响应 + 擦除结果"（A449/A434 的原始诉求）在
   v1 的显式 cast 下已可用；v2 是体验补齐。
 
-### [ ] A557 object 局部变量赋值不释放旧值（含 `= null`）——连带守卫异常泄漏
+### [x] A557 object 局部变量赋值不释放旧值（含 `= null`）——连带守卫异常泄漏
 
 - 现象（2026-10-26，A556-3 装箱探针的 leakcheck 炸出来的，**与装箱无关，
   纯类对象即复现**）：
@@ -143,16 +143,24 @@
     退出两次 release_dyn，靠运行期 rc≤0 守卫兜住）；
   - `object a = <箱或对象>; a = null;` 之后首个 try/catch → 被捕获的
     守卫异常也泄漏 1 个（m7；无 `a = null` 的同构 g2/g3 干净）。
-- IR 证据（t3/t8 `--emit-ir`）：赋值语句发射形状是
-  `__zan_eh_tmp_push(slot(RHS 或目标 var)) → store → tmp_pop`——**没有旧值
-  release 分支**（对比 t6 的初始化路径有完整 obj.probe/srel/orel 旧值
-  释放链）。声明初始化（emit_obj_local_store）语义正确：释放旧值 + owns
-  标志 + 按需 retain；赋值语句没走它。
-- 修复方向：赋值语句对 dyn-obj 目标统一走 `emit_obj_local_store`（释放
-  旧值 + 转移/retain 新值 + owns 标志），并理清 tmp_push/push 的是目标槽
-  还是 RHS 槽（t8 推的是 RHS 变量槽——读局部变量被当成了 owned 临时），
-  以及 m7 的异常泄漏是否随赋值修复消失。影响面大（每个 object 赋值），
-  动手前先用 t3/t8/m7 + `arc_throw_*` 全族钉行为。
+- 根因（诊断打印 + IR 定案）：赋值分派器（irgen_expr.c
+  emit_expr_assignment）里 `local_is_dyn_obj`（kind==TYPE_OBJECT）**优先
+  命中 emit_obj_local_store**，但普通（非 async、非闭包）object 局部量
+  没有 obj_rc_flag——该函数对它整个退化成裸 store：`owns=0`
+  （obj_slot_owns_value 不认 TYPE_OBJECT、标识符 RHS 不算 owned）→ 不
+  retain；`emit_release_obj_local` 无档案直接 return → 旧值不释放。而
+  obj 机器对普通局部量**从不建档**（建档只在 emit_obj_local_store 内
+  owns||flag 时发生），所以这条抢占从未产生过正确行为。声明侧走
+  emit_rc_capture_local（arc.old + obj.probe/srel/orel 释放链）+
+  arc_own_local 压槽，语义本就正确；IR 里的 `tmp_push(slot)` 是声明期
+  arc_own_local 的槽注册，与赋值语句无关。
+- 修复：分派器给 obj 路径加 `local->obj_rc_flag` 门禁——异步帧/闭包槽
+  （所有权运行期可变）照旧走动态派发；普通 object 局部量回落
+  `emit_rc_capture_local`（retain 新值 + 释放旧值，与类/委托/数组/字符串
+  局部量同一条编译期定权路径）。
+- 验证：t3/t8/m7 带 `--check-leaks` 全净（m7 被捕获守卫异常的泄漏随赋值
+  修复一并消失，与"修复方向"预判一致）；`scripts/test.ps1 standard
+  -Match "arc_|boxing|object_|cast_string|throw|catch|eh_"` 45/45 全绿。
 
 ### [ ] A489 GPU 3D 片元着色器把光照写死成固定键光——没有材质与光源 uniform 通路
 
