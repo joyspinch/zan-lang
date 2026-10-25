@@ -104,6 +104,22 @@
     需直接置到 diag 上：set_deny_warnings 在参数解析后已先执行过一次）、
     W0003/裸 3 两种抑制写法、非法级别报错退出 2。
 
+- **③ 已落地（2026-10-25）——`#pragma warning disable/restore`**：
+  - 语法：`#pragma warning disable 0003, W0030`（编号 token 与 --suppress
+    同形，字母可省略；不带编号 = 通配全部告警）、`#pragma warning restore 0003`。
+    未知 pragma / 未知 action 静默吞行（与 C# 一致）。
+  - 机制：lexer 指令分支调 `zan_diag_pragma_warning`——disable 在指令行开
+    半开区间 [from, to)，restore 把本文件当前行前开放的同码/通配区间关掉；
+    vemit 过滤只作用于 WARNING 级（错误不受区间影响），按 file_id+line 判定
+    （多文件区间不串号）；capture 模式照常入表。checker/parser 的诊断同受
+    区间约束（同一 diag + loc 空间）。
+  - 自举侧零改动：Directive 对未知指令本来就吞行，#pragma 免费跳过；其诊断
+    无编号过滤（语义本分叉），pragma 只影响诊断输出不影响程序行为，不触门。
+  - 锁形用例 `diag_pragma_warning_disable`（新增 run_compile_error 的
+    `EXPECT_REGEX_NOT` 断言：被静默的 #warning 不得出现在日志）。
+  - 验证：探针——disable 后静默/restore 后恢复（ctest 双断言）、通配形态、
+    多编号形态、未知 pragma 与坏 action 静默，全过。
+
 ### [~] A383 图表引擎整代语义差：官方 470 个 option 键里 278 个（59%）从不读取
 
 - **第一步已落地（2026-10-24）：未知 option 键告警进引擎。**

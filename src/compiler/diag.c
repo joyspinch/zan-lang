@@ -23,6 +23,9 @@ zan_diag_t *zan_diag_new(zan_arena_t *arena) {
     d->suppress_codes = NULL;
     d->suppress_count = 0;
     d->suppress_cap = 0;
+    d->pragma_ranges = NULL;
+    d->pragma_count = 0;
+    d->pragma_cap = 0;
     d->entries = NULL;
     d->entry_count = 0;
     d->entry_cap = 0;
@@ -106,6 +109,60 @@ static int zan_diag_code_suppressed(const zan_diag_t *diag, int code) {
     return 0;
 }
 
+void zan_diag_pragma_warning(zan_diag_t *diag, zan_loc_t loc, int disable,
+                             const int *codes, int count) {
+    if (!diag) return;
+    if (disable) {
+        int n = count > 0 ? count : 1;   /* 无编号 = 通配一条 code=0 区间 */
+        for (int k = 0; k < n; k++) {
+            if (diag->pragma_count == diag->pragma_cap) {
+                int ncap = diag->pragma_cap ? diag->pragma_cap * 2 : 8;
+                zan_diag_pragma_range_t *grown =
+                    (zan_diag_pragma_range_t *)realloc(
+                        diag->pragma_ranges,
+                        sizeof(zan_diag_pragma_range_t) * (size_t)ncap);
+                if (!grown) return;
+                diag->pragma_ranges = grown;
+                diag->pragma_cap = ncap;
+            }
+            zan_diag_pragma_range_t *r =
+                &diag->pragma_ranges[diag->pragma_count++];
+            r->code = count > 0 ? codes[k] : 0;
+            r->file_id = loc.file_id;
+            r->from_line = loc.line;
+            r->to_line = UINT32_MAX;
+        }
+        return;
+    }
+    /* restore：关闭本文件当前行前所有开放区间；无编号 = 全部，有编号 =
+     * 同码或通配区间都关（通配区间覆盖面大于 restore 点名的编号） */
+    for (int i = 0; i < diag->pragma_count; i++) {
+        zan_diag_pragma_range_t *r = &diag->pragma_ranges[i];
+        if (r->to_line != UINT32_MAX) continue;
+        if (r->file_id != loc.file_id) continue;
+        if (count > 0 && r->code != 0) {
+            int hit = 0;
+            for (int k = 0; k < count; k++) {
+                if (codes[k] == r->code) { hit = 1; break; }
+            }
+            if (!hit) continue;
+        }
+        r->to_line = loc.line;
+    }
+}
+
+/* A382③：loc 落在任一覆盖该编号的 enable 区间内（半开 [from, to)） */
+static int zan_diag_pragma_suppressed(const zan_diag_t *diag, int code,
+                                      zan_loc_t loc) {
+    for (int i = 0; i < diag->pragma_count; i++) {
+        const zan_diag_pragma_range_t *r = &diag->pragma_ranges[i];
+        if (r->file_id != loc.file_id) continue;
+        if (loc.line < r->from_line || loc.line >= r->to_line) continue;
+        if (r->code == 0 || r->code == code) return 1;
+    }
+    return 0;
+}
+
 int zan_diag_entry_count(const zan_diag_t *diag) {
     return diag->entry_count;
 }
@@ -124,6 +181,10 @@ void zan_diag_free_buffers(zan_diag_t *diag) {
     diag->suppress_codes = NULL;
     diag->suppress_count = 0;
     diag->suppress_cap = 0;
+    free(diag->pragma_ranges);
+    diag->pragma_ranges = NULL;
+    diag->pragma_count = 0;
+    diag->pragma_cap = 0;
     free((void *)diag->file_names);
     free((void *)diag->file_sources);
     diag->file_names = NULL;
@@ -185,6 +246,7 @@ static void zan_diag_vemit(zan_diag_t *diag, zan_diag_level_t level,
     if (level == DIAG_WARNING && !diag->capture) {
         if (diag->warn_level == 0) return;
         if (code > 0 && zan_diag_code_suppressed(diag, code)) return;
+        if (zan_diag_pragma_suppressed(diag, code, loc)) return;
     }
 
     if (level == DIAG_ERROR) {

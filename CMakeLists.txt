@@ -1330,6 +1330,19 @@ add_test(NAME diag_warn_level_error
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_warn_level_error PROPERTIES TIMEOUT 60)
 
+# A382③: #pragma warning disable/restore scopes by source line. The silenced
+# #warning must not appear in the log; the restored one must, and the trailing
+# syntax error fails the compile so the harness can assert on both.
+add_test(NAME diag_pragma_warning_disable
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/pragma_warning_disable.zan
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/diag_pragma_warning_disable${_exe_ext}
+    "-DEXPECT_REGEX=#warning this one must show up"
+    "-DEXPECT_REGEX_NOT=this one is silenced"
+    -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
+set_tests_properties(diag_pragma_warning_disable PROPERTIES TIMEOUT 60)
+
 add_test(NAME diag_unary_tilde_string
   COMMAND ${CMAKE_COMMAND}
     -DZANC=$<TARGET_FILE:zanc>

@@ -585,6 +585,37 @@ static void pp_handle_directive(zan_lexer_t *lex) {
             msg[mi] = '\0';
             zan_diag_emit_code(lex->diag, DIAG_WARNING, lexer_loc(lex), 3, "#warning %s", msg);
         }
+    } else if (strcmp(dir, "pragma") == 0) {
+        /* #pragma warning disable|restore <编号列表>（A382③）；未知 pragma
+         * 静默吞行（与 C# 一致）。编号 token 与 --suppress 同形：0003 / W0003 */
+        if (!pp_active(lex)) return pp_end_directive_line(lex, 0);
+        pp_skip_hspaces(lex);
+        char what[32]; pp_read_ident(lex, what, sizeof(what));
+        if (strcmp(what, "warning") != 0) return pp_end_directive_line(lex, 0);
+        pp_skip_hspaces(lex);
+        char act[16]; pp_read_ident(lex, act, sizeof(act));
+        int disable = strcmp(act, "disable") == 0;
+        int restore = strcmp(act, "restore") == 0;
+        if (!disable && !restore) return pp_end_directive_line(lex, 0);
+        zan_loc_t dloc = lexer_loc(lex);
+        int codes[64]; int nc = 0;
+        for (;;) {
+            pp_skip_hspaces(lex);
+            char c = lexer_peek_ch(lex);
+            if (lexer_at_end(lex) || c == '\n') break;
+            int code = 0, seen = 0;
+            while ((c >= '0' && c <= '9') || c == 'E' || c == 'e' ||
+                   c == 'W' || c == 'w') {
+                if (c >= '0' && c <= '9') { code = code * 10 + (c - '0'); seen = 1; }
+                lexer_advance(lex);
+                c = lexer_peek_ch(lex);
+            }
+            if (seen && nc < 64) codes[nc++] = code;
+            pp_skip_hspaces(lex);
+            if (lexer_peek_ch(lex) == ',') { lexer_advance(lex); continue; }
+            break;
+        }
+        zan_diag_pragma_warning(lex->diag, dloc, disable, codes, nc);
     }
     int honor_conditional =
         strcmp(dir, "if") == 0 || strcmp(dir, "ifdef") == 0 ||

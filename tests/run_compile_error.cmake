@@ -27,6 +27,14 @@ if(NOT compile_log MATCHES "${EXPECT_REGEX}")
   message(FATAL_ERROR
     "compiler failed without the expected diagnostic '${EXPECT_REGEX}':\n${compile_log}")
 endif()
+# 可选：断言某条诊断不出现（A382③ 抑制类用例：被 #pragma/--suppress 静默
+# 的告警不得出现在日志里）。留空则不检查。
+if(DEFINED EXPECT_REGEX_NOT)
+  if(compile_log MATCHES "${EXPECT_REGEX_NOT}")
+    message(FATAL_ERROR
+      "compiler log must not contain '${EXPECT_REGEX_NOT}' but does:\n${compile_log}")
+  endif()
+endif()
 # 可选：锁住错误条数。用来防"诊断点名了，但后面还跟着一串级联报错"——
 # 级联报错会把真正的原因淹没。留空则不检查条数。
 if(DEFINED EXPECT_ERROR_COUNT)

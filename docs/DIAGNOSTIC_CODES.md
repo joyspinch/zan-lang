@@ -23,6 +23,12 @@
   在格式化时拼前缀；`zan_diag_emit(...)` 是 code=0（不编号）的便捷入口。
 - 捕获模式（LSP）：编号随 `zan_diag_entry_t.code` 结构化携带，前缀只是打印层。
 - 前缀计入 512 字节消息缓冲，文案加号后仍受同一上限约束。
+- 级别开关（A382②）：`--warn-level none|default|error` 与
+  `--suppress=W0003,E0030`（按编号匹配，级别字母可省略）。
+- 源内局部抑制（A382③）：`#pragma warning disable 0003, W0030` 从所在行起
+  静默指定告警，`#pragma warning restore 0003` 恢复；disable 不带编号 = 通配
+  全部告警。区间按 file+line 半开判定，只作用于 WARNING 级；未知 pragma
+  静默吞行。自举侧 lexer 同样吞行（其诊断无编号过滤，语义本就分叉）。
 
 ## 0001–0999 语法/词法段（本段全部位于 C 前端）
 

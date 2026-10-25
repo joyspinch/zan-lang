@@ -23,6 +23,14 @@ typedef struct {
     char             message[512];
 } zan_diag_entry_t;
 
+/* #pragma warning disable/restore 记下的生效区间（A382③） */
+typedef struct {
+    int      code;       /* 0 = 通配所有告警 */
+    uint32_t file_id;
+    uint32_t from_line;  /* 指令所在行起（含） */
+    uint32_t to_line;    /* restore 行止（不含），UINT32_MAX = 开放到文件尾 */
+} zan_diag_pragma_range_t;
+
 struct zan_diag {
     int error_count;
     int warning_count;
@@ -42,6 +50,11 @@ struct zan_diag {
     int *suppress_codes;
     int  suppress_count;
     int  suppress_cap;
+    /* A382③：#pragma warning disable/restore 的区间抑制（按 file+line 判定，
+     * code=0 表示通配所有告警；仅作用于 WARNING 级，错误不受区间影响） */
+    zan_diag_pragma_range_t *pragma_ranges;
+    int  pragma_count;
+    int  pragma_cap;
     zan_diag_entry_t *entries;
     int               entry_count;
     int               entry_cap;
@@ -60,6 +73,10 @@ void zan_diag_set_deny_warnings(zan_diag_t *diag, bool enabled);
 void zan_diag_set_warn_level(zan_diag_t *diag, int level);
 /* 抑制指定编号的诊断（--suppress=W0003,E0030；按编号匹配，级别字母可省略） */
 void zan_diag_suppress_code(zan_diag_t *diag, int code);
+/* A382③：#pragma warning disable/restore。disable 在 loc 处开区间（无编号
+ * = 通配全部告警），restore 把当前行前开放的同码区间关到 loc.line（半开） */
+void zan_diag_pragma_warning(zan_diag_t *diag, zan_loc_t loc, int disable,
+                             const int *codes, int count);
 
 /* 诊断信息输出条数上限 */
 void zan_diag_set_max_errors(zan_diag_t *diag, int max_errors);
