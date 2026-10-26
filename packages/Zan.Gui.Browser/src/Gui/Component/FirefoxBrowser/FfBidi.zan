@@ -197,6 +197,87 @@ public class FfBidi {
         return true;
     }
 
+    // ---- Cookies（storage 模块）----------------------------------------
+
+    // 取当前分区的全部 Cookie，回复形如
+    // {cookies:[{name,value,domain,path,size,secure,httpOnly,sameSite,expiry}]}。
+    public JsonValue GetCookies() {
+        return this.Command("storage.getCookies", "{}", 10000);
+    }
+
+    // 写（或覆盖）一个 Cookie。expires 为 Unix 秒；<=0 表示会话 Cookie。
+    // 同名同域同路径再写一个已过期的 expires 即等于删除。
+    public bool SetCookie(string name, string value, string domain,
+                          string path, bool secure, bool httpOnly,
+                          string sameSite, long expires) {
+        JsonValue c = JsonValue.NewObject();
+        c.PutStr("name", name);
+        // 新版 BiDi 的 cookie.value 是 Bytes 结构：{type, value}。
+        JsonValue val = JsonValue.NewObject();
+        val.PutStr("type", "string");
+        val.PutStr("value", value);
+        c.Put("value", val);
+        if (domain != "") { c.PutStr("domain", domain); }
+        if (path != "") { c.PutStr("path", path); }
+        c.PutBool("secure", secure);
+        c.PutBool("httpOnly", httpOnly);
+        if (sameSite != "") { c.PutStr("sameSite", sameSite); }
+        if (expires > 0) { c.PutInt("expires", expires); }
+        JsonValue p = JsonValue.NewObject();
+        p.Put("cookie", c);
+        return this.Command("storage.setCookie", p.ToJson(), 10000) != null;
+    }
+
+    // 删一个页面域下的 Cookie（走 document.cookie 的 Max-Age=0 经典
+    // 语义）。storage.setCookie 的"过期重写"在这版 Firefox 上不删
+    // （实测原条目原地不动），所以删除只能借页面 JS。name/path 由
+    // 调用方保证不含单引号。
+    public bool DeletePageCookie(string context, string name, string path) {
+        JsonValue p = JsonValue.NewObject();
+        p.PutStr("expression",
+            "document.cookie = '" + name + "=; Max-Age=0; path=" + path + "'");
+        p.PutBool("awaitPromise", false);
+        JsonValue target = JsonValue.NewObject();
+        target.PutStr("context", context);
+        p.Put("target", target);
+        return this.Command("script.evaluate", p.ToJson(), 15000) != null;
+    }
+
+    // ---- 网络监听与拦截（network 模块）---------------------------------
+    // 监听不需要专门 API：session.subscribe 订阅
+    // network.beforeRequestSent / responseStarted / responseCompleted，
+    // 事件从 eventSink 流出。拦截用下面的三件套。
+
+    // 装请求拦截器，返回 intercept id（失败 ""）。phasesJson /
+    // urlPatternsJson 都是 JSON 数组文本，例如：
+    //   phases:  ["beforeRequestSent"]
+    //   patterns: [{"type":"pattern","hostname":"example.com"}]
+    // 注意 urlPattern 的 "string" 类型是精确匹配（不允许 * 通配），
+    // 通配要走 "pattern" 结构化类型。
+    public string AddIntercept(string phasesJson, string urlPatternsJson) {
+        JsonValue p = JsonValue.NewObject();
+        p.PutJson("phases", phasesJson);
+        p.PutJson("urlPatterns", urlPatternsJson);
+        JsonValue r = this.Command("network.addIntercept", p.ToJson(), 10000);
+        if (r == null) { return ""; }
+        JsonValue v = r.Get("intercept");
+        return v != null ? v.AsString("") : "";
+    }
+
+    // 放行一个被拦截的请求。
+    public bool ContinueRequest(string requestId) {
+        JsonValue p = JsonValue.NewObject();
+        p.PutStr("request", requestId);
+        return this.Command("network.continueRequest", p.ToJson(), 10000) != null;
+    }
+
+    // 摘掉拦截器。
+    public bool RemoveIntercept(string intercept) {
+        JsonValue p = JsonValue.NewObject();
+        p.PutStr("intercept", intercept);
+        return this.Command("network.removeIntercept", p.ToJson(), 10000) != null;
+    }
+
     // 结束会话并让 Firefox 退出（browser.close 是协议里的优雅关停）。
     public void Shutdown() {
         this.Command("browser.close", "{}", 10000);

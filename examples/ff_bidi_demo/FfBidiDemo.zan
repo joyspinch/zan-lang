@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Json;
 using System.IO;
 using Gui.Component.FirefoxBrowser;
 
@@ -21,6 +22,10 @@ using Gui.Component.FirefoxBrowser;
 public class FfBidiDemo {
     static int eventCount;
     static string lastEvent;
+    // 请求台账："方法 URL" / "URL -> 状态码"（network 事件里记）。
+    static List<string> requests;
+    // 拦截到的待放行请求 id。
+    static string pausedRequestId;
 
     static int Main() {
         string exe = FfHost.FindFirefoxExe();
@@ -84,10 +89,12 @@ public class FfBidiDemo {
         }
         Console.WriteLine("sessionId: " + bidi.sessionId);
 
-        // 2. 订阅事件（之后的所有进站事件都会打印）。
+        // 2. 订阅事件（含 network 模块：请求台账在 OnEvent 里记）。
         bidi.Subscribe("[\"browsingContext.domContentLoaded\","
             + "\"browsingContext.load\",\"log.entryAdded\","
-            + "\"script.message\"]");
+            + "\"script.message\",\"network.beforeRequestSent\","
+            + "\"network.responseStarted\",\"network.responseCompleted\"]");
+        FfBidiDemo.requests = new List<string>();
 
         // 3. 枚举浏览上下文。
         string ctx = bidi.TopContext();
@@ -116,7 +123,65 @@ public class FfBidiDemo {
         Console.WriteLine("事件：收到 " + eventCount + " 条"
             + (lastEvent != "" ? "（最后一条 " + lastEvent + "）" : ""));
 
-        // 7. 截图落盘。
+        // 7. Cookies：存 → 取 → 断言 → 删 → 断言消失。
+        bool setOk = bidi.SetCookie("zan_demo", "hello_bidi",
+            "example.com", "/", true, false, "lax", 0);
+        if (!setOk) {
+            Console.WriteLine("setCookie 失败：" + bidi.lastError);
+        }
+        JsonValue cookies = bidi.GetCookies();
+        string cookieJson = cookies != null ? cookies.ToJson() : "";
+        bool hasCookie = cookieJson.IndexOf("zan_demo") >= 0
+            && cookieJson.IndexOf("hello_bidi") >= 0;
+        Console.WriteLine("cookie set=" + setOk + " 读取含 zan_demo=" + hasCookie);
+        bool delOk = bidi.DeletePageCookie(ctx, "zan_demo", "/");
+        Console.WriteLine("cookie 删除调用=" + delOk);
+        JsonValue cookies2 = bidi.GetCookies();
+        bool cookieGone = cookies2 == null
+            || cookies2.ToJson().IndexOf("zan_demo") < 0;
+        Console.WriteLine("cookie 删除后已消失=" + cookieGone);
+
+        // 8. 请求监听断言：前面 navigate 期间 network 事件已流进台账。
+        int reqSeen = 0;
+        int resp200 = 0;
+        for (int i = 0; i < FfBidiDemo.requests.Count; i = i + 1) {
+            string line = FfBidiDemo.requests[i];
+            if (line.IndexOf("example.com") >= 0) {
+                if (line.IndexOf("-> ") >= 0) {
+                    if (line.IndexOf("-> 200") >= 0) { resp200 = resp200 + 1; }
+                } else {
+                    reqSeen = reqSeen + 1;
+                }
+            }
+        }
+        Console.WriteLine("请求监听：example.com 请求数=" + reqSeen
+            + " 200 响应数=" + resp200
+            + "（台账 " + FfBidiDemo.requests.Count + " 条）");
+
+        // 9. 拦截 + 放行（不参与 PASS 判定——老版本 Firefox 可能不支持）。
+        string intercept = bidi.AddIntercept("[\"beforeRequestSent\"]",
+            "[{\"type\":\"pattern\",\"hostname\":\"example.com\","
+            + "\"pathname\":\"/\"}]");
+        if (intercept != "") {
+            FfBidiDemo.requests.Clear();
+            bidi.Navigate(ctx, "https://example.com/");
+            bidi.Drain(500);
+            bool resumed = false;
+            if (FfBidiDemo.pausedRequestId != "") {
+                resumed = bidi.ContinueRequest(FfBidiDemo.pausedRequestId);
+            }
+            bidi.Drain(1500);
+            bidi.RemoveIntercept(intercept);
+            Console.WriteLine("拦截演示：装拦截器=" + (intercept != "")
+                + " 放行=" + resumed
+                + " 期间请求=" + FfBidiDemo.requests.Count + " 条");
+            FfBidiDemo.pausedRequestId = "";
+        } else {
+            Console.WriteLine("拦截演示：本版 Firefox 不支持（"
+                + bidi.lastError + "），跳过");
+        }
+
+        // 10. 截图落盘。
         string shot = Path_Getwd() + "ff_bidi_shot.png";
         bool shotOk = bidi.CaptureScreenshot(ctx, shot);
         long shotBytes = shotOk ? File.ReadAllBytes(shot).Length : 0 - 1;
@@ -125,7 +190,9 @@ public class FfBidiDemo {
         bool pass = title.IndexOf("Example") >= 0
             && url.IndexOf("example.com") >= 0
             && shotOk && shotBytes > 1000
-            && eventCount > 0;
+            && eventCount > 0
+            && setOk && hasCookie && cookieGone
+            && reqSeen > 0 && resp200 > 0;
         Console.WriteLine(pass ? "PASS" : "FAIL");
         return pass ? 0 : 7;
     }
@@ -133,7 +200,33 @@ public class FfBidiDemo {
     static void OnEvent(string method, string paramsJson) {
         eventCount = eventCount + 1;
         lastEvent = method;
-        Console.WriteLine("  [event] " + method);
+        JsonValue v = JsonValue.ParseOrStr(paramsJson);
+        JsonValue prms = v.Get("params");
+        if (method == "network.beforeRequestSent" && prms != null) {
+            JsonValue req = prms.Get("request");
+            if (req != null) {
+                JsonValue rid = req.Get("request");
+                JsonValue u = req.Get("url");
+                JsonValue m = req.Get("method");
+                string url = u != null ? u.AsString("") : "";
+                requests.Add((m != null ? m.AsString("") : "") + " " + url
+                    + " [" + (rid != null ? rid.AsString("") : "") + "]");
+                pausedRequestId = rid != null ? rid.AsString("") : "";
+            }
+        } else if (method == "network.responseCompleted" && prms != null) {
+            JsonValue resp = prms.Get("response");
+            if (resp != null) {
+                JsonValue u = resp.Get("url");
+                JsonValue st = resp.Get("status");
+                string url = u != null ? u.AsString("") : "";
+                long status = st != null ? st.AsInt(0) : 0;
+                requests.Add(url + " -> " + status);
+            }
+        }
+        // 控制台只打一行摘要；network 事件不逐条刷屏。
+        if (method.IndexOf("network.") != 0) {
+            Console.WriteLine("  [event] " + method);
+        }
     }
 
     // 当前工作目录（跨平台：Windows 用 \，其余用 /）。
