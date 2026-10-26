@@ -156,20 +156,37 @@
   报错）；`object.ToString()`/`Equals` 方法族**对任何接收者都还不存在**
   （纯类对象 `a.ToString()` 也 E3068，与装箱无关）——立 A558。
 
-### [ ] A558 System.Object 方法族：`object` 上无任何可调用成员——ToString/Equals/GetHashCode 连类接收者都绑不上
+### [x] A558 System.Object 方法族：`object` 上无任何可调用成员——ToString/Equals/GetHashCode 连类接收者都绑不上
 
-- 现象（2026-10-26，A556 装箱 v2 收尾时实测）：`object a = new Q();
-  a.ToString()` → **E3068**（no method matches）——`object` 类型的成员
-  访问没有任何解析目标，纯类接收者同样报错，与装箱无关。
-- 影响：C# 的 object 作为通用基底的体验（打印、相等比较、哈希）在 Zan
-  不可用；接口分派所需的身份 tag 机制已就绪（箱首字 = vtable，A556），
-  缺的是 object 虚方法槽位的定义与解析。
-- 方向（动手前先定口径）：Object 内建方法族（ToString/Equals/
-  GetHashCode/GetType）作为 TYPE_OBJECT 的成员表进入 checker 解析；
-  类的 override 按既有 vtable 槽位机制分发（get_virtual_method_index）；
-  箱按 A556 的 vptr 基座参与同一分派；结构体未重写时回落 object 缺省
-  （ToString 返回类型名，C# 同款）。注意与 A443 的内建 Convert.ToString
-  特判让路口径一致（精确匹配让路，其余形状走内建）。
+- **已闭环（2026-10-26）**：不走成员表（checker 解析），走 irgen 站内分派——
+  与接口分派同架构的**身份 tag 候选链**（`emit_object_family_call`，
+  irgen_call.c）：接收者首字读 tag（site 字高 32 位 = ZAN_STRING_TAG 判
+  字符串；否则取首字 vtable 指针），逐候选比对 `struct_types`（非泛型）
+  与 `generic_insts`（`get_vtable_global_inst` 特化表）的 vtable 全局，
+  命中即直呼该类最派生实现（`resolve_overload` 沿基类链走，override 生
+  效；结构体候选 this=载荷 +8，A556-2 基座）。字符串接收者：ToString 返
+  回自身（retain）、Equals 内容 strcmp（Zan 串 NUL 结尾，同
+  String.CompareOrdinal 口径）、GetHashCode djb2。缺省：ToString=分配点
+  描述符 tynames[0] 类型名（同 `is` 的描述符机制；无描述符回落 "object"）、
+  Equals 指针相等、GetHashCode (ptr>>4)*0x9E3779B9 截断 i32。推断侧
+  （irgen_expr_core.c）：接收者 OBJECT/INTERFACE/CLASS 且成员未声明时
+  ToString→string、Equals(1)→bool、GetHashCode()→int。**GetType 不做**
+  （需要 Type 对象表示，当日反射只到方法级——新立边界不挂账）。
+- 连带修复 **A556-4 装箱缺口**：`object x = new Sn{V=7}` 声明初始化把
+  栈临时裸存进 object 槽（后续 is/拆箱/释放全崩）。根因是
+  `emit_implicit_box` 的指针守卫把"值是指针"当"已是引用"——而 struct
+  NEW 的 emit_expr 产物正是栈临时地址（`coerce_struct_value` 注释记载的
+  同款形态错位，此前只在集合槽/字段/实参处修过）。修法：指针守卫放行
+  boxable 结构体 RHS（`emit_box_struct` 内部 `coerce_struct_value` 按值
+  取出）；并补**按节点去重**（`irgen_expr_was_boxed`）——同一条语句内
+  赋值总派发与字段捕获路径会先后两次到达，第二个箱不但泄漏第一个，还会
+  把箱首字 vtable 当字段 0 装进载荷（`struct_boxing_implicit` 回归当场
+  抓住）。
+- 验证：新用例 `object_family`（+det 孪生）：类覆写/缺省类型名/基类链
+  继承/箱参与（this=+8）/字符串接收者三件套/Equals 覆写经 object 接收者
+  命中/哈希稳定性，18 行金标准全对；`struct_boxing`、
+  `struct_boxing_implicit`、`struct_boxing_managed`、
+  `async_boxed_local_release` 孪生回归全绿；探针 leakcheck 干净。
 
 ### [x] A557 object 局部变量赋值不释放旧值（含 `= null`）——连带守卫异常泄漏
 

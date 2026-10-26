@@ -2012,6 +2012,35 @@ static zan_type_t *infer_expr_type_raw(zan_irgen_t *g, zan_ast_node_t *e,
                 zan_type_t *bot = infer_expr_type(g, callee->member.object, locals);
                 if (bot && bot->kind == TYPE_ARRAY) return g->binder->type_string;
             }
+            /* A558：Object 方法族推断——接收者是 object/接口/类且该类型
+             * 自身（含基类链/接口）未声明同名成员时：Equals(1)→bool、
+             * GetHashCode(0)→int。ToString(0) 由下方通用启发式覆盖
+             * （返回 string）。缺 Equals 覆写的声明时也不劫持：让普通
+             * 推断路径先走。 */
+            if (mm.len == 6 && memcmp(mm.str, "Equals", 6) == 0 &&
+                e->call.args.count == 1) {
+                zan_type_t *eot = infer_expr_type(g, callee->member.object, locals);
+                if (eot && (eot->kind == TYPE_OBJECT || eot->kind == TYPE_INTERFACE ||
+                            eot->kind == TYPE_CLASS)) {
+                    zan_symbol_t *osym = eot->sym;
+                    bool declared = osym && resolve_overload(osym, mm, 1, 0) != NULL;
+                    if (eot->kind == TYPE_INTERFACE && osym)
+                        declared = resolve_iface_overload(osym, mm, 1, 0) != NULL;
+                    if (!declared) return g->binder->type_bool;
+                }
+            }
+            if (mm.len == 11 && memcmp(mm.str, "GetHashCode", 11) == 0 &&
+                e->call.args.count == 0) {
+                zan_type_t *eot = infer_expr_type(g, callee->member.object, locals);
+                if (eot && (eot->kind == TYPE_OBJECT || eot->kind == TYPE_INTERFACE ||
+                            eot->kind == TYPE_CLASS)) {
+                    zan_symbol_t *osym = eot->sym;
+                    bool declared = osym && resolve_overload(osym, mm, 0, 0) != NULL;
+                    if (eot->kind == TYPE_INTERFACE && osym)
+                        declared = resolve_iface_overload(osym, mm, 0, 0) != NULL;
+                    if (!declared) return g->binder->type_int;
+                }
+            }
             /* string 实例方法启发式——char/Char 的静态类（char.ToUpper 等，
              * A525）成员名与之相撞（ToUpper/ToLower），先跳过让它落到
              * 下面的静态内建分支按 Char 表解析。 */

@@ -5467,9 +5467,20 @@ static LLVMValueRef emit_implicit_box(zan_irgen_t *g, zan_type_t *lt,
                                       local_scope_t *locals) {
     if (!val || !lt || !rhs) return val;
     if (lt->kind != TYPE_OBJECT && lt->kind != TYPE_INTERFACE) return val;
-    if (LLVMGetTypeKind(LLVMTypeOf(val)) == LLVMPointerTypeKind) return val;
+    /* 同一 RHS 节点在一条语句内会经多条存储路径到达这里（赋值总派发
+     * 已装箱，字段/槽位捕获再走一次）：箱按节点登记去重，第二个箱不但
+     * 泄漏第一个，还会把箱首字 vtable 当字段 0 装进载荷。 */
+    if (irgen_expr_was_boxed(g, rhs)) return val;
     zan_type_t *st = infer_expr_type(g, rhs, locals);
-    if (!st || st->kind != TYPE_STRUCT || !irgen_boxed_eligible_struct(g, st))
+    bool boxable = st && st->kind == TYPE_STRUCT &&
+        irgen_boxed_eligible_struct(g, st);
+    /* 指针形值一般是引用形状（类/串/数组/集合），无需装箱；唯一例外是
+     * 构造临时：new T{...} 的 emit_expr 结果是栈临时地址而不是已装箱
+     * 引用，放行会让栈指针存进 object 槽（A556-4），必须交给
+     * emit_box_struct 按值取出后再装箱。 */
+    if (LLVMGetTypeKind(LLVMTypeOf(val)) == LLVMPointerTypeKind && !boxable)
+        return val;
+    if (!boxable)
         return val;
     irgen_note_boxed_expr(g, rhs);
     return emit_box_struct(g, st, rhs, val, locals);
