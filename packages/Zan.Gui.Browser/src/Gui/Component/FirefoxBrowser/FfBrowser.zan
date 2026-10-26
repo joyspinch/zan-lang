@@ -1,0 +1,394 @@
+using System;
+using System.Json;
+using System.Threading;
+using Gui;
+
+namespace Gui.Component.FirefoxBrowser;
+
+// 内嵌的 Firefox 浏览器视图。与 CefBrowser（进程内 CEF）、WebView
+// （系统引擎）并立的第三个浏览器家族：拉起真正的 Firefox 子进程，
+// 把它的原生窗口寄宿进宿主窗口（Windows SetParent / Linux
+// XReparentWindow / macOS AX 浮窗锁定），导航/标题/JS 走 Firefox 内置
+// 的 Marionette 协议（<see cref="FfMarionette"/>）。
+// 原生窗口由每帧驱动（和 CefBrowser 一致）：
+//   web.NavComplete += () => { ... };
+//   // 每帧，针对可见面板：
+//   web.Render(app, x, y, w, h);
+//   // 每帧，针对隐藏面板：
+//   web.Hide();
+// 启动在第一次 Render 时发生（子进程拉起 + 窗口寄宿要几秒，期间画
+// 占位符）；失败后 IsSupported() 为 false，Render 持续画占位符说明
+// 原因，不会崩。
+public class FfBrowser : IDisposable {
+    #if WINDOWS
+    // 键盘焦点交接走 Win32（与 CefBrowser 同一套问题：子窗口一拿焦点
+    // 宿主就收不到 WM_CHAR，界面上自己的输入框就没法打字了）。
+    [DllImport("user32", EntryPoint = "SetFocus")]
+    public static extern nint Win32SetFocus(nint hwnd);
+    [DllImport("user32", EntryPoint = "GetFocus")]
+    public static extern nint Win32GetFocus();
+    #endif
+
+    public FfInstance inst;  // 进程状态（首次 Render 时创建）
+    public bool created;     // 已尝试启动
+    public bool supported;   // 寄宿就绪（state==1）
+    public string pendingUrl;  // 启动完成前请求的导航
+
+    bool lastSeenLoading;
+    string lastSeenTitle;
+    int lastX;
+    int lastY;
+    int lastW;
+    int lastH;
+    bool guiHadFocus;
+
+    public SignalString url;
+    public SignalString title;
+
+    // 主框架开始加载时触发。
+    public UiEvent NavStart;
+    // 导航完成（或失败）时触发，即当前 URL/标题可能已变化。
+    public UiEvent NavComplete;
+    // 文档标题变化时触发。
+    public UiEvent TitleChanged;
+    // 加载开始或结束时触发（IsLoading() 指示是哪种）。
+    public UiEvent LoadingChanged;
+
+    // 全默认状态：未启动、乐观地假定可用。
+    public FfBrowser() {
+        this.inst = null;
+        this.created = false;
+        this.supported = true;
+        this.pendingUrl = "";
+        this.lastSeenLoading = false;
+        this.lastSeenTitle = "";
+        this.lastX = 0;
+        this.lastY = 0;
+        this.lastW = 0;
+        this.lastH = 0;
+        this.guiHadFocus = false;
+        this.url = new SignalString("");
+        this.title = new SignalString("");
+        this.NavComplete = new UiEvent();
+        this.NavStart = new UiEvent();
+        this.TitleChanged = new UiEvent();
+        this.LoadingChanged = new UiEvent();
+    }
+
+    // 就绪（Firefox 已寄宿且 Marionette 已连上）时为 true。首帧之前
+    // 乐观 true——启动发生在第一次 Render。
+    public bool IsSupported() { return this.supported; }
+
+    // 响应式当前 URL/文档标题（轮询更新，与 Marionette 轮询同拍）。
+    public SignalString Url() { return this.url; }
+    public SignalString Title() { return this.title; }
+    // 当前 URL 的字符串形式。
+    public string CurrentUrl() { return this.url.Get(); }
+    // 当前文档标题的字符串形式。
+    public string CurrentTitle() { return this.title.Get(); }
+
+    // 第一次 Render 时启动：建 FfInstance、挂宿主窗口、起工作线程。
+    // pendingUrl 已经是启动参数的一部分（--new-window），之后到达的
+    // 导航走命令队列。
+    void EnsureStarted(App app) {
+        if (this.created) { return; }
+        this.created = true;
+        FfInstance inst = new FfInstance();
+        inst.parentWindow = app.window.GetHandle();
+        inst.startUrl = this.pendingUrl == "" ? "about:blank" : this.pendingUrl;
+        this.pendingUrl = "";
+        this.inst = inst;
+        Thread.Start(() => { FfHost.RunWorker(inst); });
+    }
+
+    // 导航到 URL。无协议的裸主机名视为 https://。启动完成前只挂起，
+    // 由命令队列在就绪后执行。
+    public void Navigate(string target) {
+        string u = FfBrowser.Normalize(target);
+        if (this.inst == null || this.inst.state == 0) {
+            this.pendingUrl = u;
+            return;
+        }
+        this.inst.commands.Enqueue("nav|" + u);
+    }
+
+    // 加载内存中的 HTML 字符串（走 data: URL）。
+    public void LoadHtml(string html) {
+        this.Navigate("data:text/html;charset=utf-8," + FfBrowser.UrlEscape(html));
+    }
+
+    // 历史后退一页（未就绪为空操作，下同）。
+    public void Back() {
+        if (this.Ready()) { this.inst.commands.Enqueue("back"); }
+    }
+
+    // 历史前进一页。
+    public void Forward() {
+        if (this.Ready()) { this.inst.commands.Enqueue("fwd"); }
+    }
+
+    // 重新加载当前页。
+    public void Reload() {
+        if (this.Ready()) { this.inst.commands.Enqueue("reload"); }
+    }
+
+    // 停止当前加载：Marionette 没有对应命令，空操作（页面加载通常
+    // 很快；保留 API 形状与 CefBrowser 对齐）。
+    public void Stop() { }
+
+    // 能否后退（按 history.length>1 估算，每 2 秒刷新一次）。
+    public bool CanGoBack() {
+        if (!this.Ready()) { return false; }
+        Mutex.Lock(this.inst.lockHandle);
+        bool v = this.inst.canBack;
+        Mutex.Unlock(this.inst.lockHandle);
+        return v;
+    }
+
+    // 能否前进：Marionette 没有廉价查询，v1 一律 false。
+    public bool CanGoForward() { return false; }
+
+    // 是否正在加载。
+    public bool IsLoading() {
+        if (!this.Ready()) { return false; }
+        Mutex.Lock(this.inst.lockHandle);
+        bool v = this.inst.loading;
+        Mutex.Unlock(this.inst.lockHandle);
+        return v;
+    }
+
+    // 最近一次主框架响应的 HTTP 状态码：Marionette 基础命令拿不到，
+    // 恒为 0（v1）。
+    public int LastStatus() { return 0; }
+
+    // 在页面里执行 JavaScript（不取返回值；要结果用
+    // ExecuteScript 后续版本扩展）。
+    public void ExecuteJs(string code) {
+        if (this.Ready()) { this.inst.commands.Enqueue("js|" + code); }
+    }
+
+    // 键盘焦点交给/收回浏览器。
+    public void SetFocus(bool focus) {
+        #if WINDOWS
+        if (this.inst != null && this.inst.child != 0 && focus) {
+            FfBrowser.Win32SetFocus(this.inst.child);
+        }
+        #elif MACOS
+        if (focus) { FfHostMac.Raise(); }
+        #else
+        if (this.inst != null && this.inst.child != 0 && focus) {
+            FfHostX11.SetFocusTo(FfHostX11.disp, this.inst.child, true);
+        }
+        #endif
+    }
+
+    // 隐藏原生浏览器（对不在屏幕上的标签/面板调用；Windows/Linux 由
+    // NativeLayer 未登记时兜底隐藏，macOS 这里把浮窗移出屏幕）。
+    public void Hide() {
+        #if MACOS
+        if (this.Ready()) { FfHostMac.ApplyClip(0, ""); }
+        #endif
+    }
+
+    // 关闭浏览器：置 disposed 让工作线程走收尾（礼貌关窗 + 超时强杀），
+    // 并把原生层从遮挡体系里摘掉。销毁后不要再 Render 本对象。
+    public void Destroy() {
+        if (this.inst != null) {
+            this.inst.disposed = true;
+            #if WINDOWS
+            if (this.inst.child != 0) {
+                NativeLayer.Forget((int)this.inst.child);
+            }
+            #endif
+            #if LINUX
+            if (this.inst.child != 0) {
+                NativeLayer.Forget((int)this.inst.child);
+            }
+            #endif
+        }
+        this.created = false;
+        this.supported = false;
+    }
+
+    public void Dispose() {
+        this.Destroy();
+    }
+
+    bool Ready() {
+        return this.inst != null && this.inst.state == 1 && !this.inst.disposed;
+    }
+
+    // 每帧驱动：同步边界、登记原生层（弹层裁剪）、从快照 diff 出
+    // 事件。启动中画「正在启动」，失败画原因。
+    public int Render(App app, int x, int y, int w, int h) {
+        this.EnsureStarted(app);
+        if (this.inst == null || this.inst.state == 0) {
+            FfBrowser.PaintPlaceholder(app, x, y, w, h);
+            app.RequestAnimationFrameIn(120, x, y, w, h);
+            return 0;
+        }
+        if (this.inst.state == 2) {
+            FfBrowser.PaintPlaceholder(app, x, y, w, h);
+            return 0;
+        }
+        // ---- 就绪：同步边界与遮挡 --------------------------------
+        bool boundsChanged = x != this.lastX || y != this.lastY
+            || w != this.lastW || h != this.lastH;
+        #if WINDOWS
+        if (boundsChanged && this.inst.child != 0) {
+            FfHostWin.SetBounds(this.inst.child, x, y, w, h);
+        }
+        if (this.inst.child != 0) {
+            NativeLayer.Register(app, (int)this.inst.child, x, y, w, h,
+                                 FfHostWin.ApplyClip);
+        }
+        this.SyncFocus(app);
+        #elif MACOS
+        this.inst.canvasW = w;
+        this.inst.canvasH = h;
+        FfHostMac.SetBounds(x, y, w, h);
+        #else
+        if (boundsChanged && this.inst.child != 0 && FfHostX11.disp != 0) {
+            FfHostX11.SetBounds(FfHostX11.disp, this.inst.child, x, y, w, h);
+        }
+        if (this.inst.child != 0) {
+            NativeLayer.Register(app, (int)this.inst.child, x, y, w, h,
+                                 FfHostX11.ApplyClip);
+        }
+        #endif
+        this.lastX = x;
+        this.lastY = y;
+        this.lastW = w;
+        this.lastH = h;
+        // ---- 快照 diff 出事件 --------------------------------------
+        Mutex.Lock(this.inst.lockHandle);
+        string curUrl = this.inst.curUrl;
+        string curTitle = this.inst.curTitle;
+        bool busy = this.inst.loading;
+        Mutex.Unlock(this.inst.lockHandle);
+        bool dirty = false;
+        if (busy != this.lastSeenLoading) {
+            this.lastSeenLoading = busy;
+            if (busy) { this.NavStart.Raise(); }
+            this.LoadingChanged.Raise();
+            dirty = true;
+        }
+        if (curUrl != this.url.Get()) {
+            this.url.Set(curUrl);
+            this.title.Set(curTitle);
+            this.NavComplete.Raise();
+            dirty = true;
+        }
+        if (curTitle != this.lastSeenTitle) {
+            this.lastSeenTitle = curTitle;
+            this.title.Set(curTitle);
+            this.TitleChanged.Raise();
+            dirty = true;
+        }
+        if (dirty) { app.RequestRedraw(); }
+        // 状态靠轮询（worker 200ms 一拍），这里保持画面节拍即可。
+        int next = 30;
+        if (busy) { next = 8; }
+        app.RequestAnimationFrameIn(next, x, y, w, h);
+        return 1;
+    }
+
+    // 每帧跟随界面焦点（Windows）：界面上有控件拿到键盘焦点（如
+    // 地址栏）时把 Win32 焦点搬回宿主窗口；焦点清掉时交还 Firefox。
+    // 只在切换沿动作，页面里的点击照旧把焦点拿回去。
+    void SyncFocus(App app) {
+        #if WINDOWS
+        if (this.inst == null || this.inst.child == 0) { return; }
+        bool gui = app.focus.focusedId >= 0;
+        if (gui != this.guiHadFocus) {
+            this.guiHadFocus = gui;
+            if (gui) {
+                FfBrowser.Win32SetFocus(app.window.GetHandle());
+            } else {
+                FfBrowser.Win32SetFocus(this.inst.child);
+            }
+        }
+        if (!gui && FfBrowser.Win32GetFocus() != this.inst.child) {
+            FfBrowser.Win32SetFocus(this.inst.child);
+        }
+        #endif
+    }
+
+    // 启动中/失败时的画布内占位：图标加一行说明文字。
+    public static void PaintPlaceholder(App app, int x, int y, int w, int h) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        StyleBox s = Style.Part(app, "ff", "placeholder", "", "",
+        "", Style.SNormal());
+        StyleBox icon = Style.Part(app, "ff", "icon", "", "",
+        "", Style.SNormal());
+        StyleBox label = Style.Part(app, "ff", "label", "", "",
+        "", Style.SNormal());
+        c.FillRect(x, y, w, h, s.BgOr(0));
+        c.DrawRect(x, y, w, h, s.BorderOr(0), t.borderWidth);
+        c.DrawGlyphIn("globe", x, y - app.Scale(28), w, h, t.iconSizeLarge,
+        icon.FgOr(0));
+        c.DrawTextCentered(x, y + app.Scale(18), w, h,
+        FfBrowser.PlaceholderText(), label.FgOr(0), Style.FontFallback(app, "medium"));
+    }
+
+    // 占位符文案：失败给原因；启动中给等待提示。
+    public static string PlaceholderText() {
+        string err = FfHost.Error();
+        if (err != "") { return err; }
+        return "Firefox 启动中…（首次冷启动需要几秒）";
+    }
+
+    // 导航目标补全：没有协议前缀的裸地址加 `https://`。
+    public static string Normalize(string target) {
+        if (target == "") { return ""; }
+        if (FfBrowser.HasScheme(target)) { return target; }
+        return "https://" + target;
+    }
+
+    // 是否带协议前缀（"://"，或 data:/about: 这类无 // 的 scheme）。
+    public static bool HasScheme(string s) {
+        int n = s.Length;
+        for (int i = 0; i + 2 < n; i = i + 1) {
+            if (s[i] == ':' && s[i + 1] == '/' && s[i + 2] == '/') { return true; }
+        }
+        if (s.StartsWith("data:")) { return true; }
+        if (s.StartsWith("about:")) { return true; }
+        return false;
+    }
+
+    // data: URL 里必须转义的字符（其余按 UTF-8 原样传，Firefox 接受）。
+    public static string UrlEscape(string s) {
+        if (s == null) { return ""; }
+        int len = s.Length;
+        bool hasBad = false;
+        for (int j = 0; j < len; j = j + 1) {
+            int c = s[j] & 255;
+            if (c == 35 || c == 37 || c == 38 || c == 63 || c == 32) {
+                hasBad = true;
+                break;
+            }
+        }
+        if (!hasBad) { return s; }
+        StringBuilder sb = new StringBuilder();
+        int start = 0;
+        for (int i = 0; i < len; i = i + 1) {
+            int c = s[i] & 255;
+            if (c == 35 || c == 37 || c == 38 || c == 63 || c == 32) {
+                if (i > start) {
+                    sb.Append(s.Substring(start, i - start));
+                }
+                if (c == 35) { sb.Append("%23"); }
+                else if (c == 37) { sb.Append("%25"); }
+                else if (c == 38) { sb.Append("%26"); }
+                else if (c == 63) { sb.Append("%3F"); }
+                else { sb.Append("%20"); }
+                start = i + 1;
+            }
+        }
+        if (start < len) {
+            sb.Append(s.Substring(start, len - start));
+        }
+        return sb.ToString();
+    }
+}

@@ -1,0 +1,386 @@
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+
+namespace Gui.Component.FirefoxBrowser;
+
+// macOS 宿主后端（实验性）：AppKit 不允许把另一个进程的窗口装进自己的
+// 视图树（没有 SetParent/XReparentWindow 的等价物），这里用辅助功能
+// （Accessibility）API 把 Firefox 窗口「悬浮锁定」在宿主窗口的控件
+// 区域上方：按宿主窗口在屏幕上的位置实时改写 Firefox 窗口的
+// AXPosition/AXSize，拖动宿主窗口时 Firefox 跟随（有轻微延迟）。
+// 首次使用需要用户在系统设置里给宿主程序授予「辅助功能」权限。
+// 火狐窗口的标题栏（红绿灯）是 AppKit 画的，跨进程去不掉——这是
+// 本方案与真嵌入的可见差距。
+public class FfHostMac {
+    public static bool probed;
+    public static bool ok;
+    public static string probeError;
+
+    public static FfCopyValueFn pCopyAttr;
+    public static FfSetValueFn pSetAttr;
+    public static FfCreateApplicationFn pCreateApplication;
+    public static FfIsTrustedFn pIsTrusted;
+    public static FfValueCreateFn pValueCreate;
+    public static FfPerformActionFn pPerformAction;
+    public static FfCFStringFn pCFStringCreate;
+    public static FfCFDictGetFn pCFDictGet;
+    public static FfCFArrayCountFn pCFArrayCount;
+    public static FfCFArrayGetFn pCFArrayGet;
+    public static FfCFNumGetFn pCFNumGet;
+    public static FfCFReleaseFn pCFRelease;
+    public static FfMsgSendFn pMsgSendLong;
+    public static FfCGListCopyFn pCGListCopy;
+    public static FfPixHighFn pPixHigh;
+
+    public delegate nint FfCopyValueFn(nint el, nint attr, nint result);
+    public delegate int FfSetValueFn(nint el, nint attr, nint value);
+    public delegate nint FfCreateApplicationFn(int pid);
+    public delegate int FfIsTrustedFn(nint options);
+    public delegate nint FfValueCreateFn(int type, nint value);
+    public delegate int FfPerformActionFn(nint el, nint action);
+    public delegate nint FfCFStringFn(nint alloc, string cstr, int encoding);
+    public delegate nint FfCFDictGetFn(nint dict, nint key);
+    public delegate long FfCFArrayCountFn(nint array);
+    public delegate nint FfCFArrayGetFn(nint array, long idx);
+    public delegate int FfCFNumGetFn(nint num, int type, nint outPtr);
+    public delegate void FfCFReleaseFn(nint cf);
+    public delegate long FfMsgSendFn(nint receiver, nint sel);
+    public delegate nint FfCGListCopyFn(int option, nint windowId);
+    public delegate int FfPixHighFn(nint display);
+
+    // AXValue 类型：CGPoint=1，CGSize=2。
+    public const int AXPoint = 1;
+    public const int AXSize = 2;
+    public const int CFNumFloat64 = 6;
+    public const int CFUtf8 = 0x08000100;
+
+    // 运行态：Firefox 的 AX 元素与 pid，宿主窗口在屏幕上的 frame
+    // （CG 坐标，top-left 原点，单位 point）与画布缩放比。
+    public static nint appEl;
+    public static nint winEl;
+    public static int ffPid;
+    public static double hostX;
+    public static double hostY;
+    public static double hostW;
+    public static double scale = 1.0;
+
+    // 懒解析框架符号；失败时 probeError 说明原因。
+    public static bool Ensure() {
+        if (FfHostMac.probed) { return FfHostMac.ok; }
+        FfHostMac.probed = true;
+        FfHostMac.ok = false;
+        nint cf = Interop.Load("/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation");
+        nint his = Interop.Load("/System/Library/Frameworks/ApplicationServices.framework/ApplicationServices");
+        nint cg = Interop.Load("/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics");
+        nint objc = Interop.Load("/usr/lib/libobjc.dylib");
+        if (cf == 0 || his == 0 || cg == 0 || objc == 0) {
+            FfHostMac.probeError = "系统框架加载失败：" + Interop.lastError;
+            return false;
+        }
+        FfHostMac.pCFStringCreate = (FfCFStringFn)Interop.Symbol(cf, "CFStringCreateWithCString");
+        FfHostMac.pCFDictGet = (FfCFDictGetFn)Interop.Symbol(cf, "CFDictionaryGetValue");
+        FfHostMac.pCFArrayCount = (FfCFArrayCountFn)Interop.Symbol(cf, "CFArrayGetCount");
+        FfHostMac.pCFArrayGet = (FfCFArrayGetFn)Interop.Symbol(cf, "CFArrayGetValueAtIndex");
+        FfHostMac.pCFNumGet = (FfCFNumGetFn)Interop.Symbol(cf, "CFNumberGetValue");
+        FfHostMac.pCFRelease = (FfCFReleaseFn)Interop.Symbol(cf, "CFRelease");
+        FfHostMac.pCopyAttr = (FfCopyValueFn)Interop.Symbol(his, "AXUIElementCopyAttributeValue");
+        FfHostMac.pSetAttr = (FfSetValueFn)Interop.Symbol(his, "AXUIElementSetAttributeValue");
+        FfHostMac.pCreateApplication = (FfCreateApplicationFn)Interop.Symbol(his, "AXUIElementCreateApplication");
+        FfHostMac.pIsTrusted = (FfIsTrustedFn)Interop.Symbol(his, "AXIsProcessTrustedWithOptions");
+        FfHostMac.pValueCreate = (FfValueCreateFn)Interop.Symbol(his, "AXValueCreate");
+        FfHostMac.pPerformAction = (FfPerformActionFn)Interop.Symbol(his, "AXUIElementPerformAction");
+        FfHostMac.pMsgSendLong = (FfMsgSendFn)Interop.Symbol(objc, "objc_msgSend");
+        FfHostMac.pCGListCopy = (FfCGListCopyFn)Interop.Symbol(cg, "CGWindowListCopyWindowInfo");
+        FfHostMac.pPixHigh = (FfPixHighFn)Interop.Symbol(cg, "CGDisplayPixelsHigh");
+        if (FfHostMac.pCopyAttr == null || FfHostMac.pSetAttr == null
+                || FfHostMac.pCreateApplication == null
+                || FfHostMac.pValueCreate == null || FfHostMac.pCFStringCreate == null
+                || FfHostMac.pCFDictGet == null || FfHostMac.pMsgSendLong == null) {
+            FfHostMac.probeError = "AX/HIServices 缺少必需符号";
+            return false;
+        }
+        FfHostMac.ok = true;
+        return true;
+    }
+
+    // 常用 CF 键的进程级缓存（CF 对象不归 ARC 管，静态键只建一次）。
+    static Dict<string, nint> cfKeys = new Dict<string, nint>();
+
+    static nint CFStr(string s) {
+        nint cached = FfHostMac.cfKeys.Get(s);
+        if (cached != 0) { return cached; }
+        nint made = FfHostMac.pCFStringCreate(0, s, FfHostMac.CFUtf8);
+        FfHostMac.cfKeys.Put(s, made);
+        return made;
+    }
+
+    // 辅助功能权限：notTrusted=true 时弹系统授权引导（只提示一次，
+    // 用户授权后要重启宿主程序才生效——AX 权限是按进程签发的）。
+    public static bool EnsureTrusted(bool prompt) {
+        if (!FfHostMac.Ensure()) { return false; }
+        if (FfHostMac.pIsTrusted == null) { return true; }
+        if (FfHostMac.pIsTrusted(0) != 0) { return true; }
+        if (prompt) {
+            nint key = FfHostMac.CFStr("AXTrustedCheckOptionPrompt");
+            nint dict = 0;
+            nint cf = Interop.Load("/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation");
+            nint pDictCreate = Interop.Symbol(cf, "CFDictionaryCreateMutable");
+            nint pDictSet = Interop.Symbol(cf, "CFDictionarySetValue");
+            nint pBoolTrue = Interop.Symbol(cf, "kCFBooleanTrue");
+            if (key != 0 && pDictCreate != 0 && pDictSet != 0 && pBoolTrue != 0) {
+                FfDictCreateFn create = (FfDictCreateFn)pDictCreate;
+                FfDictSetFn setv = (FfDictSetFn)pDictSet;
+                dict = create(0, 0, 0, 0);
+                if (dict != 0) {
+                    setv(dict, key, pBoolTrue);
+                    FfHostMac.pIsTrusted(dict);  // 弹系统授权对话框。
+                }
+            }
+        }
+        FfHostMac.probeError = "需要在 系统设置 → 隐私与安全性 → 辅助功能 "
+            + "里授权本程序，授权后重启程序生效";
+        return false;
+    }
+
+    public delegate nint FfDictCreateFn(nint alloc, long capacity,
+        nint keys, nint values, nint callbacks);
+    public delegate void FfDictSetFn(nint dict, nint key, nint value);
+
+    // 用 ps 扫出命令行里带 profileDir 的 Firefox 进程（派生 API 拿不到
+    // 直接 pid；命令行匹配专属 profile 路径足够可靠）。
+    public static int FindPidByProfile(string profileDir) {
+        ProcessResult r = Process.CaptureSafe("/bin/ps",
+            new List<string>(new string[] { "-axo", "pid=,command=" }));
+        for (int i = 0; i < r.lines.Count; i = i + 1) {
+            string line = r.lines[i];
+            if (line.IndexOf(profileDir) < 0) { continue; }
+            if (line.IndexOf("Firefox") < 0 && line.IndexOf("firefox") < 0) {
+                continue;
+            }
+            int sp = line.IndexOf(" ");
+            if (sp <= 0) { continue; }
+            int pid = line.Substring(0, sp).Trim().ToInt32();
+            if (pid > 1) { return pid; }
+        }
+        return 0;
+    }
+
+    // 附着到 Firefox 进程的第一个窗口。成功后静态字段 appEl/winEl/ffPid
+    // 就绪，之后 SetBounds/ApplyClip 都基于它们。
+    public static bool Attach(int pid) {
+        if (!FfHostMac.EnsureTrusted(true)) { return false; }
+        FfHostMac.ffPid = pid;
+        FfHostMac.appEl = FfHostMac.pCreateApplication(pid);
+        if (FfHostMac.appEl == 0) {
+            FfHostMac.probeError = "AXUIElementCreateApplication 失败";
+            return false;
+        }
+        return FfHostMac.AdoptWindow();
+    }
+
+    // 从 AXWindows 里取第一个窗口。
+    static bool AdoptWindow() {
+        nint key = FfHostMac.CFStr("AXWindows");
+        nint outPtr = NativeMemory.Alloc(8);
+        int rc = FfHostMac.pCopyAttr(FfHostMac.appEl, key, outPtr);
+        if (rc != 0) {
+            NativeMemory.Free(outPtr);
+            FfHostMac.probeError = "AXWindows 读取失败（错误码 " + rc + "）";
+            return false;
+        }
+        nint arr = (nint)new Span<long>(outPtr, 1)[0];
+        NativeMemory.Free(outPtr);
+        if (arr == 0 || FfHostMac.pCFArrayCount(arr) < 1) {
+            FfHostMac.probeError = "Firefox 还没有可用的窗口";
+            return false;
+        }
+        FfHostMac.winEl = FfHostMac.pCFArrayGet(arr, 0);
+        return FfHostMac.winEl != 0;
+    }
+
+    // 刷新宿主窗口在屏幕上的 frame（CG 坐标，point）。hostWindow 是
+    // Zan Gui 的 NSWindow*。画布尺寸用来求 point→canvas 缩放比。
+    public static bool RefreshHostFrame(nint hostWindow, int canvasW, int canvasH) {
+        if (!FfHostMac.Ensure()) { return false; }
+        if (FfHostMac.pMsgSendLong == null || FfHostMac.pCGListCopy == null) {
+            return false;
+        }
+        // [window windowNumber] —— 标量返回，objc_msgSend 直呼。
+        nint cls = FfHostMac.ObjcGetClass("NSWindow");
+        nint sel = FfHostMac.ObjcSel("windowNumber");
+        if (cls == 0 || sel == 0) { return false; }
+        long winNum = FfHostMac.pMsgSendLong(hostWindow, sel);
+        if (winNum <= 0) { return false; }
+        // kCGWindowListOptionAll = 0（要包含被其他窗口盖住的状态——
+        // 我们的宿主自己可能暂时不在最前）。
+        nint list = FfHostMac.pCGListCopy(0, 0);
+        if (list == 0) { return false; }
+        long n = FfHostMac.pCFArrayCount(list);
+        bool found = false;
+        for (long i = 0; i < n; i = i + 1) {
+            nint dict = FfHostMac.pCFArrayGet(list, i);
+            if (dict == 0) { continue; }
+            nint numKey = FfHostMac.CFStr("kCGWindowNumber");
+            nint numVal = FfHostMac.pCFDictGet(dict, numKey);
+            if (numVal == 0) { continue; }
+            nint numBuf = NativeMemory.Alloc(8);
+            FfHostMac.pCFNumGet(numVal, FfHostMac.CFNumFloat64, numBuf);
+            long thisNum = (long)new Span<double>(numBuf, 1)[0];
+            NativeMemory.Free(numBuf);
+            if (thisNum != winNum) { continue; }
+            nint bKey = FfHostMac.CFStr("kCGWindowBounds");
+            nint bounds = FfHostMac.pCFDictGet(dict, bKey);
+            if (bounds == 0) { continue; }
+            double x = FfHostMac.DictNum(bounds, "X");
+            double y = FfHostMac.DictNum(bounds, "Y");
+            double w = FfHostMac.DictNum(bounds, "Width");
+            double h = FfHostMac.DictNum(bounds, "Height");
+            if (w <= 0 || h <= 0) { continue; }
+            FfHostMac.hostX = x;
+            FfHostMac.hostY = y;
+            FfHostMac.hostW = w;
+            // 画布物理像素 → point 的缩放比（Retina 为 2）。
+            if (canvasW > 0) { FfHostMac.scale = canvasW / w; }
+            found = true;
+            break;
+        }
+        FfHostMac.pCFRelease(list);
+        return found;
+    }
+
+    static nint objcClass;
+    static nint objcMsg;
+    static bool objcProbed;
+
+    static nint ObjcGetClass(string name) {
+        if (!FfHostMac.objcProbed) {
+            FfHostMac.objcProbed = true;
+            nint lib = Interop.Load("/usr/lib/libobjc.dylib");
+            if (lib != 0) {
+                FfHostMac.objcClass = Interop.Symbol(lib, "objc_getClass");
+                FfHostMac.objcMsg = Interop.Symbol(lib, "sel_getUid");
+            }
+        }
+        if (FfHostMac.objcClass == 0 || FfHostMac.objcMsg == 0) { return 0; }
+        FfObjcClassFn f = (FfObjcClassFn)FfHostMac.objcClass;
+        return f(name);
+    }
+
+    static nint ObjcSel(string name) {
+        if (FfHostMac.objcMsg == 0) { return 0; }
+        FfObjcSelFn f = (FfObjcSelFn)FfHostMac.objcMsg;
+        return f(name);
+    }
+
+    public delegate nint FfObjcClassFn(string name);
+    public delegate nint FfObjcSelFn(string name);
+
+    // 从 CFDictionary 里读一个 double 值。
+    static double DictNum(nint dict, string key) {
+        nint k = FfHostMac.CFStr(key);
+        nint v = FfHostMac.pCFDictGet(dict, k);
+        if (v == 0) { return 0; }
+        nint buf = NativeMemory.Alloc(8);
+        FfHostMac.pCFNumGet(v, FfHostMac.CFNumFloat64, buf);
+        double val = new Span<double>(buf, 1)[0];
+        NativeMemory.Free(buf);
+        return val;
+    }
+
+    // canvas 客户区矩形 → 屏幕 point 矩形（CG top-left 坐标）。
+    static void CanvasToScreen(int x, int y, int w, int h, double[] outp) {
+        double s = FfHostMac.scale;
+        if (s <= 0) { s = 1.0; }
+        outp[0] = FfHostMac.hostX + x / s;
+        outp[1] = FfHostMac.hostY + y / s;
+        outp[2] = w / s;
+        outp[3] = h / s;
+    }
+
+    // 把 Firefox 窗口摆到 canvas 矩形对应的屏幕位置（AX 用 bottom-left
+    // 原点，要翻一次 Y 轴；屏幕高用主显示器——多屏下浮窗跨屏会偏，
+    // v1 接受）。
+    public static void SetBounds(int x, int y, int w, int h) {
+        if (!FfHostMac.ok || FfHostMac.winEl == 0) { return; }
+        double[] r = new double[4];
+        FfHostMac.CanvasToScreen(x, y, w, h, r);
+        nint cg = Interop.Load("/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics");
+        int screenH = 0;
+        if (FfHostMac.pPixHigh != null && cg != 0) {
+            FfMainDisplayFn main = (FfMainDisplayFn)Interop.Symbol(cg, "CGMainDisplayID");
+            if (main != 0) {
+                screenH = FfHostMac.pPixHigh(main());
+            }
+        }
+        // AXPosition：CGPoint（bottom-left 原点）。
+        nint ptBuf = NativeMemory.Alloc(16);
+        new Span<double>(ptBuf, 1)[0] = r[0];
+        new Span<double>(ptBuf + 8, 1)[0] = screenH - r[1] - r[3];
+        nint pt = FfHostMac.pValueCreate(FfHostMac.AXPoint, ptBuf);
+        nint posKey = FfHostMac.CFStr("AXPosition");
+        FfHostMac.pSetAttr(FfHostMac.winEl, posKey, pt);
+        // AXSize：CGSize。
+        nint szBuf = NativeMemory.Alloc(16);
+        new Span<double>(szBuf, 1)[0] = r[2];
+        new Span<double>(szBuf + 8, 1)[0] = r[3];
+        nint sz = FfHostMac.pValueCreate(FfHostMac.AXSize, szBuf);
+        nint sizeKey = FfHostMac.CFStr("AXSize");
+        FfHostMac.pSetAttr(FfHostMac.winEl, sizeKey, sz);
+    }
+
+    public delegate nint FfMainDisplayFn();
+
+    // 本帧未遮挡区域（Gui.NativeClipFn 签名）："" = 被完全盖住 → 把
+    // Firefox 移出屏幕藏起来；否则按第一个（最大的）可见矩形摆位。
+    public static void ApplyClip(int h, string spec) {
+        if (!FfHostMac.ok || FfHostMac.winEl == 0) { return; }
+        if (spec == "") {
+            FfHostMac.SetBounds(0 - 20000, 0 - 20000, 100, 100);
+            return;
+        }
+        List<int> rects = FfHost.ParseSpec(spec);
+        if (rects.Count < 4) { return; }
+        // 取面积最大的一块（Zan 的弹层通常只遮一角）。
+        int best = 0;
+        long bestArea = 0;
+        for (int i = 0; i + 3 < rects.Count; i = i + 4) {
+            long area = (long)rects[i + 2] * rects[i + 3];
+            if (area > bestArea) {
+                bestArea = area;
+                best = i;
+            }
+        }
+        FfHostMac.SetBounds(rects[best], rects[best + 1],
+                            rects[best + 2], rects[best + 3]);
+    }
+
+    // Firefox 还活着（AX 还能读到窗口列表）。
+    public static bool IsAlive() {
+        if (!FfHostMac.ok || FfHostMac.appEl == 0) { return false; }
+        nint key = FfHostMac.CFStr("AXWindows");
+        nint outPtr = NativeMemory.Alloc(8);
+        int rc = FfHostMac.pCopyAttr(FfHostMac.appEl, key, outPtr);
+        nint arr = (nint)new Span<long>(outPtr, 1)[0];
+        NativeMemory.Free(outPtr);
+        return rc == 0 && arr != 0;
+    }
+
+    // 拖到前台（宿主窗口激活时调用，避免 Firefox 被压在后面）。
+    public static void Raise() {
+        if (!FfHostMac.ok || FfHostMac.winEl == 0
+                || FfHostMac.pPerformAction == null) { return; }
+        nint act = FfHostMac.CFStr("AXRaise");
+        FfHostMac.pPerformAction(FfHostMac.winEl, act);
+    }
+
+    // 收尾：SIGTERM。
+    public static void Kill(int pid) {
+        if (pid > 0) {
+            FfHostMac.WinKill(pid, 15);
+        }
+    }
+
+    [DllImport("crt", EntryPoint = "kill")]
+    public static extern int WinKill(int pid, int sig);
+}

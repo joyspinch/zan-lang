@@ -1,0 +1,245 @@
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.IO;
+
+namespace Gui.Component.FirefoxBrowser;
+
+// Windows 宿主后端：把 Firefox 顶层窗口变成宿主窗口的真子窗口。
+// Firefox 主窗口类名是 MozillaWindowClass（十余年未变，但它是实现
+// 细节而非合同——找不到时上层回退占位并给出错误说明）。
+public class FfHostWin {
+    #if WINDOWS
+    [DllImport("user32", EntryPoint = "FindWindowExW")]
+    public static extern nint FindWindowEx(nint parent, nint after, nint cls, nint title);
+    [DllImport("user32", EntryPoint = "GetWindowThreadProcessId")]
+    public static extern int GetWindowThreadProcessId(nint hwnd, nint pidOut);
+    [DllImport("user32", EntryPoint = "SetParent")]
+    public static extern nint SetParent(nint child, nint parent);
+    [DllImport("user32", EntryPoint = "GetWindowLongPtrW")]
+    public static extern nint GetWindowLong(nint hwnd, int index);
+    [DllImport("user32", EntryPoint = "SetWindowLongPtrW")]
+    public static extern nint SetWindowLong(nint hwnd, int index, nint newLong);
+    [DllImport("user32", EntryPoint = "SetWindowPos")]
+    public static extern int SetWindowPos(nint hwnd, nint after, int x, int y, int w, int h, int flags);
+    [DllImport("user32", EntryPoint = "ShowWindow")]
+    public static extern int ShowWindow(nint hwnd, int cmd);
+    [DllImport("user32", EntryPoint = "IsWindow")]
+    public static extern int IsWindow(nint hwnd);
+    [DllImport("user32", EntryPoint = "PostMessageW")]
+    public static extern int PostMessage(nint hwnd, int msg, nint wp, nint lp);
+    [DllImport("user32", EntryPoint = "SetFocus")]
+    public static extern nint SetFocus(nint hwnd);
+    [DllImport("user32", EntryPoint = "GetFocus")]
+    public static extern nint GetFocus();
+    [DllImport("user32", EntryPoint = "SetWindowRgn")]
+    public static extern int SetWindowRgn(nint hwnd, nint rgn, int redraw);
+    [DllImport("user32", EntryPoint = "CreateRectRgn")]
+    public static extern nint CreateRectRgn(int x1, int y1, int x2, int y2);
+    [DllImport("gdi32", EntryPoint = "CombineRgn")]
+    public static extern int CombineRgn(nint dest, nint src1, nint src2, int mode);
+    [DllImport("gdi32", EntryPoint = "DeleteObject")]
+    public static extern int DeleteObject(nint obj);
+    [DllImport("kernel32", EntryPoint = "CreateProcessW")]
+    public static extern int CreateProcessW(nint app, nint cmdline, nint procAttr,
+                                    nint threadAttr, int inheritHandles,
+                                    int flags, nint env, nint dir,
+                                    nint startupInfo, nint procInfo);
+    [DllImport("kernel32", EntryPoint = "OpenProcess")]
+    public static extern nint OpenProcess(int access, int inherit, int pid);
+    [DllImport("kernel32", EntryPoint = "TerminateProcess")]
+    public static extern int TerminateProcess(nint proc, int code);
+    [DllImport("kernel32", EntryPoint = "CloseHandle")]
+    public static extern int CloseHandle(nint handle);
+    [DllImport("advapi32", EntryPoint = "RegGetValueW")]
+    public static extern int RegGetValue(nint hkey, nint subKey, nint value,
+                                    int flags, nint typeOut, nint dataBuf,
+                                    nint dataLen);
+
+    // 从注册表读一个 REG_SZ（找不到或非字符串返回 ""）。
+    public static string RegGetString(nint hkey, string subKey, string value) {
+        nint k = Wide.Of(subKey);
+        nint v = Wide.Of(value);
+        nint buf = NativeMemory.Alloc(4096);
+        nint len = NativeMemory.Alloc(8);
+        new Span<int>(len, 1)[0] = 2048;
+        // RRF_RT_REG_SZ = 2。
+        int rc = RegGetValue(hkey, k, v, 2, 0, buf, len);
+        Wide.Free(k);
+        Wide.Free(v);
+        string outp = "";
+        if (rc == 0) {
+            string s = Wide.Read(buf);
+            if (s != null) { outp = s; }
+        }
+        NativeMemory.Free(buf);
+        NativeMemory.Free(len);
+        return outp;
+    }
+
+    // 注册表发现 Firefox：安装器写死的两处登记，非标准安装目录的
+    // 唯一可靠来源（App Paths 与 Mozilla 自家的 CurrentVersion\Main）。
+    // 找不到或登记的文件已不存在返回 ""。
+    public static string RegistryFirefoxPath() {
+        // HKEY_LOCAL_MACHINE = 0x80000002。
+        nint hklm = (nint)0x80000002;
+        string p = FfHostWin.RegGetString(hklm,
+            "SOFTWARE\\Mozilla\\Mozilla Firefox\\CurrentVersion\\Main",
+            "PathToExe");
+        if (p != "" && File.Exists(p)) { return p; }
+        p = FfHostWin.RegGetString(hklm,
+            "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\App Paths\\firefox.exe",
+            "");
+        if (p != "" && File.Exists(p)) { return p; }
+        return "";
+    }
+
+    // 启动 Firefox 并返回子进程 pid（失败 -1）。直接走 CreateProcessW
+    // 而不是 Process.StartDetachedSafe：后者关掉句柄不返回 pid，而窗口
+    // 匹配需要 pid。
+    public static int SpawnWithPid(string exe, List<string> args) {
+        string cmdline = Process.BuildCommandLine(exe, args);
+        nint cmd = Wide.Of(cmdline);
+        nint si = NativeMemory.Alloc(104);  // STARTUPINFOW，cb = 104
+        for (int i = 0; i < 104; i = i + 1) {
+            new Span<byte>(si + i, 1)[0] = 0;
+        }
+        new Span<int>(si, 1)[0] = 104;
+        nint pi = NativeMemory.Alloc(24);   // PROCESS_INFORMATION
+        int ok = CreateProcessW(0, cmd, 0, 0, 0, 0, 0, 0, si, pi);
+        Wide.Free(cmd);
+        NativeMemory.Free(si);
+        if (ok == 0) {
+            NativeMemory.Free(pi);
+            return 0 - 1;
+        }
+        nint hProc = new Span<long>(pi, 1)[0];
+        nint hThread = new Span<long>(pi + 8, 1)[0];
+        int pid = new Span<int>(pi + 16, 1)[0];
+        NativeMemory.Free(pi);
+        if (hProc != 0) { CloseHandle(hProc); }
+        if (hThread != 0) { CloseHandle(hThread); }
+        return pid;
+    }
+
+    // 在 timeoutMs 内找到属于 pid 的 Firefox 主窗口。轮询期 Firefox
+    // 正在启动，窗口可能出现得很晚。
+    public static nint FindHostedWindow(int pid, int timeoutMs) {
+        nint cls = Wide.Of("MozillaWindowClass");
+        Stopwatch sw = Stopwatch.StartNew();
+        while (sw.ElapsedMilliseconds() < timeoutMs) {
+            nint hwnd = FindWindowEx(0, 0, cls, 0);
+            while (hwnd != 0) {
+                if (BelongsTo(hwnd, pid)) {
+                    Wide.Free(cls);
+                    return hwnd;
+                }
+                hwnd = FindWindowEx(0, hwnd, cls, 0);
+            }
+            Thread.Sleep(100);
+        }
+        Wide.Free(cls);
+        return 0;
+    }
+
+    static bool BelongsTo(nint hwnd, int pid) {
+        nint pidBuf = NativeMemory.Alloc(4);
+        new Span<int>(pidBuf, 1)[0] = 0;
+        GetWindowThreadProcessId(hwnd, pidBuf);
+        int found = new Span<int>(pidBuf, 1)[0];
+        NativeMemory.Free(pidBuf);
+        return found == pid;
+    }
+
+    // 把 Firefox 顶层窗口改造成宿主窗口的子窗口：去掉弹出/标题样式、
+    // 加 WS_CHILD，SetParent 后摆到 (0,0)。摆位由 SetBounds 跟随帧走。
+    public static bool HostWindow(nint child, nint parent) {
+        long style = (long)GetWindowLong(child, 0 - 16);
+        // WS_POPUP | WS_CAPTION | WS_THICKFRAME | WS_SYSMENU
+        // | WS_MINIMIZEBOX | WS_MAXIMIZEBOX
+        long clear = 0x80000000L | 0x00C00000L | 0x00040000L
+                   | 0x00080000L | 0x00020000L | 0x00010000L;
+        style = style & ~clear;
+        style = style | 0x40000000L;  // WS_CHILD
+        SetWindowLong(child, 0 - 16, (nint)style);
+        long ex = (long)GetWindowLong(child, 0 - 20);
+        ex = ex & ~0x00040000L;       // WS_EX_APPWINDOW
+        ex = ex & ~0x00000008L;       // WS_EX_TOPMOST
+        SetWindowLong(child, 0 - 20, (nint)ex);
+        SetParent(child, parent);
+        SetWindowPos(child, 0, 0, 0, 10, 10, 0x0004 | 0x0020);
+        return true;
+    }
+
+    // 摆到父窗口客户区坐标 (x,y) 尺寸 (w,h)。
+    public static void SetBounds(nint child, int x, int y, int w, int h) {
+        SetWindowPos(child, 0, x, y, w, h, 0x0004 | 0x0010);
+    }
+
+    public static void SetVisible(nint child, bool visible) {
+        ShowWindow(child, visible ? 4 : 0);  // SW_SHOWNOACTIVATE / SW_HIDE
+    }
+
+    // 本帧未被遮挡的区域下发（Gui.NativeClipFn 签名）。spec 是
+    // "x,y,w,h;..." 的矩形并集（父窗口客户区坐标），"" = 完全被盖住
+    // → 隐藏。多矩形用 GDI 区域精确裁剪（Zan 弹层盖住一半浏览器时
+    // 另一半照常可见）。
+    public static void ApplyClip(int h, string spec) {
+        nint child = (nint)h;
+        if (spec == "") {
+            ShowWindow(child, 0);
+            return;
+        }
+        if (IsWindow(child) == 0) { return; }
+        List<int> rects = FfHost.ParseSpec(spec);
+        ShowWindow(child, 4);
+        if (rects.Count < 4) { return; }
+        nint rgn = 0;
+        for (int i = 0; i + 3 < rects.Count; i = i + 4) {
+            nint piece = CreateRectRgn(rects[i], rects[i + 1],
+                                       rects[i] + rects[i + 2],
+                                       rects[i + 1] + rects[i + 3]);
+            if (rgn == 0) {
+                rgn = piece;
+                continue;
+            }
+            CombineRgn(rgn, rgn, piece, 2);  // RGN_OR
+            DeleteObject(piece);
+        }
+        if (rgn != 0) {
+            SetWindowRgn(child, rgn, 1);
+            // SetWindowRgn 之后系统接管区域，不再 DeleteObject(rgn)。
+        }
+    }
+
+    // 键盘焦点交给/收回 Firefox 子窗口。
+    public static void SetFocusTo(nint child, bool focus) {
+        if (focus) { SetFocus(child); }
+    }
+
+    // 子窗口还活着（Firefox 没崩、没被用户关掉）。
+    public static bool IsAlive(nint child) {
+        return child != 0 && IsWindow(child) != 0;
+    }
+
+    // 收尾：先礼貌 WM_CLOSE（Firefox 正常退出、写 profile），3 秒不退
+    // 再 TerminateProcess。
+    public static void Kill(nint child, int pid) {
+        if (IsWindow(child) != 0) {
+            PostMessage(child, 0x0010, 0, 0);  // WM_CLOSE
+            Stopwatch sw = Stopwatch.StartNew();
+            while (sw.ElapsedMilliseconds() < 3000) {
+                if (IsWindow(child) == 0) { return; }
+                Thread.Sleep(100);
+            }
+        }
+        if (pid > 0) {
+            nint proc = OpenProcess(0x0001, 0, pid);  // PROCESS_TERMINATE
+            if (proc != 0) {
+                TerminateProcess(proc, 0);
+                CloseHandle(proc);
+            }
+        }
+    }
+    #endif
+}

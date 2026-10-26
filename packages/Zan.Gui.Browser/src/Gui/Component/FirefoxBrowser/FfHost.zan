@@ -1,0 +1,502 @@
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.IO;
+using System.Json;
+using System.Net.Sockets;
+using System.Threading;
+
+namespace Gui.Component.FirefoxBrowser;
+
+// 一个 FfBrowser 实例的宿主进程状态 + 跨线程快照。
+// 写法约定：worker 与 UI 都碰的字段（url/title/loading 等）必须在
+// lockHandle 互斥区内读写；启动参数只由 worker 写一次，之后只读。
+public class FfInstance {
+    // Firefox 进程号（Windows 拉起时拿到；POSIX 双 fork 拿不到，寄宿
+    // 找到窗口后按 _NET_WM_PID/ps 回填）。收尾强杀用。
+    public int pid;
+    // 宿主状态机：0 = 启动中，1 = 就绪（窗口已寄宿），2 = 失败（error
+    // 说明原因）。UI 线程只读。
+    public int state;
+    public string error;
+    // 已寄宿的原生窗口（Windows HWND / Linux XID；macOS 浮窗方案没有
+    // 子窗口，恒为 0，UI 走 FfHostMac 的静态门面）。
+    public nint child;
+    public bool disposed;
+
+    // 启动参数（worker 开工前填好）。
+    public string exe;
+    public string profileDir;
+    public int port;
+    public bool chromeless;
+    public nint parentWindow;
+    public string startUrl;
+
+    // 互斥快照：worker 写，UI 每帧读。
+    public nint lockHandle;
+    public string curUrl;
+    public string curTitle;
+    public bool loading;
+    public bool marionetteOk;
+    public bool canBack;
+
+    // UI → worker 的命令队列："nav|<url>" "back" "fwd" "reload" "js|<code>"。
+    public BlockingQueue<string> commands;
+    public FfMarionette mario;
+    // macOS 浮窗锁定要用的画布尺寸（Render 每帧更新，worker 周期读）。
+    public int canvasW;
+    public int canvasH;
+
+    public FfInstance() {
+        this.pid = 0;
+        this.state = 0;
+        this.error = "";
+        this.child = 0;
+        this.disposed = false;
+        this.exe = "";
+        this.profileDir = "";
+        this.port = 0;
+        this.chromeless = true;
+        this.parentWindow = 0;
+        this.startUrl = "";
+        this.lockHandle = Mutex.Create();
+        this.curUrl = "";
+        this.curTitle = "";
+        this.loading = false;
+        this.marionetteOk = false;
+        this.canBack = false;
+        this.commands = new BlockingQueue<string>();
+        this.mario = null;
+        this.canvasW = 0;
+        this.canvasH = 0;
+    }
+}
+
+// Firefox 嵌入的进程层总控：发现可执行文件、引导专属 profile、拉起
+// 子进程、按平台寄宿窗口、连 Marionette，并在一个后台工作线程里
+// 轮询状态 + 执行 UI 下发的命令。UI 帧循环只碰 FfInstance 的快照，
+// 永不阻塞。
+public class FfHost {
+    public static int profileCounter;
+    public static string lastError = "";
+
+    // 最近一次启动失败的原因（占位符文案用它）。
+    public static string Error() { return FfHost.lastError; }
+
+    // 找 Firefox 可执行文件。顺序：显式配置/ZAN_FF_EXE → 平台标准
+    // 安装位置。找不到返回 ""（lastError 说明原因）。
+    public static string FindFirefoxExe() {
+        string configured = FfOptions.ExePath();
+        if (configured != "") {
+            if (File.Exists(configured)) { return configured; }
+            FfHost.lastError = "ZAN_FF_EXE 指定的文件不存在：" + configured;
+            return "";
+        }
+        #if WINDOWS
+        string pf = Interop.EnvVar("ProgramFiles");
+        string pfx86 = Interop.EnvVar("ProgramFiles(x86)");
+        string lad = Interop.EnvVar("LOCALAPPDATA");
+        if (pf != "" && File.Exists(pf + "\\Mozilla Firefox\\firefox.exe")) {
+            return pf + "\\Mozilla Firefox\\firefox.exe";
+        }
+        if (pfx86 != "" && File.Exists(pfx86 + "\\Mozilla Firefox\\firefox.exe")) {
+            return pfx86 + "\\Mozilla Firefox\\firefox.exe";
+        }
+        if (lad != "" && File.Exists(lad + "\\Mozilla Firefox\\firefox.exe")) {
+            return lad + "\\Mozilla Firefox\\firefox.exe";
+        }
+        string reg = FfHostWin.RegistryFirefoxPath();
+        if (reg != "") { return reg; }
+        FfHost.lastError = "未找到 Firefox：请安装 Mozilla Firefox，"
+            + "或用环境变量 ZAN_FF_EXE 指定 firefox.exe 的完整路径";
+        return "";
+        #elif MACOS
+        string home = Interop.EnvVar("HOME");
+        string p1 = "/Applications/Firefox.app/Contents/MacOS/firefox";
+        string p2 = home + "/Applications/Firefox.app/Contents/MacOS/firefox";
+        if (File.Exists(p1)) { return p1; }
+        if (File.Exists(p2)) { return p2; }
+        FfHost.lastError = "未找到 Firefox：请安装到 /Applications，"
+            + "或用环境变量 ZAN_FF_EXE 指定完整路径";
+        return "";
+        #else
+        string[] candidates = new string[] {
+            "/usr/bin/firefox", "/usr/lib/firefox/firefox",
+            "/snap/bin/firefox", "/opt/firefox/firefox",
+            "/usr/bin/firefox-esr", "/usr/lib/firefox-esr/firefox-esr",
+        };
+        for (int i = 0; i < candidates.Length; i = i + 1) {
+            if (File.Exists(candidates[i])) { return candidates[i]; }
+        }
+        // PATH 逐目录找。
+        string path = Interop.EnvVar("PATH");
+        int start = 0;
+        int n = path.Length;
+        for (int i = 0; i <= n; i = i + 1) {
+            if (i == n || path[i] == ':') {
+                if (i > start) {
+                    string dir = path.Substring(start, i - start);
+                    string exe = dir + "/firefox";
+                    if (File.Exists(exe)) { return exe; }
+                }
+                start = i + 1;
+            }
+        }
+        FfHost.lastError = "未找到 Firefox：请安装，或用环境变量 "
+            + "ZAN_FF_EXE 指定完整路径";
+        return "";
+        #endif
+    }
+
+    // 平台缓存根（profile 目录的父目录）。
+    public static string CacheRoot() {
+        string configured = FfOptions.ProfileRoot();
+        if (configured != "") { return configured; }
+        #if WINDOWS
+        string lad = Interop.EnvVar("LOCALAPPDATA");
+        if (lad == "") { lad = "."; }
+        return lad + "\\Zan\\ff";
+        #elif MACOS
+        string home = Interop.EnvVar("HOME");
+        if (home == "") { home = "."; }
+        return home + "/Library/Caches/Zan/ff";
+        #else
+        string home = Interop.EnvVar("HOME");
+        if (home == "") { home = "."; }
+        return home + "/.cache/zan/ff";
+        #endif
+    }
+
+    public static int portCursor;
+
+    // 挑一个空闲端口：TcpListener 不回查系统分配的端口（port=0 会原样
+    // 返回 0），这里用绑定试探法——bind 成功即认为空闲，立刻 Stop 让出。
+    // 起点用「开机毫秒 + 进程内游标」而不是 new Random()：Random 每个新
+    // 进程若拿到相同种子，两次启动会选中同一个端口，上一个 Firefox 还
+    // 没退时下一个就撞上 profile/port 双锁（实测踩过）。拿到与 Firefox
+    // 真正监听之间有理论上的竞争窗口，本机会话里概率可忽略。
+    public static int PickFreePort() {
+        Stopwatch sw = Stopwatch.StartNew();
+        while (sw.ElapsedMilliseconds() < 3000) {
+            FfHost.portCursor = (FfHost.portCursor + 1) % 400;
+            int port = 20000
+                + (int)(Stopwatch.GetMilliseconds() % 1000) * 20
+                + FfHost.portCursor;
+            TcpListener l = null;
+            try {
+                l = TcpListener.CreateAndStart("127.0.0.1", port, 1);
+            } catch (SocketException e) {
+                l = null;
+            }
+            if (l != null) {
+                l.Stop();
+                return port;
+            }
+            Thread.Sleep(20);
+        }
+        return 2828;  // 兜底：Marionette 的传统默认端口。
+    }
+
+    // 引导专属 profile：user.js（Marionette 端口 + 关掉一切首启干扰）
+    // 和 chromeless 的 userChrome.css。
+    public static void EnsureProfile(string dir, int port, bool chromeless) {
+        Directory.CreateDirectoryRecursive(dir);
+        Directory.CreateDirectoryRecursive(dir + "/chrome");
+        StringBuilder js = new StringBuilder();
+        js.Append("user_pref(\"marionette.port\", " + port + ");\n");
+        js.Append("user_pref(\"browser.shell.checkDefaultBrowser\", false);\n");
+        js.Append("user_pref(\"browser.startup.page\", 0);\n");
+        js.Append("user_pref(\"browser.startup.homepage_override.mstone\", \"ignore\");\n");
+        js.Append("user_pref(\"browser.aboutwelcome.enabled\", false);\n");
+        js.Append("user_pref(\"browser.warnOnQuit\", false);\n");
+        js.Append("user_pref(\"browser.tabs.warnOnClose\", false);\n");
+        js.Append("user_pref(\"browser.sessionstore.resume_from_crash\", false);\n");
+        js.Append("user_pref(\"datareporting.policy.dataSubmissionEnabled\", false);\n");
+        js.Append("user_pref(\"datareporting.healthreport.uploadEnabled\", false);\n");
+        js.Append("user_pref(" + "\"toolkit.telemetry.reportingpolicy.firstRun\", false);\n");
+        js.Append("user_pref(\"toolkit.legacyUserProfileCustomizations.stylesheets\", true);\n");
+        js.Append("user_pref(\"app.update.auto\", false);\n");
+        js.Append("user_pref(\"extensions.autoDisableScopes\", 0);\n");
+        File.WriteAllText(dir + "/user.js", js.ToString());
+        if (chromeless) {
+            StringBuilder css = new StringBuilder();
+            css.Append("@namespace url(\"http://www.mozilla.org/keymaster/gatekeeper/there.is.only.xul\");\n");
+            css.Append("#navigator-toolbox, #TabsToolbar, #nav-bar, "
+                + "#PersonalToolbar { visibility: collapse !important; }\n");
+            File.WriteAllText(dir + "/chrome/userChrome.css", css.ToString());
+        } else {
+            File.WriteAllText(dir + "/chrome/userChrome.css", "");
+        }
+    }
+
+    // 拉起 Firefox 子进程。不传 --new-window：headless 下它会吞掉默认
+    // 窗口创建（实测句柄为 0），窗口一律靠 Firefox 自己开的那个，
+    // 起始 URL 由会话建立后经 Marionette 导航。Windows 返回子进程
+    // pid；POSIX 的派生 API 是双 fork 守护，返回 0（后续认窗口时按
+    // profile 命令行找回 pid）。
+    public static int Spawn(string exe, string profileDir, string url,
+                            int width, int height) {
+        List<string> args = new List<string>();
+        args.Add("-profile");
+        args.Add(profileDir);
+        args.Add("-no-remote");
+        args.Add("-marionette");
+        if (width > 0 && height > 0) {
+            args.Add("-width");
+            args.Add(width + "");
+            args.Add("-height");
+            args.Add(height + "");
+        }
+        string extra = FfOptions.ExtraArgs();
+        if (extra != "") {
+            int start = 0;
+            for (int i = 0; i <= extra.Length; i = i + 1) {
+                if (i == extra.Length || extra[i] == ' ') {
+                    if (i > start) { args.Add(extra.Substring(start, i - start)); }
+                    start = i + 1;
+                }
+            }
+        }
+        #if WINDOWS
+        return FfHostWin.SpawnWithPid(exe, args);
+        #elif MACOS
+        if (Process.StartDetachedSafe(exe, args) != 0) { return 0 - 1; }
+        return 0;
+        #else
+        // 强制 GTK 走 X11：Zan Gui 是 X11 窗口，Firefox 落 Wayland 就
+        // 看不见了。经 /usr/bin/env 注入单进程环境变量，不污染自己。
+        List<string> wrapped = new List<string>();
+        wrapped.Add("GDK_BACKEND=x11");
+        wrapped.Add(exe);
+        for (int i = 0; i < args.Count; i = i + 1) { wrapped.Add(args[i]); }
+        if (File.Exists("/usr/bin/env")) {
+            if (Process.StartDetachedSafe("/usr/bin/env", wrapped) != 0) {
+                return 0 - 1;
+            }
+            return 0;
+        }
+        if (Process.StartDetachedSafe(exe, args) != 0) { return 0 - 1; }
+        return 0;
+        #endif
+    }
+
+    // 工作线程主体：拉起 → 找窗口寄宿 → 连 Marionette → 轮询循环。
+    // 任何一步失败都把 state 置 2 并写 error；disposed 置位后收尾退出。
+    public static void RunWorker(FfInstance inst) {
+        FfHost.lastError = "";
+        // 1. 找 Firefox。
+        string exe = FfHost.FindFirefoxExe();
+        if (exe == "") {
+            FfHost.Fail(inst, FfHost.lastError);
+            return;
+        }
+        inst.exe = exe;
+        // 2. 专属 profile + 端口。
+        FfHost.profileCounter = FfHost.profileCounter + 1;
+        string root = FfHost.CacheRoot();
+        inst.profileDir = root + "/p" + FfHost.profileCounter + "-"
+            + Stopwatch.GetMilliseconds();
+        inst.port = FfOptions.Port();
+        if (inst.port <= 0) { inst.port = FfHost.PickFreePort(); }
+        inst.chromeless = !FfOptions.ShowChrome();
+        FfHost.EnsureProfile(inst.profileDir, inst.port, inst.chromeless);
+        // 3. 拉起。
+        int pid = FfHost.Spawn(inst.exe, inst.profileDir, inst.startUrl, 0, 0);
+        if (pid < 0) {
+            FfHost.Fail(inst, "Firefox 进程启动失败：" + inst.exe);
+            return;
+        }
+        inst.pid = pid;
+        // 4. 找窗口并寄宿（Firefox 冷启动要几秒，窗口出来才算就绪）。
+        if (!FfHost.HostAndAdopt(inst)) { return; }
+        // 5. 连 Marionette（Firefox 主窗口出现后才监听）。
+        FfMarionette mario = FfMarionette.Connect(inst.port, 20000);
+        if (mario == null) {
+            FfHost.Fail(inst, "Marionette " + FfMarionette.staticError);
+            return;
+        }
+        inst.mario = mario;
+        // 命令上下文切到 Firefox 自己开的那扇窗（新 profile 只有它一个），
+        // 然后把起始 URL 补上（拉起参数里没有导航）。
+        List<string> handles = mario.WindowHandles();
+        if (handles.Count > 0 && !mario.SwitchToWindow(handles[0])) {
+            FfHost.Fail(inst, "SwitchToWindow 失败：" + mario.lastError);
+            return;
+        }
+        if (inst.startUrl != "" && inst.startUrl != "about:blank") {
+            mario.Navigate(FfBrowser.Normalize(inst.startUrl));
+        }
+        Mutex.Lock(inst.lockHandle);
+        inst.marionetteOk = true;
+        inst.state = 1;
+        Mutex.Unlock(inst.lockHandle);
+        // 6. 轮询循环：200ms 一拍，顺带消费命令队列。
+        int historyTick = 0;
+        while (!inst.disposed) {
+            string cmd = inst.commands.DequeueFor(200);
+            if (cmd != null && cmd != "") {
+                FfHost.Execute(inst, mario, cmd);
+            }
+            FfHost.PollState(inst, mario);
+            #if MACOS
+            // 浮窗锁定：宿主窗口可能被拖动，周期刷新屏幕 frame。
+            if (inst.parentWindow != 0 && inst.canvasW > 0) {
+                FfHostMac.RefreshHostFrame(inst.parentWindow,
+                                           inst.canvasW, inst.canvasH);
+            }
+            #endif
+            historyTick = historyTick + 1;
+            if (historyTick >= 10) {
+                historyTick = 0;
+                JsonValue v = mario.ExecuteScript("return history.length > 1;");
+                bool back = false;
+                if (v != null) {
+                    if (v.IsBool() || v.IsNumber()) { back = v.AsBool(false); }
+                    else {
+                        JsonValue inner = v.Get("value");
+                        back = inner != null && inner.AsBool(false);
+                    }
+                }
+                Mutex.Lock(inst.lockHandle);
+                inst.canBack = back;
+                Mutex.Unlock(inst.lockHandle);
+            }
+        }
+        // 7. 收尾：礼貌关窗，超时强杀。
+        FfHost.Teardown(inst, mario);
+    }
+
+    static void Fail(FfInstance inst, string message) {
+        Mutex.Lock(inst.lockHandle);
+        inst.state = 2;
+        inst.error = message;
+        Mutex.Unlock(inst.lockHandle);
+        FfHost.lastError = message;
+    }
+
+    // 找窗口 + 寄宿，成功置 inst.child；失败置 state=2 并返回 false。
+    static bool HostAndAdopt(FfInstance inst) {
+        #if WINDOWS
+        nint hwnd = FfHostWin.FindHostedWindow(inst.pid, 25000);
+        if (hwnd == 0) {
+            FfHost.Fail(inst, "Firefox 窗口未出现（MozillaWindowClass，"
+                + "25 秒超时）");
+            return false;
+        }
+        FfHostWin.HostWindow(hwnd, inst.parentWindow);
+        inst.child = hwnd;
+        return true;
+        #elif MACOS
+        // 浮窗方案：ps 找 pid → AX 附着 → 窗口元素。没有子窗口句柄。
+        Stopwatch sw = Stopwatch.StartNew();
+        int pid = inst.pid;
+        while (sw.ElapsedMilliseconds() < 25000) {
+            if (pid <= 0) { pid = FfHostMac.FindPidByProfile(inst.profileDir); }
+            if (pid > 0 && FfHostMac.Attach(pid)) {
+                FfHostMac.Raise();
+                return true;
+            }
+            Thread.Sleep(300);
+        }
+        FfHost.Fail(inst, "Firefox 窗口附着失败：" + FfHostMac.probeError);
+        return false;
+        #else
+        nint dpy = FfHostX11.OpenDisplay();
+        if (dpy == 0) {
+            FfHost.Fail(inst, "X11 宿主不可用：" + FfHostX11.probeError);
+            return false;
+        }
+        nint hwnd = 0;
+        Stopwatch sw = Stopwatch.StartNew();
+        while (sw.ElapsedMilliseconds() < 25000) {
+            hwnd = FfHostX11.FindHostedWindow(dpy, inst.profileDir, 1000);
+            if (hwnd != 0) { break; }
+        }
+        if (hwnd == 0) {
+            FfHost.Fail(inst, "Firefox 窗口未出现（25 秒超时）");
+            return false;
+        }
+        FfHostX11.HostWindow(dpy, hwnd, inst.parentWindow);
+        inst.child = hwnd;
+        inst.pid = FfHostX11.WindowPid(dpy, hwnd);
+        return true;
+        #endif
+    }
+
+    // 执行一条 UI 命令。
+    static void Execute(FfInstance inst, FfMarionette mario, string cmd) {
+        if (cmd.StartsWith("nav|")) {
+            mario.Navigate(FfBrowser.Normalize(cmd.Substring(4)));
+        } else if (cmd == "back") {
+            mario.Back();
+        } else if (cmd == "fwd") {
+            mario.Forward();
+        } else if (cmd == "reload") {
+            mario.Refresh();
+        } else if (cmd.StartsWith("js|")) {
+            JsonValue p = JsonValue.NewObject();
+            p.PutStr("script", cmd.Substring(3));
+            mario.Command("WebDriver:ExecuteScript", p.ToJson());
+        }
+    }
+
+    // 拉一次 url/title/loading 到快照。Marionette 没有事件推送，
+    // readyState 轮询就是 loading 语义（complete = 空闲）。
+    static void PollState(FfInstance inst, FfMarionette mario) {
+        if (!mario.IsAlive()) {
+            Mutex.Lock(inst.lockHandle);
+            inst.marionetteOk = false;
+            Mutex.Unlock(inst.lockHandle);
+            return;
+        }
+        string url = mario.GetUrl();
+        string title = mario.GetTitle();
+        string ready = mario.ReadyState();
+        Mutex.Lock(inst.lockHandle);
+        if (url != "") { inst.curUrl = url; }
+        if (ready != "") { inst.loading = ready != "complete"; }
+        if (title != "") { inst.curTitle = title; }
+        Mutex.Unlock(inst.lockHandle);
+    }
+
+    // 收尾：关 Marionette，窗口交给平台后端礼貌关闭，3 秒不退强杀。
+    public static void Teardown(FfInstance inst, FfMarionette mario) {
+        if (mario != null) { mario.Close(); }
+        inst.mario = null;
+        #if WINDOWS
+        FfHostWin.Kill(inst.child, inst.pid);
+        #elif MACOS
+        FfHostMac.Kill(inst.pid);
+        #else
+        nint dpy = FfHostX11.disp;
+        if (dpy != 0 && inst.child != 0) {
+            // 先 SIGTERM（Firefox 正常退出写 profile）。
+            FfHostX11.Kill(inst.pid);
+            Stopwatch sw = Stopwatch.StartNew();
+            while (sw.ElapsedMilliseconds() < 3000) {
+                if (!FfHostX11.IsAlive(dpy, inst.child)) { return; }
+                Thread.Sleep(100);
+            }
+            FfHostX11.Kill(inst.pid);
+        } else {
+            FfHostX11.Kill(inst.pid);
+        }
+        #endif
+    }
+
+    // "x,y,w,h;..." → 展开的整数表（NativeLayer.Spec 的逆运算）。
+    public static List<int> ParseSpec(string spec) {
+        List<int> outp = new List<int>();
+        int start = 0;
+        int n = spec.Length;
+        for (int i = 0; i <= n; i = i + 1) {
+            if (i == n || spec[i] == ',' || spec[i] == ';') {
+                if (i > start) {
+                    outp.Add(spec.Substring(start, i - start).ToInt32());
+                }
+                start = i + 1;
+            }
+        }
+        return outp;
+    }
+}

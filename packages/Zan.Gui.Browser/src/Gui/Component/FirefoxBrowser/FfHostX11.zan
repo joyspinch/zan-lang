@@ -1,0 +1,332 @@
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.IO;
+using System.Text;
+
+namespace Gui.Component.FirefoxBrowser;
+
+// Linux 宿主后端：把 Firefox 的 X11 顶层窗口重挂（XReparentWindow）
+// 进宿主窗口，成为同一 X 窗口树的真子窗口。Zan Gui 在 Linux 上是
+// X11 原生（Window.GetHandle() 即 XID），Firefox 侧用 GDK_BACKEND=x11
+// 拉起保证落进同一台 X server（Wayland 会话下走 XWayland）。
+// Xlib 走 Interop 动态解析（libX11.so.6 / libXext.so.6 可选），任何
+// 一步缺符号都只降级为「不支持」，不影响其他平台。
+public class FfHostX11 {
+    // 解析后的 Xlib 入口（懒加载，失败 ok=false）。
+    public static bool probed;
+    public static bool ok;
+    public static string probeError;
+    public static nint x11;
+    // 本后端的 X 连接（与 Zan Gui 运行时各自的连接，X 允许多连接）。
+    // ApplyClip 由 Gui 帧末回调，签名只有 (int,string)，display 从这取。
+    public static nint disp;
+
+    public static XOpenDisplayFn pOpenDisplay;
+    public static XDefaultRootWindowFn pRootWindow;
+    public static XInternAtomFn pInternAtom;
+    public static XGetWindowPropertyFn pGetProperty;
+    public static XQueryTreeFn pQueryTree;
+    public static XFreeFn pFree;
+    public static XReparentWindowFn pReparent;
+    public static XMoveResizeWindowFn pMoveResize;
+    public static XMapWindowFn pMap;
+    public static XUnmapWindowFn pUnmap;
+    public static XSetInputFocusFn pSetInputFocus;
+    public static XFlushFn pFlush;
+    public static XChangePropertyFn pChangeProperty;
+    // XShape（可选）。
+    public static bool hasShape;
+    public static XShapeCombineRectanglesFn pShapeCombine;
+
+    public delegate nint XOpenDisplayFn(nint name);
+    public delegate nint XDefaultRootWindowFn(nint dpy);
+    public delegate long XInternAtomFn(nint dpy, string name, int onlyIfExists);
+    public delegate int XGetWindowPropertyFn(nint dpy, long win, long prop,
+        long longOffset, long longLength, int delete, long reqType,
+        nint actualTypeOut, nint actualFormatOut, nint nitemsOut,
+        nint bytesAfterOut, nint propOut);
+    public delegate int XQueryTreeFn(nint dpy, long win, nint rootOut,
+        nint parentOut, nint childrenOut, nint countOut);
+    public delegate int XFreeFn(nint data);
+    public delegate int XReparentWindowFn(nint dpy, long win, long parent,
+        int x, int y);
+    public delegate int XMoveResizeWindowFn(nint dpy, long win, int x, int y,
+        int w, int h);
+    public delegate int XMapWindowFn(nint dpy, long win);
+    public delegate int XUnmapWindowFn(nint dpy, long win);
+    public delegate int XSetInputFocusFn(nint dpy, long win, int revertTo,
+        long time);
+    public delegate int XFlushFn(nint dpy);
+    public delegate int XChangePropertyFn(nint dpy, long win, long prop,
+        long type, int format, int mode, nint data, int nelements);
+    public delegate int XShapeCombineRectanglesFn(nint dpy, long win,
+        int destKind, int xOffset, int yOffset, nint rects, int n,
+        int op, int ordering);
+
+    // 懒解析 Xlib；失败时 probeError 说明原因。
+    public static bool Ensure() {
+        if (FfHostX11.probed) { return FfHostX11.ok; }
+        FfHostX11.probed = true;
+        FfHostX11.ok = false;
+        nint lib = Interop.Load("libX11.so.6");
+        if (lib == 0) {
+            FfHostX11.probeError = "libX11.so.6 加载失败：" + Interop.lastError;
+            return false;
+        }
+        FfHostX11.x11 = lib;
+        nint a;
+        a = Interop.Symbol(lib, "XOpenDisplay");
+        if (a == 0) { FfHostX11.probeError = "缺 XOpenDisplay"; return false; }
+        FfHostX11.pOpenDisplay = (XOpenDisplayFn)a;
+        a = Interop.Symbol(lib, "XDefaultRootWindow");
+        if (a == 0) { FfHostX11.probeError = "缺 XDefaultRootWindow"; return false; }
+        FfHostX11.pRootWindow = (XDefaultRootWindowFn)a;
+        a = Interop.Symbol(lib, "XInternAtom");
+        if (a == 0) { FfHostX11.probeError = "缺 XInternAtom"; return false; }
+        FfHostX11.pInternAtom = (XInternAtomFn)a;
+        a = Interop.Symbol(lib, "XGetWindowProperty");
+        if (a == 0) { FfHostX11.probeError = "缺 XGetWindowProperty"; return false; }
+        FfHostX11.pGetProperty = (XGetWindowPropertyFn)a;
+        a = Interop.Symbol(lib, "XQueryTree");
+        if (a == 0) { FfHostX11.probeError = "缺 XQueryTree"; return false; }
+        FfHostX11.pQueryTree = (XQueryTreeFn)a;
+        a = Interop.Symbol(lib, "XFree");
+        if (a == 0) { FfHostX11.probeError = "缺 XFree"; return false; }
+        FfHostX11.pFree = (XFreeFn)a;
+        a = Interop.Symbol(lib, "XReparentWindow");
+        if (a == 0) { FfHostX11.probeError = "缺 XReparentWindow"; return false; }
+        FfHostX11.pReparent = (XReparentWindowFn)a;
+        a = Interop.Symbol(lib, "XMoveResizeWindow");
+        if (a == 0) { FfHostX11.probeError = "缺 XMoveResizeWindow"; return false; }
+        FfHostX11.pMoveResize = (XMoveResizeWindowFn)a;
+        a = Interop.Symbol(lib, "XMapWindow");
+        if (a == 0) { FfHostX11.probeError = "缺 XMapWindow"; return false; }
+        FfHostX11.pMap = (XMapWindowFn)a;
+        a = Interop.Symbol(lib, "XUnmapWindow");
+        if (a == 0) { FfHostX11.probeError = "缺 XUnmapWindow"; return false; }
+        FfHostX11.pUnmap = (XUnmapWindowFn)a;
+        a = Interop.Symbol(lib, "XSetInputFocus");
+        if (a != 0) { FfHostX11.pSetInputFocus = (XSetInputFocusFn)a; }
+        a = Interop.Symbol(lib, "XFlush");
+        if (a != 0) { FfHostX11.pFlush = (XFlushFn)a; }
+        a = Interop.Symbol(lib, "XChangeProperty");
+        if (a != 0) { FfHostX11.pChangeProperty = (XChangePropertyFn)a; }
+        // XShape 扩展可选：没有就退化为整块显隐。
+        nint ext = Interop.Load("libXext.so.6");
+        if (ext != 0) {
+            a = Interop.Symbol(ext, "XShapeCombineRectangles");
+            if (a != 0) {
+                FfHostX11.pShapeCombine = (XShapeCombineRectanglesFn)a;
+                FfHostX11.hasShape = true;
+            }
+        }
+        FfHostX11.ok = true;
+        return true;
+    }
+
+    // 打开进程级 X 连接；ApplyClip 的帧末回调要用。
+    public static nint OpenDisplay() {
+        if (FfHostX11.disp != 0) { return FfHostX11.disp; }
+        if (!FfHostX11.Ensure()) { return 0; }
+        FfHostX11.disp = FfHostX11.pOpenDisplay(0);
+        return FfHostX11.disp;
+    }
+
+    // 在根窗口树下找属于「命令行里含 profileDir 的进程」的顶层窗口
+    // （_NET_WM_PID → /proc/<pid>/cmdline 匹配专属 profile 路径）。
+    // 派生 API 拿不到直接 pid，认 profile 参数反而更稳：Firefox 自己
+    // 重启的子进程也带着同一参数。
+    public static nint FindHostedWindow(nint dpy, string profileDir,
+                                        int timeoutMs) {
+        nint root = FfHostX11.pRootWindow(dpy);
+        Stopwatch sw = Stopwatch.StartNew();
+        while (sw.ElapsedMilliseconds() < timeoutMs) {
+            nint hwnd = FfHostX11.ScanTopWindows(dpy, root, profileDir);
+            if (hwnd != 0) { return hwnd; }
+            Thread.Sleep(150);
+        }
+        return 0;
+    }
+
+    // 扫根窗口的一级子窗口（顶层窗口），命中返回 XID。
+    static nint ScanTopWindows(nint dpy, nint root, string profileDir) {
+        nint rootOut = NativeMemory.Alloc(8);
+        nint parentOut = NativeMemory.Alloc(8);
+        nint childrenOut = NativeMemory.Alloc(8);
+        nint countOut = NativeMemory.Alloc(4);
+        new Span<int>(countOut, 1)[0] = 0;
+        nint hit = 0;
+        int rc = FfHostX11.pQueryTree(dpy, (long)root, rootOut, parentOut,
+                                      childrenOut, countOut);
+        if (rc == 0) {
+            int n = new Span<int>(countOut, 1)[0];
+            nint kids = (nint)new Span<long>(childrenOut, 1)[0];
+            if (kids != 0 && n > 0) {
+                for (int i = 0; i < n; i = i + 1) {
+                    long win = new Span<long>(kids + i * 8, 1)[0];
+                    int pid = FfHostX11.WindowPid(dpy, win);
+                    if (pid > 0 && FfHostX11.CmdlineHas(pid, profileDir)) {
+                        hit = (nint)win;
+                        break;
+                    }
+                }
+                FfHostX11.pFree(kids);
+            }
+        }
+        NativeMemory.Free(rootOut);
+        NativeMemory.Free(parentOut);
+        NativeMemory.Free(childrenOut);
+        NativeMemory.Free(countOut);
+        return hit;
+    }
+
+    // 读 _NET_WM_PID（XA_CARDINAL=6，32 位格式）。Xlib 的出参里是
+    // 指针，用 Span<long> 读出来再解引用。FfHost 在寄宿完成后取一次
+    // pid 用于收尾。
+    public static int WindowPid(nint dpy, long win) {
+        long atom = FfHostX11.pInternAtom(dpy, "_NET_WM_PID", 1);
+        if (atom == 0) { return 0; }
+        nint typeOut = NativeMemory.Alloc(8);
+        nint formatOut = NativeMemory.Alloc(4);
+        nint nitemsOut = NativeMemory.Alloc(8);
+        nint bytesAfterOut = NativeMemory.Alloc(8);
+        nint propOut = NativeMemory.Alloc(8);
+        int pid = 0;
+        int rc = FfHostX11.pGetProperty(dpy, win, atom, 0, 4, 0, 6,
+                                        typeOut, formatOut, nitemsOut,
+                                        bytesAfterOut, propOut);
+        if (rc == 0) {
+            long nitems = new Span<long>(nitemsOut, 1)[0];
+            nint data = (nint)new Span<long>(propOut, 1)[0];
+            if (nitems > 0 && data != 0) {
+                pid = new Span<int>(data, 1)[0];
+                FfHostX11.pFree(data);  // 属性数据要用 XFree 释放。
+            }
+        }
+        NativeMemory.Free(typeOut);
+        NativeMemory.Free(formatOut);
+        NativeMemory.Free(nitemsOut);
+        NativeMemory.Free(bytesAfterOut);
+        NativeMemory.Free(propOut);
+        return pid;
+    }
+
+    // /proc/<pid>/cmdline 是否包含 needle（NUL 分隔的参数表，直接
+    // 当子串找 profile 路径即可）。
+    static bool CmdlineHas(int pid, string needle) {
+        if (needle == "") { return false; }
+        string path = "/proc/" + pid + "/cmdline";
+        if (!File.Exists(path)) { return false; }
+        byte[] raw = File.ReadAllBytes(path);
+        if (raw == null || raw.Length == 0) { return false; }
+        string text = Encoding.UTF8.GetString(raw);
+        return text.IndexOf(needle) >= 0;
+    }
+
+    // 把顶层窗口收编为宿主窗口的子窗口：先写 _MOTIF_WM_HINTS 去装饰，
+    // unmap → reparent → map 让窗口管理器重读。
+    public static bool HostWindow(nint dpy, long child, long parent) {
+        long hints = FfHostX11.pInternAtom(dpy, "_MOTIF_WM_HINTS", 1);
+        if (hints != 0 && FfHostX11.pChangeProperty != null) {
+            // MWM_HINTS：flags=MWM_HINTS_DECORATIONS(2)，decorations=0。
+            nint data = NativeMemory.Alloc(40);
+            new Span<long>(data, 1)[0] = 2;
+            new Span<long>(data + 8, 1)[0] = 0;
+            new Span<long>(data + 16, 1)[0] = 0;
+            new Span<long>(data + 24, 1)[0] = 0;
+            new Span<long>(data + 32, 1)[0] = 0;
+            FfHostX11.pChangeProperty(dpy, child, hints, hints, 32, 0, data, 5);
+            NativeMemory.Free(data);
+        }
+        FfHostX11.pUnmap(dpy, child);
+        FfHostX11.pReparent(dpy, child, parent, 0, 0);
+        FfHostX11.pMap(dpy, child);
+        if (FfHostX11.pFlush != null) { FfHostX11.pFlush(dpy); }
+        return true;
+    }
+
+    public static void SetBounds(nint dpy, long child, int x, int y,
+                                 int w, int h) {
+        FfHostX11.pMoveResize(dpy, child, x, y, w, h);
+        if (FfHostX11.pFlush != null) { FfHostX11.pFlush(dpy); }
+    }
+
+    public static void SetVisible(nint dpy, long child, bool visible) {
+        if (visible) { FfHostX11.pMap(dpy, child); }
+        else { FfHostX11.pUnmap(dpy, child); }
+        if (FfHostX11.pFlush != null) { FfHostX11.pFlush(dpy); }
+    }
+
+    // 本帧未被遮挡的区域（Gui.NativeClipFn 签名，句柄是 (int)XID）。
+    // spec "" = 完全被盖住 → unmap。有 XShape 时多矩形精确裁剪。
+    public static void ApplyClip(int h, string spec) {
+        if (FfHostX11.disp == 0) { return; }
+        long child = h;
+        if (spec == "") {
+            FfHostX11.pUnmap(FfHostX11.disp, child);
+            if (FfHostX11.pFlush != null) { FfHostX11.pFlush(FfHostX11.disp); }
+            return;
+        }
+        FfHostX11.pMap(FfHostX11.disp, child);
+        if (FfHostX11.hasShape) {
+            List<int> rects = FfHost.ParseSpec(spec);
+            int n = rects.Count / 4;
+            if (n > 0) {
+                nint data = NativeMemory.Alloc(n * 8);
+                for (int i = 0; i < n; i = i + 1) {
+                    int x = rects[i * 4];
+                    int y = rects[i * 4 + 1];
+                    int w = rects[i * 4 + 2];
+                    int hh = rects[i * 4 + 3];
+                    // XRectangle: short x, short y, unsigned short w, h。
+                    new Span<short>(data + i * 8, 1)[0] = (short)x;
+                    new Span<short>(data + i * 8 + 2, 1)[0] = (short)y;
+                    new Span<short>(data + i * 8 + 4, 1)[0] = (short)w;
+                    new Span<short>(data + i * 8 + 6, 1)[0] = (short)hh;
+                }
+                // ShapeBounding=0, ShapeSet=0, YXBanded=2。
+                FfHostX11.pShapeCombine(FfHostX11.disp, child, 0, 0, 0,
+                                        data, n, 0, 2);
+                NativeMemory.Free(data);
+            }
+        }
+        if (FfHostX11.pFlush != null) { FfHostX11.pFlush(FfHostX11.disp); }
+    }
+
+    // 键盘焦点交给 Firefox（revert-to-parent，按键直接进 X 输入流）。
+    public static void SetFocusTo(nint dpy, long child, bool focus) {
+        if (focus && FfHostX11.pSetInputFocus != null) {
+            FfHostX11.pSetInputFocus(dpy, child, 2, 0);
+            if (FfHostX11.pFlush != null) { FfHostX11.pFlush(dpy); }
+        }
+    }
+
+    // 窗口还存在吗（XQueryTree 成功即认为在）。
+    public static bool IsAlive(nint dpy, long child) {
+        nint rootOut = NativeMemory.Alloc(8);
+        nint parentOut = NativeMemory.Alloc(8);
+        nint childrenOut = NativeMemory.Alloc(8);
+        nint countOut = NativeMemory.Alloc(4);
+        new Span<int>(countOut, 1)[0] = 0;
+        int rc = FfHostX11.pQueryTree(dpy, child, rootOut, parentOut,
+                                      childrenOut, countOut);
+        NativeMemory.Free(rootOut);
+        NativeMemory.Free(parentOut);
+        NativeMemory.Free(childrenOut);
+        NativeMemory.Free(countOut);
+        return rc == 0;
+    }
+
+    // 收尾：SIGTERM 给找到窗口时记下的进程号。
+    public static void Kill(int pid) {
+        if (pid > 0) {
+            FfHostX11.WinKill(pid, 15);
+        }
+    }
+
+    #if !WINDOWS
+    [DllImport("crt", EntryPoint = "kill")]
+    public static extern int WinKill(int pid, int sig);
+    #endif
+}

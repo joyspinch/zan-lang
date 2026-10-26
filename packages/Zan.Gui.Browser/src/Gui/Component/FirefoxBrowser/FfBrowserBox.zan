@@ -1,0 +1,144 @@
+using System;
+using Gui;
+
+namespace Gui.Component.FirefoxBrowser;
+
+// 可摆放的 Firefox 浏览器控件：把原生 FfBrowser 包成一个普通的保留式
+// Control，因此设计器 / .html 设计稿里的 Firefox 浏览器和别的控件
+// 一样，由布局给它一块矩形、由它自己负责绘制（与 CefBrowserBox 同构，
+// 只是引擎换成独立进程的真 Firefox）。
+// tabs.Page(0).Add(box);              // 标签页里放一个浏览器
+// box.View().NavComplete += () => { ... };
+public class FfBrowserBox : Control {
+    // 本控件拥有的原生浏览器（每个 FfBrowserBox 一个 Firefox 实例，
+    // 因此多标签浏览器就是多个 FfBrowserBox——每个标签一个独立
+    // Firefox 进程与专属 profile，多开互不干扰）。
+    public FfBrowser view;
+    // 设计期填写的起始地址，首帧导航一次。
+    public string startUrl;
+    public bool navigated;
+
+    // 默认构造：无起始地址。
+    public FfBrowserBox() {
+        this.InitControl("firefoxbrowser", 5);
+        this.view = new FfBrowser();
+        this.startUrl = "";
+        this.navigated = false;
+    }
+
+    // 底层原生浏览器：导航、事件都在它上面。
+    // 返回: 本控件唯一拥有的 FfBrowser 实例。返回:
+    public FfBrowser View() { return this.view; }
+
+    // 起始地址（设计属性 `url`，设计文档里也可写成
+    // `placeholder`）。首帧之前设置只记录起始地址，待首次绘制时
+    // 导航一次；首帧之后设置立即等同于 Navigate。
+    public void SetStartUrl(string u) {
+        this.startUrl = u;
+        if (this.navigated && u != "") { this.view.Navigate(u); }
+    }
+
+    // 当前设置的起始地址。
+    public string StartUrl() { return this.startUrl; }
+
+    // 立即导航到 target（与 SetStartUrl 不同，不等首帧）。
+    public void Navigate(string target) {
+        this.navigated = true;
+        this.view.Navigate(target);
+    }
+
+    // 历史后退一页（转发到底层浏览器）。
+    public void Back() { this.view.Back(); }
+    // 历史前进一页。
+    public void Forward() { this.view.Forward(); }
+    // 重新加载当前页。
+    public void Reload() { this.view.Reload(); }
+    // 停止当前加载。
+    public void Stop() { this.view.Stop(); }
+    // 能否后退。
+    public bool CanGoBack() { return this.view.CanGoBack(); }
+    // 能否前进。
+    public bool CanGoForward() { return this.view.CanGoForward(); }
+    // 是否正在加载。
+    public bool IsLoading() { return this.view.IsLoading(); }
+    // 最近一次响应的 HTTP 状态码（Marionette 拿不到，恒为 0）。
+    public int LastStatus() { return this.view.LastStatus(); }
+    // 当前 URL 快照。
+    public string CurrentUrl() { return this.view.CurrentUrl(); }
+    // 当前文档标题快照。
+    public string CurrentTitle() { return this.view.CurrentTitle(); }
+
+    // 隐藏原生浏览器（本控件不再上屏时调用；隐藏的标签页由
+    // NativeLayer 自动兜底，这里供宿主显式收起）。
+    public void Hide() { this.view.Hide(); }
+
+    // 关闭原生浏览器（关闭标签页时调用：Firefox 进程一并退出），
+    // 并把控件从树上摘下。销毁后不要再 Render 本控件。
+    public void Destroy() {
+        this.view.Destroy();
+        if (this.parent != null) { this.parent.Remove(this); }
+    }
+
+    // ---- 设计器 / 序列化模型 --------------------------------------
+
+    // 控件类型标识（"FfBrowserBox"）。
+    public override string Kind() { return "FfBrowserBox"; }
+
+    // 设计器属性：起始地址（"url"）。
+    public override List<PropSpec> Props() {
+        List<PropSpec> ps = new List<PropSpec>();
+        // 设计器把每个字段的文本属性存成 `placeholder`，所以起始地址
+        // 同时应答这个键：在检查器里填的地址能原样往返。
+        PropSpec u = PropSpec.Text("url", "Start URL").Also("placeholder");
+        u.str = this.startUrl;
+        ps.Add(u);
+        return ps;
+    }
+
+    // 控件事件清单：公共事件外加四个导航语义事件。
+    public override List<string> Events() {
+        List<string> e = Control.CommonEvents();
+        e.Add("NavStart");
+        e.Add("NavComplete");
+        e.Add("TitleChanged");
+        e.Add("LoadingChanged");
+        return e;
+    }
+
+    // 浏览器的语义事件挂在原生视图上，设计里的 `onNavComplete` 之类
+    // 因此直接落到它的 UiEvent，宿主不必自己接线。
+    public override void BindEvent(string evt, Action a) {
+        if (evt == "NavStart") { this.view.NavStart.Add(a); return; }
+        if (evt == "NavComplete") { this.view.NavComplete.Add(a); return; }
+        if (evt == "TitleChanged") { this.view.TitleChanged.Add(a); return; }
+        if (evt == "LoadingChanged") { this.view.LoadingChanged.Add(a); return; }
+        this.On.AddByName(evt, a);
+    }
+
+    // <see cref="BindEvent"/> 的 sender 通道（S = Sender）：
+    // 特化事件接本控件的 UiEvent，通用事件按名路由。
+    public override void BindEventS(string evt, ControlEvent a) {
+        if (evt == "NavStart") { this.view.NavStart.AddS(a); return; }
+        if (evt == "NavComplete") { this.view.NavComplete.AddS(a); return; }
+        if (evt == "TitleChanged") { this.view.TitleChanged.AddS(a); return; }
+        if (evt == "LoadingChanged") { this.view.LoadingChanged.AddS(a); return; }
+        this.On.AddByNameS(evt, a);
+    }
+
+    // ---- 保留式钩子（Control） ---------------------------------------
+
+    // 绘制：零尺寸时隐藏原生浏览器；首帧前先消费起始地址，然后
+    // 每帧驱动底层浏览器。
+    public override void OnPaint(App app) {
+        if (this.bw <= 0 || this.bh <= 0) {
+            this.view.Hide();
+            return;
+        }
+        // 导航要早于第一次 Render：启动参数在 EnsureStarted 里消费。
+        if (!this.navigated && this.startUrl != "") {
+            this.navigated = true;
+            this.view.Navigate(this.startUrl);
+        }
+        this.view.Render(app, this.bx, this.by, this.bw, this.bh);
+    }
+}
