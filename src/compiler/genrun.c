@@ -283,6 +283,25 @@ static void zan_gen_sweep_one(const char *name, void *ud) {
     /* ZanGen_<16hex>[_pid].exe */
     if (zan_gen_strip(name, "ZanGen_", &rest)) {
         int kind = zan_gen_parse_zangen(rest, &pid);
+        if (kind == 1) {
+            uint64_t fkey = 0;
+            for (int i = 0; i < 16; i++) {
+                char c = rest[i];
+                int d = (c >= '0' && c <= '9') ? (c - '0') :
+                        (c >= 'a' && c <= 'f') ? (c - 'a' + 10) :
+                        (c >= 'A' && c <= 'F') ? (c - 'A' + 10) : 0;
+                fkey = (fkey << 4) | (uint64_t)d;
+            }
+            if (ctx->keep_key != 0 && fkey != ctx->keep_key) {
+                snprintf(path, sizeof(path), "%s%c%s", dir, sep, name);
+#ifdef _WIN32
+                DeleteFileA(path);
+#else
+                remove(path);
+#endif
+            }
+            return;
+        }
         if (kind == 2 && !zan_pid_alive(pid)) {
             snprintf(path, sizeof(path), "%s%c%s", dir, sep, name);
 #ifdef _WIN32
