@@ -1,0 +1,303 @@
+using System;
+using System.Json;
+using System.Net.Sockets;
+using System.Text;
+
+namespace Gui.Component.FirefoxBrowser;
+
+// 极简 RFC 6455 WebSocket 客户端（供 <see cref="FfBidi"/> 连 Firefox 的
+// WebDriver BiDi 端点用）。设计取舍：
+// - 阻塞收发、单线程使用——BiDi 客户端自己带读线程，这里不做异步。
+// - 帧在 Zan 字符串（字节缓冲）上手工编解码：客户端帧必须带掩码，
+//   帧里可能出现任意字节（含 NUL），所以发送走
+//   <c>Socket.Send(sock, data, len)</c> 的显式长度形式，不用会被
+//   strlen 截断的 TcpClient.Send。
+// - 只实现文本帧 + Ping/Pong/Close + 续帧聚合，足够 BiDi 这种
+//   「小命令、大回复」的 JSON 会话。
+public class FfWs {
+    public TcpClient sock;
+    // 收流缓冲：TCP 分片与 WS 帧边界无关，攒着按帧切。
+    public string pending;
+    // 续帧聚合缓冲（opcode 0 的碎片拼到上一帧之后）。
+    public string frag;
+    public bool open;
+    public string lastError;
+
+    // 连接 ws://host:port<path> 并完成 HTTP 升级握手。
+    // timeoutMs 内连不上（Firefox 还没起来）就重试。成功返回客户端。
+    public static FfWs Connect(string host, int port, string path,
+                               int timeoutMs) {
+        Stopwatch sw = Stopwatch.StartNew();
+        while (sw.ElapsedMilliseconds() < timeoutMs) {
+            Socket.Initialize();
+            nint s = Socket.CreateTcp();
+            int rc = Socket.Connect(s, host, port);
+            if (rc != 0) {
+                Socket.Close(s);
+                Thread.Sleep(150);
+                continue;
+            }
+            FfWs ws = new FfWs();
+            ws.sock = TcpClient.FromSocket(s);
+            ws.pending = "";
+            ws.frag = "";
+            ws.open = true;
+            ws.lastError = "";
+            if (!ws.Handshake(host, port, path)) {
+                ws.Close();
+                return null;
+            }
+            return ws;
+        }
+        return null;
+    }
+
+    // HTTP Upgrade 握手：Sec-WebSocket-Key 用 16 个随机字节，回复的
+    // Sec-WebSocket-Accept 必须 = base64(SHA1(key + GUID))。
+    bool Handshake(string host, int port, string path) {
+        byte[] keyBytes = new byte[16];
+        Random r = new Random();
+        for (int i = 0; i < 16; i = i + 1) {
+            keyBytes[i] = (byte)(r.Next() & 255);
+        }
+        string key = Convert.ToBase64String(keyBytes);
+        StringBuilder req = new StringBuilder();
+        req.Append("GET " + path + " HTTP/1.1\r\n");
+        req.Append("Host: " + host + ":" + port + "\r\n");
+        req.Append("Upgrade: websocket\r\n");
+        req.Append("Connection: Upgrade\r\n");
+        req.Append("Sec-WebSocket-Key: " + key + "\r\n");
+        req.Append("Sec-WebSocket-Version: 13\r\n\r\n");
+        if (this.sock.Send(req.ToString()) <= 0) {
+            this.lastError = "握手请求发送失败";
+            return false;
+        }
+        // 读到空行（头结束）为止。
+        Stopwatch sw = Stopwatch.StartNew();
+        while (this.pending.IndexOf("\r\n\r\n") < 0) {
+            if (sw.ElapsedMilliseconds() > 10000) {
+                this.lastError = "握手响应超时";
+                return false;
+            }
+            string chunk = this.RecvRaw(2000);
+            if (chunk == null) { return false; }
+            if (chunk.Length == 0) { continue; }
+            this.pending = this.pending + chunk;
+        }
+        int headEnd = this.pending.IndexOf("\r\n\r\n");
+        string head = this.pending.Substring(0, headEnd);
+        this.pending = this.pending.Substring(headEnd + 4);
+        // 状态行必须 101。
+        if (!head.StartsWith("HTTP/1.1 101") && !head.StartsWith("HTTP/1.0 101")) {
+            this.lastError = "WebSocket 升级被拒：" +
+                head.Substring(0, head.IndexOf("\r\n") > 0
+                    ? head.IndexOf("\r\n") : head.Length);
+            return false;
+        }
+        // 校验 Accept（头名大小写不敏感）。
+        string low = head.ToLowerAscii();
+        int keyPos = low.IndexOf("sec-websocket-accept:");
+        if (keyPos < 0) {
+            this.lastError = "握手响应缺少 Sec-WebSocket-Accept";
+            return false;
+        }
+        int vStart = keyPos + "sec-websocket-accept:".Length;
+        int vEnd = low.IndexOf("\r\n", vStart);
+        if (vEnd < 0) { vEnd = low.Length; }
+        string accept = head.Substring(vStart, vEnd - vStart).Trim();
+        if (accept != Encoding.WebSocketAccept(key)) {
+            this.lastError = "Sec-WebSocket-Accept 校验失败";
+            return false;
+        }
+        return true;
+    }
+
+    // 发一帧文本（JSON）。客户端帧必须掩码；掩码后可能出现任意字节
+    // （含 NUL），字符串的 C 串语义会在 NUL 处截断，所以整帧在原生
+    // 缓冲区里构建，走二进制安全的 ReactorSendPtr。
+    public bool SendText(string payload) {
+        TcpClient s = this.sock;
+        if (!this.open || s == null) {
+            this.lastError = "连接已关闭";
+            return false;
+        }
+        int len = payload.Length;
+        Random r = new Random();
+        byte m0 = (byte)(r.Next() & 255);
+        byte m1 = (byte)(r.Next() & 255);
+        byte m2 = (byte)(r.Next() & 255);
+        byte m3 = (byte)(r.Next() & 255);
+        // 帧头 = 2 字节基础（opcode + 长度）+ 长度扩展（0/2/8）+ 4 字节掩码键。
+        int headerLen = 6 + (len >= 126 ? 2 : 0) + (len >= 65536 ? 8 : 0);
+        int total = headerLen + len;
+        nint buf = NativeMemory.Alloc(total);
+        Span<byte> b = new Span<byte>(buf, total);
+        b[0] = 0x81;  // FIN + 文本帧
+        int pos = 1;
+        if (len < 126) {
+            b[1] = (byte)(0x80 | len);
+            pos = 2;
+        } else if (len < 65536) {
+            b[1] = (byte)(0x80 | 126);
+            b[2] = (byte)((len >> 8) & 255);
+            b[3] = (byte)(len & 255);
+            pos = 4;
+        } else {
+            b[1] = (byte)(0x80 | 127);
+            for (int shift = 56; shift >= 0; shift = shift - 8) {
+                b[pos] = (byte)((len >> shift) & 255);
+                pos = pos + 1;
+            }
+        }
+        b[pos] = m0; b[pos + 1] = m1; b[pos + 2] = m2; b[pos + 3] = m3;
+        pos = pos + 4;
+        for (int i = 0; i < len; i = i + 1) {
+            int mk = i % 4 == 0 ? m0 : i % 4 == 1 ? m1 : i % 4 == 2 ? m2 : m3;
+            b[pos + i] = (byte)((payload[i] & 255) ^ mk);
+        }
+        long sent = Socket.ReactorSendPtr(s.Sock(), buf, total, 0);
+        NativeMemory.Free(buf);
+        if (sent != total) {
+            this.lastError = "帧发送失败（" + sent + "/" + total + "）";
+            return false;
+        }
+        return true;
+    }
+
+    // 收一帧文本（自动回 Pong、聚合续帧）。连接关闭返回 null。
+    // Zan 的同步 Recv 没有超时参数；对端异常退出会以 EOF 唤醒，
+    // 这里只靠 ReadFrame 的调用方节奏推进。
+    public string RecvText() {
+        while (true) {
+            string f = this.TakeFrame();
+            if (f != null) { return f; }
+            string chunk = this.RecvRaw(0 - 1);
+            if (chunk == null) { return null; }
+            if (chunk.Length == 0) { continue; }
+            this.pending = this.pending + chunk;
+        }
+    }
+
+    // 底层收一段字节。阻塞 recv 在对端关闭时以空串返回，不会永久
+    // 挂死；sock 被并发的 Close 置空前先取本地引用（读线程会与本
+    // 线程的 Disconnect 竞争）。
+    string RecvRaw(int timeoutMs) {
+        TcpClient s = this.sock;
+        if (s == null) {
+            this.open = false;
+            return null;
+        }
+        string chunk = "";
+        try {
+            chunk = s.Recv(65536);
+        } catch (SocketException e) {
+            this.lastError = "接收失败：" + e.Message;
+            this.open = false;
+            return null;
+        }
+        if (chunk == null || (chunk.Length == 0 && !s.IsConnected())) {
+            this.lastError = "连接已关闭";
+            this.open = false;
+            return null;
+        }
+        return chunk;
+    }
+
+    // 从 pending 里切出一个完整 WS 帧，按 opcode 语义处理：
+    // 文本/二进制 → 返回载荷；Ping → 回 Pong 并继续；Close → 回
+    // Close 并置断开；续帧 → 累进 frag。凑不齐整帧返回 null。
+    string TakeFrame() {
+        if (this.pending.Length < 2) { return null; }
+        int b0 = this.pending[0] & 255;
+        int b1 = this.pending[1] & 255;
+        bool fin = (b0 & 0x80) != 0;
+        int opcode = b0 & 0x0F;
+        int len = b1 & 0x7F;
+        int pos = 2;
+        if (len == 126) {
+            if (this.pending.Length < 4) { return null; }
+            len = ((this.pending[2] & 255) << 8) | (this.pending[3] & 255);
+            pos = 4;
+        } else if (len == 127) {
+            if (this.pending.Length < 10) { return null; }
+            len = 0;
+            for (int i = 0; i < 8; i = i + 1) {
+                len = (len << 8) | (this.pending[2 + i] & 255);
+            }
+            pos = 10;
+        }
+        // 帧长防御：超 64MB 的"帧"必然是流错位后的垃圾，断开重连。
+        if (len < 0 || len > 67108864) {
+            this.lastError = "帧长度异常（" + len + "），流已错位";
+            this.open = false;
+            return null;
+        }
+        // 服务器到客户端的帧按协议不掩码；遇到掩码位也按无掩码解析
+        // （Firefox 不发掩码帧，防御性忽略该位）。
+        if (this.pending.Length < pos + len) { return null; }
+        string payload = this.pending.Substring(pos, len);
+        this.pending = this.pending.Substring(pos + len);
+        if (opcode == 9) {
+            // Ping → Pong（opcode 0x8A，带同样载荷，需掩码）。
+            this.SendControl(0x8A, payload);
+            return null;
+        }
+        if (opcode == 8) {
+            this.SendControl(0x88, "");
+            this.open = false;
+            this.lastError = "对端关闭连接";
+            return null;
+        }
+        if (opcode == 0) {
+            // 续帧。
+            this.frag = this.frag + payload;
+            if (fin) {
+                string outp = this.frag;
+                this.frag = "";
+                return outp;
+            }
+            return null;
+        }
+        // 文本(1)/二进制(2)。
+        if (!fin) {
+            this.frag = payload;
+            return null;
+        }
+        return payload;
+    }
+
+    // 控制帧（Pong/Close）也要掩码，同样走二进制安全发送。
+    void SendControl(int opcode, string payload) {
+        TcpClient s = this.sock;
+        if (s == null) { return; }
+        int len = payload.Length;
+        int total = 2 + 4 + len;
+        nint buf = NativeMemory.Alloc(total);
+        Span<byte> b = new Span<byte>(buf, total);
+        b[0] = (byte)(0x80 | opcode);
+        b[1] = (byte)(0x80 | len);
+        Random r = new Random();
+        byte m0 = (byte)(r.Next() & 255);
+        byte m1 = (byte)(r.Next() & 255);
+        byte m2 = (byte)(r.Next() & 255);
+        byte m3 = (byte)(r.Next() & 255);
+        b[2] = m0; b[3] = m1; b[4] = m2; b[5] = m3;
+        for (int i = 0; i < len; i = i + 1) {
+            int mk = i % 4 == 0 ? m0 : i % 4 == 1 ? m1 : i % 4 == 2 ? m2 : m3;
+            b[6 + i] = (byte)((payload[i] & 255) ^ mk);
+        }
+        Socket.ReactorSendPtr(s.Sock(), buf, total, 0);
+        NativeMemory.Free(buf);
+    }
+
+    // 关闭连接（不做 Close 握手礼，直接断——收尾场景够用）。
+    public void Close() {
+        if (this.sock != null) {
+            this.sock.Close();
+            this.sock = null;
+        }
+        this.open = false;
+        this.pending = "";
+        this.frag = "";
+    }
+}

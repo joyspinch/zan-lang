@@ -510,4 +510,79 @@ public class FfHost {
         }
         return outp;
     }
+
+    // launcher 家族的 pid 列表（自身 + 后代，沿 parentPid 向下 BFS，
+    // 深度 4 封顶）。Firefox 启动器会重启自己，真浏览器进程是它的
+    // 后代；用户自己打开的 Firefox 不在家族里，清理绝不波及。
+    public static List<int> FamilySet(int launcherPid) {
+        List<int> outp = new List<int>();
+        if (launcherPid <= 0) { return outp; }
+        List<ProcessEntry> ps = ProcessList.List();
+        Dict<int, List<int>> kids = new Dict<int, List<int>>();
+        for (int i = 0; i < ps.Count; i = i + 1) {
+            int pp = ps[i].parentPid;
+            if (pp <= 0) { continue; }
+            List<int> list = null;
+            if (!kids.TryGetValue(pp, out list) || list == null) {
+                list = new List<int>();
+                kids.Add(pp, list);
+            }
+            list.Add(ps[i].pid);
+        }
+        outp.Add(launcherPid);
+        List<int> frontier = new List<int>();
+        frontier.Add(launcherPid);
+        for (int depth = 0; depth < 4 && frontier.Count > 0; depth = depth + 1) {
+            List<int> next = new List<int>();
+            for (int i = 0; i < frontier.Count; i = i + 1) {
+                List<int> ck = null;
+                if (!kids.TryGetValue(frontier[i], out ck) || ck == null) {
+                    continue;
+                }
+                for (int j = 0; j < ck.Count; j = j + 1) {
+                    bool seen = false;
+                    for (int k = 0; k < outp.Count; k = k + 1) {
+                        if (outp[k] == ck[j]) { seen = true; break; }
+                    }
+                    if (seen) { continue; }
+                    outp.Add(ck[j]);
+                    next.Add(ck[j]);
+                }
+            }
+            frontier = next;
+        }
+        return outp;
+    }
+
+    // 收尾兜底：优雅关停（browser.close / WM_CLOSE）没生效时强杀
+    // launcher 家族。跨平台。
+    public static void TeardownFamily(int launcherPid) {
+        if (launcherPid <= 0) { return; }
+        #if WINDOWS
+        FfHostWin.KillFamily(launcherPid);
+        #else
+        List<int> family = FfHost.FamilySet(launcherPid);
+        for (int i = 0; i < family.Count; i = i + 1) {
+            FfHost.PosixKill(family[i], 9);
+        }
+        #endif
+    }
+
+    // 家族是否还有活口。
+    public static bool FamilyAlive(int launcherPid) {
+        if (launcherPid <= 0) { return false; }
+        List<int> family = FfHost.FamilySet(launcherPid);
+        List<ProcessEntry> ps = ProcessList.List();
+        for (int i = 0; i < family.Count; i = i + 1) {
+            for (int j = 0; j < ps.Count; j = j + 1) {
+                if (ps[j].pid == family[i]) { return true; }
+            }
+        }
+        return false;
+    }
+
+    #if !WINDOWS
+    [DllImport("crt", EntryPoint = "kill")]
+    public static extern int PosixKill(int pid, int sig);
+    #endif
 }
