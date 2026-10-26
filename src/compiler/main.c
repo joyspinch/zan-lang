@@ -8248,6 +8248,9 @@ int main(int argc, char **argv) {
                     }
                 }
             }
+            if (getenv("ZAN_VERBOSE_LINK")) {
+                fprintf(stderr, "zanc: [link] %s\n", cmd);
+            }
             link_ret = system(cmd);
         } else if (cross_compiling && target.os == ZAN_OS_FREESTANDING) {
             remove(obj_path);
