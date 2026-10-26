@@ -90,6 +90,9 @@ public class FfHost {
     // 找 Firefox 可执行文件。顺序：显式配置/ZAN_FF_EXE → 平台标准
     // 安装位置。找不到返回 ""（lastError 说明原因）。
     public static string FindFirefoxExe() {
+        // 测试/支持开关：置 1 跳过系统 Firefox 探测，强制走运行时
+        // 缓存自举（下载→静默安装）。用于验证无浏览器环境全链路。
+        if (Interop.EnvVar("ZAN_FF_NO_SYSTEM") == "1") { return ""; }
         string configured = FfOptions.ExePath();
         if (configured != "") {
             if (File.Exists(configured)) { return configured; }
@@ -262,6 +265,11 @@ public class FfHost {
                 }
             }
         }
+        return FfHost.SpawnWithRetry(exe, args);
+    }
+
+    // 平台分发本体，不做重试。
+    public static int SpawnOnce(string exe, List<string> args) {
         #if WINDOWS
         return FfHostWin.SpawnWithPid(exe, args);
         #elif MACOS
@@ -283,6 +291,21 @@ public class FfHost {
         if (Process.StartDetachedSafe(exe, args) != 0) { return 0 - 1; }
         return 0;
         #endif
+    }
+
+    // 首启瞬态兜底：官方安装器刚放下 firefox.exe 的几秒内，安装器
+    // 进程可能仍短暂持有文件句柄，第一次 CreateProcessW 会失败
+    // （实测：首装完成立即启动 → pid<0 → 调用方报"启动失败"退出，
+    // 重跑就好）。15 秒窗口内每秒重试，窗口过了才放弃。
+    public static int SpawnWithRetry(string exe, List<string> args) {
+        Stopwatch sw = Stopwatch.StartNew();
+        int pid = 0 - 1;
+        while (sw.ElapsedMilliseconds() < 15000) {
+            pid = FfHost.SpawnOnce(exe, args);
+            if (pid >= 0) { return pid; }
+            Thread.Sleep(1000);
+        }
+        return pid;
     }
 
     // 工作线程主体：拉起 → 找窗口寄宿 → 连 Marionette → 轮询循环。

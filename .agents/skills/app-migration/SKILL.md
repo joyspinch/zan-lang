@@ -1121,3 +1121,17 @@ description: 现有业务程序（特别是 C#/WinForms/WPF/Web 后端等）迁�
   报出**假的差异**。这类假失败会浪费大量时间去"修"本来正确的代码。
 - 推广：批量验证脚本失败时，**先单独复跑一遍**确认；
   复跑通过就判定为环境竞争，不改代码。
+
+### 7.101 照 C# 直觉写 `Directory.GetDirectories` 会拿到**裸目录名**
+
+- 动作：Zan stdlib 的 `Directory.GetFiles` / `GetDirectories` 返回**裸名字**
+  （不含路径），这是文档化行为、几十处既有调用依赖它，不能改签名；
+  要 C# 形态的完整路径，用 `GetPaths` / `GetDirectoryPaths`，或自己
+  `ToPaths(names, baseDir)` 拼接。
+- 为什么：C# 的同名 API 返回完整路径，凭直觉拿返回值直接拼文件名或直接
+  `File.Exists` 判存在，永远 miss——实测：FirefoxBrowser 的缓存检测用
+  `GetDirectories(root)` 拿到的是裸名，拿它当路径验 `ready.zan-ff` 永远
+  判"没装上"，装完还要重装。这类失败**零异常零日志**，只剩行为层的
+  "反复重装"表象。
+- 症状识别：路径类检测"明明存在却判不存在"、或拿枚举结果直接当下一步
+  的入参却报找不到文件，先打印一条看返回的是裸名还是全路径，再查逻辑。

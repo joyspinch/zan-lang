@@ -1,7 +1,6 @@
 using System;
 using System.IO;
 using System.Net.Http.Download;
-using Gui.Component.Downloader;
 
 namespace Gui.Component.FirefoxBrowser;
 
@@ -32,36 +31,23 @@ public class FfBootstrap {
         string ver = await FfRuntime.ResolveVersionAsync();
         if (ver == "") { return ""; }
         DownloadJob job = FfRuntime.NewEnsureJob(ver);
-        DownloadDialog dlg = null;
-        bool wantUi = Interop.EnvVar("ZAN_FF_DOWNLOAD_UI") != "0";
-        if (wantUi) {
-            try {
-                dlg = DownloadDialog.OpenStandalone("正在准备 Firefox", job);
-            } catch (Exception) {
-                // 无显示器/无 Gui 宿主：回退到下面的静默路径。
-                dlg = null;
-            }
-        }
+        // 控制台进度：下载协程的续体要靠本线程驱动 reactor，等待必须
+        // 用异步延时而不是 Thread.Sleep（阻塞主线程会饿死 worker）。
+        // Gui 宿主要求弹进度窗的用 <see cref="FfBootstrapUi"/>。
         job.Start();
         bool ok = false;
-        if (dlg != null && dlg.IsOpen()) {
-            dlg.SetIntro("首次运行会从 Mozilla 官方源下载 Firefox（约 60~90MB）"
-                + "并安装到用户级缓存，之后不再下载。");
-            // 泵驱动等待：host.PumpSafe() 每圈分发 Win32 消息，窗口
-            // 全程响应；进度条由对话框的 AfterFrame 每帧刷新。
-            dlg.PumpStandaloneUntilKeepOpen(() => { return job.Running(); });
-            ok = job.Succeeded();
-            dlg.Close();
-        } else {
-            // 窗口没开成（无显示器/锁屏会话）：静默等完。必须用异步
-            // 延时而不是 Thread.Sleep——下载协程的续体要靠本线程驱动
-            // reactor，阻塞主线程会把 worker 一起饿死。
-            while (job.Running()) {
-                job.Poll();
-                await Task.Delay(100);
+        while (job.Running()) {
+            job.Poll();
+            long got = job.Got();
+            long total = job.Total();
+            if (total > 0) {
+                Console.Write("下载 " + DownloadJob.Human(got) + " / "
+                    + DownloadJob.Human(total) + "   ");
             }
-            ok = job.Succeeded();
+            await Task.Delay(200);
         }
+        Console.WriteLine("");
+        ok = job.Succeeded();
         if (!ok) {
             FfRuntime.Fail("Firefox 自举失败：" + FfBootstrap.JobError(job));
             return "";

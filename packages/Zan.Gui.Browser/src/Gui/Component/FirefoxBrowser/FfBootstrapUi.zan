@@ -1,0 +1,56 @@
+using System;
+using System.Net.Http.Download;
+using Gui.Component.Downloader;
+
+namespace Gui.Component.FirefoxBrowser;
+
+// Gui 宿主专用的 Firefox 自举：与 <see cref="FfBootstrap.EnsureAsync"/>
+// 同一任务，但用 <see cref="DownloadDialog"/> 显示下载进度窗（宿主
+// 有 Gui 帧循环时消息泵由帧循环驱动）。控制台程序用
+// <see cref="FfBootstrap.EnsureAsync"/> 的控制台进度即可，不拉 Gui。
+public class FfBootstrapUi {
+    // 发现 → 缓存 → 下载（带进度窗）→ 安装。返回 Firefox 可执行
+    // 路径；失败 ""（FfRuntime.lastError）。
+    public static async string EnsureWithWindow() {
+        string exe = FfHost.FindFirefoxExe();
+        if (exe != "") { return exe; }
+        exe = FfRuntime.InstalledExe();
+        if (exe != "") { return exe; }
+        // 进度窗必须在主线程、第一个 await 之前打开：await 之后的
+        // 续体不保证还在主线程，窗口没人喂消息就会"未响应"。版本
+        // 解析因此放进任务的准备回调（worker 线程）。
+        DownloadJob job = FfRuntime.NewEnsureJob();
+        DownloadDialog dlg = null;
+        try {
+            dlg = DownloadDialog.OpenStandalone("正在准备 Firefox", job);
+        } catch (Exception) {
+            dlg = null;
+        }
+        job.Start();
+        bool ok = false;
+        if (dlg != null && dlg.IsOpen()) {
+            dlg.SetIntro("首次运行会从 Mozilla 官方源下载 Firefox（约 60~90MB）"
+                + "并安装到用户级缓存，之后不再下载。");
+            // 泵驱动等待：host.PumpSafe() 每圈分发 Win32 消息，窗口
+            // 全程响应；进度条由对话框的 AfterFrame 每帧刷新。
+            dlg.PumpStandaloneUntilKeepOpen(() => { return job.Running(); });
+            ok = job.Succeeded();
+            dlg.Close();
+        } else {
+            while (job.Running()) {
+                job.Poll();
+                await Task.Delay(100);
+            }
+            ok = job.Succeeded();
+        }
+        if (!ok) {
+            FfRuntime.Fail("Firefox 自举失败：" + FfBootstrap.JobError(job));
+            return "";
+        }
+        exe = FfRuntime.EnsuredExe();
+        if (exe == "") {
+            FfRuntime.Fail("Firefox 自举失败：" + FfRuntime.lastError);
+        }
+        return exe;
+    }
+}
