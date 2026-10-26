@@ -36,6 +36,20 @@
 #endif
 #include "../common/host_oom.h"
 
+/* ASan 不认识 swapcontext 的换栈（跑 sanitizer 时它会自己告警 may produce
+ * false positives），UAF/悬栈报会被换栈搅出的影子内存假象淹没。用官方
+ * 协程注解把每次切换的"离开栈/进入栈"告诉它。 */
+#if defined(__SANITIZE_ADDRESS__)
+#define ZAN_ASAN_FIBER 1
+#elif defined(__has_feature)
+#if __has_feature(address_sanitizer)
+#define ZAN_ASAN_FIBER 1
+#endif
+#endif
+#if ZAN_ASAN_FIBER
+#include <sanitizer/asan_interface.h>
+#endif
+
 #define ZAN_CO_STACK_DEFAULT (128 * 1024)
 
 static size_t co_stack_size(void) {
@@ -210,7 +224,7 @@ static void co_trampoline_posix(unsigned hi, unsigned lo);
 static void co_trampoline_posix(unsigned ptr);
 #endif
 
-typedef struct { ucontext_t ctx; char *stack; } posix_fiber_t;
+typedef struct { ucontext_t ctx; char *stack; void *asan_fss; } posix_fiber_t;
 
 #define ZAN_CO_STACK_POOL_MAX 256
 
@@ -292,9 +306,20 @@ static void plat_fiber_delete(void *f) {
 }
 static void plat_switch(void *to) {
 #ifndef _WIN32
-    ((posix_fiber_t *)to)->ctx.uc_link = &g_sched_ctx;
+    posix_fiber_t *pf = (posix_fiber_t *)to;
+    pf->ctx.uc_link = &g_sched_ctx;
+#if ZAN_ASAN_FIBER
+    /* 调度栈→协程栈：fss 既给本函数返回路径用（协程切回时恢复调度侧假栈），
+     * 也经 pf->asan_fss 交给 trampoline（首次进入时消费同一份）。 */
+    void *fss = NULL;
+    __sanitizer_start_switch_fiber(&fss, pf->stack, co_stack_size());
+    pf->asan_fss = fss;
+    swapcontext(&g_sched_ctx, &pf->ctx);
+    __sanitizer_finish_switch_fiber(fss, NULL, NULL);
+#else
+    swapcontext(&g_sched_ctx, &pf->ctx);
 #endif
-    swapcontext(&g_sched_ctx, &((posix_fiber_t *)to)->ctx);
+#endif
 }
 static void plat_sleep(int64_t ms) {
     if (ms < 0) ms = 0;
@@ -312,7 +337,17 @@ static void switch_to_sched(void) {
 #ifdef _WIN32
     plat_switch(g_sched_fiber);
 #else
-    swapcontext(&((posix_fiber_t *)g_current->fiber)->ctx, &g_sched_ctx);
+    posix_fiber_t *pf = (posix_fiber_t *)g_current->fiber;
+#if ZAN_ASAN_FIBER
+    /* 协程栈→调度栈；本协程已 finished 时它永不返回，假栈随之作废
+     * （fake_stack_save=NULL 告诉 ASan 丢弃而不是留给一次不会发生的恢复）。 */
+    void *fss = NULL;
+    __sanitizer_start_switch_fiber(g_current->finished ? NULL : &fss, NULL, 0);
+    swapcontext(&pf->ctx, &g_sched_ctx);
+    if (fss) __sanitizer_finish_switch_fiber(fss, NULL, NULL);
+#else
+    swapcontext(&pf->ctx, &g_sched_ctx);
+#endif
 #endif
 }
 
@@ -628,6 +663,12 @@ static void co_trampoline_posix(unsigned hi, unsigned lo) {
 #else
 static void co_trampoline_posix(unsigned ptr) {
     zan_co_t *co = (zan_co_t *)(uintptr_t)ptr;
+#endif
+#if ZAN_ASAN_FIBER
+    /* 首次进入协程栈：消费 plat_switch 存下的调度侧假栈句柄。 */
+    if (co->fiber)
+        __sanitizer_finish_switch_fiber(((posix_fiber_t *)co->fiber)->asan_fss,
+                                        NULL, NULL);
 #endif
     co->body(co->task);
     co->finished = 1;
