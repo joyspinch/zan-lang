@@ -8,28 +8,6 @@
 
 ## 未完成
 
-### [ ] A490 3D 实例化批次依赖 GL 3.3 / GLES 3.1 的 core 特性——移动端可用性未实测
-
-- 现象：3D 批次提交（`zan_game_draw3d_batch`）用 `gl->VertexAttribDivisor`
-  与 `gl->DrawElementsInstanced`（`src/runtime/zan_game.c` 719 / 724 / 768 行）。
-  这两个是 **GL 3.3 core / GLES 3.1 core** 的特性；GLES 3.0（同文件 168 行的
-  `ZAN_GAME_GLSL_HEAD_GLES` 用的是 `#version 300 es`）只有 ANGLE 扩展
-  `ANGLE_instanced_arrays` 才有等价物。单发路径（`zan_game_draw3d` →
-  `glDrawElements`，同文件 634 行）**没有**这个限制。
-- 影响：`Zan.Gui` 的 EGL/GLES 上下文路径是有的（`src/runtime/gui_gl_context.c`
-  的 `zan_egl_ctx_t`），移动端**单发 3D** 可用；但 `Gui.MeshBatch` 的
-  **实例化批次**在 GLES 3.0 设备上没有等价实现——而 `Zan.Game.Render3D` 的
-  绘制层走的正是批次路径。
-- 未实测：路线图 §3 表里"Android/OHOS 是 stub"这句到底是旧结论还是现状，
-  本机没有设备/模拟器，**无法验证**。`SetRenderBackend(1)` 返回 0 的真实
-  原因是"这台机器没有可用的 GL 上下文（远程桌面 / 虚拟机 / CI）"，见
-  `packages/Zan.Gui/src/Gui/Core/App.zan` 的 `SetRenderBackend` 注释——
-  不能据此判定移动端不可用。
-- 方向：Android / OHOS 真机实测（记 GLES 版本），再决定是补
-  `ANGLE_instanced_arrays` 扩展路径，还是把移动端批次降级成逐实例
-  `DrawMesh3D`。
-- 关联：`Zan.Game.Render3D`（`docs/ECOSYSTEM_ROADMAP.md` §1.30）。
-
 ### [ ] A493 发布的 hello world 有 84% 的 .text 是运行时——已改归档成员收口大半，win/android 交叉待工具链
 
 - 现象（2026-10-22 重定体积预算时撞到）：`size_budget_publish_host` 实测
@@ -101,116 +79,6 @@
   `-ffunction-sections`"那句已被本次实测推翻，已一并更正）、A491（预算重新定
   基线的直接原因）、A499（归档按特性再切的后续）。
 
-### [~] A501 跨目标全量扫描：13 个目标的 console 与 GUI 交叉链接体检
-
-- 起因（2026-10-22）：被问"跨平台交叉编译现在都是全绿的吗"。此前只逐个目标试过
-  单个程序，没有**全目标 × 多特性**的扫描，于是漏掉的东西整整一批。
-- 扫描装置（`_scratch/xsweep/`，一次性）：3 个 console 探针（hello / crypto /
-  decimal）+ 1 个 GUI 探针（GUI + decimal）× 13~16 个目标，逐个记录链接返回码、
-  `.text` 与 `zan_hw_*` 符号数。**探针必须按特性选**：只跑 console 探针的话，
-  iOS（GUI-only）与 GUI 目标专属的注入路径一条都照不到。
-- 扫描暴露并已修掉的缺陷（五个，各有独立根因）：
-  - `src/compiler/main.c`：交叉路径复用 `rt_crypto_buf` 这块**共享缓冲区**，
-    归档找不到时仍留着指向它的指针 → 链接器拿到一个不存在的交叉路径
-    （android/ios 直接报错）。改为交叉分支**无条件赋值**
-    （`zan_file_exists(...) ? buf : NULL`），原生分支加 `if (!cross_compiling)`。
-  - **wasm32 的链接分支根本没注入 decimal 运行时**：别的目标都有
-    `if (irgen.uses_decimal_runtime)` 注入 `zanrt_decimal.o`，wasm 没有 →
-    任何用 `System.Decimal` 的 wasm 程序链接期报一串
-    `undefined symbol: __zan_decimal_*`。已补注入 + 补对象
-    （`toolchain/wasm32/zanrt_decimal.o`）。
-  - `src/runtime/rt_decimal.{c,h}`：对外 ABI 用了 `size_t`（长度/容量），
-    而编译器后端按 Zan 的 `long`（**恒 64 位**）发调用 → wasm32 上 `size_t` 是
-    32 位，`wasm-ld` 报 *function signature mismatch*（链接过了，模块运行时坏）。
-    改为定宽 `int64_t`（其余 `__zan_decimal_*` 早就是定宽的）。
-  - **ohos / win / ios / wasm 目标缺 `zanrt_decimal.o`**：decimal 运行时当初只补了
-    macOS/Android/linux，用 `System.Decimal` 的交叉程序在这些目标上链接红。
-  - `toolchain/ohos-{x64,arm64}/zanrt_sync.o` 停在 **10-05**，比 `rt_sync.c` 老，
-    缺 `zan_ui_thread_set` → OHOS 的 **GUI** 程序链接红（console 程序照不到）。
-    已用 zig 按 `build_ohos_rt_zig.sh` 的配方重出。
-- 顺带修掉的**自相矛盾**：`zanc --list-targets` 是一张写死的表，把本机构建
-  **发不了码**的目标也 advertise 出去（mozbuild LLVM 没有 RISC-V 后端，
-  `zanc --target riscv64` 只会得到一句笼统的 "code generation failed"）。
-  现在按 **LLVM 自己的注册表**过滤：目标表里没有的 triple 不出现在列表里，
-  `--target` 直接点名"这个构建没有该 triple 的 LLVM 后端"（链接了带 RISC-V
-  后端的 LLVM 时这些目标照旧可用）。后端注册要先做
-  （`zan_irgen_init_llvm_targets()` 从 irgen_emit.c 提成对外函数），
-  否则查表时注册表是空的，会把**所有**目标都判成不可用。
-- 现在的体检结论：13 个目标 × console 全绿；GUI 探针 10 绿 3 红（红的是
-  android-x64 与 ohos 两个平台，原因见 A502 / A503）。**OHOS 的 GUI exe 现在
-  给的是一句"为什么 + 怎么办"**（静态链接装不下驱动要的 EGL/GLES/FreeType，
-  GUI 请用 `--emit-lib`），不是一串 undefined symbol；OHOS 的 GUI 走
-  `--emit-lib` 实测**链接成功**。
-- 关联：A493（归档成员机制）、A502、A503、A499。
-
-### [~] A503 OHOS 的 GUI 交叉链接缺 EGL/GLES——静态 exe 形态装不下预编译驱动的 GL 依赖
-
-- 现象（2026-10-22 A501 扫描）：`--target ohos-x64` / `ohos-arm64` 链接 GUI
-  程序报一串 `undefined symbol: eglMakeCurrent / eglDestroySurface /
-  glCreateShader / glShaderSource / glCompileShader ...`（外加 20 多个
-  `FT_*`），引用方是
-  `packages/Zan.Gui/src/Gui/drivers/ohos-<arch>/static/libzan_gui.a` 里的
-  `zan_gui_present`。
-- 根因（2026-10-22 钉死）：**OHOS 的 exe 走全静态链接**
-  （`ld.lld -static ... libc.a libunwind.a libclang_rt.builtins.a`），静态模型里
-  没有 EGL/GLES/FreeType 的位置；而 OHOS 的 GUI 驱动直连 EGL/GLES
-  （实测需要 10 个 `egl*` + 34 个 `gl*`；`FT_*` 是编进驱动归档的，所以不报
-  undefined）。⇒ 任何 OHOS GUI 程序走 **exe** 这条路都链不过，**不是配置问题，
-  是链接形态选错了**。
-- 更正一处此前的误判（2026-10-22 复核 `scripts/build_gui_ohos.sh` 时发现）：
-  "驱动是预编译产物、没有源码" —— **不对**。OHOS 驱动由
-  `scripts/build_gui_ohos.sh` 从 `src/runtime/gui_runtime.c`（`-DZAN_GUI_OHOS
-  -DZAN_GUI_FREETYPE`）+ freetype 源码编出来（用 DevEco Studio 自带的 OHOS
-  SDK），再 `llvm-ar` 成 `static/libzan_gui.a`、编成 `libzan_gui.so`。
-  **源码就在仓库里**，只是要一台装了 DevEco 的机器。
-- **再更正一处（同日）**：本条上一版写着"**本机没有 DevEco**，这一支只能在那台
-  机器上跑"——**也是错的**。DevEco Studio 就在这台机器上
-  （`C:\Program Files\Huawei\DevEco Studio`，带
-  `sdk/default/openharmony/native/{llvm,sysroot}`，sysroot 里有
-  `x86_64-linux-ohos` / `aarch64-linux-ohos` 两套 `libEGL.so`/`libGLESv3.so`），
-  freetype 源码也在（`D:/project/firefox/modules/freetype2`）。于是
-  `scripts/build_gui_ohos.sh all` **在这台机器上跑通了**（2026-10-22 实跑）：
-  两个架构的 GUI/image/audio/game 驱动全部重出。
-  **教训：判"这台机器补不了"之前，先把常见安装位置查一遍**——凭印象下结论会
-  把"能补"误写成"补不了"。
-- 重出后暴露的两处**仓库缺口**（2026-10-22 实跑）：
-  ① **committed 的 `libzan_gui.so` 是拆分前的旧产物**：它还带着 nanosvg / libwebp
-     的符号（`nsvgCreateRasterizer` / `kVP8Log2Range` / `IsValidColorspace`），
-     而当前代码已把图像解码拆到独立的 image 驱动（重出的 GUI 驱动导出 673 个
-     符号，旧的 1005 个，多出来的正是那批解码符号），并且**缺**新加的
-     `zan_gui_gpu_*` / `zan_gui_blit_*` 入口 ⇒ 仓库里那个 .so 是**陈旧**的。
-  ② **image / game 驱动的二进制从来没进过仓库**：只跟踪了 `.libs` 与
-     `.bundle`，而 `.bundle` 里写着 `libzan_image.so` / `libzan_game.so`
-     ⇒ **发布出去的 OHOS 应用会缺这两个驱动**（audio 驱动的 .so/.a 是跟踪着的，
-     image/game 不是）。
-- 正确的形态（2026-10-22 实测）：OHOS 的 GUI 程序应当产出 **HAP**
-  （`zanc --target ohos-x64 --emit-lib`）——**实测链接成功**：HAP 本身不调用
-  EGL/GLES（那是驱动 .so 的事），驱动 .so 随应用进 bundle
-  （`zan_gui.bundle` 里列了 `libzan_gui.so`），设备系统提供 EGL/GLES 真库。
-  **静态 exe + GUI 驱动**这个组合在 OHOS 上本来就不成立。
-- 补法（2026-10-22 已落地）：
-  ① **静态 exe 带 GUI 驱动时给明确错误**（已改 `src/compiler/main.c`）：说明
-     "静态链接装不下驱动要的 EGL/GLES、OHOS 的 GUI 请用 `--emit-lib`（HAP
-     形态）"，不再吐 60 多个 undefined symbol 的瀑布。
-  ② **HAP 形态按需链 EGL/GLES**（同上）：`<sys>`（=toolchain/ohos-<arch>/）里有
-     就链上（记 DT_NEEDED），没有就点名缺哪个、去哪拷。**只列 EGL/GLES 两项**：
-     OHOS 的 FreeType 是**静态**链进驱动的，设备上不存在 `libfreetype.so`
-     ——列进去只会让人去找一个哪都没有的文件。
-  ③ **配方改成拷真库**（`scripts/build_cross_rt.cmd` 的 OHOS NDK 块）：从
-     `<OHOS_NDK>/native/sysroot/usr/lib/<triple>/` 拷 `libEGL.so` /
-     `libGLESv3.so` 到 `toolchain/ohos-<arch>/`；原先那两个**空壳**（导不出任何
-     符号，只记录 DT_NEEDED，连同 `scripts/ohos_stub.c`）已删——**空壳比缺库
-     更坏**：它让人以为支持着这个目标。
-  ④ **让 OHOS 的对象别再停在旧代码**：`toolchain.yml` 新增 `ohos-objects`
-     job（zig 路径，`scripts/build_ohos_rt_zig.sh`），源码一改就重出并提交。
-  ⑤ **驱动本身重出并补齐跟踪**（2026-10-22，本机有 DevEco）：GUI 驱动的 .so/.a
-     重出（旧产物是拆分前的形态），image / game 驱动的 .so/.a **补进仓库**
-     （`.bundle` 指着它们，仓库里却没有）。
-- 剩下的：**真机 / 模拟器上的运行验证**（DevEco 模拟器装在这台机器上，
-  `C:\Users\QQ\AppData\Local\Huawei\Emulator26.0`；仓库历史里也有 DevEco 模拟器
-  跑通 GUI 画廊的记录 `e59be75a`）。**构建这一环已经不再是缺口。**
-- 关联：A501、A502、A504。
-
 ### [~] A504 CI 的"配方产出"与"提交清单/触发路径"必须一一对应——漏一处，对象就永远停在旧代
 
 - 现象（2026-10-22 查 A502 时顺着查出来的）：`.github/workflows/` 里重建
@@ -235,9 +103,10 @@
 - 2026-10-25 复核：清单/触发路径修复确认在位（drivers.yml 提交清单含
   decimal/crypto/embed_api/inflate；toolchain.yml 触发路径含 embed_api/inflate）；
   **macOS 死腿已救活**（3b47a5587 修符号检查器、a3c50cafd 补齐
-  `toolchain/macos/arm64/zanrt_decimal.o`）。剩 wasm32 / ios 两平台的对象
-  job 未接（wasm32 配方是 .cmd、GUI 依赖外部 freetype checkout；ios 无配方
-  工具链）——工具链受阻，维持 [~]。
+  `toolchain/macos/arm64/zanrt_decimal.o`）；**wasm32 console 对象已接上 CI**
+  （2026-10-26：`scripts/build_wasm_rt.sh` + `toolchain.yml` 的 `wasm32-objects`
+  job，7 项 console 对象切到 `runtime` 托管，触发路径补齐）；剩 ios 无独立
+  交叉工具链，对象维持 manual 报告。
 - **macOS 这条腿整个是死的**（2026-10-22 顺着查 macOS 的 decimal 查出来的）：
   - `runtime-objects` job 的检查步骤 `python3 scripts/check_macos_rt.py` 从
     **2026-09-20**（`e35521ad7` 让 `gui_compat_mac.c` 开始 import
@@ -286,33 +155,5 @@
      悄悄胖 53 KB。
 - 关联：A502（android 的具体症状）、A503（ohos 的具体症状）、A493（归档拆分
   后 win 变胖的根因）、A501。
-
-### [ ] A544 子窗口（聊天记录窗/独立聊天窗/设置窗）在本会话无法像素验收
-- 现象：`ZAN_UI_SCRIPT` 的 `dump pixels` 只抓**主 App** 的窗口；子窗口
-  （`Gui.ChildWindow`：聊天记录窗、独立聊天窗、设置窗、通讯录管理窗）是
-  各自的顶层窗口，抓不到。改用屏幕抓取（CopyFromScreen）在本会话拿到的是
-  全黑桌面——没有可交互的桌面会话。
-- 绕法（已落地）：把窗口**内容**（视图）塞进独立宿主 Form 再抓像素。设置窗
-  （`WxSettingsView`）与通讯录管理窗（`WxContactManagerView`）用这招验过，
-  像素正常（导航列、正文、底栏各归各位）。聊天记录窗与独立聊天窗把 root
-  建在 ChildWindow 类内部，视图接口没暴露，暂用这招。
-- 已定性（2026-10-23 19:0x，闭掉「待查」那半）：那 6 条「裁剪」命中**不是误报**，
-  是真缺陷——**flex 收缩没有 min-content 下限**（CSS 的 `min-width:auto` 未实现），
-  行一旦放不下，子项按比例缩：图标钮被切掉几像素，工具条项被压成 **0 宽**（按钮
-  看不见也点不着）。复现：把客户端主窗口改窄（探针副本里 `Form.Create("微聊",
-  520, 600)`，只改副本不动模板）后跑聊天页，`ZAN_GUI_LAYOUTLINT=1` 稳定命中 4 条：
-  `Button[675,69 34x42]`/`[721,69 35x42]`（标题行图标钮，42→34/35 被切）、
-  `Button[717,661 36x42]`/`[753,661 0x42]`（输入区工具条末项被压成 0 宽）。
-  单独开聊天记录窗/独立聊天窗（宿主窗）各跑一遍都是 **0 命中**——子窗本身干净。
-- 模板侧已修（gui-wechat）：皮肤层补全局工具类 `.shrink-0 { flex-shrink: 0; }`；
-  标题行图标钮与各页工具条按钮挂 `shrink-0`；聊天页 `#ToolsHost` 改 `display:
-  flex`（ToolStrip 是块级子项时宽度=宿主宽，窄窗口下项被压成 0 宽；做成 flex
-  行后工具条是 flex 项，shrink-0 即可保持自然尺寸）。修后同一窄窗探针 **0 命中**，
-  像素复验：标题行两个图标钮与工具条图标完整不再缺块（见 `_scratch/probe/
-  narrow3.png`）；正常宽度十页重跑仍 0 命中、像素无变化。
-- 框架侧缺口 A545 已闭（2026-10-25，c059bba3c：base.css 补 `.shrink-0` +
-  flex 收缩 min-content 下限；停靠 FitSize 裁 0 宽定性为 WinForms 同款不改）。
-- 前提：要有可交互的桌面会话（锁屏/远程会话会拿到黑屏），或让子窗口支持
-	  把 root 暴露给宿主驱动。
 
 

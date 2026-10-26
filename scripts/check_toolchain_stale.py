@@ -183,14 +183,19 @@ ARTIFACTS = [
     ("toolchain/ios/arm64/zan_embed_api.o", EMBED, "manual"),
     ("toolchain/ios/arm64/zan_inflate.o", INFLATE, "manual"),
     ("toolchain/ios/libSystem.tbd", ZIG_BUNDLED, "manual"),
-    # wasm32 has no CI leg yet either (its recipe is the .cmd one and the GUI
-    # branch needs an external freetype checkout) -- reported, not gating.
-    ("toolchain/wasm32/zanrt_wasm.o", RT_WASM, "manual"),
-    ("toolchain/wasm32/zanrt_file.o", RT_FILE, "manual"),
-    ("toolchain/wasm32/zanrt_decimal.o", RT_DECIMAL, "manual"),
-    ("toolchain/wasm32/zanrt_timer.o", RT_TIMER, "manual"),
-    ("toolchain/wasm32/libzancrypto.a", RT_CRYPTO, "manual"),
-    ("toolchain/wasm32/zan_inflate.o", INFLATE, "manual"),
+    # wasm32 console bundle: the wasm32-objects job (toolchain.yml) owns
+    # these since 2026-10-26 -- scripts/build_wasm_rt.sh (bash port of the
+    # .cmd's wasm32 block) rebuilds them on one Linux runner. Feature
+    # objects below stay "manual" on purpose, same policy as the native
+    # feature drivers (the gui one wants an external freetype checkout;
+    # ehtag needs mozbuild clang's wasm EH backend).
+    ("toolchain/wasm32/zanrt_wasm.o", RT_WASM, "runtime"),
+    ("toolchain/wasm32/zanrt_file.o", RT_FILE, "runtime"),
+    ("toolchain/wasm32/zanrt_decimal.o", RT_DECIMAL, "runtime"),
+    ("toolchain/wasm32/zanrt_timer.o", RT_TIMER, "runtime"),
+    ("toolchain/wasm32/libzancrypto.a", RT_CRYPTO, "runtime"),
+    ("toolchain/wasm32/zan_inflate.o", INFLATE, "runtime"),
+    ("toolchain/wasm32/zanrt_syncw.o", ["src/runtime/rt_sync_wasm.c"], "runtime"),
     # Built with mozbuild clang -fexceptions -mllvm -wasm-enable-eh (zig's
     # clang cannot emit the tag); source lives beside the object. The commit
     # below it keeps the artifact fresh by hand -- see build_cross_rt.cmd.
@@ -202,7 +207,6 @@ ARTIFACTS = [
     ("toolchain/wasm32/zanrt_image.o", IMAGE, "manual"),
     ("toolchain/wasm32/zanrt_audio.o", AUDIO, "manual"),
     ("toolchain/wasm32/zanrt_game.o", GAME, "manual"),
-    ("toolchain/wasm32/zanrt_syncw.o", ["src/runtime/rt_sync_wasm.c"], "manual"),
     # wasi-libc subset + external prebuilts (freetype archive): no repo source.
     ("toolchain/wasm32/crt1.o", ZIG_BUNDLED, "manual"),
     ("toolchain/wasm32/libc.a", ZIG_BUNDLED, "manual"),
