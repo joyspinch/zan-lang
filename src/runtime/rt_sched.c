@@ -20,6 +20,11 @@
 #include <windows.h>
 #else
 #include <sys/mman.h>
+/* Darwin 的 mmap 只有 MAP_ANON（即使 _XOPEN_SOURCE/_GNU_SOURCE 也不给
+ * MAP_ANONYMOUS 拼写）；栈池的 mmap 两侧统一走这个别名。 */
+#if !defined(MAP_ANONYMOUS) && defined(MAP_ANON)
+#define MAP_ANONYMOUS MAP_ANON
+#endif
 #include <ucontext.h>
 #include <time.h>
 #include <unistd.h>

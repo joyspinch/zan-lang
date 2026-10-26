@@ -11,8 +11,11 @@
 #define rmdir _rmdir
 #define unlink _unlink
 #else
-#include <sys/stat.h> /* mkdir */
+#include <sys/stat.h>
 #include <unistd.h>
+/* 调用点按 Windows 形状写单参 mkdir；POSIX 的真签名带 mode，这里对齐
+ * （_GNU_SOURCE 起声明可见后，单参调用会撞 too-few-arguments 硬错误）。 */
+#define mkdir(p) mkdir((p), 0755)
 #endif
 
 static int failures = 0;

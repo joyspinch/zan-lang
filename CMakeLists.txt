@@ -189,6 +189,16 @@ else()
 endif()
 target_compile_definitions(zanc PRIVATE ${LLVM_DEFINITIONS})
 if(WIN32)
+    # MSYS2 的 mingw-w64 头（crt 14.0.0.r536+）：裸 <windows.h> 走
+    # winscard.h → wtypes.h → rpcndr.h → rpcnsip.h 支路，而 rpcnsip.h 在
+    # RPC_NS_HANDLE 有 typedef 之前就使用它，直接编译失败（runner 镜像
+    # 升头文件后引爆）。LEAN_AND_MEAN 掐断 winscard/rpc/shell/winsock 支路；
+    # zanc 的 Windows 调用面只有 kernel32（CreateProcess 族）与 shell32 的
+    # GetProcAddress 动态加载，不依赖任何被排除的头。只对 zanc 生效，
+    # lsp/dap 等保持完整 windows.h。
+    target_compile_definitions(zanc PRIVATE WIN32_LEAN_AND_MEAN)
+endif()
+if(WIN32)
     # emit_stmt keeps every AST case in one function, so its frame is ~6KB
     # (Release) / far larger in Debug; the stdlib carries else-if chains
     # hundreds of levels deep (Theme.SetToken, IconVector.Draw), and
