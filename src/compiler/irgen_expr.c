@@ -11685,7 +11685,7 @@ static LLVMValueRef emit_unbox_struct(zan_irgen_t *g, zan_type_t *tt,
         LLVMConstInt(LLVMInt1TypeInContext(g->ctx), 1, 0),
         expr->loc,
         "InvalidCastException: object is not an instance of the target struct type");
-    LLVMValueRef bad_end = LLVMGetInsertBlock(g->builder);
+    LLVMBasicBlockRef bad_end = LLVMGetInsertBlock(g->builder);
     LLVMBuildBr(g->builder, m_bb);
     LLVMPositionBuilderAtEnd(g->builder, m_bb);
     LLVMValueRef phi = LLVMBuildPhi(g->builder, lt, "unbox.r");

@@ -2,6 +2,11 @@
 #if defined(__APPLE__) && !defined(_XOPEN_SOURCE)
 #define _XOPEN_SOURCE 700
 #endif
+/* _XOPEN_SOURCE 在 Darwin 上等效关掉 BSD 层，MAP_ANON 藏在 _DARWIN_C_SOURCE
+ * 之后（Linux 的 _GNU_SOURCE 管不着这里）——栈池的 mmap 需要它。 */
+#if defined(__APPLE__) && !defined(_DARWIN_C_SOURCE)
+#define _DARWIN_C_SOURCE 1
+#endif
 
 #if defined(_WIN32) && !defined(_WIN32_WINNT)
 #define _WIN32_WINNT 0x0601

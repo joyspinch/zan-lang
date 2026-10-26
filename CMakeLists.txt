@@ -187,7 +187,13 @@ elseif(WIN32)
 else()
     target_link_libraries(zanc PRIVATE ${LLVM_LIBS} ${LLVM_SYSTEM_LIBS} stdc++ m pthread)
 endif()
-target_compile_definitions(zanc PRIVATE ${LLVM_DEFINITIONS})
+# LLVM_DEFINITIONS is a single STRING ("-DFOO=1 -DBAR=2"); handed to
+# target_compile_definitions unsplit it becomes ONE macro whose value is the
+# rest of the line — on MSYS2's LLVM 23 that macro is _GLIBCXX_USE_CXX11_ABI,
+# and the C++ TU (irgen_compact.cpp) then fails "#if _GLIBCXX_USE_CXX11_ABI"
+# with "token '=' is not valid in preprocessor expressions". Split on spaces.
+separate_arguments(_llvm_defs_list NATIVE_COMMAND "${LLVM_DEFINITIONS}")
+target_compile_definitions(zanc PRIVATE ${_llvm_defs_list})
 if(WIN32)
     # MSYS2 的 mingw-w64 头（crt 14.0.0.r536+）：裸 <windows.h> 走
     # winscard.h → wtypes.h → rpcndr.h → rpcnsip.h 支路，而 rpcnsip.h 在
@@ -793,11 +799,21 @@ if(ZAN_BUILD_GUI)
     # logic (object/string layout, calling conventions, reflection protocol),
     # not in any C header ninja could track. A zanc-only rebuild therefore
     # used to leave a stale-generation zan_gui.dll in build/ (GUI exes hung in
-    # App.PumpGuarded). Pinning the zanc executable as a compile dependency of
-    # both sources forces a same-generation recompile whenever zanc relinks --
-    # two files, a few seconds.
+    # App.PumpGuarded). The compile dependency must be a FILE, but pinning the
+    # zanc executable itself breaks the Makefile generator: the per-target
+    # submake has no rule for it ("No rule to make target 'zanc'"), and even
+    # where it resolves, a pure relink bumps the mtime and recompiles even
+    # when the binary bytes are unchanged. So zanc's POST_BUILD publishes a
+    # content probe (copy_if_different: new mtime only when bytes change) and
+    # the sources pin the probe; add_dependencies orders zan_gui after zanc so
+    # the probe always exists before the staleness check reads it.
+    set(ZAN_ABI_PROBE "${CMAKE_BINARY_DIR}/zanc_abi_probe.bin")
+    add_custom_command(TARGET zanc POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                $<TARGET_FILE:zanc> ${ZAN_ABI_PROBE}
+        VERBATIM)
     set_source_files_properties(src/runtime/gui_runtime.c src/runtime/gui_runtime_dwrite.cpp
-        PROPERTIES OBJECT_DEPENDS "${CMAKE_BINARY_DIR}/zanc${CMAKE_EXECUTABLE_SUFFIX}")
+        PROPERTIES OBJECT_DEPENDS "${ZAN_ABI_PROBE}")
     if(WIN32)
         # gui_runtime_dwrite.cpp: DirectWrite glyph fallback (color emoji).
         # C++ because the SDK's dwrite.h only parses as C++; the rest of the
@@ -839,6 +855,11 @@ if(ZAN_BUILD_GUI)
         else()
             message(WARNING "libX11 not found; skipping zan_gui (Gui conformance tests will be disabled)")
         endif()
+    endif()
+    if(ZAN_GUI_AVAILABLE)
+        # Order-only edge: zanc (and its POST_BUILD probe refresh) before the
+        # zan_gui submake reads the probe. See the B-ID23 comment above.
+        add_dependencies(zan_gui zanc)
     endif()
 endif()
 
