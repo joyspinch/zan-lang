@@ -34,9 +34,11 @@ chmod +x ff_bidi_demo-macos-arm64
 ./ff_bidi_demo-macos-arm64
 ```
 
-Firefox 来源与 `gui_firefox_browser` 相同：`ZAN_FF_EXE` 环境变量 →
-标准安装位置（macOS 是 `/Applications/Firefox.app`）。**自建/裁剪版
-Firefox 可能无法建立自动化会话，请用官方构建。**
+Firefox 来源：`ZAN_FF_EXE` 环境变量 → 注册表/标准安装位置 →
+**都没有时自动从 Mozilla 官方源下载最新版并静默安装到用户级缓存**
+（`<缓存根>/runtime/`，非 admin、无 UAC；下载有进度窗/控制台进度，
+`ZAN_FF_DOWNLOAD_UI=0` 关窗）。**自建/裁剪版 Firefox 可能无法建立
+自动化会话，请用官方构建。**
 
 ## 版本兼容（Win7 = Firefox 115 ESR）
 

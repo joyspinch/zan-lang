@@ -84,6 +84,44 @@ public class FfHostWin {
                                     int flags, nint typeOut, nint dataBuf,
                                     nint dataLen);
 
+    [DllImport("advapi32", EntryPoint = "RegOpenKeyExW")]
+    public static extern int RegOpenKey(nint hkey, nint subKey, int options,
+                                    int samDesired, nint resultOut);
+    [DllImport("advapi32", EntryPoint = "RegEnumKeyExW")]
+    public static extern int RegEnumKey(nint hkey, int index, nint nameBuf,
+                                    nint nameLen, nint classOut,
+                                    nint classLen, nint timeOut, nint reserved);
+    [DllImport("advapi32", EntryPoint = "RegCloseKey")]
+    public static extern int RegCloseKey(nint hkey);
+
+    // 枚举 hkey 下所有子键名（KEY_READ；失败返回空表）。
+    public static List<string> RegSubKeys(nint hkey, string subKey) {
+        List<string> outp = new List<string>();
+        nint k = Wide.Of(subKey);
+        nint opened = NativeMemory.Alloc(8);
+        // KEY_READ = 0x20019。
+        int rc = RegOpenKey(hkey, k, 0, 0x20019, opened);
+        Wide.Free(k);
+        if (rc != 0) { NativeMemory.Free(opened); return outp; }
+        nint key = (nint)new Span<long>(opened, 1)[0];
+        nint nameBuf = NativeMemory.Alloc(512);
+        for (int i2 = 0; i2 < 64; i2 = i2 + 1) {
+            nint len = NativeMemory.Alloc(4);
+            new Span<int>(len, 1)[0] = 256;
+            int r = RegEnumKey(key, i2, nameBuf, len, 0, 0, 0, 0);
+            if (r != 0) { NativeMemory.Free(len); break; }
+            int n = new Span<int>(len, 1)[0];
+            // W API 的长度单位是 UTF-16 字符，字节长度要乘 2。
+            string name = NativeMemory.GetString(nameBuf, 0, n * 2);
+            NativeMemory.Free(len);
+            if (name != "") { outp.Add(name); }
+        }
+        NativeMemory.Free(nameBuf);
+        RegCloseKey(key);
+        NativeMemory.Free(opened);
+        return outp;
+    }
+
     // 从注册表读一个 REG_SZ（找不到或非字符串返回 ""）。
     public static string RegGetString(nint hkey, string subKey, string value) {
         nint k = Wide.Of(subKey);
@@ -109,15 +147,19 @@ public class FfHostWin {
     // 唯一可靠来源（App Paths 与 Mozilla 自家的 CurrentVersion\Main）。
     // 找不到或登记的文件已不存在返回 ""。
     public static string RegistryFirefoxPath() {
-        // HKEY_LOCAL_MACHINE = 0x80000002。
+        // HKEY_LOCAL_MACHINE = 0x80000002。安装器的登记分散在
+        // SOFTWARE\Mozilla\Mozilla Firefox\<版本>\Main\PathToExe
+        // （版本子键名随版本/语言变化，必须枚举）与 App Paths。
         nint hklm = (nint)0x80000002;
-        string p = FfHostWin.RegGetString(hklm,
-            "SOFTWARE\\Mozilla\\Mozilla Firefox\\CurrentVersion\\Main",
-            "PathToExe");
-        if (p != "" && File.Exists(p)) { return p; }
-        p = FfHostWin.RegGetString(hklm,
-            "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\App Paths\\firefox.exe",
-            "");
+        List<string> subs = FfHostWin.RegSubKeys(hklm,
+            "SOFTWARE\\Mozilla\\Mozilla Firefox");
+        string p = "";
+        for (int i = 0; i < subs.Count; i = i + 1) {
+            p = FfHostWin.RegGetString(hklm,
+                "SOFTWARE\\Mozilla\\Mozilla Firefox\\" + subs[i]
+                    + "\\Main", "PathToExe");
+            if (p != "" && File.Exists(p)) { return p; }
+        }
         if (p != "" && File.Exists(p)) { return p; }
         return "";
     }

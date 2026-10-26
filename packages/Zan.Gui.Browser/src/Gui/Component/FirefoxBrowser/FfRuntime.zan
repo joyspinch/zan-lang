@@ -1,0 +1,303 @@
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.IO;
+using System.Json;
+using System.Net.Http;
+using System.Net.Http.Download;
+using System.Threading;
+
+namespace Gui.Component.FirefoxBrowser;
+
+// Firefox 运行时自举：本机没有可用的 Firefox 时，从 Mozilla 官方
+// HTTPS 源下载并装到用户级缓存——不碰系统目录、不需要管理员权限：
+// - Windows：官方安装器 + /S /InstallDirectoryPath=<缓存>（实测非
+//   admin 无 UAC，安装器退出码 0）。
+// - macOS：官方 dmg → hdiutil 只读挂载 → cp -R Firefox.app → 卸载。
+// - Linux：官方 tar.bz2 → tar -xjf 解包（顶层 firefox/ 目录保留）。
+// 版本：ZAN_FF_VERSION 覆盖 → product-details.mozilla.org 的
+// LATEST_FIREFOX_VERSION。全部走 ftp.mozilla.org/product-details 的
+// 直连 HTTPS（无重定向），带响应体上限与总超时预算。
+public class FfRuntime {
+    public static string lastError = "";
+    // 准备/安装阶段写下的运行时目录与版本（DownloadJob 是单任务
+    // 语义：worker 线程写、收工后同一个调用流读）。
+    public static string pendingDir;
+    public static string pendingVersion;
+    // 任务成功收工后的 Firefox 可执行文件路径。
+    public static string pendingExe;
+
+    static void Fail(string msg) { FfRuntime.lastError = msg; }
+
+    // 运行时缓存根：<FfHost.CacheRoot()>/runtime/<版本>/。
+    public static string RuntimeDir(string ver) {
+        return FfHost.CacheRoot() + "/runtime/" + FfRuntime.SafeVersion(ver);
+    }
+
+    public static string DownloadDir() {
+        return FfHost.CacheRoot() + "/runtime-download";
+    }
+
+    static string SafeVersion(string v) {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < v.Length; i = i + 1) {
+            char c = v[i];
+            bool ok = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z')
+                || (c >= 'A' && c <= 'Z') || c == '.' || c == '-' || c == '_';
+            sb.Append(ok ? c : '_');
+        }
+        return sb.ToString();
+    }
+
+    // 该目录是否已完整安装（对应平台的 Firefox 主程序 + 就绪标记）。
+    public static bool IsReady(string dir) {
+        #if WINDOWS
+        return File.Exists(dir + "/firefox.exe")
+            && File.Exists(dir + "/ready.zan-ff");
+        #elif MACOS
+        return File.Exists(dir + "/Firefox.app/Contents/MacOS/firefox")
+            && File.Exists(dir + "/ready.zan-ff");
+        #else
+        return File.Exists(dir + "/firefox/firefox")
+            && File.Exists(dir + "/ready.zan-ff");
+        #endif
+    }
+
+    // 缓存里已装好的 Firefox 可执行文件路径（挑版本号最新的一个就绪
+    // 目录）；不联网。没有则 ""。
+    public static string InstalledExe() {
+        string root = FfHost.CacheRoot() + "/runtime";
+        if (!Directory.Exists(root)) { return ""; }
+        List<string> subs = Directory.GetDirectories(root);
+        string bestDir = "";
+        string bestVer = "";
+        for (int i = 0; i < subs.Count; i = i + 1) {
+            string dir = subs[i];
+            if (!FfRuntime.IsReady(dir)) { continue; }
+            string ver = dir.Substring(dir.LastIndexOf("/") + 1);
+            if (bestDir == "" || FfRuntime.VersionNewer(ver, bestVer)) {
+                bestDir = dir;
+                bestVer = ver;
+            }
+        }
+        return FfRuntime.ExeOf(bestDir);
+    }
+
+    static string ExeOf(string dir) {
+        if (dir == "") { return ""; }
+        #if WINDOWS
+        return dir + "/firefox.exe";
+        #elif MACOS
+        return dir + "/Firefox.app/Contents/MacOS/firefox";
+        #else
+        return dir + "/firefox/firefox";
+        #endif
+    }
+
+    // 版本号比较：按 '.' 分段逐段比数值，段数不同短的在前算旧。
+    static bool VersionNewer(string a, string b) {
+        List<string> pa = a.Split('.');
+        List<string> pb = b.Split('.');
+        int n = pa.Count < pb.Count ? pa.Count : pb.Count;
+        for (int i = 0; i < n; i = i + 1) {
+            long x = pa[i].ToInt32();
+            long y = pb[i].ToInt32();
+            if (x != y) { return x > y; }
+        }
+        return pa.Count > pb.Count;
+    }
+
+    // ---- 版本解析 ------------------------------------------------------
+
+    // ZAN_FF_VERSION 覆盖 → product-details 的 LATEST_FIREFOX_VERSION。
+    public static async string ResolveVersionAsync() {
+        string pinned = Interop.EnvVar("ZAN_FF_VERSION");
+        if (pinned != "") { return pinned; }
+        Directory.CreateDirectoryRecursive(FfRuntime.DownloadDir());
+        string dest = FfRuntime.DownloadDir() + "/firefox_versions.json";
+        HttpClient client = HttpClient.CreateHttps(
+            "product-details.mozilla.org", 443);
+        client.SetCallPolicy(FfRuntime.VersionPolicy());
+        client.SetTimeout(30000);
+        long n = 0 - 1;
+        for (int attempt = 0; attempt < 2; attempt = attempt + 1) {
+            if (File.Exists(dest)) { File.Delete(dest); }
+            n = await client.DownloadBinaryToFileAsync(
+                "/1.0/firefox_versions.json", dest, dest + ".progress");
+            if (n > 0) {
+                File.Delete(dest + ".progress");
+                string body = File.ReadAllText(dest);
+                JsonValue v = JsonValue.ParseOrStr(body);
+                JsonValue lv = v != null ? v.Get("LATEST_FIREFOX_VERSION")
+                    : null;
+                if (lv != null && lv.AsString("") != "") {
+                    return lv.AsString("");
+                }
+                FfRuntime.Fail("版本索引里没有 LATEST_FIREFOX_VERSION");
+                return "";
+            }
+        }
+        FfRuntime.Fail("下载 Firefox 版本索引失败（检查网络与代理）："
+            + client.LastDownloadError());
+        return "";
+    }
+
+    // 版本索引的预算：响应体上限 1 MiB、总超时 30 秒。
+    public static ExternalCallPolicy VersionPolicy() {
+        return ExternalCallPolicy.Default()
+            .TotalTimeout(30000)
+            .ResponseLimit(1024 * 1024)
+            .StreamLimit(1024 * 1024)
+            .Redirects(0)
+            .RetryNetwork(false)
+            .RetryAttempts(0);
+    }
+
+    // 归档下载的预算：响应体上限 384 MiB（安装器/dmg/tar 都远小于
+    // 此）、总超时 10 分钟。
+    public static ExternalCallPolicy ArchivePolicy() {
+        return ExternalCallPolicy.Default()
+            .TotalTimeout(600000)
+            .ResponseLimit(384L * 1024 * 1024)
+            .StreamLimit(384L * 1024 * 1024)
+            .Redirects(0)
+            .RetryNetwork(false)
+            .RetryAttempts(0);
+    }
+
+    // ---- 下载任务 ------------------------------------------------------
+
+    // 把自举做成通用 DownloadJob（宿主用 DownloadDialog 显示进度）。
+    // ver 由调用方先 ResolveVersionAsync 解析好再传入——**准备回调必须
+    // 纯同步**：含 await 的方法经同步委托调用时，协程在第一个挂起点
+    // 就孤儿化（同步调用点立即拿到未完成返回值），任务层瞬间假收工。
+    public static DownloadJob NewEnsureJob(string ver) {
+        FfRuntime.lastError = "";
+        FfRuntime.pendingDir = "";
+        FfRuntime.pendingVersion = "";
+        FfRuntime.pendingExe = "";
+        DownloadJob job = new DownloadJob();
+        job.SetPrepare((DownloadJob j) => {
+            return FfRuntime.PrepareJob(j, ver);
+        });
+        return job;
+    }
+
+    // 任务的准备回调（工作线程，纯同步）：装好了直接收工；否则加
+    // 一条下载条目，安装步骤走本类的 <see cref="InstallItem"/>。
+    public static bool PrepareJob(DownloadJob job, string ver) {
+        string have = FfRuntime.InstalledExe();
+        if (have != "") {
+            FfRuntime.pendingExe = have;
+            return true;
+        }
+        string dir = FfRuntime.RuntimeDir(ver);
+        FfRuntime.pendingDir = dir;
+        FfRuntime.pendingVersion = ver;
+        Directory.CreateDirectoryRecursive(FfRuntime.DownloadDir());
+        string fileName = FfRuntime.ReleaseFile(ver);
+        string archive = FfRuntime.DownloadDir() + "/" + fileName;
+        // releases 文件名带空格，URL 里必须编码成 %20，否则解析拒收。
+        string url = "https://ftp.mozilla.org"
+            + FfRuntime.ReleaseDir(ver) + "/"
+            + fileName.Replace(" ", "%20");
+        DownloadItem it = DownloadItem.FromUrl(url, archive);
+        if (it == null) {
+            FfRuntime.Fail("下载地址异常：" + url);
+            return false;
+        }
+        job.Add(it.WithName(fileName)
+            .WithInstaller(FfRuntime.InstallItem));
+        return true;
+    }
+
+    // releases 目录里的平台文件名与目录（URL 已是直链、无重定向）。
+    static string ReleaseFile(string ver) {
+        #if WINDOWS
+        return "Firefox Setup " + ver + ".exe";
+        #elif MACOS
+        return "Firefox " + ver + ".dmg";
+        #else
+        return "firefox-" + ver + ".tar.bz2";
+        #endif
+    }
+
+    static string ReleaseDir(string ver) {
+        #if WINDOWS
+        return "/pub/firefox/releases/" + ver + "/win64/en-US";
+        #elif MACOS
+        return "/pub/firefox/releases/" + ver + "/mac/en-US";
+        #else
+        return "/pub/firefox/releases/" + ver + "/linux-x86_64/en-US";
+        #endif
+    }
+
+    // 任务的安装步骤（工作线程）：按平台把下好的归档装进
+    // pendingDir，打就绪标记，回填 pendingExe。
+    public static bool InstallItem(DownloadItem it) {
+        string dir = FfRuntime.pendingDir;
+        Console.WriteLine("[ff-install] begin: " + it.LocalPath() + " -> " + dir);
+        Directory.CreateDirectoryRecursive(dir);
+        #if WINDOWS
+        // 静默安装到指定目录：非 admin、无 UAC（实测）。安装器要跑
+        // 几十秒且无进度输出，进度窗在此期间停在"安装"阶段。
+        ProcessResult r = Process.CaptureSafe(it.LocalPath(),
+            new List<string>(new string[] {
+                "/S", "/InstallDirectoryPath=" + dir.Replace("/", "\\") }),
+            600000);
+        Console.WriteLine("[ff-install] installer exit=" + r.exitCode);
+        if (r.exitCode != 0) {
+            FfRuntime.Fail("Firefox 安装器退出码 " + r.exitCode);
+            return false;
+        }
+        #elif MACOS
+        // 挂载 dmg → 拷贝 Firefox.app → 卸载。
+        string mnt = FfRuntime.DownloadDir() + "/mnt";
+        Directory.CreateDirectoryRecursive(mnt);
+        ProcessResult att = Process.CaptureSafe("/usr/bin/hdiutil",
+            new List<string>(new string[] { "attach", it.LocalPath(),
+                "-nobrowse", "-readonly", "-mountpoint", mnt }), 120000);
+        if (att.exitCode != 0) {
+            FfRuntime.Fail("hdiutil attach 失败：" + att.exitCode);
+            return false;
+        }
+        ProcessResult cp = Process.CaptureSafe("/bin/cp",
+            new List<string>(new string[] { "-R",
+                mnt + "/Firefox.app", dir + "/Firefox.app" }), 300000);
+        Process.CaptureSafe("/usr/bin/hdiutil",
+            new List<string>(new string[] { "detach", mnt }), 60000);
+        if (cp.exitCode != 0) {
+            FfRuntime.Fail("拷贝 Firefox.app 失败：" + cp.exitCode);
+            return false;
+        }
+        #else
+        // 官方 tar.bz2（顶层 firefox/ 目录保留）。
+        ProcessResult r2 = Process.CaptureSafe("/usr/bin/tar",
+            new List<string>(new string[] { "-xjf", it.LocalPath(),
+                "-C", dir }), 600000);
+        if (r2.exitCode != 0) {
+            FfRuntime.Fail("tar 解包失败：" + r2.exitCode
+                + "（需要 bzip2）");
+            return false;
+        }
+        #endif
+        if (!FfRuntime.IsReady(dir)) {
+            FfRuntime.Fail("安装后未找到 Firefox 主程序：" + dir);
+            return false;
+        }
+        File.WriteAllText(dir + "/ready.zan-ff", FfRuntime.pendingVersion);
+        FfRuntime.pendingExe = FfRuntime.ExeOf(dir);
+        return true;
+    }
+
+    // 任务成功收工后的 Firefox 可执行路径；没装好 ""。
+    public static string EnsuredExe() {
+        string have = FfRuntime.InstalledExe();
+        if (have != "") { return have; }
+        if (FfRuntime.pendingExe != ""
+                && File.Exists(FfRuntime.pendingExe)) {
+            return FfRuntime.pendingExe;
+        }
+        return "";
+    }
+}
