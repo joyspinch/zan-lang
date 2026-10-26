@@ -1,0 +1,252 @@
+using System;
+using System.Diagnostics;
+using Gui;
+using Gui.Widget;
+using Gui.Component.FirefoxBrowser;
+
+// 真 Firefox 的多标签浏览器示例：每个标签一个 FfBrowserBox。它拉起一个
+// 独立的 Firefox 子进程（专属 profile、-no-remote 多开），把 Firefox 的
+// 原生窗口寄宿进控件矩形，导航/标题/JS 走 Firefox 内置的 Marionette
+// 协议。与 examples/gui_cef_browser 完全同构，只是引擎从进程内 CEF 换
+// 成了外挂的真 Firefox——网页兼容性就是用户桌面那个 Firefox 的兼容性，
+// 指纹也是它自己的。
+// 与 CEF 版的差异：没有运行时下载（用的是本机已装的 Firefox，找不到时
+// 控件画占位符说明原因，可用 ZAN_FF_EXE 指定路径）；每个标签一个独立
+// Firefox 进程，关标签即退进程。
+// 跑起来：
+// build/ffbrowser [起始地址]
+// 没装 Firefox 时：set ZAN_FF_EXE=D:\path\to\firefox.exe 后再跑。
+public class FfBrowserDemo {
+    static Form form;
+    // 标签条兼页容器：第 i 页里装着第 i 个浏览器。
+    static Tabs tabs;
+    // 与标签一一对应的浏览器（下标 = 标签索引）。
+    static List<FfBrowserBox> views;
+    static Input address;
+    static Label status;
+    static string home;
+    // 已回填进地址栏的地址：只在导航落地后回填一次，避免
+    // http→https 的重定向中间态让地址栏闪烁。
+    static string shownUrl;
+    // 上一次同步时的活动标签：切标签要无条件回填一次它的地址，
+    // 不能等“加载完成”——新标签还在加载时地址栏会一直停在旧页。
+    static int shownTab;
+    // 用户正在改地址栏：期间不回填，免得异步来的 URL 把打的字冲掉。
+    // 回车导航（或切标签）后复位。
+    static bool editing;
+    // 启动计时：Firefox 冷启动要几秒（进程 + 窗口 + Marionette 会话），
+    // 拆出「首屏」总耗时。
+    static Stopwatch boot;
+    static bool bootLogged;
+
+    static int Main() {
+        FfBrowserDemo.boot = Stopwatch.StartNew();
+        FfBrowserDemo.bootLogged = false;
+        // 浏览器控件工厂注册进 ControlFactory（设计文档/序列化通道用）。
+        FfControlBootstrap.Install();
+
+        FfBrowserDemo.home = "https://www.example.com";
+        if (Environment.ArgCount() > 0) {
+            FfBrowserDemo.home = Environment.ArgAt(0);
+        }
+        FfBrowserDemo.shownUrl = "";
+        FfBrowserDemo.shownTab = 0 - 1;
+        FfBrowserDemo.editing = false;
+
+        Form f = Form.CreateDark("Zan Firefox Browser", 1200, 800);
+        FfBrowserDemo.form = f;
+        App app = f.GetApp();
+
+        // ---- 工具栏：一行三个圆形图标按钮 + 吃掉剩余宽度的地址栏 ----
+        // 行内子节点用 With() 追加（它才会按流式轴自动停靠；Add() 只挂节点，
+        // 子节点仍是手动定位，全部叠在行首互相遮挡）。
+        Button back = new Button { Icon = "arrow-left", Class = "circle" };
+        back.Click += FfBrowserDemo.OnBack;
+        Button fwd = new Button { Icon = "arrow-right", Class = "circle" };
+        fwd.Click += FfBrowserDemo.OnForward;
+        Button reload = new Button { Icon = "refresh", Class = "circle" };
+        reload.Click += FfBrowserDemo.OnReload;
+
+        FfBrowserDemo.address = new Input("输入网址后回车");
+        FfBrowserDemo.address.Submit += FfBrowserDemo.OnSubmit;
+        FfBrowserDemo.address.Change += FfBrowserDemo.OnAddressEdited;
+        FfBrowserDemo.address.Grow();
+
+        Panel bar = Panel.Row();
+        bar.Dock(Dock.Top());
+        bar.Pad(app.Scale(8));
+        bar.Gap(app.Scale(6));
+        bar.With(back).With(fwd).With(reload).With(FfBrowserDemo.address);
+
+        FfBrowserDemo.status = new Label("就绪");
+        FfBrowserDemo.status.Dock(Dock.Bottom());
+        FfBrowserDemo.status.Pad(app.Scale(6));
+
+        // ---- 标签条：标签下面就是页面区，活动页铺满、其余页隐藏 ----
+        FfBrowserDemo.tabs = new Tabs(Tabs.Card());
+        FfBrowserDemo.tabs.SetShowAdd(true);
+        FfBrowserDemo.tabs.Dock(Dock.Fill());
+        FfBrowserDemo.tabs.TabAdded += FfBrowserDemo.OnTabAdded;
+        FfBrowserDemo.tabs.TabClosed += FfBrowserDemo.OnTabClosed;
+        FfBrowserDemo.tabs.TabChanged += FfBrowserDemo.OnTabChanged;
+
+        f.Add(bar);
+        f.Add(FfBrowserDemo.status);
+        f.Add(FfBrowserDemo.tabs);
+
+        FfBrowserDemo.views = new List<FfBrowserBox>();
+        FfBrowserDemo.NewTab(FfBrowserDemo.home);
+        // 首屏耗时按导航完成事件计。
+        FfBrowserDemo.views[0].View().NavComplete += FfBrowserDemo.OnFirstReady;
+
+        // 页面标题 / 地址 / 加载状态由 Firefox 异步更新（Marionette 轮询），
+        // 定时同步进标签文本、地址栏和状态行。
+        f.Every(250, FfBrowserDemo.Sync);
+
+        f.Run();
+        return 0;
+    }
+
+    // ---- 标签模型 ----------------------------------------------------
+
+    // 建一个新标签：标签条添一项，它的页里放一个浏览器。
+    static void NewTab(string url) {
+        FfBrowserBox box = new FfBrowserBox();
+        box.SetStartUrl(url);
+        box.Dock(Dock.Fill());
+        FfBrowserDemo.views.Add(box);
+        FfBrowserDemo.tabs.AddPage("新标签", box, true);
+        FfBrowserDemo.tabs.Select(FfBrowserDemo.tabs.Count() - 1);
+        FfBrowserDemo.shownUrl = "";
+    }
+
+    // 把第 i 个标签的浏览器挂进它的页容器。
+    static void AttachView(int i, string url) {
+        FfBrowserBox box = new FfBrowserBox();
+        box.SetStartUrl(url);
+        box.Dock(Dock.Fill());
+        FfBrowserDemo.tabs.Page(i).Add(box);
+        FfBrowserDemo.views.Add(box);
+    }
+
+    static FfBrowserBox Active() {
+        int i = FfBrowserDemo.tabs.Active();
+        if (i < 0 || i >= FfBrowserDemo.views.Count) { return null; }
+        return FfBrowserDemo.views[i];
+    }
+
+    // 标签条上的「+」：新标签用主页地址。
+    static void OnTabAdded() {
+        int i = FfBrowserDemo.tabs.TakeAdded();
+        if (i < 0) { return; }
+        // Tabs 自己已经添好了标签项，这里只补它的页和浏览器。
+        if (i == FfBrowserDemo.views.Count) {
+            FfBrowserDemo.AttachView(i, FfBrowserDemo.home);
+        }
+        FfBrowserDemo.tabs.SetLabel(i, "新标签");
+        FfBrowserDemo.shownUrl = "";
+    }
+
+    // 关标签：Tabs 已经摘掉了那一页，这里关掉它的 Firefox（进程退出）。
+    static void OnTabClosed() {
+        int i = FfBrowserDemo.tabs.TakeClosed();
+        if (i < 0 || i >= FfBrowserDemo.views.Count) { return; }
+        FfBrowserDemo.views[i].Destroy();
+        FfBrowserDemo.views.RemoveAt(i);
+        if (FfBrowserDemo.views.Count == 0) {
+            FfBrowserDemo.NewTab(FfBrowserDemo.home);
+            return;
+        }
+        FfBrowserDemo.OnTabChanged();
+    }
+
+    // 切标签：非活动标签的 Firefox 窗口显式收起（隐藏的页不再绘制，
+    // 原生层不会自己让位），地址栏改回填新活动页。
+    static void OnTabChanged() {
+        for (int i = 0; i < FfBrowserDemo.views.Count; i = i + 1) {
+            if (i != FfBrowserDemo.tabs.Active()) {
+                FfBrowserDemo.views[i].Hide();
+            }
+        }
+        FfBrowserDemo.shownUrl = "";
+        FfBrowserDemo.Sync();
+    }
+
+    // ---- 工具栏动作 --------------------------------------------------
+
+    static void OnSubmit() {
+        FfBrowserBox b = FfBrowserDemo.Active();
+        if (b == null) { return; }
+        string u = FfBrowserDemo.address.GetText();
+        if (u == "") { return; }
+        FfBrowserDemo.editing = false;
+        FfBrowserDemo.shownUrl = u;
+        b.Navigate(u);
+    }
+
+    static void OnAddressEdited() { FfBrowserDemo.editing = true; }
+
+    static void OnBack() {
+        FfBrowserBox b = FfBrowserDemo.Active();
+        if (b != null) { b.Back(); }
+    }
+
+    static void OnForward() {
+        FfBrowserBox b = FfBrowserDemo.Active();
+        if (b != null) { b.Forward(); }
+    }
+
+    static void OnReload() {
+        FfBrowserBox b = FfBrowserDemo.Active();
+        if (b != null) { b.Reload(); }
+    }
+
+    // 第一个标签首次导航完成：报出「进程启动 → 首屏」总耗时。
+    static void OnFirstReady() {
+        if (FfBrowserDemo.bootLogged) { return; }
+        FfBrowserDemo.bootLogged = true;
+        Console.WriteLine("首屏完成（自进程启动 " +
+            Convert.ToString(FfBrowserDemo.boot.ElapsedMilliseconds()) +
+            " ms）");
+    }
+
+    // ---- 同步显示 ----------------------------------------------------
+
+    // 每个标签的标题回填标签文本；活动页的地址和加载状态回填地址栏
+    // 与状态行。
+    static void Sync() {
+        for (int i = 0; i < FfBrowserDemo.views.Count; i = i + 1) {
+            string t = FfBrowserDemo.views[i].CurrentTitle();
+            if (t != "") { FfBrowserDemo.tabs.SetLabel(i, t); }
+        }
+
+        FfBrowserBox b = FfBrowserDemo.Active();
+        if (b == null) { return; }
+
+        // 地址栏回填：切标签时无条件跟上活动页（哪怕还在加载），
+        // 其余时候只在导航落地后回填一次。地址栏正被编辑（有键盘
+        // 焦点）时一律不覆盖，否则用户打的字会被异步的 URL 冲掉。
+        int tab = FfBrowserDemo.tabs.Active();
+        bool switched = tab != FfBrowserDemo.shownTab;
+        FfBrowserDemo.shownTab = tab;
+        if (switched) { FfBrowserDemo.editing = false; }
+        if (!FfBrowserDemo.editing && (switched || !b.IsLoading())) {
+            string u = b.CurrentUrl();
+            if (u == "") { u = b.StartUrl(); }
+            if (u != "" && (switched || u != FfBrowserDemo.shownUrl)) {
+                FfBrowserDemo.address.SetText(u);
+                FfBrowserDemo.shownUrl = u;
+            }
+        }
+
+        string state = "就绪";
+        if (!b.IsSupported()) {
+            state = "Firefox 不可用";
+        } else if (b.IsLoading()) {
+            state = "加载中...";
+        }
+        string title = b.CurrentTitle();
+        if (title == "") { title = "(无标题)"; }
+        FfBrowserDemo.status.Text = state + "   ·   " + title;
+    }
+}

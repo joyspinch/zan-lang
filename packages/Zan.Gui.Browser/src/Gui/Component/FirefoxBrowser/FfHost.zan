@@ -39,6 +39,9 @@ public class FfInstance {
     public bool loading;
     public bool marionetteOk;
     public bool canBack;
+    // 窗口标记：启动 URL 里的唯一页面标题（Windows 的 firefox.exe
+    // 启动器会重启自己，pid 会变，认窗口靠这个标记）。
+    public string windowMarker;
 
     // UI → worker 的命令队列："nav|<url>" "back" "fwd" "reload" "js|<code>"。
     public BlockingQueue<string> commands;
@@ -65,6 +68,7 @@ public class FfInstance {
         this.loading = false;
         this.marionetteOk = false;
         this.canBack = false;
+        this.windowMarker = "";
         this.commands = new BlockingQueue<string>();
         this.mario = null;
         this.canvasW = 0;
@@ -229,12 +233,13 @@ public class FfHost {
         }
     }
 
-    // 拉起 Firefox 子进程。不传 --new-window：headless 下它会吞掉默认
-    // 窗口创建（实测句柄为 0），窗口一律靠 Firefox 自己开的那个，
-    // 起始 URL 由会话建立后经 Marionette 导航。Windows 返回子进程
-    // pid；POSIX 的派生 API 是双 fork 守护，返回 0（后续认窗口时按
-    // profile 命令行找回 pid）。
-    public static int Spawn(string exe, string profileDir, string url,
+    // 拉起 Firefox 子进程。`openUrl` 作为位置参数传给 Firefox（默认
+    // 窗口里打开）；窗口寄宿需要认出这扇窗，所以传的是带唯一标记
+    // 标题的 data: 页（<title>zanff<port></title>）。不传 --new-window：
+    // headless 下它会吞掉默认窗口创建（实测句柄为 0）。Windows 返回
+    // 子进程 pid；POSIX 的派生 API 是双 fork 守护，返回 0（后续认窗口
+    // 时按 profile 命令行找回 pid）。
+    public static int Spawn(string exe, string profileDir, string openUrl,
                             int width, int height) {
         List<string> args = new List<string>();
         args.Add("-profile");
@@ -300,8 +305,13 @@ public class FfHost {
         if (inst.port <= 0) { inst.port = FfHost.PickFreePort(); }
         inst.chromeless = !FfOptions.ShowChrome();
         FfHost.EnsureProfile(inst.profileDir, inst.port, inst.chromeless);
-        // 3. 拉起。
-        int pid = FfHost.Spawn(inst.exe, inst.profileDir, inst.startUrl, 0, 0);
+        // 3. 拉起。位置参数是一页纯 ASCII 标题的 data: 占位页，窗口寄宿
+        //    的辅助信号认它（主判据是启动器进程家族）；真实起始 URL
+        //    在会话建立后经 Marionette 导航过去。
+        inst.windowMarker = "zanff" + inst.port;
+        string openUrl = "data:text/html,<title>" + inst.windowMarker
+            + "</title>loading";
+        int pid = FfHost.Spawn(inst.exe, inst.profileDir, openUrl, 0, 0);
         if (pid < 0) {
             FfHost.Fail(inst, "Firefox 进程启动失败：" + inst.exe);
             return;
@@ -377,7 +387,8 @@ public class FfHost {
     // 找窗口 + 寄宿，成功置 inst.child；失败置 state=2 并返回 false。
     static bool HostAndAdopt(FfInstance inst) {
         #if WINDOWS
-        nint hwnd = FfHostWin.FindHostedWindow(inst.pid, 25000);
+        nint hwnd = FfHostWin.FindHostedWindow(inst.pid, inst.windowMarker,
+                                               25000);
         if (hwnd == 0) {
             FfHost.Fail(inst, "Firefox 窗口未出现（MozillaWindowClass，"
                 + "25 秒超时）");

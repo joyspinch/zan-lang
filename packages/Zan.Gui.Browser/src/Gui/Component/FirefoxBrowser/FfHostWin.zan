@@ -94,6 +94,9 @@ public class FfHostWin {
         return "";
     }
 
+    [DllImport("user32", EntryPoint = "GetWindowTextW")]
+    public static extern int GetWindowText(nint hwnd, nint buf, int maxCount);
+
     // 启动 Firefox 并返回子进程 pid（失败 -1）。直接走 CreateProcessW
     // 而不是 Process.StartDetachedSafe：后者关掉句柄不返回 pid，而窗口
     // 匹配需要 pid。
@@ -122,15 +125,25 @@ public class FfHostWin {
         return pid;
     }
 
-    // 在 timeoutMs 内找到属于 pid 的 Firefox 主窗口。轮询期 Firefox
-    // 正在启动，窗口可能出现得很晚。
-    public static nint FindHostedWindow(int pid, int timeoutMs) {
+    // 在 timeoutMs 内找到我们这次拉起的 Firefox 主窗口。不能只认
+    // 启动器 pid：Windows 的 firefox.exe 启动器会重启自己（真正的
+    // 浏览器进程是另一个 pid）。主判据是「窗口进程属于启动器的
+    // 家族」（沿 parentPid 上溯几跳能到启动器）；标题含启动标记
+    // （data: 占位页的 <title>zanff<port></title>）作为辅助信号。
+    public static nint FindHostedWindow(int launcherPid, string marker,
+                                        int timeoutMs) {
         nint cls = Wide.Of("MozillaWindowClass");
         Stopwatch sw = Stopwatch.StartNew();
         while (sw.ElapsedMilliseconds() < timeoutMs) {
+            Dict<int, int> parent = new Dict<int, int>();
+            List<ProcessEntry> ps = ProcessList.List();
+            for (int i = 0; i < ps.Count; i = i + 1) {
+                parent.Add(ps[i].pid, ps[i].parentPid);
+            }
             nint hwnd = FindWindowEx(0, 0, cls, 0);
             while (hwnd != 0) {
-                if (BelongsTo(hwnd, pid)) {
+                if (FfHostWin.InFamily(hwnd, launcherPid, parent)
+                        || (marker != "" && FfHostWin.WindowHasMarker(hwnd, marker))) {
                     Wide.Free(cls);
                     return hwnd;
                 }
@@ -140,6 +153,38 @@ public class FfHostWin {
         }
         Wide.Free(cls);
         return 0;
+    }
+
+    // 窗口进程是否属于 launcher 家族（自身、父链上至 4 跳内出现
+    // launcher 即算——Firefox 启动器重启一次，浏览器是它的直接子进程）。
+    static bool InFamily(nint hwnd, int launcherPid, Dict<int, int> parent) {
+        nint pidBuf = NativeMemory.Alloc(4);
+        new Span<int>(pidBuf, 1)[0] = 0;
+        GetWindowThreadProcessId(hwnd, pidBuf);
+        int pid = new Span<int>(pidBuf, 1)[0];
+        NativeMemory.Free(pidBuf);
+        if (pid <= 0) { return false; }
+        int cur = pid;
+        for (int hop = 0; hop < 5 && cur > 0; hop = hop + 1) {
+            if (cur == launcherPid) { return true; }
+            int up = 0;
+            if (!parent.TryGetValue(cur, out up)) { return false; }
+            if (up <= 0 || up == cur) { return false; }
+            cur = up;
+        }
+        return false;
+    }
+
+    static bool WindowHasMarker(nint hwnd, string marker) {
+        nint buf = NativeMemory.Alloc(512);
+        int n = GetWindowText(hwnd, buf, 256);
+        if (n <= 0) {
+            NativeMemory.Free(buf);
+            return false;
+        }
+        string title = Wide.Read(buf);
+        NativeMemory.Free(buf);
+        return title != null && title.IndexOf(marker) >= 0;
     }
 
     static bool BelongsTo(nint hwnd, int pid) {
