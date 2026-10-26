@@ -813,28 +813,6 @@ public class Chart {
         nt1 = Chart.RoundP(Math.Floor(e1 / interval) * interval, precision);
     }
 
-    // `Interval.ts:183 getTicks()` —— 刻度序列（略去 break 分支）。
-    // 结果写进 out 列表；precision 决定标签小数位。
-    public static void ScaleTicks(double extent0, double extent1, double nt0, double nt1,
-                           double interval, int precision, List<double> outTicks) {
-        if (interval == 0.0) { return; }
-        // extent 低于 nice 下界时补一个原始端点（源码 :215-221）
-        if (extent0 < nt0) { outTicks.Add(extent0); }
-        double tick = nt0;
-        int guard = 0;
-        while (guard < 3000) {
-            if (tick > nt1) { break; }
-            outTicks.Add(tick);
-            double next = Chart.RoundP(tick + interval, precision);
-            // 浮点饱和保护（源码 :266-270）
-            if (next == outTicks[outTicks.Count - 1]) { break; }
-            tick = next;
-            guard = guard + 1;
-        }
-        double last = outTicks.Count > 0 ? outTicks[outTicks.Count - 1] : nt1;
-        // extent 高于 nice 上界时补一个原始端点（源码 :279-288）
-        if (extent1 > last) { outTicks.Add(extent1); }
-    }
 
     // `scale/helper.ts:125 increaseInterval(niceInterval)`：把 nice 步长
     // 抬到下一个 nice 值（f 是十进制系数）——1→2、2→3、3→5、5→10。
@@ -1048,33 +1026,6 @@ public class Chart {
                 if (mt > e0 && mt < e1) { into.Add(mt); }
             }
         }
-    }
-
-    // ECharts 语义的数值轴 [lo, hi]（供 BuildAxes* 用）。
-    // 两个端点必须落在**同一 interval 的整数倍**上，否则两端刻度
-    // 间距会被截断成不等距——旧的 NiceMin/NiceMax 各自独立取整
-    // 就是这个毛病。退化域（单点/全等）先按
-    // `intervalScaleEnsureValidExtent` 撑开。
-    public static void AxisNiceRange(double fixedLo, double fixedHi,
-                              double dataMin, double dataMax, int splitNumber,
-                              double minInterval, double maxInterval,
-                              out double lo, out double hi, out double interval,
-                              out int precision) {
-        double d0 = dataMin;
-        double d1 = dataMax;
-        if (d1 <= d0) {
-            double pad = (d0 == 0.0) ? 1.0 : (d0 < 0.0 ? 0.0 - d0 : d0) * 0.5;
-            d0 = d0 - pad;
-            d1 = d1 + pad;
-            if (d1 <= d0) { d1 = d0 + 1.0; }
-        }
-        double nt0 = 0.0;
-        double nt1 = 0.0;
-        Chart.IntervalScaleNiceTicks(d0, d1, splitNumber, minInterval, maxInterval,
-            out interval, out precision, out nt0, out nt1);
-        lo = ChartOption.IsAutoD(fixedLo) ? nt0 : fixedLo;
-        hi = ChartOption.IsAutoD(fixedHi) ? nt1 : fixedHi;
-        if (hi <= lo) { hi = lo + (interval > 0.0 ? interval : 1.0); }
     }
 
 
@@ -2450,12 +2401,6 @@ public class Chart {
         return mn;
     }
 
-    // 列表最大值，下界 0（无负值语义）。
-    public static int MaxInt(List<int> vs) {
-        int mx = 0;
-        for (int i = 0; i < vs.Count; i = i + 1) { if (vs[i] > mx) { mx = vs[i]; } }
-        return mx;
-    }
 
     // ---- 几何 ----
 
@@ -2629,16 +2574,6 @@ public class Chart {
         return s;
     }
 
-    // ---- 共享框架 ----
-
-    // 面板背景 + 标题 + 图例色块。返回标题/图例带
-    // 下方紧邻的 y，调用方可在其下布局绘图区。
-    // 非交互版（wid=0）：图例色块不可点击。需要图例交互时
-    // 用 DrawPanelI。
-    public static int DrawPanel(App app, int x, int y, int w, int h, string title,
-                         List<ChartSeries> series, bool showLegend) {
-        return Chart.DrawPanelI(app, x, y, w, h, 0, title, series, 0, showLegend);
-    }
 
     // 交互 id `wid` 下系列 `si` 的图例隐藏状态键。
     public static int LegendKey(int wid, int si) { return 6000000 + wid * 64 + si; }
@@ -2712,12 +2647,6 @@ public class Chart {
     // 打包 RGB 为不透明 ARGB（alpha 0 在 DrawText 里视为不透明）。
     public static int TitleNeutral(int r, int g, int b) {
         return (r << 16) | (g << 8) | b;
-    }
-    // 本帧图例水平对齐："left" | "center"（默认）| "right"。
-    public static string LegendAlignX() {
-        ChartOption lo = Chart.legendOpt;
-        if (lo == null) { return ""; }
-        return lo.legendX;
     }
     // legend.left/right 的等效水平对齐（官方盒模型）：显式
     // left/right/center 关键字直接返回；数值/百分比锚返回 ""（走 px
@@ -3001,8 +2930,6 @@ public class Chart {
     // wid 上）：组内图指针在绘图区内时写入自己的类别下标，
     // 其余图同帧读它对齐十字线；组长登记时初始化为 -1（无悬停）。
     public static int ConnectHoverKey(int wid) { return 8600000 + wid * 16 + 1; }
-    // connect 组键段槽 2（8600000 + wid*16 + 2），当前仓库内无读写方。
-    public static int ConnectHoverGenKey(int wid) { return 8600000 + wid * 16 + 2; }
 
     // 将缩放窗口（千分值）解析为包含端点的分类索引范围 [i0,i1]。
     // 首次调用时从 ChartOption.zoomStart/zoomEnd 初始化状态。
@@ -3517,13 +3444,6 @@ public class Chart {
         return n.ay + Canvas.MeasureText(a.title, fs) / 2;
     }
 
-    // 画一根轴的轴名（三态 + nameGap + inverse + y 轴 position=right）。
-    public static void DrawAxisName(App app, Canvas c, ChartAxis a, bool isX,
-                            int plotX, int plotY, int plotW, int plotH, bool far,
-                            StyleBox sTitle, int fs) {
-        Chart.DrawAxisNameAt(app, c, a, isX, plotX, plotY, plotW, plotH, far,
-            sTitle, fs, 0 - 1);
-    }
 
     // 同上，另给轴线位置覆盖（page 坐标）：onZero 让轴线骑到零线上时，
     // start/end 态的名字贴轴线走，middle 态留在绘图区边界（官方

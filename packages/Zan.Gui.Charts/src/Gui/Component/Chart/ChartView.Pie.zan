@@ -12,12 +12,6 @@ public partial class ChartView {
         return raw;
     }
 
-    // 两个同类标量的比值（千分比）：radiusInner/radius 这类比率
-    // 只依赖 amount（percent/percent 或 px/px 均同量纲可除）。
-    public static int ScalarRatioPromille(ChartScalar a, ChartScalar b) {
-        if (b.amount <= 0) { return 0; }
-        return a.amount * 1000 / b.amount;
-    }
 
     // 是否配置了任何 emphasis paint（填充/边框色/边框宽任一
     // 非零）；全零时命中不重画高亮。
@@ -89,27 +83,7 @@ public partial class ChartView {
             // legend.data 白名单存在时按白名单过滤并排序；项文本只有
             // 名字（百分比在扇区标签里）。orient=vertical 左侧整列
             // （legend.x=left），否则顶部一行放不下换行。
-            List<PieLegendItem> cands = new List<PieLegendItem>();
-            for (int si = 0; si < o.series.Count; si = si + 1) {
-                ChartSeries ps = o.series[si];
-                if (ps.type != ChartType.Pie) { continue; }
-                for (int di = 0; di < ps.data.Count; di = di + 1) {
-                    string nmm = PieLayout.SliceName(ps, di);
-                    bool dup = false;
-                    for (int ci = 0; ci < cands.Count; ci = ci + 1) {
-                        if (cands[ci].name == nmm) { dup = true; break; }
-                    }
-                    if (dup) { continue; }
-                    if (o.legendData != null && o.legendData.Count > 0) {
-                        bool white = false;
-                        for (int wl = 0; wl < o.legendData.Count; wl = wl + 1) {
-                            if (o.legendData[wl] == nmm) { white = true; break; }
-                        }
-                        if (!white) { continue; }
-                    }
-                    cands.Add(new PieLegendItem(si, di, nmm));
-                }
-            }
+            List<PieLegendItem> cands = ChartView.PieLegendCollect(o);
             if (o.legendData != null && o.legendData.Count > 1) {
                 for (int wi = 0; wi < o.legendData.Count && wi < cands.Count; wi = wi + 1) {
                     for (int ci = wi; ci < cands.Count; ci = ci + 1) {
@@ -1549,61 +1523,6 @@ public partial class ChartView {
         return " (" + Convert.ToString(stages[idx].val * 100 / prev) + "%)";
     }
 
-    // 横向自动换行的阶段图例（多条系列走系列开关，单系列走
-    // 数据项开关），返回图例底部 y（图区顶部）。
-    public static int DrawStageLegendWrap(App app, ChartOption o, int x, int y, int w, int top) {
-        int pad = app.theme.paddingMedium;
-        int x0 = x + pad;
-        int xCur = x0;
-        int yCur = top;
-        int maxX = x + w - pad;
-        int rowH = Canvas.FontHeight(ChartFonts.Legend(app)) + app.Scale(6);
-        int bodyY = top;
-        Theme t = app.theme;
-        if (o.series.Count > 1) {
-            for (int si = 0; si < o.series.Count; si = si + 1) {
-                ChartSeries s = o.series[si];
-                int col = s.color;
-                if (col == 0) { col = Chart.Palette(t, si); }
-                string nm = s.name;
-                if (nm.Length == 0) { nm = ChartView.StageName(si); }
-                int v = 0;
-                if (s.Count() > 0) { v = s.Value(0); }
-                string lbl = nm + "  " + Convert.ToString(v);
-                int cw = Chart.LegendChipW(app, lbl);
-                if (xCur > x0 && xCur + cw > maxX) {
-                    xCur = x0;
-                    yCur = yCur + rowH;
-                }
-                int key = 0;
-                if (o.iwid != 0) { key = Chart.LegendKey(o.iwid, si); }
-                Chart.DrawLegendChip(app, xCur, yCur, cw, rowH, col, lbl, s.hidden, key);
-                xCur = xCur + cw;
-                bodyY = yCur + rowH + app.Scale(4);
-            }
-        } else if (o.series.Count == 1) {
-            ChartSeries s = o.series[0];
-            for (int di = 0; di < s.data.Count; di = di + 1) {
-                int col = Chart.Palette(t, di);
-                if (s.data[di].color != 0) { col = s.data[di].color; }
-                string nm = s.data[di].name;
-                if (nm.Length == 0) { nm = ChartView.StageName(di); }
-                string lbl = nm + "  " + Chart.SeriesNumText(s, di);
-                int cw = Chart.LegendChipW(app, lbl);
-                if (xCur > x0 && xCur + cw > maxX) {
-                    xCur = x0;
-                    yCur = yCur + rowH;
-                }
-                int key = 0;
-                if (o.iwid != 0) { key = Chart.LegendSliceKey(o.iwid, 0, di); }
-                Chart.DrawLegendChip(app, xCur, yCur, cw, rowH, col, lbl,
-                    s.data[di].hidden, key);
-                xCur = xCur + cw;
-                bodyY = yCur + rowH + app.Scale(4);
-            }
-        }
-        return bodyY;
-    }
 
     // 漏斗/玫瑰等"阶段图"的图例绘制（单列定宽）。
     public static void DrawStageLegend(App app, ChartOption o, int lx, int ly, int legendW) {
@@ -1677,20 +1596,9 @@ public partial class ChartView {
     }
 
     public static string PieLabelFmt(ChartSeries s, string name, int val, int pct) {
-        string f = s.labelFmt;
-        if (f.Length == 0) { return name; }
-        f = f.Replace("{a}", s.name);
-        f = f.Replace("{b}", name);
-        f = f.Replace("{c}", Convert.ToString(val));
-        f = f.Replace("{d}", Convert.ToString(pct));
-        while (true) {
-            int at = f.IndexOf("{@");
-            if (at < 0) { break; }
-            int cb = f.IndexOf("}", at);
-            if (cb < 0) { break; }
-            f = f.Substring(0, at) + Convert.ToString(val) + f.Substring(cb + 1);
-        }
-        return ChartView.PieStripRich(f);
+        // 与 tooltip 同一道令牌展开（Chart.RichFmtRaw），饼图额外剥
+        // {style|...} 壳取纯文本。
+        return ChartView.PieStripRich(Chart.RichFmtRaw(s, s.labelFmt, name, val, pct));
     }
 
     // 剥 {styleName|content} 壳取 content；裸 {token} 原样保留。
