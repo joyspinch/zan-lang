@@ -604,6 +604,23 @@ description: zanc 编译器内部（parser/checker/irgen/runtime/ABI）设计契
      逐个试要试十几次。
    - 判定器：一条带 `-g` 编译的 conformance 用例（普通构建不产生调试信息，
      踩不到这条路径）。
+32. **`new List<T>(实参)` 必须按实参静态类型分流语义，数组实参不能落进集合初始化式**：
+   - 动作：`new List<T>(x)` 有两种语义——实参是 `List<T>` 时是拷贝构造
+     （checker 置 `new_expr.list_copy`，irgen 按槽逐元素搬）；实参是 `T[]`
+     时是**数组拷贝构造**（读 `zan_array_len`、逐元素取出后按槽步长写入）。
+     `list_copy_candidate` 只认 List<T> 实参，所以 irgen 里凡
+     `!list_copy && args.count==1 && arg_inits.count==0` 的形态**不能**默认走
+     "集合初始化式"（那会把整个数组对象当 1 个元素 Add）；要先按实参静态
+     类型判是否一维数组，是则发数组→List 逐元素拷贝（结构体元素 GEP by
+     elem type + 按槽加载，标量按位宽 SExt/Trunc 到 i64），目标槽照常走
+     槽下标换算 + 槽写入。
+   - 理由：数组实参走 Add(整个数组) 时 count=1、元素是"假扮字符串的数组头"
+     （len=垃圾、data=指针字节），下标 1 即越界，**全程零诊断**。实测踩坑：
+     浏览器组件用 `new List<string>(args)` 拼安装器参数，进程拿到的 argv
+     全是垃圾字节，官方安装器收不到 `/S` 进交互模式弹窗干等、不写任何
+     文件，表象却是"自动安装反复触发"——三层排查全是假线索。
+   - 判定器：一条 conformance 用例（string/int/空数组/快照独立性/结构体
+     元素五组断言）。
 
 ---
 

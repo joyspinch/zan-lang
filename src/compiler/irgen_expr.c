@@ -9325,6 +9325,113 @@ static LLVMValueRef emit_expr_new_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                     LLVMPositionBuilderAtEnd(g->builder, end_bb);
                     return LLVMBuildBitCast(g->builder, typed_ptr, i8ptr, "listv");
                 }
+                /* new List<T>(array) 数组拷贝构造：数组不是 List，落进下面
+                 * 的初始化式路径会把整个数组对象当成 1 个元素 Add 进去
+                 * （count=1、读元素得到假扮字符串的数组头、下标 1 越界，
+                 * 全程静默——Process 参数列表全是垃圾，实测踩过）。这里
+                 * 按数组布局（长度在 ptr-16，元素从 ptr+0 紧凑排布）逐
+                 * 元素拷进 List 的字槽。 */
+                if (!expr->new_expr.list_copy && expr->new_expr.args.count == 1
+                        && expr->new_expr.arg_inits.count == 0) {
+                    zan_ast_node_t *asrc = expr->new_expr.args.items[0];
+                    zan_type_t *at = asrc
+                        ? infer_expr_type(g, asrc, locals) : NULL;
+                    if (at && at->kind == TYPE_ARRAY && at->array_rank == 1
+                            && at->element_type) {
+                        LLVMValueRef arr = emit_expr(g, asrc, locals);
+                        LLVMTypeRef aetl = map_type(g, at->element_type);
+                        LLVMTypeKind aek = LLVMGetTypeKind(aetl);
+                        unsigned alwords = elem_slot_words(g, lelem);
+                        LLVMValueRef alen = zan_array_len(g, arr);
+                        LLVMValueRef aeight = LLVMConstInt(i64, 8, 0);
+                        LLVMValueRef acap = LLVMBuildSelect(g->builder,
+                            zan_icmp(g->builder, LLVMIntSGT, alen, aeight,
+                                     "acpy.gt8"),
+                            alen, aeight, "acpy.cap");
+                        zan_store_fit(g, alen, LLVMBuildStructGEP2(g->builder,
+                            g->list_struct_type, typed_ptr, 0, "acnt"));
+                        zan_store_fit(g, acap, LLVMBuildStructGEP2(g->builder,
+                            g->list_struct_type, typed_ptr, 1, "acap"));
+                        LLVMValueRef abytes = LLVMBuildMul(g->builder, acap,
+                            LLVMConstInt(i64,
+                                (unsigned long long)(8 * alwords), 0),
+                            "acpy.bytes");
+                        LLVMValueRef adata = zan_call2(g->builder,
+                            LLVMFunctionType(i8ptr,
+                                (LLVMTypeRef[]){ i64, i64 }, 2, 0),
+                            get_calloc_fn(g),
+                            (LLVMValueRef[]){
+                                LLVMConstInt(i64, 1, 0), abytes }, 2,
+                            "acpy.data");
+                        zan_irgen_emit_oom_check(g, g->current_fn, adata);
+                        LLVMValueRef adp = LLVMBuildBitCast(g->builder, adata,
+                            LLVMPointerType(i64, 0), "acpy.dp");
+                        zan_store_fit(g, adp, LLVMBuildStructGEP2(g->builder,
+                            g->list_struct_type, typed_ptr, 2, "adf"));
+                        LLVMValueRef acfn = LLVMGetBasicBlockParent(
+                            LLVMGetInsertBlock(g->builder));
+                        LLVMBasicBlockRef acond = LLVMAppendBasicBlockInContext(
+                            g->ctx, acfn, "acpy.cond");
+                        LLVMBasicBlockRef abody = LLVMAppendBasicBlockInContext(
+                            g->ctx, acfn, "acpy.body");
+                        LLVMBasicBlockRef aend = LLVMAppendBasicBlockInContext(
+                            g->ctx, acfn, "acpy.end");
+                        LLVMValueRef aip = LLVMBuildAlloca(g->builder, i64,
+                                                           "acpy.i");
+                        LLVMBuildStore(g->builder, LLVMConstInt(i64, 0, 0),
+                                       aip);
+                        LLVMBuildBr(g->builder, acond);
+                        LLVMPositionBuilderAtEnd(g->builder, acond);
+                        LLVMValueRef aiv = LLVMBuildLoad2(g->builder, i64,
+                                                          aip, "acpy.iv");
+                        LLVMBuildCondBr(g->builder,
+                            zan_icmp(g->builder, LLVMIntSLT, aiv, alen,
+                                     "acpy.more"),
+                            abody, aend);
+                        LLVMPositionBuilderAtEnd(g->builder, abody);
+                        aiv = LLVMBuildLoad2(g->builder, i64, aip, "acpy.iv2");
+                        LLVMValueRef aslot;
+                        if (aek == LLVMStructTypeKind) {
+                            aslot = LLVMBuildGEP2(g->builder, aetl, arr,
+                                                  &aiv, 1, "acpy.ss");
+                        } else {
+                            LLVMValueRef aptr = LLVMBuildBitCast(g->builder,
+                                arr, LLVMPointerType(aetl, 0), "acpy.ab");
+                            aslot = LLVMBuildGEP2(g->builder, aetl, aptr,
+                                                  &aiv, 1, "acpy.ss");
+                        }
+                        LLVMValueRef av;
+                        if (aek == LLVMStructTypeKind) {
+                            av = load_struct_from_slot(g, aslot, aetl);
+                        } else {
+                            av = LLVMBuildLoad2(g->builder, aetl, aslot,
+                                                "acpy.sv");
+                            if (aek == LLVMIntegerTypeKind) {
+                                unsigned aw = LLVMGetIntTypeWidth(aetl);
+                                if (aw < 64) {
+                                    av = LLVMBuildSExt(g->builder, av, i64,
+                                                       "acpy.sw");
+                                } else if (aw > 64) {
+                                    av = LLVMBuildTrunc(g->builder, av, i64,
+                                                        "acpy.tw");
+                                }
+                            }
+                        }
+                        LLVMValueRef awpos = slot_word_index(g, aiv,
+                                                             alwords);
+                        LLVMValueRef adst = LLVMBuildGEP2(g->builder, i64,
+                            adp, &awpos, 1, "acpy.ds");
+                        emit_collection_slot_store(g, lelem, i64, adst, av,
+                                                   NULL, locals, 0);
+                        LLVMValueRef anx = LLVMBuildAdd(g->builder, aiv,
+                            LLVMConstInt(i64, 1, 0), "acpy.nx");
+                        LLVMBuildStore(g->builder, anx, aip);
+                        LLVMBuildBr(g->builder, acond);
+                        LLVMPositionBuilderAtEnd(g->builder, aend);
+                        return LLVMBuildBitCast(g->builder, typed_ptr, i8ptr,
+                                                "listv");
+                    }
+                }
                 /* 集合初始化式项处理 (new List<T>{ a, b, c })：发射逐项 Add 调用 */
                 int ninit = expr->new_expr.args.count +
                             expr->new_expr.arg_inits.count;
