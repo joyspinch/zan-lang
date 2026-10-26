@@ -14,10 +14,75 @@ namespace Game.Render3D;
 public class Renderer3D {
     MeshBatch batch;
     Mat4 scratch;
+    float[] lightAmbient;
+    float[] dirs1;
+    float[] dirs2;
+    float[] dirs3;
+    float[] dirs4;
+    float[] colors1;
+    float[] colors2;
+    float[] colors3;
+    float[] colors4;
+
+    // 是否强制使用 CPU 侧光照着色（传入 it.Tint 而非 it.Albedo）；缺省 false（GPU 档着色）。
+    public bool UseCpuLighting;
 
     public Renderer3D(int capacity) {
         this.batch = MeshBatch.Create(capacity);
         this.scratch = new Mat4();
+        this.lightAmbient = new float[3];
+        this.dirs1 = new float[3];
+        this.dirs2 = new float[6];
+        this.dirs3 = new float[9];
+        this.dirs4 = new float[12];
+        this.colors1 = new float[3];
+        this.colors2 = new float[6];
+        this.colors3 = new float[9];
+        this.colors4 = new float[12];
+        this.UseCpuLighting = false;
+    }
+
+    void ApplyLights(Canvas canvas, RenderPlan plan) {
+        this.lightAmbient[0] = plan.AmbientRed;
+        this.lightAmbient[1] = plan.AmbientGreen;
+        this.lightAmbient[2] = plan.AmbientBlue;
+        int count = 0;
+        if (plan.Lights != null) {
+            for (int i = 0; i < plan.Lights.Count; i = i + 1) {
+                Light lt = plan.Lights[i];
+                if (lt != null && lt.Enabled && lt.Kind == LightKind.Directional) {
+                    count = count + 1;
+                    if (count == 4) { break; }
+                }
+            }
+        }
+        if (count == 0) {
+            canvas.SetLights3D(null, null, this.lightAmbient);
+            return;
+        }
+        float[] d = this.dirs1;
+        float[] c = this.colors1;
+        if (count == 2) { d = this.dirs2; c = this.colors2; }
+        else if (count == 3) { d = this.dirs3; c = this.colors3; }
+        else if (count == 4) { d = this.dirs4; c = this.colors4; }
+
+        int idx = 0;
+        for (int i = 0; i < plan.Lights.Count; i = i + 1) {
+            Light lt = plan.Lights[i];
+            if (lt != null && lt.Enabled && lt.Kind == LightKind.Directional) {
+                // Direction 是光线传播方向（从光源射向场景），指向光源的方向取反
+                d[idx * 3 + 0] = 0.0f - lt.Direction.X;
+                d[idx * 3 + 1] = 0.0f - lt.Direction.Y;
+                d[idx * 3 + 2] = 0.0f - lt.Direction.Z;
+                float energy = lt.Intensity;
+                c[idx * 3 + 0] = lt.Red * energy;
+                c[idx * 3 + 1] = lt.Green * energy;
+                c[idx * 3 + 2] = lt.Blue * energy;
+                idx = idx + 1;
+                if (idx == count) { break; }
+            }
+        }
+        canvas.SetLights3D(d, c, this.lightAmbient);
     }
 
     // 提交一帧。
@@ -28,13 +93,17 @@ public class Renderer3D {
         }
         int n = plan.Count();
         if (n <= 0) { return 0; }
+        if (!this.UseCpuLighting) {
+            this.ApplyLights(canvas, plan);
+        }
         Mat4 vp = plan.Camera.ViewProjectionMatrix();
         this.batch.Begin();
         for (int i = 0; i < n; i = i + 1) {
             RenderItem it = plan.ItemAt(i);
             if (it == null || it.MeshKey <= 0) { continue; }
             RenderTransform.MulInto(this.scratch, vp, it.Model);
-            this.batch.Add(it.MeshKey, it.TextureKey, this.scratch, it.Tint);
+            int tint = this.UseCpuLighting ? it.Tint : it.Albedo;
+            this.batch.Add(it.MeshKey, it.TextureKey, this.scratch, tint);
         }
         return this.batch.Draw(canvas);
     }

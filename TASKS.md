@@ -8,17 +8,6 @@
 
 ## 未完成
 
-### [ ] A559 Zan.Game.Render3D 接入 GPU 光照 uniform 通路（A489 落地后的一档）
-
-- 背景：A489 已把 3D 管线的光照做成 uniform 通路（4 盏方向光 + 环境光，
-  `Canvas.SetLights3D`，单网格与批量实例共用）。Render3D 目前仍是
-  CPU 侧 `Lighting.Shade` 算完打包成 tint 传入，与 GPU 键光叠加成双重着色。
-- 方向：Renderer3D 提交前把场景灯推给 `SetLights3D`，材质输出改传反照率
-  （albedo）tint，让 GPU 做着色；CPU 兜底档（3D 不可用）保留现有 CPU
-  着色路径。改动会变像素表现，需按 gui-design/game-dev 的像素复核口径
-  验收（对照改前截图），不能只看编译过。
-
-
 ### [ ] A490 3D 实例化批次依赖 GL 3.3 / GLES 3.1 的 core 特性——移动端可用性未实测
 
 - 现象：3D 批次提交（`zan_game_draw3d_batch`）用 `gl->VertexAttribDivisor`
