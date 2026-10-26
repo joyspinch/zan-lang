@@ -8,4 +8,20 @@
 
 ## 未完成
 
-暂无（全部历史挂账与缺陷条目均已闭环平账，详细闭环证据由 git 历史与测试套承载）。
+### A595 `--publish` 构建 ff_bidi_demo 挂起 + null length probe 软错（publish 路径缺陷）
+
+- 症状：同一份 `examples/ff_bidi_demo` 源（685 文件，2026-10-27），普通
+  构建全新解压实跑 exit=0 全 PASS；`--publish` 构建跑出三处
+  `soft runtime error: null reference where a string/byte buffer is
+  required (length probe)`——`stdlib/System/IO/Directory.zan:593`、
+  `packages/Zan.Diagnostics/src/System/Diagnostics/Process.zan:521`、
+  `packages/Zan.Gui.Browser/.../FirefoxBrowser/FfWs.zan:84`——随后卡在
+  BiDi session.new 之前不退出；`zan_crash.log` 只有 soft 记录、无 fault。
+- 复现：`build/zanc.exe examples/ff_bidi_demo/FfBidiDemo.zan
+  --auto-stdlib --package-project zan-lang --publish -o out.exe` 后运行
+  （机器需有 Zan ff 缓存或 `ZAN_FF_NO_SYSTEM=1`）。
+- 定向：探针点在普通构建下工作正常的字符串上 → 差异在 publish 专属
+  插桩/优化（arc_net 等），不在三处业务调用点本身。下一步做最小探针
+  二分：是插桩误报还是真 UB。
+- 本任务处置：dist/ff-bidi-test 测试包按 README 配方用普通构建交付
+  （两轮解压验证 PASS）；publish 缺陷留此挂账，不许绕行改写业务代码。
