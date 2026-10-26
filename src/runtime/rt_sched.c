@@ -224,7 +224,7 @@ static void co_trampoline_posix(unsigned hi, unsigned lo);
 static void co_trampoline_posix(unsigned ptr);
 #endif
 
-typedef struct { ucontext_t ctx; char *stack; void *asan_fss; } posix_fiber_t;
+typedef struct { ucontext_t ctx; char *stack; } posix_fiber_t;
 
 #define ZAN_CO_STACK_POOL_MAX 256
 
@@ -309,13 +309,9 @@ static void plat_switch(void *to) {
     posix_fiber_t *pf = (posix_fiber_t *)to;
     pf->ctx.uc_link = &g_sched_ctx;
 #if ZAN_ASAN_FIBER
-    /* 调度栈→协程栈：fss 既给本函数返回路径用（协程切回时恢复调度侧假栈），
-     * 也经 pf->asan_fss 交给 trampoline（首次进入时消费同一份）。 */
-    void *fss = NULL;
-    __sanitizer_start_switch_fiber(&fss, pf->stack, co_stack_size());
-    pf->asan_fss = fss;
+    __sanitizer_start_switch_fiber(NULL, pf->stack, co_stack_size());
     swapcontext(&g_sched_ctx, &pf->ctx);
-    __sanitizer_finish_switch_fiber(fss, NULL, NULL);
+    __sanitizer_finish_switch_fiber(NULL, NULL, NULL);
 #else
     swapcontext(&g_sched_ctx, &pf->ctx);
 #endif
@@ -339,12 +335,9 @@ static void switch_to_sched(void) {
 #else
     posix_fiber_t *pf = (posix_fiber_t *)g_current->fiber;
 #if ZAN_ASAN_FIBER
-    /* 协程栈→调度栈；本协程已 finished 时它永不返回，假栈随之作废
-     * （fake_stack_save=NULL 告诉 ASan 丢弃而不是留给一次不会发生的恢复）。 */
-    void *fss = NULL;
-    __sanitizer_start_switch_fiber(g_current->finished ? NULL : &fss, NULL, 0);
+    __sanitizer_start_switch_fiber(NULL, NULL, 0);
     swapcontext(&pf->ctx, &g_sched_ctx);
-    if (fss) __sanitizer_finish_switch_fiber(fss, NULL, NULL);
+    __sanitizer_finish_switch_fiber(NULL, NULL, NULL);
 #else
     swapcontext(&pf->ctx, &g_sched_ctx);
 #endif
@@ -665,10 +658,7 @@ static void co_trampoline_posix(unsigned ptr) {
     zan_co_t *co = (zan_co_t *)(uintptr_t)ptr;
 #endif
 #if ZAN_ASAN_FIBER
-    /* 首次进入协程栈：消费 plat_switch 存下的调度侧假栈句柄。 */
-    if (co->fiber)
-        __sanitizer_finish_switch_fiber(((posix_fiber_t *)co->fiber)->asan_fss,
-                                        NULL, NULL);
+    __sanitizer_finish_switch_fiber(NULL, NULL, NULL);
 #endif
     co->body(co->task);
     co->finished = 1;
@@ -710,13 +700,14 @@ zan_task_t *zan_spawn(zan_co_body_t body, void *arg) {
     zan_co_t *co = (zan_co_t *)calloc(1, sizeof(*co));
     if (!co) zan_rt_fatal("oom", "scheduler: coroutine alloc failed");
     co->body = body;
-    co->task = task_new(co);
+    zan_task_t *task = task_new(co);
+    co->task = task;
     co->task->arg = arg;
     co->fiber = plat_fiber_new(co);
     if (!co->fiber) zan_rt_fatal("oom", "scheduler: fiber alloc failed");
     zan_atomic_inc(&g_live);
     ready_push(co);
-    return co->task;
+    return task;
 }
 
 void *zan_task_arg(zan_task_t *task) { return task ? task->arg : NULL; }
@@ -735,7 +726,7 @@ int64_t zan_task_await(zan_task_t *task) {
         task->waiters = g_current;
         zan_mutex_unlock(&task->lock);
         switch_to_sched();
-        return task->result;
+        zan_mutex_lock(&task->lock);
     }
     int64_t res = task->result;
     zan_mutex_unlock(&task->lock);
