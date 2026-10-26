@@ -11,6 +11,7 @@
 #define rmdir _rmdir
 #define unlink _unlink
 #else
+#include <sys/stat.h> /* mkdir */
 #include <unistd.h>
 #endif
 

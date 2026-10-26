@@ -28,6 +28,18 @@ if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
     add_compile_options(-Wall -Wextra -Wpedantic)
 endif()
 
+# POSIX/GNU declarations under the strict -std=c11 above: glibc's feature
+# tiers are all off in that mode, so sigaltstack/SS_DISABLE (rt_crash.h),
+# accept4 (rt_io.c), dladdr etc. are invisible and gcc14+/clang16+ turn the
+# implicit declarations into hard errors. Every custom command that compiles
+# runtime sources carries ${ZAN_RT_OBJ_DEFS} (below) for the same reason; this
+# covers the plain targets (tests, lsp, dap) so new ones cannot rot the same
+# way. Windows/MinGW takes no definitions (the glibc feature tiers do not
+# exist there); the macOS/iOS/musl cross recipes set their own flags.
+if(NOT WIN32)
+    add_compile_definitions(_GNU_SOURCE)
+endif()
+
 # The CRT's _s-function deprecation warnings fire on deliberately-audited
 # getenv/fopen/strncpy call sites across the tree. Opt out once, globally:
 # the historical per-target if(MSVC) definitions never fired under the clang
@@ -3298,7 +3310,7 @@ if(SELFHOST_CLANG)
     set(_sh_obj "${CMAKE_BINARY_DIR}/zanrt_sh_${_sh_stem}${CMAKE_C_OUTPUT_EXTENSION}")
     add_custom_command(
       OUTPUT ${_sh_obj}
-      COMMAND ${SELFHOST_CLANG} -O2 -c ${CMAKE_SOURCE_DIR}/src/runtime/${_sh_src}
+      COMMAND ${SELFHOST_CLANG} ${ZAN_RT_OBJ_DEFS} -O2 -c ${CMAKE_SOURCE_DIR}/src/runtime/${_sh_src}
               -o ${_sh_obj}
       DEPENDS ${CMAKE_SOURCE_DIR}/src/runtime/${_sh_src}
       COMMENT "Building ${_sh_src} for the selfhost fixed point")
@@ -3373,7 +3385,7 @@ if(SELFHOST_CLANG)
     set(_shd_obj "${CMAKE_BINARY_DIR}/zanrt_shd_${_shd_stem}${CMAKE_C_OUTPUT_EXTENSION}")
     add_custom_command(
       OUTPUT ${_shd_obj}
-      COMMAND ${SELFHOST_CLANG} -O2 -c ${CMAKE_SOURCE_DIR}/src/runtime/${_shd_src}
+      COMMAND ${SELFHOST_CLANG} ${ZAN_RT_OBJ_DEFS} -O2 -c ${CMAKE_SOURCE_DIR}/src/runtime/${_shd_src}
               -o ${_shd_obj}
       DEPENDS ${CMAKE_SOURCE_DIR}/src/runtime/${_shd_src}
       COMMENT "Building ${_shd_src} for the selfhost differential gate")

@@ -87,6 +87,8 @@ int main(void) {
 
 #else /* !_WIN32 */
 
+#include <stdio.h>
+
 int main(void) {
     /* POSIX 分支不写 zan_crash.log 文件，无可测行为。 */
     printf("skip: crash log rotation is Windows-only\n");

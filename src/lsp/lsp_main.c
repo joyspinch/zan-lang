@@ -33,6 +33,7 @@ typedef SOCKET lsp_sock_t;
 #include <sys/socket.h>
 #include <sys/select.h>
 #include <netinet/in.h>
+#include <dirent.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #include <pthread.h>
