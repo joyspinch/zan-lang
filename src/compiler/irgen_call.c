@@ -2743,11 +2743,22 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                              * 先清零 errno，调用后读回比对 34（ERANGE）。 */
                             LLVMTypeRef errno_ty = LLVMFunctionType(
                                 LLVMPointerType(i32t, 0), NULL, 0, 0);
-#if defined(_WIN32)
-                            const char *errno_sym = "_errno";
-#else
+                            /* 按**目标**平台选 TLS errno 取址函数，不是按宿主
+                             * #if：Windows 宿主交叉编 macOS 时 IR 名 `_errno`
+                             * 会被 Mach-O 再加前导下划线成 `__errno`，而
+                             * libSystem 导出的 C 符号是 `__error`——链接期才
+                             * 炸，且炸在离病灶最远的 Convert.ToInt 调用点上。
+                             * 分支次序对齐 Socket.zan 的 DllImport 守卫
+                             * （ANDROID 也定义 LINUX，安卓分支必须在前）。 */
                             const char *errno_sym = "__errno_location";
-#endif
+                            if (strstr(g->target_triple, "android") ||
+                                strstr(g->target_triple, "ohos")) {
+                                errno_sym = "__errno";
+                            } else if (g->target_is_macos || g->target_is_ios) {
+                                errno_sym = "__error";
+                            } else if (g->target_is_windows) {
+                                errno_sym = "_errno";
+                            }
                             LLVMValueRef errno_fn = get_libc_fn(g, errno_sym, errno_ty);
                             LLVMValueRef errnop = zan_call2(g->builder, errno_ty,
                                 errno_fn, NULL, 0, "toint.errnop");

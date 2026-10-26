@@ -692,6 +692,14 @@ description: zanc 编译器内部（parser/checker/irgen/runtime/ABI）设计契
 39. **iOS Mach-O 交叉编译平台标记与原生外壳驱动内嵌**：
    - 动作：交叉编译生成 iOS ARM64 运行时对象时，必须指定 `-target aarch64-ios`（严禁使用 `aarch64-macos` 代替），避免 `ld64.lld` 因平台头标识不符（`has platform macOS, which is different from target platform iOS`）拒绝合流。针对 iOS 上的 `zan_gui` 与 `zan_image` 驱动，编译器禁止生成桩函数，而是直接静态内嵌 `zanrt_gui.o` 与 `zanrt_image.o`。
    - 理由：iOS 设备禁止动态加载未签名的第三方 dylib，所有 GUI 视图生命周期、Retina 触控、2D 软件光栅与图像解码器（PNG/WebP/SVG）驱动均以静态目标文件合流进可执行 Mach-O，确保输出的标准 `.ipa` 即装即用。
+   - 边界：交叉目标引用 libc 符号必须按**目标**平台选名字，不许按宿主
+     `#if defined(_WIN32)` 选——Windows 宿主编 macOS 时 IR 名 `_errno`
+     会被 Mach-O 再加一个前导下划线变成 `__errno`，而 libSystem 导出的
+     C 符号是 `__error`。这类错链接期才炸、且炸在离病灶最远的调用点上
+     （实例：`Convert.ToInt*` 字符串路径的 ERANGE 探针发 `__errno`，
+     ff_bidi_demo 交叉编 macos-arm64 链接失败；已改 irgen_call.c 按
+     target_triple/目标标志选 `__error`/`__errno`/`__errno_location`/
+     `_errno`，分支次序对齐 Socket.zan 的 DllImport 守卫）。
 40. **iOS CoreText 字体生命周期、主线程呈现与触控事件流纪律**：
    - 动作：(1) 通过 UIKit `[UIFont systemFontOfSize:]` 桥接获取系统字体后，必须显式 `CFRetain` 并常驻全局字号索引表（`g_font_table[128]`），其 ascent/height 度量必须持久化缓存，禁止在文本测量或光栅化完成时直接调用 `CFRelease` 释放系统单例，防止内部度量数据归零引发排版坍塌；(2) CoreText 绘制采用正向坐标系光栅化，基线锚定 `descent + 1.0`，内存行索引直接按 `mask[py * tw]` 正向写入 Zan 软件表面，严禁在写入时做垂直翻转（`th - 1 - py`），否则会导致字形 180 度上下倒置；(3) iOS CALayer 的 `setContents:` 与 `CATransaction` 提交必须通过 `dispatch_sync_f` 派发至主线程（`_dispatch_main_q`）执行，禁止在后台工作线程直接 flush；(4) 触控滑动判定阈值（slop）设定为 `6.0f * scale`（6pt），滚轮事件在队列中实施增量合并（coalescing），并在拖拽释放时标记 `flag = 1` 抑制误触。
    - 理由：UIFont 在 iOS 内部由 UIKit 统一管理引用计数，过度释放破坏单例内存引发度量归零与中文降级回退（问号乱码/像素风）；CGBitmapContext 在 iOS 内存布局中第 0 行为顶部，反向 blit 会造成字形上下颠倒；CoreAnimation 事务在非主线程提交会被系统延迟至未知主循环周期，导致拖动画面延迟极高（卡顿迟钝）。
