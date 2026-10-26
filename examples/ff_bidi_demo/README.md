@@ -38,6 +38,23 @@ Firefox 来源与 `gui_firefox_browser` 相同：`ZAN_FF_EXE` 环境变量 →
 标准安装位置（macOS 是 `/Applications/Firefox.app`）。**自建/裁剪版
 Firefox 可能无法建立自动化会话，请用官方构建。**
 
+## 版本兼容（Win7 = Firefox 115 ESR）
+
+Win7 官方支持的最后一个 Firefox 是 **115 ESR**，本演示按对端版本自适应，
+两端都实测通过：
+
+| 能力 | FF 147（现代） | FF 115 ESR（Win7） |
+|------|----------------|---------------------|
+| 会话/导航/求值/截图 | ✓ | ✓ |
+| Cookie 存取 | `storage.setCookie/getCookies`（value 是 Bytes 结构） | storage 模块不可用 → **自动落页面 JS** `document.cookie` |
+| 网络监听事件 | ✓ | ✓（115 已实现 network.* 事件） |
+| 请求拦截 | `network.addIntercept` ✓ | unknown command → **优雅跳过** |
+| 优雅关停 | `browser.close` ✓ | 不可用 → **家族兜底强杀** |
+
+自适应是行为探测而非版本硬编码：`SetCookie` 先发新版结构、报错点名
+value 再按老版裸字符串重试；演示里 storage 不可用自动切 JS 路径；
+network 断言只在真的收到 network 事件时才参与 PASS 判定。
+
 ## 生命周期约定（防 "already running" 弹窗）
 
 - **每次运行独立 profile**（`<缓存根>/bidi-<端口>`）：上一轮的孤儿

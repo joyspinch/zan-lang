@@ -22,6 +22,10 @@ public class FfBidi {
     public string lastError;
     public FfBidiEventFn eventSink;
     public bool disposed;
+    // 对端 Firefox 版本（session.new 的 capabilities.browserVersion，
+    // 主版本号）。Win7 上限是 115 ESR——storage/network 模块的能力
+    // 子集随版本不同，调用方按它挑路径。
+    public int browserMajor;
 
     public BlockingQueue<string> inbox;
     // Connect 失败时给全局的说明。
@@ -130,6 +134,17 @@ public class FfBidi {
         if (r == null) { return false; }
         JsonValue sid = r.Get("sessionId");
         this.sessionId = sid != null ? sid.AsString("") : "";
+        // capabilities.browserVersion → 主版本号（如 "115.14.0" → 115）。
+        JsonValue caps = r.Get("capabilities");
+        if (caps != null) {
+            JsonValue bv = caps.Get("browserVersion");
+            if (bv != null) {
+                string vt = bv.AsString("");
+                int dot = vt.IndexOf(".");
+                this.browserMajor = (dot > 0 ? vt.Substring(0, dot) : vt)
+                    .ToInt32();
+            }
+        }
         return true;
     }
 
@@ -212,7 +227,9 @@ public class FfBidi {
                           string sameSite, long expires) {
         JsonValue c = JsonValue.NewObject();
         c.PutStr("name", name);
-        // 新版 BiDi 的 cookie.value 是 Bytes 结构：{type, value}。
+        // 新版 BiDi 的 cookie.value 是 Bytes 结构 {type, value}；老版
+        // （FF115 一代）是裸字符串。先按新版发，报错点名 value 就按
+        // 老版重试一次——两条路都通才算兼容。
         JsonValue val = JsonValue.NewObject();
         val.PutStr("type", "string");
         val.PutStr("value", value);
@@ -225,7 +242,22 @@ public class FfBidi {
         if (expires > 0) { c.PutInt("expires", expires); }
         JsonValue p = JsonValue.NewObject();
         p.Put("cookie", c);
-        return this.Command("storage.setCookie", p.ToJson(), 10000) != null;
+        JsonValue r = this.Command("storage.setCookie", p.ToJson(), 10000);
+        if (r == null && this.lastError.IndexOf("value") >= 0) {
+            JsonValue c2 = JsonValue.NewObject();
+            c2.PutStr("name", name);
+            c2.PutStr("value", value);
+            if (domain != "") { c2.PutStr("domain", domain); }
+            if (path != "") { c2.PutStr("path", path); }
+            c2.PutBool("secure", secure);
+            c2.PutBool("httpOnly", httpOnly);
+            if (sameSite != "") { c2.PutStr("sameSite", sameSite); }
+            if (expires > 0) { c2.PutInt("expires", expires); }
+            JsonValue p2 = JsonValue.NewObject();
+            p2.Put("cookie", c2);
+            r = this.Command("storage.setCookie", p2.ToJson(), 10000);
+        }
+        return r != null;
     }
 
     // 删一个页面域下的 Cookie（走 document.cookie 的 Max-Age=0 经典
