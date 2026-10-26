@@ -238,43 +238,93 @@ public class GenForm {
                 body.Append("        " + self + ".Add(__flow);\n");
                 rootParent = "__flow";
             }
-            if (is_html && bodyContent != null && bodyContent.IsArray()) {
-                bool rootIsEl = is_html && !ctl;
-                List<string> fieldNames = new List<string>();
-                for (int i = 0; i < fields.Count(); i = i + 1) {
-                    JsonValue fo = fields.At(i);
-                    string fVn = GenForm.PredeclareKid(decls, body, fo, id, used,
-                                                       ctl, false);
-                    id = GenForm.EmitFieldCore(decls, body, wire, valid, fo,
-                                               rootParent, "", rootIsEl, id, used, free_mode || is_html,
-                                               !free_mode && !is_html, dispatch, ctl, false,
-                                               default_size_class, true);
-                    fieldNames.Add(fVn);
-                }
-                bool[] added = new bool[fields.Count()];
-                for (int ci = 0; ci < bodyContent.Count(); ci = ci + 1) {
-                    JsonValue item = bodyContent.At(ci);
-                    if (item.IsString()) {
-                        if (rootIsEl) {
-                            body.Append("        " + self + ".AddText(\"");
-                            body.Append(GenCommon.Esc(item.AsString("")));
-                            body.Append("\");\n");
-                        }
-                    } else if (item.IsNumber()) {
-                        int idx = item.AsInt(0 - 1);
-                        if (idx >= 0 && idx < fieldNames.Count && !added[idx]) {
-                            JsonValue fo = fields.At(idx);
-                            string kHost = GenForm.ParentExpr(fo, rootParent, "");
-                            GenForm.EmitAttach(body, fo, fieldNames[idx], kHost, rootParent, "", rootIsEl, free_mode || is_html, false);
-                            added[idx] = true;
+            if (is_html) {
+                List<JsonValue> allNodes = new List<JsonValue>();
+                GenForm.CollectAllNodes(fields, allNodes);
+
+                // 1. 扫描没有名称但带事件处理器的节点，分配稳定名称 c0, c1...
+                // 直接回写到 JSON 节点，确保序列化到 __designDoc 后 FormBuilder 赋同名
+                int anonId = 0;
+                for (int ni = 0; ni < allNodes.Count; ni = ni + 1) {
+                    JsonValue o = allNodes[ni];
+                    string fn = GenForm.ObjStr(o, "name");
+                    if (!GenCommon.IsIdent(fn) || fn.Length == 0) {
+                        if (GenForm.HasHandlers(o)) {
+                            string varName = "c" + Convert.ToString(anonId);
+                            anonId = anonId + 1;
+                            o.Put("name", JsonValue.NewStr(varName));
                         }
                     }
                 }
-                for (int i = 0; i < fieldNames.Count; i = i + 1) {
-                    if (!added[i]) {
-                        JsonValue fo = fields.At(i);
-                        string kHost = GenForm.ParentExpr(fo, rootParent, "");
-                        GenForm.EmitAttach(body, fo, fieldNames[i], kHost, rootParent, "", rootIsEl, free_mode || is_html, false);
+
+                // 2. 检查是否有控件需要静态初始化（泛型控件、用户自定义控件等）
+                bool hasPrepared = false;
+                for (int ni = 0; ni < allNodes.Count; ni = ni + 1) {
+                    if (GenForm.RequiresPrepared(allNodes[ni])) {
+                        hasPrepared = true;
+                        break;
+                    }
+                }
+
+                if (hasPrepared) {
+                    body.Append("        List<Gui.Control> __prepared = new List<Gui.Control>();\n");
+                    for (int ni = 0; ni < allNodes.Count; ni = ni + 1) {
+                        JsonValue o = allNodes[ni];
+                        string fn = GenForm.ObjStr(o, "name");
+                        string kd = GenForm.TypeOf(o);
+                        if (GenForm.RequiresPrepared(o)) {
+                            string prepVar = GenCommon.IsIdent(fn) && fn.Length > 0 ? (ctl ? "this." + fn : fn) : "__p" + Convert.ToString(ni);
+                            if (!GenCommon.IsIdent(fn) || fn.Length == 0) {
+                                body.Append("        " + kd + " " + prepVar + " = new " + kd + "();\n");
+                            } else {
+                                body.Append("        " + prepVar + " = new " + kd + "();\n");
+                            }
+                            if (GenForm.KindOf(o) == "DataGrid") {
+                                GenForm.EmitColumns(body, o, prepVar);
+                            }
+                            body.Append("        __prepared.Add(" + prepVar + ");\n");
+                        } else {
+                            body.Append("        __prepared.Add(null);\n");
+                        }
+                    }
+                }
+
+                if (ctl) {
+                    if (hasPrepared) {
+                        body.Append("        Gui.Widget.FormBuilder.BuildInto(this, __designDoc, __prepared);\n");
+                    } else {
+                        body.Append("        Gui.Widget.FormBuilder.BuildInto(this, __designDoc, null);\n");
+                    }
+                } else {
+                    if (hasPrepared) {
+                        body.Append("        Element root = (Element)Gui.Widget.FormBuilder.BuildWith(__designDoc, __prepared);\n");
+                    } else {
+                        body.Append("        Element root = (Element)Gui.Widget.FormBuilder.Build(__designDoc);\n");
+                    }
+                }
+
+                // 3. 字段声明 (decls)、查找绑定与事件接线 (wire)
+                for (int ni = 0; ni < allNodes.Count; ni = ni + 1) {
+                    JsonValue o = allNodes[ni];
+                    string fn = GenForm.ObjStr(o, "name");
+                    string kd = GenForm.TypeOf(o);
+                    string castType = GenForm.IsElement(o) ? "Element" : GenForm.KindOf(o);
+                    bool isPrep = GenForm.RequiresPrepared(o);
+                    if (GenCommon.IsIdent(fn) && fn.Length > 0 && !used.Contains(fn)) {
+                        used.Add(fn);
+                        if (ctl) {
+                            decls.Append("    " + kd + " " + fn + ";\n");
+                            if (!isPrep) {
+                                body.Append("        this." + fn + " = (" + castType + ")this.Find(\"" + GenCommon.Esc(fn) + "\");\n");
+                            }
+                            GenForm.EmitHandlers(wire, o, "this." + fn, dispatch);
+                        } else {
+                            decls.Append("    static " + kd + " " + fn + ";\n");
+                            if (!isPrep) {
+                                body.Append("        " + fn + " = (" + castType + ")root.Find(\"" + GenCommon.Esc(fn) + "\");\n");
+                            }
+                            GenForm.EmitHandlers(wire, o, fn, dispatch);
+                        }
                     }
                 }
             } else {
@@ -346,6 +396,9 @@ public class GenForm {
             out0.Append("    /// so a host never wires anything by hand; it is null\n");
             out0.Append("    /// while the control lives outside any window.\n");
             out0.Append("    Gui.Form __form;\n");
+            if (is_html) {
+                out0.Append("    static System.Json.JsonValue __designDoc;\n");
+            }
         } else {
             out0.Append("    /// The live form, kept for the non-capturing handler\n");
             out0.Append("    /// lambdas (the generator keeps handlers capture-free).\n");
@@ -370,15 +423,11 @@ public class GenForm {
             out0.Append(GenCommon.Esc(name));
             out0.Append("\", 5);\n");
             if (is_html) {
-                if (doc_css.Length > 0) {
-                    GenForm.EmitDesignCss(out0, "this", doc_css);
-                }
-                if (body_class.Length > 0) {
-                    out0.Append("        this.AddClass(\"" + GenCommon.Esc(body_class) + "\");\n");
-                }
-                if (body_style.Length > 0) {
-                    GenForm.EmitSetProp(out0, "this", "style", body_style);
-                }
+                out0.Append("        if (__designDoc == null) {\n");
+                out0.Append("            __designDoc = System.Json.JsonValue.Parse(\"");
+                out0.Append(GenCommon.Esc(root.ToJson()));
+                out0.Append("\");\n");
+                out0.Append("        }\n");
             } else if (free_mode) {
                 // 自由画布：内边距/间距不写死，交给样式表——写死会置上
                 // padSet，样式表里的 `padding` 从此再也顶不进来。
@@ -412,20 +461,7 @@ public class GenForm {
             out0.Append("        __designDoc = System.Json.JsonValue.Parse(\"");
             out0.Append(GenCommon.Esc(root.ToJson()));
             out0.Append("\");\n");
-            if (is_html) {
-                out0.Append("        Gui.Element root = new Gui.Element();\n");
-                out0.Append("        root.InitElement(\"body\", \"root\");\n");
-                out0.Append("        root.Dock(Gui.Dock.Fill());\n");
-                if (doc_css.Length > 0) {
-                    GenForm.EmitDesignCss(out0, "root", doc_css);
-                }
-                if (body_class.Length > 0) {
-                    out0.Append("        root.AddClass(\"" + GenCommon.Esc(body_class) + "\");\n");
-                }
-                if (body_style.Length > 0) {
-                    GenForm.EmitSetProp(out0, "root", "style", body_style);
-                }
-            } else {
+            if (!is_html) {
                 out0.Append("        Gui.Widget.Panel root = Gui.Widget.Panel.Root(\"root\");\n");
                 out0.Append("        root.Dock(Gui.Dock.Fill());\n");
                 if (free_mode) {
@@ -2087,6 +2123,39 @@ static List<string> NonConstructibleKinds() {
                             Convert.ToString(GenForm.PrefH(o)) + ");\n");
                 body.Append("        " + parent + ".AddCell(" + vn + ", " +
                             Convert.ToString(sp) + ");\n");
+            }
+        }
+    }
+
+    public static bool RequiresPrepared(JsonValue o) {
+        if (o == null || !o.IsObject()) { return false; }
+        if (GenForm.IsElement(o)) { return false; }
+        string kind = GenForm.KindOf(o);
+        if (kind == "Table" || kind == "DataTable") { kind = "DataGrid"; }
+        if (kind == "Scrollbar" || kind == "Layer") { kind = "Panel"; }
+        if (kind == "Chart") { kind = "ChartHost"; }
+        if (kind == "Ellipsis") { kind = "Label"; }
+        if (kind == "Ribbon") { kind = "ToolStrip"; }
+        if (kind == "Alert") { kind = "AlertBox"; }
+        if (kind == "DataGrid" && GenForm.ObjStr(o, "of").Length > 0) {
+            return true;
+        }
+        if (GenForm.IsStdWidgetKind(kind) || GenForm.IsHmiKind(kind) ||
+            kind == "DataGrid" || kind == "ChartHost" || kind == "WebViewBox" ||
+            kind == "CefBrowserBox" || kind == "Element" || kind == "Panel") {
+            return false;
+        }
+        return true;
+    }
+
+    public static void CollectAllNodes(JsonValue arr, List<JsonValue> nodes) {
+        if (arr == null || !arr.IsArray()) { return; }
+        for (int i = 0; i < arr.Count(); i = i + 1) {
+            JsonValue o = arr.At(i);
+            nodes.Add(o);
+            JsonValue kids = o.Get("kids");
+            if (kids != null && kids.IsArray()) {
+                GenForm.CollectAllNodes(kids, nodes);
             }
         }
     }
