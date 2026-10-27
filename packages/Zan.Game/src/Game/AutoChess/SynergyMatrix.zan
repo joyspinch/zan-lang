@@ -1,0 +1,157 @@
+using System;
+using System.Collections.Generic;
+
+namespace Game.AutoChess;
+
+// 自走棋与团队羁绊矩阵计算器（SynergyMatrix）。
+// 对应《云顶之弈》、《金铲铲》与《背包乱斗》类自走棋核心数值算法：
+// 羁绊档位判定、上场同名英雄羁绊去重（Deduplication）以及各阶加成解算。
+public class SynergyMatrix {
+    public class SynergyDef {
+        public string name;
+        public int[] thresholds;   // 档位门槛，例如 [2, 4, 6]
+        public int[] bonusValues;  // 各档位加成数值，例如 [15, 35, 70]
+
+        public SynergyDef(string name, int[] thresholds, int[] bonusValues) {
+            this.name = name != null ? name : "";
+            this.thresholds = thresholds;
+            this.bonusValues = bonusValues;
+        }
+
+        // 根据当前有效英雄数，解算出当前激活的档位阶数（0: 未激活, 1: 一阶, 2: 二阶 ...）
+        public int ResolveTier(int count) {
+            if (thresholds == null || count <= 0) { return 0; }
+            int tier = 0;
+            for (int i = 0; i < thresholds.Length; i = i + 1) {
+                if (count >= thresholds[i]) {
+                    tier = i + 1;
+                } else {
+                    break;
+                }
+            }
+            return tier;
+        }
+
+        // 获取当前阶数对应的加成数值
+        public int ResolveBonus(int tier) {
+            if (bonusValues == null || tier <= 0 || tier > bonusValues.Length) { return 0; }
+            return bonusValues[tier - 1];
+        }
+    }
+
+    public class ChessUnit {
+        public string heroId;      // 英雄唯一种类 ID（如 "garen"）
+        public int star;           // 星级 (1, 2, 3)
+        public string[] traits;    // 拥有的羁绊/职业列表（如 ["Knight", "Noble"]）
+
+        public ChessUnit(string heroId, int star, string[] traits) {
+            this.heroId = heroId != null ? heroId : "";
+            this.star = star > 0 ? star : 1;
+            this.traits = traits;
+        }
+    }
+
+    public class SynergyResult {
+        public string synergyName;
+        public int heroCount;      // 有效去重后的人数
+        public int tier;           // 当前激活阶数 (0 表示未激活)
+        public int bonusValue;     // 当前加成值
+
+        public SynergyResult(string name, int count, int tier, int bonus) {
+            this.synergyName = name;
+            this.heroCount = count;
+            this.tier = tier;
+            this.bonusValue = bonus;
+        }
+    }
+
+    public List<SynergyDef> definitions;
+
+    public SynergyMatrix() {
+        this.definitions = new List<SynergyDef>();
+    }
+
+    public static SynergyMatrix Create() {
+        return new SynergyMatrix();
+    }
+
+    // 注册一个羁绊规则
+    public void AddSynergy(string name, int[] thresholds, int[] bonusValues) {
+        definitions.Add(new SynergyDef(name, thresholds, bonusValues));
+    }
+
+    // 核心算法：评估当前场上阵容，计算激活的羁绊。
+    // 严格遵循工业级自走棋规则：同种 heroId 无论上场多少个，只提供 1 次羁绊计数！
+    public List<SynergyResult> Evaluate(List<ChessUnit> boardUnits) {
+        List<SynergyResult> results = new List<SynergyResult>();
+        if (boardUnits == null || boardUnits.Count == 0) {
+            return results;
+        }
+
+        // 1. 英雄去重过滤：每个 heroId 只保留一份有效羁绊贡献
+        List<string> countedHeroes = new List<string>();
+        // 统计各羁绊名字出现的人数
+        List<string> traitNames = new List<string>();
+        List<int> traitCounts = new List<int>();
+
+        for (int i = 0; i < boardUnits.Count; i = i + 1) {
+            ChessUnit u = boardUnits[i];
+            if (u == null || u.heroId.Length == 0) { continue; }
+
+            // 检查该 heroId 是否已经计入过
+            bool alreadyCounted = false;
+            for (int h = 0; h < countedHeroes.Count; h = h + 1) {
+                if (countedHeroes[h] == u.heroId) {
+                    alreadyCounted = true;
+                    break;
+                }
+            }
+
+            if (alreadyCounted) {
+                continue;
+            }
+            countedHeroes.Add(u.heroId);
+
+            // 累计该英雄持有的各个羁绊
+            if (u.traits != null) {
+                for (int t = 0; t < u.traits.Length; t = t + 1) {
+                    string tName = u.traits[t];
+                    if (tName == null || tName.Length == 0) { continue; }
+
+                    int foundIdx = -1;
+                    for (int k = 0; k < traitNames.Count; k = k + 1) {
+                        if (traitNames[k] == tName) {
+                            foundIdx = k;
+                            break;
+                        }
+                    }
+
+                    if (foundIdx >= 0) {
+                        traitCounts[foundIdx] = traitCounts[foundIdx] + 1;
+                    } else {
+                        traitNames.Add(tName);
+                        traitCounts.Add(1);
+                    }
+                }
+            }
+        }
+
+        // 2. 匹配已注册的羁绊定义，解算档位与加成
+        for (int d = 0; d < definitions.Count; d = d + 1) {
+            SynergyDef def = definitions[d];
+            int count = 0;
+            for (int k = 0; k < traitNames.Count; k = k + 1) {
+                if (traitNames[k] == def.name) {
+                    count = traitCounts[k];
+                    break;
+                }
+            }
+
+            int tier = def.ResolveTier(count);
+            int bonus = def.ResolveBonus(tier);
+            results.Add(new SynergyResult(def.name, count, tier, bonus));
+        }
+
+        return results;
+    }
+}

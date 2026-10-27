@@ -1,0 +1,231 @@
+using System;
+
+namespace Game.Match3;
+
+// 三消与连锁级联消除引擎（Match3Board）。
+// 提供三消游戏核心数学状态机：相邻交换校验、横纵三连扫描、相交消除合并、
+// 重力下落空缺压缩（Gravity Fall）以及级联多重连击解算（Cascading Combos）。
+// 纯无头确定性架构，零外部渲染依赖。
+public class Match3Board {
+    public int cols;
+    public int rows;
+    public int[] grid; // 0 表示空格子，>= 1 表示不同类型/颜色的宝石或方块
+
+    public Match3Board(int cols, int rows) {
+        this.cols = cols > 0 ? cols : 8;
+        this.rows = rows > 0 ? rows : 8;
+        this.grid = new int[this.cols * this.rows];
+    }
+
+    public static Match3Board Create(int cols, int rows) {
+        return new Match3Board(cols, rows);
+    }
+
+    public int Cols { get { return cols; } }
+    public int Rows { get { return rows; } }
+    public int TotalTiles { get { return cols * rows; } }
+
+    public int Get(int c, int r) {
+        if (c < 0 || c >= cols || r < 0 || r >= rows) { return 0; }
+        return grid[r * cols + c];
+    }
+
+    public void Set(int c, int r, int val) {
+        if (c >= 0 && c < cols && r >= 0 && r < rows) {
+            grid[r * cols + c] = val;
+        }
+    }
+
+    // 填充整个棋盘数据（一维数组长度必须为 cols * rows）
+    public void Load(int[] data) {
+        if (data == null) { return; }
+        int len = data.Length < grid.Length ? data.Length : grid.Length;
+        for (int i = 0; i < len; i = i + 1) {
+            grid[i] = data[i];
+        }
+    }
+
+    // 判断两个格子是否相邻（曼哈顿距离恰好为 1）
+    public static bool IsAdjacent(int c1, int r1, int c2, int r2) {
+        int dc = c1 > c2 ? c1 - c2 : c2 - c1;
+        int dr = r1 > r2 ? r1 - r2 : r2 - r1;
+        return (dc + dr) == 1;
+    }
+
+    // 交换两格
+    public void Swap(int c1, int r1, int c2, int r2) {
+        if (c1 < 0 || c1 >= cols || r1 < 0 || r1 >= rows) { return; }
+        if (c2 < 0 || c2 >= cols || r2 < 0 || r2 >= rows) { return; }
+        int idx1 = r1 * cols + c1;
+        int idx2 = r2 * cols + c2;
+        int temp = grid[idx1];
+        grid[idx1] = grid[idx2];
+        grid[idx2] = temp;
+    }
+
+    // 模拟交换，判断交换后是否能触发至少一个有效的三连消除
+    public bool CanSwap(int c1, int r1, int c2, int r2) {
+        if (!IsAdjacent(c1, r1, c2, r2)) { return false; }
+        int val1 = Get(c1, r1);
+        int val2 = Get(c2, r2);
+        if (val1 == 0 || val2 == 0 || val1 == val2) { return false; }
+
+        Swap(c1, r1, c2, r2);
+        bool hasMatch = HasAnyMatch();
+        Swap(c1, r1, c2, r2); // 换回
+        return hasMatch;
+    }
+
+    // 快速检测全盘是否存在至少一个三连（无需分配标记数组）
+    public bool HasAnyMatch() {
+        // 横向检测
+        for (int r = 0; r < rows; r = r + 1) {
+            int rowOff = r * cols;
+            for (int c = 0; c < cols - 2; c = c + 1) {
+                int v = grid[rowOff + c];
+                if (v != 0 && v == grid[rowOff + c + 1] && v == grid[rowOff + c + 2]) {
+                    return true;
+                }
+            }
+        }
+        // 纵向检测
+        for (int c = 0; c < cols; c = c + 1) {
+            for (int r = 0; r < rows - 2; r = r + 1) {
+                int v = grid[r * cols + c];
+                if (v != 0 && v == grid[(r + 1) * cols + c] && v == grid[(r + 2) * cols + c]) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    // 全盘扫描三连消除项，并将待消除的格子在 marked 数组中置为 true。
+    // 返回本次命中的消除格子总数。
+    public int FindMatches(bool[] marked) {
+        if (marked == null || marked.Length < grid.Length) { return 0; }
+        for (int i = 0; i < grid.Length; i = i + 1) {
+            marked[i] = false;
+        }
+
+        int count = 0;
+
+        // 1. 横向扫描（连续相同且非 0 的项 >= 3）
+        for (int r = 0; r < rows; r = r + 1) {
+            int rowOff = r * cols;
+            int matchLen = 1;
+            for (int c = 0; c < cols; c = c + 1) {
+                bool isSame = (c < cols - 1) && (grid[rowOff + c] != 0) && (grid[rowOff + c] == grid[rowOff + c + 1]);
+                if (isSame) {
+                    matchLen = matchLen + 1;
+                } else {
+                    if (matchLen >= 3 && grid[rowOff + c] != 0) {
+                        for (int k = 0; k < matchLen; k = k + 1) {
+                            int idx = rowOff + c - k;
+                            if (!marked[idx]) {
+                                marked[idx] = true;
+                                count = count + 1;
+                            }
+                        }
+                    }
+                    matchLen = 1;
+                }
+            }
+        }
+
+        // 2. 纵向扫描
+        for (int c = 0; c < cols; c = c + 1) {
+            int matchLen = 1;
+            for (int r = 0; r < rows; r = r + 1) {
+                bool isSame = (r < rows - 1) && (grid[r * cols + c] != 0) && (grid[r * cols + c] == grid[(r + 1) * cols + c]);
+                if (isSame) {
+                    matchLen = matchLen + 1;
+                } else {
+                    if (matchLen >= 3 && grid[r * cols + c] != 0) {
+                        for (int k = 0; k < matchLen; k = k + 1) {
+                            int idx = (r - k) * cols + c;
+                            if (!marked[idx]) {
+                                marked[idx] = true;
+                                count = count + 1;
+                            }
+                        }
+                    }
+                    matchLen = 1;
+                }
+            }
+        }
+
+        return count;
+    }
+
+    // 清空被标记的格子（置 0）
+    public void ClearMarked(bool[] marked) {
+        if (marked == null) { return; }
+        int len = marked.Length < grid.Length ? marked.Length : grid.Length;
+        for (int i = 0; i < len; i = i + 1) {
+            if (marked[i]) {
+                grid[i] = 0;
+            }
+        }
+    }
+
+    // 施加重力：每列从底向上压缩非空元素，上方出现空缺，返回发生位移的方块数量
+    public int ApplyGravity() {
+        int movedTiles = 0;
+        for (int c = 0; c < cols; c = c + 1) {
+            int writeRow = rows - 1; // 写入指针从最底行开始
+            for (int r = rows - 1; r >= 0; r = r - 1) {
+                int val = grid[r * cols + c];
+                if (val != 0) {
+                    if (r != writeRow) {
+                        grid[writeRow * cols + c] = val;
+                        grid[r * cols + c] = 0;
+                        movedTiles = movedTiles + 1;
+                    }
+                    writeRow = writeRow - 1;
+                }
+            }
+        }
+        return movedTiles;
+    }
+
+    // 顶部空位回填：从 incoming 数组中依次提取新元素填补顶部的 0 空位
+    public int FillTop(int[] incoming, ref int incomingIdx) {
+        if (incoming == null) { return 0; }
+        int filled = 0;
+        for (int c = 0; c < cols; c = c + 1) {
+            for (int r = rows - 1; r >= 0; r = r - 1) {
+                if (grid[r * cols + c] == 0) {
+                    if (incomingIdx < incoming.Length) {
+                        grid[r * cols + c] = incoming[incomingIdx];
+                        incomingIdx = incomingIdx + 1;
+                        filled = filled + 1;
+                    }
+                }
+            }
+        }
+        return filled;
+    }
+
+    // 执行一次完整的级联消除直到棋盘稳定。
+    // 返回消除的总方块数与触发的连击层数（Combo 次数）
+    public void ResolveCascades(int[] incoming, ref int incomingIdx, out int totalCleared, out int comboCount) {
+        totalCleared = 0;
+        comboCount = 0;
+        bool[] marked = new bool[grid.Length];
+
+        while (true) {
+            int clearedThisTurn = FindMatches(marked);
+            if (clearedThisTurn <= 0) {
+                break;
+            }
+
+            ClearMarked(marked);
+            totalCleared = totalCleared + clearedThisTurn;
+            comboCount = comboCount + 1;
+
+            ApplyGravity();
+            FillTop(incoming, ref incomingIdx);
+        }
+    }
+}

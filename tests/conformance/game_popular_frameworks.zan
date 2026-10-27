@@ -1,0 +1,184 @@
+using System;
+using System.Collections.Generic;
+using Game.Match3;
+using Game.AutoChess;
+using Game.HardcoreCombat;
+
+// 热门游戏品类底层核心框架综合单元测试：
+//   - Game.Match3：相邻交换模拟、三连扫描、重力下落与级联消除；
+//   - Game.AutoChess：羁绊门槛解算、同名英雄去重统计、三合一升星与级联三星；
+//   - Game.HardcoreCombat：耐力消耗/虚脱态、招架弹反窗口/免伤、削韧破防与硬直复原。
+public class GamePopularFrameworksTests {
+    private static int failures = 0;
+
+    private static void Check(string name, bool ok) {
+        if (!ok) {
+            failures = failures + 1;
+            Console.WriteLine("FAIL: " + name);
+        }
+    }
+
+    public static void Main(string[] args) {
+        TestMatch3();
+        TestAutoChess();
+        TestHardcoreCombat();
+
+        if (failures == 0) {
+            Console.WriteLine("PASS");
+        } else {
+            Console.WriteLine("FAILURES: " + failures);
+            Environment.Exit(1);
+        }
+    }
+
+    private static void TestMatch3() {
+        // 创建 4 列 x 4 行的测试小棋盘
+        Match3Board board = new Match3Board(4, 4);
+
+        // 设置底行：[1, 1, 0, 1]，(2, 3) 为 0 空位
+        board.Set(0, 3, 1);
+        board.Set(1, 3, 1);
+        board.Set(2, 3, 2);
+        board.Set(3, 3, 1);
+
+        // (2, 2) 上方放一个 1
+        board.Set(2, 2, 1);
+
+        // (2, 2) 的 1 与 (2, 3) 的 2 交换，应该能在底行凑成 [1, 1, 1, 1] 4 连！
+        Check("Match3_CanSwap", board.CanSwap(2, 2, 2, 3));
+        // 非相邻格不可换
+        Check("Match3_CannotSwapNonAdj", !board.CanSwap(0, 3, 3, 3));
+
+        // 执行交换
+        board.Swap(2, 2, 2, 3);
+        Check("Match3_HasMatch", board.HasAnyMatch());
+
+        bool[] marked = new bool[16];
+        int matchCount = board.FindMatches(marked);
+        // 底行 4 个 1 全部应被标记为待消除
+        Check("Match3_FindMatches", matchCount == 4);
+
+        board.ClearMarked(marked);
+        Check("Match3_Cleared", board.Get(0, 3) == 0 && board.Get(1, 3) == 0);
+
+        // 重力下落：(2, 2) 处的方块 2 应该落到底行 (2, 3)
+        board.ApplyGravity();
+        Check("Match3_Gravity", board.Get(2, 3) == 2 && board.Get(2, 2) == 0);
+
+        // 测试级联消除
+        Match3Board board2 = new Match3Board(3, 3);
+        // 第一行放 [3, 3, 3]
+        board2.Set(0, 0, 3);
+        board2.Set(1, 0, 3);
+        board2.Set(2, 0, 3);
+
+        int[] incoming = new int[4] { 5, 6, 7, 8 };
+        int inIdx = 0;
+        int totalCleared = 0;
+        int combos = 0;
+        board2.ResolveCascades(incoming, ref inIdx, out totalCleared, out combos);
+        Check("Match3_Cascade", totalCleared == 3 && combos == 1);
+    }
+
+    private static void TestAutoChess() {
+        SynergyMatrix matrix = new SynergyMatrix();
+        // 注册羁绊：Knight (门槛 2, 4；加成 20, 50)
+        matrix.AddSynergy("Knight", new int[2] { 2, 4 }, new int[2] { 20, 50 });
+        // 注册羁绊：Noble (门槛 3；加成 100)
+        matrix.AddSynergy("Noble", new int[1] { 3 }, new int[1] { 100 });
+
+        List<SynergyMatrix.ChessUnit> board = new List<SynergyMatrix.ChessUnit>();
+        // 上场 2 个盖伦（同名 heroId="garen"，拥有 Knight 与 Noble 羁绊）
+        board.Add(new SynergyMatrix.ChessUnit("garen", 1, new string[2] { "Knight", "Noble" }));
+        board.Add(new SynergyMatrix.ChessUnit("garen", 1, new string[2] { "Knight", "Noble" }));
+        // 上场 1 个波比（heroId="poppy"，拥有 Knight 羁绊）
+        board.Add(new SynergyMatrix.ChessUnit("poppy", 1, new string[1] { "Knight" }));
+
+        List<SynergyMatrix.SynergyResult> results = matrix.Evaluate(board);
+
+        // 验证去重规则：2 个盖伦只算 1 个 Knight + 1 个波比 = 2 个 Knight，刚好激活一阶 Knight(加成20)！
+        // Noble 只有盖伦提供 1 个，未达门槛 3，应为 0 阶！
+        int knightTier = 0;
+        int knightBonus = 0;
+        int nobleTier = 0;
+        for (int i = 0; i < results.Count; i = i + 1) {
+            if (results[i].synergyName == "Knight") {
+                knightTier = results[i].tier;
+                knightBonus = results[i].bonusValue;
+            } else if (results[i].synergyName == "Noble") {
+                nobleTier = results[i].tier;
+            }
+        }
+
+        Check("AutoChess_KnightTier", knightTier == 1 && knightBonus == 20);
+        Check("AutoChess_NobleTier", nobleTier == 0);
+
+        // 测试三合一升星：给场上再加第 3 个 1 星盖伦，应该自动合成 1 个 2 星盖伦，并使单位总数从 4 变 2
+        board.Add(new SynergyMatrix.ChessUnit("garen", 1, new string[2] { "Knight", "Noble" }));
+        Check("AutoChess_PreUpgradeCount", board.Count == 4);
+
+        List<StarUpgrader.UpgradeEvent> events = StarUpgrader.TryUpgrade(board);
+        Check("AutoChess_Upgraded", events.Count == 1 && events[0].heroId == "garen" && events[0].toStar == 2);
+        Check("AutoChess_PostUpgradeCount", board.Count == 2);
+    }
+
+    private static void TestHardcoreCombat() {
+        // 1. 耐力槽测试
+        StaminaSystem stamina = new StaminaSystem(100.0, 40.0);
+        Check("Stamina_Init", stamina.Current == 100.0 && !stamina.IsExhausted);
+
+        // 翻滚消耗 60
+        stamina.Consume(60.0);
+        Check("Stamina_AfterRoll", stamina.Current == 40.0);
+
+        // 再消耗 40，刚好归零，进入虚脱惩罚态
+        stamina.Consume(40.0);
+        Check("Stamina_Exhausted", stamina.Current == 0.0 && stamina.IsExhausted);
+
+        // 处于虚脱态时，尝试消耗应被拒绝
+        Check("Stamina_RefuseInExhausted", !stamina.Consume(10.0));
+
+        // 步进回复 0.8s 延迟后自然回复
+        stamina.Update(1.0); // 0.8s 延迟 + 0.2s * 40/s = 8
+        Check("Stamina_RegenDelayed", stamina.Current > 0.0);
+
+        // 2. 弹反窗口测试
+        ParryWindow parry = new ParryWindow();
+        int damageTaken = 0;
+
+        // 未格挡受创
+        int resHit = parry.ResolveIncomingAttack(100, out damageTaken);
+        Check("Parry_Hit", resHit == ParryWindow.ResultHit && damageTaken == 100);
+
+        // 按下招架，处于 150ms 完美弹反窗口内
+        parry.StartBlock();
+        Check("Parry_InWindow", parry.IsInParryWindow);
+
+        int resParry = parry.ResolveIncomingAttack(100, out damageTaken);
+        Check("Parry_Success", resParry == ParryWindow.ResultParried && damageTaken == 0);
+
+        // 时间过去 0.2s，超出弹反窗口，但仍处于按住防御态（转为普通格挡）
+        parry.Update(0.2);
+        Check("Parry_OutWindow", !parry.IsInParryWindow && parry.IsBlocking);
+
+        int resBlock = parry.ResolveIncomingAttack(100, out damageTaken);
+        // 普通格挡减免 70% 伤害，承受 30 伤害
+        Check("Parry_Block", resBlock == ParryWindow.ResultBlocked && damageTaken == 30);
+
+        // 3. 削韧与破防测试
+        PoiseSystem poise = new PoiseSystem(100.0);
+        Check("Poise_Init", poise.Current == 100.0 && !poise.IsStaggered);
+
+        // 受到 60 点削韧
+        bool broken1 = poise.ApplyPoiseDamage(60.0);
+        Check("Poise_Hit1", !broken1 && poise.Current == 40.0 && !poise.IsStaggered);
+
+        // 再受到 50 点削韧，击穿 40 剩余韧性，触发破防失衡！
+        bool broken2 = poise.ApplyPoiseDamage(50.0);
+        Check("Poise_Broken", broken2 && poise.IsStaggered && poise.Current == 0.0);
+
+        // 硬直 1.5 秒后复原
+        poise.Update(1.6);
+        Check("Poise_Recovered", !poise.IsStaggered && poise.Current == 100.0);
+    }
+}
