@@ -254,8 +254,12 @@ static const zan_glyph_tile *win_dwrite_tile(const char *text, int size,
 
     ensure_text_dc();
     int wlen = MultiByteToWideChar(CP_UTF8, 0, text, -1, NULL, 0);
-    wchar_t *wtext = (wchar_t *)malloc((size_t)wlen * sizeof(wchar_t));
-    if (!wtext) return NULL;
+    wchar_t stack_wtext[256];
+    wchar_t *wtext = stack_wtext;
+    if ((size_t)wlen > sizeof(stack_wtext) / sizeof(stack_wtext[0])) {
+        wtext = (wchar_t *)malloc((size_t)wlen * sizeof(wchar_t));
+        if (!wtext) return NULL;
+    }
     MultiByteToWideChar(CP_UTF8, 0, text, -1, wtext, wlen);
     HFONT font = get_or_create_font(size, bold);
     HFONT old_font = (HFONT)SelectObject(g_text_dc, font);
@@ -267,7 +271,7 @@ static const zan_glyph_tile *win_dwrite_tile(const char *text, int size,
     int tw = 0, th = 0, adv = 0;
     int ok = zan_dw_render(wtext, wlen - 1, family, (float)size,
                            bold ? 1 : 0, &px, &tw, &th, &adv);
-    free(wtext);
+    if (wtext != stack_wtext) free(wtext);
     if (!ok || !px) return NULL;
 
     const zan_glyph_tile *tile = zan_atlas_store(ZAN_TILE_RUN, ksize, text,
@@ -297,8 +301,12 @@ static const zan_glyph_tile *win_run_tile(const char *text, int size, int bold) 
     if (cached) return cached;
 
     int wlen = MultiByteToWideChar(CP_UTF8, 0, text, -1, NULL, 0);
-    wchar_t *wtext = (wchar_t *)malloc((size_t)wlen * sizeof(wchar_t));
-    if (!wtext) return NULL;
+    wchar_t stack_wtext[256];
+    wchar_t *wtext = stack_wtext;
+    if ((size_t)wlen > sizeof(stack_wtext) / sizeof(stack_wtext[0])) {
+        wtext = (wchar_t *)malloc((size_t)wlen * sizeof(wchar_t));
+        if (!wtext) return NULL;
+    }
     MultiByteToWideChar(CP_UTF8, 0, text, -1, wtext, wlen);
     int text_len = wlen - 1;
 
@@ -309,7 +317,7 @@ static const zan_glyph_tile *win_run_tile(const char *text, int size, int bold) 
     int tw = ts.cx + 2;
     int th = ts.cy + 2;
     if (tw <= 0 || th <= 0) {
-        free(wtext); SelectObject(g_text_dc, old_font); return NULL;
+        if (wtext != stack_wtext) free(wtext); SelectObject(g_text_dc, old_font); return NULL;
     }
 
     BITMAPINFO bmi = {0};
@@ -321,7 +329,7 @@ static const zan_glyph_tile *win_run_tile(const char *text, int size, int bold) 
     bmi.bmiHeader.biCompression = BI_RGB;
     void *dbits = NULL;
     HBITMAP hbmp = CreateDIBSection(g_text_dc, &bmi, DIB_RGB_COLORS, &dbits, NULL, 0);
-    if (!hbmp) { free(wtext); SelectObject(g_text_dc, old_font); return NULL; }
+    if (!hbmp) { if (wtext != stack_wtext) free(wtext); SelectObject(g_text_dc, old_font); return NULL; }
     HBITMAP old_bmp = (HBITMAP)SelectObject(g_text_dc, hbmp);
     memset(dbits, 0, (size_t)(tw * th * 4));
     SetTextColor(g_text_dc, RGB(255, 255, 255));
@@ -335,7 +343,7 @@ static const zan_glyph_tile *win_run_tile(const char *text, int size, int bold) 
     SelectObject(g_text_dc, old_bmp);
     SelectObject(g_text_dc, old_font);
     DeleteObject(hbmp);
-    free(wtext);
+    if (wtext != stack_wtext) free(wtext);
     return tile;
 }
 
@@ -438,8 +446,12 @@ EXPORT void zan_gui_draw_text_rot(
     const zan_glyph_tile *tile = zan_atlas_find(ZAN_TILE_RUN, size, key, klen);
     if (!tile) {
         int wlen = MultiByteToWideChar(CP_UTF8, 0, text, -1, NULL, 0);
-        wchar_t *wtext = (wchar_t *)malloc((size_t)wlen * sizeof(wchar_t));
-        if (!wtext) { free(key); return; }
+        wchar_t stack_wtext[256];
+        wchar_t *wtext = stack_wtext;
+        if ((size_t)wlen > sizeof(stack_wtext) / sizeof(stack_wtext[0])) {
+            wtext = (wchar_t *)malloc((size_t)wlen * sizeof(wchar_t));
+            if (!wtext) { free(key); return; }
+        }
         MultiByteToWideChar(CP_UTF8, 0, text, -1, wtext, wlen);
         int text_len = wlen - 1;
 
@@ -476,7 +488,7 @@ EXPORT void zan_gui_draw_text_rot(
         int bh = (int)ceil(mxy) - (int)floor(mny) + 2;
 
         if (bw <= 0 || bh <= 0 || bw > 16384 || bh > 16384) {
-            free(wtext);
+            if (wtext != stack_wtext) free(wtext);
             SelectObject(g_text_dc, old_font);
             free(key);
             return;
@@ -493,7 +505,7 @@ EXPORT void zan_gui_draw_text_rot(
         HBITMAP hbmp = CreateDIBSection(g_text_dc, &bmi, DIB_RGB_COLORS,
                                         &dbits, NULL, 0);
         if (!hbmp) {
-            free(wtext);
+            if (wtext != stack_wtext) free(wtext);
             SelectObject(g_text_dc, old_font);
             free(key);
             return;
@@ -520,7 +532,7 @@ EXPORT void zan_gui_draw_text_rot(
         SelectObject(g_text_dc, old_bmp);
         DeleteObject(hbmp);
         SelectObject(g_text_dc, old_font);
-        free(wtext);
+        if (wtext != stack_wtext) free(wtext);
     }
     free(key);
     if (tile) {

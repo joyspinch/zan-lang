@@ -1,4 +1,5 @@
 using System;
+using System.Threading;
 using System.Net.Http.Download;
 using Gui;
 using Gui.Widget;
@@ -83,17 +84,25 @@ public class DownloadDialog : ChildWindow {
         return d;
     }
 
-    // 驱动窗口直到任务成功或用户关窗，并返回是否成功（协程异步驱动，零消息泵阻塞）。
+    // 驱动窗口直到任务成功或用户关窗，并返回是否成功。
+    // 在独立事件泵下运行，实时处理操作系统事件（鼠标/键盘/关闭事件与系统心跳），杜绝未响应。
     // 失败/取消时窗口保留，调用方可以先更新说明文字，再等待用户关窗。用户关窗不会取消任务；
     // 关窗后不再绘制界面，剩余工作静默等到收工。
     async bool RunStandalone() {
-        while (this.IsOpen() && this.job != null && this.job.Running()) {
-            this.Render();
-            await Task.Delay(16);
-        }
+        return this.RunStandaloneSync();
+    }
+
+    // 独立事件泵驱动的同步版本。
+    bool RunStandaloneSync() {
+        // 1. 窗口开启期间，持续以宿主原生事件泵驱动，直到任务收工或用户关窗
+        this.PumpStandaloneUntilKeepOpen(() => {
+            return this.job == null || !this.job.Running();
+        });
+        // 2. 若用户中途主动关窗（关窗不取消任务），静默等待后台 worker 线程收工
         while (this.job != null && this.job.Running()) {
-            await Task.Delay(50);
+            Thread.Sleep(50);
         }
+        // 3. 任务成功收工：若窗口仍开着则自动关闭并清理当前引用
         if (this.job != null && this.job.Succeeded()) {
             if (this.IsOpen()) { this.Close(); }
             if (DownloadDialog.current == this) {
@@ -101,21 +110,16 @@ public class DownloadDialog : ChildWindow {
             }
             return true;
         }
+        // 4. 任务失败/取消且窗口已被用户关闭
         if (!this.IsOpen() && DownloadDialog.current == this) {
             DownloadDialog.current = null;
         }
         return false;
     }
 
-    // 异步等待用户关闭窗口（协程挂起，不卡死 GUI）。
+    // 异步等待用户关闭窗口。在独立事件泵下运行，响应用户点击界面“关闭”按钮或标题栏关闭叉号。
     async Task WaitStandaloneCloseAsync() {
-        while (this.IsOpen()) {
-            this.Render();
-            await Task.Delay(16);
-        }
-        if (DownloadDialog.current == this) {
-            DownloadDialog.current = null;
-        }
+        this.WaitStandaloneClose();
     }
 
     // 失败/取消后继续驱动窗口，直到用户关窗。
