@@ -21,9 +21,12 @@
     pwsh -File scripts\audit_game_projects.ps1
     pwsh -File scripts\audit_game_projects.ps1 -GamesRoot D:\project\games -Json
 #>
+$defaultRepoRoot = Split-Path -Parent $PSScriptRoot
+$defaultGamesRoot = if ($env:ZAN_GAMES_ROOT) { $env:ZAN_GAMES_ROOT } elseif (Test-Path (Join-Path (Split-Path -Parent $defaultRepoRoot) 'games')) { (Join-Path (Split-Path -Parent $defaultRepoRoot) 'games') } else { 'D:\project\games' }
+
 [CmdletBinding()]
 param(
-    [string]$GamesRoot = 'D:\project\games',
+    [string]$GamesRoot = $defaultGamesRoot,
     [switch]$Json
 )
 $ErrorActionPreference = 'Continue'

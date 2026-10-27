@@ -301,7 +301,24 @@ foreach ($driver in @('zan_gui', 'zan_image', 'zan_audio', 'zan_game')) {
 # or a TDM-GCC install; copy gdb.exe plus the DLLs it needs to run.
 $gdbSrcDir = $env:ZAN_GDB_DIR
 if (-not $gdbSrcDir -or -not (Test-Path (Join-Path $gdbSrcDir 'gdb.exe'))) {
-    $gdbSrcDir = 'C:\TDM-GCC-64\bin'
+    $pathGdb = Get-Command gdb.exe -ErrorAction SilentlyContinue
+    if ($pathGdb -and (Test-Path $pathGdb.Source)) {
+        $gdbSrcDir = Split-Path -Parent $pathGdb.Source
+    } else {
+        $gdbCandidates = @(
+            $(if ($env:MINGW_ROOT) { Join-Path $env:MINGW_ROOT 'bin' }),
+            $(if ($env:MINGW_HOME) { Join-Path $env:MINGW_HOME 'bin' }),
+            'C:\msys64\mingw64\bin',
+            'C:\msys64\ucrt64\bin',
+            'C:\TDM-GCC-64\bin'
+        )
+        foreach ($c in $gdbCandidates) {
+            if ($c -and (Test-Path (Join-Path $c 'gdb.exe'))) {
+                $gdbSrcDir = $c
+                break
+            }
+        }
+    }
 }
 $gdbExe = Join-Path $gdbSrcDir 'gdb.exe'
 if (Test-Path $gdbExe) {

@@ -20,14 +20,33 @@ Write-Output "IDE_BUILD_START"
 # name is unreliable in some restricted sessions even with the dir prepended,
 # so every native call below uses the full path via $clangExe / $clangDir.
 $clangExe = ""
-$clangHints = @(
-    "$env:USERPROFILE\.mozbuild\clang\bin",
-    "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\Llvm\x64\bin"
-)
-foreach ($hint in $clangHints) {
-    if (Test-Path (Join-Path $hint "clang.exe")) {
-        $clangExe = (Get-Item $hint).FullName + "\clang.exe"
-        break
+# 0.1 Check PATH and env vars first
+$pathClang = Get-Command clang.exe -ErrorAction SilentlyContinue
+if ($pathClang -and (Test-Path $pathClang.Source)) {
+    $clangExe = $pathClang.Source
+} elseif ($env:LLVM_DIR -and (Test-Path (Join-Path $env:LLVM_DIR "bin\clang.exe"))) {
+    $clangExe = (Join-Path $env:LLVM_DIR "bin\clang.exe")
+} elseif ($env:LLVM_HOME -and (Test-Path (Join-Path $env:LLVM_HOME "bin\clang.exe"))) {
+    $clangExe = (Join-Path $env:LLVM_HOME "bin\clang.exe")
+}
+
+if ($clangExe -eq "") {
+    $clangHints = @(
+        "$env:USERPROFILE\.mozbuild\clang\bin",
+        "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\Llvm\x64\bin",
+        "C:\Program Files\Microsoft Visual Studio\2022\Professional\VC\Tools\Llvm\x64\bin",
+        "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Tools\Llvm\x64\bin",
+        "C:\Program Files\Microsoft Visual Studio\2022\BuildTools\VC\Tools\Llvm\x64\bin",
+        "D:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\Llvm\x64\bin",
+        "D:\Program Files\Microsoft Visual Studio\2022\Professional\VC\Tools\Llvm\x64\bin",
+        "C:\Program Files\LLVM\bin",
+        "D:\Program Files\LLVM\bin"
+    )
+    foreach ($hint in $clangHints) {
+        if (Test-Path (Join-Path $hint "clang.exe")) {
+            $clangExe = (Get-Item $hint).FullName + "\clang.exe"
+            break
+        }
     }
 }
 if ($clangExe -eq "") {

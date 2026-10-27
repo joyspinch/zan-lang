@@ -53,16 +53,34 @@ param(
     # 失败重试次数
     [int]$Retries = 3,
 
-    # 密钥来源（默认 D:/project/secrets.local.ps1）
-    [string]$Secrets = 'D:/project/secrets.local.ps1'
+    # 密钥来源（可选，缺省尝试环境变量、~/.secrets.local.ps1、上级目录等）
+    [string]$Secrets = ''
 )
 
 $ErrorActionPreference = 'Stop'
 $repo = Split-Path -Parent $PSScriptRoot
-if (-not (Test-Path $Secrets)) { throw "找不到密钥文件：$Secrets" }
-. $Secrets
-if (-not $env:OPENAI_API_KEY) { throw '密钥文件里没有 OPENAI_API_KEY' }
-if (-not $env:OPENAI_BASE_URL) { throw '密钥文件里没有 OPENAI_BASE_URL' }
+
+if (-not $env:OPENAI_API_KEY -or -not $env:OPENAI_BASE_URL) {
+    if (-not $Secrets) {
+        $candidates = @(
+            $env:ZAN_SECRETS_FILE,
+            (Join-Path (Split-Path -Parent $repo) 'secrets.local.ps1'),
+            (Join-Path $HOME '.secrets.local.ps1'),
+            'D:/project/secrets.local.ps1'
+        )
+        foreach ($c in $candidates) {
+            if ($c -and (Test-Path $c)) {
+                $Secrets = $c
+                break
+            }
+        }
+    }
+    if ($Secrets -and (Test-Path $Secrets)) {
+        . $Secrets
+    }
+}
+if (-not $env:OPENAI_API_KEY) { throw '未找到有效的 OPENAI_API_KEY（可通过环境变量设置或提供 -Secrets 脚本）' }
+if (-not $env:OPENAI_BASE_URL) { throw '未找到有效的 OPENAI_BASE_URL（可通过环境变量设置或提供 -Secrets 脚本）' }
 
 $script = Join-Path $repo 'scripts\gen_game_art.py'
 $outPath = if ([IO.Path]::IsPathRooted($Out)) { $Out } else { Join-Path $repo $Out }

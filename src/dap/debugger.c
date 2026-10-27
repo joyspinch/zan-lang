@@ -352,6 +352,7 @@ static bool mi_file_exists(const char *path) {
 static void mi_resolve_gdb(debugger_t *dbg, char *out, int size) {
     if (dbg->gdb_path[0]) { snprintf(out, (size_t)size, "%s", dbg->gdb_path); return; }
     const char *env = getenv("ZAN_GDB");
+    if (!env || !env[0]) env = getenv("ZAN_GDB_EXE");
     if (env && env[0]) { snprintf(out, (size_t)size, "%s", env); return; }
 
     char dir[1024];
@@ -369,8 +370,21 @@ static void mi_resolve_gdb(debugger_t *dbg, char *out, int size) {
         }
     }
 #ifdef _WIN32
-    const char *known = "C:\\TDM-GCC-64\\bin\\gdb.exe";
-    if (mi_file_exists(known)) { snprintf(out, (size_t)size, "%s", known); return; }
+    const char *mw = getenv("MINGW_ROOT");
+    if (!mw || !mw[0]) mw = getenv("MINGW_HOME");
+    if (mw && mw[0]) {
+        char cand[1200];
+        snprintf(cand, sizeof(cand), "%s\\bin\\gdb.exe", mw);
+        if (mi_file_exists(cand)) { snprintf(out, (size_t)size, "%s", cand); return; }
+    }
+    const char *candidates[] = {
+        "C:\\msys64\\mingw64\\bin\\gdb.exe",
+        "C:\\msys64\\ucrt64\\bin\\gdb.exe",
+        "C:\\TDM-GCC-64\\bin\\gdb.exe"
+    };
+    for (size_t i = 0; i < sizeof(candidates) / sizeof(candidates[0]); i++) {
+        if (mi_file_exists(candidates[i])) { snprintf(out, (size_t)size, "%s", candidates[i]); return; }
+    }
     snprintf(out, (size_t)size, "gdb.exe");
 #else
     snprintf(out, (size_t)size, "gdb");

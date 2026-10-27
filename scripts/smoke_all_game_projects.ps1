@@ -11,14 +11,17 @@
       pwsh -File scripts\smoke_all_game_projects.ps1 -Projects arena,crawler
       pwsh -File scripts\smoke_all_game_projects.ps1 -Json
 #>
+$defaultRepoRoot = Split-Path -Parent $PSScriptRoot
+$defaultGamesRoot = if ($env:ZAN_GAMES_ROOT) { $env:ZAN_GAMES_ROOT } elseif (Test-Path (Join-Path (Split-Path -Parent $defaultRepoRoot) 'games')) { (Join-Path (Split-Path -Parent $defaultRepoRoot) 'games') } else { 'D:\project\games' }
+
 [CmdletBinding()]
 param(
-    [string]$GamesRoot = 'D:\project\games',
+    [string]$GamesRoot = $defaultGamesRoot,
     # 要跑的项目目录名（默认：阶段一骨架的十个单文件项目）
     [string[]]$Projects = @('arena', 'cardarena', 'crawler', 'hacker', 'mahjong',
         'platformer', 'powder', 'racekart', 'rail', 'voxel'),
     # zan-lang 仓库根（编译器与公共包在它下面）
-    [string]$ZanHome = 'D:\project\zan-lang',
+    [string]$ZanHome = $defaultRepoRoot,
     # 公共包解析根（默认 = zan-lang 仓库根；公共包一律用主仓、只读）。
     # 公共包正被并行改动时，把主仓的 packages/ **拷**一份到别处再指过去——
     # 不要用 git worktree 副本：它与主仓天然漂移，公共包一改就落后。

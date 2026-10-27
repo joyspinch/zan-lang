@@ -17,11 +17,27 @@ param(
 $ErrorActionPreference = "Stop"
 
 if (-not $Compiler) {
-    $Compiler = "C:\TDM-GCC-64\bin\x86_64-w64-mingw32-gcc.exe"
-    if (-not (Test-Path -LiteralPath $Compiler)) {
+    if ($env:CC) { $Compiler = $env:CC }
+    if (-not $Compiler -or -not (Test-Path -LiteralPath $Compiler)) {
         $cc = Get-Command x86_64-w64-mingw32-gcc, gcc -ErrorAction SilentlyContinue |
               Select-Object -First 1
         if ($cc) { $Compiler = $cc.Source }
+    }
+    if (-not $Compiler -or -not (Test-Path -LiteralPath $Compiler)) {
+        $candidates = @(
+            $(if ($env:MINGW_ROOT) { Join-Path $env:MINGW_ROOT 'bin\x86_64-w64-mingw32-gcc.exe' }),
+            $(if ($env:MINGW_ROOT) { Join-Path $env:MINGW_ROOT 'bin\gcc.exe' }),
+            "C:\msys64\mingw64\bin\gcc.exe",
+            "C:\msys64\ucrt64\bin\gcc.exe",
+            "C:\TDM-GCC-64\bin\x86_64-w64-mingw32-gcc.exe",
+            "C:\TDM-GCC-64\bin\gcc.exe"
+        )
+        foreach ($c in $candidates) {
+            if ($c -and (Test-Path -LiteralPath $c)) {
+                $Compiler = $c
+                break
+            }
+        }
     }
 }
 if (!(Test-Path -LiteralPath $Compiler)) {
