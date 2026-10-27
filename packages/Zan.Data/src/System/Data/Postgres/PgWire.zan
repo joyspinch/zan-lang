@@ -11,13 +11,34 @@ namespace System.Data.Postgres;
 // <see cref="MySqlWire"/> 同一取舍（stdlib 去重 批D-1 的定式）。
 public class PgWire {
 
-    // 把缓冲区 <c>[off, off+len)</c> 的字节原样拷出并转为字符串；
-    // len &lt;= 0 时返回空串。
+    // 把缓冲区 <c>[off, off+len)</c> 的字节原样转为字符串；
+    // len <= 0 时返回空串。直接基于 ToStr(off, len) 实现原生切片，
+    // 免去 new byte[] + 逐字节复制 + ToStr 的双重堆分配。
     public static string bytesToStr(byte[] buf, int off, int len) {
         if (len <= 0) { return ""; }
-        byte[] t = new byte[len + 1];
-        for (int i = 0; i < len; i = i + 1) { t[i] = (byte)(buf[off + i] & 255); }
-        return t.ToStr(0, len);
+        return buf.ToStr(off, len);
+    }
+
+    // 从原始字节中直接就地解析十进制整数（int2/int4/int8），
+    // 完全消除产生临时 string 再 Convert.ToInt64 的堆分配。
+    public static long parseIntFromBytes(byte[] pay, int p, int clen) {
+        if (clen <= 0) { return 0; }
+        long acc = 0;
+        int i = p;
+        int end = p + clen;
+        bool neg = false;
+        if ((pay[i] & 255) == 45) { // '-'
+            neg = true;
+            i = i + 1;
+        }
+        while (i < end) {
+            int d = (pay[i] & 255) - 48;
+            if (d >= 0 && d <= 9) {
+                acc = acc * 10 + (long)d;
+            }
+            i = i + 1;
+        }
+        return neg ? (0 - acc) : acc;
     }
 
     // 把字符串的前 len 字节拷入新 byte[]，末尾追加 '\0'（C 字符串哨兵）。
@@ -161,8 +182,7 @@ public class PgWire {
                 int oid = c < colOids.Count ? colOids[c] : 0;
                 if (oid == 20 || oid == 21 || oid == 23) {
                     cell.kind = 1;
-                    string txt = PgWire.bytesToStr(pay, p, clen);
-                    cell.ival = txt.Length == 0 ? 0 : Convert.ToInt64(txt);
+                    cell.ival = PgWire.parseIntFromBytes(pay, p, clen);
                     texts.Add("");
                 } else {
                     cell.kind = 2;

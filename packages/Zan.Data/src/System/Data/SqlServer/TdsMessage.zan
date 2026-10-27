@@ -362,14 +362,22 @@ public class TdsMessage {
     }
 
     // ROW，或 NBCROW——前导位图标记 NULL 列，
-    // 这些列的值完全省略。
+    // 这些列的值完全省略。<=64 列采用 64 位无分配栈位图，>64 列回退动态表。
     public static void ReadRow(TdsReader r, List<TdsColumn> cols, TdsResponse resp,
             bool nbc) {
-        List<int> bitmap = new List<int>();
+        long nbcBits = 0L;
+        List<int> bitmap = null;
         if (nbc) {
             int bytes = (cols.Count + 7) / 8;
-            for (int i = 0; i < bytes; i = i + 1) {
-                bitmap.Add(r.U8());
+            if (bytes <= 8) {
+                for (int i = 0; i < bytes; i = i + 1) {
+                    nbcBits = nbcBits | ((long)r.U8() << (i * 8));
+                }
+            } else {
+                bitmap = new List<int>();
+                for (int i = 0; i < bytes; i = i + 1) {
+                    bitmap.Add(r.U8());
+                }
             }
         }
         List<DbCell> cells = new List<DbCell>();
@@ -377,8 +385,12 @@ public class TdsMessage {
         for (int c = 0; c < cols.Count; c = c + 1) {
             DbCell dc = new DbCell();
             bool isNull = false;
-            if (nbc && ((bitmap[c / 8] >> (c % 8)) & 1) == 1) {
-                isNull = true;
+            if (nbc) {
+                if (bitmap == null) {
+                    if (((nbcBits >> c) & 1L) == 1L) { isNull = true; }
+                } else {
+                    if (((bitmap[c / 8] >> (c % 8)) & 1) == 1) { isNull = true; }
+                }
             }
             if (isNull) {
                 texts.Add("");
