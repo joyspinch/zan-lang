@@ -70,6 +70,9 @@ public class FfHostMac {
     // DeriveScreenHeight。
     public static double screenH;
     public static bool screenHKnown;
+    static bool deriveWarned;
+    static bool placedOnce;
+    static bool hostFrameLogged;
 
     // 懒解析框架符号；失败时 probeError 说明原因。
     public static bool Ensure() {
@@ -177,14 +180,24 @@ public class FfHostMac {
     // 附着到 Firefox 进程的第一个窗口。成功后静态字段 appEl/winEl/ffPid
     // 就绪，之后 SetBounds/ApplyClip 都基于它们。
     public static bool Attach(int pid) {
-        if (!FfHostMac.EnsureTrusted(true)) { return false; }
+        if (!FfHostMac.EnsureTrusted(true)) {
+            Console.WriteLine("ffmac: attach 失败（权限）：" + FfHostMac.probeError);
+            return false;
+        }
         FfHostMac.ffPid = pid;
         FfHostMac.appEl = FfHostMac.pCreateApplication(pid);
         if (FfHostMac.appEl == 0) {
             FfHostMac.probeError = "AXUIElementCreateApplication 失败";
+            Console.WriteLine("ffmac: attach 失败：" + FfHostMac.probeError);
             return false;
         }
-        return FfHostMac.AdoptWindow();
+        bool ok = FfHostMac.AdoptWindow();
+        if (ok) {
+            Console.WriteLine("ffmac: attach ok pid=" + pid);
+        } else {
+            Console.WriteLine("ffmac: adopt 窗口失败：" + FfHostMac.probeError);
+        }
+        return ok;
     }
 
     // 从 AXWindows 里取第一个窗口。
@@ -250,6 +263,11 @@ public class FfHostMac {
             FfHostMac.hostW = w;
             // 画布物理像素 → point 的缩放比（Retina 为 2）。
             if (canvasW > 0) { FfHostMac.scale = canvasW / w; }
+            if (!FfHostMac.hostFrameLogged) {
+                FfHostMac.hostFrameLogged = true;
+                Console.WriteLine("ffmac: 宿主 frame (" + x + "," + y
+                    + " w=" + w + " h=" + h + "） scale=" + FfHostMac.scale);
+            }
             found = true;
             break;
         }
@@ -366,8 +384,16 @@ public class FfHostMac {
             if (h > 0) {
                 FfHostMac.screenH = h;
                 FfHostMac.screenHKnown = true;
+                Console.WriteLine("ffmac: screenH=" + h + " point（axY="
+                    + pos[1] + " cgY=" + FfHostMac.hostY + " cgH=" + sz[1]
+                    + "）");
                 return true;
             }
+        }
+        if (!FfHostMac.deriveWarned) {
+            FfHostMac.deriveWarned = true;
+            Console.WriteLine("ffmac: 主屏高推导失败（窗口数 " + n
+                + "，hostW=" + FfHostMac.hostW + "）");
         }
         return false;
     }
@@ -383,6 +409,14 @@ public class FfHostMac {
         }
         double[] r = new double[4];
         FfHostMac.CanvasToScreen(x, y, w, h, r);
+        if (!FfHostMac.placedOnce) {
+            FfHostMac.placedOnce = true;
+            Console.WriteLine("ffmac: 首次摆位 canvas=(" + x + "," + y + " "
+                + w + "x" + h + ") → 屏幕 point=(" + r[0] + "," + r[1] + " "
+                + r[2] + "x" + r[3] + "） scale=" + FfHostMac.scale
+                + " host=(" + FfHostMac.hostX + "," + FfHostMac.hostY
+                + " w=" + FfHostMac.hostW + "）");
+        }
         // AXPosition：CGPoint（bottom-left 原点）。
         nint ptBuf = NativeMemory.Alloc(16);
         new Span<double>(ptBuf, 1)[0] = r[0];
