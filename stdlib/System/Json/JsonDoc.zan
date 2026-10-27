@@ -4,8 +4,12 @@
 using System;
 using System.Collections.Generic;
 using System.Text;
+using System.Threading;
 
 namespace System.Json;
+
+public delegate T JsonDocScopeFunc<T>(JsonDoc doc);
+public delegate void JsonDocScopeAction(JsonDoc doc);
 
 // 一个 JSON 槽位（tape 上的一个节点）。JsonDoc 的 slots 列表就是
 // 解析出的整棵树，深度优先连续排布：标量内联在槽里，孩子紧随
@@ -47,6 +51,85 @@ public class JsonDoc {
         this.src = "";
         this.buf = null;
         this.root = 0;
+    }
+
+    private static ThreadLocal<JsonScratch> scratchPool = new ThreadLocal<JsonScratch>(() => new JsonScratch());
+
+    public static JsonScratch GetScratch() {
+        return JsonDoc.scratchPool.Value;
+    }
+
+    // 零分配瞬时解析：将 JSON 字符串解析进线程局部复用缓冲并执行回调，
+    // 执行期间 0 堆内存分配；回调结束后工作区自动复位，适用于控制器只读提取字段。
+    public static T ParseScoped<T>(string src, JsonDocScopeFunc<T> fn) {
+        if (src == null) { throw new JsonException("JSON source cannot be null"); }
+        if (fn == null) { throw new JsonException("Scoped function cannot be null"); }
+        int len = src.Length;
+        int slotCap = len / 4 + 32;
+        int pairCap = len / 8 + 16;
+        JsonScratch sc = JsonDoc.GetScratch();
+        sc.EnsureCapacity(len, slotCap, pairCap);
+        NativeMemory.PutString(sc.buf, 0, src, len);
+        long ret = JsonDoc.ParsePureFast(sc.buf, len, sc.slots, sc.slots.Length, sc.pairs, sc.pairs.Length, sc.fr, sc.counts);
+        if (ret == 0) {
+            int slotCount = (int)sc.counts[0];
+            int pairCount = (int)sc.counts[1];
+            int endPos = (int)sc.counts[2];
+            endPos = (int)NativeMemory.JsonSkipWhitespace(sc.buf, (long)endPos, (long)len);
+            if (endPos >= len && slotCount > 0) {
+                JsonDoc d = new JsonDoc();
+                d.src = src;
+                d.buf = sc.buf;
+                d.slots = sc.slots;
+                d.slotCount = slotCount;
+                d.pairs = sc.pairs;
+                d.pairCount = pairCount;
+                d.root = 0;
+                T result = fn(d);
+                d.slots = null;
+                d.pairs = null;
+                d.buf = null;
+                return result;
+            }
+        }
+        JsonDoc full = JsonDoc.Parse(src);
+        return fn(full);
+    }
+
+    // 零分配瞬时解析无返回值重载。
+    public static void ParseScoped(string src, JsonDocScopeAction fn) {
+        if (src == null) { throw new JsonException("JSON source cannot be null"); }
+        if (fn == null) { throw new JsonException("Scoped action cannot be null"); }
+        int len = src.Length;
+        int slotCap = len / 4 + 32;
+        int pairCap = len / 8 + 16;
+        JsonScratch sc = JsonDoc.GetScratch();
+        sc.EnsureCapacity(len, slotCap, pairCap);
+        NativeMemory.PutString(sc.buf, 0, src, len);
+        long ret = JsonDoc.ParsePureFast(sc.buf, len, sc.slots, sc.slots.Length, sc.pairs, sc.pairs.Length, sc.fr, sc.counts);
+        if (ret == 0) {
+            int slotCount = (int)sc.counts[0];
+            int pairCount = (int)sc.counts[1];
+            int endPos = (int)sc.counts[2];
+            endPos = (int)NativeMemory.JsonSkipWhitespace(sc.buf, (long)endPos, (long)len);
+            if (endPos >= len && slotCount > 0) {
+                JsonDoc d = new JsonDoc();
+                d.src = src;
+                d.buf = sc.buf;
+                d.slots = sc.slots;
+                d.slotCount = slotCount;
+                d.pairs = sc.pairs;
+                d.pairCount = pairCount;
+                d.root = 0;
+                fn(d);
+                d.slots = null;
+                d.pairs = null;
+                d.buf = null;
+                return;
+            }
+        }
+        JsonDoc full = JsonDoc.Parse(src);
+        fn(full);
     }
 
     public static JsonDoc Parse(string src) {
@@ -1011,6 +1094,41 @@ public class JsonDoc {
         if (k == 1) { return "true"; }
         if (k == 6) { return "false"; }
         return dflt;
+    }
+
+    // 零分配字符串比对：直接将底层缓冲中指定槽位的文本与目标字符串比对，不产生 Substring 堆分配。
+    public bool StrEquals(int at, string expected) {
+        if (at < 0 || at >= this.slotCount || expected == null) { return false; }
+        long a = slots[at].a;
+        int k = (int)(a & 255);
+        if (k != 3) {
+            if (k == 7) {
+                int ns = (int)(a >> 8);
+                int len = (int)slots[at].b;
+                if (len != expected.Length) { return false; }
+                byte[] buf = this.buf;
+                for (int i = 0; i < len; i = i + 1) {
+                    if ((buf[ns + i] & 255) != (expected[i] & 255)) { return false; }
+                }
+                return true;
+            }
+            return false;
+        }
+        int start = (int)(a >> 8);
+        int elen = expected.Length;
+        if (start >= 0) {
+            if ((int)slots[at].b != elen) { return false; }
+            byte[] buf = this.buf;
+            for (int i = 0; i < elen; i = i + 1) {
+                if ((buf[start + i] & 255) != (expected[i] & 255)) { return false; }
+            }
+            return true;
+        }
+        return escPool[(int)slots[at].b] == expected;
+    }
+
+    public bool StrEquals(string expected) {
+        return this.StrEquals(this.root, expected);
     }
 
     public bool BoolAt(int at, bool dflt) {
