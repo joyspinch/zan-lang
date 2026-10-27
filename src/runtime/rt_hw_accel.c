@@ -3855,11 +3855,68 @@ static inline int zan_ctz32_local(uint32_t x) {
 #endif
 }
 
+#if (defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)) && (defined(__GNUC__) || defined(__clang__))
+__attribute__((target("avx2")))
+static int64_t zan_hw_json_skip_whitespace_avx2(const uint8_t *p, int64_t pos, int64_t len) {
+    __m256i m_sp = _mm256_set1_epi8(' ');
+    __m256i m_tb = _mm256_set1_epi8('\t');
+    __m256i m_nl = _mm256_set1_epi8('\n');
+    __m256i m_cr = _mm256_set1_epi8('\r');
+
+    while (pos + 32 <= len) {
+        __m256i v = _mm256_loadu_si256((const __m256i*)(p + pos));
+        __m256i eq_sp = _mm256_cmpeq_epi8(v, m_sp);
+        __m256i eq_tb = _mm256_cmpeq_epi8(v, m_tb);
+        __m256i eq_nl = _mm256_cmpeq_epi8(v, m_nl);
+        __m256i eq_cr = _mm256_cmpeq_epi8(v, m_cr);
+        __m256i is_ws = _mm256_or_si256(_mm256_or_si256(eq_sp, eq_tb), _mm256_or_si256(eq_nl, eq_cr));
+        uint32_t mask = (uint32_t)_mm256_movemask_epi8(is_ws);
+        if (mask != 0xFFFFFFFFu) {
+            int idx = zan_ctz32_local(~mask);
+            return pos + idx;
+        }
+        pos += 32;
+    }
+    return pos;
+}
+
+__attribute__((target("avx2")))
+static int64_t zan_hw_json_scan_string_avx2(const uint8_t *p, int64_t pos, int64_t len) {
+    __m256i q = _mm256_set1_epi8('"');
+    __m256i b = _mm256_set1_epi8('\\');
+
+    while (pos + 32 <= len) {
+        __m256i v = _mm256_loadu_si256((const __m256i*)(p + pos));
+        __m256i hit = _mm256_or_si256(_mm256_cmpeq_epi8(v, q), _mm256_cmpeq_epi8(v, b));
+        uint32_t mask = (uint32_t)_mm256_movemask_epi8(hit);
+        if (mask != 0) {
+            int idx = zan_ctz32_local(mask);
+            int64_t target = pos + idx;
+            if (p[target] == '"') {
+                return target;
+            } else {
+                return -(target + 1);
+            }
+        }
+        pos += 32;
+    }
+    return pos;
+}
+#endif
+
 int64_t zan_hw_json_skip_whitespace(const uint8_t *buf, int64_t pos, int64_t len) {
     if (!buf || pos >= len) return pos;
     const uint8_t *p = buf;
 
 #if (defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)) && (defined(__GNUC__) || defined(__clang__))
+    if (g_has_avx2 && pos + 32 <= len) {
+        int64_t new_pos = zan_hw_json_skip_whitespace_avx2(p, pos, len);
+        if (new_pos + 32 <= len || (new_pos < len && p[new_pos] != ' ' && p[new_pos] != '\t' && p[new_pos] != '\n' && p[new_pos] != '\r')) {
+            return new_pos;
+        }
+        pos = new_pos;
+    }
+
     __m128i m_sp = _mm_set1_epi8(' ');
     __m128i m_tb = _mm_set1_epi8('\t');
     __m128i m_nl = _mm_set1_epi8('\n');
@@ -3895,6 +3952,14 @@ int64_t zan_hw_json_scan_string(const uint8_t *buf, int64_t pos, int64_t len) {
     const uint8_t *p = buf;
 
 #if (defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)) && (defined(__GNUC__) || defined(__clang__))
+    if (g_has_avx2 && pos + 32 <= len) {
+        int64_t res = zan_hw_json_scan_string_avx2(p, pos, len);
+        if (res < 0 || (res < len && (p[res] == '"' || p[res] == '\\'))) {
+            return res;
+        }
+        pos = res;
+    }
+
     __m128i q = _mm_set1_epi8('"');
     __m128i b = _mm_set1_epi8('\\');
 
@@ -4163,8 +4228,8 @@ int64_t zan_hw_json_parse_fast(const uint8_t *buf, int64_t len,
                 sl[vslot].a = 2;
                 sl[vslot].b = nacc;
             } else {
-                sl[vslot].a = 7;
-                sl[vslot].b = zan_dbl_to_i64(zan_parse_double_fast(buf, ns, ni));
+                sl[vslot].a = (int64_t)7 | ((int64_t)ns << 8);
+                sl[vslot].b = (int64_t)(ni - ns);
             }
             pos = ni;
         }
