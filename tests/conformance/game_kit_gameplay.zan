@@ -1,0 +1,149 @@
+using System;
+using Game.Kit;
+
+// 游戏开发套件机制单元测试：
+//   - GameFeel.ScreenShake：创伤衰减、非线性能量振幅、相机偏移；
+//   - GameFeel.HitStop：打击顿帧与时钟阻尼；
+//   - DebugDraw：开关控制与安全调用；
+//   - FloatingTextPool：伤害跳字/治疗飘字对象池复用与动力学更新；
+//   - GridSlotGroup：背包/技能网格几何换算、间隙排除与鼠标命中测试。
+public class GameKitGameplayTests {
+    private static int failures = 0;
+
+    private static void Check(string name, bool ok) {
+        if (!ok) {
+            failures = failures + 1;
+            Console.WriteLine("FAIL: " + name);
+        }
+    }
+
+    public static void Main(string[] args) {
+        TestScreenShake();
+        TestHitStop();
+        TestDebugDraw();
+        TestFloatingTextPool();
+        TestGridSlotGroup();
+
+        if (failures == 0) {
+            Console.WriteLine("PASS");
+        } else {
+            Console.WriteLine("FAILURES: " + failures);
+            Environment.Exit(1);
+        }
+    }
+
+    private static void TestScreenShake() {
+        GameFeel.ScreenShake shake = new GameFeel.ScreenShake();
+        Check("Shake_Init", shake.Trauma == 0.0 && shake.OffsetX == 0.0);
+
+        // 注入创伤
+        shake.AddTrauma(0.5);
+        Check("Shake_TraumaAdd", shake.Trauma == 0.5);
+
+        // 累加超出 1.0 应截断
+        shake.AddTrauma(0.8);
+        Check("Shake_TraumaClamp", shake.Trauma == 1.0);
+
+        // 步进更新
+        shake.Update(0.1);
+        Check("Shake_TraumaDecay", shake.Trauma < 1.0 && shake.Trauma > 0.0);
+        Check("Shake_ActiveOffset", shake.OffsetX != 0.0 || shake.OffsetY != 0.0);
+
+        // 自然衰减至 0
+        shake.Update(2.0);
+        Check("Shake_FullDecay", shake.Trauma == 0.0 && shake.OffsetX == 0.0 && shake.OffsetY == 0.0);
+    }
+
+    private static void TestHitStop() {
+        GameFeel.HitStop hitStop = new GameFeel.HitStop();
+        Check("HitStop_Init", !hitStop.IsFrozen);
+
+        hitStop.Freeze(0.1);
+        Check("HitStop_Frozen", hitStop.IsFrozen);
+
+        // 更新 0.05 秒，仍应冻结
+        bool frozen1 = hitStop.Update(0.05);
+        Check("HitStop_Mid", frozen1 && hitStop.IsFrozen);
+
+        // 再更新 0.06 秒，剩余冻结时间被消耗完毕
+        bool frozen2 = hitStop.Update(0.06);
+        Check("HitStop_Done", frozen2 && !hitStop.IsFrozen);
+
+        // 下一次时钟推进不再处于冻结态
+        bool frozen3 = hitStop.Update(0.01);
+        Check("HitStop_NextClear", !frozen3 && !hitStop.IsFrozen);
+    }
+
+    private static void TestDebugDraw() {
+        // 关闭时安全无异常
+        DebugDraw.Enabled = false;
+        DebugDraw.Rect(null, 0, 0, 10, 10, -1);
+        DebugDraw.Line(null, 0, 0, 10, 10, -1);
+        DebugDraw.Circle(null, 0, 0, 5, -1);
+        DebugDraw.Ray(null, 0, 0, 1.0, 0.0, 50.0, -1);
+        DebugDraw.Cross(null, 0, 0, 4, -1);
+
+        DebugDraw.Enabled = true;
+        // 传入 null canvas 应安全短路
+        DebugDraw.Rect(null, 10, 10, 20, 20, -1);
+        Check("DebugDraw_NullSafe", true);
+    }
+
+    private static void TestFloatingTextPool() {
+        FloatingTextPool pool = new FloatingTextPool(16);
+        Check("Pool_Init", pool.ActiveCount == 0);
+
+        // 生成普通伤害与暴击伤害
+        pool.SpawnDamage(100.0, 200.0, 50, false);
+        pool.SpawnDamage(120.0, 200.0, 200, true);
+        pool.SpawnHeal(80.0, 190.0, 30);
+
+        Check("Pool_SpawnCount", pool.ActiveCount == 3);
+
+        // 步进动力学更新
+        pool.Update(0.1);
+        Check("Pool_Updating", pool.ActiveCount == 3);
+
+        // 推进到超出寿命，应自动全部回收
+        pool.Update(1.5);
+        Check("Pool_Recycled", pool.ActiveCount == 0);
+    }
+
+    private static void TestGridSlotGroup() {
+        // 创建 4 列 x 3 行的网格，单格 40x40，间隙 5px，位于 (100, 200)
+        GridSlotGroup grid = new GridSlotGroup(100, 200, 4, 3, 40, 40, 5, 5);
+
+        Check("Grid_TotalSlots", grid.TotalSlots == 12);
+        // 总宽度: 4*40 + 3*5 = 175
+        Check("Grid_TotalWidth", grid.TotalWidth == 175);
+        // 总高度: 3*40 + 2*5 = 130
+        Check("Grid_TotalHeight", grid.TotalHeight == 130);
+
+        int gx, gy, gw, gh;
+        // 格子 (0, 0)
+        grid.GetSlotRect(0, 0, out gx, out gy, out gw, out gh);
+        Check("Grid_Slot00", gx == 100 && gy == 200 && gw == 40 && gh == 40);
+
+        // 格子 (1, 0) -> x = 100 + 40 + 5 = 145
+        grid.GetSlotRect(1, 0, out gx, out gy, out gw, out gh);
+        Check("Grid_Slot10", gx == 145 && gy == 200);
+
+        // 一维索引索引 5 (第 1 行第 1 列: r=1, c=1) -> x=145, y=200+45=245
+        grid.GetSlotRectByIndex(5, out gx, out gy, out gw, out gh);
+        Check("Grid_Index5", gx == 145 && gy == 245);
+
+        // 鼠标命中测试
+        int mc, mr, mi;
+        // 点击在 (105, 205)，应命中 (0, 0, 0)
+        bool hit1 = grid.HitTest(105, 205, out mc, out mr, out mi);
+        Check("Grid_Hit00", hit1 && mc == 0 && mr == 0 && mi == 0);
+
+        // 点击在两格之间的 gap 间隙空隙 (142, 205) [100+40=140 到 145 之间]
+        bool hitGap = grid.HitTest(142, 205, out mc, out mr, out mi);
+        Check("Grid_HitGap_Miss", !hitGap);
+
+        // 点击在外部负坐标
+        bool hitOut = grid.HitTest(50, 50, out mc, out mr, out mi);
+        Check("Grid_HitOut_Miss", !hitOut);
+    }
+}

@@ -1,0 +1,125 @@
+using System;
+using Gui;
+
+namespace Game.Kit;
+
+// 游戏手感与打击感核心反馈中枢（GameFeel）。
+// 包含创伤衰减震屏模型（ScreenShake）与打击停顿（HitStop）。
+public class GameFeel {
+
+    // 创伤衰减屏幕震荡器（基于行业标准 Trauma Model）。
+    // 震动能量 = Trauma^2，使大爆炸剧烈震动、小受击轻微颤抖，
+    // 多次连续受击平滑叠加且永不溢出边界。
+    public class ScreenShake {
+        public double trauma;          // 当前创伤值 [0.0, 1.0]
+        public double traumaDecay;     // 创伤值每秒自然衰减速率 (默认 1.5)
+        public double maxOffsetX;      // 最大水平像素抖动幅度 (默认 24.0)
+        public double maxOffsetY;      // 最大垂直像素抖动幅度 (默认 24.0)
+        public double maxAngleDeg;     // 最大角度晃动幅度 (默认 3.0度)
+        public double timeAccum;
+
+        public double currentOffsetX;  // 当前帧计算出的相机 X 偏移
+        public double currentOffsetY;  // 当前帧计算出的相机 Y 偏移
+        public double currentAngleDeg; // 当前帧计算出的相机旋转偏移
+
+        public ScreenShake() {
+            this.trauma = 0.0;
+            this.traumaDecay = 1.5;
+            this.maxOffsetX = 24.0;
+            this.maxOffsetY = 24.0;
+            this.maxAngleDeg = 3.0;
+            this.timeAccum = 0.0;
+            this.currentOffsetX = 0.0;
+            this.currentOffsetY = 0.0;
+            this.currentAngleDeg = 0.0;
+        }
+
+        public static ScreenShake Create() {
+            return new ScreenShake();
+        }
+
+        public double Trauma { get { return trauma; } }
+        public double OffsetX { get { return currentOffsetX; } }
+        public double OffsetY { get { return currentOffsetY; } }
+        public double AngleDeg { get { return currentAngleDeg; } }
+
+        // 注入创伤值（例如小枪命中 +0.1，手雷爆炸 +0.6，核弹 +1.0）。
+        // 自动钳位至 1.0 上限。
+        public void AddTrauma(double amount) {
+            if (amount <= 0.0) { return; }
+            trauma = trauma + amount;
+            if (trauma > 1.0) { trauma = 1.0; }
+        }
+
+        // 时钟步进：衰减创伤值并实时解算当前帧的相机微位移。
+        public void Update(double dt) {
+            if (trauma <= 0.0) {
+                currentOffsetX = 0.0;
+                currentOffsetY = 0.0;
+                currentAngleDeg = 0.0;
+                return;
+            }
+
+            timeAccum = timeAccum + dt * 25.0; // 高频振荡速度
+            double shakePower = trauma * trauma; // 非线性能量曲线
+
+            // 伪噪声谐波拟合（避免引入沉重第三方噪声库）
+            double nX = Math.Sin(timeAccum * 1.1) + Math.Sin(timeAccum * 2.3) * 0.5;
+            double nY = Math.Cos(timeAccum * 1.3) + Math.Cos(timeAccum * 2.7) * 0.5;
+            double nA = Math.Sin(timeAccum * 0.9) * 0.8;
+
+            currentOffsetX = maxOffsetX * shakePower * (nX * 0.66);
+            currentOffsetY = maxOffsetY * shakePower * (nY * 0.66);
+            currentAngleDeg = maxAngleDeg * shakePower * nA;
+
+            trauma = trauma - traumaDecay * dt;
+            if (trauma < 0.0) {
+                trauma = 0.0;
+                currentOffsetX = 0.0;
+                currentOffsetY = 0.0;
+                currentAngleDeg = 0.0;
+            }
+        }
+
+        // 施加到相机坐标。
+        public void ApplyToCamera(ref int camX, ref int camY) {
+            camX = camX + (int)currentOffsetX;
+            camY = camY + (int)currentOffsetY;
+        }
+    }
+
+    // 打击顿帧 / 冻结帧控制器（HitStop）。
+    // 在近战挥刀入肉或子弹爆头瞬间冻结画面若干毫秒，赋予硬核打击阻尼感。
+    public class HitStop {
+        public double freezeTimer;
+        public double timeScale;
+
+        public HitStop() {
+            this.freezeTimer = 0.0;
+            this.timeScale = 1.0;
+        }
+
+        public static HitStop Create() {
+            return new HitStop();
+        }
+
+        public bool IsFrozen { get { return freezeTimer > 0.0; } }
+
+        // 触发顿帧（单位：秒。轻击一般 0.04~0.06s，重击大招一般 0.1~0.15s）。
+        public void Freeze(double durationSec) {
+            if (durationSec > freezeTimer) {
+                freezeTimer = durationSec;
+            }
+        }
+
+        // 步进更新。返回 true 表示当前帧处于停顿冻结状态（调用方应跳过实体移动与物理结算）。
+        public bool Update(double dt) {
+            if (freezeTimer > 0.0) {
+                freezeTimer = freezeTimer - dt;
+                if (freezeTimer < 0.0) { freezeTimer = 0.0; }
+                return true;
+            }
+            return false;
+        }
+    }
+}

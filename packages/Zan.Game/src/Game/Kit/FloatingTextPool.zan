@@ -1,0 +1,165 @@
+using System;
+using Gui;
+
+namespace Game.Kit;
+
+// 游戏战斗飘字/跳字对象池（FloatingTextPool）。
+// 面向 ARPG、搜打撤、射击与卡牌对战中密集的伤害数字、暴击弹出与治疗飘字。
+// 零 GC 预分配架构，支持重力弹跳、弹性缩放（Punch Scale）与平滑淡出。
+public class FloatingTextPool {
+    public class FloatingItem {
+        public bool active;
+        public double x;
+        public double y;
+        public double vx;
+        public double vy;
+        public string text;
+        public int baseColor;
+        public double timer;
+        public double lifetime;
+        public bool isCrit;
+        public double scale;
+
+        public FloatingItem() {
+            this.active = false;
+            this.x = 0.0;
+            this.y = 0.0;
+            this.vx = 0.0;
+            this.vy = 0.0;
+            this.text = "";
+            this.baseColor = -1;
+            this.timer = 0.0;
+            this.lifetime = 0.8;
+            this.isCrit = false;
+            this.scale = 1.0;
+        }
+    }
+
+    public FloatingItem[] items;
+    public int capacity;
+    public int activeCount;
+
+    public FloatingTextPool(int capacity) {
+        int cap = capacity > 0 ? capacity : 64;
+        this.capacity = cap;
+        this.activeCount = 0;
+        this.items = new FloatingItem[cap];
+        for (int i = 0; i < cap; i = i + 1) {
+            this.items[i] = new FloatingItem();
+        }
+    }
+
+    public static FloatingTextPool Create(int capacity) {
+        return new FloatingTextPool(capacity);
+    }
+
+    public int ActiveCount { get { return activeCount; } }
+
+    // 产生一个跳字。
+    // isCrit: 是否为暴击（暴击带初始弹跳与更大初速度）
+    public void Spawn(double x, double y, string text, int color, bool isCrit) {
+        if (text == null || text.Length == 0) { return; }
+
+        // 寻找空闲插槽或覆盖最旧项
+        int targetIdx = -1;
+        double maxProgress = -1.0;
+        for (int i = 0; i < capacity; i = i + 1) {
+            if (!items[i].active) {
+                targetIdx = i;
+                break;
+            }
+            if (items[i].timer > maxProgress) {
+                maxProgress = items[i].timer;
+                targetIdx = i;
+            }
+        }
+
+        if (targetIdx < 0) { return; }
+
+        bool wasActive = items[targetIdx].active;
+        FloatingItem item = items[targetIdx];
+        item.active = true;
+        if (!wasActive) {
+            activeCount = activeCount + 1;
+        }
+        item.x = x;
+        item.y = y;
+        item.text = text;
+        item.baseColor = color;
+        item.timer = 0.0;
+        item.lifetime = isCrit ? 1.0 : 0.75;
+        item.isCrit = isCrit;
+        item.scale = isCrit ? 1.6 : 1.0;
+
+        // 随机横向微散开，竖直向上弹起
+        double randAngle = ((double)(targetIdx * 37 % 100) / 100.0 - 0.5) * 40.0;
+        item.vx = randAngle;
+        item.vy = isCrit ? -140.0 : -90.0;
+    }
+
+    public void SpawnDamage(double x, double y, int damage, bool isCrit) {
+        int col = isCrit ? unchecked((int)0xFFFFD700) : unchecked((int)0xFFFFFFFF); // 金色暴击 / 白色普通
+        string txt = isCrit ? "!" + Convert.ToString(damage) : Convert.ToString(damage);
+        Spawn(x, y, txt, col, isCrit);
+    }
+
+    public void SpawnHeal(double x, double y, int healAmount) {
+        int col = unchecked((int)0xFF00FF7F); // 春绿色
+        Spawn(x, y, "+" + Convert.ToString(healAmount), col, false);
+    }
+
+    // 逐帧动力学推进与淡出计算。
+    public void Update(double dt) {
+        if (dt <= 0.0) { return; }
+        int curActive = 0;
+
+        for (int i = 0; i < capacity; i = i + 1) {
+            FloatingItem it = items[i];
+            if (!it.active) { continue; }
+
+            it.timer = it.timer + dt;
+            if (it.timer >= it.lifetime) {
+                it.active = false;
+                continue;
+            }
+
+            // 抛物线阻尼上升
+            it.x = it.x + it.vx * dt;
+            it.y = it.y + it.vy * dt;
+            it.vy = it.vy + 120.0 * dt; // 重力微阻尼
+
+            // 暴击弹性缩放回弹
+            if (it.isCrit && it.scale > 1.0) {
+                it.scale = it.scale - dt * 2.0;
+                if (it.scale < 1.0) { it.scale = 1.0; }
+            }
+
+            curActive = curActive + 1;
+        }
+
+        activeCount = curActive;
+    }
+
+    // 绘制所有活跃飘字。
+    public void Draw(Canvas c) {
+        if (c == null || activeCount == 0) { return; }
+
+        for (int i = 0; i < capacity; i = i + 1) {
+            FloatingItem it = items[i];
+            if (!it.active) { continue; }
+
+            // 计算平滑淡出 Alpha
+            double progress = it.timer / it.lifetime;
+            int alpha = 255;
+            if (progress > 0.6) {
+                alpha = (int)(255.0 * (1.0 - (progress - 0.6) / 0.4));
+                if (alpha < 0) { alpha = 0; }
+            }
+
+            int finalColor = (it.baseColor & 0x00FFFFFF) | (alpha << 24);
+            int fs = (int)(16.0 * it.scale);
+            if (fs < 10) { fs = 10; }
+            c.DrawText((int)it.x, (int)it.y, it.text, finalColor, fs);
+        }
+    }
+}
