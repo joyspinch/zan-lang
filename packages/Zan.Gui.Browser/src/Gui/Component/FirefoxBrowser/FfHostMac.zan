@@ -31,7 +31,7 @@ public class FfHostMac {
     public static FfCFReleaseFn pCFRelease;
     public static FfMsgSendFn pMsgSendLong;
     public static FfCGListCopyFn pCGListCopy;
-    public static FfPixHighFn pPixHigh;
+    public static FfValueGetFn pValueGetValue;
 
     public delegate nint FfCopyValueFn(nint el, nint attr, nint result);
     public delegate int FfSetValueFn(nint el, nint attr, nint value);
@@ -47,7 +47,7 @@ public class FfHostMac {
     public delegate void FfCFReleaseFn(nint cf);
     public delegate long FfMsgSendFn(nint receiver, nint sel);
     public delegate nint FfCGListCopyFn(int option, nint windowId);
-    public delegate int FfPixHighFn(nint display);
+    public delegate int FfValueGetFn(nint value, int type, nint bufPtr);
 
     // AXValue 类型：CGPoint=1，CGSize=2。
     public const int AXPoint = 1;
@@ -64,6 +64,12 @@ public class FfHostMac {
     public static double hostY;
     public static double hostW;
     public static double scale = 1.0;
+    // 主屏高（point，主屏左下原点坐标系的总高）。AX 坐标翻转 Y 必须用它，
+    // 不能用 CGDisplayPixelsHigh（那是像素，HiDPI 下差一个缩放比，
+    // 浮窗会被摆到屏幕外）。由宿主自己窗口双重坐标推导，见
+    // DeriveScreenHeight。
+    public static double screenH;
+    public static bool screenHKnown;
 
     // 懒解析框架符号；失败时 probeError 说明原因。
     public static bool Ensure() {
@@ -92,7 +98,7 @@ public class FfHostMac {
         FfHostMac.pPerformAction = (FfPerformActionFn)Interop.Symbol(his, "AXUIElementPerformAction");
         FfHostMac.pMsgSendLong = (FfMsgSendFn)Interop.Symbol(objc, "objc_msgSend");
         FfHostMac.pCGListCopy = (FfCGListCopyFn)Interop.Symbol(cg, "CGWindowListCopyWindowInfo");
-        FfHostMac.pPixHigh = (FfPixHighFn)Interop.Symbol(cg, "CGDisplayPixelsHigh");
+        FfHostMac.pValueGetValue = (FfValueGetFn)Interop.Symbol(his, "AXValueGetValue");
         if (FfHostMac.pCopyAttr == null || FfHostMac.pSetAttr == null
                 || FfHostMac.pCreateApplication == null
                 || FfHostMac.pValueCreate == null || FfHostMac.pCFStringCreate == null
@@ -300,26 +306,87 @@ public class FfHostMac {
         outp[3] = h / s;
     }
 
-    // 把 Firefox 窗口摆到 canvas 矩形对应的屏幕位置（AX 用 bottom-left
-    // 原点，要翻一次 Y 轴；屏幕高用主显示器——多屏下浮窗跨屏会偏，
-    // v1 接受）。
-    public static void SetBounds(int x, int y, int w, int h) {
-        if (!FfHostMac.ok || FfHostMac.winEl == 0) { return; }
-        double[] r = new double[4];
-        FfHostMac.CanvasToScreen(x, y, w, h, r);
-        nint cg = Interop.Load("/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics");
-        int screenH = 0;
-        if (FfHostMac.pPixHigh != null && cg != 0) {
-            nint mainAddr = Interop.Symbol(cg, "CGMainDisplayID");
-            if (mainAddr != 0) {
-                FfMainDisplayFn main = (FfMainDisplayFn)mainAddr;
-                screenH = FfHostMac.pPixHigh(main());
+    [DllImport("crt", EntryPoint = "getpid")]
+    static extern int GetPid();
+
+    // 读一个 AXValue（CGPoint/CGSize）里的两个 double。失败返回 null。
+    static double[] AxPoint(nint el, string attr, int type) {
+        nint key = FfHostMac.CFStr(attr);
+        nint outPtr = NativeMemory.Alloc(8);
+        nint val = 0;
+        if ((int)FfHostMac.pCopyAttr(el, key, outPtr) == 0) {
+            val = (nint)new Span<long>(outPtr, 1)[0];
+        }
+        NativeMemory.Free(outPtr);
+        if (val == 0 || FfHostMac.pValueGetValue == null) { return null; }
+        nint buf = NativeMemory.Alloc(16);
+        double[] r = null;
+        if ((int)FfHostMac.pValueGetValue(val, type, buf) != 0) {
+            r = new double[2];
+            r[0] = new Span<double>(buf, 1)[0];
+            r[1] = new Span<double>(buf + 8, 1)[0];
+        }
+        NativeMemory.Free(buf);
+        return r;
+    }
+
+    // 推导主屏高（point）：AXPosition 用主屏左下原点，kCGWindowBounds
+    // 用主屏左上原点，同一窗口同一时刻满足
+    //     axY = screenH - cgY - cgH   =>   screenH = axY + cgY + cgH
+    // 取宿主自己窗口推导——两种坐标单位天然一致（都是 point），且读自家
+    // 进程的 AX 不需要辅助功能授权。多窗口时按宽度匹配宿主窗口。
+    public static bool DeriveScreenHeight() {
+        if (FfHostMac.pCreateApplication == null
+                || FfHostMac.pValueGetValue == null) { return false; }
+        if (FfHostMac.hostW <= 0) { return false; }
+        int self = FfHostMac.GetPid();
+        if (self <= 0) { return false; }
+        nint el = FfHostMac.pCreateApplication(self);
+        if (el == 0) { return false; }
+        nint winKey = FfHostMac.CFStr("AXWindows");
+        nint outPtr = NativeMemory.Alloc(8);
+        nint arr = 0;
+        if ((int)FfHostMac.pCopyAttr(el, winKey, outPtr) == 0) {
+            arr = (nint)new Span<long>(outPtr, 1)[0];
+        }
+        NativeMemory.Free(outPtr);
+        if (arr == 0) { return false; }
+        long n = FfHostMac.pCFArrayCount(arr);
+        for (long i = 0; i < n; i = i + 1) {
+            nint w = FfHostMac.pCFArrayGet(arr, i);
+            if (w == 0) { continue; }
+            double[] sz = FfHostMac.AxPoint(w, "AXSize", FfHostMac.AXSize);
+            if (sz == null) { continue; }
+            double dw = sz[0] - FfHostMac.hostW;
+            if (dw < 0) { dw = 0 - dw; }
+            if (dw > 0.5) { continue; }
+            double[] pos = FfHostMac.AxPoint(w, "AXPosition", FfHostMac.AXPoint);
+            if (pos == null) { continue; }
+            double h = pos[1] + FfHostMac.hostY + sz[1];
+            if (h > 0) {
+                FfHostMac.screenH = h;
+                FfHostMac.screenHKnown = true;
+                return true;
             }
         }
+        return false;
+    }
+
+    // 把 Firefox 窗口摆到 canvas 矩形对应的屏幕位置（AX 用 bottom-left
+    // 原点，要翻一次 Y 轴；屏幕点高由 DeriveScreenHeight 推导——多屏下
+    // 浮窗跨屏会偏，v1 接受）。
+    public static void SetBounds(int x, int y, int w, int h) {
+        if (!FfHostMac.ok || FfHostMac.winEl == 0) { return; }
+        if (!FfHostMac.screenHKnown && !FfHostMac.DeriveScreenHeight()) {
+            // 推导不出屏幕点高就不动浮窗——宁可原地，不可摆出屏幕外。
+            return;
+        }
+        double[] r = new double[4];
+        FfHostMac.CanvasToScreen(x, y, w, h, r);
         // AXPosition：CGPoint（bottom-left 原点）。
         nint ptBuf = NativeMemory.Alloc(16);
         new Span<double>(ptBuf, 1)[0] = r[0];
-        new Span<double>(ptBuf + 8, 1)[0] = screenH - r[1] - r[3];
+        new Span<double>(ptBuf + 8, 1)[0] = FfHostMac.screenH - r[1] - r[3];
         nint pt = FfHostMac.pValueCreate(FfHostMac.AXPoint, ptBuf);
         nint posKey = FfHostMac.CFStr("AXPosition");
         FfHostMac.pSetAttr(FfHostMac.winEl, posKey, pt);
@@ -331,8 +398,6 @@ public class FfHostMac {
         nint sizeKey = FfHostMac.CFStr("AXSize");
         FfHostMac.pSetAttr(FfHostMac.winEl, sizeKey, sz);
     }
-
-    public delegate nint FfMainDisplayFn();
 
     // 本帧未遮挡区域（Gui.NativeClipFn 签名）："" = 被完全盖住 → 把
     // Firefox 移出屏幕藏起来；否则按第一个（最大的）可见矩形摆位。
