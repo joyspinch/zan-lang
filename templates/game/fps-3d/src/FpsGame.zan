@@ -1,0 +1,197 @@
+using System;
+using System.Collections.Generic;
+using System.Numerics;
+using Gui;
+using Game.Animation;
+using Game.Render3D;
+
+namespace Fps3D;
+
+public class FpsGame {
+    public Camera3D camera;
+    public FpsController3D controller;
+    public RenderPlan plan;
+    public Renderer3D renderer;
+    public SceneNode rootNode;
+
+    // 交互拾取状态
+    public bool targetHit;
+    public float hitDistance;
+
+    // 键盘移动状态
+    public bool keyFwd;
+    public bool keyBwd;
+    public bool keyLeft;
+    public bool keyRight;
+    public bool keyUp;
+    public bool keyDown;
+
+    // 场景中建筑的 AABB 包围盒（用于射线检测）
+    public Vector3[] targetMins;
+    public Vector3[] targetMaxs;
+    public int targetCount;
+
+    public FpsGame() {
+        this.camera = new Camera3D();
+        this.camera.SetViewport(1280, 720);
+        this.controller = new FpsController3D();
+        this.controller.Position = new Vector3(0.0f, 1.8f, 12.0f); // 初始站在场景前方
+
+        this.plan = new RenderPlan(this.camera);
+        this.plan.AmbientRed = 0.2f;
+        this.plan.AmbientGreen = 0.22f;
+        this.plan.AmbientBlue = 0.28f;
+
+        // 添加一束斜向阳光
+        Light sun = new Light();
+        sun.Kind = LightKind.Directional;
+        sun.Direction = new Vector3(-0.5f, -1.0f, -0.6f);
+        sun.Red = 1.0f;
+        sun.Green = 0.95f;
+        sun.Blue = 0.85f;
+        sun.Intensity = 1.2f;
+        this.plan.Lights.Add(sun);
+
+        this.renderer = new Renderer3D(256);
+        this.rootNode = new SceneNode("WorldRoot");
+
+        this.targetHit = false;
+        this.hitDistance = 0.0f;
+
+        this.keyFwd = false;
+        this.keyBwd = false;
+        this.keyLeft = false;
+        this.keyRight = false;
+        this.keyUp = false;
+        this.keyDown = false;
+
+        this.targetCount = 3;
+        this.targetMins = new Vector3[3];
+        this.targetMaxs = new Vector3[3];
+    }
+
+    public static FpsGame Create() {
+        return new FpsGame();
+    }
+
+    // 初始化场景几何体并上传到 GPU
+    public void InitScene(Canvas canvas) {
+        if (canvas == null) { return; }
+
+        // 1. 生成并上传地面平面 (40m x 40m)
+        Mesh3D groundMesh = Primitives3D.CreatePlane(40.0f, 40.0f, 4, 4);
+        int groundKey = canvas.MeshUpload(groundMesh);
+
+        SceneNode groundNode = new SceneNode("Ground");
+        groundNode.MeshKey = groundKey;
+        groundNode.BoundsRadius = 30.0f;
+        groundNode.Material = new Material();
+        groundNode.Material.Red = 0.2f;
+        groundNode.Material.Green = 0.2f;
+        groundNode.Material.Blue = 0.28f;
+        rootNode.Children.Add(groundNode);
+
+        // 2. 生成立方体网格 (2m x 2m x 2m)
+        Mesh3D cubeMesh = Primitives3D.CreateCube(2.0f, 2.0f, 2.0f);
+        int cubeKey = canvas.MeshUpload(cubeMesh);
+
+        // 摆放 3 栋不同颜色的立方体目标
+        float[] posX = new float[3] { -4.0f, 0.0f, 4.0f };
+        float[] colR = new float[3] { 1.0f, 0.2f, 0.2f };
+        float[] colG = new float[3] { 0.2f, 0.6f, 0.8f };
+        float[] colB = new float[3] { 0.2f, 0.9f, 0.2f };
+
+        for (int i = 0; i < 3; i = i + 1) {
+            SceneNode b = new SceneNode("Building_" + Convert.ToString(i));
+            b.MeshKey = cubeKey;
+            b.BoundsRadius = 2.0f;
+            b.Local = new Transform3D(new Vector3(posX[i], 1.0f, 0.0f), Quaternion.Identity, Vector3.One);
+            b.Material = new Material();
+            b.Material.Red = colR[i];
+            b.Material.Green = colG[i];
+            b.Material.Blue = colB[i];
+            rootNode.Children.Add(b);
+
+            // 记录对应 AABB 包围盒便于射线拾取
+            targetMins[i] = new Vector3(posX[i] - 1.0f, 0.0f, -1.0f);
+            targetMaxs[i] = new Vector3(posX[i] + 1.0f, 2.0f, 1.0f);
+        }
+    }
+
+    public void OnKeyDown(int code) {
+        if (code == 87 || code == 38) { keyFwd = true; } // W
+        if (code == 83 || code == 40) { keyBwd = true; } // S
+        if (code == 65 || code == 37) { keyLeft = true; } // A
+        if (code == 68 || code == 39) { keyRight = true; } // D
+        if (code == 32) { keyUp = true; } // Space 向上升
+        if (code == 16) { keyDown = true; } // Shift 向下沉
+    }
+
+    public void OnKeyUp(int code) {
+        if (code == 87 || code == 38) { keyFwd = false; }
+        if (code == 83 || code == 40) { keyBwd = false; }
+        if (code == 65 || code == 37) { keyLeft = false; }
+        if (code == 68 || code == 39) { keyRight = false; }
+        if (code == 32) { keyUp = false; }
+        if (code == 16) { keyDown = false; }
+    }
+
+    public void OnMouseMove(float deltaX, float deltaY) {
+        controller.OnMouseMove(deltaX, deltaY);
+    }
+
+    public void Tick(double dt) {
+        float fdt = (float)dt;
+        // 键盘移动步进
+        controller.UpdateInput(keyFwd, keyBwd, keyLeft, keyRight, keyUp, keyDown, fdt);
+        // 同步位置到 Camera3D
+        controller.SyncToCamera(camera);
+
+        // 从屏幕中心点 (640, 360) 发射视线射线检测准星目标
+        Ray3D centerRay = Raycast3D.ScreenPointToRay(640, 360, 1280, 720, camera);
+
+        targetHit = false;
+        hitDistance = 999999.0f;
+
+        for (int i = 0; i < targetCount; i = i + 1) {
+            float dist = 0.0f;
+            if (Raycast3D.IntersectAabb(centerRay, targetMins[i], targetMaxs[i], out dist)) {
+                if (dist < hitDistance) {
+                    hitDistance = dist;
+                    targetHit = true;
+                }
+            }
+        }
+    }
+
+    public void Render(Canvas c) {
+        if (c == null) { return; }
+
+        // 1. 提交 3D 场景渲染计划
+        plan.Build(rootNode);
+        renderer.Draw(c, plan);
+
+        // 2. 绘制 2D HUD 界面与准星
+        int cx = 640;
+        int cy = 360;
+        int crosshairColor = targetHit ? unchecked((int)0xFF00FF00) : unchecked((int)0xFFFFFFFF);
+
+        // 绘制屏幕准星 (+)
+        c.DrawLine(cx - 8, cy, cx + 8, cy, crosshairColor, 2);
+        c.DrawLine(cx, cy - 8, cx, cy + 8, crosshairColor, 2);
+
+        // 顶部 HUD 信息
+        c.DrawRect(10, 10, 360, 80, unchecked((int)0xCC000000), 1);
+        c.DrawText(20, 20, "3D FIRST-PERSON EXPLORER", unchecked((int)0xFF00E5FF), 16);
+        string posStr = "POS: (" + Convert.ToString((int)controller.Position.X) + ", "
+                                 + Convert.ToString((int)controller.Position.Y) + ", "
+                                 + Convert.ToString((int)controller.Position.Z) + ")";
+        c.DrawText(20, 42, posStr, unchecked((int)0xFFFFFFFF), 14);
+
+        if (targetHit) {
+            c.DrawText(20, 64, "LOCKED ON CUBE (DIST: " + Convert.ToString((int)hitDistance) + "m)", unchecked((int)0xFF00FF00), 14);
+        } else {
+            c.DrawText(20, 64, "AIM: NO TARGET [WASD TO MOVE]", unchecked((int)0xFFAAAAAA), 14);
+        }
+    }
+}

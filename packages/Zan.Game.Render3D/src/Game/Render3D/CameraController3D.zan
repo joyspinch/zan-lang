@@ -1,0 +1,133 @@
+using System;
+using System.Numerics;
+
+namespace Game.Render3D;
+
+// 第一人称 FPS 漫游控制器（FpsController3D）。
+// 管理角色眼球世界位置与俯仰偏航视角，提供平滑键盘移动与鼠标视线旋转，
+// 严格将俯仰角约束在 ±89°（±1.553 弧度）内杜绝万向节翻滚锁死。
+public class FpsController3D {
+    public Vector3 Position;
+    public float Pitch; // 俯仰角 (弧度，上下看)
+    public float Yaw;   // 偏航角 (弧度，左右看)
+    public float MoveSpeed;
+    public float MouseSensitivity;
+
+    public FpsController3D() {
+        this.Position = new Vector3(0.0f, 1.8f, 5.0f); // 默认眼球高度 1.8m
+        this.Pitch = 0.0f;
+        this.Yaw = 0.0f;
+        this.MoveSpeed = 8.0f;
+        this.MouseSensitivity = 0.003f;
+    }
+
+    public static FpsController3D Create() {
+        return new FpsController3D();
+    }
+
+    // 接收鼠标相对位移，更新视角朝向
+    public void OnMouseMove(float deltaX, float deltaY) {
+        Yaw = Yaw - deltaX * MouseSensitivity;
+        Pitch = Pitch - deltaY * MouseSensitivity;
+
+        // 约束俯仰角在 ±89 度之间，防止翻滚万向锁
+        float maxPitch = 1.5533f;
+        if (Pitch > maxPitch) { Pitch = maxPitch; }
+        if (Pitch < -maxPitch) { Pitch = -maxPitch; }
+    }
+
+    // 视线前方水平单位方向向量（XZ 平面，忽略俯仰，用于平滑地面行走）
+    public Vector3 WalkForward() {
+        return new Vector3(-(float)Math.Sin((double)Yaw), 0.0f, -(float)Math.Cos((double)Yaw));
+    }
+
+    // 视线右侧水平单位方向向量
+    public Vector3 WalkRight() {
+        return new Vector3((float)Math.Cos((double)Yaw), 0.0f, -(float)Math.Sin((double)Yaw));
+    }
+
+    // 真实视线全向前向量（包含上下俯仰）
+    public Vector3 LookDirection() {
+        float cosPitch = (float)Math.Cos((double)Pitch);
+        float sinPitch = (float)Math.Sin((double)Pitch);
+        float sinYaw = (float)Math.Sin((double)Yaw);
+        float cosYaw = (float)Math.Cos((double)Yaw);
+
+        return new Vector3(-sinYaw * cosPitch, sinPitch, -cosYaw * cosPitch);
+    }
+
+    // 根据输入按键状态与帧时间步进更新控制器位移
+    public void UpdateInput(bool fwd, bool bwd, bool left, bool right, bool up, bool down, float dt) {
+        if (dt <= 0.0f) { return; }
+
+        Vector3 move = Vector3.Zero;
+        Vector3 forward = WalkForward();
+        Vector3 strafe = WalkRight();
+
+        if (fwd) { move = Vector3.Add(move, forward); }
+        if (bwd) { move = Vector3.Subtract(move, forward); }
+        if (right) { move = Vector3.Add(move, strafe); }
+        if (left) { move = Vector3.Subtract(move, strafe); }
+        if (up) { move = Vector3.Add(move, new Vector3(0.0f, 1.0f, 0.0f)); }
+        if (down) { move = Vector3.Subtract(move, new Vector3(0.0f, 1.0f, 0.0f)); }
+
+        if (move.LengthSquared() > 0.0001f) {
+            move = Vector3.Normalize(move);
+            Position = Vector3.Add(Position, Vector3.Multiply(move, MoveSpeed * dt));
+        }
+    }
+
+    // 将控制器状态同步更新给底层 Camera3D
+    public void SyncToCamera(Camera3D camera) {
+        if (camera == null) { return; }
+        camera.Position = this.Position;
+        camera.Target = Vector3.Add(this.Position, LookDirection());
+        camera.Up = new Vector3(0.0f, 1.0f, 0.0f);
+    }
+}
+
+// 第三人称/轨道环视相机控制器（OrbitController3D）。
+// 挂接在观察目标点周围，支持球坐标旋转、滚轮平滑缩放与弹簧臂。
+public class OrbitController3D {
+    public Vector3 Target;
+    public float Distance;
+    public float MinDistance;
+    public float MaxDistance;
+    public float Yaw;
+    public float Pitch;
+
+    public OrbitController3D() {
+        this.Target = Vector3.Zero;
+        this.Distance = 10.0f;
+        this.MinDistance = 1.0f;
+        this.MaxDistance = 100.0f;
+        this.Yaw = 0.0f;
+        this.Pitch = 0.4f; // 约 23 度微俯角
+    }
+
+    public static OrbitController3D Create() {
+        return new OrbitController3D();
+    }
+
+    public void Rotate(float deltaYaw, float deltaPitch) {
+        Yaw = Yaw + deltaYaw;
+        Pitch = Pitch + deltaPitch;
+
+        float maxPitch = 1.55f;
+        if (Pitch > maxPitch) { Pitch = maxPitch; }
+        if (Pitch < -maxPitch) { Pitch = -maxPitch; }
+    }
+
+    public void Zoom(float delta) {
+        Distance = Distance - delta;
+        if (Distance < MinDistance) { Distance = MinDistance; }
+        if (Distance > MaxDistance) { Distance = MaxDistance; }
+    }
+
+    // 同步到 Camera3D
+    public void SyncToCamera(Camera3D camera) {
+        if (camera == null) { return; }
+        camera.Target = this.Target;
+        camera.Orbit(this.Yaw, this.Pitch, this.Distance);
+    }
+}

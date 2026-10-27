@@ -1,0 +1,180 @@
+using System;
+using System.Collections.Generic;
+using Gui;
+
+namespace Game.Assets;
+
+// Wavefront OBJ 3D 模型解析器（ObjLoader）。
+// 支持从标准 .obj 文本中解析顶点坐标 (v)、纹理贴图坐标 (vt)、法线向量 (vn)
+// 以及任意多边形三角面 (f v/vt/vn)，自动执行多边形扇形三角化并组装为可渲染的 Mesh3D。
+public class ObjLoader {
+
+    public class Vec3F {
+        public float x;
+        public float y;
+        public float z;
+
+        public Vec3F(float x, float y, float z) {
+            this.x = x;
+            this.y = y;
+            this.z = z;
+        }
+    }
+
+    public class Vec2F {
+        public float u;
+        public float v;
+
+        public Vec2F(float u, float v) {
+            this.u = u;
+            this.v = v;
+        }
+    }
+
+    public class FaceVertex {
+        public int vIdx;
+        public int vtIdx;
+        public int vnIdx;
+
+        public FaceVertex(int v, int vt, int vn) {
+            this.vIdx = v;
+            this.vtIdx = vt;
+            this.vnIdx = vn;
+        }
+    }
+
+    // 从 OBJ 文本内容解析生成 Mesh3D
+    public static Mesh3D LoadFromText(string objText) {
+        if (objText == null || objText.Length == 0) {
+            return new Mesh3D();
+        }
+
+        List<Vec3F> positions = new List<Vec3F>();
+        List<Vec2F> texCoords = new List<Vec2F>();
+        List<Vec3F> normals = new List<Vec3F>();
+
+        Mesh3D mesh = new Mesh3D();
+
+        List<string> lines = objText.Split('\n');
+        for (int lineIdx = 0; lineIdx < lines.Count; lineIdx = lineIdx + 1) {
+            string line = lines[lineIdx].Trim();
+            if (line.Length == 0 || line.StartsWith("#")) {
+                continue;
+            }
+
+            List<string> tokens = SplitTokens(line);
+            if (tokens.Count == 0) { continue; }
+
+            string prefix = tokens[0];
+
+            if (prefix == "v" && tokens.Count >= 4) {
+                // 顶点坐标
+                float x = ParseFloat(tokens[1], 0.0f);
+                float y = ParseFloat(tokens[2], 0.0f);
+                float z = ParseFloat(tokens[3], 0.0f);
+                positions.Add(new Vec3F(x, y, z));
+            } else if (prefix == "vt" && tokens.Count >= 3) {
+                // 纹理 UV 坐标
+                float u = ParseFloat(tokens[1], 0.0f);
+                float v = ParseFloat(tokens[2], 0.0f);
+                texCoords.Add(new Vec2F(u, v));
+            } else if (prefix == "vn" && tokens.Count >= 4) {
+                // 法线向量
+                float nx = ParseFloat(tokens[1], 0.0f);
+                float ny = ParseFloat(tokens[2], 0.0f);
+                float nz = ParseFloat(tokens[3], 0.0f);
+                normals.Add(new Vec3F(nx, ny, nz));
+            } else if (prefix == "f" && tokens.Count >= 4) {
+                // 面数据 (支持三角面或四边形/多边形)
+                List<FaceVertex> faceVerts = new List<FaceVertex>();
+                for (int t = 1; t < tokens.Count; t = t + 1) {
+                    faceVerts.Add(ParseFaceVertex(tokens[t]));
+                }
+
+                if (faceVerts.Count >= 3) {
+                    // 扇形三角剖分：(0, 1, 2), (0, 2, 3), ...
+                    for (int i = 1; i < faceVerts.Count - 1; i = i + 1) {
+                        int idx0 = EmitVertex(mesh, faceVerts[0], positions, texCoords, normals);
+                        int idx1 = EmitVertex(mesh, faceVerts[i], positions, texCoords, normals);
+                        int idx2 = EmitVertex(mesh, faceVerts[i + 1], positions, texCoords, normals);
+                        mesh.Triangle(idx0, idx1, idx2);
+                    }
+                }
+            }
+        }
+
+        return mesh;
+    }
+
+    private static int EmitVertex(Mesh3D mesh, FaceVertex fv, List<Vec3F> positions, List<Vec2F> texCoords, List<Vec3F> normals) {
+        float px = 0.0f; float py = 0.0f; float pz = 0.0f;
+        float nx = 0.0f; float ny = 1.0f; float nz = 0.0f;
+        float u = 0.0f; float v = 0.0f;
+
+        // 1-based index 转换为 0-based
+        if (fv.vIdx > 0 && fv.vIdx <= positions.Count) {
+            Vec3F pos = positions[fv.vIdx - 1];
+            px = pos.x; py = pos.y; pz = pos.z;
+        }
+
+        if (fv.vtIdx > 0 && fv.vtIdx <= texCoords.Count) {
+            Vec2F uv = texCoords[fv.vtIdx - 1];
+            u = uv.u; v = uv.v;
+        }
+
+        if (fv.vnIdx > 0 && fv.vnIdx <= normals.Count) {
+            Vec3F n = normals[fv.vnIdx - 1];
+            nx = n.x; ny = n.y; nz = n.z;
+        }
+
+        return mesh.Vertex(px, py, pz, nx, ny, nz, u, v);
+    }
+
+    private static FaceVertex ParseFaceVertex(string token) {
+        // 格式通常为: "v", "v/vt", "v//vn", 或 "v/vt/vn"
+        int v = 0;
+        int vt = 0;
+        int vn = 0;
+
+        List<string> parts = token.Split('/');
+        if (parts.Count >= 1 && parts[0].Length > 0) {
+            v = ParseInt(parts[0], 0);
+        }
+        if (parts.Count >= 2 && parts[1].Length > 0) {
+            vt = ParseInt(parts[1], 0);
+        }
+        if (parts.Count >= 3 && parts[2].Length > 0) {
+            vn = ParseInt(parts[2], 0);
+        }
+
+        return new FaceVertex(v, vt, vn);
+    }
+
+    private static List<string> SplitTokens(string line) {
+        List<string> list = new List<string>();
+        List<string> raw = line.Split(' ');
+        for (int i = 0; i < raw.Count; i = i + 1) {
+            string s = raw[i].Trim();
+            if (s.Length > 0) {
+                list.Add(s);
+            }
+        }
+        return list;
+    }
+
+    private static float ParseFloat(string s, float defVal) {
+        try {
+            return (float)Convert.ToDouble(s);
+        } catch (Exception ex) {
+            return defVal;
+        }
+    }
+
+    private static int ParseInt(string s, int defVal) {
+        try {
+            return Convert.ToInt32(s);
+        } catch (Exception ex) {
+            return defVal;
+        }
+    }
+}

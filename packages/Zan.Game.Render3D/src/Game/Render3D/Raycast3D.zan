@@ -1,0 +1,162 @@
+using System;
+using System.Numerics;
+using Gui;
+
+namespace Game.Render3D;
+
+// 3D 射线定义
+public class Ray3D {
+    public Vector3 Origin;
+    public Vector3 Direction; // 必须是单位向量
+
+    public Ray3D(Vector3 origin, Vector3 direction) {
+        this.Origin = origin;
+        this.Direction = Vector3.Normalize(direction);
+    }
+
+    public static Ray3D Create(Vector3 origin, Vector3 direction) {
+        return new Ray3D(origin, direction);
+    }
+
+    public Vector3 GetPoint(float dist) {
+        return Vector3.Add(Origin, Vector3.Multiply(Direction, dist));
+    }
+}
+
+// 3D 射线拾取与几何求交检测工具（Raycast3D）。
+// 支持从屏幕鼠标点击反投影生成 3D 世界射线，
+// 并提供射线与球体、平面、AABB 轴对齐包围盒的精确求交算法，用于 3D 鼠标拾取、射击命中与建造落点。
+public class Raycast3D {
+
+    // 从屏幕像素坐标 (screenX, screenY) 反投影生成穿过视口的 3D 世界空间射线
+    public static Ray3D ScreenPointToRay(int screenX, int screenY, int viewportW, int viewportH, Camera3D camera) {
+        if (camera == null || viewportW <= 0 || viewportH <= 0) {
+            return new Ray3D(Vector3.Zero, new Vector3(0.0f, 0.0f, -1.0f));
+        }
+
+        // 1. 视口像素映射到归一化设备坐标 NDC (-1.0 ~ 1.0)
+        float ndcX = ((float)screenX / (float)viewportW) * 2.0f - 1.0f;
+        float ndcY = 1.0f - ((float)screenY / (float)viewportH) * 2.0f;
+
+        // 2. 利用相机的基底向量推算视锥空间方向
+        // 视线中心方向、相机正上方向、相机正右方向
+        Vector3 forward = camera.Forward();
+        Vector3 right = camera.Right();
+        Vector3 up = camera.Up;
+
+        float tanFovHalf = (float)Math.Tan((double)(camera.FieldOfView * 0.5f));
+        float aspect = camera.AspectRatio;
+
+        // 视锥平截头体内射线方向向量
+        Vector3 rayDir = Vector3.Add(
+            forward,
+            Vector3.Add(
+                Vector3.Multiply(right, ndcX * tanFovHalf * aspect),
+                Vector3.Multiply(up, ndcY * tanFovHalf)
+            )
+        );
+
+        return new Ray3D(camera.Position, rayDir);
+    }
+
+    // 射线与球体求交检测
+    public static bool IntersectSphere(Ray3D ray, Vector3 sphereCenter, float radius, out float hitDist) {
+        hitDist = 0.0f;
+        if (ray == null || radius <= 0.0f) { return false; }
+
+        Vector3 oc = Vector3.Subtract(ray.Origin, sphereCenter);
+        float a = Vector3.Dot(ray.Direction, ray.Direction);
+        float b = 2.0f * Vector3.Dot(oc, ray.Direction);
+        float c = Vector3.Dot(oc, oc) - radius * radius;
+        float discriminant = b * b - 4.0f * a * c;
+
+        if (discriminant < 0.0f) {
+            return false;
+        }
+
+        float sqrtD = (float)Math.Sqrt((double)discriminant);
+        float t0 = (-b - sqrtD) / (2.0f * a);
+        float t1 = (-b + sqrtD) / (2.0f * a);
+
+        if (t0 > 0.0001f) {
+            hitDist = t0;
+            return true;
+        }
+        if (t1 > 0.0001f) {
+            hitDist = t1;
+            return true;
+        }
+        return false;
+    }
+
+    // 射线与水平/空间平面求交 (planeNormal 必须归一化)
+    public static bool IntersectPlane(Ray3D ray, Vector3 planePoint, Vector3 planeNormal, out float hitDist) {
+        hitDist = 0.0f;
+        if (ray == null) { return false; }
+
+        float denom = Vector3.Dot(planeNormal, ray.Direction);
+        if (Math.Abs(denom) < 0.00001f) {
+            return false; // 平行无交点
+        }
+
+        Vector3 p0l0 = Vector3.Subtract(planePoint, ray.Origin);
+        float t = Vector3.Dot(p0l0, planeNormal) / denom;
+        if (t >= 0.0001f) {
+            hitDist = t;
+            return true;
+        }
+        return false;
+    }
+
+    // 射线与 AABB 轴对齐包围盒求交（Slab 经典快速算法）
+    public static bool IntersectAabb(Ray3D ray, Vector3 min, Vector3 max, out float hitDist) {
+        hitDist = 0.0f;
+        if (ray == null) { return false; }
+
+        float tmin = -9999999.0f;
+        float tmax = 9999999.0f;
+
+        // X 轴
+        if (Math.Abs(ray.Direction.X) > 0.000001f) {
+            float tx1 = (min.X - ray.Origin.X) / ray.Direction.X;
+            float tx2 = (max.X - ray.Origin.X) / ray.Direction.X;
+            float tnear = tx1 < tx2 ? tx1 : tx2;
+            float tfar  = tx1 > tx2 ? tx1 : tx2;
+            if (tnear > tmin) { tmin = tnear; }
+            if (tfar < tmax)  { tmax = tfar; }
+        } else {
+            if (ray.Origin.X < min.X || ray.Origin.X > max.X) { return false; }
+        }
+
+        // Y 轴
+        if (Math.Abs(ray.Direction.Y) > 0.000001f) {
+            float ty1 = (min.Y - ray.Origin.Y) / ray.Direction.Y;
+            float ty2 = (max.Y - ray.Origin.Y) / ray.Direction.Y;
+            float tnear = ty1 < ty2 ? ty1 : ty2;
+            float tfar  = ty1 > ty2 ? ty1 : ty2;
+            if (tnear > tmin) { tmin = tnear; }
+            if (tfar < tmax)  { tmax = tfar; }
+        } else {
+            if (ray.Origin.Y < min.Y || ray.Origin.Y > max.Y) { return false; }
+        }
+
+        // Z 轴
+        if (Math.Abs(ray.Direction.Z) > 0.000001f) {
+            float tz1 = (min.Z - ray.Origin.Z) / ray.Direction.Z;
+            float tz2 = (max.Z - ray.Origin.Z) / ray.Direction.Z;
+            float tnear = tz1 < tz2 ? tz1 : tz2;
+            float tfar  = tz1 > tz2 ? tz1 : tz2;
+            if (tnear > tmin) { tmin = tnear; }
+            if (tfar < tmax)  { tmax = tfar; }
+        } else {
+            if (ray.Origin.Z < min.Z || ray.Origin.Z > max.Z) { return false; }
+        }
+
+        if (tmax >= tmin && tmax > 0.0001f) {
+            hitDist = tmin > 0.0001f ? tmin : tmax;
+            return true;
+        }
+
+        return false;
+    }
+}

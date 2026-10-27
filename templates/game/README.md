@@ -22,6 +22,7 @@ IDE 的"新建项目"按这个标签分组。
 | 休闲益智 Puzzle | [match3](match3/) | `Game.Match3` + `Game.Kit` | 经典三消：滑块交换、重力掉落填充、连击消除与飘字计分 |
 | 动作平台 Action | [platformer](platformer/) | `Game.Arcade2D` | 2D 横版平台：零分配循环、土狼时间、跳跃缓冲 |
 | 肉鸽动作 Action | [survivor](survivor/) | `Game.Kit` + `Game.Graphics` | 幸存者割草：自动瞄准弹幕、怪物蜂拥波次、深度遮挡排序、打击顿帧与震屏 |
+| 3D 漫游交互 Action3D | [fps-3d](fps-3d/) | `Game.Render3D` | 3D 第一人称漫游：GPU 网格批次渲染、视锥裁剪、平滑漫游与 3D 射线拾取 |
 | 放置挂机 Idle | [idle](idle/) | `Game.Idle` | 放置矿工：Gui + SpriteBatch + 弹性反馈 |
 
 ## 仓库外的大型游戏项目
