@@ -19,7 +19,9 @@ IDE 的"新建项目"按这个标签分组。
 | 卡牌 Card | [roguelike](roguelike/) | `Game.Cards` + `Game.Foundation` | 肉鸽爬塔：种子决定地图/敌人/奖励三选一 |
 | 策略塔防 Strategy | [rts](rts/) | `Game.Tactics` | 即时战术：流场寻路 + RVO 群体避障 + 小地图 |
 | 益智解谜 Puzzle | [trap-cat](trap-cat/) | `Game.Board` | 围住神经猫：逐点封堵、撤销、最短路 AI |
+| 休闲益智 Puzzle | [match3](match3/) | `Game.Match3` + `Game.Kit` | 经典三消：滑块交换、重力掉落填充、连击消除与飘字计分 |
 | 动作平台 Action | [platformer](platformer/) | `Game.Arcade2D` | 2D 横版平台：零分配循环、土狼时间、跳跃缓冲 |
+| 肉鸽动作 Action | [survivor](survivor/) | `Game.Kit` + `Game.Graphics` | 幸存者割草：自动瞄准弹幕、怪物蜂拥波次、深度遮挡排序、打击顿帧与震屏 |
 | 放置挂机 Idle | [idle](idle/) | `Game.Idle` | 放置矿工：Gui + SpriteBatch + 弹性反馈 |
 
 ## 仓库外的大型游戏项目

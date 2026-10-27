@@ -1,0 +1,395 @@
+using System;
+using System.Collections.Generic;
+using Gui;
+using Game.Foundation.Gui;
+using Game.Kit;
+using Game.Graphics;
+
+namespace Survivor;
+
+public class Enemy {
+    public double x;
+    public double y;
+    public int hp;
+    public int maxHp;
+    public double speed;
+    public bool active;
+    public int color;
+    public double radius;
+
+    public Enemy(double x, double y, int hp, double speed, int color) {
+        this.x = x;
+        this.y = y;
+        this.hp = hp;
+        this.maxHp = hp;
+        this.speed = speed;
+        this.active = true;
+        this.color = color;
+        this.radius = 12.0;
+    }
+}
+
+public class Bullet {
+    public double x;
+    public double y;
+    public double vx;
+    public double vy;
+    public int damage;
+    public bool active;
+    public double lifetime;
+
+    public Bullet(double x, double y, double vx, double vy, int damage) {
+        this.x = x;
+        this.y = y;
+        this.vx = vx;
+        this.vy = vy;
+        this.damage = damage;
+        this.active = true;
+        this.lifetime = 2.0;
+    }
+}
+
+public class Gem {
+    public double x;
+    public double y;
+    public int expValue;
+    public bool active;
+
+    public Gem(double x, double y, int exp) {
+        this.x = x;
+        this.y = y;
+        this.expValue = exp;
+        this.active = true;
+    }
+}
+
+public class SurvivorGame {
+    public double playerX;
+    public double playerY;
+    public double playerSpeed;
+    public int playerHp;
+    public int playerMaxHp;
+    public int level;
+    public int exp;
+    public int expToNext;
+    public int killCount;
+    public double gameTime;
+
+    // 输入移动轴向
+    public double moveX;
+    public double moveY;
+
+    // 武器自动开火计时
+    public double shootCooldown;
+    public double shootTimer;
+
+    // 怪物波次生成计时
+    public double spawnCooldown;
+    public double spawnTimer;
+
+    public List<Enemy> enemies;
+    public List<Bullet> bullets;
+    public List<Gem> gems;
+
+    // 手感与视觉组件
+    public GameFeel.ScreenShake shake;
+    public GameFeel.HitStop hitStop;
+    public FloatingTextPool floatingTexts;
+    public YSortQueue ySorter;
+
+    public SurvivorGame() {
+        this.playerX = 640.0;
+        this.playerY = 360.0;
+        this.playerSpeed = 160.0;
+        this.playerHp = 100;
+        this.playerMaxHp = 100;
+        this.level = 1;
+        this.exp = 0;
+        this.expToNext = 50;
+        this.killCount = 0;
+        this.gameTime = 0.0;
+
+        this.moveX = 0.0;
+        this.moveY = 0.0;
+
+        this.shootCooldown = 0.35;
+        this.shootTimer = 0.0;
+
+        this.spawnCooldown = 0.8;
+        this.spawnTimer = 0.0;
+
+        this.enemies = new List<Enemy>();
+        this.bullets = new List<Bullet>();
+        this.gems = new List<Gem>();
+
+        this.shake = new GameFeel.ScreenShake();
+        this.hitStop = new GameFeel.HitStop();
+        this.floatingTexts = new FloatingTextPool(64);
+        this.ySorter = new YSortQueue(256);
+    }
+
+    public static SurvivorGame Create() {
+        return new SurvivorGame();
+    }
+
+    public void OnKeyDown(int keyCode) {
+        if (keyCode == 87 || keyCode == 38) { moveY = -1.0; } // W or UP
+        if (keyCode == 83 || keyCode == 40) { moveY = 1.0; }  // S or DOWN
+        if (keyCode == 65 || keyCode == 37) { moveX = -1.0; } // A or LEFT
+        if (keyCode == 68 || keyCode == 39) { moveX = 1.0; }  // D or RIGHT
+    }
+
+    public void OnKeyUp(int keyCode) {
+        if ((keyCode == 87 || keyCode == 38) && moveY < 0.0) { moveY = 0.0; }
+        if ((keyCode == 83 || keyCode == 40) && moveY > 0.0) { moveY = 0.0; }
+        if ((keyCode == 65 || keyCode == 37) && moveX < 0.0) { moveX = 0.0; }
+        if ((keyCode == 68 || keyCode == 39) && moveX > 0.0) { moveX = 0.0; }
+    }
+
+    public void Tick(double dt) {
+        // 顿帧检查：打击凝滞时暂停动力学步进
+        if (hitStop.Update(dt)) {
+            shake.Update(dt);
+            floatingTexts.Update(dt);
+            return;
+        }
+
+        shake.Update(dt);
+        floatingTexts.Update(dt);
+        gameTime = gameTime + dt;
+
+        // 玩家移动与边界约束
+        playerX = playerX + moveX * playerSpeed * dt;
+        playerY = playerY + moveY * playerSpeed * dt;
+        if (playerX < 30.0) { playerX = 30.0; }
+        if (playerX > 1250.0) { playerX = 1250.0; }
+        if (playerY < 80.0) { playerY = 80.0; }
+        if (playerY > 690.0) { playerY = 690.0; }
+
+        // 武器自动开火逻辑
+        shootTimer = shootTimer + dt;
+        if (shootTimer >= shootCooldown) {
+            shootTimer = 0.0;
+            AutoShootNearest();
+        }
+
+        // 怪物波次生成
+        spawnTimer = spawnTimer + dt;
+        if (spawnTimer >= spawnCooldown) {
+            spawnTimer = 0.0;
+            SpawnHordeEnemy();
+        }
+
+        // 推进子弹
+        for (int i = 0; i < bullets.Count; i = i + 1) {
+            Bullet b = bullets[i];
+            if (!b.active) { continue; }
+            b.x = b.x + b.vx * dt;
+            b.y = b.y + b.vy * dt;
+            b.lifetime = b.lifetime - dt;
+            if (b.lifetime <= 0.0 || b.x < 0.0 || b.x > 1280.0 || b.y < 0.0 || b.y > 720.0) {
+                b.active = false;
+            }
+        }
+
+        // 推进怪物并检测受击与伤害
+        for (int i = 0; i < enemies.Count; i = i + 1) {
+            Enemy e = enemies[i];
+            if (!e.active) { continue; }
+
+            // 朝玩家追踪移动
+            double dx = playerX - e.x;
+            double dy = playerY - e.y;
+            double dist = Math.Sqrt(dx * dx + dy * dy);
+            if (dist > 5.0) {
+                e.x = e.x + (dx / dist) * e.speed * dt;
+                e.y = e.y + (dy / dist) * e.speed * dt;
+            }
+
+            // 碰撞子弹判定
+            for (int j = 0; j < bullets.Count; j = j + 1) {
+                Bullet b = bullets[j];
+                if (!b.active) { continue; }
+
+                double bdx = b.x - e.x;
+                double bdy = b.y - e.y;
+                double bdist = Math.Sqrt(bdx * bdx + bdy * bdy);
+                if (bdist <= e.radius + 6.0) {
+                    // 命中
+                    b.active = false;
+                    bool isCrit = (killCount % 4 == 0);
+                    int dmg = isCrit ? b.damage * 2 : b.damage;
+                    e.hp = e.hp - dmg;
+                    floatingTexts.SpawnDamage(e.x, e.y - 10.0, dmg, isCrit);
+
+                    if (isCrit) {
+                        hitStop.Freeze(0.04);
+                    }
+
+                    if (e.hp <= 0) {
+                        e.active = false;
+                        killCount = killCount + 1;
+                        shake.AddTrauma(0.12);
+                        gems.Add(new Gem(e.x, e.y, 15));
+                        break;
+                    }
+                }
+            }
+        }
+
+        // 宝石拾取与升级结算
+        for (int i = 0; i < gems.Count; i = i + 1) {
+            Gem g = gems[i];
+            if (!g.active) { continue; }
+            double gx = playerX - g.x;
+            double gy = playerY - g.y;
+            double gdist = Math.Sqrt(gx * gx + gy * gy);
+            // 拾取磁吸范围 60 像素
+            if (gdist < 60.0) {
+                g.x = g.x + (gx / gdist) * 350.0 * dt;
+                g.y = g.y + (gy / gdist) * 350.0 * dt;
+                if (gdist < 15.0) {
+                    g.active = false;
+                    exp = exp + g.expValue;
+                    floatingTexts.SpawnHeal(playerX, playerY - 20.0, g.expValue);
+                    if (exp >= expToNext) {
+                        level = level + 1;
+                        exp = exp - expToNext;
+                        expToNext = (int)((double)expToNext * 1.4);
+                        playerMaxHp = playerMaxHp + 20;
+                        playerHp = playerMaxHp;
+                        shake.AddTrauma(0.25);
+                    }
+                }
+            }
+        }
+    }
+
+    private void AutoShootNearest() {
+        Enemy nearest = null;
+        double minDist = 999999.0;
+        for (int i = 0; i < enemies.Count; i = i + 1) {
+            Enemy e = enemies[i];
+            if (!e.active) { continue; }
+            double dx = e.x - playerX;
+            double dy = e.y - playerY;
+            double d = Math.Sqrt(dx * dx + dy * dy);
+            if (d < minDist) {
+                minDist = d;
+                nearest = e;
+            }
+        }
+
+        if (nearest != null && minDist <= 500.0) {
+            double dirX = nearest.x - playerX;
+            double dirY = nearest.y - playerY;
+            double len = Math.Sqrt(dirX * dirX + dirY * dirY);
+            if (len > 0.0) {
+                double speed = 450.0;
+                bullets.Add(new Bullet(playerX, playerY, (dirX / len) * speed, (dirY / len) * speed, 25));
+            }
+        }
+    }
+
+    private void SpawnHordeEnemy() {
+        // 沿屏幕外边缘随机方位生成
+        int edge = (int)(gameTime * 7.0) % 4;
+        double sx = 0.0;
+        double sy = 0.0;
+        double offset = ((int)(gameTime * 31.0) % 100) / 100.0;
+
+        if (edge == 0) { sx = 1280.0 * offset; sy = -20.0; }
+        else if (edge == 1) { sx = 1300.0; sy = 720.0 * offset; }
+        else if (edge == 2) { sx = 1280.0 * offset; sy = 740.0; }
+        else { sx = -20.0; sy = 720.0 * offset; }
+
+        int hp = 40 + level * 5;
+        double spd = 70.0 + (level > 5 ? 20.0 : 0.0);
+        int col = (level % 2 == 0) ? unchecked((int)0xFFCF1322) : unchecked((int)0xFF531DAB);
+        enemies.Add(new Enemy(sx, sy, hp, spd, col));
+    }
+
+    public void Render(Canvas c) {
+        if (c == null) { return; }
+
+        int shakeX = (int)shake.OffsetX;
+        int shakeY = (int)shake.OffsetY;
+
+        // 背景
+        c.DrawRect(0, 0, 1280, 720, unchecked((int)0xFF14141E), 1);
+
+        // 绘制经验宝石
+        for (int i = 0; i < gems.Count; i = i + 1) {
+            Gem g = gems[i];
+            if (!g.active) { continue; }
+            c.DrawRect((int)g.x + shakeX - 4, (int)g.y + shakeY - 4, 8, 8, unchecked((int)0xFF00E5FF), 1);
+        }
+
+        // 绘制子弹
+        for (int i = 0; i < bullets.Count; i = i + 1) {
+            Bullet b = bullets[i];
+            if (!b.active) { continue; }
+            c.DrawRect((int)b.x + shakeX - 3, (int)b.y + shakeY - 3, 6, 6, unchecked((int)0xFFFFFF00), 1);
+        }
+
+        // 使用 YSortQueue 按底部 Y 坐标排好序后，从上向下渲染遮挡
+        ySorter.Clear();
+        // 玩家实体 ID 设为 0
+        ySorter.Push(0, playerY);
+
+        for (int i = 0; i < enemies.Count; i = i + 1) {
+            Enemy e = enemies[i];
+            if (!e.active) { continue; }
+            // 怪物实体 ID 设为 i + 1
+            ySorter.Push(i + 1, e.y);
+        }
+
+        ySorter.Sort();
+
+        for (int i = 0; i < ySorter.Count; i = i + 1) {
+            int entityId = ySorter.GetEntityId(i);
+            if (entityId == 0) {
+                // 渲染玩家自身（绿色武士）
+                int px = (int)playerX + shakeX;
+                int py = (int)playerY + shakeY;
+                c.DrawRect(px - 14, py - 20, 28, 28, unchecked((int)0xFF52C41A), 1);
+                c.DrawRect(px - 10, py - 16, 20, 10, unchecked((int)0xFFFFFFFF), 1); // 眼睛
+            } else {
+                // 渲染怪物
+                int eIdx = entityId - 1;
+                if (eIdx >= 0 && eIdx < enemies.Count) {
+                    Enemy e = enemies[eIdx];
+                    int ex = (int)e.x + shakeX;
+                    int ey = (int)e.y + shakeY;
+                    c.DrawRect(ex - 12, ey - 16, 24, 24, e.color, 1);
+                    // 血条
+                    if (e.hp < e.maxHp) {
+                        double hpPct = (double)e.hp / (double)e.maxHp;
+                        c.DrawRect(ex - 12, ey - 22, 24, 3, unchecked((int)0xFF555555), 1);
+                        c.DrawRect(ex - 12, ey - 22, (int)(24.0 * hpPct), 3, unchecked((int)0xFFFF4D4F), 1);
+                    }
+                }
+            }
+        }
+
+        // 绘制飘字
+        floatingTexts.Draw(c);
+
+        // 顶部 HUD 界面
+        c.DrawRect(0, 0, 1280, 50, unchecked((int)0xCC0A0A10), 1);
+        c.DrawText(30, 14, "LV. " + Convert.ToString(level), unchecked((int)0xFFFFC53D), 20);
+
+        // 经验条
+        c.DrawRect(110, 18, 400, 14, unchecked((int)0xFF333344), 1);
+        double expPct = expToNext > 0 ? (double)exp / (double)expToNext : 0.0;
+        if (expPct > 1.0) { expPct = 1.0; }
+        c.DrawRect(110, 18, (int)(400.0 * expPct), 14, unchecked((int)0xFF00E5FF), 1);
+
+        // 击杀与生存时长
+        c.DrawText(550, 14, "KILLS: " + Convert.ToString(killCount), unchecked((int)0xFFFF4D4F), 20);
+        int mins = (int)gameTime / 60;
+        int secs = (int)gameTime % 60;
+        string timeStr = (mins < 10 ? "0" : "") + Convert.ToString(mins) + ":" + (secs < 10 ? "0" : "") + Convert.ToString(secs);
+        c.DrawText(750, 14, "TIME: " + timeStr, unchecked((int)0xFFFFFFFF), 20);
+    }
+}

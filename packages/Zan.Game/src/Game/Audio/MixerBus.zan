@@ -1,0 +1,120 @@
+using System;
+using System.Collections.Generic;
+
+namespace Game.Audio;
+
+// 游戏音频混音总线与 2D 空间声相求解器（MixerBus & Spatial2D）。
+// 为游戏统一管理 Master / BGM / SFX / UI / Voice 各通道音量与静音，
+// 并提供俯视角/平台动作游戏所需的 2D 空间距离衰减与左右声道声相（Panning）计算。
+public class MixerBus {
+
+    // 预设总线通道 ID
+    public const int BusMaster = 0;
+    public const int BusMusic  = 1;
+    public const int BusSfx    = 2;
+    public const int BusVoice  = 3;
+    public const int BusUi     = 4;
+    public const int BusCount  = 5;
+
+    private double[] busVolumes;
+    private bool[] busMuted;
+
+    public MixerBus() {
+        this.busVolumes = new double[BusCount];
+        this.busMuted = new bool[BusCount];
+        for (int i = 0; i < BusCount; i = i + 1) {
+            this.busVolumes[i] = 1.0;
+            this.busMuted[i] = false;
+        }
+    }
+
+    public static MixerBus Create() {
+        return new MixerBus();
+    }
+
+    // 设置通道音量（0.0 ~ 1.0）
+    public void SetVolume(int busId, double volume) {
+        if (busId < 0 || busId >= BusCount) { return; }
+        if (volume < 0.0) { volume = 0.0; }
+        if (volume > 1.0) { volume = 1.0; }
+        busVolumes[busId] = volume;
+    }
+
+    // 获取通道音量
+    public double GetVolume(int busId) {
+        if (busId < 0 || busId >= BusCount) { return 0.0; }
+        return busVolumes[busId];
+    }
+
+    // 设置静音
+    public void SetMute(int busId, bool muted) {
+        if (busId < 0 || busId >= BusCount) { return; }
+        busMuted[busId] = muted;
+    }
+
+    // 检查是否静音
+    public bool IsMuted(int busId) {
+        if (busId < 0 || busId >= BusCount) { return true; }
+        return busMuted[busId];
+    }
+
+    // 计算某个通道最终综合音量（通道音量 * Master 音量，任何一处静音则为 0.0）
+    public double ResolveEffectiveVolume(int busId) {
+        if (busMuted[BusMaster] || busMuted[busId]) {
+            return 0.0;
+        }
+        double masterVol = busVolumes[BusMaster];
+        if (busId == BusMaster) {
+            return masterVol;
+        }
+        return masterVol * busVolumes[busId];
+    }
+
+    // 2D 空间声学解算结果
+    public class SpatialResult {
+        public double volume;   // 经距离衰减后的音量倍率 (0.0 ~ 1.0)
+        public double pan;      // 声相平衡 (-1.0 完全左声道, 0.0 居中, 1.0 完全右声道)
+        public double distance; // 真实欧氏距离
+
+        public SpatialResult(double vol, double pan, double dist) {
+            this.volume = vol;
+            this.pan = pan;
+            this.distance = dist;
+        }
+    }
+
+    // 求解 2D 空间音效参数：
+    // lx, ly: 听者（通常是主角玩家或摄像机中心）
+    // sx, sy: 音源位置（怪物咆哮、爆炸、掉落物）
+    // minDistance: 全音量保真半径（小于此距离不发生衰减）
+    // maxDistance: 最大听闻半径（超出此距离音量衰减为 0）
+    public static SpatialResult EvaluateSpatial2D(double lx, double ly, double sx, double sy, double minDist, double maxDist) {
+        double dx = sx - lx;
+        double dy = sy - ly;
+        double dist = Math.Sqrt(dx * dx + dy * dy);
+
+        if (minDist < 1.0) { minDist = 1.0; }
+        if (maxDist <= minDist) { maxDist = minDist + 100.0; }
+
+        double vol = 1.0;
+        if (dist <= minDist) {
+            vol = 1.0;
+        } else if (dist >= maxDist) {
+            vol = 0.0;
+        } else {
+            // 平滑线性衰减 (1.0 -> 0.0)
+            vol = 1.0 - (dist - minDist) / (maxDist - minDist);
+        }
+
+        // 声相 Panning 计算：以屏幕/视口半宽参考进行归一化映射 (-1.0 ~ 1.0)
+        // 设左右最大偏角参考范围为 maxDist * 0.75
+        double panRange = maxDist * 0.6;
+        if (panRange < 10.0) { panRange = 10.0; }
+
+        double pan = dx / panRange;
+        if (pan < -1.0) { pan = -1.0; }
+        if (pan > 1.0) { pan = 1.0; }
+
+        return new SpatialResult(vol, pan, dist);
+    }
+}

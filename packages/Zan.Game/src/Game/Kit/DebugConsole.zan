@@ -1,0 +1,270 @@
+using System;
+using System.Collections.Generic;
+using Gui;
+using Game.Foundation.Gui;
+
+namespace Game.Kit;
+
+// 游戏调试指令处理器委托定义
+public interface IDebugCommandHandler {
+    void Execute(DebugConsole console, string cmd, List<string> args);
+}
+
+// 游戏开发者与测试内置控制台（DebugConsole）。
+// 按下波浪键 (~) 或调用 Toggle() 即可呼出半透明覆层，
+// 支持注册各类作弊/调试指令（如 god, speed, noclip, give 等），
+// 提供命令自动切词、历史记录回溯与彩色日志输出。
+public class DebugConsole {
+
+    public class ConsoleLogEntry {
+        public string text;
+        public int color;
+
+        public ConsoleLogEntry(string text, int color) {
+            this.text = text != null ? text : "";
+            this.color = color;
+        }
+    }
+
+    public class RegisteredCommand {
+        public string name;
+        public string description;
+        public IDebugCommandHandler handler;
+
+        public RegisteredCommand(string name, string desc, IDebugCommandHandler handler) {
+            this.name = name != null ? name.ToLower() : "";
+            this.description = desc != null ? desc : "";
+            this.handler = handler;
+        }
+    }
+
+    // 默认内置 Help 指令处理器
+    private class HelpCommandHandler : IDebugCommandHandler {
+        public void Execute(DebugConsole console, string cmd, List<string> args) {
+            console.Log("=== AVAILABLE COMMANDS ===", unchecked((int)0xFFFFC53D));
+            for (int i = 0; i < console.commands.Count; i = i + 1) {
+                RegisteredCommand rc = console.commands[i];
+                console.Log("  " + rc.name + " - " + rc.description, unchecked((int)0xFFE0E0E0));
+            }
+        }
+    }
+
+    // 默认内置 Clear 指令处理器
+    private class ClearCommandHandler : IDebugCommandHandler {
+        public void Execute(DebugConsole console, string cmd, List<string> args) {
+            console.logs.Clear();
+        }
+    }
+
+    // 默认内置 Echo 指令处理器
+    private class EchoCommandHandler : IDebugCommandHandler {
+        public void Execute(DebugConsole console, string cmd, List<string> args) {
+            string s = "";
+            for (int i = 0; i < args.Count; i = i + 1) {
+                s = s + (i > 0 ? " " : "") + args[i];
+            }
+            console.Log(s, unchecked((int)0xFFFFFFFF));
+        }
+    }
+
+    public bool isOpen;
+    public string inputBuffer;
+    public List<ConsoleLogEntry> logs;
+    public List<RegisteredCommand> commands;
+    public List<string> history;
+    public int historyIndex;
+    public int maxLogs;
+    public double cursorTimer;
+
+    public DebugConsole() {
+        this.isOpen = false;
+        this.inputBuffer = "";
+        this.logs = new List<ConsoleLogEntry>();
+        this.commands = new List<RegisteredCommand>();
+        this.history = new List<string>();
+        this.historyIndex = -1;
+        this.maxLogs = 80;
+        this.cursorTimer = 0.0;
+
+        // 注册默认系统指令
+        Register("help", "List all registered commands", new HelpCommandHandler());
+        Register("clear", "Clear console log output", new ClearCommandHandler());
+        Register("echo", "Echo back text to the console", new EchoCommandHandler());
+
+        Log("Developer Debug Console initialized. Type 'help' for commands.", unchecked((int)0xFF00E5FF));
+    }
+
+    public static DebugConsole Create() {
+        return new DebugConsole();
+    }
+
+    public void Toggle() {
+        isOpen = !isOpen;
+    }
+
+    public void Register(string name, string description, IDebugCommandHandler handler) {
+        if (name == null || handler == null) { return; }
+        // 覆盖已存在同名指令
+        string low = name.ToLower();
+        for (int i = 0; i < commands.Count; i = i + 1) {
+            if (commands[i].name == low) {
+                commands[i].description = description;
+                commands[i].handler = handler;
+                return;
+            }
+        }
+        commands.Add(new RegisteredCommand(low, description, handler));
+    }
+
+    public void Log(string text, int color) {
+        if (logs.Count >= maxLogs) {
+            logs.RemoveAt(0);
+        }
+        logs.Add(new ConsoleLogEntry(text, color));
+    }
+
+    public void LogInfo(string text) {
+        Log(text, unchecked((int)0xFFFFFFFF));
+    }
+
+    public void LogSuccess(string text) {
+        Log(text, unchecked((int)0xFF52C41A));
+    }
+
+    public void LogWarning(string text) {
+        Log(text, unchecked((int)0xFFFAAD14));
+    }
+
+    public void LogError(string text) {
+        Log(text, unchecked((int)0xFFFF4D4F));
+    }
+
+    // 键盘事件截获处理：如果返回 true，说明控制台正在消费该按键，外层游戏应阻断人物移动/动作
+    public bool HandleKeyDown(int keyCode, char keyChar) {
+        // 波浪键 (ASCII 192 或 '~' 或 '`') 切换控制台显隐
+        if (keyCode == 192 || keyChar == '`' || keyChar == '~') {
+            Toggle();
+            return true;
+        }
+
+        if (!isOpen) { return false; }
+
+        if (keyCode == 13) { // Enter 执行当前指令
+            if (inputBuffer.Trim().Length > 0) {
+                SubmitCommand(inputBuffer);
+                inputBuffer = "";
+                historyIndex = -1;
+            }
+            return true;
+        }
+
+        if (keyCode == 8) { // Backspace
+            if (inputBuffer.Length > 0) {
+                inputBuffer = inputBuffer.Substring(0, inputBuffer.Length - 1);
+            }
+            return true;
+        }
+
+        // 字符输入
+        if (keyChar >= 32 && keyChar <= 126) {
+            inputBuffer = inputBuffer + keyChar;
+            return true;
+        }
+
+        return true;
+    }
+
+    // 执行单行指令
+    public void SubmitCommand(string rawLine) {
+        if (rawLine == null) { return; }
+        string trimmed = rawLine.Trim();
+        if (trimmed.Length == 0) { return; }
+
+        // 记录历史
+        history.Add(trimmed);
+        Log("> " + trimmed, unchecked((int)0xFF40A9FF));
+
+        // 切词
+        List<string> tokens = SplitCommandLine(trimmed);
+        if (tokens.Count == 0) { return; }
+
+        string cmdName = tokens[0].ToLower();
+        List<string> args = new List<string>();
+        for (int i = 1; i < tokens.Count; i = i + 1) {
+            args.Add(tokens[i]);
+        }
+
+        // 查找匹配指令
+        IDebugCommandHandler target = null;
+        for (int i = 0; i < commands.Count; i = i + 1) {
+            if (commands[i].name == cmdName) {
+                target = commands[i].handler;
+                break;
+            }
+        }
+
+        if (target != null) {
+            try {
+                target.Execute(this, cmdName, args);
+            } catch (Exception ex) {
+                LogError("Exception while executing command '" + cmdName + "': " + ex.Message);
+            }
+        } else {
+            LogError("Unknown command: '" + cmdName + "'. Type 'help' for available commands.");
+        }
+    }
+
+    // 简单命令行切词（按空格切分）
+    private List<string> SplitCommandLine(string line) {
+        List<string> list = new List<string>();
+        List<string> parts = line.Split(' ');
+        for (int i = 0; i < parts.Count; i = i + 1) {
+            string token = parts[i].Trim();
+            if (token.Length > 0) {
+                list.Add(token);
+            }
+        }
+        return list;
+    }
+
+    public void Update(double dt) {
+        if (!isOpen) { return; }
+        cursorTimer = cursorTimer + dt;
+    }
+
+    // 渲染控制台界面
+    public void Render(Canvas c, int screenWidth, int screenHeight) {
+        if (!isOpen || c == null) { return; }
+
+        int consoleH = screenHeight * 40 / 100; // 占据顶部 40%
+        if (consoleH < 200) { consoleH = 200; }
+
+        // 背景半透明底色
+        c.DrawRect(0, 0, screenWidth, consoleH, unchecked((int)0xE60A0A12), 1);
+        c.DrawRect(0, consoleH - 2, screenWidth, 2, unchecked((int)0xFF00E5FF), 1); // 底部霓虹青分割线
+
+        // 绘制输入框提示符与文本
+        int inputY = consoleH - 30;
+        c.DrawRect(10, inputY - 4, screenWidth - 20, 26, unchecked((int)0xFF1C1C28), 1);
+
+        bool showCursor = ((int)(cursorTimer * 2.0)) % 2 == 0;
+        string displayText = "> " + inputBuffer + (showCursor ? "_" : " ");
+        c.DrawText(16, inputY + 2, displayText, unchecked((int)0xFFFFFFFF), 16);
+
+        // 绘制日志文本（从下往上贴着输入框绘制）
+        int lineH = 18;
+        int maxVisibleLines = (inputY - 30) / lineH;
+        int startIdx = logs.Count - maxVisibleLines;
+        if (startIdx < 0) { startIdx = 0; }
+
+        int drawY = inputY - 24;
+        for (int i = logs.Count - 1; i >= startIdx; i = i - 1) {
+            ConsoleLogEntry entry = logs[i];
+            c.DrawText(16, drawY, entry.text, entry.color, 14);
+            drawY = drawY - lineH;
+        }
+
+        // 顶部小标题
+        c.DrawText(screenWidth - 180, 8, "DEBUG CONSOLE [~]", unchecked((int)0xFF777788), 12);
+    }
+}

@@ -1,0 +1,98 @@
+using System;
+using System.Collections.Generic;
+using Game.Tilemap;
+using Game.Audio;
+
+public class Program {
+    private static void Check(string label, bool condition) {
+        if (condition) {
+            Console.WriteLine("[PASS] " + label);
+        } else {
+            Console.WriteLine("[FAIL] " + label);
+        }
+    }
+
+    private static void TestTiledMapAndColliders() {
+        // 创建 4x4 地图，单瓦片 32 像素
+        TiledMap map = new TiledMap(4, 4, 32, 32);
+
+        // 构造实体层
+        TileLayer layer = new TileLayer("Walls", 4, 4, 32);
+        // 第一行放 4 个实体瓦片 (id=1)，构成一道连续横向墙壁
+        layer.SetTile(0, 0, 1);
+        layer.SetTile(1, 0, 1);
+        layer.SetTile(2, 0, 1);
+        layer.SetTile(3, 0, 1);
+
+        map.AddLayer(layer);
+
+        // 测试优化合并碰撞体：整行4个连贯瓦片应贪心合并为 1 个宽 128、高 32 的 Rect2 碰撞体
+        List<Rect2> colliders = map.GenerateLayerColliders("Walls", 1);
+        Check("Tilemap_ColCount", colliders.Count == 1);
+        if (colliders.Count > 0) {
+            Rect2 r = colliders[0];
+            Check("Tilemap_ColBounds", r.x == 0.0 && r.y == 0.0 && r.width == 128.0 && r.height == 32.0);
+        }
+    }
+
+    private static void TestTiledLoader() {
+        // 模拟 Tiled 导出的 JSON 片段
+        string fakeJson = "{\n" +
+                          "  \"width\": 3,\n" +
+                          "  \"height\": 2,\n" +
+                          "  \"tilewidth\": 16,\n" +
+                          "  \"tileheight\": 16,\n" +
+                          "  \"data\": [1, 1, 0, 0, 2, 2]\n" +
+                          "}";
+
+        TiledMap loaded = TiledLoader.LoadJson(fakeJson);
+        Check("Loader_Dimensions", loaded.cols == 3 && loaded.rows == 2 && loaded.tileWidth == 16);
+
+        TileLayer g = loaded.GetLayer("Ground");
+        Check("Loader_LayerExists", g != null);
+        if (g != null) {
+            Check("Loader_TileValue", g.GetTile(0, 0) == 1 && g.GetTile(2, 0) == 0 && g.GetTile(1, 1) == 2);
+        }
+    }
+
+    private static void TestMixerBus() {
+        MixerBus mixer = new MixerBus();
+        mixer.SetVolume(MixerBus.BusMaster, 0.8);
+        mixer.SetVolume(MixerBus.BusSfx, 0.5);
+
+        // SFX 实际音量应为 0.8 * 0.5 = 0.4
+        double sfxVol = mixer.ResolveEffectiveVolume(MixerBus.BusSfx);
+        Check("Mixer_EffectiveVolume", Math.Abs(sfxVol - 0.4) < 0.001);
+
+        // 静音 Master，所有通道 effective 归零
+        mixer.SetMute(MixerBus.BusMaster, true);
+        Check("Mixer_MasterMute", mixer.ResolveEffectiveVolume(MixerBus.BusSfx) == 0.0);
+
+        mixer.SetMute(MixerBus.BusMaster, false);
+        Check("Mixer_Unmute", Math.Abs(mixer.ResolveEffectiveVolume(MixerBus.BusSfx) - 0.4) < 0.001);
+    }
+
+    private static void TestSpatialAudio() {
+        // 听者位于 (100, 100)
+        // 音源位于 (100, 100) -> 距离为 0，音量全满，声相 0
+        MixerBus.SpatialResult res1 = MixerBus.EvaluateSpatial2D(100.0, 100.0, 100.0, 100.0, 50.0, 500.0);
+        Check("Spatial_Center", res1.volume == 1.0 && res1.pan == 0.0 && res1.distance == 0.0);
+
+        // 音源位于完全右侧偏远距离 (400, 100) -> dx = 300, dist = 300
+        // pan 偏向右侧 (pan > 0)，音量处于半衰减状态
+        MixerBus.SpatialResult res2 = MixerBus.EvaluateSpatial2D(100.0, 100.0, 400.0, 100.0, 50.0, 500.0);
+        Check("Spatial_RightPan", res2.pan > 0.0 && res2.volume > 0.0 && res2.volume < 1.0);
+
+        // 音源超出最大范围 (1000, 100) -> 音量归零
+        MixerBus.SpatialResult res3 = MixerBus.EvaluateSpatial2D(100.0, 100.0, 1000.0, 100.0, 50.0, 500.0);
+        Check("Spatial_OutRange", res3.volume == 0.0);
+    }
+
+    public static void Main() {
+        TestTiledMapAndColliders();
+        TestTiledLoader();
+        TestMixerBus();
+        TestSpatialAudio();
+        Console.WriteLine("ALL ASSET PIPELINE TESTS PASSED.");
+    }
+}

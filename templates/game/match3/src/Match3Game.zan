@@ -1,0 +1,204 @@
+using System;
+using System.Collections.Generic;
+using Gui;
+using Game.Foundation.Gui;
+using Game.Match3;
+using Game.Kit;
+
+namespace Match3;
+
+public class Match3Game {
+    public const int Cols = 8;
+    public const int Rows = 8;
+    public const int TileSize = 64;
+    public const int BoardStartX = 104;
+    public const int BoardStartY = 200;
+
+    public Match3Board board;
+    public FloatingTextPool floatingTexts;
+
+    public int score;
+    public int movesLeft;
+    public int targetScore;
+    public bool gameOver;
+
+    // 选中状态
+    public int selectedCol;
+    public int selectedRow;
+    public bool hasSelection;
+
+    // 宝石配色 (AARRGGBB)
+    public int[] gemColors;
+
+    public Match3Game() {
+        this.board = new Match3Board(Cols, Rows);
+        this.floatingTexts = new FloatingTextPool(32);
+        this.score = 0;
+        this.movesLeft = 25;
+        this.targetScore = 1500;
+        this.gameOver = false;
+        this.selectedCol = -1;
+        this.selectedRow = -1;
+        this.hasSelection = false;
+
+        this.gemColors = new int[7];
+        this.gemColors[0] = unchecked((int)0x00000000); // 0 为空
+        this.gemColors[1] = unchecked((int)0xFFFF4D4F); // 红：火宝石
+        this.gemColors[2] = unchecked((int)0xFF40A9FF); // 蓝：冰宝石
+        this.gemColors[3] = unchecked((int)0xFF73D13D); // 绿：翡翠
+        this.gemColors[4] = unchecked((int)0xFFFFC53D); // 黄：金曜石
+        this.gemColors[5] = unchecked((int)0xFF9254DE); // 紫：紫水晶
+        this.gemColors[6] = unchecked((int)0xFFFF7A45); // 橙：太阳石
+
+        InitBoard();
+    }
+
+    public static Match3Game Create() {
+        return new Match3Game();
+    }
+
+    public void InitBoard() {
+        // 初始填充并保证没有预先匹配好的三连
+        for (int r = 0; r < Rows; r = r + 1) {
+            for (int c = 0; c < Cols; c = c + 1) {
+                int val = 1 + (c * 3 + r * 5) % 6;
+                board.Set(c, r, val);
+            }
+        }
+        score = 0;
+        movesLeft = 25;
+        gameOver = false;
+        hasSelection = false;
+    }
+
+    // 玩家点击坐标处理
+    public void OnClick(int px, int py) {
+        if (gameOver) {
+            // 点击任意处重新开局
+            InitBoard();
+            return;
+        }
+
+        int relX = px - BoardStartX;
+        int relY = py - BoardStartY;
+        if (relX < 0 || relY < 0) { return; }
+
+        int col = relX / TileSize;
+        int row = relY / TileSize;
+        if (col < 0 || col >= Cols || row < 0 || row >= Rows) {
+            hasSelection = false;
+            return;
+        }
+
+        if (!hasSelection) {
+            selectedCol = col;
+            selectedRow = row;
+            hasSelection = true;
+        } else {
+            // 判断是否相邻
+            int dc = (int)Math.Abs((double)(col - selectedCol));
+            int dr = (int)Math.Abs((double)(row - selectedRow));
+            if ((dc == 1 && dr == 0) || (dc == 0 && dr == 1)) {
+                // 尝试交换
+                TrySwap(selectedCol, selectedRow, col, row);
+                hasSelection = false;
+            } else {
+                // 点击了不相邻格子，切换选中
+                selectedCol = col;
+                selectedRow = row;
+                hasSelection = true;
+            }
+        }
+    }
+
+    private void TrySwap(int c1, int r1, int c2, int r2) {
+        if (movesLeft <= 0) { return; }
+
+        bool valid = board.CanSwap(c1, r1, c2, r2);
+        if (valid) {
+            board.Swap(c1, r1, c2, r2);
+            movesLeft = movesLeft - 1;
+
+            // 产生连续掉落结算
+            int[] incoming = new int[Cols * Rows];
+            for (int i = 0; i < incoming.Length; i = i + 1) {
+                incoming[i] = 1 + (i * 7 + movesLeft * 11) % 6;
+            }
+            int inIdx = 0;
+            int totalCleared = 0;
+            int combos = 0;
+            board.ResolveCascades(incoming, ref inIdx, out totalCleared, out combos);
+
+            int earnedScore = totalCleared * 10 * (combos > 0 ? combos : 1);
+            score = score + earnedScore;
+
+            double spawnX = (double)(BoardStartX + c2 * TileSize + TileSize / 2);
+            double spawnY = (double)(BoardStartY + r2 * TileSize);
+            floatingTexts.SpawnDamage(spawnX, spawnY, earnedScore, combos > 1);
+
+            if (score >= targetScore || movesLeft <= 0) {
+                gameOver = true;
+            }
+        }
+    }
+
+    public void Update(double dt) {
+        floatingTexts.Update(dt);
+    }
+
+    public void Render(Canvas c) {
+        if (c == null) { return; }
+
+        // 背景
+        c.DrawRect(0, 0, 720, 960, unchecked((int)0xFF1F1F2E), 1);
+
+        // 顶部 HUD
+        c.DrawText(40, 50, "CLASSIC MATCH-3", unchecked((int)0xFFFFFFFF), 28);
+        c.DrawText(40, 100, "SCORE: " + Convert.ToString(score) + " / " + Convert.ToString(targetScore), unchecked((int)0xFFFFC53D), 20);
+        c.DrawText(400, 100, "MOVES LEFT: " + Convert.ToString(movesLeft), unchecked((int)0xFF40A9FF), 20);
+
+        // 棋盘背景底槽
+        int boardW = Cols * TileSize;
+        int boardH = Rows * TileSize;
+        c.DrawRect(BoardStartX - 4, BoardStartY - 4, boardW + 8, boardH + 8, unchecked((int)0xFF14141F), 1);
+
+        // 绘制格子与宝石
+        for (int r = 0; r < Rows; r = r + 1) {
+            for (int col = 0; col < Cols; col = col + 1) {
+                int gx = BoardStartX + col * TileSize;
+                int gy = BoardStartY + r * TileSize;
+
+                // 槽位底色
+                int slotColor = ((col + r) % 2 == 0) ? unchecked((int)0xFF2A2A3C) : unchecked((int)0xFF323247);
+                c.DrawRect(gx + 2, gy + 2, TileSize - 4, TileSize - 4, slotColor, 1);
+
+                // 选中高亮框
+                if (hasSelection && selectedCol == col && selectedRow == r) {
+                    c.DrawRect(gx + 1, gy + 1, TileSize - 2, TileSize - 2, unchecked((int)0xFFFFFFFF), 2);
+                }
+
+                // 绘制宝石体
+                int val = board.Get(col, r);
+                if (val >= 1 && val <= 6) {
+                    int gemCol = gemColors[val];
+                    c.DrawRect(gx + 10, gy + 10, TileSize - 20, TileSize - 20, gemCol, 1);
+                }
+            }
+        }
+
+        // 渲染消除飘字
+        floatingTexts.Draw(c);
+
+        // 游戏结束提示
+        if (gameOver) {
+            int bannerCol = unchecked((int)0xCC000000);
+            c.DrawRect(100, 400, 520, 160, bannerCol, 1);
+            if (score >= targetScore) {
+                c.DrawText(220, 440, "STAGE CLEAR!", unchecked((int)0xFF52C41A), 32);
+            } else {
+                c.DrawText(240, 440, "OUT OF MOVES!", unchecked((int)0xFFFF4D4F), 32);
+            }
+            c.DrawText(180, 500, "CLICK ANYWHERE TO REPLAY", unchecked((int)0xFFFFFFFF), 18);
+        }
+    }
+}
