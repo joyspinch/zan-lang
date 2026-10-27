@@ -1,0 +1,481 @@
+using System;
+using System.Collections.Generic;
+using Gui.Backend;
+
+namespace Gui;
+
+public partial class App {
+    Theme theme;
+    StyleSheet sheet;
+    StyleSheet useCssSheet;
+    StyleSheet chartSheet;
+    string appCss;
+    string skinName;
+    List<string> skinPacks;
+    bool autoSkins;
+    int appliedSkin;
+    int accentOverride;
+    bool hasSkinDensity;
+    int density;
+
+    bool showThemeButton;
+    string themeTipText;
+    List<string> themeNames;
+    SignalInt themeMenuModel;
+    SignalBool themeMenuOpen;
+    SignalInt themeMenuScroll;
+    int themeMenuBaseId;
+    int themeMenuTriggerId;
+    UiEvent themeMenuChange;
+    SignalInt themeDrawerTab;
+    ThemeMetricsSnapshot densitySnapshot;
+    string chartThemeName;
+    string skinArt;
+    int skinArtOpacity;
+
+    string bgImagePath;
+    int bgImageOpacity;
+    string userWallpaperPath;
+    int userWallpaperOpacity;
+    bool bgImagePickWanted;
+    int bgThemeGen;
+
+    void InitSkinning() {
+        this.theme = Theme.Light();
+        this.showThemeButton = true;
+        this.themeTipText = "主题";
+        this.themeNames = new List<string>();
+        this.themeMenuModel = new SignalInt(0);
+        this.themeMenuOpen = new SignalBool(false);
+        this.themeMenuScroll = new SignalInt(0);
+        this.themeMenuBaseId = 0;
+        this.themeMenuTriggerId = 0 - 1;
+        this.themeMenuChange = new UiEvent();
+        this.accentOverride = 0;
+        this.themeDrawerTab = new SignalInt(0);
+        this.density = 1;
+        this.densitySnapshot = null;
+        this.hasSkinDensity = false;
+        this.autoSkins = false;
+        this.appliedSkin = -1;
+        this.skinPacks = new List<string>();
+        this.skinArt = "";
+        this.skinArtOpacity = 100;
+        this.sheet = new StyleSheet();
+        this.appCss = "";
+        this.chartSheet = null;
+        this.chartThemeName = "";
+        this.skinName = "";
+        this.useCssSheet = null;
+        this.bgThemeGen = 1;
+        this.bgImagePath = "";
+        this.bgImageOpacity = 100;
+        this.userWallpaperPath = "";
+        this.userWallpaperOpacity = 100;
+        this.bgImagePickWanted = false;
+    }
+
+    // 切换当前主题（浅色/深色）并重新应用 DPI 缩放。
+    public void SetDark(bool dark) {
+        isDark = dark;
+        if (dark) { theme = Theme.Dark(); } else { theme = Theme.Light(); }
+        this.ScaleThemeMetrics();
+        this.NoteRedrawWhy("SetDark");
+        needsRedraw = true;
+    }
+
+    // 安装任意主题预设（重新应用 DPI 缩放）。`dark`
+    // 控制适合深色模式的边框细节（标题悬停水色等）。
+    public void ApplyTheme(Theme t, bool dark) {
+        isDark = dark;
+        theme = t;
+        this.ScaleThemeMetrics();
+        // 磨砂玻璃在应用内渲染：在主题壁纸上做软件模糊，
+        // 窗口本身不透明。若设置了分层样式则一律去除。
+        if (glassNative) { window.DisableGlass(); }
+        glassNative = false;
+        this.ApplySurfaceTranslucency();
+        bgThemeGen = bgThemeGen + 1;
+        fxSnapValid = false;
+        fxDamage = null;
+        fxTouched = null;
+        fxTouchedFull = false;
+        backdropDirty = true;
+        this.NoteRedrawWhy("ApplyTheme");
+        needsRedraw = true;
+    }
+
+    public void SetTheme(Theme t) {
+        theme = t;
+        this.ScaleThemeMetrics();
+        this.ApplySurfaceTranslucency();
+        bgThemeGen = bgThemeGen + 1;
+        this.ApplyAppCss();
+        this.NoteRedrawWhy("SetTheme");
+        needsRedraw = true;
+    }
+
+    // 把当前 theme 的度量重算为"基线 × 密度档 × DPI"。基线在换肤 /
+    // 换主题时快照（theme 实例是新建的），密度切换、DPI 变化从基线
+    // 重推——两档缩放叠加时不会互相污染，往返切换不累积舍入误差。
+    void ScaleThemeMetrics() {
+        if (density < 0) { density = 0; }
+        if (density > 2) { density = 2; }
+        if (theme == null) { return; }
+        if (densitySnapshot == null) {
+            densitySnapshot = theme.Snapshot();
+        }
+        theme.ApplyDensitySnapshot(densitySnapshot, density);
+        theme.ScaleByDpi(dpiScale);
+        if (sheet != null) {
+            this.ApplyAppCss();
+            bgThemeGen = bgThemeGen + 1;
+        }
+    }
+
+    // 全局密度档：0 小（紧凑）/ 1 中（默认）/ 2 大（宽松）。
+    void SetDensity(int d) {
+        if (d < 0) { d = 0; }
+        if (d > 2) { d = 2; }
+        if (d == density) { return; }
+        density = d;
+        if (densitySnapshot == null && theme != null) {
+            densitySnapshot = theme.Snapshot();
+        }
+        this.ScaleThemeMetrics();
+        bgThemeGen = bgThemeGen + 1;
+        backdropDirty = true;
+        this.NoteRedrawWhy("SetDensity");
+        needsRedraw = true;
+        if (themeMenuChange != null) {
+            themeMenuChange.Raise();
+        }
+    }
+
+    int Density() { return density; }
+
+    string DensityLabel() { return Theme.DensityName(density); }
+
+    bool UseSkin(string name) {
+        Skin s = Skin.Load(name);
+        if (!s.IsLoaded()) { return false; }
+        s.Apply(this);
+        this.ApplyAppCss();
+        return true;
+    }
+
+    bool ReloadSkin() {
+        if (skinName == "") { return false; }
+        Skin s = Skin.Reload(skinName);
+        if (!s.IsLoaded()) { return false; }
+        s.Apply(this);
+        this.ApplyAppCss();
+        return true;
+    }
+
+    public void UseAppCss(string css) {
+        appCss = css;
+        this.ApplyAppCss();
+        bgThemeGen = bgThemeGen + 1;
+        backdropDirty = true;
+        this.NoteRedrawWhy("UseAppCss");
+        needsRedraw = true;
+    }
+
+    public void SetChartSheet(StyleSheet s, string pkgName) {
+        this.chartSheet = s;
+        this.chartThemeName = pkgName;
+        bgThemeGen = bgThemeGen + 1;
+        backdropDirty = true;
+        this.NoteRedrawWhy("UseChartTheme");
+        needsRedraw = true;
+    }
+
+    public string SkinName() { return this.skinName; }
+    public string AppCss() { return this.appCss; }
+    public string ChartThemeName() { return this.chartThemeName; }
+
+    public void ApplyAppCss() {
+        StyleSheet fresh = new StyleSheet();
+        List<CssVarDecl> varList = Css.CollectVarDecls(Style.RootFromTheme(theme));
+        fresh.MergeSheet(Css.ParseWithSources(Style.UaCss(), varList, 0));
+        if (skinName != "") {
+            Skin s = Skin.Load(skinName);
+            if (s.IsLoaded()) {
+                fresh.MergeSheet(s.SheetWithVars(varList, varList.Count));
+            }
+        } else if (useCssSheet != null) {
+            fresh.MergeSheet(useCssSheet);
+        }
+        int themeVarCount = varList.Count;
+        if (fresh.vars != null) {
+            for (int i = 0; i < fresh.vars.Count(); i = i + 1) {
+                varList.Add(new CssVarDecl(fresh.vars.KeyAt(i), fresh.vars.ValAt(i).AsString("")));
+            }
+        }
+        if (appCss != "") {
+            fresh.MergeSheet(Css.ParseWithSources(appCss, varList, themeVarCount));
+        }
+        sheet = fresh;
+    }
+
+    public void UseCss(string css) {
+        useCssSheet = StyleSheet.FromCss(css);
+        sheet = useCssSheet;
+        this.ApplyAppCss();
+        bgThemeGen = bgThemeGen + 1;
+        fxSnapValid = false;
+        fxDamage = null;
+        fxTouched = null;
+        fxTouchedFull = false;
+        backdropDirty = true;
+        this.NoteRedrawWhy("UseCss");
+        needsRedraw = true;
+    }
+
+    public int GlassTint() {
+        return theme.GlassTint();
+    }
+
+    void EnableSkins(int index) {
+        autoSkins = true;
+        skinPacks = Skin.Names();
+        themeNames = Skin.Labels(skinPacks);
+        if (themeMenuBaseId == 0) {
+            themeMenuBaseId = WidgetId.Block(themeNames.Count);
+        }
+        themeMenuModel.Set(index);
+        appliedSkin = index;
+        if (!isChildWindow) {
+            showThemeButton = true;
+        }
+        window.SetCaptionButtons(this.ChromeButtonCount());
+        this.NoteRedrawWhy("EnableSkins");
+        needsRedraw = true;
+    }
+
+    void EnableSkins() { this.EnableSkins(0); }
+
+    int SkinCount() { return skinPacks.Count; }
+
+    string SkinNameAt(int i) {
+        if (i < 0 || i >= skinPacks.Count) { return ""; }
+        return skinPacks[i];
+    }
+
+    int SkinIndexOf(string name) {
+        if (name == "") { return 0 - 1; }
+        for (int i = 0; i < skinPacks.Count; i = i + 1) {
+            if (skinPacks[i] == name) { return i; }
+        }
+        return 0 - 1;
+    }
+
+    void ApplySkinName(string name) {
+        int i = this.SkinIndexOf(name);
+        if (i >= 0) { this.ApplySkin(i); }
+    }
+
+    Theme SkinThemeAt(int i) {
+        Skin s = Skin.Load(this.SkinNameAt(i));
+        if (s.IsLoaded()) {
+            Theme pt = s.NewTheme();
+            if (pt != null) { return pt; }
+        }
+        return Theme.Dark();
+    }
+
+    void ApplySkin(int i) {
+        if (!this.UseSkin(this.SkinNameAt(i))) { return; }
+        if (accentOverride != 0) {
+            theme.ApplyAccent(accentOverride);
+        }
+        themeMenuModel.Set(i);
+        appliedSkin = i;
+        this.SyncSkinDensity();
+    }
+
+    int SkinDensity() {
+        if (sheet == null) { return 0 - 1; }
+        return Skin.DensityOf(sheet);
+    }
+
+    void SyncSkinDensity() {
+        int sd = this.SkinDensity();
+        if (sd < 0) { hasSkinDensity = false; return; }
+        hasSkinDensity = true;
+        if (sd == density) { return; }
+        density = sd;
+        if (theme != null) {
+            if (densitySnapshot != null) {
+                theme.ApplyDensitySnapshot(densitySnapshot, density);
+            }
+            theme.ScaleByDpi(dpiScale);
+            this.ApplyAppCss();
+            bgThemeGen = bgThemeGen + 1;
+            backdropDirty = true;
+            this.NoteRedrawWhy("SyncSkinDensity");
+            needsRedraw = true;
+        }
+    }
+
+    void SyncSkin() {
+        if (autoSkins && themeMenuModel.Get() != appliedSkin) {
+            this.ApplySkin(themeMenuModel.Get());
+            themeMenuChange.Raise();
+        }
+    }
+
+    void ToggleThemeMenu(int triggerId) {
+        if (!autoSkins || themeNames.Count == 0) { return; }
+        this.themeMenuTriggerId = triggerId;
+        if (!themeMenuOpen.Get()) { themeMenuScroll.Set(0); }
+        themeMenuOpen.Set(!themeMenuOpen.Get());
+        this.NoteRedrawWhy("ToggleThemeMenu");
+        needsRedraw = true;
+    }
+
+    void RenderThemeMenuOverlay() {
+        if (showChrome || !themeMenuOpen.Get()) { return; }
+        AddOverlay(OverlayPopup.ThemeDrawer(themeMenuBaseId,
+            themeMenuTriggerId, themeMenuOpen, themeMenuScroll));
+    }
+
+    UiEvent SetThemeMenu(List<string> names, int index) {
+        themeNames = names;
+        themeMenuModel.Set(index);
+        themeMenuBaseId = WidgetId.Block(names.Count);
+        if (!isChildWindow) {
+            showThemeButton = true;
+        }
+        window.SetCaptionButtons(this.ChromeButtonCount());
+        this.NoteRedrawWhy("SetThemeMenu");
+        needsRedraw = true;
+        return themeMenuChange;
+    }
+
+    bool ThemeMenuMode() { return themeNames.Count > 0; }
+    int ThemeMenuIndex() { return themeMenuModel.Get(); }
+    void SetThemeMenuIndex(int i) {
+        themeMenuModel.Set(i);
+        this.NoteRedrawWhy("SetThemeMenuIndex");
+        needsRedraw = true;
+    }
+
+    void SetWallpaper(string path, int opacity) {
+        int op = opacity;
+        if (op < 10) { op = 10; }
+        if (op > 100) { op = 100; }
+        if (bgImagePath != "" && bgImagePath != path) {
+            Canvas.EvictImage(bgImagePath);
+        }
+        bgImagePath = path;
+        bgImageOpacity = op;
+        bgThemeGen = bgThemeGen + 1;
+        fxSnapValid = false;
+        this.NoteRedrawWhy("SetWallpaper");
+        needsRedraw = true;
+        theme.MakeSurfacesOpaque();
+        this.ApplySurfaceTranslucency();
+    }
+
+    string UserWallpaperPath() { return userWallpaperPath; }
+
+    int UserWallpaperOpacity() {
+        if (userWallpaperOpacity <= 0) { return 100; }
+        return userWallpaperOpacity;
+    }
+
+    void SetUserWallpaper(string path, int opacity) {
+        int op = opacity;
+        if (op < 10) { op = 10; }
+        if (op > 100) { op = 100; }
+        userWallpaperPath = path;
+        userWallpaperOpacity = op;
+        if (path == "") {
+            if (skinArt != "") { this.SetWallpaper(skinArt, skinArtOpacity); }
+            else { this.SetWallpaper("", op); }
+            return;
+        }
+        this.SetWallpaper(path, op);
+    }
+
+    static int WithAlpha(int color, int alpha) {
+        int a = alpha;
+        if (a < 0) { a = 0; }
+        if (a > 255) { a = 255; }
+        return (color & 16777215) | (a << 24);
+    }
+
+    void ApplySurfaceTranslucency() {
+        if (bgImagePath == "") {
+            if (theme.gradient == 0 && theme.glass == 0) { return; }
+            theme.ApplyTranslucency(225, 215, 205);
+            return;
+        }
+        int strength = this.WallpaperOpacity();
+        int alpha;
+        int chrome;
+        int rail;
+        if (this.SkinArtWallpaper()) {
+            alpha = 180;
+            chrome = 168;
+            rail = 156;
+        } else {
+            alpha = 255 - strength * 85 / 100;
+            chrome = alpha - 10;
+            rail = alpha - 20;
+            if (alpha < 190) { alpha = 190; }
+            if (chrome < 180) { chrome = 180; }
+            if (rail < 170) { rail = 170; }
+        }
+        theme.ApplyTranslucency(alpha, chrome, rail);
+    }
+
+    bool SkinArtWallpaper() {
+        return skinArt != "" && bgImagePath == skinArt;
+    }
+
+    bool HasUserWallpaper() {
+        return userWallpaperPath != "";
+    }
+
+    bool IsSkinArtPath(string path) {
+        if (path == "") { return false; }
+        string norm = path;
+        norm = norm.Replace("\\", "/");
+        norm = norm.ToLower();
+        for (int i = 0; i < skinPacks.Count; i = i + 1) {
+            Skin s = Skin.Load(skinPacks[i]);
+            string a = s.ArtPath();
+            if (a != "") {
+                string an = a.Replace("\\", "/").ToLower();
+                if (an == norm) { return true; }
+            }
+        }
+        return false;
+    }
+
+    void ClearWallpaper() {
+        this.SetUserWallpaper("", bgImageOpacity);
+    }
+
+    string WallpaperPath() { return bgImagePath; }
+
+    int WallpaperOpacity() {
+        if (bgImageOpacity <= 0) { return 100; }
+        return bgImageOpacity;
+    }
+
+    void RequestWallpaperPick() {
+        bgImagePickWanted = true;
+        this.NoteRedrawWhy("RequestWallpaperPick");
+        needsRedraw = true;
+    }
+
+    bool ConsumeWallpaperPick() {
+        if (!bgImagePickWanted) { return false; }
+        bgImagePickWanted = false;
+        return true;
+    }
+}

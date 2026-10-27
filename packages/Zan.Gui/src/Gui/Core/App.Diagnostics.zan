@@ -1,0 +1,572 @@
+using System;
+using System.Collections.Generic;
+using Gui.Backend;
+
+namespace Gui;
+
+public partial class App {
+    int perfFrames;
+    int perfRenderMs;
+    int perfPresentMs;
+    int perfPartFrames;
+    int perfPartRenderMs;
+    int perfPartPresentMs;
+    int perfWorstMs;
+    int perfSlowFrames;
+    int perfStyleAt;
+    int perfStyleMissAt;
+    int perfPxFillAt;
+    int perfPxBlendAt;
+    int perfPxBlurAt;
+    int perfPxGlyphAt;
+    int perfPxSnapAt;
+    int phaseAtUs;
+    int phaseBgUs;
+    int phaseMeasUs;
+    int phaseArrUs;
+    int phaseTreeUs;
+    int scopeId;
+    int scopeAtUs;
+    int scopeEndUs;
+    int scopeEndId;
+    string phaseSecTop;
+    int phaseSecTopUs;
+    int markAtUs;
+    string phaseMarkTop;
+    int phaseMarkTopUs;
+    string markNow;
+    string redrawWhy;
+    int redrawCount;
+    string frameWhy;
+    int frameWhyN;
+    List<WhyTally> fullWhy;
+    string phaseTopNode;
+    int phaseTopUs;
+    int perfBgUs;
+    int perfMeasUs;
+    int perfArrUs;
+    int perfTreeUs;
+    int perfBeginMs;
+    int perfFxMs;
+    int perfOverlayMs;
+    int lastPresentMs;
+    FrameCadence frameCadence = new FrameCadence();
+    bool displayAnimationPending;
+    bool displayFxPending;
+    int lastFullFrameMs;
+    int perfLoopAt;
+    int perfLoops;
+    int perfPollPath;
+    int perfAnimPath;
+    int perfWaitPath;
+    int perfEvNone;
+    int perfEvMove;
+    int perfEvOther;
+    int perfLoopMs;
+    int perfFxTicks;
+    int perfFxOnlyTicks;
+    int perfFxTickMs;
+    int perfFxTickUs;
+    int perfFxRestoreUs;
+    int perfFxRenderUs;
+    int perfFxPresentUs;
+    int lastInputMs;
+    int lastInX;
+    int lastInY;
+
+    static bool paintHashOn;
+    static long paintHashAcc;
+    static long paintHashSaved;
+    Dictionary<int, long> paintHashStore;
+    static int perfMode;
+
+    // 启用可选帧分析器（ZAN_FRAME_PROF=1）时为真。
+    public static bool PerfOn() {
+        if (App.perfMode == 0) {
+            App.perfMode = 2;
+            if (Interop.EnvVar("ZAN_FRAME_PROF") == "1") { App.perfMode = 1; }
+        }
+        return App.perfMode == 1;
+    }
+
+    // 帧分析器的空闲侧：记一圈事件循环走了哪条等待路径、被什么
+    // 唤醒、在循环体外花了多少毫秒，每 2 秒往同一个日志追一行。
+    void PerfLoopTick(int t0, int path) {
+        int now = Window.GetTickMs();
+        perfLoops = perfLoops + 1;
+        perfLoopMs = perfLoopMs + (now - t0);
+        if (path == 0) { perfPollPath = perfPollPath + 1; }
+        else if (path == 1) { perfAnimPath = perfAnimPath + 1; }
+        else { perfWaitPath = perfWaitPath + 1; }
+        int ek = window.EventKind();
+        if (ek == 0) { perfEvNone = perfEvNone + 1; }
+        else if (ek == 1) { perfEvMove = perfEvMove + 1; }
+        else { perfEvOther = perfEvOther + 1; }
+        this.PerfMaybeFlushLoop(now);
+    }
+
+    // 把累计的循环/特效计数按 2 秒窗口落盘。除了事件循环本身，
+    // 纯特效 tick（FxPresent 在等待循环内就地呈现，不经过
+    // PerfLoopTick）也调用这里，否则安静的效果层会让日志整段
+    // 缺行，看起来像循环根本没在跑。
+    void PerfMaybeFlushLoop(int now) {
+        if (perfLoopAt == 0) { perfLoopAt = now; }
+        int span = now - perfLoopAt;
+        if (span < 2000) { return; }
+        File.AppendAllText("zan_frame_perf.log",
+            "loops=" + Convert.ToString(perfLoops)
+            + " over_ms=" + Convert.ToString(span)
+            + " frames=" + Convert.ToString(perfFrames)
+            + " wait_ms=" + Convert.ToString(perfLoopMs)
+            + " path_poll=" + Convert.ToString(perfPollPath)
+            + " path_anim=" + Convert.ToString(perfAnimPath)
+            + " path_block=" + Convert.ToString(perfWaitPath)
+            + " ev_none=" + Convert.ToString(perfEvNone)
+            + " ev_move=" + Convert.ToString(perfEvMove)
+            + " ev_other=" + Convert.ToString(perfEvOther)
+            + " fx_ticks=" + Convert.ToString(perfFxTicks)
+            + " fx_only=" + Convert.ToString(perfFxOnlyTicks)
+            + " fx_tick_ms=" + Convert.ToString(perfFxTickMs)
+            + " fx_tick_us=" + Convert.ToString(perfFxTickUs)
+            + " fx_restore_us=" + Convert.ToString(perfFxRestoreUs)
+            + " fx_render_us=" + Convert.ToString(perfFxRenderUs)
+            + " fx_present_us=" + Convert.ToString(perfFxPresentUs)
+            + " fx_kind=" + Convert.ToString(this.EffectiveFx())
+            + " anim_armed=" + Convert.ToString(animNextMs)
+            + " fx_armed=" + Convert.ToString(fxNextMs) + "\n");
+        perfLoopAt = now;
+        perfLoops = 0;
+        perfLoopMs = 0;
+        perfPollPath = 0;
+        perfAnimPath = 0;
+        perfWaitPath = 0;
+        perfEvNone = 0;
+        perfEvMove = 0;
+        perfEvOther = 0;
+        perfFxTicks = 0;
+        perfFxOnlyTicks = 0;
+        perfFxTickMs = 0;
+        perfFxTickUs = 0;
+        perfFxRestoreUs = 0;
+        perfFxRenderUs = 0;
+        perfFxPresentUs = 0;
+    }
+
+    // 宿主在一大段绘制里埋的标记点：把自上一个标记以来的时间
+    // 记到 `name` 头上（空名字只重置起点），分析器关着时不做事。
+    public void PerfMark(string name) {
+        if (!App.PerfOn()) { return; }
+        int now = Window.GetTickUs();
+        int d = now - markAtUs;
+        bool first = markAtUs == 0;
+        markAtUs = now;
+        if (name != "") { markNow = name; }
+        if (name == "" || first) { return; }
+        if (d > phaseMarkTopUs) {
+            phaseMarkTopUs = d;
+            phaseMarkTop = name;
+        }
+    }
+
+    public void PerfScopeBegin(int id) {
+        if (!App.PerfOn()) { return; }
+        scopeId = id;
+        scopeAtUs = Window.GetTickUs();
+    }
+
+    public void PerfScopeEnd(int id) {
+        if (!App.PerfOn()) { return; }
+        int now = Window.GetTickUs();
+        int d = now - scopeAtUs;
+        scopeEndUs = now;
+        scopeEndId = id;
+        if (d <= phaseSecTopUs) { return; }
+        phaseSecTopUs = d;
+        phaseSecTop = Convert.ToString(id);
+    }
+
+    public void NoteRedrawWhy(string why) {
+        if (!App.PerfOn()) { return; }
+        if (redrawWhy == "") {
+            string ctx = markNow;
+            if (ctx == "") { ctx = "ev"; }
+            redrawWhy = ctx + ":" + why;
+            redrawCount = 1;
+        } else {
+            redrawCount = redrawCount + 1;
+        }
+    }
+
+    void NoteFullFrameWhy() {
+        if (!App.PerfOn()) { return; }
+        if (fullWhy == null) { fullWhy = new List<WhyTally>(); }
+        string key = frameWhy;
+        if (key == "") { key = "unspecified"; }
+        for (int i = 0; i < fullWhy.Count; i = i + 1) {
+            if (fullWhy[i].why == key) {
+                fullWhy[i].n = fullWhy[i].n + 1;
+                return;
+            }
+        }
+        WhyTally t = new WhyTally(key);
+        fullWhy.Add(t);
+    }
+
+    string FullFrameWhyTop(int top) {
+        if (fullWhy == null || fullWhy.Count == 0) { return "-"; }
+        List<int> left = new List<int>();
+        for (int i = 0; i < fullWhy.Count; i = i + 1) {
+            left.Add(fullWhy[i].n);
+        }
+        string outp = "";
+        int taken = 0;
+        while (taken < top) {
+            int best = 0 - 1;
+            for (int i = 0; i < left.Count; i = i + 1) {
+                if (left[i] <= 0) { continue; }
+                if (best < 0 || left[i] > left[best]) { best = i; }
+            }
+            if (best < 0) { break; }
+            if (outp != "") { outp = outp + ","; }
+            outp = outp + fullWhy[best].why + ":"
+                + Convert.ToString(fullWhy[best].n);
+            left[best] = 0;
+            taken = taken + 1;
+        }
+        if (outp == "") { return "-"; }
+        return outp;
+    }
+
+    public void PerfNode(string kind, string nm, int us) {
+        if (us <= phaseTopUs) { return; }
+        phaseTopUs = us;
+        phaseTopNode = kind + "#" + nm;
+    }
+
+    public void PhaseBegin() {
+        if (!App.PerfOn()) { return; }
+        phaseAtUs = Window.GetTickUs();
+    }
+
+    public void PhaseEnd(int slot) {
+        if (!App.PerfOn()) { return; }
+        int now = Window.GetTickUs();
+        int d = now - phaseAtUs;
+        phaseAtUs = now;
+        if (d < 0) { return; }
+        if (slot == 0) { phaseBgUs = phaseBgUs + d; }
+        else if (slot == 1) { phaseMeasUs = phaseMeasUs + d; }
+        else if (slot == 2) { phaseArrUs = phaseArrUs + d; }
+        else { phaseTreeUs = phaseTreeUs + d; }
+    }
+
+    public static string UsAvg(int us, int n) {
+        if (n <= 0) { n = 1; }
+        int tenths = us / n / 100;
+        return Convert.ToString(tenths / 10) + "."
+            + Convert.ToString(tenths % 10);
+    }
+
+    public static string MsAvg(int total, int n) {
+        if (n <= 0) { n = 1; }
+        int tenths = total * 10 / n;
+        return Convert.ToString(tenths / 10) + "."
+            + Convert.ToString(tenths % 10);
+    }
+
+    public bool ForceFullFrames() { return !partialFrames; }
+    public bool PartialFrames() { return partialFrames; }
+
+    public void SetPartialFrames(bool on) {
+        this.partialFrames = on;
+        if (!on) {
+            partialPending = false;
+            needsRedraw = true;
+        }
+    }
+
+    public bool PaintHashBegin() {
+        if (!paintHashOn) { return false; }
+        paintHashSaved = paintHashAcc;
+        paintHashAcc = 5381;
+        return true;
+    }
+
+    public void PaintHashEndSelf(int id, int x, int y, int w, int h) {
+        long cur = paintHashAcc;
+        paintHashAcc = paintHashSaved;
+        if (paintHashStore == null) {
+            paintHashStore = new Dictionary<int, long>();
+        }
+        long prev = 0;
+        bool had = paintHashStore.TryGetValue(id, out prev);
+        if (had && prev == cur) { return; }
+        if (had) { paintHashStore.Remove(id); }
+        paintHashStore.Add(id, cur);
+        if (!partialFrame || this.RectInDamage(x, y, w, h)) { return; }
+        this.NoteDamage(x, y, w, h);
+    }
+
+    public static void PaintHashOp(int op, int a, int b, int c, int d) {
+        if (!paintHashOn) { return; }
+        long h = paintHashAcc;
+        h = (h * 1099511628211) ^ op;
+        h = (h * 1099511628211) ^ a;
+        h = (h * 1099511628211) ^ b;
+        h = (h * 1099511628211) ^ c;
+        h = (h * 1099511628211) ^ d;
+        paintHashAcc = h;
+    }
+
+    public static void PaintHashText(int op, int a, int b, int c, int d, string text) {
+        if (!paintHashOn) { return; }
+        long h = paintHashAcc;
+        h = (h * 1099511628211) ^ op;
+        h = (h * 1099511628211) ^ a;
+        h = (h * 1099511628211) ^ b;
+        h = (h * 1099511628211) ^ c;
+        h = (h * 1099511628211) ^ d;
+        int n = text.Length;
+        h = (h * 1099511628211) ^ n;
+        for (int i = 0; i < n; i = i + 1) {
+            h = (h * 1099511628211) ^ text[i];
+        }
+        paintHashAcc = h;
+    }
+
+    public static void PaintHashList(List<int> xs) {
+        if (!paintHashOn) { return; }
+        long h = paintHashAcc;
+        int n = xs.Count;
+        h = (h * 1099511628211) ^ n;
+        for (int i = 0; i < n; i = i + 1) {
+            h = (h * 1099511628211) ^ xs[i];
+        }
+        paintHashAcc = h;
+    }
+
+    public static bool PaintHashArmed() {
+        return paintHashOn;
+    }
+
+    public int RenderBackendMode() { return renderBackendMode; }
+
+    public string RenderBackendName() { return Canvas.Backend(); }
+
+    public int SetRenderBackend(int mode) {
+        this.renderBackendMode = mode;
+        int got = Canvas.SetBackend(mode);
+        forceFullNext = true;
+        needsRedraw = true;
+        return got;
+    }
+
+    public static int FxSnapSlot() { return 384; }
+
+    public static string RasterLine(int frames) {
+        List<string> names = new List<string>{
+            "fill",
+            "blend",
+            "grad",
+            "round",
+            "radial",
+            "blur",
+            "blurhit",
+            "img",
+            "snap",
+            "restore",
+            "glyph",
+            "bsimd",
+            "bscalar" };
+        string line = "";
+        for (int i = 0; i < names.Count; i = i + 1) {
+            int calls = Canvas.RasterStat(i, 0);
+            int kpx = Canvas.RasterStat(i, 1);
+            if (calls > 0 || kpx > 0) {
+                line = line + names[i] + "=" + Convert.ToString(calls / frames)
+                    + "/" + Convert.ToString(kpx / frames) + "kpx ";
+            }
+        }
+        int styleN = Style.StatRead(0);
+        int styleHit = Style.StatRead(1);
+        line = line + "style=" + Convert.ToString(styleN / frames) + "/"
+            + Convert.ToString((styleN - styleHit) / frames) + "miss ";
+        for (int rank = 0; rank < 6; rank = rank + 1) {
+            int kpx = Canvas.RasterTopBlend(rank, 0);
+            int bx = Canvas.RasterTopBlend(rank, 1);
+            int by = Canvas.RasterTopBlend(rank, 2);
+            int bw = Canvas.RasterTopBlend(rank, 3);
+            int ba = Canvas.RasterTopBlend(rank, 5);
+            int bh = Canvas.RasterTopBlend(rank, 4);
+            if (kpx > 0) {
+                line = line + "top" + Convert.ToString(rank) + "="
+                    + Convert.ToString(kpx) + "kpx@" + Convert.ToString(bx)
+                    + "," + Convert.ToString(by) + "+" + Convert.ToString(bw)
+                    + "x" + Convert.ToString(bh) + "a" + Convert.ToString(ba)
+                    + " ";
+            }
+        }
+        for (int rank = 0; rank < 6; rank = rank + 1) {
+            int kpx = Canvas.RasterTopFill(rank, 0);
+            int fx = Canvas.RasterTopFill(rank, 1);
+            int fy = Canvas.RasterTopFill(rank, 2);
+            int fw = Canvas.RasterTopFill(rank, 3);
+            int fh = Canvas.RasterTopFill(rank, 4);
+            if (kpx > 0) {
+                line = line + "op" + Convert.ToString(rank) + "="
+                    + Convert.ToString(kpx) + "kpx@" + Convert.ToString(fx)
+                    + "," + Convert.ToString(fy) + "+" + Convert.ToString(fw)
+                    + "x" + Convert.ToString(fh) + " ";
+            }
+        }
+        return line;
+    }
+
+    void RecordFramePerf(int perfBeginMs, int perfPreMs, int endMs, bool partialFrame) {
+        int wholeMs = endMs - perfBeginMs;
+        if (wholeMs > perfWorstMs) { perfWorstMs = wholeMs; }
+        if (wholeMs > 16) { perfSlowFrames = perfSlowFrames + 1; }
+        int styleNow = Style.StatPeek(0);
+        int styleMissNow = styleNow - Style.StatPeek(1);
+        int spikePart = 0;
+        if (partialFrame) { spikePart = 1; }
+        int pxFill = Canvas.RasterStat(0, 2);
+        int pxBlend = Canvas.RasterStat(1, 2);
+        int pxBlur = Canvas.RasterStat(5, 2);
+        int pxGlyph = Canvas.RasterStat(10, 2);
+        int pxSnap = Canvas.RasterStat(8, 2);
+        if (frameCount == 0) {
+            int pxRound = Canvas.RasterStat(3, 2);
+            int pxGrad = Canvas.RasterStat(2, 2);
+            int pxRestore = Canvas.RasterStat(9, 2);
+            File.AppendAllText("zan_frame_perf.log",
+                "firstframe whole_ms=" + Convert.ToString(wholeMs)
+                + " render_ms=" + Convert.ToString(perfPreMs - perfBeginMs)
+                + " present_ms=" + Convert.ToString(endMs - perfPreMs)
+                + " bg_ms=" + App.UsAvg(phaseBgUs, 1)
+                + " measure_ms=" + App.UsAvg(phaseMeasUs, 1)
+                + " arrange_ms=" + App.UsAvg(phaseArrUs, 1)
+                + " tree_ms=" + App.UsAvg(phaseTreeUs, 1)
+                + " fill=" + Convert.ToString(pxFill) + "kpx"
+                + " blend=" + Convert.ToString(pxBlend) + "kpx"
+                + " round=" + Convert.ToString(pxRound) + "kpx"
+                + " grad=" + Convert.ToString(pxGrad) + "kpx"
+                + " restore=" + Convert.ToString(pxRestore) + "kpx"
+                + " blur=" + Convert.ToString(pxBlur) + "kpx"
+                + " glyph=" + Convert.ToString(pxGlyph) + "kpx"
+                + " snap=" + Convert.ToString(pxSnap) + "kpx"
+                + " style=" + Convert.ToString(styleNow)
+                + "/" + Convert.ToString(styleMissNow) + "miss"
+                + " text_draw_n=" + Convert.ToString(Canvas.TextStat(0))
+                + " text_measure_n=" + Convert.ToString(Canvas.TextStat(1))
+                + " text_height_n=" + Convert.ToString(Canvas.TextStat(2))
+                + " text_font_create_n=" + Convert.ToString(Canvas.TextStat(3))
+                + " text_font_hit_n=" + Convert.ToString(Canvas.TextStat(4))
+                + " text_draw_hit_n=" + Convert.ToString(Canvas.TextStat(5))
+                + " text_draw_miss_n=" + Convert.ToString(Canvas.TextStat(6))
+                + " text_measure_hit_n=" + Convert.ToString(Canvas.TextStat(7))
+                + " text_measure_miss_n=" + Convert.ToString(Canvas.TextStat(8))
+                + " text_draw_us=" + Convert.ToString(Canvas.TextStat(9))
+                + " text_measure_us=" + Convert.ToString(Canvas.TextStat(10))
+                + " text_height_us=" + Convert.ToString(Canvas.TextStat(11))
+                + "\n");
+        }
+        if (wholeMs > 16) {
+            File.AppendAllText("zan_frame_perf.log",
+                "spike whole_ms=" + Convert.ToString(wholeMs)
+                + " render_ms=" + Convert.ToString(perfPreMs - perfBeginMs)
+                + " present_ms=" + Convert.ToString(endMs - perfPreMs)
+                + " partial=" + Convert.ToString(spikePart)
+                + " style=" + Convert.ToString(styleNow - perfStyleAt)
+                + "/" + Convert.ToString(styleMissNow - perfStyleMissAt)
+                + "miss fill=" + Convert.ToString(pxFill - perfPxFillAt)
+                + "kpx blend=" + Convert.ToString(pxBlend - perfPxBlendAt)
+                + "kpx blur=" + Convert.ToString(pxBlur - perfPxBlurAt)
+                + "kpx glyph=" + Convert.ToString(pxGlyph - perfPxGlyphAt)
+                + " snap=" + Convert.ToString(pxSnap - perfPxSnapAt)
+                + "kpx bg=" + App.UsAvg(phaseBgUs, 1)
+                + " measure=" + App.UsAvg(phaseMeasUs, 1)
+                + " arrange=" + App.UsAvg(phaseArrUs, 1)
+                + " tree=" + App.UsAvg(phaseTreeUs, 1)
+                + " top=" + phaseTopNode
+                + " top_ms=" + App.UsAvg(phaseTopUs, 1)
+                + " scope=" + phaseSecTop
+                + " scope_ms=" + App.UsAvg(phaseSecTopUs, 1)
+                + " mark=" + phaseMarkTop
+                + " mark_ms=" + App.UsAvg(phaseMarkTopUs, 1)
+                + " redraw=" + Convert.ToString(frameWhyN)
+                + "/" + frameWhy
+                + " frame=" + Convert.ToString(frameCount) + "\n");
+        }
+        phaseTopNode = "";
+        phaseTopUs = 0;
+        phaseSecTop = "";
+        phaseSecTopUs = 0;
+        scopeEndUs = 0;
+        phaseMarkTop = "";
+        phaseMarkTopUs = 0;
+        markAtUs = 0;
+        markNow = "";
+        perfBgUs = perfBgUs + phaseBgUs;
+        perfMeasUs = perfMeasUs + phaseMeasUs;
+        perfArrUs = perfArrUs + phaseArrUs;
+        perfTreeUs = perfTreeUs + phaseTreeUs;
+        phaseBgUs = 0;
+        phaseMeasUs = 0;
+        phaseArrUs = 0;
+        phaseTreeUs = 0;
+        perfPxFillAt = pxFill;
+        perfPxBlendAt = pxBlend;
+        perfPxBlurAt = pxBlur;
+        perfPxGlyphAt = pxGlyph;
+        perfPxSnapAt = pxSnap;
+        perfStyleAt = styleNow;
+        perfStyleMissAt = styleMissNow;
+        if (partialFrame) {
+            perfPartFrames = perfPartFrames + 1;
+            perfPartRenderMs = perfPartRenderMs + (perfPreMs - perfBeginMs);
+            perfPartPresentMs = perfPartPresentMs + (endMs - perfPreMs);
+        } else {
+            perfRenderMs = perfRenderMs + (perfPreMs - perfBeginMs);
+            perfPresentMs = perfPresentMs + (endMs - perfPreMs);
+            this.NoteFullFrameWhy();
+        }
+        frameWhy = "";
+        perfFrames = perfFrames + 1;
+        if (perfFrames >= 30) {
+            int fullN = perfFrames - perfPartFrames;
+            if (fullN <= 0) { fullN = 1; }
+            int partN = perfPartFrames;
+            if (partN <= 0) { partN = 1; }
+            File.AppendAllText("zan_frame_perf.log",
+                "frames=" + Convert.ToString(perfFrames)
+                + " full=" + Convert.ToString(perfFrames - perfPartFrames)
+                + " render_ms=" + App.MsAvg(perfRenderMs, fullN)
+                + " present_ms=" + App.MsAvg(perfPresentMs, fullN)
+                + " partial=" + Convert.ToString(perfPartFrames)
+                + " part_render_ms=" + App.MsAvg(perfPartRenderMs, partN)
+                + " part_present_ms=" + App.MsAvg(perfPartPresentMs, partN)
+                + " bg_ms=" + App.UsAvg(perfBgUs, perfFrames)
+                + " meas_ms=" + App.UsAvg(perfMeasUs, perfFrames)
+                + " arr_ms=" + App.UsAvg(perfArrUs, perfFrames)
+                + " tree_ms=" + App.UsAvg(perfTreeUs, perfFrames)
+                + " slow=" + Convert.ToString(perfSlowFrames)
+                + " worst_ms=" + Convert.ToString(perfWorstMs)
+                + " " + App.RasterLine(perfFrames)
+                + "whytop=" + this.FullFrameWhyTop(3)
+                + "\n");
+            perfFrames = 0;
+            perfRenderMs = 0;
+            perfPresentMs = 0;
+            perfPartFrames = 0;
+            perfPartRenderMs = 0;
+            perfPartPresentMs = 0;
+            perfSlowFrames = 0;
+            perfWorstMs = 0;
+            perfBgUs = 0;
+            perfMeasUs = 0;
+            perfArrUs = 0;
+            perfTreeUs = 0;
+        }
+    }
+}

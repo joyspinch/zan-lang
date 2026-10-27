@@ -2,7 +2,57 @@ using System;
 using System.Data;
 namespace System.Data.Orm;
 
+public delegate IZanSql ZanSqlProvider();
+public delegate void TransactionAction();
+
 public class ZanSql : IZanSql {
+    public static IZanSql DefaultInstance;
+    public static ZanSqlProvider CurrentProvider;
+
+    // 核心环境门面：优先取动态上下文解析器，其次回退到全局默认连接池门面
+    public static IZanSql Current {
+        get {
+            if (CurrentProvider != null) {
+                IZanSql s = CurrentProvider();
+                if (s != null) { return s; }
+            }
+            return DefaultInstance;
+        }
+        set {
+            DefaultInstance = value;
+        }
+    }
+
+    public static void SetDefault(IZanSql orm) {
+        DefaultInstance = orm;
+    }
+
+    public static void SetProvider(ZanSqlProvider provider) {
+        CurrentProvider = provider;
+    }
+
+    // 自动事务闭包：内部自动创建 UnitOfWork 并在当前上下文中隔离执行
+    public static void Transaction(TransactionAction action) {
+        IZanSql currentOrm = ZanSql.Current;
+        if (currentOrm == null) {
+            throw new Exception("ZanSql.Transaction: no active database connection or pool in current context");
+        }
+        IUnitOfWork uow = currentOrm.CreateUnitOfWork();
+        IZanSql previous = DefaultInstance;
+        IZanSql uowOrm = ZanSql.FromConnection(uow.GetConnection());
+        try {
+            DefaultInstance = uowOrm;
+            action();
+            uow.Commit();
+        } catch (Exception ex) {
+            uow.Rollback();
+            throw ex;
+        } finally {
+            DefaultInstance = previous;
+            uow.Dispose();
+        }
+    }
+
     public IDbConnection conn;
     public DbPool pool;
     public AopProvider aop;

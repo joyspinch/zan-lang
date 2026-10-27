@@ -130,10 +130,13 @@ public class CrudScreenController : AdminController {
         long total = await this.CountRows(conf, conds);
         ListQuery q = this.PagedAny();
         List<StrMap> rows = await this.LoadRows(conf, conds, q);
-        JsonValue data = JsonValue.NewObject();
-        data.Put("total", JsonValue.NewInt((int)total));
-        data.Put("data", JsonRows(rows, this.rowKeys));
-        Env(this, data);
+        JsonWriter w = new JsonWriter();
+        w.StartObject();
+        w.WriteProperty("total", (int)total);
+        w.WriteKey("data");
+        WriteRows(w, rows, this.rowKeys);
+        w.EndObject();
+        Env(this, w.ToString());
     }
 
     /* 行数据（adminUI 契约 POST /edit）：编辑表单回显取数，信封
@@ -149,14 +152,16 @@ public class CrudScreenController : AdminController {
         this.LoadKeys(conf, r);
         /* 行对象就地构建（与 DoFormConf 同形）：列名 + 声明的虚拟列，
            虚拟列取空串（编辑回显不投影计数列）。 */
-        JsonValue row = JsonValue.NewObject();
+        JsonWriter w = new JsonWriter();
+        w.StartObject();
         for (int j = 0; j < this.rowKeys.Count; j = j + 1) {
             int col = r.GetColumnIndex(this.rowKeys[j]);
             string v = "";
             if (col >= 0 && !r.IsNull(0, col)) { v = r.GetString(0, col); }
-            row.Put(this.rowKeys[j], JsonValue.NewStr(v));
+            w.WriteProperty(this.rowKeys[j], v);
         }
-        Env(this, row);
+        w.EndObject();
+        Env(this, w.ToString());
     }
 
     /* 表单 schema（adminUI 契约 PUT {api}/formconf）：字段表投影为
@@ -165,36 +170,41 @@ public class CrudScreenController : AdminController {
        pass→password、opts→select；校验规则同源导出。 */
     public virtual void DoFormConf() {
         CrudConf conf = this.Def();
-        JsonValue data = JsonValue.NewObject();
-        data.Put("title", JsonValue.NewStr(conf.Title()));
-        data.Put("width", JsonValue.NewStr("600px"));
-        data.Put("labelWidth", JsonValue.NewInt(100));
-        data.Put("size", JsonValue.NewStr("medium"));
-        data.Put("cols", JsonValue.NewInt(24));
-        JsonValue items = JsonValue.NewArray();
+        JsonWriter w = new JsonWriter();
+        w.StartObject();
+        w.WriteProperty("title", conf.Title());
+        w.WriteProperty("width", "600px");
+        w.WriteProperty("labelWidth", 100);
+        w.WriteProperty("size", "medium");
+        w.WriteProperty("cols", 24);
+        w.WriteKey("formItems");
+        w.StartArray();
         for (int i = 0; i < conf.forms.Count; i = i + 1) {
             FormField f = conf.forms[i];
-            JsonValue it = JsonValue.NewObject();
-            it.Put("field", JsonValue.NewStr(f.name));
-            it.Put("label", JsonValue.NewStr(f.label));
+            w.StartObject();
+            w.WriteProperty("field", f.name);
+            w.WriteProperty("label", f.label);
             string comp = "input";
             if (f.kind == "int") { comp = "input-number"; }
             else if (f.kind == "area") { comp = "textarea"; }
             else if (f.kind == "pass") { comp = "password"; }
             else if (f.kind == "select") { comp = "select"; }
-            it.Put("component", JsonValue.NewStr(comp));
-            it.Put("span", JsonValue.NewInt(f.span ? 24 : 12));
-            it.Put("required", JsonValue.NewBool(f.required));
-            if (f.ph.Length > 0) { it.Put("placeholder", JsonValue.NewStr(f.ph)); }
-            if (f.value.Length > 0) { it.Put("defaultValue", JsonValue.NewStr(f.value)); }
+            w.WriteProperty("component", comp);
+            w.WriteProperty("span", f.span ? 24 : 12);
+            w.WriteProperty("required", f.required);
+            if (f.ph.Length > 0) { w.WriteProperty("placeholder", f.ph); }
+            if (f.value.Length > 0) { w.WriteProperty("defaultValue", f.value); }
             if (f.kind == "select") {
-                it.Put("options", SelectOptsJson(f.options));
+                w.WriteKey("options");
+                WriteSelectOpts(w, f.options);
             }
-            it.Put("rules", RulesJson(f));
-            items.Append(it);
+            w.WriteKey("rules");
+            WriteRules(w, f);
+            w.EndObject();
         }
-        data.Put("formItems", items);
-        Env(this, data);
+        w.EndArray();
+        w.EndObject();
+        Env(this, w.ToString());
     }
 
     /* 通用屏共享一份视图（views/Admin/CrudScreenController.Index.html，键即基座自身的约定视图键）：screenHtml 整段由
@@ -444,30 +454,34 @@ public class CrudScreenController : AdminController {
         if (idv.Length > 0) {
             DbResult r = await t.Query().WhereEq("id", Filter.ToLong(idv, 0))
                 .Limit(1).ToResultAsync();
-            JsonValue one = JsonValue.NewObject();
+            JsonWriter w = new JsonWriter();
+            w.StartObject();
             if (r != null && r.RowCount() > 0 && await this.RowAllowed(conf, r)) {
-                one.Set("id", JsonValue.NewInt(Filter.ToInt(idv, 0)));
-                one.Set("label", JsonValue.NewStr(r.GetString(0, r.GetColumnIndex(conf.labelCol))));
+                w.WriteProperty("id", Filter.ToInt(idv, 0));
+                w.WriteProperty("label", r.GetString(0, r.GetColumnIndex(conf.labelCol)));
             }
-            this.Ctx().Api(Codes.Ok, "ok", one.ToJson());
+            w.EndObject();
+            this.Ctx().Api(Codes.Ok, "ok", w.ToString());
             return;
         }
         DbTableQuery q = t.Query();
         q = await this.Scoped(q, conf);
         if (kw.Length > 0) { q = q.WhereContains(conf.labelCol, kw); }
         DbResult rows = await q.OrderBy(conf.orderCol).Limit(20).ToResultAsync();
-        JsonValue arr = JsonValue.NewArray();
+        JsonWriter wArr = new JsonWriter();
+        wArr.StartArray();
         if (rows != null) {
             int idc = rows.GetColumnIndex("id");
             int lbc = rows.GetColumnIndex(conf.labelCol);
             for (int i = 0; i < rows.RowCount(); i = i + 1) {
-                JsonValue o = JsonValue.NewObject();
-                o.Set("id", JsonValue.NewInt(rows.GetInt(i, idc)));
-                o.Set("label", JsonValue.NewStr(rows.GetString(i, lbc)));
-                arr.Append(o);
+                wArr.StartObject();
+                wArr.WriteProperty("id", rows.GetInt(i, idc));
+                wArr.WriteProperty("label", rows.GetString(i, lbc));
+                wArr.EndObject();
             }
         }
-        this.Ctx().Api(Codes.Ok, "ok", arr.ToJson());
+        wArr.EndArray();
+        this.Ctx().Api(Codes.Ok, "ok", wArr.ToString());
     }
 
     /* ---- 钩子（子类按需覆写） ------------------------------------ */
@@ -621,34 +635,38 @@ public class CrudScreenController : AdminController {
     }
 
     /* adminUI 统一信封（与 CrudOps.Conf 同形）：resp_code "0000" 为成功。 */
-    private static void Env(AdminController c, JsonValue data) {
-        JsonValue body = JsonValue.NewObject();
-        body.Put("resp_code", JsonValue.NewStr("0000"));
-        body.Put("status", JsonValue.NewInt(200));
-        body.Put("msg", JsonValue.NewStr("ok"));
-        body.Put("url", JsonValue.NewStr(""));
-        body.Put("dynamicToken", JsonValue.NewStr(""));
-        body.Put("t", JsonValue.NewInt(0));
-        body.Put("data", data);
-        c.Json(body.ToJson());
+    private static void Env(AdminController c, string dataJson) {
+        JsonWriter w = new JsonWriter();
+        w.StartObject();
+        w.WriteProperty("resp_code", "0000");
+        w.WriteProperty("status", 200);
+        w.WriteProperty("msg", "ok");
+        w.WriteProperty("url", "");
+        w.WriteProperty("dynamicToken", "");
+        w.WriteProperty("t", 0);
+        if (dataJson.Length > 0) {
+            w.WriteRawProperty("data", dataJson);
+        }
+        w.EndObject();
+        c.Json(w.ToString());
     }
 
     /* 行 → JSON 数组：按显式键集序列化，值全部文本（NULL 一律空串）。 */
-    private static JsonValue JsonRows(List<StrMap> rows, List<string> keys) {
-        JsonValue arr = JsonValue.NewArray();
+    private static void WriteRows(JsonWriter w, List<StrMap> rows, List<string> keys) {
+        w.StartArray();
         for (int i = 0; i < rows.Count; i = i + 1) {
-            JsonValue o = JsonValue.NewObject();
+            w.StartObject();
             for (int j = 0; j < keys.Count; j = j + 1) {
-                o.Put(keys[j], JsonValue.NewStr(rows[i].Get(keys[j])));
+                w.WriteProperty(keys[j], rows[i].Get(keys[j]));
             }
-            arr.Append(o);
+            w.EndObject();
         }
-        return arr;
+        w.EndArray();
     }
 
     /* "1=显示,0=隐藏" → [{value,label}]（下拉选项 JSON）。 */
-    private static JsonValue SelectOptsJson(string opts) {
-        JsonValue arr = JsonValue.NewArray();
+    private static void WriteSelectOpts(JsonWriter w, string opts) {
+        w.StartArray();
         string rest = opts;
         while (rest.Length > 0) {
             string pair = rest;
@@ -657,43 +675,43 @@ public class CrudScreenController : AdminController {
             else { rest = ""; }
             int eq = pair.IndexOf("=");
             if (eq <= 0) { continue; }
-            JsonValue o = JsonValue.NewObject();
-            o.Put("value", JsonValue.NewStr(pair.Substring(0, eq)));
-            o.Put("label", JsonValue.NewStr(pair.Substring(eq + 1)));
-            arr.Append(o);
+            w.StartObject();
+            w.WriteProperty("value", pair.Substring(0, eq));
+            w.WriteProperty("label", pair.Substring(eq + 1));
+            w.EndObject();
         }
-        return arr;
+        w.EndArray();
     }
 
     /* FormField → 校验规则 JSON（adminUI FormRule 形状，与 FormPage.
        Validate 同一规则集：required/min/max/pattern）。 */
-    private static JsonValue RulesJson(FormField f) {
-        JsonValue rules = JsonValue.NewArray();
+    private static void WriteRules(JsonWriter w, FormField f) {
+        w.StartArray();
         if (f.required) {
-            JsonValue r = JsonValue.NewObject();
-            r.Put("required", JsonValue.NewBool(true));
-            r.Put("message", JsonValue.NewStr(Lang.T(f.label) + Lang.T("不能为空")));
-            rules.Append(r);
+            w.StartObject();
+            w.WriteProperty("required", true);
+            w.WriteProperty("message", Lang.T(f.label) + Lang.T("不能为空"));
+            w.EndObject();
         }
         if (f.min > 0) {
-            JsonValue r = JsonValue.NewObject();
-            r.Put("min", JsonValue.NewInt(f.min));
-            r.Put("message", JsonValue.NewStr(Lang.T(f.label) + Lang.T("长度不足")));
-            rules.Append(r);
+            w.StartObject();
+            w.WriteProperty("min", f.min);
+            w.WriteProperty("message", Lang.T(f.label) + Lang.T("长度不足"));
+            w.EndObject();
         }
         if (f.max > 0) {
-            JsonValue r = JsonValue.NewObject();
-            r.Put("max", JsonValue.NewInt(f.max));
-            r.Put("message", JsonValue.NewStr(Lang.T(f.label) + Lang.T("超出长度")));
-            rules.Append(r);
+            w.StartObject();
+            w.WriteProperty("max", f.max);
+            w.WriteProperty("message", Lang.T(f.label) + Lang.T("超出长度"));
+            w.EndObject();
         }
         if (f.pattern.Length > 0) {
-            JsonValue r = JsonValue.NewObject();
-            r.Put("pattern", JsonValue.NewStr(f.pattern));
-            r.Put("message", JsonValue.NewStr(Lang.T(f.label) + Lang.T("格式不正确")));
-            rules.Append(r);
+            w.StartObject();
+            w.WriteProperty("pattern", f.pattern);
+            w.WriteProperty("message", Lang.T(f.label) + Lang.T("格式不正确"));
+            w.EndObject();
         }
-        return rules;
+        w.EndArray();
     }
 
     /* 审计目标：Label() 列的提交值优先（人可读），否则 #id。 */

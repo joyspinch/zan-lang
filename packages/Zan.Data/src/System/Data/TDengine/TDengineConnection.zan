@@ -142,7 +142,7 @@ public class TDengineConnection : IDbConnection {
     public bool Ping() {
         string body = Post("SELECT SERVER_VERSION()");
         if (body.Length == 0) { return false; }
-        JsonValue root = JsonValue.ParseLenient(body);
+        JsonDoc root = JsonDoc.Parse(body);
         return !Failed(root);
     }
 
@@ -150,7 +150,7 @@ public class TDengineConnection : IDbConnection {
     public async bool PingAsync() {
         string body = await PostAsync("SELECT SERVER_VERSION()");
         if (body.Length == 0) { return false; }
-        JsonValue root = JsonValue.ParseLenient(body);
+        JsonDoc root = JsonDoc.Parse(body);
         return !Failed(root);
     }
 
@@ -438,16 +438,18 @@ public class TDengineConnection : IDbConnection {
     // 错误描述保存在 lastError 中，错误码保存在 lastCode 中。
     // 3.x 的（`code` != 0）和 2.x 的（`status` == "error"）
     // 都会被识别。
-    bool Failed(JsonValue root) {
-        if (!root.IsObject()) {
+    bool Failed(JsonDoc doc) {
+        if (doc == null || doc.KindAt(doc.root) != 5) {
             this.lastError = "malformed response from taosAdapter";
             this.lastCode = 0;
             return true;
         }
-        bool bad = root.Int("code", 0) != 0 || root.Str("status", "succ") == "error";
+        int code = (int)doc.PathLong("code", 0);
+        string status = doc.PathStr("status", "succ");
+        bool bad = code != 0 || status == "error";
         if (bad) {
-            this.lastError = root.Str("desc", root.Str("status", "unknown error"));
-            this.lastCode = root.Int("code", 0);
+            this.lastError = doc.PathStr("desc", doc.PathStr("status", "unknown error"));
+            this.lastCode = code;
         }
         return bad;
     }
@@ -472,25 +474,31 @@ public class TDengineConnection : IDbConnection {
             if (this.lastError.Length == 0) { this.lastError = "empty response"; }
             return result;
         }
-        JsonValue root = JsonValue.ParseLenient(body);
+        JsonDoc root = JsonDoc.Parse(body);
         if (Failed(root)) { return result; }
 
         List<string> names = new List<string>();
-        JsonValue meta = root.Get("column_meta");
-        if (meta != null && meta.IsArray()) {
-            for (int i = 0; i < meta.Count(); i = i + 1) {
-                JsonValue col = meta.At(i);
-                if (col.IsArray() && col.Count() > 0) {
-                    names.Add(col.At(0).AsString(""));
+        int meta = root.Get("column_meta");
+        if (meta >= 0 && root.KindAt(meta) == 4) {
+            int mCount = root.Count(meta);
+            int col = root.FirstChild(meta);
+            for (int i = 0; i < mCount && col >= 0; i = i + 1) {
+                if (root.KindAt(col) == 4 && root.Count(col) > 0) {
+                    int c0 = root.FirstChild(col);
+                    names.Add(root.StrAt(c0, ""));
                 } else {
-                    names.Add(col.AsString(""));
+                    names.Add(root.StrAt(col, ""));
                 }
+                col = root.NextSibling(col);
             }
         } else {
-            JsonValue head = root.Get("head");
-            if (head != null && head.IsArray()) {
-                for (int i = 0; i < head.Count(); i = i + 1) {
-                    names.Add(head.At(i).AsString(""));
+            int head = root.Get("head");
+            if (head >= 0 && root.KindAt(head) == 4) {
+                int hCount = root.Count(head);
+                int hcol = root.FirstChild(head);
+                for (int i = 0; i < hCount && hcol >= 0; i = i + 1) {
+                    names.Add(root.StrAt(hcol, ""));
+                    hcol = root.NextSibling(hcol);
                 }
             }
         }
@@ -499,30 +507,38 @@ public class TDengineConnection : IDbConnection {
             result.AddColumnName(names[n]);
         }
 
-        JsonValue data = root.Get("data");
-        if (data != null && data.IsArray()) {
-            for (int r = 0; r < data.Count(); r = r + 1) {
-                JsonValue jrow = data.At(r);
+        int data = root.Get("data");
+        if (data >= 0 && root.KindAt(data) == 4) {
+            int rowCount = root.Count(data);
+            int jrow = root.FirstChild(data);
+            for (int r = 0; r < rowCount && jrow >= 0; r = r + 1) {
                 List<string> row = new List<string>();
                 List<bool> nulls = null;
-                for (int c = 0; c < jrow.Count(); c = c + 1) {
-                    JsonValue cell = jrow.At(c);
-                    row.Add(cell.AsString(""));
-                    if (cell.IsNull()) {
+                int colCount = root.Count(jrow);
+                int cell = root.FirstChild(jrow);
+                for (int c = 0; c < colCount && cell >= 0; c = c + 1) {
+                    bool isNull = root.KindAt(cell) == 0;
+                    if (isNull) {
+                        row.Add("");
                         if (nulls == null) {
                             nulls = new List<bool>();
                             for (int k = 0; k < c; k = k + 1) { nulls.Add(false); }
                         }
                         nulls.Add(true);
-                    } else if (nulls != null) {
-                        nulls.Add(false);
+                    } else {
+                        row.Add(root.StrAt(cell, ""));
+                        if (nulls != null) {
+                            nulls.Add(false);
+                        }
                     }
+                    cell = root.NextSibling(cell);
                 }
                 if (nulls != null) {
                     result.AddRowNulls(row, nulls);
                 } else {
                     result.AddRow(row);
                 }
+                jrow = root.NextSibling(jrow);
             }
         }
 
@@ -531,7 +547,7 @@ public class TDengineConnection : IDbConnection {
         if (names.Count == 1 && names[0] == "affected_rows" && result.RowCount() == 1) {
             this.affected = result.GetInt(0, 0);
         } else {
-            this.affected = root.Int("rows", result.RowCount());
+            this.affected = (int)root.PathLong("rows", (long)result.RowCount());
         }
         return result;
     }

@@ -1,0 +1,292 @@
+using System;
+using System.Collections.Generic;
+using Gui.Backend;
+
+namespace Gui;
+
+public partial class App {
+    List<AnimSlot> anims;
+    bool freezeAnimClock;
+    int animNextMs;
+    bool animRectValid;
+    bool animRectAll;
+    int animRX;
+    int animRY;
+    int animRW;
+    int animRH;
+    bool animPrevValid;
+    int animPX;
+    int animPY;
+    int animPW;
+    int animPH;
+
+    void InitAnimation() {
+        this.anims = new List<AnimSlot>();
+        this.freezeAnimClock = false;
+        this.animNextMs = -1;
+        this.animRectValid = false;
+        this.animRectAll = false;
+        this.animRX = 0;
+        this.animRY = 0;
+        this.animRW = 0;
+        this.animRH = 0;
+        this.animPrevValid = false;
+        this.animPX = 0;
+        this.animPY = 0;
+        this.animPW = 0;
+        this.animPH = 0;
+        this.displayAnimationPending = false;
+    }
+
+    public void RequestAnimationFrame() {
+        this.RequestAnimationFrame(this.DisplayFrameDelay());
+    }
+
+    public void RequestAnimationFrameIn(int x, int y, int w, int h) {
+        this.RequestAnimationFrameIn(this.DisplayFrameDelay(), x, y, w, h);
+    }
+
+    public void RequestAnimationFrame(int minIntervalMs) {
+        int due = Window.GetTickMs() + minIntervalMs;
+        if (animNextMs < 0 || due < animNextMs) { animNextMs = due; }
+        animRectAll = true;
+    }
+
+    void RequestAnimationFrameIn(int minIntervalMs, int x, int y, int w, int h) {
+        int due = Window.GetTickMs() + minIntervalMs;
+        if (animNextMs < 0 || due < animNextMs) { animNextMs = due; }
+        if (w <= 0 || h <= 0) { animRectAll = true; return; }
+        int pad = this.Scale(6);
+        int x0 = x - pad;
+        int y0 = y - pad;
+        int x1 = x + w + pad;
+        int y1 = y + h + pad;
+        if (x1 <= 0 || y1 <= 0 || x0 >= canvas.Width() || y0 >= canvas.Height()) {
+            x0 = 0;
+            y0 = 0;
+            x1 = 1;
+            y1 = 1;
+        }
+        if (animRectValid) {
+            if (animRX < x0) { x0 = animRX; }
+            if (animRY < y0) { y0 = animRY; }
+            if (animRX + animRW > x1) { x1 = animRX + animRW; }
+            if (animRY + animRH > y1) { y1 = animRY + animRH; }
+        }
+        if (x0 < 0) { x0 = 0; }
+        if (y0 < 0) { y0 = 0; }
+        if (x1 > canvas.Width()) { x1 = canvas.Width(); }
+        if (y1 > canvas.Height()) { y1 = canvas.Height(); }
+        if (x1 - x0 <= 0 || y1 - y0 <= 0) { animRectAll = true; return; }
+        animRX = x0;
+        animRY = y0;
+        animRW = x1 - x0;
+        animRH = y1 - y0;
+        animRectValid = true;
+    }
+
+    int AnimIndex(int key) {
+        for (int i = 0; i < anims.Count; i = i + 1) {
+            if (anims[i].key == key) { return i; }
+        }
+        return -1;
+    }
+
+    void AnimAdd(int key, int val, int target, int durMs) {
+        anims.Add(new AnimSlot(key, val, target, val, nowMs, durMs));
+    }
+
+    int StateGet(int key, int dflt) {
+        int idx = AnimIndex(key);
+        if (idx < 0) { return dflt; }
+        return anims[idx].cur;
+    }
+
+    void StateSet(int key, int val) {
+        int idx = AnimIndex(key);
+        if (idx < 0) { AnimAdd(key, val, val, 1); return; }
+        AnimSlot a = anims[idx];
+        a.cur = val;
+        a.dst = val;
+        a.src = val;
+    }
+
+    int AnimToValue(int key, int target, int durMs) {
+        int idx = AnimIndex(key);
+        if (idx < 0) {
+            AnimAdd(key, target, target, durMs);
+            return target;
+        }
+        AnimSlot a = anims[idx];
+        if (a.dst != target) {
+            a.src = a.cur;
+            a.dst = target;
+            a.startMs = nowMs;
+            a.dur = durMs;
+        }
+        int from = a.src;
+        int tgt = a.dst;
+        if (from == tgt) { a.cur = tgt; return tgt; }
+        int dur = a.dur;
+        if (dur < 1) { dur = 1; }
+        int elapsed = nowMs - a.startMs;
+        if (elapsed < 0) { elapsed = 0; }
+        int p = elapsed * 1000 / dur;
+        if (p > 1000) { p = 1000; }
+        int e = App.Ease(p);
+        int val = from + (tgt - from) * e / 1000;
+        a.cur = val;
+        if (p >= 1000) { a.cur = tgt; }
+        return a.cur;
+    }
+
+    bool AnimActive(int key) {
+        int idx = AnimIndex(key);
+        if (idx < 0) { return false; }
+        return anims[idx].cur != anims[idx].dst;
+    }
+
+    void AnimRestart(int key, int durMs) {
+        int idx = AnimIndex(key);
+        if (durMs < 1) { durMs = 1; }
+        if (idx < 0) {
+            this.anims.Add(new AnimSlot(key, 0, 1000, 0, this.nowMs, durMs));
+            return;
+        }
+        AnimSlot a = this.anims[idx];
+        a.src = 0;
+        a.cur = 0;
+        a.dst = 1000;
+        a.startMs = this.nowMs;
+        a.dur = durMs;
+    }
+
+    public int AnimTo(int key, int target, int durMs) {
+        int value = this.AnimToValue(key, target, durMs);
+        if (this.AnimActive(key)) {
+            this.NoteRedrawWhy("anim");
+            needsRedraw = true;
+        }
+        return value;
+    }
+
+    public int AnimToIn(int key, int target, int durMs,
+                 int x, int y, int w, int h) {
+        int value = this.AnimToValue(key, target, durMs);
+        if (this.AnimActive(key)) {
+            this.RequestAnimationFrameIn(0, x, y, w, h);
+        }
+        return value;
+    }
+
+    public int AnimIntroValue(int key, int durMs) {
+        int idx = AnimIndex(key);
+        if (idx < 0) {
+            anims.Add(new AnimSlot(key, 0, 1000, 0, nowMs, durMs));
+            return 0;
+        }
+        AnimSlot a = anims[idx];
+        int from = a.src;
+        int tgt = a.dst;
+        if (from == tgt) { a.cur = tgt; return tgt; }
+        int dur = a.dur;
+        if (dur < 1) { dur = 1; }
+        int elapsed = nowMs - a.startMs;
+        if (elapsed < 0) { elapsed = 0; }
+        int p = elapsed * 1000 / dur;
+        if (p > 1000) { p = 1000; }
+        int e = App.Ease(p);
+        int val = from + (tgt - from) * e / 1000;
+        a.cur = val;
+        if (p >= 1000) { a.cur = tgt; }
+        return a.cur;
+    }
+
+    public int AnimIntro(int key, int durMs) {
+        int value = this.AnimIntroValue(key, durMs);
+        if (this.AnimActive(key)) {
+            this.NoteRedrawWhy("anim-intro");
+            needsRedraw = true;
+        }
+        return value;
+    }
+
+    public int AnimIntroIn(int key, int durMs, int x, int y, int w, int h) {
+        int value = this.AnimIntroValue(key, durMs);
+        if (this.AnimActive(key)) {
+            this.RequestAnimationFrameIn(x, y, w, h);
+        }
+        return value;
+    }
+
+    int AnimPxValue(int key, int target, int tauMs) {
+        int idx = AnimIndex(key);
+        if (idx < 0) {
+            AnimAdd(key, target, target, tauMs);
+            return target;
+        }
+        AnimSlot a = anims[idx];
+        a.dst = target;
+        int cur = a.cur;
+        if (cur == target) { return cur; }
+        int dt = nowMs - lastFrameMs;
+        if (dt < 1) { dt = 1; }
+        if (dt > 64) { dt = 64; }
+        if (tauMs < 1) { tauMs = 1; }
+        int f = dt * 1000 / (dt + tauMs);
+        int delta = (target - cur) * f / 1000;
+        if (delta == 0) {
+            if (target > cur) { delta = 1; } else { delta = -1; }
+        }
+        int next = cur + delta;
+        if (delta > 0 && next > target) { next = target; }
+        if (delta < 0 && next < target) { next = target; }
+        a.cur = next;
+        return next;
+    }
+
+    int AnimPx(int key, int target, int tauMs) {
+        int value = this.AnimPxValue(key, target, tauMs);
+        if (this.AnimActive(key)) {
+            this.NoteRedrawWhy("anim-step");
+            needsRedraw = true;
+        }
+        return value;
+    }
+
+    int AnimPxIn(int key, int target, int tauMs,
+                 int x, int y, int w, int h) {
+        int value = this.AnimPxValue(key, target, tauMs);
+        if (this.AnimActive(key)) {
+            this.RequestAnimationFrameIn(0, x, y, w, h);
+        }
+        return value;
+    }
+
+    static int Ease(int p) {
+        if (p <= 0) { return 0; }
+        if (p >= 1000) { return 1000; }
+        int t2 = p * p / 1000;
+        int t3 = t2 * p / 1000;
+        return 3 * t2 - 2 * t3;
+    }
+
+    void FreezeAnimClock(int fixedMs) {
+        Window.FreezeTick(fixedMs);
+        nowMs = Window.GetTickMs();
+        freezeAnimClock = true;
+        lastFrameMs = nowMs;
+        lastPresentMs = nowMs;
+        animNextMs = -1;
+        wakeNextMs = -1;
+        wakeFrameNextMs = -1;
+        fxNextMs = -1;
+    }
+
+    void UnfreezeAnimClock() {
+        Window.UnfreezeTick();
+        freezeAnimClock = false;
+        nowMs = Window.GetTickMs();
+        lastFrameMs = nowMs;
+    }
+}

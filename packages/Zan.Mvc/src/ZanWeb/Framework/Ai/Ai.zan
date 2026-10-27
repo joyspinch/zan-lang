@@ -122,16 +122,18 @@ public class Ai {
         string temp = await Settings.Get(SettingKeys.AiTemperature, "0.3");
         AiEndpoint ep = AiEndpoint.Parse(baseUrl);
         if (ep == null) { return AiReply.Bad("服务地址不合法"); }
-        JsonValue msgs = JsonValue.NewArray();
-        JsonValue sys = JsonValue.NewObject();
-        sys.PutStr("role", "system");
-        sys.PutStr("content", systemPrompt);
-        msgs.Append(sys);
-        JsonValue cur = JsonValue.NewObject();
-        cur.PutStr("role", "user");
-        cur.PutStr("content", question);
-        msgs.Append(cur);
-        return await Complete(ep, key, model, temp, msgs.ToJson());
+        JsonWriter w = new JsonWriter();
+        w.StartArray();
+        w.StartObject();
+        w.WriteProperty("role", "system");
+        w.WriteProperty("content", systemPrompt);
+        w.EndObject();
+        w.StartObject();
+        w.WriteProperty("role", "user");
+        w.WriteProperty("content", question);
+        w.EndObject();
+        w.EndArray();
+        return await Complete(ep, key, model, temp, w.ToString());
     }
 
     /* 构造 messages 数组：系统提示词 + 历史（最多 20 轮）+ 当前问题。
@@ -140,16 +142,17 @@ public class Ai {
      *
      * historyJson 是**客户端**传来的（AssistantController 里 this.In("history")），
      * 所以坏 JSON 必须兜住——解析不了就当没有历史，这一轮照样能问。
-     * JsonValue.Parse 遇坏 JSON 是**抛**异常，不接住就是 500。
+     * JsonDoc.Parse 遇坏 JSON 返回 null，不抛异常。
      *
      * 公开是为了能单独测（它是个纯函数，不碰数据库）。
      */
     public static string Messages(AiAgent agent, string historyJson, string question) {
-        JsonValue msgs = JsonValue.NewArray();
-        JsonValue sys = JsonValue.NewObject();
-        sys.PutStr("role", "system");
-        sys.PutStr("content", agent.prompt);
-        msgs.Append(sys);
+        JsonWriter w = new JsonWriter();
+        w.StartArray();
+        w.StartObject();
+        w.WriteProperty("role", "system");
+        w.WriteProperty("content", agent.prompt);
+        w.EndObject();
         JsonDoc hist = null;
         try {
             hist = JsonDoc.Parse(historyJson);
@@ -170,17 +173,18 @@ public class Ai {
                 if (role != "user" && role != "assistant") { role = "user"; }
                 string content = hist.StrAt(hist.Get(m, "content"), "");
                 if (content.Length == 0) { continue; }
-                JsonValue one = JsonValue.NewObject();
-                one.PutStr("role", role);
-                one.PutStr("content", content);
-                msgs.Append(one);
+                w.StartObject();
+                w.WriteProperty("role", role);
+                w.WriteProperty("content", content);
+                w.EndObject();
             }
         }
-        JsonValue cur = JsonValue.NewObject();
-        cur.PutStr("role", "user");
-        cur.PutStr("content", question);
-        msgs.Append(cur);
-        return msgs.ToJson();
+        w.StartObject();
+        w.WriteProperty("role", "user");
+        w.WriteProperty("content", question);
+        w.EndObject();
+        w.EndArray();
+        return w.ToString();
     }
 
     /* AI 外部调用预算：所有请求都必须有有限的大小、时间和重试预算。
@@ -219,11 +223,13 @@ public class Ai {
     /* 非流式调用：发送 messages，返回文本或失败原因。 */
     static async AiReply Complete(AiEndpoint ep, string key, string model,
     string temp, string messages) {
-        JsonValue body = JsonValue.NewObject();
-        body.PutStr("model", model);
-        body.PutJson("temperature", Number(temp));
-        body.PutBool("stream", false);
-        body.PutJson("messages", messages);
+        JsonWriter w = new JsonWriter();
+        w.StartObject();
+        w.WriteProperty("model", model);
+        w.WriteRawProperty("temperature", Number(temp));
+        w.WriteProperty("stream", false);
+        w.WriteRawProperty("messages", messages);
+        w.EndObject();
 
         HttpClient http = new HttpClient(ep.Host(), ep.Port());
         if (ep.Tls()) { http = HttpClient.CreateHttps(ep.Host(), ep.Port()); }
@@ -235,7 +241,7 @@ public class Ai {
         string raw = "";
         try {
             HttpResponse resp = await http.SendAsync("POST",
-            ep.Path() + "/chat/completions", body.ToJson());
+            ep.Path() + "/chat/completions", w.ToString());
             raw = resp.body;
             if (resp.statusCode >= 500) {
                 return AiReply.Bad("AI 服务返回 "
@@ -285,11 +291,14 @@ public class Ai {
         AiEndpoint ep = AiEndpoint.Parse(baseUrl);
         if (ep == null) { return AiReply.Bad("服务地址不合法"); }
 
-        JsonValue body = JsonValue.NewObject();
-        body.PutStr("model", model);
-        body.PutJson("temperature", Number(temp));
-        body.PutBool("stream", true);
-        body.PutJson("messages", Messages(AgentOf(agentCode), historyJson, question));
+        JsonWriter w = new JsonWriter();
+        w.StartObject();
+        w.WriteProperty("model", model);
+        w.WriteRawProperty("temperature", Number(temp));
+        w.WriteProperty("stream", true);
+        w.WriteRawProperty("messages", Messages(AgentOf(agentCode), historyJson, question));
+        w.EndObject();
+
         HttpClient http = new HttpClient(ep.Host(), ep.Port());
         if (ep.Tls()) { http = HttpClient.CreateHttps(ep.Host(), ep.Port()); }
         /* 空闲超时：每个分片重设，慢响应也能存活，静默超时会被挂断。 */
@@ -309,7 +318,7 @@ public class Ai {
             return false;
         });
         long producer = Task.Spawn(http.PostSseToSinkAsync(
-        ep.Path() + "/chat/completions", body.ToJson(), sink));
+        ep.Path() + "/chat/completions", w.ToJson(), sink));
 
         StringBuilder full = new StringBuilder();
         string pending = "";

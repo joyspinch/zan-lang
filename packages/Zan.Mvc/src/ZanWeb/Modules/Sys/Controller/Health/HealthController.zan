@@ -1,6 +1,5 @@
 using System;
 using System.Data;
-using System.Json;
 using System.Web;
 using Zan.Web.Core;
 using Zan.Web.Services;
@@ -16,49 +15,60 @@ public class HealthController : AppController {
     [Route("/health")]
     [Description("健康检查")]
     public async void Index() {
-        JsonValue o = JsonValue.NewObject();
-        o.Put("status", JsonValue.NewStr("ok"));
+        long uptimeMs = 0L;
+        long reqCount = 0L;
         WebApp app = WebHost.Current();
         if (app != null) {
-            JsonValue m = JsonValue.ParseLenient(app.MetricsJson());
-            if (m != null && m.IsObject()) {
-                o.Put("uptime_ms", MetricsCluster.Num(m.Long("uptime_ms", 0)));
-                JsonValue rq = m.Get("requests");
-                if (rq != null) {
-                    o.Put("requests", MetricsCluster.Num(rq.Long("count", 0)));
-                }
+            JsonDoc m = JsonDoc.Parse(app.MetricsJson());
+            if (m != null) {
+                uptimeMs = m.PathLong("uptime_ms", 0L);
+                reqCount = m.PathLong("requests.count", 0L);
             }
         }
-        o.Put("pid", MetricsCluster.Num(ProcessHost.Pid()));
-        o.Put("worker", MetricsCluster.Num(ProcessHost.WorkerId()));
+
+        string status = "ok";
+        string dbStatus = "";
+        bool is503 = false;
 
         if (this.In("deep") == "1") {
             /* 租约在 OnBeforeAsync 已取得：DbReady() 即"借到了连接"。 绝不再向池借第二条——持有租约时的嵌套借还会在连接耗尽时 变成人人持一等人人的循环等待（AdminController 有实测注）。 */
             if (!this.DbReady()) {
-                o.Set("status", JsonValue.NewStr("down"));
-                o.Put("db", JsonValue.NewStr("pool not ready"));
-                this.Ctx().Status(503, "Service Unavailable");
-                this.Json(o.ToJson());
-                return;
+                status = "down";
+                dbStatus = "pool not ready";
+                is503 = true;
+            } else {
+                bool dbUp = false;
+                try {
+                    DbResult r = await this.Held().QueryAsync("SELECT 1",
+                        new DbParams());
+                    dbUp = r != null;
+                } catch (Exception ex) {
+                    Console.WriteLine("[health] database probe failed: " + ex.Message);
+                }
+                if (!dbUp) {
+                    status = "down";
+                    dbStatus = "unreachable";
+                    is503 = true;
+                } else {
+                    dbStatus = "up";
+                }
             }
-            bool dbUp = false;
-            try {
-                DbResult r = await this.Held().QueryAsync("SELECT 1",
-                    new DbParams());
-                dbUp = r != null;
-            } catch (Exception ex) {
-                Console.WriteLine("[health] database probe failed: " + ex.Message);
-            }
-            if (!dbUp) {
-                o.Set("status", JsonValue.NewStr("down"));
-                o.Put("db", JsonValue.NewStr("unreachable"));
-                this.Ctx().Status(503, "Service Unavailable");
-                this.Json(o.ToJson());
-                return;
-            }
-            o.Put("db", JsonValue.NewStr("up"));
         }
-        this.Json(o.ToJson());
+
+        if (is503) {
+            this.Ctx().Status(503, "Service Unavailable");
+        }
+
+        JsonWriter w = new JsonWriter();
+        w.WriteStartObject();
+        w.WritePropertyString("status", status);
+        if (uptimeMs > 0L) { w.WritePropertyLong("uptime_ms", uptimeMs); }
+        if (reqCount > 0L) { w.WritePropertyLong("requests", reqCount); }
+        w.WritePropertyInt("pid", ProcessHost.Pid());
+        w.WritePropertyInt("worker", ProcessHost.WorkerId());
+        if (dbStatus.Length > 0) { w.WritePropertyString("db", dbStatus); }
+        w.WriteEndObject();
+        this.Json(w.ToString());
     }
 
     /* K8s 存活探针：进程与事件循环存活，微秒级直接应答。 */
@@ -66,11 +76,13 @@ public class HealthController : AppController {
     [Route("/healthz/live")]
     [Description("K8s存活探针")]
     public void Live() {
-        JsonValue o = JsonValue.NewObject();
-        o.Put("status", JsonValue.NewStr("ok"));
-        o.Put("pid", MetricsCluster.Num(ProcessHost.Pid()));
-        o.Put("worker", MetricsCluster.Num(ProcessHost.WorkerId()));
-        this.Json(o.ToJson());
+        JsonWriter w = new JsonWriter();
+        w.WriteStartObject();
+        w.WritePropertyString("status", "ok");
+        w.WritePropertyInt("pid", ProcessHost.Pid());
+        w.WritePropertyInt("worker", ProcessHost.WorkerId());
+        w.WriteEndObject();
+        this.Json(w.ToString());
     }
 
     /* K8s 就绪探针：检查核心依赖（数据库、Redis）是否就绪，不可达时返回 503 让 Ingress/LB 摘除流量。 */
@@ -78,35 +90,41 @@ public class HealthController : AppController {
     [Route("/healthz/ready")]
     [Description("K8s就绪探针")]
     public async void Ready() {
-        JsonValue o = JsonValue.NewObject();
-        if (!this.DbReady()) {
-            o.Put("status", JsonValue.NewStr("down"));
-            o.Put("db", JsonValue.NewStr("pool not ready"));
-            this.Ctx().Status(503, "Service Unavailable");
-            this.Json(o.ToJson());
-            return;
-        }
-
+        string dbStatus = "";
         bool dbUp = false;
-        try {
-            DbResult r = await this.Held().QueryAsync("SELECT 1", new DbParams());
-            dbUp = (r != null);
-        } catch (Exception ex) {
-            Console.WriteLine("[health] database probe failed: " + ex.Message);
+        if (!this.DbReady()) {
+            dbStatus = "pool not ready";
+        } else {
+            try {
+                DbResult r = await this.Held().QueryAsync("SELECT 1", new DbParams());
+                dbUp = (r != null);
+            } catch (Exception ex) {
+                Console.WriteLine("[health] database probe failed: " + ex.Message);
+            }
+            if (!dbUp) {
+                dbStatus = "unreachable";
+            }
         }
+
         if (!dbUp) {
-            o.Put("status", JsonValue.NewStr("down"));
-            o.Put("db", JsonValue.NewStr("unreachable"));
             this.Ctx().Status(503, "Service Unavailable");
-            this.Json(o.ToJson());
+            JsonWriter w = new JsonWriter();
+            w.WriteStartObject();
+            w.WritePropertyString("status", "down");
+            w.WritePropertyString("db", dbStatus);
+            w.WriteEndObject();
+            this.Json(w.ToString());
             return;
         }
 
-        o.Put("status", JsonValue.NewStr("ready"));
-        o.Put("db", JsonValue.NewStr("up"));
+        JsonWriter w2 = new JsonWriter();
+        w2.WriteStartObject();
+        w2.WritePropertyString("status", "ready");
+        w2.WritePropertyString("db", "up");
         if (ClusterBus.Enabled()) {
-            o.Put("cluster", JsonValue.NewStr("up"));
+            w2.WritePropertyString("cluster", "up");
         }
-        this.Json(o.ToJson());
+        w2.WriteEndObject();
+        this.Json(w2.ToString());
     }
 }

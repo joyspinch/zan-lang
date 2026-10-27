@@ -79,13 +79,13 @@ public class MetricsCluster {
         WebApp app = WebHost.Current();
         await Publish();  // 本 worker 始终保持最新
         List<LiveRow> rows = await LiveRows("snapshot", 0);
-        List<JsonValue> ms = new List<JsonValue>();
+        List<JsonDoc> ms = new List<JsonDoc>();
         List<LiveRow> kept = new List<LiveRow>();
         int live = 0;
         for (int i = 0; i < rows.Count; i = i + 1) {
             LiveRow w = rows[i];
-            JsonValue m = JsonValue.ParseLenient(w.json);
-            if (m == null || !m.IsObject()) { continue; }
+            JsonDoc m = JsonDoc.Parse(w.json);
+            if (m == null) { continue; }
             ms.Add(m);
             kept.Add(w);
             if (w.age <= (long)FreshSeconds) { live = live + 1; }
@@ -94,77 +94,59 @@ public class MetricsCluster {
         string own = app.MetricsJson();
         if (ms.Count <= 1) {
             /* 单进程场景：自身快照即服务器全貌。 */
-            JsonValue o = JsonValue.ParseLenient(own);
-            if (o == null || !o.IsObject()) { return own; }
-            List<JsonValue> self = new List<JsonValue>();
-            self.Add(o);
+            JsonDoc ownDoc = JsonDoc.Parse(own);
+            if (ownDoc == null) { return own; }
+            List<JsonDoc> self = new List<JsonDoc>();
+            self.Add(ownDoc);
             List<LiveRow> selfRow = new List<LiveRow>();
             LiveRow r = new LiveRow();
             r.worker = ProcessHost.WorkerId();
             r.age = 0;
             r.json = own;
             selfRow.Add(r);
-            o.Put("processes", ProcessesJson(selfRow, self));
-            /* 单 worker 场景补全 fleet 字段，避免页面显示异常。 */
-            o.Put("workers", Num(1));
-            o.Put("workers_counted", Num(1));
-            o.Put("worker_list", JsonValue.NewStr(
-                Convert.ToString(ProcessHost.WorkerId())));
-            return o.ToJson();
+            return MergeSnapshots(self, 1, selfRow);
         }
-        JsonValue merged = JsonValue.ParseLenient(
-            MergeSnapshots(ms, live));
-        if (merged == null || !merged.IsObject()) { return own; }
-        merged.Put("processes", ProcessesJson(kept, ms));
-        return merged.ToJson();
+        return MergeSnapshots(ms, live, kept);
     }
 
     /* 每个进程一行，含 uptime/requests/queries/load 等，age 为发布到现在的秒数。 */
-    public static JsonValue ProcessesJson(List<LiveRow> rows, List<JsonValue> ms) {
-        JsonValue arr = JsonValue.NewArray();
+    public static void WriteProcesses(JsonWriter w, List<LiveRow> rows, List<JsonDoc> ms) {
+        w.StartArray();
         for (int i = 0; i < ms.Count; i = i + 1) {
-            JsonValue m = ms[i];
+            JsonDoc m = ms[i];
             long age = 0;
-            int wid = (int)m.Long("worker_id", 0);
+            int wid = (int)m.PathLong("worker_id", 0);
             if (i < rows.Count) {
                 age = rows[i].age;
                 wid = rows[i].worker;
             }
-            JsonValue o = JsonValue.NewObject();
-            o.Put("worker", Num(wid));
-            o.Put("pid", Num(m.Long("pid", 0)));
-            o.Put("uptime_ms", Num(m.Long("uptime_ms", 0)));
-            o.Put("cpu_percent", Num(m.Long("cpu_percent", 0 - 1)));
-            o.Put("cpu_ms", Num(m.Long("cpu_ms", 0)));
-            o.Put("mem_rss_bytes", Num(m.Long("mem_rss_bytes", 0)));
-            JsonValue rq = m.Get("requests");
-            long n = 0;
-            if (rq != null) {
-                n = rq.Long("count", 0);
-                o.Put("errors", Num(rq.Long("errors", 0)));
-                o.Put("avg_us", Num(rq.Long("avg_us", 0)));
-                o.Put("max_us", Num(rq.Long("max_us", 0)));
-            }
-            o.Put("requests", Num(n));
-            JsonValue ld = m.Get("load");
-            if (ld != null) {
-                o.Put("concurrent", Num(ld.Long("concurrent", 0)));
-                o.Put("streams", Num(ld.Long("streams", 0)));
-            }
-            JsonValue qs = m.Get("queries");
-            if (qs != null) {
-                o.Put("queries", Num(qs.Long("count", 0)));
-            }
-            o.Put("age", Num(age));
+            w.StartObject();
+            w.WriteProperty("worker", (long)wid);
+            w.WriteProperty("pid", m.PathLong("pid", 0));
+            w.WriteProperty("uptime_ms", m.PathLong("uptime_ms", 0));
+            w.WriteProperty("cpu_percent", m.PathLong("cpu_percent", -1));
+            w.WriteProperty("cpu_ms", m.PathLong("cpu_ms", 0));
+            w.WriteProperty("mem_rss_bytes", m.PathLong("mem_rss_bytes", 0));
+
+            long n = m.PathLong("requests.count", 0);
+            w.WriteProperty("requests", n);
+            w.WriteProperty("errors", m.PathLong("requests.errors", 0));
+            w.WriteProperty("avg_us", m.PathLong("requests.avg_us", 0));
+            w.WriteProperty("max_us", m.PathLong("requests.max_us", 0));
+
+            w.WriteProperty("concurrent", m.PathLong("load.concurrent", 0));
+            w.WriteProperty("streams", m.PathLong("load.streams", 0));
+            w.WriteProperty("queries", m.PathLong("queries.count", 0));
+            w.WriteProperty("age", age);
             long alive = 0;
             if (age <= (long)FreshSeconds) { alive = 1; }
-            o.Put("live", Num(alive));
-            arr.Append(o);
+            w.WriteProperty("live", alive);
+            w.EndObject();
         }
-        return arr;
+        w.EndArray();
     }
 
-    public static string MergeSnapshots(List<JsonValue> ms, int live) {
+    public static string MergeSnapshots(List<JsonDoc> ms, int live, List<LiveRow> rows) {
         long upt = 0;
         long cpuPct = 0;
         long rss = 0;
@@ -187,166 +169,192 @@ public class MetricsCluster {
         long lFrames = 0;
         long lBytes = 0;
         StringBuilder wl = new StringBuilder();
-        JsonValue topReq = JsonValue.NewArray();
-        JsonValue topSql = JsonValue.NewArray();
+        List<ClusterTopEntry> topReq = new List<ClusterTopEntry>();
+        List<ClusterTopEntry> topSql = new List<ClusterTopEntry>();
         for (int i = 0; i < ms.Count; i = i + 1) {
-            JsonValue m = ms[i];
+            JsonDoc m = ms[i];
             if (i > 0) { wl.Append(","); }
-            wl.Append(Convert.ToString(m.Long("worker_id", 0)));
-            if (m.Long("uptime_ms", 0) > upt) { upt = m.Long("uptime_ms", 0); }
-            long c = m.Long("cpu_percent", 0 - 1);
+            wl.Append(Convert.ToString(m.PathLong("worker_id", 0)));
+            long u = m.PathLong("uptime_ms", 0);
+            if (u > upt) { upt = u; }
+            long c = m.PathLong("cpu_percent", 0 - 1);
             if (c > 0) { cpuPct = cpuPct + c; }
-            long rb = m.Long("mem_rss_bytes", 0 - 1);
+            long rb = m.PathLong("mem_rss_bytes", 0 - 1);
             if (rb > 0) { rss = rss + rb; }
-            JsonValue rq = m.Get("requests");
-            if (rq != null) {
-                long n = rq.Long("count", 0);
-                rCount = rCount + n;
-                rErrors = rErrors + rq.Long("errors", 0);
-                rFailed = rFailed + rq.Long("failed", 0);
-                rRejected = rRejected + rq.Long("rejected", 0);
-                rAvgW = rAvgW + n * rq.Long("avg_us", 0);
-                if (rq.Long("max_us", 0) > rMax) { rMax = rq.Long("max_us", 0); }
-                rSlowTh = rq.Long("slow_threshold_us", 0);
-                rSlowN = rSlowN + rq.Long("slow_count", 0);
-            }
-            JsonValue qs = m.Get("queries");
-            if (qs != null) {
-                long n2 = qs.Long("count", 0);
-                qCount = qCount + n2;
-                qAvgW = qAvgW + n2 * qs.Long("avg_us", 0);
-                if (qs.Long("max_us", 0) > qMax) { qMax = qs.Long("max_us", 0); }
-                qSlowTh = qs.Long("slow_threshold_us", 0);
-                qSlowN = qSlowN + qs.Long("slow_count", 0);
-            }
-            JsonValue ld = m.Get("load");
-            if (ld != null) {
-                lConc = lConc + ld.Long("concurrent", 0);
-                lPeak = lPeak + ld.Long("peak", 0);
-                lStreams = lStreams + ld.Long("streams", 0);
-                lFrames = lFrames + ld.Long("stream_frames", 0);
-                lBytes = lBytes + ld.Long("stream_bytes", 0);
-            }
-            MergeTop(topReq, m.Get("top_requests"), "req");
-            MergeTop(topSql, m.Get("top_sql"), "sql");
+
+            long n = m.PathLong("requests.count", 0);
+            rCount = rCount + n;
+            rErrors = rErrors + m.PathLong("requests.errors", 0);
+            rFailed = rFailed + m.PathLong("requests.failed", 0);
+            rRejected = rRejected + m.PathLong("requests.rejected", 0);
+            rAvgW = rAvgW + n * m.PathLong("requests.avg_us", 0);
+            long rqMax = m.PathLong("requests.max_us", 0);
+            if (rqMax > rMax) { rMax = rqMax; }
+            rSlowTh = m.PathLong("requests.slow_threshold_us", 0);
+            rSlowN = rSlowN + m.PathLong("requests.slow_count", 0);
+
+            long n2 = m.PathLong("queries.count", 0);
+            qCount = qCount + n2;
+            qAvgW = qAvgW + n2 * m.PathLong("queries.avg_us", 0);
+            long qsMax = m.PathLong("queries.max_us", 0);
+            if (qsMax > qMax) { qMax = qsMax; }
+            qSlowTh = m.PathLong("queries.slow_threshold_us", 0);
+            qSlowN = qSlowN + m.PathLong("queries.slow_count", 0);
+
+            lConc = lConc + m.PathLong("load.concurrent", 0);
+            lPeak = lPeak + m.PathLong("load.peak", 0);
+            lStreams = lStreams + m.PathLong("load.streams", 0);
+            lFrames = lFrames + m.PathLong("load.stream_frames", 0);
+            lBytes = lBytes + m.PathLong("load.stream_bytes", 0);
+
+            MergeTop(topReq, m, "top_requests", "req");
+            MergeTop(topSql, m, "top_sql", "sql");
         }
 
-        JsonValue requests = JsonValue.NewObject();
-        requests.Put("count", Num(rCount));
-        requests.Put("errors", Num(rErrors));
-        requests.Put("failed", Num(rFailed));
-        requests.Put("rejected", Num(rRejected));
+        JsonWriter w = new JsonWriter();
+        w.StartObject();
+        w.WriteProperty("uptime_ms", upt);
+        w.WriteProperty("pid", (long)ProcessHost.Pid());
+        w.WriteProperty("worker_id", (long)ProcessHost.WorkerId());
+        w.WriteProperty("workers", (long)live);
+        w.WriteProperty("workers_counted", (long)ms.Count);
+        w.WriteProperty("worker_list", wl.ToString());
+        w.WriteProperty("cpu_percent", cpuPct);
+        w.WriteProperty("mem_rss_bytes", rss);
+
+        w.WriteKey("requests");
+        w.StartObject();
+        w.WriteProperty("count", rCount);
+        w.WriteProperty("errors", rErrors);
+        w.WriteProperty("failed", rFailed);
+        w.WriteProperty("rejected", rRejected);
         long rAvg = 0;
         if (rCount > 0) { rAvg = rAvgW / rCount; }
-        requests.Put("avg_us", Num(rAvg));
-        requests.Put("max_us", Num(rMax));
-        requests.Put("slow_threshold_us", Num(rSlowTh));
-        requests.Put("slow_count", Num(rSlowN));
+        w.WriteProperty("avg_us", rAvg);
+        w.WriteProperty("max_us", rMax);
+        w.WriteProperty("slow_threshold_us", rSlowTh);
+        w.WriteProperty("slow_count", rSlowN);
+        w.EndObject();
 
-        JsonValue queries = JsonValue.NewObject();
-        queries.Put("count", Num(qCount));
+        w.WriteKey("queries");
+        w.StartObject();
+        w.WriteProperty("count", qCount);
         long qAvg = 0;
         if (qCount > 0) { qAvg = qAvgW / qCount; }
-        queries.Put("avg_us", Num(qAvg));
-        queries.Put("max_us", Num(qMax));
-        queries.Put("slow_threshold_us", Num(qSlowTh));
-        queries.Put("slow_count", Num(qSlowN));
+        w.WriteProperty("avg_us", qAvg);
+        w.WriteProperty("max_us", qMax);
+        w.WriteProperty("slow_threshold_us", qSlowTh);
+        w.WriteProperty("slow_count", qSlowN);
+        w.EndObject();
 
-        JsonValue load = JsonValue.NewObject();
-        load.Put("concurrent", Num(lConc));
-        load.Put("peak", Num(lPeak));
-        load.Put("streams", Num(lStreams));
-        load.Put("stream_frames", Num(lFrames));
-        load.Put("stream_bytes", Num(lBytes));
+        w.WriteKey("load");
+        w.StartObject();
+        w.WriteProperty("concurrent", lConc);
+        w.WriteProperty("peak", lPeak);
+        w.WriteProperty("streams", lStreams);
+        w.WriteProperty("stream_frames", lFrames);
+        w.WriteProperty("stream_bytes", lBytes);
+        w.EndObject();
 
-        JsonValue o = JsonValue.NewObject();
-        o.Put("uptime_ms", Num(upt));
-        o.Put("pid", Num(ProcessHost.Pid()));
-        o.Put("worker_id", Num(ProcessHost.WorkerId()));
-        o.Put("workers", Num(live));
-        /* 计入所有参与合并的 worker（含已停发），停发与流量消失的区别由此区分。 */
-        o.Put("workers_counted", Num(ms.Count));
-        o.Put("worker_list", JsonValue.NewStr(wl.ToString()));
-        o.Put("cpu_percent", Num(cpuPct));
-        o.Put("mem_rss_bytes", Num(rss));
-        o.Put("requests", requests);
-        o.Put("queries", queries);
-        o.Put("load", load);
-        o.Put("top_requests", SortTop(topReq));
-        o.Put("top_sql", SortTop(topSql));
-        return o.ToJson();
+        w.WriteKey("top_requests");
+        WriteTopArray(w, SortTop(topReq), "req");
+
+        w.WriteKey("top_sql");
+        WriteTopArray(w, SortTop(topSql), "sql");
+
+        w.WriteKey("processes");
+        WriteProcesses(w, rows, ms);
+
+        w.EndObject();
+        return w.ToString();
     }
 
     /* 合并一个 worker 的 top 列表：同 key 累加 count/total_us，取较大 max_us，重算 avg。 */
-    private static void MergeTop(JsonValue merged, JsonValue add, string key) {
-        if (add == null || !add.IsArray()) { return; }
-        for (int i = 0; i < add.Count(); i = i + 1) {
-            JsonValue s = add.At(i);
-            string k = s.Str(key, "");
-            JsonValue hit = null;
-            for (int j = 0; j < merged.Count(); j = j + 1) {
-                if (merged.At(j).Str(key, "") == k) { hit = merged.At(j); break; }
+    private static void MergeTop(List<ClusterTopEntry> merged, JsonDoc doc, string topKey, string itemKey) {
+        int arr = doc.Get(topKey);
+        if (arr < 0 || doc.KindAt(arr) != 4) { return; }
+        int count = doc.Count(arr);
+        int p = doc.FirstChild(arr);
+        for (int i = 0; i < count && p >= 0; i = i + 1) {
+            string k = doc.StrAt(doc.Get(p, itemKey), "");
+            ClusterTopEntry hit = null;
+            for (int j = 0; j < merged.Count; j = j + 1) {
+                if (merged[j].key == k) { hit = merged[j]; break; }
             }
+            long c = doc.LongAt(doc.Get(p, "count"), 0);
+            long errs = doc.LongAt(doc.Get(p, "errors"), 0);
+            long fld = doc.LongAt(doc.Get(p, "failed"), 0);
+            long rej = doc.LongAt(doc.Get(p, "rejected"), 0);
+            long tot = doc.LongAt(doc.Get(p, "total_us"), 0);
+            long mx = doc.LongAt(doc.Get(p, "max_us"), 0);
             if (hit == null) {
-                JsonValue row = JsonValue.NewObject();
-                row.Put(key, JsonValue.NewStr(k));
-                row.Put("count", Num(s.Long("count", 0)));
-                row.Put("errors", Num(s.Long("errors", 0)));
-                row.Put("failed", Num(s.Long("failed", 0)));
-                row.Put("rejected", Num(s.Long("rejected", 0)));
-                row.Put("total_us", Num(s.Long("total_us", 0)));
-                row.Put("max_us", Num(s.Long("max_us", 0)));
+                ClusterTopEntry row = new ClusterTopEntry();
+                row.key = k;
+                row.count = c;
+                row.errors = errs;
+                row.failed = fld;
+                row.rejected = rej;
+                row.totalUs = tot;
+                row.maxUs = mx;
                 Reavg(row);
-                merged.Append(row);
-                continue;
+                merged.Add(row);
+            } else {
+                hit.count = hit.count + c;
+                hit.errors = hit.errors + errs;
+                hit.failed = hit.failed + fld;
+                hit.rejected = hit.rejected + rej;
+                hit.totalUs = hit.totalUs + tot;
+                if (mx > hit.maxUs) { hit.maxUs = mx; }
+                Reavg(hit);
             }
-            hit.Set("count", Num(hit.Long("count", 0)
-                + s.Long("count", 0)));
-            hit.Set("errors", Num(hit.Long("errors", 0)
-                + s.Long("errors", 0)));
-            hit.Set("failed", Num(hit.Long("failed", 0)
-                + s.Long("failed", 0)));
-            hit.Set("rejected", Num(hit.Long("rejected", 0)
-                + s.Long("rejected", 0)));
-            hit.Set("total_us", Num(hit.Long("total_us", 0)
-                + s.Long("total_us", 0)));
-            if (s.Long("max_us", 0) > hit.Long("max_us", 0)) {
-                hit.Set("max_us", Num(s.Long("max_us", 0)));
-            }
-            Reavg(hit);
+            p = doc.NextSibling(p);
         }
     }
 
-    private static void Reavg(JsonValue row) {
-        long n = row.Long("count", 0);
-        long avg = 0;
-        if (n > 0) { avg = row.Long("total_us", 0) / n; }
-        row.Set("avg_us", Num(avg));
+    private static void Reavg(ClusterTopEntry row) {
+        if (row.count > 0) {
+            row.avgUs = row.totalUs / row.count;
+        } else {
+            row.avgUs = 0;
+        }
     }
 
     /* 按累计耗时降序排列，最多取 20 条，选择排序。 */
-    private static JsonValue SortTop(JsonValue arr) {
-        int n = arr.Count();
-        List<JsonValue> rows = new List<JsonValue>();
-        for (int i = 0; i < n; i = i + 1) { rows.Add(arr.At(i)); }
+    private static List<ClusterTopEntry> SortTop(List<ClusterTopEntry> rows) {
         for (int a = 0; a < rows.Count - 1; a = a + 1) {
             int best = a;
             for (int b = a + 1; b < rows.Count; b = b + 1) {
-                if (rows[b].Long("total_us", 0) > rows[best].Long("total_us", 0)) {
+                if (rows[b].totalUs > rows[best].totalUs) {
                     best = b;
                 }
             }
             if (best != a) {
-                JsonValue tmp = rows[a];
+                ClusterTopEntry tmp = rows[a];
                 rows[a] = rows[best];
                 rows[best] = tmp;
             }
         }
-        JsonValue outp = JsonValue.NewArray();
+        return rows;
+    }
+
+    private static void WriteTopArray(JsonWriter w, List<ClusterTopEntry> rows, string itemKey) {
+        w.StartArray();
         int keep = rows.Count;
         if (keep > 20) { keep = 20; }
-        for (int i = 0; i < keep; i = i + 1) { outp.Append(rows[i]); }
-        return outp;
+        for (int i = 0; i < keep; i = i + 1) {
+            ClusterTopEntry e = rows[i];
+            w.StartObject();
+            w.WriteProperty(itemKey, e.key);
+            w.WriteProperty("count", e.count);
+            w.WriteProperty("errors", e.errors);
+            w.WriteProperty("failed", e.failed);
+            w.WriteProperty("rejected", e.rejected);
+            w.WriteProperty("total_us", e.totalUs);
+            w.WriteProperty("max_us", e.maxUs);
+            w.WriteProperty("avg_us", e.avgUs);
+            w.EndObject();
+        }
+        w.EndArray();
     }
 
     /* 合并秒级时序：请求/错误相加，延迟按请求数加权，p95/max 取最值，CPU/RSS 相加。 */
@@ -439,9 +447,5 @@ public class MetricsCluster {
         }
         sb.Append("]}");
         return sb.ToString();
-    }
-
-    public static JsonValue Num(long v) {
-        return JsonValue.NewNum(Convert.ToString(v));
     }
 }

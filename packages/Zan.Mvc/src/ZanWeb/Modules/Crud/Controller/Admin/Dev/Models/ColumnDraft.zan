@@ -1,4 +1,5 @@
 using System;
+using System.Json;
 
 namespace Zan.Web.Modules.Crud.Controller.Admin.Dev;
 
@@ -9,7 +10,7 @@ public class ColumnDraft {
 
     /* 把清单（模型或浏览器回传）重验成设计行：名字合法性、kind/widget 白名单、
        关联表必须真实存在、标志位归一、与已有字段及批内互不重名。无效项丢弃。 */
-    public static ColumnDraft Sanitize(JsonValue arr, List<SysGenColumn> existing,
+    public static ColumnDraft Sanitize(JsonDoc doc, int arrNode, List<SysGenColumn> existing,
                                        List<SysGenTable> tables) {
         ColumnDraft outp = new ColumnDraft();
         outp.cols = new List<SysGenColumn>();
@@ -18,40 +19,49 @@ public class ColumnDraft {
         for (int i = 0; i < existing.Count; i = i + 1) {
             taken.Add(existing[i].name);
         }
-        for (int i = 0; i < arr.Count(); i = i + 1) {
-            JsonValue o = arr.At(i);
-            if (o == null || !o.IsObject()) { outp.dropped = outp.dropped + 1; continue; }
-            string name = o.Str("name", "").Trim();
-            if (!Gen.SafeCode(name) || taken.Contains(name)) {
+        if (doc == null || arrNode < 0 || doc.KindAt(arrNode) != 4) {
+            return outp;
+        }
+        int count = doc.Count(arrNode);
+        int p = doc.FirstChild(arrNode);
+        for (int i = 0; i < count && p >= 0; i = i + 1) {
+            if (doc.KindAt(p) != 5) {
                 outp.dropped = outp.dropped + 1;
+                p = doc.NextSibling(p);
                 continue;
             }
-            string kind = o.Str("kind", "").Trim();
+            string name = doc.StrAt(doc.Get(p, "name"), "").Trim();
+            if (!Gen.SafeCode(name) || taken.Contains(name)) {
+                outp.dropped = outp.dropped + 1;
+                p = doc.NextSibling(p);
+                continue;
+            }
+            string kind = doc.StrAt(doc.Get(p, "kind"), "").Trim();
             if (!InList(kind, "string,text,int,long,decimal,bool,datetime")) {
                 kind = "string";
             }
-            string widget = o.Str("widget", "").Trim();
+            string widget = doc.StrAt(doc.Get(p, "widget"), "").Trim();
             if (!InList(widget,
                     "text,textarea,number,select,switch,date,richtext,upload")) {
                 widget = WidgetOf(kind);
             }
             SysGenColumn c = new SysGenColumn();
             c.name = name;
-            c.label = Clip(o.Str("label", "").Trim(), 64);
+            c.label = Clip(doc.StrAt(doc.Get(p, "label"), "").Trim(), 64);
             if (c.label.Length == 0) { c.label = name; }
             c.kind = kind;
-            long size = o.Long("size", 255);
+            long size = doc.LongAt(doc.Get(p, "size"), 255);
             if (size < 1 || size > 4000) { size = 255; }
             c.size = (int)size;
-            c.defValue = Clip(o.Str("defValue", ""), 255);
+            c.defValue = Clip(doc.StrAt(doc.Get(p, "defValue"), ""), 255);
             c.widget = widget;
             c.dictType = "";
-            string dict = o.Str("dictType", "").Trim();
+            string dict = doc.StrAt(doc.Get(p, "dictType"), "").Trim();
             if (dict.Length > 0 && Gen.Safe(dict)) { c.dictType = dict; }
             c.relTable = "";
             c.relValue = "";
             c.relLabel = "";
-            string rel = o.Str("relTable", "").Trim();
+            string rel = doc.StrAt(doc.Get(p, "relTable"), "").Trim();
             bool known = false;
             if (Gen.Safe(rel)) {
                 for (int k = 0; k < tables.Count; k = k + 1) {
@@ -60,52 +70,53 @@ public class ColumnDraft {
             }
             if (known) {
                 c.relTable = rel;
-                c.relValue = Clip(o.Str("relValue", "").Trim(), 64);
+                c.relValue = Clip(doc.StrAt(doc.Get(p, "relValue"), "").Trim(), 64);
                 if (!Gen.Safe(c.relValue)) { c.relValue = "id"; }
-                c.relLabel = Clip(o.Str("relLabel", "").Trim(), 64);
+                c.relLabel = Clip(doc.StrAt(doc.Get(p, "relLabel"), "").Trim(), 64);
                 if (!Gen.Safe(c.relLabel)) { c.relLabel = "name"; }
             }
-            long so = o.Long("sortOrder", 0 - 1);
-            if (so < 0) { so = Filter.ToInt(o.Str("sortOrder", ""), 10); }
+            long so = doc.LongAt(doc.Get(p, "sortOrder"), 0 - 1);
+            if (so < 0) { so = Filter.ToInt(doc.StrAt(doc.Get(p, "sortOrder"), ""), 10); }
             c.sortOrder = (int)(so > 0 ? so : 10);
-            c.nullable = FlagOf(o, "nullable", 0);
-            c.inList = FlagOf(o, "inList", 1);
-            c.inFilter = FlagOf(o, "inFilter", 0);
-            c.inCreate = FlagOf(o, "inCreate", 1);
-            c.inEdit = FlagOf(o, "inEdit", 1);
-            c.inQuick = FlagOf(o, "inQuick", 1);
-            c.required = FlagOf(o, "required", 0);
+            c.nullable = FlagOf(doc, p, "nullable", 0);
+            c.inList = FlagOf(doc, p, "inList", 1);
+            c.inFilter = FlagOf(doc, p, "inFilter", 0);
+            c.inCreate = FlagOf(doc, p, "inCreate", 1);
+            c.inEdit = FlagOf(doc, p, "inEdit", 1);
+            c.inQuick = FlagOf(doc, p, "inQuick", 1);
+            c.required = FlagOf(doc, p, "required", 0);
             taken.Add(name);
             outp.cols.Add(c);
+            p = doc.NextSibling(p);
         }
         return outp;
     }
 
-    static JsonValue ColumnJson(SysGenColumn c) {
-        JsonValue o = JsonValue.NewObject();
-        o.Put("name", JsonValue.NewStr(c.name));
-        o.Put("label", JsonValue.NewStr(c.label));
-        o.Put("kind", JsonValue.NewStr(c.kind));
-        o.Put("widget", JsonValue.NewStr(c.widget));
-        o.Put("size", MetricsCluster.Num(c.size));
-        o.Put("defValue", JsonValue.NewStr(c.defValue));
-        o.Put("dictType", JsonValue.NewStr(c.dictType));
-        o.Put("relTable", JsonValue.NewStr(c.relTable));
-        o.Put("relValue", JsonValue.NewStr(c.relValue));
-        o.Put("relLabel", JsonValue.NewStr(c.relLabel));
-        o.Put("required", MetricsCluster.Num(c.required));
-        o.Put("nullable", MetricsCluster.Num(c.nullable));
-        o.Put("inList", MetricsCluster.Num(c.inList));
-        o.Put("inFilter", MetricsCluster.Num(c.inFilter));
-        o.Put("inCreate", MetricsCluster.Num(c.inCreate));
-        o.Put("inEdit", MetricsCluster.Num(c.inEdit));
-        o.Put("inQuick", MetricsCluster.Num(c.inQuick));
-        o.Put("sortOrder", MetricsCluster.Num(c.sortOrder));
-        return o;
+    public static void WriteColumn(JsonWriter w, SysGenColumn c) {
+        w.StartObject();
+        w.WriteProperty("name", c.name);
+        w.WriteProperty("label", c.label);
+        w.WriteProperty("kind", c.kind);
+        w.WriteProperty("widget", c.widget);
+        w.WriteProperty("size", (long)c.size);
+        w.WriteProperty("defValue", c.defValue);
+        w.WriteProperty("dictType", c.dictType);
+        w.WriteProperty("relTable", c.relTable);
+        w.WriteProperty("relValue", c.relValue);
+        w.WriteProperty("relLabel", c.relLabel);
+        w.WriteProperty("required", (long)c.required);
+        w.WriteProperty("nullable", (long)c.nullable);
+        w.WriteProperty("inList", (long)c.inList);
+        w.WriteProperty("inFilter", (long)c.inFilter);
+        w.WriteProperty("inCreate", (long)c.inCreate);
+        w.WriteProperty("inEdit", (long)c.inEdit);
+        w.WriteProperty("inQuick", (long)c.inQuick);
+        w.WriteProperty("sortOrder", (long)c.sortOrder);
+        w.EndObject();
     }
 
     /* s 在词表（逗号分隔）中吗。 */
-    static bool InList(string s, string csv) {
+    public static bool InList(string s, string csv) {
         if (s.Length == 0) { return false; }
         return ("," + csv + ",").Contains("," + s + ",");
     }
@@ -119,17 +130,19 @@ public class ColumnDraft {
         return "text";
     }
 
-    static string Clip(string s, int max) {
+    public static string Clip(string s, int max) {
         if (s.Length <= max) { return s; }
         return s.Substring(0, max);
     }
 
     /* JSON 标志位：数字 0/1、文本 "1"/"true"/"false" 都认，认不出用默认。 */
-    private static int FlagOf(JsonValue o, string key, int def) {
-        long n = o.Long(key, def);
+    private static int FlagOf(JsonDoc doc, int node, string key, int def) {
+        int k = doc.Get(node, key);
+        if (k < 0) { return def; }
+        long n = doc.LongAt(k, 0 - 1);
         if (n == 1) { return 1; }
         if (n == 0) { return 0; }
-        string s = o.Str(key, "").ToLower();
+        string s = doc.StrAt(k, "").ToLower();
         if (s == "1" || s == "true") { return 1; }
         if (s == "0" || s == "false") { return 0; }
         return def;

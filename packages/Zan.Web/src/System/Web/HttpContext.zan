@@ -44,6 +44,18 @@ public class HttpContext : IDisposable {
     public List<string> headers;
     public bool ended;  // a hook or handler already produced the response
 
+    // Worker 级序列化缓冲池持有的全响应（头+正文）字节数组，发送完毕后归还。
+    public byte[] responseBuf;
+    public int responseLen;
+
+    public void ReleaseResponseBuf() {
+        if (this.responseBuf != null) {
+            HttpBufferPool.ReturnBytes(this.responseBuf);
+            this.responseBuf = null;
+            this.responseLen = 0;
+        }
+    }
+
     // ---- 流式响应 (SSE / WebSocket) 连接接管 ----
     public TcpClient conn;
     public bool hijacked;
@@ -63,7 +75,7 @@ public class HttpContext : IDisposable {
         this.remoteIp = remoteIp;
         this.routeParams = null;
         this.query = null;
-        this.form = null;
+        this.form = new StrMap();
         this.uid = "";
         this.routeAction = "";
         this.routePattern = "";
@@ -112,6 +124,7 @@ public class HttpContext : IDisposable {
     }
 
     public void Dispose() {
+        this.ReleaseResponseBuf();
         if (this.headers != null) {
             this.headers.Clear();
             this.headers = null;
@@ -859,8 +872,10 @@ public class HttpContext : IDisposable {
 
     // 序列化为完整 HTTP/1.1 报文：状态行、Content-Type/Length、依
     // keepAlive 的 Connection 头、Server 头，再接已清洗的自定义头。
-    // 字节正文不并入（防 NUL 截断），由调用方按 BodyLength 另行发送。
-    string BuildResponse(bool keepAlive) {
+    // Worker 级全报文流式装配：通过 HttpBufferPool.RentBytes 零分配复用 byte[] 缓冲区，
+    // 将响应头与正文在连续内存中原位格式化，一并交付底层 Socket.SendBytesAsync，
+    // 完全消除堆分配与大包阶段的双报文拆分开销。
+    public void BuildResponseDirect(bool keepAlive) {
         // HEAD 的应答头必须与 GET 完全一致（含 Content-Length），
         // 但正文一律不发送（RFC 9110 §9.3.2）。不剥离的话 keep-alive
         // 连接上正文会被当作下一个请求解析——请求走私；非 keep-alive
@@ -905,9 +920,39 @@ public class HttpContext : IDisposable {
             sb.Append(header);
         }
         sb.Append("\r\n\r\n");
-        if (this.bodyBytes == null && !omitBody) { sb.Append(this.body); }
-        string res = sb.ToString();
+
+        int headLen = sb.Length;
+        int bodyLen = 0;
+        if (!omitBody) {
+            if (this.bodyBytes != null) {
+                bodyLen = this.BodyLength();
+            } else if (this.body != null) {
+                bodyLen = this.body.Length;
+            }
+        }
+        int total = headLen + bodyLen;
+        byte[] buf = HttpBufferPool.RentBytes(total);
+
+        NativeMemory.PutString((nint)buf, 0, sb.ToString(), headLen);
         HttpBufferPool.Return(sb);
+
+        if (!omitBody && bodyLen > 0) {
+            if (this.bodyBytes != null) {
+                NativeMemory.Copy((nint)buf + headLen, (nint)this.bodyBytes, bodyLen);
+            } else if (this.body != null) {
+                NativeMemory.PutString((nint)buf, headLen, this.body, bodyLen);
+            }
+        }
+
+        this.responseBuf = buf;
+        this.responseLen = total;
+    }
+
+    public string BuildResponse(bool keepAlive) {
+        this.BuildResponseDirect(keepAlive);
+        if (this.responseBuf == null || this.responseLen == 0) { return ""; }
+        string res = NativeMemory.GetString((nint)this.responseBuf, 0, this.responseLen);
+        this.ReleaseResponseBuf();
         return res;
     }
 

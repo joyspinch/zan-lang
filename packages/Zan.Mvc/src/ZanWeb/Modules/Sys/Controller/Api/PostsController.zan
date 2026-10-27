@@ -6,7 +6,6 @@ using Zan.Web.Security;
 using Zan.Web.Services;
 using Zan.Web;
 using System.Web;
-using System.Json;
 using Zan.Web.Model.Blog;
 
 namespace Zan.Web.Api;
@@ -42,17 +41,22 @@ public class PostsController : AdminController {
             .Skip(q.Skip()).Take(q.Limit()).ToListAsync();
         List<Category> cats = await this.Category.OrderBy(a => a.sortOrder).ToListAsync();
 
-        JsonValue arr = JsonValue.NewArray();
+        JsonWriter w = new JsonWriter();
+        w.WriteStartObject();
+        w.WritePropertyName("items");
+        w.WriteStartArray();
         for (int i = 0; i < rows.Count; i = i + 1) {
-            arr.Append(RowJson(rows[i], cats));
+            WritePostJson(w, rows[i]);
+            w.WritePropertyString("category", CategoryName(cats, rows[i].categoryId));
+            w.WriteEndObject();
         }
-        JsonValue o = JsonValue.NewObject();
-        o.Put("items", arr);
-        o.Put("total", JsonValue.NewInt(total));
-        o.Put("page", JsonValue.NewInt(q.Page()));
-        o.Put("limit", JsonValue.NewInt(q.Limit()));
-        o.Put("pages", JsonValue.NewInt(q.Pages(total)));
-        this.Ok(o.ToJson());
+        w.WriteEndArray();
+        w.WritePropertyInt("total", total);
+        w.WritePropertyInt("page", q.Page());
+        w.WritePropertyInt("limit", q.Limit());
+        w.WritePropertyInt("pages", q.Pages(total));
+        w.WriteEndObject();
+        this.Ok(w.ToString());
     }
 
     [HttpGet]
@@ -62,19 +66,23 @@ public class PostsController : AdminController {
         int id = this.InInt("id", 0);
         Post p = await this.Post.ById(id);
         if (p == null) { this.Fail(404, "0404", "文章不存在"); }
-        JsonValue o = PostJson(p);
-        /* 编辑表单需要回填正文，列表行不需要，故只放在详情里。 */
-        o.Put("body", JsonValue.NewStr(p.body));
+
         List<Category> cats = await this.Category.OrderBy(a => a.sortOrder).ToListAsync();
-        JsonValue carr = JsonValue.NewArray();
+        JsonWriter w = new JsonWriter();
+        WritePostJson(w, p);
+        /* 编辑表单需要回填正文，列表行不需要，故只放在详情里。 */
+        w.WritePropertyString("body", p.body);
+        w.WritePropertyName("categories");
+        w.WriteStartArray();
         for (int i = 0; i < cats.Count; i = i + 1) {
-            JsonValue c = JsonValue.NewObject();
-            c.Put("id", JsonValue.NewInt(cats[i].id));
-            c.Put("name", JsonValue.NewStr(cats[i].name));
-            carr.Append(c);
+            w.WriteStartObject();
+            w.WritePropertyInt("id", cats[i].id);
+            w.WritePropertyString("name", cats[i].name);
+            w.WriteEndObject();
         }
-        o.Put("categories", carr);
-        this.Ok(o.ToJson());
+        w.WriteEndArray();
+        w.WriteEndObject();
+        this.Ok(w.ToString());
     }
 
     [HttpPost]
@@ -87,9 +95,11 @@ public class PostsController : AdminController {
         int newId = await this.Post.Insert(p).ExecuteIdentityAsync();
         await this.Bust();
         await this.Note("新增文章", p.title, newId > 0, "");
-        JsonValue o = JsonValue.NewObject();
-        o.Put("id", JsonValue.NewInt(newId));
-        this.Ok(o.ToJson());
+        JsonWriter w = new JsonWriter();
+        w.WriteStartObject();
+        w.WritePropertyInt("id", newId);
+        w.WriteEndObject();
+        this.Ok(w.ToString());
     }
 
     [HttpPost]
@@ -120,10 +130,12 @@ public class PostsController : AdminController {
             .ExecuteAffrowsAsync();
         await this.Bust();
         await this.Note("编辑文章", p.title, n > 0, "");
-        JsonValue o = JsonValue.NewObject();
-        o.Put("id", JsonValue.NewInt(id));
-        o.Put("version", JsonValue.NewInt(p.updatedAt));
-        this.Ok(o.ToJson());
+        JsonWriter w = new JsonWriter();
+        w.WriteStartObject();
+        w.WritePropertyInt("id", id);
+        w.WritePropertyLong("version", p.updatedAt);
+        w.WriteEndObject();
+        this.Ok(w.ToString());
     }
 
     [HttpPost]
@@ -190,27 +202,20 @@ public class PostsController : AdminController {
         await cache.DelAsync("blog:list");
     }
 
-    private static JsonValue RowJson(Post p, List<Category> cats) {
-        JsonValue o = PostJson(p);
-        o.Put("category", JsonValue.NewStr(CategoryName(cats, p.categoryId)));
-        return o;
-    }
-
-    private static JsonValue PostJson(Post p) {
-        JsonValue o = JsonValue.NewObject();
-        o.Put("id", JsonValue.NewInt(p.id));
-        o.Put("title", JsonValue.NewStr(p.title));
-        o.Put("summary", JsonValue.NewStr(p.summary));
-        o.Put("author", JsonValue.NewStr(p.author));
-        o.Put("tags", JsonValue.NewStr(p.tags));
-        o.Put("cover", JsonValue.NewStr(p.cover));
-        o.Put("categoryId", JsonValue.NewInt(p.categoryId));
-        o.Put("published", JsonValue.NewInt(p.published));
-        o.Put("top", JsonValue.NewInt(p.top));
+    private static void WritePostJson(JsonWriter w, Post p) {
+        w.WriteStartObject();
+        w.WritePropertyInt("id", p.id);
+        w.WritePropertyString("title", p.title);
+        w.WritePropertyString("summary", p.summary);
+        w.WritePropertyString("author", p.author);
+        w.WritePropertyString("tags", p.tags);
+        w.WritePropertyString("cover", p.cover);
+        w.WritePropertyInt("categoryId", p.categoryId);
+        w.WritePropertyInt("published", p.published);
+        w.WritePropertyInt("top", p.top);
         /* updatedAt 兼作乐观锁版本号：读时带给表单，写时校验。 */
-        o.Put("version", JsonValue.NewInt(p.updatedAt));
-        o.Put("createdAt", JsonValue.NewInt(p.createdAt));
-        return o;
+        w.WritePropertyLong("version", p.updatedAt);
+        w.WritePropertyLong("createdAt", p.createdAt);
     }
 
     private static string CategoryName(List<Category> cats, int id) {

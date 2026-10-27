@@ -668,27 +668,30 @@ public class CoderController : AdminController {
         AiReply r = await Ai.CompleteRaw(DesignPrompt(),
             DesignAsk(t, desc, cols, dicts, tables));
         if (!r.ok) { this.Fail(400, "0005", r.text); }
-        JsonValue root = DesignJson(r.text);
-        if (root == null || !root.IsObject()) {
+        JsonDoc root = DesignJson(r.text);
+        if (root == null || root.KindAt(root.root) != 5) {
             this.Fail(400, "0005", "AI 返回的内容无法解析为字段设计，请重试或换个描述");
         }
-        JsonValue colsArr = root.Get("columns");
-        if (colsArr == null || !colsArr.IsArray()) {
+        int colsArr = root.Get("columns");
+        if (colsArr < 0 || root.KindAt(colsArr) != 4) {
             this.Fail(400, "0005", "AI 返回的内容无法解析为字段设计，请重试或换个描述");
         }
-        ColumnDraft draft = ColumnDraft.Sanitize(colsArr, cols, tables);
+        ColumnDraft draft = ColumnDraft.Sanitize(root, colsArr, cols, tables);
         if (draft.cols.Count == 0) {
             this.Fail(400, "0005", "AI 给出的字段全部无效（重名或类型不合法），请换个描述再试");
         }
 
-        JsonValue outArr = JsonValue.NewArray();
+        JsonWriter w = new JsonWriter();
+        w.StartObject();
+        w.WriteKey("columns");
+        w.StartArray();
         for (int i = 0; i < draft.cols.Count; i = i + 1) {
-            outArr.Append(ColumnDraft.ColumnJson(draft.cols[i]));
+            ColumnDraft.WriteColumn(w, draft.cols[i]);
         }
-        JsonValue outObj = JsonValue.NewObject();
-        outObj.Put("columns", outArr);
-        outObj.Put("dropped", MetricsCluster.Num(draft.dropped));
-        this.Ok(outObj.ToJson());
+        w.EndArray();
+        w.WriteProperty("dropped", (long)draft.dropped);
+        w.EndObject();
+        this.Ok(w.ToString());
     }
 
     [HttpPost]
@@ -704,12 +707,12 @@ public class CoderController : AdminController {
             .ToListAsync();
         List<SysGenTable> tables = await this.SysGenTable.OrderBy(a => a.id)
             .ToListAsync();
-        JsonValue arr = JsonValue.ParseLenient(listJson);
-        if (arr == null || !arr.IsArray()) {
+        JsonDoc arrDoc = JsonDoc.Parse(listJson);
+        if (arrDoc == null || arrDoc.KindAt(arrDoc.root) != 4) {
             this.Fail(400, "0004", "字段清单无法解析");
         }
         /* 浏览器回传的数据同样不被信任：与生成走同一个清洗器。 */
-        ColumnDraft draft = ColumnDraft.Sanitize(arr, cols, tables);
+        ColumnDraft draft = ColumnDraft.Sanitize(arrDoc, arrDoc.root, cols, tables);
         if (draft.cols.Count == 0) {
             this.Fail(400, "0004", "没有可应用的有效字段");
         }
@@ -1023,11 +1026,11 @@ public class CoderController : AdminController {
     }
 
     /* 模型答语 → JSON 对象：剥掉可能的代码围栏与前后闲话，取首个 { 到末个 }。 */
-    private static JsonValue DesignJson(string raw) {
+    private static JsonDoc DesignJson(string raw) {
         int a = raw.IndexOf("{");
         int b = raw.LastIndexOf("}");
         if (a < 0 || b <= a) { return null; }
-        return JsonValue.ParseLenient(raw.Substring(a, b - a + 1));
+        return JsonDoc.Parse(raw.Substring(a, b - a + 1));
     }
 }
 

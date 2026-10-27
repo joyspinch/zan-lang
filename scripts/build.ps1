@@ -50,9 +50,10 @@ $doBuild = {
     # $ZAN_HOME\build\zanc.exe 当编译器）。Windows 上运行中的 exe 不可被
     # 替换，lld 会报 "permission denied" 并**先删掉输出**——于是：
     #   一边是这次构建失败，另一边是下一个调用者拿到"文件不存在"。
-    # 占用者通常几百毫秒就退出（一次编译而已），所以等一下重试即可。
+    # 占用者通常几百毫秒就退出（一次编译而已），但外部大项目发布时
+    # 可能会占用数十秒，因此重试上限设为 30 次（约 1 分钟）。
     # 只对"被占用"这一种失败重试，真实编译错误照常立刻失败。
-    $maxTry = 6
+    $maxTry = 30
     for ($try = 1; $try -le $maxTry; $try++) {
         # 这一次调用把 ErrorActionPreference 临时降为 Continue：native 命令把
         # stderr 写进管道时，Stop 会把它当成终止性错误直接抛出——那样就永远

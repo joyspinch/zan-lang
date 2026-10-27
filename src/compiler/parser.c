@@ -497,6 +497,15 @@ static bool paren_is_named_cast(zan_parser_t *p) {
     bool result = false;
     parser_advance(p);
     parser_advance(p);
+    while (p->current.kind == TK_DOT) {
+        if (zan_lexer_peek(p->lex).kind != TK_IDENT) break;
+        parser_advance(p);
+        parser_advance(p);
+    }
+    if (p->current.kind == TK_LBRACKET && zan_lexer_peek(p->lex).kind == TK_RBRACKET) {
+        parser_advance(p);
+        parser_advance(p);
+    }
     if (p->current.kind == TK_RPAREN) {
         switch (zan_lexer_peek(p->lex).kind) {
         case TK_IDENT: case TK_INT_LIT: case TK_FLOAT_LIT: case TK_DECIMAL_LIT:

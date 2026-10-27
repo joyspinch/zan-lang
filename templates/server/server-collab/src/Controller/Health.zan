@@ -19,53 +19,55 @@ public class Health : AppController {
     [Route("/health")]
     [Description("健康检查")]
     async void Index() {
-        JsonValue o = JsonValue.NewObject();
-        o.Put("status", JsonValue.NewStr("ok"));
-        WebApp app = WebHost.Current();
-        if (app != null) {
-            JsonValue m = JsonValue.ParseLenient(app.MetricsJson());
-            if (m != null && m.IsObject()) {
-                o.Put("uptime_ms", MetricsCluster.Num(m.Long("uptime_ms", 0)));
-                JsonValue rq = m.Get("requests");
-                if (rq != null) {
-                    o.Put("requests", MetricsCluster.Num(rq.Long("count", 0)));
-                }
-            }
-        }
-        o.Put("pid", MetricsCluster.Num(ProcessHost.Pid()));
-        o.Put("worker", MetricsCluster.Num(ProcessHost.WorkerId()));
-
+        string status = "ok";
+        string dbStatus = "";
         if (this.In("deep") == "1") {
             /* 租约在 OnBeforeAsync 已取得：DbReady() 即"借到了连接"。
                绝不再向池借第二条——持有租约时的嵌套借还会在连接耗尽时
                变成人人持一等人人的循环等待（AdminController 有实测注）。 */
             if (!this.DbReady()) {
-                o.Put("status", JsonValue.NewStr("down"));
-                o.Put("db", JsonValue.NewStr("pool not ready"));
+                status = "down";
+                dbStatus = "pool not ready";
                 this.Ctx().Status(503, "Service Unavailable");
-                this.Json(o.ToJson());
-                return;
+            } else {
+                string err = "";
+                bool dbUp = false;
+                try {
+                    DbResult r = await this.Held().QueryAsync("SELECT 1",
+                        new DbParams());
+                    dbUp = r != null;
+                } catch (Exception ex) {
+                    err = ex.Message;
+                }
+                if (!dbUp) {
+                    status = "down";
+                    string why = "unreachable";
+                    if (err.Length > 0) { why = err; }
+                    dbStatus = why;
+                    this.Ctx().Status(503, "Service Unavailable");
+                } else {
+                    dbStatus = "up";
+                }
             }
-            string err = "";
-            bool dbUp = false;
-            try {
-                DbResult r = await this.Held().QueryAsync("SELECT 1",
-                    new DbParams());
-                dbUp = r != null;
-            } catch (Exception ex) {
-                err = ex.Message;
-            }
-            if (!dbUp) {
-                o.Put("status", JsonValue.NewStr("down"));
-                string why = "unreachable";
-                if (err.Length > 0) { why = err; }
-                o.Put("db", JsonValue.NewStr(why));
-                this.Ctx().Status(503, "Service Unavailable");
-                this.Json(o.ToJson());
-                return;
-            }
-            o.Put("db", JsonValue.NewStr("up"));
         }
-        this.Json(o.ToJson());
+
+        JsonWriter w = new JsonWriter();
+        w.StartObject();
+        w.WriteProperty("status", status);
+        WebApp app = WebHost.Current();
+        if (app != null) {
+            JsonDoc m = JsonDoc.Parse(app.MetricsJson());
+            if (m != null) {
+                w.WriteProperty("uptime_ms", m.PathLong("uptime_ms", 0));
+                w.WriteProperty("requests", m.PathLong("requests.count", 0));
+            }
+        }
+        w.WriteProperty("pid", (long)ProcessHost.Pid());
+        w.WriteProperty("worker", (long)ProcessHost.WorkerId());
+        if (dbStatus.Length > 0) {
+            w.WriteProperty("db", dbStatus);
+        }
+        w.EndObject();
+        this.Json(w.ToString());
     }
 }

@@ -5,13 +5,20 @@ using System.Text;
 namespace System.Net.Http;
 
 // Worker / 协程级序列化缓冲复用池：
-// 为 HTTP 响应报文头构建与正文序列化提供零分配 StringBuilder 借还机制。
-// 借出时自动 Clear，归还时施加容量保护（超大缓冲区直接淘汰，防止常驻内存膨胀）。
+// 1. 为 HTTP 响应报文头构建与正文序列化提供零分配 StringBuilder 借还机制。
+// 2. 为 HTTP 全报文（头 + 正文）流式装配提供分级 byte[] 零分配复用池（16K / 64K / 256K）。
+// 借出时自动就绪，归还时施加容量保护（超大缓冲区直接淘汰，防止常驻内存膨胀）。
 public class HttpBufferPool {
     static List<StringBuilder> pool = new List<StringBuilder>();
     static int maxPoolSize = 512;
     // 超过 128KB 的异常大响应缓冲区不回池，直接由运行时析构回收
     static int maxRetainCapacity = 131072;
+
+    // 分级 byte[] 缓冲池
+    static List<byte[]> pool16k = new List<byte[]>();
+    static List<byte[]> pool64k = new List<byte[]>();
+    static List<byte[]> pool256k = new List<byte[]>();
+    static int maxBytePoolSize = 256;
 
     // 从池中借出一个已清理就绪的 StringBuilder。若池空则创建新实例。
     public static StringBuilder Rent() {
@@ -35,6 +42,63 @@ public class HttpBufferPool {
         lock (pool) {
             if (pool.Count >= maxPoolSize) { return; }
             pool.Add(sb);
+        }
+    }
+
+    // 租借指定最小容量的字节缓冲区：按 16K / 64K / 256K 梯度分桶，超大直分不回池。
+    public static byte[] RentBytes(int minCap) {
+        if (minCap <= 16384) {
+            lock (pool16k) {
+                int n = pool16k.Count;
+                if (n > 0) {
+                    byte[] b = pool16k[n - 1];
+                    pool16k.RemoveAt(n - 1);
+                    return b;
+                }
+            }
+            return new byte[16384];
+        }
+        if (minCap <= 65536) {
+            lock (pool64k) {
+                int n = pool64k.Count;
+                if (n > 0) {
+                    byte[] b = pool64k[n - 1];
+                    pool64k.RemoveAt(n - 1);
+                    return b;
+                }
+            }
+            return new byte[65536];
+        }
+        if (minCap <= 262144) {
+            lock (pool256k) {
+                int n = pool256k.Count;
+                if (n > 0) {
+                    byte[] b = pool256k[n - 1];
+                    pool256k.RemoveAt(n - 1);
+                    return b;
+                }
+            }
+            return new byte[262144];
+        }
+        return new byte[minCap];
+    }
+
+    // 归还字节缓冲区到对应梯度池中。
+    public static void ReturnBytes(byte[] buf) {
+        if (buf == null) { return; }
+        int len = buf.Length;
+        if (len == 16384) {
+            lock (pool16k) {
+                if (pool16k.Count < maxBytePoolSize) { pool16k.Add(buf); }
+            }
+        } else if (len == 65536) {
+            lock (pool64k) {
+                if (pool64k.Count < maxBytePoolSize) { pool64k.Add(buf); }
+            }
+        } else if (len == 262144) {
+            lock (pool256k) {
+                if (pool256k.Count < maxBytePoolSize) { pool256k.Add(buf); }
+            }
         }
     }
 }

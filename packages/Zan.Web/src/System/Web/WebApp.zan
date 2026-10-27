@@ -573,15 +573,12 @@ public class WebApp : IDisposable {
             }
 
             Worker.BumpStat();
-            string responseData = await this.Dispatch(ctx, route, keepAlive);
-            if (ctx.Hijacked()) { keepAlive = false; break; }
-            int _sent = await client.SendAsync(responseData);
-            if (ctx.IsBinary()) {
-                int blen = ctx.BodyLength();
-                if (blen > 0 && ctx.method != "HEAD") {
-                    int _sb = await client.SendBytesAsync(ctx.bodyBytes, blen);
-                }
+            await this.Dispatch(ctx, route, keepAlive);
+            if (ctx.Hijacked()) { keepAlive = false; ctx.ReleaseResponseBuf(); break; }
+            if (ctx.responseBuf != null && ctx.responseLen > 0) {
+                int _sent = await client.SendBytesAsync(ctx.responseBuf, 0, ctx.responseLen);
             }
+            ctx.ReleaseResponseBuf();
             Worker.BumpSent();
             if (!keepAlive) { break; }
         }
@@ -634,13 +631,12 @@ public class WebApp : IDisposable {
         return new byte[size + 1];
     }
 
-    async string Dispatch(HttpContext ctx, Route route, bool keepAlive) {
+    async void Dispatch(HttpContext ctx, Route route, bool keepAlive) {
         long startUs = ServerMetrics.MonoMicros();
         long _n = this.totalRequests.Increment();
         this.metrics.Entered();
-        string resp = "";
         try {
-            resp = await this.DispatchInner(ctx, route, keepAlive, startUs);
+            await this.DispatchInner(ctx, route, keepAlive, startUs);
         } finally {
             this.metrics.Left();
         }
@@ -658,7 +654,6 @@ public class WebApp : IDisposable {
             }
         }
         this.hooks.RunAfter(ctx, elapsedUs);
-        return resp;
     }
 
     // 全局与路由限流的唯一判定点，在正文缓冲/解析之前调用。
@@ -692,7 +687,7 @@ public class WebApp : IDisposable {
     // 花服务器的带宽与解析 CPU），uid 亦由门处解析好放在 ctx.uid。
     // ApiError 变成它携带的应答；其余异常记录后回答 500，handler 结束
     // 时仍未写应答的也兜底 500。
-    async string DispatchInner(HttpContext ctx, Route route, bool keepAlive, long startUs) {
+    async void DispatchInner(HttpContext ctx, Route route, bool keepAlive, long startUs) {
 
         string uid = ctx.uid;
         string principal = uid;
@@ -700,7 +695,8 @@ public class WebApp : IDisposable {
         if (principal.Length == 0) { principal = "_unknown_"; }
 
         if (!this.hooks.RunBefore(ctx)) {
-            return ctx.BuildResponse(keepAlive);
+            ctx.BuildResponseDirect(keepAlive);
+            return;
         }
 
         if (route == null) {
@@ -711,7 +707,8 @@ public class WebApp : IDisposable {
                 ctx.Status(404, "Not Found");
                 ctx.Json(WebApp.ErrorJson("404", "not found"));
             }
-            return ctx.BuildResponse(keepAlive);
+            ctx.BuildResponseDirect(keepAlive);
+            return;
         }
 
         ctx.routeAction = route.action;
@@ -723,17 +720,20 @@ public class WebApp : IDisposable {
                 if (this.WantsPage(ctx)) {
                     ctx.Redirect(this.loginPath + "?next="
                         + Encoding.UrlEncode(ctx.path));
-                    return ctx.BuildResponse(keepAlive);
+                    ctx.BuildResponseDirect(keepAlive);
+                    return;
                 }
                 ctx.Status(401, "Unauthorized");
                 ctx.Json(WebApp.ErrorJson("401", "authentication required"));
-                return ctx.BuildResponse(keepAlive);
+                ctx.BuildResponseDirect(keepAlive);
+                return;
             }
             if (route.needsAuth) {
                 if (!await this.Allow(uid, route.action)) {
                     ctx.Status(403, "Forbidden");
                     ctx.Json(WebApp.ErrorJson("403", "insufficient permission"));
-                    return ctx.BuildResponse(keepAlive);
+                    ctx.BuildResponseDirect(keepAlive);
+                    return;
                 }
             }
         }
@@ -745,7 +745,8 @@ public class WebApp : IDisposable {
             if (lockLease == null) {
                 ctx.Status(429, "Too Many Requests").SetHeader("Retry-After", "1");
                 ctx.Json(WebApp.ErrorJson("429", "request already in progress"));
-                return ctx.BuildResponse(keepAlive);
+                ctx.BuildResponseDirect(keepAlive);
+                return;
             }
         }
 
@@ -795,7 +796,7 @@ public class WebApp : IDisposable {
             long elapsedUs = ServerMetrics.MonoMicros() - startUs;
             this.router.RecordHit(rIdx, elapsedUs);
         }
-        return ctx.BuildResponse(keepAlive);
+        ctx.BuildResponseDirect(keepAlive);
     }
 
     bool WantsPage(HttpContext ctx) {
