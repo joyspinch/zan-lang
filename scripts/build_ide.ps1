@@ -86,6 +86,9 @@ $files += (Get-ChildItem src\ide_zan\*.zan -Recurse).FullName
 # The GUI stdlib is namespaced across subfolders (Gui root + Widget /
 # Component / Designer); recurse so every part is compiled.
 $files += (Get-ChildItem packages\Zan.Gui\src\Gui -Recurse -Include *.zan).FullName
+if (Test-Path packages\Zan.Gui.Designer) {
+    $files += (Get-ChildItem packages\Zan.Gui.Designer\src -Recurse -Include *.zan).FullName
+}
 if (Test-Path packages\Zan.Gui.Charts) {
     $files += (Get-ChildItem packages\Zan.Gui.Charts\src -Recurse -Include *.zan).FullName
 }
