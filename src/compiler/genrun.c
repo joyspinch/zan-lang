@@ -263,9 +263,17 @@ static int zan_gen_parse_pid(const char *s, uint32_t *out) {
     return 1;
 }
 
+typedef struct zan_gen_cached_item {
+    char name[ZAN_GEN_MAX_PATH];
+    uint64_t key;
+    uint64_t mtime;
+} zan_gen_cached_item;
+
 typedef struct zan_gen_sweep_ctx {
     const char *dir;
     uint64_t keep_key;
+    zan_gen_cached_item items[64];
+    int item_count;
 } zan_gen_sweep_ctx;
 
 static void zan_gen_sweep_one(const char *name, void *ud) {
@@ -292,13 +300,27 @@ static void zan_gen_sweep_one(const char *name, void *ud) {
                         (c >= 'A' && c <= 'F') ? (c - 'A' + 10) : 0;
                 fkey = (fkey << 4) | (uint64_t)d;
             }
-            if (ctx->keep_key != 0 && fkey != ctx->keep_key) {
-                snprintf(path, sizeof(path), "%s%c%s", dir, sep, name);
+            if (ctx->item_count < 64) {
+                snprintf(ctx->items[ctx->item_count].name,
+                         sizeof(ctx->items[ctx->item_count].name), "%s", name);
+                ctx->items[ctx->item_count].key = fkey;
+                uint64_t mt = 0;
 #ifdef _WIN32
-                DeleteFileA(path);
+                WIN32_FILE_ATTRIBUTE_DATA fad;
+                snprintf(path, sizeof(path), "%s%c%s", dir, sep, name);
+                if (GetFileAttributesExA(path, GetFileExInfoStandard, &fad)) {
+                    mt = ((uint64_t)fad.ftLastWriteTime.dwHighDateTime << 32) |
+                         (uint64_t)fad.ftLastWriteTime.dwLowDateTime;
+                }
 #else
-                remove(path);
+                struct stat st;
+                snprintf(path, sizeof(path), "%s%c%s", dir, sep, name);
+                if (stat(path, &st) == 0) {
+                    mt = (uint64_t)st.st_mtime;
+                }
 #endif
+                ctx->items[ctx->item_count].mtime = mt;
+                ctx->item_count++;
             }
             return;
         }
@@ -342,9 +364,42 @@ static void zan_gen_sweep(const char *dir, uint64_t keep_key) {
     if (swept) return;
     swept = 1;
     zan_gen_sweep_ctx ctx;
+    memset(&ctx, 0, sizeof(ctx));
     ctx.dir = dir;
     ctx.keep_key = keep_key;
     zan_gen_scan_dir(dir, zan_gen_sweep_one, &ctx);
+
+    /* 严格容量淘汰：至多保留 2 个已发布镜像（当前活跃版本 + 最多1个旧版本），彻底杜绝无限膨胀 */
+    if (ctx.item_count > 2) {
+        for (int i = 0; i < ctx.item_count - 1; i++) {
+            for (int j = i + 1; j < ctx.item_count; j++) {
+                int score_i = (ctx.items[i].key == keep_key) ? 1 : 0;
+                int score_j = (ctx.items[j].key == keep_key) ? 1 : 0;
+                int swap = 0;
+                if (score_j > score_i) swap = 1;
+                else if (score_j == score_i && ctx.items[j].mtime > ctx.items[i].mtime) swap = 1;
+                if (swap) {
+                    zan_gen_cached_item tmp = ctx.items[i];
+                    ctx.items[i] = ctx.items[j];
+                    ctx.items[j] = tmp;
+                }
+            }
+        }
+        for (int i = 2; i < ctx.item_count; i++) {
+            char del_path[ZAN_GEN_MAX_PATH];
+#ifdef _WIN32
+            const char s = '\\';
+#else
+            const char s = '/';
+#endif
+            snprintf(del_path, sizeof(del_path), "%s%c%s", dir, s, ctx.items[i].name);
+#ifdef _WIN32
+            DeleteFileA(del_path);
+#else
+            remove(del_path);
+#endif
+        }
+    }
 }
 
 
@@ -472,6 +527,29 @@ int zan_gen_ensure(const char *stdlib_root, char *exe, size_t exe_size) {
     if (!zexe[0]) {
         fprintf(stderr, "error: cannot locate zanc to compile the code generators\n");
         return -1;
+    }
+    /* 优先复用编译器同级已有的预编译生成器（如 build/ZanGen.exe 或 bin/ZanGen.exe），杜绝磁盘污染与动态编译 */
+    {
+        char tool_exe[ZAN_GEN_MAX_PATH];
+        snprintf(tool_exe, sizeof(tool_exe), "%s", zexe);
+        char *slash = strrchr(tool_exe, '/');
+        char *bslash = strrchr(tool_exe, '\\');
+        if (!slash || (bslash && bslash > slash)) slash = bslash;
+        if (slash) {
+            slash[1] = '\0';
+            strncat(tool_exe, "ZanGen" GEN_EXE_SUFFIX, sizeof(tool_exe) - strlen(tool_exe) - 1);
+#ifdef _WIN32
+            if (GetFileAttributesA(tool_exe) != INVALID_FILE_ATTRIBUTES) {
+                snprintf(exe, exe_size, "%s", tool_exe);
+                return 0;
+            }
+#else
+            if (access(tool_exe, X_OK) == 0) {
+                snprintf(exe, exe_size, "%s", tool_exe);
+                return 0;
+            }
+#endif
+        }
     }
     uint64_t key = UINT64_C(1469598103934665603);
     zan_gen_hash_text(&key, "zan-generator-cache-v2");

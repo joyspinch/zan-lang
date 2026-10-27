@@ -1531,20 +1531,8 @@ static uint64_t pi_meta_file_hash(const char *path, const char *src, size_t len)
 }
 
 static void pi_meta_cache_path(uint64_t key, char *out, size_t out_sz) {
-    out[0] = 0;
-    if (!key) return;
-    /* 默认不污染用户磁盘；仅当显式指定 ZAN_META_CACHE_DIR 时向隔离目录落盘 */
-    const char *override = getenv("ZAN_META_CACHE_DIR");
-    if (override && *override) {
-#ifdef _WIN32
-        snprintf(out, out_sz, "%s\\pullin-meta-%016llx.bin", override,
-                 (unsigned long long)key);
-#else
-        snprintf(out, out_sz, "%s/pullin-meta-%016llx.bin", override,
-                 (unsigned long long)key);
-#endif
-        return;
-    }
+    (void)key;
+    if (out && out_sz > 0) out[0] = 0;
 }
 
 #define PI_META_MAGIC UINT32_C(0x5a504d32)
@@ -1552,151 +1540,12 @@ static void pi_meta_cache_path(uint64_t key, char *out, size_t out_sz) {
 #define PI_META_MAX_NAMES 100000u
 
 static int pi_meta_cache_load(pi_file_t *f, const char *src, size_t len) {
-    if (!f || !f->path) return 0;
-    uint64_t key = pi_meta_file_hash(f->path, src, len);
-    char cache[1024];
-    pi_meta_cache_path(key, cache, sizeof(cache));
-    if (!cache[0]) return 0;
-    FILE *in = fopen(cache, "rb");
-    if (!in) return 0;
-    pi_dir_t *saved_head = pi_dirs_head, *saved_tail = pi_dirs_tail;
-    uint32_t magic = 0, version = 0, top = 0, idents = 0, usings = 0;
-    unsigned char ext = 0;
-    unsigned char ctrl = 0;
-    int ok = fread(&magic, sizeof(magic), 1, in) == 1 &&
-             fread(&version, sizeof(version), 1, in) == 1 &&
-             fread(&top, sizeof(top), 1, in) == 1 &&
-             fread(&idents, sizeof(idents), 1, in) == 1 &&
-             fread(&usings, sizeof(usings), 1, in) == 1 &&
-             fread(&ext, sizeof(ext), 1, in) == 1 &&
-             fread(&ctrl, sizeof(ctrl), 1, in) == 1 &&
-             magic == PI_META_MAGIC && version == PI_META_VERSION &&
-             top <= PI_META_MAX_NAMES && idents <= PI_META_MAX_NAMES &&
-             usings <= PI_META_MAX_NAMES;
-    for (uint32_t i = 0; ok && i < top; i++) {
-        uint16_t n = 0;
-        char buf[1024];
-        ok = fread(&n, sizeof(n), 1, in) == 1 && n < sizeof(buf) &&
-             fread(buf, 1, n, in) == n;
-        if (!ok) break;
-        buf[n] = 0;
-        pi_name_t *name = pi_intern(buf, n);
-        ok = name && pi_reserve((void *)&f->top, f->top_count,
-                                &f->top_cap, sizeof(pi_name_t *));
-        if (ok) f->top[f->top_count++] = name;
-    }
-    for (uint32_t i = 0; ok && i < idents; i++) {
-        uint16_t n = 0;
-        char buf[1024];
-        ok = fread(&n, sizeof(n), 1, in) == 1 && n < sizeof(buf) &&
-             fread(buf, 1, n, in) == n;
-        if (!ok) break;
-        pi_flag_ident(f, buf, n);
-    }
-    for (uint32_t i = 0; ok && i < usings; i++) {
-        uint16_t n = 0;
-        char buf[1024];
-        ok = fread(&n, sizeof(n), 1, in) == 1 && n < sizeof(buf) &&
-             fread(buf, 1, n, in) == n;
-        if (!ok) break;
-        buf[n] = 0;
-        ok = pi_reserve((void *)&f->usings, f->using_count,
-                        &f->using_cap, sizeof(char *));
-        if (ok) {
-            char *dup = (char *)zan_arena_alloc(pi_arena, n + 1);
-            ok = dup != NULL;
-            if (ok) {
-                memcpy(dup, buf, n + 1);
-                f->usings[f->using_count++] = dup;
-                pi_reach(dup);
-            }
-        }
-    }
-    fclose(in);
-    if (!ok) {
-        f->top = NULL; f->top_count = f->top_cap = 0;
-        f->usings = NULL; f->using_count = f->using_cap = 0;
-        pi_dirs_head = saved_head;
-        pi_dirs_tail = saved_tail;
-        return 0;
-    }
-    f->has_ext = ext != 0;
-    f->has_controller = ctrl != 0;
-    g_scale_stats.metadata_cache_hits++;
-    return 1;
+    (void)f; (void)src; (void)len;
+    return 0;
 }
 
 static void pi_meta_cache_write(const pi_file_t *f, const char *src, size_t len) {
-    if (!f || !f->path) return;
-    uint64_t key = pi_meta_file_hash(f->path, src, len);
-    char cache[1024], tmp[1060];
-    pi_meta_cache_path(key, cache, sizeof(cache));
-    if (!cache[0]) return;
-    /* 创建the cache directory (one level deep suffices everywhere) */
-    {
-        char dir[1024];
-        size_t dl = strlen(cache);
-        size_t cut = dl;
-        while (cut > 0 && cache[cut - 1] != '/' && cache[cut - 1] != '\\') cut--;
-        if (cut == 0 || cut >= sizeof(dir)) return;
-        memcpy(dir, cache, cut - 1);
-        dir[cut - 1] = 0;
-#ifdef _WIN32
-        CreateDirectoryA(dir, NULL);
-#else
-        mkdir(dir, 0755);
-#endif
-    }
-#ifdef _WIN32
-    snprintf(tmp, sizeof(tmp), "%s.tmp.%lu", cache, (unsigned long)GetCurrentProcessId());
-#else
-    snprintf(tmp, sizeof(tmp), "%s.tmp.%ld", cache, (long)getpid());
-#endif
-    FILE *out = fopen(tmp, "wb");
-    if (!out) return;
-    uint32_t magic = PI_META_MAGIC, version = PI_META_VERSION;
-    uint32_t top = (uint32_t)f->top_count;
-    uint32_t idents = (uint32_t)f->ident_count;
-    uint32_t usings = (uint32_t)f->using_count;
-    unsigned char ext = (unsigned char)(f->has_ext != 0);
-    unsigned char ctrl = (unsigned char)(f->has_controller != 0);
-    int ok = fwrite(&magic, sizeof(magic), 1, out) == 1 &&
-             fwrite(&version, sizeof(version), 1, out) == 1 &&
-             fwrite(&top, sizeof(top), 1, out) == 1 &&
-             fwrite(&idents, sizeof(idents), 1, out) == 1 &&
-             fwrite(&usings, sizeof(usings), 1, out) == 1 &&
-             fwrite(&ext, sizeof(ext), 1, out) == 1 &&
-             fwrite(&ctrl, sizeof(ctrl), 1, out) == 1;
-    for (uint32_t i = 0; ok && i < top; i++) {
-        const pi_name_t *n = f->top[i];
-        uint16_t len16 = n->len > UINT16_MAX ? 0 : (uint16_t)n->len;
-        ok = len16 != 0 || n->len == 0;
-        ok = ok && fwrite(&len16, sizeof(len16), 1, out) == 1 &&
-             fwrite(n->str, 1, len16, out) == len16;
-    }
-    for (uint32_t i = 0; ok && i < idents; i++) {
-        const pi_name_t *n = f->idents[i];
-        uint16_t len16 = n->len > UINT16_MAX ? 0 : (uint16_t)n->len;
-        ok = len16 != 0 || n->len == 0;
-        ok = ok && fwrite(&len16, sizeof(len16), 1, out) == 1 &&
-             fwrite(n->str, 1, len16, out) == len16;
-    }
-    for (uint32_t i = 0; ok && i < usings; i++) {
-        size_t nlen = strlen(f->usings[i]);
-        uint16_t len16 = nlen > UINT16_MAX ? 0 : (uint16_t)nlen;
-        ok = nlen <= UINT16_MAX && fwrite(&len16, sizeof(len16), 1, out) == 1 &&
-             fwrite(f->usings[i], 1, len16, out) == len16;
-    }
-    if (fclose(out) != 0) ok = 0;
-    if (ok) {
-#ifdef _WIN32
-        ok = MoveFileExA(tmp, cache, MOVEFILE_REPLACE_EXISTING) != 0;
-#else
-        ok = rename(tmp, cache) == 0;
-#endif
-        if (ok) g_scale_stats.metadata_cache_writes++;
-        else remove(tmp);
-    } else remove(tmp);
+    (void)f; (void)src; (void)len;
 }
 
 static void pi_scan_file(pi_file_t *f) {
