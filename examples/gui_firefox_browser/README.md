@@ -25,7 +25,12 @@ build/ffbrowser [起始地址]
 ## Firefox 从哪来
 
 按顺序自动发现：`ZAN_FF_EXE` 环境变量 → 注册表（`PathToExe` /
-App Paths）→ 标准安装目录。都找不到时控件画占位符说明原因。
+App Paths）→ 标准安装目录 → Zan 用户级缓存运行时。都没有时弹
+"正在准备 Firefox"进度窗，从 Mozilla 官方源自动下载（约 160MB）
+安装到 `~/Library/Caches/Zan/ff`（Windows 为
+`%LOCALAPPDATA%\Zan\ff`），之后不再下载；不想走下载就用
+`ZAN_FF_EXE` 指定本机 Firefox。控制台（无 Gui 帧循环）宿主用
+`FfBootstrap.EnsureAsync`，进度打在终端。
 
 注意：**部分自建/裁剪版 Firefox 的浏览器 UI 层不完整，Marionette
 会话建立会挂起**（`WebDriver:NewSession` 无回复）。遇到这种情况请
