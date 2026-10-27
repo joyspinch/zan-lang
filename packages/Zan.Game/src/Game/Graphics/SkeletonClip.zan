@@ -1,0 +1,168 @@
+using System;
+using System.Collections.Generic;
+
+namespace Game.Graphics;
+
+// 骨骼关键帧（BoneKeyframe）
+public class BoneKeyframe {
+    public double time; // 秒
+    public double x;
+    public double y;
+    public double rotation; // 弧度
+    public double scaleX;
+    public double scaleY;
+
+    public BoneKeyframe(double time, double x, double y, double rot, double sx, double sy) {
+        this.time = time;
+        this.x = x;
+        this.y = y;
+        this.rotation = rot;
+        this.scaleX = sx;
+        this.scaleY = sy;
+    }
+}
+
+// 骨骼关键帧动画轨道（BoneTrack）
+public class BoneTrack {
+    public int boneIndex;
+    public List<BoneKeyframe> keyframes;
+
+    public BoneTrack(int boneIndex) {
+        this.boneIndex = boneIndex;
+        this.keyframes = new List<BoneKeyframe>();
+    }
+
+    public void AddKeyframe(double time, double x, double y, double rot, double sx, double sy) {
+        keyframes.Add(new BoneKeyframe(time, x, y, rot, sx, sy));
+    }
+
+    // 针对给定时间采样求值（线性插值）
+    public void Evaluate(double time, out double outX, out double outY, out double outRot, out double outSx, out double outSy) {
+        if (keyframes.Count == 0) {
+            outX = 0.0; outY = 0.0; outRot = 0.0; outSx = 1.0; outSy = 1.0;
+            return;
+        }
+
+        if (keyframes.Count == 1 || time <= keyframes[0].time) {
+            BoneKeyframe k = keyframes[0];
+            outX = k.x; outY = k.y; outRot = k.rotation; outSx = k.scaleX; outSy = k.scaleY;
+            return;
+        }
+
+        int lastIdx = keyframes.Count - 1;
+        if (time >= keyframes[lastIdx].time) {
+            BoneKeyframe k = keyframes[lastIdx];
+            outX = k.x; outY = k.y; outRot = k.rotation; outSx = k.scaleX; outSy = k.scaleY;
+            return;
+        }
+
+        // 查找左右关键帧
+        for (int i = 0; i < lastIdx; i = i + 1) {
+            BoneKeyframe k1 = keyframes[i];
+            BoneKeyframe k2 = keyframes[i + 1];
+            if (time >= k1.time && time <= k2.time) {
+                double span = k2.time - k1.time;
+                double t = span > 0.0001 ? (time - k1.time) / span : 0.0;
+
+                outX = k1.x + (k2.x - k1.x) * t;
+                outY = k1.y + (k2.y - k1.y) * t;
+
+                // 角度最短路径插值
+                double diff = k2.rotation - k1.rotation;
+                while (diff > Math.PI) { diff = diff - Math.PI * 2.0; }
+                while (diff < -Math.PI) { diff = diff + Math.PI * 2.0; }
+                outRot = k1.rotation + diff * t;
+
+                outSx = k1.scaleX + (k2.scaleX - k1.scaleX) * t;
+                outSy = k1.scaleY + (k2.scaleY - k1.scaleY) * t;
+                return;
+            }
+        }
+
+        BoneKeyframe fallback = keyframes[0];
+        outX = fallback.x; outY = fallback.y; outRot = fallback.rotation; outSx = fallback.scaleX; outSy = fallback.scaleY;
+    }
+}
+
+// 骨骼动画剪辑（SkeletonClip）
+public class SkeletonClip {
+    public string name;
+    public double duration;
+    public bool isLoop;
+    public List<BoneTrack> tracks;
+
+    public SkeletonClip(string name, double duration, bool isLoop) {
+        this.name = name != null ? name : "";
+        this.duration = duration > 0.0 ? duration : 0.1;
+        this.isLoop = isLoop;
+        this.tracks = new List<BoneTrack>();
+    }
+
+    public void AddTrack(BoneTrack track) {
+        if (track != null) {
+            tracks.Add(track);
+        }
+    }
+
+    public void Sample(double time, SkeletonPose pose) {
+        if (pose == null) { return; }
+
+        double sampleTime = time;
+        if (isLoop && duration > 0.0) {
+            sampleTime = time % duration;
+            if (sampleTime < 0.0) { sampleTime = sampleTime + duration; }
+        } else {
+            if (sampleTime > duration) { sampleTime = duration; }
+            if (sampleTime < 0.0) { sampleTime = 0.0; }
+        }
+
+        for (int i = 0; i < tracks.Count; i = i + 1) {
+            BoneTrack trk = tracks[i];
+            Bone2D bone = pose.GetBone(trk.boneIndex);
+            if (bone != null) {
+                double x = 0.0; double y = 0.0; double rot = 0.0; double sx = 1.0; double sy = 1.0;
+                trk.Evaluate(sampleTime, out x, out y, out rot, out sx, out sy);
+                bone.SetLocal(x, y, rot, sx, sy);
+            }
+        }
+    }
+}
+
+// 骨骼动画播放器（SkeletonPlayer）
+public class SkeletonPlayer {
+    public SkeletonPose pose;
+    public SkeletonClip currentClip;
+    public double currentTime;
+    public double speed;
+    public bool isPlaying;
+
+    public SkeletonPlayer(SkeletonPose pose) {
+        this.pose = pose;
+        this.currentClip = null;
+        this.currentTime = 0.0;
+        this.speed = 1.0;
+        this.isPlaying = false;
+    }
+
+    public static SkeletonPlayer Create(SkeletonPose pose) {
+        return new SkeletonPlayer(pose);
+    }
+
+    public void Play(SkeletonClip clip) {
+        this.currentClip = clip;
+        this.currentTime = 0.0;
+        this.isPlaying = true;
+    }
+
+    public void Stop() {
+        this.isPlaying = false;
+    }
+
+    public void Update(double dt) {
+        if (!isPlaying || currentClip == null || pose == null) { return; }
+
+        currentTime = currentTime + dt * speed;
+        currentClip.Sample(currentTime, pose);
+        pose.UpdateWorldTransforms();
+    }
+}

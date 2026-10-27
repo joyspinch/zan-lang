@@ -1,0 +1,113 @@
+using System;
+using System.Collections.Generic;
+using Game.Graphics;
+using Game.Physics2D;
+using Game.Lighting2D;
+
+public class Program {
+    private static void Check(string label, bool condition) {
+        if (condition) {
+            Console.WriteLine("[PASS] " + label);
+        } else {
+            Console.WriteLine("[FAIL] " + label);
+        }
+    }
+
+    private static void TestSkeletonHierarchy() {
+        SkeletonPose pose = new SkeletonPose();
+        // 根骨骼位于 (100, 100)，长度 50
+        Bone2D root = new Bone2D("root", -1, 50.0);
+        root.SetLocal(100.0, 100.0, 0.0, 1.0, 1.0);
+        pose.AddBone(root);
+
+        // 手臂子骨骼接在根骨骼原点，长度 30，向右旋转 90 度 (PI / 2)
+        Bone2D arm = new Bone2D("arm", 0, 30.0);
+        arm.SetLocal(50.0, 0.0, Math.PI / 2.0, 1.0, 1.0);
+        pose.AddBone(arm);
+
+        pose.UpdateWorldTransforms();
+
+        Check("Skel_RootPos", root.worldX == 100.0 && root.worldY == 100.0);
+        // 手臂世界坐标 = 根世界坐标 + 50 = (150, 100)
+        Check("Skel_ArmPos", arm.worldX == 150.0 && arm.worldY == 100.0);
+
+        // 手臂骨尖（向下延伸 30）
+        double tipX = 0.0;
+        double tipY = 0.0;
+        arm.GetWorldTip(out tipX, out tipY);
+        Check("Skel_ArmTip", Math.Abs(tipX - 150.0) < 0.001 && Math.Abs(tipY - 130.0) < 0.001);
+
+        // 动画轨道插值采样
+        BoneTrack track = new BoneTrack(1);
+        track.AddKeyframe(0.0, 50.0, 0.0, 0.0, 1.0, 1.0);
+        track.AddKeyframe(1.0, 70.0, 0.0, Math.PI, 1.0, 1.0);
+
+        double sx = 0.0; double sy = 0.0; double srot = 0.0; double ssx = 1.0; double ssy = 1.0;
+        track.Evaluate(0.5, out sx, out sy, out srot, out ssx, out ssy);
+        // 0.5 秒时 x 应插值为 60
+        Check("Skel_TrackEval", Math.Abs(sx - 60.0) < 0.001 && Math.Abs(srot - Math.PI / 2.0) < 0.001);
+    }
+
+    private static void TestPhysicsJoints() {
+        JointWorld2D world = new JointWorld2D();
+        world.gravityY = 100.0; // 较小重力便于断言
+
+        // 静态锚点位于 (0, 0)
+        Body2D anchor = Body2D.CreateStatic(1, 0.0, 0.0);
+        // 悬挂质点位于 (0, 50)
+        Body2D bob = Body2D.CreateDynamic(2, 0.0, 50.0, 2.0);
+
+        world.AddBody(anchor);
+        world.AddBody(bob);
+
+        // 刚性距离连杆：目标距离 50.0
+        DistanceJoint2D distJoint = DistanceJoint2D.Create(anchor, bob, 50.0);
+        world.AddDistanceJoint(distJoint);
+
+        // 模拟步进 10 步
+        for (int i = 0; i < 10; i = i + 1) {
+            world.Step(0.02);
+        }
+
+        // 连杆约束下，虽然受重力下落拉扯，两点间距离仍应精确保持在 50.0 左右（误差 < 0.1 像素）
+        double dx = bob.x - anchor.x;
+        double dy = bob.y - anchor.y;
+        double actualDist = Math.Sqrt(dx * dx + dy * dy);
+        Check("Phys_DistanceConstraint", Math.Abs(actualDist - 50.0) < 0.1);
+
+        // 测试弹簧阻尼
+        Body2D p1 = Body2D.CreateStatic(3, 0.0, 0.0);
+        Body2D p2 = Body2D.CreateDynamic(4, 100.0, 0.0, 1.0); // 静止拉伸了 20 像素
+        SpringJoint2D spring = SpringJoint2D.Create(p1, p2, 80.0, 100.0, 5.0);
+        spring.ApplyForces(0.016);
+        // p2 受到向左拉力，vx 应小于 0
+        Check("Phys_SpringForce", p2.vx < 0.0);
+    }
+
+    private static void TestLightingAndShadows() {
+        Lighting2D lighting = new Lighting2D();
+        // 光源位于 (100, 100)，半径 200
+        PointLight2D light = PointLight2D.Create(100.0, 100.0, 200.0, unchecked((int)0xFFFFFFFF));
+        lighting.AddLight(light);
+
+        // 中间放置一块挡光墙 (180, 50, 20, 100)
+        ShadowCaster2D wall = ShadowCaster2D.CreateFromRect(180.0, 50.0, 20.0, 100.0);
+        lighting.AddCaster(wall);
+
+        // 未被遮挡点 (150, 100)：直射光照，距离 50，强度应大于 0
+        double unoccludedIntensity = lighting.SampleIntensity(150.0, 100.0);
+        Check("Light_Direct", unoccludedIntensity > 0.5);
+
+        // 处于墙体正后方的背光点 (250, 100)：被墙体阻断，强度应为 0
+        double occludedIntensity = lighting.SampleIntensity(250.0, 100.0);
+        Check("Light_ShadowOccluded", occludedIntensity == 0.0);
+        Check("Light_IsInShadow", lighting.IsInShadow(250.0, 100.0, 0.1));
+    }
+
+    public static void Main() {
+        TestSkeletonHierarchy();
+        TestPhysicsJoints();
+        TestLightingAndShadows();
+        Console.WriteLine("ALL ADVANCED 2D SYSTEMS PASSED.");
+    }
+}
