@@ -14,6 +14,10 @@ public class FpsGame {
     public Renderer3D renderer;
     public SceneNode rootNode;
 
+    // 渲染后端状态
+    public string backendName;
+    public bool isGpuBackend;
+
     // 交互拾取状态
     public bool targetHit;
     public float hitDistance;
@@ -57,6 +61,8 @@ public class FpsGame {
 
         this.targetHit = false;
         this.hitDistance = 0.0f;
+        this.backendName = "gl";
+        this.isGpuBackend = true;
 
         this.keyFwd = false;
         this.keyBwd = false;
@@ -169,7 +175,12 @@ public class FpsGame {
 
         // 1. 提交 3D 场景渲染计划
         plan.Build(rootNode);
-        renderer.Draw(c, plan);
+        int drawRes = renderer.Draw(c, plan);
+
+        // 如果 GPU 批次渲染未提交 (返回 0，通常为 CPU 兜底后端)，启用 CPU 3D 透视投影线框
+        if (drawRes == 0) {
+            DrawCpuWireframeFallback(c);
+        }
 
         // 2. 绘制 2D HUD 界面与准星
         int cx = 640;
@@ -181,17 +192,95 @@ public class FpsGame {
         c.DrawLine(cx, cy - 8, cx, cy + 8, crosshairColor, 2);
 
         // 顶部 HUD 信息
-        c.DrawRect(10, 10, 360, 80, unchecked((int)0xCC000000), 1);
-        c.DrawText(20, 20, "3D FIRST-PERSON EXPLORER", unchecked((int)0xFF00E5FF), 16);
+        c.DrawRect(10, 10, 420, 95, unchecked((int)0xCC000000), 1);
+        c.DrawText(20, 18, "3D FIRST-PERSON EXPLORER", unchecked((int)0xFF00E5FF), 16);
         string posStr = "POS: (" + Convert.ToString((int)controller.Position.X) + ", "
                                  + Convert.ToString((int)controller.Position.Y) + ", "
                                  + Convert.ToString((int)controller.Position.Z) + ")";
-        c.DrawText(20, 42, posStr, unchecked((int)0xFFFFFFFF), 14);
+        c.DrawText(20, 38, posStr, unchecked((int)0xFFFFFFFF), 14);
+
+        string backendStr = "BACKEND: " + (drawRes > 0 ? "GPU (OpenGL 3.3)" : "CPU (3D Wireframe Fallback)");
+        int backendColor = (drawRes > 0) ? unchecked((int)0xFF52C41A) : unchecked((int)0xFFFAAD14);
+        c.DrawText(20, 58, backendStr, backendColor, 13);
 
         if (targetHit) {
-            c.DrawText(20, 64, "LOCKED ON CUBE (DIST: " + Convert.ToString((int)hitDistance) + "m)", unchecked((int)0xFF00FF00), 14);
+            c.DrawText(20, 78, "LOCKED ON CUBE (DIST: " + Convert.ToString((int)hitDistance) + "m)", unchecked((int)0xFF00FF00), 14);
         } else {
-            c.DrawText(20, 64, "AIM: NO TARGET [WASD TO MOVE]", unchecked((int)0xFFAAAAAA), 14);
+            c.DrawText(20, 78, "AIM: NO TARGET [WASD TO MOVE]", unchecked((int)0xFFAAAAAA), 14);
         }
+    }
+
+    // CPU 3D 透视投影线框兜底渲染器
+    private void DrawCpuWireframeFallback(Canvas c) {
+        Mat4 vp = camera.ViewProjectionMatrix();
+
+        // 1. 绘制地面网格 (XZ 平面，-20m 到 +20m，每隔 4m 一道线)
+        for (int i = -5; i <= 5; i = i + 1) {
+            float coord = (float)i * 4.0f;
+            // 横线：(-20, 0, coord) -> (20, 0, coord)
+            Draw3DLine(c, vp, -20.0f, 0.0f, coord, 20.0f, 0.0f, coord, unchecked((int)0xFF2A2A3D));
+            // 纵线：(coord, 0, -20) -> (coord, 0, 20)
+            Draw3DLine(c, vp, coord, 0.0f, -20.0f, coord, 0.0f, 20.0f, unchecked((int)0xFF2A2A3D));
+        }
+
+        // 2. 绘制 3 栋建筑的 12 条棱线
+        float[] posX = new float[3] { -4.0f, 0.0f, 4.0f };
+        int[] colors = new int[3] { unchecked((int)0xFFFF4D4F), unchecked((int)0xFF40A9FF), unchecked((int)0xFF52C41A) };
+
+        for (int b = 0; b < 3; b = b + 1) {
+            float cx = posX[b];
+            int col = colors[b];
+
+            // 底面 4 条边
+            Draw3DLine(c, vp, cx - 1.0f, 0.0f, -1.0f, cx + 1.0f, 0.0f, -1.0f, col);
+            Draw3DLine(c, vp, cx + 1.0f, 0.0f, -1.0f, cx + 1.0f, 0.0f,  1.0f, col);
+            Draw3DLine(c, vp, cx + 1.0f, 0.0f,  1.0f, cx - 1.0f, 0.0f,  1.0f, col);
+            Draw3DLine(c, vp, cx - 1.0f, 0.0f,  1.0f, cx - 1.0f, 0.0f, -1.0f, col);
+
+            // 顶面 4 条边
+            Draw3DLine(c, vp, cx - 1.0f, 2.0f, -1.0f, cx + 1.0f, 2.0f, -1.0f, col);
+            Draw3DLine(c, vp, cx + 1.0f, 2.0f, -1.0f, cx + 1.0f, 2.0f,  1.0f, col);
+            Draw3DLine(c, vp, cx + 1.0f, 2.0f,  1.0f, cx - 1.0f, 2.0f,  1.0f, col);
+            Draw3DLine(c, vp, cx - 1.0f, 2.0f,  1.0f, cx - 1.0f, 2.0f, -1.0f, col);
+
+            // 4 条垂直立柱
+            Draw3DLine(c, vp, cx - 1.0f, 0.0f, -1.0f, cx - 1.0f, 2.0f, -1.0f, col);
+            Draw3DLine(c, vp, cx + 1.0f, 0.0f, -1.0f, cx + 1.0f, 2.0f, -1.0f, col);
+            Draw3DLine(c, vp, cx + 1.0f, 0.0f,  1.0f, cx + 1.0f, 2.0f,  1.0f, col);
+            Draw3DLine(c, vp, cx - 1.0f, 0.0f,  1.0f, cx - 1.0f, 2.0f,  1.0f, col);
+        }
+    }
+
+    // 空间两点通过相机透视投影矩阵绘制 2D 线段
+    private void Draw3DLine(Canvas c, Mat4 vp, float x1, float y1, float z1, float x2, float y2, float z2, int color) {
+        int sx1 = 0; int sy1 = 0;
+        int sx2 = 0; int sy2 = 0;
+        if (ProjectPoint(vp, x1, y1, z1, out sx1, out sy1) && ProjectPoint(vp, x2, y2, z2, out sx2, out sy2)) {
+            c.DrawLine(sx1, sy1, sx2, sy2, color, 1);
+        }
+    }
+
+    // 单点透视投影至屏幕像素坐标 (1280x720)
+    private bool ProjectPoint(Mat4 vp, float x, float y, float z, out int sx, out int sy) {
+        sx = 0; sy = 0;
+        // 列主序矩阵变换: v' = M * v
+        float clipX = vp.m[0] * x + vp.m[1] * y + vp.m[2] * z + vp.m[3];
+        float clipY = vp.m[4] * x + vp.m[5] * y + vp.m[6] * z + vp.m[7];
+        float clipW = vp.m[12] * x + vp.m[13] * y + vp.m[14] * z + vp.m[15];
+
+        if (clipW < 0.1f) {
+            return false; // 在相机近平面后方
+        }
+
+        float ndcX = clipX / clipW;
+        float ndcY = clipY / clipW;
+
+        if (ndcX < -2.0f || ndcX > 2.0f || ndcY < -2.0f || ndcY > 2.0f) {
+            return false;
+        }
+
+        sx = (int)((ndcX * 0.5f + 0.5f) * 1280.0f);
+        sy = (int)((0.5f - ndcY * 0.5f) * 720.0f);
+        return true;
     }
 }
