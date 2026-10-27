@@ -15,6 +15,9 @@
 - **丰富的坐标轴能力**：类目轴 (`category`)、数值轴 (`value`)、时间轴 (`time`)、对数轴 (`log`)、双 Y 轴及断轴 (`axis.breaks`)。
 - **开箱即用的交互体验**：悬浮工具提示 (Hover Tooltip)、图例点击过滤 (Legend Toggle)、数据区域缩放 (DataZoom)、标记线与标记点 (MarkLine / MarkPoint)。
 - **精美预设主题**：内置 `blue`, `dark`, `echarts6`, `macarons`, `shine`, `mint`, `sakura`, `roma`, `green`, `red`, `helianthus` 等多种配色方案。
+- **现代化正交架构**：
+  - **策略渲染器分派（`SeriesRendererRegistry`）**：采用策略模式解耦 32 种系列绘制算法，支持用户通过 `SeriesRendererRegistry.Register` 无缝扩展自定义渲染策略；
+  - **清晰工具层划分**：`ChartColor` 专注于色彩模型、透明度与色阶梯度；`ChartGeometry` 专注于网格盒模型、Nice 刻度划分与投影映射；`Chart.zan` 保留门面转发桩，100% 保持向后兼容。
 
 ---
 

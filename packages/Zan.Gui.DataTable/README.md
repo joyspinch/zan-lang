@@ -14,6 +14,8 @@
 - **导出**：Xlsx 导出（复用 stdlib System.Data.Excel）。
 - **多语言**：`lang/en.json`、`lang/zh.json` 参考语言包（App 自带
   `assets/lang/` 时优先）。
+- **统一虚拟化基元**：深度接入 `VirtualScrollHost` 纯计算基元，行切片与视口裁剪零堆分配；
+- **标准化数据契约**：布尔过滤与槽位序列化全面对齐语言级 `true`/`false` 字符串标准。
 
 ## 依赖
 
