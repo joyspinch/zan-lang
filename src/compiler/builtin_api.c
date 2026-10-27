@@ -193,6 +193,7 @@ static const zan_builtin_member_t members_nativemem[] = {
     { "Base64Decode",     'M', "long Base64Decode(nint dst, nint src, long size)" },
     { "JsonSkipWhitespace", 'M', "long JsonSkipWhitespace(nint ptr, long pos, long len)" },
     { "JsonScanString",     'M', "long JsonScanString(nint ptr, long pos, long len)" },
+    { "JsonParseFast",      'M', "long JsonParseFast(nint buf, long len, nint slots, long slotCap, nint pairs, long pairCap, nint outCounts)" },
     { "X25519",             'M', "long X25519(nint scalar, nint point, nint outBuf)" },
 };
 

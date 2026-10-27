@@ -46,26 +46,75 @@ public class JsonDoc {
     }
 
     public static JsonDoc Parse(string src) {
+        if (src == null) { throw new JsonException("JSON source cannot be null"); }
+        int len = src.Length;
+        byte[] buf = new byte[len + 32];
+        NativeMemory.PutString(buf, 0, src, len);
+        return JsonDoc.ParseInternal(buf, 0, len, src);
+    }
+
+    // 原生字节零拷贝直通解析（适用于底层网络 Socket / 文件缓冲）
+    public static JsonDoc ParseBytes(byte[] buf, int off, int len) {
+        if (buf == null) { throw new JsonException("JSON buffer cannot be null"); }
+        if (off < 0 || len < 0 || off + len > buf.Length) {
+            throw new JsonException("JSON buffer range out of bounds");
+        }
+        byte[] pbuf = buf;
+        int pstart = off;
+        if (buf.Length < off + len + 32) {
+            pbuf = new byte[len + 32];
+            NativeMemory.Copy(pbuf, (nint)buf + (nint)off, len);
+            pstart = 0;
+        }
+        string src = pbuf.ToStr(pstart, len);
+        return JsonDoc.ParseInternal(pbuf, pstart, len, src);
+    }
+
+    private static JsonDoc ParseInternal(byte[] buf, int off, int len, string src) {
         JsonDoc d = new JsonDoc();
+        d.src = src;
+        d.buf = buf;
+        d.escPool = new List<string>();
+
+        int slotCap = len / 4 + 32;
+        int pairCap = len / 8 + 16;
+        JsonSlot[] fastSlots = new JsonSlot[slotCap];
+        JsonPair[] fastPairs = new JsonPair[pairCap];
+        long[] counts = new long[4];
+
+        long ret = NativeMemory.JsonParseFast(buf, len, fastSlots, slotCap, fastPairs, pairCap, counts);
+        if (ret == 0) {
+            int slotCount = (int)counts[0];
+            int pairCount = (int)counts[1];
+            int endPos = (int)counts[2];
+            endPos = (int)NativeMemory.JsonSkipWhitespace(buf, (long)endPos, (long)len);
+            if (endPos >= len) {
+                d.slots = new List<JsonSlot>();
+                d.slots.Reserve(slotCount);
+                for (int i = 0; i < slotCount; i = i + 1) {
+                    d.slots.Add(fastSlots[i]);
+                }
+                d.pairs = new List<JsonPair>();
+                d.pairs.Reserve(pairCount);
+                for (int i = 0; i < pairCount; i = i + 1) {
+                    d.pairs.Add(fastPairs[i]);
+                }
+                d.root = 0;
+                return d;
+            }
+        }
+
+        // 回退至托管 ParseCore（支持带复杂反斜杠转义池物化、超深嵌套或超限扩容）
         d.slots = new List<JsonSlot>();
         d.pairs = new List<JsonPair>();
-        d.escPool = new List<string>();
-        d.slots.Reserve(src.Length / 4 + 16);
-        d.pairs.Reserve(src.Length / 8 + 8);
-        d.src = src;
-        int len = src.Length;
-        // pad 32 字节零：Load64 在 pos=len 处读 len..len+7 也安全，
-        // 热循环免去逐字节越界检查；pad 字节 0 不是任何 token 前缀，
-        // EOF 判定语义不变。下标 < len 与 ToBytes 逐字节一致。
-        d.buf = new byte[len + 32];
-        NativeMemory.PutString(d.buf, 0, src, len);
-        int pos = JsonDoc.ParseCore(d.slots, d.pairs, d.escPool, src,
-            d.buf, len);
+        d.slots.Reserve(slotCap);
+        d.pairs.Reserve(pairCap);
+        int pos = JsonDoc.ParseCore(d.slots, d.pairs, d.escPool, src, buf, len);
         if (pos < 0) {
             throw new JsonException("Malformed JSON at position "
                 + Convert.ToString(-1 - pos));
         }
-        pos = (int)NativeMemory.JsonSkipWhitespace(d.buf, (long)pos, (long)len);
+        pos = (int)NativeMemory.JsonSkipWhitespace(buf, (long)pos, (long)len);
         if (pos < len) {
             throw new JsonException("Malformed JSON at position "
                 + Convert.ToString(pos));

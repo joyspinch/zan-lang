@@ -323,7 +323,7 @@ add_custom_command(TARGET zanc POST_BUILD
 # single family still drag the whole block in, so splitting the members per
 # feature family is the follow-up (TASKS.md A493).
 set(ZAN_RT_CRYPTO_OBJ "${CMAKE_BINARY_DIR}/zan_crypto${CMAKE_C_OUTPUT_EXTENSION}")
-set(ZAN_RT_CRYPTO_ARCHIVE "${CMAKE_BINARY_DIR}/libzancrypto${CMAKE_C_STATIC_LIBRARY_SUFFIX}")
+set(ZAN_RT_CRYPTO_ARCHIVE "${CMAKE_BINARY_DIR}/libzancrypto.a")
 add_custom_command(
     OUTPUT ${ZAN_RT_CRYPTO_ARCHIVE}
     COMMAND ${ZAN_RT_IO_CC} ${ZAN_RT_OBJ_DEFS} -std=c11
@@ -2514,7 +2514,7 @@ add_test(NAME server_mvc_metrics_flush_retry
 set_tests_properties(server_mvc_metrics_flush_retry PROPERTIES TIMEOUT 180
   LABELS "full;standard;smoke")
 
-# The web AI chat parses SSE lines in ZanWeb.Ai.Ai.Delta. Three defects
+# The web AI chat parses SSE lines in Zan.Web.Ai.Ai.Delta. Three defects
 # lived there: a malformed frame threw (killing the whole stream), a
 # mid-stream error frame was skipped (caller saw a half answer and no
 # error), and the trailing half-line was dropped.

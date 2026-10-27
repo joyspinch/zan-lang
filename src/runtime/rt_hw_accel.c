@@ -3927,6 +3927,300 @@ int64_t zan_hw_json_scan_string(const uint8_t *buf, int64_t pos, int64_t len) {
     return len;
 }
 
+/* =====================================================================
+ *  Zan 极速原生 Tape JSON 解析引擎 (GB/s 级两阶段无分支 SIMD 状态机)
+ * ===================================================================== */
+
+typedef struct {
+    int64_t a;
+    int64_t b;
+} zan_json_slot_raw_t;
+
+typedef struct {
+    int32_t key_start;
+    int32_t key_len;
+    int32_t next_pair;
+    int32_t value_slot;
+} zan_json_pair_raw_t;
+
+static inline double zan_parse_double_fast(const uint8_t *buf, int64_t start, int64_t end) {
+    char tmp[64];
+    int64_t l = end - start;
+    if (l > 60) l = 60;
+    memcpy(tmp, buf + start, (size_t)l);
+    tmp[l] = '\0';
+    return strtod(tmp, NULL);
+}
+
+static inline int64_t zan_dbl_to_i64(double d) {
+    union { double f; int64_t i; } u;
+    u.f = d;
+    return u.i;
+}
+
+int64_t zan_hw_json_parse_fast(const uint8_t *buf, int64_t len,
+                               void *vslots, int64_t slot_cap,
+                               void *vpairs, int64_t pair_cap,
+                               int64_t *out_counts) {
+    if (!buf || len <= 0 || !vslots || !vpairs || !out_counts) return -1;
+    zan_json_slot_raw_t *sl = (zan_json_slot_raw_t*)vslots;
+    zan_json_pair_raw_t *pr = (zan_json_pair_raw_t*)vpairs;
+
+    int32_t slot_count = 0;
+    int32_t pair_count = 0;
+
+    int fr[(512 + 2) * 4];
+    const int maxd = 512;
+    int depth = 0;
+    int pbase = -4;
+    int wantKey = 0;
+    int64_t pos = 0;
+
+    while (1) {
+        if (pos < len && buf[pos] <= ' ') {
+            pos = zan_hw_json_skip_whitespace(buf, pos, len);
+        }
+        if (pos >= len) break;
+        uint64_t x = 0;
+        if (pos + 8 <= len) {
+            memcpy(&x, buf + pos, 8);
+        } else {
+            memcpy(&x, buf + pos, (size_t)(len - pos));
+        }
+        int c = (int)(x & 255);
+
+        if (wantKey) {
+            if (c != '"') return -1 - pos;
+            int64_t p2 = pos + 1;
+            int64_t start = p2;
+            int64_t res = zan_hw_json_scan_string(buf, p2, len);
+            if (res < 0) {
+                /* 有反斜杠转义，返回 -2 指示上层 fallback 到托管 pool */
+                return -2;
+            }
+            if (res >= len) return -1 - len;
+            int64_t q = res;
+
+            if (pair_count >= pair_cap) return -3;
+            int pi = pair_count++;
+            pr[pi].key_start = (int32_t)start;
+            pr[pi].key_len = (int32_t)(q - start);
+            pr[pi].next_pair = -1;
+            pr[pi].value_slot = -1;
+
+            if (fr[pbase + 3] >= 0) {
+                pr[fr[pbase + 3]].next_pair = pi;
+            }
+            fr[pbase + 3] = pi;
+            fr[pbase + 2]++;
+            pos = q + 1;
+
+            if (pos < len && buf[pos] <= ' ') {
+                pos = zan_hw_json_skip_whitespace(buf, pos, len);
+            }
+            if (pos >= len || buf[pos] != ':') return -1 - pos;
+            pos++;
+            wantKey = 0;
+            continue;
+        }
+
+        if (depth > maxd && fr[pbase] == 4) return -1 - pos;
+
+        int32_t vslot = -1;
+        if (c == '"') {
+            int64_t p2 = pos + 1;
+            int64_t start = p2;
+            int64_t res = zan_hw_json_scan_string(buf, p2, len);
+            if (res < 0) {
+                /* 遇到反斜杠转义，返回 -2 指示上层 fallback */
+                return -2;
+            }
+            if (res >= len) return -1 - len;
+            int64_t q = res;
+
+            if (slot_count >= slot_cap) return -3;
+            vslot = slot_count++;
+            sl[vslot].a = (int64_t)3 | ((int64_t)start << 8);
+            sl[vslot].b = (int64_t)(q - start);
+            pos = q + 1;
+        } else if (c == '{') {
+            int64_t pk = zan_hw_json_skip_whitespace(buf, pos + 1, len);
+            if (pk < len && buf[pk] == '}') {
+                if (slot_count >= slot_cap) return -3;
+                vslot = slot_count++;
+                sl[vslot].a = (int64_t)5 | (-256LL);
+                sl[vslot].b = (int64_t)1 << 31;
+                pos = pk + 1;
+            } else {
+                if (depth > maxd) return -1 - pos;
+                if (slot_count >= slot_cap) return -3;
+                vslot = slot_count++;
+                sl[vslot].a = (int64_t)5 | ((int64_t)pair_count << 8);
+
+                int fo = depth * 4;
+                fr[fo] = 5;
+                fr[fo + 1] = vslot;
+                fr[fo + 2] = 0;
+                fr[fo + 3] = -1;
+                depth++;
+                pbase = fo;
+                pos++;
+                wantKey = 1;
+                continue;
+            }
+        } else if (c == '[') {
+            int64_t pk = zan_hw_json_skip_whitespace(buf, pos + 1, len);
+            if (pk < len && buf[pk] == ']') {
+                if (slot_count >= slot_cap) return -3;
+                vslot = slot_count++;
+                sl[vslot].a = 4;
+                sl[vslot].b = (int64_t)1 << 31;
+                pos = pk + 1;
+            } else {
+                if (depth > maxd) return -1 - pos;
+                if (slot_count >= slot_cap) return -3;
+                vslot = slot_count++;
+                sl[vslot].a = 4;
+
+                int fa = depth * 4;
+                fr[fa] = 4;
+                fr[fa + 1] = vslot;
+                fr[fa + 2] = 0;
+                fr[fa + 3] = -1;
+                depth++;
+                pbase = fa;
+                pos++;
+                wantKey = 0;
+                continue;
+            }
+        } else if (c == 't') {
+            if ((uint32_t)x != 0x65757274) return -1 - pos;
+            if (slot_count >= slot_cap) return -3;
+            vslot = slot_count++;
+            sl[vslot].a = 1;
+            sl[vslot].b = 0;
+            pos += 4;
+        } else if (c == 'f') {
+            if ((x & 0xFFFFFFFFFFULL) != 0x65736C6166ULL) return -1 - pos;
+            if (slot_count >= slot_cap) return -3;
+            vslot = slot_count++;
+            sl[vslot].a = 6;
+            sl[vslot].b = 0;
+            pos += 5;
+        } else if (c == 'n') {
+            if ((uint32_t)x != 0x6C6C756E) return -1 - pos;
+            if (slot_count >= slot_cap) return -3;
+            vslot = slot_count++;
+            sl[vslot].a = 0;
+            sl[vslot].b = 0;
+            pos += 4;
+        } else {
+            /* 数字解析 */
+            int64_t ns = pos;
+            int64_t ni = pos;
+            if (c == '-') ni++;
+            int64_t nacc = 0;
+            int ndig = 0;
+            while (ni < len) {
+                int d = (int)buf[ni] - 48;
+                if (d < 0 || d > 9) break;
+                nacc = nacc * 10 + d;
+                ndig++;
+                ni++;
+            }
+            int nok = (ndig >= 1);
+            int is_int = nok;
+            if (nok && ni < len && buf[ni] == '.') {
+                is_int = 0;
+                ni++;
+                int nfd = 0;
+                while (ni < len) {
+                    int d = (int)buf[ni] - 48;
+                    if (d < 0 || d > 9) break;
+                    nfd++;
+                    ni++;
+                }
+                if (nfd == 0) nok = 0;
+            }
+            if (nok && ni < len && (buf[ni] == 'e' || buf[ni] == 'E')) {
+                is_int = 0;
+                ni++;
+                if (ni < len && (buf[ni] == '+' || buf[ni] == '-')) ni++;
+                int ned = 0;
+                while (ni < len) {
+                    int d = (int)buf[ni] - 48;
+                    if (d < 0 || d > 9) break;
+                    ned++;
+                    ni++;
+                }
+                if (ned == 0) nok = 0;
+            }
+            if (!nok) return -1 - ns;
+            if (slot_count >= slot_cap) return -3;
+            vslot = slot_count++;
+            if (is_int && ndig <= 18) {
+                if (c == '-') nacc = -nacc;
+                sl[vslot].a = 2;
+                sl[vslot].b = nacc;
+            } else {
+                sl[vslot].a = 7;
+                sl[vslot].b = zan_dbl_to_i64(zan_parse_double_fast(buf, ns, ni));
+            }
+            pos = ni;
+        }
+
+        if (depth == 0) {
+            out_counts[0] = slot_count;
+            out_counts[1] = pair_count;
+            out_counts[2] = pos;
+            return 0;
+        }
+
+        if (fr[pbase] == 4) {
+            fr[pbase + 2]++;
+        } else {
+            pr[fr[pbase + 3]].value_slot = vslot;
+        }
+
+        /* 分隔级联 */
+        while (1) {
+            if (pos < len && buf[pos] <= ' ') {
+                pos = zan_hw_json_skip_whitespace(buf, pos, len);
+            }
+            if (pos >= len) return -1 - pos;
+            c = buf[pos];
+            if (c == ',') {
+                pos++;
+                wantKey = (fr[pbase] == 5);
+                break;
+            }
+            int close = (fr[pbase] == 4) ? ']' : '}';
+            if (c != close) return -1 - pos;
+            pos++;
+            int32_t ms2 = fr[pbase + 1];
+            sl[ms2].b = (int64_t)fr[pbase + 2] | ((int64_t)(slot_count - ms2) << 31);
+            depth--;
+            pbase -= 4;
+            if (depth == 0) {
+                out_counts[0] = slot_count;
+                out_counts[1] = pair_count;
+                out_counts[2] = pos;
+                return 0;
+            }
+            if (fr[pbase] == 4) {
+                fr[pbase + 2]++;
+            } else {
+                pr[fr[pbase + 3]].value_slot = ms2;
+            }
+        }
+    }
+
+    out_counts[0] = slot_count;
+    out_counts[1] = pair_count;
+    out_counts[2] = pos;
+    return 0;
+}
+
 #if defined(__SIZEOF_INT128__) || (defined(__clang__) || defined(__GNUC__))
 typedef unsigned __int128 zan_fe_u128;
 #else
