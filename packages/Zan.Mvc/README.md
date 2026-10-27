@@ -6,12 +6,12 @@ Enterprise web application skeleton modeled on a production swoole (ZxPHP)
 framework, rebuilt on Zan's coroutine runtime — a layered controller/model
 structure, an external config file, and the ORM and cache wired in by default.
 
-本包以**包（基座）**形态存在，不再是一个项目：应用按层 `using ZanWeb.*;`
+本包以**包（基座）**形态存在，不再是一个项目：应用按层 `using Zan.Web.*;`
 引用包源（zanc 自动发现拉入），框架随包升级，应用代码零改动——非侵入。
 
 分层两件事：
 
-- **`Zan.Mvc` 包（本目录）** — 应用框架层与管理台：引导（`ZanWeb.Boot`）、
+- **`Zan.Mvc` 包（本目录）** — 应用框架层与管理台：引导（`Zan.Web.Core.Boot`）、
   配置/DB/缓存上下文、鉴权 RBAC、设置、Schema + 种子挂点、指标、任务宿主、
   sys 实体与 DAO、三个控制器基类（`AppController` / `ApiController` /
   `AdminController`），以及管理台与前台控制器、随包视图与静态资产。
@@ -783,8 +783,8 @@ logged at the `[log].slowSqlMs` / `[log].slowMs` thresholds.
 ```zan
 using System;
 using System.Web;
-using ZanWeb;
-using ZanWeb.Blog;
+using Zan.Web;
+using Zan.Web.Blog;
 
 class Program {
     static void Main() {

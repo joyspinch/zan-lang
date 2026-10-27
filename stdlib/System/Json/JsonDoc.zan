@@ -89,7 +89,7 @@ public class JsonDoc {
             int pairCount = (int)counts[1];
             int endPos = (int)counts[2];
             endPos = (int)NativeMemory.JsonSkipWhitespace(buf, (long)endPos, (long)len);
-            if (endPos >= len) {
+            if (endPos >= len && slotCount > 0) {
                 d.slots = new List<JsonSlot>();
                 d.slots.Reserve(slotCount);
                 for (int i = 0; i < slotCount; i = i + 1) {
@@ -103,7 +103,7 @@ public class JsonDoc {
                 d.root = 0;
                 return d;
             }
-        } else if (ret < -3) {
+        } else if (ret < 0 && ret != -2L && ret != -3L) {
             // 语法格式错误 -(位置+1)
             int errPos = (int)(-1 - ret);
             throw new JsonException("Malformed JSON at position " + Convert.ToString(errPos));
@@ -379,6 +379,7 @@ public class JsonDoc {
                 }
             }
         }
+        return (long)(-1 - pos);
     }
 
     // 熔合解析核心：单函数显式状态机。
@@ -841,7 +842,7 @@ public class JsonDoc {
     public int SlotCount() { return slots.Count; }
 
     public int NextSibling(int at) {
-        if (at < 0) { return -1; }
+        if (at < 0 || at >= slots.Count) { return -1; }
         long a = slots[at].a;
         int k = (int)(a & 255);
         if (k == 4 || k == 5) { return at + (int)(slots[at].b >> 31); }
@@ -849,13 +850,14 @@ public class JsonDoc {
     }
 
     public int FirstChild(int at) {
-        if (at < 0) { return -1; }
+        if (at < 0 || at >= slots.Count) { return -1; }
         int k = (int)(slots[at].a & 255);
         if (k == 4 || k == 5) { return at + 1; }
         return -1;
     }
 
     public int KindAt(int at) {
+        if (at < 0 || at >= slots.Count) { return 0; }
         int k = (int)(slots[at].a & 255);
         if (k == 6) { return 1; }
         if (k == 7) { return 2; }
@@ -867,8 +869,14 @@ public class JsonDoc {
     // （215 倍实测差距）。顺序遍历请走 FirstChild/NextSibling 链或
     // <see cref="ForEachChild"/>，只有真正的随机访问才用 At。
     public int At(int at, int i) {
+        if (at < 0 || at >= slots.Count || i < 0) { return -1; }
+        int count = this.Count(at);
+        if (i >= count) { return -1; }
         int c = at + 1;
-        for (int j = 0; j < i; j = j + 1) { c = this.NextSibling(c); }
+        for (int j = 0; j < i; j = j + 1) {
+            c = this.NextSibling(c);
+            if (c < 0 || c >= slots.Count) { return -1; }
+        }
         return c;
     }
 
@@ -890,12 +898,12 @@ public class JsonDoc {
     }
 
     public int Count(int at) {
-        if (at < 0) { return 0; }
+        if (at < 0 || at >= slots.Count) { return 0; }
         return (int)(slots[at].b & 2147483647L);
     }
 
     public int Get(int at, string key) {
-        if (at < 0) { return -1; }
+        if (at < 0 || at >= slots.Count) { return -1; }
         long oa = slots[at].a;
         if ((int)(oa & 255) != 5) { return -1; }
         int p = (int)(oa >> 8);
@@ -922,9 +930,12 @@ public class JsonDoc {
         return -1;
     }
 
+    public int Get(string key) { return this.Get(this.root, key); }
+    public bool Has(string key) { return this.Has(this.root, key); }
     public bool Has(int at, string key) { return this.Get(at, key) >= 0; }
 
     public string StrOfSlot(int at) {
+        if (at < 0 || at >= slots.Count) { return ""; }
         long a = slots[at].a;
         int start = (int)(a >> 8);
         if (start >= 0) { return src.Substring(start, (int)slots[at].b); }
@@ -932,7 +943,7 @@ public class JsonDoc {
     }
 
     public int IntAt(int at, int dflt) {
-        if (at < 0) { return dflt; }
+        if (at < 0 || at >= slots.Count) { return dflt; }
         int k = (int)(slots[at].a & 255);
         if (k == 2) { return (int)slots[at].b; }
         if (k == 7) { return (int)NativeMemory.AsF64(slots[at].b); }
@@ -942,7 +953,7 @@ public class JsonDoc {
     }
 
     public long LongAt(int at, long dflt) {
-        if (at < 0) { return dflt; }
+        if (at < 0 || at >= slots.Count) { return dflt; }
         int k = (int)(slots[at].a & 255);
         if (k == 2) { return slots[at].b; }
         if (k == 7) { return (long)NativeMemory.AsF64(slots[at].b); }
@@ -952,7 +963,7 @@ public class JsonDoc {
     }
 
     public double DoubleAt(int at, double dflt) {
-        if (at < 0) { return dflt; }
+        if (at < 0 || at >= slots.Count) { return dflt; }
         int k = (int)(slots[at].a & 255);
         if (k == 2) { return (double)slots[at].b; }
         if (k == 7) { return NativeMemory.AsF64(slots[at].b); }
@@ -962,7 +973,7 @@ public class JsonDoc {
     }
 
     public string StrAt(int at, string dflt) {
-        if (at < 0) { return dflt; }
+        if (at < 0 || at >= slots.Count) { return dflt; }
         long a = slots[at].a;
         int k = (int)(a & 255);
         if (k == 3) {
@@ -978,7 +989,7 @@ public class JsonDoc {
     }
 
     public bool BoolAt(int at, bool dflt) {
-        if (at < 0) { return dflt; }
+        if (at < 0 || at >= slots.Count) { return dflt; }
         int k = (int)(slots[at].a & 255);
         if (k == 1) { return true; }
         if (k == 6) { return false; }
@@ -1057,7 +1068,8 @@ public class JsonDoc {
         sb.Append("}");
     }
 
-    // 深度路径寻址：按点号切分（如 "user.profile.age"），在 Tape 槽位上快速推进。找不到返回 -1。
+    // 深度路径寻址：按点号与括号切分（如 "user.profile.age"、"choices[0].message.content" 或 "data.0.id"）。
+    // 在 Tape 槽位上无临时对象快速推进。找不到返回 -1。
     public int Path(int at, string path) {
         if (at < 0 || path == null || path.Length == 0) { return at; }
         int cur = at;
@@ -1067,10 +1079,63 @@ public class JsonDoc {
             int dot = i;
             while (dot < n && (path[dot] & 255) != 46) { dot = dot + 1; }
             string seg = path.Substring(i, dot - i);
-            cur = this.Get(cur, seg);
             i = dot + 1;
+            if (seg.Length == 0) { continue; }
+            cur = this.ResolveSeg(cur, seg);
         }
         return cur;
+    }
+
+    private int ResolveSeg(int at, string seg) {
+        if (at < 0 || seg == null || seg.Length == 0) { return at; }
+        int cur = at;
+        int slen = seg.Length;
+        int p = 0;
+        while (p < slen && cur >= 0) {
+            int bopen = p;
+            while (bopen < slen && (seg[bopen] & 255) != 91) { bopen = bopen + 1; }
+            if (bopen > p) {
+                string key = seg.Substring(p, bopen - p);
+                int k = (int)(slots[cur].a & 255);
+                if (k == 4) {
+                    int idx = 0;
+                    bool isNum = true;
+                    for (int j = 0; j < key.Length; j = j + 1) {
+                        int c = (key[j] & 255) - 48;
+                        if (c < 0 || c > 9) { isNum = false; break; }
+                        idx = idx * 10 + c;
+                    }
+                    cur = isNum ? this.At(cur, idx) : -1;
+                } else {
+                    cur = this.Get(cur, key);
+                }
+                if (cur < 0) { return -1; }
+            }
+            if (bopen < slen && (seg[bopen] & 255) == 91) {
+                int bclose = bopen + 1;
+                while (bclose < slen && (seg[bclose] & 255) != 93) { bclose = bclose + 1; }
+                if (bclose > bopen + 1) {
+                    int idx = 0;
+                    bool isNum = true;
+                    for (int j = bopen + 1; j < bclose; j = j + 1) {
+                        int c = (seg[j] & 255) - 48;
+                        if (c < 0 || c > 9) { isNum = false; break; }
+                        idx = idx * 10 + c;
+                    }
+                    cur = isNum ? this.At(cur, idx) : -1;
+                    if (cur < 0) { return -1; }
+                }
+                p = bclose + 1;
+            } else {
+                p = bopen;
+                break;
+            }
+        }
+        return cur;
+    }
+
+    public int Path(string path) {
+        return this.Path(this.root, path);
     }
 
     public int PathInt(string path, int dflt) {

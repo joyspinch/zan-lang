@@ -1,8 +1,8 @@
 using System;
 using System.Collections.Generic;
-using ZanWeb.Framework.Services;
+using System.Json;
 
-namespace ZanWeb;
+namespace Zan.Web.Services;
 
 public class MetricsCluster {
     /* 发布间隔 2 秒，秒级数据失效阈值 30 秒；累加总量不受失效阈值影响。 */
@@ -368,32 +368,38 @@ public class MetricsCluster {
         long[] rssArr = new long[want];
         int merged = 0;
         for (int i = 0; i < rows.Count; i = i + 1) {
-            JsonValue s = JsonValue.ParseLenient(rows[i].json);
-            if (s == null || !s.IsObject()) { continue; }
-            JsonValue pts = s.Get("points");
-            if (pts == null || !pts.IsArray()) { continue; }
+            JsonDoc s = JsonDoc.Parse(rows[i].json);
+            if (s == null) { continue; }
+            int pts = s.Get("points");
+            if (pts < 0 || s.KindAt(pts) != 4) { continue; }
             merged = merged + 1;
             /* 各 worker 以自身时间零点编号，回移 age 使同一秒来自所有 worker 的数据对齐。 */
             int shift = (int)rows[i].age;
-            for (int j = 0; j < pts.Count(); j = j + 1) {
-                JsonValue p = pts.At(j);
-                long t = p.Long("t", 1);
-                if (t > 0) { continue; }
-                int idx = want - 1 + (int)t - shift;  // t: -(want-1)..0
-                if (idx < 0 || idx >= want) { continue; }
-                long r = p.Long("req", 0);
-                req[idx] = req[idx] + r;
-                err[idx] = err[idx] + p.Long("err", 0);
-                avgW[idx] = avgW[idx] + r * p.Long("avg_us", 0);
-                if (p.Long("p95_us", 0) > p95[idx]) { p95[idx] = p.Long("p95_us", 0); }
-                if (p.Long("max_us", 0) > max[idx]) { max[idx] = p.Long("max_us", 0); }
-                long qn = p.Long("queries", 0);
-                q[idx] = q[idx] + qn;
-                qavgW[idx] = qavgW[idx] + qn * p.Long("query_avg_us", 0);
-                long c = p.Long("cpu_percent", 0 - 1);
-                if (c > 0) { cpu[idx] = cpu[idx] + c; }
-                long rb = p.Long("mem_rss_bytes", 0 - 1);
-                if (rb > 0) { rssArr[idx] = rssArr[idx] + rb; }
+            int count = s.Count(pts);
+            int p = s.FirstChild(pts);
+            for (int j = 0; j < count && p >= 0; j = j + 1) {
+                long t = s.LongAt(s.Get(p, "t"), 1);
+                if (t <= 0) {
+                    int idx = want - 1 + (int)t - shift;  // t: -(want-1)..0
+                    if (idx >= 0 && idx < want) {
+                        long r = s.LongAt(s.Get(p, "req"), 0);
+                        req[idx] = req[idx] + r;
+                        err[idx] = err[idx] + s.LongAt(s.Get(p, "err"), 0);
+                        avgW[idx] = avgW[idx] + r * s.LongAt(s.Get(p, "avg_us"), 0);
+                        long p95v = s.LongAt(s.Get(p, "p95_us"), 0);
+                        if (p95v > p95[idx]) { p95[idx] = p95v; }
+                        long maxv = s.LongAt(s.Get(p, "max_us"), 0);
+                        if (maxv > max[idx]) { max[idx] = maxv; }
+                        long qn = s.LongAt(s.Get(p, "queries"), 0);
+                        q[idx] = q[idx] + qn;
+                        qavgW[idx] = qavgW[idx] + qn * s.LongAt(s.Get(p, "query_avg_us"), 0);
+                        long c = s.LongAt(s.Get(p, "cpu_percent"), 0 - 1);
+                        if (c > 0) { cpu[idx] = cpu[idx] + c; }
+                        long rb = s.LongAt(s.Get(p, "mem_rss_bytes"), 0 - 1);
+                        if (rb > 0) { rssArr[idx] = rssArr[idx] + rb; }
+                    }
+                }
+                p = s.NextSibling(p);
             }
         }
         if (merged <= 1) { return app.MetricsSeriesJson(seconds); }

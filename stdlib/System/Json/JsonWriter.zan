@@ -1,0 +1,226 @@
+using System;
+using System.Text;
+
+namespace System.Json;
+
+// 工业级极速流式 JSON 写入器（JsonWriter）。
+// 专为高频服务端响应构造、网络协议封包与数据导出设计。
+// 零中间对象分配，状态由扁平深度栈管理，支持链式流式写入与对象池复用。
+public class JsonWriter {
+    private StringBuilder sb;
+    private int[] stack;
+    private int depth;
+    // 容器状态：0 = 刚进入容器（未写元素，不需逗号），1 = 已有元素（下次写入需补逗号），2 = 对象已写属性名（等待写入值）
+    // 容器类型：按位标记：bit 0-1 = 状态，bit 2 = 1 表示对象，0 表示数组
+
+    public JsonWriter() {
+        this.sb = new StringBuilder();
+        this.stack = new int[64];
+        this.depth = 0;
+    }
+
+    public JsonWriter(StringBuilder target) {
+        this.sb = target != null ? target : new StringBuilder();
+        this.stack = new int[64];
+        this.depth = 0;
+    }
+
+    // 重置写入器，复用内部缓冲区与栈，清零状态（服务端 Worker 级对象池复用核心）。
+    public void Reset() {
+        this.sb.Clear();
+        this.depth = 0;
+    }
+
+    // 重置并指定底层 StringBuilder
+    public void Reset(StringBuilder target) {
+        this.sb = target != null ? target : new StringBuilder();
+        this.depth = 0;
+    }
+
+    // 内部：处理元素/属性值前置分隔符
+    private void PrepareValue() {
+        if (this.depth > 0) {
+            int st = this.stack[this.depth - 1];
+            int kind = st & 4;
+            int state = st & 3;
+            if (kind == 4) { // Object
+                if (state == 2) {
+                    // 已写 key，值写完后将状态置为 1（已有完整键值对）
+                    this.stack[this.depth - 1] = kind | 1;
+                }
+            } else { // Array
+                if (state == 1) {
+                    this.sb.Append(",");
+                } else {
+                    this.stack[this.depth - 1] = kind | 1;
+                }
+            }
+        }
+    }
+
+    // 开始写入一个对象: {
+    public JsonWriter WriteStartObject() {
+        this.PrepareValue();
+        this.sb.Append("{");
+        this.Push(4 | 0); // Object, state = 0
+        return this;
+    }
+
+    // 结束写入当前对象: }
+    public JsonWriter WriteEndObject() {
+        if (this.depth <= 0 || (this.stack[this.depth - 1] & 4) == 0) {
+            throw new JsonException("JsonWriter: Mismatched WriteEndObject call");
+        }
+        this.depth = this.depth - 1;
+        this.sb.Append("}");
+        return this;
+    }
+
+    // 开始写入一个数组: [
+    public JsonWriter WriteStartArray() {
+        this.PrepareValue();
+        this.sb.Append("[");
+        this.Push(0 | 0); // Array, state = 0
+        return this;
+    }
+
+    // 结束写入当前数组: ]
+    public JsonWriter WriteEndArray() {
+        if (this.depth <= 0 || (this.stack[this.depth - 1] & 4) != 0) {
+            throw new JsonException("JsonWriter: Mismatched WriteEndArray call");
+        }
+        this.depth = this.depth - 1;
+        this.sb.Append("]");
+        return this;
+    }
+
+    // 写入对象属性名
+    public JsonWriter WritePropertyName(string name) {
+        if (this.depth <= 0 || (this.stack[this.depth - 1] & 4) == 0) {
+            throw new JsonException("JsonWriter: WritePropertyName must be called inside an Object");
+        }
+        int st = this.stack[this.depth - 1];
+        int state = st & 3;
+        if (state == 1) {
+            this.sb.Append(",");
+        }
+        this.sb.Append("\"");
+        this.sb.Append(Encoding.JsonEscape(name != null ? name : ""));
+        this.sb.Append("\":");
+        this.stack[this.depth - 1] = 4 | 2; // Object, waiting for value
+        return this;
+    }
+
+    // 写入标量字符串值
+    public JsonWriter WriteString(string val) {
+        this.PrepareValue();
+        if (val == null) {
+            this.sb.Append("null");
+        } else {
+            this.sb.Append("\"");
+            this.sb.Append(Encoding.JsonEscape(val));
+            this.sb.Append("\"");
+        }
+        return this;
+    }
+
+    // 写入整型值
+    public JsonWriter WriteInt(int val) {
+        this.PrepareValue();
+        this.sb.Append(Convert.ToString(val));
+        return this;
+    }
+
+    // 写入 64 位长整型值
+    public JsonWriter WriteLong(long val) {
+        this.PrepareValue();
+        this.sb.Append(Convert.ToString(val));
+        return this;
+    }
+
+    // 写入浮点数值
+    public JsonWriter WriteDouble(double val) {
+        this.PrepareValue();
+        this.sb.Append(Convert.ToString(val));
+        return this;
+    }
+
+    // 写入布尔值
+    public JsonWriter WriteBool(bool val) {
+        this.PrepareValue();
+        this.sb.Append(val ? "true" : "false");
+        return this;
+    }
+
+    // 写入 null 值
+    public JsonWriter WriteNull() {
+        this.PrepareValue();
+        this.sb.Append("null");
+        return this;
+    }
+
+    // 直接透传一段已序列化好的合法 JSON 片段（零拷贝组装如子文档）
+    public JsonWriter WriteRaw(string rawJson) {
+        this.PrepareValue();
+        if (rawJson == null || rawJson.Length == 0) {
+            this.sb.Append("null");
+        } else {
+            this.sb.Append(rawJson);
+        }
+        return this;
+    }
+
+    // ================= 便捷属性写入族 (Name + Value 单行调用) =================
+
+    public JsonWriter WriteProperty(string name, string val) {
+        this.WritePropertyName(name);
+        return this.WriteString(val);
+    }
+
+    public JsonWriter WriteProperty(string name, int val) {
+        this.WritePropertyName(name);
+        return this.WriteInt(val);
+    }
+
+    public JsonWriter WriteProperty(string name, long val) {
+        this.WritePropertyName(name);
+        return this.WriteLong(val);
+    }
+
+    public JsonWriter WriteProperty(string name, double val) {
+        this.WritePropertyName(name);
+        return this.WriteDouble(val);
+    }
+
+    public JsonWriter WriteProperty(string name, bool val) {
+        this.WritePropertyName(name);
+        return this.WriteBool(val);
+    }
+
+    public JsonWriter WriteNullProperty(string name) {
+        this.WritePropertyName(name);
+        return this.WriteNull();
+    }
+
+    public JsonWriter WriteRawProperty(string name, string rawJson) {
+        this.WritePropertyName(name);
+        return this.WriteRaw(rawJson);
+    }
+
+    private void Push(int val) {
+        if (this.depth >= this.stack.Length) {
+            int[] n = new int[this.stack.Length * 2];
+            for (int i = 0; i < this.stack.Length; i = i + 1) {
+                n[i] = this.stack[i];
+            }
+            this.stack = n;
+        }
+        this.stack[this.depth] = val;
+        this.depth = this.depth + 1;
+    }
+
+    // 获取当前写入的完整 JSON 文本
+    public string ToJson() {
+        return this.sb.ToString();
+    }
+}

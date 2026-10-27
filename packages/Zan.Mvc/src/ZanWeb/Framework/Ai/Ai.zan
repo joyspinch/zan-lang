@@ -6,10 +6,10 @@ using System.Net.Http;
 using System.Net.Http.Client;
 using System.Text;
 using System.Web;
-using ZanWeb.Security;
-using ZanWeb.Services;
+using Zan.Web.Security;
+using Zan.Web.Services;
 
-namespace ZanWeb.Ai;
+namespace Zan.Web.Ai;
 
 /* AI 助手：每个助手只是一段系统提示词。 */
 public class Ai {
@@ -150,25 +150,25 @@ public class Ai {
         sys.PutStr("role", "system");
         sys.PutStr("content", agent.prompt);
         msgs.Append(sys);
-        JsonValue hist = null;
+        JsonDoc hist = null;
         try {
-            hist = JsonValue.Parse(historyJson);
+            hist = JsonDoc.Parse(historyJson);
         } catch (Exception e) {
             /* history 是**客户端**传来的（见 AssistantController 的 this.In），
              * 坏 JSON 不该把请求炸成 500。解析不了就当没有历史——这一轮
-             * 照样能问，只是没有上文。Parse 遇坏 JSON 是抛异常。 */
+             * 照样能问，只是没有上文。 */
             hist = null;
         }
-        if (hist != null && hist.IsArray()) {
-            int keep = hist.Count();
+        if (hist != null && hist.KindAt(hist.root) == 4) {
+            int keep = hist.Count(hist.root);
             int start = 0;
             if (keep > 20) { start = keep - 20; }
             for (int i = start; i < keep; i = i + 1) {
-                JsonValue m = hist.At(i);
-                if (m == null) { continue; }
-                string role = m.Str("role", "user");
+                int m = hist.At(hist.root, i);
+                if (m < 0) { continue; }
+                string role = hist.StrAt(hist.Get(m, "role"), "user");
                 if (role != "user" && role != "assistant") { role = "user"; }
-                string content = m.Str("content", "");
+                string content = hist.StrAt(hist.Get(m, "content"), "");
                 if (content.Length == 0) { continue; }
                 JsonValue one = JsonValue.NewObject();
                 one.PutStr("role", role);
@@ -250,29 +250,28 @@ public class Ai {
         }
         if (raw == null || raw.Length == 0) { return AiReply.Bad("AI 服务没有返回内容"); }
 
-        JsonValue root = null;
+        JsonDoc root = null;
         try {
-            root = JsonValue.Parse(raw);
+            root = JsonDoc.Parse(raw);
         } catch (Exception e) {
             /* 坏 JSON 不该把整个请求炸成 500：上游返回的可能是代理的
-             * HTML 错误页、截断的响应体、网关插的一行日志。Parse 遇坏
-             * JSON 是**抛**异常（不是返回 null），这里接住，报成"无法解析"
-             * ——下面那行 "内容无法解析" 的分支本来就是这个意思。 */
+             * HTML 错误页、截断的响应体、网关插的一行日志。 */
             return AiReply.Bad("AI 服务返回的内容无法解析");
         }
         if (root == null) { return AiReply.Bad("AI 服务返回的内容无法解析"); }
-        JsonValue err = root.Get("error");
-        if (err != null && err.IsObject()) {
+        int err = root.Get("error");
+        if (err >= 0 && root.KindAt(err) == 5) {
             /* 服务商的错误文案直接回传，不会泄露 Key。 */
-            return AiReply.Bad(err.Str("message", "AI 服务返回错误"));
+            return AiReply.Bad(root.PathStr("error.message", "AI 服务返回错误"));
         }
-        JsonValue choices = root.Get("choices");
-        if (choices == null || !choices.IsArray() || choices.Count() == 0) {
-            return AiReply.Bad("AI 服务没有返回回答");
+        string content = root.PathStr("choices[0].message.content", "");
+        if (content.Length == 0) {
+            int msgSlot = root.Path(root.root, "choices[0].message");
+            if (msgSlot < 0) {
+                return AiReply.Bad("AI 服务没有返回回答");
+            }
         }
-        JsonValue msg = choices.At(0).Get("message");
-        if (msg == null) { return AiReply.Bad("AI 服务没有返回回答"); }
-        return AiReply.Good(msg.Str("content", ""));
+        return AiReply.Good(content);
     }
 
     /* 流式调用：delta 逐块推到浏览器。 */
@@ -416,29 +415,21 @@ public class Ai {
         if (!line.StartsWith("data:")) { return AiStreamFrame.Skip(); }
         string payload = line.Substring(5).Trim();
         if (payload.Length == 0 || payload == "[DONE]") { return AiStreamFrame.Skip(); }
-        JsonValue v = null;
+        JsonDoc doc = null;
         try {
-            v = JsonValue.Parse(payload);
+            doc = JsonDoc.Parse(payload);
         } catch (Exception e) {
             /* 坏帧跳过，不让整条流断掉。 */
             return AiStreamFrame.Skip();
         }
-        if (v == null) { return AiStreamFrame.Skip(); }
-        JsonValue frameError = v.Get("error");
-        if (frameError != null && !frameError.IsNull()) {
-            string reason = frameError.Str("message", "");
+        if (doc == null) { return AiStreamFrame.Skip(); }
+        int frameError = doc.Get("error");
+        if (frameError >= 0 && doc.KindAt(frameError) != 0) {
+            string reason = doc.PathStr("error.message", "");
             if (reason.Length == 0) { reason = "流内错误帧"; }
             return AiStreamFrame.Error(reason);
         }
-        JsonValue choices = v.Get("choices");
-        if (choices == null || !choices.IsArray() || choices.Count() == 0) {
-            return AiStreamFrame.Skip();
-        }
-        JsonValue first = choices.At(0);
-        if (first == null) { return AiStreamFrame.Skip(); }
-        JsonValue delta = first.Get("delta");
-        if (delta == null) { return AiStreamFrame.Skip(); }
-        string piece = delta.Str("content", "");
+        string piece = doc.PathStr("choices[0].delta.content", "");
         if (piece.Length == 0) { return AiStreamFrame.Skip(); }
         return AiStreamFrame.Delta(piece);
     }
@@ -463,23 +454,23 @@ public class Ai {
         }
         http.Close();
         if (raw == null || raw.Length == 0) { return ids; }
-        JsonValue root = null;
+        JsonDoc root = null;
         try {
-            root = JsonValue.Parse(raw);
+            root = JsonDoc.Parse(raw);
         } catch (Exception e) {
             /* 拿不到模型列表不是致命错误：返回空列表，让调用方按"没有可用
-             * 模型"处理。Parse 遇坏 JSON 是抛异常，不接住的话整个列表请求
-             * 会炸掉——而模型列表只是下拉框的候选项。 */
+             * 模型"处理。 */
             return ids;
         }
         if (root == null) { return ids; }
-        JsonValue data = root.Get("data");
-        if (data == null || !data.IsArray()) { return ids; }
-        for (int i = 0; i < data.Count(); i = i + 1) {
-            JsonValue m = data.At(i);
-            if (m == null) { continue; }
-            string id = m.Str("id", "");
+        int data = root.Get("data");
+        if (data < 0 || root.KindAt(data) != 4) { return ids; }
+        int dCount = root.Count(data);
+        int m = root.FirstChild(data);
+        for (int i = 0; i < dCount && m >= 0; i = i + 1) {
+            string id = root.StrAt(root.Get(m, "id"), "");
             if (id.Length > 0) { ids.Add(id); }
+            m = root.NextSibling(m);
         }
         return ids;
     }
