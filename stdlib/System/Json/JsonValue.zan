@@ -944,25 +944,66 @@ public class JsonValue {
 
     // ---- 解析 -----------------------------------------------------------
 
-    // 将 JSON 文档解析为值树。格式错误时抛出
-    // JsonException（与 C# 一致）。校验与建树在同一遍扫描里
-    // 完成：出错只记录位置并停止，抛异常前先丢掉部分树，
-    // 所以错误路径依然不持有存活分配。
+    // 将 JsonDoc Tape 节点快速物化为可变的 JsonValue DOM 子树。
+    public static JsonValue FromDoc(JsonDoc doc) {
+        if (doc == null) { return JsonValue.NewNull(); }
+        return JsonValue.FromDoc(doc, doc.root);
+    }
+
+    // 从 JsonDoc 指定槽位快速物化为 JsonValue DOM 节点（预知容量、零重复语法校验）。
+    public static JsonValue FromDoc(JsonDoc doc, int at) {
+        if (doc == null || at < 0 || at >= doc.slotCount) { return JsonValue.NewNull(); }
+        int k = doc.KindAt(at);
+        if (k == 0) { return JsonValue.NewNull(); }
+        if (k == 1) { return JsonValue.NewBool(doc.BoolAt(at, false)); }
+        if (k == 2) {
+            long a = doc.slots[at].a;
+            int rawK = (int)(a & 255);
+            if (rawK == 7) {
+                return JsonValue.NewDouble(doc.DoubleAt(at, 0.0));
+            }
+            return JsonValue.NewInt(doc.LongAt(at, 0L));
+        }
+        if (k == 3) { return JsonValue.NewStr(doc.StrAt(at, "")); }
+        if (k == 4) {
+            int n = doc.Count(at);
+            JsonValue arr = JsonValue.NewArray();
+            if (n == 0) { return arr; }
+            arr.items.Reserve(n);
+            int c = doc.FirstChild(at);
+            for (int i = 0; i < n; i = i + 1) {
+                arr.items.Add(JsonValue.FromDoc(doc, c));
+                c = doc.NextSibling(c);
+            }
+            return arr;
+        }
+        if (k == 5) {
+            int n = doc.Count(at);
+            JsonValue obj = JsonValue.NewObject();
+            if (n == 0) { return obj; }
+            obj.keys.Reserve(n);
+            obj.vals.Reserve(n);
+            int p = (int)(doc.slots[at].a >> 8);
+            int seen = 0;
+            while (p >= 0 && seen < n) {
+                JsonPair pair = doc.pairs[p];
+                string key = pair.keyStart < 0 ? doc.escPool[pair.keyLen] : doc.src.Substring(pair.keyStart, pair.keyLen);
+                obj.keys.Add(key);
+                obj.vals.Add(JsonValue.FromDoc(doc, pair.valueSlot));
+                p = pair.nextPair;
+                seen = seen + 1;
+            }
+            return obj;
+        }
+        return JsonValue.NewNull();
+    }
+
+    // 将 JSON 文档解析为值树。基于 JsonDoc Tape 高速扫描索引一次性物化 DOM 树，
+    // 预知子容器容量且免除二次语法校验。格式错误时抛出 JsonException。
     public static JsonValue Parse(string src) {
-        JsonReader r = JsonReader.OfStrict(src);
-        JsonValue v = r.ReadValue();
-        if (r.errPos < 0) {
-            r.SkipWs();
-            if (r.pos < r.len) { r.errPos = r.pos; }  // 尾部有多余内容
-        }
-        int errPos = r.errPos;
-        if (errPos >= 0) {
-            v = null;
-            r = null;
-            throw new JsonException("Malformed JSON at position "
-            + Convert.ToString(errPos));
-        }
-        return v;
+        if (src == null) { throw new JsonException("JSON source cannot be null"); }
+        JsonDoc doc = JsonDoc.Parse(src);
+        return JsonValue.FromDoc(doc, doc.root);
     }
 
     // 尽力而为的解析：输入格式错误时返回已解析的部分

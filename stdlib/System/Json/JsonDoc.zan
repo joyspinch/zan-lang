@@ -22,14 +22,16 @@ namespace System.Json;
 // <see cref="JsonDoc.KindAt"/> 把 6/7 归一化回 0..5 对外契约。
 public class JsonDoc {
     // tape 槽位（外部走访问器）。
-    public List<JsonSlot> slots;
+    public JsonSlot[] slots;
+    public int slotCount;
     // 全部对象的键值对表（对象槽 a 高位记首对下标）。
-    public List<JsonPair> pairs;
+    public JsonPair[] pairs;
+    public int pairCount;
     // 含转义的字符串/键在此物化（无转义的走 src 零拷贝）。
     public List<string> escPool;
     // 源串。零拷贝 token 指向它，因此它随 doc 存活。
     public string src;
-    // 源字节缓冲，下标 &lt; len 与字符串下标一一对应；尾部多 32 字节
+    // 源字节缓冲，下标 < len 与字符串下标一一对应；尾部多 32 字节
     // 零填充供 Load64 裸读兜越界。键比较走它——数组索引比 string
     // 索引快约 7 倍。
     public byte[] buf;
@@ -38,7 +40,9 @@ public class JsonDoc {
 
     public JsonDoc() {
         this.slots = null;
+        this.slotCount = 0;
         this.pairs = null;
+        this.pairCount = 0;
         this.escPool = null;
         this.src = "";
         this.buf = null;
@@ -90,16 +94,10 @@ public class JsonDoc {
             int endPos = (int)counts[2];
             endPos = (int)NativeMemory.JsonSkipWhitespace(buf, (long)endPos, (long)len);
             if (endPos >= len && slotCount > 0) {
-                d.slots = new List<JsonSlot>();
-                d.slots.Reserve(slotCount);
-                for (int i = 0; i < slotCount; i = i + 1) {
-                    d.slots.Add(fastSlots[i]);
-                }
-                d.pairs = new List<JsonPair>();
-                d.pairs.Reserve(pairCount);
-                for (int i = 0; i < pairCount; i = i + 1) {
-                    d.pairs.Add(fastPairs[i]);
-                }
+                d.slots = fastSlots;
+                d.slotCount = slotCount;
+                d.pairs = fastPairs;
+                d.pairCount = pairCount;
                 d.root = 0;
                 return d;
             }
@@ -110,11 +108,11 @@ public class JsonDoc {
         }
 
         // 回退至托管 ParseCore（支持带复杂反斜杠转义池物化、超深嵌套或超限扩容）
-        d.slots = new List<JsonSlot>();
-        d.pairs = new List<JsonPair>();
-        d.slots.Reserve(slotCap);
-        d.pairs.Reserve(pairCap);
-        int pos = JsonDoc.ParseCore(d.slots, d.pairs, d.escPool, src, buf, len);
+        List<JsonSlot> coreSlots = new List<JsonSlot>();
+        List<JsonPair> corePairs = new List<JsonPair>();
+        coreSlots.Reserve(slotCap);
+        corePairs.Reserve(pairCap);
+        int pos = JsonDoc.ParseCore(coreSlots, corePairs, d.escPool, src, buf, len);
         if (pos < 0) {
             throw new JsonException("Malformed JSON at position "
                 + Convert.ToString(-1 - pos));
@@ -124,6 +122,17 @@ public class JsonDoc {
             throw new JsonException("Malformed JSON at position "
                 + Convert.ToString(pos));
         }
+        if (coreSlots.Count == 0) {
+            throw new JsonException("Empty JSON document");
+        }
+        JsonSlot[] slArr = new JsonSlot[coreSlots.Count];
+        for (int i = 0; i < coreSlots.Count; i = i + 1) { slArr[i] = coreSlots[i]; }
+        d.slots = slArr;
+        d.slotCount = coreSlots.Count;
+        JsonPair[] prArr = new JsonPair[corePairs.Count];
+        for (int i = 0; i < corePairs.Count; i = i + 1) { prArr[i] = corePairs[i]; }
+        d.pairs = prArr;
+        d.pairCount = corePairs.Count;
         d.root = 0;
         return d;
     }
@@ -320,7 +329,7 @@ public class JsonDoc {
                     }
                     if (ned == 0) { nok = false; }
                 }
-                if (!nok) { return (long)(-1 - ns); }
+                if (!nok) { return (long)(-1 - ni); }
                 if (slotCount >= slotCap) { return -3L; }
                 vslot = slotCount;
                 slotCount = slotCount + 1;
@@ -329,8 +338,8 @@ public class JsonDoc {
                     sl[vslot].a = 2L;
                     sl[vslot].b = nacc;
                 } else {
-                    sl[vslot].a = 7L;
-                    sl[vslot].b = NativeMemory.AsI64(JsonDoc.DoubleInRange(buf, ns, ni));
+                    sl[vslot].a = 7L | ((long)ns << 8);
+                    sl[vslot].b = (long)(ni - ns);
                 }
                 pos = ni;
             }
@@ -599,16 +608,15 @@ public class JsonDoc {
                     }
                     if (ned == 0) { nok = false; }
                 }
-                if (!nok) { return -1 - ns; }
+                if (!nok) { return -1 - ni; }
                 JsonSlot tn2 = new JsonSlot();
                 if (nisInt && ndig <= 18) {
                     if (c == 45) { nacc = 0 - nacc; }
                     tn2.a = 2;
                     tn2.b = nacc;
                 } else {
-                    tn2.a = 7;
-                    tn2.b = NativeMemory.AsI64(
-                        JsonDoc.DoubleInRange(buf, ns, ni));
+                    tn2.a = 7L | ((long)ns << 8);
+                    tn2.b = (long)(ni - ns);
                 }
                 sl.Add(tn2);
                 pos = ni;
@@ -716,9 +724,10 @@ public class JsonDoc {
                 else if (n2 == 98) { sb.Append(Encoding.CharFromCode(8)); }
                 else if (n2 == 102) { sb.Append(Encoding.CharFromCode(12)); }
                 else if (n2 == 117) {
+                    int escStart = pos;
                     pos = pos + 2;
                     int cp = JsonDoc.Hex4(src, pos, len);
-                    if (cp < 0) { return -1 - pos; }
+                    if (cp < 0) { return -1 - escStart; }
                     pos = pos + 4;
                     if (cp >= 55296 && cp <= 56319 && pos + 5 < len
                         && (buf[pos] & 255) == 92 && (buf[pos + 1] & 255) == 117) {
@@ -839,10 +848,10 @@ public class JsonDoc {
 
     // ---------- 访问器 ----------
 
-    public int SlotCount() { return slots.Count; }
+    public int SlotCount() { return this.slotCount; }
 
     public int NextSibling(int at) {
-        if (at < 0 || at >= slots.Count) { return -1; }
+        if (at < 0 || at >= this.slotCount) { return -1; }
         long a = slots[at].a;
         int k = (int)(a & 255);
         if (k == 4 || k == 5) { return at + (int)(slots[at].b >> 31); }
@@ -850,14 +859,14 @@ public class JsonDoc {
     }
 
     public int FirstChild(int at) {
-        if (at < 0 || at >= slots.Count) { return -1; }
+        if (at < 0 || at >= this.slotCount) { return -1; }
         int k = (int)(slots[at].a & 255);
         if (k == 4 || k == 5) { return at + 1; }
         return -1;
     }
 
     public int KindAt(int at) {
-        if (at < 0 || at >= slots.Count) { return 0; }
+        if (at < 0 || at >= this.slotCount) { return 0; }
         int k = (int)(slots[at].a & 255);
         if (k == 6) { return 1; }
         if (k == 7) { return 2; }
@@ -869,13 +878,13 @@ public class JsonDoc {
     // （215 倍实测差距）。顺序遍历请走 FirstChild/NextSibling 链或
     // <see cref="ForEachChild"/>，只有真正的随机访问才用 At。
     public int At(int at, int i) {
-        if (at < 0 || at >= slots.Count || i < 0) { return -1; }
+        if (at < 0 || at >= this.slotCount || i < 0) { return -1; }
         int count = this.Count(at);
         if (i >= count) { return -1; }
         int c = at + 1;
         for (int j = 0; j < i; j = j + 1) {
             c = this.NextSibling(c);
-            if (c < 0 || c >= slots.Count) { return -1; }
+            if (c < 0 || c >= this.slotCount) { return -1; }
         }
         return c;
     }
@@ -898,12 +907,12 @@ public class JsonDoc {
     }
 
     public int Count(int at) {
-        if (at < 0 || at >= slots.Count) { return 0; }
+        if (at < 0 || at >= this.slotCount) { return 0; }
         return (int)(slots[at].b & 2147483647L);
     }
 
     public int Get(int at, string key) {
-        if (at < 0 || at >= slots.Count) { return -1; }
+        if (at < 0 || at >= this.slotCount) { return -1; }
         long oa = slots[at].a;
         if ((int)(oa & 255) != 5) { return -1; }
         int p = (int)(oa >> 8);
@@ -935,7 +944,7 @@ public class JsonDoc {
     public bool Has(int at, string key) { return this.Get(at, key) >= 0; }
 
     public string StrOfSlot(int at) {
-        if (at < 0 || at >= slots.Count) { return ""; }
+        if (at < 0 || at >= this.slotCount) { return ""; }
         long a = slots[at].a;
         int start = (int)(a >> 8);
         if (start >= 0) { return src.Substring(start, (int)slots[at].b); }
@@ -943,37 +952,49 @@ public class JsonDoc {
     }
 
     public int IntAt(int at, int dflt) {
-        if (at < 0 || at >= slots.Count) { return dflt; }
+        if (at < 0 || at >= this.slotCount) { return dflt; }
         int k = (int)(slots[at].a & 255);
         if (k == 2) { return (int)slots[at].b; }
-        if (k == 7) { return (int)NativeMemory.AsF64(slots[at].b); }
+        if (k == 7) {
+            int ns = (int)(slots[at].a >> 8);
+            int len = (int)slots[at].b;
+            return (int)JsonDoc.DoubleInRange(this.buf, ns, ns + len);
+        }
         if (k == 1) { return 1; }
         if (k == 6) { return 0; }
         return dflt;
     }
 
     public long LongAt(int at, long dflt) {
-        if (at < 0 || at >= slots.Count) { return dflt; }
+        if (at < 0 || at >= this.slotCount) { return dflt; }
         int k = (int)(slots[at].a & 255);
         if (k == 2) { return slots[at].b; }
-        if (k == 7) { return (long)NativeMemory.AsF64(slots[at].b); }
+        if (k == 7) {
+            int ns = (int)(slots[at].a >> 8);
+            int len = (int)slots[at].b;
+            return (long)JsonDoc.DoubleInRange(this.buf, ns, ns + len);
+        }
         if (k == 1) { return 1L; }
         if (k == 6) { return 0L; }
         return dflt;
     }
 
     public double DoubleAt(int at, double dflt) {
-        if (at < 0 || at >= slots.Count) { return dflt; }
+        if (at < 0 || at >= this.slotCount) { return dflt; }
         int k = (int)(slots[at].a & 255);
         if (k == 2) { return (double)slots[at].b; }
-        if (k == 7) { return NativeMemory.AsF64(slots[at].b); }
+        if (k == 7) {
+            int ns = (int)(slots[at].a >> 8);
+            int len = (int)slots[at].b;
+            return JsonDoc.DoubleInRange(this.buf, ns, ns + len);
+        }
         if (k == 1) { return 1.0; }
         if (k == 6) { return 0.0; }
         return dflt;
     }
 
     public string StrAt(int at, string dflt) {
-        if (at < 0 || at >= slots.Count) { return dflt; }
+        if (at < 0 || at >= this.slotCount) { return dflt; }
         long a = slots[at].a;
         int k = (int)(a & 255);
         if (k == 3) {
@@ -982,19 +1003,27 @@ public class JsonDoc {
             return escPool[(int)slots[at].b];
         }
         if (k == 2) { return Convert.ToString(slots[at].b); }
-        if (k == 7) { return Convert.ToString(NativeMemory.AsF64(slots[at].b)); }
+        if (k == 7) {
+            int ns = (int)(a >> 8);
+            int len = (int)slots[at].b;
+            return this.src.Substring(ns, len);
+        }
         if (k == 1) { return "true"; }
         if (k == 6) { return "false"; }
         return dflt;
     }
 
     public bool BoolAt(int at, bool dflt) {
-        if (at < 0 || at >= slots.Count) { return dflt; }
+        if (at < 0 || at >= this.slotCount) { return dflt; }
         int k = (int)(slots[at].a & 255);
         if (k == 1) { return true; }
         if (k == 6) { return false; }
         if (k == 2) { return slots[at].b != 0; }
-        if (k == 7) { return (long)NativeMemory.AsF64(slots[at].b) != 0L; }
+        if (k == 7) {
+            int ns = (int)(slots[at].a >> 8);
+            int len = (int)slots[at].b;
+            return (long)JsonDoc.DoubleInRange(this.buf, ns, ns + len) != 0L;
+        }
         if (k == 3) { return this.StrOfSlot(at) == "true"; }
         return dflt;
     }
@@ -1030,7 +1059,12 @@ public class JsonDoc {
         if (k == 1) { sb.Append("true"); return; }
         if (k == 6) { sb.Append("false"); return; }
         if (k == 2) { sb.Append(Convert.ToString(slots[at].b)); return; }
-        if (k == 7) { sb.Append(Convert.ToString(NativeMemory.AsF64(slots[at].b))); return; }
+        if (k == 7) {
+            int ns = (int)(a >> 8);
+            int len = (int)slots[at].b;
+            sb.Append(this.src.Substring(ns, len));
+            return;
+        }
         if (k == 3) {
             sb.Append("\"");
             sb.Append(Encoding.JsonEscape(this.StrOfSlot(at)));
