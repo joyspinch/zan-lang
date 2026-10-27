@@ -80,9 +80,10 @@ public class JsonDoc {
         int pairCap = len / 8 + 16;
         JsonSlot[] fastSlots = new JsonSlot[slotCap];
         JsonPair[] fastPairs = new JsonPair[pairCap];
+        int[] fr = new int[(JsonDoc.MaxDepth + 2) * 4];
         long[] counts = new long[4];
 
-        long ret = NativeMemory.JsonParseFast(buf, len, fastSlots, slotCap, fastPairs, pairCap, counts);
+        long ret = JsonDoc.ParsePureFast(buf, len, fastSlots, slotCap, fastPairs, pairCap, fr, counts);
         if (ret == 0) {
             int slotCount = (int)counts[0];
             int pairCount = (int)counts[1];
@@ -102,6 +103,10 @@ public class JsonDoc {
                 d.root = 0;
                 return d;
             }
+        } else if (ret < -3) {
+            // 语法格式错误 -(位置+1)
+            int errPos = (int)(-1 - ret);
+            throw new JsonException("Malformed JSON at position " + Convert.ToString(errPos));
         }
 
         // 回退至托管 ParseCore（支持带复杂反斜杠转义池物化、超深嵌套或超限扩容）
@@ -121,6 +126,259 @@ public class JsonDoc {
         }
         d.root = 0;
         return d;
+    }
+
+    // 纯 Zan 实现的 GB/s 级极速 Tape 状态机（单函数展开、零中间集合调用、直写扁平数组）
+    public static long ParsePureFast(byte[] buf, int len, JsonSlot[] sl, int slotCap, JsonPair[] pr, int pairCap, int[] fr, long[] counts) {
+        int slotCount = 0;
+        int pairCount = 0;
+        int maxd = JsonDoc.MaxDepth;
+        int depth = 0;
+        int pbase = -4;
+        bool wantKey = false;
+        int pos = 0;
+
+        while (true) {
+            if (pos < len && (buf[pos] & 255) <= 32) {
+                pos = (int)NativeMemory.JsonSkipWhitespace(buf, (long)pos, (long)len);
+            }
+            if (pos >= len) { break; }
+            long x = NativeMemory.Load64(buf, pos);
+            int c = (int)(x & 255);
+
+            if (wantKey) {
+                if (c != 34) { return (long)(-1 - pos); }
+                int p2 = pos + 1;
+                int start = p2;
+                long res = NativeMemory.JsonScanString(buf, (long)p2, (long)len);
+                if (res < 0) { return -2L; } // 遇到转义字符，回退至物化池
+                if (res >= len) { return (long)(-1 - len); }
+                int q = (int)res;
+
+                if (pairCount >= pairCap) { return -3L; }
+                int pi = pairCount;
+                pairCount = pairCount + 1;
+                pr[pi].keyStart = start;
+                pr[pi].keyLen = q - start;
+                pr[pi].nextPair = -1;
+                pr[pi].valueSlot = -1;
+
+                if (fr[pbase + 3] >= 0) {
+                    pr[fr[pbase + 3]].nextPair = pi;
+                }
+                fr[pbase + 3] = pi;
+                fr[pbase + 2] = fr[pbase + 2] + 1;
+                pos = q + 1;
+
+                if (pos < len && (buf[pos] & 255) <= 32) {
+                    pos = (int)NativeMemory.JsonSkipWhitespace(buf, (long)pos, (long)len);
+                }
+                if (pos >= len || (buf[pos] & 255) != 58) { return (long)(-1 - pos); }
+                pos = pos + 1;
+                wantKey = false;
+                continue;
+            }
+
+            if (depth > maxd && fr[pbase] == 4) { return (long)(-1 - pos); }
+
+            int vslot = -1;
+            if (c == 34) {
+                int p2 = pos + 1;
+                int start = p2;
+                long res = NativeMemory.JsonScanString(buf, (long)p2, (long)len);
+                if (res < 0) { return -2L; }
+                if (res >= len) { return (long)(-1 - len); }
+                int q = (int)res;
+
+                if (slotCount >= slotCap) { return -3L; }
+                vslot = slotCount;
+                slotCount = slotCount + 1;
+                sl[vslot].a = 3L | ((long)start << 8);
+                sl[vslot].b = (long)(q - start);
+                pos = q + 1;
+            } else if (c == 123) {
+                int pk = pos + 1;
+                if (pk < len && (buf[pk] & 255) <= 32) {
+                    pk = (int)NativeMemory.JsonSkipWhitespace(buf, (long)pk, (long)len);
+                }
+                if (pk < len && (buf[pk] & 255) == 125) {
+                    if (slotCount >= slotCap) { return -3L; }
+                    vslot = slotCount;
+                    slotCount = slotCount + 1;
+                    sl[vslot].a = -251L;
+                    sl[vslot].b = 1L << 31;
+                    pos = pk + 1;
+                } else {
+                    if (depth > maxd) { return (long)(-1 - pos); }
+                    if (slotCount >= slotCap) { return -3L; }
+                    vslot = slotCount;
+                    slotCount = slotCount + 1;
+                    sl[vslot].a = 5L | ((long)pairCount << 8);
+
+                    int fo = depth * 4;
+                    fr[fo] = 5;
+                    fr[fo + 1] = vslot;
+                    fr[fo + 2] = 0;
+                    fr[fo + 3] = -1;
+                    depth = depth + 1;
+                    pbase = fo;
+                    pos = pos + 1;
+                    wantKey = true;
+                    continue;
+                }
+            } else if (c == 91) {
+                int pk = pos + 1;
+                if (pk < len && (buf[pk] & 255) <= 32) {
+                    pk = (int)NativeMemory.JsonSkipWhitespace(buf, (long)pk, (long)len);
+                }
+                if (pk < len && (buf[pk] & 255) == 93) {
+                    if (slotCount >= slotCap) { return -3L; }
+                    vslot = slotCount;
+                    slotCount = slotCount + 1;
+                    sl[vslot].a = 4L;
+                    sl[vslot].b = 1L << 31;
+                    pos = pk + 1;
+                } else {
+                    if (depth > maxd) { return (long)(-1 - pos); }
+                    if (slotCount >= slotCap) { return -3L; }
+                    vslot = slotCount;
+                    slotCount = slotCount + 1;
+                    sl[vslot].a = 4L;
+
+                    int fa = depth * 4;
+                    fr[fa] = 4;
+                    fr[fa + 1] = vslot;
+                    fr[fa + 2] = 0;
+                    fr[fa + 3] = -1;
+                    depth = depth + 1;
+                    pbase = fa;
+                    pos = pos + 1;
+                    wantKey = false;
+                    continue;
+                }
+            } else if (c == 116) {
+                if ((int)x != 0x65757274) { return (long)(-1 - pos); }
+                if (slotCount >= slotCap) { return -3L; }
+                vslot = slotCount;
+                slotCount = slotCount + 1;
+                sl[vslot].a = 1L;
+                sl[vslot].b = 0L;
+                pos = pos + 4;
+            } else if (c == 102) {
+                if ((x & 0xFFFFFFFFFFL) != 0x65736C6166L) { return (long)(-1 - pos); }
+                if (slotCount >= slotCap) { return -3L; }
+                vslot = slotCount;
+                slotCount = slotCount + 1;
+                sl[vslot].a = 6L;
+                sl[vslot].b = 0L;
+                pos = pos + 5;
+            } else if (c == 110) {
+                if ((int)x != 0x6C6C756E) { return (long)(-1 - pos); }
+                if (slotCount >= slotCap) { return -3L; }
+                vslot = slotCount;
+                slotCount = slotCount + 1;
+                sl[vslot].a = 0L;
+                sl[vslot].b = 0L;
+                pos = pos + 4;
+            } else {
+                int ns = pos;
+                int ni = pos;
+                if (c == 45) { ni = ni + 1; }
+                long nacc = 0;
+                int ndig = 0;
+                while (ni < len) {
+                    int d = (buf[ni] & 255) - 48;
+                    if (d < 0 || d > 9) { break; }
+                    nacc = nacc * 10 + d;
+                    ndig = ndig + 1;
+                    ni = ni + 1;
+                }
+                bool nok = ndig >= 1;
+                bool isInt = nok;
+                if (nok && ni < len && (buf[ni] & 255) == 46) {
+                    isInt = false;
+                    ni = ni + 1;
+                    int nfd = 0;
+                    while (ni < len) {
+                        int d = (buf[ni] & 255) - 48;
+                        if (d < 0 || d > 9) { break; }
+                        nfd = nfd + 1;
+                        ni = ni + 1;
+                    }
+                    if (nfd == 0) { nok = false; }
+                }
+                if (nok && ni < len && ((buf[ni] & 255) == 101 || (buf[ni] & 255) == 69)) {
+                    isInt = false;
+                    ni = ni + 1;
+                    if (ni < len && ((buf[ni] & 255) == 43 || (buf[ni] & 255) == 45)) { ni = ni + 1; }
+                    int ned = 0;
+                    while (ni < len) {
+                        int d = (buf[ni] & 255) - 48;
+                        if (d < 0 || d > 9) { break; }
+                        ned = ned + 1;
+                        ni = ni + 1;
+                    }
+                    if (ned == 0) { nok = false; }
+                }
+                if (!nok) { return (long)(-1 - ns); }
+                if (slotCount >= slotCap) { return -3L; }
+                vslot = slotCount;
+                slotCount = slotCount + 1;
+                if (isInt && ndig <= 18) {
+                    if (c == 45) { nacc = 0 - nacc; }
+                    sl[vslot].a = 2L;
+                    sl[vslot].b = nacc;
+                } else {
+                    sl[vslot].a = 7L;
+                    sl[vslot].b = NativeMemory.AsI64(JsonDoc.DoubleInRange(buf, ns, ni));
+                }
+                pos = ni;
+            }
+
+            if (depth == 0) {
+                counts[0] = (long)slotCount;
+                counts[1] = (long)pairCount;
+                counts[2] = (long)pos;
+                return 0L;
+            }
+
+            if (fr[pbase] == 4) {
+                fr[pbase + 2] = fr[pbase + 2] + 1;
+            } else {
+                pr[fr[pbase + 3]].valueSlot = vslot;
+            }
+
+            while (true) {
+                if (pos < len && (buf[pos] & 255) <= 32) {
+                    pos = (int)NativeMemory.JsonSkipWhitespace(buf, (long)pos, (long)len);
+                }
+                if (pos >= len) { return (long)(-1 - pos); }
+                c = buf[pos] & 255;
+                if (c == 44) {
+                    pos = pos + 1;
+                    wantKey = fr[pbase] == 5;
+                    break;
+                }
+                int close = fr[pbase] == 4 ? 93 : 125;
+                if (c != close) { return (long)(-1 - pos); }
+                pos = pos + 1;
+                int ms2 = fr[pbase + 1];
+                sl[ms2].b = (long)fr[pbase + 2] | ((long)(slotCount - ms2) << 31);
+                depth = depth - 1;
+                pbase = pbase - 4;
+                if (depth == 0) {
+                    counts[0] = (long)slotCount;
+                    counts[1] = (long)pairCount;
+                    counts[2] = (long)pos;
+                    return 0L;
+                }
+                if (fr[pbase] == 4) {
+                    fr[pbase + 2] = fr[pbase + 2] + 1;
+                } else {
+                    pr[fr[pbase + 3]].valueSlot = ms2;
+                }
+            }
+        }
     }
 
     // 熔合解析核心：单函数显式状态机。
