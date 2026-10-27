@@ -4280,6 +4280,10 @@ int64_t zan_hw_json_parse_fast(const uint8_t *buf, int64_t len,
         }
     }
 
+    if (depth != 0 || wantKey || slot_count == 0) {
+        return -1 - len;
+    }
+
     out_counts[0] = slot_count;
     out_counts[1] = pair_count;
     out_counts[2] = pos;
