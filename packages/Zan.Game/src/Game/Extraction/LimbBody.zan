@@ -1,0 +1,212 @@
+using System;
+
+namespace Game.Extraction;
+
+// 搜打撤硬核身体部位创伤与健康模型（LimbBody）。
+// 对应《逃离塔科夫》、《暗区突围》等工业级部位创伤结算：
+// 细分为 7 个独立部位（头、胸、腹、左右手、左右腿），包含部位黑掉（Blacked Out）、
+// 轻重度流血（Bleed）、骨折（Fracture）、溢出伤害分摊以及手术包治疗。
+public class LimbBody {
+    public const int LimbHead = 0;      // 头部（生命 35，致命部位）
+    public const int LimbThorax = 1;    // 胸部（生命 85，致命部位）
+    public const int LimbStomach = 2;   // 腹部（生命 70）
+    public const int LimbLeftArm = 3;   // 左手（生命 60）
+    public const int LimbRightArm = 4;  // 右手（生命 60）
+    public const int LimbLeftLeg = 5;   // 左腿（生命 65）
+    public const int LimbRightLeg = 6;  // 右腿（生命 65）
+    public const int TotalLimbs = 7;
+
+    public double[] currentHp;
+    public double[] maxHp;
+    public bool[] isBlacked;            // 部位是否已损毁变黑（生命为0）
+    public int[] bleedLevel;            // 0: 无, 1: 轻度流血, 2: 重度流血
+    public bool[] hasFracture;          // 是否骨折
+    public bool isDead;
+
+    public LimbBody() {
+        this.currentHp = new double[TotalLimbs];
+        this.maxHp = new double[TotalLimbs];
+        this.isBlacked = new bool[TotalLimbs];
+        this.bleedLevel = new int[TotalLimbs];
+        this.hasFracture = new bool[TotalLimbs];
+        this.isDead = false;
+
+        // 初始化标准生命值分布 (塔科夫/暗区标准)
+        maxHp[LimbHead] = 35.0;
+        maxHp[LimbThorax] = 85.0;
+        maxHp[LimbStomach] = 70.0;
+        maxHp[LimbLeftArm] = 60.0;
+        maxHp[LimbRightArm] = 60.0;
+        maxHp[LimbLeftLeg] = 65.0;
+        maxHp[LimbRightLeg] = 65.0;
+
+        for (int i = 0; i < TotalLimbs; i = i + 1) {
+            currentHp[i] = maxHp[i];
+            isBlacked[i] = false;
+            bleedLevel[i] = 0;
+            hasFracture[i] = false;
+        }
+    }
+
+    public static LimbBody Create() {
+        return new LimbBody();
+    }
+
+    public bool IsAlive { get { return !isDead; } }
+
+    public double TotalHp {
+        get {
+            double sum = 0.0;
+            for (int i = 0; i < TotalLimbs; i = i + 1) {
+                sum = sum + currentHp[i];
+            }
+            return sum;
+        }
+    }
+
+    public double MaxTotalHp {
+        get {
+            double sum = 0.0;
+            for (int i = 0; i < TotalLimbs; i = i + 1) {
+                sum = sum + maxHp[i];
+            }
+            return sum;
+        }
+    }
+
+    // 检查是否能够奔跑（双腿骨折或黑掉则无法奔跑）
+    public bool CanSprint {
+        get {
+            if (isDead) { return false; }
+            if (isBlacked[LimbLeftLeg] || hasFracture[LimbLeftLeg]) { return false; }
+            if (isBlacked[LimbRightLeg] || hasFracture[LimbRightLeg]) { return false; }
+            return true;
+        }
+    }
+
+    // 受到伤害打击
+    public void ApplyDamage(int limbIdx, double damage, double heavyBleedChance, double fractureChance) {
+        if (isDead || limbIdx < 0 || limbIdx >= TotalLimbs || damage <= 0.0) { return; }
+
+        if (isBlacked[limbIdx]) {
+            // 已损毁黑掉的部位再次中弹：伤害按溢出比例向其余未黑掉部位扩散！
+            double spillover = damage * 0.7; // 溢出分摊系数 0.7
+            DistributeSpilloverDamage(spillover, limbIdx);
+            return;
+        }
+
+        currentHp[limbIdx] = currentHp[limbIdx] - damage;
+
+        // 判定异常状态
+        if (heavyBleedChance > 0.0 && bleedLevel[limbIdx] < 2) {
+            bleedLevel[limbIdx] = 2; // 重度流血
+        } else if (bleedLevel[limbIdx] == 0) {
+            bleedLevel[limbIdx] = 1; // 轻度流血
+        }
+
+        if (fractureChance > 0.0) {
+            hasFracture[limbIdx] = true; // 骨折
+        }
+
+        // 部位扣空检查
+        if (currentHp[limbIdx] <= 0.0) {
+            currentHp[limbIdx] = 0.0;
+            isBlacked[limbIdx] = true;
+
+            // 头部或胸腔被直接击穿黑掉 -> 立即死亡！
+            if (limbIdx == LimbHead || limbIdx == LimbThorax) {
+                isDead = true;
+            }
+        }
+    }
+
+    // 向其他未黑掉的健康部位分摊溢出伤害
+    void DistributeSpilloverDamage(double spillover, int excludedLimb) {
+        int activeCount = 0;
+        for (int i = 0; i < TotalLimbs; i = i + 1) {
+            if (i != excludedLimb && !isBlacked[i]) {
+                activeCount = activeCount + 1;
+            }
+        }
+
+        if (activeCount == 0) {
+            isDead = true;
+            return;
+        }
+
+        double perLimb = spillover / (double)activeCount;
+        for (int i = 0; i < TotalLimbs; i = i + 1) {
+            if (i != excludedLimb && !isBlacked[i]) {
+                currentHp[i] = currentHp[i] - perLimb;
+                if (currentHp[i] <= 0.0) {
+                    currentHp[i] = 0.0;
+                    isBlacked[i] = true;
+                    if (i == LimbHead || i == LimbThorax) {
+                        isDead = true;
+                    }
+                }
+            }
+        }
+    }
+
+    // 医疗包加血
+    public void Heal(int limbIdx, double amount) {
+        if (isDead || limbIdx < 0 || limbIdx >= TotalLimbs || amount <= 0.0) { return; }
+        if (isBlacked[limbIdx]) { return; } // 已黑掉部位普通医疗包无法回血，必须先手术！
+
+        currentHp[limbIdx] = currentHp[limbIdx] + amount;
+        if (currentHp[limbIdx] > maxHp[limbIdx]) {
+            currentHp[limbIdx] = maxHp[limbIdx];
+        }
+    }
+
+    // 绷带/止血带止血
+    public void TreatBleed(int limbIdx) {
+        if (limbIdx >= 0 && limbIdx < TotalLimbs) {
+            bleedLevel[limbIdx] = 0;
+        }
+    }
+
+    // 夹板治疗骨折
+    public void TreatFracture(int limbIdx) {
+        if (limbIdx >= 0 && limbIdx < TotalLimbs) {
+            hasFracture[limbIdx] = false;
+        }
+    }
+
+    // 手术包（CMS / Surg10）缝合手术：重建损毁变黑的部位（恢复至 1 点生命，上限略微永久损耗）
+    public bool PerformSurgery(int limbIdx) {
+        if (isDead || limbIdx < 0 || limbIdx >= TotalLimbs) { return false; }
+        if (!isBlacked[limbIdx]) { return false; }
+        if (limbIdx == LimbHead || limbIdx == LimbThorax) { return false; } // 致命部位黑掉无法手术
+
+        isBlacked[limbIdx] = false;
+        maxHp[limbIdx] = maxHp[limbIdx] * 0.8; // 手术扣减 20% 部位最大生命上限
+        currentHp[limbIdx] = 1.0;              // 恢复至 1 点起始血量
+        bleedLevel[limbIdx] = 0;              // 手术同时清空该部位流血
+        return true;
+    }
+
+    // 时钟步进：处理持续流血扣血
+    public void Update(double dt) {
+        if (isDead || dt <= 0.0) { return; }
+
+        for (int i = 0; i < TotalLimbs; i = i + 1) {
+            if (bleedLevel[i] == 1) {
+                // 轻度流血：每秒扣 1.5 点
+                currentHp[i] = currentHp[i] - 1.5 * dt;
+            } else if (bleedLevel[i] == 2) {
+                // 重度流血：每秒扣 4.0 点
+                currentHp[i] = currentHp[i] - 4.0 * dt;
+            }
+
+            if (currentHp[i] <= 0.0) {
+                currentHp[i] = 0.0;
+                isBlacked[i] = true;
+                if (i == LimbHead || i == LimbThorax) {
+                    isDead = true;
+                }
+            }
+        }
+    }
+}

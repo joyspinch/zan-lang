@@ -1,0 +1,177 @@
+using System;
+using System.Collections.Generic;
+
+namespace Game.Tycoon;
+
+// 模拟经营与餐馆服务全流程状态机（ServiceFlow）。
+// 对应《潜水员戴夫》、开罗系列餐厅服务大厅顾客核心状态演进：
+// 顾客排队 -> 安排入座 -> 冒泡点餐 -> 跑堂上菜 -> 满意就餐 -> 结账收款 -> 离店，
+// 以及顾客耐心值衰减（Patience Timeout）愤而离店机制。
+public class ServiceFlow {
+    public const int StateQueueing = 0;   // 在门外排队等待空桌
+    public const int StateSeated = 1;     // 已入座，等待点单
+    public const int StateWaitingFood = 2;// 已下单，头顶冒泡焦急等餐
+    public const int StateEating = 3;     // 菜已上桌，正在享用美食
+    public const int StatePaying = 4;     // 吃完，等待买单结账
+    public const int StateLeftSuccess = 5;// 满意买单离开
+    public const int StateLeftAngry = 6;  // 耐心耗尽愤怒离开（差评）
+
+    public class Customer {
+        public int id;
+        public int state;
+        public string wantedDish;
+        public int dishPrice;
+        public double maxPatience;
+        public double currentPatience;
+        public double eatingDuration;
+        public double eatingTimer;
+
+        public Customer(int id, string wantedDish, int price, double patience) {
+            this.id = id;
+            this.state = ServiceFlow.StateQueueing;
+            this.wantedDish = wantedDish != null ? wantedDish : "";
+            this.dishPrice = price > 0 ? price : 10;
+            this.maxPatience = patience > 0.0 ? patience : 30.0;
+            this.currentPatience = this.maxPatience;
+            this.eatingDuration = 4.0;
+            this.eatingTimer = 0.0;
+        }
+
+        public double PatiencePercent {
+            get { return maxPatience > 0.0 ? currentPatience / maxPatience : 0.0; }
+        }
+    }
+
+    public List<Customer> customers;
+    public int nextCustomerId;
+    public int maxTables;          // 店内餐桌数量 (例如 4 张桌子)
+    public int seatedCount;        // 当前已入座顾客数
+    public int totalRevenue;       // 餐厅总营业额流水
+    public int happyCustomerCount; // 成功服务顾客数
+    public int angryCustomerCount; // 跑单差评顾客数
+
+    public ServiceFlow(int maxTables) {
+        this.maxTables = maxTables > 0 ? maxTables : 4;
+        this.customers = new List<Customer>();
+        this.nextCustomerId = 1;
+        this.seatedCount = 0;
+        this.totalRevenue = 0;
+        this.happyCustomerCount = 0;
+        this.angryCustomerCount = 0;
+    }
+
+    public static ServiceFlow Create(int maxTables) {
+        return new ServiceFlow(maxTables);
+    }
+
+    public int TotalRevenue { get { return totalRevenue; } }
+    public int ActiveCustomerCount { get { return customers.Count; } }
+    public bool HasEmptyTable { get { return seatedCount < maxTables; } }
+
+    // 顾客进门到达
+    public int Arrive(string dish, int price, double patience) {
+        int id = nextCustomerId;
+        nextCustomerId = nextCustomerId + 1;
+        Customer c = new Customer(id, dish, price, patience);
+        customers.Add(c);
+
+        // 如果有空桌，自动引导入座
+        if (HasEmptyTable) {
+            SeatCustomer(id);
+        }
+        return id;
+    }
+
+    // 安排入座并自动转入点餐等菜态
+    public bool SeatCustomer(int customerId) {
+        if (!HasEmptyTable) { return false; }
+
+        for (int i = 0; i < customers.Count; i = i + 1) {
+            Customer c = customers[i];
+            if (c.id == customerId && c.state == StateQueueing) {
+                c.state = StateWaitingFood; // 入座后直接进入等餐状态
+                seatedCount = seatedCount + 1;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // 跑堂上菜（根据顾客期望的菜品匹配）
+    public bool ServeDish(int customerId, string dishName) {
+        for (int i = 0; i < customers.Count; i = i + 1) {
+            Customer c = customers[i];
+            if (c.id == customerId && c.state == StateWaitingFood) {
+                if (c.wantedDish == dishName) {
+                    c.state = StateEating;
+                    c.eatingTimer = 0.0;
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    // 结账买单
+    public bool CollectPayment(int customerId) {
+        for (int i = 0; i < customers.Count; i = i + 1) {
+            Customer c = customers[i];
+            if (c.id == customerId && c.state == StatePaying) {
+                totalRevenue = totalRevenue + c.dishPrice;
+                happyCustomerCount = happyCustomerCount + 1;
+                c.state = StateLeftSuccess;
+                seatedCount = seatedCount - 1;
+                customers.RemoveAt(i);
+
+                // 腾出桌位，尝试引导排队中的下一位顾客入座
+                TrySeatQueueingCustomer();
+                return true;
+            }
+        }
+        return false;
+    }
+
+    void TrySeatQueueingCustomer() {
+        if (!HasEmptyTable) { return; }
+        for (int i = 0; i < customers.Count; i = i + 1) {
+            Customer c = customers[i];
+            if (c.state == StateQueueing) {
+                c.state = StateWaitingFood;
+                seatedCount = seatedCount + 1;
+                break;
+            }
+        }
+    }
+
+    // 时钟步进：处理耐心扣减、超时愤怒离店、就餐时间演进
+    public void Update(double dt) {
+        if (dt <= 0.0) { return; }
+
+        for (int i = customers.Count - 1; i >= 0; i = i - 1) {
+            Customer c = customers[i];
+
+            if (c.state == StateQueueing || c.state == StateWaitingFood) {
+                // 等餐或排队中，扣减耐心
+                c.currentPatience = c.currentPatience - dt;
+                if (c.currentPatience <= 0.0) {
+                    // 耐心耗尽，愤而离店！
+                    c.currentPatience = 0.0;
+                    c.state = StateLeftAngry;
+                    angryCustomerCount = angryCustomerCount + 1;
+                    if (c.state == StateWaitingFood) {
+                        seatedCount = seatedCount - 1;
+                    }
+                    customers.RemoveAt(i);
+                    TrySeatQueueingCustomer();
+                }
+            } else if (c.state == StateEating) {
+                // 就餐中，累加吃菜时长
+                c.eatingTimer = c.eatingTimer + dt;
+                if (c.eatingTimer >= c.eatingDuration) {
+                    // 吃完，转入等待买单态
+                    c.state = StatePaying;
+                }
+            }
+        }
+    }
+}

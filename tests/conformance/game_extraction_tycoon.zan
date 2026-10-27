@@ -1,0 +1,146 @@
+using System;
+using System.Collections.Generic;
+using Game.Extraction;
+using Game.Tycoon;
+
+// 搜打撤（Game.Extraction）与双循环模拟经营（Game.Tycoon）单元测试：
+//   - LimbBody：7 部位独立生命、头部/胸部致命判定、黑掉伤害溢出分摊、手术恢复；
+//   - BallisticSolver：弹药穿透力 vs 护甲防弹等级与耐久损耗计算；
+//   - ExtractZone：条件撤离检测、读秒推进、受击打断与撤离成功清算；
+//   - KitchenQueue：多灶台并行出餐、烹饪时间步进与取餐；
+//   - ServiceFlow：顾客排队/入座/点单/就餐/买单全链路与耐心超时跑单。
+public class GameExtractionTycoonTests {
+    private static int failures = 0;
+
+    private static void Check(string name, bool ok) {
+        if (!ok) {
+            failures = failures + 1;
+            Console.WriteLine("FAIL: " + name);
+        }
+    }
+
+    public static void Main(string[] args) {
+        TestLimbBody();
+        TestBallisticSolver();
+        TestExtractZone();
+        TestKitchenQueue();
+        TestServiceFlow();
+
+        if (failures == 0) {
+            Console.WriteLine("PASS");
+        } else {
+            Console.WriteLine("FAILURES: " + failures);
+            Environment.Exit(1);
+        }
+    }
+
+    private static void TestLimbBody() {
+        LimbBody body = new LimbBody();
+        Check("Limb_InitAlive", body.IsAlive && body.CanSprint);
+
+        // 打击左手 30 点伤害
+        body.ApplyDamage(LimbBody.LimbLeftArm, 30.0, 0.0, 0.0);
+        Check("Limb_ArmDamage", body.currentHp[LimbBody.LimbLeftArm] == 30.0);
+
+        // 打烂双腿（左腿 70 点，右腿 70 点）
+        body.ApplyDamage(LimbBody.LimbLeftLeg, 70.0, 1.0, 1.0);
+        body.ApplyDamage(LimbBody.LimbRightLeg, 70.0, 1.0, 1.0);
+        Check("Limb_LegsBlacked", body.isBlacked[LimbBody.LimbLeftLeg] && body.isBlacked[LimbBody.LimbRightLeg]);
+        // 双腿黑掉无法奔跑
+        Check("Limb_CannotSprint", !body.CanSprint);
+
+        // 再次打击已黑掉的左腿，触发溢出伤害分摊
+        double hpBefore = body.TotalHp;
+        body.ApplyDamage(LimbBody.LimbLeftLeg, 20.0, 0.0, 0.0);
+        Check("Limb_Spillover", body.TotalHp < hpBefore);
+
+        // 对已黑掉的左腿进行手术
+        bool surgOk = body.PerformSurgery(LimbBody.LimbLeftLeg);
+        Check("Limb_SurgerySuccess", surgOk && !body.isBlacked[LimbBody.LimbLeftLeg] && body.currentHp[LimbBody.LimbLeftLeg] == 1.0);
+
+        // 头部直接爆头致死判定（头部满血 35，受到 40 伤害）
+        body.ApplyDamage(LimbBody.LimbHead, 40.0, 0.0, 0.0);
+        Check("Limb_HeadShotDead", !body.IsAlive && body.isDead);
+    }
+
+    private static void TestBallisticSolver() {
+        // 场景 1：5 级穿甲弹 (穿透 55) 射击 3 级甲 (防弹阈值约 30) -> 必定穿透！
+        var res1 = BallisticSolver.Calculate(55.0, 60.0, 3, 50.0, 50.0);
+        Check("Ballistic_Penetrated", res1.isPenetrated && res1.healthDamage > 50.0);
+
+        // 场景 2：1 级肉伤弹 (穿透 12) 射击 5 级防弹衣 (防弹阈值 50) -> 未击穿，转为微量钝伤！
+        var res2 = BallisticSolver.Calculate(12.0, 80.0, 5, 80.0, 80.0);
+        Check("Ballistic_BlockedBlunt", !res2.isPenetrated && res2.healthDamage < 20.0 && res2.armorDurabilityLoss > 10.0);
+    }
+
+    private static void TestExtractZone() {
+        // 撤离点在 (100, 100)，半径 50，需倒计时 3.0s
+        ExtractZone zone = new ExtractZone("Bunker", 100.0, 100.0, 50.0, 3.0);
+        zone.requiresNoBackpack = true; // 需丢包撤离点
+
+        // 玩家背着背包在圈内 (110, 100)，不满足条件，读秒不推进
+        zone.Update(1.0, 110.0, 100.0, true, false, false);
+        Check("Extract_BackpackBlocked", !zone.isExtracting && zone.currentTimer == 0.0);
+
+        // 丢掉背包，读秒开始推进 1.5s
+        zone.Update(1.5, 110.0, 100.0, false, false, false);
+        Check("Extract_TimerRunning", zone.isExtracting && zone.currentTimer == 1.5);
+
+        // 突然受击，读秒被打断重置！
+        zone.Update(0.1, 110.0, 100.0, false, false, true);
+        Check("Extract_Interrupted", !zone.isExtracting && zone.currentTimer == 0.0);
+
+        // 重新平稳读秒 3.5s -> 撤离成功！
+        zone.Update(3.5, 110.0, 100.0, false, false, false);
+        Check("Extract_Success", zone.IsSuccess);
+    }
+
+    private static void TestKitchenQueue() {
+        KitchenQueue kitchen = new KitchenQueue(2); // 2 个灶台
+
+        Check("Kitchen_Accept1", kitchen.StartCooking(101, "Sushi", 2.0));
+        Check("Kitchen_Accept2", kitchen.StartCooking(102, "Ramen", 3.0));
+        // 满灶台，拒绝第 3 单
+        Check("Kitchen_Refuse3", !kitchen.StartCooking(103, "Steak", 4.0));
+
+        // 推进 2.2 秒，第 1 单 (Sushi) 出餐完成！
+        kitchen.Update(2.2);
+        string dishName;
+        bool took1 = kitchen.TakeReadyDish(101, out dishName);
+        Check("Kitchen_TakeSushi", took1 && dishName == "Sushi");
+
+        // 取走后灶台空出，可以接新单
+        Check("Kitchen_AcceptNew", kitchen.CanAcceptNewOrder);
+    }
+
+    private static void TestServiceFlow() {
+        ServiceFlow restaurant = new ServiceFlow(2); // 2 张餐桌
+
+        // 顾客 1 到店 (点炸鸡 35 元，耐心 10s) -> 有空桌，自动入座等菜
+        int c1 = restaurant.Arrive("FriedChicken", 35, 10.0);
+        // 顾客 2 到店 (点奶茶 15 元，耐心 10s) -> 自动入座
+        int c2 = restaurant.Arrive("MilkTea", 15, 10.0);
+        // 顾客 3 到店 -> 桌位已满，在门外排队！
+        int c3 = restaurant.Arrive("Burger", 25, 2.0); // 耐心极短
+
+        Check("Rest_SeatedCount", restaurant.seatedCount == 2);
+
+        // 给顾客 1 上菜 -> 转入就餐态
+        bool served = restaurant.ServeDish(c1, "FriedChicken");
+        Check("Rest_Served", served);
+
+        // 步进 2.5 秒：
+        // 顾客 3 在门外等了 2.5s（超出 2.0s 耐心），愤而离店！
+        // 顾客 1 正在就餐
+        restaurant.Update(2.5);
+        Check("Rest_AngryLeft", restaurant.angryCustomerCount == 1);
+
+        // 顾客 1 吃完 (就餐持续 4s)，再推进 2.0s -> 转入买单态并收银
+        restaurant.Update(2.0);
+        bool paid = restaurant.CollectPayment(c1);
+        Check("Rest_PaidSuccess", paid && restaurant.TotalRevenue == 35);
+
+        // 顾客 1 买单离店后桌子空出，门外若有排队顾客会自动补入
+        Check("Rest_TableFreed", restaurant.seatedCount == 1);
+    }
+}
