@@ -1,0 +1,160 @@
+using System;
+using Game.Graphics;
+
+// 2D 角色图形与纸娃娃渲染框架单元测试：
+//   - DirectionMapper：8/4 方向向量与角度解算、边界环绕、死区回退、朝向互转；
+//   - Socket2D：8 朝向偏置、对称 5 方向镜像解算、层级偏置；
+//   - YSortQueue：原位稳定插入排序、零堆分配、按 Y 轴及 Tag 偏置遮挡排序；
+//   - DirectionalAnimator：向量直通朝向、图集像素矩形获取；
+//   - PaperdollRenderer：挂点注册与解算、图层像素裁剪矩形获取。
+public class GameGraphicsFrameworkTests {
+    private static int failures = 0;
+
+    private static void Check(string name, bool ok) {
+        if (!ok) {
+            failures = failures + 1;
+            Console.WriteLine("FAIL: " + name);
+        }
+    }
+
+    public static void Main(string[] args) {
+        TestDirectionMapper();
+        TestSocket2D();
+        TestYSortQueue();
+        TestAnimatorAndPaperdoll();
+
+        if (failures == 0) {
+            Console.WriteLine("PASS");
+        } else {
+            Console.WriteLine("FAILURES: " + failures);
+            Environment.Exit(1);
+        }
+    }
+
+    private static void TestDirectionMapper() {
+        // 1. 向量转 8 朝向测试 (+X 向右为东, +Y 向下为南)
+        Check("Vector8_East", DirectionMapper.FromVector8(10.0, 0.0) == 0);
+        Check("Vector8_SouthEast", DirectionMapper.FromVector8(10.0, 10.0) == 1);
+        Check("Vector8_South", DirectionMapper.FromVector8(0.0, 10.0) == 2);
+        Check("Vector8_SouthWest", DirectionMapper.FromVector8(-10.0, 10.0) == 3);
+        Check("Vector8_West", DirectionMapper.FromVector8(-10.0, 0.0) == 4);
+        Check("Vector8_NorthWest", DirectionMapper.FromVector8(-10.0, -10.0) == 5);
+        Check("Vector8_North", DirectionMapper.FromVector8(0.0, -10.0) == 6);
+        Check("Vector8_NorthEast", DirectionMapper.FromVector8(10.0, -10.0) == 7);
+
+        // 死区测试
+        Check("Vector8_DeadZone", DirectionMapper.FromVector8(0.001, 0.001, 6) == 6);
+
+        // 2. 向量转 4 朝向测试
+        Check("Vector4_East", DirectionMapper.FromVector4(10.0, 1.0) == 0);
+        Check("Vector4_South", DirectionMapper.FromVector4(1.0, 10.0) == 1);
+        Check("Vector4_West", DirectionMapper.FromVector4(-10.0, 1.0) == 2);
+        Check("Vector4_North", DirectionMapper.FromVector4(1.0, -10.0) == 3);
+
+        // 3. 角度转 8 朝向
+        Check("Angle8_Zero", DirectionMapper.FromAngle8(0.0) == 0);
+        Check("Angle8_NegativePi", DirectionMapper.FromAngle8(-DirectionMapper.PI) == 4);
+
+        // 4. 方向互转与名称
+        Check("Dir4To8_South", DirectionMapper.Dir4To8(1) == 2);
+        Check("Dir8To4_SE", DirectionMapper.Dir8To4(1) == 1);
+        Check("Name8_NW", DirectionMapper.Name8(5) == "NW");
+    }
+
+    private static void TestSocket2D() {
+        Socket2D socket = new Socket2D("Weapon_R");
+
+        // 使用对称 5 方向配置：东侧设置 (X=20, Y=10)
+        // dir5=2 对应 East，自动镜像生成 West (X=-20, Y=10)
+        socket.SetSymmetric5(2, 20, 10, 5);
+
+        int ox = 0;
+        int oy = 0;
+        int oz = 0;
+
+        // 解算东向 (dir8=0)
+        socket.ResolvePosition(0, 100, 200, out ox, out oy, out oz);
+        Check("Socket_East_X", ox == 120);
+        Check("Socket_East_Y", oy == 210);
+        Check("Socket_East_Z", oz == 5);
+
+        // 解算西向 (dir8=4)，X 偏移应镜像为 -20
+        socket.ResolvePosition(4, 100, 200, out ox, out oy, out oz);
+        Check("Socket_West_X", ox == 80);
+        Check("Socket_West_Y", oy == 210);
+        Check("Socket_West_Z", oz == 5);
+    }
+
+    private static void TestYSortQueue() {
+        YSortQueue queue = new YSortQueue(8);
+
+        // 乱序压入 4 个实体 (entityId, sortY, tag)
+        queue.Push(101, 300.0, 0); // 远/上
+        queue.Push(102, 100.0, 0); // 最近/最上
+        queue.Push(103, 500.0, 0); // 最深/最底
+        queue.Push(104, 300.0, 1); // 同样 300，但 tag 更大应排在后面
+
+        Check("YSort_Count", queue.Count == 4);
+
+        queue.Sort();
+
+        // 排序后应为：102 (100.0) -> 101 (300.0, tag 0) -> 104 (300.0, tag 1) -> 103 (500.0)
+        int id = 0;
+        double sy = 0.0;
+        int tag = 0;
+
+        queue.Get(0, out id, out sy, out tag);
+        Check("YSort_Rank0", id == 102 && sy == 100.0);
+
+        queue.Get(1, out id, out sy, out tag);
+        Check("YSort_Rank1", id == 101 && sy == 300.0 && tag == 0);
+
+        queue.Get(2, out id, out sy, out tag);
+        Check("YSort_Rank2", id == 104 && sy == 300.0 && tag == 1);
+
+        queue.Get(3, out id, out sy, out tag);
+        Check("YSort_Rank3", id == 103 && sy == 500.0);
+
+        // 清空测试
+        queue.Clear();
+        Check("YSort_Clear", queue.Count == 0);
+    }
+
+    private static void TestAnimatorAndPaperdoll() {
+        // 创建 256x256 图集，帧大小 64x64 (4 列 x 4 行)
+        SpriteSheet sheet = new SpriteSheet("test_hero", 256, 256, 64, 64);
+        Check("Sheet_Cols", sheet.Cols == 4 && sheet.Rows == 4);
+
+        PaperdollRenderer doll = new PaperdollRenderer(sheet, 4);
+
+        // 注册挂点
+        Socket2D headSocket = new Socket2D("Head");
+        headSocket.SetOffset(2, 0, -50, 10); // 朝南头顶偏移 (0, -50)
+        doll.AddSocket(headSocket);
+
+        Check("Doll_GetSocket", doll.GetSocket("Head") != null);
+
+        int hx = 0;
+        int hy = 0;
+        int hz = 0;
+        bool found = doll.ResolveSocket("Head", 200, 300, out hx, out hy, out hz);
+        Check("Doll_ResolveSocket", found && hx == 200 && hy == 250 && hz == 10);
+
+        // 注册图层
+        doll.AddLayer("Armor", sheet, 20, null, true);
+        Check("Doll_LayerCount", doll.LayerCount == 1);
+
+        // 获取当前帧像素矩形
+        int sx = 0;
+        int sy = 0;
+        int sw = 0;
+        int sh = 0;
+        bool flipped = false;
+        doll.GetLayerCurrentPixelRect(0, out sx, out sy, out sw, out sh, out flipped);
+        Check("Doll_PixelRect", sw == 64 && sh == 64);
+
+        // 测试向量驱动方向
+        doll.MasterAnimator.SetDirectionFromVector(-10.0, 0.0);
+        Check("Animator_VectorDir", doll.MasterAnimator.Direction == 4); // 西
+    }
+}
