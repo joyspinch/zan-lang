@@ -272,6 +272,43 @@ static char *read_file(const char *path, size_t *out_len) {
     return buf;
 }
 
+static char *read_file_arena(zan_arena_t *arena, const char *path, size_t *out_len) {
+#ifdef _WIN32
+    if (zan_utf8_is_directory(path)) {
+#else
+    struct stat st;
+    if (stat(path, &st) == 0 && S_ISDIR(st.st_mode)) {
+#endif
+        fprintf(stderr, "error: '%s' is a directory, not a source file\n", path);
+        return NULL;
+    }
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        fprintf(stderr, "error: cannot open file '%s'\n", path);
+        return NULL;
+    }
+    fseek(f, 0, SEEK_END);
+    long len = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (len < 0) {
+        fclose(f);
+        fprintf(stderr, "error: cannot read file '%s'\n", path);
+        return NULL;
+    }
+    char *buf = (char *)zan_arena_alloc(arena, (size_t)len + 1);
+    if (!buf) {
+        fclose(f);
+        return NULL;
+    }
+    size_t read = fread(buf, 1, (size_t)len, f);
+    buf[read] = '\0';
+    fclose(f);
+    g_scale_stats.file_reads++;
+    g_scale_stats.bytes_read += read;
+    if (out_len) *out_len = read;
+    return buf;
+}
+
 static void canon_key(const char *in, char *out, size_t out_sz) {
 #ifdef _WIN32
     char full[4096];
@@ -4849,24 +4886,13 @@ int main(int argc, char **argv) {
     for (int fi = scanned; fi < round_end; fi++) {
         if (fi > 0 && zan_is_zcomp_path(input_files[fi])) continue;
         size_t slen = 0;
-        char *src = (fi == 0) ? source : read_file(input_files[fi], &slen);
+        char *src = (fi == 0) ? source : read_file_arena(arena, input_files[fi], &slen);
         if (fi == 0) slen = source_len;
         if (!src) {
             fprintf(stderr, "error: cannot read '%s'\n", input_files[fi]);
             zan_arena_free(arena);
             free(source);
             return 1;
-        }
-        if (fi > 0) {
-            char *heap_src = src;
-            src = zan_arena_strdup(arena, heap_src, slen);
-            free(heap_src);
-            if (!src) {
-                fprintf(stderr, "error: out of memory\n");
-                zan_arena_free(arena);
-                free(source);
-                return 1;
-            }
         }
         {
             if ((size_t)fi < design_count && design_outs[fi]) {
@@ -7199,7 +7225,7 @@ int main(int argc, char **argv) {
             char cmd[4096];
             snprintf(cmd, sizeof(cmd),
                      "ld.lld -static%s --gc-sections -o \"%s\" \"%s/crt1.o\" \"%s/crti.o\" \"%s\"",
-                     (publish_mode || strip_symbols) ? " -s" : "", obj_path, sys, sys, obj_tmp);
+                     (publish_mode || strip_symbols) ? " -s --icf=all -O2" : "", obj_path, sys, sys, obj_tmp);
             for (int di = 0; di < zan_lib_ndirs; di++) {
                 cmd_appendf(cmd, sizeof(cmd), " -L\"%s\"",
                          zan_lib_dirs[di]);
@@ -7344,7 +7370,7 @@ int main(int argc, char **argv) {
             snprintf(cmd, sizeof(cmd),
                      "ld.lld -static%s --gc-sections -o \"%s\" \"%s/crt1.o\" \"%s/crti.o\""
                      " \"%s/clang_rt.crtbegin.o\" \"%s\"",
-                     (publish_mode || strip_symbols) ? " -s" : "", obj_path, sys, sys, sys, obj_tmp);
+                     (publish_mode || strip_symbols) ? " -s --icf=all -O2" : "", obj_path, sys, sys, sys, obj_tmp);
             for (int di = 0; di < zan_lib_ndirs; di++) {
                 cmd_appendf(cmd, sizeof(cmd), " -L\"%s\"",
                          zan_lib_dirs[di]);
@@ -7425,12 +7451,12 @@ int main(int argc, char **argv) {
                 snprintf(cmd, sizeof(cmd),
                          "ld.lld -pie%s --gc-sections -o \"%s\" \"%s/crtbegin_dynamic.o\""
                          " \"%s\"",
-                         (publish_mode || strip_symbols) ? " -s" : "", obj_path, sys, obj_tmp);
+                         (publish_mode || strip_symbols) ? " -s --icf=all -O2" : "", obj_path, sys, obj_tmp);
             } else {
                 snprintf(cmd, sizeof(cmd),
                          "ld.lld -static%s --gc-sections -o \"%s\" \"%s/crtbegin_static.o\""
                          " \"%s\"",
-                         (publish_mode || strip_symbols) ? " -s" : "", obj_path, sys, obj_tmp);
+                         (publish_mode || strip_symbols) ? " -s --icf=all -O2" : "", obj_path, sys, obj_tmp);
             }
             for (int di = 0; di < zan_lib_ndirs; di++) {
                 cmd_appendf(cmd, sizeof(cmd), " -L\"%s\"",
@@ -7575,7 +7601,7 @@ int main(int argc, char **argv) {
                      "ld.lld -m %s --stack 268435456%s --gc-sections%s -o \"%s\" "
                      "\"%s/crt2.o\" \"%s/crtbegin.o\"",
                      (target.arch == ZAN_ARCH_AARCH64) ? "arm64pe" : "i386pep",
-                     (publish_mode || strip_symbols) ? " -s" : "",
+                     (publish_mode || strip_symbols) ? " -s --icf=all -O2" : "",
                      (link_subsystem && strcmp(link_subsystem, "windows") == 0)
                          ? " --subsystem windows" : "",
                      obj_path, syslib, syslib);

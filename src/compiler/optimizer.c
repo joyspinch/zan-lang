@@ -363,7 +363,61 @@ zan_constfold_stats_t zan_opt_const_fold(zan_irgen_t *g) {
                             unsigned long long cval = LLVMConstIntGetZExtValue(cond);
                             LLVMBasicBlockRef target_bb = (cval != 0) ? LLVMGetSuccessor(inst, 0)
                                                                      : LLVMGetSuccessor(inst, 1);
+                            LLVMBasicBlockRef dead_bb = (cval != 0) ? LLVMGetSuccessor(inst, 1)
+                                                                   : LLVMGetSuccessor(inst, 0);
                             if (target_bb) {
+                                /* 折叠分支删掉"本块→dead_bb"这条边时，dead_bb 的
+                                 * PHI 里来自本块的 incoming 条目必须一并删除——
+                                 * 否则模块非法（PHINode 缺 predecessor 条目）。
+                                 * A595：非法 IR 曾让 VerifyModule 静默失败、
+                                 * default<O1> 整条管线被跳过，后续 pass 和后端
+                                 * 在非法 IR 上产出错码（字符串长度探测误报 0）。 */
+                                if (dead_bb && dead_bb != target_bb) {
+                                    LLVMValueRef phi = LLVMGetFirstInstruction(dead_bb);
+                                    while (phi && LLVMIsAPHINode(phi)) {
+                                        LLVMValueRef phi_next = LLVMGetNextInstruction(phi);
+                                        unsigned n = LLVMCountIncoming(phi);
+                                        bool has_this = false;
+                                        for (unsigned i = 0; i < n; i++) {
+                                            if (LLVMGetIncomingBlock(phi, i) == bb) {
+                                                has_this = true;
+                                                break;
+                                            }
+                                        }
+                                        if (has_this) {
+                                            LLVMValueRef *vals =
+                                                (LLVMValueRef *)malloc(sizeof(LLVMValueRef) * (n > 0 ? n : 1));
+                                            LLVMBasicBlockRef *blks =
+                                                (LLVMBasicBlockRef *)malloc(sizeof(LLVMBasicBlockRef) * (n > 0 ? n : 1));
+                                            unsigned m = 0;
+                                            if (vals && blks) {
+                                                for (unsigned i = 0; i < n; i++) {
+                                                    if (LLVMGetIncomingBlock(phi, i) == bb) continue;
+                                                    vals[m] = LLVMGetIncomingValue(phi, i);
+                                                    blks[m] = LLVMGetIncomingBlock(phi, i);
+                                                    m++;
+                                                }
+                                            }
+                                            LLVMBuilderRef pb = g->builder;
+                                            LLVMPositionBuilderBefore(pb, phi);
+                                            if (m > 0) {
+                                                LLVMValueRef np = LLVMBuildPhi(pb, LLVMTypeOf(phi), "");
+                                                LLVMAddIncoming(np, vals, blks, m);
+                                                LLVMReplaceAllUsesWith(phi, np);
+                                            } else {
+                                                /* 本块是唯一前驱：边删后 dead_bb 不可达，
+                                                 * PHI 悬空——用 undef 顶替引用，块本身
+                                                 * 交给后续死代码清理。 */
+                                                LLVMReplaceAllUsesWith(phi,
+                                                    LLVMConstNull(LLVMTypeOf(phi)));
+                                            }
+                                            LLVMInstructionEraseFromParent(phi);
+                                            free(vals);
+                                            free(blks);
+                                        }
+                                        phi = phi_next;
+                                    }
+                                }
                                 LLVMBuilderRef b = g->builder;
                                 LLVMPositionBuilderBefore(b, inst);
                                 LLVMBuildBr(b, target_bb);
@@ -492,6 +546,18 @@ void zan_opt_run_passes_on_module(LLVMModuleRef mod, LLVMTargetMachineRef tm, za
     default: return;
     }
 
+    /* 调试旋钮：ZAN_OPT_PIPELINE 覆盖默认管线文本（如 "sroa" 逐 pass
+     * 二分），"none" 完全跳过 LLVM 管线——定位优化缺陷用（A595）。 */
+    {
+        const char *pipe_env = getenv("ZAN_OPT_PIPELINE");
+        if (pipe_env && pipe_env[0]) {
+            if (strcmp(pipe_env, "none") == 0) {
+                return;
+            }
+            passes = pipe_env;
+        }
+    }
+
     LLVMPassBuilderOptionsRef opts = LLVMCreatePassBuilderOptions();
     LLVMPassBuilderOptionsSetVerifyEach(opts, 0);
     LLVMPassBuilderOptionsSetDebugLogging(opts, 0);
@@ -505,6 +571,9 @@ void zan_opt_run_passes_on_module(LLVMModuleRef mod, LLVMTargetMachineRef tm, za
 
     char *vmsg = NULL;
     if (LLVMVerifyModule(mod, LLVMReturnStatusAction, &vmsg)) {
+        fprintf(stderr, "warning: module verification failed before pass "
+                        "pipeline, skipping pipeline: %s\n",
+                vmsg ? vmsg : "(no message)");
         if (vmsg) LLVMDisposeMessage(vmsg);
         LLVMDisposePassBuilderOptions(opts);
         return;
@@ -516,6 +585,16 @@ void zan_opt_run_passes_on_module(LLVMModuleRef mod, LLVMTargetMachineRef tm, za
         char *msg = LLVMGetErrorMessage(err);
         fprintf(stderr, "warning: LLVM pass pipeline error: %s\n", msg);
         LLVMDisposeErrorMessage(msg);
+    }
+    /* 调试旋钮：ZAN_DUMP_OPT_IR=<路径> 落盘优化后的模块 IR（A595 二分用） */
+    {
+        const char *dump = getenv("ZAN_DUMP_OPT_IR");
+        if (dump && dump[0]) {
+            char err2[256];
+            if (LLVMPrintModuleToFile(mod, dump, &err2)) {
+                fprintf(stderr, "warning: dump opt IR failed: %s\n", err2);
+            }
+        }
     }
 
     LLVMDisposePassBuilderOptions(opts);
@@ -536,10 +615,14 @@ void zan_opt_strip_unused(zan_irgen_t *g) {
 }
 
 static void zan_opt_early_mem2reg(zan_irgen_t *g) {
+    /* 调试旋钮：ZAN_EARLY_PASSES 覆盖早期 pass 集（A595 二分用） */
+    const char *early = getenv("ZAN_EARLY_PASSES");
+    if (early && strcmp(early, "none") == 0) return;
+    const char *passes_txt = (early && early[0]) ? early : "sroa,early-cse";
     LLVMPassBuilderOptionsRef opts = LLVMCreatePassBuilderOptions();
     LLVMPassBuilderOptionsSetVerifyEach(opts, 0);
     LLVMPassBuilderOptionsSetDebugLogging(opts, 0);
-    LLVMErrorRef err = LLVMRunPasses(g->mod, "sroa,early-cse", NULL, opts);
+    LLVMErrorRef err = LLVMRunPasses(g->mod, passes_txt, NULL, opts);
     if (err) {
         char *msg = LLVMGetErrorMessage(err);
         fprintf(stderr, "warning: LLVM early sroa error: %s\n", msg);
@@ -555,12 +638,13 @@ zan_opt_report_t zan_optimize(zan_irgen_t *g, zan_binder_t *binder, zan_opt_leve
 
     double t0 = get_time_ms();
 
-    zan_opt_early_mem2reg(g);
-    report.arc = zan_opt_arc(g, level);
-    report.devirt = zan_opt_devirtualize(g, binder);
-    report.constfold = zan_opt_const_fold(g);
-    report.dce = zan_opt_dce(g);
-    report.inlining = zan_opt_inline(g, level);
+    /* 调试旋钮：ZAN_NO_OPT_<NAME>=1 跳过对应自定义 pass（A595 二分） */
+    if (!getenv("ZAN_NO_OPT_EARLY")) zan_opt_early_mem2reg(g);
+    if (!getenv("ZAN_NO_OPT_ARC")) report.arc = zan_opt_arc(g, level);
+    if (!getenv("ZAN_NO_OPT_DEVIRT")) report.devirt = zan_opt_devirtualize(g, binder);
+    if (!getenv("ZAN_NO_OPT_CONSTFOLD")) report.constfold = zan_opt_const_fold(g);
+    if (!getenv("ZAN_NO_OPT_DCE")) report.dce = zan_opt_dce(g);
+    if (!getenv("ZAN_NO_OPT_INLINE")) report.inlining = zan_opt_inline(g, level);
     zan_opt_configure_llvm_passes(g, level);
 
     double t1 = get_time_ms();

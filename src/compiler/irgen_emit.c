@@ -3167,6 +3167,14 @@ static zan_status_t zan_bind_target_layout(zan_irgen_t *g,
     }
     LLVMCodeGenOptLevel cg = g->fast_codegen ? LLVMCodeGenLevelNone
                                              : LLVMCodeGenLevelDefault;
+    const char *cgenv = getenv("ZAN_CODEGEN_LEVEL");
+    if (cgenv && *cgenv) {
+        int clvl = atoi(cgenv);
+        if (clvl == 0) cg = LLVMCodeGenLevelNone;
+        else if (clvl == 1) cg = LLVMCodeGenLevelLess;
+        else if (clvl == 2) cg = LLVMCodeGenLevelDefault;
+        else if (clvl == 3) cg = LLVMCodeGenLevelAggressive;
+    }
     /* 记下后端选用的 CPU/特性：--emit-ir 的产物要靠它自述目标特性，
        否则消费方（llc 等）用 generic CPU 拿到 256 位向量路径会合法化失败。 */
     snprintf(g->target_cpu, sizeof(g->target_cpu), "%s", tm_cpu);
