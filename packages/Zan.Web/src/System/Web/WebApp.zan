@@ -4,6 +4,7 @@ using System.Json;
 using System.Net.Http;
 using System.Net.Sockets;
 using System.Net;
+using System.Text;
 using System.Threading;
 using System;
 
@@ -828,11 +829,25 @@ public class WebApp : IDisposable {
         return "";
     }
 
+    static string err404 = "{\"code\":\"404\",\"msg\":\"not found\"}";
+    static string err405 = "{\"code\":\"405\",\"msg\":\"method not allowed\"}";
+    static string err401 = "{\"code\":\"401\",\"msg\":\"authentication required\"}";
+    static string err403 = "{\"code\":\"403\",\"msg\":\"insufficient permission\"}";
+    static string err429 = "{\"code\":\"429\",\"msg\":\"request already in progress\"}";
+    static string err500 = "{\"code\":\"500\",\"msg\":\"internal server error\"}";
+    static string err500noResp = "{\"code\":\"500\",\"msg\":\"handler produced no response\"}";
+
     private static string ErrorJson(string code, string msg) {
-        ApiErrorBody o = new ApiErrorBody();
-        o.code = code;
-        o.msg = msg;
-        return Json.Serialize<ApiErrorBody>(o);
+        if (code == "404" && msg == "not found") { return WebApp.err404; }
+        if (code == "500") {
+            if (msg == "internal server error") { return WebApp.err500; }
+            if (msg == "handler produced no response") { return WebApp.err500noResp; }
+        }
+        if (code == "401" && msg == "authentication required") { return WebApp.err401; }
+        if (code == "403" && msg == "insufficient permission") { return WebApp.err403; }
+        if (code == "405" && msg == "method not allowed") { return WebApp.err405; }
+        if (code == "429" && msg == "request already in progress") { return WebApp.err429; }
+        return "{\"code\":\"" + code + "\",\"msg\":\"" + msg + "\"}";
     }
 
     string StatusJson() {
@@ -855,14 +870,25 @@ public class WebApp : IDisposable {
     // 构造一条完整的 HTTP/1.1 JSON 应答字符串（Connection: close），
     // 用于 HttpContext 尚不存在的早期拒绝（413/431/503、定界失败）。
     private static string SimpleResponse(int code, string text, string msg) {
-        JsonValue o = JsonValue.NewObject();
-        o.Put("code", JsonValue.NewStr(Convert.ToString(code)));
-        o.Put("msg", JsonValue.NewStr(msg));
-        string body = o.ToJson();
-        return "HTTP/1.1 " + Convert.ToString(code) + " " + text
-            + "\r\nContent-Type: application/json\r\nContent-Length: "
-            + Convert.ToString(body.Length)
-            + "\r\nConnection: close\r\n\r\n" + body;
+        StringBuilder sb = HttpBufferPool.Rent();
+        sb.Append("{\"code\":\"");
+        sb.Append(Convert.ToString(code));
+        sb.Append("\",\"msg\":\"");
+        sb.Append(msg);
+        sb.Append("\"}");
+        string body = sb.ToString();
+        sb.Clear();
+        sb.Append("HTTP/1.1 ");
+        sb.Append(Convert.ToString(code));
+        sb.Append(" ");
+        sb.Append(text);
+        sb.Append("\r\nContent-Type: application/json\r\nContent-Length: ");
+        sb.Append(Convert.ToString(body.Length));
+        sb.Append("\r\nConnection: close\r\n\r\n");
+        sb.Append(body);
+        string res = sb.ToString();
+        HttpBufferPool.Return(sb);
+        return res;
     }
 
     // 报文中头部块的结束位置（"\n\n" 或 "\n\r\n" 之后的首下标）；

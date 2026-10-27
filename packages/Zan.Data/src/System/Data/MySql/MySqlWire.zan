@@ -1,17 +1,46 @@
 using System;
 
+namespace System.Data.MySql;
+
 // MySQL 线格式纯函数库：async 与 sync 连接双胞胎共享的
 // 字节解析/编码工具。只做纯变换、无 IO 无状态——从两份逐字节
 // 一致的副本合并而来（stdlib 去重 批D-1）。
 public class MySqlWire {
 
     // 把缓冲区 <c>[off, off+len)</c> 的字节原样拷出并转为字符串；
-    // len &lt;= 0 时返回空串。
+    // len <= 0 时返回空串。直接基于 Substring 实现单次原生复制，
+    // 免去 new byte[] + 逐字节复制 + ToStr 的双重堆分配。
     public static string bytesToStr(string buf, int off, int len) {
         if (len <= 0) { return ""; }
-        byte[] t = new byte[len + 1];
-        for (int i = 0; i < len; i = i + 1) { t[i] = (byte)(buf[off+i] & 255); }
-        return t.ToStr(0, len);
+        return buf.Substring(off, len);
+    }
+
+    // 从 wire 缓冲区中就地解析 length-encoded 整数；
+    // 0xFB（NULL）返回 0 并把游标前进 1。
+    // 直接在原始字节上累积十进制数值，完全消除临时字符串分配与 Convert.ToInt64 开销。
+    public static long readLenencInt(string buf, List<int> cur) {
+        int b0 = buf[cur[0]] & 255;
+        if (b0 == 251) { cur[0] = cur[0] + 1; return 0; }
+        int len = (int)readLenenc(buf, cur);
+        if (len <= 0) { return 0; }
+        int p = cur[0];
+        cur[0] = p + len;
+        long acc = 0;
+        int i = p;
+        int end = p + len;
+        bool neg = false;
+        if ((buf[i] & 255) == 45) {  // '-'
+            neg = true;
+            i = i + 1;
+        }
+        while (i < end) {
+            int d = (buf[i] & 255) - 48;
+            if (d >= 0 && d <= 9) {
+                acc = acc * 10 + (long)d;
+            }
+            i = i + 1;
+        }
+        return neg ? (0 - acc) : acc;
     }
 
     // 读取 MySQL length-encoded 整数（1/3/4/9 字节形式，小端）；
