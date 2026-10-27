@@ -70,6 +70,17 @@ class PlatformProbe {
 
 ## 2. Directory Structure
 
+Layout rule: the `System/` root holds **core primitives only** (Array,
+DateTime, Guid, Random…). Thematic groups — exceptions, FFI/interop,
+extension methods — live in same-namespace subdirectories (`Exceptions/`,
+`Interop/`, `Extensions/`, like the pre-existing `Models/`): their files
+still declare `namespace System`, and the compiler pulls them in exactly
+like root files (first-file namespace probe in `glob_stdlib_dir`,
+`src/compiler/main.c` — one level deep, every file in such a subdirectory
+must declare the parent namespace). Keep new non-primitive files out of
+the root: everything loose there gets compiled into every `using System;`
+program.
+
 ```
 stdlib/
 ├── System/                          # namespace System
@@ -84,15 +95,19 @@ stdlib/
 │   │                                # (QPC / clock_gettime); also the static
 │   │                                # GetMilliseconds/GetMicroseconds readings
 │   ├── TimeSpan.zan                 # Time span
-│   ├── Interop.zan                  # FFI helpers ([DllImport] wrappers)
-│   ├── NativeMemory.zan             # Low-level memory operations
 │   ├── GC.zan                       # Allocation tracking + memory metrics (A464)
-│   ├── Exception.zan                # Exception base types
 │   ├── Binding.zan                  # late binding / dynamic dispatch helpers
 │   ├── TaskJoin.zan                 # async task join helpers
 │   ├── ZanVersion.zan               # version constants (generated from .in)
-│   ├── ListExtensions.zan           # Remove / GetRange / Sort (extensions)
-│   ├── StringExtensions.zan         # String extension methods
+│   │
+│   ├── Exceptions/                  # namespace System — Exception base +
+│   │                                # the concrete exception types
+│   ├── Interop/                     # namespace System — FFI/marshaling:
+│   │                                # Interop ([DllImport] wrappers),
+│   │                                # NativeMemory, Marshal, Com/ComVtbl, Wide
+│   ├── Extensions/                  # namespace System — extension methods:
+│   │                                # ListExtensions, StringExtensions,
+│   │                                # MemoryExtensions
 │   │
 │   ├── IO/                          # System.IO
 │   │   ├── File.zan                 # file read/write (static helpers)
