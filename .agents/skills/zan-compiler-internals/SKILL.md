@@ -621,6 +621,29 @@ description: zanc 编译器内部（parser/checker/irgen/runtime/ABI）设计契
      不写任何文件，表象却是"自动安装反复触发"——三层排查全是假线索。
    - 判定器：`tests/conformance/list_array_ctor.zan`（string/int/空数组/
      快照独立性/结构体元素五组断言）。
+33. **手写 CFG 编辑必须同步维护 PHI 前驱表——VerifyModule 失败绝不能静默吞掉**：
+   - 动作：optimizer 里折叠常量条件分支（`LLVMBuildBr(target)` + erase
+     condbr）时，"本块→未选中后继"这条边同时消失，未选中后继块里每个
+     PHI 中来自本块的 incoming 条目必须一并删除（LLVM-C 没有
+     remove-incoming，做法：新建 PHI 收集幸存 (value, block) 对 +
+     `LLVMReplaceAllUsesWith` + erase 旧 PHI；本块是唯一前驱时用
+     undef/null 顶替引用）。两个后继是同一块时跳过清理（边仍在）。
+     另外 `LLVMVerifyModule` 失败必须 `fprintf` 报警——曾静默
+     dispose-and-return，default&lt;O1&gt; 整条管线被无声跳过，所有"优化"
+     实际来自管线之外的自定义 pass，用户毫不知情。
+   - 理由（A595，坑很深）：early-cse 会把短路条件的分支化成常量，
+     constfold 随后折叠该分支；悬空 PHI 条目使模块非法 → 管线整条
+     被静默跳过 → 管线之后的 pass 与后端在非法 IR 上跑，字符串长度
+     探测把正常串判成 null（长度归 0）：`--publish` 构建 ff_bidi_demo
+     三处 soft error 后挂起，而 O0 一切正常。排查时表象全指向业务代码
+     与 publish 插桩，真因在两步之外的 CFG 编辑。
+   - 排查工具（已留常设开关，optimizer.c）：`ZAN_DUMP_OPT_IR=1`（dump
+     优化后 IR）、`ZAN_OPT_PIPELINE=none/<管线串>`、
+     `ZAN_NO_OPT_EARLY/ARC/DEVIRT/CONSTFOLD/DCE/INLINE=1`（逐 pass 关）、
+     `ZAN_EARLY_PASSES=sroa,early-cse`（改 early 段）。验证时盯 stderr 的
+     `module verification failed`——它出现即管线没跑。
+   - 判定器：`tests/conformance/opt_constfold_branch_phi.zan`（注册处
+     带 `-O1` 编译；普通 conformance 全在 -O0，永远踩不到这条路径）。
 
 ---
 

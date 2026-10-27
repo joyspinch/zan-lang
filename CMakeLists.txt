@@ -2766,6 +2766,12 @@ foreach(_src ${_conf_srcs})
     # A --publish build of a Tls program verifies that the published exe starts
     # and hands back a usable TlsContext under native TLS without external dependencies.
     set(_extra_args "--publish")
+  elseif(_name STREQUAL "opt_constfold_branch_phi")
+    # A595: the O1+ pass pipeline used to be silently skipped because constfold
+    # left stale PHI incoming entries when folding a constant branch (invalid
+    # module). Plain conformance runs at -O0 and never reaches that code, so
+    # the folded-branch + string-length-probe shape must be pinned at -O1.
+    set(_extra_args "-O1")
   elseif(_needs_gui_driver)
     set(_extra_args "${_gui_driver_args}")
   else()
