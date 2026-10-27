@@ -612,9 +612,11 @@ static int ensure_java(char *out, size_t outsz) {
     if (find_java(out, outsz) == 0) return 0;
 
 #ifdef _WIN32
-    const char *url =
-        "https://api.adoptium.net/v3/binary/latest/21/ga/windows/x64/jre/hotspot/normal/eclipse"
-        "?project=jdk";
+    const char *url = getenv("ZAN_JDK_URL");
+    if (!url || !url[0]) {
+        url = "https://api.adoptium.net/v3/binary/latest/21/ga/windows/x64/jre/hotspot/normal/eclipse"
+              "?project=jdk";
+    }
     const char *zdir_name = "jre-win";
 #else
     const char *url = "";

@@ -4095,7 +4095,10 @@ static int zan_write_static_lib(const char *obj, const char *arc,
         snprintf(bundled, sizeof(bundled), "%s/llvm-ar%s", exe_dir, suffix);
     snprintf(versioned, sizeof(versioned), "llvm-ar-%d%s", ZAN_LLVM_MAJOR,
              suffix);
+    const char *env_ar = getenv("ZAN_LLVM_AR");
+    if (!env_ar || !*env_ar) env_ar = getenv("LLVM_AR");
     const char *tools[] = {
+        env_ar ? env_ar : "",
         bundled, "llvm-ar", versioned,
 #ifdef __APPLE__
         "/opt/homebrew/opt/llvm/bin/llvm-ar",

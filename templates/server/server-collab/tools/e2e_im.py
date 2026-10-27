@@ -37,8 +37,8 @@ import urllib.request
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)                      # templates/server/server-collab
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(ROOT)))
-BASE = "http://127.0.0.1:8090"
-PORT = 8090
+BASE = os.environ.get("COLLAB_BASE_URL", "http://127.0.0.1:8090")
+PORT = int(os.environ.get("PORT", "8090"))
 
 fails = []
 checks = 0
