@@ -124,7 +124,30 @@ public class HttpRequest {
         while (sp1 < rlEnd && !HttpRequest.IsOws(raw[sp1] & 255)) {
             sp1 = sp1 + 1;
         }
-        req.method = raw.Substring(0, sp1);
+        if (sp1 == 3) {
+            int b0 = raw[0] & 255;
+            int b1 = raw[1] & 255;
+            int b2 = raw[2] & 255;
+            if (b0 == 71 && b1 == 69 && b2 == 84) { req.method = "GET"; }
+            else if (b0 == 80 && b1 == 85 && b2 == 84) { req.method = "PUT"; }
+            else { req.method = raw.Substring(0, sp1); }
+        } else if (sp1 == 4) {
+            int b0 = raw[0] & 255;
+            int b1 = raw[1] & 255;
+            int b2 = raw[2] & 255;
+            int b3 = raw[3] & 255;
+            if (b0 == 80 && b1 == 79 && b2 == 83 && b3 == 84) { req.method = "POST"; }
+            else if (b0 == 72 && b1 == 69 && b2 == 65 && b3 == 68) { req.method = "HEAD"; }
+            else { req.method = raw.Substring(0, sp1); }
+        } else if (sp1 == 6 && HttpRequest.RegionIs(raw, 0, sp1, "delete")) {
+            req.method = "DELETE";
+        } else if (sp1 == 7 && HttpRequest.RegionIs(raw, 0, sp1, "options")) {
+            req.method = "OPTIONS";
+        } else if (sp1 == 5 && HttpRequest.RegionIs(raw, 0, sp1, "patch")) {
+            req.method = "PATCH";
+        } else {
+            req.method = raw.Substring(0, sp1);
+        }
         int pathStart = HttpRequest.TrimOwsStart(raw, sp1, rlEnd);
         int sp2 = pathStart;
         while (sp2 < rlEnd && !HttpRequest.IsOws(raw[sp2] & 255)) {
@@ -133,7 +156,12 @@ public class HttpRequest {
         int pathEnd = sp2;
         int versionStart = HttpRequest.TrimOwsStart(raw, sp2, rlEnd);
         int versionStop = HttpRequest.TrimOwsStop(raw, versionStart, rlEnd);
-        if (versionStart < versionStop) {
+        int vLen = versionStop - versionStart;
+        if (vLen == 8 && HttpRequest.RegionIs(raw, versionStart, versionStop, "http/1.1")) {
+            req.version = "HTTP/1.1";
+        } else if (vLen == 8 && HttpRequest.RegionIs(raw, versionStart, versionStop, "http/1.0")) {
+            req.version = "HTTP/1.0";
+        } else if (versionStart < versionStop) {
             req.version = raw.Substring(versionStart, versionStop - versionStart);
         } else {
             req.parseStatus = 400;
@@ -459,6 +487,76 @@ public class HttpRequest {
             pos = lineEnd + 1;
         }
         return "";
+    }
+
+    // 按名称获取某个头部值的只读切片视图（零堆内存分配）。
+    // 若未找到，返回长度为 0 的空 ReadOnlySpan<char>。
+    public ReadOnlySpan<char> GetHeaderSpan(string name) {
+        if (HttpRequest.NameIs(name, "authorization")) {
+            return this.authorization.AsSpan();
+        }
+        if (HttpRequest.NameIs(name, "cookie")) {
+            return this.cookie.AsSpan();
+        }
+        if (HttpRequest.NameIs(name, "user-agent")) {
+            return this.userAgent.AsSpan();
+        }
+        if (this.rawHeaders == null || this.rawHeaders.Length == 0) {
+            return "".AsSpan();
+        }
+        int pos = 0;
+        int len = this.rawHeaders.Length;
+        while (pos < len) {
+            int lineEnd = pos;
+            while (lineEnd < len && (this.rawHeaders[lineEnd] & 255) != 10) {
+                lineEnd = lineEnd + 1;
+            }
+            int lineStop = lineEnd;
+            if (lineStop > pos && (this.rawHeaders[lineStop - 1] & 255) == 13) { lineStop = lineStop - 1; }
+            int colonPos = pos;
+            while (colonPos < lineStop && (this.rawHeaders[colonPos] & 255) != 58) {
+                colonPos = colonPos + 1;
+            }
+            if (colonPos < lineStop) {
+                if (RegionIsCi(this.rawHeaders, pos, colonPos, name)) {
+                    int vStart = HttpRequest.TrimOwsStart(this.rawHeaders,
+                        colonPos + 1, lineStop);
+                    int vStop = HttpRequest.TrimOwsStop(this.rawHeaders,
+                        vStart, lineStop);
+                    if (vStop > vStart) {
+                        return this.rawHeaders.AsSpan().Slice(vStart, vStop - vStart);
+                    }
+                    return "".AsSpan();
+                }
+            }
+            pos = lineEnd + 1;
+        }
+        return "".AsSpan();
+    }
+
+    // 判定是否存在指定名称的请求头（零堆内存分配）。
+    public bool HasHeader(string name) {
+        return this.GetHeaderSpan(name).Length > 0;
+    }
+
+    // 零分配判定指定头部的值是否与 target 完全匹配（大小写敏感）。
+    public bool HeaderSpanEquals(string name, string target) {
+        ReadOnlySpan<char> span = this.GetHeaderSpan(name);
+        if (span.Length != target.Length) { return false; }
+        for (int i = 0; i < span.Length; i = i + 1) {
+            if (span[i] != target[i]) { return false; }
+        }
+        return true;
+    }
+
+    // 零分配判定指定头部的值是否以 prefix 开头。
+    public bool HeaderSpanStartsWith(string name, string prefix) {
+        ReadOnlySpan<char> span = this.GetHeaderSpan(name);
+        if (span.Length < prefix.Length) { return false; }
+        for (int i = 0; i < prefix.Length; i = i + 1) {
+            if (span[i] != prefix[i]) { return false; }
+        }
+        return true;
     }
 
     // 比对 raw[pos..stop) 与 str 是否逐字节完全匹配（零分配）。

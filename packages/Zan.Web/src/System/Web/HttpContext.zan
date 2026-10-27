@@ -30,6 +30,9 @@ public class HttpContext : IDisposable {
     // 直接返回缓存（同一个请求体往往被多个读取方消费）。
     public JsonValue jsonBody;
     public bool jsonParsed;
+    // 高性能平面 Tape JSON 文档缓存（零分配解析，JsonDoc() 调用时解析一次）。
+    public JsonDoc jsonDoc;
+    public bool jsonDocParsed;
 
     public int status;
     public string statusText;
@@ -58,9 +61,9 @@ public class HttpContext : IDisposable {
         this.method = req.method;
         this.path = req.path;
         this.remoteIp = remoteIp;
-        this.routeParams = new StrMap();
-        this.query = new StrMap();
-        this.form = new StrMap();
+        this.routeParams = null;
+        this.query = null;
+        this.form = null;
         this.uid = "";
         this.routeAction = "";
         this.routePattern = "";
@@ -69,6 +72,8 @@ public class HttpContext : IDisposable {
         this.uploadSize = 0;
         this.jsonBody = null;
         this.jsonParsed = false;
+        this.jsonDoc = null;
+        this.jsonDocParsed = false;
         this.status = 200;
         this.statusText = "OK";
         this.contentType = "text/html; charset=utf-8";
@@ -85,7 +90,10 @@ public class HttpContext : IDisposable {
         this.deadlineSlot = null;
         this.streamIdleMs = 30000;
         this.framer = null;
-        HttpContext.ParsePairs(req.queryString, this.query);
+        if (req.queryString.Length > 0) {
+            this.query = new StrMap();
+            HttpContext.ParsePairs(req.queryString, this.query);
+        }
         // 表单在这里解析一次，服务的是直接构造 HttpContext 的调用方
         // （此时 request.body 已是完整正文）。WebApp 的连接循环里正文
         // 是在构造之后才由 HttpFramer 缓冲齐的，那里经 ParseFormBody
@@ -93,7 +101,10 @@ public class HttpContext : IDisposable {
         // 表单仍然只被真正解析一次。
         if (req.method == "POST" || req.method == "PUT" || req.method == "PATCH") {
             if (HttpContext.StartsWith(req.contentType, "application/x-www-form-urlencoded")) {
-                HttpContext.ParsePairs(req.body, this.form);
+                if (req.body.Length > 0) {
+                    this.form = new StrMap();
+                    HttpContext.ParsePairs(req.body, this.form);
+                }
             } else if (HttpContext.StartsWith(req.contentType, "multipart/form-data")) {
                 HttpContext.ParseMultipartFields(req, this);
             }
@@ -116,6 +127,7 @@ public class HttpContext : IDisposable {
         }
         this.bodyBytes = null;
         this.jsonBody = null;
+        this.jsonDoc = null;
     }
 
     // 客户端 IP 文本（点分 IPv4）。
@@ -126,8 +138,15 @@ public class HttpContext : IDisposable {
     // 请求体缓冲完成后重新解析表单键值对。
     public static void ParseFormBody(HttpRequest req, HttpContext ctx) {
         if (HttpContext.StartsWith(req.contentType, "application/x-www-form-urlencoded")) {
-            ctx.form.Clear();
-            HttpContext.ParsePairs(req.body, ctx.form);
+            if (ctx.form == null) {
+                if (req.body.Length > 0) {
+                    ctx.form = new StrMap();
+                    HttpContext.ParsePairs(req.body, ctx.form);
+                }
+            } else {
+                ctx.form.Clear();
+                HttpContext.ParsePairs(req.body, ctx.form);
+            }
         }
     }
 
@@ -144,7 +163,11 @@ public class HttpContext : IDisposable {
         string ctype = req.contentType;
         int bIdx = HttpContext.FindNoCaseFrom(ctype, "boundary=", 0);
         if (bIdx < 0) { return; }
-        ctx.form.Clear();
+        if (ctx.form == null) {
+            ctx.form = new StrMap();
+        } else {
+            ctx.form.Clear();
+        }
         int bs = bIdx + 9;
         int be = bs;
         while (be < ctype.Length && (ctype[be] & 255) != 59) { be = be + 1; }
@@ -265,11 +288,20 @@ public class HttpContext : IDisposable {
 
 
     // 路由参数（{param} 段匹配到的值）。
-    string Param(string name) { return this.routeParams.Get(name); }
+    string Param(string name) {
+        if (this.routeParams == null) { return ""; }
+        return this.routeParams.Get(name);
+    }
     // query string 参数。
-    string Query(string name) { return this.query.Get(name); }
+    string Query(string name) {
+        if (this.query == null) { return ""; }
+        return this.query.Get(name);
+    }
     // 表单字段（urlencoded 或 multipart 的文本字段）。
-    string Form(string name) { return this.form.Get(name); }
+    string Form(string name) {
+        if (this.form == null) { return ""; }
+        return this.form.Get(name);
+    }
     // 原始请求正文。
     string Body() { return this.request.body; }
 
@@ -284,6 +316,19 @@ public class HttpContext : IDisposable {
             }
         }
         return this.jsonBody;
+    }
+
+    // 解析并缓存请求体高性能平面 Tape JSON 文档（零中间节点分配），空体返回 null。
+    public JsonDoc JsonDoc() {
+        if (!this.jsonDocParsed) {
+            this.jsonDocParsed = true;
+            this.jsonDoc = null;
+            string b = this.request.body;
+            if (b.Length > 0) {
+                this.jsonDoc = System.Json.JsonDoc.Parse(b);
+            }
+        }
+        return this.jsonDoc;
     }
 
     // ================= 类型化取参族 =================
@@ -406,11 +451,18 @@ public class HttpContext : IDisposable {
 
     // 获取原始未过滤参数值 (优先级：路由参数 -> Query -> Form)。
     string InRaw(string name) {
-        string v = this.routeParams.Get(name);
-        if (v.Length > 0) { return v; }
-        v = this.query.Get(name);
-        if (v.Length > 0) { return v; }
-        return this.form.Get(name);
+        if (this.routeParams != null) {
+            string v = this.routeParams.Get(name);
+            if (v.Length > 0) { return v; }
+        }
+        if (this.query != null) {
+            string v = this.query.Get(name);
+            if (v.Length > 0) { return v; }
+        }
+        if (this.form != null) {
+            return this.form.Get(name);
+        }
+        return "";
     }
 
     // 获取安全过滤后的字符串参数值（自动裁剪首尾空白并剔除控制字符）。
@@ -435,8 +487,10 @@ public class HttpContext : IDisposable {
     bool InBool(string name, bool def) { return Filter.ToBool(this.InRaw(name), def); }
 
     bool HasIn(string name) {
-        return this.form.Has(name) || this.query.Has(name)
-            || this.routeParams.Has(name);
+        if (this.form != null && this.form.Has(name)) { return true; }
+        if (this.query != null && this.query.Has(name)) { return true; }
+        if (this.routeParams != null && this.routeParams.Has(name)) { return true; }
+        return false;
     }
 
 
@@ -790,7 +844,7 @@ public class HttpContext : IDisposable {
         bool statusBodyless = this.StatusForbidsBody();
         bool omitBody = this.method == "HEAD" || statusBodyless;
         bool forbidFraming = statusBodyless && this.status != 304;
-        StringBuilder sb = new StringBuilder();
+        StringBuilder sb = HttpBufferPool.Rent();
         sb.Append("HTTP/1.1 ");
         sb.Append(HttpContext.Itoa(this.status));
         sb.Append(" ");
@@ -798,12 +852,17 @@ public class HttpContext : IDisposable {
         sb.Append("\r\nContent-Type: ");
         sb.Append(this.contentType);
         if (!statusBodyless) {
-            sb.Append("\r\nContent-Length: ");
-            sb.Append(HttpContext.Itoa(this.BodyLength()));
+            int blen = this.BodyLength();
+            if (blen == 0) {
+                sb.Append("\r\nContent-Length: 0");
+            } else {
+                sb.Append("\r\nContent-Length: ");
+                sb.Append(HttpContext.Itoa(blen));
+            }
         }
         if (keepAlive) { sb.Append("\r\nConnection: keep-alive"); }
         else { sb.Append("\r\nConnection: close"); }
-        sb.Append("\r\nServer: ZanWeb/0.1");
+        sb.Append("\r\nServer: Zan/1.0");
         int hn = 0;
         if (this.headers != null) { hn = this.headers.Count; }
         for (int i = 0; i < hn; i = i + 1) {
@@ -823,24 +882,28 @@ public class HttpContext : IDisposable {
         }
         sb.Append("\r\n\r\n");
         if (this.bodyBytes == null && !omitBody) { sb.Append(this.body); }
-        return sb.ToString();
+        string res = sb.ToString();
+        HttpBufferPool.Return(sb);
+        return res;
     }
 
     private static string Itoa(int v) {
+        if (v == 200) { return "200"; }
         if (v == 0) { return "0"; }
-        int x = v;
-        bool neg = false;
-        if (x < 0) { neg = true; x = 0 - x; }
-        int div = 1;
-        int t = x;
-        while (t >= 10) { div = div * 10; t = t / 10; }
-        StringBuilder sb = new StringBuilder();
-        if (neg) { sb.Append("-"); }
-        while (div > 0) {
-            sb.Append(HttpContext.Digit((x / div) % 10));
-            div = div / 10;
-        }
-        return sb.ToString();
+        if (v == 404) { return "404"; }
+        if (v == 500) { return "500"; }
+        if (v == 400) { return "400"; }
+        if (v == 401) { return "401"; }
+        if (v == 403) { return "403"; }
+        if (v == 302) { return "302"; }
+        if (v == 301) { return "301"; }
+        if (v == 204) { return "204"; }
+        if (v == 405) { return "405"; }
+        if (v == 413) { return "413"; }
+        if (v == 429) { return "429"; }
+        if (v == 431) { return "431"; }
+        if (v >= 1 && v <= 9) { return HttpContext.Digit(v); }
+        return Convert.ToString(v);
     }
 
     // 单个十进制数字的字面量（d 取 0–9）。
@@ -859,10 +922,14 @@ public class HttpContext : IDisposable {
 
     // ---- helpers ----
 
-    // 前缀判断（大小写敏感）。
+    // 前缀判断（大小写敏感，零堆分配逐字符比对）。
     public static bool StartsWith(string s, string prefix) {
-        if (s.Length < prefix.Length) { return false; }
-        return s.Substring(0, prefix.Length) == prefix;
+        if (s == null || prefix == null || s.Length < prefix.Length) { return false; }
+        int n = prefix.Length;
+        for (int i = 0; i < n; i = i + 1) {
+            if (s[i] != prefix[i]) { return false; }
+        }
+        return true;
     }
 
     private static void ParsePairs(string s, StrMap into) {

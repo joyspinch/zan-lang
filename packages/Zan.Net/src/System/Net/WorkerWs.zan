@@ -409,15 +409,16 @@ public class WorkerWs {
             return;
         }
         HttpRequest req = HttpRequest.Parse(framer.Head(headerEnd), headerEnd);
-        string wsKey = req.GetHeader("Sec-WebSocket-Key");
-        bool wantsUpgrade = wsKey.Length > 0
-            || req.GetHeader("Upgrade").Length > 0
-            || req.GetHeader("Sec-WebSocket-Version").Length > 0
+        bool wantsUpgrade = req.HasHeader("Sec-WebSocket-Key")
+            || req.HasHeader("Upgrade")
+            || req.HasHeader("Sec-WebSocket-Version")
             || WsHandshake.HasToken(req.GetHeader("Connection"), "upgrade");
-        Worker.Dbg("ws port got " + req.method + " " + req.path
-            + " headEnd=" + Convert.ToString(headerEnd)
-            + " parseStatus=" + Convert.ToString(req.parseStatus)
-            + " upgrade=" + Convert.ToString(wantsUpgrade));
+        if (Worker.IsDebug()) {
+            Worker.Dbg("ws port got " + req.method + " " + req.path
+                + " headEnd=" + Convert.ToString(headerEnd)
+                + " parseStatus=" + Convert.ToString(req.parseStatus)
+                + " upgrade=" + Convert.ToString(wantsUpgrade));
+        }
 
         if (!wantsUpgrade && req.parseStatus == 0) {
             await HttpServer.ServeFramed(clientSock, w.RequestHandler(), framer,
@@ -425,6 +426,7 @@ public class WorkerWs {
             w.DropConn();
             return;
         }
+        string wsKey = req.GetHeader("Sec-WebSocket-Key");
         if (!WsHandshake.Valid(req)) {
             int _bad = await client.SendAsync("HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
             framer.Dispose();
@@ -435,14 +437,16 @@ public class WorkerWs {
         // 之后的路径全部收口到帧循环末尾的统一清理；本函数内不再
         // 有提前 return。
 
-        StringBuilder sb = new StringBuilder();
+        StringBuilder sb = HttpBufferPool.Rent();
         sb.Append("HTTP/1.1 101 Switching Protocols\r\n");
         sb.Append("Upgrade: websocket\r\n");
         sb.Append("Connection: Upgrade\r\n");
         sb.Append("Sec-WebSocket-Accept: ");
         sb.Append(Encoding.WebSocketAccept(wsKey));
         sb.Append("\r\n\r\n");
-        int _hs = await client.SendAsync(sb.ToString());
+        string hsText = sb.ToString();
+        HttpBufferPool.Return(sb);
+        int _hs = await client.SendAsync(hsText);
 
         Connection conn = w.NewConnection(clientSock);
 

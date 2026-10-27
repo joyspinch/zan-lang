@@ -1,0 +1,40 @@
+using System;
+using System.Collections.Generic;
+using System.Text;
+
+namespace System.Net.Http;
+
+// Worker / 协程级序列化缓冲复用池：
+// 为 HTTP 响应报文头构建与正文序列化提供零分配 StringBuilder 借还机制。
+// 借出时自动 Clear，归还时施加容量保护（超大缓冲区直接淘汰，防止常驻内存膨胀）。
+public class HttpBufferPool {
+    static List<StringBuilder> pool = new List<StringBuilder>();
+    static int maxPoolSize = 512;
+    // 超过 128KB 的异常大响应缓冲区不回池，直接由运行时析构回收
+    static int maxRetainCapacity = 131072;
+
+    // 从池中借出一个已清理就绪的 StringBuilder。若池空则创建新实例。
+    public static StringBuilder Rent() {
+        lock (pool) {
+            int n = pool.Count;
+            if (n > 0) {
+                StringBuilder sb = pool[n - 1];
+                pool.RemoveAt(n - 1);
+                sb.Clear();
+                return sb;
+            }
+        }
+        return new StringBuilder();
+    }
+
+    // 将 StringBuilder 归还池中；单次膨胀超限则淘汰。
+    public static void Return(StringBuilder sb) {
+        if (sb == null) { return; }
+        if (sb.Length > maxRetainCapacity) { return; }
+        sb.Clear();
+        lock (pool) {
+            if (pool.Count >= maxPoolSize) { return; }
+            pool.Add(sb);
+        }
+    }
+}
