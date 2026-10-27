@@ -290,19 +290,17 @@ public class Encoding {
     // 数），s[i] 取的是 UTF-8 编码字节；文本层的"第 N 个字符"用下面
     // 这组。字节语义不受影响，存量代码零破坏。
 
-    // 从字节偏移 <paramref name="byteIndex"/> 起解码一个
-    // Unicode 码点，写入 <paramref name="cpOut"/>（长度 ≥1 的 int 数组
-    // ——Zan 无出参，借用数组回传）并返回该码点占用的字节数
-    // （1-4）。byteIndex 越界返回 0，cpOut[0] 不动。非法序列
-    // （截断的多字节头、落单续字节、过长编码）返回 1、
-    // cpOut[0] = U+FFFD，与 <see cref="GetString"/> 的替换行为一致。
-    public static int DecodeCodePoint(string s, int byteIndex, int[] cpOut) {
+    // 从字节偏移 <paramref name="byteIndex"/> 起无分配解码一个
+    // Unicode 码点。返回 64 位复合值：
+    // 高 32 位为占用的字节数（1-4），低 32 位为码点值（0-1114111）。
+    // 越界返回 0L。非法序列返回 (1L << 32) | 65533L。
+    // 寄存器直接返回，绝无 heap 数组分配开销。
+    public static long DecodeCodePointFast(string s, int byteIndex) {
         int n = s.Length;
-        if (byteIndex < 0 || byteIndex >= n) { return 0; }
+        if (byteIndex < 0 || byteIndex >= n) { return 0L; }
         int b0 = s[byteIndex] & 255;
         if (b0 < 128) {
-            cpOut[0] = b0;
-            return 1;
+            return (1L << 32) | (long)b0;
         }
         int need = 0;
         int cp = 0;
@@ -310,37 +308,46 @@ public class Encoding {
         else if (b0 >= 224 && b0 <= 239) { need = 2; cp = b0 & 15; }
         else if (b0 >= 240 && b0 <= 244) { need = 3; cp = b0 & 7; }
         if (need == 0 || byteIndex + need > n - 1) {
-            // 非法首字节，或续字节落出串尾（byteIndex+need 越过末字节）
-            cpOut[0] = 65533;
-            return 1;
+            return (1L << 32) | 65533L;
         }
         int k = 1;
         while (k <= need) {
             int bx = s[byteIndex + k] & 255;
             if ((bx & 192) != 128) {
-                cpOut[0] = 65533;
-                return 1;
+                return (1L << 32) | 65533L;
             }
             cp = (cp << 6) | (bx & 63);
             k = k + 1;
         }
         int min = need == 1 ? 128 : (need == 2 ? 2048 : 65536);
         if (cp < min || cp > 1114111 || (cp >= 55296 && cp <= 57343)) {
-            cpOut[0] = 65533;
-            return 1;
+            return (1L << 32) | 65533L;
         }
-        cpOut[0] = cp;
-        return need + 1;
+        return ((long)(need + 1) << 32) | (long)cp;
+    }
+
+    // 从字节偏移 <paramref name="byteIndex"/> 起解码一个
+    // Unicode 码点，写入 <paramref name="cpOut"/>（长度 ≥1 的 int 数组
+    // ——Zan 无出参，借用数组回传）并返回该码点占用的字节数
+    // （1-4）。byteIndex 越界返回 0，cpOut[0] 不动。非法序列
+    // （截断的多字节头、落单续字节、过长编码）返回 1、
+    // cpOut[0] = U+FFFD，与 <see cref="GetString"/> 的替换行为一致。
+    public static int DecodeCodePoint(string s, int byteIndex, int[] cpOut) {
+        long res = Encoding.DecodeCodePointFast(s, byteIndex);
+        if (res == 0L) { return 0; }
+        if (cpOut != null && cpOut.Length > 0) {
+            cpOut[0] = (int)(res & 0xFFFFFFFFL);
+        }
+        return (int)(res >> 32);
     }
 
     // 从字节偏移 <paramref name="byteIndex"/> 起解码一个码点
     // 并直接编码回 1-4 字节 UTF-8 字符串（等价 DecodeCodePoint 后接
     // Utf8FromCodePoint）。非法序列收敛为 U+FFFD 单字符。
     public static string RuneAt(string s, int byteIndex) {
-        int[] slot = new int[1];
-        int used = Encoding.DecodeCodePoint(s, byteIndex, slot);
-        if (used == 0) { return ""; }
-        return Encoding.Utf8FromCodePoint(slot[0]);
+        long res = Encoding.DecodeCodePointFast(s, byteIndex);
+        if (res == 0L) { return ""; }
+        return Encoding.Utf8FromCodePoint((int)(res & 0xFFFFFFFFL));
     }
 
     // 字符串中的码点个数（≠ Length 字节数，非 ASCII 时更

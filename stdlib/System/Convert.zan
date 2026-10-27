@@ -19,36 +19,51 @@ public class Convert {
         string hw = NativeMemory.Base64Encode(inArray, (long)inArray.Length);
         if (hw != null) { return hw; }
 
-        string a = BASE64_ALPHA();
         int len = inArray.Length;
         int outLen = ((len + 2) / 3) * 4;
         byte[] outBuf = new byte[outLen];
-        int di = 0;
-        int i = 0;
-        while (i + 3 <= len) {
+        Convert.ToBase64Chars(inArray, 0, len, outBuf, 0);
+        return outBuf.ToStr(0, outLen);
+    }
+
+    // 高吞吐零分配 Base64 编码：将 inArray[inOff..inOff+inLen] 编码直接写入 outBuf[outOff..]。
+    // 返回实际写入 outBuf 的字节数。若缓冲区不足返回 -1。
+    public static int ToBase64Chars(byte[] inArray, int inOff, int inLen, byte[] outBuf, int outOff) {
+        if (inArray == null || inLen <= 0) { return 0; }
+        if (outBuf == null) { return -1; }
+        int req = ((inLen + 2) / 3) * 4;
+        if (outOff < 0 || outOff + req > outBuf.Length) { return -1; }
+
+        string a = BASE64_ALPHA();
+        int di = outOff;
+        int i = inOff;
+        int end = inOff + inLen;
+        while (i + 3 <= end) {
             int n = ((inArray[i] & 255) << 16) | ((inArray[i + 1] & 255) << 8) | (inArray[i + 2] & 255);
-            outBuf[di] = (byte)(a[(n >> 18) & 63] & 255);
+            outBuf[di]     = (byte)(a[(n >> 18) & 63] & 255);
             outBuf[di + 1] = (byte)(a[(n >> 12) & 63] & 255);
             outBuf[di + 2] = (byte)(a[(n >> 6) & 63] & 255);
             outBuf[di + 3] = (byte)(a[n & 63] & 255);
             di = di + 4;
             i = i + 3;
         }
-        int rem = len - i;
+        int rem = end - i;
         if (rem == 1) {
             int n = (inArray[i] & 255) << 16;
-            outBuf[di] = (byte)(a[(n >> 18) & 63] & 255);
+            outBuf[di]     = (byte)(a[(n >> 18) & 63] & 255);
             outBuf[di + 1] = (byte)(a[(n >> 12) & 63] & 255);
-            outBuf[di + 2] = (byte)61;  // '='
+            outBuf[di + 2] = (byte)61; // '='
             outBuf[di + 3] = (byte)61;
+            di = di + 4;
         } else if (rem == 2) {
             int n = ((inArray[i] & 255) << 16) | ((inArray[i + 1] & 255) << 8);
-            outBuf[di] = (byte)(a[(n >> 18) & 63] & 255);
+            outBuf[di]     = (byte)(a[(n >> 18) & 63] & 255);
             outBuf[di + 1] = (byte)(a[(n >> 12) & 63] & 255);
             outBuf[di + 2] = (byte)(a[(n >> 6) & 63] & 255);
-            outBuf[di + 3] = (byte)61;  // '='
+            outBuf[di + 3] = (byte)61; // '='
+            di = di + 4;
         }
-        return outBuf.ToStr(0, outLen);
+        return di - outOff;
     }
 
     // 单个 Base64 字符解码为数值 (0-63)，非法字符返回 -1
@@ -103,6 +118,63 @@ public class Convert {
             si = si + 4;
         }
         return outb;
+    }
+
+    // 高吞吐零分配 Base64 解码：将 inBuf[inOff..inOff+inLen] 中的 ASCII 字符解码直接写入 outBuf[outOff..]。
+    // 返回实际写入 outBuf 的字节数。若格式非法或缓冲区不足返回 -1。
+    public static int FromBase64Chars(byte[] inBuf, int inOff, int inLen, byte[] outBuf, int outOff) {
+        if (inBuf == null || inLen <= 0) { return 0; }
+        if (outBuf == null) { return -1; }
+
+        int pad = 0;
+        int end = inOff + inLen;
+        if (inLen > 0 && inBuf[end - 1] == 61) { pad = pad + 1; }
+        if (inLen > 1 && inBuf[end - 2] == 61) { pad = pad + 1; }
+
+        long outLenL = ((long)inLen * 3) / 4 - pad;
+        if (outLenL < 0) { outLenL = 0; }
+        int req = (int)outLenL;
+        if (outOff < 0 || outOff + req > outBuf.Length) { return -1; }
+
+        int si = inOff;
+        int di = outOff;
+        int validEnd = end - pad;
+
+        while (si + 4 <= validEnd) {
+            int c0 = DecB64(inBuf[si] & 255);
+            int c1 = DecB64(inBuf[si + 1] & 255);
+            int c2 = DecB64(inBuf[si + 2] & 255);
+            int c3 = DecB64(inBuf[si + 3] & 255);
+            if (c0 < 0 || c1 < 0 || c2 < 0 || c3 < 0) { return -1; }
+
+            int n = (c0 << 18) | (c1 << 12) | (c2 << 6) | c3;
+            outBuf[di]     = (byte)((n >> 16) & 255);
+            outBuf[di + 1] = (byte)((n >> 8) & 255);
+            outBuf[di + 2] = (byte)(n & 255);
+            di = di + 3;
+            si = si + 4;
+        }
+
+        if (pad > 0 && si + 4 == end) {
+            int c0 = DecB64(inBuf[si] & 255);
+            int c1 = DecB64(inBuf[si + 1] & 255);
+            if (c0 < 0 || c1 < 0) { return -1; }
+
+            if (pad == 2) {
+                int n = (c0 << 18) | (c1 << 12);
+                outBuf[di] = (byte)((n >> 16) & 255);
+                di = di + 1;
+            } else if (pad == 1) {
+                int c2 = DecB64(inBuf[si + 2] & 255);
+                if (c2 < 0) { return -1; }
+                int n = (c0 << 18) | (c1 << 12) | (c2 << 6);
+                outBuf[di]     = (byte)((n >> 16) & 255);
+                outBuf[di + 1] = (byte)((n >> 8) & 255);
+                di = di + 2;
+            }
+        }
+
+        return di - outOff;
     }
 
     // 将字节数组编码为小写十六进制文本（零中间字符串分配）。

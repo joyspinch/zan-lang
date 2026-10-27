@@ -1266,6 +1266,58 @@ static bool emit_native_memory_call(zan_irgen_t *g, zan_ast_node_t *expr,
         }, 7, "nm.json_parse_fast");
         return true;
     }
+    /* AtomicInt 核心操作一律内联发射为单指令硬件原子操作，消除 C ABI 跨语言调用开销 */
+    #define IS_ATOMIC_INT(m) (is_call_to(expr, "AtomicInt", m) || \
+        (expr->kind == AST_CALL && expr->call.callee && expr->call.callee->kind == AST_IDENTIFIER && \
+         (int)expr->call.callee->ident.name.len == (int)strlen(m) && \
+         memcmp(expr->call.callee->ident.name.str, m, (size_t)expr->call.callee->ident.name.len) == 0))
+
+    if (IS_ATOMIC_INT("NativeLoad") && expr->call.args.count == 1) {
+        LLVMValueRef handle = nm_arg(g, expr, 0, locals);
+        LLVMValueRef ptr = LLVMBuildIntToPtr(g->builder, handle, LLVMPointerType(i64t, 0), "atom.ptr");
+        LLVMValueRef val = LLVMBuildLoad2(g->builder, i64t, ptr, "atom.load");
+        LLVMSetOrdering(val, LLVMAtomicOrderingSequentiallyConsistent);
+        *out = val;
+        return true;
+    }
+    if (IS_ATOMIC_INT("NativeStore") && expr->call.args.count == 2) {
+        LLVMValueRef handle = nm_arg(g, expr, 0, locals);
+        LLVMValueRef val = nm_arg(g, expr, 1, locals);
+        LLVMValueRef ptr = LLVMBuildIntToPtr(g->builder, handle, LLVMPointerType(i64t, 0), "atom.ptr");
+        LLVMValueRef st = LLVMBuildStore(g->builder, val, ptr);
+        LLVMSetOrdering(st, LLVMAtomicOrderingSequentiallyConsistent);
+        *out = zero64;
+        return true;
+    }
+    if (IS_ATOMIC_INT("NativeAdd") && expr->call.args.count == 2) {
+        LLVMValueRef handle = nm_arg(g, expr, 0, locals);
+        LLVMValueRef delta = nm_arg(g, expr, 1, locals);
+        LLVMValueRef ptr = LLVMBuildIntToPtr(g->builder, handle, LLVMPointerType(i64t, 0), "atom.ptr");
+        LLVMValueRef old = LLVMBuildAtomicRMW(g->builder, LLVMAtomicRMWBinOpAdd, ptr, delta,
+                                              LLVMAtomicOrderingSequentiallyConsistent, false);
+        *out = LLVMBuildAdd(g->builder, old, delta, "atom.add.res");
+        return true;
+    }
+    if (IS_ATOMIC_INT("NativeExchange") && expr->call.args.count == 2) {
+        LLVMValueRef handle = nm_arg(g, expr, 0, locals);
+        LLVMValueRef val = nm_arg(g, expr, 1, locals);
+        LLVMValueRef ptr = LLVMBuildIntToPtr(g->builder, handle, LLVMPointerType(i64t, 0), "atom.ptr");
+        *out = LLVMBuildAtomicRMW(g->builder, LLVMAtomicRMWBinOpXchg, ptr, val,
+                                  LLVMAtomicOrderingSequentiallyConsistent, false);
+        return true;
+    }
+    if (IS_ATOMIC_INT("NativeCompareExchange") && expr->call.args.count == 3) {
+        LLVMValueRef handle = nm_arg(g, expr, 0, locals);
+        LLVMValueRef expected = nm_arg(g, expr, 1, locals);
+        LLVMValueRef desired = nm_arg(g, expr, 2, locals);
+        LLVMValueRef ptr = LLVMBuildIntToPtr(g->builder, handle, LLVMPointerType(i64t, 0), "atom.ptr");
+        LLVMValueRef pair = LLVMBuildAtomicCmpXchg(g->builder, ptr, expected, desired,
+                                                   LLVMAtomicOrderingSequentiallyConsistent,
+                                                   LLVMAtomicOrderingSequentiallyConsistent, false);
+        *out = LLVMBuildExtractValue(g->builder, pair, 0, "atom.cmpxchg.old");
+        return true;
+    }
+    #undef IS_ATOMIC_INT
     return false;
 }
 
