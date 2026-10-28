@@ -685,6 +685,7 @@ static LLVMValueRef get_dict_find_fn(zan_irgen_t *g) {
     LLVMValueRef is_str = LLVMGetParam(fn, 2);
     LLVMValueRef i_a = LLVMBuildAlloca(b, i64, "i");
     LLVMValueRef h_a = LLVMBuildAlloca(b, i64, "h");
+    LLVMValueRef tag_a = LLVMBuildAlloca(b, i64, "tag");
     LLVMValueRef cap_a = LLVMBuildAlloca(b, i64, "ncap");
     LLVMValueRef ix_a = LLVMBuildAlloca(b, i64ptr, "ixcur");
     LLVMValueRef mask_a = LLVMBuildAlloca(b, i64, "mask");
@@ -771,6 +772,9 @@ static LLVMValueRef get_dict_find_fn(zan_irgen_t *g) {
     LLVMValueRef fi2 = LLVMBuildLoad2(b, i64, i_a, "fi2");
     LLVMValueRef fkey = LLVMBuildLoad2(b, i8ptr, LLVMBuildGEP2(b, i8ptr, rks, &fi2, 1, "fksl"), "fkey");
     LLVMValueRef fh = zan_call2(b, hash_ty, hashf, (LLVMValueRef[]){ fkey, is_str }, 2, "fh");
+    LLVMValueRef fhtag = zan_or(b, zan_and(b, fh, LLVMConstInt(i64, 0xFFFFFFFF00000000ULL, 0), "fh_hi"),
+                                LLVMConstInt(i64, 0x8000000000000000ULL, 0), "fhtag");
+    LLVMBuildStore(b, fhtag, tag_a);
     LLVMBuildStore(b, zan_and(b, fh, fmask, "fh.m"), h_a);
     LLVMBuildBr(b, fpcond);
     LLVMPositionBuilderAtEnd(b, fpcond);
@@ -781,13 +785,21 @@ static LLVMValueRef get_dict_find_fn(zan_irgen_t *g) {
     LLVMBuildCondBr(b, zan_icmp(b, LLVMIntEQ, fslot, LLVMConstInt(i64, 0, 0), "ffree"),
                     fput, fdup);
     LLVMPositionBuilderAtEnd(b, fput);
+    LLVMValueRef curtag = LLVMBuildLoad2(b, i64, tag_a, "curtag");
     LLVMValueRef fi3 = LLVMBuildLoad2(b, i64, i_a, "fi3");
-    LLVMBuildStore(b, zan_add(b, fi3, LLVMConstInt(i64, 1, 0), "fi3p1"),
-                   LLVMBuildGEP2(b, i64, fix, &fh2, 1, "fslotp2"));
+    LLVMValueRef fval = zan_or(b, curtag, zan_add(b, fi3, LLVMConstInt(i64, 1, 0), "fi3p1"), "fval");
+    LLVMBuildStore(b, fval, LLVMBuildGEP2(b, i64, fix, &fh2, 1, "fslotp2"));
     LLVMBuildBr(b, fnext);
     LLVMPositionBuilderAtEnd(b, fdup);
+    LLVMValueRef curtag2 = LLVMBuildLoad2(b, i64, tag_a, "curtag2");
+    LLVMValueRef fslot_tag = zan_and(b, fslot, LLVMConstInt(i64, 0xFFFFFFFF00000000ULL, 0), "fslot_tag");
+    LLVMValueRef ftag_eq = zan_icmp(b, LLVMIntEQ, fslot_tag, curtag2, "ftag_eq");
+    LLVMBasicBlockRef fchk = LLVMAppendBasicBlockInContext(c, fn, "rb.chk");
+    LLVMBuildCondBr(b, ftag_eq, fchk, fpnext);
+    LLVMPositionBuilderAtEnd(b, fchk);
     LLVMValueRef dks = LLVMBuildLoad2(b, i8pp, kp, "dks");
-    LLVMValueRef fold = zan_sub(b, fslot, LLVMConstInt(i64, 1, 0), "fold");
+    LLVMValueRef fslot_idx = zan_and(b, fslot, LLVMConstInt(i64, 0x00000000FFFFFFFFULL, 0), "fslot_idx");
+    LLVMValueRef fold = zan_sub(b, fslot_idx, LLVMConstInt(i64, 1, 0), "fold");
     LLVMValueRef foldk = LLVMBuildLoad2(b, i8ptr, LLVMBuildGEP2(b, i8ptr, dks, &fold, 1, "foldkp"), "foldk");
     LLVMValueRef fsame = zan_call2(b, keq_ty, keq, (LLVMValueRef[]){ foldk, fkey, is_str }, 3, "fsame");
     LLVMBuildCondBr(b, fsame, fnext, fpnext);
@@ -807,6 +819,9 @@ static LLVMValueRef get_dict_find_fn(zan_irgen_t *g) {
     LLVMValueRef pks = LLVMBuildLoad2(b, i8pp, kp, "pks");
     LLVMValueRef pmask = zan_sub(b, pcap, LLVMConstInt(i64, 1, 0), "pmask");
     LLVMValueRef ph = zan_call2(b, hash_ty, hashf, (LLVMValueRef[]){ key, is_str }, 2, "ph");
+    LLVMValueRef phtag = zan_or(b, zan_and(b, ph, LLVMConstInt(i64, 0xFFFFFFFF00000000ULL, 0), "ph_hi"),
+                                LLVMConstInt(i64, 0x8000000000000000ULL, 0), "phtag");
+    LLVMBuildStore(b, phtag, tag_a);
     LLVMBuildStore(b, zan_and(b, ph, pmask, "ph.m"), h_a);
     LLVMBuildBr(b, pcond);
     LLVMPositionBuilderAtEnd(b, pcond);
@@ -815,7 +830,14 @@ static LLVMValueRef get_dict_find_fn(zan_irgen_t *g) {
     LLVMBuildCondBr(b, zan_icmp(b, LLVMIntEQ, pslot, LLVMConstInt(i64, 0, 0), "pfree"),
                     miss, pchk);
     LLVMPositionBuilderAtEnd(b, pchk);
-    LLVMValueRef pidx = zan_sub(b, pslot, LLVMConstInt(i64, 1, 0), "pidx");
+    LLVMValueRef curptag = LLVMBuildLoad2(b, i64, tag_a, "curptag");
+    LLVMValueRef pslot_tag = zan_and(b, pslot, LLVMConstInt(i64, 0xFFFFFFFF00000000ULL, 0), "pslot_tag");
+    LLVMValueRef ptag_match = zan_icmp(b, LLVMIntEQ, pslot_tag, curptag, "ptag_match");
+    LLVMBasicBlockRef pcmp = LLVMAppendBasicBlockInContext(c, fn, "p.cmp");
+    LLVMBuildCondBr(b, ptag_match, pcmp, pnext);
+    LLVMPositionBuilderAtEnd(b, pcmp);
+    LLVMValueRef pidx_raw = zan_and(b, pslot, LLVMConstInt(i64, 0x00000000FFFFFFFFULL, 0), "pidx_raw");
+    LLVMValueRef pidx = zan_sub(b, pidx_raw, LLVMConstInt(i64, 1, 0), "pidx");
     LLVMValueRef pk = LLVMBuildLoad2(b, i8ptr, LLVMBuildGEP2(b, i8ptr, pks, &pidx, 1, "pkp"), "pk");
     LLVMBuildCondBr(b, zan_call2(b, keq_ty, keq, (LLVMValueRef[]){ pk, key, is_str }, 3, "peq"),
                     phit, pnext);

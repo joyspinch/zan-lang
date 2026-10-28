@@ -1,0 +1,212 @@
+// 16 字节 POD 零分配切片原语（StringView）。
+// 无堆分配、无 ARC retain/release 计数、跨线程无竞争。
+// 可透明借用托管 string、byte[] 数组、NativeMemory 或栈缓冲，
+// 用于高性能解析（HTTP 路由与 Header 提取、JSON 键比对、协议拆包）。
+using System;
+using System.Interop;
+
+namespace System;
+
+public struct StringView {
+    public nint ptr;
+    public int length;
+
+    public StringView(nint p, int len) {
+        this.ptr = p;
+        this.length = len;
+    }
+
+    public static StringView Empty() {
+        return new StringView((nint)0, 0);
+    }
+
+    public static StringView FromString(string s) {
+        if (s == null) { return StringView.Empty(); }
+        return new StringView((nint)s, s.Length);
+    }
+
+    public static StringView FromBytes(byte[] buf, int off, int len) {
+        if (buf == null || len <= 0 || off < 0 || off + len > buf.Length) {
+            return StringView.Empty();
+        }
+        return new StringView((nint)buf + (nint)off, len);
+    }
+
+    public int Length { get { return this.length; } }
+    public bool IsEmpty { get { return this.length <= 0; } }
+
+    public byte ByteAt(int index) {
+        if (index < 0 || index >= this.length) {
+            throw new IndexOutOfRangeException("StringView index out of range");
+        }
+        return new Span<byte>(this.ptr, this.length)[index];
+    }
+
+    public StringView Slice(int start) {
+        if (start < 0 || start > this.length) {
+            throw new ArgumentOutOfRangeException("StringView.Slice start out of range");
+        }
+        return new StringView(this.ptr + (nint)start, this.length - start);
+    }
+
+    public StringView Slice(int start, int count) {
+        if (start < 0 || count < 0 || start + count > this.length) {
+            throw new ArgumentOutOfRangeException("StringView.Slice range invalid");
+        }
+        return new StringView(this.ptr + (nint)start, count);
+    }
+
+    public bool Equals(StringView other) {
+        if (this.length != other.length) { return false; }
+        if (this.ptr == other.ptr) { return true; }
+        if (this.length == 0) { return true; }
+        return NativeMemory.SequenceEqual(this.ptr, other.ptr, this.length);
+    }
+
+    public bool Equals(string other) {
+        if (other == null) { return false; }
+        int olen = other.Length;
+        if (this.length != olen) { return false; }
+        if (olen == 0) { return true; }
+        return NativeMemory.SequenceEqual(this.ptr, (nint)other, olen);
+    }
+
+    public bool StartsWith(string prefix) {
+        if (prefix == null) { return false; }
+        int plen = prefix.Length;
+        if (this.length < plen) { return false; }
+        if (plen == 0) { return true; }
+        return NativeMemory.SequenceEqual(this.ptr, (nint)prefix, plen);
+    }
+
+    public bool StartsWith(StringView prefix) {
+        int plen = prefix.length;
+        if (this.length < plen) { return false; }
+        if (plen == 0) { return true; }
+        return NativeMemory.SequenceEqual(this.ptr, prefix.ptr, plen);
+    }
+
+    public bool EndsWith(string suffix) {
+        if (suffix == null) { return false; }
+        int slen = suffix.Length;
+        if (this.length < slen) { return false; }
+        if (slen == 0) { return true; }
+        return NativeMemory.SequenceEqual(this.ptr + (nint)(this.length - slen), (nint)suffix, slen);
+    }
+
+    public int IndexOf(byte b) {
+        return this.IndexOf(b, 0);
+    }
+
+    public int IndexOf(byte b, int startIndex) {
+        if (startIndex < 0 || startIndex >= this.length) { return -1; }
+        int rem = this.length - startIndex;
+        int hit = NativeMemory.Find(this.ptr, startIndex, (int)b, rem);
+        if (hit < 0) { return -1; }
+        return hit;
+    }
+
+    public int IndexOf(string s) {
+        if (s == null) { return -1; }
+        int slen = s.Length;
+        if (slen == 0) { return 0; }
+        if (slen > this.length) { return -1; }
+        int max = this.length - slen;
+        byte first = (byte)s[0];
+        int pos = 0;
+        while (pos <= max) {
+            int hit = NativeMemory.Find(this.ptr, pos, (int)first, this.length - pos);
+            if (hit < 0 || hit > max) { return -1; }
+            if (NativeMemory.SequenceEqual(this.ptr + (nint)hit, (nint)s, slen)) {
+                return hit;
+            }
+            pos = hit + 1;
+        }
+        return -1;
+    }
+
+    public StringView TrimStart() {
+        if (this.length <= 0) { return this; }
+        Span<byte> sp = new Span<byte>(this.ptr, this.length);
+        int i = 0;
+        while (i < this.length) {
+            byte ch = sp[i];
+            if (ch != 32 && ch != 9 && ch != 10 && ch != 13) { break; }
+            i = i + 1;
+        }
+        if (i == 0) { return this; }
+        return new StringView(this.ptr + (nint)i, this.length - i);
+    }
+
+    public StringView TrimEnd() {
+        if (this.length <= 0) { return this; }
+        Span<byte> sp = new Span<byte>(this.ptr, this.length);
+        int i = this.length - 1;
+        while (i >= 0) {
+            byte ch = sp[i];
+            if (ch != 32 && ch != 9 && ch != 10 && ch != 13) { break; }
+            i = i - 1;
+        }
+        int newLen = i + 1;
+        if (newLen == this.length) { return this; }
+        return new StringView(this.ptr, newLen);
+    }
+
+    public StringView Trim() {
+        return this.TrimStart().TrimEnd();
+    }
+
+    public int ToInt32() {
+        return this.ToInt32(0);
+    }
+
+    public int ToInt32(int dflt) {
+        if (this.length <= 0) { return dflt; }
+        Span<byte> sp = new Span<byte>(this.ptr, this.length);
+        int i = 0;
+        bool neg = false;
+        byte b0 = sp[0];
+        if (b0 == 45) { neg = true; i = 1; }
+        else if (b0 == 43) { i = 1; }
+        if (i >= this.length) { return dflt; }
+        long val = 0;
+        while (i < this.length) {
+            byte ch = sp[i];
+            if (ch < 48 || ch > 57) { return dflt; }
+            val = val * 10L + (long)(ch - 48);
+            if (val > 2147483647L) { return dflt; }
+            i = i + 1;
+        }
+        if (neg) { val = -val; }
+        return (int)val;
+    }
+
+    public long ToInt64() {
+        return this.ToInt64(0L);
+    }
+
+    public long ToInt64(long dflt) {
+        if (this.length <= 0) { return dflt; }
+        Span<byte> sp = new Span<byte>(this.ptr, this.length);
+        int i = 0;
+        bool neg = false;
+        byte b0 = sp[0];
+        if (b0 == 45) { neg = true; i = 1; }
+        else if (b0 == 43) { i = 1; }
+        if (i >= this.length) { return dflt; }
+        long val = 0;
+        while (i < this.length) {
+            byte ch = sp[i];
+            if (ch < 48 || ch > 57) { return dflt; }
+            val = val * 10L + (long)(ch - 48);
+            i = i + 1;
+        }
+        if (neg) { val = -val; }
+        return val;
+    }
+
+    public string ToString() {
+        if (this.length <= 0) { return ""; }
+        return NativeMemory.GetString(this.ptr, 0, this.length);
+    }
+}

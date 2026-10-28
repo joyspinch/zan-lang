@@ -141,12 +141,14 @@ public class JsonDoc {
     public static JsonDoc Parse(string src) {
         if (src == null) { throw new JsonException("JSON source cannot be null"); }
         int len = src.Length;
-        int slotCap = len / 4 + 32;
-        int pairCap = len / 8 + 16;
-        JsonScratch sc = JsonDoc.GetScratch();
-        sc.EnsureCapacity(len, slotCap, pairCap);
-        NativeMemory.PutString(sc.buf, 0, src, len);
-        return JsonDoc.ParseInternal(sc.buf, 0, len, src);
+        // buf 必须是本 doc 独占的缓冲：slots 里的键偏移指向它，
+        // doc 存活期间 Get() 都要在它上面比对。线程局部 scratch 池
+        // 会被任何一次后续 Parse 覆写，绝不能交给长命 doc（否则同线程
+        // 再解析一次就破坏老 doc 的键查找）。scratch 只复用 slots/pairs
+        // 暂存（ParseInternal 会拷出）与 ParseScoped 瞬时场景。
+        byte[] buf = new byte[len + 32];
+        NativeMemory.PutString(buf, 0, src, len);
+        return JsonDoc.ParseInternal(buf, 0, len, src);
     }
 
     // 原生字节零拷贝直通解析（适用于底层网络 Socket / 文件缓冲）
@@ -1111,6 +1113,10 @@ public class JsonDoc {
         }
         if (k == 1) { return 1; }
         if (k == 6) { return 0; }
+        if (k == 3) {
+            string s = this.StrOfSlot(at);
+            if (s != null && s.Length > 0) { return JsonValue.IntOf(s); }
+        }
         return dflt;
     }
 
@@ -1125,6 +1131,10 @@ public class JsonDoc {
         }
         if (k == 1) { return 1L; }
         if (k == 6) { return 0L; }
+        if (k == 3) {
+            string s = this.StrOfSlot(at);
+            if (s != null && s.Length > 0) { return JsonValue.LongOf(s); }
+        }
         return dflt;
     }
 
@@ -1139,6 +1149,10 @@ public class JsonDoc {
         }
         if (k == 1) { return 1.0; }
         if (k == 6) { return 0.0; }
+        if (k == 3) {
+            string s = this.StrOfSlot(at);
+            if (s != null && s.Length > 0) { return JsonValue.DoubleOf(s); }
+        }
         return dflt;
     }
 
@@ -1160,6 +1174,28 @@ public class JsonDoc {
         if (k == 1) { return "true"; }
         if (k == 6) { return "false"; }
         return dflt;
+    }
+
+    // 零分配视图提取：直接返回指定槽位指向底层缓冲区的 16 字节 StringView，免去 Substring 堆内存分配与垃圾回收。
+    public StringView ViewAt(int at) {
+        if (at < 0 || at >= this.slotCount) { return StringView.Empty(); }
+        long a = slots[at].a;
+        int k = (int)(a & 255);
+        if (k == 3) {
+            int start = (int)(a >> 8);
+            if (start >= 0) {
+                int len = (int)slots[at].b;
+                return new StringView((nint)this.buf + (nint)start, len);
+            }
+            string s = escPool[(int)slots[at].b];
+            return StringView.FromString(s);
+        }
+        if (k == 7) {
+            int ns = (int)(a >> 8);
+            int len = (int)slots[at].b;
+            return new StringView((nint)this.buf + (nint)ns, len);
+        }
+        return StringView.Empty();
     }
 
     // 零分配字符串比对：直接将底层缓冲中指定槽位的文本与目标字符串比对，不产生 Substring 堆分配。

@@ -4220,7 +4220,7 @@ int64_t zan_hw_json_parse_fast(const uint8_t *buf, int64_t len,
                 }
                 if (ned == 0) nok = 0;
             }
-            if (!nok) return -1 - ns;
+            if (!nok) return -1 - ni; /* 首个坏字符位置，与托管 ParseCore 语义一致 */
             if (slot_count >= slot_cap) return -3;
             vslot = slot_count++;
             if (is_int && ndig <= 18) {
