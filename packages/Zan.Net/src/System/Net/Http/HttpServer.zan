@@ -378,8 +378,10 @@ public class HttpServer : IDisposable {
             bool omitBody = (request != null && request.method == "HEAD") || statusBodyless;
 
             if (omitBody) {
-                string head = response.BuildHeaders();
-                int _h0 = await client.SendBytesAsync(head, head.Length);
+                StringBuilder hsb = HttpBufferPool.Rent();
+                response.WriteHeadersTo(hsb);
+                int _h0 = await client.SendViewAsync(hsb.AsView());
+                HttpBufferPool.Return(hsb);
             } else if (response.framingChunked) {
                 // 分块传输：先发头部（Transfer-Encoding: chunked，不带
                 // Content-Length），再逐块取正文写出。块边界必须在线路
@@ -389,8 +391,10 @@ public class HttpServer : IDisposable {
                 // 分支条件是 framingChunked 而不是"有正文来源"：空正文
                 // 也要走这条路径（发完头部写结束块），否则客户端会一直
                 // 等一个永远不来的结束块。
-                string head = response.BuildHeaders();
-                int _h3 = await client.SendBytesAsync(head, head.Length);
+                StringBuilder hsb = HttpBufferPool.Rent();
+                response.WriteHeadersTo(hsb);
+                int _h3 = await client.SendViewAsync(hsb.AsView());
+                HttpBufferPool.Return(hsb);
                 bool complete = true;
                 while (true) {
                     byte[] piece = null;
@@ -425,15 +429,19 @@ public class HttpServer : IDisposable {
                     keepAlive = false;
                 }
             } else if (response.IsBinary()) {
-                string head = response.BuildHeaders();
-                int _h2 = await client.SendBytesAsync(head, head.Length);
+                StringBuilder hsb = HttpBufferPool.Rent();
+                response.WriteHeadersTo(hsb);
+                int _h2 = await client.SendViewAsync(hsb.AsView());
+                HttpBufferPool.Return(hsb);
                 int blen = response.BodyLength();
                 if (blen > 0) {
                     int _b2 = await client.SendBytesAsync(response.bodyBytes, blen);
                 }
             } else {
-                string responseData = response.Build();
-                int _sent = await client.SendBytesAsync(responseData, responseData.Length);
+                StringBuilder rsb = HttpBufferPool.Rent();
+                response.WriteTo(rsb);
+                int _sent = await client.SendViewAsync(rsb.AsView());
+                HttpBufferPool.Return(rsb);
                 if (System.Net.Worker.IsDebug()) {
                     System.Net.Worker.Dbg("http sent bytes=" + Convert.ToString(_sent)
                         + " status=" + Convert.ToString(response.statusCode));
@@ -452,28 +460,36 @@ public class HttpServer : IDisposable {
             HttpResponse big = HttpResponse.WithStatus(431,
                 "Request Header Fields Too Large", "header block exceeds limit");
             big = big.SetKeepAlive(false);
-            string body = big.Build();
-            int _h = await client.SendBytesAsync(body, body.Length);
+            StringBuilder rsb = HttpBufferPool.Rent();
+            big.WriteTo(rsb);
+            int _h = await client.SendViewAsync(rsb.AsView());
+            HttpBufferPool.Return(rsb);
         } else if (reject == 413) {
             HttpResponse tooLarge = HttpResponse.WithStatus(413, "Payload Too Large",
                 "request exceeds limit");
             tooLarge = tooLarge.SetKeepAlive(false);
-            string body = tooLarge.Build();
-            int _s = await client.SendBytesAsync(body, body.Length);
+            StringBuilder rsb = HttpBufferPool.Rent();
+            tooLarge.WriteTo(rsb);
+            int _s = await client.SendViewAsync(rsb.AsView());
+            HttpBufferPool.Return(rsb);
         } else if (reject == 400) {
             // 定界冲突/畸形长度：请求走私拒绝。必须关闭连接——
             // 缓冲区里可能还有伪装成下一条请求的剩余正文。
             HttpResponse bad = HttpResponse.WithStatus(400, "Bad Request",
                 "malformed request framing");
             bad = bad.SetKeepAlive(false);
-            string body = bad.Build();
-            int _b = await client.SendBytesAsync(body, body.Length);
+            StringBuilder rsb = HttpBufferPool.Rent();
+            bad.WriteTo(rsb);
+            int _b = await client.SendViewAsync(rsb.AsView());
+            HttpBufferPool.Return(rsb);
         } else if (reject == 501) {
             HttpResponse nai = HttpResponse.WithStatus(501, "Not Implemented",
                 "Transfer-Encoding is not supported");
             nai = nai.SetKeepAlive(false);
-            string body = nai.Build();
-            int _n = await client.SendBytesAsync(body, body.Length);
+            StringBuilder rsb = HttpBufferPool.Rent();
+            nai.WriteTo(rsb);
+            int _n = await client.SendViewAsync(rsb.AsView());
+            HttpBufferPool.Return(rsb);
         }
 
         return 0;

@@ -52,6 +52,7 @@ static const zan_builtin_member_t members_sb[] = {
     { "AppendLine", 'M', "void AppendLine(object value)" },
     { "Clear",      'M', "void Clear()" },
     { "Length",     'P', "int Length" },
+    { "BufferPtr",  'M', "nint BufferPtr()" },
     { "ToString",   'M', "string ToString()" },
 };
 

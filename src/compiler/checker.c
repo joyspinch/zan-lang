@@ -126,6 +126,7 @@ static zan_type_t *builtin_call_result_type(zan_checker_t *c,
     if (strcmp(res, "double") == 0) return c->binder->type_double;
     if (strcmp(res, "bool") == 0) return c->binder->type_bool;
     if (strcmp(res, "char") == 0) return c->binder->type_char;
+    if (strcmp(res, "nint") == 0) return c->binder->type_nint;
     if (strcmp(res, "List<string>") == 0)
         return zan_binder_make_list_type(c->binder, c->binder->type_string);
     if (strcmp(res, "T[]") == 0) {

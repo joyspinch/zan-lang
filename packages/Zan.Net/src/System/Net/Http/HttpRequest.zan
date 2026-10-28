@@ -41,8 +41,20 @@ public class HttpRequest {
     // 未实现的 Transfer-Encoding 都是请求走私的入口。
     public int parseStatus;
 
+    // 零拷贝视图支持：原始报文及路径/查询切片偏移与长度
+    public string raw;
+    public int pathOffset;
+    public int pathLength;
+    public int queryOffset;
+    public int queryLength;
+
     // 默认构造：HTTP/1.1 keep-alive 的默认状态，由 Parse 使用。
     public HttpRequest() {
+        this.raw = "";
+        this.pathOffset = 0;
+        this.pathLength = 0;
+        this.queryOffset = 0;
+        this.queryLength = 0;
         this.method = "";
         this.path = "";
         this.version = "HTTP/1.1";
@@ -99,6 +111,7 @@ public class HttpRequest {
     // 处停下，据此切分正文会把二进制上传截断。
     public static HttpRequest Parse(string raw, int rawLen) {
         HttpRequest req = new HttpRequest();
+        req.raw = raw;
         int len = rawLen;
         if (len < 0) { len = 0; }
         if (len == 0) { return req; }
@@ -181,9 +194,17 @@ public class HttpRequest {
             qmark = qmark + 1;
         }
         if (foundQ) {
+            req.pathOffset = pathStart;
+            req.pathLength = qmark - pathStart;
+            req.queryOffset = qmark + 1;
+            req.queryLength = pathEnd - qmark - 1;
             req.path = raw.Substring(pathStart, qmark - pathStart);
             req.queryString = raw.Substring(qmark + 1, pathEnd - qmark - 1);
         } else {
+            req.pathOffset = pathStart;
+            req.pathLength = pathEnd - pathStart;
+            req.queryOffset = 0;
+            req.queryLength = 0;
             req.path = raw.Substring(pathStart, pathEnd - pathStart);
         }
 
@@ -491,7 +512,13 @@ public class HttpRequest {
 
     // 零分配视图辅助：直接返回路径的 StringView 视图。
     public StringView PathView() {
-        return StringView.FromString(this.path);
+        if (this.raw == null || this.pathLength <= 0) {
+            if (this.path != null && this.path.Length > 0) {
+                return this.path.AsView();
+            }
+            return StringView.Empty();
+        }
+        return this.raw.AsView(this.pathOffset, this.pathLength);
     }
 
     // 零分配视图辅助：直接返回 HTTP 方法的 StringView 视图。
@@ -501,7 +528,13 @@ public class HttpRequest {
 
     // 零分配视图辅助：直接返回查询字符串的 StringView 视图。
     public StringView QueryView() {
-        return StringView.FromString(this.queryString);
+        if (this.raw == null || this.queryLength <= 0) {
+            if (this.queryString != null && this.queryString.Length > 0) {
+                return this.queryString.AsView();
+            }
+            return StringView.Empty();
+        }
+        return this.raw.AsView(this.queryOffset, this.queryLength);
     }
 
     // 按名称获取某个头部值的 16 字节只读切片视图（StringView，完全零堆内存分配）。

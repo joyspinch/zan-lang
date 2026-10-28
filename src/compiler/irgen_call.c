@@ -1626,12 +1626,22 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                                         expr->call.args.count <= 1);
                 int sb_is_clear = (sbm.len == 5 && memcmp(sbm.str, "Clear", 5) == 0 &&
                                    expr->call.args.count == 0);
+                int sb_is_bufptr = (sbm.len == 9 && memcmp(sbm.str, "BufferPtr", 9) == 0 &&
+                                    expr->call.args.count == 0);
                 int sb_is_tostring = (sbm.len == 8 && memcmp(sbm.str, "ToString", 8) == 0 &&
                                       expr->call.args.count == 0);
                 int sb_recv_own = 0;
-                if (sb_is_append || sb_is_appendline || sb_is_tostring || sb_is_clear)
+                if (sb_is_append || sb_is_appendline || sb_is_tostring || sb_is_clear || sb_is_bufptr)
                     sb_recv_own = emit_intrinsic_own_recv(g,
                         sbcallee->member.object, raw, locals);
+                if (sb_is_bufptr) {
+                    LLVMValueRef dptr = LLVMBuildStructGEP2(g->builder, g->sb_struct_type, sbp, 2, "sbdp");
+                    LLVMValueRef data = LLVMBuildLoad2(g->builder, i8ptr, dptr, "sbdv");
+                    LLVMValueRef pval = LLVMBuildPtrToInt(g->builder, data, i64, "sbi64");
+                    emit_intrinsic_drop_recv(g, sbcallee->member.object, raw,
+                                             locals, sb_recv_own);
+                    return pval;
+                }
                 if (sb_is_clear) {
                     LLVMValueRef cptr = LLVMBuildStructGEP2(g->builder, g->sb_struct_type, sbp, 0, "sbcp");
                     LLVMBuildStore(g->builder, LLVMConstInt(i64, 0, 0), cptr);
@@ -1653,36 +1663,56 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                     if (expr->call.args.count == 1) {
                         zan_ast_node_t *arg0 = expr->call.args.items[0];
                         LLVMValueRef v = emit_expr(g, arg0, locals);
-                        int char_arg =
-                            LLVMGetTypeKind(LLVMTypeOf(v)) == LLVMIntegerTypeKind &&
-                            expr_is_char(g, arg0, locals);
-                        int int_arg = !char_arg &&
-                            LLVMGetTypeKind(LLVMTypeOf(v)) == LLVMIntegerTypeKind &&
-                            LLVMGetIntTypeWidth(LLVMTypeOf(v)) > 1;
-                        LLVMValueRef s, slen;
-                        if (int_arg) {
-                            s = emit_entry_scratch(g, 40, "sb.i2s");
-                            slen = emit_itoa_into(g, s,
-                                emit_widen_i64_for_print(g, v),
-                                expr_is_ulong(g, arg0, locals) ? 1 : 0);
-                        } else {
-                            s = char_arg ? emit_char_to_cstr(g, v)
-                                         : emit_value_as_cstr(g, v);
-                            int str_arg = !char_arg &&
-                                LLVMGetTypeKind(LLVMTypeOf(v)) == LLVMPointerTypeKind &&
-                                is_string_expr(g, arg0, locals);
-                            if (str_arg) {
-                                s = emit_str_nonnull(g, s);
-                                slen = emit_string_buffer_len(g, s, arg0->loc);
+                        zan_type_t *at = infer_expr_type(g, arg0, locals);
+                        int sv_arg = at && at->kind == TYPE_STRUCT &&
+                            at->name.len == 10 && memcmp(at->name.str, "StringView", 10) == 0;
+                        if (sv_arg) {
+                            LLVMValueRef sv_ptr_i64, sv_len_i32;
+                            if (LLVMGetTypeKind(LLVMTypeOf(v)) == LLVMPointerTypeKind) {
+                                LLVMTypeRef st_ty = map_type(g, at);
+                                LLVMValueRef p_ptr = LLVMBuildStructGEP2(g->builder, st_ty, v, 0, "svp.ptr");
+                                sv_ptr_i64 = LLVMBuildLoad2(g->builder, i64, p_ptr, "svp.ptrv");
+                                LLVMValueRef l_ptr = LLVMBuildStructGEP2(g->builder, st_ty, v, 1, "svp.len");
+                                sv_len_i32 = LLVMBuildLoad2(g->builder, LLVMInt32TypeInContext(g->ctx), l_ptr, "svp.lenv");
                             } else {
-                                slen = emit_cstr_len_of(g, s, arg0);
+                                sv_ptr_i64 = LLVMBuildExtractValue(g->builder, v, 0, "sv.ptr");
+                                sv_len_i32 = LLVMBuildExtractValue(g->builder, v, 1, "sv.len");
                             }
+                            LLVMValueRef s_bytes = LLVMBuildIntToPtr(g->builder, sv_ptr_i64, i8ptr, "sv.bptr");
+                            LLVMValueRef slen_i64 = LLVMBuildZExt(g->builder, sv_len_i32, i64, "sv.len64");
+                            emit_sb_append_bytes(g, sbp, s_bytes, slen_i64);
+                        } else {
+                            int char_arg =
+                                LLVMGetTypeKind(LLVMTypeOf(v)) == LLVMIntegerTypeKind &&
+                                expr_is_char(g, arg0, locals);
+                            int int_arg = !char_arg &&
+                                LLVMGetTypeKind(LLVMTypeOf(v)) == LLVMIntegerTypeKind &&
+                                LLVMGetIntTypeWidth(LLVMTypeOf(v)) > 1;
+                            LLVMValueRef s, slen;
+                            if (int_arg) {
+                                s = emit_entry_scratch(g, 40, "sb.i2s");
+                                slen = emit_itoa_into(g, s,
+                                    emit_widen_i64_for_print(g, v),
+                                    expr_is_ulong(g, arg0, locals) ? 1 : 0);
+                            } else {
+                                s = char_arg ? emit_char_to_cstr(g, v)
+                                             : emit_value_as_cstr(g, v);
+                                int str_arg = !char_arg &&
+                                    LLVMGetTypeKind(LLVMTypeOf(v)) == LLVMPointerTypeKind &&
+                                    is_string_expr(g, arg0, locals);
+                                if (str_arg) {
+                                    s = emit_str_nonnull(g, s);
+                                    slen = emit_string_buffer_len(g, s, arg0->loc);
+                                } else {
+                                    slen = emit_cstr_len_of(g, s, arg0);
+                                }
+                            }
+                            emit_sb_append_bytes(g, sbp, s, slen);
+                            if (char_arg)
+                                emit_string_release(g, s);
+                            else if (LLVMGetTypeKind(LLVMTypeOf(v)) == LLVMPointerTypeKind)
+                                emit_release_owned_call_temp(g, arg0, v, locals);
                         }
-                        emit_sb_append_bytes(g, sbp, s, slen);
-                        if (char_arg)
-                            emit_string_release(g, s);
-                        else if (LLVMGetTypeKind(LLVMTypeOf(v)) == LLVMPointerTypeKind)
-                            emit_release_owned_call_temp(g, arg0, v, locals);
                     }
                     if (sb_is_appendline) {
                         zan_istr_t nl = { "\n", 1 };
