@@ -1673,6 +1673,13 @@ static zan_type_t *irgen_promote_pair(zan_irgen_t *g, zan_type_t *a,
     if (a->kind == TYPE_FLOAT  || b->kind == TYPE_FLOAT)  return g->binder->type_float;
     if (a->kind == TYPE_ULONG  || b->kind == TYPE_ULONG)  return g->binder->type_ulong;
     if (a->kind == TYPE_LONG   || b->kind == TYPE_LONG)   return g->binder->type_long;
+    if (a->kind == TYPE_UINT   || b->kind == TYPE_UINT)   return g->binder->type_uint;
+    int fa = type_family(a);
+    int fb = type_family(b);
+    if ((fa == FAM_INT || fa == FAM_FLOAT || fa == FAM_DECIMAL) &&
+        (fb == FAM_INT || fb == FAM_FLOAT || fb == FAM_DECIMAL)) {
+        return g->binder ? g->binder->type_int : a;
+    }
     return a;
 }
 

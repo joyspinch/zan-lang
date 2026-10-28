@@ -19,15 +19,24 @@ public class MySqlWire {
     // 0xFB（NULL）返回 0 并把游标前进 1。
     // 直接在原始字节上累积十进制数值，完全消除临时字符串分配与 Convert.ToInt64 开销。
     public static long readLenencInt(string buf, List<int> cur) {
-        int b0 = buf[cur[0]] & 255;
-        if (b0 == 251) { cur[0] = cur[0] + 1; return 0; }
-        int len = (int)readLenenc(buf, cur);
-        if (len <= 0) { return 0; }
         int p = cur[0];
-        cur[0] = p + len;
+        long v = readLenencIntRaw(buf, ref p);
+        cur[0] = p;
+        return v;
+    }
+
+    // 从 wire 缓冲区中就地解析 length-encoded 整数（0 堆分配，使用栈标量引用偏移）；
+    // 0xFB（NULL）返回 0 并把游标前进 1。
+    public static long readLenencIntRaw(string buf, ref int p) {
+        int b0 = buf[p] & 255;
+        if (b0 == 251) { p = p + 1; return 0; }
+        int len = (int)readLenencRaw(buf, ref p);
+        if (len <= 0) { return 0; }
+        int start = p;
+        p = p + len;
         long acc = 0;
-        int i = p;
-        int end = p + len;
+        int i = start;
+        int end = start + len;
         bool neg = false;
         if ((buf[i] & 255) == 45) {  // '-'
             neg = true;
@@ -47,27 +56,57 @@ public class MySqlWire {
     // 首字节 0xFB（NULL 标记）返回 -1，游标仍前进 1。
     public static long readLenenc(string buf, List<int> cur) {
         int p = cur[0];
+        long v = readLenencRaw(buf, ref p);
+        cur[0] = p;
+        return v;
+    }
+
+    // 读取 MySQL length-encoded 整数（0 堆分配，使用栈标量引用偏移）；
+    // 首字节 0xFB（NULL 标记）返回 -1，游标仍前进 1。
+    public static long readLenencRaw(string buf, ref int p) {
         int b0 = buf[p] & 255;
-        if (b0 < 251) { cur[0] = p + 1; return b0; }
-        if (b0 == 252) { cur[0] = p + 3; return (buf[p+1]&255)|((buf[p+2]&255)<<8); }
-        if (b0 == 253) { cur[0] = p + 4; return (buf[p+1]&255)|((buf[p+2]&255)<<8)|((buf[p+3]&255)<<16); }
+        if (b0 < 251) { p = p + 1; return b0; }
+        if (b0 == 252) { int v = (buf[p+1]&255)|((buf[p+2]&255)<<8); p = p + 3; return v; }
+        if (b0 == 253) { int v = (buf[p+1]&255)|((buf[p+2]&255)<<8)|((buf[p+3]&255)<<16); p = p + 4; return v; }
         if (b0 == 254) {
             long v = 0; 
             for (int i = 0; i < 8; i = i + 1) { v = v | ((long)(buf[p+1+i]&255) << (8*i)); }
-            cur[0] = p + 9; return v;
+            p = p + 9; return v;
         }
-        cur[0] = p + 1; return -1;
+        p = p + 1; return -1;
     }
 
     // 读取 length-encoded 字符串：先读长度再取字节；
     // 0xFB（NULL）返回空串并把游标前进 1。
     public static string readLenencStr(string buf, List<int> cur) {
-        int b0 = buf[cur[0]] & 255;
-        if (b0 == 251) { cur[0] = cur[0] + 1; return ""; }
-        int len = (int)readLenenc(buf, cur);
         int p = cur[0];
-        cur[0] = p + len;
-        return bytesToStr(buf, p, len);
+        string s = readLenencStrRaw(buf, ref p);
+        cur[0] = p;
+        return s;
+    }
+
+    // 读取 length-encoded 字符串（0 额外参数分配）；
+    // 0xFB（NULL）返回空串并把游标前进 1。
+    public static string readLenencStrRaw(string buf, ref int p) {
+        int b0 = buf[p] & 255;
+        if (b0 == 251) { p = p + 1; return ""; }
+        int len = (int)readLenencRaw(buf, ref p);
+        if (len <= 0) { return ""; }
+        int start = p;
+        p = p + len;
+        return bytesToStr(buf, start, len);
+    }
+
+    // 核心零分配原语：直接返回指向 buf 的 16 字节 StringView 切片。
+    // 0 字节堆分配，0 次内存复制。
+    public static StringView readLenencView(string buf, ref int p) {
+        int b0 = buf[p] & 255;
+        if (b0 == 251) { p = p + 1; return StringView.Empty(); }
+        int len = (int)readLenencRaw(buf, ref p);
+        if (len <= 0) { return StringView.Empty(); }
+        int start = p;
+        p = p + len;
+        return buf.AsView(start, len);
     }
 
     // 在 <c>h[0..hlen)</c> 中自 <c>from</c> 起查找字节串

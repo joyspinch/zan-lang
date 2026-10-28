@@ -630,46 +630,44 @@ public class MySqlConnection : IDbConnection {
             }
             if (b0 == 0 || b0 == 254) {
                 // OK 包（无结果集）：偏移 1 处的 lenenc 整数即受影响行数。
-                List<int> cur = new List<int>(); cur.Add(1);
-                this.lastAffected = (int)MySqlWire.readLenenc(first, cur);
+                int p = 1;
+                this.lastAffected = (int)MySqlWire.readLenencRaw(first, ref p);
                 return result;
             }
             // 结果集：首个数据包为列数（lenenc）。
-            List<int> cc = new List<int>(); cc.Add(0);
-            int ncols = (int)MySqlWire.readLenenc(first, cc);
+            int pcc = 0;
+            int ncols = (int)MySqlWire.readLenencRaw(first, ref pcc);
             result.SetColumnCount(ncols);
             List<int> colTypes = new List<int>();
             List<int> colFlags = new List<int>();
             int c = 0;
             for (; c < ncols; c = c + 1) {
                 byte[] cd = await this.readPacket();
-                List<int> cur = new List<int>(); cur.Add(0);
-                MySqlWire.readLenencStr(cd, cur);  // catalog
-                MySqlWire.readLenencStr(cd, cur);  // schema
-                MySqlWire.readLenencStr(cd, cur);  // table
-                MySqlWire.readLenencStr(cd, cur);  // org_table
-                result.AddColumnName(MySqlWire.readLenencStr(cd, cur));  // name
-                MySqlWire.readLenencStr(cd, cur);  // org_name
-                MySqlWire.readLenenc(cd, cur);  // 定长字段标记（0x0c）
-                int p = cur[0];
+                int p = 0;
+                MySqlWire.readLenencStrRaw(cd, ref p);  // catalog
+                MySqlWire.readLenencStrRaw(cd, ref p);  // schema
+                MySqlWire.readLenencStrRaw(cd, ref p);  // table
+                MySqlWire.readLenencStrRaw(cd, ref p);  // org_table
+                result.AddColumnName(MySqlWire.readLenencStrRaw(cd, ref p));  // name
+                MySqlWire.readLenencStrRaw(cd, ref p);  // org_name
+                MySqlWire.readLenencRaw(cd, ref p);  // 定长字段标记（0x0c）
                 colTypes.Add(cd[p + 6] & 255);  // 字符集 2 + 长度 4
                 colFlags.Add((cd[p+7]&255) | ((cd[p+8]&255) << 8));
             }
             byte[] colEof = await this.readPacket();  // 结束列定义的 EOF
             int rowCount = 0;
-            List<int> cur = new List<int>(); cur.Add(0);
             while (true) {
                 byte[] row = await this.readPacket();
                 if (row == null) { break; }
                 if (this.isEof(row)) { break; }
-                cur[0] = 0;
+                int p = 0;
                 List<DbCell> cells = new List<DbCell>();
                 List<string> texts = new List<string>();
                 c = 0;
                 while (c < ncols) {
                     DbCell cell = new DbCell();
-                    if ((row[cur[0]] & 255) == 251) {  // NULL 标记
-                        cur[0] = cur[0] + 1;
+                    if ((row[p] & 255) == 251) {  // NULL 标记
+                        p = p + 1;
                         texts.Add("");
                     } else {
                         int ct = colTypes[c];
@@ -678,10 +676,10 @@ public class MySqlConnection : IDbConnection {
                         if ((ct == 1 || ct == 2 || ct == 3 || ct == 9 || ct == 13)
                                 || (ct == 8 && (colFlags[c] & 32) == 0)) {
                             cell.kind = 1;
-                            cell.ival = MySqlWire.readLenencInt(row, cur);
+                            cell.ival = MySqlWire.readLenencIntRaw(row, ref p);
                             texts.Add("");
                         } else {
-                            string v = MySqlWire.readLenencStr(row, cur);
+                            string v = MySqlWire.readLenencStrRaw(row, ref p);
                             cell.kind = 2;
                             texts.Add(v);
                         }
@@ -752,27 +750,33 @@ public class MySqlConnection : IDbConnection {
     // readBinValue 一样按 long 回绕解释）。
     private static long readBinLong(string buf, List<int> cur, int type, int flags) {
         int p = cur[0];
+        long v = readBinLongRaw(buf, ref p, type, flags);
+        cur[0] = p;
+        return v;
+    }
+
+    private static long readBinLongRaw(string buf, ref int p, int type, int flags) {
         bool uns = (flags & 32) != 0;
         if (type == 1) {
-            int v = buf[p] & 255; cur[0] = p + 1;
+            int v = buf[p] & 255; p = p + 1;
             if (!uns && v > 127) { v = v - 256; }
             return v;
         }
         if (type == 2 || type == 13) {
-            int v = (buf[p]&255) | ((buf[p+1]&255) << 8); cur[0] = p + 2;
+            int v = (buf[p]&255) | ((buf[p+1]&255) << 8); p = p + 2;
             if (!uns && v > 32767) { v = v - 65536; }
             return v;
         }
         if (type == 3 || type == 9) {
             long v = (long)(buf[p]&255) | ((long)(buf[p+1]&255)<<8)
                    | ((long)(buf[p+2]&255)<<16) | ((long)(buf[p+3]&255)<<24);
-            cur[0] = p + 4;
+            p = p + 4;
             if (!uns && v > 2147483647) { v = v - 4294967296; }
             return v;
         }
         long w = 0;
         for (int i = 0; i < 8; i = i + 1) { w = w | ((long)(buf[p+i]&255) << (8*i)); }
-        cur[0] = p + 8;
+        p = p + 8;
         return w;
     }
 
@@ -780,41 +784,47 @@ public class MySqlConnection : IDbConnection {
     // 读取后推进游标，返回其文本形式。
     public static string readBinValue(string buf, List<int> cur, int type, int flags) {
         int p = cur[0];
+        string s = readBinValueRaw(buf, ref p, type, flags);
+        cur[0] = p;
+        return s;
+    }
+
+    public static string readBinValueRaw(string buf, ref int p, int type, int flags) {
         bool uns = (flags & 32) != 0;
         if (type == 1) {
-            int v = buf[p] & 255; cur[0] = p + 1;
+            int v = buf[p] & 255; p = p + 1;
             if (!uns && v > 127) { v = v - 256; }
             return Convert.ToString(v);
         }
         if (type == 2 || type == 13) {
-            int v = (buf[p]&255) | ((buf[p+1]&255) << 8); cur[0] = p + 2;
+            int v = (buf[p]&255) | ((buf[p+1]&255) << 8); p = p + 2;
             if (!uns && v > 32767) { v = v - 65536; }
             return Convert.ToString(v);
         }
         if (type == 3 || type == 9) {
             long v = (long)(buf[p]&255) | ((long)(buf[p+1]&255)<<8)
                    | ((long)(buf[p+2]&255)<<16) | ((long)(buf[p+3]&255)<<24);
-            cur[0] = p + 4;
+            p = p + 4;
             if (!uns && v > 2147483647) { v = v - 4294967296; }
             return Convert.ToString(v);
         }
         if (type == 8) {
             long v = 0;
             for (int i = 0; i < 8; i = i + 1) { v = v | ((long)(buf[p+i]&255) << (8*i)); }
-            cur[0] = p + 8;
+            p = p + 8;
             return Convert.ToString(v);
         }
         if (type == 4) {  // FLOAT（IEEE binary32）
             long bits = (long)(buf[p]&255) | ((long)(buf[p+1]&255)<<8)
                       | ((long)(buf[p+2]&255)<<16) | ((long)(buf[p+3]&255)<<24);
-            cur[0] = p + 4;
+            p = p + 4;
             return MySqlWire.ieeeToText((int)((bits >> 31) & 1), (int)((bits >> 23) & 255),
                               bits & 8388607, 127, 23);
         }
         if (type == 5) {  // DOUBLE（IEEE binary64）
             long bits = 0; 
             for (int i = 0; i < 8; i = i + 1) { bits = bits | ((long)(buf[p+i]&255) << (8*i)); }
-            cur[0] = p + 8;
+            p = p + 8;
             return MySqlWire.ieeeToText((int)((bits >> 63) & 1), (int)((bits >> 52) & 2047),
                               bits & 4503599627370495, 1023, 52);
         }
@@ -826,7 +836,7 @@ public class MySqlConnection : IDbConnection {
                 mo = buf[p+2] & 255; d = buf[p+3] & 255;
             }
             if (len >= 7) { h = buf[p+4] & 255; mi = buf[p+5] & 255; s = buf[p+6] & 255; }
-            cur[0] = cur[0] + 1 + len;
+            p = p + len;
             string date = Convert.ToString(y) + "-" + MySqlWire.pad2(mo) + "-" + MySqlWire.pad2(d);
             if (type == 10) { return date; }
             return date + " " + MySqlWire.pad2(h) + ":" + MySqlWire.pad2(mi) + ":" + MySqlWire.pad2(s);
@@ -839,11 +849,11 @@ public class MySqlConnection : IDbConnection {
                 int days = (buf[p+1]&255) | ((buf[p+2]&255)<<8) | ((buf[p+3]&255)<<16) | ((buf[p+4]&255)<<24);
                 h = (buf[p+5] & 255) + days * 24; mi = buf[p+6] & 255; s = buf[p+7] & 255;
             }
-            cur[0] = cur[0] + 1 + len;
+            p = p + len;
             return sign + MySqlWire.pad2(h) + ":" + MySqlWire.pad2(mi) + ":" + MySqlWire.pad2(s);
         }
         // VAR_STRING、STRING、GEOMETRY：长度编码的字节串。
-        return MySqlWire.readLenencStr(buf, cur);
+        return MySqlWire.readLenencStrRaw(buf, ref p);
     }
 
     // 预编译 sql；成功后填写 out[0]=stmtId、out[1]=numCols、
@@ -1024,27 +1034,26 @@ public class MySqlConnection : IDbConnection {
                 this.fail();
             }
             if (b0 == 0 || b0 == 254) {
-                List<int> cur = new List<int>(); cur.Add(1);
-                this.lastAffected = (int)MySqlWire.readLenenc(first, cur);
+                int p = 1;
+                this.lastAffected = (int)MySqlWire.readLenencRaw(first, ref p);
                 return result;
             }
-            List<int> cc = new List<int>(); cc.Add(0);
-            int ncols = (int)MySqlWire.readLenenc(first, cc);
+            int pcc = 0;
+            int ncols = (int)MySqlWire.readLenencRaw(first, ref pcc);
             result.SetColumnCount(ncols);
             List<int> colTypes = new List<int>();
             List<int> colFlags = new List<int>();
             int c = 0;
             for (; c < ncols; c = c + 1) {
                 byte[] cd = await this.readPacket();
-                List<int> cur = new List<int>(); cur.Add(0);
-                MySqlWire.readLenencStr(cd, cur);  // catalog
-                MySqlWire.readLenencStr(cd, cur);  // schema
-                MySqlWire.readLenencStr(cd, cur);  // table
-                MySqlWire.readLenencStr(cd, cur);  // org_table
-                result.AddColumnName(MySqlWire.readLenencStr(cd, cur));  // name
-                MySqlWire.readLenencStr(cd, cur);  // org_name
-                MySqlWire.readLenenc(cd, cur);  // 定长字段标记（0x0c）
-                int p = cur[0];
+                int p = 0;
+                MySqlWire.readLenencStrRaw(cd, ref p);  // catalog
+                MySqlWire.readLenencStrRaw(cd, ref p);  // schema
+                MySqlWire.readLenencStrRaw(cd, ref p);  // table
+                MySqlWire.readLenencStrRaw(cd, ref p);  // org_table
+                result.AddColumnName(MySqlWire.readLenencStrRaw(cd, ref p));  // name
+                MySqlWire.readLenencStrRaw(cd, ref p);  // org_name
+                MySqlWire.readLenencRaw(cd, ref p);  // 定长字段标记（0x0c）
                 int ctype = cd[p + 6] & 255;  // 字符集 2 + 长度 4
                 int cflags = (cd[p+7]&255) | ((cd[p+8]&255) << 8);
                 colTypes.Add(ctype);
@@ -1052,14 +1061,13 @@ public class MySqlConnection : IDbConnection {
             }
             byte[] colEof = await this.readPacket();
             int rowCount = 0;
-            List<int> cur = new List<int>(); cur.Add(0);
             while (true) {
                 byte[] row = await this.readPacket();
                 if (row == null) { break; }
                 if (this.isEof(row)) { break; }
                 // 二进制行：0x00 头，接着是带 2 位偏移的 null bitmap。
                 int bmLen = (ncols + 9) / 8;
-                cur[0] = 1 + bmLen;
+                int p = 1 + bmLen;
                 List<DbCell> cells = new List<DbCell>();
                 List<string> texts = new List<string>();
                 c = 0;
@@ -1074,11 +1082,11 @@ public class MySqlConnection : IDbConnection {
                         if (ct == 1 || ct == 2 || ct == 3 || ct == 8
                                 || ct == 9 || ct == 13) {
                             cell.kind = 1;  // 整型直取
-                            cell.ival = readBinLong(row, cur, ct, colFlags[c]);
+                            cell.ival = readBinLongRaw(row, ref p, ct, colFlags[c]);
                             texts.Add("");
                         } else {
                             cell.kind = 2;
-                            texts.Add(readBinValue(row, cur, ct, colFlags[c]));
+                            texts.Add(readBinValueRaw(row, ref p, ct, colFlags[c]));
                         }
                     }
                     cells.Add(cell);
