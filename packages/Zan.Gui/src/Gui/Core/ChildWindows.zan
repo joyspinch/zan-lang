@@ -151,6 +151,9 @@ public class ChildWindows {
     // 任一组件选择器开着且要求重绘（轮询判据；FilePicker 文档约定：
     // 弹窗开着时主循环不得阻塞在 WaitEvent 上）。
     static bool AnyPickerWants() {
+        if (ChildWindows.picker != null && ChildWindows.picker.IsOpen() && ChildWindows.picker.NeedsRedraw()) {
+            return true;
+        }
         if (ChildWindows.pickers == null) { return false; }
         for (int i = 0; i < ChildWindows.pickers.Count; i = i + 1) {
             IModalWindow p = ChildWindows.pickers[i];
@@ -161,6 +164,9 @@ public class ChildWindows {
 
     // 任一组件选择器开着（主循环用它收紧阻塞等待）。
     static bool AnyPickerOpen() {
+        if (ChildWindows.picker != null && ChildWindows.picker.IsOpen()) {
+            return true;
+        }
         if (ChildWindows.pickers == null) { return false; }
         for (int i = 0; i < ChildWindows.pickers.Count; i = i + 1) {
             if (ChildWindows.pickers[i].IsOpen()) { return true; }
@@ -181,8 +187,14 @@ public class ChildWindows {
     // 组件选择器开着时把它的重绘需求折叠进主应用：轮询判据（开着时
     // 不得阻塞在 WaitEvent 上）+ 弹窗要出帧时唤醒主循环。
     static bool PumpPickers(App main) {
-        if (ChildWindows.pickers == null) { return false; }
         bool woken = false;
+        if (ChildWindows.picker != null && ChildWindows.picker.IsOpen()) {
+            if (ChildWindows.picker.NeedsRedraw()) {
+                main.RequestRedraw();
+                woken = true;
+            }
+        }
+        if (ChildWindows.pickers == null) { return woken; }
         for (int i = 0; i < ChildWindows.pickers.Count; i = i + 1) {
             IModalWindow p = ChildWindows.pickers[i];
             if (!p.IsOpen()) { continue; }
@@ -195,6 +207,9 @@ public class ChildWindows {
     }
 
     static void PrunePickers() {
+        if (ChildWindows.picker != null && !ChildWindows.picker.IsOpen()) {
+            ChildWindows.picker = null;
+        }
         if (ChildWindows.pickers == null) { return; }
         List<IModalWindow> keep = new List<IModalWindow>();
         for (int i = 0; i < ChildWindows.pickers.Count; i = i + 1) {
@@ -347,6 +362,13 @@ public class ChildWindows {
         // Form.Run 会阻塞在 WaitEvent 上，弹窗永远出不了帧。
         if (ChildWindows.AnyPickerOpen()) {
             main.RequestRedraw();
+        }
+        // 任一子窗口开着时保持主循环心跳（16ms 帧节拍），避免主事件循环在 WaitEvent
+        // 处因等待主窗口事件而无限期挂起（陷入5秒心跳才唤醒）；只要有子窗口存活，
+        // 主循环小睡至多 16ms 便唤醒泵送子窗口，保证首帧排版与组件即时上屏；
+        // 所有子窗口关闭后自动回退到 WaitEvent 零 CPU 休眠。
+        if (ChildWindows.AnyOpen()) {
+            main.RequestWakeFrameAt(now + 16);
         }
     }
 

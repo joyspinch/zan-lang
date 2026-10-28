@@ -105,6 +105,7 @@ static zan_mwin_t *mwin_find(long hwnd) {
 static long g_evq[ZAN_EVQ_CAP][7];
 static int g_evq_head = 0;
 static int g_evq_tail = 0;
+static i64 g_ev_seq_mac = 1;
 
 static void evq_push(long kind, long x, long y, long button, long keycode, long mods) {
     int next = (g_evq_tail + 1) % ZAN_EVQ_CAP;
@@ -123,6 +124,7 @@ static int evq_pop(void) {
     if (g_evq_head == g_evq_tail) return 0;
     memcpy(g_evt, g_evq[g_evq_head], sizeof(g_evt));
     g_evq_head = (g_evq_head + 1) % ZAN_EVQ_CAP;
+    g_ev_seq_mac++;
     return 1;
 }
 
@@ -899,7 +901,6 @@ EXPORT i32 zan_gui_center_window(iptr hwnd_val) {
 }
 
 EXPORT i32 zan_gui_event_kind(void)    { return g_evt[0]; }
-static i64 g_ev_seq_mac = 1;
 EXPORT i64 zan_gui_event_seq(void)     { return g_ev_seq_mac; }
 EXPORT i32 zan_gui_event_x(void)       { return g_evt[1]; }
 EXPORT i32 zan_gui_event_y(void)       { return g_evt[2]; }
@@ -1230,6 +1231,7 @@ EXPORT i32 zan_gui_present(iptr hwnd_val, i32 surface_id) {
                 layer.contentsScale = zan_window_scale([view window]);
                 layer.contents = (__bridge id)surf;
                 [CATransaction commit];
+                [CATransaction flush];
             }
         } @catch (NSException *ex) {
             fprintf(stderr, "[Zan GUI Error] present failed: %s: %s\n",
@@ -1850,6 +1852,11 @@ EXPORT void zan_gui_webview_set_visible(i32 h, i32 visible) {
     WKWebView *wv = wv_get(h);
     if (!wv) return;
     [wv setHidden:(visible ? NO : YES)];
+    if (!visible && h >= 1 && h <= ZAN_MAX_WEBVIEWS) {
+        zan_webview_t *slot = &g_webviews[(int)h - 1];
+        free(slot->clipSpec);
+        slot->clipSpec = NULL;
+    }
 }
 
 /* Visible region of a web view, as "x,y,w,h;x,y,w,h;..." in the same
@@ -1901,7 +1908,8 @@ EXPORT void zan_gui_webview_set_clip(i32 h, const char *spec) {
             CGFloat ly = (CGFloat)ry / scale - frame.origin.y;
             CGFloat rwPoints = (CGFloat)rw / scale;
             CGFloat rhPoints = (CGFloat)rh / scale;
-            CGFloat layerY = fh - ly - rhPoints;
+            BOOL flipped = [wv isFlipped] || [wv.layer isGeometryFlipped];
+            CGFloat layerY = flipped ? ly : (fh - ly - rhPoints);
             CGPathAddRect(path, NULL,
                           CGRectMake(lx, layerY, rwPoints, rhPoints));
             rects++;
@@ -1921,6 +1929,9 @@ EXPORT void zan_gui_webview_set_clip(i32 h, const char *spec) {
         } else {
             CAShapeLayer *mask = [CAShapeLayer layer];
             mask.frame = wv.layer.bounds;
+            if ([wv isFlipped] || [wv.layer isGeometryFlipped]) {
+                mask.geometryFlipped = YES;
+            }
             mask.path = path;
             wv.layer.mask = mask;
         }
