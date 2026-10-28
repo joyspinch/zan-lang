@@ -95,14 +95,20 @@ public class HttpFramer {
         int n = 0;
         if (this.recv != null) {
             n = await this.recv(this.buf, this.bufCap);
-        } else {
-            n = await Socket.RecvIntoAsync(this.sock, this.buf, this.bufCap);
+            if (n <= 0) {
+                this.closed = true;
+                return 0;
+            }
+            this.pend.WriteRaw(this.buf, n);
+            return n;
         }
+        this.pend.EnsureRoom(this.bufCap);
+        n = await Socket.RecvPtrAsync(this.sock, this.pend.data + (nint)this.pend.length, this.bufCap);
         if (n <= 0) {
             this.closed = true;
             return 0;
         }
-        this.pend.WriteRaw(this.buf, n);
+        this.pend.SetLength(this.pend.length + n);
         return n;
     }
 
@@ -113,12 +119,19 @@ public class HttpFramer {
         if (room <= 0) { return -1; }
         int want = this.bufCap;
         if (want > room) { want = room; }
-        int n = this.recv != null
-            ? await this.recv(this.buf, want)
-            : await Socket.RecvIntoAsync(this.sock, this.buf, want);
+        int n = 0;
+        if (this.recv != null) {
+            n = await this.recv(this.buf, want);
+            if (n <= 0) { this.closed = true; return 0; }
+            if (n > room) { return -1; }
+            this.pend.WriteRaw(this.buf, n);
+            return n;
+        }
+        this.pend.EnsureRoom(want);
+        n = await Socket.RecvPtrAsync(this.sock, this.pend.data + (nint)this.pend.length, want);
         if (n <= 0) { this.closed = true; return 0; }
         if (n > room) { return -1; }
-        this.pend.WriteRaw(this.buf, n);
+        this.pend.SetLength(this.pend.length + n);
         return n;
     }
 
@@ -159,17 +172,33 @@ public class HttpFramer {
         int n = 0;
         if (this.recv != null) {
             n = await this.recv(this.buf, want);
-        } else {
-            n = await Socket.RecvIntoAsync(this.sock, this.buf, want);
+            if (n <= 0) {
+                this.closed = true;
+                return 0;
+            }
+            if (n > room) { return -431; }
+            this.pend.WriteRaw(this.buf, n);
+            if (this.pend.Length() > maxHeaderBytes) { return -431; }
+            return n;
         }
+        this.pend.EnsureRoom(want);
+        n = await Socket.RecvPtrAsync(this.sock, this.pend.data + (nint)this.pend.length, want);
         if (n <= 0) {
             this.closed = true;
             return 0;
         }
         if (n > room) { return -431; }
-        this.pend.WriteRaw(this.buf, n);
+        this.pend.SetLength(this.pend.length + n);
         if (this.pend.Length() > maxHeaderBytes) { return -431; }
         return n;
+    }
+
+    // 头部块（前 headerLen 个字节）的零分配 StringView 视图。
+    public StringView HeadView(int headerLen) {
+        if (headerLen <= 0 || this.pend == null) { return StringView.Empty(); }
+        int n = headerLen;
+        if (n > this.pend.length) { n = this.pend.length; }
+        return new StringView(this.pend.data, n);
     }
 
     // 一直接收，直到完整的头部块到齐。

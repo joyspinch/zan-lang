@@ -10846,8 +10846,12 @@ static LLVMValueRef emit_expr_await_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                 if (LLVMTypeOf(fd) != di64)
                     fd = LLVMBuildIntCast2(g->builder, fd, di64, 1, "fd64");
                 LLVMValueRef buf = emit_expr(g, expr->await_expr.expr->call.args.items[1], locals);
-                if (LLVMTypeOf(buf) != di8ptr)
-                    buf = LLVMBuildBitCast(g->builder, buf, di8ptr, "recvbuf");
+                if (LLVMTypeOf(buf) != di8ptr) {
+                    if (LLVMGetTypeKind(LLVMTypeOf(buf)) == LLVMIntegerTypeKind)
+                        buf = LLVMBuildIntToPtr(g->builder, buf, di8ptr, "recvbuf");
+                    else
+                        buf = LLVMBuildBitCast(g->builder, buf, di8ptr, "recvbuf");
+                }
                 LLVMValueRef len = emit_expr(g, expr->await_expr.expr->call.args.items[2], locals);
                 if (LLVMTypeOf(len) != di32)
                     len = LLVMBuildIntCast2(g->builder, len, di32, 1, "len32");
@@ -10886,8 +10890,12 @@ static LLVMValueRef emit_expr_await_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                 if (LLVMTypeOf(fd) != di64)
                     fd = LLVMBuildIntCast2(g->builder, fd, di64, 1, "fd64");
                 LLVMValueRef buf = emit_expr(g, expr->await_expr.expr->call.args.items[1], locals);
-                if (LLVMTypeOf(buf) != di8ptr)
-                    buf = LLVMBuildBitCast(g->builder, buf, di8ptr, "recvbuf");
+                if (LLVMTypeOf(buf) != di8ptr) {
+                    if (LLVMGetTypeKind(LLVMTypeOf(buf)) == LLVMIntegerTypeKind)
+                        buf = LLVMBuildIntToPtr(g->builder, buf, di8ptr, "recvbuf");
+                    else
+                        buf = LLVMBuildBitCast(g->builder, buf, di8ptr, "recvbuf");
+                }
                 LLVMValueRef len = emit_expr(g, expr->await_expr.expr->call.args.items[2], locals);
                 if (LLVMTypeOf(len) != di32)
                     len = LLVMBuildIntCast2(g->builder, len, di32, 1, "len32");
