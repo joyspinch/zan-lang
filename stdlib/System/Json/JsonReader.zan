@@ -69,12 +69,19 @@ public class JsonReader {
         return s[pos] & 255;
     }
 
-    // 跳过空白（空格/制表/换行/回车）。实测 JSON 文档里空白
-    // 游程通常 0-2 字节，跨 libc 的 strspn 调用开销（PLT + 参数
-    // 布置 ~40ns）比逐字节循环更贵。字节循环处理常见短游程，
-    // 长游程也只是多转几圈，分支预测器对"还是空白"方向的命中
-    // 率极高，实测无惩罚。
+    // 跳过空白（空格/制表/换行/回车）。
+    // 针对 JSON 中大部分非空白字符首字节快速直接跳出；
+    // 遇到空白游程时直接进入 AVX2/SSE2 硬件向量化单指令周期跳跃。
     public void SkipWs() {
+        if (pos >= len) { return; }
+        int c0 = s[pos] & 255;
+        if (c0 != 32 && c0 != 9 && c0 != 10 && c0 != 13) {
+            return;
+        }
+        if (this.ptr != (nint)0) {
+            pos = (int)NativeMemory.JsonSkipWhitespace(this.ptr, (long)pos, (long)len);
+            return;
+        }
         while (pos < len) {
             int c = s[pos] & 255;
             if (c == 32 || c == 9 || c == 10 || c == 13) {
@@ -190,20 +197,33 @@ public class JsonReader {
         }
         pos = pos + 1;  // 消费起始引号
         int start = pos;
-        while (pos < len) {
-            // strcspn 找下一个引号或反斜杠：向量化，替代逐字节循环。
-            // 返回相对扫描起点（pos）的偏移；-1 表示窗口内干净到尾。
-            int run = (int)NativeMemory.FindNotAnyOf(this.ptr, pos, "\"\\",
-                len - pos);
-            if (run < 0) { pos = len; break; }
-            pos = pos + run;
-            int c = s[pos] & 255;
-            if (c == 34) {
-                string plain = s.Substring(start, pos - start);
-                pos = pos + 1;
+        if (this.ptr != (nint)0) {
+            long scan = NativeMemory.JsonScanString(this.ptr, (long)pos, (long)len);
+            if (scan >= 0L && scan < (long)len) {
+                string plain = s.Substring(start, (int)scan - start);
+                pos = (int)scan + 1;
                 return plain;
+            } else if (scan < 0L) {
+                pos = (int)(-scan - 1L);
+            } else {
+                pos = len;
             }
-            break;  // '\\' -> 转义路径
+        } else {
+            while (pos < len) {
+                // strcspn 找下一个引号或反斜杠：向量化，替代逐字节循环。
+                // 返回相对扫描起点（pos）的偏移；-1 表示窗口内干净到尾。
+                int run = (int)NativeMemory.FindNotAnyOf(this.ptr, pos, "\"\\",
+                    len - pos);
+                if (run < 0) { pos = len; break; }
+                pos = pos + run;
+                int c = s[pos] & 255;
+                if (c == 34) {
+                    string plain = s.Substring(start, pos - start);
+                    pos = pos + 1;
+                    return plain;
+                }
+                break;  // '\\' -> 转义路径
+            }
         }
         StringBuilder sb = new StringBuilder();
         if (pos > start) { sb.Append(s.Substring(start, pos - start)); }
@@ -274,9 +294,19 @@ public class JsonReader {
                     pos = pos + 1;
                     continue;
                 }
-                int run2 = (int)NativeMemory.FindNotAnyOf(this.ptr, pos, "\"\\",
-                    len - pos);
-                int stop2 = run2 < 0 ? len : pos + run2;
+                int stop2 = len;
+                if (this.ptr != (nint)0) {
+                    long scan2 = NativeMemory.JsonScanString(this.ptr, (long)pos, (long)len);
+                    if (scan2 >= 0L && scan2 < (long)len) {
+                        stop2 = (int)scan2;
+                    } else if (scan2 < 0L) {
+                        stop2 = (int)(-scan2 - 1L);
+                    }
+                } else {
+                    int run2 = (int)NativeMemory.FindNotAnyOf(this.ptr, pos, "\"\\",
+                        len - pos);
+                    stop2 = run2 < 0 ? len : pos + run2;
+                }
                 sb.Append(s.Substring(pos, stop2 - pos));
                 pos = stop2;
             }
