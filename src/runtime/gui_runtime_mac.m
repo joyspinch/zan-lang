@@ -1698,6 +1698,14 @@ static void wv_spin(volatile BOOL *done, double timeout) {
  * The dictionary retains each store for the process lifetime and keys the
  * cache so a repeated profileId reuses its store. */
 static NSMutableDictionary<NSString *, WKWebsiteDataStore *> *g_wv_profiles = nil;
+static WKProcessPool *g_wv_process_pool = nil;
+
+static WKProcessPool *wv_shared_process_pool(void) {
+    if (!g_wv_process_pool) {
+        g_wv_process_pool = [[WKProcessPool alloc] init];
+    }
+    return g_wv_process_pool;
+}
 
 /* Derive a stable, well-formed (v4-shaped) UUID from an arbitrary profile id so
  * a human-readable id maps to a persistent per-identifier data store. */
@@ -1751,6 +1759,7 @@ EXPORT i32 zan_gui_webview_create(iptr hwnd_val, const char *profile_id) {
     @autoreleasepool {
         @try {
             WKWebViewConfiguration *cfg = [[WKWebViewConfiguration alloc] init];
+            cfg.processPool = wv_shared_process_pool();
             /* Enable the context-menu "Inspect Element" so embedded pages can be
              * debugged from within the app (the Windows peer opens DevTools
              * programmatically via ICoreWebView2::OpenDevToolsWindow; WebKit has
@@ -1871,11 +1880,13 @@ EXPORT void zan_gui_webview_set_clip(i32 h, const char *spec) {
     ZAN_MAC_ENSURE_MAIN_THREAD_VOID(zan_gui_webview_set_clip(h, spec));
     WKWebView *wv = wv_get(h);
     if (!wv) return;
+    zan_webview_t *slot = &g_webviews[(int)h - 1];
     if (!spec || !*spec) {
         [wv setHidden:YES];
+        free(slot->clipSpec);
+        slot->clipSpec = NULL;
         return;
     }
-    zan_webview_t *slot = &g_webviews[(int)h - 1];
     /* Called every frame; rebuilding the mask each time would thrash the
      * compositor, so only act when the region actually changed. */
     if (slot->clipSpec && strcmp(slot->clipSpec, spec) == 0) {
