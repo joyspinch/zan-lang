@@ -156,7 +156,15 @@ typedef struct zan_timer {
 #define ZAN_MAX_WORKERS 32
 #define ZAN_LOCAL_QUEUE_CAP 256
 
-typedef struct zan_worker {
+#if defined(_MSC_VER)
+#define ZAN_CACHELINE_ALIGN __declspec(align(64))
+#elif defined(__GNUC__) || defined(__clang__)
+#define ZAN_CACHELINE_ALIGN __attribute__((aligned(64)))
+#else
+#define ZAN_CACHELINE_ALIGN _Alignas(64)
+#endif
+
+typedef struct ZAN_CACHELINE_ALIGN zan_worker {
     int          id;
     int          active;
     volatile int sleeping;
@@ -172,6 +180,7 @@ typedef struct zan_worker {
     pthread_cond_t  wake_cond;
     pthread_mutex_t wake_mutex;
 #endif
+    char         pad[64];
 } zan_worker_t;
 
 static zan_worker_t        g_workers[ZAN_MAX_WORKERS];
@@ -388,8 +397,11 @@ static void ready_push(zan_co_t *co) {
             else               w->local_head = co;
             w->local_tail = co;
             w->local_count++;
+            int count = w->local_count;
             zan_mutex_unlock(&w->lock);
-            wake_one_worker();
+            if (count > 1) {
+                wake_one_worker();
+            }
             return;
         }
         zan_mutex_unlock(&w->lock);
