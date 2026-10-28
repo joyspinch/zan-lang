@@ -1983,7 +1983,7 @@ static int get_simd_array_element_size(zan_irgen_t *g, zan_ast_node_t *arg, loca
 }
 
 /* 判断目标平台是否为 x86/x86-64 架构（SSE/AVX 向量内建指令门控） */
-static bool emit_target_is_x86(const zan_irgen_t *g)
+bool emit_target_is_x86(const zan_irgen_t *g)
 {
     if (g->target_triple[0] == '\0') {
 #if defined(__aarch64__) || defined(_M_ARM64) || defined(__arm__)
@@ -2007,7 +2007,7 @@ static bool emit_target_has_avx2(const zan_irgen_t *g)
  * 全程在 <lanes/8 x i64> 泳道向量上做 SWAR，不产生任何 i1 向量——
  * <32 x i1> 这类非法宽度会在通用 CPU（无 AVX2）的合法化阶段触发
  * "Do not know how to split this operator's operand"（A439）。 */
-static LLVMValueRef emit_pmovmskb_portable(zan_irgen_t *g, LLVMValueRef v,
+LLVMValueRef emit_pmovmskb_portable(zan_irgen_t *g, LLVMValueRef v,
                                            unsigned lanes)
 {
     LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
@@ -2111,7 +2111,7 @@ static LLVMValueRef emit_pavg_portable(zan_irgen_t *g, LLVMValueRef a,
  * 会触发 "Do not know how to split this operator's operand"。
  * 每泳道：x = a^b（等值字节为 0）；经典 haszero 掩码标出等值字节
  * （0x80 per byte）；(t >> 7) * 0xFF 展开成字节掩码。 */
-static LLVMValueRef emit_byte_eq_mask_i64(zan_irgen_t *g, LLVMValueRef a,
+LLVMValueRef emit_byte_eq_mask_i64(zan_irgen_t *g, LLVMValueRef a,
                                           LLVMValueRef b, unsigned lanes)
 {
     LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);

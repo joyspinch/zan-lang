@@ -691,6 +691,10 @@ int interp_format_to_printf(const zan_istr_t *spec, bool is_float,
                             bool is_ulong, bool *want_float,
                             char *out, size_t outcap);
 
+bool emit_target_is_x86(const zan_irgen_t *g);
+LLVMValueRef emit_pmovmskb_portable(zan_irgen_t *g, LLVMValueRef v, unsigned lanes);
+LLVMValueRef emit_byte_eq_mask_i64(zan_irgen_t *g, LLVMValueRef a, LLVMValueRef b, unsigned lanes);
+
 static inline void zan_set_module_local(LLVMValueRef fn) {
     if (fn) LLVMSetLinkage(fn, LLVMInternalLinkage);
 }

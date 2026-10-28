@@ -639,6 +639,40 @@ static LLVMValueRef get_dict_hash_fn(zan_irgen_t *g) {
     return fn;
 }
 
+/* SwissTable Group matching: returns i32 mask where bit k is 1 if byte k == h2 */
+static LLVMValueRef emit_swisstable_match_mask(zan_irgen_t *g, LLVMValueRef ctrl_vec, LLVMValueRef h2_byte) {
+    LLVMContextRef c = g->ctx;
+    LLVMBuilderRef b = g->builder;
+    LLVMTypeRef i8 = LLVMInt8TypeInContext(c);
+    LLVMTypeRef i32 = LLVMInt32TypeInContext(c);
+    LLVMTypeRef v16i8 = LLVMVectorType(i8, 16);
+
+    LLVMValueRef ins = LLVMBuildInsertElement(b, LLVMGetUndef(v16i8), h2_byte, LLVMConstInt(i32, 0, 0), "h2.0");
+    LLVMValueRef mask_elems[16];
+    for (int i = 0; i < 16; i++) mask_elems[i] = LLVMConstInt(i32, 0, 0);
+    LLVMValueRef mask = LLVMConstVector(mask_elems, 16);
+    LLVMValueRef h2_vec = LLVMBuildShuffleVector(b, ins, LLVMGetUndef(v16i8), mask, "h2.vec");
+
+    LLVMValueRef eq_vec = emit_byte_eq_mask_i64(g, ctrl_vec, h2_vec, 16);
+    return emit_pmovmskb_portable(g, eq_vec, 16);
+}
+
+/* SwissTable empty mask: in SwissTable, EMPTY is 0x80 (bit 7 == 1), while occupied buckets
+ * have h2 = hash & 0x7F (bit 7 == 0). So pmovmskb directly returns mask of empty slots! */
+static LLVMValueRef emit_swisstable_empty_mask(zan_irgen_t *g, LLVMValueRef ctrl_vec) {
+    return emit_pmovmskb_portable(g, ctrl_vec, 16);
+}
+
+static LLVMValueRef emit_cttz32(zan_irgen_t *g, LLVMValueRef val32) {
+    LLVMTypeRef i32 = LLVMInt32TypeInContext(g->ctx);
+    LLVMTypeRef i1 = LLVMInt1TypeInContext(g->ctx);
+    LLVMTypeRef fty = LLVMFunctionType(i32, (LLVMTypeRef[]){ i32, i1 }, 2, 0);
+    LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "llvm.cttz.i32");
+    if (!fn) fn = LLVMAddFunction(g->mod, "llvm.cttz.i32", fty);
+    LLVMValueRef args[] = { val32, LLVMConstInt(i1, 1, 0) };
+    return zan_call2(g->builder, fty, fn, args, 2, "cttz");
+}
+
 static LLVMValueRef get_dict_find_fn(zan_irgen_t *g) {
     LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "__zan_dict_find");
     if (fn) return fn;
@@ -647,8 +681,10 @@ static LLVMValueRef get_dict_find_fn(zan_irgen_t *g) {
     LLVMTypeRef i8 = LLVMInt8TypeInContext(c);
     LLVMTypeRef i8ptr = LLVMPointerType(i8, 0);
     LLVMTypeRef i8pp = LLVMPointerType(i8ptr, 0);
+    LLVMTypeRef i32 = LLVMInt32TypeInContext(c);
     LLVMTypeRef i64 = LLVMInt64TypeInContext(c);
     LLVMTypeRef i64ptr = LLVMPointerType(i64, 0);
+    LLVMTypeRef v16i8 = LLVMVectorType(i8, 16);
     LLVMTypeRef dty = g->dict_struct_type;
     LLVMTypeRef fnty = LLVMFunctionType(i64, (LLVMTypeRef[]){ i8ptr, i8ptr, i64 }, 3, 0);
     fn = LLVMAddFunction(g->mod, "__zan_dict_find", fnty);
@@ -657,38 +693,51 @@ static LLVMValueRef get_dict_find_fn(zan_irgen_t *g) {
     LLVMTypeRef hash_ty = LLVMGlobalGetValueType(hashf);
     LLVMValueRef keq = get_dict_key_eq_fn(g);
     LLVMTypeRef keq_ty = LLVMGlobalGetValueType(keq);
-    LLVMTypeRef calloc_ty = LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i64, i64 }, 2, 0);
-    LLVMValueRef calloc_fn = get_calloc_fn(g);
+    LLVMTypeRef malloc_ty = LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i64 }, 1, 0);
+    LLVMValueRef malloc_fn = get_libc_fn(g, "malloc", malloc_ty);
+    LLVMTypeRef memset_ty = LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i8ptr, i32, i64 }, 3, 0);
+    LLVMValueRef memset_fn = get_libc_fn(g, "memset", memset_ty);
+    LLVMTypeRef ixfree_ty = LLVMFunctionType(LLVMVoidTypeInContext(c), (LLVMTypeRef[]){ i8ptr }, 1, 0);
+    LLVMValueRef ixfree_fn = get_libc_fn(g, "free", ixfree_ty);
+
     LLVMBasicBlockRef saved = LLVMGetInsertBlock(b);
     LLVMBasicBlockRef entry  = LLVMAppendBasicBlockInContext(c, fn, "entry");
     LLVMBasicBlockRef miss   = LLVMAppendBasicBlockInContext(c, fn, "miss");
     LLVMBasicBlockRef chk    = LLVMAppendBasicBlockInContext(c, fn, "chk");
+    LLVMBasicBlockRef live   = LLVMAppendBasicBlockInContext(c, fn, "live");
+    LLVMBasicBlockRef needc  = LLVMAppendBasicBlockInContext(c, fn, "rb.need");
     LLVMBasicBlockRef capc   = LLVMAppendBasicBlockInContext(c, fn, "rb.capc");
     LLVMBasicBlockRef capb   = LLVMAppendBasicBlockInContext(c, fn, "rb.capb");
     LLVMBasicBlockRef alloc  = LLVMAppendBasicBlockInContext(c, fn, "rb.alloc");
+    LLVMBasicBlockRef append_bb = LLVMAppendBasicBlockInContext(c, fn, "rb.append");
     LLVMBasicBlockRef fcond  = LLVMAppendBasicBlockInContext(c, fn, "rb.cond");
     LLVMBasicBlockRef fbody  = LLVMAppendBasicBlockInContext(c, fn, "rb.body");
-    LLVMBasicBlockRef fpcond = LLVMAppendBasicBlockInContext(c, fn, "rb.pcond");
-    LLVMBasicBlockRef fput   = LLVMAppendBasicBlockInContext(c, fn, "rb.put");
-    LLVMBasicBlockRef fdup   = LLVMAppendBasicBlockInContext(c, fn, "rb.dup");
-    LLVMBasicBlockRef fpnext = LLVMAppendBasicBlockInContext(c, fn, "rb.pnext");
+    LLVMBasicBlockRef fp_loop = LLVMAppendBasicBlockInContext(c, fn, "rb.ploop");
+    LLVMBasicBlockRef fp_dup  = LLVMAppendBasicBlockInContext(c, fn, "rb.pdup");
+    LLVMBasicBlockRef fp_empty = LLVMAppendBasicBlockInContext(c, fn, "rb.pempty");
+    LLVMBasicBlockRef fp_put  = LLVMAppendBasicBlockInContext(c, fn, "rb.put");
+    LLVMBasicBlockRef fp_step = LLVMAppendBasicBlockInContext(c, fn, "rb.step");
     LLVMBasicBlockRef fnext  = LLVMAppendBasicBlockInContext(c, fn, "rb.next");
+
     LLVMBasicBlockRef probe  = LLVMAppendBasicBlockInContext(c, fn, "probe");
-    LLVMBasicBlockRef pcond  = LLVMAppendBasicBlockInContext(c, fn, "p.cond");
-    LLVMBasicBlockRef pchk   = LLVMAppendBasicBlockInContext(c, fn, "p.chk");
-    LLVMBasicBlockRef phit   = LLVMAppendBasicBlockInContext(c, fn, "p.hit");
-    LLVMBasicBlockRef pnext  = LLVMAppendBasicBlockInContext(c, fn, "p.next");
+    LLVMBasicBlockRef p_loop = LLVMAppendBasicBlockInContext(c, fn, "p.loop");
+    LLVMBasicBlockRef p_mchk = LLVMAppendBasicBlockInContext(c, fn, "p.mchk");
+    LLVMBasicBlockRef p_hit  = LLVMAppendBasicBlockInContext(c, fn, "p.hit");
+    LLVMBasicBlockRef p_echk = LLVMAppendBasicBlockInContext(c, fn, "p.echk");
+    LLVMBasicBlockRef p_step = LLVMAppendBasicBlockInContext(c, fn, "p.step");
 
     LLVMPositionBuilderAtEnd(b, entry);
     LLVMValueRef draw = LLVMGetParam(fn, 0);
     LLVMValueRef key = LLVMGetParam(fn, 1);
     LLVMValueRef is_str = LLVMGetParam(fn, 2);
+
     LLVMValueRef i_a = LLVMBuildAlloca(b, i64, "i");
-    LLVMValueRef h_a = LLVMBuildAlloca(b, i64, "h");
-    LLVMValueRef tag_a = LLVMBuildAlloca(b, i64, "tag");
     LLVMValueRef cap_a = LLVMBuildAlloca(b, i64, "ncap");
-    LLVMValueRef ix_a = LLVMBuildAlloca(b, i64ptr, "ixcur");
-    LLVMValueRef mask_a = LLVMBuildAlloca(b, i64, "mask");
+    LLVMValueRef gidx_a = LLVMBuildAlloca(b, i64, "gidx");
+    LLVMValueRef step_a = LLVMBuildAlloca(b, i64, "step");
+    LLVMValueRef mmask_a = LLVMBuildAlloca(b, i32, "mmask");
+    LLVMValueRef fh2_a = LLVMBuildAlloca(b, i8, "fh2");
+
     LLVMValueRef dnull = zan_icmp(b, LLVMIntEQ, draw, LLVMConstNull(i8ptr), "dnull");
     LLVMBuildCondBr(b, dnull, miss, chk);
     LLVMPositionBuilderAtEnd(b, miss);
@@ -703,38 +752,40 @@ static LLVMValueRef get_dict_find_fn(zan_irgen_t *g) {
     LLVMValueRef icapp = LLVMBuildStructGEP2(b, dty, dp, 5, "icapp");
     LLVMValueRef icntp = LLVMBuildStructGEP2(b, dty, dp, 6, "icntp");
     LLVMValueRef empty = zan_icmp(b, LLVMIntSLE, cnt, LLVMConstInt(i64, 0, 0), "empty");
-    LLVMValueRef ix = LLVMBuildLoad2(b, i64ptr, ixp, "ix");
+    LLVMValueRef ix = LLVMBuildLoad2(b, i8ptr, ixp, "ix");
     LLVMValueRef icap = LLVMBuildLoad2(b, i64, icapp, "icap");
     LLVMValueRef icnt = LLVMBuildLoad2(b, i64, icntp, "icnt");
-    LLVMValueRef noidx = zan_icmp(b, LLVMIntEQ, ix, LLVMConstNull(i64ptr), "noidx");
+    LLVMValueRef noidx = zan_icmp(b, LLVMIntEQ, ix, LLVMConstNull(i8ptr), "noidx");
     LLVMValueRef nocap = zan_icmp(b, LLVMIntSLE, icap, LLVMConstInt(i64, 0, 0), "nocap");
     LLVMValueRef stale = zan_icmp(b, LLVMIntNE, icnt, cnt, "stale");
     LLVMValueRef need = zan_or(b, zan_or(b, noidx, nocap, "o1"), stale, "need");
-    LLVMBasicBlockRef live = LLVMAppendBasicBlockInContext(c, fn, "live");
-    LLVMBasicBlockRef needc = LLVMAppendBasicBlockInContext(c, fn, "rb.need");
-    LLVMBasicBlockRef grow = LLVMAppendBasicBlockInContext(c, fn, "rb.grow");
     LLVMBuildCondBr(b, empty, miss, live);
+
     LLVMPositionBuilderAtEnd(b, live);
-    LLVMValueRef fits = zan_icmp(b, LLVMIntSGE, icap,
-        zan_mul(b, cnt, LLVMConstInt(i64, 4, 0), "want4"), "fits");
+    /* SwissTable 87.5% load factor check: cnt * 8 <= icap * 7 */
+    LLVMValueRef cnt8 = zan_mul(b, cnt, LLVMConstInt(i64, 8, 0), "cnt8");
+    LLVMValueRef cap7 = zan_mul(b, icap, LLVMConstInt(i64, 7, 0), "cap7");
+    LLVMValueRef fits = zan_icmp(b, LLVMIntSLE, cnt8, cap7, "fits");
     LLVMValueRef grew = zan_icmp(b, LLVMIntSLT, icnt, cnt, "grew");
     LLVMValueRef kept = zan_icmp(b, LLVMIntSGT, icnt, LLVMConstInt(i64, 0, 0), "kept");
     LLVMValueRef append = zan_and(b, zan_and(b, zan_and(b,
         LLVMBuildNot(b, noidx, "haveidx"), fits, "a1"), grew, "a2"), kept, "append");
     LLVMBuildCondBr(b, need, needc, probe);
-    LLVMPositionBuilderAtEnd(b, needc);
-    LLVMBuildCondBr(b, append, grow, capc);
 
-    LLVMPositionBuilderAtEnd(b, grow);
-    LLVMBuildStore(b, ix, ix_a);
-    LLVMBuildStore(b, zan_sub(b, icap, LLVMConstInt(i64, 1, 0), "gmask"), mask_a);
+    LLVMPositionBuilderAtEnd(b, needc);
+    LLVMBuildCondBr(b, append, append_bb, capc);
+
+    LLVMPositionBuilderAtEnd(b, append_bb);
     LLVMBuildStore(b, cnt, icntp);
     LLVMBuildStore(b, icnt, i_a);
     LLVMBuildBr(b, fcond);
 
     LLVMPositionBuilderAtEnd(b, capc);
     LLVMBuildStore(b, LLVMConstInt(i64, 16, 0), cap_a);
-    LLVMValueRef want = zan_mul(b, cnt, LLVMConstInt(i64, 4, 0), "want");
+    /* want = (cnt * 8 + 6) / 7 */
+    LLVMValueRef want = zan_sdiv(b,
+        zan_add(b, cnt8, LLVMConstInt(i64, 6, 0), "c8p6"),
+        LLVMConstInt(i64, 7, 0), "want");
     LLVMBasicBlockRef caploop = LLVMAppendBasicBlockInContext(c, fn, "rb.caploop");
     LLVMBuildBr(b, caploop);
     LLVMPositionBuilderAtEnd(b, caploop);
@@ -746,107 +797,194 @@ static LLVMValueRef get_dict_find_fn(zan_irgen_t *g) {
     LLVMBuildBr(b, caploop);
 
     LLVMPositionBuilderAtEnd(b, alloc);
-    LLVMTypeRef ixfree_ty = LLVMFunctionType(LLVMVoidTypeInContext(c),
-        (LLVMTypeRef[]){ i8ptr }, 1, 0);
-    LLVMValueRef ixfree = get_libc_fn(g, "free", ixfree_ty);
-    LLVMValueRef oldix8 = LLVMBuildBitCast(b, ix, i8ptr, "oldix8");
-    zan_call2(b, ixfree_ty, ixfree, &oldix8, 1, "");
+    zan_call2(b, ixfree_ty, ixfree_fn, &ix, 1, "");
     LLVMValueRef ncap = LLVMBuildLoad2(b, i64, cap_a, "ncap.v");
-    LLVMValueRef nix8 = zan_call2(b, calloc_ty, calloc_fn,
-        (LLVMValueRef[]){ ncap, LLVMConstInt(i64, 8, 0) }, 2, "nix8");
-    LLVMValueRef nix = LLVMBuildBitCast(b, nix8, i64ptr, "nix");
+    /* total_bytes = (ncap + 16) + (ncap * 8) = ncap * 9 + 16 */
+    LLVMValueRef total_bytes = zan_add(b,
+        zan_mul(b, ncap, LLVMConstInt(i64, 9, 0), "ncap9"),
+        LLVMConstInt(i64, 16, 0), "tot_sz");
+    LLVMValueRef nix = zan_call2(b, malloc_ty, malloc_fn, &total_bytes, 1, "nix");
+    LLVMValueRef nix_null = zan_icmp(b, LLVMIntEQ, nix, LLVMConstNull(i8ptr), "nix_null");
+    /* Initialize control bytes: memset(nix, 0x80, ncap + 16) */
+    LLVMValueRef ctrl_sz = zan_add(b, ncap, LLVMConstInt(i64, 16, 0), "ctrl_sz");
+    zan_call2(b, memset_ty, memset_fn,
+        (LLVMValueRef[]){ nix, LLVMConstInt(i32, 0x80, 0), ctrl_sz }, 3, "");
     LLVMBuildStore(b, nix, ixp);
     LLVMBuildStore(b, ncap, icapp);
     LLVMBuildStore(b, cnt, icntp);
-    LLVMBuildStore(b, nix, ix_a);
-    LLVMBuildStore(b, zan_sub(b, ncap, LLVMConstInt(i64, 1, 0), "rmask"), mask_a);
-    LLVMValueRef nixnull = zan_icmp(b, LLVMIntEQ, nix8, LLVMConstNull(i8ptr), "nixnull");
     LLVMBuildStore(b, LLVMConstInt(i64, 0, 0), i_a);
-    LLVMBuildCondBr(b, nixnull, miss, fcond);
+    LLVMBuildCondBr(b, nix_null, miss, fcond);
+
+    /* ---- Rebuild / Populate Table Loop ---- */
     LLVMPositionBuilderAtEnd(b, fcond);
     LLVMValueRef fi = LLVMBuildLoad2(b, i64, i_a, "fi");
     LLVMBuildCondBr(b, zan_icmp(b, LLVMIntSLT, fi, cnt, "fmore"), fbody, probe);
+
     LLVMPositionBuilderAtEnd(b, fbody);
-    LLVMValueRef fmask = LLVMBuildLoad2(b, i64, mask_a, "fmask");
+    LLVMValueRef cur_cap = LLVMBuildLoad2(b, i64, icapp, "cur_cap");
+    LLVMValueRef fmask = zan_sub(b, cur_cap, LLVMConstInt(i64, 1, 0), "fmask");
+    LLVMValueRef cur_ix = LLVMBuildLoad2(b, i8ptr, ixp, "cur_ix");
+    LLVMValueRef slots_off = zan_add(b, cur_cap, LLVMConstInt(i64, 16, 0), "slots_off");
+    LLVMValueRef slots_base = LLVMBuildBitCast(b, LLVMBuildGEP2(b, i8, cur_ix, &slots_off, 1, "sbase8"), i64ptr, "sbase");
     LLVMValueRef rks = LLVMBuildLoad2(b, i8pp, kp, "rks");
-    LLVMValueRef fi2 = LLVMBuildLoad2(b, i64, i_a, "fi2");
-    LLVMValueRef fkey = LLVMBuildLoad2(b, i8ptr, LLVMBuildGEP2(b, i8ptr, rks, &fi2, 1, "fksl"), "fkey");
+    LLVMValueRef fkey = LLVMBuildLoad2(b, i8ptr, LLVMBuildGEP2(b, i8ptr, rks, &fi, 1, "fkeyp"), "fkey");
     LLVMValueRef fh = zan_call2(b, hash_ty, hashf, (LLVMValueRef[]){ fkey, is_str }, 2, "fh");
-    LLVMValueRef fhtag = zan_or(b, zan_and(b, fh, LLVMConstInt(i64, 0xFFFFFFFF00000000ULL, 0), "fh_hi"),
-                                LLVMConstInt(i64, 0x8000000000000000ULL, 0), "fhtag");
-    LLVMBuildStore(b, fhtag, tag_a);
-    LLVMBuildStore(b, zan_and(b, fh, fmask, "fh.m"), h_a);
-    LLVMBuildBr(b, fpcond);
-    LLVMPositionBuilderAtEnd(b, fpcond);
-    LLVMValueRef fix = LLVMBuildLoad2(b, i64ptr, ix_a, "fix");
-    LLVMValueRef fh2 = LLVMBuildLoad2(b, i64, h_a, "fh2");
-    LLVMValueRef fslotp = LLVMBuildGEP2(b, i64, fix, &fh2, 1, "fslotp");
-    LLVMValueRef fslot = LLVMBuildLoad2(b, i64, fslotp, "fslot");
-    LLVMBuildCondBr(b, zan_icmp(b, LLVMIntEQ, fslot, LLVMConstInt(i64, 0, 0), "ffree"),
-                    fput, fdup);
-    LLVMPositionBuilderAtEnd(b, fput);
-    LLVMValueRef curtag = LLVMBuildLoad2(b, i64, tag_a, "curtag");
-    LLVMValueRef fi3 = LLVMBuildLoad2(b, i64, i_a, "fi3");
-    LLVMValueRef fval = zan_or(b, curtag, zan_add(b, fi3, LLVMConstInt(i64, 1, 0), "fi3p1"), "fval");
-    LLVMBuildStore(b, fval, LLVMBuildGEP2(b, i64, fix, &fh2, 1, "fslotp2"));
+    LLVMValueRef fh1 = zan_lshr(b, fh, LLVMConstInt(i64, 7, 0), "fh1");
+    LLVMValueRef fh2 = LLVMBuildTrunc(b, zan_and(b, fh, LLVMConstInt(i64, 0x7F, 0), "fh2.and"), i8, "fh2");
+    LLVMBuildStore(b, fh2, fh2_a);
+    LLVMBuildStore(b, zan_and(b, fh1, fmask, "fgidx0"), gidx_a);
+    LLVMBuildStore(b, LLVMConstInt(i64, 0, 0), step_a);
+    LLVMBuildBr(b, fp_loop);
+
+    LLVMPositionBuilderAtEnd(b, fp_loop);
+    LLVMValueRef cur_gidx = LLVMBuildLoad2(b, i64, gidx_a, "cur_gidx");
+    LLVMValueRef cptr = LLVMBuildGEP2(b, i8, cur_ix, &cur_gidx, 1, "cptr");
+    LLVMValueRef cvec_p = LLVMBuildBitCast(b, cptr, LLVMPointerType(v16i8, 0), "cvec_p");
+    LLVMValueRef cvec = LLVMBuildLoad2(b, v16i8, cvec_p, "cvec");
+    LLVMSetAlignment(cvec, 1);
+    LLVMValueRef cur_fh2 = LLVMBuildLoad2(b, i8, fh2_a, "cur_fh2");
+    LLVMValueRef feq_mask = emit_swisstable_match_mask(g, cvec, cur_fh2);
+    LLVMBuildStore(b, feq_mask, mmask_a);
+    LLVMValueRef has_dup = zan_icmp(b, LLVMIntNE, feq_mask, LLVMConstInt(i32, 0, 0), "has_dup");
+    LLVMBuildCondBr(b, has_dup, fp_dup, fp_empty);
+
+    LLVMPositionBuilderAtEnd(b, fp_dup);
+    LLVMValueRef cur_mmask = LLVMBuildLoad2(b, i32, mmask_a, "cur_mmask");
+    LLVMValueRef bit = emit_cttz32(g, cur_mmask);
+    LLVMValueRef bit64 = LLVMBuildZExt(b, bit, i64, "bit64");
+    LLVMValueRef dslot = zan_and(b, zan_add(b, cur_gidx, bit64, "dslot0"), fmask, "dslot");
+    LLVMValueRef dentry = LLVMBuildLoad2(b, i64, LLVMBuildGEP2(b, i64, slots_base, &dslot, 1, "dentryp"), "dentry");
+    LLVMValueRef valid_idx = zan_icmp(b, LLVMIntSLT, dentry, cnt, "valid_idx");
+    LLVMBasicBlockRef fp_keq = LLVMAppendBasicBlockInContext(c, fn, "rb.pkeq");
+    LLVMBasicBlockRef fp_dnext = LLVMAppendBasicBlockInContext(c, fn, "rb.pdnext");
+    LLVMBuildCondBr(b, valid_idx, fp_keq, fp_dnext);
+
+    LLVMPositionBuilderAtEnd(b, fp_keq);
+    LLVMValueRef dkey = LLVMBuildLoad2(b, i8ptr, LLVMBuildGEP2(b, i8ptr, rks, &dentry, 1, "dkeyp"), "dkey");
+    LLVMValueRef is_same = zan_call2(b, keq_ty, keq, (LLVMValueRef[]){ dkey, fkey, is_str }, 3, "is_same");
+    LLVMBasicBlockRef fp_dup_hit = LLVMAppendBasicBlockInContext(c, fn, "rb.duphit");
+    LLVMBuildCondBr(b, is_same, fp_dup_hit, fp_dnext);
+
+    LLVMPositionBuilderAtEnd(b, fp_dup_hit);
+    LLVMBuildStore(b, fi, LLVMBuildGEP2(b, i64, slots_base, &dslot, 1, "upd_slot"));
     LLVMBuildBr(b, fnext);
-    LLVMPositionBuilderAtEnd(b, fdup);
-    LLVMValueRef curtag2 = LLVMBuildLoad2(b, i64, tag_a, "curtag2");
-    LLVMValueRef fslot_tag = zan_and(b, fslot, LLVMConstInt(i64, 0xFFFFFFFF00000000ULL, 0), "fslot_tag");
-    LLVMValueRef ftag_eq = zan_icmp(b, LLVMIntEQ, fslot_tag, curtag2, "ftag_eq");
-    LLVMBasicBlockRef fchk = LLVMAppendBasicBlockInContext(c, fn, "rb.chk");
-    LLVMBuildCondBr(b, ftag_eq, fchk, fpnext);
-    LLVMPositionBuilderAtEnd(b, fchk);
-    LLVMValueRef dks = LLVMBuildLoad2(b, i8pp, kp, "dks");
-    LLVMValueRef fslot_idx = zan_and(b, fslot, LLVMConstInt(i64, 0x00000000FFFFFFFFULL, 0), "fslot_idx");
-    LLVMValueRef fold = zan_sub(b, fslot_idx, LLVMConstInt(i64, 1, 0), "fold");
-    LLVMValueRef foldk = LLVMBuildLoad2(b, i8ptr, LLVMBuildGEP2(b, i8ptr, dks, &fold, 1, "foldkp"), "foldk");
-    LLVMValueRef fsame = zan_call2(b, keq_ty, keq, (LLVMValueRef[]){ foldk, fkey, is_str }, 3, "fsame");
-    LLVMBuildCondBr(b, fsame, fnext, fpnext);
-    LLVMPositionBuilderAtEnd(b, fpnext);
-    LLVMValueRef wmask = LLVMBuildLoad2(b, i64, mask_a, "wmask");
-    LLVMBuildStore(b, zan_and(b,
-        zan_add(b, fh2, LLVMConstInt(i64, 1, 0), "fh.inc"), wmask, "fh.wrap"), h_a);
-    LLVMBuildBr(b, fpcond);
+
+    LLVMPositionBuilderAtEnd(b, fp_dnext);
+    /* clear bit: mmask = mmask & (mmask - 1) */
+    LLVMValueRef msub1 = zan_sub(b, cur_mmask, LLVMConstInt(i32, 1, 0), "msub1");
+    LLVMValueRef mnext = zan_and(b, cur_mmask, msub1, "mnext");
+    LLVMBuildStore(b, mnext, mmask_a);
+    LLVMValueRef mmore = zan_icmp(b, LLVMIntNE, mnext, LLVMConstInt(i32, 0, 0), "mmore");
+    LLVMBuildCondBr(b, mmore, fp_dup, fp_empty);
+
+    LLVMPositionBuilderAtEnd(b, fp_empty);
+    LLVMValueRef emask = emit_swisstable_empty_mask(g, cvec);
+    LLVMValueRef has_empty = zan_icmp(b, LLVMIntNE, emask, LLVMConstInt(i32, 0, 0), "has_empty");
+    LLVMBuildCondBr(b, has_empty, fp_put, fp_step);
+
+    LLVMPositionBuilderAtEnd(b, fp_put);
+    LLVMValueRef ebit = emit_cttz32(g, emask);
+    LLVMValueRef ebit64 = LLVMBuildZExt(b, ebit, i64, "ebit64");
+    LLVMValueRef eslot = zan_and(b, zan_add(b, cur_gidx, ebit64, "eslot0"), fmask, "eslot");
+    /* Update ctrl[eslot] = fh2 */
+    LLVMBuildStore(b, cur_fh2, LLVMBuildGEP2(b, i8, cur_ix, &eslot, 1, "eslotp"));
+    /* If eslot < 16, clone sentinel: ctrl[cur_cap + eslot] = fh2 */
+    LLVMValueRef eslot_lt16 = zan_icmp(b, LLVMIntSLT, eslot, LLVMConstInt(i64, 16, 0), "eslot_lt16");
+    LLVMBasicBlockRef fp_clone = LLVMAppendBasicBlockInContext(c, fn, "rb.pclone");
+    LLVMBasicBlockRef fp_store_entry = LLVMAppendBasicBlockInContext(c, fn, "rb.pstore");
+    LLVMBuildCondBr(b, eslot_lt16, fp_clone, fp_store_entry);
+
+    LLVMPositionBuilderAtEnd(b, fp_clone);
+    LLVMValueRef clone_idx = zan_add(b, cur_cap, eslot, "clone_idx");
+    LLVMBuildStore(b, cur_fh2, LLVMBuildGEP2(b, i8, cur_ix, &clone_idx, 1, "clonep"));
+    LLVMBuildBr(b, fp_store_entry);
+
+    LLVMPositionBuilderAtEnd(b, fp_store_entry);
+    LLVMBuildStore(b, fi, LLVMBuildGEP2(b, i64, slots_base, &eslot, 1, "eslot_val"));
+    LLVMBuildBr(b, fnext);
+
+    LLVMPositionBuilderAtEnd(b, fp_step);
+    LLVMValueRef cur_step = LLVMBuildLoad2(b, i64, step_a, "cur_step");
+    LLVMValueRef next_step = zan_add(b, cur_step, LLVMConstInt(i64, 16, 0), "next_step");
+    LLVMBuildStore(b, next_step, step_a);
+    LLVMBuildStore(b, zan_and(b, zan_add(b, cur_gidx, next_step, "gidx_next"), fmask, "gidx_wrap"), gidx_a);
+    LLVMBuildBr(b, fp_loop);
+
     LLVMPositionBuilderAtEnd(b, fnext);
-    LLVMValueRef fi4 = LLVMBuildLoad2(b, i64, i_a, "fi4");
-    LLVMBuildStore(b, zan_add(b, fi4, LLVMConstInt(i64, 1, 0), "fi.inc"), i_a);
+    LLVMValueRef fi_next = zan_add(b, fi, LLVMConstInt(i64, 1, 0), "fi_next");
+    LLVMBuildStore(b, fi_next, i_a);
     LLVMBuildBr(b, fcond);
 
+    /* ---- Hot Path Lookup Probe ---- */
     LLVMPositionBuilderAtEnd(b, probe);
-    LLVMValueRef pix = LLVMBuildLoad2(b, i64ptr, ixp, "pix");
+    LLVMValueRef pix = LLVMBuildLoad2(b, i8ptr, ixp, "pix");
     LLVMValueRef pcap = LLVMBuildLoad2(b, i64, icapp, "pcap");
     LLVMValueRef pks = LLVMBuildLoad2(b, i8pp, kp, "pks");
     LLVMValueRef pmask = zan_sub(b, pcap, LLVMConstInt(i64, 1, 0), "pmask");
+    LLVMValueRef p_slots_off = zan_add(b, pcap, LLVMConstInt(i64, 16, 0), "p_slots_off");
+    LLVMValueRef p_slots_base = LLVMBuildBitCast(b,
+        LLVMBuildGEP2(b, i8, pix, &p_slots_off, 1, "p_sbase8"), i64ptr, "p_sbase");
     LLVMValueRef ph = zan_call2(b, hash_ty, hashf, (LLVMValueRef[]){ key, is_str }, 2, "ph");
-    LLVMValueRef phtag = zan_or(b, zan_and(b, ph, LLVMConstInt(i64, 0xFFFFFFFF00000000ULL, 0), "ph_hi"),
-                                LLVMConstInt(i64, 0x8000000000000000ULL, 0), "phtag");
-    LLVMBuildStore(b, phtag, tag_a);
-    LLVMBuildStore(b, zan_and(b, ph, pmask, "ph.m"), h_a);
-    LLVMBuildBr(b, pcond);
-    LLVMPositionBuilderAtEnd(b, pcond);
-    LLVMValueRef ph2 = LLVMBuildLoad2(b, i64, h_a, "ph2");
-    LLVMValueRef pslot = LLVMBuildLoad2(b, i64, LLVMBuildGEP2(b, i64, pix, &ph2, 1, "pslotp"), "pslot");
-    LLVMBuildCondBr(b, zan_icmp(b, LLVMIntEQ, pslot, LLVMConstInt(i64, 0, 0), "pfree"),
-                    miss, pchk);
-    LLVMPositionBuilderAtEnd(b, pchk);
-    LLVMValueRef curptag = LLVMBuildLoad2(b, i64, tag_a, "curptag");
-    LLVMValueRef pslot_tag = zan_and(b, pslot, LLVMConstInt(i64, 0xFFFFFFFF00000000ULL, 0), "pslot_tag");
-    LLVMValueRef ptag_match = zan_icmp(b, LLVMIntEQ, pslot_tag, curptag, "ptag_match");
-    LLVMBasicBlockRef pcmp = LLVMAppendBasicBlockInContext(c, fn, "p.cmp");
-    LLVMBuildCondBr(b, ptag_match, pcmp, pnext);
-    LLVMPositionBuilderAtEnd(b, pcmp);
-    LLVMValueRef pidx_raw = zan_and(b, pslot, LLVMConstInt(i64, 0x00000000FFFFFFFFULL, 0), "pidx_raw");
-    LLVMValueRef pidx = zan_sub(b, pidx_raw, LLVMConstInt(i64, 1, 0), "pidx");
-    LLVMValueRef pk = LLVMBuildLoad2(b, i8ptr, LLVMBuildGEP2(b, i8ptr, pks, &pidx, 1, "pkp"), "pk");
-    LLVMBuildCondBr(b, zan_call2(b, keq_ty, keq, (LLVMValueRef[]){ pk, key, is_str }, 3, "peq"),
-                    phit, pnext);
-    LLVMPositionBuilderAtEnd(b, phit);
-    LLVMBuildRet(b, pidx);
-    LLVMPositionBuilderAtEnd(b, pnext);
-    LLVMBuildStore(b, zan_and(b,
-        zan_add(b, ph2, LLVMConstInt(i64, 1, 0), "ph.inc"), pmask, "ph.wrap"), h_a);
-    LLVMBuildBr(b, pcond);
+    LLVMValueRef ph1 = zan_lshr(b, ph, LLVMConstInt(i64, 7, 0), "ph1");
+    LLVMValueRef ph2 = LLVMBuildTrunc(b, zan_and(b, ph, LLVMConstInt(i64, 0x7F, 0), "ph2.and"), i8, "ph2");
+    LLVMBuildStore(b, ph2, fh2_a);
+    LLVMBuildStore(b, zan_and(b, ph1, pmask, "pgidx0"), gidx_a);
+    LLVMBuildStore(b, LLVMConstInt(i64, 0, 0), step_a);
+    LLVMBuildBr(b, p_loop);
+
+    LLVMPositionBuilderAtEnd(b, p_loop);
+    LLVMValueRef p_gidx = LLVMBuildLoad2(b, i64, gidx_a, "p_gidx");
+    LLVMValueRef p_cptr = LLVMBuildGEP2(b, i8, pix, &p_gidx, 1, "p_cptr");
+    LLVMValueRef p_cvec_p = LLVMBuildBitCast(b, p_cptr, LLVMPointerType(v16i8, 0), "p_cvec_p");
+    LLVMValueRef p_cvec = LLVMBuildLoad2(b, v16i8, p_cvec_p, "p_cvec");
+    LLVMSetAlignment(p_cvec, 1);
+    LLVMValueRef p_h2 = LLVMBuildLoad2(b, i8, fh2_a, "p_h2");
+    LLVMValueRef p_mmask = emit_swisstable_match_mask(g, p_cvec, p_h2);
+    LLVMBuildStore(b, p_mmask, mmask_a);
+    LLVMValueRef p_has_match = zan_icmp(b, LLVMIntNE, p_mmask, LLVMConstInt(i32, 0, 0), "p_has_match");
+    LLVMBuildCondBr(b, p_has_match, p_mchk, p_echk);
+
+    LLVMPositionBuilderAtEnd(b, p_mchk);
+    LLVMValueRef p_cur_mmask = LLVMBuildLoad2(b, i32, mmask_a, "p_cur_mmask");
+    LLVMValueRef p_bit = emit_cttz32(g, p_cur_mmask);
+    LLVMValueRef p_bit64 = LLVMBuildZExt(b, p_bit, i64, "p_bit64");
+    LLVMValueRef p_slot = zan_and(b, zan_add(b, p_gidx, p_bit64, "p_slot0"), pmask, "p_slot");
+    LLVMValueRef p_entry = LLVMBuildLoad2(b, i64,
+        LLVMBuildGEP2(b, i64, p_slots_base, &p_slot, 1, "p_entryp"), "p_entry");
+    LLVMValueRef p_valid = zan_icmp(b, LLVMIntSLT, p_entry, cnt, "p_valid");
+    LLVMBasicBlockRef p_keq_bb = LLVMAppendBasicBlockInContext(c, fn, "p.keq");
+    LLVMBasicBlockRef p_mnext_bb = LLVMAppendBasicBlockInContext(c, fn, "p.mnext");
+    LLVMBuildCondBr(b, p_valid, p_keq_bb, p_mnext_bb);
+
+    LLVMPositionBuilderAtEnd(b, p_keq_bb);
+    LLVMValueRef p_cand_key = LLVMBuildLoad2(b, i8ptr,
+        LLVMBuildGEP2(b, i8ptr, pks, &p_entry, 1, "p_cand_keyp"), "p_cand_key");
+    LLVMValueRef p_matched = zan_call2(b, keq_ty, keq,
+        (LLVMValueRef[]){ p_cand_key, key, is_str }, 3, "p_matched");
+    LLVMBuildCondBr(b, p_matched, p_hit, p_mnext_bb);
+
+    LLVMPositionBuilderAtEnd(b, p_hit);
+    LLVMBuildRet(b, p_entry);
+
+    LLVMPositionBuilderAtEnd(b, p_mnext_bb);
+    LLVMValueRef p_msub1 = zan_sub(b, p_cur_mmask, LLVMConstInt(i32, 1, 0), "p_msub1");
+    LLVMValueRef p_mnext = zan_and(b, p_cur_mmask, p_msub1, "p_mnext");
+    LLVMBuildStore(b, p_mnext, mmask_a);
+    LLVMValueRef p_mmore = zan_icmp(b, LLVMIntNE, p_mnext, LLVMConstInt(i32, 0, 0), "p_mmore");
+    LLVMBuildCondBr(b, p_mmore, p_mchk, p_echk);
+
+    LLVMPositionBuilderAtEnd(b, p_echk);
+    LLVMValueRef p_emask = emit_swisstable_empty_mask(g, p_cvec);
+    LLVMValueRef p_has_empty = zan_icmp(b, LLVMIntNE, p_emask, LLVMConstInt(i32, 0, 0), "p_has_empty");
+    LLVMBuildCondBr(b, p_has_empty, miss, p_step);
+
+    LLVMPositionBuilderAtEnd(b, p_step);
+    LLVMValueRef p_cur_step = LLVMBuildLoad2(b, i64, step_a, "p_cur_step");
+    LLVMValueRef p_next_step = zan_add(b, p_cur_step, LLVMConstInt(i64, 16, 0), "p_next_step");
+    LLVMBuildStore(b, p_next_step, step_a);
+    LLVMBuildStore(b, zan_and(b, zan_add(b, p_gidx, p_next_step, "p_gidx_next"), pmask, "p_gidx_wrap"), gidx_a);
+    LLVMBuildBr(b, p_loop);
+
     if (saved) LLVMPositionBuilderAtEnd(b, saved);
     return fn;
 }
