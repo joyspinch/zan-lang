@@ -1,0 +1,147 @@
+using System;
+using System.Json;
+using Gui;
+using Gui.Widget;
+
+namespace Conformance;
+
+public class UserViewModel {
+    public string Name;
+    public int Age;
+    public bool Active;
+}
+
+class Program {
+    static int fails = 0;
+
+    static void Eq(string what, string got, string want) {
+        if (got == want) { return; }
+        fails = fails + 1;
+        Console.WriteLine("FAIL " + what + ": got '" + got + "' want '" + want + "'");
+    }
+
+    static Control Pick(Control root, string id) {
+        Control c = root.Find(id);
+        if (c == null) {
+            fails = fails + 1;
+            Console.WriteLine("FAIL find '" + id + "'");
+            return new Panel();
+        }
+        return c;
+    }
+
+    static void RunTest() {
+        // ====================================================================
+        // 场景 1：POCO 强类型实体双向数据绑定 (ModelBinder + POCO Entity)
+        // ====================================================================
+        UserViewModel vm = new UserViewModel();
+        vm.Name = "Alice";
+        vm.Age = 25;
+        vm.Active = true;
+
+        HtmlDoc doc1 = Html.Parse(
+            "<div id=\"page1\">"
+            + "<input id=\"uname\" data-bind=\"Name\" />"
+            + "<p id=\"uage\" data-bind=\"Age\"></p>"
+            + "<span id=\"uactive\" data-if=\"Active\">User Active</span>"
+            + "</div>", "", null);
+        Control page1 = doc1.root.children[0];
+
+        ModelBinder b1 = new ModelBinder();
+        b1.SetRoot(page1, vm);
+        b1.Wire();
+
+        Control uname = Pick(page1, "uname");
+        Control uage = Pick(page1, "uage");
+        Control uactive = Pick(page1, "uactive");
+
+        Eq("poco uname init", uname.GetProp("value"), "Alice");
+        Eq("poco uage init", uage.GetProp("text"), "25");
+        Eq("poco uactive visible", Convert.ToString(uactive.visible), "true");
+
+        // UI -> Model 双向回写 POCO 属性
+        uname.SetProp("value", "Bob");
+        b1.SyncChangedNode(page1);
+        Eq("poco vm.Name updated", vm.Name, "Bob");
+
+        // 翻转布尔属性 -> Model -> UI 同步
+        vm.Active = false;
+        b1.MarkDirty();
+        b1.SyncFromModel();
+        Eq("poco uactive hidden", Convert.ToString(uactive.visible), "false");
+
+        b1.Detach();
+
+        // ====================================================================
+        // 场景 2：JsonDoc 零拷贝 Tape 模型绑定与 <template data-for> 展开
+        // ====================================================================
+        string json = "{\"title\":\"Symbol List\",\"items\":[{\"name\":\"App\"},{\"name\":\"Window\"},{\"name\":\"Control\"}]}";
+        JsonDoc doc = JsonDoc.Parse(json);
+
+        HtmlDoc doc2 = Html.Parse(
+            "<div id=\"page2\">"
+            + "<h1 id=\"title\" data-bind=\"title\"></h1>"
+            + "<template data-for=\"items\">"
+            + "<li><span data-bind=\"name\"></span></li>"
+            + "</template>"
+            + "</div>", "", null);
+        Control page2 = doc2.root.children[0];
+
+        ModelBinder b2 = new ModelBinder();
+        b2.SetRoot(page2, doc);
+        b2.Wire();
+
+        Control title = Pick(page2, "title");
+        Eq("doc title", title.GetProp("text"), "Symbol List");
+
+        // 验证 data-for 模板行展开
+        // page2 孩子：h1 (0), template (1), row0 (2), row1 (3), row2 (4) -> 共 5 个
+        Eq("doc kids count", Convert.ToString(page2.ChildCount()), "5");
+        Control row0 = page2.children[2];
+        Control row1 = page2.children[3];
+        Control row2 = page2.children[4];
+
+        Eq("doc row0 text", row0.children[0].GetProp("text"), "App");
+        Eq("doc row1 text", row1.children[0].GetProp("text"), "Window");
+        Eq("doc row2 text", row2.children[0].GetProp("text"), "Control");
+
+        b2.Detach();
+
+        // ====================================================================
+        // 场景 3：现有 JsonValue 完全向后兼容
+        // ====================================================================
+        JsonValue jv = JsonValue.Parse("{\"city\":\"Berlin\",\"code\":49}");
+        HtmlDoc doc3 = Html.Parse(
+            "<div id=\"page3\">"
+            + "<input id=\"city\" data-bind=\"city\" />"
+            + "<span id=\"code\" data-bind=\"code\"></span>"
+            + "</div>", "", null);
+        Control page3 = doc3.root.children[0];
+
+        ModelBinder b3 = new ModelBinder();
+        b3.SetRoot(page3, jv);
+        b3.Wire();
+
+        Control city = Pick(page3, "city");
+        Eq("jv city init", city.GetProp("value"), "Berlin");
+
+        city.SetProp("value", "Munich");
+        b3.SyncChangedNode(page3);
+        JsonValue cv = jv.PathGet("city");
+        Eq("jv city updated", cv != null ? cv.AsString("") : "", "Munich");
+
+        b3.Detach();
+    }
+
+    static void Main() {
+        fails = 0;
+        Html.Install();
+        ControlBootstrap.Install();
+
+        RunTest();
+
+        if (fails == 0) {
+            Console.WriteLine("GUI_MODEL_POCO_JSONDOC_OK");
+        }
+    }
+}
