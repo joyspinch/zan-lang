@@ -9592,6 +9592,31 @@ static LLVMValueRef emit_expr_new_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                 LLVMValueRef value_words_const = LLVMConstInt(i64, value_words, 0);
                 zan_store_fit(g, value_words_const,
                     LLVMBuildStructGEP2(g->builder, g->dict_struct_type, typed_ptr, 7, "vwp"));
+                /* 字典初始化式条目处理 (new Dict<K,V>{ {k, v}, ... })：发射逐项索引器写入 */
+                zan_ast_list_t dict_inits;
+                zan_ast_list_init(&dict_inits);
+                for (int di = 0; di < expr->new_expr.args.count; di++)
+                    zan_ast_list_push(&dict_inits,
+                        expr->new_expr.args.items[di], g->arena);
+                for (int di = 0; di < expr->new_expr.arg_inits.count; di++)
+                    zan_ast_list_push(&dict_inits,
+                        expr->new_expr.arg_inits.items[di], g->arena);
+                int ninit = dict_inits.count;
+                if (ninit == 0) {
+                    /* count = 0 */
+                    LLVMValueRef cnt_p = LLVMBuildStructGEP2(g->builder, g->dict_struct_type, typed_ptr, 0, "cnt");
+                    zan_store_fit(g, LLVMConstInt(i64, 0, 0), cnt_p);
+                    /* capacity = 0 (惰性分配，避免空字典产生键值数组微碎片) */
+                    LLVMValueRef cap_p = LLVMBuildStructGEP2(g->builder, g->dict_struct_type, typed_ptr, 1, "cap");
+                    zan_store_fit(g, LLVMConstInt(i64, 0, 0), cap_p);
+                    /* keys = NULL */
+                    LLVMValueRef kf = LLVMBuildStructGEP2(g->builder, g->dict_struct_type, typed_ptr, 2, "kf");
+                    zan_store_fit(g, LLVMConstNull(LLVMPointerType(i8ptr, 0)), kf);
+                    /* values = NULL */
+                    LLVMValueRef vf = LLVMBuildStructGEP2(g->builder, g->dict_struct_type, typed_ptr, 3, "vf");
+                    zan_store_fit(g, LLVMConstNull(LLVMPointerType(i64, 0)), vf);
+                    return LLVMBuildBitCast(g->builder, typed_ptr, i8ptr, "dictv");
+                }
                 /* count = 0 */
                 LLVMValueRef cnt_p = LLVMBuildStructGEP2(g->builder, g->dict_struct_type, typed_ptr, 0, "cnt");
                 zan_store_fit(g, LLVMConstInt(i64, 0, 0), cnt_p);
@@ -9618,16 +9643,6 @@ static LLVMValueRef emit_expr_new_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                     LLVMPointerType(i64, 0), "vptr");
                 LLVMValueRef vf = LLVMBuildStructGEP2(g->builder, g->dict_struct_type, typed_ptr, 3, "vf");
                 zan_store_fit(g, vals_typed, vf);
-                /* 字典初始化式条目处理 (new Dict<K,V>{ {k, v}, ... })：发射逐项索引器写入 */
-                zan_ast_list_t dict_inits;
-                zan_ast_list_init(&dict_inits);
-                for (int di = 0; di < expr->new_expr.args.count; di++)
-                    zan_ast_list_push(&dict_inits,
-                        expr->new_expr.args.items[di], g->arena);
-                for (int di = 0; di < expr->new_expr.arg_inits.count; di++)
-                    zan_ast_list_push(&dict_inits,
-                        expr->new_expr.arg_inits.items[di], g->arena);
-                int ninit = dict_inits.count;
                 if (ninit >= 2) {
                     zan_type_t *kt = dict_key_type(g, dict_type);
                     for (int ii = 0; ii + 1 < ninit; ii += 2) {
