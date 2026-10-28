@@ -9508,6 +9508,15 @@ static LLVMValueRef emit_expr_new_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                 /* 集合初始化式项处理 (new List<T>{ a, b, c })：发射逐项 Add 调用 */
                 int ninit = expr->new_expr.args.count +
                             expr->new_expr.arg_inits.count;
+                if (ninit == 0) {
+                    LLVMValueRef count_ptr = LLVMBuildStructGEP2(g->builder, g->list_struct_type, typed_ptr, 0, "cnt");
+                    zan_store_fit(g, LLVMConstInt(i64, 0, 0), count_ptr);
+                    LLVMValueRef cap_ptr = LLVMBuildStructGEP2(g->builder, g->list_struct_type, typed_ptr, 1, "cap");
+                    zan_store_fit(g, LLVMConstInt(i64, 0, 0), cap_ptr);
+                    LLVMValueRef data_field = LLVMBuildStructGEP2(g->builder, g->list_struct_type, typed_ptr, 2, "df");
+                    zan_store_fit(g, LLVMConstNull(LLVMPointerType(i64, 0)), data_field);
+                    return LLVMBuildBitCast(g->builder, typed_ptr, i8ptr, "listv");
+                }
                 long long initcap = ninit > 8 ? (long long)ninit : 8;
                 /* count = ninit */
                 LLVMValueRef count_ptr = LLVMBuildStructGEP2(g->builder, g->list_struct_type, typed_ptr, 0, "cnt");

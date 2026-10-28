@@ -4559,7 +4559,11 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                     LLVMBasicBlockRef add_bb = LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "list.add");
                     LLVMBuildCondBr(g->builder, need_grow, grow_bb, add_bb);
                     LLVMPositionBuilderAtEnd(g->builder, grow_bb);
-                    LLVMValueRef new_cap = zan_mul(g->builder, cap, LLVMConstInt(i64, 2, 0), "ncap");
+                    LLVMValueRef cap_zero = zan_icmp(g->builder, LLVMIntEQ, cap,
+                        LLVMConstInt(i64, 0, 0), "cap.zero");
+                    LLVMValueRef dbl_cap = zan_mul(g->builder, cap, LLVMConstInt(i64, 2, 0), "ncap");
+                    LLVMValueRef new_cap = LLVMBuildSelect(g->builder, cap_zero,
+                        LLVMConstInt(i64, 8, 0), dbl_cap, "new_cap");
                     LLVMBuildStore(g->builder, new_cap, cap_ptr);
                     LLVMValueRef data_field = LLVMBuildStructGEP2(g->builder, g->list_struct_type, list_ptr, 2, "df");
                     LLVMValueRef old_data = LLVMBuildLoad2(g->builder, LLVMPointerType(i64, 0), data_field, "od");
@@ -5113,7 +5117,11 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                     LLVMBasicBlockRef shift_bb = LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "ins.shift");
                     LLVMBuildCondBr(g->builder, need, grow_bb, shift_bb);
                     LLVMPositionBuilderAtEnd(g->builder, grow_bb);
-                    LLVMValueRef new_cap = zan_mul(g->builder, cap, LLVMConstInt(i64, 2, 0), "nc");
+                    LLVMValueRef cap_zero = zan_icmp(g->builder, LLVMIntEQ, cap,
+                        LLVMConstInt(i64, 0, 0), "ins.cap.zero");
+                    LLVMValueRef dbl_cap = zan_mul(g->builder, cap, LLVMConstInt(i64, 2, 0), "nc");
+                    LLVMValueRef new_cap = LLVMBuildSelect(g->builder, cap_zero,
+                        LLVMConstInt(i64, 8, 0), dbl_cap, "new_cap");
                     LLVMBuildStore(g->builder, new_cap, cap_ptr);
                     LLVMValueRef nbytes = zan_mul(g->builder, new_cap,
                         LLVMConstInt(i64, 8ULL * ins_words, 0), "nb");
