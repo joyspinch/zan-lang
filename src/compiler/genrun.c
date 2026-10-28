@@ -1047,6 +1047,7 @@ static bool ast_type_triggers(zan_ast_node_t *decl) {
             if (a->attribute.name->kind == AST_IDENTIFIER)
                 an = a->attribute.name->ident.name.str;
             if (an && (strcmp(an, "Route") == 0 ||
+                       strcmp(an, "RouteR") == 0 ||
                        strcmp(an, "ApiController") == 0 ||
                        strcmp(an, "Table") == 0)) {
                 return true;

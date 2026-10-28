@@ -1,6 +1,7 @@
 using System;
 using System.Threading;
 using System.Json;
+using System.Text.RegularExpressions;
 
 namespace System.Web;
 
@@ -8,6 +9,7 @@ namespace System.Web;
 public class Router {
     List<Route> statics;  // no {param} segments: matched by full-path compare
     List<Route> dynamics;  // contain {param} segments: matched per-segment
+    List<Route> regexes;   // regex patterns: matched by Regex.Find / IsMatch
     // 静态路由 O(1) 快速查找哈希表。
     Dictionary<string, Route> staticIndex;
     // 静态路由开放寻址哈希索引。
@@ -22,6 +24,7 @@ public class Router {
     public Router() {
         this.statics = new List<Route>();
         this.dynamics = new List<Route>();
+        this.regexes = new List<Route>();
         this.staticIndex = new Dictionary<string, Route>();
         this.hashSlots = null;
         this.hashMask = 0;
@@ -44,6 +47,15 @@ public class Router {
         } else {
             this.dynamics.Add(r);
         }
+        r.idx = this.flat.Count;
+        this.flat.Add(r);
+        return r;
+    }
+
+    // 注册一条正则路由并返回 Route（可继续 fluent 配置）。
+    public Route AddRegex(string method, string pattern, HttpHandler handler) {
+        Route r = new Route(method, pattern, handler, true);
+        this.regexes.Add(r);
         r.idx = this.flat.Count;
         this.flat.Add(r);
         return r;
@@ -115,6 +127,8 @@ public class Router {
         for (; i < this.statics.Count; i = i + 1) { outp.Add(this.statics[i]); }
         i = 0;
         while (i < this.dynamics.Count) { outp.Add(this.dynamics[i]); i = i + 1; }
+        i = 0;
+        while (i < this.regexes.Count) { outp.Add(this.regexes[i]); i = i + 1; }
         return outp;
     }
 
@@ -152,6 +166,12 @@ public class Router {
     public Route Put(string pattern, HttpHandler handler) { return this.Add("PUT", pattern, handler); }
     // DELETE 快捷。
     public Route Delete(string pattern, HttpHandler handler) { return this.Add("DELETE", pattern, handler); }
+
+    // 正则快捷
+    public Route GetRegex(string pattern, HttpHandler handler) { return this.AddRegex("GET", pattern, handler); }
+    public Route PostRegex(string pattern, HttpHandler handler) { return this.AddRegex("POST", pattern, handler); }
+    public Route PutRegex(string pattern, HttpHandler handler) { return this.AddRegex("PUT", pattern, handler); }
+    public Route DeleteRegex(string pattern, HttpHandler handler) { return this.AddRegex("DELETE", pattern, handler); }
 
     private static int HashKey(string method, string path) {
         int h = 0x811C9DC5;
@@ -224,16 +244,57 @@ public class Router {
         if (hit != null) { return hit; }
         hit = this.FindStatic("*", path);
         if (hit != null) { return hit; }
-        if (this.dynamics.Count == 0) { return null; }
-        List<string> segs = Router.SplitPath(path);
-        for (int i = 0; i < this.dynamics.Count; i = i + 1) {
-            Route r = this.dynamics[i];
-            if (r.method == method || r.method == "*") {
-                if (ctx.routeParams == null) { ctx.routeParams = new StrMap(); }
-                if (Router.MatchRoute(r, segs, ctx.routeParams)) {
-                    return r;
+        // 自动尾部斜杠容错：/about/company/ -> /about/company
+        if (path.Length > 1 && path.EndsWith("/")) {
+            string altPath = path.Substring(0, path.Length - 1);
+            hit = this.FindStatic(method, altPath);
+            if (hit != null) { return hit; }
+            hit = this.FindStatic("*", altPath);
+            if (hit != null) { return hit; }
+        }
+
+        // 动态分段路由
+        if (this.dynamics.Count > 0) {
+            List<string> segs = Router.SplitPath(path);
+            for (int i = 0; i < this.dynamics.Count; i = i + 1) {
+                Route r = this.dynamics[i];
+                if (r.method == method || r.method == "*") {
+                    if (ctx.routeParams == null) { ctx.routeParams = new StrMap(); }
+                    if (Router.MatchRoute(r, segs, ctx.routeParams)) {
+                        return r;
+                    }
+                    ctx.routeParams.Clear();
                 }
-                ctx.routeParams.Clear();
+            }
+        }
+
+        // 正则路由（支持命名捕获组及数字捕获组自动写入 ctx.routeParams）
+        if (this.regexes.Count > 0) {
+            for (int ri = 0; ri < this.regexes.Count; ri = ri + 1) {
+                Route r = this.regexes[ri];
+                if (r.method == method || r.method == "*") {
+                    Match m = r.regex.Find(path);
+                    if (m.Success()) {
+                        if (ctx.routeParams == null) { ctx.routeParams = new StrMap(); }
+                        if (r.regexGroupNames != null) {
+                            for (int gi = 0; gi < r.regexGroupNames.Count; gi = gi + 1) {
+                                string gname = r.regexGroupNames[gi];
+                                if (gname.Length > 0) {
+                                    int gnum = r.regex.GroupNumber(gname);
+                                    if (gnum >= 0 && m.GroupSuccess(gnum)) {
+                                        ctx.routeParams.Set(gname, m.Group(gnum));
+                                    }
+                                }
+                            }
+                        }
+                        for (int gi = 1; gi < m.GroupCount(); gi = gi + 1) {
+                            if (m.GroupSuccess(gi)) {
+                                ctx.routeParams.Set(Convert.ToString(gi), m.Group(gi));
+                            }
+                        }
+                        return r;
+                    }
+                }
             }
         }
         return null;
@@ -244,13 +305,25 @@ public class Router {
         for (; i < this.statics.Count; i = i + 1) {
             if (this.statics[i].pattern == path) { return true; }
         }
-        if (this.dynamics.Count == 0) { return false; }
-        List<string> segs = Router.SplitPath(path);
-        StrMap scratch = new StrMap();
-        i = 0;
-        while (i < this.dynamics.Count) {
-            if (Router.MatchRoute(this.dynamics[i], segs, scratch)) { return true; }
-            i = i + 1;
+        if (path.Length > 1 && path.EndsWith("/")) {
+            string altPath = path.Substring(0, path.Length - 1);
+            for (i = 0; i < this.statics.Count; i = i + 1) {
+                if (this.statics[i].pattern == altPath) { return true; }
+            }
+        }
+        if (this.dynamics.Count > 0) {
+            List<string> segs = Router.SplitPath(path);
+            StrMap scratch = new StrMap();
+            i = 0;
+            while (i < this.dynamics.Count) {
+                if (Router.MatchRoute(this.dynamics[i], segs, scratch)) { return true; }
+                i = i + 1;
+            }
+        }
+        if (this.regexes.Count > 0) {
+            for (int ri = 0; ri < this.regexes.Count; ri = ri + 1) {
+                if (this.regexes[ri].regex.IsMatch(path)) { return true; }
+            }
         }
         return false;
     }

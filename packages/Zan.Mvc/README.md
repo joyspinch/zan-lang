@@ -28,8 +28,8 @@ structure, an external config file, and the ORM and cache wired in by default.
 
 ```
 zan.pkg                 包清单（版本随包演进）
-src/ZanWeb/             包源码。目录是工程组织（Framework/Modules 两块），
-                        命名空间保持扁平、与 URL 同构，不随目录加深
+src/Zan/Web/            包源码。目录是工程组织（Framework/Modules 两块），
+                        命名空间与目录同构（Zan.Web.*），不随目录加深
   Framework/              框架层：所有模块共享的件；业务模块只依赖它
     Core/                   基建：Boot 引导 · Cfg 配置 · Db/DbContext · Schema
     Services/               业务支撑：JobHost 任务宿主 · Cache/CacheContext · Metrics ·
@@ -657,7 +657,7 @@ crashing.
 
 | Capability | Where | Notes |
 |---|---|---|
-| Layered controllers | `src/ZanWeb/` | thin composition root, one class per resource |
+| Layered controllers | `src/Zan/Web/` | thin composition root, one class per resource |
 | Config-driven CRUD screens | `Modules/Crud` | one CrudConf declaration → list/form/save/delete/batch/inline/conf/options; hooks for the rest |
 | Default ORM | `Modules/Sys/Model`, `Framework/Core/Db.zan` | `System.Data.Orm` models, config-driven engine |
 | Default cache | `Framework/Services/Cache.zan` | in-memory TTL; Redis via `System.Data.Redis` on async path |
@@ -814,7 +814,7 @@ live-name 闭包所致，修复后纯 `using` 引用即可），当前消费配�
 
 ```sh
 zanc src/main.zan src/**/*.zan \
-     packages/Zan.Mvc/src/ZanWeb/**/*.zan \
+     packages/Zan.Mvc/src/Zan/Web/**/*.zan \
      --auto-stdlib -o build/app.exe
 ```
 
