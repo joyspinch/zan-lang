@@ -1017,6 +1017,17 @@ static void resolve_package_project_root(const char *input) {
         snprintf(manifest, sizeof(manifest), "%s/zan.proj", package_project_root);
         FILE *f = fopen(manifest, "rb");
         if (f) { fclose(f); return; }
+
+        char pkg_dir[1200];
+        snprintf(pkg_dir, sizeof(pkg_dir), "%s/packages", package_project_root);
+#ifdef _WIN32
+        DWORD a_attr = zan_utf8_get_file_attributes(pkg_dir);
+        if (a_attr != INVALID_FILE_ATTRIBUTES && (a_attr & FILE_ATTRIBUTE_DIRECTORY)) return;
+#else
+        struct stat st_pkg;
+        if (stat(pkg_dir, &st_pkg) == 0 && S_ISDIR(st_pkg.st_mode)) return;
+#endif
+
         char *a = strrchr(package_project_root, '/');
         char *b = strrchr(package_project_root, '\\');
         char *last = (!a || (b && b > a)) ? b : a;
@@ -5421,6 +5432,8 @@ int main(int argc, char **argv) {
         effective_opt = (zan_opt_level_t)opt_level;
     } else if (publish_mode) {
         effective_opt = ZAN_OPT_SIZE;
+    } else if (!debug_info) {
+        effective_opt = ZAN_OPT_FULL;
     }
     if (debug_info && effective_opt > ZAN_OPT_NONE) {
         fprintf(stderr, "note: -g forces -O0 (debug info is emitted unoptimized)\n");
@@ -5433,10 +5446,12 @@ int main(int argc, char **argv) {
         snprintf(obj_path, sizeof(obj_path), "%s", output_file);
     } else {
         size_t ilen = strlen(input_file);
+        const char *def_ext = (target.os == ZAN_OS_WINDOWS) ? ".exe" : "";
         if (ilen > 4 && strcmp(input_file + ilen - 4, ".zan") == 0) {
-            snprintf(obj_path, sizeof(obj_path), "%.*s", (int)(ilen - 4), input_file);
+            snprintf(obj_path, sizeof(obj_path), "%.*s%s", (int)(ilen - 4), input_file, def_ext);
         } else {
-            snprintf(obj_path, sizeof(obj_path), "%s.out", input_file);
+            snprintf(obj_path, sizeof(obj_path), "%s%s", input_file,
+                     (target.os == ZAN_OS_WINDOWS) ? ".exe" : ".out");
         }
     }
 

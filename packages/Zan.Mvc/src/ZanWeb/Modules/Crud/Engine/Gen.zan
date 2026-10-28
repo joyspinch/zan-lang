@@ -477,29 +477,33 @@ public class Gen {
         b.Append("        if (idv.Length > 0) {\n");
         b.Append("            DbResult one = await t.Query().WhereEq(\"id\", Filter.ToLong(idv, 0))\n");
         b.Append("                .Limit(1).ToResultAsync();\n");
-        b.Append("            JsonValue row = JsonValue.NewObject();\n");
+        b.Append("            JsonWriter row = new JsonWriter();\n");
+        b.Append("            row.StartObject();\n");
         b.Append("            if (one != null && one.RowCount() > 0) {\n");
-        b.Append("                row.Set(\"id\", JsonValue.NewInt(Filter.ToInt(idv, 0)));\n");
-        b.Append("                row.Set(\"label\", JsonValue.NewStr(one.GetString(0, one.GetColumnIndex(\""
-            + labelCol + "\"))));\n");
+        b.Append("                row.WriteProperty(\"id\", Filter.ToInt(idv, 0));\n");
+        b.Append("                row.WriteProperty(\"label\", one.GetString(0, one.GetColumnIndex(\""
+            + labelCol + "\")));\n");
         b.Append("            }\n");
+        b.Append("            row.EndObject();\n");
         b.Append("            this.Ctx().Api(Codes.Ok, \"ok\", row.ToJson());\n");
         b.Append("            return;\n        }\n");
         b.Append("        DbTableQuery q = t.Query();\n");
         b.Append("        if (kw.Length > 0) { q = q.WhereContains(\"" + labelCol + "\", kw); }\n");
         b.Append("        DbResult rows = await q.OrderBy(\"" + labelCol
             + "\").Limit(20).ToResultAsync();\n");
-        b.Append("        JsonValue arr = JsonValue.NewArray();\n");
+        b.Append("        JsonWriter arr = new JsonWriter();\n");
+        b.Append("        arr.StartArray();\n");
         b.Append("        if (rows != null) {\n");
         b.Append("            int idc = rows.GetColumnIndex(\"id\");\n");
         b.Append("            int lbc = rows.GetColumnIndex(\"" + labelCol + "\");\n");
         b.Append("            for (int i = 0; i < rows.RowCount(); i = i + 1) {\n");
-        b.Append("                JsonValue o = JsonValue.NewObject();\n");
-        b.Append("                o.Set(\"id\", JsonValue.NewInt(rows.GetInt(i, idc)));\n");
-        b.Append("                o.Set(\"label\", JsonValue.NewStr(rows.GetString(i, lbc)));\n");
-        b.Append("                arr.Append(o);\n");
+        b.Append("                arr.StartObject();\n");
+        b.Append("                arr.WriteProperty(\"id\", rows.GetInt(i, idc));\n");
+        b.Append("                arr.WriteProperty(\"label\", rows.GetString(i, lbc));\n");
+        b.Append("                arr.EndObject();\n");
         b.Append("            }\n");
         b.Append("        }\n");
+        b.Append("        arr.EndArray();\n");
         b.Append("        this.Ctx().Api(Codes.Ok, \"ok\", arr.ToJson());\n");
         b.Append("    }\n");
 
@@ -1285,16 +1289,19 @@ public class Gen {
         b.Append("            ." + orderCall + "\n");
         b.Append("            .Skip((page - 1) * " + Convert.ToString(pageSize)
             + ").Take(" + Convert.ToString(pageSize) + ").ToListAsync();\n");
-        b.Append("        JsonValue arr = JsonValue.NewArray();\n");
+        b.Append("        JsonWriter outp = new JsonWriter();\n");
+        b.Append("        outp.StartObject();\n");
+        b.Append("        outp.WriteProperty(\"total\", total);\n");
+        b.Append("        outp.WritePropertyName(\"rows\");\n");
+        b.Append("        outp.StartArray();\n");
         b.Append("        for (int i = 0; i < rows.Count; i = i + 1) {\n");
-        b.Append("            JsonValue o = JsonValue.NewObject();\n");
-        b.Append("            o.Put(\"id\", JsonValue.NewInt(rows[i].id));\n");
-        ApiPuts(b, cols, "rows[i]", "            ");
-        b.Append("            arr.Append(o);\n");
+        b.Append("            outp.StartObject();\n");
+        b.Append("            outp.WriteProperty(\"id\", rows[i].id);\n");
+        ApiPuts(b, cols, "rows[i]", "            ", "outp");
+        b.Append("            outp.EndObject();\n");
         b.Append("        }\n");
-        b.Append("        JsonValue outp = JsonValue.NewObject();\n");
-        b.Append("        outp.Put(\"total\", JsonValue.NewNum(Convert.ToString(total)));\n");
-        b.Append("        outp.Put(\"rows\", arr);\n");
+        b.Append("        outp.EndArray();\n");
+        b.Append("        outp.EndObject();\n");
         b.Append("        this.Ok(outp.ToJson());\n");
         b.Append("    }\n\n");
         b.Append("    [HttpGet]\n    [Custom(Perm = PermBit.View)]\n");
@@ -1304,28 +1311,29 @@ public class Gen {
         b.Append("        " + mdl + " e = null;\n");
         b.Append("        if (id > 0) { e = await this." + t.entityName + ".Read(id); }\n");
         b.Append("        if (e == null) { this.Fail(404, \"0404\", \"记录不存在\"); }\n");
-        b.Append("        JsonValue o = JsonValue.NewObject();\n");
-        b.Append("        o.Put(\"id\", JsonValue.NewInt(e.id));\n");
-        ApiPuts(b, cols, "e", "        ");
+        b.Append("        JsonWriter o = new JsonWriter();\n");
+        b.Append("        o.StartObject();\n");
+        b.Append("        o.WriteProperty(\"id\", e.id);\n");
+        ApiPuts(b, cols, "e", "        ", "o");
+        b.Append("        o.EndObject();\n");
         b.Append("        this.Ok(o.ToJson());\n");
         b.Append("    }\n}\n");
         return b.ToString();
     }
 
-    /* JSON 字段投影：字符串出 NewStr，其余出数值（datetime 保持 epoch 秒，
-       交给客户端格式化）；调用方是生成的实体行或列表元素。 */
+    /* JSON 字段投影：利用 JsonWriter 零分配流式写出字段 */
     public static void ApiPuts(StringBuilder b, List<SysGenColumn> cols, string target,
-        string pad) {
+        string pad, string writerVar) {
         for (int i = 0; i < cols.Count; i = i + 1) {
             SysGenColumn c = cols[i];
             if (c.name == "id") { continue; }
             string v = target + "." + c.name;
             if (ZanType(c.kind) == "string") {
-                b.Append(pad + "o.Put(\"" + c.name + "\", JsonValue.NewStr("
-                    + v + "));\n");
+                b.Append(pad + writerVar + ".WriteProperty(\"" + c.name + "\", "
+                    + v + ");\n");
             } else {
-                b.Append(pad + "o.Put(\"" + c.name + "\", JsonValue.NewNum(Convert.ToString("
-                    + v + ")));\n");
+                b.Append(pad + writerVar + ".WriteProperty(\"" + c.name + "\", "
+                    + v + ");\n");
             }
         }
     }
