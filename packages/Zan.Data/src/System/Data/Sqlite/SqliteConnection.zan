@@ -181,7 +181,7 @@ public class SqliteConnection : IDbConnection {
     // 抛出记录的失败：文本来自 sqlite3_errmsg（服务器
     // 自身的说明），错误号是驱动返回码（如 SQLITE_CONSTRAINT）。
     // 空结果从此总意味着「无行」，而不是掩盖了一次失败。
-    void Fail(int rc) {
+    public void Fail(int rc) {
         string why = "the statement failed";
         if (this.handle != 0) {
             string msg = SqliteConnection.CopyText(sqlite3_errmsg(this.handle));
@@ -359,6 +359,52 @@ public class SqliteConnection : IDbConnection {
         return result;
     }
 
+    // 执行查询并返回只进流式数据读取器。
+    public SqliteDataReader ExecuteReader(string sql) {
+        return this.ExecuteReader(sql, new DbParams());
+    }
+
+    // 执行带参数的查询并返回只进流式数据读取器。
+    public SqliteDataReader ExecuteReader(string sql, DbParams prms) {
+        if (!this.connected) {
+            throw new DbException("not connected", 0, DbProvider.SQLite);
+        }
+        nint stmt = 0;
+        bool cached = false;
+        byte[] ppStmt = new byte[8];
+        byte[] pzTail = new byte[8];
+        nint hit = 0;
+        if (this.stmtCache.TryGetValue(sql, out hit)) {
+            bool busy = false;
+            if (!this.stmtBusy.TryGetValue(sql, out busy) || !busy) {
+                cached = true;
+                stmt = hit;
+                sqlite3_reset(stmt);
+                sqlite3_clear_bindings(stmt);
+                this.stmtBusy[sql] = true;
+            }
+        }
+        if (stmt == 0) {
+            int rc = sqlite3_prepare_v2(this.handle, sql, sql.Length,
+                                        ppStmt, pzTail);
+            if (rc != 0) { this.Fail(rc); }
+            stmt = HandleFromBuf(ppStmt);
+            nint ignore = 0;
+            if (HandleFromBuf(pzTail) == 0
+                && !this.stmtCache.TryGetValue(sql, out ignore)) {
+                this.stmtCache.Add(sql, stmt);
+                this.stmtBusy[sql] = true;
+                cached = true;
+            }
+        }
+        int brc = BindAll(stmt, prms);
+        if (brc != 0) {
+            this.ReleaseStmt(sql, stmt, cached);
+            this.Fail(brc);
+        }
+        return new SqliteDataReader(this, sql, stmt, cached);
+    }
+
     // 执行标量查询（第一行第一列）。
     string ExecuteScalar(string sql) {
         DbResult result = Query(sql);
@@ -471,6 +517,16 @@ public class SqliteConnection : IDbConnection {
             this.Fail(step);
         }
         return result;
+    }
+
+    // <see cref="ExecuteReader(string)"/> 的协程版本。
+    public async SqliteDataReader ExecuteReaderAsync(string sql) {
+        return await this.ExecuteReaderAsync(sql, new DbParams());
+    }
+
+    // <see cref="ExecuteReader(string, DbParams)"/> 的协程版本。
+    public async SqliteDataReader ExecuteReaderAsync(string sql, DbParams prms) {
+        return this.ExecuteReader(sql, prms);
     }
 
     // <see cref="Execute(string)"/> 的协程版本。

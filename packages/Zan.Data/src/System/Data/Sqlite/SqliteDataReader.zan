@@ -1,0 +1,230 @@
+using System;
+using System.Interop;
+using System.Data;
+
+namespace System.Data.Sqlite;
+
+// SQLite 原生只进流式数据读取器。
+// 针对高频数据查询场景彻底消灭结果集全量中间物化（DbResult / List<DbRow> / List<DbCell>）。
+// 借助 StringView 直接透传 sqlite3 内部行数据缓冲区，实现 0 堆分配遍历。
+public class SqliteDataReader : IDataReader {
+    SqliteConnection conn;
+    string sql;
+    nint stmt;
+    bool cached;
+    bool closed;
+    bool hasRow;
+    int fieldCount;
+    Dict<string, int> colMap;
+    List<string> colNames;
+
+    [DllImport("sqlite3")]
+    static extern int sqlite3_step(nint stmt);
+
+    [DllImport("sqlite3")]
+    static extern int sqlite3_column_count(nint stmt);
+
+    [DllImport("sqlite3")]
+    static extern string sqlite3_column_name(nint stmt, int col);
+
+    [DllImport("sqlite3")]
+    static extern int sqlite3_column_type(nint stmt, int col);
+
+    [DllImport("sqlite3")]
+    static extern int sqlite3_column_bytes(nint stmt, int col);
+
+    [DllImport("sqlite3")]
+    static extern int sqlite3_column_int(nint stmt, int col);
+
+    [DllImport("sqlite3")]
+    static extern long sqlite3_column_int64(nint stmt, int col);
+
+    [DllImport("sqlite3")]
+    static extern double sqlite3_column_double(nint stmt, int col);
+
+    [DllImport("sqlite3", EntryPoint = "sqlite3_column_text")]
+    static extern nint sqlite3_column_text_ptr(nint stmt, int col);
+
+    public SqliteDataReader(SqliteConnection conn, string sql, nint stmt, bool cached) {
+        this.conn = conn;
+        this.sql = sql;
+        this.stmt = stmt;
+        this.cached = cached;
+        this.closed = false;
+        this.hasRow = false;
+        this.colMap = null;
+        this.colNames = null;
+        if (stmt != 0) {
+            this.fieldCount = sqlite3_column_count(stmt);
+        } else {
+            this.fieldCount = 0;
+        }
+    }
+
+    // 读取下一行；若存在行返回 true，到达末尾返回 false 并自动释放语句资源。
+    public bool Read() {
+        if (this.closed || this.stmt == 0) { return false; }
+        int step = sqlite3_step(this.stmt);
+        if (step == 100) {  // SQLITE_ROW = 100
+            this.hasRow = true;
+            return true;
+        }
+        this.hasRow = false;
+        this.Close();
+        if (step != 101) {  // SQLITE_DONE = 101
+            this.conn.Fail(step);
+        }
+        return false;
+    }
+
+    // 协程版异步读取下一行。
+    public async bool ReadAsync() {
+        if (this.closed || this.stmt == 0) { return false; }
+        int step = await sqlite3_step(this.stmt);
+        if (step == 100) {  // SQLITE_ROW = 100
+            this.hasRow = true;
+            return true;
+        }
+        this.hasRow = false;
+        this.Close();
+        if (step != 101) {  // SQLITE_DONE = 101
+            this.conn.Fail(step);
+        }
+        return false;
+    }
+
+    // 获取当前结果集列数。
+    public int GetFieldCount() {
+        return this.fieldCount;
+    }
+
+    // 获取指定列名。
+    public string GetName(int i) {
+        if (i < 0 || i >= this.fieldCount) {
+            throw new IndexOutOfRangeException("column index out of range");
+        }
+        if (this.colNames != null && i < this.colNames.Count) {
+            return this.colNames[i];
+        }
+        string n = sqlite3_column_name(this.stmt, i);
+        return SqliteConnection.CopyText(n);
+    }
+
+    // 根据列名获取列序号（0-based）；未找到返回 -1。
+    public int GetOrdinal(string name) {
+        if (name == null) { return -1; }
+        if (this.colMap == null) {
+            this.colMap = new Dict<string, int>();
+            int count = this.fieldCount;
+            for (int i = 0; i < count; i = i + 1) {
+                string colName = this.GetName(i);
+                if (!this.colMap.ContainsKey(colName)) {
+                    this.colMap.Add(colName, i);
+                }
+            }
+        }
+        int idx = 0;
+        if (this.colMap.TryGetValue(name, out idx)) {
+            return idx;
+        }
+        return -1;
+    }
+
+    // 获取指定列的数据类型种类代码（1=Int, 2=Float, 3=Text, 4=Blob, 5=Null）。
+    public int GetFieldType(int i) {
+        if (!this.hasRow || this.stmt == 0) {
+            throw new InvalidOperationException("no current row");
+        }
+        return sqlite3_column_type(this.stmt, i);
+    }
+
+    // 检查指定列是否为 SQL NULL。
+    public bool IsDBNull(int i) {
+        if (!this.hasRow || this.stmt == 0) {
+            throw new InvalidOperationException("no current row");
+        }
+        return sqlite3_column_type(this.stmt, i) == 5;  // SQLITE_NULL = 5
+    }
+
+    // 类型化直取 32 位整型（0 堆分配）。
+    public int GetInt32(int i) {
+        if (!this.hasRow || this.stmt == 0) {
+            throw new InvalidOperationException("no current row");
+        }
+        return sqlite3_column_int(this.stmt, i);
+    }
+
+    // 类型化直取 64 位长整型（0 堆分配）。
+    public long GetInt64(int i) {
+        if (!this.hasRow || this.stmt == 0) {
+            throw new InvalidOperationException("no current row");
+        }
+        return sqlite3_column_int64(this.stmt, i);
+    }
+
+    // 类型化直取双精度浮点数（0 堆分配）。
+    public double GetDouble(int i) {
+        if (!this.hasRow || this.stmt == 0) {
+            throw new InvalidOperationException("no current row");
+        }
+        return sqlite3_column_double(this.stmt, i);
+    }
+
+    // 获取布尔值（0 堆分配）。
+    public bool GetBoolean(int i) {
+        if (!this.hasRow || this.stmt == 0) {
+            throw new InvalidOperationException("no current row");
+        }
+        return sqlite3_column_int64(this.stmt, i) != 0L;
+    }
+
+    // 核心零分配切片访问：直接借用 sqlite3 原生缓冲区构造 16 字节 StringView。
+    // 0 字节堆分配，0 次内存复制，0 次 ARC 计数开销。
+    public StringView GetStringView(int i) {
+        if (!this.hasRow || this.stmt == 0) {
+            throw new InvalidOperationException("no current row");
+        }
+        if (sqlite3_column_type(this.stmt, i) == 5) {
+            return StringView.Empty();
+        }
+        nint ptr = sqlite3_column_text_ptr(this.stmt, i);
+        int len = sqlite3_column_bytes(this.stmt, i);
+        if (ptr == 0 || len <= 0) {
+            return StringView.Empty();
+        }
+        return new StringView(ptr, len);
+    }
+
+    // 获取指定列的托管字符串副本。
+    public string GetString(int i) {
+        if (!this.hasRow || this.stmt == 0) {
+            throw new InvalidOperationException("no current row");
+        }
+        if (sqlite3_column_type(this.stmt, i) == 5) {
+            return "";
+        }
+        nint ptr = sqlite3_column_text_ptr(this.stmt, i);
+        int len = sqlite3_column_bytes(this.stmt, i);
+        if (ptr == 0 || len <= 0) {
+            return "";
+        }
+        return NativeMemory.GetString(ptr, 0, len);
+    }
+
+    // 关闭读取器并归还语句。
+    public void Close() {
+        if (this.closed) { return; }
+        this.closed = true;
+        this.hasRow = false;
+        if (this.stmt != 0) {
+            nint s = this.stmt;
+            this.stmt = 0;
+            this.conn.ReleaseStmt(this.sql, s, this.cached);
+        }
+    }
+
+    // 释放资源（实现 IDisposable）。
+    public void Dispose() {
+        this.Close();
+    }
+}

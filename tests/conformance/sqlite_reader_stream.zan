@@ -1,0 +1,57 @@
+using System;
+using System.Data;
+using System.Data.Sqlite;
+using System.IO;
+
+class Program {
+    static async void Main() {
+        string path = "sqlite_reader_stream_test.tmp.db";
+        File.Delete(path);
+        SqliteConnection db = SqliteConnection.Open(path);
+        db.Execute("CREATE TABLE goods (id INTEGER PRIMARY KEY, title TEXT, price REAL, note TEXT)");
+
+        db.Execute("INSERT INTO goods (id, title, price, note) VALUES (?, ?, ?, ?)",
+            new DbParams().AddInt(1).Add("Book").AddDouble(12.5).Add("paperback"));
+        db.Execute("INSERT INTO goods (id, title, price, note) VALUES (?, ?, ?, ?)",
+            new DbParams().AddInt(2).Add("Pen").AddDouble(1.99).Add(null));
+        db.Execute("INSERT INTO goods (id, title, price, note) VALUES (?, ?, ?, ?)",
+            new DbParams().AddInt(3).Add("Notebook").AddDouble(4.5).Add("ruled"));
+
+        // 1. 同步流式读取验证
+        SqliteDataReader reader = db.ExecuteReader("SELECT id, title, price, note FROM goods ORDER BY id");
+        Console.WriteLine("field_count=" + reader.GetFieldCount());
+        Console.WriteLine("col_title=" + reader.GetName(1));
+        Console.WriteLine("col_price_idx=" + reader.GetOrdinal("price"));
+
+        int totalRead = 0;
+        while (reader.Read()) {
+            totalRead = totalRead + 1;
+            int id = reader.GetInt32(0);
+            StringView titleView = reader.GetStringView(1);
+            double price = reader.GetDouble(2);
+            bool isNull = reader.IsDBNull(3);
+            string note = "";
+            if (!isNull) {
+                note = reader.GetString(3);
+            }
+            Console.WriteLine("id=" + id + ",title=" + titleView.ToString() + ",price=" + price + ",null=" + isNull + ",note=" + note);
+        }
+        reader.Close();
+        Console.WriteLine("sync_total=" + totalRead);
+
+        // 2. 协程异步流式读取验证
+        SqliteDataReader asyncReader = await db.ExecuteReaderAsync("SELECT id, title FROM goods WHERE price < ? ORDER BY id",
+            new DbParams().AddDouble(10.0));
+        int asyncTotal = 0;
+        while (await asyncReader.ReadAsync()) {
+            asyncTotal = asyncTotal + 1;
+            Console.WriteLine("async_id=" + asyncReader.GetInt32(0) + ",async_title=" + asyncReader.GetString(1));
+        }
+        asyncReader.Close();
+        Console.WriteLine("async_total=" + asyncTotal);
+
+        db.Close();
+        File.Delete(path);
+        Console.WriteLine("STREAM_READER_OK");
+    }
+}
