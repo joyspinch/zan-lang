@@ -4192,43 +4192,28 @@ void zan_co_ready(void *frame, zan_co_step_t step) {
  * 的帧延迟归还：守卫位在被覆盖之前，第二次释放稳定读到 DEAD 并返回。
  * 封顶 ZAN_FRAME_QUAR_MAX 帧，超限按 FIFO 真放前一半——检疫窗口过后
  * 的陈旧双释放本就超出指针身份能判定的范围（A380 的结论）。 */
-/* 帧释放可能早于 zan_co_sched_init（同步完成的 async 调用在 main 里
- * 就释放帧）——锁必须静态初始化，不能依赖调度器的初始化时序。 */
-#if defined(_WIN32)
-static SRWLOCK g_frame_quar_lock = SRWLOCK_INIT;
-#define ZAN_QUAR_LOCK()   AcquireSRWLockExclusive(&g_frame_quar_lock)
-#define ZAN_QUAR_UNLOCK() ReleaseSRWLockExclusive(&g_frame_quar_lock)
-#else
-static pthread_mutex_t g_frame_quar_lock = PTHREAD_MUTEX_INITIALIZER;
-#define ZAN_QUAR_LOCK()   pthread_mutex_lock(&g_frame_quar_lock)
-#define ZAN_QUAR_UNLOCK() pthread_mutex_unlock(&g_frame_quar_lock)
-#endif
-static void **g_frame_quar = NULL;
-static size_t g_frame_quar_n = 0, g_frame_quar_cap = 0;
-#define ZAN_FRAME_QUAR_MAX 1024
+/* 线程本地检疫区（Per-Thread TLS Quarantine）：
+ * 彻底消除多线程并发下释放协程帧时的全局排他锁争用（Lock Contention）。
+ * 每个工作线程独立维护 64 帧容量的无锁环形检疫窗口；满后平滑真释放最老的一半，
+ * 为幂等守卫提供完全充足的 DEAD 状态检疫时间窗口，零动态分配、零跨核锁竞争。 */
+#define ZAN_TLS_FRAME_QUAR_CAP 64
+static _Thread_local void  *t_frame_quar[ZAN_TLS_FRAME_QUAR_CAP];
+static _Thread_local size_t t_frame_quar_head = 0;
+static _Thread_local size_t t_frame_quar_len = 0;
 
 static void co_frame_quarantine_add(void *frame) {
-    ZAN_QUAR_LOCK();
-    if (g_frame_quar_n == g_frame_quar_cap) {
-        size_t ncap = g_frame_quar_cap ? g_frame_quar_cap * 2 : 64;
-        void **ng = (void **)realloc(g_frame_quar, ncap * sizeof(void *));
-        if (!ng) {
-            ZAN_QUAR_UNLOCK();
-            free(frame);
-            return;
+    if (t_frame_quar_len == ZAN_TLS_FRAME_QUAR_CAP) {
+        size_t half = ZAN_TLS_FRAME_QUAR_CAP / 2;
+        for (size_t i = 0; i < half; i++) {
+            void *old_frame = t_frame_quar[(t_frame_quar_head + i) % ZAN_TLS_FRAME_QUAR_CAP];
+            free(old_frame);
         }
-        g_frame_quar = ng;
-        g_frame_quar_cap = ncap;
+        t_frame_quar_head = (t_frame_quar_head + half) % ZAN_TLS_FRAME_QUAR_CAP;
+        t_frame_quar_len -= half;
     }
-    g_frame_quar[g_frame_quar_n++] = frame;
-    if (g_frame_quar_n >= ZAN_FRAME_QUAR_MAX) {
-        size_t half = g_frame_quar_n / 2;
-        for (size_t i = 0; i < half; i++) free(g_frame_quar[i]);
-        memmove(g_frame_quar, g_frame_quar + half,
-                (g_frame_quar_n - half) * sizeof(void *));
-        g_frame_quar_n -= half;
-    }
-    ZAN_QUAR_UNLOCK();
+    size_t tail = (t_frame_quar_head + t_frame_quar_len) % ZAN_TLS_FRAME_QUAR_CAP;
+    t_frame_quar[tail] = frame;
+    t_frame_quar_len++;
 }
 
 void __zan_co_frame_free(void *frame) {
