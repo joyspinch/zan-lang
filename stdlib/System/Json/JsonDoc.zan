@@ -1032,6 +1032,59 @@ public class JsonDoc {
         return -1;
     }
 
+    // 零分配子串键寻址：直接在外部路径字符串的 [keyOff, keyOff + keyLen) 范围内进行比对，
+    // 完全免除 Substring 堆内存分配与垃圾回收开销。
+    public int GetDirect(int at, string path, int keyOff, int keyLen) {
+        if (at < 0 || at >= this.slotCount || path == null || keyLen <= 0 || keyOff < 0 || keyOff + keyLen > path.Length) {
+            return -1;
+        }
+        long oa = slots[at].a;
+        if ((int)(oa & 255) != 5) { return -1; }
+        int p = (int)(oa >> 8);
+        byte[] buf = this.buf;
+        while (p >= 0) {
+            JsonPair pair = pairs[p];
+            if (pair.keyLen == keyLen) {
+                int ks = pair.keyStart;
+                if (ks >= 0) {
+                    if (keyLen == 2) {
+                        if ((buf[ks] & 255) == (path[keyOff] & 255) &&
+                            (buf[ks + 1] & 255) == (path[keyOff + 1] & 255)) {
+                            return pair.valueSlot;
+                        }
+                    } else if (keyLen == 4) {
+                        if ((buf[ks] & 255) == (path[keyOff] & 255) &&
+                            (buf[ks + 1] & 255) == (path[keyOff + 1] & 255) &&
+                            (buf[ks + 2] & 255) == (path[keyOff + 2] & 255) &&
+                            (buf[ks + 3] & 255) == (path[keyOff + 3] & 255)) {
+                            return pair.valueSlot;
+                        }
+                    } else if (keyLen == 5) {
+                        if ((buf[ks] & 255) == (path[keyOff] & 255) &&
+                            (buf[ks + 1] & 255) == (path[keyOff + 1] & 255) &&
+                            (buf[ks + 2] & 255) == (path[keyOff + 2] & 255) &&
+                            (buf[ks + 3] & 255) == (path[keyOff + 3] & 255) &&
+                            (buf[ks + 4] & 255) == (path[keyOff + 4] & 255)) {
+                            return pair.valueSlot;
+                        }
+                    } else {
+                        int m = 0;
+                        int ok = 1;
+                        while (m < keyLen) {
+                            if ((buf[ks + m] & 255) != (path[keyOff + m] & 255)) { ok = 0; break; }
+                            m = m + 1;
+                        }
+                        if (ok != 0) { return pair.valueSlot; }
+                    }
+                } else if (escPool[pair.keyLen] == path.Substring(keyOff, keyLen)) {
+                    return pair.valueSlot;
+                }
+            }
+            p = pair.nextPair;
+        }
+        return -1;
+    }
+
     public int Get(string key) { return this.Get(this.root, key); }
     public bool Has(string key) { return this.Has(this.root, key); }
     public bool Has(int at, string key) { return this.Get(at, key) >= 0; }
@@ -1231,7 +1284,7 @@ public class JsonDoc {
     }
 
     // 深度路径寻址：按点号与括号切分（如 "user.profile.age"、"choices[0].message.content" 或 "data.0.id"）。
-    // 在 Tape 槽位上无临时对象快速推进。找不到返回 -1。
+    // 全程在 Tape 槽位上以索引切片推进，0 临时字符串分配。找不到返回 -1。
     public int Path(int at, string path) {
         if (at < 0 || path == null || path.Length == 0) { return at; }
         int cur = at;
@@ -1240,47 +1293,48 @@ public class JsonDoc {
         while (i < n && cur >= 0) {
             int dot = i;
             while (dot < n && (path[dot] & 255) != 46) { dot = dot + 1; }
-            string seg = path.Substring(i, dot - i);
+            int segLen = dot - i;
+            if (segLen > 0) {
+                cur = this.ResolveSegDirect(cur, path, i, segLen);
+            }
             i = dot + 1;
-            if (seg.Length == 0) { continue; }
-            cur = this.ResolveSeg(cur, seg);
         }
         return cur;
     }
 
-    private int ResolveSeg(int at, string seg) {
-        if (at < 0 || seg == null || seg.Length == 0) { return at; }
+    private int ResolveSegDirect(int at, string path, int segOff, int segLen) {
+        if (at < 0 || segLen <= 0) { return at; }
         int cur = at;
-        int slen = seg.Length;
         int p = 0;
-        while (p < slen && cur >= 0) {
+        while (p < segLen && cur >= 0) {
             int bopen = p;
-            while (bopen < slen && (seg[bopen] & 255) != 91) { bopen = bopen + 1; }
-            if (bopen > p) {
-                string key = seg.Substring(p, bopen - p);
+            while (bopen < segLen && (path[segOff + bopen] & 255) != 91) { bopen = bopen + 1; }
+            int keyLen = bopen - p;
+            if (keyLen > 0) {
                 int k = (int)(slots[cur].a & 255);
                 if (k == 4) {
                     int idx = 0;
                     bool isNum = true;
-                    for (int j = 0; j < key.Length; j = j + 1) {
-                        int c = (key[j] & 255) - 48;
+                    for (int j = 0; j < keyLen; j = j + 1) {
+                        int c = (path[segOff + p + j] & 255) - 48;
                         if (c < 0 || c > 9) { isNum = false; break; }
                         idx = idx * 10 + c;
                     }
                     cur = isNum ? this.At(cur, idx) : -1;
                 } else {
-                    cur = this.Get(cur, key);
+                    cur = this.GetDirect(cur, path, segOff + p, keyLen);
                 }
                 if (cur < 0) { return -1; }
             }
-            if (bopen < slen && (seg[bopen] & 255) == 91) {
+            if (bopen < segLen && (path[segOff + bopen] & 255) == 91) {
                 int bclose = bopen + 1;
-                while (bclose < slen && (seg[bclose] & 255) != 93) { bclose = bclose + 1; }
-                if (bclose > bopen + 1) {
+                while (bclose < segLen && (path[segOff + bclose] & 255) != 93) { bclose = bclose + 1; }
+                int blen = bclose - (bopen + 1);
+                if (blen > 0) {
                     int idx = 0;
                     bool isNum = true;
-                    for (int j = bopen + 1; j < bclose; j = j + 1) {
-                        int c = (seg[j] & 255) - 48;
+                    for (int j = 0; j < blen; j = j + 1) {
+                        int c = (path[segOff + bopen + 1 + j] & 255) - 48;
                         if (c < 0 || c > 9) { isNum = false; break; }
                         idx = idx * 10 + c;
                     }
@@ -1289,7 +1343,6 @@ public class JsonDoc {
                 }
                 p = bclose + 1;
             } else {
-                p = bopen;
                 break;
             }
         }
