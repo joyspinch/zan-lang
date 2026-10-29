@@ -17,6 +17,7 @@ namespace Gui;
 // 架构升级：
 // - 突破单一 JsonValue 限制，原生支持 POCO 强类型实体对象（Class/Entity）直接挂载；
 // - 利用 Zan 内建原生反射（HasField / GetField* / SetField* / 属性 Getter/Setter）实现零 JSON 开销的强类型双向绑定；
+// - 原生支持 Dictionary 字典（Dict<string, string>、Dict<string, double> 等）直接挂载与双向写回，免除 JSON 树转换开销；
 // - 原生支持 JsonDoc 零拷贝平铺 Tape 结构，只读列表/复杂界面零节点堆分配极速渲染；
 // - 100% 向后兼容既有的 JsonValue 体系。
 public class ModelBinder {
@@ -307,6 +308,26 @@ public class ModelBinder {
         return "";
     }
 
+    // 解析嵌套对象路径（如 "user.addr.city"），返回最内层承载对象与叶子字段名。
+    static object ResolveFieldScope(object scope, string path, out string leafField) {
+        leafField = path;
+        if (scope == null || path == "") { return null; }
+        int dot = path.IndexOf(".");
+        if (dot < 0) { return scope; }
+        object cur = scope;
+        int start = 0;
+        while (dot >= 0) {
+            string segment = path.Substring(start, dot - start);
+            if (!cur.HasField(segment)) { return null; }
+            cur = cur.GetFieldObject(segment);
+            if (cur == null) { return null; }
+            start = dot + 1;
+            dot = path.IndexOf(".", start);
+        }
+        leafField = path.Substring(start);
+        return cur;
+    }
+
     // 从任意多态模型（JsonValue、JsonDocCursor、JsonDoc 或强类型 POCO 实体）解析字符串
     public bool TryResolveString(Control c, string path, out string result) {
         result = "";
@@ -353,14 +374,33 @@ public class ModelBinder {
             return false;
         }
 
-        // POCO 强类型实体反射
-        if (scope.HasField(actualPath)) {
-            result = scope.GetFieldString(actualPath);
+        // 字典模型高性能直读（零 JSON 堆分配）
+        if (scope is Dictionary<string, string>) {
+            Dictionary<string, string> dict = (Dictionary<string, string>)scope;
+            if (dict.ContainsKey(actualPath)) {
+                result = dict[actualPath];
+                return true;
+            }
+            if (scope != this.model && this.model != null && this.model is Dictionary<string, string>) {
+                Dictionary<string, string> mdict = (Dictionary<string, string>)this.model;
+                if (mdict.ContainsKey(path)) {
+                    result = mdict[path];
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        // POCO 强类型实体反射（支持点号级联导航如 user.addr.city）
+        string leaf = "";
+        object target = ModelBinder.ResolveFieldScope(scope, actualPath, out leaf);
+        if (target != null && target.HasField(leaf)) {
+            result = target.GetFieldString(leaf);
             if (result == "") {
-                double d = scope.GetFieldDouble(actualPath);
+                double d = target.GetFieldDouble(leaf);
                 if (d != 0.0) {
                     result = Convert.ToString(d);
-                } else if (scope.GetFieldBool(actualPath)) {
+                } else if (target.GetFieldBool(leaf)) {
                     result = "true";
                 }
             }
@@ -368,8 +408,10 @@ public class ModelBinder {
         }
 
         if (scope != this.model && this.model != null) {
-            if (this.model.HasField(path)) {
-                result = this.model.GetFieldString(path);
+            string mleaf = "";
+            object mtarget = ModelBinder.ResolveFieldScope(this.model, path, out mleaf);
+            if (mtarget != null && mtarget.HasField(mleaf)) {
+                result = mtarget.GetFieldString(mleaf);
                 return true;
             }
         }
@@ -422,9 +464,55 @@ public class ModelBinder {
             return false;
         }
 
-        if (scope.HasField(actualPath)) {
-            result = scope.GetFieldDouble(actualPath);
+        // 字典模型高性能数值直读
+        if (scope is Dictionary<string, double>) {
+            Dictionary<string, double> ddict = (Dictionary<string, double>)scope;
+            if (ddict.ContainsKey(actualPath)) {
+                result = ddict[actualPath];
+                return true;
+            }
+            if (scope != this.model && this.model != null && this.model is Dictionary<string, double>) {
+                Dictionary<string, double> mddict = (Dictionary<string, double>)this.model;
+                if (mddict.ContainsKey(path)) {
+                    result = mddict[path];
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        if (scope is Dictionary<string, string>) {
+            Dictionary<string, string> sdict = (Dictionary<string, string>)scope;
+            if (sdict.ContainsKey(actualPath)) {
+                string sv = sdict[actualPath];
+                result = sv != "" ? sv.ToDouble() : 0.0;
+                return true;
+            }
+            if (scope != this.model && this.model != null && this.model is Dictionary<string, string>) {
+                Dictionary<string, string> msdict = (Dictionary<string, string>)this.model;
+                if (msdict.ContainsKey(path)) {
+                    string msv = msdict[path];
+                    result = msv != "" ? msv.ToDouble() : 0.0;
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        string leaf = "";
+        object target = ModelBinder.ResolveFieldScope(scope, actualPath, out leaf);
+        if (target != null && target.HasField(leaf)) {
+            result = target.GetFieldDouble(leaf);
             return true;
+        }
+
+        if (scope != this.model && this.model != null) {
+            string mleaf = "";
+            object mtarget = ModelBinder.ResolveFieldScope(this.model, path, out mleaf);
+            if (mtarget != null && mtarget.HasField(mleaf)) {
+                result = mtarget.GetFieldDouble(mleaf);
+                return true;
+            }
         }
         return false;
     }
@@ -460,6 +548,37 @@ public class ModelBinder {
             int slot = doc.Path(doc.root, actualPath);
             if (slot >= 0) {
                 return doc.BoolAt(slot, false) || (doc.IntAt(slot, 0) != 0) || (doc.StrAt(slot, "") != "" && doc.StrAt(slot, "") != "false");
+            }
+            return false;
+        }
+
+        // 字典真值直判（用于 data-if）
+        if (scope is Dictionary<string, bool>) {
+            Dictionary<string, bool> bdict = (Dictionary<string, bool>)scope;
+            if (bdict.ContainsKey(actualPath)) {
+                return bdict[actualPath];
+            }
+            if (scope != this.model && this.model != null && this.model is Dictionary<string, bool>) {
+                Dictionary<string, bool> mbdict = (Dictionary<string, bool>)this.model;
+                if (mbdict.ContainsKey(path)) {
+                    return mbdict[path];
+                }
+            }
+            return false;
+        }
+
+        if (scope is Dictionary<string, string>) {
+            Dictionary<string, string> sdict = (Dictionary<string, string>)scope;
+            if (sdict.ContainsKey(actualPath)) {
+                string s = sdict[actualPath];
+                return s != "" && s != "false" && s != "0";
+            }
+            if (scope != this.model && this.model != null && this.model is Dictionary<string, string>) {
+                Dictionary<string, string> msdict = (Dictionary<string, string>)this.model;
+                if (msdict.ContainsKey(path)) {
+                    string ms = msdict[path];
+                    return ms != "" && ms != "false" && ms != "0";
+                }
             }
             return false;
         }
@@ -574,16 +693,29 @@ public class ModelBinder {
                 }
             } else if (scope is JsonDocCursor || scope is JsonDoc) {
                 // JsonDoc 为只读零分配数据源，不参与回写
+            } else if (scope is Dictionary<string, string>) {
+                Dictionary<string, string> dict = (Dictionary<string, string>)scope;
+                dict[actualPath] = s;
+            } else if (scope is Dictionary<string, double>) {
+                Dictionary<string, double> dict = (Dictionary<string, double>)scope;
+                dict[actualPath] = s != "" ? s.ToDouble() : 0.0;
+            } else if (scope is Dictionary<string, bool>) {
+                Dictionary<string, bool> dict = (Dictionary<string, bool>)scope;
+                dict[actualPath] = (s == "true");
             } else {
-                // POCO 强类型实体双向写回
-                if (isNumCtrl) {
-                    double numVal = s != "" ? s.ToDouble() : 0.0;
-                    scope.SetFieldDouble(actualPath, numVal);
-                    scope.SetFieldInt(actualPath, (int)numVal);
-                } else if (isBoolCtrl) {
-                    scope.SetFieldBool(actualPath, s == "true");
-                } else {
-                    scope.SetFieldString(actualPath, s);
+                // POCO 强类型实体双向写回（支持嵌套字段）
+                string leaf = "";
+                object target = ModelBinder.ResolveFieldScope(scope, actualPath, out leaf);
+                if (target != null) {
+                    if (isNumCtrl) {
+                        double numVal = s != "" ? s.ToDouble() : 0.0;
+                        target.SetFieldDouble(leaf, numVal);
+                        target.SetFieldInt(leaf, (int)numVal);
+                    } else if (isBoolCtrl) {
+                        target.SetFieldBool(leaf, s == "true");
+                    } else {
+                        target.SetFieldString(leaf, s);
+                    }
                 }
             }
             this.RecordSnapshot(c, s);
@@ -604,15 +736,28 @@ public class ModelBinder {
                 } else {
                     jm.PathSet(c.bindPath, s);
                 }
+            } else if (this.model is Dictionary<string, string>) {
+                Dictionary<string, string> mdict = (Dictionary<string, string>)this.model;
+                mdict[c.bindPath] = s;
+            } else if (this.model is Dictionary<string, double>) {
+                Dictionary<string, double> mdict = (Dictionary<string, double>)this.model;
+                mdict[c.bindPath] = s != "" ? s.ToDouble() : 0.0;
+            } else if (this.model is Dictionary<string, bool>) {
+                Dictionary<string, bool> mdict = (Dictionary<string, bool>)this.model;
+                mdict[c.bindPath] = (s == "true");
             } else if (!(this.model is JsonDoc)) {
-                if (isNumCtrl) {
-                    double numVal = s != "" ? s.ToDouble() : 0.0;
-                    this.model.SetFieldDouble(c.bindPath, numVal);
-                    this.model.SetFieldInt(c.bindPath, (int)numVal);
-                } else if (isBoolCtrl) {
-                    this.model.SetFieldBool(c.bindPath, s == "true");
-                } else {
-                    this.model.SetFieldString(c.bindPath, s);
+                string mleaf = "";
+                object mtarget = ModelBinder.ResolveFieldScope(this.model, c.bindPath, out mleaf);
+                if (mtarget != null) {
+                    if (isNumCtrl) {
+                        double numVal = s != "" ? s.ToDouble() : 0.0;
+                        mtarget.SetFieldDouble(mleaf, numVal);
+                        mtarget.SetFieldInt(mleaf, (int)numVal);
+                    } else if (isBoolCtrl) {
+                        mtarget.SetFieldBool(mleaf, s == "true");
+                    } else {
+                        mtarget.SetFieldString(mleaf, s);
+                    }
                 }
             }
             this.RecordSnapshot(c, s);
@@ -698,6 +843,7 @@ public class ModelBinder {
             if (path == "" || t.children.Count == 0) { continue; }
             JsonValue arr = null;
             JsonDoc doc = null;
+            List<object> objList = null;
             int docArrSlot = -1;
             int n = 0;
 
@@ -711,14 +857,33 @@ public class ModelBinder {
                     if (docArrSlot >= 0 && doc.KindAt(docArrSlot) == 4) {
                         n = doc.Count(docArrSlot);
                     }
+                } else if (this.model is List<object>) {
+                    objList = (List<object>)this.model;
+                    n = objList.Count;
+                } else if (this.model is Dictionary<string, object>) {
+                    Dictionary<string, object> d = (Dictionary<string, object>)this.model;
+                    if (d.ContainsKey(path) && d[path] is List<object>) {
+                        objList = (List<object>)d[path];
+                        n = objList.Count;
+                    }
+                } else {
+                    string pleaf = "";
+                    object ptarget = ModelBinder.ResolveFieldScope(this.model, path, out pleaf);
+                    if (ptarget != null && ptarget.HasField(pleaf)) {
+                        object fo = ptarget.GetFieldObject(pleaf);
+                        if (fo != null && fo is List<object>) {
+                            objList = (List<object>)fo;
+                            n = objList.Count;
+                        }
+                    }
                 }
             }
 
             string keyAttr = t.CssAttr("data-key");
 
-            if (keyAttr != "" && (arr != null || (doc != null && docArrSlot >= 0))) {
+            if (keyAttr != "" && (arr != null || (doc != null && docArrSlot >= 0) || objList != null)) {
                 if (!this.dirty && this.tmplMetas[i].lastCount == n) { continue; }
-                this.EnsureExpandedKeyed(t, arr, doc, docArrSlot, n, keyAttr, this.tmplMetas[i]);
+                this.EnsureExpandedKeyed(t, arr, doc, docArrSlot, objList, n, keyAttr, this.tmplMetas[i]);
             } else {
                 if (this.tmplMetas[i].lastCount == n) { continue; }
                 this.RemoveRows(t);
@@ -733,6 +898,8 @@ public class ModelBinder {
                         item = arr.At(k);
                     } else if (doc != null && docArrSlot >= 0) {
                         item = new JsonDocCursor(doc, doc.At(docArrSlot, k));
+                    } else if (objList != null) {
+                        item = objList[k];
                     }
                     for (int j = 0; j < t.children.Count; j = j + 1) {
                         Control row = App.CloneTree(t.children[j]);
@@ -751,7 +918,7 @@ public class ModelBinder {
         }
     }
 
-    void EnsureExpandedKeyed(Control t, JsonValue arr, JsonDoc doc, int docArrSlot, int n, string keyAttr, ChildTemplateMeta meta) {
+    void EnsureExpandedKeyed(Control t, JsonValue arr, JsonDoc doc, int docArrSlot, List<object> objList, int n, string keyAttr, ChildTemplateMeta meta) {
         Control p = t.parent;
         if (p == null) { return; }
         meta.lastCount = n;
@@ -797,6 +964,30 @@ public class ModelBinder {
                         }
                     }
                 }
+            } else if (objList != null) {
+                object item = objList[k];
+                if (item != null) {
+                    if (item is Dictionary<string, string>) {
+                        Dictionary<string, string> d = (Dictionary<string, string>)item;
+                        if (d.ContainsKey(actualKey)) { keyVal = d[actualKey]; }
+                    } else if (item is Dictionary<string, object>) {
+                        Dictionary<string, object> d = (Dictionary<string, object>)item;
+                        if (d.ContainsKey(actualKey)) {
+                            object v = d[actualKey];
+                            if (v != null) { keyVal = Convert.ToString(v); }
+                        }
+                    } else {
+                        string leaf = "";
+                        object target = ModelBinder.ResolveFieldScope(item, actualKey, out leaf);
+                        if (target != null && target.HasField(leaf)) {
+                            keyVal = target.GetFieldString(leaf);
+                            if (keyVal == "") {
+                                double d = target.GetFieldDouble(leaf);
+                                if (d != 0.0) { keyVal = Convert.ToString(d); }
+                            }
+                        }
+                    }
+                }
             }
             if (keyVal == "") { keyVal = k.ToString(); }
             newKeys.Add(keyVal);
@@ -822,6 +1013,8 @@ public class ModelBinder {
                 item = arr.At(k);
             } else if (doc != null && docArrSlot >= 0) {
                 item = new JsonDocCursor(doc, doc.At(docArrSlot, k));
+            } else if (objList != null) {
+                item = objList[k];
             }
             string keyVal = newKeys[k];
 

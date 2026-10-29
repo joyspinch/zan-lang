@@ -1235,6 +1235,112 @@ static LLVMValueRef refl_get_str_fn(zan_irgen_t *g) {
     return fn;
 }
 
+static LLVMValueRef refl_get_obj_fn(zan_irgen_t *g) {
+    if (g->fn_refl_get_obj) return g->fn_refl_get_obj;
+    LLVMTypeRef i8 = LLVMInt8TypeInContext(g->ctx);
+    LLVMTypeRef i8ptr = LLVMPointerType(i8, 0);
+    LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
+    LLVMTypeRef fn_ty = LLVMFunctionType(i8ptr,
+        (LLVMTypeRef[]){ i8ptr, i8ptr, i8ptr }, 3, 0);
+    LLVMValueRef fn = LLVMAddFunction(g->mod, "__zan_refl_get_obj", fn_ty);
+    LLVMSetLinkage(fn, LLVMInternalLinkage);
+    g->fn_refl_get_obj = fn;
+    LLVMValueRef find = refl_find_fn(g);
+    LLVMValueRef null_obj = LLVMConstNull(i8ptr);
+
+    LLVMBasicBlockRef save = LLVMGetInsertBlock(g->builder);
+    LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(g->ctx, fn, "entry");
+    LLVMBasicBlockRef have  = LLVMAppendBasicBlockInContext(g->ctx, fn, "have");
+    LLVMBasicBlockRef load  = LLVMAppendBasicBlockInContext(g->ctx, fn, "load");
+    LLVMBasicBlockRef none  = LLVMAppendBasicBlockInContext(g->ctx, fn, "none");
+
+    LLVMValueRef ti = LLVMGetParam(fn, 0);
+    LLVMValueRef obj = LLVMGetParam(fn, 1);
+    LLVMValueRef name = LLVMGetParam(fn, 2);
+
+    LLVMBasicBlockRef prop = LLVMAppendBasicBlockInContext(g->ctx, fn, "prop");
+    LLVMBasicBlockRef notprop = LLVMAppendBasicBlockInContext(g->ctx, fn, "notprop");
+
+    LLVMPositionBuilderAtEnd(g->builder, entry);
+    LLVMValueRef pk = NULL;
+    LLVMValueRef pv = refl_call_pget(g, ti, obj, name, &pk);
+    LLVMValueRef is_prop_ref = LLVMBuildOr(g->builder,
+        LLVMBuildICmp(g->builder, LLVMIntEQ, pk,
+                      LLVMConstInt(i64, ZAN_REFL_FK_REF, 0), "refl.propref"),
+        LLVMBuildICmp(g->builder, LLVMIntEQ, pk,
+                      LLVMConstInt(i64, ZAN_REFL_FK_STRING, 0), "refl.propstr"),
+        "refl.propreforstr");
+    LLVMBuildCondBr(g->builder, is_prop_ref, prop, notprop);
+
+    LLVMTypeRef arc_ty = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx),
+                                          (LLVMTypeRef[]){ i8ptr }, 1, 0);
+
+    LLVMPositionBuilderAtEnd(g->builder, prop);
+    LLVMValueRef ppv = LLVMBuildIntToPtr(g->builder, pv, i8ptr, "refl.ppv");
+    LLVMBasicBlockRef prop_ret = LLVMAppendBasicBlockInContext(g->ctx, fn, "prop.ret");
+    LLVMBasicBlockRef prop_retain = LLVMAppendBasicBlockInContext(g->ctx, fn, "prop.retain");
+    LLVMBuildCondBr(g->builder, LLVMBuildIsNull(g->builder, ppv, "refl.pnull"),
+                    prop_ret, prop_retain);
+
+    LLVMPositionBuilderAtEnd(g->builder, prop_retain);
+    zan_call2(g->builder, arc_ty, g->rt_retain, &ppv, 1, "");
+    LLVMBuildBr(g->builder, prop_ret);
+
+    LLVMPositionBuilderAtEnd(g->builder, prop_ret);
+    LLVMBuildRet(g->builder, ppv);
+
+    LLVMPositionBuilderAtEnd(g->builder, notprop);
+    LLVMBuildCondBr(g->builder,
+        LLVMBuildIsNull(g->builder, obj, "refl.objnull"), none, have);
+
+    LLVMPositionBuilderAtEnd(g->builder, have);
+    LLVMValueRef idx = zan_call2(g->builder,
+        LLVMFunctionType(i64, (LLVMTypeRef[]){ i8ptr, i8ptr }, 2, 0),
+        find, (LLVMValueRef[]){ ti, name }, 2, "refl.idx");
+    LLVMBasicBlockRef chk = LLVMAppendBasicBlockInContext(g->ctx, fn, "chk");
+    LLVMBuildCondBr(g->builder,
+        LLVMBuildICmp(g->builder, LLVMIntSLT, idx, LLVMConstInt(i64, 0, 0), "refl.nf"),
+        none, chk);
+
+    LLVMPositionBuilderAtEnd(g->builder, chk);
+    LLVMValueRef fields = refl_hdr_ptr(g, ti, ZAN_REFL_FIELDS_OFF, "refl.fields");
+    LLVMValueRef byte_off = LLVMBuildMul(g->builder, idx,
+        LLVMConstInt(i64, ZAN_REFL_FIELD_SIZE, 0), "refl.fo");
+    LLVMValueRef fe = LLVMBuildGEP2(g->builder, i8, fields, &byte_off, 1, "refl.fe");
+    LLVMValueRef kind = refl_hdr_i64(g, fe, 16, "refl.kind");
+    LLVMValueRef foff = refl_hdr_i64(g, fe, 24, "refl.off");
+    LLVMValueRef is_ref = LLVMBuildOr(g->builder,
+        LLVMBuildICmp(g->builder, LLVMIntEQ, kind,
+                      LLVMConstInt(i64, ZAN_REFL_FK_REF, 0), "refl.isref"),
+        LLVMBuildICmp(g->builder, LLVMIntEQ, kind,
+                      LLVMConstInt(i64, ZAN_REFL_FK_STRING, 0), "refl.isstr"),
+        "refl.isref_or_str");
+    LLVMBuildCondBr(g->builder, is_ref, load, none);
+
+    LLVMPositionBuilderAtEnd(g->builder, load);
+    LLVMValueRef p = LLVMBuildGEP2(g->builder, i8, obj, &foff, 1, "refl.slot");
+    LLVMValueRef ov = LLVMBuildLoad2(g->builder, i8ptr,
+        LLVMBuildBitCast(g->builder, p, LLVMPointerType(i8ptr, 0), "refl.op"),
+        "refl.ov");
+    LLVMBasicBlockRef load_ret = LLVMAppendBasicBlockInContext(g->ctx, fn, "load.ret");
+    LLVMBasicBlockRef load_retain = LLVMAppendBasicBlockInContext(g->ctx, fn, "load.retain");
+    LLVMBuildCondBr(g->builder, LLVMBuildIsNull(g->builder, ov, "refl.onull"),
+                    load_ret, load_retain);
+
+    LLVMPositionBuilderAtEnd(g->builder, load_retain);
+    zan_call2(g->builder, arc_ty, g->rt_retain, &ov, 1, "");
+    LLVMBuildBr(g->builder, load_ret);
+
+    LLVMPositionBuilderAtEnd(g->builder, load_ret);
+    LLVMBuildRet(g->builder, ov);
+
+    LLVMPositionBuilderAtEnd(g->builder, none);
+    LLVMBuildRet(g->builder, null_obj);
+
+    if (save) LLVMPositionBuilderAtEnd(g->builder, save);
+    return fn;
+}
+
 static LLVMValueRef refl_fname_fn(zan_irgen_t *g) {
     if (g->fn_refl_fname) return g->fn_refl_fname;
     LLVMTypeRef i8 = LLVMInt8TypeInContext(g->ctx);
@@ -2440,6 +2546,11 @@ static bool refl_emit_instance_call_1(zan_irgen_t *g, zan_type_t *rt,
     if (code == ZAN_REFL_M_OSTRING) {
         *out = zan_call2(g->builder, LLVMFunctionType(i8ptr, three, 3, 0),
             refl_get_str_fn(g), (LLVMValueRef[]){ ti, obj, nm }, 3, "refl.str");
+        return true;
+    }
+    if (code == ZAN_REFL_M_OOBJECT) {
+        *out = zan_call2(g->builder, LLVMFunctionType(i8ptr, three, 3, 0),
+            refl_get_obj_fn(g), (LLVMValueRef[]){ ti, obj, nm }, 3, "refl.obj");
         return true;
     }
     LLVMValueRef v = zan_call2(g->builder, LLVMFunctionType(i64, three, 3, 0),

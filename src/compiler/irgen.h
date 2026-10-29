@@ -445,6 +445,7 @@ struct zan_irgen {
     LLVMValueRef fn_refl_get_i64;   /* i64 (i8* ti, i8* obj, i8* name) */
     LLVMValueRef fn_refl_get_f64;   /* double (i8* ti, i8* obj, i8* name) */
     LLVMValueRef fn_refl_get_str;   /* i8* (i8* ti, i8* obj, i8* name) */
+    LLVMValueRef fn_refl_get_obj;   /* i8* (i8* ti, i8* obj, i8* name) */
     LLVMValueRef fn_refl_fname;     /* i8* (i8* ti, i64 idx, i64 which) */
     LLVMValueRef fn_refl_obj_type;  /* i8* (i8* obj, i8* fallback) */
     LLVMTypeRef  refl_method_type;

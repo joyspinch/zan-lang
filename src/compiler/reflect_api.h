@@ -18,6 +18,7 @@
 #define ZAN_REFL_M_ODOUBLE    14   /* obj.GetFieldDouble(name)   -> double */
 #define ZAN_REFL_M_OSTRING    15   /* obj.GetFieldString(name)   -> string */
 #define ZAN_REFL_M_OBOOL      16   /* obj.GetFieldBool(name)     -> bool */
+#define ZAN_REFL_M_OOBJECT    17   /* obj.GetFieldObject(name)   -> object */
 
 #define ZAN_REFL_M_MCOUNT     20   /* TypeInfo.MethodCount            -> int */
 #define ZAN_REFL_M_MNAME      21   /* TypeInfo.GetMethodName(i)       -> string */
@@ -102,6 +103,7 @@ static inline bool zan_refl_instance_method(zan_istr_t n, int *out) {
         { "GetFieldDouble", 14, ZAN_REFL_M_ODOUBLE },
         { "GetFieldString", 14, ZAN_REFL_M_OSTRING },
         { "GetFieldBool",   12, ZAN_REFL_M_OBOOL },
+        { "GetFieldObject", 14, ZAN_REFL_M_OOBJECT },
         { "SetFieldInt",    11, ZAN_REFL_M_SETINT },
         { "SetFieldLong",   12, ZAN_REFL_M_SETLONG },
         { "SetFieldDouble", 14, ZAN_REFL_M_SETDOUBLE },
@@ -135,6 +137,7 @@ static inline bool zan_refl_member_takes_arg(int code) {
     case ZAN_REFL_M_ODOUBLE:
     case ZAN_REFL_M_OSTRING:
     case ZAN_REFL_M_OBOOL:
+    case ZAN_REFL_M_OOBJECT:
     case ZAN_REFL_M_MNAME:
     case ZAN_REFL_M_MRET:
     case ZAN_REFL_M_MPCOUNT:
@@ -227,6 +230,7 @@ static inline zan_type_t *zan_refl_result_type(zan_binder_t *b, int code) {
     case ZAN_REFL_M_GETTYPE:
     case ZAN_REFL_M_ELEMTYPE:
     case ZAN_REFL_M_TARG:    return b->type_typeinfo;
+    case ZAN_REFL_M_OOBJECT:
     case ZAN_REFL_M_CNEW:    return b->type_object;
     default:                 return b->type_long;
     }
