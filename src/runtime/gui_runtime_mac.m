@@ -1927,13 +1927,15 @@ EXPORT void zan_gui_webview_set_clip(i32 h, const char *spec) {
             CGFloat ly = (CGFloat)ry / scale - frame.origin.y;
             CGFloat rwPoints = (CGFloat)rw / scale;
             CGFloat rhPoints = (CGFloat)rh / scale;
-            BOOL flipped = [wv isFlipped] || [wv.layer isGeometryFlipped];
-            CGFloat layerY = flipped ? ly : (fh - ly - rhPoints);
+            /* In CoreAnimation CAShapeLayer, CGPath coordinates are always in
+             * native Quartz 2D space (origin (0,0) at bottom-left), regardless of
+             * view or layer flipped flags. Convert top-relative ly into Quartz space: */
+            CGFloat layerY = fh - ly - rhPoints;
             CGPathAddRect(path, NULL,
                           CGRectMake(lx, layerY, rwPoints, rhPoints));
             rects++;
-            if (lx <= 0 && layerY <= 0
-                && lx + rwPoints >= fw && layerY + rhPoints >= fh) {
+            if (lx <= 0 && ly <= 0
+                && lx + rwPoints >= fw && ly + rhPoints >= fh) {
                 whole = 1;
             }
         }
@@ -1948,9 +1950,6 @@ EXPORT void zan_gui_webview_set_clip(i32 h, const char *spec) {
         } else {
             CAShapeLayer *mask = [CAShapeLayer layer];
             mask.frame = wv.layer.bounds;
-            if ([wv isFlipped] || [wv.layer isGeometryFlipped]) {
-                mask.geometryFlipped = YES;
-            }
             mask.path = path;
             wv.layer.mask = mask;
         }
