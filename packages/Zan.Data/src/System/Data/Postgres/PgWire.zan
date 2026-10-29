@@ -1,5 +1,6 @@
 using System;
 using System.Data;
+using System.Interop;
 using System.Security.Cryptography;
 using System.Text;
 
@@ -45,7 +46,7 @@ public class PgWire {
     // PostgreSQL 文本协议查询与命令以 NUL 结尾。
     public static byte[] strToBytes(string s, int len) {
         byte[] b = new byte[len + 2];
-        for (int i = 0; i < len; i = i + 1) { b[i] = (byte)(s[i] & 255); }
+        if (len > 0) { NativeMemory.PutString((nint)b, 0, s, len); }
         b[len] = (byte)0;
         return b;
     }
@@ -53,7 +54,7 @@ public class PgWire {
     // 复制 4 字节切片（MD5 认证的盐）。
     public static byte[] slice4(byte[] b, int off) {
         byte[] r = new byte[5];
-        for (int i = 0; i < 4; i = i + 1) { r[i] = (byte)(b[off + i] & 255); }
+        NativeMemory.Copy((nint)r, (nint)b + off, 4);
         return r;
     }
 
@@ -337,9 +338,8 @@ public class PgWire {
         string inner = Hex.Encode(
             Md5.Hash(password + user, password.Length + user.Length), 16);
         byte[] mid = new byte[37];
-        int i = 0;
-        for (; i < 32; i = i + 1) { mid[i] = (byte)(inner[i] & 255); }
-        for (i = 0; i < 4; i = i + 1) { mid[32 + i] = (byte)(salt[i] & 255); }
+        NativeMemory.PutString((nint)mid, 0, inner, 32);
+        NativeMemory.Copy((nint)mid + 32, (nint)salt, 4);
         return "md5" + Hex.Encode(Md5.Hash(mid, 36), 16);
     }
 
@@ -376,16 +376,15 @@ public class PgWire {
         if (iters < 1) { iters = 1; }
         byte[] pw = PgWire.strToBytes(password, password.Length);
         byte[] block = new byte[saltLen + 5];
-        int i = 0;
-        for (; i < saltLen; i = i + 1) { block[i] = (byte)(salt[i] & 255); }
+        if (saltLen > 0) { NativeMemory.Copy((nint)block, (nint)salt, saltLen); }
         block[saltLen + 3] = 1;
         byte[] u = Hmac.Sha256(pw, pw.Length, block, saltLen + 4);
         byte[] acc = new byte[33];
-        for (i = 0; i < 32; i = i + 1) { acc[i] = (byte)(u[i] & 255); }
+        NativeMemory.Copy((nint)acc, (nint)u, 32);
         int j = 1;
         while (j < iters) {
             u = Hmac.Sha256(pw, pw.Length, u, 32);
-            for (i = 0; i < 32; i = i + 1) { acc[i] = (byte)((acc[i] ^ u[i]) & 255); }
+            for (int i = 0; i < 32; i = i + 1) { acc[i] = (byte)((acc[i] ^ u[i]) & 255); }
             j = j + 1;
         }
         return acc;
