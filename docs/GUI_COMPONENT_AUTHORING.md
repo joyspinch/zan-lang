@@ -162,10 +162,72 @@ public class MyWidget : Control {
 
 ---
 
-## 4. 互嵌与调用
+## 4. Visual Tree 路由分发与事件管线
+
+全库控件交互分发遵循**现代保留模式 Visual Tree 标准拓扑**：
+
+```
+           [Window / Form]
+                 │ (1. Tunneling / Preview ↓)
+            [RootControl]
+             ┌───┴───┐
+         [Panel]   [Card]
+           │         │ (2. HitTest 确定叶子节点)
+        [Button]   [Input]
+                 │ (3. Bubbling ↑)
+           [Window / Form]
+```
+
+### 1) 命中测试（Hit Testing）
+- 容器与基础控件必须通过 `Control.HitTest(x, y)` 进行拓扑感知定位；
+- 容器沿子节点列表**逆 Z-order（后添加者优先）**递归探测，精准命中最高可见叶子节点；
+- 隐藏（`!Visible`）、折叠或不可用节点自动略过。
+
+### 2) 双向路由（Tunneling & Bubbling）
+- **隧道阶段（Preview/Tunneling）**：事件生成后自 Root 节点向下传递至目标叶子控件，供上层全局拦截器监听（`OnPreviewRoutedEvent`）；
+- **冒泡阶段（Bubbling）**：事件到达叶子节点后沿父链向上传播（`OnRoutedEvent`）；
+- **中断机制**：任何节点处理后可调用 `e.Handle()`，冒泡立即终止，防止上层容器或下层滚动视口误触。
+
+### 3) 全局指针捕获（Pointer Capture）
+- 拖拽手势（分割条、滑块、表格列宽/行高调整、弹层外部点击判定）禁止裸算鼠标位移；
+- 按下时调用 `app.CapturePointer(this)` 锁定交互焦点；
+- 移动与释放期间所有指针事件直达捕获控件；手势结束调用 `app.ReleasePointerCapture()`。
+
+---
+
+## 5. 控件 ID 与作用域管理（彻底杜绝魔数号段）
+
+全库**严禁**使用硬编码 ID 段（如历史上的 `820000`、`880000`、`900000`、`940000` 等魔数，跨组件、跨帧、跨弹层必冲突踩踏）。
+
+### 统一使用作用域 Hash 栈（Scoped ID Stack）：
+
+```zan
+// 1) 命名容器/子模块作用域
+WidgetId.Push("sub_module_name");
+int localId = WidgetId.Next();
+WidgetId.Pop();
+
+// 2) 循环列表/网格单元项作用域
+for (int i = 0; i < count; i = i + 1) {
+    WidgetId.Push(i);
+    // 内部分配的所有局部 ID 自动通过 (ParentHash ^ FNV(i)) 派生，天然隔离
+    WidgetId.Pop();
+}
+
+// 3) 即时模式/焦点管理作用域
+focus.PushId("dialog_header");
+int btnId = focus.AllocId();
+focus.PopId();
+```
+
+- **保证连续性**：在作用域内，`AllocId()` 派生连续的局部线性序号，确保需要连续槽位的复合控件（Tabs/Ribbon/Wizard）安全稳定；
+- **无限嵌套隔离**：同屏渲染多个相同组件、主从嵌套网格或多层弹层时，各自处于不同哈希作用域，绝对零碰撞。
+
+---
+
+## 6. 互嵌与调用
 
 ### 互嵌
-
 ```zan
 // 容器：Add 拿回子节点引用，With 追加并返回自身（可链式）
 Button save = panel.Add(new Button { Text = "保存" });
@@ -181,6 +243,9 @@ panel.With(a).With(b);
   收养前基类会判环并拒绝。
 - 复合控件（自己也是别人的子节点）不要在 `OnPaint` 里手摆子控件位置，
   走 `OnMeasure` + `Arrange` + 自己的 `OnPaint`，否则父容器的布局算不准。
+- **高阶复合与重型组件管线化**：对于复杂组件（如 DataTable、TreeGrid、Designer），严禁在单个文件内编写数千行巨石渲染代码；
+  必须按单一职责拆解为独立管线（如 `RenderCell`, `RenderHeader`, `RenderFrozen`, `RenderBody`, `RenderFooter`, `RenderInteraction`），
+  主渲染类仅作为流水线调度中枢。
 
 ### 调用（事件与绑定）
 
@@ -196,7 +261,7 @@ panel.With(a).With(b);
 
 ---
 
-## 5. 反面清单
+## 7. 反面清单
 
 | 别做 | 为什么 | 改成 |
 |------|--------|------|
@@ -206,6 +271,9 @@ panel.With(a).With(b);
 | 组件里写 `transition: 220ms` | 与全库动效档脱节 | `--anim-fast/medium/slow` |
 | 给不支持的控件加 `Size` 字段 | 设了不生效的假接口 | 不加；要加就补齐四档 CSS |
 | 自己造第二条绑定通道 | 与 `data` 语义打架 | 走 `Binding<T>` |
+| `WidgetId.SetSeq(900000)` 硬编码号段 | 跨实例、跨组件、弹层必冲突踩踏 | `WidgetId.Push(name/index)` 作用域栈 |
+| 裸坐标探测点击与事件穿透 | 忽略层叠顺序与容器裁剪，极难维护 | Visual Tree 路由分发与 `e.Handle()` |
+| 单文件 3000+ 行巨石渲染单体 | 关注点混杂、牵一发动全身 | 单职责管线模块拆解（如 DataTable 管线） |
 
 ---
 
