@@ -1,0 +1,148 @@
+using System;
+using System.Collections.Generic;
+using Gui;
+using Gui.Widget;
+
+// 自定义测试容器：记录捕获和冒泡历史
+class TestRoutingNode : Panel {
+    public string tag;
+    public int previewCount;
+    public int bubbleCount;
+    public bool interceptAtBubble;
+
+    public TestRoutingNode(string tag) {
+        this.tag = tag;
+        this.previewCount = 0;
+        this.bubbleCount = 0;
+        this.interceptAtBubble = false;
+    }
+
+    public override void OnPreviewRoutedEvent(RoutedEventArgs e) {
+        this.previewCount = this.previewCount + 1;
+    }
+
+    public override void OnRoutedEvent(RoutedEventArgs e) {
+        this.bubbleCount = this.bubbleCount + 1;
+        if (this.interceptAtBubble) {
+            e.Handle();
+        }
+    }
+}
+
+class GuiVisualTreeRoutingTest {
+    static int fails;
+
+    static void Check(string label, bool ok) {
+        if (ok) { return; }
+        fails = fails + 1;
+        Console.WriteLine("FAIL: " + label);
+    }
+
+    static void Main() {
+        Console.WriteLine("Running GuiVisualTreeRoutingTest...");
+
+        // ==========================================
+        // 1. 测试作用域 ID Hash 栈（消除魔数号段）
+        // ==========================================
+        WidgetId.Push("WindowA");
+        int idA1 = WidgetId.Next();
+        int idA2 = WidgetId.Next();
+        WidgetId.Pop();
+
+        WidgetId.Push("WindowB");
+        int idB1 = WidgetId.Next();
+        int idB2 = WidgetId.Next();
+        WidgetId.Pop();
+
+        Check("idA1 != idB1 across scopes", idA1 != idB1);
+        Check("idA2 != idB2 across scopes", idA2 != idB2);
+        Check("idA1 and idA2 are distinct", idA1 != idA2);
+
+        // 嵌套作用域测试
+        WidgetId.Push("Table");
+        WidgetId.Push(0); // 第 0 行
+        int row0Id = WidgetId.Next();
+        WidgetId.Pop();
+        WidgetId.Push(1); // 第 1 行
+        int row1Id = WidgetId.Next();
+        WidgetId.Pop();
+        WidgetId.Pop(); // 退出 Table
+        Check("Nested scope row0 != row1", row0Id != row1Id);
+
+        // ==========================================
+        // 2. 测试 Visual Tree 命中测试（HitTest）
+        // ==========================================
+        TestRoutingNode root = new TestRoutingNode("root");
+        root.bx = 0; root.by = 0; root.bw = 800; root.bh = 600;
+
+        TestRoutingNode child = new TestRoutingNode("child");
+        child.bx = 50; child.by = 50; child.bw = 200; child.bh = 200;
+        root.With(child);
+
+        TestRoutingNode leaf = new TestRoutingNode("leaf");
+        leaf.bx = 80; leaf.by = 80; leaf.bw = 50; leaf.bh = 50;
+        child.With(leaf);
+
+        // 命中深层叶子
+        Control hitLeaf = root.HitTest(90, 90);
+        Check("HitTest hits deepest leaf", hitLeaf == leaf);
+
+        // 命中中间容器
+        Control hitChild = root.HitTest(60, 60);
+        Check("HitTest hits middle child", hitChild == child);
+
+        // 命中根节点空白处
+        Control hitRoot = root.HitTest(10, 10);
+        Check("HitTest hits root container", hitRoot == root);
+
+        // 外部坐标未命中
+        Control hitOutside = root.HitTest(900, 900);
+        Check("HitTest misses outside rect", hitOutside == null);
+
+        // ==========================================
+        // 3. 测试标准路由事件管线（Tunneling & Bubbling）
+        // ==========================================
+        RoutedEventArgs evt1 = new RoutedEventArgs("Click", leaf, 90, 90);
+        Control.RouteEvent(leaf, evt1);
+
+        // 验证隧穿（Preview）与冒泡（Bubble）次数
+        Check("Leaf got preview", leaf.previewCount == 1);
+        Check("Child got preview", child.previewCount == 1);
+        Check("Root got preview", root.previewCount == 1);
+
+        Check("Leaf got bubble", leaf.bubbleCount == 1);
+        Check("Child got bubble", child.bubbleCount == 1);
+        Check("Root got bubble", root.bubbleCount == 1);
+
+        // ==========================================
+        // 4. 测试冒泡拦截（Handled = true）
+        // ==========================================
+        child.interceptAtBubble = true; // 中间节点拦截
+        RoutedEventArgs evt2 = new RoutedEventArgs("Click", leaf, 90, 90);
+        Control.RouteEvent(leaf, evt2);
+
+        Check("Leaf bubble 2", leaf.bubbleCount == 2);
+        Check("Child bubble 2 (intercepted)", child.bubbleCount == 2);
+        Check("Root bubble blocked by child", root.bubbleCount == 1); // root 依然只有 1 次！
+        Check("Event is marked handled", evt2.handled);
+
+        // ==========================================
+        // 5. 测试指针捕获（Pointer Capture）
+        // ==========================================
+        Form form = Form.CreateOffscreen("CaptureTest", 800, 600);
+        App app = form.GetApp();
+        Check("Initial captured pointer is null", app.GetCapturedPointer() == null);
+
+        app.CapturePointer(leaf);
+        Check("Pointer captured by leaf", app.GetCapturedPointer() == leaf);
+
+        app.ReleasePointerCapture();
+        Check("Pointer released", app.GetCapturedPointer() == null);
+
+        if (fails == 0) {
+            Console.WriteLine("ALL VISUAL TREE ROUTING TESTS PASSED.");
+        } else {
+            Console.WriteLine("FAILURES: " + fails);
+        }
+    }
+}

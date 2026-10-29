@@ -1,0 +1,89 @@
+using System;
+using Gui;
+using Gui.Backend;
+
+namespace Gui;
+
+// App.VisualTree.zan - 现代 Visual Tree 事件路由与指针捕获支持
+public partial class App {
+    // 当前视口绑定的 Visual Tree 根节点
+    public Control rootControl;
+
+    // 指针（鼠标/触摸）当前捕获的独占控件（如滑块拖拽、分栏拖拽、选区拖动）
+    Control capturedPointerControl;
+
+    // 捕获指针输入：后续所有的 PointerMove / PointerUp 将直接定向投递给该控件，
+    // 即使鼠标已移出控件边界或窗口边界。
+    public void CapturePointer(Control ctl) {
+        this.capturedPointerControl = ctl;
+    }
+
+    // 释放指针捕获
+    public void ReleasePointerCapture() {
+        this.capturedPointerControl = null;
+    }
+
+    // 获取当前捕获指针的控件（未捕获时为 null）
+    public Control GetCapturedPointer() {
+        return this.capturedPointerControl;
+    }
+
+    // 设置当前视口/窗口的 Visual Tree 根控件
+    public void SetRootControl(Control root) {
+        this.rootControl = root;
+    }
+
+    // 将底层 OS 输入事件尝试分发给 Visual Tree 路由管线。
+    // 返回 true 表示 Visual Tree 已完全消费（e.handled == true），无需继续走老式 HitTester 扁平查表。
+    public bool DispatchVisualTree(int eventKind, int x, int y, int keyCode, int delta) {
+        if (this.rootControl == null && this.capturedPointerControl == null) {
+            return false;
+        }
+
+        Control target = this.capturedPointerControl;
+        if (target == null && this.rootControl != null) {
+            target = this.rootControl.HitTest(x, y);
+        }
+
+        if (target == null) {
+            return false;
+        }
+
+        string evtName = "";
+        if (eventKind == 1) { evtName = "MouseMove"; }
+        else if (eventKind == 2) { evtName = "MouseDown"; }
+        else if (eventKind == 3) { evtName = "MouseUp"; }
+        else if (eventKind == 4) { evtName = "KeyDown"; }
+        else if (eventKind == 5) { evtName = "KeyUp"; }
+        else if (eventKind == 13) { evtName = "Wheel"; }
+
+        if (evtName == "") {
+            return false;
+        }
+
+        RoutedEventArgs e = new RoutedEventArgs(evtName, target, x, y);
+        e.keyCode = keyCode;
+        e.delta = delta;
+
+        // 执行完整的隧穿与冒泡路由
+        Control.RouteEvent(target, e);
+
+        // 如果是鼠标按下，将焦点同步转移给命中目标（双轨兼顾）
+        if (eventKind == 2 && target != null) {
+            if (this.focus != null) {
+                this.focus.SetFocused(target.WidgetId());
+            }
+        }
+
+        // 如果是点击释放且在同一个目标上释放，合成标准 Click 路由事件
+        if (eventKind == 3 && target != null && !e.handled) {
+            RoutedEventArgs clickEvt = new RoutedEventArgs("Click", target, x, y);
+            Control.RouteEvent(target, clickEvt);
+            if (clickEvt.handled) {
+                e.Handle();
+            }
+        }
+
+        return e.handled;
+    }
+}

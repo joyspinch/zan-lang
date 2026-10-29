@@ -1,57 +1,116 @@
 using System;
+using System.Collections.Generic;
 
 namespace Gui;
 
-// （弹出窗口不再导致其后所有 id 重编号）。id 从高位开始，
-// 这样它们永远不会与旧式逐帧位置 id 冲突，
-// 后者由 <see cref="FocusManager.AllocId"/> 分配。
+// 统一控件标识与作用域管理系统：
+// 支持全局稳定计数器与分层作用域 Hash 栈（Push/Pop）。
+// 容器与复合控件进入子域时调用 Push(name/index)，离开时 Pop()，
+// 局部 ID 自动通过父级 Hash + 局部槽位派生，彻底消灭硬编码号段魔数。
 public class WidgetId {
     static int seq;
     static int frameBase;
 
-    // 新的、进程唯一的控件 id（在调用方生命周期内稳定）。
-    static int Next() {
+    // 作用域 Hash 栈
+    static List<int> idStack;
+    // 对应各层作用域的局部序列号栈
+    static List<int> seqStack;
+    // 当前作用域内的局部序列号
+    static int localSeq;
+
+    static void EnsureStack() {
+        if (idStack == null) { idStack = new List<int>(); }
+        if (seqStack == null) { seqStack = new List<int>(); }
+    }
+
+    // 获取当前作用域的基准哈希种子
+    public static int CurrentScope() {
+        WidgetId.EnsureStack();
+        if (idStack.Count > 0) {
+            return idStack[idStack.Count - 1];
+        }
+        return 0x811C9DC5;
+    }
+
+    // 压入字符串命名的子作用域（如 "table_row", "dialog_header"）
+    public static void Push(string name) {
+        WidgetId.EnsureStack();
+        int parentHash = WidgetId.CurrentScope();
+        int nextHash = IdHash.HashString(name, parentHash);
+        idStack.Add(nextHash);
+        seqStack.Add(localSeq);
+        localSeq = 0;
+    }
+
+    // 压入整数命名的子作用域（如行索引 rowIndex, 单元格列号 colIndex）
+    public static void Push(int index) {
+        WidgetId.EnsureStack();
+        int parentHash = WidgetId.CurrentScope();
+        int nextHash = IdHash.HashInt(index, parentHash);
+        idStack.Add(nextHash);
+        seqStack.Add(localSeq);
+        localSeq = 0;
+    }
+
+    // 弹出当前作用域并恢复上层计数器
+    public static void Pop() {
+        WidgetId.EnsureStack();
+        if (idStack.Count > 0) {
+            idStack.RemoveAt(idStack.Count - 1);
+        }
+        if (seqStack.Count > 0) {
+            localSeq = seqStack[seqStack.Count - 1];
+            seqStack.RemoveAt(seqStack.Count - 1);
+        } else {
+            localSeq = 0;
+        }
+    }
+
+    // 新的进程唯一或局部作用域唯一的控件 id。
+    public static int Next() {
+        WidgetId.EnsureStack();
+        if (idStack.Count > 0) {
+            // 在作用域栈内时，基于当前作用域 Hash + 局部序列派生正数 ID
+            int baseHash = idStack[idStack.Count - 1] & 0x3FFFFFFF;
+            int scopedId = 2000000 + baseHash + localSeq;
+            localSeq = localSeq + 1;
+            return scopedId;
+        }
         seq = seq + 1;
         return 1000000 + seq;
     }
 
-    // 将当前计数器记录为逐帧基线。即时模式
-    // 应用应在所有保留式控件 id 分配完成后调用一次，
-    // （chrome、常驻控件），这样 ResetFrame() 只会回退到此处，
-    // 绝不会重复发放已由保留式控件持有的 id。
-    static void Mark() {
+    // 将当前计数器记录为逐帧基线。
+    public static void Mark() {
         frameBase = seq;
     }
 
-    // 将 id 计数器回退到帧基线（参见 Mark）。纯
-    // 即时模式 UI（每帧重建控件）每帧调用一次，
-    // 使按相同顺序绘制的控件在帧间获得相同的 id——
-    // 否则不断递增的计数器会给每个
-    // 重建的控件分配新 id，悬停/按压/点击（均按 id 关联）将永远
-    // 匹配不到上一帧框架解析出的指针目标。
-    // 保留式控件应用不得调用此方法。
-    static void ResetFrame() {
+    // 将 id 计数器回退到帧基线。
+    public static void ResetFrame() {
         seq = frameBase;
+        if (idStack != null) { idStack.Clear(); }
+        if (seqStack != null) { seqStack.Clear(); }
+        localSeq = 0;
     }
 
-    // 当前原始计数器。与 SetSeq 配合使用，使次级即时模式
-    // 表面（例如渲染在同一共享计数器上的子对话框窗口）
-    // 可以固定自己的稳定逐帧基线，之后再恢复主
-    // 应用的计数器。
-    static int SeqValue() { return seq; }
+    // 当前原始计数器。
+    public static int SeqValue() { return seq; }
 
-    // 强制将计数器设为 `v`（参见 SeqValue）。子表面在渲染前设置一个固定的、
-    // 高位基线，使其控件每帧获得相同 id
-    // （悬停/按压/点击按 id 关联），且不与主应用冲突。
-    static void SetSeq(int v) { seq = v; }
+    // 强制将计数器设为 `v`（保留向后兼容老代码）。
+    public static void SetSeq(int v) { seq = v; }
 
-    // 预留 `n` 个连续的稳定 id 并返回第一个。需要注册
-    // 多个命中区域的控件（如 Rate 的每个星）可用它保证
-    // 子 id 在帧间连续且稳定。
-    static int Block(int n) {
-        int first = 1000000 + seq + 1;
+    // 预留 `n` 个连续的稳定 id 并返回第一个。
+    public static int Block(int n) {
+        WidgetId.EnsureStack();
+        if (idStack.Count > 0) {
+            int baseHash = idStack[idStack.Count - 1] & 0x3FFFFFFF;
+            int first = 2000000 + baseHash + localSeq;
+            localSeq = localSeq + n;
+            return first;
+        }
+        int f = 1000000 + seq + 1;
         seq = seq + n;
-        return first;
+        return f;
     }
 }
 

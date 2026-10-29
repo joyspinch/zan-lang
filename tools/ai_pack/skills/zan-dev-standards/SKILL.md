@@ -156,7 +156,7 @@ server-dev-standards；数据建模见 data-modeling；SQL 细则见 server-db-d
   ④ 文本转义、分词与模板解析统一采用分块游标切片（Window Chunking），无特殊字符时直通返回原始字符串（0 堆申请），含特殊字符时以区间切片追加，消灭逐字节碎片分配；字典键值查询优先使用 `vars.ContainsKey(key)` 与 `TryGetValue`，严禁遍历 `vars.Keys` 数组造成 $O(N)$ 性能降级；
   ⑤ GUI 与游戏高频渲染循环严禁闭包委托与多重 Span 重复构造：`YSortLayer` 等空间与深度排序结构采用紧凑索引直接访问（`GetSortedEntityId`）替代 `ForEachSorted` 委托闭包，消灭每帧闭包分配；`SpriteBatch.Add` 复用单一 `Span<float>` 实例完成 8 浮点装填；富文本与代码高亮词法探测（`CodeEditor.InSet/ContainsSub`、`Markdown` 行内解析、`ChatView.MdStrip`）全面直通原生 `IndexOf` 与分块游标区间切片；
   ⑥ 网络与通讯协议热路径（WebSocket、Redis RESP、HTTP 流）全面采用 AVX2/SSE2 向量化与 NativeMemory 零堆分配加速：WebSocket 数据帧 4 字节掩码在广播构造 64/128/256 位宽掩码向量后通过 `Vector256.Xor` / `Vector128.Xor` 单指令处理 32/16 字节，非对齐尾部按 4 字节整数步进异或；Redis RESP 文本行协议与 WebSocket HTTP 握手终止符（`\r\n` / `\r\n\r\n`）采用带界限限制的 `MemoryExtensions.IndexOf`（AVX2 `Equals` + `ExtractMostSignificantBits` + `TrailingZeroCount`）实现单周期 32 字节跳跃定位，杜绝逐字节标量比对与越界脏读；缓冲区扩容与搬移严禁使用 `for` 循环逐字节赋值，统一调用直接对接 libc `memmove`/`memcpy` 的 `NativeMemory.Copy` 与 `NativeMemory.PutString`。
-- **ZanWeb/Mvc 视图 CSP 纪律（`[security].csp` 开启后 `style-src 'self'` 拦内联）**：
+- **Zan.Web (Zan.Mvc) 视图 CSP 纪律（`[security].csp` 开启后 `style-src 'self'` 拦内联）**：
   `style=""` 属性、`<style>` 块、`onclick=` 内联 handler、JS 里 innerHTML 拼进的
   style 属性全会被拦；CSSOM 赋值（`el.style.width=`）不受限。视图写法：th/td 列宽用
   `width="N"` 表现属性；组合样式进 admin.css「视图去内联工具类」或语义类；模板条件
@@ -977,6 +977,17 @@ server-dev-standards；数据建模见 data-modeling；SQL 细则见 server-db-d
   两份实现不会各走各的。坑出处：帧剖析覆盖层工具的十个文件里只有面板文件碰 GUI。
 - **同一份行模型要有无 GUI 的等价呈现**：同一批行要能同时变成面板和纯文本，
   这样 CI / 日志里能逐字比对"这一帧到底报告了什么"，而不是只能靠人眼看截图。
+
+### GUI 事件与标识纪律：杜绝硬编码号段魔数，必须走 Visual Tree 路由与作用域 Hash 栈
+
+- **硬编码号段（如 820000、850000、900000、930000、940000 等）在即时模式与保留模式混合时是致命隐患**：
+  ① **同屏多实例必撞车**：两个文件选择器或两张 DataTable 同屏时 ID 完全重叠，点击事件乱飞；
+  ② **步长越界踩踏**：列表按步长分配时，行内控件稍多即踩入下一行号段；
+  ③ **组件假互嵌与脏单例**：单例适配器（如 SwitchComp）保留实例字段在多行/多表渲染时状态串扰。
+  **正解**：
+  - 保留模式控件走真实的 Visual Tree 命中测试（`HitTest`）与标准路由派发（`Control.RouteEvent` 隧穿与冒泡）；
+  - 即时模式与池化隔离走作用域 Hash 栈（`WidgetId.Push(name/index)` / `Pop()`），由父级 Hash + 局部序号派生 ID；
+  - 槽位状态必须与 `WidgetPoolSlot` 控件实例绑定，单例适配器严禁持有有状态字段。
 - **排序要确定**：调试工具的输出顺序不能飘——主键相同时按 id 升序兜底，降序只
   翻转主键。顺序一飘，同一份数据两次输出就不一样，diff 全是噪声。
 
@@ -2002,7 +2013,7 @@ server-dev-standards；数据建模见 data-modeling；SQL 细则见 server-db-d
   "菜单不响应点击"，真因是节拍不是逻辑。修法：每次 `UiDriver.Exec` 之后固定
   喂 4~5 帧再断言。坑出处：代码编辑器右键菜单的实机回归，菜单已开但宿主项点
   不中，排查半天才发现是驱动事件节拍。
-- **ZanWeb 模板实机核对坑清单**（ListPage/FormPage/视觉重绘验证起，每条都白折腾过一轮）：
+- **Zan.Web 模板实机核对坑清单**（ListPage/FormPage/视觉重绘验证起，每条都白折腾过一轮）：
   ① 静态资产挂在 `/static/*`（`StaticFiles.Mount(app, "/static", "wwwroot")`），
   curl `/js/x.js` 拿到的是 API 层 `{"code":"404"}` JSON——不是"服务了旧文件"，
   先核对 URL 再怀疑缓存；② 改 wwwroot 的 JS/CSS 必须同步升布局模板
