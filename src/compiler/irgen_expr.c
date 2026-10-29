@@ -752,7 +752,21 @@ static bool emit_native_memory_call(zan_irgen_t *g, zan_ast_node_t *expr,
         return true;
     }
 
-    /* AsI64 / AsF64: long 与 double 之间的零开销二进制重解释位转换 */
+    /* AsI32 / AsF32 / AsI64 / AsF64: 浮点与整数标量之间的零开销二进制重解释位转换 */
+    if (is_call_to(expr, "NativeMemory", "AsI32") &&
+        expr->call.args.count == 1) {
+        LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
+        LLVMValueRef v = emit_expr(g, expr->call.args.items[0], locals);
+        *out = LLVMBuildBitCast(g->builder, v, i32t, "nm.asi32");
+        return true;
+    }
+    if (is_call_to(expr, "NativeMemory", "AsF32") &&
+        expr->call.args.count == 1) {
+        LLVMTypeRef fltt = LLVMFloatTypeInContext(g->ctx);
+        LLVMValueRef v = coerce_int_to(g, emit_expr(g, expr->call.args.items[0], locals), i32t);
+        *out = LLVMBuildBitCast(g->builder, v, fltt, "nm.asf32");
+        return true;
+    }
     if (is_call_to(expr, "NativeMemory", "AsI64") &&
         expr->call.args.count == 1) {
         LLVMValueRef v = nm_arg(g, expr, 0, locals);

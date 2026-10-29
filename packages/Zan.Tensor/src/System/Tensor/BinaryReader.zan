@@ -1,13 +1,11 @@
 using System;
+using System.Buffers.Binary;
 using System.Text;
 
 namespace System.Tensor;
 
 // 小端二进制游标：权重文件（GGUF / safetensors）都是小端。
-//
-// 为什么自己写：stdlib 里没有 BitConverter，也没有"byte[] + 偏移 + 长度"
-// 的读取器；Zan.Cbor 的大端游标是包内私有的，跨包不可见。自己写一份小端
-// 的，两种格式共用一份。
+// 底层对齐 stdlib 的 System.Buffers.Binary.BinaryPrimitives 进行零开销解析。
 //
 // 越界一律当场抛：截断的输入如果读出垃圾值再往下走，症状会漂到很远的地方
 // （形状对不上、数值全是 NaN），比当场报错难查得多。
@@ -61,40 +59,35 @@ public class BinaryReader {
 
     public int U16() {
         Need(2);
-        int v = buf[pos] & 255;
-        v = v | ((buf[pos + 1] & 255) << 8);
+        int v = (int)BinaryPrimitives.ReadUInt16LittleEndian(buf.AsSpan(pos, 2));
         pos = pos + 2;
         return v;
     }
 
     public int I16() {
-        int v = U16();
-        if (v > 32767) { return v - 65536; }
+        Need(2);
+        int v = (int)BinaryPrimitives.ReadInt16LittleEndian(buf.AsSpan(pos, 2));
+        pos = pos + 2;
         return v;
     }
 
     public long U32() {
         Need(4);
-        long v = 0;
-        for (int i = 3; i >= 0; i = i - 1) {
-            v = (v << 8) | (long)(buf[pos + i] & 255);
-        }
+        long v = (long)BinaryPrimitives.ReadUInt32LittleEndian(buf.AsSpan(pos, 4));
         pos = pos + 4;
         return v;
     }
 
     public long I32() {
-        long v = U32();
-        if (v > 2147483647) { return v - 4294967296; }
+        Need(4);
+        long v = (long)BinaryPrimitives.ReadInt32LittleEndian(buf.AsSpan(pos, 4));
+        pos = pos + 4;
         return v;
     }
 
     public long U64() {
         Need(8);
-        long v = 0;
-        for (int i = 7; i >= 0; i = i - 1) {
-            v = (v << 8) | (long)(buf[pos + i] & 255);
-        }
+        long v = (long)BinaryPrimitives.ReadUInt64LittleEndian(buf.AsSpan(pos, 8));
         pos = pos + 8;
         return v;
     }
@@ -104,13 +97,17 @@ public class BinaryReader {
     }
 
     public float F32() {
-        long bits = U32();
-        return FloatBits.FromF32Bits(bits);
+        Need(4);
+        float v = BinaryPrimitives.ReadSingleLittleEndian(buf.AsSpan(pos, 4));
+        pos = pos + 4;
+        return v;
     }
 
     public double F64() {
-        long bits = U64();
-        return NativeMemory.AsF64(bits);
+        Need(8);
+        double v = BinaryPrimitives.ReadDoubleLittleEndian(buf.AsSpan(pos, 8));
+        pos = pos + 8;
+        return v;
     }
 
     // GGUF 风格的长度前缀字符串：u64 长度 + UTF-8 字节（无终止符）。
