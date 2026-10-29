@@ -1564,8 +1564,16 @@ static void wv_run_alert(NSAlert *alert, NSWindow *host,
     (void)configuration; (void)windowFeatures;
     /* No tab management down here: load the target in this view, which is what
      * an embedded single-view browser can honour. Returning nil means "handled
-     * by the app", so WebKit will not open a window of its own. */
-    if (!action.targetFrame && action.request.URL) [wv loadRequest:action.request];
+     * by the app", so WebKit will not open a window of its own.
+     * Note: dispatch asynchronously to prevent WebKit from immediately aborting
+     * the load when the synchronous createWebView callback returns nil. */
+    if (!action.targetFrame && action.request.URL) {
+        NSURLRequest *req = [action.request copy];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [wv loadRequest:req];
+            [req release];
+        });
+    }
     return nil;
 }
 - (void)webView:(WKWebView *)wv runJavaScriptAlertPanelWithMessage:(NSString *)message
@@ -2080,6 +2088,31 @@ EXPORT const char *zan_gui_webview_eval(i32 h, const char *js) {
         const char *ret = wv_store(&w->evalBuf, s);
         if (out) [out release];
         return ret;
+    }
+}
+
+EXPORT void zan_gui_webview_snapshot(i32 h, const char *out_png_path) {
+    ZAN_MAC_ENSURE_MAIN_THREAD_VOID(zan_gui_webview_snapshot(h, out_png_path));
+    WKWebView *wv = wv_get(h);
+    if (!wv || !out_png_path || !*out_png_path) return;
+    @autoreleasepool {
+        NSString *path = [NSString stringWithUTF8String:out_png_path];
+        WKSnapshotConfiguration *cfg = [[WKSnapshotConfiguration alloc] init];
+        [wv takeSnapshotWithConfiguration:cfg completionHandler:^(NSImage *img, NSError *err) {
+            [cfg release];
+            if (img) {
+                CGImageRef cg = [img CGImageForProposedRect:NULL context:nil hints:nil];
+                if (cg) {
+                    NSBitmapImageRep *rep = [[NSBitmapImageRep alloc] initWithCGImage:cg];
+                    NSData *png = [rep representationUsingType:NSBitmapImageFileTypePNG properties:@{}];
+                    [png writeToFile:path atomically:YES];
+                    [rep release];
+                    fprintf(stderr, "[Zan WebView] snapshot saved to %s (%ld bytes)\n", out_png_path, (long)[png length]);
+                }
+            } else if (err) {
+                fprintf(stderr, "[Zan WebView] snapshot error: %s\n", [[err localizedDescription] UTF8String]);
+            }
+        }];
     }
 }
 
