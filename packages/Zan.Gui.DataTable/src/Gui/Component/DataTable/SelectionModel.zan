@@ -180,8 +180,8 @@ public class SelectionModel {
         return copy;
     }
 
-    // 序列化为 ver/mode/all/keys/excluded JSON。
-    public string ToJson() {
+    // 序列化为 ver/mode/all/keys/excluded JsonValue。
+    public JsonValue ToJsonValue() {
         JsonValue root = JsonValue.NewObject();
         root.Put("ver", JsonValue.NewNum("1"));
         root.Put("mode", JsonValue.NewNum(Convert.ToString(this.mode)));
@@ -196,14 +196,62 @@ public class SelectionModel {
             excluded.Append(JsonValue.NewStr(this.excludedKeys[i]));
         }
         root.Put("excluded", excluded);
-        return root.ToJson();
+        return root;
+    }
+
+    // 序列化为 ver/mode/all/keys/excluded JSON 文本。
+    public string ToJson() {
+        return this.ToJsonValue().ToJson();
     }
 
     // 从 ToJson 文本恢复；文本为空或非对象返回 null。
     // all=true 时只保留排除表，否则只保留显式集。
     public static SelectionModel FromJson(string text) {
         if (text == null || text.Length == 0) { return null; }
-        JsonValue root = JsonValue.ParseLenient(text);
+        JsonDoc doc = null;
+        try {
+            doc = JsonDoc.Parse(text);
+        } catch (Exception ex) {
+            return null;
+        }
+        if (doc == null || doc.KindAt(doc.root) != 5) { return null; }
+        int modeSlot = doc.Get(doc.root, "mode");
+        int mode = modeSlot >= 0 ? doc.IntAt(modeSlot, SelectionMode.Row) : SelectionMode.Row;
+        SelectionModel result = new SelectionModel(mode);
+        int allSlot = doc.Get(doc.root, "all");
+        result.allSelected = allSlot >= 0 ? doc.BoolAt(allSlot, false) : false;
+        int keysSlot = doc.Get(doc.root, "keys");
+        if (keysSlot >= 0 && doc.KindAt(keysSlot) == 4) {
+            int kCount = doc.Count(keysSlot);
+            int kSlot = doc.FirstChild(keysSlot);
+            for (int i = 0; i < kCount; i = i + 1) {
+                string key = doc.StrAt(kSlot, "");
+                result.AddExplicit(key);
+                kSlot = doc.NextSibling(kSlot);
+            }
+        }
+        int excludedSlot = doc.Get(doc.root, "excluded");
+        if (excludedSlot >= 0 && doc.KindAt(excludedSlot) == 4) {
+            int eCount = doc.Count(excludedSlot);
+            int eSlot = doc.FirstChild(excludedSlot);
+            for (int i = 0; i < eCount; i = i + 1) {
+                string key = doc.StrAt(eSlot, "");
+                result.AddExcluded(key);
+                eSlot = doc.NextSibling(eSlot);
+            }
+        }
+        if (result.allSelected) {
+            result.explicitKeys.Clear();
+            result.explicitIndex.Clear();
+        } else {
+            result.excludedKeys.Clear();
+            result.excludedIndex.Clear();
+        }
+        return result;
+    }
+
+    // 从 JsonValue 节点直接恢复，避免二次序列化与字符串解析开销。
+    public static SelectionModel FromJsonValue(JsonValue root) {
         if (root == null || !root.IsObject()) { return null; }
         int mode = root.Int("mode", SelectionMode.Row);
         SelectionModel result = new SelectionModel(mode);

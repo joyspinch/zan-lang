@@ -3236,11 +3236,11 @@ static LLVMTypeRef map_tuple_struct(zan_irgen_t *g, zan_type_t *type) {
             return g->struct_types[i].llvm_type;
         }
     }
-    /* 有声明才有成员信息、才能算布局——此时必须把结构体类型注册进去。
-     * 条件写反过（`if (!type->sym->decl)`）：有声明时反而不注册，字段类型
-     * 降级成 i8*，类的字段布局随即错位——跨文件引用结构体（包里另一个
-     * 文件声明的 struct）必现，表现为字段读到相邻字段的值。 */
-    if (type->sym->decl) register_struct_type(g, type->sym);
+    /* 有声明或有合成成员时算布局——此时必须把结构体类型注册进去。
+     * 合成类型（如 Tuple、LINQ 中间 row）无 AST 声明节点但有 members，
+     * 普通结构体/类有 decl 节点。两者都需要注册 LLVM struct 布局，
+     * 否则字段类型会降级成 i8* / ptr，导致 GEP 校验失败或字段错位。 */
+    if (type->sym->decl || type->sym->member_count > 0) register_struct_type(g, type->sym);
     for (int i = 0; i < g->struct_type_count; i++) {
         if (g->struct_types[i].sym == type->sym) {
             return g->struct_types[i].llvm_type;
@@ -3319,9 +3319,9 @@ static LLVMTypeRef map_type(zan_irgen_t *g, zan_type_t *type) {
                 return g->struct_types[i].llvm_type;
             }
         }
-        /* 还没注册：有声明才有成员信息、才能算布局——先注册再取。
+        /* 还没注册：有声明或合成成员才能算布局——先注册再取。
          * 类取指针（引用语义），结构体取值（值语义）。 */
-        if (type->sym && type->sym->decl) {
+        if (type->sym && (type->sym->decl || type->sym->member_count > 0)) {
             register_struct_type(g, type->sym);
             for (int i = 0; i < g->struct_type_count; i++) {
                 if (g->struct_types[i].sym == type->sym) {
@@ -4300,7 +4300,15 @@ static LLVMValueRef emit_implicit_box(zan_irgen_t *g, zan_type_t *lt,
 #include "irgen_reflect.c"
 #include "irgen_builtins.c"
 #include "irgen_expr.c"
+#include "irgen_expr_ops.c"
+#include "irgen_expr_access.c"
+#include "irgen_expr_construct.c"
+#include "irgen_expr_lambda.c"
+#include "irgen_expr_dispatch.c"
 #include "irgen_abi.c"
+#include "irgen_call_async.c"
+#include "irgen_call_spec.c"
+#include "irgen_call_builtins.c"
 #include "irgen_call.c"
 #include "irgen_async.c"
 #include "irgen_stmt.c"

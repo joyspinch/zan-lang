@@ -15,6 +15,7 @@ public class QueryDescriptor {
     int queryRevision;
     int viewRevision;
     int capabilities;
+    int cachedFingerprint;
     List<QueryFilterClause> filters;
     List<QuerySortClause> sorts;
     List<QueryGroupClause> groups;
@@ -31,6 +32,7 @@ public class QueryDescriptor {
         this.queryRevision = queryRev;
         this.viewRevision = viewRev;
         this.capabilities = caps;
+        this.cachedFingerprint = -1;
         this.filters = new List<QueryFilterClause>();
         this.sorts = new List<QuerySortClause>();
         this.groups = new List<QueryGroupClause>();
@@ -64,32 +66,56 @@ public class QueryDescriptor {
 
     // 追加一个过滤子句；null 忽略。
     public void AddFilter(QueryFilterClause clause) {
-        if (clause != null) { this.filters.Add(clause); }
+        if (clause != null) {
+            this.filters.Add(clause);
+            this.cachedFingerprint = -1;
+        }
     }
 
     // 追加一个排序子句；null 忽略。
     public void AddSort(QuerySortClause clause) {
-        if (clause != null) { this.sorts.Add(clause); }
+        if (clause != null) {
+            this.sorts.Add(clause);
+            this.cachedFingerprint = -1;
+        }
     }
 
     // 追加一个分组子句；null 忽略。
     public void AddGroup(QueryGroupClause clause) {
-        if (clause != null) { this.groups.Add(clause); }
+        if (clause != null) {
+            this.groups.Add(clause);
+            this.cachedFingerprint = -1;
+        }
     }
 
     // 追加一个聚合子句；null 忽略。
     public void AddAggregate(QueryAggregateClause clause) {
-        if (clause != null) { this.aggregates.Add(clause); }
+        if (clause != null) {
+            this.aggregates.Add(clause);
+            this.cachedFingerprint = -1;
+        }
     }
 
     // 清空过滤子句。
-    void ClearFilters() { this.filters.Clear(); }
+    void ClearFilters() {
+        this.filters.Clear();
+        this.cachedFingerprint = -1;
+    }
     // 清空排序子句。
-    void ClearSorts() { this.sorts.Clear(); }
+    void ClearSorts() {
+        this.sorts.Clear();
+        this.cachedFingerprint = -1;
+    }
     // 清空分组子句。
-    void ClearGroups() { this.groups.Clear(); }
+    void ClearGroups() {
+        this.groups.Clear();
+        this.cachedFingerprint = -1;
+    }
     // 清空聚合子句。
-    void ClearAggregates() { this.aggregates.Clear(); }
+    void ClearAggregates() {
+        this.aggregates.Clear();
+        this.cachedFingerprint = -1;
+    }
 
     // 校验并构建查询计划（列数已知，columnCount<0 表示未知）。
     public QueryPlan BuildPlan(int columnCount, QueryCapabilities supported) {
@@ -102,15 +128,50 @@ public class QueryDescriptor {
     }
 
     // 逻辑查询相同的判断不包含 viewRevision；列宽、隐藏和冻结不应
-    // 让远端查询缓存失效。
+    // 让远端查询缓存失效。纯内存结构化零分配比对，免除昂贵的 Json 序列化。
     public bool SameQuery(QueryDescriptor other) {
         if (other == null) { return false; }
-        return this.version == other.version
-            && this.dataset == other.dataset
-            && this.dataRevision == other.dataRevision
-            && this.queryRevision == other.queryRevision
-            && this.capabilities == other.capabilities
-            && this.QueryJson() == other.QueryJson();
+        if (this.version != other.version
+            || this.dataset != other.dataset
+            || this.dataRevision != other.dataRevision
+            || this.queryRevision != other.queryRevision
+            || this.capabilities != other.capabilities) {
+            return false;
+        }
+        if (this.filters.Count != other.filters.Count) { return false; }
+        for (int i = 0; i < this.filters.Count; i = i + 1) {
+            QueryFilterClause a = this.filters[i];
+            QueryFilterClause b = other.filters[i];
+            if (a.Column() != b.Column() || a.Mode() != b.Mode() || a.Kind() != b.Kind()
+                || a.Value() != b.Value() || a.Value2() != b.Value2()) {
+                return false;
+            }
+        }
+        if (this.sorts.Count != other.sorts.Count) { return false; }
+        for (int i = 0; i < this.sorts.Count; i = i + 1) {
+            QuerySortClause a = this.sorts[i];
+            QuerySortClause b = other.sorts[i];
+            if (a.Column() != b.Column() || a.Direction() != b.Direction() || a.Kind() != b.Kind()) {
+                return false;
+            }
+        }
+        if (this.groups.Count != other.groups.Count) { return false; }
+        for (int i = 0; i < this.groups.Count; i = i + 1) {
+            QueryGroupClause a = this.groups[i];
+            QueryGroupClause b = other.groups[i];
+            if (a.Column() != b.Column() || a.Kind() != b.Kind()) {
+                return false;
+            }
+        }
+        if (this.aggregates.Count != other.aggregates.Count) { return false; }
+        for (int i = 0; i < this.aggregates.Count; i = i + 1) {
+            QueryAggregateClause a = this.aggregates[i];
+            QueryAggregateClause b = other.aggregates[i];
+            if (a.Column() != b.Column() || a.Mode() != b.Mode() || a.Kind() != b.Kind()) {
+                return false;
+            }
+        }
+        return true;
     }
 
     // 渲染/显示快照是否仍对应当前状态。
@@ -224,12 +285,17 @@ public class QueryDescriptor {
     }
 
     // FNV-1a 的 30 位稳定查询指纹；只是缓存键辅助，不替代文本比较。
+    // 首度计算后缓存在成员字段，后续检索为 O(1)。
     public int QueryFingerprint() {
+        if (this.cachedFingerprint >= 0) {
+            return this.cachedFingerprint;
+        }
         int h = 0x811C9DC5;
         string text = this.QueryJson();
         for (int i = 0; i < text.Length; i = i + 1) {
             h = ((h ^ ((int)text[i] & 255)) * 16777619) & 1073741823;
         }
+        this.cachedFingerprint = h;
         return h;
     }
 

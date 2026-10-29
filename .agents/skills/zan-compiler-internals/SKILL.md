@@ -644,6 +644,20 @@ description: zanc 编译器内部（parser/checker/irgen/runtime/ABI）设计契
      `module verification failed`——它出现即管线没跑。
    - 判定器：`tests/conformance/opt_constfold_branch_phi.zan`（注册处
      带 `-O1` 编译；普通 conformance 全在 -O0，永远踩不到这条路径）。
+34. **临时拥有接收者的成员赋值必须在赋值后释放该临时接收者**：
+   - 动作：在 `emit_expr_assignment`（`src/compiler/irgen_expr_ops.c`）处理
+     `AST_MEMBER_ACCESS` 赋值（`obj.field = value` 或 `obj.prop = value`）时，若
+     `obj_expr` 经由方法调用等表达式产生临时拥有对象（`expr_yields_owned_rc_value` 为真），
+     必须在字段存储或属性 setter 调用完成之后，调用
+     `emit_release_owned_call_temp(g, obj_expr, obj_val, locals)`（setter 分支对应 `rval`）
+     释放该临时接收者。
+   - 理由：如果不释放，调用返回的临时对象引用计数永远停留在 +1，宿主释放时
+     由于计数未归零产生 ARC 内存泄漏。典型案例：`this.EnsureExtra().bindPath = value;`
+     使 `ControlExtra` 的引用计数恒为 2，`Control` 销毁时只能减至 1，导致
+     `ControlExtra` 永久泄漏。
+   - 边界：仅对堆上托管对象生效（结构体不走该路径；局部变量标识符由
+     `emit_release_owned_call_temp` 内部识别并安全跳过）。
+   - 判定器：`tests/conformance/arc_assign_call_temp_receiver.zan`。
 
 ---
 

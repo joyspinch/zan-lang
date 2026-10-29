@@ -11,6 +11,30 @@ static LLVMValueRef get_array_desc(zan_irgen_t *g, zan_type_t *elem_type);
 static LLVMValueRef get_libc_fn(zan_irgen_t *g, const char *name, LLVMTypeRef ty);
 
 static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_t *locals);
+static LLVMValueRef emit_expr_identifier(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_t *locals);
+static LLVMValueRef emit_expr_unary(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_t *locals);
+static LLVMValueRef emit_expr_binary(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_t *locals);
+static LLVMValueRef emit_expr_assignment(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_t *locals);
+static LLVMValueRef emit_incdec_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_t *locals, int is_prefix);
+static LLVMValueRef emit_expr_string_interp(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_t *locals);
+static LLVMValueRef emit_expr_member_access(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_t *locals);
+static LLVMValueRef emit_expr_index(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_t *locals);
+static LLVMValueRef emit_expr_query_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_t *locals);
+static LLVMValueRef emit_expr_tuple(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_t *locals);
+static LLVMValueRef emit_expr_new_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_t *locals);
+static LLVMValueRef emit_expr_conditional(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_t *locals);
+static LLVMValueRef emit_expr_switch_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_t *locals);
+static LLVMValueRef emit_expr_with_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_t *locals);
+static LLVMValueRef emit_expr_await_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_t *locals);
+static LLVMValueRef emit_expr_cast_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_t *locals);
+static LLVMValueRef emit_ref_arg(zan_irgen_t *g, zan_ast_node_t *arg, local_scope_t *locals);
+static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_t *locals);
+
+/* 判断目标平台是否为 WebAssembly */
+static inline bool target_is_wasm32(zan_irgen_t *g) {
+    return g->target_triple[0] &&
+           strncmp(g->target_triple, "wasm32", 6) == 0;
+}
 static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *locals);
 static void emit_runtime_check(zan_irgen_t *g, LLVMValueRef is_error,
                                zan_loc_t loc, const char *msg);
