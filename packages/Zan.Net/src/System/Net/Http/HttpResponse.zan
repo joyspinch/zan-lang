@@ -106,7 +106,12 @@ public class HttpResponse : IDisposable {
     // 字符集判定。
     // <paramref name="isName"/> 为 true 时按名字判定。
     internal static bool HeaderFramingSafe(bool isName, string s) {
-        for (int i = 0; i < s.Length; i = i + 1) {
+        if (s == null) { return false; }
+        return HttpResponse.HeaderFramingSafeRange(isName, s, 0, s.Length);
+    }
+
+    internal static bool HeaderFramingSafeRange(bool isName, string s, int start, int end) {
+        for (int i = start; i < end; i = i + 1) {
             int ch = s[i] & 255;
             if (isName) {
                 if (!((ch >= 48 && ch <= 57)
@@ -119,6 +124,23 @@ public class HttpResponse : IDisposable {
                 if (ch == 127 || (ch < 32 && ch != 9)) { return false; }
             }
         }
+        return true;
+    }
+
+    private static bool IsContentTypeHeader(string s, int start, int len) {
+        if (len != 12) { return false; }
+        int c0 = s[start] & 255; if (c0 != 99 && c0 != 67) { return false; }
+        int c1 = s[start + 1] & 255; if (c1 != 111 && c1 != 79) { return false; }
+        int c2 = s[start + 2] & 255; if (c2 != 110 && c2 != 78) { return false; }
+        int c3 = s[start + 3] & 255; if (c3 != 116 && c3 != 84) { return false; }
+        int c4 = s[start + 4] & 255; if (c4 != 101 && c4 != 69) { return false; }
+        int c5 = s[start + 5] & 255; if (c5 != 110 && c5 != 78) { return false; }
+        int c6 = s[start + 6] & 255; if (c6 != 116 && c6 != 84) { return false; }
+        int c7 = s[start + 7] & 255; if (c7 != 45) { return false; }
+        int c8 = s[start + 8] & 255; if (c8 != 116 && c8 != 84) { return false; }
+        int c9 = s[start + 9] & 255; if (c9 != 121 && c9 != 89) { return false; }
+        int c10 = s[start + 10] & 255; if (c10 != 112 && c10 != 80) { return false; }
+        int c11 = s[start + 11] & 255; if (c11 != 101 && c11 != 69) { return false; }
         return true;
     }
 
@@ -495,25 +517,22 @@ public class HttpResponse : IDisposable {
             int hEnd = raw.IndexOf("\r\n", pos);
             if (hEnd < 0) { resp.statusCode = 0; return resp; }
             if (hEnd == pos) { pos = hEnd + 2; ended = true; break; }
+            int colon = raw.IndexOf(":", pos);
+            if (colon <= pos || colon >= hEnd) {
+                resp.statusCode = 0;
+                return resp;
+            }
+            if (!HttpResponse.HeaderFramingSafeRange(true, raw, pos, colon)
+                || !HttpResponse.HeaderFramingSafeRange(false, raw, colon + 1, hEnd)) {
+                resp.statusCode = 0;
+                return resp;
+            }
             string headerLine = raw.Substring(pos, hEnd - pos);
-            int colon = headerLine.IndexOf(":");
-            if (colon <= 0) {
-                resp.statusCode = 0;
-                return resp;
-            }
-            string nameRaw = headerLine.Substring(0, colon);
-            string valRaw = headerLine.Substring(colon + 1);
-            if (!HttpResponse.HeaderFramingSafe(true, nameRaw)
-                || !HttpResponse.HeaderFramingSafe(false, valRaw)) {
-                resp.statusCode = 0;
-                return resp;
-            }
             resp.headers.Add(headerLine);
-            string name = nameRaw.ToLower();
-            if (name == "content-type") {
-                int valueStart = HttpResponse.TrimOwsStart(valRaw, 0, valRaw.Length);
-                int valueStop = HttpResponse.TrimOwsStop(valRaw, valueStart, valRaw.Length);
-                resp.contentType = valRaw.Substring(valueStart, valueStop - valueStart);
+            if (HttpResponse.IsContentTypeHeader(raw, pos, colon - pos)) {
+                int valueStart = HttpResponse.TrimOwsStart(raw, colon + 1, hEnd);
+                int valueStop = HttpResponse.TrimOwsStop(raw, valueStart, hEnd);
+                resp.contentType = raw.Substring(valueStart, valueStop - valueStart);
             }
             pos = hEnd + 2;
         }
