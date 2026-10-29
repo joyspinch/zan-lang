@@ -1,0 +1,332 @@
+using System;
+using Game.Server.Network;
+using Game.Server.Core;
+using Game.Server.Aoi;
+using Game.Server.Room;
+using Game.Server.Cluster;
+using Game.Server.Storage;
+
+// 用于测试的 Actor 实体
+public class TestEchoActor : Actor {
+    public int receivedCount;
+    public int lastMsgType;
+    public long tickedDelta;
+
+    public TestEchoActor(long id) : base(id, 100) {
+        this.receivedCount = 0;
+        this.lastMsgType = 0;
+        this.tickedDelta = 0L;
+    }
+
+    public override void OnReceive(ActorMessage msg) {
+        this.receivedCount = this.receivedCount + 1;
+        this.lastMsgType = msg.msgType;
+    }
+
+    public override void OnTick(long deltaMs) {
+        this.tickedDelta = this.tickedDelta + deltaMs;
+    }
+}
+
+public class GameServerTests {
+    private static int failures = 0;
+
+    private static void Check(string name, bool ok) {
+        if (!ok) {
+            failures = failures + 1;
+            Console.WriteLine("FAIL " + name);
+        }
+    }
+
+    private static void CheckEq(string name, long actual, long expected) {
+        if (actual != expected) {
+            failures = failures + 1;
+            Console.WriteLine("FAIL " + name + " actual=" + actual.ToString()
+                + " expected=" + expected.ToString());
+        }
+    }
+
+    // 1. 测试 Packet 与 PacketFramer 粘包拆包编解码
+    private static void TestPacketAndFramer() {
+        byte[] payload = new byte[4];
+        payload[0] = 10;
+        payload[1] = 20;
+        payload[2] = 30;
+        payload[3] = 40;
+
+        Packet p1 = Packet.Create(1001, 1, 99999L, payload);
+        byte[] encoded = PacketFramer.Encode(p1);
+        CheckEq("packet-encoded-len", (long)encoded.Length, 24L);
+
+        PacketFramer framer = new PacketFramer();
+        // 模拟拆包：先喂前 10 字节（半包）
+        framer.Feed(encoded, 0, 10);
+        Packet polled1 = framer.Poll();
+        Check("framer-half-packet-null", polled1 == null);
+
+        // 模拟粘包：喂入剩下的 14 字节 + 另一个空包 20 字节
+        Packet p2 = Packet.CreateEmpty(1002, 2, 88888L);
+        byte[] encoded2 = PacketFramer.Encode(p2);
+
+        byte[] combined = new byte[14 + encoded2.Length];
+        for (int i = 0; i < 14; i = i + 1) {
+            combined[i] = encoded[10 + i];
+        }
+        for (int i = 0; i < encoded2.Length; i = i + 1) {
+            combined[14 + i] = encoded2[i];
+        }
+
+        framer.Feed(combined, 0, combined.Length);
+
+        // 依次弹出两个包
+        Packet out1 = framer.Poll();
+        Check("framer-out1-not-null", out1 != null);
+        CheckEq("framer-out1-opcode", (long)out1.opCode, 1001L);
+        CheckEq("framer-out1-seq", (long)out1.seq, 1L);
+        CheckEq("framer-out1-route", out1.routeId, 99999L);
+        CheckEq("framer-out1-paylen", (long)out1.payloadLength, 4L);
+        CheckEq("framer-out1-byte0", (long)out1.payload[0], 10L);
+
+        Packet out2 = framer.Poll();
+        Check("framer-out2-not-null", out2 != null);
+        CheckEq("framer-out2-opcode", (long)out2.opCode, 1002L);
+        CheckEq("framer-out2-seq", (long)out2.seq, 2L);
+        CheckEq("framer-out2-route", out2.routeId, 88888L);
+        CheckEq("framer-out2-paylen", (long)out2.payloadLength, 0L);
+
+        Check("framer-empty-after-drain", framer.Poll() == null);
+    }
+
+    // 2. 测试 Session 会话管理、离线缓冲与断线重连
+    private static void TestSessionAndManager() {
+        SessionManager mgr = new SessionManager();
+        Session s1 = new Session(101L);
+        mgr.AddSession(s1);
+        mgr.BindPlayer(101L, 5001L, "token-abc");
+
+        Check("session-bound", s1.playerId == 5001L);
+        Check("session-active", s1.IsActive());
+
+        // 下行报文入队
+        Packet p = Packet.CreateEmpty(2001, 1, 5001L);
+        s1.EnqueueOutbox(p);
+        CheckEq("session-outbox-count", (long)s1.OutboxCount(), 1L);
+
+        // 模拟断线
+        s1.MarkDisconnected(1000L);
+        Check("session-disconnected", s1.state == Session.STATE_DISCONNECTED);
+
+        // 重连申请
+        Session resumed = mgr.TryResume(5001L, 102L, "token-abc", 1500L);
+        Check("session-resume-ok", resumed != null);
+        CheckEq("session-new-id", resumed.sessionId, 102L);
+        Check("session-resumed-connected", resumed.IsActive());
+
+        // 提取离线积攒的报文
+        Packet[] unread = resumed.DrainOutbox();
+        CheckEq("session-drained-len", (long)unread.Length, 1L);
+        CheckEq("session-drained-opcode", (long)unread[0].opCode, 2001L);
+
+        // 模拟心跳超期清理
+        resumed.lastActiveTime = 1000L;
+        mgr.SweepTimeouts(60000L, 5000L, 10000L);
+        Check("session-sweep-disconnected", resumed.state == Session.STATE_DISCONNECTED);
+
+        mgr.SweepTimeouts(100000L, 5000L, 10000L);
+        Check("session-sweep-purged", mgr.GetByPlayerId(5001L) == null);
+    }
+
+    // 3. 测试 Core 层的 Actor 调度模型
+    private static void TestActorSystem() {
+        ActorSystem sys = new ActorSystem();
+        TestEchoActor a1 = new TestEchoActor(1001L);
+        TestEchoActor a2 = new TestEchoActor(1002L);
+
+        sys.Spawn(a1);
+        sys.Spawn(a2);
+        CheckEq("actors-count", (long)sys.Count(), 2L);
+
+        // 发送消息
+        sys.Send(ActorMessage.Create(501, 0L, 1001L, null));
+        sys.Send(ActorMessage.Create(502, 0L, 1001L, null));
+        sys.Send(ActorMessage.Create(503, 0L, 1002L, null));
+
+        // 单轮最多处理 1 条
+        int pCount = sys.Dispatch(1);
+        CheckEq("actors-dispatched-batch1", (long)pCount, 2L); // a1 消费 1 条，a2 消费 1 条
+        CheckEq("a1-received-first", (long)a1.receivedCount, 1L);
+        CheckEq("a2-received-first", (long)a2.receivedCount, 1L);
+
+        // 再轮询一次，处理完剩余消息
+        sys.Dispatch(16);
+        CheckEq("a1-received-all", (long)a1.receivedCount, 2L);
+        CheckEq("a1-last-msg", (long)a1.lastMsgType, 502L);
+
+        // Tick 心跳驱动
+        sys.Tick(50L);
+        CheckEq("a1-ticked", a1.tickedDelta, 50L);
+
+        // 销毁
+        sys.Kill(1001L);
+        Check("actor-killed", sys.Get(1001L) == null);
+        CheckEq("actors-count-after-kill", (long)sys.Count(), 1L);
+        sys.Clear();
+    }
+
+    // 4. 测试 AOI 空间九宫格视野与差集增量
+    private static void TestAoiGrid() {
+        // 1000x1000 场景，网格步长 100
+        AoiGrid grid = new AoiGrid(0.0f, 0.0f, 1000.0f, 1000.0f, 100.0f);
+
+        // 实体 1 在 (50, 50) -> 格子 (0, 0)
+        grid.Enter(1L, 50.0f, 50.0f);
+        // 实体 2 在 (60, 60) -> 格子 (0, 0)
+        long[] near2 = grid.Enter(2L, 60.0f, 60.0f);
+        CheckEq("aoi-near2-count", (long)near2.Length, 1L);
+        CheckEq("aoi-near2-has-1", near2[0], 1L);
+
+        // 实体 3 在 (800, 800) -> 格子 (8, 8)，远在视野外
+        grid.Enter(3L, 800.0f, 800.0f);
+        long[] near1 = grid.GetSurroundEntities(0, 0, 1L);
+        CheckEq("aoi-near1-count", (long)near1.Length, 1L);
+        CheckEq("aoi-near1-has-2", near1[0], 2L);
+
+        // 实体 2 从 (60, 60) 跨越移动到 (850, 850) -> 格子 (8, 8)
+        AoiDiff diff = grid.Move(2L, 850.0f, 850.0f);
+        Check("aoi-diff-not-null", diff != null);
+        // 实体 2 应该离开实体 1 的视野，进入实体 3 的视野
+        CheckEq("aoi-leaves-count", (long)diff.leavesCount, 1L);
+        CheckEq("aoi-leaves-has-1", diff.leaves[0], 1L);
+        CheckEq("aoi-enters-count", (long)diff.entersCount, 1L);
+        CheckEq("aoi-enters-has-3", diff.enters[0], 3L);
+
+        // 实体 1 离开场景
+        long[] left = grid.Leave(1L);
+        CheckEq("aoi-leave-count", (long)left.Length, 0L); // 此时 1 周围已无任何实体
+    }
+
+    // 5. 测试 Room 房间对局与生命周期
+    private static void TestRoomLifecycle() {
+        RoomManager rm = new RoomManager();
+        Room room = rm.CreateRoom(888L, 2);
+        Check("room-created", room != null);
+        CheckEq("room-state-waiting", (long)room.state, (long)Room.STATE_WAITING);
+
+        // 加入两个玩家
+        Check("room-join-1", room.Join(101L, 1, 1000L));
+        Check("room-join-2", room.Join(102L, 2, 1000L));
+        Check("room-full", room.IsFull());
+
+        // 准备状态
+        Check("room-not-ready", !room.AreAllReady());
+        room.SetReady(101L, true);
+        room.SetReady(102L, true);
+        Check("room-all-ready", room.AreAllReady());
+
+        // 开局并驱动 Tick
+        Check("room-start", room.StartGame());
+        CheckEq("room-state-playing", (long)room.state, (long)Room.STATE_PLAYING);
+
+        room.Tick(50L);
+        room.Tick(50L);
+        CheckEq("room-frame-count", (long)room.currentFrame, 2L);
+
+        // 房间广播
+        SessionManager sm = new SessionManager();
+        Session s1 = new Session(1L);
+        s1.BindPlayer(101L, "");
+        Session s2 = new Session(2L);
+        s2.BindPlayer(102L, "");
+        sm.AddSession(s1);
+        sm.AddSession(s2);
+
+        int sent = room.Broadcast(sm, Packet.CreateEmpty(3001, 1, 888L));
+        CheckEq("room-broadcast-sent", (long)sent, 2L);
+        CheckEq("room-s1-outbox", (long)s1.OutboxCount(), 1L);
+        CheckEq("room-s2-outbox", (long)s2.OutboxCount(), 1L);
+    }
+
+    // 6. 测试 Cluster 位置透明路由
+    private static void TestClusterRouting() {
+        ActorSystem sys = new ActorSystem();
+        TestEchoActor localActor = new TestEchoActor(2001L);
+        sys.Spawn(localActor);
+
+        LocationService loc = new LocationService();
+        // 2001 在本地节点 1；2002 在远端节点 2
+        loc.Register(2001L, 1, 1, 1000L);
+        loc.Register(2002L, 2, 1, 1000L);
+
+        ClusterRouter router = new ClusterRouter(1, sys, loc);
+
+        // 路由到本地 Actor
+        int retLocal = router.Route(ActorMessage.Create(701, 0L, 2001L, null));
+        CheckEq("router-local-code", (long)retLocal, 1L);
+
+        // 路由到远端 Actor
+        int retRemote = router.Route(ActorMessage.Create(702, 0L, 2002L, null));
+        CheckEq("router-remote-code", (long)retRemote, 2L);
+        CheckEq("router-outbound-count", (long)router.OutboundCount(), 1L);
+
+        RemotePacket outP = router.PollOutbound();
+        Check("router-outbound-packet", outP != null);
+        CheckEq("router-outbound-target-node", (long)outP.targetNodeId, 2L);
+        CheckEq("router-outbound-msg-type", (long)outP.message.msgType, 702L);
+
+        // 原子跨节点迁移
+        Check("loc-migrate-ok", loc.Migrate(2002L, 2, 3, 2, 1200L));
+        CheckEq("loc-migrated-node", (long)loc.GetNode(2002L), 3L);
+
+        sys.Dispatch(16);
+        sys.Clear();
+    }
+
+    // 7. 测试 Storage 回写队列合并与防抖
+    private static void TestWriteBackQueue() {
+        WriteBackQueue queue = new WriteBackQueue(1000L, 5000L, 16);
+
+        byte[] d1 = new byte[2];
+        d1[0] = 1;
+        byte[] d2 = new byte[2];
+        d2[0] = 99;
+
+        // 针对 entity 10001 连续标记两次脏数据（原位掩码合并）
+        queue.MarkDirty(10001L, 1, d1, 1000L);
+        queue.MarkDirty(10001L, 2, d2, 1200L); // 掩码 1 | 2 = 3
+
+        CheckEq("wb-queue-count", (long)queue.Count(), 1L); // 原位合并，依然只有 1 条
+
+        // 防抖时间内不触发提取
+        WriteBackItem[] ready1 = queue.DrainReady(1500L);
+        CheckEq("wb-not-ready", (long)ready1.Length, 0L);
+
+        // 超过 debounceMs (1200 + 1000 = 2200) 后触发提取
+        WriteBackItem[] ready2 = queue.DrainReady(2300L);
+        CheckEq("wb-ready-count", (long)ready2.Length, 1L);
+        CheckEq("wb-ready-mask", (long)ready2[0].dirtyMask, 3L);
+        CheckEq("wb-ready-data0", (long)ready2[0].payload[0], 99L);
+        CheckEq("wb-queue-empty-after-drain", (long)queue.Count(), 0L);
+    }
+
+    public static void Run() {
+        TestPacketAndFramer();
+        TestSessionAndManager();
+        TestActorSystem();
+        TestAoiGrid();
+        TestRoomLifecycle();
+        TestClusterRouting();
+        TestWriteBackQueue();
+
+        if (failures > 0) {
+            Console.WriteLine("GAME SERVER TESTS FAILED: " + failures.ToString());
+        } else {
+            Console.WriteLine("ALL GAME SERVER TESTS PASSED");
+        }
+    }
+}
+
+public class GameServerTestsMain {
+    public static void Main() {
+        GameServerTests.Run();
+    }
+}

@@ -1,0 +1,180 @@
+using System;
+
+namespace Game.Server.Network;
+
+// 网关会话管理器：提供 O(1) 会话检索、心跳检测与断线重连窗口管理。
+public class SessionManager {
+    private Session[] sessions;
+    private int capacity;
+    private int count;
+
+    public SessionManager(int initialCapacity) {
+        int cap = initialCapacity > 16 ? initialCapacity : 128;
+        this.capacity = cap;
+        this.sessions = new Session[cap];
+        this.count = 0;
+    }
+
+    public SessionManager() : this(1024) {
+    }
+
+    public int Count() {
+        return this.count;
+    }
+
+    // 注册新会话
+    public bool AddSession(Session session) {
+        if (session == null) { return false; }
+        if (this.GetBySessionId(session.sessionId) != null) {
+            return false;
+        }
+        this.EnsureCapacity();
+        this.sessions[this.count] = session;
+        this.count = this.count + 1;
+        return true;
+    }
+
+    // 按 SessionId 查询
+    public Session GetBySessionId(long sId) {
+        for (int i = 0; i < this.count; i = i + 1) {
+            Session s = this.sessions[i];
+            if (s != null && s.sessionId == sId) {
+                return s;
+            }
+        }
+        return null;
+    }
+
+    // 按 PlayerId 查询（优先返回 CONNECTED 的会话）
+    public Session GetByPlayerId(long pId) {
+        if (pId <= 0L) { return null; }
+        Session fallback = null;
+        for (int i = 0; i < this.count; i = i + 1) {
+            Session s = this.sessions[i];
+            if (s != null && s.playerId == pId) {
+                if (s.state == Session.STATE_CONNECTED) {
+                    return s;
+                }
+                fallback = s;
+            }
+        }
+        return fallback;
+    }
+
+    // 绑定 PlayerId
+    public bool BindPlayer(long sId, long pId, string token) {
+        Session s = this.GetBySessionId(sId);
+        if (s == null) { return false; }
+
+        // 如果旧连接已有同一 PlayerId，顶号踢掉旧连接
+        for (int i = 0; i < this.count; i = i + 1) {
+            Session old = this.sessions[i];
+            if (old != null && old.playerId == pId && old.sessionId != sId) {
+                old.Close();
+                this.RemoveSession(old.sessionId);
+                break;
+            }
+        }
+
+        s.BindPlayer(pId, token);
+        return true;
+    }
+
+    // 断线重连申请：老会话接管并换新 SessionId
+    public Session TryResume(long pId, long newSessionId, string token, long nowMs) {
+        Session old = this.GetByPlayerId(pId);
+        if (old == null) {
+            return null;
+        }
+        if (old.TryResume(newSessionId, token, nowMs)) {
+            return old;
+        }
+        return null;
+    }
+
+    // 移除并关闭指定会话
+    public bool RemoveSession(long sId) {
+        for (int i = 0; i < this.count; i = i + 1) {
+            Session s = this.sessions[i];
+            if (s != null && s.sessionId == sId) {
+                s.Close();
+                // 尾部交换移除
+                this.sessions[i] = this.sessions[this.count - 1];
+                this.sessions[this.count - 1] = null;
+                this.count = this.count - 1;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // 定期巡检心跳超时与断线超时
+    // heartbeatTimeoutMs: 长时间无数据则判断线
+    // reconnectGraceMs: 断线后保留会话与离线队列的最大等待时长
+    public int SweepTimeouts(long nowMs, long heartbeatTimeoutMs, long reconnectGraceMs) {
+        int purged = 0;
+        int i = 0;
+        while (i < this.count) {
+            Session s = this.sessions[i];
+            if (s == null) {
+                i = i + 1;
+                continue;
+            }
+
+            if (s.state == Session.STATE_CONNECTED) {
+                if (s.lastActiveTime > 0L && (nowMs - s.lastActiveTime) > heartbeatTimeoutMs) {
+                    // 转为断线重连等待态
+                    s.MarkDisconnected(nowMs);
+                }
+                i = i + 1;
+            } else if (s.state == Session.STATE_DISCONNECTED) {
+                if (s.disconnectTime > 0L && (nowMs - s.disconnectTime) > reconnectGraceMs) {
+                    // 超过重连宽限期，彻底清除
+                    s.Close();
+                    this.sessions[i] = this.sessions[this.count - 1];
+                    this.sessions[this.count - 1] = null;
+                    this.count = this.count - 1;
+                    purged = purged + 1;
+                } else {
+                    i = i + 1;
+                }
+            } else if (s.state == Session.STATE_CLOSED) {
+                this.sessions[i] = this.sessions[this.count - 1];
+                this.sessions[this.count - 1] = null;
+                this.count = this.count - 1;
+                purged = purged + 1;
+            } else {
+                i = i + 1;
+            }
+        }
+        return purged;
+    }
+
+    // 广播报文给所有活跃会话
+    public int Broadcast(Packet packet) {
+        if (packet == null) { return 0; }
+        int sent = 0;
+        for (int i = 0; i < this.count; i = i + 1) {
+            Session s = this.sessions[i];
+            if (s != null && s.state == Session.STATE_CONNECTED) {
+                if (s.EnqueueOutbox(packet)) {
+                    sent = sent + 1;
+                }
+            }
+        }
+        return sent;
+    }
+
+    private void EnsureCapacity() {
+        if (this.count < this.capacity) {
+            return;
+        }
+        int newCap = this.capacity * 2;
+        Session[] newArr = new Session[newCap];
+        for (int i = 0; i < this.count; i = i + 1) {
+            newArr[i] = this.sessions[i];
+        }
+        this.sessions = newArr;
+        this.capacity = newCap;
+    }
+}

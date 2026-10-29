@@ -1,0 +1,199 @@
+using System;
+
+namespace Game.Server.Network;
+
+// 流式拆包与封包器（处理 TCP 粘包与拆包）。
+//
+// 编码规则（大端序 Big-Endian）：
+// [0..3]   totalLength: int (包括 Header 20 字节 + payload 字节)
+// [4..7]   opCode:      int
+// [8..11]  seq:         int
+// [12..19] routeId:     long
+// [20..]   payload:     byte[]
+public class PacketFramer {
+    private byte[] buffer;
+    private int writePos;
+    private int readPos;
+    private int maxPacketSize;
+
+    public PacketFramer(int initialCapacity, int maxPacketSize) {
+        int cap = initialCapacity > 64 ? initialCapacity : 1024;
+        this.buffer = new byte[cap];
+        this.writePos = 0;
+        this.readPos = 0;
+        this.maxPacketSize = maxPacketSize > 1024 ? maxPacketSize : 1024 * 1024;
+    }
+
+    public PacketFramer() {
+        this.buffer = new byte[4096];
+        this.writePos = 0;
+        this.readPos = 0;
+        this.maxPacketSize = 1024 * 1024;
+    }
+
+    // 将 Packet 序列化为连续二进制网络报文。
+    public static byte[] Encode(Packet packet) {
+        if (packet == null) {
+            return new byte[0];
+        }
+        int payLen = packet.payloadLength;
+        if (packet.payload != null && payLen > packet.payload.Length) {
+            payLen = packet.payload.Length;
+        }
+        if (payLen < 0) { payLen = 0; }
+        int totalLen = Packet.HEADER_SIZE + payLen;
+        byte[] bytes = new byte[totalLen];
+
+        // 1. totalLength (大端 4 字节)
+        WriteInt32(bytes, 0, totalLen);
+        // 2. opCode
+        WriteInt32(bytes, 4, packet.opCode);
+        // 3. seq
+        WriteInt32(bytes, 8, packet.seq);
+        // 4. routeId (大端 8 字节)
+        WriteInt64(bytes, 12, packet.routeId);
+
+        // 5. payload
+        if (packet.payload != null && payLen > 0) {
+            for (int i = 0; i < payLen; i = i + 1) {
+                bytes[Packet.HEADER_SIZE + i] = packet.payload[i];
+            }
+        }
+        return bytes;
+    }
+
+    // 接收字节流追加到缓冲中。
+    public bool Feed(byte[] chunk, int offset, int count) {
+        if (chunk == null || count <= 0 || offset < 0 || offset + count > chunk.Length) {
+            return false;
+        }
+
+        // 检查缓冲容量，必要时压缩或扩容
+        this.EnsureCapacity(count);
+
+        for (int i = 0; i < count; i = i + 1) {
+            this.buffer[this.writePos + i] = chunk[offset + i];
+        }
+        this.writePos = this.writePos + count;
+        return true;
+    }
+
+    // 尝试解析并弹出一个完整的 Packet。若不够一个完整包则返回 null。
+    public Packet Poll() {
+        int available = this.writePos - this.readPos;
+        if (available < Packet.HEADER_SIZE) {
+            return null;
+        }
+
+        int totalLen = ReadInt32(this.buffer, this.readPos);
+        if (totalLen < Packet.HEADER_SIZE || totalLen > this.maxPacketSize) {
+            // 非法包长，重置清空防穿透
+            this.Reset();
+            return null;
+        }
+
+        if (available < totalLen) {
+            // 半包，等待更多数据
+            return null;
+        }
+
+        // 提取头部
+        int opCode = ReadInt32(this.buffer, this.readPos + 4);
+        int seq = ReadInt32(this.buffer, this.readPos + 8);
+        long routeId = ReadInt64(this.buffer, this.readPos + 12);
+        int payloadLen = totalLen - Packet.HEADER_SIZE;
+
+        byte[] payload = null;
+        if (payloadLen > 0) {
+            payload = new byte[payloadLen];
+            int pStart = this.readPos + Packet.HEADER_SIZE;
+            for (int i = 0; i < payloadLen; i = i + 1) {
+                payload[i] = this.buffer[pStart + i];
+            }
+        }
+
+        this.readPos = this.readPos + totalLen;
+
+        // 如果读指针追平写指针，直接归零以最大化复用连续空间
+        if (this.readPos == this.writePos) {
+            this.readPos = 0;
+            this.writePos = 0;
+        }
+
+        return new Packet(opCode, seq, routeId, payload, payloadLen);
+    }
+
+    public void Reset() {
+        this.readPos = 0;
+        this.writePos = 0;
+    }
+
+    public int UnconsumedBytes() {
+        return this.writePos - this.readPos;
+    }
+
+    private void EnsureCapacity(int needed) {
+        int available = this.buffer.Length - this.writePos;
+        if (available >= needed) {
+            return;
+        }
+
+        int unconsumed = this.writePos - this.readPos;
+        // 如果头部有空出的已读区域，先向前紧凑搬移
+        if (this.readPos > 0) {
+            for (int i = 0; i < unconsumed; i = i + 1) {
+                this.buffer[i] = this.buffer[this.readPos + i];
+            }
+            this.readPos = 0;
+            this.writePos = unconsumed;
+        }
+
+        // 重新检查容量，若仍不够则扩容
+        if (this.buffer.Length - this.writePos < needed) {
+            int newCap = this.buffer.Length * 2;
+            while (newCap - this.writePos < needed) {
+                newCap = newCap * 2;
+            }
+            byte[] newBuf = new byte[newCap];
+            for (int i = 0; i < this.writePos; i = i + 1) {
+                newBuf[i] = this.buffer[i];
+            }
+            this.buffer = newBuf;
+        }
+    }
+
+    public static void WriteInt32(byte[] dest, int offset, int val) {
+        dest[offset + 0] = (byte)((val >> 24) & 0xFF);
+        dest[offset + 1] = (byte)((val >> 16) & 0xFF);
+        dest[offset + 2] = (byte)((val >> 8) & 0xFF);
+        dest[offset + 3] = (byte)(val & 0xFF);
+    }
+
+    public static int ReadInt32(byte[] src, int offset) {
+        int b0 = ((int)src[offset + 0]) & 0xFF;
+        int b1 = ((int)src[offset + 1]) & 0xFF;
+        int b2 = ((int)src[offset + 2]) & 0xFF;
+        int b3 = ((int)src[offset + 3]) & 0xFF;
+        return (b0 << 24) | (b1 << 16) | (b2 << 8) | b3;
+    }
+
+    public static void WriteInt64(byte[] dest, int offset, long val) {
+        dest[offset + 0] = (byte)((val >> 56) & 0xFFL);
+        dest[offset + 1] = (byte)((val >> 48) & 0xFFL);
+        dest[offset + 2] = (byte)((val >> 40) & 0xFFL);
+        dest[offset + 3] = (byte)((val >> 32) & 0xFFL);
+        dest[offset + 4] = (byte)((val >> 24) & 0xFFL);
+        dest[offset + 5] = (byte)((val >> 16) & 0xFFL);
+        dest[offset + 6] = (byte)((val >> 8) & 0xFFL);
+        dest[offset + 7] = (byte)(val & 0xFFL);
+    }
+
+    public static long ReadInt64(byte[] src, int offset) {
+        long v = 0L;
+        for (int i = 0; i < 8; i = i + 1) {
+            long b = ((long)src[offset + i]) & 0xFFL;
+            v = (v << 8) | b;
+        }
+        return v;
+    }
+}

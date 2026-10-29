@@ -1,0 +1,131 @@
+using System;
+
+namespace Game.Server.Storage;
+
+// 状态三级放置：内存权威模式下的防抖与合并异步回写队列。
+public class WriteBackQueue {
+    public long debounceMs;
+    public long maxDelayMs;
+
+    private WriteBackItem[] items;
+    private int capacity;
+    private int count;
+
+    public WriteBackQueue(long debounceMs, long maxDelayMs, int initialCapacity) {
+        this.debounceMs = debounceMs > 10L ? debounceMs : 1000L;
+        this.maxDelayMs = maxDelayMs > debounceMs ? maxDelayMs : 5000L;
+
+        int cap = initialCapacity > 16 ? initialCapacity : 128;
+        this.capacity = cap;
+        this.items = new WriteBackItem[cap];
+        this.count = 0;
+    }
+
+    public WriteBackQueue() : this(2000L, 10000L, 256) {
+    }
+
+    public int Count() {
+        return this.count;
+    }
+
+    // 标记数据变脏：如果队列中已有该实体，原位合并掩码与最新数据，不产生多余队列项
+    public bool MarkDirty(long entityId, int dirtyMask, byte[] payload, long nowMs) {
+        if (entityId <= 0L) {
+            return false;
+        }
+
+        int len = payload != null ? payload.Length : 0;
+
+        // 1. 原位合并
+        for (int i = 0; i < this.count; i = i + 1) {
+            WriteBackItem item = this.items[i];
+            if (item != null && item.entityId == entityId) {
+                item.Update(dirtyMask, payload, len, nowMs);
+                return true;
+            }
+        }
+
+        // 2. 新增条目
+        this.EnsureCapacity();
+        WriteBackItem newItem = new WriteBackItem(entityId, dirtyMask, payload, len, nowMs);
+        this.items[this.count] = newItem;
+        this.count = this.count + 1;
+        return true;
+    }
+
+    // 扫描并批量提取达到防抖时间或达到最长等待时间的就绪条目
+    public WriteBackItem[] DrainReady(long nowMs) {
+        if (this.count == 0) {
+            return new WriteBackItem[0];
+        }
+
+        // 先计算就绪数量
+        int readyCount = 0;
+        for (int i = 0; i < this.count; i = i + 1) {
+            WriteBackItem it = this.items[i];
+            if (it != null) {
+                bool debounced = (nowMs - it.lastUpdateTime) >= this.debounceMs;
+                bool maxDelayReached = (nowMs - it.firstDirtyTime) >= this.maxDelayMs;
+                if (debounced || maxDelayReached) {
+                    readyCount = readyCount + 1;
+                }
+            }
+        }
+
+        if (readyCount == 0) {
+            return new WriteBackItem[0];
+        }
+
+        WriteBackItem[] readyList = new WriteBackItem[readyCount];
+        int writeIdx = 0;
+
+        int i = 0;
+        while (i < this.count) {
+            WriteBackItem it = this.items[i];
+            if (it != null) {
+                bool debounced = (nowMs - it.lastUpdateTime) >= this.debounceMs;
+                bool maxDelayReached = (nowMs - it.firstDirtyTime) >= this.maxDelayMs;
+                if (debounced || maxDelayReached) {
+                    readyList[writeIdx] = it;
+                    writeIdx = writeIdx + 1;
+
+                    // 从队列中移除已提取项（尾部交换）
+                    this.items[i] = this.items[this.count - 1];
+                    this.items[this.count - 1] = null;
+                    this.count = this.count - 1;
+                    continue; // 重新检查当前交换过来的项
+                }
+            }
+            i = i + 1;
+        }
+
+        return readyList;
+    }
+
+    // 关服或全量存盘时清空并返回全部未落盘数据
+    public WriteBackItem[] FlushAll() {
+        if (this.count == 0) {
+            return new WriteBackItem[0];
+        }
+        WriteBackItem[] result = new WriteBackItem[this.count];
+        for (int i = 0; i < this.count; i = i + 1) {
+            result[i] = this.items[i];
+            this.items[i] = null;
+        }
+        this.count = 0;
+        return result;
+    }
+
+    private void EnsureCapacity() {
+        if (this.count < this.capacity) {
+            return;
+        }
+        int newCap = this.capacity * 2;
+        WriteBackItem[] newArr = new WriteBackItem[newCap];
+        for (int i = 0; i < this.count; i = i + 1) {
+            newArr[i] = this.items[i];
+        }
+        this.items = newArr;
+        this.capacity = newCap;
+    }
+}

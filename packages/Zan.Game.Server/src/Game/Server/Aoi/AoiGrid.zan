@@ -1,0 +1,285 @@
+using System;
+
+namespace Game.Server.Aoi;
+
+// 2D 空间九宫格视野管理器。
+public class AoiGrid {
+    public float minX;
+    public float minY;
+    public float maxX;
+    public float maxY;
+    public float cellSize;
+
+    public int cols;
+    public int rows;
+
+    // 格子内的实体 ID 列表，一维展开：index = y * cols + x
+    private long[][] cellEntities;
+    private int[] cellCounts;
+
+    // 全局实体注册表
+    private AoiEntity[] entities;
+    private int entityCount;
+    private int entityCap;
+
+    public AoiGrid(float minX, float minY, float maxX, float maxY, float cellSize) {
+        this.minX = minX;
+        this.minY = minY;
+        this.maxX = maxX;
+        this.maxY = maxY;
+        this.cellSize = cellSize > 1.0f ? cellSize : 10.0f;
+
+        float width = maxX - minX;
+        float height = maxY - minY;
+        this.cols = (int)(width / this.cellSize) + 1;
+        this.rows = (int)(height / this.cellSize) + 1;
+
+        int totalCells = this.cols * this.rows;
+        this.cellEntities = new long[totalCells][];
+        this.cellCounts = new int[totalCells];
+        for (int i = 0; i < totalCells; i = i + 1) {
+            this.cellEntities[i] = new long[8];
+            this.cellCounts[i] = 0;
+        }
+
+        this.entityCap = 128;
+        this.entities = new AoiEntity[this.entityCap];
+        this.entityCount = 0;
+    }
+
+    // 坐标计算格子 X
+    public int ToCellX(float x) {
+        int cx = (int)((x - this.minX) / this.cellSize);
+        if (cx < 0) { cx = 0; }
+        if (cx >= this.cols) { cx = this.cols - 1; }
+        return cx;
+    }
+
+    // 坐标计算格子 Y
+    public int ToCellY(float y) {
+        int cy = (int)((y - this.minY) / this.cellSize);
+        if (cy < 0) { cy = 0; }
+        if (cy >= this.rows) { cy = this.rows - 1; }
+        return cy;
+    }
+
+    public int CellIndex(int cx, int cy) {
+        return cy * this.cols + cx;
+    }
+
+    // 实体进入场景，返回周围九宫格内的所有实体
+    public long[] Enter(long id, float x, float y) {
+        if (id <= 0L || this.FindEntity(id) != null) {
+            return new long[0];
+        }
+
+        int cx = this.ToCellX(x);
+        int cy = this.ToCellY(y);
+        AoiEntity ent = new AoiEntity(id, x, y, cx, cy);
+        this.AddEntity(ent);
+
+        int cellIdx = this.CellIndex(cx, cy);
+        this.AddToCell(cellIdx, id);
+
+        return this.GetSurroundEntities(cx, cy, id);
+    }
+
+    // 实体离开场景，返回离开前周围九宫格内的所有实体
+    public long[] Leave(long id) {
+        AoiEntity ent = this.FindEntity(id);
+        if (ent == null) {
+            return new long[0];
+        }
+
+        long[] surrounds = this.GetSurroundEntities(ent.cellX, ent.cellY, id);
+
+        int cellIdx = this.CellIndex(ent.cellX, ent.cellY);
+        this.RemoveFromCell(cellIdx, id);
+        this.RemoveEntity(id);
+
+        return surrounds;
+    }
+
+    // 实体移动位置
+    public AoiDiff Move(long id, float newX, float newY) {
+        AoiEntity ent = this.FindEntity(id);
+        if (ent == null) {
+            return null;
+        }
+
+        int oldCx = ent.cellX;
+        int oldCy = ent.cellY;
+        int newCx = this.ToCellX(newX);
+        int newCy = this.ToCellY(newY);
+
+        ent.x = newX;
+        ent.y = newY;
+
+        // 格子没有发生变化，无需计算增量差集
+        if (oldCx == newCx && oldCy == newCy) {
+            return null;
+        }
+
+        // 跨格子：更新实体所在格
+        this.RemoveFromCell(this.CellIndex(oldCx, oldCy), id);
+        this.AddToCell(this.CellIndex(newCx, newCy), id);
+        ent.cellX = newCx;
+        ent.cellY = newCy;
+
+        AoiDiff diff = new AoiDiff(16);
+
+        // 计算视野离开集合：在 old 九宫格，但不在 new 九宫格中的格子实体
+        for (int dy = -1; dy <= 1; dy = dy + 1) {
+            for (int dx = -1; dx <= 1; dx = dx + 1) {
+                int cx = oldCx + dx;
+                int cy = oldCy + dy;
+                if (cx >= 0 && cx < this.cols && cy >= 0 && cy < this.rows) {
+                    // 如果该格子不在新九宫格内
+                    if (cx < newCx - 1 || cx > newCx + 1 || cy < newCy - 1 || cy > newCy + 1) {
+                        int cIdx = this.CellIndex(cx, cy);
+                        int count = this.cellCounts[cIdx];
+                        for (int i = 0; i < count; i = i + 1) {
+                            long otherId = this.cellEntities[cIdx][i];
+                            if (otherId != id) {
+                                diff.AddLeave(otherId);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // 计算视野进入集合：在 new 九宫格，但不在 old 九宫格中的格子实体
+        for (int dy = -1; dy <= 1; dy = dy + 1) {
+            for (int dx = -1; dx <= 1; dx = dx + 1) {
+                int cx = newCx + dx;
+                int cy = newCy + dy;
+                if (cx >= 0 && cx < this.cols && cy >= 0 && cy < this.rows) {
+                    // 如果该格子不在旧九宫格内
+                    if (cx < oldCx - 1 || cx > oldCx + 1 || cy < oldCy - 1 || cy > oldCy + 1) {
+                        int cIdx = this.CellIndex(cx, cy);
+                        int count = this.cellCounts[cIdx];
+                        for (int i = 0; i < count; i = i + 1) {
+                            long otherId = this.cellEntities[cIdx][i];
+                            if (otherId != id) {
+                                diff.AddEnter(otherId);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        return diff;
+    }
+
+    // 获取某个格子周围九宫格内的所有其它实体
+    public long[] GetSurroundEntities(int cx, int cy, long excludeId) {
+        int total = 0;
+        // 先统计数量
+        for (int dy = -1; dy <= 1; dy = dy + 1) {
+            for (int dx = -1; dx <= 1; dx = dx + 1) {
+                int x = cx + dx;
+                int y = cy + dy;
+                if (x >= 0 && x < this.cols && y >= 0 && y < this.rows) {
+                    total = total + this.cellCounts[this.CellIndex(x, y)];
+                }
+            }
+        }
+
+        if (total == 0) {
+            return new long[0];
+        }
+
+        long[] result = new long[total];
+        int writeIdx = 0;
+        for (int dy = -1; dy <= 1; dy = dy + 1) {
+            for (int dx = -1; dx <= 1; dx = dx + 1) {
+                int x = cx + dx;
+                int y = cy + dy;
+                if (x >= 0 && x < this.cols && y >= 0 && y < this.rows) {
+                    int cIdx = this.CellIndex(x, y);
+                    int count = this.cellCounts[cIdx];
+                    for (int i = 0; i < count; i = i + 1) {
+                        long eid = this.cellEntities[cIdx][i];
+                        if (eid != excludeId) {
+                            result[writeIdx] = eid;
+                            writeIdx = writeIdx + 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        // 截取有效数组
+        if (writeIdx == total) {
+            return result;
+        }
+        long[] trimmed = new long[writeIdx];
+        for (int i = 0; i < writeIdx; i = i + 1) {
+            trimmed[i] = result[i];
+        }
+        return trimmed;
+    }
+
+    public AoiEntity FindEntity(long id) {
+        for (int i = 0; i < this.entityCount; i = i + 1) {
+            if (this.entities[i] != null && this.entities[i].id == id) {
+                return this.entities[i];
+            }
+        }
+        return null;
+    }
+
+    private void AddEntity(AoiEntity ent) {
+        if (this.entityCount >= this.entityCap) {
+            int newCap = this.entityCap * 2;
+            AoiEntity[] n = new AoiEntity[newCap];
+            for (int i = 0; i < this.entityCount; i = i + 1) {
+                n[i] = this.entities[i];
+            }
+            this.entities = n;
+            this.entityCap = newCap;
+        }
+        this.entities[this.entityCount] = ent;
+        this.entityCount = this.entityCount + 1;
+    }
+
+    private void RemoveEntity(long id) {
+        for (int i = 0; i < this.entityCount; i = i + 1) {
+            if (this.entities[i] != null && this.entities[i].id == id) {
+                this.entities[i] = this.entities[this.entityCount - 1];
+                this.entities[this.entityCount - 1] = null;
+                this.entityCount = this.entityCount - 1;
+                return;
+            }
+        }
+    }
+
+    private void AddToCell(int cellIdx, long id) {
+        int count = this.cellCounts[cellIdx];
+        long[] list = this.cellEntities[cellIdx];
+        if (count >= list.Length) {
+            long[] n = new long[list.Length * 2];
+            for (int i = 0; i < count; i = i + 1) {
+                n[i] = list[i];
+            }
+            this.cellEntities[cellIdx] = n;
+            list = n;
+        }
+        list[count] = id;
+        this.cellCounts[cellIdx] = count + 1;
+    }
+
+    private void RemoveFromCell(int cellIdx, long id) {
+        int count = this.cellCounts[cellIdx];
+        long[] list = this.cellEntities[cellIdx];
+        for (int i = 0; i < count; i = i + 1) {
+            if (list[i] == id) {
+                list[i] = list[count - 1];
+                this.cellCounts[cellIdx] = count - 1;
+                return;
+            }
+        }
+    }
+}

@@ -1,0 +1,106 @@
+using System;
+using Game.Server.Core;
+
+namespace Game.Server.Cluster;
+
+// 待发往远端节点的 RPC 消息包
+public class RemotePacket {
+    public int targetNodeId;
+    public ActorMessage message;
+
+    public RemotePacket(int targetNodeId, ActorMessage message) {
+        this.targetNodeId = targetNodeId;
+        this.message = message;
+    }
+}
+
+// 集群路由分发器：实现跨节点 Actor 透明寻址。
+public class ClusterRouter {
+    public int localNodeId;
+    public ActorSystem actorSystem;
+    public LocationService locationService;
+
+    // 远端跨节点待发送出站队列
+    private RemotePacket[] outboundQueue;
+    private int outboundHead;
+    private int outboundTail;
+    private int outboundCount;
+    private int outboundCapacity;
+
+    public ClusterRouter(int localNodeId, ActorSystem actorSystem, LocationService locationService, int queueCap) {
+        this.localNodeId = localNodeId;
+        this.actorSystem = actorSystem;
+        this.locationService = locationService;
+
+        int cap = queueCap > 16 ? queueCap : 64;
+        this.outboundCapacity = cap;
+        this.outboundQueue = new RemotePacket[cap];
+        this.outboundHead = 0;
+        this.outboundTail = 0;
+        this.outboundCount = 0;
+    }
+
+    public ClusterRouter(int localNodeId, ActorSystem actorSystem, LocationService locationService) : this(localNodeId, actorSystem, locationService, 256) {
+    }
+
+    public int OutboundCount() {
+        return this.outboundCount;
+    }
+
+    // 跨节点透明路由投递
+    // 返回值：
+    //  1 = 本地投递成功
+    //  2 = 远端压入出站队列成功
+    // -1 = 目标 Actor 未在 LocationService 中找到
+    // -2 = 队列满或目标系统不可达
+    public int Route(ActorMessage msg) {
+        if (msg == null || msg.targetId == 0L || this.locationService == null) {
+            return -1;
+        }
+
+        int targetNode = this.locationService.GetNode(msg.targetId);
+        if (targetNode < 0) {
+            // 未定位到目标 Actor
+            return -1;
+        }
+
+        // 1. 本地节点：直接投递 ActorSystem
+        if (targetNode == this.localNodeId) {
+            if (this.actorSystem != null && this.actorSystem.Send(msg)) {
+                return 1;
+            }
+            return -2;
+        }
+
+        // 2. 远端节点：压入待发往远端节点的队列
+        if (this.outboundCount >= this.outboundCapacity) {
+            return -2;
+        }
+
+        RemotePacket rp = new RemotePacket(targetNode, msg);
+        this.outboundQueue[this.outboundTail] = rp;
+        this.outboundTail = (this.outboundTail + 1) % this.outboundCapacity;
+        this.outboundCount = this.outboundCount + 1;
+        return 2;
+    }
+
+    // 弹出一条待发送到远端的报文
+    public RemotePacket PollOutbound() {
+        if (this.outboundCount == 0) {
+            return null;
+        }
+        RemotePacket p = this.outboundQueue[this.outboundHead];
+        this.outboundQueue[this.outboundHead] = null;
+        this.outboundHead = (this.outboundHead + 1) % this.outboundCapacity;
+        this.outboundCount = this.outboundCount - 1;
+        return p;
+    }
+
+    // 处理从集群其它节点接收到的入站消息
+    public bool DeliverInbound(ActorMessage msg) {
+        if (msg == null || this.actorSystem == null) {
+            return false;
+        }
+        return this.actorSystem.Send(msg);
+    }
+}

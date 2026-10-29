@@ -1,0 +1,152 @@
+using System;
+
+namespace Game.Server.Network;
+
+// 客户端长连接会话（具备断线重连与下行缓冲）。
+public class Session {
+    public const int STATE_INIT = 0;
+    public const int STATE_CONNECTED = 1;
+    public const int STATE_DISCONNECTED = 2;
+    public const int STATE_CLOSED = 3;
+
+    public long sessionId;
+    public long playerId;
+    public string token;
+    public int state;
+    public long lastActiveTime;
+    public long disconnectTime;
+
+    public PacketFramer framer;
+
+    // 下行未确认报文暂存缓冲（用于断线重连后快速补发）
+    private Packet[] outbox;
+    private int outboxHead;
+    private int outboxTail;
+    private int outboxCount;
+    private int outboxCapacity;
+
+    public Session(long sessionId, int outboxCap) {
+        this.sessionId = sessionId;
+        this.playerId = 0L;
+        this.token = "";
+        this.state = STATE_INIT;
+        this.lastActiveTime = 0L;
+        this.disconnectTime = 0L;
+        this.framer = new PacketFramer(1024, 1024 * 1024);
+
+        int cap = outboxCap > 16 ? outboxCap : 64;
+        this.outboxCapacity = cap;
+        this.outbox = new Packet[cap];
+        this.outboxHead = 0;
+        this.outboxTail = 0;
+        this.outboxCount = 0;
+    }
+
+    public Session(long sessionId) : this(sessionId, 64) {
+    }
+
+    public void BindPlayer(long pId, string reconnectToken) {
+        this.playerId = pId;
+        this.token = reconnectToken != null ? reconnectToken : "";
+        this.state = STATE_CONNECTED;
+    }
+
+    public void UpdateHeartbeat(long nowMs) {
+        this.lastActiveTime = nowMs;
+        if (this.state == STATE_INIT) {
+            this.state = STATE_CONNECTED;
+        }
+    }
+
+    // 标记断线（进入断线重连保留期）
+    public void MarkDisconnected(long nowMs) {
+        if (this.state != STATE_CLOSED) {
+            this.state = STATE_DISCONNECTED;
+            this.disconnectTime = nowMs;
+        }
+    }
+
+    // 尝试断线重连恢复
+    public bool TryResume(long newSessionId, string resumeToken, long nowMs) {
+        if (this.state != STATE_DISCONNECTED) {
+            return false;
+        }
+        if (this.token != "" && this.token != resumeToken) {
+            return false;
+        }
+        this.sessionId = newSessionId;
+        this.state = STATE_CONNECTED;
+        this.lastActiveTime = nowMs;
+        this.disconnectTime = 0L;
+        return true;
+    }
+
+    public void Close() {
+        this.state = STATE_CLOSED;
+        this.ClearOutbox();
+    }
+
+    public bool IsActive() {
+        return this.state == STATE_CONNECTED;
+    }
+
+    // 将报文压入下行队列
+    public bool EnqueueOutbox(Packet packet) {
+        if (packet == null || this.state == STATE_CLOSED) {
+            return false;
+        }
+        if (this.outboxCount >= this.outboxCapacity) {
+            // 溢出时淘汰最老的一条
+            this.outbox[this.outboxHead] = null;
+            this.outboxHead = (this.outboxHead + 1) % this.outboxCapacity;
+            this.outboxCount = this.outboxCount - 1;
+        }
+        this.outbox[this.outboxTail] = packet;
+        this.outboxTail = (this.outboxTail + 1) % this.outboxCapacity;
+        this.outboxCount = this.outboxCount + 1;
+        return true;
+    }
+
+    // 获取未确认报文数量
+    public int OutboxCount() {
+        return this.outboxCount;
+    }
+
+    // 重连后导出所有待补发的报文
+    public Packet[] DrainOutbox() {
+        int count = this.outboxCount;
+        if (count == 0) {
+            return new Packet[0];
+        }
+        Packet[] result = new Packet[count];
+        for (int i = 0; i < count; i = i + 1) {
+            int idx = (this.outboxHead + i) % this.outboxCapacity;
+            result[i] = this.outbox[idx];
+        }
+        return result;
+    }
+
+    // 确认收到 seq 之前的报文，清理缓冲
+    public void Ack(int ackSeq) {
+        // 从头部开始弹出 <= ackSeq 的报文
+        while (this.outboxCount > 0) {
+            Packet p = this.outbox[this.outboxHead];
+            if (p != null && p.seq <= ackSeq) {
+                this.outbox[this.outboxHead] = null;
+                this.outboxHead = (this.outboxHead + 1) % this.outboxCapacity;
+                this.outboxCount = this.outboxCount - 1;
+            } else {
+                break;
+            }
+        }
+    }
+
+    public void ClearOutbox() {
+        for (int i = 0; i < this.outboxCapacity; i = i + 1) {
+            this.outbox[i] = null;
+        }
+        this.outboxHead = 0;
+        this.outboxTail = 0;
+        this.outboxCount = 0;
+    }
+}

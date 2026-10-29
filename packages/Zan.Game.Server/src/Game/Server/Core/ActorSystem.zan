@@ -1,0 +1,166 @@
+using System;
+
+namespace Game.Server.Core;
+
+// Actor 调度系统：负责 Actor 生命周期、消息投递与分发调度。
+public class ActorSystem {
+    private Actor[] actors;
+    private int capacity;
+    private int count;
+
+    public ActorSystem(int initialCapacity) {
+        int cap = initialCapacity > 16 ? initialCapacity : 128;
+        this.capacity = cap;
+        this.actors = new Actor[cap];
+        this.count = 0;
+    }
+
+    public ActorSystem() : this(256) {
+    }
+
+    public int Count() {
+        return this.count;
+    }
+
+    // 孵化 Actor
+    public bool Spawn(Actor actor) {
+        if (actor == null || actor.id == 0L) {
+            return false;
+        }
+        if (this.Get(actor.id) != null) {
+            return false;
+        }
+        this.EnsureCapacity();
+        actor.system = this;
+        actor.isAlive = true;
+        this.actors[this.count] = actor;
+        this.count = this.count + 1;
+
+        actor.OnInit();
+        return true;
+    }
+
+    // 终止 Actor
+    public bool Kill(long actorId) {
+        for (int i = 0; i < this.count; i = i + 1) {
+            Actor a = this.actors[i];
+            if (a != null && a.id == actorId) {
+                a.isAlive = false;
+                a.OnDestroy();
+                a.system = null;
+                if (a.mailbox != null) {
+                    a.mailbox.Clear();
+                }
+
+                // 交换移除
+                this.actors[i] = this.actors[this.count - 1];
+                this.actors[this.count - 1] = null;
+                this.count = this.count - 1;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // 清空并解除所有 Actor 绑定
+    public void Clear() {
+        for (int i = 0; i < this.count; i = i + 1) {
+            Actor a = this.actors[i];
+            if (a != null) {
+                a.system = null;
+                if (a.mailbox != null) {
+                    a.mailbox.Clear();
+                }
+                this.actors[i] = null;
+            }
+        }
+        this.count = 0;
+    }
+
+    // 查询 Actor
+    public Actor Get(long actorId) {
+        for (int i = 0; i < this.count; i = i + 1) {
+            Actor a = this.actors[i];
+            if (a != null && a.id == actorId && a.isAlive) {
+                return a;
+            }
+        }
+        return null;
+    }
+
+    // 投递消息
+    public bool Send(ActorMessage msg) {
+        if (msg == null || msg.targetId == 0L) {
+            return false;
+        }
+        Actor target = this.Get(msg.targetId);
+        if (target == null || !target.isAlive) {
+            return false;
+        }
+        return target.mailbox.Enqueue(msg);
+    }
+
+    // 广播消息给指定类型（若 actorType == 0 则广播给所有 Actor）
+    public int Broadcast(int actorType, ActorMessage msg) {
+        if (msg == null) { return 0; }
+        int dispatched = 0;
+        for (int i = 0; i < this.count; i = i + 1) {
+            Actor a = this.actors[i];
+            if (a != null && a.isAlive) {
+                if (actorType == 0 || a.actorType == actorType) {
+                    if (a.mailbox.Enqueue(msg)) {
+                        dispatched = dispatched + 1;
+                    }
+                }
+            }
+        }
+        return dispatched;
+    }
+
+    // 消息派发轮询：单轮最多消费每个 Actor 的 maxPerActor 条消息，防止饥饿
+    public int Dispatch(int maxPerActor) {
+        int limit = maxPerActor > 0 ? maxPerActor : 16;
+        int totalProcessed = 0;
+
+        for (int i = 0; i < this.count; i = i + 1) {
+            Actor a = this.actors[i];
+            if (a == null || !a.isAlive) {
+                continue;
+            }
+
+            int processedThisActor = 0;
+            while (processedThisActor < limit && !a.mailbox.IsEmpty()) {
+                ActorMessage msg = a.mailbox.Dequeue();
+                if (msg != null) {
+                    a.OnReceive(msg);
+                    processedThisActor = processedThisActor + 1;
+                    totalProcessed = totalProcessed + 1;
+                }
+            }
+        }
+        return totalProcessed;
+    }
+
+    // 周期心跳驱动
+    public void Tick(long deltaMs) {
+        for (int i = 0; i < this.count; i = i + 1) {
+            Actor a = this.actors[i];
+            if (a != null && a.isAlive) {
+                a.OnTick(deltaMs);
+            }
+        }
+    }
+
+    private void EnsureCapacity() {
+        if (this.count < this.capacity) {
+            return;
+        }
+        int newCap = this.capacity * 2;
+        Actor[] newArr = new Actor[newCap];
+        for (int i = 0; i < this.count; i = i + 1) {
+            newArr[i] = this.actors[i];
+        }
+        this.actors = newArr;
+        this.capacity = newCap;
+    }
+}

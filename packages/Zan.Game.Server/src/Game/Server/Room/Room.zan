@@ -1,0 +1,173 @@
+using System;
+using Game.Server.Network;
+
+namespace Game.Server.Room;
+
+// 对局房间实体（承载游戏对局生命周期与帧驱动）。
+public class Room {
+    public const int STATE_WAITING = 0;
+    public const int STATE_PLAYING = 1;
+    public const int STATE_SETTLING = 2;
+    public const int STATE_CLOSED = 3;
+
+    public long roomId;
+    public int maxMembers;
+    public int state;
+    public int currentFrame;
+
+    private RoomMember[] members;
+    private int memberCount;
+
+    public Room(long roomId, int maxMembers) {
+        this.roomId = roomId;
+        int max = maxMembers > 1 ? maxMembers : 2;
+        this.maxMembers = max;
+        this.state = STATE_WAITING;
+        this.currentFrame = 0;
+
+        this.members = new RoomMember[max];
+        this.memberCount = 0;
+    }
+
+    public int MemberCount() {
+        return this.memberCount;
+    }
+
+    public bool IsFull() {
+        return this.memberCount >= this.maxMembers;
+    }
+
+    public bool Join(long playerId, int teamId, long nowMs) {
+        if (playerId <= 0L || this.IsFull() || this.state != STATE_WAITING) {
+            return false;
+        }
+        if (this.FindMember(playerId) != null) {
+            return false;
+        }
+
+        RoomMember m = new RoomMember(playerId, teamId, nowMs);
+        this.members[this.memberCount] = m;
+        this.memberCount = this.memberCount + 1;
+        return true;
+    }
+
+    public bool Leave(long playerId) {
+        for (int i = 0; i < this.memberCount; i = i + 1) {
+            RoomMember m = this.members[i];
+            if (m != null && m.playerId == playerId) {
+                // 如果对局已在进行中，仅标记离线，避免破坏帧同步一致性
+                if (this.state == STATE_PLAYING) {
+                    m.isOnline = false;
+                    return true;
+                }
+                // 等待阶段直接移出
+                this.members[i] = this.members[this.memberCount - 1];
+                this.members[this.memberCount - 1] = null;
+                this.memberCount = this.memberCount - 1;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    public RoomMember FindMember(long playerId) {
+        for (int i = 0; i < this.memberCount; i = i + 1) {
+            RoomMember m = this.members[i];
+            if (m != null && m.playerId == playerId) {
+                return m;
+            }
+        }
+        return null;
+    }
+
+    public bool SetReady(long playerId, bool ready) {
+        RoomMember m = this.FindMember(playerId);
+        if (m == null || this.state != STATE_WAITING) {
+            return false;
+        }
+        m.isReady = ready;
+        return true;
+    }
+
+    public bool AreAllReady() {
+        if (this.memberCount < 2) {
+            return false;
+        }
+        for (int i = 0; i < this.memberCount; i = i + 1) {
+            RoomMember m = this.members[i];
+            if (m == null || !m.isReady) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    public bool StartGame() {
+        if (this.state != STATE_WAITING || !this.AreAllReady()) {
+            return false;
+        }
+        this.state = STATE_PLAYING;
+        this.currentFrame = 0;
+        return true;
+    }
+
+    public void FinishGame() {
+        this.state = STATE_SETTLING;
+    }
+
+    public void Close() {
+        this.state = STATE_CLOSED;
+    }
+
+    // 逻辑帧步进（例如 20Hz / 60Hz 驱动）
+    public int Tick(long deltaMs) {
+        if (this.state != STATE_PLAYING) {
+            return this.currentFrame;
+        }
+        this.currentFrame = this.currentFrame + 1;
+        return this.currentFrame;
+    }
+
+    // 广播报文送达给房间内成员会话
+    public int Broadcast(SessionManager sessionMgr, Packet packet) {
+        if (sessionMgr == null || packet == null) { return 0; }
+        int sent = 0;
+        for (int i = 0; i < this.memberCount; i = i + 1) {
+            RoomMember m = this.members[i];
+            if (m != null && m.isOnline) {
+                Session s = sessionMgr.GetByPlayerId(m.playerId);
+                if (s != null && s.IsActive()) {
+                    s.EnqueueOutbox(packet);
+                    sent = sent + 1;
+                }
+            }
+        }
+        return sent;
+    }
+
+    // 广播给房间内除指定玩家外的成员
+    public int BroadcastExcept(SessionManager sessionMgr, long excludePlayerId, Packet packet) {
+        if (sessionMgr == null || packet == null) { return 0; }
+        int sent = 0;
+        for (int i = 0; i < this.memberCount; i = i + 1) {
+            RoomMember m = this.members[i];
+            if (m != null && m.isOnline && m.playerId != excludePlayerId) {
+                Session s = sessionMgr.GetByPlayerId(m.playerId);
+                if (s != null && s.IsActive()) {
+                    s.EnqueueOutbox(packet);
+                    sent = sent + 1;
+                }
+            }
+        }
+        return sent;
+    }
+
+    // 获取房间内全部成员 ID
+    public long[] GetMemberIds() {
+        long[] ids = new long[this.memberCount];
+        for (int i = 0; i < this.memberCount; i = i + 1) {
+            ids[i] = this.members[i].playerId;
+        }
+        return ids;
+    }
+}

@@ -1,0 +1,109 @@
+using System;
+
+namespace Game.Server.Cluster;
+
+// 集群 Actor 位置服务（维护全局 ActorId -> NodeId 映射）。
+public class LocationService {
+    private LocationRecord[] records;
+    private int capacity;
+    private int count;
+
+    public LocationService(int initialCapacity) {
+        int cap = initialCapacity > 16 ? initialCapacity : 128;
+        this.capacity = cap;
+        this.records = new LocationRecord[cap];
+        this.count = 0;
+    }
+
+    public LocationService() : this(512) {
+    }
+
+    public int Count() {
+        return this.count;
+    }
+
+    // 注册或更新 Actor 所在节点
+    public bool Register(long actorId, int nodeId, int version, long nowMs) {
+        if (actorId <= 0L || nodeId < 0) {
+            return false;
+        }
+
+        for (int i = 0; i < this.count; i = i + 1) {
+            LocationRecord r = this.records[i];
+            if (r != null && r.actorId == actorId) {
+                // 如果已有记录，按版本号单调递增覆盖
+                if (version >= r.version) {
+                    r.nodeId = nodeId;
+                    r.version = version;
+                    r.updateTime = nowMs;
+                    return true;
+                }
+                return false;
+            }
+        }
+
+        this.EnsureCapacity();
+        LocationRecord nr = new LocationRecord(actorId, nodeId, version, nowMs);
+        this.records[this.count] = nr;
+        this.count = this.count + 1;
+        return true;
+    }
+
+    // 查询 Actor 所在节点 ID（未找到则返回 -1）
+    public int GetNode(long actorId) {
+        for (int i = 0; i < this.count; i = i + 1) {
+            LocationRecord r = this.records[i];
+            if (r != null && r.actorId == actorId) {
+                return r.nodeId;
+            }
+        }
+        return -1;
+    }
+
+    // 原子跨节点迁移
+    public bool Migrate(long actorId, int fromNodeId, int toNodeId, int newVersion, long nowMs) {
+        for (int i = 0; i < this.count; i = i + 1) {
+            LocationRecord r = this.records[i];
+            if (r != null && r.actorId == actorId) {
+                if (r.nodeId == fromNodeId && newVersion > r.version) {
+                    r.nodeId = toNodeId;
+                    r.version = newVersion;
+                    r.updateTime = nowMs;
+                    return true;
+                }
+                return false;
+            }
+        }
+        return false;
+    }
+
+    // 注销 Actor 位置
+    public bool Unregister(long actorId, int nodeId) {
+        for (int i = 0; i < this.count; i = i + 1) {
+            LocationRecord r = this.records[i];
+            if (r != null && r.actorId == actorId) {
+                if (nodeId < 0 || r.nodeId == nodeId) {
+                    this.records[i] = this.records[this.count - 1];
+                    this.records[this.count - 1] = null;
+                    this.count = this.count - 1;
+                    return true;
+                }
+                return false;
+            }
+        }
+        return false;
+    }
+
+    private void EnsureCapacity() {
+        if (this.count < this.capacity) {
+            return;
+        }
+        int newCap = this.capacity * 2;
+        LocationRecord[] newArr = new LocationRecord[newCap];
+        for (int i = 0; i < this.count; i = i + 1) {
+            newArr[i] = this.records[i];
+        }
+        this.records = newArr;
+        this.capacity = newCap;
+    }
+}
