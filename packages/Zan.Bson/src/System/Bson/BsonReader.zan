@@ -125,16 +125,15 @@ public class BsonReader {
     }
 
     // cstring 元素名：扫描到第一个 NUL（cstring 定义上不含 NUL，
-    // 首个即终结）；扫到文档尾都没遇到即畸形。
+    // 首个即终结）；扫到文档尾都没遇到即畸形。直接从 buf 切片解码，零中间数组分配。
     public string CStr(int bodyEnd) {
         int start = pos;
         while (pos < bodyEnd && pos < len) {
             if ((buf[pos] & 255) == 0) {
                 int n = pos - start;
-                pos = start;
-                byte[] b = Take(n);
+                string s = buf.ToStr(start, n);
                 pos = pos + 1;
-                return Encoding.GetString(b, 0, b.Length);
+                return s;
             }
             pos = pos + 1;
         }
@@ -148,7 +147,7 @@ public class BsonReader {
             return JsonValue.NewDouble(BitsDouble(U64LE()));
         }
         if (t == 2) {  // string
-            return JsonValue.NewStr(DecodedText(StringBody()));
+            return JsonValue.NewStr(ReadString());
         }
         if (t == 3) { return ReadDocument(depth + 1, false); }  // document
         if (t == 4) { return ReadDocument(depth + 1, true); }  // array
@@ -188,8 +187,8 @@ public class BsonReader {
     }
 
     // string 值主体：int32 字节数（含终止 NUL）+ 字节 + NUL，
-    // 末字节必须为 0。
-    public byte[] StringBody() {
+    // 末字节必须为 0。直接从 buf 切片解码，消除中间 byte[] 堆分配。
+    public string ReadString() {
         int n = S32LE();
         if (n < 1) {
             throw new BsonException("string length " + Convert.ToString(n)
@@ -199,14 +198,17 @@ public class BsonReader {
             throw new BsonException("string length " + Convert.ToString(n)
                 + " exceeds 512MB limit at byte " + Convert.ToString(pos));
         }
-        byte[] b = Take(n);
-        if ((b[n - 1] & 255) != 0) {
-            throw new BsonException("string missing NUL terminator at byte "
-                + Convert.ToString(pos));
+        if (n > len - pos) {
+            throw new BsonException("truncated at byte "
+                + Convert.ToString(pos) + " (need " + Convert.ToString(n) + ")");
         }
-        byte[] body = new byte[n - 1];
-        NativeMemory.Copy((nint)body, (nint)b, n - 1);
-        return body;
+        if ((buf[pos + n - 1] & 255) != 0) {
+            throw new BsonException("string missing NUL terminator at byte "
+                + Convert.ToString(pos + n));
+        }
+        string s = buf.ToStr(pos, n - 1);
+        pos = pos + n;
+        return s;
     }
 
     // 12 字节 ObjectId → 24 位小写十六进制。

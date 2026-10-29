@@ -83,123 +83,79 @@ program.
 
 ```
 stdlib/
-├── System/                          # namespace System
+├── System/                          # namespace System（核心基石原语）
 │   ├── ConsoleColor.zan             # ConsoleColor enum
 │   ├── DateTime.zan                 # Date and time
 │   ├── Guid.zan                     # UUID generation
 │   ├── Random.zan                   # Random numbers (non-cryptographic)
-│   ├── RandomNumberGenerator.zan    # OS CSPRNG bytes — a root primitive:
-│   │                                # keeping it under Security/Cryptography
-│   │                                # made `using System;` pull 29 files
-│   ├── Stopwatch.zan                # monotonic clock + elapsed timing
-│   │                                # (QPC / clock_gettime); also the static
-│   │                                # GetMilliseconds/GetMicroseconds readings
+│   ├── RandomNumberGenerator.zan    # OS CSPRNG bytes
+│   ├── Stopwatch.zan                # monotonic clock + elapsed timing (QPC / clock_gettime)
 │   ├── TimeSpan.zan                 # Time span
 │   ├── GC.zan                       # Allocation tracking + memory metrics (A464)
 │   ├── Binding.zan                  # late binding / dynamic dispatch helpers
 │   ├── TaskJoin.zan                 # async task join helpers
-│   ├── ZanVersion.zan               # version constants (generated from .in)
+│   ├── ZanVersion.zan               # version constants
 │   │
-│   ├── Exceptions/                  # namespace System — Exception base +
-│   │                                # the concrete exception types
-│   ├── Interop/                     # namespace System — FFI/marshaling:
-│   │                                # Interop ([DllImport] wrappers),
-│   │                                # NativeMemory, Marshal, Com/ComVtbl, Wide
-│   ├── Extensions/                  # namespace System — extension methods:
-│   │                                # ListExtensions, StringExtensions,
-│   │                                # MemoryExtensions
+│   ├── Exceptions/                  # namespace System — Exception base + concrete types
+│   ├── Interop/                     # namespace System — FFI/marshaling: NativeMemory, Marshal, Com, Wide
+│   ├── Extensions/                  # namespace System — ListExtensions, StringExtensions, MemoryExtensions
 │   │
-│   ├── IO/                          # System.IO
-│   │   ├── File.zan                 # file read/write (static helpers)
-│   │   ├── Directory.zan            # directory operations
-│   │   ├── Path.zan                 # path manipulation
-│   │   ├── Stream.zan               # base stream class
-│   │   ├── StreamReader.zan         # text reading
-│   │   ├── StreamWriter.zan         # text writing
-│   │   ├── FileStream.zan           # file stream
-│   │   ├── MemoryStream.zan         # in-memory stream
-│   │   ├── ByteBuffer.zan           # growable byte buffer
-│   │   ├── FileInfo.zan / FileInfoEx.zan
-│   │   ├── DirectoryTree.zan        # directory tree enumeration
-│   │   ├── Watch/                   # System.IO.Watch — DirectoryWatcher
-│   │   │                            # (separate namespace: it needs a
-│   │   │                            #  background thread, and pulling
-│   │   │                            #  System.Threading into every reader
-│   │   │                            #  of a file cost +34 files / +150KB)
-│   │   ├── IniFile.zan              # INI parsing
-│   │   ├── Shortcut.zan             # .lnk / .desktop shortcuts
-│   │   ├── KnownFolders.zan         # OS known-folder lookup
-│   │   ├── MemoryMappedFile.zan     # memory-mapped files
-│   │   └── Compression/             # Deflate / GZip / Zip / Tar / Crc32
+│   ├── IO/                          # System.IO 原语基石
+│   │   ├── File.zan                 # 基础文件读写与同步/异步双轨 API
+│   │   ├── Directory.zan            # 目录扫描、创建与双轨异步操作
+│   │   ├── Path.zan                 # 路径运算与归一化
+│   │   ├── Stream.zan               # 基础抽象流
+│   │   ├── FileStream.zan           # 文件流
+│   │   ├── ByteBuffer.zan           # 可增长字节缓冲区
+│   │   ├── FileInfo.zan             # 文件元数据
+│   │   ├── FileInfoEx.zan           # 文件扩展信息与属性探针
+│   │   └── SeekOrigin.zan           # 偏移枚举
 │   │
-│   ├── Collections/                 # System.Collections
-│   │   ├── Generic/
-│   │   │   └── KeyValuePair.zan     # KVP(K, V) key/value pair
-│   │   ├── HashSet.zan              # hash set
-│   │   ├── LinkedList.zan           # doubly linked list
-│   │   ├── Queue.zan                # FIFO queue
-│   │   └── Stack.zan                # LIFO stack
+│   ├── Collections/Generic/         # System.Collections.Generic 基础集合容器
+│   │   ├── HashSet.zan              # 哈希集合
+│   │   ├── LinkedList.zan           # 双向链表
+│   │   ├── Queue.zan                # 连续环形数组 FIFO 队列
+│   │   ├── Stack.zan                # LIFO 栈
+│   │   ├── PriorityQueue.zan        # 最小堆优先队列
+│   │   ├── RingBuffer.zan           # 定长环形缓冲
+│   │   ├── KeyValuePair.zan         # 键值对
+│   │   ├── IEnumerable.zan          # 迭代器接口
+│   │   └── IEnumerator.zan          # 枚举器接口
 │   │
-│   ├── Text/                        # System.Text (encoding only; text
-│   │   │                            # processing lives in packages/Zan.Text,
-│   │   │                            # CSV in packages/Zan.Csv)
-│   │   └── Encoding.zan             # UTF-8/16/32 encoding
+│   ├── Json/                        # System.Json 零分配与扁平解析
+│   │   ├── Json.zan                 # 顶层序列化/反序列化门面
+│   │   ├── JsonValue.zan            # 经典 AST 对象模型
+│   │   ├── JsonDoc.zan              # 扁平只读无分配索引文档（极速推荐）
+│   │   ├── JsonReader.zan           # 词法与语法流式游标扫描
+│   │   ├── JsonWriter.zan           # 文本格式化发射器
+│   │   └── JsonTape.zan             # 线性记录磁带
 │   │
-│   ├── Net/                         # System.Net
-│   │   ├── IPAddress.zan / NetworkInterface.zan / ServerBanner.zan
-│   │   ├── Ping.zan                 # ICMP ping
-│   │   ├── Worker.zan               # background worker helpers
-│   │   ├── Http/                    # Client/ (HttpClient, CookieJar, SseSink),
-│   │   │                            # HttpServer.zan, HttpRequest.zan,
-│   │   │                            # HttpResponse.zan, Proxy/ (HttpForwarder)
-│   │   ├── Https/                   # HttpsServer.zan
-│   │   ├── Sockets/                 # Socket, TcpClient, TcpListener,
-│   │   │                            # UdpClient, AsyncSocket
-│   │   ├── Tls/                     # TlsStream.zan (+ drivers/)
-│   │   ├── WebSocket/               # WebSocketClient.zan (+ Secure/)
-│   │   ├── Sse/                     # server-sent events
-│   │   ├── Mqtt/                    # MqttClient, MqttBroker
-│   │   ├── Coap/                    # CoapClient
-│   │   ├── Modbus/                  # ModbusClient
-│   │   ├── Sip/                     # SipClient, SipMessage
-│   │   ├── Ntp/                     # NtpClient
-│   │   ├── WebDav/                  # WebDavClient
-│   │   └── Rpc/                     # RpcClient/RpcServer, codecs, transports
+│   ├── Numerics/                    # System.Numerics
+│   │   └── MathUtil.zan             # 高精度数学计算
 │   │
-│   ├── Threading/                   # System.Threading
-│   │   ├── Thread.zan / Mutex.zan / Semaphore.zan
-│   │   │                            # AtomicInt.zan / SharedTable.zan
-│   │   ├── AsyncGate.zan / AsyncRwLock.zan / BlockingQueue.zan
-│   │   ├── Gate.zan / SemaphoreSlim.zan / Timer.zan
+│   ├── Text/                        # System.Text
+│   │   └── Encoding.zan             # UTF-8/16/32 编码解码
 │   │
-│   ├── Diagnostics/                 # Process, ProcessList, ProcessHost,
-│   │   │                            # ProcessControl, Privileges,
-│   │   │                            # ServerMetrics
-│   ├── Json/                        # Json.zan, JsonValue.zan
-│   ├── Linq/                        # Enumerable.zan, Expression.zan
-│   │
-│   └── (Automation, Compiler, Data/ — 含 Excel/（XlsxBook 纯 Zan
-│       写 .xlsx：SaveToBytes 整表内存 / SaveStreaming 流式落盘
-│       —— XlsxRowSource 逐行供给、超 1048576 行自动分表、可取消）,
-│       Drawing/, Globalization, Input,
-│       Management, Resources, Scripting/, Security/, ServiceProcess,
-│       Web/, Windows/)
+│   └── Web/                         # System.Web
+│       ├── DesignerHtml.zan         # 设计器 HTML 映射
+│       └── HtmlScope.zan            # HTML 节点作用域
 │
-├── Gui/                             # self-hosted GUI framework (Zan source)
-│   ├── App.zan / Point.zan / Color.zan / Theme.zan / Signal.zan / FlexStyle.zan / FlexNode.zan
-│   ├── Canvas.zan / EventHub.zan / Text.zan / Icon.zan / Css.zan / Style*.zan
-│   ├── Backend/                     # Window.zan, UiDriver.zan, Win32Shell.zan
-│   ├── Component/                   # Chart, CodeEditor, DataTable, WebView, ...
-│   ├── Widget/                      # 60 controls (Button, Input, Label, ...)
-│   ├── Designer/ / Hmi/
-│   ├── drivers/                     # driver.manifest + win-x64/... (zan_gui)
-│   └── skins/                       # CSS theme skins (light, dark, ...)
-│
-├── Game/                            # Arcade2D, Arpg, Board, Cards, Core,
-│   │                                # Foundation, Render, Scene
-├── Sdk/                             # Jd, Wechat
-└── Platform/
-    └── Runtime.zan                  # platform runtime hooks (#if WINDOWS, ...)
+packages/                            # 独立拆解的高性能可复用包生态
+├── Zan.IO/                          # 扩展 I/O：MemoryStream、StreamReader/Writer、Compression (Deflate, GZip, Zip, Tar, Zstd)
+├── Zan.Net/                         # 完整网络栈：Socket, Tcp/Udp, Http/Https, Tls, WebSocket, Mqtt, Sse, Rpc
+├── Zan.Threading/                   # 线程与并发原语：Thread, Mutex, Semaphore, AtomicInt, BlockingQueue, AsyncGate
+├── Zan.Desktop/                     # 桌面与操作系统服务：Process, Display, Device, Media, Clipboard
+├── Zan.Data/                        # 数据访问与持久化：Sqlite, SqlServer, Redis, Orm, ZanDb
+├── Zan.Security/                    # 安全与密码学：Cryptography, Jwt, X509Certificate
+├── Zan.Ai/                          # LLM 运行时：AiClient, AnthropicClient, AiStream, Rag, Embeddings, VectorStore
+├── Zan.Gui/                         # 纯 Zan 自举的 GUI 原生渲染框架
+│   ├── Zan.Gui.Charts/              # 工业级图表组件
+│   ├── Zan.Gui.DataTable/           # 高性能虚拟化表格
+│   ├── Zan.Gui.CodeEditor/          # 代码编辑器与语法高亮
+│   ├── Zan.Gui.Designer/            # 可视化低代码设计器
+│   └── Zan.Gui.Browser/             # WebView 与 CEF 双驱动内嵌浏览器
+├── Zan.Game/                        # 游戏引擎架构、物理与空间划分 (Physics2D, Physics3D, Pathfinding, Factory)
+└── Zan.Linq/, Zan.Csv/, Zan.Xml/, Zan.Yaml/, Zan.Toml/, Zan.Bson/, Zan.Cbor/ # 格式与数据处理
 ```
 
 **Compiler builtins are not files.** `Console`, `Math`, `String`, `Convert`,
