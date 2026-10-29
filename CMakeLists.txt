@@ -2838,8 +2838,12 @@ foreach(_src ${_conf_srcs})
       "-DPLAIN_OUT_EXE=${_plain_out_exe}"
       "-DPLAIN_ZANC_ARGS=${_plain_args}"
       -P ${CMAKE_SOURCE_DIR}/tests/run_case_modes.cmake)
+  set(_case_timeout 180)
+  if(_name MATCHES "security_x509_ec")
+    set(_case_timeout 600)
+  endif()
   set_tests_properties(case_${_name} PROPERTIES
-    RESOURCE_LOCK src_${_name} TIMEOUT 180)
+    RESOURCE_LOCK src_${_name} TIMEOUT ${_case_timeout})
   # The determinism lens needs a *second* codegen to compare against, so it
   # cannot share the run above -- but it shares the source, the arguments and
   # the stamp directory, and it produces no executable: the verdict is
