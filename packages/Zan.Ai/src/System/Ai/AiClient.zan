@@ -118,7 +118,7 @@ public class AiClient : IDisposable, IChat {
             body.PutStr("stop", stop);
         }
         body.PutBool("stream", false);
-        body.PutJson("messages", AiClient.MessagesJson(messages));
+        body.Put("messages", AiClient.MessagesArray(messages));
 
         string raw = await this.PostJson(ep, "/chat/completions", body);
         if (raw == null) { return null; }
@@ -168,8 +168,48 @@ public class AiClient : IDisposable, IChat {
     // 返回 null 表示调用失败（原因在 lastError）。
     public async AiToolTurn CompleteWithTools(List<AiMessage> messages,
     List<AiTool> tools, double temperature) {
-        return await this.CompleteWithToolsJson(messages,
-            AiClient.DeclarationsJson(tools), temperature);
+        this.lastError = "";
+        AiEndpoint ep = AiEndpoint.Parse(this.config.baseUrl);
+        if (ep == null) {
+            this.lastError = "服务地址不合法: " + this.config.baseUrl;
+            return null;
+        }
+        if (this.config.model.Length == 0) {
+            this.lastError = "没有指定模型";
+            return null;
+        }
+        JsonValue body = JsonValue.NewObject();
+        body.PutStr("model", this.config.model);
+        if (temperature >= 0.0) {
+            body.PutDouble("temperature", temperature);
+        }
+        body.PutBool("stream", false);
+        body.Put("messages", AiClient.MessagesArray(messages));
+        if (tools != null && tools.Count > 0) {
+            body.Put("tools", AiClient.DeclarationsArray(tools));
+            body.PutStr("tool_choice", "auto");
+        }
+
+        string raw = await this.PostJson(ep, "/chat/completions", body);
+        if (raw == null) { return null; }
+        JsonValue root = null;
+        try {
+            root = JsonValue.Parse(raw);
+        } catch (Exception e) {
+            this.lastError = "AI 服务返回的内容无法解析";
+            return null;
+        }
+        if (root == null) {
+            this.lastError = "AI 服务返回的内容无法解析";
+            return null;
+        }
+        AiToolTurn turn = AiClient.ParseToolTurn(root);
+        if (turn == null) {
+            this.lastError = "AI 服务返回的内容无法解析";
+            return null;
+        }
+        this.CaptureUsage(root);
+        return turn;
     }
 
     // 补全（带工具），工具声明**已经是 OpenAI 兼容的线格式 JSON**。
@@ -199,7 +239,7 @@ public class AiClient : IDisposable, IChat {
             body.PutDouble("temperature", temperature);
         }
         body.PutBool("stream", false);
-        body.PutJson("messages", AiClient.MessagesJson(messages));
+        body.Put("messages", AiClient.MessagesArray(messages));
         if (toolsJson != null && toolsJson.Length > 0) {
             body.PutJson("tools", toolsJson);
             // 让模型在需要时自己决定不调（有些服务方默认不许不调）。
@@ -208,25 +248,28 @@ public class AiClient : IDisposable, IChat {
 
         string raw = await this.PostJson(ep, "/chat/completions", body);
         if (raw == null) { return null; }
-        AiToolTurn turn = AiClient.ParseToolTurn(raw);
-        if (turn == null) {
-            this.lastError = "AI 服务返回的内容无法解析";
-            return null;
-        }
-        this.CaptureUsage(JsonValue.Parse(raw));
-        return turn;
-    }
-
-    // 解析带工具的响应（公开是为了能单独测——归位、错误提取全在这里）。
-    //
-    // 坏 JSON → 返回 null。
-    public static AiToolTurn ParseToolTurn(string raw) {
         JsonValue root = null;
         try {
             root = JsonValue.Parse(raw);
         } catch (Exception e) {
+            this.lastError = "AI 服务返回的内容无法解析";
             return null;
         }
+        if (root == null) {
+            this.lastError = "AI 服务返回的内容无法解析";
+            return null;
+        }
+        AiToolTurn turn = AiClient.ParseToolTurn(root);
+        if (turn == null) {
+            this.lastError = "AI 服务返回的内容无法解析";
+            return null;
+        }
+        this.CaptureUsage(root);
+        return turn;
+    }
+
+    // 解析带工具的响应 DOM。
+    public static AiToolTurn ParseToolTurn(JsonValue root) {
         if (root == null) { return null; }
         string errMsg = AiClient.ErrorMessage(root);
         if (errMsg.Length > 0) { return null; }
@@ -257,6 +300,20 @@ public class AiClient : IDisposable, IChat {
             }
         }
         return turn;
+    }
+
+    // 解析带工具的响应文本（公开是为了能单独测——归位、错误提取全在这里）。
+    //
+    // 坏 JSON → 返回 null。
+    public static AiToolTurn ParseToolTurn(string raw) {
+        if (raw == null) { return null; }
+        JsonValue root = null;
+        try {
+            root = JsonValue.Parse(raw);
+        } catch (Exception e) {
+            return null;
+        }
+        return AiClient.ParseToolTurn(root);
     }
 
     // 补全并返回用量（成本核算用）。
@@ -295,7 +352,7 @@ public class AiClient : IDisposable, IChat {
             body.PutDouble("temperature", temperature);
         }
         body.PutBool("stream", true);
-        body.PutJson("messages", AiClient.MessagesJson(messages));
+        body.Put("messages", AiClient.MessagesArray(messages));
 
         string payload = body.ToJson();
         if (payload.Length > this.config.requestLimitBytes) {
@@ -422,9 +479,9 @@ public class AiClient : IDisposable, IChat {
             body.PutDouble("temperature", temperature);
         }
         body.PutBool("stream", true);
-        body.PutJson("messages", AiClient.MessagesJson(messages));
+        body.Put("messages", AiClient.MessagesArray(messages));
         if (tools != null && tools.Count > 0) {
-            body.PutJson("tools", AiClient.DeclarationsJson(tools));
+            body.Put("tools", AiClient.DeclarationsArray(tools));
             // 让模型在需要时自己决定不调（有些服务方默认不许不调）。
             body.PutStr("tool_choice", "auto");
         }
@@ -608,24 +665,39 @@ public class AiClient : IDisposable, IChat {
     //
     // 与 `ToolRegistry.DeclarationsJson` 同一形状——放在这里是为了让
     // 客户端不依赖注册表（注册表只是"声明 + 实现"的一个来源）。
-    public static string DeclarationsJson(List<AiTool> tools) {
+    // 工具声明（实体）→ OpenAI 兼容的线格式 JSON 数组 DOM。
+    public static JsonValue DeclarationsArray(List<AiTool> tools) {
         JsonValue arr = JsonValue.NewArray();
-        if (tools == null) { return arr.ToJson(); }
+        if (tools == null) { return arr; }
         for (int i = 0; i < tools.Count; i = i + 1) {
             AiTool t = tools[i];
             if (t == null) { continue; }
             arr.Append(t.ToJson());
         }
-        return arr.ToJson();
+        return arr;
+    }
+
+    // 工具声明（实体）→ OpenAI 兼容的线格式 JSON 数组文本。
+    //
+    // 与 `ToolRegistry.DeclarationsJson` 同一形状——放在这里是为了让
+    // 客户端不依赖注册表（注册表只是"声明 + 实现"的一个来源）。
+    public static string DeclarationsJson(List<AiTool> tools) {
+        return AiClient.DeclarationsArray(tools).ToJson();
+    }
+
+    // 消息列表 → JSON 数组 DOM。
+    public static JsonValue MessagesArray(List<AiMessage> messages) {
+        JsonValue arr = JsonValue.NewArray();
+        if (messages == null) { return arr; }
+        for (int i = 0; i < messages.Count; i = i + 1) {
+            arr.Append(AiClient.MessageJson(messages[i]));
+        }
+        return arr;
     }
 
     // 消息列表 → JSON 数组文本。
     public static string MessagesJson(List<AiMessage> messages) {
-        JsonValue arr = JsonValue.NewArray();
-        for (int i = 0; i < messages.Count; i = i + 1) {
-            arr.Append(AiClient.MessageJson(messages[i]));
-        }
-        return arr.ToJson();
+        return AiClient.MessagesArray(messages).ToJson();
     }
 
     // 单条消息的 JSON。

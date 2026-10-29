@@ -22,12 +22,15 @@ public class CollectionSearch {
     }
 
     public static JsonValue Member(JsonValue value, string key) {
+        if (value == null) { return JsonValue.NewNull(); }
         JsonValue v = value.Get(key);
         return v != null ? v : JsonValue.NewNull();
     }
     public static long Number(JsonValue value, string key) {
-        JsonValue v = CollectionSearch.Member(value, key);
-        if (!v.IsNumber()) { throw new IOException("invalid search metadata number: " + key); }
+        if (value == null) { throw new IOException("invalid search metadata number: " + key); }
+        JsonValue v = value.Get(key);
+        if (v == null || !v.IsNumber()) { throw new IOException("invalid search metadata number: " + key); }
+        if (v.numIsInt && v.numI >= 0) { return v.numI; }
         string s = v.AsString("");
         if (s.Length == 0 || s.Length > 19) { throw new IOException("invalid search metadata integer"); }
         long n = 0;
@@ -63,13 +66,13 @@ public class CollectionSearch {
 
     public static void CheckDefinition(JsonValue def) {
         if (!def.IsObject() || CollectionSearch.Number(def, "format") != 1
-                || CollectionSearch.Member(def, "status").AsString("") != "ready") {
+                || def.Str("status", "") != "ready") {
             throw new IOException("unsupported or unfinished search index");
         }
-        string kind = CollectionSearch.Member(def, "type").AsString("");
+        string kind = def.Str("type", "");
         if (kind != "text" && kind != "vector") { throw new IOException("invalid search index type"); }
-        CollectionSearch.CheckField(CollectionSearch.Member(def, "field").AsString(""));
-        string generation = CollectionSearch.Member(def, "generation").AsString("");
+        CollectionSearch.CheckField(def.Str("field", ""));
+        string generation = def.Str("generation", "");
         if (generation.Length != 20) { throw new IOException("invalid search generation"); }
         for (int i = 0; i < generation.Length; i = i + 1) {
             int c = generation[i] & 255;
@@ -208,7 +211,8 @@ public class CollectionSearch {
         if (oldBody.Length > 0) {
             JsonValue oldDef = JsonValue.Parse(oldBody);
             CollectionSearch.CheckDefinition(oldDef);
-            JsonValue previous = CollectionSearch.Member(oldDef, "options");
+            JsonValue previous = oldDef.Get("options");
+            if (previous == null) { previous = JsonValue.NewNull(); }
             if (kind == "text") {
                 if (TextTokenizer.ImportState(previous).Fingerprint() == TextTokenizer.ImportState(config).Fingerprint()) { return; }
             } else if (previous.ToJson() == config.ToJson()) { return; }
@@ -232,8 +236,8 @@ public class CollectionSearch {
             List<JsonValue> old = Definitions();
             JsonValue catalog = JsonValue.NewArray();
             for (int i = 0; i < old.Count; i = i + 1) {
-                if (CollectionSearch.Member(old[i], "field").AsString("") == field
-                        && CollectionSearch.Member(old[i], "type").AsString("") == kind) { continue; }
+                if (old[i].Str("field", "") == field
+                        && old[i].Str("type", "") == kind) { continue; }
                 catalog.Append(old[i].Clone());
             }
             catalog.Append(def.Clone());
@@ -307,14 +311,14 @@ public class CollectionSearch {
         if (doc == null || !doc.IsObject()) { throw new ArgumentException("document must be an object"); }
         List<JsonValue> defs = Definitions();
         for (int i = 0; i < defs.Count; i = i + 1) {
-            string field = CollectionSearch.Member(defs[i], "field").AsString("");
-            string kind = CollectionSearch.Member(defs[i], "type").AsString("");
+            string field = defs[i].Str("field", "");
+            string kind = defs[i].Str("type", "");
             JsonValue value = doc.Get(field);
             if (value == null || value.IsNull()) { continue; }
             if (kind == "text") {
                 if (!value.IsString()) { throw new ArgumentException("text index requires string values"); }
             } else {
-                CollectionSearch.ReadVector(value, VectorIndexOptions.FromJson(CollectionSearch.Member(defs[i], "options")));
+                CollectionSearch.ReadVector(value, VectorIndexOptions.FromJson(defs[i].Get("options")));
             }
         }
     }
@@ -324,9 +328,9 @@ public class CollectionSearch {
         List<JsonValue> defs = Definitions();
         long revision = this.kv.GetRevision() + 1;
         for (int i = 0; i < defs.Count; i = i + 1) {
-            string field = CollectionSearch.Member(defs[i], "field").AsString("");
-            string kind = CollectionSearch.Member(defs[i], "type").AsString("");
-            string generation = CollectionSearch.Member(defs[i], "generation").AsString("");
+            string field = defs[i].Str("field", "");
+            string kind = defs[i].Str("type", "");
+            string generation = defs[i].Str("generation", "");
             JsonValue value = doc != null ? doc.Get(field) : null;
             JsonValue change = JsonValue.NewObject();
             change.PutInt("id", id);
@@ -355,8 +359,8 @@ public class CollectionSearch {
         if (defBody.Length == 0) { throw new InvalidOperationException("search index does not exist: " + field); }
         JsonValue def = JsonValue.Parse(defBody);
         CollectionSearch.CheckDefinition(def);
-        JsonValue config = CollectionSearch.Member(def, "options");
-        string generation = CollectionSearch.Member(def, "generation").AsString("");
+        JsonValue config = def.Get("options");
+        string generation = def.Str("generation", "");
         string cacheKey = kind + ":" + field;
         CollectionSearchState state = null;
         this.states.TryGetValue(cacheKey, out state);
@@ -372,15 +376,16 @@ public class CollectionSearch {
             state.checkpoint = snapshotBody;
             JsonValue snapshot = JsonValue.Parse(snapshotBody);
             if (CollectionSearch.Number(snapshot, "format") != 1
-                    || CollectionSearch.Member(snapshot, "definition").AsString("") != defBody) {
+                    || snapshot.Str("definition", "") != defBody) {
                 throw new IOException("incompatible search checkpoint; rebuild required");
             }
             state.applied = CollectionSearch.Number(snapshot, "revision");
             if (state.applied > revision) { throw new IOException("search checkpoint ahead of input"); }
-            string snapshotGeneration = CollectionSearch.Member(snapshot, "generation").AsString("");
+            string snapshotGeneration = snapshot.Str("generation", "");
             long rowCount = CollectionSearch.Number(snapshot, "count");
             if (rowCount > 2147483647) { throw new IOException("search checkpoint too large"); }
-            JsonValue root = CollectionSearch.Member(snapshot, "root").Clone();
+            JsonValue rootNode = snapshot.Get("root");
+            JsonValue root = rootNode != null ? rootNode.Clone() : JsonValue.NewNull();
             JsonValue rows = JsonValue.NewArray();
             for (int i = 0; i < (int)rowCount; i = i + 1) {
                 string row = this.kv.Get(ip + "snap:" + snapshotGeneration + ":" + Collection.PadId(i));
@@ -389,14 +394,14 @@ public class CollectionSearch {
             }
             root.Set(kind == "text" ? "docs" : "nodes", rows);
             if (kind == "text") {
-                if (TextTokenizer.ImportState(CollectionSearch.Member(root, "tokenizer")).Fingerprint()
+                if (TextTokenizer.ImportState(root.Get("tokenizer")).Fingerprint()
                         != TextTokenizer.ImportState(config).Fingerprint()) {
                     throw new IOException("checkpoint tokenizer differs from index definition");
                 }
                 state.text = Bm25Index.ImportState(root);
             } else {
                 state.options = VectorIndexOptions.FromJson(config);
-                VectorIndexOptions rootOpts = VectorIndexOptions.FromJson(CollectionSearch.Member(root, "options"));
+                VectorIndexOptions rootOpts = VectorIndexOptions.FromJson(root.Get("options"));
                 if (!rootOpts.Equals(state.options)) {
                     throw new IOException("checkpoint vector options differ from index definition");
                 }
@@ -411,7 +416,9 @@ public class CollectionSearch {
                 this.kv.Scan(start, (string key, string body) => {
                     if (!key.StartsWith(journal)) { return false; }
                     JsonValue change = JsonValue.Parse(body);
-                    Apply(loading, (int)CollectionSearch.Number(change, "id"), CollectionSearch.Member(change, "value"));
+                    JsonValue val = change.Get("value");
+                    if (val == null) { val = JsonValue.NewNull(); }
+                    Apply(loading, (int)CollectionSearch.Number(change, "id"), val);
                     return true;
                 });
                 state.applied = revision;
@@ -481,7 +488,8 @@ public class CollectionSearch {
         string ip = IndexPrefix(state.kind, state.field);
         JsonValue root = state.kind == "text" ? state.text.ExportState() : state.vector.ExportState();
         string rowKey = state.kind == "text" ? "docs" : "nodes";
-        JsonValue rows = CollectionSearch.Member(root, rowKey);
+        JsonValue rows = root.Get(rowKey);
+        if (rows == null) { rows = JsonValue.NewNull(); }
         List<KvEntry> batch = new List<KvEntry>();
         long bytes = 0;
         for (int i = 0; i < rows.Count(); i = i + 1) {
@@ -509,8 +517,8 @@ public class CollectionSearch {
         RequireCommitted();
         List<JsonValue> defs = Definitions();
         for (int i = 0; i < defs.Count; i = i + 1) {
-            CollectionSearchState state = Load(CollectionSearch.Member(defs[i], "type").AsString(""),
-                CollectionSearch.Member(defs[i], "field").AsString(""));
+            CollectionSearchState state = Load(defs[i].Str("type", ""),
+                defs[i].Str("field", ""));
             string generation = CollectionSearch.RevisionKey(this.kv.GetRevision() + 1);
             try {
                 JsonValue snapshot = StageCheckpoint(state, generation);
@@ -531,9 +539,9 @@ public class CollectionSearch {
         RequireCommitted();
         List<JsonValue> defs = Definitions();
         for (int i = 0; i < defs.Count; i = i + 1) {
-            string kind = CollectionSearch.Member(defs[i], "type").AsString("");
-            string field = CollectionSearch.Member(defs[i], "field").AsString("");
-            JsonValue config = CollectionSearch.Member(defs[i], "options");
+            string kind = defs[i].Str("type", "");
+            string field = defs[i].Str("field", "");
+            JsonValue config = defs[i].Get("options");
             string generation = CollectionSearch.RevisionKey(this.kv.GetRevision() + 1);
             JsonValue def = defs[i].Clone();
             def.Set("generation", JsonValue.NewStr(generation));
@@ -546,8 +554,8 @@ public class CollectionSearch {
                 JsonValue catalog = JsonValue.NewArray();
                 List<JsonValue> current = Definitions();
                 for (int j = 0; j < current.Count; j = j + 1) {
-                    bool same = CollectionSearch.Member(current[j], "type").AsString("") == kind
-                        && CollectionSearch.Member(current[j], "field").AsString("") == field;
+                    bool same = current[j].Str("type", "") == kind
+                        && current[j].Str("field", "") == field;
                     catalog.Append(same ? def.Clone() : current[j].Clone());
                 }
                 string ip = IndexPrefix(kind, field);
