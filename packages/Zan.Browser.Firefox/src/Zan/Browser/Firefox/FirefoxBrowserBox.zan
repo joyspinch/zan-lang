@@ -1,0 +1,170 @@
+using System;
+using Gui;
+
+namespace Zan.Browser.Firefox;
+
+/// <summary>
+/// 可摆放的火狐 Gecko 浏览器控件：把原生 Gecko 视口包成一个普通的保留式 Control。
+/// 支持嵌入多标签页容器（Tabs）、面板布局（Panel）、设计器属性与 AI 智能体直接调用。
+/// 全面接入 Zan 官方 NativeLayer 遮挡裁剪与层级管线，完美避让自绘标题栏与浮动菜单。
+/// </summary>
+public class FirefoxBrowserBox : Control {
+    public FirefoxAgentTab tab;
+    public string startUrl;
+    public bool navigated;
+    public int contextId;
+    public FingerprintProfile fingerprint;
+    nint handle;
+    int lastX;
+    int lastY;
+    int lastW;
+    int lastH;
+    bool lastVisible;
+
+    public FirefoxBrowserBox(int userContextId, FingerprintProfile profile) {
+        this.InitControl("firefoxbrowser", 5);
+        this.contextId = userContextId;
+        this.fingerprint = (profile != null) ? profile : FingerprintProfile.CleanDefault();
+        this.startUrl = "";
+        this.navigated = false;
+        this.handle = 0;
+        this.tab = null;
+        this.lastX = -1;
+        this.lastY = -1;
+        this.lastW = -1;
+        this.lastH = -1;
+        this.lastVisible = false;
+    }
+
+    public FirefoxBrowserBox(int userContextId) : this(userContextId, null) { }
+
+    public FirefoxBrowserBox(string url) : this(0, null) {
+        this.startUrl = url;
+    }
+
+    public FirefoxBrowserBox() : this(0, null) { }
+
+    public FirefoxAgentTab GetAgent() {
+        return this.tab;
+    }
+
+    public void SetStartUrl(string u) {
+        this.startUrl = u;
+        if (this.navigated && u != "" && this.tab != null) {
+            this.tab.Navigate(u);
+        }
+    }
+
+    public string StartUrl() {
+        return this.startUrl;
+    }
+
+    public void Navigate(string target) {
+        this.navigated = true;
+        if (this.tab != null) {
+            this.tab.Navigate(target);
+        }
+    }
+
+    public static void ApplyClip(int viewId, string spec) {
+        if (GeckoNative.PfnSetClipById != 0) {
+            GeckoClipByIdFn fn = (GeckoClipByIdFn)GeckoNative.PfnSetClipById;
+            fn(viewId, spec);
+        }
+    }
+
+    public void Hide() {
+        if (this.tab != null) {
+            int viewId = this.tab.GetViewId();
+            if (viewId > 0) {
+                ApplyClip(viewId, "");
+            }
+        }
+        if (this.handle != 0 && this.lastVisible) {
+            this.lastVisible = false;
+            if (GeckoNative.PfnSetVisible != 0) {
+                GeckoVisibleFn fn = (GeckoVisibleFn)GeckoNative.PfnSetVisible;
+                fn(this.handle, false);
+            }
+        }
+    }
+
+    public void Destroy() {
+        if (this.tab != null) {
+            int viewId = this.tab.GetViewId();
+            if (viewId > 0) {
+                NativeLayer.Forget(viewId);
+                ApplyClip(viewId, "");
+            }
+        }
+        if (this.handle != 0) {
+            this.Hide();
+            if (GeckoNative.PfnDestroy != 0) {
+                GeckoActionFn fn = (GeckoActionFn)GeckoNative.PfnDestroy;
+                fn(this.handle);
+            }
+            this.handle = 0;
+            this.tab = null;
+        }
+        if (this.parent != null) {
+            this.parent.Remove(this);
+        }
+    }
+
+    public string CurrentUrl() {
+        return (this.tab != null) ? this.tab.Url() : this.startUrl;
+    }
+
+    public string CurrentTitle() {
+        return (this.tab != null) ? this.tab.Title() : "";
+    }
+
+    public override string Kind() { return "FirefoxBrowserBox"; }
+
+    public override void OnPaint(App app) {
+        if (this.bw <= 0 || this.bh <= 0) {
+            this.Hide();
+            return;
+        }
+
+        if (this.handle == 0) {
+            nint parentHwnd = (app != null && app.window != null) ? app.window.GetHandle() : 0;
+            FirefoxBootstrap.Init(parentHwnd);
+            string url = (this.startUrl != "") ? this.startUrl : "about:blank";
+            this.tab = FirefoxAgentSession.CreateTab(
+                parentHwnd, this.bx, this.by, this.bw, this.bh, url,
+                this.contextId, this.fingerprint
+            );
+            if (this.tab != null) {
+                this.handle = this.tab.GetHandle();
+                this.navigated = true;
+            }
+        }
+
+        if (this.handle == 0) return;
+
+        if (this.bx != this.lastX || this.by != this.lastY || this.bw != this.lastW || this.bh != this.lastH) {
+            this.lastX = this.bx;
+            this.lastY = this.by;
+            this.lastW = this.bw;
+            this.lastH = this.bh;
+            if (GeckoNative.PfnSetBounds != 0) {
+                GeckoBoundsFn bfn = (GeckoBoundsFn)GeckoNative.PfnSetBounds;
+                bfn(this.handle, this.bx, this.by, this.bw, this.bh);
+            }
+        }
+
+        int vId = (this.tab != null) ? this.tab.GetViewId() : 0;
+        if (vId > 0) {
+            NativeLayer.Register(app, vId, this.bx, this.by, this.bw, this.bh, FirefoxBrowserBox.ApplyClip);
+        } else {
+            if (!this.lastVisible) {
+                this.lastVisible = true;
+                if (GeckoNative.PfnSetVisible != 0) {
+                    GeckoVisibleFn vfn = (GeckoVisibleFn)GeckoNative.PfnSetVisible;
+                    vfn(this.handle, true);
+                }
+            }
+        }
+    }
+}

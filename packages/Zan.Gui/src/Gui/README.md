@@ -40,8 +40,8 @@ Zan 编译器采用**按路径零配置自动按需引入**（Demand-driven stdl
 | 命名空间 / 路径 | 核心定位与职责 | 代表类型与文件 |
 | :--- | :--- | :--- |
 | **`Gui`** (`stdlib/Gui/`) | **GUI 核心内核**。提供应用程序生命周期、事件总线、排版引擎、样式系统、渲染画布与声明式工厂。 | `App`, `Control`, `Element`, `Event`, `Layout`, `Render`, `Style`, `Html` |
-| **`Gui.Widget`** (`stdlib/Gui/Widget/`) | **原子控件集**。轻量、无复杂嵌套依赖的基础 UI 输入/展示控件。 | `Button`, `TextBox`, `Label`, `CheckBox`, `ComboBox`, `Slider`, `QrCode` |
-| **`Gui.Component`** (`stdlib/Gui/Component/`) | **高级复合组件**。具备独立状态机、复杂视口与重型业务交互的专业控件。 | `CodeEditor`, `DataTable`, `TreeView`, `MarkdownViewer`, `Dock`, `Ribbon` |
+| **`Gui.Widget`** (`stdlib/Gui/Widget/`) | **原子与复合控件集**。轻量、结构明确的基础 UI 输入/展示控件与工具条。 | `Button`, `TextBox`, `Label`, `CheckBox`, `ComboBox`, `Slider`, `QrCode`, `Ribbon` |
+| **`Gui.Component`** (`stdlib/Gui/Component/`) | **高级业务组件**。具备独立状态机、复杂视口与重型交互的高级控件与特效。 | `ChatView`, `ConsoleView`, `LogView`, `TreeView`, `MarkdownViewer`, `Dock`, `RibbonFx` |
 | **`Gui.Reactive`** (`stdlib/Gui/Reactive/`) | **响应式数据流**。单向数据流与细粒度响应式状态绑定（Signal, Observable, Store）。 | `Store`, `Signal`, `Binding` |
 | **`Gui.Backend`** (`stdlib/Gui/Backend/`) | **底层图形后端适配**。对接 Windows GDI/DirectWrite、Software Rasterizer 等本地驱动。 | `GdiBackend`, `SoftwareBackend` |
 

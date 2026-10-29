@@ -27,30 +27,30 @@
 
 ## 如何使用
 
-在 Zan GUI 项目中，可以通过加载对应皮肤的 `skin.css` 快速切换应用程序整体风格：
+在 Zan GUI 项目中，通过 `Gui.Themes` 提供的 `ThemePack` 强类型 API 快速切换应用程序整体风格：
 
 ```zan
 using System;
-using System.IO;
 using Gui;
+using Gui.Themes;
 
 class Program {
     static void Main() {
+        App app = new App();
+        
+        // 1. 强类型方式一键应用主题（如新中式 Chinese 或赛博朋克 Neon）
+        ThemePack.Apply(app, ThemePack.Chinese);
+
+        // 2. 也可以按名称查询是否存在或获取 CSS 样式文本
+        if (ThemePack.Exists("matrix")) {
+            string matrixCss = ThemePack.GetCss("matrix");
+        }
+
         Window win = new Window();
         win.Title = "主题演示";
         win.SetBounds(100, 100, 800, 600);
-
-        // 加载指定主题（例如：新中式 chinese 或 黑客帝国 matrix）
-        string themeName = "chinese";
-        string cssPath = "packages/Zan.Gui.Themes/skins/" + themeName + "/skin.css";
-        
-        if (File.Exists(cssPath)) {
-            string css = File.ReadAllText(cssPath);
-            win.SetStyleSheet(css);
-        }
-
         win.Show();
-        Application.Run();
+        app.Run();
     }
 }
 ```

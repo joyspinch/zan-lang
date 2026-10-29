@@ -93,7 +93,7 @@ singleAxis、dataset transform 等子系统仍缺。每批闭环：移植 → �
   → 整段柱"消失"。修复：全部数据值 × g 位点（柱/线/散点/极径/误差棒/
   漏斗宽/大图）改 long 乘法；像素/扫描角/透明度等有界位点不动。教训：
   小数值验证不出的时变缺陷先怀疑溢出类，用终态帧（g=1000）定点追踪。
-- `transparent` 哨兵色 `Chart.Transparent()`（alpha≈1 非零，避免与
+- `transparent` 哨兵色 `ChartColor.Transparent()`（alpha≈1 非零，避免与
   0=继承系列色冲突），瀑布图占位系列用。
 - `YOfF` 整数轴回落路径定点化：vF(×1000) 对 [lo×1000, hi×1000] 比例映射，
   整数数据与旧 int 路径逐像素一致；堆叠感知的 frac 轴界

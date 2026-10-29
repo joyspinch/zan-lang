@@ -91,8 +91,7 @@ partial class Irgen {
         L("  store i8* " + bufp + ", i8** " + slot);
         string sp1 = NT(); L("  " + sp1 + " = add i64 " + sp + ", 1");
         L("  store i64 " + sp1 + ", i64* @__exc_sp");
-        string fp = NT(); L("  " + fp + " = call i8* @llvm.frameaddress.p0(i32 0)");
-        string r = NT(); L("  " + r + " = call i32 @_setjmp(i8* " + bufp + ", i8* " + fp + ")");
+        string r = NT(); L("  " + r + " = call i32 @_setjmp(i8* " + bufp + ", i8* null)");
         string c = NT(); L("  " + c + " = icmp ne i32 " + r + ", 0");
         int ltr = NL();
         L("  br i1 " + c + ", label %L" + ltr + ", label %co.pre");
@@ -130,8 +129,7 @@ partial class Irgen {
             L("  store i8* " + bufp + ", i8** " + slot);
             string sp1 = NT(); L("  " + sp1 + " = add i64 " + sp + ", 1");
             L("  store i64 " + sp1 + ", i64* @__exc_sp");
-            string fp = NT(); L("  " + fp + " = call i8* @llvm.frameaddress.p0(i32 0)");
-            string r = NT(); L("  " + r + " = call i32 @_setjmp(i8* " + bufp + ", i8* " + fp + ")");
+            string r = NT(); L("  " + r + " = call i32 @_setjmp(i8* " + bufp + ", i8* null)");
             string c = NT(); L("  " + c + " = icmp ne i32 " + r + ", 0");
             int lnext = NL();
             L("  br i1 " + c + ", label %L" + lbl + ", label %L" + lnext);
@@ -584,6 +582,8 @@ partial class Irgen {
         if (c.a == null || c.a.kind != AK.Ident()) { return false; }
         string cn = c.a.sval; string mn = c.sval;
         if (cn == "Task" && mn == "Delay") { return true; }
+        if (cn == "Task" && mn == "Yield") { return true; }
+        if (cn == "Task" && mn == "JoinWait") { return true; }
         if (cn == "Gate" && mn == "Park") { return true; }
         if (cn != "Socket") { return false; }
         if (mn == "ResolveSockAddr" && callExpr.kids.Count == 4) { return true; }
@@ -611,6 +611,25 @@ partial class Irgen {
             EmitAsyncReloadSlots();
             EmitAsyncRearm();
             return new ExprVal("0", MkType("int"));
+        }
+        if (cn == "Task" && mn == "Yield") {
+            EmitAsyncSaveSlots();
+            L("  store i64 " + st + ", i64* " + FrameGep("%ff", 2));
+            L("  call void @zan_co_ready(i8* %fp, void(i8*)* @" + curResumeSym + ")");
+            EmitAsyncSuspend();
+            L("  ret void");
+            L("resume_" + st + ":");
+            term = false; curLbl = "resume_" + st;
+            EmitAsyncReloadSlots();
+            EmitAsyncRearm();
+            return new ExprVal("0", MkType("int"));
+        }
+        if (cn == "Task" && mn == "JoinWait") {
+            // Task.JoinWait returns 2 to signal fallback to TaskJoin.WhenAllPoll / WhenAnyPoll
+            if (!term) { L("  br label %resume_" + st); }
+            L("resume_" + st + ":");
+            term = false; curLbl = "resume_" + st;
+            return new ExprVal("2", MkType("int"));
         }
         if (cn == "Gate" && mn == "Park") {
             // event-driven wait: the frame is re-readied by zan_gate_signal
@@ -2007,10 +2026,8 @@ partial class Irgen {
         return new ExprVal("0", MkType("void"));
     }
 
-    // Task.IsDone(handle)：裸句柄是否已经跑完。
-    // 自举没有宿主那样的工作线程池：任务只在**主线程泵调度器**时前进，
-    // 所以这里在读到「还没完」时给调度器一次机会——否则
-    // `while (Task.IsDone(h) == 0) {}` 这种忙等永远推不动。
+    // Task.IsDone(handle)：裸句柄是否已经跑完（槽 3 done 标志是否置位）。
+    // 纯谓词查询，不阻塞泵调度器（阻塞泵由 t.Wait() 即 EmitTaskWait 负责）。
     ExprVal EmitTaskIsDone(Node e) {
         ExprVal h = GenExpr(e.kids[0]);
         string fp;
@@ -2023,20 +2040,7 @@ partial class Irgen {
         string dp = FrameGep(fph, 3);
         string dn = NT(); L("  " + dn + " = load i64, i64* " + dp);
         string c = NT(); L("  " + c + " = icmp ne i64 " + dn + ", 0");
-        int lYes = NL(); int lNo = NL(); int lZero = NL(); int lJoin = NL();
-        L("  br i1 " + c + ", label %L" + lYes + ", label %L" + lNo);
-        Label(lNo);
-        L("  call void @zan_co_sched_run()");
-        string dn2 = NT(); L("  " + dn2 + " = load i64, i64* " + dp);
-        string c2 = NT(); L("  " + c2 + " = icmp ne i64 " + dn2 + ", 0");
-        L("  br i1 " + c2 + ", label %L" + lYes + ", label %L" + lZero);
-        Label(lZero);
-        L("  br label %L" + lJoin);
-        Label(lYes);
-        L("  br label %L" + lJoin);
-        Label(lJoin);
-        string r = NT();
-        L("  " + r + " = phi i64 [ 0, %L" + lZero + " ], [ 1, %L" + lYes + " ]");
+        string r = NT(); L("  " + r + " = zext i1 " + c + " to i64");
         return new ExprVal(r, MkType("int"));
     }
 
@@ -2382,8 +2386,7 @@ partial class Irgen {
         L("  store i8* " + rbp + ", i8** " + rslot);
         string rsp1 = NT(); L("  " + rsp1 + " = add i64 " + rsp + ", 1");
         L("  store i64 " + rsp1 + ", i64* @__exc_sp");
-        string rfp = NT(); L("  " + rfp + " = call i8* @llvm.frameaddress.p0(i32 0)");
-        string rr = NT(); L("  " + rr + " = call i32 @_setjmp(i8* " + rbp + ", i8* " + rfp + ")");
+        string rr = NT(); L("  " + rr + " = call i32 @_setjmp(i8* " + rbp + ", i8* null)");
         string rc = NT(); L("  " + rc + " = icmp ne i32 " + rr + ", 0");
         int lbody = NL(); int lcatch = NL();
         L("  br i1 " + rc + ", label %L" + lcatch + ", label %L" + lbody);
@@ -2398,7 +2401,6 @@ partial class Irgen {
             // (mirrors the C host's emit_main_method).
             string mainSym = MethodSym(owner, mainMeth);
             string fr = NT(); L("  " + fr + " = call i8* @" + mainSym + "()");
-            L("  call void @zan_co_sched_init()");
             string rs = NT(); L("  " + rs + " = ptrtoint void(i8*)* @" + mainSym + "$resume to i64");
             string rf = NT(); L("  " + rf + " = inttoptr i64 " + rs + " to void(i8*)*");
             L("  call void @zan_co_ready(i8* " + fr + ", void(i8*)* " + rf + ")");

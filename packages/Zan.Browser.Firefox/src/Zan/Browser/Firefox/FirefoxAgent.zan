@@ -1,0 +1,498 @@
+using System;
+using System.IO;
+using System.Collections.Generic;
+using System.Text;
+using System.Threading;
+
+namespace Zan.Browser.Firefox;
+
+public delegate bool GeckoInitFn(nint hostHwnd);
+public delegate nint GeckoCreateWithContextFn(
+    nint parentHwnd, int x, int y, int w, int h,
+    string initialUrl, int userContextId,
+    string webglVendor, string webglRenderer,
+    string timezone, string userAgent);
+public delegate void GeckoBoundsFn(nint viewHandle, int x, int y, int w, int h);
+public delegate void GeckoVisibleFn(nint viewHandle, bool visible);
+public delegate void GeckoNavigateFn(nint viewHandle, string url);
+public delegate void GeckoActionFn(nint viewHandle);
+public delegate void GeckoVoidFn();
+public delegate void GeckoExecuteScriptFn(nint viewHandle, string script, int evalId);
+public delegate void GeckoClickElementFn(nint viewHandle, string selector, int evalId);
+public delegate void GeckoTypeTextFn(nint viewHandle, string selector, string text, int evalId);
+public delegate string GeckoGetStringFn(nint viewHandle);
+public delegate bool GeckoGetBoolFn(nint viewHandle);
+public delegate int GeckoGetIntFn(nint viewHandle);
+public delegate void GeckoSetFingerprintFn(nint viewHandle, string configJson);
+public delegate void GeckoClipByIdFn(int viewId, string spec);
+public delegate void GeckoClearDataFn(int userContextId);
+
+/// <summary>
+/// 语义交互元素 (面向 AI Agent 的压缩结构)
+/// </summary>
+public class PageElement {
+    public string Ref;       // 紧凑索引，如 "e1", "e2"
+    public string Tag;       // HTML 标签，如 "button", "input"
+    public string Type;      // input 类型，如 "text", "password"
+    public string Text;      // 元素文本或 placeholder
+    public string Selector;  // CSS 选择器
+    public int X;
+    public int Y;
+    public int W;
+    public int H;
+
+    public PageElement() {
+        this.Ref = "";
+        this.Tag = "";
+        this.Type = "";
+        this.Text = "";
+        this.Selector = "";
+        this.X = 0;
+        this.Y = 0;
+        this.W = 0;
+        this.H = 0;
+    }
+}
+
+/// <summary>
+/// 页面视口语义快照 (Token 优化型 DOM 投影)
+/// </summary>
+public class PageSnapshot {
+    public string Title;
+    public string Url;
+    public List<PageElement> Elements;
+
+    public PageSnapshot() {
+        this.Title = "";
+        this.Url = "";
+        this.Elements = new List<PageElement>();
+    }
+
+    public static PageSnapshot FromJson(string json) {
+        PageSnapshot snap = new PageSnapshot();
+        if (json == null || json == "") return snap;
+
+        snap.Title = ExtractJsonString(json, "\"title\":\"");
+        snap.Url = ExtractJsonString(json, "\"url\":\"");
+
+        int cur = 0;
+        while (true) {
+            int startObj = json.IndexOf("{\"ref\":", cur);
+            if (startObj < 0) break;
+            int endObj = json.IndexOf("}", startObj);
+            if (endObj < 0) break;
+
+            string objStr = json.Substring(startObj, endObj - startObj + 1);
+            PageElement el = new PageElement();
+            el.Ref = ExtractJsonString(objStr, "\"ref\":\"");
+            el.Tag = ExtractJsonString(objStr, "\"tag\":\"");
+            el.Type = ExtractJsonString(objStr, "\"type\":\"");
+            el.Text = ExtractJsonString(objStr, "\"text\":\"");
+            el.Selector = ExtractJsonString(objStr, "\"selector\":\"");
+            el.X = ExtractJsonInt(objStr, "\"x\":");
+            el.Y = ExtractJsonInt(objStr, "\"y\":");
+            el.W = ExtractJsonInt(objStr, "\"w\":");
+            el.H = ExtractJsonInt(objStr, "\"h\":");
+
+            snap.Elements.Add(el);
+            cur = endObj + 1;
+        }
+
+        return snap;
+    }
+
+    static string ExtractJsonString(string src, string key) {
+        int k = src.IndexOf(key);
+        if (k < 0) return "";
+        int s = k + key.Length;
+        int e = src.IndexOf("\"", s);
+        if (e < 0) return "";
+        return src.Substring(s, e - s);
+    }
+
+    static int ExtractJsonInt(string src, string key) {
+        int k = src.IndexOf(key);
+        if (k < 0) return 0;
+        int s = k + key.Length;
+        int e = s;
+        while (e < src.Length) {
+            char c = src[e];
+            if ((c >= '0' && c <= '9') || c == '-') {
+                e = e + 1;
+            } else {
+                break;
+            }
+        }
+        if (e > s) {
+            return int.Parse(src.Substring(s, e - s));
+        }
+        return 0;
+    }
+}
+
+/// <summary>
+/// 火狐内核动态链接库底层导出直通
+/// </summary>
+public class GeckoNative {
+    #if WINDOWS
+    [DllImport("kernel32", EntryPoint = "SetDllDirectoryA")]
+    public static extern bool SetDllDirectoryA(string path);
+    #endif
+
+    public static nint XulMod = 0;
+    static bool loaded = false;
+
+    public static nint PfnInit = 0;
+    public static nint PfnCreateWithContext = 0;
+    public static nint PfnSetBounds = 0;
+    public static nint PfnSetVisible = 0;
+    public static nint PfnNavigate = 0;
+    public static nint PfnDestroy = 0;
+    public static nint PfnExecuteScript = 0;
+    public static nint PfnClickElement = 0;
+    public static nint PfnTypeText = 0;
+    public static nint PfnGetTitle = 0;
+    public static nint PfnGetUrl = 0;
+    public static nint PfnCanGoBack = 0;
+    public static nint PfnCanGoForward = 0;
+    public static nint PfnGetLastEvalResult = 0;
+    public static nint PfnGetLastEvalId = 0;
+    public static nint PfnGetLastEvalSuccess = 0;
+    public static nint PfnSetFingerprint = 0;
+    public static nint PfnShrinkMemory = 0;
+    public static nint PfnShutdown = 0;
+    public static nint PfnSetClipById = 0;
+    public static nint PfnGetViewId = 0;
+    public static nint PfnClearOriginData = 0;
+
+    public static bool EnsureLoaded() {
+        if (loaded && XulMod != 0) return true;
+        loaded = true;
+
+        string[] searchPaths = new string[] {
+            ".",
+            "bin",
+            "D:/project/firefox/dist/bin",
+            "D:/project/firefox/dist/zan-browser-windows-x64",
+            "D:/project/firefox/obj-x86_64-pc-windows-msvc/dist/bin",
+            "../dist/zan-browser-windows-x64"
+        };
+
+        for (int i = 0; i < searchPaths.Length; i = i + 1) {
+            string p = searchPaths[i];
+            string xulPath = Path.Combine(p, "xul.dll");
+            if (File.Exists(xulPath)) {
+                #if WINDOWS
+                SetDllDirectoryA(p);
+                #endif
+                XulMod = Interop.Load(xulPath);
+                if (XulMod != 0) {
+                    ResolveSymbols();
+                    return true;
+                }
+            }
+        }
+
+        XulMod = Interop.Load("xul.dll");
+        if (XulMod != 0) {
+            ResolveSymbols();
+            return true;
+        }
+
+        return false;
+    }
+
+    static void ResolveSymbols() {
+        PfnInit = Interop.Symbol(XulMod, "Gecko_Init");
+        PfnCreateWithContext = Interop.Symbol(XulMod, "Gecko_CreateWebViewWithContext");
+        PfnSetBounds = Interop.Symbol(XulMod, "Gecko_SetBounds");
+        PfnSetVisible = Interop.Symbol(XulMod, "Gecko_SetVisible");
+        PfnNavigate = Interop.Symbol(XulMod, "Gecko_Navigate");
+        PfnDestroy = Interop.Symbol(XulMod, "Gecko_DestroyWebView");
+        PfnExecuteScript = Interop.Symbol(XulMod, "Gecko_ExecuteScript");
+        PfnClickElement = Interop.Symbol(XulMod, "Gecko_ClickElement");
+        PfnTypeText = Interop.Symbol(XulMod, "Gecko_TypeText");
+        PfnGetTitle = Interop.Symbol(XulMod, "Gecko_GetTitle");
+        PfnGetUrl = Interop.Symbol(XulMod, "Gecko_GetUrl");
+        PfnCanGoBack = Interop.Symbol(XulMod, "Gecko_CanGoBack");
+        PfnCanGoForward = Interop.Symbol(XulMod, "Gecko_CanGoForward");
+        PfnGetLastEvalResult = Interop.Symbol(XulMod, "Gecko_GetLastEvalResult");
+        PfnGetLastEvalId = Interop.Symbol(XulMod, "Gecko_GetLastEvalId");
+        PfnGetLastEvalSuccess = Interop.Symbol(XulMod, "Gecko_GetLastEvalSuccess");
+        PfnSetFingerprint = Interop.Symbol(XulMod, "Gecko_SetFingerprint");
+        PfnShrinkMemory = Interop.Symbol(XulMod, "Gecko_ShrinkMemory");
+        PfnShutdown = Interop.Symbol(XulMod, "Gecko_Shutdown");
+        PfnSetClipById = Interop.Symbol(XulMod, "Gecko_SetClipById");
+        PfnGetViewId = Interop.Symbol(XulMod, "Gecko_GetViewId");
+        PfnClearOriginData = Interop.Symbol(XulMod, "Gecko_ClearOriginData");
+    }
+}
+
+/// <summary>
+/// 浏览器智能体标签页句柄：承载现代非阻塞协程异步 API (await Task.Delay) 与完整自动化生态
+/// </summary>
+public class FirefoxAgentTab {
+    nint viewHandle;
+    int contextId;
+    int nextEvalId;
+
+    public FirefoxAgentTab(nint handle, int userContextId) {
+        this.viewHandle = handle;
+        this.contextId = userContextId;
+        this.nextEvalId = 1000;
+    }
+
+    public nint GetHandle() { return this.viewHandle; }
+    public int GetContextId() { return this.contextId; }
+
+    public int GetViewId() {
+        if (this.viewHandle == 0 || GeckoNative.PfnGetViewId == 0) return 0;
+        GeckoGetIntFn fn = (GeckoGetIntFn)GeckoNative.PfnGetViewId;
+        return fn(this.viewHandle);
+    }
+
+    public void Navigate(string url) {
+        if (this.viewHandle == 0 || GeckoNative.PfnNavigate == 0) return;
+        GeckoNavigateFn fn = (GeckoNavigateFn)GeckoNative.PfnNavigate;
+        fn(this.viewHandle, url);
+    }
+
+    public string Title() {
+        if (this.viewHandle == 0 || GeckoNative.PfnGetTitle == 0) return "";
+        GeckoGetStringFn fn = (GeckoGetStringFn)GeckoNative.PfnGetTitle;
+        return fn(this.viewHandle);
+    }
+
+    public string Url() {
+        if (this.viewHandle == 0 || GeckoNative.PfnGetUrl == 0) return "";
+        GeckoGetStringFn fn = (GeckoGetStringFn)GeckoNative.PfnGetUrl;
+        return fn(this.viewHandle);
+    }
+
+    public int ExecuteScriptAsync(string script) {
+        if (this.viewHandle == 0 || GeckoNative.PfnExecuteScript == 0) return -1;
+        this.nextEvalId = this.nextEvalId + 1;
+        int id = this.nextEvalId;
+        GeckoExecuteScriptFn fn = (GeckoExecuteScriptFn)GeckoNative.PfnExecuteScript;
+        fn(this.viewHandle, script, id);
+        return id;
+    }
+
+    public bool IsDone(int evalId) {
+        if (GeckoNative.PfnGetLastEvalId == 0) return false;
+        GeckoGetIntFn fn = (GeckoGetIntFn)GeckoNative.PfnGetLastEvalId;
+        return fn(this.viewHandle) == evalId;
+    }
+
+    public string GetResult() {
+        if (GeckoNative.PfnGetLastEvalResult == 0) return "";
+        GeckoGetStringFn fn = (GeckoGetStringFn)GeckoNative.PfnGetLastEvalResult;
+        return fn(this.viewHandle);
+    }
+
+    public bool GetSuccess() {
+        if (GeckoNative.PfnGetLastEvalSuccess == 0) return false;
+        GeckoGetBoolFn fn = (GeckoGetBoolFn)GeckoNative.PfnGetLastEvalSuccess;
+        return fn(this.viewHandle);
+    }
+
+    // =========================================================================
+    // 现代 Zan 协程异步 API (纯正 await Task.Delay 挂起，绝不阻塞 UI 线程与调度器)
+    // =========================================================================
+
+    /// <summary>
+    /// 核心异步非阻塞求值 (基于 await Task.Delay 协程挂起，零线程开销，让出事件循环)
+    /// </summary>
+    public async string EvalAsync(string script, int timeoutMs = 8000) {
+        int id = this.ExecuteScriptAsync(script);
+        if (id < 0) return "";
+        int elapsed = 0;
+        while (elapsed < timeoutMs) {
+            if (this.IsDone(id)) {
+                return this.GetResult();
+            }
+            await Task.Delay(16);
+            elapsed = elapsed + 16;
+        }
+        return "";
+    }
+
+    /// <summary>
+    /// 异步获取页面交互快照 (面向 AI Agent 的压缩语义树，Token 节省 90%)
+    /// </summary>
+    public async PageSnapshot SnapshotAsync(int timeoutMs = 8000) {
+        string res = await this.EvalAsync("ZanAgent.snapshot();", timeoutMs);
+        return PageSnapshot.FromJson(res);
+    }
+
+    /// <summary>
+    /// 异步智能拟人点击 (三次贝塞尔轨迹 + 菲茨定律加减速 + 悬停 + 物理按压时长 + 遮挡探测)
+    /// </summary>
+    public async bool ClickAsync(string refOrSel, int timeoutMs = 8000) {
+        string clean = refOrSel.Replace("'", "\'");
+        string script = "ZanAgent.click('" + clean + "');";
+        string res = await this.EvalAsync(script, timeoutMs);
+        return res == "true" || res == "ok";
+    }
+
+    /// <summary>
+    /// 异步智能表单直填 (穿透 React/Vue 双向绑定 Setter 并派发完整 InputEvent)
+    /// </summary>
+    public async bool FillAsync(string refOrSel, string text, int timeoutMs = 8000) {
+        string cleanSel = refOrSel.Replace("'", "\'");
+        string cleanText = text.Replace("'", "\'");
+        string script = "ZanAgent.fill('" + cleanSel + "', '" + cleanText + "');";
+        string res = await this.EvalAsync(script, timeoutMs);
+        return res == "true" || res == "ok";
+    }
+
+    /// <summary>
+    /// 异步拟人逐字敲击 (模拟人类击键时序与高斯分布节奏抖动，突破前端击键生物识别)
+    /// </summary>
+    public async bool TypeAsync(string refOrSel, string text, int timeoutMs = 12000) {
+        string cleanSel = refOrSel.Replace("'", "\'");
+        string cleanText = text.Replace("'", "\'");
+        string script = "ZanAgent.type('" + cleanSel + "', '" + cleanText + "');";
+        string res = await this.EvalAsync(script, timeoutMs);
+        return res == "true" || res == "ok";
+    }
+
+    /// <summary>
+    /// 异步平滑鼠标移动 (三次贝塞尔曲线 + 菲茨加减速 + 生理微震颤)
+    /// </summary>
+    public async bool MouseMoveAsync(string target, int timeoutMs = 8000) {
+        string clean = target.Replace("'", "\'");
+        string script = "ZanAgent.mouseMove('" + clean + "');";
+        string res = await this.EvalAsync(script, timeoutMs);
+        return res == "true" || res == "ok";
+    }
+
+    /// <summary>
+    /// 异步滑块验证码拖拽 (非匀速物理加速+减速+微波浪 Y 轴微动)
+    /// </summary>
+    public async bool DragAsync(string target, int offsetX, int offsetY = 0, int timeoutMs = 8000) {
+        string clean = target.Replace("'", "\'");
+        string script = "ZanAgent.drag('" + clean + "', " + offsetX.ToString() + ", " + offsetY.ToString() + ");";
+        string res = await this.EvalAsync(script, timeoutMs);
+        return res == "true" || res == "ok";
+    }
+
+    /// <summary>
+    /// 异步抗网页改版选项匹配 (Picker-Rank 7级平滑阶梯，支持原生与现代化框架自定义 Select)
+    /// </summary>
+    public async string SelectOptionAsync(string target, string wanted, int timeoutMs = 8000) {
+        string cleanTarget = target.Replace("'", "\'");
+        string cleanWanted = wanted.Replace("'", "\'");
+        string script = "ZanAgent.selectOption('" + cleanTarget + "', '" + cleanWanted + "');";
+        return await this.EvalAsync(script, timeoutMs);
+    }
+
+    /// <summary>
+    /// 异步真实可见文本提取 (过滤 -9999px / clip 等防爬虫蜜罐文本陷阱)
+    /// </summary>
+    public async string VisibleTextAsync(string target, int timeoutMs = 8000) {
+        string clean = target.Replace("'", "\'");
+        string script = "ZanAgent.visibleText('" + clean + "');";
+        return await this.EvalAsync(script, timeoutMs);
+    }
+
+    /// <summary>
+    /// 异步多行结构化批量采集 (一次性抽取多行数据为 JSON，0 次多余 IPC 开销)
+    /// </summary>
+    public async string ReadRowsAsync(string rowSelector, string fieldMapJson, int limit = 100, int timeoutMs = 10000) {
+        string cleanRow = rowSelector.Replace("'", "\'");
+        string script = "ZanAgent.readRows('" + cleanRow + "', " + fieldMapJson + ", { limit: " + limit.ToString() + " });";
+        return await this.EvalAsync(script, timeoutMs);
+    }
+
+    /// <summary>
+    /// 异步结果驱动全分支竞速等待状态机 (成功/报错/消失/跳转全分支竞速，抛弃低效 Sleep)
+    /// </summary>
+    public async string WaitForOutcomeAsync(string success = "", string error = "", string gone = "", string url = "", int timeoutMs = 10000) {
+        string script = "ZanAgent.waitForOutcome({";
+        bool hasField = false;
+        if (success != "") { script = script + " success: '" + success.Replace("'", "\'") + "'"; hasField = true; }
+        if (error != "") { if (hasField) script = script + ","; script = script + " error: '" + error.Replace("'", "\'") + "'"; hasField = true; }
+        if (gone != "") { if (hasField) script = script + ","; script = script + " gone: '" + gone.Replace("'", "\'") + "'"; hasField = true; }
+        if (url != "") { if (hasField) script = script + ","; script = script + " url: '" + url.Replace("'", "\'") + "'"; hasField = true; }
+        if (hasField) script = script + ",";
+        script = script + " timeoutMs: " + timeoutMs.ToString() + " });";
+        return await this.EvalAsync(script, timeoutMs + 1000);
+    }
+
+    /// <summary>
+    /// 异步平滑页面滚动
+    /// </summary>
+    public async bool ScrollAsync(int dy, int timeoutMs = 5000) {
+        string script = "ZanAgent.scroll(" + dy.ToString() + ");";
+        string res = await this.EvalAsync(script, timeoutMs);
+        return res == "true" || res == "ok";
+    }
+
+    /// <summary>
+    /// 一键清空当前隔离容器的存储数据 (Cookie, LocalStorage, IndexedDB)
+    /// </summary>
+    /// <summary>
+    /// 异步注入内存级网络 Mock 响应 (借鉴 ruyiJS put_resource: 离线注入响应、解密脱壳或替换验证码图片)
+    /// </summary>
+    public async bool MockResourceAsync(string urlPattern, string responseBody, string contentType = "application/json", int timeoutMs = 5000) {
+        string cleanPat = urlPattern.Replace("'", "\\'");
+        string cleanBody = responseBody.Replace("'", "\\'");
+        string cleanType = contentType.Replace("'", "\\'");
+        string script = "ZanAgent.mockResource('" + cleanPat + "', '" + cleanBody + "', '" + cleanType + "');";
+        string res = await this.EvalAsync(script, timeoutMs);
+        return res == "true" || res == "ok";
+    }
+
+    /// <summary>
+    /// 异步清除所有内存级网络 Mock 拦截
+    /// </summary>
+    public async bool ClearMocksAsync(int timeoutMs = 5000) {
+        string res = await this.EvalAsync("ZanAgent.clearMocks();", timeoutMs);
+        return res == "true" || res == "ok";
+    }
+
+    public void ClearData() {
+        if (this.contextId > 0 && GeckoNative.PfnClearOriginData != 0) {
+            GeckoClearDataFn fn = (GeckoClearDataFn)GeckoNative.PfnClearOriginData;
+            fn(this.contextId);
+        }
+    }
+}
+
+/// <summary>
+/// 浏览器智能体会话工厂
+/// </summary>
+public class FirefoxAgentSession {
+    public static bool Initialize(nint hostHwnd) {
+        return FirefoxBootstrap.Init(hostHwnd);
+    }
+
+    public static void Shutdown() {
+        if (GeckoNative.PfnShutdown != 0) {
+            GeckoVoidFn fn = (GeckoVoidFn)GeckoNative.PfnShutdown;
+            fn();
+        }
+    }
+
+    public static FirefoxAgentTab CreateTab(nint parentHwnd, int x, int y, int w, int h, string initialUrl, int contextId, FingerprintProfile profile) {
+        if (!GeckoNative.EnsureLoaded()) return null;
+
+        FingerprintProfile fp = (profile != null) ? profile : FingerprintProfile.CleanDefault();
+
+        GeckoCreateWithContextFn fn = (GeckoCreateWithContextFn)GeckoNative.PfnCreateWithContext;
+        nint handle = fn(
+            parentHwnd, x, y, w, h, initialUrl, contextId,
+            fp.webglVendor, fp.webglRenderer, fp.timezone, fp.userAgent
+        );
+
+        if (handle == 0) return null;
+
+        if (GeckoNative.PfnSetFingerprint != 0) {
+            GeckoSetFingerprintFn fpFn = (GeckoSetFingerprintFn)GeckoNative.PfnSetFingerprint;
+            fpFn(handle, fp.ToJson());
+        }
+
+        return new FirefoxAgentTab(handle, contextId);
+    }
+}

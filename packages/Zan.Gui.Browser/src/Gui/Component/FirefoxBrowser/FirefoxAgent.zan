@@ -1,0 +1,207 @@
+using System;
+using System.IO;
+using System.Collections.Generic;
+
+namespace Gui.Component.FirefoxBrowser;
+
+/// <summary>
+/// 语义交互元素 (面向 AI Agent 的压缩结构)
+/// </summary>
+public class PageElement {
+    public string Ref;       // 紧凑索引，如 "e1", "e2"
+    public string Tag;       // HTML 标签，如 "button", "input"
+    public string Type;      // input 类型，如 "text", "password"
+    public string Text;      // 元素文本或 placeholder
+    public string Selector;  // CSS 选择器
+    public int X;
+    public int Y;
+    public int W;
+    public int H;
+
+    public PageElement() {
+        this.Ref = "";
+        this.Tag = "";
+        this.Type = "";
+        this.Text = "";
+        this.Selector = "";
+        this.X = 0;
+        this.Y = 0;
+        this.W = 0;
+        this.H = 0;
+    }
+}
+
+/// <summary>
+/// 页面语义快照 (经由 Token 降噪后的结构化表示)
+/// </summary>
+public class PageSnapshot {
+    public string Title;
+    public string Url;
+    public List<PageElement> Elements;
+
+    public PageSnapshot() {
+        this.Title = "";
+        this.Url = "";
+        this.Elements = new List<PageElement>();
+    }
+
+    public string ToPromptText() {
+        string res = "=== 页面语义状态快照 ===\n";
+        res = res + "页面标题: " + this.Title + "\n";
+        res = res + "当前网址: " + this.Url + "\n";
+        res = res + "可交互元素列表 (共 " + this.Elements.Count.ToString() + " 项):\n";
+        for (int i = 0; i < this.Elements.Count; i = i + 1) {
+            PageElement el = this.Elements[i];
+            string typeInfo = (el.Type != "") ? (" type=\"" + el.Type + "\"") : "";
+            res = res + "  [" + el.Ref + "] <" + el.Tag + typeInfo + "> \"" + el.Text + "\"\n";
+        }
+        res = res + "========================";
+        return res;
+    }
+
+    public static PageSnapshot FromJson(string json) {
+        PageSnapshot snap = new PageSnapshot();
+        if (json == null || json == "") return snap;
+
+        snap.Title = ExtractJsonString(json, "\"title\":\"");
+        snap.Url = ExtractJsonString(json, "\"url\":\"");
+
+        int elemIdx = json.IndexOf("\"elements\":[");
+        if (elemIdx < 0) return snap;
+
+        int cur = elemIdx + 11;
+        while (cur < json.Length) {
+            int startObj = json.IndexOf("{", cur);
+            if (startObj < 0) break;
+            int endObj = json.IndexOf("}", startObj);
+            if (endObj < 0) break;
+
+            string objStr = json.Substring(startObj, endObj - startObj + 1);
+            PageElement el = new PageElement();
+            el.Ref = ExtractJsonString(objStr, "\"ref\":\"");
+            el.Tag = ExtractJsonString(objStr, "\"tag\":\"");
+            el.Type = ExtractJsonString(objStr, "\"type\":\"");
+            el.Text = ExtractJsonString(objStr, "\"text\":\"");
+            el.Selector = ExtractJsonString(objStr, "\"selector\":\"");
+            el.X = ExtractJsonInt(objStr, "\"x\":");
+            el.Y = ExtractJsonInt(objStr, "\"y\":");
+            el.W = ExtractJsonInt(objStr, "\"w\":");
+            el.H = ExtractJsonInt(objStr, "\"h\":");
+
+            snap.Elements.Add(el);
+            cur = endObj + 1;
+        }
+
+        return snap;
+    }
+
+    static string ExtractJsonString(string src, string key) {
+        int k = src.IndexOf(key);
+        if (k < 0) return "";
+        int s = k + key.Length;
+        int e = src.IndexOf("\"", s);
+        if (e < 0) return "";
+        return src.Substring(s, e - s);
+    }
+
+    static int ExtractJsonInt(string src, string key) {
+        int k = src.IndexOf(key);
+        if (k < 0) return 0;
+        int s = k + key.Length;
+        int e = s;
+        while (e < src.Length) {
+            char c = src[e];
+            if ((c >= '0' && c <= '9') || c == '-') {
+                e = e + 1;
+            } else {
+                break;
+            }
+        }
+        if (e > s) {
+            return int.Parse(src.Substring(s, e - s));
+        }
+        return 0;
+    }
+}
+
+/// <summary>
+/// 面向大模型 AI Agent 的强类型标签页控制接口
+/// </summary>
+public class FirefoxAgentTab {
+    nint viewHandle;
+    int contextId;
+    int nextEvalId;
+
+    public FirefoxAgentTab(nint handle, int userContextId) {
+        this.viewHandle = handle;
+        this.contextId = userContextId;
+        this.nextEvalId = 1000;
+    }
+
+    public nint GetHandle() { return this.viewHandle; }
+    public int GetContextId() { return this.contextId; }
+
+    public void Navigate(string url) {
+        if (this.viewHandle == 0 || FirefoxCore.PfnNavigate == 0) return;
+        GeckoNavigateFn fn = (GeckoNavigateFn)FirefoxCore.PfnNavigate;
+        fn(this.viewHandle, url);
+    }
+
+    public string Title() {
+        if (this.viewHandle == 0 || FirefoxCore.PfnGetTitle == 0) return "";
+        GeckoGetStringFn fn = (GeckoGetStringFn)FirefoxCore.PfnGetTitle;
+        return fn(this.viewHandle);
+    }
+
+    public string Url() {
+        if (this.viewHandle == 0 || FirefoxCore.PfnGetUrl == 0) return "";
+        GeckoGetStringFn fn = (GeckoGetStringFn)FirefoxCore.PfnGetUrl;
+        return fn(this.viewHandle);
+    }
+
+    public int SendSnapshot() {
+        return this.ExecuteScriptAsync("window.ZanAgent ? ZanAgent.snapshot() : ''");
+    }
+
+    public int SendFill(string targetRefOrSel, string text) {
+        string clean = text.Replace("'", "\\'");
+        string js = "window.ZanAgent ? ZanAgent.fill('" + targetRefOrSel + "', '" + clean + "') : false";
+        return this.ExecuteScriptAsync(js);
+    }
+
+    public int SendClick(string targetRefOrSel) {
+        string js = "window.ZanAgent ? ZanAgent.click('" + targetRefOrSel + "') : false";
+        return this.ExecuteScriptAsync(js);
+    }
+
+    public int SendRunBatch(string batchScript) {
+        return this.ExecuteScriptAsync(batchScript);
+    }
+
+    public int ExecuteScriptAsync(string script) {
+        if (this.viewHandle == 0 || FirefoxCore.PfnExecuteScript == 0) return -1;
+        this.nextEvalId = this.nextEvalId + 1;
+        int id = this.nextEvalId;
+        GeckoExecuteScriptFn fn = (GeckoExecuteScriptFn)FirefoxCore.PfnExecuteScript;
+        fn(this.viewHandle, script, id);
+        return id;
+    }
+
+    public bool IsDone(int evalId) {
+        if (FirefoxCore.PfnGetLastEvalId == 0) return false;
+        GeckoGetIntFn fn = (GeckoGetIntFn)FirefoxCore.PfnGetLastEvalId;
+        return fn(this.viewHandle) == evalId;
+    }
+
+    public string GetResult() {
+        if (FirefoxCore.PfnGetLastEvalResult == 0) return "";
+        GeckoGetStringFn fn = (GeckoGetStringFn)FirefoxCore.PfnGetLastEvalResult;
+        return fn(this.viewHandle);
+    }
+
+    public bool GetSuccess() {
+        if (FirefoxCore.PfnGetLastEvalSuccess == 0) return false;
+        GeckoGetBoolFn fn = (GeckoGetBoolFn)FirefoxCore.PfnGetLastEvalSuccess;
+        return fn(this.viewHandle);
+    }
+}

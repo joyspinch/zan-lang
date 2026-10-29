@@ -1,0 +1,1166 @@
+using System;
+using System.Json;
+using Gui;
+
+namespace Gui.Component.Chart;
+
+// Chart.Panel.zan - 面板框架、标题与工具箱排版、图例/数据缩放/标记线/区域绘制
+public partial class Chart {
+    // 覆窗口）→ selectedDataBackground（窗口内重画阴影，accent40
+    // 线 / α0.3 面）→ 1px 边框（borderColor accent10）→ 手柄（白
+    // 圆角 grip，handleStyle color neutral00 / border accent20，
+    // handleSize 百分比条高，0 = 无）→ moveHandle（brushSelect 缺省
+    // true：窗口等宽圆角底条 accent40 α0.5 + 白三纹，并入平移命中）。
+    // zoomLock = 跨度锁定：手柄拖拽禁用、平移保留。minSpan/minValueSpan
+    // 折千分值进 minGap。showDetail 标签官方缺省只在 hover/拖拽时显
+    // （handleLabel.show 缺省 false + emphasis true）——静态首帧不画。
+    public static void DrawZoomBar(App app, ChartOption o, int plotX, int plotW,
+                            int x, int y, int w, int h, int wid, int n) {
+        ChartZoom zc = Chart.ZoomBarComp(o);
+        if (zc == null) { return; }
+        Canvas c = app.canvas;
+        if (plotW < 4 || n < 2 || w < 4) { return; }
+
+        // ---- 条几何 ----
+        int barH = Chart.ZoomBarH(app, zc, h);
+        int barY = y + h - app.Scale(22) - barH;
+        if (zc.top >= 0) { barY = y + app.Scale(zc.top); }
+        else if (zc.topPct >= 0) { barY = y + h * zc.topPct / 100; }
+        else if (zc.bottom >= 0) { barY = y + h - app.Scale(zc.bottom) - barH; }
+        int barW = plotW;
+        int barX = plotX;
+        if (zc.width >= 0) { barW = app.Scale(zc.width); }
+        else if (zc.widthPct >= 0) { barW = w * zc.widthPct / 100; }
+        if (zc.left >= 0) { barX = x + app.Scale(zc.left); }
+        else if (zc.leftPct >= 0) { barX = x + w * zc.leftPct / 100; }
+        else if (zc.right >= 0) { barX = x + w - app.Scale(zc.right) - barW; }
+        else if (zc.rightPct >= 0) { barX = x + w - w * zc.rightPct / 100 - barW; }
+        if (barW < 4) { return; }
+
+        int lo = app.StateGet(Chart.ZoomLoKey(wid), 0);
+        int hi = app.StateGet(Chart.ZoomHiKey(wid), 1000);
+        int loX = barX + lo * barW / 1000;
+        int hiX = barX + hi * barW / 1000;
+
+        // 官方 token 缺省（visual/tokens.ts），声明色覆盖。
+        int colBorder = zc.borderColor != 0 ? zc.borderColor : ChartColor.Rgb(224, 228, 242);
+        int colDbArea = zc.dbAreaColor != 0 ? zc.dbAreaColor : ChartColor.Rgb(192, 201, 230);
+        int colDbLine = zc.dbLineColor != 0 ? zc.dbLineColor : ChartColor.Rgb(161, 174, 217);
+        int colSelDbArea = zc.selDbAreaColor != 0 ? zc.selDbAreaColor : ChartColor.Rgb(192, 201, 230);
+        int colSelDbLine = zc.selDbLineColor != 0 ? zc.selDbLineColor : ChartColor.Rgb(130, 146, 204);
+        int colFiller = zc.fillerColor != 0 ? zc.fillerColor
+            : ChartColor.WithAlpha(ChartColor.Rgb(135, 175, 255), 51);
+        int colHandleFill = ChartColor.Rgb(255, 255, 255);
+        int colHandleBorder = ChartColor.Rgb(192, 201, 230);
+
+        // ---- dataBackground 阴影（filler 之下的整条宽面 + 线）----
+        bool shadow = Chart.ZoomShadowWanted(o, zc);
+        List<int> xs = new List<int>();
+        List<int> ys = new List<int>();
+        if (shadow) {
+            ChartSeries rep = Chart.ZoomShadowSeries(o);
+            if (rep != null && Chart.ZoomShadowN(rep) > 1) {
+                int lo0 = 0;
+                int hi1 = Chart.ZoomShadowN(rep) - 1;
+                if (hi1 > n - 1) { hi1 = n - 1; }
+                int stride = (hi1 - lo0) / barW;
+                if (stride < 1) { stride = 1; }
+                int dmin = 0;
+                int dmax = 0;
+                bool have = false;
+                for (int i = lo0; i <= hi1; i = i + stride) {
+                    int v = Chart.ZoomShadowV(rep, i);
+                    if (!have) { dmin = v; dmax = v; have = true; }
+                    else {
+                        if (v < dmin) { dmin = v; }
+                        if (v > dmax) { dmax = v; }
+                    }
+                }
+                if (have && dmax > dmin) {
+                    // 官方 otherOffset = (max-min) * 0.3 两侧外扩。
+                    int pad = (dmax - dmin) * 3 / 10;
+                    dmin = dmin - pad;
+                    dmax = dmax + pad;
+                    for (int i = lo0; i <= hi1; i = i + stride) {
+                        int px2 = barX + (i - lo0) * (barW - 1) / (hi1 - lo0);
+                        int v = Chart.ZoomShadowV(rep, i);
+                        int py = barY + barH - (v - dmin) * barH / (dmax - dmin);
+                        if (py < barY) { py = barY; }
+                        xs.Add(px2);
+                        ys.Add(py);
+                    }
+                    // 面多边形：曲线 + 条底线闭合（官方 scaleY -1 翻转后
+                    // otherCoord 0 贴条底）。
+                    List<ChartMapPoint> poly = new List<ChartMapPoint>();
+                    for (int pi = 0; pi < xs.Count; pi = pi + 1) {
+                        poly.Add(ChartMapPoint.Of(xs[pi], ys[pi]));
+                    }
+                    poly.Add(ChartMapPoint.Of(barX + barW, barY + barH));
+                    poly.Add(ChartMapPoint.Of(barX, barY + barH));
+                    ChartView.FillPolygon(c, poly, ChartColor.WithAlpha(colDbArea, 51));
+                    c.DrawPolyline(xs, ys, ChartColor.WithAlpha(colDbLine, 128), 1);
+                }
+            }
+        }
+
+        // ---- filler（窗口覆盖）----
+        c.FillRect(loX, barY, hiX - loX, barH, colFiller);
+
+        // ---- selectedDataBackground：窗口内重画阴影 ----
+        if (shadow && xs.Count > 1) {
+            List<ChartMapPoint> spoly = new List<ChartMapPoint>();
+            for (int pi = 0; pi < xs.Count; pi = pi + 1) {
+                spoly.Add(ChartMapPoint.Of(xs[pi], ys[pi]));
+            }
+            spoly.Add(ChartMapPoint.Of(barX + barW, barY + barH));
+            spoly.Add(ChartMapPoint.Of(barX, barY + barH));
+            c.PushClip(loX, barY, hiX - loX, barH);
+            ChartView.FillPolygon(c, spoly, ChartColor.WithAlpha(colSelDbArea, 77));
+            c.DrawPolyline(xs, ys, ChartColor.WithAlpha(colSelDbLine, 192), 1);
+            c.PopClip();
+        }
+
+        // ---- 边框（DEFAULT_FRAME_BORDER_WIDTH 1）----
+        c.DrawRect(barX, barY, barW, barH, colBorder, 1);
+
+        // ---- 手柄（官方缺省 grip path 8x40，aspect 0.2）----
+        int hw = 0;
+        if (zc.handleSizePx == 0) {
+            hw = 0;
+        } else if (zc.handleSizePx > 0) {
+            hw = app.Scale(zc.handleSizePx);
+        } else {
+            hw = barH * zc.handleSize / 100;
+        }
+        if (hw > 0) {
+            int hH = hw;
+            int hTop = barY;
+            if (hw > barH) {
+                hH = hw;
+                hTop = barY - (hw - barH) / 2;
+            }
+            int gripW = hH / 5;
+            if (gripW < 3) { gripW = 3; }
+            c.FillRoundRect(loX - gripW / 2, hTop, gripW, hH, 2, colHandleFill);
+            c.DrawRoundRect(loX - gripW / 2, hTop, gripW, hH, 2, colHandleBorder, 1);
+            c.FillRoundRect(hiX - gripW / 2, hTop, gripW, hH, 2, colHandleFill);
+            c.DrawRoundRect(hiX - gripW / 2, hTop, gripW, hH, 2, colHandleBorder, 1);
+            int gripH = hH * 2 / 5;
+            int gy1 = hTop + (hH - gripH) / 2;
+            c.DrawLine(loX, gy1, loX, gy1 + gripH, colHandleBorder, 1);
+            c.DrawLine(hiX, gy1, hiX, gy1 + gripH, colHandleBorder, 1);
+        }
+
+        // ---- moveHandle（brushSelect 缺省 true，窗口等宽底条）----
+        bool moveStrip = zc.brushSelect && hiX > loX;
+        if (moveStrip) {
+            int mhH = app.Scale(7);
+            int mhY = barY + barH;
+            c.FillRoundRectIn(loX, mhY, hiX - loX, mhH, 2, 12,
+                ChartColor.WithAlpha(ChartColor.Rgb(130, 146, 204), 128));
+            int ic = mhH * 8 / 10;
+            int icy = mhY + (mhH - ic) / 2;
+            int icx = loX + (hiX - loX) / 2;
+            for (int d = 0 - 1; d <= 1; d = d + 1) {
+                int bx = icx + d * app.Scale(2) - app.Scale(1) / 2;
+                c.FillRect(bx, icy, app.Scale(1), ic, ChartColor.Rgb(255, 255, 255));
+            }
+        }
+
+        // ---- 交互（千分值窗口状态，wid 键）----
+        int hwHalf = hw > 0 ? 3 : app.Scale(6);
+        int loId = app.focus.AllocId();
+        int hiId = app.focus.AllocId();
+        int bandId = app.focus.AllocId();
+        app.hitTester.RegisterRect(loId, loX - hwHalf, barY, hwHalf * 2, barH, 3);
+        app.hitTester.RegisterRect(hiId, hiX - hwHalf, barY, hwHalf * 2, barH, 3);
+        int bandH = barH;
+        if (moveStrip) { bandH = barH + app.Scale(7); }
+        app.hitTester.RegisterRect(bandId, loX + hwHalf, barY, hiX - loX - hwHalf * 2, bandH, 3);
+
+        int mxPm = (app.mouseX - barX) * 1000 / barW;
+        if (mxPm < 0) { mxPm = 0; }
+        if (mxPm > 1000) { mxPm = 1000; }
+        int minGap = 1000 / (n - 1);
+        if (minGap < 20) { minGap = 20; }
+        if (zc.minSpan > 0) {
+            int g2 = zc.minSpan * 10;
+            if (g2 > minGap) { minGap = g2; }
+        }
+        if (zc.minValueSpan > 0) {
+            // 数据单位按类目均分近似（时间轴 ms 亦然——点距均匀时等价）。
+            int g3 = zc.minValueSpan * 1000 / (n - 1);
+            if (g3 > minGap) { minGap = g3; }
+        }
+
+        if (zc.zoomLock) {
+            // zoomLock：跨度锁定，只许整体平移。
+            if (Ui.Pressed(app, bandId)) {
+                int width = hi - lo;
+                int nlo = mxPm - width / 2;
+                if (nlo < 0) { nlo = 0; }
+                if (nlo + width > 1000) { nlo = 1000 - width; }
+                app.StateSet(Chart.ZoomLoKey(wid), nlo);
+                app.StateSet(Chart.ZoomHiKey(wid), nlo + width);
+                app.RequestRedraw();
+            }
+            return;
+        }
+
+        if (Ui.Pressed(app, loId)) {
+            lo = mxPm;
+            if (lo > hi - minGap) { lo = hi - minGap; }
+            if (lo < 0) { lo = 0; }
+            app.StateSet(Chart.ZoomLoKey(wid), lo);
+            app.RequestRedraw();
+        } else if (Ui.Pressed(app, hiId)) {
+            hi = mxPm;
+            if (hi < lo + minGap) { hi = lo + minGap; }
+            if (hi > 1000) { hi = 1000; }
+            app.StateSet(Chart.ZoomHiKey(wid), hi);
+            app.RequestRedraw();
+        } else if (Ui.Pressed(app, bandId)) {
+            // 平移：保持带宽，以指针为中心。
+            int width = hi - lo;
+            int nlo = mxPm - width / 2;
+            if (nlo < 0) { nlo = 0; }
+            if (nlo + width > 1000) { nlo = 1000 - width; }
+            app.StateSet(Chart.ZoomLoKey(wid), nlo);
+            app.StateSet(Chart.ZoomHiKey(wid), nlo + width);
+            app.RequestRedraw();
+        }
+    }
+
+    // 首个可见 slider 组件（show!=false 的 x 靶向组件）；
+    // 无 = inside-only 或未声明——不画条、不预留带。
+    public static ChartZoom ZoomBarComp(ChartOption o) {
+        if (o == null) { return null; }
+        for (int i = 0; i < o.zooms.Count; i = i + 1) {
+            ChartZoom zc = o.zooms[i];
+            if (zc.slider && zc.show && !zc.isY) { return zc; }
+        }
+        return null;
+    }
+
+    // 条高：height px | 'N%' 相对容器高 | 缺省 30（官方
+    // DEFAULT_FILLER_SIZE）。
+    public static int ZoomBarH(App app, ChartZoom zc, int containerH) {
+        if (zc.heightPct >= 0) { return containerH * zc.heightPct / 100; }
+        if (zc.height >= 0) { return app.Scale(zc.height); }
+        return app.Scale(30);
+    }
+
+    // 预留带高：条高（百分比锚无容器基数时退 px 缺省 30）+
+    // moveHandle 7 + edgeGap 15（官方缺省锚总高 [H-52, H-15]）。
+    public static int ZoomBandH(App app, ChartOption o, int containerH) {
+        ChartZoom zc = Chart.ZoomBarComp(o);
+        if (zc == null) { return 0; }
+        return Chart.ZoomBarH(app, zc, containerH) + app.Scale(22);
+    }
+
+    // 数据阴影是否画：showDataShadow != false 且代表系列类型在
+    // SHOW_DATA_SHADOW_SERIES_TYPE 白名单（line/bar/candlestick/
+    // scatter，SliderZoomView.ts:61）。
+    // 阴影取值接缝（官方 dataShadowDimension 缺省取 close 维）：
+    // K 系列的数据在 candles 里，通用 Value()/Count() 返回 0，
+    // 必须走这里按类型取收口价。
+    public static int ZoomShadowN(ChartSeries s) {
+        if (s.type == ChartType.K) { return s.candles.Count; }
+        return s.Count();
+    }
+
+    public static int ZoomShadowV(ChartSeries s, int i) {
+        if (s.type == ChartType.K && i >= 0 && i < s.candles.Count) {
+            return s.candles[i].close;
+        }
+        return s.Value(i);
+    }
+    public static bool ZoomShadowWanted(ChartOption o, ChartZoom zc) {
+        if (zc.shadowMode == 2) { return false; }
+        return Chart.ZoomShadowSeries(o) != null;
+    }
+
+    // 代表系列：首条非隐藏且类型在阴影白名单内的系列（官方取
+    // 靶向轴目标系列首个匹配；引擎单窗近似取全局首个）。
+    public static ChartSeries ZoomShadowSeries(ChartOption o) {
+        for (int i = 0; i < o.series.Count; i = i + 1) {
+            ChartSeries s = o.series[i];
+            if (s.hidden) { continue; }
+            if (s.type == ChartType.Line || s.type == ChartType.Bar
+                || s.type == ChartType.K || s.type == ChartType.Scatter) {
+                return s;
+            }
+        }
+        return null;
+    }
+
+    // 轴名几何：ECharts `AxisBuilder.ts:855-880` 的**基位**（即
+    // nameMoveOverlap 求解之前的确定量）+ 官方缺省
+    // 标准坐标系里的公式（sig = inverse ? -1 : 1、extent 沿轴方向）：
+    // 渲染到屏幕要再叠 transformGroup：
+    // x 轴：rotation 0，translate (plotX, 轴线 y)，nameDirection +1
+    // y 轴：rotation +90°，translate (轴线 x, plotBot)，
+    // nameDirection = left ? -1 : +1，映射 (a,b) -> (b, -a) + t
+    // 把两式合成、代入 nameGap=15，实测（关掉 nameMoveOverlap，
+    // `_scratch/chart_oracle/axisname.js`，rect=100,100,400,200）得到：
+    // x start  (85,300) 右对齐锚   x middle (300,315) 居中、字盒顶贴锚
+    // x end    (515,300) 左对齐锚  y start  (100,315) 居中、字盒顶贴锚
+    // y middle (85,200) 绕锚点逆时针 90°（自下而上读），贴轴线内侧
+    // y end    (100,85) 居中、字盒底贴锚
+    // inverse 只翻 start/end 的端：yAxes[1].inverse 的 area-rainfall
+    // 实测 start 落顶、end 落底（与不翻转相反）。
+
+    // nameGap 像素（官方缺省 15，已按 DPI 缩放）。
+    public static int NameGapPx(App app, ChartAxis a) {
+        int g = 15;
+        if (a.nameGap >= 0) { g = a.nameGap; }
+        return app.Scale(g);
+    }
+
+    // 轴名基位（纯整数几何，字体度量由调用方喂进来）——conformance
+    // 用例据此在没有 App/Canvas 的情况下钉死三态落点。`fh` = 行盒高，
+    // `centerTop` = 垂直居中一行文本时的行盒顶边偏移（= CenterTextYAt(0)）。
+    public static ChartAxisName AxisNamePosPx(ChartAxis a, bool isX, int plotX,
+                                       int plotY, int plotW, int plotH,
+                                       bool far, int gap, int fh, int centerTop) {
+        return Chart.AxisNamePosPx(a, isX, plotX, plotY, plotW, plotH, far,
+            gap, fh, centerTop, 0 - 1);
+    }
+
+    // 同上，另给轴线位置覆盖（page 坐标）：`axisLine` = x 轴的轴线 y /
+    // y 轴的轴线 x，-1 = 按绘图区边界推（x 轴底边、y 轴左/右缘）。
+    // T3b 的 axisLine.onZero 让轴线骑到零线上时从这条缝进来。
+    public static ChartAxisName AxisNamePosPx(ChartAxis a, bool isX, int plotX,
+                                       int plotY, int plotW, int plotH,
+                                       bool far, int gap, int fh, int centerTop,
+                                       int axisLine) {
+        int sig = 1;
+        if (a.reversed) { sig = 0 - 1; }
+        int len = plotW;
+        if (!isX) { len = plotH; }
+        // extent[0] = 数据下界的 local 坐标；翻转时落在轴的远端。
+        int ext0 = 0;
+        if (a.reversed) { ext0 = len; }
+        int ext1 = len - ext0;
+        int plotBot = plotY + plotH;
+        // 未移动的边界基位（骑线覆盖只搬 start/end，middle 永远回到这里）。
+        int baseLine = plotBot;
+        if (!isX) { baseLine = plotX; if (far) { baseLine = plotX + plotW; } }
+        if (axisLine < 0) { axisLine = baseLine; }
+        string loc = a.nameLocation;
+        if (loc != "start" && loc != "middle") { loc = "end"; }
+        // onZero 只搬 start/end 态的名字（贴轴线走）；middle 的官方
+        // pos.y = labelOffset + nameDirection*gap，labelOffset 是轴线
+        // 位移的补偿，页面坐标里抵回原位 ⇒ 名字留在绘图区边界
+        // （_scratch/chart_oracle/onzero_namemid.js 实测）。
+        if (loc == "middle") { axisLine = baseLine; }
+        ChartAxisName n = new ChartAxisName();
+        n.rot = 0;
+        n.anchor = 1;
+        if (isX) {
+            if (loc == "middle") {
+                n.ax = plotX + len / 2;
+                n.ay = axisLine + gap;  // 字盒顶贴锚
+            } else if (loc == "start") {
+                n.ax = plotX + ext0 - sig * gap;
+                n.anchor = 2;  // 右对齐
+                n.ay = axisLine + centerTop;
+            } else {
+                n.ax = plotX + ext1 + sig * gap;
+                n.anchor = 0;  // 左对齐
+                n.ay = axisLine + centerTop;
+            }
+            return n;
+        }
+        if (loc == "middle") {
+            n.rot = 0 - 90;  // 自下而上读
+            // 旋转 −90° 后文字盒占 x∈[ax, ax+行高]；ECharts 的实测是把这个
+            // 盒**以轴线内侧 gap 处为中心**（左轴实测盒 [79,93]，axisLine
+            // =100、gap=15 ⇒ 中心 86 ≈ axisLine−gap），故锚点回退半个行高。
+            n.ax = axisLine - gap - fh / 2;
+            if (far) { n.ax = axisLine + gap - fh / 2; }
+            n.ay = plotBot - len / 2;  // 锚点中线
+            return n;
+        }
+        n.ax = axisLine;
+        // 锚点（AxisBuilder.ts:855-864 的 pos.x 经 transformGroup 映射到
+        // 页面 y：page_y = plotBot - pos.x）。
+        int anchorY = plotBot - ext1 - sig * gap;
+        if (loc == "start") { anchorY = plotBot - ext0 + sig * gap; }
+        // 轴名恒在绘图区**外侧**：锚点落在下侧时字盒顶贴锚，落在上侧
+        // 时字盒底贴锚（`endTextLayout` 的 onLeft → verticalAlign
+        // bottom/top）。inverse 把 start/end 的落点对调，所以"是否在
+        // 下侧"= (loc == "start") != inverse。
+        bool below = (loc == "start");
+        if (a.reversed) { below = !below; }
+        n.ay = anchorY;
+        if (!below) { n.ay = anchorY - fh; }
+        return n;
+    }
+
+    // App 版：换算 nameGap（缺省 15）并取字体度量。
+    public static ChartAxisName AxisNamePos(App app, ChartAxis a, bool isX,
+                                    int plotX, int plotY, int plotW, int plotH,
+                                    bool far, int fs) {
+        return Chart.AxisNamePos(app, a, isX, plotX, plotY, plotW, plotH, far,
+            fs, 0 - 1);
+    }
+
+    // App 版 + 轴线位置覆盖（onZero 让轴线离开绘图区边界时用）。
+    public static ChartAxisName AxisNamePos(App app, ChartAxis a, bool isX,
+                                    int plotX, int plotY, int plotW, int plotH,
+                                    bool far, int fs, int axisLine) {
+        return Chart.AxisNamePosPx(a, isX, plotX, plotY, plotW, plotH, far,
+            Chart.NameGapPx(app, a), Canvas.FontHeight(fs),
+            Canvas.CenterTextYAt(0, fs), axisLine);
+    }
+
+    // 轴名占据的像素盒（用于给绘图区让出上下栏）。rot=-90 的行盒
+    // （tw x fh）绕 (ax, ay) 逆时针转 90° 后占 x∈[ax,ax+fh]、
+    // y∈[ay-tw, ay]（见 AxisNameY 的推导），故 y 区间以 ay 为下界。
+
+    public static ChartNameBox AxisNameBoxPx(ChartAxis a, bool isX, int plotX,
+                                      int plotY, int plotW, int plotH,
+                                      bool far, int gap, int fh, int centerTop,
+                                      int tw, int axisLine) {
+        ChartNameBox b = new ChartNameBox();
+        ChartAxisName n = Chart.AxisNamePosPx(a, isX, plotX, plotY, plotW,
+            plotH, far, gap, fh, centerTop, axisLine);
+        if (n.rot == 0) {
+            int l = n.ax;
+            if (n.anchor == 1) { l = n.ax - tw / 2; }
+            if (n.anchor == 2) { l = n.ax - tw; }
+            b.left = l; b.right = l + tw;
+            b.top = n.ay; b.bottom = n.ay + fh;
+        } else {
+            b.left = n.ax; b.right = n.ax + fh;
+            b.top = n.ay - tw / 2; b.bottom = n.ay + tw / 2;
+        }
+        return b;
+    }
+
+    // 轴名行盒左缘（rot=0 时按 anchor 对齐）。
+    public static int AxisNameX(App app, ChartAxis a, ChartAxisName n, int fs) {
+        if (n.rot != 0) { return n.ax; }
+        int tw = Canvas.MeasureText(a.title, fs);
+        if (n.anchor == 1) { return n.ax - tw / 2; }
+        if (n.anchor == 2) { return n.ax - tw; }
+        return n.ax;
+    }
+
+    // 轴名行盒顶边：rot=-90 的行盒（tw x fh）绕 (ax, ay) 逆时针转 90°
+    // 后占 y∈[ay-tw, ay]，故把锚点下移半个文本宽使文本以锚点为中心。
+    public static int AxisNameY(App app, ChartAxis a, ChartAxisName n, int fs) {
+        if (n.rot == 0) { return n.ay; }
+        return n.ay + Canvas.MeasureText(a.title, fs) / 2;
+    }
+
+
+    // 同上，另给轴线位置覆盖（page 坐标）：onZero 让轴线骑到零线上时，
+    // start/end 态的名字贴轴线走，middle 态留在绘图区边界（官方
+    // AxisBuilder.ts:869 的 middle pos.y = labelOffset + nameDir*gap，
+    // labelOffset 恰好抵回原位；start/end 的 pos.y=0 直接收组的平移）。
+    public static void DrawAxisNameAt(App app, Canvas c, ChartAxis a, bool isX,
+                              int plotX, int plotY, int plotW, int plotH, bool far,
+                              StyleBox sTitle, int fs, int axisLine) {
+        if (a == null || a.title.Length == 0 || !a.show) { return; }
+        int nfs = a.nameFontSize > 0 ? a.nameFontSize : fs;
+        ChartAxisName n = Chart.AxisNamePos(app, a, isX, plotX, plotY, plotW,
+            plotH, far, nfs, axisLine);
+        int ax = Chart.AxisNameX(app, a, n, nfs);
+        int ay = Chart.AxisNameY(app, a, n, nfs);
+        int col = a.nameColor != 0 ? a.nameColor : sTitle.FgOr(0);
+        if (n.rot == 0) {
+            c.DrawText(ax, ay, a.title, col, nfs);
+        } else {
+            c.DrawTextRot(ax, ay, a.title, col, nfs, n.rot);
+        }
+    }
+
+    // 右侧竖排图例的起始 y（官方盒模型）：先按 legend.top/bottom 锚
+    // （未声明时官方默认 bottom 15）算贴底位置，再受工具箱避让约束
+    // 下移。rowsH 为图例整列高度；<= 0 时退化为仅工具箱避让。
+    public static int LegendStartY(App app, int y, int proposed) {
+        return Chart.LegendStartYRows(app, y, proposed, 0, 0, 0);
+    }
+
+    // 带容器尺寸的版本：h/rowsH 给出时按官方 bottom 锚贴底。
+    public static int LegendStartYRows(App app, int y, int proposed, int h, int rowsH, int pad) {
+        int startY = proposed;
+        if (h > 0 && rowsH > 0) {
+            startY = Chart.LegendFloatTop(app, y, h, rowsH, pad);
+        }
+        if (Chart.toolReserve < 1) { return startY; }
+        int bandBot = y + app.theme.paddingMedium
+            + ChartToolbox.Height(app) + app.Scale(4);
+        if (startY < bandBot) { return bandBot; }
+        return startY;
+    }
+
+    // 图例占用的行数：有工具箱时整排下移到标题行之下（至少 1 行）；
+    // 否则与标题同行，仅统计放不下而换出的行。
+    // 图例项 = 唯一系列名（ECharts 图例按名字去重：bar9 同名的
+    // 可见段与透明孔段共用一个图例项）。返回每个名字首个系列
+    // 的下标；DrawPanelI 与 LegendRowCount 必须同用本函数，
+    // 两边的行高/换行才能对齐。
+    public static List<int> LegendPrimIdx(List<ChartSeries> series) {
+        List<int> prim = new List<int>();
+        // 混搭面板（ECharts 同 option 混排）：与主体不同族的
+        // Pie/Gauge/Funnel 系列经 DrawOverlaySeries 叠绘在笛卡尔
+        // 坐标系上，不占图例项；piePerPoint 饼在散点核内逐点绘制，
+        // 同样不占。legend.data 白名单存在时只列白名单内的名字。
+        ChartOption lo = Chart.legendOpt;
+        ChartType leadT = series.Count > 0 ? series[0].type : ChartType.Line;
+        if (lo != null && lo.series.Count > 0) {
+            leadT = lo.series[0].type;
+            if (leadT == ChartType.Pie && lo.series[0].piePerPoint) {
+                leadT = ChartType.Scatter;
+            }
+        }
+        for (int ui = 0; ui < series.Count; ui = ui + 1) {
+            ChartSeries cs = series[ui];
+            bool ov = (cs.type == ChartType.Pie || cs.type == ChartType.Gauge
+                || cs.type == ChartType.Funnel) && cs.type != leadT;
+            if (cs.type == ChartType.Pie && cs.piePerPoint) { ov = true; }
+            if (lo != null && ov) { continue; }
+            if (lo != null && lo.legendData != null
+                && lo.legendData.Count > 0) {
+                bool white = false;
+                for (int wl = 0; wl < lo.legendData.Count; wl = wl + 1) {
+                    if (lo.legendData[wl] == cs.name) { white = true; break; }
+                }
+                if (!white) { continue; }
+            }
+            bool dup = false;
+            for (int uj = 0; uj < prim.Count; uj = uj + 1) {
+                if (series[prim[uj]].name == cs.name) { dup = true; break; }
+            }
+            if (!dup) { prim.Add(ui); }
+        }
+        return prim;
+    }
+
+    public static int LegendRowCount(App app, int x, int w, string title,
+                              List<ChartSeries> series) {
+        if (series == null || series.Count < 1) { return 0; }
+        List<int> prim = Chart.LegendPrimIdx(series);
+        if (Chart.LegendVertical()) { return prim.Count; }
+        string fmt = Chart.LegendFmt();
+        int pad = app.theme.paddingMedium;
+        int lgFs = ChartFonts.Legend(app);
+        int sw = app.Scale(12);
+        bool below = Chart.toolReserve > 0;
+        int extra = 0;
+        if (below) {
+            extra = 1;
+            int xCur = x + pad;
+            int maxX = x + w - pad;
+            for (int pi = 0; pi < prim.Count; pi = pi + 1) {
+                int chipW = sw + app.Scale(6)
+                    + Canvas.MeasureText(Chart.LegendLabel(fmt, series[prim[pi]].name), lgFs);
+                if (xCur > x + pad && xCur + chipW > maxX) {
+                    extra = extra + 1;
+                    xCur = x + pad;
+                }
+                xCur = xCur + chipW + app.Scale(14);
+            }
+            return extra;
+        }
+        int lx = x + w - pad;
+        int leftLimit = x + pad;
+        if (title.Length > 0) {
+            leftLimit = x + pad
+                + Canvas.MeasureText(title, Style.FontFallback(app, "large"))
+                + app.Scale(14);
+        }
+        int pi2 = prim.Count - 1;
+        while (pi2 >= 0) {
+            int tw = Canvas.MeasureText(Chart.LegendLabel(fmt, series[prim[pi2]].name), lgFs);
+            int rowLeft = lx - tw - app.Scale(6) - sw;
+            if (rowLeft < leftLimit) {
+                extra = extra + 1;
+                lx = x + w - pad;
+                leftLimit = x + pad;
+                rowLeft = lx - tw - app.Scale(6) - sw;
+                if (rowLeft < leftLimit) { rowLeft = leftLimit; }
+            }
+            lx = rowLeft - app.Scale(14);
+            pi2 = pi2 - 1;
+        }
+        return extra;
+    }
+
+    // 面板内容区顶部 y：标题/工具箱行 + 图例行 + 间隙。
+    // DrawPanelI 与 PanelTopI 共用，悬停层才能与主体对齐。
+    public static int PanelContentTop(App app, int x, int y, int w, string title,
+                               List<ChartSeries> series, bool showLegend) {
+        int pad = app.theme.paddingMedium;
+        // grid 子面板是纯绘图区：不预留标题/工具箱头部（ECharts
+        // grid 语义，页级元素由派发层在面板坐标画一次）。
+        if (Chart.gridPanelSub) { return y + pad; }
+        int titleH = Canvas.FontHeight(Style.FontFallback(app, "large"));
+        if (title.Length > 0 && Chart.TitleSubText().Length > 0) {
+            titleH = titleH + Canvas.FontHeight(ChartFonts.SeriesLabel(app))
+                + app.Scale(2);
+        }
+        int headH = titleH;
+        if (Chart.toolReserve > 0) {
+            int th = ChartToolbox.Height(app);
+            if (th > headH) { headH = th; }
+        }
+        int belowGap = 0;
+        int extra = 0;
+        // ECharts 6：水平图例在面板底部（legendBottomReserve，
+        // BuildAxesR 扣除），只有竖排图例还从内容区顶部占行。
+        if (showLegend && Chart.LegendVertical()) {
+            extra = Chart.LegendRowCount(app, x, w, title, series);
+            if (Chart.toolReserve > 0) { belowGap = app.Scale(4); }
+        }
+        int rowH = Canvas.FontHeight(ChartFonts.Legend(app)) + app.Scale(6);
+        return y + pad + headH + belowGap + extra * rowH + app.Scale(6);
+    }
+
+    // 面板 + 交互式图例。wid != 0 时每个色块是一个命中区域：
+    // 点击切换该系列的可见性（以 wid 为键持久化在
+    // App 状态映射中），解析后的隐藏标志写入帧内系列
+    // 快照，所有下游渲染器都会跳过它。隐藏的系列
+    // 以变暗 + 删除线绘制，以便可以恢复显示。
+    // showLegend=false 时既绘制也不解析隐藏状态——
+    // 图例关闭时系列恒为可见，避免状态残留让图无声消失。
+    // 返回内容区顶部 y。悬停覆盖层请用 PanelTopI。
+    public static int DrawPanelI(App app, int x, int y, int w, int h,
+                          int legendTextCol, string title,
+                          List<ChartSeries> series, int wid, bool showLegend) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int pad = t.paddingMedium;
+
+        StyleBox sPanel = Style.Full(app, "chart", "", "", Style.SNormal());
+        // option.backgroundColor 优先于主题面板色（A13）：整卡底色。
+        if (!Chart.gridPanelSub) {
+            c.SurfaceRoundRect(x, y, w, h, t.borderRadiusMedium,
+                Chart.PanelBgOr(sPanel.BgOr(0)), sPanel.BorderOr(0), 1);
+        }
+
+        int top = y + pad;
+        // color tokens.color.quaternary(#86878c)。按官方 px 值缩放，不跟随
+        // IDE 主题字号档（图表是契约兼容，默认值须与官方一致）。
+        int titleFs = app.Scale(18);
+        int titleSubFs = app.Scale(12);
+        int titleH = Canvas.FontHeight(titleFs);
+        string titleSub = Chart.TitleSubText();
+        if (title.Length > 0 && titleSub.Length > 0) {
+            titleH = titleH + Canvas.FontHeight(titleSubFs) + app.Scale(2);
+        }
+        int titleMax = x + w - pad - Chart.toolReserve - (x + pad) - app.Scale(8);
+        if (title.Length > 0 && titleMax > 0) {
+            int tW = Canvas.MeasureText(title, titleFs);
+            string tal = Chart.TitleAlignMode();
+            int tx = x + pad;
+            if (tal == "center") { tx = x + pad + (titleMax - tW) / 2; }
+            else if (tal == "right") { tx = x + pad + titleMax - tW; }
+            if (tx < x + pad) { tx = x + pad; }
+            c.PushClip(x + pad, top, titleMax, titleH);
+            // 官方 title.textStyle.fontWeight 默认 'bold'。
+            c.DrawTextBold(tx, top, title, Chart.TitleColor(), titleFs);
+            if (titleSub.Length > 0) {
+                int subFs = titleSubFs;
+                int subW = Canvas.MeasureText(titleSub, subFs);
+                int sx = tx;
+                if (tal == "center") { sx = x + pad + (titleMax - subW) / 2; }
+                else if (tal == "right") { sx = x + pad + titleMax - subW; }
+                if (sx < x + pad) { sx = x + pad; }
+                c.DrawText(sx, top + Canvas.FontHeight(titleFs), titleSub,
+                    Chart.TitleSubColor(), subFs);
+            }
+            c.PopClip();
+        }
+
+        if (showLegend) {
+        // dataZoom 预留带：读后即清，图例锚点上移由 zbr 生效。
+        int zbr = Chart.zoomBandReserve;
+        Chart.zoomBandReserve = 0;
+        // 图例项按系列名去重（LegendPrimIdx）；先把全部系列的
+        // 隐藏态从状态映射同步进来——同名非主系列没有自己的
+        // 色块，靠这一步跟随主项显隐。
+        List<int> prim = Chart.LegendPrimIdx(series);
+        for (int hsi = 0; hsi < series.Count; hsi = hsi + 1) {
+            bool hs0 = series[hsi].hidden;
+            if (wid != 0) {
+                hs0 = app.StateGet(Chart.LegendKey(wid, hsi), hs0 ? 1 : 0) == 1;
+            }
+            series[hsi].hidden = hs0;
+        }
+        // ECharts 6 默认（LegendModel defaultOption：left 'center' +
+        // bottom tokens.size.m）：水平图例画在面板底部居中，行数计入
+        // legendBottomReserve，由 BuildAxesR 从绘图区底边扣除；竖排
+        // 图例保持顶部标题行之下左对齐（官方例显式 orient:'vertical'
+        // 才纵向，位置随例声明）。
+        StyleBox sLegend = Style.Part(app, "chart", "legend", "", "", "",
+                                      Style.SNormal());
+        StyleBox sLegendOff = Style.Part(app, "chart", "legend", "", "off", "",
+                                         Style.SNormal());
+        int sw = app.Scale(12);
+        int lgFs = ChartFonts.Legend(app);
+        int rowH = Canvas.FontHeight(lgFs) + app.Scale(6);
+        string fmt = Chart.LegendFmt();
+        int lmode = Chart.LegendSelMode();
+        bool vert = Chart.LegendVertical();
+        int headH = titleH;
+        if (vert) {
+            int toolH = ChartToolbox.Height(app);
+            if (toolH > headH) { headH = toolH; }
+        }
+        int lgY = y + pad;
+        if (vert) {
+            lgY = y + pad + headH + app.Scale(4);
+            // 官方盒模型：显式 top 数值锚贴顶，显式 bottom 数值锚贴底，
+            // 关键字 top/middle/bottom 对应上/中/下。竖排图例官方默认
+            // 仍是 left 'center' + bottom 15（LegendModel.defaultOption），
+            // 故未声明垂直锚时按 bottom 15 贴底。
+            int rowsV = prim.Count;
+            if (rowsV < 1) { rowsV = 1; }
+            lgY = Chart.LegendFloatTop(app, y, h - zbr, rowsV * rowH, pad);
+            Chart.legendBottomReserve = 0;  // 竖排不占横带
+        } else {
+            // 底部：先用与绘制完全相同的换行规则量出行数，再从面板
+            // 底边起排（绘图区一侧留 app.Scale(4) 间隙）。
+            int availL = x + pad;
+            int availR = x + w - pad;
+            int rows = 1;
+            int wCur = availL;
+            for (int sm = 0; sm < prim.Count; sm = sm + 1) {
+                int chipW = app.Scale(25) + app.Scale(5)
+                    + Canvas.MeasureText(Chart.LegendLabel(fmt, series[prim[sm]].name), lgFs);
+                if (wCur > availL && wCur + chipW > availR) {
+                    rows = rows + 1;
+                    wCur = availL;
+                }
+                wCur = wCur + chipW + app.Scale(10);
+            }
+            // 图例盒模型：图例默认 bottom 15 + padding 5 浮在画布
+            // 底部边距里，grid 不让位（同一边距带内分层）。
+            lgY = y + h - zbr - app.Scale(27) - rowH / 2
+                - (rows - 1) * rowH;
+            Chart.legendBottomReserve = 0;
+        }
+            int xCur = x + pad;
+            int maxX = x + w - pad;
+            if (!vert) {
+                int totW = 0;
+                for (int sm = 0; sm < prim.Count; sm = sm + 1) {
+                    totW = totW + app.Scale(25) + app.Scale(5)
+                        + Canvas.MeasureText(Chart.LegendLabel(fmt, series[prim[sm]].name), lgFs)
+                        + app.Scale(10);
+                }
+                if (prim.Count > 0) { totW = totW - app.Scale(10); }
+                if (totW > 0 && totW <= maxX - xCur) {
+                    // 官方盒模型：left/right/center 关键字，或 left/right
+                    // 数值锚（px）。两者都未声明时 = 官方默认 center。
+                    xCur = Chart.LegendFloatLeft(app, x, w, totW, pad,
+                        x + pad, maxX);
+                }
+            }
+            for (int pi = 0; pi < prim.Count; pi = pi + 1) {
+                int p = prim[pi];
+                bool hid = series[p].hidden;
+                string nm = Chart.LegendLabel(fmt, series[p].name);
+                int tw = Canvas.MeasureText(nm, lgFs);
+                int chipW = app.Scale(25) + app.Scale(5) + tw;
+                if (xCur > x + pad && (vert || xCur + chipW > maxX)) {
+                    xCur = x + pad;
+                    lgY = lgY + rowH;
+                }
+                // legend.textStyle.color 显式声明压过主题（radar-aqi
+                // 深底的 #fff 图例白字）。
+                int txtCol = legendTextCol != 0
+                    ? legendTextCol : sLegend.FgOr(0);
+                int swCol = ChartColor.SeriesPaintColor(series[p], t, p);
+                if (hid) { txtCol = sLegendOff.FgOr(0); swCol = sLegendOff.BgOr(0); }
+                // 官方 6.1 图例项（SSR 实测）：itemWidth 25 × itemHeight
+                // 14 的图标盒 + 5px 文本缝。线族 = 系列色 2px 横线 +
+                // 线上 r5.6 白底描边圆点（圆心 x≈18 偏右）；其余类型 =
+                // 系列色圆角矩形（roundRect）。
+                int iconW = app.Scale(25);
+                int cy = lgY + rowH / 2;
+                if (ChartView.IsLineFamily(series[p].type)) {
+                    c.FillRect(xCur, cy - app.Scale(1), iconW, app.Scale(2), swCol);
+                    Chart.DrawSymbol(c, xCur + app.Scale(18), cy,
+                        (app.Scale(56) + 5) / 10, "circle", 0xFFFFFF, swCol,
+                        app.Scale(2));
+                } else {
+                    c.FillRoundRect(xCur, cy - app.Scale(7), iconW,
+                        app.Scale(14), t.borderRadiusSmall, swCol);
+                }
+                int ty = lgY + (rowH - Canvas.FontHeight(lgFs)) / 2;
+                c.DrawText(xCur + iconW + app.Scale(5), ty, nm, txtCol, lgFs);
+                if (hid) {
+                    int my = ty + Canvas.FontHeight(lgFs) / 2;
+                    c.FillRect(xCur + iconW + app.Scale(5), my, tw, 1,
+                        sLegendOff.FgOr(0));
+                }
+                if (wid != 0 && lmode != 0 - 1) {
+                    int hitId = app.focus.AllocId();
+                    app.hitTester.RegisterRect(hitId, xCur, lgY, chipW, rowH, 3);
+                    if (Ui.Clicked(app, hitId)) {
+                        hid = Chart.LegendClick(app, wid, series, p, hid, lmode);
+                        // 同名系列随主项一起开关（single 模式下
+                        // LegendClick 先全隐藏，这里把本组改回来）。
+                        for (int gm = 0; gm < series.Count; gm = gm + 1) {
+                            if (gm != p && series[gm].name == series[p].name) {
+                                app.StateSet(Chart.LegendKey(wid, gm), hid ? 1 : 0);
+                            }
+                        }
+                    }
+                }
+                series[p].hidden = hid;
+                xCur = xCur + chipW + app.Scale(14);
+            }
+        }
+
+        return Chart.PanelContentTop(app, x, y, w, title, series, showLegend);
+    }
+
+    // legend 色块点击（单一实现供两个布局分支复用）：写隐藏态，
+    // single 模式下「显示一个」同时隐藏其余系列。返回点击后的 hid。
+    // 触发 LegendSelected 交互事件。
+    public static bool LegendClick(App app, int wid, List<ChartSeries> series,
+                            int si, bool hid, int mode) {
+        int nv = 1;
+        if (hid) { nv = 0; }
+        app.StateSet(Chart.LegendKey(wid, si), nv);
+        ChartInteractionEvent le = ChartInteractionEvent.Series(
+            ChartEventType.LegendSelected, wid, si, series[si].name);
+        le.selected = nv == 0;
+        ChartView.RaiseActive(le);
+        if (nv == 0 && mode == 1) {
+            for (int oi = 0; oi < series.Count; oi = oi + 1) {
+                if (oi != si) {
+                    app.StateSet(Chart.LegendKey(wid, oi), 1);
+                    series[oi].hidden = true;
+                }
+            }
+        }
+        app.RequestRedraw();
+        return nv == 1;
+    }
+
+    // 只算不画：与 DrawPanelI 完全一致的面板内容顶部
+    // （标题行高 + 图例换行占位，换行算法逐行镜像）。
+    // 悬停覆盖层用它与主体帧对齐——覆盖层绝不能调
+    // DrawPanelI / PanelHead，它们会重绘面板背景盖住图形。
+    public static int PanelTopI(App app, int x, int y, int w, string title,
+                         List<ChartSeries> series, bool showLegend) {
+        return Chart.PanelContentTop(app, x, y, w, title, series, showLegend);
+    }
+
+    // 左轴上的阴影 markArea 带 [markLo, markHi]（绘制在
+    // 系列之下）。两个边界未全部设置时为空操作。
+    public static void DrawMarkArea(App app, ChartFrame f, ChartOption o) {
+        if (o.markLo == ChartOption.Auto() || o.markHi == ChartOption.Auto()) { return; }
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int y0 = f.YOf(o.markHi, 0);
+        int y1 = f.YOf(o.markLo, 0);
+        if (y1 < y0) { int tmp = y0; y0 = y1; y1 = tmp; }
+        int areaBase = Style.Part(app, "chart", "mark-area", "", "", "",
+                                  Style.SNormal()).BgOr(0);
+        c.FillRect(f.plotX, y0, f.plotW, y1 - y0, ChartColor.WithAlpha(areaBase, 28));
+    }
+
+    // ---- dataRange 值过滤（消费方共用 seam）----
+
+    // 生效筛选窗口的单边边界：固定 dataRangeLo/Hi 优先（Auto →
+    // dMin/dMax）；calculable 时再取滑条状态位（q 0..1000，默认
+    // 不裁剪）线性映射后与固定值取更收紧的一侧。upper=false 取下界。
+    public static int DRangeEff(App app, ChartOption o, int wid, int dMin, int dMax,
+                         bool upper) {
+        int baseV = upper ? o.dataRangeHi : o.dataRangeLo;
+        if (baseV == ChartOption.Auto()) { baseV = upper ? dMax : dMin; }
+        if (o.dataRangeCalculable && wid != 0) {
+            int q = app.StateGet(upper ? Chart.DRangeHiKey(wid)
+                                       : Chart.DRangeLoKey(wid),
+                                 upper ? 1000 : 0);
+            int sv = Chart.DataRangeValue(dMin, dMax, q);
+            if (upper) { if (sv < baseV) { baseV = sv; } }
+            else { if (sv > baseV) { baseV = sv; } }
+        }
+        return baseV;
+    }
+
+    // 值 v 是否落在 splitList 的某个「未点掉」分段里（无列表 = 放行）。
+    public static bool DRangeBandOk(App app, ChartOption o, int wid, int v) {
+        if (o.dataRangeList.Count < 1) { return true; }
+        for (int bi = 0; bi < o.dataRangeList.Count; bi = bi + 1) {
+            ChartRangeSplit sp = o.dataRangeList[bi];
+            if ((sp.lo == ChartOption.Auto() || v >= sp.lo)
+                && (sp.hi == ChartOption.Auto() || v <= sp.hi)) {
+                if (wid != 0 && app.StateGet(Chart.DRangeBandKey(wid, bi), 0) != 0) {
+                    return false;
+                }
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // 统一消费 seam：值 v 是否通过当前 dataRange 过滤
+    // （滑条窗口 + splitList 分段可见性）。dataRangeShow=false 时放行。
+    public static bool DRangeOk(App app, ChartOption o, int wid, int dMin, int dMax, int v) {
+        if (!o.dataRangeShow) { return true; }
+        if (v < Chart.DRangeEff(app, o, wid, dMin, dMax, false)) { return false; }
+        if (v > Chart.DRangeEff(app, o, wid, dMin, dMax, true)) { return false; }
+        return Chart.DRangeBandOk(app, o, wid, v);
+    }
+
+    // 左轴 markLine 处的水平阈值线（虚线），带可选的
+    // 右对齐标签（绘制在系列之上）。markLine 未设置时为空操作。
+    public static void DrawMarkLine(App app, ChartFrame f, ChartOption o) {
+        if (o.markLine == ChartOption.Auto()) { return; }
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int my = f.YOf(o.markLine, 0);
+        StyleBox sMark = Style.Part(app, "chart", "mark", "", "", "",
+                                    Style.SNormal());
+        // 虚线
+        int dx = f.plotX;
+        int dash = app.Scale(6);
+        while (dx < f.plotX + f.plotW) {
+            int seg = dash;
+            if (dx + seg > f.plotX + f.plotW) { seg = f.plotX + f.plotW - dx; }
+            c.FillRect(dx, my, seg, 1, sMark.BgOr(0));
+            dx = dx + dash * 2;
+        }
+        if (o.markLabel.Length > 0) {
+            int fs = ChartFonts.SeriesLabel(app);
+            int lw = Canvas.MeasureText(o.markLabel, fs);
+            c.DrawText(f.plotX + f.plotW - lw, my - Canvas.FontHeight(fs) - app.Scale(1),
+                o.markLabel, sMark.FgOr(0), fs);
+        }
+    }
+
+    // 轴线公共尾（DrawFrameTO/DrawFrameLoHiO 用）：竖线 = y 轴、
+    // 横线 = x 轴，按 axisLine 三态/'auto'（cartesianAxisHelper.ts
+    // axisLineAutoShow：'auto' 只画对侧为 value/log 的轴）定画不画，
+    // onZero 骑线把 x 轴线搬到 y 轴的 0 位（Grid.ts:614-717，
+    // EDGE 也算、钳在绘图区内）。yLo/yHi 为 y 轴数值域；
+    // o = null 时两根线都画（旧形态）。
+    public static void FrameLines(App app, Canvas c, ChartOption o, int yLo, int yHi,
+                           int plotX, int plotY, int plotW, int plotH, int ink) {
+        ChartAxis frX = o == null ? null : o.XAxis0();
+        ChartAxis frY = o == null ? null : o.YAxis0();
+        bool frXIsVL = frX != null && (frX.type == ChartAxisType.Value
+            || frX.type == ChartAxisType.Log);
+        bool frYIsVL = frY != null && (frY.type == ChartAxisType.Value
+            || frY.type == ChartAxisType.Log);
+        bool yLine = frY == null || (frY.show
+            && Chart.AxisLineDraws(frY.axisLineShow, frXIsVL));
+        bool xLine = frX == null || (frX.show
+            && Chart.AxisLineDraws(frX.axisLineShow, frYIsVL));
+        int xLineY = plotY + plotH;
+        if (o != null && Chart.CanOnZeroTo(frY, yLo, yHi, frX.onZero)) {
+            long spanL = (long)yHi - (long)yLo;
+            if (spanL < 1) { spanL = 1; }
+            int zy = plotY + plotH
+                - (int)((long)(0 - yLo) * (long)plotH / spanL);
+            if (zy < plotY) { zy = plotY; }
+            if (zy > plotY + plotH) { zy = plotY + plotH; }
+            xLineY = zy;
+        }
+        if (yLine) { c.FillRect(plotX, plotY, app.Scale(2), plotH, ink); }
+        if (xLine) { c.FillRect(plotX, xLineY, plotW, app.Scale(2), ink); }
+    }
+
+
+    // 同 DrawFrame，但刻度数显式给定（ECharts nice 步长的
+    // 刻度数可不同于 5，如 0..1400 每 200 = 7 格）。
+    public static ChartFrame DrawFrameT(App app, int x, int y, int w, int h, int plotTop,
+                                 List<string> labels, int maxV, int ticks) {
+        return Chart.DrawFrameTO(app, x, y, w, h, plotTop, labels, maxV, ticks,
+            null);
+    }
+
+    // 同 DrawFrameT，另吃 ChartOption：按 axisLine 三态/骑线画
+    // 轴线（o = null 保持旧形态，两根线都画）。y 域 [0, maxV] 的
+    // 0 是 EDGE，x 轴线骑过去仍是底边。
+    public static ChartFrame DrawFrameTO(App app, int x, int y, int w, int h, int plotTop,
+                                  List<string> labels, int maxV, int ticks,
+                                  ChartOption o) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int pad = t.paddingMedium;
+        int axisFs = ChartFonts.AxisLabel(app);
+        if (ticks < 1) { ticks = 5; }
+
+        int botGut = Canvas.FontHeight(axisFs) + app.Scale(8);
+
+        // A16：与 BuildAxesR 同一矩形来源（GridRawRect）；o 为 null
+        // （对象 API 旧形态）时缺省 left 15% / right 10% 照旧生效，
+        // 头部下限与图例带仍是外壳语义（ECharts 图例浮在画布上）。
+        ChartLayoutRect fr;
+        if (o != null) {
+            fr = ChartGeometry.GridRawRect(o.gridLeftRaw, o.gridRightRaw,
+                o.gridTopRaw, o.gridBottomRaw, o.gridWidthRaw, o.gridHeightRaw,
+                (double)w, (double)h, false);
+        } else {
+            fr = ChartGeometry.GridRawRect(null, null, null, null, null, null,
+                (double)w, (double)h, false);
+        }
+        int plotX = x + (int)Math.Round(fr.x);
+        int plotY = plotTop;
+        int plotW = (int)Math.Round(fr.x + fr.width) - plotX;
+        // 底部图例（ECharts 6 默认）从绘图区底边扣除。
+        int frBot = y + (int)Math.Round(fr.y + fr.height)
+            - botGut - Chart.legendBottomReserve;
+        int plotH = frBot - plotY;
+        if (plotH > y + h - pad - plotY) { plotH = y + h - pad - plotY; }
+        if (plotW < app.Scale(20)) { plotW = app.Scale(20); }
+        if (plotH < app.Scale(20)) { plotH = app.Scale(20); }
+
+        StyleBox sGrid = Style.Part(app, "chart", "grid", "", "", "",
+                                    Style.SNormal());
+        StyleBox sAxis = Style.Part(app, "chart", "axis", "", "", "",
+                                    Style.SNormal());
+        for (int k = 0; k <= ticks; k = k + 1) {
+            int gy = plotY + plotH - (k * plotH / ticks);
+            c.FillRect(plotX, gy, plotW, 1, sGrid.BgOr(0));
+            int val = maxV * k / ticks;
+            string vs = Chart.Commas(val);
+            int vw = Canvas.MeasureText(vs, axisFs);
+            c.DrawText(plotX - app.Scale(6) - vw, Canvas.CenterTextYAt(gy, axisFs), vs, sAxis.FgOr(0), axisFs);
+        }
+        Chart.FrameLines(app, c, o, 0, maxV, plotX, plotY, plotW, plotH,
+            sAxis.BgOr(0));
+
+        int n = labels.Count;
+        if (n > 0) {
+            for (int ci = 0; ci < n; ci = ci + 1) {
+                int cxs = plotX + ci * plotW / n;
+                int cellW = plotX + (ci + 1) * plotW / n - cxs;
+                c.DrawTextCentered(cxs, plotY + plotH + app.Scale(4), cellW, botGut,
+                    labels[ci], sAxis.FgOr(0), axisFs);
+            }
+        }
+
+        ChartFrame f = new ChartFrame();
+        f.plotX = plotX;
+        f.plotY = plotY;
+        f.plotW = plotW;
+        f.plotH = plotH;
+        f.leftMin = 0;
+        f.leftMax = maxV;
+        f.catBoundaryGap = true;
+        return f;
+    }
+
+
+    // 同 DrawFrameLoHi，但 y 刻度数显式给定（smartSteps 包络的
+    // 步长数可为 4..7，如 2200..2450 每 50 = 5 格）。
+    public static ChartFrame DrawFrameLoHiT(App app, int x, int y, int w, int h, int plotTop,
+                                     List<string> labels, int lo, int hi, int ticks) {
+        return Chart.DrawFrameLoHiO(app, x, y, w, h, plotTop, labels, lo, hi,
+            ticks, null);
+    }
+
+    // 同 DrawFrameLoHiT，另吃 ChartOption：按 axisLine 三态/'auto'
+    // 与 onZero 骑线画轴线（boxplot-multi 的 x 轴线骑 y0 零线；
+    // 蜡烛/箱线 y 'auto' 不画左线）。o = null 保持旧形态。
+    public static ChartFrame DrawFrameLoHiO(App app, int x, int y, int w, int h, int plotTop,
+                                     List<string> labels, int lo, int hi, int ticks,
+                                     ChartOption o) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int pad = t.paddingMedium;
+        int axisFs = ChartFonts.AxisLabel(app);
+        if (hi <= lo) { hi = lo + 1; }
+
+        int botGut = Canvas.FontHeight(axisFs) + app.Scale(8);
+
+        // A16：与 BuildAxesR/DrawFrameTO 同一矩形来源；o 为 null 保持
+        // 旧形态。leftGut 不再参与矩形（标签绘制起点由矩形左缘推）。
+        int plotX;
+        int plotY = plotTop;
+        ChartLayoutRect fr2;
+        if (o != null) {
+            fr2 = ChartGeometry.GridRawRect(o.gridLeftRaw, o.gridRightRaw,
+                o.gridTopRaw, o.gridBottomRaw, o.gridWidthRaw, o.gridHeightRaw,
+                (double)w, (double)h, false);
+        } else {
+            fr2 = ChartGeometry.GridRawRect(null, null, null, null, null, null,
+                (double)w, (double)h, false);
+        }
+        plotX = x + (int)Math.Round(fr2.x);
+        int plotW = (int)Math.Round(fr2.x + fr2.width) - plotX;
+        // 底部图例（ECharts 6 默认）从绘图区底边扣除。
+        int frBot = y + (int)Math.Round(fr2.y + fr2.height)
+            - botGut - Chart.legendBottomReserve;
+        int plotH = frBot - plotY;
+        if (plotH > y + h - pad - plotY) { plotH = y + h - pad - plotY; }
+        if (plotW < app.Scale(20)) { plotW = app.Scale(20); }
+        if (plotH < app.Scale(20)) { plotH = app.Scale(20); }
+
+        StyleBox sGrid = Style.Part(app, "chart", "grid", "", "", "",
+                                    Style.SNormal());
+        StyleBox sAxis = Style.Part(app, "chart", "axis", "", "", "",
+                                    Style.SNormal());
+        int span = hi - lo;
+        if (ticks < 1) { ticks = 5; }
+        for (int k = 0; k <= ticks; k = k + 1) {
+            int gy = plotY + plotH - (k * plotH / ticks);
+            c.FillRect(plotX, gy, plotW, 1, sGrid.BgOr(0));
+            int val = lo + span * k / ticks;
+            string vs = Chart.Commas(val);
+            int vw = Canvas.MeasureText(vs, axisFs);
+            c.DrawText(plotX - app.Scale(6) - vw, Canvas.CenterTextYAt(gy, axisFs), vs, sAxis.FgOr(0), axisFs);
+        }
+        Chart.FrameLines(app, c, o, lo, hi, plotX, plotY, plotW, plotH,
+            sAxis.BgOr(0));
+
+        // 类目标签 auto 抽稀（ECharts axisLabel.interval 缺省 'auto'）：
+        // 宽日期标签逐个画会互相叠字，贪心让位规则与 BuildAxesR/
+        // CategoryTicks 同一套（带状模式居中在格子内、不越左缘）。
+        int n = labels.Count;
+        if (n > 0) {
+            int labelGap = app.Scale(6);
+            List<int> shown = new List<int>();
+            int labelRight = plotX - labelGap;
+            // 预抽稀步长：槽宽连一个最小标签（估 24px）都放不下时，
+            // 逐条 MeasureText 纯烧帧——candlestick-large 2.2 万条
+            // 标签量宽 ≈ 0.9s/帧（鼠标每事件全帧重绘即卡顿）。按
+            // ceil(n×估宽/plotW) 先跳步，只对候选量宽再贪心。
+            int stride = 1;
+            if (n > 1) {
+                stride = (n * app.Scale(24) + plotW - 1) / plotW;
+                if (stride < 1) { stride = 1; }
+            }
+            for (int ci = 0; ci < n; ci = ci + stride) {
+                int labelW = Canvas.MeasureText(labels[ci], axisFs);
+                int cxs = plotX + ci * plotW / n;
+                int cellW = plotX + (ci + 1) * plotW / n - cxs;
+                int labelLeft = cxs + (cellW - labelW) / 2;
+                if (labelLeft < cxs) { labelLeft = cxs; }
+                if (labelLeft >= labelRight + labelGap) {
+                    shown.Add(ci);
+                    labelRight = labelLeft + labelW;
+                }
+            }
+            for (int si = 0; si < shown.Count; si = si + 1) {
+                int ci = shown[si];
+                int cxs = plotX + ci * plotW / n;
+                int cellW = plotX + (ci + 1) * plotW / n - cxs;
+                c.DrawTextCentered(cxs, plotY + plotH + app.Scale(4), cellW, botGut,
+                    labels[ci], sAxis.FgOr(0), axisFs);
+            }
+        }
+
+        ChartFrame f = new ChartFrame();
+        f.plotX = plotX;
+        f.plotY = plotY;
+        f.plotW = plotW;
+        f.plotH = plotH;
+        f.leftMin = lo;
+        f.leftMax = hi;
+        f.catBoundaryGap = true;
+        return f;
+    }
+}

@@ -1,0 +1,2089 @@
+using System;
+using System.Collections.Generic;
+using Gui;
+using Gui.Backend;
+using Gui.Widget;
+
+namespace Gui;
+
+// Control.Layout.zan - 控件尺寸度量（Measure）与停靠/Flex/流式排版（Arrange）
+public partial class Control {
+    // 测量阶段入口（Arrange 之前每帧调用）：换算文档声明的逻辑
+    // 尺寸（ApplyDeclaredUnits）→ 常态样式过期时重新解析 →
+    // 不可见节点到此为止（不测量子树）→ 传播断行宽度提示 →
+    // 递归子节点 → OnMeasure 自测（作者用 Prefer()/文档
+    // width/height 声明的正数尺寸优先于自测结果）→ 容器按内容
+    // 补齐作者留空的轴（MeasureDocked/MeasureFlexContent）。
+    void MeasureTree(App app) {
+        // 测量和绘制必须按同一个节点求组合器；只在绘制时推上下文
+        // 会让后代选择器的尺寸在测量阶段丢失，并逐帧来回击穿样式缓存。
+        Control prevCtx = app.styleCtx;
+        app.styleCtx = this;
+        try {
+            this.MeasureTreeInner(app);
+        } finally {
+            app.styleCtx = prevCtx;
+        }
+    }
+
+    void MeasureTreeInner(App app) {
+        this.ApplyDeclaredUnits(app);
+        // 上一帧按内容补齐的轴先归还，等子树测完再重新补齐——
+        // 补齐规则只在轴为空时生效，不清零的话首帧的错值就永久化了。
+        if (this.fillW) { prefW = 0; this.fillW = false; }
+        if (this.fillH) { prefH = 0; this.fillH = false; }
+        // 常态样式只在它真的过期时才重新解析：解析一次要拼一条
+        // 缓存键、查一次表并克隆一个 StyleBox，一屏几百个节点
+        // 每帧一次就是白花的几十万纳秒。状态样式（悬停/按下的
+        // 过渡态）标记为 -1，因此永远不会被当成常态复用。
+        if (!this.ComputedStyleCurrent(app)
+            || computedStyleState != Style.SNormal()) {
+            this.ResolveStyle(app, Style.SNormal());
+        }
+        if (!this.StyleVisible()) { return; }
+        this.PropagateWrapHint();
+        for (int i = 0; i < children.Count; i = i + 1) {
+            children[i].MeasureTree(app);
+        }
+        // 作者要求的尺寸（Prefer()，或 UiDoc 中的 `width`/`height`）
+        // 优先于控件自行测量的尺寸：OnMeasure
+        // 无条件赋值 prefW/prefH，过去会丢掉
+        // 停靠表格列给定的 92px，把控件停靠在
+        // 自然宽度上——导致一行内的列互相重叠。
+        int keepW = prefW;
+        int keepH = prefH;
+        bool keepSet = prefSet;
+        OnMeasure(app);
+        if (keepSet) {
+            if (keepW > 0) { prefW = keepW; }
+            if (keepH > 0) { prefH = keepH; }
+            prefSet = true;
+        }
+        this.MeasureDocked(app);
+    }
+
+    // 把已知的断行宽度传给纵向排布的子节点。纵向排布（停靠成一列，
+    // 或 `flex-direction: column`）的子节点各自铺满内宽，所以本节点
+    // 知道的宽度对它们同样成立；横向排布的子节点要分摊宽度，这时
+    // 还不知道各自能分到多少，就不传。
+    // 少了这一步，只有最外层容器能拿到宿主给的宽度：嵌在一列里的
+    // 换行 flex 行会按单行测量，第二行被裁掉。
+    void PropagateWrapHint() {
+        int inner = prefW;
+        if (inner <= 0) { inner = hintWrapW; }
+        if (inner <= 0) { return; }
+        inner = inner - this.StyleInsetL() - this.StyleInsetR();
+        if (inner <= 0) { return; }
+        bool flex = this.StyleDisplay() == 1;
+        bool flexRow = flex && this.StyleFlexDir() != 1;
+        for (int i = 0; i < children.Count; i = i + 1) {
+            Control c = children[i];
+            if (c.hintWrapW > 0) { continue; }
+            if (flex) {
+                if (flexRow) { continue; }
+            } else if (c.dock == 3 || c.dock == 4) {
+                continue;
+            }
+            c.hintWrapW = inner;
+        }
+    }
+
+    // ---- 块流（display: flow）与 margin 塌陷（WEB_GUI_ROADMAP P1）----
+
+    // 相邻两个塌陷 margin 的合并值（CSS 2.1 §8.3.1）：同为非负取大；
+    // 同为负取绝对值大的；一正一负相加。
+    static int CollapseMargins(int a, int b) {
+        if (a >= 0 && b >= 0) { return a > b ? a : b; }
+        if (a < 0 && b < 0) { return a < b ? a : b; }
+        int hi = a > b ? a : b;
+        int lo = a < b ? a : b;
+        return hi + lo;
+    }
+
+    // 顶部是否有"分隔"（即不与首子的 margin-top 塌陷）：BFC
+    // （flow-root/行内级/overflow != visible/absolute 定位容器）、
+    // 非 block 流容器，或 border-top/padding-top 把首子隔开。
+    bool FlowSepT() {
+        StyleBox sb = computedStyle;
+        if (sb == null) { return true; }
+        if (sb.bfc != 0 || sb.overflowCss == 1 || sb.position == 2) {
+            return true;
+        }
+        if (sb.display != 3) { return true; }
+        return this.StyleInsetT() > 0;
+    }
+
+    // 底部分隔（不与尾子的 margin-bottom 塌陷），规则同 FlowSepT。
+    bool FlowSepB() {
+        StyleBox sb = computedStyle;
+        if (sb == null) { return true; }
+        if (sb.bfc != 0 || sb.overflowCss == 1 || sb.position == 2) {
+            return true;
+        }
+        if (sb.display != 3) { return true; }
+        return this.StyleInsetB() > 0;
+    }
+
+    // 子项 `c` 在块流父里的有效上外边距：display:flow 的普通容器
+    // （非 BFC、无分隔内衬）与首子塌陷——递归取链上合并值；
+    // 其余原样返回自身 margin-top。空块的双边自塌在兄弟链合并。
+    int FlowMarT(Control c) {
+        int m = c.StyleMarT();
+        if (c.StyleDisplay() != 3 || c.FlowSepT()) { return m; }
+        List<Control> kk = c.FlexKids();
+        if (kk.Count == 0) { return m; }
+        return CollapseMargins(m, this.FlowMarT(kk[0]));
+    }
+
+    // 子项 `c` 的有效下外边距，规则同 FlowMarT（对最后一个流内子项）。
+    int FlowMarB(Control c) {
+        int m = c.StyleMarB();
+        if (c.StyleDisplay() != 3 || c.FlowSepB()) { return m; }
+        List<Control> kk = c.FlexKids();
+        if (kk.Count == 0) { return m; }
+        return CollapseMargins(m, this.FlowMarB(kk[kk.Count - 1]));
+    }
+
+    // 块流意义上的空块（CSS 2.1 §8.3.1 自塌条件）：display:flow、
+    // 无流内子项、无匿名文本、块尺寸为零——声明高 >0、min-height
+    // >0、上下 border/padding 任一非零都使它成为真实盒子
+    // （`height: 0` 仍是零，塌穿；`height: 30px` 不塌）。
+    bool IsEmptyFlowBlock(Control c) {
+        if (c.StyleDisplay() != 3) { return false; }
+        if (c.FlowEntries().Count > 0) { return false; }
+        StyleBox sb = c.computedStyle;
+        if (sb != null) {
+            // 百分比高在包含块定下后是确定值——声明了 % 高的空块
+            // 不塌穿（CSS 8.3.1：有高度的块不参与塌穿）。
+            if (sb.height > 0 || sb.heightPm > 0
+                || sb.minH > 0 || sb.minHPm > 0) { return false; }
+            if (sb.BorderTopPx() > 0 || sb.BorderBottomPx() > 0) { return false; }
+            if (c.StyleInsetT() > 0 || c.StyleInsetB() > 0) { return false; }
+        }
+        return true;
+    }
+
+    // 行内内容（P2 行盒）：元素直接持有的裸文本（Element.SetText）。
+    // Control 没有；Element 覆写。块流容器把它与行内级子项一起排成
+    // 行盒（自身文本在前——"<div>text<span>…</span></div>" 的文档序
+    // 简化；文本与块子项交错的真实序要等 P5 HTML 层）。
+    public virtual string FlowText() { return ""; }
+
+    // 行盒排布期钩子：本节点将作为行内参与者被落位——先清上一帧
+    // 的 run 缓存（Element 覆写；绘制端以"本帧是否 fresh"防陈旧）。
+    public virtual void InlineRunsBegin() { }
+
+    // 行盒排布期钩子：落位一个文本 run。坐标与 Arrange 同一空间
+    // （窗口根相对）；topY = piece 顶（基线 − asc），drawOff =
+    // 半行距下移，DrawText y = topY + drawOff。
+    public virtual void InlineRunPlace(int x, int topY, int w, int h, int drawOff,
+                                int fs, string text) { }
+
+    // 真块流测量（P1）：margin 塌陷后取各块高度之和——兄弟相邻
+    // margin 合并、容器不塌陷（FlowSepT/B）时首/尾 margin 计入
+    // 内容高、塌陷时塌出容器外由父结算。gap 在相邻已放置块之间
+    // 追加。空块（无内容无子）只贡献一条塌陷链不占高；"只有空块
+    // 的 BFC 容器"把链关在内容框里占高。
+    void MeasureFlow(App app) {
+        if (prefW > 0 && prefH > 0) { return; }
+        int sumH = 0;
+        int maxW = 0;
+        int rows = 0;
+        bool sepT = this.FlowSepT();
+        bool sepB = this.FlowSepB();
+        int pending = 0 - 1;  // 待结算的塌陷链（-1 = 还没有占高块）
+        int wrapW = hintWrapW - this.StyleInsetL() - this.StyleInsetR();
+        List<FlowEntry> es = this.FlowEntries();
+        List<FlowEntry> seg = new List<FlowEntry>();
+        // P3：float 入侵表（内容框坐标）+ 行内段的流起点——段在
+        // float 之后的行要绕排，段高才与排布端一致。父块下传的
+        // hostFloats 复制进来（本容器的 float 也会追加到这张表，
+        // 共享实例会把表污染回父级和下一帧）。
+        List<FloatIntrusion> floats = new List<FloatIntrusion>();
+        int ownFloats = 0;
+        if (this.hostFloats != null) {
+            for (int fi = 0; fi < this.hostFloats.Count; fi = fi + 1) {
+                floats.Add(this.hostFloats[fi]);
+            }
+            ownFloats = floats.Count;
+        }
+        int segY = 0;
+        for (int i = 0; i <= es.Count; i = i + 1) {
+            FlowEntry e = i < es.Count ? es[i] : null;
+            Control c = e != null ? e.kid : null;
+            if (e != null && (c == null || c.StyleInlineLevel() == 1)) {
+                if (seg.Count == 0) {
+                    segY = sumH + (pending > 0 ? pending : 0);
+                }
+                seg.Add(e);
+                continue;
+            }
+            // 块级边界：结算行内段（段是无 margin 的匿名块，塌陷
+            // 上下义务为 0）。
+            if (seg.Count > 0) {
+                FlowSegment fs2 = this.FlowLayoutSegment(
+                    seg, wrapW > 0 ? wrapW : 0, 0, floats, segY);
+                seg = new List<FlowEntry>();
+                if (fs2.lines.Count > 0) {
+                    if (pending >= 0) {
+                        sumH = sumH + CollapseMargins(pending, 0);
+                    }
+                    pending = 0;
+                    sumH = sumH + fs2.height;
+                    int lw = 0;
+                    for (int li = 0; li < fs2.lines.Count; li = li + 1) {
+                        int w2 = fs2.lines[li].xOff + fs2.lines[li].width;
+                        if (w2 > lw) { lw = w2; }
+                    }
+                    if (lw > maxW) { maxW = lw; }
+                    rows = rows + 1;
+                }
+            }
+            if (c == null) { break; }
+            // P3：float 子项——脱离流，占入侵表；宽度计 shrink-to-fit。
+            if (c.StyleFloat() != 0) {
+                // CSS 9.5.1 规则 2：后声明 float 的顶边不得高于先声明
+                // float 的顶边（f3 坠到 61 后，f4 不能再回 y=1 的空档，
+                // 只能在 61 起找位、撞 f3 再坠 100）。
+                int fy = sumH + (pending > 0 ? pending : 0);
+                for (int oi = ownFloats; oi < floats.Count; oi = oi + 1) {
+                    if (floats[oi].yTop > fy) { fy = floats[oi].yTop; }
+                }
+                // 这是容器的内在宽累积（maxW）：float 的 % 宽按 auto
+                // 回落测量偏好（css-sizing），不算进内在贡献。
+                int fw = c.StyleDeclaresWidthAbs()
+                    ? c.StyleWidthIn(wrapW) : c.prefW;
+                int fwm = (fw > 0 ? fw : 0) + c.StyleMarL() + c.StyleMarR();
+                if (fwm > maxW) { maxW = fwm; }
+                this.PlaceFloatKid(floats, c, wrapW > 0 ? wrapW : 0, fy,
+                                   0, 0, false);
+                continue;
+            }
+            bool empty = this.IsEmptyFlowBlock(c);
+            int kmt = empty ? c.StyleMarT() : this.FlowMarT(c);
+            int kmb = empty ? c.StyleMarB() : this.FlowMarB(c);
+            // P3：clear——块顶边被推到相关 float 底边之下。clearance
+            // 不是 margin，不进塌陷链（首占位块在非分隔容器里 margin
+            // 会塌出容器、clearance 不能跟着丢），在 margin 结算后
+            // 直接推进流位置。
+            int clr = c.StyleClear();
+            int clear = 0;
+            if (clr != 0) {
+                int clearY = LineBox.ClearY(
+                    floats, clr, sumH + (pending > 0 ? pending : 0));
+                int need = clearY - sumH;
+                if (need > 0) { clear = need; }
+            }
+            int h = 0;
+            if (!empty) {
+                // 高度取声明值（含 border-box 下限钳制），未声明回退
+                // 测量偏好——叶子 pref 是 0，"空 div 高为零"就是对的。
+                // 包含块未定，百分比高按 0（与 flex 测量同规矩）。
+                h = c.StyleHeightIn(0);
+                if (h < 0) { h = 0; }
+            }
+            int w = 0;
+            // 内在宽（shrink-to-fit）里包含块未定，% 按 auto 回落
+            // 测量偏好（css-sizing），与 grid 轨道同规矩。
+            if (c.StyleDeclaresWidthAbs()) { w = c.StyleWidthIn(0); }
+            else { w = c.prefW; }
+            w = w + c.MarMain(true);  // 水平 margin 不塌陷，照常计宽
+            if (w > maxW) { maxW = w; }
+            if (empty) {
+                // 空块塌穿：上边与既有链合并定出它自己的位置，
+                // 双边再依次并入链（逐边折叠，保持与排布端同式）。
+                int withMt = pending < 0 ? kmt : CollapseMargins(pending, kmt);
+                pending = CollapseMargins(withMt, kmb);
+                continue;
+            }
+            int withMt2 = pending < 0 ? kmt : CollapseMargins(pending, kmt);
+            // P3：float 下传——float 会绕进后代块的行盒，把入侵表
+            // 换算到子块内容框坐标后，auto 高子块带表重测（被 float
+            // 顶高的部分计入堆叠）；声明高的盒子高不变，只传表供其
+            // 行盒绕排。无 float 时清掉上一帧残留。
+            if (floats.Count > 0) {
+                this.SetHostFloats(c, floats,
+                                   c.StyleMarL() + c.StyleInsetL(),
+                                   sumH + withMt2 + c.StyleInsetT());
+                if (!c.StyleDeclaresHeightAbs()) {
+                    c.prefH = 0;
+                    c.fillH = false;
+                    c.MeasureFlow(null);
+                    h = c.prefH;
+                    if (h < 0) { h = 0; }
+                }
+            } else {
+                c.hostFloats = null;
+            }
+            if (pending < 0) {
+                if (sepT) { sumH = sumH + withMt2; }
+            } else {
+                sumH = sumH + withMt2;
+            }
+            pending = kmb;
+            sumH = sumH + clear;
+            sumH = sumH + h;
+            rows = rows + 1;
+        }
+        // P3：BFC 容器收编 float（CSS 10.6.7）——auto 高至少到最低
+        // float 的 margin 底边；非 BFC 容器 float 溢出（Chrome 同款）。
+        // 只收编自己放的 float：祖先下传的该走"毗邻收窄"（未实现），
+        // 收编会把容器高错误地撑到祖先 float 的底边。
+        if (floats.Count > ownFloats && computedStyle != null
+            && computedStyle.bfc != 0) {
+            for (int i = ownFloats; i < floats.Count; i = i + 1) {
+                if (floats[i].yBot > sumH) { sumH = floats[i].yBot; }
+            }
+        }
+        if (rows > 1) { sumH = sumH + this.StyleGap() * (rows - 1); }
+        if (pending > 0 && sepB && rows > 0) { sumH = sumH + pending; }
+        else if (pending > 0 && sepT && sepB && rows == 0) {
+            sumH = sumH + pending;
+        }
+        if (prefH <= 0 && sumH > 0) {
+            prefH = sumH + this.StyleInsetT() + this.StyleInsetB();
+            this.fillH = true;
+        }
+        if (prefW <= 0 && maxW > 0) {
+            prefW = maxW + this.StyleInsetL() + this.StyleInsetR();
+            this.fillW = true;
+        }
+    }
+
+    // 真块流排布（P1）：pending 携带"已塌陷未结算"的下义务 margin，
+    // 遇到下一个块的上 margin 时合并落位；首/尾链在分隔容器里计入
+    // 内容位，普通容器里塌出容器外。`margin-left/right: auto` 把
+    // 声明宽以外的剩余空间分给对应边（两边 auto = 水平居中，
+    // CSS 10.3.3）。容器高 auto（fillH）时子项百分比高按 0，与
+    // 测量端一致。
+    void ArrangeFlow(int cx, int cy, int cw, int ch, int gapPx) {
+        int y = cy;
+        bool sepT = this.FlowSepT();
+        bool sepB = this.FlowSepB();
+        // 容器自己的高是声明值（CSS px/%， Arrange 收到的 ch 即包含
+        // 块）时子项百分比高照常解析；fillH 只描述 prefH 的来源
+        // （测量端按内容补齐过），高声明时它不代表"高未定"。
+        // 真 auto 容器（fillH 且无声明）高未定，子项 % 高按 0，
+        // 与测量端一致（CSS 10.3.3）。
+        int chKids = (this.fillH && !this.StyleDeclaresHeight()) ? 0 : ch;
+        int pending = 0 - 1;
+        int placed = 0;
+        // P3：float 入侵表（内容框坐标）+ 行内段流起点（同测量端）。
+        // hostFloats 复制进来，防 PlaceFloatKid 把追加项写回共享表。
+        List<FloatIntrusion> floats = new List<FloatIntrusion>();
+        int ownFloats = floats.Count;
+        if (this.hostFloats != null) {
+            for (int fi = 0; fi < this.hostFloats.Count; fi = fi + 1) {
+                floats.Add(this.hostFloats[fi]);
+            }
+            ownFloats = floats.Count;
+        }
+        int segY = 0;
+        int align = computedStyle != null ? computedStyle.align : 0;
+        this.InlineRunsBegin();
+        List<FlowEntry> es = this.FlowEntries();
+        List<FlowEntry> seg = new List<FlowEntry>();
+        for (int i = 0; i <= es.Count; i = i + 1) {
+            FlowEntry e = i < es.Count ? es[i] : null;
+            Control c = e != null ? e.kid : null;
+            if (e != null && (c == null || c.StyleInlineLevel() == 1)) {
+                if (c != null) { c.InlineRunsBegin(); }
+                if (seg.Count == 0) {
+                    segY = (y - cy) + (pending > 0 ? pending : 0);
+                }
+                seg.Add(e);
+                continue;
+            }
+            // 块级边界：落位行内段（无 margin 义务，塌陷语义同测量端）。
+            if (seg.Count > 0) {
+                FlowSegment fs2 = this.FlowLayoutSegment(seg, cw, cw,
+                                                         floats, segY);
+                if (fs2.lines.Count > 0) {
+                    if (pending >= 0) {
+                        y = y + CollapseMargins(pending, 0);
+                        if (placed > 0) { y = y + gapPx; }
+                    }
+                    pending = 0;
+                    this.FlowSegmentPlace(fs2, cx, y, cw, align, seg);
+                    y = y + fs2.height;
+                    placed = placed + 1;
+                }
+                seg = new List<FlowEntry>();
+            }
+            if (c == null) { break; }
+            // P3：float 子项——脱离流，占入侵表并落位（不计 gap/rows）。
+            // 规则 2 的顶边下限与测量端同式。
+            if (c.StyleFloat() != 0) {
+                int fy = (y - cy) + (pending > 0 ? pending : 0);
+                for (int oi = ownFloats; oi < floats.Count; oi = oi + 1) {
+                    if (floats[oi].yTop > fy) { fy = floats[oi].yTop; }
+                }
+                this.PlaceFloatKid(floats, c, cw, fy, cx, cy, true);
+                continue;
+            }
+            bool empty = this.IsEmptyFlowBlock(c);
+            int kmt = empty ? c.StyleMarT() : this.FlowMarT(c);
+            int kmb = empty ? c.StyleMarB() : this.FlowMarB(c);
+            // P3：clear——clearance 不进 margin 塌陷链，margin 结算
+            // 完直接把流位置推下去（同测量端）。
+            int clr = c.StyleClear();
+            int clear = 0;
+            if (clr != 0) {
+                int clearY = LineBox.ClearY(
+                    floats, clr, (y - cy) + (pending > 0 ? pending : 0));
+                int need = clearY - (y - cy);
+                if (need > 0) { clear = need; }
+            }
+            if (empty) {
+                int withMt = pending < 0 ? kmt : CollapseMargins(pending, kmt);
+                int dy = (pending < 0 && !sepT) ? 0 : withMt;
+                // 空块也落矩形（塌穿边界处，高 0），矩形才可被对比。
+                StyleBox sbE = c.computedStyle;
+                int mlE = c.StyleMarL();
+                int mrE = c.StyleMarR();
+                int wE = 0;
+                if (c.StyleDeclaresWidth()) { wE = c.StyleWidthIn(cw); }
+                else { wE = cw - mlE - mrE; }
+                if (wE < 0) { wE = 0; }
+                int xE = cx + mlE;
+                if (sbE != null && sbE.marL == 0 - 1 && sbE.marR == 0 - 1) {
+                    xE = cx + (cw - wE) / 2;
+                }
+                c.Arrange(xE, y + dy, wE, 0);
+                pending = CollapseMargins(withMt, kmb);
+                continue;
+            }
+            int h = 0;
+            if (c.StyleDeclaresHeight()) { h = c.StyleHeightIn(chKids); }
+            else { h = c.prefH; }
+            if (h < 0) { h = 0; }
+            if (pending < 0) {
+                if (sepT) { y = y + kmt; }
+            } else {
+                y = y + CollapseMargins(pending, kmt);
+                if (placed > 0) { y = y + gapPx; }
+            }
+            pending = kmb;
+            // 水平：声明宽用声明值；未声明填满内容框。margin 的
+            // auto 哨兵（computedStyle.marX == -1）分剩余空间。
+            StyleBox sb = c.computedStyle;
+            int ml = c.StyleMarL();
+            int mr = c.StyleMarR();
+            int w = 0;
+            if (c.StyleDeclaresWidth()) { w = c.StyleWidthIn(cw); }
+            else { w = cw - ml - mr; }
+            if (w < 0) { w = 0; }
+            int x = cx + ml;
+            if (sb != null && sb.marL == 0 - 1 && sb.marR == 0 - 1) {
+                x = cx + (cw - w) / 2;
+            } else if (sb != null && sb.marL == 0 - 1) {
+                x = cx + cw - mr - w;
+            }
+            // P3：float 下传（同测量端）——落位前把入侵表换算给子块，
+            // auto 高子块带表重测定高，堆叠与文本绕排才一致。
+            if (floats.Count > 0) {
+                this.SetHostFloats(c, floats,
+                                   x - cx + c.StyleInsetL(),
+                                   (y - cy) + c.StyleInsetT());
+                if (!c.StyleDeclaresHeightAbs()) {
+                    c.prefH = 0;
+                    c.fillH = false;
+                    c.MeasureFlow(null);
+                    h = c.prefH;
+                    if (h < 0) { h = 0; }
+                }
+            } else {
+                c.hostFloats = null;
+            }
+            y = y + clear;
+            c.Arrange(x, y, w, h);
+            y = y + h;
+            placed = placed + 1;
+        }
+        if (pending > 0 && sepB) { y = y + pending; }
+    }
+
+    // 把父级的 float 入侵表换算成本块内容框坐标后传给 `c`（P3 绕
+    // 排）：float 影响后代块的行盒，而各层排版都在自己的内容框里
+    // 做，坐标要逐级平移。无 float 时清空，防上一帧残留。
+    void SetHostFloats(Control c, List<FloatIntrusion> src, int dx, int dy) {
+        if (src == null || src.Count == 0) {
+            c.hostFloats = null;
+            return;
+        }
+        List<FloatIntrusion> shifted = new List<FloatIntrusion>();
+        for (int i = 0; i < src.Count; i = i + 1) {
+            FloatIntrusion f = src[i];
+            FloatIntrusion s = new FloatIntrusion();
+            s.side = f.side;
+            s.x0 = f.x0 - dx;
+            s.x1 = f.x1 - dx;
+            s.yTop = f.yTop - dy;
+            s.yBot = f.yBot - dy;
+            shifted.Add(s);
+        }
+        c.hostFloats = shifted;
+    }
+
+    // 放一个 float 子项（P3，CSS 2.1 §9.5.1 简化子集）：从流位置
+    // yFlow 起，clear 先推；左 float 贴同行左 float 右缘/内容左缘，
+    // 右 float 镜像；放不下（越内容右缘/撞右 float）下坠到最低
+    // float 底（NextShelf），无处可坠就原地溢出（防呆不挂死）。
+    // 入侵记录用内容框坐标 x 与流坐标 y（margin box 语义）；place
+    // 时把子项 Arrange 到 border box。测量/排布两端共用同一算法，
+    // 行盒绕排的高度才与落位一致。
+    void PlaceFloatKid(List<FloatIntrusion> floats, Control c, int frameW,
+                       int yFlow, int cx, int cy, bool place) {
+        int w = c.StyleDeclaresWidth() ? c.StyleWidthIn(frameW) : c.prefW;
+        int h = c.StyleDeclaresHeightAbs() ? c.StyleHeightIn(0) : c.prefH;
+        if (w < 0) { w = 0; }
+        if (h < 0) { h = 0; }
+        int ml = c.StyleMarL();
+        int mr = c.StyleMarR();
+        int mt = c.StyleMarT();
+        int mb = c.StyleMarB();
+        int side = c.StyleFloat();
+        int clear = c.StyleClear();
+        if (frameW <= 0) { frameW = 1; }
+        int y = yFlow;
+        if (clear == 1 || clear == 3) { y = LineBox.ClearY(floats, 1, y); }
+        if (clear == 2 || clear == 3) { y = LineBox.ClearY(floats, 2, y); }
+        int x0 = 0;
+        int yBot = y + mt + h + mb;
+        for (int guard = 0; guard < 16; guard = guard + 1) {
+            yBot = y + mt + h + mb;
+            LineSpan sp = LineBox.LineAvail(floats, frameW, y, yBot);
+            bool fits;
+            if (side == 1) {
+                x0 = sp.xOff;
+                fits = x0 + ml + w + mr <= sp.availW;
+            } else {
+                x0 = sp.availW - ml - w - mr;
+                fits = x0 >= sp.xOff;
+            }
+            if (fits) { break; }
+            int shelf = LineBox.NextShelf(floats, y);
+            if (shelf <= y) { break; }  // 无处下坠：原地溢出
+            y = shelf;
+        }
+        FloatIntrusion f = new FloatIntrusion();
+        f.side = side;
+        f.x0 = x0;
+        f.x1 = x0 + ml + w + mr;
+        f.yTop = y;
+        f.yBot = yBot;
+        floats.Add(f);
+        if (place) {
+            c.Arrange(cx + x0 + ml, cy + y + mt, w, h);
+        }
+    }
+
+    // 行内文本的继承态（CSS 可继承属性在行盒里的落地）：段内文本
+    // 未声明 font-size / line-height / white-space 时随容器——span
+    // 不写 line-height 时浏览器用的就是父级行高，少了这一步混排
+    // 基线整体错位。只服务行盒 piece；块级子树的样式解析不受影响。
+    StyleBox InheritText(StyleBox parent, StyleBox own) {
+        int pfs = parent.fontPx > 0 ? parent.fontPx
+            : (parent.envRemPx > 0 ? parent.envRemPx : 14);
+        bool need = own.fontPx <= 0
+            || (own.lineHeightKind == 0 && parent.lineHeightKind != 0)
+            || (own.whiteSpace == 0 && parent.whiteSpace != 0);
+        if (!need) { return own; }
+        StyleBox d = own.Clone();
+        if (d.fontPx <= 0) { d.fontPx = pfs; }
+        if (d.lineHeightKind == 0) {
+            d.lineHeight = parent.lineHeight;
+            d.lineHeightKind = parent.lineHeightKind;
+        }
+        if (d.whiteSpace == 0 && parent.whiteSpace != 0) {
+            d.whiteSpace = parent.whiteSpace;
+        }
+        return d;
+    }
+
+    // 排版一个行内段（P2）：条目 = 文本块（容器自身）或行内子项
+    // （无子且有文本 → 文本 run、否则原子盒）。wrapW 是折行宽
+    // （测量端 = 断行提示，0 = 单行；排布端 = 内容宽），wAvail 是
+    // 百分比宽的包含块（测量端按 0，shrink-to-fit 同规矩）。
+    // floats/segY（P3）：段前的 float 入侵表与段在流里的起点——
+    // 行盒绕排用；floats 为 null/空时与旧路径逐 bit 相同。
+    FlowSegment FlowLayoutSegment(List<FlowEntry> seg,
+                                  int wrapW, int wAvail,
+                                  List<FloatIntrusion> floats, int segY) {
+        FlowSegment fs2 = new FlowSegment();
+        List<InlinePiece> items = new List<InlinePiece>();
+        StyleBox sb = computedStyle;
+        if (sb == null) { sb = new StyleBox(); }
+        InlinePiece strut = LineBox.MakeStrut(sb);
+        // va:middle 的 x 高取父字体（CSS 10.8.1）：FontHeight×5/12 是
+        // Segoe UI 的真实 x 高比例（Chrome 实测校准），/24 即再取半。
+        int pf = sb.fontPx > 0 ? sb.fontPx : (sb.envRemPx > 0 ? sb.envRemPx : 14);
+        int xhHalf = Canvas.FontHeight(pf) * 5 / 24;
+        for (int i = 0; i < seg.Count; i = i + 1) {
+            FlowEntry en = seg[i];
+            if (en.kid == null) {
+                LineBox.PushText(items, this, sb, en.text);
+                continue;
+            }
+            Control c = en.kid;
+            StyleBox cs = c.computedStyle;
+            if (cs == null) { cs = new StyleBox(); }
+            if (c.FlexKids().Count == 0 && c.FlowText() != "") {
+                LineBox.PushText(items, c, this.InheritText(sb, cs), c.FlowText());
+                continue;
+            }
+            int w = c.StyleDeclaresWidth() ? c.StyleWidthIn(wAvail) : c.prefW;
+            int h = c.StyleDeclaresHeightAbs() ? c.StyleHeightIn(0) : c.prefH;
+            if (w < 0) { w = 0; }
+            if (h < 0) { h = 0; }
+            items.Add(LineBox.MakeBox(c, w, h, c.StyleMarL(), c.StyleMarR(),
+                                      c.StyleMarT(), c.StyleMarB(), cs, xhHalf));
+        }
+        List<InlineLine> lines = new List<InlineLine>();
+        if (floats != null && floats.Count > 0) {
+            LineBox.LayoutF(items, strut, wrapW, lines, floats, segY);
+        } else {
+            LineBox.Layout(items, strut, wrapW, lines);
+        }
+        int hh = 0;
+        int ww = 0;
+        for (int i = 0; i < lines.Count; i = i + 1) {
+            // 段高 = 最大行底（P3：整行下坠后行间有空洞，不能累加）。
+            int bot = lines[i].yOff + lines[i].asc + lines[i].desc;
+            if (bot > hh) { hh = bot; }
+            int lw = lines[i].xOff + lines[i].width;
+            if (lw > ww) { ww = lw; }
+        }
+        fs2.lines = lines;
+        fs2.height = hh;
+        fs2.width = ww;
+        return fs2;
+    }
+
+    // 落位一个行内段（P2）：text-align 分配行内剩余空间；文本 piece
+    // 回填 owner 的 run 缓存（InlineRunPlace）；原子盒按
+    // vertical-align（baseline 下 margin 边坐基线 / middle 对
+    // baseline + x 高一半 / top、bottom 对行盒上下）落位；文本型
+    // owner 的矩形 = 全部 run 的并集（inline 盒的 Chrome 矩形语义）。
+    void FlowSegmentPlace(FlowSegment fs2, int cx, int y0, int availW,
+                          int align, List<FlowEntry> seg) {
+        List<Control> owners = new List<Control>();
+        List<int> uL = new List<int>();
+        List<int> uT = new List<int>();
+        List<int> uR = new List<int>();
+        List<int> uB = new List<int>();
+        int y = y0;
+        for (int li = 0; li < fs2.lines.Count; li = li + 1) {
+            InlineLine ln = fs2.lines[li];
+            // P3：行顶 = 段顶 + yOff（整行下坠后行间有空洞，不能
+            // 靠上一行高度累加；floats 盲路径 yOff 就是累加值）。
+            y = y0 + ln.yOff;
+            int baseline = y + ln.asc;
+            // P3 绕排：对齐与行内定位都用本行的可用宽/左缘位移
+            // （availW <= 0 时回退使用容器宽）。
+            int lineW = ln.availW > 0 ? ln.availW : availW;
+            int free = lineW - ln.width;
+            int dx = 0;
+            if (align == 1 && free > 0) { dx = free / 2; }
+            else if (align == 2 && free > 0) { dx = free; }
+            for (int pi = 0; pi < ln.pieces.Count; pi = pi + 1) {
+                InlinePiece p = ln.pieces[pi];
+                if (p.isStrut) { continue; }
+                int px = cx + ln.xOff + dx + p.x;
+                if (p.isBox) {
+                    StyleBox bs = p.st;
+                    int topY = baseline - p.boxH;  // baseline：下 margin 边坐基线
+                    if (bs.vaInline == 2) {
+                        topY = y;
+                    } else if (bs.vaInline == 3) {
+                        topY = y + ln.asc + ln.desc - p.boxH;
+                    } else if (bs.vaInline == 1) {
+                        // 浏览器把盒中点对到基线向上半个 x 高（Chrome 基线
+                        // 探针实测：盒顶 = baseline − xh/2 − 盒高/2）。
+                        StyleBox sbp = computedStyle;
+                        int pfp = sbp != null && sbp.fontPx > 0 ? sbp.fontPx
+                            : (sbp != null && sbp.envRemPx > 0 ? sbp.envRemPx : 14);
+                        int xh2 = Canvas.FontHeight(pfp) * 5 / 24;
+                        topY = baseline - xh2 - p.boxH / 2;
+                    }
+                    p.owner.Arrange(px + p.ml, topY, p.w - p.ml - p.mr, p.boxH);
+                    continue;
+                }
+                if (p.isSpace) { continue; }
+                int topY2 = baseline - p.asc;
+                p.owner.InlineRunPlace(px, topY2, p.w, p.lh, p.ascOff, p.fs, p.text);
+                // 行内盒的并集矩形按字型内容区（基线 − FontAscent、
+                // 高 FontHeight）——Chrome 对 inline span 的
+                // getBoundingClientRect 语义，行高不参与盒矩形。
+                int cellTop = topY2 + p.ascOff;
+                int cellBot = cellTop + Canvas.FontHeight(p.fs);
+                int oi = -1;
+                for (int k = 0; k < owners.Count; k = k + 1) {
+                    if (owners[k] == p.owner) { oi = k; break; }
+                }
+                if (oi < 0) {
+                    owners.Add(p.owner);
+                    uL.Add(px); uT.Add(cellTop); uR.Add(px + p.w); uB.Add(cellBot);
+                } else {
+                    if (px < uL[oi]) { uL[oi] = px; }
+                    if (cellTop < uT[oi]) { uT[oi] = cellTop; }
+                    if (px + p.w > uR[oi]) { uR[oi] = px + p.w; }
+                    if (cellBot > uB[oi]) { uB[oi] = cellBot; }
+                }
+            }
+        }
+        for (int k = 0; k < owners.Count; k = k + 1) {
+            Control o = owners[k];
+            if (o == this) { continue; }  // 自身矩形由父给，run 已是绝对坐标
+            // 文本型行内 owner 不走 Arrange：它的内容已由本段排好，
+            // 再 Arrange 会重跑它的流布局并对集回自己（递归）。
+            o.bx = uL[k];
+            o.by = uT[k];
+            o.bw = uR[k] - uL[k];
+            o.bh = uB[k] - uT[k];
+        }
+    }
+
+
+    // grid 条目：可见、非定位、非 none 的直接子项（文档序）。
+    List<Control> GridItems() {
+        List<Control> items = new List<Control>();
+        for (int i = 0; i < children.Count; i = i + 1) {
+            Control c = children[i];
+            if (!c.StyleVisible() || c.StylePosition() == 2
+                || c.StyleDisplay() == 2) { continue; }
+            items.Add(c);
+        }
+        return items;
+    }
+
+    // 条目外围宽（轨道尺寸用）：声明宽用声明值（包含块未定，%
+    // 按 auto 回落测量偏好，与块流测量同规矩）；加水平 margin。
+    int GridOuterW(Control c) {
+        int w = c.StyleDeclaresWidthAbs() ? c.StyleWidthIn(0) : c.prefW;
+        if (w < 0) { w = 0; }
+        return w + c.StyleMarL() + c.StyleMarR();
+    }
+
+    int GridOuterH(Control c) {
+        int h = c.StyleDeclaresHeightAbs() ? c.StyleHeightIn(0) : c.prefH;
+        if (h < 0) { h = 0; }
+        return h + c.StyleMarT() + c.StyleMarB();
+    }
+
+    // 按内容测量一个 `display: grid` 容器：列轨先定宽（声明宽的容器
+    // 按声明内容宽放大 fr/auto，auto 容器只按内容基尺寸），宽度相关
+    // 的条目高度按所在列宽重测后定行轨。只填补留空的轴。
+    void MeasureGridContent(App app) {
+        if (prefW > 0 && prefH > 0) { return; }
+        StyleBox sb = computedStyle;
+        if (sb == null) { sb = new StyleBox(); }
+        int colGap = this.StyleColGap(this.StyleGap());
+        int rowGap = this.StyleRowGap(this.StyleGap());
+        List<GridTrack> colDefs = CssGrid.ParseTracks(sb.gridCols);
+        List<GridTrack> rowDefs = CssGrid.ParseTracks(sb.gridRows);
+        List<GridTrack> autoCols = CssGrid.ParseTracks(sb.gridAutoCols);
+        List<GridTrack> autoRows = CssGrid.ParseTracks(sb.gridAutoRows);
+        List<Control> items = this.GridItems();
+        GridPlace pl = CssGrid.Place(items, colDefs.Count, rowDefs.Count);
+        // 列：跨 1 格条目的外围宽喂给 auto 轨道。
+        List<int> at = new List<int>();
+        List<int> sz = new List<int>();
+        for (int i = 0; i < items.Count; i = i + 1) {
+            GridItemSlot slot = pl.slots[i];
+            if (slot.colSpan != 1) { continue; }
+            at.Add(slot.colStart);
+            sz.Add(this.GridOuterW(items[i]));
+        }
+        int colAvail = 0 - 1;
+        if (this.StyleDeclaresWidthAbs()) {
+            colAvail = this.StyleWidthIn(0)
+                - this.StyleInsetL() - this.StyleInsetR();
+            if (colAvail < 0) { colAvail = 0; }
+        }
+        List<int> colW = CssGrid.SizeTracks(colDefs, autoCols, pl.nCols,
+                                         at, sz, colAvail, colGap);
+        // 行：高度依赖宽度的条目按所在列宽重测（流容器断行）。
+        at = new List<int>();
+        sz = new List<int>();
+        for (int i = 0; i < items.Count; i = i + 1) {
+            Control c = items[i];
+            GridItemSlot slot = pl.slots[i];
+            if (!c.StyleDeclaresHeightAbs() && c.StyleDisplay() == 3) {
+                int inner = CssGrid.SpanSum(colW, colGap, slot.colStart,
+                                         slot.colSpan)
+                    - c.StyleMarL() - c.StyleMarR();
+                if (inner < 0) { inner = 0; }
+                c.HintWrapWidth(inner);
+                c.prefH = 0;
+                c.fillH = false;
+                c.MeasureFlow(null);
+            }
+            if (slot.rowSpan != 1) { continue; }
+            at.Add(slot.rowStart);
+            sz.Add(this.GridOuterH(items[i]));
+        }
+        int rowAvail = 0 - 1;
+        if (this.StyleDeclaresHeightAbs()) {
+            rowAvail = this.StyleHeightIn(0)
+                - this.StyleInsetT() - this.StyleInsetB();
+            if (rowAvail < 0) { rowAvail = 0; }
+        }
+        List<int> rowH = CssGrid.SizeTracks(rowDefs, autoRows, pl.nRows,
+                                         at, sz, rowAvail, rowGap);
+        int sumW = CssGrid.SpanSum(colW, colGap, 0, pl.nCols);
+        int sumH = CssGrid.SpanSum(rowH, rowGap, 0, pl.nRows);
+        if (prefH <= 0 && sumH > 0) {
+            prefH = sumH + this.StyleInsetT() + this.StyleInsetB();
+            this.fillH = true;
+        }
+        if (prefW <= 0 && sumW > 0) {
+            prefW = sumW + this.StyleInsetL() + this.StyleInsetR();
+            this.fillW = true;
+        }
+    }
+
+    // grid 排布（P4）：列轨按实际内容宽定尺寸 → 宽度相关条目重测 →
+    // 行轨定尺寸 → 逐条目落格。格内对齐：inline 轴 justify-items、
+    // block 轴 align-items（0 stretch / 1 start / 2 center / 3 end）；
+    // stretch 只对未声明尺寸的条目生效，声明了尺寸按 start（Chrome
+    // 同款）。
+    void ArrangeGrid(int cx, int cy, int cw, int ch) {
+        StyleBox sb = computedStyle;
+        if (sb == null) { sb = new StyleBox(); }
+        int colGap = this.StyleColGap(this.StyleGap());
+        int rowGap = this.StyleRowGap(this.StyleGap());
+        List<GridTrack> colDefs = CssGrid.ParseTracks(sb.gridCols);
+        List<GridTrack> rowDefs = CssGrid.ParseTracks(sb.gridRows);
+        List<GridTrack> autoCols = CssGrid.ParseTracks(sb.gridAutoCols);
+        List<GridTrack> autoRows = CssGrid.ParseTracks(sb.gridAutoRows);
+        List<Control> items = this.GridItems();
+        GridPlace pl = CssGrid.Place(items, colDefs.Count, rowDefs.Count);
+        List<int> at = new List<int>();
+        List<int> sz = new List<int>();
+        for (int i = 0; i < items.Count; i = i + 1) {
+            GridItemSlot slot = pl.slots[i];
+            if (slot.colSpan != 1) { continue; }
+            at.Add(slot.colStart);
+            sz.Add(this.GridOuterW(items[i]));
+        }
+        if (cw < 0) { cw = 0; }
+        List<int> colW = CssGrid.SizeTracks(colDefs, autoCols, pl.nCols,
+                                         at, sz, cw, colGap);
+        at = new List<int>();
+        sz = new List<int>();
+        for (int i = 0; i < items.Count; i = i + 1) {
+            Control c = items[i];
+            GridItemSlot slot = pl.slots[i];
+            if (!c.StyleDeclaresHeightAbs() && c.StyleDisplay() == 3) {
+                int inner = CssGrid.SpanSum(colW, colGap, slot.colStart,
+                                         slot.colSpan)
+                    - c.StyleMarL() - c.StyleMarR();
+                if (inner < 0) { inner = 0; }
+                c.HintWrapWidth(inner);
+                c.prefH = 0;
+                c.fillH = false;
+                c.MeasureFlow(null);
+            }
+            if (slot.rowSpan != 1) { continue; }
+            at.Add(slot.rowStart);
+            sz.Add(this.GridOuterH(items[i]));
+        }
+        if (ch < 0) { ch = 0; }
+        List<int> rowH = CssGrid.SizeTracks(rowDefs, autoRows, pl.nRows,
+                                         at, sz, ch, rowGap);
+        for (int i = 0; i < items.Count; i = i + 1) {
+            Control c = items[i];
+            GridItemSlot slot = pl.slots[i];
+            int cellX = cx + CssGrid.TrackOffset(colW, colGap, slot.colStart);
+            int cellY = cy + CssGrid.TrackOffset(rowH, rowGap, slot.rowStart);
+            int cellW = CssGrid.SpanSum(colW, colGap, slot.colStart,
+                                     slot.colSpan);
+            int cellH = CssGrid.SpanSum(rowH, rowGap, slot.rowStart,
+                                     slot.rowSpan);
+            int ml = c.StyleMarL();
+            int mr = c.StyleMarR();
+            int mt = c.StyleMarT();
+            int mb = c.StyleMarB();
+            int innerW = cellW - ml - mr;
+            if (innerW < 0) { innerW = 0; }
+            int innerH = cellH - mt - mb;
+            if (innerH < 0) { innerH = 0; }
+            int jc = sb.justifyItems;
+            int px = cellX + ml;
+            int w = innerW;
+            if (jc != 0 || c.StyleDeclaresWidth()) {
+                w = c.StyleDeclaresWidth()
+                    ? c.StyleWidthIn(cellW) : c.prefW;
+                if (w < 0) { w = 0; }
+                int free = innerW - w;
+                if (jc == 2) { px = px + free / 2; }
+                else if (jc == 3) { px = px + free; }
+            }
+            int ac = sb.alignItems;
+            int py = cellY + mt;
+            int h = innerH;
+            if (ac != 0 || c.StyleDeclaresHeight()) {
+                h = c.StyleDeclaresHeight()
+                    ? c.StyleHeightIn(cellH) : c.prefH;
+                if (h < 0) { h = 0; }
+                int free = innerH - h;
+                if (ac == 2) { py = py + free / 2; }
+                else if (ac == 3) { py = py + free; }
+            }
+            c.Arrange(px, py, w, h);
+        }
+    }
+
+    // 停靠容器在没人给尺寸时按内容测量：一列停靠的行
+    // 高等于各行之和，一行停靠的控件宽等于各控件之和
+    // （加上内边距和间距）。少了这一步，设计器只能给
+    // 每个容器写死一个高度，字号或 DPI 一变就错位。
+    // 只填补留空的那根轴：OnMeasure 或作者给过的尺寸优先。
+    void MeasureDocked(App app) {
+        if (children.Count == 0 && this.FlowEntries().Count == 0) { return; }
+        int disp = this.StyleDisplay();
+        if (disp == 1) {
+            this.MeasureFlexContent(app);
+            return;
+        }
+        if (disp == 3) {
+            this.MeasureFlow(app);
+            return;
+        }
+        if (disp == 4) {
+            this.MeasureGridContent(app);
+            return;
+        }
+        if (prefW > 0 && prefH > 0) { return; }
+        int sumH = 0;
+        int sumW = 0;
+        int maxH = 0;
+        int maxW = 0;
+        int rows = 0;
+        int cols = 0;
+        for (int i = 0; i < children.Count; i = i + 1) {
+            Control c = children[i];
+            if (!c.StyleVisible() || c.StylePosition() == 2) { continue; }
+            if (c.dock == 1 || c.dock == 2) {
+                sumH = sumH + c.prefH;
+                rows = rows + 1;
+                if (c.prefW > maxW) { maxW = c.prefW; }
+            } else if (c.dock == 3 || c.dock == 4) {
+                sumW = sumW + c.prefW;
+                cols = cols + 1;
+                if (c.prefH > maxH) { maxH = c.prefH; }
+            }
+        }
+        int innerGap = this.StyleGap();
+        if (rows > 1) { sumH = sumH + innerGap * (rows - 1); }
+        if (cols > 1) { sumW = sumW + innerGap * (cols - 1); }
+        if (sumH < maxH) { sumH = maxH; }
+        if (sumW < maxW) { sumW = maxW; }
+        if (prefH <= 0 && sumH > 0) {
+            prefH = sumH + this.StyleInsetT() + this.StyleInsetB();
+            this.fillH = true;
+        }
+        if (prefW <= 0 && sumW > 0) {
+            prefW = sumW + this.StyleInsetL() + this.StyleInsetR();
+            this.fillW = true;
+        }
+    }
+
+    // 按内容测量一个 `display: flex` 容器：主轴取各子项之和（换行时
+    // 取最长那一行），交叉轴取各行之和。只填补作者留空的那根轴，
+    // 因此 Prefer() 与样式表的 width/height 依然优先。
+    // 少了这一步，一个 flex 容器的 prefW/prefH 会停在 0：停靠进
+    // 一列里就是零高，作者只能给每个容器写死一个像素高度——
+    // 换行的一排按钮也就永远只能是一行。
+    void MeasureFlexContent(App app) {
+        if (prefW > 0 && prefH > 0) { return; }
+        bool row = true;
+        if (this.StyleFlexDir() == 1) { row = false; }
+        int baseGap = this.StyleGap();
+        int mainGap = this.StyleColGap(baseGap);
+        int crossGap = this.StyleRowGap(baseGap);
+        if (!row) {
+            mainGap = this.StyleRowGap(baseGap);
+            crossGap = this.StyleColGap(baseGap);
+        }
+
+        // 断行宽度：作者给过固定主轴尺寸就用它，否则用上一帧
+        // Arrange 记下的实际内容框长度。仍为 0（首帧）时按单行测量，
+        // 下面会再要一帧来收敛。
+        int wrapMain = 0;
+        if (this.StyleWrap() != 0) {
+            wrapMain = flexWrapMain;
+            // 宿主给过宽度就用它：每帧重建的容器没有上一帧的
+            // flexWrapMain 可用，这是它唯一能算准行数的依据。
+            // 纵向容器的主轴是高度，这个提示不适用。
+            if (row && hintWrapW > 0) {
+                wrapMain = hintWrapW - this.StyleInsetL() - this.StyleInsetR();
+            }
+            if (row && prefW > 0) {
+                wrapMain = prefW - this.StyleInsetL() - this.StyleInsetR();
+            } else if (!row && prefH > 0) {
+                wrapMain = prefH - this.StyleInsetT() - this.StyleInsetB();
+            }
+        }
+
+        int onLine = 0;
+        int lineMain = 0;
+        int lineCross = 0;
+        int mainMax = 0;
+        int crossSum = 0;
+        int lines = 0;
+        List<Control> flexKids = this.FlexKids();
+        for (int i = 0; i < flexKids.Count; i = i + 1) {
+            Control c = flexKids[i];
+            // 主轴尺寸和排布时用同一个来源：flex-basis 优先，其次
+            // 才是测量偏好，否则断行数会和实际排布不一致。这里的
+            // 包含块尚未确定，因此百分比 basis 按 auto 回落（断行
+            // 计算里 % basis 取测量偏好/width 声明）。
+            int m = c.prefH;
+            int cr = c.prefW;
+            if (row) { m = c.prefW; cr = c.prefH; }
+            int bs = c.StyleBasisIn(wrapMain);
+            if (bs < 0) {
+                if (row) { bs = c.StyleWidthIn(wrapMain); }
+                else { bs = c.StyleHeightIn(wrapMain); }
+            }
+            if (bs >= 0) { m = bs; }
+            if (row) {
+                int ch = c.StyleHeightIn(0);
+                if (ch >= 0) { cr = ch; }
+            } else {
+                int cw = c.StyleWidthIn(0);
+                if (cw >= 0) { cr = cw; }
+            }
+            m = m + c.MarMain(row);
+            cr = cr + c.MarCross(row);
+            int need = m;
+            if (onLine > 0) { need = need + mainGap; }
+            if (wrapMain > 0 && onLine > 0 && lineMain + need > wrapMain) {
+                if (lineMain > mainMax) { mainMax = lineMain; }
+                crossSum = crossSum + lineCross;
+                lines = lines + 1;
+                lineMain = m;
+                lineCross = cr;
+                onLine = 1;
+            } else {
+                lineMain = lineMain + need;
+                if (cr > lineCross) { lineCross = cr; }
+                onLine = onLine + 1;
+            }
+        }
+        if (onLine == 0) { return; }
+        if (lineMain > mainMax) { mainMax = lineMain; }
+        crossSum = crossSum + lineCross;
+        lines = lines + 1;
+
+        int lh = this.StyleLineHeight();
+        if (lh > 0 && lh * lines > crossSum) { crossSum = lh * lines; }
+        if (lines > 1) { crossSum = crossSum + crossGap * (lines - 1); }
+
+        if (row) {
+            if (prefW <= 0 && mainMax > 0) {
+                prefW = mainMax + this.StyleInsetL() + this.StyleInsetR();
+                this.fillW = true;
+            }
+            if (prefH <= 0 && crossSum > 0) {
+                prefH = crossSum + this.StyleInsetT() + this.StyleInsetB();
+                this.fillH = true;
+            }
+        } else {
+            if (prefH <= 0 && mainMax > 0) {
+                prefH = mainMax + this.StyleInsetT() + this.StyleInsetB();
+                this.fillH = true;
+            }
+            if (prefW <= 0 && crossSum > 0) {
+                prefW = crossSum + this.StyleInsetL() + this.StyleInsetR();
+                this.fillW = true;
+            }
+        }
+
+        // 首帧（或宿主刚改过宽度）时断行宽度还是上一轮的值，算出的
+        // 高度就是过时的。Arrange 拿到真实宽度后会更新 flexWrapMain，
+        // 这里主动再要一帧，让高度在下一帧收敛后就地稳定下来。
+        if (this.StyleWrap() != 0 && flexMeasMain != flexWrapMain) {
+            flexMeasMain = flexWrapMain;
+            app.RequestRedraw();
+        }
+    }
+
+    // 把请求尺寸钳制到可用空间内；任一为负时返回 0。
+    static int FitSize(int requested, int available) {
+        if (requested < 0) { return 0; }
+        if (available < 0) { return 0; }
+        if (requested > available) { return available; }
+        return requested;
+    }
+
+    // 把请求间距钳制到剩余空间内；剩余 <= 0 时返回 0。
+    static int FitGap(int requested, int available) {
+        if (requested < 0 || available <= 0) { return 0; }
+        if (requested > available) { return available; }
+        return requested;
+    }
+
+    // 计算此节点及其子树（通过停靠）的边界。
+    // 虚方法，使容器（如 ScrollColumn）可以偏移/裁剪其子节点。
+    // 滚动容器排布收口（P6）：流/flex/grid/legacy 四条排布路径都
+    // 经过这里；非滚动容器零开销。clientH 是内容框高。
+    void ArrangeScrollTail(int clientH) {
+        if (children.Count == 0 || !this.IsScrollContainer()) { return; }
+        this.UpdateScroll(clientH, this.StylePadB());
+    }
+
+    // Arrange 尾段（P6 滚动容器）：算内容延伸、钳偏移、把子树平移
+    // -scrollY/-scrollX。延伸 = 可见内容底/右缘（子项 border-box，
+    // absolute 后代也计入——Chrome 里 abs 后代贡献滚动溢出）+ 自身
+    // 对应侧 padding，换算到 padding-box 坐标；下限 = client 尺寸
+    // （内容不足不滚）。`clientH` 是内容框高，`padB` 是内容框底
+    // padding（延伸含它，CSSOM scrollHeight/scrollWidth 同义）。
+    void UpdateScroll(int clientH, int padB) {
+        int bottom = 0;
+        int right = 0;
+        for (int i = 0; i < children.Count; i = i + 1) {
+            Control c = children[i];
+            if (!c.StyleVisible() || c.designFloat) { continue; }
+            int b = c.by + c.bh;
+            if (b > bottom) { bottom = b; }
+            int r = c.bx + c.bw;
+            if (r > right) { right = r; }
+        }
+        // padding-box 顶 = by + borderT = 内容框顶（by+InsetT）- padT
+        int top = this.by + this.StyleInsetT() - this.StylePadT();
+        this.scrollExtent = bottom > 0 ? bottom + padB - top : clientH;
+        if (this.scrollExtent < clientH) { this.scrollExtent = clientH; }
+        int mo = this.scrollExtent - clientH;
+        if (mo < 0) { mo = 0; }
+        if (this.scrollY > mo) { this.scrollY = mo; }
+        if (this.scrollY < 0) { this.scrollY = 0; }
+        // 水平轴（P6 横滚）：同式换算右缘。客户端宽 = 内容框宽；
+        // 右缘下限 = 内容框右（内容不足不横滚）。
+        int clientW = this.bw - this.StyleInsetL() - this.StyleInsetR();
+        int left = this.bx + this.StyleInsetL() - this.StylePadL();
+        this.scrollExtentX = right > 0 ? right + this.StylePadR() - left
+                                       : clientW;
+        if (this.scrollExtentX < clientW) { this.scrollExtentX = clientW; }
+        int moX = this.scrollExtentX - clientW;
+        if (moX < 0) { moX = 0; }
+        if (this.scrollX > moX) { this.scrollX = moX; }
+        if (this.scrollX < 0) { this.scrollX = 0; }
+        int dy = 0 - this.scrollY;
+        int dx = 0 - this.scrollX;
+        if (dy != 0 || dx != 0) {
+            for (int i = 0; i < children.Count; i = i + 1) {
+                children[i].ShiftTree(dx, dy);
+            }
+        }
+    }
+
+    // 子树整体平移（滚动偏移的渲染/命中实现）：后代都是绝对坐标，
+    // 逐层平移；下一帧 Arrange 从自然位置重排，不会累积。
+    public virtual void ShiftTree(int dx, int dy) {
+        this.bx = this.bx + dx;
+        this.by = this.by + dy;
+        for (int i = 0; i < children.Count; i = i + 1) {
+            children[i].ShiftTree(dx, dy);
+        }
+    }
+
+    public virtual void Arrange(int px, int py, int pw, int ph) {
+        if (pw < 0) { pw = 0; }
+        if (ph < 0) { ph = 0; }
+        bx = px;
+        by = py;
+        bw = pw;
+        bh = ph;
+        int innerPadL = this.StyleInsetL();
+        int innerPadT = this.StyleInsetT();
+        int innerPadR = this.StyleInsetR();
+        int innerPadB = this.StyleInsetB();
+        int innerGap = this.StyleGap();
+        int cx = px + innerPadL;
+        int cy = py + innerPadT;
+        int cw = pw - innerPadL - innerPadR;
+        int ch = ph - innerPadT - innerPadB;
+        if (cw < 0) { cw = 0; }
+        if (ch < 0) { ch = 0; }
+        // positioned 子项的包含块是 padding box（border 内侧，
+        // 覆盖 padding 区）——停靠/flex 流只消耗内容框，这里先把
+        // padding box 存下来。
+        int pbx = px;
+        int pby = py;
+        int pbw = pw;
+        int pbh = ph;
+        int dispBox = this.StyleDisplay();
+        if (dispBox == 3) {
+            this.ArrangeFlow(cx, cy, cw, ch, innerGap);
+            this.ArrangePositioned(pbx, pby, pbw, pbh);
+            this.CheckKidsLayout();
+            this.ArrangeScrollTail(ch);
+            return;
+        }
+        if (dispBox == 1) {
+            this.ArrangeFlex(cx, cy, cw, ch, innerGap);
+            this.ArrangePositioned(pbx, pby, pbw, pbh);
+            this.CheckKidsLayout();
+            this.ArrangeScrollTail(ch);
+            return;
+        }
+        if (dispBox == 4) {
+            this.ArrangeGrid(cx, cy, cw, ch);
+            this.ArrangePositioned(pbx, pby, pbw, pbh);
+            this.CheckKidsLayout();
+            this.ArrangeScrollTail(ch);
+            return;
+        }
+        for (int i = 0; i < children.Count; i = i + 1) {
+            Control c = children[i];
+            if (c.StyleVisible() && c.StylePosition() != 2) {
+                if (c.dock == 1) {
+                    bool isTopBar = (c.Kind() == "ToolStrip" || c.Kind() == "MenuBar");
+                    int ml = isTopBar ? 0 : c.StyleMarL();
+                    int mt = isTopBar ? 0 : c.StyleMarT();
+                    int mr = isTopBar ? 0 : c.StyleMarR();
+                    int mb = isTopBar ? 0 : c.StyleMarB();
+                    int availH = isTopBar ? (ph - mt - mb) : (ch - mt - mb);
+                    if (availH < 0) { availH = 0; }
+                    int hh = Control.FitSize(c.DockSize(availH, false), availH);
+                    int curX = isTopBar ? px : (cx + ml);
+                    int curW = isTopBar ? pw : (cw - ml - mr);
+                    int curY = isTopBar ? py : (cy + mt);
+                    if (curW < 0) { curW = 0; }
+                    c.Arrange(curX, curY, curW, hh);
+                    int stepH = hh + mt + mb;
+                    int restH = ch - stepH;
+                    int gh = isTopBar ? 0 : Control.FitGap(innerGap, restH);
+                    cy = cy + stepH + gh;
+                    ch = restH - gh;
+                } else if (c.dock == 2) {
+                    bool isStatusBar = (c.Kind() == "StatusBar");
+                    int ml = isStatusBar ? 0 : c.StyleMarL();
+                    int mt = isStatusBar ? 0 : c.StyleMarT();
+                    int mr = isStatusBar ? 0 : c.StyleMarR();
+                    int mb = isStatusBar ? 0 : c.StyleMarB();
+                    int availH = isStatusBar ? (ph - mt - mb) : (ch - mt - mb);
+                    if (availH < 0) { availH = 0; }
+                    int hh = Control.FitSize(c.DockSize(availH, false), availH);
+                    int curX = isStatusBar ? px : (cx + ml);
+                    int curW = isStatusBar ? pw : (cw - ml - mr);
+                    int curY = isStatusBar ? (py + ph - hh) : (cy + ch - hh - mb);
+                    if (curW < 0) { curW = 0; }
+                    c.Arrange(curX, curY, curW, hh);
+                    int stepH = hh + mt + mb;
+                    int restH = ch - stepH;
+                    int gh = isStatusBar ? 0 : Control.FitGap(innerGap, restH);
+                    ch = restH - gh;
+                } else if (c.dock == 3) {
+                    int ml = c.StyleMarL();
+                    int mt = c.StyleMarT();
+                    int mr = c.StyleMarR();
+                    int mb = c.StyleMarB();
+                    int availW = cw - ml - mr;
+                    if (availW < 0) { availW = 0; }
+                    int ww = Control.FitSize(c.DockSize(availW, true), availW);
+                    int availH = ch - mt - mb;
+                    if (availH < 0) { availH = 0; }
+                    if (c.StyleDeclaresHeight()) {
+                        int hh = Control.FitSize(c.StyleHeightIn(availH), availH);
+                        c.Arrange(cx + ml, cy + mt + (availH - hh) / 2, ww, hh);
+                    } else {
+                        c.Arrange(cx + ml, cy + mt, ww, availH);
+                    }
+                    int stepW = ww + ml + mr;
+                    int restW = cw - stepW;
+                    int gw = Control.FitGap(innerGap, restW);
+                    cx = cx + stepW + gw;
+                    cw = restW - gw;
+                } else if (c.dock == 4) {
+                    int ml = c.StyleMarL();
+                    int mt = c.StyleMarT();
+                    int mr = c.StyleMarR();
+                    int mb = c.StyleMarB();
+                    int availW = cw - ml - mr;
+                    if (availW < 0) { availW = 0; }
+                    int ww = Control.FitSize(c.DockSize(availW, true), availW);
+                    int availH = ch - mt - mb;
+                    if (availH < 0) { availH = 0; }
+                    if (c.StyleDeclaresHeight()) {
+                        int hh = Control.FitSize(c.StyleHeightIn(availH), availH);
+                        c.Arrange(cx + cw - ww - mr, cy + mt + (availH - hh) / 2, ww, hh);
+                    } else {
+                        c.Arrange(cx + cw - ww - mr, cy + mt, ww, availH);
+                    }
+                    int stepW = ww + ml + mr;
+                    int restW = cw - stepW;
+                    int gw = Control.FitGap(innerGap, restW);
+                    cw = restW - gw;
+                } else if (c.dock != 5) {
+                    int ml = c.StyleMarL();
+                    int mt = c.StyleMarT();
+                    int mr = c.StyleMarR();
+                    int mb = c.StyleMarB();
+                    int ww = c.StyleWidth();
+                    int hh = c.StyleHeight();
+                    int maxW = cw - ml - mr;
+                    int maxH = ch - mt - mb;
+                    if (maxW < 0) { maxW = 0; }
+                    if (maxH < 0) { maxH = 0; }
+                    if (ww > maxW && maxW > 0) { ww = maxW; }
+                    if (hh > maxH && maxH > 0) { hh = maxH; }
+                    if (ww < 0) { ww = 0; }
+                    if (hh < 0) { hh = 0; }
+                    c.Arrange(cx + c.mx + ml, cy + c.my + mt, ww, hh);
+                }
+            }
+        }
+        for (int i = 0; i < children.Count; i = i + 1) {
+            Control c = children[i];
+            if (c.StyleVisible() && c.dock == 5
+                && c.StylePosition() != 2) {
+                int ml = c.StyleMarL();
+                int mt = c.StyleMarT();
+                int mr = c.StyleMarR();
+                int mb = c.StyleMarB();
+                int fw = cw - ml - mr;
+                int fh = ch - mt - mb;
+                if (fw < 0) { fw = 0; }
+                if (fh < 0) { fh = 0; }
+                c.Arrange(cx + ml, cy + mt, fw, fh);
+            }
+        }
+        this.ArrangePositioned(pbx, pby, pbw, pbh);
+        this.CheckKidsLayout();
+        this.ArrangeScrollTail(ch);
+    }
+
+    // 排布 `position` 子项。absolute/fixed 脱离常规流（停靠/flex
+    // 的测量与排布两端都跳过它），包含块是父内容框：top/right/
+    // bottom/left（inset 展开成这四条）里声明的边起作用，宽度
+    // 优先取声明值，左右两边都声明时用差值，否则取测量偏好；
+    // relative 不脱流，在流位置上平移（left/right 同设按 CSS 用
+    // left，top/bottom 同设用 top，未声明当 0）。
+    void ArrangePositioned(int cx, int cy, int cw, int ch) {
+        // 顶部停靠条（标题栏 / 工具条 / 面包屑）：浮动件的定位基准要
+        // 让开它——否则 fy=0 的浮动件正好压在标题栏上（"浮动组件忽略
+        // 标题栏高度"）。只让开最靠上的那一条：浮动件本来就浮在内容
+        // 之上，后面的内容条不挡它。浮动件自己与布局内部的流式容器
+        // 都不算（前者正是在从流里摘出来的那一条，后者是布局结构，
+        // 不是作者摆的标题栏）。
+        int band = 0;
+        int bandTop = 0;
+        bool hasBand = false;
+        for (int i = 0; i < children.Count; i = i + 1) {
+            Control d = children[i];
+            if (d.dock != 1 || d.layoutFlow || d.designFloat) { continue; }
+            if (!d.StyleVisible() || d.StylePosition() == 2) { continue; }
+            if (!hasBand || d.by < bandTop) {
+                hasBand = true;
+                bandTop = d.by;
+                band = d.StyleMarT() + d.bh;
+            }
+        }
+        for (int i = 0; i < children.Count; i = i + 1) {
+            Control c = children[i];
+            if (!c.StyleVisible()) { continue; }
+            if (c.designFloat) {
+                bool isStatusBar = (c.Kind() == "StatusBar");
+                bool isTopBar = (c.Kind() == "ToolStrip" || c.Kind() == "MenuBar");
+                int dx = (isTopBar || isStatusBar) ? 0 : this.StylePadL();
+                int dy = isTopBar ? 0 : (this.StylePadT() + band);
+                int aw = (isTopBar || isStatusBar) ? cw : (cw - dx - this.StylePadR());
+                int ah = isStatusBar ? (ch - dy) : (isTopBar ? (ch - this.StylePadB()) : (ch - dy - this.StylePadB()));
+                if (aw < 0) { aw = 0; }
+                if (ah < 0) { ah = 0; }
+                int ml = (isTopBar || isStatusBar) ? 0 : c.StyleMarL();
+                int mt = isTopBar ? 0 : c.StyleMarT();
+                int mr = (isTopBar || isStatusBar) ? 0 : c.StyleMarR();
+                int mb = isStatusBar ? 0 : c.StyleMarB();
+                int availW = aw - ml - mr;
+                int availH = ah - mt - mb;
+                if (availW < 0) { availW = 0; }
+                if (availH < 0) { availH = 0; }
+                // 设计器记录的是最终框尺寸；拖动后显式尺寸优先于原 CSS。
+                int w = c.logW > 0 ? c.prefW : c.StyleWidthIn(availW);
+                int h = c.logH > 0 ? c.prefH : c.StyleHeightIn(availH);
+                if (isTopBar || isStatusBar) {
+                    if (w <= 0 || c.logW <= 0) { w = availW; }
+                }
+                if (c.logW <= 0 && w > availW && availW > 0) { w = availW; }
+                if (c.logH <= 0 && h > availH && availH > 0) { h = availH; }
+                int x = cx + dx + c.mx + ml;
+                int y = cy + dy + c.my + mt;
+                int anchor = c.designAnchor;
+                if (anchor == 10) {
+                    x = cx + dx + ml;
+                    y = cy + dy + mt;
+                    w = availW;
+                    h = availH;
+                    if (w < 0) { w = 0; }
+                    if (h < 0) { h = 0; }
+                } else if (anchor >= 1 && anchor <= 9) {
+                    int col = (anchor - 1) % 3;
+                    int row = (anchor - 1) / 3;
+                    x = x + (availW - w) * col / 2;
+                    y = y + (availH - h) * row / 2;
+                }
+                if (isStatusBar) {
+                    // StatusBar 永远贴底全宽，独占窗口底边，消除浮动偏移和父内边距导致的间隙
+                    x = cx;
+                    w = cw;
+                    y = cy + ch - h;
+                } else if (isTopBar) {
+                    // ToolStrip / MenuBar 永远贴顶全宽，独占窗口顶边
+                    x = cx;
+                    w = cw;
+                    y = cy;
+                }
+                if (w < 0) { w = 0; }
+                if (h < 0) { h = 0; }
+                c.Arrange(x, y, w, h);
+                continue;
+            }
+            StyleBox sb = c.computedStyle;
+            int pos = c.StylePosition();
+            if (pos != 1 && pos != 2) { continue; }
+            int posT = sb == null ? 0 - 1 : sb.posT;
+            int posR = sb == null ? 0 - 1 : sb.posR;
+            int posB = sb == null ? 0 - 1 : sb.posB;
+            int posL = sb == null ? 0 - 1 : sb.posL;
+            if (pos == 1) {
+                int dx = posL != 0 - 1 ? posL
+                    : (posR != 0 - 1 ? 0 - posR : 0);
+                int dy = posT != 0 - 1 ? posT
+                    : (posB != 0 - 1 ? 0 - posB : 0);
+                if (dx != 0 || dy != 0) {
+                    c.Arrange(c.bx + dx, c.by + dy, c.bw, c.bh);
+                }
+                continue;
+            }
+            int w = c.StyleWidthIn(cw);
+            int h = c.StyleHeightIn(ch);
+            if (posL != 0 - 1 && posR != 0 - 1) { w = cw - posL - posR; }
+            if (posT != 0 - 1 && posB != 0 - 1) { h = ch - posT - posB; }
+            if (w < 0) { w = 0; }
+            if (h < 0) { h = 0; }
+            int x = cx;
+            int y = cy;
+            if (posL != 0 - 1) { x = cx + posL; }
+            else if (posR != 0 - 1) { x = cx + cw - posR - w; }
+            if (posT != 0 - 1) { y = cy + posT; }
+            else if (posB != 0 - 1) { y = cy + ch - posB - h; }
+            c.Arrange(x, y, w, h);
+        }
+    }
+
+    // --- 排版重叠自检（默认关）----------------------------------
+    // 停靠 / flex / grid 布局在构造上互不重叠；兄弟矩形压在一起
+    // 只可能来自绕开布局原语的手摆 mx/my + 手工宽高——这正是自动
+    // 生成界面的代码最常犯的排版事故（大按钮盖住旁边的钮、指标卡
+    // 宽窄不齐、内容漂出容器）。检测挂在 Arrange 尾部（每帧跑，
+    // 关闭时只多一次布尔判断），命中按「父控件 + 两个子矩形」签
+    // 名去重，只报新面孔。
+
+    // 环境变量只读一次，避免每帧碰内核。
+    static bool overlapEnvRead;
+    static bool overlapEnvOn;
+    // 编程开关：测试/宿主不经环境变量直接开。
+    static bool DebugOverlap;
+    // 本进程去重后命中的重叠对数；测试据此断言。
+    static int overlapHits;
+    static Dict<string, bool> overlapSeen;
+
+    static bool OverlapActive() {
+        if (!overlapEnvRead) {
+            overlapEnvRead = true;
+            overlapEnvOn = Interop.EnvVar("ZAN_GUI_OVERLAP") == "1";
+        }
+        return DebugOverlap || overlapEnvOn;
+    }
+
+    // 允许刻意叠放的场景（角标、悬浮装饰）在子控件上挂免检牌。
+    bool overlapExempt;
+
+    // 不参与重叠自检（本控件作为兄弟被跳过）。
+    Control NoOverlapCheck() {
+        overlapExempt = true;
+        return this;
+    }
+
+    // 测试读取：本进程去重后命中的重叠对数。
+    static int OverlapHits() { return overlapHits; }
+
+    // 测试复位：清零计数与去重表。
+    static void ResetOverlapHits() {
+        overlapHits = 0;
+        overlapSeen = null;
+    }
+
+    void CheckOverlapKids() {
+        if (!OverlapActive()) { return; }
+        int n = children.Count;
+        for (int i = 0; i < n; i = i + 1) {
+            Control a = children[i];
+            if (!a.StyleVisible() || a.overlapExempt) { continue; }
+            int ar = a.bx + a.bw;
+            int ab = a.by + a.bh;
+            for (int j = i + 1; j < n; j = j + 1) {
+                Control b = children[j];
+                if (!b.StyleVisible() || b.overlapExempt) { continue; }
+                int ix = (ar < b.bx + b.bw ? ar : b.bx + b.bw)
+                    - (a.bx > b.bx ? a.bx : b.bx);
+                int iy = (ab < b.by + b.bh ? ab : b.by + b.bh)
+                    - (a.by > b.by ? a.by : b.by);
+                if (ix > 1 && iy > 1) {
+                    this.ReportOverlap(a, b, ix, iy);
+                }
+            }
+        }
+    }
+
+    void ReportOverlap(Control a, Control b, int ix, int iy) {
+        string sig = this.Kind()
+            + "|" + a.Kind() + "@" + Convert.ToString(a.bx) + ","
+            + Convert.ToString(a.by) + "+" + Convert.ToString(a.bw)
+            + "x" + Convert.ToString(a.bh)
+            + "|" + b.Kind() + "@" + Convert.ToString(b.bx) + ","
+            + Convert.ToString(b.by) + "+" + Convert.ToString(b.bw)
+            + "x" + Convert.ToString(b.bh);
+        if (overlapSeen == null) { overlapSeen = new Dict<string, bool>(); }
+        if (overlapSeen.ContainsKey(sig)) { return; }
+        if (overlapSeen.Count < 400) { overlapSeen.Add(sig, true); }
+        overlapHits = overlapHits + 1;
+        string line = "gui-overlap #" + Convert.ToString(overlapHits)
+            + " in " + this.Kind()
+            + ": " + a.Kind() + "[" + Convert.ToString(a.bx) + ","
+            + Convert.ToString(a.by) + " " + Convert.ToString(a.bw)
+            + "x" + Convert.ToString(a.bh) + "] overlaps "
+            + b.Kind() + "[" + Convert.ToString(b.bx) + ","
+            + Convert.ToString(b.by) + " " + Convert.ToString(b.bw)
+            + "x" + Convert.ToString(b.bh) + "] by "
+            + Convert.ToString(ix) + "x" + Convert.ToString(iy) + "px";
+        string log = Interop.EnvVar("ZAN_GUI_OVERLAP_LOG");
+        if (log.Length > 0) {
+            File.AppendAllText(log, line + "\n");
+        } else {
+            Console.WriteLine(line);
+        }
+    }
+
+    // --- 控件尺寸自检（默认关，与重叠自检共用挂点）----------------
+    // 重叠检测照不到的另一类手打布局事故：给文字控件手写尺寸。
+    // 按钮的宽高有唯一正解——文字加皮肤内边距（OnMeasure 自算）；
+    // 作者一旦用 Prefer()/文档 width/height 钉死，改文案就裁字、
+    // 换皮肤就变形，自动生成界面的代码“一个按钮调来调去”反复
+    // 微调的正是这两个数。三条规则，命中按「父 + 规则 + 矩形」
+    // 签名去重：
+    // 固定尺寸  交互叶子控件带 prefSet——直接报（最强的手打信号）；
+    // 拉高      分到的高度超过自然高度 1.4 倍且多出 12px——巨块按钮；
+    // 裁剪      分到的矩形装不下自然尺寸——文字会被切。
+    // 宽度不查“拉宽”：表单列里通栏按钮是正经排版。
+    // 开关：ZAN_GUI_LAYOUTLINT=1（或 DebugLayoutLint），日志落
+    // ZAN_GUI_OVERLAP_LOG（与重叠自检共用），否则打控制台；
+    // 刻意定尺寸的场景（图标按钮、画布图元、分隔条）挂
+    // FreeLayout() 免检。
+
+    // 环境变量只读一次，避免每帧碰内核。
+    static bool lintEnvRead;
+    static bool lintEnvOn;
+    // 编程开关：测试/宿主不经环境变量直接开。
+    static bool DebugLayoutLint;
+    // 本进程去重后命中的尺寸问题数；测试据此断言。
+    static int lintHits;
+    static Dict<string, bool> lintSeen;
+
+    static bool LintActive() {
+        if (!lintEnvRead) {
+            lintEnvRead = true;
+            lintEnvOn = Interop.EnvVar("ZAN_GUI_LAYOUTLINT") == "1";
+        }
+        return DebugLayoutLint || lintEnvOn;
+    }
+
+    // 免检牌：同一张牌同时豁免重叠与尺寸两条自检。
+    Control FreeLayout() {
+        overlapExempt = true;
+        return this;
+    }
+
+    // 谁参与尺寸自检：只有“宽高有正解”的文字叶子控件
+    // （Button/Checkbox 覆写为真；Panel/Input 这类通栏合理的
+    // 控件不参与，免得表单里满屏误报）。
+    public virtual bool LintLeafSize() { return false; }
+
+    // Arrange 的两条出口（停靠尾、flex 尾）共用的子树自检入口。
+    void CheckKidsLayout() {
+        this.CheckOverlapKids();
+        this.CheckKidsSizes();
+        this.CheckInvalidManualCoords();
+    }
+
+    // 检查在自动流式、弹性盒或停靠容器中手写无效绝对坐标的反模式。
+    void CheckInvalidManualCoords() {
+        if (!LintActive()) { return; }
+        for (int i = 0; i < children.Count; i = i + 1) {
+            Control c = children[i];
+            if (!c.StyleVisible() || c.overlapExempt) { continue; }
+            if (c.mx == 0 && c.my == 0) { continue; }
+            if (c.StylePosition() == 2) { continue; } // absolute/fixed 脱流合法
+
+            bool autoParent = (this.StyleDisplay() != 0) || (this.layout != 0);
+            if (autoParent || c.dock != 0) {
+                this.ReportLint(c, "无效坐标",
+                    "在自动容器或停靠模式下手动设置了 (x="
+                    + Convert.ToString(c.mx) + ", y=" + Convert.ToString(c.my)
+                    + ")，坐标被完全忽略。请移除 Place()/Float()，改用父级 Gap、Padding 或对齐");
+            }
+        }
+    }
+
+    // 测试读取：本进程去重后命中的尺寸问题数。
+    static int LintHits() { return lintHits; }
+
+    // 测试复位：清零计数与去重表。
+    static void ResetLintHits() {
+        lintHits = 0;
+        lintSeen = null;
+    }
+
+    void CheckKidsSizes() {
+        if (!LintActive()) { return; }
+        for (int i = 0; i < children.Count; i = i + 1) {
+            Control c = children[i];
+            if (!c.StyleVisible() || c.overlapExempt
+                || !c.LintLeafSize()) { continue; }
+            if (c.prefSet) {
+                this.ReportLint(c, "固定尺寸",
+                    "宽高被 Prefer()/文档钉死成 "
+                    + Convert.ToString(c.prefW) + "x"
+                    + Convert.ToString(c.prefH)
+                    + ",应让文字+皮肤内边距自算");
+                continue;
+            }
+            if (c.prefW <= 0 || c.prefH <= 0) { continue; }
+            if (c.bh > c.prefH + 12 && c.bh * 10 > c.prefH * 14) {
+                this.ReportLint(c, "拉高",
+                    "分到 " + Convert.ToString(c.bh) + " 高,内容只要 "
+                    + Convert.ToString(c.prefH) + ",巨块按钮");
+                continue;
+            }
+            if (c.bw < c.prefW - 2 || c.bh < c.prefH - 2) {
+                this.ReportLint(c, "裁剪",
+                    "矩形 " + Convert.ToString(c.bw) + "x"
+                    + Convert.ToString(c.bh) + " 装不下内容 "
+                    + Convert.ToString(c.prefW) + "x"
+                    + Convert.ToString(c.prefH) + ",文字会被切");
+            }
+        }
+    }
+
+    void ReportLint(Control c, string rule, string detail) {
+        string sig = this.Kind() + "|" + rule + "|" + c.Kind()
+            + "@" + Convert.ToString(c.bx) + ","
+            + Convert.ToString(c.by) + "+" + Convert.ToString(c.bw)
+            + "x" + Convert.ToString(c.bh);
+        if (lintSeen == null) { lintSeen = new Dict<string, bool>(); }
+        if (lintSeen.ContainsKey(sig)) { return; }
+        if (lintSeen.Count < 400) { lintSeen.Add(sig, true); }
+        lintHits = lintHits + 1;
+        string line = "gui-lint #" + Convert.ToString(lintHits)
+            + " in " + this.Kind() + ": " + c.Kind()
+            + "[" + Convert.ToString(c.bx) + ","
+            + Convert.ToString(c.by) + " " + Convert.ToString(c.bw)
+            + "x" + Convert.ToString(c.bh) + "] " + rule + ": " + detail;
+        string log = Interop.EnvVar("ZAN_GUI_OVERLAP_LOG");
+        if (log.Length > 0) {
+            File.AppendAllText(log, line + "\n");
+        } else {
+            Console.WriteLine(line);
+        }
+    }
+
+    // 把子节点作为一个 CSS flex 容器排布在本节点的内容框内。
+    // `flex-wrap: nowrap`（默认）时全部子节点排成一条 flex 行。
+    // `wrap` 时按各项自然主轴尺寸断行——一行至少容纳一项，因此
+    // 比整框还长的子项只会自己占满一行，不会卡住断行——行与行
+    // 之间用交叉轴间距（row 容器取 `row-gap`，column 容器取
+    // `column-gap`，都回退到 `gap`）分隔，多余的交叉轴空间按
+    // `align-content` 分配。每一行内部的规则见 ArrangeFlexLine。
+    // flex 容器参与排布的子项：可见、非 absolute（absolute 脱离
+    // 常规流）、按 CSS `order` 稳定排序（同 order 保持文档序）。
+    // 测量（MeasureFlexContent）与排布（ArrangeFlex）共用同一份
+    // 顺序，断行行数才一致。
+    static List<Control> emptyKids = new List<Control>();
+
+    List<Control> FlexKids() {
+        if (children == null || children.Count == 0) { return Control.emptyKids; }
+        List<Control> items = new List<Control>();
+        for (int k = 0; k < children.Count; k = k + 1) {
+            Control c = children[k];
+            if (!c.StyleVisible() || c.StylePosition() == 2) { continue; }
+            int ord = c.StyleOrder();
+            if (ord == 0) {
+                items.Add(c);
+                continue;
+            }
+            int ins = items.Count;
+            while (ins > 0 && items[ins - 1].StyleOrder() > ord) {
+                ins = ins - 1;
+            }
+            items.Insert(ins, c);
+        }
+        if (items.Count == 0) { return Control.emptyKids; }
+        return items;
+    }
+
+    void ArrangeFlex(int cx, int cy, int cw, int ch, int gapPx) {
+        bool row = true;
+        if (this.StyleFlexDir() == 1) { row = false; }
+        int mainBox = cw;
+        int crossBox = ch;
+        int mainGap = this.StyleColGap(gapPx);
+        int crossGap = this.StyleRowGap(gapPx);
+        if (!row) {
+            mainBox = ch;
+            crossBox = cw;
+            mainGap = this.StyleRowGap(gapPx);
+            crossGap = this.StyleColGap(gapPx);
+        }
+
+        List<Control> items = this.FlexKids();
+        int n = items.Count;
+        if (n == 0) { return; }
+
+        // 记下真正用来断行的主轴框长：下一次测量据此算出行数，
+        // 换行容器的高度才能收敛（见 MeasureFlexContent）。
+        flexWrapMain = mainBox;
+
+        if (this.StyleWrap() == 0) {
+            this.ArrangeFlexLine(items, cx, cy, cw, ch, mainGap, row, 0, crossBox);
+            return;
+        }
+
+        List<int> lineFrom = new List<int>();
+        List<int> lineTo = new List<int>();
+        List<int> lineCross = new List<int>();
+        int declaredLineH = this.StyleLineHeight();
+        int idx = 0;
+        while (idx < n) {
+            int start = idx;
+            int lineMain = 0;
+            int maxCross = 0;
+            while (idx < n) {
+                Control c = items[idx];
+                int m = c.StyleHeightIn(ch);
+                int cr = c.StyleWidthIn(cw);
+                if (row) {
+                    m = c.StyleWidthIn(cw);
+                    cr = c.StyleHeightIn(ch);
+                }
+                if (m < 0) { m = 0; }
+                m = m + c.MarMain(row);
+                cr = cr + c.MarCross(row);
+                int need = m;
+                if (idx > start) { need = need + mainGap; }
+                if (idx > start && lineMain + need > mainBox) { break; }
+                lineMain = lineMain + need;
+                if (cr > maxCross) { maxCross = cr; }
+                idx = idx + 1;
+            }
+            if (declaredLineH > maxCross) { maxCross = declaredLineH; }
+            lineFrom.Add(start);
+            lineTo.Add(idx);
+            lineCross.Add(maxCross);
+        }
+
+        int lines = lineFrom.Count;
+        int crossUsed = 0;
+        for (int li = 0; li < lines; li = li + 1) {
+            crossUsed = crossUsed + lineCross[li];
+        }
+        if (lines > 1) { crossUsed = crossUsed + crossGap * (lines - 1); }
+        int crossFree = crossBox - crossUsed;
+        if (crossFree < 0) { crossFree = 0; }
+
+        int crossOff = 0;
+        int between = crossGap;
+        int stretch = 0;
+        int ac = this.StyleAlignContent();
+        if (ac == 1) { crossOff = crossFree / 2; }
+        else if (ac == 2) { crossOff = crossFree; }
+        else if (ac == 3 && lines > 1) {
+            between = between + crossFree / (lines - 1);
+        } else if (ac == 4) {
+            crossOff = crossFree / (lines + 1);
+            between = between + crossOff;
+        } else if (ac == 5) { stretch = crossFree / lines; }
+
+        for (int li = 0; li < lines; li = li + 1) {
+            int lc = lineCross[li] + stretch;
+            this.ArrangeFlexLineSlice(items, lineFrom[li], lineTo[li], cx, cy, cw, ch, mainGap, row, crossOff, lc);
+            crossOff = crossOff + lc + between;
+        }
+    }
+
+    // 排布一条 flex 行：每个子节点取声明的主轴尺寸（px 或框的
+    // 百分比），未声明时取测量偏好；`flex-grow` 分配剩余空间；
+    // `justify-content` 安排剩余部分，`align-items` 决定交叉轴
+    // 尺寸（默认 stretch）。支持 margins 和 `gap`，溢出的一行
+    // 会按比例收缩而不是溢出框外。
+    // `crossOff` 是该行在交叉轴上相对内容框的偏移，`crossBox`
+    // 是该行的交叉轴尺寸——单行容器就是整个内容框，换行容器
+    // 则由 ArrangeFlex 逐行给出。
+    void ArrangeFlexLine(List<Control> items, int cx, int cy, int cw, int ch,
+                         int gapPx, bool row, int crossOff, int crossBox) {
+        if (items == null) { return; }
+        this.ArrangeFlexLineSlice(items, 0, items.Count, cx, cy, cw, ch, gapPx, row, crossOff, crossBox);
+    }
+
+    // ArrangeFlexLine 的切片版本：直接在主项列表中按 [start, end) 索引进行排布，
+    // 避免多行换行排布时每行动态分配中间 List<Control>。
+    void ArrangeFlexLineSlice(List<Control> items, int start, int end, int cx, int cy, int cw, int ch,
+                              int gapPx, bool row, int crossOff, int crossBox) {
+        int n = end - start;
+        if (n <= 0) { return; }
+        int mainBox = cw;
+        if (!row) { mainBox = ch; }
+
+        List<int> sizes = new List<int>();
+        int used = 0;
+        int totalGrow = 0;
+        int i = 0;
+        while (i < n) {
+            Control c = items[start + i];
+            // flex-basis 优先于 width/height 与测量偏好（CSS 的顺序）：
+            // `flex: 1 1 0` 的一组子项因此从 0 起分空间，得到真正等宽的
+            // 列，而不是各自的自然宽度加上剩余空间的份额。
+            int sz = c.StyleBasisIn(mainBox);
+            if (sz < 0) {
+                if (row) { sz = c.StyleWidthIn(cw); } else { sz = c.StyleHeightIn(ch); }
+            }
+            if (sz < 0) { sz = 0; }
+            sizes.Add(sz);
+            used = used + sz + c.MarMain(row);
+            totalGrow = totalGrow + c.StyleGrow();
+            i = i + 1;
+        }
+        int gaps = 0;
+        if (n > 1) { gaps = (n - 1) * gapPx; }
+        int free = mainBox - used - gaps;
+
+        if (free > 0 && totalGrow > 0) {
+            // 两遍处理：先按 flex-grow 分配剩余空间并把结果
+            // 钳制到 max-width/height，再把被钳制项让出的空间
+            // 分给还能接受的项目。
+            int pass = 0;
+            while (pass < 2 && free > 0) {
+                int share = free;
+                int growable = 0;
+                i = 0;
+                while (i < n) {
+                    int g = items[start + i].StyleGrow();
+                    if (g > 0) { growable = growable + g; }
+                    i = i + 1;
+                }
+                if (growable == 0) { pass = 2; }
+                else {
+                    // 整除剩下的那几个像素全给最后一个可增长项：按
+                    // `share * g / growable` 逐项分配会把余数丢掉，
+                    // 一行三等分因此总短 1~2 px，右边缘和上下相邻的
+                    // 行对不齐——正是排版看起来"没对准"的来源。
+                    int lastGrow = 0 - 1;
+                    i = 0;
+                    while (i < n) {
+                        if (items[start + i].StyleGrow() > 0) { lastGrow = i; }
+                        i = i + 1;
+                    }
+                    int taken = 0;
+                    int handed = 0;
+                    i = 0;
+                    while (i < n) {
+                        int g = items[start + i].StyleGrow();
+                        if (g > 0) {
+                            int add = share * g / growable;
+                            if (i == lastGrow) { add = share - handed; }
+                            handed = handed + add;
+                            int want = sizes[i] + add;
+                            int got = want;
+                            if (row) { got = items[start + i].StyleClampW(cw, want); }
+                            else { got = items[start + i].StyleClampH(ch, want); }
+                            taken = taken + got - sizes[i];
+                            sizes[i] = got;
+                        }
+                        i = i + 1;
+                    }
+                    free = free - taken;
+                    if (taken == 0) { pass = 2; }
+                    pass = pass + 1;
+                }
+            }
+            if (free < 0) { free = 0; }
+        } else if (free < 0 && used > 0) {
+            // 溢出的一行：当容器为主轴滚动容器（overflow-x/y >= 2 即 auto/scroll）时，
+            // 子项不应被强制收缩压扁，而应保持自然尺寸溢出供滚动；
+            // 只有非滚动或 overflow:hidden 容器才按比例收缩（flex-shrink 默认 1）。
+            // 声明了 `flex-shrink: 0` 的子项保持自身尺寸不参与。
+            bool canScrollMain = row ? (this.StyleOverflowX() >= 2) : (this.StyleOverflowY() >= 2);
+            if (!canScrollMain) {
+                int marTotal = 0;
+                int fixedMain = 0;
+                int flexMain = 0;
+                i = 0;
+                while (i < n) {
+                    marTotal = marTotal + items[start + i].MarMain(row);
+                    if (items[start + i].StyleShrink() == 0) {
+                        fixedMain = fixedMain + sizes[i];
+                    } else {
+                        flexMain = flexMain + sizes[i];
+                    }
+                    i = i + 1;
+                }
+                int room = mainBox - gaps - marTotal - fixedMain;
+                if (room < 0) { room = 0; }
+                if (flexMain > 0) {
+                    // min-content 下限（CSS 的 min-width:auto，A545）：收缩
+                    // 不把内容不可重排的子项压扁——下限由 MinContentMain
+                    // 逐件给出，声明了的 min/max 经 StyleClampW/H 套上，
+                    // 再钳到基准尺寸内（flex-basis:0 的子项按 CSS 的
+                    // specified-size 建议钳到 0）。顶到下限的子项冻结，
+                    // 缺口按「可让空间」（尺寸-下限）转摊给还能让位的
+                    // 子项，每轮至少冻结一件故至多 n 轮收敛；全都顶住时
+                    // 整行按自然尺寸溢出——溢出可见好过压成 0 宽（看不
+                    // 见也点不着）。
+                    List<int> floors = new List<int>();
+                    int give = room;
+                    i = 0;
+                    while (i < n) {
+                        int f = 0;
+                        if (items[start + i].StyleShrink() != 0) {
+                            if (row) { f = items[start + i].StyleClampW(cw, items[start + i].MinContentMain(row)); }
+                            else { f = items[start + i].StyleClampH(ch, items[start + i].MinContentMain(row)); }
+                            if (f > sizes[i]) { f = sizes[i]; }
+                            give = give - sizes[i];
+                        }
+                        floors.Add(f);
+                        i = i + 1;
+                    }
+                    int guard = 0;
+                    while (give < 0 && guard <= n) {
+                        guard = guard + 1;
+                        int pool = 0;
+                        i = 0;
+                        while (i < n) {
+                            if (items[start + i].StyleShrink() != 0
+                                && sizes[i] - floors[i] > 0) { pool = pool + sizes[i] - floors[i]; }
+                            i = i + 1;
+                        }
+                        if (pool <= 0) { break; }
+                        int taken = 0;
+                        int lastGive = 0 - 1;
+                        i = 0;
+                        while (i < n) {
+                            if (items[start + i].StyleShrink() != 0
+                                && sizes[i] - floors[i] > 0) { lastGive = i; }
+                            i = i + 1;
+                        }
+                        i = 0;
+                        while (i < n) {
+                            if (items[start + i].StyleShrink() != 0
+                                && sizes[i] - floors[i] > 0) {
+                                int cut = give * (sizes[i] - floors[i]) / pool;
+                                if (i == lastGive) { cut = give + taken; }
+                                int want = sizes[i] + cut;
+                                if (want < floors[i]) { want = floors[i]; }
+                                taken = taken + sizes[i] - want;
+                                sizes[i] = want;
+                            }
+                            i = i + 1;
+                        }
+                        give = give + taken;
+                    }
+                }
+            }
+            free = 0;
+        }
+
+        int offset = 0;
+        int between = gapPx;
+        int justify = 0;
+        if (computedStyle != null) { justify = computedStyle.justify; }
+        if (justify == 1) { offset = free / 2; }
+        else if (justify == 2) { offset = free; }
+        else if (justify == 3 && n > 1) { between = between + free / (n - 1); }
+        else if (justify == 4) {
+            int slots = n + 1;
+            offset = free / slots;
+            between = between + offset;
+        }
+
+        int align = 0;
+        if (computedStyle != null) { align = computedStyle.alignItems; }
+        int pos = offset;
+        i = 0;
+        while (i < n) {
+            Control c = items[start + i];
+            int main = sizes[i];
+            int crossAvail = crossBox - c.MarCross(row);
+            if (crossAvail < 0) { crossAvail = 0; }
+            int cross;
+            if (row) { cross = c.StyleHeightIn(ch); } else { cross = c.StyleWidthIn(cw); }
+            bool declaresCross = row ? c.StyleDeclaresHeight() : c.StyleDeclaresWidth();
+            // aspect-ratio：交叉轴没有被显式声明时由主轴尺寸推出，
+            // 这样一张 16/9 的缩略图只需要给宽度。
+            int ratio = c.StyleAspect();
+            if (ratio > 0 && !declaresCross) {
+                if (row) { cross = main * 1000 / ratio; }
+                else { cross = main * ratio / 1000; }
+                declaresCross = true;
+            }
+            // align-self 覆盖容器的 align-items（未声明为 -1）。
+            int al = c.StyleAlignSelf();
+            if (al < 0) { al = align; }
+            if (cross > crossAvail) { cross = crossAvail; }
+            if (al == 0 && !declaresCross) { cross = crossAvail; }
+            if (cross <= 0) { cross = crossAvail; }
+            int crossPos = 0;
+            if (al == 2) { crossPos = (crossAvail - cross) / 2; }
+            else if (al == 3) { crossPos = crossAvail - cross; }
+            if (row) {
+                c.Arrange(cx + pos + c.StyleMarL(),
+                          cy + crossOff + crossPos + c.StyleMarT(), main, cross);
+            } else {
+                c.Arrange(cx + crossOff + crossPos + c.StyleMarL(),
+                          cy + pos + c.StyleMarT(), cross, main);
+            }
+            pos = pos + main + c.MarMain(row) + between;
+            i = i + 1;
+        }
+    }
+
+    // 把此节点的 min/max-width（或 -height）应用到 `v`，
+    // 百分比边界按 `avail` 的包含块解析。
+    int StyleClampW(int avail, int v) {
+        if (computedStyle == null) { return v; }
+        return computedStyle.ClampWIn(avail, v);
+    }
+
+    // 把 `v` 限制在本节点的 min/max-height 内（百分比边界按
+    // `avail` 的包含块解析），同 StyleClampW。
+    int StyleClampH(int avail, int v) {
+        if (computedStyle == null) { return v; }
+        return computedStyle.ClampHIn(avail, v);
+    }
+
+    // 沿/跨 flex 行的总外边距。
+    int MarMain(bool row) {
+        if (row) { return this.StyleMarL() + this.StyleMarR(); }
+        return this.StyleMarT() + this.StyleMarB();
+    }
+
+    // 交叉方向上的总外边距（行容器为上下，列容器为左右）。
+    int MarCross(bool row) {
+        if (row) { return this.StyleMarT() + this.StyleMarB(); }
+        return this.StyleMarL() + this.StyleMarR();
+    }
+
+}

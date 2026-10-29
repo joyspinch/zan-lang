@@ -17,7 +17,7 @@
 - **精美预设主题**：内置 `blue`, `dark`, `echarts6`, `macarons`, `shine`, `mint`, `sakura`, `roma`, `green`, `red`, `helianthus` 等多种配色方案。
 - **现代化正交架构**：
   - **策略渲染器分派（`SeriesRendererRegistry`）**：采用策略模式解耦 32 种系列绘制算法，支持用户通过 `SeriesRendererRegistry.Register` 无缝扩展自定义渲染策略；
-  - **清晰工具层划分**：`ChartColor` 专注于色彩模型、透明度与色阶梯度；`ChartGeometry` 专注于网格盒模型、Nice 刻度划分与投影映射；`Chart.zan` 保留门面转发桩，100% 保持向后兼容。
+  - **职责单一工具层**：`ChartColor` 专注于色彩模型、透明度、感知对比度与色阶梯度；`ChartGeometry` 专注于网格盒模型（`GridRawRect`/`GridGetLayoutRect`）、Nice 刻度划分、坐标数值投影与多边形几何；`Chart` 专注于图表框架、双轴系统与视图渲染编排，全面规范化直调，消除冗余转发与历史包袱。
 
 ---
 

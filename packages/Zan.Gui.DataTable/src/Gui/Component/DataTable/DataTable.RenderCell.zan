@@ -1,0 +1,427 @@
+using System;
+using Gui;
+using Gui.Widget;
+using Gui.Backend;
+using Gui.Component.Chart;
+
+namespace Gui.Component.DataTable;
+
+// DataTable 渲染管道分层：单元格图元、迷你图、图标、文本换行与单元格内容分发。
+public partial class DataTable {
+    // ---------- 拖动手柄 ----------
+
+    // 在 bx,by,bw,bh 内居中画一个 2×3 点阵的拖动手柄（列头 /
+    // 行号的专用拖动按钮）。用点阵而不是字体图标，
+    // 是因为图标集里没有 gripper 码点，而点阵在小尺寸下
+    // 也不会糊成一团。
+    public static void DrawGrip(App app, int bx, int by, int bw, int bh, int color) {
+        Canvas c = app.canvas;
+        int d = app.Scale(2);
+        int gap = app.Scale(2);
+        int gw = d * 2 + gap;
+        int gh = d * 3 + gap * 2;
+        int gx = bx + (bw - gw) / 2;
+        int gy = by + (bh - gh) / 2;
+        int row = 0;
+        while (row < 3) {
+            int col = 0;
+            while (col < 2) {
+                c.FillRect(gx + col * (d + gap), gy + row * (d + gap), d, d, color);
+                col = col + 1;
+            }
+            row = row + 1;
+        }
+    }
+
+    // ---------- 迷你图绘制 ----------
+
+    // 迷你柱状图零值基线的 Y 坐标（像素）。全部为正
+    // 时在底边，全部为负时在顶边，有正有负时按 0 在
+    // 区间内的比例插值。
+    public static int SparkZeroY(int y, int h, int min, int max) {
+        if (min >= 0) { return y + h; }
+        if (max <= 0) { return y; }
+        int span = max - min;
+        if (span <= 0) { return y + h; }
+        return y + (int)(((long)max * (long)h) / (long)span);
+    }
+
+    // 单个数值在迷你柱状图中的 Y 坐标（像素）。
+    // 值大于等于 0 时柱子向上画（从 topY 到 zeroY），
+    // 小于 0 时向下画（从 zeroY 到 topY）。
+    public static int SparkValueY(int y, int h, int min, int max, int val) {
+        int span = max - min;
+        if (span <= 0) { return y + h; }
+        int t = (int)(((long)(val - min) * (long)h) / (long)span);
+        return y + h - t;
+    }
+
+    // 绘制迷你柱状图：每个值一根细柱，按值正负
+    // 双向偏离零基线，正值用 posColor、负值用 negColor。
+    public static void DrawSparkBars(Canvas c, List<int> vals, int min, int max,
+                              int x, int y, int w, int h,
+                              int posColor, int negColor) {
+        int n = vals.Count;
+        if (n <= 0 || w <= 0 || h <= 0) { return; }
+        int zeroY = DataTable.SparkZeroY(y, h, min, max);
+        int barW = w / n;
+        int gap = 1;
+        if (barW > 3) { gap = 2; }
+        int effW = barW - gap;
+        if (effW < 1) { effW = 1; }
+        int i = 0;
+        while (i < n) {
+            int bx = x + i * barW;
+            int v = vals[i];
+            int vy = DataTable.SparkValueY(y, h, min, max, v);
+            int color = v >= 0 ? posColor : negColor;
+            if (v >= 0) {
+                int bh = zeroY - vy;
+                if (bh < 1) { bh = 1; }
+                c.FillRect(bx, vy, effW, bh, color);
+            } else {
+                int bh = vy - zeroY;
+                if (bh < 1) { bh = 1; }
+                c.FillRect(bx, zeroY, effW, bh, color);
+            }
+            i = i + 1;
+        }
+    }
+
+    // 绘制迷你折线图：连接各值顶点的细折线（lineColor，
+    // 粗 1px），并在折线下方到底边之间填充半透明渐变底色
+    // （fillColor，纯色单层替代）。
+    public static void DrawSparkLine(Canvas c, List<int> vals, int min, int max,
+                              int x, int y, int w, int h,
+                              int lineColor, int fillColor) {
+        int n = vals.Count;
+        if (n < 2 || w <= 0 || h <= 0) { return; }
+        int i = 0;
+        int prevX = x;
+        int prevY = DataTable.SparkValueY(y, h, min, max, vals[0]);
+        while (i < n) {
+            int cx = x + (int)(((long)i * (long)(w - 1)) / (long)(n - 1));
+            int cy = DataTable.SparkValueY(y, h, min, max, vals[i]);
+            if (i > 0) {
+                c.DrawLine(prevX, prevY, cx, cy, lineColor, 1);
+                int segW = cx - prevX;
+                if (segW > 0) {
+                    int topY = prevY < cy ? prevY : cy;
+                    int polyH = y + h - topY;
+                    if (polyH > 0) {
+                        c.FillRect(prevX, topY, segW, polyH, fillColor);
+                    }
+                }
+            }
+            prevX = cx;
+            prevY = cy;
+            i = i + 1;
+        }
+    }
+
+    // ---------- 单元格内容分发 ----------
+
+    public static void DrawCell(App app, Canvas c, Theme t, DataColumn col,
+                         string val, int cx, int cy, int cw, int rowH,
+                         int fs, StyleBox sCell, StyleBox sAccent, StyleBox sHint,
+                         int rowIdx, DataSource src, DataTableState st) {
+        DataTable.DrawCellRange(app, c, t, col, val, cx, cy, cw, rowH, fs, sCell,
+                                sAccent, sHint, rowIdx, src, st, -1, -1, -1, -1, false);
+    }
+
+    public static void DrawCellCtx(App app, Canvas c, Theme t, DataColumn col,
+                            string val, int cx, int cy, int cw, int rowH,
+                            int fs, StyleBox sCell, StyleBox sAccent, StyleBox sHint,
+                            int rowIdx, DataSource src, DataTableState st,
+                            int cc, bool isSelected) {
+        DataTable.DrawCellRangeCtx(app, c, t, col, val, cx, cy, cw, rowH, fs, sCell,
+                                   sAccent, sHint, rowIdx, src, st, -1, -1, -1, -1,
+                                   false, cc, isSelected);
+    }
+
+    public static void DrawCellIndented(App app, Canvas c, Theme t, DataColumn col,
+                                 string val, int cx, int cy, int cw, int rowH,
+                                 int fs, StyleBox sCell, StyleBox sAccent, StyleBox sHint,
+                                 int rowIdx, DataSource src, DataTableState st,
+                                 int indent) {
+        DataTable.DrawCellRange(app, c, t, col, val, cx + indent, cy, cw - indent,
+                                rowH, fs, sCell, sAccent, sHint, rowIdx, src, st,
+                                -1, -1, -1, -1, false);
+    }
+
+    public static void DrawCellRange(App app, Canvas c, Theme t, DataColumn col,
+                              string val, int cx, int cy, int cw, int rowH,
+                              int fs, StyleBox sCell, StyleBox sAccent, StyleBox sHint,
+                              int rowIdx, DataSource src, DataTableState st,
+                              int rgR0, int rgC0, int rgR1, int rgC1,
+                              bool hasRange) {
+        DataTable.DrawCellRangeCtx(app, c, t, col, val, cx, cy, cw, rowH, fs, sCell,
+                                   sAccent, sHint, rowIdx, src, st, rgR0, rgC0, rgR1,
+                                   rgC1, hasRange, -1, false);
+    }
+
+    public static void DrawCellRangeCtx(App app, Canvas c, Theme t, DataColumn col,
+                                 string val, int cx, int cy, int cw, int rowH,
+                                 int fs, StyleBox sCell, StyleBox sAccent, StyleBox sHint,
+                                 int rowIdx, DataSource src, DataTableState st,
+                                 int rgR0, int rgC0, int rgR1, int rgC1,
+                                 bool hasRange, int cc, bool isSelected) {
+        // 条件格式（热力图背景/色阶文本）：优先于普通
+        // 样式生效；选中格不覆盖背景（选区蓝底优先），
+        // 但仍保留彩色文本。
+        int cfBg = 0;
+        int cfFg = 0;
+        if (col.cfType != 0 && val.Length > 0 && st != null) {
+            ColumnCfExtents ext = DataTable.FindCfExtents(st, col);
+            if (ext != null) {
+                ColumnCfRule rule = col.cfRule;
+                if (rule != null) {
+                    double numVal = 0.0;
+                    if (val.TryParseDouble(out numVal)) {
+                        cfBg = rule.BgColor(numVal, ext.minVal, ext.maxVal);
+                        cfFg = rule.FgColor(numVal, ext.minVal, ext.maxVal);
+                    }
+                }
+            }
+        }
+        if (cfBg != 0 && !isSelected) {
+            c.FillRect(cx, cy, cw, rowH - 1, cfBg);
+        }
+
+        if (col.cellType == 3) {
+            // 布尔列（勾选框，支持中立态和只读开关）
+            int boxSz = app.Scale(16);
+            int bx = cx + (cw - boxSz) / 2;
+            int by = cy + (rowH - boxSz) / 2;
+            bool isNull = val == "" || val == "null";
+            bool isTrue = val == "true" || val == "1" || val == "yes" || val == "on";
+            bool isFalse = val == "false" || val == "0" || val == "no" || val == "off";
+            int checkId = app.focus.AllocId();
+            app.hitTester.RegisterRect(checkId, cx, cy, cw, rowH);
+
+            if (!col.readOnly && Ui.Clicked(app, checkId)) {
+                string nextVal = "true";
+                if (col.allowIndeterminate) {
+                    if (isTrue) { nextVal = "false"; }
+                    else if (isFalse) { nextVal = ""; }
+                    else { nextVal = "true"; }
+                } else {
+                    if (isTrue) { nextVal = "false"; }
+                    else { nextVal = "true"; }
+                }
+                DataTable.CommitCellText(st, src, rowIdx, cc, nextVal);
+                st.hitRow = rowIdx;
+                st.hitCol = cc;
+                st.CellEdit.Raise();
+                app.RequestRedraw();
+            }
+
+            int lvl = 0;
+            if (isTrue) { lvl = 1000; }
+            else if (isNull && col.allowIndeterminate) { lvl = 500; }
+
+            if (col.renderAsIcon) {
+                int iconColor = isTrue ? 0x2DA44E : 0xCF222E;
+                if (isNull) { iconColor = 0x8C959F; }
+                string iconName = isTrue ? "check" : "x";
+                if (isNull) { iconName = "dash"; }
+                c.DrawGlyphIn(iconName, bx, by, boxSz, boxSz, app.Scale(12), iconColor);
+            } else if (col.renderAsText) {
+                string displayLabel = isTrue ? col.boolTrueLabel : (isFalse ? col.boolFalseLabel : col.boolNullLabel);
+                int fg = sCell.FgOr(0);
+                if (cfFg != 0) { fg = cfFg; }
+                c.DrawTextCentered(cx, cy, cw, rowH, displayLabel, fg, fs);
+            } else {
+                Checkbox.PaintBox(app, bx, by, boxSz, lvl);
+            }
+        } else if (col.cellType == 6) {
+            // 图片列（本地文件路径或已缓存的 http 图片）：按 contain 比例
+            // 缩放到格内居中，保持宽高比不拉伸，格高格宽任意变都不变形。
+            int imgPad = app.Scale(3);
+            int boxW = cw - imgPad * 2;
+            int boxH = rowH - imgPad * 2;
+            if (boxW > 0 && boxH > 0 && val.Length > 0) {
+                // http(s) URL：自动异步获取；未获取到时触发预取，
+                // 获取完成通过 NeedsRedraw 自动刷新。
+                string localPath = val;
+                if (val.IndexOf("http://") == 0 || val.IndexOf("https://") == 0) {
+                    localPath = app.PrefetchImage(val);
+                }
+                if (localPath.Length > 0) {
+                    Image img = app.GetImage(localPath);
+                    if (img != null && img.Width() > 0 && img.Height() > 0) {
+                        int iw = img.Width();
+                        int ih = img.Height();
+                        int drawW = boxW;
+                        int drawH = (int)(((long)ih * (long)boxW) / (long)iw);
+                        if (drawH > boxH) {
+                            drawH = boxH;
+                            drawW = (int)(((long)iw * (long)boxH) / (long)ih);
+                        }
+                        if (drawW > 0 && drawH > 0) {
+                            int ix = cx + imgPad + (boxW - drawW) / 2;
+                            int iy = cy + imgPad + (boxH - drawH) / 2;
+                            c.DrawImage(img, ix, iy, drawW, drawH);
+                        }
+                    }
+                }
+            }
+        } else if (col.cellType == 7) {
+            // 图标列：单元格内容为 Tabler 图标名（如 "check", "star", "flame"），
+            // 居中按 iconSizeMedium 矢量渲染；空串保持空白。
+            if (val.Length > 0) {
+                int iconColor = sCell.FgOr(0);
+                if (col.iconColor != 0) { iconColor = col.iconColor; }
+                int isz = app.Scale(16);
+                int ix = cx + (cw - isz) / 2;
+                int iy = cy + (rowH - isz) / 2;
+                c.DrawGlyphIn(val, ix, iy, isz, isz, isz, iconColor);
+            }
+        } else if (col.cellType == 8) {
+            // 迷你图列：逗号分隔的整数序列（如 "3,8,-2,14,9"）。
+            // 柱状图按 0 基线双向展开；折线图带半透明底色渐变。
+            List<int> vals = DataTable.ParseIntSeries(val);
+            if (vals.Count > 0) {
+                int spPad = app.Scale(4);
+                int spX = cx + spPad;
+                int spY = cy + spPad;
+                int spW = cw - spPad * 2;
+                int spH = rowH - spPad * 2;
+                int min = DataTable.SeriesMin(vals);
+                int max = DataTable.SeriesMax(vals);
+                if (col.sparkKind == 1) {
+                    int posColor = col.sparkPosColor != 0 ? col.sparkPosColor : t.primary;
+                    int negColor = col.sparkNegColor != 0 ? col.sparkNegColor : t.error;
+                    DataTable.DrawSparkBars(c, vals, min, max, spX, spY, spW, spH,
+                                           posColor, negColor);
+                } else {
+                    int lineColor = col.sparkLineColor != 0 ? col.sparkLineColor : t.primary;
+                    int fillColor = col.sparkFillColor != 0 ? col.sparkFillColor
+                                    : (int)(((long)lineColor & 0x00FFFFFF) | 0x26000000);
+                    DataTable.DrawSparkLine(c, vals, min, max, spX, spY, spW, spH,
+                                            lineColor, fillColor);
+                }
+            }
+        } else if (col.cellType == 9 || col.cellType == 10) {
+            DataTable.RenderCompCell(app, col, val, cx, cy, cw, rowH, rowIdx, cc, src, st);
+        } else if (col.cellType == 11) {
+            // 操作按钮组列（Actions 动作列）：按钮名逗号分隔（如 "增,删,改,查"），
+            // 平分格宽排成一组细按钮；段点击落入 CellClick，段号在 st.compC（0..n-1）。
+            DataTable.RenderButtonsCell(app, col, val, cx, cy, cw, rowH, rowIdx, cc, st);
+        } else {
+            // 纯文本、数字、链接等通用格式
+            int pad = t.paddingSmall;
+            int align = col.align;
+            int fg = sCell.FgOr(0);
+            if (cfFg != 0) { fg = cfFg; }
+            if (col.cellType == 1) {
+                // 数字列：若设置了阈值高亮
+                int num = 0;
+                if (val.TryParseInt(out num) && col.threshOn) {
+                    if (num < col.threshLow) { fg = col.threshLowColor; }
+                    else if (num > col.threshHigh) { fg = col.threshHighColor; }
+                }
+            } else if (col.cellType == 2) {
+                // 链接列
+                fg = sAccent.FgOr(0);
+            }
+
+            int availW = cw - pad * 2;
+            if (availW < 0) { availW = 0; }
+
+            // 文字换行：col.wrap 开启且格高容得下至少两行时按词拆行逐行绘制；
+            // 否则退回单行截断（Truncate + "…"）。
+            if (col.wrap && availW > 0 && rowH >= fs * 2 + app.Scale(6)) {
+                List<string> lines = DataTable.WrapTextLines(val, fs, availW);
+                DataTable.DrawWrappedLines(c, lines, cx + pad, cy, availW, rowH, fs, fg, align);
+            } else {
+                string shown = DataTable.Truncate(val, fs, availW);
+                int tw = Canvas.MeasureText(shown, fs);
+                int tx = cx + pad;
+                if (align == 2) { tx = cx + cw - pad - tw; }
+                else if (align == 1) { tx = cx + (cw - tw) / 2; }
+                int ty = Canvas.CenterTextY(cy, rowH, fs);
+
+                // 快速查找命中高亮：包含查找关键字时把匹配片段
+                // 底色刷成高亮色（sAccent.BgOr），文本保持原色。
+                // 只有完全可见且非空的关键字才做切分。
+                int matchStart = -1;
+                int matchLen = 0;
+                if (st != null && st.findText.Length > 0) {
+                    matchStart = DataTable.FindMatchIn(shown, st.findText, st.findMatchCase);
+                    if (matchStart >= 0) { matchLen = st.findText.Length; }
+                }
+
+                if (matchStart >= 0 && matchLen > 0) {
+                    string prefix = shown.Substring(0, matchStart);
+                    string hit = shown.Substring(matchStart, matchLen);
+                    int preW = Canvas.MeasureText(prefix, fs);
+                    int hitW = Canvas.MeasureText(hit, fs);
+                    int hx = tx + preW;
+                    c.FillRect(hx, cy + 2, hitW, rowH - 4, sAccent.BgOr(0));
+                }
+
+                c.DrawText(tx, ty, shown, fg, fs);
+            }
+        }
+    }
+
+    // 逐行绘制已折行的多行文本，垂直居中于整个单元格内。
+    public static void DrawWrappedLines(Canvas c, List<string> lines, int x, int y,
+                                 int maxW, int rowH, int fs, int fg, int align) {
+        int lineCount = lines.Count;
+        if (lineCount <= 0) { return; }
+        int lineH = fs + 2;
+        int totalH = lineCount * lineH;
+        int startY = y + (rowH - totalH) / 2;
+        if (startY < y) { startY = y; }
+        int i = 0;
+        while (i < lineCount) {
+            string line = lines[i];
+            int lw = Canvas.MeasureText(line, fs);
+            int lx = x;
+            if (align == 2) { lx = x + maxW - lw; }
+            else if (align == 1) { lx = x + (maxW - lw) / 2; }
+            c.DrawText(lx, startY + i * lineH, line, fg, fs);
+            i = i + 1;
+        }
+    }
+
+    // 将单行文本按 maxW 像素宽度折成多行；折点优先选空格，
+    // 无空格时硬切，超长单词不会撑破列宽。
+    public static List<string> WrapTextLines(string text, int fs, int maxW) {
+        List<string> outp = new List<string>();
+        if (maxW <= 0 || text.Length == 0) {
+            outp.Add(text);
+            return outp;
+        }
+        int n = text.Length;
+        int start = 0;
+        while (start < n) {
+            int fit = DataTable.FitPrefix(text, start, fs, maxW);
+            if (fit <= 0) { fit = 1; }
+            if (start + fit >= n) {
+                outp.Add(text.Substring(start, n - start));
+                break;
+            }
+            int brk = -1;
+            int scan = fit;
+            while (scan > 0) {
+                if ((text[start + scan] & 255) == 32) {
+                    brk = scan;
+                    break;
+                }
+                scan = scan - 1;
+            }
+            if (brk <= 0) { brk = fit; }
+            outp.Add(text.Substring(start, brk));
+            start = start + brk;
+            while (start < n && (text[start] & 255) == 32) { start = start + 1; }
+        }
+        if (start < n && outp.Count > 0) {
+            int last = outp.Count - 1;
+            outp[last] = DataTable.Truncate(outp[last] + "…", fs, maxW);
+        }
+        return outp;
+    }
+}

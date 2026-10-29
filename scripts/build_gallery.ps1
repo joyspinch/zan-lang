@@ -55,7 +55,7 @@ try {
     $zanArgs = @()
     $zanArgs += $entry
     $zanArgs += ("@" + $rsp)
-    $zanArgs += @("-o", "build\gallery_test.exe", "--subsystem", "windows")
+    $zanArgs += @("-o", "build/gallery_test.exe", "--subsystem", "windows")
     # Demo/props/events catalog + map geometry (assets/) travel inside the
     # exe; File.ReadAllText falls back to the embedded copy when the loose
     # file is not next to the binary.

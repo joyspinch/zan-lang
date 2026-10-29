@@ -1,0 +1,114 @@
+using System;
+using Gui;
+using Gui.Widget;
+using Gui.Backend;
+
+namespace Gui.Component.DataTable;
+
+// DataTable 渲染管道分层：冻结带条带几何裁剪原语与顶置/底置固定行（Pinned Rows）。
+public partial class DataTable {
+    // ---------- 冻结 band 几何 ----------
+    // 数据区域是三个并排条带：0 左冻结，1 滚动，
+    // 2 右冻结。每个流程都向这三者索要自己的条带，而非
+    // 重新计算，因此表头、筛选行、单元格和汇总
+    // 不会错位。
+
+    public static int BandLeft(int band, int firstDataX, int bandX, int rightX) {
+        if (band == 0) { return firstDataX; }
+        if (band == 2) { return rightX; }
+        return bandX;
+    }
+
+    public static int BandRight(int band, int firstDataX, int bandX, int bandW,
+                         int rightX, int pinnedW, int pinnedRW, int clipRight) {
+        if (band == 0) { return firstDataX + pinnedW; }
+        if (band == 2) { return rightX + pinnedRW; }
+        int r = bandX + bandW;
+        if (r > clipRight) { return clipRight; }
+        return r;
+    }
+
+    public static void PushBandClip(Canvas c, int band, int firstDataX, int bandX, int bandW,
+                             int rightX, int pinnedW, int pinnedRW,
+                             int y, int h, int clipRight) {
+        int l = DataTable.BandLeft(band, firstDataX, bandX, rightX);
+        int r = DataTable.BandRight(band, firstDataX, bandX, bandW, rightX,
+                                    pinnedW, pinnedRW, clipRight);
+        int w = r - l;
+        if (w < 0) { w = 0; }
+        c.PushClip(l, y, w, h);
+    }
+
+    // 渲染单行置顶或置底固定行（Pinned / Floating Rows，不随纵向垂直滚动）：
+    public static void RenderPinnedRow(App app, int x, int ry, int viewW, int rowH, int numW, int selW,
+                               List<DataColumn> cols, DataRow pRow, DataTableState st,
+                               List<FrameColumn> frameColumns, int firstDataX, int bandX, int bandW,
+                               int rightX, int pinnedW, int pinnedRW, int clipRight, int gridColor,
+                               string prefixLabel) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        StyleBox sPinned = Style.Part(app, "datatable", "footer", "", "", "", Style.SNormal());
+        StyleBox sCell = Style.Part(app, "datatable", "cell", "", "", "", Style.SNormal());
+        StyleBox sHint = Style.Part(app, "datatable", "hint", "", "", "", Style.SNormal());
+        int fs = Style.FontFallback(app, "small");
+
+        // 固定行背景（微带底色以区分普通行）与下边框线
+        c.FillRect(x + 1, ry, viewW - 2, rowH, sPinned.BgOr(0));
+        c.FillRect(x + 1, ry + rowH - 1, viewW - 2, 1, gridColor);
+
+        if (prefixLabel.Length > 0 && (st.showRowNum || st.showSelect)) {
+            if (prefixLabel == "📌" || prefixLabel == "pin") {
+                int psz = app.Scale(13);
+                int px = x + (numW + selW - psz) / 2;
+                int py = ry + (rowH - psz) / 2;
+                c.DrawGlyphIn("pin", px, py, psz, psz, psz, sHint.FgOr(0));
+            } else {
+                c.DrawTextCentered(x, ry, numW + selW, rowH, prefixLabel, sHint.FgOr(0), fs);
+            }
+        }
+
+        int sBand = -1;
+        for (int soi = 0; soi < frameColumns.Count; soi = soi + 1) {
+            FrameColumn fCol = frameColumns[soi];
+            int sc = fCol.column;
+            int cw = st.dispW[sc];
+            if (fCol.band != sBand) {
+                if (sBand >= 0) { c.PopClip(); }
+                sBand = fCol.band;
+                DataTable.PushBandClip(c, sBand, firstDataX, bandX, bandW, rightX,
+                                       pinnedW, pinnedRW, ry, rowH, clipRight);
+            }
+            int cx = fCol.x;
+            int sBandL = DataTable.BandLeft(fCol.band, firstDataX, bandX, rightX);
+            int sBandR = DataTable.BandRight(fCol.band, firstDataX, bandX, bandW,
+                                             rightX, pinnedW, pinnedRW, clipRight);
+            // 列虚拟化裁剪（Column Virtualization）：中间滚动带滚出视口右侧时快速跳过后续不可见列
+            if (fCol.band == 1 && cx >= sBandR) {
+                while (soi + 1 < frameColumns.Count && frameColumns[soi + 1].band == 1) {
+                    soi = soi + 1;
+                }
+                continue;
+            }
+            if (cx + cw <= sBandL) {
+                continue;
+            }
+            if (cx + cw > sBandL && cx < sBandR) {
+                string cellText = "";
+                if (pRow != null && sc < pRow.cells.Count) {
+                    cellText = pRow.cells[sc];
+                }
+                if (cellText.Length > 0) {
+                    int pad = t.paddingSmall;
+                    string shown = DataTable.Truncate(cellText, fs, cw - pad * 2);
+                    int tw = Canvas.MeasureText(shown, fs);
+                    int tx = cx + pad;
+                    if (cols[sc].align == 2) { tx = cx + cw - pad - tw; }
+                    else if (cols[sc].align == 1) { tx = cx + (cw - tw) / 2; }
+                    int ty = Canvas.CenterTextY(ry, rowH, fs);
+                    c.DrawText(tx, ty, shown, sCell.FgOr(0), fs);
+                }
+            }
+        }
+        if (sBand >= 0) { c.PopClip(); }
+    }
+}

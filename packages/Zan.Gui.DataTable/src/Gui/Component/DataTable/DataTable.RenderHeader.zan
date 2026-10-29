@@ -1,0 +1,605 @@
+using System;
+using Gui;
+using Gui.Widget;
+using Gui.Backend;
+
+namespace Gui.Component.DataTable;
+
+// DataTable 渲染管道分层：表头区域、多级 Band 跨度行、分组面板与列重排/调整大小交互。
+public partial class DataTable {
+    // ---------- 分组面板 ----------
+
+    // 分组面板芯片的 x 位置和宽度，由外到内。
+    // 条带绘制、命中测试和表头拖放共用，三者
+    // 几何上天然一致。
+    public static List<GroupChipGeometry> GroupChipLayout(App app, List<DataColumn> cols,
+                                                   DataTableState st, int x) {
+        Theme t = app.theme;
+        int fs = Style.FontFallback(app, "small");
+        List<GroupChipGeometry> chips = new List<GroupChipGeometry>();
+        int cx = x + app.Scale(10);
+        for (int i = 0; i < st.groupCols.Count; i = i + 1) {
+            int w = Canvas.MeasureText(cols[st.groupCols[i]].title, fs) + app.Scale(38);
+            chips.Add(new GroupChipGeometry(cx, w));
+            cx = cx + w + app.Scale(8);
+        }
+        return chips;
+    }
+
+    // 指针指向的插入槽位（0..count）：中点位于
+    // 指针左侧的芯片数量。
+    public static int GroupDropSlot(App app, List<GroupChipGeometry> chips) {
+        int slot = 0;
+        for (int i = 0; i < chips.Count; i = i + 1) {
+            GroupChipGeometry chip = chips[i];
+            if (app.mouseX > chip.x + chip.width / 2) { slot = i + 1; }
+        }
+        return slot;
+    }
+
+    // 模态浮层打开期间，表格交互面归浮层所有：内容阶段的事件种类就地清零。
+    public static int ModalEvt(App app, DataTableState st) {
+        if (st.ctxOpen || st.hdrCtxOpen || st.colChooserOpen
+            || st.cfClearOpen || st.edPopHot || st.openMenu >= 0
+            || st.chartOpen || st.ExportUiOpen()) { return 0; }
+        return app.EventKind();
+    }
+
+    public static void RenderGroupPanel(App app, int x, int y, int viewW, int h,
+                                 List<DataColumn> cols, DataTableState st,
+                                 bool headerDrag) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int evt = DataTable.ModalEvt(app, st);
+        int fs = Style.FontFallback(app, "small");
+        bool over = app.mouseX >= x && app.mouseX < x + viewW
+                    && app.mouseY >= y && app.mouseY < y + h;
+        int panelState = Style.SNormal();
+        if (headerDrag && over) { panelState = Style.SActive(); }
+        StyleBox sPanel = Style.Part(app, "datatable", "panel", "", "", "",
+                                     panelState);
+        StyleBox sGrid = Style.Part(app, "datatable", "grid", "", "", "",
+                                    Style.SNormal());
+        StyleBox sHint = Style.Part(app, "datatable", "hint", "", "", "",
+                                    Style.SNormal());
+        StyleBox sChip = Style.Part(app, "datatable", "chip", "", "", "",
+                                    Style.SNormal());
+        StyleBox sChipDrag = Style.Part(app, "datatable", "chip", "", "", "",
+                                        Style.SSelected());
+        StyleBox sAccent = Style.Part(app, "datatable", "accent", "", "", "",
+                                      Style.SNormal());
+        c.FillRect(x, y, viewW, h, sPanel.BgOr(0));
+        c.FillRect(x, y + h - 1, viewW, 1, sGrid.BgOr(0));
+        c.PushClip(x, y, viewW, h);
+
+        // 列选择器入口：条带右缘的 "Columns" 按钮。
+        int ccBtnW = app.Scale(74);
+        int ccBtnH = h - app.Scale(12);
+        int ccBtnX = x + viewW - ccBtnW - app.Scale(6);
+        int ccBtnY = y + app.Scale(6);
+        if (DataTable.TextBtn(app, ccBtnX, ccBtnY, ccBtnW, ccBtnH, DataTable.T("Columns", "Columns"), false)) {
+            DataTable.SetColumnChooser(st, !st.colChooserOpen);
+            app.RequestRedraw();
+        }
+        int panelContentW = ccBtnX - x - app.Scale(6);
+
+        List<GroupChipGeometry> chips = DataTable.GroupChipLayout(app, cols, st, x);
+        int chipH = h - app.Scale(10);
+        int chipY = y + app.Scale(5);
+
+        if (st.groupCols.Count == 0) {
+            c.DrawText(x + app.Scale(10), Canvas.CenterTextY(y, h, fs),
+                       DataTable.Truncate("Drag a column header here to group by it",
+                                          fs, panelContentW - app.Scale(20)),
+                       sHint.FgOr(0), fs);
+        }
+
+        for (int i = 0; i < st.groupCols.Count; i = i + 1) {
+            int col = st.groupCols[i];
+            GroupChipGeometry chip = chips[i];
+            int cxp = chip.x;
+            int cwp = chip.width;
+            bool dragged = st.dragChip == col;
+            int fill = sChip.BgOr(0);
+            if (dragged) { fill = sChipDrag.BgOr(0); }
+            c.FillRoundRect(cxp, chipY, cwp, chipH, chipH / 2, fill);
+            int lc = sChip.FgOr(0);
+            if (dragged) { lc = sChipDrag.FgOr(0); }
+            int rsz = app.Scale(14);
+            int rx = cxp + cwp - rsz - app.Scale(6);
+            int ry = chipY + (chipH - rsz) / 2;
+            string lbl = DataTable.Truncate(cols[col].title, fs,
+                                            rx - cxp - app.Scale(14));
+            c.DrawText(cxp + app.Scale(10),
+                       Canvas.CenterTextY(chipY, chipH, fs), lbl, lc, fs);
+            int rmId = app.focus.AllocId();
+            c.DrawGlyphIn("close", rx, ry, rsz, rsz, app.Scale(10), lc);
+            app.hitTester.RegisterRectL(rmId, rx, ry, rsz, rsz, 0,
+                cols[col].title + " ×");
+            int chipId = app.focus.AllocId();
+            app.hitTester.RegisterRectL(chipId, cxp, chipY,
+                                        rx - cxp, chipH, 0, cols[col].title);
+            if (evt == 3 && app.window.EventButton() == 0
+                && app.hitTester.HitTest(app.mouseX, app.mouseY) == rmId) {
+                DataTable.UngroupOne(st, col);
+                st.GroupChanged.Raise();
+                app.RequestRedraw();
+            }
+            if (evt == 2 && app.window.EventButton() == 0
+                && app.hitTester.HitTest(app.mouseX, app.mouseY) == chipId) {
+                st.dragChip = col;
+                app.RequestRedraw();
+            }
+        }
+
+        if (st.dragChip >= 0 || (headerDrag && over)) {
+            int slot = DataTable.GroupDropSlot(app, chips);
+            int lineX = x + app.Scale(6);
+            if (slot > 0) {
+                GroupChipGeometry previous = chips[slot - 1];
+                lineX = previous.x + previous.width + app.Scale(2);
+            }
+            c.FillRect(lineX, chipY, app.Scale(2), chipH, sAccent.BgOr(0));
+        }
+        c.PopClip();
+
+        // 松开时完成芯片拖放
+        if (st.dragChip >= 0 && app.focus.pressedId < 0) {
+            int from = DataTable.GroupDepth(st, st.dragChip);
+            int dst = DataTable.GroupDropSlot(app, chips);
+            if (dst > from) { dst = dst - 1; }
+            if (from >= 0 && dst != from) {
+                DataTable.MoveGroup(st, st.dragChip, dst);
+                st.GroupChanged.Raise();
+            }
+            st.dragChip = -1;
+            app.RequestRedraw();
+        }
+    }
+
+    // 渲染表头整块（包括全选框/行号头、多级Band行、列标题、排序箭头、筛选图标、调整大小和列拖动重排）
+    public static void RenderHeader(App app, int x, int y, int viewW,
+                             DataTableFrame f, List<DataColumn> cols, DataSource src,
+                             DataTableState st, int evt, int openMenuAtStart) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        bool touchUi = app.TouchDevice();
+
+        int numW = f.numW;
+        int selW = f.selW;
+        int gridColor = f.gridColor;
+        int menuIconW = f.menuIconW;
+        int clipRight = f.clipRight;
+        int firstDataX = f.firstDataX;
+        int titleRowH = f.titleRowH;
+        int fs = f.fs;
+        int bandRowH = f.bandRowH;
+        int bandLevels = f.bandLevels;
+        int headerH = f.headerH;
+        int titleTop = f.titleTop;
+        int pinnedW = f.pinnedW;
+        int pinnedRW = f.pinnedRW;
+        int bandX = f.bandX;
+        int bandW = f.bandW;
+        int rightX = f.rightX;
+        int panelY = f.panelY;
+        int groupPanelH = f.groupPanelH;
+        List<FrameColumn> frameColumns = f.columns;
+
+        StyleBox sHeader = Style.Part(app, "datatable", "header", "", "", "", Style.SNormal());
+        StyleBox sHeaderHover = Style.Part(app, "datatable", "header", "", "", "", Style.SHover());
+        StyleBox sIcon = Style.Part(app, "datatable", "icon", "", "", "", Style.SNormal());
+        StyleBox sIconHover = Style.Part(app, "datatable", "icon", "", "", "", Style.SHover());
+        StyleBox sIconSel = Style.Part(app, "datatable", "icon", "", "", "", Style.SSelected());
+        StyleBox sBandHdr = Style.Part(app, "datatable", "band", "", "", "", Style.SNormal());
+        StyleBox sAccent = Style.Part(app, "datatable", "accent", "", "", "", Style.SNormal());
+
+        // ---------------- 表头背景 ----------------
+        c.FillRect(x, y, viewW, headerH, sHeader.BgOr(0));
+        int hx = x;
+
+        if (st.showRowNum) {
+            c.DrawTextCentered(hx, y, numW, headerH, "#", sIcon.FgOr(0), Style.FontFallback(app, "small"));
+            hx = hx + numW;
+            c.FillRect(hx, y, 1, headerH, gridColor);
+        }
+        if (st.showSelect) {
+            // 全选复选框
+            int allId = app.focus.AllocId();
+            bool allChecked = st.order.Count > 0;
+            int oi = 0;
+            while (oi < st.order.Count) {
+                if (!DataTable.IsSelected(st, src, st.order[oi])) { allChecked = false; oi = st.order.Count; } else { oi = oi + 1; }
+            }
+            int box = app.Scale(16);
+            int bx = hx + (selW - box) / 2;
+            int by = y + (headerH - box) / 2;
+            int allLvl = 0;
+            if (allChecked) { allLvl = 1000; }
+            Checkbox.PaintBox(app, bx, by, box, allLvl);
+            app.hitTester.RegisterRectL(allId, hx, y, selW, headerH, 0, "select-all");
+            if (evt == 3 && app.window.EventButton() == 0 && app.hitTester.HitTest(app.mouseX, app.mouseY) == allId) {
+                bool target = !allChecked;
+                DataTable.SelectAllRows(st, src, target);
+                st.SelectionChanged.Raise();
+                app.RequestRedraw();
+            }
+            hx = hx + selW;
+            c.FillRect(hx, y, 1, headerH, gridColor);
+        }
+
+        // ---------------- band 行（多级表头）----------------
+        for (int blv = 0; blv < bandLevels; blv = blv + 1) {
+            int by0 = y + blv * bandRowH;
+            List<BandSpan> spans = DataTable.BandRow(st, cols, frameColumns, blv);
+            for (int si = 0; si < spans.Count; si = si + 1) {
+                BandSpan sp = spans[si];
+                int seg = sp.from;
+                while (seg < sp.to) {
+                    int segBand = frameColumns[seg].band;
+                    int segEnd = seg;
+                    while (segEnd < sp.to && frameColumns[segEnd].band == segBand) { segEnd = segEnd + 1; }
+                    int sx0 = frameColumns[seg].x;
+                    FrameColumn lastSegmentColumn = frameColumns[segEnd - 1];
+                    int sx1 = lastSegmentColumn.x + st.dispW[lastSegmentColumn.column];
+                    int sbL = DataTable.BandLeft(segBand, firstDataX, bandX, rightX);
+                    int sbR = DataTable.BandRight(segBand, firstDataX, bandX, bandW,
+                                                  rightX, pinnedW, pinnedRW, clipRight);
+                    if (sx1 > sbL && sx0 < sbR) {
+                        DataTable.PushBandClip(c, segBand, firstDataX, bandX, bandW, rightX,
+                                               pinnedW, pinnedRW, by0, bandRowH, clipRight);
+                        int vx0 = sx0;
+                        if (vx0 < sbL) { vx0 = sbL; }
+                        int vx1 = sx1;
+                        if (vx1 > sbR) { vx1 = sbR; }
+                        c.FillRect(sx0, by0, sx1 - sx0, bandRowH - 1, sBandHdr.BgOr(0));
+                        c.FillRect(sx1 - 1, by0, 1, bandRowH, gridColor);
+
+                        int capX = sx0;
+                        int capW = sx1 - sx0;
+                        bool owner = seg == sp.from;
+                        if (owner) {
+                            int chev = app.Scale(14);
+                            int chId = app.focus.AllocId();
+                            string chIcon = "chevron-down";
+                            if (DataTable.BandIsCollapsed(st, sp.path)) { chIcon = "chevron-right"; }
+                            int chX = sx0 + app.Scale(4);
+                            c.DrawGlyphIn(chIcon, chX, by0, chev, bandRowH,
+                                                app.Scale(11), sIcon.FgOr(0));
+                            app.hitTester.RegisterRect(chId, chX, by0, chev, bandRowH, 0);
+                            if (evt == 3 && app.window.EventButton() == 0
+                                && app.hitTester.HitTest(app.mouseX, app.mouseY) == chId) {
+                                DataTable.ToggleBand(st, cols, sp.path);
+                                st.BandToggled.Raise();
+                                app.RequestRedraw();
+                            }
+                            capX = chX + chev;
+                            capW = sx1 - capX;
+                        }
+                        int capPad = app.Scale(4);
+                        capW = capW - capPad * 2;
+                        if (capW < 0) { capW = 0; }
+                        string capT = DataTable.Truncate(sp.label, Style.FontFallback(app, "small"), capW);
+                        c.DrawTextCentered(capX + capPad, by0, capW, bandRowH, capT,
+                                           sBandHdr.FgOr(0), Style.FontFallback(app, "small"));
+                        c.PopClip();
+                    }
+                    seg = segEnd;
+                }
+            }
+            c.FillRect(x, by0 + bandRowH - 1, viewW, 1, gridColor);
+        }
+
+        // 本帧进行中的列拖拽重排
+        bool colDragging = st.dragCol >= 0 && st.dragColMoved;
+        int dropVisLocal = -1;
+        int dropX = -1;
+
+        int hoi = 0;
+        int hcl = firstDataX;
+        int hBand = -1;
+        while (hoi < frameColumns.Count) {
+            FrameColumn headerColumn = frameColumns[hoi];
+            int i = headerColumn.column;
+            DataColumn col = cols[i];
+            int cw = st.dispW[i];
+            if (headerColumn.band != hBand) {
+                if (hBand >= 0) { c.PopClip(); }
+                hBand = headerColumn.band;
+                DataTable.PushBandClip(c, hBand, firstDataX, bandX, bandW, rightX,
+                                       pinnedW, pinnedRW, y, headerH, clipRight);
+            }
+            hcl = headerColumn.x;
+            int effTitleTop = (col.band == "" && bandLevels > 0) ? y : titleTop;
+            int effTitleH = (col.band == "" && bandLevels > 0) ? headerH : titleRowH;
+            int titleId = app.focus.AllocId();
+            int menuId = -1;
+            if (col.filterable || col.sortable) { menuId = app.focus.AllocId(); }
+            int rzId = app.focus.AllocId();
+            int gripId = app.focus.AllocId();
+
+            int bandL = DataTable.BandLeft(headerColumn.band, firstDataX, bandX, rightX);
+            int bandR = DataTable.BandRight(headerColumn.band, firstDataX, bandX, bandW,
+                                            rightX, pinnedW, pinnedRW, clipRight);
+            if (hcl + cw <= bandL || hcl >= bandR) {
+                hoi = hoi + 1;
+            } else {
+                hx = hcl;
+                int visX = hx;
+                if (visX < bandL) { visX = bandL; }
+                int visR = hx + cw;
+                if (visR > bandR) { visR = bandR; }
+                int visW = visR - visX;
+                if (colDragging && dropVisLocal < 0 && app.mouseX < hx + cw / 2) {
+                    dropVisLocal = hoi;
+                    dropX = visX;
+                }
+                int pad = t.paddingSmall;
+                bool hHover = app.mouseX >= visX && app.mouseX < visR
+                              && app.mouseY >= effTitleTop && app.mouseY < effTitleTop + effTitleH;
+                if (hHover) { c.FillRect(visX, effTitleTop, visW, effTitleH, sHeaderHover.BgOr(0)); }
+
+                int gripW = 0;
+                bool showGrip = hHover || st.dragCol == i || touchUi;
+                if (showGrip) { gripW = pad + app.Scale(7); }
+
+                int availTitle = cw - pad * 2 - menuIconW - gripW;
+                string ht = DataTable.Truncate(col.title, fs, availTitle);
+                int ty = Canvas.CenterTextY(effTitleTop, effTitleH, fs);
+                int titleTextX = hx + pad;
+                if (showGrip) { titleTextX = hx + gripW; }
+                c.DrawText(titleTextX, ty, ht, sHeader.FgOr(0), fs);
+                if (showGrip) {
+                    bool gripHot = app.mouseX >= hx && app.mouseX < hx + gripW
+                                   && app.mouseY >= effTitleTop && app.mouseY < effTitleTop + effTitleH;
+                    int gCol = sIcon.FgOr(0);
+                    if (gripHot || st.dragCol == i) { gCol = sIconSel.FgOr(0); }
+                    DataTable.DrawGrip(app, hx, effTitleTop, gripW, effTitleH, gCol);
+                    app.hitTester.RegisterRect(gripId, hx, effTitleTop, gripW, effTitleH, 0);
+                    if (gripHot && evt == 2 && app.window.EventButton() == 0) {
+                        st.dragCol = i;
+                        st.dragColStartX = app.mouseX;
+                        st.dragColMoved = false;
+                        if (touchUi) { app.ClaimDrag(); }
+                    }
+                }
+
+                int spos = DataTable.SortIndexOf(st, i);
+                if (spos >= 0) {
+                    string arrow = "arrow-up";
+                    if (st.sortKeys[spos].dir == 2) { arrow = "arrow-down"; }
+                    int aw = app.Scale(12);
+                    int ax = titleTextX + Canvas.MeasureText(ht, fs) + app.Scale(4);
+                    c.DrawGlyph(arrow, ax, effTitleTop + (effTitleH - aw) / 2, aw, sIconSel.FgOr(0));
+                    if (st.sortKeys.Count > 1) {
+                        c.DrawText(ax + aw + app.Scale(1), ty,
+                                   Convert.ToString(spos + 1), sIconSel.FgOr(0), Style.FontFallback(app, "small"));
+                    }
+                }
+
+                if (menuId >= 0) {
+                    int mIx = hx + cw - menuIconW - app.Scale(1);
+                    bool active = st.filters[i].Active();
+                    bool cellHover = app.mouseX >= visX && app.mouseX < visR
+                                     && app.mouseY >= effTitleTop && app.mouseY < effTitleTop + effTitleH;
+                    bool showIcon = active || cellHover || st.openMenu == i || touchUi;
+                    if (showIcon) {
+                        int mColor = sIcon.FgOr(0);
+                        if (active) { mColor = sIconSel.FgOr(0); }
+                        if (app.focus.IsHovered(menuId)) { mColor = sIconHover.FgOr(0); }
+                        c.DrawGlyphIn("filter", mIx, effTitleTop, menuIconW, effTitleH, app.Scale(10), mColor);
+                        app.hitTester.RegisterRect(menuId, mIx, effTitleTop, menuIconW, effTitleH, 0);
+                        int iconEvt = st.openMenu >= 0 ? app.EventKind() : evt;
+                        if (!st.dragColMoved && iconEvt == 3 && app.window.EventButton() == 0
+                            && !app.LongPressFired()
+                            && app.hitTester.HitTest(app.mouseX, app.mouseY) == menuId
+                            && app.ClickFrameCurrent()) {
+                            if (st.openMenu == i) { st.openMenu = -1; } else {
+                                DataTable.OpenFilterMenu(st, cols, src, i);
+                            }
+                            app.RequestRedraw();
+                        } else if (touchUi && st.openMenu < 0 && !st.hdrCtxOpen
+                                   && app.PollLongPress(menuId)) {
+                            DataTable.OpenHdrMenu(st);
+                            st.hdrCtxCol = i;
+                            st.hdrCtxX = app.mouseX;
+                            st.hdrCtxY = app.mouseY;
+                            st.hitCol = i;
+                            app.RequestRedraw();
+                        }
+                    }
+                }
+
+                int titleX = visX + gripW;
+                int titleW = visW - menuIconW - gripW;
+                if (titleW < 0) { titleW = 0; }
+                app.hitTester.RegisterRectL(titleId, titleX, effTitleTop, titleW, effTitleH, 0,
+                                            DataTable.ColTitle(cols, i));
+
+                if (cols[i].description.Length > 0 && !touchUi
+                    && !st.editing && !st.ctxOpen && !st.hdrCtxOpen && !st.chartOpen
+                    && !st.colChooserOpen && st.openMenu < 0 && !st.rangeDrag
+                    && !st.rowSelDrag && st.dragRow < 0 && st.dragCol < 0
+                    && !app.PointerCaptured() && !app.HasOverlays()
+                    && !(evt == 2 && app.window.EventButton() == 1)) {
+                    bool hdrHover = app.mouseX >= titleX && app.mouseX < titleX + titleW
+                                    && app.mouseY >= effTitleTop
+                                    && app.mouseY < effTitleTop + effTitleH;
+                    if (hdrHover) {
+                        int tipNowMs = Window.GetTickMs();
+                        if (st.hdrTipCol != i) {
+                            st.hdrTipCol = i;
+                            st.hdrTipSinceMs = tipNowMs;
+                        }
+                        if (tipNowMs - st.hdrTipSinceMs < Tooltip.DefaultDelayMs()) {
+                            app.RequestAnimationFrameIn(0, titleX, effTitleTop, titleW, effTitleH);
+                        } else if (app.hitTester.HitTest(app.mouseX, app.mouseY) == titleId) {
+                            Tooltip.RequestBox(app, titleX, effTitleTop, titleW, effTitleH,
+                                               DataTable.ColTitle(cols, i) + "\n"
+                                               + cols[i].description,
+                                               Tooltip.Bottom(), app.Scale(320));
+                        }
+                    } else if (st.hdrTipCol == i) { st.hdrTipCol = -1; }
+                } else if (st.hdrTipCol == i) { st.hdrTipCol = -1; }
+
+                if (st.dragCol == i && app.focus.pressedId >= 0) {
+                    int dd = app.mouseX - st.dragColStartX;
+                    if (dd < 0) { dd = 0 - dd; }
+                    if (!st.dragColMoved && dd > app.Scale(2)) {
+                        st.dragColMoved = true;
+                    }
+                    if (st.dragColMoved) { app.RequestRedraw(); }
+                }
+                if (colDragging && st.dragCol == i) {
+                    c.FillRect(visX, effTitleTop, visW, effTitleH, sHeaderHover.BgOr(0));
+                }
+                if (col.sortable && !st.dragColMoved && evt == 3 && app.window.EventButton() == 0 && app.ClickTarget() == titleId) {
+                    if (!app.LongPressFired()) {
+                        st.hitCol = i;
+                        st.HeaderClick.Raise();
+                        bool addSort = Modifiers.HasShift(app.window.EventMods());
+                        DataTable.CycleSort(st, i, addSort);
+                        st.dirty = true;
+                        st.Sort.Raise();
+                    }
+                    app.RequestRedraw();
+                }
+
+                if (evt == 2 && app.window.EventButton() == 1
+                    && st.openMenu < 0
+                    && app.mouseX >= hx && app.mouseX < hx + cw
+                    && app.mouseY >= effTitleTop && app.mouseY < effTitleTop + effTitleH) {
+                    st.hdrTipCol = -1;
+                    Tooltip.Cancel();
+                    DataTable.OpenHdrMenu(st);
+                    st.hdrCtxCol = i;
+                    st.hdrCtxX = app.mouseX;
+                    st.hdrCtxY = app.mouseY;
+                    st.hitCol = i;
+                    app.RequestRedraw();
+                }
+
+                int rzW = app.Scale(6);
+                int rzPad = touchUi ? app.Scale(6) : 0;
+                int rzX = hx + cw - rzW / 2 - rzPad;
+                int rzHitW = rzW + rzPad * 2;
+                if (rzPad > 0 && menuId >= 0) {
+                    int rzR = rzX + rzHitW;
+                    int iconL = hx + cw - menuIconW - app.Scale(1);
+                    if (rzR > iconL) { rzR = iconL; }
+                    if (rzR > hx + cw) { rzR = hx + cw; }
+                    rzX = rzR - rzHitW;
+                    if (rzX < visX) { rzX = visX; }
+                    rzHitW = rzR - rzX;
+                }
+                int rzCursor = 4;
+                if (!col.resizable) { rzCursor = 6; }
+                app.hitTester.RegisterRect(rzId, rzX, effTitleTop, rzHitW, effTitleH, rzCursor);
+                if (col.resizable && evt == 2 && app.window.EventButton() == 0 && app.PressTarget() == rzId) {
+                    if (Ui.DoubleClicked(app, rzId) || app.DoubleClickNow()) {
+                        DataTable.AutoFitColumn(app, cols, src, st, i);
+                        st.resizeCol = -1;
+                        app.RequestRedraw();
+                    } else {
+                        st.resizeCol = i;
+                        st.resizeStartX = app.mouseX;
+                        st.resizeStartW = st.colWidths[i];
+                    }
+                }
+                if (col.resizable && st.resizeCol == i && app.focus.pressedId == rzId) {
+                    int nw = st.resizeStartW + (app.mouseX - st.resizeStartX);
+                    if (nw < app.Scale(48)) { nw = app.Scale(48); }
+                    if (nw != st.colWidths[i]) {
+                        st.colWidths[i] = nw;
+                        st.hitCol = i;
+                        st.ColumnResize.Raise();
+                        app.RequestRedraw();
+                    }
+                }
+
+                if (st.resizeCol == i && evt == 3 && app.window.EventButton() == 0) {
+                    st.hitCol = i;
+                    st.resizeCol = -1;
+                    st.ColumnResizeEnd.Raise();
+                }
+
+                c.FillRect(hx + cw, titleTop, 1, titleRowH, gridColor);
+                hoi = hoi + 1;
+            }
+        }
+        if (hBand >= 0) { c.PopClip(); }
+
+        if (st.openMenu >= 0 && openMenuAtStart >= 0
+            && st.openMenu == openMenuAtStart
+            && app.EventKind() == 3 && app.ClickFrameCurrent()
+            && app.window.EventButton() == 0
+            && !st.dragColMoved
+            && app.mouseY >= y && app.mouseY < y + headerH) {
+            st.openMenu = -1;
+            app.RequestRedraw();
+        }
+        c.FillRect(x, y + headerH - 1, viewW, 1, gridColor);
+
+        // 列拖拽反馈与放置
+        if (colDragging) {
+            if (dropVisLocal < 0) { dropX = hx; }
+            int indCol = sAccent.BgOr(0);
+            int lineW = app.Scale(2);
+            c.FillRect(dropX - lineW / 2, y, lineW, headerH, indCol);
+
+            int caretH = app.Scale(4);
+            for (int dy = 0; dy < caretH; dy = dy + 1) {
+                int halfW = caretH - dy;
+                c.FillRect(dropX - halfW, y + dy, halfW * 2, 1, indCol);
+            }
+            for (int dy = 0; dy < caretH; dy = dy + 1) {
+                int halfW = dy + 1;
+                c.FillRect(dropX - halfW, y + headerH - caretH + dy, halfW * 2, 1, indCol);
+            }
+
+            string dl = cols[st.dragCol].title;
+            int chW = Canvas.MeasureText(dl, fs) + app.Scale(18);
+            int chH = titleRowH - app.Scale(6);
+            int chX = app.mouseX - chW / 2;
+            int chY = app.mouseY - chH / 2;
+            if (chX < x) { chX = x; }
+            if (chX + chW > x + viewW) { chX = x + viewW - chW; }
+            if (chY < y - app.Scale(20)) { chY = y - app.Scale(20); }
+            if (chY + chH > y + headerH + app.Scale(40)) { chY = y + headerH + app.Scale(40) - chH; }
+
+            c.FillRoundRect(chX + 1, chY + 2, chW, chH, t.borderRadiusSmall, 0x40000000);
+            c.FillRoundRect(chX, chY, chW, chH, t.borderRadiusSmall, DataTable.ColorAlpha(sAccent.BgOr(0), 220));
+            c.DrawRoundRect(chX, chY, chW, chH, t.borderRadiusSmall, 1, DataTable.ColorAlpha(sAccent.FgOr(0), 120));
+            c.DrawText(chX + app.Scale(9),
+                       Canvas.CenterTextY(chY, chH, fs), dl, sAccent.FgOr(0), fs);
+        }
+
+        if (colDragging && app.focus.pressedId >= 0) { st.dropVis = dropVisLocal; }
+
+        if (st.dragCol >= 0 && app.focus.pressedId < 0) {
+            bool toPanel = st.showGroupPanel && st.dragColMoved
+                && app.mouseX >= x && app.mouseX < x + viewW
+                && app.mouseY >= panelY && app.mouseY < panelY + groupPanelH;
+            if (toPanel) {
+                List<GroupChipGeometry> groupChips = DataTable.GroupChipLayout(app, cols, st, x);
+                DataTable.GroupByAt(st, st.dragCol,
+                                    DataTable.GroupDropSlot(app, groupChips));
+                st.GroupChanged.Raise();
+            } else if (st.dragColMoved) {
+                int beforeCol = -1;
+                if (st.dropVis >= 0 && st.dropVis < frameColumns.Count) {
+                    beforeCol = frameColumns[st.dropVis].column;
+                }
+                if (beforeCol != st.dragCol) {
+                    DataTable.MoveColumn(st, st.dragCol, beforeCol);
+                    st.hitCol = st.dragCol;
+                    st.ColumnReorder.Raise();
+                }
+            }
+            st.dragCol = -1;
+            st.dragColMoved = false;
+            st.dropVis = -1;
+            app.RequestRedraw();
+        }
+    }
+}

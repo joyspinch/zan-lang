@@ -1754,6 +1754,32 @@ static WKWebsiteDataStore *wv_store_for_profile(const char *profile_id) {
     return ds ? ds : [WKWebsiteDataStore defaultDataStore];
 }
 
+@interface ZanWKWebView : WKWebView
+@end
+
+@implementation ZanWKWebView
+- (NSView *)hitTest:(NSPoint)point {
+    if (self.isHidden || self.alphaValue <= 0.001) return nil;
+    if (self.layer.mask) {
+        CAShapeLayer *mask = (CAShapeLayer *)self.layer.mask;
+        if ([mask isKindOfClass:[CAShapeLayer class]] && mask.path) {
+            /* point passed into hitTest: is in self.superview coordinates.
+             * First convert to local view coordinates: */
+            NSPoint local = [self convertPoint:point fromView:self.superview];
+            /* Since the view is flipped (top-left origin), and mask.path is defined
+             * in bottom-left origin CoreGraphics space, convert local.y to CG Y: */
+            CGPoint p = CGPointMake(local.x, self.bounds.size.height - local.y);
+            if (!CGPathContainsPoint(mask.path, NULL, p, false)) {
+                /* Point falls into the occluded/cutout region (e.g. dropdown menu).
+                 * Return nil to let click pass through to the host ZanView. */
+                return nil;
+            }
+        }
+    }
+    return [super hitTest:point];
+}
+@end
+
 EXPORT i32 zan_gui_webview_create(iptr hwnd_val, const char *profile_id) {
     ZAN_MAC_ENSURE_MAIN_THREAD(zan_gui_webview_create(hwnd_val, profile_id));
     zan_mwin_t *mw = mwin_find(hwnd_val);
@@ -1775,8 +1801,8 @@ EXPORT i32 zan_gui_webview_create(iptr hwnd_val, const char *profile_id) {
             [cfg.preferences setValue:@YES forKey:@"developerExtrasEnabled"];
             WKWebsiteDataStore *ds = wv_store_for_profile(profile_id);
             if (ds) cfg.websiteDataStore = ds;
-            WKWebView *wv = [[WKWebView alloc] initWithFrame:NSMakeRect(0, 0, 100, 100)
-                                               configuration:cfg];
+            ZanWKWebView *wv = [[ZanWKWebView alloc] initWithFrame:NSMakeRect(0, 0, 100, 100)
+                                                     configuration:cfg];
             [cfg release];
             ZanWebViewDelegate *d = [[ZanWebViewDelegate alloc] init];
             d.slot = slot;
@@ -1844,6 +1870,77 @@ EXPORT void zan_gui_webview_destroy(i32 h) {
     free(w->msgBuf);
     for (int i = 0; i < w->msgCount; i++) free(w->msgQ[i]);
     memset(w, 0, sizeof(*w));
+}
+
+EXPORT void zan_gui_window_snapshot(iptr hwnd_val, const char *out_png_path) {
+    ZAN_MAC_ENSURE_MAIN_THREAD_VOID(zan_gui_window_snapshot(hwnd_val, out_png_path));
+    zan_mwin_t *mw = mwin_find(hwnd_val);
+    if (!mw && hwnd_val == 0 && g_mwin_count > 0) mw = &g_mwins[0];
+    if (!mw || !mw->view || !out_png_path || !*out_png_path) return;
+    @autoreleasepool {
+        ZanView *zv = (ZanView *)mw->view;
+        NSRect r = [zv bounds];
+        int w = (int)r.size.width;
+        int h = (int)r.size.height;
+        NSBitmapImageRep *rep = [[NSBitmapImageRep alloc]
+            initWithBitmapDataPlanes:NULL
+                          pixelsWide:w
+                          pixelsHigh:h
+                       bitsPerSample:8
+                     samplesPerPixel:4
+                            hasAlpha:YES
+                            isPlanar:NO
+                      colorSpaceName:NSDeviceRGBColorSpace
+                         bytesPerRow:w * 4
+                        bitsPerPixel:32];
+        if (rep) {
+            NSGraphicsContext *gc = [NSGraphicsContext graphicsContextWithBitmapImageRep:rep];
+            [NSGraphicsContext saveGraphicsState];
+            [NSGraphicsContext setCurrentContext:gc];
+            CGContextRef ctx = (CGContextRef)[gc CGContext];
+
+            /* 1. Base layer: Zan software GUI canvas (titlebar, tabs, menus) */
+            IOSurfaceRef surf = zv->iosurf[zv->backingIdx];
+            if (surf) {
+                IOSurfaceLock(surf, kIOSurfaceLockReadOnly, NULL);
+                void *base = IOSurfaceGetBaseAddress(surf);
+                size_t bpr = IOSurfaceGetBytesPerRow(surf);
+                CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+                CGContextRef sctx = CGBitmapContextCreate(base, zv->ioW, zv->ioH, 8, bpr, cs,
+                    kCGBitmapByteOrder32Little | kCGImageAlphaPremultipliedFirst);
+                CGImageRef img = sctx ? CGBitmapContextCreateImage(sctx) : NULL;
+                if (img) {
+                    CGContextSaveGState(ctx);
+                    CGContextTranslateCTM(ctx, 0, h);
+                    CGContextScaleCTM(ctx, 1.0, -1.0);
+                    CGContextDrawImage(ctx, CGRectMake(0, 0, w, h), img);
+                    CGContextRestoreGState(ctx);
+                    CGImageRelease(img);
+                }
+                if (sctx) CGContextRelease(sctx);
+                CGColorSpaceRelease(cs);
+                IOSurfaceUnlock(surf, kIOSurfaceLockReadOnly, NULL);
+            }
+
+            /* 2. Subviews: WKWebView instances with their layer mask */
+            for (NSView *sub in zv.subviews) {
+                if ([sub isHidden]) continue;
+                NSRect subFrame = sub.frame;
+                NSBitmapImageRep *subRep = [sub bitmapImageRepForCachingDisplayInRect:sub.bounds];
+                if (subRep) {
+                    [sub cacheDisplayInRect:sub.bounds toBitmapImageRep:subRep];
+                    [subRep drawInRect:subFrame];
+                }
+            }
+
+            [NSGraphicsContext restoreGraphicsState];
+            NSData *png = [rep representationUsingType:NSBitmapImageFileTypePNG properties:@{}];
+            if (png) {
+                [png writeToFile:[NSString stringWithUTF8String:out_png_path] atomically:YES];
+            }
+            [rep release];
+        }
+    }
 }
 
 EXPORT void zan_gui_webview_set_frame(i32 h, i32 x, i32 y, i32 w, i32 hh) {
@@ -1927,10 +2024,9 @@ EXPORT void zan_gui_webview_set_clip(i32 h, const char *spec) {
             CGFloat ly = (CGFloat)ry / scale - frame.origin.y;
             CGFloat rwPoints = (CGFloat)rw / scale;
             CGFloat rhPoints = (CGFloat)rh / scale;
-            /* In CoreAnimation CAShapeLayer, CGPath coordinates are always in
-             * native Quartz 2D space (origin (0,0) at bottom-left), regardless of
-             * view or layer flipped flags. Convert top-relative ly into Quartz space: */
-            CGFloat layerY = fh - ly - rhPoints;
+            /* In CoreGraphics (bottom-left origin), the Y coordinate for a top-origin
+             * rect [ly, ly + rhPoints] of a view with height fh is fh - (ly + rhPoints): */
+            CGFloat layerY = fh - (ly + rhPoints);
             CGPathAddRect(path, NULL,
                           CGRectMake(lx, layerY, rwPoints, rhPoints));
             rects++;
@@ -1947,11 +2043,13 @@ EXPORT void zan_gui_webview_set_clip(i32 h, const char *spec) {
         wv.wantsLayer = YES;
         if (rects == 1 && whole) {
             wv.layer.mask = nil;
+            fprintf(stderr, "[ZAN_CLIP] h=%d rects=1 whole=1 (no mask) spec=%s\n", (int)h, spec);
         } else {
             CAShapeLayer *mask = [CAShapeLayer layer];
             mask.frame = wv.layer.bounds;
             mask.path = path;
             wv.layer.mask = mask;
+            fprintf(stderr, "[ZAN_CLIP] h=%d rects=%d whole=%d (mask applied) spec=%s\n", (int)h, rects, whole, spec);
         }
         CGPathRelease(path);
         [wv setHidden:NO];
@@ -1962,6 +2060,7 @@ EXPORT void zan_gui_webview_set_clip(i32 h, const char *spec) {
 
 EXPORT void zan_gui_webview_navigate(i32 h, const char *url) {
     ZAN_MAC_ENSURE_MAIN_THREAD_VOID(zan_gui_webview_navigate(h, url));
+    fprintf(stderr, "[ZAN_NAV] h=%d url=%s\n", (int)h, url ? url : "(null)");
     WKWebView *wv = wv_get(h);
     if (!wv || !url || !*url) return;
     @autoreleasepool {

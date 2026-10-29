@@ -65,6 +65,66 @@ class HardeningProgram {
         DbResult rTotal = zanSql.Query("SELECT COUNT(*) FROM items");
         Console.WriteLine("total items: " + Convert.ToString(rTotal.GetInt(0, 0)));
 
+        // 7. 自适应主键（非 "id" 字段）WherePk 测试
+        db.Execute("CREATE TABLE orders (order_no INTEGER PRIMARY KEY, note TEXT)");
+        db.Execute("INSERT INTO orders (order_no, note) VALUES (1001, 'Order 1001')");
+        db.Execute("INSERT INTO orders (order_no, note) VALUES (1002, 'Order 1002')");
+
+        OrmMeta orderMeta = OrmMeta.Of("Order", "orders");
+        orderMeta.Col("order_no", "OrderNo", DbParams.KindInt, true, true, false, true, 0);
+        orderMeta.Col("note", "Note", DbParams.KindText, false, false, false, true, 100);
+        orderMeta.Seal();
+
+        OrmSelect selOrder = OrmSelect.Create(db, orderMeta);
+        selOrder.WherePk(1001);
+        DbResult rOrder = selOrder.Rows();
+        Console.WriteLine("order 1001 count: " + Convert.ToString(rOrder.RowCount()));
+        Console.WriteLine("order 1001 note: " + rOrder.GetString(0, 1));
+
+        OrmDelete delOrder = OrmDelete.Create(db, orderMeta);
+        delOrder.WherePk(1002);
+        int delAff = delOrder.ExecuteAffrows();
+        Console.WriteLine("order 1002 deleted: " + Convert.ToString(delAff));
+
+        // 8. TransactionScope 异常安全回滚测试
+        TransactionScope scope = TransactionScope.Create(db);
+        db.Execute("INSERT INTO orders (order_no, note) VALUES (1003, 'Order 1003')");
+        // 未调用 scope.Complete() 直接 Dispose
+        scope.Dispose();
+
+        DbResult r1003 = db.Query("SELECT COUNT(*) FROM orders WHERE order_no = 1003");
+        Console.WriteLine("order 1003 after abort: " + Convert.ToString(r1003.GetInt(0, 0)));
+
+        // 9. 安全防护：标识符注入拦截测试
+        bool caughtDotDot = false;
+        try {
+            QueryBuilder.RequireIdent("users..hack");
+        } catch (Exception _e1) {
+            caughtDotDot = true;
+        }
+        Console.WriteLine("caught dot dot: " + (caughtDotDot ? "1" : "0"));
+
+        bool caughtTrailingDot = false;
+        try {
+            QueryBuilder.RequireIdent("users.");
+        } catch (Exception _e2) {
+            caughtTrailingDot = true;
+        }
+        Console.WriteLine("caught trailing dot: " + (caughtTrailingDot ? "1" : "0"));
+
+        // 10. 安全防护：WhereIn 2000 超限拒绝服务防护
+        List<int> largeList = new List<int>();
+        for (int li = 0; li < 2005; li = li + 1) {
+            largeList.Add(li);
+        }
+        bool caughtLargeIn = false;
+        try {
+            selOrder.WhereIn("order_no", largeList);
+        } catch (Exception _e3) {
+            caughtLargeIn = true;
+        }
+        Console.WriteLine("caught large WhereIn: " + (caughtLargeIn ? "1" : "0"));
+
         // 6. 析构与 Dispose 释放闭环
         db.Dispose();
         if (File.Exists(path)) { File.Delete(path); }

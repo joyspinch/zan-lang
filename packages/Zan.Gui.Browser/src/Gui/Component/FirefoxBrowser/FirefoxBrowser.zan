@@ -1,0 +1,232 @@
+using System;
+using Gui;
+using Gui.Widget;
+
+namespace Gui.Component.FirefoxBrowser;
+
+/// <summary>
+/// 火狐 Gecko 进程内嵌入式浏览器对象
+/// 承载 C-ABI 视口句柄、生命周期、智能体代理与渲染裁剪
+/// </summary>
+public class FirefoxBrowser {
+    public nint handle;
+    public int contextId;
+    public FingerprintProfile fingerprint;
+    public string initialUrl;
+
+    public UiEvent NavStart;
+    public UiEvent NavComplete;
+    public UiEvent TitleChanged;
+    public UiEvent LoadingChanged;
+
+    FirefoxAgentTab agent;
+    bool created;
+    public int viewId;
+    string pendingUrl;
+    string lastTitle;
+    string lastUrl;
+    int lastX;
+    int lastY;
+    int lastW;
+    int lastH;
+    bool lastVisible;
+
+    public FirefoxBrowser(int userContextId, FingerprintProfile profile) {
+        this.handle = 0;
+        this.contextId = userContextId;
+        this.fingerprint = (profile != null) ? profile : FingerprintProfile.CleanDefault();
+        this.initialUrl = "";
+        this.pendingUrl = "";
+        this.lastTitle = "";
+        this.lastUrl = "";
+        this.created = false;
+        this.lastX = -1;
+        this.lastY = -1;
+        this.lastW = -1;
+        this.lastH = -1;
+        this.lastVisible = false;
+
+        this.NavStart = new UiEvent();
+        this.NavComplete = new UiEvent();
+        this.TitleChanged = new UiEvent();
+        this.LoadingChanged = new UiEvent();
+    }
+
+    public FirefoxBrowser() : this(0, null) { }
+
+    public FirefoxAgentTab GetAgent() {
+        if (this.agent == null && this.handle != 0) {
+            this.agent = new FirefoxAgentTab(this.handle, this.contextId);
+        }
+        return this.agent;
+    }
+
+    public void Navigate(string target) {
+        this.pendingUrl = target;
+        if (this.handle != 0 && FirefoxCore.PfnNavigate != 0) {
+            GeckoNavigateFn fn = (GeckoNavigateFn)FirefoxCore.PfnNavigate;
+            fn(this.handle, target);
+        }
+    }
+
+    public void Back() {
+        if (this.handle != 0 && FirefoxCore.PfnGoBack != 0) {
+            GeckoActionFn fn = (GeckoActionFn)FirefoxCore.PfnGoBack;
+            fn(this.handle);
+        }
+    }
+
+    public void Forward() {
+        if (this.handle != 0 && FirefoxCore.PfnGoForward != 0) {
+            GeckoActionFn fn = (GeckoActionFn)FirefoxCore.PfnGoForward;
+            fn(this.handle);
+        }
+    }
+
+    public void Reload() {
+        if (this.handle != 0 && FirefoxCore.PfnReload != 0) {
+            GeckoActionFn fn = (GeckoActionFn)FirefoxCore.PfnReload;
+            fn(this.handle);
+        }
+    }
+
+    public void Hide() {
+        if (this.viewId > 0) {
+            FirefoxCore.ApplyClip(this.viewId, "");
+        }
+        if (this.handle != 0 && this.lastVisible) {
+            this.lastVisible = false;
+            if (FirefoxCore.PfnSetVisible != 0) {
+                GeckoVisibleFn fn = (GeckoVisibleFn)FirefoxCore.PfnSetVisible;
+                fn(this.handle, false);
+            }
+        }
+    }
+
+    public void Destroy() {
+        if (this.viewId > 0) {
+            NativeLayer.Forget(this.viewId);
+            FirefoxCore.ApplyClip(this.viewId, "");
+        }
+        if (this.handle != 0) {
+            this.Hide();
+            if (FirefoxCore.PfnDestroy != 0) {
+                GeckoActionFn fn = (GeckoActionFn)FirefoxCore.PfnDestroy;
+                fn(this.handle);
+            }
+            this.handle = 0;
+            this.agent = null;
+        }
+    }
+
+    public string CurrentUrl() {
+        if (this.handle != 0 && FirefoxCore.PfnGetUrl != 0) {
+            GeckoGetStringFn fn = (GeckoGetStringFn)FirefoxCore.PfnGetUrl;
+            return fn(this.handle);
+        }
+        return this.pendingUrl;
+    }
+
+    public string CurrentTitle() {
+        if (this.handle != 0 && FirefoxCore.PfnGetTitle != 0) {
+            GeckoGetStringFn fn = (GeckoGetStringFn)FirefoxCore.PfnGetTitle;
+            return fn(this.handle);
+        }
+        return "";
+    }
+
+    public bool CanGoBack() {
+        if (this.handle != 0 && FirefoxCore.PfnCanGoBack != 0) {
+            GeckoGetBoolFn fn = (GeckoGetBoolFn)FirefoxCore.PfnCanGoBack;
+            return fn(this.handle);
+        }
+        return false;
+    }
+
+    public bool CanGoForward() {
+        if (this.handle != 0 && FirefoxCore.PfnCanGoForward != 0) {
+            GeckoGetBoolFn fn = (GeckoGetBoolFn)FirefoxCore.PfnCanGoForward;
+            return fn(this.handle);
+        }
+        return false;
+    }
+
+    public void Render(App app, int x, int y, int w, int h) {
+        if (!this.created) {
+            this.EnsureCreated(app, x, y, w, h);
+        }
+        if (this.handle == 0) return;
+
+        if (x != this.lastX || y != this.lastY || w != this.lastW || h != this.lastH) {
+            this.lastX = x;
+            this.lastY = y;
+            this.lastW = w;
+            this.lastH = h;
+            if (FirefoxCore.PfnSetBounds != 0) {
+                GeckoBoundsFn bfn = (GeckoBoundsFn)FirefoxCore.PfnSetBounds;
+                bfn(this.handle, x, y, w, h);
+            }
+        }
+
+        if (this.viewId > 0) {
+            NativeLayer.Register(app, this.viewId, x, y, w, h, FirefoxCore.ApplyClip);
+        } else {
+            if (!this.lastVisible) {
+                this.lastVisible = true;
+                if (FirefoxCore.PfnSetVisible != 0) {
+                    GeckoVisibleFn vfn = (GeckoVisibleFn)FirefoxCore.PfnSetVisible;
+                    vfn(this.handle, true);
+                }
+            }
+        }
+
+        string curT = this.CurrentTitle();
+        if (curT != "" && curT != this.lastTitle) {
+            this.lastTitle = curT;
+            this.TitleChanged.Raise();
+        }
+
+        string curU = this.CurrentUrl();
+        if (curU != "" && curU != this.lastUrl) {
+            this.lastUrl = curU;
+            this.NavComplete.Raise();
+        }
+    }
+
+    void EnsureCreated(App app, int x, int y, int w, int h) {
+        if (this.created) return;
+        this.created = true;
+
+        if (!FirefoxCore.EnsureLoaded()) return;
+
+        nint parentHwnd = 0;
+        if (app != null && app.window != null) {
+            parentHwnd = app.window.GetHandle();
+        }
+
+        if (FirefoxCore.PfnInit != 0) {
+            GeckoInitFn initFn = (GeckoInitFn)FirefoxCore.PfnInit;
+            initFn(parentHwnd);
+        }
+
+        if (FirefoxCore.PfnCreateWithContext != 0) {
+            GeckoCreateWithContextFn cfn = (GeckoCreateWithContextFn)FirefoxCore.PfnCreateWithContext;
+            string start = (this.pendingUrl != "") ? this.pendingUrl : "about:blank";
+            this.handle = cfn(
+                parentHwnd, x, y, w, h, start, this.contextId,
+                this.fingerprint.webglVendor, this.fingerprint.webglRenderer,
+                this.fingerprint.timezone, this.fingerprint.userAgent
+            );
+
+            if (this.handle != 0 && FirefoxCore.PfnSetFingerprint != 0) {
+                GeckoSetFingerprintFn fpFn = (GeckoSetFingerprintFn)FirefoxCore.PfnSetFingerprint;
+                fpFn(this.handle, this.fingerprint.ToJson());
+            }
+
+            if (this.handle != 0 && FirefoxCore.PfnGetViewId != 0) {
+                GeckoGetIntFn vidFn = (GeckoGetIntFn)FirefoxCore.PfnGetViewId;
+                this.viewId = vidFn(this.handle);
+            }
+        }
+    }
+}
