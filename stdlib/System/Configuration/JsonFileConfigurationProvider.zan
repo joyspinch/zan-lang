@@ -45,13 +45,56 @@ public class JsonFileConfigurationProvider : ConfigurationProvider {
             throw new FileNotFoundException("Configuration file not found: " + this.path);
         }
         string text = File.ReadAllText(this.path);
-        JsonValue root = JsonValue.Parse(text);
+        JsonDoc doc = JsonDoc.Parse(text);
         this.data.Clear();
         string basePrefix = "";
         if (this.rootSection != null && this.rootSection.Length > 0) {
             basePrefix = ConfigurationKeys.Canonical(this.rootSection);
         }
-        this.Flatten(basePrefix, root);
+        this.FlattenDoc(basePrefix, doc, doc.root);
+    }
+
+    // 基于 JsonDoc 扁平磁带展开键值对（零 DOM 节点分配）。
+    private void FlattenDoc(string prefix, JsonDoc doc, int at) {
+        if (doc == null || at < 0 || at >= doc.slotCount) { return; }
+        int k = doc.KindAt(at);
+        if (k == 5) {
+            int n = doc.Count(at);
+            int p = (int)(doc.slots[at].a >> 8);
+            int seen = 0;
+            while (p >= 0 && seen < n) {
+                JsonPair pair = doc.pairs[p];
+                string key = pair.keyStart < 0 ? doc.escPool[pair.keyLen] : doc.src.Substring(pair.keyStart, pair.keyLen);
+                string child = prefix.Length > 0 ? prefix + ":" + key : key;
+                this.FlattenDoc(child, doc, pair.valueSlot);
+                p = pair.nextPair;
+                seen = seen + 1;
+            }
+            return;
+        }
+        if (k == 4) {
+            int n = doc.Count(at);
+            int c = doc.FirstChild(at);
+            for (int i = 0; i < n; i = i + 1) {
+                string idx = Convert.ToString(i);
+                string child = prefix.Length > 0 ? prefix + ":" + idx : idx;
+                this.FlattenDoc(child, doc, c);
+                c = doc.NextSibling(c);
+            }
+            return;
+        }
+        if (k == 3) {
+            this.Set(prefix, doc.StrAt(at, ""));
+            return;
+        }
+        if (k == 2) {
+            this.Set(prefix, doc.StrAt(at, ""));
+            return;
+        }
+        if (k == 1) {
+            this.Set(prefix, doc.BoolAt(at, false) ? "true" : "false");
+            return;
+        }
     }
 
     // 把 JSON 树摊平成配置键。
