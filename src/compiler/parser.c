@@ -502,7 +502,36 @@ static bool paren_is_named_cast(zan_parser_t *p) {
         parser_advance(p);
         parser_advance(p);
     }
-    if (p->current.kind == TK_LBRACKET && zan_lexer_peek(p->lex).kind == TK_RBRACKET) {
+    if (p->current.kind == TK_LESS) {
+        int depth = 1;
+        parser_advance(p);
+        while (depth > 0 && p->current.kind != TK_EOF && p->current.kind != TK_SEMICOLON) {
+            if (p->current.kind == TK_LESS) {
+                depth++;
+            } else if (p->current.kind == TK_GREATER) {
+                depth--;
+            } else if (p->current.kind == TK_GREATER_GREATER) {
+                depth -= 2;
+            } else if (p->current.kind == TK_GREATER_GREATER_GREATER) {
+                depth -= 3;
+            }
+            if (depth <= 0) {
+                parser_advance(p);
+                break;
+            }
+            parser_advance(p);
+        }
+        if (depth > 0) {
+            *p->lex = saved_lex;
+            p->current = saved_cur;
+            p->previous = saved_prev;
+            return false;
+        }
+    }
+    if (p->current.kind == TK_QUESTION) {
+        parser_advance(p);
+    }
+    while (p->current.kind == TK_LBRACKET && zan_lexer_peek(p->lex).kind == TK_RBRACKET) {
         parser_advance(p);
         parser_advance(p);
     }

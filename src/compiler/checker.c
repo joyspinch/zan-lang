@@ -197,15 +197,14 @@ static zan_symbol_t *checker_find_method(zan_symbol_t *type_sym, zan_istr_t name
 
 static zan_symbol_t *checker_find_field(zan_symbol_t *type_sym, zan_istr_t name) {
     while (type_sym) {
-        zan_symbol_t *found = NULL;
-        for (int i = 0; i < type_sym->member_count; i++) {
+        /* 从后往前查找，确保派生类隐藏字段（排在基类复制字段之后）优先命中并提前退出 */
+        for (int i = type_sym->member_count - 1; i >= 0; i--) {
             zan_symbol_t *m = type_sym->members[i];
             if (m && (m->kind == SYM_FIELD || m->kind == SYM_PROPERTY) &&
                 m->name.len == name.len &&
                 memcmp(m->name.str, name.str, (size_t)name.len) == 0)
-                found = m;
+                return m;
         }
-        if (found) return found;
         type_sym = (type_sym->type && type_sym->type->base_type)
             ? type_sym->type->base_type->sym : NULL;
     }
