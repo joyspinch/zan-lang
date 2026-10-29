@@ -1,5 +1,6 @@
 using System;
 using System.IO;
+using System.Interop;
 
 namespace System.IO.Compression;
 
@@ -21,16 +22,19 @@ public class Zip {
     // 压缩级别 1-9（0 = 存储）。返回的字节为完整
     // 归档：本地头 + 数据、中央目录、EOCD。
     public static byte[] Create(List<ZipEntry> entries, int level) {
-        // 第一步：压缩全部数据，以便得知大小。
+        // 第一步：压缩全部数据并缓存结果，消除二次压缩计算与多余内存遍历。
+        List<byte[]> compressedChunks = new List<byte[]>();
         int i = 0;
         for (; i < entries.Count; i = i + 1) {
             ZipEntry e = entries[i];
+            byte[] comp = null;
             if (!e.isDirectory && e.data != null) {
                 e.crc32 = Crc32.Compute(e.data, 0, e.data.Length, 0);
                 e.uncompressedSize = e.data.Length;
                 if (level > 0 && e.data.Length >= 64) {
                     e.method = Zip.MethodDeflate;
-                    e.compressedSize = Deflate.Deflate(e.data, level).Length;
+                    comp = Deflate.Deflate(e.data, level);
+                    e.compressedSize = comp.Length;
                 } else {
                     e.method = Zip.MethodStored;
                     e.compressedSize = e.data.Length;
@@ -40,6 +44,7 @@ public class Zip {
                 e.compressedSize = 0;
                 e.uncompressedSize = 0;
             }
+            compressedChunks.Add(comp);
         }
         // 第二步：计算总大小。
         int total = 0;
@@ -77,25 +82,18 @@ public class Zip {
             Zip.WriteU32(out2, ref pos, e.uncompressedSize);
             Zip.WriteU16(out2, ref pos, nameLen);
             Zip.WriteU16(out2, ref pos, 0);  // 额外字段长度
-            int k = 0;
-            for (; k < nameLen; k = k + 1) {
-                out2[pos + k] = (byte)e.name[k];
+            if (nameLen > 0) {
+                NativeMemory.PutString((nint)out2 + pos, 0, e.name, nameLen);
+                pos = pos + nameLen;
             }
-            pos = pos + nameLen;
             if (e.compressedSize > 0 && e.data != null) {
                 if (e.method == Zip.MethodDeflate) {
-                    byte[] comp = Deflate.Deflate(e.data, level);
-                    k = 0;
-                    while (k < comp.Length) {
-                        out2[pos + k] = comp[k];
-                        k = k + 1;
+                    byte[] comp = compressedChunks[i];
+                    if (comp != null && comp.Length > 0) {
+                        NativeMemory.Copy((nint)out2 + pos, (nint)comp, comp.Length);
                     }
                 } else {
-                    k = 0;
-                    while (k < e.data.Length) {
-                        out2[pos + k] = e.data[k];
-                        k = k + 1;
-                    }
+                    NativeMemory.Copy((nint)out2 + pos, (nint)e.data, e.data.Length);
                 }
                 pos = pos + e.compressedSize;
             }
@@ -124,10 +122,10 @@ public class Zip {
             Zip.WriteU16(out2, ref pos, 0);  // 内部属性
             Zip.WriteU32(out2, ref pos, 0);  // 外部属性
             Zip.WriteU32(out2, ref pos, cdOffsets[i]);
-            for (int k = 0; k < nameLen; k = k + 1) {
-                out2[pos + k] = (byte)e.name[k];
+            if (nameLen > 0) {
+                NativeMemory.PutString((nint)out2 + pos, 0, e.name, nameLen);
+                pos = pos + nameLen;
             }
-            pos = pos + nameLen;
             cdSize = cdSize + 46 + nameLen;
             i = i + 1;
         }
@@ -218,8 +216,8 @@ public class Zip {
         long dataPos = headerEnd;
         if (csize < 0 || dataPos + (long)csize > (long)zip.Length) { return null; }
         byte[] raw = new byte[csize];
-        for (int k = 0; k < csize; k = k + 1) {
-            raw[k] = zip[dataPos + k];
+        if (csize > 0) {
+            NativeMemory.Copy((nint)raw, (nint)zip + (int)dataPos, csize);
         }
         byte[] content = null;
         if (method == Zip.MethodDeflate) {
