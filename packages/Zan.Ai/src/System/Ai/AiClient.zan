@@ -122,37 +122,36 @@ public class AiClient : IDisposable, IChat {
 
         string raw = await this.PostJson(ep, "/chat/completions", body);
         if (raw == null) { return null; }
-        // JsonValue.Parse 对坏 JSON **抛异常**（不是返回 null）——
-        // 解析外部响应必须兜住。
-        JsonValue root = null;
+        JsonDoc doc = null;
         try {
-            root = JsonValue.Parse(raw);
+            doc = JsonDoc.Parse(raw);
         } catch (Exception e) {
             this.lastError = "AI 服务返回的内容无法解析";
             return null;
         }
-        if (root == null) {
+        if (doc == null || doc.root < 0) {
             this.lastError = "AI 服务返回的内容无法解析";
             return null;
         }
-        string errMsg = AiClient.ErrorMessage(root);
+        string errMsg = AiClient.ErrorMessage(doc);
         if (errMsg.Length > 0) {
             this.lastError = errMsg;
             return null;
         }
-        JsonValue choices = root.Get("choices");
-        if (choices == null || !choices.IsArray() || choices.Count() == 0) {
+        int choices = doc.Get(doc.root, "choices");
+        if (choices < 0 || doc.KindAt(choices) != 4 || doc.Count(choices) == 0) {
             this.lastError = "AI 服务没有返回回答";
             return null;
         }
-        JsonValue msg = choices.At(0).Get("message");
-        if (msg == null) {
+        int choice0 = doc.FirstChild(choices);
+        int msg = doc.Get(choice0, "message");
+        if (msg < 0) {
             this.lastError = "AI 服务没有返回回答";
             return null;
         }
         // 记下用量（若服务端口径一致就用服务端的，否则保持估算）。
-        this.CaptureUsage(root);
-        return msg.Str("content", "");
+        this.CaptureUsage(doc);
+        return doc.StrAt(doc.Get(msg, "content"), "");
     }
 
     // ------------------------------------------------------------------
@@ -747,6 +746,15 @@ public class AiClient : IDisposable, IChat {
 
     // 从响应里取错误信息（OpenAI 兼容格式：error.message）。
     // 不是错误返回空串。
+    public static string ErrorMessage(JsonDoc doc) {
+        if (doc == null || doc.root < 0) { return ""; }
+        int err = doc.Get(doc.root, "error");
+        if (err < 0) { return ""; }
+        string msg = doc.StrAt(doc.Get(err, "message"), "");
+        if (msg.Length > 0) { return msg; }
+        return "AI 服务返回错误";
+    }
+
     public static string ErrorMessage(JsonValue root) {
         if (root == null) { return ""; }
         JsonValue err = root.Get("error");
@@ -758,14 +766,14 @@ public class AiClient : IDisposable, IChat {
     private static string HttpErrorMessage(int status, string body) {
         string detail = "";
         if (body != null && body.Length > 0) {
-            JsonValue root = null;
+            JsonDoc doc = null;
             try {
-                root = JsonValue.Parse(body);
+                doc = JsonDoc.Parse(body);
             } catch (Exception e) {
-                root = null;
+                doc = null;
             }
-            if (root != null) {
-                detail = AiClient.ErrorMessage(root);
+            if (doc != null && doc.root >= 0) {
+                detail = AiClient.ErrorMessage(doc);
             }
         }
         if (detail.Length == 0) {
@@ -775,6 +783,16 @@ public class AiClient : IDisposable, IChat {
     }
 
     // 记录用量：服务端口径与本包一致就用服务端的，否则保持估算。
+    private void CaptureUsage(JsonDoc doc) {
+        if (doc == null || doc.root < 0) { return; }
+        int usage = doc.Get(doc.root, "usage");
+        if (usage < 0) { return; }
+        int p = doc.IntAt(doc.Get(usage, "prompt_tokens"), 0);
+        int c = doc.IntAt(doc.Get(usage, "completion_tokens"), 0);
+        if (p <= 0 && c <= 0) { return; }
+        this.lastUsage = new AiUsage(p, c, false);
+    }
+
     private void CaptureUsage(JsonValue root) {
         JsonValue usage = root.Get("usage");
         if (usage == null || !usage.IsObject()) { return; }
