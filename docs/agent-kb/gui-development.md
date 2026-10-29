@@ -1,38 +1,38 @@
 # GUI / 主题 / 设计器 / HMI 开发速查
 
-## 心智模型：立即模式
+## 心智模型：保留模式 Visual Tree 与即时渲染双轨架构
 
-`packages/Zan.Gui/src/Gui` 是**立即模式**（immediate mode）UI：每帧重新绘制并即时判定交互，
-控件没有长生命周期对象树。典型循环（`Gui/App.zan`）：
+`packages/Zan.Gui/src/Gui` 采用**现代保留模式 Visual Tree 拓扑为核心、辅以即时渲染双轨**架构：
+- 控件树（`Control`）具备长生命周期的树状对象图（`parent` 弱引用、`children` 列表、`MeasureTree`、`Arrange` 绝对坐标边界 `bx, by, bw, bh`、`RenderTree` 裁切栈）。
+- 事件分发通过 **Visual Tree 路由分发**（`Tunneling` 隧穿向下 + `Bubbling` 冒泡向上，`RoutedEventArgs` 携带 `originalSource`、`source` 与 `handled` 消费标记，支持指针捕获 `App.CapturePointer`）。
+- 即时模式与动态子元素采用 **作用域 Hash 栈（Scoped ID Hash Stack）** 进行命名空间隔离，完全杜绝硬编码号段魔数。
+
+典型应用程序循环（`Gui/App.zan` / `Form.zan`）：
 
 ```zan
-App app = App.CreateDark("Title", 900, 640);
-app.Show();
-while (app.isRunning) {
-    if (!app.ProcessEvent()) { break; }
-    if (!app.needsRedraw) { continue; }
-    app.BeginFrame();
-    // 这里画内容：控件的静态 Render/Show 方法
-    app.RenderChrome("Title");
-    app.PresentFrame();
-}
+Form form = new MainForm();
+form.Run(); // 自动挂载 rootControl 到 App 并开启事件驱动渲染循环
 ```
 
-由此推出几条**必须遵守**的约定：
+由此推出几条**必须遵守**的现代架构约定：
 
-1. **控件 id 必须每帧稳定**。`WidgetId` 是进程级递增计数器；命中判定用的是上一帧算出的
-   目标。如果某个窗口的绘制顺序/数量在帧间变化，按钮会"点不动"。
-   子窗口的做法见 `ZanIDE.Shell.zan`：进入子窗口帧前 `WidgetId.SetSeq(850000)` 钉一个
-   固定基线，画完 `WidgetId.SetSeq(savedSeq)` 还原。**新增子窗口时照抄这个模式。**
-   已钉的段（seq 域，实际 id = 1000000 + 段值 + n）：Designer `800000/840000/860000`、
-   ZanIDE.Shell `850000`、FilePicker/ChildWindow `900000`、LayerState（可拖动窗口）
-   `930000`。**保留式控件若会在帧中途创建（点击回调里 `new`），绝不能从宿主计数器直接
-   领号**：即时模式宿主每帧 `WidgetId.ResetFrame()` 会回卷重发，领走的正是随后每帧控件
-   的本命 id——表现为"点 A 控件触发 B 控件"的信号污染（gallery 曾是"点 Layer 窗口
-   标题栏弹出 Photos"）。照 `LayerState` 构造器：`SetSeq(段基)` 领号、
-   `SetSeq(outer)` 还原。
-2. **状态放在调用方**，用 `SignalInt` / `Input` 等承载（`Gui/Reactive.zan`、
-   `Widget/Input.zan`），控件本身不存状态。
+1. **事件与输入处理首选 Visual Tree 路由分发**：
+   - 控件重写 `OnRoutedEvent(RoutedEventArgs e)` 或 `OnPreviewRoutedEvent(RoutedEventArgs e)` 处理事件；
+   - 消费事件时显式调用 `e.Handle()`，冒泡派发自动终止；
+   - 拖拽手势（分割条、滑块、窗口移动）在按下时调用 `app.CapturePointer(this)`，释放时调用 `app.ReleasePointerCapture()`，后续位移与抬键直接定向派发，无需各处手动打脏标记。
+
+2. **杜绝硬编码号段魔数，动态/即时组件统一使用作用域 Hash 栈（Scoped ID Stack）**：
+   - **严禁**使用 `WidgetId.SetSeq(850000)` 等魔数号段（已彻底废除，跨实例必冲突踩踏）；
+   - 需局部隔离 ID 空间或循环派生项时，统一使用：
+     ```zan
+     WidgetId.Push("sub_component_name"); // 或 Push(index)
+     // ... 构造控件或执行局部渲染
+     WidgetId.Pop();
+     ```
+   - 栈式 Hash 自动结合父级 Hash 生成均匀分布的高位隔离 ID，天然支持无限层级嵌套与同类组件同屏多实例。
+
+3. **状态响应式绑定**，推荐使用 `Signal<T>` / `SignalInt` / `Input` 等承载（`Gui/Reactive.zan`、
+   `Widget/Input.zan`）或通过 `ModelBinder` 双向绑定，控件负责视觉呈现与交互映射。
 3. **UI 线程专职渲染与交互，一切耗时业务/IO/计算完全异步解耦非阻塞（开发基本铁律）**：
    - **职责边界**：UI 线程（主线程事件循环）有且仅有两项职责：分发操作系统输入事件（按键/鼠标/焦点/窗口尺寸）与推进界面排版绘制（Layout/Paint/Present）。任何单次超过 1~2ms 的操作严禁在 UI 线程执行。
    - **严禁同步阻塞反模式**：严禁在 UI 线程直接执行网络请求（HTTP/WebSocket）、磁盘文件大读写、数据库存取、大 JSON 解析、图像编解码、压缩解压、重 CPU 矩阵/分词计算或同步 `Sleep`。同步阻塞是造成界面掉帧、卡顿、甚至触发系统“未响应”白屏的万恶之源。

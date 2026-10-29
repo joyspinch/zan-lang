@@ -1,0 +1,439 @@
+using System;
+using Gui.Backend;
+
+namespace Gui;
+
+// App.Chrome.zan - 窗口标题栏、胶囊按钮、品牌图标与系统控制区绘制
+public partial class App {
+    // 绘制无边框窗口的标题栏（品牌 + 拖动区域 + 最小化/最大化/关闭
+    // 标题按钮）并处理标题按钮的点击。应
+    // 每帧最后绘制，以便覆盖内容。
+    public void RenderChrome(string title) {
+        // 异形/无边框窗口自成一派：不显示标题栏边框，
+        // 除非应用通过 SetChromeVisible(true) 显式重新启用。
+        if (!showChrome) { return; }
+        StyleBox chromeStyle = Style.Full(this, "titlebar", "", "",
+                                           Style.SNormal());
+        StyleBox brandStyle = Style.Part(this, "titlebar", "brand", "",
+                                         "", "", Style.SNormal());
+        StyleBox titleStyle = Style.Part(this, "titlebar", "title", "",
+                                         "", "", Style.SNormal());
+        StyleBox glassStyle = Style.Part(this, "titlebar", "glass", "",
+                                         "", "", Style.SNormal());
+        StyleBox sheenStyle = Style.Part(this, "titlebar", "sheen", "",
+                                         "", "", Style.SNormal());
+        StyleBox edgeStyle = Style.Part(this, "titlebar", "edge", "",
+                                        "", "", Style.SNormal());
+        StyleBox edgeHighlightStyle = Style.Part(this, "titlebar",
+                                                  "edge-highlight", "",
+                                                  "", "", Style.SNormal());
+        Canvas c = canvas;
+        Theme t = theme;
+        // 阴影带外扩了表面，内容轮廓相对画布原点偏移
+        // (ShapeOffX, ShapeOffY)：标题栏底、边框与整圈按钮
+        // 都以内容区原点定位，不能从 (0,0) 画起。
+        int offX = this.ShapeOffX();
+        int offY = this.ShapeOffY();
+        int W = c.Width() - offX * 2;
+        int hbar = titlebarH;
+        NativeLayer.Occlude(this, offX, offY, W, hbar);
+
+        // 圆角/异形窗口：标题栏按窗口外轮廓圆角化其上角后再上屏。方角
+        // 条先画、圆角条再补一遍是盖不住的——方角条画进角外的
+        // 像素没人擦，尖角原样留在屏上。这里从源头只画一次：
+        // 克隆皮肤声明的标题栏盒子（皮肤可能自带圆角/渐变/各边
+        // 边框，不能改原对象），半径取轮廓圆角，只圆化上角；
+        // 渐变、边框、sheen 各原语都按覆盖率裁角，尖角不会出现。
+        int cr = this.EffectiveCornerRadius();
+        bool shapeTop = cr > 0;
+        if (shapeTop) {
+            chromeStyle = chromeStyle.Clone();
+            chromeStyle.SetRadius(cr);
+            chromeStyle.SetCorners(Corner.Top());
+            chromeStyle.shadow = 0;
+            chromeStyle.blur = 0;
+        }
+        // 在磨砂玻璃皮肤下，标题栏也会磨砂其后的内容
+        // （模糊 + 半透明主题着色 + 微弱白色光泽），
+        // 使边框与玻璃主体协调，而非落在扁平的实色条上。
+        if (t.glass != 0) {
+            // 标题栏是每帧同一个元素：固定身份，永不换槽。
+            int tslot = this.BlurSlotFor(1);
+            bool dirty = this.BackdropDirtyIn(tslot, offX, offY, W, hbar);
+            if (shapeTop) {
+                // 模糊与着色都裁进圆角：方形模糊盖在异形轮廓上，
+                // 角外像素会以不透明玻璃色顶替阴影。
+                c.BlurRoundCached(offX, offY, W, hbar, Scale(22),
+                    tslot, dirty, cr, Corner.Top());
+                c.FillRoundRectIn(offX, offY, W, hbar, cr, Corner.Top(),
+                                  glassStyle.BgOr(0));
+                c.FillRoundRectIn(offX, offY, W, hbar, cr, Corner.Top(),
+                                  sheenStyle.BgOr(0));
+                if (chromeStyle.borderBottomW > 0) {
+                    c.FillRect(offX + cr, offY + hbar - chromeStyle.borderBottomW,
+                               W - cr * 2, chromeStyle.borderBottomW,
+                               chromeStyle.borderBottomColor);
+                }
+            } else {
+                c.BlurRectCached(offX, offY, W, hbar, Scale(22), tslot, dirty);
+                c.FillRect(offX, offY, W, hbar, glassStyle.BgOr(0));
+                c.FillRect(offX, offY, W, hbar, sheenStyle.BgOr(0));
+                if (chromeStyle.borderBottomW > 0) {
+                    c.FillRect(offX, offY + hbar - chromeStyle.borderBottomW, W,
+                               chromeStyle.borderBottomW, chromeStyle.borderBottomColor);
+                }
+            }
+        } else {
+            // 标题栏底交给 StyleBox 标准绘制路径：应用 CSS 写的
+            // 纯色、linear-gradient（含方向/中间停靠点）、各边
+            // 边框、sheen 与 animation 由此全部生效，chrome 不再
+            // 自绘一份只认纯色的底。
+            chromeStyle.Paint(this, offX, offY, W, hbar);
+        }
+
+        int pad = t.paddingLarge + offX;
+        int brand = t.iconSizeSmall;
+        // 品牌图标大小可用 CSS `titlebar::brand { font-size: N; }` 调。
+        if (brandStyle.fontPx > 0) { brand = brandStyle.fontPx; }
+        int brandY = offY + (hbar - brand) / 2;
+        if (chromeBrandIcon != "") {
+            // 应用显式指定了字形图标（图标库里的名字）。
+            c.DrawGlyph(chromeBrandIcon, pad, brandY, brand,
+                        brandStyle.FgOr(0));
+        } else {
+            // 默认画程序自己的图标（exe 内嵌的那份）；取不到才回落到
+            // 占位字形。所有应用共用一个占位图标，标题栏认不出是
+            // 哪个程序——程序图标就在 exe 里，直接用它。
+            string brandKey = this.BrandImageKey();
+            if (brandKey != "") {
+                c.BlitImage(brandKey, pad, brandY, brand, brand, 0, 0, 0, 0);
+            } else {
+                c.DrawGlyph("home", pad, brandY, brand, brandStyle.FgOr(0));
+            }
+        }
+        int titleFs = titleStyle.FontOr(Style.FontFallback(this, "medium"));
+        int txtY = Canvas.CenterTextY(offY, hbar, titleFs);
+        int titleX = pad + brand + t.gapSmall;
+        c.DrawText(titleX, txtY, title,
+                   titleStyle.FgOr(0), titleFs);
+
+        // 应用写入的动态信息紧跟标题；标题按钮之前留一段空白，
+        // 文本挤不进去时整段省略，不与按钮重叠。
+        if (chromeStatus != "" || chromeAccent != "") {
+            StyleBox statusStyle = Style.Part(this, "titlebar", "status", "",
+                                              "", "", Style.SNormal());
+            StyleBox accentStyle = Style.Part(this, "titlebar", "status-accent",
+                                              "", "", "", Style.SNormal());
+            int fsS = statusStyle.FontOr(titleFs);
+            int sy = Canvas.CenterTextY(offY, hbar, fsS);
+            int sx = titleX + Canvas.MeasureText(title, titleFs)
+                     + t.gapLarge;
+            int limit = offX + W - t.paddingLarge;
+            if (showChrome) { limit = limit - ChromeButtonCount() * captionBtnW; }
+            if (chromeStatus != "") {
+                int sw = Canvas.MeasureText(chromeStatus, fsS);
+                if (sx + sw <= limit) {
+                    c.DrawText(sx, sy, chromeStatus, statusStyle.FgOr(0), fsS);
+                    sx = sx + sw + t.gapLarge;
+                }
+            }
+            if (chromeAccent != "") {
+                int aw = Canvas.MeasureText(chromeAccent, fsS);
+                if (sx + aw <= limit) {
+                    c.DrawText(sx, sy, chromeAccent, accentStyle.FgOr(0), fsS);
+                }
+            }
+        }
+
+
+        int themeId = RenderCaptionButtons(c, t, W, hbar);
+
+        // 原生玻璃（分层）窗口没有 OS 投影，其边缘可能
+        // 融入相近的壁纸。为整个窗口描一圈细边
+        // 并加上更亮的顶部高光，使边界清晰可辨。
+        if (glassNative) {
+            int H = c.Height() - offY * 2;
+            c.DrawRect(offX, offY, W, H, edgeStyle.BgOr(0), 1);
+            c.FillRect(offX, offY, W, 1, edgeHighlightStyle.BgOr(0));
+        }
+
+        // 将预设菜单推迟到覆盖层渲染，使其浮于所有
+        // 内容之上，选项命中区获得更高 z 顺序。菜单
+        // 在标题按钮下右对齐；若会裁出边缘则向内微调。
+        if (themeMenuOpen.Get()) {
+            AddOverlay(OverlayPopup.ThemeDrawer(themeMenuBaseId, themeId,
+                themeMenuOpen, themeMenuScroll));
+        }
+    }
+
+    // 标题按钮（主题/置顶/最小化/最大化/关闭）：x 布局、悬停水色、字形、
+    // 命中区与点击处理。返回主题按钮的焦点 id，供
+    // 调用方在其下方锚定主题预设抽屉。
+    int RenderCaptionButtons(Canvas c, Theme t, int W, int hbar) {
+        StyleBox capStyle = Style.Part(this, "titlebar", "cap", "",
+                                       "", "", Style.SNormal());
+        StyleBox capHoverStyle = Style.Part(this, "titlebar", "cap", "",
+                                             "", "", Style.SHover());
+        StyleBox capSelectedStyle = Style.Part(this, "titlebar", "cap", "",
+                                                "", "", Style.SSelected());
+        StyleBox closeHoverStyle = Style.Part(this, "titlebar", "cap", "",
+                                               "danger", "", Style.SHover());
+        int bw = captionBtnW;
+        // 标题按钮固定钉在右上角的标准条带里，高度与标题栏默认高度
+        // 一致。当窗口使用加高品牌栏（如 96px）时，标题按钮与功能胶囊
+        // 仍必须顶在右上角标准高度条带（Scale(36)）内，不随标题栏下沉到中间。
+        int stdCapH = Scale(36);
+        int stripH = hbar > stdCapH ? stdCapH : hbar;
+        // 阴影带把内容轮廓推离画布原点 (offX, offY)：布局先按内容
+        // 宽 W 计算，再整体平移到画布坐标——绘制、命中区与原生
+        // 拖动条带三方才对得上。不偏移的话整排按钮缩进一圈阴影
+        // 带宽，右缘留出一条谁也不属于的空档。
+        int capY = this.ShapeOffY();
+        int bxo = this.ShapeOffX();
+        int closeX = -bw;
+        int nextX = bxo + W;
+        if (isChildWindow) {
+            showThemeButton = false;
+            showPinButton = false;
+        }
+        if (showCloseButton) {
+            closeX = nextX - bw;
+            nextX = closeX;
+        }
+        int maxX = -bw;
+        int minX = -bw;
+        int pinX = -bw;
+        int themeX = -bw;
+        if (showMaximizeButton) { nextX = nextX - bw; maxX = nextX; }
+        if (showMinimizeButton) { nextX = nextX - bw; minX = nextX; }
+        if (showPinButton) { nextX = nextX - bw; pinX = nextX; }
+        if (showThemeButton) { nextX = nextX - bw; themeX = nextX; }
+
+        // 标题按钮的 id 固定在专属段内：它们在一帧的最后分配，
+        // 若跟随帧内计数器，任何条件出现的表面（右键菜单、
+        // 对话框、toast）都会把它们整体挪位，于是上一帧解析出的
+        // 指针目标落到本帧的另一个控件上（信号乱串）。
+        focus.PushIds(990000);
+        int themeId = focus.AllocId();
+        int pinId = focus.AllocId();
+        int minId = focus.AllocId();
+        int maxId = focus.AllocId();
+        int closeId = focus.AllocId();
+        focus.PopIds();
+
+        bool themeH = focus.IsHovered(themeId);
+        bool pinH = focus.IsHovered(pinId);
+        bool minH = focus.IsHovered(minId);
+        bool maxH = focus.IsHovered(maxId);
+        bool closeH = focus.IsHovered(closeId);
+
+        // 标题悬停水色遵循当前主题自身的悬停令牌，使
+        // 窗口控件与每种皮肤保持协调（玻璃/渐变上为半透明水色，
+        // 浅/深色上为主题灰），而非
+        // 固定灰色。关闭按钮保留标志性的 Windows 红色。
+        int capHover = capHoverStyle.BgOr(0);
+        int closeRed = closeHoverStyle.BgOr(0);
+        if (showThemeButton && themeH) {
+            c.FillRect(themeX, capY, bw, stripH, capHover);
+        }
+        if (showPinButton && pinH) {
+            c.FillRect(pinX, capY, bw, stripH, capHover);
+        }
+        if (showMinimizeButton && minH) {
+            c.FillRect(minX, capY, bw, stripH, capHover);
+        }
+        if (showMaximizeButton && maxH) {
+            c.FillRect(maxX, capY, bw, stripH, capHover);
+        }
+        if (showCloseButton && closeH) {
+            // 圆角窗口轮廓下关闭按钮坐在右上圆角里：悬停红也按
+            // 轮廓圆角裁掉右上角，方角红块会顶出轮廓弧、破坏系统圆角或阴影。
+            // 半径收小 2 像素：标题栏圆角的抗锯齿边/描边在弧外留一圈
+            // 浅色月牙，红若与轮廓弧完全同心就盖不住它。
+            int ecr = this.EffectiveCornerRadius();
+            if (ecr > 0) {
+                int crClose = ecr > 2 ? ecr - 2 : ecr;
+                c.FillRoundRectIn(closeX, capY, bw, stripH,
+                                  crClose, Corner.TR(), closeRed);
+            } else {
+                c.FillRect(closeX, capY, bw, stripH, closeRed);
+            }
+        }
+
+        // 标题字形以 Windows 和微信使用的
+        // 小型"标题"字号（约 11px）为基准放大 1.7 倍——在正方形
+        // 按钮格中饱满居中，呈现精致均衡的标题栏。
+        int gl = (t.iconSizeCaption * 17) / 10;
+        // 标题字形大小可用 CSS `titlebar::cap { font-size: N; }` 调。
+        if (capStyle.fontPx > 0) { gl = capStyle.fontPx; }
+        // 主题/置顶字形在视觉上比几何的
+        // 最小化/最大化/关闭笔画更轻，因此绘制时放大约 5% 以显得大小一致。
+        int glBig = (gl * 21) / 20;
+        if (glBig <= gl) { glBig = gl + 1; }
+        int gcolor = capStyle.FgOr(0);
+
+        // 主题控件："调色板"字形；该按钮打开皮肤
+        // 选择抽屉。
+        int themeColor = gcolor;
+        if (themeH || themeMenuOpen.Get()) {
+            themeColor = capHoverStyle.FgOr(0);
+        }
+        string themeIcon = "color";
+        if (showThemeButton) {
+            c.DrawGlyphIn(themeIcon, themeX, capY, bw, stripH, glBig, themeColor);
+        }
+
+        // 置顶：激活时使用强调色 + 实心字形。
+        int pinColor = gcolor;
+        if (pinH) { pinColor = capHoverStyle.FgOr(0); }
+        string pinIcon = "pin";
+        if (isTopmost) {
+            pinIcon = "unpin";
+            pinColor = capSelectedStyle.FgOr(0);
+        }
+        if (showPinButton) {
+            c.DrawGlyphIn(pinIcon, pinX, capY, bw, stripH, glBig, pinColor);
+        }
+
+        int minColor = gcolor;
+        if (minH) { minColor = capHoverStyle.FgOr(0); }
+        if (showMinimizeButton) {
+            c.DrawGlyphIn("minimize", minX, capY, bw, stripH, gl, minColor);
+        }
+
+        string maxName = "maximize";
+        if (window.IsMaximized()) { maxName = "restore"; }
+        int maxColor = gcolor;
+        if (maxH) { maxColor = capHoverStyle.FgOr(0); }
+        if (showMaximizeButton) {
+            c.DrawGlyphIn(maxName, maxX, capY, bw, stripH, gl, maxColor);
+        }
+
+        int xcolor = gcolor;
+        if (closeH) { xcolor = closeHoverStyle.FgOr(0); }
+        if (showCloseButton) {
+            c.DrawGlyphIn("close", closeX, capY, bw, stripH, gl, xcolor);
+        }
+
+        if (showThemeButton) {
+            hitTester.RegisterRect(themeId, themeX, capY, bw, stripH, 3);
+        }
+        if (showPinButton) {
+            hitTester.RegisterRect(pinId, pinX, capY, bw, stripH, 3);
+        }
+        if (showMinimizeButton) {
+            hitTester.RegisterRect(minId, minX, capY, bw, stripH, 3);
+        }
+        if (showMaximizeButton) {
+            hitTester.RegisterRect(maxId, maxX, capY, bw, stripH, 3);
+        }
+        if (showCloseButton) {
+            hitTester.RegisterRect(closeId, closeX, capY, bw, stripH, 3);
+        }
+
+        // 标题栏在宿主 Flush 之后才绘制，而独立 App.Run 根本不 Flush，
+        // 所以提示必须在这里当帧绘制，不能再走 pending 通道。
+        int tipId = 0;
+        int tipX = 0;
+        if (showThemeButton && this.CaptionTipShown(themeId, themeX, bw, stripH)) {
+            Tooltip.RenderAt(this, themeX + bw / 2, capY + stripH, themeTipText,
+                Tooltip.Bottom(), this.Scale(260));
+            tipId = themeId;
+            tipX = themeX;
+        }
+        if (showPinButton && this.CaptionTipShown(pinId, pinX, bw, stripH)) {
+            Tooltip.RenderAt(this, pinX + bw / 2, capY + stripH, pinTipText,
+                Tooltip.Bottom(), this.Scale(260));
+            tipId = pinId;
+            tipX = pinX;
+        }
+        if (showMinimizeButton && this.CaptionTipShown(minId, minX, bw, stripH)) {
+            Tooltip.RenderAt(this, minX + bw / 2, capY + stripH, minimizeTipText,
+                Tooltip.Bottom(), this.Scale(260));
+            tipId = minId;
+            tipX = minX;
+        }
+        if (showMaximizeButton && this.CaptionTipShown(maxId, maxX, bw, stripH)) {
+            string maxTip = maximizeTipText;
+            if (window.IsMaximized()) { maxTip = restoreTipText; }
+            Tooltip.RenderAt(this, maxX + bw / 2, capY + stripH, maxTip,
+                Tooltip.Bottom(), this.Scale(260));
+            tipId = maxId;
+            tipX = maxX;
+        }
+        if (showCloseButton && this.CaptionTipShown(closeId, closeX, bw, stripH)) {
+            Tooltip.RenderAt(this, closeX + bw / 2, capY + stripH, closeTipText,
+                Tooltip.Bottom(), this.Scale(260));
+            tipId = closeId;
+            tipX = closeX;
+        }
+        this.NoteCaptionTip(tipId, tipX, bw, stripH + capY);
+
+        // 标题按钮和其它控件走同一套点击语义：只认主键、只认
+        // 本帧解析出的那个点击目标。以前这里直接对当前坐标做
+        // 命中测试，于是右键松开也会“点”到标题按钮（右键落在
+        // 皮肤按钮上会闪一下抽屉，落在关闭上直接关窗），弹层
+        // 盖住按钮时点击也会同时被两边收下。
+        if (this.EventKind() == 3 && window.EventButton() == 0) {
+            int hit = this.ClickTarget();
+            if (showThemeButton && hit == themeId) {
+                if (!themeMenuOpen.Get()) { themeMenuScroll.Set(0); }
+                themeMenuOpen.Set(!themeMenuOpen.Get());
+                this.NoteRedrawWhy("RenderCaptionButtons");
+                needsRedraw = true;
+            } else if (showPinButton && hit == pinId) {
+                isTopmost = !isTopmost;
+                window.SetTopmost(isTopmost);
+                this.NoteRedrawWhy("RenderCaptionButtons");
+                needsRedraw = true;
+            } else if (showMinimizeButton && hit == minId) {
+                window.Minimize();
+            } else if (showMaximizeButton && hit == maxId) {
+                window.ToggleMaximize();
+            } else if (showCloseButton && hit == closeId) {
+                window.Close();
+            }
+        }
+
+        // 应用功能按钮（SetCaptionActions 注册）：在系统按钮左侧
+        // 依次排开的玻璃胶囊，样式沿用网页 title-bar .btn（半透明
+        // 白底白边白字，悬停变亮）。标准按钮尺寸（2/3 条带高、上限
+        // Scale(24)），与标题按钮一同钉在右上角的标准条带内。
+        if (capActionIds != null) {
+            // 功能胶囊走独立的 `titlebar::action` 样式部件：字号/颜色
+            // 可单独传参，不牵动系统按钮（`titlebar::cap`）的字形大小。
+            // 不设 font-size 时用标准小字号。
+            StyleBox actStyle = Style.Part(this, "titlebar", "action",
+                "", "", "", Style.SNormal());
+            int fs = actStyle.fontPx > 0 ? actStyle.fontPx
+                : (capStyle.fontPx > 0 ? capStyle.fontPx
+                    : Style.FontFallback(this, "small"));
+            int actCol = actStyle.FgOr(0) != 0 ? actStyle.FgOr(0) : 0xFFFFFFFF;
+            int ph2 = stripH * 2 / 3;
+            if (ph2 > Scale(24)) { ph2 = Scale(24); }
+            int py = capY + (stripH - ph2) / 2;
+            int px = nextX - Scale(8);
+            for (int i = capActionIds.Length - 1; i >= 0; i = i - 1) {
+                int tw = Canvas.MeasureText(capActionLabels[i], fs);
+                int pw = tw + Scale(24);
+                px = px - pw;
+                bool actH = focus.IsHovered(capActionIds[i]);
+                c.FillRoundRect(px, py, pw, ph2, Scale(8),
+                    actH ? 0x40FFFFFF : 0x26FFFFFF);
+                c.DrawRoundRect(px, py, pw, ph2, Scale(8),
+                    actH ? 0x66FFFFFF : 0x33FFFFFF, 1);
+                c.DrawText(px + (pw - tw) / 2,
+                    Canvas.CenterTextY(py, ph2, fs),
+                    capActionLabels[i], actCol, fs);
+                hitTester.RegisterRect(capActionIds[i], px, py, pw, ph2, 3);
+                px = px - Scale(8);
+            }
+            // 原生保护带从窗口右缘盖到最左一颗胶囊：条带内的按下
+            // 交给客户区（按钮命中区），而不是当成窗口拖动。
+            // px 已是画布坐标（含左带），c.Width() - px 恰好是
+            // 右锚条带宽度（含右带）。
+            window.SetCaptionZone(c.Width() - px);
+        }
+        return themeId;
+    }
+}

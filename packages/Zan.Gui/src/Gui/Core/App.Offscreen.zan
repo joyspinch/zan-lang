@@ -1,0 +1,182 @@
+using System;
+using Gui.Backend;
+
+namespace Gui;
+
+// App.Offscreen.zan - 离屏视口渲染管线与外部输入事件转发
+public partial class App {
+    bool ReplayOffscreenWheel() {
+        if (window.GetHandle() != 0 || !offscreenWheelPending) { return false; }
+        this.ProcessOffscreenInput(13, offscreenWheelX, offscreenWheelY, 0,
+            offscreenWheelKey, offscreenWheelMods, offscreenWheelFlag);
+        window.localSeq = offscreenWheelSeq;
+        wheelReplayArmed = true;
+        return true;
+    }
+
+    // 离屏输入通过上一帧的命中登记解析，本实例不泵或重写 OS 事件。
+    void ProcessOffscreenInput(int kind, int x, int y, int button,
+            int key, int mods, int flag) {
+        if (window.GetHandle() != 0) { return; }
+        offscreenWheelPending = false;
+        wheelReplayArmed = false;
+        window.SetLocalEvent(kind, x, y, button, key, mods, flag);
+        if (kind == 1 || kind == 2 || kind == 3 || kind == 13) {
+            mouseX = x;
+            mouseY = y;
+            focus.SetHovered(hitTester.HitTest(x, y));
+        }
+        if (kind == 2) {
+            if (button == 1) {
+                rightPressTargetId = hitTester.AnchorAt(2, x, y, menuBlockPrevious);
+                hitTester.ClearAnchor(0);
+            } else {
+                int hit = hitTester.AnchorAt(0, x, y, false);
+                pressTargetId = hit;
+                // 离屏路径的「空处按下即压制释放」沿用；另加与窗口
+                // 路径同源的判据：按在阻挡区（浮层遮罩）上的那次按下
+                // 同样不得把释放解析成下层控件的点击。
+                pressOnBlocker = hit < 0
+                    || hitTester.AnchorTypeOf(0) == 0 - 1;
+                pointerDown = true;
+                focus.SetPressed(hit);
+                focus.SetFocused(hit);
+                hitTester.ClearAnchor(2);
+                hitTester.ClearAnchor(3);
+                this.NotePressStart(hit, x, y);
+            }
+        } else if (kind == 3) {
+            clickSeenSeq = 0 - 1;
+            clickEvSeq = window.EventSeq();
+            if (button == 1) {
+                rightClickTargetId = hitTester.AnchorAt(3, x, y, menuBlockPrevious);
+                hitTester.ClearAnchor(1);
+            } else {
+                int hit = hitTester.AnchorAt(1, x, y, false);
+                pointerDown = false;
+                if (flag == 1 || pressOnBlocker) {
+                    clickTargetId = 0 - 1;
+                    hitTester.ClearAnchor(1);
+                } else {
+                    clickTargetId = hit;
+                    this.NoteClickTarget(hit);
+                }
+                this.NoteRelease(x, y);
+                focus.ClearPress();
+            }
+        } else if (kind == 4 && key == 9) {
+            if (!this.HasOverlays() && !blocksInputBelow && tabHoldId < 0) {
+                focus.FocusStep(Modifiers.HasShift(mods) ? 0 - 1 : 1);
+            }
+        }
+        backdropDirty = kind != 0 && kind != 4 && kind != 5 && kind != 6
+            && (kind != 1 || pointerDown);
+    }
+
+    // 离屏帧只重置本 App 的登记和表面，不泵系统事件或同步平台外壳。
+    void BeginOffscreenFrame() {
+        if (window.GetHandle() != 0) { return; }
+        offscreenFrameParent = App.frameApp;
+        App.frameApp = this;
+        offscreenFrameActive = true;
+        offscreenTooltip = Widget.Tooltip.Suspend();
+        try {
+            lastFrameMs = nowMs;
+            if (!freezeAnimClock) { nowMs = Window.GetTickMs(); }
+            needsRedraw = false;
+            frameSeq = frameSeq + 1;
+            blurSlotSeq = 0;
+            clickClaimed = false;
+            wheelConsumed = false;
+            wheelClaimSeen = false;
+            wheelOwnerOrder = wheelCapOrder;
+            wheelClaimSeq = 0;
+            wheelCapOrder = 0;
+            wheelCapW = 0;
+            wheelCapH = 0;
+            tabHoldId = 0 - 1;
+            inputBlockPrevious = blocksInputBelow;
+            blocksInputBelow = false;
+            menuBlockPrevious = menuBlock;
+            menuBlock = false;
+            this.SyncSkin();
+            partialFrame = false;
+            partialPending = false;
+            paintHashOn = false;
+            glassDeferred = false;
+            hitTester.Clear();
+            focus.ResetIds();
+            glassRects.Clear();
+            overlays.Clear();
+            nativeLayers.Clear();
+            nativeOccluders.Clear();
+            hitOnlyBlockers.Clear();
+            if (shapeMode != 0) {
+                canvas.Clear(0);
+            } else if (glassNative) {
+                canvas.Clear(Style.Part(this, "windowbg", "glass", "", "",
+                    "", Style.SNormal()).BgOr(0));
+            } else {
+                canvas.Clear(Style.Full(this, "windowbg", "", "",
+                    Style.SNormal()).BgOr(0));
+            }
+        } catch (Exception ex) {
+            this.CancelOffscreenFrame();
+            throw ex;
+        }
+    }
+
+    void CancelOffscreenFrame() {
+        if (!offscreenFrameActive) { return; }
+        Widget.Tooltip.Restore(offscreenTooltip);
+        offscreenTooltip = null;
+        App.frameApp = offscreenFrameParent;
+        offscreenFrameParent = null;
+        offscreenFrameActive = false;
+        window.SetLocalEvent(0, mouseX, mouseY, 0, 0, 0, 0);
+    }
+
+    void EndOffscreenFrame() {
+        if (window.GetHandle() != 0 || !offscreenFrameActive) { return; }
+        try {
+            this.RenderFrameOverlays();
+            if (this.FxActive()) {
+                BackdropFx.Render(this, canvas, this.EffectiveFx(), 0, 0,
+                    canvas.Width(), canvas.Height(), nowMs, theme, dpiScale);
+                BackdropFx.TakeDamage();
+            }
+            hitTester.KeepFullSnapshot();
+            focus.prevFocusedId = focus.focusedId;
+            focus.prevHoveredId = focus.hoveredId;
+            focus.prevPressedId = focus.pressedId;
+            if (this.EventKind() == 13 && wheelClaimSeen && !wheelConsumed && !wheelReplayArmed) {
+                offscreenWheelPending = true;
+                offscreenWheelX = window.EventX();
+                offscreenWheelY = window.EventY();
+                offscreenWheelKey = window.EventKeyCode();
+                offscreenWheelMods = window.EventMods();
+                offscreenWheelFlag = window.EventFlag();
+                offscreenWheelSeq = window.EventSeq();
+            }
+        } finally {
+            this.CancelOffscreenFrame();
+        }
+    }
+
+    // 离屏帧的延迟绘制由可见宿主的事件循环兑现。
+    void ForwardOffscreenFrameRequests(App host) {
+        if (window.GetHandle() != 0 || host == null || host == this) { return; }
+        if (needsRedraw) { host.RequestRedraw(); needsRedraw = false; }
+        int due = wakeFrameNextMs;
+        if (animNextMs >= 0 && (due < 0 || animNextMs < due)) { due = animNextMs; }
+        if (wakeNextMs >= 0 && (due < 0 || wakeNextMs < due)) { due = wakeNextMs; }
+        if (due >= 0) {
+            int delay = due - Window.GetTickMs();
+            host.RequestWakeFrameIn(delay < 0 ? 0 : delay);
+        }
+        wakeFrameNextMs = 0 - 1;
+        animNextMs = 0 - 1;
+        wakeNextMs = 0 - 1;
+    }
+
+}

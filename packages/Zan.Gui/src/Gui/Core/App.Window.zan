@@ -1,0 +1,401 @@
+using System;
+using Gui.Backend;
+
+namespace Gui;
+
+// App.Window.zan - 窗口尺寸、透明度、形态样式、圆角与 OS 原生玻璃配置
+public partial class App {
+    // 整窗不透明度百分比（10..100）；100 = 不透明。转发给
+    // OS 合成器，使控件/文本随窗口整体淡出。
+    public void SetWindowOpacity(int percent) {
+        if (percent < 10) { percent = 10; }
+        if (percent > 100) { percent = 100; }
+        windowOpacity = percent;
+        window.SetOpacity(percent);
+    }
+
+    // 用户能否改变窗口大小。关闭后边框不再充当尺寸手柄、
+    // 双击标题栏不再最大化，标题栏也不再显示最大化按钮
+    // （一个点了没反应的按钮比没有更糟）。
+    public void SetResizable(bool on) {
+        windowResizable = on;
+        window.SetResizable(on);
+        if (!on && showMaximizeButton) {
+            this.SetChromeButtons(showThemeButton, showPinButton,
+                showMinimizeButton, false);
+        }
+        this.NoteRedrawWhy("SetResizable");
+        needsRedraw = true;
+    }
+
+    // 见 SetResizable。
+    public bool Resizable() { return windowResizable; }
+
+    // 最近一次通过 SetWindowOpacity 设置的不透明度（未设置时为 100）。
+    public int WindowOpacity() {
+        if (windowOpacity <= 0) { return 100; }
+        return windowOpacity;
+    }
+
+    // 窗口轮廓为各形状区域的并集。`spec` 为
+    // 逻辑像素下的 "t,x,y,w,h,r;t,x,y,w,h,r;..."：类型 1 = 圆角矩形
+    // （r = 圆角半径），类型 2 = 椭圆（w/h = 包围盒）。"" 恢复
+    // 为普通不透明矩形。多个区域并集为一个轮廓，
+    // 例如一个大圆角卡片上凸出一个圆形。在 Windows 上与
+    // 逐像素 alpha 组合（无 DWM 时回退为区域，仍兼容 Win7）；
+    // 所有区域之外的区域对绘制和点击都透明。
+    // 与原生玻璃互斥。在 Run 之前调用。
+    void SetWindowShape(string spec) {
+        shapeSpec = spec;
+        this.ParseShapeSpec(spec);
+        // 新规格以 (0,0) 为原点，重置阴影带偏移（SetWindowShadow
+        // 在此外扩时会把整份规格平移并再次累加偏移）。
+        shapeOffX = 0;
+        shapeOffY = 0;
+        if (spec.Length == 0) {
+            shapeMode = 0;
+            shapeRadius = 0;
+        } else {
+            shapeMode = 1;
+            shapeRadius = 0;
+            // 暴露首个非阴影带（kind!=3）有效内容区域的圆角半径，供 WindowShapeRadius() 使用。
+            // 若包含类型 3 阴影带（例如最大化恢复带阴影规格），同步恢复原点偏移。
+            if (shapeRegions != null) {
+                for (int i = 0; i < shapeRegions.Count; i = i + 1) {
+                    WindowShapeRegion r = shapeRegions[i];
+                    if (r.kind == 3) {
+                        shapeOffX = r.radius;
+                        shapeOffY = r.radius;
+                    } else if (shapeRadius == 0) {
+                        shapeRadius = r.radius;
+                    }
+                }
+            }
+        }
+        if (shapeMode != 0 && glassNative) {
+            window.DisableGlass();
+            glassNative = false;
+        }
+        window.SetShape(spec);
+        // 异形窗口轮廓自带圆角（掩码/区域几何），DWM 圆角不参与；
+        // 恢复矩形（spec = ""）时按需恢复上一请求的圆角策略。
+        if (spec.Length == 0) { this.ApplyRoundCorners(); }
+        this.NoteRedrawWhy("SetWindowShape");
+        needsRedraw = true;
+    }
+
+    // 围绕异形轮廓的柔和投影。`px` 是阴影的逻辑
+    // 扩展范围（0 禁用）。会自动在形状规格开头追加一个覆盖
+    // 形状包围盒向四周扩展 `px` 的类型 3 区域，把 OS 表面
+    // 外扩到轮廓之外：Win32 由 FitShapeWindow 按扩展后的包围盒
+    // 定窗口尺寸，其他平台由后端 zan_gui_set_shape 同样外扩，
+    // 内容轮廓保持原坐标，投影画在轮廓外的扩展带里。
+    // 在 SetWindowShape 之后、Show 之前调用。
+    void SetWindowShadow(int px) {
+        if (px < 0) { px = 0; }
+        shapeShadow = px;
+        if (px > 0 && shapeMode != 0 && shapeSpec.Length > 0
+                && !this.HasShadowBand()) {
+            int minX = 2147483647;
+            int minY = 2147483647;
+            int maxX = 0 - 2147483647 - 1;
+            int maxY = 0 - 2147483647 - 1;
+            if (shapeRegions != null) {
+                for (int ri = 0; ri < shapeRegions.Count; ri = ri + 1) {
+                    WindowShapeRegion reg = shapeRegions[ri];
+                    if (reg.kind != 3) {
+                        int x = reg.x;
+                        int y = reg.y;
+                        int x2 = x + reg.width;
+                        int y2 = y + reg.height;
+                        if (x < minX) { minX = x; }
+                        if (y < minY) { minY = y; }
+                        if (x2 > maxX) { maxX = x2; }
+                        if (y2 > maxY) { maxY = y2; }
+                    }
+                }
+            }
+            if (minX <= maxX && minY <= maxY && shapeRegions != null) {
+                // FitShapeWindow 拒绝负坐标的包围盒（"超出窗口上方/
+                // 左方的形状保持不变"），外扩必须同时平移：把整份
+                // 规格平移 (px, px)，band 从 (0,0) 起，内容轮廓
+                // 相应右移下移，屏幕上的合成结果不变。
+                StringBuilder shifted = new StringBuilder();
+                for (int ri = 0; ri < shapeRegions.Count; ri = ri + 1) {
+                    WindowShapeRegion reg = shapeRegions[ri];
+                    if (reg.kind == 3) { continue; }
+                    if (shifted.Length > 0) { shifted.Append(";"); }
+                    shifted.Append(Convert.ToString(reg.kind));
+                    shifted.Append(",");
+                    shifted.Append(Convert.ToString(reg.x - minX + px));
+                    shifted.Append(",");
+                    shifted.Append(Convert.ToString(reg.y - minY + px));
+                    shifted.Append(",");
+                    shifted.Append(Convert.ToString(reg.width));
+                    shifted.Append(",");
+                    shifted.Append(Convert.ToString(reg.height));
+                    shifted.Append(",");
+                    shifted.Append(Convert.ToString(reg.radius));
+                }
+                string band = "3,0,0,"
+                    + Convert.ToString(maxX - minX + px * 2) + ","
+                    + Convert.ToString(maxY - minY + px * 2) + ","
+                    + Convert.ToString(px);
+                shapeSpec = band + ";" + shifted.ToString();
+                this.ParseShapeSpec(shapeSpec);
+                // 记下内容轮廓的新原点：PaintShapeShadow / PaintShapeFill /
+                // RenderChrome 都按 (shapeOffX, shapeOffY) 定位。
+                shapeOffX = px;
+                shapeOffY = px;
+                window.SetShape(shapeSpec);
+            }
+        } else if (px > 0 && this.HasShadowBand()) {
+            shapeOffX = px;
+            shapeOffY = px;
+        }
+        this.NoteRedrawWhy("SetWindowShadow");
+        needsRedraw = true;
+    }
+
+    // 当形状规格已包含类型 3 阴影带区域时返回 true。
+    bool HasShadowBand() {
+        if (shapeRegions != null) {
+            for (int ri = 0; ri < shapeRegions.Count; ri = ri + 1) {
+                if (shapeRegions[ri].kind == 3) { return true; }
+            }
+        }
+        return false;
+    }
+
+    // 将形状规格解析为 shapeRegions（由 SetWindowShape 与
+    // SetWindowShadow 自动前置的阴影带共用）。
+    void ParseShapeSpec(string spec) {
+        shapeRegions = new List<WindowShapeRegion>();
+        if (spec.Length > 0) {
+            List<string> parts = spec.Split(";");
+            for (int i = 0; i < parts.Count; i = i + 1) {
+                List<string> nums = parts[i].Split(",");
+                if (nums.Count >= 6) {
+                    int k = Convert.ToInt32(nums[0]);
+                    int x = Convert.ToInt32(nums[1]);
+                    int y = Convert.ToInt32(nums[2]);
+                    int w = Convert.ToInt32(nums[3]);
+                    int h = Convert.ToInt32(nums[4]);
+                    int r = Convert.ToInt32(nums[5]);
+                    shapeRegions.Add(new WindowShapeRegion(k, x, y, w, h, r));
+                }
+            }
+        }
+    }
+
+    // 异形轮廓的阴影扩展范围（逻辑像素，0 = 无）。
+    int WindowShadow() { return shapeShadow; }
+
+    // 当前窗口轮廓规格（见 SetWindowShape）；"" = 矩形。
+    string WindowShapeSpec() { return shapeSpec; }
+
+    // 当前窗口轮廓（见 SetWindowShape）。
+    int WindowShape() { return shapeMode; }
+
+    // 圆角矩形轮廓的圆角半径（见 SetWindowShape）。
+    int WindowShapeRadius() { return shapeRadius; }
+
+    // 当前窗口生效的外轮廓圆角半径（物理/缩放后像素）。
+    // 异形圆角窗口（SetWindowShape）返回其规格半径缩放值；
+    // Win11 DWM 统一圆角窗口（SetWindowRoundCorners(true)）返回 8px 缩放值；
+    // 方角窗口返回 0。
+    int EffectiveCornerRadius() {
+        if (window != null && window.IsMaximized()) {
+            return 0;
+        }
+        if (shapeMode != 0 && shapeRadius > 0) {
+            return this.Scale(shapeRadius);
+        }
+        if (windowRound) {
+            return this.Scale(4);
+        }
+        return 0;
+    }
+
+    // 显示/隐藏自定义标题栏边框。隐藏时：OS 仍允许顶部
+    // TitlebarHeight() 高度的条带拖动窗口，内容从 y=0 开始。
+    void SetChromeVisible(bool on) {
+        showChrome = on;
+        int n = 0;
+        if (on) { n = ChromeButtonCount(); }
+        window.SetCaptionButtons(n);
+        this.NoteRedrawWhy("SetChromeVisible");
+        needsRedraw = true;
+    }
+
+    // 自定义标题栏边框可见时为 true。
+    bool ChromeVisible() { return showChrome; }
+
+    // 标题栏上的动态信息：`text` 用常规文本色，`accent` 用强调色，
+    // 画在窗口标题之后。应用可按需每秒刷新（登录/授权、
+    // 平均耗时、内存占用等）。传空串即隐藏。
+    void SetChromeStatus(string text, string accent) {
+        if (chromeStatus == text && chromeAccent == accent) { return; }
+        chromeStatus = text;
+        chromeAccent = accent;
+        this.RequestRedraw();
+    }
+
+    // 自定义标题栏品牌图标：传图标库字形名（如 "rocket"），
+    // 传空串恢复默认——默认是程序自己的图标（exe 内嵌的那份），
+    // 取不到时才回落到占位字形 "home"。大小/颜色走
+    // CSS `titlebar::brand`。
+    void SetChromeBrandIcon(string icon) {
+        if (chromeBrandIcon == icon) { return; }
+        chromeBrandIcon = icon;
+        this.RequestRedraw();
+    }
+
+    // 自定义标题栏品牌图片（文件路径或 mem: key）
+    public void SetChromeBrandImage(string imageKey) {
+        if (this.chromeBrandImageKey == imageKey) { return; }
+        this.chromeBrandImageKey = imageKey;
+        this.RequestRedraw();
+    }
+
+    // 标题栏左侧的程序图标（mem: key）：从 exe 资源取出像素后注册
+    // 到图片模块，再当普通图片贴。没有可用图标时返回空串。
+    string BrandImageKey() {
+        if (this.chromeBrandImageKey != "") { return this.chromeBrandImageKey; }
+        int[] pixels = AppIcon.Pixels();
+        int side = AppIcon.Side();
+        if (pixels != null && side > 0) {
+            string key = "mem:zan-app-icon";
+            if (Canvas.ImageRegisterArgb(key, pixels, side, side) == side) {
+                this.chromeBrandImageKey = key;
+                return key;
+            }
+        }
+        string[] candidates = new string[] {
+            "app.png",
+            "../Resources/app.png",
+            "Resources/app.png",
+            "app.ico",
+            "../Resources/app.ico",
+            "Resources/app.ico",
+            "1.ico"
+        };
+        for (int i = 0; i < candidates.Length; i = i + 1) {
+            string cand = candidates[i];
+            if (File.Exists(cand)) {
+                if (Canvas.ImageWidth(cand) > 0) {
+                    this.chromeBrandImageKey = cand;
+                    return cand;
+                }
+            }
+        }
+        return "";
+    }
+
+    // 运行期加高自绘标题栏（设备像素，不小于当前值）。chrome 的
+    // 背景、标题、状态位与标题按钮的布局都跟随该值；后端的
+    // 原生拖动条带同步加高，整条标题栏都能拖动。
+    // 在帧内调用（Show 会在启动时重读后端默认值）。
+    void SetTitlebarHeight(int devicePx) {
+        if (devicePx <= titlebarH) { return; }
+        titlebarH = devicePx;
+        window.SetTitlebarHeight(devicePx);
+        this.RequestRedraw();
+    }
+
+    // 登记标题栏右侧客户区保护带宽度（设备像素）：标题栏
+    // 高度以内、窗口右缘向左 width 的条带 [w-width, w) 内的按下
+    // 交给客户区（应用自绘按钮/胶囊命中区），不当作窗口拖动。
+    void SetCaptionZone(int width) {
+        window.SetCaptionZone(width);
+    }
+
+    // 在系统标题按钮左侧追加应用功能按钮：玻璃胶囊样式（半透明
+    // 白底白字，悬停变亮），随 chrome 每帧渲染并注册命中区。
+    // ids 须是应用以 focus.PushIds 专用段分配的稳定 id，点击
+    // 照常经 Ui.Clicked(id) 送达。须在 RunLoop 之前设置，
+    // 原生免拖区宽度会把这些按钮一并计入。
+    void SetCaptionActions(int[] ids, string[] labels) {
+        if (ids == null || labels == null) { return; }
+        if (ids.Length != labels.Length || ids.Length > 4) { return; }
+        capActionIds = ids;
+        capActionLabels = labels;
+    }
+
+    // 当前标题栏状态文本（常规段）。
+    string ChromeStatus() { return chromeStatus; }
+
+    // 当前标题栏状态文本（强调段）。
+    public string ChromeAccent() { return chromeAccent; }
+
+    // 同步操作系统窗口标题（任务栏/Alt-Tab 显示的文字）。
+    // 自绘标题栏上的文字由帧循环传入，见 Form.SetTitle。
+    public void SetWindowTitle(string text) { window.SetTitle(text); }
+
+    // 启用或禁用窗口置顶（topmost）。
+    public void SetTopmost(bool on) {
+        this.isTopmost = on;
+        window.SetTopmost(on);
+    }
+
+    // 窗口当前是否处于置顶状态。
+    public bool IsTopmost() {
+        return this.isTopmost;
+    }
+
+    // 设置窗口最小允许尺寸（逻辑像素）。
+    public void SetMinSize(int w, int h) {
+        window.SetMinSize(w, h);
+    }
+
+    // 启用/禁用 OS 原生半透明玻璃（Win11 亚克力）：
+    // 窗口表面半透明处，桌面在窗口后方被模糊。
+    // 与软件渲染的磨砂玻璃
+    // 皮肤不同。与异形窗口互斥。
+    void SetNativeGlass(bool on) {
+        if (on) {
+            if (shapeMode != 0) { this.SetWindowShape(""); }
+            window.EnableGlass(this.GlassTint());
+            glassNative = true;
+        } else {
+            window.DisableGlass();
+            glassNative = false;
+        }
+        this.NoteRedrawWhy("SetNativeGlass");
+        needsRedraw = true;
+    }
+
+    // OS 原生半透明玻璃启用时为 true（见 SetNativeGlass）。
+    bool NativeGlass() { return glassNative; }
+
+    // 请求窗口外轮廓圆角（Windows 11 由 DWM 合成：抗锯齿、
+    // 与系统投影一致、零绘制成本；旧系统安全空操作）。
+    // 与异形窗口互斥——异形轮廓自带圆角几何，DWM 圆角不参与，
+    // 关闭异形（SetWindowShape("")）后自动恢复此处请求的策略。
+    void SetWindowRoundCorners(bool on) {
+        windowRound = on;
+        windowRoundSet = true;
+        this.ApplyRoundCorners();
+        this.NoteRedrawWhy("SetWindowRoundCorners");
+        needsRedraw = true;
+    }
+
+    // 将 windowRound 策略落到 OS 窗口上（幂等）。
+    void ApplyRoundCorners() {
+        if (!windowRoundSet) { return; }
+        if (shapeMode != 0) {
+            // 异形窗口自带轮廓圆角；恢复矩形时重应用。
+            return;
+        }
+        window.SetRoundCorners(windowRound);
+    }
+
+    // 工具窗口：细标题栏、任务栏/Alt-Tab 不显示。
+    // 适合调色板、对话框这类附属窗口。
+    void SetToolWindow(bool on) {
+        window.SetToolWindow(on);
+    }
+
+    // 窗口是否为工具窗口（见 SetToolWindow）。
+    bool ToolWindow() { return window.ToolWindow(); }
+}
