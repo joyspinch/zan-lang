@@ -1,0 +1,784 @@
+using System;
+using Gui;
+using Gui.Widget;
+using Gui.Backend;
+
+namespace Gui.Component.DataTable;
+
+// DataTable 渲染管道分层：主体虚拟化行循环、单元格绘制调度、主从明细展开、焦点框与拖放指示。
+public partial class DataTable {
+    // 计算主体与视口各分区的纵向几何布局参数
+    public static DataTableBodyLayout ComputeBodyLayout(App app, int y, int viewH,
+                                                 DataTableFrame f, DataSource src,
+                                                 DataTableState st) {
+        DataTableBodyLayout lay = new DataTableBodyLayout();
+        lay.total = DataTable.DispCount(st);
+        lay.summaryH = 0;
+        if (st.showSummary) { lay.summaryH = f.rowH; }
+        lay.pagerH = 0;
+        if (st.paged) { lay.pagerH = app.Scale(38); }
+        lay.filterRowH = 0;
+        if (st.showFilterRow) { lay.filterRowH = f.rowH; }
+        lay.statusBarH = 0;
+        if (st.showStatusBar) { lay.statusBarH = app.Scale(28); }
+        lay.topPinnedH = 0;
+        if (st.pinnedTopRows != null) { lay.topPinnedH = st.pinnedTopRows.Count * f.rowH; }
+        lay.bottomPinnedH = 0;
+        if (st.pinnedBottomRows != null) { lay.bottomPinnedH = st.pinnedBottomRows.Count * f.rowH; }
+
+        lay.bodyTop = y + f.headerH + lay.filterRowH + lay.topPinnedH;
+        lay.bodyH = viewH - f.headerH - lay.filterRowH - lay.topPinnedH - lay.bottomPinnedH - lay.summaryH - lay.pagerH - lay.statusBarH;
+        if (lay.bodyH < f.rowH) { lay.bodyH = f.rowH; }
+        lay.visRows = lay.bodyH / f.rowH;
+        if (lay.visRows < 1) { lay.visRows = 1; }
+
+        lay.start = 0;
+        if (st.paged) {
+            st.pageRows = lay.visRows;
+            int totalPages = VirtualScrollHost.CalcTotalPages(lay.total, lay.visRows);
+            int cur = VirtualScrollHost.ClampPage(st.pageModel.Get(), totalPages);
+            st.pageModel.Set(cur);
+            lay.start = (cur - 1) * lay.visRows;
+        } else {
+            lay.start = VirtualScrollHost.ClampStartRow(st.scrollRow, lay.total, lay.visRows);
+            st.scrollRow = lay.start;
+        }
+
+        // 服务端数据源按需增长
+        if (!st.paged && src.HasMore() && lay.start >= lay.total - lay.visRows) {
+            src.RequestNextBlock();
+        }
+
+        return lay;
+    }
+
+    // 渲染表格主体（含筛选行、顶置固定行、数据行虚拟化视口、焦点框、空态覆盖层与拖放指示器）
+    public static void RenderBody(App app, int x, int y, int viewW, int viewH,
+                           DataTableFrame f, DataTableBodyLayout lay,
+                           List<DataColumn> cols, DataSource src,
+                           DataTableState st, int evt) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        bool touchUi = app.TouchDevice();
+
+        int numW = f.numW;
+        int selW = f.selW;
+        int gridColor = f.gridColor;
+        int clipRight = f.clipRight;
+        int firstDataX = f.firstDataX;
+        int dataViewW = f.dataViewW;
+        int rowH = f.rowH;
+        int fs = f.fs;
+        int headerH = f.headerH;
+        int pinnedW = f.pinnedW;
+        int pinnedRW = f.pinnedRW;
+        int bandX = f.bandX;
+        int bandW = f.bandW;
+        int rightX = f.rightX;
+        List<FrameColumn> frameColumns = f.columns;
+
+        int total = lay.total;
+        int filterRowH = lay.filterRowH;
+        int topPinnedH = lay.topPinnedH;
+        int bottomPinnedH = lay.bottomPinnedH;
+        int bodyTop = lay.bodyTop;
+        int bodyH = lay.bodyH;
+        int visRows = lay.visRows;
+        int start = lay.start;
+
+        StyleBox sSurface = Style.Full(app, "datatable", "", "", Style.SNormal());
+        StyleBox sHeader = Style.Part(app, "datatable", "header", "", "", "", Style.SNormal());
+        StyleBox sIcon = Style.Part(app, "datatable", "icon", "", "", "", Style.SNormal());
+        StyleBox sIconSel = Style.Part(app, "datatable", "icon", "", "", "", Style.SSelected());
+        StyleBox sBandHdr = Style.Part(app, "datatable", "band", "", "", "", Style.SNormal());
+        StyleBox sAccent = Style.Part(app, "datatable", "accent", "", "", "", Style.SNormal());
+        StyleBox sRow = Style.Part(app, "datatable", "row", "", "", "", Style.SNormal());
+        StyleBox sRowStriped = Style.Part(app, "datatable", "row", "", "striped", "", Style.SNormal());
+        StyleBox sRowHover = Style.Part(app, "datatable", "row", "", "", "", Style.SHover());
+        StyleBox sRowSel = Style.Part(app, "datatable", "row", "", "", "", Style.SSelected());
+        StyleBox sGroupRow = Style.Part(app, "datatable", "group-row", "", "", "", Style.SNormal());
+        StyleBox sDetail = Style.Part(app, "datatable", "detail", "", "", "", Style.SNormal());
+        StyleBox sHint = Style.Part(app, "datatable", "hint", "", "", "", Style.SNormal());
+        StyleBox sCellBox = Style.Part(app, "datatable", "cell", "", "", "", Style.SNormal());
+
+        // ---------------- 筛选行（DevExpress 行内快速筛选）----------------
+        if (st.showFilterRow && filterRowH > 0) {
+            int fry = y + headerH;
+            c.FillRect(x + 1, fry, viewW - 2, filterRowH, sHeader.BgOr(0));
+            c.FillRect(x + 1, fry, numW + selW - 2, filterRowH, sBandHdr.BgOr(0));
+
+            if (st.showRowNum && numW > 0) {
+                c.DrawGlyphIn("filter", x, fry, numW, filterRowH, app.Scale(12), sIcon.FgOr(0));
+            }
+
+            int frBand = -1;
+            for (int froi = 0; froi < frameColumns.Count; froi = froi + 1) {
+                FrameColumn filterColumn = frameColumns[froi];
+                int fri = filterColumn.column;
+                int fcw = st.dispW[fri];
+                if (filterColumn.band != frBand) {
+                    if (frBand >= 0) { c.PopClip(); }
+                    frBand = filterColumn.band;
+                    DataTable.PushBandClip(c, frBand, firstDataX, bandX, bandW, rightX,
+                                           pinnedW, pinnedRW, fry, filterRowH, clipRight);
+                }
+                int frcl = filterColumn.x;
+                int frBandL = DataTable.BandLeft(filterColumn.band, firstDataX, bandX, rightX);
+                int frBandR = DataTable.BandRight(filterColumn.band, firstDataX, bandX, bandW,
+                                                  rightX, pinnedW, pinnedRW, clipRight);
+                if (frcl + fcw > frBandL && frcl < frBandR) {
+                    int pad2 = t.paddingSmall;
+                    bool frFoc = st.filterRowFocusCol == fri;
+                    string frTxt = st.filterRowText[fri];
+                    if (frFoc) { frTxt = st.filterRowBuf; }
+                    int frid2 = app.focus.AllocId();
+                    int frX = frcl;
+                    int frW = fcw;
+                    if (frX < frBandL) { frW = frW - (frBandL - frX); frX = frBandL; }
+                    if (frX + frW > frBandR) { frW = frBandR - frX; }
+                    bool frAct = frTxt.Length > 0 || frFoc;
+                    string frCls = "";
+                    if (frAct && !frFoc) { frCls = "active"; }
+                    int frState = Style.SNormal();
+                    if (frFoc) { frState = Style.SFocus(); }
+                    StyleBox sField = Style.Part(app, "datatable", "field", "",
+                                                 frCls, "", frState);
+                    c.FillRect(frX + 2, fry + 3, frW - 4, filterRowH - 6, sField.BgOr(0));
+                    int frBorder = sField.BorderOr(0);
+                    c.DrawRoundRect(frX + 2, fry + 3, frW - 4, filterRowH - 6, t.borderRadiusSmall, frBorder, 1);
+                    int frInner = frW - 4 - pad2 * 2;
+                    if (frInner < 0) { frInner = 0; }
+                    int frfs = Style.FontFallback(app, "small");
+                    int frtY = Canvas.CenterTextY(fry, filterRowH, frfs);
+                    c.PushClip(frX + 2 + pad2, fry, frInner, filterRowH);
+                    if (frTxt.Length == 0 && !frFoc) {
+                        c.DrawText(frX + 2 + pad2, frtY, DataTable.T("Search...", "搜索..."), sHint.FgOr(0), frfs);
+                    } else {
+                        c.DrawText(frX + 2 + pad2, frtY, frTxt, sField.FgOr(0), frfs);
+                        if (frFoc) {
+                            int fcaretW = Canvas.MeasureText(Text.Left(frTxt, st.filterRowCur), frfs);
+                            c.FillRect(frX + 2 + pad2 + fcaretW, frtY, 1, Canvas.FontHeight(frfs), sAccent.BgOr(0));
+                        }
+                    }
+                    c.PopClip();
+                    app.hitTester.RegisterRect(frid2, frX, fry, frW, filterRowH, 1);
+                    if (evt == 3 && app.window.EventButton() == 0
+                        && app.hitTester.HitTest(app.mouseX, app.mouseY) == frid2) {
+                        if (st.filterRowFocusCol != fri) {
+                            st.filterRowFocusCol = fri;
+                            st.filterRowBuf = st.filterRowText[fri];
+                            st.filterRowCur = st.filterRowBuf.Length;
+                        }
+                        app.RequestRedraw();
+                    }
+                }
+            }
+            if (frBand >= 0) { c.PopClip(); }
+            c.FillRect(x + 1, fry + filterRowH - 1, viewW - 2, 1, gridColor);
+        }
+
+        // 归一化的单元格范围边界
+        bool hasRange = DataTable.HasRange(st);
+        int rgR0 = 0;
+        int rgR1 = -1;
+        int rgC0 = 0;
+        int rgC1 = -1;
+        if (hasRange) {
+            rgR0 = DataTable.MinI(st.rangeR0, st.rangeR1);
+            rgR1 = DataTable.MaxI(st.rangeR0, st.rangeR1);
+            rgC0 = DataTable.MinI(st.rangeC0, st.rangeC1);
+            rgC1 = DataTable.MaxI(st.rangeC0, st.rangeC1);
+        }
+        int multiN = DataTable.MultiCount(st);
+
+        // 当前编辑单元格的屏幕矩形
+        int edX = 0;
+        int edY = 0;
+        int edW = 0;
+        int edH = 0;
+        bool edVis = false;
+
+        // ---------------- 置顶固定行 (Pinned Top Rows) ----------------
+        if (st.pinnedTopRows != null && st.pinnedTopRows.Count > 0) {
+            for (int pti = 0; pti < st.pinnedTopRows.Count; pti = pti + 1) {
+                int pty = (bodyTop - topPinnedH) + pti * rowH;
+                DataTable.RenderPinnedRow(app, x, pty, viewW, rowH, numW, selW, cols,
+                                         st.pinnedTopRows[pti], st, frameColumns,
+                                         firstDataX, bandX, bandW, rightX, pinnedW, pinnedRW,
+                                         clipRight, gridColor, "📌");
+            }
+        }
+
+        int r = 0;
+        while (r < visRows && (start + r) < total) {
+            int oiRow = start + r;
+            int ry = bodyTop + r * rowH;
+
+            // 组表头行
+            if (DataTable.DispKind(st, oiRow) == 1) {
+                int gi = DataTable.DispRowOf(st, oiRow);
+                GroupRow grp = st.groups[gi];
+                int lvl = grp.level;
+                c.FillRect(x + 1, ry, viewW - 2, rowH, sGroupRow.BgOr(0));
+                int gcx = x + numW + selW + lvl * app.Scale(16) + app.Scale(6);
+                bool gcoll = grp.collapsed;
+                string chev = "chevron-down";
+                if (gcoll) { chev = "chevron-right"; }
+                int chSz = app.Scale(14);
+                c.DrawGlyph(chev, gcx, ry + (rowH - chSz) / 2, chSz, sHeader.FgOr(0));
+                int gcbSz = app.Scale(14);
+                int gcbX = gcx + chSz + app.Scale(4);
+                int gcbY = ry + (rowH - gcbSz) / 2;
+                int gcbId = app.focus.AllocId();
+                app.hitTester.RegisterRect(gcbId, gcbX - app.Scale(2), ry,
+                                           gcbSz + app.Scale(4), rowH, 0);
+                int gst = DataTable.GroupCheckState(st, grp, src);
+                if (gst == 1) { Checkbox.PaintBox(app, gcbX, gcbY, gcbSz, 1000); }
+                else if (gst == 2) { Checkbox.PaintBoxIndeterminate(app, gcbX, gcbY, gcbSz); }
+                else { Checkbox.PaintBox(app, gcbX, gcbY, gcbSz, 0); }
+                if (evt == 3 && app.window.EventButton() == 0
+                    && app.hitTester.HitTest(app.mouseX, app.mouseY) == gcbId) {
+                    DataTable.SelectGroupRows(st, grp, src, gst != 1);
+                    st.SelectionChanged.Raise();
+                    app.RequestRedraw();
+                }
+                string glbl = "";
+                if (st.groupFormatter != null) {
+                    glbl = st.groupFormatter.Format(grp, cols, src);
+                }
+                if (glbl.Length == 0) {
+                    glbl = grp.label + "  (" + Convert.ToString(grp.count) + ")";
+                    for (int gagg = 0; gagg < grp.aggregates.Count && gagg < cols.Count; gagg = gagg + 1) {
+                        string gat = grp.aggregates[gagg].text;
+                        if (gat.Length > 0) {
+                            glbl = glbl + "    " + cols[gagg].title + ": " + gat;
+                        }
+                    }
+                }
+                c.DrawText(gcbX + gcbSz + app.Scale(6),
+                    ry + (rowH - Style.FontFallback(app, "medium")) / 2, glbl, sGroupRow.FgOr(0), Style.FontFallback(app, "medium"));
+                c.FillRect(x + 1, ry + rowH - 1, viewW - 2, 1, gridColor);
+                r = r + 1;
+                continue;
+            }
+
+            // 详情 band
+            if (DataTable.DispKind(st, oiRow) == 2) {
+                if (DataTable.DispPart(st, oiRow) != 0) { r = r + 1; continue; }
+                int dRow = DataTable.DispRowOf(st, oiRow);
+                int span = 1;
+                int ns = oiRow + 1;
+                while (ns < total && DataTable.DispKind(st, ns) == 2
+                       && DataTable.DispPart(st, ns) != 0 && DataTable.DispRowOf(st, ns) == dRow) {
+                    span = span + 1;
+                    ns = ns + 1;
+                }
+                int dh = span * rowH;
+                c.FillRect(x + 1, ry, viewW - 2, dh, sDetail.BgOr(0));
+                c.FillRect(x + 1, ry, app.Scale(3), dh, sAccent.BgOr(0));
+                if (st.detail != null) {
+                    int dx = x + app.Scale(4);
+                    int dw = viewW - app.Scale(6);
+                    c.PushClip(dx, ry, dw, dh);
+                    Control dc = st.detail.ProvideControl(app, src, dRow, dx, ry, dw, dh);
+                    if (dc != null) {
+                        if (st.activeDetails != null && !st.activeDetails.Contains(dc)) {
+                            st.activeDetails.Add(dc);
+                        }
+                        if (st.ownerControl != null) {
+                            dc.parent = st.ownerControl;
+                        }
+                        dc.MeasureTree(app);
+                        dc.Arrange(dx, ry, dw, dh);
+                        dc.RenderTree(app);
+                    } else {
+                        st.detail.Paint(app, src, dRow, dx, ry, dw, dh);
+                    }
+                    c.PopClip();
+                }
+                c.FillRect(x + 1, ry + dh - 1, viewW - 2, 1, gridColor);
+                r = r + 1;
+                continue;
+            }
+
+            int rowIdx = DataTable.DispRowOf(st, oiRow);
+            bool rowInRange = hasRange && oiRow >= rgR0 && oiRow <= rgR1;
+
+            if (!src.CellReady(rowIdx, 0)) {
+                src.RequestBlock(rowIdx);
+                c.FillRect(x + 1, ry, viewW - 2, rowH, sDetail.BgOr(0));
+                c.DrawTextCentered(x, ry, viewW, rowH, "...", sHint.FgOr(0), Style.FontFallback(app, "small"));
+                c.FillRect(x + 1, ry + rowH - 1, viewW - 2, 1, gridColor);
+                r = r + 1;
+                continue;
+            }
+
+            int rowId = app.focus.AllocId();
+            app.hitTester.RegisterRect(rowId, x, ry, viewW, rowH, 0);
+            bool rHover = app.focus.IsHovered(rowId);
+            bool rSel = DataTable.IsSelected(st, src, rowIdx);
+
+            int stripeBg = sRow.BgOr(0);
+            if (st.striped && (DataTable.DispNo(st, oiRow) % 2 == 0)) { stripeBg = sRowStriped.BgOr(0); }
+            int rowBg = DataTable.RowBackground(st, src, rowIdx, stripeBg,
+                                                sRowSel.BgOr(0), sRowHover.BgOr(0), rSel, rHover);
+            RowStyle rStyle = null;
+            if (st.rowStyleFunc != null) {
+                rStyle = st.rowStyleFunc(src, rowIdx);
+                if (rStyle != null && rStyle.bg != 0 && !rSel && !rHover) {
+                    rowBg = rStyle.bg;
+                }
+            }
+            c.FillRect(x + 1, ry, viewW - 2, rowH, rowBg);
+            if (rSel) { c.FillRect(x + 1, ry, app.Scale(3), rowH, sAccent.BgOr(0)); }
+
+            int cx2 = x;
+            if (st.showRowNum) {
+                int rowGripW = app.Scale(10);
+                int rowGripX = cx2 + numW - rowGripW;
+                bool rowHot = app.mouseY >= ry && app.mouseY < ry + rowH
+                              && app.mouseX >= x && app.mouseX < x + viewW;
+                bool showRowGrip = st.rowReorder && (rowHot || st.dragRow == oiRow || touchUi)
+                                   && st.groupCols.Count == 0;
+                int numTextW = numW;
+                if (showRowGrip) { numTextW = numW - rowGripW; }
+                c.DrawTextCentered(cx2, ry, numTextW, rowH, Convert.ToString(DataTable.DispNo(st, oiRow)), sHint.FgOr(0), Style.FontFallback(app, "small"));
+                int rgId = app.focus.AllocId();
+                if (showRowGrip) {
+                    app.hitTester.RegisterRect(rgId, rowGripX, ry, rowGripW, rowH, 0);
+                    bool rgHot = rowHot && app.mouseX >= rowGripX && app.mouseX < rowGripX + rowGripW;
+                    int rgCol = sIcon.FgOr(0);
+                    if (rgHot || st.dragRow == oiRow) { rgCol = sIconSel.FgOr(0); }
+                    DataTable.DrawGrip(app, rowGripX, ry, rowGripW, rowH, rgCol);
+                    if (rgHot && evt == 2 && app.window.EventButton() == 0) {
+                        st.dragRow = oiRow;
+                        st.dragStartY = app.mouseY;
+                        st.dragMoved = false;
+                        st.rowGripDrag = true;
+                        if (touchUi) { app.ClaimDrag(); }
+                    }
+                }
+                if (DataTable.CanExpand(st, src, rowIdx)) {
+                    int exSz = app.Scale(12);
+                    int exX = cx2 + app.Scale(2);
+                    int exY = ry + (rowH - exSz) / 2;
+                    bool isExp = DataTable.IsExpanded(st, src, rowIdx);
+                    string exCh = "chevron-right";
+                    if (isExp) { exCh = "chevron-down"; }
+                    int exId = app.focus.AllocId();
+                    app.hitTester.RegisterRect(exId, cx2, ry, app.Scale(16), rowH, 0);
+                    int exCol = sIcon.FgOr(0);
+                    if (app.focus.IsHovered(exId)) { exCol = sIconSel.FgOr(0); }
+                    c.DrawGlyph(exCh, exX, exY, exSz, exCol);
+                    if (evt == 3 && app.window.EventButton() == 0
+                        && app.hitTester.HitTest(app.mouseX, app.mouseY) == exId) {
+                        DataTable.ToggleDetail(st, src, rowIdx);
+                        app.RequestRedraw();
+                    }
+                }
+                cx2 = cx2 + numW;
+            }
+            if (st.showSelect) {
+                int box = app.Scale(16);
+                int bx = cx2 + (selW - box) / 2;
+                int by = ry + (rowH - box) / 2;
+                int selLvl = 0;
+                if (rSel) { selLvl = 1000; }
+                Checkbox.PaintBox(app, bx, by, box, selLvl);
+                int selId = app.focus.AllocId();
+                app.hitTester.RegisterRectL(selId, cx2, ry, selW, rowH, 0,
+                                            "select-row");
+                if (evt == 3 && app.window.EventButton() == 0
+                    && app.hitTester.HitTest(app.mouseX, app.mouseY) == selId
+                    && !app.PointerCaptured()) {
+                    DataTable.SetSelected(st, src, rowIdx, !rSel);
+                    st.hitRow = rowIdx;
+                    st.SelectionChanged.Raise();
+                    app.RequestRedraw();
+                }
+                cx2 = cx2 + selW;
+            }
+
+            int cBand = -1;
+            for (int coi = 0; coi < frameColumns.Count; coi = coi + 1) {
+                FrameColumn bodyColumn = frameColumns[coi];
+                int cc = bodyColumn.column;
+                int cw = st.dispW[cc];
+                if (bodyColumn.band != cBand) {
+                    if (cBand >= 0) { c.PopClip(); }
+                    cBand = bodyColumn.band;
+                    DataTable.PushBandClip(c, cBand, firstDataX, bandX, bandW, rightX,
+                                           pinnedW, pinnedRW, ry, rowH, clipRight);
+                }
+                int ccl = bodyColumn.x;
+                int cBandL = DataTable.BandLeft(bodyColumn.band, firstDataX, bandX, rightX);
+                int cBandR = DataTable.BandRight(bodyColumn.band, firstDataX, bandX, bandW,
+                                                 rightX, pinnedW, pinnedRW, clipRight);
+                if (bodyColumn.band == 1 && ccl >= cBandR) {
+                    while (coi + 1 < frameColumns.Count && frameColumns[coi + 1].band == 1) {
+                        coi = coi + 1;
+                    }
+                    continue;
+                }
+                if (ccl + cw <= cBandL) {
+                    continue;
+                }
+                if (ccl < cBandR) {
+                    CellSpan cSpan = null;
+                    if (st.spanProvider != null) {
+                        cSpan = st.spanProvider.GetSpan(src, rowIdx, cc);
+                    }
+                    if (cSpan != null && cSpan.IsCovered()) {
+                        continue;
+                    }
+                    int drawCw = cw;
+                    int drawRowH = rowH;
+                    if (cSpan != null && cSpan.IsMaster()) {
+                        if (cSpan.colSpan > 1) {
+                            drawCw = 0;
+                            for (int sc = cc; sc < cc + cSpan.colSpan && sc < cols.Count; sc = sc + 1) {
+                                if (sc < st.dispW.Count && (sc >= st.colHidden.Count || !st.colHidden[sc])) {
+                                    drawCw = drawCw + st.dispW[sc];
+                                }
+                            }
+                        }
+                        if (cSpan.rowSpan > 1) {
+                            drawRowH = cSpan.rowSpan * rowH;
+                        }
+                    }
+
+                    int cellBg = DataTable.CellBackground(st, src, rowIdx, cc);
+                    if (cellBg != 0) { c.FillRect(ccl, ry, drawCw, drawRowH, cellBg); }
+                    bool cellInRange = rowInRange && cc >= rgC0 && cc <= rgC1;
+                    for (int mi = 0; mi < multiN && !cellInRange; mi = mi + 1) {
+                        int mr0 = -1; int mc0 = -1; int mr1 = -1; int mc1 = -1;
+                        if (DataTable.MultiAt(st, mi, out mr0, out mc0, out mr1, out mc1)
+                            && oiRow >= mr0 && oiRow <= mr1 && cc >= mc0 && cc <= mc1) {
+                            cellInRange = true;
+                        }
+                    }
+                    if (cellInRange) {
+                        c.FillRect(ccl, ry, drawCw, drawRowH, sRowSel.BgOr(0));
+                    }
+                    if (st.fillDrag && oiRow >= st.fillTR0 && oiRow <= st.fillTR1
+                        && cc >= st.fillTC0 && cc <= st.fillTC1) {
+                        c.FillRect(ccl, ry, drawCw, drawRowH, DataTable.ColorAlpha(sAccent.BgOr(0), 40));
+                    }
+                    if (st.editing && rowIdx == st.editRow && cc == st.editCol) {
+                        edX = ccl; edY = ry; edW = drawCw; edH = drawRowH; edVis = true;
+                    }
+                    bool painted = false;
+                    if (st.cellWidgets != null) {
+                        c.PushClip(ccl, ry, drawCw, drawRowH);
+                        Control wc = st.cellWidgets.Provide(app, src, rowIdx, cc, ccl, ry, drawCw, drawRowH);
+                        if (wc != null) {
+                            wc.MeasureTree(app);
+                            wc.Arrange(ccl, ry, drawCw, drawRowH);
+                            wc.RenderTree(app);
+                            painted = true;
+                        }
+                        c.PopClip();
+                    }
+                    if (!painted && st.styler != null) {
+                        c.PushClip(ccl, ry, drawCw, drawRowH);
+                        painted = st.styler.PaintCell(app, src, rowIdx, cc, ccl, ry, drawCw, drawRowH);
+                        c.PopClip();
+                    }
+                    if (!painted) {
+                        CellRenderer cr = cols[cc].renderer;
+                        if (cr == null) { cr = st.cellRenderer; }
+                        if (cr != null) {
+                            c.PushClip(ccl, ry, drawCw, drawRowH);
+                            painted = cr.Paint(app, c, src, rowIdx, cc, ccl, ry, drawCw, drawRowH, rSel, oiRow == st.hitOrder && cc == st.hitCol);
+                            c.PopClip();
+                        }
+                    }
+                    if (!painted) {
+                        double cfLo = 0.0;
+                        double cfHi = 0.0;
+                        if (st.cfExtents != null && cc < st.cfExtents.Count) {
+                            cfLo = st.cfExtents[cc].minReal;
+                            cfHi = st.cfExtents[cc].maxReal;
+                        } else if (cc < st.cfMinR.Count) {
+                            cfLo = st.cfMinR[cc];
+                            cfHi = st.cfMaxR[cc];
+                        }
+                        string cellText = src.CellText(rowIdx, cc);
+                        string fText = DataTable.FormulaText(cols, src, rowIdx, cc);
+                        if (fText != null) { cellText = fText; }
+                        int mu = 0;
+                        int md = 0;
+                        if (cols[cc].mergeSame && cols[cc].cellType < 6
+                            && !cols[cc].isBool) {
+                            while (mu < DataTable.MergeWalkCap
+                                   && oiRow - mu - 1 >= 0
+                                   && DataTable.DispKind(st, oiRow - mu - 1) == 0
+                                   && src.CellReady(DataTable.DispRowOf(st, oiRow - mu - 1), 0)
+                                   && src.CellText(DataTable.DispRowOf(st, oiRow - mu - 1), cc) == cellText) {
+                                mu = mu + 1;
+                            }
+                            while (md < DataTable.MergeWalkCap
+                                   && oiRow + md + 1 < total
+                                   && DataTable.DispKind(st, oiRow + md + 1) == 0
+                                   && src.CellReady(DataTable.DispRowOf(st, oiRow + md + 1), 0)
+                                   && src.CellText(DataTable.DispRowOf(st, oiRow + md + 1), cc) == cellText) {
+                                md = md + 1;
+                            }
+                        }
+                        if (cSpan != null && cSpan.IsMaster()) {
+                            c.FillRect(ccl, ry, drawCw, drawRowH, rowBg);
+                            string mShown = DataTable.Truncate(
+                                DataTable.FormatCell(cols[cc], cellText), fs,
+                                drawCw - t.paddingSmall * 2);
+                            int mTw = Canvas.MeasureText(mShown, fs);
+                            int mTx = ccl + t.paddingSmall;
+                            if (cols[cc].align == 1) { mTx = ccl + (drawCw - mTw) / 2; }
+                            else if (cols[cc].align == 2) { mTx = ccl + drawCw - t.paddingSmall - mTw; }
+                            int mFg = DataTable.CellForeground(st, src, rowIdx, cc);
+                            if (mFg == 0) { mFg = sCellBox.FgOr(0); }
+                            int mTy = Canvas.CenterTextY(ry, drawRowH, fs);
+                            c.PushClip(ccl, ry, drawCw, drawRowH);
+                            c.DrawText(mTx, mTy, mShown, mFg, fs);
+                            c.PopClip();
+                        } else if (mu + md > 0) {
+                            c.FillRect(ccl, ry, cw, rowH, rowBg);
+                            string mShown = DataTable.Truncate(
+                                DataTable.FormatCell(cols[cc], cellText), fs,
+                                cw - t.paddingSmall * 2);
+                            int mTw = Canvas.MeasureText(mShown, fs);
+                            int mTx = ccl + t.paddingSmall;
+                            if (cols[cc].align == 1) { mTx = ccl + (cw - mTw) / 2; }
+                            else if (cols[cc].align == 2) { mTx = ccl + cw - t.paddingSmall - mTw; }
+                            int mFg = DataTable.CellForeground(st, src, rowIdx, cc);
+                            if (mFg == 0) { mFg = sCellBox.FgOr(0); }
+                            int mTop = ry - mu * rowH;
+                            int mH = (mu + md + 1) * rowH;
+                            int cTop = mTop;
+                            if (cTop < bodyTop) { cTop = bodyTop; }
+                            int cBot = mTop + mH;
+                            if (cBot > bodyTop + bodyH) { cBot = bodyTop + bodyH; }
+                            c.PopClip();
+                            c.PushClip(ccl, cTop, cw, cBot - cTop);
+                            c.DrawText(mTx, mTop + (mH - fs) / 2, mShown,
+                                       mFg, fs);
+                            c.PopClip();
+                            DataTable.PushBandClip(c, cBand, firstDataX, bandX, bandW,
+                                                   rightX, pinnedW, pinnedRW, ry, rowH,
+                                                   clipRight);
+                        } else if (st.treeAdapter != null && cc == st.treeCol) {
+                            int depth = DataTable.DispDepth(st, oiRow);
+                            bool canExp = DataTable.CanTreeExpand(st, src, rowIdx);
+                            bool isExp = DataTable.IsTreeExpanded(st, src, rowIdx);
+                            if (DataTable.TreeIsLoading(st, rowIdx)) {
+                                int ldSz = app.Scale(12);
+                                c.DrawGlyph("dots",
+                                    ccl + t.paddingSmall + depth * app.Scale(16),
+                                    ry + (rowH - ldSz) / 2, ldSz, sHint.FgOr(0));
+                                DataTable.DrawCellIndented(app, cols[cc], cellText,
+                                    ccl, ry, cw, rowH, cfLo, cfHi,
+                                    DataTable.CellForeground(st, src, rowIdx, cc),
+                                    depth, true, false, false);
+                            } else if (canExp) {
+                                int exId = app.focus.AllocId();
+                                int exW = app.Scale(16) * (depth + 1);
+                                app.hitTester.RegisterRect(exId, ccl, ry, exW, rowH, 0);
+                                if (evt == 3 && app.window.EventButton() == 0
+                                    && app.hitTester.HitTest(app.mouseX, app.mouseY) == exId) {
+                                    DataTable.TreeToggle(st, src, rowIdx);
+                                    app.RequestRedraw();
+                                }
+                            }
+                            DataTable.DrawCellIndented(app, cols[cc], cellText,
+                                ccl, ry, cw, rowH, cfLo, cfHi,
+                                DataTable.CellForeground(st, src, rowIdx, cc),
+                                depth, true, canExp, isExp);
+                        } else {
+                            DataTable.DrawCellRangeCtx(app, cols[cc], cellText, ccl, ry, drawCw, drawRowH,
+                                                  cfLo, cfHi, DataTable.CellForeground(st, src, rowIdx, cc),
+                                                  rowIdx, cc, st, src);
+                        }
+                    }
+                    if (cols[cc].isBool && cols[cc].editable) {
+                        int tgId = app.focus.AllocId();
+                        app.hitTester.RegisterRect(tgId, ccl, ry, cw, rowH, 0);
+                        if (evt == 3 && app.window.EventButton() == 0
+                            && app.hitTester.HitTest(app.mouseX, app.mouseY) == tgId) {
+                            DataTable.ToggleBoolCell(st, cols, src, rowIdx, cc);
+                            app.RequestRedraw();
+                        }
+                    }
+                }
+            }
+            if (cBand >= 0) { c.PopClip(); }
+
+            c.FillRect(x + 1, ry + rowH - 1, viewW - 2, 1, gridColor);
+            r = r + 1;
+        }
+
+        // ---------------- 焦点单元格描边 ----------------
+        if (!st.editing && st.hitOrder >= 0 && st.hitCol >= 0
+            && !DataTable.IsWidgetCol(cols, st.hitCol)) {
+            int efR0 = st.hitOrder;
+            int efR1 = st.hitOrder;
+            int efC0 = st.hitCol;
+            int efC1 = st.hitCol;
+            if (hasRange) {
+                efR0 = rgR0;
+                efR1 = rgR1;
+                efC0 = rgC0;
+                efC1 = rgC1;
+            }
+            int efTop = bodyTop + (efR0 - start) * rowH;
+            if (efTop < bodyTop) { efTop = bodyTop; }
+            int efBottom = bodyTop + (efR1 - start + 1) * rowH;
+            if (efR1 >= start + r) { efBottom = bodyTop + visRows * rowH; }
+            if (efBottom > efTop && efR1 >= start && efR0 < start + r) {
+                int efH = efBottom - efTop;
+                for (int band = 0; band < 3; band = band + 1) {
+                    int efL = 0;
+                    int efR = -1;
+                    for (int vci = 0; vci < frameColumns.Count; vci = vci + 1) {
+                        FrameColumn efc = frameColumns[vci];
+                        if (efc.band != band || efc.column < efC0 || efc.column > efC1) { continue; }
+                        int ecw = st.dispW[efc.column];
+                        if (ecw <= 0) { continue; }
+                        if (efR < 0) { efL = efc.x; efR = efc.x + ecw; }
+                        else {
+                            if (efc.x < efL) { efL = efc.x; }
+                            if (efc.x + ecw > efR) { efR = efc.x + ecw; }
+                        }
+                    }
+                    if (efR > efL) {
+                        DataTable.PushBandClip(c, band, firstDataX, bandX, bandW,
+                                               rightX, pinnedW, pinnedRW, efTop, efH, clipRight);
+                        c.DrawRect(efL, efTop, efR - efL, efH, sAccent.BgOr(0), 1);
+                        c.PopClip();
+                    }
+                }
+            }
+        }
+
+        // ---------------- 空态/加载覆盖层 ----------------
+        st.overlayKind = "";
+        if (total == 0) {
+            bool oloading = src.HasMore() && src.RowCount() == 0;
+            st.overlayKind = oloading ? "loading" : "empty";
+            if (oloading && st.loadingWidget != null) {
+                st.loadingWidget.MeasureTree(app);
+                st.loadingWidget.Arrange(firstDataX, bodyTop, dataViewW, bodyH);
+                st.loadingWidget.RenderTree(app);
+            } else if (!oloading && st.emptyWidget != null) {
+                st.emptyWidget.MeasureTree(app);
+                st.emptyWidget.Arrange(firstDataX, bodyTop, dataViewW, bodyH);
+                st.emptyWidget.RenderTree(app);
+            } else {
+                string omsg = oloading ? st.loadingText : st.emptyText;
+                if (omsg.Length == 0) {
+                    omsg = oloading ? DataTable.T("Loading…", "加载中…")
+                                    : DataTable.T("No data", "暂无数据");
+                }
+                int otx = firstDataX + (dataViewW - Canvas.MeasureText(omsg, fs)) / 2;
+                if (otx < firstDataX) { otx = firstDataX; }
+                c.DrawText(otx, Canvas.CenterTextY(bodyTop, bodyH, fs), omsg,
+                           sHint.FgOr(0), fs);
+            }
+        }
+
+        // ---------------- 填充柄（Excel 式拖拽填充） ----------------
+        st.fillHX = -1;
+        st.fillHY = -1;
+        if (DataTable.HasRange(st) && !st.editing) {
+            int hr1 = DataTable.MaxI(st.rangeR0, st.rangeR1);
+            int hc1 = DataTable.MaxI(st.rangeC0, st.rangeC1);
+            if (hc1 >= 0 && hc1 < st.dispW.Count && hr1 >= start && hr1 < start + r) {
+                int hy = bodyTop + (hr1 - start + 1) * rowH;
+                for (int fh = 0; fh < frameColumns.Count; fh = fh + 1) {
+                    if (frameColumns[fh].column == hc1) {
+                        int hx = frameColumns[fh].x + st.dispW[hc1];
+                        int hsz = app.Scale(7);
+                        st.fillHX = hx;
+                        st.fillHY = hy;
+                        c.FillRect(hx - hsz, hy - hsz, hsz, hsz, sAccent.BgOr(0));
+                        c.DrawRect(hx - hsz, hy - hsz, hsz, hsz, sRow.BgOr(0), 1);
+                        int fillHandleHitId = app.focus.AllocId();
+                        int grabPad = app.Scale(3);
+                        app.hitTester.RegisterRect(fillHandleHitId, hx - hsz - grabPad, hy - hsz - grabPad, hsz + grabPad * 2, hsz + grabPad * 2, 3);
+                    }
+                }
+            }
+        }
+
+        // ---------------- 新行占位符 ----------------
+        if (st.allowAddRow && src.CanInsert() && r < visRows) {
+            int ay = bodyTop + r * rowH;
+            int addId = app.focus.AllocId();
+            app.hitTester.RegisterRect(addId, x, ay, viewW, rowH, 0);
+            bool aHover = app.focus.IsHovered(addId);
+            int aBg = sRow.BgOr(0);
+            if (aHover) { aBg = sRowHover.BgOr(0); }
+            c.FillRect(x + 1, ay, viewW - 2, rowH, aBg);
+            int aIco = app.Scale(12);
+            int aIx = x + app.Scale(8);
+            int aFg = sIcon.FgOr(0);
+            if (aHover) { aFg = sIconSel.FgOr(0); }
+            c.DrawGlyph("plus", aIx, ay + (rowH - aIco) / 2, aIco, aFg);
+            c.DrawText(aIx + aIco + app.Scale(6),
+                       ay + (rowH - Style.FontFallback(app, "small")) / 2,
+                       DataTable.T("Click to add row", "点击添加新行"), aFg, Style.FontFallback(app, "small"));
+            c.FillRect(x + 1, ay + rowH - 1, viewW - 2, 1, gridColor);
+            if (evt == 3 && app.window.EventButton() == 0
+                && app.hitTester.HitTest(app.mouseX, app.mouseY) == addId) {
+                int newRow = DataTable.AppendRow(st, cols, src);
+                if (newRow >= 0) {
+                    DataTable.Recompute(st, cols, src);
+                    DataTable.FocusRow(st, cols, src, newRow);
+                }
+                app.RequestRedraw();
+            }
+        }
+
+        // ---------------- 冻结边界 ----------------
+        if (pinnedW > 0 && bandX < clipRight) {
+            c.FillRect(bandX, y, app.Scale(2), bodyTop + bodyH - y, sSurface.BorderOr(0));
+        }
+        if (pinnedRW > 0 && rightX > firstDataX) {
+            c.FillRect(rightX - app.Scale(2), y, app.Scale(2), bodyTop + bodyH - y, sSurface.BorderOr(0));
+        }
+
+        // ---------------- 行拖放指示器 ----------------
+        if (st.dragRow >= 0 && st.dragMoved) {
+            int dropRow = (app.mouseY - bodyTop) / rowH;
+            if (dropRow < 0) { dropRow = 0; }
+            if (dropRow > visRows) { dropRow = visRows; }
+            int dy = bodyTop + dropRow * rowH;
+            if (dy < bodyTop) { dy = bodyTop; }
+            if (dy > bodyTop + bodyH) { dy = bodyTop + bodyH; }
+            c.FillRect(x + 1, dy - 1, viewW - 2, app.Scale(2), sAccent.BgOr(0));
+            string rl = "";
+            int dragSrcRow = DataTable.DispRowOf(st, st.dragRow);
+            for (int dc = 0; dc < st.colOrder.Count; dc = dc + 1) {
+                int dci = st.colOrder[dc];
+                if (dci < st.colHidden.Count && st.colHidden[dci]) { continue; }
+                rl = DataTable.CellTextRouted(cols, src, dragSrcRow, dci);
+                if (rl != "") { break; }
+            }
+            int rchFs = sAccent.FontOr(Style.FontFallback(app, "small"));
+            rl = DataTable.Truncate(rl, rchFs, app.Scale(180));
+            if (rl != "") {
+                int rchW = Canvas.MeasureText(rl, rchFs) + app.Scale(16);
+                int rchX = app.mouseX + app.Scale(8);
+                if (rchX + rchW > x + viewW) { rchX = x + viewW - rchW; }
+                int rchY = app.mouseY - rowH / 2;
+                if (rchY < bodyTop) { rchY = bodyTop; }
+                c.FillRoundRect(rchX, rchY, rchW, rowH, t.borderRadiusSmall, sAccent.BgOr(0));
+                c.DrawTextCentered(rchX, rchY, rchW, rowH, rl, sAccent.FgOr(0), rchFs);
+            }
+        }
+
+        // ---------------- 内联单元格编辑器浮层 ----------------
+        st.edPopHot = false;
+        if (st.editing && edVis && edW > app.Scale(8)) {
+            DataTable.RenderEditor(app, cols, src, st, edX, edY, edW, edH);
+        }
+    }
+}

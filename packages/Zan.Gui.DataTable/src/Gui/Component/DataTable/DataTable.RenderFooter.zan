@@ -1,0 +1,368 @@
+using System;
+using Gui;
+using Gui.Widget;
+using Gui.Backend;
+
+namespace Gui.Component.DataTable;
+
+// DataTable 渲染管道分层：页脚区域、置底固定行、汇总行、分页器、选区统计状态栏与滚动条交互。
+public partial class DataTable {
+    public static void RenderFooter(App app, int x, int y, int viewW, int viewH,
+                             DataTableFrame f, DataTableBodyLayout lay,
+                             List<DataColumn> cols, DataSource src,
+                             DataTableState st, int evt) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        bool touchUi = app.TouchDevice();
+
+        int numW = f.numW;
+        int selW = f.selW;
+        int gridColor = f.gridColor;
+        int clipRight = f.clipRight;
+        int firstDataX = f.firstDataX;
+        int rowH = f.rowH;
+        int fs = f.fs;
+        int pinnedW = f.pinnedW;
+        int pinnedRW = f.pinnedRW;
+        int bandX = f.bandX;
+        int bandW = f.bandW;
+        int bandNatW = f.bandNatW;
+        int maxScrollX = f.maxScrollX;
+        int rightX = f.rightX;
+        List<FrameColumn> frameColumns = f.columns;
+
+        int total = lay.total;
+        int summaryH = lay.summaryH;
+        int pagerH = lay.pagerH;
+        int statusBarH = lay.statusBarH;
+        int bottomPinnedH = lay.bottomPinnedH;
+        int bodyTop = lay.bodyTop;
+        int bodyH = lay.bodyH;
+        int visRows = lay.visRows;
+        int start = lay.start;
+
+        StyleBox sHint = Style.Part(app, "datatable", "hint", "", "", "", Style.SNormal());
+        StyleBox sCellBox = Style.Part(app, "datatable", "cell", "", "", "", Style.SNormal());
+        StyleBox sFooter = Style.Part(app, "datatable", "footer", "", "", "", Style.SNormal());
+        StyleBox sSbar = Style.Part(app, "datatable", "scrollbar", "", "", "", Style.SNormal());
+        StyleBox sSbarHover = Style.Part(app, "datatable", "scrollbar", "", "", "", Style.SHover());
+
+        // ---------------- 置底固定行 (Pinned Bottom Rows) ----------------
+        if (st.pinnedBottomRows != null && st.pinnedBottomRows.Count > 0) {
+            for (int pbi = 0; pbi < st.pinnedBottomRows.Count; pbi = pbi + 1) {
+                int pby = (bodyTop + bodyH) + pbi * rowH;
+                DataTable.RenderPinnedRow(app, x, pby, viewW, rowH, numW, selW, cols,
+                                         st.pinnedBottomRows[pbi], st, frameColumns,
+                                         firstDataX, bandX, bandW, rightX, pinnedW, pinnedRW,
+                                         clipRight, gridColor, "📌");
+            }
+        }
+
+        // ---------------- 汇总（总计）行 ----------------
+        if (st.showSummary) {
+            int sumY = bodyTop + bodyH + bottomPinnedH;
+            c.FillRect(x + 1, sumY, viewW - 2, summaryH, sFooter.BgOr(0));
+            c.FillRect(x + 1, sumY, viewW - 2, 1, gridColor);
+            int sx = x + numW + selW;
+            if (st.showRowNum || st.showSelect) {
+                c.DrawTextCentered(x, sumY, numW + selW, summaryH, "Σ", sHint.FgOr(0), Style.FontFallback(app, "small"));
+            }
+            int sBand = -1;
+            for (int soi = 0; soi < frameColumns.Count; soi = soi + 1) {
+                FrameColumn summaryColumn = frameColumns[soi];
+                int sc = summaryColumn.column;
+                int cw = st.dispW[sc];
+                if (summaryColumn.band != sBand) {
+                    if (sBand >= 0) { c.PopClip(); }
+                    sBand = summaryColumn.band;
+                    DataTable.PushBandClip(c, sBand, firstDataX, bandX, bandW, rightX,
+                                           pinnedW, pinnedRW, sumY, summaryH, clipRight);
+                }
+                sx = summaryColumn.x;
+                int sBandL = DataTable.BandLeft(summaryColumn.band, firstDataX, bandX, rightX);
+                int sBandR = DataTable.BandRight(summaryColumn.band, firstDataX, bandX, bandW,
+                                                 rightX, pinnedW, pinnedRW, clipRight);
+                if (summaryColumn.band == 1 && sx >= sBandR) {
+                    while (soi + 1 < frameColumns.Count && frameColumns[soi + 1].band == 1) {
+                        soi = soi + 1;
+                    }
+                    continue;
+                }
+                if (sx + cw <= sBandL) {
+                    continue;
+                }
+                if (sx + cw > sBandL && sx < sBandR) {
+                    string stxt = "";
+                    if (st.aggregates != null && sc < st.aggregates.Count) {
+                        stxt = st.aggregates[sc].summaryText;
+                    } else if (sc < st.summaryText.Count) {
+                        stxt = st.summaryText[sc];
+                    }
+                    if (stxt.Length > 0) {
+                        int pad = t.paddingSmall;
+                        string shown = DataTable.Truncate(stxt, fs, cw - pad * 2);
+                        int tw = Canvas.MeasureText(shown, fs);
+                        int tx = sx + pad;
+                        if (cols[sc].align == 2) { tx = sx + cw - pad - tw; }
+                        else if (cols[sc].align == 1) { tx = sx + (cw - tw) / 2; }
+                        int ty = Canvas.CenterTextY(sumY, summaryH, fs);
+                        c.DrawText(tx, ty, shown, sCellBox.FgOr(0), fs);
+                    }
+                }
+            }
+            if (sBand >= 0) { c.PopClip(); }
+        }
+
+        // ---------------- 分页器页脚 ----------------
+        if (st.paged) {
+            int fY = bodyTop + bodyH + bottomPinnedH + summaryH;
+            c.FillRect(x + 1, fY, viewW - 2, pagerH, sFooter.BgOr(0));
+            c.FillRect(x + 1, fY, viewW - 2, 1, gridColor);
+            int totalPages = 1;
+            if (total > 0) { totalPages = (total + visRows - 1) / visRows; }
+            int cur = st.pageModel.Get();
+            int pgW = Pagination.MeasureWidth(app, totalPages, cur);
+            int pgX = x + (viewW - pgW) / 2;
+            if (pgX < x + t.paddingMedium) { pgX = x + t.paddingMedium; }
+            int pgY = fY + (pagerH - t.heightMedium) / 2;
+            Pagination.Of(totalPages, st.pageModel).RenderAt(app, pgX, pgY);
+            int from = (cur - 1) * visRows + 1;
+            int to = cur * visRows;
+            if (to > total) { to = total; }
+            if (total == 0) { from = 0; }
+            string info = Convert.ToString(from) + "-" + Convert.ToString(to) + " / " + Convert.ToString(total);
+            c.DrawText(x + t.paddingMedium, Canvas.CenterTextY(pgY, t.heightMedium, Style.FontFallback(app, "small")), info, sHint.FgOr(0), Style.FontFallback(app, "small"));
+        }
+
+        // ---------------- 状态栏 ----------------
+        if (st.showStatusBar) {
+            int sbY = bodyTop + bodyH + bottomPinnedH + summaryH + pagerH;
+            c.FillRect(x + 1, sbY, viewW - 2, statusBarH, sFooter.BgOr(0));
+            c.FillRect(x + 1, sbY, viewW - 2, 1, gridColor);
+            int sbFs = Style.FontFallback(app, "small");
+            int sbTy = Canvas.CenterTextY(sbY, statusBarH, sbFs);
+
+            int totalSrc = src.RowCount();
+            int shownRows = st.order.Count;
+            string rowInfo = DataTable.T("Rows", "行数:") + " " + Convert.ToString(shownRows);
+            if (shownRows != totalSrc) { rowInfo = rowInfo + " / " + Convert.ToString(totalSrc); }
+            int selCount = 0;
+            if (st.selectionModel != null && st.selectionModel.AllSelected()) { selCount = -1; }
+            else { for (int sci = 0; sci < st.selected.Count; sci = sci + 1) { if (st.selected[sci]) { selCount = selCount + 1; } } }
+            if (selCount > 0) { rowInfo = rowInfo + "    " + DataTable.T("Selected", "已选:") + " " + Convert.ToString(selCount); }
+            c.DrawText(x + t.paddingMedium, sbTy, rowInfo, sFooter.FgOr(0), sbFs);
+
+            List<string> fitems = DataTable.FilterSummaryItems(st, cols);
+            int chipX = x + t.paddingMedium + Canvas.MeasureText(rowInfo, sbFs) + app.Scale(16);
+            int chipRightBar = x + viewW - t.paddingMedium;
+            int chipH2 = statusBarH - app.Scale(8);
+            for (int fi = 0; fi < fitems.Count && chipX < chipRightBar; fi = fi + 1) {
+                string label = fitems[fi];
+                int cw = Canvas.MeasureText(label, sbFs) + app.Scale(22);
+                int cwx = chipX + cw;
+                if (cwx > chipRightBar) { break; }
+                int chipId = app.focus.AllocId();
+                int chipState2 = Style.SNormal();
+                if (app.focus.IsHovered(chipId)) { chipState2 = Style.SHover(); }
+                StyleBox sChip2 = Style.Part(app, "datatable", "chip", "", "rule", "",
+                                             chipState2);
+                c.FillRoundRect(chipX, sbY + app.Scale(4), cw, chipH2, chipH2 / 2, sChip2.BgOr(0));
+                c.DrawTextCentered(chipX, sbY + app.Scale(4), cw - app.Scale(12), chipH2,
+                                   label, sChip2.FgOr(0), sbFs);
+                int xx = chipX + cw - app.Scale(14);
+                c.DrawTextCentered(xx, sbY + app.Scale(4), app.Scale(12), chipH2,
+                                   "×", sChip2.FgOr(0), sbFs);
+                app.hitTester.RegisterRectL(chipId, chipX, sbY + app.Scale(4), cw, chipH2, 0,
+                                            label);
+                if (evt == 3 && app.window.EventButton() == 0
+                    && app.hitTester.HitTest(app.mouseX, app.mouseY) == chipId) {
+                    if (fi >= cols.Count) {
+                        DataTable.SetFilterTree(st, null);
+                    } else {
+                        st.filters[fi].Reset();
+                        if (fi < st.filterRowText.Count) { st.filterRowText[fi] = ""; }
+                    }
+                    DataTable.InvalidateQuery(st);
+                    st.FilterChanged.Raise();
+                    app.RequestRedraw();
+                }
+                chipX = cwx + app.Scale(6);
+            }
+
+            if (DataTable.HasRange(st) || DataTable.HasMulti(st)) {
+                int nRanges = DataTable.RangeCount(st);
+                int rsum = 0;
+                int rcount = 0;
+                for (int qi = 0; qi < nRanges; qi = qi + 1) {
+                    int qr0 = -1; int qc0 = -1; int qr1 = -1; int qc1 = -1;
+                    if (!DataTable.RangeAt(st, qi, out qr0, out qc0, out qr1, out qc1)) { continue; }
+                    int rri = qr0;
+                    while (rri <= qr1 && rri < DataTable.DispCount(st)) {
+                        if (DataTable.DispKind(st, rri) == 0) {
+                            int drow = DataTable.DispRowOf(st, rri);
+                            int rci = qc0;
+                            while (rci <= qc1 && rci < cols.Count) {
+                                bool dup = false;
+                                for (int qj = 0; qj < qi && !dup; qj = qj + 1) {
+                                    int jr0 = -1; int jc0 = -1; int jr1 = -1; int jc1 = -1;
+                                    if (DataTable.RangeAt(st, qj, out jr0, out jc0, out jr1, out jc1)
+                                        && rri >= jr0 && rri <= jr1 && rci >= jc0 && rci <= jc1) {
+                                        dup = true;
+                                    }
+                                }
+                                if (!dup && cols[rci].numeric) {
+                                    double frv = 0.0;
+                                    if (cols[rci].formula.Length > 0
+                                        && DataTable.FormulaTryReal(cols, src, drow, rci, out frv)) {
+                                        rsum = rsum + (int)frv;
+                                    } else {
+                                        rsum = rsum + src.CellNum(drow, rci);
+                                    }
+                                    rcount = rcount + 1;
+                                }
+                                rci = rci + 1;
+                            }
+                        }
+                        rri = rri + 1;
+                    }
+                }
+                if (rcount > 0) {
+                    int ravg = rsum / rcount;
+                    string rangeInfo = DataTable.T("Sum", "选区求和:") + " " + Convert.ToString(rsum)
+                        + "    " + DataTable.T("Average", "平均:") + " " + Convert.ToString(ravg)
+                        + "    " + DataTable.T("Cells", "单元格:") + " " + Convert.ToString(rcount);
+                    int rw = Canvas.MeasureText(rangeInfo, sbFs);
+                    c.DrawText(x + viewW - t.paddingMedium - rw, sbTy, rangeInfo, sFooter.FgOr(0), sbFs);
+                }
+            }
+        }
+
+        // ---------------- 垂直/水平滚动条 ----------------
+        if (app.focus.pressedId < 0) {
+            st.dragVbar = false;
+            st.dragHbar = false;
+        }
+
+        // 垂直滚动条
+        if (!st.paged && total > visRows && visRows > 0) {
+            int sbW = app.Scale(8);
+            int sbX = x + viewW - sbW - app.Scale(2);
+            int trackY = bodyTop + app.Scale(2);
+            int trackH = bodyH - app.Scale(4);
+            int thumbH = trackH * visRows / total;
+            if (thumbH < app.Scale(24)) { thumbH = app.Scale(24); }
+            int maxStart = total - visRows;
+            int thumbY = trackY;
+            if (maxStart > 0) { thumbY = trackY + (trackH - thumbH) * start / maxStart; }
+
+            int sbId = app.focus.AllocId();
+            bool sbHover = app.focus.IsHovered(sbId);
+            int thumbColor = sSbar.BgOr(0);
+            if (sbHover || st.dragVbar) { thumbColor = sSbarHover.BgOr(0); }
+            c.FillRoundRect(sbX, thumbY, sbW, thumbH, sbW / 2, thumbColor);
+            app.hitTester.RegisterRect(sbId, sbX, trackY, sbW, trackH, 0);
+            if (st.dragVbar || app.focus.pressedId == sbId) {
+                if (touchUi) { app.ClaimDrag(); }
+                st.dragVbar = true;
+            }
+            if (st.dragVbar && maxStart > 0) {
+                int rel = app.mouseY - trackY - thumbH / 2;
+                int denom = trackH - thumbH;
+                if (denom < 1) { denom = 1; }
+                int ns = rel * maxStart / denom;
+                if (ns < 0) { ns = 0; }
+                if (ns > maxStart) { ns = maxStart; }
+                if (ns != st.scrollRow) { st.scrollRow = ns; st.ScrollChanged.Raise(); app.RequestRedraw(); }
+            }
+        }
+
+        // 水平滚动条
+        if (maxScrollX > 0) {
+            int hbH = app.Scale(8);
+            int hbY = bodyTop + bodyH - hbH - app.Scale(2);
+            int htrackX = bandX + app.Scale(2);
+            int htrackW = bandW - app.Scale(4);
+            if (htrackW < app.Scale(24)) { htrackW = app.Scale(24); }
+            int thumbW = htrackW * bandW / bandNatW;
+            if (thumbW < app.Scale(24)) { thumbW = app.Scale(24); }
+            int thumbX = htrackX + (htrackW - thumbW) * st.scrollX / maxScrollX;
+            int hbId = app.focus.AllocId();
+            bool hbHover = app.focus.IsHovered(hbId);
+            int hbColor = sSbar.BgOr(0);
+            if (hbHover || st.dragHbar) { hbColor = sSbarHover.BgOr(0); }
+            c.FillRoundRect(thumbX, hbY, thumbW, hbH, hbH / 2, hbColor);
+            app.hitTester.RegisterRect(hbId, htrackX, hbY, htrackW, hbH, 0);
+            if (st.dragHbar || app.focus.pressedId == hbId) {
+                if (touchUi) { app.ClaimDrag(); }
+                st.dragHbar = true;
+            }
+            if (st.dragHbar) {
+                int rel = app.mouseX - htrackX - thumbW / 2;
+                int denom = htrackW - thumbW;
+                if (denom < 1) { denom = 1; }
+                int ns = rel * maxScrollX / denom;
+                if (ns < 0) { ns = 0; }
+                if (ns > maxScrollX) { ns = maxScrollX; }
+                if (ns != st.scrollX) { st.scrollX = ns; app.RequestRedraw(); }
+            }
+        }
+
+        // 鼠标滚轮滚动表格体
+        bool ownsBodyWheel = false;
+        if (visRows > 0) {
+            ownsBodyWheel = app.CaptureWheel(x, bodyTop, viewW, bodyH);
+        }
+        if (st.openMenu < 0 && !st.colChooserOpen && ownsBodyWheel
+            && maxScrollX > 0 && ((app.window.EventMods() & 4) != 0
+                                  || (app.window.EventMods() & 2) != 0)) {
+            int hDelta = app.window.EventKeyCode();
+            int hStep = hDelta / 120;
+            if (hStep == 0) { if (hDelta > 0) { hStep = 1; } else if (hDelta < 0) { hStep = 0 - 1; } }
+            int nsx = st.scrollX - hStep * app.Scale(48);
+            if (nsx < 0) { nsx = 0; }
+            if (nsx > maxScrollX) { nsx = maxScrollX; }
+            if (nsx != st.scrollX) { st.scrollX = nsx; app.RequestRedraw(); }
+        } else if (st.openMenu < 0 && !st.colChooserOpen && ownsBodyWheel
+                   && (app.window.EventMods() & 1) != 0
+                   && !st.paged && DataTable.HasRange(st)) {
+            int wDelta = app.window.EventKeyCode();
+            int wStep = wDelta / 120;
+            if (wStep == 0) { if (wDelta > 0) { wStep = 1; } else if (wDelta < 0) { wStep = 0 - 1; } }
+            int anchor = st.rangeR0;
+            int far = st.rangeR1;
+            if (far >= anchor && anchor >= 0) {
+                int nf = far - wStep;
+                if (nf < anchor) { nf = anchor; }
+                if (nf > DataTable.DispCount(st) - 1) { nf = DataTable.DispCount(st) - 1; }
+                if (nf != far) {
+                    st.rangeR1 = nf;
+                    st.rangeC1 = st.rangeC0;
+                    DataTable.SyncRangeChecks(st, src);
+                    DataTable.ScrollSlotIntoView(st, nf, visRows);
+                    st.SelectionChanged.Raise();
+                    app.RequestRedraw();
+                }
+            }
+        } else if (st.openMenu < 0 && !st.colChooserOpen && ownsBodyWheel) {
+            if (total > visRows) {
+                int delta = app.window.EventKeyCode();
+                int step = delta / 120;
+                if (step == 0) { if (delta > 0) { step = 1; } else if (delta < 0) { step = 0 - 1; } }
+                if (st.paged) {
+                    int totalPages = (total + visRows - 1) / visRows;
+                    int cp = st.pageModel.Get();
+                    int np = cp - step;
+                    if (np < 1) { np = 1; }
+                    if (np > totalPages) { np = totalPages; }
+                    if (np != cp) { st.pageModel.Set(np); app.RequestRedraw(); }
+                } else {
+                    int ns = st.scrollRow - step * 3;
+                    int maxStart = total - visRows;
+                    if (ns < 0) { ns = 0; }
+                    if (ns > maxStart) { ns = maxStart; }
+                    if (ns != st.scrollRow) { st.scrollRow = ns; st.ScrollChanged.Raise(); app.RequestRedraw(); }
+                }
+            }
+        }
+    }
+}

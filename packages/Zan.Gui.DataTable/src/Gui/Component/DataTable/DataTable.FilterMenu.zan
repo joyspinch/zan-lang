@@ -1,0 +1,518 @@
+using System;
+using Gui;
+using Gui.Widget;
+using Gui.Backend;
+
+namespace Gui.Component.DataTable;
+
+// DataTable 列头筛选菜单（Filter Menu）：DevExpress 风格弹窗，涵盖值列表（Values）、文本规则（Text）、批量（Batch）与高级规则（Rules）。
+public partial class DataTable {
+    // 打开 `col` 列的表头筛选菜单（重置页签/搜索/批量行并
+    // 预取去重值）。图标点击与表头上下文菜单的"筛选…"项
+    // 共用，保证两条入口的初始状态一致。
+    public static void OpenFilterMenu(DataTableState st, List<DataColumn> cols,
+                               DataSource src, int col) {
+        st.openMenu = col;
+        st.filterTab = 0;
+        st.searchText = "";
+        st.valScroll = 0;
+        st.editFocus = 0;
+        st.batchLines = new List<string>();
+        st.batchLines.Add("");
+        st.batchExactFlag = 0;
+        st.menuVals = DataTable.DistinctFiltered(st, cols, src, col);
+        st.menuMatched = st.menuVals;
+        st.menuSearchCache = "";
+    }
+
+
+    // "Rules" 筛选页：值比较、相对日期预设（仅日期
+    // 列）和 Top-N。返回所绘内容下方的 y。
+    // RenderRulesTab 为这个 筛选/列 组合占用的高度。
+    // 与渲染器并列维护以保持同步：其中的每次 `cy` 前进
+    // 在此都有对应项，包括仅日期列
+    // 或选定计数型前/后模式后才出现的部分。
+    public static int RulesTabHeight(App app, ColFilter f, DataColumn col) {
+        int chipH = app.Scale(22);
+        int gap = app.Scale(4);
+        int boxH = app.Scale(26);
+        int lblH = Canvas.FontHeight(Style.FontFallback(app, "small")) + app.Scale(4);
+
+        int h = lblH;  // "Compare"
+        h = h + (chipH + gap) * 2;  // 八个运算符芯片
+        h = h + chipH + app.Scale(6);  // 为空 / 非空
+        if (f.cmpMode != 0 && f.cmpMode != 9 && f.cmpMode != 10) {
+            h = h + boxH + app.Scale(4);  // 一或两个操作数输入框
+        }
+        h = h + app.Scale(6);
+        if (col.isDate) {
+            h = h + lblH + (chipH + gap) * 4 + app.Scale(6);
+        }
+        h = h + lblH;  // "Top / bottom"
+        h = h + (chipH + gap) * 2;  // 六个前/后芯片
+        if (f.topMode >= 1 && f.topMode <= 4) { h = h + boxH; }
+        return h;
+    }
+
+    // 绘制 "Rules" 筛选页：比较运算符芯片与操作数输入框、
+    // 空值规则、日期预设（仅日期列）与 Top-N（含 N 输入框
+    // 与 +/- 步进）；改动即失效查询。返回绘制后的 y。
+    public static int RenderRulesTab(App app, int mx, int cy, int menuW, int pad,
+                              ColFilter f, DataColumn col, DataTableState st) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int fs = Style.FontFallback(app, "small");
+        int chipH = app.Scale(22);
+        int gap = app.Scale(4);
+        int innerW = menuW - pad * 2;
+        StyleBox sLabel = Style.Part(app, "datatable", "label", "", "", "",
+                                     Style.SNormal());
+
+        // ---- 比较 ----
+        c.DrawText(mx + pad, cy, DataTable.T("Compare", "Compare"), sLabel.FgOr(0), fs);
+        cy = cy + Canvas.FontHeight(fs) + app.Scale(4);
+
+        // 两行共八个运算符；再次点击芯片可关闭对应模式
+        int cw4 = (innerW - gap * 3) / 4;
+        List<string> ops = new List<string>{
+            ">", ">=", "<", "<=",
+            "=", "<>", "in", "not in" };
+        for (int oi = 0; oi < ops.Count; oi = oi + 1) {
+            int mode = oi + 1;
+            int bx = mx + pad + (cw4 + gap) * (oi % 4);
+            int by = cy + (chipH + gap) * (oi / 4);
+            if (DataTable.Chip(app, bx, by, cw4, chipH, ops[oi], f.cmpMode == mode)) {
+                if (f.cmpMode == mode) { f.cmpMode = 0; } else { f.cmpMode = mode; }
+                st.editFocus = 4;
+                DataTable.InvalidateQuery(st);
+                st.FilterChanged.Raise();
+                app.RequestRedraw();
+            }
+        }
+        cy = cy + (chipH + gap) * 2;
+
+        // 两个空值规则占用更宽芯片，因无需操作数
+        int cw2 = (innerW - gap) / 2;
+        if (DataTable.Chip(app, mx + pad, cy, cw2, chipH, DataTable.T("is empty", "is empty"), f.cmpMode == 9)) {
+            if (f.cmpMode == 9) { f.cmpMode = 0; } else { f.cmpMode = 9; st.editFocus = 0; }
+            DataTable.InvalidateQuery(st); st.FilterChanged.Raise(); app.RequestRedraw();
+        }
+        if (DataTable.Chip(app, mx + pad + cw2 + gap, cy, cw2, chipH, DataTable.T("not empty", "not empty"), f.cmpMode == 10)) {
+            if (f.cmpMode == 10) { f.cmpMode = 0; } else { f.cmpMode = 10; st.editFocus = 0; }
+            DataTable.InvalidateQuery(st); st.FilterChanged.Raise(); app.RequestRedraw();
+        }
+        cy = cy + chipH + app.Scale(6);
+
+        // 操作数输入框：单边运算符一个，in/not in 两个。
+        // 空值规则不需要操作数，因此完全没有输入框。
+        bool twoSided = f.cmpMode == 7 || f.cmpMode == 8;
+        bool needsA = f.cmpMode != 0 && f.cmpMode != 9 && f.cmpMode != 10;
+        int boxH = app.Scale(26);
+        if (needsA) {
+            int aw = innerW;
+            if (twoSided) { aw = (innerW - gap) / 2; }
+            DataTable.EditBox(app, mx + pad, cy, aw, boxH, f.cmpA, "value", st.editFocus == 4);
+            int aId = app.focus.AllocId();
+            app.hitTester.RegisterRect(aId, mx + pad, cy, aw, boxH, 0);
+            if (app.EventKind() == 3 && app.hitTester.HitTest(app.mouseX, app.mouseY) == aId) {
+                st.editFocus = 4; app.RequestRedraw();
+            }
+            if (twoSided) {
+                int bx2 = mx + pad + aw + gap;
+                DataTable.EditBox(app, bx2, cy, aw, boxH, f.cmpB, "and", st.editFocus == 5);
+                int bId = app.focus.AllocId();
+                app.hitTester.RegisterRect(bId, bx2, cy, aw, boxH, 0);
+                if (app.EventKind() == 3 && app.hitTester.HitTest(app.mouseX, app.mouseY) == bId) {
+                    st.editFocus = 5; app.RequestRedraw();
+                }
+            }
+            cy = cy + boxH + app.Scale(4);
+        }
+        cy = cy + app.Scale(6);
+
+        // ---- 日期预设（仅日期列）----
+        if (col.isDate) {
+            c.DrawText(mx + pad, cy, DataTable.T("Date range", "Date range"), sLabel.FgOr(0), fs);
+            cy = cy + Canvas.FontHeight(fs) + app.Scale(4);
+            List<string> ps = new List<string>{
+                DataTable.T("Today", "Today"), DataTable.T("Yesterday", "Yesterday"), DataTable.T("This week", "This week"),
+                DataTable.T("Last 7d", "Last 7d"), DataTable.T("This month", "This month"), DataTable.T("Last 30d", "Last 30d"),
+                DataTable.T("Quarter", "Quarter"), DataTable.T("This year", "This year"), DataTable.T("YTD", "YTD"),
+                DataTable.T("Past", "Past"), DataTable.T("Future", "Future") };
+            int cw3 = (innerW - gap * 2) / 3;
+            for (int pi = 0; pi < ps.Count; pi = pi + 1) {
+                int preset = pi + 1;
+                int bx = mx + pad + (cw3 + gap) * (pi % 3);
+                int by = cy + (chipH + gap) * (pi / 3);
+                if (DataTable.Chip(app, bx, by, cw3, chipH, ps[pi], f.datePreset == preset)) {
+                    if (f.datePreset == preset) { f.datePreset = 0; } else { f.datePreset = preset; }
+                    DataTable.InvalidateQuery(st); st.FilterChanged.Raise(); app.RequestRedraw();
+                }
+            }
+            cy = cy + (chipH + gap) * 4 + app.Scale(6);
+        }
+
+        // ---- Top-N ----
+        c.DrawText(mx + pad, cy, DataTable.T("Top / bottom", "Top / bottom"), sLabel.FgOr(0), fs);
+        cy = cy + Canvas.FontHeight(fs) + app.Scale(4);
+        List<string> tops = new List<string>{
+            DataTable.T("Top N", "Top N"), DataTable.T("Bottom N", "Bottom N"), DataTable.T("Top N%", "Top N%"),
+            DataTable.T("Bot N%", "Bot N%"), DataTable.T("Above avg", "Above avg"), DataTable.T("Below avg", "Below avg") };
+        int cw3b = (innerW - gap * 2) / 3;
+        for (int ti = 0; ti < tops.Count; ti = ti + 1) {
+            int mode = ti + 1;
+            int bx = mx + pad + (cw3b + gap) * (ti % 3);
+            int by = cy + (chipH + gap) * (ti / 3);
+            if (DataTable.Chip(app, bx, by, cw3b, chipH, tops[ti], f.topMode == mode)) {
+                if (f.topMode == mode) { f.topMode = 0; } else { f.topMode = mode; }
+                DataTable.InvalidateQuery(st); st.FilterChanged.Raise(); app.RequestRedraw();
+            }
+        }
+        cy = cy + (chipH + gap) * 2;
+
+        // N 只对四种计数模式有意义
+        if (f.topMode >= 1 && f.topMode <= 4) {
+            int lw = app.Scale(20);
+            c.DrawText(mx + pad, Canvas.CenterTextY(cy, boxH, fs), "N", sLabel.FgOr(0), fs);
+            int nx = mx + pad + lw;
+            int nw = app.Scale(64);
+            DataTable.EditBox(app, nx, cy, nw, boxH, Convert.ToString(f.topN), "10", st.editFocus == 6);
+            int nId = app.focus.AllocId();
+            app.hitTester.RegisterRect(nId, nx, cy, nw, boxH, 0);
+            if (app.EventKind() == 3 && app.hitTester.HitTest(app.mouseX, app.mouseY) == nId) {
+                st.editFocus = 6; app.RequestRedraw();
+            }
+            int spw = app.Scale(24);
+            if (DataTable.TextBtn(app, nx + nw + gap, cy, spw, boxH, "-", false)) {
+                if (f.topN > 1) { f.topN = f.topN - 1; DataTable.InvalidateQuery(st); st.FilterChanged.Raise(); }
+                app.RequestRedraw();
+            }
+            if (DataTable.TextBtn(app, nx + nw + gap + spw + gap, cy, spw, boxH, "+", false)) {
+                f.topN = f.topN + 1; DataTable.InvalidateQuery(st); st.FilterChanged.Raise(); app.RequestRedraw();
+            }
+            cy = cy + boxH;
+        }
+        return cy;
+    }
+
+    // 列头筛选弹窗总入口：标题 + 升/降序按钮、四个标签页
+    // （Values/Text/Batch/Rules）与页脚 Clear/Close；按键按
+    // editFocus 路由到对应编辑框，点击面板外（且不在列头上）
+    // 时关闭。锚定在 `mi` 列下方，整体限制在窗口内。
+    public static void RenderMenu(App app, int x, int y, int viewW, int headerH, int numW, int selW,
+                           List<DataColumn> cols, DataSource src, DataTableState st) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int mi = st.openMenu;
+        ColFilter f = st.filters[mi];
+        StyleBox sMenu = Style.Part(app, "datatable", "menu", "", "", "",
+                                    Style.SNormal());
+        StyleBox sGrid = Style.Part(app, "datatable", "grid", "", "", "",
+                                    Style.SNormal());
+        StyleBox sHint = Style.Part(app, "datatable", "hint", "", "", "",
+                                    Style.SNormal());
+        StyleBox sLabel = Style.Part(app, "datatable", "label", "", "", "",
+                                     Style.SNormal());
+        StyleBox sRowHover = Style.Part(app, "datatable", "row", "", "", "",
+                                        Style.SHover());
+        StyleBox sAccent = Style.Part(app, "datatable", "accent", "", "", "",
+                                      Style.SNormal());
+
+        int pad = app.Scale(10);
+        int fs = Style.FontFallback(app, "small");
+        int fsM = Style.FontFallback(app, "medium");
+        int rowH = app.Scale(28);
+        int menuW = app.Scale(256);
+        int menuH = app.Scale(348);
+        // Rules 页堆叠多个高度不一的区块，面板
+        // 用该页自身的布局算式确定尺寸，而非
+        // 手工调优的常量——主题度量变化时不会裁切。
+        if (st.filterTab == 3) {
+            menuH = app.Scale(8) + rowH + app.Scale(6)  // 标题行
+                  + rowH + app.Scale(8)  // 标签条
+                  + DataTable.RulesTabHeight(app, f, cols[mi])
+                  + app.Scale(40);  // 页脚
+        }
+
+        // 锚定在列下方，整体限制在窗口内
+        int mx = x + numW + selW - st.scrollX;
+        for (int k = 0; k < mi; k = k + 1) { mx = mx + st.dispW[k]; }
+        if (mx + menuW > x + viewW) { mx = x + viewW - menuW; }
+        if (mx < x) { mx = x; }
+        int my = y + headerH;
+        int canH = c.Height();
+        if (my + menuH > canH) { my = canH - menuH - app.Scale(6); }
+        if (my < app.titlebarH) { my = app.titlebarH; }
+
+        // 接管弹窗上的滚轮，避免下层页面滚动
+        app.CaptureWheel(mx, my, menuW, menuH);
+        // 吞掉整个面板的点击，空白区域不穿透
+        app.BlockHitsRect(mx, my, menuW, menuH);
+
+        // 把按键路由到获得焦点的编辑框
+        if (app.EventKind() == 6 && st.editFocus != 0) {
+            int chv = app.window.EventKeyCode();
+            if (st.editFocus == 1) {
+                if (chv == 8) { st.searchText = DataTable.Backspace(st.searchText); }
+                else { string ad = Text.CharStr(chv); if (ad.Length > 0) { st.searchText = st.searchText + ad; } }
+            } else if (st.editFocus == 2) {
+                if (chv == 8) { f.textQuery = DataTable.Backspace(f.textQuery); }
+                else { string ad = Text.CharStr(chv); if (ad.Length > 0) { f.textQuery = f.textQuery + ad; } }
+                DataTable.InvalidateQuery(st);
+                st.FilterChanged.Raise();
+            } else if (st.editFocus == 3) {
+                int last = st.batchLines.Count - 1;
+                if (last < 0) { st.batchLines.Add(""); last = 0; }
+                if (chv == 13) { st.batchLines.Add(""); }
+                else if (chv == 8) {
+                    string cur = st.batchLines[last];
+                    if (cur.Length > 0) { st.batchLines[last] = DataTable.Backspace(cur); }
+                    else if (last > 0) { st.batchLines.RemoveAt(last); }
+                } else {
+                    string ad = Text.CharStr(chv);
+                    if (ad.Length > 0) { st.batchLines[last] = st.batchLines[last] + ad; }
+                }
+            } else if (st.editFocus == 4 || st.editFocus == 5) {
+                // 比较操作数：实时编辑，同 Text 页的查询
+                string cur = f.cmpA;
+                if (st.editFocus == 5) { cur = f.cmpB; }
+                if (chv == 8) { cur = DataTable.Backspace(cur); }
+                else { string ad = Text.CharStr(chv); if (ad.Length > 0) { cur = cur + ad; } }
+                if (st.editFocus == 5) { f.cmpB = cur; } else { f.cmpA = cur; }
+                DataTable.InvalidateQuery(st);
+                st.FilterChanged.Raise();
+            } else if (st.editFocus == 6) {
+                // Top-N 数量：仅限数字，保证步进值始终是数字
+                if (chv == 8) {
+                    f.topN = f.topN / 10;
+                } else if (chv >= 48 && chv <= 57 && f.topN < 100000) {
+                    f.topN = f.topN * 10 + (chv - 48);
+                }
+                DataTable.InvalidateQuery(st);
+                st.FilterChanged.Raise();
+            }
+            app.RequestRedraw();
+        }
+
+        // 面板
+        c.FillRoundRect(mx + app.Scale(2), my + app.Scale(3), menuW, menuH, t.borderRadiusMedium, t.overlay);
+        c.FillRoundRect(mx, my, menuW, menuH, t.borderRadiusMedium, sMenu.BgOr(0));
+        c.DrawRoundRect(mx, my, menuW, menuH, t.borderRadiusMedium, sMenu.BorderOr(0), 1);
+
+        // 表头：标题 + 升/降序
+        int hy = my + app.Scale(8);
+        c.DrawText(mx + pad, Canvas.CenterTextY(hy, rowH, fsM), cols[mi].title, sMenu.FgOr(0), fsM);
+        int sbw = app.Scale(26);
+        int sUpX = mx + menuW - pad - sbw * 2 - app.Scale(4);
+        int sDnX = mx + menuW - pad - sbw;
+        if (DataTable.IconBtn(app, sUpX, hy, sbw, rowH, "arrow-up", st.sortCol == mi && st.sortDir == 1)) {
+            DataTable.SortBy(st, mi, 1); app.RequestRedraw();
+        }
+        if (DataTable.IconBtn(app, sDnX, hy, sbw, rowH, "arrow-down", st.sortCol == mi && st.sortDir == 2)) {
+            DataTable.SortBy(st, mi, 2); app.RequestRedraw();
+        }
+        int cy = hy + rowH + app.Scale(6);
+
+        // 标签页
+        int tabW = (menuW - pad * 2) / 4;
+        if (DataTable.TabBtn(app, mx + pad, cy, tabW, rowH, DataTable.T("Values", "Values"), st.filterTab == 0)) { st.filterTab = 0; st.editFocus = 0; app.RequestRedraw(); }
+        if (DataTable.TabBtn(app, mx + pad + tabW, cy, tabW, rowH, DataTable.T("Text", "Text"), st.filterTab == 1)) { st.filterTab = 1; st.editFocus = 0; app.RequestRedraw(); }
+        if (DataTable.TabBtn(app, mx + pad + tabW * 2, cy, tabW, rowH, DataTable.T("Batch", "Batch"), st.filterTab == 2)) { st.filterTab = 2; st.editFocus = 0; app.RequestRedraw(); }
+        if (DataTable.TabBtn(app, mx + pad + tabW * 3, cy, tabW, rowH, DataTable.T("Rules", "Rules"), st.filterTab == 3)) { st.filterTab = 3; st.editFocus = 0; app.RequestRedraw(); }
+        c.FillRect(mx + pad, cy + rowH, menuW - pad * 2, 1, sGrid.BgOr(0));
+        cy = cy + rowH + app.Scale(8);
+
+        int footerH = app.Scale(40);
+        int contentBottom = my + menuH - footerH;
+
+        if (st.filterTab == 0) {
+            int boxH = app.Scale(26);
+            DataTable.EditBox(app, mx + pad, cy, menuW - pad * 2, boxH, st.searchText, DataTable.T("Search values...", "Search values..."), st.editFocus == 1);
+            int sId = app.focus.AllocId();
+            app.hitTester.RegisterRect(sId, mx + pad, cy, menuW - pad * 2, boxH, 0);
+            if (app.EventKind() == 3 && app.hitTester.HitTest(app.mouseX, app.mouseY) == sId) { st.editFocus = 1; app.RequestRedraw(); }
+            cy = cy + boxH + app.Scale(6);
+
+            int itemH = app.Scale(24);
+            int allId = app.focus.AllocId();
+            bool anyHidden = f.hidden.Count > 0;
+            if (app.focus.IsHovered(allId)) { c.FillRect(mx + pad, cy, menuW - pad * 2, itemH, sRowHover.BgOr(0)); }
+            DataTable.DrawMiniCheck(app, mx + pad, cy, itemH, !anyHidden);
+            c.DrawText(mx + pad + app.Scale(22), Canvas.CenterTextY(cy, itemH, fs), "(Select All)", sMenu.FgOr(0), fs);
+            app.hitTester.RegisterRect(allId, mx + pad, cy, menuW - pad * 2, itemH, 0);
+            if (app.EventKind() == 3 && app.hitTester.HitTest(app.mouseX, app.mouseY) == allId) {
+                f.hidden.Clear();
+                DataTable.InvalidateQuery(st); st.FilterChanged.Raise(); app.RequestRedraw();
+            }
+            cy = cy + itemH;
+
+            // 仅在搜索文本变化时重建筛选值列表
+            // （而非每帧）：一列可能有数千个不同值，
+            // 每帧重扫和重分配会卡顿。列表
+            // 已虚拟化——只绘制可见窗口——因此
+            // 无论有多少不同值都保持流畅。
+            if (!(st.searchText == st.menuSearchCache)) {
+                st.menuMatched = new List<string>();
+                for (int vi0 = 0; vi0 < st.menuVals.Count; vi0 = vi0 + 1) {
+                    if (DataTable.ContainsCI(st.menuVals[vi0], st.searchText)) { st.menuMatched.Add(st.menuVals[vi0]); }
+                }
+                st.menuSearchCache = st.searchText;
+                st.valScroll = 0;
+            }
+            List<string> matched = st.menuMatched;
+
+            int sbGW = app.Scale(10);
+            int listX = mx + pad;
+            int itemW = menuW - pad * 2 - sbGW;
+            int listH = contentBottom - cy;
+            int visN = listH / itemH;
+            if (visN < 1) { visN = 1; }
+            int maxScroll = matched.Count - visN;
+            if (maxScroll < 0) { maxScroll = 0; }
+            if (st.valScroll > maxScroll) { st.valScroll = maxScroll; }
+            if (st.valScroll < 0) { st.valScroll = 0; }
+
+            int listTop = cy;
+            for (int r2 = 0; r2 < visN && (st.valScroll + r2) < matched.Count; r2 = r2 + 1) {
+                string v = matched[st.valScroll + r2];
+                int vId = app.focus.AllocId();
+                if (app.focus.IsHovered(vId)) { c.FillRect(listX, cy, itemW, itemH, sRowHover.BgOr(0)); }
+                bool visible = !f.IsHidden(v);
+                DataTable.DrawMiniCheck(app, listX, cy, itemH, visible);
+                string label = DataTable.Truncate(v, fs, itemW - app.Scale(26));
+                c.DrawText(listX + app.Scale(22), Canvas.CenterTextY(cy, itemH, fs), label, sMenu.FgOr(0), fs);
+                app.hitTester.RegisterRect(vId, listX, cy, itemW, itemH, 0);
+                if (app.EventKind() == 3 && app.hitTester.HitTest(app.mouseX, app.mouseY) == vId) {
+                    f.Toggle(v); DataTable.InvalidateQuery(st); st.FilterChanged.Raise(); app.RequestRedraw();
+                }
+                cy = cy + itemH;
+            }
+
+            // 虚拟化值列表的可拖拽滚动条
+            if (matched.Count > visN) {
+                int trackH = visN * itemH;
+                SignalInt vsPx = new SignalInt(st.valScroll * itemH);
+                Scrollbar.RenderVerticalScroll(app, listX + itemW + app.Scale(3),
+                    listTop, trackH, matched.Count * itemH, trackH, vsPx);
+                int nvs = vsPx.Get() / itemH;
+                if (nvs > maxScroll) { nvs = maxScroll; }
+                if (nvs < 0) { nvs = 0; }
+                if (nvs != st.valScroll) { st.valScroll = nvs; app.RequestRedraw(); }
+            }
+            if (app.EventKind() == 13) {
+                bool inside = app.mouseX >= mx && app.mouseX < mx + menuW && app.mouseY >= my && app.mouseY < my + menuH;
+                if (inside) {
+                    int delta = app.window.EventKeyCode();
+                    st.valScroll = st.valScroll - delta / 120;
+                    if (st.valScroll > maxScroll) { st.valScroll = maxScroll; }
+                    if (st.valScroll < 0) { st.valScroll = 0; }
+                    app.RequestRedraw();
+                }
+            }
+        } else if (st.filterTab == 1) {
+            int chipW = (menuW - pad * 2 - app.Scale(9)) / 4;
+            int chipH = app.Scale(24);
+            int gap = app.Scale(3);
+            if (DataTable.TabBtn(app, mx + pad, cy, chipW, chipH, DataTable.T("Contains", "Contains"), f.textMode == 1)) { f.textMode = 1; DataTable.InvalidateQuery(st); st.FilterChanged.Raise(); app.RequestRedraw(); }
+            if (DataTable.TabBtn(app, mx + pad + (chipW + gap), cy, chipW, chipH, DataTable.T("Equals", "Equals"), f.textMode == 2)) { f.textMode = 2; DataTable.InvalidateQuery(st); st.FilterChanged.Raise(); app.RequestRedraw(); }
+            if (DataTable.TabBtn(app, mx + pad + (chipW + gap) * 2, cy, chipW, chipH, DataTable.T("Starts", "Starts"), f.textMode == 3)) { f.textMode = 3; DataTable.InvalidateQuery(st); st.FilterChanged.Raise(); app.RequestRedraw(); }
+            if (DataTable.TabBtn(app, mx + pad + (chipW + gap) * 3, cy, chipW, chipH, DataTable.T("Ends", "Ends"), f.textMode == 4)) { f.textMode = 4; DataTable.InvalidateQuery(st); st.FilterChanged.Raise(); app.RequestRedraw(); }
+            cy = cy + chipH + app.Scale(8);
+
+            int boxH = app.Scale(26);
+            DataTable.EditBox(app, mx + pad, cy, menuW - pad * 2, boxH, f.textQuery, DataTable.T("Enter filter text...", "Enter filter text..."), st.editFocus == 2);
+            int qId = app.focus.AllocId();
+            app.hitTester.RegisterRect(qId, mx + pad, cy, menuW - pad * 2, boxH, 0);
+            if (app.EventKind() == 3 && app.hitTester.HitTest(app.mouseX, app.mouseY) == qId) { st.editFocus = 2; app.RequestRedraw(); }
+            cy = cy + boxH + app.Scale(10);
+
+            c.DrawText(mx + pad, cy, DataTable.T("Live-filters as you type", "Live-filters as you type"), sHint.FgOr(0), fs);
+            cy = cy + Canvas.FontHeight(fs) + app.Scale(2);
+            c.DrawText(mx + pad, cy, "(case-insensitive).", sHint.FgOr(0), fs);
+        } else if (st.filterTab == 3) {
+            cy = DataTable.RenderRulesTab(app, mx, cy, menuW, pad, f, cols[mi], st);
+        } else {
+            c.DrawText(mx + pad, cy, DataTable.T("One condition per line:", "One condition per line:"), sLabel.FgOr(0), fs);
+            cy = cy + Canvas.FontHeight(fs) + app.Scale(4);
+            int areaH = contentBottom - cy - app.Scale(66);
+            if (areaH < app.Scale(48)) { areaH = app.Scale(48); }
+            int aId = app.focus.AllocId();
+            int areaState = Style.SNormal();
+            if (st.editFocus == 3) { areaState = Style.SFocus(); }
+            StyleBox sArea = Style.Part(app, "datatable", "field", "", "", "",
+                                        areaState);
+            c.FillRoundRect(mx + pad, cy, menuW - pad * 2, areaH, t.borderRadiusSmall, sArea.BgOr(0));
+            c.DrawRoundRect(mx + pad, cy, menuW - pad * 2, areaH, t.borderRadiusSmall, sArea.BorderOr(0), 1);
+            app.hitTester.RegisterRect(aId, mx + pad, cy, menuW - pad * 2, areaH, 0);
+            if (app.EventKind() == 3 && app.hitTester.HitTest(app.mouseX, app.mouseY) == aId) { st.editFocus = 3; app.RequestRedraw(); }
+            int lh = Canvas.FontHeight(fs) + app.Scale(3);
+            int ly = cy + app.Scale(4);
+            for (int li = 0; li < st.batchLines.Count && ly + lh < cy + areaH; li = li + 1) {
+                string ln = DataTable.Truncate(st.batchLines[li], fs, menuW - pad * 2 - app.Scale(10));
+                c.DrawText(mx + pad + app.Scale(5), ly, ln, sMenu.FgOr(0), fs);
+                if (st.editFocus == 3 && li == st.batchLines.Count - 1) {
+                    int cxp = mx + pad + app.Scale(5) + Canvas.MeasureText(ln, fs);
+                    c.FillRect(cxp, ly, app.Scale(1), Canvas.FontHeight(fs), sAccent.BgOr(0));
+                }
+                ly = ly + lh;
+            }
+            cy = cy + areaH + app.Scale(6);
+
+            int exId = app.focus.AllocId();
+            bool exact = st.batchExactFlag == 1;
+            DataTable.DrawMiniCheck(app, mx + pad, cy, app.Scale(22), exact);
+            c.DrawText(mx + pad + app.Scale(22),
+                       Canvas.CenterTextY(cy, app.Scale(22), fs),
+                       DataTable.T("Exact match", "Exact match"), sMenu.FgOr(0), fs);
+            app.hitTester.RegisterRect(exId, mx + pad, cy, app.Scale(130), app.Scale(22), 0);
+            if (app.EventKind() == 3 && app.hitTester.HitTest(app.mouseX, app.mouseY) == exId) {
+                if (st.batchExactFlag == 1) { st.batchExactFlag = 0; } else { st.batchExactFlag = 1; }
+                app.RequestRedraw();
+            }
+            cy = cy + app.Scale(28);
+
+            int bw = (menuW - pad * 2 - app.Scale(6)) / 2;
+            int bh = app.Scale(26);
+            bool keepClick = DataTable.TextBtn(app, mx + pad, cy, bw, bh, "Keep matching", true);
+            bool exclClick = DataTable.TextBtn(app, mx + pad + bw + app.Scale(6), cy, bw, bh, "Exclude", false);
+            if (keepClick || exclClick) {
+                f.batchTerms.Clear();
+                for (int bl = 0; bl < st.batchLines.Count; bl = bl + 1) {
+                    if (st.batchLines[bl].Length > 0) { f.batchTerms.Add(st.batchLines[bl]); }
+                }
+                f.batchExact = st.batchExactFlag == 1;
+                f.batchKeep = keepClick;
+                DataTable.InvalidateQuery(st);
+                st.FilterChanged.Raise();
+                app.RequestRedraw();
+            }
+        }
+
+        // 页脚：Clear / Close
+        int fy = my + menuH - footerH + app.Scale(6);
+        int fbw = (menuW - pad * 2 - app.Scale(6)) / 2;
+        int fbh = app.Scale(28);
+        c.FillRect(mx + pad, my + menuH - footerH, menuW - pad * 2, 1, sGrid.BgOr(0));
+        bool clearClick = DataTable.TextBtn(app, mx + pad, fy, fbw, fbh, DataTable.T("Clear Filter", "Clear Filter"), false);
+        bool closeClick = DataTable.TextBtn(app, mx + pad + fbw + app.Scale(6), fy, fbw, fbh, DataTable.T("Close", "Close"), false);
+        if (clearClick) {
+            st.filters[mi] = new ColFilter();
+            st.searchText = "";
+            st.batchLines = new List<string>();
+            st.batchLines.Add("");
+            st.batchExactFlag = 0;
+            st.editFocus = 0;
+            DataTable.InvalidateQuery(st);
+            st.FilterChanged.Raise();
+            app.RequestRedraw();
+        }
+        if (closeClick) { st.openMenu = -1; app.RequestRedraw(); }
+
+        // 点击外部关闭菜单（并让编辑框失焦）
+        if (app.EventKind() == 3) {
+            bool inside = app.mouseX >= mx && app.mouseX < mx + menuW && app.mouseY >= my && app.mouseY < my + menuH;
+            bool onIcon = app.mouseY >= y && app.mouseY < y + headerH;
+            if (!inside && !onIcon) { st.openMenu = -1; app.RequestRedraw(); }
+        }
+    }
+}

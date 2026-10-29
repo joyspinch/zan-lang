@@ -2058,6 +2058,34 @@ EXPORT void zan_gui_webview_set_clip(i32 h, const char *spec) {
     slot->clipSpec = strdup(spec);
 }
 
+EXPORT void zan_gui_test_mask_probe(i32 h) {
+    ZAN_MAC_ENSURE_MAIN_THREAD_VOID(zan_gui_test_mask_probe(h));
+    WKWebView *wv = wv_get(h);
+    if (!wv) {
+        fprintf(stderr, "[PROBE] wv %d is NULL\n", (int)h);
+        return;
+    }
+    fprintf(stderr, "[PROBE] wv %d frame: (%.1f, %.1f, %.1f, %.1f), mask: %p\n",
+            (int)h, wv.frame.origin.x, wv.frame.origin.y, wv.frame.size.width, wv.frame.size.height,
+            wv.layer.mask);
+    if (wv.layer.mask) {
+        CAShapeLayer *mask = (CAShapeLayer *)wv.layer.mask;
+        CGRect b = CGPathGetPathBoundingBox(mask.path);
+        fprintf(stderr, "[PROBE] mask.path boundingBox: (%.1f, %.1f, %.1f, %.1f)\n",
+                b.origin.x, b.origin.y, b.size.width, b.size.height);
+
+        NSPoint ptMenu = NSMakePoint(100, 150);
+        NSView *vMenu = [wv hitTest:ptMenu];
+        fprintf(stderr, "[PROBE] hitTest at (100, 150) [menu cutout]: %s (expected: NULL/passthrough)\n",
+                vMenu ? [NSStringFromClass([vMenu class]) UTF8String] : "NULL (PASSTHROUGH OK!)");
+
+        NSPoint ptPage = NSMakePoint(500, 400);
+        NSView *vPage = [wv hitTest:ptPage];
+        fprintf(stderr, "[PROBE] hitTest at (500, 400) [web page]: %s (expected: WKWebView/subview)\n",
+                vPage ? [NSStringFromClass([vPage class]) UTF8String] : "NULL");
+    }
+}
+
 EXPORT void zan_gui_webview_navigate(i32 h, const char *url) {
     ZAN_MAC_ENSURE_MAIN_THREAD_VOID(zan_gui_webview_navigate(h, url));
     fprintf(stderr, "[ZAN_NAV] h=%d url=%s\n", (int)h, url ? url : "(null)");

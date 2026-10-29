@@ -1,0 +1,643 @@
+using System;
+using Gui;
+using Gui.Widget;
+using Gui.Backend;
+
+namespace Gui.Component.DataTable;
+
+// DataTable 渲染管道分层：键盘导航、查找条与筛选行按键拦截、指针选区拖拽映射与悬停提示。
+public partial class DataTable {
+    public static void RenderInteraction(App app, int x, int y, int viewW, int viewH,
+                                  DataTableFrame f, DataTableBodyLayout lay,
+                                  List<DataColumn> cols, DataSource src,
+                                  DataTableState st, int evt) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        bool touchUi = app.TouchDevice();
+
+        int numW = f.numW;
+        int selW = f.selW;
+        int clipRight = f.clipRight;
+        int firstDataX = f.firstDataX;
+        int dataViewW = f.dataViewW;
+        int rowH = f.rowH;
+        int fs = f.fs;
+        int headerH = f.headerH;
+        int pinnedW = f.pinnedW;
+        int pinnedRW = f.pinnedRW;
+        int bandX = f.bandX;
+        int bandW = f.bandW;
+        int rightX = f.rightX;
+        List<FrameColumn> frameColumns = f.columns;
+
+        int total = lay.total;
+        int filterRowH = lay.filterRowH;
+        int bodyTop = lay.bodyTop;
+        int bodyH = lay.bodyH;
+        int visRows = lay.visRows;
+        int start = lay.start;
+
+        // ---------------- 表格体指针交互 ----------------
+        int ptrOi = -1;
+        if (app.mouseY >= bodyTop && app.mouseY < bodyTop + bodyH && app.mouseX >= x && app.mouseX < clipRight) {
+            int rr2 = (app.mouseY - bodyTop) / rowH;
+            if (rr2 >= 0 && rr2 < visRows && (start + rr2) < total) { ptrOi = start + rr2; }
+            if (ptrOi >= 0 && DataTable.DispKind(st, ptrOi) == 2) { ptrOi = -1; }
+        }
+        int ptrCol = -1;
+        if (ptrOi >= 0 && app.mouseX >= firstDataX) {
+            int pci = frameColumns.Count - 1;
+            while (pci >= 0) {
+                FrameColumn pointerColumn = frameColumns[pci];
+                int cci = pointerColumn.column;
+                int colL = pointerColumn.x;
+                int colR = colL + st.dispW[cci];
+                int pbL = DataTable.BandLeft(pointerColumn.band, firstDataX, bandX, rightX);
+                int pbR = DataTable.BandRight(pointerColumn.band, firstDataX, bandX, bandW,
+                                              rightX, pinnedW, pinnedRW, clipRight);
+                if (colL < pbL) { colL = pbL; }
+                if (colR > pbR) { colR = pbR; }
+                if (app.mouseX >= colL && app.mouseX < colR) { ptrCol = cci; pci = -1; }
+                else { pci = pci - 1; }
+            }
+        }
+
+        // ---------------- 截断单元格的悬停提示 ----------------
+        if (touchUi) { st.tipOi = -1; }
+        else if (ptrOi >= 0 && ptrCol >= 0 && DataTable.DispKind(st, ptrOi) == 0
+            && !st.editing && !st.ctxOpen && !st.hdrCtxOpen && !st.chartOpen
+            && !st.colChooserOpen
+            && st.openMenu < 0 && !st.rangeDrag && !st.rowSelDrag && st.dragRow < 0
+            && !app.PointerCaptured() && !app.HasOverlays()
+            && !(evt == 2 && app.window.EventButton() == 1)) {
+            DataColumn tipCol = cols[ptrCol];
+            if (!tipCol.isBool
+                && (tipCol.cellType == 0 || tipCol.cellType == 1 || tipCol.cellType == 2)) {
+                string tipFull = DataTable.CellTextRouted(cols, src, DataTable.DispRowOf(st, ptrOi), ptrCol);
+                if (tipCol.cellType != 2) { tipFull = DataTable.FormatCell(tipCol, tipFull); }
+                int tipW = st.dispW[ptrCol];
+                if (Canvas.MeasureText(tipFull, fs) > tipW - t.paddingSmall * 2) {
+                    int tipNowMs = Window.GetTickMs();
+                    if (st.tipOi != ptrOi || st.tipCol != ptrCol) {
+                        st.tipOi = ptrOi;
+                        st.tipCol = ptrCol;
+                        st.tipSinceMs = tipNowMs;
+                    }
+                    int tvi = DataTable.VisPos(frameColumns, ptrCol);
+                    int tipRy = bodyTop + (ptrOi - start) * rowH;
+                    if (tipNowMs - st.tipSinceMs < Tooltip.DefaultDelayMs()) {
+                        if (tvi >= 0) {
+                            app.RequestAnimationFrameIn(0, frameColumns[tvi].x, tipRy,
+                                                        tipW, rowH);
+                        }
+                    } else if (tvi >= 0) {
+                        Tooltip.RequestBox(app, frameColumns[tvi].x, tipRy, tipW, rowH,
+                                           tipFull, Tooltip.Bottom(), app.Scale(280));
+                    }
+                } else { st.tipOi = -1; }
+            } else { st.tipOi = -1; }
+        } else { st.tipOi = -1; }
+
+        int ek = evt;
+        int eb = app.window.EventButton();
+        int emods = app.window.EventMods();
+
+        // ---------------- 查找条键盘处理 ----------------
+        if (st.findFocused && !st.editing) {
+            bool findKeyHandled = false;
+            if (ek == 6) {
+                int fkc = app.window.EventKeyCode();
+                if (fkc == 27) {
+                    if (st.findBuf.Length == 0) { DataTable.CloseFind(st); }
+                    else { st.findFocused = false; }
+                } else if (fkc == 8) {
+                    if (st.findCur > 0) {
+                        int fprev = Text.PrevCharStart(st.findBuf, st.findCur);
+                        st.findBuf = Text.DeleteBefore(st.findBuf, st.findCur);
+                        st.findCur = fprev;
+                    }
+                } else if (fkc == 46) {
+                    if (st.findCur < st.findBuf.Length) {
+                        st.findBuf = Text.RemoveAt(st.findBuf, st.findCur);
+                    }
+                } else if (fkc == 13) {
+                    DataTable.CommitFind(st, cols, src);
+                    DataTable.FindStep(st, cols, src,
+                                       (emods & 1) != 0 ? 0 - 1 : 1, visRows);
+                } else {
+                    string fch = Text.CharStr(fkc);
+                    if (fch.Length > 0) {
+                        st.findBuf = Text.InsertAt(st.findBuf, st.findCur, fch);
+                        st.findCur = st.findCur + fch.Length;
+                    }
+                }
+                findKeyHandled = true;
+            } else if (ek == 4) {
+                int fkc2 = app.window.EventKeyCode();
+                if (fkc2 == 114) {
+                    DataTable.CommitFind(st, cols, src);
+                    DataTable.FindStep(st, cols, src,
+                                       (emods & 1) != 0 ? 0 - 1 : 1, visRows);
+                } else if (fkc2 == 9) {
+                    st.findFocused = false;
+                } else if (fkc2 == 37) {
+                    if (st.findCur > 0) { st.findCur = Text.PrevCharStart(st.findBuf, st.findCur); }
+                } else if (fkc2 == 39) {
+                    if (st.findCur < st.findBuf.Length) { st.findCur = Text.NextCharEnd(st.findBuf, st.findCur); }
+                } else if (fkc2 == 36) {
+                    st.findCur = 0;
+                } else if (fkc2 == 35) {
+                    st.findCur = st.findBuf.Length;
+                }
+                findKeyHandled = true;
+            }
+            if (ek == 2) { st.findFocused = false; }
+            if (findKeyHandled) { ek = 0; app.RequestRedraw(); }
+        }
+
+        // ---------------- 筛选行键盘处理 ----------------
+        if (st.filterRowFocusCol >= 0) {
+            int frc = st.filterRowFocusCol;
+            bool frKeyHandled = false;
+            if (ek == 6) {
+                int fkc = app.window.EventKeyCode();
+                if (fkc == 27) {
+                    st.filterRowBuf = "";
+                    if (st.filterRowText[frc].Length > 0) {
+                        st.filterRowText[frc] = "";
+                        st.dirty = true;
+                        st.FilterChanged.Raise();
+                    }
+                    st.filterRowFocusCol = -1;
+                } else if (fkc == 8) {
+                    if (st.filterRowCur > 0) {
+                        int prevStart = Text.PrevCharStart(st.filterRowBuf, st.filterRowCur);
+                        st.filterRowBuf = Text.DeleteBefore(st.filterRowBuf, st.filterRowCur);
+                        st.filterRowCur = prevStart;
+                        st.filterRowText[frc] = st.filterRowBuf;
+                        st.dirty = true;
+                        st.FilterChanged.Raise();
+                    }
+                } else if (fkc == 46) {
+                    if (st.filterRowCur < st.filterRowBuf.Length) {
+                        st.filterRowBuf = Text.RemoveAt(st.filterRowBuf, st.filterRowCur);
+                        st.filterRowText[frc] = st.filterRowBuf;
+                        st.dirty = true;
+                        st.FilterChanged.Raise();
+                    }
+                } else {
+                    string fch = Text.CharStr(fkc);
+                    if (fch.Length > 0) {
+                        st.filterRowBuf = Text.InsertAt(st.filterRowBuf, st.filterRowCur, fch);
+                        st.filterRowCur = st.filterRowCur + fch.Length;
+                        st.filterRowText[frc] = st.filterRowBuf;
+                        st.dirty = true;
+                        st.FilterChanged.Raise();
+                    }
+                }
+                frKeyHandled = true;
+            } else if (ek == 4) {
+                int fkc2 = app.window.EventKeyCode();
+                if (fkc2 == 13 || fkc2 == 9) {
+                    st.filterRowText[frc] = st.filterRowBuf;
+                    st.filterRowFocusCol = -1;
+                } else if (fkc2 == 37) {
+                    if (st.filterRowCur > 0) { st.filterRowCur = Text.PrevCharStart(st.filterRowBuf, st.filterRowCur); }
+                } else if (fkc2 == 39) {
+                    if (st.filterRowCur < st.filterRowBuf.Length) { st.filterRowCur = Text.NextCharEnd(st.filterRowBuf, st.filterRowCur); }
+                } else if (fkc2 == 36) {
+                    st.filterRowCur = 0;
+                } else if (fkc2 == 35) {
+                    st.filterRowCur = st.filterRowBuf.Length;
+                }
+                frKeyHandled = true;
+            }
+            if (ek == 2 && (app.mouseY < y + headerH || app.mouseY >= y + headerH + filterRowH)) {
+                st.filterRowText[frc] = st.filterRowBuf;
+                st.filterRowFocusCol = -1;
+            }
+            if (frKeyHandled) { ek = 0; app.RequestRedraw(); }
+        }
+
+        // ---------------- 内联编辑器按键处理 ----------------
+        if (st.editing) {
+            DataColumn ecol = cols[st.editCol];
+            bool shiftHeld = Modifiers.HasShift(emods);
+            if (ek == 6) {
+                int code = app.window.EventKeyCode();
+                if (code == 13) {
+                    int prevSlot = st.hitOrder;
+                    int curCol = st.editCol;
+                    DataTable.CommitEdit(st, cols, src);
+                    if (!st.editing) {
+                        int nextSlot = DataTable.NextDataSlot(st, prevSlot, shiftHeld ? -1 : 1);
+                        if (nextSlot >= 0) {
+                            DataTable.MoveCursor(st, src, nextSlot, curCol, false);
+                            DataTable.ScrollSlotIntoView(st, nextSlot, visRows);
+                            st.CellClick.Raise();
+                        }
+                    }
+                }
+                else if (code == 27) { DataTable.CancelEdit(st); }
+                else if (code == 9) {
+                    int prevSlot = st.hitOrder;
+                    int curCol = st.editCol;
+                    DataTable.CommitEdit(st, cols, src);
+                    if (!st.editing) {
+                        int delta = shiftHeld ? -1 : 1;
+                        int nextCol = curCol + delta;
+                        int nextSlot = prevSlot;
+                        if (nextCol >= cols.Count) {
+                            nextCol = 0;
+                            nextSlot = DataTable.NextDataSlot(st, prevSlot, 1);
+                        } else if (nextCol < 0) {
+                            nextCol = cols.Count - 1;
+                            nextSlot = DataTable.NextDataSlot(st, prevSlot, -1);
+                        }
+                        if (nextSlot >= 0 && nextCol >= 0 && nextCol < cols.Count) {
+                            DataTable.MoveCursor(st, src, nextSlot, nextCol, false);
+                            DataTable.ScrollSlotIntoView(st, nextSlot, visRows);
+                            DataTable.ScrollColIntoView(st, frameColumns, nextCol, dataViewW, pinnedW);
+                            st.CellClick.Raise();
+                        }
+                    }
+                }
+                else if (code == 8) {
+                    if (st.editCur > 0) {
+                        int startp = Text.PrevCharStart(st.editBuf, st.editCur);
+                        st.editBuf = Text.DeleteBefore(st.editBuf, st.editCur);
+                        st.editCur = startp;
+                        st.editError = "";
+                        if (ecol.editorKind == 1) { DataTable.RefreshChoices(st, ecol); }
+                    }
+                } else {
+                    string ch = Text.CharStr(code);
+                    if (ch.Length > 0) {
+                        st.editBuf = Text.InsertAt(st.editBuf, st.editCur, ch);
+                        st.editCur = st.editCur + ch.Length;
+                        st.editError = "";
+                        if (ecol.editorKind == 1) {
+                            st.edPopOpen = true;
+                            DataTable.RefreshChoices(st, ecol);
+                        }
+                    }
+                }
+                app.RequestRedraw();
+                ek = 0;
+            } else if (ek == 4) {
+                int kc = app.window.EventKeyCode();
+                bool consumed = true;
+                if (kc == 38 || kc == 40) {
+                    int dir = 1;
+                    if (kc == 38) { dir = -1; }
+                    if (ecol.editorKind == 1) {
+                        st.edPopOpen = true;
+                        DataTable.MoveChoice(st, dir);
+                    } else if (ecol.editorKind == 2) {
+                        DataTable.CalendarStep(st, ecol, dir * 7);
+                    } else if (ecol.editorKind == 3) {
+                        st.editBuf = DataTable.StepValue(ecol, st.editBuf, 0 - dir);
+                        st.editCur = st.editBuf.Length;
+                        st.editError = "";
+                    } else { consumed = false; }
+                } else if (kc == 27) {
+                    if (st.edPopOpen) { st.edPopOpen = false; }
+                    else { DataTable.CancelEdit(st); }
+                } else if (kc == 13) {
+                    int prevSlot = st.hitOrder;
+                    int curCol = st.editCol;
+                    DataTable.CommitEdit(st, cols, src);
+                    if (!st.editing) {
+                        int nextSlot = DataTable.NextDataSlot(st, prevSlot, shiftHeld ? -1 : 1);
+                        if (nextSlot >= 0) {
+                            DataTable.MoveCursor(st, src, nextSlot, curCol, false);
+                            DataTable.ScrollSlotIntoView(st, nextSlot, visRows);
+                            st.CellClick.Raise();
+                        }
+                    }
+                }
+                else if (kc == 9) {
+                    int prevSlot = st.hitOrder;
+                    int curCol = st.editCol;
+                    DataTable.CommitEdit(st, cols, src);
+                    if (!st.editing) {
+                        int delta = shiftHeld ? -1 : 1;
+                        int nextCol = curCol + delta;
+                        int nextSlot = prevSlot;
+                        if (nextCol >= cols.Count) {
+                            nextCol = 0;
+                            nextSlot = DataTable.NextDataSlot(st, prevSlot, 1);
+                        } else if (nextCol < 0) {
+                            nextCol = cols.Count - 1;
+                            nextSlot = DataTable.NextDataSlot(st, prevSlot, -1);
+                        }
+                        if (nextSlot >= 0 && nextCol >= 0 && nextCol < cols.Count) {
+                            DataTable.MoveCursor(st, src, nextSlot, nextCol, false);
+                            DataTable.ScrollSlotIntoView(st, nextSlot, visRows);
+                            DataTable.ScrollColIntoView(st, frameColumns, nextCol, dataViewW, pinnedW);
+                            st.CellClick.Raise();
+                        }
+                    }
+                }
+                else if (kc == 37) {
+                    if (ecol.editorKind == 2) { DataTable.CalendarStep(st, ecol, -1); }
+                    else if (st.editCur > 0) { st.editCur = Text.PrevCharStart(st.editBuf, st.editCur); }
+                } else if (kc == 39) {
+                    if (ecol.editorKind == 2) { DataTable.CalendarStep(st, ecol, 1); }
+                    else if (st.editCur < st.editBuf.Length) { st.editCur = Text.NextCharEnd(st.editBuf, st.editCur); }
+                } else if (kc == 33 && ecol.editorKind == 2) { st.edCalMonth = st.edCalMonth - 1; }
+                else if (kc == 34 && ecol.editorKind == 2) { st.edCalMonth = st.edCalMonth + 1; }
+                else if (kc == 36) { st.editCur = 0; }
+                else if (kc == 35) { st.editCur = st.editBuf.Length; }
+                else if (kc == 46) {
+                    if (st.editCur < st.editBuf.Length) {
+                        st.editBuf = Text.RemoveAt(st.editBuf, st.editCur);
+                        st.editError = "";
+                        if (ecol.editorKind == 1) { DataTable.RefreshChoices(st, ecol); }
+                    }
+                } else { consumed = false; }
+                app.RequestRedraw();
+                if (consumed) { ek = 0; }
+            }
+        }
+
+        if (!st.editing && ek == 4 && (emods & 1) != 0
+            && app.window.EventKeyCode() == 70) {
+            DataTable.OpenFind(st);
+            ek = 0;
+            app.RequestRedraw();
+        }
+        if (!st.editing && st.findOpen && ek == 4 && (emods & 1) == 0
+            && app.window.EventKeyCode() == 114) {
+            DataTable.CommitFind(st, cols, src);
+            DataTable.FindStep(st, cols, src,
+                               (emods & 2) != 0 ? 0 - 1 : 1, visRows);
+            ek = 0;
+            app.RequestRedraw();
+        }
+
+        if (!st.editing && ek == 4) {
+            int kc2 = app.window.EventKeyCode();
+            if ((kc2 == 113 || kc2 == 13) && st.hitRow >= 0 && st.hitCol >= 0
+                && st.hitCol < cols.Count && cols[st.hitCol].editable) {
+                if (cols[st.hitCol].isBool) {
+                    DataTable.ToggleBoolCell(st, cols, src, st.hitRow, st.hitCol);
+                } else {
+                    DataTable.BeginEdit(st, cols, src, st.hitRow, st.hitCol);
+                }
+                ek = 0;
+                app.RequestRedraw();
+            }
+        }
+
+        if (!st.editing && ek == 6 && st.hitRow >= 0 && st.hitCol >= 0
+            && st.hitCol < cols.Count && cols[st.hitCol].editable && !cols[st.hitCol].isBool
+            && st.filterRowFocusCol < 0 && st.openMenu < 0 && !st.colChooserOpen) {
+            int code = app.window.EventKeyCode();
+            if (code >= 32 && code != 127) {
+                string ch = Text.CharStr(code);
+                if (ch.Length > 0) {
+                    DataTable.BeginEdit(st, cols, src, st.hitRow, st.hitCol);
+                    st.editBuf = ch;
+                    st.editCur = ch.Length;
+                    if (st.activeEditorWidget != null) {
+                        CellEditor activeEd = cols[st.hitCol].editor;
+                        if (activeEd == null) { activeEd = st.cellEditor; }
+                        if (activeEd != null) { activeEd.BeginEdit(st.activeEditorWidget, ch, cols[st.hitCol]); }
+                    }
+                    ek = 0;
+                    app.RequestRedraw();
+                }
+            }
+        }
+
+        if (!st.editing && ek == 4 && (st.hitRow >= 0 || DataTable.HasRange(st) || DataTable.HasMulti(st))
+            && st.filterRowFocusCol < 0 && st.openMenu < 0 && !st.colChooserOpen) {
+            if (DataTable.HandleNavKey(app, cols, src, st, frameColumns, visRows,
+                                       dataViewW, pinnedW, app.window.EventKeyCode(), emods)) {
+                ek = 0;
+                app.RequestRedraw();
+            }
+        }
+
+        if (ek == 2 && eb == 0 && ptrOi >= 0
+            && !st.chartOpen && !st.colChooserOpen
+            && !app.PointerCaptured()) {
+            bool ctrlDrag = (emods & 1) != 0;
+            int grabW = app.Scale(6);
+            if (st.fillHX >= 0 && !st.editing
+                && app.mouseX >= st.fillHX - grabW && app.mouseX < st.fillHX + grabW
+                && app.mouseY >= st.fillHY - grabW && app.mouseY < st.fillHY + grabW) {
+                st.fillDrag = true;
+                if (touchUi) { app.ClaimDrag(); }
+                st.fillSR0 = DataTable.MinI(st.rangeR0, st.rangeR1);
+                st.fillSR1 = DataTable.MaxI(st.rangeR0, st.rangeR1);
+                st.fillSC0 = DataTable.MinI(st.rangeC0, st.rangeC1);
+                st.fillSC1 = DataTable.MaxI(st.rangeC0, st.rangeC1);
+                st.fillTR0 = 0; st.fillTR1 = -1;
+                st.fillTC0 = 0; st.fillTC1 = -1;
+                app.RequestRedraw();
+            } else if (DataTable.DispKind(st, ptrOi) == 1) {
+                int gi = DataTable.DispRowOf(st, ptrOi);
+                GroupRow gRow = st.groups[gi];
+                int gcbPx = x + numW + selW + gRow.level * app.Scale(16)
+                            + app.Scale(6) + app.Scale(14) + app.Scale(4);
+                bool onCb = app.mouseX >= gcbPx - app.Scale(2)
+                            && app.mouseX < gcbPx + app.Scale(16);
+                if (!onCb) { DataTable.ToggleCollapse(st, gRow.key); }
+                app.RequestRedraw();
+            } else if (app.mouseX >= x && app.mouseX < x + numW && !st.rowGripDrag) {
+                DataTable.PickRow(st, src, ptrOi, emods);
+                st.rowSelDrag = true;
+                app.RequestRedraw();
+            } else if (app.mouseX >= firstDataX && ptrCol >= 0) {
+                bool sameCell = (!st.editing) && st.hitOrder == ptrOi && st.hitCol == ptrCol
+                    && st.rangeR0 == st.rangeR1 && st.rangeC0 == st.rangeC1;
+                if (st.editing) { DataTable.CommitEdit(st, cols, src); }
+                if (st.editing) {
+                    app.RequestRedraw();
+                } else if (DataTable.IsWidgetCol(cols, ptrCol)) {
+                    if (touchUi) { app.NotePressSentinel(-2); }
+                    app.RequestRedraw();
+                } else if (sameCell && cols[ptrCol].editable && !cols[ptrCol].isBool
+                           && !ctrlDrag) {
+                    DataTable.BeginEdit(st, cols, src, DataTable.DispRowOf(st, ptrOi), ptrCol);
+                    app.RequestRedraw();
+                } else {
+                    bool shiftDrag = (emods & 2) != 0;
+                    bool extend = shiftDrag && st.selAnchor >= 0 && st.selAnchorCol >= 0;
+                    if (ctrlDrag) {
+                        if (DataTable.HasRange(st)) { DataTable.ArchiveRange(st); }
+                    } else {
+                        if (DataTable.HasMulti(st)) { DataTable.ClearMulti(st); }
+                        if (!extend && st.showSelect && DataTable.AnyRowSelected(st, src)) {
+                            DataTable.SelectAllRows(st, src, false);
+                            st.SelectionChanged.Raise();
+                        }
+                    }
+                    st.rangeR0 = extend ? st.selAnchor : ptrOi;
+                    st.rangeR1 = ptrOi;
+                    st.rangeC0 = extend ? st.selAnchorCol : ptrCol;
+                    st.rangeC1 = ptrCol;
+                    st.rangeDrag = true;
+                    st.rangeSelTouched.Clear();
+                    if (!extend) { st.selAnchor = ptrOi; st.selAnchorCol = ptrCol; }
+                    if (st.showSelect) { DataTable.SyncRangeChecks(st, src); }
+                    st.hitOrder = ptrOi;
+                    st.hitRow = DataTable.DispRowOf(st, ptrOi);
+                    st.hitCol = ptrCol;
+                    if (touchUi) { app.NotePressSentinel(-2); }
+                    st.CellClick.Raise();
+                    app.RequestRedraw();
+                }
+            }
+        }
+
+        if (ek == 1) {
+            if (st.fillDrag) {
+                st.fillTR0 = 0; st.fillTR1 = -1;
+                st.fillTC0 = 0; st.fillTC1 = -1;
+                if (ptrOi >= 0) {
+                    if (ptrOi > st.fillSR1) {
+                        st.fillTR0 = st.fillSR1 + 1; st.fillTR1 = ptrOi;
+                        st.fillTC0 = st.fillSC0; st.fillTC1 = st.fillSC1;
+                    } else if (ptrOi < st.fillSR0) {
+                        st.fillTR0 = ptrOi; st.fillTR1 = st.fillSR0 - 1;
+                        st.fillTC0 = st.fillSC0; st.fillTC1 = st.fillSC1;
+                    } else if (ptrCol >= 0 && ptrCol > st.fillSC1) {
+                        st.fillTC0 = st.fillSC1 + 1; st.fillTC1 = ptrCol;
+                        st.fillTR0 = st.fillSR0; st.fillTR1 = st.fillSR1;
+                    } else if (ptrCol >= 0 && ptrCol < st.fillSC0) {
+                        st.fillTC0 = ptrCol; st.fillTC1 = st.fillSC0 - 1;
+                        st.fillTR0 = st.fillSR0; st.fillTR1 = st.fillSR1;
+                    }
+                    app.RequestRedraw();
+                }
+            }
+            if (st.rowSelDrag && ptrOi >= 0 && DataTable.DispKind(st, ptrOi) == 0) {
+                DataTable.SelectRowSpan(st, src, st.selAnchor, ptrOi);
+                st.hitOrder = ptrOi;
+                st.hitRow = DataTable.DispRowOf(st, ptrOi);
+                st.SelectionChanged.Raise();
+                app.RequestRedraw();
+            }
+            if (st.rangeDrag && ptrOi >= 0) {
+                st.rangeR1 = ptrOi;
+                if (ptrCol >= 0) { st.rangeC1 = ptrCol; }
+                DataTable.SyncRangeChecks(st, src);
+                if (touchUi && st.openMenu < 0 && !st.hdrCtxOpen && !st.colChooserOpen
+                    && app.PollLongPress(-2)) {
+                    st.ctxX = app.mouseX;
+                    st.ctxY = app.mouseY;
+                    st.ctxRow = -1;
+                    st.ctxOrder = -1;
+                    if (DataTable.DispKind(st, ptrOi) == 0) {
+                        int ri = DataTable.DispRowOf(st, ptrOi);
+                        st.ctxRow = ri;
+                        st.ctxOrder = ptrOi;
+                        if (!DataTable.HasSelection(st)
+                            && !DataTable.IsSelected(st, src, ri)) {
+                            DataTable.SelectAllRows(st, src, false);
+                            DataTable.SetSelected(st, src, ri, true);
+                            st.selAnchor = ptrOi;
+                        }
+                    }
+                    st.RowContext.Raise();
+                    if (!st.externalRowMenu) { DataTable.OpenRowMenu(st); }
+                    st.rangeDrag = false;
+                    app.RequestRedraw();
+                }
+            }
+            if (st.dragRow >= 0) {
+                int dd = app.mouseY - st.dragStartY;
+                if (dd < 0) { dd = 0 - dd; }
+                if (dd > rowH / 2) { st.dragMoved = true; app.RequestRedraw(); }
+            }
+        }
+
+        if (ek == 3 && eb == 0) {
+            if (st.fillDrag) {
+                st.fillDrag = false;
+                if (st.fillTR0 <= st.fillTR1 && st.fillTC0 <= st.fillTC1) {
+                    int filled = DataTable.FillApply(st, cols, src,
+                                                     st.fillSR0, st.fillSC0, st.fillSR1, st.fillSC1,
+                                                     st.fillTR0, st.fillTC0, st.fillTR1, st.fillTC1);
+                    if (filled > 0) {
+                        DataTable.Flash(st, DataTable.TN("Filled {n} cells", filled, "已填充 {n} 个单元格"));
+                    }
+                }
+                st.fillTR0 = 0; st.fillTR1 = -1;
+                st.fillTC0 = 0; st.fillTC1 = -1;
+                int grabW = app.Scale(6);
+                if (st.fillHX >= 0 && app.DoubleClickNow()
+                    && app.mouseX >= st.fillHX - grabW && app.mouseX < st.fillHX + grabW
+                    && app.mouseY >= st.fillHY - grabW && app.mouseY < st.fillHY + grabW) {
+                    int lastSlot = DataTable.LastDataSlot(st);
+                    if (lastSlot > st.fillSR1) {
+                        int dfilled = DataTable.FillApply(st, cols, src,
+                                                          st.fillSR0, st.fillSC0, st.fillSR1, st.fillSC1,
+                                                          st.fillSR1 + 1, st.fillSC0, lastSlot, st.fillSC1);
+                        if (dfilled > 0) {
+                            DataTable.Flash(st, DataTable.TN("Filled {n} cells", dfilled, "已填充 {n} 个单元格"));
+                        }
+                    }
+                }
+                app.RequestRedraw();
+            }
+            if (st.rangeDrag) { st.rangeDrag = false; st.rangeSelTouched.Clear(); app.RequestRedraw(); }
+            if (st.rowSelDrag) { st.rowSelDrag = false; app.RequestRedraw(); }
+            if (st.dragRow >= 0) {
+                if (st.groupCols.Count == 0 && st.dragMoved && ptrOi >= 0 && ptrOi != st.dragRow
+                    && DataTable.DispKind(st, ptrOi) == 0) {
+                    DataTable.MoveOrder(st, st.dragRow, ptrOi);
+                    st.sortKeys.Clear();
+                    DataTable.SyncPrimary(st);
+                    app.RequestRedraw();
+                } else if (!st.dragMoved && DataTable.DispKind(st, st.dragRow) == 0) {
+                    DataTable.PickRow(st, src, st.dragRow, emods);
+                    app.RequestRedraw();
+                }
+                st.dragRow = -1;
+                st.dragMoved = false;
+                st.rowGripDrag = false;
+            }
+        }
+
+        if (ek == 3 && eb == 0 && ptrOi >= 0 && DataTable.DispKind(st, ptrOi) == 0
+            && app.DoubleClickNow() && !app.PointerCaptured()) {
+            st.hitOrder = ptrOi;
+            st.hitRow = DataTable.DispRowOf(st, ptrOi);
+            st.hitCol = ptrCol;
+            st.RowDoubleClick.Raise();
+            st.CellDoubleClick.Raise();
+        }
+
+        if (ek == 2 && eb == 1 && st.openMenu < 0 && !st.colChooserOpen
+            && app.mouseX >= x && app.mouseX < x + viewW
+            && app.mouseY >= bodyTop && app.mouseY < bodyTop + bodyH) {
+            st.tipOi = -1;
+            st.tipCol = -1;
+            Tooltip.Cancel();
+            if (ptrOi >= 0 && DataTable.DispKind(st, ptrOi) == 0
+                && !DataTable.HasRange(st) && !DataTable.HasSelection(st)) {
+                int ri = DataTable.DispRowOf(st, ptrOi);
+                if (!DataTable.IsSelected(st, src, ri)) {
+                    DataTable.SelectAllRows(st, src, false);
+                    DataTable.SetSelected(st, src, ri, true);
+                    st.selAnchor = ptrOi;
+                }
+            }
+            st.ctxX = app.mouseX;
+            st.ctxY = app.mouseY;
+            st.ctxRow = -1;
+            st.ctxOrder = -1;
+            if (ptrOi >= 0 && DataTable.DispKind(st, ptrOi) == 0) {
+                st.ctxRow = DataTable.DispRowOf(st, ptrOi);
+                st.ctxOrder = ptrOi;
+            }
+            st.RowContext.Raise();
+            if (!st.externalRowMenu) { DataTable.OpenRowMenu(st); }
+            app.RequestRedraw();
+        }
+    }
+}
