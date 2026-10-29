@@ -94,6 +94,20 @@ public class StreamReader : IDisposable {
         this.pos = 0;
     }
 
+    // 异步拉取一块数据到缓冲区。
+    async void FillAsync() {
+        if (this.pos < this.buf.Length || this.eof) {
+            return;
+        }
+        string more = await this.stream.ReadAsync(this.chunk);
+        if (more.Length == 0) {
+            this.eof = true;
+            return;
+        }
+        this.buf = more;
+        this.pos = 0;
+    }
+
     // 读取一个字节作为单字符字符串，结束时返回 ""。
     public string ReadChar() {
         this.Fill();
@@ -189,6 +203,69 @@ public class StreamReader : IDisposable {
         return lines;
     }
 
+    // 异步读取下一行（不含终止符），或返回 null（输入结束）。
+    public async string ReadLineAsync() {
+        await this.FillAsync();
+        if (this.pos >= this.buf.Length) {
+            return null;
+        }
+        StringBuilder sb = new StringBuilder();
+        bool done = false;
+        while (!done) {
+            await this.FillAsync();
+            int bufLen = this.buf.Length;
+            if (this.pos >= bufLen) {
+                done = true;
+            } else {
+                int start = this.pos;
+                int end = this.pos;
+                while (end < bufLen) {
+                    if ((this.buf[end] & 255) == 10) {
+                        string slice = this.buf.Substring(start, end - start);
+                        if (slice.Length > 0 && (slice[slice.Length - 1] & 255) == 13) {
+                            slice = slice.Substring(0, slice.Length - 1);
+                        }
+                        if (slice.IndexOf("\r") >= 0) {
+                            slice = slice.Replace("\r", "");
+                        }
+                        if (slice.Length > 0) {
+                            sb.Append(slice);
+                        }
+                        this.pos = end + 1;
+                        done = true;
+                        break;
+                    }
+                    end = end + 1;
+                }
+                if (!done) {
+                    string slice = this.buf.Substring(start, end - start);
+                    if (slice.Length > 0 && (slice[slice.Length - 1] & 255) == 13) {
+                        slice = slice.Substring(0, slice.Length - 1);
+                    }
+                    if (slice.IndexOf("\r") >= 0) {
+                        slice = slice.Replace("\r", "");
+                    }
+                    if (slice.Length > 0) {
+                        sb.Append(slice);
+                    }
+                    this.pos = end;
+                }
+            }
+        }
+        return sb.ToString();
+    }
+
+    // 异步读取剩余的所有行。
+    public async List<string> ReadAllLinesAsync() {
+        List<string> lines = new List<string>();
+        string line = await this.ReadLineAsync();
+        while (line != null) {
+            lines.Add(line);
+            line = await this.ReadLineAsync();
+        }
+        return lines;
+    }
+
     // 读取剩余全部内容（含缓冲区）。
     public string ReadToEnd() {
         StringBuilder sb = new StringBuilder();
@@ -201,6 +278,31 @@ public class StreamReader : IDisposable {
             this.eof = true;
         }
         return sb.ToString();
+    }
+
+    // 异步读取剩余全部内容（含缓冲区）。
+    public async string ReadToEndAsync() {
+        StringBuilder sb = new StringBuilder();
+        if (this.pos < this.buf.Length) {
+            sb.Append(this.buf.Substring(this.pos, this.buf.Length - this.pos));
+            this.pos = this.buf.Length;
+        }
+        if (!this.eof) {
+            sb.Append(await this.stream.ReadToEndAsync());
+            this.eof = true;
+        }
+        return sb.ToString();
+    }
+
+    // 异步关闭 reader。
+    public async void CloseAsync() {
+        if (this.owns && this.stream != null) {
+            this.stream.Close();
+        }
+        this.stream = null;
+        this.buf = "";
+        this.pos = 0;
+        this.eof = true;
     }
 
     // 关闭 reader；若该 reader 打开了底层流，也一并关闭
