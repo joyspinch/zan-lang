@@ -1,0 +1,619 @@
+using System;
+using System.IO;
+using System.Text;
+using System.Diagnostics;
+using System.Collections.Generic;
+using System.Net.Sockets;
+using System.Net.Http;
+using System.Net.Tls;
+using System.Net.External;
+using System.Threading;
+
+namespace System.Net.Http.Client;
+
+// HttpClient.Verbs.zan - HTTP REST 动词（GET/POST/PUT/DELETE）与 Server-Sent Events (SSE) 流式传输
+public partial class HttpClient {
+    // 发送 GET 请求并返回响应体。
+    public async string GetAsync(string path) {
+        string raw = await RequestAsync("GET", path, "");
+        HttpResponse resp = HttpResponse.Parse(raw);
+        return resp.body;
+    }
+
+    // 发送带表单数据的 POST 请求。
+    public async string PostAsync(string path, string body) {
+        string raw = await RequestAsync("POST", path, body);
+        HttpResponse resp = HttpResponse.Parse(raw);
+        return resp.body;
+    }
+
+    // 发送 PUT 请求。
+    public async string PutAsync(string path, string body) {
+        string raw = await RequestAsync("PUT", path, body);
+        HttpResponse resp = HttpResponse.Parse(raw);
+        return resp.body;
+    }
+
+    // 发送 DELETE 请求。
+    public async string DeleteAsync(string path) {
+        string raw = await RequestAsync("DELETE", path, "");
+        HttpResponse resp = HttpResponse.Parse(raw);
+        return resp.body;
+    }
+
+    // 快捷静态 https GET（一次性）；校验保持开启，因此
+    // 服务器证书必须链到受信任的 CA。
+    public static async string GetHttpsAsync(string host, int port, string path) {
+        HttpClient client = HttpClient.CreateHttps(host, port);
+        string r = await client.GetAsync(path);
+        return r;
+    }
+
+    // 快捷静态 GET 方法（一次性）。
+    public static async string GetAsync(string host, int port, string path) {
+        HttpClient client = new HttpClient(host, port);
+        string r = await client.GetAsync(path);
+        return r;
+    }
+
+    // 快捷静态 POST 方法（一次性）。
+    public static async string PostAsync(string host, int port, string path, string body) {
+        HttpClient client = new HttpClient(host, port);
+        string r = await client.PostAsync(path, body);
+        return r;
+    }
+
+    // 将内容下载到文件。
+    public static async void DownloadFileAsync(string host, int port, string path, string localPath) {
+        string body = await HttpClient.GetAsync(host, port, path);
+        nint fp = fopen(localPath, "wb");
+        if (fp != 0) {
+            // 使用 fwrite 而非 fputs：含 NUL 字节的响应体不能被截断。
+            long _w = fwrite(body, 1, body.Length, fp);
+            fclose(fp);
+        }
+    }
+
+    // 逐字节的子串搜索（利用原生机器指令向量化搜索）。
+    private static int IndexOf(string s, string needle, int from) {
+        if (s == null || needle == null) { return -1; }
+        if (from < 0) { from = 0; }
+        if (from > s.Length) { return -1; }
+        return s.IndexOf(needle, from);
+    }
+
+    // 解析十六进制 chunk 大小前缀，在第一个非十六进制字节处停止
+    // （例如 ';' 分块扩展或 CR）。累计上限 0x00FFFFFF（16 MiB-1）：恶意
+    // 服务器发超长十六进制串会让 v*16 回绕成负数，下游
+    // need = crlf+2+size+2 随之为负、Substring 触发数组越界陷阱直接杀死
+    // 进程——服务器端解析器（HttpFramer.ReadChunked）早有同样的上限纪律，
+    // 客户端此前从未对齐。无有效十六进制数字或超限均返回 -1，调用方按坏帧处理。
+    private static int ParseHex(string s) {
+        int v = 0;
+        bool any = false;
+        for (int i = 0; i < s.Length; i = i + 1) {
+            int c = s[i] & 255;
+            int d = 0 - 1;
+            if (c >= 48 && c <= 57) { d = c - 48; }
+            else if (c >= 97 && c <= 102) { d = c - 97 + 10; }
+            else if (c >= 65 && c <= 70) { d = c - 65 + 10; }
+            else { i = s.Length; }
+            if (d >= 0) {
+                any = true;
+                v = v * 16 + d;
+                if (v > 16777215) { return 0 - 1; }
+            }
+        }
+        if (!any) { return 0 - 1; }
+        return v;
+    }
+
+    // 以追加模式把文本写入文件（fopen "ab" + fputs）；打不开时静默放弃。
+    private static void AppendText(string file, string s) {
+        nint fp = fopen(file, "ab");
+        if (fp != 0) {
+            fputs(s, fp);
+            fclose(fp);
+        }
+    }
+
+    // 清空文件内容（fopen "wb" 后立即关闭）；打不开时静默放弃。
+    private static void TruncateFile(string file) {
+        nint fp = fopen(file, "wb");
+        if (fp != 0) { fclose(fp); }
+    }
+
+    // 当响应头声明分块传输编码（chunked transfer-encoding）时返回 true。
+    // 调用者必须只传头部（"\r\n\r\n" 之前的字节）。
+    // 按行解析：字段名必须是行首（大小写不敏感）"transfer-encoding"，
+    // 且只有逗号列表的最后一项等于 "chunked" 才算。此前在整个头块里
+    // 包含匹配 "chunked"，恶意上游一个 ETag: "chunked" 就能把真实的
+    // SSE 流按假尺寸行解析到乱码/截断。
+    private static bool HeadIsChunked(string head) {
+        int lineStart = 0;
+        bool sawTe = false;
+        bool finalChunked = false;
+        while (lineStart < head.Length) {
+            int lineEnd = head.Length;
+            int e = HttpClient.IndexOf(head, "\n", lineStart);
+            if (e >= 0) { lineEnd = e; }
+            int stop = lineEnd;
+            if (stop > lineStart && (head[stop - 1] & 255) == 13) {
+                stop = stop - 1;
+            }
+            int colon = -1;
+            for (int i = lineStart; i < stop; i = i + 1) {
+                if ((head[i] & 255) == 58) { colon = i; break; }
+            }
+            if (colon == lineStart + 17
+                && HttpClient.AsciiNameEquals(
+                    head.Substring(lineStart, 17), "transfer-encoding", 17)) {
+                sawTe = true;
+                int p = colon + 1;
+                while (p < stop && ((head[p] & 255) == 32
+                        || (head[p] & 255) == 9)) { p = p + 1; }
+                bool lineSaw = false;
+                bool lineFinal = false;
+                while (p < stop) {
+                    int itemEnd = p;
+                    while (itemEnd < stop && (head[itemEnd] & 255) != 44) {
+                        itemEnd = itemEnd + 1;
+                    }
+                    int itemStop = itemEnd;
+                    while (itemStop > p && ((head[itemStop - 1] & 255) == 32
+                            || (head[itemStop - 1] & 255) == 9)) {
+                        itemStop = itemStop - 1;
+                    }
+                    if (itemStop <= p) { return false; }
+                    int semi = p;
+                    while (semi < itemStop && (head[semi] & 255) != 59) {
+                        semi = semi + 1;
+                    }
+                    int codingStop = semi;
+                    while (codingStop > p && ((head[codingStop - 1] & 255) == 32
+                            || (head[codingStop - 1] & 255) == 9)) {
+                        codingStop = codingStop - 1;
+                    }
+                    if (codingStop <= p) { return false; }
+                    lineFinal = codingStop - p == 7
+                        && HttpClient.AsciiNameEquals(
+                            head.Substring(p, codingStop - p), "chunked", 7);
+                    lineSaw = true;
+                    p = itemEnd + 1;
+                    while (p < stop && ((head[p] & 255) == 32
+                            || (head[p] & 255) == 9)) { p = p + 1; }
+                }
+                if (lineSaw) { finalChunked = lineFinal; }
+            }
+            if (e < 0) { break; }
+            lineStart = e + 1;
+        }
+        return sawTe && finalChunked;
+    }
+
+    // 从状态行解析数字状态码；不是严格的 "HTTP/1.0|1.1 OWS 3DIGIT"
+    // （版本后缀、缺 OWS、非数字、第 4 位数字）时返回 0，与
+    // HttpResponse.Parse 的拒收口径一致——下载/SSE 路径按 <100
+    // 拒收，不按数字前缀猜。
+    private static int HeadStatus(string head) {
+        if (head.Length < 12) { return 0; }
+        string ver = head.Substring(0, 8);
+        if (ver != "HTTP/1.0" && ver != "HTTP/1.1") { return 0; }
+        int c8 = head[8] & 255;
+        if (c8 != 32 && c8 != 9) { return 0; }
+        int i = 8;
+        while (i < head.Length && ((head[i] & 255) == 32
+            || (head[i] & 255) == 9)) { i = i + 1; }
+        if (i + 3 > head.Length) { return 0; }
+        int code = 0;
+        for (int k = 0; k < 3; k = k + 1) {
+            int b = head[i + k] & 255;
+            if (b < 48 || b > 57) { return 0; }
+            code = code * 10 + (b - 48);
+        }
+        if (i + 3 < head.Length) {
+            int b4 = head[i + 3] & 255;
+            if (b4 >= 48 && b4 <= 57) { return 0; }
+        }
+        return code;
+    }
+
+    // 将响应体边到达边流入 <paramref name="outFile"/>
+    // （解码分块传输编码），因此轮询该文件的调用者
+    // 能看到增量输出——例如 text/event-stream（SSE）应答。
+    // 此处的超时是空闲窗口，不是总预算：每收到一个
+    // chunk 都会重新计时，因此只要对端持续发送，长连接流就能保持存活，
+    // 而对端沉默时依然会被挂起。
+    // 从不抛异常：结果写入 <paramref name="doneFile"/>，正常结束为
+    // "ok"，否则为 "err: ..."（包括非 2xx 状态，
+    // 其错误正文仍会流入 outFile）。
+    public async int PostSseToFileAsync(string path, string body, string outFile, string doneFile) {
+        SseSink sink = SseSink.ToFile(outFile, doneFile);
+        int r = await this.PostSseToSinkAsync(path, body, sink);
+        sink.Dispose();
+        return r;
+    }
+
+    // 同样的流，但交付给 <see cref="SseSink"/>。
+    // 内存 sink 让整个交互都留在进程内：请求
+    // 可在工作线程上运行，同时渲染应答的线程
+    // 从 sink 中取走数据，无需临时文件，也无需辅助进程。
+    public async int PostSseToSinkAsync(string path, string body, SseSink sink) {
+        this.ResetTotalBudget();
+        sink.Begin();
+        if (this.callPolicy != null) {
+            bool targetOk = ExternalTargetPolicy.IsClientAllowed(this.host,
+                this.port, this.useTls,
+                this.callPolicy.AllowsLoopback(),
+                this.callPolicy.AllowsHttp(),
+                this.callPolicy.LocalHttpOnly());
+            if (!targetOk) {
+                sink.Finish("err: external target is not allowed");
+                return 0;
+            }
+        }
+        if (this.callPolicy != null
+            && body.Length > this.callPolicy.MaxRequestBytes()) {
+            sink.Finish("err: request body exceeds " + Convert.ToString(
+                this.callPolicy.MaxRequestBytes()) + " bytes");
+            return 0;
+        }
+        Socket.Initialize();
+        TcpClient conn = await this.ConnectTarget();
+        if (conn == null) {
+            sink.Finish("err: connect to " + this.host + " failed");
+            return 0;
+        }
+
+        TlsStream stream = null;
+        TlsContext ctx = null;
+        if (this.useTls) {
+            if (this.clientCertificateFile.Length > 0
+                && this.clientPrivateKeyFile.Length > 0) {
+                ctx = TlsContext.CreateClientWithCertificate(
+                    this.clientCertificateFile, this.clientPrivateKeyFile);
+            } else {
+                ctx = TlsContext.CreateClient();
+            }
+            if (ctx == null) {
+                conn.Close();
+                string tlsError2 = TlsStream.LastError();
+                if (tlsError2 == "") { tlsError2 = "TLS 上下文初始化失败"; }
+                sink.Finish("err: " + tlsError2);
+                return 0;
+            }
+            if (!this.verifyTls) { ctx.DisableVerify(); }
+            this.ApplyPinning(ctx);
+            stream = await this.ConnectTls(ctx, conn.Sock());
+            if (stream == null) {
+                conn.Close();
+                ctx.Free();
+                string tlsHandshakeError2 = TlsStream.LastError();
+                if (tlsHandshakeError2 == "") {
+                    tlsHandshakeError2 = "TLS 握手失败";
+                }
+                sink.Finish("err: " + tlsHandshakeError2);
+                return 0;
+            }
+        }
+
+        HttpDeadlineToken watch = HttpDeadline.Arm(conn.Sock(), this.WriteBudget(), this.TotalBudget());
+        string requestData = BuildRequest("POST", path, body, true);
+        int sent = 0;
+        if (this.useTls) {
+            sent = await stream.SendAsync(requestData, requestData.Length);
+        } else {
+            sent = await conn.SendAsync(requestData);
+        }
+        if (sent != requestData.Length) {
+            HttpDeadline.Disarm(watch);
+            if (this.useTls) { stream.Close(); conn.Close(); ctx.Free(); }
+            else { conn.Close(); }
+            sink.Finish("err: request write failed");
+            return 0;
+        }
+        HttpDeadline.Touch(watch, this.ReadBudget());
+
+        // 读取响应头，以便把状态/头部与正文分开。
+        // 扫描从末尾前几个字节重新开始，而非从 0 开始，且头部
+        // 有上限，使从不发送空行的对端无法无限增大
+        // 缓冲区。
+        string head = "";
+        int hb = 0 - 1;
+        while (hb < 0 && head.Length < 262144) {
+            string c;
+            if (this.useTls) { c = await stream.RecvAsync(65536); }
+            else { c = await conn.RecvAsync(65536); }
+            if (c.Length == 0) { break; }
+            int scanFrom = head.Length - 3;
+            if (scanFrom < 0) { scanFrom = 0; }
+            head = head + c;
+            hb = HttpClient.IndexOf(head, "\r\n\r\n", scanFrom);
+            HttpDeadline.Touch(watch, this.IdleBudget());
+        }
+
+        // 未找到头部终止符：对端提前关闭、超时，或发送了
+        // 过大的头部。干净地失败，而不是把垃圾数据当正文解析。
+        if (hb < 0) {
+            bool timedOut = HttpDeadline.Expired(watch);
+            HttpDeadline.Disarm(watch);
+            if (this.useTls) { stream.Close(); conn.Close(); ctx.Free(); }
+            else { conn.Close(); }
+            if (timedOut) { sink.Finish("err: timeout"); }
+            else { sink.Finish("err: no response head"); }
+            return 0;
+        }
+
+        string headOnly = head.Substring(0, hb);
+        int status = HttpClient.HeadStatus(headOnly);
+        bool chunked = HttpClient.HeadIsChunked(headOnly);
+        int bodyLen = HttpClient.HeaderInt(headOnly, "content-length");
+        string pending = head.Substring(hb + 4, head.Length - hb - 4);
+        head = "";
+        sink.SetResponse(status, headOnly, "");
+        headOnly = "";
+
+        // 被拒绝的请求（401 密钥错误、400 模型无效、404 base URL 错误、
+        // 429 超额）会用一段简短的自解释 JSON 正文应答。
+        // 该正文就是完整诊断，因此在此保留并写入
+        // 结果标记中，而不是被当作普通答案
+        // 流入 sink。
+        // 非 2xx 一律按失败收场（此前只有 >=400 才算）：3xx 重定向的
+        // HTML、1xx 的杂音会被逐 token 写进 sink，订阅者收到的是垃圾
+        // 补全且调用方还会重试。本客户端有意不自动跟随重定向——
+        // 跨源跳转携带 Authorization 是更大的错误。
+        bool failed = status < 200 || status >= 300;
+        int streamLimit = 0;
+        if (!failed && this.callPolicy != null) {
+            streamLimit = this.callPolicy.MaxStreamBytes();
+        }
+        if (!failed && streamLimit <= 0) {
+            // 策略未设上限时也不能放任内存 sink 无界增长：一个不结束
+            // 的上游流会把 parts 表撑到进程 OOM。默认 64 MiB 对正常
+            // 的 LLM 回答绰绰有余，又足以在异常流耗尽内存前掐断。
+            streamLimit = 67108864;
+        }
+        if (!failed && streamLimit > 0) { sink.SetMaxBytes(streamLimit); }
+        string errBody = "";
+        int got = 0;
+        bool finished = false;
+        bool cancelled = false;
+        bool streamOverflow = false;
+        // 当对端宣告结束时流才算完成：[DONE] 哨兵、
+        // 终止的空 chunk、已完整收到的 Content-Length、
+        // 或（如下所述）在 SSE 事件边界结束。若读取到 0 字节
+        // 且不符合以上任一情况，则说明连接在流传输中途断开——
+        // 模型可能被截断了——这属于可重试的失败。
+        bool cleanEnd = false;
+        string doneScan = "";
+        bool sawDone = false;
+        if (!failed && streamLimit > 0 && bodyLen > streamLimit) {
+            streamOverflow = true;
+            finished = true;
+            sink.Overflow();
+        }
+        while (!finished) {
+            // 消费者已不需要这份数据（下游客户端断开、请求被放弃）：
+            // 立即拆掉上游连接收工，不再为没人看的答案继续烧 token。
+            // 块边界外随时可退：sink 里已写入的字节保持原样。
+            if (this.CancelRequested()) {
+                finished = true;
+                cancelled = true;
+                cleanEnd = false;
+                break;
+            }
+            if (chunked) {
+                bool progressed = true;
+                while (progressed) {
+                    progressed = false;
+                    int crlf = HttpClient.IndexOf(pending, "\r\n", 0);
+                    if (crlf < 0) { progressed = false; }
+                    else {
+                        string sizeLine = pending.Substring(0, crlf);
+                        int size = HttpClient.ParseHex(sizeLine);
+                        if (size < 0) {
+                            // 坏的块大小行：按截断响应收尾，不再扫描。
+                            finished = true;
+                            progressed = false;
+                        } else if (size == 0) {
+                            finished = true;
+                            cleanEnd = true;
+                            progressed = false;
+                        } else if (!failed && streamLimit > 0
+                                   && got > streamLimit - size) {
+                            streamOverflow = true;
+                            finished = true;
+                            sink.Overflow();
+                            progressed = false;
+                        } else {
+                            int need = crlf + 2 + size + 2;
+                            if (pending.Length >= need) {
+                                string piece = pending.Substring(crlf + 2, size);
+                                got = got + piece.Length;
+                                if (failed) {
+                                    errBody = HttpClient.KeepHead(errBody, piece);
+                                } else if (!sink.TryWrite(piece)) {
+                                    streamOverflow = true;
+                                    finished = true;
+                                }
+                                doneScan = doneScan + piece;
+                                if (doneScan.Length > 64) {
+                                    doneScan = doneScan.Substring(doneScan.Length - 64, 64);
+                                }
+                                if (HttpClient.IndexOf(doneScan, "[DONE]", 0) >= 0) {
+                                    sawDone = true;
+                                }
+                                pending = pending.Substring(need, pending.Length - need);
+                                progressed = true;
+                            }
+                        }
+                    }
+                }
+            } else {
+                if (pending.Length > 0) {
+                    if (!failed && streamLimit > 0
+                        && got > streamLimit - pending.Length) {
+                        streamOverflow = true;
+                        finished = true;
+                        sink.Overflow();
+                    } else {
+                        got = got + pending.Length;
+                        if (failed) {
+                            errBody = HttpClient.KeepHead(errBody, pending);
+                        } else if (!sink.TryWrite(pending)) {
+                            streamOverflow = true;
+                            finished = true;
+                        }
+                        doneScan = doneScan + pending;
+                    }
+                    if (doneScan.Length > 64) {
+                        doneScan = doneScan.Substring(doneScan.Length - 64, 64);
+                    }
+                    if (HttpClient.IndexOf(doneScan, "[DONE]", 0) >= 0) {
+                        sawDone = true;
+                    }
+                    pending = "";
+                }
+                // 对端声明了长度的正文，在收到相应字节数后即完整
+                // ——这对所有非流式应答都成立，
+                // 包括错误对象——因此等待一个根本不会到来的 [DONE]
+                // 并不代表流不完整。
+                if (bodyLen > 0 && got >= bodyLen) { finished = true; cleanEnd = true; }
+            }
+            if (sawDone) { finished = true; cleanEnd = true; }
+                if (finished) {
+                    // 已到达终止 chunk
+                } else {
+                    string c;
+                    if (this.useTls) { c = await stream.RecvAsync(65536); }
+                    else { c = await conn.RecvAsync(65536); }
+                    if (c.Length == 0) { finished = true; }
+                    else {
+                        // 无 callPolicy 时 streamLimit 为 0，守卫被跳过：
+                        // 恶意对端发一条永不终止的 chunked 长度行就能把
+                        // pending 喂到任意大小（且每轮从头重扫，O(n²)）。
+                        // 1MiB 默认上限封死这条路径；合法 SSE 流的单个
+                        // 事件远小于此。
+                        int pendingLimit = streamLimit;
+                        if (failed && this.callPolicy != null) {
+                            pendingLimit = this.callPolicy.MaxErrorBytes();
+                        }
+                        if (pendingLimit <= 0) { pendingLimit = 1048576; }
+                        if (pending.Length > pendingLimit - c.Length) {
+                            if (failed) {
+                                errBody = HttpClient.KeepHead(errBody, pending);
+                            } else {
+                                streamOverflow = true;
+                                sink.Overflow();
+                            }
+                            finished = true;
+                        } else {
+                            pending = pending + c;
+                            // 有数据到达：重启空闲窗口，这样健康
+                            // 的长连接流绝不会在传输中途被切断。
+                            if (!HttpDeadline.Expired(watch)) {
+                                HttpDeadline.Touch(watch, this.IdleBudget());
+                            }
+                        }
+                    }
+                }
+        }
+        bool late = HttpDeadline.Expired(watch);
+        HttpDeadline.Disarm(watch);
+        if (this.useTls) {
+            stream.Close();
+            conn.Close();
+            ctx.Free();
+        } else {
+            conn.Close();
+        }
+
+        // 在事件边界（关闭 SSE 事件的空行）处结束的流
+        // 已交付完整事件：从不发送 [DONE] 哨兵的
+        // 服务商以及本地 OpenAI 兼容服务器恰恰就是这样结束的，
+        // 若将这种结束判定为连接中断，就会把它们的每一个
+        // 应答都变成失败并被重试的请求。
+        if (!cleanEnd && status >= 200 && status < 300 && got > 0
+            && HttpClient.EndsWithStr(doneScan, "\n\n")) {
+            cleanEnd = true;
+        }
+
+        // 结果优先看状态码：拒绝不是传输层问题，
+        // 把它报告成传输问题（"connection closed"）既掩盖了
+        // 服务商的信息，又让调用者重试一个注定
+        // 再次失败的请求。
+        if (streamOverflow) {
+            sink.Finish("err: stream limit exceeded");
+        } else if (status < 200 || status >= 300) {
+            sink.SetResponse(status, sink.ResponseHeaders(), errBody);
+            string detail = HttpClient.OneLine(errBody);
+            string marker = "err: HTTP " + Convert.ToString(status);
+            if (detail != "") { marker = marker + ": " + detail; }
+            sink.Finish(marker);
+        } else if (cancelled) {
+            // 消费者主动放弃（客户端断开）：既非上游失败也非超时，
+            // 调用方不应据此重试或轮换 key。
+            sink.Finish("err: cancelled");
+        } else if (late) {
+            sink.Finish("err: timeout");
+        } else if (status == 0) {
+            sink.Finish("err: no response");
+        } else if (!cleanEnd) {
+            // 对端在终止 chunk 前关闭：流被切断，
+            // 因此把它作为可重试的失败呈现，而非成功。
+            sink.Finish("err: connection closed");
+        } else if (status >= 200 && status < 300) {
+            sink.Finish("ok");
+        } else {
+            sink.Finish("err: HTTP " + Convert.ToString(status));
+        }
+        return 0;
+    }
+
+    // 当 `acc` 不足 512 字节时把 `piece` 追加进去：足够容纳
+    // 说明原因的报错正文，并设上限，使流式发送数兆
+    // 报错正文的对端也无法撑大缓冲区。
+    private static string KeepHead(string acc, string piece) {
+        if (acc.Length >= 512) { return acc; }
+        return acc + piece;
+    }
+
+    // 当 `s` 以 `suf` 结尾时返回 true（按字节比较）。
+    private static bool EndsWithStr(string s, string suf) {
+        if (s.Length < suf.Length) { return false; }
+        return s.Substring(s.Length - suf.Length, suf.Length) == suf;
+    }
+
+    // 将连续空白合并，使 JSON 报错正文能放进一行状态栏，并
+    // 将结果限制在 300 字节以内。
+    private static string OneLine(string s) {
+        if (s == null || s.Length == 0) { return ""; }
+        StringBuilder sb = new StringBuilder();
+        int len = s.Length;
+        int wordStart = -1;
+        bool sp = false;
+        for (int i = 0; i < len && sb.Length < 300; i = i + 1) {
+            int ch = s[i] & 255;
+            if (ch == 10 || ch == 13 || ch == 9 || ch == 32) {
+                if (wordStart >= 0) {
+                    sb.Append(s.Substring(wordStart, i - wordStart));
+                    wordStart = -1;
+                }
+                sp = true;
+            } else {
+                if (sp && sb.Length > 0) {
+                    sb.Append(" ");
+                    if (sb.Length >= 300) { break; }
+                }
+                sp = false;
+                if (wordStart < 0) { wordStart = i; }
+            }
+        }
+        if (wordStart >= 0 && sb.Length < 300) {
+            int take = len - wordStart;
+            if (sb.Length + take > 300) { take = 300 - sb.Length; }
+            sb.Append(s.Substring(wordStart, take));
+        }
+        return sb.ToString();
+    }
+}
