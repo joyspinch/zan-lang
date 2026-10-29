@@ -296,6 +296,16 @@ public class AiStream {
     // 协议翻译
     // ------------------------------------------------------------------
 
+    private static string JsonDocStr(JsonDoc doc, int at, string key, string dflt) {
+        if (doc == null || at < 0) { return dflt; }
+        return doc.StrAt(doc.Get(at, key), dflt);
+    }
+
+    private static int JsonDocInt(JsonDoc doc, int at, string key, int dflt) {
+        if (doc == null || at < 0) { return dflt; }
+        return doc.IntAt(doc.Get(at, key), dflt);
+    }
+
     // OpenAI 兼容协议的一帧 → 事件。
     //
     // 帧的形状：
@@ -312,21 +322,21 @@ public class AiStream {
     // `index` 归位拼起来才是完整参数。
     public static List<AiStreamEvent> OpenAiEvents(string payload) {
         List<AiStreamEvent> events = new List<AiStreamEvent>();
-        JsonValue frame = null;
+        JsonDoc doc = null;
         try {
-            frame = JsonValue.Parse(payload);
+            doc = JsonDoc.Parse(payload);
         } catch (Exception e) {
-            frame = null;
+            doc = null;
         }
-        if (frame == null || !frame.IsObject()) { return events; }
+        if (doc == null || doc.root < 0 || doc.KindAt(doc.root) != 5) { return events; }
 
         // 流内错误帧：provider 可以在 SSE **数据里**报错（HTTP 状态码仍是
         // 200）。这种帧必须报给调用方——否则调用方拿到的是半截内容 + 空
         // 错误，看起来像"正常结束"，实际是上游炸了。
-        JsonValue frameError = frame.Get("error");
-        if (frameError != null && !frameError.IsNull()) {
+        int frameError = doc.Get(doc.root, "error");
+        if (frameError >= 0 && doc.KindAt(frameError) != 0) {
             AiStreamEvent e = new AiStreamEvent("error");
-            string reason = frameError.Str("message", "");
+            string reason = JsonDocStr(doc, frameError, "message", "");
             if (reason.Length == 0) { reason = "流内错误帧"; }
             e.error = reason;
             events.Add(e);
@@ -334,44 +344,47 @@ public class AiStream {
         }
 
         // 用量（有的服务方在流末尾单独发一帧）。
-        JsonValue usage = frame.Get("usage");
-        if (usage != null && usage.IsObject()) {
+        int usage = doc.Get(doc.root, "usage");
+        if (usage >= 0 && doc.KindAt(usage) == 5) {
             AiStreamEvent e = new AiStreamEvent("usage");
-            e.inputTokens = usage.Int("prompt_tokens", 0);
-            e.outputTokens = usage.Int("completion_tokens", 0);
+            e.inputTokens = JsonDocInt(doc, usage, "prompt_tokens", 0);
+            e.outputTokens = JsonDocInt(doc, usage, "completion_tokens", 0);
             events.Add(e);
         }
 
-        JsonValue choices = frame.Get("choices");
-        if (choices == null || !choices.IsArray() || choices.Count() == 0) {
+        int choices = doc.Get(doc.root, "choices");
+        if (choices < 0 || doc.KindAt(choices) != 4 || doc.Count(choices) == 0) {
             return events;
         }
-        JsonValue choice = choices.At(0);
-        if (choice == null) { return events; }
+        int choice = doc.FirstChild(choices);
+        if (choice < 0) { return events; }
 
-        JsonValue delta = choice.Get("delta");
-        if (delta != null) {
-            string piece = delta.Str("content", "");
+        int delta = doc.Get(choice, "delta");
+        if (delta >= 0) {
+            string piece = JsonDocStr(doc, delta, "content", "");
             if (piece.Length > 0) {
                 AiStreamEvent e = new AiStreamEvent("delta");
                 e.text = piece;
                 events.Add(e);
             }
-            JsonValue calls = delta.Get("tool_calls");
-            if (calls != null && calls.IsArray()) {
-                for (int i = 0; i < calls.Count(); i = i + 1) {
-                    JsonValue one = calls.At(i);
-                    if (one == null) { continue; }
-                    AiStreamEvent e = new AiStreamEvent("tool");
-                    // 序号是服务方给的**归位键**——不靠到达顺序。
-                    e.toolIndex = one.Int("index", i);
-                    e.toolId = one.Str("id", "");
-                    JsonValue fn = one.Get("function");
-                    if (fn != null) {
-                        e.toolName = fn.Str("name", "");
-                        e.args = fn.Str("arguments", "");
+            int calls = doc.Get(delta, "tool_calls");
+            if (calls >= 0 && doc.KindAt(calls) == 4) {
+                int count = doc.Count(calls);
+                int one = doc.FirstChild(calls);
+                for (int i = 0; i < count; i = i + 1) {
+                    if (one >= 0) {
+                        AiStreamEvent e = new AiStreamEvent("tool");
+                        // 序号是服务方给的**归位键**——不靠到达顺序。
+                        e.toolIndex = JsonDocInt(doc, one, "index", i);
+                        e.toolId = JsonDocStr(doc, one, "id", "");
+                        int fn = doc.Get(one, "function");
+                        if (fn >= 0) {
+                            e.toolName = JsonDocStr(doc, fn, "name", "");
+                            e.args = JsonDocStr(doc, fn, "arguments", "");
+                        }
+                        events.Add(e);
                     }
-                    events.Add(e);
+                    one = doc.NextSibling(one);
                 }
             }
         }
@@ -379,7 +392,7 @@ public class AiStream {
         // 结束事件放在**最后**：正文与工具调用的增量先到，"结束了"是
         // 收尾消息。顺序反了会让"先看到结束、后收到正文"的消费者
         // 提前收摊。
-        string finish = choice.Str("finish_reason", "");
+        string finish = JsonDocStr(doc, choice, "finish_reason", "");
         if (finish.Length > 0) {
             AiStreamEvent e = new AiStreamEvent("done");
             e.finishReason = finish;
@@ -408,19 +421,19 @@ public class AiStream {
     // 归位用同一个键就行，顺序由内容块的下标保证。
     public static List<AiStreamEvent> AnthropicEvents(string payload) {
         List<AiStreamEvent> events = new List<AiStreamEvent>();
-        JsonValue frame = null;
+        JsonDoc doc = null;
         try {
-            frame = JsonValue.Parse(payload);
+            doc = JsonDoc.Parse(payload);
         } catch (Exception e) {
-            frame = null;
+            doc = null;
         }
-        if (frame == null || !frame.IsObject()) { return events; }
-        string type = frame.Str("type", "");
+        if (doc == null || doc.root < 0 || doc.KindAt(doc.root) != 5) { return events; }
+        string type = JsonDocStr(doc, doc.root, "type", "");
 
         if (type == "error") {
             AiStreamEvent e = new AiStreamEvent("error");
-            JsonValue frameError = frame.Get("error");
-            string reason = frameError == null ? "" : frameError.Str("message", "");
+            int frameError = doc.Get(doc.root, "error");
+            string reason = frameError < 0 ? "" : JsonDocStr(doc, frameError, "message", "");
             if (reason.Length == 0) { reason = "流内错误帧"; }
             e.error = reason;
             events.Add(e);
@@ -428,36 +441,36 @@ public class AiStream {
         }
 
         if (type == "message_start") {
-            JsonValue message = frame.Get("message");
-            JsonValue usage = message == null ? null : message.Get("usage");
-            if (usage != null && usage.IsObject()) {
+            int message = doc.Get(doc.root, "message");
+            int usage = message < 0 ? -1 : doc.Get(message, "usage");
+            if (usage >= 0 && doc.KindAt(usage) == 5) {
                 AiStreamEvent e = new AiStreamEvent("usage");
-                e.inputTokens = usage.Int("input_tokens", 0);
+                e.inputTokens = JsonDocInt(doc, usage, "input_tokens", 0);
                 events.Add(e);
             }
             return events;
         }
 
         if (type == "content_block_start") {
-            int index = frame.Int("index", 0);
-            JsonValue block = frame.Get("content_block");
-            if (block != null && block.Str("type", "") == "tool_use") {
+            int index = JsonDocInt(doc, doc.root, "index", 0);
+            int block = doc.Get(doc.root, "content_block");
+            if (block >= 0 && JsonDocStr(doc, block, "type", "") == "tool_use") {
                 AiStreamEvent e = new AiStreamEvent("tool");
                 e.toolIndex = index;
-                e.toolId = block.Str("id", "");
-                e.toolName = block.Str("name", "");
+                e.toolId = JsonDocStr(doc, block, "id", "");
+                e.toolName = JsonDocStr(doc, block, "name", "");
                 events.Add(e);
             }
             return events;
         }
 
         if (type == "content_block_delta") {
-            int index = frame.Int("index", 0);
-            JsonValue delta = frame.Get("delta");
-            if (delta == null) { return events; }
-            string deltaType = delta.Str("type", "");
+            int index = JsonDocInt(doc, doc.root, "index", 0);
+            int delta = doc.Get(doc.root, "delta");
+            if (delta < 0) { return events; }
+            string deltaType = JsonDocStr(doc, delta, "type", "");
             if (deltaType == "text_delta") {
-                string piece = delta.Str("text", "");
+                string piece = JsonDocStr(doc, delta, "text", "");
                 if (piece.Length > 0) {
                     AiStreamEvent e = new AiStreamEvent("delta");
                     e.text = piece;
@@ -466,21 +479,21 @@ public class AiStream {
             } else if (deltaType == "input_json_delta") {
                 AiStreamEvent e = new AiStreamEvent("tool");
                 e.toolIndex = index;
-                e.args = delta.Str("partial_json", "");
+                e.args = JsonDocStr(doc, delta, "partial_json", "");
                 events.Add(e);
             }
             return events;
         }
 
         if (type == "message_delta") {
-            JsonValue usage = frame.Get("usage");
-            if (usage != null && usage.IsObject()) {
+            int usage = doc.Get(doc.root, "usage");
+            if (usage >= 0 && doc.KindAt(usage) == 5) {
                 AiStreamEvent e = new AiStreamEvent("usage");
-                e.outputTokens = usage.Int("output_tokens", 0);
+                e.outputTokens = JsonDocInt(doc, usage, "output_tokens", 0);
                 events.Add(e);
             }
-            JsonValue delta = frame.Get("delta");
-            string stop = delta == null ? "" : delta.Str("stop_reason", "");
+            int delta = doc.Get(doc.root, "delta");
+            string stop = delta < 0 ? "" : JsonDocStr(doc, delta, "stop_reason", "");
             if (stop.Length > 0) {
                 AiStreamEvent e = new AiStreamEvent("done");
                 e.finishReason = stop;

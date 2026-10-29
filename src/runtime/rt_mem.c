@@ -163,6 +163,7 @@ static unsigned zan_mem_hash(uintptr_t base) {
 }
 
 static int zan_mem_owns(const void *p) {
+    if (!__atomic_load_n(&g_slab_count, __ATOMIC_ACQUIRE)) return 0;
     uintptr_t base = (uintptr_t)p & ~(uintptr_t)(ZAN_MEM_SLAB - 1);
     unsigned i = zan_mem_hash(base);
     for (unsigned n = 0; n < 64; n++) {
@@ -170,10 +171,6 @@ static int zan_mem_owns(const void *p) {
                                       __ATOMIC_ACQUIRE);
         if (v == base) return 1;
         if (v == 0) return 0;
-    }
-    for (unsigned n = 0; n < ZAN_MEM_SET_SIZE; n++) {
-        uintptr_t v = __atomic_load_n(&g_slab_set[n], __ATOMIC_ACQUIRE);
-        if (v == base) return 1;
     }
     return 0;
 }
@@ -305,7 +302,7 @@ static int zan_mem_publish_slab(zan_mem_cache *c, uintptr_t base) {
     }
     __atomic_store_n(&g_slab_set[(i + n) & ZAN_MEM_SET_MASK], base,
                      __ATOMIC_RELEASE);
-    g_slab_count++;
+    __atomic_store_n(&g_slab_count, g_slab_count + 1, __ATOMIC_RELEASE);
     zan_mem_unlock();
 
     c->bump = (char *)base;
