@@ -506,36 +506,38 @@ public class AiClient : IDisposable, IChat {
     //   1  = 继续读下一行
     //   0  = 调用方要求停止（onDelta 返回了 false）
     //  -1  = 流内错误帧（错误已记进 lastError）
-    private int OnStreamLine(string line, StringBuilder sb, AiDeltaFn onDelta) {
+    internal int OnStreamLine(string line, StringBuilder sb, AiDeltaFn onDelta) {
         if (line.Length == 0) { return 1; }
         if (!line.StartsWith("data:")) { return 1; }
         string payload = line.Substring(5).Trim();
         if (payload == "[DONE]") { return 1; }
-        JsonValue frame = null;
+        JsonDoc doc = null;
         try {
-            frame = JsonValue.Parse(payload);
+            doc = JsonDoc.Parse(payload);
         } catch (Exception e) {
             return 1;   // 坏帧跳过，不让整条流断掉
         }
-        if (frame == null) { return 1; }
+        if (doc == null || doc.root < 0 || doc.KindAt(doc.root) != 5) { return 1; }
         // 流内错误帧：OpenAI 兼容的 provider 可以在 SSE 数据里报错，
         // 而不是靠 HTTP 状态码。这种帧必须**报给调用方**——否则调用方
         // 拿到的是半截内容 + 空 lastError，看起来像"正常结束"，
         // 实际是上游炸了。
-        JsonValue frameError = frame.Get("error");
-        if (frameError != null && !frameError.IsNull()) {
-            string reason = frameError.Str("message", "");
+        int frameError = doc.Get(doc.root, "error");
+        if (frameError >= 0 && doc.KindAt(frameError) != 0) {
+            string reason = doc.StrAt(doc.Get(frameError, "message"), "");
             if (reason.Length == 0) { reason = "流内错误帧"; }
             this.lastError = "流式请求失败：" + reason;
             return -1;
         }
-        JsonValue choices = frame.Get("choices");
-        if (choices == null || !choices.IsArray() || choices.Count() == 0) {
+        int choices = doc.Get(doc.root, "choices");
+        if (choices < 0 || doc.KindAt(choices) != 4 || doc.Count(choices) == 0) {
             return 1;
         }
-        JsonValue delta = choices.At(0).Get("delta");
-        if (delta == null) { return 1; }
-        string piece = delta.Str("content", "");
+        int choice = doc.FirstChild(choices);
+        if (choice < 0) { return 1; }
+        int delta = doc.Get(choice, "delta");
+        if (delta < 0) { return 1; }
+        string piece = doc.StrAt(doc.Get(delta, "content"), "");
         if (piece.Length == 0) { return 1; }
         sb.Append(piece);
         if (onDelta != null) {
