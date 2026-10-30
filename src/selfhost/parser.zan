@@ -44,29 +44,8 @@ public class Parser {
     public int curFile;       // index into fileStarts of the current file
     public List<int> fileStarts; // first source line of each input file
     public List<string> curFileUsings; // usings of the current file
-    // dbgen's generated ORM text when this unit triggered ORM codegen; main
-    // seeds its post-codegen pull-in round from it (null when none)
-    public string genDbSrc;
-    // attrgen attribute surface captured by the last ParseAttrs: route
-    // template, HTTP verb, description, structural flags, [Opt] args and
-    // name=constant metadata from other attributes ([Custom] and friends)
-    public string attrRoute;
-    public bool attrRouteR;
-    public string attrVerb;
-    public string attrDesc;
-    public bool attrTx;
-    public bool attrApiController;
-    public bool attrNonAction;
-    public List<string> attrOpts;
-    public List<string> attrMeta;
-    // attrgen's synthesized __AttrRoutes text when this unit has controllers;
-    // main seeds its post-codegen pull-in round from it (null when none)
-    public string genAttrSrc;
-    // EvalMeta output slots (compile-time constant attribute arguments)
-    int evKind;
-    string evVal;
 
-    public Parser(List<Token> t, Diags d) { toks = t; pos = 0; diags = d; lastErrPos = -1; attrDll = false; attrEntry = ""; attrJsonIgnore = false; curClsNode = null; synthUsing = 0; curNs = ""; curFile = -1; fileStarts = null; curFileUsings = new List<string>(); genDbSrc = null; attrRoute = ""; attrRouteR = false; attrVerb = ""; attrDesc = ""; attrTx = false; attrApiController = false; attrNonAction = false; attrOpts = null; attrMeta = null; genAttrSrc = null; attrStaticAddr = ""; }
+    public Parser(List<Token> t, Diags d) { toks = t; pos = 0; diags = d; lastErrPos = -1; attrDll = false; attrEntry = ""; attrJsonIgnore = false; curClsNode = null; synthUsing = 0; curNs = ""; curFile = -1; fileStarts = null; curFileUsings = new List<string>(); attrStaticAddr = ""; }
 
     // main.zan knows where each input file starts in the concatenated source
     // (1-based line numbers); with it the parser can give every declaration
@@ -125,15 +104,6 @@ public class Parser {
         attrColIdentity = -1;
         attrColNullable = -1;
         attrColStrLen = 0;
-        attrRoute = "";
-        attrRouteR = false;
-        attrVerb = "";
-        attrDesc = "";
-        attrTx = false;
-        attrApiController = false;
-        attrNonAction = false;
-        attrOpts = null;
-        attrMeta = null;
         while (At(TK.LBracket())) {
             Next(); // [
             if (At(TK.Ident()) && Cur().text == "DllImport") {
@@ -273,185 +243,23 @@ public class Parser {
                 }
                 if (attrIndexes == null) { attrIndexes = new List<string>(); }
                 attrIndexes.Add(inm + "|" + ifields + "|" + (iuniq == 1 ? "true" : "false"));
-            } else if (At(TK.Ident()) && (Cur().text == "Route" || Cur().text == "RouteR")) {
-                // [Route("tpl")] / [RouteR("pattern")] -- attrgen route template
-                if (Cur().text == "RouteR") { attrRouteR = true; }
-                Next();
-                if (Eat(TK.LParen())) {
-                    if (At(TK.StringLit())) { attrRoute = DecodeStrLit(Next().text); }
-                    while (!At(TK.RParen()) && !At(TK.Eof())) { Next(); }
-                    Expect(TK.RParen());
-                }
-            } else if (At(TK.Ident()) && AttrVerbOf(Cur().text).Length > 0) {
-                attrVerb = AttrVerbOf(Next().text);
-                if (Eat(TK.LParen())) {
-                    while (!At(TK.RParen()) && !At(TK.Eof())) { Next(); }
-                    Expect(TK.RParen());
-                }
-            } else if (At(TK.Ident()) && Cur().text == "Description") {
-                Next();
-                if (Eat(TK.LParen())) {
-                    if (At(TK.StringLit())) { attrDesc = DecodeStrLit(Next().text); }
-                    while (!At(TK.RParen()) && !At(TK.Eof())) { Next(); }
-                    Expect(TK.RParen());
-                }
-            } else if (At(TK.Ident()) && Cur().text == "Tx") {
-                attrTx = true;
-                Next();
-                if (Eat(TK.LParen())) {
-                    while (!At(TK.RParen()) && !At(TK.Eof())) { Next(); }
-                    Expect(TK.RParen());
-                }
-            } else if (At(TK.Ident()) && Cur().text == "ApiController") {
-                attrApiController = true;
-                Next();
-                if (Eat(TK.LParen())) {
-                    while (!At(TK.RParen()) && !At(TK.Eof())) { Next(); }
-                    Expect(TK.RParen());
-                }
-            } else if (At(TK.Ident()) && Cur().text == "NonAction") {
-                attrNonAction = true;
-                Next();
-                if (Eat(TK.LParen())) {
-                    while (!At(TK.RParen()) && !At(TK.Eof())) { Next(); }
-                    Expect(TK.RParen());
-                }
-            } else if (At(TK.Ident()) && Cur().text == "Opt") {
-                // [Opt("page=1", "kw=")] -- optional signature parameters
-                Next();
-                if (Eat(TK.LParen())) {
-                    while (!At(TK.RParen()) && !At(TK.Eof())) {
-                        if (At(TK.StringLit())) {
-                            if (attrOpts == null) { attrOpts = new List<string>(); }
-                            attrOpts.Add(DecodeStrLit(Next().text));
-                        } else { Next(); }
-                    }
-                    Expect(TK.RParen());
-                }
-            } else if (At(TK.Ident())) {
-                // any other attribute: keep its name=constant arguments as
-                // route metadata records ("kind:name=value") for attrgen
-                string an = Next().text;
-                if (Eat(TK.LParen())) {
-                    while (!At(TK.RParen()) && !At(TK.Eof())) {
-                        string pn = "";
-                        if (At(TK.Ident()) && K1() == TK.Eq()) { pn = Next().text; Next(); }
-                        Node ev = ParseExpr();
-                        string rec = MetaRec(an, pn, ev);
-                        if (rec.Length > 0) {
-                            if (attrMeta == null) { attrMeta = new List<string>(); }
-                            attrMeta.Add(rec);
-                        }
-                        if (!Eat(TK.Comma())) { break; }
-                    }
-                    Expect(TK.RParen());
-                }
             } else {
-                while (!At(TK.RBracket()) && !At(TK.Eof())) { Next(); }
+                int depth = 0;
+                while (!At(TK.Eof())) {
+                    if (At(TK.LBracket())) { depth = depth + 1; }
+                    else if (At(TK.RBracket())) {
+                        if (depth == 0) { break; }
+                        depth = depth - 1;
+                    }
+                    Next();
+                }
             }
             Expect(TK.RBracket());
         }
     }
 
-    // HTTP verb attribute name -> verb, else "" (GenRoute.AttrHttpVerb).
-    string AttrVerbOf(string n) {
-        if (n == "HttpGet") { return "GET"; }
-        if (n == "HttpPost") { return "POST"; }
-        if (n == "HttpPut") { return "PUT"; }
-        if (n == "HttpDelete") { return "DELETE"; }
-        if (n == "HttpPatch") { return "PATCH"; }
-        if (n == "HttpHead") { return "HEAD"; }
-        if (n == "HttpOptions") { return "OPTIONS"; }
-        return "";
-    }
-
-    // decode a string literal's raw token text (the lexer keeps escape
-    // sequences intact; StrEsc holds the one decoding rule)
-    string DecodeStrLit(string t) {
-        return StrEsc.DecodeText(t);
-    }
-
-    // route metadata record for one attribute argument, "" when the argument
-    // is positional or not a compile-time constant (kind 0 int 1 bool 2 str
-    // 3 enum member); records carry the attribute usage name so attrgen can
-    // apply the attribute class's own defaults first
-    string MetaRec(string attrName, string paramName, Node e) {
-        if (paramName.Length == 0) { return ""; }
-        if (!EvalMeta(e)) { return ""; }
-        return attrName + "@" + Convert.ToString(evKind) + ":" + paramName
-            + "=" + evVal;
-    }
-
-    // compile-time constant evaluation for attribute arguments: int/bool/
-    // string literals, bare identifiers and Type.Member enum references,
-    // and enum bit unions (GenRoute.EvalConst); sets evKind/evVal
-    bool EvalMeta(Node e) {
-        evVal = "";
-        evKind = -1;
-        if (e == null) { return false; }
-        if (e.kind == AK.IntLit()) { evKind = 0; evVal = Convert.ToString(e.ival); return true; }
-        if (e.kind == AK.BoolLit()) { evKind = 1; evVal = e.ival != 0 ? "true" : "false"; return true; }
-        if (e.kind == AK.StringLit()) { evKind = 2; evVal = DecodeStrLit(e.sval); return true; }
-        if (e.kind == AK.Ident()) { evKind = 3; evVal = e.sval; return true; }
-        if (e.kind == AK.MemberAccess() && e.a != null && e.a.kind == AK.Ident()) {
-            evKind = 3;
-            evVal = e.sval;
-            return true;
-        }
-        if (e.kind == AK.Unary() && e.op == TK.Minus() && e.a != null
-                && e.a.kind == AK.IntLit()) {
-            evKind = 0;
-            string sv = Convert.ToString(e.a.ival);
-            evVal = sv != "0" ? "-" + sv : "0";
-            return true;
-        }
-        if (e.kind == AK.Binary() && e.op == TK.Pipe() && e.a != null && e.b != null) {
-            if (!EvalMeta(e.a)) { return false; }
-            if (evKind != 3) { return false; }
-            string left = evVal;
-            if (!EvalMeta(e.b)) { return false; }
-            if (evKind != 3) { return false; }
-            evKind = 3;
-            evVal = left + "|" + evVal;
-            return true;
-        }
-        return false;
-    }
-
-    // pack the captured web attribute surface of one declaration into
-    // Node.attrWeb: "route\nverb\ndesc\nflags\nopts\nmeta" ("\n"-separated
-    // fields, ";"-separated list items, meta records "kind:name=value");
-    // "" when the declaration carries no web attributes
     public string AttrWebPack() {
-        string flags = "";
-        if (attrApiController) { flags = flags + "A"; }
-        if (attrNonAction) { flags = flags + "N"; }
-        if (attrTx) { flags = flags + "T"; }
-        if (attrRouteR) { flags = flags + "R"; }
-        string opts = "";
-        if (attrOpts != null) {
-            int i = 0;
-            while (i < attrOpts.Count) {
-                if (i > 0) { opts = opts + ";"; }
-                opts = opts + attrOpts[i];
-                i = i + 1;
-            }
-        }
-        string meta = "";
-        if (attrMeta != null) {
-            int i = 0;
-            while (i < attrMeta.Count) {
-                if (i > 0) { meta = meta + ";"; }
-                meta = meta + attrMeta[i];
-                i = i + 1;
-            }
-        }
-        if (attrRoute.Length == 0 && attrVerb.Length == 0 && attrDesc.Length == 0
-                && flags.Length == 0 && opts.Length == 0 && meta.Length == 0) {
-            return "";
-        }
-        return attrRoute + "\n" + attrVerb + "\n" + attrDesc + "\n" + flags
-            + "\n" + opts + "\n" + meta;
+        return "";
     }
 
     // All token access is end-of-input safe: once pos runs off the end we keep
