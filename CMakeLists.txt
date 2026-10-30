@@ -4725,17 +4725,19 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_form_dynamic${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
-  # Same primitives through the runtime-HTML compiled channel (GenHtml):
-  # data-if lands on bindIf and data-for lands in the Element attribute
-  # table, so the compiled tree behaves identically to App.LoadHtml.
+  # Runtime HTML document load (--embed fixture + LoadHtmlWith): data-if
+  # lands on bindIf and data-for lands in the Element attribute table, so
+  # model sync / handler wiring behave identically to Html.Parse.
   add_test(NAME conformance_gui_html_runtime
     COMMAND ${CMAKE_COMMAND}
       -DZANC=$<TARGET_FILE:zanc>
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/html_runtime_test.zan
-      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/tests/gui/html_runtime.html;--auto-stdlib${_gui_driver_tail}"
+      "-DZANC_ARGS=--embed;tests/gui/html_runtime.html;--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_html_runtime.out
       -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_html_runtime${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+  set_tests_properties(conformance_gui_html_runtime PROPERTIES
+    TIMEOUT 120 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
 
   # <label> 的 UA 归类契约（A546）：普通 HTML 的 <label> 经 Html.Build
   # 建成 Label 控件（文本自测自绘），块流容器里照常排版；而 UA 表不给
