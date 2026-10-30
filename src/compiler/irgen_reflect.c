@@ -710,7 +710,8 @@ static LLVMValueRef refl_ctor_record(zan_irgen_t *g, zan_symbol_t *sym,
     LLVMValueRef thunk = LLVMConstNull(i8ptr);
     if (!decl) {
         if (late) {
-            thunk = refl_make_ctor_thunk(g, sym, NULL, NULL);
+            LLVMValueRef t = refl_make_ctor_thunk(g, sym, NULL, NULL);
+            if (t) thunk = t;
         }
         return LLVMConstNamedStruct(refl_method_type(g), (LLVMValueRef[]){
             refl_const_string(g, ".ctor", 5),

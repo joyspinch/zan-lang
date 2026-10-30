@@ -1026,15 +1026,33 @@ partial class Irgen {
         }
         if (m == "AsI32" && argc == 1) {
             ExprVal v = GenExpr(e.kids[0]);
+            string fltOp = v.op;
+            string vt = MapType(v.ty);
+            if (vt == "double") {
+                string tr = NT();
+                L("  " + tr + " = fptrunc double " + v.op + " to float");
+                fltOp = tr;
+            }
             string r = NT();
-            L("  " + r + " = bitcast " + MapType(v.ty) + " " + v.op + " to i32");
-            return new ExprVal(r, MkType("int"));
+            L("  " + r + " = bitcast float " + fltOp + " to i32");
+            string z = NT();
+            L("  " + z + " = zext i32 " + r + " to i64");
+            return new ExprVal(z, MkType("int"));
         }
         if (m == "AsF32" && argc == 1) {
             ExprVal v = GenExpr(e.kids[0]);
+            string i32Op = v.op;
+            string vt = MapType(v.ty);
+            if (vt == "i64" || vt == "i8*" || vt == "") {
+                string tr = NT();
+                L("  " + tr + " = trunc i64 " + v.op + " to i32");
+                i32Op = tr;
+            }
             string r = NT();
-            L("  " + r + " = bitcast i32 " + v.op + " to float");
-            return new ExprVal(r, MkType("float"));
+            L("  " + r + " = bitcast i32 " + i32Op + " to float");
+            string ext = NT();
+            L("  " + ext + " = fpext float " + r + " to double");
+            return new ExprVal(ext, MkType("float"));
         }
         if (m == "AsI64" && argc == 1) {
             // the bit pattern of a double, reinterpreted as a long
@@ -2265,10 +2283,10 @@ partial class Irgen {
         // host's ABI); they are never heap objects
         if (n == "Vector128") { return "<2 x i64>"; }
         if (n == "Vector256") { return "<4 x i64>"; }
-        // Span<T> is a non-owning view; the host carries { base, len } but the
-        // selfhost backend has no aggregate values, so a span travels as its
-        // base address (spans are never bounds-checked).
-        if (n == "Span") { return "i64"; }
+        // Span<T> / ReadOnlySpan<T> is a non-owning view; the host carries
+        // { base, len } but the selfhost backend has no aggregate values, so
+        // a span travels as its base address (spans are never bounds-checked).
+        if (n == "Span" || n == "ReadOnlySpan") { return "i64"; }
         // A task handle travels as the coroutine frame pointer: an async call
         // hands back the frame (the `__task` pseudo-type of the call site), so
         // a Task-typed slot is a pointer, not an integer.
@@ -2308,7 +2326,7 @@ partial class Irgen {
     bool IsSpanType(Node t) {
         if (t == null) { return false; }
         if (t.ival >= 1) { return false; }
-        if (t.sval == "Span") { return true; }
+        if (t.sval == "Span" || t.sval == "ReadOnlySpan") { return true; }
         return false;
     }
 
@@ -3739,19 +3757,7 @@ partial class Irgen {
     }
 
     void EmitLocalReleases() {
-        int i = 0;
-        while (i < locName.Count) {
-            // a by-ref parameter's reference belongs to the CALLER's slot:
-            // releasing it here would drop the caller's own reference
-            if (i < locRef.Count && locRef[i]) { i = i + 1; continue; }
-            if (ArcManaged(locType[i])) {
-                string lt = MapType(locType[i]);
-                string t = NT();
-                L("  " + t + " = load " + lt + ", " + lt + "* " + locReg[i]);
-                EmitArcRelease(t, locType[i]);
-            }
-            i = i + 1;
-        }
+        ReleaseLocalsFrom(0);
     }
 
     void AddTemp(string op, Node ty) {
