@@ -8,9 +8,9 @@ to zanc (project `packages/`, `.zan-packages/`, or a toolchain-relative
 - `System.Data` — `DbConnection` / `DbPool` / `DbResult` core, connector and
   executor interfaces, tracing wrapper.
 - `System.Data.Orm` — ZanSQL ORM. `[DbTable]` models plus
-  `db.Select<T>()` fluent queries; the compiler's ORM codegen
-  (`System/Compiler/ZanGen.zan`) emits the per-entity facades, so user code
-  never spells `OrmMeta`/`OrmSelect` directly. Navigation is **bidirectional**:
+  `db.Select<T>()` fluent queries; entity facades are built from runtime
+  reflection (`TypeInfo`), so user code never spells `OrmMeta`/`OrmSelect`
+  directly. Navigation is **bidirectional**:
   `Include(p => p.user)` joins the parent into the child row, and
   `Children(parentId)` / `ChildrenOf(parentTable, parentId)` fetch the
   children of a parent row — the reverse relation is *derived* from the

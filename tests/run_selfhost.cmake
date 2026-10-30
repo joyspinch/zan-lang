@@ -37,9 +37,6 @@ else()
   ${SELFHOST_DIR}/binder.zan
   ${SELFHOST_DIR}/diag.zan
   ${SELFHOST_DIR}/parser.zan
-  ${SELFHOST_DIR}/jsongen.zan
-  ${SELFHOST_DIR}/attrgen.zan
-  ${SELFHOST_DIR}/dbgen.zan
   ${SELFHOST_DIR}/lexer.zan
   ${SELFHOST_DIR}/ngen.zan
   ${SELFHOST_DIR}/ngen_macho.zan
