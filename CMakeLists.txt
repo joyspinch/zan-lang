@@ -4556,13 +4556,15 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
   set_tests_properties(conformance_gui_formbuild_contract PROPERTIES
     TIMEOUT 120 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
 
-  # GenForm's typed fields and runtime FormBuilder must project one HTML
-  # document identically, including mixed text, slots, bindings and columns.
+  # The design document projects through the runtime channel (DesignerHtml
+  # ToJsonDoc + FormBuilder.Build): mixed text, slots, anchor metadata,
+  # bindings and z-model directives survive; handlers wire to a host
+  # window by name at runtime (fixture baked in with --embed).
   add_test(NAME conformance_gui_genform_contract
     COMMAND ${CMAKE_COMMAND}
       -DZANC=$<TARGET_FILE:zanc>
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/genform_contract_test.zan
-      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/tests/gui/genform_contract.html;--auto-stdlib${_gui_driver_tail}"
+      "-DZANC_ARGS=--embed;tests/gui/genform_contract.html;--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_genform_contract.out
       -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_genform_contract${_exe_ext}
       -DSTDLIB_STAMP=${_stdlib_stamp}
