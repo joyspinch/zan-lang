@@ -16,6 +16,7 @@ namespace Zan;
 //   - Data section (id 11): static string literals and initial memory data
 partial class Ngen {
     int wasmTarget = 0;
+    List<string> wasmExts;
     public void SetTargetWasm() { wasmTarget = 1; }
 
     void WasmWriteU32(List<int> bytes, int val) {
@@ -119,6 +120,72 @@ partial class Ngen {
                     WasmWriteU32(fnBody, idx);
                 }
             }
+        } else if (e.kind == AK.Unary()) {
+            if (e.op == 2) { // negate '-'
+                fnBody.Add(0x41); WasmWriteI32(fnBody, 0); // 0
+                WasmLowerExpr(fnBody, e.a, locals);
+                fnBody.Add(0x6B); // i32.sub (0 - a)
+            } else if (e.op == 16) { // not '!'
+                WasmLowerExpr(fnBody, e.a, locals);
+                fnBody.Add(0x45); // i32.eqz
+            } else if (e.op == 17) { // bitwise not '~'
+                WasmLowerExpr(fnBody, e.a, locals);
+                fnBody.Add(0x41); WasmWriteI32(fnBody, -1); // -1
+                fnBody.Add(0x73); // i32.xor
+            } else {
+                WasmLowerExpr(fnBody, e.a, locals);
+            }
+        } else if (e.kind == AK.StringLit()) {
+            int strOff = 4096;
+            int si = 0;
+            while (si < strs.Count) {
+                if (strs[si] == e.sval) { break; }
+                strOff = strOff + strs[si].Length + 1;
+                si = si + 1;
+            }
+            fnBody.Add(0x41);
+            WasmWriteI32(fnBody, strOff);
+        } else if (e.kind == AK.Call()) {
+            int argIdx = 1;
+            while (argIdx < e.kids.Count) {
+                WasmLowerExpr(fnBody, e.kids[argIdx], locals);
+                argIdx = argIdx + 1;
+            }
+            string calleeName = "";
+            if (e.kids.Count > 0 && e.kids[0] != null) {
+                if (e.kids[0].kind == AK.Ident()) { calleeName = e.kids[0].sval; }
+                else if (e.kids[0].kind == AK.MemberAccess()) { calleeName = e.kids[0].sval; }
+            }
+            int fIdx = -1;
+            int ei = 0;
+            if (wasmExts != null) {
+                while (ei < wasmExts.Count) {
+                    if (wasmExts[ei] == calleeName || wasmExts[ei] == "_" + calleeName) {
+                        fIdx = ei;
+                        break;
+                    }
+                    ei = ei + 1;
+                }
+            }
+            if (fIdx < 0) {
+                int si = 0;
+                int baseExt = wasmExts != null ? wasmExts.Count : 0;
+                while (si < syms.Count) {
+                    if (syms[si].name == calleeName || syms[si].name == "_" + calleeName
+                        || syms[si].name.EndsWith("_" + calleeName)) {
+                        fIdx = baseExt + si;
+                        break;
+                    }
+                    si = si + 1;
+                }
+            }
+            if (fIdx >= 0) {
+                fnBody.Add(0x10); // call
+                WasmWriteU32(fnBody, fIdx);
+            } else {
+                fnBody.Add(0x41);
+                WasmWriteI32(fnBody, 0);
+            }
         } else {
             fnBody.Add(0x41);
             WasmWriteI32(fnBody, 0);
@@ -156,6 +223,12 @@ partial class Ngen {
                 WasmLowerExpr(fnBody, s.a, locals);
             }
             fnBody.Add(0x0F); // return
+        } else if (s.kind == AK.BreakStmt()) {
+            fnBody.Add(0x0C); // br
+            WasmWriteU32(fnBody, 1); // break out of inner loop to outer block
+        } else if (s.kind == AK.ContinueStmt()) {
+            fnBody.Add(0x0C); // br
+            WasmWriteU32(fnBody, 0); // continue loop
         } else if (s.kind == AK.IfStmt()) {
             WasmLowerExpr(fnBody, s.a, locals);
             fnBody.Add(0x04); // if
@@ -264,7 +337,8 @@ partial class Ngen {
         wasm.Add(0x00); wasm.Add(0x61); wasm.Add(0x73); wasm.Add(0x6D);
         wasm.Add(0x01); wasm.Add(0x00); wasm.Add(0x00); wasm.Add(0x00);
 
-        List<string> exts = WasmExternSyms();
+        wasmExts = WasmExternSyms();
+        List<string> exts = wasmExts;
 
         // 2. Type section (id 1):
         // Type 0: () -> ()
