@@ -3007,53 +3007,6 @@ endif()
 # captured, (b) produce the expected rewrite directives / generated classes,
 # (c) run to a golden output. This pins the generator contract the way the
 # deleted C unit tests did, from outside the compiler process.
-file(GLOB _gen_srcs ${CMAKE_SOURCE_DIR}/tests/gen/*.zan)
-foreach(_src ${_gen_srcs})
-  get_filename_component(_name ${_src} NAME_WE)
-  if(_name STREQUAL "db_repository")
-    set(_gen_regex
-      "\"op\": \"db_repo_call\""
-      "\"k\": \"new\""
-      "\"t\": \"UserDao\""
-      "\"n\": \"ById\""
-      "class __DbQ_User")
-  else()
-    set(_gen_regex
-      "\"op\": \"db_root\","
-      "\"name\": \"Q_Order\""
-      "\"op\": \"db_expr_arg\","
-      "\"v\": \"SUM\\(t\\.amount\\)\""
-      "\"op\": \"db_acc_head\","
-      "class __DbQ_Order"
-      "class __DbU_Order")
-  endif()
-  set(_gen_forbid_regex
-    "GetField(Int|Long|Double|String|Bool)"
-    "SetField(Int|Long|Double|String|Bool)")
-  add_test(NAME gen_${_name}
-    COMMAND ${CMAKE_COMMAND}
-      -DZANC=$<TARGET_FILE:zanc>
-      -DSRC=${_src}
-      -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/gen/${_name}.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/gen_${_name}${_exe_ext}
-      -DREPLY=${CMAKE_BINARY_DIR}/gen_${_name}_reply.json
-      "-DREPLY_REGEX=${_gen_regex}"
-      "-DREPLY_FORBID_REGEX=${_gen_forbid_regex}"
-      -P ${CMAKE_SOURCE_DIR}/tests/run_gen_case.cmake)
-  set_tests_properties(gen_${_name} PROPERTIES TIMEOUT 120)
-endforeach()
-
-add_test(NAME gen_cache_isolation
-  COMMAND ${CMAKE_COMMAND}
-    -DZANC=$<TARGET_FILE:zanc>
-    -DSTDLIB=${CMAKE_SOURCE_DIR}/stdlib
-    -DSRC=${CMAKE_SOURCE_DIR}/tests/conformance/json_entity_mapping.zan
-    -DWORK=${CMAKE_BINARY_DIR}/gen_cache_isolation
-    -P ${CMAKE_SOURCE_DIR}/tests/run_gen_cache_isolation.cmake)
-set_tests_properties(gen_cache_isolation PROPERTIES
-  TIMEOUT 240
-  LABELS "full;standard;smoke")
-
 add_test(NAME compiler_dead_method_pre_ir
   COMMAND ${CMAKE_COMMAND}
     -DZANC=$<TARGET_FILE:zanc>

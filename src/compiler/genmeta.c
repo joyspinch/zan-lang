@@ -371,22 +371,7 @@ static bool gm_is_candidate_ast_call(zan_ast_node_t *call, gm_ctx_t *c) {
         if (gm_rec_lookup(robj, c) != 0) return true;
     }
 
-    /* 4. Receiver is Json */
-    if (robj && robj->kind == AST_IDENTIFIER && robj->ident.name.str &&
-        strcmp(robj->ident.name.str, "Json") == 0)
-        return true;
-
-    static const char *const seeds[] = {
-        "Serialize", "Deserialize",
-        "In", "InText", "InRaw", "InInt", "InLong", "InDouble", "InBool",
-        "HasIn", "Need", "NeedText", "NeedInt", "NeedLong", "Param", "Paged",
-        "Query", "Select", "Insert", "Update", "Delete", "SyncStructure",
-        "SyncStructureAsync", "SyncStructureAll", "SyncStructureAllAsync",
-        "Read", "ReadAsync"
-    };
-    if (name && gm_name_in(name, seeds, (int)(sizeof(seeds) / sizeof(seeds[0]))))
-        return true;
-
+    /* 4 */
     if (name && gm_name_in(name, c->expr_names, c->expr_count))
         return true;
 
