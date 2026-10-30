@@ -119,10 +119,13 @@ public class File {
     // 以字符串形式读取整个文件内容。
     // 文件无法打开时抛出 FileNotFoundException。
     public static string ReadAllText(string path) {
+        // 内嵌副本是权威（--embed 烤进 exe，发布后不落盘）：命中内嵌直接
+        // 返回，盘上同名文件盖不掉它 —— 发布出去的程序不会因为旁边躺了
+        // 一个明文副本就被替换或绕过。
+        string emb = File.EmbedName(path);
+        if (zan_embed_has(emb) != 0) { return File.StripBom(zan_embed_read(emb)); }
         nint fp = zan_pkg_fopen(path, "rb");
         if (fp == 0) {
-            string emb = File.EmbedName(path);
-            if (zan_embed_has(emb) != 0) { return File.StripBom(zan_embed_read(emb)); }
             throw new FileNotFoundException("Could not open file: " + path);
         }
         fseek(fp, 0, 2);
@@ -213,8 +216,9 @@ public class File {
     // 于是目录会被当成文件（调用方紧接着就会去 remove/读它），
     // 而 Windows 上同一调用失败 —— 同一份代码在两个平台行为相反。
     public static bool Exists(string path) {
+        if (File.EmbedExists(path)) { return true; }
         long a = zan_file_attributes(path);
-        if (a < 0) { return File.EmbedExists(path); }
+        if (a < 0) { return false; }
         return ((a / 4) % 2) == 0;
     }
 
@@ -345,20 +349,18 @@ public class File {
     // 内部走 64 位 ftell；返回类型受 int 签名所限，
     // 超 2GB 的文件请用 <see cref="GetSize64"/>。
     public static int GetSize(string path) {
+        // 与 ReadAllText 同口径：内嵌优先，命内嵌取副本长度。
+        string emb = File.EmbedName(path);
+        if (zan_embed_has(emb) != 0) {
+            byte[] lenBuf = new byte[8];
+            if (zan_embed_bytes(emb, lenBuf) == 0) {
+                throw new FileNotFoundException("Could not open file: " + path);
+            }
+            return (int)lenBuf[0] + (int)lenBuf[1] * 256
+                + (int)lenBuf[2] * 65536 + (int)lenBuf[3] * 16777216;
+        }
         nint fp = zan_pkg_fopen(path, "rb");
         if (fp == 0) {
-            // 与 Exists 的内嵌兜底同口径：盘上没有、内嵌副本有，大小取
-            // 副本长度。单文件发布里照片等二进制资源只存在于镜像中，
-            // 没有可打开的文件句柄（Upload 对内嵌图片取 size 走到这里）。
-            string emb = File.EmbedName(path);
-            if (zan_embed_has(emb) != 0) {
-                byte[] lenBuf = new byte[8];
-                if (zan_embed_bytes(emb, lenBuf) == 0) {
-                    throw new FileNotFoundException("Could not open file: " + path);
-                }
-                return (int)lenBuf[0] + (int)lenBuf[1] * 256
-                    + (int)lenBuf[2] * 65536 + (int)lenBuf[3] * 16777216;
-            }
             throw new FileNotFoundException("Could not open file: " + path);
         }
         fseek(fp, 0, 2);
@@ -453,6 +455,19 @@ public class File {
     // 返回实际读取的字节数；文件无法打开时抛出
     // FileNotFoundException。
     public static byte[] ReadBytes(string path, int offset, int count) {
+        // 内嵌优先：整份解到内存再切片（对齐 ReadAllBytes 的内嵌口径，
+        // 发布后对内嵌资源的片段读取不再落空）。
+        string emb = File.EmbedName(path);
+        if (zan_embed_has(emb) != 0) {
+            byte[] all = File.ReadAllBytes(path);
+            int avail = all.Length - offset;
+            if (avail < 0) { avail = 0; }
+            int take = count < avail ? count : avail;
+            if (take < 0) { take = 0; }
+            byte[] part = new byte[take];
+            if (take > 0) { NativeMemory.Copy((nint)part, (nint)all + (nint)offset, take); }
+            return part;
+        }
         nint fp = zan_pkg_fopen(path, "rb");
         if (fp == 0) {
             throw new FileNotFoundException("Could not open file: " + path);
@@ -484,27 +499,25 @@ public class File {
     // 会被保留，因此可用于图片、可执行文件等任意内容）。
     // 文件无法打开时抛出 FileNotFoundException。
     public static byte[] ReadAllBytes(string path) {
+        // 内嵌优先（与 ReadAllText 同口径）：烤进 exe 的副本是权威。
+        string emb = File.EmbedName(path);
+        if (zan_embed_has(emb) != 0) {
+            byte[] lenBuf = new byte[8];
+            nint src = zan_embed_bytes(emb, lenBuf);
+            if (src == 0) {
+                throw new FileNotFoundException("Could not open file: " + path);
+            }
+            int len = (int)lenBuf[0] + (int)lenBuf[1] * 256
+                + (int)lenBuf[2] * 65536 + (int)lenBuf[3] * 16777216;
+            if (len <= 0) {
+                throw new FileNotFoundException("Could not open file: " + path);
+            }
+            byte[] copy = new byte[len];
+            EmbedCopyIn(copy, src, len);
+            return copy;
+        }
         nint fp = zan_pkg_fopen(path, "rb");
         if (fp == 0) {
-            // 盘上没有、内嵌副本有：拷出副本字节（二进制安全）。单文件
-            // 发布里图片等二进制资源只存在于镜像中，没有可打开的文件
-            // 句柄 —— 与 Exists/GetSize 的内嵌兜底同口径。
-            string emb = File.EmbedName(path);
-            if (zan_embed_has(emb) != 0) {
-                byte[] lenBuf = new byte[8];
-                nint src = zan_embed_bytes(emb, lenBuf);
-                if (src == 0) {
-                    throw new FileNotFoundException("Could not open file: " + path);
-                }
-                int len = (int)lenBuf[0] + (int)lenBuf[1] * 256
-                    + (int)lenBuf[2] * 65536 + (int)lenBuf[3] * 16777216;
-                if (len <= 0) {
-                    throw new FileNotFoundException("Could not open file: " + path);
-                }
-                byte[] copy = new byte[len];
-                EmbedCopyIn(copy, src, len);
-                return copy;
-            }
             throw new FileNotFoundException("Could not open file: " + path);
         }
         // 这里的 fp 只用来证明盘上文件可打开；真正的读取在下面
