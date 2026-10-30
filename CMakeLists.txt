@@ -4773,10 +4773,12 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
     COMMAND ${CMAKE_COMMAND}
       -DZANC=$<TARGET_FILE:zanc>
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/html_scope_test.zan
-      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/tests/gui/html_scope.html;${CMAKE_SOURCE_DIR}/tests/gui/html_scope_b.html;--auto-stdlib${_gui_driver_tail}"
+      "-DZANC_ARGS=--embed;tests/gui/html_scope.html;--embed;tests/gui/html_scope_b.html;--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_html_scope.out
       -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_html_scope${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+  set_tests_properties(conformance_gui_html_scope PROPERTIES
+    TIMEOUT 120 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
 
   # <a> 链接导航语义（P5）：运行时 LoadHtmlWith 与 GenHtml 编译通道
   # 两条建树路都给 <a href> 接上缺省导航（http/https 进内嵌 WebView，
