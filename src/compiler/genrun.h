@@ -24,10 +24,7 @@ bool zan_is_zcomp_path(const char *p);
 
 bool zan_is_design_path(const char *p);
 
-int zan_gen_codegen(struct zan_ast_node *unit, struct zan_arena *arena,
-                    struct zan_diag *diag, const char *stdlib_root);
 
-void zan_gen_take_source_texts(char ***texts, int *count);
 
 int zan_gen_cache_dir(char *dir, size_t dir_size);
 

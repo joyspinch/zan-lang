@@ -500,22 +500,8 @@ static const char **gm_table_entity_names(json_value *classes, int *out_count) {
 static bool gm_is_codegen_seed(json_value *call, const char *const *expr_names,
                                int expr_count, const char *const *table_names,
                                int table_count) {
-    static const char *const seeds[] = {
-        "In", "InText", "InRaw", "InInt", "InLong", "InDouble", "InBool",
-        "HasIn", "Need", "NeedText", "NeedInt", "NeedLong", "Param", "Paged",
-        "Query", "Select", "Insert", "Update", "Delete", "SyncStructure",
-        "SyncStructureAsync", "SyncStructureAll", "SyncStructureAllAsync",
-        "Read", "ReadAsync"
-    };
     const char *name = json_get_str(json_obj_get(call, "name"));
-    const char *recv = json_get_str(json_obj_get(call, "recv"));
-    if (recv && strcmp(recv, "id:Json") == 0 &&
-        name && (strcmp(name, "Serialize") == 0 ||
-                 strcmp(name, "Deserialize") == 0))
-        return true;
-    if (gm_name_in(name, seeds, (int)(sizeof(seeds) / sizeof(seeds[0]))))
-        return true;
-    if (gm_name_in(name, expr_names, expr_count)) return true;
+    if (name && gm_name_in(name, expr_names, expr_count)) return true;
     {
         json_value *recvx = json_obj_get(call, "recvx");
         if (recvx && recvx->type == JSON_OBJ) {

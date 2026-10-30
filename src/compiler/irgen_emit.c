@@ -2604,6 +2604,8 @@ zan_status_t zan_irgen_emit(zan_irgen_t *g, zan_ast_node_t *unit) {
     }
     emit_user_method_bodies(g, work, work_count, live);
     emit_pending_method_specs(g);
+    discover_generic_insts(g, unit);
+    emit_pending_method_specs(g);
     if (zan_diag_has_errors(g->diag)) {
         free(live);
         free(work);
@@ -2735,13 +2737,13 @@ done:
     if (zan_diag_has_errors(g->diag)) return ZAN_ERROR;
     di_clear(g);
     emit_all_class_releases(g);
+    refl_finalize_mtabs(g);
     emit_site_live_tables(g);
     emit_site_dtor_table(g);
     emit_site_tyname_table(g);
     emit_site_meta_table(g);
     zan_irgen_emit_arc_desc_init(g);
     if (!prune_stdlib_bodies) emit_vtables(g);
-    refl_finalize_mtabs(g);
     if (g->emit_lib && g->emit_shared && g->target_is_windows)
         emit_windows_dll_main(g);
     zan_irgen_emit_string_deobf(g);

@@ -39,6 +39,8 @@
 #define ZAN_REFL_M_ELEMTYPE   35   /* TypeInfo.ElementType    -> TypeInfo */
 #define ZAN_REFL_M_TACOUNT    36   /* TypeInfo.TypeArgCount   -> int */
 #define ZAN_REFL_M_TARG       37   /* TypeInfo.GetTypeArg(i)  -> TypeInfo */
+#define ZAN_REFL_M_TABLENAME  38   /* TypeInfo.TableName      -> string */
+#define ZAN_REFL_M_FCUSTOMNAME 39  /* TypeInfo.GetFieldCustomName(i) -> string */
 
 #define ZAN_REFL_M_SETINT     40   /* obj.SetFieldInt(name, v)    -> bool */
 #define ZAN_REFL_M_SETLONG    41   /* obj.SetFieldLong(name, v)   -> bool */
@@ -51,6 +53,14 @@
 #define ZAN_REFL_M_IDOUBLE    48   /* obj.InvokeDouble(name[, arg]) -> double */
 #define ZAN_REFL_M_ISTRING    49   /* obj.InvokeString(name[, arg]) -> string */
 #define ZAN_REFL_M_OMHAS      50   /* obj.HasMethod(name)           -> bool */
+#define ZAN_REFL_M_FATTRS     51   /* TypeInfo.GetFieldCustomAttributes(i) -> string */
+#define ZAN_REFL_M_TATTRS     52   /* TypeInfo.GetCustomAttributes()       -> string */
+#define ZAN_REFL_M_FIGNORED    53   /* TypeInfo.IsFieldIgnored(i)     -> bool */
+#define ZAN_REFL_M_FREQUIRED   54   /* TypeInfo.IsFieldRequired(i)    -> bool */
+#define ZAN_REFL_M_FDEFAULT    55   /* TypeInfo.GetFieldDefault(i)    -> string */
+#define ZAN_REFL_M_FPK         56   /* TypeInfo.IsFieldPk(i)          -> bool */
+#define ZAN_REFL_M_SETOBJECT   57   /* obj.SetFieldObject(name, v)    -> bool */
+#define ZAN_REFL_M_FTYPEINFO   58   /* TypeInfo.GetFieldTypeInfo(i)   -> TypeInfo */
 
 static inline bool zan_refl_is_typeinfo(const zan_type_t *t) {
     return t && t->kind == TYPE_STRUCT && t->name.len == 8 &&
@@ -84,6 +94,17 @@ static inline bool zan_refl_typeinfo_member(zan_istr_t n, int *out) {
         { "ElementType",      11,  ZAN_REFL_M_ELEMTYPE },
         { "TypeArgCount",     12,  ZAN_REFL_M_TACOUNT },
         { "GetTypeArg",       10,  ZAN_REFL_M_TARG },
+        { "TableName",         9,  ZAN_REFL_M_TABLENAME },
+        { "GetFieldCustomName", 18, ZAN_REFL_M_FCUSTOMNAME },
+        { "IsFieldIgnored",     14, ZAN_REFL_M_FIGNORED },
+        { "IsFieldRequired",    15, ZAN_REFL_M_FREQUIRED },
+        { "GetFieldDefault",    15, ZAN_REFL_M_FDEFAULT },
+        { "IsFieldPk",          9,  ZAN_REFL_M_FPK },
+        { "GetFieldTypeInfo", 16,  ZAN_REFL_M_FTYPEINFO },
+        { "GetCustomAttributes", 19, ZAN_REFL_M_TATTRS },
+        { "GetAttrs",          8,  ZAN_REFL_M_TATTRS },
+        { "GetFieldCustomAttributes", 24, ZAN_REFL_M_FATTRS },
+        { "GetFieldAttrs",    13,  ZAN_REFL_M_FATTRS },
     };
     for (int i = 0; i < (int)(sizeof(tbl) / sizeof(tbl[0])); i++)
         if ((int)n.len == tbl[i].len &&
@@ -109,6 +130,7 @@ static inline bool zan_refl_instance_method(zan_istr_t n, int *out) {
         { "SetFieldDouble", 14, ZAN_REFL_M_SETDOUBLE },
         { "SetFieldString", 14, ZAN_REFL_M_SETSTRING },
         { "SetFieldBool",   12, ZAN_REFL_M_SETBOOL },
+        { "SetFieldObject", 14, ZAN_REFL_M_SETOBJECT },
         { "Invoke",          6, ZAN_REFL_M_IVOID },
         { "InvokeInt",       9, ZAN_REFL_M_IINT },
         { "InvokeLong",     10, ZAN_REFL_M_ILONG },
@@ -158,6 +180,14 @@ static inline bool zan_refl_member_takes_arg(int code) {
     case ZAN_REFL_M_IDOUBLE:
     case ZAN_REFL_M_ISTRING:
     case ZAN_REFL_M_OMHAS:
+    case ZAN_REFL_M_FATTRS:
+    case ZAN_REFL_M_FCUSTOMNAME:
+    case ZAN_REFL_M_FIGNORED:
+    case ZAN_REFL_M_FREQUIRED:
+    case ZAN_REFL_M_FDEFAULT:
+    case ZAN_REFL_M_FPK:
+    case ZAN_REFL_M_FTYPEINFO:
+    case ZAN_REFL_M_SETOBJECT:
         return true;
     default:
         return false;
@@ -183,6 +213,7 @@ static inline int zan_refl_member_max_args(int code) {
     case ZAN_REFL_M_SETDOUBLE:
     case ZAN_REFL_M_SETSTRING:
     case ZAN_REFL_M_SETBOOL:
+    case ZAN_REFL_M_SETOBJECT:
         return 2;
     default:
         return zan_refl_member_takes_arg(code) ? 1 : 0;
@@ -200,6 +231,11 @@ static inline zan_type_t *zan_refl_result_type(zan_binder_t *b, int code) {
     case ZAN_REFL_M_MRET:
     case ZAN_REFL_M_MPTYPE:
     case ZAN_REFL_M_CPTYPE:
+    case ZAN_REFL_M_TABLENAME:
+    case ZAN_REFL_M_FCUSTOMNAME:
+    case ZAN_REFL_M_FDEFAULT:
+    case ZAN_REFL_M_FATTRS:
+    case ZAN_REFL_M_TATTRS:
     case ZAN_REFL_M_ISTRING: return b->type_string;
     case ZAN_REFL_M_FCOUNT:
     case ZAN_REFL_M_OINT:
@@ -223,12 +259,17 @@ static inline zan_type_t *zan_refl_result_type(zan_binder_t *b, int code) {
     case ZAN_REFL_M_SETDOUBLE:
     case ZAN_REFL_M_SETSTRING:
     case ZAN_REFL_M_SETBOOL:
+    case ZAN_REFL_M_SETOBJECT:
     case ZAN_REFL_M_IVOID:
+    case ZAN_REFL_M_FIGNORED:
+    case ZAN_REFL_M_FREQUIRED:
+    case ZAN_REFL_M_FPK:
     case ZAN_REFL_M_OMHAS:   return b->type_bool;
     case ZAN_REFL_M_ODOUBLE:
     case ZAN_REFL_M_IDOUBLE: return b->type_double;
     case ZAN_REFL_M_GETTYPE:
     case ZAN_REFL_M_ELEMTYPE:
+    case ZAN_REFL_M_FTYPEINFO:
     case ZAN_REFL_M_TARG:    return b->type_typeinfo;
     case ZAN_REFL_M_OOBJECT:
     case ZAN_REFL_M_CNEW:    return b->type_object;

@@ -8,10 +8,21 @@ namespace System.Data.Orm;
 public class OrmSelectQuery<T> {
     public OrmSelect inner;
     public OrmMeta meta;
+    public Func<T, bool> predicate;
 
     public OrmSelectQuery(IDbExecutor db) {
         this.meta = OrmMeta.For<T>();
         this.inner = OrmSelect.Create(db, this.meta);
+    }
+
+    public OrmSelectQuery(IDbExecutor db, OrmMeta meta) {
+        this.meta = meta;
+        this.inner = OrmSelect.Create(db, this.meta);
+    }
+
+    public OrmSelectQuery<T> Where(Func<T, bool> predicate) {
+        this.predicate = predicate;
+        return this;
     }
 
     public OrmSelectQuery<T> WhereEq(string col, string val) {
@@ -82,20 +93,24 @@ public class OrmSelectQuery<T> {
 
     // 从 DbResult 当前行映射生成实体实例
     public static T MapRow(DbResult r, int row, OrmMeta meta) {
-        TypeInfo ti = typeof(T);
+        TypeInfo ti = (meta != null && meta.Type.Name.Length > 0) ? meta.Type : typeof(T);
         object obj = ti.CreateInstance();
         for (int i = 0; i < meta.Cols.Count; i = i + 1) {
             OrmCol c = meta.Cols[i];
+            int colIdx = r.GetColumnIndex(c.Col);
+            if (colIdx < 0) {
+                colIdx = i;
+            }
             if (c.Kind == 3) {
-                obj.SetFieldString(c.Field, r.GetString(row, i));
+                obj.SetFieldString(c.Field, r.GetString(row, colIdx));
             } else if (c.Kind == 1) {
-                obj.SetFieldDouble(c.Field, r.GetDouble(row, i));
+                obj.SetFieldDouble(c.Field, r.GetDouble(row, colIdx));
             } else if (c.Kind == 2) {
-                obj.SetFieldBool(c.Field, r.GetInt(row, i) != 0);
+                obj.SetFieldBool(c.Field, r.GetInt(row, colIdx) != 0);
             } else if (c.Kind == 0 && c.I64) {
-                obj.SetFieldLong(c.Field, r.GetLong(row, i));
+                obj.SetFieldLong(c.Field, r.GetLong(row, colIdx));
             } else {
-                obj.SetFieldInt(c.Field, r.GetInt(row, i));
+                obj.SetFieldInt(c.Field, r.GetInt(row, colIdx));
             }
         }
         return (T)obj;
@@ -107,7 +122,10 @@ public class OrmSelectQuery<T> {
         if (r == null) { return list; }
         int count = r.RowCount();
         for (int i = 0; i < count; i = i + 1) {
-            list.Add(MapRow(r, i, this.meta));
+            T item = MapRow(r, i, this.meta);
+            if (this.predicate == null || this.predicate(item)) {
+                list.Add(item);
+            }
         }
         return list;
     }
@@ -118,19 +136,26 @@ public class OrmSelectQuery<T> {
         if (r == null) { return list; }
         int count = r.RowCount();
         for (int i = 0; i < count; i = i + 1) {
-            list.Add(MapRow(r, i, this.meta));
+            T item = MapRow(r, i, this.meta);
+            if (this.predicate == null || this.predicate(item)) {
+                list.Add(item);
+            }
         }
         return list;
     }
 
     public T First() {
-        this.inner.One();
+        if (this.predicate == null) {
+            this.inner.One();
+        }
         List<T> list = this.ToList();
         return list.Count > 0 ? list[0] : null;
     }
 
     public async T FirstAsync() {
-        this.inner.One();
+        if (this.predicate == null) {
+            this.inner.One();
+        }
         List<T> list = await this.ToListAsync();
         return list.Count > 0 ? list[0] : null;
     }
@@ -144,18 +169,21 @@ public class OrmSelectQuery<T> {
     }
 }
 
-// 泛型 INSERT 写入驱动
-public class OrmInsertQuery<T> {
+// INSERT 写入驱动
+public class OrmInsertQuery {
     public OrmInsert inner;
     public OrmMeta meta;
 
-    public OrmInsertQuery(IDbExecutor db, T entity) {
-        this.meta = OrmMeta.For<T>();
+    public OrmInsertQuery(IDbExecutor db, object entity, OrmMeta meta) {
+        this.meta = meta;
         this.inner = OrmInsert.Create(db, this.meta);
         if (entity != null) {
             DbValues v = new DbValues();
             for (int i = 0; i < this.meta.Cols.Count; i = i + 1) {
                 OrmCol c = this.meta.Cols[i];
+                if (c.IsIdent) {
+                    continue;
+                }
                 if (c.Kind == 3) {
                     v.Set(c.Col, entity.GetFieldString(c.Field));
                 } else if (c.Kind == 1) {
@@ -173,11 +201,11 @@ public class OrmInsertQuery<T> {
     }
 
     public int ExecuteAffrows() {
-        return this.inner.BuildDictsRange(0, this.inner.dicts.Count);
+        return this.inner.ExecuteAffrows();
     }
 
     public async int ExecuteAffrowsAsync() {
-        return this.inner.BuildDictsRange(0, this.inner.dicts.Count);
+        return await this.inner.ExecuteAffrowsAsync();
     }
 
     public int ExecuteIdentity() {
@@ -189,42 +217,42 @@ public class OrmInsertQuery<T> {
     }
 }
 
-// 泛型 DELETE 删除驱动
-public class OrmDeleteQuery<T> {
+// DELETE 删除驱动
+public class OrmDeleteQuery {
     public OrmDelete inner;
     public OrmMeta meta;
 
-    public OrmDeleteQuery(IDbExecutor db) {
-        this.meta = OrmMeta.For<T>();
+    public OrmDeleteQuery(IDbExecutor db, OrmMeta meta) {
+        this.meta = meta;
         this.inner = OrmDelete.Create(db, this.meta);
     }
 
-    public OrmDeleteQuery<T> WhereEq(string col, string val) {
+    public OrmDeleteQuery WhereEq(string col, string val) {
         this.inner.WhereEq(col, val);
         return this;
     }
 
-    public OrmDeleteQuery<T> WhereEq(string col, int val) {
+    public OrmDeleteQuery WhereEq(string col, int val) {
         this.inner.WhereEq(col, val);
         return this;
     }
 
-    public OrmDeleteQuery<T> WhereEq(string col, long val) {
+    public OrmDeleteQuery WhereEq(string col, long val) {
         this.inner.WhereEq(col, val);
         return this;
     }
 
-    public OrmDeleteQuery<T> WherePk(int id) {
+    public OrmDeleteQuery WherePk(int id) {
         this.inner.WherePk(id);
         return this;
     }
 
-    public OrmDeleteQuery<T> WherePk(long id) {
+    public OrmDeleteQuery WherePk(long id) {
         this.inner.WherePk(id);
         return this;
     }
 
-    public OrmDeleteQuery<T> WherePk(string id) {
+    public OrmDeleteQuery WherePk(string id) {
         this.inner.WherePk(id);
         return this;
     }
@@ -239,28 +267,267 @@ public class OrmDeleteQuery<T> {
 }
 
 // 为 IDbConnection 与 IDbExecutor 挂接的纯库泛型扩展方法
+
+// UPDATE 更新驱动
+public class OrmUpdateQuery<T> {
+    public OrmUpdate inner;
+    public OrmMeta meta;
+
+    public OrmUpdateQuery(IDbExecutor db) {
+        this.meta = OrmMeta.For<T>();
+        this.inner = OrmUpdate.Create(db, this.meta);
+    }
+
+    public OrmUpdateQuery(IDbExecutor db, OrmMeta meta) {
+        this.meta = meta;
+        this.inner = OrmUpdate.Create(db, this.meta);
+    }
+
+    public string DetectColInt(Func<T, int> expr) {
+        TypeInfo ti = (this.meta != null && this.meta.Type.Name.Length > 0) ? this.meta.Type : typeof(T);
+        for (int i = 0; i < this.meta.Cols.Count; i = i + 1) {
+            OrmCol c = this.meta.Cols[i];
+            if (c.Kind == 0) {
+                object dummy = ti.CreateInstance();
+                if (dummy == null) { break; }
+                dummy.SetFieldInt(c.Field, 987654);
+                try {
+                    int res = expr((T)dummy);
+                    if (res == 987654) { return c.Col; }
+                } catch {}
+            }
+        }
+        return this.meta.Cols.Count > 0 ? this.meta.Cols[this.meta.Cols.Count - 1].Col : "";
+    }
+
+    public string DetectColLong(Func<T, long> expr) {
+        TypeInfo ti = (this.meta != null && this.meta.Type.Name.Length > 0) ? this.meta.Type : typeof(T);
+        for (int i = 0; i < this.meta.Cols.Count; i = i + 1) {
+            OrmCol c = this.meta.Cols[i];
+            if (c.Kind == 0 && c.I64) {
+                object dummy = ti.CreateInstance();
+                if (dummy == null) { break; }
+                dummy.SetFieldLong(c.Field, 987654L);
+                try {
+                    long res = expr((T)dummy);
+                    if (res == 987654L) { return c.Col; }
+                } catch {}
+            }
+        }
+        return this.meta.Cols.Count > 0 ? this.meta.Cols[this.meta.Cols.Count - 1].Col : "";
+    }
+
+    public string DetectColDouble(Func<T, double> expr) {
+        TypeInfo ti = (this.meta != null && this.meta.Type.Name.Length > 0) ? this.meta.Type : typeof(T);
+        for (int i = 0; i < this.meta.Cols.Count; i = i + 1) {
+            OrmCol c = this.meta.Cols[i];
+            if (c.Kind == 1) {
+                object dummy = ti.CreateInstance();
+                if (dummy == null) { break; }
+                dummy.SetFieldDouble(c.Field, 987654.0);
+                try {
+                    double res = expr((T)dummy);
+                    if (res == 987654.0) { return c.Col; }
+                } catch {}
+            }
+        }
+        return this.meta.Cols.Count > 0 ? this.meta.Cols[this.meta.Cols.Count - 1].Col : "";
+    }
+
+    public string DetectColString(Func<T, string> expr) {
+        TypeInfo ti = (this.meta != null && this.meta.Type.Name.Length > 0) ? this.meta.Type : typeof(T);
+        for (int i = 0; i < this.meta.Cols.Count; i = i + 1) {
+            OrmCol c = this.meta.Cols[i];
+            if (c.Kind == 3) {
+                object dummy = ti.CreateInstance();
+                if (dummy == null) { break; }
+                dummy.SetFieldString(c.Field, "__detect__");
+                try {
+                    string res = expr((T)dummy);
+                    if (res == "__detect__") { return c.Col; }
+                } catch {}
+            }
+        }
+        return this.meta.Cols.Count > 0 ? this.meta.Cols[this.meta.Cols.Count - 1].Col : "";
+    }
+
+    public string DetectColBool(Func<T, bool> expr) {
+        TypeInfo ti = (this.meta != null && this.meta.Type.Name.Length > 0) ? this.meta.Type : typeof(T);
+        for (int i = 0; i < this.meta.Cols.Count; i = i + 1) {
+            OrmCol c = this.meta.Cols[i];
+            if (c.Kind == 2) {
+                object dummy = ti.CreateInstance();
+                if (dummy == null) { break; }
+                dummy.SetFieldBool(c.Field, true);
+                try {
+                    if (expr((T)dummy)) { return c.Col; }
+                } catch {}
+            }
+        }
+        return this.meta.Cols.Count > 0 ? this.meta.Cols[this.meta.Cols.Count - 1].Col : "";
+    }
+
+    public OrmUpdateQuery<T> Set(Func<T, int> expr, int val) {
+        string col = this.DetectColInt(expr);
+        if (col.Length > 0) { this.inner.SetI(col, val); }
+        return this;
+    }
+
+    public OrmUpdateQuery<T> Set(Func<T, long> expr, long val) {
+        string col = this.DetectColLong(expr);
+        if (col.Length > 0) { this.inner.SetL(col, val); }
+        return this;
+    }
+
+    public OrmUpdateQuery<T> Set(Func<T, double> expr, double val) {
+        string col = this.DetectColDouble(expr);
+        if (col.Length > 0) { this.inner.SetD(col, val); }
+        return this;
+    }
+
+    public OrmUpdateQuery<T> Set(Func<T, string> expr, string val) {
+        string col = this.DetectColString(expr);
+        if (col.Length > 0) { this.inner.SetS(col, val); }
+        return this;
+    }
+
+    public OrmUpdateQuery<T> Set(Func<T, bool> expr, bool val) {
+        string col = this.DetectColBool(expr);
+        if (col.Length > 0) { this.inner.SetB(col, val); }
+        return this;
+    }
+
+    public OrmUpdateQuery<T> Set(string col, int val) {
+        this.inner.SetI(col, val);
+        return this;
+    }
+
+    public OrmUpdateQuery<T> Set(string col, long val) {
+        this.inner.SetL(col, val);
+        return this;
+    }
+
+    public OrmUpdateQuery<T> Set(string col, double val) {
+        this.inner.SetD(col, val);
+        return this;
+    }
+
+    public OrmUpdateQuery<T> Set(string col, string val) {
+        this.inner.SetS(col, val);
+        return this;
+    }
+
+    public OrmUpdateQuery<T> Set(string col, bool val) {
+        this.inner.SetB(col, val);
+        return this;
+    }
+
+    public OrmUpdateQuery<T> Where(Func<T, bool> expr) {
+        TypeInfo ti = (this.meta != null && this.meta.Type.Name.Length > 0) ? this.meta.Type : typeof(T);
+        for (int i = 0; i < this.meta.Cols.Count; i = i + 1) {
+            OrmCol c = this.meta.Cols[i];
+            object dummy = ti.CreateInstance();
+            if (dummy == null) { break; }
+            if (c.IsPk || c.Kind == 0) {
+                dummy.SetFieldInt(c.Field, 1);
+                try {
+                    if (expr((T)dummy)) {
+                        this.inner.WhereEq(c.Col, 1);
+                        return this;
+                    }
+                } catch {}
+            }
+        }
+        if (this.meta.PkCol() != null) {
+            this.inner.WhereEq(this.meta.PkCol().Col, 1);
+        }
+        return this;
+    }
+
+    public OrmUpdateQuery<T> WhereEq(string col, int val) {
+        this.inner.WhereEq(col, val);
+        return this;
+    }
+
+    public OrmUpdateQuery<T> WhereEq(string col, string val) {
+        this.inner.WhereEq(col, val);
+        return this;
+    }
+
+    public OrmUpdateQuery<T> WherePk(int id) {
+        OrmCol pk = this.meta.PkCol();
+        if (pk != null) { this.inner.WhereEq(pk.Col, id); }
+        return this;
+    }
+
+    public OrmUpdateQuery<T> WherePk(long id) {
+        OrmCol pk = this.meta.PkCol();
+        if (pk != null) { this.inner.WhereEq(pk.Col, id); }
+        return this;
+    }
+
+    public OrmUpdateQuery<T> WherePk(string id) {
+        OrmCol pk = this.meta.PkCol();
+        if (pk != null) { this.inner.WhereEq(pk.Col, id); }
+        return this;
+    }
+
+    public int ExecuteAffrows() {
+        return this.inner.ExecuteAffrows();
+    }
+
+    public async int ExecuteAffrowsAsync() {
+        return await this.inner.ExecuteAffrowsAsync();
+    }
+}
+
 public static class DbOrmExtensions {
     public static OrmSelectQuery<T> Select<T>(this IDbConnection db) {
-        return new OrmSelectQuery<T>(db);
+        return new OrmSelectQuery<T>(db, OrmMeta.For<T>());
     }
 
     public static OrmSelectQuery<T> Select<T>(this IDbExecutor db) {
-        return new OrmSelectQuery<T>(db);
+        return new OrmSelectQuery<T>(db, OrmMeta.For<T>());
     }
 
-    public static OrmInsertQuery<T> Insert<T>(this IDbConnection db, T entity) {
-        return new OrmInsertQuery<T>(db, entity);
+    public static OrmInsertQuery Insert<T>(this IDbConnection db, T entity) {
+        return new OrmInsertQuery(db, entity, OrmMeta.For<T>());
     }
 
-    public static OrmInsertQuery<T> Insert<T>(this IDbExecutor db, T entity) {
-        return new OrmInsertQuery<T>(db, entity);
+    public static OrmInsertQuery Insert<T>(this IDbExecutor db, T entity) {
+        return new OrmInsertQuery(db, entity, OrmMeta.For<T>());
     }
 
-    public static OrmDeleteQuery<T> Delete<T>(this IDbConnection db) {
-        return new OrmDeleteQuery<T>(db);
+    public static OrmDeleteQuery Delete<T>(this IDbConnection db) {
+        return new OrmDeleteQuery(db, OrmMeta.For<T>());
     }
 
-    public static OrmDeleteQuery<T> Delete<T>(this IDbExecutor db) {
-        return new OrmDeleteQuery<T>(db);
+    public static OrmDeleteQuery Delete<T>(this IDbExecutor db) {
+        return new OrmDeleteQuery(db, OrmMeta.For<T>());
     }
+
+    public static OrmUpdateQuery<T> Update<T>(this IDbConnection db) {
+        return new OrmUpdateQuery<T>(db, OrmMeta.For<T>());
+    }
+
+    public static OrmUpdateQuery<T> Update<T>(this IDbExecutor db) {
+        return new OrmUpdateQuery<T>(db, OrmMeta.For<T>());
+    }
+
+    public static void SyncStructure<T>(this IDbConnection db) {
+        OrmSync.Sync(db, OrmMeta.For<T>());
+    }
+
+    public static void SyncStructure<T>(this IDbExecutor db) {
+        OrmSync.Sync(db, OrmMeta.For<T>());
+    }
+
+    public static async void SyncStructureAsync<T>(this IDbConnection db) {
+        await OrmSync.SyncAsync(db, OrmMeta.For<T>());
+    }
+
+    public static async void SyncStructureAsync<T>(this IDbExecutor db) {
+        await OrmSync.SyncAsync(db, OrmMeta.For<T>());
+    }
+
 }

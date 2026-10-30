@@ -3122,23 +3122,7 @@ int main(int argc, char **argv) {
             return 0;
         }
 
-        zan_compile_trace("codegen");
-        if (zan_gen_enabled &&
-            zan_gen_codegen(ast, arena, diag, resolved_stdlib_root) != 0) {
-            zan_arena_free(arena);
-            free(source);
-            return 1;
-        }
-        phase("codegen");
         if (pi_filter_active) {
-            char **gen_texts = NULL;
-            int gen_text_count = 0;
-            zan_gen_take_source_texts(&gen_texts, &gen_text_count);
-            for (int gi = 0; gi < gen_text_count; gi++) {
-                pi_seed_source(gen_texts[gi], strlen(gen_texts[gi]));
-                free(gen_texts[gi]);
-            }
-            free(gen_texts);
             for (;;) {
                 int changed = pi_close_once(resolved_stdlib_root);
                 int fresh = pi_append_included(&input_files, &input_count,

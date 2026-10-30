@@ -1,4 +1,6 @@
 
+#define ZAN_REFL_ATTRS_OFF   (-104)
+#define ZAN_REFL_TABLE_OFF   (-96)
 #define ZAN_REFL_METHODS_OFF (-88)
 #define ZAN_REFL_MCOUNT_OFF  (-80)
 #define ZAN_REFL_CTORS_OFF   (-72)
@@ -9,8 +11,8 @@
 #define ZAN_REFL_COUNT_OFF  (-32)
 #define ZAN_REFL_KIND_OFF   (-24)
 #define ZAN_REFL_PREFIX     88
-/* { i8*, i8*, i64, i64 } */
-#define ZAN_REFL_FIELD_SIZE 32
+/* { i8*, i8*, i64, i64, i8*, i64, i8*, i8* } */
+#define ZAN_REFL_FIELD_SIZE 64
 #define ZAN_REFL_METHOD_SIZE 56
 #define ZAN_REFL_MO_NAME     0
 #define ZAN_REFL_MO_RET      8
@@ -77,13 +79,19 @@
 /* `which` selector of __zan_refl_fname */
 #define ZAN_REFL_WHICH_NAME 0
 #define ZAN_REFL_WHICH_TYPE 1
+#define ZAN_REFL_WHICH_CUSTOM 2
+#define ZAN_REFL_WHICH_DEFAULT 3
+#define ZAN_REFL_WHICH_ATTR 2
+
+static LLVMValueRef refl_meta_for(zan_irgen_t *g, zan_type_t *t,
+                                  const char *disp, int disp_len);
 
 static LLVMTypeRef refl_field_type(zan_irgen_t *g) {
     if (!g->refl_field_type) {
         LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
         LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
-        LLVMTypeRef elems[4] = { i8ptr, i8ptr, i64, i64 };
-        g->refl_field_type = LLVMStructTypeInContext(g->ctx, elems, 4, 0);
+        LLVMTypeRef elems[8] = { i8ptr, i8ptr, i64, i64, i8ptr, i64, i8ptr, i8ptr };
+        g->refl_field_type = LLVMStructTypeInContext(g->ctx, elems, 8, 0);
     }
     return g->refl_field_type;
 }
@@ -161,17 +169,12 @@ static int refl_type_kind(zan_type_t *t) {
 
 static LLVMValueRef refl_field_type_name(zan_irgen_t *g, zan_type_t *t) {
     char buf[160];
-    int n = 0;
-    if (t && t->name.len > 0) {
-        n = (int)t->name.len;
-        if (n > (int)sizeof(buf) - 3) n = (int)sizeof(buf) - 3;
-        memcpy(buf, t->name.str, (size_t)n);
-    } else {
-        memcpy(buf, "?", 1);
+    int n = t ? render_type_full(t, buf, sizeof(buf)) : 0;
+    if (n <= 0) {
+        buf[0] = '?';
+        buf[1] = 0;
         n = 1;
     }
-    if (t && t->kind == TYPE_ARRAY) { buf[n++] = '['; buf[n++] = ']'; }
-    buf[n] = 0;
     return refl_const_string(g, buf, n);
 }
 
@@ -190,6 +193,115 @@ static LLVMValueRef refl_slot_offset(zan_irgen_t *g, LLVMTypeRef st, int slot) {
     LLVMValueRef p = LLVMConstGEP2(st, LLVMConstNull(LLVMPointerType(st, 0)),
                                    idx, 2);
     return LLVMConstPtrToInt(p, i64);
+}
+
+static void refl_pack_attrs(zan_ast_list_t *attrs, char *buf, size_t buf_size);
+
+static void refl_extract_field_attrs(zan_symbol_t *m, const char **custom_name,
+                                     unsigned long long *flags, const char **dflt_val) {
+    *custom_name = m && m->name.str ? m->name.str : "";
+    *flags = 0;
+    *dflt_val = "";
+    if (!m || !m->decl) return;
+    zan_ast_list_t *attrs = zan_ast_attributes(m->decl);
+    for (int i = 0; i < attrs->count; i++) {
+        zan_ast_node_t *a = attrs->items[i];
+        if (!a || a->kind != AST_ATTRIBUTE || !a->attribute.name) continue;
+        if (a->attribute.name->kind != AST_IDENTIFIER) continue;
+        zan_istr_t n = a->attribute.name->ident.name;
+        const char *s = n.str;
+        int len = (int)n.len;
+        int dot = -1;
+        for (int k = 0; k < len; k++) {
+            if (s[k] == '.') dot = k;
+        }
+        if (dot >= 0) {
+            s += (dot + 1);
+            len -= (dot + 1);
+        }
+
+        /* 1. Custom Name: JsonProperty, JsonPropertyName, Column */
+        if ((len == 12 && memcmp(s, "JsonProperty", 12) == 0) ||
+            (len == 21 && memcmp(s, "JsonPropertyAttribute", 21) == 0) ||
+            (len == 16 && memcmp(s, "JsonPropertyName", 16) == 0) ||
+            (len == 25 && memcmp(s, "JsonPropertyNameAttribute", 25) == 0) ||
+            (len == 6  && memcmp(s, "Column", 6) == 0) ||
+            (len == 15 && memcmp(s, "ColumnAttribute", 15) == 0)) {
+            if (a->attribute.args.count > 0) {
+                zan_ast_node_t *arg = a->attribute.args.items[0];
+                if (arg->kind == AST_STRING_LITERAL) {
+                    *custom_name = arg->str_val.str;
+                } else if (arg->kind == AST_ASSIGNMENT && arg->binary.right &&
+                           arg->binary.right->kind == AST_STRING_LITERAL) {
+                    *custom_name = arg->binary.right->str_val.str;
+                }
+            }
+            for (int j = 0; j < a->attribute.args.count; j++) {
+                zan_ast_node_t *arg = a->attribute.args.items[j];
+                if (arg->kind == AST_ASSIGNMENT && arg->binary.left &&
+                    arg->binary.left->kind == AST_IDENTIFIER && arg->binary.right) {
+                    zan_istr_t an = arg->binary.left->ident.name;
+                    if (an.len == 6 && memcmp(an.str, "Ignore", 6) == 0) {
+                        if (arg->binary.right->kind == AST_BOOL_LITERAL && arg->binary.right->bool_val) {
+                            *flags |= 1ULL; /* bit 0 = ignored */
+                        }
+                    } else if (an.len == 10 && memcmp(an.str, "IsIdentity", 10) == 0) {
+                        if (arg->binary.right->kind == AST_BOOL_LITERAL && arg->binary.right->bool_val) {
+                            *flags |= 4ULL; /* bit 2 = pk */
+                        }
+                    }
+                }
+            }
+        }
+        /* 2. Ignore: JsonIgnore, Ignore, NotMapped */
+        if ((len == 10 && memcmp(s, "JsonIgnore", 10) == 0) ||
+            (len == 19 && memcmp(s, "JsonIgnoreAttribute", 19) == 0) ||
+            (len == 6  && memcmp(s, "Ignore", 6) == 0) ||
+            (len == 15 && memcmp(s, "IgnoreAttribute", 15) == 0) ||
+            (len == 9  && memcmp(s, "NotMapped", 9) == 0) ||
+            (len == 18 && memcmp(s, "NotMappedAttribute", 18) == 0)) {
+            *flags |= 1ULL; /* bit 0 = ignored */
+        }
+        /* 3. Required: JsonRequired, Required */
+        if ((len == 12 && memcmp(s, "JsonRequired", 12) == 0) ||
+            (len == 21 && memcmp(s, "JsonRequiredAttribute", 21) == 0) ||
+            (len == 8  && memcmp(s, "Required", 8) == 0) ||
+            (len == 17 && memcmp(s, "RequiredAttribute", 17) == 0)) {
+            *flags |= 2ULL; /* bit 1 = required */
+        }
+        /* 4. Primary Key: Key, PrimaryKey */
+        if ((len == 3  && memcmp(s, "Key", 3) == 0) ||
+            (len == 12 && memcmp(s, "KeyAttribute", 12) == 0) ||
+            (len == 10 && memcmp(s, "PrimaryKey", 10) == 0) ||
+            (len == 19 && memcmp(s, "PrimaryKeyAttribute", 19) == 0)) {
+            *flags |= 4ULL; /* bit 2 = pk */
+        }
+        /* 5. Default value: JsonDefault, Default, DefaultValue */
+        if ((len == 11 && memcmp(s, "JsonDefault", 11) == 0) ||
+            (len == 20 && memcmp(s, "JsonDefaultAttribute", 20) == 0) ||
+            (len == 12 && memcmp(s, "DefaultValue", 12) == 0) ||
+            (len == 21 && memcmp(s, "DefaultValueAttribute", 21) == 0)) {
+            if (a->attribute.args.count > 0) {
+                zan_ast_node_t *arg = a->attribute.args.items[0];
+                if (arg->kind == AST_ASSIGNMENT && arg->binary.right) {
+                    arg = arg->binary.right;
+                }
+                if (arg->kind == AST_STRING_LITERAL) {
+                    *dflt_val = arg->str_val.str;
+                } else if (arg->kind == AST_BOOL_LITERAL) {
+                    *dflt_val = arg->bool_val ? "true" : "false";
+                } else if (arg->kind == AST_INT_LITERAL) {
+                    char *buf = (char *)malloc(32);
+                    snprintf(buf, 32, "%lld", (long long)arg->int_val);
+                    *dflt_val = buf;
+                } else if (arg->kind == AST_FLOAT_LITERAL) {
+                    char *buf = (char *)malloc(32);
+                    snprintf(buf, 32, "%g", arg->float_val);
+                    *dflt_val = buf;
+                }
+            }
+        }
+    }
 }
 
 /* 发射the field-record array for a class/struct, or NULL when it has none */
@@ -219,11 +331,21 @@ static LLVMValueRef refl_emit_fields_class(zan_irgen_t *g, zan_symbol_t *sym,
             off = LLVMConstInt(i64, entry->field_offsets[slot], 0);
         else
             off = refl_slot_offset(g, st, slot);
+
+        const char *cname = "";
+        unsigned long long flgs = 0;
+        const char *dflt = "";
+        refl_extract_field_attrs(m, &cname, &flgs, &dflt);
+
         recs[n++] = LLVMConstNamedStruct(frec, (LLVMValueRef[]){
             refl_const_string(g, m->name.str, (int)m->name.len),
             refl_field_type_name(g, m->type),
             LLVMConstInt(i64, (unsigned long long)refl_field_kind(m->type), 0),
-            off }, 4);
+            off,
+            refl_const_string(g, cname, (int)strlen(cname)),
+            LLVMConstInt(i64, flgs, 0),
+            refl_const_string(g, dflt, (int)strlen(dflt)),
+            refl_meta_for(g, m->type, NULL, 0) }, 8);
         slot++;
     }
     LLVMValueRef arr = NULL;
@@ -266,7 +388,11 @@ static LLVMValueRef refl_emit_fields_enum(zan_irgen_t *g, zan_symbol_t *sym,
             refl_const_string(g, m->name.str, (int)m->name.len),
             refl_const_string(g, sym->name.str, (int)sym->name.len),
             LLVMConstInt(i64, ZAN_REFL_FK_ENUM_MEMBER, 0),
-            LLVMConstInt(i64, (unsigned long long)val, 0) }, 4);
+            LLVMConstInt(i64, (unsigned long long)val, 0),
+            refl_const_string(g, m->name.str, (int)m->name.len),
+            LLVMConstInt(i64, 0, 0),
+            refl_const_string(g, "", 0),
+            refl_meta_for(g, sym->type, NULL, 0) }, 8);
         val++;
     }
     LLVMValueRef arr = NULL;
@@ -513,16 +639,16 @@ static LLVMValueRef refl_make_ctor_thunk(zan_irgen_t *g, zan_symbol_t *sym,
                                          LLVMTypeRef ctor_ty) {
     if (!sym || !sym->type || sym->type->kind != TYPE_CLASS) return NULL;
     LLVMTypeRef st = get_struct_llvm_type(g, sym);
-    if (!st || !ctor_fn || !ctor_ty) return NULL;
+    if (!st) return NULL;
     LLVMTypeRef i8 = LLVMInt8TypeInContext(g->ctx);
     LLVMTypeRef i8ptr = LLVMPointerType(i8, 0);
     LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
     LLVMTypeRef i64ptr = LLVMPointerType(i64, 0);
 
-    unsigned total = LLVMCountParamTypes(ctor_ty);
-    if (total < 1 || total > ZAN_REFL_ARG_SLOTS + 1) return NULL;
+    unsigned total = (ctor_fn && ctor_ty) ? LLVMCountParamTypes(ctor_ty) : 0;
+    if (total > ZAN_REFL_ARG_SLOTS + 1) return NULL;
     LLVMTypeRef ptypes[ZAN_REFL_ARG_SLOTS + 1];
-    LLVMGetParamTypes(ctor_ty, ptypes);
+    if (total > 0) LLVMGetParamTypes(ctor_ty, ptypes);
 
     char nm[128];
     snprintf(nm, sizeof(nm), "__zan.refl.thunk.new.%d", g->refl_thunk_count++);
@@ -551,22 +677,24 @@ static LLVMValueRef refl_make_ctor_thunk(zan_irgen_t *g, zan_symbol_t *sym,
                              "refl.vt"), vp);
     }
 
-    bool ok = true;
-    LLVMValueRef args[ZAN_REFL_ARG_SLOTS + 1];
-    args[0] = LLVMBuildBitCast(g->builder, obj, ptypes[0], "refl.this");
-    for (unsigned i = 1; i < total && ok; i++) {
-        LLVMValueRef k = LLVMConstInt(i64, (unsigned long long)(i - 1), 0);
-        LLVMValueRef sp = LLVMBuildGEP2(g->builder, i64, LLVMGetParam(th, 1),
-                                        &k, 1, "refl.as");
-        args[i] = refl_slot_to(g,
-            LLVMBuildLoad2(g->builder, i64, sp, "refl.av"), ptypes[i], &ok);
+    if (total > 0) {
+        bool ok = true;
+        LLVMValueRef args[ZAN_REFL_ARG_SLOTS + 1];
+        args[0] = LLVMBuildBitCast(g->builder, obj, ptypes[0], "refl.this");
+        for (unsigned i = 1; i < total && ok; i++) {
+            LLVMValueRef k = LLVMConstInt(i64, (unsigned long long)(i - 1), 0);
+            LLVMValueRef sp = LLVMBuildGEP2(g->builder, i64, LLVMGetParam(th, 1),
+                                            &k, 1, "refl.as");
+            args[i] = refl_slot_to(g,
+                LLVMBuildLoad2(g->builder, i64, sp, "refl.av"), ptypes[i], &ok);
+        }
+        if (!ok) {
+            LLVMDeleteFunction(th);
+            if (save) LLVMPositionBuilderAtEnd(g->builder, save);
+            return NULL;
+        }
+        zan_call2(g->builder, ctor_ty, ctor_fn, args, total, "");
     }
-    if (!ok) {
-        LLVMDeleteFunction(th);
-        if (save) LLVMPositionBuilderAtEnd(g->builder, save);
-        return NULL;
-    }
-    zan_call2(g->builder, ctor_ty, ctor_fn, args, total, "");
     LLVMBuildStore(g->builder,
         LLVMBuildPtrToInt(g->builder, raw, i64, "refl.newi"),
         LLVMGetParam(th, 2));
@@ -580,6 +708,19 @@ static LLVMValueRef refl_ctor_record(zan_irgen_t *g, zan_symbol_t *sym,
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
     LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
     LLVMValueRef thunk = LLVMConstNull(i8ptr);
+    if (!decl) {
+        if (late) {
+            thunk = refl_make_ctor_thunk(g, sym, NULL, NULL);
+        }
+        return LLVMConstNamedStruct(refl_method_type(g), (LLVMValueRef[]){
+            refl_const_string(g, ".ctor", 5),
+            refl_const_string(g, sym->name.str, (int)sym->name.len),
+            LLVMConstInt(i64, ZAN_REFL_FK_REF, 0),
+            LLVMConstInt(i64, 0, 0),
+            refl_param_names(g, NULL),
+            thunk,
+            LLVMConstInt(i64, 0, 0) }, 7);
+    }
     if (late) {
         for (int i = 0; i < g->ctor_count; i++) {
             if (g->ctors[i].type_sym != sym || g->ctors[i].decl != decl)
@@ -611,7 +752,8 @@ static LLVMValueRef refl_mtab_init(zan_irgen_t *g, zan_symbol_t *sym,
         int got = decls ? refl_collect_ctors(sym, decls, n) : 0;
         for (int i = 0; i < n; i++)
             recs[i] = i < got ? refl_ctor_record(g, sym, decls[i], late)
-                              : LLVMConstNull(mrec);
+                              : (got == 0 && i == 0 ? refl_ctor_record(g, sym, NULL, late)
+                                                    : LLVMConstNull(mrec));
         free(decls);
     } else {
         zan_symbol_t **msyms = (zan_symbol_t **)calloc((size_t)n,
@@ -640,6 +782,8 @@ static LLVMValueRef refl_shape_mtab(zan_irgen_t *g, zan_symbol_t *sym,
             if (ms->items[i]->kind == AST_CONSTRUCTOR_DECL &&
                 !(ms->items[i]->method_decl.modifiers & MOD_STATIC))
                 n++;
+        if (n == 0 && sym->type && (sym->type->kind == TYPE_CLASS || sym->type->kind == TYPE_STRUCT))
+            n = 1;
     } else {
         for (int i = 0; i < sym->member_count; i++) {
             zan_symbol_t *m = sym->members[i];
@@ -675,21 +819,107 @@ static LLVMValueRef refl_shape_mtab(zan_irgen_t *g, zan_symbol_t *sym,
     return LLVMConstBitCast(gv, LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0));
 }
 
+static void refl_pack_attrs(zan_ast_list_t *attrs, char *buf, size_t buf_size) {
+    if (!attrs || attrs->count == 0 || buf_size == 0) {
+        if (buf_size > 0) buf[0] = 0;
+        return;
+    }
+    size_t pos = 0;
+    buf[0] = 0;
+    for (int i = 0; i < attrs->count; i++) {
+        zan_ast_node_t *a = attrs->items[i];
+        if (!a || a->kind != AST_ATTRIBUTE || !a->attribute.name) continue;
+        if (a->attribute.name->kind != AST_IDENTIFIER) continue;
+        zan_istr_t n = a->attribute.name->ident.name;
+        if (!n.str || n.len == 0) continue;
+
+        char attr_name[64];
+        int nlen = (int)n.len;
+        if (nlen > 60) nlen = 60;
+        memcpy(attr_name, n.str, (size_t)nlen);
+        attr_name[nlen] = 0;
+        if (nlen > 9 && memcmp(attr_name + nlen - 9, "Attribute", 9) == 0) {
+            attr_name[nlen - 9] = 0;
+        }
+
+        if (a->attribute.args.count == 0) {
+            int written = snprintf(buf + pos, buf_size - pos, "%s=true;", attr_name);
+            if (written > 0 && pos + (size_t)written < buf_size) pos += (size_t)written;
+            continue;
+        }
+
+        for (int j = 0; j < a->attribute.args.count; j++) {
+            zan_ast_node_t *arg = a->attribute.args.items[j];
+            if (!arg) continue;
+            if (arg->kind == AST_ASSIGNMENT && arg->binary.left &&
+                arg->binary.left->kind == AST_IDENTIFIER && arg->binary.right) {
+                zan_istr_t kname = arg->binary.left->ident.name;
+                char kstr[64];
+                int klen = (int)kname.len;
+                if (klen > 60) klen = 60;
+                memcpy(kstr, kname.str, (size_t)klen);
+                kstr[klen] = 0;
+
+                zan_ast_node_t *r = arg->binary.right;
+                if (r->kind == AST_STRING_LITERAL) {
+                    int written = snprintf(buf + pos, buf_size - pos, "%s.%s=%s;", attr_name, kstr, r->str_val.str ? r->str_val.str : "");
+                    if (written > 0 && pos + (size_t)written < buf_size) pos += (size_t)written;
+                } else if (r->kind == AST_BOOL_LITERAL) {
+                    int written = snprintf(buf + pos, buf_size - pos, "%s.%s=%s;", attr_name, kstr, r->bool_val ? "true" : "false");
+                    if (written > 0 && pos + (size_t)written < buf_size) pos += (size_t)written;
+                } else if (r->kind == AST_INT_LITERAL) {
+                    int written = snprintf(buf + pos, buf_size - pos, "%s.%s=%lld;", attr_name, kstr, (long long)r->int_val);
+                    if (written > 0 && pos + (size_t)written < buf_size) pos += (size_t)written;
+                }
+            } else if (arg->kind == AST_STRING_LITERAL) {
+                int written = snprintf(buf + pos, buf_size - pos, "%s=%s;", attr_name, arg->str_val.str ? arg->str_val.str : "");
+                if (written > 0 && pos + (size_t)written < buf_size) pos += (size_t)written;
+            } else if (arg->kind == AST_BOOL_LITERAL) {
+                int written = snprintf(buf + pos, buf_size - pos, "%s=%s;", attr_name, arg->bool_val ? "true" : "false");
+                if (written > 0 && pos + (size_t)written < buf_size) pos += (size_t)written;
+            } else if (arg->kind == AST_INT_LITERAL) {
+                int written = snprintf(buf + pos, buf_size - pos, "%s=%lld;", attr_name, (long long)arg->int_val);
+                if (written > 0 && pos + (size_t)written < buf_size) pos += (size_t)written;
+            }
+        }
+    }
+}
+
+static const char *refl_find_table_attr(zan_symbol_t *sym) {
+    if (!sym || !sym->decl || !sym->decl->meta) return NULL;
+    zan_ast_list_t *attrs = &sym->decl->meta->attributes;
+    for (int i = 0; i < attrs->count; i++) {
+        zan_ast_node_t *a = attrs->items[i];
+        if (!a || a->kind != AST_ATTRIBUTE || !a->attribute.name) continue;
+        if (a->attribute.name->kind != AST_IDENTIFIER) continue;
+        zan_istr_t n = a->attribute.name->ident.name;
+        if ((n.len == 5 && memcmp(n.str, "Table", 5) == 0) ||
+            (n.len == 14 && memcmp(n.str, "TableAttribute", 14) == 0)) {
+            if (a->attribute.args.count > 0) {
+                zan_ast_node_t *arg = a->attribute.args.items[0];
+                if (arg->kind == AST_STRING_LITERAL) {
+                    return arg->str_val.str;
+                } else if (arg->kind == AST_ASSIGNMENT && arg->binary.right &&
+                           arg->binary.right->kind == AST_STRING_LITERAL) {
+                    return arg->binary.right->str_val.str;
+                }
+            }
+            return sym->name.str;
+        }
+    }
+    return NULL;
+}
+
 static LLVMValueRef refl_meta_for(zan_irgen_t *g, zan_type_t *t,
                                   const char *disp, int disp_len) {
     char namebuf[256];
     if (!disp || disp_len <= 0) {
-        int n = 0;
-        if (t && t->name.len > 0) {
-            n = (int)t->name.len;
-            if (n > (int)sizeof(namebuf) - 3) n = (int)sizeof(namebuf) - 3;
-            memcpy(namebuf, t->name.str, (size_t)n);
-        } else {
-            memcpy(namebuf, "?", 1);
+        int n = t ? render_type_full(t, namebuf, sizeof(namebuf)) : 0;
+        if (n <= 0) {
+            namebuf[0] = '?';
+            namebuf[1] = 0;
             n = 1;
         }
-        if (t && t->kind == TYPE_ARRAY) { namebuf[n++] = '['; namebuf[n++] = ']'; }
-        namebuf[n] = 0;
         disp = namebuf;
         disp_len = n;
     }
@@ -706,9 +936,21 @@ static LLVMValueRef refl_meta_for(zan_irgen_t *g, zan_type_t *t,
     LLVMTypeRef i32 = LLVMInt32TypeInContext(g->ctx);
     LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
 
+    char tattrbuf[1024];
+    tattrbuf[0] = 0;
+    if (sym && sym->decl) refl_pack_attrs(zan_ast_attributes(sym->decl), tattrbuf, sizeof(tattrbuf));
+    LLVMValueRef tattr_val = refl_const_string(g, tattrbuf, (int)strlen(tattrbuf));
+
+    const char *tbl_name = refl_find_table_attr(sym);
+    LLVMValueRef tbl_val = tbl_name
+        ? refl_const_string(g, tbl_name, (int)strlen(tbl_name))
+        : refl_const_string(g, disp, disp_len);
+
     LLVMTypeRef rec_ty = LLVMStructTypeInContext(g->ctx, (LLVMTypeRef[]){
+        i8ptr, /* type_attrs (-104) */
+        i8ptr, /* table_name (-96) */
         i8ptr, i64, i8ptr, i64, i8ptr, i8ptr, i8ptr, i64, i64, i64, i64,
-        LLVMArrayType(i8, (unsigned)(disp_len + 1)) }, 12, 0);
+        LLVMArrayType(i8, (unsigned)(disp_len + 1)) }, 14, 0);
     char nm[128];
     snprintf(nm, sizeof(nm), "__zan.refl.type.%d", g->refl_meta_count);
     LLVMValueRef gv = LLVMAddGlobal(g->mod, rec_ty, nm);
@@ -716,7 +958,7 @@ static LLVMValueRef refl_meta_for(zan_irgen_t *g, zan_type_t *t,
     LLVMSetLinkage(gv, LLVMPrivateLinkage);
     LLVMSetGlobalConstant(gv, 1);
     LLVMSetAlignment(gv, 8);
-    LLVMValueRef idx[3] = { LLVMConstInt(i64, 0, 0), LLVMConstInt(i32, 11, 0),
+    LLVMValueRef idx[3] = { LLVMConstInt(i64, 0, 0), LLVMConstInt(i32, 13, 0),
                             LLVMConstInt(i64, 0, 0) };
     LLVMValueRef rec = LLVMConstGEP2(rec_ty, gv, idx, 3);
 
@@ -787,6 +1029,8 @@ static LLVMValueRef refl_meta_for(zan_irgen_t *g, zan_type_t *t,
         chars[i] = LLVMConstInt(i8, (unsigned char)disp[i], 0);
     chars[disp_len] = LLVMConstInt(i8, 0, 0);
     LLVMSetInitializer(gv, LLVMConstNamedStruct(rec_ty, (LLVMValueRef[]){
+        tattr_val,
+        tbl_val,
         methods,
         LLVMConstInt(i64, (unsigned long long)method_count, 0),
         ctors,
@@ -798,7 +1042,7 @@ static LLVMValueRef refl_meta_for(zan_irgen_t *g, zan_type_t *t,
         LLVMConstInt(i64, (unsigned long long)refl_type_kind(t), 0),
         LLVMConstInt(i64, ZAN_STRING_SENTINEL_RC, 0),
         LLVMConstInt(i64, ZAN_STR_HDR_WORD(disp_len), 0),
-        LLVMConstArray(i8, chars, (unsigned)(disp_len + 1)) }, 12));
+        LLVMConstArray(i8, chars, (unsigned)(disp_len + 1)) }, 14));
     free(chars);
     return rec;
 }
@@ -1376,7 +1620,18 @@ static LLVMValueRef refl_fname_fn(zan_irgen_t *g) {
     LLVMValueRef sel = LLVMBuildSelect(g->builder,
         LLVMBuildICmp(g->builder, LLVMIntEQ, which,
                       LLVMConstInt(i64, ZAN_REFL_WHICH_NAME, 0), "refl.isname"),
-        LLVMConstInt(i64, 0, 0), LLVMConstInt(i64, 8, 0), "refl.sel");
+        LLVMConstInt(i64, 0, 0),
+        LLVMBuildSelect(g->builder,
+            LLVMBuildICmp(g->builder, LLVMIntEQ, which,
+                          LLVMConstInt(i64, ZAN_REFL_WHICH_TYPE, 0), "refl.istype"),
+            LLVMConstInt(i64, 8, 0),
+            LLVMBuildSelect(g->builder,
+                LLVMBuildICmp(g->builder, LLVMIntEQ, which,
+                              LLVMConstInt(i64, ZAN_REFL_WHICH_CUSTOM, 0), "refl.iscust"),
+                LLVMConstInt(i64, 32, 0),
+                LLVMConstInt(i64, 48, 0), "refl.sel3"),
+            "refl.sel2"),
+        "refl.sel");
     byte_off = LLVMBuildAdd(g->builder, byte_off, sel, "refl.fo2");
     LLVMValueRef fe = LLVMBuildGEP2(g->builder, i8, fields, &byte_off, 1, "refl.fe");
     LLVMValueRef sv = LLVMBuildLoad2(g->builder, i8ptr,
@@ -1984,6 +2239,24 @@ static LLVMValueRef refl_set_fn(zan_irgen_t *g) {
     zan_call2(g->builder, arc_ty, g->rt_str_release, &ov, 1, "");
     LLVMBuildBr(g->builder, yes);
 
+    LLVMBasicBlockRef sref = LLVMAppendBasicBlockInContext(g->ctx, fn, "st.ref");
+    LLVMAddCase(sw, LLVMConstInt(i64, ZAN_REFL_FK_REF, 0), sref);
+    LLVMPositionBuilderAtEnd(g->builder, sref);
+    LLVMBasicBlockRef sref2 = LLVMAppendBasicBlockInContext(g->ctx, fn, "st.ref2");
+    LLVMBuildCondBr(g->builder,
+        LLVMBuildICmp(g->builder, LLVMIntEQ, vkind,
+                      LLVMConstInt(i64, ZAN_REFL_VK_PTR, 0), "refl.visptr_ref"),
+        sref2, no);
+    LLVMPositionBuilderAtEnd(g->builder, sref2);
+    LLVMValueRef ref_sp = LLVMBuildBitCast(g->builder, p,
+                                           LLVMPointerType(i8ptr, 0), "refl.stref_p");
+    LLVMValueRef ref_nv = LLVMBuildIntToPtr(g->builder, val, i8ptr, "refl.stref_nv");
+    LLVMValueRef ref_ov = LLVMBuildLoad2(g->builder, i8ptr, ref_sp, "refl.stref_ov");
+    zan_call2(g->builder, arc_ty, g->rt_retain, &ref_nv, 1, "");
+    LLVMBuildStore(g->builder, ref_nv, ref_sp);
+    zan_call2(g->builder, arc_ty, g->rt_release, &ref_ov, 1, "");
+    LLVMBuildBr(g->builder, yes);
+
     LLVMPositionBuilderAtEnd(g->builder, yes);
     LLVMBuildRet(g->builder, LLVMConstInt(i64, 1, 0));
     LLVMPositionBuilderAtEnd(g->builder, no);
@@ -2357,6 +2630,12 @@ static bool refl_emit_typeinfo_member(zan_irgen_t *g, LLVMValueRef ti,
     case ZAN_REFL_M_NAME:
         *out = ti;
         return true;
+    case ZAN_REFL_M_TABLENAME:
+        *out = refl_hdr_ptr(g, ti, ZAN_REFL_TABLE_OFF, "refl.tbl");
+        return true;
+    case ZAN_REFL_M_TATTRS:
+        *out = refl_hdr_ptr(g, ti, ZAN_REFL_ATTRS_OFF, "refl.tattrs");
+        return true;
     case ZAN_REFL_M_KIND: {   /* Kind */
         LLVMValueRef k = refl_hdr_i64(g, ti, ZAN_REFL_KIND_OFF, "refl.tk");
         const char *names[] = { "other", "class", "struct", "enum",
@@ -2379,16 +2658,85 @@ static bool refl_emit_typeinfo_member(zan_irgen_t *g, LLVMValueRef ti,
         return true;
     }
     case ZAN_REFL_M_FNAME:
-    case ZAN_REFL_M_FTYPE: {  /* GetFieldName / GetFieldType */
+    case ZAN_REFL_M_FTYPE:
+    case ZAN_REFL_M_FATTRS:
+    case ZAN_REFL_M_FCUSTOMNAME:
+    case ZAN_REFL_M_FDEFAULT: {  /* GetFieldName / GetFieldType / GetFieldCustomName / GetFieldDefault */
         LLVMValueRef idx = arg0 ? emit_expr(g, arg0, locals)
                                 : LLVMConstInt(i64, 0, 0);
         idx = emit_index_i64(g, idx, "refl.i");
+        int which = ZAN_REFL_WHICH_NAME;
+        if (code == ZAN_REFL_M_FTYPE) which = ZAN_REFL_WHICH_TYPE;
+        else if (code == ZAN_REFL_M_FCUSTOMNAME) which = ZAN_REFL_WHICH_CUSTOM;
+        else if (code == ZAN_REFL_M_FDEFAULT) which = ZAN_REFL_WHICH_DEFAULT;
         *out = zan_call2(g->builder,
             LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i8ptr, i64, i64 }, 3, 0),
             refl_fname_fn(g), (LLVMValueRef[]){ ti, idx,
-                LLVMConstInt(i64, code == ZAN_REFL_M_FNAME ? ZAN_REFL_WHICH_NAME
-                                            : ZAN_REFL_WHICH_TYPE, 0) },
+                LLVMConstInt(i64, (unsigned long long)which, 0) },
             3, "refl.fname");
+        return true;
+    }
+    case ZAN_REFL_M_FIGNORED:
+    case ZAN_REFL_M_FREQUIRED:
+    case ZAN_REFL_M_FPK: {       /* IsFieldIgnored / IsFieldRequired / IsFieldPk */
+        LLVMValueRef idx = arg0 ? emit_expr(g, arg0, locals)
+                                : LLVMConstInt(i64, 0, 0);
+        idx = emit_index_i64(g, idx, "refl.i");
+        LLVMValueRef fields = refl_hdr_ptr(g, ti, ZAN_REFL_FIELDS_OFF, "refl.fl");
+        LLVMValueRef count = refl_hdr_i64(g, ti, ZAN_REFL_COUNT_OFF, "refl.fc");
+        LLVMValueRef ok = LLVMBuildAnd(g->builder,
+            LLVMBuildICmp(g->builder, LLVMIntSGE, idx,
+                          LLVMConstInt(i64, 0, 0), "refl.ge"),
+            LLVMBuildICmp(g->builder, LLVMIntSLT, idx, count, "refl.lt"),
+            "refl.ok");
+        LLVMValueRef safe = LLVMBuildSelect(g->builder, ok, idx,
+                                            LLVMConstInt(i64, 0, 0), "refl.si");
+        LLVMValueRef off = LLVMBuildAdd(g->builder,
+            LLVMBuildMul(g->builder, safe,
+                         LLVMConstInt(i64, ZAN_REFL_FIELD_SIZE, 0), "refl.fo"),
+            LLVMConstInt(i64, 40, 0), "refl.flgo");
+        LLVMValueRef zero_slot = LLVMBuildAlloca(g->builder, i64, "refl.z");
+        LLVMBuildStore(g->builder, LLVMConstInt(i64, 0, 0), zero_slot);
+        LLVMValueRef p = LLVMBuildGEP2(g->builder, i8, fields, &off, 1, "refl.flgp");
+        p = LLVMBuildBitCast(g->builder, p, LLVMPointerType(i64, 0), "refl.flgpc");
+        LLVMValueRef live = LLVMBuildAnd(g->builder, ok,
+            LLVMBuildIsNotNull(g->builder, fields, "refl.fl.nn"), "refl.live");
+        p = LLVMBuildSelect(g->builder, live, p, zero_slot, "refl.flgsel");
+        LLVMValueRef flags = LLVMBuildLoad2(g->builder, i64, p, "refl.flgv");
+        unsigned long long bit = 1;
+        if (code == ZAN_REFL_M_FREQUIRED) bit = 2;
+        else if (code == ZAN_REFL_M_FPK) bit = 4;
+        LLVMValueRef masked = LLVMBuildAnd(g->builder, flags,
+            LLVMConstInt(i64, bit, 0), "refl.masked");
+        *out = LLVMBuildICmp(g->builder, LLVMIntNE, masked,
+            LLVMConstInt(i64, 0, 0), "refl.flagbool");
+        return true;
+    }
+    case ZAN_REFL_M_FTYPEINFO: {  /* GetFieldTypeInfo(idx) -> TypeInfo */
+        LLVMValueRef idx = arg0 ? emit_expr(g, arg0, locals)
+                                : LLVMConstInt(i64, 0, 0);
+        idx = emit_index_i64(g, idx, "refl.i");
+        LLVMValueRef fields = refl_hdr_ptr(g, ti, ZAN_REFL_FIELDS_OFF, "refl.fl");
+        LLVMValueRef count = refl_hdr_i64(g, ti, ZAN_REFL_COUNT_OFF, "refl.fc");
+        LLVMValueRef ok = LLVMBuildAnd(g->builder,
+            LLVMBuildICmp(g->builder, LLVMIntSGE, idx,
+                          LLVMConstInt(i64, 0, 0), "refl.ge"),
+            LLVMBuildICmp(g->builder, LLVMIntSLT, idx, count, "refl.lt"),
+            "refl.ok");
+        LLVMValueRef safe = LLVMBuildSelect(g->builder, ok, idx,
+                                            LLVMConstInt(i64, 0, 0), "refl.si");
+        LLVMValueRef off = LLVMBuildAdd(g->builder,
+            LLVMBuildMul(g->builder, safe,
+                         LLVMConstInt(i64, ZAN_REFL_FIELD_SIZE, 0), "refl.fo"),
+            LLVMConstInt(i64, 56, 0), "refl.tio");
+        LLVMValueRef zero_slot = LLVMBuildAlloca(g->builder, i8ptr, "refl.zt");
+        LLVMBuildStore(g->builder, LLVMConstNull(i8ptr), zero_slot);
+        LLVMValueRef p = LLVMBuildGEP2(g->builder, i8, fields, &off, 1, "refl.tip");
+        p = LLVMBuildBitCast(g->builder, p, LLVMPointerType(i8ptr, 0), "refl.tipc");
+        LLVMValueRef live = LLVMBuildAnd(g->builder, ok,
+            LLVMBuildIsNotNull(g->builder, fields, "refl.fl.nn"), "refl.live");
+        p = LLVMBuildSelect(g->builder, live, p, zero_slot, "refl.tsel");
+        *out = LLVMBuildLoad2(g->builder, i8ptr, p, "refl.fti");
         return true;
     }
     case ZAN_REFL_M_HAS: {    /* HasField(name) */
@@ -2460,11 +2808,11 @@ static bool refl_emit_instance_call_1(zan_irgen_t *g, zan_type_t *rt,
     LLVMTypeRef three[3] = { i8ptr, i8ptr, i8ptr };
     if (code == ZAN_REFL_M_SETINT || code == ZAN_REFL_M_SETLONG ||
         code == ZAN_REFL_M_SETBOOL || code == ZAN_REFL_M_SETDOUBLE ||
-        code == ZAN_REFL_M_SETSTRING) {
+        code == ZAN_REFL_M_SETSTRING || code == ZAN_REFL_M_SETOBJECT) {
         LLVMValueRef v = arg1 ? emit_expr(g, arg1, locals) : NULL;
         if (arg1) *val_tmp = v;
         int vkind = code == ZAN_REFL_M_SETDOUBLE ? ZAN_REFL_VK_DOUBLE
-                  : code == ZAN_REFL_M_SETSTRING ? ZAN_REFL_VK_PTR
+                  : (code == ZAN_REFL_M_SETSTRING || code == ZAN_REFL_M_SETOBJECT) ? ZAN_REFL_VK_PTR
                                                  : ZAN_REFL_VK_INT;
         LLVMValueRef slot = v ? refl_to_slot(g, v) : LLVMConstInt(i64, 0, 0);
         LLVMValueRef ok = zan_call2(g->builder,

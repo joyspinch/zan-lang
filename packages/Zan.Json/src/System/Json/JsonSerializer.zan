@@ -1,0 +1,367 @@
+using System;
+using System.Text;
+
+namespace System.Json;
+
+// 工业级 JSON 统一序列化与反序列化入口门面。
+// 提供类似 C# / Go / Rust / Java 风格的标准顶层静态接口。
+public class JsonSerializer {
+    // 将 JsonValue 序列化为紧凑 JSON 文本。
+    public static string Serialize(JsonValue val) {
+        if (val == null) { return "null"; }
+        return val.ToJson();
+    }
+
+    // 将 JsonValue 序列化为两空格缩进的美化 JSON 文本。
+    public static string SerializePretty(JsonValue val) {
+        if (val == null) { return "null"; }
+        return val.PrettyToJson();
+    }
+
+    // 将 JSON 文本解析为 JsonValue 树；格式非法时抛出 JsonException。
+    public static JsonValue Deserialize(string json) {
+        if (json == null) { return JsonValue.NewNull(); }
+        return JsonValue.Parse(json);
+    }
+
+    // 宽松模式解析 JSON 文本；尽力而为容错，不抛出异常。
+    public static JsonValue DeserializeLenient(string json) {
+        if (json == null) { return JsonValue.NewNull(); }
+        return JsonValue.ParseLenient(json);
+    }
+
+    // 将 JSON 文本解析为零拷贝平铺 tape 结构的 JsonDoc（适用于极高性能只读查询）。
+    public static JsonDoc DeserializeDoc(string json) {
+        if (json == null) { return JsonDoc.Parse("null"); }
+        return JsonDoc.Parse(json);
+    }
+}
+
+// 统一标准便捷门面 Json.Serialize<T> 与 Json.Deserialize<T>
+// 基于原生 TypeInfo 运行时反射驱动，彻底杜绝编译期代码生成器侵入。
+public class Json {
+    public static bool IsListType(string name) {
+        return name != null && name.Length >= 5 && name.Substring(0, 5) == "List<";
+    }
+
+    public static string Serialize<T>(T obj) {
+        if (obj == null) { return "null"; }
+        TypeInfo ti = typeof(T);
+        StringBuilder sb = new StringBuilder();
+        if (Json.IsListType(ti.Name)) {
+            Json.SerializeList(sb, ti, (object)obj);
+        } else {
+            Json.SerializeObject(sb, ti, (object)obj);
+        }
+        return sb.ToString();
+    }
+
+    public static T Deserialize<T>(string json) {
+        if (json == null || json.Length == 0) {
+            throw new Exception("Cannot deserialize null or empty JSON string");
+        }
+        JsonValue jv = JsonValue.Parse(json);
+        if (jv == null) {
+            throw new Exception("Invalid JSON root");
+        }
+        TypeInfo ti = typeof(T);
+        if (Json.IsListType(ti.Name)) {
+            object list = Json.DeserializeList(jv, ti);
+            return (T)list;
+        }
+        object obj = Json.DeserializeObject(jv, ti);
+        return (T)obj;
+    }
+
+    public static void SerializeObject(StringBuilder sb, TypeInfo ti, object obj) {
+        if (obj == null) { sb.Append("null"); return; }
+        sb.Append("{");
+        int count = ti.FieldCount;
+        int written = 0;
+        for (int i = 0; i < count; i = i + 1) {
+            if (ti.IsFieldIgnored(i)) { continue; }
+            string fname = ti.GetFieldName(i);
+            string ftype = ti.GetFieldType(i);
+            TypeInfo fti = ti.GetFieldTypeInfo(i);
+            string jsonKey = ti.GetFieldCustomName(i);
+            if (jsonKey.Length == 0) { jsonKey = fname; }
+            if (written > 0) { sb.Append(","); }
+            sb.Append("\"");
+            sb.Append(jsonKey);
+            sb.Append("\":");
+            Json.SerializeMember(sb, fti, ftype, obj, fname);
+            written = written + 1;
+        }
+        sb.Append("}");
+    }
+
+    public static void SerializeMember(StringBuilder sb, TypeInfo fti, string ftype, object target, string fname) {
+        if (ftype == "string") {
+            string s = target.GetFieldString(fname);
+            if (s == null) { sb.Append("null"); }
+            else {
+                sb.Append("\"");
+                Encoding.JsonEscapeTo(sb, s);
+                sb.Append("\"");
+            }
+        } else if (ftype == "int" || ftype == "short" || ftype == "byte" || ftype == "uint" || ftype == "ushort" || ftype == "sbyte") {
+            sb.Append(Convert.ToString(target.GetFieldInt(fname)));
+        } else if (ftype == "long" || ftype == "ulong") {
+            sb.Append(Convert.ToString(target.GetFieldLong(fname)));
+        } else if (ftype == "double" || ftype == "float") {
+            sb.Append(Convert.ToString(target.GetFieldDouble(fname)));
+        } else if (ftype == "bool") {
+            sb.Append(target.GetFieldBool(fname) ? "true" : "false");
+        } else if (fti.Kind == "enum") {
+            sb.Append(Convert.ToString(target.GetFieldInt(fname)));
+        } else if (ftype == "JsonValue") {
+            object jvo = target.GetFieldObject(fname);
+            if (jvo == null) { sb.Append("null"); }
+            else { sb.Append(((JsonValue)jvo).ToJson()); }
+        } else if (Json.IsListType(ftype)) {
+            object listObj = target.GetFieldObject(fname);
+            Json.SerializeList(sb, fti, listObj);
+        } else {
+            object child = target.GetFieldObject(fname);
+            if (child == null) { sb.Append("null"); }
+            else { Json.SerializeObject(sb, fti, child); }
+        }
+    }
+
+    public static void SerializeList(StringBuilder sb, TypeInfo listTi, object listObj) {
+        if (listObj == null) { sb.Append("null"); return; }
+        sb.Append("[");
+        TypeInfo elemTi = listTi;
+        if (listTi.TypeArgCount > 0) {
+            elemTi = listTi.GetTypeArg(0);
+        }
+        string elemName = elemTi.Name;
+        string elemKind = elemTi.Kind;
+
+        if (Json.IsListType(elemName)) {
+            List<object> rows = (List<object>)listObj;
+            for (int r = 0; r < rows.Count; r = r + 1) {
+                if (r > 0) { sb.Append(","); }
+                Json.SerializeList(sb, elemTi, rows[r]);
+            }
+        } else if (elemName == "string") {
+            List<string> list = (List<string>)listObj;
+            for (int j = 0; j < list.Count; j = j + 1) {
+                if (j > 0) { sb.Append(","); }
+                if (list[j] == null) { sb.Append("null"); }
+                else {
+                    sb.Append("\"");
+                    Encoding.JsonEscapeTo(sb, list[j]);
+                    sb.Append("\"");
+                }
+            }
+        } else if (elemName == "int" || elemName == "short" || elemName == "byte" || elemKind == "enum") {
+            List<int> list = (List<int>)listObj;
+            for (int j = 0; j < list.Count; j = j + 1) {
+                if (j > 0) { sb.Append(","); }
+                sb.Append(Convert.ToString(list[j]));
+            }
+        } else if (elemName == "long") {
+            List<long> list = (List<long>)listObj;
+            for (int j = 0; j < list.Count; j = j + 1) {
+                if (j > 0) { sb.Append(","); }
+                sb.Append(Convert.ToString(list[j]));
+            }
+        } else if (elemName == "double" || elemName == "float") {
+            List<double> list = (List<double>)listObj;
+            for (int j = 0; j < list.Count; j = j + 1) {
+                if (j > 0) { sb.Append(","); }
+                sb.Append(Convert.ToString(list[j]));
+            }
+        } else if (elemName == "bool") {
+            List<bool> list = (List<bool>)listObj;
+            for (int j = 0; j < list.Count; j = j + 1) {
+                if (j > 0) { sb.Append(","); }
+                sb.Append(list[j] ? "true" : "false");
+            }
+        } else if (elemName == "JsonValue") {
+            List<object> list = (List<object>)listObj;
+            for (int j = 0; j < list.Count; j = j + 1) {
+                if (j > 0) { sb.Append(","); }
+                if (list[j] == null) { sb.Append("null"); }
+                else { sb.Append(((JsonValue)list[j]).ToJson()); }
+            }
+        } else {
+            List<object> list = (List<object>)listObj;
+            for (int j = 0; j < list.Count; j = j + 1) {
+                if (j > 0) { sb.Append(","); }
+                if (list[j] == null) { sb.Append("null"); }
+                else { Json.SerializeObject(sb, elemTi, list[j]); }
+            }
+        }
+        sb.Append("]");
+    }
+
+    public static object DeserializeObject(JsonValue jv, TypeInfo ti) {
+        if (jv == null || !jv.IsObject()) {
+            throw new Exception("JSON root must be an object");
+        }
+        object obj = ti.CreateInstance();
+        int count = ti.FieldCount;
+        for (int i = 0; i < count; i = i + 1) {
+            if (ti.IsFieldIgnored(i)) { continue; }
+            string fname = ti.GetFieldName(i);
+            string ftype = ti.GetFieldType(i);
+            TypeInfo fti = ti.GetFieldTypeInfo(i);
+            string jsonKey = ti.GetFieldCustomName(i);
+            if (jsonKey.Length == 0) { jsonKey = fname; }
+            if (ti.IsFieldRequired(i) && !jv.Has(jsonKey)) {
+                throw new Exception("Missing required JSON property: " + jsonKey);
+            }
+            if (!jv.Has(jsonKey)) {
+                string dflt = ti.GetFieldDefault(i);
+                if (dflt.Length > 0) {
+                    Json.ApplyFieldDefault(obj, fname, ftype, fti, dflt);
+                }
+                continue;
+            }
+            JsonValue fv = jv.Get(jsonKey);
+            if (fv == null || fv.IsNull()) { continue; }
+            Json.DeserializeField(obj, fname, ftype, fti, fv);
+        }
+        return obj;
+    }
+
+    public static void ApplyFieldDefault(object obj, string fname, string ftype, TypeInfo fti, string dflt) {
+        if (ftype == "string") {
+            obj.SetFieldString(fname, dflt);
+        } else if (ftype == "int" || ftype == "short" || ftype == "byte" || fti.Kind == "enum") {
+            obj.SetFieldInt(fname, Convert.ToInt32(dflt));
+        } else if (ftype == "long") {
+            obj.SetFieldLong(fname, Convert.ToInt64(dflt));
+        } else if (ftype == "double" || ftype == "float") {
+            obj.SetFieldDouble(fname, Convert.ToDouble(dflt));
+        } else if (ftype == "bool") {
+            obj.SetFieldBool(fname, dflt == "true" || dflt == "1");
+        }
+    }
+
+    public static void DeserializeField(object obj, string fname, string ftype, TypeInfo fti, JsonValue fv) {
+        if (ftype == "string") {
+            obj.SetFieldString(fname, fv.AsString(""));
+        } else if (ftype == "int" || ftype == "short" || ftype == "byte" || fti.Kind == "enum") {
+            obj.SetFieldInt(fname, (int)fv.AsLong(0));
+        } else if (ftype == "long") {
+            obj.SetFieldLong(fname, fv.AsLong(0));
+        } else if (ftype == "double" || ftype == "float") {
+            obj.SetFieldDouble(fname, fv.AsDouble(0.0));
+        } else if (ftype == "bool") {
+            obj.SetFieldBool(fname, fv.AsBool(false));
+        } else if (ftype == "JsonValue") {
+            obj.SetFieldObject(fname, (object)fv);
+        } else if (Json.IsListType(ftype)) {
+            object list = Json.DeserializeList(fv, fti);
+            obj.SetFieldObject(fname, list);
+        } else {
+            if (fv.IsObject()) {
+                object child = Json.DeserializeObject(fv, fti);
+                obj.SetFieldObject(fname, child);
+            }
+        }
+    }
+
+    public static object DeserializeList(JsonValue jv, TypeInfo listTi) {
+        TypeInfo elemTi = listTi;
+        if (listTi.TypeArgCount > 0) {
+            elemTi = listTi.GetTypeArg(0);
+        }
+        string elemName = elemTi.Name;
+        string elemKind = elemTi.Kind;
+
+        if (Json.IsListType(elemName)) {
+            List<object> rows = new List<object>();
+            if (jv != null && jv.IsArray()) {
+                int n = jv.Count();
+                for (int i = 0; i < n; i = i + 1) {
+                    rows.Add(Json.DeserializeList(jv.At(i), elemTi));
+                }
+            }
+            return (object)rows;
+        } else if (elemName == "string") {
+            List<string> list = new List<string>();
+            if (jv != null && jv.IsArray()) {
+                int n = jv.Count();
+                for (int i = 0; i < n; i = i + 1) {
+                    list.Add(jv.At(i).AsString(""));
+                }
+            } else if (jv != null && !jv.IsNull()) {
+                list.Add(jv.AsString(""));
+            }
+            return (object)list;
+        } else if (elemName == "int" || elemName == "short" || elemName == "byte" || elemKind == "enum") {
+            List<int> list = new List<int>();
+            if (jv != null && jv.IsArray()) {
+                int n = jv.Count();
+                for (int i = 0; i < n; i = i + 1) {
+                    list.Add((int)jv.At(i).AsLong(0));
+                }
+            } else if (jv != null && !jv.IsNull()) {
+                list.Add((int)jv.AsLong(0));
+            }
+            return (object)list;
+        } else if (elemName == "long") {
+            List<long> list = new List<long>();
+            if (jv != null && jv.IsArray()) {
+                int n = jv.Count();
+                for (int i = 0; i < n; i = i + 1) {
+                    list.Add(jv.At(i).AsLong(0));
+                }
+            } else if (jv != null && !jv.IsNull()) {
+                list.Add(jv.AsLong(0));
+            }
+            return (object)list;
+        } else if (elemName == "double" || elemName == "float") {
+            List<double> list = new List<double>();
+            if (jv != null && jv.IsArray()) {
+                int n = jv.Count();
+                for (int i = 0; i < n; i = i + 1) {
+                    list.Add(jv.At(i).AsDouble(0.0));
+                }
+            } else if (jv != null && !jv.IsNull()) {
+                list.Add(jv.AsDouble(0.0));
+            }
+            return (object)list;
+        } else if (elemName == "bool") {
+            List<bool> list = new List<bool>();
+            if (jv != null && jv.IsArray()) {
+                int n = jv.Count();
+                for (int i = 0; i < n; i = i + 1) {
+                    list.Add(jv.At(i).AsBool(false));
+                }
+            } else if (jv != null && !jv.IsNull()) {
+                list.Add(jv.AsBool(false));
+            }
+            return (object)list;
+        } else if (elemName == "JsonValue") {
+            List<object> list = new List<object>();
+            if (jv != null && jv.IsArray()) {
+                int n = jv.Count();
+                for (int i = 0; i < n; i = i + 1) {
+                    list.Add((object)jv.At(i));
+                }
+            } else if (jv != null && !jv.IsNull()) {
+                list.Add((object)jv);
+            }
+            return (object)list;
+        } else {
+            List<object> list = new List<object>();
+            if (jv != null && jv.IsArray()) {
+                int n = jv.Count();
+                for (int i = 0; i < n; i = i + 1) {
+                    JsonValue elem = jv.At(i);
+                    if (elem != null && elem.IsObject()) {
+                        list.Add(Json.DeserializeObject(elem, elemTi));
+                    }
+                }
+            } else if (jv != null && jv.IsObject()) {
+                list.Add(Json.DeserializeObject(jv, elemTi));
+            }
+            return (object)list;
+        }
+    }
+}

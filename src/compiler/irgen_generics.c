@@ -77,6 +77,9 @@ static void collect_inst_expr(zan_irgen_t *g, zan_ast_node_t *e) {
     case AST_MEMBER_ACCESS:
         collect_inst_expr(g, e->member.object);
         break;
+    case AST_TYPEOF_EXPR:
+        collect_inst_typeref(g, e->cast.type);
+        break;
     case AST_IDENTIFIER:
         collect_inst_typeref(g, e->ident.inst_type_ref);
         break;
@@ -184,6 +187,7 @@ static void collect_inst_member(zan_irgen_t *g, zan_ast_node_t *member) {
         collect_inst_stmt(g, member->method_decl.body);
     } else if (member->kind == AST_FIELD_DECL) {
         collect_inst_typeref(g, member->field_decl.type);
+        collect_inst_expr(g, member->field_decl.initializer);
     }
 }
 

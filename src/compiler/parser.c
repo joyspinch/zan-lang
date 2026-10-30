@@ -5531,8 +5531,22 @@ static zan_ast_node_t *clone_ast_subst(zan_ast_node_t *node, type_subst_ctx_t *c
         for (int i = 0; i < node->call.args.count; i++)
             zan_ast_list_push(&res->call.args, clone_ast_subst(node->call.args.items[i], ctx), ctx->arena);
         zan_ast_list_init(&res->call.type_args);
+        if (node->call.type_args.count > 0) {
+            zan_ast_node_t *ta0 = node->call.type_args.items[0];
+            zan_compile_trace("clone_ast_subst CALL type_args count=%d kind=%d name='%.*s'",
+                node->call.type_args.count, ta0->kind,
+                ta0->kind == AST_TYPE_REF ? (int)ta0->type_ref.name.len : (ta0->kind == AST_IDENTIFIER ? (int)ta0->ident.name.len : 0),
+                ta0->kind == AST_TYPE_REF ? ta0->type_ref.name.str : (ta0->kind == AST_IDENTIFIER ? ta0->ident.name.str : ""));
+        }
         for (int i = 0; i < node->call.type_args.count; i++)
             zan_ast_list_push(&res->call.type_args, clone_ast_subst(node->call.type_args.items[i], ctx), ctx->arena);
+        if (res->call.type_args.count > 0) {
+            zan_ast_node_t *rta0 = res->call.type_args.items[0];
+            zan_compile_trace("clone_ast_subst CALL type_args after: kind=%d name='%.*s'",
+                rta0->kind,
+                rta0->kind == AST_TYPE_REF ? (int)rta0->type_ref.name.len : (rta0->kind == AST_IDENTIFIER ? (int)rta0->ident.name.len : 0),
+                rta0->kind == AST_TYPE_REF ? rta0->type_ref.name.str : (rta0->kind == AST_IDENTIFIER ? rta0->ident.name.str : ""));
+        }
         return res;
     }
     case AST_BLOCK: {
@@ -5750,6 +5764,13 @@ static void specialize_type_from_base(zan_ast_node_t *derived, zan_ast_node_t *b
                                       zan_ast_node_t *unit, zan_arena_t *arena, int depth) {
     if (!derived || !base_ref || !unit || depth > 8) return;
     if (base_ref->kind != AST_TYPE_REF || base_ref->type_ref.type_args.count == 0) return;
+
+    zan_compile_trace("specialize_type_from_base: derived='%.*s' base='%.*s' args=%d arg0='%.*s'",
+                      (int)derived->type_decl.name.len, derived->type_decl.name.str,
+                      (int)base_ref->type_ref.name.len, base_ref->type_ref.name.str,
+                      base_ref->type_ref.type_args.count,
+                      base_ref->type_ref.type_args.count > 0 ? (int)base_ref->type_ref.type_args.items[0]->type_ref.name.len : 0,
+                      base_ref->type_ref.type_args.count > 0 ? base_ref->type_ref.type_args.items[0]->type_ref.name.str : "");
 
     zan_ast_node_t *base_decl = find_type_decl_by_name(unit, base_ref->type_ref.name);
     if (!base_decl || (base_decl->kind != AST_CLASS_DECL && base_decl->kind != AST_STRUCT_DECL))

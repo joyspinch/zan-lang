@@ -1350,6 +1350,41 @@ static zan_symbol_t *find_extension_method(zan_irgen_t *g, zan_type_t *recv_ty,
     if (!recv_ty) return NULL;
     zan_symbol_t *best = NULL;
     int best_score = -1;
+
+    /* 优先从 binder 的全量扩展方法登记表中查找：包含泛型方法模板（其在发射阶段
+     * 因带有类型参数未特化而被 method_is_tp_template 略过，未进 g->functions）。 */
+    int ext_count = (g->binder && g->binder->ext_methods) ? g->binder->ext_method_count : 0;
+    for (int i = 0; i < ext_count; i++) {
+        zan_symbol_t *m = g->binder->ext_methods[i].method;
+        if (!m || m->kind != SYM_METHOD || !m->decl ||
+            m->decl->kind != AST_METHOD_DECL)
+            continue;
+        if (m->name.len != name.len ||
+            memcmp(m->name.str, name.str, (size_t)name.len) != 0)
+            continue;
+        zan_ast_list_t *ps = &m->decl->method_decl.params;
+        if (ps->count != argc + 1) continue;
+        zan_ast_node_t *p0 = ps->items[0];
+        if (!p0 || p0->kind != AST_PARAM || !p0->param.is_this) continue;
+        zan_type_t *pt = g->binder->ext_methods[i].recv_type;
+        if (!pt) pt = zan_binder_resolve_type(g->binder, p0->param.type);
+        if (!pt) continue;
+        if (pt->kind != TYPE_TYPE_PARAM &&
+            !ext_receiver_interface_match(pt, recv_ty)) {
+            if (pt->kind != recv_ty->kind) continue;
+            if ((pt->kind == TYPE_CLASS || pt->kind == TYPE_STRUCT ||
+                 pt->kind == TYPE_INTERFACE || pt->kind == TYPE_ENUM) &&
+                pt->sym != recv_ty->sym)
+                continue;
+        }
+        int score = ext_method_score(g, m, recv_ty, call, recv_expr, locals);
+        if (score > best_score) {
+            best_score = score;
+            best = m;
+        }
+    }
+    if (best && best_score >= 0) return best;
+
     for (int fi = 0; fi < g->function_count; fi++) {
         zan_symbol_t *m = g->functions[fi].sym;
         if (!m || m->kind != SYM_METHOD || !m->decl ||
@@ -1360,7 +1395,7 @@ static zan_symbol_t *find_extension_method(zan_irgen_t *g, zan_type_t *recv_ty,
             continue;
         zan_ast_list_t *ps = &m->decl->method_decl.params;
         if (ps->count != argc + 1) continue;
-        zan_ast_node_t *p0 = ps->items[0];
+        zan_ast_node_t *p0 = ps->count > 0 ? ps->items[0] : NULL;
         if (!p0 || p0->kind != AST_PARAM || !p0->param.is_this) continue;
         zan_type_t *pt = zan_binder_resolve_type(g->binder, p0->param.type);
         if (!pt) continue;

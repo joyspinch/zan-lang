@@ -1672,8 +1672,19 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                     rv = boxed;
                     ret_type = g->current_async_ret_type;
                 } else if (type_contains_collection_rc(g, value_type, 0) &&
-                    !expr_yields_owned_rc_value(g, stmt->ret.value, locals))
+                    !expr_yields_owned_rc_value(g, stmt->ret.value, locals)) {
                     emit_collection_value_retain(g, value_type, rv, 0);
+                } else if (value_type &&
+                    (is_rc_managed_type(value_type) ||
+                     value_type->kind == TYPE_OBJECT ||
+                     value_type->kind == TYPE_TYPE_PARAM) &&
+                    !expr_yields_owned_rc_value(g, stmt->ret.value, locals)) {
+                    if (is_rc_managed_type(value_type)) {
+                        emit_rc_retain_for_type(g, value_type, rv);
+                    } else if (LLVMGetTypeKind(LLVMTypeOf(rv)) == LLVMPointerTypeKind) {
+                        emit_arc_retain(g, rv);
+                    }
+                }
                 rv = coerce_async_ret(g, rv);
             }
             if (g->finally_count > 0) {
@@ -1723,6 +1734,12 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                 !expr_yields_owned_rc_value(g, stmt->ret.value, locals) &&
                 !conv_ret) {
                 emit_rc_retain_for_type(g, ret_type, val);
+            } else if (ret_type &&
+                       (ret_type->kind == TYPE_OBJECT || ret_type->kind == TYPE_TYPE_PARAM) &&
+                       LLVMGetTypeKind(LLVMTypeOf(val)) == LLVMPointerTypeKind &&
+                       !expr_yields_owned_rc_value(g, stmt->ret.value, locals) &&
+                       !conv_ret) {
+                emit_arc_retain(g, val);
             } else if (ret_type && ret_type->kind == TYPE_STRUCT &&
                        type_contains_collection_rc(g, ret_type, 0) &&
                        !expr_yields_owned_rc_value(g, stmt->ret.value, locals) &&

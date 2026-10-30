@@ -2708,8 +2708,7 @@ static LLVMValueRef emit_dict_find(zan_irgen_t *g, zan_type_t *dict_type,
 
 static zan_type_t *static_access_inst(zan_irgen_t *g, zan_ast_node_t *obj_expr) {
     if (!obj_expr || !obj_expr->ident.inst_type_ref) return NULL;
-    zan_type_t *t = zan_binder_resolve_type(g->binder, obj_expr->ident.inst_type_ref);
-    if (t && g->cur_inst) t = subst_type_param_deep(g, t, g->cur_inst);
+    zan_type_t *t = resolve_type_ctx(g, obj_expr->ident.inst_type_ref);
     return (t && t->type_arg_count > 0) ? t : NULL;
 }
 

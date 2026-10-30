@@ -1104,6 +1104,11 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                 if (local && local->type && local->type->sym) {
                     zan_symbol_t *type_sym = local->type->sym;
                     zan_symbol_t *method_sym = resolve_overload_typed(g, type_sym, callee->member.name, expr, locals);
+                    zan_compile_trace("call local method: type='%.*s' method='%.*s' owner='%.*s'",
+                        (int)type_sym->name.len, type_sym->name.str,
+                        (int)callee->member.name.len, callee->member.name.str,
+                        method_sym && method_sym->parent ? (int)method_sym->parent->name.len : 0,
+                        method_sym && method_sym->parent ? method_sym->parent->name.str : "");
                     if (method_sym) fill_default_args(g, expr, method_sym);
                     if (method_sym) pack_params_args(g, expr, method_sym, locals);
                     if (method_sym) {
