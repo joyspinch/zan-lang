@@ -76,8 +76,6 @@
             emit_symbols_path = argv[++i];
         } else if (strcmp(argv[i], "--no-gen") == 0) {
             zan_gen_enabled = 0;
-        } else if (strcmp(argv[i], "--gen") == 0) {
-            zan_gen_enabled = 1;
         } else if (strcmp(argv[i], "--quiet") == 0 || strcmp(argv[i], "-q") == 0) {
             quiet = true;
         } else if (strcmp(argv[i], "--gen-meta") == 0 && i + 1 < argc) {
