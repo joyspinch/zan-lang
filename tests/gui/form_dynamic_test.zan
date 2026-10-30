@@ -1,20 +1,21 @@
 // WEB_GUI_ROADMAP P8 用例：设计稿的动态原语（<template data-for> / data-if）
 // 宿主挂模型验证行展开、作用域推送、插拔与双向回写。无头直调同步通道。
+// 设计稿经运行期投影（DesignerHtml.ToJsonDoc + FormBuilder.Build）建树，
+// 宿主仍是 ChildWindow 的模型宿主通道。
 using System;
+using System.IO;
 using System.Json;
+using System.Web;
 using Gui;
 using Gui.Widget;
-
-partial class ZdPanel {
-    void OnInit() {
-    }
-}
 
 class FormDynamicWin : ChildWindow {
 }
 
 class DsnDynProbe {
     static int fails;
+    static FormDynamicWin w;
+    static Control root;
 
     static void Eq(string what, string got, string want) {
         if (got == want) { return; }
@@ -22,29 +23,36 @@ class DsnDynProbe {
         Console.WriteLine("FAIL " + what + ": got '" + got + "' want '" + want + "'");
     }
 
+    static Control Build() {
+        string html = File.ReadAllText("tests/gui/form_dynamic.html");
+        return FormBuilder.Build(JsonValue.ParseLenient(DesignerHtml.ToJsonDoc(html)));
+    }
+
     static void Main() {
         fails = 0;
         // 模板行展开经 App 克隆槽（Gui.Html.Install 注册）：
         // 本用例驱动 data-for 语义，先装声明层。
         Html.Install();
-        ZdPanel p = new ZdPanel();
+        root = Build();
+
+        // 模板声明：kind/template + data-for 属性表。
+        Control rows = root.Find("Rows");
+        if (rows == null) { Console.WriteLine("FAIL template Rows missing"); fails = fails + 1; return; }
+        DsnDynProbe.Eq("tpl kind", rows.Kind(), "template");
+        DsnDynProbe.Eq("tpl for", rows.CssAttr("data-for"), "items");
+
         JsonValue model = JsonValue.Parse(
             "{\"showTitle\":true,\"title\":\"hello\","
             + "\"items\":[{\"name\":\"a\"},{\"name\":\"b\"}]}");
         FormDynamicWin w = new FormDynamicWin();
-        w.SetRoot(p, model);
+        w.SetRoot(root, model);
         w.Wire();
 
-        // 生成通道落点：模板字段 kind/template + data-for 属性表。
-        DsnDynProbe.Eq("tpl kind", p.Rows.Kind(), "template");
-        DsnDynProbe.Eq("tpl for", p.Rows.CssAttr("data-for"), "items");
-
-        // HTML control 根面板：其 body 子项 = 模板 + 2 行 li + Title。
-        Control docRoot = p.children[0];
-        DsnDynProbe.Eq("panel kids", Convert.ToString(docRoot.ChildCount()), "4");
-        Control row0 = docRoot.children[1];
-        Control row1 = docRoot.children[2];
-        Control title = docRoot.children[3];
+        // 模板行展开后根面板子项 = 模板 + 2 行 li + Title。
+        DsnDynProbe.Eq("panel kids", Convert.ToString(root.ChildCount()), "4");
+        Control row0 = root.children[1];
+        Control row1 = root.children[2];
+        Control title = root.children[3];
         DsnDynProbe.Eq("row0 kind", row0.Kind(), "li");
         DsnDynProbe.Eq("row0 name", row0.children[0].GetProp("text"), "a");
         DsnDynProbe.Eq("row1 name", row1.children[0].GetProp("text"), "b");
@@ -63,12 +71,12 @@ class DsnDynProbe {
         model.PathSetValue("items", items2);
         w.SyncFromModel();
         DsnDynProbe.Eq("panel kids after shrink",
-                       Convert.ToString(docRoot.ChildCount()), "3");
+                       Convert.ToString(root.ChildCount()), "3");
 
         // 行内回写：改克隆 span 的文本 → 模型 items[0].name。
-        Control rowq = docRoot.children[1];
+        Control rowq = root.children[1];
         rowq.children[0].SetProp("text", "z");
-        w.SyncChangedNode(p);
+        w.SyncChangedNode(root);
         JsonValue back = model.Get("items");
         JsonValue back0 = back == null ? null : back.At(0);
         JsonValue backn = back0 == null ? null : back0.Get("name");
@@ -77,7 +85,7 @@ class DsnDynProbe {
 
         // 根级回写。
         title.SetProp("value", "changed");
-        w.SyncChangedNode(p);
+        w.SyncChangedNode(root);
         JsonValue mt = model.Get("title");
         DsnDynProbe.Eq("model title", mt == null ? "?" : mt.AsString(""), "changed");
 

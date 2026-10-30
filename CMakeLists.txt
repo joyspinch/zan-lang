@@ -4764,10 +4764,12 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
     COMMAND ${CMAKE_COMMAND}
       -DZANC=$<TARGET_FILE:zanc>
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/form_dynamic_test.zan
-      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/tests/gui/form_dynamic.html;--auto-stdlib${_gui_driver_tail}"
+      "-DZANC_ARGS=--embed;tests/gui/form_dynamic.html;--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_form_dynamic.out
       -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_form_dynamic${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+  set_tests_properties(conformance_gui_form_dynamic PROPERTIES
+    TIMEOUT 120 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
 
   # Runtime HTML document load (--embed fixture + LoadHtmlWith): data-if
   # lands on bindIf and data-for lands in the Element attribute table, so
@@ -4851,10 +4853,12 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
     COMMAND ${CMAKE_COMMAND}
       -DZANC=$<TARGET_FILE:zanc>
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/form_grid_test.zan
-      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/tests/gui/form_grid.html;--auto-stdlib${_gui_driver_tail}"
+      "-DZANC_ARGS=--embed;tests/gui/form_grid.html;--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_form_grid.out
       -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_form_grid${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+  set_tests_properties(conformance_gui_form_grid PROPERTIES
+    TIMEOUT 120 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
 
   # Navigation layer: route table + Tabs-as-outlet (lazy build, keepAlive,
   # ephemeral destroy-on-leave) + window back-stack bookkeeping, headless.
