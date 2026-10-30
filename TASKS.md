@@ -37,12 +37,4 @@
   二分。关联：json_scoped_scratch 的 collect 路径 locals=NULL 段错误已在本
   轮修复（infer_method_tp_bindings 空守卫），勿混淆两个崩溃。
 
-### B-ID41 空接口继承（`interface IA : IB {}`）运行时分派失败
-
-- [ ] 现象：`interface IOrmRows : IRows {}` 这类空继承别名接口，实现类
-  实现 IRows 后，经 IOrmRows 接口调用报 "interface dispatch has no
-  implementation"——itable 构建只挂直接声明的接口，未沿继承链展开。
-  ORM 里已绕开（全部直接用 IRows，别名壳已删），语言级缺陷仍在：任何
-  用户代码写空继承接口都会踩。修法方向：itable 注册时沿 base interface
-  链展开登记，加 conformance 用例锁行为。
 
