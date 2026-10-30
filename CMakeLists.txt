@@ -1254,16 +1254,17 @@ if(ZAN_PYTHON_EXE)
   set_tests_properties(csharp_compat_oracle PROPERTIES TIMEOUT 300)
 endif()
 
-# A design doc node must name a real Zan Control class. Invalid kinds fail at
-# formgen time instead of silently becoming a Panel or Label.
-add_test(NAME diag_invalid_design_kind
+# Feeding an .html design doc to the compiler is rejected outright: the
+# compile-time HTML channel is gone — windows are built with Gui widgets
+# and load markup at runtime via Gui.App.LoadHtml.
+add_test(NAME diag_html_input_rejected
   COMMAND ${CMAKE_COMMAND}
     -DZANC=$<TARGET_FILE:zanc>
-    -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/invalid_design_kind.html
-    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/diag_invalid_design_kind${_exe_ext}
-    "-DEXPECT_REGEX=invalid_design_kind\.html: design field 0 requires a valid Zan Control kind"
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/html_input_rejected.html
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/diag_html_input_rejected${_exe_ext}
+    "-DEXPECT_REGEX=html_input_rejected\.html.: the compile-time HTML channel has been removed"
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
-set_tests_properties(diag_invalid_design_kind PROPERTIES TIMEOUT 60)
+set_tests_properties(diag_html_input_rejected PROPERTIES TIMEOUT 60)
 
 # A class that declares constructors has no implicit parameterless one, so
 # `new T()` on it has nothing to run and irgen would hand back a zero-filled
@@ -2253,18 +2254,6 @@ add_test(NAME diag_decimal_literal_narrowing
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_decimal_literal_narrowing PROPERTIES TIMEOUT 60)
 
-# A `"role": "control"` .html design doc is an embeddable Control, not a window: it has
-# no Main/Show, so naming one as the project entry has to fail at formgen time
-# instead of linking a program with no entry point.
-add_test(NAME diag_control_design_entry
-  COMMAND ${CMAKE_COMMAND}
-    -DZANC=$<TARGET_FILE:zanc>
-    -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/control_design_entry.html
-    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/diag_control_design_entry${_exe_ext}
-    "-DEXPECT_REGEX=control_design_entry\.html: a design document with .role.: .control. cannot be the project entry"
-    -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
-set_tests_properties(diag_control_design_entry PROPERTIES TIMEOUT 60)
-
 # A member name denotes storage (field/property) or code (method), never both:
 # `Class.Name` in a value context reads the slot, so a same-named method is
 # unreachable and a delegate built from it calls a data pointer.
@@ -2733,12 +2722,6 @@ foreach(_src ${_conf_srcs})
     # GUI 驱动参数要一起给（tail 形式：空 list 元素会被 zanc 当成空参数）。
     set(_extra_args
       "--embed;${CMAKE_SOURCE_DIR}/tests/conformance/game_ckit_slice_assets=ckitslicefx${_gui_driver_tail}")
-  elseif(_name STREQUAL "genform_click_test")
-    # GenForm declarative column click events: columns[i].click must desugar
-    # into one HitField-filtered CellClick binding; columns without click stay
-    # binding-free. The case resolves the stdlib on its own, so --auto-stdlib
-    # comes next to the GUI driver tail.
-    set(_extra_args "--auto-stdlib${_gui_driver_tail}")
   elseif(_name STREQUAL "arc_leak_site_label")
     # Pins leak-report site attribution (A64b): the case keeps one object
     # alive on purpose and asserts the report names THAT site's own
