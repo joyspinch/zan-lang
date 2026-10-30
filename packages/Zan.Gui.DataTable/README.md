@@ -46,10 +46,12 @@
 - **`DataTableFillState`**：Excel 式选区填充柄拖拽状态与源/目标矩形跟踪。
 
 ### 4. 深度 Visual Tree 互嵌与无冲突作用域
+- **原生 Visual Tree 控件节点支持**：除强类型 `DataGrid<T>` 外，新增非泛型原生控件包装器 `DataTableControl`，允许将任意动态列与数据源作为一等公民挂入 Visual Tree（自动完成子控件度量与拓扑对接）。
 - 主从明细通过 `ProvideControl` 与父级 Visual Tree 拓扑无缝缝合，支持事件双向冒泡（Bubbling）与隧道拦截（Tunneling）。
 - 控件池与动态项全面依托 `WidgetId.Push(name/index)` 作用域栈，彻底消灭硬编码 ID 魔数。
 
 ### 5. 高阶企业级功能增强
+- **帧级样式快照缓存（DataTableStyleSnapshot）**：帧开始时统一解析并缓存当前主题全部所需 `StyleBox`，消除虚拟滚动行循环与各管道子阶段中重复触发的样式表字典查找。
 - **列宽实时指引线与像素指示胶囊**：拖拽列宽调整手柄时，沿网格全高绘制实时对齐引导线，并在表头浮动显示带有当前像素宽度的半透明指示胶囊（对标 ag-Grid & Excel）。
 - **TreeGrid 递归 Rollup 汇总引擎**：`TreeAdapter` 与 `IdTreeAdapter` 开箱支持层级递归汇总计算（`Rollup` / `RollupSum` / `RollupAvg` / `RollupMin` / `RollupMax` / `RollupCount`），自动将后代叶子节点的度量值向上汇聚至父级分组节点。
 - **开箱即用富媒体单元格预设**：`WidgetComps` 与 `DataTable` 统一暴露常用高质感图元原语（`PaintTagPill` 状态胶囊标签、`PaintUserPill` 头像缩写与用户卡片、`PaintMultiTags` 自动测宽与 `+N` 溢出裁剪标签组）。
