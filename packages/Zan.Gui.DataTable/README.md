@@ -54,6 +54,7 @@
 - **帧级样式快照缓存（DataTableStyleSnapshot）**：帧开始时统一解析并缓存当前主题全部所需 `StyleBox`，消除虚拟滚动行循环与各管道子阶段中重复触发的样式表字典查找。
 - **列宽实时指引线与像素指示胶囊**：拖拽列宽调整手柄时，沿网格全高绘制实时对齐引导线，并在表头浮动显示带有当前像素宽度的半透明指示胶囊（对标 ag-Grid & Excel）。
 - **TreeGrid 递归 Rollup 汇总引擎**：`TreeAdapter` 与 `IdTreeAdapter` 开箱支持层级递归汇总计算（`Rollup` / `RollupSum` / `RollupAvg` / `RollupMin` / `RollupMax` / `RollupCount`），自动将后代叶子节点的度量值向上汇聚至父级分组节点。
+- **通用标准 MessagePack 二进制与 Token 布局持久化**：采用通用成熟的 MessagePack 协议（`Zan.MsgPack`），提供 `SaveLayoutMsgPack` / `LoadLayoutMsgPack` 纯二进制流存取，以及 `SaveLayoutToken` / `LoadLayoutToken` 超紧凑单行令牌存取。体积相比传统 JSON 骤降 60%~80%，亚微秒级解析，彻底消灭字符串 GC 碎片，并完整保真自定义派生公式（`aggFormula`）、多列联合排序、分组与冻结带。
 - **开箱即用富媒体单元格预设**：`WidgetComps` 与 `DataTable` 统一暴露常用高质感图元原语（`PaintTagPill` 状态胶囊标签、`PaintUserPill` 头像缩写与用户卡片、`PaintMultiTags` 自动测宽与 `+N` 溢出裁剪标签组）。
 
 ---

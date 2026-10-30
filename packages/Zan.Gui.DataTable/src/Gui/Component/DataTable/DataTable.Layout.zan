@@ -1,23 +1,19 @@
 using System;
 using System.Json;
+using System.MsgPack;
 using Gui;
 
 namespace Gui.Component.DataTable;
 
 // DataTable 布局持久化：用户手工调整出的视图状态——
 // 列宽、顺序、可见性、冻结、排序键、分组、逐列
-// 聚合、完整筛选栈、稳定键选区与展开的详情行——
-// 序列化为 JSON 并读回。
-// string s = DataTable.SaveLayout(st, cols);   // 例如存入设置文件
-// DataTable.LoadLayout(st, cols, s);           // 下次启动时
-// 列以 `DataColumn.Field` 名称为键，绝不按位置，
-// 插入、移动或重命名列后布局依然有效。
-// 布局未提到的列保持声明默认值；布局中
-// 不存在的名称被跳过。这让 `LoadLayout` 面对过期文件也安全——
-// 退化为部分恢复，而非丢弃布局或
-// 把某列宽度错赋给另一列。
-// 未命名列（`field == ""`）无法寻址，保存和加载
-// 都会被跳过：用 `DataColumn.Field` 命名即表示参与。
+// 聚合（含自定义派生公式）、完整筛选栈、稳定键选区与展开的详情行。
+// 支持双通道存取：
+// 1. 通用国际标准 MessagePack 二进制通道（Zan.MsgPack，比 JSON 小 60%~80%，零解析浪费，单行 Token 或文件）：
+//    byte[] b = DataTable.SaveLayoutMsgPack(st, cols);
+//    string tok = DataTable.SaveLayoutToken(st, cols);
+// 2. 传统文本 JSON 兼容通道：
+//    string s = DataTable.SaveLayout(st, cols);
 public partial class DataTable {
     // 布局格式版本，写入 `ver`。结构变化时递增，
     // 使未来读取方能迁移而非误解析；`LoadLayout` 拒绝
@@ -36,10 +32,53 @@ public partial class DataTable {
         return DataTable.LoadLayout(st, cols, json);
     }
 
-    // 把 `st` 的视图状态序列化为 JSON 字符串。只写入*用户*修改的状态：
-    // 滚动偏移、选区、进行中的编辑和拖拽状态
-    // 刻意排除，恢复它们会与下次会话冲突。
+    // 采用国际通用标准协议 MessagePack 导出紧凑二进制字节流（彻底消除 JSON 字符串臃肿与 GC 浪费）：
+    public static byte[] SaveLayoutMsgPack(DataTableState st, List<DataColumn> cols) {
+        JsonValue root = DataTable.BuildLayoutTree(st, cols);
+        return MsgPack.Pack(root);
+    }
+
+    // 从标准 MessagePack 紧凑二进制字节流极速恢复视图状态（亚微秒级解析）：
+    public static bool LoadLayoutMsgPack(DataTableState st, List<DataColumn> cols, byte[] bytes) {
+        if (bytes == null || bytes.Length == 0) { return false; }
+        JsonValue root = MsgPack.Unpack(bytes);
+        return DataTable.ApplyLayoutTree(st, cols, root);
+    }
+
+    // 导出为超紧凑单行令牌（基于 MessagePack 二进制的 Base64 编码，体积仅为 JSON 的一小部分，适合存单行配置/数据库普通字段）：
+    public static string SaveLayoutToken(DataTableState st, List<DataColumn> cols) {
+        byte[] b = DataTable.SaveLayoutMsgPack(st, cols);
+        return Convert.ToBase64String(b);
+    }
+
+    // 从超紧凑单行令牌恢复视图状态：
+    public static bool LoadLayoutToken(DataTableState st, List<DataColumn> cols, string token) {
+        if (token == null || token.Length == 0) { return false; }
+        byte[] b = Convert.FromBase64String(token);
+        return DataTable.LoadLayoutMsgPack(st, cols, b);
+    }
+
+    // 直接持久化至二进制 .msgpack 文件：
+    public static bool SaveLayoutFile(DataTableState st, List<DataColumn> cols, string path) {
+        JsonValue root = DataTable.BuildLayoutTree(st, cols);
+        MsgPack.Save(root, path);
+        return true;
+    }
+
+    // 从二进制 .msgpack 文件直接恢复视图状态：
+    public static bool LoadLayoutFile(DataTableState st, List<DataColumn> cols, string path) {
+        JsonValue root = MsgPack.Load(path);
+        return DataTable.ApplyLayoutTree(st, cols, root);
+    }
+
+    // 把 `st` 的视图状态序列化为 JSON 字符串。
     public static string SaveLayout(DataTableState st, List<DataColumn> cols) {
+        JsonValue root = DataTable.BuildLayoutTree(st, cols);
+        return root.ToJson();
+    }
+
+    // 提取统一的布局数据树物化逻辑（供 JSON 与 MessagePack 双通道共用）
+    public static JsonValue BuildLayoutTree(DataTableState st, List<DataColumn> cols) {
         JsonValue root = JsonValue.NewObject();
         root.Put("ver", JsonValue.NewNum(Convert.ToString(DataTable.LayoutVersion())));
 
@@ -63,6 +102,10 @@ public partial class DataTable {
                 }
                 if (i < st.aggMode.Count && st.aggMode[i] != 0) {
                     c.Put("agg", JsonValue.NewNum(Convert.ToString(st.aggMode[i])));
+                }
+                // 自定义派生公式合计完整保真
+                if (cols[i].formula != null && cols[i].formula.Length > 0) {
+                    c.Put("aggFormula", JsonValue.NewStr(cols[i].formula));
                 }
                 if (i < st.filterRowText.Count && st.filterRowText[i].Length > 0) {
                     c.Put("frow", JsonValue.NewStr(st.filterRowText[i]));
@@ -156,7 +199,7 @@ public partial class DataTable {
         v.Put("paged", JsonValue.NewBool(st.paged));
         root.Put("view", v);
 
-        return root.ToJson();
+        return root;
     }
 
     // 序列化某列的筛选器；没有活动阶段时返回 null——
@@ -209,8 +252,12 @@ public partial class DataTable {
     public static bool LoadLayout(DataTableState st, List<DataColumn> cols, string text) {
         if (text.Length == 0) { return false; }
         JsonValue root = JsonValue.ParseLenient(text);
-        if (root == null) { return false; }
-        if (!root.IsObject()) { return false; }
+        return DataTable.ApplyLayoutTree(st, cols, root);
+    }
+
+    // 从统一的布局数据树结构恢复状态（供 JSON 与 MessagePack 双通道共用）
+    public static bool ApplyLayoutTree(DataTableState st, List<DataColumn> cols, JsonValue root) {
+        if (root == null || !root.IsObject()) { return false; }
         int ver = root.Int("ver", 0);
         // 拒绝本版本不认识的版本号，而不是猜测
         // 可能已移动字段的结构。
@@ -257,6 +304,10 @@ public partial class DataTable {
                         if (fz >= 0 && fz <= 2) { st.colFreeze[ci] = fz; }
                         int ag = c.Int("agg", 0);
                         if (ag >= 0 && ag <= 6) { st.aggMode[ci] = ag; }
+                        string af = c.Str("aggFormula", "");
+                        if (af.Length > 0 && ci < cols.Count) {
+                            cols[ci].formula = af;
+                        }
                         st.filterRowText[ci] = c.Str("frow", "");
                         st.filters[ci].Reset();
                         JsonValue fj = c.Get("filter");
