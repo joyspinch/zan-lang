@@ -4526,13 +4526,13 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_form_control${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
-  # Designer preview and generated HTML share pixels and control rects across
-  # 100%-300% target DPI, independently of the editor display and view zoom.
+  # Designer preview and the runtime HTML load share pixels and control rects
+  # across 100%-300% target DPI, independently of the editor display and view zoom.
   add_test(NAME conformance_gui_designer_wysiwyg
     COMMAND ${CMAKE_COMMAND}
       -DZANC=$<TARGET_FILE:zanc>
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/designer_wysiwyg_test.zan
-      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/tests/gui/designer_wysiwyg.html;--auto-stdlib${_gui_driver_tail}"
+      "-DZANC_ARGS=--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_designer_wysiwyg.out
       -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_designer_wysiwyg${_exe_ext}
       -DSTDLIB_STAMP=${_stdlib_stamp}
@@ -4620,12 +4620,12 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
   # Float placement band (framework level): a float's origin clears the
   # container's topmost docked band (title bar / tool strip), so fy=0 no
   # longer lands on the title bar; containers without a band are unchanged,
-  # and the designer preview and the generated runtime agree.
+  # and the designer preview and the runtime HTML load agree.
   add_test(NAME conformance_gui_designer_float_band
     COMMAND ${CMAKE_COMMAND}
       -DZANC=$<TARGET_FILE:zanc>
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/designer_float_band_test.zan
-      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/tests/gui/designer_float_band.html;--auto-stdlib${_gui_driver_tail}"
+      "-DZANC_ARGS=--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_designer_float_band.out
       -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_designer_float_band${_exe_ext}
       -DSTDLIB_STAMP=${_stdlib_stamp}
