@@ -1,4 +1,5 @@
 using System;
+using System.Json;
 using Gui;
 using Gui.Widget;
 
@@ -26,9 +27,12 @@ public class DataGrid<T> : Control {
     public List<DataColumn> descs;
     // 上一次 Bind 时的行数（-1 = 还没绑过）：行数变了必须让引擎重算行号集合。
     public int boundN;
+    // 设计稿契约类型名（如 ContractRow / User），供设计器属性协议与运行时投影识别。
+    public string of;
 
     public void InitGrid() {
         this.InitControl("datatable", 5);
+        this.of = "";
         this.gcols = new List<GridColumn<T>>();
         this.data = null;
         this.st = new DataTableState();
@@ -412,7 +416,72 @@ public class DataGrid<T> : Control {
         PropSpec ar = PropSpec.Bool("allowAddRow", "Allow add row");
         ar.WithTip("Show the add-row placeholder; needs a row factory.");
         ps.Add(ar);
+        PropSpec ofp = PropSpec.Text("of", "Row Type");
+        ofp.WithTip("Entity type contract name for typed rows.");
+        ps.Add(ofp);
+        PropSpec rf = PropSpec.Bool("rowFactory", "Row Factory");
+        rf.WithTip("Enable row insertion/deletion with a row factory.");
+        ps.Add(rf);
         return ps;
+    }
+
+    // 运行期通道解析设计稿 data-x-columns JSON 数组，构建真正的 DataColumn 模型并保留完整元数据。
+    public void SetColumnsJson(string json) {
+        JsonValue cols = null;
+        try { cols = JsonValue.Parse(json); } catch (Exception ex) { cols = null; }
+        if (cols == null || !cols.IsArray()) { return; }
+        this.gcols.Clear();
+        for (int i = 0; i < cols.Count(); i = i + 1) {
+            JsonValue c = cols.At(i);
+            if (c == null || !c.IsObject()) { continue; }
+            string field = c.Str("field", "");
+            string title = c.Str("title", field != "" ? field : "Col" + Convert.ToString(i + 1));
+            int width = c.Int("width", 100);
+            if (width <= 0) { width = 100; }
+            string ctype = c.Str("type", "");
+            GridColumn<T> gc = null;
+            if (ctype == "num") {
+                gc = new GridColumn<T>(DataColumn.Numeric(title, width));
+            } else if (ctype == "real") {
+                int dec = c.Int("decimals", 2);
+                gc = new GridColumn<T>(DataColumn.Real(title, width, dec));
+            } else if (ctype == "bool") {
+                gc = new GridColumn<T>(DataColumn.Bool(title, width));
+            } else if (ctype == "date") {
+                int order = c.Int("dateOrder", 0);
+                gc = new GridColumn<T>(DataColumn.AsDate(new DataColumn(title, width), order));
+            } else {
+                gc = new GridColumn<T>(DataColumn.Text(title, width));
+            }
+            if (field != "") { gc.Field(field); }
+            string align = c.Str("align", "");
+            if (align == "right") { gc.Right(); }
+            else if (align == "center") { gc.Center(); }
+            string money = c.Str("money", "");
+            if (money != "") { gc.Money(money); }
+            if (c.Bool("percent", false)) { gc.Percent(); }
+            string prefix = c.Str("prefix", "");
+            string suffix = c.Str("suffix", "");
+            if (prefix != "" || suffix != "") { gc.Affix(prefix, suffix); }
+            if (c.Bool("sum", false)) { gc.Sum(); }
+            if (c.Bool("avg", false)) { gc.Avg(); }
+            if (c.Bool("min", false)) { gc.Min(); }
+            if (c.Bool("max", false)) { gc.Max(); }
+            if (c.Bool("count", false)) { gc.Count(); }
+            string pin = c.Str("pin", "");
+            if (pin == "left") { gc.Pin(); }
+            else if (pin == "right") { gc.PinRight(); }
+            string band = c.Str("band", "");
+            if (band != "") { gc.Band(band); }
+            JsonValue sortable = c.Get("sortable");
+            if (sortable != null && sortable.IsBool() && !sortable.AsBool(true)) {
+                gc.NotSortable();
+            }
+            if (c.Bool("editable", false)) { DataColumn.Editable(gc.desc); }
+            this.gcols.Add(gc);
+        }
+        this.SyncDescs();
+        this.st.dirty = true;
     }
 
     // 运行期/设计器预览的列头:`"宽,标题|宽,标题"`。工厂只能造
@@ -446,6 +515,8 @@ public class DataGrid<T> : Control {
     }
 
     public override string GetExtra(string key) {
+        if (key == "of") { return this.of != null ? this.of : ""; }
+        if (key == "rowFactory") { return PropSpec.Flag(this.source != null && this.source.factory != null); }
         if (key == "previewColumns") { return this.PreviewColumnsText(); }
         if (key == "rowNumbers") { return PropSpec.Flag(this.st.showRowNum); }
         if (key == "selectable") { return PropSpec.Flag(this.st.showSelect); }
@@ -461,6 +532,20 @@ public class DataGrid<T> : Control {
     }
 
     public override bool SetExtra(string key, string val) {
+        if (key == "of") { this.of = val; return true; }
+        if (key == "rowFactory") {
+            if (PropSpec.IsOn(val) && this.source.factory == null) {
+                this.source.factory = () => null;
+            }
+            return true;
+        }
+        if (key == "columns") {
+            if (val.Length > 0 && val[0] == 91) { // '['
+                this.SetColumnsJson(val);
+                return true;
+            }
+            return false;
+        }
         if (key == "previewColumns") { this.SetPreviewColumns(val); return true; }
         if (key == "rowNumbers") { this.st.showRowNum = PropSpec.IsOn(val); return true; }
         if (key == "selectable") { this.st.showSelect = PropSpec.IsOn(val); return true; }

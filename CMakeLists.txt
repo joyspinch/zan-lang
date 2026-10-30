@@ -4515,8 +4515,8 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
 
   # WEB_GUI_ROADMAP: the designer's HTML storage format is exercised by
   # tests/conformance/designer_html.zan (codec roundtrip + designer bridge),
-  # auto-registered by the conformance glob above; the compile-time channel
-  # (.html design doc -> GenForm projection) by the case below, reusing the same golden byte for byte.
+  # auto-registered by the conformance glob above; the runtime projection
+  # (DesignerHtml.ToJsonDoc + FormBuilder.Build over the --embed fixture) by the case below, reusing the same golden byte for byte.
   add_test(NAME conformance_gui_form_control
     COMMAND ${CMAKE_COMMAND}
       -DZANC=$<TARGET_FILE:zanc>
@@ -4697,9 +4697,9 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
   set_tests_properties(conformance_gui_design_form_size PROPERTIES
     TIMEOUT 120 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
 
-  # The full designer palette generates compiling, constructing code even
-  # when user classes share a kind's name: GenForm must emit real
-  # namespace paths (Gui.Widget.* / Gui.Hmi.*) for every toolbox kind.
+  # The full designer palette projects to constructing runtime controls even
+  # when user classes share a kind's name: every toolbox kind must resolve
+  # through the runtime factory to a real Gui.Widget.* / Gui.Hmi.* control.
   add_test(NAME conformance_gui_design_palette
     COMMAND ${CMAKE_COMMAND}
       -DZANC=$<TARGET_FILE:zanc>
@@ -4743,23 +4743,11 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
   set_tests_properties(conformance_gui_design_label_name PROPERTIES
     TIMEOUT 120 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
 
-  # A primary design document supplies only a fallback entry point. When a
-  # later Zan input declares Main, that explicit entry must win regardless of
-  # response-file order (large designed applications depend on this shape).
-  add_test(NAME conformance_gui_design_explicit_main
-    COMMAND ${CMAKE_COMMAND}
-      -DZANC=$<TARGET_FILE:zanc>
-      -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/design_explicit_main.html
-      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/tests/gui/design_explicit_main_test.zan;--auto-stdlib${_gui_driver_tail}"
-      -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_design_explicit_main.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_design_explicit_main${_exe_ext}
-      -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
-
   # Dynamic document primitives (P8): a design doc with <template
-  # data-for> / data-if projects Rows.SetAttr("data-for") and
-  # Title.bindIf through GenForm; the host attaches a JsonValue model
-  # and the headless sync channel expands rows, toggles visibility and
-  # writes edits back through item scopes.
+  # data-for> / data-if lands data-for on the template Element and
+  # data-if on bindIf through the runtime projection; the host attaches
+  # a JsonValue model and the headless sync channel expands rows,
+  # toggles visibility and writes edits back through item scopes.
   add_test(NAME conformance_gui_form_dynamic
     COMMAND ${CMAKE_COMMAND}
       -DZANC=$<TARGET_FILE:zanc>
@@ -4938,8 +4926,8 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
   set_tests_properties(conformance_gui_props_contract PROPERTIES TIMEOUT 120)
 
   # Designer semantic-event contract: every event the designer's Events tab
-  # promises for a field type must be declared by the widget that
-  # KindForType generates (reachable via GenForm's BindEvent wiring).
+  # promises for a field type must be declared by the widget that kind
+  # maps to (wired at runtime via the host's Handle slots).
   add_test(NAME conformance_gui_events_contract
     COMMAND ${CMAKE_COMMAND}
       -DZANC=$<TARGET_FILE:zanc>

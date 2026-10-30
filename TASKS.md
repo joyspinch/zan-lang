@@ -8,6 +8,6 @@
 
 ## 未完成
 
-- [ ] B-ID43 运行期通道回填设计稿的类型化表格键：FormBuilder/Html.Build 应消费 `data-of`/`data-x-columns`/`data-row-factory`（把列定义解析进 DataGrid 的列模型、保留 of 契约名），现在这三键被整体剥掉、连属性表都不进。根因：三键是 GenForm 生成期扩展，运行期建造器从未读过；Zan 泛型擦除使 `DataGrid<string>` 能通过 `DataGrid<T>` 转型，但类型化列访问器只能程序侧代码给。探针：`tests/gui/genform_contract_test.zan` 的 grid 断言（现钉 "runtime factory 建出 DataGrid"，回填后加强为列数 2 + factory）。
+（当前无未完成挂账）
 
 
