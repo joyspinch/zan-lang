@@ -3993,19 +3993,31 @@ partial class Ngen {
             Node p = m.kids[pi];
             if (p.kind == AK.Param()) {
                 if (tgt86 == 1) {
-                    // SysV: args 0-5 arrive in the mapped registers; args
-                    // 6+ sit on the stack above the return address at
-                    // [rbp+16+8k] -- the exact mirror of the caller shim's
-                    // [rsp+8k] staging (batch 33: any arity, no cap)
-                    if (argReg >= 6) {
-                        XopRMem(0x8B, 10, 5, 16 + 8 * (argReg - 6));
-                        XSetV(argReg, 10);
-                        // 注意 StoreLocal 的源是 v 号不是寄存器号——arm64 的
-                        // v10 就是 x10,x86 的 v10 是泼溅槽(陈旧内容);
-                        // 值已经在 argReg 自己的家,从家入槽
-                        StoreLocal(argReg, argReg);
+                    if (coffTarget == 1) {
+                        // Windows x64: args 0-3 in registers rcx, rdx, r8, r9.
+                        // Args 4+ sit above return address (8) and shadow space (32) at [rbp + 48 + 8*k].
+                        if (argReg >= 4) {
+                            XopRMem(0x8B, 10, 5, 48 + 8 * (argReg - 4));
+                            XSetV(argReg, 10);
+                            StoreLocal(argReg, argReg);
+                        } else {
+                            StoreLocal(argReg, argReg);
+                        }
                     } else {
-                        StoreLocal(argReg, argReg);
+                        // SysV: args 0-5 arrive in the mapped registers; args
+                        // 6+ sit on the stack above the return address at
+                        // [rbp+16+8k] -- the exact mirror of the caller shim's
+                        // [rsp+8k] staging (batch 33: any arity, no cap)
+                        if (argReg >= 6) {
+                            XopRMem(0x8B, 10, 5, 16 + 8 * (argReg - 6));
+                            XSetV(argReg, 10);
+                            // 注意 StoreLocal 的源是 v 号不是寄存器号——arm64 的
+                            // v10 就是 x10,x86 的 v10 是泼溅槽(陈旧内容);
+                            // 值已经在 argReg 自己的家,从家入槽
+                            StoreLocal(argReg, argReg);
+                        } else {
+                            StoreLocal(argReg, argReg);
+                        }
                     }
                 } else {
                     StoreLocal(argReg, argReg);
@@ -13316,14 +13328,27 @@ partial class Ngen {
                     // stage stack args around the raw indirect call
                     // (batch 33: the XCallSeq shim's area, hand-rolled)
                     int nst = pushed > 5 ? pushed - 5 : 0;
-                    int area = 16 * ((nst + 1) / 2);
-                    if (area < 16) { area = 16; }
-                    XSubRsp(area);
-                    int k3 = 0;
-                    while (k3 < nst) {
-                        XGetV(XArgVOf(6 + k3), 10);
-                        XopMemR(0x89, 10, 4, 8 * k3);    // mov [rsp+8k], r10
-                        k3 = k3 + 1;
+                    int area = 0;
+                    if (coffTarget == 1) {
+                        area = 32 + 8 * nst;
+                        area = 16 * ((area + 15) / 16);
+                        XSubRsp(area);
+                        int k3 = 0;
+                        while (k3 < nst) {
+                            XGetV(XArgVOf(6 + k3), 10);
+                            XopMemR(0x89, 10, 4, 32 + 8 * k3);    // mov [rsp+32+8k], r10
+                            k3 = k3 + 1;
+                        }
+                    } else {
+                        area = 16 * ((nst + 1) / 2);
+                        if (area < 16) { area = 16; }
+                        XSubRsp(area);
+                        int k3 = 0;
+                        while (k3 < nst) {
+                            XGetV(XArgVOf(6 + k3), 10);
+                            XopMemR(0x89, 10, 4, 8 * k3);         // mov [rsp+8k], r10
+                            k3 = k3 + 1;
+                        }
                     }
                     X2(0xFF, 0xD0);                      // call rax (v9 rides in rax)
                     XAddRsp(area);

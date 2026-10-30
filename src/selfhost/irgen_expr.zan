@@ -2978,6 +2978,8 @@ partial class Irgen {
 
     // is class `sub` equal to or derived from `baseName`?
     bool IsSubclassName(string sub, string baseName) {
+        if (sub == baseName) { return true; }
+        if (binder.IsAssignableFrom(baseName, sub)) { return true; }
         Node c = binder.FindType(sub);
         while (c != null) {
             if (c.sval == baseName) { return true; }
@@ -6940,7 +6942,7 @@ partial class Irgen {
                     if (ccls != null && FindMethodUp(ccls, mname) != null) {
                         ExprVal r = FromSlot(recv.op, ct);
                         if (HasMod(ccls, MOD.Iface())) {
-                            return EmitVirtualCall(r, ccls, mname, FindMethodUp(ccls, mname), e);
+                            return EmitInterfaceCall(r, ccls, mname, FindMethodUp(ccls, mname), e);
                         }
                         return EmitInstanceCall(r, ct.sval, mname, e);
                     }
@@ -8197,6 +8199,9 @@ partial class Irgen {
     ExprVal EmitInstanceCallAs(ExprVal recv, string clsName, string name, Node e, bool direct) {
         Node cls = binder.FindType(clsName);
         Node m = ResolveMethodUp(cls, name, e, false);
+        if (!direct && m != null && IsPolyClass(cls) && HasMod(cls, MOD.Iface())) {
+            return EmitInterfaceCall(recv, cls, name, m, e);
+        }
         if (!direct && m != null && IsPolyClass(cls) && VSlotIndexM(cls, m) >= 0) {
             return EmitVirtualCall(recv, cls, name, m, e);
         }
@@ -8343,6 +8348,181 @@ partial class Irgen {
         }
         ExprVal recv = new ExprVal(thisOp, MkType(bcls.sval));
         return EmitInstanceCallAs(recv, bcls.sval, name, e, true);
+    }
+
+    ExprVal EmitInterfaceCall(ExprVal recv, Node ifc, string name, Node m, Node e) {
+        string ifcName = ifc.sval;
+        string declCls = DeclOwnerOf(ifc, m);
+        string rt = MapTypeDecl(m.type, declCls);
+        bool isAsyncCall = IsAsync(m);
+        if (isAsyncCall) { rt = "i8*"; }
+        bool isVoid = (rt == "void");
+
+        // 1. Evaluate arguments once into temporaries before branching.
+        List<string> argTypes = new List<string>();
+        List<string> argVals = new List<string>();
+        List<Node> aargs = OrderArgs(m, e);
+        int i = 0;
+        while (i < aargs.Count) {
+            Node pty = ParamTypeNode(m, i);
+            if (IsRefParam(m, i) && aargs[i] != null && aargs[i].kind == AK.OutArg()) {
+                string addr;
+                if (aargs[i].type != null) { addr = NewOutLocal(aargs[i]); }
+                else { addr = RefPlacePtr(aargs[i].a, pty); }
+                argTypes.Add(MapTypeDecl(pty, declCls) + "*");
+                argVals.Add(addr);
+                i = i + 1;
+                continue;
+            }
+            ExprVal av = GenArgExpr(aargs[i], pty);
+            bool rawArg = m != null && HasMod(m, MOD.Extern());
+            argTypes.Add(MapTypeDecl(pty, declCls));
+            argVals.Add(CallArg(av, pty, rawArg));
+            i = i + 1;
+        }
+
+        // 2. Prepare raw pointer to receiver object (which has vtable at offset 0).
+        string recvRaw = NT();
+        string rty = MapType(recv.ty);
+        if (rty == "i8*") {
+            recvRaw = recv.op;
+        } else {
+            L("  " + recvRaw + " = bitcast " + rty + " " + recv.op + " to i8*");
+        }
+
+        // 3. Find all candidate concrete classes implementing this interface.
+        List<Node> cands = new List<Node>();
+        List<Node> candMeths = new List<Node>();
+        List<string> candImpls = new List<string>();
+        string tags = ParamTags(m);
+        int ti = 0;
+        while (ti < binder.types.Count) {
+            Node c = binder.types[ti];
+            bool isCls = (c.kind == AK.ClassDecl() || c.kind == AK.StructDecl());
+            if (isCls && !HasMod(c, MOD.Abstract()) && !HasMod(c, MOD.Iface())) {
+                if (binder.IsAssignableFrom(ifcName, c.sval)) {
+                    string impl = FindMethodImplCls(c, name, tags);
+                    if (impl == "") { impl = FindMethodImplClsName(c, name); }
+                    if (impl == "") { impl = c.sval; }
+                    Node im = FindMethodImplNode(c, name, tags);
+                    if (im != null && !IsAbstract(im)) {
+                        cands.Add(c);
+                        candMeths.Add(im);
+                        candImpls.Add(impl);
+                    }
+                }
+            }
+            ti = ti + 1;
+        }
+
+        if (cands.Count == 0) {
+            if (!ExternSeen("abort")) { externDecls.Add("abort"); H("declare void @abort()"); }
+            L("  call void @abort()");
+            if (isVoid) { return new ExprVal("0", MkType("void")); }
+            string dummyVal = rt == "i8*" ? "null" : (rt == "double" ? "0.0" : "0");
+            AddTemp(dummyVal, m.type);
+            return new ExprVal(dummyVal, m.type);
+        }
+
+        // Single candidate devirtualization: if only 1 concrete class implements this interface,
+        // directly invoke that implementation without runtime tag comparison overhead.
+        if (cands.Count == 1) {
+            Node candCls = cands[0];
+            Node candMeth = candMeths[0];
+            string impl = candImpls[0];
+            string thisPtr = NT();
+            L("  " + thisPtr + " = bitcast i8* " + recvRaw + " to %" + impl + "*");
+            string callArgs = "%" + impl + "* " + thisPtr;
+            int ai = 0;
+            while (ai < argVals.Count) {
+                callArgs = callArgs + ", " + argTypes[ai] + " " + argVals[ai];
+                ai = ai + 1;
+            }
+            if (isVoid) {
+                L("  call void @" + MethodSym(impl, candMeth) + "(" + callArgs + ")");
+                return new ExprVal("0", MkType("void"));
+            }
+            string callRes = NT();
+            L("  " + callRes + " = call " + rt + " @" + MethodSym(impl, candMeth) + "(" + callArgs + ")");
+            if (isAsyncCall) {
+                Node tt = MkType("__task"); tt.a = m.type;
+                return AsyncFrame(callRes, tt);
+            }
+            if (IsErasedTypeDecl(m.type, declCls)) { return FromSlot(callRes, ConcreteTP(m.type, recv.ty)); }
+            AddTemp(callRes, m.type);
+            return new ExprVal(callRes, m.type);
+        }
+
+        // 4. Multiple candidates: runtime vtable tag comparison chain.
+        string tagp = NT();
+        L("  " + tagp + " = bitcast i8* " + recvRaw + " to i8**");
+        string tag = NT();
+        L("  " + tag + " = load i8*, i8** " + tagp);
+
+        string resSlot = "";
+        if (!isVoid) {
+            resSlot = NT();
+            EA(resSlot, rt);
+        }
+        int lend = NL();
+
+        int ci = 0;
+        while (ci < cands.Count) {
+            Node candCls = cands[ci];
+            Node candMeth = candMeths[ci];
+            string impl = candImpls[ci];
+            List<string> vslots = new List<string>();
+            CollectVSlots(candCls, vslots);
+
+            int lmatch = NL();
+            int lnext = NL();
+            string cmp = NT();
+            L("  " + cmp + " = icmp eq i8* " + tag + ", bitcast ([" + vslots.Count + " x i8*]* @" + candCls.sval + "_vtable to i8*)");
+            L("  br i1 " + cmp + ", label %L" + lmatch + ", label %L" + lnext);
+            Label(lmatch);
+
+            string thisPtr = NT();
+            L("  " + thisPtr + " = bitcast i8* " + recvRaw + " to %" + impl + "*");
+            string callArgs = "%" + impl + "* " + thisPtr;
+            int ai = 0;
+            while (ai < argVals.Count) {
+                callArgs = callArgs + ", " + argTypes[ai] + " " + argVals[ai];
+                ai = ai + 1;
+            }
+            if (isVoid) {
+                L("  call void @" + MethodSym(impl, candMeth) + "(" + callArgs + ")");
+            } else {
+                string callRes = NT();
+                L("  " + callRes + " = call " + rt + " @" + MethodSym(impl, candMeth) + "(" + callArgs + ")");
+                L("  store " + rt + " " + callRes + ", " + rt + "* " + resSlot);
+            }
+            L("  br label %L" + lend);
+            Label(lnext);
+            ci = ci + 1;
+        }
+
+        // Fallback if no tag matched (e.g. unhandled subtype or corrupted object).
+        if (!ExternSeen("abort")) { externDecls.Add("abort"); H("declare void @abort()"); }
+        L("  call void @abort()");
+        if (!isVoid) {
+            string dummyVal = rt == "i8*" ? "null" : (rt == "double" ? "0.0" : "0");
+            L("  store " + rt + " " + dummyVal + ", " + rt + "* " + resSlot);
+        }
+        L("  br label %L" + lend);
+        Label(lend);
+
+        if (isVoid) {
+            return new ExprVal("0", MkType("void"));
+        }
+        string finalRes = NT();
+        L("  " + finalRes + " = load " + rt + ", " + rt + "* " + resSlot);
+        if (isAsyncCall) {
+            Node tt = MkType("__task"); tt.a = m.type;
+            return AsyncFrame(finalRes, tt);
+        }
+        if (IsErasedTypeDecl(m.type, declCls)) { return FromSlot(finalRes, ConcreteTP(m.type, recv.ty)); }
+        AddTemp(finalRes, m.type);
+        return new ExprVal(finalRes, m.type);
     }
 
     ExprVal EmitVirtualCall(ExprVal recv, Node cls, string name, Node m, Node e) {

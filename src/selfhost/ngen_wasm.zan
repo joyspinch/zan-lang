@@ -27,6 +27,183 @@ partial class Ngen {
         bytes.Add(v & 0x7F);
     }
 
+    void WasmWriteI32(List<int> bytes, int val) {
+        int v = val;
+        bool more = true;
+        while (more) {
+            int b = v & 0x7F;
+            v = v >> 7;
+            if ((v == 0 && (b & 0x40) == 0) || (v == -1 && (b & 0x40) != 0)) {
+                more = false;
+            } else {
+                b = b | 0x80;
+            }
+            bytes.Add(b);
+        }
+    }
+
+    Node WasmFindMeth(string symName) {
+        int mi = 0;
+        while (mi < methNodes.Count) {
+            Node m = methNodes[mi];
+            string cls = methCls[mi];
+            if (symName == MethSymNg(cls, m) || symName == MethExportSymNg(cls, m)
+                || symName == CtorSymNg(cls, m) || symName == "_" + cls + "_" + m.sval) {
+                return m;
+            }
+            mi = mi + 1;
+        }
+        return null;
+    }
+
+    void WasmCollectVars(Node blk, List<string> vars) {
+        if (blk == null) { return; }
+        int i = 0;
+        while (i < blk.kids.Count) {
+            Node s = blk.kids[i];
+            if (s.kind == AK.VarDecl()) {
+                if (vars.IndexOf(s.sval) < 0) { vars.Add(s.sval); }
+            } else if (s.kind == AK.Block()) {
+                WasmCollectVars(s, vars);
+            } else if (s.kind == AK.IfStmt()) {
+                if (s.b != null && s.b.kind == AK.Block()) { WasmCollectVars(s.b, vars); }
+                if (s.c != null && s.c.kind == AK.Block()) { WasmCollectVars(s.c, vars); }
+            } else if (s.kind == AK.WhileStmt()) {
+                if (s.b != null && s.b.kind == AK.Block()) { WasmCollectVars(s.b, vars); }
+            }
+            i = i + 1;
+        }
+    }
+
+    void WasmLowerExpr(List<int> fnBody, Node e, List<string> locals) {
+        if (e == null) { return; }
+        if (e.kind == AK.IntLit()) {
+            fnBody.Add(0x41);
+            WasmWriteI32(fnBody, (int)e.ival);
+        } else if (e.kind == AK.BoolLit()) {
+            fnBody.Add(0x41);
+            WasmWriteI32(fnBody, e.ival != 0 ? 1 : 0);
+        } else if (e.kind == AK.Ident()) {
+            int idx = locals.IndexOf(e.sval);
+            if (idx >= 0) {
+                fnBody.Add(0x20); // local.get
+                WasmWriteU32(fnBody, idx);
+            } else {
+                fnBody.Add(0x41);
+                WasmWriteI32(fnBody, 0);
+            }
+        } else if (e.kind == AK.Binary()) {
+            WasmLowerExpr(fnBody, e.a, locals);
+            WasmLowerExpr(fnBody, e.b, locals);
+            if (e.op == 1) { fnBody.Add(0x6A); }       // + : i32.add
+            else if (e.op == 2) { fnBody.Add(0x6B); }  // - : i32.sub
+            else if (e.op == 3) { fnBody.Add(0x6C); }  // * : i32.mul
+            else if (e.op == 4) { fnBody.Add(0x6D); }  // / : i32.div_s
+            else if (e.op == 5) { fnBody.Add(0x6F); }  // % : i32.rem_s
+            else if (e.op == 6) { fnBody.Add(0x71); }  // & : i32.and
+            else if (e.op == 7) { fnBody.Add(0x72); }  // | : i32.or
+            else if (e.op == 8) { fnBody.Add(0x73); }  // ^ : i32.xor
+            else if (e.op == 9) { fnBody.Add(0x46); }  // == : i32.eq
+            else if (e.op == 10) { fnBody.Add(0x47); } // != : i32.ne
+            else if (e.op == 11) { fnBody.Add(0x48); } // < : i32.lt_s
+            else if (e.op == 12) { fnBody.Add(0x49); } // <= : i32.le_s
+            else if (e.op == 13) { fnBody.Add(0x4A); } // > : i32.gt_s
+            else if (e.op == 14) { fnBody.Add(0x4E); } // >= : i32.ge_s
+            else { fnBody.Add(0x6A); }
+        } else if (e.kind == AK.Assignment()) {
+            WasmLowerExpr(fnBody, e.b, locals);
+            if (e.a != null && e.a.kind == AK.Ident()) {
+                int idx = locals.IndexOf(e.a.sval);
+                if (idx >= 0) {
+                    fnBody.Add(0x22); // local.tee (sets local and leaves value on stack)
+                    WasmWriteU32(fnBody, idx);
+                }
+            }
+        } else {
+            fnBody.Add(0x41);
+            WasmWriteI32(fnBody, 0);
+        }
+    }
+
+    void WasmLowerStmt(List<int> fnBody, Node s, List<string> locals) {
+        if (s == null) { return; }
+        if (s.kind == AK.VarDecl()) {
+            if (s.a != null) {
+                WasmLowerExpr(fnBody, s.a, locals);
+                int idx = locals.IndexOf(s.sval);
+                if (idx >= 0) {
+                    fnBody.Add(0x21); // local.set
+                    WasmWriteU32(fnBody, idx);
+                } else {
+                    fnBody.Add(0x1A); // drop
+                }
+            }
+        } else if (s.kind == AK.Assignment()) {
+            WasmLowerExpr(fnBody, s.b, locals);
+            if (s.a != null && s.a.kind == AK.Ident()) {
+                int idx = locals.IndexOf(s.a.sval);
+                if (idx >= 0) {
+                    fnBody.Add(0x21); // local.set
+                    WasmWriteU32(fnBody, idx);
+                } else {
+                    fnBody.Add(0x1A); // drop
+                }
+            } else {
+                fnBody.Add(0x1A); // drop
+            }
+        } else if (s.kind == AK.ReturnStmt()) {
+            if (s.a != null) {
+                WasmLowerExpr(fnBody, s.a, locals);
+            }
+            fnBody.Add(0x0F); // return
+        } else if (s.kind == AK.IfStmt()) {
+            WasmLowerExpr(fnBody, s.a, locals);
+            fnBody.Add(0x04); // if
+            fnBody.Add(0x40); // empty block type
+            if (s.b != null) {
+                if (s.b.kind == AK.Block()) {
+                    int bi = 0;
+                    while (bi < s.b.kids.Count) { WasmLowerStmt(fnBody, s.b.kids[bi], locals); bi = bi + 1; }
+                } else {
+                    WasmLowerStmt(fnBody, s.b, locals);
+                }
+            }
+            if (s.c != null) {
+                fnBody.Add(0x05); // else
+                if (s.c.kind == AK.Block()) {
+                    int ci = 0;
+                    while (ci < s.c.kids.Count) { WasmLowerStmt(fnBody, s.c.kids[ci], locals); ci = ci + 1; }
+                } else {
+                    WasmLowerStmt(fnBody, s.c, locals);
+                }
+            }
+            fnBody.Add(0x0B); // end
+        } else if (s.kind == AK.WhileStmt()) {
+            fnBody.Add(0x02); fnBody.Add(0x40); // block (break target)
+            fnBody.Add(0x03); fnBody.Add(0x40); // loop (continue target)
+            WasmLowerExpr(fnBody, s.a, locals);
+            fnBody.Add(0x45); // i32.eqz
+            fnBody.Add(0x0D); WasmWriteU32(fnBody, 1); // br_if 1 (break to outer block)
+            if (s.b != null) {
+                if (s.b.kind == AK.Block()) {
+                    int bi = 0;
+                    while (bi < s.b.kids.Count) { WasmLowerStmt(fnBody, s.b.kids[bi], locals); bi = bi + 1; }
+                } else {
+                    WasmLowerStmt(fnBody, s.b, locals);
+                }
+            }
+            fnBody.Add(0x0C); WasmWriteU32(fnBody, 0); // br 0 (loop back)
+            fnBody.Add(0x0B); // end loop
+            fnBody.Add(0x0B); // end block
+        } else if (s.kind == AK.ExprStmt()) {
+            WasmLowerExpr(fnBody, s.a, locals);
+            fnBody.Add(0x1A); // drop
+        } else if (s.kind == AK.Block()) {
+            int bi = 0;
+            while (bi < s.kids.Count) { WasmLowerStmt(fnBody, s.kids[bi], locals); bi = bi + 1; }
+        }
+    }
+
     void WasmWriteString(List<int> bytes, string s) {
         if (s == null) {
             WasmWriteU32(bytes, 0);
@@ -218,14 +395,45 @@ partial class Ngen {
         i = 0;
         while (i < syms.Count) {
             List<int> fnBody = new List<int>();
-            WasmWriteU32(fnBody, 0); // 0 local declarations
-
             int sig = WasmSigType(syms[i].name);
-            if (sig == 3 || sig == 4 || sig == 2 || sig == 5) {
-                fnBody.Add(0x41); // i32.const 0 for functions returning i32
-                WasmWriteU32(fnBody, 0);
+            Node m = WasmFindMeth(syms[i].name);
+            if (m != null && m.d != null) {
+                List<string> locals = new List<string>();
+                int pi = 0;
+                while (pi < m.kids.Count) {
+                    Node p = m.kids[pi];
+                    if (p.kind == AK.Param()) { locals.Add(p.sval); }
+                    pi = pi + 1;
+                }
+                List<string> varNames = new List<string>();
+                WasmCollectVars(m.d, varNames);
+                if (varNames.Count > 0) {
+                    WasmWriteU32(fnBody, 1);
+                    WasmWriteU32(fnBody, varNames.Count);
+                    fnBody.Add(0x7F); // i32
+                    int vi = 0;
+                    while (vi < varNames.Count) { locals.Add(varNames[vi]); vi = vi + 1; }
+                } else {
+                    WasmWriteU32(fnBody, 0);
+                }
+                int si = 0;
+                while (si < m.d.kids.Count) {
+                    WasmLowerStmt(fnBody, m.d.kids[si], locals);
+                    si = si + 1;
+                }
+                if (sig == 3 || sig == 4 || sig == 2 || sig == 5) {
+                    fnBody.Add(0x41);
+                    WasmWriteI32(fnBody, 0);
+                }
+                fnBody.Add(0x0B); // end opcode
+            } else {
+                WasmWriteU32(fnBody, 0); // 0 local declarations
+                if (sig == 3 || sig == 4 || sig == 2 || sig == 5) {
+                    fnBody.Add(0x41); // i32.const 0 for functions returning i32
+                    WasmWriteI32(fnBody, 0);
+                }
+                fnBody.Add(0x0B); // end opcode
             }
-            fnBody.Add(0x0B); // end opcode
 
             WasmWriteU32(codeSec, fnBody.Count);
             int k = 0;

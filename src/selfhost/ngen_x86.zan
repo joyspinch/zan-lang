@@ -281,40 +281,65 @@ partial class Ngen {
         X4(0);
     }
 
-    // ---- calls: the SysV shim ----
+    // ---- calls: the SysV / Win64 shim ----
     // Stages the stack-class arguments (batch 33: arg(6+k) rides in the
     // v(6+k) home, lands at [rsp+8k] -- the callee reads it back at
     // [rbp+16+8k]), calls, reclaims, and lands the return in v0
     // (mov rdi, rax). xStackArgs is set by the call sites that pushed more
     // than six register-class arguments; a callee with a shorter parameter
     // list never reads the junk slots.
+    // For Windows x64 (coffTarget == 1), 32-byte shadow space is allocated
+    // at [rsp..rsp+31], and stack args begin at [rsp+32].
     int xStackArgs = 0;
     int xVecArgs = 0;          // SysV al:本调用用掉的 xmm 寄存器数(变参 C
-                               // 调用方 ABI 要求;musl printf 的 va_start
-                               // 按 al==0 跳过 xmm 溢出,%f 直接读溢出区)
+                                // 调用方 ABI 要求;musl printf 的 va_start
+                                // 按 al==0 跳过 xmm 溢出,%f 直接读溢出区)
     void XCallSeq(string sym, int isExtern) {
         int n = xStackArgs; xStackArgs = 0;
-        int area = 16 * ((n + 1) / 2);           // 8*n rounded to 16, min 16
-        if (area < 16) { area = 16; }
-        XSubRsp(area);
-        int k = 0;
-        while (k < n) {
-            // 批50:v16/v17 物理映射 = r10/r11 scratch,按位换号到 v19/v20
-            // 真家(装载端同步改道,XArgVOf)—— 否则轮到 v16 时 XGetV
-            // 空转,r10 已被上一槽覆盖(S17 探针现形)。
-            XGetV(XArgVOf(6 + k), 10);
-            XopMemR(0x89, 10, 4, 8 * k);         // mov [rsp+8k], r10
-            k = k + 1;
+        int area = 0;
+        if (coffTarget == 1) {
+            // Windows x64 ABI: 32-byte shadow space for rcx, rdx, r8, r9.
+            // Stack arguments (if any) begin at [rsp + 32].
+            area = 32 + 8 * n;
+            area = 16 * ((area + 15) / 16);
+            XSubRsp(area);
+            int k = 0;
+            while (k < n) {
+                XGetV(XArgVOf(6 + k), 10);
+                XopMemR(0x89, 10, 4, 32 + 8 * k);     // mov [rsp + 32 + 8*k], r10
+                k = k + 1;
+            }
+            if (isExtern != 0) {
+                // Shuffle SysV register args (v0=rdi, v1=rsi, v2=rdx, v3=rcx)
+                // into Windows x64 register args (rcx, rdx, r8, r9) non-destructively:
+                XMov(9, 1);                           // mov r9, rcx (v3)
+                XMov(8, 2);                           // mov r8, rdx (v2)
+                XMov(2, 6);                           // mov rdx, rsi (v1)
+                XMov(1, 7);                           // mov rcx, rdi (v0)
+            }
+        } else {
+            area = 16 * ((n + 1) / 2);               // 8*n rounded to 16, min 16
+            if (area < 16) { area = 16; }
+            XSubRsp(area);
+            int k = 0;
+            while (k < n) {
+                // 批50:v16/v17 物理映射 = r10/r11 scratch,按位换号到 v19/v20
+                // 真家(装载端同步改道,XArgVOf)—— 否则轮到 v16 时 XGetV
+                // 空转,r10 已被上一槽覆盖(S17 探针现形)。
+                XGetV(XArgVOf(6 + k), 10);
+                XopMemR(0x89, 10, 4, 8 * k);             // mov [rsp+8k], r10
+                k = k + 1;
+            }
         }
         if (isExtern != 0 && xVecArgs != 0) {
-            X2(0xB0, xVecArgs);                  // mov al, n(非变参 callee 忽略 al)
+            X2(0xB0, xVecArgs);                      // mov al, n(非变参 callee 忽略 al)
         }
         xVecArgs = 0;
         X1(0xE8);
         fixups.Add(new Fixup(txt.Count - 1, isExtern != 0 ? 4 : 3, 0, 0, sym));
         X4(0);
         XAddRsp(area);
-        XMov(7, 0);                              // mov rdi, rax  (v0 = result)
+        XMov(7, 0);                                  // mov rdi, rax  (v0 = result)
     }
 
     // ---- physical GPR move for the export shim's SysV permute (批 36):
