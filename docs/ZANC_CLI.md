@@ -137,7 +137,7 @@ trace 的事件序为准，不要顺着报表的站点名硬找。
 | `-O0..-O3/-Os/-Oz` | 优化档；默认 O0，--publish 默认 Os；-Oz 极限体积（边缘/嵌入式） |
 | `-g, --debug` | DWARF 调试信息（强制 O0；自动开 --check-leaks/--arc-guard） |
 | `--icon <f.ico>` / `--no-icon` / `--default-icon` | 嵌入/跳过 Windows 图标（--publish 默认不内嵌内置图标，可传 --default-icon 显式开启） |
-| `--embed <p[=n]>` | 把文件/目录烤进可执行资源（可重复）；运行期读取**内嵌优先**——烤进的副本是权威，`File.ReadAllText/ReadAllBytes/ReadBytes/GetSize/Exists` 命中内嵌直接返回，盘上同名文件不再覆盖它（发布后界面/资源不落盘、不被旁路文件替换）；GUI 程序自带 `skins/` 暂存时，仅当目录内含 base.css（完整替身）才跳过 stdlib 皮肤基线自动内嵌，pack-only 暂存照常内嵌基线且暂存包赢重名 |
+| `--embed <p[=n]>` | 把文件/目录烤进可执行资源（可重复）；运行期读取**内嵌优先**——烤进的副本是权威，`File.ReadAllText/ReadAllBytes/ReadBytes/GetSize/Exists` 命中内嵌直接返回，盘上同名文件不再覆盖它（发布后界面/资源不落盘、不被旁路文件替换）；资源在 exe 内**加密存放**（压缩后按内容派生密钥流整体 XOR，`strings` 扒不到明文，读取时内存解密、不落临时文件；防静态提取，不对抗逆向专家）；GUI 程序自带 `skins/` 暂存时，仅当目录内含 base.css（完整替身）才跳过 stdlib 皮肤基线自动内嵌，pack-only 暂存照常内嵌基线且暂存包赢重名 |
 | `--emit-apk` | （未列入 help）Android APK 全链路打包；配 `--apk-package`/`--apk-label` |
 | `--emit-ipa` | iOS IPA 全链路打包；配 `--ipa-bundle-id`/`--ipa-name`（`-o <file.ipa>` 也自动开启） |
 

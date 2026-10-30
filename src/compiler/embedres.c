@@ -258,6 +258,40 @@ static const char *embed_basename(const char *path) {
 
 #define ZAN_EMBED_COMPRESS_MIN 512
 #define ZAN_EMBED_COMPRESSED 0x8000000000000000ULL
+#define ZAN_EMBED_ENCRYPTED 0x2000000000000000ULL
+
+/* ---- bake 侧资源加密（与 src/runtime/zan_inflate.c 的读取侧互为镜像）----
+ * 资源不以明文躺在 exe 里：先压缩，再对整块字节做密钥流 XOR。密钥流 =
+ * splitmix64(seed ^ fnv1a64(资源名)) 的步进序列；seed 从本次内嵌全部
+ * （名字+字节）确定性派生 —— 确定性构建两次代码生成一致，不同资源集
+ * 种子不同。防 strings 静态提取界面/脚本源码，不对抗逆向专家。 */
+
+static uint64_t embed_mix64(uint64_t x) {
+    x ^= x >> 30; x *= 0xBF58476D1CE4E5B9ULL;
+    x ^= x >> 27; x *= 0x94D049BB133111EBULL;
+    x ^= x >> 31; return x;
+}
+
+static void embed_crypt(const char *name, unsigned char *buf,
+                        long long len, uint64_t seed) {
+    uint64_t h = 1469598103934665603ULL;
+    const char *p;
+    long long i = 0;
+    for (p = name ? name : ""; *p; p++) {
+        h ^= (unsigned char)*p;
+        h *= 1099511628211ULL;
+    }
+    uint64_t st = seed ^ (h * 0x9E3779B97F4A7C15ULL);
+    while (i < len) {
+        uint64_t z;
+        int n = len - i < 8 ? (int)(len - i) : 8;
+        int k;
+        st += 0x9E3779B97F4A7C15ULL;
+        z = embed_mix64(st);
+        for (k = 0; k < n; k++) buf[i + k] ^= (unsigned char)(z >> (8 * k));
+        i += n;
+    }
+}
 
 static unsigned char *embed_maybe_compress(const unsigned char *data,
                                            long long len, long long *out_len) {
@@ -306,9 +340,14 @@ static LLVMValueRef embed_bytes_global(zan_irgen_t *g, const char *label,
 static LLVMValueRef embed_define(zan_irgen_t *g, const char *name,
                                  LLVMTypeRef fty) {
     LLVMValueRef fn = LLVMGetNamedFunction(g->mod, name);
-    if (fn && LLVMCountBasicBlocks(fn) == 0) return fn;
+    if (fn && LLVMCountBasicBlocks(fn) == 0) {
+        zan_set_odr_comdat(g, fn, name);
+        return fn;
+    }
     if (fn) return NULL;
-    return LLVMAddFunction(g->mod, name, fty);
+    fn = LLVMAddFunction(g->mod, name, fty);
+    zan_set_odr_comdat(g, fn, name);
+    return fn;
 }
 
 static LLVMValueRef embed_libc(zan_irgen_t *g, const char *name,
@@ -326,6 +365,7 @@ struct embed_api_ctx {
     LLVMValueRef gtbl, gcnt, gbuf, empty;
     LLVMValueRef own_tbl, own_cnt;
     long long    buf_cap;
+    unsigned long long seed;
 };
 
 static LLVMValueRef embed_entry_at(LLVMBuilderRef b, struct embed_api_ctx *c,
@@ -415,7 +455,8 @@ static LLVMValueRef embed_emit_find(zan_irgen_t *g, struct embed_api_ctx *c) {
     return fn;
 }
 
-/* i8* zan */
+/* i8* zan.embed.unzip(ent*) —— 按条目标志解密（bit61）与解压（bit63），
+ * 全程内存，失败返回 NULL。 */
 static LLVMValueRef embed_emit_unzip(zan_irgen_t *g, struct embed_api_ctx *c) {
     LLVMTypeRef args[] = { c->i8p };
     LLVMTypeRef fty = LLVMFunctionType(c->i8p, args, 1, 0);
@@ -425,39 +466,106 @@ static LLVMValueRef embed_emit_unzip(zan_irgen_t *g, struct embed_api_ctx *c) {
     LLVMTypeRef dty;
     LLVMValueRef dec = embed_libc(g, "zan_embed_decode", c->i8p, dargs, 2,
                                   &dty);
+    LLVMTypeRef uargs[] = { c->i8p, c->i8p, c->i64, c->i64 };
+    LLVMTypeRef uty;
+    LLVMValueRef unc = embed_libc(g, "zan_embed_uncrypt", c->i8p, uargs, 4,
+                                  &uty);
+    LLVMValueRef seedk = LLVMConstInt(c->i64, c->seed, 0);
     LLVMBuilderRef b = LLVMCreateBuilderInContext(g->ctx);
     LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(g->ctx, fn, "entry");
     LLVMBasicBlockRef raw = LLVMAppendBasicBlockInContext(g->ctx, fn, "raw");
+    LLVMBasicBlockRef rawenc = LLVMAppendBasicBlockInContext(g->ctx, fn, "rawenc");
+    LLVMBasicBlockRef rawdec = LLVMAppendBasicBlockInContext(g->ctx, fn, "rawdec");
+    LLVMBasicBlockRef retraw = LLVMAppendBasicBlockInContext(g->ctx, fn, "retraw");
     LLVMBasicBlockRef comp = LLVMAppendBasicBlockInContext(g->ctx, fn, "comp");
+    LLVMBasicBlockRef compenc = LLVMAppendBasicBlockInContext(g->ctx, fn, "compenc");
+    LLVMBasicBlockRef compdec2 = LLVMAppendBasicBlockInContext(g->ctx, fn, "compdec2");
+    LLVMBasicBlockRef compdec = LLVMAppendBasicBlockInContext(g->ctx, fn, "compdec");
     LLVMBasicBlockRef ok = LLVMAppendBasicBlockInContext(g->ctx, fn, "ok");
     LLVMBasicBlockRef bad = LLVMAppendBasicBlockInContext(g->ctx, fn, "bad");
+
     LLVMPositionBuilderAtEnd(b, entry);
     LLVMValueRef e = LLVMGetParam(fn, 0);
     LLVMValueRef lp = LLVMBuildStructGEP2(b, c->ent_ty, e, 2, "lp");
     LLVMValueRef len = LLVMBuildLoad2(b, c->i64, lp, "l");
+    LLVMValueRef dv = LLVMBuildAlloca(b, c->i8p, "dv");
     LLVMBuildCondBr(b, LLVMBuildICmp(b, LLVMIntSLT, len,
         LLVMConstInt(c->i64, 0, 0), "flag"), comp, raw);
+
+    /* 未压缩条目：bit61 命中则解密一份并回填条目，否则原样返回。 */
     LLVMPositionBuilderAtEnd(b, raw);
     LLVMValueRef dp0 = LLVMBuildStructGEP2(b, c->ent_ty, e, 1, "dp0");
-    LLVMBuildRet(b, LLVMBuildLoad2(b, c->i8p, dp0, "d0"));
+    LLVMValueRef d0 = LLVMBuildLoad2(b, c->i8p, dp0, "d0");
+    LLVMBuildStore(b, d0, dv);
+    LLVMValueRef enc0 = LLVMBuildICmp(b, LLVMIntNE,
+        LLVMBuildAnd(b, len, LLVMConstInt(c->i64,
+            ZAN_EMBED_ENCRYPTED, 0), "e0"),
+        LLVMConstInt(c->i64, 0, 0), "isenc0");
+    LLVMBuildCondBr(b, enc0, rawenc, retraw);
+
+    LLVMPositionBuilderAtEnd(b, rawenc);
+    LLVMValueRef d1 = LLVMBuildLoad2(b, c->i8p, dv, "d1");
+    LLVMValueRef slen0 = LLVMBuildAnd(b, len, LLVMConstInt(c->i64,
+        ~(ZAN_EMBED_COMPRESSED | ZAN_EMBED_ENCRYPTED), 0), "slen0");
+    LLVMValueRef nmp0 = LLVMBuildStructGEP2(b, c->ent_ty, e, 0, "nmp0");
+    LLVMValueRef nm0 = LLVMBuildLoad2(b, c->i8p, nmp0, "nm0");
+    LLVMValueRef uargs0[] = { nm0, d1, slen0, seedk };
+    LLVMValueRef d2 = LLVMBuildCall2(b, uty, unc, uargs0, 4, "d2");
+    LLVMBuildCondBr(b, LLVMBuildIsNull(b, d2, "fail0"), bad, rawdec);
+
+    LLVMPositionBuilderAtEnd(b, rawdec);
+    LLVMBuildStore(b, d2, dp0);
+    LLVMBuildStore(b, slen0, lp);
+    LLVMBuildStore(b, d2, dv);
+    LLVMBuildBr(b, retraw);
+
+    LLVMPositionBuilderAtEnd(b, retraw);
+    LLVMBuildRet(b, LLVMBuildLoad2(b, c->i8p, dv, "out0"));
+
+    /* 压缩条目：先解密（8 字节头在密文内），再按原契约解压。 */
     LLVMPositionBuilderAtEnd(b, comp);
     LLVMValueRef dp = LLVMBuildStructGEP2(b, c->ent_ty, e, 1, "dp");
     LLVMValueRef d = LLVMBuildLoad2(b, c->i8p, dp, "d");
+    LLVMBuildStore(b, d, dv);
+    LLVMValueRef enc = LLVMBuildICmp(b, LLVMIntNE,
+        LLVMBuildAnd(b, len, LLVMConstInt(c->i64,
+            ZAN_EMBED_ENCRYPTED, 0), "e"),
+        LLVMConstInt(c->i64, 0, 0), "isenc");
+    LLVMBuildCondBr(b, enc, compenc, compdec);
+
+    LLVMPositionBuilderAtEnd(b, compenc);
+    LLVMValueRef d3 = LLVMBuildLoad2(b, c->i8p, dv, "d3");
+    LLVMValueRef slen = LLVMBuildAnd(b, len, LLVMConstInt(c->i64,
+        ~(ZAN_EMBED_COMPRESSED | ZAN_EMBED_ENCRYPTED), 0), "slen");
+    LLVMValueRef nmp = LLVMBuildStructGEP2(b, c->ent_ty, e, 0, "nmp");
+    LLVMValueRef nm = LLVMBuildLoad2(b, c->i8p, nmp, "nm");
+    LLVMValueRef uargs1[] = { nm, d3, slen, seedk };
+    LLVMValueRef d4 = LLVMBuildCall2(b, uty, unc, uargs1, 4, "d4");
+    LLVMBuildCondBr(b, LLVMBuildIsNull(b, d4, "fail"), bad, compdec2);
+
+    LLVMPositionBuilderAtEnd(b, compdec2);
+    LLVMBuildStore(b, d4, dv);
+    LLVMBuildBr(b, compdec);
+
+    LLVMPositionBuilderAtEnd(b, compdec);
+    LLVMValueRef d5 = LLVMBuildLoad2(b, c->i8p, dv, "d5");
     LLVMValueRef plain = LLVMBuildOr(b,
         LLVMBuildAnd(b, len,
-            LLVMConstInt(c->i64, 0x7FFFFFFFFFFFFFFFULL, 0), "pl0"),
+            LLVMConstInt(c->i64, 0x3FFFFFFFFFFFFFFFULL, 0), "pl0"),
         LLVMConstInt(c->i64, 0x4000000000000000ULL, 0), "plain");
-    LLVMValueRef cargs[] = { d, plain };
+    LLVMValueRef cargs[] = { d5, plain };
     LLVMValueRef out = LLVMBuildCall2(b, dty, dec, cargs, 2, "out");
-    LLVMBuildCondBr(b, LLVMBuildIsNull(b, out, "fail"), bad, ok);
-    LLVMPositionBuilderAtEnd(b, bad);
-    LLVMBuildRet(b, LLVMConstNull(c->i8p));
+    LLVMBuildCondBr(b, LLVMBuildIsNull(b, out, "fail2"), bad, ok);
+
     LLVMPositionBuilderAtEnd(b, ok);
-    LLVMValueRef rl = LLVMBuildLoad2(b, c->i32, d, "rawlen");
+    LLVMValueRef rl = LLVMBuildLoad2(b, c->i32, d5, "rawlen");
     LLVMValueRef rl64 = LLVMBuildZExt(b, rl, c->i64, "raw64");
     LLVMBuildStore(b, out, dp);
     LLVMBuildStore(b, rl64, lp);
     LLVMBuildRet(b, out);
+
+    LLVMPositionBuilderAtEnd(b, bad);
+    LLVMBuildRet(b, LLVMConstNull(c->i8p));
     LLVMDisposeBuilder(b);
     return fn;
 }
@@ -861,19 +969,40 @@ int zan_embed_emit_specs_filtered(zan_irgen_t *g, const char *const *specs,
         free(files.v);
         return -1;
     }
+    /* 种子从本次内嵌的全部（名字+原始字节）确定性派生：同一份资源
+     * 两次构建产出一致（确定性构建可复现），资源集不同则密钥流不同。 */
+    uint64_t seed = 1469598103934665603ULL;
+    for (int i = 0; i < files.n; i++) {
+        const char *p = files.v[i].name ? files.v[i].name : "";
+        for (; *p; p++) {
+            seed ^= (unsigned char)*p;
+            seed *= 1099511628211ULL;
+        }
+        seed ^= 0xFF;
+        seed *= 1099511628211ULL;
+        for (long long j = 0; j < files.v[i].len; j++) {
+            seed ^= files.v[i].data[j];
+            seed *= 1099511628211ULL;
+        }
+    }
+    seed = embed_mix64(seed ^ 0x5A4E454D42524453ULL);
     int any_compressed = 0;
+    int any_encrypted = 0;
     for (int i = 0; i < files.n; i++) {
         long long clen = 0;
         unsigned char *cbuf = embed_maybe_compress(files.v[i].data,
                                                    files.v[i].len, &clen);
-        if (!cbuf) continue;
-        free(files.v[i].data);
-        files.v[i].data = cbuf;
-        files.v[i].len = clen;
-        compressed[i] = 1;
-        any_compressed = 1;
+        if (cbuf) {
+            free(files.v[i].data);
+            files.v[i].data = cbuf;
+            files.v[i].len = clen;
+            compressed[i] = 1;
+            any_compressed = 1;
+        }
+        embed_crypt(files.v[i].name, files.v[i].data, files.v[i].len, seed);
+        any_encrypted = 1;
     }
-    if (any_compressed) g->uses_inflate = true;
+    if (any_compressed || any_encrypted) g->uses_inflate = true;
     LLVMTypeRef i8p = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
     LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
     LLVMTypeRef fields[] = { i8p, i8p, i64 };
@@ -905,6 +1034,7 @@ int zan_embed_emit_specs_filtered(zan_irgen_t *g, const char *const *specs,
         }
         unsigned long long lval = (unsigned long long)files.v[i].len;
         if (compressed[i]) lval |= ZAN_EMBED_COMPRESSED;
+        lval |= ZAN_EMBED_ENCRYPTED;
         LLVMValueRef vals[] = { name, data, LLVMConstInt(i64, lval, 0) };
         ents[i] = LLVMConstNamedStruct(ent_ty, vals, 3);
     }
@@ -940,6 +1070,7 @@ int zan_embed_emit_specs_filtered(zan_irgen_t *g, const char *const *specs,
     LLVMSetLinkage(c.gcnt, LLVMInternalLinkage);
     c.own_tbl = tbl0;
     c.own_cnt = LLVMConstInt(i64, (unsigned long long)files.n, 0);
+    c.seed = seed;
     c.gbuf = LLVMAddGlobal(g->mod, i8p, "zan.embed.gbuf");
     LLVMSetInitializer(c.gbuf, LLVMConstNull(i8p));
     LLVMSetLinkage(c.gbuf, LLVMInternalLinkage);
@@ -947,8 +1078,9 @@ int zan_embed_emit_specs_filtered(zan_irgen_t *g, const char *const *specs,
 
     embed_emit_register(g, &c);
     LLVMValueRef find = embed_emit_find(g, &c);
-    LLVMValueRef unzip = any_compressed ? embed_emit_unzip(g, &c)
-                                        : embed_emit_passthrough(g, &c);
+    LLVMValueRef unzip = (any_compressed || any_encrypted)
+                             ? embed_emit_unzip(g, &c)
+                             : embed_emit_passthrough(g, &c);
     embed_emit_read_has_bytes(g, &c, find, unzip);
     embed_emit_list(g, &c);
 
