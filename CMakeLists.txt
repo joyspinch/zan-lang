@@ -4532,7 +4532,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
     COMMAND ${CMAKE_COMMAND}
       -DZANC=$<TARGET_FILE:zanc>
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/designer_wysiwyg_test.zan
-      "-DZANC_ARGS=--auto-stdlib${_gui_driver_tail}"
+      "-DZANC_ARGS=--embed;tests/gui/designer_wysiwyg.html;--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_designer_wysiwyg.out
       -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_designer_wysiwyg${_exe_ext}
       -DSTDLIB_STAMP=${_stdlib_stamp}
