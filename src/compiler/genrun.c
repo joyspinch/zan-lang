@@ -33,7 +33,7 @@
 #include <mach-o/dyld.h>
 #endif
 
-int zan_gen_enabled = 1;
+int zan_gen_enabled = 0;
 
 static char **g_gen_texts = NULL;
 static int g_gen_text_count = 0;

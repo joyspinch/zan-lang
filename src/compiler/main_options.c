@@ -57,7 +57,8 @@ static void print_usage(void) {
     fprintf(stderr, "                   resources named <n>/<relative path> (repeatable)\n");
     fprintf(stderr, "  --no-icon        Do not embed any icon (skip the built-in default)\n");
     fprintf(stderr, "  --emit-symbols <f> Write the type/member index (IDE completion) and exit\n");
-    fprintf(stderr, "  --no-gen         Disable the Zan-scripted code generators (bootstrap)\n");
+    fprintf(stderr, "  --gen            Enable legacy scripted code generators (disabled by default)\n");
+    fprintf(stderr, "  --no-gen         Disable legacy scripted code generators (default)\n");
     fprintf(stderr, "  --gen-meta <f>   Export compilation-unit metadata JSON to <f> and exit\n");
     fprintf(stderr, "  --time           Report how long each compiler phase took\n");
     fprintf(stderr, "  -D<name>[=value] Define preprocessor symbol\n");
