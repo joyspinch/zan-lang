@@ -4752,18 +4752,20 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
   # Runtime-HTML channel with Chinese text and non-Zan bytes (@@) in the
-  # document: the raw HTML must reach only the generator; heuristic token
-  # scans must skip design inputs entirely, so zanc stays silent and the
-  # generated tree keeps every CJK literal byte-exact (labels, placeholder,
-  # data-arg).
+  # Runtime HTML load with CJK + junk-ASCII literals: the fixture is baked in
+  # with --embed and loaded via LoadHtmlWith, so raw text reaches only the
+  # HTML parser — the tree and event args stay byte-exact (labels,
+  # placeholder, data-arg).
   add_test(NAME conformance_gui_html_runtime_cjk
     COMMAND ${CMAKE_COMMAND}
       -DZANC=$<TARGET_FILE:zanc>
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/html_runtime_cjk_test.zan
-      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/tests/gui/html_runtime_cjk.html;--auto-stdlib${_gui_driver_tail}"
+      "-DZANC_ARGS=--embed;tests/gui/html_runtime_cjk.html;--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_html_runtime_cjk.out
       -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_html_runtime_cjk${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+  set_tests_properties(conformance_gui_html_runtime_cjk PROPERTIES
+    TIMEOUT 120 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
 
   # GenHtml 编译期样式 scoping（Vue <style scoped> 同语义）：两份文档
   # 同名类合装一张 appCss 后各自身份——同名 .card 宽度互不覆盖，
