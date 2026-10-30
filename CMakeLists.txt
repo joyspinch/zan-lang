@@ -4710,14 +4710,32 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
   # project to Gui.Widget.AlertBox — legacy designs carry "Alert", and
   # before AlertBox existed that field generated a nonexistent class.
   # The host also drives the type prop channel (word ↔ enum index).
+  # Fixture is baked in with --embed and projected at runtime via
+  # DesignerHtml.ToJsonDoc + FormBuilder.Build.
   add_test(NAME conformance_gui_design_alert
     COMMAND ${CMAKE_COMMAND}
       -DZANC=$<TARGET_FILE:zanc>
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/design_alert_test.zan
-      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/tests/gui/design_alert.html;--auto-stdlib${_gui_driver_tail}"
+      "-DZANC_ARGS=--embed;tests/gui/design_alert.html;--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_design_alert.out
       -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_design_alert${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+  set_tests_properties(conformance_gui_design_alert PROPERTIES
+    TIMEOUT 120 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+
+  # A design label's control name must stay the element id even when the
+  # label carries caption text (text used to swallow the name, breaking
+  # Find/probes). Runtime projection, fixture baked in with --embed.
+  add_test(NAME conformance_gui_design_label_name
+    COMMAND ${CMAKE_COMMAND}
+      -DZANC=$<TARGET_FILE:zanc>
+      -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/design_label_name_test.zan
+      "-DZANC_ARGS=--embed;tests/gui/design_label_name.html;--auto-stdlib${_gui_driver_tail}"
+      -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_design_label_name.out
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_design_label_name${_exe_ext}
+      -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+  set_tests_properties(conformance_gui_design_label_name PROPERTIES
+    TIMEOUT 120 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
 
   # A primary design document supplies only a fallback entry point. When a
   # later Zan input declares Main, that explicit entry must win regardless of
