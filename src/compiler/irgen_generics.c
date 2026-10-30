@@ -69,11 +69,60 @@ static void collect_inst_expr(zan_irgen_t *g, zan_ast_node_t *e) {
     case AST_AWAIT_EXPR:
         collect_inst_expr(g, e->await_expr.expr);
         break;
-    case AST_CALL:
+    case AST_CALL: {
+        for (int i = 0; i < e->call.type_args.count; i++)
+            collect_inst_typeref(g, e->call.type_args.items[i]);
         collect_inst_expr(g, e->call.callee);
         for (int i = 0; i < e->call.args.count; i++)
             collect_inst_expr(g, e->call.args.items[i]);
+
+        if (e->call.type_args.count > 0 && e->call.callee) {
+            bool all_concrete = true;
+            for (int i = 0; i < e->call.type_args.count; i++) {
+                zan_type_t *ta = resolve_type_ctx(g, e->call.type_args.items[i]);
+                if (!ta || !type_is_concrete(ta)) {
+                    all_concrete = false;
+                    break;
+                }
+            }
+            if (all_concrete) {
+                zan_istr_t mname = {0};
+                zan_ast_node_t *recv_obj = NULL;
+                if (e->call.callee->kind == AST_IDENTIFIER) {
+                    mname = e->call.callee->ident.name;
+                } else if (e->call.callee->kind == AST_MEMBER_ACCESS) {
+                    mname = e->call.callee->member.name;
+                    recv_obj = e->call.callee->member.object;
+                }
+                if (mname.str && mname.len > 0) {
+                    if (g->binder && g->binder->ext_methods) {
+                        for (int i = 0; i < g->binder->ext_method_count; i++) {
+                            zan_symbol_t *m = g->binder->ext_methods[i].method;
+                            if (!m || !m->decl || m->decl->kind != AST_METHOD_DECL) continue;
+                            if (m->name.len == mname.len &&
+                                memcmp(m->name.str, mname.str, (size_t)mname.len) == 0 &&
+                                m->decl->method_decl.type_params.count == e->call.type_args.count) {
+                                zan_type_t *ret = method_ret_type_at(g, m, e, recv_obj, NULL);
+                                if (ret) collect_inst_type(g, ret);
+                            }
+                        }
+                    }
+                    if (recv_obj && recv_obj->kind == AST_IDENTIFIER && g->binder) {
+                        zan_symbol_t *ts = zan_binder_lookup(g->binder, recv_obj->ident.name);
+                        if (ts && (ts->kind == SYM_CLASS || ts->kind == SYM_STRUCT)) {
+                            zan_symbol_t *m = get_method_sym(ts, mname);
+                            if (m && m->decl && m->decl->kind == AST_METHOD_DECL &&
+                                m->decl->method_decl.type_params.count == e->call.type_args.count) {
+                                zan_type_t *ret = method_ret_type_at(g, m, e, recv_obj, NULL);
+                                if (ret) collect_inst_type(g, ret);
+                            }
+                        }
+                    }
+                }
+            }
+        }
         break;
+    }
     case AST_MEMBER_ACCESS:
         collect_inst_expr(g, e->member.object);
         break;

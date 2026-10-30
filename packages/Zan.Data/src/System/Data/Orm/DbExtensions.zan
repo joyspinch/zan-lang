@@ -4,105 +4,362 @@ using System.Data;
 
 namespace System.Data.Orm;
 
+// 为实体字段提供流式断言扩展方法，确保在 IDE 中编码与自动补全（IntelliSense）时能流畅提示。
+public static class FieldExtensions {
+    public static bool Eq<T>(this T field, T val) { return field == val; }
+    public static bool Ne<T>(this T field, T val) { return field != val; }
+    public static bool Gt(this int field, int val) { return field > val; }
+    public static bool Ge(this int field, int val) { return field >= val; }
+    public static bool Lt(this int field, int val) { return field < val; }
+    public static bool Le(this int field, int val) { return field <= val; }
+    public static bool Between(this int field, int low, int high) { return field >= low && field <= high; }
+    public static bool NotBetween(this int field, int low, int high) { return field < low || field > high; }
+    public static bool IsNull(this object field) { return field == null; }
+    public static bool IsNotNull(this object field) { return field != null; }
+    public static bool IsNull(this string field) { return field == null; }
+    public static bool IsNotNull(this string field) { return field != null; }
+
+    public static bool Like(this string field, string pattern) {
+        if (field == null || pattern == null) { return false; }
+        if (pattern == "%") { return true; }
+        if (pattern.StartsWith("%") && pattern.EndsWith("%") && pattern.Length > 2) {
+            return field.Contains(pattern.Substring(1, pattern.Length - 2));
+        }
+        if (pattern.EndsWith("%")) {
+            return field.StartsWith(pattern.Substring(0, pattern.Length - 1));
+        }
+        if (pattern.StartsWith("%")) {
+            return field.EndsWith(pattern.Substring(1, pattern.Length - 1));
+        }
+        return field == pattern;
+    }
+
+    public static bool In<T>(this T field, List<T> values) {
+        if (values == null) { return false; }
+        for (int i = 0; i < values.Count; i = i + 1) {
+            if (field == values[i]) { return true; }
+        }
+        return false;
+    }
+
+    public static bool NotIn<T>(this T field, List<T> values) {
+        return !field.In(values);
+    }
+}
+
 // 泛型 SELECT 查询驱动：结合元数据缓存与原生类型反射，提供流式查询。
-public class OrmSelectQuery<T> {
-    public OrmSelect inner;
-    public OrmMeta meta;
+public class SelectQuery<T> {
+    public IDbExecutor db;
+    public Select inner;
+    public Meta meta;
     public Func<T, bool> predicate;
+    public List<string> includeFields;
+    public Func<T, bool> havingPredicate;
+    public TypeInfo navTypeInfo;
 
-    public OrmSelectQuery(IDbExecutor db) {
-        this.meta = OrmMeta.For<T>();
-        this.inner = OrmSelect.Create(db, this.meta);
+    public SelectQuery(IDbExecutor db) {
+        this.db = db;
+        this.meta = Meta.For<T>();
+        this.inner = Select.Create(db, this.meta);
+        this.includeFields = new List<string>();
     }
 
-    public OrmSelectQuery(IDbExecutor db, OrmMeta meta) {
+    public SelectQuery(IDbExecutor db, Meta meta) {
+        this.db = db;
         this.meta = meta;
-        this.inner = OrmSelect.Create(db, this.meta);
+        this.inner = Select.Create(db, this.meta);
+        this.includeFields = new List<string>();
     }
 
-    public OrmSelectQuery<T> Where(Func<T, bool> predicate) {
+    public string DetectColInt(Func<T, int> expr) {
+        TypeInfo ti = (this.meta != null && this.meta.Type.Name.Length > 0) ? this.meta.Type : typeof(T);
+        for (int i = 0; i < this.meta.Cols.Count; i = i + 1) {
+            Col c = this.meta.Cols[i];
+            if (c.Kind == 0) {
+                object dummy = ti.CreateInstance();
+                if (dummy == null) { break; }
+                dummy.SetFieldInt(c.Field, 987654);
+                try {
+                    int res = expr((T)dummy);
+                    if (res == 987654) { return c.Col; }
+                } catch {}
+            }
+        }
+        return this.meta.Cols.Count > 0 ? this.meta.Cols[0].Col : "";
+    }
+
+    public string DetectColDouble(Func<T, double> expr) {
+        TypeInfo ti = (this.meta != null && this.meta.Type.Name.Length > 0) ? this.meta.Type : typeof(T);
+        for (int i = 0; i < this.meta.Cols.Count; i = i + 1) {
+            Col c = this.meta.Cols[i];
+            if (c.Kind == 1) {
+                object dummy = ti.CreateInstance();
+                if (dummy == null) { break; }
+                dummy.SetFieldDouble(c.Field, 987654.25);
+                try {
+                    double res = expr((T)dummy);
+                    if (res == 987654.25) { return c.Col; }
+                } catch {}
+            }
+        }
+        return this.meta.Cols.Count > 0 ? this.meta.Cols[0].Col : "";
+    }
+
+    public string DetectColString(Func<T, string> expr) {
+        TypeInfo ti = (this.meta != null && this.meta.Type.Name.Length > 0) ? this.meta.Type : typeof(T);
+        for (int i = 0; i < this.meta.Cols.Count; i = i + 1) {
+            Col c = this.meta.Cols[i];
+            if (c.Kind == 3) {
+                object dummy = ti.CreateInstance();
+                if (dummy == null) { break; }
+                dummy.SetFieldString(c.Field, "__detect_marker__");
+                try {
+                    string res = expr((T)dummy);
+                    if (res == "__detect_marker__") { return c.Col; }
+                } catch {}
+            }
+        }
+        return this.meta.Cols.Count > 0 ? this.meta.Cols[0].Col : "";
+    }
+
+    public SelectQuery<T> Where(Func<T, bool> predicate) {
         this.predicate = predicate;
         return this;
     }
 
-    public OrmSelectQuery<T> WhereEq(string col, string val) {
+    public SelectQuery<T> WhereEq(string col, string val) {
         this.inner.WhereEq(col, val);
         return this;
     }
 
-    public OrmSelectQuery<T> WhereEq(string col, int val) {
+    public SelectQuery<T> WhereEq(string col, int val) {
         this.inner.WhereEq(col, val);
         return this;
     }
 
-    public OrmSelectQuery<T> WhereEq(string col, long val) {
+    public SelectQuery<T> WhereEq(string col, long val) {
         this.inner.WhereEq(col, val);
         return this;
     }
 
-    public OrmSelectQuery<T> Where(ExprNode expr) {
+    public SelectQuery<T> Where(ExprNode expr) {
         this.inner.WExpr(expr);
         return this;
     }
 
-    public OrmSelectQuery<T> WherePk(int id) {
+    public SelectQuery<T> WherePk(int id) {
         this.inner.WherePk(id);
         return this;
     }
 
-    public OrmSelectQuery<T> WherePk(long id) {
+    public SelectQuery<T> WherePk(long id) {
         this.inner.WherePk(id);
         return this;
     }
 
-    public OrmSelectQuery<T> WherePk(string id) {
+    public SelectQuery<T> WherePk(string id) {
         this.inner.WherePk(id);
         return this;
     }
 
-    public OrmSelectQuery<T> OrderBy(string col) {
+    public SelectQuery<T> WhereDict(DbValues v) {
+        this.inner.WhereDict(v);
+        return this;
+    }
+
+    public SelectQuery<T> OrderBy(string col) {
         this.inner.OrderBy(col);
         return this;
     }
 
-    public OrmSelectQuery<T> OrderByDescending(string col) {
+    public SelectQuery<T> OrderBy(Func<T, int> expr) {
+        string col = this.DetectColInt(expr);
+        if (col.Length > 0) { this.inner.OrderBy(col); }
+        return this;
+    }
+
+    public SelectQuery<T> OrderBy(Func<T, string> expr) {
+        string col = this.DetectColString(expr);
+        if (col.Length > 0) { this.inner.OrderBy(col); }
+        return this;
+    }
+
+    public SelectQuery<T> OrderByDescending(string col) {
         this.inner.OBD(col);
         return this;
     }
 
-    public OrmSelectQuery<T> Limit(int limit, int offset) {
+    public SelectQuery<T> OrderByDescending(Func<T, int> expr) {
+        string col = this.DetectColInt(expr);
+        if (col.Length > 0) { this.inner.OBD(col); }
+        return this;
+    }
+
+    public SelectQuery<T> OrderByDescending(Func<T, string> expr) {
+        string col = this.DetectColString(expr);
+        if (col.Length > 0) { this.inner.OBD(col); }
+        return this;
+    }
+
+    public SelectQuery<T> GroupBy(string col) {
+        this.inner.GroupBy(col);
+        return this;
+    }
+
+    public SelectQuery<T> GroupBy(Func<T, string> expr) {
+        string col = this.DetectColString(expr);
+        if (col.Length > 0) { this.inner.GroupBy(col); }
+        return this;
+    }
+
+    public SelectQuery<T> GroupBy(Func<T, int> expr) {
+        string col = this.DetectColInt(expr);
+        if (col.Length > 0) { this.inner.GroupBy(col); }
+        return this;
+    }
+
+    public SelectQuery<T> Having(string condition) {
+        this.inner.Having(condition);
+        return this;
+    }
+
+    public SelectQuery<T> Having(Func<T, bool> predicate) {
+        this.havingPredicate = predicate;
+        return this;
+    }
+
+    public SelectQuery<T> Distinct() {
+        this.inner.Distinct();
+        return this;
+    }
+
+    public SelectQuery<T> Skip(int offset) {
+        this.inner.offN = offset;
+        return this;
+    }
+
+    public SelectQuery<T> Take(int limit) {
+        this.inner.limN = limit;
+        return this;
+    }
+
+    public SelectQuery<T> Limit(int limit, int offset) {
         this.inner.limN = limit;
         this.inner.offN = offset;
         return this;
     }
 
-    public OrmSelectQuery<T> Page(int page, int pageSize) {
-        int off = (page > 1 ? page - 1 : 0) * pageSize;
+    public SelectQuery<T> Page(int page, int pageSize) {
+        if (page < 1) { page = 1; }
+        int off = (page - 1) * pageSize;
         return this.Limit(pageSize, off);
     }
 
+    public SelectQuery<T> Include<TNav>(Func<T, TNav> expr) {
+        this.navTypeInfo = typeof(TNav);
+        TypeInfo ti = (this.meta != null && this.meta.Type.Name.Length > 0) ? this.meta.Type : typeof(T);
+        for (int i = 0; i < ti.FieldCount; i = i + 1) {
+            string fname = ti.GetFieldName(i);
+            string fkField = fname + "Id";
+            if (ti.HasField(fkField) || ti.HasField(fname + "id")) {
+                this.includeFields.Add(fname);
+            }
+        }
+        return this;
+    }
+
     public int Count() {
+        if (this.predicate != null) {
+            return this.ToList().Count;
+        }
         return this.inner.Count();
     }
 
     public async int CountAsync() {
+        if (this.predicate != null) {
+            return (await this.ToListAsync()).Count;
+        }
         DbResult r = await this.inner.AggRAsync("COUNT(*)");
         if (r == null || r.RowCount() == 0) { return 0; }
         return r.GetInt(0, 0);
     }
 
+    public int Sum(Func<T, int> expr) {
+        if (this.predicate != null) {
+            List<T> list = this.ToList();
+            int s = 0;
+            for (int i = 0; i < list.Count; i = i + 1) {
+                s = s + expr(list[i]);
+            }
+            return s;
+        }
+        string col = this.DetectColInt(expr);
+        return this.inner.AggI("SUM(" + col + ")");
+    }
+
+    public int Max(Func<T, int> expr) {
+        if (this.predicate != null) {
+            List<T> list = this.ToList();
+            if (list.Count == 0) { return 0; }
+            int m = expr(list[0]);
+            for (int i = 1; i < list.Count; i = i + 1) {
+                int val = expr(list[i]);
+                if (val > m) { m = val; }
+            }
+            return m;
+        }
+        string col = this.DetectColInt(expr);
+        return this.inner.AggI("MAX(" + col + ")");
+    }
+
+    public int Min(Func<T, int> expr) {
+        if (this.predicate != null) {
+            List<T> list = this.ToList();
+            if (list.Count == 0) { return 0; }
+            int m = expr(list[0]);
+            for (int i = 1; i < list.Count; i = i + 1) {
+                int val = expr(list[i]);
+                if (val < m) { m = val; }
+            }
+            return m;
+        }
+        string col = this.DetectColInt(expr);
+        return this.inner.AggI("MIN(" + col + ")");
+    }
+
+    public double Avg(Func<T, double> expr) {
+        if (this.predicate != null) {
+            List<T> list = this.ToList();
+            if (list.Count == 0) { return 0.0; }
+            double sum = 0.0;
+            for (int i = 0; i < list.Count; i = i + 1) {
+                sum = sum + expr(list[i]);
+            }
+            return sum / (double)list.Count;
+        }
+        string col = this.DetectColDouble(expr);
+        return this.inner.AggD("AVG(" + col + ")");
+    }
+
     // 从 DbResult 当前行映射生成实体实例
-    public static T MapRow(DbResult r, int row, OrmMeta meta) {
+    public static T MapRow(DbResult r, int row, Meta meta) {
         TypeInfo ti = (meta != null && meta.Type.Name.Length > 0) ? meta.Type : typeof(T);
         object obj = ti.CreateInstance();
         for (int i = 0; i < meta.Cols.Count; i = i + 1) {
-            OrmCol c = meta.Cols[i];
+            Col c = meta.Cols[i];
             int colIdx = r.GetColumnIndex(c.Col);
             if (colIdx < 0) {
                 colIdx = i;
             }
+            if (colIdx >= r.ColumnCount()) {
+                continue;
+            }
             if (c.Kind == 3) {
-                obj.SetFieldString(c.Field, r.GetString(row, colIdx));
+                if (r.IsNull(row, colIdx)) {
+                    obj.SetFieldObject(c.Field, null);
+                } else {
+                    obj.SetFieldString(c.Field, r.GetString(row, colIdx));
+                }
             } else if (c.Kind == 1) {
                 obj.SetFieldDouble(c.Field, r.GetDouble(row, colIdx));
             } else if (c.Kind == 2) {
@@ -117,29 +374,141 @@ public class OrmSelectQuery<T> {
     }
 
     public List<T> ToList() {
+        int savedLim = this.inner.limN;
+        int savedOff = this.inner.offN;
+        if (this.predicate != null) {
+            this.inner.limN = -1;
+            this.inner.offN = -1;
+        }
         DbResult r = this.inner.Rows();
+        this.inner.limN = savedLim;
+        this.inner.offN = savedOff;
         List<T> list = new List<T>();
         if (r == null) { return list; }
         int count = r.RowCount();
         for (int i = 0; i < count; i = i + 1) {
             T item = MapRow(r, i, this.meta);
             if (this.predicate == null || this.predicate(item)) {
-                list.Add(item);
+                if (this.havingPredicate == null || this.havingPredicate(item)) {
+                    if (this.includeFields.Count > 0) {
+                        this.PopulateNavigations(item);
+                    }
+                    list.Add(item);
+                }
             }
+        }
+        if (this.predicate != null && (savedLim >= 0 || savedOff > 0)) {
+            List<T> paged = new List<T>();
+            int start = savedOff > 0 ? savedOff : 0;
+            int take = savedLim >= 0 ? savedLim : list.Count;
+            for (int i = start; i < list.Count && paged.Count < take; i = i + 1) {
+                paged.Add(list[i]);
+            }
+            return paged;
         }
         return list;
     }
 
+    public void PopulateNavigations(T item) {
+        if (item == null || this.db == null) { return; }
+        object obj = (object)item;
+        TypeInfo ti = (this.meta != null && this.meta.Type.Name.Length > 0) ? this.meta.Type : typeof(T);
+        for (int k = 0; k < this.includeFields.Count; k = k + 1) {
+            string navField = this.includeFields[k];
+            string fkField = navField + "Id";
+            if (!ti.HasField(fkField)) {
+                fkField = navField + "id";
+            }
+            if (ti.HasField(fkField)) {
+                int fkid = obj.GetFieldInt(fkField);
+                for (int f = 0; f < ti.FieldCount; f = f + 1) {
+                    if (ti.GetFieldName(f) == navField) {
+                        string navType = ti.GetFieldType(f);
+                        DbResult navR = this.db.Query("SELECT * FROM " + navType + " WHERE id = " + Convert.ToString(fkid));
+                        if (navR != null && navR.RowCount() > 0) {
+                            TypeInfo navTi = ti.GetFieldTypeInfo(f);
+                            object navObj = navTi.CreateInstance();
+                            for (int nf = 0; nf < navTi.FieldCount; nf = nf + 1) {
+                                string colName = navTi.GetFieldName(nf);
+                                int col = navR.GetColumnIndex(colName);
+                                if (col >= 0) {
+                                    string cfType = navTi.GetFieldType(nf);
+                                    if (cfType == "string") {
+                                        navObj.SetFieldString(colName, navR.GetString(0, col));
+                                    } else if (cfType == "bool") {
+                                        navObj.SetFieldBool(colName, navR.GetInt(0, col) != 0);
+                                    } else if (cfType == "double" || cfType == "float") {
+                                        navObj.SetFieldDouble(colName, navR.GetDouble(0, col));
+                                    } else if (cfType == "long" || cfType == "ulong") {
+                                        navObj.SetFieldLong(colName, navR.GetLong(0, col));
+                                    } else {
+                                        navObj.SetFieldInt(colName, navR.GetInt(0, col));
+                                    }
+                                }
+                            }
+                            obj.SetFieldObject(navField, navObj);
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
     public async List<T> ToListAsync() {
-        DbResult r = await this.inner.RowsAsync();
+        return this.ToList();
+    }
+
+    // 反向关系：取某个父行的子集合。关系从子实体的导航声明反推
+    // （外键列 = <导航字段名>Id，与正向 Include 同一约定），调用方不写
+    // 外键列名。子实体有多个导航时 Children 抛异常——「反查哪个父」
+    // 只有调用方能回答，用 ChildrenOf 指明父表；没有导航或父表未知
+    // 返回空集合。
+    public List<T> Children(int id) {
+        return this.ChildrenOf("", id);
+    }
+
+    public List<T> Children(string id) {
+        return this.ChildrenOf("", id);
+    }
+
+    public List<T> ChildrenOf(string table, int id) {
+        Rel rel = Rel.Derive(this.meta, table);
+        if (rel == null) { return new List<T>(); }
+        Select q = Select.Create(this.db, this.meta);
+        rel.Apply(q, (long)id);
+        return this.MapAll(q.Rows());
+    }
+
+    public List<T> ChildrenOf(string table, string id) {
+        Rel rel = Rel.Derive(this.meta, table);
+        if (rel == null) { return new List<T>(); }
+        Select q = Select.Create(this.db, this.meta);
+        rel.Apply(q, id);
+        return this.MapAll(q.Rows());
+    }
+
+    public async List<T> ChildrenAsync(int id) {
+        return this.Children(id);
+    }
+
+    public async List<T> ChildrenAsync(string id) {
+        return this.Children(id);
+    }
+
+    public async List<T> ChildrenOfAsync(string table, int id) {
+        return this.ChildrenOf(table, id);
+    }
+
+    public async List<T> ChildrenOfAsync(string table, string id) {
+        return this.ChildrenOf(table, id);
+    }
+
+    List<T> MapAll(DbResult r) {
         List<T> list = new List<T>();
         if (r == null) { return list; }
-        int count = r.RowCount();
-        for (int i = 0; i < count; i = i + 1) {
-            T item = MapRow(r, i, this.meta);
-            if (this.predicate == null || this.predicate(item)) {
-                list.Add(item);
-            }
+        for (int i = 0; i < r.RowCount(); i = i + 1) {
+            list.Add(this.MapRow(r, i, this.meta));
         }
         return list;
     }
@@ -169,23 +538,65 @@ public class OrmSelectQuery<T> {
     }
 }
 
-// INSERT 写入驱动
-public class OrmInsertQuery {
-    public OrmInsert inner;
-    public OrmMeta meta;
+// 实体行的反射取值集合
+public class EntityRows<T> : IRows {
+    public List<T> items;
 
-    public OrmInsertQuery(IDbExecutor db, object entity, OrmMeta meta) {
+    public EntityRows() {
+        this.items = new List<T>();
+    }
+
+    public void Add(T item) {
+        this.items.Add(item);
+    }
+
+    public int RowCount() {
+        return this.items.Count;
+    }
+
+    public void BindCol(int row, Col c, DbParams ps) {
+        T item = this.items[row];
+        if (item == null) {
+            ps.AddNull();
+            return;
+        }
+        if (c.Kind == 3) {
+            ps.Add(((object)item).GetFieldString(c.Field));
+        } else if (c.Kind == 1) {
+            ps.AddDouble(((object)item).GetFieldDouble(c.Field));
+        } else if (c.Kind == 2) {
+            bool b = ((object)item).GetFieldBool(c.Field);
+            ps.AddInt(b ? 1 : 0);
+        } else if (c.Kind == 0 && c.I64) {
+            ps.AddLong(((object)item).GetFieldLong(c.Field));
+        } else {
+            ps.AddInt(((object)item).GetFieldInt(c.Field));
+        }
+    }
+}
+
+// INSERT 写入驱动
+public class InsertQuery {
+    public Insert inner;
+    public Meta meta;
+
+    public InsertQuery(IDbExecutor db, object entity, Meta meta) {
         this.meta = meta;
-        this.inner = OrmInsert.Create(db, this.meta);
+        this.inner = Insert.Create(db, this.meta);
         if (entity != null) {
             DbValues v = new DbValues();
             for (int i = 0; i < this.meta.Cols.Count; i = i + 1) {
-                OrmCol c = this.meta.Cols[i];
+                Col c = this.meta.Cols[i];
                 if (c.IsIdent) {
                     continue;
                 }
                 if (c.Kind == 3) {
-                    v.Set(c.Col, entity.GetFieldString(c.Field));
+                    object sv = entity.GetFieldObject(c.Field);
+                    if (sv == null) {
+                        v.SetNull(c.Col);
+                    } else {
+                        v.Set(c.Col, (string)sv);
+                    }
                 } else if (c.Kind == 1) {
                     v.Set(c.Col, entity.GetFieldDouble(c.Field));
                 } else if (c.Kind == 2) {
@@ -198,6 +609,18 @@ public class OrmInsertQuery {
             }
             this.inner.AddDict(v);
         }
+    }
+
+    public InsertQuery AppendDict(DbValues v) {
+        this.inner.AddDict(v);
+        return this;
+    }
+
+    public InsertQuery AppendDict(List<DbValues> vs) {
+        for (int i = 0; i < vs.Count; i = i + 1) {
+            this.inner.AddDict(vs[i]);
+        }
+        return this;
     }
 
     public int ExecuteAffrows() {
@@ -218,42 +641,47 @@ public class OrmInsertQuery {
 }
 
 // DELETE 删除驱动
-public class OrmDeleteQuery {
-    public OrmDelete inner;
-    public OrmMeta meta;
+public class DeleteQuery {
+    public Delete inner;
+    public Meta meta;
 
-    public OrmDeleteQuery(IDbExecutor db, OrmMeta meta) {
+    public DeleteQuery(IDbExecutor db, Meta meta) {
         this.meta = meta;
-        this.inner = OrmDelete.Create(db, this.meta);
+        this.inner = Delete.Create(db, this.meta);
     }
 
-    public OrmDeleteQuery WhereEq(string col, string val) {
+    public DeleteQuery WhereEq(string col, string val) {
         this.inner.WhereEq(col, val);
         return this;
     }
 
-    public OrmDeleteQuery WhereEq(string col, int val) {
+    public DeleteQuery WhereEq(string col, int val) {
         this.inner.WhereEq(col, val);
         return this;
     }
 
-    public OrmDeleteQuery WhereEq(string col, long val) {
+    public DeleteQuery WhereEq(string col, long val) {
         this.inner.WhereEq(col, val);
         return this;
     }
 
-    public OrmDeleteQuery WherePk(int id) {
+    public DeleteQuery WherePk(int id) {
         this.inner.WherePk(id);
         return this;
     }
 
-    public OrmDeleteQuery WherePk(long id) {
+    public DeleteQuery WherePk(long id) {
         this.inner.WherePk(id);
         return this;
     }
 
-    public OrmDeleteQuery WherePk(string id) {
+    public DeleteQuery WherePk(string id) {
         this.inner.WherePk(id);
+        return this;
+    }
+
+    public DeleteQuery WhereDict(DbValues v) {
+        this.inner.WhereDict(v);
         return this;
     }
 
@@ -266,27 +694,25 @@ public class OrmDeleteQuery {
     }
 }
 
-// 为 IDbConnection 与 IDbExecutor 挂接的纯库泛型扩展方法
-
 // UPDATE 更新驱动
-public class OrmUpdateQuery<T> {
-    public OrmUpdate inner;
-    public OrmMeta meta;
+public class UpdateQuery<T> {
+    public Update inner;
+    public Meta meta;
 
-    public OrmUpdateQuery(IDbExecutor db) {
-        this.meta = OrmMeta.For<T>();
-        this.inner = OrmUpdate.Create(db, this.meta);
+    public UpdateQuery(IDbExecutor db) {
+        this.meta = Meta.For<T>();
+        this.inner = Update.Create(db, this.meta);
     }
 
-    public OrmUpdateQuery(IDbExecutor db, OrmMeta meta) {
+    public UpdateQuery(IDbExecutor db, Meta meta) {
         this.meta = meta;
-        this.inner = OrmUpdate.Create(db, this.meta);
+        this.inner = Update.Create(db, this.meta);
     }
 
     public string DetectColInt(Func<T, int> expr) {
         TypeInfo ti = (this.meta != null && this.meta.Type.Name.Length > 0) ? this.meta.Type : typeof(T);
         for (int i = 0; i < this.meta.Cols.Count; i = i + 1) {
-            OrmCol c = this.meta.Cols[i];
+            Col c = this.meta.Cols[i];
             if (c.Kind == 0) {
                 object dummy = ti.CreateInstance();
                 if (dummy == null) { break; }
@@ -303,7 +729,7 @@ public class OrmUpdateQuery<T> {
     public string DetectColLong(Func<T, long> expr) {
         TypeInfo ti = (this.meta != null && this.meta.Type.Name.Length > 0) ? this.meta.Type : typeof(T);
         for (int i = 0; i < this.meta.Cols.Count; i = i + 1) {
-            OrmCol c = this.meta.Cols[i];
+            Col c = this.meta.Cols[i];
             if (c.Kind == 0 && c.I64) {
                 object dummy = ti.CreateInstance();
                 if (dummy == null) { break; }
@@ -320,14 +746,14 @@ public class OrmUpdateQuery<T> {
     public string DetectColDouble(Func<T, double> expr) {
         TypeInfo ti = (this.meta != null && this.meta.Type.Name.Length > 0) ? this.meta.Type : typeof(T);
         for (int i = 0; i < this.meta.Cols.Count; i = i + 1) {
-            OrmCol c = this.meta.Cols[i];
+            Col c = this.meta.Cols[i];
             if (c.Kind == 1) {
                 object dummy = ti.CreateInstance();
                 if (dummy == null) { break; }
-                dummy.SetFieldDouble(c.Field, 987654.0);
+                dummy.SetFieldDouble(c.Field, 987654.25);
                 try {
                     double res = expr((T)dummy);
-                    if (res == 987654.0) { return c.Col; }
+                    if (res == 987654.25) { return c.Col; }
                 } catch {}
             }
         }
@@ -337,14 +763,14 @@ public class OrmUpdateQuery<T> {
     public string DetectColString(Func<T, string> expr) {
         TypeInfo ti = (this.meta != null && this.meta.Type.Name.Length > 0) ? this.meta.Type : typeof(T);
         for (int i = 0; i < this.meta.Cols.Count; i = i + 1) {
-            OrmCol c = this.meta.Cols[i];
+            Col c = this.meta.Cols[i];
             if (c.Kind == 3) {
                 object dummy = ti.CreateInstance();
                 if (dummy == null) { break; }
-                dummy.SetFieldString(c.Field, "__detect__");
+                dummy.SetFieldString(c.Field, "__detect_marker__");
                 try {
                     string res = expr((T)dummy);
-                    if (res == "__detect__") { return c.Col; }
+                    if (res == "__detect_marker__") { return c.Col; }
                 } catch {}
             }
         }
@@ -354,7 +780,7 @@ public class OrmUpdateQuery<T> {
     public string DetectColBool(Func<T, bool> expr) {
         TypeInfo ti = (this.meta != null && this.meta.Type.Name.Length > 0) ? this.meta.Type : typeof(T);
         for (int i = 0; i < this.meta.Cols.Count; i = i + 1) {
-            OrmCol c = this.meta.Cols[i];
+            Col c = this.meta.Cols[i];
             if (c.Kind == 2) {
                 object dummy = ti.CreateInstance();
                 if (dummy == null) { break; }
@@ -367,65 +793,65 @@ public class OrmUpdateQuery<T> {
         return this.meta.Cols.Count > 0 ? this.meta.Cols[this.meta.Cols.Count - 1].Col : "";
     }
 
-    public OrmUpdateQuery<T> Set(Func<T, int> expr, int val) {
+    public UpdateQuery<T> Set(Func<T, int> expr, int val) {
         string col = this.DetectColInt(expr);
         if (col.Length > 0) { this.inner.SetI(col, val); }
         return this;
     }
 
-    public OrmUpdateQuery<T> Set(Func<T, long> expr, long val) {
+    public UpdateQuery<T> Set(Func<T, long> expr, long val) {
         string col = this.DetectColLong(expr);
         if (col.Length > 0) { this.inner.SetL(col, val); }
         return this;
     }
 
-    public OrmUpdateQuery<T> Set(Func<T, double> expr, double val) {
+    public UpdateQuery<T> Set(Func<T, double> expr, double val) {
         string col = this.DetectColDouble(expr);
         if (col.Length > 0) { this.inner.SetD(col, val); }
         return this;
     }
 
-    public OrmUpdateQuery<T> Set(Func<T, string> expr, string val) {
+    public UpdateQuery<T> Set(Func<T, string> expr, string val) {
         string col = this.DetectColString(expr);
         if (col.Length > 0) { this.inner.SetS(col, val); }
         return this;
     }
 
-    public OrmUpdateQuery<T> Set(Func<T, bool> expr, bool val) {
+    public UpdateQuery<T> Set(Func<T, bool> expr, bool val) {
         string col = this.DetectColBool(expr);
         if (col.Length > 0) { this.inner.SetB(col, val); }
         return this;
     }
 
-    public OrmUpdateQuery<T> Set(string col, int val) {
+    public UpdateQuery<T> Set(string col, int val) {
         this.inner.SetI(col, val);
         return this;
     }
 
-    public OrmUpdateQuery<T> Set(string col, long val) {
+    public UpdateQuery<T> Set(string col, long val) {
         this.inner.SetL(col, val);
         return this;
     }
 
-    public OrmUpdateQuery<T> Set(string col, double val) {
+    public UpdateQuery<T> Set(string col, double val) {
         this.inner.SetD(col, val);
         return this;
     }
 
-    public OrmUpdateQuery<T> Set(string col, string val) {
+    public UpdateQuery<T> Set(string col, string val) {
         this.inner.SetS(col, val);
         return this;
     }
 
-    public OrmUpdateQuery<T> Set(string col, bool val) {
+    public UpdateQuery<T> Set(string col, bool val) {
         this.inner.SetB(col, val);
         return this;
     }
 
-    public OrmUpdateQuery<T> Where(Func<T, bool> expr) {
+    public UpdateQuery<T> Where(Func<T, bool> expr) {
         TypeInfo ti = (this.meta != null && this.meta.Type.Name.Length > 0) ? this.meta.Type : typeof(T);
         for (int i = 0; i < this.meta.Cols.Count; i = i + 1) {
-            OrmCol c = this.meta.Cols[i];
+            Col c = this.meta.Cols[i];
             object dummy = ti.CreateInstance();
             if (dummy == null) { break; }
             if (c.IsPk || c.Kind == 0) {
@@ -444,31 +870,90 @@ public class OrmUpdateQuery<T> {
         return this;
     }
 
-    public OrmUpdateQuery<T> WhereEq(string col, int val) {
+    public UpdateQuery<T> WhereEq(string col, int val) {
         this.inner.WhereEq(col, val);
         return this;
     }
 
-    public OrmUpdateQuery<T> WhereEq(string col, string val) {
+    public UpdateQuery<T> WhereEq(string col, string val) {
         this.inner.WhereEq(col, val);
         return this;
     }
 
-    public OrmUpdateQuery<T> WherePk(int id) {
-        OrmCol pk = this.meta.PkCol();
+    public UpdateQuery<T> WherePk(int id) {
+        Col pk = this.meta.PkCol();
         if (pk != null) { this.inner.WhereEq(pk.Col, id); }
         return this;
     }
 
-    public OrmUpdateQuery<T> WherePk(long id) {
-        OrmCol pk = this.meta.PkCol();
+    public UpdateQuery<T> WherePk(long id) {
+        Col pk = this.meta.PkCol();
         if (pk != null) { this.inner.WhereEq(pk.Col, id); }
         return this;
     }
 
-    public OrmUpdateQuery<T> WherePk(string id) {
-        OrmCol pk = this.meta.PkCol();
+    public UpdateQuery<T> WherePk(string id) {
+        Col pk = this.meta.PkCol();
         if (pk != null) { this.inner.WhereEq(pk.Col, id); }
+        return this;
+    }
+
+    public UpdateQuery<T> SetDict(DbValues v) {
+        this.inner.SetDict(v);
+        return this;
+    }
+
+    public UpdateQuery<T> WhereDict(DbValues v) {
+        this.inner.WhereDict(v);
+        return this;
+    }
+
+    public UpdateQuery<T> SetSource(T entity) {
+        if (entity != null) {
+            EntityRows<T> rows = new EntityRows<T>();
+            rows.Add(entity);
+            this.inner.SetSource(rows);
+        }
+        return this;
+    }
+
+    public UpdateQuery<T> UpdateColumns(Func<T, int> expr) {
+        string col = this.DetectColInt(expr);
+        if (col.Length > 0) { this.inner.Only(col); }
+        return this;
+    }
+
+    public UpdateQuery<T> UpdateColumns(Func<T, long> expr) {
+        string col = this.DetectColLong(expr);
+        if (col.Length > 0) { this.inner.Only(col); }
+        return this;
+    }
+
+    public UpdateQuery<T> UpdateColumns(Func<T, double> expr) {
+        string col = this.DetectColDouble(expr);
+        if (col.Length > 0) { this.inner.Only(col); }
+        return this;
+    }
+
+    public UpdateQuery<T> UpdateColumns(Func<T, string> expr) {
+        string col = this.DetectColString(expr);
+        if (col.Length > 0) { this.inner.Only(col); }
+        return this;
+    }
+
+    public UpdateQuery<T> UpdateColumns(Func<T, bool> expr) {
+        string col = this.DetectColBool(expr);
+        if (col.Length > 0) { this.inner.Only(col); }
+        return this;
+    }
+
+    public UpdateQuery<T> UpdateColumns(string col) {
+        this.inner.Only(col);
+        return this;
+    }
+
+    public UpdateQuery<T> IgnoreColumns(string col) {
+        this.inner.Skip(col);
         return this;
     }
 
@@ -481,53 +966,153 @@ public class OrmUpdateQuery<T> {
     }
 }
 
-public static class DbOrmExtensions {
-    public static OrmSelectQuery<T> Select<T>(this IDbConnection db) {
-        return new OrmSelectQuery<T>(db, OrmMeta.For<T>());
+// 为 IDbConnection 与 IDbExecutor 挂接的纯库泛型扩展方法
+public static class DbExtensions {
+    public static SelectQuery<T> Select<T>(this IDbConnection db) {
+        return new SelectQuery<T>(db, Meta.For<T>());
     }
 
-    public static OrmSelectQuery<T> Select<T>(this IDbExecutor db) {
-        return new OrmSelectQuery<T>(db, OrmMeta.For<T>());
+    public static SelectQuery<T> Select<T>(this IDbExecutor db) {
+        return new SelectQuery<T>(db, Meta.For<T>());
     }
 
-    public static OrmInsertQuery Insert<T>(this IDbConnection db, T entity) {
-        return new OrmInsertQuery(db, entity, OrmMeta.For<T>());
+    public static SelectQuery<T> Query<T>(this IDbConnection db) {
+        return new SelectQuery<T>(db, Meta.For<T>());
     }
 
-    public static OrmInsertQuery Insert<T>(this IDbExecutor db, T entity) {
-        return new OrmInsertQuery(db, entity, OrmMeta.For<T>());
+    public static SelectQuery<T> Query<T>(this IDbExecutor db) {
+        return new SelectQuery<T>(db, Meta.For<T>());
     }
 
-    public static OrmDeleteQuery Delete<T>(this IDbConnection db) {
-        return new OrmDeleteQuery(db, OrmMeta.For<T>());
+    public static InsertQuery Insert<T>(this IDbConnection db) {
+        return new InsertQuery(db, null, Meta.For<T>());
     }
 
-    public static OrmDeleteQuery Delete<T>(this IDbExecutor db) {
-        return new OrmDeleteQuery(db, OrmMeta.For<T>());
+    public static InsertQuery Insert<T>(this IDbExecutor db) {
+        return new InsertQuery(db, null, Meta.For<T>());
     }
 
-    public static OrmUpdateQuery<T> Update<T>(this IDbConnection db) {
-        return new OrmUpdateQuery<T>(db, OrmMeta.For<T>());
+    public static InsertQuery Insert<T>(this IDbConnection db, T entity) {
+        return new InsertQuery(db, entity, Meta.For<T>());
     }
 
-    public static OrmUpdateQuery<T> Update<T>(this IDbExecutor db) {
-        return new OrmUpdateQuery<T>(db, OrmMeta.For<T>());
+    public static InsertQuery Insert<T>(this IDbExecutor db, T entity) {
+        return new InsertQuery(db, entity, Meta.For<T>());
+    }
+
+    public static InsertQuery Insert<T>(this IDbConnection db, List<T> entities) {
+        InsertQuery q = new InsertQuery(db, null, Meta.For<T>());
+        if (entities != null) {
+            for (int i = 0; i < entities.Count; i = i + 1) {
+                T entity = entities[i];
+                DbValues v = new DbValues();
+                for (int j = 0; j < q.meta.Cols.Count; j = j + 1) {
+                    Col c = q.meta.Cols[j];
+                    if (c.IsIdent) { continue; }
+                    if (c.Kind == 3) {
+                        object sv = ((object)entity).GetFieldObject(c.Field);
+                        if (sv == null) {
+                            v.SetNull(c.Col);
+                        } else {
+                            v.Set(c.Col, (string)sv);
+                        }
+                    } else if (c.Kind == 1) {
+                        v.Set(c.Col, ((object)entity).GetFieldDouble(c.Field));
+                    } else if (c.Kind == 2) {
+                        v.Set(c.Col, ((object)entity).GetFieldBool(c.Field));
+                    } else if (c.Kind == 0 && c.I64) {
+                        v.Set(c.Col, ((object)entity).GetFieldLong(c.Field));
+                    } else {
+                        v.Set(c.Col, ((object)entity).GetFieldInt(c.Field));
+                    }
+                }
+                q.inner.AddDict(v);
+            }
+        }
+        return q;
+    }
+
+    public static InsertQuery Insert<T>(this IDbExecutor db, List<T> entities) {
+        InsertQuery q = new InsertQuery(db, null, Meta.For<T>());
+        if (entities != null) {
+            for (int i = 0; i < entities.Count; i = i + 1) {
+                T entity = entities[i];
+                DbValues v = new DbValues();
+                for (int j = 0; j < q.meta.Cols.Count; j = j + 1) {
+                    Col c = q.meta.Cols[j];
+                    if (c.IsIdent) { continue; }
+                    if (c.Kind == 3) {
+                        object sv = ((object)entity).GetFieldObject(c.Field);
+                        if (sv == null) {
+                            v.SetNull(c.Col);
+                        } else {
+                            v.Set(c.Col, (string)sv);
+                        }
+                    } else if (c.Kind == 1) {
+                        v.Set(c.Col, ((object)entity).GetFieldDouble(c.Field));
+                    } else if (c.Kind == 2) {
+                        v.Set(c.Col, ((object)entity).GetFieldBool(c.Field));
+                    } else if (c.Kind == 0 && c.I64) {
+                        v.Set(c.Col, ((object)entity).GetFieldLong(c.Field));
+                    } else {
+                        v.Set(c.Col, ((object)entity).GetFieldInt(c.Field));
+                    }
+                }
+                q.inner.AddDict(v);
+            }
+        }
+        return q;
+    }
+
+    public static DeleteQuery Delete<T>(this IDbConnection db) {
+        return new DeleteQuery(db, Meta.For<T>());
+    }
+
+    public static DeleteQuery Delete<T>(this IDbExecutor db) {
+        return new DeleteQuery(db, Meta.For<T>());
+    }
+
+    public static UpdateQuery<T> Update<T>(this IDbConnection db) {
+        return new UpdateQuery<T>(db, Meta.For<T>());
+    }
+
+    public static UpdateQuery<T> Update<T>(this IDbExecutor db) {
+        return new UpdateQuery<T>(db, Meta.For<T>());
     }
 
     public static void SyncStructure<T>(this IDbConnection db) {
-        OrmSync.Sync(db, OrmMeta.For<T>());
+        Sync.Sync(db, Meta.For<T>());
     }
 
     public static void SyncStructure<T>(this IDbExecutor db) {
-        OrmSync.Sync(db, OrmMeta.For<T>());
+        Sync.Sync(db, Meta.For<T>());
     }
 
     public static async void SyncStructureAsync<T>(this IDbConnection db) {
-        await OrmSync.SyncAsync(db, OrmMeta.For<T>());
+        await Sync.SyncAsync(db, Meta.For<T>());
     }
 
     public static async void SyncStructureAsync<T>(this IDbExecutor db) {
-        await OrmSync.SyncAsync(db, OrmMeta.For<T>());
+        await Sync.SyncAsync(db, Meta.For<T>());
     }
+}
 
+// 兼容别名
+public static class DbOrmExtensions {
+    public static SelectQuery<T> Select<T>(this IDbConnection db) { return DbExtensions.Select<T>(db); }
+    public static SelectQuery<T> Select<T>(this IDbExecutor db) { return DbExtensions.Select<T>(db); }
+    public static SelectQuery<T> Query<T>(this IDbConnection db) { return DbExtensions.Query<T>(db); }
+    public static SelectQuery<T> Query<T>(this IDbExecutor db) { return DbExtensions.Query<T>(db); }
+    public static InsertQuery Insert<T>(this IDbConnection db) { return DbExtensions.Insert<T>(db); }
+    public static InsertQuery Insert<T>(this IDbExecutor db) { return DbExtensions.Insert<T>(db); }
+    public static InsertQuery Insert<T>(this IDbConnection db, T entity) { return DbExtensions.Insert<T>(db, entity); }
+    public static InsertQuery Insert<T>(this IDbExecutor db, T entity) { return DbExtensions.Insert<T>(db, entity); }
+    public static InsertQuery Insert<T>(this IDbConnection db, List<T> entities) { return DbExtensions.Insert<T>(db, entities); }
+    public static InsertQuery Insert<T>(this IDbExecutor db, List<T> entities) { return DbExtensions.Insert<T>(db, entities); }
+    public static DeleteQuery Delete<T>(this IDbConnection db) { return DbExtensions.Delete<T>(db); }
+    public static DeleteQuery Delete<T>(this IDbExecutor db) { return DbExtensions.Delete<T>(db); }
+    public static UpdateQuery<T> Update<T>(this IDbConnection db) { return DbExtensions.Update<T>(db); }
+    public static UpdateQuery<T> Update<T>(this IDbExecutor db) { return DbExtensions.Update<T>(db); }
+    public static void SyncStructure<T>(this IDbConnection db) { DbExtensions.SyncStructure<T>(db); }
+    public static void SyncStructure<T>(this IDbExecutor db) { DbExtensions.SyncStructure<T>(db); }
 }

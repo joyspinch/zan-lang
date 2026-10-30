@@ -2254,7 +2254,11 @@ static LLVMValueRef refl_set_fn(zan_irgen_t *g) {
     LLVMValueRef ref_ov = LLVMBuildLoad2(g->builder, i8ptr, ref_sp, "refl.stref_ov");
     zan_call2(g->builder, arc_ty, g->rt_retain, &ref_nv, 1, "");
     LLVMBuildStore(g->builder, ref_nv, ref_sp);
-    zan_call2(g->builder, arc_ty, g->rt_release, &ref_ov, 1, "");
+    /* 覆写丢弃的旧值是类实例：必须走 dyn 释放（按对象头里的 dtor
+     * 分发到类型化释放体），否则它的字符串/引用字段不会被释放——
+     * 浅释放只减计数不 walk 字段，旧值的子对象整串泄漏
+     * （ORM Include 反复覆写导航字段时每轮漏一个，探针 pH5/pH7）。 */
+    zan_call2(g->builder, arc_ty, g->rt_release_dyn, &ref_ov, 1, "");
     LLVMBuildBr(g->builder, yes);
 
     LLVMPositionBuilderAtEnd(g->builder, yes);
@@ -2549,6 +2553,11 @@ static bool refl_emit_typeinfo_member(zan_irgen_t *g, LLVMValueRef ti,
         LLVMValueRef nm = refl_arg_str(g, arg0, locals);
         *out = LLVMBuildICmp(g->builder, LLVMIntSGE,
             refl_mfind(g, ti, nm, 0), LLVMConstInt(i64, 0, 0), "refl.mhas");
+        /* 实参 temp 归属：拼接/调用产出的 fresh owned 名串在 mfind 消费完
+         * 释放；局部变量/字段/字面量是借用，不得动（否则双重释放）。
+         * 曾经不管不问——ORM 的 `HasField(a + b)` 每次调用漏一个串
+         * （Include 循环里每轮 3 个，probe pQL5/pQL8）。 */
+        if (arg0) emit_release_owned_call_temp(g, arg0, nm, locals);
         return true;
     }
     case ZAN_REFL_M_MSTATIC: {   /* IsMethodStatic(i) */
@@ -2746,6 +2755,9 @@ static bool refl_emit_typeinfo_member(zan_irgen_t *g, LLVMValueRef ti,
             LLVMFunctionType(i64, (LLVMTypeRef[]){ i8ptr, i8ptr }, 2, 0),
             refl_find_fn(g), (LLVMValueRef[]){ ti,
                 LLVMBuildBitCast(g->builder, nm, i8ptr, "refl.nm") }, 2, "refl.f");
+        /* 实参 temp 归属：同 M_MHAS——fresh owned 名串消费完释放，
+         * 借用实参不动。 */
+        if (arg0) emit_release_owned_call_temp(g, arg0, nm, locals);
         *out = LLVMBuildICmp(g->builder, LLVMIntSGE, found,
                              LLVMConstInt(i64, 0, 0), "refl.has");
         return true;

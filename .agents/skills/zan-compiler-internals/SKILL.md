@@ -920,3 +920,56 @@ description: zanc 编译器内部（parser/checker/irgen/runtime/ABI）设计契
       新的泄漏类别，不必加运行时函数或新槽类型：入口存 old_top，正常返回
       走 disarm 免释放回退，抛出走 unwind 按槽 kind 释放。A528（结构体
       ctor 字段）零运行时改动闭环即此模式。
+
+55. **ARC 分配点编号从 1 起，site 0 是运行时的"未跟踪"哨兵**：
+    - 动作：`reserve_arc_site` 的站点索引一律从 1 开始分配（0 号槽永远
+      留空，去重循环也从 1 起扫）。
+    - 理由：运行时把对象头里的 site==0 当作"无站点"——
+      `refl_obj_type_fn` 的动态类型解析带 `site > 0` 守卫，rt_alloc 零
+      初始化的头部天然是 0。站点若从 0 起数，第一个抢到 0 号的类型
+      （往往是主文件里第一个带分配的类——主文件先于 stdlib 发射），
+      其所有对象的动态反射 Set/Get 会被守卫拒绝而**静默失效**（读回
+      恒 0，无任何诊断）。坑出处：ORM 探针式列名检测（对 dummy 实体
+      写入哨兵值再回调 lambda 验证）在插桩构建下全部落兜底列，聚合
+      SUM 变成 SUM(主键)；最小复现只差一个"类内 static 方法含 new"。
+    - 判定器：conformance 反射用例在 `--check-leaks` 下的读写回读；
+      探针 pOff 系（同构类去掉 static 方法即恢复）。
+56. **覆写丢弃的引用字段旧值必须走 dyn 释放，浅释放会整串泄漏**：
+    - 动作：任何"覆写引用字段/槽位"的发射路径（反射 SetFieldObject
+      的 FK_REF 分支等），丢旧值必须调 `zan_rt_release_dyn`（按对象头
+      的 dtor 分发到类型化释放体）；`zan_rt_release` 是浅释放——只减
+      计数不 walk 字段。
+    - 理由：旧值若是类实例，浅释放后它的 string/引用字段全部滞留——
+      ARC 泄漏计数线性增长且 per-site 归因缺失（泄漏对象在别的 TU 里
+      分配时站点表对不上）。坑出处：ORM Include 每轮覆写导航字段漏
+      约 3 个对象（导航实例+其名字串），10 次循环漏 30 的探针实锤；
+      同构探针把覆写改成局部变量作用域释放就干净， proving 问题只在
+      覆写路径。
+    - 边界：覆盖前旧值可能为 null（rt_release_dyn 首判空，安全）；
+      字符串字段用 rt_str_release 的同理只适用于串本身。
+57. **反射 Set/Has 类名字实参的所有权判定必须显式做**：
+    - 动作：`TypeInfo.HasField/HasMethod` 等吃名字串的反射内建，发射
+      实参后必须调 `emit_release_owned_call_temp`——拼接/调用产出的
+      fresh owned 名串在消费完释放；局部变量/字段/字面量是借用，
+      该函数内部识别并安全跳过。
+    - 理由：这些内建直接 `emit_expr` 吃掉实参却从不释放，产 owned 的
+      实参每次调用漏一个串；循环里 `HasField(a + b)` 每轮漏一个，
+      泄漏量与迭代数精确线性（n 次调用 n 个对象），极易误判为
+      "缓存泄漏"。坑出处：ORM Include 循环里 `HasField(fname + "Id")
+      || HasField(fname + "id")`，10 轮漏 40。
+    - 判定器：同构探针——把实参从字面量换成拼接，泄漏量应保持 0。
+58. **泛型实例收集路径没有词法作用域（locals=NULL）**：
+    - 动作：`collect_inst_expr`（收集泛型实例化清单）调用
+      `method_ret_type_at` 等类型推断时传的 locals 是 NULL；被调链里
+      凡是要把实参表达式交给 `infer_expr_type`/`local_find` 的推导
+      （lambda 形参绑定、实参类型合一），必须先判空提前返回——
+      `local_find` 对 NULL scope 直接解引用。显式 type_args 的绑定
+      不需要作用域，保留。
+    - 理由：`M<T>(json, x => ...)` 这类"显式类型实参 + lambda 实参"
+      的调用走进收集路径就在编译期段错误；程序里只要有一个这种调用
+      整个编译崩。坑出处：JSON 门面 `ParseScoped<T>(json, lambda)`
+      编译即崩，json_scoped_scratch/reflect 系用例全红；修复只加了
+      一个 `if (!locals) return;`。
+    - 边界：collect 路径丢了 lambda 形参类型带来的 TP 绑定能力，
+      但显式 `<T>` 绑定已够用（返回类型代换仍正确）；若未来要在
+      collect 里做完整推断，需先给收集器建独立作用域。

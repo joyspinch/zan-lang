@@ -1955,10 +1955,12 @@ static void checker_check_method_call_constraints(zan_checker_t *c,
 }
 
 static zan_symbol_t *checker_find_method_typed(zan_checker_t *c,
+                                                zan_type_t *recv_type,
                                                 zan_symbol_t *type_sym,
                                                 zan_istr_t name,
                                                 zan_ast_node_t *call,
-                                                zan_type_t **args) {    zan_symbol_t *best = NULL;
+                                                zan_type_t **args) {
+    zan_symbol_t *best = NULL;
     int best_score = -1;
     /* null 实参把候选判死的现场：留一份用于报错（见函数末尾）。 */
     zan_type_t *null_bad_type = NULL;
@@ -2013,6 +2015,46 @@ static zan_symbol_t *checker_find_method_typed(zan_checker_t *c,
                         zan_type_t *lpt = zan_binder_resolve_type(c->binder, lp->param.type);
                         zan_type_t *dpt = pt->delegate_param_types[k];
                         if (lpt && dpt && checker_type_equal(lpt, dpt)) score += 1;
+                    }
+                    if (pt->delegate_ret_type && lam->lambda.body &&
+                        lam->lambda.body->kind != AST_BLOCK &&
+                        lam->lambda.params.count == 1 && pt->delegate_param_count == 1) {
+                        zan_ast_node_t *lp = lam->lambda.params.items[0];
+                        zan_ast_node_t *body = lam->lambda.body;
+                        if (lp && lp->kind == AST_PARAM && body->kind == AST_MEMBER_ACCESS &&
+                            body->member.object && body->member.object->kind == AST_IDENTIFIER &&
+                            body->member.object->ident.name.len == lp->param.name.len &&
+                            memcmp(body->member.object->ident.name.str, lp->param.name.str, lp->param.name.len) == 0) {
+                            zan_type_t *param_t = pt->delegate_param_types[0];
+                            if (param_t && param_t->kind == TYPE_TYPE_PARAM && recv_type && recv_type->type_arg_count > 0) {
+                                if (type_sym && type_sym->decl && (type_sym->decl->kind == AST_CLASS_DECL || type_sym->decl->kind == AST_STRUCT_DECL)) {
+                                    zan_ast_list_t *tps = &type_sym->decl->type_decl.type_params;
+                                    for (int tp_i = 0; tp_i < tps->count && tp_i < recv_type->type_arg_count; tp_i++) {
+                                        zan_ast_node_t *tpn = tps->items[tp_i];
+                                        if (tpn && tpn->param.name.len == param_t->name.len &&
+                                            memcmp(tpn->param.name.str, param_t->name.str, param_t->name.len) == 0) {
+                                            param_t = recv_type->type_args[tp_i];
+                                            break;
+                                        }
+                                    }
+                                } else if (recv_type->type_arg_count == 1) {
+                                    param_t = recv_type->type_args[0];
+                                }
+                            }
+                            zan_symbol_t *tsym = param_t ? (param_t->sym ? param_t->sym : (param_t->name.len ? zan_binder_lookup(c->binder, param_t->name) : NULL)) : NULL;
+                            if (tsym) {
+                                zan_symbol_t *f = checker_find_field(tsym, body->member.name);
+                                if (f && f->type) {
+                                    if (checker_type_equal(f->type, pt->delegate_ret_type) ||
+                                        checker_type_assignable(pt->delegate_ret_type, f->type)) {
+                                        score += 8;
+                                    } else {
+                                        compatible = false;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
                     }
                     continue;
                 }
@@ -3172,7 +3214,7 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
                 expr->call.callee->member.name, expr, arg_types);
         }
         if (callee_is_method && recv && recv->sym) {
-            zan_symbol_t *typed = checker_find_method_typed(c, recv->sym,
+            zan_symbol_t *typed = checker_find_method_typed(c, recv, recv->sym,
                 expr->call.callee->member.name, expr, arg_types);
             if (typed && typed != called_sym) {
                 if (!access_member_allowed(c, typed)) {
@@ -3191,6 +3233,7 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
             c->current_type_sym &&
             (!called_sym || called_sym->kind == SYM_METHOD)) {
             zan_symbol_t *resolved = checker_find_method_typed(c,
+                c->current_type_sym ? c->current_type_sym->type : NULL,
                 c->current_type_sym, expr->call.callee->ident.name,
                 expr, arg_types);
             if (resolved) called_sym = resolved;
@@ -4910,49 +4953,63 @@ static zan_type_t *check_member_access(zan_checker_t *c, zan_ast_node_t *expr,
         return c->binder->type_error;
     }
     if (obj_type && obj_type->sym) {
+        /* 同名冲突裁决：构造器名 == 类型名，它会和同名字段一起命中——
+         * SYM_CONSTRUCTOR 不是 "." 取值成员，必须跳过让字段赢（C# 同规：
+         * 只有当所有同名成员都是方法时才按方法组处理）。构造器符号的
+         * ->type 是类自身的类型，不跳过就会把 `c.Col` 定型成类 Col。 */
+        zan_symbol_t *hit = NULL;
+        zan_ast_node_t *hit_decl = NULL;
+        bool saw_method = false;
         for (zan_symbol_t *s = obj_type->sym; s;
              s = (s->type && s->type->base_type) ? s->type->base_type->sym : NULL) {
             for (int i = s->member_count - 1; i >= 0; i--) {
                 zan_symbol_t *m = s->members[i];
-                if (!m) continue;
-                if (m->name.len == expr->member.name.len &&
-                    memcmp(m->name.str, expr->member.name.str, m->name.len) == 0) {
-                    if (!access_member_allowed(c, m)) {
-                        report_inaccessible(c, m, expr->loc);
-                        return c->binder->type_error;
-                    }
-                    if (m->kind == SYM_METHOD)
-                        return c->binder->type_error;
-                    if (m->kind == SYM_FIELD && (m->modifiers & MOD_STATIC) &&
-                        expr->member.object &&
-                        receiver_is_value_expr(c, expr->member.object)) {
-                        zan_diag_emit_code(c->diag, DIAG_ERROR, expr->loc, 2088,
-                                      "'%.*s' is a static field of '%.*s'; "
-                                      "qualify it with the type name "
-                                      "('%.*s.%.*s'), not an instance",
-                                      (int)expr->member.name.len,
-                                      expr->member.name.str,
-                                      (int)obj_type->sym->name.len,
-                                      obj_type->sym->name.str,
-                                      (int)obj_type->sym->name.len,
-                                      obj_type->sym->name.str,
-                                      (int)expr->member.name.len,
-                                      expr->member.name.str);
-                        return c->binder->type_error;
-                    }
-                    zan_type_t *mt = m->type;
-                    if (mt && obj_type->type_args && obj_type->type_arg_count > 0 &&
-                        s->decl &&
-                        (s->decl->kind == AST_CLASS_DECL ||
-                         s->decl->kind == AST_STRUCT_DECL)) {
-                        zan_ast_list_t *tps = &s->decl->type_decl.type_params;
-                        if (tps->count == obj_type->type_arg_count) {
-                            mt = zan_binder_subst_named(c->binder, mt, tps, obj_type->type_args);
-                        }
-                    }
-                    return mt ? mt : c->binder->type_error;
+                if (!m || m->name.len != expr->member.name.len ||
+                    memcmp(m->name.str, expr->member.name.str, m->name.len) != 0)
+                    continue;
+                if (m->kind == SYM_CONSTRUCTOR) continue;
+                if (m->kind == SYM_METHOD) { saw_method = true; continue; }
+                if (!hit) { hit = m; hit_decl = s->decl; }
+            }
+            if (hit) break;
+        }
+        if (hit) {
+            if (!access_member_allowed(c, hit)) {
+                report_inaccessible(c, hit, expr->loc);
+                return c->binder->type_error;
+            }
+            if (hit->kind == SYM_FIELD && (hit->modifiers & MOD_STATIC) &&
+                expr->member.object &&
+                receiver_is_value_expr(c, expr->member.object)) {
+                zan_diag_emit_code(c->diag, DIAG_ERROR, expr->loc, 2088,
+                              "'%.*s' is a static field of '%.*s'; "
+                              "qualify it with the type name "
+                              "('%.*s.%.*s'), not an instance",
+                              (int)expr->member.name.len,
+                              expr->member.name.str,
+                              (int)obj_type->sym->name.len,
+                              obj_type->sym->name.str,
+                              (int)obj_type->sym->name.len,
+                              obj_type->sym->name.str,
+                              (int)expr->member.name.len,
+                              expr->member.name.str);
+                return c->binder->type_error;
+            }
+            zan_type_t *mt = hit->type;
+            if (mt && obj_type->type_args && obj_type->type_arg_count > 0 &&
+                hit_decl &&
+                (hit_decl->kind == AST_CLASS_DECL ||
+                 hit_decl->kind == AST_STRUCT_DECL)) {
+                zan_ast_list_t *tps = &hit_decl->type_decl.type_params;
+                if (tps->count == obj_type->type_arg_count) {
+                    mt = zan_binder_subst_named(c->binder, mt, tps, obj_type->type_args);
                 }
             }
+            return mt ? mt : c->binder->type_error;
+        }
+        if (saw_method) {
+            /* 只命中方法/构造器：方法组不能当值用（老语义保持） */
+            return c->binder->type_error;
         }
     }
     {

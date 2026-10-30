@@ -2,45 +2,45 @@ using System;
 using System.Data;
 namespace System.Data.Orm;
 
-public class OrmMeta {
+public class Meta {
     public string Entity;
     public string Table;
     public TypeInfo Type;
-    public List<OrmCol> Cols;
-    public List<OrmNav> Navs;
-    public List<OrmIndex> Idx;
-    public Dict<string, OrmCol> byCol;
+    public List<Col> Cols;
+    public List<Nav> Navs;
+    public List<Index> Idx;
+    public Dict<string, Col> byCol;
     public string selList;
     public bool frozen;
 
-    public OrmMeta(string entity, string table) {
+    public Meta(string entity, string table) {
         this.Entity = entity;
         this.Table = QueryBuilder.RequireIdent(table);
-        this.Cols = new List<OrmCol>();
-        this.Navs = new List<OrmNav>();
-        this.Idx = new List<OrmIndex>();
-        this.byCol = new Dict<string, OrmCol>();
+        this.Cols = new List<Col>();
+        this.Navs = new List<Nav>();
+        this.Idx = new List<Index>();
+        this.byCol = new Dict<string, Col>();
         this.selList = "";
         this.frozen = false;
     }
 
     // 新建一个实体的元数据。
-    public static OrmMeta Of(string entity, string table) {
-        return new OrmMeta(entity, table);
+    public static Meta Of(string entity, string table) {
+        return new Meta(entity, table);
     }
 
     // 基于原生运行时反射自动提取实体类型的元数据（表名、字段、类型与主键）。
-    public static OrmMeta For<T>() {
-        return OrmMeta.BuildFor<T>();
+    public static Meta For<T>() {
+        return Meta.BuildFor<T>();
     }
 
-    public static OrmMeta BuildFor<T>() {
+    public static Meta BuildFor<T>() {
         TypeInfo ti = typeof(T);
         string tbl = ti.TableName;
         if (tbl.Length == 0) {
             tbl = ti.Name;
         }
-        OrmMeta meta = new OrmMeta(ti.Name, tbl);
+        Meta meta = new Meta(ti.Name, tbl);
         meta.Type = ti;
         for (int i = 0; i < ti.FieldCount; i = i + 1) {
             if (ti.IsFieldIgnored(i)) {
@@ -63,11 +63,24 @@ public class OrmMeta {
             } else if (ftype == "long" || ftype == "ulong") {
                 kind = 0;
                 i64 = true;
+            } else if (ftype == "int" || ftype == "uint" || ftype == "short" || ftype == "ushort" || ftype == "byte" || ftype == "sbyte") {
+                kind = 0;
             } else {
+                // 实体引用（GetFieldTypeInfo 有名字且不是枚举）= 导航属性：
+                // 登记反向关系（Children/ChildrenOf 反推用），不作为物理
+                // 数据库列；枚举按 int 处理。
+                TypeInfo navTi = ti.GetFieldTypeInfo(i);
+                if (navTi.Name.Length > 0 && navTi.Kind != "enum") {
+                    meta.Navs.Add(new Nav(fname, ftype));
+                    continue;
+                }
                 kind = 0;
             }
+            // 主键只认声明：[Key] / [PrimaryKey] / [Column(IsIdentity: true)]，
+            // 不按字段名猜——「叫 id 就是主键」是隐式约定，把普通业务列
+            // 静默升格成主键既不可见也不可控。
             bool isIdent = ti.IsFieldPk(i);
-            bool isPk = isIdent || (fname == "id" || fname == "Id" || fname == "ID");
+            bool isPk = isIdent;
             meta.Col(colName, fname, kind, i64, isPk, isIdent, false, 255);
         }
         meta.Seal();
@@ -77,7 +90,7 @@ public class OrmMeta {
     // 封存元数据：<see cref="Seal"/> 之后的构建调用一律
     // 抛异常。生成的代码在元数据建成并发布到静态缓存前调用它，
     // 保证运行期描述不会被后续代码悄悄改形。
-    public OrmMeta Seal() {
+    public Meta Seal() {
         this.frozen = true;
         return this;
     }
@@ -91,10 +104,10 @@ public class OrmMeta {
     }
 
     // 追加一列（按实体字段声明顺序）。
-    public OrmMeta Col(string col, string field, int kind, bool i64, bool pk,
+    public Meta Col(string col, string field, int kind, bool i64, bool pk,
                 bool ident, bool notNull, int len) {
         this.CheckNotFrozen();
-        OrmCol c = new OrmCol(QueryBuilder.RequireIdent(col), field, kind,
+        Col c = new Col(QueryBuilder.RequireIdent(col), field, kind,
                               i64, pk, ident, notNull, len);
         this.Cols.Add(c);
         this.byCol.Add(col, c);
@@ -102,28 +115,28 @@ public class OrmMeta {
     }
 
     // 追加一个导航字段，返回它以便继续追加它的列。
-    public OrmNav Nav(string field, string table) {
+    public Nav Nav(string field, string table) {
         this.CheckNotFrozen();
-        OrmNav n = new OrmNav(field, table);
+        Nav n = new Nav(field, table);
         this.Navs.Add(n);
         return n;
     }
 
     // 追加一条索引声明。
-    public OrmMeta Index(string name, string cols, bool uniq) {
+    public Meta Index(string name, string cols, bool uniq) {
         this.CheckNotFrozen();
         QueryBuilder.RequireIdent(name);
         List<string> parts = cols.Split(",");
         for (int i = 0; i < parts.Count; i = i + 1) {
             QueryBuilder.RequireIdent(parts[i].Trim());
         }
-        this.Idx.Add(new OrmIndex(name, cols, uniq));
+        this.Idx.Add(new Index(name, cols, uniq));
         return this;
     }
 
     // 列描述，不存在时为 null。
-    public OrmCol Find(string c) {
-        OrmCol v;
+    public Col Find(string c) {
+        Col v;
         if (this.byCol.TryGetValue(c, out v)) { return v; }
         return null;
     }
@@ -133,7 +146,7 @@ public class OrmMeta {
 
     // 列的声明类型（DbParams.Kind*），不存在时 KindNull。
     public int KindOf(string c) {
-        OrmCol f = this.Find(c);
+        Col f = this.Find(c);
         if (f == null) { return DbParams.KindNull; }
         return f.PKind();
     }
@@ -174,8 +187,8 @@ public class OrmMeta {
 
     // UPDATE ... WHERE 用的定位列：最后一个主键列，
     // 没有主键时为 null（与实体链的既有语义一致）。
-    public OrmCol PkCol() {
-        OrmCol pk = null;
+    public Col PkCol() {
+        Col pk = null;
         for (int i = 0; i < this.Cols.Count; i = i + 1) {
             if (this.Cols[i].IsPk) { pk = this.Cols[i]; }
         }
@@ -188,7 +201,7 @@ public class OrmMeta {
         StringBuilder sb = new StringBuilder();
         int n = 0;
         for (int i = 0; i < this.Cols.Count; i = i + 1) {
-            OrmCol c = this.Cols[i];
+            Col c = this.Cols[i];
             if (!c.IsPk || c.IsIdent) { continue; }
             if (n > 0) { sb.Append(", "); }
             sb.Append(c.Col);
@@ -200,7 +213,7 @@ public class OrmMeta {
 
 }
 
-public class OrmMetaCache<T> {
-    public static OrmMeta Meta = OrmMeta.BuildFor<T>();
+public class MetaCache<T> {
+    public static Meta Meta = Meta.BuildFor<T>();
 }
 

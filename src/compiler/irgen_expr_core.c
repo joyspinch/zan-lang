@@ -1459,6 +1459,11 @@ static zan_symbol_t *resolve_overload_typed(zan_irgen_t *g,
     int best_score = -1;
     int arity_matches = 0;
     zan_symbol_t *cls = type_sym;
+    zan_ast_node_t *recv_obj = (call && call->kind == AST_CALL &&
+                                call->call.callee &&
+                                call->call.callee->kind == AST_MEMBER_ACCESS)
+                               ? call->call.callee->member.object
+                               : NULL;
     while (cls) {
         for (int i = 0; i < cls->member_count; i++) {
             zan_symbol_t *m = cls->members[i];
@@ -1471,7 +1476,7 @@ static zan_symbol_t *resolve_overload_typed(zan_irgen_t *g,
                 continue;
             if (!method_accepts_arity(m, argc)) continue;
             arity_matches++;
-            int score = method_args_score(g, m, call, NULL, locals, 0);
+            int score = method_args_score(g, m, call, recv_obj, locals, 0);
             if (score > best_score) {
                 best_score = score;
                 best = m;
@@ -2159,7 +2164,7 @@ static zan_type_t *infer_expr_type_raw(zan_irgen_t *g, zan_ast_node_t *e,
                     zan_symbol_t *m = resolve_overload_typed(g, ts, callee->member.name, e, locals);
                     if (!m) m = get_method_sym(ts, callee->member.name);
                     if (m) {
-                        zan_type_t *gr = generic_method_ret(g, m, e, locals);
+                        zan_type_t *gr = method_ret_type_at(g, m, e, NULL, locals);
                         return gr ? gr : m->type;
                     }
                 }
@@ -2221,7 +2226,7 @@ static zan_type_t *infer_expr_type_raw(zan_irgen_t *g, zan_ast_node_t *e,
                         qpath_ns_ok(g, obj, ts)) {
                         zan_symbol_t *m = get_method_sym(ts, callee->member.name);
                         if (m) {
-                            zan_type_t *gr = generic_method_ret(g, m, e, locals);
+                            zan_type_t *gr = method_ret_type_at(g, m, e, NULL, locals);
                             return gr ? gr : m->type;
                         }
                     }

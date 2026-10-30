@@ -1489,6 +1489,12 @@ static void infer_method_tp_bindings(zan_irgen_t *g, zan_symbol_t *msym,
     for (int i = 0; i < tps->count && i < call->call.type_args.count; i++)
         bind[i] = resolve_type_ctx(g, call->call.type_args.items[i]);
 
+    /* collect_inst_expr 的实例收集路径没有词法作用域（locals=NULL）：
+     * 显式类型实参的绑定已在上面完成，其余两遍推导都要把实参表达式
+     * 交给 infer_expr_type/local_find——local_find 对 NULL scope 直接
+     * 解引用，`ParseScoped<T>(json, lambda)` 编译期段错误
+     * （json_scoped_scratch/reflect_* 一线）。没有 locals 就到此为止。 */
+    if (!locals) return;
     zan_ast_list_t *params = &msym->decl->method_decl.params;
     /* 形参与实参的映射口径必须和发射端一致（try_method_spec / emit_method_spec_call）：
      * 只有「静态方法经实例表达式调用」时接收者才占第 0 个实参；实例方法的接收者是

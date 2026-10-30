@@ -1023,7 +1023,8 @@ static int reserve_arc_site(zan_irgen_t *g, zan_symbol_t *sym,
                             zan_type_t *coll_elem) {
     uint32_t key_file = g->check_leaks ? g->di_cur_file : 0;
     uint32_t key_line = g->check_leaks ? g->di_cur_line : 0;
-    for (int i = 0; i < g->leak_site_count; i++) {
+    /* 从 1 起扫：0 号是哨兵槽，永不参与去重复用。 */
+    for (int i = 1; i < g->leak_site_count; i++) {
         int existing_kind = g->site_coll ? g->site_coll[i] : 0;
         if (existing_kind != coll_kind) continue;
         if (g->site_loc_file && g->site_loc_file[i] != key_file) continue;
@@ -1694,7 +1695,13 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
     LLVMSetInitializer(g->g_live, LLVMConstInt(LLVMInt64TypeInContext(g->ctx), 0, 0));
     LLVMSetLinkage(g->g_live, LLVMInternalLinkage);
 
-    g->leak_site_count = 0;
+    /* site 0 留作哨兵：0 在运行时语义是"未跟踪对象"（refl_obj_type_fn
+     * 的 site>0 守卫、rt_alloc 零初始化头），真实分配点从 1 起。曾经
+     * 从 0 起数——主文件先于 stdlib 发射时，用户类的第一个分配点抢到
+     * 0 号，该类所有对象的动态反射（site→meta 解析）被 site>0 守卫
+     * 拒绝，SetFieldX/GetFieldX 静默失效（orm_extended 插桩构建
+     * DetectColInt 全落兜底列，探针 pOff6/pOff11）。 */
+    g->leak_site_count = 1;
     g->desc_hdr = !check_leaks;
     g->desc_gv_cap = 0;
     g->leak_site_cap = 256;

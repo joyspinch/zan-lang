@@ -8,11 +8,11 @@ namespace System.Data.Orm;
 //
 // ## 为什么需要它
 //
-// ORM 的导航（`OrmNav`）是**单边**的：子实体声明 `public User user;` 之后，
+// ORM 的导航（`Nav`）是**单边**的：子实体声明 `public User user;` 之后，
 // `LEFT JOIN` 把父表的列带进子行——查子行时能顺手拿到父行。但**反方向
 // 没有**：「这个用户有哪些 UserPoint」只能自己写
 // `Where(p => p.userId == 1)`，而外键列名（`<导航字段名>Id`）这个约定
-// 只写在 `OrmNav.Join()` 里，调用方看不见——写错了列名要等到运行期
+// 只写在 `Nav.Join()` 里，调用方看不见——写错了列名要等到运行期
 // 「no such column」才知道。
 //
 // 本类把这个约定**显式化**：从子实体的导航声明**反推**出反向关系
@@ -21,7 +21,7 @@ namespace System.Data.Orm;
 //
 // ## 反推不是另立一套规则
 //
-// 外键列名 = `<导航字段名>Id`，与 `OrmNav.Join()` 的 ON 子句
+// 外键列名 = `<导航字段名>Id`，与 `Nav.Join()` 的 ON 子句
 // （`ON t.<field>Id = j_<field>.id`）**同一套约定**——反推只是把连接
 // 子句读回来。子实体没声明导航，就没有反向关系（返回 null）。
 //
@@ -31,7 +31,7 @@ namespace System.Data.Orm;
 // （`ECols.__Meta()` 首次用到才建）。要在运行时回答这个问题，就得有一份
 // 常驻的全局表——那是**进程退出时的泄漏**（包级 static 持有集合），
 // 得不偿失。调用方知道自己的实体类型，把子实体的元数据传进来即可。
-public class OrmRel {
+public class Rel {
     // 关系名：子侧对父的称呼（导航字段名）。
     public string Name;
 
@@ -44,14 +44,14 @@ public class OrmRel {
     // 子表上的外键列。
     public string ForeignKey;
 
-    public OrmRel() {
+    public Rel() {
         this.Name = "";
         this.ParentTable = "";
         this.ChildTable = "";
         this.ForeignKey = "";
     }
 
-    public OrmRel(string name, string parentTable, string childTable,
+    public Rel(string name, string parentTable, string childTable,
     string foreignKey) {
         this.Name = name == null ? "" : name;
         this.ParentTable = parentTable == null ? "" : parentTable;
@@ -59,7 +59,7 @@ public class OrmRel {
         this.ForeignKey = foreignKey == null ? "" : foreignKey;
     }
 
-    // 外键列名的约定：`<导航字段名>Id`（与 `OrmNav.Join()` 同源）。
+    // 外键列名的约定：`<导航字段名>Id`（与 `Nav.Join()` 同源）。
     public static string ForeignKeyOf(string navField) {
         return navField + "Id";
     }
@@ -71,24 +71,24 @@ public class OrmRel {
     // （猜错会静默返回另一个父的子集合）。
     //
     // 找不到对应导航时返回 null——调用方据此返回空集合，而不是崩。
-    public static OrmRel Derive(OrmMeta child, string parentTable) {
+    public static Rel Derive(Meta child, string parentTable) {
         if (child == null) { return null; }
         string want = parentTable == null ? "" : parentTable;
         if (want.Length > 0) {
             for (int i = 0; i < child.Navs.Count; i = i + 1) {
-                OrmNav nav = child.Navs[i];
+                Nav nav = child.Navs[i];
                 if (nav.Table == want) {
-                    return new OrmRel(nav.Field, nav.Table, child.Table,
-                        OrmRel.ForeignKeyOf(nav.Field));
+                    return new Rel(nav.Field, nav.Table, child.Table,
+                        Rel.ForeignKeyOf(nav.Field));
                 }
             }
             // 表名大小写不同但指的是同一张表（SQL 里表名通常不区分
             // 大小写）——再按不区分大小写找一次。
             for (int i = 0; i < child.Navs.Count; i = i + 1) {
-                OrmNav nav = child.Navs[i];
+                Nav nav = child.Navs[i];
                 if (nav.Table.ToLower() == want.ToLower()) {
-                    return new OrmRel(nav.Field, nav.Table, child.Table,
-                        OrmRel.ForeignKeyOf(nav.Field));
+                    return new Rel(nav.Field, nav.Table, child.Table,
+                        Rel.ForeignKeyOf(nav.Field));
                 }
             }
             return null;
@@ -99,19 +99,19 @@ public class OrmRel {
                 Convert.ToString(child.Navs.Count) + " 个导航，反查父行要指明父表："
                 + "用 ChildrenOf(父表, id)");
         }
-        OrmNav only = child.Navs[0];
-        return new OrmRel(only.Field, only.Table, child.Table,
-            OrmRel.ForeignKeyOf(only.Field));
+        Nav only = child.Navs[0];
+        return new Rel(only.Field, only.Table, child.Table,
+            Rel.ForeignKeyOf(only.Field));
     }
 
     // 把「外键 = 父行 id」加到查询上（数值外键）。
-    public void Apply(OrmSelect q, long parentId) {
+    public void Apply(Select q, long parentId) {
         this.Require(q);
         q.WhereEq(this.ForeignKey, parentId);
     }
 
     // 把「外键 = 父行 id」加到查询上（文本外键）。
-    public void Apply(OrmSelect q, string parentId) {
+    public void Apply(Select q, string parentId) {
         this.Require(q);
         q.WhereEq(this.ForeignKey, parentId);
     }
@@ -119,9 +119,9 @@ public class OrmRel {
     // 外键列必须落在子实体的**映射列**里：查询条件按实体元数据校验列名，
     // 未知列抛异常。与其让调用方拿到一句干巴巴的 "has no column"，
     // 不如说清楚是哪个关系的外键没被映射。
-    void Require(OrmSelect q) {
+    void Require(Select q) {
         if (q == null) { return; }
-        OrmMeta m = q.Meta();
+        Meta m = q.Meta();
         if (m == null) { return; }
         if (m.Has(this.ForeignKey)) { return; }
         throw new Exception("反向关系 " + this.Name + " 的外键列 " +

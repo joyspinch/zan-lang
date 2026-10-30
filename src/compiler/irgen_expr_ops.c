@@ -1414,22 +1414,20 @@ static zan_type_t *subst_delegate_sig(zan_irgen_t *g, zan_type_t *t,
                                       zan_type_t *recv) {
     if (!t || t->kind != TYPE_DELEGATE || !recv || recv->type_arg_count <= 0)
         return t;
-    bool needs = t->delegate_ret_type &&
-                 t->delegate_ret_type->kind == TYPE_TYPE_PARAM;
+    bool needs = (t->delegate_ret_type && type_mentions_tp(t->delegate_ret_type));
     for (int i = 0; !needs && i < t->delegate_param_count; i++)
-        needs = t->delegate_param_types[i] &&
-                t->delegate_param_types[i]->kind == TYPE_TYPE_PARAM;
+        needs = (t->delegate_param_types[i] && type_mentions_tp(t->delegate_param_types[i]));
     if (!needs) return t;
 
     zan_type_t *out = (zan_type_t *)zan_arena_alloc(g->arena, sizeof(zan_type_t));
     *out = *t;
-    out->delegate_ret_type = subst_type_param(t->delegate_ret_type, recv);
+    out->delegate_ret_type = subst_type_param_deep(g, t->delegate_ret_type, recv);
     if (t->delegate_param_count > 0) {
         out->delegate_param_types = (zan_type_t **)zan_arena_alloc(g->arena,
             sizeof(zan_type_t *) * (size_t)t->delegate_param_count);
         for (int i = 0; i < t->delegate_param_count; i++)
             out->delegate_param_types[i] =
-                subst_type_param(t->delegate_param_types[i], recv);
+                subst_type_param_deep(g, t->delegate_param_types[i], recv);
     }
     return out;
 }

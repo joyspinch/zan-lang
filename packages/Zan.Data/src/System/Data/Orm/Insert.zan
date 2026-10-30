@@ -5,11 +5,11 @@ namespace System.Data.Orm;
 
 // 类型化 INSERT 的运行期实现：实体行与动态列（DbValues）两条来源，
 // Only/Skip 决定的列集合在运行期成形，upsert 子句按方言拼装。
-public class OrmInsert {
+public class Insert {
     public IDbExecutor db;
-    public OrmMeta meta;
+    public Meta meta;
     public string tbl;
-    public IOrmRows rows;
+    public IRows rows;
     public List<DbValues> dicts;
     public List<string> only;
     public List<string> skip;
@@ -23,7 +23,7 @@ public class OrmInsert {
     public DbParams bound;
 
     // 私有构造；统一经 <see cref="Create"/> 创建。
-    public OrmInsert(IDbExecutor db, OrmMeta meta) {
+    public Insert(IDbExecutor db, Meta meta) {
         this.db = db;
         this.meta = meta;
         this.tbl = meta.Table;
@@ -42,14 +42,14 @@ public class OrmInsert {
     }
 
     // 为实体创建一个空的 INSERT 构造器。
-    public static OrmInsert Create(IDbExecutor db, OrmMeta meta) {
-        return new OrmInsert(db, meta);
+    public static Insert Create(IDbExecutor db, Meta meta) {
+        return new Insert(db, meta);
     }
 
     // 改写到另一张表（标识符校验，防注入）。
     public void AsTable(string t) { this.tbl = QueryBuilder.RequireIdent(t); }
     // 实体行来源：由编译期为该实体发的取值口提供。
-    public void SetRows(IOrmRows rows) { this.rows = rows; }
+    public void SetRows(IRows rows) { this.rows = rows; }
 
     // 实体行数。
     public int RowCount() { return this.rows == null ? 0 : this.rows.RowCount(); }
@@ -81,23 +81,23 @@ public class OrmInsert {
     // 这一列是否进语句：Only 优先，其次自增列不写，
     // 最后看 Skip。
     public bool Use(string c, bool identity) {
-        if (this.only.Count > 0) { return OrmDialect.Has(this.only, c); }
+        if (this.only.Count > 0) { return Dialect.Has(this.only, c); }
         if (identity) { return false; }
-        return !OrmDialect.Has(this.skip, c);
+        return !Dialect.Has(this.skip, c);
     }
 
     // 依 Only / 自增列 / Skip 规则选出参与语句的列集合。
-    public List<OrmCol> used() {
-        List<OrmCol> l = new List<OrmCol>();
+    public List<Col> used() {
+        List<Col> l = new List<Col>();
         for (int i = 0; i < this.meta.Cols.Count; i = i + 1) {
-            OrmCol c = this.meta.Cols[i];
+            Col c = this.meta.Cols[i];
             if (this.Use(c.Col, c.IsIdent)) { l.Add(c); }
         }
         return l;
     }
 
     // 把列集合拼成逗号分隔的列名清单。
-    public string colList(List<OrmCol> cols) {
+    public string colList(List<Col> cols) {
         StringBuilder sb = new StringBuilder();
         for (int i = 0; i < cols.Count; i = i + 1) {
             if (i > 0) { sb.Append(", "); }
@@ -107,7 +107,7 @@ public class OrmInsert {
     }
 
     // 冲突子句。键列缺省取实体主键；方言差异
-    // （excluded 对 VALUES()、GREATEST 对 max）在 OrmDialect 里解决。
+    // （excluded 对 VALUES()、GREATEST 对 max）在 Dialect 里解决。
     public string Conflict() {
         if (!this.upsert) { return ""; }
         int p = this.db.GetProvider();
@@ -118,19 +118,19 @@ public class OrmInsert {
                 + ": OnConflict needs key columns");
         }
         StringBuilder sb = new StringBuilder();
-        sb.Append(OrmDialect.ConflictHead(p, keys, this.nop));
+        sb.Append(Dialect.ConflictHead(p, keys, this.nop));
         if (this.nop) { return sb.ToString(); }
         int n = 0;
         for (int i = 0; i < this.meta.Cols.Count; i = i + 1) {
-            OrmCol c = this.meta.Cols[i];
+            Col c = this.meta.Cols[i];
             if (!this.Use(c.Col, c.IsIdent)) { continue; }
-            if (OrmDialect.Has(keys, c.Col)) { continue; }
+            if (Dialect.Has(keys, c.Col)) { continue; }
             if (n > 0) { sb.Append(", "); }
-            sb.Append(OrmDialect.Excl(p, c.Col,
-                OrmDialect.Mode(this.acc, this.gmx, this.gmn, c.Col)));
+            sb.Append(Dialect.Excl(p, c.Col,
+                Dialect.Mode(this.acc, this.gmx, this.gmn, c.Col)));
             n = n + 1;
         }
-        if (n == 0) { return OrmDialect.ConflictHead(p, keys, true); }
+        if (n == 0) { return Dialect.ConflictHead(p, keys, true); }
         return sb.ToString();
     }
 
@@ -182,7 +182,7 @@ public class OrmInsert {
     // 实体行写入（指定行范围）：列集合成形一次，每行按同一集合绑定。
     public int BuildRowsRange(int start, int count) {
         if (count <= 0) { return 0; }
-        List<OrmCol> cols = this.used();
+        List<Col> cols = this.used();
         if (cols.Count == 0) { return 0; }
         DbParams ps = new DbParams();
         StringBuilder sb = new StringBuilder();
@@ -191,7 +191,7 @@ public class OrmInsert {
         sb.Append(" (");
         sb.Append(this.colList(cols));
         sb.Append(") VALUES ");
-        string marks = OrmDialect.Marks(cols.Count);
+        string marks = Dialect.Marks(cols.Count);
         int i = 0;
         while (i < count) {
             int rowIdx = start + i;
@@ -278,7 +278,7 @@ public class OrmInsert {
     public int ExecuteRows() {
         int total = this.RowCount();
         if (total == 0) { return 0; }
-        List<OrmCol> cols = this.used();
+        List<Col> cols = this.used();
         if (cols.Count == 0) { return 0; }
         int batch = this.safeBatchRows(cols.Count);
         if (total <= batch) {
@@ -302,7 +302,7 @@ public class OrmInsert {
     public async int ExecuteRowsAsync() {
         int total = this.RowCount();
         if (total == 0) { return 0; }
-        List<OrmCol> cols = this.used();
+        List<Col> cols = this.used();
         if (cols.Count == 0) { return 0; }
         int batch = this.safeBatchRows(cols.Count);
         if (total <= batch) {
@@ -337,13 +337,13 @@ public class OrmInsert {
     // 插入单行并取自增主键值（0 = 插入失败或无自增列）。
     public int ExecuteIdentity() {
         if (this.ExecuteAffrows() == 0) { return 0; }
-        return OrmDialect.LastId(this.db);
+        return Dialect.LastId(this.db);
     }
 
     // 异步插入并取自增主键值。
     public async int ExecuteIdentityAsync() {
         int n = await this.ExecuteAffrowsAsync();
         if (n == 0) { return 0; }
-        return await OrmDialect.LastIdAsync(this.db);
+        return await Dialect.LastIdAsync(this.db);
     }
 }
