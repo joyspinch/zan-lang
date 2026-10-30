@@ -1,0 +1,266 @@
+using System;
+using System.Collections.Generic;
+using System.Data;
+
+namespace System.Data.Orm;
+
+// 泛型 SELECT 查询驱动：结合元数据缓存与原生类型反射，提供流式查询。
+public class OrmSelectQuery<T> {
+    public OrmSelect inner;
+    public OrmMeta meta;
+
+    public OrmSelectQuery(IDbExecutor db) {
+        this.meta = OrmMeta.For<T>();
+        this.inner = OrmSelect.Create(db, this.meta);
+    }
+
+    public OrmSelectQuery<T> WhereEq(string col, string val) {
+        this.inner.WhereEq(col, val);
+        return this;
+    }
+
+    public OrmSelectQuery<T> WhereEq(string col, int val) {
+        this.inner.WhereEq(col, val);
+        return this;
+    }
+
+    public OrmSelectQuery<T> WhereEq(string col, long val) {
+        this.inner.WhereEq(col, val);
+        return this;
+    }
+
+    public OrmSelectQuery<T> Where(ExprNode expr) {
+        this.inner.WExpr(expr);
+        return this;
+    }
+
+    public OrmSelectQuery<T> WherePk(int id) {
+        this.inner.WherePk(id);
+        return this;
+    }
+
+    public OrmSelectQuery<T> WherePk(long id) {
+        this.inner.WherePk(id);
+        return this;
+    }
+
+    public OrmSelectQuery<T> WherePk(string id) {
+        this.inner.WherePk(id);
+        return this;
+    }
+
+    public OrmSelectQuery<T> OrderBy(string col) {
+        this.inner.OrderBy(col);
+        return this;
+    }
+
+    public OrmSelectQuery<T> OrderByDescending(string col) {
+        this.inner.OBD(col);
+        return this;
+    }
+
+    public OrmSelectQuery<T> Limit(int limit, int offset) {
+        this.inner.limN = limit;
+        this.inner.offN = offset;
+        return this;
+    }
+
+    public OrmSelectQuery<T> Page(int page, int pageSize) {
+        int off = (page > 1 ? page - 1 : 0) * pageSize;
+        return this.Limit(pageSize, off);
+    }
+
+    public int Count() {
+        return this.inner.Count();
+    }
+
+    public async int CountAsync() {
+        DbResult r = await this.inner.AggRAsync("COUNT(*)");
+        if (r == null || r.RowCount() == 0) { return 0; }
+        return r.GetInt(0, 0);
+    }
+
+    // 从 DbResult 当前行映射生成实体实例
+    public static T MapRow(DbResult r, int row, OrmMeta meta) {
+        TypeInfo ti = typeof(T);
+        object obj = ti.CreateInstance();
+        for (int i = 0; i < meta.Cols.Count; i = i + 1) {
+            OrmCol c = meta.Cols[i];
+            if (c.Kind == 3) {
+                obj.SetFieldString(c.Field, r.GetString(row, i));
+            } else if (c.Kind == 1) {
+                obj.SetFieldDouble(c.Field, r.GetDouble(row, i));
+            } else if (c.Kind == 2) {
+                obj.SetFieldBool(c.Field, r.GetInt(row, i) != 0);
+            } else if (c.Kind == 0 && c.I64) {
+                obj.SetFieldLong(c.Field, r.GetLong(row, i));
+            } else {
+                obj.SetFieldInt(c.Field, r.GetInt(row, i));
+            }
+        }
+        return (T)obj;
+    }
+
+    public List<T> ToList() {
+        DbResult r = this.inner.Rows();
+        List<T> list = new List<T>();
+        if (r == null) { return list; }
+        int count = r.RowCount();
+        for (int i = 0; i < count; i = i + 1) {
+            list.Add(MapRow(r, i, this.meta));
+        }
+        return list;
+    }
+
+    public async List<T> ToListAsync() {
+        DbResult r = await this.inner.RowsAsync();
+        List<T> list = new List<T>();
+        if (r == null) { return list; }
+        int count = r.RowCount();
+        for (int i = 0; i < count; i = i + 1) {
+            list.Add(MapRow(r, i, this.meta));
+        }
+        return list;
+    }
+
+    public T First() {
+        this.inner.One();
+        List<T> list = this.ToList();
+        return list.Count > 0 ? list[0] : null;
+    }
+
+    public async T FirstAsync() {
+        this.inner.One();
+        List<T> list = await this.ToListAsync();
+        return list.Count > 0 ? list[0] : null;
+    }
+
+    public bool Any() {
+        return this.First() != null;
+    }
+
+    public async bool AnyAsync() {
+        return (await this.FirstAsync()) != null;
+    }
+}
+
+// 泛型 INSERT 写入驱动
+public class OrmInsertQuery<T> {
+    public OrmInsert inner;
+    public OrmMeta meta;
+
+    public OrmInsertQuery(IDbExecutor db, T entity) {
+        this.meta = OrmMeta.For<T>();
+        this.inner = OrmInsert.Create(db, this.meta);
+        if (entity != null) {
+            DbValues v = new DbValues();
+            for (int i = 0; i < this.meta.Cols.Count; i = i + 1) {
+                OrmCol c = this.meta.Cols[i];
+                if (c.Kind == 3) {
+                    v.Set(c.Col, entity.GetFieldString(c.Field));
+                } else if (c.Kind == 1) {
+                    v.Set(c.Col, entity.GetFieldDouble(c.Field));
+                } else if (c.Kind == 2) {
+                    v.Set(c.Col, entity.GetFieldBool(c.Field));
+                } else if (c.Kind == 0 && c.I64) {
+                    v.Set(c.Col, entity.GetFieldLong(c.Field));
+                } else {
+                    v.Set(c.Col, entity.GetFieldInt(c.Field));
+                }
+            }
+            this.inner.AddDict(v);
+        }
+    }
+
+    public int ExecuteAffrows() {
+        return this.inner.BuildDictsRange(0, this.inner.dicts.Count);
+    }
+
+    public async int ExecuteAffrowsAsync() {
+        return this.inner.BuildDictsRange(0, this.inner.dicts.Count);
+    }
+
+    public int ExecuteIdentity() {
+        return this.inner.ExecuteIdentity();
+    }
+
+    public async int ExecuteIdentityAsync() {
+        return await this.inner.ExecuteIdentityAsync();
+    }
+}
+
+// 泛型 DELETE 删除驱动
+public class OrmDeleteQuery<T> {
+    public OrmDelete inner;
+    public OrmMeta meta;
+
+    public OrmDeleteQuery(IDbExecutor db) {
+        this.meta = OrmMeta.For<T>();
+        this.inner = OrmDelete.Create(db, this.meta);
+    }
+
+    public OrmDeleteQuery<T> WhereEq(string col, string val) {
+        this.inner.WhereEq(col, val);
+        return this;
+    }
+
+    public OrmDeleteQuery<T> WhereEq(string col, int val) {
+        this.inner.WhereEq(col, val);
+        return this;
+    }
+
+    public OrmDeleteQuery<T> WhereEq(string col, long val) {
+        this.inner.WhereEq(col, val);
+        return this;
+    }
+
+    public OrmDeleteQuery<T> WherePk(int id) {
+        this.inner.WherePk(id);
+        return this;
+    }
+
+    public OrmDeleteQuery<T> WherePk(long id) {
+        this.inner.WherePk(id);
+        return this;
+    }
+
+    public OrmDeleteQuery<T> WherePk(string id) {
+        this.inner.WherePk(id);
+        return this;
+    }
+
+    public int ExecuteAffrows() {
+        return this.inner.ExecuteAffrows();
+    }
+
+    public async int ExecuteAffrowsAsync() {
+        return await this.inner.ExecuteAffrowsAsync();
+    }
+}
+
+// 为 IDbConnection 与 IDbExecutor 挂接的纯库泛型扩展方法
+public static class DbOrmExtensions {
+    public static OrmSelectQuery<T> Select<T>(this IDbConnection db) {
+        return new OrmSelectQuery<T>(db);
+    }
+
+    public static OrmSelectQuery<T> Select<T>(this IDbExecutor db) {
+        return new OrmSelectQuery<T>(db);
+    }
+
+    public static OrmInsertQuery<T> Insert<T>(this IDbConnection db, T entity) {
+        return new OrmInsertQuery<T>(db, entity);
+    }
+
+    public static OrmInsertQuery<T> Insert<T>(this IDbExecutor db, T entity) {
+        return new OrmInsertQuery<T>(db, entity);
+    }
+
+    public static OrmDeleteQuery<T> Delete<T>(this IDbConnection db) {
+        return new OrmDeleteQuery<T>(db);
+    }
+
+    public static OrmDeleteQuery<T> Delete<T>(this IDbExecutor db) {
+        return new OrmDeleteQuery<T>(db);
+    }
+}
