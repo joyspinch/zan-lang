@@ -1,4 +1,5 @@
 using System;
+using System.Buffers.Binary;
 using System.Json;
 
 namespace System.Cbor;
@@ -39,24 +40,23 @@ public class CborReader {
     }
 
     public int U16BE() {
-        int hi = U8();
-        return (hi << 8) | U8();
+        if (pos + 2 > len) { throw new CborException("truncated at byte " + Convert.ToString(pos)); }
+        int v = (int)BinaryPrimitives.ReadUInt16BigEndian(buf.AsSpan(pos, 2));
+        pos = pos + 2;
+        return v;
     }
 
     public long U32BE() {
-        long v = U8();
-        v = (v << 8) | U8();
-        v = (v << 8) | U8();
-        return (v << 8) | U8();
+        if (pos + 4 > len) { throw new CborException("truncated at byte " + Convert.ToString(pos)); }
+        long v = (long)BinaryPrimitives.ReadUInt32BigEndian(buf.AsSpan(pos, 4));
+        pos = pos + 4;
+        return v;
     }
 
     public long U64BE() {
-        long v = U8();
-        int i = 0;
-        while (i < 7) {
-            v = (v << 8) | U8();
-            i = i + 1;
-        }
+        if (pos + 8 > len) { throw new CborException("truncated at byte " + Convert.ToString(pos)); }
+        long v = (long)BinaryPrimitives.ReadUInt64BigEndian(buf.AsSpan(pos, 8));
+        pos = pos + 8;
         return v;
     }
 
@@ -345,35 +345,10 @@ public class CborReader {
         return sign == 1 ? 0.0 - r2 : r2;
     }
 
-    // 32 位 IEEE-754 位型 → double。
+    // 32 位 IEEE-754 位型 → double：编译器内建 bitcast
+    // （NativeMemory.AsF32，零开销、逐位精确——次正规/±∞/NaN/-0.0 原位还原）。
     public static double BitsSingle(int bits) {
-        int sign = (bits >> 31) & 1;
-        int exp = (bits >> 23) & 255;
-        int mant = bits & 8388607;
-        if (exp == 255) {
-            double inf = Pow2(128);
-            if (mant == 0) { return sign == 1 ? 0.0 - inf : inf; }
-            return inf - inf;
-        }
-        double m = 0.0;
-        if (exp == 0) {
-            if (mant == 0) { return sign == 1 ? -1.0 * 0.0 : 0.0; }
-            int b = 22;
-            while (b >= 0) {
-                if (((mant >> b) & 1) == 1) { m = m + Pow2(b - 23); }
-                b = b - 1;
-            }
-            double v = m * Pow2(-126);
-            return sign == 1 ? 0.0 - v : v;
-        }
-        m = 1.0;
-        int b2 = 22;
-        while (b2 >= 0) {
-            if (((mant >> b2) & 1) == 1) { m = m + Pow2(b2 - 23); }
-            b2 = b2 - 1;
-        }
-        double r = m * Pow2(exp - 127);
-        return sign == 1 ? 0.0 - r : r;
+        return (double)NativeMemory.AsF32(bits);
     }
 
     // 64 位 IEEE-754 位型 → double：编译器内建 bitcast

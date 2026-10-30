@@ -246,28 +246,28 @@ public class AnthropicClient : IChat {
 
         string raw = await this.PostJson(ep, body);
         if (raw == null) { return null; }
-        JsonValue root = null;
+        JsonDoc doc = null;
         try {
-            root = JsonValue.Parse(raw);
+            doc = JsonDoc.Parse(raw);
         } catch (Exception e) {
-            root = null;
+            doc = null;
         }
-        if (root == null) {
+        if (doc == null || doc.root < 0) {
             this.lastError = "Anthropic 服务返回的内容无法解析";
             return null;
         }
         // 错误体形状与 OpenAI 兼容一样（{"error":{"message":...}}）。
-        string errMsg = AiClient.ErrorMessage(root);
+        string errMsg = AiClient.ErrorMessage(doc);
         if (errMsg.Length > 0) {
             this.lastError = errMsg;
             return null;
         }
-        AiToolTurn turn = AnthropicClient.ParseTurn(root);
+        AiToolTurn turn = AnthropicClient.ParseTurn(doc);
         if (turn == null) {
             this.lastError = "Anthropic 服务返回的内容无法解析";
             return null;
         }
-        this.CaptureUsage(root);
+        this.CaptureUsage(doc);
         return turn;
     }
 
@@ -534,6 +534,16 @@ public class AnthropicClient : IChat {
     // 坏 JSON → 返回 null。**错误响应也返回 null**（错误文案由调用方从
     // 响应里取——静态方法碰不到实例的 lastError）。
     public static AiToolTurn ParseTurn(string raw) {
+        if (raw == null) { return null; }
+        JsonDoc doc = null;
+        try {
+            doc = JsonDoc.Parse(raw);
+        } catch (Exception e) {
+            doc = null;
+        }
+        if (doc != null && doc.root >= 0) {
+            return AnthropicClient.ParseTurn(doc);
+        }
         JsonValue root = null;
         try {
             root = JsonValue.Parse(raw);
@@ -542,6 +552,35 @@ public class AnthropicClient : IChat {
         }
         if (root == null) { return null; }
         return AnthropicClient.ParseTurn(root);
+    }
+
+    public static AiToolTurn ParseTurn(JsonDoc doc) {
+        if (doc == null || doc.root < 0 || doc.KindAt(doc.root) != 5) { return null; }
+        int content = doc.Get(doc.root, "content");
+        if (content < 0 || doc.KindAt(content) != 4) { return null; }
+        AiToolTurn turn = new AiToolTurn();
+        turn.finishReason = doc.StrAt(doc.Get(doc.root, "stop_reason"), "");
+        StringBuilder sb = new StringBuilder();
+        int count = doc.Count(content);
+        int block = doc.FirstChild(content);
+        for (int i = 0; i < count; i = i + 1) {
+            if (block < 0) { break; }
+            string type = doc.StrAt(doc.Get(block, "type"), "");
+            if (type == "text") {
+                string t = doc.StrAt(doc.Get(block, "text"), "");
+                if (sb.Length > 0) { sb.Append("\n"); }
+                sb.Append(t);
+            } else if (type == "tool_use") {
+                int input = doc.Get(block, "input");
+                string args = input < 0 ? "{}" : doc.ToJson(input);
+                if (args == null || args.Length == 0) { args = "{}"; }
+                turn.toolCalls.Add(new AiToolCall(doc.StrAt(doc.Get(block, "id"), ""),
+                    doc.StrAt(doc.Get(block, "name"), ""), args));
+            }
+            block = doc.NextSibling(block);
+        }
+        turn.content = sb.ToString();
+        return turn;
     }
 
     // 解析 Anthropic 的响应体。
@@ -579,14 +618,14 @@ public class AnthropicClient : IChat {
     private static string HttpErrorMessage(int status, string body) {
         string detail = "";
         if (body != null && body.Length > 0) {
-            JsonValue root = null;
+            JsonDoc doc = null;
             try {
-                root = JsonValue.Parse(body);
+                doc = JsonDoc.Parse(body);
             } catch (Exception e) {
-                root = null;
+                doc = null;
             }
-            if (root != null) {
-                detail = AiClient.ErrorMessage(root);
+            if (doc != null && doc.root >= 0) {
+                detail = AiClient.ErrorMessage(doc);
             }
         }
         if (detail.Length == 0) {
@@ -596,6 +635,16 @@ public class AnthropicClient : IChat {
     }
 
     // 记录用量（Anthropic 的字段名是 input_tokens / output_tokens）。
+    private void CaptureUsage(JsonDoc doc) {
+        if (doc == null || doc.root < 0) { return; }
+        int usage = doc.Get(doc.root, "usage");
+        if (usage < 0) { return; }
+        int p = doc.IntAt(doc.Get(usage, "input_tokens"), 0);
+        int c = doc.IntAt(doc.Get(usage, "output_tokens"), 0);
+        if (p <= 0 && c <= 0) { return; }
+        this.lastUsage = new AiUsage(p, c, false);
+    }
+
     private void CaptureUsage(JsonValue root) {
         if (root == null) { return; }
         JsonValue usage = root.Get("usage");

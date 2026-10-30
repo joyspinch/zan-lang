@@ -78,26 +78,25 @@ public class Embeddings {
     //    和稀泥的处理（截断会让相似度算出来是错的，且错得很隐蔽）。
     public static AiEmbedding ParseResponse(AiClient client, string raw,
     int expected, bool normalize) {
-        // JsonValue.Parse 对坏 JSON **抛异常**（不是返回 null）——
-        // 解析外部响应必须兜住，否则一个畸形响应就把调用方炸了。
-        JsonValue root = null;
+        // JsonDoc.Parse 扁平线性解析，零多余树状堆分配与垃圾回收开销
+        JsonDoc doc = null;
         try {
-            root = JsonValue.Parse(raw);
+            doc = JsonDoc.Parse(raw);
         } catch (Exception e) {
             client.lastError = "嵌入服务返回的内容无法解析";
             return null;
         }
-        if (root == null) {
+        if (doc == null || doc.root < 0) {
             client.lastError = "嵌入服务返回的内容无法解析";
             return null;
         }
-        string errMsg = AiClient.ErrorMessage(root);
+        string errMsg = AiClient.ErrorMessage(doc);
         if (errMsg.Length > 0) {
             client.lastError = errMsg;
             return null;
         }
-        JsonValue data = root.Get("data");
-        if (data == null || !data.IsArray() || data.Count() == 0) {
+        int data = doc.Get(doc.root, "data");
+        if (data < 0 || doc.KindAt(data) != 4 || doc.Count(data) == 0) {
             client.lastError = "嵌入服务没有返回向量";
             return null;
         }
@@ -108,25 +107,33 @@ public class Embeddings {
             slots.Add(null);
         }
         int dims = 0;
-        for (int i = 0; i < data.Count(); i = i + 1) {
-            JsonValue one = data.At(i);
-            if (one == null) { continue; }
-            JsonValue idxVal = one.Get("index");
-            int at = idxVal == null ? i : (int)idxVal.AsDouble((double)i);
-            if (at < 0 || at >= slots.Count) { continue; }
-            JsonValue vec = one.Get("embedding");
-            if (vec == null || !vec.IsArray()) { continue; }
-            List<double> v = new List<double>();
-            for (int k = 0; k < vec.Count(); k = k + 1) {
-                v.Add(vec.At(k).AsDouble(0.0));
+        int dataCount = doc.Count(data);
+        int itemNode = doc.FirstChild(data);
+        for (int i = 0; i < dataCount; i = i + 1) {
+            if (itemNode < 0) { break; }
+            int at = doc.IntAt(doc.Get(itemNode, "index"), i);
+            int vecNode = doc.Get(itemNode, "embedding");
+            if (vecNode >= 0 && doc.KindAt(vecNode) == 4) {
+                int vecLen = doc.Count(vecNode);
+                List<double> v = new List<double>();
+                v.Reserve(vecLen);
+                int elemNode = doc.FirstChild(vecNode);
+                for (int k = 0; k < vecLen; k = k + 1) {
+                    if (elemNode < 0) { break; }
+                    v.Add(doc.DoubleAt(elemNode, 0.0));
+                    elemNode = doc.NextSibling(elemNode);
+                }
+                if (dims == 0) { dims = v.Count; }
+                else if (v.Count != dims) {
+                    client.lastError = "嵌入服务返回的向量维度不一致（"
+                    + Convert.ToString(dims) + " vs " + Convert.ToString(v.Count) + "）";
+                    return null;
+                }
+                if (at >= 0 && at < slots.Count) {
+                    slots[at] = v;
+                }
             }
-            if (dims == 0) { dims = v.Count; }
-            else if (v.Count != dims) {
-                client.lastError = "嵌入服务返回的向量维度不一致（"
-                + Convert.ToString(dims) + " vs " + Convert.ToString(v.Count) + "）";
-                return null;
-            }
-            slots[at] = v;
+            itemNode = doc.NextSibling(itemNode);
         }
         // 有槽位没填上 → 响应不完整。
         for (int i = 0; i < slots.Count; i = i + 1) {
@@ -141,17 +148,16 @@ public class Embeddings {
                 Embeddings.Normalize(slots[i]);
             }
         }
-        return new AiEmbedding(slots, dims, Embeddings.Usage(root));
+        return new AiEmbedding(slots, dims, Embeddings.Usage(doc));
     }
 
     // 从响应里取用量（服务端给了就用服务端的，否则用估算）。
-    private static AiUsage Usage(JsonValue root) {
-        JsonValue u = root.Get("usage");
-        if (u == null || !u.IsObject()) { return new AiUsage(); }
-        JsonValue pt = u.Get("prompt_tokens");
-        JsonValue tt = u.Get("total_tokens");
-        int p = pt == null ? 0 : (int)pt.AsDouble(0.0);
-        int t = tt == null ? 0 : (int)tt.AsDouble(0.0);
+    private static AiUsage Usage(JsonDoc doc) {
+        if (doc == null || doc.root < 0) { return new AiUsage(); }
+        int u = doc.Get(doc.root, "usage");
+        if (u < 0) { return new AiUsage(); }
+        int p = doc.IntAt(doc.Get(u, "prompt_tokens"), 0);
+        int t = doc.IntAt(doc.Get(u, "total_tokens"), 0);
         if (p <= 0 && t <= 0) { return new AiUsage(); }
         return new AiUsage(p, t, false);
     }
