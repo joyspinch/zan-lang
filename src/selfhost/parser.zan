@@ -20,20 +20,8 @@ public class Parser {
     public bool attrAtomicLoad;  // [AtomicLoad]: body emitted as ldar
     public bool attrAtomicStore; // [AtomicStore]: body emitted as stlr
     public string attrStaticAddr; // [StaticAddr("fld")]: static whose address the method returns
-    public bool attrJsonIgnore; // last ParseAttrs saw [JsonIgnore]
     public bool attrLayoutExplicit;
     public int attrFieldOffset = -1;
-    // dbgen attribute surface captured by the last ParseAttrs: [Table]
-    // presence + explicit name, [Index(Name=,Fields=,IsUnique=)] lines, and
-    // the [Column(...)] flags of the field being declared (-1 = unset bool).
-    public bool attrHasTable;
-    public string attrTableName;
-    public List<string> attrIndexes;
-    public string attrColName;
-    public int attrColPrimary;
-    public int attrColIdentity;
-    public int attrColNullable;
-    public int attrColStrLen;
     public Node curClsNode;   // class being parsed: local functions hoist here
     public int synthUsing;    // counter for `using (expr)` temp names
     public int chkMode;       // 0 default, 1 checked, 2 unchecked (for + - *)
@@ -45,7 +33,7 @@ public class Parser {
     public List<int> fileStarts; // first source line of each input file
     public List<string> curFileUsings; // usings of the current file
 
-    public Parser(List<Token> t, Diags d) { toks = t; pos = 0; diags = d; lastErrPos = -1; attrDll = false; attrEntry = ""; attrJsonIgnore = false; curClsNode = null; synthUsing = 0; curNs = ""; curFile = -1; fileStarts = null; curFileUsings = new List<string>(); attrStaticAddr = ""; }
+    public Parser(List<Token> t, Diags d) { toks = t; pos = 0; diags = d; lastErrPos = -1; attrDll = false; attrEntry = ""; curClsNode = null; synthUsing = 0; curNs = ""; curFile = -1; fileStarts = null; curFileUsings = new List<string>(); attrStaticAddr = ""; }
 
     // main.zan knows where each input file starts in the concatenated source
     // (1-based line numbers); with it the parser can give every declaration
@@ -80,10 +68,7 @@ public class Parser {
     bool HasModBit(int mods, int bit) { return (mods / bit) - ((mods / bit) / 2) * 2 == 1; }
 
     // Attributes: [DllImport("lib")] / [DllImport("lib", EntryPoint="n")] /
-    // [StructLayout(...)] / [Group(...)] / [JsonIgnore] ... DllImport marks
-    // the following method as an extern C-ABI import (the library is linked
-    // by the build); JsonIgnore exempts a field from compile-time Json
-    // mapping; all other attributes are skipped.
+    // [StructLayout(...)] / [FieldOffset(...)] ... all other attributes are skipped.
     void ParseAttrs() {
         attrDll = false;
         attrEntry = "";
@@ -93,17 +78,8 @@ public class Parser {
         attrAtomicLoad = false;
         attrAtomicStore = false;
         attrStaticAddr = "";
-        attrJsonIgnore = false;
         attrLayoutExplicit = false;
         attrFieldOffset = -1;
-        attrHasTable = false;
-        attrTableName = "";
-        attrIndexes = null;
-        attrColName = "";
-        attrColPrimary = -1;
-        attrColIdentity = -1;
-        attrColNullable = -1;
-        attrColStrLen = 0;
         while (At(TK.LBracket())) {
             Next(); // [
             if (At(TK.Ident()) && Cur().text == "DllImport") {
@@ -172,77 +148,6 @@ public class Parser {
                 else { diags.Error("FieldOffset requires a nonnegative integer literal", attr.line, attr.col); }
                 while (!At(TK.RParen()) && !At(TK.RBracket()) && !At(TK.Eof())) { Next(); }
                 Expect(TK.RParen());
-            } else if (At(TK.Ident()) && Cur().text == "JsonIgnore") {
-                attrJsonIgnore = true;
-                Next();
-                if (Eat(TK.LParen())) {
-                    while (!At(TK.RParen()) && !At(TK.Eof())) { Next(); }
-                    Expect(TK.RParen());
-                }
-            } else if (At(TK.Ident()) && Cur().text == "Table") {
-                // [Table] | [Table("phys_name")] | [Table(Name = "phys_name")]
-                Next();
-                attrHasTable = true;
-                if (Eat(TK.LParen())) {
-                    if (At(TK.StringLit())) { attrTableName = Next().text; }
-                    // first argument may itself be a named one, so scan
-                    // flat to the closing paren
-                    while (!At(TK.RParen()) && !At(TK.Eof())) {
-                        if (At(TK.Ident()) && Cur().text == "Name" && K1() == TK.Eq()) {
-                            Next(); Next();
-                            if (At(TK.StringLit())) { attrTableName = Next().text; }
-                        } else { Next(); }
-                    }
-                    Expect(TK.RParen());
-                }
-            } else if (At(TK.Ident()) && Cur().text == "Column") {
-                // [Column(Name=, IsPrimary=, IsIdentity=, IsNullable=,
-                //  StringLength=)] on an entity field
-                Next();
-                attrColName = "";
-                attrColPrimary = -1;
-                attrColIdentity = -1;
-                attrColNullable = -1;
-                attrColStrLen = 0;
-                if (Eat(TK.LParen())) {
-                    if (At(TK.StringLit())) { attrColName = Next().text; }
-                    while (!At(TK.RParen()) && !At(TK.Eof())) {
-                        if (At(TK.Ident()) && K1() == TK.Eq()) {
-                            string an = Next().text;
-                            Next();
-                            if (an == "Name" && At(TK.StringLit())) { attrColName = Next().text; }
-                            else if (an == "IsPrimary" && (At(TK.True()) || At(TK.False()))) { attrColPrimary = At(TK.True()) ? 1 : 0; Next(); }
-                            else if (an == "IsIdentity" && (At(TK.True()) || At(TK.False()))) { attrColIdentity = At(TK.True()) ? 1 : 0; Next(); }
-                            else if (an == "IsNullable" && (At(TK.True()) || At(TK.False()))) { attrColNullable = At(TK.True()) ? 1 : 0; Next(); }
-                            else if (an == "StringLength" && At(TK.IntLit())) { attrColStrLen = (int)Next().intVal; }
-                            else { Next(); }
-                        } else { Next(); }
-                    }
-                    Expect(TK.RParen());
-                }
-            } else if (At(TK.Ident()) && Cur().text == "Index") {
-                // [Index("ix_name", Fields = "a,b", IsUnique = true)] on an
-                // entity class; multiple allowed, declaration order kept
-                Next();
-                string inm = "";
-                string ifields = "";
-                int iuniq = 0;
-                if (Eat(TK.LParen())) {
-                    if (At(TK.StringLit())) { inm = Next().text; }
-                    while (!At(TK.RParen()) && !At(TK.Eof())) {
-                        if (At(TK.Ident()) && K1() == TK.Eq()) {
-                            string an = Next().text;
-                            Next();
-                            if (an == "Name" && At(TK.StringLit())) { inm = Next().text; }
-                            else if (an == "Fields" && At(TK.StringLit())) { ifields = Next().text; }
-                            else if (an == "IsUnique" && (At(TK.True()) || At(TK.False()))) { iuniq = At(TK.True()) ? 1 : 0; Next(); }
-                            else { Next(); }
-                        } else { Next(); }
-                    }
-                    Expect(TK.RParen());
-                }
-                if (attrIndexes == null) { attrIndexes = new List<string>(); }
-                attrIndexes.Add(inm + "|" + ifields + "|" + (iuniq == 1 ? "true" : "false"));
             } else {
                 int depth = 0;
                 while (!At(TK.Eof())) {
@@ -256,10 +161,6 @@ public class Parser {
             }
             Expect(TK.RBracket());
         }
-    }
-
-    public string AttrWebPack() {
-        return "";
     }
 
     // All token access is end-of-input safe: once pos runs off the end we keep
@@ -1689,19 +1590,11 @@ public class Parser {
 
     Node ParseClass(int mods, int kw) {
         bool explicitLayout = attrLayoutExplicit;
-        bool clsHasTable = attrHasTable;
-        string clsTable = attrTableName;
-        List<string> clsIndexes = attrIndexes;
-        string clsWeb = AttrWebPack();
         Next(); // class/struct
         Node cls = new Node(AK.ClassDecl());
         cls.layoutExplicit = explicitLayout;
         if (kw == TK.Struct()) { cls.kind = AK.StructDecl(); }
         cls.mods = mods;
-        cls.attrHasTable = clsHasTable;
-        cls.attrTable = clsTable;
-        cls.attrIndexes = clsIndexes;
-        cls.attrWeb = clsWeb;
         if (At(TK.Ident())) { cls.sval = Next().text; }
         // generic params <T, ...> recorded as TypeParam children
         if (At(TK.Less())) {
@@ -1861,9 +1754,7 @@ public class Parser {
         bool wantVariadic = attrVariadic;
         string entry = attrEntry;
         int fieldOffset = attrFieldOffset;
-        string mWeb = AttrWebPack();
         int mods = ParseMods();
-        if (attrJsonIgnore) { mods = mods + MOD.JsonIgnore(); }
         if (attrThreadEntry) { mods = mods + MOD.ThreadEntry(); }
         if (attrAtomicCas) { mods = mods + MOD.AtomicCas(); }
         if (attrAtomicLoad) { mods = mods + MOD.AtomicLoad(); }
@@ -1942,17 +1833,6 @@ public class Parser {
         member.type = type;
         member.fieldOffset = fieldOffset;
         member.attrStaticAddr = attrStaticAddr;
-        // [Column(...)] capture for dbgen: name|primary|identity|nullable|len
-        // with -1 standing for an unset bool flag ("" when no [Column]).
-        if (attrColName.Length > 0 || attrColPrimary >= 0 || attrColIdentity >= 0
-                || attrColNullable >= 0 || attrColStrLen > 0) {
-            member.attrCol = attrColName + "|" + Convert.ToString(attrColPrimary)
-                + "|" + Convert.ToString(attrColIdentity)
-                + "|" + Convert.ToString(attrColNullable)
-                + "|" + Convert.ToString(attrColStrLen);
-        }
-        // Stamp the member name's position so jsongen's unsupported-field
-        // diagnostics point at the offending field (defaults to 0:0).
         member.line = Cur().line; member.col = Cur().col;
         if (HasModBit(mods, MOD.Weak())) { type.mods = type.mods + MOD.Weak(); }
         if (At(TK.Ident()) || At(TK.Get()) || At(TK.Set())) { member.sval = Next().text; }
@@ -1960,7 +1840,6 @@ public class Parser {
         if (member.sval == "operator") {
             int otk = Next().kind;
             member.kind = AK.MethodDecl();
-            member.attrWeb = mWeb;
             member.sval = OpMethodName(otk);
             ParseParams(member);
             if (At(TK.LBrace())) { member.d = ParseBlock(); }
@@ -1985,7 +1864,6 @@ public class Parser {
         }
         if (At(TK.LParen())) {
             member.kind = AK.MethodDecl();
-            member.attrWeb = mWeb;
             ParseParams(member);
             ParseWhereClauses(member);
             // expression-bodied method:  T Name(...) => expr;
