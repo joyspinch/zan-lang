@@ -1677,10 +1677,18 @@ static LLVMValueRef refl_obj_type_fn(zan_irgen_t *g) {
     if (!g->desc_hdr) {
         LLVMValueRef bound = LLVMBuildLoad2(g->builder, i64, g->g_site_count,
                                             "refl.bound");
+        LLVMValueRef is_arr = LLVMBuildICmp(g->builder, LLVMIntEQ,
+            refl_hdr_i64(g, obj, ZAN_ARR_RC_MAGIC_OFF, "refl.rcm"),
+            LLVMConstInt(i64, ZAN_ARRAY_RC_MAGIC, 0), "refl.is_arrmagic");
+        LLVMValueRef is_not_obj = zan_or(g->builder,
+            zan_hdr_is_string(g, site, "refl.isstr"),
+            is_arr, "refl.not_obj");
         in_range = LLVMBuildAnd(g->builder,
-            LLVMBuildICmp(g->builder, LLVMIntUGT, site, LLVMConstInt(i64, 0, 0), "refl.s0"),
-            LLVMBuildICmp(g->builder, LLVMIntULT, site, bound, "refl.sn"),
-            "refl.sok");
+            LLVMBuildAnd(g->builder,
+                LLVMBuildICmp(g->builder, LLVMIntUGT, site, LLVMConstInt(i64, 0, 0), "refl.s0"),
+                LLVMBuildICmp(g->builder, LLVMIntULT, site, bound, "refl.sn"),
+                "refl.sok"),
+            LLVMBuildNot(g->builder, is_not_obj, "refl.not_tag"), "refl.in_range");
     } else {
         LLVMValueRef is_tag = zan_or(g->builder,
             zan_or(g->builder,
@@ -2947,7 +2955,9 @@ static void emit_site_meta_table(zan_irgen_t *g) {
         if (g->site_coll && g->site_coll[i]) continue;   /* List/Dict/... */
         zan_symbol_t *sym = g->site_syms[i];
         if (!sym || !sym->type) continue;
-        elems[i] = refl_meta_for(g, sym->type, sym->name.str, (int)sym->name.len);
+        zan_type_t *t = (g->site_inst && g->site_inst[i])
+            ? g->site_inst[i] : sym->type;
+        elems[i] = refl_meta_for(g, t, NULL, 0);
     }
     LLVMTypeRef at = LLVMArrayType(i8ptr, (unsigned)n);
     LLVMValueRef arr = LLVMAddGlobal(g->mod, at, "__zan_site_meta_tbl");
@@ -3036,9 +3046,11 @@ void zan_irgen_emit_arc_desc_init(zan_irgen_t *g) {
                                         LLVMConstInt(i64, 0, 0) };
                 tynames = LLVMBuildGEP2(g->builder, at, gv, idxs, 2, "tn.ptr");
             }
-            if (g->refl_used && sym->type)
-                meta = refl_meta_for(g, sym->type, sym->name.str,
-                                     (int)sym->name.len);
+            if (g->refl_used && sym->type) {
+                zan_type_t *t = (g->site_inst && g->site_inst[i])
+                    ? g->site_inst[i] : sym->type;
+                meta = refl_meta_for(g, t, NULL, 0);
+            }
         }
         LLVMValueRef fields[4] = { dtor, tynames, meta,
                                    LLVMConstInt(i64, (unsigned long long)i, 0) };

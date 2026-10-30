@@ -444,6 +444,12 @@ static int render_type_full(zan_type_t *t, char *buf, int cap) {
         if (n < cap) buf[n] = '\0';
         return n;
     }
+    if (t->kind == TYPE_NULLABLE && t->element_type) {
+        n = render_type_full(t->element_type, buf, cap);
+        if (n < cap - 1) buf[n++] = '?';
+        if (n < cap) buf[n] = '\0';
+        return n;
+    }
     if (t->name.len) {
         int w = (int)t->name.len;
         if (w > cap - n - 1) w = cap - n - 1;

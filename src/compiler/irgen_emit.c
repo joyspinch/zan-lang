@@ -2594,6 +2594,14 @@ zan_status_t zan_irgen_emit(zan_irgen_t *g, zan_ast_node_t *unit) {
                             }
                         }
                     }
+                    if (!is_refl_root && g->site_syms) {
+                        for (int k = 0; k < g->leak_site_count; k++) {
+                            if (g->site_syms[k] == owner) {
+                                is_refl_root = true;
+                                break;
+                            }
+                        }
+                    }
                 }
                 bool has_attrs = (m->meta && m->meta->attributes.count > 0);
                 if (is_entry || is_cctor || is_lib_export || is_refl_root || has_attrs) {
@@ -2692,15 +2700,23 @@ done:
                         }
                     }
                 }
-                if (!is_refl_root && g->refl_metas) {
-                    for (int m = 0; m < g->refl_meta_count; m++) {
-                        if (g->refl_metas[m].sym == tsym) {
-                            is_refl_root = true;
-                            break;
+                    if (!is_refl_root && g->refl_metas) {
+                        for (int m = 0; m < g->refl_meta_count; m++) {
+                            if (g->refl_metas[m].sym == tsym) {
+                                is_refl_root = true;
+                                break;
+                            }
+                        }
+                    }
+                    if (!is_refl_root && g->site_syms) {
+                        for (int m = 0; m < g->leak_site_count; m++) {
+                            if (g->site_syms[m] == tsym) {
+                                is_refl_root = true;
+                                break;
+                            }
                         }
                     }
                 }
-            }
             bool root = (g->emit_lib &&
                          ((member->method_decl.modifiers & MOD_PUBLIC) ||
                           member->kind == AST_CONSTRUCTOR_DECL)) ||
@@ -2737,12 +2753,12 @@ done:
     if (zan_diag_has_errors(g->diag)) return ZAN_ERROR;
     di_clear(g);
     emit_all_class_releases(g);
-    refl_finalize_mtabs(g);
     emit_site_live_tables(g);
     emit_site_dtor_table(g);
     emit_site_tyname_table(g);
     emit_site_meta_table(g);
     zan_irgen_emit_arc_desc_init(g);
+    refl_finalize_mtabs(g);
     if (!prune_stdlib_bodies) emit_vtables(g);
     if (g->emit_lib && g->emit_shared && g->target_is_windows)
         emit_windows_dll_main(g);
