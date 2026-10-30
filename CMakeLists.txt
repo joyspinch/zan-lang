@@ -4784,18 +4784,21 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
   set_tests_properties(conformance_gui_html_scope PROPERTIES
     TIMEOUT 120 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
 
-  # <a> 链接导航语义（P5）：运行时 LoadHtmlWith 与 GenHtml 编译通道
-  # 两条建树路都给 <a href> 接上缺省导航（http/https 进内嵌 WebView，
-  # target="_blank" 弹系统浏览器），# 锚/javascript: 不路由，宿主
-  # data-on-click 接管不叠加，UA 给 a accent 色 + pointer 光标。
+  # <a> 链接导航语义（P5）：运行时 LoadHtmlWith 装载扫描与无宿主建树
+  # （Html.Parse + AutoLinkTree 补线）两条建树路都给 <a href> 接上缺省
+  # 导航（http/https 进内嵌 WebView，target="_blank" 弹系统浏览器），
+  # # 锚/javascript: 不路由，宿主 data-on-click 接管不叠加，UA 给 a
+  # accent 色 + pointer 光标。夹具经 --embed 烤进 exe。
   add_test(NAME conformance_gui_html_link
     COMMAND ${CMAKE_COMMAND}
       -DZANC=$<TARGET_FILE:zanc>
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/html_link_test.zan
-      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/tests/gui/html_link.html;--auto-stdlib${_gui_driver_tail}"
+      "-DZANC_ARGS=--embed;tests/gui/html_link.html;--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_html_link.out
       -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_html_link${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+  set_tests_properties(conformance_gui_html_link PROPERTIES
+    TIMEOUT 120 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
 
   # Declarative typed grid: a DataGrid field with "of" + "columns" projects
   # typed accessor lambdas onto the generic column API, binds the caller's
