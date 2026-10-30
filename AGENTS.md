@@ -3,7 +3,7 @@
 Guidance for humans and AI agents working in this repo. **本文件只是一行式门禁
 清单：每条规则的可执行全文在
 [`docs/WORKSPACE_CONVENTIONS.md`](docs/WORKSPACE_CONVENTIONS.md)（下称 WC），
-行尾标注对应章节；Zan 编码规范在 `.agents/skills/`（清单与准入标准见
+第 N 条 = WC §N；Zan 编码规范在 `.agents/skills/`（清单与准入标准见
 `.agents/skills/SKILLS_GOVERNANCE.md`）。行为守则（八荣八耻、对话与执行纪律）
 见用户全局守则与 `zan-dev-standards` §二，此处不重复。**
 
@@ -42,8 +42,8 @@ git hooks（`core.hooksPath`，`cmake -B build` 自动配置）每次 commit/mer
 12. **回退是决定不是调试手段**，默认向前修；仅限用户点名或有证据的陈旧重复。— §12
 13. **验证过的教训当天进 skills，三副本同一提交同步**：`.agents/skills/` → `tools/ai_pack/skills/` → `~/.agents/skills/`（`sync_skills.ps1 -SyncGlobal`）。— §13
 14. **公共机制进 `packages/`，模板只放"这个游戏"本身**（判据：换个游戏还成立吗）。— §14
-15. **测试产物收口**：一用例 = 一条 ctest = 一个 exe，只进 `build\cases\`；日志归 `build\test-out\`；清扫用 `scripts/clean_build.ps1`。— §16
-16. **多任务并行走调度器**：`scripts/sched.ps1 register/heartbeat/finish`，同题拒重、超限排队；裸 ctest 也自动排队。— §17
+15. **测试产物收口**：一用例 = 一条 ctest = 一个 exe，只进 `build\cases\`；日志归 `build\test-out\`；清扫用 `scripts/clean_build.ps1`。— §15
+16. **多任务并行走调度器**：`scripts/sched.ps1 register/heartbeat/finish`，同题拒重、超限排队；裸 ctest 也自动排队。— §16
 
 ## Build / dev quickstart
 
