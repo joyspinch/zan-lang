@@ -838,20 +838,20 @@ static void sh_ensure_parent_dir(const char *path) {
     }
 }
 
-static bool sh_emit_one_file(sh_state_t *st, const char *frag_path,
+static bool sh_emit_one_file(sh_state_t *st, int shard_idx, const char *frag_path,
                              LLVMTargetMachineRef tm, const char *path,
                              char *errbuf, size_t errsz) {
     zan_irgen_t *g = st->g;
     sh_ensure_parent_dir(path);
     const char *dump = getenv("ZAN_SHARD_DUMP");
     if (dump && *dump) {
-        FILE *df = fopen(dump, "wb");
+        FILE *df = fopen(dump, shard_idx == 0 ? "wb" : "ab");
         FILE *sf = fopen(frag_path, "rb");
         if (df && sf) {
             char cbuf[8192];
-            size_t n;
-            while ((n = fread(cbuf, 1, sizeof(cbuf), sf)) > 0)
-                fwrite(cbuf, 1, n, df);
+            size_t nr;
+            while ((nr = fread(cbuf, 1, sizeof(cbuf), sf)) > 0)
+                fwrite(cbuf, 1, nr, df);
         }
         if (sf) fclose(sf);
         if (df) fclose(df);
@@ -1473,7 +1473,7 @@ int zan_irgen_shard_run(zan_irgen_t *g, const zan_cg_manifest_t *m,
         char ptag[64];
         snprintf(ptag, sizeof(ptag), "shard %d: before emit", s);
         sh_probe_mem(ptag);
-        if (sh_emit_one_file(&st, frag_path, tm, path, errbuf, sizeof(errbuf))) {
+        if (sh_emit_one_file(&st, s, frag_path, tm, path, errbuf, sizeof(errbuf))) {
             objs[s] = (char *)malloc(strlen(path) + 1);
             if (objs[s]) strcpy(objs[s], path);
             else sh_fail(&st, "out of memory");

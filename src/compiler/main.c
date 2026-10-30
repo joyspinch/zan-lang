@@ -2633,23 +2633,11 @@ static int zan_run_archiver(const char *tool, const char *format,
     free(wide_path);
     if (!path) return 1;
     argv[0] = path;
-    char *quoted[6] = {0};
-    for (int i = 0; i < 5; i++) {
-        size_t len = strlen(argv[i]);
-        quoted[i] = malloc(len + 3);
-        if (!quoted[i]) {
-            for (int j = 0; j < i; j++) free(quoted[j]);
-            free(path);
-            return 1;
-        }
-        snprintf(quoted[i], len + 3, "\"%s\"", argv[i]);
-    }
     intptr_t rc = zan_utf8_spawnv(_P_WAIT, path,
-                                  (const char *const *)quoted);
+                                  (const char *const *)argv);
     if (rc < 0)
         fprintf(stderr, "error: cannot start archiver '%s': %s\n",
                 path, strerror(errno));
-    for (int i = 0; i < 5; i++) free(quoted[i]);
     free(path);
     return rc == 0 ? 0 : 1;
 #else
@@ -4198,6 +4186,10 @@ int main(int argc, char **argv) {
             for (int es = 0; es < embed_spec_count && !assets_staged; es++) {
                 const char *seq = strrchr(embed_specs[es], '=');
                 if (seq && strcmp(seq + 1, "assets") == 0) assets_staged = true;
+                if (!seq) {
+                    const char *base = zan_path_basename(embed_specs[es]);
+                    if (base && strcmp(base, "assets") == 0) assets_staged = true;
+                }
             }
             for (int ac = 0; ac < assets_cand_count && !assets_staged; ac++) {
                 const char *adir = assets_cands[ac];

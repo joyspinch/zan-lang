@@ -91,11 +91,9 @@
 #endif
         const char *rt_inflate_obj = NULL;
 #ifdef ZAN_INFLATE_OBJ
-        if (irgen.uses_inflate) {
-            snprintf(rt_inflate_buf, sizeof(rt_inflate_buf), "%s/%s",
-                     link_exe_dir, zan_path_basename(ZAN_INFLATE_OBJ));
-            rt_inflate_obj = rt_inflate_buf;
-        }
+        snprintf(rt_inflate_buf, sizeof(rt_inflate_buf), "%s/%s",
+                 link_exe_dir, zan_path_basename(ZAN_INFLATE_OBJ));
+        if (zan_file_exists(rt_inflate_buf)) rt_inflate_obj = rt_inflate_buf;
 #endif
         const char *rt_timer_obj = NULL;
 #ifdef ZAN_RT_TIMER_OBJ
@@ -1442,7 +1440,7 @@
             }
             { cmd_appendf(cmd, sizeof(cmd), " --start-group"
                        " -lmingw32 -lmoldname -lmingwex -lmsvcrt"
-                       " -lkernel32 -ladvapi32 -lshell32 -luser32"); }
+                       " -lkernel32 -ladvapi32 -lshell32 -luser32 -lversion"); }
             if (winrt_io[0]) {
                 cmd_appendf(cmd, sizeof(cmd), " -lws2_32");
             }
@@ -2035,7 +2033,8 @@
             argv[a++] = "-lmoldname"; argv[a++] = "-lmingwex";
             argv[a++] = "-lmsvcrt";   argv[a++] = "-lkernel32";
             argv[a++] = "-ladvapi32"; argv[a++] = "-lshell32";
-            argv[a++] = "-luser32";   argv[a++] = "-l:libwinpthread.a";
+            argv[a++] = "-luser32";   argv[a++] = "-lversion";
+            argv[a++] = "-l:libwinpthread.a";
             if (rt_io_obj) argv[a++] = "-lws2_32";
             char libbufs[ZAN_LINK_MAX_LIBS][128]; int nb = 0;
             for (int li = 0; li < irgen.extern_lib_count; li++) {

@@ -8,14 +8,4 @@
 
 ## 未完成
 
-### B-ID42 compiler_driver_liveness 全档红：提取分片缺 live extern caller
-
-- [ ] 现象：`ctest -R compiler_driver_liveness` 失败——"extracted shard did
-  not contain the live extern caller"（sharded 模式提取出的 shard IR 没有
-  `@PublishFeature_` 定义与 `@EmitLib_Add` 调用；sharding 本身没回退）。
-  2026-10-31 在干净 HEAD（000d4c721+）A/B 实锭与本轮 genrun 拔除无关。
-  怀疑与近期 publish 分节/瘦身提交（80082105e 一类）相关——DCE 把跨分片
-  live 的 extern caller 判死或移出了提取分片。复现：`cd build && ctest -R
-  compiler_driver_liveness --output-on-failure`。
-
 
