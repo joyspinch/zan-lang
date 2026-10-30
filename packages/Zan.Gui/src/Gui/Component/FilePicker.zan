@@ -82,8 +82,11 @@ public class FilePicker : IModalWindow {
 
     FilePicker() {
         this.pathInput = new Input("path");
+        this.pathInput.Submit.Add(() => { this.OnPathSubmit(); });
         this.nameInput = new Input("file name");
+        this.nameInput.Submit.Add(() => { this.TryAccept(); });
         this.folderInput = new Input("folder name");
+        this.folderInput.Submit.Add(() => { this.OnFolderSubmit(); });
         this.searchInput = null;
         this.treeScroll = new SignalInt(0);
         this.listScroll = new SignalInt(0);
@@ -516,7 +519,7 @@ public class FilePicker : IModalWindow {
     // `name` 通过当前所选过滤器时为 true。空模式
     // （所有文件）匹配一切；否则 ";" 分隔的
     // 任一扩展名匹配即可。
-    bool MatchesCurrentFilter(string name) {
+    public bool MatchesCurrentFilter(string name) {
         if (filters.Count == 0) {
             return this.PatternMatches(name, suffix);
         }
@@ -698,6 +701,86 @@ public class FilePicker : IModalWindow {
         if (popup != null) { popup.RequestRedraw(); }
     }
 
+    void OnPathSubmit() {
+        this.Navigate(pathInput.GetText());
+    }
+
+    void OnFolderSubmit() {
+        if (!creatingFolder) { return; }
+        string dir = FilePicker.Normalize(pathInput.GetText());
+        bool valid = Directory.ExistsUtf8(dir);
+        string folderName = folderInput.GetText();
+        if (!valid) {
+            statusText = FilePicker.T(
+                "Choose a valid parent folder.",
+                "请选择有效的父文件夹。");
+        } else if (!FilePicker.ValidFolderName(folderName)) {
+            statusText = FilePicker.T(
+                "Enter a valid folder name.",
+                "请输入有效的文件夹名称。");
+        } else {
+            string created = FilePicker.Join(dir, folderName);
+            if (!Directory.ExistsUtf8(created)) {
+                Directory.CreateDirectoryUtf8(created);
+            }
+            if (Directory.ExistsUtf8(created)) {
+                creatingFolder = false;
+                Navigate(created);
+            } else {
+                statusText = FilePicker.T(
+                    "Could not create the folder.",
+                    "无法创建文件夹。");
+            }
+        }
+        if (popup != null) { popup.RequestRedraw(); }
+    }
+
+    void TryAccept() {
+        string dir = FilePicker.Normalize(pathInput.GetText());
+        bool valid = Directory.ExistsUtf8(dir);
+        if (mode == 0 && valid) {
+            selectedPath = dir;
+            Finish(1);
+        } else if (mode == 1 && (Directory.FileExistsUtf8(selectedPath) || (allowMulti && selectedPaths.Count > 0))) {
+            Finish(1);
+        } else if (mode == 1) {
+            // 名称框兼作选择器：输入完整名称（或要进入的
+            // 文件夹名）后按 Open 即可确定。
+            string typed = nameInput.GetText();
+            if (typed != "") {
+                string typedPath = FilePicker.Join(dir, typed);
+                if (Directory.FileExistsUtf8(typedPath)) {
+                    selectedPath = typedPath;
+                    Finish(1);
+                } else if (Directory.ExistsUtf8(typedPath)) {
+                    selectedPath = "";
+                    Navigate(typedPath);
+                } else {
+                    statusText = FilePicker.T(
+                        "No such file or folder.", "没有此文件或文件夹。");
+                    if (popup != null) { popup.RequestRedraw(); }
+                }
+            } else {
+                statusText = FilePicker.T(
+                    "Select a file first.", "请先选择文件。");
+                if (popup != null) { popup.RequestRedraw(); }
+            }
+        } else if (mode == 2 && valid && nameInput.GetText() != "") {
+            string name = nameInput.GetText();
+            string wantSuffix = "";
+            if (filters.Count > 0 && filterSel.Get() >= 0 && filterSel.Get() < filters.Count) {
+                wantSuffix = FilePicker.FilterTokenToSuffix(FilePicker.FirstExt(filters[filterSel.Get()].pattern));
+            } else {
+                wantSuffix = FilePicker.FilterTokenToSuffix(FilePicker.FirstExt(suffix));
+            }
+            if (wantSuffix != "" && !this.MatchesCurrentFilter(name)) {
+                name = name + wantSuffix;
+            }
+            selectedPath = FilePicker.Join(dir, name);
+            Finish(1);
+        }
+    }
+
     void RenderWindow() {
         if (!open || popup == null || !popup.needsRedraw) { return; }
         popup.BeginFrame();
@@ -844,29 +927,7 @@ public class FilePicker : IModalWindow {
 
             if (FilePicker.Clicked(
                     app, createX, paneY, createW, t.heightMedium)) {
-                string folderName = folderInput.GetText();
-                if (!valid) {
-                    statusText = FilePicker.T(
-                        "Choose a valid parent folder.",
-                        "请选择有效的父文件夹。");
-                } else if (!FilePicker.ValidFolderName(folderName)) {
-                    statusText = FilePicker.T(
-                        "Enter a valid folder name.",
-                        "请输入有效的文件夹名称。");
-                } else {
-                    string created = FilePicker.Join(dir, folderName);
-                    if (!Directory.ExistsUtf8(created)) {
-                        Directory.CreateDirectoryUtf8(created);
-                    }
-                    if (Directory.ExistsUtf8(created)) {
-                        creatingFolder = false;
-                        Navigate(created);
-                    } else {
-                        statusText = FilePicker.T(
-                            "Could not create the folder.",
-                            "无法创建文件夹。");
-                    }
-                }
+                this.OnFolderSubmit();
             } else if (FilePicker.Clicked(
                     app, folderCancelX, paneY, cancelW, t.heightMedium)) {
                 creatingFolder = false;
@@ -1271,13 +1332,51 @@ public class FilePicker : IModalWindow {
             listDragging = false;
         }
 
+        if (!suppressOthers && app.EventKind() == 4) {
+            int key = app.window.EventKeyCode();
+            if (key == 27) {
+                if (creatingFolder) {
+                    creatingFolder = false;
+                    folderInput.SetText("");
+                    statusText = "";
+                    app.ClaimKey();
+                    app.RequestRedraw();
+                } else if (filterOpen) {
+                    filterOpen = false;
+                    app.ClaimKey();
+                    app.RequestRedraw();
+                } else {
+                    app.ClaimKey();
+                    Close();
+                }
+            } else if (key == 13) {
+                if (creatingFolder) {
+                    this.OnFolderSubmit();
+                    app.ClaimKey();
+                } else if (app.focus.IsFocused(pathInput.WidgetId())) {
+                    this.OnPathSubmit();
+                    app.ClaimKey();
+                } else if (searchInput != null && app.focus.IsFocused(searchInput.WidgetId())) {
+                    if (items.Count == 1 && items[0].kind == 0) {
+                        selectedPath = items[0].path;
+                        nameInput.SetText(items[0].name);
+                        this.TryAccept();
+                        app.ClaimKey();
+                    }
+                } else {
+                    this.TryAccept();
+                    app.ClaimKey();
+                }
+            }
+        }
+
         if (!suppressOthers && FilePicker.Clicked(
                 app, pad, top, upW, t.heightMedium)) {
             string parent = FilePicker.ParentDirectory(dir);
             if (Directory.ExistsUtf8(parent)) { Navigate(parent); }
         } else if (!suppressOthers && FilePicker.Clicked(
                 app, goX, top, goW, t.heightMedium)) {
-            Navigate(pathInput.GetText());
+            this.OnPathSubmit();
         } else if (!suppressOthers && FilePicker.Clicked(
                 app, newX, top, newW, t.heightMedium)) {
             if (valid) {
@@ -1345,12 +1444,20 @@ public class FilePicker : IModalWindow {
                 // 上限拦截信息必须存活到渲染：仅当本次点击
                 // 真正改动了选区时才清状态。
                 if (!blocked) { statusText = ""; }
-                app.RequestRedraw();
+                if (app.DoubleClickNow()) {
+                    this.TryAccept();
+                } else {
+                    app.RequestRedraw();
+                }
             } else {
                 selectedPath = clickedItem.path;
                 nameInput.SetText(clickedItem.name);
                 statusText = "";
-                app.RequestRedraw();
+                if (app.DoubleClickNow()) {
+                    this.TryAccept();
+                } else {
+                    app.RequestRedraw();
+                }
             }
         }
 
@@ -1474,45 +1581,7 @@ public class FilePicker : IModalWindow {
             Finish(2);
         } else if (!suppressOthers && FilePicker.Clicked(
                 app, acceptX, footerY, buttonW, t.heightMedium)) {
-            if (mode == 0 && valid) {
-                selectedPath = dir;
-                Finish(1);
-            } else if (mode == 1
-                       && Directory.FileExistsUtf8(selectedPath)) {
-                Finish(1);
-            } else if (mode == 1) {
-                // 名称框兼作选择器：输入完整名称（或要进入的
-                // 文件夹名）后按 Open 即可确定。
-                string typed = nameInput.GetText();
-                if (typed != "") {
-                    string typedPath = FilePicker.Join(dir, typed);
-                    if (Directory.FileExistsUtf8(typedPath)) {
-                        selectedPath = typedPath;
-                        Finish(1);
-                    } else if (Directory.ExistsUtf8(typedPath)) {
-                        selectedPath = "";
-                        Navigate(typedPath);
-                    } else {
-                        statusText = FilePicker.T(
-                            "No such file or folder.", "没有此文件或文件夹。");
-                        app.RequestRedraw();
-                    }
-                } else {
-                    statusText = FilePicker.T(
-                        "Select a file first.", "请先选择文件。");
-                    app.RequestRedraw();
-                }
-            } else if (mode == 2
-                       && valid && nameInput.GetText() != "") {
-                string name = nameInput.GetText();
-                string wantSuffix = FilePicker.FilterTokenToSuffix(suffix);
-                if (wantSuffix != ""
-                    && !FilePicker.EndsWith(name, wantSuffix)) {
-                    name = name + wantSuffix;
-                }
-                selectedPath = FilePicker.Join(dir, name);
-                Finish(1);
-            }
+            this.TryAccept();
         }
     }
 }
