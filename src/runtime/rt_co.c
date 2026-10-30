@@ -35,7 +35,7 @@ void zan_co_set_idle(zan_co_idle_fn fn) {
 
 static void queue_grow(void) {
     size_t ncap = g_cap ? g_cap * 2 : 16;
-    zan_co_slot_t *nq = (zan_co_slot_t *)realloc(g_queue, ncap * sizeof(*nq));
+    zan_co_slot_t *nq = (zan_co_slot_t *)malloc(ncap * sizeof(*nq));
     if (!nq) {
         /* 队列扩容遇 OOM 丢弃本次恢复，保护主进程与已连接会话不崩溃 */
         fprintf(stderr, "zan runtime: coroutine ready-queue grow failed "
