@@ -98,7 +98,7 @@
 6. **文档承诺必须与实现一致**：宣称"响应式/变更通知"的成员必须有真实订阅者，
    否则删除（反例：`Signal.Changed` 曾零订阅空转）。
 7. **字符串 `bind` 通道的边界**：`Control.bindPath`/`bindProp` 是**设计时声明
-   元数据**（设计器 Inspector、Serialize 行格式、GenForm 生成器读写），运行时
+   元数据**（设计器 Inspector、Serialize 行格式、DesignerHtml 编解码读写），运行时
    由 `ChildWindow` 消费——每帧把 JsonValue 状态实体按路径同步进控件/回写。
 8. **`Props()` 指针必须优先指向活的外部通道**：属性 spec 同时存在 Binding 与
    内部 Signal 背书时，`data != null` 分支必须指向 Binding（`spec.num = data`），

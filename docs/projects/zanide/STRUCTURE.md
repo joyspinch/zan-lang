@@ -5,6 +5,12 @@
 
 ## 1. 一个可视单元 = 一个 `.html` 设计稿 + 同名 code-behind
 
+> **通道注记（B-ID44 迁移中）**：编译期 HTML 通道（GenForm 生成 partial
+> class、.html 当 zanc 输入/入口）已删除——zanc 现在显式拒绝 `.html`
+> 输入。设计稿的终态是 `--embed` 烘进 exe、启动时经 `DesignerHtml.ToJsonDoc`
+> + `FormBuilder.Build` 运行期投影（迁移配方见 tests/gui/form_* 系列）。
+> 下文涉及"生成物/入口规则"的条目随 B-ID44 一起改写。
+
 | 文件 | 职责 |
 |------|------|
 | `Xxx.html` | 声明式设计（body 带 data-zan-design）：控件树、布局、事件名。**唯一** UI 声明来源 |

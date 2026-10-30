@@ -1,15 +1,16 @@
 # HTML 窗口规范（HTML UI）
 
 > HTML 声明式窗口（原 WEB_GUI_ROADMAP P5 阶段）的主文档：用 HTML + CSS 描述窗口，事件走
-> `data-on-*` 属性协议。同一份 .html 既能运行时动态装载（`App.LoadHtml`），
-> 也能编译期展开成建树代码（GenHtml 生成器）——两条路径吃同一个解析器，
-> 几何逐盒全等（oracle 裁决）。"web 一样"的布局语义（块流/行盒/float/
+> `data-on-*` 属性协议。HTML 只在**运行时装载**（`App.LoadHtml` /
+> `Html.Parse`）——编译期 HTML 通道（GenHtml/GenForm 生成器）已删除，
+> zanc 拒绝 `.html`/`.htm` 输入（tests/diag/html_input_rejected.html 钉住
+> 这条诊断）。"web 一样"的布局语义（块流/行盒/float/
 > grid）见 `docs/archive/WEB_GUI_ROADMAP.md`（各阶段已全量落地，归档留档）；
 > 本文只讲声明层本身的协议与支持面。
 
-## 两条装载路径
+## 装载路径与发布形态
 
-**运行时动态装载**（html 文本可来自文件/网络/字符串）：
+**运行时装载**（html 文本可来自内嵌资源/文件/网络/字符串）：
 
 ```zan
 HtmlHandlers h = new HtmlHandlers();
@@ -22,28 +23,15 @@ Control root = app.LoadHtmlWith(html, h, baseDir);   // <link> 相对 baseDir
 style 属性合成规则）并进 appCss 再建树。`root` 恒为 body 元素——片段
 没有 body 标签时包一层隐式 body（对齐 Chrome 的文档语义）。
 
-**编译期展开**（发布不携带 HTML 文本与解析器）：
-
-```bash
-zanc app.zan ui.html --stdlib-path <stdlib> -o app.exe
-```
-
-`.html`/`.htm` 输入经 ZanGen 的 GenHtml 生成器展开成一个建树类
-（`ui.html` → 类 `UiHtml`；基名帕斯卡化 + `Html` 后缀）：
-
-```zan
-public class UiHtml {
-    public static string Css;   // <style>/<link>/style 属性收集的 CSS
-    public static Control Build(HtmlHandlers handlers);
-}
-```
-
-调用方在 Main 里 `app.UseAppCss(UiHtml.Css); Control root =
-UiHtml.Build(handlers);`。生成器与运行时共用 `System.Web.HtmlParser`
-的声明记录（WDoc/WNode），建树顺序同构——`UiHtml.Build` 的几何与
-`App.LoadHtml` 逐盒全等（tests/weboracle/html 13 盒 diff 全等）。
-生成器 exe 按 zanc+stdlib+源内容哈希缓存在
-`%LOCALAPPDATA%\Zan\gen`，stdlib 变了自动重编。
+**发布与保护**：HTML 源码不落散盘——`zanc --embed <路径>` 把 .html 烘进
+exe（`File.ReadAllText` 内嵌优先），烘入内容先压缩、再以按文件名派生的
+密钥流加密存放（防 strings 抠源，不对抗逆向专家；密钥种子由全部内嵌
+文件确定性推导，确定性孪生测试不受影响）。装载全程内存内解密+解压，
+**不解压到任何临时路径**。设计稿同理：`DesignerHtml.ToJsonDoc` +
+`FormBuilder.Build` 在运行期投影成控件树（见「设计器文档格式」）。
+编译器对 `.html` 输入的显式拒绝与内嵌通道的契约分别由
+`diag_html_input_rejected`（ctest）与 `tests/conformance/file_embed_*`
+钉住。
 
 ## 元素映射
 
@@ -87,7 +75,7 @@ HtmlHandlers h = new HtmlHandlers();
 h.Add("submit", () => { ... });
 ```
 
-后缀 → 事件名映射（`HtmlText.EventKind`，运行时与生成器共用）：
+后缀 → 事件名映射（`HtmlText.EventKind`）：
 click→Click、dblclick/doubleclick→DoubleClick、
 rightclick/contextmenu→RightClick、mousedown/mouseup、
 mouseenter/mouseover→Enter、mouseleave/mouseout→Leave、wheel→Wheel、
@@ -117,14 +105,11 @@ h.AddArg("pick", (string arg) => { ... });   // 同名也可再 Add 无参版
 - 名字命中带参槽 → 有参调用；只注册了无参 `Add` → 回落无参调用；
   都没注册 → 静默不接（同上）；
 - 名字无论如何都落控件（`SetHandler`），ChildWindow 宿主可用
-  `HandleArg("pick", ...)` + `Wire()` 二次解析——运行时 `Html.Parse`
-  与编译期 `GenHtml`（发射 `handlerArg` 字段 + `Html.WireArg`）同一
-  语义；`<template data-for>` 克隆行保留声明，展开后逐行接线共享
-  原型上的同一实参；
+  `HandleArg("pick", ...)` + `Wire()` 二次解析；`<template data-for>`
+  克隆行保留声明，展开后逐行接线共享原型上的同一实参；
 - 设计器通道同样建模（2026-09-15 起）：DesignerHtml 编解码把模型
   `"arg"` 键折成 `data-arg` 属性（与运行时协议同键同名）、
-  FieldFromJson 落 `handlerArg`、GenForm 编译期发射
-  `handlerArg` 字段——.html 设计稿里写
+  FieldFromJson 落 `handlerArg`——.html 设计稿里写
   `data-on-click="pick" data-arg="apple"` 全链路语义一致。
 
 ## 动态原语：data-if 与 `<template data-for>`（P8）
@@ -163,14 +148,13 @@ UI、设计器画布、主窗口 `LoadHtmlWith` 装载的树）一律惰性。
 **Element 的缺省绑定属性是 text**：行里 `<span data-bind="name">`
 由 ChildWindow 按 `SetText` 通道推送/读回（真控件缺省是 value）。
 
-**三条通道同语义**（同一份文档在运行时装载与编译期生成行为一致，
-conformance 三用例互为镜像）：
+**两条通道同语义**（同一份文档在 HTML 装载与设计稿投影下行为一致，
+conformance 用例互为镜像）：
 
 | 通道 | data-if | data-for |
 |------|---------|----------|
 | 运行时 `App.LoadHtml` | 属性协议 → bindIf | Element 属性表 |
-| 编译期 `GenHtml`（非设计稿 .html） | → bindIf | Element 分支 parity `SetAttr("data-for")` |
-| 设计稿 `GenForm` / 设计器 | JSON `"if"` 键 → bindIf | JSON `"for"` 键 → `SetAttr("data-for")` |
+| 设计稿投影（`DesignerHtml.ToJsonDoc` → `FormBuilder.Build`） | JSON `"if"` 键 → bindIf | JSON `"for"` 键 → `SetAttr("data-for")` |
 
 设计器存取格式里模板字段的形态（"tag"/"for"/"if" 都不在
 IsModeledKey 名单，Inspector 经 extra 原样透传保真）：
@@ -242,7 +226,7 @@ IsModeledKey 名单，Inspector 经 extra 原样透传保真）：
 - 纯空白 run 只在两个行内级兄弟之间保留；
 - 块边界的空白丢弃；
 - 容器的行内内容按文档序保真（文本 run 与子控件交错）——这是混排
-  行盒的输入，生成代码的内容游走（EmitContent）与运行时装配同一顺序。
+  行盒的输入，运行时装配按同一文档序游走。
 
 ## 样式装载与优先级
 
@@ -264,14 +248,16 @@ P0-P4 节）。CSS 支持面（含 grid/flex/float）见 TASKS.md A16。
   `#id x,y wxh` 行。当前 13 盒全绿（唯一非零是 #s1 的 x/w GDI 步进台账）。
 - **同构断言**：`_scratch` 之外，css_test.zan 的 DisplayHtml 段断言
   解析/建树/事件接线/样式合并；conformance_gui_css golden 含 html 11 行。
-- **端到端**：同一份 html 喂 GenHtml（UiHtml.Build）与运行时
-  （LoadHtmlWith），13 盒输出 diff 全等。
+- **端到端**：运行时（LoadHtmlWith）与 Chrome oracle 的 13 盒
+  逐盒对比（见上条）；html_runtime/html_scope/form_* 系列 conformance
+  用例钉装载、设计稿投影与动态原语语义。
 
 ## 设计器文档格式（P7a）
 
 窗口设计器的存取格式就是本文件的 HTML 子集：文档 `<body>` 带裸属性
-`data-zan-design`（区分设计稿与运行期 UI 文档——编译期前者进 GenForm 窗体
-投影，后者进 GenHtml 建树类；IDE 里前者开设计器）。同一份 JSON 文档模型
+`data-zan-design`（区分设计稿与运行期 UI 文档——前者由
+`DesignerHtml.ToJsonDoc` + `FormBuilder.Build` 在运行期投影成控件树，
+后者走 `Html.Parse`/`LoadHtmlWith`；IDE 里前者开设计器）。同一份 JSON 文档模型
 经 `System.Web.DesignerHtml` 与 HTML 解析：
 
 - 文档级键（winW/role/layoutMode/…）→ `<body>` 的 `data-<kebab>` 属性；
@@ -294,10 +280,11 @@ P0-P4 节）。CSS 支持面（含 grid/flex/float）见 TASKS.md A16。
 内部表示（撤销快照、JSON 抽屉、LSP 供数），不落盘、不手写。
 
 P7d 起全仓库窗口声明只有 .html 一种形态：templates/gui 12 份与 IDE 自用
-31 份设计稿均已迁移（模型级等价校验），模板/新建文件/编译发现全部以
-.html 为入口。早期 .html 编译通道已彻底删除，统一采用 .html 设计稿。
-把设计文档转成 .html（`DesignerHtml.FromJsonDoc` 是规范转换器）后编译；
-GenForm 与 GenScene 均统一以 .html 设计稿为规范格式（分别通过 `data-zan-design` 与 `data-zan-scene` 标记），`.zcomp`（用户组件）不受影响。
+31 份设计稿均已迁移（模型级等价校验），模板/新建文件/设计器存取全部以
+.html 为规范格式（`DesignerHtml.FromJsonDoc` 是规范转换器；
+`data-zan-design` 与 `data-zan-scene` 分别标记窗体与场景设计稿，
+`.zcomp` 用户组件不受影响）。.html 是**数据**不是编译输入——编译器
+拒绝 `.html` 源文件，程序经 `--embed` 携带设计稿、运行期投影装载。
 
 ## 字段内联 style（P7b）
 
@@ -306,9 +293,9 @@ Inspector 的 STYLE 区逐行编辑（`键: 值`，一行一条）。运行时�
 `SetProp("style", ...)` → `StyleSheet.ApplyInline`——声明文本交给整块 CSS
 解析器（颜色函数/缩写键/`!important` 全复用），布局键（pad/gap/width/
 height/dock/x/y）落控件字段，视觉键经 `DeclSource`+`CopyToControl` 落
-`style*` 覆盖字段（在每次样式解析的 Inline 覆盖之后，优先于类规则）。三个
-消费端同落点：画布预览（FormBuilder.FromField → MakeControl）、生成代码
-（GenForm 发射 `SetProp("style", ...)`）、运行期文档（UiDoc）。
+`style*` 覆盖字段（在每次样式解析的 Inline 覆盖之后，优先于类规则）。两个
+消费端同落点：画布预览（FormBuilder.FromField → MakeControl）与运行期
+装载（文档/设计稿的 style 属性都走 `SetProp("style", ...)`）。
 
 **语义边界（台账）**：设计几何拥有布局——字段的 X/Y/宽/高（或流式跨距、
 显式 pad/gap）由发射器以 `logW/Prefer/logPad` 在 style 之后接管，measure
@@ -354,8 +341,7 @@ font-size/transition）完全生效，不受几何影响。这是对浏览器 "i
   `focus.hoverStartMs`，随 SetHovered 目标变化重置）。前提是元素
   有命中区（链接/带 data-on-click 的元素天然有；纯展示容器无人
   监听时不给指针，也就无提示）。真控件（button/input/...）的
-  title 忽略——不进控件属性面；GenHtml 编译通道对 Element 发
-  `elTitle`，双通道同形。与浏览器差异：气泡是 Zan 皮肤样式而非
+  title 忽略——不进控件属性面。与浏览器差异：气泡是 Zan 皮肤样式而非
   系统原生；`title` 不承担浏览器里的其它兜底语义（如 img 替换
   文本）。
 - **捕获控件的内嵌元素忽略**：`<button><span>x</span></button>` 的

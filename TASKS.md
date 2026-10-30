@@ -8,6 +8,18 @@
 
 ## 未完成
 
-（当前无未完成挂账）
+### B-ID44 IDE 自举构建迁移运行期设计稿通道
+
+编译期 HTML 通道删除后（zanc 显式拒绝 `.html` 输入，
+`diag_html_input_rejected` 钉住该诊断），`scripts/build_ide.ps1` 仍按
+genrun 时代规则把 `src/IdeForm.html` 等 31 份设计稿当编译输入传给
+zanc——IDE 自举构建当前必红。迁移形状：设计稿改 `--embed` 随 exe 烘入
+（内嵌优先读回、发布加密），程序 Main 落在 Zan 代码里，启动时经
+`DesignerHtml.ToJsonDoc` + `FormBuilder.Build`/`ChildWindow` 投影各设计稿
+（迁移配方即 tests/gui/form_* 系列）；`docs/projects/zanide/STRUCTURE.md`
+§1 的 GenForm 生成物/入口规则说法随迁移一并改写。
+探针：`build/zanc.exe tests/diag/html_input_rejected.html` 报
+"the compile-time HTML channel has been removed"。
+
 
 
