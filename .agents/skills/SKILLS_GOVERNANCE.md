@@ -20,7 +20,7 @@
 
 | skill | 定位 | 发布包 |
 |---|---|---|
-| zan-dev-standards | Zan 开发总纲：工作流闭环、代码规范、验证纪律、沉淀纪律 | 是 |
+| zan-dev-standards | Zan 开发总纲：工作流闭环、代码规范、验证纪律、沉淀纪律（验证/并发细节在 references/verification.md） | 是 |
 | zan-workflow | 版本提交与任务管理规范：提交信息格式、提交纪律、任务台账、会话卫生 | 是 |
 | app-migration | 业务程序迁移与复刻规范：C#/强类型/业务系统向 Zan 迁移的方法论与纪律 | 是 |
 | gui-design | GUI 排版与审美规范（含 references/ 细节） | 是 |
@@ -52,7 +52,7 @@ tag→控件映射/空白语义/设计器 .html P7a、P7b 字段内联 style）�
 ## 已执行的历史处置
 
 - 2026-09 删除 11 个：testing-* 7 个（实机验证仪式，机器专属内容混入，可迁移规则
-  已提炼进 zan-dev-standards 第三节）、zan-lsp-intellisense / zan-dap-debugging /
+  已提炼进 zan-dev-standards 验证纪律节（现 references/verification.md））、zan-lsp-intellisense / zan-dap-debugging /
   zan-designer-components / game-online / app-migration（项目专属全链路定式，
   历史内容在 git 历史可找回）。
 - 2026-10 **app-migration 重新加入**（通用方法论改写版），其余三个
@@ -61,3 +61,7 @@ tag→控件映射/空白语义/设计器 .html P7a、P7b 字段内联 style）�
 - 全部保留 skill 已去日期流水、收短 description；game-dev 删除进行中的
   会话记录节。
 - ai_pack 发布变体只保留规范类与 SDK 使用面；全局 ~/.agents/skills 同步收敛。
+- 2026-10-31 收敛：zan-dev-standards 验证纪律 40+ 逐坑小节拆入
+  references/verification.md（主文件 2769→775 行）；全部 description 收敛 ≤2 行；
+  删除全局 fast-and-solid（与用户全局 AGENTS.md 逐字重复）；八荣八耻统一为
+  工作区 9 条版；worktree 口径收窄为"不拿当构建环境/公共包来源"。

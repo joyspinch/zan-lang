@@ -1,6 +1,6 @@
 ---
 name: zan-debugging
-description: How to diagnose a failing Zan program with the Zan SDK — compiler diagnostics, ARC leak reports, the language server (zan-lsp) and the debug adapter (zan-dap) over stdio. Use it when a build fails, a program misbehaves, or memory looks wrong.
+description: How to diagnose a failing Zan program — compiler diagnostics, ARC leak reports, zan-lsp and zan-dap over stdio. Use when a build fails, a program misbehaves, or memory looks wrong.
 ---
 
 # Debugging Zan

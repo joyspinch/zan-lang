@@ -1,6 +1,6 @@
 ---
 name: zan-development
-description: The fixed workflow for writing or changing Zan code with the Zan SDK — orient, look the API up, edit, compile, run — plus the language facts and the exact commands. Use it for any Zan coding task.
+description: The fixed workflow for Zan coding tasks — orient, look the API up, edit, compile, run — plus language facts and exact commands. Use for any Zan coding task.
 ---
 
 # Writing Zan code

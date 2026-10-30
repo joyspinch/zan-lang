@@ -1,6 +1,6 @@
 ---
 name: zan-mcp
-description: How to drive the Zan SDK through its MCP server (stdio or hosted HTTP) — the tool catalog, reading and editing without re-reading, skills over MCP, the safety flags, deploying one shared server, and how to reach zan-lsp / zan-dap directly. Use it when connecting an AI client to Zan or when an MCP call misbehaves.
+description: Drive the Zan SDK through its MCP server (stdio or hosted HTTP) — tool catalog, read/edit without re-reading, skills over MCP, safety flags, shared deployment. Use when connecting an AI client to Zan or when an MCP call misbehaves.
 ---
 
 # Using the Zan MCP server

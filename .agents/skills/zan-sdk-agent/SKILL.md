@@ -1,6 +1,6 @@
 ---
 name: zan-sdk-agent
-description: 在 zan-lang 源仓库里用配套工具干活：查地图定位、查影响面、算该跑哪组 ctest、跑模板门。改任何 .zan / 改公共 API / 要判断"这次改动该跑什么检查"时用它。
+description: 在 zan-lang 源仓库里用配套工具干活：地图定位、影响面、该跑哪组 ctest、模板门。改任何 .zan / 改公共 API / 要判断该跑什么检查时使用。
 ---
 
 # 在 zan-lang 里干活
@@ -124,6 +124,6 @@ tools/agent/impact.ps1 -Symbol 'File.ReadAllText'
 
 - 在读第 4 个文件还没动手 → 该用 `map.ps1`。
 - 直接编译 `templates/**/App.zan`，或单文件编译多文件工具 → 必红，且不是真错。
-- 报"编译通过"但没跑 `verify.ps1` → 不算验证。
+- 报"编译通过"但没跑判定器（`verify.ps1`，或等效的探针 + 受影响单用例）→ 不算验证。
 - `impact.ps1` 报跨边界，却只跑了单文件编译 → 漏改已发生。
 - 想跑 `scripts/test.ps1 standard` 来"确认一下" → 违反 Rule 8。

@@ -1,12 +1,12 @@
 # AGENTS.md
 
-
 Guidance for humans and AI agents (Devin, Copilot, etc.) working in this repo.
-**Read this before creating files.** The full rules live in
-[`docs/WORKSPACE_CONVENTIONS.md`](docs/WORKSPACE_CONVENTIONS.md); this file is the
-short, enforceable summary.
+**本文件只是一行式门禁清单。每条规则的可执行全文都在
+[`docs/WORKSPACE_CONVENTIONS.md`](docs/WORKSPACE_CONVENTIONS.md)（下称 WC），
+章节号与条号一致（第 N 条 = WC §N）。** Zan 编码规范在 `.agents/skills/`
+（清单与准入标准见 `.agents/skills/SKILLS_GOVERNANCE.md`）。
 
-## AI 编码八荣八耻（行为守则，所有会话始终遵守）
+## AI 编码八荣八耻（行为守则，所有会话始终遵守；与用户全局守则为同一版本）
 
 以瞎猜接口为耻，以认真查询为荣
 以模糊执行为耻，以寻求确认为荣
@@ -18,20 +18,8 @@ short, enforceable summary.
 以盲目修改为耻，以谨慎重构为荣
 以低阶模型为耻，以深度思考为荣
 
-## 工程师认知与交互纪律（讲人话、重实效、杜绝机械重复）
-
-1. **单次读取与上下文信任（禁止反刍读取）**：
-   - 工具调用已知或已读到的代码/结构默认全部记住；严禁对同一文件的同一片段反复 `read_file`。
-   - 修改代码采用「grep定位 -> 紧凑读20~50行上下文 -> 直接edit -> 单测闭环」，禁止大范围通读无关代码。
-   - 编辑完不要为了“确认写进去了没有”而二次回读，工具自会报错或校验。
-2. **人类对话风格（讲人话、言简意赅、拒绝机械报幕）**：
-   - 彻底摒弃公文式汇报、虚词套话、报幕前缀（如“一句话交代动作：”、“正在执行：”等）与自问自答式的过程流水账。
-   - 工具调用非必要不发空话，直奔执行；仅在方向切换或关键耗时操作前简短自然说明，严禁给发言套用固定口头禅或句式模板。
-   - 最终回复直接给结论：“改了哪、为什么、验证结果”。
-   - 遇到技术决策，像老手同事一样给出明确推荐与利弊，不抛出冗长选择清单把问题甩回给人类。
-3. **带着工程假设破局（主动推进而非原地打转）**：
-   - 面对报错或需求，基于架构直觉形成 1~2 个最可能的假设并以最小代价验证，不盲目漫游全仓。
-   - 验证过即自动提交，不堆积未提交的工作区变动。
+（对话与执行纪律——讲人话、禁反刍复读、假设破局——见用户全局守则与
+`zan-dev-standards` §二，此处不再重复。）
 
 ## Directory map — where things go
 
@@ -57,264 +45,37 @@ short, enforceable summary.
 | `dist/`         | Release staging output (git-ignored, never commit)              |
 | `_scratch/`     | ALL throwaway work: probes, benchmarks, logs, drafts (git-ignored) |
 
-> Note: the old C IDE (`src/ide/`) was removed. The IDE is now `src/ide_zan/`;
-> its analysis/debug backends live in `src/lsp/` and `src/dap/`.
 ## ZanIDE
-ZanIDE禁止任何自绘必须全部用标准库组件来完成
+
+ZanIDE 禁止任何自绘，必须全部用标准库组件来完成。
 
 ## Git gate hooks — enforced rules (always on)
 
-The repo enables `scripts/hooks/` via `core.hooksPath` (set automatically by
-`cmake -B build`; see `docs/WORKSPACE_CONVENTIONS.md` §0). Every commit,
-merge/pull and push is machine-checked for **leftover conflict markers**
-(rules 11/12 — a blocked commit means the conflict was "resolved" without a
-hand merge) and **>8 MiB blobs on source extensions** (rules 1–3). Fix the
-underlying problem; bypass with `--no-verify` only for a proven false
-positive, stated in the commit message.
+仓库经 `core.hooksPath` 启用 `scripts/hooks/`（`cmake -B build` 自动配置，
+详见 WC §0）：每次 commit / merge / push 机检**遗留冲突标记**（规则 11/12）
+与**源码扩展名 >8 MiB 大文件**（规则 1–3）。修底层问题；仅对已证实的误报
+才可用 `--no-verify` 绕过，并在提交说明里写明。
 
-## Hard rules — DO NOT break these
+## Hard rules — 一行门禁，全文 = WC §N（条号一致）
 
-1. **Keep the repo root clean.** Only long-lived, version-controlled entries
-   belong there (source dirs, `CMakeLists.txt`, `README.md`, `LICENSE`,
-   `.gitignore`, `AGENTS.md`). Never drop build artifacts, logs, probes,
-   one-off scripts, PR drafts, diffs, or patches in the root.
-2. **All throwaway files go in `_scratch/`** (git-ignored). This includes
-   debug probes, benchmarks, ad-hoc scripts, screenshots, `*.log`, PR bodies,
-   commit-message drafts, `*.diff`/`*.patch`. **Cleanup is part of finishing
-   the task** — `_scratch` once hit 48G because it only ever grew: before
-   committing, delete what you created this session (bisect trees via
-   `git worktree add`/`git worktree remove`, A/B compiler snapshots, stdlib
-   copies — reuse fixed names like `_scratch/zanc-good` instead of minting
-   new ones). Keepers (SDKs, toolchains, anything expensive to re-acquire)
-   must carry a one-line `README.md` saying what it is and how to re-acquire
-   it; README-marked entries are skipped by `scripts/clean_scratch.ps1`,
-   which sweeps entries older than 7 days (`-Apply` to actually delete,
-   dry-run by default) — run it when `_scratch` grows past a few GB.
-3. **Build only out-of-source into `build/`** via `cmake -B build && cmake --build build`.
-   Never copy build products into the source tree or root.
-   **并发时走 `scripts/build.ps1`，不要裸跑 `cmake --build`**（见规则 8a）。
-4. **Tests go in `tests/`** and are committed. One-off memory/leak probes are
-   NOT tests — put them in `_scratch/`.
-5. **Use `gh` / the PR template** to open PRs. Do not generate `mkpr*.py`,
-   PR-body `.md`, or `*.diff` files in the repo.
-6. **`.gitignore` is a safety net, not a license to litter.** Even ignored
-   files must not pile up in the source tree.
-7. **Every task ends clean — and ends with a commit.** Run `git status` before
-   finishing; there should be no stray untracked files. Review
-   `git diff --stat` and commit only what the task requires. Never
-   `git add .` / `git add -A` blindly. Once the change is verified (rule 8),
-   **commit on your own**: do not ask for permission and do not leave verified
-   work uncommitted. If `git push` fails (e.g. network), leave the commit on
-   local `main` and say so. Hold the commit only when verification failed or
-   the working tree mixes in unrelated in-flight changes you must not touch.
-8. **ctest tiers are opt-in, never a reflex — do not saturate the machine.**
-   A tier run fans out across every core for tens of minutes and maxes the
-   CPU, and relinking `zanc` invalidates every test artifact — so tiers are
-   NOT the default verification step, **including for compiler/runtime/
-   stdlib changes**. Default verification is direct and cheap: compile and
-   run the affected program/probe (`build\zanc.exe <file.zan> --auto-stdlib
-   -o _scratch\out.exe`), diff the one affected golden/diagnostic, and run
-   the single affected test case when one exists (`ctest -R
-   conformance_<name>` — seconds, vs tens of minutes for a tier; narrow
-   further with `-Match`/`-R` when the change is local, e.g. a generics/ARC
-   change: `-R "generic|leakcheck_generic"`). Do NOT run `smoke`/`standard`/
-   `full` tiers (`scripts\test.ps1 <tier>`, or `ctest -L <tier>`) as a
-   pre-commit step, and do not re-run a tier after small follow-up edits:
-   run a tier only when the user explicitly asks for it, or at an agreed
-   release gate (`full` — determinism/leakcheck twins + self-hosting — is a
-   release gate only). A hand-run probe plus the affected single case is a
-   complete verification; it does not need to be "upgraded" to a tier run.
-   **Nothing else may build while tests run**: the cases share
-   `build\zanc.exe` and the stdlib stamp, so a concurrent
-   `build_gallery`/`build_ide` makes unrelated cases fail en masse.
-8a. **共享构建资源要串行拿，不要另开一份。** 多会话同时用一个 `build/` 时，
-   编译与测试必须互斥——机制已落地，不用靠自觉：
-   - 构建：`pwsh -File scripts/build.ps1`（**不要裸跑 `cmake --build build`**）
-   - 测试：`pwsh -File scripts/test.ps1 <tier> [-Match <name>]`
-   - 两把脚本共用一把跨进程锁（`scripts/build_gate.ps1`）。拿不到就**排队等**
-     （默认 30 分钟超时，超时报错而不是静默绕过）。
-   - 看当前谁占着锁：`pwsh -File scripts/build_gate.ps1 -Status`
-   **为什么是"等"而不是"另建一棵构建树"**：另建（`build_mine`、
-   `build-zancprobe`、`zan-pkgs`…）是用磁盘换隔离——代价是几百 MB 到 2 GB
-   的重复构建，而且公共包一改副本就漂移，副本并没有让共享状态消失，只是
-   把它藏起来了，漂移照旧。实测一次并发就多出 2.7 GB 重复构建树 + 一个
-   247 MB 仓库副本，而公共包仍旧不同步。**共享资源冲突时的正确动作是排队
-   等，不是复制一份。** 同理，公共包**不要用 worktree 副本**——直接用主仓库
-   `packages/`（编译时 `--package-project zan-lang`），worktree 会漂移且
-   规则 9 禁分支。
-   坑出处：15 个游戏 worker 并发时，一个因公共包副本被删而自建 247 MB
-   仓库副本顶上（副本停在旧 commit，公共包改动永远追不上）；另一个为抓
-   一个 40 帧闪光反复调采样间隔，296K token 花在代码逻辑里已经写明的结论
-   上——"分支走了→flashTimer 被赋值→闪光没画出来"，问题是渲染不是采样。
-   **能用断言钉住的行为不要靠截图反推**；抓帧只用于"好不好看"这类断言不了
-   的东西，且一次抓完批量分析，别边抓边猜时序。
-9. **Never create branches.** Do NOT create local or remote branches; commit
-   directly to `main` and push. Delete any stray branch you find after making
-   sure its commits are merged into `main`. Content check, not name check:
-   `git log main..<branch>` alone is not proof of unmerged work — a
-   cherry-picked or re-committed fix has no ancestry link. Before deleting,
-   prove every unique commit's content lives in main (blob-compare per file
-   `git rev-parse <branch>:<file>` vs `main:<file>`, or find the equivalent
-   commit), keep the tip reachable (`git tag archive/<name>-<date> <tip>`),
-   then `git branch -D`. Ancestry-only reasoning ("tip is ancestor of main")
-   plus grep of the main-side feature is the evidence to write into the
-   delivery notes.
-10. **Fix the compiler, don't route around it.** When Zan code fails because the
-    compiler/runtime has a bug or a missing capability, the default is to fix
-    the compiler or runtime. Do NOT rewrite the Zan code into a shape that
-    dodges the defect (hand-rolled `while` instead of a broken `foreach`,
-    `string`/`NativeMemory` instead of a broken `byte[]`, a C shim instead of
-    the Zan implementation, an extra `count` parameter because arrays lack a
-    length). Those workarounds are how the debt in A15 accumulated: each one
-    hides the root cause and spreads through the standard library.
-    Procedure: reduce it to a minimal probe in `_scratch/`, find the root cause
-    in `src/compiler/` or `src/runtime/`, fix it, add a `tests/conformance/`
-    case and run just that case (rule 8 — the probe plus the new conformance
-    case IS the verification; a tier run is not required and must not be run
-    by reflex), and only then write the natural Zan code. If the fix is genuinely out
-    of scope for the current task, do not silently work around it: record it in
-    `TASKS.md` with the probe and the root cause, say so explicitly, and get
-    agreement before shipping any temporary shape.
-11. **Concurrent sessions share this working tree — commit finished work the
-    moment it is verified.** Do not accumulate completed changes in the working
-    tree or index across steps: another session's `git stash pop`, `git reset`,
-    or broad `git checkout` can silently overwrite them, which reads as a
-    mass-revert of committed features. Commit (and push) each coherent change
-    as soon as it is verified (rule 8). Stash discipline: before any
-    `git stash`/`push`/`pop`/`apply`, run `git status` — if the tree holds
-    another session's in-flight edits or untracked files, isolate your own work
-    with a targeted path spec (`git stash push -- <paths>`) or use a separate
-    `git worktree`; never pop a stale snapshot over a newer HEAD.
-    **Conflicts are repaired, never rolled back or discarded.** Hitting UU index
-    entries, `<<<<<<<` markers, or concurrent edits to the same files means two
-    lines of work must be **merged by hand**: for each conflicted file compare
-    both sides (`git show :2:<file>` = committed/HEAD side, `:3:<file>` =
-    in-flight side) against HEAD, keep committed features unconditionally, fold
-    in genuinely new work from the other side, verify with the narrowest check
-    (rule 8 — probe/single case, not a tier), resolve **every** UU entry, and
-    commit. Making the conflict "go away"
-    is forbidden — no bulk one-sided resolves (`git checkout --ours/--theirs .`,
-    `git checkout .`), no `git reset --hard`, no deleting the file or copying an
-    older version over it: all of those silently revert committed features and
-    read as a mass-revert. Drop one side only after proving it is a stale
-    duplicate of already-committed content (evidence: HEAD grep / blob compare).
-    Do not leave unresolved conflicts or markers for the next session. Full
-    procedure: `docs/WORKSPACE_CONVENTIONS.md` §9.1.
-12. **Never revert code casually — reverting is a decision, not a debugging
-    move.** Rolling code back to make an error "go away" is forbidden by
-    default: no `git checkout` / `git restore` / `git reset --hard` to dodge a
-    build or test failure, no copying an older version of a file over the
-    current one, no `git revert` of commits you did not author, no commenting
-    out or deleting freshly committed code because it misbehaves. The default
-    is to **fix forward**: reproduce, find the root cause, repair. A revert is
-    legitimate only when (a) the user explicitly asked for it, or (b) you have
-    evidence the target code is a stale duplicate or provably broken — state
-    that evidence (`git log` / `git blame`, blob compare) in the delivery
-    notes. A revert touching another session's in-flight or committed work
-    needs the user's explicit go-ahead first; conflict scenarios follow rule
-    11. When in doubt: surface the problem, never roll back to finish cleanly.
-    Full text: `docs/WORKSPACE_CONVENTIONS.md` §10.
-
-13. **经验沉淀纪律：验证过的教训必须进 skill，且持续增删迭代。** 项目级
-    skills 在 `.agents/skills/`（当前 13 个：通用规范类 9 + SDK 使用面 3 +
-    仓库专属 1；清单与准入标准见
-    `.agents/skills/SKILLS_GOVERNANCE.md`。发布变体
-    `tools/ai_pack/skills/` 12 个，随 SDK 进 `dist/ai/skills/`；
-    项目专属的 game-online/testing-* 已删，历史在 git）。规则：
-    - 会话中**验证过**的新经验（踩坑后成立的解法）当天并入对应 skill，
-      与功能同一提交；跨项目可复用的写通用节，项目专属写项目节。
-    - 被**推翻**的旧经验在同一提交里删除——skill 里不留"可能也对"的
-      僵尸规则，宁缺毋滥。
-    - 每条规则带"为什么"（踩过的坑）；没有坑出处的新增不予合入。
-    - 动手前先查 skill：同类的坑别人踩过就不要再踩一遍。
-    - skills 有**三份副本**，更新必须同一提交走完全程，只改工作区 =
-      用户项目永远收不到教训：① 工作区 `.agents/skills/`（活源，LF）→
-      ② `tools/ai_pack/skills/`（发布变体：剥离"在 zan-lang 仓库内工作"
-      节、仓库内路径改写成通用说法、description 尾保留"仓库内有同名
-      项目级版本，会自动优先"提示）→ ③ `C:\Users\<user>\.agents\skills\`
-      （②的字节副本，zcode 在仓库外使用）。`scripts\sync_skills.ps1`
-      报告 ①↔② 漂移（VARIANT 条目 = 人工维护的变体，需人工比对），
-      `-SyncGlobal` 把 ② 字节复制到 ③；② 再由 `publish_ide.ps1` 随
-      SDK 进 `dist\ai\skills\`。
-14. **公共机制进包，模板只放"这个游戏"本身。** `templates/` 里出现
-    通用子系统（物流/配方、存档、寻路、成长表、回合规则……）就是放错地方
-    了——判据是"**换个游戏还成立吗**"：成立 → 抽成 `packages/Zan.*` 包，
-    模板只留玩法规则、界面、入口与资源。理由：模板是"怎么做一个游戏"的
-    示范，公共库散在模板里会被每个项目各抄一份，修复无法回流。
-    动手前先查 `packages/` 是否已有同类模块（复用优先，规则 10）；
-    抽包时把配套的无头测试一起搬过去（包的测试跑在包上，不是跑在某个
-    模板上）。坑出处：`coreforge`（现为仓库外项目 `D:/project/games/coreforge`）
-    曾在模板里长出 261KB 的
-    工厂自动化引擎，抽出为 `Zan.Game.Factory` 时顺带发现它的存档读回
-    全线失败（查裸字段 `numIsInt` 判整数，解析出来的 JSON 数字带的是
-    `numRaw` 文本），修好后 240 条断言才真正跑起来——被模板藏起来的
-    腐化，进了包就会被迫面对。
-15. **大型游戏项目不进仓库，放仓库外的独立项目。** 产品级规模的游戏
-    （几十 MB 素材、上千文件、自带工具链与服务端）放 `D:/project/games/<名字>/`
-    这类仓库外目录，仓库只留 SDK、公共包与**示例级**模板。判据是体量与
-    产品化程度：`legend` 57MB/7219 文件、`wuwei` 15.6MB/414 文件——它们是
-    产品，不是"怎么做一个游戏"的示范；留在 `templates/` 里既拖慢仓库，
-    又会被 IDE 当成可新建的模板误导用户。
-    **一个游戏 = 一个项目目录**，内部按端分目录（`client/` `server/`），
-    跨端用例放项目顶层 `tests/`——两端各自分目录、好管理，跨端校验也有地方放。
-    搬迁用 `scripts/export_game_project.ps1`：复制模板 + 配套测试、改写所有
-    仓库路径引用、退掉模板身份（删 `template.manifest`、`{{NAME}}` 落实名）、
-    补 `PROJECT.md`、`git init` 出独立历史。仓库侧删除前先
-    `git tag archive/<名字>-<日期>` 留住版本，导出时用 `-SourceRef <标签>`
-    从标签取源（仓库里已经没有源目录了）。
-    搬出后**包依赖**要自己解决：包从 `<项目根>/packages/`、
-    `<项目根>/.zan-packages/`、全局 `%LOCALAPPDATA%\Zan\packages` 三处解析，
-    或编译时 `--package-project <zan-lang>`。坑出处：搬迁脚本的改写规则
-    必须用**单行**替换（多行块会因 CRLF/LF 差异对不上，规则静默不生效）；
-    模板自带的构建/测试脚本常常从没跑通过（wuwei 的 `build.ps1` 只枚举
-    `src/*.zan` 顶层，漏掉 `src/Model/` 下的源码，`test.ps1` 又漏带设计稿
-    导致 `Menu` 解析错位），搬迁正好逼它们面对——先修根因再搬。
-16. **测试产物必须收口，不许散着堆。** 每个 conformance 用例都把自己的可执行
-    文件编到 `build\` 下——历史上全编在 `build\` 根目录，几百轮测试之后根目录
-    堆了 **1884 个一次性 exe / 6 GB**，真产物只剩 4 个，`ctest` 每跑一次还留
-    一个 `LastTest.log.tmpXXXXXX`。规矩：
-    - **一个用例 = 一条 ctest 条目 = 一个可执行文件**：conformance / 泄漏 /
-      ARC 三个结论共用同一份插桩产物（`build\cases\case_*.exe`），determinism
-      另立一条 `case_det_*`（它要比两次代码生成，多半不产可执行文件，只留一枚
-      stamp）。**别再把同一个源编成多个 exe**——孪生档的老写法是同一份源码编
-      三遍（普通版 / `--check-leaks` / `--arc-guard`）跑三遍，一轮全量下来是
-      3500+ 个 exe、4700 个一次性文件，而每个程序本身只跑几毫秒。
-    - **用例产物只有一个去处**：`build\cases\`（`CMakeLists.txt` 里所有
-      `OUT_EXE=${CMAKE_BINARY_DIR}/...` 都指向那里）。`build\` 根只留真产物
-      与工具链。新增用例时不要另开目录，也不要写回根目录。
-    - **它是缓存，不是垃圾**：`run_case_modes.cmake` 靠"源文件/编译器/stdlib
-      stamp 没变就复用旧 exe"加速。全删等于每轮重编一千多个程序，所以按
-      **最近使用 + 体积上限** 清扫，别一把删光——`scripts\clean_build.ps1`
-      干这件事（`-KeepDays` / `-MaxCacheMB`）。
-    - **日志合并成一份**：`ctest` 的完整输出归档到
-      `build\test-out\<tier>-<时间>.log`，只留最近 5 份；不要每个用例一个
-      输出文件散在 `build\` 里。
-    - 清扫在 `scripts\test.ps1` 跑完 ctest 后自动执行；手动扫用
-      `scripts\clean_build.ps1`（默认 dry-run，`-Apply` 才删）。
-    - 坑出处：`build\` 根的用例 exe **不是 cmake 编译产物**（没有同名
-      `.dir` 中间态，是 `tests/run_case.cmake` 每次现场编译的），所以删掉
-      安全、下次会重新生成——但 `build\` 根同时躺着 `ld.lld.exe`、
-      `repomap.exe`、`zan-mcp.exe` 等真工具链，**按名字猜着删会踩到它们**，
-      所以保留清单写死在 `clean_build.ps1` 里，不按通配符删。
-
-17. **多任务并行靠调度器，不靠"复制一份躲开"。** 仓库里已经有自动协调机制，
-    用它，别手抄、别另开一份：
-    - **共享构建资源**：`scripts/build.ps1`、`scripts/test.ps1`、**裸 `ctest`**
-      都走同一把锁（`scripts/sched.ps1` 的租约）。裸 ctest 也自动排队——钩子
-      挂在 CMake 生成的 `CTestCustom.cmake` 上（`scripts/ctest_gate.ps1`），
-      谁跑都一样，**绕不过去**。拿不到就排队等（默认 30 分钟，超时报错，
-      不静默绕过）。
-    - **任务准入**：派 worker 前先
-      `pwsh -File scripts/sched.ps1 register -Title "<任务名>"`——**同题已在跑
-      直接拒**（exit=2，点名是谁在跑），并发超上限就排队（默认 4）。长任务
-      用 `heartbeat -Id <lease>` 续租，结束时 `finish -Id <lease>`（顺手清掉
-      它登记的副本）。派发前先 `status` 看一眼有几条在跑。
-    - **副本自动回收**：`scripts/sched.ps1 reap`（每次 build/test 跑完自动
-      执行）清掉过期任务租约，以及**没人引用的仓库外 worktree 副本**——删前
-      先证明"内容已在主仓"（工作树干净 + HEAD 是 main 的祖先）；有独有提交
-      或未提交改动的会保留并报出来，不硬删。
-    - 机制细节与踩过的坑见 `.agents/skills/zan-dev-standards/SKILL.md` 的
-      「并发会话的串行纪律」与「PowerShell 脚本协作的几个坑」两节。
+1. **根目录只放长期受控内容**；产物、日志、探针、PR 草稿一律不进根目录。— WC §1
+2. **所有一次性文件进 `_scratch/`**（探针/benchmark/日志/草稿/diff），收尾清理是任务的一部分；长驻大件必须带一行 README。— WC §2
+3. **只做 out-of-source 构建，产物只进 `build/`**；并发时构建走 `scripts/build.ps1`，不裸跑 `cmake --build`。— WC §3
+4. **测试进 `tests/` 并提交**；一次性内存/泄漏探针不是测试，进 `_scratch/`。— WC §4
+5. **PR 用 `gh` / PR 模板**；不在仓库生成 PR 脚本、正文 md、diff 文件。— WC §5
+6. **`.gitignore` 是兜底不是借口**，忽略的文件也不许在源码树堆积。— WC §6
+7. **每个任务收尾干净、以一次提交结束**：验证过（规则 8）即自行 commit+push，不等批准；push 失败留在本地 main 并说明；绝不 `git add .`。— WC §7
+8. **ctest 整档（smoke/standard/full）opt-in**：默认验证 = 编译运行受影响程序/探针 + 单跑受影响用例（`ctest -R <name>`，可再 `-Match` 窄化）；档位只在用户点名或发布门槛跑；**档位运行期间不得并行任何构建**。探针 + 单用例即完整验证。— WC §8
+8a. **共享构建资源串行拿，冲突排队等，不另开副本**：build.ps1 / test.ps1 / 裸 ctest 共用一把跨进程锁（`scripts/build_gate.ps1`，超时报错）；公共包直接用主仓库 `packages/`（`--package-project zan-lang`）。— WC §8a
+9. **永不建分支**，直接提交 main 并 push；删任何遗留分支前先证内容已并入（内容判定，不是名字/血缘）。— WC §9
+10. **编译器/runtime 有缺陷就修编译器，禁止绕行写法**：`_scratch` 最小探针 → 修根因 → 补 conformance 用例单跑 → 再用自然写法改上层；超范围记 TASKS.md 并明说，不静默绕过。— WC §10
+11. **并发会话共享工作树，验证过即提交**；stash 前先 git status、路径限定隔离；冲突一律逐文件手工合并、UU 清零——禁止 checkout --ours/--theirs、reset --hard、删文件拷旧版等一切单边回退。— WC §11
+12. **回退是决定不是调试手段**：默认向前修；仅允许用户点名回退、或有证据证明陈旧重复/确定损坏（证据写进交付说明）。— WC §12
+13. **验证过的教训当天沉淀进 skills，三副本同一提交同步**：① `.agents/skills/`（活源）→ ② `tools/ai_pack/skills/`（发布变体）→ ③ `~/.agents/skills/`（② 字节副本，`sync_skills.ps1 -SyncGlobal`）；新规则带"为什么"，被推翻的同提交删除。— WC §13 + SKILLS_GOVERNANCE.md
+14. **公共机制进 `packages/`，模板只放"这个游戏"本身**（判据：换个游戏还成立吗）；动手前先查 packages/ 复用；抽包把配套测试一起搬。— WC §14
+15. **大型游戏项目不进仓库**，放 `D:/project/games/<名字>/` 独立项目（一游戏一目录，client/ server/ 分端）；搬迁用 `scripts/export_game_project.ps1`，仓库侧先打 archive tag。— WC §15
+16. **测试产物收口**：一用例 = 一条 ctest = 一个 exe，只进 `build\cases\`；日志归档 `build\test-out\`；缓存按最近使用 + 体积上限清扫（`scripts/clean_build.ps1`），不按名字猜着删。— WC §16
+17. **多任务并行走调度器**：派发前 `scripts/sched.ps1 register`（同题拒重、超限排队），长任务 heartbeat 续租、结束 finish；共享构建资源与裸 ctest 自动排队，绕不过去。— WC §17
 
 ## Build / dev quickstart
 
@@ -329,10 +90,6 @@ pwsh -File scripts/build.ps1        # 构建（受串行闸保护，多会话时
 # IDE (self-hosted) is a zan.proj project: scripts/build_ide.ps1 (entry src/IdeForm.html).
 ```
 
-**并发时不要裸跑 `cmake --build build`** —— 它没有闸，多会话会互踩 `build\zanc.exe`，
-让别人的测试成片假红。`scripts/build.ps1` 与 `scripts/test.ps1` 共用一把跨进程锁：
-拿不到就排队等，不另建构建树（见规则 8a）。
-
 Compile a single program: `build/zanc <file.zan> --auto-stdlib -o out.exe`
 Release build of a program: `build/zanc <file.zan> --auto-stdlib --publish -o out.exe`
 
@@ -343,10 +100,8 @@ update it in the same commit when changing argument parsing.
 
 ### CEF browser driver (optional)
 
-`Gui.Component.CefBrowser` ships as an opt-in native driver (`zan_cef` / on
-Windows also `zan_cef109` for Win7/8/8.1). It is **off by default** because the
-configure step fetches CEF headers from the official Spotify CDN (a few hundred
-MB). Enable with:
+`Gui.Component.CefBrowser` 是 opt-in 原生驱动（默认关闭：configure 会从官方
+CDN 拉几百 MB CEF 头文件）：
 
 ```bash
 cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DZAN_BUILD_CEF=ON
@@ -355,7 +110,5 @@ cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DZAN_BUILD_CEF=ON -DZAN_BUIL
 cmake --build build --target zan_cef
 ```
 
-Built drivers are staged next to the source (`packages/Zan.Gui.Browser/src/Gui/Component/CefBrowser/drivers/<plat>/`)
-so `zanc --publish` carries them with the program. The CEF *runtime* (libcef)
-is still downloaded per-machine at first run; see
-`examples/gui_cef_browser/README.md` for `ZAN_CEF_*` env vars.
+驱动随源码 stage，`zanc --publish` 携带；CEF 运行时首次运行按机下载，
+`ZAN_CEF_*` 环境变量见 `examples/gui_cef_browser/README.md`。

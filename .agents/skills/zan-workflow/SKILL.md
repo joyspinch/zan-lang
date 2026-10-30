@@ -1,6 +1,6 @@
 ---
 name: zan-workflow
-description: 版本提交与任务管理规范——提交信息格式（scope: 一句话结果）、提交纪律（验证过即提交、不攒工作树）、任务台账（TASKS.md 记缺陷挂账与闭账）、会话卫生（临时产物即用即删）。凡是要 git commit、写提交信息、更新任务台账、结束一轮开发工作、或问 "这个改动要不要提交/怎么写 commit message" 时使用。
+description: 版本提交与任务管理规范——提交信息格式（scope: 一句话结果）、提交纪律（验证过即提交、路径限定）、TASKS.md 台账、会话卫生。git commit、写提交信息、更新台账或收尾一轮开发时使用。
 ---
 
 # 版本提交与任务管理规范
@@ -129,7 +129,9 @@ description: 版本提交与任务管理规范——提交信息格式（scope: 
   另一会话未提交的源码编辑会被重建直接烤进产物——发出去的二进制里是别人
   的半成品，而"产物提交时间新于源提交"的陈旧判定还显得一切正常。重建
   驱动/交叉对象等提交态产物前，把编译闭包源逐个过 `git status --short`；
-  有 ' M' 行就等落库再建；确实要在旁路重建就用 `_scratch` 下的**普通目录拷贝**（仓库外的 git worktree 副本一律不再建——见 zan-dev-standards 的并发纪律一节）。
+  有 ' M' 行就等落库再建；确实要在旁路重建就用 `_scratch` 下的**普通目录拷贝**（仓库外的
+  git worktree 副本不拿当构建环境——见 zan-dev-standards references/verification.md
+  的并发纪律一节；二分定位的短命 worktree 除外）。
   坑出处（/04 两连）：win-x64 GUI 驱动 dll 从并行会话在途的
   gui 源编出并入 staging——当时自己的 status 检查带 grep 过滤把 ' M' 行
   滤没，复核才发现并撤销；次日交叉 rt 十四件同型拦截（rt_file.c 等三源
