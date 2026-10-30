@@ -593,7 +593,7 @@ int zan_gen_ensure(const char *stdlib_root, char *exe, size_t exe_size) {
                  GEN_EXE_SUFFIX);
         char *argv[] = {
             zexe, src, "--stdlib-path", (char *)stdlib_root, "--auto-stdlib",
-            "--no-gen", "--no-packages", "--quiet", "-DZAN_GEN_MAIN=1",
+            "--no-gen", "--quiet", "-DZAN_GEN_MAIN=1",
             "-o", tmp, NULL
         };
         int r = zan_spawn_wait(argv);
