@@ -154,6 +154,86 @@ public class Binder {
         return null;
     }
 
+    public bool IsMethodTypeParam(Node m, string tpName) {
+        if (m == null || tpName == null || tpName == "") { return false; }
+        int k = 0;
+        while (k < m.kids.Count) {
+            Node kd = m.kids[k];
+            if (kd.kind == AK.TypeParam() && kd.sval == tpName) { return true; }
+            k = k + 1;
+        }
+        return false;
+    }
+
+    // Subtyping / compatibility check: is targetTy assignable from fromTy?
+    // Checks exact equality, universal object, base class inheritance chains,
+    // and implemented interfaces.
+    public bool IsAssignableFrom(string targetTy, string fromTy) {
+        if (targetTy == null || fromTy == null) { return false; }
+        if (targetTy == fromTy) { return true; }
+        if (targetTy == "object" || targetTy == "System.Object") { return true; }
+
+        string baseTarget = targetTy;
+        int tlt = targetTy.IndexOf("<");
+        if (tlt > 0) { baseTarget = targetTy.Substring(0, tlt); }
+
+        string baseFrom = fromTy;
+        int flt = fromTy.IndexOf("<");
+        if (flt > 0) { baseFrom = fromTy.Substring(0, flt); }
+
+        if (baseTarget == baseFrom) { return true; }
+
+        // Builtin collection interfaces
+        if (baseTarget == "IEnumerable" || baseTarget == "IReadOnlyList" ||
+            baseTarget == "IList" || baseTarget == "ICollection") {
+            if (baseFrom == "List" || fromTy.EndsWith("[]")) { return true; }
+        }
+        if (baseTarget == "IDictionary" || baseTarget == "IReadOnlyDictionary") {
+            if (baseFrom == "Dictionary" || baseFrom == "Dict") { return true; }
+        }
+
+        string curName = baseFrom;
+        int depth = 0;
+        while (curName != "" && depth < 64) {
+            depth = depth + 1;
+            Node decl = FindType(curName);
+            if (decl == null) { break; }
+
+            // Check implemented interfaces
+            if (decl.interfaces != null) {
+                int i = 0;
+                while (i < decl.interfaces.Count) {
+                    string ifn = decl.interfaces[i];
+                    int ilt = ifn.IndexOf("<");
+                    string baseIfn = ilt > 0 ? ifn.Substring(0, ilt) : ifn;
+                    if (baseIfn == baseTarget || IsAssignableFrom(targetTy, ifn)) { return true; }
+                    i = i + 1;
+                }
+            }
+
+            // Move to base class
+            if (decl.sval2 != null && decl.sval2 != "") {
+                string bname = decl.sval2;
+                int blt = bname.IndexOf("<");
+                string baseB = blt > 0 ? bname.Substring(0, blt) : bname;
+                if (baseB == baseTarget || IsAssignableFrom(targetTy, bname)) { return true; }
+                curName = baseB;
+            } else {
+                break;
+            }
+        }
+        return false;
+    }
+
+    public bool MatchReceiver(Node m, Node p0, string recvTy) {
+        if (p0 == null || p0.type == null) { return false; }
+        string pty = p0.type.sval;
+        if (pty == recvTy) { return true; }
+        if (IsMethodTypeParam(m, pty)) { return true; }
+        if (IsAssignableFrom(pty, recvTy)) { return true; }
+        return false;
+    }
+
     // Find an extension method `name` (static, marked with a `this` receiver of
     // type recvTy) anywhere in the program. ownerOut receives its class name.
     public Node FindExtension(string recvTy, string name, List<string> ownerOut) {
@@ -165,7 +245,7 @@ public class Binder {
                 Node m = cls.kids[j];
                 if (m.kind == AK.MethodDecl() && m.sval == name && m.ival == 1) {
                     Node p0 = FirstParam(m);
-                    if (p0 != null && p0.type != null && p0.type.sval == recvTy) {
+                    if (MatchReceiver(m, p0, recvTy)) {
                         ownerOut.Add(cls.sval);
                         return m;
                     }
@@ -187,7 +267,7 @@ public class Binder {
                 Node m = cls.kids[j];
                 if (m.kind == AK.MethodDecl() && m.sval == name && m.ival == 1) {
                     Node p0 = FirstParam(m);
-                    if (p0 != null && p0.type != null && p0.type.sval == recvTy) {
+                    if (MatchReceiver(m, p0, recvTy)) {
                         ms.Add(m);
                         owners.Add(cls.sval);
                     }
