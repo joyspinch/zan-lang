@@ -341,19 +341,42 @@ public class SelectQuery<T> {
         return this.inner.AggD("AVG(" + col + ")");
     }
 
-    // 从 DbResult 当前行映射生成实体实例
-    public static T MapRow(DbResult r, int row, Meta meta) {
-        TypeInfo ti = (meta != null && meta.Type.Name.Length > 0) ? meta.Type : typeof(T);
-        object obj = ti.CreateInstance();
+    // 列名至结果集列索引预解析，避免在行遍历内层高频重复字典查表
+    public static List<int> ResolveColIndices(DbResult r, Meta meta) {
+        List<int> colIndices = new List<int>();
+        if (r == null || meta == null) { return colIndices; }
+        int totalCols = r.ColumnCount();
         for (int i = 0; i < meta.Cols.Count; i = i + 1) {
             Col c = meta.Cols[i];
             int colIdx = r.GetColumnIndex(c.Col);
             if (colIdx < 0) {
                 colIdx = i;
             }
-            if (colIdx >= r.ColumnCount()) {
+            if (colIdx >= totalCols) {
+                colIdx = -1;
+            }
+            colIndices.Add(colIdx);
+        }
+        return colIndices;
+    }
+
+    // 从 DbResult 当前行映射生成实体实例（带预解析列索引缓存，O(1) 零查找）
+    public static T MapRow(DbResult r, int row, Meta meta, List<int> colIndices) {
+        TypeInfo ti = (meta != null && meta.Type.Name.Length > 0) ? meta.Type : typeof(T);
+        object obj = ti.CreateInstance();
+        for (int i = 0; i < meta.Cols.Count; i = i + 1) {
+            int colIdx = -1;
+            if (colIndices != null && i < colIndices.Count) {
+                colIdx = colIndices[i];
+            } else {
+                colIdx = r.GetColumnIndex(meta.Cols[i].Col);
+                if (colIdx < 0) { colIdx = i; }
+                if (colIdx >= r.ColumnCount()) { continue; }
+            }
+            if (colIdx < 0) {
                 continue;
             }
+            Col c = meta.Cols[i];
             if (c.Kind == 3) {
                 if (r.IsNull(row, colIdx)) {
                     obj.SetFieldObject(c.Field, null);
@@ -373,6 +396,11 @@ public class SelectQuery<T> {
         return (T)obj;
     }
 
+    // 从 DbResult 当前行映射生成实体实例
+    public static T MapRow(DbResult r, int row, Meta meta) {
+        return MapRow(r, row, meta, null);
+    }
+
     public List<T> ToList() {
         int savedLim = this.inner.limN;
         int savedOff = this.inner.offN;
@@ -386,8 +414,9 @@ public class SelectQuery<T> {
         List<T> list = new List<T>();
         if (r == null) { return list; }
         int count = r.RowCount();
+        List<int> colIndices = ResolveColIndices(r, this.meta);
         for (int i = 0; i < count; i = i + 1) {
-            T item = MapRow(r, i, this.meta);
+            T item = MapRow(r, i, this.meta, colIndices);
             if (this.predicate == null || this.predicate(item)) {
                 if (this.havingPredicate == null || this.havingPredicate(item)) {
                     if (this.includeFields.Count > 0) {
@@ -507,8 +536,10 @@ public class SelectQuery<T> {
     List<T> MapAll(DbResult r) {
         List<T> list = new List<T>();
         if (r == null) { return list; }
-        for (int i = 0; i < r.RowCount(); i = i + 1) {
-            list.Add(this.MapRow(r, i, this.meta));
+        List<int> colIndices = ResolveColIndices(r, this.meta);
+        int totalRows = r.RowCount();
+        for (int i = 0; i < totalRows; i = i + 1) {
+            list.Add(MapRow(r, i, this.meta, colIndices));
         }
         return list;
     }
