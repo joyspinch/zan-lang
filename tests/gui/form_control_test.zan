@@ -1,12 +1,12 @@
 using System;
+using System.IO;
+using System.Web;
 using Gui;
 using Gui.Widget;
 
-partial class ZfPanel {
-    void OnInit() {
-    }
-}
-
+// 设计稿 control（data-role="control"）的运行期投影契约：命名控件
+// 齐活、Card 收子、两次构建实例独立、data-on-click 只在接入宿主
+// （Wire）后才路由到宿主事件。
 class FormControlTest {
     static int fails;
     static bool went;
@@ -19,59 +19,81 @@ class FormControlTest {
         Console.WriteLine("FAIL " + what + ": got '" + got + "' want '" + want + "'");
     }
 
+    static Control Ctl(Control root, string name) {
+        Control c = root.Find(name);
+        if (c == null) { throw new Exception("missing " + name); }
+        return c;
+    }
+
+    static Control Build() {
+        string html = File.ReadAllText("tests/gui/form_control.html");
+        return FormBuilder.Build(JsonValue.ParseLenient(DesignerHtml.ToJsonDoc(html)));
+    }
+
     static void Main() {
         fails = 0;
 
-        ZfPanel p = new ZfPanel();
-        FormControlTest.Eq("kind", p.Kind(), "ZfPanel");
-
-        if (p.ChildCount() == 0) {
-            fails = fails + 1;
-            Console.WriteLine("FAIL control has no designed children");
-        }
-
-        FormControlTest.Eq("label text", p.Caption.GetProp("text"),
+        Control p = Build();
+        FormControlTest.Eq("label text", Ctl(p, "Caption").GetProp("text"),
                             "side panel");
-        FormControlTest.Eq("button text", p.GoBtn.GetProp("text"), "Go");
-        FormControlTest.Eq("button name", p.GoBtn.name, "GoBtn");
+        FormControlTest.Eq("button text", Ctl(p, "GoBtn").GetProp("text"), "Go");
+        FormControlTest.Eq("button name", Ctl(p, "GoBtn").name, "GoBtn");
 
-        if (p.Box == null || p.Box.ChildCount() != 1) {
+        Control box = Ctl(p, "Box");
+        if (box.ChildCount() != 1) {
             fails = fails + 1;
             Console.WriteLine("FAIL designed Card did not take its child");
         }
-        FormControlTest.Eq("card note", p.BoxNote.GetProp("text"), "in card");
+        FormControlTest.Eq("card note", Ctl(p, "BoxNote").GetProp("text"), "in card");
 
-        FormControlTest.Eq("container text", p.Body.GetProp("text"), "");
-        FormControlTest.Eq("container class", p.Body.GetProp("class"), "");
+        FormControlTest.Eq("container text", Ctl(p, "Body").GetProp("text"), "");
+        FormControlTest.Eq("container class", Ctl(p, "Body").GetProp("class"), "");
 
-        ZfPanel q = new ZfPanel();
-        if (q.GoBtn == p.GoBtn || q.Caption == p.Caption) {
+        Control q = Build();
+        Control qcap = Ctl(q, "Caption");
+        Control pcap = Ctl(p, "Caption");
+        if (Ctl(q, "GoBtn") == Ctl(p, "GoBtn")
+            || qcap == pcap) {
             fails = fails + 1;
             Console.WriteLine("FAIL second instance shares the first's widgets");
         }
-        q.Caption.SetProp("text", "other panel");
+        qcap.SetProp("text", "other panel");
         FormControlTest.Eq("first instance untouched",
-                            p.Caption.GetProp("text"), "side panel");
+                            pcap.GetProp("text"), "side panel");
         FormControlTest.Eq("second instance edited",
-                            q.Caption.GetProp("text"), "other panel");
+                            qcap.GetProp("text"), "other panel");
 
-        p.__Dispatch("go");
-
-        Form form = new Form("host", 200, 100);
-        form.On("go", FormControlTest.Went);
-        form.Add(p);
-        p.__Dispatch("go");
-        if (!went) {
-            fails = fails + 1;
-            Console.WriteLine("FAIL attaching the control did not hand it the form");
-        }
+        // 未接宿主：按钮事件不路由。
+        FormControlDocWin w = new FormControlDocWin();
         went = false;
-        q.__Dispatch("go");
+        w.Handle("go", FormControlTest.Went);
+        w.SetRoot(p, JsonValue.Parse("{}"));
+        ((Button)Ctl(p, "GoBtn")).Click.Raise();
         if (went) {
             fails = fails + 1;
-            Console.WriteLine("FAIL an unattached instance reached the host form");
+            Console.WriteLine("FAIL un-wired tree reached the host handler");
+        }
+        // 接入宿主（Wire）后路由。
+        w.Wire();
+        ((Button)Ctl(p, "GoBtn")).Click.Raise();
+        if (!went) {
+            fails = fails + 1;
+            Console.WriteLine("FAIL wiring did not hand the host the event");
+        }
+        // 第二棵树有自己的宿主槽，互不串扰。
+        FormControlDocWin w2 = new FormControlDocWin();
+        went = false;
+        w2.SetRoot(q, JsonValue.Parse("{}"));
+        w2.Wire();
+        ((Button)Ctl(q, "GoBtn")).Click.Raise();
+        if (went) {
+            fails = fails + 1;
+            Console.WriteLine("FAIL an unhandled instance reached the first host");
         }
 
         if (fails == 0) { Console.WriteLine("FORM_CONTROL_OK"); }
     }
+}
+
+class FormControlDocWin : ChildWindow {
 }

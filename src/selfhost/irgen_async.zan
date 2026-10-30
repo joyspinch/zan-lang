@@ -2027,7 +2027,7 @@ partial class Irgen {
     }
 
     // Task.IsDone(handle)：裸句柄是否已经跑完（槽 3 done 标志是否置位）。
-    // 纯谓词查询，不阻塞泵调度器（阻塞泵由 t.Wait() 即 EmitTaskWait 负责）。
+    // 若未完成则主动 pump 一次协同调度器，防止 `while (Task.IsDone(h) == 0) {}` 紧循环饥饿。
     ExprVal EmitTaskIsDone(Node e) {
         ExprVal h = GenExpr(e.kids[0]);
         string fp;
@@ -2040,7 +2040,18 @@ partial class Irgen {
         string dp = FrameGep(fph, 3);
         string dn = NT(); L("  " + dn + " = load i64, i64* " + dp);
         string c = NT(); L("  " + c + " = icmp ne i64 " + dn + ", 0");
-        string r = NT(); L("  " + r + " = zext i1 " + c + " to i64");
+        string lentry = curLbl;
+        int ldone = NL(); int lcont = NL();
+        L("  br i1 " + c + ", label %L" + ldone + ", label %L" + lcont);
+        Label(lcont);
+        L("  call void @zan_co_sched_run()");
+        string dn2 = NT(); L("  " + dn2 + " = load i64, i64* " + dp);
+        string c2 = NT(); L("  " + c2 + " = icmp ne i64 " + dn2 + ", 0");
+        L("  br label %L" + ldone);
+        Label(ldone);
+        string cphi = NT();
+        L("  " + cphi + " = phi i1 [ true, %" + lentry + " ], [ " + c2 + ", %L" + lcont + " ]");
+        string r = NT(); L("  " + r + " = zext i1 " + cphi + " to i64");
         return new ExprVal(r, MkType("int"));
     }
 

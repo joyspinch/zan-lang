@@ -4521,10 +4521,12 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
     COMMAND ${CMAKE_COMMAND}
       -DZANC=$<TARGET_FILE:zanc>
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/form_control_test.zan
-      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/tests/gui/form_control.html;--auto-stdlib${_gui_driver_tail}"
+      "-DZANC_ARGS=--embed;tests/gui/form_control.html;--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_form_control.out
       -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_form_control${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+  set_tests_properties(conformance_gui_form_control PROPERTIES
+    TIMEOUT 120 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
 
   # Designer preview and the runtime HTML load share pixels and control rects
   # across 100%-300% target DPI, independently of the editor display and view zoom.
@@ -4688,10 +4690,12 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
     COMMAND ${CMAKE_COMMAND}
       -DZANC=$<TARGET_FILE:zanc>
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/design_form_size_test.zan
-      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/tests/gui/design_form_size_large.html;${CMAKE_SOURCE_DIR}/tests/gui/design_form_size_default.html;${CMAKE_SOURCE_DIR}/tests/gui/design_form_size_small.html;--auto-stdlib${_gui_driver_tail}"
+      "-DZANC_ARGS=--embed;tests/gui/design_form_size_large.html;--embed;tests/gui/design_form_size_default.html;--embed;tests/gui/design_form_size_small.html;--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_design_form_size.out
       -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_design_form_size${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+  set_tests_properties(conformance_gui_design_form_size PROPERTIES
+    TIMEOUT 120 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
 
   # The full designer palette generates compiling, constructing code even
   # when user classes share a kind's name: GenForm must emit real
@@ -4700,10 +4704,12 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
     COMMAND ${CMAKE_COMMAND}
       -DZANC=$<TARGET_FILE:zanc>
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/design_palette_test.zan
-      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/tests/gui/design_palette.html;--auto-stdlib${_gui_driver_tail}"
+      "-DZANC_ARGS=--embed;tests/gui/design_palette.html;--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_design_palette.out
       -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_design_palette${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+  set_tests_properties(conformance_gui_design_palette PROPERTIES
+    TIMEOUT 120 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
 
   # The alert-banner family: the palette's serialized kind "Alert"
   # (FormField ftype 28) and the real control kind "AlertBox" must both
