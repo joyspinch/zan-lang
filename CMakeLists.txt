@@ -148,7 +148,6 @@ add_executable(zanc
     src/compiler/lexer.c
     src/compiler/ast.c
     src/compiler/parser.c
-    src/compiler/genrun.c
     src/compiler/genmeta.c
     src/common/json.c
     src/compiler/nsresolve.c

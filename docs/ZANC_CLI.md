@@ -146,7 +146,7 @@ trace 的事件序为准，不要顺着报表的站点名硬找。
 |---|---|
 | `--auto-stdlib` | 自动定位 stdlib 与已安装包，**按需拉入**用到的命名空间 |
 | `--stdlib-path <dir>` | 指定 stdlib 目录（测试门用；拉入仍按需） |
-| `--no-packages` | 只关包发现（stdlib 拉入照常）。由 zanc 自己在嵌套构建代码生成器时传给子进程：生成器闭包钉死在 stdlib——包文件跳过拉入活名门会无条件入编，而生成器魔法调用（`Json.Serialize<T>`/`db.Insert<T>`）只在父编译降级，`--no-gen` 子编里无法解析；用户包里任何带魔法调用的文件都会炸掉所有触发生成器的编译。回归锁 `conformance_gen_pkg_isolation` |
+| `--no-packages` | 只关包发现（stdlib 拉入照常）。回归锁 `conformance_gen_pkg_isolation`：包内库级调用不牵连父编译 |
 | `--package-api <url>` / `--package-list-missing` / `--package-install <dir> --package-name <n>` / `--package-scope` / `--package-project` | 包市场：API 地址、缺包诊断、本地包安装与作用域 |
 
 ### 目标与运行时
@@ -179,13 +179,12 @@ trace 的事件序为准，不要顺着报表的站点名硬找。
 | `--no-check-leaks` / `--no-arc-guard` | 调试构建里关掉它们 |
 | `--strict-runtime` | 守卫失败 exit(70) 退出 |
 | `--deny-warnings` | 将编译警告视为致命错误（阻断构建） |
-| `--no-gen` | 禁用 Zan 脚本代码生成器（bootstrap 用） |
 | `--emit-symbols <f>` / `--gen-meta <f>` | 输出索引/元数据后退出（IDE/LSP 用） |
 | `--api <symbol>` | 从知识库检索 API 符号并打印签名与位置（无需编译，极速响应） |
 | `--time` / `-q` / `--quiet` | 阶段计时 / 静默进度行 |
 | `-D<name>[=v]` | 预处理符号 |
 | `@<file>` | 响应文件：从文件读更多参数（一行一个或空白分隔，带空格路径用引号）——**超长命令行/含空格路径用它** |
-| （位置参数，目录） | `zanc <dir> ...`：**目录**递归展开成 `*.zan` 输入（按路径排序，跳过 `.` 前缀与 `build/bin/obj/dist/out/vendor/node_modules` 等目录）——大项目首选，命令行长度与文件数无关；目录里没有 `.zan` 报 "no .zan source files under '...'"。**只收 `.zan`**：设计稿（`.html`）要显式给、且放第一个参数（`zanc src/MyApp.html src -o app.exe`） |
+| （位置参数，目录） | `zanc <dir> ...`：**目录**递归展开成 `*.zan` 输入（按路径排序，跳过 `.` 前缀与 `build/bin/obj/dist/out/vendor/node_modules` 等目录）——大项目首选，命令行长度与文件数无关；目录里没有 `.zan` 报 "no .zan source files under '...'"。**只收 `.zan`**：显式给 `.html`/`.htm` 位置参数会被拒绝——编译期 HTML 通道已移除，界面用 Gui 组件搭骨架、运行期 `Gui.App.LoadHtml` 装载标记（内嵌资源走 `--embed`） |
 | `--version/-v`、`--help/-h` | 版本 / 帮助 |
 
 ## 3. 交叉编译目标（--list-targets）

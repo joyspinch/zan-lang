@@ -5,7 +5,6 @@
 #include "diag.h"
 #include "lexer.h"
 #include "parser.h"
-#include "genrun.h"
 #include "genmeta.h"
 #include "nsresolve.h"
 #include "ast.h"
@@ -73,6 +72,17 @@ typedef struct {
     int count;
     int capacity;
 } generated_object_vec_t;
+
+static bool zan_is_zcomp_path(const char *p) {
+    size_t n = strlen(p);
+    return n > 6 && strcmp(p + n - 6, ".zcomp") == 0;
+}
+
+static bool zan_is_html_input(const char *p) {
+    size_t n = strlen(p);
+    return (n > 5 && strcmp(p + n - 5, ".html") == 0) ||
+           (n > 4 && strcmp(p + n - 4, ".htm") == 0);
+}
 
 static void generated_object_vec_add(generated_object_vec_t *objects,
                                      const char *path) {
@@ -2764,6 +2774,17 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    for (int fi = 0; fi < input_count; fi++) {
+        if (zan_is_html_input(input_files[fi])) {
+            fprintf(stderr,
+                    "error: '%s': the compile-time HTML channel has been "
+                    "removed; build the window with Gui widgets and load "
+                    "markup at runtime via Gui.App.LoadHtml\n",
+                    input_files[fi]);
+            return 1;
+        }
+    }
+
     input_file = input_files[0];
     if (package_project)
         snprintf(package_project_root, sizeof(package_project_root), "%s",
@@ -2771,8 +2792,7 @@ int main(int argc, char **argv) {
     else if (!packages_disabled)
         resolve_package_project_root(input_file);
     for (int fi = 0; fi < input_count; fi++) {
-        if (zan_is_design_path(input_files[fi]) ||
-            zan_is_zcomp_path(input_files[fi])) continue;
+        if (zan_is_zcomp_path(input_files[fi])) continue;
         size_t nlen = 0;
         char *nsrc = read_file(input_files[fi], &nlen);
         if (!nsrc) continue;
@@ -2868,11 +2888,6 @@ int main(int argc, char **argv) {
     }
 #endif
 
-        design_outs = zan_gen_design(
-            resolved_stdlib_root, (const char *const *)input_files,
-            (size_t)input_count);
-        if (!design_outs) return 1;
-        design_count = (size_t)input_count;
         explicit_input_count = input_count;
 
         pi_filter_active = !emit_symbols_path &&
@@ -2894,16 +2909,9 @@ int main(int argc, char **argv) {
                 size_t slen3 = 0;
                 char *src3 = read_file(input_files[fi], &slen3);
                 if (!src3) continue;
-                char *owned = NULL;
-                if ((size_t)fi < design_count && design_outs[fi]) {
-                    free(src3);
-                    src3 = strdup(design_outs[fi]);
-                    owned = src3;
-                    if (!src3) { fprintf(stderr, "error: out of memory\n"); return 1; }
-                }
                 scan_using_tokens(src3, strlen(src3), stdlib_root,
                                   &input_files, &input_count, &input_cap);
-                free(owned ? owned : src3);
+                free(src3);
             }
             scanned = round_end;
         }
@@ -2983,28 +2991,6 @@ int main(int argc, char **argv) {
             free(source);
             return 1;
         }
-        {
-            if ((size_t)fi < design_count && design_outs[fi]) {
-                char *owned_text = design_outs[fi];
-                design_outs[fi] = NULL;
-                if (fi == 0) {
-                    free(src);
-                    src = owned_text;
-                    source = src;
-                } else {
-                    src = zan_arena_strdup(arena, owned_text,
-                                           strlen(owned_text));
-                    free(owned_text);
-                    if (!src) {
-                        fprintf(stderr, "error: out of memory\n");
-                        zan_arena_free(arena);
-                        free(source);
-                        return 1;
-                    }
-                }
-                slen = strlen(src);
-            }
-        }
         zan_diag_add_file(diag, input_files[fi], src);
 
         zan_lexer_t lex;
@@ -3076,8 +3062,6 @@ int main(int argc, char **argv) {
             break;
         }
     }
-    free(design_outs);
-
     phase("parse");
     probe_phase_mem("parse");
     if (g_time_phases) zan_arena_dump_stats();
@@ -3904,7 +3888,7 @@ int main(int argc, char **argv) {
         }
 
         if (target.os == ZAN_OS_WINDOWS && link_subsystem == NULL) {
-            bool is_gui_app = (design_count > 0);
+            bool is_gui_app = false;
             if (!is_gui_app) {
                 for (int d = 0; d < used_driver_count; d++) {
                     if (used_driver_len[d] == 7 && memcmp(used_drivers[d], "zan_gui", 7) == 0) {

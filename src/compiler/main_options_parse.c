@@ -64,8 +64,6 @@
     const char *extra_link_libs[ZAN_LINK_MAX_LIBS]; int extra_link_lib_count = 0;
     const char *extra_lib_paths[ZAN_LINK_MAX_DIRS]; int extra_lib_path_count = 0;
     char resolved_stdlib_root[1024] = {0};
-    char **design_outs = NULL;
-    size_t design_count = 0;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--dump-tokens") == 0) {
@@ -74,8 +72,6 @@
             do_dump_ast = true;
         } else if (strcmp(argv[i], "--emit-symbols") == 0 && i + 1 < argc) {
             emit_symbols_path = argv[++i];
-        } else if (strcmp(argv[i], "--no-gen") == 0) {
-            zan_gen_enabled = 0;
         } else if (strcmp(argv[i], "--quiet") == 0 || strcmp(argv[i], "-q") == 0) {
             quiet = true;
         } else if (strcmp(argv[i], "--gen-meta") == 0 && i + 1 < argc) {
