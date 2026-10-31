@@ -3,31 +3,23 @@
 本文件是 ZanIDE 的结构约定，也是**其他 Zan GUI 商业项目的参考模板**。
 新增文件前先读这里；`scripts\check_structure.ps1` 会在构建/提交前做守门检查。
 
-## 1. 一个可视单元 = 一个 `.html` 设计稿 + 同名 code-behind
-
-> **通道注记（B-ID44 迁移中）**：编译期 HTML 通道（GenForm 生成 partial
-> class、.html 当 zanc 输入/入口）已删除——zanc 现在显式拒绝 `.html`
-> 输入。设计稿的终态是 `--embed` 烘进 exe、启动时经 `DesignerHtml.ToJsonDoc`
-> + `FormBuilder.Build` 运行期投影（迁移配方见 tests/gui/form_* 系列）。
-> 下文涉及"生成物/入口规则"的条目随 B-ID44 一起改写。
+## 1. 一个可视单元 = 一个 `.html` 设计稿 + 同名 code-behind + 运行期投影半件
 
 | 文件 | 职责 |
 |------|------|
 | `Xxx.html` | 声明式设计（body 带 data-zan-design）：控件树、布局、事件名。**唯一** UI 声明来源 |
 | `Xxx.zan`   | code-behind：`partial class Xxx`，只放数据绑定与事件逻辑 |
+| `Xxx.design.zan` | 运行期投影半件：由 `scripts/gen_design_halves.py` 自动生成，暴露类型化控件访问器 |
 
-* 设计稿由构建时的 `System.Compiler.GenForm` 生成 `partial class`，**不要手改生成物**。
-* 窗口文档（缺省，或 `"role": "window"`）生成 `__CreateWindow()` / `Show()`；
-  项目入口（`zan.proj` 的 `entry`）必须是窗口文档，且必须是 zanc 的第一个输入。
-* 面板 / 页 / 卡片等可嵌入单元写 `"role": "control"`，生成
-  `partial class Xxx : Control`，可以直接作为别的 `.html` 设计稿里的 `kind`：
+* **运行期投影单通道**：编译期 HTML 通道已彻底废除（zanc 显式拒绝 `.html` 作为编译源文件）。所有设计稿（`.html`）通过 `--embed` 烘入可执行文件（内嵌优先读回、发布自动压缩加密），程序启动时在内存中经 `DesignerHtml.ToJsonDoc` + `FormBuilder` 投影。
+* **程序入口**：`zan.proj` 的 `entry` 指向主 `.zan` 文件（如 `src/IdeForm.zan`）。程序 `Main()` 落在手写 Zan 代码里，启动时解析主窗体设计稿、建树、挂载 `OnLoad` 后进入消息循环。
+* **可嵌入控件（role="control"）**：面板 / 页 / 卡片等可嵌入单元在设计稿中声明 `data-role="control"`，其半件继承 `DesignedControl`（`partial class Xxx : DesignedControl`）。构造时自动调 `this.Design(kind, docPath)` 将设计文档投影进自身控件树，命名控件以强类型属性暴露（`this.Tree` 等），并在建树后调用 code-behind 的 `void OnInit()`。可以在其它设计稿中直接以其类名作为 `data-kind` 嵌套引用：
 
   ```json
   { "kind": "ExplorerPanel", "name": "Explorer", "dock": 3, "fw": 260 }
   ```
 
-  控件文档的 code-behind 提供 `void OnInit()`，由生成的构造函数在建树后调用。
-* 禁止自绘：控件树只能由标准库 GUI 组件（`Gui` / `Gui.Widget` / `Gui.Hmi`）构成。
+* **禁止自绘**：控件树只能由标准库 GUI 组件（`Gui` / `Gui.Widget` / `Gui.Component`）构成。
 
 ## 2. 目录分层
 

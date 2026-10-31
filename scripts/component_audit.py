@@ -211,7 +211,9 @@ def registered_kinds():
 
 
 def genform_kinds():
-    """编译期限定名单：IsStdWidgetKind ∪ IsHmiKind ∪ QualifyKind 的特例。"""
+    """编译期限定名单：已随编译期 HTML 通道删除废除（文件若存在仍读）。"""
+    if not os.path.exists(GENFORM):
+        return set()
     text = read(GENFORM)
     out = set()
     for _name, body in RE_GENFORM_LIST.findall(text):
@@ -224,6 +226,8 @@ def genform_kinds():
 
 def nonconstructible_kinds():
     """GenForm 里明令不可实例化的 kind（抽象基类 / 内部字段记录）。"""
+    if not os.path.exists(GENFORM):
+        return set()
     text = read(GENFORM)
     m = RE_NONCONSTRUCTIBLE.search(text)
     if not m:
@@ -264,17 +268,18 @@ def main():
     nonconstructible = nonconstructible_kinds()
     kinds = control_kinds(files)
 
-    # R1：一份 kind 名单，三处副本必须对得上
-    for kind in sorted(reg - comp):
-        problems.append('R1 运行期可重建的 kind "%s" 不在编译期名单里'
-                        '（生成代码发裸名，用户项目的同名全局类会压过 stdlib）'
-                        % kind)
-    for kind, name in sorted(kinds.items()):
-        if kind in comp or kind in nonconstructible:
-            continue
-        problems.append('R1 控件 %s 声明了 Kind()="%s"，但编译期名单里没有它'
-                        '（导出成设计稿后编译不过，或退化成用户自己的同名类）'
-                        % (name, kind))
+    # R1：一份 kind 名单，三处副本必须对得上（编译期 GenForm 存在时）
+    if comp:
+        for kind in sorted(reg - comp):
+            problems.append('R1 运行期可重建的 kind "%s" 不在编译期名单里'
+                            '（生成代码发裸名，用户项目的同名全局类会压过 stdlib）'
+                            % kind)
+        for kind, name in sorted(kinds.items()):
+            if kind in comp or kind in nonconstructible:
+                continue
+            problems.append('R1 控件 %s 声明了 Kind()="%s"，但编译期名单里没有它'
+                            '（导出成设计稿后编译不过，或退化成用户自己的同名类）'
+                            % (name, kind))
 
     # R2：Size 字段 ↔ SizeOf() 覆写
     sizes = {}

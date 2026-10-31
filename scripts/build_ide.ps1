@@ -4,11 +4,14 @@ Set-Location $root
 
 # ---- Standard Zan GUI project build for the IDE ---------------------------
 # src/ide_zan is a normal zan.proj project: the `entry` manifest key names the
-# designed form (src/IdeForm.html), the GenForm generator projects it into a
-# partial class with the program's Main, code-behind src/IdeForm.zan holds the
-# logic and the rest of the shell/editor lives under src/. zanc compiles
-# everything, drives the bundled linker, and links the static native GUI
-# runtime (Win32 backend) + the embedded skin packs.
+# .zan file holding the handwritten Main (IdeEntry, src/IdeForm.zan). The 33
+# design documents (.html) are baked into the exe via --embed (compressed +
+# encrypted) and projected at runtime through DesignedControl /
+# FormBuilder.ProjectInto - the compile-time HTML channel (GenForm) is gone.
+# zanc compiles everything, drives the bundled linker, and links the static
+# native GUI runtime (Win32 backend) + the embedded skin packs.
+
+$script:embedArgs = @()
 
 Write-Output "IDE_BUILD_START"
 
@@ -145,9 +148,11 @@ $files += (Join-Path (Get-Location) "stdlib\System\IO\File.zan")
 $files += (Join-Path (Get-Location) "stdlib\System\IO\Directory.zan")
 $files += (Join-Path (Get-Location) "stdlib\System\IO\FileInfo.zan")
 
-# Entry FIRST: zanc gives the generated Main() to the first design document on
-# the command line (genrun.c passes emitMain only for paths[0]), so the form
-# named by the manifest's `entry` key has to lead the input list.
+# Entry: the handwritten Main (IdeEntry, B-ID44) lives in the file named by
+# the manifest's `entry` key. Design documents are NOT compile inputs any
+# more - the compile-time HTML channel is gone (zanc rejects .html) - they
+# ride in the executable via --embed below and are projected at runtime
+# (DesignedControl / FormBuilder.ProjectInto).
 $entryRel = ([regex]::Match(
     [System.IO.File]::ReadAllText((Join-Path (Get-Location) "src\ide_zan\zan.proj")),
     '(?m)^\s*entry\s*=\s*(.+?)\s*$')).Groups[1].Value
@@ -156,16 +161,16 @@ $entry = Join-Path (Get-Location) (Join-Path "src\ide_zan" ($entryRel -replace '
 if (!(Test-Path -LiteralPath $entry)) { Write-Output "PROJECT_ENTRY_NOT_FOUND $entry"; exit 1 }
 Write-Output "[entry] $entry"
 
-# Every designed document in the project is compiled, not just the entry: one
-# .html per visual unit (window / panel / dialog / page) with a same-named
-# code-behind. The entry is passed separately (first), so skip it here to
-# avoid handing zanc the same path twice.
+# Every designed document is baked into the exe under the "ide/" prefix
+# (matching the Design("...", "ide/...") paths in the generated halves):
+# File.ReadAllText resolves embedded-first, and baked payloads are
+# compressed + encrypted (no loose HTML ships with the publish).
 $designs = @(Get-ChildItem src\ide_zan -Recurse -Include *.html |
-    Where-Object { $_.FullName -ne $entry } |
     ForEach-Object { $_.FullName })
-if ($designs.Count -gt 0) {
-    $files += $designs
-    Write-Output ("[designs] " + ($designs.Count + 1))
+Write-Output ("[designs] " + $designs.Count + " embedded")
+$designs | ForEach-Object {
+    $rel = $_.Substring((Join-Path (Get-Location) "src\ide_zan\src\").Length).Replace('\', '/')
+    $script:embedArgs += @("--embed", "$_=ide/$rel")
 }
 
 $exeOut = Join-Path (Get-Location) "build\ZanIDE.exe"
@@ -174,11 +179,13 @@ $exeOld = Join-Path (Get-Location) "build\ZanIDE.prev.exe"
 # The source list goes through a zanc @file response file: the explicit list
 # crossed the Windows 32K command-line limit when Zan.Security joined the
 # package groups ("The filename or extension is too long" from CreateProcess).
+$files = @($files | Where-Object { $_ -ne $entry })
 $rsp = Join-Path (Get-Location) "build\ide_files.rsp"
 $files | ForEach-Object { '"' + $_ + '"' } | Set-Content -Path $rsp -Encoding UTF8
 
 $zanArgs = @()
 $zanArgs += $entry
+$zanArgs += $script:embedArgs
 $zanArgs += ("@" + $rsp)
 $zanArgs += @("-o", $exeOut, "--subsystem", "windows")
 # Release shape (--publish): Os codegen + the optimization sweep + a stripped
