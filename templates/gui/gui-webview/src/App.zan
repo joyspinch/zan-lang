@@ -1,42 +1,75 @@
 using System;
+using System.Json;
 using Gui;
 using Gui.Widget;
 using Gui.Component.WebView;
 
-/* {{NAME}} 的业务逻辑：多标签浏览器。每页一个 WebViewBox，标签条只决定哪一页可见。 */
+/* {{NAME}} 的业务逻辑：多标签浏览器。每页一个 WebViewBox，标签条只决定
+ * 哪一页可见（B-ID46 运行期形态：设计稿由 Main 运行期投影，控件用
+ * ui.Ctl("Id") 取用）。 */
 partial class {{NAME}} {
+    // 主窗引用：事件处理器用 ui.Ctl("Id") 取设计里的控件。
+    static Form ui;
     static string Home() { return "https://www.example.com"; }
 
     static List<WebViewBox> views;
     /* 地址栏当前显示的地址，输入中不被回填覆盖。 */
     static string shownUrl;
-    static App ui;
+    static bool editing;
+
+    static void Main() {
+        ControlBootstrap.Install();
+        WebViewBootstrap.Install();
+        JsonValue doc = DesignDoc.Load("src/{{NAME}}.html");
+        if (doc == null) {
+            Console.WriteLine("error: design not found: src/{{NAME}}.html");
+            return;
+        }
+        Form form = Form.Create(doc.Str("winTitle", "{{NAME}}"),
+                                doc.Int("winW", 1180), doc.Int("winH", 720));
+        form.Add(FormBuilder.BuildWith(doc, null));
+        if (doc.Bool("winCenter", false)) { form.GetApp().CenterWindow(); }
+        ui = form;
+        Wire(form);
+        OnLoad(form);
+        form.Run();
+    }
+
+    static void Wire(Form form) {
+        form.On("OnNavCommand", OnNavCommand);
+    }
 
     static void OnLoad(Form form) {
         views = new List<WebViewBox>();
-        views.Add(Tab1View);
-        shownUrl = Tab1View.StartUrl();
-        ui = form.GetApp();
-        BrowserTabs.SetShowAdd(true);
-        AddressBar.SetText(shownUrl);
+        WebViewBox first = (WebViewBox)ui.Ctl("Tab1View");
+        views.Add(first);
+        shownUrl = first.StartUrl();
+        Tabs tabs = Tabs();
+        tabs.SetShowAdd(true);
+        Input address = AddressBar();
+        address.SetText(shownUrl);
 
-        AddressBar.Submit += () => { {{NAME}}.Go(); };
-        AddressBar.On.Focus += () => { AddressBar.SelectAll(); };
-        BrowserTabs.TabAdded += () => { {{NAME}}.OpenTab(); };
-        BrowserTabs.TabClosed += () => { {{NAME}}.Reap(); };
-        BrowserTabs.TabChanged += () => { {{NAME}}.Switched(); };
+        address.Submit += () => { {{NAME}}.Go(); };
+        tabs.TabAdded += () => { {{NAME}}.OpenTab(); };
+        tabs.TabClosed += () => { {{NAME}}.Reap(); };
+        tabs.TabChanged += () => { {{NAME}}.Switched(); };
         form.FrameHook(() => { {{NAME}}.Sync(); });
     }
 
+    // 设计稿里的常驻控件：多个处理器共用，收口到取用点。
+    static Tabs Tabs() { return (Tabs)ui.Ctl("BrowserTabs"); }
+    static Input AddressBar() { return (Input)ui.Ctl("AddressBar"); }
+    static StatusBar Bar() { return (StatusBar)ui.Ctl("MainStatusBar"); }
+
     static void OnNavCommand() {
-        int index = NavStrip.LastIndex();
-        {{NAME}}.Command(index);
+        ToolStrip nav = (ToolStrip)ui.Ctl("NavStrip");
+        {{NAME}}.Command(nav.LastIndex());
     }
 
     /* 工具条命令：0 后退，1 前进，2 刷新，4 新建标签。 */
     static void Command(int index) {
         if (index == 4) {
-            BrowserTabs.AddNew();
+            Tabs().AddNew();
             return;
         }
         WebViewBox v = {{NAME}}.Active();
@@ -50,20 +83,15 @@ partial class {{NAME}} {
     static void Go() {
         WebViewBox v = {{NAME}}.Active();
         if (v == null) { return; }
-        shownUrl = AddressBar.GetText();
+        shownUrl = AddressBar().GetText();
         v.Navigate(shownUrl);
-    }
-
-    /* 检查用户是否在地址栏编辑中（按焦点判断）。 */
-    static bool Editing() {
-        return ui != null && ui.focus.IsFocused(AddressBar.WidgetId());
     }
 
     /* 新标签：AddNew() 之后补一个 WebViewBox。 */
     static void OpenTab() {
-        int i = BrowserTabs.Active();
+        int i = Tabs().Active();
         WebViewBox v = new WebViewBox();
-        BrowserTabs.Page(i).Add(v);
+        Tabs().Page(i).Add(v);
         if (i >= views.Count) { views.Add(v); }
         else { views.Insert(i, v); }
         v.Navigate({{NAME}}.Home());
@@ -80,7 +108,7 @@ partial class {{NAME}} {
         }
         views = keep;
         shownUrl = "";
-        if (BrowserTabs.Count() == 0) { BrowserTabs.AddNew(); }
+        if (Tabs().Count() == 0) { Tabs().AddNew(); }
     }
 
     static void Switched() {
@@ -88,7 +116,7 @@ partial class {{NAME}} {
     }
 
     static WebViewBox Active() {
-        int i = BrowserTabs.Active();
+        int i = Tabs().Active();
         if (i < 0 || i >= views.Count) { return null; }
         return views[i];
     }
@@ -99,20 +127,20 @@ partial class {{NAME}} {
             string label = views[i].CurrentTitle();
             if (label == "") { label = "新建标签"; }
             if (label.Length > 24) { label = label.Substring(0, 24) + "..."; }
-            if (BrowserTabs.LabelAt(i) != label) {
-                BrowserTabs.SetLabel(i, label);
+            if (Tabs().LabelAt(i) != label) {
+                Tabs().SetLabel(i, label);
             }
         }
-        MainStatusBar.SetText(1, Convert.ToString(views.Count) + " 个标签");
+        Bar().SetText(1, Convert.ToString(views.Count) + " 个标签");
         WebViewBox v = {{NAME}}.Active();
         if (v == null) { return; }
         string url = v.CurrentUrl();
-        if ({{NAME}}.Editing()) { return; }
+        if (editing) { return; }
         if (url != "" && url != shownUrl) {
             shownUrl = url;
-            AddressBar.SetText(url);
+            AddressBar().SetText(url);
         }
-        MainStatusBar.SetText(0, {{NAME}}.Status(v));
+        Bar().SetText(0, {{NAME}}.Status(v));
     }
 
     static string Status(WebViewBox v) {
