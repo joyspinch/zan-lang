@@ -57,8 +57,25 @@ public static class IdeDesignedRegistry {{
 """
 
 
+PLACEMENT = {'fx', 'fy', 'fw', 'fh', 'dock', 'span', 'position', 'anchor',
+             'flexgrow', 'margin', 'padding', 'gap', 'flexdir', 'justify',
+             'alignitems', 'flexwrap'}
+
+
+def _has_placement(attrs):
+    """data-<kebab> 定位键（IsPlacementKey 同表，kebab 折小写比对）。"""
+    for m in re.finditer(r'data-([a-zA-Z0-9-]+)\s*=', attrs):
+        if m.group(1).replace('-', '').lower() in PLACEMENT:
+            return True
+    return False
+
+
 def tag_kind(tag, attrs):
-    """与 DesignerHtml.TagKind 同表：裸容器兜底 Panel，zan-* 恢复 Pascal。"""
+    """与 DesignerHtml.FieldJson/TagKind 同表：data-kind 权威，zan-* 恢复
+    Pascal，p/h1-h6 → Typography，未知名兜底 Panel。裸容器（无 data-kind、
+    兜底 Panel、非 zan-*、div 无定位属性）FieldJson 会保留 htmlTag，
+    运行时 IsElement 建 **Element**——访问器类型必须跟着是 Element，
+    否则 (Panel) 强转即 InvalidCastException（AiPanel.ModelHost 实证）。"""
     t = tag.lower()
     if t == 'body':
         return None
@@ -66,29 +83,36 @@ def tag_kind(tag, attrs):
     if km:
         return km.group(1)
     if t.startswith('zan-'):
-        return ''.join(p[:1].upper() + p[1:] for p in t[4:].split('-') if p)
-    if t == 'input':
+        kind = ''.join(p[:1].upper() + p[1:] for p in t[4:].split('-') if p)
+    elif t == 'label':
+        kind = 'Label'
+    elif t == 'button':
+        kind = 'Button'
+    elif t == 'input':
         tm = re.search(r'type="([A-Za-z0-9_]+)"', attrs)
         ty = tm.group(1).lower() if tm else ''
-        if ty == 'checkbox':
-            return 'Checkbox'
-        if ty == 'radio':
-            return 'Radio'
-        if ty == 'range':
-            return 'Slider'
-        if ty == 'color':
-            return 'ColorPicker'
-        if ty == 'number':
-            return 'InputNumber'
-        if ty in ('date', 'month', 'week', 'time'):
-            return 'DatePicker'
-        if ty == 'file':
-            return 'Upload'
-        return 'Input'
-    return {'label': 'Label', 'span': 'Label', 'button': 'Button',
-            'textarea': 'TextArea', 'img': 'Image', 'hr': 'Divider',
-            'progress': 'Progress', 'select': 'SelectBox',
-            'table': 'DataGrid', 'ul': 'ListView', 'ol': 'ListView'}.get(t, 'Panel')
+        kind = {'checkbox': 'Checkbox', 'radio': 'Radio', 'range': 'Slider',
+                'color': 'ColorPicker', 'number': 'InputNumber',
+                'date': 'DatePicker', 'month': 'DatePicker', 'week': 'DatePicker',
+                'time': 'DatePicker', 'file': 'Upload'}.get(ty, 'Input')
+    elif t == 'textarea':
+        kind = 'TextArea'
+    elif t == 'img':
+        kind = 'Image'
+    elif t == 'hr':
+        kind = 'Divider'
+    elif t == 'progress':
+        kind = 'Progress'
+    elif t == 'select':
+        kind = 'SelectBox'
+    elif t in ('p', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6'):
+        kind = 'Typography'
+    else:
+        kind = 'Panel'
+    if kind == 'Panel' and (t != 'div' or not _has_placement(attrs)
+                            or re.search(r'data-html-tag="div"', attrs)):
+        return 'Element'
+    return kind
 
 
 def named_fields(html):
