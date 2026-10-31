@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     编译器前端（lexer/parser/nsresolve/binder/checker）变异模糊测试。
 

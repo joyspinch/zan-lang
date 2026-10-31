@@ -1,4 +1,4 @@
-<#
+﻿<#
     smoke_all_game_projects.ps1 — 批量跑 D:/project/games 下"阶段一骨架"项目的
     构建 + 无头冒烟 + 存档落盘验证。
 

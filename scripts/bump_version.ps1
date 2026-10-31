@@ -1,4 +1,4 @@
-# bump_version.ps1 -- Increments the patch component of the root VERSION file
+﻿# bump_version.ps1 -- Increments the patch component of the root VERSION file
 # (the single source of truth every binary reports) and prints the new version.
 #
 # Releases are cut by scripts\publish_ide.ps1, which calls this first, so each

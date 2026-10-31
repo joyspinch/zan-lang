@@ -1,4 +1,4 @@
-# Sweep build/: the test artifacts that pile up there.
+﻿# Sweep build/: the test artifacts that pile up there.
 #
 # Why this exists: every conformance / arc / leakcheck case compiles its own
 # executable and every ctest run leaves a LastTest.log.tmpXXXXXX behind. After

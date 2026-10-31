@@ -1,4 +1,4 @@
-# scripts/pkg_tests.ps1 — 包内无头测试运行器（规则 14：包的测试跑在包上）。
+﻿# scripts/pkg_tests.ps1 — 包内无头测试运行器（规则 14：包的测试跑在包上）。
 #
 # 约定：packages/<Pkg>/tests/*.zan 每个文件是一个独立 Zan.Test 程序
 #   （using System.Test + 断言 + Test.Finish() 收尾，以失败数为退出码）。

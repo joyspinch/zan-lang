@@ -1,4 +1,4 @@
-$ErrorActionPreference = "Stop"
+﻿$ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
 Set-Location $root
 
@@ -172,6 +172,12 @@ $designs | ForEach-Object {
     $rel = $_.Substring((Join-Path (Get-Location) "src\ide_zan\src\").Length).Replace('\', '/')
     $script:embedArgs += @("--embed", "$_=ide/$rel")
 }
+
+# ---- 2.5) 设计稿半件 + 组件注册表（自发现）---------------------------------
+# 扫描 .html 设计稿：生成 <Name>.design.zan 半件与 IdeDesignedRegistry.zan。
+# 新增组件 = 新增 .html(+code-behind)，下次构建自动进表——没有手工清单。
+python scripts/gen_design_halves.py
+if ($LASTEXITCODE -ne 0) { Write-Output "DESIGN_HALVES_FAILED"; exit 1 }
 
 $exeOut = Join-Path (Get-Location) "build\ZanIDE.exe"
 $exeOld = Join-Path (Get-Location) "build\ZanIDE.prev.exe"

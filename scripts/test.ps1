@@ -1,4 +1,4 @@
-# Runs one tier of the test suite (see the "Test tiers" block in CMakeLists).
+﻿# Runs one tier of the test suite (see the "Test tiers" block in CMakeLists).
 #
 #   scripts\test.ps1                 # smoke: compiler gates only (~300 cases)
 #   scripts\test.ps1 standard -ReleaseGate  # RELEASE GATE ONLY: 1000+ full programs

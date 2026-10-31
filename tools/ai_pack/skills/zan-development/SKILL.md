@@ -616,14 +616,14 @@ exe**，于是 A 用例的输出被拿去和 B 用例的 golden 比，报出与 
 
 Windows can be described in plain HTML + CSS instead of hand-built control
 trees — use it whenever the user says "用网页/HTML 写界面" or the layout is
-web-shaped. Two paths, same parser, pixel-identical geometry:
+web-shaped. One path (the compile-time HTML channel was removed; zanc
+rejects `.html` input with a targeted error):
 
 - **Runtime**: `Control root = app.LoadHtmlWith(html, handlers, baseDir);`
-  (fragments are fine — a missing body gets an implicit one).
-- **Compile time**: pass the `.html` file to zanc next to your `.zan`
-  sources; it expands to `UiHtml.Build(handlers)` + `UiHtml.Css` (call
-  `app.UseAppCss(UiHtml.Css)` first). The shipped exe carries no HTML text
-  and no parser.
+  (fragments are fine — a missing body gets an implicit one). Ship the
+  markup inside the exe: publish with `--embed <file>=<alias>` — payloads
+  are compressed+encrypted and read back in memory (no loose files, no
+  temp extraction).
 
 Protocols: containers map to `Element` (UA stylesheet supplies web defaults
 — never write `display: block` by hand), `button`/`textarea`/`input`/`img`
@@ -654,17 +654,17 @@ Full spec: `docs/HTML_UI.md` in the SDK.
 
 The visual window designer's storage format is HTML — a doc whose
 `<body>` carries the bare `data-zan-design` marker. Every shipped
-template and all IDE-internal forms ARE .html (the legacy .html compile
-channel was removed in P8-4: zanc rejects .html input with a targeted
+template and all IDE-internal forms ARE .html (the compile-time HTML
+channels were removed entirely: zanc rejects .html input with a targeted
 error; convert with `DesignerHtml.FromJsonDoc`, the canonical
 .html→.html converter); the JSON doc model is an internal
 representation (undo/redo snapshots, the JSON drawer, the LSP
 feed) — don't hand-write it, and write new designs as .html.
 
-- **Compile channel**: zanc sends a `body[data-zan-design]` .html to the
-  same GenForm projection the old .html used (typed partial class); a plain .html
-  goes to the GenHtml build-tree class instead. Keep the marker intact —
-  it is the routing bit.
+- **Load channel**: every design doc is projected at runtime —
+  `FormBuilder.BuildWith`/`ProjectInto` for windows and designed
+  controls, `App.LoadHtmlWith` for pages. Publish bakes docs via
+  `--embed` (compressed+encrypted, in-memory).
 - **Round-trip is key-faithful** (tested): doc-level keys become body
   `data-<kebab>` attrs, `on<Event>` becomes `data-on-<kebab>` (Pascal
   restored on read), pass-through objects (`props`, `columns`) ride

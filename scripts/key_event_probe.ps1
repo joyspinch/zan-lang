@@ -1,4 +1,4 @@
-param(
+﻿param(
   # SendKeys 组合串，分号分隔，每组单独起一个探针进程，日志不串。
   # 例："+{F12};^{ };^+f;%{ENTER}"
   [string]$Combos = "+{F12};^{ };^+f",

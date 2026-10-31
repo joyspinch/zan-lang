@@ -1,46 +1,30 @@
 # HTML 窗口开发定式（.html 设计稿 = 唯一格式）
 
-窗口的布局/内容/样式进设计稿，交互与数据在 code-behind。旧 `.html`
-通道已删（GenForm 只认 .html）——别再写、别再提，见到旧稿用设计器
-往返转一次即可。
+窗口的布局/内容/样式进设计稿，交互与数据在 code-behind。编译期
+HTML 通道（GenForm/GenHtml）已整体删除——**设计稿不是编译输入**，
+zanc 对 .html 显式拒绝；唯一通道是运行期装载（2026-10-31，B-ID44）。
 
-## 三条建树通道（同解析器，按窗口形态选）
+## 唯一建树通道：运行期装载
 
-- **编译期设计稿（GenForm）**：body 带 `data-zan-design` 的设计文档
-  作为编译输入，GenForm 合成 Main、控件字段、`__BuildForm`（含
-  `root.Dock(Dock.Fill)`）。**设计稿必须是命令行第一个文件**——
-  zanc 从第一份设计文档合成入口，放后面 = 字段全缺（模板门配方：
-  html 首参 + 全部 src/*.zan）。
-- **编译期运行期文档（GenHtml）**：body **不带** `data-zan-design`
-  的普通 .html 作为编译输入，GenHtml 展开成
-  `class <文件基名帕斯卡化>Html { public static string Css;
-  public static string Doc; public static Control Build(HtmlHandlers); }`
-  ——类名来自**文件基名**（App.html → `AppHtml`），不是 body id 也不是
-  `{{NAME}}`；成员是静态字段 `Css`（样式，无括号）、`Doc`（**文档原文**
-  ，供运行期装载）与静态方法 `Build`。**不发射 Main、不发射
-  字段、不管 dock**：`data-win-*` 是 GenForm 专属，dock/图标/Tip 等
-  行为配置在 code-behind 里 `Find(id)` 后补。适合"文档=结构快照、
-  行为=代码"的窗口。
-  - **`Doc` 原文成员**：同一份 .html 既能编译期建树（`Build`），也能在
-    运行期重新装载（`app.LoadHtmlWith(XxxHtml.Doc, null, dir)`）——
-    文档文本随 exe 走（发布不依赖外部文件），运行期那棵树的样式自动
-    并进 appCss、作用域类自动混入、可挂模型宿主。
-  - **成员名不能叫 `Html`**：生成代码里用 `Html.AddChild(...)` 调
-    `Gui.Html` 的静态方法，同名成员会把那个名字解析成字符串字段
-    （编译报 `type 'string' has no method 'AddChild'`）。
-- **运行时**：`App.LoadHtml(...)` 同一解析器动态建树（html 文本可来自
-  文件/网络/字符串）。切页出口里装每页内容时用这条。**运行时装载 +
-  `ModelBinder` = 主窗口内的数据驱动页面**：文档负责结构与样式，
-  code-behind 负责数据与事件，`data-bind`/`data-if`/`data-for` 照常
-  生效（不再需要把页面做成独立子窗口）。
-
-**GenHtml 通道的树根坑（实机踩过）**：`Build` 返回的 body 元素 dock=0
-（Manual）——窗口只对 dock=Fill 的根做客户区填充，**code-behind 必须
-补一句 `root.DockFill`**，否则整棵树缩在窗口左上角按内容尺寸排版
-（GenForm 时代这句由 `__BuildForm` 发射，runtime 文档没人替你发射）。
-同理：左栏宽度这类"GenForm 靠 logW/logH 声明"的定尺寸，在 GenHtml
-通道走 CSS `width/height` 声明（dock 排布的 `DockSize` 取
-`StyleWidthIn/StyleHeightIn`）。
+- **装载**：`Html.Install()` 后 `app.LoadHtmlWith(html, handlers,
+  baseDir)`（html 文本可来自文件/网络/字符串，窗口根文档也可用
+  `FormBuilder.BuildWith(doc, null)` 投影）。装载器自己把 html 根
+  `Dock(Fill)` 挂进宿主——GenHtml 时代"必须补一句 root.DockFill"的
+  树根坑已成历史；定制宿主（设计类控件）走
+  `FormBuilder.ProjectInto(host, doc)`。
+- **发布保护**：设计稿用 `--embed <file>=<别名>` 随 exe 烘入（压缩 +
+  加密，运行期 `File.ReadAllText` 内嵌优先、内存解出，**不落盘**、
+  不解压临时文件）。
+- **窗口属性**：`data-win-title/win-w/win-h/win-chrome/win-center` 等
+  是文档键，由入口代码读键后调 `Form.Create`/`SetChromeVisible` 等
+  落地（一份手写入口，业务代码不碰建树）。
+- **组件零清单扩展**：文档里 `zan-*`/`data-kind` 引用的组件，其类
+  自声明 `static void Install()`（内部 `HeavyControls.Register`）即被
+  构建期扫描自动收进注册表；设计类视图的半件与注册表由
+  生成脚本扫描 .html 自动产出——新增组件不加任何清单。
+- **运行时装载 + `ModelBinder` = 主窗口内的数据驱动页面**：文档负责
+  结构与样式，code-behind 负责数据与事件，`data-bind`/`data-if`/
+  `data-for` 照常生效（不必把页面做成独立子窗口）。
 
 **迁移设计稿 → 运行期文档的三个语义坑（都真踩过）**：
 1. **单位数字是 CSS，不是逻辑 px**：`line-height: 72` 是 72 **倍**
@@ -49,26 +33,25 @@
    width/height/font-size 同理——搬 CSS 时逐条补单位。
 2. **样式单一来源**：骨架样式搬进文档 `<style>` 后，把 skin/appCss
    里的同规则删掉，别留两份（改一处忘另一处）。
-3. **`{{NAME}}` 只在 .zan 里替换**；GenHtml 类名跟文件名走，
-   code-behind 里引用的是 `<基名>Html.Build/Css`。
+3. **`{{NAME}}` 两处同换**：.zan 的主类名与 .html 的根元素
+   `id`/`data-win-title` 都落实名；设计稿文件随项目走
+   （开发期按相对路径读，发布 `--embed` 烘入）。
 
 **多文档 appCss 的定式（gui-wechat 实机踩过，run10~17；scoping 已自动化）**：
-- **`UseAppCss` 是整表替换**（`appCss = css`），且它就是 app 唯一的
-  应用样式入口——每份文档的 `<style>` 只进了自己生成类的 `Css`
-  字段，**装载几份文档就要把它们几段 Css 全量拼进同一次
-  `UseAppCss` 调用**（`AppHtml.Css + "\n" + FavsHtml.Css + ...`）。
-  漏拼哪份，那份的骨架样式（flex、栏宽、渐变）整体静默失效，页面
-  塌回纵向块流——不报错，只有截图能看出来。
-- **样式 scoping 编译/装载期自动完成**（2026-09 起，gui-wechat 四页"裸
-  body 互中"踩坑后的工具链修复）：GenHtml 给文档每个元素混入作用域
-  类 `zs-<基名>`，并把文档 `<style>` 的每个复合块补上该类——同名类
+- **文档 `<style>` 随装载自动并进 appCss**：运行期每装载一份文档，
+  其 `<style>`（已混入作用域类）自动并入应用样式表，不需要也**不能**
+  手工拼（GenHtml 时代"几段 Css 全量拼进一次 UseAppCss"的定式随
+  生成类一起退出历史）。`UseAppCss` 仍是皮肤/全局样式的唯一入口，
+  但只喂你自己额外的那份。
+- **样式 scoping 装载期自动完成**（2026-09 起，gui-wechat 四页"裸
+  body 互中"踩坑后的工具链修复）：装载器给文档每个元素混入作用域
+  类 `zs-load-<序>`，并把文档 `<style>` 的每个复合块补上该类——同名类
   跨文档互不串，裸 `body` 只作用自己的根，手写唯一 body id 不再是
   必须项（留作 Find/可读性）。`@media`/`@supports` 内层递归，
   `@keyframes`/`@font-face` 原样。**边界**：运行期挂载件（ListView
   行模板等 code-behind 建的控件）不携作用域类，其样式放皮肤层（全
-  局通道）——与 Vue 组件样式不泄漏子组件同一取舍。运行期
-  `App.LoadHtml` 同语义：装载即组件，每次装载造 `zs-load-<序>` 作用域
-  （变换器共用 System.Web.HtmlScope，与编译通道同一保证）。
+  局通道）——与 Vue 组件样式不泄漏子组件同一取舍。（变换器共用
+  System.Web.HtmlScope。）
 - **flex 链条上每个"吃满"的环节都要自己声明**：页面根控件挂进 flex
   宿主后，没有声明高度就是零高（dock 时代的 MeasureDocked 不认
   flex 宿主里的 dock=5 子页）——`.page { flex-grow: 1; align-self:
@@ -83,7 +66,7 @@
 
 ## 声明面原语与语法糖（全事件与响应式指令）
 
-在 `.html` 模板中支持 Vue 风格声明式全事件绑定与响应式指令，编译期（GenForm/GenHtml）静态直连，彻底避免后台繁琐重复的命令式查找与手动绑定：
+在 `.html` 模板中支持 Vue 风格声明式全事件绑定与响应式指令，装载解析期直接落成控件绑定元数据（ModelBinder 每帧消费），彻底避免后台繁琐重复的命令式查找与手动绑定：
 
 ### 1. 事件绑定语法糖（支持 `@<event>`、`v-on:<event>`、`z-on:<event>`、`on<event>`）
 
@@ -106,7 +89,7 @@
 
 ### 2. 数据双向与显隐指令
 
-| 指令 | 编译期映射 | 说明 |
+| 指令 | 解析映射 | 说明 |
 |---|---|---|
 | `z-model="form.username"` / `v-model="..."` | `ctrl.bindPath = "form.username";` | 表单输入控件（Input、Checkbox 等）双向数据同步 |
 | `z-show="form.isVip"` / `v-show="..."` | `ctrl.bindIf = "form.isVip";` | 依布尔表达式路径控制控件显隐（真时显） |
@@ -130,8 +113,10 @@
 ### 4. 声明式事件绑定与控件 ID 约束（坑出处与规范）
 
 - **带声明式事件（`@click` 等）的元素必须显式标注 `id`**：
-  - 踩坑：在 HTML AOT 模式下，未标 `id` 的元素会被视为匿名局部控件（如 `v12`）；而生成的 `__WireForm` 事件接线方法是 `static` 静态方法，只能访问窗体类的静态具名字段。若元素缺少 `id`，事件分发器无法为其实例化静态字段，导致生成的事件绑定失效或丢弃，运行时点击静默无反应。
-  - 正确姿势：任何需要响应交互事件的按钮、卡片、输入框，一律显式设置 `id="winBtnClose"`、`id="navBtnHome"` 等语义 ID。
+  - 说明：运行期事件接线按处理器名走、不依赖 `id`；但 code-behind
+    要 `Find(id)` 改文案/换图标/取值的控件必须有 id，否则拿不到引用。
+  - 正确姿势：需要交互响应或代码访问的按钮、卡片、输入框，一律显式
+    设置 `id="winBtnClose"`、`id="navBtnHome"` 等语义 ID。
 - **顶栏窗口控制按钮图标必须使用标准语义名**：
   - 踩坑：使用 `icon="square"`（试图画方形最大化框）或 `icon="chevron-down"`（试图画菜单）会导致回退字体渲染失败——`Icon.Codepoint` 只收录 `minimize` (0xE921)、`maximize` (0xE922)、`restore` (0xE923)、`close` (0xE8BB)、`menu` (0xE700) 等语义名。非标准名称在未命中 Tabler 矢量 SVG 缓存时会退化为空白或问号。
   - 正确姿势：窗口系统按钮严格使用 `icon="menu"`、`icon="minimize"`、`icon="maximize"`、`icon="close"`。
@@ -168,8 +153,7 @@
   类规则；没有"改第 N 行"助手——列表局部高频更新留在模型通道
   （data-for 长度变了整组重建）。
 - **模型宿主与窗口无关**：任何一棵控件树（`LoadHtmlWith` 装出的
-  运行期文档、GenForm/GenHtml 生成树、手搭树）挂上 ModelBinder
-  即生效。此前只有 ChildWindow 带这层驱动——主窗口里的页面写了
+  运行期文档树、手搭树）挂上 ModelBinder 即生效。此前只有 ChildWindow 带这层驱动——主窗口里的页面写了
   绑定也不生效，于是「一个 .html 文档 + 一个 .zan code-behind」这种
   页面写法在主窗口内拿不到判断与双向绑定。
 
@@ -182,14 +166,14 @@
 ## 页面范式：.html 文档 + .zan code-behind + 模型宿主
 
 一个页面 = 一份文档（结构与样式）+ 一段 code-behind（数据与事件）+
-一个模型（JsonValue）。**不是"GenHtml 建树 + 命令式填值"**——那样
-样式要手工拼进 `UseAppCss`、列表要手搭行模板、判断与绑定都写不进
-声明面。主窗口里的页面分区同样适用（不必把页面做成独立子窗口）：
+一个模型（JsonValue）。**不是"装载文档 + 命令式填值"**——那样
+列表要手搭行模板、判断与绑定都写不进声明面。主窗口里的页面分区
+同样适用（不必把页面做成独立子窗口）：
 
 ```zan
 // 1) 装载文档（样式随装载并进 appCss，作用域类自动混入）
 Html.Install();                       // 运行时装载必须先装声明层
-Control ui = app.LoadHtmlWith(MyPageHtml.Doc, null, "");
+Control ui = app.LoadHtmlWith(html, null, "");  // html 来自文件/内嵌资源
 // 2) 挂模型宿主：事件按名字接线 + 绑定声明从此生效
 ModelBinder b = new ModelBinder();
 b.Handle("save", () => { ... });          // 无参
@@ -229,7 +213,7 @@ ModelHosts.Register(app, b);            // 主窗口的每帧泵驱动它
   出帧——改完模型记得 `app.RequestRedraw()`。
 
 代码内实时绑定是另一层：`Binding<T>`（stdlib 规范 §6.1），
-编译期字段直绑；字符串 bindPath 是"对话框 ↔ 状态实体"通道，
+强类型字段直绑；字符串 bindPath 是"对话框 ↔ 状态实体"通道，
 两者互不替代（Control.zan bindPath 头注释、STDLIB_COMPONENT_
 STANDARDS.md §6.7）。
 
@@ -334,12 +318,10 @@ Cookie，"对照组"就不成立了。
 
 - `{{NAME}}` 在**两处**都要替换：`src/App.html`（根元素
   `id="{{NAME}}"` 与 `data-win-title`）和 `src/App.zan`
-  （`partial class {{NAME}}`），且两个入口文件要改名为
-  `<NAME>.html`/`<NAME>.zan`（zan.proj `entry = src/{{NAME}}.html`
-  按名对上）。只换 .zan 不换 .html，GenForm 合成的
-  `<NAME>.OnLoad` 找不到方法、模板内组件字段全裸（只复制
-  App.zan/App.html 各一份编译 gui-wechat 这类多文件模板也会
-  undefined type——整个 src 都要带）。
+  （主类 `class {{NAME}}`），且两个入口文件要改名为
+  `<NAME>.html`/`<NAME>.zan`（zan.proj `entry = src/{{NAME}}.zan`
+  按名对上）。只换一处，装载路径或入口就对不上；模板缺文件
+  直接编译/装载失败——整个 src 都要带。
 - 参考脚本 `scripts/e2e_pipeline.ps1`：整树拷贝 + 替换 + 用
   zan.proj 编译，别手搓单文件。
 
@@ -464,8 +446,8 @@ Cookie，"对照组"就不成立了。
 
 ## HTML 窗口设计器的所见所得
 
-- **共用完整建树与布局，拾取读取实际框**：生成代码的 typed 对象按原始
-  `fields/kids` DFS 填 prepared 槽，FormBuilder 统一装配；混排顺序只影响
+- **共用完整建树与布局，拾取读取实际框**：预览树按原始
+  `fields/kids` DFS 装配（prepared 槽），FormBuilder 统一装配；混排顺序只影响
   展示，不改变槽序。完整结构遍历 `Control.children`，文本次序结合
   `Element.elOrder`；`FlowEntries` 是流布局视图，会排除 absolute/hidden，
   用它分配槽或断言整树曾把仍存在的定位控件误判为丢失。选框、拖动、
@@ -495,12 +477,11 @@ Cookie，"对照组"就不成立了。
   和混排文字；直接复用旧索引会指向另一个孩子。同级重排还须保持文本槽
   并重写子节点槽的显示顺序：只重映射身份曾让 MoveSel/SelToEdge 改了
   kids 顺序，混排画面却仍按旧序，验收要检查实际 elOrder 的控件引用。
-- **GenForm 与 FormBuilder 装配契约 100% 对齐**：HTML 容器节点导出的
-  JSON 结构常为 `kind: "Panel"` 且带有 `htmlTag`。GenForm 在发射子节点
-  装配代码时，若父级是 Element（满足 `IsElement`：带有 `htmlTag` 或
-  `kind == "Element"`），必须调用 `parent.AddKid(child)` 而不是 `parent.Add(child)`；
-  调用 `Add` 会绕过 `elOrder`，使子节点被推迟到全部内联文本流条目之后，
-  导致编译后 AOT 窗体与设计器预览的行盒混排流序与几何出现偏差。
+- **FormBuilder 装配契约（Element 混排）**：HTML 容器节点导出的
+  JSON 结构常为 `kind: "Panel"` 且带有 `htmlTag`。父级是 Element
+  （满足 `IsElement`：带有 `htmlTag` 或 `kind == "Element"`）时必须走
+  `AddKid`/`AddChild` 保 `elOrder`，绕过它子节点会被推迟到全部内联
+  文本流条目之后，混排流序与设计器预览出现偏差。
 - **最终窗形与运行窗口共用遮罩**：逐 region 计算并集，圆角 SDF 保留
   `min(max(qx,qy),0)` 内部项；旧步进曾跳过后续区域，缺内部项使 radius=0
   整块半覆盖。区分 straight/premult，预乘缓冲须满足 RGB≤A：
@@ -522,14 +503,14 @@ Cookie，"对照组"就不成立了。
   形态的探针 + 金样（CRLF）。
 - 布局几何：oracle 逐盒对比（同一份 .html 喂 Chrome 与引擎，
   getBoundingClientRect vs Arrange）。
-- 手工编 GUI 设计稿程序：设计稿 html 首参 + 全部 src + 
-  `--subsystem windows`；跑起来截图对照（锚定 PID），交互用
+- 手工编 GUI 程序：zanc 编全部 .zan（入口走 zan.proj `entry`）+
+  `--subsystem windows`；设计稿 .html 不是编译输入（运行期加载，
+  发布 `--embed`）。跑起来截图对照（锚定 PID），交互用
   UiDriver 可重复驱动。
 - **真窗冒烟要带主窗骨架，裸页截图会"缺导航栏"**：页面文档只含
-  页内骨架，图标导航栏在主窗文档里——把单页 `Build(null)` 直接装
-  进裸 Form 截图，看到的永远是"少了左侧导航"（不是回归）。要看
-  真实形态就复刻 `Root` 的装配（UseAppCss 拼表 + 主窗文档 Build +
-  各页宿主挂页 + Pick），跳过登录泵。
+  页内骨架，图标导航栏在主窗文档里——把单页文档直接装进裸 Form
+  截图，看到的永远是"少了左侧导航"（不是回归）。要看真实形态就
+  复刻主窗装配（LoadHtmlWith 主窗文档 + 各页宿主挂页），跳过登录泵。
 - **截屏三坑（当天连踩五次才抓到图）**：① 带中文注释的 `.ps1`
   以无 BOM UTF-8 落盘，PowerShell 5.1 按 ANSI 误解析，多字节序列
   会吞掉下一行语句——参数/环境变量"神秘变空"多半是这个，自动化
@@ -575,7 +556,7 @@ Cookie，"对照组"就不成立了。
    - 单元格级：`CellClick`、`CellDoubleClick`（别名 `CellDblClick`）、`CellEdit`、`CellValidating`。
    - 列与表头级：`HeaderClick`（别名 `ColumnClick`）、`ColumnDoubleClick`、`ColumnResize`、`ColumnResizeEnd`、`Sort`、`ColumnReorder`。
    - 网格视图与状态：`FilterChanged`、`SelectionChanged`、`GroupChanged`、`BandToggled`、`ScrollChanged`。
-   - **双击命中坐标锁定**：在双击触发判定时必须锁定列索引（如 `st.hitCol = ptrCol;`），并同时触发 `RowDoubleClick` 与 `CellDoubleClick`，保证 `DataGrid.HitField` 能解析出目标列字段，供 `GenForm` 中列声明的事件脱糖分派精准路由。
+   - **双击命中坐标锁定**：在双击触发判定时必须锁定列索引（如 `st.hitCol = ptrCol;`），并同时触发 `RowDoubleClick` 与 `CellDoubleClick`，保证 `DataGrid.HitField` 能解析出目标列字段，供列声明的事件绑定（`@cell-dblclick` 等）精准路由。
 4. **常用组件专属语义事件标配**：
    - `TreeView`：`Select`、`Activate`、`Expand`、`Collapse`、`Context`、`Check`。
    - `Pagination`：`Change`（切页）、`SizeChange`（切每页条数）。
@@ -583,8 +564,7 @@ Cookie，"对照组"就不成立了。
    - `Tabs`：`Change`（切标签页）。
    - 全部专属事件必须注册在 `Events` 清单中，并通过 `BindEvent` / `BindEventS` 双通道无缝转发。
 
-5. **设计器与代码生成脱糖契约（ToolStrip 项事件与组件配置规范）**：
-   - **ToolStrip 项点击事件脱糖**：`ToolStrip` 的按钮项（`items`）在设计器或 JSON 声明中配置了 `click` 属性时，`GenForm` 自动脱糖聚合生成该工具条的 `ItemClick` 事件监听；内部通过 `if (vn.LastIndex == i) { __form.Call("OnHandler"); }` 区分触发项，无须手写胶水代码分派。
+5. **设计器画布纪律（ToolStrip 项与组件配置规范）**：
    - **紧凑型关闭按钮（MiniCloseBtn）排版纪律**：属性检查器（选项列表、CSS 样式表等）中的单项删除按钮禁止使用常规 28px/34px 操作按钮，统一采用 20px 紧凑圆底微十字按钮，避免挤占输入框与标签的空间。
    - **设计器画布网格避让渲染**：画布网格必须使用淡色微点阵（35%~40% 次级透明度）替代粗实线；绘制点阵时需检查控件包围盒（`fx, fy, fw, fh`），组件覆盖区域跳过绘制，彻底消除网格穿透遮挡组件界面的视觉干扰。
    - **常用组件属性契约闭环**：基础组件在设计器 `BuiltinPropRows` 中必须完整声明属性元数据，`Button` 等支持 `type` / `size` 变体类的组件在 `SetProp` 中使用 `SetClassIn` 维护互斥语义类，确保设计器即时配置所见即所得。
@@ -623,11 +603,11 @@ Cookie，"对照组"就不成立了。
       - *黄金解法*：HTML 模板中所有切页面板标签**不要写内联 `style="display: none;"`**；页面初始显隐由后台 `OnLoad(Form form)` 首帧调用 `ShowPage(0)` 统一控制（通过 `page.visible = (idx == 0)`），这样 `visible = false` 干净隐藏、`visible = true` 干净恢复，零样式冲突。
     - **Checkbox 与 Radio 的文字标签：必须声明在 `<input>` 的 `value="..."` 属性**：
       - *踩坑实证*：按网页习惯写 `<label><input type="checkbox"> 记住我</label>`，复选框旁边的文字丢失。
-      - *原因*：GenForm 将 `label` 作为独立 `Label` 控件，且含有 child `<input>`，内嵌的裸文本被忽略。而 Checkbox / Radio 在 Zan 原生控件体系中自带 label 文案属性。
+      - *原因*：解析器将 `label` 折成独立 `Label` 控件，且含有 child `<input>`，内嵌的裸文本被忽略。而 Checkbox / Radio 在 Zan 原生控件体系中自带 label 文案属性。
       - *黄金解法*：Checkbox 与 Radio 的标签文字**直接写在 `<input>` 的 `value="..."` 属性中**（例如 `<input type="checkbox" id="chk1" value="把“病毒扫描”加入右键菜单" checked>`），`DesignerHtml.zan` 会将其自动映射为 `label` 属性并在控件内部右侧绘制文字，排版与基线对齐完美闭环。
     - **文本必须包裹在语义标签中（禁止容器 `div` 中散落裸文本）**：
       - *踩坑实证*：在 `<div class="tag">已保护<span>399</span>天</div>` 中，“已保护”和“天”丢失；在 `<div class="dropzone">拖拽到此</div>` 中，“拖拽到此”丢失。
-      - *原因*：`<div>` 在 GenForm 中被映射为容器 `Panel`。容器如果有子元素（如 span），散落在容器内部的裸文本没有对应的 AST 控件节点包裹，会被跳过。
+      - *原因*：`<div>` 在解析器里兜底为容器 `Panel`。容器如果有子元素（如 span），散落在容器内部的裸文本没有对应的控件节点包裹，会被跳过。
       - *黄金解法*：所有需要呈现的文本内容，必须显式包裹在文本语义标签中：`<span>` / `<label>`（生成 Label 控件）或 `<p>` / `<h1>~<h6>`（生成 Typography 控件）。
     - **自定义无边框窗口操作**：
       - 窗口声明 `data-win-chrome="false"`，顶栏自定义按钮（`icon="minus"`, `icon="square"`, `icon="x"`），后台 `OnLoad` 订阅后直接调用 `__form.Minimize()`、`__form.ToggleMaximize()`、`__form.Close()`。
@@ -651,13 +631,9 @@ Cookie，"对照组"就不成立了。
    - **事件修饰符与防冒泡（`@click.stop` / `@keydown.enter`）**：在 `@click.stop`、`@submit.prevent`、`@keydown.enter` 等事件声明中，`HtmlText.EventKind` 自动剥离修饰符后缀以匹配核心事件种类，并在 `Html.Wire` / `Html.WireArg` 中通过 `WrapModifier` 装饰底层回调：`.stop` 自动调用 `app.ClaimClick` 截断事件向下冒泡；`.enter` 严格校验 `app.window.EventKeyCode == 13`，免去业务回调中重复编写键码和冒泡判定样板代码。
 
 12. **HTML5 声明式输入控件多态映射与模型类型感知自动强转规范**：
-   - **`<input type="...">` 多态组件实例化**：在 HTML 声明中写 `<input type="checkbox|radio|number|range|color|date|password" />` 时，`Html.Build` 自动映射实例化为对应的专属高阶组件（`checkbox` -> `Checkbox`、`radio` -> `Radio`、`number` -> `InputNumber`、`range` -> `Slider`、`color` -> `ColorPicker`、`date` -> `DatePicker`、`password` -> `Input` 带密码掩码属性），与自定义组件标签（`<slider>`、`<colorpicker>` 等）完全等价且支持标准 HTML 语义。
+   - **`<input type="...">` 多态组件实例化**：在 HTML 声明中写 `<input type="checkbox|radio|number|range|color|date|password" />` 时，装载器（`DesignerHtml.InputTypeKind`）自动映射实例化为对应的专属高阶组件（`checkbox` -> `Checkbox`、`radio` -> `Radio`、`number` -> `InputNumber`、`range` -> `Slider`、`color` -> `ColorPicker`、`date` -> `DatePicker`、`password` -> `Input` 带密码掩码属性），与自定义组件标签（`<slider>`、`<colorpicker>` 等）完全等价且支持标准 HTML 语义。
    - **组件类型感知模型强转回写（Coercion On Writeback）**：双向绑定 `data-bind` 回写时，若目标 JSON 模型节点尚未初始化（`cur == null`），`WriteBoundValue` 自动根据当前绑定的控件类型进行精准的类型归一化：`Checkbox` / `Switch` 强制以 `JsonValue.NewBool` 写入；`Slider` / `InputNumber` / `Progress` / `Rate` 及声明了 `.number` 的控件强制以 `JsonValue.NewNum` 写入；避免空模型初次绑定输入时被统一回写为字符串而破坏数据契约。
    - **快照即时同步防抖**：控件完成 `WriteBoundValue` 模型就地回写后，立即调用 `RecordSnapshot(c, s)` 同步控件快照，防止同一帧在后续流程中再次触发无效重复写入。
-
-13. **编译期 GenHtml 与运行时 Html.Build 双通道语义同构对齐规范**：
-   - **指令与修饰符发射对齐**：AOT 编译期代码生成器 `GenHtml` 必须完整发射 `:class` (`v.bindClass`)、`:disabled` (`v.bindDisabled`)、`:prop` / `v-bind:prop` (`v.AddBindProp("prop", expr)`)、以及 `v-model.lazy.number.trim` 对应的修饰符布尔标记（`v.bindLazy`、`v.bindNumber`、`v.bindTrim`），确保 AOT 编译生成的控件树在运行期享有与 JIT 动态解析完全一致的双向绑定与响应式行为。
-   - **模板插值与作用域对齐**：静态节点与容器内部的 `{{ expr }}` 文本在 `GenHtml` 中自动扫描并合成 `v.bindTpl = "..."` 发射，由 `ChildWindow.SyncFromNode` 统一求值与更新。
 
 14. **设计器复合与容器组件项事件与细粒度配置闭环规范（ToolStrip 项事件/Tab 与选项关闭尺寸/大编辑器定位）**：
    - **工具条（ToolStrip）项点击事件在属性与事件面板双通道暴露**：
@@ -668,10 +644,10 @@ Cookie，"对照组"就不成立了。
    - **选项与 Tab 关闭按钮精致化度量（14px~16px）**：
      - 属性检查器选项列表中删除按钮（`MiniCloseBtn`）重构为轻量 16px 矩形热区配 10px `close` 字符图标与悬停高亮；`Tabs` 标签页的关闭按钮统一收缩至 14px 方形热区并配合 10px 字符，彻底根绝关闭按钮过大挤占选项标签或误触的问题。
 
-15. **AOT 编译期高级组件标签映射与插槽挂载同构规范（Tabs/Card/Badge/Tag 等）**：
-   - **高阶组件声明式类型映射**：在 AOT 编译阶段（`GenHtml.EmitDecl`），标准组件标签（`<card>`、`<badge>`、`<avatar>`、`<tag>`、`<divider>`、`<alert-box>`、`<rate>`、`<split-panel>`、`<collapse>`、`<breadcrumb>`、`<steps>`、`<timeline>`、`<qrcode>`、`<watermark>`、`<marquee>`、`<spin>`、`<empty>`、`<result>`、`<skeleton>`、`<input-number>` 等）必须直接发射强类型实例化代码（如 `Gui.Widget.Card vN = new Gui.Widget.Card("...");`），并在 `IsWidgetTag` 中注册为受管组件，严禁退化为通用 `Gui.Element` 导致方法丢失。
-   - **真组件文本与空白过滤（Anti-Bogus-AddText）**：真实组件继承自 `Control` 而非 `Element`，不具备 `AddText` 接口。在 `GenHtml.EmitContent` 中，对于 `IsWidgetTag` 判为真的组件，游离空白符与换行符必须严加过滤，禁止发射 `v.AddText(" ")`；非空白文本内容通过 `v.SetProp("text", ...)` 规范写入。
-   - **Tabs 容器选项自动推导与元子节点插槽转挂**：`<tabs>` 容器若未显式指定 `options` 属性，`GenHtml` 与 `Html.Build` 均自动深层扫描子级 `<tab title="...">` / `<tab-pane>` 元素并推导拼接 `options` 字符串；元子节点在 `IsMetaChild` 中标记放行，其内部实际承载的子孙控件自动注入 `slotName = tTitle` 并重定向挂载至父级 `Tabs`，在 AOT 与 JIT 两大模式下达成 100% 同构闭环。
+15. **高级组件标签映射与插槽挂载规范（Tabs/Card/Badge/Tag 等）**：
+   - **高阶组件声明式类型映射**：标准组件标签（`<card>`、`<badge>`、`<avatar>`、`<tag>`、`<divider>`、`<alert-box>`、`<rate>`、`<split-panel>`、`<collapse>`、`<breadcrumb>`、`<steps>`、`<timeline>`、`<qrcode>`、`<watermark>`、`<marquee>`、`<spin>`、`<empty>`、`<result>`、`<skeleton>`、`<input-number>` 等）装载时直接实例化真组件，严禁退化为通用 `Gui.Element` 导致方法丢失。
+   - **真组件文本与空白过滤（Anti-Bogus-AddText）**：真实组件继承自 `Control` 而非 `Element`，不具备 `AddText` 接口。装载装配时对判为真组件的标签，游离空白符与换行符必须严加过滤；非空白文本内容通过 `v.SetProp("text", ...)` 规范写入。
+   - **Tabs 容器选项自动推导与元子节点插槽转挂**：`<tabs>` 容器若未显式指定 `options` 属性，装载器自动深层扫描子级 `<tab title="...">` / `<tab-pane>` 元素并推导拼接 `options` 字符串；元子节点标记放行，其内部实际承载的子孙控件自动注入 `slotName = tTitle` 并重定向挂载至父级 `Tabs`。
    - **密码输入与扩展属性双向对称性（GetExtra/SetExtra）**：`<input type="password">` 统一通过 `v.SetProp("password", "true")` 声明，且控件层在 `GetExtra` 与 `SetExtra` 中形成完整读写闭环，确保属性获取与状态同步双向对称。
 
 16. **动态模型数组驱动选项绑定与双向值同步规范（`:options` 与 `<option value="...">` JIT/AOT 同构）**：
@@ -681,7 +657,7 @@ Cookie，"对照组"就不成立了。
    - **双向绑定语义值与下标自适应（Two-Way Binding Type Adaptability）**：
      - 当从 `SelectBox` 读取值回写模型时（`ChildWindow.BoundValue`），先检查目标模型字段当前是否为数值类型；若为数值，则回写整型下标字符串（`Convert.ToString(sb.Selected)`）；若为字符串或未初始化，则回写语义值（`sb.SelectedValue`，回退至 `sb.Text`）。
      - 当从模型向 `SelectBox` 写入属性时（`SetProp("value", val)`），优先在选项列表中匹配 `opts[i].val == val || opts[i].label == val`；若未命中则回退为数值下标解析，实现语义值与下标的双向平滑转换。
-   - **JIT 与 AOT `<option value="...">` 编译同构**：当在声明式 HTML 中声明带有显式 `value` 属性的 `<option value="bj">北京</option>` 时，运行时 JIT（`Html.Parse`）与编译期 AOT（`GenHtml.Translate`）统一探测子级是否包含非空自定义 `value`。一旦包含，自动合成 `[{"label": "北京", "value": "bj"}, ...]` JSON 数组并发射为 `SetProp("options", ...)`，确保原生 HTML `<select>` 语义在动静双通道下 100% 行为一致。
+   - **`<option value="...">` 语义合成**：声明式 HTML 里带显式 `value` 属性的 `<option value="bj">北京</option>`，装载器统一探测子级非空自定义 `value`，自动合成 `[{"label": "北京", "value": "bj"}, ...]` JSON 数组并 `SetProp("options", ...)`，原生 `<select>` 语义完整保真。
 
 17. **流式排版、停靠体系与边距内外消费全链路契约（Fill Height / Flex / Margin / Padding）**：
    - **FormBuilder 布局流与容器 Display 属性声明**：
@@ -736,9 +712,6 @@ Cookie，"对照组"就不成立了。
    - **界面美学克制与品牌主视觉对齐（Anti-Cyberpunk Overfitting）**：
      - *踩坑*：AI 开发安全卫士/系统工具时，容易臆想出密密麻麻的 PCB 微电路、芯片针脚、暗黑赛博朋克风，破坏桌面产品的现代清爽扁平/微立体质感。
      - *规范*：严格遵循 `gui-design` 规范：纯白卡片底色（`#ffffff`）、极细边缘（`#eaedf2`）、品牌主色（如火绒橙 `#F58220`）、微透明柔和光晕与 2.5D 切面金盾，克制配色与呼吸节奏。
-   - **HTML + Code-behind 编译输入顺序硬契约**：
-     - *规范*：执行 `zanc` 编译时，HTML 文件必须作为命令行首个输入参数（例如 `zanc.exe App.html App.zan --auto-stdlib -o app.exe`），由编译器从首个设计文档合成 Form 宿主与入口。
-
 21. **同构集合列表的数据驱动与模板复用架构（Anti-Hardcoded-DOM-List-Duplication）**：
    - **踩坑出处**：在开发火绒安全卫士的“防护中心”（22项开关）、“访问控制”（6项规则）、“安全工具”（11项工具）等大量结构相同但数据不同的卡片视图时，若直接在 HTML 中手写复制数十份静态 `<div class="protect-row-card">` 节点，会导致：
      1) HTML 臃肿失控（单文件 2000 多行，充斥重复代码）；

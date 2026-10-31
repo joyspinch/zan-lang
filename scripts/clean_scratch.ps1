@@ -1,4 +1,4 @@
-# Sweep _scratch/: entries untouched for -KeepDays days are deleted.
+﻿# Sweep _scratch/: entries untouched for -KeepDays days are deleted.
 #
 # Why this exists: _scratch only ever grew. Sessions drop bisect trees, A/B
 # compiler snapshots, SDK extractions and screenshot runs and never loop back

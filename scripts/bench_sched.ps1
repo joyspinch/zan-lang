@@ -1,4 +1,4 @@
-# Scheduler throughput baseline for the multi-worker coroutine driver.
+﻿# Scheduler throughput baseline for the multi-worker coroutine driver.
 #
 # A single run of the socket benchmark varies by ~25% on a loaded desktop, which
 # is more than most scheduler changes are worth -- so every configuration is run

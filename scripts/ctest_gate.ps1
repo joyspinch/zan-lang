@@ -1,4 +1,4 @@
-# ctest 的自动排队钩子（CTEST_CUSTOM_PRE_TEST / POST_TEST）
+﻿# ctest 的自动排队钩子（CTEST_CUSTOM_PRE_TEST / POST_TEST）
 #
 # 为什么需要它：
 #   共享构建资源的闸只在 scripts\build.ps1 / scripts\test.ps1 上。裸跑

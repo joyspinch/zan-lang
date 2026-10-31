@@ -1,4 +1,4 @@
-# stage_dev_toolchain.ps1 -- Populate build\toolchain for a DEV IDE run.
+﻿# stage_dev_toolchain.ps1 -- Populate build\toolchain for a DEV IDE run.
 #
 # ZanIDE resolves the compiler and its friends relative to its own folder
 # (ZanIDE.BaseDir()/toolchain -- see ZanIDE.Zanc / ToolchainDir), so an IDE

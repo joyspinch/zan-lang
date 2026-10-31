@@ -118,12 +118,14 @@ description: Zan 开发规范总纲——开发工作流闭环、代码规范（
      样式盒里的 width 只影响画出来的那张面，撑不开控件的槽位，漏了这一段
      就是"写了等于没写"（坑出处：内联通道改成"解析时重放"时把布局键
      一起丢了，`style="width:88px"` 失效，回归用例 `gui_field_style` 变红）。
-  ③ **控件的 kind 名单三处副本要对得上**：运行期重建注册表
-     （`ControlBootstrap.Names` + 各族 bootstrap）、编译期限定名单
-     （`GenForm.IsStdWidgetKind` / `IsHmiKind`）、控件自己声明的 `Kind()`。
-     少一处就出两种症状：按 kind 重建拿到 null，或生成代码发裸名、用户
-     项目的同名全局类压过 stdlib（坑出处：`Row`/`Spacer`/`FormGroup`/
-     `FormItem`/`Modal`/`Drawer` 在注册表里却不在编译期名单）。
+  ③ **控件的 kind 名单副本要对得上**：运行期重建注册表
+     （`ControlBootstrap.Names` + 各族 bootstrap；应用组件走自发现
+     约定——类自声明 `static void Install()` 注册进 HeavyControls，
+     注册表由脚本扫描文档引用生成，不维护手工清单）、控件自己声明的
+     `Kind()`。少一处就出症状：按 kind 重建拿到 null，控件在运行期
+     整体消失（坑出处：`Row`/`Spacer`/`FormGroup`/`FormItem`/`Modal`/
+     `Drawer` 注册表漏登记；编译期限定名单已随 GenForm 删除退出历史，
+     2026-10-31）。
 - **窗口程序开发铁律：UI 线程专职渲染与事件派发，业务/IO/计算绝对异步解耦非阻塞**：
   ① **职责唯一性约束**：UI 线程（主事件消息泵）核心使命是保持 60/120Hz 丝滑响应，只负责系统输入事件分发与界面排版绘制（Layout -> Paint -> Present），单次事件或帧处理耗时红线严禁超过 2ms；
   ② **严禁同步阻塞反模式**：严禁在 UI 线程直接执行网络通信（HTTP/WebSocket）、磁盘文件大读写、数据库 SQL 执行、大 JSON/XML 解析、图像解码、重 CPU 计算或同步 `Sleep`；

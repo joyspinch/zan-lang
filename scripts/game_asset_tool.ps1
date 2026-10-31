@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
   Zan 游戏引擎素材与图集自动化处理工具
 .EXAMPLE

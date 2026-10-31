@@ -1,4 +1,4 @@
-# Bakes a high-resolution anti-aliased ASCII glyph atlas (code points 32..126)
+﻿# Bakes a high-resolution anti-aliased ASCII glyph atlas (code points 32..126)
 # for the Game.Kit smooth font. The atlas is rendered at M x the design cell size
 # so text stays razor sharp when the scene is rasterized at native 4K.
 #

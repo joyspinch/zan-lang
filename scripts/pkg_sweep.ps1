@@ -1,4 +1,4 @@
-# Whole-tree package health sweep: compile every .zan of each package in one
+﻿# Whole-tree package health sweep: compile every .zan of each package in one
 # unit, so files that no entry program references still get diagnosed. The
 # stdlib/package on-demand pull is a dead-code shield -- a "born broken" file
 # (the Zan.Game multi-arity Action batch) compiles green until the first

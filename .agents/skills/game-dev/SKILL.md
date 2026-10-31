@@ -185,9 +185,10 @@ App.html + 游戏自己的皮肤。坑与定式，每条都是踩过才成立的
   `SetHandler(key.Substring(2))`，模型键 onClick 截出 Click。
   自测合成点击走 `form.Call(control.GetHandler("Click"))`，与真实
   点击同一条 form.Call 分发路径。
-- **设计文档必须显式列进 zanc 命令行**（App.html 与 main.zan 同目录
-  也不会被自动捡起；漏了就是生成字段全体缺失，报
-  "partial class has no member rXxx" 满屏）。
+- **设计文档不是编译输入**（编译期 HTML 通道已删，zanc 对 .html 显式
+  拒绝）：运行期 `App.LoadHtml`/FormBuilder 投影，发布 `--embed` 烘入
+  exe（压缩加密、不落盘）。"生成字段缺失满屏报错"是历史症状；现在
+  漏加载表现为运行期节点为 null、界面缺块。
 - **皮肤从 cwd 解析**（`./skins` walk，其次 $ZAN_GUI_SKINS，再次
   exe 内嵌）：开发期从模板目录运行；发布 `--publish --embed
   skins=skins`。皮肤没加载时回落内置暗色主题——"界面突然变灰"先查 cwd。
@@ -225,7 +226,8 @@ App.html + 游戏自己的皮肤。坑与定式，每条都是踩过才成立的
 - **每个页面一张 .html 设计稿**：布局/列表/样式进设计稿，数据绑定走
   `data-bind`/`data-for`（服务端 JSON 或本地模型都接 JsonValue），
   交互在 code-behind。五件声明原语与硬边界见 gui-design skill 的
-  "HTML 窗口开发定式"（设计稿必须是编译输入第一个文件等）。
+  "HTML 窗口开发定式"（五件声明原语等；设计稿运行期加载，发布
+  `--embed` 烘入，不是编译输入）。
 - **页与页切换 = `Gui/Nav.zan` 的 `Nav.Embed`**（Tabs-as-outlet）：
   路由表对应按钮排（legend 的按钮本来就从 navigation.csv 读——
   `data-for` 一条渲染），中间区 = 出口；惰性实例化、默认切走保留
@@ -237,8 +239,8 @@ App.html + 游戏自己的皮肤。坑与定式，每条都是踩过才成立的
   直绘或 HTML 都行。
 - 已知坑出处：wuwei 百艺页签全叠的根因是**只带自家 skin.css 的目录暂存吞掉
   了 stdlib 基线内嵌**（编译器已把跳过条件收紧成"暂存目录自带 base.css"），
-  不是"该把 base.css 一起带"；运行时建树用 `App.LoadHtml`，编译期通道用
-  GenHtml，两者同语义。
+  不是"该把 base.css 一起带"；运行时建树用 `App.LoadHtml`
+  （编译期通道 GenHtml 已删，只此一条运行期通道）。
 
 ## GPU 档 3D（DrawMesh3D）平台事实与 NVIDIA 死锁定式
 
@@ -631,8 +633,8 @@ Post 调用核对编码，别信二手注释。
 
 ## GUI 登录门（登录成功才进主窗）定式
 
-- **时序**：GenForm 顺序是 Show→__CreateWindow(→OnLoad)→Run，在 OnLoad 里
-  阻塞即"主窗 Show 之前"的门。子窗类（ChildWindow 子类，覆写 Title/Width/
+- **时序**：入口顺序是 注册→LoadHtml 建树→OnLoad→Run，在 OnLoad 里
+  阻塞即"主窗 Run 之前"的门。子窗类（ChildWindow 子类，覆写 Title/Width/
   Height/ShowMaximize/IdBase）用 `OpenStandalone` + `PumpStandaloneUntil(
   stop)` 泵自己的事件循环；登录成功置位 stop 条件返回 true，主窗才继续。
   进程内没有干净的"放弃启动"出口：登录窗被直接关掉 = Pump 返回 false，

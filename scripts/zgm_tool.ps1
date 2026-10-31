@@ -1,4 +1,4 @@
-param(
+﻿param(
     [ValidateSet("audit", "test", "stats", "coverage")]
     [string]$Action = "audit"
 )

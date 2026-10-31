@@ -208,8 +208,9 @@ description: 版本提交与任务管理规范——提交信息格式（scope: 
 - **挂账"编译器回归"前的三步对照**（误诊教训）：把
   "示例/项目编译失败"定性为主线回归前——① 查项目 README 与构建脚本的
   文档调用形态，照抄重试：多单元项目各有受支持形态（全文件清单、
-  包源+跨项目数据文件、.html 设计稿必须是第一个编译输入——GenForm 从
-  它合成窗口与控件字段，漏了报一片 undeclared identifier）；② 用 dist
+  包源+跨项目数据文件、GUI 项目走 zan.proj 的 entry=入口.zan——设计稿
+  .html 不是编译输入（zanc 显式拒绝），运行期经
+  LoadHtmlWith/FormBuilder 投影、发布 `--embed` 烘入 exe）；② 用 dist
   发布快照工具链跑同一调用对照——同样失败=从来如此，不是回归；
   ③ 编译通过后跑运行时自检（html_gallery 启动即打
   `SELFTEST fails=N of 86` 逐组件机检）——编译过≠装配对，正是

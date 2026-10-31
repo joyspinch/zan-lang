@@ -289,15 +289,15 @@ description: Zan GUI（Zan.Gui 包）审美与排版规范——对齐、间距�
   Element 上的 title 文本在指针停稳 500ms 后浮出皮肤样式的 Tooltip 气泡
   (贴元素底边、260px 自动换行),指针挪走即消失。前提:元素要有命中区
   (链接/带 data-on-click 的元素天然有,纯展示容器没有指针也就无提示)。
-  真控件(button/input/...)的 title 仍忽略;GenHtml 编译通道对 Element
-  发 elTitle,与运行时 LoadHtmlWith 同形。
+  真控件(button/input/...)的 title 仍忽略;运行时装载对 Element
+  发 elTitle。
 - **导入侧两个静默坑**(都真踩过):①读端属性循环里,专用分支必须排在
   通用分支之前——checkbox/radio 的 value 是文案(→label)、progress 的
   value/max 要截流(→percent),排进通用 value/min/max 分支之后就成了
   死代码,值静默丢失;②原生标签折进模型的键形态必须与消费端对齐——
-  select 折出的 options 是 `"a|b|c"` 字符串,GenForm 老代码只认数组形态,
-  options 静默不发射、SelectBox 空白。折新键前先查 GenForm/FieldSetup
-  与控件 SetProp 期望的形态。
+  select 折出的 options 形态必须与消费端对齐(字符串/JSON 数组二选一,
+  两头同形),折错形态 SelectBox 空白。折新键前先查
+  DesignerHtml.FieldJson 与控件 SetProp 期望的形态。
 - **code-behind 职责分界**:结构全部进设计稿;只有声明通道喂不活的组件
   (泛型 `ListView<T>`、需运行时模型、立即模式助手、设计器文档节点)在
   HTML 里落 Panel 占位壳,由 code-behind 构造真控件 `Add` 进壳。两个
@@ -769,7 +769,7 @@ description: Zan GUI（Zan.Gui 包）审美与排版规范——对齐、间距�
 - **同色折线大批量必须走批量入口,且批量入口要链接期验真**:逐条
   polyline 是每条一次覆盖缓冲清+合成+一次 FFI 跨界,3.2 万条航线
 - **HTML+CSS+Zan 设计稿零胶水规范与纯矢量图标体系（从截图还原精美客户端铁律）**:
-  - **GenForm 设计稿零胶水通道**:在 HTML `body` 上声明 `data-zan-design`、`data-win-title`、`data-win-w`、`data-win-h`、`data-win-chrome="false"`(沉浸式无边框)和 `data-win-center="true"`。编译器自动生成窗口、自动注入 `<style>` 中的 CSS 样式表、去除标题栏、自动居中、DockFill 挂载并连线所有 `@click` 事件与默认 Main 入口。后台 `App.zan` 严禁手写任何 `Form.Create`、`UseAppCss`、`SetChromeVisible` 或 `handlers.Add` 等样板胶水代码,只需声明 `partial class` 编写纯粹的业务状态与事件响应。
+  - **设计稿运行期零建树通道**:HTML 设计稿不是编译输入(zanc 拒绝 .html)。窗口属性(`data-win-title`、`data-win-w`、`data-win-h`、`data-win-chrome="false"` 沉浸式无边框、`data-win-center="true"`)是文档键,由入口代码读键后调 `Form.Create`/`SetChromeVisible` 等落地;内容经 `FormBuilder.BuildWith`/`LoadHtmlWith` 投影,`<style>` 随装载并进应用样式,`@click` 事件由 handlers/binder 接线。业务代码只写状态与事件响应,不碰建树;发布用 `--embed` 把设计稿烘进 exe(压缩加密、内存解出、不落盘)。
   - **无边框窗口右上角系统控制按钮保护区（SetCaptionZone）**:声明 `data-win-chrome="false"` 沉浸式无边框窗口时，若标题栏高度生效，Win32 的 `WM_NCHITTEST` 会将整个窗口顶栏判定为 `HTCAPTION (2)` 导致拖拽吞掉右上角按钮点击；必须在 `OnLoad` 中调用 `form.GetApp().SetCaptionZone(width)`（如 `form.GetApp().Scale(160)`）为右上角功能区（菜单/最小化/最大化/关闭）保留非拖拽客户区。
   - **Tabler SVG 纯矢量图标铁律(杜绝伪 Unicode 字符)**:按钮与图标控件一律声明标准 SVG 矢量名(如 `icon="player-play"`、`icon="player-skip-back"`、`icon="player-skip-forward"`、`icon="heart"`、`icon="volume"`、`icon="reload"`、`icon="playlist"`、`icon="chevron-down"` 等),走内置 997+ Tabler SVG 矢量图标集经 nanosvg 矢量光栅化与 GPU 贴图缓存。严禁使用 `▶`、`⏮`、`❤` 等 Unicode 假字符冒充图标。
   - **Nanosvg 矢量图元约束与动态透明 SVG 规范**:

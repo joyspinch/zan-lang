@@ -26,6 +26,36 @@ HEADER = """// <auto-design> {doc}.html 的运行期投影半件（B-ID44）—�
 // {doc}.zan。设计稿改动后重跑生成脚本。
 """
 
+# 组件自注册约定（零清单扩展）：被任何文档引用的 kind，其同名类
+# 要么是设计类（本脚本发工厂），要么在自己的类文件里声明
+# `static void Install()`（注册表发一条调用）。两者都不满足的
+# （内置控件、泛型容器）不进注册表——它们由包级 Bootstrap 覆盖。
+SCAN_ROOTS = [SRC, os.path.join(ROOT, 'packages', 'Zan.Gui', 'src')]
+
+REGISTRY = """// <auto-design> IDE 组件注册表（B-ID44）——由
+// scripts/gen_design_halves.py 扫描全部 .html 设计稿的 kind 引用
+// 生成：设计类发 HeavyControls 工厂；类文件声明了 static void
+// Install() 的组件类发一条调用。新增组件只需新增文档（或带
+// Install 的组件类）后重新构建，本表自动更新。勿手改。
+using Gui;
+using Gui.Widget;
+using Gui.Component;
+
+public static class IdeDesignedRegistry {{
+    static bool installed;
+
+    // 注册文档实际引用的全部 kind（幂等）。未注册的 kind 显式
+    // 失败（节点为 null），拼错的名字不会静默变型。
+    public static void Install() {{
+        if (installed) {{ return; }}
+        installed = true;
+        Gui.ControlBootstrap.Install();
+        Gui.Component.DataTable.DataTableBootstrap.Install();
+{lines}
+    }}
+}}
+"""
+
 
 def tag_kind(tag, attrs):
     """与 DesignerHtml.TagKind 同表：裸容器兜底 Panel，zan-* 恢复 Pascal。"""
@@ -132,14 +162,64 @@ def emit(doc_path):
 def main():
     docs = sorted(glob.glob(os.path.join(SRC, '**', '*.html'), recursive=True))
     written = 0
+    designed = set()
+    refs = set()
     for d in docs:
+        html = open(d, encoding='utf-8').read()
+        for m in re.finditer(r'<([a-zA-Z-]+)\b([^>]*?)(/?)>', html):
+            k = tag_kind(m.group(1), m.group(2))
+            if k:
+                refs.add(k)
         if os.path.basename(d) == 'IdeForm.html':
             continue  # 窗口文档：入口手工投影，不生成半件
         dst, n, has_init = emit(d)
+        designed.add(os.path.basename(d)[:-5])
         print('%s fields=%d onInit=%s' % (os.path.relpath(dst, ROOT), n, has_init))
         written += 1
-    print('wrote %d halves' % written)
+    lines = registry_lines(refs, designed)
+    reg = os.path.join(SRC, 'IdeDesignedRegistry.zan')
+    with open(reg, 'w', encoding='utf-8', newline='\n') as f:
+        f.write(REGISTRY.format(lines='\n'.join(lines)))
+    print('wrote %d halves, registry kinds=%d' % (written, len(lines)))
     return 0
+
+
+def registry_lines(refs, designed):
+    """文档引用的 kind → 注册表行。设计类发工厂；声明了 Install 的
+    组件类发调用；其余（内置/泛型容器/拼错名）不进表。"""
+    lines = []
+    for k in sorted(refs):
+        qual = k
+        if k not in designed:
+            cf = class_file(k)
+            if cf is None:
+                continue
+            text = open(cf, encoding='utf-8').read()
+            if 'static void Install()' not in text:
+                continue
+            ns = re.search(r'^namespace\s+([A-Za-z0-9_.]+);', text, re.M)
+            qual = ns.group(1) + '.' + k if ns else k
+            lines.append('        %s.Install();' % qual)
+            continue
+        ns = ''
+        cf = class_file(k)
+        if cf is not None:
+            ns = re.search(r'^namespace\s+([A-Za-z0-9_.]+);',
+                           open(cf, encoding='utf-8').read(), re.M)
+            ns = ns.group(1) if ns else ''
+        full = ns + '.' + k if ns else k
+        lines.append('        HeavyControls.Register("%s", (string k) => new %s());'
+                     % (k, full))
+    return lines
+
+
+def class_file(name):
+    for root in SCAN_ROOTS:
+        for p in glob.glob(os.path.join(root, '**', name + '.zan'), recursive=True):
+            if p.endswith('.design.zan'):
+                continue
+            return p
+    return None
 
 
 if __name__ == '__main__':

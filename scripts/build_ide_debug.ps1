@@ -1,4 +1,4 @@
-# 调试版 IDE 构建：出带调试信息的 exe，且**不占用** build\ZanIDE.exe。
+﻿# 调试版 IDE 构建：出带调试信息的 exe，且**不占用** build\ZanIDE.exe。
 #
 # 为什么需要它（坑出处）：
 #   调试崩溃时要用 file:line，得用 -g 编；但 -g + 不 --publish 的产物
