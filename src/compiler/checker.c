@@ -4915,26 +4915,26 @@ static bool checker_type_mentions_type_param(zan_type_t *t, int depth) {
  *
  * 为什么是"擦除模板"：开放泛型模板（类/结构体带类型形参）的方法体是
  * 模板，真身由泛型基类特化（zan_parser_specialize_generic_bases）在派生
- * 类里补出，模板体本身只留一个运行期转发桩。ORM 的泛型基类就是这个形状：
+ * 类里补出，模板体本身只留一个运行期转发桩。模板体里"真解析不到"的调用
+ * （典型：T 接收者的调用，成员集要等 T 落成具体类型才存在），irgen 不报
+ * 3068，而是发运行期转发桩 + A494 软诊断（执行到才报，返回默认值继续跑；
+ * 见 irgen_call.c 的 call_receiver_is_open_generic，那边口径更宽：模板体
+ * 内、或接收者/实参带类型形参都算）。checker 这边必须把该放行的放行，
+ * 否则合法的泛型基类模板直接编不过；conformance 的
+ * generic_template_forward_stub 钉这个口径。
  *
- *     public class BaseDao<T> {
- *         IDbConnection db;
- *         public List<T> All() { return this.db.Select<T>().ToList(); }
- *     }
- *
- * `IDbConnection` 上并没有 Select —— 编译期 ORM 代码生成器（GenDb）
- * 只改写类型实参是具体实体类的调用（db.Select<Blog>()），模板里的 T
- * 不是具体实体，改写不了。irgen 对这种调用不报错：解析不到就发运行期
- * 转发桩（见 irgen_call.c 的 call_receiver_is_open_generic，它的判据
- * 与此同口径）。checker 必须同口径，否则 BaseDao<T> / BaseRepository<T>
- * 直接编不过。
+ * 注意 ORM 已经不是这里的例子：Insert<T>/Select<T>/Update<T>/Delete<T>
+ * 现在是 System.Data.Orm（DbExtensions.zan）的真扩展方法，接收者是已知
+ * 类型时静态绑定就解析——模板体里的 db.Select<T>() 也一样，不经过本函数
+ * （历史上这四个方法由编译期生成器 GenDb 改写调用点而来，生成器已随 ORM
+ * 重构移除）。反过来，接收者类型已知且成员谁都不声明时，irgen 的成员
+ * 访问健壮性路径（irgen_expr_access.c）当场报 E3009——本函数的放行只是
+ * 不抢在 irgen 的诊断前面按自己的口径误报。
  *
  * 为什么 ② 不可省：**只按 ① 放行，等于把整个泛型类的成员存在性检查
- * 关掉**——模板里调一个谁都没有的方法（repo.NoSuchMethod()）照样编得
- * 过，一路跑到运行期才炸。带类型实参的调用才是"真身要等类型定了才
- * 落得到成员上"的那一类（db.Select<T>() 的 Select 由 GenDb 改写、
- * 由特化补真身），不带类型实参的调用（shape.NoSuchMethod()）成员集
- * 是定死的，该报就报。
+ * 关掉**——模板里调一个谁都没有的方法（repo.NoSuchMethod()，不带类型
+ * 实参）成员集是定死的，该报就报（checker_report_no_member）；带类型
+ * 实参的调用才是"真身要等类型定了才落得到成员上"的那一类。
  *
  * 为什么 ① 不可省：模板体之外（普通类里的泛型方法、非泛型类），
  * 成员集判不出来只是"这个成员压根不存在"——那是真错。缺了 ①，
