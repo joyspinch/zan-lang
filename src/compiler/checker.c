@@ -1652,15 +1652,66 @@ static bool checker_cast_is_valid(zan_checker_t *c, zan_type_t *dst,
 static zan_symbol_t *expr_method_group(zan_checker_t *c, zan_ast_node_t *e);
 static void reject_method_group(zan_checker_t *c, zan_ast_node_t *e);
 
+/* 方法组 → 委托的签名兼容性（C# 方法组转换规则的收窄版）：
+ * 参数个数一致、每个委托形参可赋给方法形参（逆变方向）、
+ * 返回值 void 对 void，否则方法返回类型可赋给委托返回类型（协变）。
+ * 不兼容绝不能静默放行——发码侧裸函数指针按错误签名调用时，
+ * 形参读到的就是寄存器残渣（B-ID48 的运行期腐坏）。 */
+static bool method_group_matches_delegate(zan_checker_t *c, zan_symbol_t *m,
+                                         zan_type_t *dlg) {
+    if (!m || !m->decl || m->decl->kind != AST_METHOD_DECL ||
+        !dlg || dlg->kind != TYPE_DELEGATE)
+        return false;
+    if (m->decl->method_decl.type_params.count > 0)
+        return false; /* 泛型方法组：发码侧无实例化路径，直接判不兼容 */
+    zan_ast_list_t *ps = &m->decl->method_decl.params;
+    int dp = dlg->delegate_param_count;
+    if (!ps || ps->count != dp) return false;
+    if (dp > 0 && !dlg->delegate_param_types) return false;
+    for (int i = 0; i < dp; i++) {
+        zan_type_t *dpt = dlg->delegate_param_types[i];
+        zan_ast_node_t *pn = ps->items[i];
+        zan_type_t *mpt = (pn && pn->kind == AST_PARAM && pn->param.type)
+            ? zan_binder_resolve_type(c->binder, pn->param.type) : NULL;
+        if (!dpt || !mpt) return false;
+        if (dpt->kind == TYPE_TYPE_PARAM || mpt->kind == TYPE_TYPE_PARAM)
+            return false;
+        if (!checker_type_equal(dpt, mpt) &&
+            !checker_type_assignable(mpt, dpt))
+            return false;
+    }
+    zan_type_t *dret = dlg->delegate_ret_type;
+    zan_ast_node_t *rt = m->decl->method_decl.return_type;
+    zan_type_t *mret = rt ? zan_binder_resolve_type(c->binder, rt)
+                          : c->binder->type_void;
+    if (!dret || dret->kind == TYPE_VOID || dret->kind == TYPE_ERROR)
+        return !mret || mret->kind == TYPE_VOID;
+    if (!mret || mret->kind == TYPE_VOID) return false;
+    return checker_type_equal(dret, mret) ||
+           checker_type_assignable(dret, mret);
+}
+
 static void checker_check_assignable(zan_checker_t *c, zan_type_t *target,
                                      zan_type_t *value, zan_ast_node_t *expr,
                                      zan_loc_t loc, const char *what) {
     if (!target || !value) return;
-    if (expr && target->kind != TYPE_DELEGATE) {
+    if (expr) {
         zan_symbol_t *mg = expr_method_group(c, expr);
         if (mg) {
-            reject_method_group(c, expr);
-            return;
+            if (target->kind != TYPE_DELEGATE) {
+                reject_method_group(c, expr);
+                return;
+            }
+            /* 方法组 → 委托：签名兼容才放行，不兼容当场报——
+             * 静默放行会走到发码侧按错误签名调用（B-ID48）。 */
+            if (!method_group_matches_delegate(c, mg, target)) {
+                zan_diag_emit_code(c->diag, DIAG_ERROR, loc, 2098,
+                    "method '%.*s' cannot be converted to delegate type "
+                    "'%s': signature is not compatible",
+                    (int)mg->name.len, mg->name.str, type_name(target));
+                return;
+            }
+            return; /* 兼容：方法组转换成立，跳过 void/常规可赋值检查 */
         }
     }
     if (target == c->binder->type_error || value == c->binder->type_error)
@@ -2056,6 +2107,27 @@ static zan_symbol_t *checker_find_method_typed(zan_checker_t *c,
                             }
                         }
                     }
+                    continue;
+                }
+                zan_ast_node_t *mg_probe = arg;
+                while (mg_probe && mg_probe->kind == AST_CAST_EXPR)
+                    mg_probe = mg_probe->cast.expr;
+                zan_symbol_t *mgs = expr_method_group(c, mg_probe);
+                if (mgs) {
+                    /* 方法组实参：与 lambda 同规——按目标委托形参的签名
+                     * 兼容性打分，不兼容的候选直接出局。裸方法名在
+                     * checking 阶段定型为 void（方法符号的 ->type 是返回
+                     * 类型），不比签名会全候选同分，退化成"第一个同名
+                     * 重载"（B-ID48：On 四重载错绑 Action，运行期腐坏
+                     * 形参）。 */
+                    if (!pt || pt->kind == TYPE_ERROR) continue;
+                    if (pt->kind == TYPE_TYPE_PARAM) continue; /* T 可能是委托 */
+                    if (pt->kind != TYPE_DELEGATE) { compatible = false; break; }
+                    if (!method_group_matches_delegate(c, mgs, pt)) {
+                        compatible = false;
+                        break;
+                    }
+                    score += 4;
                     continue;
                 }
                 if (!pt || !at || pt->kind == TYPE_ERROR ||
@@ -2475,6 +2547,19 @@ static void check_call_arg_type(zan_checker_t *c, zan_symbol_t *sig, int index,
                           "cannot use a 'void' value in argument %d of "
                           "'%.*s': a void call has no result",
                           index + 1, (int)sig->name.len, sig->name.str);
+            return;
+        }
+        /* void 实参里藏着方法组：形参是委托时必须验签名兼容——
+         * 重载路径按兼容性选优，这里兜底唯一方法/无类型兜底的场景
+         * （B-ID48：裸方法名 + 委托形参 = 无条件放行）。 */
+        zan_ast_node_t *vg = arg;
+        while (vg && vg->kind == AST_CAST_EXPR) vg = vg->cast.expr;
+        zan_symbol_t *vmg = expr_method_group(c, vg);
+        if (vmg && !method_group_matches_delegate(c, vmg, pt)) {
+            zan_diag_emit_code(c->diag, DIAG_ERROR, arg->loc, 2098,
+                "method '%.*s' cannot be converted to delegate type "
+                "'%s': signature is not compatible",
+                (int)vmg->name.len, vmg->name.str, type_name(pt));
         }
         return;
     }
@@ -2556,7 +2641,15 @@ static void check_ctor_call_arguments(zan_checker_t *c, zan_type_t *type,
 
             if (!pt || !at) continue;
             if (at == c->binder->type_void) {
-                if (pt->kind != TYPE_DELEGATE) {
+                /* 方法组实参：委托形参还须签名兼容（B-ID48 同源） */
+                bool mg_ok = true;
+                zan_ast_node_t *vg = arg_node;
+                while (vg && vg->kind == AST_CAST_EXPR) vg = vg->cast.expr;
+                zan_symbol_t *vmg = expr_method_group(c, vg);
+                if (pt && pt->kind == TYPE_DELEGATE && vmg &&
+                    !method_group_matches_delegate(c, vmg, pt))
+                    mg_ok = false;
+                if (!pt || pt->kind != TYPE_DELEGATE || !mg_ok) {
                     match = false;
                     if (cand_bad_arg < 0) {
                         cand_bad_arg = j;
@@ -2637,7 +2730,30 @@ static bool binary_op_compares(zan_token_kind_t op) {
 }
 
 static zan_symbol_t *expr_method_group(zan_checker_t *c, zan_ast_node_t *e) {
-    if (!e || e->kind != AST_MEMBER_ACCESS) return NULL;
+    if (!e) return NULL;
+    if (e->kind == AST_IDENTIFIER) {
+        /* 类型名（如类名访问静态成员 Deflate.LengthBase）优先是类型，绝非方法组 */
+        zan_symbol_t *ts = zan_binder_lookup(c->binder, e->ident.name);
+        if (ts && (ts->kind == SYM_CLASS || ts->kind == SYM_STRUCT ||
+                   ts->kind == SYM_ENUM || ts->kind == SYM_INTERFACE))
+            return NULL;
+        if (c->current_type_sym &&
+            c->current_type_sym->name.len == e->ident.name.len &&
+            memcmp(c->current_type_sym->name.str, e->ident.name.str,
+                   (size_t)e->ident.name.len) == 0)
+            return NULL;
+        /* 裸方法名（`form.On("x", OnFocus)`）：局部/形参/字段先遮蔽，
+         * 再在当前类型链上找同名方法——与 irgen 的 get_method_sym
+         * 同一口径，否则 checker 看不见的方法组会在发码侧变成裸
+         * 函数指针，按错误重载的签名调用（B-ID48：腐坏形参）。 */
+        if (checker_find_local(c, e->ident.name)) return NULL;
+        if (!c->current_type_sym) return NULL;
+        zan_symbol_t *f = checker_find_field(c->current_type_sym,
+                                             e->ident.name);
+        if (f) return NULL;
+        return checker_find_method(c->current_type_sym, e->ident.name);
+    }
+    if (e->kind != AST_MEMBER_ACCESS) return NULL;
     zan_ast_node_t *obj = e->member.object;
     if (!obj || (obj->kind != AST_IDENTIFIER && obj->kind != AST_THIS_EXPR))
         return NULL;

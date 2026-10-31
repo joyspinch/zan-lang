@@ -856,7 +856,25 @@ static zan_type_t *lambda_body_type(zan_irgen_t *g, zan_ast_node_t *lam,
 
 static zan_symbol_t *arg_method_group(zan_irgen_t *g, zan_ast_node_t *a,
                                       local_scope_t *locals, int arity) {
-    if (!a || a->kind != AST_MEMBER_ACCESS) return NULL;
+    if (!a) return NULL;
+    if (a->kind == AST_IDENTIFIER) {
+        /* 裸方法名（`form.On("x", OnFocus)`）：与发码侧标识符兜底
+         * （irgen_expr_ops 的 get_method_sym）同一口径——局部先遮蔽、
+         * 类型名优先（R2.Table 的 R2 是类不是方法组）、字段再遮蔽，
+         * 最后在当前类型链上找方法。不识别这一形态时打分循环拿它
+         * 当普通表达式，全部候选 0 分，重载退化成"第一个同名"
+         * （B-ID48：On 四重载错绑 Action，运行期形参腐坏）。 */
+        if (locals && local_find(locals, a->ident.name)) return NULL;
+        zan_symbol_t *ts = zan_binder_lookup(g->binder, a->ident.name);
+        if (ts && (ts->kind == SYM_CLASS || ts->kind == SYM_STRUCT))
+            return NULL;
+        if (!g->current_type_sym) return NULL;
+        if (get_field_sym(g->current_type_sym, a->ident.name)) return NULL;
+        zan_symbol_t *bm = get_method_sym(g->current_type_sym, a->ident.name);
+        if (!bm || !bm->decl || bm->decl->kind != AST_METHOD_DECL) return NULL;
+        return bm;
+    }
+    if (a->kind != AST_MEMBER_ACCESS) return NULL;
     zan_ast_node_t *obj = a->member.object;
     if (!obj || obj->kind != AST_IDENTIFIER) return NULL;
     if (locals && local_find(locals, obj->ident.name)) return NULL;
@@ -873,6 +891,19 @@ static zan_symbol_t *arg_method_group(zan_irgen_t *g, zan_ast_node_t *a,
 static int method_group_score(zan_irgen_t *g, zan_symbol_t *mg, zan_type_t *pt) {
     if (!pt || pt->kind != TYPE_DELEGATE) return -1;
     if (mg->decl->method_decl.params.count != pt->delegate_param_count) return -1;
+    /* 委托形参族必须与方法形参族一致：不查这一层，`OnFocus(Control)`
+     * 会在 Action<string> 与 ControlEvent 之间打出平分，第一个声明
+     * 的错重载照样赢（B-ID48）。 */
+    for (int i = 0; i < pt->delegate_param_count; i++) {
+        zan_type_t *dpt = pt->delegate_param_types[i];
+        zan_ast_node_t *pn = mg->decl->method_decl.params.items[i];
+        zan_type_t *mpt = (pn && pn->kind == AST_PARAM && pn->param.type)
+            ? zan_binder_resolve_type(g->binder, pn->param.type) : NULL;
+        if (!dpt || !mpt) return -1;
+        if (!type_mentions_tp(dpt) && !type_mentions_tp(mpt) &&
+            type_family(dpt) != type_family(mpt))
+            return -1;
+    }
     int score = 2;
     zan_type_t *rt = mg->decl->method_decl.return_type
         ? zan_binder_resolve_type(g->binder, mg->decl->method_decl.return_type)
@@ -884,6 +915,10 @@ static int method_group_score(zan_irgen_t *g, zan_symbol_t *mg, zan_type_t *pt) 
                  type_family(rt) != FAM_UNKNOWN &&
                  type_family(dr) != FAM_UNKNOWN)
             return -1;
+    } else if (rt && !dr) {
+        /* 委托无返回类型槽而方法是 void：视作 void==void 贴合（Action
+         * 系委托 dr 为空时的等价判定） */
+        if (rt->kind == TYPE_VOID) score += 2;
     }
     return score;
 }
@@ -1242,6 +1277,7 @@ static int method_args_score(zan_irgen_t *g, zan_symbol_t *m,
             zan_ast_node_t *body = lam->lambda.body;
             if (!body) continue;
             int mark = locals->count;
+            unsigned mark_gen = g_local_gen;
             for (int k = 0; k < lam->lambda.params.count; k++) {
                 zan_ast_node_t *lp = lam->lambda.params.items[k];
                 zan_type_t *lpt = lp->param.type
@@ -1257,6 +1293,7 @@ static int method_args_score(zan_irgen_t *g, zan_symbol_t *m,
                 bf = expr_family(g, body, locals);
             }
             locals->count = mark;
+            g_local_gen = mark_gen;
             int df = type_family(dp->delegate_ret_type);
             if (bf != FAM_UNKNOWN && df != FAM_UNKNOWN) {
                 if (bf == df) score += 2;
@@ -1452,11 +1489,11 @@ static void check_shared_table_width(zan_irgen_t *g, zan_symbol_t *type_sym,
                   what, (long long)arg->int_val, limit);
 }
 
-static zan_symbol_t *resolve_overload_typed(zan_irgen_t *g,
-                                            zan_symbol_t *type_sym,
-                                            zan_istr_t name,
-                                            zan_ast_node_t *call,
-                                            local_scope_t *locals) {
+static zan_symbol_t *resolve_overload_typed_inner(zan_irgen_t *g,
+                                                  zan_symbol_t *type_sym,
+                                                  zan_istr_t name,
+                                                  zan_ast_node_t *call,
+                                                  local_scope_t *locals) {
     int argc = (call && call->kind == AST_CALL) ? call->call.args.count : 0;
     int type_arg_count = (call && call->kind == AST_CALL)
         ? call->call.type_args.count : 0;
@@ -1527,6 +1564,27 @@ static zan_symbol_t *resolve_overload_typed(zan_irgen_t *g,
         return NULL;
     }
     return resolve_overload(type_sym, name, argc, type_arg_count);
+}
+
+static zan_symbol_t *resolve_overload_typed(zan_irgen_t *g,
+                                            zan_symbol_t *type_sym,
+                                            zan_istr_t name,
+                                            zan_ast_node_t *call,
+                                            local_scope_t *locals) {
+    if (call && (call->in_infer & 2)) return NULL;
+    if (call) call->in_infer |= 2;
+    zan_ast_node_t *recv_obj = (call && call->kind == AST_CALL &&
+                                call->call.callee &&
+                                call->call.callee->kind == AST_MEMBER_ACCESS)
+                               ? call->call.callee->member.object
+                               : NULL;
+    zan_type_t *saved_recv = g->cur_recv_type;
+    if (recv_obj) g->cur_recv_type = infer_expr_type(g, recv_obj, locals);
+    else if (type_sym && type_sym->type) g->cur_recv_type = type_sym->type;
+    zan_symbol_t *res = resolve_overload_typed_inner(g, type_sym, name, call, locals);
+    g->cur_recv_type = saved_recv;
+    if (call) call->in_infer &= ~2;
+    return res;
 }
 
 static zan_symbol_t *resolve_op_overload(zan_irgen_t *g,
@@ -1705,6 +1763,8 @@ static bool g_infer_bailed;
 
 static zan_type_t *infer_expr_type(zan_irgen_t *g, zan_ast_node_t *e,
                                    local_scope_t *locals) {
+    if (!e) return NULL;
+    if (e->in_infer & 1) return NULL;
     infer_cache_slot_t *slot = infer_cache_slot(g, e, locals);
     if (slot && slot->node == e) return slot->type;
     if (g_infer_depth >= ZAN_MAX_INFER_DEPTH) {
@@ -1717,9 +1777,11 @@ static zan_type_t *infer_expr_type(zan_irgen_t *g, zan_ast_node_t *e,
         }
         return NULL;
     }
+    e->in_infer |= 1;
     g_infer_depth++;
     zan_type_t *t = infer_expr_type_uncached(g, e, locals);
     g_infer_depth--;
+    e->in_infer &= ~1;
     slot = infer_cache_slot(g, e, locals);
     if (slot) {
         slot->node = e;

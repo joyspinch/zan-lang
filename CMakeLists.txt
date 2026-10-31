@@ -1278,6 +1278,19 @@ add_test(NAME diag_ctor_missing_parameterless
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_ctor_missing_parameterless PROPERTIES TIMEOUT 60)
 
+# A method group converted to a delegate must match the delegate's signature.
+# The old path accepted any method name for any delegate slot, so
+# `On(name, Handle)` could silently bind a zero-arg overload and the handler
+# received register garbage as its sender (B-ID48).
+add_test(NAME diag_method_group_signature_mismatch
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/method_group_signature_mismatch.zan
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/diag_method_group_signature_mismatch${_exe_ext}
+    "-DEXPECT_REGEX=method .Handle. cannot be converted to delegate type .Act.: signature is not compatible"
+    -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
+set_tests_properties(diag_method_group_signature_mismatch PROPERTIES TIMEOUT 60)
+
 # A unary operator applied to a class/struct without a matching overload must
 # fail with a readable diagnostic. The old path fell into the built-in integer
 # arithmetic and subtracted two struct pointers, which the LLVM verifier
