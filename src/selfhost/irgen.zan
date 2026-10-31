@@ -191,9 +191,15 @@ partial class Irgen {
     public bool crcEmitted; // NativeMemory.Crc32 helper+table emitted once
     public bool crc32cEmitted; // NativeMemory.Crc32C helpers+table emitted once
     public List<string> tidNames; // classes whose @__tid_X global was emitted
+    public List<string> reflMetaNames;
+    public List<string> reflMetaGvs;
+    public int reflMetaSeq;
 
     public Irgen(Binder b, Diags d) {
         binder = b; diags = d;
+        reflMetaNames = new List<string>();
+        reflMetaGvs = new List<string>();
+        reflMetaSeq = 0;
         head = new StringBuilder(); body = new StringBuilder();
         deferred = new StringBuilder(); lamCount = 0;
         entryAllocas = new StringBuilder(); eaActive = false;
@@ -1004,16 +1010,11 @@ partial class Irgen {
             return NmCall("zan_hw_json_scan_string", "i64", "i8*, i64, i64", a, "long");
         }
         if (m == "JsonParseFast" && argc == 7) {
-            ExprVal buf = GenExpr(e.kids[0]); ExprVal len = GenExpr(e.kids[1]);
-            ExprVal slots = GenExpr(e.kids[2]); ExprVal slotCap = GenExpr(e.kids[3]);
-            ExprVal pairs = GenExpr(e.kids[4]); ExprVal pairCap = GenExpr(e.kids[5]);
-            ExprVal counts = GenExpr(e.kids[6]);
-            List<string> a = new List<string>();
-            a.Add(NmAddr(buf, "0")); a.Add(len.op);
-            a.Add(NmAddr(slots, "0")); a.Add(slotCap.op);
-            a.Add(NmAddr(pairs, "0")); a.Add(pairCap.op);
-            a.Add(NmAddr(counts, "0"));
-            return NmCall("zan_hw_json_parse_fast", "i64", "i8*, i64, i8*, i64, i8*, i64, i8*", a, "long");
+            // Selfhost struct arrays are heap object pointer arrays rather than flat C structs.
+            // Returning -2L gracefully falls back to JsonDoc.ParseCore with SIMD scan acceleration.
+            int ai = 0;
+            while (ai < argc) { GenExpr(e.kids[ai]); ai = ai + 1; }
+            return new ExprVal("-2", MkType("long"));
         }
         if (m == "Load64" && argc == 2) {
             // an unaligned 8-byte scalar load
@@ -2426,8 +2427,9 @@ partial class Irgen {
     // The tid global of a container has no source declaration, so it is
     // emitted here (a user class of the same name takes precedence).
     string ContainerTidName(string ty) {
-        if (ty == "List") { return "List"; }
-        if (ty == "Dict" || ty == "Dictionary") { return "Dict"; }
+        if (ty == null) { return ""; }
+        if (ty == "List" || ty.StartsWith("List<")) { return "List"; }
+        if (ty == "Dict" || ty.StartsWith("Dict<") || ty == "Dictionary" || ty.StartsWith("Dictionary<")) { return "Dict"; }
         if (ty == "StringBuilder") { return "StringBuilder"; }
         return "";
     }
@@ -3702,6 +3704,43 @@ partial class Irgen {
         H("  %z = zext i1 %eq to i64");
         H("  ret i64 %z");
         H("}");
+        // Dynamic field metadata lookup: given TypeInfo %ti and string %name,
+        // returns the field's metadata slot pointer { fname, ftype, fkind, foff, ... }, or null if not found.
+        H("define i8* @__zan_refl_field_find(i8* %ti, i8* %name) {");
+        H("entry:");
+        H("  %isnull_ti = icmp eq i8* %ti, null");
+        H("  %isnull_nm = icmp eq i8* %name, null");
+        H("  %bad = or i1 %isnull_ti, %isnull_nm");
+        H("  br i1 %bad, label %miss, label %read");
+        H("read:");
+        H("  %fp_off = getelementptr inbounds i8, i8* %ti, i64 -40");
+        H("  %fp_ptr = bitcast i8* %fp_off to i8**");
+        H("  %fbase = load i8*, i8** %fp_ptr");
+        H("  %fcp_off = getelementptr inbounds i8, i8* %ti, i64 -32");
+        H("  %fcp_ptr = bitcast i8* %fcp_off to i64*");
+        H("  %fcnt = load i64, i64* %fcp_ptr");
+        H("  %noc = icmp sle i64 %fcnt, 0");
+        H("  br i1 %noc, label %miss, label %loop_init");
+        H("loop_init:");
+        H("  br label %loop");
+        H("loop:");
+        H("  %idx = phi i64 [ 0, %loop_init ], [ %next_idx, %step ]");
+        H("  %cur_off = mul i64 %idx, 64");
+        H("  %slot = getelementptr inbounds i8, i8* %fbase, i64 %cur_off");
+        H("  %fn_ptr = bitcast i8* %slot to i8**");
+        H("  %fname = load i8*, i8** %fn_ptr");
+        H("  %eq = call i32 @strcmp(i8* %fname, i8* %name)");
+        H("  %hit = icmp eq i32 %eq, 0");
+        H("  br i1 %hit, label %found, label %step");
+        H("step:");
+        H("  %next_idx = add i64 %idx, 1");
+        H("  %cont = icmp slt i64 %next_idx, %fcnt");
+        H("  br i1 %cont, label %loop, label %miss");
+        H("found:");
+        H("  ret i8* %slot");
+        H("miss:");
+        H("  ret i8* null");
+        H("}");
     }
 
     // is `t` a heap object carrying an ARC header (class/struct instance or one
@@ -3731,6 +3770,25 @@ partial class Irgen {
             L("  " + t + " = bitcast " + lt + " " + val + " to i8*");
             L("  call void @zretain(i8* " + t + ")");
         }
+    }
+
+    void EmitArcRetainObject(string val) {
+        int lnotstr = NL();
+        int lskip = NL();
+        string isNull = NT();
+        L("  " + isNull + " = icmp eq i8* " + val + ", null");
+        L("  br i1 " + isNull + ", label %L" + lskip + ", label %L" + lnotstr);
+        Label(lnotstr);
+        string isStr = NT();
+        L("  " + isStr + " = call i64 @__zan_is_string(i8* " + val + ")");
+        string isZero = NT();
+        L("  " + isZero + " = icmp eq i64 " + isStr + ", 0");
+        int lret = NL();
+        L("  br i1 " + isZero + ", label %L" + lret + ", label %L" + lskip);
+        Label(lret);
+        L("  call void @zretain(i8* " + val + ")");
+        L("  br label %L" + lskip);
+        Label(lskip);
     }
 
     // Retain a value that is stored into a slot.  An ARC-managed slot type
