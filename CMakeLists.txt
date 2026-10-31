@@ -149,6 +149,7 @@ add_executable(zanc
     src/compiler/ast.c
     src/compiler/parser.c
     src/compiler/genmeta.c
+    src/compiler/routegen.c
     src/common/json.c
     src/compiler/nsresolve.c
     src/compiler/binder.c
