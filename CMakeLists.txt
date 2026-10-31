@@ -2634,7 +2634,7 @@ endfunction()
 
 # 用例不走通用 glob 的名字（各自有专属 harness）。这份名单是 glob 跳过逻辑
 # 与"基准文件存在性"守卫的共同真相源：少一处同步，守卫就会误报或漏报。
-set(_conf_skip_cases arc_net_publish embed_compress publish_design_embed)
+set(_conf_skip_cases arc_net_publish embed_compress publish_design_embed shard_deep_refl)
 
 # 已知会漏的用例：泄漏是**既有的**（stdlib 层的 ARC 欠账，见 TASKS.md A495），
 # 旧世界里它们只红在 full 档的 leakcheck 孪生档上——那条档是发布门控，没人
@@ -6193,6 +6193,23 @@ add_test(NAME conformance_arc_net_publish COMMAND ${CMAKE_COMMAND}
   -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_arc_net_publish${_exe_ext}
   -P ${CMAKE_SOURCE_DIR}/tests/run_arcnet.cmake)
 set_tests_properties(conformance_arc_net_publish PROPERTIES TIMEOUT 120)
+
+# ---- publish shard closure completeness (B-ID49) ----
+# A Gui design-doc program compiles with auto-stdlib, so --publish takes the
+# SHARDED main path: its reflection metadata graph nests ~90 globals deep and
+# the old 32-level closure-walk cap silently truncated nested travel globals'
+# dependency walks, leaving a fragment referencing an undefined
+# @__zan.refl.str.N (LLVM parse reject). Requires --auto-stdlib: without it
+# the module stays below the shard threshold and the defect is not exercised.
+add_test(NAME conformance_shard_deep_refl COMMAND ${CMAKE_COMMAND}
+  -DZANC=$<TARGET_FILE:zanc>
+  -DSRC=${CMAKE_SOURCE_DIR}/tests/conformance/shard_deep_refl.zan
+  -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/shard_deep_refl.out
+  -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_shard_deep_refl${_exe_ext}
+  -DWORKDIR=${CMAKE_BINARY_DIR}/test-out
+  -DEXTRA_FLAGS=--auto-stdlib
+  -P ${CMAKE_SOURCE_DIR}/tests/run_arcnet.cmake)
+set_tests_properties(conformance_shard_deep_refl PROPERTIES TIMEOUT 240)
 
 # ---- --embed deflate compression ----
 # A 1200-byte repetitive asset bakes raw-deflate (embedres.c embed_maybe_compress)

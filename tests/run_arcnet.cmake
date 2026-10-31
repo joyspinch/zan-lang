@@ -8,7 +8,9 @@
 #
 # Invoked as:
 #   cmake -DZANC=<zanc> -DSRC=<file.zan> -DEXPECTED=<golden> -DOUT_EXE=<path> \
-#         [-DWORKDIR=<dir>] -P run_arcnet.cmake
+#         [-DWORKDIR=<dir>] [-DEXTRA_FLAGS=<flags>] -P run_arcnet.cmake
+# EXTRA_FLAGS forwards extra zanc flags (e.g. --auto-stdlib for cases that
+# pull Gui packages and need the sharded publish path).
 
 cmake_policy(SET CMP0012 NEW)
 if(NOT ZANC OR NOT SRC OR NOT EXPECTED OR NOT OUT_EXE)
@@ -21,7 +23,7 @@ if(NOT WORKDIR AND CMAKE_SCRIPT_MODE_FILE)
 endif()
 
 execute_process(
-  COMMAND ${ZANC} ${SRC} --publish -o ${OUT_EXE}
+  COMMAND ${ZANC} ${SRC} --publish ${EXTRA_FLAGS} -o ${OUT_EXE}
   RESULT_VARIABLE compile_rc
   OUTPUT_VARIABLE compile_out
   ERROR_VARIABLE  compile_err)
