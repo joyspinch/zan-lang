@@ -37,8 +37,10 @@ if(NOT compile_rc EQUAL 0)
 endif()
 
 # No plaintext of the asset content may survive in the image.
-file(READ ${OUT_EXE} image)
-string(FIND ${image} "THE-QUICK-BROWN-FOX" hit)
+# HEX read: text-mode file(READ) stops at the first NUL byte and any 0x3B
+# in the image list-splits the variable into extra FIND parameters.
+file(READ ${OUT_EXE} image HEX)
+string(FIND ${image} "5448452D515549434B2D42524F574E2D464F58" hit)
 if(NOT hit EQUAL -1)
   message(FATAL_ERROR "the 1200-byte asset is baked uncompressed; deflate compression did not engage")
 endif()

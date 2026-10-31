@@ -1417,6 +1417,8 @@ static zan_type_t *subst_delegate_sig(zan_irgen_t *g, zan_type_t *t,
     bool needs = (t->delegate_ret_type && type_mentions_tp(t->delegate_ret_type));
     for (int i = 0; !needs && i < t->delegate_param_count; i++)
         needs = (t->delegate_param_types[i] && type_mentions_tp(t->delegate_param_types[i]));
+    for (int i = 0; !needs && i < t->type_arg_count; i++)
+        needs = (t->type_args[i] && type_mentions_tp(t->type_args[i]));
     if (!needs) return t;
 
     zan_type_t *out = (zan_type_t *)zan_arena_alloc(g->arena, sizeof(zan_type_t));
@@ -1428,6 +1430,12 @@ static zan_type_t *subst_delegate_sig(zan_irgen_t *g, zan_type_t *t,
         for (int i = 0; i < t->delegate_param_count; i++)
             out->delegate_param_types[i] =
                 subst_type_param_deep(g, t->delegate_param_types[i], recv);
+    }
+    if (t->type_arg_count > 0) {
+        out->type_args = (zan_type_t **)zan_arena_alloc(g->arena,
+            sizeof(zan_type_t *) * (size_t)t->type_arg_count);
+        for (int i = 0; i < t->type_arg_count; i++)
+            out->type_args[i] = subst_type_param_deep(g, t->type_args[i], recv);
     }
     return out;
 }

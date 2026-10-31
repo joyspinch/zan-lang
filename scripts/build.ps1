@@ -41,7 +41,7 @@ if (-not (Test-Path (Join-Path $buildDir 'CMakeCache.txt'))) {
 }
 
 $doConfigure = {
-    & cmake -B $buildDir -G Ninja -DCMAKE_BUILD_TYPE=Release
+    & cmake -B $buildDir -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo
     if ($LASTEXITCODE -ne 0) { throw "cmake configure 失败 exit=$LASTEXITCODE" }
 }
 

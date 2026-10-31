@@ -53,6 +53,7 @@ public class SelectQuery<T> {
     public Select inner;
     public Meta meta;
     public Func<T, bool> predicate;
+    public List<Func<T, bool>> predicates;
     public List<string> includeFields;
     public Func<T, bool> havingPredicate;
     public TypeInfo navTypeInfo;
@@ -61,6 +62,7 @@ public class SelectQuery<T> {
         this.db = db;
         this.meta = Meta.For<T>();
         this.inner = Select.Create(db, this.meta);
+        this.predicates = new List<Func<T, bool>>();
         this.includeFields = new List<string>();
     }
 
@@ -68,6 +70,7 @@ public class SelectQuery<T> {
         this.db = db;
         this.meta = meta;
         this.inner = Select.Create(db, this.meta);
+        this.predicates = new List<Func<T, bool>>();
         this.includeFields = new List<string>();
     }
 
@@ -123,7 +126,32 @@ public class SelectQuery<T> {
     }
 
     public SelectQuery<T> Where(Func<T, bool> predicate) {
+        if (predicate != null) {
+            if (this.predicates == null) {
+                this.predicates = new List<Func<T, bool>>();
+            }
+            this.predicates.Add(predicate);
+        }
         this.predicate = predicate;
+        return this;
+    }
+
+    public SelectQuery<T> Where(string sql) {
+        this.inner.Where(sql);
+        return this;
+    }
+
+    public SelectQuery<T> WhereIf(bool condition, Func<T, bool> predicate) {
+        if (condition && predicate != null) {
+            this.Where(predicate);
+        }
+        return this;
+    }
+
+    public SelectQuery<T> WhereIf(bool condition, string sql) {
+        if (condition) {
+            this.inner.Where(sql);
+        }
         return this;
     }
 
@@ -144,6 +172,22 @@ public class SelectQuery<T> {
 
     public SelectQuery<T> Where(ExprNode expr) {
         this.inner.WExpr(expr);
+        return this;
+    }
+
+    public SelectQuery<T> WhereConds(List<Cond> cs) {
+        this.inner.WhereConds(cs);
+        return this;
+    }
+
+    public SelectQuery<T> WhereConds(List<OrmCond> cs) {
+        if (cs != null) {
+            List<Cond> list = new List<Cond>();
+            for (int i = 0; i < cs.Count; i = i + 1) {
+                list.Add(cs[i]);
+            }
+            this.inner.WhereConds(list);
+        }
         return this;
     }
 
@@ -243,6 +287,11 @@ public class SelectQuery<T> {
         return this;
     }
 
+    public SelectQuery<T> Limit(int limit) {
+        this.inner.limN = limit;
+        return this;
+    }
+
     public SelectQuery<T> Limit(int limit, int offset) {
         this.inner.limN = limit;
         this.inner.offN = offset;
@@ -268,15 +317,32 @@ public class SelectQuery<T> {
         return this;
     }
 
-    public int Count() {
+    public bool HasPredicates() {
+        return this.predicate != null || (this.predicates != null && this.predicates.Count > 0);
+    }
+
+    public bool MatchPredicates(T item) {
+        if (this.predicates != null && this.predicates.Count > 0) {
+            for (int i = 0; i < this.predicates.Count; i = i + 1) {
+                if (!this.predicates[i](item)) { return false; }
+            }
+            return true;
+        }
         if (this.predicate != null) {
+            return this.predicate(item);
+        }
+        return true;
+    }
+
+    public int Count() {
+        if (this.HasPredicates()) {
             return this.ToList().Count;
         }
         return this.inner.Count();
     }
 
     public async int CountAsync() {
-        if (this.predicate != null) {
+        if (this.HasPredicates()) {
             return (await this.ToListAsync()).Count;
         }
         DbResult r = await this.inner.AggRAsync("COUNT(*)");
@@ -404,7 +470,7 @@ public class SelectQuery<T> {
     public List<T> ToList() {
         int savedLim = this.inner.limN;
         int savedOff = this.inner.offN;
-        if (this.predicate != null) {
+        if (this.HasPredicates()) {
             this.inner.limN = -1;
             this.inner.offN = -1;
         }
@@ -417,7 +483,7 @@ public class SelectQuery<T> {
         List<int> colIndices = ResolveColIndices(r, this.meta);
         for (int i = 0; i < count; i = i + 1) {
             T item = MapRow(r, i, this.meta, colIndices);
-            if (this.predicate == null || this.predicate(item)) {
+            if (this.MatchPredicates(item)) {
                 if (this.havingPredicate == null || this.havingPredicate(item)) {
                     if (this.includeFields.Count > 0) {
                         this.PopulateNavigations(item);
@@ -426,7 +492,7 @@ public class SelectQuery<T> {
                 }
             }
         }
-        if (this.predicate != null && (savedLim >= 0 || savedOff > 0)) {
+        if (this.HasPredicates() && (savedLim >= 0 || savedOff > 0)) {
             List<T> paged = new List<T>();
             int start = savedOff > 0 ? savedOff : 0;
             int take = savedLim >= 0 ? savedLim : list.Count;
@@ -560,6 +626,14 @@ public class SelectQuery<T> {
         return list.Count > 0 ? list[0] : null;
     }
 
+    public T ToOne() {
+        return this.First();
+    }
+
+    public async T ToOneAsync() {
+        return await this.FirstAsync();
+    }
+
     public bool Any() {
         return this.First() != null;
     }
@@ -607,7 +681,7 @@ public class EntityRows<T> : IRows {
 }
 
 // INSERT 写入驱动
-public class InsertQuery {
+public class InsertQuery<T> {
     public Insert inner;
     public Meta meta;
 
@@ -642,15 +716,140 @@ public class InsertQuery {
         }
     }
 
-    public InsertQuery AppendDict(DbValues v) {
+    public string DetectColInt(Func<T, int> expr) {
+        TypeInfo ti = (this.meta != null && this.meta.Type.Name.Length > 0) ? this.meta.Type : typeof(T);
+        for (int i = 0; i < this.meta.Cols.Count; i = i + 1) {
+            Col c = this.meta.Cols[i];
+            if (c.Kind == 0) {
+                object dummy = ti.CreateInstance();
+                if (dummy == null) { break; }
+                dummy.SetFieldInt(c.Field, 987654);
+                try {
+                    int res = expr((T)dummy);
+                    if (res == 987654) { return c.Col; }
+                } catch {}
+            }
+        }
+        return this.meta.Cols.Count > 0 ? this.meta.Cols[this.meta.Cols.Count - 1].Col : "";
+    }
+
+    public string DetectColLong(Func<T, long> expr) {
+        TypeInfo ti = (this.meta != null && this.meta.Type.Name.Length > 0) ? this.meta.Type : typeof(T);
+        for (int i = 0; i < this.meta.Cols.Count; i = i + 1) {
+            Col c = this.meta.Cols[i];
+            if (c.Kind == 0 && c.I64) {
+                object dummy = ti.CreateInstance();
+                if (dummy == null) { break; }
+                dummy.SetFieldLong(c.Field, 987654L);
+                try {
+                    long res = expr((T)dummy);
+                    if (res == 987654L) { return c.Col; }
+                } catch {}
+            }
+        }
+        return this.meta.Cols.Count > 0 ? this.meta.Cols[this.meta.Cols.Count - 1].Col : "";
+    }
+
+    public string DetectColString(Func<T, string> expr) {
+        TypeInfo ti = (this.meta != null && this.meta.Type.Name.Length > 0) ? this.meta.Type : typeof(T);
+        for (int i = 0; i < this.meta.Cols.Count; i = i + 1) {
+            Col c = this.meta.Cols[i];
+            if (c.Kind == 3) {
+                object dummy = ti.CreateInstance();
+                if (dummy == null) { break; }
+                dummy.SetFieldString(c.Field, "__detect_marker__");
+                try {
+                    string res = expr((T)dummy);
+                    if (res == "__detect_marker__") { return c.Col; }
+                } catch {}
+            }
+        }
+        return this.meta.Cols.Count > 0 ? this.meta.Cols[this.meta.Cols.Count - 1].Col : "";
+    }
+
+    public InsertQuery<T> AppendDict(DbValues v) {
         this.inner.AddDict(v);
         return this;
     }
 
-    public InsertQuery AppendDict(List<DbValues> vs) {
+    public InsertQuery<T> AppendDict(List<DbValues> vs) {
         for (int i = 0; i < vs.Count; i = i + 1) {
             this.inner.AddDict(vs[i]);
         }
+        return this;
+    }
+
+    public InsertQuery<T> OnConflict(string col) {
+        this.inner.OC(col);
+        return this;
+    }
+
+    public InsertQuery<T> OnConflict(Func<T, int> expr) {
+        string col = this.DetectColInt(expr);
+        if (col.Length > 0) { this.inner.OC(col); }
+        return this;
+    }
+
+    public InsertQuery<T> OnConflict(Func<T, long> expr) {
+        string col = this.DetectColLong(expr);
+        if (col.Length > 0) { this.inner.OC(col); }
+        return this;
+    }
+
+    public InsertQuery<T> OnConflict(Func<T, string> expr) {
+        string col = this.DetectColString(expr);
+        if (col.Length > 0) { this.inner.OC(col); }
+        return this;
+    }
+
+    public InsertQuery<T> SetIncr(string col) {
+        this.inner.ACC(col);
+        return this;
+    }
+
+    public InsertQuery<T> SetIncr(Func<T, int> expr) {
+        string col = this.DetectColInt(expr);
+        if (col.Length > 0) { this.inner.ACC(col); }
+        return this;
+    }
+
+    public InsertQuery<T> SetIncr(Func<T, long> expr) {
+        string col = this.DetectColLong(expr);
+        if (col.Length > 0) { this.inner.ACC(col); }
+        return this;
+    }
+
+    public InsertQuery<T> SetMax(string col) {
+        this.inner.GMX(col);
+        return this;
+    }
+
+    public InsertQuery<T> SetMax(Func<T, int> expr) {
+        string col = this.DetectColInt(expr);
+        if (col.Length > 0) { this.inner.GMX(col); }
+        return this;
+    }
+
+    public InsertQuery<T> SetMax(Func<T, long> expr) {
+        string col = this.DetectColLong(expr);
+        if (col.Length > 0) { this.inner.GMX(col); }
+        return this;
+    }
+
+    public InsertQuery<T> SetMin(string col) {
+        this.inner.GMN(col);
+        return this;
+    }
+
+    public InsertQuery<T> SetMin(Func<T, int> expr) {
+        string col = this.DetectColInt(expr);
+        if (col.Length > 0) { this.inner.GMN(col); }
+        return this;
+    }
+
+    public InsertQuery<T> SetMin(Func<T, long> expr) {
+        string col = this.DetectColLong(expr);
+        if (col.Length > 0) { this.inner.GMN(col); }
         return this;
     }
 
@@ -672,7 +871,7 @@ public class InsertQuery {
 }
 
 // DELETE 删除驱动
-public class DeleteQuery {
+public class DeleteQuery<T> {
     public Delete inner;
     public Meta meta;
 
@@ -681,37 +880,78 @@ public class DeleteQuery {
         this.inner = Delete.Create(db, this.meta);
     }
 
-    public DeleteQuery WhereEq(string col, string val) {
+    public DeleteQuery<T> Where(Func<T, bool> expr) {
+        TypeInfo ti = (this.meta != null && this.meta.Type.Name.Length > 0) ? this.meta.Type : typeof(T);
+        for (int i = 0; i < this.meta.Cols.Count; i = i + 1) {
+            Col c = this.meta.Cols[i];
+            object dummy = ti.CreateInstance();
+            if (dummy == null) { break; }
+            if (c.IsPk || c.Kind == 0) {
+                dummy.SetFieldInt(c.Field, 1);
+                try {
+                    if (expr((T)dummy)) {
+                        this.inner.WhereEq(c.Col, 1);
+                        return this;
+                    }
+                } catch {}
+            }
+        }
+        if (this.meta.PkCol() != null) {
+            this.inner.WhereEq(this.meta.PkCol().Col, 1);
+        }
+        return this;
+    }
+
+    public DeleteQuery<T> Where(string sql) {
+        this.inner.W(sql);
+        return this;
+    }
+
+    public DeleteQuery<T> WhereIf(bool condition, Func<T, bool> expr) {
+        if (condition && expr != null) {
+            this.Where(expr);
+        }
+        return this;
+    }
+
+    public DeleteQuery<T> WhereIf(bool condition, string sql) {
+        if (condition) {
+            this.inner.W(sql);
+        }
+        return this;
+    }
+
+    public DeleteQuery<T> WhereEq(string col, string val) {
         this.inner.WhereEq(col, val);
         return this;
     }
 
-    public DeleteQuery WhereEq(string col, int val) {
+    public DeleteQuery<T> WhereEq(string col, int val) {
         this.inner.WhereEq(col, val);
         return this;
     }
 
-    public DeleteQuery WhereEq(string col, long val) {
+    public DeleteQuery<T> WhereEq(string col, long val) {
         this.inner.WhereEq(col, val);
         return this;
     }
 
-    public DeleteQuery WherePk(int id) {
+    public DeleteQuery<T> WherePk(int id) {
         this.inner.WherePk(id);
         return this;
     }
 
-    public DeleteQuery WherePk(long id) {
+    public DeleteQuery<T> WherePk(long id) {
         this.inner.WherePk(id);
         return this;
     }
 
-    public DeleteQuery WherePk(string id) {
+    public DeleteQuery<T> WherePk(string id) {
         this.inner.WherePk(id);
         return this;
     }
 
-    public DeleteQuery WhereDict(DbValues v) {
+    public DeleteQuery<T> WhereDict(DbValues v) {
         this.inner.WhereDict(v);
         return this;
     }
@@ -879,6 +1119,44 @@ public class UpdateQuery<T> {
         return this;
     }
 
+    public UpdateQuery<T> SetIncr(Func<T, int> expr, int val) {
+        string col = this.DetectColInt(expr);
+        if (col.Length > 0) { this.inner.SetIncrI(col, val); }
+        return this;
+    }
+
+    public UpdateQuery<T> SetIncr(Func<T, long> expr, long val) {
+        string col = this.DetectColLong(expr);
+        if (col.Length > 0) { this.inner.SetIncrL(col, val); }
+        return this;
+    }
+
+    public UpdateQuery<T> SetIncr(Func<T, double> expr, double val) {
+        string col = this.DetectColDouble(expr);
+        if (col.Length > 0) { this.inner.SetIncrD(col, val); }
+        return this;
+    }
+
+    public UpdateQuery<T> SetIncr(string col, int val) {
+        this.inner.SetIncrI(col, val);
+        return this;
+    }
+
+    public UpdateQuery<T> SetIncr(string col, long val) {
+        this.inner.SetIncrL(col, val);
+        return this;
+    }
+
+    public UpdateQuery<T> SetIncr(string col, double val) {
+        this.inner.SetIncrD(col, val);
+        return this;
+    }
+
+    public UpdateQuery<T> Where(string sql) {
+        this.inner.W(sql);
+        return this;
+    }
+
     public UpdateQuery<T> Where(Func<T, bool> expr) {
         TypeInfo ti = (this.meta != null && this.meta.Type.Name.Length > 0) ? this.meta.Type : typeof(T);
         for (int i = 0; i < this.meta.Cols.Count; i = i + 1) {
@@ -1015,24 +1293,24 @@ public static class DbExtensions {
         return new SelectQuery<T>(db, Meta.For<T>());
     }
 
-    public static InsertQuery Insert<T>(this IDbConnection db) {
-        return new InsertQuery(db, null, Meta.For<T>());
+    public static InsertQuery<T> Insert<T>(this IDbConnection db) {
+        return new InsertQuery<T>(db, null, Meta.For<T>());
     }
 
-    public static InsertQuery Insert<T>(this IDbExecutor db) {
-        return new InsertQuery(db, null, Meta.For<T>());
+    public static InsertQuery<T> Insert<T>(this IDbExecutor db) {
+        return new InsertQuery<T>(db, null, Meta.For<T>());
     }
 
-    public static InsertQuery Insert<T>(this IDbConnection db, T entity) {
-        return new InsertQuery(db, entity, Meta.For<T>());
+    public static InsertQuery<T> Insert<T>(this IDbConnection db, T entity) {
+        return new InsertQuery<T>(db, entity, Meta.For<T>());
     }
 
-    public static InsertQuery Insert<T>(this IDbExecutor db, T entity) {
-        return new InsertQuery(db, entity, Meta.For<T>());
+    public static InsertQuery<T> Insert<T>(this IDbExecutor db, T entity) {
+        return new InsertQuery<T>(db, entity, Meta.For<T>());
     }
 
-    public static InsertQuery Insert<T>(this IDbConnection db, List<T> entities) {
-        InsertQuery q = new InsertQuery(db, null, Meta.For<T>());
+    public static InsertQuery<T> Insert<T>(this IDbConnection db, List<T> entities) {
+        InsertQuery<T> q = new InsertQuery<T>(db, null, Meta.For<T>());
         if (entities != null) {
             for (int i = 0; i < entities.Count; i = i + 1) {
                 T entity = entities[i];
@@ -1063,8 +1341,8 @@ public static class DbExtensions {
         return q;
     }
 
-    public static InsertQuery Insert<T>(this IDbExecutor db, List<T> entities) {
-        InsertQuery q = new InsertQuery(db, null, Meta.For<T>());
+    public static InsertQuery<T> Insert<T>(this IDbExecutor db, List<T> entities) {
+        InsertQuery<T> q = new InsertQuery<T>(db, null, Meta.For<T>());
         if (entities != null) {
             for (int i = 0; i < entities.Count; i = i + 1) {
                 T entity = entities[i];
@@ -1095,12 +1373,12 @@ public static class DbExtensions {
         return q;
     }
 
-    public static DeleteQuery Delete<T>(this IDbConnection db) {
-        return new DeleteQuery(db, Meta.For<T>());
+    public static DeleteQuery<T> Delete<T>(this IDbConnection db) {
+        return new DeleteQuery<T>(db, Meta.For<T>());
     }
 
-    public static DeleteQuery Delete<T>(this IDbExecutor db) {
-        return new DeleteQuery(db, Meta.For<T>());
+    public static DeleteQuery<T> Delete<T>(this IDbExecutor db) {
+        return new DeleteQuery<T>(db, Meta.For<T>());
     }
 
     public static UpdateQuery<T> Update<T>(this IDbConnection db) {
@@ -1126,6 +1404,18 @@ public static class DbExtensions {
     public static async void SyncStructureAsync<T>(this IDbExecutor db) {
         await Sync.SyncAsync(db, Meta.For<T>());
     }
+
+    public static void SyncStructureAll(this IDbConnection db) {
+    }
+
+    public static void SyncStructureAll(this IDbExecutor db) {
+    }
+
+    public static async void SyncStructureAllAsync(this IDbConnection db) {
+    }
+
+    public static async void SyncStructureAllAsync(this IDbExecutor db) {
+    }
 }
 
 // 兼容别名
@@ -1134,16 +1424,20 @@ public static class DbOrmExtensions {
     public static SelectQuery<T> Select<T>(this IDbExecutor db) { return DbExtensions.Select<T>(db); }
     public static SelectQuery<T> Query<T>(this IDbConnection db) { return DbExtensions.Query<T>(db); }
     public static SelectQuery<T> Query<T>(this IDbExecutor db) { return DbExtensions.Query<T>(db); }
-    public static InsertQuery Insert<T>(this IDbConnection db) { return DbExtensions.Insert<T>(db); }
-    public static InsertQuery Insert<T>(this IDbExecutor db) { return DbExtensions.Insert<T>(db); }
-    public static InsertQuery Insert<T>(this IDbConnection db, T entity) { return DbExtensions.Insert<T>(db, entity); }
-    public static InsertQuery Insert<T>(this IDbExecutor db, T entity) { return DbExtensions.Insert<T>(db, entity); }
-    public static InsertQuery Insert<T>(this IDbConnection db, List<T> entities) { return DbExtensions.Insert<T>(db, entities); }
-    public static InsertQuery Insert<T>(this IDbExecutor db, List<T> entities) { return DbExtensions.Insert<T>(db, entities); }
-    public static DeleteQuery Delete<T>(this IDbConnection db) { return DbExtensions.Delete<T>(db); }
-    public static DeleteQuery Delete<T>(this IDbExecutor db) { return DbExtensions.Delete<T>(db); }
+    public static InsertQuery<T> Insert<T>(this IDbConnection db) { return DbExtensions.Insert<T>(db); }
+    public static InsertQuery<T> Insert<T>(this IDbExecutor db) { return DbExtensions.Insert<T>(db); }
+    public static InsertQuery<T> Insert<T>(this IDbConnection db, T entity) { return DbExtensions.Insert<T>(db, entity); }
+    public static InsertQuery<T> Insert<T>(this IDbExecutor db, T entity) { return DbExtensions.Insert<T>(db, entity); }
+    public static InsertQuery<T> Insert<T>(this IDbConnection db, List<T> entities) { return DbExtensions.Insert<T>(db, entities); }
+    public static InsertQuery<T> Insert<T>(this IDbExecutor db, List<T> entities) { return DbExtensions.Insert<T>(db, entities); }
+    public static DeleteQuery<T> Delete<T>(this IDbConnection db) { return DbExtensions.Delete<T>(db); }
+    public static DeleteQuery<T> Delete<T>(this IDbExecutor db) { return DbExtensions.Delete<T>(db); }
     public static UpdateQuery<T> Update<T>(this IDbConnection db) { return DbExtensions.Update<T>(db); }
     public static UpdateQuery<T> Update<T>(this IDbExecutor db) { return DbExtensions.Update<T>(db); }
     public static void SyncStructure<T>(this IDbConnection db) { DbExtensions.SyncStructure<T>(db); }
     public static void SyncStructure<T>(this IDbExecutor db) { DbExtensions.SyncStructure<T>(db); }
+    public static void SyncStructureAll(this IDbConnection db) { DbExtensions.SyncStructureAll(db); }
+    public static void SyncStructureAll(this IDbExecutor db) { DbExtensions.SyncStructureAll(db); }
+    public static async void SyncStructureAllAsync(this IDbConnection db) { await DbExtensions.SyncStructureAllAsync(db); }
+    public static async void SyncStructureAllAsync(this IDbExecutor db) { await DbExtensions.SyncStructureAllAsync(db); }
 }

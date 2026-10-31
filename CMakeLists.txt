@@ -2633,7 +2633,7 @@ endfunction()
 
 # 用例不走通用 glob 的名字（各自有专属 harness）。这份名单是 glob 跳过逻辑
 # 与"基准文件存在性"守卫的共同真相源：少一处同步，守卫就会误报或漏报。
-set(_conf_skip_cases arc_net_publish embed_compress)
+set(_conf_skip_cases arc_net_publish embed_compress publish_design_embed)
 
 # 已知会漏的用例：泄漏是**既有的**（stdlib 层的 ARC 欠账，见 TASKS.md A495），
 # 旧世界里它们只红在 full 档的 leakcheck 孪生档上——那条档是发布门控，没人
@@ -6207,6 +6207,22 @@ add_test(NAME conformance_embed_compress COMMAND ${CMAKE_COMMAND}
   -DWORKDIR=${CMAKE_BINARY_DIR}
   -P ${CMAKE_SOURCE_DIR}/tests/run_embed_compress.cmake)
 set_tests_properties(conformance_embed_compress PROPERTIES TIMEOUT 180)
+
+# ---- publish-time design html auto-embed ----
+# A project whose source carries the DesignDoc. token gets its src/*.html
+# discovered and encrypted into the publish image automatically (no
+# --embed). The runner stages a mini project, fails if the design's
+# plaintext survives in the exe, and runs it from a directory without
+# src/ so the read exercises the embedded copy. An html under the skipped
+# src/docs subtree must stay out (EmbeddedNames count).
+add_test(NAME conformance_publish_design_embed COMMAND ${CMAKE_COMMAND}
+  -DZANC=$<TARGET_FILE:zanc>
+  -DSRC=${CMAKE_SOURCE_DIR}/tests/conformance/publish_design_embed.zan
+  -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/publish_design_embed.out
+  -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_publish_design_embed${_exe_ext}
+  -DWORKDIR=${CMAKE_BINARY_DIR}
+  -P ${CMAKE_SOURCE_DIR}/tests/run_publish_design_embed.cmake)
+set_tests_properties(conformance_publish_design_embed PROPERTIES TIMEOUT 180)
 
 # ---- Published-size budgets (docs/archive/embedded_runtime_assessment.md) ----
 # A minimal --publish build must stay small: a reintroduced fixed static

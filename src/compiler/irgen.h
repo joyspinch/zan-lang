@@ -280,6 +280,7 @@ struct zan_irgen {
 
     zan_type_t *collect_inst_ctx;
     zan_type_t *cur_inst;   /* 当前泛型类单态化实例化上下文 */
+    zan_type_t *cur_recv_type;
     struct zan_generic_fn {
         zan_symbol_t *msym;
         zan_type_t  **args;

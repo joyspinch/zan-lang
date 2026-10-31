@@ -7,6 +7,7 @@
 #include "parser.h"
 #include "genmeta.h"
 #include "nsresolve.h"
+#include "routegen.h"
 #include "ast.h"
 #include "binder.h"
 #include "checker.h"
@@ -2349,6 +2350,63 @@ static bool zan_file_exists(const char *path) {
 #endif
 }
 
+/* ---------- 发布态设计稿自动内嵌（门控与工程根解析） ---------- */
+
+/* 输入源里出现 Gui 设计稿通道的记号（DesignDoc.）才启用自动内嵌：
+ * 服务端/web 程序的 html 是运行期盘上资产，绝不能烘死进 exe。 */
+static bool zan_inputs_use_design_doc(const char *const *input_files,
+                                      int input_count) {
+    for (int fi = 0; fi < input_count; fi++) {
+        if (zan_is_zcomp_path(input_files[fi])) continue;
+        size_t len = 0;
+        char *src = read_file(input_files[fi], &len);
+        if (!src) continue;
+        bool hit = strstr(src, "DesignDoc.") != NULL;
+        free(src);
+        if (hit) return true;
+    }
+    return false;
+}
+
+/* 输入文件所属工程根：向上找最近的 zan.proj 祖先目录；散文件编译
+ * 退回输入所在目录。不向上吞 packages/ 祖先（package_project_root
+ * 的规则会把仓库内构建的整个仓库指成设计根）。 */
+static void zan_design_root_for(const char *input, char *out, size_t sz) {
+    /* 先解析成绝对路径：相对输入（如 src\App.zan）剥掉文件名后，
+     * "src" 这样的单段目录无法在字符串上继续向上行。 */
+    char abs[1024];
+#ifdef _WIN32
+    if (!zan_utf8_full_path(input, abs, sizeof(abs)))
+        snprintf(abs, sizeof(abs), "%s", input);
+#else
+    if (realpath(input, abs) == NULL)
+        snprintf(abs, sizeof(abs), "%s", input);
+#endif
+    char dir[1024];
+    snprintf(dir, sizeof(dir), "%s", abs);
+    char *fwd = strrchr(dir, '/');
+    char *back = strrchr(dir, '\\');
+    char *sep = (fwd && fwd > back) ? fwd : back;
+    if (sep) *sep = '\0';
+    else snprintf(dir, sizeof(dir), ".");
+    for (;;) {
+        char probe[1200];
+        snprintf(probe, sizeof(probe), "%s/zan.proj", dir);
+        if (zan_file_exists(probe)) break;
+        fwd = strrchr(dir, '/');
+        back = strrchr(dir, '\\');
+        char *last = (fwd && fwd > back) ? fwd : back;
+        if (!last) break;
+        if (last == dir) {
+            if (dir[1] == '\0') break;      /* 已到文件系统根 "/" */
+            dir[1] = '\0';                  /* 收敛到 "/" 再试一次 */
+            continue;
+        }
+        *last = '\0';
+    }
+    snprintf(out, sz, "%s", dir);
+}
+
 static void zan_extract_json_str(const char *line, const char *key, char *out, size_t outsz) {
     out[0] = '\0';
     char needle[64];
@@ -3161,6 +3219,8 @@ int main(int argc, char **argv) {
         }
         zan_compile_trace("nsresolve generated");
         zan_nsresolve_run(ast, arena, diag);
+        zan_compile_trace("routegen");
+        zan_routegen_run(ast, arena, diag);
         zan_compile_trace("prune");
         zan_nsresolve_prune(ast, arena, diag);
         phase("prune");
@@ -4044,6 +4104,36 @@ int main(int argc, char **argv) {
                         free(pinyin_spec);
                     }
                 }
+            }
+        }
+
+        /* 设计稿：--publish 且源码走 DesignDoc 通道时，把工程 src/ 下的
+         * *.html 自动加密内嵌进 exe——发布态界面资产不留在盘上。 */
+        if (publish_mode && zan_inputs_use_design_doc(input_files, input_count)) {
+            char design_root[1024];
+            zan_design_root_for(input_files[0], design_root, sizeof(design_root));
+            static char design_specs[256][1300];
+            int nd = zan_embed_collect_design_html(design_root, design_specs, 256);
+            if (nd < 0) {
+                fprintf(stderr, "warning: more than 256 design html files "
+                        "under '%s/src'; only the first 256 are embedded\n",
+                        design_root);
+                nd = 256;
+            }
+            for (int di = 0; di < nd; di++) {
+                if (embed_spec_count < ZAN_MAX_EMBED_SPECS) {
+                    embed_specs[embed_spec_count++] = design_specs[di];
+                } else {
+                    fprintf(stderr, "warning: cannot auto-embed design html "
+                            "from '%s/src'; --embed resources limit reached\n",
+                            design_root);
+                    break;
+                }
+            }
+            if (nd > 0) {
+                fprintf(stderr, "note: auto-embedded %d design html file(s) "
+                        "from '%s/src' (encrypted in publish output)\n",
+                        nd, design_root);
             }
         }
 

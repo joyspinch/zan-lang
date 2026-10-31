@@ -11,7 +11,7 @@
 # 说明：直接调 zanc 编译（不经 cmake --build），不与构建闸互斥；
 #   可执行文件落在 _scratch\pkg_tests\（git-ignored，固定名可复用）。
 param([string]$Filter = "")
-$ErrorActionPreference = "Stop"
+$ErrorActionPreference = "Continue"
 $repo = Split-Path -Parent $PSScriptRoot
 $zanc = Join-Path $repo "build\zanc.exe"
 if (-not (Test-Path $zanc)) {

@@ -467,10 +467,24 @@ static void pi_scan_file(pi_file_t *f) {
             if (depth > 0) depth--;
             break;
         case TK_LBRACKET: {
-            zan_token_t next = zan_lexer_peek(&lex);
-            if (next.kind == TK_IDENT) {
-                /* 凡声明了任何 Attribute 注解（如 [Route]、[Table]、[Test] 等）的实体/类型，天然具有反射或元数据用途，保留为不可裁剪根 */
-                f->has_controller = 1;
+            if (depth <= 1 && (prev == TK_EOF || prev == TK_SEMICOLON ||
+                               prev == TK_RBRACE || prev == TK_LBRACE ||
+                               prev == TK_RBRACKET)) {
+                zan_token_t next = zan_lexer_peek(&lex);
+                if (next.kind == TK_IDENT) {
+                    if ((next.str_val.len == 5 && memcmp(next.str_val.str, "Route", 5) == 0) ||
+                        (next.str_val.len == 13 && memcmp(next.str_val.str, "ApiController", 13) == 0) ||
+                        (next.str_val.len == 5 && memcmp(next.str_val.str, "Table", 5) == 0) ||
+                        (next.str_val.len == 6 && memcmp(next.str_val.str, "Custom", 6) == 0) ||
+                        (next.str_val.len == 7 && memcmp(next.str_val.str, "HttpGet", 7) == 0) ||
+                        (next.str_val.len == 8 && memcmp(next.str_val.str, "HttpPost", 8) == 0) ||
+                        (next.str_val.len == 7 && memcmp(next.str_val.str, "HttpPut", 7) == 0) ||
+                        (next.str_val.len == 10 && memcmp(next.str_val.str, "HttpDelete", 10) == 0) ||
+                        (next.str_val.len == 9 && memcmp(next.str_val.str, "HttpPatch", 9) == 0) ||
+                        (next.str_val.len == 4 && memcmp(next.str_val.str, "Test", 4) == 0)) {
+                        f->has_controller = 1;
+                    }
+                }
             }
             break;
         }

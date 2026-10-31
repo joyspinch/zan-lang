@@ -129,6 +129,33 @@ static zan_symbol_t *scope_find(zan_scope_t *scope, zan_istr_t name) {
     return NULL;
 }
 
+static bool sym_is_type(zan_symbol_t *sym) {
+    if (!sym) return false;
+    return sym->kind == SYM_CLASS ||
+           sym->kind == SYM_STRUCT ||
+           sym->kind == SYM_INTERFACE ||
+           sym->kind == SYM_ENUM ||
+           sym->kind == SYM_TYPE_PARAM ||
+           sym->kind == SYM_DELEGATE;
+}
+
+static zan_symbol_t *scope_find_type(zan_scope_t *scope, zan_istr_t name) {
+    uint32_t h = istr_hash(name);
+    for (zan_scope_t *s = scope; s; s = s->parent) {
+        if (!s->bucket_count) continue;
+        zan_symbol_t *sym = s->buckets[h & (uint32_t)(s->bucket_count - 1)];
+        for (; sym; sym = sym->hash_next) {
+            if (sym->name.len == name.len &&
+                memcmp(sym->name.str, name.str, (size_t)name.len) == 0) {
+                if (sym_is_type(sym)) {
+                    return sym;
+                }
+            }
+        }
+    }
+    return NULL;
+}
+
 void zan_binder_init(zan_binder_t *b, zan_arena_t *arena, zan_diag_t *diag) {
     memset(b, 0, sizeof(*b));
     b->arena = arena;
@@ -890,7 +917,7 @@ zan_type_t *zan_binder_resolve_type(zan_binder_t *b, zan_ast_node_t *type_ref) {
     else if (istr_eq(name, "Func", 4) || istr_eq(name, "Action", 6))
         base = make_type(b->arena, TYPE_DELEGATE, name.str, name.len);
     else {
-        zan_symbol_t *sym = scope_find(b->current_scope, name);
+        zan_symbol_t *sym = scope_find_type(b->current_scope, name);
         if (sym) base = sym->type;
     }
 

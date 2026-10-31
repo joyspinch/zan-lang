@@ -1533,6 +1533,7 @@ static void infer_method_tp_bindings(zan_irgen_t *g, zan_symbol_t *msym,
         if (a->lambda.params.count != dp->delegate_param_count) continue;
         zan_type_t *sdp = subst_method_tp(g, dp, tps, bind);
         int mark = locals->count;
+        unsigned mark_gen = g_local_gen;
         bool params_known = true;
         for (int k = 0; k < a->lambda.params.count; k++) {
             zan_ast_node_t *lp = a->lambda.params.items[k];
@@ -1569,6 +1570,7 @@ static void infer_method_tp_bindings(zan_irgen_t *g, zan_symbol_t *msym,
                 unify_method_tp(dp->delegate_ret_type, bt, tps, bind);
         }
         locals->count = mark;
+        g_local_gen = mark_gen;
     }
 }
 
@@ -1581,8 +1583,9 @@ static zan_type_t *method_param_type_at(zan_irgen_t *g, zan_symbol_t *msym,
     if (!pt) return pt;
     /* 外层泛型类类型形参代换 */
     if (pt->kind == TYPE_DELEGATE) {
-        zan_type_t *recv = recv_expr ? infer_expr_type(g, recv_expr, locals)
-                                     : g->cur_inst;
+        zan_type_t *recv = g->cur_recv_type ? g->cur_recv_type
+                         : (recv_expr ? infer_expr_type(g, recv_expr, locals)
+                                      : g->cur_inst);
         if (recv && recv->type_arg_count > 0)
             pt = subst_delegate_sig(g, pt, recv);
     }

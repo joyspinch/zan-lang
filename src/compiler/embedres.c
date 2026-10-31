@@ -239,6 +239,128 @@ static void embed_walk_filtered(zan_embed_list_t *l, const char *dir,
     embed_walk_filtered_impl(l, dir, name, 1, filter, filter_count);
 }
 
+/* ---------- 发布态设计稿自动发现 ----------
+ * Gui 程序的界面设计稿（*.html）在 --publish 时必须随 exe 走（发布态
+ * 加密内嵌，不留在盘上）。这里只负责按工程根收集候选：
+ *   - 只扫 <root>/src（设计稿与源码同源的工程布局约定）；
+ *   - 跳表排除构建产物、依赖副本与文档测试等非设计稿 html；
+ *   - spec 形如 "<绝对路径>=<工程根相对路径>"，相对段用 '/'，
+ *     与 DesignDoc.Load 的查找名一致。
+ * 是否启用由 main.c 的门控决定（publish 模式 + 源码出现 DesignDoc.
+ * 记号）——服务端/web 程序的 html 是运行期盘上资产，绝不自动内嵌。 */
+
+static int embed_design_dir_skipped(const char *leaf) {
+    static const char *const skip[] = {
+        ".git", ".svn", ".hg", "build", "dist", "bin", "obj", "out",
+        "node_modules", "packages", ".zan-packages", "_scratch",
+        "docs", "doc", "tests", "test", ".idea", ".vs",
+    };
+    for (size_t i = 0; i < sizeof(skip) / sizeof(skip[0]); i++)
+        if (strcmp(leaf, skip[i]) == 0) return 1;
+    return 0;
+}
+
+static int embed_tail_eq_ci(const char *leaf, const char *tail) {
+    size_t ln = strlen(leaf), lt = strlen(tail);
+    if (ln < lt) return 0;
+    for (size_t i = 0; i < lt; i++) {
+        char a = leaf[ln - lt + i];
+        if (a >= 'A' && a <= 'Z') a = (char)(a - 'A' + 'a');
+        if (a != tail[i]) return 0;
+    }
+    return 1;
+}
+
+typedef struct {
+    char (*specs)[1300];
+    int max_specs;
+    int count;
+    int truncated;
+} design_scan_t;
+
+static void design_scan_impl(design_scan_t *s, const char *dir,
+                             const char *rel, int depth) {
+    if (s->truncated || depth > 24) return;
+#ifdef _WIN32
+    char pattern[1024];
+    snprintf(pattern, sizeof(pattern), "%s\\*", dir);
+    wchar_t *wide_pattern = zan_utf8_to_wide_alloc(pattern);
+    if (!wide_pattern) return;
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileW(wide_pattern, &fd);
+    free(wide_pattern);
+    if (h == INVALID_HANDLE_VALUE) return;
+    do {
+        char *file_name = zan_wide_to_utf8_alloc(fd.cFileName);
+        if (!file_name) continue;
+        if (strcmp(file_name, ".") == 0 || strcmp(file_name, "..") == 0) {
+            free(file_name);
+            continue;
+        }
+        char path[1024];
+        snprintf(path, sizeof(path), "%s\\%s", dir, file_name);
+        char *sub = embed_join(rel, file_name);
+        free(file_name);
+        if (!sub) continue;
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) { free(sub); continue; }
+            const char *leaf = strrchr(sub, '/');
+            leaf = leaf ? leaf + 1 : sub;
+            if (!embed_design_dir_skipped(leaf))
+                design_scan_impl(s, path, sub, depth + 1);
+        } else if (embed_tail_eq_ci(sub, ".html") ||
+                   embed_tail_eq_ci(sub, ".htm")) {
+            if (s->count >= s->max_specs) { s->truncated = 1; free(sub); break; }
+            snprintf(s->specs[s->count], 1300, "%s=src/%s", path, sub);
+            s->count++;
+        }
+        free(sub);
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+#else
+    DIR *d = opendir(dir);
+    if (!d) return;
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL) {
+        if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0)
+            continue;
+        char path[1024];
+        snprintf(path, sizeof(path), "%s/%s", dir, e->d_name);
+        struct stat st;
+        if (lstat(path, &st) != 0) continue;
+        char *sub = embed_join(rel, e->d_name);
+        if (!sub) continue;
+        if (S_ISDIR(st.st_mode)) {
+            if (S_ISLNK(st.st_mode)) { free(sub); continue; }
+            const char *leaf = strrchr(sub, '/');
+            leaf = leaf ? leaf + 1 : sub;
+            if (!embed_design_dir_skipped(leaf))
+                design_scan_impl(s, path, sub, depth + 1);
+        } else if (S_ISREG(st.st_mode) &&
+                   (embed_tail_eq_ci(sub, ".html") ||
+                    embed_tail_eq_ci(sub, ".htm"))) {
+            if (s->count >= s->max_specs) { s->truncated = 1; free(sub); break; }
+            snprintf(s->specs[s->count], 1300, "%s=src/%s", path, sub);
+            s->count++;
+        }
+        free(sub);
+    }
+    closedir(d);
+#endif
+}
+
+int zan_embed_collect_design_html(const char *project_root,
+                                  char (*specs)[1300], int max_specs) {
+    char src_dir[1024];
+    snprintf(src_dir, sizeof(src_dir), "%s/src", project_root);
+    design_scan_t s;
+    memset(&s, 0, sizeof(s));
+    s.specs = specs;
+    s.max_specs = max_specs;
+    design_scan_impl(&s, src_dir, "", 1);
+    return s.truncated ? -1 : s.count;
+}
+
 static int embed_is_dir(const char *path) {
 #ifdef _WIN32
     DWORD a = zan_utf8_get_file_attributes(path);

@@ -18,7 +18,7 @@ param(
     [switch]$DryRun,
     [switch]$Json,
     [switch]$KeepTree,
-    [int]$TimeoutSec = 240
+    [int]$TimeoutSec = 600
 )
 
 $ErrorActionPreference = 'Stop'
@@ -142,12 +142,11 @@ foreach ($t in $tpls) {
         }
     }
 
-    # 输入：src 下全部 .zan（多文件必须逐一枚举）+ 全部 .html 设计稿
-    # （zanc 不自动发现入口旁的 .html，设计器生成的控件字段全靠它）
+    # 输入：src 下全部 .zan（多文件必须逐一枚举）
+    # （编译期 HTML 代码生成已在 f896826d3 废除，HTML 改由运行期通过 Gui.App.LoadHtml 等动态加载，zanc 只接收 .zan 源码）
     $srcDir = Join-Path $dst 'src'
     $scan = if (Test-Path $srcDir) { $srcDir } else { $dst }
     $inputs = @(Get-ChildItem -Recurse -File -Filter *.zan $scan | ForEach-Object { $_.FullName -replace '\\', '/' })
-    $inputs += @(Get-ChildItem -Recurse -File $scan -Include *.html, *.htm -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName -replace '\\', '/' })
     $inputs = $inputs | Where-Object { $_ } | Sort-Object -Unique
     if ($entryRel) { $entryRel = $entryRel.Replace('{{NAME}}', $Name) }
     if ($inputs.Count -eq 0) {
@@ -166,7 +165,11 @@ foreach ($t in $tpls) {
     if (-not $ok) { $failed++ }
     $detail =
         if ($ok) { (($r.text -split "`n" | Where-Object { $_ -match '^Compiled' } | Select-Object -First 1)) }
-        else { (($r.text -split "`n" | Where-Object { $_ -match 'error' } | Select-Object -First 3) -join ' | ') }
+        else {
+            $errLines = @($r.text -split "`n" | Where-Object { $_ -match 'error' })
+            if ($errLines.Count -gt 0) { ($errLines | Select-Object -First 3) -join ' | ' }
+            else { ($r.text -split "`n" | Where-Object { $_.Trim() } | Select-Object -First 3) -join ' | ' }
+        }
     if (-not $detail) { $detail = if ($ok) { 'ok' } else { 'failed' } }
 
     $rows += [pscustomobject]@{ template = $t.rel; entry = $entryRel; ok = $ok; detail = $detail.Trim() }

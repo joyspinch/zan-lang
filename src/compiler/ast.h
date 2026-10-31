@@ -133,7 +133,7 @@ struct zan_ast_node {
 
     uint8_t lit_radix;
     unsigned char from_stdlib;
-    uint8_t _pad;
+    uint8_t in_infer;
 
     zan_decl_meta_t *meta;
 

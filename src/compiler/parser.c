@@ -5477,9 +5477,21 @@ typedef struct {
     zan_ast_list_t *tparams;
     zan_ast_list_t *targs;
     zan_arena_t *arena;
+    int depth;
 } type_subst_ctx_t;
 
+static zan_ast_node_t *clone_ast_subst_impl(zan_ast_node_t *node, type_subst_ctx_t *ctx);
+
 static zan_ast_node_t *clone_ast_subst(zan_ast_node_t *node, type_subst_ctx_t *ctx) {
+    if (!node) return NULL;
+    if (ctx->depth > 64) return node;
+    ctx->depth++;
+    zan_ast_node_t *res = clone_ast_subst_impl(node, ctx);
+    ctx->depth--;
+    return res;
+}
+
+static zan_ast_node_t *clone_ast_subst_impl(zan_ast_node_t *node, type_subst_ctx_t *ctx) {
     if (!node) return NULL;
     switch (node->kind) {
     case AST_TYPE_REF: {
@@ -5773,7 +5785,7 @@ static void specialize_type_from_base(zan_ast_node_t *derived, zan_ast_node_t *b
                       base_ref->type_ref.type_args.count > 0 ? base_ref->type_ref.type_args.items[0]->type_ref.name.str : "");
 
     zan_ast_node_t *base_decl = find_type_decl_by_name(unit, base_ref->type_ref.name);
-    if (!base_decl || (base_decl->kind != AST_CLASS_DECL && base_decl->kind != AST_STRUCT_DECL))
+    if (!base_decl || base_decl == derived || (base_decl->kind != AST_CLASS_DECL && base_decl->kind != AST_STRUCT_DECL))
         return;
     if (base_decl->type_decl.type_params.count != base_ref->type_ref.type_args.count)
         return;
@@ -5782,6 +5794,7 @@ static void specialize_type_from_base(zan_ast_node_t *derived, zan_ast_node_t *b
     ctx.tparams = &base_decl->type_decl.type_params;
     ctx.targs = &base_ref->type_ref.type_args;
     ctx.arena = arena;
+    ctx.depth = 0;
 
     for (int i = 0; i < base_decl->type_decl.members.count; i++) {
         zan_ast_node_t *m = base_decl->type_decl.members.items[i];
