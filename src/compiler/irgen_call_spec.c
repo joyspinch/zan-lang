@@ -578,9 +578,24 @@ static bool class_inst_implements_iface(zan_irgen_t *g, zan_symbol_t *cls,
             if (bases->items[i] && bases->items[i]->kind == AST_TYPE_REF && g && g->binder) {
                 zan_symbol_t *isym = zan_binder_lookup(g->binder,
                                                        bases->items[i]->type_ref.name);
-                if (isym && isym->kind == SYM_INTERFACE &&
-                    class_inst_implements_iface(g, isym, inst, obj_ty))
-                    return true;
+                if (isym && isym->kind == SYM_INTERFACE) {
+                    /* 跳边要把边的具体实例化带下去（B-ID51）：非泛型类
+                     * IntBox : BoxSource<int>，BoxSource<T> : Box<T>——
+                     * 递进 BoxSource 时 inst 还是 NULL，边 Box<T> 的
+                     * T 统一不到 int，"实现 Box<int>" 就此误判为假，
+                     * 提升接口上的调用运行期报 no implementation。
+                     * 边引用带实参时先解析成实例化类型再递进。 */
+                    zan_type_t *binst = inst;
+                    if (!binst && bases->items[i]->type_ref.type_args.count > 0) {
+                        zan_type_t *rt = zan_binder_resolve_type(
+                            g->binder, bases->items[i]);
+                        if (rt && rt->kind == TYPE_INTERFACE &&
+                            rt != g->binder->type_error)
+                            binst = rt;
+                    }
+                    if (class_inst_implements_iface(g, isym, binst, obj_ty))
+                        return true;
+                }
             }
         }
     }

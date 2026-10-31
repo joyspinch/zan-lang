@@ -8,7 +8,7 @@
 
 ## 未完成
 
-- [ ] B-ID51 HEAD 上 case_generic_iface_convert 红：`up 0`（期望 `up 11`），iface_convert.zan:47 运行期报 "interface dispatch has no implementation"。8d4a3e72d 交付时该用例 4/4 绿，其后某提交回退了接口分发。复现：`build/zanc.exe tests/conformance/generic_iface_convert.zan --package-project . -o x.exe && x.exe`。嫌疑范围：2df60642a（方法组→委托验签）、2e3932369（ORM 泛型模板重构）；仅注释/测试注册的 e91c05f59、727fdea73 可排除。
+- （暂无未闭环任务）
 
 
 
