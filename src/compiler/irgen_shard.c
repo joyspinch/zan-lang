@@ -497,16 +497,24 @@ static void sh_mark_closure_fns(sh_state_t *st, sh_refs_t *r, LLVMValueRef gv) {
                 stack = ns;
             }
             if (gvv == SH_G_TRAVEL) {
-                /* 嵌套可迁移全局变量：完整定义打印至当前分片 */
-                if (sh_map_get(&r->travel, v) < 0)
+                /* 嵌套可迁移全局变量：完整定义打印至当前分片。
+                 * 依赖闭包走查必须与 note_global 的 TRAVEL 路径同构
+                 * （memo 防重入、每层重置深度预算）：反射元数据链
+                 * （fields→ctors→mtab→type→targs→str）深于本函数的
+                 * 32 层栈深上限，裸栈推进会在深层被静默截断，分片
+                 * 打出 type 却缺其引用的 str/targs 定义（B-ID49）。 */
+                if (sh_map_get(&r->travel, v) < 0) {
                     sh_map_put(&r->travel, v, 1);
-            } else {
-                if (!sh_refs_note_global(r, v)) { break; }
+                    if (!r->closure_seen ||
+                        sh_map_get(r->closure_seen, v) < 0) {
+                        if (r->closure_seen)
+                            sh_map_put(r->closure_seen, v, 1);
+                        sh_mark_closure_fns(st, r, v);
+                    }
+                }
                 continue;
             }
-            stack[sn].v = v; stack[sn].depth = it.depth + 1; sn++;
-            stack[sn].v = LLVMGetInitializer(v);
-            stack[sn].depth = it.depth + 1; sn++;
+            if (!sh_refs_note_global(r, v)) { break; }
             continue;
         }
         /* 复合常量（结构体/数组字面量）递归遍历其包含的指针 */

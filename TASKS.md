@@ -8,7 +8,7 @@
 
 ## 未完成
 
-- [~] **B-ID49** Gui 工程 `--publish` 在 LLVM 分片阶段确定性失败：`shard: shard 0: parse: <exe>.shard0.frag.ll:3102:168: error: use of undefined value '@__zan.refl.str.1910'`。复现：`templates/gui/gui-components`（sed 掉 `{{NAME}}` 后 `zanc src/App.zan --publish --auto-stdlib --package-project <repo>`）与 `_scratch/bid48/Fail.zan --publish`，发布链最终仍产出 exe（走了回退路径），但分片错误使 publish 无法走主路径；非 publish 编译与显式 `--embed` 发布不受影响。`__zan.refl.str.*` 是反射字符串全局——疑似分片器拆分反射串定义/引用时把定义留在别的分片或丢弃。证据与最小复刻：`_scratch/bid49/README.md`。注意：当前工作区有另一会话在飞的 `src/compiler/routegen.c`（未提交），定位时先分清 HEAD 状态与在飞改动。
+- （暂无未闭环任务）
 
 
 

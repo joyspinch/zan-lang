@@ -165,32 +165,48 @@ for ($i = 0; $i -lt $Jobs; $i++) { $chunks += , @() }
 for ($i = 0; $i -lt $probes.Count; $i++) { $chunks[$i % $Jobs] += $probes[$i] }
 $results = @{}
 $workers = @()
-for ($w = 0; $w -lt $Jobs; $w++) {
-    $chunk = $chunks[$w]
-    $workers += Start-ThreadJob -ScriptBlock {
-        param($gen1, $work, $chunk)
-        $res = @{}
-        foreach ($p in $chunk) {
-            $err = & $gen1 "$work\s$($p.Idx).ll" "$work\p$($p.Idx).zan" 2>&1 | Out-String
-            $rc = $LASTEXITCODE
-            $msg = ''
-            if ($rc -ne 0) {
-                $line = ($err -split "`n" | Where-Object { $_ -match 'error' } | Select-Object -First 1)
-                if ($null -ne $line) {
-                    $msg = (($line -replace '\x1b\[[0-9;]*m', '') -replace '.*error:\s*', '').Trim()
-                } else { $msg = 'rejected' }
+$hasThreadJob = [bool](Get-Command Start-ThreadJob -ErrorAction SilentlyContinue)
+if ($hasThreadJob) {
+    for ($w = 0; $w -lt $Jobs; $w++) {
+        $chunk = $chunks[$w]
+        $workers += Start-ThreadJob -ScriptBlock {
+            param($gen1, $work, $chunk)
+            $res = @{}
+            foreach ($p in $chunk) {
+                $err = & $gen1 "$work\s$($p.Idx).ll" "$work\p$($p.Idx).zan" 2>&1 | Out-String
+                $rc = $LASTEXITCODE
+                $msg = ''
+                if ($rc -ne 0) {
+                    $line = ($err -split "`n" | Where-Object { $_ -match 'error' } | Select-Object -First 1)
+                    if ($null -ne $line) {
+                        $msg = (($line -replace '\x1b\[[0-9;]*m', '') -replace '.*error:\s*', '').Trim()
+                    } else { $msg = 'rejected' }
+                }
+                $res[$p.Idx] = $msg
             }
-            $res[$p.Idx] = $msg
+            $res
+        } -ArgumentList $Gen1, $work, $chunk -ThrottleLimit $Jobs
+    }
+    $null = Wait-Job -Job $workers
+    foreach ($r in (Receive-Job -Job $workers)) {
+        if ($null -eq $r) { continue }
+        foreach ($k in $r.Keys) { $results[$k] = $r[$k] }
+    }
+    Remove-Job -Job $workers
+} else {
+    foreach ($p in $probes) {
+        $err = & $Gen1 "$work\s$($p.Idx).ll" "$work\p$($p.Idx).zan" 2>&1 | Out-String
+        $rc = $LASTEXITCODE
+        $msg = ''
+        if ($rc -ne 0) {
+            $line = ($err -split "`n" | Where-Object { $_ -match 'error' } | Select-Object -First 1)
+            if ($null -ne $line) {
+                $msg = (($line -replace '\x1b\[[0-9;]*m', '') -replace '.*error:\s*', '').Trim()
+            } else { $msg = 'rejected' }
         }
-        $res
-    } -ArgumentList $Gen1, $work, $chunk -ThrottleLimit $Jobs
+        $results[$p.Idx] = $msg
+    }
 }
-$null = Wait-Job -Job $workers
-foreach ($r in (Receive-Job -Job $workers)) {
-    if ($null -eq $r) { continue }
-    foreach ($k in $r.Keys) { $results[$k] = $r[$k] }
-}
-Remove-Job -Job $workers
 
 # ---- report -----------------------------------------------------------------
 $rows = @()
