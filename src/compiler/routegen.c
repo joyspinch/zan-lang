@@ -405,9 +405,43 @@ static bool method_has_route_or_verb(zan_ast_node_t *m) {
     const zan_ast_list_t *attrs = zan_ast_attributes_const(m);
     for (int i = 0; i < attrs->count; i++) {
         zan_istr_t n = attr_name(attrs->items[i]);
-        if (attr_http_verb(n) || istr_is(n, "Route")) return true;
+        if (attr_http_verb(n) || istr_is(n, "Route") || istr_is(n, "RouteR"))
+            return true;
     }
     return false;
+}
+
+/* [RouteR("...")] 的正则模式串；没有则 out[0]=0 返回 false。 */
+static bool method_regex_template(zan_ast_node_t *m, char *out, size_t cap) {
+    const zan_ast_list_t *attrs = zan_ast_attributes_const(m);
+    for (int i = 0; i < attrs->count; i++) {
+        zan_ast_node_t *a = attrs->items[i];
+        if (istr_is(attr_name(a), "RouteR") &&
+            a->attribute.args.count >= 1 &&
+            a->attribute.args.items[0]->kind == AST_STRING_LITERAL) {
+            istr_to(out, cap, a->attribute.args.items[0]->str_val);
+            return true;
+        }
+    }
+    out[0] = 0;
+    return false;
+}
+
+/* 表单类参数（GenRoute.FormClassOf 同口径）：类型名指向本单元的
+ * class，且能无参构造——显式无参构造，或根本没声明构造。返回类
+ * decl，否则 NULL；蹦床里 new 出来后按字段名逐字段绑定。 */
+static zan_ast_node_t *routegen_form_class(zan_ast_node_t *unit,
+                                           const char *name) {
+    zan_ast_node_t *cls = find_type(unit, name, AST_CLASS_DECL);
+    if (!cls) return NULL;
+    bool has_ctor = false;
+    for (int i = 0; i < cls->type_decl.members.count; i++) {
+        zan_ast_node_t *mm = cls->type_decl.members.items[i];
+        if (mm->kind != AST_CONSTRUCTOR_DECL) continue;
+        has_ctor = true;
+        if (mm->method_decl.params.count == 0) return cls;
+    }
+    return has_ctor ? NULL : cls;
 }
 
 static bool method_has_attr(zan_ast_node_t *m, const char *nm) {
@@ -494,10 +528,22 @@ static void build_path(const char *cls_tpl, const char *m_tpl,
     } else if (m_tpl[0]) {
         if (cls_tpl[0]) snprintf(tpl, sizeof(tpl), "%s/%s", cls_tpl, m_tpl);
         else snprintf(tpl, sizeof(tpl), "%s", m_tpl);
+    } else if (strcmp(action_tok, "index") == 0) {
+        /* index 折叠（GenRoute.BuildPath 口径）：类模板以 /[action]
+         * 收尾时剥掉它——MenuPosts.Index 的路径是 /admin/menuposts，
+         * 不是 /admin/menuposts/index（web_menu_attrs 钉的形状）。 */
+        size_t cl = strlen(cls_tpl);
+        if (cl >= 9 && strcmp(cls_tpl + cl - 9, "/[action]") == 0)
+            snprintf(tpl, sizeof(tpl), "%.*s", (int)(cl - 9), cls_tpl);
+        else if (strstr(cls_tpl, "[action]"))
+            snprintf(tpl, sizeof(tpl), "%s", cls_tpl);
+        else
+            snprintf(tpl, sizeof(tpl), "%s", cls_tpl[0] ? cls_tpl : "/");
     } else {
         snprintf(tpl, sizeof(tpl), "%s", cls_tpl);
     }
-    if (!strstr(tpl, "[action]") && m_tpl[0] != '/') {
+    if (!strstr(tpl, "[action]") && m_tpl[0] != '/' &&
+        strcmp(action_tok, "index") != 0) {
         size_t tl = strlen(tpl);
         if (tl && tpl[tl - 1] == '/') snprintf(tpl + tl, sizeof(tpl) - tl, "[action]");
         else snprintf(tpl + tl, sizeof(tpl) - tl, "/[action]");
@@ -624,8 +670,7 @@ static void rg_literal(zan_ast_node_t *e, char *out, size_t cap) {
 }
 
 static void rg_params_add(rg_params *ps, const rg_reader *rd,
-                          zan_ast_node_t *call) {
-    if (ps->count >= (int)(sizeof(ps->items) / sizeof(ps->items[0]))) return;
+                          zan_ast_node_t *call) {    if (ps->count >= (int)(sizeof(ps->items) / sizeof(ps->items[0]))) return;
     if (call->call.args.count < 1) return;
     zan_ast_node_t *a0 = call->call.args.items[0];
     if (a0->kind != AST_STRING_LITERAL) return;   /* dynamic name: not documentable */
@@ -663,6 +708,60 @@ static void rg_params_add(rg_params *ps, const rg_reader *rd,
  * shares (Controller.Paged -> ListQuery.From). The reads happen inside the
  * framework, so documenting them means expanding the one call site here --
  * otherwise /api/docs would describe a list endpoint as taking nothing. */
+/* 签名绑定参数与表单字段的文档直录（GenRoute boundDocs 同口径）：与
+ * 体内 In/Need 实读扫描同表合并，同名按更强声明收敛，先声明的绑定项
+ * 会被体内同名的实读细化而不是顶掉。 */
+static void rg_params_add_doc(rg_params *ps, const rg_param *d) {
+    if (!d->name[0]) return;
+    if (ps->count >= (int)(sizeof(ps->items) / sizeof(ps->items[0]))) return;
+    for (int i = 0; i < ps->count; i++) {
+        if (strcmp(ps->items[i].name, d->name) != 0) continue;
+        rg_param *p = &ps->items[i];
+        if (d->required) p->required = true;
+        if (d->def[0] && !p->def[0]) snprintf(p->def, sizeof(p->def), "%s", d->def);
+        if (strcmp(p->type, "string") == 0) p->type = d->type;
+        return;
+    }
+    rg_param *p = &ps->items[ps->count++];
+    memset(p, 0, sizeof(*p));
+    *p = *d;
+}
+
+/* [Opt("page=1","kw=")]:可选签名参数 name → default（GenRoute.OptArgs
+ * 同口径）。names/defs 各收 cap 组，返回组数。 */
+static int routegen_opt_args(zan_ast_node_t *m, char (*names)[64],
+                             char (*defs)[64], int cap) {
+    const zan_ast_list_t *attrs = zan_ast_attributes_const(m);
+    int n = 0;
+    for (int i = 0; i < attrs->count; i++) {
+        zan_ast_node_t *a = attrs->items[i];
+        if (!istr_is(attr_name(a), "Opt")) continue;
+        for (int k = 0; k < a->attribute.args.count; k++) {
+            zan_ast_node_t *arg = a->attribute.args.items[k];
+            if (!arg || arg->kind != AST_STRING_LITERAL) continue;
+            if (n >= cap) return n;
+            char v[192];
+            istr_to(v, sizeof(v), arg->str_val);
+            char *eq = strchr(v, '=');
+            if (eq) { *eq = 0; snprintf(defs[n], 64, "%s", eq + 1); }
+            else defs[n][0] = 0;
+            snprintf(names[n], 64, "%s", v);
+            n++;
+        }
+    }
+    return n;
+}
+
+/* 把字符串排成可进 Zan 字符串字面量的形状（" 与 \ 转义）。 */
+static void rg_esc(char *out, size_t cap, const char *s) {
+    size_t n = 0;
+    for (; *s && n + 2 < cap; s++) {
+        if (*s == '"' || *s == '\\') out[n++] = '\\';
+        out[n++] = *s;
+    }
+    out[n] = 0;
+}
+
 static void rg_params_add_paged(rg_params *ps, zan_ast_node_t *call) {
     static const struct { const char *name, *type, *desc; } listed[] = {
         { "page",  "int",    "页码，从 1 开始" },
@@ -903,6 +1002,21 @@ static void emit_fluent(rg_buf_t *out, rg_meta *m, const char *title) {
 
 /* ---- entry point ---- */
 
+/* 蹦床签名绑定（B-ID52）：纯 Zan 生成器时代（GenRoute.zan）的类型化
+ * action 参数在蹦床里从请求逐个绑定（缺失/非法统一 ApiError(400) 应答），
+ * C 重写版把这丢了——带参 action 全被当"不支持形状"跳过，__AttrRoutes
+ * 缺 handler，conformance 的 async_catch_ownership_route /
+ * web_route_async_teardown 直接编不过。可绑定集与 GenRoute.BindableType
+ * 同口径：string/int/long/double/bool。 */
+static bool routegen_bindable_type(zan_ast_node_t *t) {
+    if (!t || t->kind != AST_TYPE_REF) return false;
+    return istr_is(t->type_ref.name, "string") ||
+           istr_is(t->type_ref.name, "int") ||
+           istr_is(t->type_ref.name, "long") ||
+           istr_is(t->type_ref.name, "double") ||
+           istr_is(t->type_ref.name, "bool");
+}
+
 void zan_routegen_run(zan_ast_node_t *unit, zan_arena_t *arena,
                       zan_diag_t *diag) {
     if (zan_diag_has_errors(diag)) return;
@@ -943,7 +1057,10 @@ void zan_routegen_run(zan_ast_node_t *unit, zan_arena_t *arena,
             /* only public actions become routes */
             if (m->method_decl.modifiers & (MOD_PRIVATE | MOD_PROTECTED)) continue;
 
-            /* supported shapes: 0 params, or single HttpContext param */
+            /* supported shapes: 0 params, single HttpContext param, or an
+             * instance action whose params are all primitives (the trampoline
+             * binds them from the request, GenRoute.zan 口径)。其余形状
+             * 不是路由。 */
             int np = m->method_decl.params.count;
             bool ctx_param = false;
             if (np == 1) {
@@ -953,7 +1070,41 @@ void zan_routegen_run(zan_ast_node_t *unit, zan_arena_t *arena,
                     istr_is(p0->param.type->type_ref.name, "HttpContext"))
                     ctx_param = true;
             }
-            if (np != 0 && !ctx_param) continue;
+            bool is_static = (m->method_decl.modifiers & MOD_STATIC) != 0;
+            bool tx = !is_static && (method_has_attr(m, "Tx") ||
+                                     class_has_attr(cls, "Tx"));
+            bool ro = !is_static && method_has_attr(m, "ReadOnly");
+            if (ro && tx) continue;  /* GenRoute 同款：一段动作二选一 */
+            bool bindable = np > 0 && !ctx_param && !is_static;
+            char optn[16][64];
+            char optd[16][64];
+            int nopt = routegen_opt_args(m, optn, optd, 16);
+            rg_param sig_docs[24];
+            int nsig = 0;
+            for (int pi = 0; bindable && pi < np; pi++) {
+                zan_ast_node_t *p = m->method_decl.params.items[pi];
+                if (!p || p->kind != AST_PARAM || !p->param.type ||
+                    p->param.type->kind != AST_TYPE_REF) {
+                    bindable = false;
+                    break;
+                }
+                char pt[64];
+                istr_to(pt, sizeof(pt), p->param.type->type_ref.name);
+                if (!routegen_bindable_type(p->param.type) &&
+                    !routegen_form_class(unit, pt))
+                    bindable = false;
+            }
+            if (np != 0 && !ctx_param && !bindable) continue;
+            char arg[512] = "";
+            if (ctx_param) snprintf(arg, sizeof(arg), "ctx");
+            for (int pi = 0; bindable && pi < np; pi++) {
+                zan_ast_node_t *p = m->method_decl.params.items[pi];
+                char pn[128];
+                istr_to(pn, sizeof(pn), p->param.name);
+                if (pi == 0) snprintf(arg, sizeof(arg), "%s", pn);
+                else snprintf(arg + strlen(arg), sizeof(arg) - strlen(arg),
+                              ", %s", pn);
+            }
 
             char mname[128]; istr_to(mname, sizeof(mname), m->method_decl.name);
             char actiontok[128]; snprintf(actiontok, sizeof(actiontok), "%s", mname);
@@ -963,8 +1114,17 @@ void zan_routegen_run(zan_ast_node_t *unit, zan_arena_t *arena,
             if (!verb) verb = "GET";
 
             char m_tpl[256]; method_route_template(m, m_tpl, sizeof(m_tpl));
+            char m_rregex[256]; method_regex_template(m, m_rregex,
+                                                      sizeof(m_rregex));
+            bool is_regex = m_rregex[0] != 0;
             char path[600];
-            build_path(cls_tpl, m_tpl, ctrltok, actiontok, path, sizeof(path));
+            if (is_regex) {
+                /* [RouteR] 的模式串就是注册键，不走模板展开 */
+                snprintf(path, sizeof(path), "%s", m_rregex);
+            } else {
+                build_path(cls_tpl, m_tpl, ctrltok, actiontok, path,
+                           sizeof(path));
+            }
 
             /* three-layer metadata merge: class then method (method overrides) */
             rg_meta meta; meta.count = 0;
@@ -981,7 +1141,6 @@ void zan_routegen_run(zan_ast_node_t *unit, zan_arena_t *arena,
             char m_desc[256]; bool has_md = decl_description(m, m_desc, sizeof(m_desc));
             const char *title = has_md ? m_desc : cls_desc;
 
-            bool is_static = (m->method_decl.modifiers & MOD_STATIC) != 0;
             bool is_async = (m->method_decl.modifiers & MOD_ASYNC) != 0;
             const char *hname_fmt = "__h_%s_%s";
             char hname[300]; snprintf(hname, sizeof(hname), hname_fmt, cname, mname);
@@ -1007,30 +1166,160 @@ void zan_routegen_run(zan_ast_node_t *unit, zan_arena_t *arena,
                 if (cmod[0]) snprintf(vkey, sizeof(vkey), "%s.%s.%s", cmod, cdisp, mname);
                 else snprintf(vkey, sizeof(vkey), "%s.%s", cdisp, mname);
                 rg_putf(&handlers, "        __c.__SetView(\"%s\");\n", vkey);
-                /* A required parameter aborts by throwing ApiError; catching it
-                 * here is what lets `this.Need("title", "标题")` read as one
-                 * expression instead of a guard clause in every action. Teardown
-                 * still runs, so the request connection is released either way. */
-                rg_putf(&handlers, "        if (await __c.__BeforeAsync()) {\n");
-                rg_putf(&handlers, "            try {\n");
-                rg_putf(&handlers, "                %s__c.%s(%s);\n", aw, mname, ctx_param ? "ctx" : "");
-                rg_putf(&handlers, "            } catch (ApiError __e) {\n");
-                rg_putf(&handlers, "                ctx.Status(__e.Status(), ApiError.Reason(__e.Status()));\n");
-                rg_putf(&handlers, "                ctx.Api(__e.Code(), __e.Message, \"null\");\n");
+                if (ro)
+                    rg_putf(&handlers, "        __c.__UseReadOnly();\n");
+                /* 必填参数以抛 ApiError 中止；在这里捕获，`this.Need(...)`
+                 * 读起来仍是单一表达式。[Tx] 动作的事务三段与收尾照
+                 * GenRoute.zan 口径：Before→Begin→绑定→动作→Commit，
+                 * Rollback 只在 Begin 成功后跑，AfterAsync 在 finally
+                 * 兜底且失败时不覆盖原始错误。 */
+                rg_putf(&handlers, "        bool __failed = false;\n");
+                if (tx)
+                    rg_putf(&handlers, "        bool __tx = false;\n");
+                rg_putf(&handlers, "        try {\n");
+                rg_putf(&handlers, "            if (await __c.__BeforeAsync()) {\n");
+                if (tx) {
+                    rg_putf(&handlers, "                __tx = await __c.__TxBegin();\n");
+                    rg_putf(&handlers, "                if (!__tx) { throw new ApiError(503, \"0503\", \"服务不可用\"); }\n");
+                }
+                for (int pi = 0; bindable && pi < np; pi++) {
+                    zan_ast_node_t *p = m->method_decl.params.items[pi];
+                    char pt[64], pn[128];
+                    istr_to(pt, sizeof(pt), p->param.type->type_ref.name);
+                    istr_to(pn, sizeof(pn), p->param.name);
+                    zan_ast_node_t *fcls = routegen_form_class(unit, pt);
+                    if (fcls) {
+                        /* 表单类：new 出来后逐字段绑定，请求未携带的
+                         * 字段保留声明时的初始值；静态字段不是请求
+                         * 形态（经实例写静态字段是必炸源码），跳过。 */
+                        rg_putf(&handlers, "                %s %s = new %s();\n",
+                                pt, pn, pt);
+                        for (int fi = 0;
+                             fi < fcls->type_decl.members.count; fi++) {
+                            zan_ast_node_t *fd =
+                                fcls->type_decl.members.items[fi];
+                            if (!fd || fd->kind != AST_FIELD_DECL ||
+                                (fd->field_decl.modifiers & MOD_STATIC) != 0)
+                                continue;
+                            if (!fd->field_decl.type ||
+                                fd->field_decl.type->kind != AST_TYPE_REF)
+                                continue;
+                            char ft[64], fn[128];
+                            istr_to(ft, sizeof(ft),
+                                    fd->field_decl.type->type_ref.name);
+                            istr_to(fn, sizeof(fn), fd->field_decl.name);
+                            if (!routegen_bindable_type(fd->field_decl.type))
+                                continue;
+                            if (nsig < (int)(sizeof(sig_docs) / sizeof(sig_docs[0]))) {
+                                rg_param *d = &sig_docs[nsig++];
+                                memset(d, 0, sizeof(*d));
+                                snprintf(d->name, sizeof(d->name), "%s", fn);
+                                d->type = ft;
+                                d->required = false;
+                                d->where = "form";
+                            }
+                            if (strcmp(ft, "int") == 0)
+                                rg_putf(&handlers, "                if (__c.HasIn(\"%s\")) { %s.%s = __c.InInt(\"%s\", 0); }\n", fn, pn, fn, fn);
+                            else if (strcmp(ft, "long") == 0)
+                                rg_putf(&handlers, "                if (__c.HasIn(\"%s\")) { %s.%s = __c.InLong(\"%s\", 0); }\n", fn, pn, fn, fn);
+                            else if (strcmp(ft, "double") == 0)
+                                rg_putf(&handlers, "                if (__c.HasIn(\"%s\")) { %s.%s = __c.InDouble(\"%s\", 0); }\n", fn, pn, fn, fn);
+                            else if (strcmp(ft, "bool") == 0)
+                                rg_putf(&handlers, "                if (__c.HasIn(\"%s\")) { %s.%s = __c.InBool(\"%s\", false); }\n", fn, pn, fn, fn);
+                            else
+                                rg_putf(&handlers, "                if (__c.HasIn(\"%s\")) { %s.%s = __c.In(\"%s\"); }\n", fn, pn, fn, fn);
+                        }
+                        continue;
+                    }
+                    int oi = -1;
+                    for (int k = 0; k < nopt; k++)
+                        if (strcmp(optn[k], pn) == 0) { oi = k; break; }
+                    const char *odef = oi >= 0 ? optd[oi] : "";
+                    if (nsig < (int)(sizeof(sig_docs) / sizeof(sig_docs[0]))) {
+                        rg_param *d = &sig_docs[nsig++];
+                        memset(d, 0, sizeof(*d));
+                        snprintf(d->name, sizeof(d->name), "%s", pn);
+                        /* 绑定项按签名原类型入档（double 不改写为
+                         * number：那是 InDouble 实读扫描的口径） */
+                        d->type = pt;
+                        d->required = oi < 0;
+                        snprintf(d->def, sizeof(d->def), "%s", odef);
+                        d->where = "query";
+                    }
+                    if (oi >= 0) {
+                        /* [Opt] 点名：缺省读，缺失取默认值，不再 400
+                         * （GenRoute.OptBindLine 口径）；string 默认在
+                         * 空读时回填。 */
+                        if (strcmp(pt, "int") == 0)
+                            rg_putf(&handlers, "                int %s = __c.InInt(\"%s\", %s);\n", pn, pn, odef[0] ? odef : "0");
+                        else if (strcmp(pt, "long") == 0)
+                            rg_putf(&handlers, "                long %s = __c.InLong(\"%s\", %s);\n", pn, pn, odef[0] ? odef : "0");
+                        else if (strcmp(pt, "double") == 0)
+                            rg_putf(&handlers, "                double %s = __c.InDouble(\"%s\", %s);\n", pn, pn, odef[0] ? odef : "0");
+                        else if (strcmp(pt, "bool") == 0)
+                            rg_putf(&handlers, "                bool %s = __c.InBool(\"%s\", %s);\n", pn, pn, strcmp(odef, "true") == 0 ? "true" : "false");
+                        else {
+                            rg_putf(&handlers, "                string %s = __c.In(\"%s\");\n", pn, pn);
+                            if (odef[0]) {
+                                char ed[128];
+                                rg_esc(ed, sizeof(ed), odef);
+                                rg_putf(&handlers, "                if (%s.Length == 0) { %s = \"%s\"; }\n", pn, pn, ed);
+                            }
+                        }
+                        continue;
+                    }
+                    if (strcmp(pt, "int") == 0)
+                        rg_putf(&handlers, "                int %s = __c.NeedInt(\"%s\", \"%s\");\n", pn, pn, pn);
+                    else if (strcmp(pt, "long") == 0)
+                        rg_putf(&handlers, "                long %s = __c.NeedLong(\"%s\", \"%s\");\n", pn, pn, pn);
+                    else if (strcmp(pt, "double") == 0)
+                        rg_putf(&handlers, "                double %s = __c.NeedDouble(\"%s\", \"%s\");\n", pn, pn, pn);
+                    else if (strcmp(pt, "bool") == 0)
+                        rg_putf(&handlers, "                bool %s = __c.NeedBool(\"%s\", \"%s\");\n", pn, pn, pn);
+                    else
+                        rg_putf(&handlers, "                string %s = __c.Need(\"%s\", \"%s\");\n", pn, pn, pn);
+                }
+                rg_putf(&handlers, "                %s__c.%s(%s);\n", aw, mname, arg);
+                if (tx)
+                    rg_putf(&handlers, "                await __c.__TxCommit();\n");
                 rg_putf(&handlers, "            }\n");
-                rg_putf(&handlers, "            await __c.__AfterAsync();\n");
+                rg_putf(&handlers, "        } catch (ApiError __e) {\n");
+                rg_putf(&handlers, "            __failed = true;\n");
+                if (tx) {
+                    rg_putf(&handlers, "            if (__tx) {\n");
+                    rg_putf(&handlers, "                try { await __c.__TxRollback(); } catch (Exception __rollback) { }\n");
+                    rg_putf(&handlers, "            }\n");
+                }
+                rg_putf(&handlers, "            ctx.Status(__e.Status(), ApiError.Reason(__e.Status()));\n");
+                rg_putf(&handlers, "            ctx.Api(__e.Code(), __e.Message, \"null\");\n");
+                rg_putf(&handlers, "        } catch (Exception __x) {\n");
+                rg_putf(&handlers, "            __failed = true;\n");
+                if (tx) {
+                    rg_putf(&handlers, "            if (__tx) {\n");
+                    rg_putf(&handlers, "                try { await __c.__TxRollback(); } catch (Exception __rollback) { }\n");
+                    rg_putf(&handlers, "            }\n");
+                }
+                rg_putf(&handlers, "            throw;\n");
+                rg_putf(&handlers, "        } finally {\n");
+                rg_putf(&handlers, "            try { await __c.__AfterAsync(); }\n");
+                rg_putf(&handlers, "            catch (Exception __cleanup) { if (!__failed) { throw; } }\n");
                 rg_putf(&handlers, "        }\n");
             }
             rg_putf(&handlers, "    }\n");
 
             /* registration */
-            rg_putf(&reg, "        app.Map(\"%s\", \"", verb);
+            rg_putf(&reg, "        app.%s(\"%s\", \"",
+                    is_regex ? "MapRegex" : "Map", verb);
             rg_put_qstr(&reg, path);
             rg_putf(&reg, "\", __AttrRoutes.%s)\n            .Named(\"", hname);
             rg_put_qstr(&reg, cact); rg_putf(&reg, "."); rg_put_qstr(&reg, mname);
             rg_putf(&reg, "\")");
             emit_fluent(&reg, &meta, title);
             rg_params params_doc; params_doc.count = 0;
+            /* 签名绑定与表单字段先进文档表，再被体内 In/Need 实读
+             * 细化（GenRoute 的 ParamDocs + ScanCalls 合并口径） */
+            for (int si = 0; si < nsig; si++)
+                rg_params_add_doc(&params_doc, &sig_docs[si]);
             rg_scan(m->method_decl.body, &params_doc);
             rg_params_from_path(&params_doc, path);
             rg_emit_params(&reg, &params_doc);

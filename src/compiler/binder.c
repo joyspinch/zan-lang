@@ -914,8 +914,15 @@ zan_type_t *zan_binder_resolve_type(zan_binder_t *b, zan_ast_node_t *type_ref) {
     else if (istr_eq(name, "Task", 4))
         base = make_type(b->arena, TYPE_TASK, "Task", 4);
     /*  */
-    else if (istr_eq(name, "Func", 4) || istr_eq(name, "Action", 6))
-        base = make_type(b->arena, TYPE_DELEGATE, name.str, name.len);
+    else if (istr_eq(name, "Func", 4) || istr_eq(name, "Action", 6)) {
+        /* 用户声明的同名 delegate 遮蔽内建委托形状（C# 语义，B-ID53）；
+         * 其余形状仍短路到内建。 */
+        zan_symbol_t *sym = scope_find_type(b->current_scope, name);
+        if (sym && sym->kind == SYM_DELEGATE && sym->type)
+            base = sym->type;
+        else
+            base = make_type(b->arena, TYPE_DELEGATE, name.str, name.len);
+    }
     else {
         zan_symbol_t *sym = scope_find_type(b->current_scope, name);
         if (sym) base = sym->type;
@@ -1160,7 +1167,8 @@ static zan_type_kind_t ast_kind_to_type_kind(zan_ast_kind_t kind) {
 /* A551：resolve_type 里这些名字**硬编码短路**到内建类型，永远轮不到 scope
  * 查找——用户声明同名类型会被静默顶掉，成员解析落空报"has no member"把人
  * 引向无关方向。在声明处直接报重名。名单必须与 resolve_type 的内建短路表
- * 保持一致。 */
+ * 保持一致；例外：Func/Action 允许被同名 delegate 遮蔽（resolve_type 优先
+ * 取用户声明，C# 语义），delegate 声明不算碰撞。 */
 static bool builtin_type_name(zan_istr_t name) {
     if (istr_eq(name, "void", 4) || istr_eq(name, "bool", 4) ||
         istr_eq(name, "byte", 4) || istr_eq(name, "short", 5) ||
@@ -1190,7 +1198,11 @@ static void bind_type_decls(zan_binder_t *b, zan_ast_list_t *decls) {
 
         if (node->kind == AST_DELEGATE_DECL) {
             zan_istr_t name = node->method_decl.name;
-            if (builtin_type_name(name)) {
+            /* Func/Action 可被同名 delegate 遮蔽（resolve_type 会优先取
+             * 用户声明，C# 语义）；其余内建名一律拦。 */
+            bool shadowable_delegate = istr_eq(name, "Func", 4) ||
+                                       istr_eq(name, "Action", 6);
+            if (builtin_type_name(name) && !shadowable_delegate) {
                 zan_diag_emit_code(b->diag, DIAG_ERROR, node->loc, 1009,
                               "type declaration '%.*s' collides with a built-in type name",
                               name.len, name.str);

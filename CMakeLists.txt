@@ -1371,7 +1371,7 @@ add_test(NAME diag_builtin_name_shadow_delegate
     -DZANC=$<TARGET_FILE:zanc>
     -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/builtin_name_shadow_delegate.zan
     -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/diag_builtin_name_shadow_delegate${_exe_ext}
-    "-DEXPECT_REGEX=type declaration 'Action' collides with a built-in type name"
+    "-DEXPECT_REGEX=type declaration 'Task' collides with a built-in type name"
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_builtin_name_shadow_delegate PROPERTIES TIMEOUT 60)
 

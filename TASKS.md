@@ -8,7 +8,7 @@
 
 ## 未完成
 
-- （暂无未闭环任务）
+- [ ] B-ID56 Zan.Web 响应/协议回归 4 案红（b1752059e/2e3932369 重构尾债，非 2026-11-01 批次引入，本批前即红）：server_mvc_security_routes（"only harmless TxProbe route generated"——路由生成的安全过滤语义）、web_list_protocol（Paged 协议深处输出分叉）、web_response_bodyless（二进制/HEAD 无体帧 contract 2 断言）、web_response_safety。另注：web_route_regex / web_mvc_base_routes 编译 120-170s 贴 180s 预算，-j3 以上并行会 Timeout，-j2 稳定绿。
 
 
 
