@@ -27,6 +27,8 @@ public class TextArea : Control {
     // 接受选择，而不是移动光标、破坏换行。每次
     // Render 都会清除，因此漏帧不会让框失聪。
     bool skipKeys;
+    // 最近一次发过命名键事件的 OS 事件序号（键槽未认领时跨帧留存）。
+    long lastKeyNamedSeq;
     // `cacheTxt` 按行拆分的结果。拆分会为每行分配一个列表和一个
     // 字符串，而框在每帧以及每次
     // 方向键时都需要这些行——每帧都做正是让长提示文本
@@ -99,6 +101,7 @@ public class TextArea : Control {
         FieldStatus = "";
         Round = false;
         Filter = null;
+        lastKeyNamedSeq = 0;
         wiresOwnEvents = true;
         Change = new UiEvent();
     }
@@ -488,13 +491,29 @@ public class TextArea : Control {
                 if (this.Insert("  ")) { app.RequestRedraw(); }
             } else {
                 string ch = Text.CharStr(code);
-                if (ch.Length > 0) {
+                if (ch.Length > 0 && Window.EventSeqGlobal() != this.lastKeyNamedSeq) {
+                    // 字符键出口：落文本之前通知（DOM keypress 语义）；
+                    // 同一序号去重（与 KeyDown/KeyUp 共用一档）。
+                    this.lastKeyNamedSeq = Window.EventSeqGlobal();
+                    this.FireKeyNamed("KeyPress");
                     if (this.Insert(ch)) { app.RequestRedraw(); }
                 }
+            }
+        } else if (kind == 5) {
+            // 键释放出口：命名 KeyUp（仅通知，不消费事件槽）。
+            if (Window.EventSeqGlobal() != this.lastKeyNamedSeq) {
+                this.lastKeyNamedSeq = Window.EventSeqGlobal();
+                this.FireKeyNamed("KeyUp");
             }
         } else if (kind == 4) {
             int kc = app.window.EventKeyCode();
             int mods = app.window.EventMods();
+            // 键按下出口：编辑快捷键之前通知。事件槽未认领时跨帧
+            // 留存，按事件序号去重。
+            if (Window.EventSeqGlobal() != this.lastKeyNamedSeq) {
+                this.lastKeyNamedSeq = Window.EventSeqGlobal();
+                this.FireKeyNamed("KeyDown");
+            }
             bool shift = Modifiers.HasShift(mods);
             bool ctrl = Modifiers.HasCtrl(mods);
             if (ctrl && kc == 65) {
@@ -813,7 +832,9 @@ public class TextArea : Control {
         // 恢复 Class，避免设计器/序列化器读到污染字段。
         Class = origClass;
 
-        On.Fire(app, id, this);
+        // 键盘族不在此轮询（键槽跨帧留存会重复投递），走 HandleInput
+        // 的命名出口；其余通用事件照常按帧快照轮询。
+        On.FireNonKey(app, id, this);
         return id;
     }
 

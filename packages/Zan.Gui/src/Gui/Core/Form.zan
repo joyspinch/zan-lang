@@ -15,10 +15,12 @@ public class Form : Control {
     List<FormTask> tasks;
     // 设计出的 `on<Event>` 绑定的 Name -> Action 表（与
     // UiDoc/HandlerRegistry 契约相同）：设计文档存储处理器名，
-    // 业务文件用 On() 注册 Action，生成的
-    // 生成代码把每个控件的事件订阅到 Handle(name)。从未注册的
-    // 处理器自然不会触发。
+    // 业务文件用 On() 注册 Action，Run() 前的 WireDocEvents 整树
+    // 解析把每个控件的声明订阅到处理器。从未注册的处理器自然
+    // 不会触发。
     HandlerRegistry handlers;
+    // WireDocEvents 已跑过（Run 只进一次，重复解析会叠加订阅）。
+    bool docWired;
 
     // 构建底层窗口和 app。树可以在 Run() 之前
     // 组装并布局好。
@@ -298,6 +300,60 @@ public class Form : Control {
         if (aa != null) { aa(arg); }
     }
 
+    // ---- 文档事件接线 ----
+
+    // 把整树控件声明的 `on<Event>` 处理器名解析到 On() 注册的
+    // Action 并 BindEvent 成真正的订阅。投影（FormBuilder）只落
+    // 处理器名元数据；GenForm 时代这条解析在生成的 __Dispatch 里，
+    // 生成器删除后由运行期窗口统一承担——ModelBinder.WireNode 对
+    // 模型绑定树做的正是同一件事。在 Run() 进循环前调用一次，
+    // 因此 Wire(form) 的注册必须先于 Run()（模板样板即此顺序）。
+    void WireDocEvents() {
+        if (this.docWired) { return; }
+        this.docWired = true;
+        for (int i = 0; i < children.Count; i = i + 1) {
+            this.WireDocNode(children[i]);
+        }
+    }
+
+    // 解析顺序与 ModelBinder.WireNode 一致：Item → Sender →
+    // handlerArg+Arg → 无参。未注册的名字静默跳过（与生成器
+    // 时代一致——设计里允许留尚未实现的处理器）。
+    void WireDocNode(Control c) {
+        for (int i = 0; i < c.events.Count; i = i + 1) {
+            string evt = c.events[i].key;
+            string hname = c.events[i].val;
+            if (hname == "") { continue; }
+            ControlItemEvent ia = handlers.GetItem(hname);
+            if (ia != null) {
+                Control sc = c;
+                c.BindEvent(evt, () => { ia(sc, sc.item); });
+                continue;
+            }
+            ControlEvent sa = handlers.GetSender(hname);
+            if (sa != null) {
+                Control sc = c;
+                c.BindEvent(evt, () => { sa(sc); });
+                continue;
+            }
+            if (c.handlerArg != "") {
+                Action<string> aa = handlers.GetArg(hname);
+                if (aa != null) {
+                    string arg = c.handlerArg;
+                    c.BindEvent(evt, () => { aa(arg); });
+                    continue;
+                }
+            }
+            Action a = handlers.Get(hname);
+            if (a != null) {
+                c.BindEvent(evt, a);
+            }
+        }
+        for (int j = 0; j < c.children.Count; j = j + 1) {
+            this.WireDocNode(c.children[j]);
+        }
+    }
+
     // 在当前帧中一次性测量、布局并绘制整棵树，
     // 位于装饰之下。公开以便手写循环可以组合调用它。
     void RenderFrame(App a) {
@@ -332,6 +388,7 @@ public class Form : Control {
     // 装饰、呈现。子窗口（ChildWindow）与共享文件选择器由
     // ChildWindows 注册表在此自动泵送，宿主无需手写任何泵逻辑。
     void Run() {
+        this.WireDocEvents();
         app.Show();
         App prior = App.frameApp;
         // 拖动窗口边框时 OS 进入模态尺寸调整循环，下面这个循环拿不到

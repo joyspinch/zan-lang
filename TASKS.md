@@ -8,7 +8,7 @@
 
 ## 未完成
 
-- [ ] **B-ID47** 运行期文档通道缺键事件派发：`DesignerHtml.NormalizeEventName` 认 `@keydown`/`@focus`/`@blur`（产出 `onKeyDown` 等文档键），但运行期没有任何控件触发这些命名事件——绑定静默失效（gui-free/gui-watch 模板因此删掉 @keydown 演示）。修法：Input 按键路径接 `BindEvent("KeyDown", ...)` 一类的命名事件出口，conformance 用例钉住。
+- [ ] **B-ID48** UiEvent sender 通道委托实参腐坏（编译器/运行时缺陷）：`UiEvent.RaiseS` 里 `h(sender)` 按名调用 sender 通道委托，处理器体里读形参得到的是坏引用——虚分派即段错误，读字段得空值；忽略形参则正常；无参 Action 通道完全正常。证据：`_scratch/bid47` 探针（Form 桥 ControlEvent 处理器读 `c.name` 得空串、`c.Kind()` 崩；Main 里直接 `in1.OnKeyDownS((Control c) => ... c == in1 ...)` 同样崩）；脱离 GUI 的最小复刻（List 存委托 + 循环 `h(sender)`）通过，说明需 GUI 规模上下文才现形；`--emit-ir` 检查 RaiseS/FireByName/FireKeyNamed 调用链 IR 全部正确（closure 分支 `fn(env, sender)`、bare 分支 `fn(sender)`），疑点在委托元素的 tag/调用约定错配（崩溃现场 `call *0xf8(%rax)` 的 rax 是函数序言机器码，即形参拿到代码指针）。修法方向：查 zanc 委托创建/加载的 tag 编码与 callee 参数槽映射；连带核查 ModelBinder.WireNode 与 Html 通道的 sender 处理器是否同样受害（生产面板处理器普遍忽略 sender 参数，缺陷因此潜伏）。修好后把 B-ID47 的探针升级出 sender 形态断言。
 
 
 

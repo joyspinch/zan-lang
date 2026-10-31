@@ -114,6 +114,9 @@ public class Input : Control {
     // 文本输入，按回车才开始编辑——避免误触 Tab 聚焦就吞掉输入。
     bool PassiveActivated;
     bool passiveActive;
+    // 最近一次发过命名键事件的 OS 事件序号：键槽未认领时跨帧留存，
+    // 靠序号把 KeyDown/KeyUp/KeyPress 各限制为每物理事件一次。
+    long lastKeyNamedSeq;
 
     // 输入过滤（Naive UI allow-input）：返回清洗后的候选文本，
     // null 表示原样拒绝。用于「只允许数字」「trim 空白」这类
@@ -151,6 +154,7 @@ public class Input : Control {
         FieldStatus = "";
         PassiveActivated = false;
         passiveActive = false;
+        lastKeyNamedSeq = 0;
         Filter = null;
         liveApp = null;
         wiresOwnEvents = true;
@@ -450,7 +454,11 @@ public class Input : Control {
                 // 忽略 Tab（由框架焦点遍历处理）——不消费，Tab 留给框架。
             } else {
                 string ch = Text.CharStr(code);
-                if (ch.Length > 0) {
+                if (ch.Length > 0 && Window.EventSeqGlobal() != this.lastKeyNamedSeq) {
+                    // 字符键出口：落文本之前通知（DOM keypress 语义）；
+                    // 同一序号去重（与 KeyDown/KeyUp 共用一档）。
+                    this.lastKeyNamedSeq = Window.EventSeqGlobal();
+                    this.FireKeyNamed("KeyPress");
                     // IME 组合：直接插入（上限/过滤同样生效）。
                     if (this.Insert(ch)) { app.RequestRedraw(); }
                     // 这个字符已归本输入框：事件槽留到下次轮询期间窗口
@@ -459,9 +467,22 @@ public class Input : Control {
                     app.ClaimKey();
                 }
             }
+        } else if (kind == 5) {
+            // 键释放出口：命名 KeyUp（仅通知，不消费事件槽）。
+            if (Window.EventSeqGlobal() != this.lastKeyNamedSeq) {
+                this.lastKeyNamedSeq = Window.EventSeqGlobal();
+                this.FireKeyNamed("KeyUp");
+            }
         } else if (kind == 4) {
             int kc = app.window.EventKeyCode();
             int mods = app.window.EventMods();
+            // 键按下出口：编辑快捷键之前通知，命名处理器看到包括
+            // Ctrl 组合在内的每一次按键。事件槽未认领时跨帧留存，
+            // 按事件序号去重，一个物理按键只通知一次。
+            if (Window.EventSeqGlobal() != this.lastKeyNamedSeq) {
+                this.lastKeyNamedSeq = Window.EventSeqGlobal();
+                this.FireKeyNamed("KeyDown");
+            }
             bool shift = Modifiers.HasShift(mods);
             bool ctrl = Modifiers.HasCtrl(mods);
             if (ctrl && kc == 65) {
@@ -838,7 +859,9 @@ public class Input : Control {
         // 恢复 Class，避免设计器/序列化器读到污染的字段。
         Class = origClass;
 
-        On.Fire(app, id, this);
+        // 键盘族不在此轮询（键槽跨帧留存会重复投递），走 HandleInput
+        // 的命名出口；其余通用事件照常按帧快照轮询。
+        On.FireNonKey(app, id, this);
         return id;
     }
 
