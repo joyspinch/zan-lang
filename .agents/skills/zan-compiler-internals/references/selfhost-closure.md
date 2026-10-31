@@ -166,7 +166,7 @@ kernel32、shell32、user32、advapi32、version）。
 - 理由（2026-10-20 差分门实测）：自举原来**生产侧不打标签、消费侧按标签判别**
   ——闭包记录地址被当成裸函数指针直接 `call`，于是 pc 落在数据地址上，
   表现为 0xC0000005（ASAN: "UNKNOWN memory access"，pc=数据地址）。
-  判别位是必需的：`(Delegate)nint`（`stdlib/System/Interop.zan` 的
+  判别位是必需的：`(Delegate)nint`（`stdlib/System/Interop/Interop.zan` 的
   `(GetEnvironmentVariableWFn)fn`）产生的是**没有标签的裸原生函数指针**，
   调用侧要靠标签区分"堆闭包"与"裸函数指针"，后者按声明形参直接调、不带 env。
 - 连带：extern 形参是 delegate 时要的是**代码地址**，必须先脱标签再取

@@ -8,7 +8,7 @@
 
 ## 未完成
 
-- （暂无未闭环任务）
+- [ ] B-ID50 `src/compiler/checker.c` 开放泛型转发桩注释块（~4918-4945）仍以已移除的 GenDb 编译期生成器为据：ORM 收口为纯反射库后 `Select<T>` 是 DbExtensions 扩展方法、模板体静态绑定（探针：`BaseDao<T>.All()` 里 `db.Select<T>().ToList()` 编译运行通过），BaseDao 示例已失真。按现机制重写该注释块，并为"真解析不到"的调用补一条仍走转发桩的 conformance 例。
 
 
 

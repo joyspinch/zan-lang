@@ -5,8 +5,7 @@ description: Zan 游戏开发规范——Gui 美术风格一致性、帧循环�
 
 # Zan 游戏开发：美术风格、帧循环、HUD 与手感
 
-> 框架侧看 `stdlib/Game/Kit/Host.zan`（LimitFps/SetIdleFps/
-> SetRedrawInterval/ShouldRender/Pace/Focused/Begin/End），
+> 框架侧看 Gui App 帧循环（`packages/Zan.Gui/src/Gui/Core/App.zan`），
 > 范例看 `templates/game/` 各游戏。
 
 ## 图形游戏的 Gui 组件必须匹配游戏美术风格（硬规则）
@@ -101,7 +100,7 @@ description: Zan 游戏开发规范——Gui 美术风格一致性、帧循环�
   光栅化。动作/工厂游戏通过 GuiHost 分开固定逻辑步与显示帧，并保留必要
   输入状态。为什么：用户实机否决失焦时世界停住，焦点或输入空闲不能代表
   没有人在看。
-- **降速闸门必须选"没人看"的真信号，输入空闲不算**（stdlib/Gui App 对照
+- **降速闸门必须选"没人看"的真信号，输入空闲不算**（Gui App 帧循环对照
   条 用户实机反馈后删案）：App.zan `FxIntervalMs` 曾按输入
   空闲把 BackdropFx 心跳 ×2/×4/×8（基值才 80-200ms，×2 起粒子漂移就
   肉眼可见地一卡一卡）——失焦可见窗首当其冲。前提"输入空闲=没人看"
@@ -923,7 +922,7 @@ Post 调用核对编码，别信二手注释。
 ## 游戏基座引擎体系与各类型定式（Core / Tactics / Arpg / Cards）
 
 - **渲染引擎与游戏引擎职责严格解耦**：
-  - 渲染引擎（`stdlib/Gui/Rendering`、GPU Quad Batcher `SpriteBatch`、纹理烘焙 `BakeSprite`、`Canvas`）只管 GPU 显存纹理、视口裁剪与着色器四边形极速绘制（实测 10,000 精灵仅 0.085ms/frame），不包含任何血量、碰撞或游戏业务概念。
+  - 渲染引擎（`packages/Zan.Gui/src/Gui/Rendering`、GPU Quad Batcher `SpriteBatch`、纹理烘焙 `BakeSprite`、`Canvas`）只管 GPU 显存纹理、视口裁剪与着色器四边形极速绘制（实测 10,000 精灵仅 0.085ms/frame），不包含任何血量、碰撞或游戏业务概念。
   - 游戏引擎（`packages/Zan.Game`）负责纯逻辑状态推进、定步时钟、空间检索、路径解算，向渲染引擎单向提交轻量绘制指令。
 - **L0 核心底座（Game.Core）**：
   - `GameClock`：固定时间步长（50Hz/60Hz），`InterpolationAlpha` 导出亚帧平滑插值比例，严格内置 `maxAccumulator` 熔断防止“螺旋死锁”。

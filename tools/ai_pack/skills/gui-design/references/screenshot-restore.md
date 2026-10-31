@@ -95,7 +95,7 @@ SKILL.md"缩放纪律"的样式路径/自绘路径两分法），抄物理值 = 
 
 - 原引擎文档里**列了控件、但这个移植/工具链里没有**的（实证：第三方 UI 规格
   有 `bagBox`/`itemBox`/`skillBox`/
-  `quickBox` 一族格子控件，`stdlib/Game/Arpg` 只移植了数据模型与
+  `quickBox` 一族格子控件，`packages/Zan.Game/src/Game/Arpg` 只移植了数据模型与
   label/button/imageBox/progressBar 等基础控件，**格子类没移植**）——
   **不要自绘**（违反"控件自己负责绘制"），也**不要凭空给标准库造一个新
   公开接口**（违反"以复用现有为荣"）。正确动作：用**项目内已有的共享组件**

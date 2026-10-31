@@ -37,7 +37,7 @@ Config templates ship in the SDK under `ai\`: `.mcp.json` (Claude Code and
 most clients), `.cursor\mcp.json`, `.vscode\mcp.json` — install them with
 `--init-agent`, not by hand-copying (the `<ZAN_MCP>` placeholder would stay
 literal and the client would fail to launch the server). Full guide:
-`docs\AI_ONBOARDING.md`.
+`docs/AI_ONBOARDING.md` (in this repo: `tools/ai_pack/docs/AI_ONBOARDING.md`).
 
 HTTP is the same API on `POST /`, `/mcp` or `/rpc`:
 

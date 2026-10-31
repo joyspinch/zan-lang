@@ -9,7 +9,8 @@ description: The fixed workflow for Zan coding tasks — orient, look the API up
 
 MCP connected: `zan_start_here` → layout, entry point, build/test commands,
 which optional tools this installation actually has.
-No MCP: read `AGENTS.md` and `docs/AI_ONBOARDING.md` at the SDK root (shipped from this pack).
+No MCP: read `AGENTS.md` and `docs/AI_ONBOARDING.md` at the SDK root
+(in this repo: `tools/ai_pack/docs/AI_ONBOARDING.md`).
 
 ## 1. Locate before you read
 
@@ -515,22 +516,12 @@ Without MCP the same index is a file: `knowledge/symbols.json` next to the SDK
   会把 `stdlib/System` 整棵子树拉进来，靠它"顺便"解析到 `System.Json` 的
   `JsonValue` 是**依赖副作用**——要 `JsonValue` 就写 `using System.Json;`
   （仓库里 6700+ 个文件都这么写），别指望父命名空间兜底。
-* **编译期 ORM 的 `Insert<T>` / `Select<T>` / `Update<T>` / `Delete<T>` 不是接口
-  方法**（实证，2026-10-22）：`IDbExecutor` 上只有 `Query` / `Execute` /
-  `ExecuteScalar` / `GetProvider`；那四个泛型方法是编译器的**代码生成器**
-  （`stdlib/System/Compiler/GenDb.zan`）把调用点改写成 `__DbQ_<E>` /
-  `__DbI_<E>` 类型化门面（`GenDbEmit.zan`）才有的——门面里才调
-  `OrmSelect` / `OrmInsert`，接口上当然没有。
-  - 生成器**只在类型实参是具体实体类**时才改写（`GenDb.IsRoot` 要求
-    `ClassGet(targ) != null`）；类型实参是**类型形参**（`BaseRepository<T>` 里的
-    `T`）就改写不了——那正是"开放泛型模板"：真身由
-    `zan_parser_specialize_generic_bases` 在派生类里特化出来，模板体本身只留
-    运行期转发桩。
-  - 推论：看到"`IDbExecutor` 没有 `Insert`"**不要去补接口**——补了只是多一份
-    要同步的空契约；正确问法是"类型实参是不是具体实体类"。
-  - 坑出处：查 ORM 报错时先按"接口缺方法"读接口，读完发现全仓**没有任何
-    `Insert<T>` 的声明**——真身在生成器里；而 `BaseRepository<T>` 必须**继承**
-    才能用（直接 `new` 会静默返回默认值，见 `TASKS.md` A494）。
+* **ORM 的 `Insert<T>` / `Select<T>` / `Update<T>` / `Delete<T>` 是扩展方法，
+  不是 `IDbConnection` / `IDbExecutor` 的接口方法**：真身在纯反射 ORM 库
+  `packages/Zan.Data/src/System/Data/Orm/`（`DbExtensions.zan` 按反射物化
+  实体行），静态绑定——泛型基类模板体里的 `db.Select<T>()` 也直接解析。
+  看到"接口上没有 `Insert`"**不要去补接口**——补了只是多一份要同步的
+  空契约；泛型仓储按惯例继承使用，由派生类把 `T` 落成具体实体。
 ## 4. Edit
 
 `edit_file(path, old, new)` (MCP) replaces an exact snippet in place — the

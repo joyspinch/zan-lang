@@ -1,6 +1,6 @@
 ---
 name: zan-dev-standards
-description: Zan 开发规范总纲——开发工作流闭环、代码规范（自绘禁令等）、验证纪律、经验沉淀纪律。用 Zan 写任何程序（GUI/游戏/服务端/工具）、改 stdlib/templates/examples、做实机验证与调试时使用；验证/并发逐坑细节在 references/verification.md。
+description: Zan 开发规范总纲——开发工作流闭环、代码规范（自绘禁令等）、验证纪律、经验沉淀纪律。用 Zan 写任何程序（GUI/游戏/服务端/工具）、改 stdlib、packages、templates、examples，做实机验证与调试时使用；验证/并发逐坑细节在 references/verification.md。
 ---
 
 # Zan 开发规范总纲
