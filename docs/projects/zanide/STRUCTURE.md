@@ -28,8 +28,11 @@ src/ide_zan/
   zan.proj              项目清单（entry / name / kind）
   ide.css               页面样式表
   src/
-    IdeForm.html        主窗体（入口，窗口文档）
-    IdeForm.zan
+    IdeForm.zan         入口（zan.proj entry=）：读 ide/IdeForm.html 投影主窗
+    *.html              设计稿（运行期装载；发布 --embed 烘入，非编译输入）
+    *.design.zan        设计稿半件（scripts/gen_design_halves.py 生成，勿手改）
+    IdeDesignedRegistry.zan  组件注册表（同脚本扫描文档引用生成：设计类发工厂、
+                        声明 Install() 的组件类发调用——新增组件零清单自发现）
     shell/              外壳：ribbon 命令、停靠注册、快捷键、帧循环
     panels/             停靠面板（每个一对 .html + .zan，role: control）
     editor/             编辑器宿主、标签条、查找栏、代码导航、诊断存储
