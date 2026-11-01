@@ -1006,3 +1006,17 @@ description: zanc 编译器内部（parser/checker/irgen/runtime/ABI）设计契
       三处调用点（Parse 抛 / TryParse false / Convert 软诊断+0）零改动。
     - 判定器：case_double_format（Infinity 回读两侧比较）+
       case_convert_overflow（真溢出仍要判坏）+ case_builtin_parse_chain。
+
+61. **泛型类里的 static Main 不是合法入口——入口选择必须拒收，否则开放编译静默产坏码**：
+    - 动作：入口选择（irgen_emit.c 的 Main 扫描）跳过 `type_params.count > 0`
+      的宿主类（__DesignMain 同守卫）；全程序无入口且仅见泛型 Main 时报
+      E3102 清晰诊断，不再落到链接期 undefined main 的哑错。
+    - 理由：入口体按"无宿主实例化"编译，体内对该类类型参数的一切显式引用
+      （调用类型实参如 `db.SyncStructure<E>()`）绑回开放参数——扩展侧烟枪
+      实证收到 `entity=T cols=0` 的空 Meta，Sync 产 `CREATE TABLE ()` 报
+      `near ")"`；同形调用在实例方法（有宿主实例化）与经实例化链调用的
+      static（p33）都正确，唯入口路径漏环境。C# 原版即禁止泛型类入口。
+    - 判定器：`class Repo<E>{ static void Main(){ db.SyncStructure<E>(); } }`
+      须报 E3102；实例方法/static 经实例化链两形照常。
+    - 连带纪律：新增诊断码先查 docs/DIAGNOSTIC_CODES.md 占用（本次初版误用
+      已占用的 3092，靠补文档行时纠出改号 3102）。

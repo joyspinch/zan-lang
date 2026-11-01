@@ -2676,7 +2676,7 @@ zan_status_t zan_irgen_emit(zan_irgen_t *g, zan_ast_node_t *unit) {
             }
         }
         if (!LLVMGetNamedFunction(g->mod, "main") && generic_main) {
-            zan_diag_emit_code(g->diag, DIAG_ERROR, generic_main_loc, 3092,
+            zan_diag_emit_code(g->diag, DIAG_ERROR, generic_main_loc, 3102,
                 "entry point 'Main' cannot be declared in a generic class"
                 " -- move it to a non-generic type (C# parity)");
         }

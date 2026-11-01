@@ -350,6 +350,7 @@
 | E3099 | E | %s |
 | E3100 | E | generic instantiation did not reach a fixed point within %d iterations; the type graph may be recursively dependent or too large |
 | E3101 | E | out of memory recording obfuscated string literals (%d recorded) |
+| E3102 | E | entry point 'Main' cannot be declared in a generic class -- move it to a non-generic type (C# parity) |
 
 ### 互操作/运行时契约（src/compiler/irgen_abi.c + irgen_expr_core.c + checker.c，段 4000–4999）
 
