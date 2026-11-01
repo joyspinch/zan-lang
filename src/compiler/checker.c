@@ -5008,6 +5008,214 @@ static int checker_call_target_member_state(zan_checker_t *c, zan_type_t *t,
     return -1;
 }
 
+/* ---------- 类型化数据访问口：recv.<Entity>（"表即属性"） ----------
+ *
+ * [Table] 实体把"取一个查询面"变成普通成员访问：
+ *   await this.User.Where(a => a.published == 1).Take(20).ToListAsync()
+ *   await db.User.Read(id)
+ * 生成器时代（ee0cfd87b dbgen.c，后迁 ZanGen.zan）由外部生成器改写链
+ * 条；生成器废除后（de208fe98）收编为编译器原生合成：checker 把成员
+ * 节点原地降级为普通 new 表达式，irgen 与后续各道零感知。
+ *
+ * 命中条件全部满足才接管（宁可漏配、不可错配——普通成员永远优先，
+ * 本函数只在常规成员查找落空后到达）：
+ *   ① 成员名按类型解析得到带 [Table] 的类；
+ *   ② 接收者能给出连接：本身是（或实现）IDbConnection，或其类声明
+ *      了无参 __Conn()；
+ *   ③ <Entity>Dao 已声明且有"单个连接可赋值参数"的构造器 —— 用它
+ *      （合成调用属编译器可信代码，与反射取值口同等待遇，不做访问
+ *      检查）；否则回退 BaseRepository<Entity>，经
+ *      ZanSql.FromConnection(conn) 构造——这是编译器与 Zan.Data 的
+ *      唯一构造接线点，库侧重构该口时同步改这里。 */
+static zan_istr_t checker_istr_lit(zan_arena_t *arena, const char *s) {
+    zan_istr_t out;
+    out.str = zan_arena_strdup(arena, s, strlen(s));
+    out.len = (uint32_t)strlen(s);
+    return out;
+}
+
+static zan_istr_t checker_istr_join(zan_arena_t *arena, zan_istr_t a,
+                                    const char *b) {
+    size_t blen = strlen(b);
+    char buf[256];
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < a.len && n < sizeof buf; i++) buf[n++] = a.str[i];
+    for (size_t i = 0; i < blen && n < sizeof buf - 1; i++) buf[n++] = b[i];
+    zan_istr_t out;
+    out.str = zan_arena_strdup(arena, buf, n);
+    out.len = n;
+    return out;
+}
+
+/* 造一个 AST_TYPE_REF；gen 参数非空时造单参泛型（BaseRepository<E>）。 */
+static zan_ast_node_t *checker_type_ref(zan_checker_t *c, zan_istr_t name,
+                                        zan_ast_node_t *gen, zan_loc_t loc) {
+    zan_ast_node_t *t = zan_ast_new(c->arena, AST_TYPE_REF, loc);
+    t->type_ref.name = name;
+    t->type_ref.is_nullable = false;
+    t->type_ref.is_array = false;
+    zan_ast_list_init(&t->type_ref.type_args);
+    if (gen) zan_ast_list_push(&t->type_ref.type_args, gen, c->arena);
+    return t;
+}
+
+static bool checker_is_table_entity(zan_checker_t *c, zan_istr_t name,
+                                    zan_type_t **out) {
+    if (name.len == 0 || name.len > 100) return false;
+    if (name.str[0] < 'A' || name.str[0] > 'Z') return false;
+    /* 探针必须无诊断：binder_lookup 查无此名静默返回 NULL，不能用
+     * resolve_type——未定义名会当场打 E1005，把"不是访问器"的正常
+     * 路径污染成编译错误。 */
+    zan_symbol_t *sym = zan_binder_lookup(c->binder, name);
+    if (!sym || sym->kind != SYM_CLASS || !sym->decl) return false;
+    if (!zan_ast_has_attr(sym->decl, "Table")) return false;
+    *out = sym->type;
+    return true;
+}
+
+/* 连接表达式：连接接收者返回对象节点本身，类接收者返回 __Conn() 调用
+ * 节点；同时经 *conn_out 带回连接表达式的静态类型。 */
+static zan_ast_node_t *checker_accessor_conn_expr(zan_checker_t *c,
+                                                  zan_ast_node_t *expr,
+                                                  zan_type_t *obj_type,
+                                                  zan_type_t **conn_out) {
+    zan_type_t *idbc = NULL;
+    zan_symbol_t *isym = zan_binder_lookup(
+        c->binder, checker_istr_lit(c->arena, "IDbConnection"));
+    if (isym && isym->kind == SYM_INTERFACE && isym->type) idbc = isym->type;
+    if (idbc && obj_type->sym &&
+        (obj_type->sym == idbc->sym ||
+         ((obj_type->kind == TYPE_CLASS || obj_type->kind == TYPE_STRUCT) &&
+          zan_binder_class_implements_iface(obj_type->sym, idbc->sym)))) {
+        *conn_out = obj_type;
+        return expr->member.object;
+    }
+    if (idbc && obj_type->kind == TYPE_CLASS && obj_type->sym) {
+        zan_symbol_t *cls = obj_type->sym;
+        for (int i = 0; i < cls->member_count; i++) {
+            zan_symbol_t *m = cls->members[i];
+            if (m->kind != SYM_METHOD || m->name.len != 6 ||
+                memcmp(m->name.str, "__Conn", 6) != 0) continue;
+            if (!m->decl || m->decl->kind != AST_METHOD_DECL ||
+                m->decl->method_decl.params.count != 0) continue;
+            zan_type_t *rt = zan_binder_resolve_type(
+                c->binder, m->decl->method_decl.return_type);
+            if (!rt || !(rt->sym == idbc->sym ||
+                         ((rt->kind == TYPE_CLASS ||
+                           rt->kind == TYPE_STRUCT) &&
+                          zan_binder_class_implements_iface(rt->sym,
+                                                            idbc->sym))))
+                continue;
+            zan_ast_node_t *callee = zan_ast_new(c->arena,
+                                                 AST_MEMBER_ACCESS, expr->loc);
+            callee->member.object = expr->member.object;
+            callee->member.name = m->name;
+            callee->member.null_cond = 0;
+            zan_ast_node_t *call = zan_ast_new(c->arena, AST_CALL, expr->loc);
+            call->call.callee = callee;
+            zan_ast_list_init(&call->call.args);
+            zan_ast_list_init(&call->call.type_args);
+            *conn_out = rt;
+            return call;
+        }
+    }
+    return NULL;
+}
+
+/* 连接实参是否能赋给构造器形参（形参为接口时按实现判定）。 */
+static bool checker_conn_fits_param(zan_checker_t *c, zan_type_t *conn,
+                                    zan_type_t *param) {
+    if (!conn || !param || !conn->sym || !param->sym) return false;
+    if (conn->sym == param->sym) return true;
+    if (param->kind == TYPE_INTERFACE &&
+        (conn->kind == TYPE_CLASS || conn->kind == TYPE_STRUCT))
+        return zan_binder_class_implements_iface(conn->sym, param->sym);
+    return false;
+}
+
+/* 原地降级：成员节点改写为 new <Dao 或 BaseRepository<E>>(...)。成员与
+ * new_expr 是同一 union 的两个臂，必须先取尽 member 侧数据再落笔。 */
+static zan_type_t *checker_emit_accessor_new(zan_checker_t *c,
+                                             zan_ast_node_t *expr,
+                                             zan_ast_node_t *type_ref,
+                                             zan_ast_node_t *arg) {
+    expr->kind = AST_NEW_EXPR;
+    expr->new_expr.type = type_ref;
+    expr->new_expr.call_init = NULL;
+    zan_ast_list_init(&expr->new_expr.args);
+    if (arg) zan_ast_list_push(&expr->new_expr.args, arg, c->arena);
+    zan_ast_list_init(&expr->new_expr.arg_inits);
+    expr->new_expr.is_array = false;
+    expr->new_expr.array_init = false;
+    expr->new_expr.array_rank = 0;
+    expr->new_expr.list_copy = false;
+    return zan_checker_check_expr(c, expr);
+}
+
+static zan_type_t *checker_try_entity_accessor(zan_checker_t *c,
+                                               zan_ast_node_t *expr,
+                                               zan_type_t *obj_type) {
+    zan_type_t *ent = NULL;
+    if (!checker_is_table_entity(c, expr->member.name, &ent)) return NULL;
+    zan_type_t *conn_ty = NULL;
+    zan_ast_node_t *conn = checker_accessor_conn_expr(c, expr, obj_type,
+                                                      &conn_ty);
+    if (!conn) return NULL;
+
+    /* ③ <Entity>Dao 已声明：单连接参数构造器直连。 */
+    zan_istr_t dao_name = checker_istr_join(c->arena, expr->member.name,
+                                            "Dao");
+    zan_symbol_t *dsym = zan_binder_lookup(c->binder, dao_name);
+    zan_type_t *dao = (dsym && dsym->kind == SYM_CLASS) ? dsym->type : NULL;
+    if (dao && dao->kind == TYPE_CLASS && dao->sym) {
+        for (int i = 0; i < dao->sym->member_count; i++) {
+            zan_symbol_t *m = dao->sym->members[i];
+            if (m->kind != SYM_CONSTRUCTOR || !m->decl ||
+                m->decl->kind != AST_CONSTRUCTOR_DECL ||
+                m->decl->method_decl.params.count != 1) continue;
+            zan_type_t *pt = zan_binder_resolve_type(
+                c->binder,
+                m->decl->method_decl.params.items[0]->param.type);
+            if (!checker_conn_fits_param(c, conn_ty, pt)) continue;
+            return checker_emit_accessor_new(c, expr,
+                checker_type_ref(c, dao_name, NULL, expr->loc), conn);
+        }
+        zan_diag_emit_code(c->diag, DIAG_ERROR, expr->loc, 2095,
+            "'%.*s' accessor needs a single-parameter constructor on "
+            "'%.*s' taking the connection",
+            (int)expr->member.name.len, expr->member.name.str,
+            (int)dao_name.len, dao_name.str);
+        return c->binder->type_error;
+    }
+
+    /* 回退：BaseRepository<Entity>(ZanSql.FromConnection(conn))。 */
+    zan_symbol_t *bsym = zan_binder_lookup(
+        c->binder, checker_istr_lit(c->arena, "BaseRepository"));
+    zan_type_t *baset = (bsym && bsym->kind == SYM_CLASS) ? bsym->type : NULL;
+    /* 只探存在性：开放泛型的 type_arg_count 形态不定，绑定交给降级
+     * 后节点自身的 resolve_type。 */
+    if (!baset || baset->kind != TYPE_CLASS || !baset->sym)
+        return NULL;
+    zan_ast_node_t *ent_ref = checker_type_ref(c, expr->member.name, NULL,
+                                               expr->loc);
+    zan_ast_node_t *base_ref = checker_type_ref(
+        c, checker_istr_lit(c->arena, "BaseRepository"), ent_ref, expr->loc);
+    zan_ast_node_t *zid = zan_ast_new(c->arena, AST_IDENTIFIER, expr->loc);
+    zid->ident.name = checker_istr_lit(c->arena, "ZanSql");
+    zid->ident.inst_type_ref = NULL;
+    zan_ast_node_t *zcallee = zan_ast_new(c->arena, AST_MEMBER_ACCESS,
+                                          expr->loc);
+    zcallee->member.object = zid;
+    zcallee->member.name = checker_istr_lit(c->arena, "FromConnection");
+    zcallee->member.null_cond = 0;
+    zan_ast_node_t *zcall = zan_ast_new(c->arena, AST_CALL, expr->loc);
+    zcall->call.callee = zcallee;
+    zan_ast_list_init(&zcall->call.args);
+    zan_ast_list_push(&zcall->call.args, conn, c->arena);
+    zan_ast_list_init(&zcall->call.type_args);
+    return checker_emit_accessor_new(c, expr, base_ref, zcall);
+}
+
 static zan_type_t *check_member_access(zan_checker_t *c, zan_ast_node_t *expr,
                                        zan_type_t *obj_type, bool in_call_callee,
                                        zan_ast_node_t *call) {
@@ -5177,6 +5385,8 @@ static zan_type_t *check_member_access(zan_checker_t *c, zan_ast_node_t *expr,
         (obj_type->kind == TYPE_CLASS || obj_type->kind == TYPE_STRUCT ||
          obj_type->kind == TYPE_INTERFACE)) {
         if (!in_call_callee) {
+            zan_type_t *dao = checker_try_entity_accessor(c, expr, obj_type);
+            if (dao) return dao;
             checker_report_no_member(c, expr, obj_type, expr->member.name, false);
             return c->binder->type_error;
         }
