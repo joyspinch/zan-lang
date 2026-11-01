@@ -366,6 +366,11 @@ static bool derives_from_controller(zan_ast_node_t *cls) {
 }
 
 static bool is_controller(zan_ast_node_t *cls) {
+    /* 抽象类与泛型原型类不直接生成路由分发器（GenRoute.IsController
+     * 同口径）——否则基类自己的动作会蹦出 new AdminController() 这类
+     * 必炸源码。 */
+    if (cls->type_decl.modifiers & MOD_ABSTRACT) return false;
+    if (cls->type_decl.type_params.count > 0) return false;
     char nm[128]; istr_to(nm, sizeof(nm), cls->type_decl.name);
     size_t l = strlen(nm);
     if (l >= 10 && strcmp(nm + l - 10, "Controller") == 0) return true;
@@ -1015,6 +1020,17 @@ static void emit_fluent(rg_buf_t *out, rg_meta *m, const char *title) {
         if (strcmp(e->val.sval, "Login") == 0) rg_putf(out, ".Login()");
         else if (strcmp(e->val.sval, "Grant") == 0) rg_putf(out, ".Auth()");
         else if (strcmp(e->val.sval, "ApiAuth") == 0) rg_putf(out, ".Auth()");
+        else if (strcmp(e->val.sval, "None") == 0 ||
+                 strcmp(e->val.sval, "Auth") == 0) {
+            /* 显式公开或仅挂载用户，不强制登录 */
+        } else {
+            rg_putf(out, ".Login()");
+        }
+    } else {
+        /* 默认 fail-closed（GenRoute.EmitFluent 同口径）：未声明
+         * Authorization 的端点统一要求登录——admin 门禁要求每个
+         * 端点（别名也算）都非匿名。 */
+        rg_putf(out, ".Login()");
     }
     /* IsMenu -> surface in admin menu (boolean flag on the route). Its text is
      * the action's [Description] and its place in the sidebar is its URL, so the
@@ -1109,9 +1125,10 @@ void zan_routegen_run(zan_ast_node_t *unit, zan_arena_t *arena,
             zan_ast_node_t *m = cls->type_decl.members.items[mi];
             if (m->kind != AST_METHOD_DECL) continue;
             if (method_has_attr(m, "NonAction")) continue;
-
             bool tagged = method_has_route_or_verb(m);
             if (!tagged && !api_controller) continue;
+            if (m->method_decl.name.str && m->method_decl.name.len > 0 &&
+                m->method_decl.name.str[0] == '_') continue;
 
             /* only public actions become routes */
             if (m->method_decl.modifiers & (MOD_PRIVATE | MOD_PROTECTED)) continue;
@@ -1170,7 +1187,29 @@ void zan_routegen_run(zan_ast_node_t *unit, zan_arena_t *arena,
             lower_inplace(actiontok);
 
             const char *verb = method_verb(m);
-            if (!verb) verb = "GET";
+            if (!verb) {
+                /* 约定动词推断（GenRoute.InferMethodVerb 同口径）：
+                 * 写作语义的方法名推 POST，其余 GET。 */
+                char lower[128];
+                snprintf(lower, sizeof(lower), "%s", mname);
+                lower_inplace(lower);
+                bool writes =
+                    strncmp(lower, "post", 4) == 0 ||
+                    strncmp(lower, "save", 4) == 0 ||
+                    strncmp(lower, "add", 3) == 0 ||
+                    strncmp(lower, "insert", 6) == 0 ||
+                    strncmp(lower, "edit", 4) == 0 ||
+                    strncmp(lower, "update", 6) == 0 ||
+                    strncmp(lower, "del", 3) == 0 ||
+                    strncmp(lower, "remove", 6) == 0 ||
+                    strncmp(lower, "field", 5) == 0 ||
+                    strncmp(lower, "upload", 6) == 0 ||
+                    strstr(lower, "delete") != NULL ||
+                    strstr(lower, "remove") != NULL ||
+                    strstr(lower, "save") != NULL ||
+                    strstr(lower, "update") != NULL;
+                verb = writes ? "POST" : "GET";
+            }
 
             char m_tpl[256]; method_route_template(m, m_tpl, sizeof(m_tpl));
             char m_rregex[256]; method_regex_template(m, m_rregex,
