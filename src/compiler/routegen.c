@@ -517,6 +517,61 @@ static void controller_token(zan_ast_node_t *cls, char *out, size_t cap) {
     lower_inplace(out);
 }
 
+/* 约定路由前缀（GenRoute.DefaultClassRoute 同口径）：显式 [Route] 优先，
+ * 否则零注解按命名空间推——首段是应用根不进路由，样板词（app/controller/
+ * src/packages/zan/mvc/web…）无论位置剥掉，控制器 token 与末段同名去尾
+ * 合并（Media/Media、Monitor/Monitor 路由落在命名空间段本身上）。 */
+static void default_class_route(zan_ast_node_t *cls, char *out, size_t cap) {
+    char segs[8][64];
+    int nseg = 0;
+    zan_istr_t ns_name = cls->meta ? cls->meta->ns_name : (zan_istr_t){NULL, 0};
+    char ns[256]; istr_to(ns, sizeof(ns), ns_name);
+    int start = 0, segidx = 0;
+    for (int i = 0; ; i++) {
+        if (ns[i] == '.' || ns[i] == 0) {
+            if (i > start && nseg < 8) {
+                char seg[64];
+                snprintf(seg, sizeof(seg), "%.*s", i - start, ns + start);
+                lower_inplace(seg);
+                bool root = segidx == 0;
+                segidx++;
+                if (!root && strcmp(seg, "app") != 0 &&
+                    strcmp(seg, "application") != 0 &&
+                    strcmp(seg, "controller") != 0 &&
+                    strcmp(seg, "controllers") != 0 &&
+                    strcmp(seg, "src") != 0 &&
+                    strcmp(seg, "source") != 0 &&
+                    strcmp(seg, "packages") != 0 &&
+                    strcmp(seg, "package") != 0 &&
+                    strcmp(seg, "zan") != 0 &&
+                    strcmp(seg, "mvc") != 0 &&
+                    strcmp(seg, "web") != 0)
+                    snprintf(segs[nseg++], sizeof(segs[0]), "%s", seg);
+            }
+            if (ns[i] == 0) break;
+            start = i + 1;
+        }
+    }
+    char tok[128];
+    controller_token(cls, tok, sizeof(tok));
+    if (nseg > 0) {
+        const char *last = segs[nseg - 1];
+        size_t ll = strlen(last);
+        if (strcmp(tok, last) == 0) tok[0] = 0;
+        else if (strncmp(tok, last, ll) == 0 && strlen(tok) > ll)
+            memmove(tok, tok + ll, strlen(tok) - ll + 1);
+    }
+    if (strcmp(tok, "department") == 0) snprintf(tok, sizeof(tok), "dept");
+    else if (strcmp(tok, "operationlog") == 0)
+        snprintf(tok, sizeof(tok), "log");
+    size_t oi = 0;
+    for (int si = 0; si < nseg && oi < cap; si++)
+        oi += (size_t)snprintf(out + oi, cap - oi, "/%s", segs[si]);
+    if (tok[0] && oi < cap)
+        oi += (size_t)snprintf(out + oi, cap - oi, "/%s", tok);
+    if (oi == 0 && cap) snprintf(out, cap, "/");
+}
+
 /* Combine class + method route templates, substitute [controller]/[action],
  * normalize slashes. */
 static void build_path(const char *cls_tpl, const char *m_tpl,
@@ -1024,6 +1079,8 @@ void zan_routegen_run(zan_ast_node_t *unit, zan_arena_t *arena,
     rg_buf_t handlers; memset(&handlers, 0, sizeof(handlers));
     rg_buf_t reg; memset(&reg, 0, sizeof(reg));
     int nroutes = 0;
+    char reg_keys[64][320];
+    int nkeys = 0;
 
     /* A route action is named "<Controller>.<Action>" ("Users.Save"): that name
      * is what the audit log records and what a role is granted, so it has to
@@ -1043,6 +1100,8 @@ void zan_routegen_run(zan_ast_node_t *unit, zan_arena_t *arena,
         char cact[256]; controller_action_name(unit, cls, cdisp, cmod,
                                               cact, sizeof(cact));
         char cls_tpl[256]; class_route_template(cls, cls_tpl, sizeof(cls_tpl));
+        if (!cls_tpl[0])
+            default_class_route(cls, cls_tpl, sizeof(cls_tpl));
         char cls_desc[256]; decl_description(cls, cls_desc, sizeof(cls_desc));
         bool api_controller = class_has_attr(cls, "ApiController");
 
@@ -1324,6 +1383,48 @@ void zan_routegen_run(zan_ast_node_t *unit, zan_arena_t *arena,
             rg_params_from_path(&params_doc, path);
             rg_emit_params(&reg, &params_doc);
             rg_putf(&reg, ";\n");
+            /* index 别名（GenRoute.IndexAlias 同口径）：主路径之外补
+             * /xxx/index 同权注册——完整 fluent 照搬只剥 .Menu()（同一
+             * 动作在侧边栏出现两次是错的），授权链照搬（别名不带授权
+             * 链时 /xxx/index 一度是匿名旁路）。 */
+            if (strcmp(actiontok, "index") == 0 && !m_tpl[0] && !is_regex) {
+                char apath[640];
+                snprintf(apath, sizeof(apath), "%s/index", cls_tpl);
+                if (strcmp(path, apath) != 0) {
+                    char akey[720];
+                    snprintf(akey, sizeof(akey), "%s %s", verb, apath);
+                    bool aseen = false;
+                    for (int ki = 0; ki < nkeys; ki++)
+                        if (strcmp(reg_keys[ki], akey) == 0) {
+                            aseen = true;
+                            break;
+                        }
+                    if (!aseen && nkeys < 64) {
+                        snprintf(reg_keys[nkeys++], sizeof(reg_keys[0]),
+                                 "%s", akey);
+                        rg_putf(&reg, "        app.Map(\"%s\", \"", verb);
+                        rg_put_qstr(&reg, apath);
+                        rg_putf(&reg, "\", __AttrRoutes.%s)\n            .Named(\"", hname);
+                        rg_put_qstr(&reg, cact);
+                        rg_putf(&reg, ".");
+                        rg_put_qstr(&reg, mname);
+                        rg_putf(&reg, "\")");
+                        rg_buf_t afl; memset(&afl, 0, sizeof(afl));
+                        emit_fluent(&afl, &meta, title);
+                        for (size_t fi = 0; fi < afl.len; ) {
+                            if (fi + 7 <= afl.len &&
+                                memcmp(afl.buf + fi, ".Menu()", 7) == 0) {
+                                fi += 7;
+                                continue;
+                            }
+                            rg_putf(&reg, "%c", afl.buf[fi]);
+                            fi++;
+                        }
+                        free(afl.buf);
+                        rg_putf(&reg, ";\n");
+                    }
+                }
+            }
             nroutes++;
         }
     }
