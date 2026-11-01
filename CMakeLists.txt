@@ -2455,7 +2455,7 @@ add_test(NAME policy_server_mvc_ai_endpoint
     -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/server_mvc/ai_endpoint_allowlist.out
     -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/policy_server_mvc_ai_endpoint${_exe_ext}
     -DSTDLIB_STAMP=${_stdlib_stamp}
-    "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/packages/Zan.Mvc/src/ZanWeb/Framework/Ai/AiEndpointPolicy.zan"
+    "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/packages/Zan.Mvc/src/Zan/Web/Framework/Ai/AiEndpointPolicy.zan"
     -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 set_tests_properties(policy_server_mvc_ai_endpoint PROPERTIES TIMEOUT 120)
 
@@ -2681,7 +2681,7 @@ foreach(_src ${_conf_srcs})
   endif()
   if(_name STREQUAL "server_mvc_timezone")
     set(_extra_args
-      "${CMAKE_SOURCE_DIR}/packages/Zan.Mvc/src/ZanWeb/Framework/Fmt.zan")
+      "${CMAKE_SOURCE_DIR}/packages/Zan.Mvc/src/Zan/Web/Framework/Fmt.zan")
   elseif(_name STREQUAL "security_cryptography_suite")
     file(GLOB _sec_crypto_srcs "${CMAKE_SOURCE_DIR}/packages/Zan.Security/src/System/Security/Cryptography/*.zan")
     set(_extra_args "${_sec_crypto_srcs};--auto-stdlib")
