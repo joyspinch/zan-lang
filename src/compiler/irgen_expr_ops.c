@@ -768,6 +768,33 @@ static LLVMValueRef mask_shift_count(zan_irgen_t *g, zan_ast_node_t *lhs,
 static LLVMValueRef emit_binary_op_values(zan_irgen_t *g, zan_ast_node_t *expr,
                                           LLVMValueRef left, LLVMValueRef right,
                                           local_scope_t *locals) {
+        /* 比较类的 int/指针 混比必须当场诊断：checker 在开放泛型 lambda
+         * 上下文里判不出成员类型（特化后才知道，E2045 被静默跳过），裸
+         * icmp i32 vs ptr 会被 LLVM verify 整模块击毙（E3090 报在 0:0，
+         * 比编译错难懂得多——B-ID59 的 diag_orm_where_int_string 形状）。 */
+        {
+            int op = expr->binary.op;
+            bool cmp = op == TK_EQ_EQ || op == TK_BANG_EQ || op == TK_LESS ||
+                       op == TK_GREATER || op == TK_LESS_EQ ||
+                       op == TK_GREATER_EQ;
+            if (cmp) {
+                LLVMTypeKind lk = LLVMGetTypeKind(LLVMTypeOf(left));
+                LLVMTypeKind rk = LLVMGetTypeKind(LLVMTypeOf(right));
+                bool li = lk == LLVMIntegerTypeKind;
+                bool ri = rk == LLVMIntegerTypeKind;
+                bool lp = lk == LLVMPointerTypeKind;
+                bool rp = rk == LLVMPointerTypeKind;
+                if ((li && rp) || (lp && ri)) {
+                    zan_diag_emit_code(g->diag, DIAG_ERROR, expr->loc, 2045,
+                        "cannot compare a %s operand and a %s operand -- "
+                        "convert one side explicitly",
+                        li ? "numeric" : "reference",
+                        ri ? "numeric" : "reference");
+                    return LLVMConstInt(LLVMInt1TypeInContext(g->ctx), 0, 0);
+                }
+            }
+        }
+
         /* 混合位宽整数与浮点数类型隐式提升转换 */
         coerce_int_pair(g, &left, &right);
 

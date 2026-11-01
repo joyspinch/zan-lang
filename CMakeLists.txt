@@ -5655,14 +5655,17 @@ endforeach()
 
 # Typed-ORM queries must reject literal/column type mismatches at compile
 # time. dbgen used to lower `p.num == "abc"` / `p.name == 123` to a bound
-# parameter of the wrong shape, silently running a type-coerced comparison.
+# parameter of the wrong shape, silently running a type-coerced comparison;
+# after GenDb's removal the checker misses these inside open-generic lambda
+# bodies (member types only exist after specialization), so irgen emits
+# E2045 instead of letting a mismatched ICmp reach LLVM verify.
 foreach(_mismatch int_string string_int)
   add_test(NAME diag_orm_where_${_mismatch}
     COMMAND ${CMAKE_COMMAND}
       -DZANC=$<TARGET_FILE:zanc>
       -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/orm_where_${_mismatch}.zan
       -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/diag_orm_where_${_mismatch}${_exe_ext}
-      "-DEXPECT_REGEX=type mismatch"
+      "-DEXPECT_REGEX=cannot compare"
       -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
   set_tests_properties(diag_orm_where_${_mismatch} PROPERTIES TIMEOUT 60)
 endforeach()
@@ -5672,7 +5675,7 @@ add_test(NAME diag_orm_set_string_int
     -DZANC=$<TARGET_FILE:zanc>
     -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/orm_set_string_int.zan
     -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/diag_orm_set_string_int${_exe_ext}
-    "-DEXPECT_REGEX=type mismatch"
+    "-DEXPECT_REGEX=no overload of 'UpdateQuery.Set' matches"
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_orm_set_string_int PROPERTIES TIMEOUT 60)
 
