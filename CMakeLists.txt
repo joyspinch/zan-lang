@@ -3311,7 +3311,7 @@ if(SELFHOST_CLANG)
   # / SHGetFileInfoW -> shell32, DestroyIcon -> user32, the version API ->
   # version). POSIX needs libdl/libpthread for the same stdlib surface.
   if(WIN32)
-    set(_sh_syslibs "-lkernel32;-lshell32;-luser32;-ladvapi32;-lversion")
+    set(_sh_syslibs "-lkernel32;-lshell32;-luser32;-ladvapi32;-lversion;-lws2_32;-lbcrypt")
   else()
     set(_sh_syslibs "-ldl;-lpthread;-lm")
   endif()
