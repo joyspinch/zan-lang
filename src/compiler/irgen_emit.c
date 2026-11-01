@@ -2622,6 +2622,11 @@ zan_status_t zan_irgen_emit(zan_irgen_t *g, zan_ast_node_t *unit) {
 
     {
         zan_ast_node_t *design_main = NULL;
+        /* C# 同步：泛型类中的 static Main 不是合法入口——按开放泛型编译
+         * 会让体内对该类类型参数的一切显式引用（调用类型实参等）落回
+         * 开放参数（探针实证扩展收到 entity=T cols=0），静默产坏码。 */
+        bool generic_main = false;
+        zan_loc_t generic_main_loc = zan_loc(0, 0, 0, 0);
         for (int i = 0; i < unit->comp_unit.decls.count; i++) {
             zan_ast_node_t *decl = unit->comp_unit.decls.items[i];
             if (decl->kind != AST_CLASS_DECL && decl->kind != AST_STRUCT_DECL)
@@ -2633,6 +2638,10 @@ zan_status_t zan_irgen_emit(zan_irgen_t *g, zan_ast_node_t *unit) {
                     !(member->method_decl.modifiers & MOD_STATIC)) continue;
                 if (member->method_decl.name.len == 4 &&
                     memcmp(member->method_decl.name.str, "Main", 4) == 0) {
+                    if (decl->type_decl.type_params.count > 0) {
+                        if (!generic_main) { generic_main = true; generic_main_loc = member->loc; }
+                        continue;
+                    }
                     zan_symbol_t *main_type_sym =
                         zan_binder_lookup(g->binder, decl->type_decl.name);
                     emit_main_method(g, member, main_type_sym, unit);
@@ -2640,7 +2649,8 @@ zan_status_t zan_irgen_emit(zan_irgen_t *g, zan_ast_node_t *unit) {
                 }
                 if (!design_main && member->method_decl.name.len == 12 &&
                     memcmp(member->method_decl.name.str, "__DesignMain",
-                           12) == 0) {
+                           12) == 0 &&
+                    decl->type_decl.type_params.count == 0) {
                     design_main = member;
                 }
             }
@@ -2664,6 +2674,11 @@ zan_status_t zan_irgen_emit(zan_irgen_t *g, zan_ast_node_t *unit) {
                     break;
                 }
             }
+        }
+        if (!LLVMGetNamedFunction(g->mod, "main") && generic_main) {
+            zan_diag_emit_code(g->diag, DIAG_ERROR, generic_main_loc, 3092,
+                "entry point 'Main' cannot be declared in a generic class"
+                " -- move it to a non-generic type (C# parity)");
         }
     }
 done:
