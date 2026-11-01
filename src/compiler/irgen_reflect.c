@@ -668,7 +668,19 @@ static LLVMValueRef refl_make_ctor_thunk(zan_irgen_t *g, zan_symbol_t *sym,
     LLVMPositionBuilderAtEnd(g->builder,
         LLVMAppendBasicBlockInContext(g->ctx, th, "entry"));
 
-    int site = reserve_arc_site(g, sym, sym->type, 0, NULL);
+    /* 站点必须在 desc_init（站点→类型名表）冻结**之前**登记：这里晚于
+     * 名表发射，新建点查无此名，反射造出的对象过不了任何 is/下转
+     * （ORM MapRow 的 (T)obj 全军覆没）。预登记站点见
+     * refl_reserve_thunk_sites；此处只取用。 */
+    int site = -1;
+    for (int i = 0; i < g->refl_mtab_count; i++) {
+        if (g->refl_mtabs[i].ctors && g->refl_mtabs[i].sym == sym &&
+            g->refl_mtabs[i].site >= 0) {
+            site = g->refl_mtabs[i].site;
+            break;
+        }
+    }
+    if (site < 0) site = reserve_arc_site(g, sym, sym->type, 0, NULL);
     LLVMValueRef raw = zan_call2(g->builder,
         LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i64, i64, i8ptr }, 3, 0),
         g->rt_alloc, (LLVMValueRef[]){ LLVMSizeOf(st),
@@ -822,6 +834,7 @@ static LLVMValueRef refl_shape_mtab(zan_irgen_t *g, zan_symbol_t *sym,
     g->refl_mtabs[g->refl_mtab_count].sym = sym;
     g->refl_mtabs[g->refl_mtab_count].n = n;
     g->refl_mtabs[g->refl_mtab_count].ctors = ctors;
+    g->refl_mtabs[g->refl_mtab_count].site = -1;
     g->refl_mtab_count++;
     *out_count = n;
     return LLVMConstBitCast(gv, LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0));
@@ -1053,6 +1066,19 @@ static LLVMValueRef refl_meta_for(zan_irgen_t *g, zan_type_t *t,
         LLVMConstArray(i8, chars, (unsigned)(disp_len + 1)) }, 14));
     free(chars);
     return rec;
+}
+
+/* ctor thunk 的分配点必须在站点→类型名表冻结之前登记（irgen_emit.c
+ * 的顺序：refl_reserve_thunk_sites → arc desc/tyname 表 → 
+ * refl_finalize_mtabs）。登记时 sym 已知，名表把实体类名的继承链
+ * 挂到该分配点上，反射 CreateInstance 造出的对象才能通过 is/下转。 */
+void refl_reserve_thunk_sites(zan_irgen_t *g) {
+    for (int i = 0; i < g->refl_mtab_count; i++) {
+        if (!g->refl_mtabs[i].ctors || g->refl_mtabs[i].site >= 0) continue;
+        zan_symbol_t *sym = g->refl_mtabs[i].sym;
+        if (!sym || !sym->type || sym->type->kind != TYPE_CLASS) continue;
+        g->refl_mtabs[i].site = reserve_arc_site(g, sym, sym->type, 0, NULL);
+    }
 }
 
 static void refl_finalize_mtabs(zan_irgen_t *g) {

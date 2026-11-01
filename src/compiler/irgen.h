@@ -457,6 +457,7 @@ struct zan_irgen {
         zan_symbol_t *sym;
         int           n;
         bool          ctors;
+        int           site;   /* ctor thunk 的分配点，desc_init 前预登记 */
     } *refl_mtabs;
     int refl_mtab_count;
     int refl_mtab_cap;

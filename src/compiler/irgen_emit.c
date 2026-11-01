@@ -2752,6 +2752,11 @@ done:
     free(work);
     if (zan_diag_has_errors(g->diag)) return ZAN_ERROR;
     di_clear(g);
+    /* 不变量：全部分配点登记必须先于任何按站点索引的表发射
+     * （live/dtor/tyname/meta/desc）。反射 ctor thunk 的分配点原本在
+     * finalize 才登记，名表早已冻结——反射造出的对象过不了任何
+     * is/下转（MapRow (T)obj 全军覆没）。 */
+    refl_reserve_thunk_sites(g);
     emit_all_class_releases(g);
     emit_site_live_tables(g);
     emit_site_dtor_table(g);
