@@ -139,6 +139,11 @@ static zan_type_t *builtin_call_result_type(zan_checker_t *c,
 
 #define CHECKER_DERIVES_MAX_DEPTH 8192
 
+/* SyncStructureAll(Async) 编译期实体发现（定义见文件尾 SyncStructureAll 节） */
+static bool checker_recv_is_conn(zan_checker_t *c, zan_type_t *recv);
+static zan_ast_node_t *checker_synthesize_table_array(zan_checker_t *c,
+                                                      zan_loc_t loc);
+static zan_istr_t checker_istr_lit(zan_arena_t *arena, const char *s);
 void zan_checker_init(zan_checker_t *c, zan_binder_t *binder,
                       zan_arena_t *arena, zan_diag_t *diag) {
     memset(c, 0, sizeof(*c));
@@ -3257,6 +3262,42 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
                 "nameof requires a single identifier or member access");
             return c->binder->type_error;
         }
+        /* 零参 SyncStructureAll(Async)：合成 Meta[] 实参（见文件尾
+         * checker_synthesize_table_array），之后按普通扩展调用走。 */
+        if (expr->call.callee && expr->call.callee->kind == AST_MEMBER_ACCESS &&
+            expr->call.args.count == 0 &&
+            ((expr->call.callee->member.name.len == 16 &&
+              memcmp(expr->call.callee->member.name.str, "SyncStructureAll",
+                     16) == 0) ||
+             (expr->call.callee->member.name.len == 21 &&
+              memcmp(expr->call.callee->member.name.str,
+                     "SyncStructureAllAsync", 21) == 0))) {
+            zan_type_t *srecv = zan_checker_check_expr(
+                c, expr->call.callee->member.object);
+            if (checker_recv_is_conn(c, srecv)) {
+                /* 改写为静态直调 DbExtensions.SyncStructureAll*(db, metas)：
+                 * 扩展分发 + await 会踩泛型环境失真（体不执行、结果槽 0，
+                 * B-ID63 家族；metrics 直调 SyncAsync 的同一绕开术）——
+                 * 扩展就是 this 首参的静态，直调语义等价。 */
+                zan_ast_node_t *recvnode = expr->call.callee->member.object;
+                zan_istr_t mname = expr->call.callee->member.name;
+                zan_ast_node_t *zid = zan_ast_new(c->arena, AST_IDENTIFIER,
+                                                  expr->loc);
+                zid->ident.name = checker_istr_lit(c->arena, "DbExtensions");
+                zid->ident.inst_type_ref = NULL;
+                zan_ast_node_t *ncal = zan_ast_new(c->arena, AST_MEMBER_ACCESS,
+                                                   expr->loc);
+                ncal->member.object = zid;
+                ncal->member.name = mname;
+                ncal->member.null_cond = 0;
+                expr->call.callee = ncal;
+                zan_ast_list_init(&expr->call.args);
+                zan_ast_list_push(&expr->call.args, recvnode, c->arena);
+                zan_ast_list_push(&expr->call.args,
+                                  checker_synthesize_table_array(c, expr->loc),
+                                  c->arena);
+            }
+        }
         zan_type_t *callee_type;
         zan_type_t *recv = NULL;
         int callee_is_method = 0;
@@ -5726,9 +5767,103 @@ static void check_virtual_shadows_base(zan_checker_t *c, zan_ast_node_t *decl) {
     }
 }
 
+/* ---------- SyncStructureAll(Async) 的编译期实体发现 ----------
+ *
+ * "自动发现自动建表"：`db.SyncStructureAllAsync()` 零参调用不查运行时
+ * 注册表——checker 在编译单元里预扫描 [Table] 类，在调用点原地合成
+ * `new Meta[] { Meta.For<E1>(), ... }` 实参，交给库侧逐实体 Sync。
+ * 无运行时 ABI、无生成器，实体清单与编译单元永远一致。 */
+
+static void checker_collect_table_entities(zan_checker_t *c,
+                                           zan_ast_node_t *unit) {
+    if (c->table_ents_done || !unit || unit->kind != AST_COMPILATION_UNIT) {
+        return;
+    }
+    c->table_ents_done = true;
+    for (int i = 0; i < unit->comp_unit.decls.count; i++) {
+        zan_ast_node_t *decl = unit->comp_unit.decls.items[i];
+        if (decl->kind != AST_CLASS_DECL || !decl->type_decl.name.str) continue;
+        if (!zan_ast_has_attr(decl, "Table")) continue;
+        int dup = 0;
+        for (int k = 0; k < c->table_ent_count; k++) {
+            if (c->table_ents[k].len == decl->type_decl.name.len &&
+                memcmp(c->table_ents[k].str, decl->type_decl.name.str,
+                       (size_t)decl->type_decl.name.len) == 0) { dup = 1; break; }
+        }
+        if (dup) continue;
+        if (c->table_ent_count >= c->table_ent_cap) {
+            int ncap = c->table_ent_cap ? c->table_ent_cap * 2 : 16;
+            zan_istr_t *nm = (zan_istr_t *)zan_arena_alloc(
+                c->arena, (size_t)ncap * sizeof(zan_istr_t));
+            for (int k = 0; k < c->table_ent_count; k++) nm[k] = c->table_ents[k];
+            c->table_ents = nm;
+            c->table_ent_cap = ncap;
+        }
+        c->table_ents[c->table_ent_count++] = decl->type_decl.name;
+    }
+}
+
+/* 接收者能否充当同步连接：本身是（或实现）IDbConnection/IDbExecutor。 */
+static bool checker_recv_is_conn(zan_checker_t *c, zan_type_t *recv) {
+    if (!recv || !recv->sym) return false;
+    if (recv->kind != TYPE_CLASS && recv->kind != TYPE_STRUCT &&
+        recv->kind != TYPE_INTERFACE) return false;
+    zan_symbol_t *isym = zan_binder_lookup(
+        c->binder, checker_istr_lit(c->arena, "IDbConnection"));
+    zan_symbol_t *xsym = zan_binder_lookup(
+        c->binder, checker_istr_lit(c->arena, "IDbExecutor"));
+    if (isym && recv->sym == isym) return true;
+    if (xsym && recv->sym == xsym) return true;
+    if (recv->kind != TYPE_INTERFACE &&
+        (recv->kind == TYPE_CLASS || recv->kind == TYPE_STRUCT)) {
+        if (isym && zan_binder_class_implements_iface(recv->sym, isym)) return true;
+        if (xsym && zan_binder_class_implements_iface(recv->sym, xsym)) return true;
+    }
+    return false;
+}
+
+/* new Meta[] { Meta.For<E1>(), ... }：数组初始化式，元素为泛型静态
+ * 调用（与 ZanSql.FromConnection 同款合成形状，多 type_args）。 */
+static zan_ast_node_t *checker_synthesize_table_array(zan_checker_t *c,
+                                                      zan_loc_t loc) {
+    zan_ast_node_t *tref = zan_ast_new(c->arena, AST_TYPE_REF, loc);
+    tref->type_ref.name = checker_istr_lit(c->arena, "Meta");
+    tref->type_ref.is_nullable = false;
+    tref->type_ref.is_array = true;
+    zan_ast_list_init(&tref->type_ref.type_args);
+    zan_ast_node_t *n = zan_ast_new(c->arena, AST_NEW_EXPR, loc);
+    n->new_expr.type = tref;
+    n->new_expr.call_init = NULL;
+    zan_ast_list_init(&n->new_expr.args);
+    zan_ast_list_init(&n->new_expr.arg_inits);
+    n->new_expr.is_array = true;
+    n->new_expr.array_init = true;
+    n->new_expr.array_rank = 0;
+    n->new_expr.list_copy = false;
+    for (int i = 0; i < c->table_ent_count; i++) {
+        zan_ast_node_t *zid = zan_ast_new(c->arena, AST_IDENTIFIER, loc);
+        zid->ident.name = checker_istr_lit(c->arena, "Meta");
+        zid->ident.inst_type_ref = NULL;
+        zan_ast_node_t *cal = zan_ast_new(c->arena, AST_MEMBER_ACCESS, loc);
+        cal->member.object = zid;
+        cal->member.name = checker_istr_lit(c->arena, "For");
+        cal->member.null_cond = 0;
+        zan_ast_node_t *call = zan_ast_new(c->arena, AST_CALL, loc);
+        call->call.callee = cal;
+        zan_ast_list_init(&call->call.args);
+        zan_ast_list_init(&call->call.type_args);
+        zan_ast_list_push(&call->call.type_args,
+                          checker_type_ref(c, c->table_ents[i], NULL, loc),
+                          c->arena);
+        zan_ast_list_push(&n->new_expr.args, call, c->arena);
+    }
+    return n;
+}
+
 void zan_checker_check(zan_checker_t *c, zan_ast_node_t *unit) {
     if (!unit || unit->kind != AST_COMPILATION_UNIT) return;
 
+    checker_collect_table_entities(c, unit);
     check_all_struct_cycles(c, unit);
 
     for (int i = 0; i < unit->comp_unit.decls.count; i++) {

@@ -19,6 +19,12 @@ struct zan_checker {
     struct checker_local *locals;
     zan_ast_node_t *last_call_node;
     zan_symbol_t *last_call_method;
+    /* [Table] 实体名清单：SyncStructureAll(Async) 零参调用点合成
+     * Meta[] 实参用；zan_checker_check 入口对编译单元预扫描收集。 */
+    zan_istr_t *table_ents;
+    int table_ent_count;
+    int table_ent_cap;
+    bool table_ents_done;
     zan_ast_node_t *current_body;
     zan_ast_node_t *current_method_decl;
     /* 已经报过"null 绑不上值类型形参"的实参位置：同一个实参只报一次
