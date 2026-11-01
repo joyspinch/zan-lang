@@ -8,7 +8,7 @@
 
 ## 未完成
 
-（当前无未决缺陷台账，全量闭环）
+- [ ] B-ID57 server_mvc 三案红（Zan GenRoute→C routegen 换代的语义对齐余债；金样锚点 7c3519da1）：admin_gate 路由计数 173 vs 金样 193（缺 ~20 条 admin 路由，疑似 Zan 版元数据拍平继承动作 Saved/Note 一类口径未对齐；gate raised=0 已达标）、generator_sources（生成产物断言 "api json projection" 红，属 Zan.Mvc 源生成器输出）、metrics_flush_retry（lease-retry-result/cleared 两断言）。已修：CMakeLists 两处 ZanWeb 旧路径（AiEndpointPolicy/Fmt）致 ai_endpoint_allowlist 与 timezone 双案瞬时红——2026-11-01 批次绿。
 
 
 
