@@ -88,3 +88,11 @@ description: 服务端 DB 专属数据层细则——索引选择、两段式分
 - SQLite 的 `PRAGMA journal_mode/synchronous` 是"赋值并回显新值"的语句，
   `ExecuteAsync` 对返回行的语句会抛 "the statement returned rows"——
   必须用 `QueryAsync` 读掉结果集。
+- bool-lambda `Where(a => a.col == v)`（Delete/Update）的既定语义：谓词
+  是黑盒无法还原 SQL 文本，Zan.Data 按「候选行物化 → 内存谓词过滤 →
+  命中主键 WhereIn/复合元组/SQLite rowid 下推」执行——语义正确但整表
+  扫描且有 2000 参数上限。批量清扫/整表级更新**禁止** bool lambda，用
+  显式列谓词下推：`q.inner.W("ts < ?"); q.inner.Pl(cut);`。
+- `await` 挂在 `async void` 方法上是火后不理：包装异步库调用的 facade
+  方法签名必须 `async bool`/`async int`（调方才真正等得到完成）；
+  `async void` 只留给事件/停机钩子出口。

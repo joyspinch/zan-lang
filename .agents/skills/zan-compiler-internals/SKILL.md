@@ -973,3 +973,20 @@ description: zanc 编译器内部（parser/checker/irgen/runtime/ABI）设计契
     - 边界：collect 路径丢了 lambda 形参类型带来的 TP 绑定能力，
       但显式 `<T>` 绑定已够用（返回类型代换仍正确）；若未来要在
       collect 里做完整推断，需先给收集器建独立作用域。
+59. **分配点登记必须先于一切按站点索引的表发射（反射 thunk 时序）**：
+    - 动作：所有 `reserve_arc_site` 调用必须发生在 irgen_emit.c 尾部的
+      `emit_site_live_tables` / `emit_site_dtor_table` /
+      `emit_site_tyname_table` / `emit_site_meta_table` /
+      `zan_irgen_emit_arc_desc_init` 之前。反射 ctor thunk
+      （`refl_finalize_mtabs`）原本在名表冻结后才 reserve 新站点，反射
+      `CreateInstance` 造出的对象按站点查类型名落空，一切 is/下转恒假。
+      现以 `refl_reserve_thunk_sites` 前置登记（mtabs 带 site 字段），
+      thunk 构建只取用预登记站点。
+    - 理由：运行时 is/下转按"对象头 site 字 → 站点类型名表"判身份，
+      且有两个模式：desc_hdr（desc 指针表）与 check_leaks（站点索引表）
+      ——冻结后补登记的站点两个模式都查无此名；只调换 desc/finalize
+      顺序会修好一个模式、弄混另一个（thunk 退回索引模式与正常分配的
+      指针模式混搭），必须用"登记前置"而非"换序"。
+    - 判定器：orm_reverse_relation / orm_typed_query /
+      orm_metadata_concurrency；最小探针 =
+      `typeof(T).CreateInstance()` 后 `(T)obj` 判型（修复前得 OTHER）。
