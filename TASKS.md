@@ -26,10 +26,25 @@
 - [ ] B-ID72 宽字符与文本封送跨平台断裂（Wide.zan 强绑 kernel32）：`stdlib/System/Interop/Wide.zan` 无条件 `[DllImport("kernel32")]` 导入 Win32 API 且写死 2 字节 UTF-16 假定，在 Linux/macOS 上直接因找不到 kernel32 崩毁，且违背 POSIX 4 字节 wchar_t 规范。需抽象为支持 POSIX iconv / mbstowcs 与 Windows 多分发的跨平台文本封送器；双轨同步。
 - [ ] B-ID73 DateTime.Now 本地墙钟时间语义纠正与跨平台时区（IANA）规范化：`stdlib/System/DateTime.zan` 中 `DateTime.Now` 硬编码返回 `UtcNow()` 严重背离行业标准心智，导致业务时间偏差；且本地时区偏移依赖平台特化 CRT 函数，缺乏 POSIX 下 `/usr/share/zoneinfo` IANA 时区统一支持。需纠正 Now/UtcNow 语义并建立跨平台 TimeZoneInfo；双轨同步。
 - [ ] B-ID74 编译器静态魔数深度上限弹性化（ZAN_MAX_FINALLY_DEPTH 等）：`src/compiler/irgen_stmt.c` 对 try-finally 与 lock 嵌套深度施加固定静态数组上限（超出直接报 3080 错误），且多处存在写死缓冲区大小假定。需将静态栈帧与嵌套跟踪重构为动态伸缩结构，消除硬编码限制；双轨同步。
-
-
-
-
+- [ ] B-ID75 全仓平台抽象层（PAL, Platform Abstraction Layer）统一标准落地：终结全仓各模块随意穿插 `#if WINDOWS`、写死 `kernel32`/`user32` 与平铺单平台实现的混乱局面。确立“抽象契约（Interface/Abstractions）+ 平台物理目录隔离（Platform/Windows/Linux/Mac）+ 统一工厂/构建系统装配（Factory/CMake）”的顶层架构纲领，覆盖四大核心领域：(1) 文件与路径系统（路径分隔/文件锁/目录监听）、(2) 进程/管道与环境信号、(3) 网络事件循环（IOCP/epoll/kqueue）、(4) 动态库加载与错误码映射（dlopen/LoadLibrary/errno）；双编译器双轨保持一致。
+- [ ] B-ID76 整数算术溢出未定义行为（UB）防护与 checked/unchecked 模式：`src/compiler/irgen_expr_ops.c` 算术运算直接发射裸 LLVM `add/sub/mul` 指令，有符号溢出在 LLVM IR 属未定义行为，优化器会激进消除边界检查引发越界漏洞。需引入溢出陷阱检测（llvm.sadd.with.overflow 等）并支持编译期 checked/unchecked 算术控制；双轨同步。
+- [ ] B-ID77 静态空安全（Null-Safety）契约与可空引用类型体系：当前引用类型全部默认为裸指针，全仓依赖运行期判空与空指针异常崩溃。需在类型检查器引入现代空安全语义（如 `string?` 可空与 `string` 非空分离），在编译期截胡潜在空引用；双轨保持一致。
+- [ ] B-ID78 ARC 深层对象树级联析构栈溢出防护（迭代式延迟释放队列）：`irgen_arc.c` 中对象析构函数采用递归调用下钻释放子字段，遇到上千层深度的链表、树或 AST 根节点被 release 时，同步递归在析构阶段直接耗尽线程栈引发 Stack Overflow 崩溃。需引入工业级迭代式延迟释放队列（Deferred Drop Queue）；双轨同步。
+- [ ] B-ID79 结构化并发（Structured Concurrency）与统一 CancellationToken 取消机制：异步任务（Task/async）缺乏父子生命周期联动与取消令牌链，父协程超时或异常退出时子协程沦为失控孤儿协程。需在标准库与运行时建立贯穿异步调用链的 CancellationToken 取消信号与任务树监控；双轨同步。
+- [ ] B-ID80 核心集合抗哈希碰撞拒绝服务攻击（Hash-DoS）免疫：`Dictionary<K, V>` 与 `HashSet<T>` 目前采用无盐简单哈希算法，在 Web 服务端接收恶意构造的碰撞 JSON 键时哈希桶退化为 O(N) 链表被打满 CPU。需引入带随机盐的 SipHash-2-4 / AHash 算法保证抗碰撞安全性；双轨同步。
+- [ ] B-ID81 只读与不可变集合契约健全（IReadOnlyList / ReadOnlySpan 等）：标准库集合缺乏只读抽象约束，实体向外暴露内部集合时可被随意篡改或并发破坏。需补全 `IReadOnlyCollection<T>`、`IReadOnlyList<T>`、`IReadOnlyDictionary<K, V>` 接口及切片视图；双轨同步。
+- [ ] B-ID82 包管理语义化版本仲裁与钻石依赖求解器（Diamond Dependency Solver）：当前 `.zan-packages/` 仅支持简单扁平安装，当两个依赖库分别引入同一包的不同大版本时缺乏冲突求解能力。需引入类似 PubGrub 的语义化版本依赖解析算法与包隔离机制；双轨保持一致。
+- [ ] B-ID83 模块/包级私有可见性修饰符（internal 访问控制）：语言目前仅有 public/private/protected，缺乏包级内部访问控制，导致驱动与基础设施细节类被迫暴露为 public 被外部深度耦合。需在编译器与符号表中引入 `internal` 模块可见性边界；双轨同步。
+- [ ] B-ID84 高精度十进制（Decimal）除零静默返回 0 与逐位移位性能缺陷：`src/runtime/rt_decimal.c` 中 `u128_divrem` 在除数为 0 时静默返回 0（`100 / 0 = 0`），严重破坏金融与计费业务安全底线，应严格抛出除零异常；且 128 位除法采用 128 次循环逐位移位法，单次除法耗费上千 CPU 周期，需演进为 Knuth 算法 D 多精度快速除法；双轨同步。
+- [ ] B-ID85 密码学实现缓存时序侧信道攻击风险（SM4 静态 S-Box 查表）：`src/runtime/rt_hw_accel_sm4_tables.h` 采用全局静态 S-Box 表直查实现国密 SM4。非恒定时间查表在多租户/云原生环境下易遭受 Cache-Timing 侧信道攻击还原出加密密钥。需改用比特切片（Bit-sliced）恒定时间位运算或调用硬件加速指令（ARMv8 Crypto / SM4 特性）；双轨保持一致。
+- [ ] B-ID86 协程纯协作式调度引发的线程饥饿（Starvation）与废弃 ucontext 依赖：`src/runtime/rt_sched.c` 缺乏基于时间片或信号的抢占机制（Preemption）。CPU 密集型长循环会永久霸占调度线程，导致挂载在该线程上的所有异步 I/O、Web 请求与定时器永久假死；且 POSIX 下依赖已在 POSIX.1-2008 废弃的 `ucontext.h`（换栈拷贝信号掩码带来巨大开销），需演进为轻量寄存器汇编保存与协作抢占插桩；双轨保持一致。
+- [ ] B-ID87 Unicode 规范化（NFC/NFD）与国际化大小写折叠（Case Folding）缺失：标准库缺乏 Unicode 规范化算法（UAX #15）支持，`string.ToLower/ToUpper/Equals` 仅能处理基本 ASCII 或简单码点映射。欧洲带重音符、德语等在不同输入源下单码点与组合码点无法等价匹配，存在严峻的国际化乱码与鉴权仿冒越权风险；双轨同步。
+- [ ] B-ID88 崩溃信号处理器中非异步信号安全函数（Async-Signal-Safety）死锁隐患：`src/runtime/rt_crash.h` 在崩溃信号处理过程中直接调用 `fprintf`、`CreateFileA`、`ReadFile` 等带内部锁的 I/O 操作。在进程持锁状态崩溃时极易触发信号处理器内部死锁，导致崩溃栈日志丢失、进程假死。需重构为仅调用直接系统调用（`write`/裸文件描述符）的纯 Async-Signal-Safe 报告器；双轨同步。
+- [ ] B-ID89 生产级内存可观测性与循环引用泄漏分析工具缺失：Zan 采用无 GC 的纯 ARC 模型，循环引用必定造成长驻内存泄漏。目前全仓缺乏运行时“孤儿环探测器（Cycle Detector）”与生产环境 Heap Snapshot / Dump 导出机制，在长期运行的服务端与复杂桌面 GUI 中一旦发生内存缓慢增长，运维与开发缺乏定位手段；双轨保持一致。
+- [ ] B-ID90 包管理器校验和仅计算 Manifest 导致源码防篡改失效（供应链安全虚设）：`src/compiler/package.c:679` 中 `zan_pkg_compute_checksum` 计算的仅是 `manifest_path`（`package.json`）的哈希，而非源码压缩包或源码树哈希。攻击者篡改源码包内部 `.zan` 文件仍能通过校验。需升级为计算并锁定完整 Tarball/源码树的 SHA-256 哈希锁；双轨保持一致。
+- [ ] B-ID91 解析器语法容错与错误节点占位机制伪造（Resilient Parsing & Poison Node 缺失）：`src/compiler/parser.c:41` `parser_error_node` 在语法解析失败时粗暴返回 `AST_INT_LITERAL`（常数 0 节点），导致后续类型检查器误将其作为 int 校验并喷出大量风马牛不相及的级联误报（如 cannot access member on int），破坏 IDE/LSP 键入补全。需建立正规 `AST_ERROR_EXPR` 毒化节点与错误静默抑制体系；双轨同步。
+- [ ] B-ID92 静态构造函数（cctor）声明序盲目初始化与依赖拓扑排序缺失：`src/compiler/irgen_emit.c:206` 在 Main 函数开头仅按 AST 声明的原始数组顺序同步调用各个类型的 `_cctor`，缺乏依赖图拓扑排序与按需/首次访问惰性初始化（Lazy BeforeFieldInit）机制，跨文件静态字段互相依赖时因编译顺序漂移引发静默空引用或读取未初始化零值；双轨同步。
+- [ ] B-ID93 异步调试信息（Debug Info）状态机展开与原始源码行映射断裂：`src/compiler/di.c` 目前在生成 DWARF/PDB 调试符号时，尚未对 `async/await` 重写后的闭包状态机帧建立原始行号映射（Source-Mapping），在调试器（zan-dap / lldb）中单步步入（Step-Over / Step-Into）异步函数时 PC 指针直接跳入底层合成的 `$resume` 状态机跳转表与帧槽存取汇编，开发者无法直观断点调试业务源码行；双轨保持一致。
 
 
 

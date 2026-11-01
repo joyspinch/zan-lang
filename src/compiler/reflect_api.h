@@ -61,6 +61,7 @@
 #define ZAN_REFL_M_FPK         56   /* TypeInfo.IsFieldPk(i)          -> bool */
 #define ZAN_REFL_M_SETOBJECT   57   /* obj.SetFieldObject(name, v)    -> bool */
 #define ZAN_REFL_M_FTYPEINFO   58   /* TypeInfo.GetFieldTypeInfo(i)   -> TypeInfo */
+#define ZAN_REFL_M_FIDENT      59   /* TypeInfo.IsFieldIdentity(i)    -> bool */
 
 static inline bool zan_refl_is_typeinfo(const zan_type_t *t) {
     return t && t->kind == TYPE_STRUCT && t->name.len == 8 &&
@@ -100,6 +101,7 @@ static inline bool zan_refl_typeinfo_member(zan_istr_t n, int *out) {
         { "IsFieldRequired",    15, ZAN_REFL_M_FREQUIRED },
         { "GetFieldDefault",    15, ZAN_REFL_M_FDEFAULT },
         { "IsFieldPk",          9,  ZAN_REFL_M_FPK },
+        { "IsFieldIdentity",    15, ZAN_REFL_M_FIDENT },
         { "GetFieldTypeInfo", 16,  ZAN_REFL_M_FTYPEINFO },
         { "GetCustomAttributes", 19, ZAN_REFL_M_TATTRS },
         { "GetAttrs",          8,  ZAN_REFL_M_TATTRS },
@@ -186,6 +188,7 @@ static inline bool zan_refl_member_takes_arg(int code) {
     case ZAN_REFL_M_FREQUIRED:
     case ZAN_REFL_M_FDEFAULT:
     case ZAN_REFL_M_FPK:
+    case ZAN_REFL_M_FIDENT:
     case ZAN_REFL_M_FTYPEINFO:
     case ZAN_REFL_M_SETOBJECT:
         return true;

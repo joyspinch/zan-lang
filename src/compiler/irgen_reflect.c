@@ -247,6 +247,13 @@ static void refl_extract_field_attrs(zan_symbol_t *m, const char **custom_name,
                         }
                     } else if (an.len == 10 && memcmp(an.str, "IsIdentity", 10) == 0) {
                         if (arg->binary.right->kind == AST_BOOL_LITERAL && arg->binary.right->bool_val) {
+                            /* bit 3 = identity（自增列）。与 pk 位分离：
+                             * 复合主键（IsPrimary）不能被当成自增列，
+                             * PkList 按 IsIdent 排除自增列走列级主键。 */
+                            *flags |= 8ULL;
+                        }
+                    } else if (an.len == 9 && memcmp(an.str, "IsPrimary", 9) == 0) {
+                        if (arg->binary.right->kind == AST_BOOL_LITERAL && arg->binary.right->bool_val) {
                             *flags |= 4ULL; /* bit 2 = pk */
                         }
                     }
@@ -2696,7 +2703,8 @@ static bool refl_emit_typeinfo_member(zan_irgen_t *g, LLVMValueRef ti,
     }
     case ZAN_REFL_M_FIGNORED:
     case ZAN_REFL_M_FREQUIRED:
-    case ZAN_REFL_M_FPK: {       /* IsFieldIgnored / IsFieldRequired / IsFieldPk */
+    case ZAN_REFL_M_FPK:
+    case ZAN_REFL_M_FIDENT: {    /* IsFieldIgnored / IsFieldRequired / IsFieldPk / IsFieldIdentity */
         LLVMValueRef idx = arg0 ? emit_expr(g, arg0, locals)
                                 : LLVMConstInt(i64, 0, 0);
         idx = emit_index_i64(g, idx, "refl.i");
@@ -2724,6 +2732,7 @@ static bool refl_emit_typeinfo_member(zan_irgen_t *g, LLVMValueRef ti,
         unsigned long long bit = 1;
         if (code == ZAN_REFL_M_FREQUIRED) bit = 2;
         else if (code == ZAN_REFL_M_FPK) bit = 4;
+        else if (code == ZAN_REFL_M_FIDENT) bit = 8;
         LLVMValueRef masked = LLVMBuildAnd(g->builder, flags,
             LLVMConstInt(i64, bit, 0), "refl.masked");
         *out = LLVMBuildICmp(g->builder, LLVMIntNE, masked,
