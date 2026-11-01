@@ -149,7 +149,6 @@ add_executable(zanc
     src/compiler/ast.c
     src/compiler/parser.c
     src/compiler/genmeta.c
-    src/compiler/routegen.c
     src/common/json.c
     src/compiler/nsresolve.c
     src/compiler/binder.c
@@ -3311,7 +3310,7 @@ if(SELFHOST_CLANG)
   # / SHGetFileInfoW -> shell32, DestroyIcon -> user32, the version API ->
   # version). POSIX needs libdl/libpthread for the same stdlib surface.
   if(WIN32)
-    set(_sh_syslibs "-lkernel32;-lshell32;-luser32;-ladvapi32;-lversion;-lws2_32;-lbcrypt")
+    set(_sh_syslibs "-lkernel32;-lshell32;-luser32;-ladvapi32;-lversion;-lws2_32;-lbcrypt;-lpsapi")
   else()
     set(_sh_syslibs "-ldl;-lpthread;-lm")
   endif()

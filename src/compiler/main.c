@@ -7,7 +7,6 @@
 #include "parser.h"
 #include "genmeta.h"
 #include "nsresolve.h"
-#include "routegen.h"
 #include "ast.h"
 #include "binder.h"
 #include "checker.h"
@@ -3219,8 +3218,6 @@ int main(int argc, char **argv) {
         }
         zan_compile_trace("nsresolve generated");
         zan_nsresolve_run(ast, arena, diag);
-        zan_compile_trace("routegen");
-        zan_routegen_run(ast, arena, diag);
         zan_compile_trace("prune");
         zan_nsresolve_prune(ast, arena, diag);
         phase("prune");
