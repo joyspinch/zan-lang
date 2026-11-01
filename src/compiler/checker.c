@@ -2219,6 +2219,29 @@ static void check_call_arity(zan_checker_t *c, zan_ast_node_t *call,
         }
     }
     if (!candidates) return;
+    /* 成员组无适用候选时扩展方法仍是候选（C# 同款）：名字匹配、接收
+     * 者可赋给扩展的 this 形参、实参数（含 this）落在其元数区间内——
+     * 命中则交给主解析，不在此抢报（ICodeFirst.SyncStructure(Meta)
+     * 遮蔽 SyncStructure<T>() 扩展的 E2030 由此而来）。 */
+    for (int ei = 0; ei < c->binder->ext_method_count; ei++) {
+        zan_symbol_t *em = c->binder->ext_methods[ei].method;
+        if (!em || em->kind != SYM_METHOD || em->name.len != name.len ||
+            memcmp(em->name.str, name.str, (size_t)name.len) != 0) continue;
+        zan_type_t *ert = c->binder->ext_methods[ei].recv_type;
+        int asn = (ert && ert->sym) ? checker_type_assignable(ert, recv) : -1;
+        int elo = -1, ehi = -1;
+        int ar = method_arity(em, &elo, &ehi);
+        if (!ar && em->decl && em->decl->kind == AST_METHOD_DECL &&
+            em->decl->method_decl.params.count > 0) {
+            /* 泛型扩展（SyncStructure<T>(this IDbExecutor)）的 method_arity
+             * 失算：扩展没有变参，参数个数即元数。 */
+            elo = ehi = em->decl->method_decl.params.count;
+            ar = 1;
+        }
+        if (ert && ert->sym && recv->sym != ert->sym && asn == 0) continue;
+        if (!ar) continue;
+        if (argc + 1 >= elo && argc + 1 <= ehi) return;
+    }
     if (candidates > 1) {
         zan_diag_emit_code(c->diag, DIAG_ERROR, call->loc, 2029,
                       "no overload of '%.*s.%.*s' takes %d argument%s",

@@ -1203,16 +1203,9 @@ static LLVMValueRef emit_builtin_call_intercept(zan_irgen_t *g, zan_ast_node_t *
                         (LLVMValueRef[]){ s_safe, endp }, 2, "parse");
                     LLVMValueRef ep = LLVMBuildLoad2(g->builder, i8ptr, endp, "parse.ep");
                     LLVMValueRef bad = emit_parse_bad_pred(g, s_safe, ep);
-                    /* C# double.Parse 溢出抛 OverflowException：strtod 返
-                     * ±HUGE_VAL（inf），判坏返 0。 */
-                    LLVMTypeRef fabs_ty = LLVMFunctionType(dbl,
-                        (LLVMTypeRef[]){ dbl }, 1, 0);
-                    LLVMValueRef av = zan_call2(g->builder, fabs_ty,
-                        get_libc_fn(g, "fabs", fabs_ty), &r, 1, "parse.fabs");
-                    LLVMValueRef isinf = LLVMBuildFCmp(g->builder,
-                        LLVMRealOEQ, av,
-                        LLVMConstReal(dbl, 1.7976931348623157e308 * 2.0), "parse.inf");
-                    bad = LLVMBuildOr(g->builder, bad, isinf, "parse.bad2");
+                    /* 溢出（strtod ERANGE）由 zan_rt_dbl_parse 把 endp 拨回
+                     * 起点走零消费判坏——"Infinity" 特殊拼写是合法 INF 回读，
+                     * 不能按值判 INF 当溢出杀（曾误杀致 case_double_format 红）。 */
                     emit_runtime_check(g, bad, expr->loc,
                         "double.Parse: input is not a valid number (or out of range)");
                     r = LLVMBuildSelect(g->builder, bad,

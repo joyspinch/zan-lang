@@ -990,3 +990,19 @@ description: zanc 编译器内部（parser/checker/irgen/runtime/ABI）设计契
     - 判定器：orm_reverse_relation / orm_typed_query /
       orm_metadata_concurrency；最小探针 =
       `typeof(T).CreateInstance()` 后 `(T)obj` 判型（修复前得 OTHER）。
+
+60. **strtod 系解析的溢出判定只能走 endp 零消费约定，不能按值判 INF**：
+    - 动作：`double.Parse` / `Convert.ToDouble` / `TryParse` 的内建展开
+      （irgen_call_builtins.c）共用 `zan_rt_dbl_parse`（rt_timer.c）。
+      判"输入溢出"（C# OverflowException / TryParse false）必须在运行时
+      `errno == ERANGE` 且结果为 ±INF 时把 `*endp` 拨回起点，让既有的
+      `emit_parse_bad_pred` 零消费判坏（`ep == s`）接住；不要在 IR 侧
+      `fabs(r) == DBL_MAX*2` 按值判 INF——`"Infinity"` 特殊拼写（93ac441b3
+      的 C# 可回读契约）合法返回 INF，按值判会把回读一并杀成 0
+      （case_double_format 的 `inf > 1e308` / `ninf < -1e308` 变假由此）。
+    - 理由：溢出与合法 INF 在值域上同形（都是 ±INF），值不可区分；
+      唯一的区分点是"输入是拼写还是数字串"，只有运行时能看到 errno，
+      IR 侧只能看到值。约定终点收敛在 parse 家族已有的 bad_pred，
+      三处调用点（Parse 抛 / TryParse false / Convert 软诊断+0）零改动。
+    - 判定器：case_double_format（Infinity 回读两侧比较）+
+      case_convert_overflow（真溢出仍要判坏）+ case_builtin_parse_chain。

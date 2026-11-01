@@ -232,9 +232,9 @@ description: zanc 编译器内部（parser/checker/irgen/runtime/ABI）设计契
      grep `ast.h` 的 `AST_*` 枚举、`parser.c` 的 `case TK_*` 分支与 checker/irgen
      的对应 case——`sizeof`/`typeof` 早已存在（`TK_SIZEOF` → `AST_SIZEOF_EXPR`
      → irgen `LLVMSizeOf`），缺的往往只是 checker 校验这一小块。
-   - 理由：做 Marshal.SizeOf 时重复造轮子：新加枚举成员导致重定义编译错、
-     新加 parse 分支与既有 TK_SIZEOF 分支并存——全部回滚后真正要做的只有
-     checker 的尺寸校验一行路。
+   - 理由：A382④ 做 Marshal.SizeOf 时重复造轮子：新加枚举成员导致重定义编译
+     错、新加 parse 分支与既有 TK_SIZEOF 分支并存——全部回滚后真正要做的只有
+     checker 的 E4002 校验一行路。
    - 边界：既原语的返回形态以 irgen 现状为准（sizeof 返回 i64），wrapper（如
      `Marshal.SizeOf<T>() { return sizeof(T); }`）用纯 Zan 泛型方法表达，不要
      给原语再叠 irgen 拦截。
@@ -243,8 +243,8 @@ description: zanc 编译器内部（parser/checker/irgen/runtime/ABI）设计契
      新实参**时，切分器必须同时跟踪 `()`、`[]`、`{}` 三种括号——`(zan_loc_t){0, 0, 0, 0}`
      复合字面量里的逗号不是实参分隔符；并且回读校验：插完后的目标槽必须是
      纯整数字面量（code 槽）、格式串槽必须以引号/标识符开头。
-   - 理由：只跟踪圆括号方括号的切分器把编号插进了 `{0, 0, 0, 0}` 内部，
-     fmt 串被挤进 int 槽——文案与代码整体错位；全量编号 300+ 站点时
+   - 理由：只跟踪圆括号方括号的切分器把代码 `2093` 插进了 `{0, 0, 0, 0}` 内部，
+     fmt 串被挤进 int 槽——文案与代码整体错位；A382 全量编号 300+ 站点时
      checker.c 一处中招。
    - 边界：这类错位**必现编译错误**（字符串落进 int 形参），所以"改完必编译"
      就能全量兜住；但脚本层的回读校验能把发现点从"编译失败逐个排查"提前到
@@ -258,10 +258,10 @@ description: zanc 编译器内部（parser/checker/irgen/runtime/ABI）设计契
    - 理由：checker **全程不设置 `current_scope`**（零处赋值），`resolve_type` 的
      `rt_scope` 缓存守卫令 checking 阶段方法体内新出现的类型引用全部落回
      **根作用域**解析——根作用域那份注册是承重墙，拆掉或分层会让泛型方法体
-     一律 E1005（两轮探针 + 静态审计的结论；钉形 conformance 用例
-     type_param_same_name）。
+     一律 E1005（A453 两轮探针 + 静态审计的结论；钉形
+     `tests/conformance/type_param_same_name`）。
    - 边界：真正的同名冲突在内建类型层（`class Dict<K,V>` 被 builder 的内建
-     Dict 顶掉），那是内建同名顶掉的问题，与类型参数注册无关。
+     Dict 顶掉），那是 A551 的事，与类型参数注册无关。
 ---
 
 ## 二、LLVM 代码生成与指令下沉（IRGen）
@@ -610,40 +610,40 @@ description: zanc 编译器内部（parser/checker/irgen/runtime/ABI）设计契
      时是**数组拷贝构造**（读 `zan_array_len`、逐元素取出后按槽步长写入）。
      `list_copy_candidate` 只认 List<T> 实参，所以 irgen 里凡
      `!list_copy && args.count==1 && arg_inits.count==0` 的形态**不能**默认走
-     "集合初始化式"（那会把整个数组对象当 1 个元素 Add）；要先按实参静态
-     类型判是否一维数组，是则发数组→List 逐元素拷贝（结构体元素 GEP by
-     elem type + 按槽加载，标量按位宽 SExt/Trunc 到 i64），目标槽照常走
-     槽下标换算 + 槽写入。
+     "集合初始化式"（那会把整个数组对象当 1 个元素 Add）；要先
+     `infer_expr_type` 判实参是否一维数组，是则发数组→List 逐元素拷贝
+     （结构体元素 GEP by elem type + `load_struct_from_slot`，标量按位宽
+     SExt/Trunc 到 i64），目标槽照常走 `slot_word_index` + 槽写入。
    - 理由：数组实参走 Add(整个数组) 时 count=1、元素是"假扮字符串的数组头"
      （len=垃圾、data=指针字节），下标 1 即越界，**全程零诊断**。实测踩坑：
-     浏览器组件用 `new List<string>(args)` 拼安装器参数，进程拿到的 argv
-     全是垃圾字节，官方安装器收不到 `/S` 进交互模式弹窗干等、不写任何
-     文件，表象却是"自动安装反复触发"——三层排查全是假线索。
-   - 判定器：一条 conformance 用例（string/int/空数组/快照独立性/结构体
-     元素五组断言）。
+     FirefoxBrowser 用 `new List<string>(args)` 拼安装器参数，进程拿到的
+     argv 全是垃圾字节，官方安装器收不到 `/S` 进交互模式弹窗干等、
+     不写任何文件，表象却是"自动安装反复触发"——三层排查全是假线索。
+   - 判定器：`tests/conformance/list_array_ctor.zan`（string/int/空数组/
+     快照独立性/结构体元素五组断言）。
 33. **手写 CFG 编辑必须同步维护 PHI 前驱表——VerifyModule 失败绝不能静默吞掉**：
-   - 动作：优化器里折叠常量条件分支（`LLVMBuildBr(target)` + erase
+   - 动作：optimizer 里折叠常量条件分支（`LLVMBuildBr(target)` + erase
      condbr）时，"本块→未选中后继"这条边同时消失，未选中后继块里每个
      PHI 中来自本块的 incoming 条目必须一并删除（LLVM-C 没有
      remove-incoming，做法：新建 PHI 收集幸存 (value, block) 对 +
      `LLVMReplaceAllUsesWith` + erase 旧 PHI；本块是唯一前驱时用
      undef/null 顶替引用）。两个后继是同一块时跳过清理（边仍在）。
-     另外 `LLVMVerifyModule` 失败必须报警——曾静默
-     dispose-and-return，default<O1> 整条管线被无声跳过，所有"优化"
+     另外 `LLVMVerifyModule` 失败必须 `fprintf` 报警——曾静默
+     dispose-and-return，default&lt;O1&gt; 整条管线被无声跳过，所有"优化"
      实际来自管线之外的自定义 pass，用户毫不知情。
-   - 理由（坑很深）：early-cse 会把短路条件的分支化成常量，
+   - 理由（A595，坑很深）：early-cse 会把短路条件的分支化成常量，
      constfold 随后折叠该分支；悬空 PHI 条目使模块非法 → 管线整条
      被静默跳过 → 管线之后的 pass 与后端在非法 IR 上跑，字符串长度
-     探测把正常串判成 null（长度归 0）：`--publish` 构建一个含字符串
-     处理的示例程序三处 soft error 后挂起，而 O0 一切正常。排查时表象
-     全指向业务代码与 publish 插桩，真因在两步之外的 CFG 编辑。
-   - 排查工具（优化器留有常设开关）：`ZAN_DUMP_OPT_IR=1`（dump
+     探测把正常串判成 null（长度归 0）：`--publish` 构建 ff_bidi_demo
+     三处 soft error 后挂起，而 O0 一切正常。排查时表象全指向业务代码
+     与 publish 插桩，真因在两步之外的 CFG 编辑。
+   - 排查工具（已留常设开关，optimizer.c）：`ZAN_DUMP_OPT_IR=1`（dump
      优化后 IR）、`ZAN_OPT_PIPELINE=none/<管线串>`、
      `ZAN_NO_OPT_EARLY/ARC/DEVIRT/CONSTFOLD/DCE/INLINE=1`（逐 pass 关）、
      `ZAN_EARLY_PASSES=sroa,early-cse`（改 early 段）。验证时盯 stderr 的
      `module verification failed`——它出现即管线没跑。
-   - 判定器：一条以 `-O1` 编译的 conformance 用例（注册处带 -O1；
-     普通 conformance 全在 -O0，永远踩不到这条路径）。
+   - 判定器：`tests/conformance/opt_constfold_branch_phi.zan`（注册处
+     带 `-O1` 编译；普通 conformance 全在 -O0，永远踩不到这条路径）。
 34. **临时拥有接收者的成员赋值必须在赋值后释放该临时接收者**：
    - 动作：在 `emit_expr_assignment`（`src/compiler/irgen_expr_ops.c`）处理
      `AST_MEMBER_ACCESS` 赋值（`obj.field = value` 或 `obj.prop = value`）时，若
@@ -657,7 +657,7 @@ description: zanc 编译器内部（parser/checker/irgen/runtime/ABI）设计契
      `ControlExtra` 永久泄漏。
    - 边界：仅对堆上托管对象生效（结构体不走该路径；局部变量标识符由
      `emit_release_owned_call_temp` 内部识别并安全跳过）。
-   - 判定器：一条对方法调用临时接收者的字段连续赋值的 conformance 用例。
+   - 判定器：`tests/conformance/arc_assign_call_temp_receiver.zan`。
 
 ---
 
@@ -734,7 +734,7 @@ description: zanc 编译器内部（parser/checker/irgen/runtime/ABI）设计契
      会被 Mach-O 再加一个前导下划线变成 `__errno`，而 libSystem 导出的
      C 符号是 `__error`。这类错链接期才炸、且炸在离病灶最远的调用点上
      （实例：`Convert.ToInt*` 字符串路径的 ERANGE 探针发 `__errno`，
-     示例程序交叉编 macos-arm64 链接失败；已改 irgen_call.c 按
+     ff_bidi_demo 交叉编 macos-arm64 链接失败；已改 irgen_call.c 按
      target_triple/目标标志选 `__error`/`__errno`/`__errno_location`/
      `_errno`，分支次序对齐 Socket.zan 的 DllImport 守卫）。
 40. **iOS CoreText 字体生命周期、主线程呈现与触控事件流纪律**：
@@ -990,3 +990,19 @@ description: zanc 编译器内部（parser/checker/irgen/runtime/ABI）设计契
     - 判定器：orm_reverse_relation / orm_typed_query /
       orm_metadata_concurrency；最小探针 =
       `typeof(T).CreateInstance()` 后 `(T)obj` 判型（修复前得 OTHER）。
+
+60. **strtod 系解析的溢出判定只能走 endp 零消费约定，不能按值判 INF**：
+    - 动作：`double.Parse` / `Convert.ToDouble` / `TryParse` 的内建展开
+      （irgen_call_builtins.c）共用 `zan_rt_dbl_parse`（rt_timer.c）。
+      判"输入溢出"（C# OverflowException / TryParse false）必须在运行时
+      `errno == ERANGE` 且结果为 ±INF 时把 `*endp` 拨回起点，让既有的
+      `emit_parse_bad_pred` 零消费判坏（`ep == s`）接住；不要在 IR 侧
+      `fabs(r) == DBL_MAX*2` 按值判 INF——`"Infinity"` 特殊拼写（93ac441b3
+      的 C# 可回读契约）合法返回 INF，按值判会把回读一并杀成 0
+      （case_double_format 的 `inf > 1e308` / `ninf < -1e308` 变假由此）。
+    - 理由：溢出与合法 INF 在值域上同形（都是 ±INF），值不可区分；
+      唯一的区分点是"输入是拼写还是数字串"，只有运行时能看到 errno，
+      IR 侧只能看到值。约定终点收敛在 parse 家族已有的 bad_pred，
+      三处调用点（Parse 抛 / TryParse false / Convert 软诊断+0）零改动。
+    - 判定器：case_double_format（Infinity 回读两侧比较）+
+      case_convert_overflow（真溢出仍要判坏）+ case_builtin_parse_chain。

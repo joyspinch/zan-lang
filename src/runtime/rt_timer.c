@@ -13,6 +13,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <limits.h>
+#include <errno.h>
 #include "../common/host_oom.h"
 #include "../common/zan_abi.h"
 
@@ -1459,7 +1460,15 @@ double zan_rt_dbl_parse(const char *s, char **endp) {
         if (endp) *endp = (char *)s + 9;
         return -(double)INFINITY;
     }
-    return strtod(s, endp);
+    errno = 0;
+    double r = strtod(s, endp);
+    if (errno == ERANGE && (r == (double)INFINITY || r == -(double)INFINITY)) {
+        /* strtod 上溢：把 endp 拨回起点，让调用方的"零消费"判坏接住
+         * （C# double.Parse 抛 OverflowException、TryParse 返 false），
+         * 与 "Infinity" 特殊拼写的合法 INF 回读区分开。 */
+        if (endp) { *endp = (char *)s; }
+    }
+    return r;
 }
 
 /* 堆内存分配度量 (A464) */
