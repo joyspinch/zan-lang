@@ -6,6 +6,11 @@ static bool async_slot_type_compatible(zan_type_t *a, zan_type_t *b) {
     int depth = 0;
     while (a && b && depth < 32) {
         if (a == b) return true;
+        /* 类型参数一侧放行：预接线槽冻结的是首趟发射的类型（开放泛型），
+         * 固定点重发趟已具体化（E→string）——同一帧槽按 LLVM 布局同型，
+         * 按开放实参拒接会让重发趟跌回未接线 alloca（mem2reg 提升后跨
+         * 挂起丢值：尾声释放读幻影槽 = 泄漏，await 后再读 = NRE）。 */
+        if (a->kind == TYPE_TYPE_PARAM || b->kind == TYPE_TYPE_PARAM) return true;
         if (a->kind != b->kind) return false;
         if (a->name.len != b->name.len ||
             (a->name.len && memcmp(a->name.str, b->name.str,
