@@ -185,6 +185,20 @@ static rg_cval eval_const(zan_ast_node_t *unit, zan_ast_node_t *e) {
                 }
             }
             return r;
+        case AST_BINARY:
+            /* 枚举位的并（PermBit.Create | PermBit.Update）：按 GenRoute
+             * 原口径只做名字拼接 "Create|Update"——编译期不需要枚举数值，
+             * 消费者（Perm.BitValue）按名字认位；任一侧不是枚举/名字
+             * 即求值失败，fail-closed。 */
+            if (e->binary.op != TK_PIPE) return r;
+            {
+                rg_cval l = eval_const(unit, e->binary.left);
+                rg_cval rr = eval_const(unit, e->binary.right);
+                if (!l.ok || !rr.ok || l.kind != 3 || rr.kind != 3) return r;
+                r.ok = 1; r.kind = 3;
+                snprintf(r.sval, sizeof(r.sval), "%s|%s", l.sval, rr.sval);
+            }
+            return r;
         default:
             return r;
     }
