@@ -6,7 +6,7 @@
 >
 > 平账纪律：闭账条目当批移出，已闭环内容移至 git 历史。
 >
-> 最近平账 2026-11-03（彻底清理）：全账按「只记剩余欠账」压缩，验证流水归 git 历史；B-ID95/98/100/105 闭账移出（导出面 devirt 预修 33f21d49e 落地且场景暂不可达 / OOM 注入钩子+三钉 55367b004 落地 / 预扫缓存收益 ~12ms 低于噪声底不做 / json 消费方 dap_integration+lsp_integration_utf16 绿）；B-ID68/69/70 归并指针行移出（B-ID75 领域点名承接）；stdout 行尾重登记 B-ID113；新登记 B-ID114（lsp_session_editor 预存红）。同日早前：B-ID80 SipHash 落地闭账、B-ID66 闭账移出、B-ID104/105/106/110 各片落地（详 git 历史）。
+> 最近平账 2026-11-03（彻底清理）：全账按「只记剩余欠账」压缩，验证流水归 git 历史；B-ID95/98/100/105 闭账移出（导出面 devirt 预修 33f21d49e 落地且场景暂不可达 / OOM 注入钩子+三钉 55367b004 落地 / 预扫缓存收益 ~12ms 低于噪声底不做 / json 消费方 dap_integration+lsp_integration_utf16 绿）；B-ID68/69/70 归并指针行移出（B-ID75 领域点名承接）。同日晚：B-ID113 闭账移出（stdout 二进制模式 25ca931ff，字节钉 stdio_binary_mode 7/7 绿）、B-ID108 闭账移出（JsonDoc 槽位三访问器 9a40bdf88，AppUpdate --emit-lib 77 文件绿 + Json 回归五钉绿）。早前同日：B-ID80 SipHash 落地闭账、B-ID66 闭账移出、B-ID104/105/106/110 各片落地（详 git 历史）。
 
 ## 未完成
 
@@ -39,9 +39,7 @@
 - [ ] B-ID104 apk.c 打包面：余：自动下载 JRE 无哈希校验（与 deps/checksums.txt 钉扎纪律矛盾）+ JRE 安装器职责整体移出编译器（scripts/ 或独立 setup 工具）。axml 池头/长度前缀越界、失败路径泄漏、PowerShell 单引号注入已修（1752eeeeb）。
 - [ ] B-ID106 运行时与公共库结构性收敛余项：rt_crash.h 1413 行实现住头文件被 3 TU 重复编译，拆 .c 为工程项（rt_io/rt_timer 是独立 .obj 定制命令拼链，需动原生/mt/wasm/bare 多条链路）；rt_mem slab 只进不出无归还 OS 路径（长驻进程高水位永不下落）；错误码四种口径并存（rt_file.c:113 返 0 与 epoch 0 不可区分为典型）。json 族/arena/tuple 签名/ferror-limit/diag 去重已修（git 历史）。
 - [ ] B-ID107 TypeInfo.Name 返回全限定名打穿 ORM 默认表名与 Json 类型判断（f896826d3 原生反射世界）：irgen_reflect.c refl_meta_for 的 blob name 槽存全名（兼去重键），ZAN_REFL_M_NAME 直接回该串——`tbl = ti.Name` 拿到 `Game.Arpg.Data.ArpgSaveSlotEntity` 拼 CREATE TABLE 报 sqlite 语法错（case_arpg_save_repository 红，基线同红）；JsonSerializer.IsListType 按短名前缀 `List<` 匹配同样失真。修法方向：契约对齐 C#（Name=短名另给 FullName），blob 去重键与 name 槽分离；或维持全名补 ShortName 并迁移 Zan.Data/Zan.Json 消费点。
-- [ ] B-ID108 Zan.AppUpdate 全源编译 13 错：UpdateFileEntry.zan / UpdateManifest.zan 调 `doc.Str(slot,name,dflt)` 系 JsonDoc 槽位访问器，但 Str/Long/Bool 只存在于 JsonValue（键值形态）——14c555c08 "JsonDoc 扁平解析"重构后槽位 API 无主，包在 main 上不可编译（基线同红）。修法方向：Zan.Json 补 JsonDoc 槽位访问器（若扁平槽位语义仍是设计意图）或迁移 AppUpdate 调用点改走 JsonValue 口径。
 - [ ] B-ID109 selfhost_fixed_point / selfhost_diff 闭环红：gen1 编译通过，但 gen2==gen3 不动点不成立且 gen2/gen3 与 gen1 产物 diff 失败（ctest，预存失败，最早引入点未定位，需向前二分）。修法方向：scripts/bootstrap.sh 复现，diff g2.ll/g3.ll 首个分叉定位（自举 irgen/ngen 与宿主 stdlib 子集语义差）。
 - [ ] B-ID110 Zan.Web 属性路由四案预存红：case_web_api_docs、case_web_list_protocol、case_web_menu_attrs、case_web_typed_binding——手编复刻缺 api-docs 参数行（page/limit/order/dir），指向 AttrRoutes 的 ApiDocs 生成链路在近期 MVC/attrs 重构后掉了参数元数据。gallery 两政策案已闭（97c7925dc，git 历史）。
 - [ ] B-ID112 string.AsView 悬垂视图——语言级生命周期分析缺口（登记不修）：`StringExtensions.AsView(this string)` 返回非 owning 的视图结构，表达式临时 string 上取视图在语句末被 ARC 释放后即悬垂，后续读取越界/脏数据（探针实证 2026-11-03；同族面 StringBuilder/ByteBuffer.AsView）。根修在编译器生命周期分析（视图与源对象生存期绑定、视图逃逸禁释放），库级不可修；短期约束：文档明示 AsView 结果不得脱离源对象生存期使用。
-- [ ] B-ID113 运行时重定向 stdout 文本模式翻译——CLI 工具「输出到管道」与「内部写文件」字节不一致：`Console.Write` 输出到管道/重定向时 `\n` 被 CRT 文本模式翻译为 `\r\n`，而 `File.WriteAllText` 原样 LF（字节级实证 2026-11-03：zanfmt 三路径共用同一 `Format()`，`--stdout` 产物 CRLF、就地模式产物 LF）。后果：`zanfmt --stdout f > f` 把文件翻成 CRLF，任何字节级比较工作流拿到幻影 diff；影响所有 Zan CLI 重定向输出。根修方向：runtime 对重定向 stdout 设二进制模式（`_setmode(_fileno(stdout), _O_BINARY)` 一族），配 conformance 钉「重定向输出 ≡ 程序内写文件」；改前先扫 conformance golden 是否 bake 了 CRLF。
 - [ ] B-ID114 lsp_session_editor 预存红（2026-11-03 发现）：测试客户端编译 831 文件成功后 ZANPKG_MISSING namespace=System/Threading/Tasks——TaskCompletionSource 实居 stdlib/System/Threading 平铺（无 Tasks 子空间），ide_zan editor/nav 5 文件仍 using System.Threading.Tasks 但不在该测试编译集，真实引用源待定位；缺失计数是否影响退出码待核（main.c auto_include_namespace）。与 json.c 改动无关（json.c 只链 zan-lsp/zan-dap，编译步为 zanc）；同日 dap_integration、lsp_integration_utf16 绿。
