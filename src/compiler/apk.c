@@ -269,6 +269,9 @@ static int axml_patch(const unsigned char *xml, size_t xml_len,
     uint32_t str_count;
     memcpy(&str_count, pool + 8, 4);
     if (str_count > 4096) return -1;
+    /* 偏移表须整体落在串池块内：曾无此校验，str_count 最大 4096 时
+     * offs[i] 的读取可越 xml 末尾最多 16KB */
+    if (28 + (size_t)str_count * 4 > first_size) return -1;
     const uint32_t *offs = (const uint32_t *)(pool + 28);
     const unsigned char *base = pool + str_start;
 
@@ -278,29 +281,39 @@ static int axml_patch(const unsigned char *xml, size_t xml_len,
     if (!raw || !raw_len || !text) zan_host_oom();
     for (uint32_t i = 0; i < str_count; i++) {
         size_t p = (size_t)(base - pool) + offs[i];
-        if (p >= first_size) return -1;
+        if (p >= first_size) goto fail_pool;
         size_t hl = 1;
         size_t n = 0;
         size_t rl;
         if (utf8) {
             size_t hl2 = 1;
             n = pool[p];
-            if (n & 0x80) { n = ((n & 0x7F) << 8) | pool[p + 1]; hl = 2; }
+            /* 长度前缀先验后读：曾先读后验，前缀字节可越 xml 末尾最多 3 字节 */
+            if (n & 0x80) {
+                if (p + 2 > first_size) goto fail_pool;
+                n = ((n & 0x7F) << 8) | pool[p + 1];
+                hl = 2;
+            }
+            if (p + hl >= first_size) goto fail_pool;
             size_t nb = pool[p + hl];
             if (nb & 0x80) {
+                if (p + hl + 2 > first_size) goto fail_pool;
                 nb = ((nb & 0x7F) << 8) | pool[p + hl + 1];
                 hl2 = 2;
             }
-            if (p + hl + hl2 + nb + 1 > first_size) return -1;
+            if (p + hl + hl2 + nb + 1 > first_size) goto fail_pool;
             size_t keep = nb < 255 ? nb : 255;
             memcpy(text[i], pool + p + hl + hl2, keep);
             text[i][keep] = '\0';
             rl = hl + hl2 + nb + 1;
         } else {
+            /* 长度前缀先验后读（同 utf8 分支） */
+            if (p + 2 > first_size) goto fail_pool;
             uint16_t n16;
             memcpy(&n16, pool + p, 2);
             hl = 2;
             if (n16 & 0x8000) {
+                if (p + 4 > first_size) goto fail_pool;
                 uint16_t n16b;
                 memcpy(&n16b, pool + p + 2, 2);
                 n = ((size_t)(n16 & 0x7FFF) << 16) | n16b;
@@ -308,7 +321,7 @@ static int axml_patch(const unsigned char *xml, size_t xml_len,
             } else {
                 n = n16;
             }
-            if (p + hl + n * 2 + 2 > first_size) return -1;
+            if (p + hl + n * 2 + 2 > first_size) goto fail_pool;
             size_t chars = n < 255 ? n : 255;
             for (size_t c = 0; c < chars; c++) {
                 uint16_t ch;
@@ -330,7 +343,7 @@ static int axml_patch(const unsigned char *xml, size_t xml_len,
         if (strcmp(text[i], "Zan App") == 0 && lbl_i < 0) lbl_i = (int)i;
     }
     if (pkg_i < 0) { fprintf(stderr, "error: template manifest lacks the "
-                             "package placeholder\n"); return -1; }
+                             "package placeholder\n"); goto fail_pool; }
 
     unsigned char repl[2][1200];
     size_t repl_len[2];
@@ -344,7 +357,7 @@ static int axml_patch(const unsigned char *xml, size_t xml_len,
             if (4 + n + 1 > sizeof(repl[v])) {
                 fprintf(stderr, "error: manifest string replacement "
                         "(%zu bytes) exceeds the pool entry buffer\n", n);
-                return -1;
+                goto fail_pool;
             }
             size_t dl = pool_put_len(repl[v], units);
             dl += pool_put_len(repl[v] + dl, n);
@@ -356,7 +369,7 @@ static int axml_patch(const unsigned char *xml, size_t xml_len,
             if (4 + n * 2 > sizeof(repl[v])) {
                 fprintf(stderr, "error: manifest string replacement "
                         "(%zu bytes) exceeds the pool entry buffer\n", n);
-                return -1;
+                goto fail_pool;
             }
             size_t out = 0;
             for (size_t c = 0; c < n; ) {
@@ -513,6 +526,12 @@ static int axml_patch(const unsigned char *xml, size_t xml_len,
     free(new_offs);
     buf_free(&nb);
     return 0;
+
+fail_pool:
+    /* 串池已分配后的统一失败出口：曾 6 处早退整批泄漏 raw/raw_len/text */
+    for (uint32_t i = 0; i < str_count; i++) free(raw[i]);
+    free(raw); free(raw_len); free(text);
+    return -1;
 }
 
 static unsigned char *read_all(const char *path, size_t *len) {
@@ -681,6 +700,14 @@ static int ensure_java(char *out, size_t outsz) {
         fprintf(stderr,
             "error: could not download the signing runtime (Java).\n"
             "       Install a JRE and make sure 'java' is on PATH, then retry.\n");
+        return -1;
+    }
+
+    /* PowerShell 单引号串内 `'` 即断串：曾直接拼路径，安装目录/压缩包
+     * 名含单引号时可注入任意命令 */
+    if (strchr(zip_path, '\'') || strchr(zdir, '\'')) {
+        fprintf(stderr, "error: install path contains a single quote\n");
+        remove(zip_path);
         return -1;
     }
 
