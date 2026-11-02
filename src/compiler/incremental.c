@@ -536,7 +536,9 @@ zan_compile_result_t *zan_parallel_compile(zan_parallel_opts_t *opts) {
     if (nthreads > 64) nthreads = 64;
 
     zan_compile_result_t *results = (zan_compile_result_t *)calloc((size_t)n, sizeof(zan_compile_result_t));
+    if (!results) { fprintf(stderr, "incremental: calloc results failed\n"); return NULL; }
     worker_task_t *tasks = (worker_task_t *)calloc((size_t)n, sizeof(worker_task_t));
+    if (!tasks) { fprintf(stderr, "incremental: calloc tasks failed\n"); free(results); return NULL; }
 
     for (int i = 0; i < n; i++) {
         tasks[i].source_path = opts->source_files[i];
@@ -546,17 +548,42 @@ zan_compile_result_t *zan_parallel_compile(zan_parallel_opts_t *opts) {
     }
 
     HANDLE *threads = (HANDLE *)malloc(sizeof(HANDLE) * (size_t)nthreads);
+    if (!threads) { fprintf(stderr, "incremental: malloc threads failed\n"); free(tasks); free(results); return NULL; }
+    bool *created = (bool *)calloc((size_t)nthreads, sizeof(bool));
+    if (!created) { fprintf(stderr, "incremental: calloc created failed\n"); free(threads); free(tasks); free(results); return NULL; }
+
     int idx = 0;
     while (idx < n) {
         int batch = (n - idx < nthreads) ? (n - idx) : nthreads;
+        HANDLE wait_handles[64];
+        int wait_count = 0;
         for (int t = 0; t < batch; t++) {
-            threads[t] = CreateThread(NULL, 0, compile_worker, &tasks[idx + t], 0, NULL);
+            HANDLE h = CreateThread(NULL, 0, compile_worker, &tasks[idx + t], 0, NULL);
+            if (h) {
+                threads[t] = h;
+                created[t] = true;
+                wait_handles[wait_count++] = h;
+            } else {
+                /* CreateThread 失败（句柄耗尽 / 系统资源紧张）——退化为当前线
+                 * 程直接跑 compile_worker。result->exit_code 在 task 完成时被
+                 * 写入，后续 join/collect 路径不依赖句柄。 */
+                fprintf(stderr, "incremental: CreateThread failed — task %d/%d runs on current thread\n",
+                        idx + t + 1, n);
+                compile_worker(&tasks[idx + t]);
+                created[t] = false;
+            }
         }
-        WaitForMultipleObjects((DWORD)batch, threads, TRUE, INFINITE);
-        for (int t = 0; t < batch; t++) { CloseHandle(threads[t]); }
+        if (wait_count > 0) {
+            WaitForMultipleObjects(wait_count, wait_handles, TRUE, INFINITE);
+        }
+        for (int t = 0; t < batch; t++) {
+            if (created[t]) CloseHandle(threads[t]);
+            created[t] = false;
+        }
         idx += batch;
     }
 
+    free(created);
     free(threads);
     free(tasks);
     return results;
@@ -637,7 +664,9 @@ zan_compile_result_t *zan_parallel_compile(zan_parallel_opts_t *opts) {
     if (nthreads > 64) nthreads = 64;
 
     zan_compile_result_t *results = (zan_compile_result_t *)calloc((size_t)n, sizeof(zan_compile_result_t));
+    if (!results) { fprintf(stderr, "incremental: calloc results failed\n"); return NULL; }
     worker_task_t *tasks = (worker_task_t *)calloc((size_t)n, sizeof(worker_task_t));
+    if (!tasks) { fprintf(stderr, "incremental: calloc tasks failed\n"); free(results); return NULL; }
 
     for (int i = 0; i < n; i++) {
         tasks[i].source_path = opts->source_files[i];
@@ -647,16 +676,35 @@ zan_compile_result_t *zan_parallel_compile(zan_parallel_opts_t *opts) {
     }
 
     pthread_t *threads = (pthread_t *)malloc(sizeof(pthread_t) * (size_t)nthreads);
+    if (!threads) { fprintf(stderr, "incremental: malloc threads failed\n"); free(tasks); free(results); return NULL; }
+    bool *created = (bool *)calloc((size_t)nthreads, sizeof(bool));
+    if (!created) { fprintf(stderr, "incremental: calloc created failed\n"); free(threads); free(tasks); free(results); return NULL; }
+
     int idx = 0;
     while (idx < n) {
         int batch = (n - idx < nthreads) ? (n - idx) : nthreads;
         for (int t = 0; t < batch; t++) {
-            pthread_create(&threads[t], NULL, compile_worker_posix, &tasks[idx + t]);
+            int rc = pthread_create(&threads[t], NULL, compile_worker_posix, &tasks[idx + t]);
+            if (rc == 0) {
+                created[t] = true;
+            } else {
+                /* pthread_create 失败（EAGAIN / ENOMEM — 系统线程或内存耗尽）。
+                 * 退化为当前线程直接跑 compile_worker_posix。注意：POSIX
+                 * 下这个函数返回 void*，这里忽略返回值即可（它只写
+                 * result->exit_code / result->error_msg）。 */
+                fprintf(stderr, "incremental: pthread_create rc=%d — task %d/%d runs on current thread\n",
+                        rc, idx + t + 1, n);
+                compile_worker_posix(&tasks[idx + t]);
+                created[t] = false;
+            }
         }
-        for (int t = 0; t < batch; t++) { pthread_join(threads[t], NULL); }
+        for (int t = 0; t < batch; t++) {
+            if (created[t]) pthread_join(threads[t], NULL);
+        }
         idx += batch;
     }
 
+    free(created);
     free(threads);
     free(tasks);
     return results;

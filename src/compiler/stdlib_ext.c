@@ -456,10 +456,16 @@ void zan_http_response_free(zan_http_response_t *resp) {
 #ifdef _WIN32
 
 zan_thread_t zan_thread_create(zan_thread_fn fn, void *arg) {
-    return (zan_thread_t)CreateThread(NULL, 0, (LPTHREAD_START_ROUTINE)fn, arg, 0, NULL);
+    HANDLE h = CreateThread(NULL, 0, (LPTHREAD_START_ROUTINE)fn, arg, 0, NULL);
+    if (!h) {
+        fprintf(stderr, "stdlib_ext: CreateThread failed: %lu\n", GetLastError());
+        return NULL;
+    }
+    return (zan_thread_t)h;
 }
 
 void zan_thread_join(zan_thread_t thread) {
+    if (!thread) return;
     WaitForSingleObject((HANDLE)thread, INFINITE);
     CloseHandle((HANDLE)thread);
 }
@@ -470,18 +476,32 @@ int64_t zan_thread_id(void) { return (int64_t)GetCurrentThreadId(); }
 
 zan_mutex_t zan_mutex_create(void) {
     CRITICAL_SECTION *cs = (CRITICAL_SECTION *)malloc(sizeof(CRITICAL_SECTION));
+    if (!cs) { fprintf(stderr, "stdlib_ext: malloc for CRITICAL_SECTION failed\n"); return NULL; }
+    /* InitializeCriticalSection 对内存做原子分配，极缺内存时可能抛出
+     * STATUS_NO_MEMORY 异常，MSDN 文档明确说它在这种情况下不返回——
+     * 但正常环境下不会发生。这里只保留 malloc 判空，不做 SEH 包裹
+     * （过度复杂化，且 Zan 其他地方也没这么做）。 */
     InitializeCriticalSection(cs);
     return (zan_mutex_t)cs;
 }
 
-void zan_mutex_lock(zan_mutex_t mtx) { EnterCriticalSection((CRITICAL_SECTION *)mtx); }
-void zan_mutex_unlock(zan_mutex_t mtx) { LeaveCriticalSection((CRITICAL_SECTION *)mtx); }
-void zan_mutex_destroy(zan_mutex_t mtx) { DeleteCriticalSection((CRITICAL_SECTION *)mtx); free(mtx); }
+void zan_mutex_lock(zan_mutex_t mtx) { if (mtx) EnterCriticalSection((CRITICAL_SECTION *)mtx); }
+void zan_mutex_unlock(zan_mutex_t mtx) { if (mtx) LeaveCriticalSection((CRITICAL_SECTION *)mtx); }
+void zan_mutex_destroy(zan_mutex_t mtx) {
+    if (mtx) { DeleteCriticalSection((CRITICAL_SECTION *)mtx); free(mtx); }
+}
 
-zan_event_t zan_event_create(void) { return (zan_event_t)CreateEventA(NULL, FALSE, FALSE, NULL); }
-void zan_event_signal(zan_event_t evt) { SetEvent((HANDLE)evt); }
-void zan_event_wait(zan_event_t evt) { WaitForSingleObject((HANDLE)evt, INFINITE); }
-void zan_event_destroy(zan_event_t evt) { CloseHandle((HANDLE)evt); }
+zan_event_t zan_event_create(void) {
+    HANDLE h = CreateEventA(NULL, FALSE, FALSE, NULL);
+    if (!h) {
+        fprintf(stderr, "stdlib_ext: CreateEventA failed: %lu\n", GetLastError());
+        return NULL;
+    }
+    return (zan_event_t)h;
+}
+void zan_event_signal(zan_event_t evt) { if (evt) SetEvent((HANDLE)evt); }
+void zan_event_wait(zan_event_t evt) { if (evt) WaitForSingleObject((HANDLE)evt, INFINITE); }
+void zan_event_destroy(zan_event_t evt) { if (evt) CloseHandle((HANDLE)evt); }
 
 int64_t zan_atomic_add(volatile int64_t *ptr, int64_t val) { return InterlockedExchangeAdd64(ptr, val); }
 int64_t zan_atomic_load(volatile int64_t *ptr) { return InterlockedCompareExchange64(ptr, 0, 0); }
@@ -491,11 +511,21 @@ void zan_atomic_store(volatile int64_t *ptr, int64_t val) { InterlockedExchange6
 
 zan_thread_t zan_thread_create(zan_thread_fn fn, void *arg) {
     pthread_t *t = (pthread_t *)malloc(sizeof(pthread_t));
-    pthread_create(t, NULL, (void *(*)(void *))fn, arg);
+    if (!t) {
+        fprintf(stderr, "stdlib_ext: malloc for pthread_t failed\n");
+        return NULL;
+    }
+    int rc = pthread_create(t, NULL, (void *(*)(void *))fn, arg);
+    if (rc != 0) {
+        fprintf(stderr, "stdlib_ext: pthread_create failed (%d)\n", rc);
+        free(t);
+        return NULL;
+    }
     return (zan_thread_t)t;
 }
 
 void zan_thread_join(zan_thread_t thread) {
+    if (!thread) return;
     pthread_join(*(pthread_t *)thread, NULL);
     free(thread);
 }
@@ -509,13 +539,28 @@ int64_t zan_thread_id(void) { return (int64_t)(uintptr_t)pthread_self(); }
 
 zan_mutex_t zan_mutex_create(void) {
     pthread_mutex_t *m = (pthread_mutex_t *)malloc(sizeof(pthread_mutex_t));
-    pthread_mutex_init(m, NULL);
+    if (!m) {
+        fprintf(stderr, "stdlib_ext: malloc for pthread_mutex_t failed\n");
+        return NULL;
+    }
+    int rc = pthread_mutex_init(m, NULL);
+    if (rc != 0) {
+        fprintf(stderr, "stdlib_ext: pthread_mutex_init failed (%d)\n", rc);
+        free(m);
+        return NULL;
+    }
     return (zan_mutex_t)m;
 }
 
-void zan_mutex_lock(zan_mutex_t mtx) { pthread_mutex_lock((pthread_mutex_t *)mtx); }
-void zan_mutex_unlock(zan_mutex_t mtx) { pthread_mutex_unlock((pthread_mutex_t *)mtx); }
-void zan_mutex_destroy(zan_mutex_t mtx) { pthread_mutex_destroy((pthread_mutex_t *)mtx); free(mtx); }
+void zan_mutex_lock(zan_mutex_t mtx) {
+    if (mtx) pthread_mutex_lock((pthread_mutex_t *)mtx);
+}
+void zan_mutex_unlock(zan_mutex_t mtx) {
+    if (mtx) pthread_mutex_unlock((pthread_mutex_t *)mtx);
+}
+void zan_mutex_destroy(zan_mutex_t mtx) {
+    if (mtx) { pthread_mutex_destroy((pthread_mutex_t *)mtx); free(mtx); }
+}
 
 typedef struct {
     pthread_mutex_t mtx;
@@ -524,26 +569,42 @@ typedef struct {
 
 zan_event_t zan_event_create(void) {
     zan_event_posix_t *e = (zan_event_posix_t *)malloc(sizeof(*e));
-    if (!e) return NULL;
-    pthread_mutex_init(&e->mtx, NULL);
-    pthread_cond_init(&e->cond, NULL);
+    if (!e) {
+        fprintf(stderr, "stdlib_ext: malloc for zan_event_posix_t failed\n");
+        return NULL;
+    }
+    int rc = pthread_mutex_init(&e->mtx, NULL);
+    if (rc != 0) {
+        fprintf(stderr, "stdlib_ext: pthread_mutex_init (event) failed (%d)\n", rc);
+        free(e);
+        return NULL;
+    }
+    rc = pthread_cond_init(&e->cond, NULL);
+    if (rc != 0) {
+        fprintf(stderr, "stdlib_ext: pthread_cond_init failed (%d)\n", rc);
+        pthread_mutex_destroy(&e->mtx);
+        free(e);
+        return NULL;
+    }
     return (zan_event_t)e;
 }
 void zan_event_signal(zan_event_t evt) {
+    if (!evt) return;
     zan_event_posix_t *e = (zan_event_posix_t *)evt;
     pthread_mutex_lock(&e->mtx);
     pthread_cond_signal(&e->cond);
     pthread_mutex_unlock(&e->mtx);
 }
 void zan_event_wait(zan_event_t evt) {
+    if (!evt) return;
     zan_event_posix_t *e = (zan_event_posix_t *)evt;
     pthread_mutex_lock(&e->mtx);
     pthread_cond_wait(&e->cond, &e->mtx);
     pthread_mutex_unlock(&e->mtx);
 }
 void zan_event_destroy(zan_event_t evt) {
+    if (!evt) return;
     zan_event_posix_t *e = (zan_event_posix_t *)evt;
-    if (!e) return;
     pthread_cond_destroy(&e->cond);
     pthread_mutex_destroy(&e->mtx);
     free(e);
