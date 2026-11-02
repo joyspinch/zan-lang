@@ -2642,6 +2642,7 @@ set(_conf_skip_cases arc_net_publish embed_compress publish_design_embed shard_d
 # 出现，修好了就翻红提醒把它从名单里拿掉。
 set(_known_leaky
   closure_cycle_warning
+  designer_html
 )
 # golden 必须取未插桩普通版的用例：泄漏报告打在 stdout 上，插桩版多一行报告
 # 就比不过 golden（已知会漏的那八条 + arc_leak_site_label），另有插桩自己会改

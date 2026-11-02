@@ -3,7 +3,7 @@
 服务端 Web 框架（纯 Zan，无原生依赖）。`using System.Web;` 按需拉入，
 命名空间保留零破坏。
 
-## 内容（System/Web 拆半：Designer 三件留守 stdlib，其余迁入）
+## 内容（服务端 Web 框架核心）
 
 | 文件 | 内容 |
 |---|---|
@@ -20,10 +20,9 @@
 | `Attribute.zan` | 自定义特性（Attribute/CustomAttribute/DescriptionAttribute 等） |
 | `WebWs.zan` / `WsSession.zan` | WebSocket 与会话（Sessions） |
 
-## 留守 stdlib（生成器子编译闭包，`--no-packages` 可达）
+## 标记层归位（Gui.Markup）
 
-`DesignerHtml` / `Html` / `HtmlScope`——设计器 HTML 发射三件，已核验对迁出
-13 文件零真实依赖。
+原 `DesignerHtml` / `HtmlParser` / `HtmlScope` 等设计器与 HTML 标记解析三件套已彻底归位至 `Zan.Gui`（`Gui.Markup` 命名空间），标准库 `stdlib/System/Web` 已彻底废除。
 
 ## 消费者
 
