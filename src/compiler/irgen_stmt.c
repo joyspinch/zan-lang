@@ -2512,7 +2512,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
         g->throw_catch_base = g->catch_cleanup_count;
         int fin_idx = -1;
         if (stmt->try_stmt.finally_body &&
-            g->finally_count < ZAN_MAX_FINALLY_DEPTH) {
+            ZAN_TAB_ENSURE(g->finallys, g->finally_count, g->finally_cap, 16)) {
             fin_idx = g->finally_count++;
             g->finallys[fin_idx].body = stmt->try_stmt.finally_body;
             g->finallys[fin_idx].monitor_obj = NULL;
@@ -2540,7 +2540,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                 "too many nested try/finally blocks in one function body");
         }
         int armed_idx = -1;
-        if (g->eh_armed_count < ZAN_MAX_ARMED_TRY) {
+        if (ZAN_TAB_ENSURE(g->eh_armed, g->eh_armed_count, g->eh_armed_cap, 16)) {
             armed_idx = g->eh_armed_count++;
             g->eh_armed[armed_idx].old_top_slot = old_top_slot;
             g->eh_armed[armed_idx].restore_tmps = false;
@@ -3341,7 +3341,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
         zan_store_fit(g, obj, obj_slot);
         zan_call2(g->builder, mon_ty, enter_fn, &obj, 1, "");
         int lock_fin = -1;
-        if (g->finally_count < ZAN_MAX_FINALLY_DEPTH) {
+        if (ZAN_TAB_ENSURE(g->finallys, g->finally_count, g->finally_cap, 16)) {
             lock_fin = g->finally_count++;
             g->finallys[lock_fin].body = NULL;
             g->finallys[lock_fin].monitor_obj = obj_slot;

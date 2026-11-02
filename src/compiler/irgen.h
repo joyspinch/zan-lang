@@ -62,8 +62,9 @@ static inline bool zan_tab_reserve(void **items, int *cap, size_t elem,
 /* 表达式推导递归深度上限（防止类型循环推导死循环） */
 #define ZAN_MAX_INFER_DEPTH 16384
 
-#define ZAN_MAX_FINALLY_DEPTH 256
-
+/* B-ID74：finally 栈与 try 武装栈已改为动态伸缩（finallys/eh_armed +
+ * ZAN_TAB_ENSURE），不再有 256/1024 层静态封顶。此常量仅剩 wasm_lpad_stack
+ * 一处残留使用（该栈从未被压入，待 wasm EH 落地时一并改动态）。 */
 #define ZAN_MAX_ARMED_TRY 1024
 
 typedef struct zan_irgen_pending_scope {
@@ -235,9 +236,10 @@ struct zan_irgen {
     /* 当前 try 块内的 catch 清理项数量 */
     int throw_catch_base;
 
-    /* 当前激活的 finally 代码块栈（由内至外排布） */
-    zan_irgen_finally_entry_t finallys[ZAN_MAX_FINALLY_DEPTH];
+    /* 当前激活的 finally 代码块栈（由内至外排布；动态伸缩，B-ID74） */
+    zan_irgen_finally_entry_t *finallys;
     int finally_count;
+    int finally_cap;
     int finally_loop_base;
     zan_irgen_pending_context_t pending;
     void *current_locals;
@@ -252,8 +254,9 @@ struct zan_irgen {
          * tmps 栈顶）。错写会把无 try 时的 top=-1 冲成 0，之后失败的
          * 运行期检查误判“在 try 里”而跳进从未 setjmp 的 bufs[0]。 */
         bool restore_tmps;
-    } eh_armed[ZAN_MAX_ARMED_TRY];
+    } *eh_armed;          /* 动态伸缩（B-ID74） */
     int eh_armed_count;
+    int eh_armed_cap;
     /* 当前函数体拥有的作用域清理项 */
     int eh_armed_base;
     int eh_armed_loop_base;

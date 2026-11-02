@@ -2991,6 +2991,12 @@ void zan_irgen_destroy(zan_irgen_t *g) {
     free(g->catch_cleanups);
     g->catch_cleanups = NULL;
     g->catch_cleanup_count = g->catch_cleanup_cap = 0;
+    free(g->finallys);
+    g->finallys = NULL;
+    g->finally_count = g->finally_cap = 0;
+    free(g->eh_armed);
+    g->eh_armed = NULL;
+    g->eh_armed_count = g->eh_armed_cap = 0;
     free(g->di_files);
     g->di_files = NULL;
     g->di_file_cap = 0;

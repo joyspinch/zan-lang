@@ -1974,7 +1974,7 @@ static void emit_user_method_bodies(zan_irgen_t *g, method_body_work_t *work,
              * 所有权交给调用方），抛出走 unwind 按字段类型释放。 */
             if (type_sym->type && type_sym->type->kind == TYPE_STRUCT &&
                 !g->current_async_frame &&
-                g->eh_armed_count < ZAN_MAX_ARMED_TRY) {
+                ZAN_TAB_ENSURE(g->eh_armed, g->eh_armed_count, g->eh_armed_cap, 16)) {
                 LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
                 LLVMValueRef tt = get_eh_tmp_top_global(g);
                 LLVMValueRef base = LLVMBuildLoad2(g->builder, i32t, tt,
