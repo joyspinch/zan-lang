@@ -1424,6 +1424,28 @@ add_test(NAME diag_builtin_name_shadow_delegate
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_builtin_name_shadow_delegate PROPERTIES TIMEOUT 60)
 
+# E1007 边界：只有 Action/Func（内建可遮蔽名字）在被同名非泛型 delegate
+# 遮蔽时才放行到内建泛型合成；普通名字（如 MyAction）必须照旧报 E1007。
+add_test(NAME diag_delegate_nongeneric_typeargs
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/delegate_nongeneric_typeargs.zan
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/diag_delegate_nongeneric_typeargs${_exe_ext}
+    "-DEXPECT_REGEX=E1007.*the non-generic type .MyAction. cannot be used with type arguments"
+    -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
+set_tests_properties(diag_delegate_nongeneric_typeargs PROPERTIES TIMEOUT 60)
+
+# E1006 边界：同理，普通名字的泛型 delegate 传错 arity 必须照旧报 E1006，
+# 内建 Action/Func 在 arity 不匹配时才路由到内建合成。
+add_test(NAME diag_delegate_generic_wrong_arity
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/delegate_generic_wrong_arity.zan
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/diag_delegate_generic_wrong_arity${_exe_ext}
+    "-DEXPECT_REGEX=E1006.*using the generic type .GenAct. requires 1 type arguments .got 2"
+    -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
+set_tests_properties(diag_delegate_generic_wrong_arity PROPERTIES TIMEOUT 60)
+
 # A382②: --warn-level=error must upgrade #warning to a fatal error (the
 # compile fails and the diagnostic keeps its original W-letter prefix).
 add_test(NAME diag_warn_level_error
