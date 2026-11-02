@@ -2047,14 +2047,20 @@ static LLVMValueRef emit_expr_conditional(zan_irgen_t *g, zan_ast_node_t *expr,
                 g, expr->conditional.then_expr, locals);
             int else_owned = expr_yields_owned_rc_value(
                 g, expr->conditional.else_expr, locals);
-            /* 产生持有引用的条件表达式需规范化各分支所有权状态 */
+            /* 产生持有引用的条件表达式需规范化各分支所有权状态。
+             * B-ID111：委托 retain 不是直线调用——值可能是裸函数指针或堆闭包，
+             * irgen_arc 以运行期 clo.is 分流建 clo.rt/clo.rt.end 两块并把 builder
+             * 留在后者；此处不重取臂末块，下方 Br(merge) 便落回旧块成双终结符、
+             * clo.rt.end 悬空无终结符（`c ? (Op)(lambda) : null` 必炸 E3090）。 */
             if (then_owned != else_owned) {
                 if (!then_owned) {
                     LLVMPositionBuilderAtEnd(g->builder, then_end);
                     emit_rc_retain_for_type(g, conditional_type, then_val);
+                    then_end = LLVMGetInsertBlock(g->builder);
                 } else {
                     LLVMPositionBuilderAtEnd(g->builder, else_end);
                     emit_rc_retain_for_type(g, conditional_type, else_val);
+                    else_end = LLVMGetInsertBlock(g->builder);
                 }
             }
         }
@@ -2079,8 +2085,10 @@ static LLVMValueRef emit_expr_conditional(zan_irgen_t *g, zan_ast_node_t *expr,
             }
             LLVMPositionBuilderAtEnd(g->builder, then_end);
             then_val = coerce_ternary_value(g, then_val, phi_ty);
+            then_end = LLVMGetInsertBlock(g->builder);
             LLVMPositionBuilderAtEnd(g->builder, else_end);
             else_val = coerce_ternary_value(g, else_val, phi_ty);
+            else_end = LLVMGetInsertBlock(g->builder);
         }
 
         LLVMPositionBuilderAtEnd(g->builder, then_end);
