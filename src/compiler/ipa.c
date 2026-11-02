@@ -8,6 +8,8 @@
 #include <stdint.h>
 #include <stdbool.h>
 
+#include "../common/fmt_checked.h"
+
 #ifdef _WIN32
 #include <windows.h>
 #else
@@ -114,8 +116,8 @@ static int zip_add(ipa_zip_t *z, const char *name, const void *data, size_t sz, 
     }
 
     ipa_zip_ent_t *e = &z->ents[z->nent];
-    strncpy(e->name, name, sizeof(e->name) - 1);
-    e->name[sizeof(e->name) - 1] = '\0';
+    if (zan_fmt_checked(e->name, sizeof(e->name), "zip entry name",
+                        "%s", name) != 0) return -1;
     e->uncomp_size = (uint32_t)sz;
     e->crc = ipa_crc32((const unsigned char *)data, sz);
     e->offset = z->out.len;
@@ -268,56 +270,76 @@ static unsigned char *extract_png_from_ico_or_png(const unsigned char *data, siz
     return NULL;
 }
 
-static void ipa_add_tree(ipa_zip_t *zip, const char *fs_dir, const char *zip_prefix) {
+static int ipa_add_tree(ipa_zip_t *zip, const char *fs_dir, const char *zip_prefix) {
 #ifdef _WIN32
     char pattern[1024];
-    snprintf(pattern, sizeof(pattern), "%s\\*", fs_dir);
+    if (zan_fmt_checked(pattern, sizeof(pattern), "asset search pattern",
+                        "%s\\*", fs_dir) != 0) return -1;
     WIN32_FIND_DATAA fd;
     HANDLE h = FindFirstFileA(pattern, &fd);
-    if (h == INVALID_HANDLE_VALUE) return;
+    if (h == INVALID_HANDLE_VALUE) return 0;
     do {
         if (strcmp(fd.cFileName, ".") == 0 || strcmp(fd.cFileName, "..") == 0) continue;
         char sub_fs[1024];
-        snprintf(sub_fs, sizeof(sub_fs), "%s/%s", fs_dir, fd.cFileName);
+        if (zan_fmt_checked(sub_fs, sizeof(sub_fs), "asset filesystem path",
+                            "%s/%s", fs_dir, fd.cFileName) != 0) {
+            FindClose(h); return -1;
+        }
         char sub_zip[1024];
-        snprintf(sub_zip, sizeof(sub_zip), "%s/%s", zip_prefix, fd.cFileName);
+        if (zan_fmt_checked(sub_zip, sizeof(sub_zip), "asset zip entry name",
+                            "%s/%s", zip_prefix, fd.cFileName) != 0) {
+            FindClose(h); return -1;
+        }
         if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
-            ipa_add_tree(zip, sub_fs, sub_zip);
+            if (ipa_add_tree(zip, sub_fs, sub_zip) != 0) {
+                FindClose(h); return -1;
+            }
         } else {
             size_t sz = 0;
             unsigned char *d = read_file_bytes(sub_fs, &sz);
             if (d) {
-                zip_add(zip, sub_zip, d, sz, 0100644);
+                int rc = zip_add(zip, sub_zip, d, sz, 0100644);
                 free(d);
+                if (rc != 0) { FindClose(h); return -1; }
             }
         }
     } while (FindNextFileA(h, &fd));
     FindClose(h);
 #else
     DIR *d = opendir(fs_dir);
-    if (!d) return;
+    if (!d) return 0;
     struct dirent *e;
     while ((e = readdir(d)) != NULL) {
         if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0) continue;
         char sub_fs[1024];
-        snprintf(sub_fs, sizeof(sub_fs), "%s/%s", fs_dir, e->d_name);
+        if (zan_fmt_checked(sub_fs, sizeof(sub_fs), "asset filesystem path",
+                            "%s/%s", fs_dir, e->d_name) != 0) {
+            closedir(d); return -1;
+        }
         char sub_zip[1024];
-        snprintf(sub_zip, sizeof(sub_zip), "%s/%s", zip_prefix, e->d_name);
+        if (zan_fmt_checked(sub_zip, sizeof(sub_zip), "asset zip entry name",
+                            "%s/%s", zip_prefix, e->d_name) != 0) {
+            closedir(d); return -1;
+        }
         struct stat st;
         if (stat(sub_fs, &st) != 0) continue;
         if (S_ISDIR(st.st_mode)) {
-            ipa_add_tree(zip, sub_fs, sub_zip);
+            if (ipa_add_tree(zip, sub_fs, sub_zip) != 0) {
+                closedir(d); return -1;
+            }
         } else if (S_ISREG(st.st_mode)) {
             size_t sz = 0;
             unsigned char *data = read_file_bytes(sub_fs, &sz);
             if (data) {
-                zip_add(zip, sub_zip, data, sz, 0100644);
+                int rc = zip_add(zip, sub_zip, data, sz, 0100644);
                 free(data);
+                if (rc != 0) { closedir(d); return -1; }
             }
         }
     }
     closedir(d);
 #endif
+    return 0;
 }
 
 int zan_ipa_build(const char *ipa_path, const char *binary_path,
@@ -359,7 +381,13 @@ int zan_ipa_build(const char *ipa_path, const char *binary_path,
 
     char default_bundle[256];
     if (!bundle_id || !bundle_id[0]) {
-        snprintf(default_bundle, sizeof(default_bundle), "dev.zan.%s", app_name);
+        if (zan_fmt_checked(default_bundle, sizeof(default_bundle),
+                            "default bundle id", "dev.zan.%s",
+                            app_name) != 0) {
+            if (icon_png) free(icon_png);
+            free(bin_data);
+            return -1;
+        }
         bundle_id = default_bundle;
     }
     if (!display_name || !display_name[0]) {
@@ -370,7 +398,7 @@ int zan_ipa_build(const char *ipa_path, const char *binary_path,
     }
 
     char plist[4096];
-    int plist_len = snprintf(plist, sizeof(plist),
+    if (zan_fmt_checked(plist, sizeof(plist), "Info.plist",
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
         "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" "
         "\"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n"
@@ -466,14 +494,12 @@ int zan_ipa_build(const char *ipa_path, const char *binary_path,
         "    <string>AppIcon60x60</string>\n"
         "</dict>\n"
         "</plist>\n",
-        app_name, bundle_id, app_name, display_name, version);
-
-    if (plist_len < 0 || (size_t)plist_len >= sizeof(plist)) {
+        app_name, bundle_id, app_name, display_name, version) != 0) {
         if (icon_png) free(icon_png);
         free(bin_data);
-        fprintf(stderr, "error: generated Info.plist exceeded buffer\n");
         return -1;
     }
+    size_t plist_len = strlen(plist);
 
     const char *pkg_info = "APPL????";
 
@@ -481,7 +507,13 @@ int zan_ipa_build(const char *ipa_path, const char *binary_path,
     zip_start(&zip);
 
     char bin_entry[512];
-    snprintf(bin_entry, sizeof(bin_entry), "Payload/%s.app/%s", app_name, app_name);
+    if (zan_fmt_checked(bin_entry, sizeof(bin_entry), "IPA binary entry name",
+                        "Payload/%s.app/%s", app_name, app_name) != 0) {
+        if (icon_png) free(icon_png);
+        free(bin_data);
+        zip_destroy(&zip);
+        return -1;
+    }
     if (zip_add(&zip, bin_entry, bin_data, bin_sz, 0100755) != 0) {
         if (icon_png) free(icon_png);
         free(bin_data);
@@ -489,21 +521,26 @@ int zan_ipa_build(const char *ipa_path, const char *binary_path,
         return -1;
     }
     free(bin_data);
+    bin_data = NULL;
 
     char plist_entry[512];
-    snprintf(plist_entry, sizeof(plist_entry), "Payload/%s.app/Info.plist", app_name);
-    if (zip_add(&zip, plist_entry, plist, (size_t)plist_len, 0100644) != 0) {
-        if (icon_png) free(icon_png);
-        zip_destroy(&zip);
-        return -1;
+    if (zan_fmt_checked(plist_entry, sizeof(plist_entry),
+                        "IPA Info.plist entry name",
+                        "Payload/%s.app/Info.plist", app_name) != 0) {
+        goto fail_pack;
+    }
+    if (zip_add(&zip, plist_entry, plist, plist_len, 0100644) != 0) {
+        goto fail_pack;
     }
 
     char pkg_entry[512];
-    snprintf(pkg_entry, sizeof(pkg_entry), "Payload/%s.app/PkgInfo", app_name);
+    if (zan_fmt_checked(pkg_entry, sizeof(pkg_entry),
+                        "IPA PkgInfo entry name",
+                        "Payload/%s.app/PkgInfo", app_name) != 0) {
+        goto fail_pack;
+    }
     if (zip_add(&zip, pkg_entry, pkg_info, 8, 0100644) != 0) {
-        if (icon_png) free(icon_png);
-        zip_destroy(&zip);
-        return -1;
+        goto fail_pack;
     }
 
     if (icon_png && icon_png_sz > 0) {
@@ -524,17 +561,32 @@ int zan_ipa_build(const char *ipa_path, const char *binary_path,
         };
         char icon_entry[512];
         for (int k = 0; icon_names[k]; k++) {
-            snprintf(icon_entry, sizeof(icon_entry), "Payload/%s.app/%s", app_name, icon_names[k]);
-            zip_add(&zip, icon_entry, icon_png, icon_png_sz, 0100644);
+            if (zan_fmt_checked(icon_entry, sizeof(icon_entry),
+                                "IPA icon entry name",
+                                "Payload/%s.app/%s",
+                                app_name, icon_names[k]) != 0) {
+                goto fail_pack;
+            }
+            if (zip_add(&zip, icon_entry, icon_png, icon_png_sz,
+                        0100644) != 0) {
+                goto fail_pack;
+            }
         }
-        zip_add(&zip, "iTunesArtwork", icon_png, icon_png_sz, 0100644);
+        if (zip_add(&zip, "iTunesArtwork", icon_png, icon_png_sz,
+                    0100644) != 0) {
+            goto fail_pack;
+        }
     }
-    if (icon_png) free(icon_png);
+    if (icon_png) { free(icon_png); icon_png = NULL; }
 
     if (assets_dir && assets_dir[0]) {
         char zip_assets[512];
-        snprintf(zip_assets, sizeof(zip_assets), "Payload/%s.app/assets", app_name);
-        ipa_add_tree(&zip, assets_dir, zip_assets);
+        if (zan_fmt_checked(zip_assets, sizeof(zip_assets),
+                            "IPA assets entry name",
+                            "Payload/%s.app/assets", app_name) != 0) {
+            goto fail_pack;
+        }
+        if (ipa_add_tree(&zip, assets_dir, zip_assets) != 0) goto fail_pack;
     }
 
     zip_finish(&zip);
@@ -557,4 +609,10 @@ int zan_ipa_build(const char *ipa_path, const char *binary_path,
 
     zip_destroy(&zip);
     return 0;
+
+fail_pack:
+    free(bin_data);
+    if (icon_png) free(icon_png);
+    zip_destroy(&zip);
+    return -1;
 }

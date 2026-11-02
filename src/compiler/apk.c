@@ -14,6 +14,7 @@
 #include <unistd.h>
 #endif
 
+#include "../common/fmt_checked.h"
 #include "../common/host_oom.h"
 
 typedef struct {
@@ -132,7 +133,8 @@ static int zip_add(zip_t *z, const char *name, const unsigned char *data,
     }
     zip_ent_t *e = &z->ents[z->nent];
     memset(e, 0, sizeof(*e));
-    snprintf(e->name, sizeof(e->name), "%s", name);
+    if (zan_fmt_checked(e->name, sizeof(e->name), "zip entry name",
+                        "%s", name) != 0) return -1;
     e->method = compress ? 8 : 0;
     e->align = align;
     e->usize = (uint32_t)n;
@@ -564,21 +566,25 @@ static int find_java(char *out, size_t outsz) {
     const char *home = getenv("JAVA_HOME");
     if (home && home[0]) {
 #ifdef _WIN32
-        snprintf(out, outsz, "%s\\bin\\java.exe", home);
+        if (zan_fmt_checked(out, outsz, "java path (JAVA_HOME)",
+                            "%s\\bin\\java.exe", home) != 0) return -1;
 #else
-        snprintf(out, outsz, "%s/bin/java", home);
+        if (zan_fmt_checked(out, outsz, "java path (JAVA_HOME)",
+                            "%s/bin/java", home) != 0) return -1;
 #endif
         if (file_exists(out)) return 0;
     }
 #ifdef _WIN32
     char found[MAX_PATH];
     if (SearchPathA(NULL, "java.exe", NULL, MAX_PATH, found, NULL) > 0) {
-        snprintf(out, outsz, "%s", found);
+        if (zan_fmt_checked(out, outsz, "java path (PATH search)",
+                            "%s", found) != 0) return -1;
         return 0;
     }
 #else
     if (file_exists("/usr/bin/java") || file_exists("/usr/local/bin/java")) {
-        snprintf(out, outsz, "java");
+        if (zan_fmt_checked(out, outsz, "java path (standard install)",
+                            "java") != 0) return -1;
         return 0;
     }
     FILE *w = popen("command -v java 2>/dev/null", "r");
@@ -587,7 +593,12 @@ static int find_java(char *out, size_t outsz) {
         if (fgets(line, sizeof(line), w)) {
             size_t l = strlen(line);
             while (l > 0 && (line[l-1] == '\n' || line[l-1] == '\r')) line[--l] = 0;
-            if (l > 0 && file_exists(line)) { snprintf(out, outsz, "%s", line); pclose(w); return 0; }
+            if (l > 0 && file_exists(line)) {
+                pclose(w);
+                if (zan_fmt_checked(out, outsz, "java path (command -v)",
+                                    "%s", line) != 0) return -1;
+                return 0;
+            }
         }
         pclose(w);
     }
@@ -635,13 +646,19 @@ static int ensure_java(char *out, size_t outsz) {
     }
     char zdir[1200], zip_path[1300], done[1300];
 #ifdef _WIN32
-    snprintf(zdir, sizeof(zdir), "%s\\.zan", home);
-    snprintf(zip_path, sizeof(zip_path), "%s\\jre.zip", zdir);
-    snprintf(done, sizeof(done), "%s\\jre-win\\.done", zdir);
+    if (zan_fmt_checked(zdir, sizeof(zdir), "JRE cache dir", "%s\\.zan",
+                        home) != 0) return -1;
+    if (zan_fmt_checked(zip_path, sizeof(zip_path), "JRE download path",
+                        "%s\\jre.zip", zdir) != 0) return -1;
+    if (zan_fmt_checked(done, sizeof(done), "JRE done marker",
+                        "%s\\jre-win\\.done", zdir) != 0) return -1;
 #else
-    snprintf(zdir, sizeof(zdir), "%s/.zan", home);
-    snprintf(zip_path, sizeof(zip_path), "%s/jre.zip", zdir);
-    snprintf(done, sizeof(done), "%s/jre-win/.done", zdir);
+    if (zan_fmt_checked(zdir, sizeof(zdir), "JRE cache dir", "%s/.zan",
+                        home) != 0) return -1;
+    if (zan_fmt_checked(zip_path, sizeof(zip_path), "JRE download path",
+                        "%s/jre.zip", zdir) != 0) return -1;
+    if (zan_fmt_checked(done, sizeof(done), "JRE done marker",
+                        "%s/jre-win/.done", zdir) != 0) return -1;
 #endif
     if (!dir_exists(zdir)) {
 #ifdef _WIN32
@@ -652,9 +669,11 @@ static int ensure_java(char *out, size_t outsz) {
     }
     if (file_exists(done)) {
 #ifdef _WIN32
-        snprintf(out, outsz, "%s\\jre-win\\bin\\java.exe", zdir);
+        if (zan_fmt_checked(out, outsz, "JRE java path",
+                            "%s\\jre-win\\bin\\java.exe", zdir) != 0) return -1;
 #else
-        snprintf(out, outsz, "%s/jre-win/bin/java", zdir);
+        if (zan_fmt_checked(out, outsz, "JRE java path",
+                            "%s/jre-win/bin/java", zdir) != 0) return -1;
 #endif
         if (file_exists(out)) return 0;
     }
@@ -668,27 +687,29 @@ static int ensure_java(char *out, size_t outsz) {
     }
 
     char cmd[3000];
-    snprintf(cmd, sizeof(cmd),
+    if (zan_fmt_checked(cmd, sizeof(cmd), "JRE unpack command",
         "powershell -NoProfile -Command \"$ErrorActionPreference='Stop';"
         "Expand-Archive -Force -LiteralPath '%s' -DestinationPath '%s'\"",
-        zip_path, zdir);
+        zip_path, zdir) != 0) { remove(zip_path); return -1; }
     int rc = system(cmd);
     remove(zip_path);
     if (rc != 0) {
         fprintf(stderr, "error: could not unpack the downloaded JRE\n");
         return -1;
     }
-    snprintf(cmd, sizeof(cmd),
+    if (zan_fmt_checked(cmd, sizeof(cmd), "JRE move command",
         "powershell -NoProfile -Command \"$d=Get-ChildItem '%s' -Directory |"
         "Where-Object Name -like 'jdk-*'; if($d){Move-Item -Force $d.FullName '%s\\jre-win'}\"",
-        zdir, zdir);
+        zdir, zdir) != 0) return -1;
     system(cmd);
     FILE *df = fopen(done, "wb");
     if (df) { fputs("ok\n", df); fclose(df); }
 #ifdef _WIN32
-    snprintf(out, outsz, "%s\\jre-win\\bin\\java.exe", zdir);
+    if (zan_fmt_checked(out, outsz, "JRE java path",
+                        "%s\\jre-win\\bin\\java.exe", zdir) != 0) return -1;
 #else
-    snprintf(out, outsz, "%s/jre-win/bin/java", zdir);
+    if (zan_fmt_checked(out, outsz, "JRE java path",
+                        "%s/jre-win/bin/java", zdir) != 0) return -1;
 #endif
     if (!file_exists(out)) {
         fprintf(stderr, "error: JRE download did not produce %s\n", out);
@@ -704,13 +725,17 @@ static int ensure_keystore(char *out, size_t outsz) {
     if (!home || !home[0]) home = getenv("HOME");
     if (!home || !home[0]) return -1;
 #ifdef _WIN32
-    snprintf(out, outsz, "%s\\.zan\\debug.keystore", home);
+    if (zan_fmt_checked(out, outsz, "debug keystore path",
+                        "%s\\.zan\\debug.keystore", home) != 0) return -1;
 #else
-    snprintf(out, outsz, "%s/.zan/debug.keystore", home);
+    if (zan_fmt_checked(out, outsz, "debug keystore path",
+                        "%s/.zan/debug.keystore", home) != 0) return -1;
 #endif
     if (file_exists(out)) return 0;
 #ifdef _WIN32
-    { char dir[1200]; snprintf(dir, sizeof(dir), "%s\\.zan", home);
+    { char dir[1200];
+      if (zan_fmt_checked(dir, sizeof(dir), "debug keystore dir",
+                          "%s\\.zan", home) != 0) return -1;
       if (!dir_exists(dir)) CreateDirectoryA(dir, NULL); }
 #endif
     return 0;
@@ -726,16 +751,25 @@ int zan_apk_build(const char *apk_path, const char *lib_main,
                   const char *shell_dir, char **extra_libs, int extra_count,
                   int perm_count, const char (*perms)[128]) {
     char tmp_apk[1400];
-    snprintf(tmp_apk, sizeof(tmp_apk), "%s.tmp", apk_path);
+    if (zan_fmt_checked(tmp_apk, sizeof(tmp_apk), "APK temporary path",
+                        "%s.tmp", apk_path) != 0) return 1;
 
     char path[1400];
     size_t man_len = 0, arsc_len = 0, dex_len = 0, lib_len = 0;
-    snprintf(path, sizeof(path), "%s/AndroidManifest.xml.bin", shell_dir);
-    unsigned char *manifest = read_all(path, &man_len);
-    snprintf(path, sizeof(path), "%s/resources.arsc", shell_dir);
-    unsigned char *arsc = read_all(path, &arsc_len);
-    snprintf(path, sizeof(path), "%s/classes.dex", shell_dir);
-    unsigned char *dex = read_all(path, &dex_len);
+    unsigned char *manifest = NULL, *arsc = NULL, *dex = NULL;
+    if (zan_fmt_checked(path, sizeof(path), "APK shell manifest path",
+                        "%s/AndroidManifest.xml.bin", shell_dir) != 0) return 1;
+    manifest = read_all(path, &man_len);
+    if (zan_fmt_checked(path, sizeof(path), "APK shell resources path",
+                        "%s/resources.arsc", shell_dir) != 0) {
+        free(manifest); return 1;
+    }
+    arsc = read_all(path, &arsc_len);
+    if (zan_fmt_checked(path, sizeof(path), "APK shell dex path",
+                        "%s/classes.dex", shell_dir) != 0) {
+        free(manifest); free(arsc); return 1;
+    }
+    dex = read_all(path, &dex_len);
     unsigned char *lib = read_all(lib_main, &lib_len);
     if (!manifest || !arsc || !dex || !lib) {
         fprintf(stderr, "error: APK shell assets missing in '%s' "
@@ -756,55 +790,56 @@ int zan_apk_build(const char *apk_path, const char *lib_main,
     if (zip_add(&z, "AndroidManifest.xml", man2, man2_len, 1, 4) != 0 ||
         zip_add(&z, "resources.arsc", arsc, arsc_len, 0, 4) != 0 ||
         zip_add(&z, "classes.dex", dex, dex_len, 1, 4) != 0) {
-        buf_free(&z.out); free(z.ents);
-        free(man2); free(arsc); free(dex); free(lib);
-        return 1;
+        goto fail_zip;
     }
     {
         static const char *dpis[] = { "mipmap-mdpi", "mipmap-hdpi",
             "mipmap-xhdpi", "mipmap-xxhdpi", "mipmap-xxxhdpi" };
         for (unsigned di = 0; di < sizeof(dpis) / sizeof(dpis[0]); di++) {
-            snprintf(path, sizeof(path), "%s/res/%s/ic_launcher.png",
-                     shell_dir, dpis[di]);
+            if (zan_fmt_checked(path, sizeof(path), "APK icon path",
+                                "%s/res/%s/ic_launcher.png",
+                                shell_dir, dpis[di]) != 0) goto fail_zip;
             size_t ilen = 0;
             unsigned char *idata = read_all(path, &ilen);
             if (!idata) continue;
             char ename[160];
-            snprintf(ename, sizeof(ename), "res/%s-v4/ic_launcher.png", dpis[di]);
+            if (zan_fmt_checked(ename, sizeof(ename), "APK icon entry name",
+                                "res/%s-v4/ic_launcher.png", dpis[di]) != 0) {
+                free(idata);
+                goto fail_zip;
+            }
             if (zip_add(&z, ename, idata, ilen, 1, 4) != 0) {
-                free(idata); buf_free(&z.out); free(z.ents);
-                free(man2); free(arsc); free(dex); free(lib);
-                return 1;
+                free(idata);
+                goto fail_zip;
             }
             free(idata);
         }
     }
     char lname[160];
-    snprintf(lname, sizeof(lname), "lib/%s/libmain.so", abi);
-    if (zip_add(&z, lname, lib, lib_len, 0, 4) != 0) {
-        buf_free(&z.out); free(z.ents);
-        free(man2); free(arsc); free(dex); free(lib);
-        return 1;
-    }
+    if (zan_fmt_checked(lname, sizeof(lname), "APK main library entry name",
+                        "lib/%s/libmain.so", abi) != 0) goto fail_zip;
+    if (zip_add(&z, lname, lib, lib_len, 0, 4) != 0) goto fail_zip;
     for (int i = 0; i < extra_count; i++) {
         size_t elen = 0;
         unsigned char *edata = read_all(extra_libs[i], &elen);
         if (!edata) {
             fprintf(stderr, "error: cannot read bundled library '%s'\n",
                     extra_libs[i]);
-            free(edata); buf_free(&z.out); free(z.ents); free(man2); free(arsc);
-            free(dex); free(lib); return 1;
+            goto fail_zip;
         }
         const char *base = strrchr(extra_libs[i], '/');
         const char *base2 = strrchr(extra_libs[i], '\\');
         if (base2 > base) base = base2;
         base = base ? base + 1 : extra_libs[i];
         char ename[200];
-        snprintf(ename, sizeof(ename), "lib/%s/%s", abi, base);
+        if (zan_fmt_checked(ename, sizeof(ename), "APK extra library entry name",
+                            "lib/%s/%s", abi, base) != 0) {
+            free(edata);
+            goto fail_zip;
+        }
         if (zip_add(&z, ename, edata, elen, 0, 4) != 0) {
-            free(edata); buf_free(&z.out); free(z.ents);
-            free(man2); free(arsc); free(dex); free(lib);
-            return 1;
+            free(edata);
+            goto fail_zip;
         }
         free(edata);
     }
@@ -817,11 +852,22 @@ int zan_apk_build(const char *apk_path, const char *lib_main,
         fprintf(stderr, "error: cannot write '%s'\n", tmp_apk);
         return 1;
     }
+    goto success_zip;
+
+fail_zip:
+    buf_free(&z.out);
+    free(z.ents);
+    free(man2); free(arsc); free(dex); free(lib);
+    return 1;
+
+success_zip: ;
 
     char exe_dir[1200] = {0};
 #ifdef _WIN32
     { char mod[1200]; DWORD n = GetModuleFileNameA(NULL, mod, sizeof(mod));
-      if (n > 0 && n < sizeof(mod)) { char *s = strrchr(mod, '\\'); if (s) *s = 0; snprintf(exe_dir, sizeof(exe_dir), "%s", mod); } }
+      if (n > 0 && n < sizeof(mod)) { char *s = strrchr(mod, '\\'); if (s) *s = 0;
+          if (zan_fmt_checked(exe_dir, sizeof(exe_dir), "zanc install dir",
+                              "%s", mod) != 0) { remove(tmp_apk); return 1; } } }
 #elif defined(__APPLE__)
     { uint32_t sz = sizeof(exe_dir); if (_NSGetExecutablePath(exe_dir, &sz) != 0) exe_dir[0] = 0; else { char *s = strrchr(exe_dir, '/'); if (s) *s = 0; } }
 #else
@@ -829,9 +875,15 @@ int zan_apk_build(const char *apk_path, const char *lib_main,
       if (n > 0) { exe_dir[n] = 0; char *s = strrchr(exe_dir, '/'); if (s) *s = 0; } }
 #endif
     char signer[1300];
-    snprintf(signer, sizeof(signer), "%s/apksigner.jar", exe_dir);
+    if (zan_fmt_checked(signer, sizeof(signer), "apksigner path",
+                        "%s/apksigner.jar", exe_dir) != 0) {
+        remove(tmp_apk); return 1;
+    }
     if (!file_exists(signer)) {
-        snprintf(signer, sizeof(signer), "%s/apk-shell/apksigner.jar", exe_dir);
+        if (zan_fmt_checked(signer, sizeof(signer), "apksigner path",
+                            "%s/apk-shell/apksigner.jar", exe_dir) != 0) {
+            remove(tmp_apk); return 1;
+        }
     }
     if (!file_exists(signer)) {
         fprintf(stderr, "error: apksigner.jar not found next to zan "
@@ -853,18 +905,31 @@ int zan_apk_build(const char *apk_path, const char *lib_main,
         char keytool[1200], cmd[3000];
         { char *s = strrchr(java, '/'); char *s2 = strrchr(java, '\\');
           char *cut = (s2 > s) ? s2 : s;
-          if (cut) { size_t keep = (size_t)(cut - java); snprintf(keytool, sizeof(keytool), "%.*s", (int)keep, java); }
-          else snprintf(keytool, sizeof(keytool), "%s", java); }
+          if (cut) { size_t keep = (size_t)(cut - java);
+            if (zan_fmt_checked(keytool, sizeof(keytool), "keytool path",
+                                "%.*s", (int)keep, java) != 0) {
+                remove(tmp_apk); return 1;
+            } }
+          else if (zan_fmt_checked(keytool, sizeof(keytool), "keytool path",
+                                   "%s", java) != 0) {
+              remove(tmp_apk); return 1;
+          } }
 #ifdef _WIN32
-        snprintf(cmd, sizeof(cmd), "\"\"%s\\keytool.exe\" -genkeypair -keystore \"%s\""
+        if (zan_fmt_checked(cmd, sizeof(cmd), "keystore generation command",
+                 "\"\"%s\\keytool.exe\" -genkeypair -keystore \"%s\""
                  " -storepass android -keypass android -alias zan"
                  " -dname CN=Zan_Debug -keyalg RSA -keysize 2048"
-                 " -validity 10000 -storetype PKCS12\"", keytool, ks);
+                 " -validity 10000 -storetype PKCS12\"", keytool, ks) != 0) {
+            remove(tmp_apk); return 1;
+        }
 #else
-        snprintf(cmd, sizeof(cmd), "\"%s/keytool\" -genkeypair -keystore \"%s\""
+        if (zan_fmt_checked(cmd, sizeof(cmd), "keystore generation command",
+                 "\"%s/keytool\" -genkeypair -keystore \"%s\""
                  " -storepass android -keypass android -alias zan"
                  " -dname \"CN=Zan Debug\" -keyalg RSA -keysize 2048"
-                 " -validity 10000 -storetype PKCS12 >/dev/null 2>&1", keytool, ks);
+                 " -validity 10000 -storetype PKCS12 >/dev/null 2>&1", keytool, ks) != 0) {
+            remove(tmp_apk); return 1;
+        }
 #endif
         if (run_quiet(cmd) != 0 || !file_exists(ks)) {
             fprintf(stderr, "error: could not generate the debug keystore "
@@ -877,20 +942,25 @@ int zan_apk_build(const char *apk_path, const char *lib_main,
 
     char scmd[4000];
 #ifdef _WIN32
-    snprintf(scmd, sizeof(scmd),
+    if (zan_fmt_checked(scmd, sizeof(scmd), "apksigner command",
              "\"\"%s\" -jar \"%s\" sign --ks \"%s\" --ks-pass pass:android"
-             " --out \"%s\" \"%s\"\"", java, signer, ks, apk_path, tmp_apk);
+             " --out \"%s\" \"%s\"\"", java, signer, ks, apk_path,
+             tmp_apk) != 0) { remove(tmp_apk); return 1; }
 #else
-    snprintf(scmd, sizeof(scmd),
+    if (zan_fmt_checked(scmd, sizeof(scmd), "apksigner command",
              "\"%s\" -jar \"%s\" sign --ks \"%s\" --ks-pass pass:android"
-             " --out \"%s\" \"%s\" >/dev/null 2>&1", java, signer, ks, apk_path, tmp_apk);
+             " --out \"%s\" \"%s\" >/dev/null 2>&1", java, signer, ks,
+             apk_path, tmp_apk) != 0) { remove(tmp_apk); return 1; }
 #endif
     if (run_quiet(scmd) != 0) {
         fprintf(stderr, "error: APK signing failed (apksigner). Run with the"
                 " same command manually for details:\n  java -jar %s sign "
                 "--ks %s --out %s %s\n", signer, ks, apk_path, tmp_apk);
         char keep[1400];
-        snprintf(keep, sizeof(keep), "%s.unsigned", apk_path);
+        if (zan_fmt_checked(keep, sizeof(keep), "unsigned APK path",
+                            "%s.unsigned", apk_path) != 0) {
+            remove(tmp_apk); return 1;
+        }
         remove(keep);
         rename(tmp_apk, keep);
         fprintf(stderr, "  (unsigned package kept at %s)\n", keep);
