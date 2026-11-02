@@ -1,0 +1,42 @@
+using System;
+using System.Threading;
+
+// ThreadLocal<T> 并发回归：values Dict 曾裸用，多线程并发首插
+// 会同时触发扩容/rehash 导致结构损坏。锁内后：4 线程并发首次
+// 读取（走 valueFactory）、并发写入、主线程快照，全部一致。
+class Program {
+    static ThreadLocal<int> tl;
+    static AtomicInt done;
+
+    static void Worker(int id) {
+        int expect = 100 + id;
+        // 首次读取走工厂，得到线程独立副本
+        int got = Program.tl.Value;
+        if (got != expect) { Program.tl.Value = -1; }
+        Program.tl.Value = expect;
+        Program.done.Add(1);
+    }
+
+    static void Main() {
+        Program.tl = new ThreadLocal<int>(() => {
+            // 工厂按线程给初值：拿不到 id 的线程给 0，Worker 随后覆盖
+            return 0;
+        });
+        Program.done = new AtomicInt(0);
+
+        Thread.Start(() => Program.Worker(1));
+        Thread.Start(() => Program.Worker(2));
+        Thread.Start(() => Program.Worker(3));
+        Program.Worker(4);
+        while (Program.done.Load() < 3) { Thread.Sleep(1); }
+
+        List<int> snapshot = Program.tl.Values;
+        Console.WriteLine("factory-count: " + Convert.ToString(snapshot.Count));
+        Console.WriteLine("has-101: " + Convert.ToString(snapshot.IndexOf(101) >= 0 ? 1 : 0));
+        Console.WriteLine("has-102: " + Convert.ToString(snapshot.IndexOf(102) >= 0 ? 1 : 0));
+        Console.WriteLine("has-103: " + Convert.ToString(snapshot.IndexOf(103) >= 0 ? 1 : 0));
+        Console.WriteLine("has-104: " + Convert.ToString(snapshot.IndexOf(104) >= 0 ? 1 : 0));
+        Console.WriteLine("no-corrupt: " + Convert.ToString(snapshot.Count == 4 ? 1 : 0));
+        Program.tl.Dispose();
+    }
+}
