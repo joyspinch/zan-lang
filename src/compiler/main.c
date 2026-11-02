@@ -510,6 +510,7 @@ static void add_stdlib_input(const char ***files, int *count, int *cap,
     fclose(check);
     if (input_file_present(path)) return;
     char *dup = (char *)malloc(strlen(path) + 1);
+    if (!dup) zan_host_oom();
     memcpy(dup, path, strlen(path) + 1);
     input_files_push(files, count, cap, dup);
 }
