@@ -1,5 +1,244 @@
 
 
+/* ---- B-ID92: 静态初始化依赖拓扑排序 ----
+ * Main 开头曾按 AST 声明序盲目跑各类型的静态字段初始化与 _cctor：A 的
+ * 初始化器读 B 的静态字段而 B 声明在后，读到的就是未初始化零值/空引用，
+ * 且随文件编译顺序漂移。这里扫描每个类型的静态初始化器 + 静态构造体，
+ * 对其引用到的本编译单元其他类型建边，DFS 后序得到"被依赖者先初始化"
+ * 的顺序；环路成员退回声明序（C# 对环同样不保证）。 */
+static bool sinit_istr_eq(zan_istr_t a, zan_istr_t b) {
+    return a.len == b.len && a.len > 0 && memcmp(a.str, b.str, (size_t)a.len) == 0;
+}
+
+typedef struct {
+    zan_ast_node_t *unit;
+    int n;            /* decls.count */
+    uint8_t *dep;     /* n*n，dep[a*n+b]=1 表示 a 依赖 b */
+} sinit_graph_t;
+
+static int sinit_type_index(sinit_graph_t *gr, zan_istr_t name) {
+    for (int i = 0; i < gr->n; i++) {
+        zan_ast_node_t *d = gr->unit->comp_unit.decls.items[i];
+        if (d->kind != AST_CLASS_DECL && d->kind != AST_STRUCT_DECL) continue;
+        if (sinit_istr_eq(d->type_decl.name, name)) return i;
+    }
+    return -1;
+}
+
+static void sinit_scan_list(sinit_graph_t *gr, int self, zan_ast_list_t *l, int depth);
+
+static void sinit_scan(sinit_graph_t *gr, int self, zan_ast_node_t *n, int depth) {
+    if (!n || depth > 64) return;
+    switch (n->kind) {
+    case AST_IDENTIFIER: {
+        int j = sinit_type_index(gr, n->ident.name);
+        if (j >= 0 && j != self) gr->dep[self * gr->n + j] = 1;
+        return;
+    }
+    case AST_TYPE_REF: {
+        int j = sinit_type_index(gr, n->type_ref.name);
+        if (j >= 0 && j != self) gr->dep[self * gr->n + j] = 1;
+        sinit_scan_list(gr, self, &n->type_ref.type_args, depth + 1);
+        return;
+    }
+    case AST_QUALIFIED_NAME:
+        sinit_scan_list(gr, self, &n->qualified_name.parts, depth + 1);
+        return;
+    case AST_MEMBER_ACCESS:
+        sinit_scan(gr, self, n->member.object, depth + 1);
+        return;
+    case AST_BINARY: case AST_ASSIGNMENT:
+        sinit_scan(gr, self, n->binary.left, depth + 1);
+        sinit_scan(gr, self, n->binary.right, depth + 1);
+        return;
+    case AST_UNARY: case AST_POSTFIX_UNARY:
+        sinit_scan(gr, self, n->unary.operand, depth + 1);
+        return;
+    case AST_CALL:
+        sinit_scan(gr, self, n->call.callee, depth + 1);
+        sinit_scan_list(gr, self, &n->call.args, depth + 1);
+        sinit_scan_list(gr, self, &n->call.type_args, depth + 1);
+        return;
+    case AST_INDEX:
+        sinit_scan(gr, self, n->index.object, depth + 1);
+        sinit_scan(gr, self, n->index.index, depth + 1);
+        sinit_scan_list(gr, self, &n->index.extra, depth + 1);
+        return;
+    case AST_CONDITIONAL:
+        sinit_scan(gr, self, n->conditional.cond, depth + 1);
+        sinit_scan(gr, self, n->conditional.then_expr, depth + 1);
+        sinit_scan(gr, self, n->conditional.else_expr, depth + 1);
+        return;
+    case AST_NEW_EXPR:
+        sinit_scan(gr, self, n->new_expr.type, depth + 1);
+        sinit_scan(gr, self, n->new_expr.call_init, depth + 1);
+        sinit_scan_list(gr, self, &n->new_expr.args, depth + 1);
+        sinit_scan_list(gr, self, &n->new_expr.arg_inits, depth + 1);
+        return;
+    case AST_CAST_EXPR:
+        sinit_scan(gr, self, n->cast.type, depth + 1);
+        sinit_scan(gr, self, n->cast.expr, depth + 1);
+        return;
+    case AST_IS_EXPR: case AST_AS_EXPR:
+        sinit_scan(gr, self, n->type_test.expr, depth + 1);
+        sinit_scan(gr, self, n->type_test.type, depth + 1);
+        return;
+    case AST_TYPEOF_EXPR: case AST_SIZEOF_EXPR:
+        sinit_scan(gr, self, n->cast.type, depth + 1);
+        return;
+    case AST_AWAIT_EXPR:
+        sinit_scan(gr, self, n->await_expr.expr, depth + 1);
+        return;
+    case AST_LAMBDA:
+        sinit_scan(gr, self, n->lambda.body, depth + 1);
+        return;
+    case AST_STRING_INTERP:
+        sinit_scan_list(gr, self, &n->string_interp.parts, depth + 1);
+        return;
+    case AST_TUPLE_EXPR:
+        sinit_scan_list(gr, self, &n->tuple_expr.items, depth + 1);
+        return;
+    case AST_COLL_INIT:
+        sinit_scan_list(gr, self, &n->coll_init.items, depth + 1);
+        return;
+    case AST_REF_ARG:
+        sinit_scan(gr, self, n->ref_arg.expr, depth + 1);
+        return;
+    case AST_NAMED_ARG:
+        sinit_scan(gr, self, n->named_arg.expr, depth + 1);
+        return;
+    case AST_BLOCK:
+        sinit_scan_list(gr, self, &n->block.stmts, depth + 1);
+        return;
+    case AST_EXPR_STMT:
+        sinit_scan(gr, self, n->expr_stmt.expr, depth + 1);
+        return;
+    case AST_VAR_DECL:
+        sinit_scan(gr, self, n->var_decl.type, depth + 1);
+        sinit_scan(gr, self, n->var_decl.initializer, depth + 1);
+        return;
+    case AST_RETURN_STMT:
+        sinit_scan(gr, self, n->ret.value, depth + 1);
+        return;
+    case AST_THROW_STMT:
+        sinit_scan(gr, self, n->throw_stmt.value, depth + 1);
+        return;
+    case AST_IF_STMT:
+        sinit_scan(gr, self, n->if_stmt.cond, depth + 1);
+        sinit_scan(gr, self, n->if_stmt.then_body, depth + 1);
+        sinit_scan(gr, self, n->if_stmt.else_body, depth + 1);
+        return;
+    case AST_WHILE_STMT: case AST_DO_WHILE_STMT:
+        sinit_scan(gr, self, n->while_stmt.cond, depth + 1);
+        sinit_scan(gr, self, n->while_stmt.body, depth + 1);
+        return;
+    case AST_FOR_STMT:
+        sinit_scan(gr, self, n->for_stmt.init, depth + 1);
+        sinit_scan(gr, self, n->for_stmt.cond, depth + 1);
+        sinit_scan(gr, self, n->for_stmt.step, depth + 1);
+        sinit_scan(gr, self, n->for_stmt.body, depth + 1);
+        return;
+    case AST_FOREACH_STMT:
+        sinit_scan(gr, self, n->foreach_stmt.var_type, depth + 1);
+        sinit_scan(gr, self, n->foreach_stmt.collection, depth + 1);
+        sinit_scan(gr, self, n->foreach_stmt.body, depth + 1);
+        return;
+    case AST_TRY_STMT:
+        sinit_scan(gr, self, n->try_stmt.try_body, depth + 1);
+        sinit_scan_list(gr, self, &n->try_stmt.catches, depth + 1);
+        sinit_scan(gr, self, n->try_stmt.finally_body, depth + 1);
+        return;
+    case AST_CATCH_CLAUSE:
+        sinit_scan(gr, self, n->catch_clause.type, depth + 1);
+        sinit_scan(gr, self, n->catch_clause.body, depth + 1);
+        return;
+    case AST_SWITCH_STMT:
+        sinit_scan(gr, self, n->switch_stmt.expr, depth + 1);
+        sinit_scan_list(gr, self, &n->switch_stmt.cases, depth + 1);
+        return;
+    case AST_SWITCH_CASE:
+        sinit_scan(gr, self, n->switch_case.pattern, depth + 1);
+        sinit_scan(gr, self, n->switch_case.when_cond, depth + 1);
+        sinit_scan(gr, self, n->switch_case.body, depth + 1);
+        return;
+    case AST_SWITCH_EXPR:
+        sinit_scan(gr, self, n->switch_expr.expr, depth + 1);
+        sinit_scan_list(gr, self, &n->switch_expr.arms, depth + 1);
+        return;
+    case AST_SWITCH_ARM:
+        sinit_scan(gr, self, n->switch_arm.pattern, depth + 1);
+        sinit_scan(gr, self, n->switch_arm.when_cond, depth + 1);
+        sinit_scan(gr, self, n->switch_arm.result, depth + 1);
+        return;
+    case AST_LOCK_STMT:
+        sinit_scan(gr, self, n->lock_stmt.expr, depth + 1);
+        sinit_scan(gr, self, n->lock_stmt.body, depth + 1);
+        return;
+    case AST_CHECKED_STMT:
+        sinit_scan(gr, self, n->checked_stmt.body, depth + 1);
+        return;
+    default:
+        /* 其余节点（字面量、this/base、查询表达式等）不产生跨类型依赖，
+         * 或极少出现在静态初始化器中；漏扫只退回声明序，不会更差。 */
+        return;
+    }
+}
+
+static void sinit_scan_list(sinit_graph_t *gr, int self, zan_ast_list_t *l, int depth) {
+    if (!l) return;
+    for (int i = 0; i < l->count; i++) sinit_scan(gr, self, l->items[i], depth);
+}
+
+static void sinit_visit(sinit_graph_t *gr, int i, uint8_t *color, int *order, int *pos) {
+    if (color[i]) return;          /* 1=在栈上（环，跳过）/ 2=已完成 */
+    color[i] = 1;
+    for (int j = 0; j < gr->n; j++)
+        if (gr->dep[i * gr->n + j] && color[j] != 1) sinit_visit(gr, j, color, order, pos);
+    color[i] = 2;
+    order[(*pos)++] = i;
+}
+
+/* 返回 decls 下标的排列（malloc，调用方 free）：被依赖的类型排在前面，
+ * 其余保持声明序。 */
+static int *emit_static_init_order(zan_ast_node_t *unit) {
+    int n = unit->comp_unit.decls.count;
+    int *order = (int *)malloc(sizeof(int) * (size_t)(n > 0 ? n : 1));
+    if (n <= 0) return order;
+    sinit_graph_t gr;
+    gr.unit = unit;
+    gr.n = n;
+    gr.dep = (uint8_t *)calloc((size_t)n * (size_t)n, 1);
+    uint8_t *color = (uint8_t *)calloc((size_t)n, 1);
+    if (!gr.dep || !color) {
+        free(gr.dep); free(color);
+        for (int i = 0; i < n; i++) order[i] = i;
+        return order;
+    }
+    for (int i = 0; i < n; i++) {
+        zan_ast_node_t *d = unit->comp_unit.decls.items[i];
+        if (d->kind != AST_CLASS_DECL && d->kind != AST_STRUCT_DECL) continue;
+        for (int mi = 0; mi < d->type_decl.members.count; mi++) {
+            zan_ast_node_t *m = d->type_decl.members.items[mi];
+            if ((m->kind == AST_FIELD_DECL || m->kind == AST_PROPERTY_DECL) &&
+                (m->field_decl.modifiers & MOD_STATIC) && m->field_decl.initializer)
+                sinit_scan(&gr, i, m->field_decl.initializer, 0);
+            else if (m->kind == AST_CONSTRUCTOR_DECL &&
+                     (m->method_decl.modifiers & MOD_STATIC) && m->method_decl.body)
+                sinit_scan(&gr, i, m->method_decl.body, 0);
+        }
+    }
+    int pos = 0;
+    for (int i = 0; i < n; i++) sinit_visit(&gr, i, color, order, &pos);
+    for (int i = 0; i < n && pos < n; i++) { /* 理论上不会发生，兜底补齐 */
+        bool seen = false;
+        for (int k = 0; k < pos; k++) if (order[k] == i) { seen = true; break; }
+        if (!seen) order[pos++] = i;
+    }
+    free(gr.dep);
+    free(color);
+    return order;
+}
+
 static void emit_main_method(zan_irgen_t *g, zan_ast_node_t *method, zan_symbol_t *type_sym,
                              zan_ast_node_t *unit) {
     LLVMTypeRef i32ty = LLVMInt32TypeInContext(g->ctx);
@@ -138,11 +377,15 @@ static void emit_main_method(zan_irgen_t *g, zan_ast_node_t *method, zan_symbol_
         zan_symbol_t *saved_type = g->current_type_sym;
         LLVMValueRef saved_this = g->current_this;
         g->current_this = NULL;
-        for (int di = 0; di < unit->comp_unit.decls.count; di++) {
+        /* B-ID92：按依赖拓扑序逐类型「字段初始化 → _cctor」成对发射（对齐 C# 每类型序），
+         * 不再"全部字段初始化完再跑全部 cctor"且不再盲从声明序。 */
+        int *init_order = emit_static_init_order(unit);
+        for (int oi = 0; oi < unit->comp_unit.decls.count; oi++) {
+            int di = init_order[oi];
             zan_ast_node_t *d = unit->comp_unit.decls.items[di];
             if (d->kind != AST_CLASS_DECL && d->kind != AST_STRUCT_DECL) continue;
             zan_symbol_t *csym = zan_binder_lookup(g->binder, d->type_decl.name);
-            if (!csym) continue;
+            if (csym) {
             g->current_type_sym = csym;
             for (int mi = 0; mi < d->type_decl.members.count; mi++) {
                 zan_ast_node_t *m = d->type_decl.members.items[mi];
@@ -202,18 +445,16 @@ static void emit_main_method(zan_irgen_t *g, zan_ast_node_t *method, zan_symbol_
                 }
                 free(insts);
             }
-        }
-        for (int di = 0; di < unit->comp_unit.decls.count; di++) {
-            zan_ast_node_t *d = unit->comp_unit.decls.items[di];
-            if (d->kind != AST_CLASS_DECL && d->kind != AST_STRUCT_DECL) continue;
+            } /* csym */
             char cctor_name[512];
             snprintf(cctor_name, sizeof(cctor_name), "%.*s_cctor",
                      (int)d->type_decl.name.len, d->type_decl.name.str);
             LLVMValueRef cctor = LLVMGetNamedFunction(g->mod, cctor_name);
-            if (!cctor) continue;
-            zan_call2(g->builder, LLVMGlobalGetValueType(cctor), cctor,
-                      NULL, 0, "");
+            if (cctor)
+                zan_call2(g->builder, LLVMGlobalGetValueType(cctor), cctor,
+                          NULL, 0, "");
         }
+        free(init_order);
         g->current_type_sym = saved_type;
         g->current_this = saved_this;
     }
