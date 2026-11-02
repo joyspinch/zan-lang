@@ -790,9 +790,6 @@ static long long timer_dispatch_due_locked(void) {
             free(entry);
         }
     }
-    __atomic_store_n(&g_dispatch_busy, 0, __ATOMIC_RELEASE);
-    g_dispatch_owned = 0;
-    return dispatched;
 }
 
 long long zan_timer_dispatch_due(void) {
