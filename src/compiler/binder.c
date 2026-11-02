@@ -1002,17 +1002,28 @@ zan_type_t *zan_binder_resolve_type(zan_binder_t *b, zan_ast_node_t *type_ref) {
             base = inst;
         } else if (base->sym && base->sym->decl) {
             int expected_tps = binder_decl_type_param_count(base->sym->decl);
+            /* Action/Func 是可遮蔽的内建 delegate：用户声明的同名 delegate
+             * 只在类型参数数量匹配时生效；数量不匹配时跳过错误，让
+             * 后面的内建合成路径（Func/Action synthesize）构造正确的
+             * 泛型类型覆盖 base。——与 nsresolve 的 arity filter 配合
+             * 实现跨命名空间同名不同元数的正确分派。 */
+            bool is_shadowable_builtin =
+                istr_eq(name, "Action", 6) || istr_eq(name, "Func", 4);
             if (expected_tps == 0) {
-                zan_diag_emit_code(b->diag, DIAG_ERROR, type_ref->loc, 1007,
-                              "the non-generic type '%.*s' cannot be used with type arguments",
-                              (int)name.len, name.str);
-                return b->type_error;
+                if (!is_shadowable_builtin) {
+                    zan_diag_emit_code(b->diag, DIAG_ERROR, type_ref->loc, 1007,
+                                  "the non-generic type '%.*s' cannot be used with type arguments",
+                                  (int)name.len, name.str);
+                    return b->type_error;
+                }
             } else if (type_ref->type_ref.type_args.count != expected_tps) {
-                zan_diag_emit_code(b->diag, DIAG_ERROR, type_ref->loc, 1006,
-                              "using the generic type '%.*s' requires %d type arguments (got %d)",
-                              (int)name.len, name.str, expected_tps,
-                              type_ref->type_ref.type_args.count);
-                return b->type_error;
+                if (!is_shadowable_builtin) {
+                    zan_diag_emit_code(b->diag, DIAG_ERROR, type_ref->loc, 1006,
+                                  "using the generic type '%.*s' requires %d type arguments (got %d)",
+                                  (int)name.len, name.str, expected_tps,
+                                  type_ref->type_ref.type_args.count);
+                    return b->type_error;
+                }
             }
         }
     }
