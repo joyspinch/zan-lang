@@ -375,7 +375,26 @@ public class File {
     public static long GetSize64(string path) {
         long len = zan_file_length(path);
         if (len >= 0) { return len; }
-        return (long)File.GetSize(path);
+        // 回退（内嵌文件等 zan_file_length 探不到的目标）ftell64 直测，
+        // 不经 GetSize——那里受 int 契约所限在 2GB 处截断，回退会把
+        // 大文件静默错报成 2147483647。
+        string emb = File.EmbedName(path);
+        if (zan_embed_has(emb) != 0) {
+            byte[] lenBuf = new byte[8];
+            if (zan_embed_bytes(emb, lenBuf) == 0) {
+                throw new FileNotFoundException("Could not open file: " + path);
+            }
+            return (long)lenBuf[0] + (long)lenBuf[1] * 256
+                + (long)lenBuf[2] * 65536 + (long)lenBuf[3] * 16777216;
+        }
+        nint fp = zan_pkg_fopen(path, "rb");
+        if (fp == 0) {
+            throw new FileNotFoundException("Could not open file: " + path);
+        }
+        fseek(fp, 0, 2);
+        long size = ftell64(fp);
+        fclose(fp);
+        return size;
     }
 
     // 将文件所有行读入 List。识别 LF 与 CRLF，
