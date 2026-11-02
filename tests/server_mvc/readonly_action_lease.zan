@@ -255,6 +255,18 @@ class Program {
         Console.WriteLine("transaction failure cases=8");
     }
 
+    static async void Dispatch(HttpContext ctx, int which) {
+        LeaseActionController c = new LeaseActionController();
+        c.__Bind(ctx);
+        if (which == 0) { c.__UseReadOnly(); }
+        if (await c.__BeforeAsync()) {
+            if (which == 0) { await c.List(); }
+            else if (which == 1) { await c.MutatingGet(); }
+            else if (which == 2) { await c.Save(); }
+        }
+        await c.__AfterAsync();
+    }
+
     static async void Main() {
         Directory.CreateDirectoryRecursive("_scratch/readonly-action-lease");
         string writePath = "_scratch/readonly-action-lease/write.db";
@@ -264,21 +276,21 @@ class Program {
         DbPool write = SqliteConnector.Pool(writePath, 1);
         DbPool read = SqliteConnector.Pool(readPath, 1);
         AppServices.Use(new AppServices(DbContext.Of(write, read), null));
-        await __AttrRoutes.__h_LeaseActionController_List(Program.Ctx("GET", "/lease/list"));
+        await Program.Dispatch(Program.Ctx("GET", "/lease/list"), 0);
         Program.Check(LeaseActionController.observed == "replica", "replica selected before action");
         Program.Check(LeaseActionController.reused, "same request lease for accessor and read");
         Program.Check(read.LiveCount() == 1 && read.IdleCount() == 1
             && write.LiveCount() == 0, "one replica lease returned, no primary lease");
-        await __AttrRoutes.__h_LeaseActionController_MutatingGet(Program.Ctx("GET", "/lease/mutatingget"));
+        await Program.Dispatch(Program.Ctx("GET", "/lease/mutatingget"), 1);
         Program.Check(LeaseActionController.observed == "from-get", "mutating GET reads its primary write");
         Program.Check(write.IdleCount() == 1 && read.IdleCount() == 1,
             "plain GET primary returned");
-        await __AttrRoutes.__h_LeaseActionController_Save(Program.Ctx("POST", "/lease/save"));
+        await Program.Dispatch(Program.Ctx("POST", "/lease/save"), 2);
         Program.Check(LeaseActionController.observed == "1", "transaction wrote primary");
         Program.Check(write.IdleCount() == 1 && read.IdleCount() == 1,
             "transaction primary returned");
         AppServices.Use(new AppServices(DbContext.Of(write, null), null));
-        await __AttrRoutes.__h_LeaseActionController_List(Program.Ctx("GET", "/lease/list"));
+        await Program.Dispatch(Program.Ctx("GET", "/lease/list"), 0);
         Program.Check(LeaseActionController.observed == "updated", "no-replica fallback to primary");
         Program.Check(write.LiveCount() == 1 && write.IdleCount() == 1
             && read.LiveCount() == 1 && read.IdleCount() == 1,

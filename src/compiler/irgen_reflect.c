@@ -13,7 +13,7 @@
 #define ZAN_REFL_PREFIX     88
 /* { i8*, i8*, i64, i64, i8*, i64, i8*, i8* } */
 #define ZAN_REFL_FIELD_SIZE 64
-#define ZAN_REFL_METHOD_SIZE 56
+#define ZAN_REFL_METHOD_SIZE 64
 #define ZAN_REFL_MO_NAME     0
 #define ZAN_REFL_MO_RET      8
 #define ZAN_REFL_MO_RETKIND  16
@@ -21,6 +21,7 @@
 #define ZAN_REFL_MO_PTYPES   32
 #define ZAN_REFL_MO_THUNK    40
 #define ZAN_REFL_MO_FLAGS    48
+#define ZAN_REFL_MO_ATTRS    56
 
 #define ZAN_REFL_MF_STATIC   1
 #define ZAN_REFL_MF_VIRTUAL  2
@@ -34,6 +35,7 @@
 #define ZAN_REFL_MW_NAME     0
 #define ZAN_REFL_MW_RET      1
 #define ZAN_REFL_MW_PARAM    2
+#define ZAN_REFL_MW_ATTRS    3
 
 /* `which` selector of __zan_refl_mi64 */
 #define ZAN_REFL_MI_COUNT    0
@@ -196,6 +198,7 @@ static LLVMValueRef refl_slot_offset(zan_irgen_t *g, LLVMTypeRef st, int slot) {
 }
 
 static void refl_pack_attrs(zan_ast_list_t *attrs, char *buf, size_t buf_size);
+static LLVMValueRef refl_empty_string(zan_irgen_t *g);
 
 static void refl_extract_field_attrs(zan_symbol_t *m, const char **custom_name,
                                      unsigned long long *flags, const char **dflt_val) {
@@ -424,8 +427,8 @@ static LLVMTypeRef refl_method_type(zan_irgen_t *g) {
     if (!g->refl_method_type) {
         LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
         LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
-        LLVMTypeRef elems[7] = { i8ptr, i8ptr, i64, i64, i8ptr, i8ptr, i64 };
-        g->refl_method_type = LLVMStructTypeInContext(g->ctx, elems, 7, 0);
+        LLVMTypeRef elems[8] = { i8ptr, i8ptr, i64, i64, i8ptr, i8ptr, i64, i8ptr };
+        g->refl_method_type = LLVMStructTypeInContext(g->ctx, elems, 8, 0);
     }
     return g->refl_method_type;
 }
@@ -630,6 +633,9 @@ static LLVMValueRef refl_method_record(zan_irgen_t *g, zan_symbol_t *sym,
             if (t) thunk = t;
         }
     }
+    char mattrbuf[512];
+    refl_pack_attrs(decl ? zan_ast_attributes(decl) : NULL, mattrbuf, sizeof(mattrbuf));
+    LLVMValueRef mattrs = refl_const_string(g, mattrbuf, (int)strlen(mattrbuf));
     return LLVMConstNamedStruct(mrec, (LLVMValueRef[]){
         refl_const_string(g, msym->name.str, (int)msym->name.len),
         refl_field_type_name(g, rt),
@@ -638,7 +644,8 @@ static LLVMValueRef refl_method_record(zan_irgen_t *g, zan_symbol_t *sym,
         LLVMConstInt(i64, (unsigned long long)decl->method_decl.params.count, 0),
         refl_param_names(g, &decl->method_decl.params),
         thunk,
-        LLVMConstInt(i64, (unsigned long long)flags, 0) }, 7);
+        LLVMConstInt(i64, (unsigned long long)flags, 0),
+        mattrs }, 8);
 }
 
 static LLVMValueRef refl_make_ctor_thunk(zan_irgen_t *g, zan_symbol_t *sym,
@@ -739,7 +746,8 @@ static LLVMValueRef refl_ctor_record(zan_irgen_t *g, zan_symbol_t *sym,
             LLVMConstInt(i64, 0, 0),
             refl_param_names(g, NULL),
             thunk,
-            LLVMConstInt(i64, 0, 0) }, 7);
+            LLVMConstInt(i64, 0, 0),
+            refl_empty_string(g) }, 8);
     }
     if (late) {
         for (int i = 0; i < g->ctor_count; i++) {
@@ -758,7 +766,8 @@ static LLVMValueRef refl_ctor_record(zan_irgen_t *g, zan_symbol_t *sym,
         LLVMConstInt(i64, (unsigned long long)decl->method_decl.params.count, 0),
         refl_param_names(g, &decl->method_decl.params),
         thunk,
-        LLVMConstInt(i64, 0, 0) }, 7);
+        LLVMConstInt(i64, 0, 0),
+        refl_empty_string(g) }, 8);
 }
 
 static LLVMValueRef refl_mtab_init(zan_irgen_t *g, zan_symbol_t *sym,
@@ -840,8 +849,40 @@ static LLVMValueRef refl_shape_mtab(zan_irgen_t *g, zan_symbol_t *sym,
     return LLVMConstBitCast(gv, LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0));
 }
 
+static void refl_pack_val_str(zan_ast_node_t *r, char *buf, size_t cap) {
+    if (!r || cap <= 1) { if (cap > 0) buf[0] = 0; return; }
+    if (r->kind == AST_STRING_LITERAL) {
+        snprintf(buf, cap, "%s", r->str_val.str ? r->str_val.str : "");
+    } else if (r->kind == AST_BOOL_LITERAL) {
+        snprintf(buf, cap, "%s", r->bool_val ? "true" : "false");
+    } else if (r->kind == AST_INT_LITERAL) {
+        snprintf(buf, cap, "%lld", (long long)r->int_val);
+    } else if (r->kind == AST_MEMBER_ACCESS && r->member.name.str) {
+        if (r->member.object && r->member.object->kind == AST_IDENTIFIER && r->member.object->ident.name.str) {
+            snprintf(buf, cap, "%.*s.%.*s",
+                     (int)r->member.object->ident.name.len, r->member.object->ident.name.str,
+                     (int)r->member.name.len, r->member.name.str);
+        } else {
+            snprintf(buf, cap, "%.*s", (int)r->member.name.len, r->member.name.str);
+        }
+    } else if (r->kind == AST_IDENTIFIER && r->ident.name.str) {
+        snprintf(buf, cap, "%.*s", (int)r->ident.name.len, r->ident.name.str);
+    } else if (r->kind == AST_BINARY && r->binary.left && r->binary.right) {
+        char left[128], right[128];
+        refl_pack_val_str(r->binary.left, left, sizeof(left));
+        refl_pack_val_str(r->binary.right, right, sizeof(right));
+        const char *op = "|";
+        if (r->binary.op == TK_PIPE) op = "|";
+        else if (r->binary.op == TK_AMP) op = "&";
+        else if (r->binary.op == TK_PLUS) op = "+";
+        snprintf(buf, cap, "%s%s%s", left, op, right);
+    } else {
+        buf[0] = 0;
+    }
+}
+
 static void refl_pack_attrs(zan_ast_list_t *attrs, char *buf, size_t buf_size) {
-    if (!attrs || attrs->count == 0 || buf_size == 0) {
+    if (!attrs || attrs->count == 0 || buf_size <= 1) {
         if (buf_size > 0) buf[0] = 0;
         return;
     }
@@ -881,28 +922,46 @@ static void refl_pack_attrs(zan_ast_list_t *attrs, char *buf, size_t buf_size) {
                 memcpy(kstr, kname.str, (size_t)klen);
                 kstr[klen] = 0;
 
-                zan_ast_node_t *r = arg->binary.right;
-                if (r->kind == AST_STRING_LITERAL) {
-                    int written = snprintf(buf + pos, buf_size - pos, "%s.%s=%s;", attr_name, kstr, r->str_val.str ? r->str_val.str : "");
-                    if (written > 0 && pos + (size_t)written < buf_size) pos += (size_t)written;
-                } else if (r->kind == AST_BOOL_LITERAL) {
-                    int written = snprintf(buf + pos, buf_size - pos, "%s.%s=%s;", attr_name, kstr, r->bool_val ? "true" : "false");
-                    if (written > 0 && pos + (size_t)written < buf_size) pos += (size_t)written;
-                } else if (r->kind == AST_INT_LITERAL) {
-                    int written = snprintf(buf + pos, buf_size - pos, "%s.%s=%lld;", attr_name, kstr, (long long)r->int_val);
-                    if (written > 0 && pos + (size_t)written < buf_size) pos += (size_t)written;
-                }
-            } else if (arg->kind == AST_STRING_LITERAL) {
-                int written = snprintf(buf + pos, buf_size - pos, "%s=%s;", attr_name, arg->str_val.str ? arg->str_val.str : "");
+                char val_str[256];
+                refl_pack_val_str(arg->binary.right, val_str, sizeof(val_str));
+                int written = snprintf(buf + pos, buf_size - pos, "%s.%s=%s;", attr_name, kstr, val_str);
                 if (written > 0 && pos + (size_t)written < buf_size) pos += (size_t)written;
-            } else if (arg->kind == AST_BOOL_LITERAL) {
-                int written = snprintf(buf + pos, buf_size - pos, "%s=%s;", attr_name, arg->bool_val ? "true" : "false");
-                if (written > 0 && pos + (size_t)written < buf_size) pos += (size_t)written;
-            } else if (arg->kind == AST_INT_LITERAL) {
-                int written = snprintf(buf + pos, buf_size - pos, "%s=%lld;", attr_name, (long long)arg->int_val);
+            } else {
+                char val_str[256];
+                refl_pack_val_str(arg, val_str, sizeof(val_str));
+                int written = snprintf(buf + pos, buf_size - pos, "%s=%s;", attr_name, val_str);
                 if (written > 0 && pos + (size_t)written < buf_size) pos += (size_t)written;
             }
         }
+    }
+}
+
+static void refl_append_inherited_attrs(char *dest, size_t dest_cap, const char *src) {
+    if (!src || !*src || dest_cap <= 1) return;
+    const char *p = src;
+    while (*p) {
+        const char *semi = strchr(p, ';');
+        if (!semi) semi = p + strlen(p);
+        const char *eq = memchr(p, '=', (size_t)(semi - p));
+        if (eq) {
+            size_t klen = (size_t)(eq - p + 1);
+            char key[128];
+            if (klen < sizeof(key)) {
+                memcpy(key, p, klen);
+                key[klen] = 0;
+                if (!strstr(dest, key)) {
+                    size_t cur_len = strlen(dest);
+                    size_t token_len = (size_t)(semi - p);
+                    if (cur_len + token_len + 2 < dest_cap) {
+                        memcpy(dest + cur_len, p, token_len);
+                        cur_len += token_len;
+                        dest[cur_len++] = ';';
+                        dest[cur_len] = 0;
+                    }
+                }
+            }
+        }
+        p = (*semi == ';') ? semi + 1 : semi;
     }
 }
 
@@ -957,9 +1016,19 @@ static LLVMValueRef refl_meta_for(zan_irgen_t *g, zan_type_t *t,
     LLVMTypeRef i32 = LLVMInt32TypeInContext(g->ctx);
     LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
 
-    char tattrbuf[1024];
+    char tattrbuf[2048];
     tattrbuf[0] = 0;
     if (sym && sym->decl) refl_pack_attrs(zan_ast_attributes(sym->decl), tattrbuf, sizeof(tattrbuf));
+    for (zan_symbol_t *cur = (sym && sym->type && sym->type->base_type) ? sym->type->base_type->sym : NULL;
+         cur;
+         cur = (cur->type && cur->type->base_type) ? cur->type->base_type->sym : NULL) {
+        if (cur->decl) {
+            char base_buf[1024];
+            base_buf[0] = 0;
+            refl_pack_attrs(zan_ast_attributes(cur->decl), base_buf, sizeof(base_buf));
+            refl_append_inherited_attrs(tattrbuf, sizeof(tattrbuf), base_buf);
+        }
+    }
     LLVMValueRef tattr_val = refl_const_string(g, tattrbuf, (int)strlen(tattrbuf));
 
     const char *tbl_name = refl_find_table_attr(sym);
@@ -1907,7 +1976,12 @@ static LLVMValueRef refl_mstr_fn(zan_irgen_t *g) {
         LLVMBuildICmp(g->builder, LLVMIntEQ, which,
                       LLVMConstInt(i64, ZAN_REFL_MW_NAME, 0), "refl.isn"),
         LLVMConstInt(i64, ZAN_REFL_MO_NAME, 0),
-        LLVMConstInt(i64, ZAN_REFL_MO_RET, 0), "refl.sel");
+        LLVMBuildSelect(g->builder,
+            LLVMBuildICmp(g->builder, LLVMIntEQ, which,
+                          LLVMConstInt(i64, ZAN_REFL_MW_RET, 0), "refl.isret"),
+            LLVMConstInt(i64, ZAN_REFL_MO_RET, 0),
+            LLVMConstInt(i64, ZAN_REFL_MO_ATTRS, 0), "refl.sel2"),
+        "refl.sel");
     LLVMValueRef sp = LLVMBuildGEP2(g->builder, i8, rec, &sel, 1, "refl.sp");
     LLVMValueRef sv = LLVMBuildLoad2(g->builder, i8ptr,
         LLVMBuildBitCast(g->builder, sp, LLVMPointerType(i8ptr, 0), "refl.spc"),
@@ -2565,11 +2639,13 @@ static bool refl_emit_typeinfo_member(zan_irgen_t *g, LLVMValueRef ti,
         *out = LLVMBuildTrunc(g->builder, c, i32, "refl.mc32");
         return true;
     }
-    case ZAN_REFL_M_MNAME:       /* GetMethodName / GetMethodReturnType */
-    case ZAN_REFL_M_MRET: {
+    case ZAN_REFL_M_MNAME:       /* GetMethodName / GetMethodReturnType / GetMethodCustomAttributes */
+    case ZAN_REFL_M_MRET:
+    case ZAN_REFL_M_MATTRS: {
         LLVMValueRef idx = refl_arg_index(g, arg0, locals);
-        *out = refl_mstr(g, ti, ZAN_REFL_TBL_METHOD, idx,
-            code == ZAN_REFL_M_MNAME ? ZAN_REFL_MW_NAME : ZAN_REFL_MW_RET,
+        int mw = code == ZAN_REFL_M_MNAME ? ZAN_REFL_MW_NAME :
+                 (code == ZAN_REFL_M_MRET ? ZAN_REFL_MW_RET : ZAN_REFL_MW_ATTRS);
+        *out = refl_mstr(g, ti, ZAN_REFL_TBL_METHOD, idx, mw,
             LLVMConstInt(i64, 0, 0));
         return true;
     }

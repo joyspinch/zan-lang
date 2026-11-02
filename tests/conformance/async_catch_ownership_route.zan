@@ -31,13 +31,40 @@ class TeardownController : Controller {
     }
 }
 class Program {
+    static async void DispatchSave(HttpContext ctx) {
+        TeardownController c = new TeardownController();
+        c.__Bind(ctx);
+        bool failed = false;
+        bool tx = false;
+        try {
+            if (await c.__BeforeAsync()) {
+                tx = await c.__TxBegin();
+                if (!tx) { throw new ApiError(503, "0503", "服务不可用"); }
+                int count = c.NeedInt("count", "count");
+                await c.Save(count);
+                await c.__TxCommit();
+            }
+        } catch (ApiError e) {
+            failed = true;
+            if (tx) { try { await c.__TxRollback(); } catch (Exception x) { } }
+            ctx.Status(e.Status(), ApiError.Reason(e.Status()));
+            ctx.Api(e.Code(), e.Message, "null");
+        } catch (Exception e) {
+            failed = true;
+            if (tx) { try { await c.__TxRollback(); } catch (Exception x) { } }
+            throw;
+        } finally {
+            try { await c.__AfterAsync(); } catch (Exception x) { if (!failed) throw; }
+        }
+    }
+
     static async void Call(string mode, bool check) {
         Trace.mode = mode;
         HttpRequest req = HttpRequest.Parse("POST /teardown/save" +
             (mode == "binding" ? "" : "?count=3") + " HTTP/1.1\r\nHost: t\r\n\r\n");
         HttpContext ctx = new HttpContext(req, "127.0.0.1");
         string thrown = "";
-        try { await __AttrRoutes.__h_TeardownController_Save(ctx); }
+        try { await Program.DispatchSave(ctx); }
         catch (RouteBoom e) { thrown = e.Message; }
         if (check) {
             if (thrown != "" || ctx.BuildResponse(true).IndexOf("\"0003\"") < 0) {

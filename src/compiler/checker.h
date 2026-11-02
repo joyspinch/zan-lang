@@ -25,6 +25,11 @@ struct zan_checker {
     int table_ent_count;
     int table_ent_cap;
     bool table_ents_done;
+    /* Controller 类名清单：__AttrRoutes.Register 调用点合成 TypeInfo[] 实参用 */
+    zan_istr_t *ctrl_ents;
+    int ctrl_ent_count;
+    int ctrl_ent_cap;
+    bool ctrl_ents_done;
     zan_ast_node_t *current_body;
     zan_ast_node_t *current_method_decl;
     /* 已经报过"null 绑不上值类型形参"的实参位置：同一个实参只报一次

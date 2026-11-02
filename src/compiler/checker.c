@@ -143,6 +143,20 @@ static zan_type_t *builtin_call_result_type(zan_checker_t *c,
 static bool checker_recv_is_conn(zan_checker_t *c, zan_type_t *recv);
 static zan_ast_node_t *checker_synthesize_table_array(zan_checker_t *c,
                                                       zan_loc_t loc);
+static zan_ast_node_t *checker_synthesize_controllers_array(zan_checker_t *c,
+                                                            zan_loc_t loc);
+static bool checker_is_attr_routes(zan_ast_node_t *obj) {
+    if (!obj) return false;
+    if (obj->kind == AST_IDENTIFIER) {
+        return obj->ident.name.len == 12 &&
+               memcmp(obj->ident.name.str, "__AttrRoutes", 12) == 0;
+    }
+    if (obj->kind == AST_MEMBER_ACCESS) {
+        return obj->member.name.len == 12 &&
+               memcmp(obj->member.name.str, "__AttrRoutes", 12) == 0;
+    }
+    return false;
+}
 static zan_istr_t checker_istr_lit(zan_arena_t *arena, const char *s);
 void zan_checker_init(zan_checker_t *c, zan_binder_t *binder,
                       zan_arena_t *arena, zan_diag_t *diag) {
@@ -3321,6 +3335,17 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
                                   c->arena);
             }
         }
+        /* __AttrRoutes.Register(app) 编译期控制器发现：合成 TypeInfo[] 实参
+         * 注入为第 2 实参，交给 Zan.Mvc 框架动态约定路由引擎遍历计算。 */
+        if (expr->call.callee && expr->call.callee->kind == AST_MEMBER_ACCESS &&
+            expr->call.args.count == 1 &&
+            checker_is_attr_routes(expr->call.callee->member.object) &&
+            expr->call.callee->member.name.len == 8 &&
+            memcmp(expr->call.callee->member.name.str, "Register", 8) == 0) {
+            zan_ast_list_push(&expr->call.args,
+                              checker_synthesize_controllers_array(c, expr->loc),
+                              c->arena);
+        }
         zan_type_t *callee_type;
         zan_type_t *recv = NULL;
         int callee_is_method = 0;
@@ -5883,10 +5908,103 @@ static zan_ast_node_t *checker_synthesize_table_array(zan_checker_t *c,
     return n;
 }
 
+/* ---------- __AttrRoutes.Register 的编译期控制器发现 ----------
+ *
+ * 预扫描 compilation unit 里的 Controller 类，在 __AttrRoutes.Register(app)
+ * 调用点原地合成 `new TypeInfo[] { typeof(C1), typeof(C2), ... }` 实参，
+ * 由框架动态约定路由引擎遍历计算并载入共享内存表。 */
+
+static void checker_collect_controllers(zan_checker_t *c,
+                                        zan_ast_node_t *unit) {
+    if (c->ctrl_ents_done || !unit || unit->kind != AST_COMPILATION_UNIT) {
+        return;
+    }
+    c->ctrl_ents_done = true;
+    for (int i = 0; i < unit->comp_unit.decls.count; i++) {
+        zan_ast_node_t *decl = unit->comp_unit.decls.items[i];
+        if (decl->kind != AST_CLASS_DECL || !decl->type_decl.name.str) continue;
+        if (decl->type_decl.modifiers & MOD_ABSTRACT) continue;
+        if (decl->type_decl.type_params.count > 0) continue;
+
+        /* 排除框架基类本身 */
+        uint32_t nl = decl->type_decl.name.len;
+        const char *ns = decl->type_decl.name.str;
+        if (nl == 10 && memcmp(ns, "Controller", 10) == 0) continue;
+        if (nl == 13 && memcmp(ns, "AppController", 13) == 0) continue;
+        if (nl == 15 && memcmp(ns, "AdminController", 15) == 0) continue;
+        if (nl == 13 && memcmp(ns, "ApiController", 13) == 0) continue;
+        if (nl == 20 && memcmp(ns, "CrudScreenController", 20) == 0) continue;
+
+        /* 判定是否为控制器：以 Controller 结尾，或带有 [Route]/[ApiController]，或继承自 Controller 家族 */
+        bool is_ctrl = false;
+        if (nl >= 10 && memcmp(ns + nl - 10, "Controller", 10) == 0) {
+            is_ctrl = true;
+        } else if (zan_ast_has_attr(decl, "Route") || zan_ast_has_attr(decl, "ApiController")) {
+            is_ctrl = true;
+        } else {
+            for (int b = 0; b < decl->type_decl.bases.count; b++) {
+                zan_ast_node_t *base = decl->type_decl.bases.items[b];
+                if (base && base->kind == AST_TYPE_REF && base->type_ref.name.str) {
+                    uint32_t bl = base->type_ref.name.len;
+                    const char *bs = base->type_ref.name.str;
+                    if (bl >= 10 && memcmp(bs + bl - 10, "Controller", 10) == 0) {
+                        is_ctrl = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if (!is_ctrl) continue;
+
+        int dup = 0;
+        for (int k = 0; k < c->ctrl_ent_count; k++) {
+            if (c->ctrl_ents[k].len == decl->type_decl.name.len &&
+                memcmp(c->ctrl_ents[k].str, decl->type_decl.name.str,
+                       (size_t)decl->type_decl.name.len) == 0) { dup = 1; break; }
+        }
+        if (dup) continue;
+        if (c->ctrl_ent_count >= c->ctrl_ent_cap) {
+            int ncap = c->ctrl_ent_cap ? c->ctrl_ent_cap * 2 : 32;
+            zan_istr_t *nm = (zan_istr_t *)zan_arena_alloc(
+                c->arena, (size_t)ncap * sizeof(zan_istr_t));
+            for (int k = 0; k < c->ctrl_ent_count; k++) nm[k] = c->ctrl_ents[k];
+            c->ctrl_ents = nm;
+            c->ctrl_ent_cap = ncap;
+        }
+        c->ctrl_ents[c->ctrl_ent_count++] = decl->type_decl.name;
+    }
+}
+
+/* new TypeInfo[] { typeof(C1), typeof(C2), ... } */
+static zan_ast_node_t *checker_synthesize_controllers_array(zan_checker_t *c,
+                                                            zan_loc_t loc) {
+    zan_ast_node_t *tref = zan_ast_new(c->arena, AST_TYPE_REF, loc);
+    tref->type_ref.name = checker_istr_lit(c->arena, "TypeInfo");
+    tref->type_ref.is_nullable = false;
+    tref->type_ref.is_array = true;
+    zan_ast_list_init(&tref->type_ref.type_args);
+    zan_ast_node_t *n = zan_ast_new(c->arena, AST_NEW_EXPR, loc);
+    n->new_expr.type = tref;
+    n->new_expr.call_init = NULL;
+    zan_ast_list_init(&n->new_expr.args);
+    zan_ast_list_init(&n->new_expr.arg_inits);
+    n->new_expr.is_array = true;
+    n->new_expr.array_init = true;
+    n->new_expr.array_rank = 0;
+    n->new_expr.list_copy = false;
+    for (int i = 0; i < c->ctrl_ent_count; i++) {
+        zan_ast_node_t *tof = zan_ast_new(c->arena, AST_TYPEOF_EXPR, loc);
+        tof->cast.type = checker_type_ref(c, c->ctrl_ents[i], NULL, loc);
+        zan_ast_list_push(&n->new_expr.args, tof, c->arena);
+    }
+    return n;
+}
+
 void zan_checker_check(zan_checker_t *c, zan_ast_node_t *unit) {
     if (!unit || unit->kind != AST_COMPILATION_UNIT) return;
 
     checker_collect_table_entities(c, unit);
+    checker_collect_controllers(c, unit);
     check_all_struct_cycles(c, unit);
 
     for (int i = 0; i < unit->comp_unit.decls.count; i++) {

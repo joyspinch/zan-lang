@@ -451,6 +451,22 @@ static int render_type_full(zan_type_t *t, char *buf, int cap) {
         return n;
     }
     if (t->name.len) {
+        zan_istr_t ns = (zan_istr_t){NULL, 0};
+        zan_symbol_t *s = t->sym;
+        while (s) {
+            if (s->decl && zan_ast_ns_name(s->decl).len) {
+                ns = zan_ast_ns_name(s->decl);
+                break;
+            }
+            s = s->parent;
+        }
+        if (ns.len && !memchr(t->name.str, '.', (size_t)t->name.len)) {
+            int nw = (int)ns.len;
+            if (nw > cap - n - 1) nw = cap - n - 1;
+            memcpy(buf + n, ns.str, (size_t)nw);
+            n += nw;
+            if (n < cap - 1) buf[n++] = '.';
+        }
         int w = (int)t->name.len;
         if (w > cap - n - 1) w = cap - n - 1;
         memcpy(buf + n, t->name.str, (size_t)w);

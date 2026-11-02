@@ -20,6 +20,8 @@ public class Router {
     List<RouteStatEntry> statEntries;
     // 跨进程共享路由统计表（记录命中次数与总微秒耗时）。
     SharedTable routeStats;
+    // 跨进程共享路由属性查找表（服务器启动时一次性预装载，用于极速 O(1) 匹配与 404 判定）。
+    public RouteTable routeTable;
 
     public Router() {
         this.statics = new List<Route>();
@@ -31,6 +33,7 @@ public class Router {
         this.flat = new List<Route>();
         this.statEntries = new List<RouteStatEntry>();
         this.routeStats = null;
+        this.routeTable = null;
     }
 
     public int Count() { return this.flat.Count; }
@@ -110,6 +113,31 @@ public class Router {
         if (!t.IsOpen()) { return; }
         t.Label("web route stats");
         this.routeStats = t;
+    }
+
+    public void InitRouteTableShared() {
+        if (this.flat.Count == 0) { return; }
+        if (this.routeTable != null) { return; }
+        RouteTable rt = RouteTable.Create("", this.flat.Count + 16);
+        if (rt == null) { return; }
+        for (int i = 0; i < this.statics.Count; i = i + 1) {
+            Route r = this.statics[i];
+            int auth = (r.needsLogin || r.needsAuth) ? 1 : 0;
+            int perm = 0;
+            int menu = r.inMenu ? 1 : 0;
+            rt.Add(r.method, r.pattern, auth, perm, menu, r.action, r.idx);
+        }
+        this.routeTable = rt;
+    }
+
+    public long RouteTableOsHandle() {
+        if (this.routeTable == null) { return 0; }
+        return this.routeTable.OsHandle();
+    }
+
+    public void AttachRouteTable(long osHandle) {
+        if (osHandle == 0) { return; }
+        this.routeTable = RouteTable.Attach(osHandle);
     }
 
     // computation.
@@ -241,6 +269,23 @@ public class Router {
     public Route Match(HttpContext ctx) {
         string method = ctx.method;
         string path = ctx.path;
+
+        // 1. 优先通过跨进程共享内存路由表做 O(1) 匹配
+        if (this.routeTable != null) {
+            string key = RouteTable.KeyOf(method, path);
+            long h = SharedTable.Hash(key);
+            RouteInfo info = this.routeTable.Lookup(h, key);
+            if (info.found && info.routeIdx >= 0 && info.routeIdx < this.flat.Count) {
+                return this.flat[info.routeIdx];
+            }
+            string starKey = RouteTable.KeyOf("*", path);
+            long starH = SharedTable.Hash(starKey);
+            RouteInfo starInfo = this.routeTable.Lookup(starH, starKey);
+            if (starInfo.found && starInfo.routeIdx >= 0 && starInfo.routeIdx < this.flat.Count) {
+                return this.flat[starInfo.routeIdx];
+            }
+        }
+
         Route hit = this.FindStatic(method, path);
         if (hit != null) { return hit; }
         hit = this.FindStatic("*", path);
@@ -302,6 +347,12 @@ public class Router {
     }
 
     public bool PathExists(string path) {
+        if (this.routeTable != null) {
+            long keyHash = RouteTable.Key("GET", path);
+            if (this.routeTable.Has(keyHash, RouteTable.KeyOf("GET", path))) { return true; }
+            keyHash = RouteTable.Key("POST", path);
+            if (this.routeTable.Has(keyHash, RouteTable.KeyOf("POST", path))) { return true; }
+        }
         int i = 0;
         for (; i < this.statics.Count; i = i + 1) {
             if (this.statics[i].pattern == path) { return true; }

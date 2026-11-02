@@ -1119,6 +1119,21 @@ void zan_nsresolve_prune(zan_ast_node_t *unit, zan_arena_t *arena,
                     ps->items[0]->param.is_this) is_ext_host = true;
             }
             if (is_ext_host) kept[i] = 1;
+
+            /* 控制器（自动路由发现）：不修剪包与标准库控制器 */
+            if (d->kind == AST_CLASS_DECL && d->type_decl.name.str) {
+                uint32_t nl = d->type_decl.name.len;
+                const char *ns = d->type_decl.name.str;
+                if (nl >= 10 && memcmp(ns + nl - 10, "Controller", 10) == 0) {
+                    if (nl != 10 && (nl != 13 || memcmp(ns, "AppController", 13) != 0) &&
+                        (nl != 15 || memcmp(ns, "AdminController", 15) != 0) &&
+                        (nl != 13 || memcmp(ns, "ApiController", 13) != 0)) {
+                        kept[i] = 1;
+                    }
+                } else if (zan_ast_has_attr(d, "Route")) {
+                    kept[i] = 1;
+                }
+            }
         }
     }
 

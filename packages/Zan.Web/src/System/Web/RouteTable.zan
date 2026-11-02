@@ -1,0 +1,128 @@
+using System;
+using System.Threading;
+
+namespace System.Web;
+
+/// <summary>
+/// 跨进程共享内存路由属性与查找表：
+/// 在服务器启动时一次性装载，服务期间纯只读无锁共享。
+/// 
+/// 键由请求方法与路径组合（如 GET_/user/list），经 64 位 FNV-1a 单次计算哈希寻址。
+/// 请求到达时先查共享内存表做存在性判断（Has），未命中直接抛 404（Fail-Fast）。
+/// </summary>
+public class RouteInfo {
+    public bool found;
+    public int auth;       // 1: 需要登录会话
+    public int perm;       // 权限位掩码
+    public int menu;       // 1: 显示在导航菜单
+    public int routeIdx;   // 路由槽位索引
+    public string handler;
+
+    public RouteInfo() {
+        this.found = false;
+        this.auth = 0;
+        this.perm = 0;
+        this.menu = 0;
+        this.routeIdx = -1;
+        this.handler = "";
+    }
+}
+
+public class RouteTable {
+    SharedTable table;
+
+    public RouteTable() {
+        this.table = null;
+    }
+
+    /// <summary>拼接方法与路径为表格路由键。</summary>
+    public static string KeyOf(string method, string path) {
+        return method + "_" + path;
+    }
+
+    /// <summary>计算路由键的 64 位整型哈希。</summary>
+    public static long Key(string method, string path) {
+        return SharedTable.Hash(RouteTable.KeyOf(method, path));
+    }
+
+    /// <summary>主进程启动时创建共享路由表（匿名或命名）。</summary>
+    public static RouteTable Create(string name, int capacity) {
+        RouteTable r = new RouteTable();
+        SharedTable t = new SharedTable(name, capacity);
+        t.KeySize(16);
+        t.ColumnInt("auth");
+        t.ColumnInt("perm");
+        t.ColumnInt("menu");
+        t.ColumnInt("route_idx");
+        t.ColumnString("path", 192);
+        t.ColumnString("handler", 64);
+        if (name.Length == 0) {
+            if (!t.CreateAnonymous()) { return null; }
+        } else {
+            if (!t.Create()) { return null; }
+        }
+        t.Label("web route table");
+        r.table = t;
+        return r;
+    }
+
+    /// <summary>Worker 进程通过 OS 句柄挂载共享表。</summary>
+    public static RouteTable Attach(long osHandle) {
+        if (osHandle == 0) { return null; }
+        RouteTable r = new RouteTable();
+        SharedTable t = SharedTable.Attach(osHandle);
+        if (!t.IsOpen()) { return null; }
+        t.Label("web route table");
+        r.table = t;
+        return r;
+    }
+
+    /// <summary>注册一条路由元数据。若哈希槽已存在且路径不一致则拒绝注册。</summary>
+    public bool Add(string method, string path, int auth, int perm, int menu, string handler, int routeIdx) {
+        if (this.table == null) { return false; }
+        string key = RouteTable.KeyOf(method, path);
+        long h = SharedTable.Hash(key);
+        if (this.table.ExistsAt(h)) {
+            string existing = this.table.GetStringAt(h, "path");
+            if (existing != key && existing.Length > 0) { return false; }
+        }
+        if (!this.table.SetStringAt(h, "path", key)) { return false; }
+        this.table.SetStringAt(h, "handler", handler);
+        this.table.SetIntAt(h, "auth", auth);
+        this.table.SetIntAt(h, "perm", perm);
+        this.table.SetIntAt(h, "menu", menu);
+        this.table.SetIntAt(h, "route_idx", routeIdx);
+        return true;
+    }
+
+    /// <summary>极速存在性校验：一次哈希寻址 + 零拷贝内存字符串比对，未命中直接 404。</summary>
+    public bool Has(long keyHash, string key) {
+        if (this.table == null) { return false; }
+        return this.table.MatchAt(keyHash, "path", key);
+    }
+
+    /// <summary>读取路由的元数据信息。</summary>
+    public RouteInfo Lookup(long keyHash, string key) {
+        RouteInfo info = new RouteInfo();
+        if (this.table == null || !this.table.MatchAt(keyHash, "path", key)) {
+            return info;
+        }
+        info.found = true;
+        info.auth = (int)this.table.GetIntAt(keyHash, "auth");
+        info.perm = (int)this.table.GetIntAt(keyHash, "perm");
+        info.menu = (int)this.table.GetIntAt(keyHash, "menu");
+        info.routeIdx = (int)this.table.GetIntAt(keyHash, "route_idx");
+        info.handler = this.table.GetStringAt(keyHash, "handler");
+        return info;
+    }
+
+    public long OsHandle() {
+        if (this.table == null) { return 0; }
+        return this.table.OsHandle();
+    }
+
+    public int Count() {
+        if (this.table == null) { return 0; }
+        return this.table.Count();
+    }
+}

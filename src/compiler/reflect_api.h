@@ -55,6 +55,7 @@
 #define ZAN_REFL_M_OMHAS      50   /* obj.HasMethod(name)           -> bool */
 #define ZAN_REFL_M_FATTRS     51   /* TypeInfo.GetFieldCustomAttributes(i) -> string */
 #define ZAN_REFL_M_TATTRS     52   /* TypeInfo.GetCustomAttributes()       -> string */
+#define ZAN_REFL_M_MATTRS     60   /* TypeInfo.GetMethodCustomAttributes(i) -> string */
 #define ZAN_REFL_M_FIGNORED    53   /* TypeInfo.IsFieldIgnored(i)     -> bool */
 #define ZAN_REFL_M_FREQUIRED   54   /* TypeInfo.IsFieldRequired(i)    -> bool */
 #define ZAN_REFL_M_FDEFAULT    55   /* TypeInfo.GetFieldDefault(i)    -> string */
@@ -107,6 +108,8 @@ static inline bool zan_refl_typeinfo_member(zan_istr_t n, int *out) {
         { "GetAttrs",          8,  ZAN_REFL_M_TATTRS },
         { "GetFieldCustomAttributes", 24, ZAN_REFL_M_FATTRS },
         { "GetFieldAttrs",    13,  ZAN_REFL_M_FATTRS },
+        { "GetMethodCustomAttributes", 25, ZAN_REFL_M_MATTRS },
+        { "GetMethodAttrs",   14,  ZAN_REFL_M_MATTRS },
     };
     for (int i = 0; i < (int)(sizeof(tbl) / sizeof(tbl[0])); i++)
         if ((int)n.len == tbl[i].len &&
@@ -183,6 +186,7 @@ static inline bool zan_refl_member_takes_arg(int code) {
     case ZAN_REFL_M_ISTRING:
     case ZAN_REFL_M_OMHAS:
     case ZAN_REFL_M_FATTRS:
+    case ZAN_REFL_M_MATTRS:
     case ZAN_REFL_M_FCUSTOMNAME:
     case ZAN_REFL_M_FIGNORED:
     case ZAN_REFL_M_FREQUIRED:
@@ -238,6 +242,7 @@ static inline zan_type_t *zan_refl_result_type(zan_binder_t *b, int code) {
     case ZAN_REFL_M_FCUSTOMNAME:
     case ZAN_REFL_M_FDEFAULT:
     case ZAN_REFL_M_FATTRS:
+    case ZAN_REFL_M_MATTRS:
     case ZAN_REFL_M_TATTRS:
     case ZAN_REFL_M_ISTRING: return b->type_string;
     case ZAN_REFL_M_FCOUNT:
