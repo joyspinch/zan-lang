@@ -384,6 +384,102 @@ public class DateTime {
         return DateTime.FromDate(y, m, d);
     }
 
+    // 解析 ISO-8601 日时刻为 UTC 时刻。接受 "YYYY-MM-DD"（当天零点）、
+    // "YYYY-MM-DDTHH:MM[:SS][.f{1,3}]"（T 亦可为小写 t 或空格）、
+    // 尾缀 "Z"/"z" 或 "+HH:MM"/"-HH:MM"/"+HHMM" 偏移。无时区后缀按
+    // UTC（C# Unspecified 的取值语义，本库无 Kind 概念，统一 UTC 最
+    // 可测）；偏移按含义换算进时刻（+08:00 表示本地比 UTC 快 8 小时，
+    // 从时刻里减掉）。毫秒超 3 位截断到毫秒。成功写 result 并返回
+    // true；任何形态/取值非法（月日、闰年、时 0..23、分秒 0..59、
+    // 偏移 0..23:59、尾随字符）返回 false 且 result=null。
+    public static bool TryParse(string s, out DateTime result) {
+        result = null;
+        if (s == null || s.Length < 10) { return false; }
+        if ((s[4] & 255) != 45 || (s[7] & 255) != 45) { return false; }  // '-'
+        int y = DateTime.ParseDigits(s, 0, 4);
+        int mo = DateTime.ParseDigits(s, 5, 2);
+        int d = DateTime.ParseDigits(s, 8, 2);
+        if (y < 1 || mo < 1 || mo > 12 || d < 1 ||
+            d > DateTime.DaysInMonth(y, mo)) { return false; }
+        long secs = (long)DateTime.DaysFromCivil(y, mo, d) * 86400;
+        int i = 10;
+        if (i >= s.Length) {
+            result = DateTime.FromUnixMilliseconds(secs * 1000);
+            return true;
+        }
+        int sep = s[i] & 255;
+        if (sep != 84 && sep != 116 && sep != 32) { return false; }  // 'T'/'t'/' '
+        i = i + 1;
+        int h = DateTime.ParseDigits(s, i, 2);
+        if (h < 0 || h > 23) { return false; }
+        if ((s[i + 2] & 255) != 58) { return false; }  // ':'
+        int mi = DateTime.ParseDigits(s, i + 3, 2);
+        if (mi < 0 || mi > 59) { return false; }
+        i = i + 5;
+        int sec = 0;
+        int ms = 0;
+        if (i < s.Length && (s[i] & 255) == 58) {  // ':SS'
+            sec = DateTime.ParseDigits(s, i + 1, 2);
+            if (sec < 0 || sec > 59) { return false; }
+            i = i + 3;
+            if (i < s.Length && (s[i] & 255) == 46) {  // '.' + 小数毫秒
+                i = i + 1;
+                int fd = 0;
+                long fval = 0;
+                while (i < s.Length) {
+                    int c = s[i] & 255;
+                    if (c < 48 || c > 57) { break; }
+                    if (fd < 3) { fval = fval * 10 + (c - 48); }
+                    fd = fd + 1;
+                    i = i + 1;
+                }
+                if (fd == 0) { return false; }
+                if (fd == 1) { ms = (int)(fval * 100); }
+                else if (fd == 2) { ms = (int)(fval * 10); }
+                else { ms = (int)fval; }
+            }
+        }
+        secs = secs + h * 3600 + mi * 60 + sec;
+        if (i < s.Length) {  // 时区后缀
+            int c = s[i] & 255;
+            i = i + 1;
+            if (c == 90 || c == 122) {  // 'Z'/'z'：UTC，无偏移
+            } else if (c == 43 || c == 45) {  // '+'/'-'
+                int sign = c == 43 ? 1 : -1;
+                int oh = DateTime.ParseDigits(s, i, 2);
+                if (oh < 0 || oh > 23) { return false; }
+                i = i + 2;
+                int om = 0;
+                if (i < s.Length && (s[i] & 255) == 58) {  // ':mm'
+                    om = DateTime.ParseDigits(s, i + 1, 2);
+                    if (om < 0 || om > 59) { return false; }
+                    i = i + 3;
+                } else if (i < s.Length) {  // 紧凑 mm
+                    om = DateTime.ParseDigits(s, i, 2);
+                    if (om < 0 || om > 59) { return false; }
+                    i = i + 2;
+                }
+                secs = secs - sign * (oh * 3600 + om * 60);
+            } else {
+                return false;
+            }
+        }
+        if (i != s.Length) { return false; }
+        result = DateTime.FromUnixMilliseconds(secs * 1000 + ms);
+        return true;
+    }
+
+    // 解析 ISO-8601 日时刻（口径同 <see cref="TryParse"/>）；非法
+    // 抛 FormatException（C# DateTime.Parse 同约定，容错入口用
+    // TryParse）。
+    public static DateTime Parse(string s) {
+        DateTime r;
+        if (!DateTime.TryParse(s, out r)) {
+            throw new FormatException("The string was not recognized as a valid DateTime.");
+        }
+        return r;
+    }
+
     // 解析 `at` 起 `count` 位十进制数字；含非数字返回 -1。
     public static int ParseDigits(string s, int at, int count) {
         if (s == null || at < 0 || at + count > s.Length) { return -1; }
