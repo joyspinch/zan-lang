@@ -406,9 +406,14 @@ static LLVMValueRef emit_dispatch_call(zan_irgen_t *g, zan_symbol_t *static_sym,
         LLVMGetTypeKind(LLVMTypeOf(call_args[0])) == LLVMPointerTypeKind) {
 
         bool devirt = ((static_sym->modifiers & MOD_SEALED) != 0) ||
-                      ((method_sym->modifiers & MOD_SEALED) != 0) ||
-                      !class_has_derived_in_module(g, static_sym) ||
-                      !hierarchy_has_subclass_override(g, static_sym, method_sym);
+                      ((method_sym->modifiers & MOD_SEALED) != 0);
+        /* B-ID95：导出面（emit_lib/emit_shared）是开放世界——消费者可对导出类
+         * 源码子类化并经导出 API 传入派生对象，「本模块无派生/无重写」不再成立，
+         * 封闭世界 devirt 会把虚调用钉死到基类实现。仅 sealed 可安全直调。 */
+        if (!g->emit_lib) {
+            devirt = devirt || !class_has_derived_in_module(g, static_sym) ||
+                     !hierarchy_has_subclass_override(g, static_sym, method_sym);
+        }
 
         if (!devirt) {
             int slot = get_virtual_method_index(static_sym, method_sym);
