@@ -1926,3 +1926,34 @@ zan_token_t zan_lexer_peek(zan_lexer_t *lex) {
 zan_token_t zan_lexer_peek2(zan_lexer_t *lex) {
     return lexer_peek_n(lex, 2);
 }
+
+void zan_lexer_mark(zan_lexer_t *lex, zan_lexer_mark_t *out, zan_arena_t *arena) {
+    out->pos = lex->pos;
+    out->line = lex->line;
+    out->col = lex->col;
+    out->interp_depth = lex->interp_depth;
+    out->interp_tail = NULL;
+    if (lex->interp_depth > 0) {
+        out->interp_tail = (zan_interp_level_t *)zan_arena_alloc(
+            arena, sizeof(zan_interp_level_t) * (size_t)lex->interp_depth);
+        memcpy(out->interp_tail, lex->interp_stack,
+               sizeof(zan_interp_level_t) * (size_t)lex->interp_depth);
+    }
+    out->define_count = lex->define_count;
+    out->cond_depth = lex->cond_depth;
+    out->cond_overflow = lex->cond_overflow;
+}
+
+void zan_lexer_reset(zan_lexer_t *lex, const zan_lexer_mark_t *mark) {
+    lex->pos = mark->pos;
+    lex->line = mark->line;
+    lex->col = mark->col;
+    lex->interp_depth = mark->interp_depth;
+    if (mark->interp_tail) {
+        memcpy(lex->interp_stack, mark->interp_tail,
+               sizeof(zan_interp_level_t) * (size_t)mark->interp_depth);
+    }
+    lex->define_count = mark->define_count;
+    lex->cond_depth = mark->cond_depth;
+    lex->cond_overflow = mark->cond_overflow;
+}

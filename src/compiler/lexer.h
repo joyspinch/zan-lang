@@ -70,6 +70,24 @@ zan_token_t zan_lexer_peek(zan_lexer_t *lex);
 /* 向前预看两个词法单元（不消费 token，完全恢复词法状态） */
 zan_token_t zan_lexer_peek2(zan_lexer_t *lex);
 
+/* 回溯快照：只存位置态与深度计数，替代整结构体拷贝
+ * （zan_lexer_t 含 512 层 interp 栈 ~10KB，parser lookahead 消歧热路径拷不起）。
+ * interp 洞栈只回存 mark 深度以内的内容（深度 0 时不分配）；
+ * defines/cond 栈按计数截断恢复（投机扫描中途的 #define/#if 尾巴无害）。 */
+typedef struct {
+    size_t pos;
+    uint32_t line;
+    uint32_t col;
+    int interp_depth;
+    zan_interp_level_t *interp_tail; /* arena 拷贝；深度 0 为 NULL */
+    int define_count;
+    int cond_depth;
+    int cond_overflow;
+} zan_lexer_mark_t;
+
+void zan_lexer_mark(zan_lexer_t *lex, zan_lexer_mark_t *out, zan_arena_t *arena);
+void zan_lexer_reset(zan_lexer_t *lex, const zan_lexer_mark_t *mark);
+
 void zan_lexer_define(zan_lexer_t *lex, const char *name, const char *value);
 
 /* 关键字 token → 词面文本；不是关键字返回 NULL */

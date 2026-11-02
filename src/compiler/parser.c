@@ -467,7 +467,7 @@ static uint32_t parse_modifiers(zan_parser_t *p) {
 }
 
 static bool paren_is_lambda(zan_parser_t *p) {
-    zan_lexer_t saved_lex = *p->lex;
+    zan_lexer_mark_t saved_lex; zan_lexer_mark(p->lex, &saved_lex, p->arena);
     zan_token_t saved_cur = p->current;
     zan_token_t saved_prev = p->previous;
     int depth = 0;
@@ -484,7 +484,7 @@ static bool paren_is_lambda(zan_parser_t *p) {
         }
         parser_advance(p);
     }
-    *p->lex = saved_lex;
+    zan_lexer_reset(p->lex, &saved_lex);
     p->current = saved_cur;
     p->previous = saved_prev;
     return result;
@@ -493,7 +493,7 @@ static bool paren_is_lambda(zan_parser_t *p) {
 /* (Name)operand 显式类型转换表达式语法消歧 */
 static bool paren_is_named_cast(zan_parser_t *p) {
     if (zan_lexer_peek(p->lex).kind != TK_IDENT) return false;
-    zan_lexer_t saved_lex = *p->lex;
+    zan_lexer_mark_t saved_lex; zan_lexer_mark(p->lex, &saved_lex, p->arena);
     zan_token_t saved_cur = p->current;
     zan_token_t saved_prev = p->previous;
     bool result = false;
@@ -524,7 +524,7 @@ static bool paren_is_named_cast(zan_parser_t *p) {
             parser_advance(p);
         }
         if (depth > 0) {
-            *p->lex = saved_lex;
+            zan_lexer_reset(p->lex, &saved_lex);
             p->current = saved_cur;
             p->previous = saved_prev;
             return false;
@@ -548,7 +548,7 @@ static bool paren_is_named_cast(zan_parser_t *p) {
             break;
         }
     }
-    *p->lex = saved_lex;
+    zan_lexer_reset(p->lex, &saved_lex);
     p->current = saved_cur;
     p->previous = saved_prev;
     return result;
@@ -642,7 +642,7 @@ static zan_ast_node_t *parse_primary(zan_parser_t *p) {
     if (p->current.kind == TK_IDENT && p->current.str_val.len == 4 &&
         memcmp(p->current.str_val.str, "from", 4) == 0 &&
         zan_lexer_peek(p->lex).kind == TK_IDENT) {
-        zan_lexer_t saved_lex = *p->lex;
+        zan_lexer_mark_t saved_lex; zan_lexer_mark(p->lex, &saved_lex, p->arena);
         zan_token_t saved_cur = p->current;
         zan_token_t saved_prev = p->previous;
         parser_advance(p);
@@ -784,7 +784,7 @@ static zan_ast_node_t *parse_primary(zan_parser_t *p) {
             }
             return n;
         }
-        *p->lex = saved_lex;
+        zan_lexer_reset(p->lex, &saved_lex);
         p->current = saved_cur;
         p->previous = saved_prev;
     }
@@ -1219,7 +1219,7 @@ static bool is_type_kw(zan_token_kind_t k) {
 
 /* Disambiguate `name< */
 static bool looks_like_call_type_args(zan_parser_t *p) {
-    zan_lexer_t saved_lex = *p->lex;
+    zan_lexer_mark_t saved_lex; zan_lexer_mark(p->lex, &saved_lex, p->arena);
     zan_token_t saved_cur = p->current;
     zan_token_t saved_prev = p->previous;
     bool ok = false;
@@ -1244,7 +1244,7 @@ static bool looks_like_call_type_args(zan_parser_t *p) {
         }
         parser_advance(p);
     }
-    *p->lex = saved_lex;
+    zan_lexer_reset(p->lex, &saved_lex);
     p->current = saved_cur;
     p->previous = saved_prev;
     return ok;
@@ -1252,7 +1252,7 @@ static bool looks_like_call_type_args(zan_parser_t *p) {
 
 /* Disambiguate `Name< */
 static bool looks_like_type_args_before_dot(zan_parser_t *p) {
-    zan_lexer_t saved_lex = *p->lex;
+    zan_lexer_mark_t saved_lex; zan_lexer_mark(p->lex, &saved_lex, p->arena);
     zan_token_t saved_cur = p->current;
     zan_token_t saved_prev = p->previous;
     bool ok = false;
@@ -1277,7 +1277,7 @@ static bool looks_like_type_args_before_dot(zan_parser_t *p) {
         }
         parser_advance(p);
     }
-    *p->lex = saved_lex;
+    zan_lexer_reset(p->lex, &saved_lex);
     p->current = saved_cur;
     p->previous = saved_prev;
     return ok;
@@ -1285,7 +1285,7 @@ static bool looks_like_type_args_before_dot(zan_parser_t *p) {
 
 /* Disambiguate `Name< */
 static bool looks_like_type_args_before_brace(zan_parser_t *p) {
-    zan_lexer_t saved_lex = *p->lex;
+    zan_lexer_mark_t saved_lex; zan_lexer_mark(p->lex, &saved_lex, p->arena);
     zan_token_t saved_cur = p->current;
     zan_token_t saved_prev = p->previous;
     bool ok = false;
@@ -1310,7 +1310,7 @@ static bool looks_like_type_args_before_brace(zan_parser_t *p) {
         }
         parser_advance(p);
     }
-    *p->lex = saved_lex;
+    zan_lexer_reset(p->lex, &saved_lex);
     p->current = saved_cur;
     p->previous = saved_prev;
     return ok;
@@ -1746,7 +1746,7 @@ static bool token_starts_expr(zan_token_kind_t k) {
 }
 
 static bool is_question_is_conditional(zan_parser_t *p) {
-    zan_lexer_t saved_lex = *p->lex;
+    zan_lexer_mark_t saved_lex; zan_lexer_mark(p->lex, &saved_lex, p->arena);
     zan_token_t saved_cur = p->current;
     zan_token_t saved_prev = p->previous;
     int depth = 0;
@@ -1781,7 +1781,7 @@ static bool is_question_is_conditional(zan_parser_t *p) {
         }
         parser_advance(p);
     }
-    *p->lex = saved_lex;
+    zan_lexer_reset(p->lex, &saved_lex);
     p->current = saved_cur;
     p->previous = saved_prev;
     return result;
@@ -2841,7 +2841,7 @@ static bool skip_angle_group(zan_parser_t *p) {
 }
 
 static bool looks_like_local_func(zan_parser_t *p) {
-    zan_lexer_t saved = *p->lex;
+    zan_lexer_mark_t saved; zan_lexer_mark(p->lex, &saved, p->arena);
 
     zan_token_t t = p->current;
 
@@ -2857,12 +2857,12 @@ static bool looks_like_local_func(zan_parser_t *p) {
             if (after.kind == TK_DOT) {
                 zan_lexer_next(p->lex);
                 if (zan_lexer_next(p->lex).kind != TK_IDENT) {
-                    *p->lex = saved; return false;
+                    zan_lexer_reset(p->lex, &saved); return false;
                 }
                 continue;
             }
             if (after.kind == TK_LESS) {
-                if (!skip_angle_group(p)) { *p->lex = saved; return false; }
+                if (!skip_angle_group(p)) { zan_lexer_reset(p->lex, &saved); return false; }
                 continue;
             }
             break;
@@ -2882,19 +2882,19 @@ static bool looks_like_local_func(zan_parser_t *p) {
             if (bt.kind == TK_LBRACKET) depth++;
             else if (bt.kind == TK_RBRACKET) depth--;
             else if (bt.kind == TK_EOF || bt.kind == TK_SEMICOLON) {
-                *p->lex = saved; return false;
+                zan_lexer_reset(p->lex, &saved); return false;
             }
             if (depth <= 0) break;
         }
     }
 
-    if (zan_lexer_next(p->lex).kind != TK_IDENT) { *p->lex = saved; return false; }
+    if (zan_lexer_next(p->lex).kind != TK_IDENT) { zan_lexer_reset(p->lex, &saved); return false; }
 
     if (zan_lexer_peek(p->lex).kind == TK_LESS) {
-        if (!skip_angle_group(p)) { *p->lex = saved; return false; }
+        if (!skip_angle_group(p)) { zan_lexer_reset(p->lex, &saved); return false; }
     }
 
-    if (zan_lexer_next(p->lex).kind != TK_LPAREN) { *p->lex = saved; return false; }
+    if (zan_lexer_next(p->lex).kind != TK_LPAREN) { zan_lexer_reset(p->lex, &saved); return false; }
 
     {
         int depth = 1;
@@ -2903,13 +2903,13 @@ static bool looks_like_local_func(zan_parser_t *p) {
             if (pt.kind == TK_LPAREN || pt.kind == TK_LBRACKET) depth++;
             else if (pt.kind == TK_RPAREN || pt.kind == TK_RBRACKET) depth--;
             else if (pt.kind == TK_SEMICOLON || pt.kind == TK_EOF) {
-                *p->lex = saved; return false;
+                zan_lexer_reset(p->lex, &saved); return false;
             }
         }
     }
 
     zan_token_t tail = zan_lexer_next(p->lex);
-    *p->lex = saved;
+    zan_lexer_reset(p->lex, &saved);
     return tail.kind == TK_LBRACE || tail.kind == TK_ARROW;
 }
 
