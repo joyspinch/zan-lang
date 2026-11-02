@@ -2709,7 +2709,10 @@ set(_conf_skip_cases arc_net_publish embed_compress publish_design_embed shard_d
   # B-ID98 OOM 注入直钉：必须带 ZAN_OOM_INJECT_SITE 环境变量才有意义，
   # 走 run_oom_case.cmake 单独注册（无注入裸跑会让 monitor fatal 用例
   # 正常结束而 golden 期待的是 fatal 空输出）。
-  oom_monitor_fatal oom_timer_delay oom_co_queue_grow)
+  oom_monitor_fatal oom_timer_delay oom_co_queue_grow
+  # B-ID113 stdout 二进制模式钉子：通用 harness 做 CRLF 归一化，恰是本钉
+  # 要抓的东西——走 run_stdout_binary.cmake 字节级比对单独注册。
+  stdio_binary_mode)
 
 # 已知会漏的用例：泄漏是**既有的**（stdlib 层的 ARC 欠账，见 TASKS.md A495），
 # 旧世界里它们只红在 full 档的 leakcheck 孪生档上——那条档是发布门控，没人
@@ -2980,6 +2983,14 @@ foreach(_oom_case monitor_fatal timer_delay co_queue_grow)
       -P ${CMAKE_SOURCE_DIR}/tests/run_oom_case.cmake)
   set_tests_properties(case_oom_${_oom_case} PROPERTIES TIMEOUT 300)
 endforeach()
+
+# B-ID113：重定向 stdout 二进制模式字节钉（详见 tests/run_stdout_binary.cmake 头注）
+add_test(NAME case_stdio_binary_mode
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/conformance/stdio_binary_mode.zan
+    -DOUT_EXE=${CMAKE_CURRENT_BINARY_DIR}/cases/stdio_binary_mode
+    -P ${CMAKE_SOURCE_DIR}/tests/run_stdout_binary.cmake)
 
 # datetime_now pins the local wall-clock semantics with a fixed POSIX timezone:
 # EST/EDT with the US 2007+ transition rules, so winter/summer offsets and both

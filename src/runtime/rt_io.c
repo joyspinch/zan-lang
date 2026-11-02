@@ -5182,6 +5182,11 @@ void zan_gate_free(long long handle) {
  * wasm 目标的运行时集不含本符号，调用前见 irgen_call.c 的收窄说明。 */
 void zan_rt_eprint_line(const char *text) {
     if (text && text[0]) { fputs(text, stderr); }
+#if defined(_WIN32)
+    /* B-ID113：stderr 同走二进制模式（__zan_stdio_init），行尾显式 CRLF
+     * 对齐 C# Console.Error.WriteLine 的 Environment.NewLine */
+    fputc('\r', stderr);
+#endif
     fputc('\n', stderr);
     fflush(stderr);
 }

@@ -1709,7 +1709,10 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
     LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(g->ctx, g->rt_println, "entry");
     LLVMPositionBuilderAtEnd(g->builder, entry);
 
-    LLVMValueRef fmt_str = zan_irgen_intern_string(g, "%s\n");
+    /* B-ID113：Windows 目标显式 \r\n（C# Environment.NewLine 语义）——配合
+     * startup 二进制 stdout，CRT 文本模式翻译退场后 golden 字节不变 */
+    LLVMValueRef fmt_str = zan_irgen_intern_string(g,
+        g->target_is_windows ? "%s\r\n" : "%s\n");
     LLVMValueRef args[] = { fmt_str, LLVMGetParam(g->rt_println, 0) };
     zan_call2(g->builder, printf_type, printf_fn, args, 2, "");
     LLVMBuildRetVoid(g->builder);
@@ -1721,7 +1724,8 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
 
     LLVMBasicBlockRef pint_entry = LLVMAppendBasicBlockInContext(g->ctx, g->rt_print_int, "entry");
     LLVMPositionBuilderAtEnd(g->builder, pint_entry);
-    LLVMValueRef int_fmt = zan_irgen_intern_string(g, "%lld\n");
+    LLVMValueRef int_fmt = zan_irgen_intern_string(g,
+        g->target_is_windows ? "%lld\r\n" : "%lld\n");
     LLVMValueRef iargs[] = { int_fmt, LLVMGetParam(g->rt_print_int, 0) };
     zan_call2(g->builder, printf_type, printf_fn, iargs, 2, "");
     LLVMBuildRetVoid(g->builder);
@@ -1730,7 +1734,8 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
 
     LLVMBasicBlockRef puint_entry = LLVMAppendBasicBlockInContext(g->ctx, g->rt_print_uint, "entry");
     LLVMPositionBuilderAtEnd(g->builder, puint_entry);
-    LLVMValueRef uint_fmt = zan_irgen_intern_string(g, "%llu\n");
+    LLVMValueRef uint_fmt = zan_irgen_intern_string(g,
+        g->target_is_windows ? "%llu\r\n" : "%llu\n");
     LLVMValueRef uargs[] = { uint_fmt, LLVMGetParam(g->rt_print_uint, 0) };
     zan_call2(g->builder, printf_type, printf_fn, uargs, 2, "");
     LLVMBuildRetVoid(g->builder);
@@ -1756,7 +1761,8 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
         LLVMValueRef ds_args[] = { ds_bufp,
             LLVMConstInt(i64_t, 40, 0), LLVMGetParam(g->rt_print_double, 0) };
         zan_call2(g->builder, ds_fn_ty, ds_fn, ds_args, 3, "");
-        LLVMValueRef nl_fmt = zan_irgen_intern_string(g, "%s\n");
+        LLVMValueRef nl_fmt = zan_irgen_intern_string(g,
+            g->target_is_windows ? "%s\r\n" : "%s\n");
         LLVMValueRef dargs[] = { nl_fmt, ds_bufp };
         zan_call2(g->builder, printf_type, printf_fn, dargs, 2, "");
     }
@@ -1785,11 +1791,49 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
         LLVMValueRef ds_args[] = { ds_bufp,
             LLVMConstInt(i64_t, 40ULL | 0x8000000000000000ULL, 0), ext_arg };
         zan_call2(g->builder, ds_fn_ty, ds_fn, ds_args, 3, "");
-        LLVMValueRef nl_fmt = zan_irgen_intern_string(g, "%s\n");
+        LLVMValueRef nl_fmt = zan_irgen_intern_string(g,
+            g->target_is_windows ? "%s\r\n" : "%s\n");
         LLVMValueRef dargs[] = { nl_fmt, ds_bufp };
         zan_call2(g->builder, printf_type, printf_fn, dargs, 2, "");
     }
     LLVMBuildRetVoid(g->builder);
+
+    /* B-ID113：Windows 目标在 main 前把 stdout/stderr 设为二进制模式——
+     * CRT 文本模式曾把 "\n" 翻译成 "\r\n"，CLI 工具「输出到管道」与
+     * 「内部写文件」字节不一致（zanfmt --stdout f > f 整文件幻影 diff）。
+     * fd 常量 1/2 直用免 FILE* 跨 CRT 形态取手；_O_BINARY = 0x8000。
+     * POSIX/wasm 无文本模式翻译，不发射。 */
+    if (g->target_is_windows) {
+        LLVMTypeRef sm_i32 = LLVMInt32TypeInContext(g->ctx);
+        LLVMTypeRef sm_ty = LLVMFunctionType(sm_i32,
+            (LLVMTypeRef[]){ sm_i32, sm_i32 }, 2, 0);
+        LLVMValueRef setmode = LLVMAddFunction(g->mod, "_setmode", sm_ty);
+        LLVMTypeRef init_ty = LLVMFunctionType(
+            LLVMVoidTypeInContext(g->ctx), NULL, 0, 0);
+        LLVMValueRef init_fn = LLVMAddFunction(g->mod, "__zan_stdio_init", init_ty);
+        LLVMBasicBlockRef sm_saved = LLVMGetInsertBlock(g->builder);
+        LLVMBasicBlockRef sm_entry = LLVMAppendBasicBlockInContext(g->ctx, init_fn, "entry");
+        LLVMPositionBuilderAtEnd(g->builder, sm_entry);
+        LLVMValueRef obinary = LLVMConstInt(sm_i32, 0x8000, 0);
+        LLVMValueRef sm_args1[] = { LLVMConstInt(sm_i32, 1, 0), obinary };
+        LLVMValueRef sm_args2[] = { LLVMConstInt(sm_i32, 2, 0), obinary };
+        zan_call2(g->builder, sm_ty, setmode, sm_args1, 2, "");
+        zan_call2(g->builder, sm_ty, setmode, sm_args2, 2, "");
+        LLVMBuildRetVoid(g->builder);
+        LLVMPositionBuilderAtEnd(g->builder, sm_saved);
+        LLVMValueRef ctor_fields[] = {
+            LLVMConstInt(sm_i32, 65535, 0), init_fn, LLVMConstNull(
+                LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0))
+        };
+        LLVMTypeRef ctor_ty = LLVMStructTypeInContext(g->ctx,
+            (LLVMTypeRef[]){ sm_i32, LLVMTypeOf(init_fn),
+                             LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0) }, 3, 0);
+        LLVMValueRef ctor_c = LLVMConstStruct(ctor_fields, 3, 0);
+        LLVMTypeRef ctor_arr = LLVMArrayType(LLVMTypeOf(ctor_c), 1);
+        LLVMValueRef ctors = LLVMAddGlobal(g->mod, ctor_arr, "llvm.global_ctors");
+        LLVMSetLinkage(ctors, LLVMAppendingLinkage);
+        LLVMSetInitializer(ctors, LLVMConstArray(LLVMTypeOf(ctor_c), &ctor_c, 1));
+    }
 
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
     LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
