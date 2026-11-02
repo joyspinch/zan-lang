@@ -1,6 +1,5 @@
 
 #include "rt_hw_accel.h"
-#include "rt_hw_accel_sm4_tables.h"
 #include <string.h>
 #include <stdlib.h>
 
@@ -3103,6 +3102,112 @@ static inline uint32_t zan_rotl32(uint32_t x, int n) {
     return (x << n) | (x >> (32 - n));
 }
 
+/* —— SM4 恒定时间核心（B-ID85）——
+ * 曾用静态 S-box/T-table 直查（rt_hw_accel_sm4_tables.h，已删）：缓存时序
+ * 侧信道可还原轮密钥与明文。现把 AESNI 路径（zan_sm4_kat_x86 运行期 KAT
+ * 自证）的同构分解 S(x) = M2( AES_S( M1(x) ) ⊕ 0x0f ) 改写为纯标量位运算：
+ *   - M1/M2：4→8 位仿射（pshufb 表等价的位选择实现，无查表无分支）；
+ *   - AES_S：GF(2^8) mod x^8+x^4+x^3+x+1 的恒定时间逆（Itoh 链 15 乘）
+ *     + 仿射 0x63；⊕0x0f 是 aesenclast 的 round key 常量。
+ * 探针验证：256 项全表对拍旧 S-box 表逐位一致；GB/T 32907-2016 附录 A
+ * KAT（key/pt=0123456789abcdeffedcba9876543210 → 681edf34…4246）通过。 */
+
+#define ZAN_SM4_FK0 0xa3b1bac6u
+#define ZAN_SM4_FK1 0x56aa3350u
+#define ZAN_SM4_FK2 0x677d9197u
+#define ZAN_SM4_FK3 0xb27022dcu
+
+static const uint32_t zan_sm4_ck[32] = {
+ 0x00070e15u, 0x1c232a31u, 0x383f464du, 0x545b6269u,
+ 0x70777e85u, 0x8c939aa1u, 0xa8afb6bdu, 0xc4cbd2d9u,
+ 0xe0e7eef5u, 0xfc030a11u, 0x181f262du, 0x343b4249u,
+ 0x50575e65u, 0x6c737a81u, 0x888f969du, 0xa4abb2b9u,
+ 0xc0c7ced5u, 0xdce3eaf1u, 0xf8ff060du, 0x141b2229u,
+ 0x30373e45u, 0x4c535a61u, 0x686f767du, 0x848b9299u,
+ 0xa0a7aeb5u, 0xbcc3cad1u, 0xd8dfe6edu, 0xf4fb0209u,
+ 0x10171e25u, 0x2c333a41u, 0x484f565du, 0x646b7279u,
+};
+
+/* 位选择仿射（M1/M2 的 pshufb 表等价式）：r = c ^ XOR d[i]·bit_i(v)。
+ * 常量取自 m1l/m1h/m2l/m2h（_mm_set_epi64x 解码后按仿射性提取）。 */
+static inline uint8_t zan_sm4_sel4(uint8_t c, uint8_t d0, uint8_t d1,
+                                   uint8_t d2, uint8_t d3, uint8_t v) {
+    uint8_t r = c;
+    r ^= (uint8_t)(d0 & (uint8_t)(0u - (v & 1)));
+    r ^= (uint8_t)(d1 & (uint8_t)(0u - ((v >> 1) & 1)));
+    r ^= (uint8_t)(d2 & (uint8_t)(0u - ((v >> 2) & 1)));
+    r ^= (uint8_t)(d3 & (uint8_t)(0u - ((v >> 3) & 1)));
+    return r;
+}
+
+/* GF(2^8) mod x^8+x^4+x^3+x+1 恒定时间乘（固定 8 轮移位-规约） */
+static inline uint8_t zan_sm4_gf_mul(uint8_t a, uint8_t b) {
+    uint8_t r = 0;
+    for (int i = 0; i < 8; i++) {
+        r ^= (uint8_t)(a & (uint8_t)(0u - (b & 1)));
+        uint8_t hi = (uint8_t)(a >> 7);
+        a = (uint8_t)((uint8_t)(a << 1) ^ (uint8_t)(0x1b & (uint8_t)(0u - hi)));
+        b >>= 1;
+    }
+    return r;
+}
+
+/* 域内逆：x^254 = x^(250+4)，Itoh 链（固定 15 次域乘），x=0 归 0 */
+static inline uint8_t zan_sm4_gf_inv(uint8_t x) {
+    uint8_t x2   = zan_sm4_gf_mul(x, x);
+    uint8_t x4   = zan_sm4_gf_mul(x2, x2);
+    uint8_t x3   = zan_sm4_gf_mul(x2, x);
+    uint8_t x6   = zan_sm4_gf_mul(x3, x3);
+    uint8_t x7   = zan_sm4_gf_mul(x6, x);
+    uint8_t x14  = zan_sm4_gf_mul(x7, x7);
+    uint8_t x15  = zan_sm4_gf_mul(x14, x);
+    uint8_t x30  = zan_sm4_gf_mul(x15, x15);
+    uint8_t x31  = zan_sm4_gf_mul(x30, x);
+    uint8_t x62  = zan_sm4_gf_mul(x31, x31);
+    uint8_t x124 = zan_sm4_gf_mul(x62, x62);
+    uint8_t x125 = zan_sm4_gf_mul(x124, x);
+    uint8_t x250 = zan_sm4_gf_mul(x125, x125);
+    uint8_t x252 = zan_sm4_gf_mul(x250, x2);
+    uint8_t x254 = zan_sm4_gf_mul(x252, x2);
+    return (uint8_t)(x254 & (uint8_t)(0u - (x != 0)));
+}
+
+static inline uint8_t zan_rotl8(uint8_t v, int n) {
+    return (uint8_t)((uint8_t)(v << n) | (uint8_t)(v >> (8 - n)));
+}
+
+/* AES S-box（恒定时间）：仿射 = v ^ rotl1 ^ rotl2 ^ rotl3 ^ rotl4 ^ 0x63 */
+static inline uint8_t zan_sm4_aes_sbox(uint8_t u) {
+    uint8_t v = zan_sm4_gf_inv(u);
+    return (uint8_t)(v ^ zan_rotl8(v, 1) ^ zan_rotl8(v, 2) ^
+                     zan_rotl8(v, 3) ^ zan_rotl8(v, 4) ^ 0x63);
+}
+
+/* SM4 S-box 恒定时间合成（M1 → AES_S ⊕0x0f → M2，M2 低半字节取反） */
+static inline uint8_t zan_sm4_sbox(uint8_t x) {
+    uint8_t u = (uint8_t)(
+        zan_sm4_sel4(0x00, 0xa2, 0x49, 0x09, 0x12, (uint8_t)(x >> 4)) ^
+        zan_sm4_sel4(0x01, 0x06, 0x73, 0xe5, 0x56, (uint8_t)(x & 0x0f)));
+    uint8_t v = (uint8_t)(zan_sm4_aes_sbox(u) ^ 0x0f);
+    return (uint8_t)(
+        zan_sm4_sel4(0x00, 0xdc, 0xaf, 0xdd, 0xbf, (uint8_t)(v >> 4)) ^
+        zan_sm4_sel4(0x34, 0x3c, 0xa9, 0xfa, 0xb6, (uint8_t)(~v & 0x0f)));
+}
+
+/* 轮函数 τ：4 字节 S-box 并置（恒定时间） */
+static inline uint32_t zan_sm4_tau(uint32_t x) {
+    return ((uint32_t)zan_sm4_sbox((uint8_t)(x >> 24)) << 24) |
+           ((uint32_t)zan_sm4_sbox((uint8_t)(x >> 16)) << 16) |
+           ((uint32_t)zan_sm4_sbox((uint8_t)(x >> 8)) << 8) |
+            (uint32_t)zan_sm4_sbox((uint8_t)x);
+}
+
+/* 轮函数 L（加解密）：B ^ <<<2 ^ <<<10 ^ <<<18 ^ <<<24 */
+static inline uint32_t zan_sm4_l(uint32_t b) {
+    return b ^ zan_rotl32(b, 2) ^ zan_rotl32(b, 10) ^
+               zan_rotl32(b, 18) ^ zan_rotl32(b, 24);
+}
+
 /* 8 */
 static inline uint32_t zan_sm4_lp(uint32_t b) {
     return b ^ zan_rotl32(b, 13) ^ zan_rotl32(b, 23);
@@ -3115,15 +3220,11 @@ static void zan_sm4_set_key(uint32_t rk[32], const uint8_t key[16]) {
                      ((uint32_t)key[i*4 + 1] << 16) |
                      ((uint32_t)key[i*4 + 2] << 8)  |
                      ((uint32_t)key[i*4 + 3]);
-        K[i] = w ^ SM4_FK[i];
+        K[i] = w ^ ((const uint32_t[]){ZAN_SM4_FK0, ZAN_SM4_FK1, ZAN_SM4_FK2, ZAN_SM4_FK3})[i];
     }
     for (int i = 0; i < 32; i++) {
-        uint32_t x = K[i+1] ^ K[i+2] ^ K[i+3] ^ SM4_CK[i];
-        uint32_t tau = ((uint32_t)SM4_SBOX[(x >> 24) & 0xff] << 24) |
-                       ((uint32_t)SM4_SBOX[(x >> 16) & 0xff] << 16) |
-                       ((uint32_t)SM4_SBOX[(x >> 8) & 0xff] << 8)   |
-                       ((uint32_t)SM4_SBOX[x & 0xff]);
-        K[i+4] = K[i] ^ zan_sm4_lp(tau);
+        uint32_t x = K[i+1] ^ K[i+2] ^ K[i+3] ^ zan_sm4_ck[i];
+        K[i+4] = K[i] ^ zan_sm4_lp(zan_sm4_tau(x));
         rk[i] = K[i+4];
     }
 }
@@ -3134,18 +3235,9 @@ static inline void zan_sm4_crypt_block(const uint32_t rk[32], const uint8_t in[1
     uint32_t x2 = ((uint32_t)in[8] << 24) | ((uint32_t)in[9] << 16) | ((uint32_t)in[10] << 8) | in[11];
     uint32_t x3 = ((uint32_t)in[12] << 24) | ((uint32_t)in[13] << 16) | ((uint32_t)in[14] << 8) | in[15];
 
-    for (int i = 0; i < 32; i += 4) {
-        uint32_t b = x1 ^ x2 ^ x3 ^ rk[i+0];
-        x0 ^= SM4_T0[(b >> 24) & 0xff] ^ SM4_T1[(b >> 16) & 0xff] ^ SM4_T2[(b >> 8) & 0xff] ^ SM4_T3[b & 0xff];
-
-        b = x2 ^ x3 ^ x0 ^ rk[i+1];
-        x1 ^= SM4_T0[(b >> 24) & 0xff] ^ SM4_T1[(b >> 16) & 0xff] ^ SM4_T2[(b >> 8) & 0xff] ^ SM4_T3[b & 0xff];
-
-        b = x3 ^ x0 ^ x1 ^ rk[i+2];
-        x2 ^= SM4_T0[(b >> 24) & 0xff] ^ SM4_T1[(b >> 16) & 0xff] ^ SM4_T2[(b >> 8) & 0xff] ^ SM4_T3[b & 0xff];
-
-        b = x0 ^ x1 ^ x2 ^ rk[i+3];
-        x3 ^= SM4_T0[(b >> 24) & 0xff] ^ SM4_T1[(b >> 16) & 0xff] ^ SM4_T2[(b >> 8) & 0xff] ^ SM4_T3[b & 0xff];
+    for (int i = 0; i < 32; i++) {
+        uint32_t nx = x0 ^ zan_sm4_l(zan_sm4_tau(x1 ^ x2 ^ x3 ^ rk[i]));
+        x0 = x1; x1 = x2; x2 = x3; x3 = nx;
     }
 
     out[0] = (uint8_t)(x3 >> 24); out[1] = (uint8_t)(x3 >> 16); out[2] = (uint8_t)(x3 >> 8); out[3] = (uint8_t)x3;

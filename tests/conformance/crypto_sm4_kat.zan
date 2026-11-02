@@ -1,0 +1,58 @@
+using System;
+using System.Security.Cryptography;
+
+// B-ID85 钉子：SM4 S-box 恒定时间化后两轨同输出。
+// ① GB/T 32907-2016 附录 A KAT（EncryptBlock 走纯 Zan 恒定时间 S 盒）；
+// ② CBC 零 IV 单分组走运行时原生路径（x86 AESNI / ARM SM4 / 标量恒定时间
+//    回退，配 ZAN_NO_HWACCEL=1 的同源用例强制标量）——两条轨与标准向量
+//    三方一致；③ 解密回环 + 非零 IV CBC 回环。
+class Program {
+    static void Main() {
+        // 标准向量：key = pt = 0123456789abcdeffedcba9876543210
+        byte[] key = Hex.Decode("0123456789abcdeffedcba9876543210");
+        string keyStr = key.ToStr(0, 16);
+
+        // ① 纯 Zan 轨：单分组 ECB KAT
+        byte[] kat = Sm4.EncryptBlock(keyStr, keyStr);
+        if (kat == null) {
+            Console.WriteLine("ecb=null");
+            return;
+        }
+        Console.WriteLine("ecb=" + Hex.Encode(kat));
+
+        // ② 原生轨：CBC 零 IV + 16 字节明文 == ECB KAT
+        string zeroIv = Hex.Decode("00000000000000000000000000000000").ToStr(0, 16);
+        List<int> outLen = new List<int>(); outLen.Add(0);
+        byte[] cbc = Sm4.EncryptCbc(keyStr, zeroIv, keyStr, 16, outLen);
+        if (cbc == null) {
+            Console.WriteLine("cbc=null");
+        } else {
+            Console.WriteLine("cbc=" + Hex.Encode(cbc, outLen[0]));
+        }
+
+        // ③ 解密回环（纯 Zan 轨）
+        string katStr = kat.ToStr(0, 16);
+        byte[] back = Sm4.DecryptBlock(keyStr, katStr);
+        if (back == null) {
+            Console.WriteLine("roundtrip=null");
+        } else {
+            Console.WriteLine("roundtrip=" + (back.ToStr(0, 16) == keyStr).ToString().ToLower());
+        }
+
+        // 非零 IV CBC 与解密回环
+        string iv = Hex.Decode("000102030405060708090a0b0c0d0e0f").ToStr(0, 16);
+        byte[] cbc2 = Sm4.EncryptCbc(keyStr, iv, keyStr, 16, outLen);
+        if (cbc2 == null) {
+            Console.WriteLine("cbc2=null");
+            Console.WriteLine("cbc2roundtrip=null");
+        } else {
+            Console.WriteLine("cbc2=" + Hex.Encode(cbc2, cbc2.Length));
+            byte[] plain2 = Sm4.DecryptCbc(keyStr, iv, cbc2.ToStr(0, cbc2.Length), cbc2.Length, outLen);
+            if (plain2 == null) {
+                Console.WriteLine("cbc2roundtrip=null");
+            } else {
+                Console.WriteLine("cbc2roundtrip=" + (plain2.ToStr(0, outLen[0]) == keyStr).ToString().ToLower());
+            }
+        }
+    }
+}

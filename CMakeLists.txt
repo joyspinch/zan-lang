@@ -2757,6 +2757,11 @@ foreach(_src ${_conf_srcs})
   elseif(_name STREQUAL "security_cryptography_suite")
     file(GLOB _sec_crypto_srcs "${CMAKE_SOURCE_DIR}/packages/Zan.Security/src/System/Security/Cryptography/*.zan")
     set(_extra_args "${_sec_crypto_srcs};--auto-stdlib")
+  elseif(_name STREQUAL "crypto_sm4_kat")
+    # B-ID85 钉子：GB/T 32907 KAT 压两轨——EncryptBlock 走纯 Zan 恒定时间
+    # S 盒，EncryptCbc 走运行时原生路径；Zan.Security 源显式参编。
+    file(GLOB _sec_crypto_srcs "${CMAKE_SOURCE_DIR}/packages/Zan.Security/src/System/Security/Cryptography/*.zan")
+    set(_extra_args "${_sec_crypto_srcs};--auto-stdlib")
   elseif(_name STREQUAL "ns_conflict_generic_arity")
     # The case needs a same-simple-name delegate in a second namespace so
     # nsresolve sees the cross-namespace collision it locks in.
@@ -2928,6 +2933,20 @@ foreach(_src ${_conf_srcs})
       -P ${CMAKE_SOURCE_DIR}/tests/run_case_modes.cmake)
   set_tests_properties(case_det_${_name} PROPERTIES TIMEOUT 180)
 endforeach()
+
+# B-ID85 钉子的标量强制变体：ZAN_NO_HWACCEL=1 关掉全部硬件加速，SM4 走
+# 标量恒定时间路径，与 case_crypto_sm4_kat（硬件路径）必须逐字节同输出。
+add_test(NAME case_crypto_sm4_scalar_kat
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/conformance/crypto_sm4_kat.zan
+    -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/crypto_sm4_kat.out
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/crypto_sm4_scalar_kat${_exe_ext}
+    -DSTDLIB_STAMP=${_stdlib_stamp}
+    "-DZANC_ARGS=${_sec_crypto_srcs};--auto-stdlib"
+    -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+set_tests_properties(case_crypto_sm4_scalar_kat PROPERTIES
+  ENVIRONMENT "ZAN_NO_HWACCEL=1" TIMEOUT 300)
 
 # datetime_now pins the local wall-clock semantics with a fixed POSIX timezone:
 # EST/EDT with the US 2007+ transition rules, so winter/summer offsets and both
