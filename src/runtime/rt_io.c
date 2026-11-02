@@ -2653,20 +2653,20 @@ int32_t zan_io_poll(int64_t timeout_ms) {
         if (op->rto == 2) {
             IOTRACE("poll_op rto-dead op=%p kind=%d", (void*)op, op->kind);
             op_free(op);
-            g_io_count--;
+            IO_CNT_DEC();
             continue;
         }
         if (op->rto && !rto_claim(co)) {
             IOTRACE("poll_op rto-late op=%p kind=%d", (void*)op, op->kind);
             op_free(op);
-            g_io_count--;
+            IO_CNT_DEC();
             continue;
         }
         IOTRACE("poll_op op=%p kind=%d bytes=%lu status=%llu", (void*)op, op->kind, (unsigned long)entries[i].dwNumberOfBytesTransferred, (unsigned long long)entries[i].Internal);
         io_complete_op(op, entries[i].dwNumberOfBytesTransferred,
                        entries[i].Internal);
         op_free(op);
-        g_io_count--;
+        IO_CNT_DEC();
         io_wake(co, step);
         woke++;
     }
@@ -3603,13 +3603,13 @@ int64_t zan_io_connect(intptr_t fd, const char *ip, int32_t port) {
     op->sock = s;
     op->interest = ZAN_IO_WRITE;
     op->co = co;
-    g_io_count++;
+    IO_CNT_INC();
 
     BOOL ok = pConnectEx(s, (struct sockaddr *)&target, sizeof(target),
                          NULL, 0, NULL, &op->ov);
     if (!ok && WSAGetLastError() != ERROR_IO_PENDING) {
         op_free(op);
-        g_io_count--;
+        IO_CNT_DEC();
         return -1;
     }
     zan_io_suspend_current();

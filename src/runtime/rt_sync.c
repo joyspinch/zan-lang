@@ -953,7 +953,8 @@ void zan_monitor_enter(void *obj) {
 #else
             pthread_mutex_unlock(&bucket->bucket_mx);
 #endif
-            return;
+            /* B-ID98：monitor 块分配失败即 fatal，不得未持锁裸奔回返回（对齐本文件 TLS 路径口径） */
+            zan_rt_fatal("oom", "sync: monitor block alloc failed");
         }
         sb->obj = obj;
         sb->ref_count = 0;

@@ -76,7 +76,7 @@ i64 zan_atomic_int_add(i64 handle, i64 delta) {
     if (!a) return 0;
     i64 old = a->value;
     a->value = old + delta;
-    return old;
+    return old + delta; /* AtomicInt.Add 契约=加后新值：与原生 add_fetch 对齐 */
 }
 
 

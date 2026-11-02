@@ -602,7 +602,7 @@ static long long delay_ms_to_us(long long ms) {
 void zan_timer_delay(long long ms, void *frame, zan_timer_step_t step) {
     if (!step) return;
     zan_timer_entry *entry = (zan_timer_entry *)calloc(1, sizeof(*entry));
-    if (!entry) return;   
+    if (!entry) { step(frame); return; } /* B-ID98：口径同 heap_push 失败路径，立即恢复等待协程不悬挂 */
     entry->due_us = zan_timer_saturating_due_us(zan_co_precise_us(),
                                                                delay_ms_to_us(ms));
     entry->kind = ZAN_TIMER_DELAY;

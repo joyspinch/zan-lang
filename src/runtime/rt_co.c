@@ -37,10 +37,14 @@ static void queue_grow(void) {
     size_t ncap = g_cap ? g_cap * 2 : 16;
     zan_co_slot_t *nq = (zan_co_slot_t *)malloc(ncap * sizeof(*nq));
     if (!nq) {
+        /* B-ID98：翻倍失败降档 +16，碎片化内存下最大化扩容成功率 */
+        ncap = g_cap ? g_cap + 16 : 16;
+        nq = (zan_co_slot_t *)malloc(ncap * sizeof(*nq));
+    }
+    if (!nq) {
         /* 队列扩容遇 OOM 丢弃本次恢复，保护主进程与已连接会话不崩溃 */
         fprintf(stderr, "zan runtime: coroutine ready-queue grow failed "
                         "(OOM); dropping one resumption\n");
-        return;
     }
     /* 将环形缓冲区重新线性化到新存储区 */
     for (size_t i = 0; i < g_len; i++) {
