@@ -171,29 +171,54 @@ void json_obj_set(json_value *obj, const char *key, json_value *val) {
 
 /* free */
 
+/* 待释放节点栈的推入：容量翻倍，OOM 走 host fail-fast（释放路径无回旋） */
+static void jfree_push(json_value ***st, size_t *cap, size_t *n,
+                       json_value *v) {
+    if (*n == *cap) {
+        if (*cap > SIZE_MAX / (2 * sizeof(json_value *))) zan_host_oom();
+        *cap *= 2;
+        json_value **g =
+            (json_value **)realloc(*st, sizeof(json_value *) * *cap);
+        if (!g) zan_host_oom();
+        *st = g;
+    }
+    (*st)[(*n)++] = v;
+}
+
 void json_free(json_value *v) {
     if (!v) return;
-    switch (v->type) {
-    case JSON_STR:
-        free(v->as.str);
-        break;
-    case JSON_ARR:
-        for (int i = 0; i < v->as.arr.count; i++) json_free(v->as.arr.items[i]);
-        free(v->as.arr.items);
-        break;
-    case JSON_OBJ:
-        for (int i = 0; i < v->as.obj.count; i++) {
-            free(v->as.obj.keys[i]);
-            json_free(v->as.obj.vals[i]);
+    /* 显式栈迭代释放：解析器允许 1024 层、程序化构建不限层，曾递归下钻
+     * 可耗尽线程栈（析构路径 Stack Overflow） */
+    size_t cap = 64, n = 0;
+    json_value **st = (json_value **)malloc(sizeof(json_value *) * cap);
+    if (!st) zan_host_oom();
+    st[n++] = v;
+    while (n) {
+        json_value *cur = st[--n];
+        switch (cur->type) {
+        case JSON_STR:
+            free(cur->as.str);
+            break;
+        case JSON_ARR:
+            for (int i = 0; i < cur->as.arr.count; i++)
+                jfree_push(&st, &cap, &n, cur->as.arr.items[i]);
+            free(cur->as.arr.items);
+            break;
+        case JSON_OBJ:
+            for (int i = 0; i < cur->as.obj.count; i++)
+                free(cur->as.obj.keys[i]);
+            for (int i = 0; i < cur->as.obj.count; i++)
+                jfree_push(&st, &cap, &n, cur->as.obj.vals[i]);
+            free(cur->as.obj.keys);
+            free(cur->as.obj.vals);
+            free(cur->as.obj.index);
+            break;
+        default:
+            break;
         }
-        free(v->as.obj.keys);
-        free(v->as.obj.vals);
-        free(v->as.obj.index);
-        break;
-    default:
-        break;
+        free(cur);
     }
-    free(v);
+    free(st);
 }
 
 /* accessors */
@@ -271,6 +296,49 @@ static void jp_skip_ws(jparser *j) {
 
 static json_value *jp_value(jparser *j);
 
+/* UTF-8 良构校验并把整段序列追加进解码缓冲（lead 已由调用方读走但尚未入
+ * buf，续字节在 j->p 处）。拒绝坏续字节、超长编码（C0/C1 头、E0 后 A0
+ * 以下、F0 后 90 以下）、UTF-16 代理区（ED 后 A0 以上）与 >U+10FFFF
+ * （F4 后 90 以上、F5+）。追加途中扩容失败返回 false，buf 所有权仍在
+ * 调用方。 */
+static bool jp_utf8_append(jparser *j, unsigned char lead,
+                           char **pbuf, size_t *plen, size_t *pcap) {
+    int need;
+    unsigned char lo_min = 0x80, lo_max = 0xBF;
+    if (lead >= 0xC2 && lead <= 0xDF) {
+        need = 2;
+    } else if (lead >= 0xE0 && lead <= 0xEF) {
+        need = 3;
+        if (lead == 0xE0) { lo_min = 0xA0; }
+        else if (lead == 0xED) { lo_max = 0x9F; }
+    } else if (lead >= 0xF0 && lead <= 0xF4) {
+        need = 4;
+        if (lead == 0xF0) { lo_min = 0x90; }
+        else if (lead == 0xF4) { lo_max = 0x8F; }
+    } else {
+        return false;
+    }
+    if (j->end - j->p < need - 1) return false;
+    for (int k = 0; k < need - 1; k++) {
+        unsigned char cont = (unsigned char)j->p[k];
+        if (cont < lo_min || cont > lo_max) return false;
+        lo_min = 0x80; lo_max = 0xBF;
+    }
+    const char *src = j->p - 1; /* lead 已被读走，回看一字节 */
+    for (int k = 0; k < need; k++) {
+        if (*plen + 1 >= *pcap) {
+            if (*pcap > SIZE_MAX / 2) return false;
+            *pcap *= 2;
+            char *g = (char *)realloc(*pbuf, *pcap);
+            if (!g) return false;
+            *pbuf = g;
+        }
+        (*pbuf)[(*plen)++] = src[k];
+    }
+    j->p += need - 1;
+    return true;
+}
+
 static json_value *jp_string(jparser *j) {
     if (j->p >= j->end || *j->p != '"') { j->ok = false; return NULL; }
     j->p++;
@@ -279,6 +347,17 @@ static json_value *jp_string(jparser *j) {
     if (!buf) { j->ok = false; return NULL; }
     while (j->p < j->end && *j->p != '"') {
         char c = *j->p++;
+        if ((unsigned char)c < 0x20) {
+            /* RFC 8259：字符串内不允许未转义控制字符（曾直通，可走私协议帧） */
+            free(buf); j->ok = false; return NULL;
+        }
+        if ((unsigned char)c >= 0x80) {
+            /* 非法 UTF-8 序列（坏续字节/超长/代理区/越界码点）曾直通 */
+            if (!jp_utf8_append(j, (unsigned char)c, &buf, &len, &cap)) {
+                free(buf); j->ok = false; return NULL;
+            }
+            continue;
+        }
         if (c == '\\' && j->p < j->end) {
             char e = *j->p++;
             switch (e) {
@@ -373,6 +452,32 @@ static json_value *jp_string(jparser *j) {
     return v;
 }
 
+/* RFC 8259 number 语法整 token 复核：-?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?
+ * 曾只扫字符集不验结构，strtod 前缀语义把 "1.2.3"→1.2、"-"→0.0、"1e"→1.0
+ * 静默产错值（消费方 LSP/DAP 外部输入面）。 */
+static bool jp_num_valid(const char *s, size_t n) {
+    size_t i = 0;
+    if (i < n && s[i] == '-') i++;
+    if (i >= n || s[i] < '0' || s[i] > '9') return false;
+    if (s[i] == '0') {
+        i++;
+    } else {
+        while (i < n && s[i] >= '0' && s[i] <= '9') i++;
+    }
+    if (i < n && s[i] == '.') {
+        i++;
+        if (i >= n || s[i] < '0' || s[i] > '9') return false;
+        while (i < n && s[i] >= '0' && s[i] <= '9') i++;
+    }
+    if (i < n && (s[i] == 'e' || s[i] == 'E')) {
+        i++;
+        if (i < n && (s[i] == '+' || s[i] == '-')) i++;
+        if (i >= n || s[i] < '0' || s[i] > '9') return false;
+        while (i < n && s[i] >= '0' && s[i] <= '9') i++;
+    }
+    return i == n;
+}
+
 static json_value *jp_number(jparser *j) {
     const char *start = j->p;
     /* RFC 8259 grammar: no leading '+' */
@@ -381,10 +486,14 @@ static json_value *jp_number(jparser *j) {
            (isdigit((unsigned char)*j->p) || *j->p == '.' ||
             *j->p == 'e' || *j->p == 'E' || *j->p == '+' || *j->p == '-'))
         j->p++;
-    char tmp[64];
     size_t n = (size_t)(j->p - start);
+    if (!jp_num_valid(start, n)) {
+        j->ok = false;
+        return NULL;
+    }
+    char tmp[64];
     if (n >= sizeof(tmp)) {
-        /* 超出浮点数解析缓冲区的长标记溢出保护 */
+        /* 语法已验合法的超长数值按浮点边界值落盘（溢出保护） */
         return json_new_num(*start == '-' ? -HUGE_VAL : HUGE_VAL);
     }
     memcpy(tmp, start, n);
@@ -538,43 +647,76 @@ static void sb_put_escaped(sbuf *s, const char *str) {
     sb_putc(s, '"');
 }
 
+/* 序列化工作栈帧：容器携带下一子下标，idx=-1 表示尚未开括号 */
+typedef struct {
+    const json_value *v;
+    int idx;
+} putframe;
+
 static void sb_put_value(sbuf *s, const json_value *v) {
     if (!v) { sb_puts(s, "null"); return; }
-    switch (v->type) {
-    case JSON_NULL: sb_puts(s, "null"); break;
-    case JSON_BOOL: sb_puts(s, v->as.b ? "true" : "false"); break;
-    case JSON_NUM: {
-        double n = v->as.num;
-        if (!isfinite(n)) { sb_puts(s, "null"); break; }
-        char tmp[64];
-        if (n == floor(n) && fabs(n) < 1e15) {
-            snprintf(tmp, sizeof(tmp), "%lld", (long long)n);
-        } else {
-            snprintf(tmp, sizeof(tmp), "%.17g", n);
-        }
-        sb_puts(s, tmp);
-        break;
-    }
-    case JSON_STR: sb_put_escaped(s, v->as.str ? v->as.str : ""); break;
-    case JSON_ARR:
-        sb_putc(s, '[');
-        for (int i = 0; i < v->as.arr.count; i++) {
-            if (i) sb_putc(s, ',');
-            sb_put_value(s, v->as.arr.items[i]);
-        }
-        sb_putc(s, ']');
-        break;
-    case JSON_OBJ:
-        sb_putc(s, '{');
-        for (int i = 0; i < v->as.obj.count; i++) {
-            if (i) sb_putc(s, ',');
-            sb_put_escaped(s, v->as.obj.keys[i]);
+    /* 显式栈迭代序列化：与 json_free 同源的深嵌套栈溢出防护，
+     * 输出序与旧递归版逐字节一致 */
+    size_t cap = 64, n = 0;
+    putframe *st = (putframe *)malloc(sizeof(putframe) * cap);
+    if (!st) { s->oom = 1; return; }
+    st[n].v = v; st[n].idx = -1; n++;
+    while (n) {
+        if (s->oom) break;
+        putframe *f = &st[n - 1];
+        const json_value *cur = f->v;
+        if (cur->type == JSON_ARR) {
+            if (f->idx < 0) { sb_putc(s, '['); f->idx = 0; continue; }
+            if (f->idx >= cur->as.arr.count) { sb_putc(s, ']'); n--; continue; }
+            if (f->idx > 0) sb_putc(s, ',');
+            const json_value *child = cur->as.arr.items[f->idx++];
+            if (n == cap) {
+                size_t nc = cap * 2;
+                putframe *g = (putframe *)realloc(st, sizeof(putframe) * nc);
+                if (!g) { s->oom = 1; break; }
+                st = g; cap = nc;
+            }
+            st[n].v = child; st[n].idx = -1; n++;
+        } else if (cur->type == JSON_OBJ) {
+            if (f->idx < 0) { sb_putc(s, '{'); f->idx = 0; continue; }
+            if (f->idx >= cur->as.obj.count) { sb_putc(s, '}'); n--; continue; }
+            if (f->idx > 0) sb_putc(s, ',');
+            sb_put_escaped(s, cur->as.obj.keys[f->idx]);
             sb_putc(s, ':');
-            sb_put_value(s, v->as.obj.vals[i]);
+            const json_value *child = cur->as.obj.vals[f->idx++];
+            if (n == cap) {
+                size_t nc = cap * 2;
+                putframe *g = (putframe *)realloc(st, sizeof(putframe) * nc);
+                if (!g) { s->oom = 1; break; }
+                st = g; cap = nc;
+            }
+            st[n].v = child; st[n].idx = -1; n++;
+        } else {
+            switch (cur->type) {
+            case JSON_NULL: sb_puts(s, "null"); break;
+            case JSON_BOOL: sb_puts(s, cur->as.b ? "true" : "false"); break;
+            case JSON_NUM: {
+                double num = cur->as.num;
+                if (!isfinite(num)) { sb_puts(s, "null"); break; }
+                char tmp[64];
+                if (num == floor(num) && fabs(num) < 1e15) {
+                    snprintf(tmp, sizeof(tmp), "%lld", (long long)num);
+                } else {
+                    snprintf(tmp, sizeof(tmp), "%.17g", num);
+                }
+                sb_puts(s, tmp);
+                break;
+            }
+            case JSON_STR:
+                sb_put_escaped(s, cur->as.str ? cur->as.str : "");
+                break;
+            default:
+                break;
+            }
+            n--;
         }
-        sb_putc(s, '}');
-        break;
     }
+    free(st);
 }
 
 char *json_serialize(const json_value *v) {
