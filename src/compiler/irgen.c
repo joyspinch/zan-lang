@@ -1098,51 +1098,6 @@ static LLVMValueRef zan_call2(LLVMBuilderRef b, LLVMTypeRef ty, LLVMValueRef fn,
                LLVMTypeOf(fn) != LLVMPointerType(ty, 0)) {
         fn = LLVMBuildBitCast(b, fn, LLVMPointerType(ty, 0), "callee.fp");
     }
-    if (false && s_current_irgen && s_current_irgen->target_is_wasm &&
-        s_current_irgen->wasm_try_depth > 0 &&
-        !s_current_irgen->in_wasm_throw_op &&
-        !(fn && LLVMIsAFunction(fn) && fn == s_current_irgen->wasm_eh_state_fn)) {
-        zan_irgen_t *g = s_current_irgen;
-        LLVMBasicBlockRef cur = LLVMGetInsertBlock(b);
-        LLVMValueRef parent = LLVMGetBasicBlockParent(cur);
-        LLVMBasicBlockRef lpad = g->wasm_lpad_stack[g->wasm_try_depth - 1];
-        if (!lpad ||
-            LLVMGetBasicBlockParent(cur) != LLVMGetBasicBlockParent(lpad)) {
-            LLVMValueRef call = LLVMBuildCall2(b, ty, fn, args, n, nm);
-            if (callee && LLVMIsAFunction(callee)) {
-                static const char *ext[2] = { "signext", "zeroext" };
-                for (int e = 0; e < 2; e++) {
-                    unsigned kind = LLVMGetEnumAttributeKindForName(ext[e], strlen(ext[e]));
-                    if (!kind) continue;
-                    for (unsigned idx = 0; idx <= n; idx++) {
-                        unsigned at = idx == 0 ? (unsigned)LLVMAttributeReturnIndex : idx;
-                        if (!LLVMGetEnumAttributeAtIndex(callee, at, kind)) continue;
-                        LLVMAddCallSiteAttribute(call, at,
-                            LLVMCreateEnumAttribute(LLVMGetTypeContext(ty), kind, 0));
-                    }
-                }
-            }
-            return call;
-        }
-        LLVMBasicBlockRef cont =
-            LLVMAppendBasicBlockInContext(LLVMGetTypeContext(ty), parent, "invoke.cont");
-        LLVMValueRef inv = LLVMBuildInvoke2(b, ty, fn, args, n, cont, lpad, nm);
-        if (callee && LLVMIsAFunction(callee)) {
-            static const char *ext[2] = { "signext", "zeroext" };
-            for (int e = 0; e < 2; e++) {
-                unsigned kind = LLVMGetEnumAttributeKindForName(ext[e], strlen(ext[e]));
-                if (!kind) continue;
-                for (unsigned idx = 0; idx <= n; idx++) {
-                    unsigned at = idx == 0 ? (unsigned)LLVMAttributeReturnIndex : idx;
-                    if (!LLVMGetEnumAttributeAtIndex(callee, at, kind)) continue;
-                    LLVMAddCallSiteAttribute(inv, at,
-                        LLVMCreateEnumAttribute(LLVMGetTypeContext(ty), kind, 0));
-                }
-            }
-        }
-        LLVMPositionBuilderAtEnd(b, cont);
-        return inv;
-    }
     LLVMValueRef call = LLVMBuildCall2(b, ty, fn, args, n, nm);
     if (callee && LLVMIsAFunction(callee)) {
         static const char *ext[2] = { "signext", "zeroext" };

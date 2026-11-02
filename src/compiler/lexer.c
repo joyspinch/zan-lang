@@ -207,7 +207,6 @@ void zan_lexer_init(zan_lexer_t *lex, const char *source, size_t len,
     lex->file_id = file_id;
     lex->arena = arena;
     lex->diag = diag;
-    lex->at_line_start = 1;
     lex->defines = NULL;
     lex->define_count = 0;
     lex->define_cap = 0;

@@ -61,7 +61,6 @@ struct zan_lexer {
     int cond_seen_true[ZAN_PP_MAX_COND_DEPTH];
     /* 条件编译预处理嵌套深度溢出计数 */
     int cond_overflow;
-    int at_line_start;
 };
 
 void zan_lexer_init(zan_lexer_t *lex, const char *source, size_t len,

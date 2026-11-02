@@ -257,13 +257,11 @@ static int axml_patch(const unsigned char *xml, size_t xml_len,
     memcpy(&first_hdr, xml + 10, 2);
     memcpy(&first_size, xml + 12, 4);
     if (first_type != 0x0001 || first_hdr != 28) return -1;
-    uint32_t pool_size, str_start;
+    uint32_t str_start;
     uint32_t flags32;
-    memcpy(&pool_size, xml + 12, 4);
     memcpy(&flags32, xml + 24, 4);
     memcpy(&str_start, xml + 28, 4);
     int utf8 = (flags32 & 0x100) != 0;
-    (void)pool_size;
     if (8 + first_size > xml_len || str_start < 28) return -1;
 
     size_t pool_off = 8;
@@ -718,7 +716,6 @@ static int ensure_java(char *out, size_t outsz) {
     return 0;
 }
 
-static int find_java(char *out, size_t outsz);
 
 static int ensure_keystore(char *out, size_t outsz) {
     const char *home = getenv("USERPROFILE");
