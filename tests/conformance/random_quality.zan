@@ -1,0 +1,105 @@
+using System;
+
+// System.Random 修复回归：LCG 低位短周期（NextBool 曾退化成周期 2
+// 交替）与 % 模偏置（NextBelow/NextDouble 曾偏小值、精度仅 10^6）。
+// 修后取状态高位段 + Lemire 乘法取模，Seeded 固定种子可复现。
+class Program {
+    static int failures = 0;
+
+    static void Check(bool cond, string name) {
+        if (cond) {
+            Console.WriteLine("ok " + name);
+        } else {
+            failures = failures + 1;
+            Console.WriteLine("FAIL " + name);
+        }
+    }
+
+    static void Main() {
+        // 固定种子可复现（回归锚）
+        Random r1 = Random.Seeded(42);
+        Random r2 = Random.Seeded(42);
+        bool same = true;
+        for (int i = 0; i < 16; i = i + 1) {
+            if (r1.Next() != r2.Next()) { same = false; }
+        }
+        Check(same, "Seeded reproducible");
+
+        // NextBool 不再是周期 2 交替：32 步里必须出现连续同值
+        //（旧实现严格 true/false 轮流，绝无连续同值）
+        Random rb = Random.Seeded(7);
+        bool hasRun = false;
+        int run = 1;
+        bool prev = rb.NextBool();
+        for (int i = 1; i < 32; i = i + 1) {
+            bool cur = rb.NextBool();
+            if (cur == prev) {
+                run = run + 1;
+                if (run >= 2) { hasRun = true; }
+            } else {
+                run = 1;
+            }
+            prev = cur;
+        }
+        Check(hasRun, "NextBool not period-2 alternating");
+
+        // NextBool 两种值都出现
+        Random rb2 = Random.Seeded(7);
+        int trues = 0;
+        for (int i = 0; i < 200; i = i + 1) {
+            if (rb2.NextBool()) { trues = trues + 1; }
+        }
+        Check(trues > 40 && trues < 160, "NextBool both values (got " + Convert.ToString(trues) + ")");
+
+        // NextBelow 均匀性：10 桶 × 10000，宽松界
+        Random rd2 = Random.Seeded(1234);
+        int[] b = new int[10];
+        for (int i = 0; i < 10000; i = i + 1) {
+            int v = rd2.NextBelow(10);
+            b[v] = b[v] + 1;
+        }
+        bool uniform = true;
+        for (int i = 0; i < 10; i = i + 1) {
+            if (b[i] < 800 || b[i] > 1200) { uniform = false; }
+        }
+        Check(uniform, "NextBelow(10) uniform in [800,1200] per bucket");
+
+        // 幂界：NextBelow(2^n) 也均匀（旧实现走 LCG 低位短周期）
+        Random rp = Random.Seeded(99);
+        int even = 0;
+        for (int i = 0; i < 10000; i = i + 1) {
+            if (rp.NextBelow(8) % 2 == 0) { even = even + 1; }
+        }
+        Check(even > 4400 && even < 5600, "NextBelow(8) even parity ~half (got " + Convert.ToString(even) + ")");
+
+        // 边界
+        Check(Random.Seeded(1).NextBelow(1) == 0, "NextBelow(1) == 0");
+        Check(Random.Seeded(1).Between(5, 5) == 5, "Between(5,5) == 5");
+        Check(Random.Seeded(1).Between(5, 6) == 5, "Between(5,6) == 5");
+        bool inRange = true;
+        Random rr = Random.Seeded(3);
+        for (int i = 0; i < 1000; i = i + 1) {
+            int v = rr.Between(10, 20);
+            if (v < 10 || v >= 20) { inRange = false; }
+        }
+        Check(inRange, "Between in [10,20)");
+
+        // NextDouble：精度与值域。旧实现只有 10^6 离散刻度——
+        // 200 个值里必有小数点后第 7 位非零（2^31 刻度几乎必然）；
+        // 旧实现第 7 位恒 0。
+        Random rx = Random.Seeded(555);
+        bool fine = false;
+        bool inUnit = true;
+        for (int i = 0; i < 200; i = i + 1) {
+            double d = rx.NextDouble();
+            if (d < 0.0 || d >= 1.0) { inUnit = false; }
+            double scaled = d * 10000000.0;
+            long s = (long)scaled;
+            if (s % 10 != 0) { fine = true; }
+        }
+        Check(inUnit, "NextDouble in [0,1)");
+        Check(fine, "NextDouble has >1e-6 precision");
+
+        Console.WriteLine("failures=" + failures);
+    }
+}
