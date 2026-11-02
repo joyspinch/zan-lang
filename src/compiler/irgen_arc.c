@@ -822,7 +822,7 @@ static LLVMValueRef get_array_desc(zan_irgen_t *g, zan_type_t *elem_type) {
     LLVMValueRef z = LLVMConstNull(i8p);
     LLVMValueRef dtor_c = LLVMConstBitCast(dtor, i8p);
     LLVMSetInitializer(dg, LLVMConstNamedStruct(dt,
-        (LLVMValueRef[]){ dtor_c, z, z, LLVMConstInt(i64t, 0, 0) }, 4));
+        (LLVMValueRef[]){ dtor_c, z, z }, 3));
     return dg;
 }
 

@@ -3163,8 +3163,7 @@ void zan_irgen_emit_arc_desc_init(zan_irgen_t *g) {
                 meta = refl_meta_for(g, t, NULL, 0);
             }
         }
-        LLVMValueRef fields[4] = { dtor, tynames, meta,
-                                   LLVMConstInt(i64, (unsigned long long)i, 0) };
-        LLVMSetInitializer(dg, LLVMConstNamedStruct(dt, fields, 4));
+        LLVMValueRef fields[3] = { dtor, tynames, meta };
+        LLVMSetInitializer(dg, LLVMConstNamedStruct(dt, fields, 3));
     }
 }

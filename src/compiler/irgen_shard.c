@@ -901,8 +901,12 @@ static bool sh_emit_one_file(sh_state_t *st, int shard_idx, const char *frag_pat
         return false;
     }
     if (vmsg) LLVMDisposeMessage(vmsg);
-    if (g->obfuscate_strings || getenv("ZAN_SHARD_OPT")) {
-        zan_opt_run_passes_on_module(mod, tm, g->obfuscate_strings ? ZAN_OPT_SIZE : ZAN_OPT_FULL);
+    /* shard 模块必须和主模块跑同一级别的 LLVM pass pipeline，否则
+     * publish 模式下 shard 里的函数完全没经过体积优化，会导致发布产物
+     * 体积几乎不降。ZAN_SHARD_OPT 环境变量留作逃生口。 */
+    if (g->publish_mode || g->obfuscate_strings || getenv("ZAN_SHARD_OPT")) {
+        zan_opt_run_passes_on_module(mod, tm,
+            (g->publish_mode || g->obfuscate_strings) ? ZAN_OPT_SIZE : ZAN_OPT_FULL);
     }
     char *eerr = NULL;
     SH_TRACE("shard emit: verify ok -> codegen\n");

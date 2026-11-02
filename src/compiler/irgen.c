@@ -945,9 +945,12 @@ static LLVMValueRef zan_hdr_read_ok(zan_irgen_t *g, LLVMValueRef obj) {
 }
 
 static LLVMTypeRef arc_desc_type(zan_irgen_t *g) {
+    /* 3 字段：{dtor_fn, tynames_arr_ptr, meta_ptr}，共 24 字节。
+     * 历史上第 4 字段 site_idx(i64, offset 24) 已在 desc_hdr=true 模式下
+     * 从未被 runtime 读取——arc_site_arg 传的是 desc 指针而非 site 整数，
+     * 故移除之。前 3 字段偏移不变，不影响 runtime 硬编码 GEP(8)/GEP(16)。 */
     LLVMTypeRef i8p = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
-    LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
-    return LLVMStructType((LLVMTypeRef[]){ i8p, i8p, i8p, i64t }, 4, 0);
+    return LLVMStructType((LLVMTypeRef[]){ i8p, i8p, i8p }, 3, 0);
 }
 
 static LLVMValueRef create_arc_desc(zan_irgen_t *g, int site_idx) {
@@ -961,7 +964,7 @@ static LLVMValueRef create_arc_desc(zan_irgen_t *g, int site_idx) {
     LLVMSetGlobalConstant(dg, 1);
     LLVMValueRef z = LLVMConstNull(i8p);
     LLVMSetInitializer(dg, LLVMConstNamedStruct(dt,
-        (LLVMValueRef[]){ z, z, z, LLVMConstInt(i64t, 0, 0) }, 4));
+        (LLVMValueRef[]){ z, z, z }, 3));
     g->desc_gv[site_idx] = dg;
     return dg;
 }

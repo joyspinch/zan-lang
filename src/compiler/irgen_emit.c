@@ -3638,7 +3638,21 @@ zan_status_t zan_irgen_write_obj(zan_irgen_t *g, const char *path) {
     }
     zan_irgen_init_llvm_targets();
 
-    if (g->obfuscate_strings /* publish */ && !g->target_is_macos && !g->target_is_ios && !g->target_is_wasm) {
+    /* publish 模式需要按函数拆独立 section，否则链接器 --gc-sections
+     * 无法丢弃未引用函数（section 粒度太粗，.text 里任何一个函数被引用
+     * 就把整个 .text 留住）。
+     * 全局数据不拆——Windows COFF 下成千上万个 .rdata$xxx section 会让
+     * REL32 relocation 溢出；全局数据靠 COMDAT/ICF 合并即可。
+     * 字符串混淆模式保留旧行为（全局数据也要拆）因为混淆需要精确控制。
+     * macOS/iOS/WASM 暂跳过——macOS 链接器默认按 atom 粒度做 dead_strip，
+     * iOS 有 App Store 工具链，WASM 靠 wasm-ld 自带 GC。 */
+    bool need_fn_sec = (g->obfuscate_strings || g->publish_mode)
+                       && !g->target_is_macos && !g->target_is_ios
+                       && !g->target_is_wasm;
+    bool need_gv_sec = g->obfuscate_strings
+                       && !g->target_is_macos && !g->target_is_ios
+                       && !g->target_is_wasm;
+    if (need_fn_sec) {
         for (LLVMValueRef fn = LLVMGetFirstFunction(g->mod); fn;
              fn = LLVMGetNextFunction(fn)) {
             if (LLVMIsDeclaration(fn) || LLVMGetSection(fn)) continue;
@@ -3649,6 +3663,8 @@ zan_status_t zan_irgen_write_obj(zan_irgen_t *g, const char *path) {
             snprintf(sec, sizeof(sec), ".text.%s", nm);
             LLVMSetSection(fn, sec);
         }
+    }
+    if (need_gv_sec) {
         int coff_obj = g->target_triple[0]
                            ? strstr(g->target_triple, "windows-gnu") != NULL
                            :
@@ -3666,7 +3682,6 @@ zan_status_t zan_irgen_write_obj(zan_irgen_t *g, const char *path) {
             size_t nlen = 0;
             const char *nm = LLVMGetValueName2(gv, &nlen);
             if (!nm || !nlen || nlen > 200) continue;
-            /* llvm */
             if (strncmp(nm, "llvm.", 5) == 0) continue;
             if (strncmp(nm, "rterr", 5) == 0) continue;
             char sec[260];
