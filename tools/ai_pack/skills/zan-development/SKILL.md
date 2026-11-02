@@ -324,6 +324,37 @@ Without MCP the same index is a file: `knowledge/symbols.json` next to the SDK
   区分"0 值命中"与"没读到"（GetInt 二者都返回 0）；`BlockingQueue.EnqueueFor(item, ms)`
   超时回 false、负超时无限等；`Decimal.Round(d[, decimals])` 银行家舍入（ToEven）；
   `new Guid(string)` 收规范/花括号/N 三形态归一规范小写，非法抛 FormatException。
+* **Mutex 不可重入——锁内禁调工厂/回调**（实证，2026-11-03）：Zan `Mutex.Lock`
+  是不可重入 OS 锁（C# Monitor 可重入），同线程二次 Lock 即自死锁。凡
+  「锁内解析依赖/调 valueFactory/回调可能再进同一把锁」必须两段式：锁内查缓存
+  + 登记 building 标记，工厂在**锁外**调，回锁回填。DI ServiceProvider
+  单例/Scoped 已改此型（曾同线程自死锁），环依赖抛 InvalidOperationException
+  （.NET 同文案）。ThreadLocal 的 valueFactory 也在锁内执行，不得重入同一
+  ThreadLocal。
+* **Random 取高位不取低位**（实证，2026-11-03）：stdlib Random 是 64 位 LCG，
+  低 k 位周期只有 2^k——按 LSB 写 NextBool 曾退化周期-2 交替（"0101…"）。
+  现约定：Next/NextBool 取 63..33 高位，NextBelow(bound) 用 Lemire
+  `(u32*bound)>>32` 免模偏置；NextRaw/Seeded 序列未动（复现契约保留）。
+* **Task.Spawn 只收 asyncCall 实参**（实证，2026-11-03）：方法组
+  `Task.Spawn(Program.M)` 报 E3064，要写 `Task.Spawn(Program.M(1))`——需要
+  标识时给方法加参数再传。委托作实参撞重载歧义（E2103，如
+  `AddSingleton("B", (p)=>…)` 撞 `(string, object)` 重载）时，先赋给
+  `ServiceFactory f = (p)=>…` 局部变量再传。`string + object` 拼接是
+  E2040，object 须显式 cast string。
+* **并发 API 面**（实证，2026-11-03）：`Gate.SignalAll()` 广播唤醒全部等待者
+  （无等待者时 bank surplus+1，与 Signal 单唤醒对称）；`File.Move` 源缺失抛
+  FileNotFoundException、rename 失败抛 IOException（不再静默）；
+  `Environment.ProcessorCount` 走 runtime 探针（GetSystemInfo/sysconf），
+  不读 NUMBER_OF_PROCESSORS 环境变量（污染免疫、非 Windows 不再恒 1）；
+  `string.AsView()` 返回非 owning {ptr,len} 视图，临时 string 上取视图
+  ARC 释放后即悬垂（B-ID112，语言级生命周期缺口，勿脱离源对象生存期用）。
+* **ctest 用例选择速查**（实证，2026-11-03）：conformance 用例注册为
+  `case_<name>` 与 `case_det_<name>` 双变体，标签只有 full/standard（无
+  smoke）；单跑 `cd build && ctest -C Release -R "case_x|case_y"`；
+  test.ps1 参数是 `-Tier`/`-Match`（无 -Filter）。golden `.out` 只能用
+  cmake -P 的 execute_process 生成（PowerShell 重定向得 0 字节）；比对
+  用 stdout-only——`2>&1` 会把 stderr 软诊断（"runtime error: …"）混进
+  golden 造成假 DIFF。
 * **空安全是编译期硬检查**（实证，2026-10-22）：`JsonValue.Get(key)`、
   `List.First()` 等标为"可返回 null"的调用，其结果**直接取成员**会被编译器
   拦下（"'Get' can return null; accessing 'IsArray' on its result faults at
