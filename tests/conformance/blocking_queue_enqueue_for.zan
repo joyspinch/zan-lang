@@ -1,0 +1,79 @@
+using System;
+using System.Threading;
+
+// BlockingQueue.EnqueueFor：无界立即成功；满时限时等待，超时回
+// false；消费者腾位后挂起的生产方被唤醒回 true；负超时无限等待；
+// Complete 后回 false。
+class Prog {
+    static BlockingQueue<string> q1;   // 容量 1：超时场景
+    static AtomicInt r1;
+    static BlockingQueue<string> q2;   // 容量 1：腾位唤醒场景
+    static AtomicInt r2;
+    static BlockingQueue<string> q3;   // 容量 1：负超时无限等场景
+    static AtomicInt r3;
+
+    static void TimeoutPoster() {
+        bool ok = Prog.q1.EnqueueFor("late", 100);
+        Prog.r1.Store(ok ? 1 : 0);
+    }
+
+    static void RoomPoster() {
+        bool ok = Prog.q2.EnqueueFor("second", 500);   // 满挂起
+        Prog.r2.Store(ok ? 1 : 0);
+    }
+
+    static void InfinitePoster() {
+        bool ok = Prog.q3.EnqueueFor("blocks", -1);
+        Prog.r3.Store(ok ? 1 : 0);
+    }
+
+    static void Main() {
+        // 无界队列：立即成功
+        BlockingQueue<string> uq = new BlockingQueue<string>("", 0);
+        Console.WriteLine("unbounded: " + Convert.ToString(uq.EnqueueFor("x", 50) ? 1 : 0));
+        uq.Dispose();
+
+        // 超时：满且无人取，100ms 内回 false；原条目不受影响
+        Prog.q1 = new BlockingQueue<string>("", 1);
+        Prog.q1.Enqueue("first");
+        Prog.r1 = new AtomicInt(-1);
+        Thread.Start(Prog.TimeoutPoster);
+        while (Prog.r1.Load() == -1) { Thread.Sleep(1); }
+        Console.WriteLine("timeout: " + Convert.ToString(Prog.r1.Load()));
+        Console.WriteLine("first-alive: [" + Prog.q1.TryDequeue() + "]");
+        Console.WriteLine("empty-after: " + Convert.ToString(Prog.q1.Count()));
+        Prog.q1.Dispose();
+
+        // 腾位唤醒：生产方挂起后消费者取走，限时投递成功
+        Prog.q2 = new BlockingQueue<string>("", 1);
+        Prog.q2.Enqueue("hold");
+        Prog.r2 = new AtomicInt(-1);
+        Thread.Start(Prog.RoomPoster);
+        Thread.Sleep(100);   // 让生产方先挂上
+        Console.WriteLine("drained-first: [" + Prog.q2.TryDequeue() + "]");
+        while (Prog.r2.Load() == -1) { Thread.Sleep(1); }
+        Console.WriteLine("room: " + Convert.ToString(Prog.r2.Load()));
+        Console.WriteLine("second: [" + Prog.q2.TryDequeue() + "]");
+        Prog.q2.Dispose();
+
+        // 负超时：无限等待，先确认还在等，再腾位
+        Prog.q3 = new BlockingQueue<string>("", 1);
+        Prog.q3.Enqueue("hold");
+        Prog.r3 = new AtomicInt(-1);
+        Thread.Start(Prog.InfinitePoster);
+        Thread.Sleep(100);
+        Console.WriteLine("infinite-pending: " + Convert.ToString(Prog.r3.Load()));
+        Console.WriteLine("drained: [" + Prog.q3.TryDequeue() + "]");
+        while (Prog.r3.Load() == -1) { Thread.Sleep(1); }
+        Console.WriteLine("infinite: " + Convert.ToString(Prog.r3.Load()));
+        Console.WriteLine("drained2: [" + Prog.q3.TryDequeue() + "]");
+        Prog.q3.Dispose();
+
+        // Complete 后拒绝
+        BlockingQueue<string> cq = new BlockingQueue<string>("", 1);
+        cq.Enqueue("x");
+        cq.Complete();
+        Console.WriteLine("after-complete: " + Convert.ToString(cq.EnqueueFor("y", 50) ? 1 : 0));
+        cq.Dispose();
+    }
+}

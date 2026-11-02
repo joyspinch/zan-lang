@@ -112,6 +112,42 @@ public class BlockingQueue<T> : IDisposable {
         }
     }
 
+    // 投递一个条目，最多等待 `timeoutMs` 毫秒：有界队列满时挂起
+    // 调用方，直到消费者取走一个空位或超时。超时或队列已结束
+    // 返回 false。负超时表示无限等待；无界队列立即成功（与
+    // <see cref="Enqueue"/> 相同）。竞态处理与
+    // <see cref="DequeueFor"/> 对称：超时后撤回注册，但若消费者
+    // 已把本次投递与一个空位配对，再循环一次把条目放进空位。
+    public bool EnqueueFor(T item, int timeoutMs) {
+        while (true) {
+            Mutex.Lock(this.lockHandle);
+            if (this.closed) {
+                Mutex.Unlock(this.lockHandle);
+                return false;
+            }
+            if (this.capacity <= 0
+                || this.items.Count - this.head < this.capacity) {
+                this.items.Add(item);
+                bool wake = this.waiters > 0;
+                if (wake) { this.waiters = this.waiters - 1; }
+                Mutex.Unlock(this.lockHandle);
+                if (wake) { Semaphore.Release(this.sem); }
+                return true;
+            }
+            this.posters = this.posters + 1;
+            Mutex.Unlock(this.lockHandle);
+            if (Semaphore.WaitFor(this.slots, timeoutMs)) { continue; }
+            // 已超时：撤回注册，除非消费者已将其与一次取走配对；
+            // 这种情况下吃掉空位令牌再循环一次，把条目投进去。
+            Mutex.Lock(this.lockHandle);
+            bool parked = this.posters > 0;
+            if (parked) { this.posters = this.posters - 1; }
+            Mutex.Unlock(this.lockHandle);
+            if (parked) { return false; }
+            Semaphore.Wait(this.slots);
+        }
+    }
+
     // 取出下一个条目；若队列当前
     // 没有数据，则返回 `empty` 哨兵。
     public T TryDequeue() {
