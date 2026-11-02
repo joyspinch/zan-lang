@@ -576,67 +576,17 @@ static LLVMValueRef get_dict_key_eq_fn(zan_irgen_t *g) {
 }
 
 static LLVMValueRef get_dict_hash_fn(zan_irgen_t *g) {
+    /* B-ID80：哈希算法挪到运行时——SipHash-2-4 + 进程级随机盐
+     * （hosted rt_mem.c 用 OS 熵盐；wasm/bare 确定性盐）。曾是 IR 内联的
+     * 定种 FNV-1a，基值写死，攻击者可离线构造碰撞键族打满哈希桶。
+     * IR 只留外部声明，链接由运行时对象供给。 */
     LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "__zan_dict_hash");
     if (fn) return fn;
-    LLVMContextRef c = g->ctx;
-    LLVMBuilderRef b = g->builder;
-    LLVMTypeRef i8 = LLVMInt8TypeInContext(c);
+    LLVMTypeRef i8 = LLVMInt8TypeInContext(g->ctx);
     LLVMTypeRef i8ptr = LLVMPointerType(i8, 0);
-    LLVMTypeRef i64 = LLVMInt64TypeInContext(c);
+    LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
     LLVMTypeRef fnty = LLVMFunctionType(i64, (LLVMTypeRef[]){ i8ptr, i64 }, 2, 0);
-    fn = LLVMAddFunction(g->mod, "__zan_dict_hash", fnty);
-    LLVMSetLinkage(fn, LLVMInternalLinkage);
-    LLVMBasicBlockRef saved = LLVMGetInsertBlock(b);
-    LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(c, fn, "entry");
-    LLVMBasicBlockRef nul   = LLVMAppendBasicBlockInContext(c, fn, "nul");
-    LLVMBasicBlockRef raw   = LLVMAppendBasicBlockInContext(c, fn, "raw");
-    LLVMBasicBlockRef sini  = LLVMAppendBasicBlockInContext(c, fn, "s.init");
-    LLVMBasicBlockRef scond = LLVMAppendBasicBlockInContext(c, fn, "s.cond");
-    LLVMBasicBlockRef sbody = LLVMAppendBasicBlockInContext(c, fn, "s.body");
-    LLVMBasicBlockRef sdone = LLVMAppendBasicBlockInContext(c, fn, "s.done");
-    LLVMPositionBuilderAtEnd(b, entry);
-    LLVMValueRef key = LLVMGetParam(fn, 0);
-    LLVMValueRef is_str = LLVMGetParam(fn, 1);
-    LLVMValueRef h_a = LLVMBuildAlloca(b, i64, "h");
-    LLVMValueRef p_a = LLVMBuildAlloca(b, i8ptr, "p");
-    LLVMValueRef isn = zan_icmp(b, LLVMIntEQ, key, LLVMConstNull(i8ptr), "isn");
-    LLVMBuildCondBr(b, isn, nul, sini);
-    LLVMPositionBuilderAtEnd(b, nul);
-    LLVMBuildRet(b, LLVMConstInt(i64, 0, 0));
-    LLVMPositionBuilderAtEnd(b, sini);
-    LLVMValueRef strk = zan_icmp(b, LLVMIntNE, is_str, LLVMConstInt(i64, 0, 0), "strk");
-    LLVMBuildCondBr(b, strk, scond, raw);
-    LLVMPositionBuilderAtEnd(b, raw);
-    LLVMValueRef v = LLVMBuildPtrToInt(b, key, i64, "kv");
-    v = zan_xor(b, v, zan_lshr(b, v, LLVMConstInt(i64, 33, 0), "s1"), "x1");
-    v = zan_mul(b, v, LLVMConstInt(i64, 0xff51afd7ed558ccdULL, 0), "m1");
-    v = zan_xor(b, v, zan_lshr(b, v, LLVMConstInt(i64, 29, 0), "s2"), "x2");
-    v = zan_mul(b, v, LLVMConstInt(i64, 0xc4ceb9fe1a85ec53ULL, 0), "m2");
-    v = zan_xor(b, v, zan_lshr(b, v, LLVMConstInt(i64, 32, 0), "s3"), "x3");
-    LLVMBuildRet(b, v);
-    LLVMPositionBuilderAtEnd(b, scond);
-    LLVMBuildStore(b, LLVMConstInt(i64, 1469598103934665603ULL, 0), h_a);
-    LLVMBuildStore(b, key, p_a);
-    LLVMBasicBlockRef loop = LLVMAppendBasicBlockInContext(c, fn, "s.loop");
-    LLVMBuildBr(b, loop);
-    LLVMPositionBuilderAtEnd(b, loop);
-    LLVMValueRef p = LLVMBuildLoad2(b, i8ptr, p_a, "p.cur");
-    LLVMValueRef ch = LLVMBuildLoad2(b, i8, p, "ch");
-    LLVMValueRef end = zan_icmp(b, LLVMIntEQ, ch, LLVMConstInt(i8, 0, 0), "end");
-    LLVMBuildCondBr(b, end, sdone, sbody);
-    LLVMPositionBuilderAtEnd(b, sbody);
-    LLVMValueRef hv = LLVMBuildLoad2(b, i64, h_a, "h.cur");
-    LLVMValueRef c64 = LLVMBuildZExt(b, ch, i64, "ch64");
-    hv = zan_xor(b, hv, c64, "h.x");
-    hv = zan_mul(b, hv, LLVMConstInt(i64, 1099511628211ULL, 0), "h.m");
-    LLVMBuildStore(b, hv, h_a);
-    LLVMValueRef one = LLVMConstInt(i64, 1, 0);
-    LLVMBuildStore(b, LLVMBuildGEP2(b, i8, p, &one, 1, "p.next"), p_a);
-    LLVMBuildBr(b, loop);
-    LLVMPositionBuilderAtEnd(b, sdone);
-    LLVMBuildRet(b, LLVMBuildLoad2(b, i64, h_a, "h.out"));
-    if (saved) LLVMPositionBuilderAtEnd(b, saved);
-    return fn;
+    return LLVMAddFunction(g->mod, "__zan_dict_hash", fnty);
 }
 
 /* SwissTable Group matching: returns i32 mask where bit k is 1 if byte k == h2 */

@@ -266,3 +266,7 @@ int zan_w32_snprintf(char *s, long long n, const char *fmt, ...) {
     return r;
 }
 #endif
+
+
+/* __zan_dict_hash（B-ID80）在 rt_timer.c 提供（bare 编译走其
+ * ZAN_BARE_METAL 确定性盐分支）——本文件不重复定义。 */

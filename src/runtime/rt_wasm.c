@@ -28,3 +28,6 @@ int setjmp(void *env) { (void)env; return 0; }
  * 的运行时集；external_async_executor 路径引用本符号，wasm 侧由此提供
  * 定义）。 */
 void __zan_co_frame_free(void *frame) { free(frame); }
+
+/* __zan_dict_hash（B-ID80）在 zanrt_timer.o 里（rt_timer.c，全链接路径
+ * 无条件对象）——wasm 链接同时拉 timer 与本对象，这里不得重复定义。 */

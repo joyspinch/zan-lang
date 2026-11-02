@@ -6,6 +6,12 @@
 #define _WIN32_WINNT 0x0601
 #endif
 
+/* rand_s 声明开关——须先于 <stdlib.h>（Dictionary 键哈希盐的熵源，
+ * 见文件尾 B-ID80 段） */
+#if defined(_WIN32) && !defined(_CRT_RAND_S)
+#define _CRT_RAND_S 1
+#endif
+
 #include "rt_timer.h"
 
 #include <stdio.h>
@@ -16,6 +22,7 @@
 #include <errno.h>
 #include "../common/host_oom.h"
 #include "../common/zan_abi.h"
+#include "rt_oom.h"  /* B-ID98 站点化 OOM 注入 */
 
 #if !defined(__wasm__) && !defined(ZAN_BARE_METAL)
 #include "rt_crash.h"
@@ -601,7 +608,7 @@ static long long delay_ms_to_us(long long ms) {
 
 void zan_timer_delay(long long ms, void *frame, zan_timer_step_t step) {
     if (!step) return;
-    zan_timer_entry *entry = (zan_timer_entry *)calloc(1, sizeof(*entry));
+    zan_timer_entry *entry = (zan_timer_entry *)ZAN_OOM_CALLOC("timer.delay_entry", 1, sizeof(*entry));
     if (!entry) { step(frame); return; } /* B-ID98：口径同 heap_push 失败路径，立即恢复等待协程不悬挂 */
     entry->due_us = zan_timer_saturating_due_us(zan_co_precise_us(),
                                                                delay_ms_to_us(ms));
@@ -1497,3 +1504,90 @@ size_t zan_mem_slabs(void) {
     return 0;
 }
 
+
+/* —— Dictionary/HashSet 键哈希（B-ID80）——
+ * 曾在 IR 内联定种 FNV-1a（基值写死，irgen_builtins.c）：攻击者可离线
+ * 构造碰撞键族，Web 服务端收到恶意键集即把哈希桶打满 O(N) 链。现改
+ * SipHash-2-4 + 进程级随机盐：盐由 OS 熵源一次性取（构造器初始化 +
+ * 惰性兜底），不出进程——离线碰撞构造失效，同进程内哈希稳定。
+ * 落点选 rt_timer.o：它是唯一被所有链接路径（hosted/交叉 linux/macos/
+ * ios/wasm32/android）无条件拉入的运行时对象；bare 单独走
+ * bare 编译（ZAN_BARE_METAL）走本文件确定性盐分支。SipHash 本体共享于 rt_siphash.h
+ * （性质探针：雪崩 0.4999、10^6 键 2^16 桶 max/mean=2.23、跨盐同桶率
+ * ≈1/256）。 */
+#if defined(ZAN_BARE_METAL)
+
+/* bare：无 OS 熵源，确定性盐（行为可复现，威胁模型同 wasm 说明） */
+int64_t __zan_dict_hash(const void *key, int64_t is_str) {
+    if (key == NULL) return 0;
+    const uint64_t k0 = 0x5a4e483153344801ull; /* "ZNH1S4H" */
+    const uint64_t k1 = 0x9e3779b97f4a7c15ull;
+    if (is_str) {
+        size_t n = 0;
+        const char *c = (const char *)key;
+        while (c[n]) n++;
+        return (int64_t)zan_siphash24(key, n, k0, k1);
+    }
+    return (int64_t)zan_siphash24(&key, sizeof(key), k0, k1);
+}
+
+#else /* !ZAN_BARE_METAL：hosted 熵盐版 */
+
+#include "rt_siphash.h"
+#if defined(_WIN32)
+#include <time.h>
+#endif
+
+static uint64_t zan_hash_salt_k0 = 0, zan_hash_salt_k1 = 0;
+static volatile uint64_t zan_hash_salt_ready = 0;
+
+static void zan_hash_salt_fill(uint64_t *k0, uint64_t *k1) {
+#if defined(_WIN32)
+    unsigned int r0 = 0, r1 = 0;
+    if (rand_s(&r0) == 0 && rand_s(&r1) == 0) {
+        *k0 = ((uint64_t)r0 << 32) | r1;
+        if (rand_s(&r0) == 0 && rand_s(&r1) == 0)
+            *k1 = ((uint64_t)r0 << 32) | r1;
+        else
+            *k1 = (uint64_t)(uintptr_t)zan_hash_salt_fill;
+        return;
+    }
+    LARGE_INTEGER pc;
+    QueryPerformanceCounter(&pc);
+    *k0 = pc.QuadPart ^ ((uint64_t)(uintptr_t)&pc << 17);
+    *k1 = (uint64_t)(uintptr_t)zan_hash_salt_fill ^ ((uint64_t)GetCurrentProcessId() << 32);
+#else
+    FILE *f = fopen("/dev/urandom", "rb");
+    if (f) {
+        size_t got = fread(k0, 1, 16, f);
+        fclose(f);
+        if (got == 16) return;
+    }
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    *k0 = ((uint64_t)ts.tv_nsec << 32) ^ (uint64_t)(uintptr_t)k0;
+    *k1 = (uint64_t)getpid() << 47 ^ (uint64_t)(uintptr_t)zan_hash_salt_fill;
+#endif
+}
+
+__attribute__((constructor)) static void zan_hash_salt_ctor(void) {
+    zan_hash_salt_fill(&zan_hash_salt_k0, &zan_hash_salt_k1);
+    zan_hash_salt_ready = 1;
+}
+
+int64_t __zan_dict_hash(const void *key, int64_t is_str) {
+    if (key == NULL) return 0;
+    if (!zan_hash_salt_ready) {
+        zan_hash_salt_fill(&zan_hash_salt_k0, &zan_hash_salt_k1);
+        zan_hash_salt_ready = 1;
+    }
+    if (is_str) {
+        return (int64_t)zan_siphash24(key, strlen((const char *)key),
+                                      zan_hash_salt_k0, zan_hash_salt_k1);
+    }
+    /* 非字符串键走引用同一性：哈希指针 8 字节（同进程内稳定） */
+    return (int64_t)zan_siphash24(&key, sizeof(key),
+                                  zan_hash_salt_k0, zan_hash_salt_k1);
+}
+
+#endif /* !ZAN_BARE_METAL */

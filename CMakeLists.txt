@@ -2705,7 +2705,11 @@ endfunction()
 
 # 用例不走通用 glob 的名字（各自有专属 harness）。这份名单是 glob 跳过逻辑
 # 与"基准文件存在性"守卫的共同真相源：少一处同步，守卫就会误报或漏报。
-set(_conf_skip_cases arc_net_publish embed_compress publish_design_embed shard_deep_refl)
+set(_conf_skip_cases arc_net_publish embed_compress publish_design_embed shard_deep_refl
+  # B-ID98 OOM 注入直钉：必须带 ZAN_OOM_INJECT_SITE 环境变量才有意义，
+  # 走 run_oom_case.cmake 单独注册（无注入裸跑会让 monitor fatal 用例
+  # 正常结束而 golden 期待的是 fatal 空输出）。
+  oom_monitor_fatal oom_timer_delay oom_co_queue_grow)
 
 # 已知会漏的用例：泄漏是**既有的**（stdlib 层的 ARC 欠账，见 TASKS.md A495），
 # 旧世界里它们只红在 full 档的 leakcheck 孪生档上——那条档是发布门控，没人
@@ -2947,6 +2951,35 @@ add_test(NAME case_crypto_sm4_scalar_kat
     -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 set_tests_properties(case_crypto_sm4_scalar_kat PROPERTIES
   ENVIRONMENT "ZAN_NO_HWACCEL=1" TIMEOUT 300)
+
+# B-ID98 OOM 注入直钉：三路运行时 fail-fast/恢复口径的确定性验证。
+foreach(_oom_case monitor_fatal timer_delay co_queue_grow)
+  if(_oom_case STREQUAL "monitor_fatal")
+    set(_oom_env "sync.monitor_block")
+    set(_oom_rc "nonzero")
+    set(_oom_marker "fatal (oom): sync: monitor block alloc failed")
+  elseif(_oom_case STREQUAL "timer_delay")
+    set(_oom_env "timer.delay_entry:2")
+    set(_oom_rc "")
+    set(_oom_marker "")
+  else()
+    set(_oom_env "co.queue_grow:1")
+    set(_oom_rc "")
+    set(_oom_marker "")
+  endif()
+  add_test(NAME case_oom_${_oom_case}
+    COMMAND ${CMAKE_COMMAND}
+      -DZANC=$<TARGET_FILE:zanc>
+      -DSRC=${CMAKE_SOURCE_DIR}/tests/conformance/oom_${_oom_case}.zan
+      -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/oom_${_oom_case}.out
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/oom_${_oom_case}${_exe_ext}
+      -DSTDLIB_STAMP=${_stdlib_stamp}
+      -DOOM_ENV=${_oom_env}
+      -DEXPECT_RC=${_oom_rc}
+      "-DERR_MARKER=${_oom_marker}"
+      -P ${CMAKE_SOURCE_DIR}/tests/run_oom_case.cmake)
+  set_tests_properties(case_oom_${_oom_case} PROPERTIES TIMEOUT 300)
+endforeach()
 
 # datetime_now pins the local wall-clock semantics with a fixed POSIX timezone:
 # EST/EDT with the US 2007+ transition rules, so winter/summer offsets and both

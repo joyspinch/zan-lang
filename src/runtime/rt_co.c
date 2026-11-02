@@ -6,6 +6,7 @@
 #include <stdlib.h>
 
 #include "../common/host_oom.h"
+#include "rt_oom.h"  /* B-ID98 站点化 OOM 注入 */
 
 /* 就绪协程槽位：step(frame) 重新进入状态机执行 */
 typedef struct {
@@ -35,16 +36,21 @@ void zan_co_set_idle(zan_co_idle_fn fn) {
 
 static void queue_grow(void) {
     size_t ncap = g_cap ? g_cap * 2 : 16;
-    zan_co_slot_t *nq = (zan_co_slot_t *)malloc(ncap * sizeof(*nq));
+    zan_co_slot_t *nq = (zan_co_slot_t *)ZAN_OOM_MALLOC("co.queue_grow",
+                                                        ncap * sizeof(*nq));
     if (!nq) {
         /* B-ID98：翻倍失败降档 +16，碎片化内存下最大化扩容成功率 */
         ncap = g_cap ? g_cap + 16 : 16;
-        nq = (zan_co_slot_t *)malloc(ncap * sizeof(*nq));
+        nq = (zan_co_slot_t *)ZAN_OOM_MALLOC("co.queue_grow",
+                                             ncap * sizeof(*nq));
     }
     if (!nq) {
         /* 队列扩容遇 OOM 丢弃本次恢复，保护主进程与已连接会话不崩溃 */
         fprintf(stderr, "zan runtime: coroutine ready-queue grow failed "
                         "(OOM); dropping one resumption\n");
+        /* 双档全败必须早退：曾继续线性化写 NULL 并 free 掉现存队列
+         * （本批 OOM 注入钉子暴露的落空分支） */
+        return;
     }
     /* 将环形缓冲区重新线性化到新存储区 */
     for (size_t i = 0; i < g_len; i++) {

@@ -24,6 +24,7 @@
 
 #include "rt_timer.h"
 #include "../common/zan_abi.h"
+#include "rt_oom.h"  /* B-ID98 站点化 OOM 注入 */
 
 #ifdef _WIN32
 #include <windows.h>
@@ -946,7 +947,8 @@ void zan_monitor_enter(void *obj) {
     }
 
     if (!sb) {
-        sb = (zan_sync_block_t *)malloc(sizeof(zan_sync_block_t));
+        sb = (zan_sync_block_t *)ZAN_OOM_MALLOC("sync.monitor_block",
+                                                sizeof(zan_sync_block_t));
         if (!sb) {
 #ifdef _WIN32
             LeaveCriticalSection(&bucket->bucket_cs);
