@@ -439,6 +439,7 @@ Without MCP the same index is a file: `knowledge/symbols.json` next to the SDK
   `void Register<T>(...)` 里把 `fromJson(argsJson)` 写进 lambda 再赋给
   Func<string, R>` 能正常工作（`T` 在闭包里可用）。这条让"泛型强类型 +
   显式序列化委托"这种没有反射也能做的设计成立。
+* **`Directory.GetFiles` 返回完整路径（C# 口径，实证 2026-11-02）**：磁盘项拼 ReadPath 解析目录、内嵌项拼原始 path；裸文件名用 `Directory.GetFileNames`（承接旧裸名契约，内嵌枚举同语义）。注意 `GetDirectories` 仍是裸目录名（既有调用面大，迁移另行安排），完整目录路径用 `GetDirectoryPaths`。曾按裸名实现是 C# 移植陷阱，已迁 48 站点（27 处拼接裸名改 GetFileNames，叶子提取/计数类保持 GetFiles 自动升级）。
 * **`File.AppendAllText` 不加 BOM**（实证，2026-10-29）：追加的内容原样写入，
   换行按传入的字符串来（自己带 `\n`），不会替你补 BOM 或转成 CRLF。
   读回来用 `File.ReadAllText` / `ReadAllLines`。
