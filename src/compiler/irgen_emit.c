@@ -2838,8 +2838,10 @@ zan_status_t zan_irgen_emit(zan_irgen_t *g, zan_ast_node_t *unit) {
                     if (!is_refl_root && g->site_syms) {
                         for (int k = 0; k < g->leak_site_count; k++) {
                             if (g->site_syms[k] == owner) {
-                                is_refl_root = true;
-                                break;
+                                if (!g->publish_mode || refl_type_needs_site_meta(g, owner)) {
+                                    is_refl_root = true;
+                                    break;
+                                }
                             }
                         }
                     }
@@ -2967,8 +2969,10 @@ done:
                     if (!is_refl_root && g->site_syms) {
                         for (int m = 0; m < g->leak_site_count; m++) {
                             if (g->site_syms[m] == tsym) {
-                                is_refl_root = true;
-                                break;
+                                if (!g->publish_mode || refl_type_needs_site_meta(g, tsym)) {
+                                    is_refl_root = true;
+                                    break;
+                                }
                             }
                         }
                     }

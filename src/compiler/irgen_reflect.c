@@ -335,6 +335,18 @@ static LLVMValueRef refl_emit_fields_class(zan_irgen_t *g, zan_symbol_t *sym,
         if ((m->kind != SYM_FIELD && m->kind != SYM_PROPERTY) ||
             field_member_is_static(m))
             continue;
+        if (g->publish_mode) {
+            /* 在 publish 模式下：
+             * 私有字段（非 public 且不是属性）既不参与外部反射，也不参与 HTML 数据绑定，
+             * 剥离其反射元数据记录，避免级联展开庞大的字段类型元数据树 */
+            uint32_t mods = m->modifiers;
+            if (m->decl && m->decl->kind == AST_FIELD_DECL)
+                mods |= m->decl->field_decl.modifiers;
+            if (m->kind == SYM_FIELD && !(mods & MOD_PUBLIC)) {
+                slot++;
+                continue;
+            }
+        }
         LLVMValueRef off;
         if (entry && entry->explicit_layout && entry->field_offsets &&
             slot < entry->field_count)
@@ -449,13 +461,33 @@ static int refl_accessor_flag(zan_symbol_t *sym, zan_symbol_t *msym) {
     return 0;
 }
 
-static int refl_collect_methods(zan_symbol_t *sym, zan_symbol_t **out, int cap) {
+static bool refl_method_should_export(zan_irgen_t *g, zan_symbol_t *sym, zan_symbol_t *m) {
+    if (!m || m->kind != SYM_METHOD || !m->decl || m->decl->kind != AST_METHOD_DECL)
+        return false;
+    if (!g->publish_mode)
+        return true;
+    /* publish 模式下：
+     * 1. 属性访问器（get_/set_）必须保留，支持运行期动态数据绑定
+     * 2. 带有显式特性注解（attributes）的方法保留
+     * 3. 必须是公开方法；私有/内部方法在发布期绝对不暴露反射
+     */
+    if (refl_accessor_flag(sym, m) != 0)
+        return true;
+    zan_ast_list_t *attrs = zan_ast_attributes(m->decl);
+    if (attrs && attrs->count > 0)
+        return true;
+    uint32_t mods = m->modifiers | m->decl->method_decl.modifiers;
+    if (!(mods & MOD_PUBLIC))
+        return false;
+    return true;
+}
+
+static int refl_collect_methods(zan_irgen_t *g, zan_symbol_t *sym, zan_symbol_t **out, int cap) {
     int n = 0;
     if (!sym) return 0;
     for (int i = 0; i < sym->member_count && n < cap; i++) {
         zan_symbol_t *m = sym->members[i];
-        if (!m || m->kind != SYM_METHOD || !m->decl ||
-            m->decl->kind != AST_METHOD_DECL)
+        if (!refl_method_should_export(g, sym, m))
             continue;
         out[n++] = m;
     }
@@ -625,12 +657,20 @@ static LLVMValueRef refl_method_record(zan_irgen_t *g, zan_symbol_t *sym,
     flags |= refl_accessor_flag(sym, msym);
     LLVMValueRef thunk = LLVMConstNull(i8ptr);
     if (late) {
-        int fi = irgen_find_function(g, msym);
-        if (fi >= 0) {
-            LLVMValueRef t = refl_make_thunk(g, g->functions[fi].fn,
-                                             g->functions[fi].fn_type,
-                                             is_static, "m");
-            if (t) thunk = t;
+        /* 在 publish 模式下，仅为属性访问器（get_/set_）或带注解方法生成 thunk，
+         * 避免为所有普通方法生成包装桩强行锚定死代码，让链接器 --gc-sections 正常工作 */
+        zan_ast_list_t *attrs = zan_ast_attributes(decl);
+        bool need_thunk = !g->publish_mode ||
+                          (flags & (ZAN_REFL_MF_PROPGET | ZAN_REFL_MF_PROPSET)) != 0 ||
+                          (attrs && attrs->count > 0);
+        if (need_thunk) {
+            int fi = irgen_find_function(g, msym);
+            if (fi >= 0) {
+                LLVMValueRef t = refl_make_thunk(g, g->functions[fi].fn,
+                                                 g->functions[fi].fn_type,
+                                                 is_static, "m");
+                if (t) thunk = t;
+            }
         }
     }
     char mattrbuf[512];
@@ -787,7 +827,7 @@ static LLVMValueRef refl_mtab_init(zan_irgen_t *g, zan_symbol_t *sym,
     } else {
         zan_symbol_t **msyms = (zan_symbol_t **)calloc((size_t)n,
                                                     sizeof(zan_symbol_t *));
-        int got = msyms ? refl_collect_methods(sym, msyms, n) : 0;
+        int got = msyms ? refl_collect_methods(g, sym, msyms, n) : 0;
         for (int i = 0; i < n; i++)
             recs[i] = i < got ? refl_method_record(g, sym, msyms[i], late)
                               : LLVMConstNull(mrec);
@@ -816,8 +856,7 @@ static LLVMValueRef refl_shape_mtab(zan_irgen_t *g, zan_symbol_t *sym,
     } else {
         for (int i = 0; i < sym->member_count; i++) {
             zan_symbol_t *m = sym->members[i];
-            if (m && m->kind == SYM_METHOD && m->decl &&
-                m->decl->kind == AST_METHOD_DECL)
+            if (refl_method_should_export(g, sym, m))
                 n++;
         }
     }
@@ -3079,6 +3118,27 @@ static void emit_site_meta_table(zan_irgen_t *g) {
     free(elems);
 }
 
+static bool refl_type_needs_site_meta(zan_irgen_t *g, zan_symbol_t *sym) {
+    if (!g->publish_mode) return true;
+    if (!sym || !sym->type) return false;
+    /* 1. 带注解特性的类型必须保留 */
+    zan_ast_list_t *attrs = sym->decl ? zan_ast_attributes(sym->decl) : NULL;
+    if (attrs && attrs->count > 0) return true;
+    /* 2. 具备虚方法表的多态类型必须保留（如 Control 控件家族） */
+    if (class_has_virtual_methods(sym)) return true;
+    /* 3. 继承自非 object 复杂基类的派生类必须保留 */
+    if (sym->type->base_type && sym->type->base_type->sym) {
+        zan_symbol_t *bsym = sym->type->base_type->sym;
+        bool is_obj = (bsym->name.len == 6 &&
+                       (memcmp(bsym->name.str, "object", 6) == 0 ||
+                        memcmp(bsym->name.str, "Object", 6) == 0));
+        if (!is_obj) return true;
+    }
+    /* 4. 实现了接口的类型必须保留 */
+    if (sym->type->interface_count > 0) return true;
+    return false;
+}
+
 void zan_irgen_emit_arc_desc_init(zan_irgen_t *g) {
     if (!g->desc_hdr || !g->desc_gv) return;
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
@@ -3157,7 +3217,7 @@ void zan_irgen_emit_arc_desc_init(zan_irgen_t *g) {
                                         LLVMConstInt(i64, 0, 0) };
                 tynames = LLVMBuildGEP2(g->builder, at, gv, idxs, 2, "tn.ptr");
             }
-            if (g->refl_used && sym->type) {
+            if (g->refl_used && sym->type && refl_type_needs_site_meta(g, sym)) {
                 zan_type_t *t = (g->site_inst && g->site_inst[i])
                     ? g->site_inst[i] : sym->type;
                 meta = refl_meta_for(g, t, NULL, 0);
