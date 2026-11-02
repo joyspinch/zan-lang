@@ -895,6 +895,12 @@ static LLVMValueRef emit_binary_op_values(zan_irgen_t *g, zan_ast_node_t *expr,
                     unsafe = LLVMBuildOr(g->builder, unsafe,
                         LLVMBuildAnd(g->builder, is_min, is_m1, "divovf"),
                         "divunsafe");
+                    if (want_overflow_check) {
+                        /* checked 下 MIN / -1 抛溢出（B-ID76；零除另有诊断） */
+                        emit_runtime_check(g,
+                            LLVMBuildAnd(g->builder, is_min, is_m1, "divovf.ck"),
+                            expr->loc, "integer overflow in checked operation");
+                    }
                 }
                 LLVMValueRef divisor = LLVMBuildSelect(g->builder, unsafe,
                     one, right, "divz.safe");
@@ -1419,6 +1425,23 @@ static LLVMValueRef emit_expr_unary(zan_irgen_t *g, zan_ast_node_t *expr,
             if (LLVMGetTypeKind(t) == LLVMDoubleTypeKind ||
                 LLVMGetTypeKind(t) == LLVMFloatTypeKind) {
                 return LLVMBuildFNeg(g->builder, operand, "neg");
+            }
+            if (g->irgen_checked_depth > 0 &&
+                LLVMGetTypeKind(t) == LLVMIntegerTypeKind &&
+                LLVMGetIntTypeWidth(t) > 1 &&
+                !expr_is_uint(g, expr->unary.operand, locals) &&
+                !expr_is_ulong(g, expr->unary.operand, locals)) {
+                /* checked 下 -MIN 溢出陷阱（B-ID76）；int 值可能以 i64 承载，
+                 * 按静态类型取 MIN。 */
+                unsigned w = LLVMGetIntTypeWidth(t);
+                long long minv = (w > 32 && expr_is_int32(g, expr->unary.operand, locals))
+                    ? -2147483647LL - 1
+                    : (long long)(1ULL << (w - 1)) * -1;
+                if (w >= 64) minv = (long long)(1ULL << 63);
+                LLVMValueRef smin = LLVMConstInt(t, (unsigned long long)minv, 1);
+                LLVMValueRef ovf = zan_icmp(g->builder, LLVMIntEQ, operand, smin, "ck.neg.ovf");
+                emit_runtime_check(g, ovf, expr->loc,
+                    "integer overflow in checked operation");
             }
             return LLVMBuildNeg(g->builder, operand, "neg");
         }
@@ -3376,6 +3399,17 @@ static LLVMValueRef emit_incdec_expr(zan_irgen_t *g, zan_ast_node_t *expr,
             new_val = (expr->unary.op == TK_PLUS_PLUS)
                 ? zan_add(g->builder, old_val, one, "inc")
                 : zan_sub(g->builder, old_val, one, "dec");
+            if (g->irgen_checked_depth > 0 && LLVMGetIntTypeWidth(pty) > 1) {
+                bool uns = expr_is_uint(g, operand, locals) ||
+                           expr_is_ulong(g, operand, locals);
+                LLVMValueRef ovf = (expr->unary.op == TK_PLUS_PLUS)
+                    ? zan_icmp(g->builder, uns ? LLVMIntULT : LLVMIntSLT,
+                               new_val, old_val, "ck.inc.ovf")
+                    : zan_icmp(g->builder, uns ? LLVMIntUGT : LLVMIntSGT,
+                               new_val, old_val, "ck.dec.ovf");
+                emit_runtime_check(g, ovf, expr->loc,
+                    "integer overflow in checked operation");
+            }
         }
         emit_property_setter_call(g, prop_setter, prop_recv_type, prop_recv,
             new_val, operand, expr->unary.operand, locals);
@@ -3423,6 +3457,18 @@ static LLVMValueRef emit_incdec_expr(zan_irgen_t *g, zan_ast_node_t *expr,
         new_val = (expr->unary.op == TK_PLUS_PLUS)
             ? zan_add(g->builder, old_val, one, "inc")
             : zan_sub(g->builder, old_val, one, "dec");
+        if (g->irgen_checked_depth > 0 && LLVMGetIntTypeWidth(slot_ty) > 1) {
+            /* checked 下 ++/-- 回绕陷阱（B-ID76）：加一变小 / 减一变大即溢出 */
+            bool uns = expr_is_uint(g, operand, locals) ||
+                       expr_is_ulong(g, operand, locals);
+            LLVMValueRef ovf = (expr->unary.op == TK_PLUS_PLUS)
+                ? zan_icmp(g->builder, uns ? LLVMIntULT : LLVMIntSLT,
+                           new_val, old_val, "ck.inc.ovf")
+                : zan_icmp(g->builder, uns ? LLVMIntUGT : LLVMIntSGT,
+                           new_val, old_val, "ck.dec.ovf");
+            emit_runtime_check(g, ovf, expr->loc,
+                "integer overflow in checked operation");
+        }
     }
     LLVMBasicBlockRef inc_do = NULL, inc_end = NULL;
     if (slot_oob) emit_oob_store_split(g, slot_oob, &inc_do, &inc_end);
