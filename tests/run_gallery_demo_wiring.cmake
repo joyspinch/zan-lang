@@ -28,7 +28,7 @@ if(NOT DEFINED ROOT)
   message(FATAL_ERROR "ROOT not set")
 endif()
 
-set(_src "${ROOT}/examples/gui_gallery/gui_gallery.zan")
+set(_src "${ROOT}/examples/gui_gallery/Gallery.zan")
 if(NOT EXISTS "${_src}")
   message(FATAL_ERROR "missing ${_src}")
 endif()
