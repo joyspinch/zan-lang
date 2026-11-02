@@ -1,4 +1,28 @@
 /* irgen_call_builtins.c - 语言内置原语、数学、字符串、IO 与系统调用求值拦截 */
+
+/* 按**目标**平台选 TLS errno 取址函数并清零，返回 errno 槽位指针。
+ * Windows 宿主交叉编 macOS 时 IR 名 `_errno` 会被 Mach-O 再加前导下划线，
+ * 而 libSystem 导出的 C 符号是 `__error`——链接期才炸，且炸在离病灶最远的
+ * 调用点上。分支次序对齐 Socket.zan 的 DllImport 守卫（ANDROID 也定义
+ * LINUX，安卓分支必须在前）。strtoll 溢出的唯一可靠信号是 errno=ERANGE：
+ * 返回值分不清「输入恰好是极值」与「饱和」。 */
+static LLVMValueRef emit_errno_preset(zan_irgen_t *g, LLVMTypeRef i32t) {
+    LLVMTypeRef errno_ty = LLVMFunctionType(LLVMPointerType(i32t, 0), NULL, 0, 0);
+    const char *errno_sym = "__errno_location";
+    if (strstr(g->target_triple, "android") || strstr(g->target_triple, "ohos")) {
+        errno_sym = "__errno";
+    } else if (g->target_is_macos || g->target_is_ios) {
+        errno_sym = "__error";
+    } else if (g->target_is_windows) {
+        errno_sym = "_errno";
+    }
+    LLVMValueRef errno_fn = get_libc_fn(g, errno_sym, errno_ty);
+    LLVMValueRef errnop = zan_call2(g->builder, errno_ty, errno_fn, NULL, 0,
+                                    "parse.errnop");
+    LLVMBuildStore(g->builder, LLVMConstInt(i32t, 0, 0), errnop);
+    return errnop;
+}
+
 static LLVMValueRef emit_builtin_call_intercept(zan_irgen_t *g, zan_ast_node_t *expr,
                                                 local_scope_t *locals, bool *matched) {
     if (matched) *matched = true;
@@ -1167,28 +1191,48 @@ static LLVMValueRef emit_builtin_call_intercept(zan_irgen_t *g, zan_ast_node_t *
                 }
                 LLVMValueRef r;
                 if (int_recv) {
+                    int is64 = (rn.len == 4 && memcmp(rn.str, "long", 4) == 0) ||
+                               (rn.len == 5 && memcmp(rn.str, "Int64", 5) == 0);
                     LLVMTypeRef strtoll_ty = LLVMFunctionType(i64,
                         (LLVMTypeRef[]){ i8ptr, i8pp, i32t }, 3, 0);
                     LLVMValueRef f = get_libc_fn(g, "strtoll", strtoll_ty);
                     LLVMValueRef endp = emit_entry_alloca(g, i8ptr, "parse.endp");
                     LLVMBuildStore(g->builder, LLVMConstNull(i8ptr), endp);
                     LLVMValueRef s_safe = emit_parse_str_guard(g, s, expr->loc);
+                    LLVMValueRef errnop = emit_errno_preset(g, i32t);
                     r = zan_call2(g->builder, strtoll_ty, f,
                         (LLVMValueRef[]){ s_safe, endp,
                                           LLVMConstInt(i32t, 10, 0) }, 3, "parse");
                     LLVMValueRef ep = LLVMBuildLoad2(g->builder, i8ptr, endp, "parse.ep");
+                    /* C# 语义两路分流：格式错 → FormatException，数值越界 →
+                     * OverflowException。曾共用一条带 "(or out of range)" 的
+                     * 消息，被关键词匹配整体误判成 IndexOutOfRange。两条检查
+                     * 顺序发射：try 内第一条命中即抛不走第二条；try 外软诊断
+                     * 各报各的，最后统一 select 归零。 */
                     LLVMValueRef bad = emit_parse_bad_pred(g, s_safe, ep);
-                    /* C# int.Parse 超出 int 范围抛 OverflowException：
-                     * strtoll 会静默吃下 64 位值，这里同样判坏。 */
-                    LLVMValueRef over = LLVMBuildOr(g->builder,
-                        zan_icmp(g->builder, LLVMIntSLT, r,
-                            LLVMConstInt(i64, (int64_t)INT32_MIN, 0), "parse.lo"),
-                        zan_icmp(g->builder, LLVMIntSGT, r,
-                            LLVMConstInt(i64, INT32_MAX, 0), "parse.hi"),
-                        "parse.over");
-                    bad = LLVMBuildOr(g->builder, bad, over, "parse.bad2");
                     emit_runtime_check(g, bad, expr->loc,
-                        "int.Parse: input is not a valid integer (or out of range)");
+                        "int.Parse: input is not a valid integer");
+                    /* strtoll 饱和返回 LLONG_MIN/MAX 并置 errno=ERANGE——返回
+                     * 值分不清「恰好极值」与「饱和」，long.Parse 的全宽范围
+                     * 只有 ERANGE 抓得住（曾按 INT32 边界判，把合法的
+                     * long.Parse("9223372036854775807") 误杀）。i32 档再补中段
+                     * 越界：3000000000 吃进 64 位不置 ERANGE，但超出 int 范围
+                     * 要按 C# 抛 Overflow。 */
+                    LLVMValueRef er = LLVMBuildLoad2(g->builder, i32t, errnop,
+                        "parse.errno");
+                    LLVMValueRef over = zan_icmp(g->builder, LLVMIntEQ, er,
+                        LLVMConstInt(i32t, 34, 0), "parse.erange");
+                    if (!is64) {
+                        over = LLVMBuildOr(g->builder, over, LLVMBuildOr(g->builder,
+                            zan_icmp(g->builder, LLVMIntSLT, r,
+                                LLVMConstInt(i64, (int64_t)INT32_MIN, 0), "parse.lo"),
+                            zan_icmp(g->builder, LLVMIntSGT, r,
+                                LLVMConstInt(i64, INT32_MAX, 0), "parse.hi"),
+                            "parse.over32"), "parse.over");
+                    }
+                    emit_runtime_check(g, over, expr->loc,
+                        "int.Parse: value is outside the range of the target type");
+                    bad = LLVMBuildOr(g->builder, bad, over, "parse.bad2");
                     r = LLVMBuildSelect(g->builder, bad,
                         LLVMConstInt(i64, 0, 0), r, "parse.safe");
                 } else {
@@ -1207,7 +1251,7 @@ static LLVMValueRef emit_builtin_call_intercept(zan_irgen_t *g, zan_ast_node_t *
                      * 起点走零消费判坏——"Infinity" 特殊拼写是合法 INF 回读，
                      * 不能按值判 INF 当溢出杀（曾误杀致 case_double_format 红）。 */
                     emit_runtime_check(g, bad, expr->loc,
-                        "double.Parse: input is not a valid number (or out of range)");
+                        "double.Parse: input is not a valid number");
                     r = LLVMBuildSelect(g->builder, bad,
                         LLVMConstReal(dbl, 0.0), r, "parse.safe");
                 }
@@ -1231,7 +1275,21 @@ static LLVMValueRef emit_builtin_call_intercept(zan_irgen_t *g, zan_ast_node_t *
                                   (int)rn.len, rn.str);
                     return LLVMConstInt(LLVMInt1TypeInContext(g->ctx), 0, 0);
                 }
-                LLVMValueRef outp = emit_expr(g, expr->call.args.items[1], locals);
+                /* out 实参取槽位地址而非值：AST_REF_ARG 由 emit_ref_arg 直接
+                 * 给地址，裸标识符查局部槽 alloca。曾按值 emit_expr——类型
+                 * 非指针被下方守卫静默跳过写入，out 变量永远不更新
+                 * （int.TryParse("123", out okv) 的 okv 原值原样保留）。 */
+                zan_ast_node_t *out_arg = expr->call.args.items[1];
+                LLVMValueRef outp = NULL;
+                zan_type_t *out_ty = NULL;
+                if (out_arg->kind == AST_REF_ARG) {
+                    outp = emit_expr(g, out_arg, locals);
+                    if (out_arg->ref_arg.expr)
+                        out_ty = infer_expr_type(g, out_arg->ref_arg.expr, locals);
+                } else if (out_arg->kind == AST_IDENTIFIER) {
+                    local_var_t *ol = local_find(locals, out_arg->ident.name);
+                    if (ol) { outp = ol->alloca; out_ty = ol->type; }
+                }
                 LLVMValueRef endp = emit_entry_alloca(g, i8ptr, "endp");
                 LLVMBuildStore(g->builder, LLVMConstNull(i8ptr), endp);
                 LLVMValueRef v;
@@ -1257,8 +1315,15 @@ static LLVMValueRef emit_builtin_call_intercept(zan_irgen_t *g, zan_ast_node_t *
                 LLVMValueRef ok = zan_and(g->builder, moved, at_end, "ok");
                 LLVMValueRef stored = LLVMBuildSelect(g->builder, ok, v,
                     int_recv ? LLVMConstInt(i64, 0, 0) : (LLVMValueRef)LLVMConstReal(dbl, 0.0), "tpv");
-                if (LLVMGetTypeKind(LLVMTypeOf(outp)) == LLVMPointerTypeKind)
-                    LLVMBuildStore(g->builder, stored, outp);
+                if (outp) {
+                    if (out_ty) {
+                        /* 槽位宽度和值宽度不一致（如 int 槽收 i64 解析值）按
+                         * 类型收窄，与 Dict.TryGetValue 同一套 out 落槽机制。 */
+                        emit_typed_out_store(g, out_ty, outp, stored);
+                    } else if (LLVMGetTypeKind(LLVMTypeOf(outp)) == LLVMPointerTypeKind) {
+                        LLVMBuildStore(g->builder, stored, outp);
+                    }
+                }
                 emit_release_owned_call_temp(g, expr->call.args.items[0], s, locals);
                 return ok;
             }
@@ -1434,56 +1499,37 @@ static LLVMValueRef emit_builtin_call_intercept(zan_irgen_t *g, zan_ast_node_t *
                              * （ToInt64("99999999999999999999") 曾静默钳成
                              * INT64_MAX，C# 语义是 OverflowException）。
                              * 先清零 errno，调用后读回比对 34（ERANGE）。 */
-                            LLVMTypeRef errno_ty = LLVMFunctionType(
-                                LLVMPointerType(i32t, 0), NULL, 0, 0);
-                            /* 按**目标**平台选 TLS errno 取址函数，不是按宿主
-                             * #if：Windows 宿主交叉编 macOS 时 IR 名 `_errno`
-                             * 会被 Mach-O 再加前导下划线成 `__errno`，而
-                             * libSystem 导出的 C 符号是 `__error`——链接期才
-                             * 炸，且炸在离病灶最远的 Convert.ToInt 调用点上。
-                             * 分支次序对齐 Socket.zan 的 DllImport 守卫
-                             * （ANDROID 也定义 LINUX，安卓分支必须在前）。 */
-                            const char *errno_sym = "__errno_location";
-                            if (strstr(g->target_triple, "android") ||
-                                strstr(g->target_triple, "ohos")) {
-                                errno_sym = "__errno";
-                            } else if (g->target_is_macos || g->target_is_ios) {
-                                errno_sym = "__error";
-                            } else if (g->target_is_windows) {
-                                errno_sym = "_errno";
-                            }
-                            LLVMValueRef errno_fn = get_libc_fn(g, errno_sym, errno_ty);
-                            LLVMValueRef errnop = zan_call2(g->builder, errno_ty,
-                                errno_fn, NULL, 0, "toint.errnop");
-                            LLVMBuildStore(g->builder, LLVMConstInt(i32t, 0, 0),
-                                errnop);
+                            LLVMValueRef errnop = emit_errno_preset(g, i32t);
                             parsed = zan_call2(g->builder, strtoll_ty, f,
                                 (LLVMValueRef[]){ s_safe, endp,
                                                   LLVMConstInt(i32t, 10, 0) }, 3, "toint");
                             LLVMValueRef ep = LLVMBuildLoad2(g->builder, i8ptr,
                                 endp, "toint.ep");
+                            /* 与 int.Parse 同口径两路分流：格式错 →
+                             * FormatException，越界（范围谓词 / ERANGE 兜底）→
+                             * OverflowException。 */
                             LLVMValueRef bad = emit_parse_bad_pred(g, s_safe, ep);
+                            emit_runtime_check(g, bad, expr->loc,
+                                "Convert.ToInt*: input is not a valid integer");
+                            LLVMValueRef er = LLVMBuildLoad2(g->builder, i32t,
+                                errnop, "toint.errno");
+                            LLVMValueRef over = zan_icmp(g->builder, LLVMIntEQ, er,
+                                LLVMConstInt(i32t, 34, 0), "toint.erange");
                             if (method_name.str[6] != '4') {
-                                /* ToInt32/ToInt：C# 超出 int 范围抛 OverflowException */
-                                bad = LLVMBuildOr(g->builder, bad, LLVMBuildOr(
+                                /* ToInt32/ToInt：ERANGE 抓不到的中段越界
+                                 * （3000000000 吃进 64 位不置 ERANGE），C# 抛
+                                 * Overflow。 */
+                                over = LLVMBuildOr(g->builder, over, LLVMBuildOr(
                                     g->builder,
                                     zan_icmp(g->builder, LLVMIntSLT, parsed,
                                         LLVMConstInt(i64t, (int64_t)INT32_MIN, 0), "toint.lo"),
                                     zan_icmp(g->builder, LLVMIntSGT, parsed,
                                         LLVMConstInt(i64t, INT32_MAX, 0), "toint.hi"),
-                                    "toint.over"), "toint.bad2");
+                                    "toint.over32"), "toint.over");
                             }
-                            /* ERANGE 兜底：两档共用（i32 越界必然先饱和到
-                             * i64 边缘再置 ERANGE，与上面的范围谓词等价；
-                             * i64 档只有它能抓到）。 */
-                            LLVMValueRef er = LLVMBuildLoad2(g->builder, i32t,
-                                errnop, "toint.errno");
-                            bad = LLVMBuildOr(g->builder, bad,
-                                zan_icmp(g->builder, LLVMIntEQ, er,
-                                    LLVMConstInt(i32t, 34, 0), "toint.erange"),
-                                "toint.bad3");
-                            emit_runtime_check(g, bad, expr->loc,
-                                "Convert.ToInt*: input is not a valid integer (or out of range)");
+                            emit_runtime_check(g, over, expr->loc,
+                                "Convert.ToInt*: value is outside the range of the target type");
+                            bad = LLVMBuildOr(g->builder, bad, over, "toint.bad2");
                             parsed = LLVMBuildSelect(g->builder, bad,
                                 LLVMConstInt(i64t, 0, 0), parsed, "toint.safe");
                         } else if (ak == LLVMDoubleTypeKind || ak == LLVMFloatTypeKind) {

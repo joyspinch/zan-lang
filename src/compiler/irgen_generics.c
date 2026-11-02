@@ -1440,6 +1440,13 @@ static zan_symbol_t *infer_guard_exception_sym(zan_irgen_t *g, const char *msg) 
     zan_symbol_t *sym = NULL;
     if (strstr(msg, "division by zero")) {
         sym = lookup_sys_class(g, "DivideByZeroException", "System.DivideByZeroException");
+    } else if (strstr(msg, "not a valid")) {
+        /* 解析失败（int.Parse / Convert.ToInt* 等的 "input is not a valid
+         * ..."）。必须放在 "range" 分支之前：旧解析文案带 "(or out of
+         * range)" 尾巴，曾被 "range" 子串整体误判成 IndexOutOfRange。 */
+        sym = lookup_sys_class(g, "FormatException", "System.FormatException");
+    } else if (strstr(msg, "outside the range")) {
+        sym = lookup_sys_class(g, "OverflowException", "System.OverflowException");
     } else if (strstr(msg, "out of bounds") || strstr(msg, "index") || strstr(msg, "range")) {
         sym = lookup_sys_class(g, "IndexOutOfRangeException", "System.IndexOutOfRangeException");
     } else if (strstr(msg, "null reference")) {

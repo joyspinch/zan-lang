@@ -310,6 +310,11 @@ Without MCP the same index is a file: `knowledge/symbols.json` next to the SDK
   InvalidOperationException；ConcurrentQueue 走 ToArray 快照（迭代中并发入队不影响
   本次迭代）。顺序口径：Stack 顶→底、LinkedList 头→尾、HashSet 按插入序。
   foreach 不调用枚举器的 Dispose，无需手动释放。
+  foreach 不调用枚举器的 Dispose，无需手动释放。
+* **解析失败异常类型对齐 C#**（实证，2026-11-02）：try 内 int.Parse("abc") 抛
+  FormatException、超界（99999999999）抛 OverflowException，long.Parse 接受全宽
+  值（3000000000、MaxValue）——此前一律误判成 IndexOutOfRangeException。
+  int.TryParse("s", out v) 的 out 已按预期写入（曾静默不写，调用方拿原值）。
 * **空安全是编译期硬检查**（实证，2026-10-22）：`JsonValue.Get(key)`、
   `List.First()` 等标为"可返回 null"的调用，其结果**直接取成员**会被编译器
   拦下（"'Get' can return null; accessing 'IsArray' on its result faults at

@@ -724,6 +724,23 @@ b.weakF` 每执行一次泄漏一个对象，stdlib `LinkedList.Remove` 的
 `cur.next.prev = cur.prev` 曾因此让未 Clear 的链表整条释放不掉。二分时先区分
 "弱读做接收者"（不泄漏）与"弱读做右值"（泄漏）——钉子用例
 `tests/conformance/weak_store_owned_rhs.zan`。
+`tests/conformance/weak_store_owned_rhs.zan`。
+
+**guard 异常关键词分流次序与 out 实参落槽**（实证，2026-11-02）：
+- `infer_guard_exception_sym` 按消息子串分流，次序敏感：division by zero →
+  "not a valid"（→FormatException）→ "outside the range"（→Overflow）→
+  "out of bounds"/"index"/"range"（→IndexOutOfRange）。新增 guard 消息先查子串
+  污染——解析消息曾带 "(or out of range)" 尾巴，被 "range" 分支整体吃进
+  IndexOutOfRange。int.Parse/Convert.ToInt* 的格式错与越界必须两条
+  emit_runtime_check 分开发射才能分流成两种异常。
+- out 实参取**槽位地址**不是值：AST_REF_ARG 走 `emit_ref_arg` 直接返回地址
+  （内联 `out int v` 声明在该函数里建 alloca），裸标识符查 `local_find` 的
+  alloca + `ol->type`，落槽统一走 `emit_typed_out_store`（处理整型宽度换算与
+  ARC 旧值释放）。`emit_expr` 对标识符返回的是加载后的值，指针守卫静默跳写——
+  int.TryParse 的 out 曾永不更新就是这一坑。
+- long.Parse 全宽越界只能靠 strtoll 饱和置的 errno=ERANGE 判（`emit_errno_preset`
+  按**目标** triple 选 TLS errno 地址），按 INT32 边界判会误杀合法值
+  （3000000000、MaxValue 曾被拒）。
 
 
 ---
