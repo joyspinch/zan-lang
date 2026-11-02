@@ -358,6 +358,23 @@ static LLVMValueRef emit_decimal_binary(zan_irgen_t *g, zan_ast_node_t *expr,
     }
 
     if (op_fn) {
+        if (expr->binary.op == TK_SLASH || expr->binary.op == TK_PERCENT) {
+            /* decimal 零除与整数路径同口径：抛 DivideByZeroException，
+             * 不再由运行时静默退化为 0（B-ID84）。 */
+            LLVMTypeRef i32_ty = LLVMInt32TypeInContext(g->ctx);
+            LLVMValueRef zslot = emit_entry_alloca(g, dec_ty, "dec.zero");
+            LLVMBuildStore(g->builder, LLVMConstNull(dec_ty), zslot);
+            LLVMTypeRef cmp_fn_ty = LLVMFunctionType(i32_ty,
+                (LLVMTypeRef[]){ ptr_ty, ptr_ty }, 2, 0);
+            LLVMValueRef cmp_fn = get_libc_fn(g, "__zan_decimal_cmp", cmp_fn_ty);
+            LLVMValueRef cmp_z = zan_call2(g->builder, cmp_fn_ty, cmp_fn,
+                (LLVMValueRef[]){ rslot, zslot }, 2, "dec.divz.cmp");
+            LLVMValueRef is_zero = zan_icmp(g->builder, LLVMIntEQ, cmp_z,
+                LLVMConstInt(i32_ty, 0, 0), "dec.divz");
+            emit_runtime_check(g, is_zero, expr->loc,
+                expr->binary.op == TK_SLASH ? "division by zero"
+                                            : "division by zero (modulo)");
+        }
         LLVMValueRef res_slot = emit_entry_alloca(g, dec_ty, "dec.res");
         LLVMTypeRef fn_ty = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx),
             (LLVMTypeRef[]){ ptr_ty, ptr_ty, ptr_ty }, 3, 0);

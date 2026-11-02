@@ -33,7 +33,7 @@
 - [ ] B-ID81 只读与不可变集合契约健全（IReadOnlyList / ReadOnlySpan 等）：标准库集合缺乏只读抽象约束，实体向外暴露内部集合时可被随意篡改或并发破坏。需补全 `IReadOnlyCollection<T>`、`IReadOnlyList<T>`、`IReadOnlyDictionary<K, V>` 接口及切片视图；双轨同步。
 - [ ] B-ID82 包管理语义化版本仲裁与钻石依赖求解器（Diamond Dependency Solver）：当前 `.zan-packages/` 仅支持简单扁平安装，当两个依赖库分别引入同一包的不同大版本时缺乏冲突求解能力。需引入类似 PubGrub 的语义化版本依赖解析算法与包隔离机制；双轨保持一致。
 - [ ] B-ID83 模块/包级私有可见性修饰符（internal 访问控制）：语言目前仅有 public/private/protected，缺乏包级内部访问控制，导致驱动与基础设施细节类被迫暴露为 public 被外部深度耦合。需在编译器与符号表中引入 `internal` 模块可见性边界；双轨同步。
-- [ ] B-ID84 高精度十进制（Decimal）除零静默返回 0 与逐位移位性能缺陷：`src/runtime/rt_decimal.c` 中 `u128_divrem` 在除数为 0 时静默返回 0（`100 / 0 = 0`），严重破坏金融与计费业务安全底线，应严格抛出除零异常；且 128 位除法采用 128 次循环逐位移位法，单次除法耗费上千 CPU 周期，需演进为 Knuth 算法 D 多精度快速除法；双轨同步。
+- [ ] B-ID84 高精度十进制（Decimal）128 位除法逐位移位性能缺陷：`src/runtime/rt_decimal.c` 的 `u128_divrem` 采用 128 次循环逐位移位法，单次除法耗费上千 CPU 周期，需演进为 Knuth 算法 D 多精度快速除法；双轨同步。已闭子项：decimal `/`、`%` 零除静默返 0 已改为编译器守卫抛 DivideByZeroException（与 int 同口径，conformance decimal_divide_by_zero）；selfhost 无独立 decimal 二元发射路径，无镜像欠账。
 - [ ] B-ID85 密码学实现缓存时序侧信道攻击风险（SM4 静态 S-Box 查表）：`src/runtime/rt_hw_accel_sm4_tables.h` 采用全局静态 S-Box 表直查实现国密 SM4。非恒定时间查表在多租户/云原生环境下易遭受 Cache-Timing 侧信道攻击还原出加密密钥。需改用比特切片（Bit-sliced）恒定时间位运算或调用硬件加速指令（ARMv8 Crypto / SM4 特性）；双轨保持一致。
 - [ ] B-ID86 协程纯协作式调度引发的线程饥饿（Starvation）与废弃 ucontext 依赖：`src/runtime/rt_sched.c` 缺乏基于时间片或信号的抢占机制（Preemption）。CPU 密集型长循环会永久霸占调度线程，导致挂载在该线程上的所有异步 I/O、Web 请求与定时器永久假死；且 POSIX 下依赖已在 POSIX.1-2008 废弃的 `ucontext.h`（换栈拷贝信号掩码带来巨大开销），需演进为轻量寄存器汇编保存与协作抢占插桩；双轨保持一致。
 - [ ] B-ID87 Unicode 规范化（NFC/NFD）与国际化大小写折叠（Case Folding）缺失：标准库缺乏 Unicode 规范化算法（UAX #15）支持，`string.ToLower/ToUpper/Equals` 仅能处理基本 ASCII 或简单码点映射。欧洲带重音符、德语等在不同输入源下单码点与组合码点无法等价匹配，存在严峻的国际化乱码与鉴权仿冒越权风险；双轨同步。
