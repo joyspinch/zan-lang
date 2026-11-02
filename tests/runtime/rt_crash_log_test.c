@@ -50,10 +50,10 @@ int main(void) {
 
     /* 1) 未超限：不动，追加内容留在原文件里。 */
     if (!write_blob(k_log, 1024)) FAIL("cannot write small log");
-    FILE *f = zan__crash_open_log(k_log);
-    if (!f) FAIL("open failed on small log");
-    fputs("small\n", f);
-    fclose(f);
+    zan__cf_t f = zan__crash_open_log(k_log);
+    if (!f.h) FAIL("open failed on small log");
+    zan__cf_puts(f, "small\n");
+    zan__cf_close(f);
     if (file_size(rotated) >= 0) FAIL("small log must not rotate");
     if (file_size(k_log) != 1024 + 6) FAIL("small log content changed");
 
@@ -62,9 +62,9 @@ int main(void) {
         FAIL("cannot write big log");
     long big = file_size(k_log);
     f = zan__crash_open_log(k_log);
-    if (!f) FAIL("open failed on big log");
-    fputs("after-rotation\n", f);
-    fclose(f);
+    if (!f.h) FAIL("open failed on big log");
+    zan__cf_puts(f, "after-rotation\n");
+    zan__cf_close(f);
     if (file_size(rotated) != big) FAIL("rotated file must keep the old content");
     if (file_size(k_log) != 15) FAIL("current log must start empty after rotation");
 
@@ -73,8 +73,8 @@ int main(void) {
         FAIL("cannot rewrite big log");
     long bigger = file_size(k_log);
     f = zan__crash_open_log(k_log);
-    if (!f) FAIL("open failed on second big log");
-    fclose(f);
+    if (!f.h) FAIL("open failed on second big log");
+    zan__cf_close(f);
     if (file_size(rotated) != bigger)
         FAIL("only one generation is kept: stale .1 was not replaced");
     if (file_size(rotated) == big) FAIL("rotated file was not refreshed");

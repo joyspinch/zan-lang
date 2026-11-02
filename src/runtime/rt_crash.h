@@ -17,7 +17,151 @@ WINBASEAPI ULONGLONG WINAPI GetTickCount64(VOID);
 #include <stdlib.h>
 #include <string.h>
 
-static void zan__crash_modline(FILE *f, void *addr, const char *tag) {
+#include <stdarg.h>
+
+/* ---- B-ID88: 崩溃路径专用无锁 IO ----
+ * fopen/fprintf 持 stdio 流锁、FILE 缓冲区走 CRT 堆锁；崩在持锁状态会把
+ * 报告器自己锁死。这里只走 Win32 HANDLE + 栈缓冲 + 手写格式化器：
+ * 零 CRT 锁、零堆分配（与 POSIX 侧 write(fd) 同一纪律）。 */
+typedef struct zan__cf { HANDLE h; } zan__cf_t;
+static zan__cf_t zan__cf_open_append(const char *path);
+static void zan__cf_close(zan__cf_t f);
+
+static void zan__cf_write(zan__cf_t f, const char *s, size_t n) {
+    while (n) {
+        DWORD w = 0;
+        if (!WriteFile(f.h, s, (DWORD)(n > 0x7ffffff0 ? 0x7ffffff0 : n),
+                       &w, NULL) || w == 0)
+            return; /* 磁盘满等：安全丢弃剩余日志，不重试不崩 */
+        s += w;
+        n -= w;
+    }
+}
+static void zan__cf_puts(zan__cf_t f, const char *s) {
+    zan__cf_write(f, s, strlen(s));
+}
+
+/* 无符号整数按进制从 end 往左写，返回有效起始位置 */
+static const char *zan__cf_dec_r(char *end, unsigned long long v) {
+    do { *--end = (char)('0' + (v % 10)); v /= 10; } while (v);
+    return end;
+}
+static const char *zan__cf_hex_r(char *end, unsigned long long v, int upper) {
+    const char *d = upper ? "0123456789ABCDEF" : "0123456789abcdef";
+    do { *--end = d[v & 15]; v >>= 4; } while (v);
+    return end;
+}
+
+/* 极简 printf 子集：flags -/0、宽度、l/ll、s c d i u x X p %%。
+ * 语义对齐调用点现有用法；%p 输出 16 位大写十六进制（同 CRT）。 */
+static void zan__cf_vfmt(char *out, size_t cap, const char *fmt, va_list ap) {
+    size_t o = 0;
+    for (const char *p = fmt; *p && o < cap - 1; p++) {
+        if (*p != '%') { out[o++] = *p; continue; }
+        p++;
+        if (*p == '%') { out[o++] = '%'; continue; }
+        int ljust = 0, zero = 0;
+        for (;; p++) {
+            if (*p == '-') ljust = 1;
+            else if (*p == '0') zero = 1;
+            else break;
+        }
+        int width = 0;
+        while (*p >= '0' && *p <= '9') width = width * 10 + (*p++ - '0');
+        int lcount = 0;
+        while (*p == 'l') { lcount++; p++; }
+        char num[24];
+        const char *s = NULL;
+        char cbuf[2];
+        unsigned long long uv = 0;
+        int neg = 0;
+        switch (*p) {
+        case 's':
+            s = va_arg(ap, const char *);
+            if (!s) s = "(null)";
+            break;
+        case 'c':
+            cbuf[0] = (char)va_arg(ap, int);
+            cbuf[1] = '\0';
+            s = cbuf;
+            break;
+        case 'd': case 'i': {
+            long long v = lcount >= 2 ? va_arg(ap, long long)
+                        : lcount == 1 ? va_arg(ap, long)
+                                      : va_arg(ap, int);
+            if (v < 0) { neg = 1; uv = (unsigned long long)(-(v + 1)) + 1; }
+            else uv = (unsigned long long)v;
+            s = zan__cf_dec_r(num + sizeof num, uv);
+            break;
+        }
+        case 'u': case 'x': case 'X':
+            uv = lcount >= 2 ? va_arg(ap, unsigned long long)
+               : lcount == 1 ? va_arg(ap, unsigned long)
+                             : va_arg(ap, unsigned int);
+            s = (*p == 'u') ? zan__cf_dec_r(num + sizeof num, uv)
+                            : zan__cf_hex_r(num + sizeof num, uv, *p == 'X');
+            break;
+        case 'p':
+            uv = (unsigned long long)(uintptr_t)va_arg(ap, void *);
+            s = zan__cf_hex_r(num + sizeof num, uv, 1);
+            width = 16;
+            zero = 1;
+            ljust = 0;
+            break;
+        default:
+            out[o++] = '%';
+            if (*p && o < cap - 1) out[o++] = *p;
+            continue;
+        }
+        size_t len = strlen(s);
+        size_t body = len + (size_t)neg;
+        size_t pad = (size_t)width > body ? (size_t)width - body : 0;
+        char pc = (zero && !ljust) ? '0' : ' ';
+        if (!ljust) {
+            if (pc == '0' && neg && o < cap - 1) { out[o++] = '-'; neg = 0; }
+            while (pad-- && o < cap - 1) out[o++] = pc;
+        }
+        if (neg && o < cap - 1) out[o++] = '-';
+        while (*s && o < cap - 1) out[o++] = *s++;
+        if (ljust) while (pad-- && o < cap - 1) out[o++] = ' ';
+    }
+    out[o] = '\0';
+}
+
+static void zan__cf_printf(zan__cf_t f, const char *fmt, ...) {
+    char out[1024];
+    va_list ap;
+    va_start(ap, fmt);
+    zan__cf_vfmt(out, sizeof out, fmt, ap);
+    va_end(ap);
+    zan__cf_puts(f, out);
+}
+
+/* 崩溃路径内的路径/标签拼装也走同一格式化器（绕开 CRT snprintf） */
+static int zan__crash_snprintf(char *buf, size_t cap, const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    zan__cf_vfmt(buf, cap, fmt, ap);
+    va_end(ap);
+    return (int)strlen(buf);
+}
+
+
+/* 追加模式打开崩溃日志；失败返回 h==NULL 的句柄，便于沿用 !f 判空 */
+static zan__cf_t zan__cf_open_append(const char *path) {
+    zan__cf_t f;
+    f.h = CreateFileA(path, FILE_APPEND_DATA,
+                      FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_ALWAYS,
+                      FILE_ATTRIBUTE_NORMAL, NULL);
+    if (f.h == INVALID_HANDLE_VALUE) f.h = NULL;
+    return f;
+}
+static void zan__cf_close(zan__cf_t f) {
+    if (f.h) CloseHandle(f.h);
+}
+
+
+static void zan__crash_modline(zan__cf_t f, void *addr, const char *tag) {
     HMODULE m = NULL;
     char mp[MAX_PATH];
     if (addr &&
@@ -25,10 +169,10 @@ static void zan__crash_modline(FILE *f, void *addr, const char *tag) {
                                GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
                            (LPCSTR)addr, &m) &&
         m && GetModuleFileNameA(m, mp, (DWORD)sizeof mp)) {
-        fprintf(f, "%s%p  %s+0x%llX\n", tag, addr, mp,
+        zan__cf_printf(f, "%s%p  %s+0x%llX\n", tag, addr, mp,
                 (unsigned long long)((char *)addr - (char *)m));
     } else {
-        fprintf(f, "%s%p  <unknown>\n", tag, addr);
+        zan__cf_printf(f, "%s%p  <unknown>\n", tag, addr);
     }
 }
 
@@ -77,13 +221,13 @@ static int zan__crash_in_main(void *addr, uintptr_t exe_base) {
 
 static int zan__crash_find_symbolizer(const char *exe_dir, char *out, size_t outsz) {
     char cand[MAX_PATH];
-    snprintf(cand, sizeof cand, "%saddr2line.exe", exe_dir);
+    zan__crash_snprintf(cand, sizeof cand, "%saddr2line.exe", exe_dir);
     if (GetFileAttributesA(cand) != INVALID_FILE_ATTRIBUTES) {
-        snprintf(out, outsz, "%s", cand); return 1;
+        zan__crash_snprintf(out, outsz, "%s", cand); return 1;
     }
-    snprintf(cand, sizeof cand, "%sllvm-symbolizer.exe", exe_dir);
+    zan__crash_snprintf(cand, sizeof cand, "%sllvm-symbolizer.exe", exe_dir);
     if (GetFileAttributesA(cand) != INVALID_FILE_ATTRIBUTES) {
-        snprintf(out, outsz, "%s", cand); return 2;
+        zan__crash_snprintf(out, outsz, "%s", cand); return 2;
     }
     return 0;
 }
@@ -103,19 +247,43 @@ static int zan__crash_line_is_noise(const char *line) {
 /* 过滤符号化输出噪音行并写入崩溃日志 */
 static int zan__crash_append_filtered(const char *logpath, const char *tmppath,
                                       int keep_all) {
-    FILE *in = fopen(tmppath, "rb");
-    if (!in) return 0;
-    FILE *out = fopen(logpath, "ab");
-    if (!out) { fclose(in); return 0; }
-    char line[1024];
-    int kept = 0;
-    while (fgets(line, (int)sizeof line, in)) {
-        if (!keep_all && zan__crash_line_is_noise(line)) continue;
-        fputs(line, out);
-        kept++;
+    HANDLE in = CreateFileA(tmppath, GENERIC_READ,
+                            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                            NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (in == INVALID_HANDLE_VALUE) return 0;
+    zan__cf_t out = zan__cf_open_append(logpath);
+    if (!out.h) { CloseHandle(in); return 0; }
+    /* ReadFile 分块读 + 行重组，替代 fgets（stdio 流锁） */
+    char chunk[8192];
+    char line[2048];
+    size_t lp = 0;
+    int kept = 0, eof = 0;
+    while (!eof) {
+        DWORD got = 0;
+        if (!ReadFile(in, chunk, (DWORD)sizeof chunk, &got, NULL) || got == 0)
+            eof = 1;
+        for (DWORD i = 0; i < got; i++) {
+            char c = chunk[i];
+            if (lp + 1 < sizeof line) line[lp++] = c;
+            if (c == '\n') {
+                line[lp] = '\0';
+                if (keep_all || !zan__crash_line_is_noise(line)) {
+                    zan__cf_write(out, line, lp);
+                    kept++;
+                }
+                lp = 0;
+            }
+        }
     }
-    fclose(out);
-    fclose(in);
+    if (lp) { /* 末行无换行符 */
+        line[lp] = '\0';
+        if (keep_all || !zan__crash_line_is_noise(line)) {
+            zan__cf_write(out, line, lp);
+            kept++;
+        }
+    }
+    zan__cf_close(out);
+    CloseHandle(in);
     return kept;
 }
 
@@ -139,7 +307,7 @@ static void zan__crash_symbolize(const char *logpath, const char *exe,
         if (zan__crash_in_main(frames[i], exe_base)) seq[nseq++] = frames[i];
     for (int i = 0; i < nseq; i++) {
         uintptr_t vma = image_base + ((uintptr_t)seq[i] - exe_base);
-        int w = snprintf(addrs + ap, sizeof(addrs) - ap, " 0x%llX",
+        int w = zan__crash_snprintf(addrs + ap, sizeof(addrs) - ap, " 0x%llX",
                          (unsigned long long)vma);
         if (w <= 0 || (size_t)w >= sizeof(addrs) - ap) break;
         ap += (size_t)w;
@@ -149,9 +317,9 @@ static void zan__crash_symbolize(const char *logpath, const char *exe,
 
     char cmd[4096];
     if (mode == 1) /* addr2line */
-        snprintf(cmd, sizeof cmd, "\"%s\" -e \"%s\" -f -C -i -p%s", sym, exe, addrs);
+        zan__crash_snprintf(cmd, sizeof cmd, "\"%s\" -e \"%s\" -f -C -i -p%s", sym, exe, addrs);
     else /* llvm-symbolizer */
-        snprintf(cmd, sizeof cmd,
+        zan__crash_snprintf(cmd, sizeof cmd,
                  "\"%s\" --obj=\"%s\" --demangle --functions=linkage --inlines%s",
                  sym, exe, addrs);
 
@@ -167,7 +335,7 @@ static void zan__crash_symbolize(const char *logpath, const char *exe,
         LARGE_INTEGER qpc;
         if (QueryPerformanceCounter(&qpc))
             salt ^= (unsigned long long)qpc.QuadPart << 19;
-        snprintf(tmppath, sizeof tmppath, "%szan_crash.sym.%lu.%016llx.tmp",
+        zan__crash_snprintf(tmppath, sizeof tmppath, "%szan_crash.sym.%lu.%016llx.tmp",
                  exe_dir, (unsigned long)GetCurrentProcessId(), salt);
         SECURITY_ATTRIBUTES sa;
         memset(&sa, 0, sizeof sa);
@@ -198,32 +366,32 @@ static void zan__crash_symbolize(const char *logpath, const char *exe,
     CloseHandle(h);
 
     /* 崩溃回溯块头部标识 */
-    FILE *hf = fopen(logpath, "ab");
-    if (hf) {
-        fprintf(hf, "resolved source locations (%d in-module frame(s), top first%s):\n",
+    zan__cf_t hf = zan__cf_open_append(logpath);
+    if (hf.h) {
+        zan__cf_printf(hf, "resolved source locations (%d in-module frame(s), top first%s):\n",
                 count, keep_all ? "" : ", CRT frames omitted");
-        fclose(hf);
+        zan__cf_close(hf);
     }
     if (zan__crash_append_filtered(logpath, tmppath, keep_all) == 0) {
-        FILE *nf = fopen(logpath, "ab");
-        if (nf) {
-            fprintf(nf, "  <no source locations: build with `zanc -g` to get "
+        zan__cf_t nf = zan__cf_open_append(logpath);
+        if (nf.h) {
+            zan__cf_printf(nf, "  <no source locations: build with `zanc -g` to get "
                         "file:line; the module+offset backtrace above still "
                         "resolves offline via scripts\\symbolize_crash.ps1>\n");
-            fclose(nf);
+            zan__cf_close(nf);
         }
     }
     DeleteFileA(tmppath);
-    FILE *tf = fopen(logpath, "ab");
-    if (tf) { fprintf(tf, "\n"); fclose(tf); }
+    zan__cf_t tf = zan__cf_open_append(logpath);
+    if (tf.h) { zan__cf_printf(tf, "\n"); zan__cf_close(tf); }
 }
 
 /* 解析单个隔离地址（ARC 保护检测） */
 static void zan__crash_symbolize_one(const char *logpath, const char *exe,
                                     const char *exe_dir, uintptr_t exe_base,
                                     void *addr) {
-    FILE *hf = fopen(logpath, "ab");
-    if (hf) { fprintf(hf, "released (arc.freed_by) at:\n"); fclose(hf); }
+    zan__cf_t hf = zan__cf_open_append(logpath);
+    if (hf.h) { zan__cf_printf(hf, "released (arc.freed_by) at:\n"); zan__cf_close(hf); }
     /* 保留所有符号化行，包括合成析构函数 */
     zan__crash_symbolize(logpath, exe, exe_dir, exe_base, addr, NULL, 0, 1);
 }
@@ -233,12 +401,12 @@ static void zan__crash_logpath(char *logpath, size_t cap, char *exe_dir) {
     exe_dir[0] = '\0';
     DWORD n = GetModuleFileNameA(NULL, logpath, (DWORD)cap);
     if (n == 0 || n >= cap) {
-        snprintf(logpath, cap, "zan_crash.log");
+        zan__crash_snprintf(logpath, cap, "zan_crash.log");
         return;
     }
     char *slash = strrchr(logpath, '\\');
     if (!slash) {
-        snprintf(logpath, cap, "zan_crash.log");
+        zan__crash_snprintf(logpath, cap, "zan_crash.log");
         return;
     }
     size_t dl = (size_t)(slash + 1 - logpath);
@@ -254,7 +422,7 @@ static void zan__crash_temp_logpath(char *logpath, size_t cap) {
     char tmp[MAX_PATH];
     DWORD n = GetTempPathA((DWORD)sizeof tmp, tmp);
     if (n == 0 || n >= sizeof tmp) { logpath[0] = '\0'; return; }
-    snprintf(logpath, cap, "%szan_crash.log", tmp);
+    zan__crash_snprintf(logpath, cap, "%szan_crash.log", tmp);
 }
 
 /* 崩溃兜底日志的大小上限。
@@ -264,19 +432,17 @@ static void zan__crash_temp_logpath(char *logpath, size_t cap) {
 #define ZAN_CRASH_LOG_MAX_BYTES (1024 * 1024)
 
 /* 打开崩溃日志（追加模式），顺手做一次体积轮转。 */
-static FILE *zan__crash_open_log(const char *logpath) {
-    FILE *f = fopen(logpath, "ab");
-    if (!f) return NULL;
-    if (fseek(f, 0, SEEK_END) == 0) {
-        long sz = ftell(f);
-        if (sz >= ZAN_CRASH_LOG_MAX_BYTES) {
-            fclose(f);
-            char old[MAX_PATH];
-            snprintf(old, sizeof old, "%s.1", logpath);
-            DeleteFileA(old);
-            MoveFileA(logpath, old);
-            f = fopen(logpath, "ab");
-        }
+static zan__cf_t zan__crash_open_log(const char *logpath) {
+    zan__cf_t f = zan__cf_open_append(logpath);
+    if (!f.h) return f;
+    LARGE_INTEGER sz;
+    if (GetFileSizeEx(f.h, &sz) && sz.QuadPart >= ZAN_CRASH_LOG_MAX_BYTES) {
+        zan__cf_close(f);
+        char old[MAX_PATH];
+        zan__crash_snprintf(old, sizeof old, "%s.1", logpath);
+        DeleteFileA(old);
+        MoveFileA(logpath, old);
+        f = zan__cf_open_append(logpath);
     }
     return f;
 }
@@ -285,22 +451,22 @@ static void zan__crash_note(const char *what, const char *detail) {
     char logpath[MAX_PATH];
     char exe_dir[MAX_PATH];
     zan__crash_logpath(logpath, sizeof logpath, exe_dir);
-    FILE *f = zan__crash_open_log(logpath);
-    if (!f) f = zan__crash_open_log("zan_crash.log");
-    if (!f) {
+    zan__cf_t f = zan__crash_open_log(logpath);
+    if (!f.h) f = zan__crash_open_log("zan_crash.log");
+    if (!f.h) {
         char tpath[MAX_PATH];
         zan__crash_temp_logpath(tpath, sizeof tpath);
         if (tpath[0]) f = zan__crash_open_log(tpath);
     }
-    if (!f) return;
+    if (!f.h) return;
     SYSTEMTIME st;
     GetLocalTime(&st);
-    fprintf(f, "---- %s %04d-%02d-%02d %02d:%02d:%02d.%03d pid=%lu tid=%lu %s\n",
+    zan__cf_printf(f, "---- %s %04d-%02d-%02d %02d:%02d:%02d.%03d pid=%lu tid=%lu %s\n",
             what, st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute,
             st.wSecond, st.wMilliseconds,
             (unsigned long)GetCurrentProcessId(),
             (unsigned long)GetCurrentThreadId(), detail ? detail : "");
-    fclose(f);
+    zan__cf_close(f);
 }
 
 static void zan__crash_write_record(EXCEPTION_POINTERS *ep, const char *reason,
@@ -346,7 +512,7 @@ static void zan__crash_image_range(uintptr_t base, uintptr_t *lo,
 }
 
 /* 返回addresses left on the faulting stack, most frequent first */
-static void zan__crash_stack_scan(FILE *f, ULONG_PTR rsp, uintptr_t exe_base) {
+static void zan__crash_stack_scan(zan__cf_t f, ULONG_PTR rsp, uintptr_t exe_base) {
     uintptr_t lo, hi;
     zan__crash_image_range(exe_base, &lo, &hi);
     if (hi <= lo) return;
@@ -384,7 +550,7 @@ static void zan__crash_stack_scan(FILE *f, ULONG_PTR rsp, uintptr_t exe_base) {
     }
     if (!used) return;
 
-    fprintf(f, "stack-scan (%lu in-image addresses, most frequent first --"
+    zan__cf_printf(f, "stack-scan (%lu in-image addresses, most frequent first --"
                " a repeated address is the recursion):\n", total);
     for (unsigned n = 0; n < used && n < 12; n++) {
         unsigned best = n;
@@ -394,7 +560,7 @@ static void zan__crash_stack_scan(FILE *f, ULONG_PTR rsp, uintptr_t exe_base) {
         addr[best] = addr[n]; hits[best] = hits[n];
         addr[n] = ta; hits[n] = th;
         char tag[32];
-        snprintf(tag, sizeof tag, "  x%-6lu ", th);
+        zan__crash_snprintf(tag, sizeof tag, "  x%-6lu ", th);
         zan__crash_modline(f, (void *)ta, tag);
     }
 }
@@ -484,25 +650,25 @@ static void zan__crash_write_record(EXCEPTION_POINTERS *ep,
     USHORT fn = 0;
     void *arc_freed_by = NULL;
 
-    FILE *f = zan__crash_open_log(logpath);
-    if (!f) f = zan__crash_open_log("zan_crash.log");
-    if (!f) {
+    zan__cf_t f = zan__crash_open_log(logpath);
+    if (!f.h) f = zan__crash_open_log("zan_crash.log");
+    if (!f.h) {
         char tpath[MAX_PATH];
         zan__crash_temp_logpath(tpath, sizeof tpath);
         if (tpath[0]) f = zan__crash_open_log(tpath);
     }
-    if (f) {
+    if (f.h) {
         SYSTEMTIME st;
         GetLocalTime(&st);
         EXCEPTION_RECORD *er = ep->ExceptionRecord;
 
-        fprintf(f, "==== ZAN CRASH %04d-%02d-%02d %02d:%02d:%02d.%03d (%s) ====\n",
+        zan__cf_printf(f, "==== ZAN CRASH %04d-%02d-%02d %02d:%02d:%02d.%03d (%s) ====\n",
                 st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute,
                 st.wSecond, st.wMilliseconds, reason ? reason : "unhandled");
-        fprintf(f, "exe=%s pid=%lu tid=%lu\n", exe,
+        zan__cf_printf(f, "exe=%s pid=%lu tid=%lu\n", exe,
                 (unsigned long)GetCurrentProcessId(),
                 (unsigned long)GetCurrentThreadId());
-        fprintf(f, "code=0x%08lX flags=0x%08lX\n",
+        zan__cf_printf(f, "code=0x%08lX flags=0x%08lX\n",
                 (unsigned long)er->ExceptionCode,
                 (unsigned long)er->ExceptionFlags);
         {   /* ARC 完整性断言崩溃代码判定 */
@@ -528,15 +694,15 @@ static void zan__crash_write_record(EXCEPTION_POINTERS *ep,
             /* 运行时断言失败崩溃（越界、除零或 IO 门控断言） */
             if (er->ExceptionCode == 0xE0A2C010 &&
                 er->NumberParameters >= 1 && er->ExceptionInformation[0]) {
-                fprintf(f, "zan=%s", (const char *)er->ExceptionInformation[0]);
+                zan__cf_printf(f, "zan=%s", (const char *)er->ExceptionInformation[0]);
                 if (er->NumberParameters >= 2)
-                    fprintf(f, "exit=%lld\n",
+                    zan__cf_printf(f, "exit=%lld\n",
                             (long long)er->ExceptionInformation[1]);
             }
             if (arc) {
-                fprintf(f, "arc=%s\n", arc);
+                zan__cf_printf(f, "arc=%s\n", arc);
                 if (er->NumberParameters >= 3) {
-                    fprintf(f, "arc.object=0x%p arc.refcount=%lld\n",
+                    zan__cf_printf(f, "arc.object=0x%p arc.refcount=%lld\n",
                             (void *)er->ExceptionInformation[0],
                             (long long)er->ExceptionInformation[1]);
                     arc_freed_by = (void *)er->ExceptionInformation[2];
@@ -549,7 +715,7 @@ static void zan__crash_write_record(EXCEPTION_POINTERS *ep,
             const char *kind = er->ExceptionInformation[0] == 1 ? "write"
                              : er->ExceptionInformation[0] == 8 ? "execute"
                                                                 : "read";
-            fprintf(f, "access=%s addr=0x%p\n", kind,
+            zan__cf_printf(f, "access=%s addr=0x%p\n", kind,
                     (void *)er->ExceptionInformation[1]);
         }
         zan__crash_modline(f, er->ExceptionAddress, "fault=");
@@ -557,9 +723,9 @@ static void zan__crash_write_record(EXCEPTION_POINTERS *ep,
 #if defined(_M_X64) || defined(__x86_64__)
         if (ep->ContextRecord) {
             CONTEXT *c = ep->ContextRecord;
-            fprintf(f, "rip=%p rsp=%p rbp=%p\n",
+            zan__cf_printf(f, "rip=%p rsp=%p rbp=%p\n",
                     (void *)c->Rip, (void *)c->Rsp, (void *)c->Rbp);
-            fprintf(f, "rax=%p rbx=%p rcx=%p rdx=%p rsi=%p rdi=%p\n",
+            zan__cf_printf(f, "rax=%p rbx=%p rcx=%p rdx=%p rsi=%p rdi=%p\n",
                     (void *)c->Rax, (void *)c->Rbx, (void *)c->Rcx,
                     (void *)c->Rdx, (void *)c->Rsi, (void *)c->Rdi);
             {
@@ -569,11 +735,11 @@ static void zan__crash_write_record(EXCEPTION_POINTERS *ep,
                                             sizeof raw_mbi)
                     && raw_mbi.State == MEM_COMMIT
                     && !(raw_mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS))) {
-                    fprintf(f, "raw stack (@rsp):\n");
+                    zan__cf_printf(f, "raw stack (@rsp):\n");
                     for (unsigned w = 0; w < 16; w++) {
                         ULONG_PTR p = raw_rsp + w * sizeof(ULONG_PTR);
                         char tag[16];
-                        snprintf(tag, sizeof tag, "  [%02u] ", w);
+                        zan__crash_snprintf(tag, sizeof tag, "  [%02u] ", w);
                         zan__crash_modline(f, (void *)(*(ULONG_PTR *)p), tag);
                     }
                 }
@@ -582,10 +748,10 @@ static void zan__crash_write_record(EXCEPTION_POINTERS *ep,
 #elif defined(_M_ARM64) || defined(__aarch64__)
         if (ep->ContextRecord) {
             CONTEXT *c = ep->ContextRecord;
-            fprintf(f, "pc=%p sp=%p lr=%p fp=%p\n",
+            zan__cf_printf(f, "pc=%p sp=%p lr=%p fp=%p\n",
                     (void *)c->Pc, (void *)c->Sp, (void *)c->Lr,
                     (void *)c->Fp);
-            fprintf(f, "x0=%p x1=%p x2=%p x3=%p x4=%p x5=%p\n",
+            zan__cf_printf(f, "x0=%p x1=%p x2=%p x3=%p x4=%p x5=%p\n",
                     (void *)c->X0, (void *)c->X1, (void *)c->X2,
                     (void *)c->X3, (void *)c->X4, (void *)c->X5);
         }
@@ -600,14 +766,14 @@ static void zan__crash_write_record(EXCEPTION_POINTERS *ep,
         }
         if (fn == 0 && ep->ContextRecord)
             zan__crash_stack_scan(f, ZAN_CTX_SP(ep->ContextRecord), exe_base);
-        fprintf(f, "backtrace (%u frames):\n", (unsigned)fn);
+        zan__cf_printf(f, "backtrace (%u frames):\n", (unsigned)fn);
         for (USHORT i = 0; i < fn; i++) {
             char tag[16];
-            snprintf(tag, sizeof tag, "  #%02u ", (unsigned)i);
+            zan__crash_snprintf(tag, sizeof tag, "  #%02u ", (unsigned)i);
             zan__crash_modline(f, frames[i], tag);
         }
-        fprintf(f, "\n");
-        fclose(f);
+        zan__cf_printf(f, "\n");
+        zan__cf_close(f);
 
         DWORD crash_code = er->ExceptionCode;
         if (crash_code != EXCEPTION_STACK_OVERFLOW &&
@@ -811,7 +977,7 @@ static ZAN_MAYBE_UNUSED LONG zan__guard_recovered_count(void) {
 
 static void zan__crash_atexit(void) {
     char detail[96];
-    snprintf(detail, sizeof detail, "recovered=%ld logged=%ld first-chance=%ld",
+    zan__crash_snprintf(detail, sizeof detail, "recovered=%ld logged=%ld first-chance=%ld",
              (long)zan__guard_recovered, (long)zan__guard_logged,
              (long)zan__guard_firstchance);
     zan__crash_note("exit", detail);
