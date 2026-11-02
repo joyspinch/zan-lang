@@ -1,0 +1,60 @@
+using System;
+using System.Threading;
+
+// Gate.SignalAll：广播唤醒全部等待者；无等待者时暂存一次（计数
+// 语义，先 SignalAll 后 Wait 立即通过）；单播 Signal 仍只醒一个。
+class Program {
+    static Gate broadcast = new Gate();
+    static int woke = 0;
+    static Gate solo = new Gate();
+    static int soloWoke = 0;
+
+    static async void BroadcastWaiter(int id) {
+        bool r = await Program.broadcast.Wait(5000);
+        if (r) { Program.woke = Program.woke + 1; }
+    }
+
+    static async void SoloWaiter(int id) {
+        bool r = await Program.solo.Wait(5000);
+        if (r) { Program.soloWoke = Program.soloWoke + 1; }
+    }
+
+    static async void Run() {
+        // 三个等待者挂上同一门，SignalAll 全部恢复
+        Task.Spawn(Program.BroadcastWaiter(1));
+        Task.Spawn(Program.BroadcastWaiter(1));
+        Task.Spawn(Program.BroadcastWaiter(1));
+        await Task.Delay(40);   // 让三个都挂上
+        Program.broadcast.SignalAll();
+        await Task.Delay(40);
+        Console.WriteLine("all-woke: " + Convert.ToString(Program.woke));
+
+        // 暂存：无等待者时 SignalAll，下一个 Wait 立即通过
+        Gate banked = new Gate();
+        banked.SignalAll();
+        long t0 = DateTime.GetCurrentUnixMilliseconds();
+        bool r = await banked.Wait(5000);
+        long dt = DateTime.GetCurrentUnixMilliseconds() - t0;
+        Console.WriteLine("banked: " + Convert.ToString(r ? 1 : 0)
+            + " fast: " + Convert.ToString(dt < 2000 ? 1 : 0));
+
+        // 单播对照：一次 Signal 只醒一个等待者（旧口径保留）
+        Task.Spawn(Program.SoloWaiter(1));
+        Task.Spawn(Program.SoloWaiter(1));
+        Task.Spawn(Program.SoloWaiter(1));
+        await Task.Delay(40);
+        Program.solo.Signal();
+        await Task.Delay(40);
+        Console.WriteLine("solo-one: " + Convert.ToString(Program.soloWoke));
+        Program.solo.Signal();
+        Program.solo.Signal();
+        await Task.Delay(40);
+        Console.WriteLine("solo-rest: " + Convert.ToString(Program.soloWoke));
+    }
+
+    static void Main() {
+        await Program.Run();
+        Program.broadcast.Close();
+        Program.solo.Close();
+    }
+}

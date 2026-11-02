@@ -339,6 +339,10 @@ void zan_gate_signal(long h) {
     (void)h;
 }
 
+void zan_gate_signal_all(long h) {
+    (void)h;
+}
+
 void zan_gate_free(long h) {
     (void)h;
 }

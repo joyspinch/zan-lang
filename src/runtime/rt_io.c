@@ -4281,6 +4281,21 @@ int zan_co_poll(void) {
     return (now - w->slice_start_us >= q * 1000) ? 1 : 0;
 }
 
+/* 逻辑处理器数（Environment.ProcessorCount 的探针）：Windows 用
+ * GetSystemInfo，POSIX 用 sysconf(_SC_NPROCESSORS_ONLN)，查询失败
+ * 回 1。曾只读 NUMBER_OF_PROCESSORS 环境变量——Linux/macOS 上没有
+ * 这个变量，ProcessorCount 恒 1，线程池全部退化单线程。 */
+int32_t zan_cpu_count(void) {
+#if defined(_WIN32)
+    SYSTEM_INFO si;
+    GetSystemInfo(&si);
+    return (si.dwNumberOfProcessors > 0) ? (int32_t)si.dwNumberOfProcessors : 1;
+#else
+    long n = sysconf(_SC_NPROCESSORS_ONLN);
+    return (n > 0) ? (int32_t)n : 1;
+#endif
+}
+
 static void co_stats_dump(void);
 
 void zan_co_sched_init(void) {
@@ -5119,6 +5134,29 @@ void zan_gate_signal(long long handle) {
     }
     g->surplus++;
     zan_gate_unlock(g);
+}
+
+/* 唤醒全部等待者（Monitor.PulseAll 口径）；无等待者时暂存一次
+ * 信号——与 zan_gate_signal 的计数语义一致，先 SignalAll 后 Wait
+ * 立即通过。 */
+void zan_gate_signal_all(long long handle) {
+    zan_gate *g = (zan_gate *)(intptr_t)handle;
+    if (!g) return;
+    zan_gate_lock(g);
+    zan_gate_waiter *w = g->head;
+    if (!w) {
+        g->surplus++;
+        zan_gate_unlock(g);
+        return;
+    }
+    g->head = g->tail = NULL;
+    zan_gate_unlock(g);
+    while (w) {
+        zan_gate_waiter *n = w->next;
+        zan_co_ready(w->frame, w->step);
+        free(w);
+        w = n;
+    }
 }
 
 /* Destroy a gate */
