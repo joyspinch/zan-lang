@@ -6,11 +6,13 @@
 
 #include "../common/host_oom.h"
 zan_arena_t *zan_arena_new(void) {
+    /* OOM fail-fast：曾返回 NULL，而调用方（binder/parser/irgen 全域）
+     * 普遍不检查——OOM 即段错误。全体调用点由此免检。 */
     zan_arena_t *a = (zan_arena_t *)malloc(sizeof(zan_arena_t));
-    if (!a) return NULL;
+    if (!a) zan_host_oom();
     a->cap = ZAN_ARENA_BLOCK_SIZE;
     a->base = (char *)malloc(a->cap);
-    if (!a->base) { free(a); return NULL; }
+    if (!a->base) { free(a); zan_host_oom(); }
     a->used = 0;
     a->prev = NULL;
     return a;
@@ -39,7 +41,9 @@ static int g_top_size_count = 0;
 #endif
 
 void *zan_arena_alloc(zan_arena_t *arena, size_t size) {
-    if (size > SIZE_MAX - 7) return NULL;
+    /* OOM fail-fast：曾返回 NULL，调用方普遍不检查（B-ID106）。
+     * 荒谬尺寸与块分配失败同走 host OOM——编译器进程明确退出优于段错误。 */
+    if (size > SIZE_MAX - 7) zan_host_oom();
     size = (size + 7) & ~(size_t)7;
 
 #ifdef ZAN_ARENA_STATS
@@ -74,9 +78,9 @@ void *zan_arena_alloc(zan_arena_t *arena, size_t size) {
         size_t new_cap = ZAN_ARENA_BLOCK_SIZE;
         if (size > new_cap) new_cap = size;
         zan_arena_t *block = (zan_arena_t *)malloc(sizeof(zan_arena_t));
-        if (!block) return NULL;
+        if (!block) zan_host_oom();
         block->base = (char *)malloc(new_cap);
-        if (!block->base) { free(block); return NULL; }
+        if (!block->base) { free(block); zan_host_oom(); }
         block->cap = new_cap;
         block->used = 0;
         block->prev = arena->prev;
