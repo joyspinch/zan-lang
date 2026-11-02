@@ -5489,6 +5489,7 @@ typedef struct {
     zan_ast_list_t *targs;
     zan_arena_t *arena;
     int depth;
+    zan_diag_t *diag;
 } type_subst_ctx_t;
 
 static zan_ast_node_t *clone_ast_subst_impl(zan_ast_node_t *node, type_subst_ctx_t *ctx);
@@ -5742,7 +5743,199 @@ static zan_ast_node_t *clone_ast_subst_impl(zan_ast_node_t *node, type_subst_ctx
         res->catch_clause.body = clone_ast_subst(node->catch_clause.body, ctx);
         return res;
     }
+    case AST_SWITCH_STMT: {
+        zan_ast_node_t *res = zan_ast_new(ctx->arena, AST_SWITCH_STMT, node->loc);
+        *res = *node;
+        res->switch_stmt.expr = clone_ast_subst(node->switch_stmt.expr, ctx);
+        zan_ast_list_init(&res->switch_stmt.cases);
+        for (int i = 0; i < node->switch_stmt.cases.count; i++)
+            zan_ast_list_push(&res->switch_stmt.cases, clone_ast_subst(node->switch_stmt.cases.items[i], ctx), ctx->arena);
+        return res;
+    }
+    case AST_SWITCH_CASE: {
+        zan_ast_node_t *res = zan_ast_new(ctx->arena, AST_SWITCH_CASE, node->loc);
+        *res = *node;
+        res->switch_case.pattern = clone_ast_subst(node->switch_case.pattern, ctx);
+        res->switch_case.type_pattern = clone_ast_subst(node->switch_case.type_pattern, ctx);
+        res->switch_case.when_cond = clone_ast_subst(node->switch_case.when_cond, ctx);
+        res->switch_case.body = clone_ast_subst(node->switch_case.body, ctx);
+        return res;
+    }
+    case AST_SWITCH_EXPR: {
+        zan_ast_node_t *res = zan_ast_new(ctx->arena, AST_SWITCH_EXPR, node->loc);
+        *res = *node;
+        res->switch_expr.expr = clone_ast_subst(node->switch_expr.expr, ctx);
+        zan_ast_list_init(&res->switch_expr.arms);
+        for (int i = 0; i < node->switch_expr.arms.count; i++)
+            zan_ast_list_push(&res->switch_expr.arms, clone_ast_subst(node->switch_expr.arms.items[i], ctx), ctx->arena);
+        return res;
+    }
+    case AST_SWITCH_ARM: {
+        zan_ast_node_t *res = zan_ast_new(ctx->arena, AST_SWITCH_ARM, node->loc);
+        *res = *node;
+        res->switch_arm.pattern = clone_ast_subst(node->switch_arm.pattern, ctx);
+        res->switch_arm.type_pattern = clone_ast_subst(node->switch_arm.type_pattern, ctx);
+        res->switch_arm.when_cond = clone_ast_subst(node->switch_arm.when_cond, ctx);
+        res->switch_arm.result = clone_ast_subst(node->switch_arm.result, ctx);
+        return res;
+    }
+    case AST_LAMBDA: {
+        zan_ast_node_t *res = zan_ast_new(ctx->arena, AST_LAMBDA, node->loc);
+        *res = *node;
+        zan_ast_list_init(&res->lambda.params);
+        for (int i = 0; i < node->lambda.params.count; i++)
+            zan_ast_list_push(&res->lambda.params, clone_ast_subst(node->lambda.params.items[i], ctx), ctx->arena);
+        res->lambda.body = clone_ast_subst(node->lambda.body, ctx);
+        return res;
+    }
+    case AST_STRING_INTERP: {
+        zan_ast_node_t *res = zan_ast_new(ctx->arena, AST_STRING_INTERP, node->loc);
+        *res = *node;
+        zan_ast_list_init(&res->string_interp.parts);
+        for (int i = 0; i < node->string_interp.parts.count; i++)
+            zan_ast_list_push(&res->string_interp.parts, clone_ast_subst(node->string_interp.parts.items[i], ctx), ctx->arena);
+        zan_ast_list_init(&res->string_interp.formats);
+        for (int i = 0; i < node->string_interp.formats.count; i++)
+            zan_ast_list_push(&res->string_interp.formats, clone_ast_subst(node->string_interp.formats.items[i], ctx), ctx->arena);
+        return res;
+    }
+    case AST_TUPLE_EXPR: {
+        zan_ast_node_t *res = zan_ast_new(ctx->arena, AST_TUPLE_EXPR, node->loc);
+        *res = *node;
+        zan_ast_list_init(&res->tuple_expr.items);
+        for (int i = 0; i < node->tuple_expr.items.count; i++)
+            zan_ast_list_push(&res->tuple_expr.items, clone_ast_subst(node->tuple_expr.items.items[i], ctx), ctx->arena);
+        return res;
+    }
+    case AST_TUPLE_TYPE: {
+        zan_ast_node_t *res = zan_ast_new(ctx->arena, AST_TUPLE_TYPE, node->loc);
+        *res = *node;
+        zan_ast_list_init(&res->tuple_type.elems);
+        for (int i = 0; i < node->tuple_type.elems.count; i++)
+            zan_ast_list_push(&res->tuple_type.elems, clone_ast_subst(node->tuple_type.elems.items[i], ctx), ctx->arena);
+        return res;
+    }
+    case AST_TUPLE_DECON: {
+        zan_ast_node_t *res = zan_ast_new(ctx->arena, AST_TUPLE_DECON, node->loc);
+        *res = *node;
+        zan_ast_list_init(&res->tuple_decon.names);
+        for (int i = 0; i < node->tuple_decon.names.count; i++)
+            zan_ast_list_push(&res->tuple_decon.names, clone_ast_subst(node->tuple_decon.names.items[i], ctx), ctx->arena);
+        zan_ast_list_init(&res->tuple_decon.types);
+        for (int i = 0; i < node->tuple_decon.types.count; i++)
+            zan_ast_list_push(&res->tuple_decon.types, clone_ast_subst(node->tuple_decon.types.items[i], ctx), ctx->arena);
+        res->tuple_decon.initializer = clone_ast_subst(node->tuple_decon.initializer, ctx);
+        return res;
+    }
+    case AST_COLL_INIT: {
+        zan_ast_node_t *res = zan_ast_new(ctx->arena, AST_COLL_INIT, node->loc);
+        *res = *node;
+        zan_ast_list_init(&res->coll_init.items);
+        for (int i = 0; i < node->coll_init.items.count; i++)
+            zan_ast_list_push(&res->coll_init.items, clone_ast_subst(node->coll_init.items.items[i], ctx), ctx->arena);
+        return res;
+    }
+    case AST_NAMED_ARG: {
+        zan_ast_node_t *res = zan_ast_new(ctx->arena, AST_NAMED_ARG, node->loc);
+        *res = *node;
+        res->named_arg.expr = clone_ast_subst(node->named_arg.expr, ctx);
+        return res;
+    }
+    case AST_REF_ARG: {
+        zan_ast_node_t *res = zan_ast_new(ctx->arena, AST_REF_ARG, node->loc);
+        *res = *node;
+        res->ref_arg.decl_type = clone_ast_subst(node->ref_arg.decl_type, ctx);
+        res->ref_arg.expr = clone_ast_subst(node->ref_arg.expr, ctx);
+        return res;
+    }
+    case AST_QUERY_EXPR: {
+        zan_ast_node_t *res = zan_ast_new(ctx->arena, AST_QUERY_EXPR, node->loc);
+        *res = *node;
+        res->query.source = clone_ast_subst(node->query.source, ctx);
+        zan_ast_list_init(&res->query.clauses);
+        for (int i = 0; i < node->query.clauses.count; i++)
+            zan_ast_list_push(&res->query.clauses, clone_ast_subst(node->query.clauses.items[i], ctx), ctx->arena);
+        res->query.group_expr = clone_ast_subst(node->query.group_expr, ctx);
+        res->query.group_key = clone_ast_subst(node->query.group_key, ctx);
+        res->query.select = clone_ast_subst(node->query.select, ctx);
+        return res;
+    }
+    case AST_QUERY_WHERE:
+    case AST_QUERY_LET:
+    case AST_QUERY_ORDERBY:
+    case AST_QUERY_JOIN: {
+        zan_ast_node_t *res = zan_ast_new(ctx->arena, node->kind, node->loc);
+        *res = *node;
+        res->query_clause.expr = clone_ast_subst(node->query_clause.expr, ctx);
+        res->query_clause.source = clone_ast_subst(node->query_clause.source, ctx);
+        res->query_clause.left_key = clone_ast_subst(node->query_clause.left_key, ctx);
+        res->query_clause.right_key = clone_ast_subst(node->query_clause.right_key, ctx);
+        return res;
+    }
+    case AST_WITH_EXPR: {
+        zan_ast_node_t *res = zan_ast_new(ctx->arena, AST_WITH_EXPR, node->loc);
+        *res = *node;
+        res->with_expr.expr = clone_ast_subst(node->with_expr.expr, ctx);
+        zan_ast_list_init(&res->with_expr.assigns);
+        for (int i = 0; i < node->with_expr.assigns.count; i++)
+            zan_ast_list_push(&res->with_expr.assigns, clone_ast_subst(node->with_expr.assigns.items[i], ctx), ctx->arena);
+        return res;
+    }
+    case AST_YIELD_STMT: {
+        zan_ast_node_t *res = zan_ast_new(ctx->arena, AST_YIELD_STMT, node->loc);
+        *res = *node;
+        res->yield_stmt.value = clone_ast_subst(node->yield_stmt.value, ctx);
+        return res;
+    }
+    case AST_LOCK_STMT: {
+        zan_ast_node_t *res = zan_ast_new(ctx->arena, AST_LOCK_STMT, node->loc);
+        *res = *node;
+        res->lock_stmt.expr = clone_ast_subst(node->lock_stmt.expr, ctx);
+        res->lock_stmt.body = clone_ast_subst(node->lock_stmt.body, ctx);
+        return res;
+    }
+    case AST_CHECKED_STMT: {
+        zan_ast_node_t *res = zan_ast_new(ctx->arena, AST_CHECKED_STMT, node->loc);
+        *res = *node;
+        res->checked_stmt.body = clone_ast_subst(node->checked_stmt.body, ctx);
+        return res;
+    }
+    case AST_QUALIFIED_NAME: {
+        zan_ast_node_t *res = zan_ast_new(ctx->arena, AST_QUALIFIED_NAME, node->loc);
+        *res = *node;
+        zan_ast_list_init(&res->qualified_name.parts);
+        for (int i = 0; i < node->qualified_name.parts.count; i++)
+            zan_ast_list_push(&res->qualified_name.parts, clone_ast_subst(node->qualified_name.parts.items[i], ctx), ctx->arena);
+        return res;
+    }
     default: {
+        /* B-ID99：default 只允许纯标量叶子浅拷——带子节点/列表的复合 kind
+         * 必须走上面显式 case。新增 AST kind 落到这里即 E0061 拒绝：
+         * 浅拷会共享 zan_ast_list_t.items，而 push 未扩容时原地写
+         * items[count++]，两个特化克隆会互写穿对方的列表。 */
+        switch (node->kind) {
+        case AST_INT_LITERAL:
+        case AST_FLOAT_LITERAL:
+        case AST_DECIMAL_LITERAL:
+        case AST_STRING_LITERAL:
+        case AST_CHAR_LITERAL:
+        case AST_BOOL_LITERAL:
+        case AST_NULL_LITERAL:
+        case AST_THIS_EXPR:
+        case AST_BASE_EXPR:
+        case AST_BREAK_STMT:
+        case AST_CONTINUE_STMT:
+        case AST_GOTO_STMT:
+        case AST_LABEL_STMT:
+        case AST_ERROR_EXPR:
+            break;
+        default:
+            if (ctx->diag)
+                zan_diag_emit_code(ctx->diag, DIAG_ERROR, node->loc, 61,
+                                   "internal: generic base specialization hit unhandled AST kind %d",
+                                   (int)node->kind);
+            return node;
+        }
         zan_ast_node_t *res = zan_ast_new(ctx->arena, node->kind, node->loc);
         *res = *node;
         return res;
@@ -5784,7 +5977,8 @@ static bool class_has_method_name_and_param_count(zan_ast_node_t *cls, zan_istr_
 }
 
 static void specialize_type_from_base(zan_ast_node_t *derived, zan_ast_node_t *base_ref,
-                                      zan_ast_node_t *unit, zan_arena_t *arena, int depth) {
+                                      zan_ast_node_t *unit, zan_arena_t *arena, int depth,
+                                      zan_diag_t *diag) {
     if (!derived || !base_ref || !unit || depth > 8) return;
     if (base_ref->kind != AST_TYPE_REF || base_ref->type_ref.type_args.count == 0) return;
 
@@ -5806,6 +6000,7 @@ static void specialize_type_from_base(zan_ast_node_t *derived, zan_ast_node_t *b
     ctx.targs = &base_ref->type_ref.type_args;
     ctx.arena = arena;
     ctx.depth = 0;
+    ctx.diag = diag;
 
     for (int i = 0; i < base_decl->type_decl.members.count; i++) {
         zan_ast_node_t *m = base_decl->type_decl.members.items[i];
@@ -5831,7 +6026,7 @@ static void specialize_type_from_base(zan_ast_node_t *derived, zan_ast_node_t *b
     }
 
     for (int b = 0; b < base_decl->type_decl.bases.count; b++) {
-        specialize_type_from_base(derived, base_decl->type_decl.bases.items[b], unit, arena, depth + 1);
+        specialize_type_from_base(derived, base_decl->type_decl.bases.items[b], unit, arena, depth + 1, diag);
     }
 }
 
@@ -5843,8 +6038,7 @@ void zan_parser_specialize_generic_bases(zan_ast_node_t *unit, zan_arena_t *aren
         zan_ast_node_t *d = unit->comp_unit.decls.items[i];
         if (d->kind != AST_CLASS_DECL && d->kind != AST_STRUCT_DECL) continue;
         for (int b = 0; b < d->type_decl.bases.count; b++) {
-            specialize_type_from_base(d, d->type_decl.bases.items[b], unit, arena, 0);
+            specialize_type_from_base(d, d->type_decl.bases.items[b], unit, arena, 0, diag);
         }
     }
-    (void)diag;
 }

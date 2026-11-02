@@ -99,6 +99,9 @@
 | E0056 | E | declaration too large to lower: generated source exceeds %d bytes |
 | E0057 | E | event field requires a non-generic delegate type |
 | E0058 | E | event type '%.*s' is not a declared delegate |
+| E0059 | E | iterator 局部变量约束（动态文案：duplicate local '%.*s' in iterator method / must declare an explicit type 等，多处共用） |
+| E0060 | E | iterator method '%.*s' must be static in this release (instance iterators are not synthesized yet) |
+| E0061 | E | internal: generic base specialization hit unhandled AST kind %d |
 
 表中 `%s`/`%d` 等为文案里的格式占位符，非文档转义。
 
