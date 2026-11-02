@@ -1,0 +1,157 @@
+using System;
+using System.Collections.Generic;
+using System.Collections.Concurrent;
+
+// 集合 foreach 落地：Queue/Stack/LinkedList/HashSet 实现 IEnumerable<T>（活枚举 + version 修改检测），
+// ConcurrentQueue 实现快照语义枚举。覆盖：环形绕回后 FIFO 序、栈顶→底序、链表头→尾序、
+// 哈希集跳过墓碑（含 Compact 触发）、并发队快照、接口引用迭代、嵌套独立枚举器、空集合、
+// 迭代中修改抛 InvalidOperationException。
+class Program {
+    static int failures = 0;
+
+    static void Check(bool cond, string name) {
+        if (cond) {
+            Console.WriteLine("ok " + name);
+        } else {
+            failures = failures + 1;
+            Console.WriteLine("FAIL " + name);
+        }
+    }
+
+    // 经 IEnumerable<int> 接口引用迭代（参数位也是接口类型）。
+    static string Join(IEnumerable<int> seq) {
+        string s = "";
+        foreach (int x in seq) {
+            if (s.Length > 0) { s = s + ","; }
+            s = s + x;
+        }
+        return s;
+    }
+
+    static void Main() {
+        // Queue：入 10 个触发 Grow，再出 3 入 3 让 head 绕回环形缓冲区
+        Queue<int> q = new Queue<int>();
+        for (int i = 1; i <= 10; i = i + 1) { q.Enqueue(i); }
+        q.Dequeue();
+        q.Dequeue();
+        q.Dequeue();
+        q.Enqueue(11);
+        q.Enqueue(12);
+        q.Enqueue(13);
+        Check(Join(q) == "4,5,6,7,8,9,10,11,12,13", "queue fifo after wrap");
+        Check(q.Count() == 10, "queue count intact after foreach");
+
+        Queue<string> qs = new Queue<string>();
+        qs.Enqueue("a");
+        qs.Enqueue("b");
+        qs.Enqueue("c");
+        string cat = "";
+        foreach (string s in qs) {
+            cat = cat + s;
+        }
+        Check(cat == "abc", "queue<string> fifo");
+
+        // Stack：从栈顶到栈底
+        Stack<int> st = new Stack<int>();
+        st.Push(1);
+        st.Push(2);
+        st.Push(3);
+        Check(Join(st) == "3,2,1", "stack top to bottom");
+
+        // LinkedList：头→尾（含 AddFirst 头插）
+        LinkedList<string> ll = new LinkedList<string>();
+        ll.AddLast("b");
+        ll.AddLast("c");
+        ll.AddFirst("a");
+        string lc = "";
+        foreach (string s in ll) {
+            lc = lc + s;
+        }
+        Check(lc == "abc", "linkedlist head to tail");
+
+        // HashSet：跳过墓碑按插入序；再删两个触发 Compact（live*2 < order.Count）
+        HashSet<int> hs = new HashSet<int>();
+        for (int i = 1; i <= 6; i = i + 1) { hs.Add(i); }
+        hs.Remove(2);
+        hs.Remove(5);
+        Check(Join(hs) == "1,3,4,6", "hashset skips tombstones");
+        hs.Remove(1);
+        hs.Remove(3);
+        Check(Join(hs) == "4,6", "hashset after compact");
+
+        // ConcurrentQueue：快照——迭代中入队不影响本次迭代次数
+        ConcurrentQueue<int> cq = new ConcurrentQueue<int>();
+        cq.Enqueue(1);
+        cq.Enqueue(2);
+        cq.Enqueue(3);
+        int seen = 0;
+        foreach (int x in cq) {
+            seen = seen + 1;
+            cq.Enqueue(x + 100);
+        }
+        Check(seen == 3, "concurrentqueue snapshot iteration");
+        Check(cq.Count() == 6, "concurrentqueue enqueue during foreach lands");
+
+        // 接口引用迭代
+        IEnumerable<int> ie = st;
+        int sum = 0;
+        foreach (int x in ie) {
+            sum = sum + x;
+        }
+        Check(sum == 6, "iterate via IEnumerable<int> reference");
+
+        // 嵌套 foreach 同集合：独立枚举器互不干扰
+        int pairs = 0;
+        foreach (int a in st) {
+            foreach (int b in st) {
+                pairs = pairs + 1;
+            }
+        }
+        Check(pairs == 9, "nested foreach independent enumerators");
+
+        // 空集合零次迭代
+        int n = 0;
+        Queue<int> emptyQ = new Queue<int>();
+        foreach (int x in emptyQ) { n = n + 1; }
+        LinkedList<int> emptyLl = new LinkedList<int>();
+        foreach (int x in emptyLl) { n = n + 1; }
+        Stack<int> emptySt = new Stack<int>();
+        foreach (int x in emptySt) { n = n + 1; }
+        HashSet<int> emptyHs = new HashSet<int>();
+        foreach (int x in emptyHs) { n = n + 1; }
+        Check(n == 0, "empty collections zero iterations");
+
+        // 迭代中修改队列 → 下一次 MoveNext 抛 InvalidOperationException
+        bool caught = false;
+        try {
+            foreach (int x in q) {
+                q.Enqueue(99);
+            }
+        } catch (InvalidOperationException e) {
+            caught = true;
+        }
+        Check(caught, "queue modification during foreach throws");
+
+        caught = false;
+        try {
+            foreach (int x in hs) {
+                hs.Add(1000);
+            }
+        } catch (InvalidOperationException e) {
+            caught = true;
+        }
+        Check(caught, "hashset modification during foreach throws");
+
+        caught = false;
+        try {
+            foreach (string s in ll) {
+                ll.AddLast("zz");
+            }
+        } catch (InvalidOperationException e) {
+            caught = true;
+        }
+        Check(caught, "linkedlist modification during foreach throws");
+
+        Console.WriteLine("failures=" + failures);
+    }
+}

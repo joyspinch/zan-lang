@@ -1217,10 +1217,17 @@ static void emit_rc_store_field(zan_irgen_t *g, zan_type_t *type,
     if (is_weak && is_arc_managed_type(type) &&
         (type->kind == TYPE_INTERFACE ||
          (type->kind == TYPE_CLASS && type->sym != NULL))) {
-        if (LLVMGetTypeKind(vt) == LLVMPointerTypeKind)
+        if (LLVMGetTypeKind(vt) == LLVMPointerTypeKind) {
             emit_weak_store(g, field_ptr, v);
-        else
+            /* 弱存储不接管所有权：右值若是 +1 临时（弱字段读取提升为 +1 强引用、
+             * new、调用结果），存完必须在此释放，否则这一个 retain 永远还不掉——
+             * LinkedList.Remove 的 `cur.next.prev = cur.prev` 曾因此每次泄漏一个节点。
+             * 强路径（下方）靠"消费 owned 右值"吸收这个 +1，弱路径没有消费者。 */
+            if (expr_yields_owned_rc_value(g, rhs, locals))
+                emit_rc_release_for_type(g, type, v);
+        } else {
             LLVMBuildStore(g->builder, v, field_ptr);
+        }
         return;
     }
     if (LLVMGetTypeKind(vt) != LLVMPointerTypeKind) {

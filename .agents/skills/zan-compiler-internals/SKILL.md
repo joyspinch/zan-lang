@@ -715,6 +715,16 @@ description: zanc 编译器内部（parser/checker/irgen/runtime/ABI）设计契
      先读它再决定要不要上调试器；最小探针二分（`object o = "字面量"` vs
      `string s = "字面量"`）通常一步就切到根因。
 
+**弱字段存储不接管所有权——右值是 +1 临时时存储后必须释放**（实证，2026-11-02）：
+`emit_rc_store_field` 的 weak 路径经 `emit_weak_store` 落槽后，若右值属于 owned
+形态（`expr_yields_owned_rc_value`：弱字段读取提升出的 +1 强引用、`new`、无主
+调用结果），必须补一次 `emit_rc_release_for_type`。强路径靠"消费 owned 右值"
+吸收这个 +1，弱路径没有消费者，漏释放 = 这个 retain 永远还不掉：`a.weakF =
+b.weakF` 每执行一次泄漏一个对象，stdlib `LinkedList.Remove` 的
+`cur.next.prev = cur.prev` 曾因此让未 Clear 的链表整条释放不掉。二分时先区分
+"弱读做接收者"（不泄漏）与"弱读做右值"（泄漏）——钉子用例
+`tests/conformance/weak_store_owned_rhs.zan`。
+
 
 ---
 

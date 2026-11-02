@@ -1,0 +1,86 @@
+using System;
+
+// 弱字段存储不接管所有权：右值若是 +1 临时（弱字段读取提升、new、调用结果），
+// 编译器必须在弱存储后释放它。此前 `a.weakF = b.weakF` 这一形态每次泄漏一个 retain
+// （LinkedList.Remove 的 cur.next.prev = cur.prev 整条链表释放不掉）。
+// 本用例在 --check-leaks 下跑：任何泄漏都会让 ctest 失败，同时钉住弱引用语义
+// （只被弱持有的新对象立即释放、弱槽清空）。
+class Node<T> {
+    public T item;
+    public weak Node<T> prev;
+    public Node<T> next;
+    public Node(T v) { this.item = v; this.prev = null; this.next = null; }
+}
+
+class Holder {
+    public weak Holder target;
+    public Holder strongRef;
+    public Holder() { this.target = null; this.strongRef = null; }
+    public static Holder Make() { return new Holder(); }
+}
+
+class Program {
+    static int failures = 0;
+
+    static void Check(bool cond, string name) {
+        if (cond) {
+            Console.WriteLine("ok " + name);
+        } else {
+            failures = failures + 1;
+            Console.WriteLine("FAIL " + name);
+        }
+    }
+
+    // 泛型节点：弱读 → 弱存（自然链式写法，正是曾泄漏的形态）
+    static void WeakReadToWeakStore() {
+        Node<string> a = new Node<string>("A");
+        Node<string> b = new Node<string>("B");
+        Node<string> c = new Node<string>("C");
+        a.next = b; b.prev = a;
+        b.next = c; c.prev = b;
+        // 摘掉 b：弱读 cur.prev 直接存进弱槽 cur.next.prev
+        b.prev.next = b.next;
+        b.next.prev = b.prev;
+        b.prev = null;
+        b.next = null;
+        Check(c.prev == a, "weak read stored into weak slot points to a");
+        Check(a.next == c, "strong relink ok");
+        a.next = null;
+        c.prev = null;
+    }
+
+    // 只被弱持有的新对象立即释放，弱槽读回 null
+    static void FreshObjectIntoWeak() {
+        Holder h = new Holder();
+        h.target = new Holder();
+        Check(h.target == null, "fresh object held only weakly is released immediately");
+    }
+
+    // 调用结果：无人强持有 → 立即释放；另有强引用持有 → 存活
+    static void CallResultIntoWeak() {
+        Holder h = new Holder();
+        h.target = Holder.Make();
+        Check(h.target == null, "unowned call result into weak slot is released");
+        h.strongRef = Holder.Make();
+        h.target = h.strongRef;
+        Check(h.target != null, "weak slot alive while strong holder exists");
+        h.strongRef = null;
+        Check(h.target == null, "weak slot cleared after strong holder released");
+    }
+
+    // 借用右值（局部/参数）：弱存不动引用计数，持有者在则存活
+    static void BorrowedIntoWeak() {
+        Holder owner = new Holder();
+        Holder h = new Holder();
+        h.target = owner;
+        Check(h.target == owner, "borrowed local into weak slot stays alive");
+    }
+
+    static void Main() {
+        WeakReadToWeakStore();
+        FreshObjectIntoWeak();
+        CallResultIntoWeak();
+        BorrowedIntoWeak();
+        Console.WriteLine("failures=" + failures);
+    }
+}

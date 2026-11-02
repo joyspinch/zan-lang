@@ -302,8 +302,14 @@ Without MCP the same index is a file: `knowledge/symbols.json` next to the SDK
   代码时先跑它，别自己判字段偏移。
 * **`List<T>.Count` 是属性，不是方法**（实证，2026-10-22）：写 `list.Count()`
   编译器直接报 "'List<T>.Count' is a property, not a method: drop the '()'"。
-  `Dictionary` / `Queue` 的 `Count` 同理。自己封装的类（`CellPath.Count()`）
-  才是方法——**别把两者的写法混用**。
+  内建 `Dictionary` 的 `Count`/`Keys`/`Values` 同理。**stdlib 的
+  Queue/Stack/HashSet/LinkedList 目前是 `Count()` 方法**（属性化改造未做）——
+  自己封装的类（`CellPath.Count()`）也是方法，**别把两类写法混用**。
+* **stdlib 集合全部可 foreach**（实证，2026-11-02）：Queue/Stack/LinkedList/HashSet
+  实现 IEnumerable<T>，活枚举 + version 检测，迭代中修改下一次 MoveNext 抛
+  InvalidOperationException；ConcurrentQueue 走 ToArray 快照（迭代中并发入队不影响
+  本次迭代）。顺序口径：Stack 顶→底、LinkedList 头→尾、HashSet 按插入序。
+  foreach 不调用枚举器的 Dispose，无需手动释放。
 * **空安全是编译期硬检查**（实证，2026-10-22）：`JsonValue.Get(key)`、
   `List.First()` 等标为"可返回 null"的调用，其结果**直接取成员**会被编译器
   拦下（"'Get' can return null; accessing 'IsArray' on its result faults at
