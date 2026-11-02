@@ -742,8 +742,19 @@ static void collect_shadows(nr_ctx_t *c, zan_ast_node_t *n) {
         collect_shadows(c, n->switch_arm.when_cond);
         collect_shadows(c, n->switch_arm.result);
         break;
-    default:
+    case AST_IDENTIFIER:
+        /* inst_type_ref 是类型引用，不含局部影子名——显式 no-op 而非落 default */
         break;
+    default: {
+        /* B-ID102 覆盖审计：有非 NULL 子节点的 kind 落到 default 即疑似漏改
+         * （ZANC_TRACE 门控）。 */
+        int nc = zan_ast_child_count(n), live = 0;
+        for (int i = 0; i < nc; i++) if (zan_ast_child_at(n, i)) live++;
+        if (live > 0)
+            zan_compile_trace("nsresolve.collect_shadows: kind %d has %d live children but no case",
+                              (int)n->kind, live);
+        break;
+    }
     }
 }
 
@@ -1044,8 +1055,23 @@ static void nr_walk(nr_ctx_t *c, zan_ast_node_t *n,
         nr_walk(c, n->switch_arm.result, ns, usings);
         break;
 
-    default:
+    case AST_IDENTIFIER:
+        /* 表达式位泛型实例化（`Gen<T>.Static()` / `Gen<T>{..}`）把类型实参挂在
+         * inst_type_ref 上——不下钻则其中的命名空间类型从未改写，绑定期
+         * "undefined type"（B-ID102 拓扑审计首发）。 */
+        nr_walk(c, n->ident.inst_type_ref, ns, usings);
         break;
+
+    default: {
+        /* B-ID102 覆盖审计：有非 NULL 子节点的 kind 落到 default 即疑似漏改
+         * （ZANC_TRACE 门控）。 */
+        int nc = zan_ast_child_count(n), live = 0;
+        for (int i = 0; i < nc; i++) if (zan_ast_child_at(n, i)) live++;
+        if (live > 0)
+            zan_compile_trace("nsresolve.nr_walk: kind %d has %d live children but no case",
+                              (int)n->kind, live);
+        break;
+    }
     }
 }
 
@@ -1053,6 +1079,11 @@ void zan_nsresolve_run(zan_ast_node_t *unit, zan_arena_t *arena, zan_diag_t *dia
     if (!unit || unit->kind != AST_COMPILATION_UNIT) return;
     zan_ast_list_t *decls = &unit->comp_unit.decls;
     if (decls->count == 0) return;
+    /* B-ID102 拓扑表自检（ZANC_TRACE 门控）：经 child_count/child_at 递归数全树，
+     * 与 zan_ast_node_count() 对照——拓扑表登错字段即崩或计数离谱。 */
+    if (getenv("ZANC_TRACE"))
+        zan_compile_trace("nsresolve: unit subtree nodes=%zu (allocated=%zu)",
+                          zan_ast_subtree_count(unit), zan_ast_node_count());
 
     nr_ctx_t c;
     c.arena = arena;

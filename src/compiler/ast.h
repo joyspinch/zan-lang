@@ -531,6 +531,13 @@ struct zan_ast_node {
 
 zan_ast_node_t *zan_ast_new(zan_arena_t *arena, zan_ast_kind_t kind, zan_loc_t loc);
 size_t zan_ast_node_count(void);
+
+/* B-ID102 子节点拓扑单一事实源：扁平枚举每个 kind 的子节点（列表展开、
+ * NULL 槽计入 count 但 child_at 返 NULL），完整说明见 ast.c 实现头。
+ * 新加 AST kind 必须同步实现——漏登 kind 会在遍历器 default 审计现形。 */
+int zan_ast_child_count(const zan_ast_node_t *n);
+zan_ast_node_t *zan_ast_child_at(const zan_ast_node_t *n, int i);
+size_t zan_ast_subtree_count(const zan_ast_node_t *root);
 bool zan_ast_has_attr(const zan_ast_node_t *decl, const char *name);
 void zan_ast_list_init(zan_ast_list_t *list);
 void zan_ast_list_push(zan_ast_list_t *list, zan_ast_node_t *node, zan_arena_t *arena);
