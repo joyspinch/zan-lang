@@ -12,10 +12,10 @@
 | `src/common/` | C | 编译器与运行时共用（诊断、字符串池、文件/路径） |
 | `src/lsp/` | C | 语言服务：符号索引、补全、悬停、跳转、诊断推送 |
 | `src/dap/` | C | 调试适配器（断点、变量、单步） |
-| `src/fmt/`, `src/doc/` | C | `zanfmt` 格式化、`zandoc` 文档抽取 |
+| `src/fmt/`, `src/doc/` | Zan | `zanfmt` 格式化、`zandoc` 文档抽取 |
 | `src/selfhost/` | Zan | 自举相关 |
 | `src/ide_zan/` | **Zan** | 自举 IDE（编辑器、设计器、面板、AI 助手、市场客户端） |
-| `stdlib/` | **Zan** | 标准库核心：只有 `System`（核心类型/集合/IO/Json/Text/线程/编译器） |
+| `stdlib/` | **Zan** | 标准库核心：只有 `System`（核心类型/集合/IO/Text/线程/编译器）；JSON、GUI、Web 等在 `packages/` |
 | `templates/` | 混合 | IDE"新建项目"模板（`console/ gui/ library/ server/`） |
 | `tests/` | 混合 | 测试用例（见 [testing.md](testing.md)） |
 | `examples/` | Zan | 示例与真实项目 |
@@ -38,7 +38,6 @@
 | IR 生成（调用） | `irgen_call.c` | 方法解析、重载、内建函数、委托、链式调用 |
 | IR 生成（语句/泛型/异步/ARC） | `irgen_stmt.c`, `irgen_generics.c`, `irgen_async.c`, `irgen_arc.c` | 控制流、泛型实例化、await 状态机、retain/release |
 | 代码生成/发射 | `irgen_emit.c` | LLVM 发射、调试信息 |
-| 领域代码生成 | `stdlib/System/Compiler/`（ZanGen.zan: `GenForm`/`GenScene`/`GenJson`/`GenRoute`/`GenDb`） | 设计器窗体、场景、JSON 绑定、路由表、ORM 绑定 |
 | 驱动/CLI | `main.c` | 命令行开关、`--publish`、`--stdlib-path`、打包 |
 
 **入口**：`src/compiler/main.c`。**诊断输出**：`zan_diag_emit(...)`，grep 消息文本即可
@@ -47,7 +46,7 @@
 ## IDE（Zan 自举）
 
 `src/ide_zan/` 是自举 IDE：一个 `zan.proj` 工程（`src/ide_zan/zan.proj`，入口
-`src/IdeForm.html`），源码在 `src/ide_zan/src/` 下按职责分层（`shell/`
+`src/ide_zan/src/IdeForm.html`），源码在 `src/ide_zan/src/` 下按职责分层（`shell/`
 `panels/` `editor/` `dialogs/` `pages/` `services/` `models/` `components/`
 `views/`），是一个 `partial class ZanIDE` 切成多个文件：
 
@@ -73,12 +72,12 @@
 
 | 路径 | 内容 |
 | --- | --- |
-| `stdlib/System/` | 核心类型、集合、IO、Json、Text、线程、编译器（`System/Compiler/` 放 GenForm/GenRoute 等生成器） |
+| `stdlib/System/` | 核心类型、集合、IO、Text、线程 |
 | `packages/Zan.Gui/src/Gui/` | GUI 框架，见 [gui-development.md](gui-development.md) |
 | `packages/Zan.Gui/src/Gui/Widget/` (58 个) | 基础控件：Button/Input/Table/Tabs/Ribbon/ToolStrip/StatusBar/SplitPanel/Wizard… |
 | `packages/Zan.Gui/src/Gui/Component/` | 复合组件：Chart、DataTable、CodeEditor、WebView、Dock、FilePicker、PivotTable… |
-| `packages/Zan.Gui/src/Gui/Hmi/` | 工控：`IoTag`、`Indicator`(LED/数显)、`Gauge`、`Trend`、`Alarm`、`NumPad`、`EquipPanel` |
-| `packages/Zan.Gui/src/Gui/Designer/` | 表单设计器（`Designer.zan`、`Designer.Form.zan`、`Designer.Inspector.zan`） |
+| `packages/Zan.Industrial/src/Gui/Hmi/` | 工控：`IoTag`、`Indicator`(LED/数显)、`Gauge`、`Trend`、`Alarm`、`NumPad`、`EquipPanel` |
+| `packages/Zan.Gui.Designer/src/Gui/Designer/` | 表单设计器（`Designer.zan`、`Designer.Form.zan`、`Designer.Inspector.zan`） |
 | `packages/Zan.Gui/src/Gui/skins/`, `drivers/`, `Backend/` | 皮肤资源、原生驱动绑定、后端 |
 | `packages/Zan.Game*/`、`packages/Zan.Sdk.*`、`packages/Zan.Platform.Compat` | 游戏引擎族、第三方 SDK、平台 API 兼容层 |
 
@@ -89,14 +88,14 @@
 | 新语法/语义 | `parser.c` → `binder.c`/`checker.c` → `irgen_*.c` + `tests/conformance` |
 | 编译器误报/漏报 | 对应层 + `tests/diag`（编译期错误用 `run_compile_error.cmake`） |
 | 新控件 | `packages/Zan.Gui/src/Gui/Widget/<Name>.zan` + `packages/Zan.Gui/src/Gui/Component/` 注册 + gallery 示例 |
-| 新 HMI 元件 | `packages/Zan.Gui/src/Gui/Hmi/` + `templates/gui/gui-hmi` 演示 |
+| 新 HMI 元件 | `packages/Zan.Industrial/src/Gui/Hmi/` + `templates/gui/gui-hmi` 演示 |
 | 主题/皮肤 | `packages/Zan.Gui/src/Gui/Styling/Theme.zan`, `Skin.zan`, `Style*.zan`, `skins/` |
-| 设计器行为 | `packages/Zan.Gui/src/Gui/Designer/*` + `stdlib/System/Compiler/GenForm.zan`（`.html` 设计稿 → 代码） |
+| 设计器行为 | `packages/Zan.Gui.Designer/src/Gui/Designer/*` + `src/ide_zan/src/editor/ZanIDE.CodeNav.zan`（`.html` 设计稿模型） |
 | 新建项目模板 | `templates/**/template.manifest` + `ZanIDE.Workspace.zan`（见 [templates-and-wizard.md](templates-and-wizard.md)） |
 | IDE 面板/命令 | `panels/*Panel.zan` + `shell/ZanIDE.zan`（命令分发）+ `shell/ZanIDE.State.zan`（状态） |
 | 补全/跳转/悬停 | `src/lsp/` + `LspSession.zan` |
 | 调试器 | `src/dap/` + `DebugSession.zan`, `ZanIDE.Dap.zan` |
-| Web 路由/接口文档 | `packages/Zan.Web/src/System/Web/Router.zan`, `ApiDocs.zan` + `stdlib/System/Compiler/GenRoute.zan` |
+| Web 路由/接口文档 | `packages/Zan.Web/src/System/Web/Router.zan`, `ApiDocs.zan` |
 
 ## 工具链命令（都在仓库根执行）
 

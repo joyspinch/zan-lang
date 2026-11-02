@@ -1,10 +1,10 @@
 # Zan.Json
 
 JSON 契约层（纯 Zan，无原生依赖）。基础 JSON（`JsonValue` / `JsonReader` /
-`JsonSerializer`）在 stdlib `System/Json/`；本包补上契约层的三块：
-**JSON Schema 校验**、**JSONPath 查询**、**JSON Patch 变换**。
+`JsonSerializer`）在 `src/System/Json/`（或同包统一由 `using System.Json;` 提供）；
+本包补上契约层的三块：**JSON Schema 校验**、**JSONPath 查询**、**JSON Patch 变换**。
 
-`using System.Json;` 按需拉入——命名空间与 stdlib 同名，两边合并。
+`using System.Json;` 按需拉入——基础 JSON 与高级契约统一在此命名空间。
 
 ## 文件
 

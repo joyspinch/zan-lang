@@ -294,6 +294,15 @@ foreach ($rel in $targets) {
             'templates' {
                 $results += [pscustomobject]@{ check = 'templates'; ok = $true; detail = 'Windows: tools/agent/gate-templates.ps1 | macOS: scripts/test_all_templates.py' }
             }
+
+            'docrefs' {
+                if ($DryRun) { $results += [pscustomobject]@{ check = 'docrefs'; ok = $true; detail = 'will run check_doc_refs.py' }; break }
+                $pyScript = Join-Path $Root 'scripts/check_doc_refs.py'
+                if (-not (Test-Path $pyScript)) { $results += [pscustomobject]@{ check = 'docrefs'; ok = $true; detail = 'scripts/check_doc_refs.py not found, skip' }; break }
+                $r = Invoke-Tool -Exe 'python' -Argv @($pyScript, $abs) -TimeoutMs 30000
+                $dOk = ($r.exit -eq 0)
+                $results += [pscustomobject]@{ check = 'docrefs'; ok = $dOk; detail = $(if ($dOk) { 'ok' } else { (($r.text -split "`n" | Where-Object { $_ -match 'FAILED|->' } | Select-Object -First 2) -join ' | ') }) }
+            }
         }
     }
 

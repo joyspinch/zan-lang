@@ -103,13 +103,13 @@ stdlib/
 │   ├── IO/                          # System.IO 原语基石
 │   │   ├── File.zan                 # 基础文件读写与同步/异步双轨 API
 │   │   ├── Directory.zan            # 目录扫描、创建与双轨异步操作
-│   │   ├── Path.zan                 # 路径运算与归一化
 │   │   ├── Stream.zan               # 基础抽象流
 │   │   ├── FileStream.zan           # 文件流
 │   │   ├── ByteBuffer.zan           # 可增长字节缓冲区
 │   │   ├── FileInfo.zan             # 文件元数据
 │   │   ├── FileInfoEx.zan           # 文件扩展信息与属性探针
 │   │   └── SeekOrigin.zan           # 偏移枚举
+│   │   # 注：Path 托管实现位于 packages/Zan.IO，命名空间仍为 System.IO
 │   │
 │   ├── Collections/Generic/         # System.Collections.Generic 基础集合容器
 │   │   ├── HashSet.zan              # 哈希集合
@@ -118,17 +118,9 @@ stdlib/
 │   │   ├── Stack.zan                # LIFO 栈
 │   │   ├── PriorityQueue.zan        # 最小堆优先队列
 │   │   ├── RingBuffer.zan           # 定长环形缓冲
-│   │   ├── KeyValuePair.zan         # 键值对
+│   │   ├── KeyValuePair.zan         # 键值对（KVP 历史孪生类已收敛统一入本类）
 │   │   ├── IEnumerable.zan          # 迭代器接口
 │   │   └── IEnumerator.zan          # 枚举器接口
-│   │
-│   ├── Json/                        # System.Json 零分配与扁平解析
-│   │   ├── Json.zan                 # 顶层序列化/反序列化门面
-│   │   ├── JsonValue.zan            # 经典 AST 对象模型
-│   │   ├── JsonDoc.zan              # 扁平只读无分配索引文档（极速推荐）
-│   │   ├── JsonReader.zan           # 词法与语法流式游标扫描
-│   │   ├── JsonWriter.zan           # 文本格式化发射器
-│   │   └── JsonTape.zan             # 线性记录磁带
 │   │
 │   ├── Numerics/                    # System.Numerics
 │   │   └── MathUtil.zan             # 高精度数学计算
@@ -136,14 +128,13 @@ stdlib/
 │   ├── Text/                        # System.Text
 │   │   └── Encoding.zan             # UTF-8/16/32 编码解码
 │   │
-│   └── Web/                         # System.Web
-│       ├── DesignerHtml.zan         # 设计器 HTML 映射
-│       └── HtmlScope.zan            # HTML 节点作用域
+│   └── Threading/                   # System.Threading 并发基石（Channel, TaskCompletionSource, Mutex 等）
 │
 packages/                            # 独立拆解的高性能可复用包生态
-├── Zan.IO/                          # 扩展 I/O：MemoryStream、StreamReader/Writer、Compression (Deflate, GZip, Zip, Tar, Zstd)
+├── Zan.Configuration/               # 配置提供程序体系（IConfiguration, ConfigurationBuilder, JsonFile, EnvFile 等）
+├── Zan.Json/                        # 完整 JSON 栈：JsonValue, JsonDoc, Schema, JsonPath, JsonPatch
+├── Zan.IO/                          # 扩展 I/O：Path、MemoryStream、StreamReader/Writer、Compression (Deflate, GZip, Zip, Tar, Zstd)
 ├── Zan.Net/                         # 完整网络栈：Socket, Tcp/Udp, Http/Https, Tls, WebSocket, Mqtt, Sse, Rpc
-├── Zan.Threading/                   # 线程与并发原语：Thread, Mutex, Semaphore, AtomicInt, BlockingQueue, AsyncGate
 ├── Zan.Desktop/                     # 桌面与操作系统服务：Process, Display, Device, Media, Clipboard
 ├── Zan.Data/                        # 数据访问与持久化：Sqlite, SqlServer, Redis, Orm, ZanDb
 ├── Zan.Security/                    # 安全与密码学：Cryptography, Jwt, X509Certificate
@@ -272,7 +263,7 @@ There is no `Capacity`, `Find`, `FindAll`, `Map`, `Aggregate`, `ToArray` or
 
 **Extensions.** Additional operations come from extension methods:
 
-- `System.ListExtensions` (`stdlib/System/ListExtensions.zan`):
+- `System.ListExtensions` (`stdlib/System/Extensions/ListExtensions.zan`):
   `Remove(item)`, `GetRange(start, count)`, and `Sort()` overloads for
   `List<int>`, `List<double>` and `List<string>`.
 - `System.Linq.Enumerable` (`packages/Zan.Linq/src/System/Linq/Enumerable.zan`, see §3.6):
@@ -474,9 +465,8 @@ class HttpForwarder {
 - https upstreams go through `TlsStream`, so the forwarder itself needs no
   extra TLS plumbing.
 
-See `examples/net/http_forwarder.zan` (token-by-token stream through the
-forwarder) and the `http_forwarder_stream` / `http_forwarder_tunnel`
-conformance cases.
+See the `tests/conformance/http_forwarder_stream.zan` and
+`tests/conformance/http_forwarder_tunnel.zan` conformance cases.
 
 ---
 
@@ -663,7 +653,8 @@ backends; `Socket.*Async` / `AsyncSocket` / `TcpClient` / `TcpListener` /
 
 ### 3.8 System.Configuration — 配置 provider 体系
 
-`System.Configuration` lives in `stdlib/System/Configuration/`. A
+`System.Configuration` lives in `packages/Zan.Configuration/src/System/Configuration/`
+(package `Zan.Configuration`, providing `namespace System.Configuration`). A
 configuration is a **chain of providers**; the root reads them in reverse
 order (the **last added wins**) and every provider answers
 `TryGet(key) / Set(key, value) / Load() / GetKeys()`.
@@ -839,7 +830,8 @@ public static string ReadAllText(string path) {
 ```
 
 The **`zandoc`** tool generates documentation from these comments. It is a
-standalone program written in Zan (`src/doc/zandoc.zan`, built to
+standalone program written in Zan (`src/doc/ZanDoc.zan` + `src/doc/DocMember.zan`, built to
 `build/zandoc.exe` by CMake): it extracts the `/// <summary>` / `/// <returns>`
 comments and the declarations they precede, and renders them as Markdown or
-HTML. There is no `zan doc` compiler subcommand.
+HTML (note: tags like `<param>`, `<exception>`, `<example>` are currently ignored).
+There is no `zan doc` compiler subcommand.
