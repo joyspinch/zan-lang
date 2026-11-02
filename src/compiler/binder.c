@@ -592,10 +592,12 @@ static bool tuple_sig_type(zan_type_t *t, char *buf, size_t cap) {
     if (used + 1 >= cap) return false;
     if (t->kind == TYPE_ARRAY && t->element_type) {
         bool ok = tuple_sig_type(t->element_type, buf, cap);
-        if (strlen(buf) + 4 < cap) {
+        int rank = t->array_rank > 1 ? t->array_rank : 1;
+        /* 房间按 rank 精确预留：曾只留 +4，rank>=4 时逗号被内层静默跳过
+         * 仍返 ok=true——两个不同 rank 的数组型签名可碰撞 */
+        if (strlen(buf) + 3 + (size_t)(rank - 1) * 2 < cap) {
             strcat(buf, "[");
-            for (int r = 1; r < (t->array_rank > 1 ? t->array_rank : 1); r++)
-                if (strlen(buf) + 2 < cap) strcat(buf, ",");
+            for (int r = 1; r < rank; r++) strcat(buf, ",");
             strcat(buf, "]");
         } else {
             ok = false;

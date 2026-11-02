@@ -181,7 +181,18 @@
         } else if (strcmp(argv[i], "-Oz") == 0) {
             opt_level = ZAN_OPT_SIZE_MIN;
         } else if (strncmp(argv[i], "-ferror-limit=", 14) == 0) {
-            error_limit = atoi(argv[i] + 14);
+            /* atoi 曾把 "abc" 静默变 0——main.c 以 >=0 判已设置，0 即
+             * 抑制全部错误显示；现严格十进制复核，垃圾值按用法错误退出 */
+            const char *lim = argv[i] + 14;
+            char *ep = NULL;
+            long lv = strtol(lim, &ep, 10);
+            if (lim[0] == '\0' || ep == NULL || *ep != '\0' ||
+                lv < 0 || lv > INT_MAX) {
+                fprintf(stderr, "zanc: invalid value '%s' in '-ferror-limit='\n",
+                        lim);
+                return 1;
+            }
+            error_limit = (int)lv;
         } else if (strcmp(argv[i], "--subsystem") == 0 && i + 1 < argc) {
             link_subsystem = argv[++i];
         } else if (strcmp(argv[i], "--time") == 0) {
