@@ -2929,6 +2929,13 @@ foreach(_src ${_conf_srcs})
   set_tests_properties(case_det_${_name} PROPERTIES TIMEOUT 180)
 endforeach()
 
+# datetime_now pins the local wall-clock semantics with a fixed POSIX timezone:
+# EST/EDT with the US 2007+ transition rules, so winter/summer offsets and both
+# DST boundaries are deterministic on every machine. Without TZ the case would
+# only be able to assert season-dependent invariants.
+set_tests_properties(case_datetime_now PROPERTIES
+  ENVIRONMENT "TZ=EST5EDT,M3.2.0,M11.1.0")
+
 # Every globbed conformance case needs its golden <name>.out committed. A
 # missing golden used to fail the case inside run_case.cmake with "file failed
 # to open for reading", which reads like a program bug instead of "the golden

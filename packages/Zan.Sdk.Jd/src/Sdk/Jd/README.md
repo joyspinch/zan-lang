@@ -141,10 +141,9 @@ client.Timeout(15000)                                   // 超时，默认 30000
 默认指向正式网关 `https://api.jd.com/routerjson`。
 
 时间戳（`timestamp` 协议参数，网关会拿它和自己的钟比对）默认按 `+0800` 生成，
-墙钟时间和 `+HHMM` 后缀用的是同一个偏移，永远自洽。之所以要配置而不是读系统
-时区：`DateTime.Now()` 是 `DateTime.UtcNow()` 的别名，标准库不做本地时区换算，
-照搬原版 C# 的“取本机时区”会给每个请求打上 UTC 时间戳。跑在别的时区就改这个值
-（印度 `330`、UTC `0`），机器时区本身不影响结果。
+墙钟时间和 `+HHMM` 后缀用的是同一个偏移，永远自洽。这里按网关时区显式配置而
+不是跟随运行机器：签名参数必须跨部署环境稳定，不能随机器时区漂移。跑在别的
+时区就改这个值（印度 `330`、UTC `0`），机器时区本身不影响结果。
 
 ## 与 C# 原版的差异
 
@@ -154,7 +153,7 @@ client.Timeout(15000)                                   // 超时，默认 30000
 | `Nullable<long>` 参数属性 | 强类型链式 setter（`SetLong` 不截断） | 属性赋值无法校验，setter 可以按参数类型分派 |
 | 参数校验/网关错误 → 返回字段被填好的空 Response | 抛 `JdException` | 原版调用方不检查 `IsError` 就会拿假数据继续跑 |
 | `goto retry` + `Thread.Sleep` 阻塞重试 | `await Task.Delay` 退避 | 原版重试期间整个线程不可用 |
-| 时间戳取本机时区 | `TimeZoneOffset(分钟)`，默认 480 | stdlib 无本地时区（`Now` 即 `UtcNow`），照搬会发 UTC 时间戳 |
+| 时间戳取本机时区 | `TimeZoneOffset(分钟)`，默认 480 | 网关时区必须显式固定，不能随部署机器时区漂移 |
 | XML 分支（`format` 恒为 json，永不执行） | 删除 | 死代码 |
 | 自造 `JdDictionary : Dictionary<string,string>` | 标准 `Dictionary` + `JdSign` | 只有签名规则是京东特有的，容器不是 |
 | `StringBuilder` 手拼业务参数 JSON | `JsonValue` | 手拼在值含引号时产出非法 JSON |

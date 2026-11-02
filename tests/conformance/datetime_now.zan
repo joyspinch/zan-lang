@@ -1,0 +1,89 @@
+// DateTime.Now 本地墙钟语义的 conformance。
+//
+// 运行环境由 CMake 固定为 POSIX 时区串 EST5EDT,M3.2.0,M11.1.0（UTC-5，
+// 夏令时 UTC-4，采用美国 2007+ 切换规则），因此所有绝对时刻的输出跨机器、
+// 跨季节确定：
+// - Now() 与 UtcNow() 的差等于当前本地偏移；
+// - LocalOffsetMinutesAt / ToLocalTime 在冬令时、夏令时以及两个切换边界上
+//   都返回该时刻实际生效的偏移（偏移按目标时刻计算，不是“当前时刻”）；
+// - UTC 时刻的打印/序列化格式保持不变。
+using System;
+
+class Program {
+    static int failures = 0;
+
+    static void Ok(bool cond, string name) {
+        if (cond) {
+            Console.WriteLine("ok " + name);
+        } else {
+            Console.WriteLine("FAIL " + name);
+            Program.failures = Program.failures + 1;
+        }
+    }
+
+    static void Eq(string got, string want, string name) {
+        if (got == want) {
+            Console.WriteLine("ok " + name);
+        } else {
+            Console.WriteLine("FAIL " + name + "（得到 \"" + got + "\"，期望 \"" + want + "\"）");
+            Program.failures = Program.failures + 1;
+        }
+    }
+
+    static void Main() {
+        // ---- 1. Now 是本地墙钟，UtcNow 仍是 UTC ----
+        DateTime utc = DateTime.UtcNow();
+        DateTime now = DateTime.Now();
+        long offsetMinutes = (long)DateTime.LocalOffsetMinutes();
+        long deltaMs = now.ToUnixMilliseconds() - utc.ToUnixMilliseconds();
+        long wantMs = offsetMinutes * 60000;
+        // 两次取时刻之间可能有毫秒级漂移；给 2 秒容差，判据仍是“差值即偏移”。
+        Ok(deltaMs >= wantMs - 2000 && deltaMs <= wantMs + 2000,
+           "Now 与 UtcNow 的差等于当前本地偏移");
+
+        // 冬季（EST）与夏季（EDT）固定时刻的偏移。
+        Ok(DateTime.LocalOffsetMinutesAt(1768478400) == -300, "冬令时偏移 -300");
+        Ok(DateTime.LocalOffsetMinutesAt(1784116800) == -240, "夏令时偏移 -240");
+
+        // ---- 2. 同一时刻的本地墙钟表示 ----
+        DateTime winter = DateTime.FromUnixSeconds(1768478400).ToLocalTime();
+        Eq(winter.ToString(), "2026-01-15 07:00:00", "冬令时墙钟");
+        Ok(winter.ToUnixSeconds() == 1768478400 - 300 * 60, "冬令时 ToUnixSeconds 已偏移");
+
+        DateTime summer = DateTime.FromUnixSeconds(1784116800).ToLocalTime();
+        Eq(summer.ToString(), "2026-07-15 08:00:00", "夏令时墙钟");
+
+        // ---- 3. 夏令时切换边界（2026 年美国规则：3 月第二个周日 / 11 月第一个周日） ----
+        // 起始：2026-03-08T07:00:00Z 由 EST(-300) 跳到 EDT(-240)。
+        Ok(DateTime.LocalOffsetMinutesAt(1772953199) == -300, "DST 起始前一秒仍是 EST");
+        Ok(DateTime.LocalOffsetMinutesAt(1772953200) == -240, "DST 起始当秒转为 EDT");
+        Eq(DateTime.FromUnixSeconds(1772953199).ToLocalTime().ToString(),
+           "2026-03-08 01:59:59", "DST 起始前一秒墙钟");
+        Eq(DateTime.FromUnixSeconds(1772953200).ToLocalTime().ToString(),
+           "2026-03-08 03:00:00", "DST 起始当秒墙钟");
+
+        // 结束：2026-11-01T06:00:00Z 由 EDT(-240) 回到 EST(-300)。
+        Ok(DateTime.LocalOffsetMinutesAt(1793512799) == -240, "DST 结束前一秒仍是 EDT");
+        Ok(DateTime.LocalOffsetMinutesAt(1793512800) == -300, "DST 结束当秒回到 EST");
+        Eq(DateTime.FromUnixSeconds(1793512799).ToLocalTime().ToString(),
+           "2026-11-01 01:59:59", "DST 结束前一秒墙钟");
+        Eq(DateTime.FromUnixSeconds(1793512800).ToLocalTime().ToString(),
+           "2026-11-01 01:00:00", "DST 结束当秒墙钟");
+
+        // ---- 4. 打印与序列化行为不变 ----
+        DateTime utcFixed = DateTime.FromUnixSeconds(1768478400);
+        Eq(utcFixed.ToString(), "2026-01-15 12:00:00", "UTC ToString 不变");
+        Eq(utcFixed.ToStringWithMillis(), "2026-01-15 12:00:00.000", "UTC ToStringWithMillis 不变");
+        Eq(utcFixed.ToDateString(), "2026-01-15", "UTC ToDateString 不变");
+        Eq(utcFixed.ToTimeString(), "12:00:00", "UTC ToTimeString 不变");
+        Ok(utcFixed.ToUnixSeconds() == 1768478400, "UTC 时间戳往返一致");
+        Ok(DateTime.FromUnixSeconds(1768478400).Equals(utcFixed), "UTC 相等比较不变");
+
+        // ---- 5. LocalNow 与 Now 语义一致 ----
+        Ok(DateTime.Now().Subtract(DateTime.LocalNow()).TotalSeconds() >= -2
+           && DateTime.Now().Subtract(DateTime.LocalNow()).TotalSeconds() <= 2,
+           "Now 与 LocalNow 指向同一时刻");
+
+        Console.WriteLine("failures=" + Convert.ToString(Program.failures));
+    }
+}
