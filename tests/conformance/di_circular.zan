@@ -1,0 +1,82 @@
+using System;
+using System.Threading;
+using System.DependencyInjection;
+
+// ServiceProvider 单例构建：工厂曾整体在 syncLock 临界区内执行——
+// 工厂取其它单例（依赖链）对同一把非递归锁二次 Lock 同线程死锁。
+// 现双段式（锁外建 + building 环检测）：依赖链正常解析、环/自依赖
+// 抛 InvalidOperationException（.NET 同文案）、重复解析同实例。
+class Program {
+    static ServiceProvider Build(Action<ServiceCollection> setup) {
+        ServiceCollection sc = new ServiceCollection();
+        setup(sc);
+        return sc.BuildServiceProvider();
+    }
+
+    static void Main() {
+        // 依赖链：A 工厂内取 B（旧实现此处自死锁）
+        ServiceProvider sp = Program.Build(delegate(ServiceCollection sc) {
+            ServiceFactory fB = (p) => { return "b-instance"; };
+            ServiceFactory fA = (p) => { return "a+" + ((string)p.GetService("B")); };
+            sc.AddSingleton("B", fB);
+            sc.AddSingleton("A", fA);
+        });
+        Console.WriteLine("chain: " + Convert.ToString(sp.GetService("A")));
+        Console.WriteLine("chain-same: " + Convert.ToString(sp.GetService("B") == sp.GetService("B") ? 1 : 0));
+        sp.Dispose();
+
+        // 依赖环：A→B→A 抛 InvalidOperationException
+        bool ringThrew = false;
+        ServiceProvider ring = Program.Build(delegate(ServiceCollection sc) {
+            ServiceFactory fRA = (p) => { p.GetService("RB"); return "ra"; };
+            ServiceFactory fRB = (p) => { p.GetService("RA"); return "rb"; };
+            sc.AddSingleton("RA", fRA);
+            sc.AddSingleton("RB", fRB);
+        });
+        try {
+            ring.GetService("RA");
+        } catch (InvalidOperationException) {
+            ringThrew = true;
+        }
+        Console.WriteLine("ring: " + Convert.ToString(ringThrew ? 1 : 0));
+        ring.Dispose();
+
+        // 自依赖：A 工厂取自己
+        bool selfThrew = false;
+        ServiceProvider self = Program.Build(delegate(ServiceCollection sc) {
+            ServiceFactory fS = (p) => { p.GetService("S"); return "s"; };
+            sc.AddSingleton("S", fS);
+        });
+        try {
+            self.GetService("S");
+        } catch (InvalidOperationException) {
+            selfThrew = true;
+        }
+        Console.WriteLine("self: " + Convert.ToString(selfThrew ? 1 : 0));
+        self.Dispose();
+
+        // 重复解析同一单例：同实例（双段式回填后命中缓存）
+        ServiceProvider shared = Program.Build(delegate(ServiceCollection sc) {
+            ServiceFactory fShared = (p) => { return new object(); };
+            sc.AddSingleton("shared", fShared);
+        });
+        object first = shared.GetService("shared");
+        object second = shared.GetService("shared");
+        Console.WriteLine("same-ref: " + Convert.ToString(first == second ? 1 : 0));
+        shared.Dispose();
+
+        // Scoped 工厂锁外 + 环检测
+        bool scopedRingThrew = false;
+        ServiceProvider scoped = Program.Build(delegate(ServiceCollection sc) {
+            ServiceFactory fX = (p) => { p.GetService("X"); return "x"; };
+            sc.AddScoped("X", fX);
+        });
+        try {
+            scoped.GetService("X");
+        } catch (InvalidOperationException) {
+            scopedRingThrew = true;
+        }
+        Console.WriteLine("scoped-ring: " + Convert.ToString(scopedRingThrew ? 1 : 0));
+        scoped.Dispose();
+    }
+}

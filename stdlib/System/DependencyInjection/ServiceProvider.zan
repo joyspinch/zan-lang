@@ -7,6 +7,7 @@ public class ServiceProvider : IServiceProvider, IServiceScopeFactory, IDisposab
     public Dictionary<string, ServiceDescriptor> descriptorMap;
     public Dictionary<string, object> singletons;
     public Dictionary<string, object> scopedInstances;
+    public Dictionary<string, bool> building;
     public ServiceProvider rootProvider;
     public nint syncLock;
     public bool isDisposed;
@@ -16,6 +17,7 @@ public class ServiceProvider : IServiceProvider, IServiceScopeFactory, IDisposab
         this.isDisposed = false;
         this.rootProvider = root;
         this.descriptorMap = new Dictionary<string, ServiceDescriptor>();
+        this.building = new Dictionary<string, bool>();
 
         if (descriptors != null) {
             for (int i = 0; i < descriptors.Count; i = i + 1) {
@@ -55,7 +57,12 @@ public class ServiceProvider : IServiceProvider, IServiceScopeFactory, IDisposab
             return null;
         }
 
-        // 1. Singleton
+        // 1. Singleton。曾把 d.factory 调用整个放在 syncLock 临界区内
+        // ——工厂取其它单例（依赖链）时对同一把非递归锁二次 Lock，
+        // 同线程自死锁（C# Monitor 可重入所以原版没这问题，Zan 的
+        // Mutex 不可重入）。现镜像 Scoped 的双段式：查缓存与登记
+        // 构建标记在锁内，工厂调用在锁外；building 集合捕获依赖环
+        //（A→B→A、自依赖）抛 InvalidOperationException（.NET 同文案）。
         if (d.lifetime == ServiceLifetime.Singleton) {
             ServiceProvider targetRoot = this.rootProvider != null ? this.rootProvider : this;
             if (d.implementationInstance != null) {
@@ -68,8 +75,18 @@ public class ServiceProvider : IServiceProvider, IServiceScopeFactory, IDisposab
                 Mutex.Unlock(targetRoot.syncLock);
                 return existing;
             }
+            if (targetRoot.building.ContainsKey(serviceType)) {
+                Mutex.Unlock(targetRoot.syncLock);
+                throw new InvalidOperationException(
+                    "A circular dependency was detected for the service of type '" + serviceType + "'.");
+            }
+            targetRoot.building[serviceType] = true;
+            Mutex.Unlock(targetRoot.syncLock);
 
             object created = d.factory != null ? d.factory(this) : null;
+
+            Mutex.Lock(targetRoot.syncLock);
+            targetRoot.building.Remove(serviceType);
             if (created != null) {
                 targetRoot.singletons[serviceType] = created;
             }
@@ -77,7 +94,7 @@ public class ServiceProvider : IServiceProvider, IServiceScopeFactory, IDisposab
             return created;
         }
 
-        // 2. Scoped
+        // 2. Scoped。工厂锁外调用（同 Singleton 的环检测口径）。
         if (d.lifetime == ServiceLifetime.Scoped) {
             if (this.rootProvider == null) {
                 Mutex.Lock(this.syncLock);
@@ -86,14 +103,22 @@ public class ServiceProvider : IServiceProvider, IServiceScopeFactory, IDisposab
                     Mutex.Unlock(this.syncLock);
                     return existing;
                 }
+                if (this.building.ContainsKey(serviceType)) {
+                    Mutex.Unlock(this.syncLock);
+                    throw new InvalidOperationException(
+                        "A circular dependency was detected for the service of type '" + serviceType + "'.");
+                }
+                this.building[serviceType] = true;
                 Mutex.Unlock(this.syncLock);
 
                 object created = d.factory != null ? d.factory(this) : null;
+
+                Mutex.Lock(this.syncLock);
+                this.building.Remove(serviceType);
                 if (created != null) {
-                    Mutex.Lock(this.syncLock);
                     this.singletons[serviceType] = created;
-                    Mutex.Unlock(this.syncLock);
                 }
+                Mutex.Unlock(this.syncLock);
                 return created;
             }
 
@@ -103,14 +128,22 @@ public class ServiceProvider : IServiceProvider, IServiceScopeFactory, IDisposab
                 Mutex.Unlock(this.syncLock);
                 return existing;
             }
+            if (this.building.ContainsKey(serviceType)) {
+                Mutex.Unlock(this.syncLock);
+                throw new InvalidOperationException(
+                    "A circular dependency was detected for the service of type '" + serviceType + "'.");
+            }
+            this.building[serviceType] = true;
             Mutex.Unlock(this.syncLock);
 
             object scCreated = d.factory != null ? d.factory(this) : null;
+
+            Mutex.Lock(this.syncLock);
+            this.building.Remove(serviceType);
             if (scCreated != null) {
-                Mutex.Lock(this.syncLock);
                 this.scopedInstances[serviceType] = scCreated;
-                Mutex.Unlock(this.syncLock);
             }
+            Mutex.Unlock(this.syncLock);
             return scCreated;
         }
 
