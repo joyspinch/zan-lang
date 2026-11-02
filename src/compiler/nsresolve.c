@@ -721,6 +721,27 @@ static void collect_shadows(nr_ctx_t *c, zan_ast_node_t *n) {
     case AST_YIELD_STMT:
         collect_shadows(c, n->yield_stmt.value);
         break;
+    case AST_TUPLE_EXPR:
+        collect_shadows_list(c, &n->tuple_expr.items);
+        break;
+    case AST_TUPLE_DECON:
+        /* 解构声明本身就是局部影子名（names 为 IDENTIFIER 节点） */
+        for (int i = 0; i < n->tuple_decon.names.count; i++)
+            shadow_add(&c->shadow, n->tuple_decon.names.items[i]->ident.name);
+        collect_shadows(c, n->tuple_decon.initializer);
+        break;
+    case AST_WITH_EXPR:
+        collect_shadows(c, n->with_expr.expr);
+        collect_shadows_list(c, &n->with_expr.assigns);
+        break;
+    case AST_SWITCH_EXPR:
+        collect_shadows(c, n->switch_expr.expr);
+        collect_shadows_list(c, &n->switch_expr.arms);
+        break;
+    case AST_SWITCH_ARM:
+        collect_shadows(c, n->switch_arm.when_cond);
+        collect_shadows(c, n->switch_arm.result);
+        break;
     default:
         break;
     }
@@ -991,6 +1012,36 @@ static void nr_walk(nr_ctx_t *c, zan_ast_node_t *n,
 
     case AST_COLL_INIT:
         nr_walk_list(c, &n->coll_init.items, ns, usings);
+        break;
+
+    case AST_TUPLE_EXPR:
+        nr_walk_list(c, &n->tuple_expr.items, ns, usings);
+        break;
+
+    case AST_TUPLE_TYPE:
+        nr_walk_list(c, &n->tuple_type.elems, ns, usings);
+        break;
+
+    case AST_TUPLE_DECON:
+        nr_walk_list(c, &n->tuple_decon.types, ns, usings);
+        nr_walk(c, n->tuple_decon.initializer, ns, usings);
+        break;
+
+    case AST_WITH_EXPR:
+        nr_walk(c, n->with_expr.expr, ns, usings);
+        nr_walk_list(c, &n->with_expr.assigns, ns, usings);
+        break;
+
+    case AST_SWITCH_EXPR:
+        nr_walk(c, n->switch_expr.expr, ns, usings);
+        nr_walk_list(c, &n->switch_expr.arms, ns, usings);
+        break;
+
+    case AST_SWITCH_ARM:
+        nr_walk(c, n->switch_arm.pattern, ns, usings);
+        nr_walk(c, n->switch_arm.type_pattern, ns, usings);
+        nr_walk(c, n->switch_arm.when_cond, ns, usings);
+        nr_walk(c, n->switch_arm.result, ns, usings);
         break;
 
     default:
