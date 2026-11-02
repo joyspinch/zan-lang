@@ -5965,6 +5965,19 @@ add_test(NAME diag_lambda_return_object
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_lambda_return_object PROPERTIES TIMEOUT 60)
 
+# B-ID91：表达式位置的语法错误只许一条诊断——parser 错误节点是 AST_ERROR_EXPR
+# 毒化节点（不再伪造 int 常量 0），收尾符留给外层消费，checker 对其静默。
+add_test(NAME diag_syntax_error_no_cascade
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/syntax_error_no_cascade.zan
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/diag_syntax_error_no_cascade${_exe_ext}
+    "-DEXPECT_REGEX=unexpected token ';' in expression"
+    "-DEXPECT_REGEX_NOT=expected ';'|cannot access member|has no member"
+    "-DEXPECT_ERROR_COUNT=1"
+    -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
+set_tests_properties(diag_syntax_error_no_cascade PROPERTIES TIMEOUT 60)
+
 # Source-level type and interface regressions: reject malformed inheritance,
 # mixed comparisons, invalid reference/delegate assignments, local mismatches,
 # narrowing conversions, and incomplete interface contracts before IR emission.

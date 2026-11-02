@@ -38,7 +38,6 @@
 - [ ] B-ID86 协程纯协作式调度引发的线程饥饿（Starvation）与废弃 ucontext 依赖：`src/runtime/rt_sched.c` 缺乏基于时间片或信号的抢占机制（Preemption）。CPU 密集型长循环会永久霸占调度线程，导致挂载在该线程上的所有异步 I/O、Web 请求与定时器永久假死；且 POSIX 下依赖已在 POSIX.1-2008 废弃的 `ucontext.h`（换栈拷贝信号掩码带来巨大开销），需演进为轻量寄存器汇编保存与协作抢占插桩；双轨保持一致。
 - [ ] B-ID87 Unicode 规范化（NFC/NFD）与国际化大小写折叠（Case Folding）缺失：标准库缺乏 Unicode 规范化算法（UAX #15）支持，`string.ToLower/ToUpper/Equals` 仅能处理基本 ASCII 或简单码点映射。欧洲带重音符、德语等在不同输入源下单码点与组合码点无法等价匹配，存在严峻的国际化乱码与鉴权仿冒越权风险；双轨同步。
 - [ ] B-ID89 生产级内存可观测性与循环引用泄漏分析工具缺失：Zan 采用无 GC 的纯 ARC 模型，循环引用必定造成长驻内存泄漏。目前全仓缺乏运行时“孤儿环探测器（Cycle Detector）”与生产环境 Heap Snapshot / Dump 导出机制，在长期运行的服务端与复杂桌面 GUI 中一旦发生内存缓慢增长，运维与开发缺乏定位手段；双轨保持一致。
-- [ ] B-ID91 解析器语法容错与错误节点占位机制伪造（Resilient Parsing & Poison Node 缺失）：`src/compiler/parser.c:41` `parser_error_node` 在语法解析失败时粗暴返回 `AST_INT_LITERAL`（常数 0 节点），导致后续类型检查器误将其作为 int 校验并喷出大量风马牛不相及的级联误报（如 cannot access member on int），破坏 IDE/LSP 键入补全。需建立正规 `AST_ERROR_EXPR` 毒化节点与错误静默抑制体系；双轨同步。
 - [ ] B-ID92 静态构造函数（cctor）声明序盲目初始化与依赖拓扑排序缺失：`src/compiler/irgen_emit.c:206` 在 Main 函数开头仅按 AST 声明的原始数组顺序同步调用各个类型的 `_cctor`，缺乏依赖图拓扑排序与按需/首次访问惰性初始化（Lazy BeforeFieldInit）机制，跨文件静态字段互相依赖时因编译顺序漂移引发静默空引用或读取未初始化零值；双轨同步。
 - [ ] B-ID93 异步调试信息（Debug Info）状态机展开与原始源码行映射断裂：`src/compiler/di.c` 目前在生成 DWARF/PDB 调试符号时，尚未对 `async/await` 重写后的闭包状态机帧建立原始行号映射（Source-Mapping），在调试器（zan-dap / lldb）中单步步入（Step-Over / Step-Into）异步函数时 PC 指针直接跳入底层合成的 `$resume` 状态机跳转表与帧槽存取汇编，开发者无法直观断点调试业务源码行；双轨保持一致。
 

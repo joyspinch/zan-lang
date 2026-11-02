@@ -102,6 +102,10 @@ typedef enum {
     AST_SWITCH_ARM,
     AST_WITH_EXPR,
 
+    /* 语法错误占位（毒化节点）：parser 报错后返回它而不是伪造 int 常量 0，
+     * checker 对其一律给 type_error 且不发诊断，截断级联误报（B-ID91）。 */
+    AST_ERROR_EXPR,
+
     AST__COUNT,
 } zan_ast_kind_t;
 

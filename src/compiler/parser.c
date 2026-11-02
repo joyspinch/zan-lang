@@ -38,7 +38,9 @@ static void parser_expect(zan_parser_t *p, zan_token_kind_t kind) {
 }
 
 static zan_ast_node_t *parser_error_node(zan_parser_t *p) {
-    return zan_ast_new(p->arena, AST_INT_LITERAL, p->current.loc);
+    /* 毒化节点而非 int 常量 0：后者会让 checker 把它当 int 校验，
+     * 喷出 "cannot access member on int" 之类风马牛不相及的级联误报。 */
+    return zan_ast_new(p->arena, AST_ERROR_EXPR, p->current.loc);
 }
 
 /* 保留字不能当名字用（base / out / value ... 都是关键字）。
@@ -1140,7 +1142,16 @@ static zan_ast_node_t *parse_primary(zan_parser_t *p) {
         zan_diag_emit_code(p->diag, DIAG_ERROR, loc, 45,
                       "unexpected token '%s' in expression",
                       zan_token_kind_name(p->current.kind));
-        parser_advance(p);
+        /* 结构性收尾符（; ) ] } ,）与 EOF 留给外层构造去消费：吃掉它们会让
+         * 外层紧接着再报 "expected ';'"，把真正的原因盖住（B-ID91 级联）。 */
+        switch (p->current.kind) {
+        case TK_SEMICOLON: case TK_RPAREN: case TK_RBRACKET:
+        case TK_RBRACE: case TK_COMMA: case TK_EOF:
+            break;
+        default:
+            parser_advance(p);
+            break;
+        }
         return parser_error_node(p);
     }
 }

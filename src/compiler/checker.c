@@ -2931,6 +2931,9 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
     if (!expr) return c->binder->type_error;
 
     switch (expr->kind) {
+    case AST_ERROR_EXPR:
+        /* parser 已报过语法错误；哨兵类型静默吞掉下游一切诊断（B-ID91） */
+        return c->binder->type_error;
     case AST_INT_LITERAL:
         switch (expr->lit_suffix) {
         case 1:
