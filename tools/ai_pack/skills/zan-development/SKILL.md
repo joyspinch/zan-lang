@@ -9,7 +9,8 @@ description: The fixed workflow for Zan coding tasks — orient, look the API up
 
 MCP connected: `zan_start_here` → layout, entry point, build/test commands,
 which optional tools this installation actually has.
-No MCP: read `AGENTS.md` and `docs/AI_ONBOARDING.md` at the SDK root (shipped from this pack).
+No MCP: read `AGENTS.md` and `docs/AI_ONBOARDING.md` at the SDK root
+(in this repo: `tools/ai_pack/docs/AI_ONBOARDING.md`).
 
 ## 1. Locate before you read
 
@@ -23,11 +24,12 @@ the symbol index exist to replace — and reading the same window twice is worse
 still: a tool result stays true until you change it, so use the one you have
 instead of asking again.
 
-* **搜不到 ≠ 不存在**：源码里带 NUL 字节的文件（部分生成/拼接的 C 源）会被
-  ripgrep 系工具当二进制**整文件跳过**（只提示 "stopped searching binary
-  file"）。搜这类文件改用 `Select-String -Path <glob>`（PowerShell）或
-  `grep -a`；同时留意「实现分散在多个文件」的形态，符号所在的文件未必是
-  名字最像的那个。
+* **搜不到 ≠ 不存在**：`src/compiler/irgen_*.c` 其实是 `#include` 进 `irgen.c`
+  的同一翻译单元（便于共用 `static` 辅助函数），文件里带 NUL 字节，
+  ripgrep 系工具会当二进制**整文件跳过**（只提示 "stopped searching binary
+  file"）。搜编译器内部实现时改用 `Select-String -Path <glob>`（PowerShell）
+  或 `grep -a`。另外 `irgen_call.c` 里的 `AddRange` / `Reserve` 等 List 内建
+  降级都在 `irgen_call.c`，不在 `irgen.c`。
 
 ## 2. Look up every API you are about to call
 
@@ -65,91 +67,78 @@ Without MCP the same index is a file: `knowledge/symbols.json` next to the SDK
   value-shaped targets, not null: check `!= ""`. （the parse
   ambiguity was fixed in zanc; the old advice to write `(x is T) ? a : b`
   is obsolete.)
-* **A failed cast does not throw — it silently yields the target type's
-  default**: casting a non-string object to `string` gives `""`, and a failed
-  class cast is just as silent. So reading a value out of `object` means
-  testing the type with `is` first; never rely on a cast failure to reveal a
-  type mismatch — it hides the bug. (probe-verified)
-* **Generic `is T` does not work for strings, but concrete `is string`
-  does**: a string in an `object` slot has no allocation-site metadata, so
-  its runtime type name reports as `object`; class types are unaffected
-  (`object o = new Box(); o is Box` is true). So `is T` inside
-  `T Get<T>()` misjudges strings as "type mismatch" — record a type tag at
-  registration time (`typeof(T).Name`) instead of trusting runtime `is`.
-* **`throw <expr>` goes by the static type**: `catch (Exception e) { throw e; }`
-  degrades a concrete exception type to `Exception`, so an outer
-  `catch (MyEx)` no longer matches (it only catches `Exception`). Keep the
-  type with `catch (MyEx e) { throw e; }`, or do not rethrow verbatim from a
-  `catch (Exception)` — a wrapper layer that catches everything and rethrows
-  erases the distinction for every caller above it.
-* **A lambda passed as an argument to a delegate returning `object` must
-  return an explicit `object`**: `Factory f = () => { return "x"; };` compiles
-  (assigned to a delegate variable) but `Take(() => { return "x"; })` fails
-  with "no overload matches" — the **argument position** applies a stricter
-  lambda conversion than the assignment position; write
-  `return (object)"x";`.
-* **`object` slots do not box value types**: `List<object>` cannot hold an
-  int. "Any value" containers (parameterized case lists, heterogeneous
-  result tables) can only hold reference types (string / custom classes);
-  keep ints in type-specific collections.
-* **Never put a delegate into an `object` variable and compare it to null**:
-  `object f = someDelegate;` followed by `f == null` crashes with an access
-  violation. Keep delegates in typed fields (a named delegate type such as
-  `public delegate object Factory();` works directly).
-* **A lambda cannot be async; an async delegate needs a method group**:
-  `async (JsonValue a) => {...}` does not even parse ("unexpected token
-  'async' in expression"). The supported form is a **named method +
-  method group**: `MyFn f = h.Handle;` where `Handle` is
-  `public async string Handle(JsonValue)` — it compiles and runs. The worst
-  trap is a **sync lambda assigned to an async delegate**: no error, but the
-  call **returns an empty string** (measured: `r3=` empty) — a silent
-  failure. Always use a named method for async delegates.
-* **An async method's static type is its result type, not `Task<T>`**
-  (verified 2026-10-22): `Task<List<int>> t = MakeAsync();` fails with
-  "cannot convert 'List<int>' to 'Task<List<int>>' in initializer", and
-  storing the async call in a `Task<T>` variable before awaiting makes the
-  compiler treat the awaited value as the Task itself (type mismatch).
-  **Just `await f()` directly** (`List<int> b = await MakeAsync();` compiles
-  and runs). Corollary: a `Task<T>` variable has almost no use in Zan — an
-  async call and its result share a type.
-* **String methods are compiler builtins, not stdlib code**: `Trim`,
-  `ToLower`, `ToUpper`, `StartsWith`, `EndsWith`, `Substring`, `IndexOf`,
-  `LastIndexOf`, `Split`, `Replace`, `Contains`, `Equals` live in the
-  compiler's builtin member table, not in the stdlib sources — grepping the
-  stdlib for them finds nothing, which does **not** mean they are missing.
-  (Same for the `StringBuilder`, `Task`, `Convert` and `Console` types.)
-* **`JsonValue.Get` / `At` may return null**: chaining `.Str(...)` straight
-  onto them is rejected ("'At' can return null; accessing 'Str' on its
-  result faults at runtime"). Store it, check for null, or use `?.`. When
-  writing parsing code, **wrap it in a null-safe field accessor** — a long
-  chain of `Get(...).Str(...)` produces dozens of compile errors.
-* **`JsonValue.PutJson(key, string)` only takes JSON text**; to place an
-  already-built `JsonValue` use `Put(key, value)`. Passing a `JsonValue` to
-  `PutJson` fails with "cannot convert 'JsonValue' to 'string'" —
-  `PutJson`/`AppendJson` parse *text* into the document, `Put`/`Append`
-  store a value.
-* **Interfaces cannot have fields** (a Zan interface has methods only). To
-  expose "the reason for the last failure" in a contract, declare a
-  `LastError()` method and keep a `lastError` field on the implementing
-  class as well, for callers holding the concrete type — that is the
-  existing convention (`IRetriever` / `IReranker` do exactly this).
-* **Constructors cannot chain with `this()`**: writing `this();` inside a
-  constructor body fails with "this call could not be resolved to any
-  callable (no method, delegate, operator or builtin matches)". To share
-  initialization, **copy it** or move it into a static factory — do not
-  shape the class around constructor-to-constructor calls.
-* **`string.IndexOf(needle, startIndex)` takes a start offset** (compiler
-  builtin): it searches from `startIndex` and returns the **absolute**
-  index (-1 when absent). When hand-writing a "find the first match"
-  helper, do **not** write "keep searching after a hit" — the helper then
-  walks into the "no more matches" branch and returns -1 even though it
-  found one, so "does it exist?" always answers "no".
-* **Cross-package namespaces need no manifest dependency**: compiling with
-  `--package-project <repo>` scans every `packages/*/src/`, so a cross-package
-  `using` resolves directly — nothing has to be declared in `zan.pkg`. A new
-  package only needs `packages/<Name>/src/<Ns>/...` plus a `zan.pkg`.
-* **`Convert.ToString` covers int/long/double/bool** (synthesized by the
-  compiler) — no need to hand-roll `"" + n`.
+* **转型失败不抛异常，静默给目标类型的默认值**：`(string)某个非字符串对象`
+  得到 `""`，类转型失败同样静默。所以从 `object` 取值必须先 `is` 判类型，
+  别指望"转型失败"来暴露类型不对——它会把错误藏起来。（探针实测）
+* **泛型 `is T` 对字符串无效，具体类型的 `is string` 有效**：字符串装在
+  `object` 槽里没有分配点元数据，运行期类型名会报成 `object`；类类型不受
+  影响（`object o = new Box(); o is Box` 为真）。所以 `T Get<T>()` 里想用
+  `is T` 校验字符串会误判成"类型不符"——要判字符串就在注册时记类型标签
+  （`typeof(T).Name`），别指望运行期 `is`。
+* **`throw <表达式>` 按静态类型走**：`catch (Exception e) { throw e; }` 会把
+  具体异常类型退化成 `Exception`，外层的 `catch (MyEx)` 接不住（只接得住
+  `Exception`）。要保类型就 `catch (MyEx e) { throw e; }`，或者别在
+  `catch (Exception)` 里原样 rethrow——这条在"统一 catch 再抛"的包装层里
+  很容易踩，会让上层再也分不清异常种类。
+* **lambda 传给返回 `object` 的委托时，返回值必须显式是 `object`**：
+  `Factory f = () => { return "x"; };`（赋值给委托变量）能编过，但
+  `Take(() => { return "x"; })`（形参是返回 object 的委托）报
+  "no overload matches"——**传参位置**的 lambda 转换比赋值位置严格，写成
+  `return (object)"x";`。
+* **`object` 槽不装箱值类型**：`List<object>` 装不了 int。"任意值"容器
+  （参数化用例集合、异构结果表）只能收引用类型（string / 自定义类），
+  要装 int 就按类型分开收。
+* **委托不能装进 `object` 变量再比 null**：`object f = someDelegate;` 之后
+  `f == null` 会直接 access violation 崩掉。委托要留在类型化字段里
+  （`public delegate object Factory();` 这类具名委托类型可以直接用）。
+* **lambda 不能是 async；异步委托只能用方法组**：`async (JsonValue a) =>
+  {...}` 连解析都过不去（"unexpected token 'async' in expression"）。异步
+  委托的正规写法是**具名方法 + 方法组**：`MyFn f = h.Handle;`（`Handle` 是
+  `public async string Handle(JsonValue)`）——编译、运行都对。**最坑的是
+  同步 lambda 赋给 async 委托**：不报错，但**调用返回空串**（实测
+  `r3=` 空），静默错、还看不出错。所以异步委托一律用具名方法。
+* **async 方法的静态类型就是它的结果类型，不是 `Task<T>`**（实证，2026-10-22）：
+  `Task<List<int>> t = MakeAsync();` 报 "cannot convert 'List<int>' to
+  'Task<List<int>>' in initializer"；把 async 调用先存进 `Task<T>` 变量再
+  `await`，编译器认为 `await` 的结果**还是那个 Task 本身**（类型对不上）。
+  **直接 `await f()`**（`List<int> b = await MakeAsync();` 编译运行都对）。
+  推论：Zan 里 `Task<T>` 变量几乎没有用武之地——async 调用与它的结果同型。
+* **字符串方法是编译器内建，不在 stdlib 里**：`Trim` / `ToLower` /
+  `ToUpper` / `StartsWith` / `EndsWith` / `Substring` / `IndexOf` /
+  `LastIndexOf` / `Split` / `Replace` / `Contains` / `Equals` 定义在
+  `src/compiler/builtin_api.c` 的 `members_string`——grep `stdlib/**/*.zan`
+  找不到**不等于没有**。（同理 `StringBuilder`、`Task`、`Convert`、
+  `Console` 也都是内建类型。）
+* **`JsonValue.Get` / `At` 的返回值可空**：`.Str(...)` 直接串上去会被编译器
+  拒绝（"'At' can return null; accessing 'Str' on its result faults at
+  runtime"）。存到局部变量判空、或用 `?.`。写解析类代码时**包一层
+  null 安全的取字段辅助函数**最省事（一串 `Get(...).Str(...)` 会炸出几十
+  个编译错误）。
+* **`JsonValue.PutJson(key, string)` 只收 JSON 串**；要塞一个已经建好的
+  `JsonValue` 得用 `Put(key, value)`。把 `JsonValue` 传给 `PutJson` 报
+  "cannot convert 'JsonValue' to 'string'"——`PutJson`/`AppendJson` 是
+  "把一段**文本**解析进文档"，`Put`/`Append` 才是"放一个值"。
+* **接口里不能有字段**（Zan 的接口只有方法）。契约要暴露"上一次失败
+  的原因"就写成 `LastError()` 方法，实现类里**同时**留一个 `lastError`
+  字段给"直接用这个类"的调用方——仓库既有约定（`IRetriever` /
+  `IReranker` 都是这么写的）。
+* **构造函数不能 `this()` 链式调用**（实证，2026-10-27）：在构造函数体里
+  写 `this();` 报 "this call could not be resolved to any callable (no
+  method, delegate, operator or builtin matches)"。想复用初始化只能
+  **把初始化抄一遍**，或抽成静态工厂方法。想省事就别设计成"一个构造函数
+  调另一个构造函数"的形状。
+* **`string.IndexOf(needle, startIndex)` 的第二参是起始下标**（编译器内建，
+  实证，2026-10-27）：从 `startIndex` 起找，返回**绝对下标**（找不到 -1）。
+  自己写"查找第一个匹配位置"的辅助函数时**别写成"找到就继续往后找"**——
+  那样只要找到过一次，函数最后仍会走到"没有更多匹配"那条分支，把已经
+  找到的位置返回成 -1，"存在吗"这个问题永远得到"不存在"的答案。
+* **跨包 namespace 免声明**：`zanc --package-project <repo>` 会扫所有
+  `packages/*/src/`，跨包 `using` 直接可用，**不需要在 `zan.pkg` 里声明
+  依赖**（`Zan.Ai` 一直用 `Zan.Net` 的 `System.Net.Http.Client`，从没声明
+  过）。新加一个包只要 `packages/<Name>/src/<Ns>/...` + `zan.pkg`，
+  编译器就能解析到它的命名空间——不必先想好包名再改一堆引用。
+* **`Convert.ToString` 支持 int/long/double/bool**（编译器合成，stdlib 的
+  `Convert` 类里只写了 base64/hex 那套）——拼字符串时不用手写 `"" + n`。
 * Never list attribute names with `*/` inside a `/* ... */` comment —
   `data-on-*/data-if` closes the comment mid-sentence and the rest becomes
   code (209 cascading errors). Separate with `、` or spaces.
@@ -158,18 +147,19 @@ Without MCP the same index is a file: `knowledge/symbols.json` next to the SDK
   calls instead. （test-probe compile)
 * **Enums must be top-level** — `class Foo { public enum Bar { A } }` then
   `Foo.Bar.A` fails with `cannot resolve member 'Bar'`. Declare the enum
-  at namespace scope (one file per enum) and use the bare name.
+  at namespace scope (repo convention: one file per enum, e.g.
+  `Models/Agg.zan`, `Models/ColKind.zan`) and use the bare name.
 * **There is no NaN constant, but NaN is producible and detectable** —
-  `0.0/0.0` yields NaN and `v != v` detects it (`double` has no
-  `IsNaN`/`IsInfinity`; use `v != v` and a threshold for infinities).
+  `0.0/0.0` yields NaN and `v != v` detects it（`double` has no
+  `IsNaN`/`IsInfinity`; use `v != v` and a threshold for infinities）.
   Still, don't use NaN as the "not computable" marker in a data table:
   it renders platform-specifically through `Convert.ToString` and poisons
   any downstream average. Leave the value unwritten and expose a separate
-  **validity mask** (a `List<bool>` parallel to the row indices) instead.
+  **validity mask**（a `List<bool>` parallel to the row indices）instead.
 * **Column stores truncate on type mismatch** — `DataCol.PutDouble` on an
-  `Int` column casts to `long` (16.67 → 16). When a computed result is
+  `Int` column casts to `long`（16.67 → 16）. When a computed result is
   fractional, write it to a **new Float column**, never over an integer
-  source column.
+  source column. （`Zan.DataFrame` window functions）
 * `new T[N]` is zero-initialized — a non-zero sentinel needs an explicit
   constructor pass. Every slot reads `0` right after allocation; if an
   incremental `Clear` only resets slots it has recorded (dirty buckets,
@@ -202,22 +192,23 @@ Without MCP the same index is a file: `knowledge/symbols.json` next to the SDK
 * **`new T(...)` 的值语义有坑**（实证，2026-10-20）：结构体构造临时对象在
   表达式层面是**地址**，传给按值形参 / 存进集合槽位 / 赋给结构体字段时，
   编译器需要按值取出——这条链路历史上没归一（`List<Vector3>.AddRange` 元素全 0、
-  `Vector3.Add(new Vector3(...), ...)` codegen 失败）。已在 zan 编译器侧收口。
-  写新代码时若又遇到「结构体值莫名其妙变全零 / codegen 报 Call parameter type
-  does not match」，先怀疑这条链路，别改用户代码绕开。
+  `Vector3.Add(new Vector3(...), ...)` codegen 失败）。已在 irgen 收口
+  （`coerce_struct_value` / `coerce_args_to_params`）。写新代码时若又遇到
+  「结构体值莫名其妙变全零 / codegen 报 Call parameter type does not match」，
+  先怀疑这条链路，别改用户代码绕开。
 * **泛型实例化：类型实参在 `new` 处必须是具体类型**（实证，2026-10-21）：
   具体类里写 `new Foo<Bar>()` 没问题；泛型类里写 `new Inner<T>()`（T 是**类级**
   类型参数）也没问题——`Base<Signup>` 实例化时 T 就具体化了。但**泛型方法内**
-  `new Foo<T, V>`（V 是**方法级**类型参数）不行：变体不会被编译器记录 →
-  不发射 → 调用退化成擦除版 → 取值一律 null/false/0，**不报错不抛异常**，
-  规则静默失效。设计时把类型实参留在类级，或改用 Func<T, V>` 形参而不是
-  按 V 实例化泛型类。
+  `new Foo<T, V>`（V 是**方法级**类型参数）不行：变体不会被
+  `discover_generic_insts` 记录 → 不发射 → 调用退化成擦除版 → 取值一律
+  null/false/0，**不报错不抛异常**，规则静默失效。设计时把类型实参留在类级，
+  或改用 `Func<T, V>` 形参而不是按 V 实例化泛型类。（TASKS A418）
 * **依赖型泛型基类会算错字段偏移**（实证，2026-10-21）：`class Validator<T> :
   Plan<T>` 能编译，但特化出的 `Validator<Signup>` 读基类字段的偏移是错的——
   基类构造里字段还是好的，继承来的方法里再读就成了 null（"null reference
   where an object is required"）。具体实例化的基类（`class X : Base<Signup>`）
   正常；泛型类持有依赖型泛型**字段**（`class Base<T> { Inner<T> inner; }`）
-  正常。要"泛型基类的成员"就用组合（字段），别用依赖型基类。
+  正常。要"泛型基类的成员"就用组合（字段），别用依赖型基类。（TASKS A419）
 * **泛型类的虚方法体拿不到类型参数**（实证，2026-10-21）：`class Ch<T> : Base`
   里 `Base.Accepts(object)` 是虚方法、`Ch<T>` 覆写它并写 `return m is T;`——
   **经基类引用虚调用恒为 false**（`Base b = ch; b.Accepts(o)`），直接调用
@@ -225,18 +216,18 @@ Without MCP the same index is a file: `knowledge/symbols.json` next to the SDK
   抹掉 `is T`**（`Func<object,bool> f = chan.Accepts;` → 恒 false），用
   lambda 包一层才恢复。类型判定要**定型成委托放在派生类构造器里**
   （`this.acceptsField = (object m) => { return m is T; };`），基类只调委托；
-  或者把 API 设计成非泛型。
-* **泛型方法在另一个编译单元里、类型实参靠推断 → 不单态化**（实证，
-  2026-10-21）：库里定义的 `Register<T>(Chan<T>)`，外面按推断调用
-  （`bus.Register(ch)`）→ 方法体里的 `is T` 恒假（**静默不生效**：消息没人
-  收）；写显式 `bus.Register<Order>(ch)` 就对。同一形状放单一编译单元里推断
-  与显式都对。**跨单元调用泛型方法时，类型实参要显式写**。
+  或者把 API 设计成非泛型。（TASKS A447）
+* **泛型方法在包单元里、类型实参靠推断 → 不单态化**（实证，2026-10-21）：
+  包里的 `Register<T>(Chan<T>)`，外面 `bus.Register(ch)`（推断）→ 方法体里的
+  `is T` 恒假（**静默不生效**：消息没人收）；写显式 `bus.Register<Order>(ch)`
+  就对。同一形状放单一编译单元里推断与显式都对。**跨单元调用泛型方法时，
+  类型实参要显式写**。（TASKS A448）
 * **值类型装不进 `object`**（实证，2026-10-21）：`object boxed = (object)v;`
   （v 是 int）→ **当场 access violation**（0xC0000005），没有诊断也没有消息。
   lambda 返回类型与委托返回类型不兼容（`Func<Order,object> f = (Order o) =>
   o.id;`）→ **编译期不报错**，运行期给非 null 的垃圾指针，进程退出时 ARC 去
   回收它再崩一次。凡是 `object` 参与的地方只放**引用类型**；值类型结果要用
-  泛型端点一路保留。
+  泛型端点一路保留。（TASKS A449）
 * **闭包捕获 `this` 会成引用环**（实证，2026-10-21）：把委托（闭包）存进自己
   的字段、闭包又捕获 `this` → 环 → ARC 回收不掉（`--check-leaks` 报出）。
   委托要捕获就捕获**独立的辅助对象**（如订阅表），别捕获宿主。
@@ -278,7 +269,7 @@ Without MCP the same index is a file: `knowledge/symbols.json` next to the SDK
   （返回消耗的字节数，`cpOut[0]` 是码点），别自己解 UTF-8。`string.Length`
   是**字节数**，不是字符数也不是显示宽度——显示宽度（中文 2 列、组合记号
   0 列）要另算，见 `Zan.Cli` 的 `TextWidth`。
-* **右 trim 用 `StringExtensions.TrimEnd`**（`s.TrimEnd()`）：内建 `Trim()`
+* **右trim 用 `StringExtensions.TrimEnd`**（`s.TrimEnd()`）：内建 `Trim()`
   只去两端；渲染表格/日志时想去掉行尾空白得用扩展方法。
 * **保留字坑**：`out`、`fixed`、`base` 都不能作变量名/参数名/字段名。编译器
   现在会**直接点名**：报 "'base' is a reserved word and cannot be used as a
@@ -306,9 +297,9 @@ Without MCP the same index is a file: `knowledge/symbols.json` next to the SDK
   Clear/Contains/IndexOf/LastIndexOf/Reverse/ToArray`。
 * **结构体跨文件的字段布局曾被降级成指针**（实证，2026-10-22）：类的字段类型
   声明在**另一个文件**时，旧编译器把字段类型降级成 `i8*` → 布局整体错位 →
-  **静默内存损坏**（值是错的，不是崩）。已修（编译器侧的结构体类型映射
-  `map_type`）。判定器是一条**跨文件** conformance 用例——新写"跨文件共享
-  结构体"的代码时先跑它，别自己判字段偏移。
+  **静默内存损坏**（值是错的，不是崩）。已修（`irgen.c` 的 `map_type`）。
+  判定器 `tests/conformance/struct_field_layout/`——新写"跨文件共享结构体"的
+  代码时先跑它，别自己判字段偏移。
 * **`List<T>.Count` 是属性，不是方法**（实证，2026-10-22）：写 `list.Count()`
   编译器直接报 "'List<T>.Count' is a property, not a method: drop the '()'"。
   内建 `Dictionary` 的 `Count`/`Keys`/`Values` 同理。**stdlib 的
@@ -319,11 +310,20 @@ Without MCP the same index is a file: `knowledge/symbols.json` next to the SDK
   InvalidOperationException；ConcurrentQueue 走 ToArray 快照（迭代中并发入队不影响
   本次迭代）。顺序口径：Stack 顶→底、LinkedList 头→尾、HashSet 按插入序。
   foreach 不调用枚举器的 Dispose，无需手动释放。
-  foreach 不调用枚举器的 Dispose，无需手动释放。
-* **解析失败异常类型对齐 C#**（实证，2026-11-02）：try 内 int.Parse("abc") 抛
-  FormatException、超界（99999999999）抛 OverflowException，long.Parse 接受全宽
-  值（3000000000、MaxValue）——此前一律误判成 IndexOutOfRangeException。
-  int.TryParse("s", out v) 的 out 已按预期写入（曾静默不写，调用方拿原值）。
+* **解析失败异常类型对齐 C#**（实证，2026-11-02；2026-11-03 扩 bool）：try 内
+  int.Parse("abc") 抛 FormatException、超界（99999999999）抛 OverflowException，
+  long.Parse 接受全宽值（3000000000、MaxValue）——此前一律误判成
+  IndexOutOfRangeException。int.TryParse("s", out v) 的 out 已按预期写入
+  （曾静默不写，调用方拿原值）。`bool.Parse` 也是编译器内建（2026-11-03）：
+  true/false 的大小写任意变体，其余抛 FormatException，null 走 parse guard
+  （"null string passed to a parse function"，int.Parse 同款，非 FormatException）。
+* **批次 6 糖的 API 面**（实证，2026-11-03）：`Directory.GetFiles(path, pattern)`
+  二参重载只匹配文件名（'*'/'?'，Windows 不区分大小写），返回仍是完整路径；
+  `DateTime.TryParse/Parse` 吃 ISO-8601（无时区按 UTC，偏移 ±HH:MM/±HHMM 均收）；
+  `SharedTable.TryGetInt/TryGetIntAt` 用 native 探针 `zan_shared_table_try_get_int(_at)`
+  区分"0 值命中"与"没读到"（GetInt 二者都返回 0）；`BlockingQueue.EnqueueFor(item, ms)`
+  超时回 false、负超时无限等；`Decimal.Round(d[, decimals])` 银行家舍入（ToEven）；
+  `new Guid(string)` 收规范/花括号/N 三形态归一规范小写，非法抛 FormatException。
 * **空安全是编译期硬检查**（实证，2026-10-22）：`JsonValue.Get(key)`、
   `List.First()` 等标为"可返回 null"的调用，其结果**直接取成员**会被编译器
   拦下（"'Get' can return null; accessing 'IsArray' on its result faults at
@@ -364,7 +364,7 @@ Without MCP the same index is a file: `knowledge/symbols.json` next to the SDK
 * **`JsonValue.Parse` 对坏 JSON 抛异常，不是返回 null**（实证，2026-10-26）：
   畸形 JSON 抛 `JsonException`（"Malformed JSON at position N"）。
   解析**外部输入**（网络响应、用户文件）必须自己兜 try/catch——
-  以为它返回 null 而只写 `if (root == null)` 判断的代码，遇到畸形响应
+  以为它返回 null 而直接 `if (root == null)` 判断的代码，遇到畸形响应
   会把异常抛给调用方。`JsonValue.ParseLenient` 是不抛的版本（返回
   已解析的部分）。
 * **包的命名空间按目录推导，`using` 要写到最深的那层**（实证，2026-10-26）：
@@ -468,8 +468,8 @@ Without MCP the same index is a file: `knowledge/symbols.json` next to the SDK
   值因此变成"0 毫秒"而不是"这一行坏了"，把排序和统计整个带偏；诊断数据里
   **错的值比没有值更坏**（人会照着假数据去优化）。要校验就自己严格解析：只接受
   `[+-]?digits[.digits][(e|E)[+-]?digits]`，失败判失败（由调用方决定"跳过并
-  计数"还是"报错"）。坑出处：DataValues 的严格数值解析记过一次，
-  `Zan.Game.Profiler` 的账单解析又踩一次。
+  计数"还是"报错"）。坑出处：`packages/Zan.Game/src/Game/Data/README.md` 记过
+  一次（DataValues 的严格数值解析），`Zan.Game.Profiler` 的账单解析又踩一次。
   **推论：`try { Convert.ToInt32(v) } catch { 回落默认值 }` 永远不会进 catch**
   ——坏输入不抛异常、直接给 0，于是"解析失败就回落默认值"的语义实际变成"坏值
   被读成 0"，而那圈 try/catch 是死代码。配置项、命令行参数这类"读进来再解析"
@@ -486,13 +486,13 @@ Without MCP the same index is a file: `knowledge/symbols.json` next to the SDK
   `list.Sort(...)` / `list.Sort((a, b) => ...)` 都不存在。要排序就自己写
   **稳定归并排序**（读—改—写，不用原地交换的下标赋值语义），返回**新列表**
   不改传入的列表——调用方的顺序往往带语义（"帧的时间顺序"），被排序函数改了
-  就没法再按时间看了。坑出处：帧剖析工具的排序实现踩过一次，已经写好了可复用的
-  版本，新的实体 / 事件排序照它的路子写。
+  就没法再按时间看了。坑出处：`Zan.Game.Profiler` 的 `ProfSort` 已经踩过并
+  写好了可复用的实现；`Zan.Game.Debug` 的实体排序照它的路子写。
 * **`Convert.ToString` 不存在**（实证，2026-10-22）：`Convert` 里只有
   Base64 / Hex 那几个（`ToBase64String` / `FromHexString` / `ToHexString`），
   **没有 `ToString` 重载**——`Convert.ToString(5)` 编译不过。数字转文本直接用
   数字自带的 `ToString()`（`5.ToString()`、`v.ToString()`）。浮点要定点格式
-  就自己写（固定小数位那种），别指望 `Convert.ToString(double)`。
+  就自己写（`ProfNum.Fixed` 那种），别指望 `Convert.ToString(double)`。
 * **`Gui.Mat4` 是唯一能直接喂渲染管线的 4x4 矩阵，布局别搞反**（实证，
   2026-10-30）：`Gui.Mat4` 是**列向量**约定（`v' = M * v`）+ 行主序存储
   （`m[row*4+col]`）：
@@ -538,9 +538,9 @@ Without MCP the same index is a file: `knowledge/symbols.json` next to the SDK
   `JsonValue` 是**依赖副作用**——要 `JsonValue` 就写 `using System.Json;`
   （仓库里 6700+ 个文件都这么写），别指望父命名空间兜底。
 * **ORM 的 `Insert<T>` / `Select<T>` / `Update<T>` / `Delete<T>` 是扩展方法，
-  不是数据库执行接口的接口方法**：真身在纯反射 ORM 库 `System.Data.Orm`
-  （`DbExtensions.zan` 按反射物化实体行），静态绑定——泛型基类模板体里的
-  `db.Select<T>()` 也直接解析（探针实证：`BaseDao<T>.All()` 编译运行通过）。
+  不是 `IDbConnection` / `IDbExecutor` 的接口方法**：真身在纯反射 ORM 库
+  `packages/Zan.Data/src/System/Data/Orm/`（`DbExtensions.zan` 按反射物化
+  实体行），静态绑定——泛型基类模板体里的 `db.Select<T>()` 也直接解析。
   看到"接口上没有 `Insert`"**不要去补接口**——补了只是多一份要同步的
   空契约；泛型仓储按惯例继承使用，由派生类把 `T` 落成具体实体。
 ## 4. Edit
@@ -565,9 +565,9 @@ zan_compile(content)           # one snippet in an isolated dir
 Direct:
 
 ```
-<ZAN_SDK>/toolchain/zanc <entry.zan> --auto-stdlib -o build/app
-<ZAN_SDK>/toolchain/zanc <entry.zan> --auto-stdlib --publish -o app   # release
-<ZAN_SDK>/toolchain/zanc <entry.zan> --auto-stdlib --check-leaks -o build/app
+build/zanc.exe <entry.zan> --auto-stdlib -o build/app
+build/zanc.exe <entry.zan> --auto-stdlib --publish -o app   # release
+build/zanc.exe <entry.zan> --auto-stdlib --check-leaks -o build/app
 ```
 
 **多文件项目必须枚举全部 .zan 源**（实证）：`--auto-stdlib` 只自动
@@ -763,8 +763,8 @@ State the command you ran and what it printed. Separate "compiled", "ran" and
   走的都是 `Put`，所以它们**同样不能用来更新已有键**——写第二遍就多一个
   同名成员，而读取首键胜，于是"设进去的值读回来还是第一次那个"。
   要覆盖就写 `obj.Set(key, JsonValue.NewStr(v))`（自己拼 `JsonValue.NewXxx`）。
-  实测（游戏存档基座）：`SetInt("gen", 1)` 后 `SetInt("gen", 2)`，
-  存盘读回得到 1——换成 `Set` 才对。
+  实测（`Zan.Game.Common` 的 profile 存档）：`SetInt("gen", 1)` 后
+  `SetInt("gen", 2)`，存盘读回得到 1——换成 `Set` 才对。
 * Steam 等 64 位 ID 的 JSON 约定是**字符串形态**（"76561197960287930"），
   且个别字段文档写数字、线上回字符串（如 AuthenticateUserTicket 的
   `result:"OK"`）——解析层两种形态都要接住。
@@ -798,4 +798,4 @@ State the command you ran and what it printed. Separate "compiled", "ran" and
 * 闭包（delegate/lambda）捕获方法的 **`out` 参数不回传**——捕获的是副本，delegate 里的累加/赋值调用方看不见，编译不报错（ZanDb `MinField` 首版在 `ScanRows` 回调里直接写 out 累计值，调用方永远拿到初值 0）。定式：delegate 里只操作局部变量，扫描结束后一次写回 out 参数。
 * `Dictionary.Keys` 返回的是**内部 List 本体**，不是副本——对它原地排序/增删会把键与值的配对打乱（排序后 `keys[i]` 对应的值还是旧槽位的）。需要排序先拷贝到新 List 再排。
 * `.html` 的设计名（或文件基名）**别叫 `App`**：与 stdlib `Gui.App` 同名时 nsresolve 会把 Chart 全家的 `App` 形参引用改坏（100 个 `undefined type 'App'`，100% 复现，TASKS A311）。模板 raw 编译要把 `{{NAME}}` 占位符换成真实项目名（IDE 建项目时自动替换+重命名）。要和并行会话彻底隔离：`git archive HEAD stdlib` 解到快照目录 + 复制 `zanc.exe` 和 `build/zanrt_*.obj` 进去（stdlib 按 exe 相对定位），再把 `LOCALAPPDATA` 指到私有目录隔离生成器缓存。
-* **析构器 `~X()` 不支持——声明即编译错误**（实证，2026-10-23）：它曾是死语法（binder/irgen 全程放行但从不发射、从不调用），编译器已改为当场拒绝并指路（ARC 释放链没有析构钩子）。确定性清理用显式 `Dispose`/`Close` 配 `using`；迁存量时直接删声明是零运行时差异（它们从未执行过），兜底逻辑保留在显式方法里。坑出处：编译器侧落地禁令时没迁调用点，存量 `~X()` 把既有工程重编挡了一整轮——实机报回归先对时间线（进程 StartTime + exe mtime vs 修复提交时间）。
+* **析构器 `~X()` 不支持——声明即编译错误**（实证，2026-10-23）：它曾是死语法（binder/irgen 全程放行但从不发射、从不调用），1e4e7f7d7 起编译器当场拒绝并指路（ARC 释放链没有析构钩子）。确定性清理用显式 `Dispose`/`Close` 配 `using`；迁存量时直接删声明是零运行时差异（它们从未执行过），兜底逻辑保留在显式方法里。坑出处：编译器侧落地禁令时没迁调用点，仓内 29 处 `~X()` 把 IDE 重编挡了一整轮——用户等修复等到以为「修复被回退」，实机报回归先对时间线（进程 StartTime + exe mtime vs 修复提交时间）。

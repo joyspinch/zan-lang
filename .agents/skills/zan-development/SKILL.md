@@ -310,11 +310,20 @@ Without MCP the same index is a file: `knowledge/symbols.json` next to the SDK
   InvalidOperationException；ConcurrentQueue 走 ToArray 快照（迭代中并发入队不影响
   本次迭代）。顺序口径：Stack 顶→底、LinkedList 头→尾、HashSet 按插入序。
   foreach 不调用枚举器的 Dispose，无需手动释放。
-  foreach 不调用枚举器的 Dispose，无需手动释放。
-* **解析失败异常类型对齐 C#**（实证，2026-11-02）：try 内 int.Parse("abc") 抛
-  FormatException、超界（99999999999）抛 OverflowException，long.Parse 接受全宽
-  值（3000000000、MaxValue）——此前一律误判成 IndexOutOfRangeException。
-  int.TryParse("s", out v) 的 out 已按预期写入（曾静默不写，调用方拿原值）。
+* **解析失败异常类型对齐 C#**（实证，2026-11-02；2026-11-03 扩 bool）：try 内
+  int.Parse("abc") 抛 FormatException、超界（99999999999）抛 OverflowException，
+  long.Parse 接受全宽值（3000000000、MaxValue）——此前一律误判成
+  IndexOutOfRangeException。int.TryParse("s", out v) 的 out 已按预期写入
+  （曾静默不写，调用方拿原值）。`bool.Parse` 也是编译器内建（2026-11-03）：
+  true/false 的大小写任意变体，其余抛 FormatException，null 走 parse guard
+  （"null string passed to a parse function"，int.Parse 同款，非 FormatException）。
+* **批次 6 糖的 API 面**（实证，2026-11-03）：`Directory.GetFiles(path, pattern)`
+  二参重载只匹配文件名（'*'/'?'，Windows 不区分大小写），返回仍是完整路径；
+  `DateTime.TryParse/Parse` 吃 ISO-8601（无时区按 UTC，偏移 ±HH:MM/±HHMM 均收）；
+  `SharedTable.TryGetInt/TryGetIntAt` 用 native 探针 `zan_shared_table_try_get_int(_at)`
+  区分"0 值命中"与"没读到"（GetInt 二者都返回 0）；`BlockingQueue.EnqueueFor(item, ms)`
+  超时回 false、负超时无限等；`Decimal.Round(d[, decimals])` 银行家舍入（ToEven）；
+  `new Guid(string)` 收规范/花括号/N 三形态归一规范小写，非法抛 FormatException。
 * **空安全是编译期硬检查**（实证，2026-10-22）：`JsonValue.Get(key)`、
   `List.First()` 等标为"可返回 null"的调用，其结果**直接取成员**会被编译器
   拦下（"'Get' can return null; accessing 'IsArray' on its result faults at
