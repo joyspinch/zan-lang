@@ -543,6 +543,7 @@ static const struct { const char *type; const char *name; } native_members[] = {
     { "long",   "Parse" },
     { "double", "Parse" },
     { "float",  "Parse" },
+    { "bool",   "Parse" },
     { "string", "AsSpan" },
     { "string", "ToBytes" },
     { "Gate",   "Park" },

@@ -1173,7 +1173,8 @@ static LLVMValueRef emit_builtin_call_intercept(zan_irgen_t *g, zan_ast_node_t *
                            (rn.len == 5 && memcmp(rn.str, "float", 5) == 0) ||
                            (rn.len == 6 && memcmp(rn.str, "Double", 6) == 0) ||
                            (rn.len == 6 && memcmp(rn.str, "Single", 6) == 0);
-            if ((int_recv || dbl_recv) &&
+            int bool_recv = (rn.len == 4 && memcmp(rn.str, "bool", 4) == 0);
+            if ((int_recv || dbl_recv || bool_recv) &&
                 pm.len == 5 && memcmp(pm.str, "Parse", 5) == 0 &&
                 expr->call.args.count == 1) {                LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
                 LLVMTypeRef i8pp = LLVMPointerType(i8ptr, 0);
@@ -1186,10 +1187,48 @@ static LLVMValueRef emit_builtin_call_intercept(zan_irgen_t *g, zan_ast_node_t *
                     zan_diag_emit_code(g->diag, DIAG_ERROR, expr->loc, 3057,
                                   "%.*s.Parse requires a string argument",
                                   (int)rn.len, rn.str);
+                    if (bool_recv) {
+                        return LLVMConstInt(LLVMInt1TypeInContext(g->ctx), 0, 0);
+                    }
                     return int_recv ? LLVMConstInt(i64, 0, 0)
                                     : LLVMConstReal(dbl, 0.0);
                 }
                 LLVMValueRef r;
+                if (bool_recv) {
+                    /* C# bool.Parse：只认 true/false 的大小写任意变体，
+                     * 其余 FormatException（消息含 "not a valid" 命中
+                     * guard 的 Format 路由）。strcasecmp 在目标 exe 的
+                     * CRT 可用（runtime gui_runtime_font.c 同款先例）。 */
+                    LLVMTypeRef i1t = LLVMInt1TypeInContext(g->ctx);
+                    LLVMTypeRef sc_ty = LLVMFunctionType(i32t,
+                        (LLVMTypeRef[]){ i8ptr, i8ptr }, 2, 0);
+                    LLVMValueRef f = get_libc_fn(g, "strcasecmp", sc_ty);
+                    LLVMValueRef s_safe = emit_parse_str_guard(g, s, expr->loc);
+                    LLVMValueRef s_true = LLVMBuildGlobalStringPtr(
+                        g->builder, "true", "bool.ptrue");
+                    LLVMValueRef s_false = LLVMBuildGlobalStringPtr(
+                        g->builder, "false", "bool.pfalse");
+                    LLVMValueRef st = zan_call2(g->builder, sc_ty, f,
+                        (LLVMValueRef[]){ s_safe, s_true }, 2, "bool.pt");
+                    LLVMValueRef sf = zan_call2(g->builder, sc_ty, f,
+                        (LLVMValueRef[]){ s_safe, s_false }, 2, "bool.pf");
+                    LLVMValueRef is_t = zan_icmp(g->builder, LLVMIntEQ, st,
+                        LLVMConstInt(i32t, 0, 0), "bool.ist");
+                    LLVMValueRef is_f = zan_icmp(g->builder, LLVMIntEQ, sf,
+                        LLVMConstInt(i32t, 0, 0), "bool.isf");
+                    LLVMValueRef ok = LLVMBuildOr(g->builder, is_t, is_f,
+                        "bool.ok");
+                    emit_runtime_check(g, LLVMBuildNot(g->builder, ok,
+                        "bool.bad"), expr->loc,
+                        "bool.Parse: input is not a valid Boolean");
+                    LLVMValueRef v = LLVMBuildSelect(g->builder, is_t,
+                        LLVMConstInt(i1t, 1, 0),
+                        LLVMConstInt(i1t, 0, 0), "bool.v");
+                    emit_release_owned_call_temp(
+                        g, expr->call.args.items[0], s, locals);
+                    return LLVMBuildSelect(g->builder, ok, v,
+                        LLVMConstInt(i1t, 0, 0), "bool.safe");
+                }
                 if (int_recv) {
                     int is64 = (rn.len == 4 && memcmp(rn.str, "long", 4) == 0) ||
                                (rn.len == 5 && memcmp(rn.str, "Int64", 5) == 0);
