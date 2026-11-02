@@ -4272,9 +4272,16 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
 
     case AST_BASE_EXPR:
         return c->binder->type_error; /* resolved in */
-
-    default:
+    default: {
+        /* B-ID102 覆盖审计：有非 NULL 子节点的表达式 kind 落到 default 即被静默
+         * type_error，疑似漏改（ZANC_TRACE 门控）。 */
+        int nc = zan_ast_child_count(expr), live = 0;
+        for (int i = 0; i < nc; i++) if (zan_ast_child_at(expr, i)) live++;
+        if (live > 0)
+            zan_compile_trace("checker.check_expr: kind %d has %d live children but no case",
+                              (int)expr->kind, live);
         return c->binder->type_error;
+    }
     }
 }
 
@@ -4613,8 +4620,16 @@ void zan_checker_check_stmt(zan_checker_t *c, zan_ast_node_t *stmt) {
         }
         break;
 
-    default:
+    default: {
+        /* B-ID102 覆盖审计：有非 NULL 子节点的语句 kind 落到 default 即疑似漏改
+         * （ZANC_TRACE 门控）。 */
+        int nc = zan_ast_child_count(stmt), live = 0;
+        for (int i = 0; i < nc; i++) if (zan_ast_child_at(stmt, i)) live++;
+        if (live > 0)
+            zan_compile_trace("checker.check_stmt: kind %d has %d live children but no case",
+                              (int)stmt->kind, live);
         break;
+    }
     }
 }
 
