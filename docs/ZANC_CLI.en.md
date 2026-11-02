@@ -18,7 +18,7 @@ build/zanc <entry and source files...> [options] -o <output>
 
 - No manual `.o` assembly or explicit linker steps needed; no `-I`/`-l` flags required (standard library namespaces are pulled in on-demand, and corresponding native drivers are linked automatically).
 - **Inputs are a file set, not a project folder**: `zanc` compiles only the `.zan` files listed on the command line (plus auto-resolved stdlib/package sources). In multi-file projects, specify all `src/**/*.zan` files explicitly -- **or hand it a directory** (`zanc src -o app.exe`), and the compiler expands `*.zan` recursively itself.
-- Flags fall into five categories: Output mode (`-o`, `--emit-lib`, `--publish`), Standard library (`--auto-stdlib`, `--stdlib-path`, `--no-packages`), Target platform (`--target`, `--emit-apk`, `--emit-ipa`), Native linking (`-L`, `--driver-dir`, `--link-lib`), and Diagnostics (`--emit-ir`, `-g`, `--dump-*`).
+- Flags are grouped exactly like `zanc --help`: **Common** (inputs/output/optimization/targets/stdlib/native linking), **Publish** (`--publish`, `--strip-symbols`, string obfuscation), **Debug** (`-g`, leak/runtime guards, diagnostic dumps), **Packaging** (`--emit-apk`/`--emit-ipa` and their identity flags), and **Internal (unstable)** (`-ferror-limit`, package-market install channel).
 
 ---
 
@@ -27,7 +27,7 @@ build/zanc <entry and source files...> [options] -o <output>
 ### 1.1 Daily Development Cycle
 
 ```bash
-# Compile and run (auto pulls stdlib, default debug optimization -O0)
+# Compile and run (auto pulls stdlib, default optimization -O2; only -g forces -O0)
 build/zanc src/main.zan -o _scratch/app.exe && _scratch/app.exe
 
 # Multi-file project: hand the directory to the compiler (expands *.zan
@@ -50,9 +50,10 @@ build/zanc probe.zan -o probe.exe && probe.exe
 # Windowed GUI app: Windows automatically infers windows subsystem (no black console window)
 build/zanc src -o app.exe
 
-# Design file entry (.html/.zan declarative UI): design file MUST be the first argument
-# (directory expansion only collects .zan -- pass the design file explicitly)
-build/zanc src/MyApp.html src -o app.exe
+# The compile-time HTML channel is gone: .html/.htm positional inputs are rejected
+# ("the compile-time HTML channel has been removed"). Build the window with Gui
+# widgets and load markup at runtime via Gui.App.LoadHtml; use --embed to ship assets.
+build/zanc src -o app.exe
 ```
 
 ### 1.3 Cross-Compilation & Mobile
@@ -100,66 +101,100 @@ llc -mcpu=x86-64 -mattr=+sse3,+ssse3,+sse4.1,+sse4.2,+crc32,+aes,+avx,+avx2,+fma
 (The root fix — making the IR legalizable on a generic CPU — is not done yet;
 see ledger entry A438.)
 
-Debug builds (`-g`) automatically enable leak detection and ARC quarantine (`--check-leaks --arc-guard`). Set `ZAN_ARC_TRACE=1` when running the resulting executable to print real-time ARC events (alloc/retain/release with addresses and call sites).
+Debug builds (`-g`) force `-O0` and, **unless `--publish` is also given**, automatically enable leak detection and ARC quarantine (`--check-leaks --arc-guard`). `-g` does **not** imply `--strict-runtime`; the IDE's F5 runner passes it explicitly. Under `--publish` both diagnostics default off, while the over-release net stays on unless `--arc-guard`/`--no-arc-guard` is explicit; `-g --publish` still strips at link time, so it usually yields no usable debug info. Set `ZAN_ARC_TRACE=1` when running a `--check-leaks` executable to print real-time ARC events (alloc/retain/release with addresses and call sites).
 
 ---
 
 ## 2. CLI Options Reference
 
-### Output & Optimization
-| Flag | Description |
-|---|---|
-| `-o <file>` | Output file path. Extension determines type: `.dll/.so/.dylib` = shared lib, `.a/.lib` = static lib, otherwise executable |
-| `--emit-lib` | Force library output (no CRT entry point) |
-| `--publish` | Release distribution: optimization (default `-Os`) + symbol stripping |
-| `-O0..-O3/-Os/-Oz` | Optimization level: default `O0`, `--publish` default `Os`, `-Oz` for extreme size constraint |
-| `-g, --debug` | DWARF debug symbols (forces `O0`, enables `--check-leaks` and `--arc-guard`) |
-| `--icon <f.ico>` / `--no-icon` | Embed / skip Windows application icon |
-| `--embed <path[=name]>` | Bake file or directory into executable resources (repeatable) |
-| `--emit-apk` | Full-pipeline Android APK builder; pairs with `--apk-package` / `--apk-label` |
-| `--emit-ipa` | Full-pipeline iOS IPA builder; pairs with `--ipa-bundle-id` / `--ipa-name` |
+> Grouped exactly like `zanc --help`: **Common / Publish / Debug / Packaging /
+> Internal (unstable)**. Defaults and interactions follow the parser in
+> `src/compiler/main_options_parse.c` and the value application in
+> `src/compiler/main.c`. Anything marked "(internal/unstable)" is not a public contract.
 
-### Standard Library & Packages
-| Flag | Description |
-|---|---|
-| `--auto-stdlib` | Locate stdlib & installed packages; on-demand pull-in of referenced namespaces |
-| `--stdlib-path <dir>` | Explicit stdlib directory path |
-| `--no-packages` | Disable package discovery while keeping stdlib pull-in |
-| `--package-api <url>` | Package registry endpoint |
-| `--package-install <dir>` | Install a local package |
+### 2.1 Common
+| Flag | Value / default | Description |
+|---|---|---|
+| `-o <file>` | — | Output file. Extension determines type: `.dll/.so/.dylib` = shared lib, `.a/.lib` = static lib, otherwise executable |
+| `--emit-lib` | off | Force library output (no CRT entry point); with `-o`, the suffix still decides shared vs static |
+| `-O0..-O3/-Os/-Oz` | `-O2` | Optimization level; `--publish` defaults to `-Os`; `-Oz` = minimum size. An explicit `-O` overrides the publish default, but `-g` always forces `-O0` |
+| `--target <name>` | host | Cross-compilation target (full list in §3) |
+| `--list-targets` | — | Print all available target triples and exit |
+| `--subsystem <console\|windows>` | auto | PE subsystem (Windows only); GUI apps infer `windows` |
+| `--stdlib-path <dir>` | auto | Explicit stdlib root (pull-in stays on-demand) |
+| `--auto-stdlib` | **on** | Locate stdlib & installed packages; on-demand pull-in of referenced namespaces; passing it restates the default |
+| `--no-stdlib` | — | Disable automatic stdlib **and** package discovery; `--no-packages` disables packages only |
+| `--no-packages` | — | Disable package discovery only (stdlib pull-in stays on) |
+| `--fast-alloc` | on for native | Per-thread small-object allocator (`rt_mem.c`); not linked on Apple (macOS/iOS) or cross targets; warns and falls back to CRT when no allocator object exists |
+| `--no-fast-alloc` | — | Fall back to CRT malloc (heap debugging / returning blocks to an external CRT); last of the two wins |
+| `-L<dir>`, `--libpath <dir>` | — | Append a native library search directory (repeatable) |
+| `--driver-dir <dir>` | bundled dir | Override the bundled native driver directory |
+| `--link-lib <name>` | — | Extra `-l<name>`; the name may only contain `[A-Za-z0-9._+-]` (use `-L`/`--libpath` for paths) |
+| `--link-input <file>` | — | Extra object/resource/library input file (repeatable) |
+| `--embed <path[=name]>` | — | Bake a file/directory into executable resources (repeatable; embedded copies win at runtime, stored encrypted) |
+| `--icon <f>` | built-in | Windows executable icon; `--emit-ipa` also uses it as the IPA icon (otherwise probes `assets/icon.png`, `assets/icon.ico`, `icon.png`, `icon.ico`); a failed embed warns and falls back to the built-in icon (none under `--publish` without `--default-icon`) |
+| `--no-icon` | — | Embed no icon at all (skips `--icon` and the built-in default); Windows PE only |
+| `--default-icon` | — | Explicitly embed the built-in icon; only needed under `--publish` (non-publish builds embed it anyway) |
+| `--quiet`, `-q` | — | Suppress stdout progress lines (driver bundling, APK packaging, the "Compiled N files" summary) |
+| `--time` | — | Print per-phase timings and scale stats |
+| `-D<name>[=value]` | — | Preprocessor definition |
+| `@<file>` | — | Response file (one per line or whitespace separated, `"quoted"` for paths with spaces, `#` comments, max 8 levels of nesting) |
+| (positional, file/dir) | — | `.zan` files, or a **directory** expanded recursively into sorted `*.zan` inputs. Directory walk skips `.`-prefixed and `.git/build/publish/bin/obj/node_modules/_scratch/dist/out/vendor/.zan-packages` directories; an empty directory fails with "no .zan source files under '...'". **Only `.zan` is collected**: explicit `.html`/`.htm` inputs are rejected with "the compile-time HTML channel has been removed" — build the window with Gui widgets and load markup at runtime via `Gui.App.LoadHtml` (ship assets with `--embed`) |
+| (no flag, automatic) | — | Windows/Linux/macOS x64/arm64 targets link the multi-worker coroutine scheduler (`zanrt_io_mt`); worker count order: `System.Threading.AsyncRuntime.SetWorkers` (set in Main) → `ZAN_CO_WORKERS` → logical cores. IO sharding/sync-fast paths similarly prefer `AsyncRuntime` over `ZAN_IO_SHARDS`/`ZAN_IO_SYNCFAST` |
+| (default, native) | — | Windows/Linux native link the small-object allocator (`rt_mem.c`: ≤2048B size classes, lock-free caches, 8 cross-thread free bands, `ld --wrap` over malloc/free/calloc/realloc). Apple native does not link it (ld64 has no `--wrap`); Android cross never links it (bionic TLS bootstrap crash); linux-musl cross links it when the sysroot has the object. Debug with `ZAN_LINK_ECHO=1` to echo the link command |
+| `--version`, `-v` / `--help`, `-h` | — | Print version / usage help and exit |
 
-### Target & Runtime
-| Flag | Description |
-|---|---|
-| `--target <name>` | Cross-compilation target (see §3) |
-| `--list-targets` | Print all available target triples |
-| `--subsystem <console\|windows>` | PE subsystem for Windows binaries |
-| `--fast-alloc` / `--no-fast-alloc` | Fast small-object thread-caching allocator (default on native win/linux) / fallback to CRT malloc |
-| `--no-runtime-checks` | Disable runtime guards (e.g. division-by-zero checks) |
-| `--strict-runtime` | Abort immediately with exit(70) upon runtime guard violation |
-| `--link-mode <shared\|static>` | Native driver link mode for publish builds (default: `shared`) |
+### 2.2 Publish
+| Flag | Value / default | Description |
+|---|---|---|
+| `--publish` | off | Release build: `-Os` by default, link-time strip (same as `--strip-symbols`), shard-module optimization. `--check-leaks`/`--arc-guard` default off (explicit flags still apply). The **over-release net stays on** unless `--arc-guard`/`--no-arc-guard` is given. The built-in icon is skipped by default (`--default-icon` re-enables it) |
+| `--strip-symbols` | off | Link-time `-s` + ICF + link optimization; implied by `--publish`; alone it only strips and does not change the optimization level |
+| `--link-mode <shared\|static>` | shared | Native driver linking on publish: `shared` copies driver libs next to the exe, `static` links them into the exe |
+| `--obfuscate-strings` | off | XOR-obfuscate user string literals (also prunes stdlib bodies when not `-g`). CLI wins over `ZAN_OBF=1` (internal/unstable) |
+| `--no-obfuscate-strings` | — | Force obfuscation off; last one wins; `ZAN_NO_OBF=1` has the same effect (internal/unstable) |
+| `--hide-diagnostics` | off | Replace `file:line:col` in runtime guard reports with `#site` IDs (compile diagnostics unchanged) (internal/unstable) |
+| `--emit-site-map <f>` | — | Write the `#site -> file:line:col` map for `--hide-diagnostics` (internal/unstable) |
 
-### Native Linking
-| Flag | Description |
-|---|---|
-| `-L<dir>`, `--libpath <dir>` | Append native library search directory |
-| `--driver-dir <dir>` | Override built-in native driver search directory |
-| `--link-lib <name>` | Extra `-l<name>` link flag |
-| `--link-input <file>` | Extra object/resource/library input file |
+### 2.3 Debug
+| Flag | Value / default | Description |
+|---|---|---|
+| `-g`, `--debug` | off | DWARF debug info; forces `-O0`; **unless `--publish` is also given**, enables `--check-leaks` + `--arc-guard`. It does **not** enable `--strict-runtime` (the IDE F5 runner passes that explicitly). With `--publish` the release link still strips, so debug info is usually unusable — avoid the combination |
+| `--check-leaks` | `-g` and not publish | Report unreleased objects at program exit |
+| `--no-check-leaks` | — | Turn leak reporting off |
+| `--arc-guard` | `-g` and not publish | Quarantine freed blocks and trap stale retain/release (memory grows with allocations; diagnostics only); explicit under `--publish` too |
+| `--no-arc-guard` | — | Turn quarantine off, which also turns off the `--publish` over-release net |
+| `--runtime-checks` | **on** | Enable runtime guards (bounds, division by zero, etc.), including under `--publish` |
+| `--no-runtime-checks` | — | Disable runtime guards; last of the two wins |
+| `--strict-runtime` | off | Guard failures call `exit(70)`; `ZAN_RT_HARD` non-empty and non-`0` is equivalent; `ZAN_RT_HARD=0` explicitly forces soft mode |
+| `--deny-warnings` | off | Treat compiler warnings as fatal errors |
+| `--warn-level <none\|default\|error>` | `default` | `none` hides warnings; `default` prints normally; `error` equals `--deny-warnings`; invalid values exit 2 |
+| `--suppress <list>` | — | Suppress **warnings** by numeric code (comma/space separated, letter prefix optional, e.g. `W0003,0003`); with `--deny-warnings`/`--warn-level=error` warnings are already errors and are not suppressed |
+| `--dump-tokens` | — | Dump lexer tokens and exit |
+| `--dump-ast` | — | Dump the parse tree and continue compiling |
+| `--emit-ir` | — | Emit LLVM IR to stdout and exit without linking |
+| `--emit-symbols <f>` / `--gen-meta <f>` | — | Write the symbol index / compilation-unit metadata and exit (IDE/LSP) |
+| `--api <symbol>` | — | Query signatures and locations from the API index (no compilation) |
 
-### Compiler Internals & Diagnostics
-| Flag | Description |
-|---|---|
-| `--dump-tokens`, `--dump-ast`, `--emit-ir` | Frontend & IR diagnostics |
-| `--check-leaks`, `--arc-guard` | Leak reporting & quarantined free blocks |
-| `--deny-warnings` | Treat compilation warnings as fatal errors |
-| `--no-gen` | Disable Zan code generators (used in bootstrap) |
-| `--api <symbol>` | Instant symbol lookup from knowledge index without compilation |
-| `--time`, `-q`, `--quiet` | Timing breakdown / quiet mode |
-| `-D<name>[=value]` | Preprocessor definition |
-| `@<file>` | Response file: read CLI arguments from file (newline/space separated) |
-| (positional, a directory) | `zanc <dir> ...`: a **directory** is expanded recursively into `*.zan` inputs (sorted by path; `.`-prefixed and `build/bin/obj/dist/out/vendor/node_modules` directories are skipped) -- the preferred form for large projects, since the command line no longer grows with the file count; a directory without any `.zan` fails with "no .zan source files under '...'". Only `.zan` files are collected: a design file (`.html`) must be passed explicitly and must be the first argument (`zanc src/MyApp.html src -o app.exe`) |
-| `-v, --version`, `-h, --help` | Print version / usage help |
+### 2.4 Packaging
+| Flag | Value / default | Description |
+|---|---|---|
+| `--emit-apk <f>` | — | Full Android APK pipeline; **requires** `--target android-x64` or `android-arm64`; compiles as a shared library (`-o` names the temporary libmain path, removed after packaging; the final artifact is `<f>`); signing needs Java (`JAVA_HOME` or PATH) |
+| `--apk-package <id>` | `dev.zan.<entry>` | APK package name; CLI beats `zan.proj` `androidPackage` |
+| `--apk-label <name>` | entry basename | APK display label; CLI beats `zan.proj` `androidLabel` |
+| `--emit-ipa <f>` | — | Full iOS IPA pipeline; **requires** `--target ios-arm64`; `-o <name>.ipa` enables it too; icon from `--icon` or `assets/icon.png` probes |
+| `--ipa-bundle-id <id>` | `dev.zan.<app name>` | IPA bundle identifier |
+| `--ipa-name <name>` | from the `.ipa` path | App name inside the IPA |
+
+### 2.5 Internal (unstable)
+| Flag | Value / default | Description |
+|---|---|---|
+| `-ferror-limit=N` | 100 | Stop after N errors; `0` = unlimited (internal/unstable) |
+| `--package-api <url>` | — | Configure the package-market API (HTTPS; localhost HTTP allowed); must be paired with `--package-install` (internal/unstable) |
+| `--package-list-missing` | — | Scan inputs and print missing-namespace diagnostics; exits 3 when anything is missing (internal/unstable) |
+| `--package-install <dir>` | — | Install a local package directory; requires `--package-name` (internal/unstable) |
+| `--package-name <name>` | — | Package name to install (internal/unstable) |
+| `--package-scope <project\|global>` | `project` | Install scope (internal/unstable) |
+| `--package-project <dir>` | `.` | Project root for package discovery / project-scope installation (internal/unstable) |
 
 ---
 
@@ -183,18 +218,31 @@ Debug builds (`-g`) automatically enable leak detection and ARC quarantine (`--c
 ## 4. Environment Variables
 
 ### Compile Time (`zanc`)
-- `ZAN_LIB_PATH`: Additional native library search paths (`;` on Windows, `:` on Unix).
-- `ZAN_VERBOSE_LINK`: Echo link command line to inspect `-L` / `-l` flags.
-- `ZAN_PULLIN_DEBUG`: Print standard library pull-in decisions.
-- `ZANC_DUMP_BAD_IR`: Dump offending function IR when LLVM verifier fails.
-- `JAVA_HOME`: JDK directory for APK signing in `--emit-apk`.
+| Variable | Effect |
+|---|---|
+| `ZAN_LIB_PATH` | Extra native library search directories (`;` on Windows, `:` on Unix) — set it when TLS/DB driver import libs are not on the default path |
+| `ZAN_VERBOSE_LINK` | Echo the native link command line (to see where `-L`/`-l` come from) |
+| `ZAN_PULLIN_DEBUG` | Print standard-library pull-in decisions |
+| `ZAN_NO_PULLIN_FILTER` / `ZAN_NO_PRUNE` | Pull-in debugging: disable filtering / disable pruning |
+| `ZANC_DUMP_BAD_IR` | Dump the offending function's IR when the LLVM verifier rejects it |
+| `ZANC_TRACE` | Compiler-internal tracing (unified diag.c exit) |
+| `ZAN_TRACE_SYNC` | Print which external symbols pull in the sync/coroutine runtime |
+| `ZAN_WARN_NARROW` | Narrowing-conversion warnings (silent by default) |
+| `ZAN_OBF` / `ZAN_NO_OBF` | `=1` turns string obfuscation on/off by default; the CLI `--obfuscate-strings`/`--no-obfuscate-strings` wins |
+| `ZAN_RT_HARD` | Non-empty and non-`0`: guard failures exit immediately; `=0`: force soft mode (overrides `--strict-runtime`) |
+| `JAVA_HOME` | JDK used for APK signing in `--emit-apk` |
+| `ZAN_GENMETA_DUMP` / `ZAN_GEN_REPLY` | genrun code-generator debugging |
 
-### Runtime (Target Executable)
-- `ZAN_RT_HARD`: Exit immediately on guard violation (equivalent to `--strict-runtime`).
-- `ZAN_CO_WORKERS`: Number of workers in multithreaded coroutine scheduler (default: `min(cores, 4)`).
-- `ZAN_CO_QUANTUM_MS`: Cooperative preemption time slice in ms (default: `2`).
-- `ZAN_CO_STACK`: Stack size for `Task.Spawn`/`Run` fibers (default: `128KB`).
-- `ZAN_ARC_TRACE`: Set to `1` on `--check-leaks` binaries to trace all ARC allocation/retain/release events.
+### Runtime (read by the built executable; `env` is the only channel once the exe is built)
+| Variable | Effect |
+|---|---|
+| `ZAN_RT_HARD` | Non-empty and non-`0`: guard failures exit immediately (equivalent to `--strict-runtime`); `=0` explicitly forces soft mode |
+| `ZAN_CO_WORKERS` | Worker count of the multi-worker coroutine scheduler (native 64-bit targets use the multi-worker driver by default with no build flag; default `min(logical cores, 4)`, see `AsyncRuntime.SetWorkers` precedence) |
+| `ZAN_CO_QUANTUM_MS` | Cooperative preemption time slice for coroutines (ms, default 2, `0` = off): the compiler emits `zan_co_poll` on every loop back-edge of async functions so compute-heavy frames exceeding the slice are requeued instead of starving timers/IO callbacks/sibling coroutines; accounting uses a microsecond monotonic clock (Windows QPC, POSIX CLOCK_MONOTONIC) |
+| `ZAN_CO_STACK` | Stack size for `Task.Spawn`/`Run` fibers (default 128KB, range 64KB–16MB) |
+| `ZAN_GUI_ICONS` | Override the icon-pack directory (search order: env → `icons/` next to the exe → embedded → stdlib) |
+| `ZAN_CEF_*` | CEF browser driver runtime location (see `examples/gui_cef_browser/README.md` for the full table: RUNTIME/CACHE/MIRROR/LOG/SWITCHES/HELPER*) |
+| `ZAN_ARC_TRACE` | Set to `1` on `--check-leaks` binaries to trace all ARC allocation/retain/release events |
 
 ---
 
@@ -214,5 +262,5 @@ Debug builds (`-g`) automatically enable leak detection and ARC quarantine (`--c
 
 1. **Pull-in scope affects resolution**: `--auto-stdlib` only pulls referenced namespaces. If symbols clash across unimported namespaces, it will only manifest in full-pull scenarios (such as IDE builds).
 2. **Multi-file projects require listing all sources**: Passing only `src/main.zan` will not discover peer files automatically. Use shell globbing or response files (`@sources.rsp`).
-3. **Design files (.html) must come first**: In declarative GUI apps, the design template must be the first command-line argument for code synthesis to wire up controls properly.
+3. **The compile-time HTML entry is gone**: `.html`/`.htm` positional inputs are rejected outright — "put the design first" no longer works. Build the window with Gui widgets and load markup at runtime via `Gui.App.LoadHtml`.
 4. **Use `@file` for long commands**: On Windows, command-line length limits can be exceeded; place arguments in a response file.

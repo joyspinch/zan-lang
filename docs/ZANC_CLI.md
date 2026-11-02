@@ -7,7 +7,8 @@
 一份把 zanc 的命令面说全的文档：全部参数、全部交叉目标、全部环境变量、
 各场景的标准配方（可直接复制）、以及反复踩过的坑。会话里"命令搞不清"
 时先查这里；本文与 `zanc --help` / `--list-targets` 同步维护，改了参数
-解析（src/compiler/main.c）必须同提交更新本文。
+解析（`src/compiler/main_options_parse.c`）或帮助文本
+（`src/compiler/main_options.c`）必须同提交更新本文。
 
 --------------------------------------------------------------------------------
 
@@ -23,16 +24,17 @@ build/zanc <入口和源文件...> [options] -o <输出>
 - **输入是"文件集合"而不是"工程"**：zanc 只编译命令行上列出的 .zan（加上
   按需拉入的 stdlib/包命名空间）。多文件项目要把 `src/**/*.zan` 全部列上——
   或者**直接给目录**（`zanc src -o app.exe`），编译器自己递归展开 `*.zan`。
-- 参数分五类：输出形态（-o/--emit-lib/--publish）、标准库控制
-  （默认自动拉入；--no-stdlib/--stdlib-path）、目标平台（--target/--emit-apk）、
-  原生链接（-L/--driver-dir/--link-lib）、诊断（--emit-ir/-g/--dump-*）。
+- 参数分五组（与 `zanc --help` 分组一致）：**常用**（输入/输出/优化/目标/标准库/
+  原生链接）、**发布**（--publish/--strip-symbols/字符串混淆）、**调试**
+  （-g/泄漏与运行时守卫/诊断输出）、**打包**（--emit-apk/--emit-ipa 及其身份参数）、
+  **内部（未稳定）**（-ferror-limit/包市场安装通道）。
 
 ## 1. 标准配方（复制即用）
 
 ### 1.1 日常开发循环
 
 ```bash
-# 编译 + 运行（默认自动拉入标准库，调试默认档 O0）
+# 编译 + 运行（默认自动拉入标准库，默认 -O2；-g 才强制 O0）
 build/zanc src/main.zan -o _scratch/app.exe && _scratch/app.exe
 
 # 多文件项目：把目录交给编译器（递归展开 *.zan，按路径排序，命令行恒长）
@@ -54,10 +56,10 @@ build/zanc probe.zan -o probe.exe && probe.exe
 # 带窗口的 GUI 程序：Windows 上自动推断 windows 子系统（无黑框终端，无需手动指定 --subsystem）
 build/zanc src -o app.exe
 
-# 设计稿入口（.html/.zan 声明式 UI）：**设计稿必须是命令行第一个参数**，
-# zanc 从第一份设计文档合成 Main 与控件字段，自动推断 windows 子系统
-# （目录展开只收 .zan，设计稿要显式给）
-build/zanc src/MyApp.html src -o app.exe
+# 编译期 HTML 入口已移除：.html/.htm 位置参数会被拒绝
+# （"the compile-time HTML channel has been removed"）。界面用 Gui 组件搭骨架，
+# 运行期 Gui.App.LoadHtml 装载标记；要随 exe 发布就用 --embed 烤进去。
+build/zanc src -o app.exe
 ```
 
 ### 1.3 交叉编译与移动端
@@ -111,11 +113,15 @@ llc -mcpu=x86-64 -mattr=+sse3,+ssse3,+sse4.1,+sse4.2,+crc32,+aes,+avx,+avx2,+fma
 
 （治本——让 IR 在 generic CPU 下也能合法化——尚未做，见项目台账 A438。）
 
-调试构建（`-g`）自动开启泄漏检测与 ARC 检疫（等于 `--check-leaks
---arc-guard`），程序退出时报告未释放对象并隔离悬垂指针。
-IDE 的 F5 调试使用 `-g --arc-guard --check-leaks --strict-runtime`；项目的
-`strictMemory = 1` 让普通构建/运行也使用这组诊断。发布独立选择模式：
+调试构建（`-g`）会强制 `-O0`，并在**未同时给 `--publish`** 时自动开启
+泄漏检测与 ARC 检疫（等于 `--check-leaks --arc-guard`），程序退出时报告
+未释放对象并隔离悬垂指针。`-g` **不会**自动开启 `--strict-runtime`。
+IDE 的 F5 调试是显式传 `-g --arc-guard --check-leaks --strict-runtime`；
+项目的 `strictMemory = 1` 让普通构建/运行也使用这组诊断。发布独立选择模式：
 Release 使用 `--publish`，Debug 使用 `-g --no-arc-guard --no-check-leaks`。
+`--publish` 下这两个诊断默认关闭，但 over-release 网默认开启（除非显式
+给了 `--arc-guard` 或 `--no-arc-guard`）；`-g --publish` 仍会按发布链路
+strip，通常拿不到可用调试信息，不建议组合。
 ARC 检疫会保留已释放的块，内存占用随分配量增长，因此只用于诊断运行，
 本地严格内存选项不覆盖任何平台的发布模式。
 
@@ -126,66 +132,95 @@ ARC 事件（alloc/retain/release/release-dyn，含对象地址、分配站点�
 file:line 键控），同形状分配点会互相顶掉名字——定位持有人时以
 trace 的事件序为准，不要顺着报表的站点名硬找。
 
-## 2. 全参数表（与 --help 一致 + 隐藏参数）
+## 2. 全参数表（与 `zanc --help` 同源）
 
-### 输出
-| 参数 | 说明 |
-|---|---|
-| `-o <file>` | 输出文件。**后缀决定产物类型**：`.dll/.so/.dylib`=共享库，`.a/.lib`=静态库，其余=可执行 |
-| `--emit-lib` | 强制库输出（无 CRT/入口点） |
-| `--publish` | 发布档：优化（默认 -Os）+ strip |
-| `-O0..-O3/-Os/-Oz` | 优化档；默认 O0，--publish 默认 Os；-Oz 极限体积（边缘/嵌入式） |
-| `-g, --debug` | DWARF 调试信息（强制 O0；自动开 --check-leaks/--arc-guard） |
-| `--icon <f.ico>` / `--no-icon` / `--default-icon` | 嵌入/跳过 Windows 图标（--publish 默认不内嵌内置图标，可传 --default-icon 显式开启） |
-| `--embed <p[=n]>` | 把文件/目录烤进可执行资源（可重复）；运行期读取**内嵌优先**——烤进的副本是权威，`File.ReadAllText/ReadAllBytes/ReadBytes/GetSize/Exists` 命中内嵌直接返回，盘上同名文件不再覆盖它（发布后界面/资源不落盘、不被旁路文件替换）；资源在 exe 内**加密存放**（压缩后按内容派生密钥流整体 XOR，`strings` 扒不到明文，读取时内存解密、不落临时文件；防静态提取，不对抗逆向专家）；GUI 程序自带 `skins/` 暂存时，仅当目录内含 base.css（完整替身）才跳过 stdlib 皮肤基线自动内嵌，pack-only 暂存照常内嵌基线且暂存包赢重名 |
-| `--emit-apk` | （未列入 help）Android APK 全链路打包；配 `--apk-package`/`--apk-label` |
-| `--emit-ipa` | iOS IPA 全链路打包；配 `--ipa-bundle-id`/`--ipa-name`（`-o <file.ipa>` 也自动开启） |
+> 分组与 `zanc --help` 一致：**常用 / 发布 / 调试 / 打包 / 内部（未稳定）**。
+> 默认值与联动关系以 `src/compiler/main_options_parse.c` 的解析和
+> `src/compiler/main.c` 的落值为准；标「(内部/未稳定)」的不是公共契约。
 
-### 标准库与包
-| 参数 | 说明 |
-|---|---|
-| `--auto-stdlib` | 自动定位 stdlib 与已安装包，**按需拉入**用到的命名空间 |
-| `--stdlib-path <dir>` | 指定 stdlib 目录（测试门用；拉入仍按需） |
-| `--no-packages` | 只关包发现（stdlib 拉入照常）。回归锁 `conformance_gen_pkg_isolation`：包内库级调用不牵连父编译 |
-| `--package-api <url>` / `--package-list-missing` / `--package-install <dir> --package-name <n>` / `--package-scope` / `--package-project` | 包市场：API 地址、缺包诊断、本地包安装与作用域 |
+### 2.1 常用（Common）
+| 参数 | 取值 / 默认 | 说明 |
+|---|---|---|
+| `-o <file>` | — | 输出文件。**后缀决定产物类型**：`.dll/.so/.dylib`=共享库，`.a/.lib`=静态库，其余=可执行 |
+| `--emit-lib` | 关 | 强制库输出（无 CRT/入口点）；与 `-o` 后缀推断并存时后缀仍决定 shared/static |
+| `-O0..-O3/-Os/-Oz` | 默认 `-O2` | 优化档；`--publish` 默认 `-Os`；`-Oz` 极限体积（边缘/嵌入式）。显式 `-O` 覆盖 `--publish` 默认，但 `-g` 总是强制 `-O0` |
+| `--target <name>` | 本机 | 交叉编译（§3 全表） |
+| `--list-targets` | — | 列出全部目标后退出 |
+| `--subsystem <console\|windows>` | 自动 | PE 子系统（仅 Windows）；GUI 程序自动推断 windows |
+| `--stdlib-path <dir>` | 自动定位 | 指定 stdlib 根目录（测试门用；拉入仍按需） |
+| `--auto-stdlib` | **开** | 自动定位 stdlib 与已安装包，**按需拉入**用到的命名空间；显式传等于重申默认 |
+| `--no-stdlib` | — | 关自动 stdlib **和**包发现；`--no-packages` 只关包 |
+| `--no-packages` | — | 只关包发现（stdlib 拉入照常）。回归锁 `conformance_gen_pkg_isolation`：包内库级调用不牵连父编译 |
+| `--fast-alloc` | native 默认开 | 小对象分配器（`rt_mem.c`）；Apple（macOS/iOS）与交叉目标不链；目标无分配器对象时告警并回退 CRT |
+| `--no-fast-alloc` | — | 原生回退 CRT malloc——排查堆问题、或块需交还外部 CRT/驱动边界时用；与 `--fast-alloc` 同现时后写的生效 |
+| `-L<dir>` / `--libpath <dir>` | — | 追加原生库搜索目录（可重复） |
+| `--driver-dir <d>` | 内建目录 | 覆盖内建原生驱动目录（测试门指向新编的 zan_gui） |
+| `--link-lib <name>` | — | 额外 `-l<name>`；名字只允许 `[A-Za-z0-9._+-]`，路径请用 `-L`/`--libpath` |
+| `--link-input <f>` | — | 额外链接对象/资源/库文件（可重复） |
+| `--embed <p[=n]>` | — | 把文件/目录烤进可执行资源（可重复）；运行期读取**内嵌优先**——烤进的副本是权威，`File.ReadAllText/ReadAllBytes/ReadBytes/GetSize/Exists` 命中内嵌直接返回，盘上同名文件不再覆盖它（发布后界面/资源不落盘、不被旁路文件替换）；资源在 exe 内**加密存放**（压缩后按内容派生密钥流整体 XOR，`strings` 扒不到明文，读取时内存解密、不落临时文件；防静态提取，不对抗逆向专家）；GUI 程序自带 `skins/` 暂存时，仅当目录内含 base.css（完整替身）才跳过 stdlib 皮肤基线自动内嵌，pack-only 暂存照常内嵌基线且暂存包赢重名 |
+| `--icon <f>` | 内建图标 | Windows 可执行图标；`--emit-ipa` 也把它当 IPA 图标（缺省按 `assets/icon.png`、`assets/icon.ico`、`icon.png`、`icon.ico` 探测）；嵌入失败告警并回退内建（`--publish` 未给 `--default-icon` 时则无图标） |
+| `--no-icon` | — | 不嵌入任何图标（跳过 `--icon` 与内建默认）；仅 Windows PE |
+| `--default-icon` | — | 显式嵌入内建图标；只有 `--publish` 需要它（非发布档本来就嵌内建图标） |
+| `--quiet, -q` | — | 静默 stdout 进度行（驱动装运、APK 打包、`Compiled N files` 汇总） |
+| `--time` | — | 打印各阶段耗时与规模统计 |
+| `-D<name>[=v]` | — | 预处理符号 |
+| `@<file>` | — | 响应文件（一行一个或空白分隔，带空格路径用引号，`#` 起注释，最多嵌套 8 层）——**超长命令行/含空格路径用它** |
+| （位置参数，文件/目录） | — | `.zan` 文件，或**目录**（递归展开 `*.zan`，按路径排序）。目录输入跳过 `.` 前缀与 `.git/build/publish/bin/obj/node_modules/_scratch/dist/out/vendor/.zan-packages` 等目录；目录里没有 `.zan` 报 "no .zan source files under '...'"。**只收 `.zan`**：显式给 `.html`/`.htm` 会被 "the compile-time HTML channel has been removed" 拒绝——界面用 Gui 组件搭骨架、运行期 `Gui.App.LoadHtml` 装载标记（内嵌资源走 `--embed`） |
+| （无旗标，按目标自动） | — | Windows/Linux/macOS 的 x64/arm64 目标自动链入多 worker 协程调度器（`zanrt_io_mt`）；worker 数解析顺序：`System.Threading.AsyncRuntime.SetWorkers`（Main 内设置）→ `ZAN_CO_WORKERS` 环境变量 → 逻辑核数。IO 分片与同步完成快路径同理由 `AsyncRuntime` 优先于 `ZAN_IO_SHARDS`/`ZAN_IO_SYNCFAST` |
+| （默认，native） | — | Windows/Linux 原生默认链入小对象分配器（`rt_mem.c`：≤2048B 尺寸分级无锁缓存、跨线程 free 分 8 条带，`ld --wrap` 全图接管 malloc/free/calloc/realloc）。Apple 原生不链（ld64 无 `--wrap`）；Android 交叉永不链（bionic TLS bootstrap 崩溃）；linux-musl 交叉 sysroot 有对象即自动链。Windows 链接自动改走捆绑 GNU ld（lld 的 PE `--wrap` 改写导入槽，程序加载即死 exit 127）。实测 win-x64：spawn k=1 -26%~-31%，k=32 分片后不劣。调试：`ZAN_LINK_ECHO=1` 回显链接命令 |
+| `--version, -v` / `--help, -h` | — | 版本 / 帮助 |
 
-### 目标与运行时
-| 参数 | 说明 |
-|---|---|
-| `--target <name>` | 交叉编译（§3 全表） |
-| `--list-targets` | 列出全部目标 |
-| `--subsystem <console\|windows>` | PE 子系统；GUI 程序用 windows（仅 Windows） |
-| （无旗标，按目标自动） | Windows/Linux/macOS 的 x64/arm64 目标自动链入多 worker 协程调度器（`zanrt_io_mt`）；worker 数解析顺序：`System.Threading.AsyncRuntime.SetWorkers`（Main 内设置）→ `ZAN_CO_WORKERS` 环境变量 → 逻辑核数。IO 分片与同步完成快路径同理由 `AsyncRuntime` 优先于 `ZAN_IO_SHARDS`/`ZAN_IO_SYNCFAST` |
-| （默认，native） | Windows/Linux 原生默认链入小对象分配器（`rt_mem.c`：≤2048B 尺寸分级无锁缓存、跨线程 free 分 8 条带，`ld --wrap` 全图接管 malloc/free/calloc/realloc）。Apple 原生不链（ld64 无 `--wrap`）；Android 交叉永不链（bionic TLS bootstrap 崩溃）；linux-musl 交叉 sysroot 有对象即自动链。Windows 链接自动改走捆绑 GNU ld（lld 的 PE `--wrap` 改写导入槽，程序加载即死 exit 127）。实测 win-x64：spawn k=1 -26%~-31%，k=32 分片后不劣。调试：`ZAN_LINK_ECHO=1` 回显链接命令 |
-| `--fast-alloc` | 显式请求分配器（native 默认已开，保留以兼容旧脚本、或覆盖 `--no-fast-alloc`）；目标无分配器对象时告警并回退 CRT |
-| `--no-fast-alloc` | 原生回退 CRT malloc——排查堆问题、或块需交还外部 CRT/驱动边界时用。与 `--fast-alloc` 同现时后写的生效 |
-| `--no-runtime-checks` | 关运行时守卫（如除零） |
-| `--strict-runtime` | 守卫失败直接 exit(70)（否则受 ZAN_RT_HARD 控制） |
-| `--link-mode <shared\|static>` | 发布时原生驱动链接方式（默认 shared：拷驱动在 exe 旁） |
+### 2.2 发布（Publish）
+| 参数 | 取值 / 默认 | 说明 |
+|---|---|---|
+| `--publish` | 关 | 发布档：默认 `-Os`、链接期 strip（同 `--strip-symbols`）、启用 shard 模块优化；`--check-leaks`/`--arc-guard` 默认关（显式传入仍生效）；**over-release 网默认开**（未显式给 `--arc-guard`/`--no-arc-guard` 时）；内建图标默认不嵌（`--default-icon` 可显式开启） |
+| `--strip-symbols` | 关 | 链接期 `-s` + ICF + 链接优化；`--publish` 已隐含；单独使用时只加 strip、不改优化档 |
+| `--link-mode <shared\|static>` | shared | 发布时原生驱动链接方式：shared 拷驱动到 exe 旁，static 链进 exe |
+| `--obfuscate-strings` | 关 | XOR 混淆用户字符串字面量（非 `-g` 时顺带裁剪 stdlib 函数体）；CLI 优先于环境变量 `ZAN_OBF=1`（内部/未稳定） |
+| `--no-obfuscate-strings` | — | 强制关闭；与 `--obfuscate-strings` 同现时后写的生效；环境变量 `ZAN_NO_OBF=1` 同效（内部/未稳定） |
+| `--hide-diagnostics` | 关 | 运行时守卫报告里的 `file:line:col` 换成 `#站点号`（编译期诊断不变）（内部/未稳定） |
+| `--emit-site-map <f>` | — | 落盘 `#站点号 -> file:line:col` 映射，配合 `--hide-diagnostics` 还原位置（内部/未稳定） |
 
-### 原生链接
-| 参数 | 说明 |
-|---|---|
-| `-L<dir>` / `--libpath <dir>` | 追加原生库搜索目录 |
-| `--driver-dir <d>` | 覆盖内建原生驱动目录（测试门指向新编的 zan_gui） |
-| `--link-lib <name>` | 额外 `-l<name>` |
-| `--link-input <f>` | 额外链接对象/资源/库文件 |
+### 2.3 调试（Debug）
+| 参数 | 取值 / 默认 | 说明 |
+|---|---|---|
+| `-g, --debug` | 关 | DWARF 调试信息；强制 `-O0`；**未同时给 `--publish`** 时自动开 `--check-leaks`+`--arc-guard`。**不会**自动开 `--strict-runtime`（IDE F5 是显式传的）。与 `--publish` 同用会按发布链路 strip，通常拿不到可用调试信息，不建议组合 |
+| `--check-leaks` | `-g` 且非 publish | 程序退出时报告未释放对象 |
+| `--no-check-leaks` | — | 关闭泄漏报告 |
+| `--arc-guard` | `-g` 且非 publish | 释放检疫：保留已释放块并捕获悬垂 retain/release（内存随分配量增长，只用于诊断）；显式传入时在 `--publish` 下也生效 |
+| `--no-arc-guard` | — | 关检疫，同时关掉 `--publish` 默认的 over-release 网 |
+| `--runtime-checks` | **开** | 启用运行时守卫（如数组/切片越界、除零）；发布档也默认开 |
+| `--no-runtime-checks` | — | 关运行时守卫；与 `--runtime-checks` 同现时后写的生效 |
+| `--strict-runtime` | 关 | 守卫失败直接 `exit(70)`；`ZAN_RT_HARD` 非空且非 `0` 等效；`ZAN_RT_HARD=0` 显式压回软模式 |
+| `--deny-warnings` | 关 | 将编译警告视为致命错误（阻断构建） |
+| `--warn-level <none\|default\|error>` | `default` | `none` 不打印警告；`default` 正常；`error` 等同 `--deny-warnings`；非法值报错退出 2 |
+| `--suppress <list>` | — | 按编号抑制**警告**（逗号/空格分隔，字母前缀可省，如 `W0003,0003`）；与 `--deny-warnings`/`--warn-level=error` 同用时警告已升级为错误，不再被抑制 |
+| `--dump-tokens` | — | 词法 token 后退出 |
+| `--dump-ast` | — | 打印语法树后继续编译 |
+| `--emit-ir` | — | IR 到 stdout 后退出，不链接 |
+| `--emit-symbols <f>` / `--gen-meta <f>` | — | 输出索引/元数据后退出（IDE/LSP 用） |
+| `--api <symbol>` | — | 从知识库检索 API 符号并打印签名与位置（无需编译，极速响应） |
 
-### 编译器内部
-| 参数 | 说明 |
-|---|---|
-| `--dump-tokens` / `--dump-ast` / `--emit-ir` | 前端/IR 诊断 |
-| `--check-leaks` / `--arc-guard` | 泄漏报告 / 释放检疫（-g 默认开） |
-| `--no-check-leaks` / `--no-arc-guard` | 调试构建里关掉它们 |
-| `--strict-runtime` | 守卫失败 exit(70) 退出 |
-| `--deny-warnings` | 将编译警告视为致命错误（阻断构建） |
-| `--emit-symbols <f>` / `--gen-meta <f>` | 输出索引/元数据后退出（IDE/LSP 用） |
-| `--api <symbol>` | 从知识库检索 API 符号并打印签名与位置（无需编译，极速响应） |
-| `--time` / `-q` / `--quiet` | 阶段计时 / 静默进度行 |
-| `-D<name>[=v]` | 预处理符号 |
-| `@<file>` | 响应文件：从文件读更多参数（一行一个或空白分隔，带空格路径用引号）——**超长命令行/含空格路径用它** |
-| （位置参数，目录） | `zanc <dir> ...`：**目录**递归展开成 `*.zan` 输入（按路径排序，跳过 `.` 前缀与 `build/bin/obj/dist/out/vendor/node_modules` 等目录）——大项目首选，命令行长度与文件数无关；目录里没有 `.zan` 报 "no .zan source files under '...'"。**只收 `.zan`**：显式给 `.html`/`.htm` 位置参数会被拒绝——编译期 HTML 通道已移除，界面用 Gui 组件搭骨架、运行期 `Gui.App.LoadHtml` 装载标记（内嵌资源走 `--embed`） |
-| `--version/-v`、`--help/-h` | 版本 / 帮助 |
+### 2.4 打包（Packaging）
+| 参数 | 取值 / 默认 | 说明 |
+|---|---|---|
+| `--emit-apk <f>` | — | Android APK 全链路打包；**要求** `--target android-x64` 或 `android-arm64`；按共享库编译（`-o` 给 libmain 的临时路径，打包后删除，最终产物是 `<f>`）；签名需要 Java（`JAVA_HOME` 或 PATH） |
+| `--apk-package <id>` | `dev.zan.<入口名>` | APK 包名；CLI 优先于 zan.proj `androidPackage` |
+| `--apk-label <name>` | 入口文件名 | APK 显示名；CLI 优先于 zan.proj `androidLabel` |
+| `--emit-ipa <f>` | — | iOS IPA 全链路打包；**要求** `--target ios-arm64`；`-o <name>.ipa` 也会自动开启；图标取 `--icon` 或 `assets/icon.png` 等探测 |
+| `--ipa-bundle-id <id>` | `dev.zan.<app 名>` | IPA bundle identifier |
+| `--ipa-name <name>` | 由 `.ipa` 路径推导 | IPA 内 App 名 |
+
+### 2.5 内部（未稳定）
+| 参数 | 取值 / 默认 | 说明 |
+|---|---|---|
+| `-ferror-limit=N` | 100 | 最多报 N 条错误后停止；`0` = 不限（内部/未稳定） |
+| `--package-api <url>` | — | 配置包市场 API（HTTPS；localhost 允许 HTTP）；必须与 `--package-install` 同用（内部/未稳定） |
+| `--package-list-missing` | — | 扫描输入并打印缺失命名空间诊断；有缺失退出 3（内部/未稳定） |
+| `--package-install <dir>` | — | 本地包安装；必须配 `--package-name`（内部/未稳定） |
+| `--package-name <name>` | — | 安装包名（内部/未稳定） |
+| `--package-scope <project\|global>` | `project` | 安装作用域（内部/未稳定） |
+| `--package-project <dir>` | `.` | 包发现/项目级安装的工程根（内部/未稳定） |
 
 ## 3. 交叉编译目标（--list-targets）
 
@@ -215,13 +250,15 @@ trace 的事件序为准，不要顺着报表的站点名硬找。
 | `ZANC_TRACE` | 编译器内部跟踪（diag.c 统一出口） |
 | `ZAN_TRACE_SYNC` | 打印哪些外部符号把同步/协程运行时拉进来（排查"为什么带上了 co 调度器"） |
 | `ZAN_WARN_NARROW` | 收窄转换告警（默认静默） |
+| `ZAN_OBF` / `ZAN_NO_OBF` | `=1` 时默认开/关字符串混淆；CLI `--obfuscate-strings`/`--no-obfuscate-strings` 优先 |
+| `ZAN_RT_HARD` | 非空且非 `0`：守卫失败硬退出；`=0`：强制软模式（可覆盖 `--strict-runtime`） |
 | `JAVA_HOME` | --emit-apk 签名用 JDK |
 | `ZAN_GENMETA_DUMP` / `ZAN_GEN_REPLY` | genrun 代码生成器调试 |
 
 ### 运行期（编译产物读；exe 已定型，env 是唯一现成通道）
 | 变量 | 作用 |
 |---|---|
-| `ZAN_RT_HARD` | 设了它守卫失败即硬退出（默认构建下等效 `--strict-runtime` 的行为） |
+| `ZAN_RT_HARD` | 非空且非 `0` 时守卫失败硬退出（等效 `--strict-runtime`）；`=0` 显式强制软模式 |
 | `ZAN_CO_WORKERS` | 多 worker 协程调度器的 worker 数（native 64-bit 目标默认即多 worker 驱动，无需任何构建旗标；默认=min(逻辑核数，4)，见 `AsyncRuntime.SetWorkers` 优先） |
 | `ZAN_CO_QUANTUM_MS` | 协程协作式抢占的时间片（毫秒，默认 2，0=关闭）：编译器在 async 函数的每个循环回边埋 `zan_co_poll`，超片的计算密集帧自动重排到队尾，不再饿死定时器/IO 回调/兄弟协程；片长记账走微秒级单调钟（Windows QPC，POSIX CLOCK_MONOTONIC），2ms 就是真 2ms |
 | `ZAN_CO_STACK` | Task.Spawn/Run 有栈 fiber 的栈大小（默认 128KB，范围 64KB~16MB） |
@@ -273,7 +310,8 @@ full 会把 CPU 打满几十分钟，**只在用户明确要求或发布门槛�
    大拉入面暴露——"单文件全绿、全量构建炸"先查拉入面差异，别急着改代码。
 2. **多文件项目必须显式列全源文件**。只传 main.zan 会报"DbContext
    undefined"这类缺类型错——zanc 不扫目录。
-3. **设计稿 html 必须是第一个参数**（§1.2）；放后面 = Main/控件字段全缺。
+3. **编译期 HTML 入口已移除**：`.html`/`.htm` 位置参数会被直接拒绝，
+   不再是"放第一个就能用"；界面用 Gui 组件搭骨架、运行期 `Gui.App.LoadHtml`。
 4. **非 publish 链接需要真实导入库**。程序拉了 [DllImport("ssl")] 这类
    原生库时，普通链接要求导入库在搜索路径可达（ZAN_LIB_PATH/-L/驱动目录）；
    只有 `--publish` 静态发布对无主的 DllImport 做 stub 兜底（运行期才报错）。
@@ -299,6 +337,8 @@ full 会把 CPU 打满几十分钟，**只在用户明确要求或发布门槛�
 
 ## 7. 维护
 
-改 `src/compiler/main.c` 的参数解析/加新参数 → 同提交更新本文 §2/§3/§4
-与 `zanc --help` 文案（help 文本就在 main.c）。本文与 help 冲突时以
-`zanc --help` 为准并修本文。
+改参数解析（`src/compiler/main_options_parse.c`）或加新参数 → 同提交更新
+本文 §2/§3/§4 与 `zanc --help` 文案（help 在
+`src/compiler/main_options.c` 的 `print_usage()`）。分组顺序固定为
+常用 / 发布 / 调试 / 打包 / 内部（未稳定），两侧条目必须一一对应。本文与
+help 冲突时以代码解析与 `zanc --help` 为准并修本文。
