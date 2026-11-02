@@ -7,9 +7,13 @@
 # the check is looking at the right IR (it must retain/release); the
 # [NoRuntime] one must contain no ARC call, because the runtime it would call
 # is exactly what such a method cannot rely on.
+#
+# -O0 pins the irgen-level IR: the check is about which calls irgen emits into
+# each body. At the default opt pipeline both uncalled functions are DCE'd and
+# ARC pairs can be cancelled, which would make the verdict vacuous.
 
 execute_process(
-  COMMAND "${ZANC}" "${SRC}" --emit-ir
+  COMMAND "${ZANC}" "${SRC}" --emit-ir -O0
   OUTPUT_VARIABLE _ir
   ERROR_VARIABLE _err
   RESULT_VARIABLE _rc
