@@ -2,6 +2,7 @@ cmake_minimum_required(VERSION 3.16)
 # CXX is enabled so that targets linking LLVM's C++ static libraries can be
 # driven by the C++ linker where needed (see the MinGW case below).
 project(zan-lang C CXX)
+include("${CMAKE_SOURCE_DIR}/cmake/ZanToolchain.cmake")
 
 # ---- Git gate hooks (docs/WORKSPACE_CONVENTIONS.md §0) ----
 # Point core.hooksPath at the in-repo hooks so every clone/worktree gets the
@@ -234,8 +235,37 @@ endif()
 # so compile the reactor with a MinGW gcc (NOT clang-cl/MSVC); elsewhere the
 # system C compiler already matches.
 if(WIN32)
+    # The MinGW root is resolved once and reused by the runtime-object recipe
+    # and the POST_BUILD bundle. Empty cache value = auto-detect (environment,
+    # PATH, then standard install roots); pinning it stays an explicit opt-in.
+    set(ZAN_MINGW_ROOT "" CACHE PATH
+        "MinGW-w64 root used to assemble the bundled linking toolchain (empty = auto-detect)")
+    if(ZAN_MINGW_ROOT AND EXISTS "${ZAN_MINGW_ROOT}/bin/ld.exe")
+        set(_zan_mingw_root "${ZAN_MINGW_ROOT}")
+    else()
+        if(ZAN_MINGW_ROOT)
+            message(WARNING
+                "ZAN_MINGW_ROOT=${ZAN_MINGW_ROOT} has no bin/ld.exe; "
+                "ignoring the stale cache value and probing again.")
+        endif()
+        zan_mingw_roots(_zan_mingw_roots)
+        zan_resolve_root(_zan_mingw_probe
+            NAME "MinGW-w64 runtime compiler"
+            SENTINEL "bin/ld.exe"
+            ENV ZAN_MINGW_ROOT MINGW_ROOT MINGW_HOME
+            PATH_TOOLS x86_64-w64-mingw32-gcc gcc
+            ROOTS ${_zan_mingw_roots})
+        set(_zan_mingw_root "${_zan_mingw_probe}")
+        if(NOT _zan_mingw_root)
+            zan_probe_failure_message(_zan_mingw_probe _zan_mingw_msg)
+            message(WARNING "${_zan_mingw_msg}\n"
+                "The zanrt_io/timer/... objects will be built with "
+                "${CMAKE_C_COMPILER}; cross-target builds keep using the "
+                "committed toolchain/<target> objects.")
+        endif()
+    endif()
     find_program(ZAN_RT_IO_CC NAMES gcc x86_64-w64-mingw32-gcc
-                 HINTS ${ZAN_MINGW_ROOT}/bin C:/TDM-GCC-64/bin)
+                 HINTS "${_zan_mingw_root}/bin")
     if(NOT ZAN_RT_IO_CC)
         set(ZAN_RT_IO_CC ${CMAKE_C_COMPILER})
     endif()
@@ -519,15 +549,13 @@ add_custom_command(TARGET zanc POST_BUILD
 # in-process against this bundle (see src/compiler/main.c). If the bundle is
 # absent at runtime, zanc falls back to a system clang targeting the same ABI.
 if(WIN32)
-    set(ZAN_MINGW_ROOT "C:/TDM-GCC-64" CACHE PATH
-        "MinGW-w64 root used to assemble the bundled linking toolchain")
     option(ZAN_BUNDLE_TOOLCHAIN "Bundle GNU ld + MinGW runtime next to zanc" ON)
     if(ZAN_BUNDLE_TOOLCHAIN)
         find_program(ZAN_LLD_EXECUTABLE NAMES ld.lld.exe ld.lld lld.exe lld
             HINTS "${LLVM_TOOLS_BINARY_DIR}" "${LLVM_DIR}/../../../bin")
         add_custom_command(TARGET zanc POST_BUILD
             COMMAND ${CMAKE_COMMAND}
-                    -DMINGW_ROOT=${ZAN_MINGW_ROOT}
+                    -DMINGW_ROOT=${_zan_mingw_root}
                     -DDEST=$<TARGET_FILE_DIR:zanc>
                     -DLLD_EXECUTABLE=${ZAN_LLD_EXECUTABLE}
                     -P ${CMAKE_SOURCE_DIR}/cmake/bundle_toolchain.cmake

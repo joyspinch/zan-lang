@@ -1,7 +1,7 @@
 param(
   [string]$Clicks = "",          # "x,y;x,y" in window coords, screenshot after each
   [string]$Wheels = "",          # "x,y,steps;..." applied after the clicks
-  [string]$OutPrefix = "d:\project\zan-lang\build\v_step",
+  [string]$OutPrefix = "",       # screenshot prefix; default <repo>\build\v_step
   [switch]$Restart,
   [int]$Skin = 10,
   [string]$Wall = "",
@@ -12,6 +12,12 @@ param(
   [string]$Drags = ""          # "x1,y1,x2,y2;..." press, move in steps, release
 )
 
+# Paths are derived from this script's location, so the driver works from any
+# checkout (run it from the repo root as before).
+$root = Split-Path -Parent $PSScriptRoot
+$build = Join-Path $root 'build'
+if (-not $OutPrefix) { $OutPrefix = Join-Path $build 'v_step' }
+
 if ($Restart) {
   $cfgDir = "$env:APPDATA\ZanIDE"
   New-Item -ItemType Directory -Force -Path $cfgDir | Out-Null
@@ -19,7 +25,7 @@ if ($Restart) {
   Set-Content -Path "$cfgDir\config.cfg" -Value $cfg -NoNewline
   Get-Process ZanIDE -ErrorAction SilentlyContinue | Stop-Process -Force
   Start-Sleep -Milliseconds 600
-  Start-Process "d:\project\zan-lang\build\ZanIDE.exe" -RedirectStandardOutput "d:\project\zan-lang\build\ide_out.log" -RedirectStandardError "d:\project\zan-lang\build\ide_err.log"
+  Start-Process (Join-Path $build 'ZanIDE.exe') -RedirectStandardOutput (Join-Path $build 'ide_out.log') -RedirectStandardError (Join-Path $build 'ide_err.log')
   Start-Sleep -Milliseconds 4000
 }
 

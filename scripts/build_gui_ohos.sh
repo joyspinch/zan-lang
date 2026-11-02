@@ -15,12 +15,57 @@
 # Usage: scripts/build_gui_ohos.sh [x64|arm64|all]   (default: all)
 set -euo pipefail
 REPO=$(cd "$(dirname "$0")/.." && pwd)
-DEVECO="${DEVECO_ROOT:-C:/Program Files/Huawei/DevEco Studio}"
+
+# DevEco Studio location, most specific override first, then the standard
+# install dirs of each host. Nothing is pinned to an author's drive letter.
+find_deveco() {
+  local c
+  for c in "${ZAN_DEVECO_HOME:-}" "${DEVECO_ROOT:-}"; do
+    [ -n "$c" ] && [ -d "$c/sdk/default/openharmony/native" ] && { printf '%s\n' "$c"; return 0; }
+  done
+  if [ -n "${DEVECO_SDK_HOME:-}" ]; then
+    c="$DEVECO_SDK_HOME"
+    case "$c" in */native) c="${c%/native}" ;; esac
+    while [ -n "$c" ] && [ "$c" != "/" ] && [ ! -d "$c/default/openharmony/native" ]; do
+      c=$(dirname "$c")
+    done
+    [ -d "$c/default/openharmony/native" ] && { dirname "$c"; return 0; }
+  fi
+  for c in "${PROGRAMFILES:-}/Huawei/DevEco Studio" \
+           "${PROGRAMW6432:-}/Huawei/DevEco Studio" \
+           "${LOCALAPPDATA:-}/Huawei/DevEcoStudio" \
+           "$HOME/Huawei/DevEco-Studio" \
+           "$HOME/Library/Huawei/DevEco-Studio" \
+           "/Applications/DevEco-Studio.app/Contents" \
+           "/opt/huawei/deveco-studio" "/opt/deveco-studio"; do
+    [ -n "$c" ] && [ -d "$c/sdk/default/openharmony/native" ] && { printf '%s\n' "$c"; return 0; }
+  done
+  return 1
+}
+if ! DEVECO=$(find_deveco); then
+  echo "DevEco Studio not found. Set ZAN_DEVECO_HOME (or DEVECO_ROOT / DEVECO_SDK_HOME)." >&2
+  exit 1
+fi
 LLVM="$DEVECO/sdk/default/openharmony/native/llvm/bin"
 CLANG="$LLVM/clang.exe"
 AR="$LLVM/llvm-ar.exe"
 SYS="$DEVECO/sdk/default/openharmony/native/sysroot"
-FT="${FREETYPE_SRC:-D:/project/firefox/modules/freetype2}"
+
+# FreeType source: ZAN_FREETYPE_ROOT / FREETYPE_SRC (checkout root), a bare
+# FREETYPE_INC (its include dir), then the usual user-level checkouts.
+FT="${ZAN_FREETYPE_ROOT:-${FREETYPE_SRC:-}}"
+if [ -z "$FT" ] && [ -n "${FREETYPE_INC:-}" ]; then FT=$(dirname "$FREETYPE_INC"); fi
+if [ -z "$FT" ]; then
+  for c in "$HOME/firefox/modules/freetype2" \
+           "$HOME/.mozbuild/firefox/modules/freetype2" \
+           "$HOME/src/firefox/modules/freetype2"; do
+    if [ -f "$c/include/ft2build.h" ]; then FT="$c"; break; fi
+  done
+fi
+if [ -z "$FT" ] || [ ! -f "$FT/include/ft2build.h" ]; then
+  echo "FreeType source not found. Set ZAN_FREETYPE_ROOT (or FREETYPE_SRC) to a firefox/modules/freetype2 checkout." >&2
+  exit 1
+fi
 OUT="$REPO/build/ohos_gui_drivers"
 
 WANT="${1:-all}"

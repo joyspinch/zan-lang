@@ -1,7 +1,12 @@
 import { spawn } from 'child_process';
 import path from 'path';
+import { fileURLToPath, pathToFileURL } from 'url';
 
-const LSP = path.resolve('build/zan-lsp.exe');
+// The repo root comes from this script's location (ZAN_REPO overrides it), so
+// the probe runs from any checkout without a checked-in absolute path.
+const REPO_ROOT = process.env.ZAN_REPO
+  || path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const LSP = process.env.ZAN_LSP || path.join(REPO_ROOT, 'build', 'zan-lsp.exe');
 const child = spawn(LSP, [], { stdio: ['pipe', 'pipe', 'pipe'] });
 
 let sbuf = Buffer.alloc(0);
@@ -50,12 +55,12 @@ function notify(method, params) {
 
 async function main() {
   await request('initialize', {
-    rootUri: 'file:///D:/project/zan-lang',
+    rootUri: pathToFileURL(REPO_ROOT).href,
     capabilities: {}
   });
   notify('initialized', {});
 
-  const testUri = 'file:///D:/project/zan-lang/scripts/test_chain_probe.zan';
+  const testUri = pathToFileURL(path.join(REPO_ROOT, 'scripts', 'test_chain_probe.zan')).href;
   const code = `using System;
 using System.Text;
 

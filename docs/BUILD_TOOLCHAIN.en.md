@@ -23,7 +23,7 @@ cmake --build build
 
 ### Things to Avoid:
 
-- **TDM-GCC (`C:\TDM-GCC-64`)**: If present in `PATH`, plain `cmake -B build` will accidentally pick it up. It will inevitably fail in two places: compiling C code under C17 (GCC 10 rejects C23 syntax), and linking MSVC-mangled symbols from LLVM static libraries (`undefined reference to ?...@@Z`).
+- **TDM-GCC (`C:\TDM-GCC-64`)**: If present in `PATH`, plain `cmake -B build` will accidentally pick it up. It will inevitably fail in two places: compiling C code under C17 (GCC 10 rejects C23 syntax), and linking MSVC-mangled symbols from LLVM static libraries (`undefined reference to ?...@@Z`). This only affects **building zanc itself** -- TDM-GCC is a legitimate candidate alongside MSYS2/MinGW when assembling the `mingw/` link bundle.
 - `LibXml2 not found` is merely an optional dependency notice and can be safely ignored.
 
 To switch compilers, you must purge the CMake cache:
@@ -31,6 +31,32 @@ To switch compilers, you must purge the CMake cache:
 Remove-Item build\CMakeCache.txt -Force
 Remove-Item build\CMakeFiles -Recurse -Force
 ```
+
+--------------------------------------------------------------------------------
+
+## How External Toolchains Are Found
+
+CMake uses [`cmake/ZanToolchain.cmake`](../cmake/ZanToolchain.cmake) and PowerShell
+uses [`scripts/toolchain_paths.ps1`](../scripts/toolchain_paths.ps1); the other
+scripts (`.cmd` / `.sh` / `.py` / `.mjs`) keep only the platform-specific probe they
+need. The order is the same everywhere: **explicit override -> PATH -> standard
+install roots** built from the environment (`SystemDrive` / `ProgramFiles` /
+`ProgramW6432` / `LOCALAPPDATA` / `USERPROFILE`), never a fixed drive letter. A
+miss prints the locations that were tried and the variable to set.
+
+| Purpose | Override (env / cache) | Auto-probe |
+|---|---|---|
+| Assemble the `mingw/` link bundle (`bundle_toolchain.cmake`, `CMakeLists.txt`) | `ZAN_MINGW_ROOT` (CMake cache or env; empty = auto), `MINGW_ROOT`, `MINGW_HOME` | `x86_64-w64-mingw32-gcc` / `gcc` on PATH, then MSYS2 `mingw64/ucrt64/clang64`, TDM-GCC, `mingw64`, scoop, user dirs |
+| clang for `scripts/build_ide.ps1` | `ZAN_CLANG`, `ZAN_LLVM_ROOT`, `LLVM_ROOT`, `LLVM_HOME` | PATH, then roots derived from `LLVM_DIR`, `~/.mozbuild/clang`, every VS `VC\Tools\Llvm\x64` reported by vswhere, `Program Files\LLVM` |
+| gdb staged by `scripts/publish_ide.ps1` | `ZAN_GDB_DIR`, `ZAN_GDB`, `MINGW_ROOT`, `MINGW_HOME` | PATH, then the MinGW roots above |
+| gdb resolved at run time (`src/dap/debugger.c`) | `ZAN_GDB` / `ZAN_GDB_EXE`, `ZAN_GDB_DIR`, `MINGW_ROOT`, `MINGW_HOME` | beside zan-dap, then PATH, then the standard MinGW roots |
+| FreeType sources (wasm32 / OHOS drivers) | `ZAN_FREETYPE_ROOT`, `FREETYPE_SRC`, `FREETYPE_INC` | user-level `%USERPROFILE%\firefox\modules\freetype2` checkouts |
+| HarmonyOS SDK (IDE publish, `build_gui_ohos.sh`) | `ZAN_OHOS_SDK`, `DEVECO_SDK_HOME`, `ZAN_DEVECO_HOME`, `DEVECO_ROOT` | Windows `%LOCALAPPDATA%\Huawei\DevEcoStudio\sdk`, `%ProgramFiles%\Huawei\DevEco Studio\sdk`; macOS `/Applications/...`, `~/Library/Huawei/...` |
+| CEF headers (`cmake/ZanCef.cmake`) | `ZAN_CEF_CDN` (primary), `ZAN_CEF_CDN_FALLBACK` (secondary), `ZAN_CEF_HEADERS_DIR`, `ZAN_CEF_API_VERSION`, `ZAN_CEF_CACHE` | the runtime cache dir; the CEF version still comes from the pinned table in `CefRuntime.zan` |
+| `diaguids.lib` in release.yml | `ZAN_DIAGUIDS` | recursively inside the extracted LLVM tree, then every VS install via `vswhere` |
+
+release.yml no longer hard-codes the LLVM version: it reads the `# LLVM <version>`
+line from `deps/checksums.txt`, so the version and its checksum stay in one place.
 
 --------------------------------------------------------------------------------
 

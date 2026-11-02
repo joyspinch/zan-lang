@@ -15,33 +15,25 @@ param(
 # that Lua.zan resolves symbols against.
 
 $ErrorActionPreference = "Stop"
+. (Join-Path $PSScriptRoot 'toolchain_paths.ps1')
 
 if (-not $Compiler) {
-    if ($env:CC) { $Compiler = $env:CC }
-    if (-not $Compiler -or -not (Test-Path -LiteralPath $Compiler)) {
-        $cc = Get-Command x86_64-w64-mingw32-gcc, gcc -ErrorAction SilentlyContinue |
-              Select-Object -First 1
-        if ($cc) { $Compiler = $cc.Source }
-    }
-    if (-not $Compiler -or -not (Test-Path -LiteralPath $Compiler)) {
-        $candidates = @(
-            $(if ($env:MINGW_ROOT) { Join-Path $env:MINGW_ROOT 'bin\x86_64-w64-mingw32-gcc.exe' }),
-            $(if ($env:MINGW_ROOT) { Join-Path $env:MINGW_ROOT 'bin\gcc.exe' }),
-            "C:\msys64\mingw64\bin\gcc.exe",
-            "C:\msys64\ucrt64\bin\gcc.exe",
-            "C:\TDM-GCC-64\bin\x86_64-w64-mingw32-gcc.exe",
-            "C:\TDM-GCC-64\bin\gcc.exe"
-        )
-        foreach ($c in $candidates) {
-            if ($c -and (Test-Path -LiteralPath $c)) {
-                $Compiler = $c
-                break
-            }
-        }
+    $tried = $null
+    $Compiler = Resolve-ZanExecutable -Name 'MinGW compiler' `
+        -EnvVars @('CC', 'ZAN_MINGW_ROOT', 'MINGW_ROOT', 'MINGW_HOME') `
+        -Commands @('x86_64-w64-mingw32-gcc', 'gcc') `
+        -Roots (Get-ZanMinGWRoots) `
+        -Relative @('bin\x86_64-w64-mingw32-gcc.exe', 'bin\gcc.exe',
+                   'x86_64-w64-mingw32-gcc.exe', 'gcc.exe') `
+        -Tried ([ref]$tried)
+    if (-not $Compiler) {
+        throw (Format-ZanProbeFailure -Name 'MinGW compiler' `
+            -EnvVars @('ZAN_MINGW_ROOT', 'MINGW_ROOT', 'MINGW_HOME', 'CC') `
+            -Tried $tried)
     }
 }
 if (!(Test-Path -LiteralPath $Compiler)) {
-    throw "MinGW compiler not found: $Compiler"
+    throw "MinGW compiler not found at the -Compiler path: $Compiler"
 }
 
 $root = Split-Path -Parent $PSScriptRoot

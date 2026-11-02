@@ -16,44 +16,28 @@ $script:embedArgs = @()
 Write-Output "IDE_BUILD_START"
 
 # ---- 0) clang on PATH ------------------------------------------------------
-# Sandbox/background sessions run with a trimmed PATH that may lack both the
-# mozbuild LLVM and the VS-bundled clang this repo builds with. Probe the two
-# known install locations before failing: the script needs clang, llvm-ar and
-# llvm-readobj, all in the same bin directory. NOTE: a bare "clang" command
-# name is unreliable in some restricted sessions even with the dir prepended,
-# so every native call below uses the full path via $clangExe / $clangDir.
-$clangExe = ""
-# 0.1 Check PATH and env vars first
-$pathClang = Get-Command clang.exe -ErrorAction SilentlyContinue
-if ($pathClang -and (Test-Path $pathClang.Source)) {
-    $clangExe = $pathClang.Source
-} elseif ($env:LLVM_DIR -and (Test-Path (Join-Path $env:LLVM_DIR "bin\clang.exe"))) {
-    $clangExe = (Join-Path $env:LLVM_DIR "bin\clang.exe")
-} elseif ($env:LLVM_HOME -and (Test-Path (Join-Path $env:LLVM_HOME "bin\clang.exe"))) {
-    $clangExe = (Join-Path $env:LLVM_HOME "bin\clang.exe")
-}
+# Sandbox/background sessions run with a trimmed PATH that may lack the LLVM
+# this repo builds with. The shared probe (scripts\toolchain_paths.ps1) tries
+# ZAN_CLANG/LLVM_ROOT/LLVM_HOME, then PATH, then the standard install roots it
+# derives from the environment (mozbuild, VS's VC\Tools\Llvm via vswhere,
+# Program Files\LLVM), so no candidate table lives here. The script needs
+# clang, llvm-ar and llvm-readobj in the same bin directory. NOTE: a bare
+# "clang" command name is unreliable in some restricted sessions even with the
+# dir prepended, so every native call below uses the full path via $clangExe /
+# $clangDir.
+. (Join-Path $PSScriptRoot 'toolchain_paths.ps1')
 
-if ($clangExe -eq "") {
-    $clangHints = @(
-        "$env:USERPROFILE\.mozbuild\clang\bin",
-        "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\Llvm\x64\bin",
-        "C:\Program Files\Microsoft Visual Studio\2022\Professional\VC\Tools\Llvm\x64\bin",
-        "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Tools\Llvm\x64\bin",
-        "C:\Program Files\Microsoft Visual Studio\2022\BuildTools\VC\Tools\Llvm\x64\bin",
-        "D:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\Llvm\x64\bin",
-        "D:\Program Files\Microsoft Visual Studio\2022\Professional\VC\Tools\Llvm\x64\bin",
-        "C:\Program Files\LLVM\bin",
-        "D:\Program Files\LLVM\bin"
-    )
-    foreach ($hint in $clangHints) {
-        if (Test-Path (Join-Path $hint "clang.exe")) {
-            $clangExe = (Get-Item $hint).FullName + "\clang.exe"
-            break
-        }
-    }
-}
-if ($clangExe -eq "") {
-    Write-Output "CLANG_NOT_FOUND (neither .mozbuild nor VS Llvm)"; exit 1
+$clangTried = $null
+$clangExe = Resolve-ZanExecutable -Name 'clang' `
+    -EnvVars @('ZAN_CLANG', 'ZAN_LLVM_ROOT', 'LLVM_ROOT', 'LLVM_HOME') `
+    -Commands @('clang.exe', 'clang') `
+    -Roots (Get-ZanLLVMRoots) `
+    -Relative @('bin\clang.exe', 'clang.exe') `
+    -Tried ([ref]$clangTried)
+if (-not $clangExe) {
+    Write-Output (Format-ZanProbeFailure -Name 'clang' `
+        -EnvVars @('ZAN_LLVM_ROOT', 'LLVM_DIR', 'ZAN_CLANG') -Tried $clangTried)
+    Write-Output "CLANG_NOT_FOUND"; exit 1
 }
 $clangDir = Split-Path -Parent $clangExe
 

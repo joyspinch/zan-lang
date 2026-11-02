@@ -9,19 +9,22 @@
 import { spawn } from 'child_process';
 import fs from 'fs';
 import path from 'path';
+import { fileURLToPath } from 'url';
 
 // MODE=repo (whole zan-lang monorepo, worst case)
 // MODE=gallery (examples/gui_gallery, mid-size root)
 // default 'gallery': fast and representative. 'repo' exercises the
 // full monorepo workspace (17s first-open converge, see TASKS.md).
+//
+// Roots are derived from this script's location, never from a checked-in
+// absolute path: ZAN_REPO overrides the checkout, LSP_PROBE_ROOT points the
+// probe at an external project (the ra2 mode).
+const REPO_ROOT = process.env.ZAN_REPO
+  || path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const MODE = process.env.LSP_PROBE_MODE || 'gallery';
-const ROOTS = {
-  repo: 'D:/project/zan-lang',
-  gallery: 'D:/project/zan-lang/examples/gui_gallery',
-};
-const ROOT = ROOTS[MODE];
-const LSP = MODE === 'repo' ? path.join(ROOT, 'build', 'zan-lsp.exe')
-  : 'D:/project/zan-lang/build/zan-lsp.exe';
+const ROOT = process.env.LSP_PROBE_ROOT
+  || (MODE === 'gallery' ? path.join(REPO_ROOT, 'examples', 'gui_gallery') : REPO_ROOT);
+const LSP = process.env.ZAN_LSP || path.join(REPO_ROOT, 'build', 'zan-lsp.exe');
 const perf = () => Number(process.hrtime.bigint() / 1000n) / 1000; // ms float
 
 const child = spawn(LSP, [], { stdio: ['pipe', 'pipe', 'pipe'] });

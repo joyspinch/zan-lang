@@ -408,16 +408,25 @@ def last_commit(path):
 
 
 def _find_zig():
+    """zig from ZAN_ZIG/ZIG, then PATH, then the usual user-level installs."""
+    for var in ("ZAN_ZIG", "ZIG"):
+        val = os.environ.get(var)
+        if val and os.path.isfile(val):
+            return val
     zig = shutil.which("zig")
-    if not zig:
-        for c in [
-            r"D:\tools\zig-x86_64-windows-0.15.1\zig.exe",
-            os.path.expanduser(r"~/.mozbuild/zig/zig-x86_64-windows-0.14.1/zig.exe"),
-            r"C:\zig\zig.exe"
-        ]:
-            if os.path.isfile(c):
-                return c
-    return zig
+    if zig:
+        return zig
+    local_app = os.environ.get("LOCALAPPDATA", "")
+    for pattern in [
+        os.path.expanduser("~/.mozbuild/zig/*/zig.exe"),
+        os.path.expanduser("~/scoop/apps/zig/current/zig.exe"),
+        os.path.join(local_app, "Programs", "zig", "zig.exe") if local_app else "",
+        os.path.expanduser("~/zig/zig.exe"),
+    ]:
+        for cand in sorted(glob.glob(pattern), reverse=True) if pattern else []:
+            if os.path.isfile(cand):
+                return cand
+    return None
 
 
 def _find_ndk():
@@ -427,6 +436,29 @@ def _find_ndk():
         if ndks:
             ndk = ndks[-1]
     return ndk
+
+
+def _find_freetype_inc():
+    """FreeType include dir from FREETYPE_INC / ZAN_FREETYPE_ROOT /
+    FREETYPE_SRC, then the usual user-level checkouts. None when absent."""
+    for var in ("FREETYPE_INC", "ZAN_FREETYPE_ROOT", "FREETYPE_SRC"):
+        val = os.environ.get(var)
+        if not val:
+            continue
+        cand = val
+        if os.path.isdir(os.path.join(cand, "include")):
+            cand = os.path.join(cand, "include")
+        if os.path.isfile(os.path.join(cand, "ft2build.h")):
+            return cand
+    for base in (
+        os.path.expanduser("~/firefox/modules/freetype2"),
+        os.path.expanduser("~/.mozbuild/firefox/modules/freetype2"),
+        os.path.expanduser("~/src/firefox/modules/freetype2"),
+    ):
+        cand = os.path.join(base, "include")
+        if os.path.isfile(os.path.join(cand, "ft2build.h")):
+            return cand
+    return None
 
 
 def rebuild_cmd(artifact, zig, ndk):
@@ -458,8 +490,9 @@ def rebuild_cmd(artifact, zig, ndk):
             # bitmap-font fallback, with the same static export contract.
             cmd = [zig, "cc", "-target", "wasm32-wasi", "-g0", "-std=gnu11",
                    "-I", rt]
-            ft_inc = os.environ.get("FREETYPE_INC") or "D:/project/firefox/modules/freetype2/include"
-            with_freetype = (os.path.isfile(os.path.join(ft_inc, "ft2build.h"))
+            ft_inc = _find_freetype_inc()
+            with_freetype = (bool(ft_inc)
+                             and os.path.isfile(os.path.join(ft_inc, "ft2build.h"))
                              and os.path.isfile("toolchain/wasm32/libfreetype.a"))
             if with_freetype:
                 cmd += ["-I", ft_inc, "-I", "toolchain/wasm32/freetype-shim"]
@@ -668,24 +701,11 @@ def do_verify(stale_entries):
 
 
 def do_rebuild():
-    import os, glob, shutil
-    zig = shutil.which("zig")
-    if not zig:
-        for c in [
-            r"D:\tools\zig-x86_64-windows-0.15.1\zig.exe",
-            os.path.expanduser(r"~/.mozbuild/zig/zig-x86_64-windows-0.14.1/zig.exe"),
-            r"C:\zig\zig.exe"
-        ]:
-            if os.path.isfile(c):
-                zig = c
-                break
+    import os
+    zig = _find_zig()
     print(f"Using ZIG: {zig}")
 
-    ndk = os.environ.get("ANDROID_NDK")
-    if not ndk:
-        ndks = glob.glob(os.path.expanduser(r"~\AppData\Local\Android\Sdk\ndk\*"))
-        if ndks:
-            ndk = ndks[-1]
+    ndk = _find_ndk()
     print(f"Using NDK: {ndk}")
 
     rt = "src/runtime"
@@ -747,8 +767,15 @@ def do_rebuild():
             subprocess.run([zig, "cc", "-target", "aarch64-ios.14.0", "-I", zhdr, "-g0", "-std=c11", "-fPIC", "-I", rt, "-O2", "-c", f"{rt}/{src}", "-o", f"toolchain/ios/arm64/{obj}"], check=True)
 
     if ndk:
-        clang = os.path.join(ndk, r"toolchains\llvm\prebuilt\windows-x86_64\bin\clang.exe")
-        sysroot = os.path.join(ndk, r"toolchains\llvm\prebuilt\windows-x86_64\sysroot")
+        if sys.platform.startswith("win"):
+            ndk_host, clang_name = "windows-x86_64", "clang.exe"
+        elif sys.platform == "darwin":
+            ndk_host, clang_name = "darwin-x86_64", "clang"
+        else:
+            ndk_host, clang_name = "linux-x86_64", "clang"
+        bindir = os.path.join(ndk, "toolchains", "llvm", "prebuilt", ndk_host, "bin")
+        clang = os.path.join(bindir, clang_name)
+        sysroot = os.path.join(ndk, "toolchains", "llvm", "prebuilt", ndk_host, "sysroot")
         if os.path.isfile(clang):
             for name, arch in [("android-x64", "x86_64"), ("android-arm64", "aarch64")]:
                 outdir = f"toolchain/{name}"

@@ -19,7 +19,12 @@
 # the two drift (headers 151.3.18 vs runtime 151.3.23), and libcef then refuses
 # to load with "cef api hash mismatch", so it is read out of that file instead.
 set(ZAN_CEF_CDN "https://cef-builds.spotifycdn.com"
-    CACHE STRING "Base URL of the official CEF build CDN")
+    CACHE STRING "Primary base URL for CEF build archives (override for a mirror)")
+# Second candidate tried once only when the primary fails or is overridden to
+# a mirror. Keeping the official host here means a broken mirror still falls
+# back instead of failing the whole configure. Set to "" to disable.
+set(ZAN_CEF_CDN_FALLBACK "https://cef-builds.spotifycdn.com"
+    CACHE STRING "Fallback base URL for CEF build archives (empty = none)")
 
 # The C API version the modern variant is compiled against. Pinning it is what
 # makes the driver survive a runtime upgrade: cef_api_hash() is computed per API
@@ -27,8 +32,10 @@ set(ZAN_CEF_CDN "https://cef-builds.spotifycdn.com"
 # range covers 15101. Leaving it unset selects CEF_API_VERSION_EXPERIMENTAL
 # (999999), whose hash is tied to one exact CEF build - which is how the
 # mismatch above happened.
+# Override when bumping the CEF branch: set -DZAN_CEF_API_VERSION=<api> rather
+# than editing this default.
 set(ZAN_CEF_API_VERSION "15101"
-    CACHE STRING "CEF C API version zan_cef is compiled against")
+    CACHE STRING "CEF C API version zan_cef is compiled against (override on a branch bump)")
 
 # Pull "<branch>..." out of CefRuntime.zan: <prefix_fn> is the branch accessor
 # (CurrentBranch / LegacyBranch), and the version is the first entry of the
@@ -125,14 +132,38 @@ function(zan_cef_headers version tag out_var)
     string(REPLACE "+" "%2B" archive_url_name "${archive_name}")
     set(archive "${CMAKE_BINARY_DIR}/cef-headers/${archive_name}")
     if(NOT EXISTS "${archive}")
-        message(STATUS "CEF headers ${version}: downloading ${archive_name}")
-        file(DOWNLOAD "${ZAN_CEF_CDN}/${archive_url_name}" "${archive}"
-             STATUS dl_status SHOW_PROGRESS TLS_VERIFY ON)
-        list(GET dl_status 0 dl_code)
-        if(NOT dl_code EQUAL 0)
+        # Exactly one attempt per candidate: a mirror that is down or returns
+        # an HTML error page must not become a retry storm. The first archive
+        # that expands later is validated by the unpack check below.
+        set(_cdns "${ZAN_CEF_CDN}")
+        if(ZAN_CEF_CDN_FALLBACK AND NOT "${ZAN_CEF_CDN_FALLBACK}" STREQUAL "${ZAN_CEF_CDN}")
+            list(APPEND _cdns "${ZAN_CEF_CDN_FALLBACK}")
+        endif()
+        set(_dl_errors "")
+        foreach(_cdn IN LISTS _cdns)
+            if(_cdn STREQUAL "")
+                continue()
+            endif()
+            string(REGEX REPLACE "/+$" "" _cdn "${_cdn}")
+            message(STATUS "CEF headers ${version}: downloading ${archive_name} from ${_cdn}")
+            file(DOWNLOAD "${_cdn}/${archive_url_name}" "${archive}"
+                 STATUS dl_status SHOW_PROGRESS TLS_VERIFY ON)
+            list(GET dl_status 0 dl_code)
+            if(dl_code EQUAL 0)
+                break()
+            endif()
             list(GET dl_status 1 dl_msg)
             file(REMOVE "${archive}")
-            message(WARNING "CEF headers ${version}: download failed (${dl_msg})")
+            list(APPEND _dl_errors "${_cdn}: ${dl_msg}")
+        endforeach()
+        if(NOT EXISTS "${archive}")
+            string(REPLACE ";" "\n  - " _dl_errors_text "${_dl_errors}")
+            message(WARNING
+                "CEF headers ${version}: download failed. Tried:\n  - ${_dl_errors_text}\n"
+                "Set -DZAN_CEF_CDN=<mirror base URL>, -DZAN_CEF_CDN_FALLBACK=<second base URL>,\n"
+                "or -DZAN_CEF_HEADERS_DIR=<unpacked archive with include/cef_version.h>,\n"
+                "or point ZAN_CEF_CACHE at an existing runtime cache.\n"
+                "The matching CEF driver is skipped until headers are available.")
             set(${out_var} "" PARENT_SCOPE)
             return()
         endif()

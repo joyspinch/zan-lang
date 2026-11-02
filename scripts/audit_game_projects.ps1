@@ -21,14 +21,17 @@
     pwsh -File scripts\audit_game_projects.ps1
     pwsh -File scripts\audit_game_projects.ps1 -GamesRoot D:\project\games -Json
 #>
-$defaultRepoRoot = Split-Path -Parent $PSScriptRoot
-$defaultGamesRoot = if ($env:ZAN_GAMES_ROOT) { $env:ZAN_GAMES_ROOT } elseif (Test-Path (Join-Path (Split-Path -Parent $defaultRepoRoot) 'games')) { (Join-Path (Split-Path -Parent $defaultRepoRoot) 'games') } else { 'D:\project\games' }
-
 [CmdletBinding()]
 param(
-    [string]$GamesRoot = $defaultGamesRoot,
+    [string]$GamesRoot = '',
     [switch]$Json
 )
+# Default root: $env:ZAN_GAMES_ROOT, else `games` next to the repo. Computed
+# after param() because a param default cannot see script-scope variables.
+if (-not $GamesRoot) {
+    $repoRoot = Split-Path -Parent $PSScriptRoot
+    $GamesRoot = if ($env:ZAN_GAMES_ROOT) { $env:ZAN_GAMES_ROOT } else { Join-Path (Split-Path -Parent $repoRoot) 'games' }
+}
 $ErrorActionPreference = 'Continue'
 
 if (-not (Test-Path $GamesRoot)) { Write-Error "games root not found: $GamesRoot"; exit 2 }

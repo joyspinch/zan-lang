@@ -2,11 +2,38 @@
 # Build independent NativeActivity GUI, image, audio and game archives/shared
 # libraries for Android. The GUI archive alone embeds the FreeType objects.
 # Usage: scripts/build_gui_android_static.sh [arm64|x64|all] [ndk-root]
-# Set FREETYPE_SRC and ANDROID_NDK_ROOT (or ANDROID_NDK) to override tool paths.
+# Set ZAN_FREETYPE_ROOT / FREETYPE_SRC and ANDROID_NDK_ROOT (or ANDROID_NDK) to
+# override tool paths; without them the standard install locations are probed.
 set -euo pipefail
 REPO=$(cd "$(dirname "$0")/.." && pwd)
-FT="${FREETYPE_SRC:-/d/project/firefox/modules/freetype2}"
-NDK="${2:-${ANDROID_NDK_ROOT:-${ANDROID_NDK:-${LOCALAPPDATA:-$HOME}/Android/Sdk/ndk/27.2.12479018}}}"
+
+FT="${ZAN_FREETYPE_ROOT:-${FREETYPE_SRC:-}}"
+if [ -z "$FT" ] && [ -n "${FREETYPE_INC:-}" ]; then FT=$(dirname "$FREETYPE_INC"); fi
+if [ -z "$FT" ]; then
+  for c in "$HOME/firefox/modules/freetype2" \
+           "$HOME/.mozbuild/firefox/modules/freetype2" \
+           "$HOME/src/firefox/modules/freetype2"; do
+    if [ -f "$c/include/ft2build.h" ]; then FT="$c"; break; fi
+  done
+fi
+if [ -z "$FT" ] || [ ! -f "$FT/include/ft2build.h" ]; then
+  echo "FreeType source not found. Set ZAN_FREETYPE_ROOT (or FREETYPE_SRC) to a firefox/modules/freetype2 checkout." >&2
+  exit 1
+fi
+
+NDK="${2:-${ANDROID_NDK_ROOT:-${ANDROID_NDK:-}}}"
+if [ -z "$NDK" ]; then
+  for base in "${LOCALAPPDATA:-}/Android/Sdk/ndk" "$HOME/Android/Sdk/ndk" \
+              "$HOME/Library/Android/sdk/ndk"; do
+    [ -d "$base" ] || continue
+    for cand in "$base"/*/; do [ -d "$cand" ] && NDK="${cand%/}"; done
+    [ -n "$NDK" ] && break
+  done
+fi
+if [ -z "$NDK" ] || [ ! -d "$NDK" ]; then
+  echo "Android NDK not found. Install it via the SDK manager, or set ANDROID_NDK / ANDROID_NDK_ROOT (or pass the NDK root as the 2nd argument)." >&2
+  exit 1
+fi
 case "$(uname -s)" in
   Darwin) NDKHOST=darwin-x86_64 ;;
   MINGW*|MSYS*|CYGWIN*) NDKHOST=windows-x86_64 ;;

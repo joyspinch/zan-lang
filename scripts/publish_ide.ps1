@@ -297,31 +297,20 @@ foreach ($driver in @('zan_gui', 'zan_image', 'zan_audio', 'zan_game')) {
 
 # ---- bundle the native debugger (gdb) so debugging is out-of-the-box ----
 # zan-dap resolves gdb next to itself first (toolchain\debugger\bin\gdb.exe),
-# so a published IDE debugs with no system install. Source it from ZAN_GDB_DIR
-# or a TDM-GCC install; copy gdb.exe plus the DLLs it needs to run.
-$gdbSrcDir = $env:ZAN_GDB_DIR
-if (-not $gdbSrcDir -or -not (Test-Path (Join-Path $gdbSrcDir 'gdb.exe'))) {
-    $pathGdb = Get-Command gdb.exe -ErrorAction SilentlyContinue
-    if ($pathGdb -and (Test-Path $pathGdb.Source)) {
-        $gdbSrcDir = Split-Path -Parent $pathGdb.Source
-    } else {
-        $gdbCandidates = @(
-            $(if ($env:MINGW_ROOT) { Join-Path $env:MINGW_ROOT 'bin' }),
-            $(if ($env:MINGW_HOME) { Join-Path $env:MINGW_HOME 'bin' }),
-            'C:\msys64\mingw64\bin',
-            'C:\msys64\ucrt64\bin',
-            'C:\TDM-GCC-64\bin'
-        )
-        foreach ($c in $gdbCandidates) {
-            if ($c -and (Test-Path (Join-Path $c 'gdb.exe'))) {
-                $gdbSrcDir = $c
-                break
-            }
-        }
-    }
-}
-$gdbExe = Join-Path $gdbSrcDir 'gdb.exe'
-if (Test-Path $gdbExe) {
+# so a published IDE debugs with no system install. The shared probe tries
+# ZAN_GDB_DIR/ZAN_GDB, then PATH, then the MinGW install roots it derives from
+# the environment (MSYS2, TDM-GCC, scoop, ...) -- no fixed drive letters here.
+. (Join-Path $PSScriptRoot 'toolchain_paths.ps1')
+
+$gdbTried = $null
+$gdbExe = Resolve-ZanExecutable -Name 'gdb' `
+    -EnvVars @('ZAN_GDB_DIR', 'ZAN_GDB', 'MINGW_ROOT', 'MINGW_HOME') `
+    -Commands @('gdb.exe', 'gdb') `
+    -Roots (Get-ZanMinGWRoots) `
+    -Relative @('gdb.exe', 'bin\gdb.exe') `
+    -Tried ([ref]$gdbTried)
+$gdbSrcDir = if ($gdbExe) { Split-Path -Parent $gdbExe } else { $null }
+if ($gdbExe -and (Test-Path -LiteralPath $gdbExe)) {
     $dbgBin = Join-Path $distTc 'debugger\bin'
     New-Item -ItemType Directory -Path $dbgBin -Force | Out-Null
     Copy-Item $gdbExe (Join-Path $dbgBin 'gdb.exe')
@@ -344,6 +333,8 @@ if (Test-Path $gdbExe) {
         Write-Output "PUBLISH_WARN: gdb at $gdbSrcDir is not relocatable; not bundling (zan-dap will use a system/known gdb)"
     }
 } else {
+    Write-Output (Format-ZanProbeFailure -Name 'gdb' `
+        -EnvVars @('ZAN_GDB_DIR', 'ZAN_GDB', 'MINGW_ROOT') -Tried $gdbTried)
     Write-Output "PUBLISH_WARN: gdb.exe not found (set ZAN_GDB_DIR); debugging will need a system gdb/ZAN_GDB"
 }
 

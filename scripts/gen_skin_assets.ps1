@@ -10,7 +10,9 @@ param(
 # secrets.local.ps1 and writes it as a PNG. Used to author the illustration
 # layer of a skin pack (banner art, mascot) that the GUI then animates.
 $ErrorActionPreference = "Stop"
-. d:\project\zan-lang\secrets.local.ps1
+$secrets = Join-Path (Split-Path -Parent $PSScriptRoot) 'secrets.local.ps1'
+if (-not (Test-Path -LiteralPath $secrets)) { throw "secrets.local.ps1 not found at $secrets" }
+. $secrets
 if ($PromptFile -ne "") { $Prompt = [IO.File]::ReadAllText($PromptFile) }
 if ($Prompt -eq "") { throw "no prompt: pass -Prompt or -PromptFile" }
 $req = @{ model = "gpt-image-2"; prompt = $Prompt; size = $Size } | ConvertTo-Json -Compress

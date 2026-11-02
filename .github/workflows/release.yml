@@ -119,7 +119,13 @@ jobs:
       - name: Install LLVM (dev libs + clang-cl, MSVC ABI)
         shell: pwsh
         run: |
-          $ver = "20.1.8"
+          # The version is pinned once, in deps/checksums.txt beside the archive
+          # hash -- not repeated here, so a bump cannot update one and miss the
+          # other.
+          $pin = Select-String -Path deps/checksums.txt `
+                    -Pattern '^# LLVM ([0-9]+\.[0-9]+\.[0-9]+) ' | Select-Object -First 1
+          if (-not $pin) { throw "LLVM version pin missing from deps/checksums.txt" }
+          $ver = $pin.Matches[0].Groups[1].Value
           $url = "https://github.com/llvm/llvm-project/releases/download/llvmorg-$ver/clang+llvm-$ver-x86_64-pc-windows-msvc.tar.xz"
           curl.exe -L --retry 3 --retry-all-errors -o llvm.tar.xz $url
           # Verify against the pinned hash in deps/checksums.txt before use.
@@ -138,23 +144,56 @@ jobs:
         run: choco install mingw --no-progress -y
 
       # LLVM's DebugInfoPDB component links diaguids.lib from the DIA SDK, and
-      # the prebuilt archive's CMake exports bake an absolute path to it from
-      # the VS edition LLVM's release was built with (VS2019 Professional). This
-      # runner ships a different VS, so mirror the runner's real diaguids.lib to
-      # that baked path.
-      - name: Provide diaguids.lib for LLVM's baked DIA SDK path
+      # the prebuilt archive's CMake exports bake the absolute path from the VS
+      # edition LLVM was built with. Rather than guessing that edition (or
+      # requiring it to exist), find the real library on this runner and rewrite
+      # the exported path. Nothing is written outside the extracted LLVM tree.
+      - name: Locate DIA SDK lib for LLVM's DebugInfoPDB component
         shell: pwsh
         run: |
-          $baked = "C:\Program Files (x86)\Microsoft Visual Studio\2019\Professional\DIA SDK\lib\amd64\diaguids.lib"
-          if (-not (Test-Path $baked)) {
-            $real = Get-ChildItem "C:\Program Files\Microsoft Visual Studio","C:\Program Files (x86)\Microsoft Visual Studio" `
-                      -Recurse -Filter diaguids.lib -ErrorAction SilentlyContinue |
-                    Where-Object { $_.FullName -match 'DIA SDK\\lib\\amd64' } | Select-Object -First 1
-            if (-not $real) { throw "diaguids.lib not found on the runner" }
-            Write-Host "Mirroring $($real.FullName) -> $baked"
-            New-Item -ItemType Directory -Force (Split-Path $baked) | Out-Null
-            Copy-Item $real.FullName $baked
+          $real = $null
+          if ($env:ZAN_DIAGUIDS) {
+            if (-not (Test-Path $env:ZAN_DIAGUIDS)) {
+              throw "ZAN_DIAGUIDS is set but not a file: $env:ZAN_DIAGUIDS"
+            }
+            $real = Get-Item $env:ZAN_DIAGUIDS
           }
+          # 1) Some LLVM archives carry the lib beside their CMake exports.
+          if (-not $real) {
+            $real = Get-ChildItem $env:LLVM_ROOT -Recurse -Filter diaguids.lib -File `
+                      -ErrorAction SilentlyContinue |
+                    Where-Object { $_.FullName -match 'amd64' } | Select-Object -First 1
+          }
+          # 2) Otherwise ask vswhere for every installed VS (any edition/year).
+          if (-not $real) {
+            $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+            if (Test-Path $vswhere) {
+              foreach ($root in @(& $vswhere -all -products * -property installationPath)) {
+                $hit = Get-ChildItem $root -Recurse -Filter diaguids.lib -File `
+                         -ErrorAction SilentlyContinue |
+                       Where-Object { $_.FullName -match 'DIA SDK\\lib\\amd64' } |
+                       Select-Object -First 1
+                if ($hit) { $real = $hit; break }
+              }
+            }
+          }
+          if (-not $real) {
+            throw "diaguids.lib not found. Searched $env:LLVM_ROOT and every VS install reported by vswhere. Install the 'Desktop development with C++' workload (DIA SDK), or set ZAN_DIAGUIDS to the amd64 diaguids.lib."
+          }
+          Write-Host "Using $($real.FullName)"
+          # Rewrite only the baked absolute library path in LLVM's CMake exports.
+          $realPath = $real.FullName.Replace('\', '/').Replace('$', '$$')
+          $patched = 0
+          Get-ChildItem (Join-Path $env:LLVM_ROOT 'lib\cmake') -Recurse -Include *.cmake,*.txt -File `
+            -ErrorAction SilentlyContinue | ForEach-Object {
+              $text = Get-Content -Raw $_.FullName
+              $new = [regex]::Replace($text, '([A-Za-z]:[\\/][^";]*diaguids\.lib)', $realPath)
+              if ($new -ne $text) {
+                Set-Content -Path $_.FullName -Value $new -NoNewline
+                $patched++
+              }
+            }
+          if ($patched -eq 0) { Write-Host "No baked diaguids.lib path found; nothing to patch." }
 
       - name: Configure + build toolchain (clang-cl)
         shell: pwsh

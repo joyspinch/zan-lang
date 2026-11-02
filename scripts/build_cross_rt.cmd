@@ -136,8 +136,16 @@ rem wasm EH proposal; the shim stubs it -- trusted UI fonts never enter the
 rem untrusted-font validator paths that reach setjmp). When the header tree or
 rem the archive is missing, rebuild WITHOUT the define: programs degrade to the
 rem 6x10 bitmap font.
+rem FreeType headers come from any checkout of firefox/modules/freetype2: an
+rem explicit FREETYPE_INC (the include dir) or ZAN_FREETYPE_ROOT (the source
+rem root) wins, otherwise probe the usual user-level checkouts. Without either,
+rem the object is built for the bitmap-font fallback (no hard-coded drive).
 set FT_INC=%FREETYPE_INC%
-if "%FT_INC%"=="" set FT_INC=D:/project/firefox/modules/freetype2/include
+if "%FT_INC%"=="" if not "%ZAN_FREETYPE_ROOT%"=="" set FT_INC=%ZAN_FREETYPE_ROOT%\include
+if "%FT_INC%"=="" if exist "%USERPROFILE%\firefox\modules\freetype2\include\ft2build.h" set FT_INC=%USERPROFILE%\firefox\modules\freetype2\include
+if "%FT_INC%"=="" if exist "%HOME%\firefox\modules\freetype2\include\ft2build.h" set FT_INC=%HOME%\firefox\modules\freetype2\include
+if "%FT_INC%"=="" if exist "%USERPROFILE%\.mozbuild\firefox\modules\freetype2\include\ft2build.h" set FT_INC=%USERPROFILE%\.mozbuild\firefox\modules\freetype2\include
+if "%FT_INC%"=="" echo note: FreeType headers not found; set FREETYPE_INC or ZAN_FREETYPE_ROOT for proportional text on wasm32 (bitmap fallback otherwise)
 if exist "%FT_INC%\ft2build.h" if exist toolchain\wasm32\libfreetype.a goto ft_gui
 "%ZIG%" cc -target wasm32-wasi -g0 -std=gnu11 -I %RT% -O2 -c %RT%\gui_runtime.c -DZAN_GUI_WASM -DZAN_GUI_STATIC -o toolchain\wasm32\zanrt_gui.o || exit /b 1
 goto gui_done

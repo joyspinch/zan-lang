@@ -5,12 +5,24 @@
 #
 # Invoked from CMake as:
 #   cmake -DMINGW_ROOT=<root> -DDEST=<dir> -P bundle_toolchain.cmake
+# MINGW_ROOT empty means "probe": environment (ZAN_MINGW_ROOT / MINGW_ROOT /
+# MINGW_HOME), then PATH, then the standard install roots from
+# cmake/ZanToolchain.cmake. This script mode has no CMake generator, so the
+# same probe module is included directly rather than duplicated here.
 #
 # Idempotent: if the bundle already exists it is left untouched (the MinGW
 # runtime is ~90 MB, so we never re-copy it on incremental relinks).
 
+include("${CMAKE_CURRENT_LIST_DIR}/ZanToolchain.cmake")
 if(NOT MINGW_ROOT)
-    set(MINGW_ROOT "C:/TDM-GCC-64")
+    zan_mingw_roots(_zan_mingw_roots)
+    zan_resolve_root(_zan_mingw_probe
+        NAME "MinGW-w64 linking toolchain"
+        SENTINEL "bin/ld.exe"
+        ENV ZAN_MINGW_ROOT MINGW_ROOT MINGW_HOME
+        PATH_TOOLS x86_64-w64-mingw32-gcc gcc
+        ROOTS ${_zan_mingw_roots})
+    set(MINGW_ROOT "${_zan_mingw_probe}")
 endif()
 
 set(LIBDST "${DEST}/mingw/lib")
@@ -25,10 +37,14 @@ if(EXISTS "${DEST}/ld.exe" AND EXISTS "${LIBDST}/crt2.o" AND EXISTS "${LIBDST}/l
 endif()
 
 if(NOT EXISTS "${MINGW_ROOT}/bin/ld.exe")
+    if(_zan_mingw_probe_TRIED)
+        zan_probe_failure_message(_zan_mingw_probe _zan_mingw_msg)
+        message(WARNING "${_zan_mingw_msg}")
+    endif()
     message(WARNING
-        "MinGW-w64 not found at ${MINGW_ROOT}; skipping toolchain bundle. "
-        "zanc will fall back to a system clang targeting the mingw ABI. "
-        "Set -DZAN_MINGW_ROOT=<path> to enable self-contained linking.")
+        "Skipping the self-contained toolchain bundle: zanc will fall back to "
+        "a system clang targeting the mingw ABI. Set -DZAN_MINGW_ROOT=<root> "
+        "(or the ZAN_MINGW_ROOT environment variable) to enable it.")
     return()
 endif()
 
