@@ -198,6 +198,14 @@ zan_arc_opt_stats_t zan_opt_arc(zan_irgen_t *g, zan_opt_level_t level) {
                                         }
                                         break;
                                     }
+                                    /* B-ID96：异对象 ARC 释放不安全——别名判定只认
+                                     * SSA/同槽 load、不追 GEP 与容器级联，异对象
+                                     * release 可能在运行期经容器元素/字段别名动到
+                                     * 目标对象的引用计数。保守关窗；
+                                     * 异对象 retain 不改目标计数，仍可穿窗。 */
+                                    if (k2 == ARC_RELEASE_OBJ || k2 == ARC_RELEASE_STR) {
+                                        break;
+                                    }
                                 }
 
                                 if (!is_safe_arc_intermediate(curr, op1)) {
