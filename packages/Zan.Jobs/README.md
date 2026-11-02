@@ -81,7 +81,7 @@ worker 捡起来才变成死信。接线错误越早暴露越好。
 |---|---|
 | 持久化存储 | `FileJobStorage`：追加日志 + 启动重放 + 压实；`InMemoryJobStorage`：只留当前状态 |
 | 状态机 | `Enqueued` / `Scheduled` / `Processing` / `Succeeded` / `Failed`（还会重试）/ `Dead`（死信）/ `Deleted` |
-| 处理器注册 | 显式注册（`FuncT<string, JobResult>`）或强类型泛型注册（`RegisterTyped`） |
+| 处理器注册 | 显式注册（`Func<string, JobResult>`）或强类型泛型注册（`RegisterTyped`） |
 | 重试退避 | 指数退避 + 延迟上限 + 抖动（打散同时重试的尖峰）；可配"总尝试次数" |
 | 延迟调度 | `Schedule(name, args, runAtUnixMs)`：到点才执行 |
 | 周期调度 | `EnqueueRecurring(name, args, intervalMs)`：每次成功后自动排下一次 |

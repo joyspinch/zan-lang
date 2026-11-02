@@ -363,7 +363,7 @@ static void check_value_type_mismatch(zan_irgen_t *g, zan_type_t *dst, zan_type_
 
 /* 值类型 ↔ 引用类型：Zan 没有装箱设施，两侧不能隐式互转。
  *
- * 踩过的坑（A449）：`FuncT<Order, object> f = (Order o) => o.id;` 编译期一声
+ * 踩过的坑（A449）：`Func<Order, object> f = (Order o) => o.id;` 编译期一声
  * 不吭，运行期把 int 值当对象指针（IntToPtr）返回，调用方拿到非 null 的野
  * 指针，进程退出时 ARC 去回收这个假对象再崩一次（0xC0000005）。
  * 委托返回类型与 lambda 体类型对不上时，必须在编译期拦下来。 */

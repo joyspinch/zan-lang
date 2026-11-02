@@ -91,7 +91,7 @@ ValidationResult r = validator.ValidateWith(signup, fast);
 
 ## 约束与已知边界
 
-- 规则取值器是 `FuncT<T, V>`：V 只能是编译期已知的类型（string / int /
+- 规则取值器是 `Func<T, V>`：V 只能是编译期已知的类型（string / int /
   double / bool）。要跨类型断言用 `Must`（谓词拿整个对象）。
 - 长度类规则按**字节**计（与 `string.Length` 一致）；需要按码点计用
   `RuneCount` 自行判断。

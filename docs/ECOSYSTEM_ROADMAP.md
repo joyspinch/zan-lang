@@ -1215,7 +1215,7 @@ conformance `missing_values`（66 条断言）：CSV 空字段 → 缺失、空�
    **一次投递**（一次 `Publish` / `Send` / 查询跑一遍链，不是每个订阅者一遍）。
 6. **查询端点由使用者持有，结果类型完整保留**。把结果擦成 `object` 再转回来
    这条路在 Zan 里不通（装箱缺陷），端点是泛型类、处理函数是
-   `FuncT<T, TResult>`，结果一路都是具体类型。
+   `Func<T, TResult>`，结果一路都是具体类型。
 
 conformance `messaging_bus`（类型分发 / 广播顺序 / 退订 / 命令语义 / 中间件顺序
 与吞消息 / 错误路由 / 查询端点值类型结果 / 参数校验）。ARC 守卫干净，
@@ -1344,7 +1344,7 @@ leader 选举；没有内置仪表板；参数是 JSON 文本（强类型靠显�
 | `BenchRunner.zan` | `BenchRunner` | 执行器：预热 → 测量循环 → 统计；`TicksToNs` / `TicksToMs`（先除后乘避免溢出） |
 | `BenchOptions.zan` | `BenchOptions` | 四个旋钮：预热轮数 / 轮数下限 / 目标时长 / 轮数上限；`Default()` / `Quick()` / `Copy()` |
 | `BenchCase.zan` | `BenchCase` | 无参用例：名字 + `Action` |
-| `BenchCaseT.zan` | `BenchCaseT<TArgs>` | 参数化用例：名字 + `ActionT<TArgs>` + 参数（泛型保类型，零装箱） |
+| `BenchCaseT.zan` | `BenchCaseT<TArgs>` | 参数化用例：名字 + `Action<TArgs>` + 参数（泛型保类型，零装箱） |
 | `BenchResult.zan` | `BenchResult` | 测量结果：轮数 / 样本 / 总耗时 / 均值 / 中位数 / 最小 / 最大 / 标准差 / ops/s / 相对波动 |
 | `BenchStats.zan` | `BenchStats` | 统计原语：插入排序 / 中位数 / 均值 / 最小最大 / 样本标准差 / 平方根 |
 | `BenchReport.zan` | `BenchReport` | 文本表格（按列宽对齐）+ JSON 报告 + 字符串转义 |

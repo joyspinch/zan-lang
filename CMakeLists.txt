@@ -6011,7 +6011,7 @@ set_tests_properties(diag_box_generic_value_to_object PROPERTIES TIMEOUT 60)
 
 # lambda 返回类型与委托返回类型不兼容必须报错。
 # checker 的 lambda 分支返回 type_error，而 type_error 在可赋值判定里被当作
-# 「什么都行」，于是 `(Order o) => o.id` 赋给 FuncT<Order, object> 静默通过；
+# 「什么都行」，于是 `(Order o) => o.id` 赋给 Func<Order, object> 静默通过；
 # 运行期把 int 值当对象指针返回，调用方拿到野指针。
 add_test(NAME diag_lambda_return_object
   COMMAND ${CMAKE_COMMAND}

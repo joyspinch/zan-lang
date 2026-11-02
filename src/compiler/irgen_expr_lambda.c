@@ -1541,7 +1541,7 @@ static void infer_method_tp_bindings(zan_irgen_t *g, zan_symbol_t *msym,
                 ? zan_binder_resolve_type(g->binder, lp->param.type)
                 : sdp->delegate_param_types[k];
             /* 外层泛型类的类型实参在这里已经定下来了：委托的形参类型
-             * 可能正是类的类型参数（FuncT<T,V>），不替换的话它永远算
+             * 可能正是类的类型参数（Func<T,V>），不替换的话它永远算
              * 「未定」，lambda 的返回类型就推不出来，方法类型参数绑不上。 */
             if (lpt && g->cur_inst)
                 lpt = subst_type_param_deep(g, lpt, g->cur_inst);

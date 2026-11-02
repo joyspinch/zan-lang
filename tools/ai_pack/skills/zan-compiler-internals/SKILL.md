@@ -389,7 +389,7 @@ description: zanc 编译器内部（parser/checker/irgen/runtime/ABI）设计契
      把"编译器不支持"误判成"自己代码写错"。
    - 边界：可用的替代形态：类型实参留在**类级**（`class Base<T> { Inner<T>
      inner; }` 正常）、具体实例化的基类（`class X : Base<Signup>` 正常）、
-     用 `FuncT<T,V>` 形参代替按 V 实例化。
+     用 `Func<T,V>` 形参代替按 V 实例化。
 16. **泛型实参的实参类型必须被检查（`List<int>.Add("x")` 曾一路放行）**：
    - 动作：给泛型容器/泛型类加成员时，实参类型要按**接收者的类型实参**
      替换后再比：内建泛型从 `builtin_api.c` 的签名表取形参类型（T/K/V），

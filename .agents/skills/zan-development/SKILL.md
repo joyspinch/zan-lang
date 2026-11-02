@@ -202,7 +202,7 @@ Without MCP the same index is a file: `knowledge/symbols.json` next to the SDK
   `new Foo<T, V>`（V 是**方法级**类型参数）不行：变体不会被
   `discover_generic_insts` 记录 → 不发射 → 调用退化成擦除版 → 取值一律
   null/false/0，**不报错不抛异常**，规则静默失效。设计时把类型实参留在类级，
-  或改用 `FuncT<T, V>` 形参而不是按 V 实例化泛型类。（TASKS A418）
+  或改用 `Func<T, V>` 形参而不是按 V 实例化泛型类。（TASKS A418）
 * **依赖型泛型基类会算错字段偏移**（实证，2026-10-21）：`class Validator<T> :
   Plan<T>` 能编译，但特化出的 `Validator<Signup>` 读基类字段的偏移是错的——
   基类构造里字段还是好的，继承来的方法里再读就成了 null（"null reference
@@ -213,7 +213,7 @@ Without MCP the same index is a file: `knowledge/symbols.json` next to the SDK
   里 `Base.Accepts(object)` 是虚方法、`Ch<T>` 覆写它并写 `return m is T;`——
   **经基类引用虚调用恒为 false**（`Base b = ch; b.Accepts(o)`），直接调用
   `ch.Accepts(o)` 才对；虚方法体里转交非虚方法也没用。**方法组转委托同样
-  抹掉 `is T`**（`FuncT<object,bool> f = chan.Accepts;` → 恒 false），用
+  抹掉 `is T`**（`Func<object,bool> f = chan.Accepts;` → 恒 false），用
   lambda 包一层才恢复。类型判定要**定型成委托放在派生类构造器里**
   （`this.acceptsField = (object m) => { return m is T; };`），基类只调委托；
   或者把 API 设计成非泛型。（TASKS A447）
@@ -224,7 +224,7 @@ Without MCP the same index is a file: `knowledge/symbols.json` next to the SDK
   类型实参要显式写**。（TASKS A448）
 * **值类型装不进 `object`**（实证，2026-10-21）：`object boxed = (object)v;`
   （v 是 int）→ **当场 access violation**（0xC0000005），没有诊断也没有消息。
-  lambda 返回类型与委托返回类型不兼容（`FuncT<Order,object> f = (Order o) =>
+  lambda 返回类型与委托返回类型不兼容（`Func<Order,object> f = (Order o) =>
   o.id;`）→ **编译期不报错**，运行期给非 null 的垃圾指针，进程退出时 ARC 去
   回收它再崩一次。凡是 `object` 参与的地方只放**引用类型**；值类型结果要用
   泛型端点一路保留。（TASKS A449）
@@ -382,12 +382,12 @@ Without MCP the same index is a file: `knowledge/symbols.json` next to the SDK
   编译期报错 `cannot convert 'int' to 'object': value types cannot be boxed`。
   `object` 只能装引用（类实例、字符串、数组、委托、接口）。要"擦除"一个
   值类型的结果，就把类型一路保留在泛型里（`QueryEndpoint<T, TResult>`、
-  `FuncT<T, TResult>`），别指望 `object` 能兜住。
+  `Func<T, TResult>`），别指望 `object` 能兜住。
 * **lambda 的返回类型必须和委托的返回类型兼容**（实证，2026-10-27）：
-  `FuncT<Order, object> f = (Order o) => o.id;` 编译期报错
+  `Func<Order, object> f = (Order o) => o.id;` 编译期报错
   `cannot convert 'int' to 'object' in lambda return`——委托返回 `object` 时，
   lambda 必须返回**引用类型**；表达式体和块体（`{ return o.id; }`）都会被拦。
-  反过来 `FuncT<Order, bool>` 配 `=> o.id` 正常。
+  反过来 `Func<Order, bool>` 配 `=> o.id` 正常。
 * **泛型类覆写虚方法时，类型参数在特化版里可用**（实证，2026-10-27）：
   `class Ch<T> : Base` 覆写 `Base.Accepts(object)` 并写 `return m is T;`，
   经基类引用的虚调用现在判定正确（每个实例化一张 vtable）。早年的绕行
@@ -402,18 +402,18 @@ Without MCP the same index is a file: `knowledge/symbols.json` next to the SDK
   T Make() { return new T(); } }` —— **编译期零诊断、运行期返回 null**（实测
   `Box<string>.Make()` 得到 null）。编译器不检查 T 有没有无参构造器，也不
   报"无法实例化类型参数"。凡是泛型工厂/容器要造 T，一律要求调用方传
-  **工厂委托**（`FuncT<TTarget>`），调用点再判空兜底。
+  **工厂委托**（Func<TTarget>`），调用点再判空兜底。
   （已登记 TASKS.md A462，尚未修。）
 * **结构体是值语义，成员赋值改的是副本**（实证，2026-10-28）：`Pt q = h.P;
   q.X = 99;` 之后 `h.P.X` 仍是原值——`q` 是副本。凡是"变换/映射/原地更新"
-  类 API，签名必须**交还新值**（`FuncT2<TSource, TTarget, TTarget>`），就地
+  类 API，签名必须**交还新值**（`Func<TSource, TTarget, TTarget>`），就地
   改成员改的是副本、调用方看不到。（`Zan.Mapping` 的成员规则按这条设计。）
-* **委托家族只有四件套，没有 `FuncT3`**（实证，2026-10-29）：stdlib 提供
-  `Action`（0 参）、`ActionT<T>`（1 参）、`ActionT2<T1,T2>`（2 参）、
-  `FuncT<T,TResult>`（**1 参** + 返回值）、`FuncT2<T1,T2,TResult>`（**2 参** +
-  返回值）。**三参数要用 `FuncT2`（它就是三个类型参数）或自己声明委托**——
-  写 `FuncT<A,B,C>` 报 "requires 2 type arguments"。看签名时数清楚
-  "参数个数 + 1"。
+* **委托家族 C# 同名，多参按 arity 自动合成**（实证，2026-11-02）：
+  stdlib/Action.zan 声明 `Action<T>`、`Func<T,TResult>`、`Predicate<T>`
+  遮蔽内建合成；0 参 `Action` 与 0 参 `Func<TResult>` 仍由内建提供；
+  多参请求（`Action<T1,T2>`、`Func<T1,T2,TResult>`、`Action<T1,T2,T3>` 等）
+  由编译器按泛型 arity 独立合成同名委托，无需声明直接可用，不同 arity
+  互赋正确报 E2024。旧名 ActionT/FuncT/ActionT2/FuncT2/PredicateT 已删。
 * **`Thread.Start` 是静态方法**（实证，2026-10-29）：没有 `new Thread(body)`，
   也没有实例 `Start()`——写法是 `Thread.Start(() => { ... })`（`ThreadStart`
   委托在 `System.Threading`）。它是**分离后台线程**，没有 `Join()`，要等结果
@@ -428,7 +428,7 @@ Without MCP the same index is a file: `knowledge/symbols.json` next to the SDK
   "'Dictionary<K,V>.Count' is a property, not a method"。
 * **泛型方法里可以创建捕获泛型形参的闭包**（实证，2026-10-29）：
   `void Register<T>(...)` 里把 `fromJson(argsJson)` 写进 lambda 再赋给
-  `FuncT<string, R>` 能正常工作（`T` 在闭包里可用）。这条让"泛型强类型 +
+  Func<string, R>` 能正常工作（`T` 在闭包里可用）。这条让"泛型强类型 +
   显式序列化委托"这种没有反射也能做的设计成立。
 * **`File.AppendAllText` 不加 BOM**（实证，2026-10-29）：追加的内容原样写入，
   换行按传入的字符串来（自己带 `\n`），不会替你补 BOM 或转成 CRLF。
