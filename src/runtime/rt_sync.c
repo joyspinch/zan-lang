@@ -1842,6 +1842,28 @@ int64_t zan_shared_table_get_int(
     return value;
 }
 
+/* get_int 的容错版：命中写出 *out_value 并返回 1；键不存在/列缺失/
+ * 行失效返回 0（不写出）。区分"值恰好是 0"与"没读到"。 */
+int32_t zan_shared_table_try_get_int(
+    int64_t handle, const char *key, const char *column_name,
+    int64_t *out_value) {
+    zan_shared_table *table = (zan_shared_table *)(intptr_t)handle;
+    if (!table || !out_value) return 0;
+    zan_shared_column *column = zan_find_column(
+        table->header, column_name, ZAN_TABLE_INT);
+    unsigned char *row = column ? zan_row_for(table->header, key, 0) : NULL;
+    if (!row) return 0;
+    zan_row_lock(row);
+    if (!zan_row_revalidate(row, zan_hash_bytes(key), key,
+                            table->header->key_size)) {
+        zan_row_unlock(row);
+        return 0;
+    }
+    memcpy(out_value, row + column->offset, sizeof(*out_value));
+    zan_row_unlock(row);
+    return 1;
+}
+
 int32_t zan_shared_table_set_float(
     int64_t handle, const char *key, const char *column_name, double value) {
     zan_shared_table *table = (zan_shared_table *)(intptr_t)handle;
@@ -2051,6 +2073,27 @@ int64_t zan_shared_table_get_int_at(
     memcpy(&value, row + column->offset, sizeof(value));
     zan_row_unlock(row);
     return value;
+}
+
+/* get_int_at 的容错版，口径同 zan_shared_table_try_get_int。 */
+int32_t zan_shared_table_try_get_int_at(
+    int64_t handle, int64_t key_hash, const char *column_name,
+    int64_t *out_value) {
+    zan_shared_table *table = (zan_shared_table *)(intptr_t)handle;
+    if (!table || !out_value) return 0;
+    zan_shared_column *column = zan_find_column(
+        table->header, column_name, ZAN_TABLE_INT);
+    unsigned char *row =
+        column ? zan_row_for_hash(table->header, (uint64_t)key_hash, 0) : NULL;
+    if (!row) return 0;
+    zan_row_lock(row);
+    if (!zan_row_revalidate(row, (uint64_t)key_hash, NULL, 0)) {
+        zan_row_unlock(row);
+        return 0;
+    }
+    memcpy(out_value, row + column->offset, sizeof(*out_value));
+    zan_row_unlock(row);
+    return 1;
 }
 
 int64_t zan_shared_table_increment_at(

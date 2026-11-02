@@ -175,6 +175,12 @@ i64 zan_shared_table_get_int(i64 handle, const char *key, const char *column) {
     return 0;
 }
 
+int32_t zan_shared_table_try_get_int(i64 handle, const char *key,
+                                     const char *column, i64 *out_value) {
+    (void)handle; (void)key; (void)column; (void)out_value;
+    return 0;
+}
+
 int32_t zan_shared_table_set_float(i64 handle, const char *key,
                                    const char *column, double value) {
     (void)handle; (void)key; (void)column; (void)value;
@@ -275,6 +281,12 @@ int32_t zan_shared_table_set_int_at(i64 handle, i64 key_hash,
 
 i64 zan_shared_table_get_int_at(i64 handle, i64 key_hash, const char *column) {
     (void)handle; (void)key_hash; (void)column;
+    return 0;
+}
+
+int32_t zan_shared_table_try_get_int_at(i64 handle, i64 key_hash,
+                                        const char *column, i64 *out_value) {
+    (void)handle; (void)key_hash; (void)column; (void)out_value;
     return 0;
 }
 

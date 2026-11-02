@@ -63,6 +63,9 @@ int32_t zan_shared_table_set_int(
     int64_t handle, const char *key, const char *column, int64_t value);
 int64_t zan_shared_table_get_int(
     int64_t handle, const char *key, const char *column);
+/* 容错读：命中写 *out_value 回 1，键/列缺失或行失效回 0。 */
+int32_t zan_shared_table_try_get_int(
+    int64_t handle, const char *key, const char *column, int64_t *out_value);
 int32_t zan_shared_table_set_float(
     int64_t handle, const char *key, const char *column, double value);
 double zan_shared_table_get_float(
@@ -108,6 +111,9 @@ int32_t zan_shared_table_set_int_at(
     int64_t handle, int64_t key_hash, const char *column_name, int64_t value);
 int64_t zan_shared_table_get_int_at(
     int64_t handle, int64_t key_hash, const char *column_name);
+int32_t zan_shared_table_try_get_int_at(
+    int64_t handle, int64_t key_hash, const char *column_name,
+    int64_t *out_value);
 int64_t zan_shared_table_increment_at(
     int64_t handle, int64_t key_hash, const char *column_name, int64_t delta);
 int64_t zan_shared_table_extreme_at(
