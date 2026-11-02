@@ -187,6 +187,7 @@ static void zan_sha256_final(zan_sha256_ctx_t *ctx, uint8_t digest[32]) {
     }
 }
 
+bool zan_pkg_compute_tree_checksum(const char *dir, char out_hex[65]);
 bool zan_pkg_compute_checksum(const char *file_path, char out_hex[65]) {
     if (!file_path || !out_hex) return false;
     FILE *f = fopen(file_path, "rb");
@@ -673,10 +674,13 @@ static bool zan_pkg_resolve_seen(zan_pkg_registry_t *reg, zan_package_t *root,
         }
         char manifest_path[1024];
         snprintf(manifest_path, sizeof(manifest_path), "%s" PATH_SEP "%s" PATH_SEP "zan.pkg", reg->cache_dir, dep->name);
+        char pkg_dir[1024];
+        snprintf(pkg_dir, sizeof(pkg_dir), "%s" PATH_SEP "%s", reg->cache_dir, dep->name);
         zan_package_t fetched_pkg;
         if (zan_pkg_load(&fetched_pkg, manifest_path)) {
             char computed_hash[65] = {0};
-            bool has_hash = zan_pkg_compute_checksum(manifest_path, computed_hash);
+            /* B-ID90: 校验对象从 manifest 升级为整包源码树（防源码篡改） */
+            bool has_hash = zan_pkg_compute_tree_checksum(pkg_dir, computed_hash);
             if (!zan_pkg_version_satisfies(dep, &fetched_pkg.version)) {
                 char ver_buf[64]; zan_version_format(&fetched_pkg.version, ver_buf, sizeof(ver_buf));
                 fprintf(stderr, "warning: package '%s' version %s may not satisfy constraint\n", dep->name, ver_buf);
@@ -1012,6 +1016,72 @@ static void pkg_dir_names_free(char **names, int count) {
     if (!names) return;
     for (int i = 0; i < count; i++) free(names[i]);
     free(names);
+}
+
+/* ---- B-ID90: 源码树确定性哈希 ----
+ * 只对 manifest（zan.pkg）算 SHA-256 挡不住源码被篡改。这里对整个包目录
+ * 做确定性遍历：相对路径排序后，逐文件哈希「相对路径 + NUL + 8 字节大端
+ * 长度 + 内容」。.git 目录不入账（clone 元数据非包内容）。 */
+static bool pkg_tree_hash_dir(const char *dir, const char *rel,
+                              zan_sha256_ctx_t *ctx, int depth) {
+    if (depth > 32) return false;
+    int count = 0;
+    char **names = pkg_dir_names_sorted(dir, &count);
+    if (!names && count == 0) return false;
+    bool ok = true;
+    for (int i = 0; i < count && ok; i++) {
+        const char *name = names[i];
+        if (strcmp(name, ".git") == 0) continue;
+        char child[1024], child_rel[1024];
+        if (snprintf(child, sizeof(child), "%s" PATH_SEP "%s", dir, name)
+            >= (int)sizeof(child)) { ok = false; break; }
+        if (rel[0])
+            snprintf(child_rel, sizeof(child_rel), "%s/%s", rel, name);
+        else
+            snprintf(child_rel, sizeof(child_rel), "%s", name);
+        if (pkg_is_dir(child)) {
+            ok = pkg_tree_hash_dir(child, child_rel, ctx, depth + 1);
+            continue;
+        }
+        FILE *f = fopen(child, "rb");
+        if (!f) { ok = false; break; }
+        /* 路径与长度先入账，再回卷读内容——改一个字节必变哈希 */
+        zan_sha256_update(ctx, child_rel, strlen(child_rel));
+        uint8_t nul = 0;
+        zan_sha256_update(ctx, &nul, 1);
+        long sz = -1;
+        if (fseek(f, 0, SEEK_END) == 0) {
+            sz = ftell(f);
+            fseek(f, 0, SEEK_SET);
+        }
+        uint8_t szb[8];
+        for (int k = 0; k < 8; k++) szb[k] = (uint8_t)((sz >> (56 - k * 8)) & 0xff);
+        zan_sha256_update(ctx, szb, 8);
+        uint8_t buf[8192];
+        size_t n, total = 0;
+        while ((n = fread(buf, 1, sizeof(buf), f)) > 0) {
+            zan_sha256_update(ctx, buf, n);
+            total += n;
+        }
+        fclose(f);
+        if (sz >= 0 && total != (size_t)sz) ok = false;
+    }
+    pkg_dir_names_free(names, count);
+    return ok;
+}
+
+bool zan_pkg_compute_tree_checksum(const char *dir, char out_hex[65]) {
+    if (!dir || !out_hex) return false;
+    if (!pkg_is_dir(dir)) return false;
+    zan_sha256_ctx_t ctx;
+    zan_sha256_init(&ctx);
+    if (!pkg_tree_hash_dir(dir, "", &ctx, 0)) return false;
+    uint8_t digest[32];
+    zan_sha256_final(&ctx, digest);
+    for (int i = 0; i < 32; i++)
+        sprintf(out_hex + (i * 2), "%02x", digest[i]);
+    out_hex[64] = 0;
+    return true;
 }
 
 static int pkg_scan_store(const char *store, const char *namespace_path,

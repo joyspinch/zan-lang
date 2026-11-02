@@ -1208,6 +1208,28 @@ if(NOT WIN32)
 endif()
 add_test(NAME unit_package_lock COMMAND zan_package_lock_test)
 
+# ---- package source-tree checksum unit test (B-ID90) ----
+add_executable(zan_package_tree_checksum_test
+    tests/unit/package_tree_checksum_test.c
+    src/compiler/package.c
+    src/compiler/arena.c
+    src/common/json.c
+)
+target_include_directories(zan_package_tree_checksum_test PRIVATE
+    ${CMAKE_SOURCE_DIR}
+    ${CMAKE_SOURCE_DIR}/src/compiler
+    ${CMAKE_SOURCE_DIR}/src/common
+)
+set_target_properties(zan_package_tree_checksum_test PROPERTIES
+    C_STANDARD 11
+    C_STANDARD_REQUIRED YES
+)
+if(NOT WIN32)
+    target_link_libraries(zan_package_tree_checksum_test PRIVATE m)
+endif()
+add_test(NAME unit_package_tree_checksum COMMAND zan_package_tree_checksum_test
+         WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+
 add_executable(zan_package_namespace_test
     tests/unit/package_namespace_test.c
     src/compiler/package.c
