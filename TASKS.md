@@ -39,6 +39,7 @@
 - [ ] B-ID89 生产级内存可观测性与循环引用泄漏分析工具缺失：Zan 采用无 GC 的纯 ARC 模型，循环引用必定造成长驻内存泄漏。目前全仓缺乏运行时“孤儿环探测器（Cycle Detector）”与生产环境 Heap Snapshot / Dump 导出机制，在长期运行的服务端与复杂桌面 GUI 中一旦发生内存缓慢增长，运维与开发缺乏定位手段；双轨保持一致。
 - [ ] B-ID92 静态构造（cctor）初始化序——selfhost 镜像欠账：C11 侧已闭（irgen_emit.c：按静态初始化器/静态构造体引用建依赖图，DFS 拓扑序逐类型「字段初始化→_cctor」成对发射，环路退回声明序；conformance static_init_dependency_order）。selfhost irgen.zan 的 Main 入口静态初始化仍按声明序，待镜像（文件当时在并发会话在飞域，未动）。惰性首次访问初始化（BeforeFieldInit）不做：拓扑序已覆盖单编译单元内的确定性需求。
 - [ ] B-ID93 异步调试信息（Debug Info）状态机展开与原始源码行映射断裂：`src/compiler/di.c` 目前在生成 DWARF/PDB 调试符号时，尚未对 `async/await` 重写后的闭包状态机帧建立原始行号映射（Source-Mapping），在调试器（zan-dap / lldb）中单步步入（Step-Over / Step-Into）异步函数时 PC 指针直接跳入底层合成的 `$resume` 状态机跳转表与帧槽存取汇编，开发者无法直观断点调试业务源码行；双轨保持一致。
+- [ ] B-ID94 存量 conformance/golden 基线红定性清单（11-02 抽样 1370 例实证，均在本日编译器改动之前已红，非回归）：golden_*_ir ×10��arith/control/enums/ops/structs/async_* 金样为 7 月口径，优化器已内联 Math_Add 并加 fastcc/unnamed_addr）+ diag_no_runtime_arc（同因，@Program_Managed 被内联）；div_overflow_min1（金样为 9 月"软失败契约" x/0→x、MIN/-1 饱和，现行 d47c6e276 后为 select-0 + 运行时报错，需先定契约再改金样或代码）；float32_precision（金样期望 f32 值按 double 位打印 0.30000001192092896，现打 0.3，与 38f9e8706 "float 是 f32" 契约核对）；exception_handler_depth（20 层嵌套 catch 重抛 hits 应 20 实得 1，疑真回归，优先）；datetime_civil / det_native_memory / det_ns_ambiguity_arity_filter 待定性。每条按"金样过期→按内容更新金样 / 真回归→修根因"二分闭账。
 
 
 
