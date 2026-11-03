@@ -69,6 +69,8 @@ zan_token_t zan_lexer_next(zan_lexer_t *lex);
 zan_token_t zan_lexer_peek(zan_lexer_t *lex);
 /* 向前预看两个词法单元（不消费 token，完全恢复词法状态） */
 zan_token_t zan_lexer_peek2(zan_lexer_t *lex);
+/* 向前预看 n 个词法单元（n >= 1，不消费 token，完全恢复词法状态） */
+zan_token_t zan_lexer_peek_n(zan_lexer_t *lex, int n);
 
 /* 回溯快照：只存位置态与深度计数，替代整结构体拷贝
  * （zan_lexer_t 含 512 层 interp 栈 ~10KB，parser lookahead 消歧热路径拷不起）。

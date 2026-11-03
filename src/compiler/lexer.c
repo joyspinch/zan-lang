@@ -1879,7 +1879,7 @@ pp_retry:
     }
 }
 
-static zan_token_t lexer_peek_n(zan_lexer_t *lex, int n) {
+zan_token_t zan_lexer_peek_n(zan_lexer_t *lex, int n) {
     size_t pos = lex->pos;
     uint32_t line = lex->line;
     uint32_t col = lex->col;
@@ -1920,11 +1920,11 @@ static zan_token_t lexer_peek_n(zan_lexer_t *lex, int n) {
     return tok;
 }
 zan_token_t zan_lexer_peek(zan_lexer_t *lex) {
-    return lexer_peek_n(lex, 1);
+    return zan_lexer_peek_n(lex, 1);
 }
 
 zan_token_t zan_lexer_peek2(zan_lexer_t *lex) {
-    return lexer_peek_n(lex, 2);
+    return zan_lexer_peek_n(lex, 2);
 }
 
 void zan_lexer_mark(zan_lexer_t *lex, zan_lexer_mark_t *out, zan_arena_t *arena) {

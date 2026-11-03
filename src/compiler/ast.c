@@ -276,24 +276,24 @@ int zan_ast_child_count(const zan_ast_node_t *n) {
     }
 }
 
-zan_ast_node_t *zan_ast_child_at(const zan_ast_node_t *n, int i) {
+zan_ast_node_t **zan_ast_child_ptr_at(zan_ast_node_t *n, int i) {
     if (!n || i < 0) return NULL;
     switch (n->kind) {
     case AST_COMPILATION_UNIT: {
         int b = 0;
-        if (i < b + n->comp_unit.usings.count) return n->comp_unit.usings.items[i - b];
+        if (i < b + n->comp_unit.usings.count) return &n->comp_unit.usings.items[i - b];
         b += n->comp_unit.usings.count;
-        if (i == b) return n->comp_unit.ns;
+        if (i == b) return &n->comp_unit.ns;
         b += 1;
-        if (i < b + n->comp_unit.decls.count) return n->comp_unit.decls.items[i - b];
+        if (i < b + n->comp_unit.decls.count) return &n->comp_unit.decls.items[i - b];
         return NULL;
     }
     case AST_USING_DECL:
-        return i == 0 ? n->using_decl.name : NULL;
+        return i == 0 ? &n->using_decl.name : NULL;
     case AST_NAMESPACE_DECL: {
-        if (i == 0) return n->namespace_decl.name;
+        if (i == 0) return &n->namespace_decl.name;
         int b = 1;
-        if (i < b + n->namespace_decl.members.count) return n->namespace_decl.members.items[i - b];
+        if (i < b + n->namespace_decl.members.count) return &n->namespace_decl.members.items[i - b];
         return NULL;
     }
     case AST_CLASS_DECL:
@@ -301,224 +301,224 @@ zan_ast_node_t *zan_ast_child_at(const zan_ast_node_t *n, int i) {
     case AST_INTERFACE_DECL:
     case AST_ENUM_DECL: {
         int b = 0;
-        if (i < b + n->type_decl.type_params.count) return n->type_decl.type_params.items[i - b];
+        if (i < b + n->type_decl.type_params.count) return &n->type_decl.type_params.items[i - b];
         b += n->type_decl.type_params.count;
-        if (i < b + n->type_decl.bases.count) return n->type_decl.bases.items[i - b];
+        if (i < b + n->type_decl.bases.count) return &n->type_decl.bases.items[i - b];
         b += n->type_decl.bases.count;
-        if (i < b + n->type_decl.members.count) return n->type_decl.members.items[i - b];
+        if (i < b + n->type_decl.members.count) return &n->type_decl.members.items[i - b];
         b += n->type_decl.members.count;
         if (n->type_decl.where_clauses && i < b + n->type_decl.where_clauses->count)
-            return n->type_decl.where_clauses->items[i - b];
+            return &n->type_decl.where_clauses->items[i - b];
         return NULL;
     }
     case AST_DELEGATE_DECL: {
-        if (i == 0) return n->method_decl.return_type;
+        if (i == 0) return &n->method_decl.return_type;
         int b = 1;
-        if (i < b + n->method_decl.params.count) return n->method_decl.params.items[i - b];
+        if (i < b + n->method_decl.params.count) return &n->method_decl.params.items[i - b];
         b += n->method_decl.params.count;
-        if (i < b + n->method_decl.type_params.count) return n->method_decl.type_params.items[i - b];
+        if (i < b + n->method_decl.type_params.count) return &n->method_decl.type_params.items[i - b];
         return NULL;
     }
     case AST_METHOD_DECL:
     case AST_CONSTRUCTOR_DECL:
     case AST_DESTRUCTOR_DECL: {
-        if (i == 0) return n->method_decl.return_type;
+        if (i == 0) return &n->method_decl.return_type;
         int b = 1;
-        if (i < b + n->method_decl.params.count) return n->method_decl.params.items[i - b];
+        if (i < b + n->method_decl.params.count) return &n->method_decl.params.items[i - b];
         b += n->method_decl.params.count;
-        if (i < b + n->method_decl.type_params.count) return n->method_decl.type_params.items[i - b];
+        if (i < b + n->method_decl.type_params.count) return &n->method_decl.type_params.items[i - b];
         b += n->method_decl.type_params.count;
-        if (i == b) return n->method_decl.body;
+        if (i == b) return &n->method_decl.body;
         b += 1;
         if (n->method_decl.ext) {
             if (i < b + n->method_decl.ext->where_clauses.count)
-                return n->method_decl.ext->where_clauses.items[i - b];
+                return &n->method_decl.ext->where_clauses.items[i - b];
             b += n->method_decl.ext->where_clauses.count;
             if (i < b + n->method_decl.ext->base_args.count)
-                return n->method_decl.ext->base_args.items[i - b];
+                return &n->method_decl.ext->base_args.items[i - b];
         }
         return NULL;
     }
     case AST_FIELD_DECL:
     case AST_PROPERTY_DECL:
         switch (i) {
-        case 0: return n->field_decl.type;
-        case 1: return n->field_decl.initializer;
-        case 2: return n->field_decl.getter_body;
-        case 3: return n->field_decl.setter_body;
+        case 0: return &n->field_decl.type;
+        case 1: return &n->field_decl.initializer;
+        case 2: return &n->field_decl.getter_body;
+        case 3: return &n->field_decl.setter_body;
         }
         return NULL;
     case AST_PARAM:
-        return i == 0 ? n->param.type : (i == 1 ? n->param.default_val : NULL);
+        return i == 0 ? &n->param.type : (i == 1 ? &n->param.default_val : NULL);
     case AST_BLOCK:
-        return i < n->block.stmts.count ? n->block.stmts.items[i] : NULL;
+        return i < n->block.stmts.count ? &n->block.stmts.items[i] : NULL;
     case AST_VAR_DECL:
-        return i == 0 ? n->var_decl.type : (i == 1 ? n->var_decl.initializer : NULL);
+        return i == 0 ? &n->var_decl.type : (i == 1 ? &n->var_decl.initializer : NULL);
     case AST_EXPR_STMT:
-        return i == 0 ? n->expr_stmt.expr : NULL;
+        return i == 0 ? &n->expr_stmt.expr : NULL;
     case AST_RETURN_STMT:
-        return i == 0 ? n->ret.value : NULL;
+        return i == 0 ? &n->ret.value : NULL;
     case AST_THROW_STMT:
-        return i == 0 ? n->throw_stmt.value : NULL;
+        return i == 0 ? &n->throw_stmt.value : NULL;
     case AST_YIELD_STMT:
-        return i == 0 ? n->yield_stmt.value : NULL;
+        return i == 0 ? &n->yield_stmt.value : NULL;
     case AST_ENUM_MEMBER:
-        return i == 0 ? n->enum_member.value : NULL;
+        return i == 0 ? &n->enum_member.value : NULL;
     case AST_NAMED_ARG:
-        return i == 0 ? n->named_arg.expr : NULL;
+        return i == 0 ? &n->named_arg.expr : NULL;
     case AST_AWAIT_EXPR:
-        return i == 0 ? n->await_expr.expr : NULL;
+        return i == 0 ? &n->await_expr.expr : NULL;
     case AST_IF_STMT:
         switch (i) {
-        case 0: return n->if_stmt.cond;
-        case 1: return n->if_stmt.then_body;
-        case 2: return n->if_stmt.else_body;
+        case 0: return &n->if_stmt.cond;
+        case 1: return &n->if_stmt.then_body;
+        case 2: return &n->if_stmt.else_body;
         }
         return NULL;
     case AST_WHILE_STMT:
     case AST_DO_WHILE_STMT:
-        return i == 0 ? n->while_stmt.cond : (i == 1 ? n->while_stmt.body : NULL);
+        return i == 0 ? &n->while_stmt.cond : (i == 1 ? &n->while_stmt.body : NULL);
     case AST_LOCK_STMT:
-        return i == 0 ? n->lock_stmt.expr : (i == 1 ? n->lock_stmt.body : NULL);
+        return i == 0 ? &n->lock_stmt.expr : (i == 1 ? &n->lock_stmt.body : NULL);
     case AST_CHECKED_STMT:
-        return i == 0 ? n->checked_stmt.body : NULL;
+        return i == 0 ? &n->checked_stmt.body : NULL;
     case AST_FOR_STMT:
         switch (i) {
-        case 0: return n->for_stmt.init;
-        case 1: return n->for_stmt.cond;
-        case 2: return n->for_stmt.step;
-        case 3: return n->for_stmt.body;
+        case 0: return &n->for_stmt.init;
+        case 1: return &n->for_stmt.cond;
+        case 2: return &n->for_stmt.step;
+        case 3: return &n->for_stmt.body;
         }
         return NULL;
     case AST_FOREACH_STMT:
         switch (i) {
-        case 0: return n->foreach_stmt.var_type;
-        case 1: return n->foreach_stmt.collection;
-        case 2: return n->foreach_stmt.body;
+        case 0: return &n->foreach_stmt.var_type;
+        case 1: return &n->foreach_stmt.collection;
+        case 2: return &n->foreach_stmt.body;
         }
         return NULL;
     case AST_TRY_STMT: {
-        if (i == 0) return n->try_stmt.try_body;
+        if (i == 0) return &n->try_stmt.try_body;
         int b = 1;
-        if (i < b + n->try_stmt.catches.count) return n->try_stmt.catches.items[i - b];
+        if (i < b + n->try_stmt.catches.count) return &n->try_stmt.catches.items[i - b];
         b += n->try_stmt.catches.count;
-        if (i == b) return n->try_stmt.finally_body;
+        if (i == b) return &n->try_stmt.finally_body;
         return NULL;
     }
     case AST_SWITCH_STMT: {
-        if (i == 0) return n->switch_stmt.expr;
+        if (i == 0) return &n->switch_stmt.expr;
         int b = 1;
-        if (i < b + n->switch_stmt.cases.count) return n->switch_stmt.cases.items[i - b];
+        if (i < b + n->switch_stmt.cases.count) return &n->switch_stmt.cases.items[i - b];
         return NULL;
     }
     case AST_IDENTIFIER:
-        return i == 0 ? n->ident.inst_type_ref : NULL;
+        return i == 0 ? &n->ident.inst_type_ref : NULL;
     case AST_BINARY:
     case AST_ASSIGNMENT:
-        return i == 0 ? n->binary.left : (i == 1 ? n->binary.right : NULL);
+        return i == 0 ? &n->binary.left : (i == 1 ? &n->binary.right : NULL);
     case AST_UNARY:
     case AST_POSTFIX_UNARY:
-        return i == 0 ? n->unary.operand : NULL;
+        return i == 0 ? &n->unary.operand : NULL;
     case AST_CALL: {
-        if (i == 0) return n->call.callee;
+        if (i == 0) return &n->call.callee;
         int b = 1;
-        if (i < b + n->call.args.count) return n->call.args.items[i - b];
+        if (i < b + n->call.args.count) return &n->call.args.items[i - b];
         b += n->call.args.count;
-        if (i < b + n->call.type_args.count) return n->call.type_args.items[i - b];
+        if (i < b + n->call.type_args.count) return &n->call.type_args.items[i - b];
         return NULL;
     }
     case AST_MEMBER_ACCESS:
-        return i == 0 ? n->member.object : NULL;
+        return i == 0 ? &n->member.object : NULL;
     case AST_INDEX: {
-        if (i == 0) return n->index.object;
-        if (i == 1) return n->index.index;
+        if (i == 0) return &n->index.object;
+        if (i == 1) return &n->index.index;
         int b = 2;
-        if (i < b + n->index.extra.count) return n->index.extra.items[i - b];
+        if (i < b + n->index.extra.count) return &n->index.extra.items[i - b];
         return NULL;
     }
     case AST_NEW_EXPR: {
-        if (i == 0) return n->new_expr.type;
-        if (i == 1) return n->new_expr.call_init;
+        if (i == 0) return &n->new_expr.type;
+        if (i == 1) return &n->new_expr.call_init;
         int b = 2;
-        if (i < b + n->new_expr.args.count) return n->new_expr.args.items[i - b];
+        if (i < b + n->new_expr.args.count) return &n->new_expr.args.items[i - b];
         b += n->new_expr.args.count;
-        if (i < b + n->new_expr.arg_inits.count) return n->new_expr.arg_inits.items[i - b];
+        if (i < b + n->new_expr.arg_inits.count) return &n->new_expr.arg_inits.items[i - b];
         return NULL;
     }
     case AST_CAST_EXPR:
-        return i == 0 ? n->cast.type : (i == 1 ? n->cast.expr : NULL);
+        return i == 0 ? &n->cast.type : (i == 1 ? &n->cast.expr : NULL);
     case AST_IS_EXPR:
     case AST_AS_EXPR:
-        return i == 0 ? n->type_test.expr : (i == 1 ? n->type_test.type : NULL);
+        return i == 0 ? &n->type_test.expr : (i == 1 ? &n->type_test.type : NULL);
     case AST_TYPEOF_EXPR:
     case AST_SIZEOF_EXPR:
-        return i == 0 ? n->cast.type : NULL;
+        return i == 0 ? &n->cast.type : NULL;
     case AST_CONDITIONAL:
         switch (i) {
-        case 0: return n->conditional.cond;
-        case 1: return n->conditional.then_expr;
-        case 2: return n->conditional.else_expr;
+        case 0: return &n->conditional.cond;
+        case 1: return &n->conditional.then_expr;
+        case 2: return &n->conditional.else_expr;
         }
         return NULL;
     case AST_LAMBDA: {
-        if (i < n->lambda.params.count) return n->lambda.params.items[i];
-        if (i == n->lambda.params.count) return n->lambda.body;
+        if (i < n->lambda.params.count) return &n->lambda.params.items[i];
+        if (i == n->lambda.params.count) return &n->lambda.body;
         return NULL;
     }
     case AST_STRING_INTERP: {
-        if (i < n->string_interp.parts.count) return n->string_interp.parts.items[i];
+        if (i < n->string_interp.parts.count) return &n->string_interp.parts.items[i];
         int b = n->string_interp.parts.count;
-        if (i < b + n->string_interp.formats.count) return n->string_interp.formats.items[i - b];
+        if (i < b + n->string_interp.formats.count) return &n->string_interp.formats.items[i - b];
         return NULL;
     }
     case AST_TUPLE_EXPR:
-        return i < n->tuple_expr.items.count ? n->tuple_expr.items.items[i] : NULL;
+        return i < n->tuple_expr.items.count ? &n->tuple_expr.items.items[i] : NULL;
     case AST_TUPLE_TYPE:
-        return i < n->tuple_type.elems.count ? n->tuple_type.elems.items[i] : NULL;
+        return i < n->tuple_type.elems.count ? &n->tuple_type.elems.items[i] : NULL;
     case AST_TUPLE_DECON: {
-        if (i < n->tuple_decon.names.count) return n->tuple_decon.names.items[i];
+        if (i < n->tuple_decon.names.count) return &n->tuple_decon.names.items[i];
         int b = n->tuple_decon.names.count;
-        if (i < b + n->tuple_decon.types.count) return n->tuple_decon.types.items[i - b];
-        if (i == b + n->tuple_decon.types.count) return n->tuple_decon.initializer;
+        if (i < b + n->tuple_decon.types.count) return &n->tuple_decon.types.items[i - b];
+        if (i == b + n->tuple_decon.types.count) return &n->tuple_decon.initializer;
         return NULL;
     }
     case AST_TYPE_REF: {
-        if (i < n->type_ref.type_args.count) return n->type_ref.type_args.items[i];
-        if (i == n->type_ref.type_args.count) return n->type_ref.array_element;
+        if (i < n->type_ref.type_args.count) return &n->type_ref.type_args.items[i];
+        if (i == n->type_ref.type_args.count) return &n->type_ref.array_element;
         return NULL;
     }
     case AST_QUALIFIED_NAME:
-        return i < n->qualified_name.parts.count ? n->qualified_name.parts.items[i] : NULL;
+        return i < n->qualified_name.parts.count ? &n->qualified_name.parts.items[i] : NULL;
     case AST_REF_ARG:
-        return i == 0 ? n->ref_arg.decl_type : (i == 1 ? n->ref_arg.expr : NULL);
+        return i == 0 ? &n->ref_arg.decl_type : (i == 1 ? &n->ref_arg.expr : NULL);
     case AST_COLL_INIT:
-        return i < n->coll_init.items.count ? n->coll_init.items.items[i] : NULL;
+        return i < n->coll_init.items.count ? &n->coll_init.items.items[i] : NULL;
     case AST_ATTRIBUTE: {
-        if (i == 0) return n->attribute.name;
+        if (i == 0) return &n->attribute.name;
         int b = 1;
-        if (i < b + n->attribute.args.count) return n->attribute.args.items[i - b];
+        if (i < b + n->attribute.args.count) return &n->attribute.args.items[i - b];
         return NULL;
     }
     case AST_CATCH_CLAUSE:
-        return i == 0 ? n->catch_clause.type : (i == 1 ? n->catch_clause.body : NULL);
+        return i == 0 ? &n->catch_clause.type : (i == 1 ? &n->catch_clause.body : NULL);
     case AST_SWITCH_CASE:
         switch (i) {
-        case 0: return n->switch_case.pattern;
-        case 1: return n->switch_case.type_pattern;
-        case 2: return n->switch_case.when_cond;
-        case 3: return n->switch_case.body;
+        case 0: return &n->switch_case.pattern;
+        case 1: return &n->switch_case.type_pattern;
+        case 2: return &n->switch_case.when_cond;
+        case 3: return &n->switch_case.body;
         }
         return NULL;
     case AST_WHERE_CLAUSE:
-        return i < n->where_clause.constraints.count ? n->where_clause.constraints.items[i] : NULL;
+        return i < n->where_clause.constraints.count ? &n->where_clause.constraints.items[i] : NULL;
     case AST_QUERY_EXPR: {
-        if (i == 0) return n->query.source;
+        if (i == 0) return &n->query.source;
         int b = 1;
-        if (i < b + n->query.clauses.count) return n->query.clauses.items[i - b];
+        if (i < b + n->query.clauses.count) return &n->query.clauses.items[i - b];
         b += n->query.clauses.count;
-        if (i == b) return n->query.group_expr;
-        if (i == b + 1) return n->query.group_key;
-        if (i == b + 2) return n->query.select;
+        if (i == b) return &n->query.group_expr;
+        if (i == b + 1) return &n->query.group_key;
+        if (i == b + 2) return &n->query.select;
         return NULL;
     }
     case AST_QUERY_WHERE:
@@ -526,30 +526,30 @@ zan_ast_node_t *zan_ast_child_at(const zan_ast_node_t *n, int i) {
     case AST_QUERY_ORDERBY:
     case AST_QUERY_JOIN:
         switch (i) {
-        case 0: return n->query_clause.expr;
-        case 1: return n->query_clause.source;
-        case 2: return n->query_clause.left_key;
-        case 3: return n->query_clause.right_key;
+        case 0: return &n->query_clause.expr;
+        case 1: return &n->query_clause.source;
+        case 2: return &n->query_clause.left_key;
+        case 3: return &n->query_clause.right_key;
         }
         return NULL;
     case AST_SWITCH_EXPR: {
-        if (i == 0) return n->switch_expr.expr;
+        if (i == 0) return &n->switch_expr.expr;
         int b = 1;
-        if (i < b + n->switch_expr.arms.count) return n->switch_expr.arms.items[i - b];
+        if (i < b + n->switch_expr.arms.count) return &n->switch_expr.arms.items[i - b];
         return NULL;
     }
     case AST_SWITCH_ARM:
         switch (i) {
-        case 0: return n->switch_arm.pattern;
-        case 1: return n->switch_arm.type_pattern;
-        case 2: return n->switch_arm.when_cond;
-        case 3: return n->switch_arm.result;
+        case 0: return &n->switch_arm.pattern;
+        case 1: return &n->switch_arm.type_pattern;
+        case 2: return &n->switch_arm.when_cond;
+        case 3: return &n->switch_arm.result;
         }
         return NULL;
     case AST_WITH_EXPR: {
-        if (i == 0) return n->with_expr.expr;
+        if (i == 0) return &n->with_expr.expr;
         int b = 1;
-        if (i < b + n->with_expr.assigns.count) return n->with_expr.assigns.items[i - b];
+        if (i < b + n->with_expr.assigns.count) return &n->with_expr.assigns.items[i - b];
         return NULL;
     }
     default:
@@ -559,6 +559,109 @@ zan_ast_node_t *zan_ast_child_at(const zan_ast_node_t *n, int i) {
 
 /* 经 child_count/child_at 递归数子树节点（含 root；NULL 槽跳过）。
  * 拓扑表自检与遍历器迁移的对照基线；共享子树按可达次数重复计数。 */
+zan_ast_node_t *zan_ast_child_at(const zan_ast_node_t *n, int i) {
+    zan_ast_node_t **p = zan_ast_child_ptr_at((zan_ast_node_t *)n, i);
+    return p ? *p : NULL;
+}
+
+bool zan_ast_for_each_child(zan_ast_node_t *n, zan_ast_child_fn fn, void *user_data) {
+    if (!n || !fn) return true;
+    int c = zan_ast_child_count(n);
+    for (int i = 0; i < c; i++) {
+        zan_ast_node_t *ch = zan_ast_child_at(n, i);
+        if (ch) {
+            if (!fn(ch, user_data)) return false;
+        }
+    }
+    return true;
+}
+
+bool zan_ast_for_each_child_const(const zan_ast_node_t *n, zan_ast_child_const_fn fn, void *user_data) {
+    if (!n || !fn) return true;
+    int c = zan_ast_child_count(n);
+    for (int i = 0; i < c; i++) {
+        const zan_ast_node_t *ch = zan_ast_child_at(n, i);
+        if (ch) {
+            if (!fn(ch, user_data)) return false;
+        }
+    }
+    return true;
+}
+
+bool zan_ast_for_each_child_ptr(zan_ast_node_t *n, zan_ast_child_ptr_fn fn, void *user_data) {
+    if (!n || !fn) return true;
+    int c = zan_ast_child_count(n);
+    for (int i = 0; i < c; i++) {
+        zan_ast_node_t **p = zan_ast_child_ptr_at(n, i);
+        if (p && *p) {
+            if (!fn(p, user_data)) return false;
+        }
+    }
+    return true;
+}
+
+bool zan_ast_walk(zan_ast_node_t *root,
+                  zan_ast_visitor_fn pre_visit,
+                  zan_ast_visitor_fn post_visit,
+                  void *user_data) {
+    if (!root) return true;
+    if (pre_visit) {
+        zan_walk_action_t act = pre_visit(root, user_data);
+        if (act == ZAN_WALK_ABORT) return false;
+        if (act == ZAN_WALK_SKIP_CHILDREN) {
+            if (post_visit) {
+                zan_walk_action_t post_act = post_visit(root, user_data);
+                if (post_act == ZAN_WALK_ABORT) return false;
+            }
+            return true;
+        }
+    }
+    int count = zan_ast_child_count(root);
+    for (int i = 0; i < count; i++) {
+        zan_ast_node_t *child = zan_ast_child_at(root, i);
+        if (child) {
+            if (!zan_ast_walk(child, pre_visit, post_visit, user_data))
+                return false;
+        }
+    }
+    if (post_visit) {
+        zan_walk_action_t post_act = post_visit(root, user_data);
+        if (post_act == ZAN_WALK_ABORT) return false;
+    }
+    return true;
+}
+
+bool zan_ast_walk_const(const zan_ast_node_t *root,
+                        zan_ast_visitor_const_fn pre_visit,
+                        zan_ast_visitor_const_fn post_visit,
+                        void *user_data) {
+    if (!root) return true;
+    if (pre_visit) {
+        zan_walk_action_t act = pre_visit(root, user_data);
+        if (act == ZAN_WALK_ABORT) return false;
+        if (act == ZAN_WALK_SKIP_CHILDREN) {
+            if (post_visit) {
+                zan_walk_action_t post_act = post_visit(root, user_data);
+                if (post_act == ZAN_WALK_ABORT) return false;
+            }
+            return true;
+        }
+    }
+    int count = zan_ast_child_count(root);
+    for (int i = 0; i < count; i++) {
+        const zan_ast_node_t *child = zan_ast_child_at(root, i);
+        if (child) {
+            if (!zan_ast_walk_const(child, pre_visit, post_visit, user_data))
+                return false;
+        }
+    }
+    if (post_visit) {
+        zan_walk_action_t post_act = post_visit(root, user_data);
+        if (post_act == ZAN_WALK_ABORT) return false;
+    }
+    return true;
+}
+
 size_t zan_ast_subtree_count(const zan_ast_node_t *root) {
     if (!root) return 0;
     size_t total = 1;

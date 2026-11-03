@@ -613,4 +613,42 @@ static inline zan_ast_list_t *zan_ast_ns_usings(const zan_ast_node_t *n) {
     return (n && n->meta) ? n->meta->ns_usings : NULL;
 }
 
+/* AST 子节点访问与遍历基建（B-ID102 统一基建） */
+int zan_ast_child_count(const zan_ast_node_t *n);
+zan_ast_node_t *zan_ast_child_at(const zan_ast_node_t *n, int i);
+zan_ast_node_t **zan_ast_child_ptr_at(zan_ast_node_t *n, int i);
+size_t zan_ast_subtree_count(const zan_ast_node_t *root);
+
+/* 遍历直接子节点（不递归；NULL 槽自动跳过）。回调返回 false 则提前中止并返回 false。 */
+typedef bool (*zan_ast_child_fn)(zan_ast_node_t *child, void *user_data);
+bool zan_ast_for_each_child(zan_ast_node_t *n, zan_ast_child_fn fn, void *user_data);
+
+typedef bool (*zan_ast_child_const_fn)(const zan_ast_node_t *child, void *user_data);
+bool zan_ast_for_each_child_const(const zan_ast_node_t *n, zan_ast_child_const_fn fn, void *user_data);
+
+/* 遍历直接子节点指针（用于 AST 重写或原位替换）。回调返回 false 则提前中止。 */
+typedef bool (*zan_ast_child_ptr_fn)(zan_ast_node_t **child_ptr, void *user_data);
+bool zan_ast_for_each_child_ptr(zan_ast_node_t *n, zan_ast_child_ptr_fn fn, void *user_data);
+
+/* 统一递归 AST 遍历器控制动作 */
+typedef enum {
+    ZAN_WALK_CONTINUE,       /* 继续遍历该节点的子节点 */
+    ZAN_WALK_SKIP_CHILDREN,  /* 跳过当前节点的子节点，继续下一个兄弟节点 */
+    ZAN_WALK_ABORT           /* 立即中止整个遍历 */
+} zan_walk_action_t;
+
+typedef zan_walk_action_t (*zan_ast_visitor_fn)(zan_ast_node_t *node, void *user_data);
+typedef zan_walk_action_t (*zan_ast_visitor_const_fn)(const zan_ast_node_t *node, void *user_data);
+
+/* 递归先序/后序遍历子树。pre_visit 或 post_visit 可为 NULL。返回 false 表示被 ZAN_WALK_ABORT 中止。 */
+bool zan_ast_walk(zan_ast_node_t *root,
+                  zan_ast_visitor_fn pre_visit,
+                  zan_ast_visitor_fn post_visit,
+                  void *user_data);
+
+bool zan_ast_walk_const(const zan_ast_node_t *root,
+                        zan_ast_visitor_const_fn pre_visit,
+                        zan_ast_visitor_const_fn post_visit,
+                        void *user_data);
+
 #endif /* ZAN_AST_H */

@@ -2049,41 +2049,8 @@ static zan_ast_node_t *parse_block(zan_parser_t *p) {
 }
 
 
-static zan_token_t lexer_peek_n(zan_parser_t *p, int k) {
-    size_t pos = p->lex->pos;
-    uint32_t line = p->lex->line;
-    uint32_t col = p->lex->col;
-    int idepth = p->lex->interp_depth;
-    int dcount = p->lex->define_count;
-    int nsave = idepth < ZAN_MAX_INTERP_DEPTH ? idepth : ZAN_MAX_INTERP_DEPTH;
-    zan_interp_level_t istack[ZAN_MAX_INTERP_DEPTH];
-    if (nsave > 0)
-        memcpy(istack, p->lex->interp_stack, sizeof(istack[0]) * (size_t)nsave);
-    int cdep = p->lex->cond_depth;
-    int cover = p->lex->cond_overflow;
-    int cstack[ZAN_PP_MAX_COND_DEPTH];
-    int cseen[ZAN_PP_MAX_COND_DEPTH];
-    int csave = cdep < ZAN_PP_MAX_COND_DEPTH ? cdep : ZAN_PP_MAX_COND_DEPTH;
-    if (csave > 0) {
-        memcpy(cstack, p->lex->cond_stack, sizeof(cstack[0]) * (size_t)csave);
-        memcpy(cseen, p->lex->cond_seen_true, sizeof(cseen[0]) * (size_t)csave);
-    }
-    zan_token_t tok = {0};
-    for (int i = 0; i < k; i++) tok = zan_lexer_next(p->lex);
-    p->lex->pos = pos;
-    p->lex->line = line;
-    p->lex->col = col;
-    p->lex->interp_depth = idepth;
-    p->lex->define_count = dcount;
-    if (nsave > 0)
-        memcpy(p->lex->interp_stack, istack, sizeof(istack[0]) * (size_t)nsave);
-    p->lex->cond_depth = cdep;
-    p->lex->cond_overflow = cover;
-    if (csave > 0) {
-        memcpy(p->lex->cond_stack, cstack, sizeof(cstack[0]) * (size_t)csave);
-        memcpy(p->lex->cond_seen_true, cseen, sizeof(cseen[0]) * (size_t)csave);
-    }
-    return tok;
+static inline zan_token_t lexer_peek_n(zan_parser_t *p, int k) {
+    return zan_lexer_peek_n(p->lex, k);
 }
 
 static bool looks_like_decon_decl(zan_parser_t *p) {
