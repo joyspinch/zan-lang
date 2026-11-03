@@ -1,0 +1,144 @@
+using System;
+using System.Security.Cryptography;
+using Zan.Web3.Types;
+using Zan.Web3.Encoding;
+
+namespace Zan.Web3.Contracts;
+
+// EIP-2612 链下免 Gas 签名授权凭证 (Permit Signature)
+public class PermitSignature {
+    public int V;                       // 恢复标识符 (27 或 28)
+    public byte[] R;                    // 32 字节 R
+    public byte[] S;                    // 32 字节 S
+    public string SignatureHex;         // 65 字节十六进制签名串
+
+    public PermitSignature(int v, byte[] r, byte[] s, string sigHex) {
+        V = v;
+        R = r;
+        S = s;
+        SignatureHex = sigHex != null ? sigHex : "";
+    }
+}
+
+// EIP-2612 ERC-20 链下免 Gas 授权工具类 (EIP-2612 Gasless Permit Client)
+// 基于 EIP-712 结构化数据标准，实现零 Gas 签名授权与一键组装链上 permit(owner,spender,value,deadline,v,r,s) calldata。
+public class Erc20Permit {
+
+    // EIP-2612 标准 Permit 类型哈希
+    // keccak256("Permit(address owner,address spender,uint256 value,uint256 nonce,uint256 deadline)")
+    public static string PermitTypeHash = "0x6e71edae12b1b97f4d1f60370fef10105fa2faae0126114a169c64845d6126c9";
+
+    // 计算 Permit 结构化数据哈希
+    public static byte[] GetPermitStructHash(
+        Address owner,
+        Address spender,
+        BigInt value,
+        BigInt nonce,
+        long deadline
+    ) {
+        // 6 个 32 字节槽位: typeHash + owner + spender + value + nonce + deadline (共 192 字节)
+        byte[] payload = new byte[192];
+
+        byte[] th = Hex.Decode(PermitTypeHash.Substring(2), 64);
+        for (int i = 0; i < 32; i = i + 1) { payload[i] = th[i]; }
+
+        byte[] ownerSlot = Abi.EncodeAddress(owner);
+        for (int i = 0; i < 32; i = i + 1) { payload[32 + i] = ownerSlot[i]; }
+
+        byte[] spenderSlot = Abi.EncodeAddress(spender);
+        for (int i = 0; i < 32; i = i + 1) { payload[64 + i] = spenderSlot[i]; }
+
+        byte[] valSlot = Abi.EncodeUint256(value);
+        for (int i = 0; i < 32; i = i + 1) { payload[96 + i] = valSlot[i]; }
+
+        byte[] nonceSlot = Abi.EncodeUint256(nonce);
+        for (int i = 0; i < 32; i = i + 1) { payload[128 + i] = nonceSlot[i]; }
+
+        byte[] deadSlot = Abi.EncodeUint256(deadline);
+        for (int i = 0; i < 32; i = i + 1) { payload[160 + i] = deadSlot[i]; }
+
+        return Keccak256.Hash(payload, 192);
+    }
+
+    // 为持有者生成链下免 Gas 授权签名
+    public static PermitSignature SignPermit(
+        Account ownerAccount,
+        string tokenName,
+        Address tokenAddress,
+        long chainId,
+        Address spender,
+        BigInt value,
+        BigInt nonce,
+        long deadline
+    ) {
+        if (ownerAccount == null || ownerAccount.PrivateKey == null) {
+            return null;
+        }
+
+        Eip712Domain domain = new Eip712Domain(tokenName, "1", chainId, tokenAddress);
+        byte[] structHash = GetPermitStructHash(ownerAccount.Address, spender, value, nonce, deadline);
+
+        // 计算 EIP-712 typed data 哈希
+        byte[] digest = Eip712.HashTypedData(domain, structHash);
+
+        // 使用 Secp256k1 进行确定性签名
+        Secp256k1Signature sig = ownerAccount.SignHash(digest);
+        if (sig == null) {
+            return null;
+        }
+
+        int v = sig.V + 27;
+        byte[] compact = new byte[65];
+        for (int i = 0; i < 32; i = i + 1) {
+            compact[i] = sig.R[i];
+            compact[32 + i] = sig.S[i];
+        }
+        compact[64] = (byte)v;
+
+        string sigHex = "0x" + Hex.Encode(compact, 65);
+        return new PermitSignature(v, sig.R, sig.S, sigHex);
+    }
+
+    // 构造提交至链上合约的 permit(address,address,uint256,uint256,uint8,bytes32,bytes32) calldata 字节数组
+    public static byte[] EncodePermitCalldata(
+        Address owner,
+        Address spender,
+        BigInt value,
+        long deadline,
+        PermitSignature sig
+    ) {
+        if (sig == null) { return new byte[0]; }
+
+        // 函数选择器: permit(address,address,uint256,uint256,uint8,bytes32,bytes32)
+        byte[] sel = Abi.GetFunctionSelector("permit(address,address,uint256,uint256,uint8,bytes32,bytes32)");
+
+        // 7 个槽位: 4 字节 selector + 7 * 32 字节 (共 228 字节)
+        byte[] calldata = new byte[4 + 7 * 32];
+        for (int i = 0; i < 4; i = i + 1) { calldata[i] = sel[i]; }
+
+        byte[] ownerSlot = Abi.EncodeAddress(owner);
+        for (int i = 0; i < 32; i = i + 1) { calldata[4 + i] = ownerSlot[i]; }
+
+        byte[] spenderSlot = Abi.EncodeAddress(spender);
+        for (int i = 0; i < 32; i = i + 1) { calldata[36 + i] = spenderSlot[i]; }
+
+        byte[] valSlot = Abi.EncodeUint256(value);
+        for (int i = 0; i < 32; i = i + 1) { calldata[68 + i] = valSlot[i]; }
+
+        byte[] deadSlot = Abi.EncodeUint256(deadline);
+        for (int i = 0; i < 32; i = i + 1) { calldata[100 + i] = deadSlot[i]; }
+
+        // uint8 v
+        byte[] vSlot = new byte[32];
+        vSlot[31] = (byte)(sig.V & 255);
+        for (int i = 0; i < 32; i = i + 1) { calldata[132 + i] = vSlot[i]; }
+
+        // bytes32 r
+        for (int i = 0; i < 32; i = i + 1) { calldata[164 + i] = sig.R[i]; }
+
+        // bytes32 s
+        for (int i = 0; i < 32; i = i + 1) { calldata[196 + i] = sig.S[i]; }
+
+        return calldata;
+    }
+}
