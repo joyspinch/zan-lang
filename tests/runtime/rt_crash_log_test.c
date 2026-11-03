@@ -5,13 +5,14 @@
  * 超过 ZAN_CRASH_LOG_MAX_BYTES 就把旧文件轮转成 <name>.1，只保留最近一代：
  * 崩溃现场永远在当前文件里，历史不丢但有界。
  *
- * 轮转逻辑是 rt_crash.h 里的 static 函数，只能直接 include 该头文件来测。
+ * 轮转逻辑在 rt_crash.c 里仍是 static 函数（B-ID106 拆出后头文件只留
+ * 导出原型），单测直接 include 该 .c 来测。
  * 该头文件的文件日志路径只在 Windows 分支实现，POSIX 分支走 signal+管道，
  * 所以本用例只编 Windows。
  */
 #if defined(_WIN32)
 
-#include "rt_crash.h"
+#include "rt_crash.c"
 
 #include <stdio.h>
 #include <stdlib.h>

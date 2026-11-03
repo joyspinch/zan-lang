@@ -39,6 +39,7 @@
         char rt_embed_buf[1200];
         char rt_inflate_buf[1200];
         char rt_timer_buf[1200];
+        char rt_crash_buf[1200];
         char rt_crypto_buf[1200];
         char rt_mem_buf[1200];
 
@@ -101,6 +102,19 @@
             snprintf(rt_timer_buf, sizeof(rt_timer_buf), "%s/%s",
                      link_exe_dir, zan_path_basename(ZAN_RT_TIMER_OBJ));
             rt_timer_obj = rt_timer_buf;
+        }
+#endif
+        /* Crash reporter（B-ID106 自 rt_crash.h 拆出）：rt_io.o 引
+         * zan__crash_install、gui 引 guard_call，凡链这些对象的目标都需要
+         * zanrt_crash.o；拆分前它随 rt_timer.o 的头内联构造器无条件在场，
+         * 这里保持等效的无条件注入。老部署缺此文件时静默跳过——丢的只是
+         * 崩溃报告能力，不阻塞正常链接。 */
+        const char *rt_crash_obj = NULL;
+#ifdef ZAN_RT_CRASH_OBJ
+        if (!cross_compiling) {
+            snprintf(rt_crash_buf, sizeof(rt_crash_buf), "%s/%s",
+                     link_exe_dir, zan_path_basename(ZAN_RT_CRASH_OBJ));
+            if (zan_file_exists(rt_crash_buf)) rt_crash_obj = rt_crash_buf;
         }
 #endif
         /* Hardware-accelerated crypto: an ARCHIVE, not a bare object. A bare
@@ -539,6 +553,7 @@
                     if (rt_embed_obj) argv[a++] = rt_embed_obj;
                     if (rt_inflate_obj) argv[a++] = rt_inflate_obj;
                     if (rt_timer_obj) argv[a++] = rt_timer_obj;
+                    if (rt_crash_obj) argv[a++] = rt_crash_obj;
                     if (rt_crypto_archive) argv[a++] = rt_crypto_archive;
                     argv[a++] = "-out-implib";
                     argv[a++] = implib;
@@ -700,6 +715,10 @@
                         cmd_appendf(cmd, sizeof(cmd), " \"%s\"",
                                  rt_timer_obj);
                     }
+                    if (rt_crash_obj) {
+                        cmd_appendf(cmd, sizeof(cmd), " \"%s\"",
+                                 rt_crash_obj);
+                    }
                     if (rt_crypto_archive) {
                         cmd_appendf(cmd, sizeof(cmd), " \"%s\"",
                                  rt_crypto_archive);
@@ -754,6 +773,10 @@
                     if (rt_timer_obj) {
                         cmd_appendf(cmd, sizeof(cmd), " \"%s\"",
                                  rt_timer_obj);
+                    }
+                    if (rt_crash_obj) {
+                        cmd_appendf(cmd, sizeof(cmd), " \"%s\"",
+                                 rt_crash_obj);
                     }
                     if (rt_crypto_archive) {
                         cmd_appendf(cmd, sizeof(cmd), " \"%s\"",
@@ -823,6 +846,10 @@
                     if (rt_timer_obj) {
                         cmd_appendf(cmd, sizeof(cmd), " \"%s\"",
                                  rt_timer_obj);
+                    }
+                    if (rt_crash_obj) {
+                        cmd_appendf(cmd, sizeof(cmd), " \"%s\"",
+                                 rt_crash_obj);
                     }
                     if (rt_crypto_archive) {
                         cmd_appendf(cmd, sizeof(cmd), " \"%s\"",
@@ -923,6 +950,10 @@
                     if (rt_timer_obj) {
                         cmd_appendf(cmd, sizeof(cmd), " \"%s\"",
                                  rt_timer_obj);
+                    }
+                    if (rt_crash_obj) {
+                        cmd_appendf(cmd, sizeof(cmd), " \"%s\"",
+                                 rt_crash_obj);
                     }
                     if (rt_crypto_archive) {
                         cmd_appendf(cmd, sizeof(cmd), " \"%s\"",
@@ -1031,6 +1062,9 @@
             }
             if (rt_timer_obj) {
                 cmd_appendf(cmd, sizeof(cmd), " \"%s\"", rt_timer_obj);
+                if (rt_crash_obj) {
+                    cmd_appendf(cmd, sizeof(cmd), " \"%s\"", rt_crash_obj);
+                }
             }
             if (rt_crypto_archive) {
                 cmd_appendf(cmd, sizeof(cmd), " \"%s\"", rt_crypto_archive);
@@ -1176,6 +1210,9 @@
             }
             if (rt_timer_obj) {
                 cmd_appendf(cmd, sizeof(cmd), " \"%s\"", rt_timer_obj);
+                if (rt_crash_obj) {
+                    cmd_appendf(cmd, sizeof(cmd), " \"%s\"", rt_crash_obj);
+                }
             }
             if (rt_crypto_archive) {
                 cmd_appendf(cmd, sizeof(cmd), " \"%s\"", rt_crypto_archive);
@@ -1263,6 +1300,9 @@
             }
             if (rt_timer_obj) {
                 cmd_appendf(cmd, sizeof(cmd), " \"%s\"", rt_timer_obj);
+                if (rt_crash_obj) {
+                    cmd_appendf(cmd, sizeof(cmd), " \"%s\"", rt_crash_obj);
+                }
             }
             if (rt_crypto_archive) {
                 cmd_appendf(cmd, sizeof(cmd), " \"%s\"", rt_crypto_archive);
@@ -1412,6 +1452,9 @@
             { cmd_appendf(cmd, sizeof(cmd), " \"%s\"", obj_tmp); }
             if (rt_timer_obj) {
                 cmd_appendf(cmd, sizeof(cmd), " \"%s\"", rt_timer_obj);
+                if (rt_crash_obj) {
+                    cmd_appendf(cmd, sizeof(cmd), " \"%s\"", rt_crash_obj);
+                }
             }
             if (rt_crypto_archive) {
                 cmd_appendf(cmd, sizeof(cmd), " \"%s\"", rt_crypto_archive);
@@ -1545,6 +1588,10 @@
             { cmd_appendf(cmd, sizeof(cmd),
                        " \"%s/zanrt_timer.o\" \"%s/zanrt_wasm.o\"",
                        sys, sys); }
+            { char wcrash[1300];
+              snprintf(wcrash, sizeof wcrash, "%s/zanrt_crash.o", sys);
+              if (zan_file_exists(wcrash))
+                  cmd_appendf(cmd, sizeof(cmd), " \"%s\"", wcrash); }
 
             /* The 128-bit Decimal runtime: programs that reach System.Numerics
                reference __zan_decimal_*, and the wasm link has to supply them
@@ -1767,6 +1814,9 @@
             }
             if (rt_timer_obj) {
                 cmd_appendf(cmd, sizeof(cmd), " \"%s\"", rt_timer_obj);
+                if (rt_crash_obj) {
+                    cmd_appendf(cmd, sizeof(cmd), " \"%s\"", rt_crash_obj);
+                }
             }
             if (rt_crypto_archive) {
                 cmd_appendf(cmd, sizeof(cmd), " \"%s\"", rt_crypto_archive);
@@ -2010,6 +2060,7 @@
             if (rt_embed_obj) argv[a++] = rt_embed_obj;
             if (rt_inflate_obj) argv[a++] = rt_inflate_obj;
             if (rt_timer_obj) argv[a++] = rt_timer_obj;
+            if (rt_crash_obj) argv[a++] = rt_crash_obj;
             if (rt_crypto_archive) argv[a++] = rt_crypto_archive;
             if (rt_mem_obj) {
                 argv[a++] = rt_mem_obj;
@@ -2100,6 +2151,9 @@
             }
             if (rt_timer_obj) {
                 cmd_appendf(link_cmd, sizeof(link_cmd), " \"%s\"", rt_timer_obj);
+                if (rt_crash_obj) {
+                    cmd_appendf(link_cmd, sizeof(link_cmd), " \"%s\"", rt_crash_obj);
+                }
             }
             if (rt_crypto_archive) {
                 cmd_appendf(link_cmd, sizeof(link_cmd), " \"%s\"", rt_crypto_archive);
@@ -2190,6 +2244,9 @@
             cmd_appendf(link_cmd, sizeof(link_cmd),
                      " \"%s\" -pthread -lrt", rt_timer_obj);
 #endif
+        }
+        if (rt_crash_obj) {
+            cmd_appendf(link_cmd, sizeof(link_cmd), " \"%s\"", rt_crash_obj);
         }
         if (rt_crypto_archive) {
             cmd_appendf(link_cmd, sizeof(link_cmd), " \"%s\"", rt_crypto_archive);

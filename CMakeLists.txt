@@ -338,6 +338,29 @@ add_custom_command(TARGET zanc POST_BUILD
             ${ZAN_RT_TIMER_OBJ} $<TARGET_FILE_DIR:zanc>/zanrt_timer${CMAKE_C_OUTPUT_EXTENSION}
     VERBATIM)
 
+# ---- Crash reporter / guard-recovery runtime (B-ID106: rt_crash.h 拆出) ----
+# rt_io.c calls zan__crash_install and gui_runtime.c calls zan__guard_call /
+# zan__guard_recovered_count, so every program linking zanrt_io.o (all native
+# builds) and every zan_gui consumer needs this object next to zanrt_timer.o.
+# Compiled with the same compiler/flags as the reactor for ABI match.
+set(ZAN_RT_CRASH_OBJ "${CMAKE_BINARY_DIR}/zanrt_crash${CMAKE_C_OUTPUT_EXTENSION}")
+add_custom_command(
+    OUTPUT ${ZAN_RT_CRASH_OBJ}
+    COMMAND ${ZAN_RT_IO_CC} ${ZAN_RT_OBJ_DEFS} -std=c11
+            -I ${CMAKE_SOURCE_DIR}/src/runtime -O2 ${ZAN_RT_OBJ_SECTIONS}
+            -c ${CMAKE_SOURCE_DIR}/src/runtime/rt_crash.c -o ${ZAN_RT_CRASH_OBJ}
+    DEPENDS ${CMAKE_SOURCE_DIR}/src/runtime/rt_crash.c
+            ${CMAKE_SOURCE_DIR}/src/runtime/rt_crash.h
+    COMMENT "Building crash reporter runtime object (zanrt_crash)"
+    VERBATIM)
+add_custom_target(zanrt_crash ALL DEPENDS ${ZAN_RT_CRASH_OBJ})
+add_dependencies(zanc zanrt_crash)
+target_compile_definitions(zanc PRIVATE ZAN_RT_CRASH_OBJ="${ZAN_RT_CRASH_OBJ}")
+add_custom_command(TARGET zanc POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            ${ZAN_RT_CRASH_OBJ} $<TARGET_FILE_DIR:zanc>/zanrt_crash${CMAKE_C_OUTPUT_EXTENSION}
+    VERBATIM)
+
 # ---- Hardware-accelerated crypto runtime (archive, not a bare object) ----
 #
 # rt_hw_accel.c used to be #included at the end of rt_timer.c, so every
@@ -592,6 +615,12 @@ foreach(_linux_sub linux-musl linux-arm64 linux-riscv64)
                     "${_linux_sys}/zanrt_io.o" "${_linux_sys}/zanrt_sync.o"
                     "${_linux_sys}/zanrt_timer.o"
                     ${CMAKE_BINARY_DIR}/${_linux_sub}/)
+        if(EXISTS "${_linux_sys}/zanrt_crash.o")
+            list(APPEND _cross_sysroot_cmds
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                        "${_linux_sys}/zanrt_crash.o"
+                        ${CMAKE_BINARY_DIR}/${_linux_sub}/)
+        endif()
         foreach(_linux_opt zanrt_file.o zanrt_io_mt.o zanrt_mem.o
                 zanrt_decimal.o libgcc.a
                 libfreetype.a libfontconfig.a libexpat.a
@@ -846,7 +875,7 @@ if(ZAN_BUILD_GUI)
         # gui_runtime_dwrite.cpp: DirectWrite glyph fallback (color emoji).
         # C++ because the SDK's dwrite.h only parses as C++; the rest of the
         # runtime stays C and calls it through the zan_dw_* extern "C" ABI.
-        add_library(zan_gui SHARED src/runtime/gui_runtime.c src/runtime/gui_runtime_dwrite.cpp)
+        add_library(zan_gui SHARED src/runtime/gui_runtime.c src/runtime/rt_crash.c src/runtime/gui_runtime_dwrite.cpp)
         target_link_libraries(zan_gui PRIVATE user32 gdi32 dwmapi shcore imm32 ole32)
         zan_native_import_library(zan_gui)
         # Embedded WebView needs nothing here: the Edge WebView2 backend is
@@ -861,7 +890,7 @@ if(ZAN_BUILD_GUI)
         # Real Cocoa backend (Objective-C) + shared renderer + Metal GPU pipeline. The C file
         # is compiled with ZAN_GUI_COCOA so its macOS stub branch is disabled and
         # gui_runtime_mac.m supplies the native windowing/window-management ABI.
-        add_library(zan_gui SHARED src/runtime/gui_runtime.c src/runtime/gui_runtime_mac.m src/runtime/gui_metal_backend.m)
+        add_library(zan_gui SHARED src/runtime/gui_runtime.c src/runtime/rt_crash.c src/runtime/gui_runtime_mac.m src/runtime/gui_metal_backend.m)
         set_source_files_properties(src/runtime/gui_runtime.c
             PROPERTIES COMPILE_DEFINITIONS ZAN_GUI_COCOA)
         target_link_libraries(zan_gui PRIVATE m "-framework Cocoa" "-framework CoreText" "-framework QuartzCore" "-framework IOSurface" "-framework WebKit" "-framework Metal")
@@ -869,7 +898,7 @@ if(ZAN_BUILD_GUI)
     else()
         find_package(X11)
         if(X11_FOUND)
-            add_library(zan_gui SHARED src/runtime/gui_runtime.c)
+            add_library(zan_gui SHARED src/runtime/gui_runtime.c src/runtime/rt_crash.c)
             target_include_directories(zan_gui PRIVATE ${X11_INCLUDE_DIR})
             target_link_libraries(zan_gui PRIVATE ${X11_LIBRARIES} m)
             find_package(Freetype QUIET)
@@ -1059,6 +1088,7 @@ add_executable(zanrt_io_addr_test
     tests/runtime/rt_io_addr_test.c
     src/runtime/rt_io.c
     src/runtime/rt_co.c
+    src/runtime/rt_crash.c
     src/runtime/rt_timer.c
 )
 target_compile_definitions(zanrt_io_addr_test PRIVATE ZAN_IO_STACKLESS_ONLY)
@@ -1089,6 +1119,7 @@ add_executable(zanrt_sched_test
     src/runtime/rt_sched.c
     src/runtime/rt_io.c
     src/runtime/rt_co.c
+    src/runtime/rt_crash.c
     src/runtime/rt_timer.c
     src/runtime/rt_mem.c
 )
@@ -1118,6 +1149,7 @@ if(NOT WIN32)
         tests/runtime/rt_sigpipe_test.c
         src/runtime/rt_io.c
         src/runtime/rt_co.c
+        src/runtime/rt_crash.c
         src/runtime/rt_timer.c
     )
     target_compile_definitions(zanrt_sigpipe_test PRIVATE ZAN_IO_STACKLESS_ONLY)
@@ -1145,6 +1177,7 @@ if(NOT WIN32)
     add_executable(zanrt_fg_pool_test
         tests/runtime/rt_fg_pool_test.c
         src/runtime/rt_io.c
+        src/runtime/rt_crash.c
         src/runtime/rt_timer.c
     )
     target_compile_definitions(zanrt_fg_pool_test PRIVATE
@@ -3523,8 +3556,8 @@ if(SELFHOST_CLANG)
   # it cannot be reused for a link driven by SELFHOST_CLANG. The TU is
   # therefore compiled again here, with the same clang as the rest of the
   # bundle.
-  set(_sh_rt_srcs rt_file.c rt_io.c rt_sched.c rt_timer.c rt_decimal.c
-                   rt_sync.c zan_embed_api.c rt_hw_accel.c)
+  set(_sh_rt_srcs rt_file.c rt_io.c rt_crash.c rt_sched.c rt_timer.c
+                   rt_decimal.c rt_sync.c zan_embed_api.c rt_hw_accel.c)
   set(_sh_rt_objs)
   foreach(_sh_src IN LISTS _sh_rt_srcs)
     get_filename_component(_sh_stem ${_sh_src} NAME_WE)
@@ -3598,8 +3631,8 @@ if(SELFHOST_CLANG)
   # (the C host links the shipped mt runtime, the self-host links its own
   # emitted fallback). The gate therefore compares *compiler* behaviour --
   # the stdout a program produces -- not runtime internals.
-  set(_shd_rt_srcs rt_file.c rt_io.c rt_sched.c rt_timer.c rt_decimal.c
-                    rt_sync.c zan_embed_api.c rt_hw_accel.c)
+  set(_shd_rt_srcs rt_file.c rt_io.c rt_crash.c rt_sched.c rt_timer.c
+                    rt_decimal.c rt_sync.c zan_embed_api.c rt_hw_accel.c)
   set(_shd_rt_objs)
   foreach(_shd_src IN LISTS _shd_rt_srcs)
     get_filename_component(_shd_stem ${_shd_src} NAME_WE)
