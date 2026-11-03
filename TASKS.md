@@ -22,6 +22,7 @@
 ### 批次 2 · 独立账（无前置，任一会话可领，按编号序）
 
 - [ ] B-ID132〔登记不修〕gen1 三段及以上字符串链拉平路径（StrConcatN）布尔串接输出 `True` 与 C11 `true` 不一致：双探针实证 2026-11-03（`"u=" + (u == null) + " v=" + (v == null)` gen1 出 `True`，C11 出 `true`；两段式 pairwise 串接双编译器一致出小写）。根修在 irgen_expr.zan 拉平路径的布尔字面渲染对齐 C11 小写口径；补一条三段布尔链 diff 案随修入册。
+- [ ] B-ID142〔登记不修 · 关联 de208fe98〕gui 模板族与 run_templates 门未随"编译期 HTML 通道拔除"收口：18 个 gui 模板均带 src/App.html 设计文档，run_templates.cmake 按 ZanIDE.GatherZanFiles 同口径把 .html 传入 zanc 命令行，而 de208fe98 已移除 .html 编译输入通道并给显式诊断（"the compile-time HTML channel has been removed; … load markup at runtime via Gui.App.LoadHtml"）——探针实测 gui-webapp 以 App.html 为入口编译直拒（397 错误，模板门必红），IDE 脚手架整项目编译同路径受累；需统一收口：runner/IDE 停传 .html、模板 App.html 转运行时资产（Gui.App.LoadHtml）或模板清单剥离，设计定型后一并修。
 - [ ] B-ID136 override 虚方法按静态类型分派而非运行期类型：探针实证 2026-11-04（`Animal a = new Dog(); a.ToString()` 输出基类 `"A"` 而非 `"D"`，同对象静态类型为 Dog 时正确出 `"D"`；System.Object 方法族 A558 站内分派只按编译期接收者形状选槽，upcast 后丢 override）。根修在 irgen 的 Object 方法族调用位改走虚槽/类型信息分派；关联 bbc044dbe（框架钩子静默失效同根）。
 
 ### 批次 3 · 有前置（前置闭了再领）
