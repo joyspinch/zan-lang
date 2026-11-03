@@ -1,18 +1,71 @@
 using System;
 using System.Collections.Generic;
+using System.Security.Cryptography;
 
 namespace System.Web;
 
 public class Sessions {
-    StrMap tokens;  // token -> uid
+    Dictionary<string, SessionEntry> map;
+    SessionEntry head;
+    SessionEntry tail;
+    int capacity;
+    int defaultTtl;
 
-    public Sessions() { this.tokens = new StrMap(); }
+    public Sessions() {
+        this.map = new Dictionary<string, SessionEntry>();
+        this.head = null;
+        this.tail = null;
+        this.capacity = 65536;
+        this.defaultTtl = 86400;
+    }
+
+    public Sessions(int capacity, int defaultTtl) {
+        if (capacity <= 0) { capacity = 65536; }
+        if (defaultTtl <= 0) { defaultTtl = 86400; }
+        this.map = new Dictionary<string, SessionEntry>();
+        this.head = null;
+        this.tail = null;
+        this.capacity = capacity;
+        this.defaultTtl = defaultTtl;
+    }
+
+    public int Count() {
+        lock (this) {
+            return this.map.Count;
+        }
+    }
+
+    public int Capacity {
+        get { return this.capacity; }
+    }
+
+    public int DefaultTtl {
+        get { return this.defaultTtl; }
+    }
 
     public string Issue(string uid, int nowSeconds) {
+        return this.Issue(uid, nowSeconds, this.defaultTtl);
+    }
+
+    public string Issue(string uid, int nowSeconds, int ttlSeconds) {
         lock (this) {
             byte[] rnd = RandomNumberGenerator.GetBytes(32);
             if (rnd == null) { return ""; }
-            if (this.tokens.Count() >= 65536) { this.tokens.Clear(); }
+            if (nowSeconds <= 0) {
+                nowSeconds = (int)(DateTime.GetCurrentUnixMilliseconds() / 1000);
+            }
+            if (ttlSeconds <= 0) {
+                ttlSeconds = this.defaultTtl;
+            }
+            int expiresAt = nowSeconds + ttlSeconds;
+
+            if (this.map.Count >= this.capacity) {
+                this.PruneExpiredInternal(nowSeconds);
+            }
+            while (this.map.Count >= this.capacity && this.tail != null) {
+                this.EvictTailInternal();
+            }
+
             byte[] outb = new byte[64];
             int p = 0;
             for (int i = 0; i < 32; i = i + 1) {
@@ -24,22 +77,105 @@ public class Sessions {
                 p = p + 2;
             }
             string token = outb.ToStr(0, 64);
-            this.tokens.Set(token, uid);
+            SessionEntry entry = new SessionEntry(token, uid, expiresAt);
+            this.map[token] = entry;
+            this.AddToHeadInternal(entry);
             return token;
         }
     }
 
     public string UserOf(string token) {
+        int now = (int)(DateTime.GetCurrentUnixMilliseconds() / 1000);
+        return this.UserOf(token, now);
+    }
+
+    public string UserOf(string token, int nowSeconds) {
+        if (token == null || token.Length == 0) { return ""; }
         lock (this) {
-            return this.tokens.Get(token);
+            SessionEntry entry;
+            if (!this.map.TryGetValue(token, out entry) || entry == null) {
+                return "";
+            }
+            if (nowSeconds > 0 && entry.expiresAt > 0 && entry.expiresAt <= nowSeconds) {
+                this.RemoveNodeInternal(entry);
+                this.map.Remove(token);
+                return "";
+            }
+            this.MoveToHeadInternal(entry);
+            return entry.uid;
+        }
+    }
+
+    public bool Remove(string token) {
+        if (token == null || token.Length == 0) { return false; }
+        lock (this) {
+            SessionEntry entry;
+            if (this.map.TryGetValue(token, out entry) && entry != null) {
+                this.RemoveNodeInternal(entry);
+                this.map.Remove(token);
+                return true;
+            }
+            return false;
         }
     }
 
     public void Clear() {
         lock (this) {
-            this.tokens.Clear();
+            this.map.Clear();
+            this.head = null;
+            this.tail = null;
+        }
+    }
+
+    private void AddToHeadInternal(SessionEntry node) {
+        node.prev = null;
+        node.next = this.head;
+        if (this.head != null) {
+            this.head.prev = node;
+        }
+        this.head = node;
+        if (this.tail == null) {
+            this.tail = node;
+        }
+    }
+
+    private void RemoveNodeInternal(SessionEntry node) {
+        if (node.prev != null) {
+            node.prev.next = node.next;
+        } else {
+            this.head = node.next;
+        }
+        if (node.next != null) {
+            node.next.prev = node.prev;
+        } else {
+            this.tail = node.prev;
+        }
+        node.prev = null;
+        node.next = null;
+    }
+
+    private void MoveToHeadInternal(SessionEntry node) {
+        if (this.head == node) { return; }
+        this.RemoveNodeInternal(node);
+        this.AddToHeadInternal(node);
+    }
+
+    private void EvictTailInternal() {
+        if (this.tail == null) { return; }
+        SessionEntry victim = this.tail;
+        this.RemoveNodeInternal(victim);
+        this.map.Remove(victim.token);
+    }
+
+    private void PruneExpiredInternal(int nowSeconds) {
+        SessionEntry curr = this.tail;
+        while (curr != null) {
+            SessionEntry prevNode = curr.prev;
+            if (curr.expiresAt > 0 && curr.expiresAt <= nowSeconds) {
+                this.RemoveNodeInternal(curr);
+                this.map.Remove(curr.token);
+            }
+            curr = prevNode;
         }
     }
 }
-
-// channel (Windows).
