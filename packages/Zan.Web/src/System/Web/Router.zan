@@ -10,8 +10,6 @@ public class Router {
     List<Route> statics;  // no {param} segments: matched by full-path compare
     List<Route> dynamics;  // contain {param} segments: matched per-segment
     List<Route> regexes;   // regex patterns: matched by Regex.Find / IsMatch
-    // 静态路由 O(1) 快速查找哈希表。
-    Dictionary<string, Route> staticIndex;
     // 静态路由开放寻址哈希索引。
     List<int> hashSlots;
     int hashMask;
@@ -27,7 +25,6 @@ public class Router {
         this.statics = new List<Route>();
         this.dynamics = new List<Route>();
         this.regexes = new List<Route>();
-        this.staticIndex = new Dictionary<string, Route>();
         this.hashSlots = null;
         this.hashMask = 0;
         this.flat = new List<Route>();
@@ -44,8 +41,6 @@ public class Router {
         Route r = new Route(method, pattern, handler);
         if (Router.IsStatic(pattern)) {
             this.statics.Add(r);
-            Dictionary<string, Route> idx = this.staticIndex;
-            idx[method + " " + pattern] = r;
             this.hashSlots = null;
         } else {
             this.dynamics.Add(r);
@@ -222,6 +217,7 @@ public class Router {
         int cap = 16;
         while (cap < this.statics.Count * 4) { cap = cap * 2; }
         List<int> slots = new List<int>();
+        slots.Reserve(cap);
         int i = 0;
         for (; i < cap; i = i + 1) { slots.Add(-1); }
         int mask = cap - 1;
@@ -302,14 +298,14 @@ public class Router {
         // 动态分段路由
         if (this.dynamics.Count > 0) {
             List<string> segs = Router.SplitPath(path);
+            int segCount = segs.Count;
             for (int i = 0; i < this.dynamics.Count; i = i + 1) {
                 Route r = this.dynamics[i];
-                if (r.method == method || r.method == "*") {
+                if (r.segs.Count == segCount && (r.method == method || r.method == "*")) {
                     if (ctx.routeParams == null) { ctx.routeParams = new StrMap(); }
                     if (Router.MatchRoute(r, segs, ctx.routeParams)) {
                         return r;
                     }
-                    ctx.routeParams.Clear();
                 }
             }
         }
@@ -365,10 +361,12 @@ public class Router {
         }
         if (this.dynamics.Count > 0) {
             List<string> segs = Router.SplitPath(path);
+            int segCount = segs.Count;
             StrMap scratch = new StrMap();
             i = 0;
             while (i < this.dynamics.Count) {
-                if (Router.MatchRoute(this.dynamics[i], segs, scratch)) { return true; }
+                Route r = this.dynamics[i];
+                if (r.segs.Count == segCount && Router.MatchRoute(r, segs, scratch)) { return true; }
                 i = i + 1;
             }
         }
@@ -391,14 +389,20 @@ public class Router {
     // 段数相等且逐段相等；利用预编译的 paramNames 零分配写入 into。
     public static bool MatchRoute(Route r, List<string> segs, StrMap into) {
         List<string> pat = r.segs;
-        if (pat.Count != segs.Count) { return false; }
+        int count = pat.Count;
+        if (count != segs.Count) { return false; }
         List<string> pnames = r.paramNames;
-        for (int i = 0; i < pat.Count; i = i + 1) {
+        // 1. 先验证所有静态段是否吻合，不产生中间副作用
+        for (int i = 0; i < count; i = i + 1) {
+            if (pnames[i].Length == 0 && pat[i] != segs[i]) {
+                return false;
+            }
+        }
+        // 2. 全部匹配后才写入提取的参数
+        for (int i = 0; i < count; i = i + 1) {
             string pname = pnames[i];
             if (pname.Length > 0) {
                 into.Set(pname, segs[i]);
-            } else if (pat[i] != segs[i]) {
-                return false;
             }
         }
         return true;
@@ -406,14 +410,22 @@ public class Router {
 
     // 段数相等且逐段相等；{param} 段匹配任意段并把值写入 into。
     public static bool MatchSegs(List<string> pat, List<string> segs, StrMap into) {
-        if (pat.Count != segs.Count) { return false; }
-        for (int i = 0; i < pat.Count; i = i + 1) {
+        int count = pat.Count;
+        if (count != segs.Count) { return false; }
+        // 1. 先验证非参数段是否完全吻合
+        for (int i = 0; i < count; i = i + 1) {
+            string p = pat[i];
+            if (!(p.Length > 2 && (p[0] & 255) == 123
+                && (p[p.Length - 1] & 255) == 125)) {  // '{' '}'
+                if (p != segs[i]) { return false; }
+            }
+        }
+        // 2. 确认全部匹配后才写入参数
+        for (int i = 0; i < count; i = i + 1) {
             string p = pat[i];
             if (p.Length > 2 && (p[0] & 255) == 123
                 && (p[p.Length - 1] & 255) == 125) {  // '{' '}'
                 into.Set(p.Substring(1, p.Length - 2), segs[i]);
-            } else if (p != segs[i]) {
-                return false;
             }
         }
         return true;

@@ -10,6 +10,24 @@ namespace System.IO.Compression;
 // 1-9 选择哈希链长度；格式与 zlib 默认输出一致，
 // 因此可与任何标准 inflate 实现互通）。
 public class Deflate {
+    static int[] revTable;
+
+    // 惰性构建 256 项 8 位位反转表，消除 Huffman 写出时的逐位移位循环。
+    private static int[] RevTable() {
+        if (Deflate.revTable != null) { return Deflate.revTable; }
+        int[] t = new int[256];
+        for (int i = 0; i < 256; i = i + 1) {
+            int r = 0;
+            int v = i;
+            for (int k = 0; k < 8; k = k + 1) {
+                r = (r << 1) | (v & 1);
+                v = v >> 1;
+            }
+            t[i] = r;
+        }
+        Deflate.revTable = t;
+        return t;
+    }
 
     // 从位流读 n 位（LSB 优先）；输入耗尽返回 -1，绝不越过 end 读取。
     private static int ReadBits(byte[] src, ref int pos, ref int bit, int n, int end) {
@@ -405,7 +423,6 @@ public class Deflate {
         int hsize = 65536;
         int[] head = new int[hsize];
         int[] prev = new int[n];
-        for (int i = 0; i < n; i = i + 1) { prev[i] = 0; }
 
         int pos = 0;
         while (pos < n) {
@@ -420,9 +437,21 @@ public class Deflate {
                     int c0 = cand - 1;
                     int dist = pos - c0;
                     if (dist <= 32768 && dist > 0) {
+                        // 首尾剪枝：若 matchLen 处字符不等，绝不可能更长
+                        if (matchLen > 0 && pos + matchLen < n && src[c0 + matchLen] != src[pos + matchLen]) {
+                            cand = prev[c0];
+                            continue;
+                        }
                         int l = 0;
-                        for (; l < 258 && pos + l < n &&
-                               src[c0 + l] == src[pos + l]; l = l + 1) {
+                        while (l + 4 <= 258 && pos + l + 4 <= n) {
+                            if (src[c0 + l] != src[pos + l] || src[c0 + l + 1] != src[pos + l + 1] ||
+                                src[c0 + l + 2] != src[pos + l + 2] || src[c0 + l + 3] != src[pos + l + 3]) {
+                                break;
+                            }
+                            l = l + 4;
+                        }
+                        while (l < 258 && pos + l < n && src[c0 + l] == src[pos + l]) {
+                            l = l + 1;
                         }
                         if (l > matchLen) {
                             matchLen = l;
@@ -537,9 +566,16 @@ public class Deflate {
     // 有效位），再走统一的整字节 LSB 打包。
     public static void WriteBitsMsb(byte[] out2, ref int bitPos, int v, int n) {
         if (n == 0) { return; }
+        int[] rev = Deflate.RevTable();
         int r = 0;
-        for (int i = 0; i < n; i = i + 1) {
-            r = (r << 1) | ((v >> i) & 1);
+        if (n <= 8) {
+            r = rev[v & 255] >> (8 - n);
+        } else if (n == 9) {
+            r = (rev[v & 255] << 1) | ((v >> 8) & 1);
+        } else {
+            for (int i = 0; i < n; i = i + 1) {
+                r = (r << 1) | ((v >> i) & 1);
+            }
         }
         Deflate.WriteBits(out2, ref bitPos, r, n);
     }
@@ -570,9 +606,39 @@ public class Deflate {
         }
         long s1 = 1;
         long s2 = 0;
-        for (int i = 0; i < src.Length; i = i + 1) {
-            s1 = (s1 + (src[i] & 255)) % 65521;
-            s2 = (s2 + s1) % 65521;
+        int i = 0;
+        int len = src.Length;
+        while (len > 0) {
+            int block = len > 5552 ? 5552 : len;
+            len = len - block;
+            while (block >= 16) {
+                s1 = s1 + (src[i] & 255);      s2 = s2 + s1;
+                s1 = s1 + (src[i + 1] & 255);  s2 = s2 + s1;
+                s1 = s1 + (src[i + 2] & 255);  s2 = s2 + s1;
+                s1 = s1 + (src[i + 3] & 255);  s2 = s2 + s1;
+                s1 = s1 + (src[i + 4] & 255);  s2 = s2 + s1;
+                s1 = s1 + (src[i + 5] & 255);  s2 = s2 + s1;
+                s1 = s1 + (src[i + 6] & 255);  s2 = s2 + s1;
+                s1 = s1 + (src[i + 7] & 255);  s2 = s2 + s1;
+                s1 = s1 + (src[i + 8] & 255);  s2 = s2 + s1;
+                s1 = s1 + (src[i + 9] & 255);  s2 = s2 + s1;
+                s1 = s1 + (src[i + 10] & 255); s2 = s2 + s1;
+                s1 = s1 + (src[i + 11] & 255); s2 = s2 + s1;
+                s1 = s1 + (src[i + 12] & 255); s2 = s2 + s1;
+                s1 = s1 + (src[i + 13] & 255); s2 = s2 + s1;
+                s1 = s1 + (src[i + 14] & 255); s2 = s2 + s1;
+                s1 = s1 + (src[i + 15] & 255); s2 = s2 + s1;
+                i = i + 16;
+                block = block - 16;
+            }
+            while (block > 0) {
+                s1 = s1 + (src[i] & 255);
+                s2 = s2 + s1;
+                i = i + 1;
+                block = block - 1;
+            }
+            s1 = s1 % 65521;
+            s2 = s2 % 65521;
         }
         long ad = (s2 << 16) | s1;
         out2[deflated.Length + 2] = (byte)((ad >> 24) & 255);
@@ -582,11 +648,3 @@ public class Deflate {
         return out2;
     }
 }
-
-// DEFLATE 分块压缩器：大条目按块压成一条合法的流，内存占用
-// 与数据总量无关。DEFLATE 的块在流里是位连续的，不能按字节
-// 拼接，因此每块从上一块遗留的部分字节继续写；哈希链每块
-// 重建、匹配从不跨块，对 1MB 量级的块压缩比损失可以忽略。
-// <see cref="Push"/> 每次返回可直接落盘的完整字节（残位留在
-// 内部状态里随下一块续写）；数据写完后调 <see cref="Finish"/>
-// 发射收尾块并冲出最后的残位。与 Inflate 互通：Push+Finish

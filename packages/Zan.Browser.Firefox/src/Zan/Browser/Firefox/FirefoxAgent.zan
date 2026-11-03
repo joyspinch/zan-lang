@@ -452,6 +452,63 @@ public class FirefoxAgentTab {
         return res == "true" || res == "ok";
     }
 
+    /// <summary>
+    /// 异步网络空闲等待状态机 (基于 Necko / Fetch / XHR inFlight 活跃计数器)
+    /// </summary>
+    public async bool WaitForNetworkIdleAsync(int requiredIdleMs = 500, int timeoutMs = 15000) {
+        int elapsed = 0;
+        while (elapsed < timeoutMs) {
+            string script = "window.__zan_getNetworkIdleState ? window.__zan_getNetworkIdleState(" + requiredIdleMs.ToString() + ") : '{\"isIdle\":true}';";
+            string res = await this.EvalAsync(script, 1000);
+            if (res.Contains("\"isIdle\":true") || res.Contains("\"isIdle\": true")) {
+                return true;
+            }
+            await Task.Delay(100);
+            elapsed = elapsed + 100;
+        }
+        return false;
+    }
+
+    /// <summary>
+    /// 异步虚拟文件注入 (DataTransfer API 突破操作系统文件对话框阻塞)
+    /// </summary>
+    public async bool SetInputFilesAsync(string selector, string fileNamesOrJson, int timeoutMs = 5000) {
+        string escapedSel = selector.Replace("'", "\\'");
+        string script = "window.__zan_setInputFiles ? window.__zan_setInputFiles('" + escapedSel + "', [{ name: '" + fileNamesOrJson.Replace("'", "\\'") + "', content: 'SIMULATED_FILE_PAYLOAD' }]) : false;";
+        string res = await this.EvalAsync(script, timeoutMs);
+        return res == "true" || res == "ok";
+    }
+
+    /// <summary>
+    /// 异步配置模态弹窗策略 (Alert / Confirm / Prompt 绝不阻塞主线程)
+    /// </summary>
+    public async bool ConfigureDialogPolicyAsync(bool autoAccept, string promptDefault = "", int timeoutMs = 2000) {
+        string script = "window.__zan_dialogConfig = { autoAccept: " + (autoAccept ? "true" : "false") + ", promptDefault: '" + promptDefault.Replace("'", "\\'") + "' }; true;";
+        string res = await this.EvalAsync(script, timeoutMs);
+        return res == "true" || res == "ok";
+    }
+
+    /// <summary>
+    /// 核心异步内核请求代行 (Path A 原生代行模式：免 CORS/免证书校验/继承原生 Session 与 CookieJar)
+    /// </summary>
+    public async string KernelFetchAsync(string url, string method = "GET", string headersJson = "{}", string bodyJson = "null", int timeoutMs = 15000) {
+        string escapedUrl = url.Replace("'", "\\'");
+        string safeMethod = (method != null && method != "") ? method.ToUpper() : "GET";
+        string safeHeaders = (headersJson != null && headersJson != "") ? headersJson : "{}";
+        string safeBody = (bodyJson != null && bodyJson != "" && safeMethod != "GET" && safeMethod != "HEAD")
+            ? bodyJson
+            : "null";
+
+        string script = "(function() { " +
+            "return ZanKernel.fetch('" + escapedUrl + "', { " +
+            "method: '" + safeMethod + "', " +
+            "headers: " + safeHeaders + ", " +
+            "body: " + safeBody + " " +
+            "}); })()";
+
+        return await this.EvalAsync(script, timeoutMs);
+    }
+
     public void ClearData() {
         if (this.contextId > 0 && GeckoNative.PfnClearOriginData != 0) {
             GeckoClearDataFn fn = (GeckoClearDataFn)GeckoNative.PfnClearOriginData;

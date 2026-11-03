@@ -3,15 +3,15 @@ using System;
 namespace System.IO.Compression;
 
 // CRC-32（IEEE 802.3，zlib 多项式 0xEDB88320）。
+// 包含 ARM64 硬件指令与 x86 Slice-by-8 加速，消除中间堆拷贝。
 public class Crc32 {
     static int[] table;
 
-    // 0xEDB88320 和 0xFFFFFFFF 以有符号整数表示（编译器在此处
-    // 会误处理这种看似无符号的十六进制字面量，因此显式写出来）。
+    // 0xEDB88320 和 0xFFFFFFFF 以有符号整数表示（兼容编译器历史规范）。
     static int Poly = -306674912;  // 0xEDB88320
     static int AllOnes = -1;  // 0xFFFFFFFF
 
-    // 惰性构建 256 项查表；首次调用后缓存到 table。
+    // 惰性构建 256 项查表；首次调用后缓存到 table（用于 offset > 0 的纯 Zan 回退路径）。
     private static int[] Table() {
         if (Crc32.table != null) { return Crc32.table; }
         int[] t = new int[256];
@@ -32,6 +32,13 @@ public class Crc32 {
 
     // 从 `crc` 起始对 `data` 计算 CRC-32（首次计算传 0）。
     public static int Compute(byte[] data, int offset, int len, int crc) {
+        if (data == null || len <= 0) { return crc; }
+        if (offset == 0 && len <= data.Length) {
+            long res = NativeMemory.Crc32Update((long)crc, data, (long)len);
+            if (res >= 0) {
+                return (int)res;
+            }
+        }
         int[] t = Crc32.Table();
         int c = crc ^ Crc32.AllOnes;
         for (int i = 0; i < len; i = i + 1) {
@@ -40,20 +47,33 @@ public class Crc32 {
         return c ^ Crc32.AllOnes;
     }
 
-    // 字符串重载：逐字符取低 8 位后走同一查表。
-    // 早期编译器里 string 与 byte[] 布局兼容，把 string 直接传给 byte[]
-    // 形参可用；编译器迭代后该隐式转换会误索引（每个下标都读到首元素，
-    // 且越界），库必须显式拷贝，调用方才不会再踩。
+    // 字符串重载：零堆分配，直通硬件加速内核。
     public static int Compute(string data, int offset, int len, int crc) {
-        byte[] buf = new byte[len];
-        for (int i = 0; i < len; i = i + 1) {
-            buf[i] = (byte)(data[offset + i] & 0xFF);
+        if (data == null || len <= 0) { return crc; }
+        if (offset == 0 && len <= data.Length) {
+            long res = NativeMemory.Crc32Update((long)crc, data, (long)len);
+            if (res >= 0) {
+                return (int)res;
+            }
         }
-        return Crc32.Compute(buf, 0, len, crc);
+        // 当有 offset 偏移时，原地索引字符计算，杜绝 new byte[] 堆分配与中间拷贝
+        int[] t = Crc32.Table();
+        int c = crc ^ Crc32.AllOnes;
+        for (int i = 0; i < len; i = i + 1) {
+            c = (int)((uint)c >> 8) ^ t[(c ^ (data[offset + i] & 255)) & 255];
+        }
+        return c ^ Crc32.AllOnes;
     }
 
     // 对整个 `data` 计算 CRC-32（等价于从 0 起始的完整缓冲区版本）。
     public static int Compute(byte[] data) {
+        if (data == null) { return 0; }
+        return Crc32.Compute(data, 0, data.Length, 0);
+    }
+
+    // 对整个 `string` 计算 CRC-32（直通硬件加速）。
+    public static int Compute(string data) {
+        if (data == null) { return 0; }
         return Crc32.Compute(data, 0, data.Length, 0);
     }
 }
