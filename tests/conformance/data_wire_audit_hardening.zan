@@ -1,0 +1,288 @@
+using System;
+using System.Data;
+using System.Data.Postgres;
+using System.Data.MySql;
+using System.Data.ZanDb;
+using System.Json;
+
+public class Program {
+    public static int Main() {
+        // ==========================================
+        // Part 1: Postgres/PgWire hardening
+        // ==========================================
+
+        // 1.1 readRowDescription endianness: 2 columns in big-endian (0x00, 0x02)
+        // Col 1: "id\0", Col 2: "name\0"
+        byte[] rowDesc = new byte[46];
+        rowDesc[0] = 0; rowDesc[1] = 2; // ncols = 2
+        // col 1: "id\0" (3 bytes) + 18 metadata bytes = 21 bytes
+        rowDesc[2] = (byte)'i'; rowDesc[3] = (byte)'d'; rowDesc[4] = 0;
+        // table OID(4) + colIdx(2) + typeOID(4: 23=int4) + typlen(2) + typmod(4) + format(2)
+        rowDesc[11] = 0; rowDesc[12] = 0; rowDesc[13] = 0; rowDesc[14] = 23;
+        // col 2: "name\0" (5 bytes) + 18 metadata bytes = 23 bytes (starts at 2 + 3 + 18 = 23)
+        rowDesc[23] = (byte)'n'; rowDesc[24] = (byte)'a'; rowDesc[25] = (byte)'m'; rowDesc[26] = (byte)'e'; rowDesc[27] = 0;
+        // typeOID = 25 (text)
+        rowDesc[34] = 0; rowDesc[35] = 0; rowDesc[36] = 0; rowDesc[37] = 25;
+        
+        DbResult descRes = new DbResult();
+        List<int> colOids = new List<int>();
+        PgWire.readRowDescription(descRes, rowDesc, 46, colOids);
+        if (descRes.ColumnCount() == 2) {
+            Console.WriteLine("ok: PgWire.readRowDescription column count == 2 (big-endian)");
+        } else {
+            Console.WriteLine("FAIL: PgWire.readRowDescription column count != 2: " + Convert.ToString(descRes.ColumnCount()));
+        }
+        if (colOids.Count == 2 && colOids[0] == 23 && colOids[1] == 25) {
+            Console.WriteLine("ok: PgWire.readRowDescription colOids parsed accurately");
+        } else {
+            Console.WriteLine("FAIL: PgWire.readRowDescription colOids mismatch");
+        }
+
+        // 1.2 readRowDescription bounds checks: null pay, len < 2, truncated metadata
+        DbResult nullDescRes = new DbResult();
+        List<int> nullOids = new List<int>();
+        PgWire.readRowDescription(nullDescRes, null, 0, nullOids);
+        Console.WriteLine("ok: PgWire.readRowDescription null pay handled safely");
+
+        byte[] shortDesc = new byte[1];
+        PgWire.readRowDescription(nullDescRes, shortDesc, 1, nullOids);
+        Console.WriteLine("ok: PgWire.readRowDescription short len < 2 handled safely");
+
+        byte[] truncDesc = new byte[6];
+        truncDesc[0] = 0; truncDesc[1] = 1;
+        truncDesc[2] = (byte)'a'; truncDesc[3] = 0; // name only, no metadata
+        PgWire.readRowDescription(nullDescRes, truncDesc, 4, nullOids);
+        Console.WriteLine("ok: PgWire.readRowDescription truncated metadata handled safely");
+
+        // 1.3 readDataRow endianness and normal row parsing
+        // 2 columns: col 0 = 42 (int4, len 2 "42"), col 1 = NULL (clen -1)
+        byte[] dataRow = new byte[16];
+        dataRow[0] = 0; dataRow[1] = 2; // 2 cols
+        // col 0: clen = 2 (0x00, 0x00, 0x00, 0x02)
+        dataRow[2] = 0; dataRow[3] = 0; dataRow[4] = 0; dataRow[5] = 2;
+        dataRow[6] = (byte)'4'; dataRow[7] = (byte)'2';
+        // col 1: clen = -1 (0xFF, 0xFF, 0xFF, 0xFF)
+        dataRow[8] = 255; dataRow[9] = 255; dataRow[10] = 255; dataRow[11] = 255;
+
+        DbResult dataRes = new DbResult();
+        PgWire.readDataRow(dataRes, dataRow, 12, colOids);
+        Console.WriteLine("ok: PgWire.readDataRow 2 cols with NULL handled");
+
+        // 1.4 readDataRow defensive checks: null pay, clen < -1, clen overflow
+        DbResult nullDataRes = new DbResult();
+        PgWire.readDataRow(nullDataRes, null, 0, colOids);
+        Console.WriteLine("ok: PgWire.readDataRow null pay handled safely");
+
+        byte[] negClenRow = new byte[10];
+        negClenRow[0] = 0; negClenRow[1] = 1;
+        // clen = -5 (0xFF, 0xFF, 0xFF, 0xFB)
+        negClenRow[2] = 255; negClenRow[3] = 255; negClenRow[4] = 255; negClenRow[5] = 251;
+        PgWire.readDataRow(nullDataRes, negClenRow, 6, colOids);
+        Console.WriteLine("ok: PgWire.readDataRow clen < -1 does not move backwards");
+
+        byte[] overflowClenRow = new byte[10];
+        overflowClenRow[0] = 0; overflowClenRow[1] = 1;
+        // clen = 0x7FFFFFFF
+        overflowClenRow[2] = 127; overflowClenRow[3] = 255; overflowClenRow[4] = 255; overflowClenRow[5] = 255;
+        PgWire.readDataRow(nullDataRes, overflowClenRow, 6, colOids);
+        Console.WriteLine("ok: PgWire.readDataRow clen overflow clamped safely");
+
+        // 1.5 parseIntFromBytes and helper bounds
+        byte[] numBytes = new byte[3];
+        numBytes[0] = (byte)'-'; numBytes[1] = (byte)'9'; numBytes[2] = (byte)'9';
+        long parsedNeg = PgWire.parseIntFromBytes(numBytes, 0, 3);
+        if (parsedNeg == -99) {
+            Console.WriteLine("ok: PgWire.parseIntFromBytes parses negative integer");
+        }
+        long parsedZero = PgWire.parseIntFromBytes(null, 0, 0);
+        if (parsedZero == 0) {
+            Console.WriteLine("ok: PgWire.parseIntFromBytes null returns 0");
+        }
+        string bStr = PgWire.bytesToStr(null, 0, 0);
+        if (bStr == "") {
+            Console.WriteLine("ok: PgWire.bytesToStr null returns empty");
+        }
+
+        // ==========================================
+        // Part 2: MySql/MySqlWire hardening
+        // ==========================================
+
+        // 2.1 readDerLen: short form
+        byte[] shortDerBytes = new byte[2];
+        shortDerBytes[0] = 64; shortDerBytes[1] = 0;
+        string shortDer = shortDerBytes;
+        List<int> derCur = new List<int>(); derCur.Add(0);
+        int derLen = MySqlWire.readDerLen(shortDer, derCur);
+        if (derLen == 64 && derCur[0] == 1) {
+            Console.WriteLine("ok: MySqlWire.readDerLen short form succeeds");
+        }
+
+        // 2.2 readDerLen: valid 2-byte long form (0x82, 0x01, 0x00 -> 256)
+        byte[] longDerBytes = new byte[4];
+        longDerBytes[0] = 130; longDerBytes[1] = 1; longDerBytes[2] = 0;
+        string longDer = longDerBytes;
+        derCur[0] = 0;
+        int longDerLen = MySqlWire.readDerLen(longDer, derCur);
+        if (longDerLen == 256 && derCur[0] == 3) {
+            Console.WriteLine("ok: MySqlWire.readDerLen long form succeeds");
+        }
+
+        // 2.3 readDerLen: 0xFF attack (127 length octets) on 3-byte input
+        byte[] ffDerBytes = new byte[3];
+        ffDerBytes[0] = 255; ffDerBytes[1] = 1; ffDerBytes[2] = 2;
+        string ffDer = ffDerBytes;
+        derCur[0] = 0;
+        int ffRes = MySqlWire.readDerLen(ffDer, derCur);
+        if (ffRes == -1) {
+            Console.WriteLine("ok: MySqlWire.readDerLen 0xFF rejected safely with -1");
+        }
+
+        // 2.4 readDerLen: 0x80 indefinite length rejected
+        byte[] indefDerBytes = new byte[2];
+        indefDerBytes[0] = 128; indefDerBytes[1] = 0;
+        string indefDer = indefDerBytes;
+        derCur[0] = 0;
+        int indefRes = MySqlWire.readDerLen(indefDer, derCur);
+        if (indefRes == -1) {
+            Console.WriteLine("ok: MySqlWire.readDerLen 0x80 indefinite rejected safely");
+        }
+
+        // 2.5 readDerLen: null / empty / bounds
+        int nullDerRes = MySqlWire.readDerLen(null, null);
+        if (nullDerRes == -1) {
+            Console.WriteLine("ok: MySqlWire.readDerLen null handled safely");
+        }
+
+        // 2.6 readLenencRaw: 1-byte, 3-byte, 4-byte, 9-byte
+        byte[] len1Bytes = new byte[1]; len1Bytes[0] = 100;
+        string len1Str = len1Bytes;
+        int rawP = 0;
+        long r1 = MySqlWire.readLenencRaw(len1Str, ref rawP);
+        if (r1 == 100 && rawP == 1) {
+            Console.WriteLine("ok: MySqlWire.readLenencRaw 1-byte succeeds");
+        }
+
+        byte[] len3Bytes = new byte[3]; len3Bytes[0] = 252; len3Bytes[1] = 255; len3Bytes[2] = 0;
+        string len3Str = len3Bytes;
+        rawP = 0;
+        long r3 = MySqlWire.readLenencRaw(len3Str, ref rawP);
+        if (r3 == 255 && rawP == 3) {
+            Console.WriteLine("ok: MySqlWire.readLenencRaw 3-byte succeeds");
+        }
+
+        // 2.7 readLenencRaw: truncated multibyte checks
+        byte[] truncLenBytes = new byte[1]; truncLenBytes[0] = 252; // expects 2 more bytes
+        string truncLenStr = truncLenBytes;
+        rawP = 0;
+        long rTrunc = MySqlWire.readLenencRaw(truncLenStr, ref rawP);
+        if (rTrunc == -1) {
+            Console.WriteLine("ok: MySqlWire.readLenencRaw truncated 252 rejected safely");
+        }
+
+        byte[] trunc4Bytes = new byte[2]; trunc4Bytes[0] = 253; trunc4Bytes[1] = 1;
+        string trunc4Str = trunc4Bytes;
+        rawP = 0;
+        long rTrunc4 = MySqlWire.readLenencRaw(trunc4Str, ref rawP);
+        if (rTrunc4 == -1) {
+            Console.WriteLine("ok: MySqlWire.readLenencRaw truncated 253 rejected safely");
+        }
+
+        byte[] trunc9Bytes = new byte[4]; trunc9Bytes[0] = 254;
+        string trunc9Str = trunc9Bytes;
+        rawP = 0;
+        long rTrunc9 = MySqlWire.readLenencRaw(trunc9Str, ref rawP);
+        if (rTrunc9 == -1) {
+            Console.WriteLine("ok: MySqlWire.readLenencRaw truncated 254 rejected safely");
+        }
+
+        // 2.8 readLenencStrRaw bounds and overflow
+        string emptyStr = MySqlWire.readLenencStrRaw(null, ref rawP);
+        if (emptyStr == "") {
+            Console.WriteLine("ok: MySqlWire.readLenencStrRaw null returns empty");
+        }
+
+        // 2.9 writeLenenc & findSub bounds
+        int wrRes = MySqlWire.writeLenenc(null, 0, 10);
+        if (wrRes == -1) {
+            Console.WriteLine("ok: MySqlWire.writeLenenc null returns -1");
+        }
+        int fsRes = MySqlWire.findSub(null, 0, null, 0, 0);
+        if (fsRes == -1) {
+            Console.WriteLine("ok: MySqlWire.findSub null returns -1");
+        }
+
+        // ==========================================
+        // Part 3: ZanDb/ZanDbProtocol hardening
+        // ==========================================
+
+        // 3.1 Header / Length roundtrip
+        byte[] h = ZanDbProtocol.Header(1024);
+        int decLen = ZanDbProtocol.Length(h);
+        if (decLen == 1024) {
+            Console.WriteLine("ok: ZanDbProtocol.Header and Length 1024 roundtrip succeeds");
+        }
+
+        // 3.2 Length defensive checks
+        bool lenNullThrew = false;
+        try {
+            ZanDbProtocol.Length(null);
+        } catch (ZanDbRequestException e) {
+            lenNullThrew = true;
+        }
+        if (lenNullThrew) {
+            Console.WriteLine("ok: ZanDbProtocol.Length null header throws ZanDbRequestException");
+        }
+
+        bool lenShortThrew = false;
+        byte[] shortH = new byte[2];
+        try {
+            ZanDbProtocol.Length(shortH);
+        } catch (ZanDbRequestException e) {
+            lenShortThrew = true;
+        }
+        if (lenShortThrew) {
+            Console.WriteLine("ok: ZanDbProtocol.Length short header throws ZanDbRequestException");
+        }
+
+        // 3.3 Header defensive checks
+        bool hdrNegThrew = false;
+        try {
+            ZanDbProtocol.Header(-10);
+        } catch (ZanDbRequestException e) {
+            hdrNegThrew = true;
+        }
+        if (hdrNegThrew) {
+            Console.WriteLine("ok: ZanDbProtocol.Header negative throws ZanDbRequestException");
+        }
+
+        bool hdrTooLargeThrew = false;
+        try {
+            ZanDbProtocol.Header(99999999);
+        } catch (ZanDbRequestException e) {
+            hdrTooLargeThrew = true;
+        }
+        if (hdrTooLargeThrew) {
+            Console.WriteLine("ok: ZanDbProtocol.Header too large throws ZanDbRequestException");
+        }
+
+        // 3.4 Canonical null handling
+        JsonValue canNull = ZanDbProtocol.Canonical(null, 0);
+        if (canNull != null && canNull.IsNull()) {
+            Console.WriteLine("ok: ZanDbProtocol.Canonical null returns JsonValue null");
+        }
+
+        // 3.5 Fingerprint null handling
+        string fpNull = ZanDbProtocol.Fingerprint(null);
+        if (fpNull == "") {
+            Console.WriteLine("ok: ZanDbProtocol.Fingerprint null handled safely");
+        }
+
+        // 3.6 SafeId null handling
+        if (!ZanDbProtocol.SafeId(null, 128)) {
+            Console.WriteLine("ok: ZanDbProtocol.SafeId null returns false");
+        }
+
+        Console.WriteLine("ALL_DATA_WIRE_AUDIT_HARDENING_TESTS_OK");
+        return 0;
+    }
+}

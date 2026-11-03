@@ -16,14 +16,14 @@ public class PgWire {
     // len <= 0 时返回空串。直接基于 ToStr(off, len) 实现原生切片，
     // 免去 new byte[] + 逐字节复制 + ToStr 的双重堆分配。
     public static string bytesToStr(byte[] buf, int off, int len) {
-        if (len <= 0) { return ""; }
+        if (buf == null || off < 0 || len <= 0 || off + len > buf.Length) { return ""; }
         return buf.ToStr(off, len);
     }
 
     // 从原始字节中直接就地解析十进制整数（int2/int4/int8），
     // 完全消除产生临时 string 再 Convert.ToInt64 的堆分配。
     public static long parseIntFromBytes(byte[] pay, int p, int clen) {
-        if (clen <= 0) { return 0; }
+        if (pay == null || p < 0 || clen <= 0 || p + clen > pay.Length) { return 0; }
         long acc = 0;
         int i = p;
         int end = p + clen;
@@ -70,6 +70,7 @@ public class PgWire {
 
     // 大端 int32 读取（消息长度与认证子码）。
     public static int be32(byte[] b, int off) {
+        if (b == null || off < 0 || off + 4 > b.Length) { return 0; }
         return ((b[off] & 255) << 24) | ((b[off + 1] & 255) << 16)
             | ((b[off + 2] & 255) << 8) | (b[off + 3] & 255);
     }
@@ -141,7 +142,8 @@ public class PgWire {
     // 名字与类型 OID（文本通道下其余无用）。
     public static void readRowDescription(DbResult result, byte[] pay, int len,
             List<int> colOids) {
-        int ncols = (pay[0] & 255) | ((pay[1] & 255) << 8);
+        if (result == null || pay == null || len < 2 || len > pay.Length) { return; }
+        int ncols = ((pay[0] & 255) << 8) | (pay[1] & 255);
         result.SetColumnCount(ncols);
         int p = 2;
         int c = 0;
@@ -150,11 +152,12 @@ public class PgWire {
             while (p < len && (pay[p] & 255) != 0) { p = p + 1; }
             result.AddColumnName(PgWire.bytesToStr(pay, ns, p - ns));
             p = p + 1;
+            if (p + 18 > len) { break; }
             p = p + 6;  // 表 OID(4) + 列号(2)
             int oid = PgWire.be32(pay, p);
             p = p + 4;
             p = p + 8;  // typlen(2) + typmod(4) + 格式(2)
-            colOids.Add(oid);
+            if (colOids != null) { colOids.Add(oid); }
             c = c + 1;
         }
     }
@@ -167,7 +170,8 @@ public class PgWire {
     // 列长 -1 = NULL（kind 0，文本 ""）。
     public static void readDataRow(DbResult result, byte[] pay, int len,
             List<int> colOids) {
-        int ncols = (pay[0] & 255) | ((pay[1] & 255) << 8);
+        if (result == null || pay == null || len < 2 || len > pay.Length) { return; }
+        int ncols = ((pay[0] & 255) << 8) | (pay[1] & 255);
         List<DbCell> cells = new List<DbCell>();
         List<string> texts = new List<string>();
         int p = 2;
@@ -176,11 +180,12 @@ public class PgWire {
             DbCell cell = new DbCell();
             int clen = PgWire.be32(pay, p);
             p = p + 4;
-            if (clen == -1) {
+            if (clen <= -1) {
                 texts.Add("");
             } else {
-                if (p + clen > len) { clen = len - p; }
-                int oid = c < colOids.Count ? colOids[c] : 0;
+                int rem = len - p;
+                if (clen > rem || clen < 0) { clen = rem > 0 ? rem : 0; }
+                int oid = (colOids != null && c < colOids.Count) ? colOids[c] : 0;
                 if (oid == 20 || oid == 21 || oid == 23) {
                     cell.kind = 1;
                     cell.ival = PgWire.parseIntFromBytes(pay, p, clen);

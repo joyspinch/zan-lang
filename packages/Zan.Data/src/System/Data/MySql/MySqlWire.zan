@@ -11,7 +11,7 @@ public class MySqlWire {
     // len <= 0 时返回空串。直接基于 Substring 实现单次原生复制，
     // 免去 new byte[] + 逐字节复制 + ToStr 的双重堆分配。
     public static string bytesToStr(string buf, int off, int len) {
-        if (len <= 0) { return ""; }
+        if (buf == null || off < 0 || len <= 0 || off + len > buf.Length) { return ""; }
         return buf.Substring(off, len);
     }
 
@@ -19,6 +19,7 @@ public class MySqlWire {
     // 0xFB（NULL）返回 0 并把游标前进 1。
     // 直接在原始字节上累积十进制数值，完全消除临时字符串分配与 Convert.ToInt64 开销。
     public static long readLenencInt(string buf, List<int> cur) {
+        if (cur == null || cur.Count == 0) { return 0; }
         int p = cur[0];
         long v = readLenencIntRaw(buf, ref p);
         cur[0] = p;
@@ -28,17 +29,21 @@ public class MySqlWire {
     // 从 wire 缓冲区中就地解析 length-encoded 整数（0 堆分配，使用栈标量引用偏移）；
     // 0xFB（NULL）返回 0 并把游标前进 1。
     public static long readLenencIntRaw(string buf, ref int p) {
+        if (buf == null || p < 0 || p >= buf.Length) { return 0; }
         int b0 = buf[p] & 255;
         if (b0 == 251) { p = p + 1; return 0; }
-        int len = (int)readLenencRaw(buf, ref p);
-        if (len <= 0) { return 0; }
+        long rawLen = readLenencRaw(buf, ref p);
+        if (rawLen <= 0 || rawLen > 2147483647) { return 0; }
+        int len = (int)rawLen;
+        int rem = buf.Length - p;
+        if (len > rem) { len = rem > 0 ? rem : 0; }
         int start = p;
         p = p + len;
         long acc = 0;
         int i = start;
         int end = start + len;
         bool neg = false;
-        if ((buf[i] & 255) == 45) {  // '-'
+        if (i < end && (buf[i] & 255) == 45) {  // '-'
             neg = true;
             i = i + 1;
         }
@@ -55,6 +60,7 @@ public class MySqlWire {
     // 读取 MySQL length-encoded 整数（1/3/4/9 字节形式，小端）；
     // 首字节 0xFB（NULL 标记）返回 -1，游标仍前进 1。
     public static long readLenenc(string buf, List<int> cur) {
+        if (cur == null || cur.Count == 0) { return -1; }
         int p = cur[0];
         long v = readLenencRaw(buf, ref p);
         cur[0] = p;
@@ -64,11 +70,22 @@ public class MySqlWire {
     // 读取 MySQL length-encoded 整数（0 堆分配，使用栈标量引用偏移）；
     // 首字节 0xFB（NULL 标记）返回 -1，游标仍前进 1。
     public static long readLenencRaw(string buf, ref int p) {
+        if (buf == null || p < 0 || p >= buf.Length) { return -1; }
         int b0 = buf[p] & 255;
         if (b0 < 251) { p = p + 1; return b0; }
-        if (b0 == 252) { int v = (buf[p+1]&255)|((buf[p+2]&255)<<8); p = p + 3; return v; }
-        if (b0 == 253) { int v = (buf[p+1]&255)|((buf[p+2]&255)<<8)|((buf[p+3]&255)<<16); p = p + 4; return v; }
+        if (b0 == 251) { p = p + 1; return -1; }
+        if (b0 == 252) {
+            if (p + 3 > buf.Length) { return -1; }
+            int v = (buf[p+1]&255)|((buf[p+2]&255)<<8);
+            p = p + 3; return v;
+        }
+        if (b0 == 253) {
+            if (p + 4 > buf.Length) { return -1; }
+            int v = (buf[p+1]&255)|((buf[p+2]&255)<<8)|((buf[p+3]&255)<<16);
+            p = p + 4; return v;
+        }
         if (b0 == 254) {
+            if (p + 9 > buf.Length) { return -1; }
             long v = 0; 
             for (int i = 0; i < 8; i = i + 1) { v = v | ((long)(buf[p+1+i]&255) << (8*i)); }
             p = p + 9; return v;
@@ -79,6 +96,7 @@ public class MySqlWire {
     // 读取 length-encoded 字符串：先读长度再取字节；
     // 0xFB（NULL）返回空串并把游标前进 1。
     public static string readLenencStr(string buf, List<int> cur) {
+        if (cur == null || cur.Count == 0) { return ""; }
         int p = cur[0];
         string s = readLenencStrRaw(buf, ref p);
         cur[0] = p;
@@ -88,10 +106,14 @@ public class MySqlWire {
     // 读取 length-encoded 字符串（0 额外参数分配）；
     // 0xFB（NULL）返回空串并把游标前进 1。
     public static string readLenencStrRaw(string buf, ref int p) {
+        if (buf == null || p < 0 || p >= buf.Length) { return ""; }
         int b0 = buf[p] & 255;
         if (b0 == 251) { p = p + 1; return ""; }
-        int len = (int)readLenencRaw(buf, ref p);
-        if (len <= 0) { return ""; }
+        long rawLen = readLenencRaw(buf, ref p);
+        if (rawLen <= 0 || rawLen > 2147483647) { return ""; }
+        int len = (int)rawLen;
+        int rem = buf.Length - p;
+        if (len > rem) { len = rem > 0 ? rem : 0; }
         int start = p;
         p = p + len;
         return bytesToStr(buf, start, len);
@@ -100,10 +122,14 @@ public class MySqlWire {
     // 核心零分配原语：直接返回指向 buf 的 16 字节 StringView 切片。
     // 0 字节堆分配，0 次内存复制。
     public static StringView readLenencView(string buf, ref int p) {
+        if (buf == null || p < 0 || p >= buf.Length) { return StringView.Empty(); }
         int b0 = buf[p] & 255;
         if (b0 == 251) { p = p + 1; return StringView.Empty(); }
-        int len = (int)readLenencRaw(buf, ref p);
-        if (len <= 0) { return StringView.Empty(); }
+        long rawLen = readLenencRaw(buf, ref p);
+        if (rawLen <= 0 || rawLen > 2147483647) { return StringView.Empty(); }
+        int len = (int)rawLen;
+        int rem = buf.Length - p;
+        if (len > rem) { len = rem > 0 ? rem : 0; }
         int start = p;
         p = p + len;
         return buf.AsView(start, len);
@@ -112,6 +138,9 @@ public class MySqlWire {
     // 在 <c>h[0..hlen)</c> 中自 <c>from</c> 起查找字节串
     // <c>ndl</c>，返回匹配下标；找不到返回 -1。
     public static int findSub(string h, int hlen, string ndl, int nlen, int from) {
+        if (h == null || ndl == null || from < 0 || hlen <= 0 || nlen <= 0) { return -1; }
+        if (hlen > h.Length) { hlen = h.Length; }
+        if (nlen > ndl.Length) { nlen = ndl.Length; }
         int i = from;
         while (i + nlen <= hlen) {
              bool ok = true;
@@ -125,11 +154,25 @@ public class MySqlWire {
     // 读取 DER/ASN.1 长度字段（短形式，或 0x80|n 长形式后随 n 个
     // 大端长度字节）；<c>c</c> 为游标。
     public static int readDerLen(string der, List<int> c) {
-        int b = der[c[0]] & 255; c[0] = c[0] + 1;
-        if (b < 128) { return b; }
+        if (der == null || c == null || c.Count == 0) { return -1; }
+        int pos = c[0];
+        if (pos < 0 || pos >= der.Length) { return -1; }
+        int b = der[pos] & 255;
+        pos = pos + 1;
+        if (b < 128) {
+            c[0] = pos;
+            return b;
+        }
+        if (b == 128) { return -1; } // DER 禁用不定长 0x80
         int nb = b - 128;
+        if (nb <= 0 || nb > 4) { return -1; } // 最大 4 字节表示，防止整数溢出
+        if (pos + nb > der.Length) { return -1; } // 截断守卫，严禁越界读穿
         int v = 0; 
-        for (int i = 0; i < nb; i = i + 1) { v = (v << 8) | (der[c[0]] & 255); c[0] = c[0] + 1; }
+        for (int i = 0; i < nb; i = i + 1) {
+            v = (v << 8) | (der[pos] & 255);
+            pos = pos + 1;
+        }
+        c[0] = pos;
         return v;
     }
 
@@ -137,11 +180,18 @@ public class MySqlWire {
     // 0xFC + 2 字节小端；否则为 0xFD + 3 字节小端
     // （不产生 8 字节形式，因此有效上限 2^24−1）。返回新游标。
     public static int writeLenenc(string buf, int pos, int v) {
-        if (v < 251) { buf[pos] = v & 255; return pos + 1; }
+        if (buf == null || pos < 0 || v < 0) { return -1; }
+        if (v < 251) {
+            if (pos + 1 > buf.Length) { return -1; }
+            buf[pos] = v & 255;
+            return pos + 1;
+        }
         if (v < 65536) {
+            if (pos + 3 > buf.Length) { return -1; }
             buf[pos] = 252; buf[pos+1] = v & 255; buf[pos+2] = (v >> 8) & 255;
             return pos + 3;
         }
+        if (pos + 4 > buf.Length) { return -1; }
         buf[pos] = 253; buf[pos+1] = v & 255; buf[pos+2] = (v >> 8) & 255;
         buf[pos+3] = (v >> 16) & 255;
         return pos + 4;
