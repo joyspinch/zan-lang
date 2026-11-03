@@ -1026,21 +1026,50 @@ static zan_ast_node_t *parse_primary(zan_parser_t *p) {
 
         if (parser_check(p, TK_LBRACE)) {
             parser_advance(p);
-            n = zan_ast_new(p->arena, AST_NEW_EXPR, newloc);
-            n->new_expr.type = NULL;
-            zan_ast_list_init(&n->new_expr.args);
-            n->new_expr.is_array = false;
-            n->new_expr.array_init = false;
-            int m = 0;
+            zan_loc_t loc = newloc;
+            zan_ast_node_t *res = NULL;
             while (!parser_check(p, TK_RBRACE) && !parser_check(p, TK_EOF)) {
                 zan_ast_node_t *arg = parse_expression(p);
-                zan_ast_list_push(&n->new_expr.args, arg, p->arena);
-                (void)m;
-                m++;
+                if (arg->kind == AST_ASSIGNMENT) {
+                    arg = arg->binary.right;
+                }
+                /* Convert.ToString(arg) */
+                zan_ast_node_t *cid = zan_ast_new(p->arena, AST_IDENTIFIER, loc);
+                cid->ident.name = (zan_istr_t){"Convert", 7};
+                cid->ident.inst_type_ref = NULL;
+                zan_ast_node_t *cmem = zan_ast_new(p->arena, AST_MEMBER_ACCESS, loc);
+                cmem->member.object = cid;
+                cmem->member.name = (zan_istr_t){"ToString", 8};
+                cmem->member.null_cond = 0;
+                zan_ast_node_t *call = zan_ast_new(p->arena, AST_CALL, loc);
+                call->call.callee = cmem;
+                zan_ast_list_init(&call->call.args);
+                zan_ast_list_init(&call->call.type_args);
+                zan_ast_list_push(&call->call.args, arg, p->arena);
+
+                if (!res) {
+                    res = call;
+                } else {
+                    zan_ast_node_t *tab = zan_ast_new(p->arena, AST_STRING_LITERAL, loc);
+                    tab->str_val = (zan_istr_t){"\t", 1};
+                    zan_ast_node_t *add1 = zan_ast_new(p->arena, AST_BINARY, loc);
+                    add1->binary.op = TK_PLUS;
+                    add1->binary.left = res;
+                    add1->binary.right = tab;
+                    zan_ast_node_t *add2 = zan_ast_new(p->arena, AST_BINARY, loc);
+                    add2->binary.op = TK_PLUS;
+                    add2->binary.left = add1;
+                    add2->binary.right = call;
+                    res = add2;
+                }
                 if (!parser_match(p, TK_COMMA)) break;
             }
             parser_expect(p, TK_RBRACE);
-            return n;
+            if (!res) {
+                res = zan_ast_new(p->arena, AST_STRING_LITERAL, loc);
+                res->str_val = (zan_istr_t){"", 0};
+            }
+            return res;
         }
 
         zan_ast_node_t *type = parse_type_ref(p);

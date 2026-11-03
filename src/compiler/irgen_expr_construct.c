@@ -1116,12 +1116,13 @@ static LLVMValueRef emit_expr_new_expr(zan_irgen_t *g, zan_ast_node_t *expr,
             }
             return obj;
         }
-        /* 匿名对象字面量 new { ... } 校验与降解 */
+        /* 匿名对象字面量 new { ... } 降解：
+         * 依次计算各成员表达式（保留求值副作用），返回 null 对象引用作为轻量占位 */
         if (!expr->new_expr.type) {
-            zan_diag_emit_code(g->diag, DIAG_ERROR, expr->loc, 3023,
-                "anonymous object `new { ... }` is only valid inside a typed "
-                "ORM query (GroupBy/ToList/ToAggregate)");
-            return LLVMConstNull(LLVMInt8TypeInContext(g->ctx));
+            for (int i = 0; i < expr->new_expr.args.count; i++) {
+                emit_expr(g, expr->new_expr.args.items[i], locals);
+            }
+            return LLVMConstNull(LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0));
         }
         if (expr->new_expr.type && expr->new_expr.type->kind == AST_TYPE_REF &&
             !expr->new_expr.is_array) {

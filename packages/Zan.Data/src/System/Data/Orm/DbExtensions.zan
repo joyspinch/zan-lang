@@ -47,6 +47,55 @@ public static class FieldExtensions {
     }
 }
 
+public class OrmAggContext {
+    public static List<object> current;
+}
+
+public static class OrmAggregates {
+    public static long Sum<T, V>(this T item, Func<T, V> expr) {
+        if (OrmAggContext.current == null || OrmAggContext.current.Count == 0) return 0;
+        long s = 0;
+        for (int i = 0; i < OrmAggContext.current.Count; i = i + 1) {
+            s = s + Convert.ToInt64(expr((T)OrmAggContext.current[i]));
+        }
+        return s;
+    }
+
+    public static long Max<T, V>(this T item, Func<T, V> expr) {
+        if (OrmAggContext.current == null || OrmAggContext.current.Count == 0) return 0;
+        long m = Convert.ToInt64(expr((T)OrmAggContext.current[0]));
+        for (int i = 1; i < OrmAggContext.current.Count; i = i + 1) {
+            long v = Convert.ToInt64(expr((T)OrmAggContext.current[i]));
+            if (v > m) m = v;
+        }
+        return m;
+    }
+
+    public static long Min<T, V>(this T item, Func<T, V> expr) {
+        if (OrmAggContext.current == null || OrmAggContext.current.Count == 0) return 0;
+        long m = Convert.ToInt64(expr((T)OrmAggContext.current[0]));
+        for (int i = 1; i < OrmAggContext.current.Count; i = i + 1) {
+            long v = Convert.ToInt64(expr((T)OrmAggContext.current[i]));
+            if (v < m) m = v;
+        }
+        return m;
+    }
+
+    public static double Avg<T, V>(this T item, Func<T, V> expr) {
+        if (OrmAggContext.current == null || OrmAggContext.current.Count == 0) return 0.0;
+        double s = 0.0;
+        for (int i = 0; i < OrmAggContext.current.Count; i = i + 1) {
+            s = s + Convert.ToDouble(expr((T)OrmAggContext.current[i]));
+        }
+        return s / (double)OrmAggContext.current.Count;
+    }
+
+    public static int Count<T>(this T item) {
+        if (OrmAggContext.current == null) return 0;
+        return OrmAggContext.current.Count;
+    }
+}
+
 // 泛型 SELECT 查询驱动：结合元数据缓存与原生类型反射，提供流式查询。
 public class SelectQuery<T> {
     public IDbExecutor db;
@@ -57,6 +106,9 @@ public class SelectQuery<T> {
     public List<string> includeFields;
     public Func<T, bool> havingPredicate;
     public TypeInfo navTypeInfo;
+    public Func<T, string> groupByStringFn;
+    public Func<T, long> orderByLongFn;
+    public bool orderByDesc;
 
     public SelectQuery(IDbExecutor db) {
         this.db = db;
@@ -81,14 +133,43 @@ public class SelectQuery<T> {
             if (c.Kind == 0) {
                 object dummy = ti.CreateInstance();
                 if (dummy == null) { break; }
-                dummy.SetFieldInt(c.Field, 987654);
+                if (c.I64) {
+                    dummy.SetFieldLong(c.Field, 987654L);
+                } else {
+                    dummy.SetFieldInt(c.Field, 987654);
+                }
                 try {
                     int res = expr((T)dummy);
                     if (res == 987654) { return c.Col; }
                 } catch {}
             }
         }
-        return this.meta.Cols.Count > 0 ? this.meta.Cols[0].Col : "";
+        return "";
+    }
+
+    public string DetectColLong(Func<T, long> expr) {
+        TypeInfo ti = (this.meta != null && this.meta.Type.Name.Length > 0) ? this.meta.Type : typeof(T);
+        for (int i = 0; i < this.meta.Cols.Count; i = i + 1) {
+            Col c = this.meta.Cols[i];
+            if (c.Kind == 0) {
+                object dummy = ti.CreateInstance();
+                if (dummy == null) { break; }
+                if (c.I64) {
+                    dummy.SetFieldLong(c.Field, 9876543210L);
+                    try {
+                        long res = expr((T)dummy);
+                        if (res == 9876543210L) { return c.Col; }
+                    } catch {}
+                } else {
+                    dummy.SetFieldInt(c.Field, 987654);
+                    try {
+                        long res = expr((T)dummy);
+                        if (res == 987654L) { return c.Col; }
+                    } catch {}
+                }
+            }
+        }
+        return "";
     }
 
     public string DetectColDouble(Func<T, double> expr) {
@@ -105,7 +186,7 @@ public class SelectQuery<T> {
                 } catch {}
             }
         }
-        return this.meta.Cols.Count > 0 ? this.meta.Cols[0].Col : "";
+        return "";
     }
 
     public string DetectColString(Func<T, string> expr) {
@@ -122,7 +203,7 @@ public class SelectQuery<T> {
                 } catch {}
             }
         }
-        return this.meta.Cols.Count > 0 ? this.meta.Cols[0].Col : "";
+        return "";
     }
 
     public SelectQuery<T> Where(Func<T, bool> predicate) {
@@ -216,7 +297,17 @@ public class SelectQuery<T> {
         return this;
     }
 
+    public SelectQuery<T> OrderBy(Func<T, long> expr) {
+        this.orderByLongFn = expr;
+        this.orderByDesc = false;
+        string col = this.DetectColLong(expr);
+        if (col.Length > 0) { this.inner.OrderBy(col); }
+        return this;
+    }
+
     public SelectQuery<T> OrderBy(Func<T, int> expr) {
+        this.orderByLongFn = (T item) => (long)expr(item);
+        this.orderByDesc = false;
         string col = this.DetectColInt(expr);
         if (col.Length > 0) { this.inner.OrderBy(col); }
         return this;
@@ -233,7 +324,17 @@ public class SelectQuery<T> {
         return this;
     }
 
+    public SelectQuery<T> OrderByDescending(Func<T, long> expr) {
+        this.orderByLongFn = expr;
+        this.orderByDesc = true;
+        string col = this.DetectColLong(expr);
+        if (col.Length > 0) { this.inner.OBD(col); }
+        return this;
+    }
+
     public SelectQuery<T> OrderByDescending(Func<T, int> expr) {
+        this.orderByLongFn = (T item) => (long)expr(item);
+        this.orderByDesc = true;
         string col = this.DetectColInt(expr);
         if (col.Length > 0) { this.inner.OBD(col); }
         return this;
@@ -251,6 +352,7 @@ public class SelectQuery<T> {
     }
 
     public SelectQuery<T> GroupBy(Func<T, string> expr) {
+        this.groupByStringFn = expr;
         string col = this.DetectColString(expr);
         if (col.Length > 0) { this.inner.GroupBy(col); }
         return this;
@@ -554,6 +656,122 @@ public class SelectQuery<T> {
         return this.ToList();
     }
 
+    public List<string> ToList(Func<T, string> selector) {
+        List<T> raw = this.ToList();
+        List<string> res = new List<string>();
+        for (int i = 0; i < raw.Count; i = i + 1) {
+            res.Add(selector(raw[i]));
+        }
+        return res;
+    }
+
+    public async List<string> ToListAsync(Func<T, string> selector) {
+        return this.ToList(selector);
+    }
+
+    public List<TReturn> ToList<TReturn>(Func<T, TReturn> selector) {
+        Func<T, bool> savedHaving = this.havingPredicate;
+        int savedLim = this.inner.limN;
+        int savedOff = this.inner.offN;
+        if (this.groupByStringFn != null) {
+            this.havingPredicate = null;
+            this.inner.limN = -1;
+            this.inner.offN = -1;
+        }
+        List<T> rawList = this.ToList();
+        this.havingPredicate = savedHaving;
+        this.inner.limN = savedLim;
+        this.inner.offN = savedOff;
+
+        List<TReturn> result = new List<TReturn>();
+        if (rawList.Count == 0) return result;
+
+        if (this.groupByStringFn != null) {
+            Dictionary<string, List<object>> groups = new Dictionary<string, List<object>>();
+            List<string> groupKeys = new List<string>();
+            for (int i = 0; i < rawList.Count; i = i + 1) {
+                T item = rawList[i];
+                string key = this.groupByStringFn(item);
+                if (!groups.ContainsKey(key)) {
+                    groups[key] = new List<object>();
+                    groupKeys.Add(key);
+                }
+                groups[key].Add((object)item);
+            }
+
+            if (this.orderByLongFn != null && groupKeys.Count > 1) {
+                for (int i = 0; i < groupKeys.Count - 1; i = i + 1) {
+                    for (int j = 0; j < groupKeys.Count - 1 - i; j = j + 1) {
+                        List<object> g1 = groups[groupKeys[j]];
+                        List<object> g2 = groups[groupKeys[j + 1]];
+                        OrmAggContext.current = g1;
+                        long v1 = this.orderByLongFn((T)g1[0]);
+                        OrmAggContext.current = g2;
+                        long v2 = this.orderByLongFn((T)g2[0]);
+                        OrmAggContext.current = null;
+                        bool swap = this.orderByDesc ? (v1 < v2) : (v1 > v2);
+                        if (swap) {
+                            string tmp = groupKeys[j];
+                            groupKeys[j] = groupKeys[j + 1];
+                            groupKeys[j + 1] = tmp;
+                        }
+                    }
+                }
+            }
+
+            for (int k = 0; k < groupKeys.Count; k = k + 1) {
+                string key = groupKeys[k];
+                List<object> group = groups[key];
+                OrmAggContext.current = group;
+                T first = (T)group[0];
+                if (savedHaving != null && !savedHaving(first)) {
+                    continue;
+                }
+                TReturn stat = selector(first);
+                result.Add(stat);
+            }
+            OrmAggContext.current = null;
+        } else {
+            OrmAggContext.current = new List<object>();
+            for (int i = 0; i < rawList.Count; i = i + 1) {
+                OrmAggContext.current.Add((object)rawList[i]);
+            }
+            T first = rawList[0];
+            TReturn stat = selector(first);
+            OrmAggContext.current = null;
+            result.Add(stat);
+            return result;
+        }
+
+        if (savedLim >= 0 || savedOff > 0) {
+            List<TReturn> paged = new List<TReturn>();
+            int start = savedOff > 0 ? savedOff : 0;
+            int take = savedLim >= 0 ? savedLim : result.Count;
+            for (int i = start; i < result.Count && paged.Count < take; i = i + 1) {
+                paged.Add(result[i]);
+            }
+            return paged;
+        }
+
+        return result;
+    }
+
+    public async List<TReturn> ToListAsync<TReturn>(Func<T, TReturn> selector) {
+        return this.ToList<TReturn>(selector);
+    }
+
+    public TReturn ToOne<TReturn>(Func<T, TReturn> selector) {
+        List<TReturn> list = this.ToList<TReturn>(selector);
+        if (list.Count > 0) {
+            return list[0];
+        }
+        return null;
+    }
+
+    public async TReturn ToOneAsync<TReturn>(Func<T, TReturn> selector) {
+        return this.ToOne<TReturn>(selector);
+    }
+
     // 反向关系：取某个父行的子集合。关系从子实体的导航声明反推
     // （外键列 = <导航字段名>Id，与正向 Include 同一约定），调用方不写
     // 外键列名。子实体有多个导航时 Children 抛异常——「反查哪个父」
@@ -809,8 +1027,42 @@ public class InsertQuery<T> {
     }
 
     public InsertQuery<T> OnConflict(Func<T, string> expr) {
-        string col = this.DetectColString(expr);
-        if (col.Length > 0) { this.inner.OC(col); }
+        TypeInfo ti = (this.meta != null && this.meta.Type.Name.Length > 0) ? this.meta.Type : typeof(T);
+        bool any = false;
+        for (int i = 0; i < this.meta.Cols.Count; i = i + 1) {
+            Col c = this.meta.Cols[i];
+            object d1 = ti.CreateInstance();
+            object d2 = ti.CreateInstance();
+            if (d1 == null || d2 == null) { break; }
+            if (c.Kind == 0) {
+                if (c.I64) {
+                    d2.SetFieldLong(c.Field, 987654L);
+                } else {
+                    d2.SetFieldInt(c.Field, 987654);
+                }
+            } else if (c.Kind == 1) {
+                d2.SetFieldDouble(c.Field, 987654.25);
+            } else if (c.Kind == 3) {
+                d2.SetFieldString(c.Field, "__detect_marker__");
+            }
+            try {
+                string s1 = expr((T)d1);
+                string s2 = expr((T)d2);
+                if (s1 != s2) {
+                    this.inner.OC(c.Col);
+                    any = true;
+                }
+            } catch {}
+        }
+        if (!any) {
+            string col = this.DetectColString(expr);
+            if (col.Length > 0) { this.inner.OC(col); }
+        }
+        return this;
+    }
+
+    public InsertQuery<T> IfExistsDoNothing() {
+        this.inner.NOP();
         return this;
     }
 
