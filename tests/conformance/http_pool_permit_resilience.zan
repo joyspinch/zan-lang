@@ -1,0 +1,50 @@
+using System;
+using System.Net.Sockets;
+using System.Net.Http;
+using System.Net.Http.Client;
+using System.Threading;
+
+class Program {
+    static void Main() {
+        // 1. 测试连接池初始状态与许可控制
+        HttpConnectionPool pool = new HttpConnectionPool(2, 1, 10000, 30000);
+        Console.WriteLine("init_active=" + pool.ActiveCount().ToString());
+        Console.WriteLine("init_idle=" + pool.IdleCount().ToString());
+
+        // 2. 模拟连续建连成功拿取 permit
+        bool p1 = pool.TryAcquirePermit();
+        bool p2 = pool.TryAcquirePermit();
+        bool p3 = pool.TryAcquirePermit(); // 超出 maxConnections(2)，应为 false
+        Console.WriteLine("p1=" + (p1 ? "true" : "false"));
+        Console.WriteLine("p2=" + (p2 ? "true" : "false"));
+        Console.WriteLine("p3=" + (p3 ? "true" : "false"));
+        Console.WriteLine("active_after_p2=" + pool.ActiveCount().ToString());
+
+        // 3. 模拟建连失败时的 ReleasePermit 回退
+        pool.ReleasePermit();
+        Console.WriteLine("active_after_rel1=" + pool.ActiveCount().ToString());
+        bool p4 = pool.TryAcquirePermit(); // 回退后应可再次申请
+        Console.WriteLine("p4=" + (p4 ? "true" : "false"));
+        Console.WriteLine("active_after_p4=" + pool.ActiveCount().ToString());
+
+        // 清理剩余许可
+        pool.ReleasePermit();
+        pool.ReleasePermit();
+        Console.WriteLine("active_after_all_rel=" + pool.ActiveCount().ToString());
+
+        // 4. 验证 Dispose 幂等性与安全防御
+        pool.Dispose();
+        pool.Dispose(); // 二次 Dispose 不得崩溃或重复 Destroy
+        Console.WriteLine("pool_disposed_twice=ok");
+
+        // 5. 销毁后调用各方法防御性返回安全默认值，不触发段错误
+        bool pAfter = pool.TryAcquirePermit();
+        pool.ReleasePermit();
+        pool.CloseAll();
+        Console.WriteLine("acquire_after_dispose=" + (pAfter ? "true" : "false"));
+        Console.WriteLine("active_after_dispose=" + pool.ActiveCount().ToString());
+        Console.WriteLine("idle_after_dispose=" + pool.IdleCount().ToString());
+
+        Console.WriteLine("http_pool_resilience_done=true");
+    }
+}

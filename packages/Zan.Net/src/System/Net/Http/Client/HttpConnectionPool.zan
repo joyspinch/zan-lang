@@ -37,6 +37,7 @@ public class HttpConnectionPool : IDisposable {
     public long MaxLifetimeMs() { return this.maxLifetimeMs; }
 
     public void SetLimits(int maxConnections, int maxIdleConnections, long idleTimeoutMs, long maxLifetimeMs) {
+        if (this.mtx == 0) { return; }
         Mutex.Lock(this.mtx);
         try {
             if (maxConnections > 0) { this.maxConnections = maxConnections; }
@@ -50,6 +51,9 @@ public class HttpConnectionPool : IDisposable {
 
     // 租借一条可用的空闲连接（若存在且未过期）
     public PooledHttpConnection TryRentIdle() {
+        if (this.mtx == 0) { return null; }
+        List<PooledHttpConnection> expired = new List<PooledHttpConnection>();
+        PooledHttpConnection chosen = null;
         Mutex.Lock(this.mtx);
         try {
             long idleUs = this.idleTimeoutMs * 1000L;
@@ -59,20 +63,25 @@ public class HttpConnectionPool : IDisposable {
                 PooledHttpConnection conn = this.idleList[lastIdx];
                 this.idleList.RemoveAt(lastIdx);
                 if (conn.IsExpired(idleUs, lifeUs)) {
-                    conn.Dispose();
+                    expired.Add(conn);
                     continue;
                 }
                 this.activeCount = this.activeCount + 1;
-                return conn;
+                chosen = conn;
+                break;
             }
-            return null;
         } finally {
             Mutex.Unlock(this.mtx);
         }
+        for (int i = 0; i < expired.Count; i = i + 1) {
+            expired[i].Dispose();
+        }
+        return chosen;
     }
 
     // 是否允许创建新连接（并发连接数未达上限）
     public bool TryAcquirePermit() {
+        if (this.mtx == 0) { return false; }
         Mutex.Lock(this.mtx);
         try {
             if (this.activeCount + this.idleList.Count < this.maxConnections) {
@@ -88,6 +97,11 @@ public class HttpConnectionPool : IDisposable {
     // 归还或销毁连接
     public void Return(PooledHttpConnection conn, bool reusable) {
         if (conn == null) { return; }
+        if (this.mtx == 0) {
+            conn.Dispose();
+            return;
+        }
+        bool needDispose = false;
         Mutex.Lock(this.mtx);
         try {
             if (this.activeCount > 0) {
@@ -99,15 +113,19 @@ public class HttpConnectionPool : IDisposable {
                 conn.Touch();
                 this.idleList.Add(conn);
             } else {
-                conn.Dispose();
+                needDispose = true;
             }
         } finally {
             Mutex.Unlock(this.mtx);
+        }
+        if (needDispose) {
+            conn.Dispose();
         }
     }
 
     // 撤销创建许可（建连失败时回退计数）
     public void ReleasePermit() {
+        if (this.mtx == 0) { return; }
         Mutex.Lock(this.mtx);
         try {
             if (this.activeCount > 0) {
@@ -120,6 +138,7 @@ public class HttpConnectionPool : IDisposable {
 
     // 清理所有池化连接
     public void CloseAll() {
+        if (this.mtx == 0) { return; }
         List<PooledHttpConnection> toClose = new List<PooledHttpConnection>();
         Mutex.Lock(this.mtx);
         try {
@@ -137,6 +156,7 @@ public class HttpConnectionPool : IDisposable {
     }
 
     public int ActiveCount() {
+        if (this.mtx == 0) { return 0; }
         Mutex.Lock(this.mtx);
         try {
             return this.activeCount;
@@ -146,6 +166,7 @@ public class HttpConnectionPool : IDisposable {
     }
 
     public int IdleCount() {
+        if (this.mtx == 0) { return 0; }
         Mutex.Lock(this.mtx);
         try {
             return this.idleList.Count;
@@ -156,8 +177,8 @@ public class HttpConnectionPool : IDisposable {
 
     // 彻底销毁连接池，清理所有存活连接并释放互斥量底层系统句柄
     public void Dispose() {
-        this.CloseAll();
         if (this.mtx != 0) {
+            this.CloseAll();
             Mutex.Destroy(this.mtx);
             this.mtx = 0;
         }
