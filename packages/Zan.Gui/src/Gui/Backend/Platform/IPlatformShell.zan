@@ -1,0 +1,183 @@
+using System;
+using System.Collections.Generic;
+
+namespace Gui.Backend;
+
+// 进程级平台外壳契约——事件泵、最近事件状态、时钟与系统能力的抽象面。
+// 窗口级交互（创建/呈现/外观）见 IPlatformWindow；两个接口由同一个
+// 平台实现类一起实现（Win32Platform / CapiPlatform，见 Platform.Select）。
+//
+// 事件状态族（EventKind/EventX/...）是进程级「当前事件」：一次
+// PollEvent/WaitEvent 取到事件后，其各字段由这里读出。编码与
+// Gui.Backend.EventKind / Modifiers / Keys 一致（Windows 虚拟键码口径）。
+public interface IPlatformShell {
+    // ---- 事件泵 -------------------------------------------------------
+
+    // 阻塞直到下一个 OS 事件到达。成功返回 0，退出返回 -1。
+    int WaitEvent();
+
+    // 阻塞直到 OS 事件到达或 `ms` 毫秒过去。返回 0=收到事件、
+    // 1=超时、-1=退出。在内核中空闲，等待下一帧截止时间的动画循环
+    // 不消耗 CPU。
+    int WaitEventTimeout(int ms);
+
+    // 不阻塞地轮询事件。返回 0=收到事件、1=无事件、-1=退出。
+    int PollEvent();
+
+    // 从任意线程唤醒阻塞在 WaitEvent 中的 UI 线程，使其能排空
+    // App 分发队列。线程安全。由 App.Post 使用。
+    void Wake();
+
+    // ---- 最近事件状态（进程级「当前事件」）---------------------------
+
+    // 最近一次事件类型（0=无、1=鼠标移动、2=鼠标按下、3=鼠标释放、
+    // 4=按键按下、5=按键释放、6=文本输入、7=调整大小、8=关闭、
+    // 9=文件拖放/失焦、13=滚动、14=表面还原/重露）。编码见 EventKind。
+    int EventKind();
+
+    // 最近投递事件的单调序号：每投递一个新事件 +1，没有新事件时保持
+    // 不变。调用方要区分「新事件」与「陈旧回读」时比对这里。
+    long EventSeq();
+
+    // 最近事件的 X 坐标：鼠标/滚轮/拖放为客户端像素，键盘类为 0。
+    int EventX();
+
+    // 最近事件的 Y 坐标（同 EventX）。
+    int EventY();
+
+    // 最近事件的鼠标键：0 左键、1 右键；非鼠标事件为 0。
+    int EventButton();
+
+    // 最近事件的键码：KeyDown/KeyUp 为虚拟键码，TextInput 为字符码，
+    // Scroll 为滚动 delta。
+    int EventKeyCode();
+
+    // 最近事件按下时的修饰键组合（Modifiers 位掩码）。
+    int EventMods();
+
+    // 事件标记通道：1 = 本次释放是一次触摸拖拽的收尾，App 据此不把
+    // 它当作点击分发。Windows 外壳经系统合成鼠标自带同坐标 down/up，
+    // 无此标记恒为 0。
+    int EventFlag();
+
+    // 产生最近一次事件的窗口句柄，拥有多个顶层窗口的应用可据此
+    // 正确路由事件。
+    nint EventHwnd();
+
+    // 窗口过程当前正在处理的消息所属的窗口句柄。模态尺寸调整循环
+    // 期间应用不泵事件（EventHwnd 停留在旧值），sizePaint 回调须用
+    // 这一个路由「正在缩放的窗口」。
+    nint SizePaintWindow();
+
+    // 最近一次收到调整大小事件的窗口客户区宽/高（设备像素）。外壳
+    // 全局只记一个「当前窗口」，多窗口应用要按句柄精确查询时用
+    // IPlatformWindow.ClientWidth/ClientHeight。
+    int WindowWidth();
+
+    int WindowHeight();
+
+    // ---- 合成输入与拖放 -----------------------------------------------
+
+    // 为指定窗口排队一个合成输入事件，由下一次 PollEvent/WaitEvent
+    // 与真实 OS 事件一样取出（UI 自动化驱动用）。`kind`/`button`/
+    // `keycode`/`mods` 与事件状态族使用相同的编码。
+    void InjectEvent(nint hwnd, int kind, int x, int y, int button,
+    int keycode, int mods);
+
+    // 仍排队的合成事件数量（事件循环完全消费驱动器最后一批后为 0）。
+    int InjectPending();
+
+    // 上次文件拖放事件（kind 9）携带的文件路径，取出即从队列移除：
+    // 应用看到该事件时调用一次。拖放位置为 EventX()/EventY()
+    // （客户端像素），应用可将文件路由到光标下的控件。
+    List<string> TakeDroppedFiles();
+
+    // 拖放后队列中是否有尚未被 TakeDroppedFiles 取走的路径
+    // （只看不删）。kind 9 兼作 blur，应用据此在当前事件帧上
+    // 区分真拖放与失焦。
+    bool DropPending();
+
+    // ---- 时钟与节奏 -----------------------------------------------------
+
+    // 未冻结的真实单调毫秒时钟（测试冻结只影响 Window.GetTickMs）。
+    int RawTickMs();
+
+    // 返回当前时间（微秒），用于一帧之内的分相位计时。
+    // 每 1000 秒回绕一次，只可用来算差值。
+    int GetTickUs();
+
+    // 让调用线程休眠指定的毫秒数（帧节奏控制）。
+    void SleepMs(int ms);
+
+    // ---- 输入与外观的进程级设置 -----------------------------------------
+
+    // 设置鼠标光标类型。
+    void SetCursor(int cursorType);
+
+    // 注册一个在系统模态尺寸调整循环里被调用的帧体。拖动窗口边框时
+    // 消息循环停在 OS 内部，应用自己的循环拿不到控制权；窗口过程收到
+    // 尺寸变化时回调它，就能就地画出新尺寸的一帧。没有模态循环的
+    // 平台存而不用。
+    void SetSizePaint(SizePaintBody body);
+
+    // 实时缩放时用来填充新露出边距的颜色（打包 ARGB）。窗口先被 OS
+    // 放大、应用才画出新尺寸的一帧，这段空隙里那条边距按此色填充。
+    // 未实现的平台安全空操作。
+    void SetResizeBackground(int color);
+
+    // 自定义标题栏保留高度的进程级缺省值（设备像素）。
+    int DefaultTitlebarHeight();
+
+    // 单个标题按钮宽度的进程级缺省值（设备像素）。
+    int DefaultCaptionButtonWidth();
+
+    // 当前显示器的 DPI 缩放百分比（96=100%）：逻辑坐标→设备像素
+    // 换算的进程级缺省值。按窗口的 DPI 见 IPlatformWindow.DpiScale。
+    int DpiScale();
+
+    // 屏幕安全区边距（设备像素，避开刘海/灵动岛与底部手势横条）。
+    // 没有安全区概念的平台恒 0。
+    int SafeAreaTop();
+
+    int SafeAreaBottom();
+
+    int SafeAreaLeft();
+
+    int SafeAreaRight();
+
+    // 有人（呈现路径/玻璃/系统工具）把宿主窗口又写回分层窗口时清回
+    // 来；发生过返回 true（调用方应请求一次全帧重绘，被 ULW 呈现的
+    // 那一帧原生浮层没有上屏）。分层是 Win32 概念，其余平台恒 false。
+    bool SweepLayered();
+
+    // ---- 系统能力 -------------------------------------------------------
+
+    // 将文本复制到系统剪贴板（UTF-8）。成功返回 true。
+    bool ClipboardSet(string text);
+
+    // 返回系统剪贴板文本（UTF-8），无文本时返回 ""。
+    string ClipboardGet();
+
+    // 将 IME 组合 + 候选窗口定位到给定的客户区像素坐标（通常是
+    // 光标底部）。
+    void ImeSetCaret(int x, int y);
+
+    // 打开/关闭文本输入会话。软键盘平台（Android）随会话显隐；
+    // 桌面端会话在建窗时已常开且跟随硬件焦点，空操作。
+    void ImeSetOpen(bool on);
+
+    // 输入法正在组合、尚未上屏的串（拼音等 CJK 输入的组词预览）。
+    // 随帧轮询：组合中非空，commit 或取消即清空。桌面 IME 自带组合
+    // UI 的平台恒返回 ""。
+    string ImeComposing();
+
+    // 将内容写入 path，覆盖已有文件。成功返回 true。
+    bool WriteTextFile(string path, string content);
+
+    // 程序（exe）自己的图标像素（0xAARRGGBB，顶行优先）；
+    // 取不到返回 null，由调用方回落到占位字形。
+    int[] AppIconPixels();
+
+    // 程序图标边长（正方形像素）；没有图标返回 0。
+    int AppIconSide();
+}

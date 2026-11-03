@@ -1,0 +1,193 @@
+using System;
+using System.Collections.Generic;
+
+namespace Gui.Backend;
+
+// 平台窗口契约——Zan.Gui 与「操作系统窗口」之间全部句柄级交互的抽象面。
+//
+// ## 为什么需要这层
+//
+// 此前窗口能力只有一个 Windows 实现（Win32Shell，3000+ 行裸 Win32 静态面），
+// 非 Windows 平台走 zan_gui_* C 驱动 ABI，两套面的名字、语义、覆盖面各自
+// 漂移：异形窗口、托盘、拖拽、IME 与多窗口在非 Windows 平台功能断裂
+// （TASKS B-ID66）。本契约把两边收敛成同一个 Zan 接口：
+//
+// - **Win32Platform**：委托既有 Win32Shell 静态面（Windows 行为不变）；
+// - **CapiPlatform**：委托 zan_gui_* C 驱动（X11 / macOS / Android 的
+//   运行时实现分居 src/runtime/gui_runtime_x11.c、gui_compat_mac.c 等）。
+//
+// 新增平台 = 实现本接口与 IPlatformShell，再在 Platform.Select 挂上；
+// Gui.Core 与能力包装层（Clipboard/Ime/AppIcon/SysFile）一律只认接口，
+// 不再出现按平台分叉的调用点。
+//
+// 约定：方法的第一参 `hwnd` 是 CreateWindow / CreateWindowPhysical 返回
+// 的不透明句柄；句柄 0 的离屏窗口由调用方（Gui.Backend.Window）自行短路，
+// 实现不必处理 0。能力缺口（如异形窗口仅 Windows 支持）在本接口上是
+// 「安全空操作」而非缺失成员——调用方无需按平台分支。
+public interface IPlatformWindow {
+    // 创建平台窗口（96 DPI 逻辑像素；Windows 上按显示器 DPI 放大
+    // 客户区，其余平台原样）。返回不透明句柄。
+    nint CreateWindow(string title, int width, int height);
+
+    // physical 语义：width/height 为内容区物理像素，任何平台都不做
+    // DPI 放大（Windows 上客户区额外加标准标题条高度，内容区从
+    // App.ContentTop() 之下开始）；非 Windows 后端原样创建
+    // （全屏表面，无标题条预留）——游戏舞台契约：画布舞台区尺寸
+    // 恒等于请求值，与显示器 DPI 无关，输入坐标 1:1。
+    nint CreateWindowPhysical(string title, int width, int height);
+
+    // 在屏幕上显示窗口。
+    void ShowWindow(nint hwnd);
+
+    // 开/关关窗拦截：开启后「请求关闭」不再当场销毁窗口，只投递
+    // 关闭事件（kind 8），等应用同意后再真正关掉。macOS/X11 的原生
+    // 层本来就只投递关闭事件、不销毁窗口，实现为显式声明意图即可。
+    void SetCloseIntercept(nint hwnd, bool on);
+
+    // 将窗口左上角移动到屏幕工作区的 (x, y) 像素位置。
+    // 没有自由定位概念的平台（macOS）安全空操作。
+    void SetPosition(nint hwnd, int x, int y);
+
+    // 本窗口的 DPI 百分比（96 = 100%）；不借用另一个窗口的显示器度量。
+    int DpiScale(nint hwnd);
+
+    // 为自定义标题栏保留的高度（设备像素），按窗口查询。
+    int TitlebarHeight(nint hwnd);
+
+    // 单个标题按钮的宽度（设备像素），按窗口查询。
+    int CaptionButtonWidth(nint hwnd);
+
+    // 把窗口客户区调整为 (w, h) 设备像素，外框随之伸缩、位置不变。
+    // 登录小窗 → 主窗口这类形态切换用；未实现的平台安全空操作。
+    void ResizeClient(nint hwnd, int w, int h);
+
+    // 同 ResizeClient，但实参明确是设备像素（不做任何换算）。
+    void ResizeClientExact(nint hwnd, int wDev, int hDev);
+
+    // 在显示器工作区上居中窗口。
+    void Center(nint hwnd);
+
+    // 所在显示器当前模式的刷新率（Hz），查询不可用时返回 60。
+    // 这是动画节奏提示，不保证与垂直同步相位对齐；周期应保留小数。
+    double RefreshRate(nint hwnd);
+
+    // 仅 UI/Looper 线程：按需请求下一显示帧，重复请求合并。
+    // true 表示已排期或已有未消费信号；false 时调用方用计时器回退。
+    // 不会持续订阅显示帧，必须在消费并决定继续动画后再次请求。
+    bool RequestDisplayFrame(nint hwnd);
+
+    // 仅 UI/Looper 线程：一次性消费显示帧信号，不修改输入事件记录。
+    bool TakeDisplayFrame(nint hwnd);
+
+    // 此窗口客户区宽/高（设备像素），按窗口查询。
+    int ClientWidth(nint hwnd);
+
+    int ClientHeight(nint hwnd);
+
+    // 将画布表面呈现到窗口。
+    void Present(nint hwnd, int surfaceId);
+
+    // 将下一次 Present 限制在声明的像素矩形：只重绘了几个小矩形的帧
+    // 只需几次小上传。声明每个变化的矩形——遗漏的部分保留先前呈现
+    // 的像素。不声明（默认）则呈现全部。
+    void PresentDirty(nint hwnd, int x, int y, int w, int h);
+
+    // 整窗帧的呈现声明：本帧重画了窗口的每个像素，下一次 Present 对
+    // 整个窗口上传，不做任何差分。
+    void PresentFull(nint hwnd);
+
+    // 设置窗口标题。
+    void SetTitle(nint hwnd, string title);
+
+    void Minimize(nint hwnd);
+
+    // 在最大化与还原之间切换。
+    void ToggleMaximize(nint hwnd);
+
+    // 请求关闭窗口（走与用户点关闭按钮相同的路径）。
+    void Close(nint hwnd);
+
+    // 彻底拆除窗口（销毁 OS 窗口）。在响应关闭事件后调用，避免
+    // 对话框作为孤儿滞留；在主窗口上为空操作。
+    void Destroy(nint hwnd);
+
+    // 窗口当前处于最大化状态时为真。
+    bool IsMaximized(nint hwnd);
+
+    // 窗口任意部分可见时（未最小化且未被其他窗口完全遮挡）为真。
+    // 环境动画在该值为假时暂停。
+    bool IsVisible(nint hwnd);
+
+    // 此窗口持有输入焦点时为真。此时环境动画会减速至心跳节奏。
+    bool IsFocused(nint hwnd);
+
+    // 在窗口后启用系统原生半透明玻璃（Win11 亚克力、macOS
+    // NSVisualEffectView、Linux 合成器模糊），由打包的 ARGB `tint`
+    // 着色，凡表面透明处生效。没有原生背景的平台安全空操作。
+    // 渲染器必须将表面清为透明，效果才能透出。
+    void EnableGlass(nint hwnd, int tint);
+
+    // 恢复为不透明窗口（移除原生半透明合成）。
+    void DisableGlass(nint hwnd);
+
+    // 以百分比（10..100）设置整个窗口的不透明度；100 恢复不透明。
+    void SetOpacity(nint hwnd, int percent);
+
+    // 窗口轮廓为形状区域的并集，`spec` 格式见 Gui.Backend.Window.SetShape。
+    // 仅 Windows 实现非空操作；其余平台安全空操作。
+    void SetShape(nint hwnd, string spec);
+
+    // 窗口外轮廓圆角（Windows 11 22000+ 由 DWM 合成：一致、抗锯齿、
+    // 与系统投影匹配）。其余平台安全空操作。
+    void SetRoundCorners(nint hwnd, bool on);
+
+    // 启用或禁用窗口置顶（topmost）。
+    void SetTopmost(nint hwnd, bool on);
+
+    // 设置窗口最小允许尺寸（逻辑像素）。未实现的平台安全空操作。
+    void SetMinSize(nint hwnd, int minW, int minH);
+
+    // 窗口是否可由用户改变大小。关闭后边框不再充当尺寸手柄，
+    // 双击标题栏与最大化也不再放大窗口。未实现的平台安全空操作。
+    void SetResizable(nint hwnd, bool on);
+
+    // 窗口是否允许最大化（默认允许）。标题栏不画最大化按钮的窗口
+    // 应关闭它，否则双击标题栏与 Win+Up 仍会放大窗口。
+    // 未实现的平台安全空操作。
+    void SetMaximizable(nint hwnd, bool on);
+
+    // 工具窗口样式：细标题栏、不占任务栏与 Alt-Tab 列表。
+    // 未实现的平台安全空操作。
+    void SetToolWindow(nint hwnd, bool on);
+
+    // 此窗口此前是否被 SetToolWindow(true) 标记过。
+    bool ToolWindow(nint hwnd);
+
+    // 告知运行时框架绘制多少个标题按钮，使可拖拽标题栏区域排除它们。
+    void SetCaptionButtons(nint hwnd, int count);
+
+    // 清除上一帧声明的客户端优先条带（见 AddHitGuard）。
+    // 由应用每帧调用一次。
+    void ClearHitGuards(nint hwnd);
+
+    // 为客户端区域抢占一个矩形（客户端像素），使边框边缘缩放手柄
+    // 不遮挡紧贴窗口边缘绘制的控件。角手柄保持优先。
+    void AddHitGuard(nint hwnd, int x, int y, int w, int h);
+
+    // 运行期加高自绘标题栏保留带（设备像素，只增不减）：原生拖动
+    // 条带与标题按钮布局同步加高。未实现的平台维持启动时的缺省保留带。
+    void SetTitlebarHeight(nint hwnd, int devicePx);
+
+    // 登记标题栏右侧客户区保护带宽度（设备像素）：标题栏高度以内、
+    // 窗口右缘向左 width 的条带 [w-width, w) 内的按下交给客户区
+    // （应用按钮/胶囊命中区），不当作窗口拖动。
+    void SetCaptionZone(nint hwnd, int width);
+
+    // 拒绝把宿主窗口写回分层窗口（WS_EX_LAYERED）：宿主了原生浮层
+    // 的窗口必须留在直通呈现路径上。分层是 Win32 概念，
+    // 其余平台安全空操作。
+    void ForbidLayered(nint hwnd);
+
+    // 把窗口带到前台并给以键盘焦点。
+    void SetForegroundWindow(nint hwnd);
+}

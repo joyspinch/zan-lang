@@ -1,0 +1,670 @@
+#if !WINDOWS
+using System;
+using System.Collections.Generic;
+
+namespace Gui.Backend;
+
+// IPlatformWindow / IPlatformShell 的非 Windows 实现：委托 zan_gui_* C
+// 驱动 ABI。X11 / macOS / Android 的驱动实现在 src/runtime
+// （gui_runtime_x11.c、gui_compat_mac.c、gui_runtime.c 等）。
+//
+// 原 Window.zan / Clipboard.zan / Ime.zan 里按 `#if !WINDOWS` 分叉的
+// zan_gui_* 导入与调用全部收拢到这里；能力缺口（异形窗口、运行期
+// 标题条加高等）按契约实现为安全空操作，由运行时驱动逐步补齐。
+public class CapiPlatform : IPlatformWindow, IPlatformShell {
+    // ---- C ABI 导入（原散居三处，守卫随迁）-----------------------------
+
+    [DllImport("zan_gui")]
+    static extern nint zan_gui_create_window(string title, int width, int height);
+
+    [DllImport("zan_gui")]
+    static extern int zan_gui_show_window(nint hwnd);
+
+    [DllImport("zan_gui")]
+    static extern int zan_gui_wait_event();
+
+    [DllImport("zan_gui")]
+    static extern int zan_gui_wait_event_timeout(int ms);
+
+    [DllImport("zan_gui")]
+    static extern int zan_gui_poll_event();
+
+    [DllImport("zan_gui")]
+    static extern int zan_gui_wake();
+
+    [DllImport("zan_gui")]
+    static extern int zan_gui_inject_event(nint hwnd, int kind, int x, int y,
+    int button, int keycode, int mods);
+
+    [DllImport("zan_gui")]
+    static extern int zan_gui_inject_pending();
+
+    [DllImport("zan_gui")]
+    static extern int zan_gui_event_kind();
+
+    [DllImport("zan_gui")]
+    static extern long zan_gui_event_seq();
+
+    #if !MACOS
+    [DllImport("zan_gui")]
+    static extern string zan_gui_drop_take();
+
+    [DllImport("zan_gui")]
+    static extern int zan_gui_drop_pending();
+    #endif
+
+    [DllImport("zan_gui")]
+    static extern int zan_gui_event_x();
+
+    [DllImport("zan_gui")]
+    static extern int zan_gui_event_y();
+
+    [DllImport("zan_gui")]
+    static extern int zan_gui_event_button();
+
+    [DllImport("zan_gui")]
+    static extern int zan_gui_event_keycode();
+
+    [DllImport("zan_gui")]
+    static extern int zan_gui_event_mods();
+
+    [DllImport("zan_gui")]
+    static extern int zan_gui_event_flag();
+
+    [DllImport("zan_gui")]
+    static extern int zan_gui_window_width();
+
+    [DllImport("zan_gui")]
+    static extern int zan_gui_window_height();
+
+    [DllImport("zan_gui")]
+    static extern nint zan_gui_event_hwnd();
+
+    [DllImport("zan_gui")]
+    static extern int zan_gui_client_width(nint hwnd);
+
+    [DllImport("zan_gui")]
+    static extern int zan_gui_client_height(nint hwnd);
+
+    [DllImport("zan_gui")]
+    static extern int zan_gui_present(nint hwnd, int surfaceId);
+
+    [DllImport("zan_gui")]
+    static extern int zan_gui_present_dirty_add(int x, int y, int w, int h);
+
+    [DllImport("zan_gui")]
+    static extern void zan_gui_present_full();
+
+    [DllImport("zan_gui")]
+    static extern int zan_gui_set_title(nint hwnd, string title);
+
+    [DllImport("zan_gui")]
+    static extern int zan_gui_set_cursor(int cursorType);
+
+    [DllImport("zan_gui")]
+    static extern long zan_gui_get_tick_ms();
+
+    [DllImport("zan_gui")]
+    static extern void zan_gui_sleep_ms(int ms);
+
+    [DllImport("zan_gui")]
+    static extern int zan_gui_minimize(nint hwnd);
+
+    [DllImport("zan_gui")]
+    static extern int zan_gui_toggle_maximize(nint hwnd);
+
+    [DllImport("zan_gui")]
+    static extern int zan_gui_close_window(nint hwnd);
+
+    [DllImport("zan_gui")]
+    static extern int zan_gui_destroy_window(nint hwnd);
+
+    [DllImport("zan_gui")]
+    static extern int zan_gui_is_maximized(nint hwnd);
+
+    [DllImport("zan_gui")]
+    static extern int zan_gui_window_visible(nint hwnd);
+
+    [DllImport("zan_gui")]
+    static extern int zan_gui_window_focused(nint hwnd);
+
+    [DllImport("zan_gui")]
+    static extern int zan_gui_set_topmost(nint hwnd, int on);
+
+    [DllImport("zan_gui")]
+    static extern int zan_gui_set_caption_buttons(nint hwnd, int count);
+
+    [DllImport("zan_gui")]
+    static extern int zan_gui_titlebar_height();
+
+    [DllImport("zan_gui")]
+    static extern int zan_gui_caption_button_width();
+
+    [DllImport("zan_gui")]
+    static extern int zan_gui_safe_area_top();
+
+    [DllImport("zan_gui")]
+    static extern int zan_gui_safe_area_bottom();
+
+    [DllImport("zan_gui")]
+    static extern int zan_gui_safe_area_left();
+
+    [DllImport("zan_gui")]
+    static extern int zan_gui_safe_area_right();
+
+    // 在窗口后启用系统原生半透明玻璃（Win11 亚克力、macOS
+    // NSVisualEffectView、Linux 合成器模糊），凡表面透明处生效。
+    // tint 为打包的 ARGB 颜色；没有原生背景的平台上安全地空操作。
+    [DllImport("zan_gui")]
+    static extern int zan_gui_enable_glass(nint hwnd, int tintArgb);
+
+    // 将窗口恢复不透明（移除原生半透明合成）。
+    [DllImport("zan_gui")]
+    static extern int zan_gui_disable_glass(nint hwnd);
+
+    // 以百分比（10..100）设置整个窗口的不透明度；100 恢复不透明。
+    [DllImport("zan_gui")]
+    static extern int zan_gui_set_opacity(nint hwnd, int percent);
+
+    #if !MACOS
+    // 将窗口左上角移动到屏幕工作区的 (x, y) 像素位置。
+    [DllImport("zan_gui")]
+    static extern int zan_gui_set_window_pos(nint hwnd, int x, int y);
+    #endif
+
+    // 在显示器工作区上重新居中窗口。
+    [DllImport("zan_gui")]
+    static extern int zan_gui_center_window(nint hwnd);
+
+    // 清除上一帧注册的所有客户端优先条带。
+    [DllImport("zan_gui")]
+    static extern int zan_gui_clear_hit_guards(nint hwnd);
+
+    // 为客户端像素矩形抢占边框的边缘缩放区域。
+    [DllImport("zan_gui")]
+    static extern int zan_gui_add_hit_guard(nint hwnd, int x, int y, int w, int h);
+
+    [DllImport("zan_gui")]
+    static extern int zan_gui_set_clipboard(string text);
+
+    [DllImport("zan_gui")]
+    static extern string zan_gui_get_clipboard();
+
+    [DllImport("zan_gui")]
+    static extern int zan_gui_get_dpi_scale();
+
+    [DllImport("zan_gui")]
+    static extern void zan_gui_set_ime_pos(int x, int y);
+
+    #if ANDROID
+    [DllImport("zan_gui")]
+    static extern void zan_gui_set_ime_open(int on);
+
+    [DllImport("zan_gui")]
+    static extern string zan_gui_ime_composing();
+
+    // Android：静态 APK 的驱动导出在 libmain.so；共享驱动只加载一次。
+    static bool refreshQueryResolved;
+    static nint refreshQuery;
+    static bool optionalGuiDriverResolved;
+    static nint optionalGuiDriver;
+    static bool displayFrameResolved;
+    static nint displayFrameRequest;
+    static nint displayFrameTake;
+    #endif
+
+    // SetSizePaint 的存根（没有模态尺寸调整循环的平台存而不用，
+    // 保持"参数被消费"的形态）。
+    static SizePaintBody sizePaintUnused;
+
+    #if ANDROID
+    static nint OptionalGuiEntry(string symbol) {
+        nint entry = Interop.PosixSymbol(0, symbol);
+        if (entry != 0) { return entry; }
+        if (!CapiPlatform.optionalGuiDriverResolved) {
+            CapiPlatform.optionalGuiDriverResolved = true;
+            CapiPlatform.optionalGuiDriver = Interop.Load("libzan_gui.so");
+        }
+        return Interop.Symbol(CapiPlatform.optionalGuiDriver, symbol);
+    }
+
+    static void ResolveDisplayFrame() {
+        if (CapiPlatform.displayFrameResolved) { return; }
+        CapiPlatform.displayFrameResolved = true;
+        CapiPlatform.displayFrameRequest = CapiPlatform.OptionalGuiEntry("zan_gui_request_display_frame");
+        CapiPlatform.displayFrameTake = CapiPlatform.OptionalGuiEntry("zan_gui_take_display_frame");
+    }
+    #endif
+
+    // ---- IPlatformWindow：生命周期 ------------------------------------
+
+    public nint CreateWindow(string title, int width, int height) {
+        return zan_gui_create_window(title, width, height);
+    }
+
+    public nint CreateWindowPhysical(string title, int width, int height) {
+        // 非 Windows 后端原样创建（全屏表面，无标题条预留）。
+        return zan_gui_create_window(title, width, height);
+    }
+
+    public void ShowWindow(nint hwnd) {
+        zan_gui_show_window(hwnd);
+    }
+
+    public void SetCloseIntercept(nint hwnd, bool on) {
+        // macOS/X11 的原生层本来就只投递关闭事件、不销毁窗口，
+        // 这里只是显式声明意图，行为不变。
+    }
+
+    public void SetPosition(nint hwnd, int x, int y) {
+        #if MACOS
+        // 没有自由定位概念的平台。
+        #else
+        zan_gui_set_window_pos(hwnd, x, y);
+        #endif
+    }
+
+    public int DpiScale(nint hwnd) {
+        return zan_gui_get_dpi_scale();
+    }
+
+    public int TitlebarHeight(nint hwnd) {
+        return zan_gui_titlebar_height();
+    }
+
+    public int CaptionButtonWidth(nint hwnd) {
+        return zan_gui_caption_button_width();
+    }
+
+    public void ResizeClient(nint hwnd, int w, int h) {
+        // 驱动尚无客户区缩放通道；安全空操作。
+    }
+
+    public void ResizeClientExact(nint hwnd, int wDev, int hDev) {
+        // 同 ResizeClient。
+    }
+
+    public void Center(nint hwnd) {
+        zan_gui_center_window(hwnd);
+    }
+
+    public double RefreshRate(nint hwnd) {
+        #if ANDROID
+        if (!CapiPlatform.refreshQueryResolved) {
+            CapiPlatform.refreshQueryResolved = true;
+            CapiPlatform.refreshQuery = CapiPlatform.OptionalGuiEntry("zan_gui_refresh_rate");
+        }
+        if (CapiPlatform.refreshQuery != 0) {
+            WindowRefreshRateFn query = (WindowRefreshRateFn)CapiPlatform.refreshQuery;
+            double hz = query(hwnd);
+            if (hz > 1.0 && hz <= 1000.0) { return hz; }
+        }
+        #endif
+        // X11 驱动没有 XRandR 依赖，其余后端尚无显示模式查询。
+        return 60.0;
+    }
+
+    public bool RequestDisplayFrame(nint hwnd) {
+        #if ANDROID
+        CapiPlatform.ResolveDisplayFrame();
+        if (CapiPlatform.displayFrameRequest != 0 && CapiPlatform.displayFrameTake != 0) {
+            WindowDisplayFrameFn request = (WindowDisplayFrameFn)CapiPlatform.displayFrameRequest;
+            return request(hwnd) != 0;
+        }
+        #endif
+        return false;
+    }
+
+    public bool TakeDisplayFrame(nint hwnd) {
+        #if ANDROID
+        CapiPlatform.ResolveDisplayFrame();
+        if (CapiPlatform.displayFrameRequest != 0 && CapiPlatform.displayFrameTake != 0) {
+            WindowDisplayFrameFn take = (WindowDisplayFrameFn)CapiPlatform.displayFrameTake;
+            return take(hwnd) != 0;
+        }
+        #endif
+        return false;
+    }
+
+    public int ClientWidth(nint hwnd) {
+        return zan_gui_client_width(hwnd);
+    }
+
+    public int ClientHeight(nint hwnd) {
+        return zan_gui_client_height(hwnd);
+    }
+
+    // ---- 呈现 ----------------------------------------------------------
+
+    public void Present(nint hwnd, int surfaceId) {
+        zan_gui_present(hwnd, surfaceId);
+    }
+
+    public void PresentDirty(nint hwnd, int x, int y, int w, int h) {
+        zan_gui_present_dirty_add(x, y, w, h);
+    }
+
+    public void PresentFull(nint hwnd) {
+        // 非 Windows 平台脏矩形队列标记：通知全量重绘，忽略排队脏区。
+        zan_gui_present_full();
+    }
+
+    // ---- 生命周期（续）--------------------------------------------------
+
+    public void SetTitle(nint hwnd, string title) {
+        zan_gui_set_title(hwnd, title);
+    }
+
+    public void Minimize(nint hwnd) {
+        zan_gui_minimize(hwnd);
+    }
+
+    public void ToggleMaximize(nint hwnd) {
+        zan_gui_toggle_maximize(hwnd);
+    }
+
+    public void Close(nint hwnd) {
+        zan_gui_close_window(hwnd);
+    }
+
+    public void Destroy(nint hwnd) {
+        zan_gui_destroy_window(hwnd);
+    }
+
+    public bool IsMaximized(nint hwnd) {
+        return zan_gui_is_maximized(hwnd) != 0;
+    }
+
+    public bool IsVisible(nint hwnd) {
+        return zan_gui_window_visible(hwnd) != 0;
+    }
+
+    public bool IsFocused(nint hwnd) {
+        return zan_gui_window_focused(hwnd) != 0;
+    }
+
+    // ---- 外观 -----------------------------------------------------------
+
+    public void EnableGlass(nint hwnd, int tint) {
+        zan_gui_enable_glass(hwnd, tint);
+    }
+
+    public void DisableGlass(nint hwnd) {
+        zan_gui_disable_glass(hwnd);
+    }
+
+    public void SetOpacity(nint hwnd, int percent) {
+        zan_gui_set_opacity(hwnd, percent);
+    }
+
+    public void SetShape(nint hwnd, string spec) {
+        // 异形窗口仅 Windows 后端实现，其余平台安全空操作。
+    }
+
+    public void SetRoundCorners(nint hwnd, bool on) {
+        // 旧系统安全空操作。
+    }
+
+    public void SetTopmost(nint hwnd, bool on) {
+        int v = 0;
+        if (on) { v = 1; }
+        zan_gui_set_topmost(hwnd, v);
+    }
+
+    public void SetMinSize(nint hwnd, int minW, int minH) {
+        // 驱动尚无最小尺寸通道；安全空操作。
+    }
+
+    public void SetResizable(nint hwnd, bool on) {
+        // 驱动尚无可变尺寸开关；安全空操作。
+    }
+
+    public void SetMaximizable(nint hwnd, bool on) {
+        // 同 SetResizable。
+    }
+
+    public void SetToolWindow(nint hwnd, bool on) {
+        // 工具窗口样式是 Win32 概念；安全空操作。
+    }
+
+    public bool ToolWindow(nint hwnd) {
+        return false;
+    }
+
+    public void SetCaptionButtons(nint hwnd, int count) {
+        zan_gui_set_caption_buttons(hwnd, count);
+    }
+
+    public void ClearHitGuards(nint hwnd) {
+        zan_gui_clear_hit_guards(hwnd);
+    }
+
+    public void AddHitGuard(nint hwnd, int x, int y, int w, int h) {
+        zan_gui_add_hit_guard(hwnd, x, y, w, h);
+    }
+
+    public void SetTitlebarHeight(nint hwnd, int devicePx) {
+        // 仅 Windows 后端支持运行期加高；其余后端维持启动时的缺省保留带。
+    }
+
+    public void SetCaptionZone(nint hwnd, int width) {
+        // 仅 Windows 后端实现。
+    }
+
+    public void ForbidLayered(nint hwnd) {
+        // 分层是 Win32 概念。
+    }
+
+    public void SetForegroundWindow(nint hwnd) {
+        // 驱动尚无前台切换通道；安全空操作。
+    }
+
+    // ---- IPlatformShell：事件泵 -----------------------------------------
+
+    public int WaitEvent() {
+        return zan_gui_wait_event();
+    }
+
+    public int WaitEventTimeout(int ms) {
+        return zan_gui_wait_event_timeout(ms);
+    }
+
+    public int PollEvent() {
+        return zan_gui_poll_event();
+    }
+
+    public void Wake() {
+        zan_gui_wake();
+    }
+
+    // ---- 最近事件状态 ----------------------------------------------------
+
+    public int EventKind() {
+        return zan_gui_event_kind();
+    }
+
+    public long EventSeq() {
+        return zan_gui_event_seq();
+    }
+
+    public int EventX() {
+        return zan_gui_event_x();
+    }
+
+    public int EventY() {
+        return zan_gui_event_y();
+    }
+
+    public int EventButton() {
+        return zan_gui_event_button();
+    }
+
+    public int EventKeyCode() {
+        return zan_gui_event_keycode();
+    }
+
+    public int EventMods() {
+        return zan_gui_event_mods();
+    }
+
+    public int EventFlag() {
+        return zan_gui_event_flag();
+    }
+
+    public nint EventHwnd() {
+        return zan_gui_event_hwnd();
+    }
+
+    public nint SizePaintWindow() {
+        return zan_gui_event_hwnd();
+    }
+
+    public int WindowWidth() {
+        return zan_gui_window_width();
+    }
+
+    public int WindowHeight() {
+        return zan_gui_window_height();
+    }
+
+    // ---- 合成输入与拖放 ---------------------------------------------------
+
+    public void InjectEvent(nint hwnd, int kind, int x, int y, int button,
+    int keycode, int mods) {
+        zan_gui_inject_event(hwnd, kind, x, y, button, keycode, mods);
+    }
+
+    public int InjectPending() {
+        return zan_gui_inject_pending();
+    }
+
+    public List<string> TakeDroppedFiles() {
+        List<string> outp = new List<string>();
+        #if MACOS
+        return outp;
+        #else
+        string p = zan_gui_drop_take();
+        while (p != "") {
+            outp.Add(p);
+            p = zan_gui_drop_take();
+        }
+        return outp;
+        #endif
+    }
+
+    public bool DropPending() {
+        #if MACOS
+        return false;
+        #else
+        return zan_gui_drop_pending() != 0;
+        #endif
+    }
+
+    // ---- 时钟与节奏 -------------------------------------------------------
+
+    public int RawTickMs() {
+        return (int)zan_gui_get_tick_ms();
+    }
+
+    public int GetTickUs() {
+        return (int)zan_gui_get_tick_ms() * 1000;
+    }
+
+    public void SleepMs(int ms) {
+        zan_gui_sleep_ms(ms);
+    }
+
+    // ---- 进程级设置 --------------------------------------------------------
+
+    public void SetCursor(int cursorType) {
+        zan_gui_set_cursor(cursorType);
+    }
+
+    public void SetSizePaint(SizePaintBody body) {
+        CapiPlatform.sizePaintUnused = body;
+    }
+
+    public void SetResizeBackground(int color) {
+        // 驱动无边距填充通道；安全空操作。
+    }
+
+    public int DefaultTitlebarHeight() {
+        return zan_gui_titlebar_height();
+    }
+
+    public int DefaultCaptionButtonWidth() {
+        return zan_gui_caption_button_width();
+    }
+
+    public int DpiScale() {
+        return zan_gui_get_dpi_scale();
+    }
+
+    public int SafeAreaTop() {
+        return zan_gui_safe_area_top();
+    }
+
+    public int SafeAreaBottom() {
+        return zan_gui_safe_area_bottom();
+    }
+
+    public int SafeAreaLeft() {
+        return zan_gui_safe_area_left();
+    }
+
+    public int SafeAreaRight() {
+        return zan_gui_safe_area_right();
+    }
+
+    public bool SweepLayered() {
+        return false;
+    }
+
+    // ---- 系统能力 -----------------------------------------------------------
+
+    public bool ClipboardSet(string text) {
+        return zan_gui_set_clipboard(text) == 0;
+    }
+
+    public string ClipboardGet() {
+        return zan_gui_get_clipboard();
+    }
+
+    public void ImeSetCaret(int x, int y) {
+        zan_gui_set_ime_pos(x, y);
+    }
+
+    public void ImeSetOpen(bool on) {
+        #if ANDROID
+        zan_gui_set_ime_open(on ? 1 : 0);
+        #endif
+    }
+
+    public string ImeComposing() {
+        #if ANDROID
+        return zan_gui_ime_composing();
+        #else
+        return "";
+        #endif
+    }
+
+    public bool WriteTextFile(string path, string content) {
+        try {
+            File.WriteAllText(path, content);
+            return true;
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    public int[] AppIconPixels() {
+        // 非 Windows 平台取不到程序图标，返回空，
+        // 由调用方回落到占位字形。
+        return null;
+    }
+
+    public int AppIconSide() {
+        return 0;
+    }
+}
+#endif
