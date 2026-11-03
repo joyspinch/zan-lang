@@ -5,6 +5,17 @@ using System.Net.Sip;
 using System.Threading;
 
 class Program {
+    static int ParsePortFromVia(string via) {
+        // e.g. "SIP/2.0/UDP 127.0.0.1:5064;branch=..."
+        int colon = via.IndexOf(":");
+        if (colon >= 0) {
+            int semi = via.IndexOf(";", colon);
+            string portText = semi >= 0 ? via.Substring(colon + 1, semi - colon - 1) : via.Substring(colon + 1);
+            return Convert.ToInt(portText);
+        }
+        return 5060;
+    }
+
     static void TestSdpSerializationAndParse() {
         SdpMessage sdp = SdpMessage.CreateAudio("192.168.1.50", 40000);
         string text = sdp.Serialize();
@@ -92,6 +103,7 @@ class Program {
     }
 
     // 模拟服务端响应来电：接收 INVITE -> 回复 180 Ringing -> 回复 200 OK (带 SDP) -> 接收 ACK -> 接收 BYE -> 回复 200 OK
+    // 严格遵循 RFC 3261 §18.2.2 将响应发回 Via 头部指定的客户端 IP 与端口
     static async void RunMockSipServer(int port, int clientPort) {
         UdpClient server = UdpClient.Bind("127.0.0.1", port);
         if (server == null) { return; }
@@ -105,23 +117,34 @@ class Program {
                     string method = msg.GetMethod();
                     if (method == "INVITE") {
                         string via = msg.Header("Via");
+                        int viaPort = ParsePortFromVia(via);
+                        if (viaPort != clientPort) {
+                            Console.WriteLine("FAIL: invite via port is " + Convert.ToString(viaPort) + ", want " + Convert.ToString(clientPort));
+                            Environment.Exit(30);
+                        }
+                        string contact = msg.Header("Contact");
+                        if (contact.IndexOf(":" + Convert.ToString(clientPort)) < 0) {
+                            Console.WriteLine("FAIL: invite contact port mismatch: " + contact);
+                            Environment.Exit(31);
+                        }
+
                         string from = msg.Header("From");
                         string to = msg.Header("To");
                         string callId = msg.Header("Call-ID");
                         string cseq = msg.Header("CSeq");
 
-                        // 1. 发送 180 Ringing
+                        // 1. 发送 180 Ringing 回到 Via 端口
                         SipMessage ring = SipMessage.Response(180, "Ringing");
                         ring.Add("Via", via);
                         ring.Add("From", from);
                         ring.Add("To", to + ";tag=bob-tag-999");
                         ring.Add("Call-ID", callId);
                         ring.Add("CSeq", cseq);
-                        await server.SendToAsync(ring.Serialize(), "127.0.0.1", clientPort);
+                        await server.SendToAsync(ring.Serialize(), "127.0.0.1", viaPort);
 
                         await Task.Delay(50);
 
-                        // 2. 发送 200 OK，携带对端 SDP（协商音频端口 50002）
+                        // 2. 发送 200 OK，携带对端 SDP（协商音频端口 50002）回到 Via 端口
                         SipMessage ok = SipMessage.Response(200, "OK");
                         ok.Add("Via", via);
                         ok.Add("From", from);
@@ -132,12 +155,23 @@ class Program {
                         ok.Add("Content-Type", "application/sdp");
                         SdpMessage bobSdp = SdpMessage.CreateAudio("127.0.0.1", 50002);
                         ok.SetBody(bobSdp.Serialize());
-                        await server.SendToAsync(ok.Serialize(), "127.0.0.1", clientPort);
+                        await server.SendToAsync(ok.Serialize(), "127.0.0.1", viaPort);
                     } else if (method == "ACK") {
-                        // 握手完成
+                        // 握手完成：校验 ACK 的 Via 头部端口是否对齐 localSipPort
+                        int ackPort = ParsePortFromVia(msg.Header("Via"));
+                        if (ackPort != clientPort) {
+                            Console.WriteLine("FAIL: ack via port is " + Convert.ToString(ackPort) + ", want " + Convert.ToString(clientPort));
+                            Environment.Exit(32);
+                        }
                     } else if (method == "BYE") {
-                        // 3. 挂断确认 200 OK
+                        // 3. 挂断确认 200 OK：校验 BYE 的 Via 头部端口是否对齐 localSipPort
                         string via = msg.Header("Via");
+                        int byePort = ParsePortFromVia(via);
+                        if (byePort != clientPort) {
+                            Console.WriteLine("FAIL: bye via port is " + Convert.ToString(byePort) + ", want " + Convert.ToString(clientPort));
+                            Environment.Exit(33);
+                        }
+
                         string from = msg.Header("From");
                         string to = msg.Header("To");
                         string callId = msg.Header("Call-ID");
@@ -149,7 +183,7 @@ class Program {
                         byeOk.Add("To", to);
                         byeOk.Add("Call-ID", callId);
                         byeOk.Add("CSeq", cseq);
-                        await server.SendToAsync(byeOk.Serialize(), "127.0.0.1", clientPort);
+                        await server.SendToAsync(byeOk.Serialize(), "127.0.0.1", byePort);
                         callDone = true;
                     }
                 }
@@ -196,22 +230,189 @@ class Program {
             Environment.Exit(19);
         }
 
-        // 发送一帧语音数据包
+        // 模拟对端在协商好的 50002 端口准备接收与回发 RTP 语音
+        UdpClient bobRtp = UdpClient.Bind("127.0.0.1", 50002);
+        if (bobRtp == null) {
+            Console.WriteLine("FAIL: bob rtp bind failed");
+            Environment.Exit(27);
+        }
+
+        // 发送一帧语音数据包（Alice -> Bob:50002）
         byte[] voiceFrame = new byte[160];
+        voiceFrame[0] = 11;
+        voiceFrame[159] = 22;
         int sent = await channel.SendAudioFrameAsync(voiceFrame, 0, 160);
         if (sent <= 0) {
             Console.WriteLine("FAIL: send audio frame");
             Environment.Exit(20);
         }
 
+        // Bob 接收来自 Alice 的语音数据包
+        byte[] bobBuf = new byte[2048];
+        int bobRecv = bobRtp.RecvBytesFrom(bobBuf, 2048);
+        if (bobRecv < 12) {
+            Console.WriteLine("FAIL: bob recv rtp frame: " + Convert.ToString(bobRecv));
+            Environment.Exit(28);
+        }
+        RtpPacket bobPkt = RtpPacket.Decode(bobBuf, 0, bobRecv);
+        if (bobPkt == null || bobPkt.GetPayload() == null || (bobPkt.GetPayload()[0] & 255) != 11) {
+            Console.WriteLine("FAIL: bob decode rtp packet");
+            Environment.Exit(29);
+        }
+
+        // Bob 向 Alice (127.0.0.1:50000) 回传一帧 RTP 音频流
+        byte[] srvPcm = new byte[160];
+        srvPcm[0] = 42;
+        srvPcm[159] = 84;
+        RtpPacket srvPkt = RtpPacket.Create(0, 555, 32000, 77778888, srvPcm);
+        byte[] srvData = srvPkt.Encode();
+        await bobRtp.SendBytesToAsync(srvData, srvData.Length, "127.0.0.1", 50000);
+        bobRtp.Close();
+
+        RtpPacket recvdPkt = await channel.RecvRtpAsync();
+        if (recvdPkt == null) {
+            Console.WriteLine("FAIL: recv rtp async null");
+            Environment.Exit(21);
+        }
+        if (recvdPkt.GetSequenceNumber() != 555 || recvdPkt.GetTimestamp() != 32000) {
+            Console.WriteLine("FAIL: recv rtp seq or ts mismatch");
+            Environment.Exit(22);
+        }
+        byte[] recvdPayload = recvdPkt.GetPayload();
+        if (recvdPayload == null || recvdPayload.Length != 160 || (recvdPayload[0] & 255) != 42 || (recvdPayload[159] & 255) != 84) {
+            Console.WriteLine("FAIL: recv rtp payload mismatch");
+            Environment.Exit(23);
+        }
+        Console.WriteLine("rtp channel recv async ok");
+
         // 挂断通话
         bool hungUp = await client.HangupAsync(call);
         if (!hungUp || call.GetState() != SipCallState.Terminated) {
             Console.WriteLine("FAIL: hangup failed");
-            Environment.Exit(21);
+            Environment.Exit(24);
         }
 
         Console.WriteLine("sip call workflow (invite, ringing, 200 ok, ack, rtp, bye) ok");
+    }
+
+    static async void RunMockRegisterServer(int port, int clientPort) {
+        UdpClient server = UdpClient.Bind("127.0.0.1", port);
+        if (server == null) { return; }
+
+        bool done = false;
+        while (!done) {
+            if (Socket.IsReadable(server.GetSocket())) {
+                string d = server.RecvFrom(65536);
+                SipMessage msg = SipMessage.Parse(d);
+                if (msg != null && msg.GetIsRequest()) {
+                    string method = msg.GetMethod();
+                    if (method == "REGISTER") {
+                        string via = msg.Header("Via");
+                        int viaPort = ParsePortFromVia(via);
+                        if (viaPort != clientPort) {
+                            Console.WriteLine("FAIL: register via port mismatch: " + Convert.ToString(viaPort));
+                            Environment.Exit(34);
+                        }
+
+                        string contact = msg.Header("Contact");
+                        string wantContact = "<sip:alice@127.0.0.1:" + Convert.ToString(clientPort) + ">";
+                        if (contact != wantContact) {
+                            Console.WriteLine("FAIL: register contact mismatch, got: " + contact + ", want: " + wantContact);
+                            Environment.Exit(35);
+                        }
+
+                        SipMessage ok = SipMessage.Response(200, "OK");
+                        ok.Add("Via", via);
+                        ok.Add("From", msg.Header("From"));
+                        ok.Add("To", msg.Header("To") + ";tag=reg-tag-1");
+                        ok.Add("Call-ID", msg.Header("Call-ID"));
+                        ok.Add("CSeq", msg.Header("CSeq"));
+                        ok.Add("Contact", contact);
+                        ok.Add("Expires", msg.Header("Expires"));
+                        await server.SendToAsync(ok.Serialize(), "127.0.0.1", viaPort);
+                        done = true;
+                    }
+                }
+            } else {
+                await Task.Delay(10);
+            }
+        }
+        server.Close();
+    }
+
+    static async Task TestSipRegisterWorkflow() {
+        int serverPort = 5066;
+        int clientPort = 5068;
+        RunMockRegisterServer(serverPort, clientPort);
+        await Task.Delay(50);
+
+        SipClient client = new SipClient("127.0.0.1", serverPort, "alice");
+        client.SetLocalIp("127.0.0.1");
+        client.SetLocalSipPort(clientPort);
+
+        SipMessage regResp = await client.RegisterAsync("alice", 3600);
+        if (regResp == null || regResp.GetStatus() != 200) {
+            Console.WriteLine("FAIL: register failed");
+            Environment.Exit(25);
+        }
+        Console.WriteLine("sip register workflow ok");
+    }
+
+    static async void RunMockCancelServer(int port, int clientPort) {
+        UdpClient server = UdpClient.Bind("127.0.0.1", port);
+        if (server == null) { return; }
+
+        bool done = false;
+        while (!done) {
+            if (Socket.IsReadable(server.GetSocket())) {
+                string d = server.RecvFrom(65536);
+                SipMessage msg = SipMessage.Parse(d);
+                if (msg != null && msg.GetIsRequest()) {
+                    string method = msg.GetMethod();
+                    if (method == "CANCEL") {
+                        string via = msg.Header("Via");
+                        int viaPort = ParsePortFromVia(via);
+                        if (viaPort != clientPort) {
+                            Console.WriteLine("FAIL: cancel via port mismatch: " + Convert.ToString(viaPort));
+                            Environment.Exit(36);
+                        }
+
+                        SipMessage ok = SipMessage.Response(200, "OK");
+                        ok.Add("Via", via);
+                        ok.Add("From", msg.Header("From"));
+                        ok.Add("To", msg.Header("To"));
+                        ok.Add("Call-ID", msg.Header("Call-ID"));
+                        ok.Add("CSeq", msg.Header("CSeq"));
+                        await server.SendToAsync(ok.Serialize(), "127.0.0.1", viaPort);
+                        done = true;
+                    }
+                }
+            } else {
+                await Task.Delay(10);
+            }
+        }
+        server.Close();
+    }
+
+    static async Task TestSipCancelWorkflow() {
+        int serverPort = 5070;
+        int clientPort = 5072;
+        RunMockCancelServer(serverPort, clientPort);
+        await Task.Delay(50);
+
+        SipClient client = new SipClient("127.0.0.1", serverPort, "alice");
+        client.SetLocalIp("127.0.0.1");
+        client.SetLocalSipPort(clientPort);
+
+        SipCall call = new SipCall("call-cancel-1", "sip:alice@127.0.0.1", "sip:charlie@127.0.0.1", "alice", 1, 50010);
+        call.SetState(SipCallState.Calling);
+
+        bool canceled = await client.CancelAsync(call);
+        if (!canceled || call.GetState() != SipCallState.Terminated) {
+            Console.WriteLine("FAIL: cancel call failed");
+            Environment.Exit(26);
+        }
+        Console.WriteLine("sip cancel workflow ok");
     }
 
     static async void Main() {
@@ -219,6 +420,8 @@ class Program {
         TestRtpPacketEncodeDecode();
         TestSipCallModel();
         await TestSipCallWorkflow();
+        await TestSipRegisterWorkflow();
+        await TestSipCancelWorkflow();
         Console.WriteLine("ALL_SIP_TESTS_OK");
     }
 }
