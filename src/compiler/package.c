@@ -17,6 +17,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <dirent.h>
+#include <pthread.h>
 #ifdef __APPLE__
 #include <mach-o/dyld.h>
 #endif
@@ -25,6 +26,8 @@
 
 #include "../common/host_oom.h"
 #include "../common/json.h"
+#include "diag.h"
+#include "incremental.h"
 
 bool zan_version_parse(const char *str, zan_version_t *out) {
     memset(out, 0, sizeof(*out));
@@ -1268,6 +1271,172 @@ static void pkg_dir_names_free(char **names, int count) {
     free(names);
 }
 
+/* 目录枚举（排序）+ 就地属性：FindFirstFileA/readdir 本身就带类型，
+ * 不必再对每个条目补一次 GetFileAttributesA/lstat——包源索引全树遍历
+ * 一趟要碰 ~10^4 个条目，逐条目补 stat 的系统调用在小过滤驱动的机器
+ * 上每次都是一次被拦截的打开。flags bit0=is_dir，bit1=reparse/symlink。 */
+typedef struct {
+    char **names;
+    unsigned char *flags;
+    int count;
+} pkg_dir_entries_t;
+
+static pkg_dir_entries_t *pkg_dir_entries_sorted(const char *dir) {
+    pkg_dir_entries_t *e = (pkg_dir_entries_t *)calloc(1, sizeof(*e));
+    if (!e) return NULL;
+    int cap = 64, count = 0;
+    e->names = (char **)malloc((size_t)cap * sizeof(char *));
+    e->flags = (unsigned char *)malloc((size_t)cap * sizeof(unsigned char));
+    if (!e->names || !e->flags) {
+        free(e->names);
+        free(e->flags);
+        free(e);
+        return NULL;
+    }
+#ifdef _WIN32
+    char pattern[1024];
+    WIN32_FIND_DATAA fd;
+    if (snprintf(pattern, sizeof(pattern), "%s\\*", dir) < (int)sizeof(pattern)) {
+        HANDLE h = FindFirstFileA(pattern, &fd);
+        if (h != INVALID_HANDLE_VALUE) {
+            do {
+                if (strcmp(fd.cFileName, ".") == 0 ||
+                    strcmp(fd.cFileName, "..") == 0) continue;
+                if (count == cap) {
+                    int ncap = cap * 2;
+                    char **gn = (char **)realloc(e->names, (size_t)ncap * sizeof(char *));
+                    unsigned char *gf = (unsigned char *)realloc(e->flags, (size_t)ncap);
+                    if (!gn || !gf) break;
+                    e->names = gn;
+                    e->flags = gf;
+                    cap = ncap;
+                }
+                size_t len = strlen(fd.cFileName);
+                e->names[count] = (char *)malloc(len + 1);
+                if (!e->names[count]) break;
+                memcpy(e->names[count], fd.cFileName, len + 1);
+                e->flags[count] = (unsigned char)(
+                    ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) ? 1 : 0) |
+                    ((fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) ? 2 : 0));
+                count++;
+            } while (FindNextFileA(h, &fd));
+            FindClose(h);
+        }
+    }
+#else
+    DIR *d = opendir(dir);
+    if (d) {
+        struct dirent *de;
+        while ((de = readdir(d)) != NULL) {
+            if (strcmp(de->d_name, ".") == 0 ||
+                strcmp(de->d_name, "..") == 0) continue;
+            if (count == cap) {
+                int ncap = cap * 2;
+                char **gn = (char **)realloc(e->names, (size_t)ncap * sizeof(char *));
+                unsigned char *gf = (unsigned char *)realloc(e->flags, (size_t)ncap);
+                if (!gn || !gf) break;
+                e->names = gn;
+                e->flags = gf;
+                cap = ncap;
+            }
+            size_t len = strlen(de->d_name);
+            e->names[count] = (char *)malloc(len + 1);
+            if (!e->names[count]) break;
+            memcpy(e->names[count], de->d_name, len + 1);
+            unsigned char fl = 0;
+            if (de->d_type == DT_DIR) fl = 1;
+            else if (de->d_type == DT_LNK) fl = 2;
+            else if (de->d_type == DT_UNKNOWN) {
+                char ep[1024];
+                struct stat st;
+                if (snprintf(ep, sizeof(ep), "%s" PATH_SEP "%s", dir, de->d_name)
+                    < (int)sizeof(ep) && lstat(ep, &st) == 0)
+                    fl = (unsigned char)(S_ISDIR(st.st_mode) ? 1
+                                         : (S_ISLNK(st.st_mode) ? 2 : 0));
+            }
+            e->flags[count] = fl;
+            count++;
+        }
+        closedir(d);
+    }
+#endif
+    if (count > 1) qsort(e->names, (size_t)count, sizeof(char *), pkg_names_cmp);
+    e->count = count;
+    return e;
+}
+
+static void pkg_dir_entries_free(pkg_dir_entries_t *e) {
+    if (!e) return;
+    if (e->names) {
+        for (int i = 0; i < e->count; i++) free(e->names[i]);
+        free(e->names);
+    }
+    free(e->flags);
+    free(e);
+}
+
+static long g_pkg_probe_calls = 0;
+static long g_pkg_dirs_uniform = 0;
+static long g_pkg_dirs_total = 0;
+
+static double zan_pkg_now_ms(void) {
+#ifdef _WIN32
+    LARGE_INTEGER f, c;
+    QueryPerformanceFrequency(&f);
+    QueryPerformanceCounter(&c);
+    return (double)c.QuadPart * 1000.0 / (double)f.QuadPart;
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1000000.0;
+#endif
+}
+
+/* 包源索引两阶段构建：阶段一走树只「收集」（uniform 目录内联一个首文
+ * 件 probe 定案），阶段二对待 probe 文件并行 probe（纯只读、无共享写，
+ * 单线程 ~6000 次 fopen 在小过滤驱动的机器上要 2-5s——每次编译的固定
+ * 税），最后按走树原次序单线程注册，保证与旧实现注册次序逐项一致。 */
+typedef struct {
+    char *path;
+    char *src_root;
+    struct pkg_index_package *package;
+    int project_owned;
+    int uniform;        /* 1: declared 已知 = dir_ns */
+    char dir_ns[256];   /* 目录推导命名空间（回退用） */
+    char declared[256]; /* probe 结果（仅 !uniform） */
+    int has_ns;
+} pkg_probe_item_t;
+
+typedef struct {
+    pkg_probe_item_t *items;
+    int count;
+    int cap;
+} pkg_probe_list_t;
+
+static void pkg_probe_list_push(pkg_probe_list_t *list, const pkg_probe_item_t *it) {
+    if (list->count == list->cap) {
+        int ncap = list->cap ? list->cap * 2 : 256;
+        pkg_probe_item_t *grown = (pkg_probe_item_t *)realloc(
+            list->items, (size_t)ncap * sizeof(*grown));
+        if (!grown) {
+            zan_host_oom();
+        }
+        list->items = grown;
+        list->cap = ncap;
+    }
+    list->items[list->count++] = *it;
+}
+
+static void pkg_probe_list_free(pkg_probe_list_t *list) {
+    for (int i = 0; i < list->count; i++) {
+        free(list->items[i].path);
+        free(list->items[i].src_root);
+    }
+    free(list->items);
+    list->items = NULL;
+    list->count = list->cap = 0;
+}
+
 /* ---- B-ID90: 源码树确定性哈希 ----
  * 只对 manifest（zan.pkg）算 SHA-256 挡不住源码被篡改。这里对整个包目录
  * 做确定性遍历：相对路径排序后，逐文件哈希「相对路径 + NUL + 8 字节大端
@@ -1468,59 +1637,73 @@ static void pkg_rel_dir_ns(const char *dir, const char *src_root,
     out[w] = '\0';
 }
 
-static void pkg_index_source_tree(zan_pkg_source_index_t *index,
-                                   pkg_index_package_t *package, const char *dir,
-                                   zan_pkg_namespace_probe_t probe,
-                                   int depth, const char *src_root,
-                                   int project_owned) {
+static void pkg_index_source_tree_collect(pkg_probe_list_t *list,
+                                           pkg_index_package_t *package,
+                                           const char *dir,
+                                           zan_pkg_namespace_probe_t probe,
+                                           int depth, const char *src_root,
+                                           int project_owned) {
     if (depth > 64) return;
-    int n = 0;
-    char **names = pkg_dir_names_sorted(dir, &n);
-    if (!names) return;
-    for (int i = 0; i < n; i++) {
-        const char *name = names[i];
+    pkg_dir_entries_t *ent = pkg_dir_entries_sorted(dir);
+    if (!ent) return;
+
+    /* 目录统一命名空间快路径：排序后的首个 .zan 若声明命名空间恰等于
+     * 目录推导命名空间，则整目录免逐文件 probe（仓库约定「目录即命名
+     * 空间」，stdlib glob 同款假设）。首文件无声明或与目录推导不符 →
+     * 整目录进并行 probe 队列，语义与旧实现一致。 */
+    char dir_ns[256];
+    pkg_rel_dir_ns(dir, src_root, dir_ns, sizeof(dir_ns));
+    int uniform = 0;
+    g_pkg_dirs_total++;
+    if (dir_ns[0]) {
+        for (int i = 0; i < ent->count; i++) {
+            if (ent->flags[i] & 3) continue;  /* 目录/重解析点不参与 */
+            if (!pkg_safe_component(ent->names[i])) continue;
+            size_t nl = strlen(ent->names[i]);
+            if (nl < 5 || strcmp(ent->names[i] + nl - 4, ".zan") != 0) continue;
+            char first_path[1024];
+            if (snprintf(first_path, sizeof(first_path),
+                         "%s" PATH_SEP "%s", dir, ent->names[i])
+                < (int)sizeof(first_path)) {
+                char declared0[256] = {0};
+                g_pkg_probe_calls++;
+                uniform = probe(first_path, declared0, sizeof(declared0)) &&
+                          declared0[0] &&
+                          strcmp(declared0, dir_ns) == 0;
+            }
+            break;  /* 只看排序后的首个 .zan */
+        }
+        if (uniform) g_pkg_dirs_uniform++;
+    }
+
+    for (int i = 0; i < ent->count; i++) {
+        const char *name = ent->names[i];
         if (!pkg_safe_component(name)) continue;
         char path[1024];
         if (snprintf(path, sizeof(path), "%s" PATH_SEP "%s", dir, name)
             >= (int)sizeof(path)) continue;
-        int is_dir = 0, is_reg = 0;
-#ifdef _WIN32
-        DWORD attr = GetFileAttributesA(path);
-        if (attr == INVALID_FILE_ATTRIBUTES ||
-            (attr & FILE_ATTRIBUTE_REPARSE_POINT)) continue;
-        is_dir = (attr & FILE_ATTRIBUTE_DIRECTORY) != 0;
-        is_reg = !is_dir;
-#else
-        struct stat st;
-        if (lstat(path, &st) != 0 || S_ISLNK(st.st_mode)) continue;
-        is_dir = S_ISDIR(st.st_mode) != 0;
-        is_reg = S_ISREG(st.st_mode) != 0;
-#endif
-        if (is_dir) {
-            pkg_index_source_tree(index, package, path, probe, depth + 1,
-                                   src_root, project_owned);
-        } else if (is_reg) {
-            size_t len = strlen(name);
-            if (len < 5 || strcmp(name + len - 4, ".zan") != 0) continue;
-            char declared[256] = {0};
-            int has_namespace = probe(path, declared, sizeof(declared)) && declared[0];
-            if (!has_namespace)
-                pkg_rel_dir_ns(dir, src_root, declared, sizeof(declared));
-            if (!declared[0]) continue;
-            pkg_index_source_t *source = (pkg_index_source_t *)malloc(sizeof(*source));
-            source->path = pkg_index_copy(path);
-            source->package = package;
-            source->next = index->sources;
-            index->sources = source;
-            pkg_index_add_namespace(index, declared, strlen(declared), source, 0);
-            if (has_namespace && project_owned) {
-                for (size_t k = 0; declared[k]; k++)
-                    if (declared[k] == '.')
-                        pkg_index_add_namespace(index, declared, k, source, 1);
-            }
+        if (ent->flags[i] & 2) continue;  /* reparse point 不入树 */
+        if (ent->flags[i] & 1) {
+            pkg_index_source_tree_collect(list, package, path, probe, depth + 1,
+                                           src_root, project_owned);
+            continue;
         }
+        size_t len = strlen(name);
+        if (len < 5 || strcmp(name + len - 4, ".zan") != 0) continue;
+        pkg_probe_item_t it;
+        memset(&it, 0, sizeof(it));
+        it.path = pkg_index_copy(path);
+        it.src_root = pkg_index_copy(src_root);
+        it.package = package;
+        it.project_owned = project_owned;
+        it.uniform = uniform;
+        snprintf(it.dir_ns, sizeof(it.dir_ns), "%s", dir_ns);
+        if (uniform)
+            snprintf(it.declared, sizeof(it.declared), "%s", dir_ns);
+        it.has_ns = uniform;
+        pkg_probe_list_push(list, &it);
     }
-    pkg_dir_names_free(names, n);
+    pkg_dir_entries_free(ent);
 }
 
 typedef struct {
@@ -1547,7 +1730,8 @@ static bool pkg_mark_seen(pkg_seen_names_t *seen, const char *name) {
 
 static void pkg_index_store(zan_pkg_source_index_t *index, const char *store,
                              zan_pkg_namespace_probe_t probe,
-                             pkg_seen_names_t *seen, int project_owned) {
+                             pkg_seen_names_t *seen, int project_owned,
+                             pkg_probe_list_t *list) {
     if (!pkg_is_dir(store)) return;
     int n = 0;
     char **names = pkg_dir_names_sorted(store, &n);
@@ -1580,9 +1764,186 @@ static void pkg_index_store(zan_pkg_source_index_t *index, const char *store,
         package->name = pkg_index_copy(name);
         package->next = index->packages;
         index->packages = package;
-        pkg_index_source_tree(index, package, source, probe, 0, source, project_owned);
+        pkg_index_source_tree_collect(list, package, source, probe, 0, source,
+                                       project_owned);
     }
     pkg_dir_names_free(names, n);
+}
+
+/* ---- 并行 probe：纯只读工作（fopen + 头 1KB 扫描），线程间无共享写，
+ * 结果各写各的 item 槽位。静态分块，无锁。 ---- */
+typedef struct {
+    pkg_probe_item_t *items;
+    int *pending;
+    int from;
+    int to;
+    zan_pkg_namespace_probe_t probe;
+    long probe_calls;
+} pkg_probe_task_t;
+
+static void pkg_probe_run_chunk(pkg_probe_task_t *t) {
+    for (int i = t->from; i < t->to; i++) {
+        pkg_probe_item_t *it = &t->items[t->pending[i]];
+        char declared[256] = {0};
+        t->probe_calls++;
+        it->has_ns = t->probe(it->path, declared, sizeof(declared)) && declared[0];
+        if (it->has_ns)
+            snprintf(it->declared, sizeof(it->declared), "%s", declared);
+    }
+}
+
+#ifdef _WIN32
+static DWORD WINAPI pkg_probe_worker_win(LPVOID arg) {
+    pkg_probe_run_chunk((pkg_probe_task_t *)arg);
+    return 0;
+}
+#else
+static void *pkg_probe_worker_posix(void *arg) {
+    pkg_probe_run_chunk((pkg_probe_task_t *)arg);
+    return NULL;
+}
+#endif
+
+/* 并行 probe 全部待定 item，然后按走树原次序注册进索引。 */
+static void pkg_index_build_from_items(zan_pkg_source_index_t *index,
+                                        pkg_probe_list_t *list,
+                                        zan_pkg_namespace_probe_t probe) {
+    double __b0 = zan_pkg_now_ms();
+    /* 待 probe 的 item 下标（保持走树次序中的相对顺序） */
+    int pending_n = 0;
+    for (int i = 0; i < list->count; i++)
+        if (!list->items[i].uniform) pending_n++;
+    int *pending = NULL;
+    if (pending_n > 0) {
+        pending = (int *)malloc((size_t)pending_n * sizeof(int));
+        if (!pending) {
+            zan_host_oom();
+        }
+        int k = 0;
+        for (int i = 0; i < list->count; i++)
+            if (!list->items[i].uniform) pending[k++] = i;
+    }
+
+    if (pending_n > 0) {
+        double __p0 = zan_pkg_now_ms();
+        int nthreads = zan_cpu_count();
+        if (nthreads > 16) nthreads = 16;
+        if (nthreads > pending_n) nthreads = pending_n;
+        if (nthreads < 1) nthreads = 1;
+        int per = pending_n / nthreads;
+        int rem = pending_n % nthreads;
+        pkg_probe_task_t *tasks = (pkg_probe_task_t *)calloc(
+            (size_t)nthreads, sizeof(*tasks));
+        if (!tasks) {
+            zan_host_oom();
+        }
+        int off = 0;
+        for (int t = 0; t < nthreads; t++) {
+            tasks[t].items = list->items;
+            tasks[t].pending = pending;
+            tasks[t].from = off;
+            tasks[t].to = off + per + (t < rem ? 1 : 0);
+            tasks[t].probe = probe;
+            off = tasks[t].to;
+        }
+#ifdef _WIN32
+        HANDLE *threads = (HANDLE *)malloc((size_t)nthreads * sizeof(HANDLE));
+        if (!threads) {
+            zan_host_oom();
+        }
+        int live = 0;
+        for (int t = 0; t < nthreads; t++) {
+            HANDLE h = CreateThread(NULL, 0, pkg_probe_worker_win, &tasks[t],
+                                    0, NULL);
+            if (h) {
+                threads[live++] = h;
+            } else {
+                /* 句柄耗尽等失败——该块退化为当前线程直接跑 */
+                pkg_probe_run_chunk(&tasks[t]);
+            }
+        }
+        if (live > 0)
+            WaitForMultipleObjects((DWORD)live, threads, TRUE, INFINITE);
+        for (int t = 0; t < live; t++)
+            CloseHandle(threads[t]);
+        free(threads);
+#else
+        pthread_t *threads = (pthread_t *)malloc((size_t)nthreads * sizeof(pthread_t));
+        if (!threads) {
+            zan_host_oom();
+        }
+        int live = 0;
+        for (int t = 0; t < nthreads; t++) {
+            if (pthread_create(&threads[live], NULL, pkg_probe_worker_posix,
+                               &tasks[t]) == 0) {
+                live++;
+            } else {
+                /* EAGAIN / ENOMEM——该块退化为当前线程直接跑 */
+                pkg_probe_run_chunk(&tasks[t]);
+            }
+        }
+        for (int t = 0; t < live; t++)
+            pthread_join(threads[t], NULL);
+        free(threads);
+#endif
+        for (int t = 0; t < nthreads; t++)
+            g_pkg_probe_calls += tasks[t].probe_calls;
+        free(tasks);
+        zan_compile_trace("pkg probe: pending=%d threads=%d parallel=%.1fms", pending_n, nthreads, zan_pkg_now_ms() - __p0);
+    }
+    free(pending);
+    zan_compile_trace("pkg build: probe+register total=%.1fms", zan_pkg_now_ms() - __b0);
+
+    /* 按走树原次序注册：与旧逐文件实现注册次序逐项一致 */
+    for (int i = 0; i < list->count; i++) {
+        pkg_probe_item_t *it = &list->items[i];
+        char declared[256];
+        int has_namespace;
+        if (it->uniform) {
+            snprintf(declared, sizeof(declared), "%s", it->dir_ns);
+            has_namespace = 1;
+        } else if (it->has_ns) {
+            snprintf(declared, sizeof(declared), "%s", it->declared);
+            has_namespace = 1;
+        } else {
+            snprintf(declared, sizeof(declared), "%s", it->dir_ns);
+            has_namespace = 0;
+        }
+        if (!declared[0]) continue;
+        pkg_index_source_t *source = (pkg_index_source_t *)malloc(sizeof(*source));
+        source->path = it->path;
+        it->path = NULL;  /* 所有权移交索引 */
+        source->package = it->package;
+        source->next = index->sources;
+        index->sources = source;
+        pkg_index_add_namespace(index, declared, strlen(declared), source, 0);
+        if (has_namespace && it->project_owned) {
+            for (size_t k = 0; declared[k]; k++)
+                if (declared[k] == '.')
+                    pkg_index_add_namespace(index, declared, k, source, 1);
+        }
+    }
+}
+
+static void pkg_store_canonical(const char *path, char *out, size_t cap) {
+#ifdef _WIN32
+    if (!GetFullPathNameA(path, (DWORD)cap, out, NULL)) snprintf(out, cap, "%s", path);
+    for (char *c = out; *c; c++) {
+        if (*c == '/') *c = '\\';
+        else if (*c >= 'A' && *c <= 'Z') *c = (char)(*c - 'A' + 'a');
+    }
+#else
+    if (!realpath(path, out)) snprintf(out, cap, "%s", path);
+#endif
+}
+
+/* 规范化候选 store 根并去重：重复（返回 1）不再走整树枚举。
+ * 未重复（返回 0）时 canon[*count] 已写入规范化路径。 */
+static int pkg_canon_dup(char canon[][1024], int count, const char *raw) {
+    pkg_store_canonical(raw, canon[count], 1024);
+    for (int i = 0; i < count; i++)
+        if (strcmp(canon[count], canon[i]) == 0) return 1;
+    return 0;
 }
 
 zan_pkg_source_index_t *zan_pkg_source_index_create(
@@ -1590,26 +1951,46 @@ zan_pkg_source_index_t *zan_pkg_source_index_create(
     if (!project_dir || !project_dir[0] || !probe) return NULL;
     zan_pkg_source_index_t *index = (zan_pkg_source_index_t *)calloc(1, sizeof(*index));
     char store[1024];
+    /* 候选 store 根常互相重合（exe 目录旁的 ..\packages 就是项目的
+     * packages/）：先规范化再去重，重复根不再做整树枚举。 */
+    char canon[6][1024];
+    int canon_count = 0;
     pkg_seen_names_t seen = {0};
+    pkg_probe_list_t list = {0};
     snprintf(store, sizeof(store), "%s" PATH_SEP "packages", project_dir);
-    pkg_index_store(index, store, probe, &seen, 1);
+    if (!pkg_canon_dup(canon, canon_count, store)) {
+        canon_count++;
+        pkg_index_store(index, store, probe, &seen, 1, &list);
+    }
     snprintf(store, sizeof(store), "%s" PATH_SEP ".zan-packages", project_dir);
-    pkg_index_store(index, store, probe, &seen, 1);
+    if (!pkg_canon_dup(canon, canon_count, store)) {
+        canon_count++;
+        pkg_index_store(index, store, probe, &seen, 1, &list);
+    }
     char exe_dir[1024] = {0};
 #ifdef _WIN32
     if (GetModuleFileNameA(NULL, exe_dir, sizeof(exe_dir))) {
         char *sep = strrchr(exe_dir, '\\'); if (sep) *sep = 0;
         snprintf(store, sizeof(store), "%s\\..\\packages", exe_dir);
-        pkg_index_store(index, store, probe, &seen, 1);
+        if (!pkg_canon_dup(canon, canon_count, store)) {
+            canon_count++;
+            pkg_index_store(index, store, probe, &seen, 1, &list);
+        }
         snprintf(store, sizeof(store), "%s\\packages", exe_dir);
-        pkg_index_store(index, store, probe, &seen, 1);
+        if (!pkg_canon_dup(canon, canon_count, store)) {
+            canon_count++;
+            pkg_index_store(index, store, probe, &seen, 1, &list);
+        }
     }
 #elif defined(__APPLE__)
     uint32_t size = sizeof(exe_dir);
     if (_NSGetExecutablePath(exe_dir, &size) == 0) {
         char *sep = strrchr(exe_dir, '/'); if (sep) *sep = 0;
         snprintf(store, sizeof(store), "%s/../packages", exe_dir);
-        pkg_index_store(index, store, probe, &seen, 1);
+        if (!pkg_canon_dup(canon, canon_count, store)) {
+            canon_count++;
+            pkg_index_store(index, store, probe, &seen, 1, &list);
+        }
     }
 #else
     ssize_t len = readlink("/proc/self/exe", exe_dir, sizeof(exe_dir) - 1);
@@ -1617,11 +1998,22 @@ zan_pkg_source_index_t *zan_pkg_source_index_create(
         exe_dir[len] = 0;
         char *sep = strrchr(exe_dir, '/'); if (sep) *sep = 0;
         snprintf(store, sizeof(store), "%s/../packages", exe_dir);
-        pkg_index_store(index, store, probe, &seen, 1);
+        if (!pkg_canon_dup(canon, canon_count, store)) {
+            canon_count++;
+            pkg_index_store(index, store, probe, &seen, 1, &list);
+        }
     }
 #endif
     if (zan_pkg_global_store(store, sizeof(store)))
-        pkg_index_store(index, store, probe, &seen, 0);
+        pkg_index_store(index, store, probe, &seen, 0, &list);
+    /* 阶段二：并行 probe + 按走树原次序注册 */
+    pkg_index_build_from_items(index, &list, probe);
+    pkg_probe_list_free(&list);
+    zan_compile_trace("pkg index: dirs=%d uniform=%d probes=%d",
+                      g_pkg_dirs_total, g_pkg_dirs_uniform, g_pkg_probe_calls);
+    g_pkg_dirs_total = 0;
+    g_pkg_dirs_uniform = 0;
+    g_pkg_probe_calls = 0;
     for (int i = 0; i < seen.count; i++) free(seen.names[i]);
     free(seen.names);
     return index;

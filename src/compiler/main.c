@@ -3026,6 +3026,8 @@ int main(int argc, char **argv) {
     int scanned = 0;
     for (;;) {
         int round_end = input_count;
+        zan_compile_trace("pullin round begin: scanned=%d inputs=%d", scanned, input_count);
+        double __rt0 = now_ms();
     for (int fi = scanned; fi < round_end; fi++) {
         if (fi > 0 && zan_is_zcomp_path(input_files[fi])) continue;
         size_t slen = 0;
@@ -3092,9 +3094,12 @@ int main(int argc, char **argv) {
     }
         scanned = round_end;
         if (pi_filter_active) {
+            double __ct0 = now_ms();
             int changed = pi_close_once(resolved_stdlib_root);
             int fresh = pi_append_included(&input_files, &input_count,
                                            &input_cap);
+            zan_compile_trace("pullin round done: parse=%.1fms close=%.1fms changed=%d fresh=%d inputs=%d",
+                              __ct0 - __rt0, now_ms() - __ct0, changed, fresh, input_count);
             if (!changed && !fresh) {
                 if (!pi_repair_done && pi_unsatisfied_live_name()) {
                     pi_repair_done = 1;

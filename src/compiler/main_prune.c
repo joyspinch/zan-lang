@@ -1189,12 +1189,15 @@ static void pi_process_dir(pi_dir_t *d, const char *stdlib_root) {
     if (d->reached) return;
     d->reached = 1;
     int before = d->file_count;
+    double __g0 = now_ms();
     pi_glob_into(d, stdlib_root, d->subdir);
+    double __g1 = now_ms();
     int hierarchical = stdlib_has_dir(stdlib_root, d->subdir) == 0;
     int found = d->file_count != before;
     int pre_visit = d->file_count;
     int package_count = package_visit_namespace(d->subdir, pi_add_package_source,
                                                   d, hierarchical);
+    double __g2 = now_ms();
     found = found || package_count > 0;
     if (!hierarchical) {
         for (int i = pre_visit; i < d->file_count; i++)
@@ -1206,8 +1209,13 @@ static void pi_process_dir(pi_dir_t *d, const char *stdlib_root) {
         fprintf(stderr, "ZANPKG_MISSING namespace=%s\n", d->subdir);
         missing_namespace_count++;
     }
+    size_t __sc0 = g_scale_stats.metadata_scans;
     for (int i = 0; i < d->file_count; i++)
         pi_scan_file(&d->files[i]);
+    zan_compile_trace("process_dir '%s': glob=%.1fms pkg=%d(%.1fms) files=%d scans=%zu scan=%.1fms",
+                      d->subdir, __g1 - __g0, package_count, __g2 - __g1,
+                      d->file_count, g_scale_stats.metadata_scans - __sc0,
+                      now_ms() - __g2);
 }
 
 static int pi_close_once(const char *stdlib_root) {
