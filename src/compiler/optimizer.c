@@ -72,6 +72,8 @@ static LLVMValueRef get_arc_operand(LLVMValueRef call) {
 }
 
 static bool are_same_arc_object(LLVMValueRef op1, LLVMValueRef op2) {
+    op1 = strip_pointer_casts(op1);
+    op2 = strip_pointer_casts(op2);
     if (op1 == op2) return true;
     if (!op1 || !op2) return false;
     if (LLVMIsAInstruction(op1) && LLVMIsAInstruction(op2)) {
