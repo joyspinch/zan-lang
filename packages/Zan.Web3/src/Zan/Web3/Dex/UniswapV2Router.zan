@@ -1,0 +1,154 @@
+using System;
+using System.Security.Cryptography;
+using Zan.Web3.Types;
+using Zan.Web3.Encoding;
+using Zan.Web3.Rpc;
+using Zan.Web3.Contracts;
+
+namespace Zan.Web3.Dex;
+
+// Uniswap V2 现代去中心化交易所 (DEX) 路由客户端 (Uniswap V2 Router Client)
+// 支持 Uniswap, SushiSwap, PancakeSwap 等 AMM 协议的流动性工厂查询、代币价格/滑点预估与自动兑换交易。
+public class UniswapV2Router {
+
+    // 以太坊主网官方 Uniswap V2 Router02 地址
+    public static string DefaultRouterAddress = "0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D";
+
+    public Contract Contract;           // 底层智能合约门面
+
+    public UniswapV2Router(Address routerAddress, Web3Client client, long chainId) {
+        Contract = new Contract(routerAddress, client, chainId);
+    }
+
+    public static UniswapV2Router CreateDefault(Web3Client client, long chainId) {
+        Address router = Address.Parse(DefaultRouterAddress);
+        return new UniswapV2Router(router, client, chainId);
+    }
+
+    // 查询 AMM 工厂合约地址 (factory() returns (address))
+    public Address Factory() {
+        return Contract.CallAddress("factory()", new byte[0]);
+    }
+
+    // 查询打包以太币合约地址 (WETH() returns (address))
+    public Address WETH() {
+        return Contract.CallAddress("WETH()", new byte[0]);
+    }
+
+    // 预估代币兑换产出数量 (getAmountsOut(uint256 amountIn, address[] path) returns (uint256[] amounts))
+    public List<BigInt> GetAmountsOut(BigInt amountIn, List<Address> path) {
+        if (amountIn == null || path == null || path.Count < 2) {
+            return new List<BigInt>();
+        }
+
+        // 构造动态 address[] 参数 ABI 编码:
+        // Slot 0: amountIn (32 字节)
+        // Slot 1: path 相对偏移量 (64 字节 = 0x40)
+        // Slot 2: path.Count (32 字节)
+        // Slot 3..N: 每一个 address 的 32 字节槽位
+        int pathCount = path.Count;
+        int totalLen = 32 * 3 + 32 * pathCount;
+        byte[] args = new byte[totalLen];
+
+        byte[] amountSlot = Abi.EncodeUint256(amountIn);
+        for (int i = 0; i < 32; i = i + 1) { args[i] = amountSlot[i]; }
+
+        byte[] offsetSlot = Abi.EncodeUint256(64);
+        for (int i = 0; i < 32; i = i + 1) { args[32 + i] = offsetSlot[i]; }
+
+        byte[] countSlot = Abi.EncodeUint256(pathCount);
+        for (int i = 0; i < 32; i = i + 1) { args[64 + i] = countSlot[i]; }
+
+        for (int p = 0; p < pathCount; p = p + 1) {
+            byte[] addrSlot = Abi.EncodeAddress(path[p]);
+            for (int i = 0; i < 32; i = i + 1) {
+                args[96 + p * 32 + i] = addrSlot[i];
+            }
+        }
+
+        string resHex = Contract.CallRaw("getAmountsOut(uint256,address[])", args);
+        if (resHex == null || resHex.Length == 0) {
+            return new List<BigInt>();
+        }
+
+        // 解码 uint256[] 返回值:
+        // 返回格式: 相对偏移量(32 字节) + 数组长度(32 字节) + 各元素(32 字节 * N)
+        string clean = resHex.Trim();
+        if (clean.StartsWith("0x") || clean.StartsWith("0X")) {
+            clean = clean.Substring(2);
+        }
+        if (clean.Length < 128) {
+            return new List<BigInt>();
+        }
+        byte[] raw = Hex.Decode(clean, clean.Length);
+        if (raw == null || raw.Length < 64) {
+            return new List<BigInt>();
+        }
+
+        int arrLen = (int)Abi.DecodeUint256(raw, 32).limb(0);
+        List<BigInt> result = new List<BigInt>();
+        for (int i = 0; i < arrLen; i = i + 1) {
+            if (raw.Length >= 64 + (i + 1) * 32) {
+                result.Add(Abi.DecodeUint256(raw, 64 + i * 32));
+            }
+        }
+
+        return result;
+    }
+
+    // 签署并广播代币互兑交易
+    // swapExactTokensForTokens(uint256 amountIn, uint256 amountOutMin, address[] path, address to, uint256 deadline)
+    public string SwapExactTokensForTokens(
+        Account signer,
+        BigInt amountIn,
+        BigInt amountOutMin,
+        List<Address> path,
+        Address to,
+        long deadline
+    ) {
+        if (signer == null || path == null || path.Count < 2) {
+            return null;
+        }
+
+        int pathCount = path.Count;
+        // 5 个入参: amountIn(0), amountOutMin(1), pathOffset(2 = 160), to(3), deadline(4), pathLen(5), pathItems(6..N)
+        int totalLen = 32 * 6 + 32 * pathCount;
+        byte[] args = new byte[totalLen];
+
+        byte[] inSlot = Abi.EncodeUint256(amountIn);
+        for (int i = 0; i < 32; i = i + 1) { args[i] = inSlot[i]; }
+
+        byte[] minSlot = Abi.EncodeUint256(amountOutMin);
+        for (int i = 0; i < 32; i = i + 1) { args[32 + i] = minSlot[i]; }
+
+        // pathOffset = 5 * 32 = 160
+        byte[] offsetSlot = Abi.EncodeUint256(160);
+        for (int i = 0; i < 32; i = i + 1) { args[64 + i] = offsetSlot[i]; }
+
+        byte[] toSlot = Abi.EncodeAddress(to);
+        for (int i = 0; i < 32; i = i + 1) { args[96 + i] = toSlot[i]; }
+
+        byte[] deadSlot = Abi.EncodeUint256(deadline);
+        for (int i = 0; i < 32; i = i + 1) { args[128 + i] = deadSlot[i]; }
+
+        byte[] lenSlot = Abi.EncodeUint256(pathCount);
+        for (int i = 0; i < 32; i = i + 1) { args[160 + i] = lenSlot[i]; }
+
+        for (int p = 0; p < pathCount; p = p + 1) {
+            byte[] addrSlot = Abi.EncodeAddress(path[p]);
+            for (int i = 0; i < 32; i = i + 1) {
+                args[192 + p * 32 + i] = addrSlot[i];
+            }
+        }
+
+        return Contract.SendTransaction(
+            signer,
+            "swapExactTokensForTokens(uint256,uint256,address[],address,uint256)",
+            args,
+            BigInt.zero(),
+            200000,
+            EtherUnit.FromGwei(25),
+            EtherUnit.FromGwei(2)
+        );
+    }
+}
