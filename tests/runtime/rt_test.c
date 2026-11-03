@@ -179,6 +179,81 @@ static void test_scheduler(void) {
     CHECK(g_sched_ok == 1, "expected 7*7=49 and 11*11=121 from awaited coroutines");
 }
 
+/* B-ID120: 协程上下文切换错误码（GetLastError / WSAGetLastError / errno）隔离验证 */
+static int g_err_isolation_ok = 0;
+
+static void error_coro_A(zan_task_t *t) {
+    int ok = 1;
+    for (int i = 0; i < 20; i++) {
+        int expected = 1000 + i;
+#ifdef _WIN32
+        SetLastError((DWORD)expected);
+#else
+        errno = expected;
+#endif
+        zan_task_yield();
+#ifdef _WIN32
+        if ((int)GetLastError() != expected) {
+            ok = 0;
+            break;
+        }
+#else
+        if (errno != expected) {
+            ok = 0;
+            break;
+        }
+#endif
+    }
+    zan_task_return(t, ok);
+}
+
+static void error_coro_B(zan_task_t *t) {
+    int ok = 1;
+    for (int i = 0; i < 20; i++) {
+        int expected = 5000 + i;
+#ifdef _WIN32
+        SetLastError((DWORD)expected);
+#else
+        errno = expected;
+#endif
+        zan_task_yield();
+#ifdef _WIN32
+        if ((int)GetLastError() != expected) {
+            ok = 0;
+            break;
+        }
+#else
+        if (errno != expected) {
+            ok = 0;
+            break;
+        }
+#endif
+    }
+    zan_task_return(t, ok);
+}
+
+static void error_isolation_main(zan_task_t *t) {
+    zan_task_t *a = zan_spawn(error_coro_A, NULL);
+    zan_task_t *b = zan_spawn(error_coro_B, NULL);
+    int64_t ra = zan_task_await(a);
+    int64_t rb = zan_task_await(b);
+    zan_task_release(a);
+    zan_task_release(b);
+    g_err_isolation_ok = (ra == 1 && rb == 1) ? 1 : 0;
+    zan_task_return(t, 0);
+}
+
+static void test_error_isolation(void) {
+    banner("scheduler: coroutine system error code isolation (B-ID120)");
+    zan_sched_init();
+    zan_task_t *main_task = zan_spawn(error_isolation_main, NULL);
+    zan_sched_run();
+    zan_task_release(main_task);
+    CHECK(zan_task_live() == 0, "tasks leaked: %zu still tracked", zan_task_live());
+    zan_sched_shutdown();
+    CHECK(g_err_isolation_ok == 1, "expected error codes to be preserved across yields");
+}
+
 /* 多 Worker 并发压力测试 */
 #define CONC_TASKS 128
 static void worker_calc_body(zan_task_t *t) {
@@ -648,6 +723,7 @@ int main(void) {
     printf("=== Zan runtime test suite ===\n");
 
     test_scheduler();
+    test_error_isolation();
     test_scheduler_concurrent_workers();
     test_scheduler_concurrent_high_load();
     test_timer();

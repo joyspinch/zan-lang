@@ -22,8 +22,10 @@
 #include <stdint.h>
 
 #ifdef _WIN32
+#include <winsock2.h>
 #include <windows.h>
 #else
+#include <errno.h>
 #include <sys/mman.h>
 /* Darwin 的 mmap 只有 MAP_ANON（即使 _XOPEN_SOURCE/_GNU_SOURCE 也不给
  * MAP_ANONYMOUS 拼写）；栈池的 mmap 两侧统一走这个别名。 */
@@ -109,6 +111,7 @@ typedef struct zan_co {
     zan_task_t    *task;
     int            finished;
     volatile int   running;
+    int32_t        last_error;
     struct zan_co *next;
 } zan_co_t;
 
@@ -340,8 +343,17 @@ static int64_t plat_now_ms(void) {
 
 static void switch_to_sched(void) {
 #ifdef _WIN32
+    if (g_current) {
+        g_current->last_error = (int32_t)GetLastError();
+    }
     plat_switch(g_sched_fiber);
+    if (g_current) {
+        SetLastError((DWORD)g_current->last_error);
+    }
 #else
+    if (g_current) {
+        g_current->last_error = (int32_t)errno;
+    }
     posix_fiber_t *pf = (posix_fiber_t *)g_current->fiber;
 #if ZAN_ASAN_FIBER
     __sanitizer_start_switch_fiber(NULL, NULL, 0);
@@ -350,7 +362,22 @@ static void switch_to_sched(void) {
 #else
     swapcontext(&pf->ctx, &g_sched_ctx);
 #endif
+    if (g_current) {
+        errno = (int)g_current->last_error;
+    }
 #endif
+}
+
+static inline void co_switch_to(zan_co_t *co) {
+    co_acquire(co);
+    g_current = co;
+#ifdef _WIN32
+    SetLastError((DWORD)co->last_error);
+#else
+    errno = (int)co->last_error;
+#endif
+    plat_switch(co->fiber);
+    g_current = NULL;
 }
 
 
@@ -628,6 +655,7 @@ static int64_t timers_process(void) {
 #ifdef _WIN32
 static void WINAPI co_trampoline(void *p) {
     zan_co_t *co = (zan_co_t *)p;
+    SetLastError(0);
     co->body(co->task);
     co->finished = 1;
     complete_task(co->task, 0);
@@ -642,10 +670,7 @@ static DWORD WINAPI worker_thread_main(LPVOID arg) {
     while (!g_sched_stop) {
         zan_co_t *co = ready_pop_worker(w->id);
         if (co) {
-            co_acquire(co);
-            g_current = co;
-            plat_switch(co->fiber);
-            g_current = NULL;
+            co_switch_to(co);
             if (co->finished) {
                 plat_fiber_delete(co->fiber);
                 free(co);
@@ -672,6 +697,7 @@ static void co_trampoline_posix(unsigned ptr) {
 #if ZAN_ASAN_FIBER
     __sanitizer_finish_switch_fiber(NULL, NULL, NULL);
 #endif
+    errno = 0;
     co->body(co->task);
     co->finished = 1;
     complete_task(co->task, 0);
@@ -686,10 +712,7 @@ static void *worker_thread_main(void *arg) {
     while (!g_sched_stop) {
         zan_co_t *co = ready_pop_worker(w->id);
         if (co) {
-            co_acquire(co);
-            g_current = co;
-            plat_switch(co->fiber);
-            g_current = NULL;
+            co_switch_to(co);
             if (co->finished) {
                 plat_fiber_delete(co->fiber);
                 free(co);
@@ -881,10 +904,7 @@ void zan_sched_run(void) {
         }
 
         if (co) {
-            co_acquire(co);
-            g_current = co;
-            plat_switch(co->fiber);
-            g_current = NULL;
+            co_switch_to(co);
             if (co->finished) {
                 plat_fiber_delete(co->fiber);
                 free(co);
