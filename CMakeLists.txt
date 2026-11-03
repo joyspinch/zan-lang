@@ -2712,7 +2712,10 @@ set(_conf_skip_cases arc_net_publish embed_compress publish_design_embed shard_d
   oom_monitor_fatal oom_timer_delay oom_co_queue_grow
   # B-ID113 stdout 二进制模式钉子：通用 harness 做 CRLF 归一化，恰是本钉
   # 要抓的东西——走 run_stdout_binary.cmake 字节级比对单独注册。
-  stdio_binary_mode)
+  stdio_binary_mode
+  # B-ID76 --checked 全局开关钉：同一源注册两条（默认面走 glob 会撞名），
+  # flag 面必须带 --checked 编译——下方手动 add_test。
+  checked_arith_global)
 
 # 已知会漏的用例：泄漏是**既有的**（stdlib 层的 ARC 欠账，见 TASKS.md A495），
 # 旧世界里它们只红在 full 档的 leakcheck 孪生档上——那条档是发布门控，没人
@@ -2991,6 +2994,24 @@ add_test(NAME case_stdio_binary_mode
     -DSRC=${CMAKE_SOURCE_DIR}/tests/conformance/stdio_binary_mode.zan
     -DOUT_EXE=${CMAKE_CURRENT_BINARY_DIR}/cases/stdio_binary_mode
     -P ${CMAKE_SOURCE_DIR}/tests/run_stdout_binary.cmake)
+
+# B-ID76：--checked 全局算术开关，同一源双面注册——
+# 默认面环绕（glob 跳过此处补注册），flag 面溢出抛 OverflowException。
+add_test(NAME case_checked_arith_default
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/conformance/checked_arith_global.zan
+    -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/checked_arith_global.out
+    -DOUT_EXE=${CMAKE_CURRENT_BINARY_DIR}/cases/checked_arith_default${_exe_ext}
+    -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+add_test(NAME case_checked_arith_flag
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/conformance/checked_arith_global.zan
+    -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/checked_arith_flag.out
+    -DOUT_EXE=${CMAKE_CURRENT_BINARY_DIR}/cases/checked_arith_flag${_exe_ext}
+    "-DZANC_ARGS=--checked"
+    -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
 # datetime_now pins the local wall-clock semantics with a fixed POSIX timezone:
 # EST/EDT with the US 2007+ transition rules, so winter/summer offsets and both

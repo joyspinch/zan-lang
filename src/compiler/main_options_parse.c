@@ -12,6 +12,7 @@
     const char *gen_meta_path = NULL;
     bool do_emit_ir = false;
     int check_leaks_opt = -1;
+    bool checked_arith = false; /* B-ID76：--checked 全局算术溢出守卫 */
     int arc_guard_opt = -1;
     int runtime_checks_opt = -1;
     bool runtime_checks = true;
@@ -89,6 +90,8 @@
         } else if (strcmp(argv[i], "--no-runtime-checks") == 0) {
             runtime_checks_opt = 0;
             runtime_checks = false;
+        } else if (strcmp(argv[i], "--checked") == 0) {
+            checked_arith = true; /* B-ID76：全局算术 checked（C# /checked+） */
         } else if (strcmp(argv[i], "--runtime-checks") == 0) {
             runtime_checks_opt = 1;
             runtime_checks = true;

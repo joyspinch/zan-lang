@@ -67,6 +67,9 @@ static void print_usage(void) {
     fprintf(stderr, "                     over-release net)\n");
     fprintf(stderr, "    --runtime-checks Enable runtime guards (default, including --publish)\n");
     fprintf(stderr, "    --no-runtime-checks  Disable runtime guards (e.g. division by zero)\n");
+    fprintf(stderr, "    --checked        Global checked arithmetic: overflow throws\n");
+    fprintf(stderr, "                     OverflowException (C# /checked+); unchecked(){ }\n");
+    fprintf(stderr, "                     blocks opt out locally\n");
     fprintf(stderr, "    --strict-runtime  Guard failures exit(70); ZAN_RT_HARD=0 forces soft mode\n");
     fprintf(stderr, "    --deny-warnings   Treat compiler warnings as fatal errors\n");
     fprintf(stderr, "    --warn-level <lv> none | default | error (default: default;\n");

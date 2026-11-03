@@ -3378,6 +3378,7 @@ int main(int argc, char **argv) {
     irgen.emit_debug = debug_info;
     irgen.strict_runtime = strict_runtime;
     irgen.publish_mode = publish_mode;
+    irgen.irgen_checked_depth = checked_arith ? 1 : 0; /* B-ID76 */
     irgen.rt_guard_split = !cross_compiling;
     const char *obf_env = getenv("ZAN_OBF");
     const char *no_obf_env = getenv("ZAN_NO_OBF");

@@ -191,6 +191,7 @@ trace 的事件序为准，不要顺着报表的站点名硬找。
 | `--no-arc-guard` | — | 关检疫，同时关掉 `--publish` 默认的 over-release 网 |
 | `--runtime-checks` | **开** | 启用运行时守卫（如数组/切片越界、除零）；发布档也默认开 |
 | `--no-runtime-checks` | — | 关运行时守卫；与 `--runtime-checks` 同现时后写的生效 |
+| `--checked` | 关 | 全局 checked 算术（C# `/checked+` 等价）：全部整型算术溢出抛 `OverflowException`（含 `-` 取负、`++`/`--`、窄化强转）；`unchecked(){ }` 块局部豁免。默认（关）为 C# 默认的 unchecked 环绕语义。钉：`case_checked_arith_default`/`case_checked_arith_flag` |
 | `--strict-runtime` | 关 | 守卫失败直接 `exit(70)`；`ZAN_RT_HARD` 非空且非 `0` 等效；`ZAN_RT_HARD=0` 显式压回软模式 |
 | `--deny-warnings` | 关 | 将编译警告视为致命错误（阻断构建） |
 | `--warn-level <none\|default\|error>` | `default` | `none` 不打印警告；`default` 正常；`error` 等同 `--deny-warnings`；非法值报错退出 2 |
