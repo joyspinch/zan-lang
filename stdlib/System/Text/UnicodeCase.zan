@@ -1,0 +1,167 @@
+using System;
+using System.Text;
+
+namespace System.Text;
+
+// Unicode 国际化大小写折叠与大小写转换（Unicode Standard Annex #44 / Chapter 3: Case Mappings & Case Folding）。
+// 包含 1:1 简单大小写折叠、1:N 完整多字符折叠（Full Case Folding，如德语 'ß' -> "ss"、连字 'ﬁ' -> "fi" 等）、
+// 以及基于 Unicode 规范化的等价比对（防范组合字符与大小写导致的鉴权仿冒越权安全风险）。
+public class UnicodeCase {
+    // 码点级 1:1 简单大小写折叠（二分查找）。
+    public static int FoldCodePointSimple(int cp) {
+        if (cp < 128) {
+            if (cp >= 65 && cp <= 90) { return cp + 32; }
+            return cp;
+        }
+        int lo = 0;
+        int hi = 1425; // UnicodeTables.caseFold1to1.Length / 2 - 1
+        while (lo <= hi) {
+            int mid = (lo + hi) / 2;
+            int mcp = UnicodeTables.caseFold1to1[mid * 2];
+            if (mcp == cp) {
+                return UnicodeTables.caseFold1to1[mid * 2 + 1];
+            }
+            if (mcp < cp) {
+                lo = mid + 1;
+            } else {
+                hi = mid - 1;
+            }
+        }
+        return cp;
+    }
+
+    // 字符串国际化全大小写折叠（Full Case Folding）。
+    // 将不同大小写与特殊等价字符映射到规范小写形式（如 "GROSS" 与 "groß" 折叠后均为 "gross"）。
+    public static string CaseFold(string s) {
+        if (s == null || s.Length == 0) { return s; }
+
+        // 快速 ASCII 扫描
+        bool allAscii = true;
+        int slen = s.Length;
+        for (int i = 0; i < slen; i = i + 1) {
+            if ((s[i] & 255) >= 128) {
+                allAscii = false;
+                break;
+            }
+        }
+        if (allAscii) {
+            return s.ToLowerAscii();
+        }
+
+        StringBuilder sb = new StringBuilder();
+        int idx = 0;
+        while (idx < slen) {
+            long res = Encoding.DecodeCodePointFast(s, idx);
+            int cp = (int)(res & 0xFFFFFFFFL);
+            idx = idx + (int)(res >> 32);
+
+            string multi = UnicodeTables.CaseFoldMulti(cp);
+            if (multi.Length > 0) {
+                sb.Append(multi);
+                continue;
+            }
+
+            int folded = FoldCodePointSimple(cp);
+            sb.Append(Encoding.Utf8FromCodePoint(folded));
+        }
+        return sb.ToString();
+    }
+
+    // 字符串 Unicode 大写转换，包含 1:N 完整扩张（如 'ß' -> "SS"）。
+    public static string ToUpper(string s) {
+        if (s == null || s.Length == 0) { return s; }
+
+        bool allAscii = true;
+        int slen = s.Length;
+        for (int i = 0; i < slen; i = i + 1) {
+            if ((s[i] & 255) >= 128) {
+                allAscii = false;
+                break;
+            }
+        }
+        if (allAscii) {
+            return s.ToUpperAscii();
+        }
+
+        StringBuilder sb = new StringBuilder();
+        int idx = 0;
+        while (idx < slen) {
+            long res = Encoding.DecodeCodePointFast(s, idx);
+            int cp = (int)(res & 0xFFFFFFFFL);
+            idx = idx + (int)(res >> 32);
+
+            string multi = UnicodeTables.ToUpperMulti(cp);
+            if (multi.Length > 0) {
+                sb.Append(multi);
+                continue;
+            }
+
+            int up = char.ToUpper(cp);
+            sb.Append(Encoding.Utf8FromCodePoint(up));
+        }
+        return sb.ToString();
+    }
+
+    // 字符串 Unicode 小写转换。
+    public static string ToLower(string s) {
+        if (s == null || s.Length == 0) { return s; }
+
+        bool allAscii = true;
+        int slen = s.Length;
+        for (int i = 0; i < slen; i = i + 1) {
+            if ((s[i] & 255) >= 128) {
+                allAscii = false;
+                break;
+            }
+        }
+        if (allAscii) {
+            return s.ToLowerAscii();
+        }
+
+        StringBuilder sb = new StringBuilder();
+        int idx = 0;
+        while (idx < slen) {
+            long res = Encoding.DecodeCodePointFast(s, idx);
+            int cp = (int)(res & 0xFFFFFFFFL);
+            idx = idx + (int)(res >> 32);
+
+            int low = char.ToLower(cp);
+            sb.Append(Encoding.Utf8FromCodePoint(low));
+        }
+        return sb.ToString();
+    }
+
+    // 基于 StringComparison 契约的字符串比较。
+    public static bool Equals(string a, string b, StringComparison comparison) {
+        if (a == null && b == null) { return true; }
+        if (a == null || b == null) { return false; }
+
+        switch (comparison) {
+            case StringComparison.Ordinal:
+                return a == b;
+            case StringComparison.OrdinalIgnoreCase:
+            case StringComparison.InvariantCultureIgnoreCase:
+            case StringComparison.CurrentCultureIgnoreCase:
+                return CaseFold(a) == CaseFold(b);
+            default:
+                return a == b;
+        }
+    }
+
+    // Unicode 规范化等价比对（防范组合码点/预混单字符与大小写仿冒）：
+    // 首先进行 NFC 规范化消除组合字符与预组合字符的编码差异，
+    // 若 ignoreCase 为 true，则在规范化形式上执行 CaseFold。
+    public static bool EqualsNormalized(string a, string b, bool ignoreCase) {
+        if (a == null && b == null) { return true; }
+        if (a == null || b == null) { return false; }
+
+        string normA = UnicodeNormalization.Normalize(a, NormalizationForm.FormC);
+        string normB = UnicodeNormalization.Normalize(b, NormalizationForm.FormC);
+
+        if (!ignoreCase) {
+            return normA == normB;
+        }
+
+        return CaseFold(normA) == CaseFold(normB);
+    }
+}

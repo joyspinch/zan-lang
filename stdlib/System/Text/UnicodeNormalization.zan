@@ -1,0 +1,229 @@
+using System;
+using System.Collections.Generic;
+
+namespace System.Text;
+
+// Unicode 规范化实现（Unicode Standard Annex #15: Unicode Normalization Forms）。
+// 支持 Canonical Decomposition（NFD）与 Canonical Composition（NFC），
+// 涵盖完整韩文音节（Hangul Syllables U+AC00..U+D7A3）算法分解/合成、
+// 权威 UnicodeData 规范等价分解、规范组合类（CCC）规范重排序、
+// 以及规范合成与合成排除规则。
+public class UnicodeNormalization {
+    // 获取字符的规范组合类（Canonical Combining Class, CCC）。
+    // 若字符非组合字符（非变音符号），返回 0。
+    public static int GetCombiningClass(int cp) {
+        if (cp < 0x300 || cp > 0x1E2AE) { return 0; }
+        int lo = 0;
+        int hi = 911; // UnicodeTables.ccc.Length / 2 - 1
+        while (lo <= hi) {
+            int mid = (lo + hi) / 2;
+            int mcp = UnicodeTables.ccc[mid * 2];
+            if (mcp == cp) {
+                return UnicodeTables.ccc[mid * 2 + 1];
+            }
+            if (mcp < cp) {
+                lo = mid + 1;
+            } else {
+                hi = mid - 1;
+            }
+        }
+        return 0;
+    }
+
+    // 递归规范分解一个码点到 target 列表中（NFD 阶段 1）。
+    private static void DecomposeRecursive(int cp, List<int> target) {
+        // 1. 韩文算法分解（零查表）
+        if (cp >= 0xAC00 && cp <= 0xD7A3) {
+            int sIndex = cp - 0xAC00;
+            int lIndex = sIndex / 588;
+            int vIndex = (sIndex % 588) / 28;
+            int tIndex = sIndex % 28;
+            target.Add(0x1100 + lIndex);
+            target.Add(0x1161 + vIndex);
+            if (tIndex > 0) {
+                target.Add(0x11A7 + tIndex);
+            }
+            return;
+        }
+
+        // 2. 查表分解（二分查找）
+        int lo = 0;
+        int hi = 2060; // UnicodeTables.decomp.Length / 3 - 1
+        int foundIdx = -1;
+        while (lo <= hi) {
+            int mid = (lo + hi) / 2;
+            int mcp = UnicodeTables.decomp[mid * 3];
+            if (mcp == cp) {
+                foundIdx = mid;
+                break;
+            }
+            if (mcp < cp) {
+                lo = mid + 1;
+            } else {
+                hi = mid - 1;
+            }
+        }
+
+        if (foundIdx >= 0) {
+            int p0 = UnicodeTables.decomp[foundIdx * 3 + 1];
+            int p1 = UnicodeTables.decomp[foundIdx * 3 + 2];
+            // 递归分解（部分字符有多阶组合）
+            DecomposeRecursive(p0, target);
+            if (p1 != 0) {
+                DecomposeRecursive(p1, target);
+            }
+            return;
+        }
+
+        // 无分解：原样添加
+        target.Add(cp);
+    }
+
+    // 规范重排序（Canonical Ordering, NFD 阶段 2）：
+    // 依据 UAX #15，非零 CCC 的组合字符序列必须按 CCC 升序稳定排序。
+    private static void CanonicalSort(List<int> cps) {
+        int len = cps.Count;
+        for (int i = 1; i < len; i = i + 1) {
+            int cccB = GetCombiningClass(cps[i]);
+            if (cccB == 0) { continue; }
+            int j = i - 1;
+            int curr = cps[i];
+            while (j >= 0) {
+                int cccA = GetCombiningClass(cps[j]);
+                if (cccA <= cccB || cccA == 0) {
+                    break;
+                }
+                cps[j + 1] = cps[j];
+                j = j - 1;
+            }
+            cps[j + 1] = curr;
+        }
+    }
+
+    // 查找两字符组合的主合成码点（Canonical Composition）。
+    // 若无法合成或属于 Composition Exclusion，返回 0。
+    public static int GetComposite(int starter, int combiner) {
+        // 1. 韩文算法合成
+        // L + V -> LV
+        if (starter >= 0x1100 && starter <= 0x1112 && combiner >= 0x1161 && combiner <= 0x1175) {
+            int lIndex = starter - 0x1100;
+            int vIndex = combiner - 0x1161;
+            return 0xAC00 + (lIndex * 21 + vIndex) * 28;
+        }
+        // LV + T -> LVT
+        if (starter >= 0xAC00 && starter <= 0xD7A3 && ((starter - 0xAC00) % 28 == 0) &&
+            combiner >= 0x11A8 && combiner <= 0x11C2) {
+            int tIndex = combiner - 0x11A7;
+            return starter + tIndex;
+        }
+
+        // 2. 查表合成（二分查找）
+        long key = ((long)starter << 32) | (long)combiner;
+        int lo = 0;
+        int hi = 940; // UnicodeTables.compKeys.Length - 1
+        while (lo <= hi) {
+            int mid = (lo + hi) / 2;
+            long mk = UnicodeTables.compKeys[mid];
+            if (mk == key) {
+                return UnicodeTables.compValues[mid];
+            }
+            if (mk < key) {
+                lo = mid + 1;
+            } else {
+                hi = mid - 1;
+            }
+        }
+        return 0;
+    }
+
+    // 将字符串规范化为指定的 Unicode 规范化形式（UAX #15）。
+    public static string Normalize(string s, NormalizationForm form) {
+        if (s == null || s.Length == 0) { return s; }
+
+        // 快速检测纯 ASCII：纯 ASCII 字符串在 NFC/NFD 下恒为自身
+        bool allAscii = true;
+        int slen = s.Length;
+        for (int i = 0; i < slen; i = i + 1) {
+            if ((s[i] & 255) >= 128) {
+                allAscii = false;
+                break;
+            }
+        }
+        if (allAscii) { return s; }
+
+        // 步骤 1：规范分解（NFD）
+        List<int> decomposed = new List<int>();
+        int idx = 0;
+        while (idx < slen) {
+            long res = Encoding.DecodeCodePointFast(s, idx);
+            int cp = (int)(res & 0xFFFFFFFFL);
+            DecomposeRecursive(cp, decomposed);
+            idx = idx + (int)(res >> 32);
+        }
+
+        // 步骤 2：规范重排序（Canonical Ordering）
+        CanonicalSort(decomposed);
+
+        // 若请求 NFD，直接编码返回
+        if (form == NormalizationForm.FormD) {
+            StringBuilder sbD = new StringBuilder();
+            int cntD = decomposed.Count;
+            for (int k = 0; k < cntD; k = k + 1) {
+                sbD.Append(Encoding.Utf8FromCodePoint(decomposed[k]));
+            }
+            return sbD.ToString();
+        }
+
+        // 步骤 3：规范合成（NFC）
+        int dlen = decomposed.Count;
+        if (dlen == 0) { return ""; }
+
+        List<int> composed = new List<int>();
+        int starterPos = 0;
+        composed.Add(decomposed[0]);
+        int lastCcc = GetCombiningClass(decomposed[0]);
+        if (lastCcc != 0) {
+            starterPos = -1;
+        }
+
+        for (int i = 1; i < dlen; i = i + 1) {
+            int ch = decomposed[i];
+            int chCcc = GetCombiningClass(ch);
+
+            bool combined = false;
+            if (starterPos >= 0 && (lastCcc < chCcc || lastCcc == 0)) {
+                int st = composed[starterPos];
+                int composite = GetComposite(st, ch);
+                if (composite != 0) {
+                    composed[starterPos] = composite;
+                    combined = true;
+                }
+            }
+
+            if (!combined) {
+                if (chCcc == 0) {
+                    starterPos = composed.Count;
+                    composed.Add(ch);
+                    lastCcc = 0;
+                } else {
+                    composed.Add(ch);
+                    lastCcc = chCcc;
+                }
+            }
+        }
+
+        StringBuilder sbC = new StringBuilder();
+        int cntC = composed.Count;
+        for (int m = 0; m < cntC; m = m + 1) {
+            sbC.Append(Encoding.Utf8FromCodePoint(composed[m]));
+        }
+        return sbC.ToString();
+    }
+
+    // 判断字符串是否已符合指定的 Unicode 规范化形式。
+    public static bool IsNormalized(string s, NormalizationForm form) {
+        if (s == null) { return true; }
+        string norm = Normalize(s, form);
+        return norm == s;
+    }
+}
