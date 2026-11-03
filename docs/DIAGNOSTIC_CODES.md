@@ -338,7 +338,6 @@
 | E3084 | E | goto '%.*s' leaves %d finally/lock region(s) whose exits cannot be run -- restructure with break/return |
 | E3085 | E | goto '%.*s' jumps into a finally body |
 | E3086 | E | a rethrow (`throw;`) is only valid inside a catch block |
-| E3087 | E | an async method cannot return an aggregate type: the coroutine result slot is one machine word |
 | E3088 | E | no matching %s constructor with %d argument(s) |
 | E3089 | E | LLVM function compactor initialization failed: %s |
 | E3090 | E | LLVM verification failed%s%s: %s |

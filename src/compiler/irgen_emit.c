@@ -737,14 +737,10 @@ static void declare_async_method(zan_irgen_t *g, method_body_work_t *w,
             ret_type = concretize(g, ret_type->type_args[0]);
             is_task = true;
         }
-        if (!is_task && raw_ret && raw_ret->kind != TYPE_VOID) {
-            LLVMTypeRef art = map_type(g, raw_ret);
-            if (art && LLVMGetTypeKind(art) == LLVMStructTypeKind) {
-                zan_diag_emit_code(g->diag, DIAG_ERROR, member->loc, 3087,
-                              "an async method cannot return an aggregate type: "
-                              "the coroutine result slot is one machine word");
-            }
-        }
+        /* B-ID64：非 Task 聚合 async 返回（`async Big M()`）随类型化返回值字段
+         * 解禁——E3087"结果槽只有一个机器字"的限制在帧尾 RVAL 槽落地后失去
+         * 依据：聚合返回存 RVAL、RESULT 槽承载槽地址，await 按值拷出、
+         * fire-and-forget 走 co.orphan 按类型释放。 */
         LLVMTypeRef lret = map_type(g, ret_type);
         bool is_agg_ret = (lret && LLVMGetTypeKind(lret) == LLVMStructTypeKind);
         /* B-ID64 类型化返回值字段：凡非 void 返回一律在帧尾挂 RVAL 槽（此前
