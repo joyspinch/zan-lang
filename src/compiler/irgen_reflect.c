@@ -1,4 +1,5 @@
 
+#define ZAN_REFL_FULLNAME_OFF (-112) /* B-ID107：头部 i8ptr，尾部倒数 OFF 不变 */
 #define ZAN_REFL_ATTRS_OFF   (-104)
 #define ZAN_REFL_TABLE_OFF   (-96)
 #define ZAN_REFL_METHODS_OFF (-88)
@@ -1029,6 +1030,48 @@ static const char *refl_find_table_attr(zan_symbol_t *sym) {
     return NULL;
 }
 
+/* B-ID107：短名渲染——与 render_type_full 同构但不注入命名空间前缀，
+ * 顶层与泛型实参一律剥 ns（List<Ns.Foo> -> List<Foo>），对齐 C# Name 契约 */
+static int render_type_short(zan_type_t *t, char *buf, int cap) {
+    if (!t || cap <= 1) return 0;
+    int n = 0;
+    if (t->kind == TYPE_ARRAY && t->element_type) {
+        n = render_type_short(t->element_type, buf, cap);
+        if (n < cap - 1) {
+            buf[n++] = '[';
+            for (int r = 1; r < (t->array_rank > 1 ? t->array_rank : 1); r++)
+                if (n < cap - 1) buf[n++] = ',';
+            if (n < cap - 1) buf[n++] = ']';
+        }
+        if (n < cap) buf[n] = '\0';
+        return n;
+    }
+    if (t->kind == TYPE_NULLABLE && t->element_type) {
+        n = render_type_short(t->element_type, buf, cap);
+        if (n < cap - 1) buf[n++] = '?';
+        if (n < cap) buf[n] = '\0';
+        return n;
+    }
+    if (t->name.len) {
+        int w = (int)t->name.len;
+        if (w > cap - n - 1) w = cap - n - 1;
+        memcpy(buf + n, t->name.str, (size_t)w);
+        n += w;
+    } else if (n < cap - 1) {
+        buf[n++] = '?';
+    }
+    if (t->type_arg_count > 0 && n < cap - 2) {
+        buf[n++] = '<';
+        for (int i = 0; i < t->type_arg_count && n < cap - 2; i++) {
+            if (i) buf[n++] = ',';
+            n += render_type_short(t->type_args[i], buf + n, cap - n);
+        }
+        if (n < cap - 1) buf[n++] = '>';
+    }
+    if (n < cap) buf[n] = '\0';
+    return n;
+}
+
 static LLVMValueRef refl_meta_for(zan_irgen_t *g, zan_type_t *t,
                                   const char *disp, int disp_len) {
     char namebuf[256];
@@ -1041,6 +1084,16 @@ static LLVMValueRef refl_meta_for(zan_irgen_t *g, zan_type_t *t,
         }
         disp = namebuf;
         disp_len = n;
+    }
+    /* B-ID107：blob 名槽存短名（Name/TableName 兜底），FullName 另存 -112 槽，
+     * 去重键维持全名（metas[].name 仍存 disp） */
+    char shortbuf[256];
+    int sn = render_type_short(t, shortbuf, sizeof(shortbuf));
+    if (sn <= 0) {
+        if (disp_len > (int)sizeof(shortbuf) - 1) disp_len = (int)sizeof(shortbuf) - 1;
+        memcpy(shortbuf, disp, (size_t)disp_len);
+        shortbuf[disp_len] = 0;
+        sn = disp_len;
     }
     zan_symbol_t *sym = t ? t->sym : NULL;
     for (int i = 0; i < g->refl_meta_count; i++) {
@@ -1073,13 +1126,14 @@ static LLVMValueRef refl_meta_for(zan_irgen_t *g, zan_type_t *t,
     const char *tbl_name = refl_find_table_attr(sym);
     LLVMValueRef tbl_val = tbl_name
         ? refl_const_string(g, tbl_name, (int)strlen(tbl_name))
-        : refl_const_string(g, disp, disp_len);
+        : refl_const_string(g, shortbuf, sn);
 
     LLVMTypeRef rec_ty = LLVMStructTypeInContext(g->ctx, (LLVMTypeRef[]){
+        i8ptr, /* full_name (-112) B-ID107 */
         i8ptr, /* type_attrs (-104) */
         i8ptr, /* table_name (-96) */
         i8ptr, i64, i8ptr, i64, i8ptr, i8ptr, i8ptr, i64, i64, i64, i64,
-        LLVMArrayType(i8, (unsigned)(disp_len + 1)) }, 14, 0);
+        LLVMArrayType(i8, (unsigned)(sn + 1)) }, 15, 0);
     char nm[128];
     snprintf(nm, sizeof(nm), "__zan.refl.type.%d", g->refl_meta_count);
     LLVMValueRef gv = LLVMAddGlobal(g->mod, rec_ty, nm);
@@ -1087,7 +1141,7 @@ static LLVMValueRef refl_meta_for(zan_irgen_t *g, zan_type_t *t,
     LLVMSetLinkage(gv, LLVMPrivateLinkage);
     LLVMSetGlobalConstant(gv, 1);
     LLVMSetAlignment(gv, 8);
-    LLVMValueRef idx[3] = { LLVMConstInt(i64, 0, 0), LLVMConstInt(i32, 13, 0),
+    LLVMValueRef idx[3] = { LLVMConstInt(i64, 0, 0), LLVMConstInt(i32, 14, 0),
                             LLVMConstInt(i64, 0, 0) };
     LLVMValueRef rec = LLVMConstGEP2(rec_ty, gv, idx, 3);
 
@@ -1151,13 +1205,14 @@ static LLVMValueRef refl_meta_for(zan_irgen_t *g, zan_type_t *t,
         }
     }
 
-    LLVMValueRef *chars = (LLVMValueRef *)calloc((size_t)disp_len + 1,
+    LLVMValueRef *chars = (LLVMValueRef *)calloc((size_t)sn + 1,
                                                 sizeof(LLVMValueRef));
     if (!chars) return rec;
-    for (int i = 0; i < disp_len; i++)
-        chars[i] = LLVMConstInt(i8, (unsigned char)disp[i], 0);
-    chars[disp_len] = LLVMConstInt(i8, 0, 0);
+    for (int i = 0; i < sn; i++)
+        chars[i] = LLVMConstInt(i8, (unsigned char)shortbuf[i], 0);
+    chars[sn] = LLVMConstInt(i8, 0, 0);
     LLVMSetInitializer(gv, LLVMConstNamedStruct(rec_ty, (LLVMValueRef[]){
+        refl_const_string(g, disp, disp_len), /* FullName（B-ID107） */
         tattr_val,
         tbl_val,
         methods,
@@ -1170,8 +1225,8 @@ static LLVMValueRef refl_meta_for(zan_irgen_t *g, zan_type_t *t,
         LLVMConstInt(i64, (unsigned long long)field_count, 0),
         LLVMConstInt(i64, (unsigned long long)refl_type_kind(t), 0),
         LLVMConstInt(i64, ZAN_STRING_SENTINEL_RC, 0),
-        LLVMConstInt(i64, ZAN_STR_HDR_WORD(disp_len), 0),
-        LLVMConstArray(i8, chars, (unsigned)(disp_len + 1)) }, 14));
+        LLVMConstInt(i64, ZAN_STR_HDR_WORD(sn), 0),
+        LLVMConstArray(i8, chars, (unsigned)(sn + 1)) }, 15));
     free(chars);
     return rec;
 }
@@ -2795,6 +2850,9 @@ static bool refl_emit_typeinfo_member(zan_irgen_t *g, LLVMValueRef ti,
     switch (code) {
     case ZAN_REFL_M_NAME:
         *out = ti;
+        return true;
+    case ZAN_REFL_M_FULLNAME: /* B-ID107：全限定名，-112 槽 */
+        *out = refl_hdr_ptr(g, ti, ZAN_REFL_FULLNAME_OFF, "refl.full");
         return true;
     case ZAN_REFL_M_TABLENAME:
         *out = refl_hdr_ptr(g, ti, ZAN_REFL_TABLE_OFF, "refl.tbl");

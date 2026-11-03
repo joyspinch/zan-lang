@@ -56,6 +56,7 @@
 #define ZAN_REFL_M_FATTRS     51   /* TypeInfo.GetFieldCustomAttributes(i) -> string */
 #define ZAN_REFL_M_TATTRS     52   /* TypeInfo.GetCustomAttributes()       -> string */
 #define ZAN_REFL_M_MATTRS     60   /* TypeInfo.GetMethodCustomAttributes(i) -> string */
+#define ZAN_REFL_M_FULLNAME   61   /* TypeInfo.FullName       -> string（B-ID107） */
 #define ZAN_REFL_M_FIGNORED    53   /* TypeInfo.IsFieldIgnored(i)     -> bool */
 #define ZAN_REFL_M_FREQUIRED   54   /* TypeInfo.IsFieldRequired(i)    -> bool */
 #define ZAN_REFL_M_FDEFAULT    55   /* TypeInfo.GetFieldDefault(i)    -> string */
@@ -72,6 +73,7 @@ static inline bool zan_refl_is_typeinfo(const zan_type_t *t) {
 static inline bool zan_refl_typeinfo_member(zan_istr_t n, int *out) {
     static const struct { const char *name; int len; int code; } tbl[] = {
         { "Name",              4,  ZAN_REFL_M_NAME },
+        { "FullName",          8,  ZAN_REFL_M_FULLNAME },
         { "Kind",              4,  ZAN_REFL_M_KIND },
         { "FieldCount",       10,  ZAN_REFL_M_FCOUNT },
         { "GetFieldName",     12,  ZAN_REFL_M_FNAME },
@@ -230,6 +232,7 @@ static inline int zan_refl_member_max_args(int code) {
 static inline zan_type_t *zan_refl_result_type(zan_binder_t *b, int code) {
     switch (code) {
     case ZAN_REFL_M_NAME:
+    case ZAN_REFL_M_FULLNAME:
     case ZAN_REFL_M_KIND:
     case ZAN_REFL_M_FNAME:
     case ZAN_REFL_M_FTYPE:

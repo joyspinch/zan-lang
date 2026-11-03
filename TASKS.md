@@ -12,7 +12,7 @@
 
 ### 批次 0 · 在飞（持有会话未提交；其他会话勿碰同文件）
 
-- [ ] B-ID107〔在飞 · irgen_reflect.c + reflect_api.h，2026-11-03 09:25 实时改动中〕TypeInfo.Name 返回全限定名打穿 ORM 默认表名与 Json 类型判断（f896826d3 原生反射世界）：irgen_reflect.c refl_meta_for 的 blob name 槽存全名（兼去重键），ZAN_REFL_M_NAME 直接回该串——`tbl = ti.Name` 拿到 `Game.Arpg.Data.ArpgSaveSlotEntity` 拼 CREATE TABLE 报 sqlite 语法错（case_arpg_save_repository 红，基线同红）；JsonSerializer.IsListType 按短名前缀 `List<` 匹配同样失真。修法方向：契约对齐 C#（Name=短名另给 FullName），blob 去重键与 name 槽分离；或维持全名补 ShortName 并迁移 Zan.Data/Zan.Json 消费点。
+- [ ] B-ID107 TypeInfo.Name 返回全限定名打穿 ORM 默认表名与 Json 类型判断契约对齐——selfhost 镜像同步余项：C11 侧已闭（Name=短名/FullName=-112 槽/TableName 兜底短名，去重键维持全名；conformance refl_name_fullname，case_arpg_save_repository 转绿，反射三钉金标随契约翻转更新，ORM 族 16 绿；git 历史）。余：src/selfhost/ngen_reflect.zan 镜像 name 槽仍存全名（TypeFullName），待 B-ID109 自举链闭环后同法同步并验证。
 
 ### 批次 1 · 根修项（闭它解锁下游，优先领）
 
@@ -41,7 +41,7 @@
 ### 批次 3 · 有前置（前置闭了再领）
 
 - [ ] B-ID59〔前置 B-ID63〕ORM 查询链泛型推断断裂（E2108 泛型不变性）：`ToList<RouteStat>(a => new RouteStat {...})` 等链式投影报 cannot convert；余（2026-11-03 实测收敛）：case_orm_group_aggregate（E2108 三处投影）与 case_linq_and_zandb_opt（运行期零输出 access violation，接手先 _scratch 直执行定位）两案；orm/linq 族其余、generic_base_dao_orm、diag_orm 三例全绿（原"orm 族 ~20 案红"过时）；根修归 B-ID63（方差/泛型环境）。已修片段见 git 历史（diag_orm 三例、E2030 皮下钩）。
-- [ ] B-ID60〔串行前置 B-ID107 落地 · 同改 irgen_reflect.c〕反射元数据特性体系重构（解耦硬编码字符串）：`irgen_reflect.c` 与 selfhost 镜像目前以 `memcmp` 硬编码匹配有限特性名（Key/Required/NotMapped），命名参数与参数化属性（如 `[Column(IsPrimary = true)]`）无法进入元数据位表。需重构为结构化特性元数据流（Metadata Blob），支持反射面读取完整参数并保留 C11/selfhost 1:1 对齐。
+- [ ] B-ID60 反射元数据特性体系重构（解耦硬编码字符串）：`irgen_reflect.c` 与 selfhost 镜像目前以 `memcmp` 硬编码匹配有限特性名（Key/Required/NotMapped），命名参数与参数化属性（如 `[Column(IsPrimary = true)]`）无法进入元数据位表。需重构为结构化特性元数据流（Metadata Blob），支持反射面读取完整参数并保留 C11/selfhost 1:1 对齐。
 - [ ] B-ID62〔软前置 B-ID102〕语言内置原语与方法横截重构：`irgen_call_builtins.c` 现存 3200+ 行根据方法名字符串横截调用（nameof/GetValueOrDefault/ToString 等），易与用户自定义符号或重载产生意外冲突。需演进为标准库 `[Intrinsic]` 符号级绑定分发机制，checker 期绑定符号而非 irgen 字符串匹配，C11 与 selfhost 差分保持一致。
 - [ ] B-ID65〔前置 B-ID64（异步泄漏半）；表达式树/ON CONFLICT 半无前置可先行〕ORM 强类型表达式树与复合主键支持：余：只读表达式树（Expression Tree）AST 节点体系及 SQL 访问者（Visitor）翻译管线（复合主键 ON CONFLICT 下推）；异步仓储帧捕获链未随任务终结释放（退出 52 对象仍可达：Meta 静态单例链 + 连接内部集合，同步形态零泄漏）。红案面（2026-11-03 实测）：case_orm_upsert——`.OnConflict(a => new { a.minute, a.method, a.path })` 匿名对象键报 E3023（皮下钩只认 GroupBy/ToList/ToAggregate），即 ON CONFLICT 下推未落地的 conformance 直钉。bool-lambda Where/Delete/Update 语义已修见 git 历史。
 - [ ] B-ID72〔前置 B-ID75（先有 PAL 目录结构再迁入）〕宽字符与文本封送跨平台断裂（Wide.zan 强绑 kernel32）：`stdlib/System/Interop/Wide.zan` 无条件 `[DllImport("kernel32")]` 导入 Win32 API 且写死 2 字节 UTF-16 假定，在 Linux/macOS 上直接崩毁，且违背 POSIX 4 字节 wchar_t 规范。需抽象为支持 POSIX iconv / mbstowcs 与 Windows 多分发的跨平台文本封送器；双轨同步。
