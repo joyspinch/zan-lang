@@ -1,0 +1,185 @@
+using System;
+using System.Security.Cryptography;
+using Zan.Web3.Types;
+using Zan.Web3.Encoding;
+
+namespace Zan.Web3.Rpc;
+
+// RPC 传输驱动抽象接口（允许在真实网络传输与离线单元测试仿真之间无缝切换）
+public interface IRpcTransport {
+    string Send(string host, int port, bool useTls, string path, string body);
+}
+
+// 模拟测试与离线回放用的 RPC 传输驱动
+public class MockRpcTransport : IRpcTransport {
+    public string MockResponse = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":\"0x10\"}";
+    public string LastSentBody = "";
+
+    public string Send(string host, int port, bool useTls, string path, string body) {
+        LastSentBody = body;
+        return MockResponse;
+    }
+}
+
+// 以太坊与 Web3 JSON-RPC 高阶客户端，封装节点通信、错误处理、类型转换与智能合约只读调用。
+public class Web3Client {
+
+    public string RpcUrl;
+    public string Host;
+    public int Port;
+    public bool UseTls;
+    public string Path;
+    public IRpcTransport Transport;
+
+    private int _requestId = 1;
+
+    public Web3Client(string rpcUrl) {
+        RpcUrl = rpcUrl != null ? rpcUrl : "http://127.0.0.1:8545";
+        Transport = new MockRpcTransport(); // 默认传输器
+        parseUrl(RpcUrl);
+    }
+
+    public Web3Client(string rpcUrl, IRpcTransport transport) {
+        RpcUrl = rpcUrl != null ? rpcUrl : "http://127.0.0.1:8545";
+        Transport = transport != null ? transport : new MockRpcTransport();
+        parseUrl(RpcUrl);
+    }
+
+    // 解析标准 HTTP / HTTPS RPC URL
+    private void parseUrl(string url) {
+        string u = url.Trim();
+        if (u.StartsWith("https://") || u.StartsWith("HTTPS://")) {
+            UseTls = true;
+            Port = 443;
+            u = u.Substring(8);
+        } else if (u.StartsWith("http://") || u.StartsWith("HTTP://")) {
+            UseTls = false;
+            Port = 8545;
+            u = u.Substring(7);
+        } else {
+            UseTls = false;
+            Port = 8545;
+        }
+
+        int slashIdx = u.IndexOf("/");
+        if (slashIdx >= 0) {
+            Host = u.Substring(0, slashIdx);
+            Path = u.Substring(slashIdx);
+        } else {
+            Host = u;
+            Path = "/";
+        }
+
+        int colonIdx = Host.IndexOf(":");
+        if (colonIdx >= 0) {
+            string portStr = Host.Substring(colonIdx + 1);
+            Host = Host.Substring(0, colonIdx);
+            // 简单解析端口号
+            int p = 0;
+            for (int i = 0; i < portStr.Length; i = i + 1) {
+                int c = portStr[i] - 48;
+                if (c >= 0 && c <= 9) { p = p * 10 + c; }
+            }
+            if (p > 0) { Port = p; }
+        }
+    }
+
+    // 十六进制字符串转为 long 整数（处理形如 "0x1b4" 或 "0x0"）
+    public static long HexToLong(string hex) {
+        if (hex == null) { return 0; }
+        string clean = hex.Trim();
+        if (clean.StartsWith("0x") || clean.StartsWith("0X")) {
+            clean = clean.Substring(2);
+        }
+        if (clean.Length == 0) { return 0; }
+        long val = 0;
+        for (int i = 0; i < clean.Length; i = i + 1) {
+            int c = clean[i] & 255;
+            int digit = 0;
+            if (c >= 48 && c <= 57) { digit = c - 48; }
+            else if (c >= 97 && c <= 102) { digit = c - 97 + 10; }
+            else if (c >= 65 && c <= 70) { digit = c - 65 + 10; }
+            val = (val << 4) | (long)digit;
+        }
+        return val;
+    }
+
+    // 从 JSON 响应文本中提取 "result" 字段的值（去除外层引号）
+    public static string ExtractResult(string jsonResponse) {
+        if (jsonResponse == null) { return ""; }
+        string tag = "\"result\":";
+        int idx = jsonResponse.IndexOf(tag);
+        if (idx < 0) { return ""; }
+        int start = idx + tag.Length;
+        while (start < jsonResponse.Length && (jsonResponse[start] == ' ' || jsonResponse[start] == '\t')) {
+            start = start + 1;
+        }
+        if (start >= jsonResponse.Length) { return ""; }
+
+        if (jsonResponse[start] == '\"') {
+            start = start + 1;
+            int end = jsonResponse.IndexOf("\"", start);
+            if (end < 0) { return ""; }
+            return jsonResponse.Substring(start, end - start);
+        }
+
+        // 非字符串字面量（如数字或布尔）
+        int endNonStr = start;
+        while (endNonStr < jsonResponse.Length && jsonResponse[endNonStr] != ',' && jsonResponse[endNonStr] != '}' && jsonResponse[endNonStr] != ']') {
+            endNonStr = endNonStr + 1;
+        }
+        return jsonResponse.Substring(start, endNonStr - start).Trim();
+    }
+
+    // 发送基础 JSON-RPC 请求并返回提取后的结果字符串
+    public string SendRpc(string method, string paramsJson) {
+        int id = _requestId;
+        _requestId = _requestId + 1;
+        string reqJson = JsonRpcBuilder.BuildRequest(method, paramsJson, id);
+        string respJson = Transport.Send(Host, Port, UseTls, Path, reqJson);
+        return ExtractResult(respJson);
+    }
+
+    // 获取当前最新区块高度
+    public long GetBlockNumber() {
+        string res = SendRpc("eth_blockNumber", "[]");
+        return HexToLong(res);
+    }
+
+    // 查询账户以太币余额 (Wei)
+    public BigInt GetBalance(Address address, string blockTag) {
+        string addrHex = address != null ? address.ToLowerHex() : "0x0000000000000000000000000000000000000000";
+        string tag = (blockTag != null && blockTag.Length > 0) ? blockTag : "latest";
+        string res = SendRpc("eth_getBalance", "[\"" + addrHex + "\",\"" + tag + "\"]");
+        return Abi.DecodeUint256(res);
+    }
+
+    // 查询账户当前确认的交易笔数 (Nonce)
+    public long GetTransactionCount(Address address, string blockTag) {
+        string addrHex = address != null ? address.ToLowerHex() : "0x0000000000000000000000000000000000000000";
+        string tag = (blockTag != null && blockTag.Length > 0) ? blockTag : "latest";
+        string res = SendRpc("eth_getTransactionCount", "[\"" + addrHex + "\",\"" + tag + "\"]");
+        return HexToLong(res);
+    }
+
+    // 执行智能合约只读调用 (eth_call)
+    public string Call(Address to, string dataHex, string blockTag) {
+        string toHex = to != null ? to.ToLowerHex() : "0x0000000000000000000000000000000000000000";
+        string tag = (blockTag != null && blockTag.Length > 0) ? blockTag : "latest";
+        string callObj = "{\"to\":\"" + toHex + "\",\"data\":\"" + dataHex + "\"}";
+        return SendRpc("eth_call", "[" + callObj + ",\"" + tag + "\"]");
+    }
+
+    // 广播已签名的原始交易十六进制字符串，返回交易哈希 (txHash)
+    public string SendRawTransaction(string rawTxHex) {
+        return SendRpc("eth_sendRawTransaction", "[\"" + rawTxHex + "\"]");
+    }
+
+    // 查询 ERC-20 代币余额
+    public BigInt CallErc20BalanceOf(Address tokenContract, Address account) {
+        byte[] calldata = Abi.EncodeErc20BalanceOf(account);
+        string calldataHex = "0x" + Hex.Encode(calldata, calldata.Length);
+        string resHex = Call(tokenContract, calldataHex, "latest");
+        return Abi.DecodeUint256(resHex);
+    }
+}
