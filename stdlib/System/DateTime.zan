@@ -39,6 +39,12 @@ public class DateTime {
     public static extern long plat_timegm(nint tm);
     #endif
 
+    [DllImport("crt", EntryPoint = "zan_time_epoch_ms")]
+    public static extern long zan_time_epoch_ms();
+
+    [DllImport("crt", EntryPoint = "zan_time_local_offset_minutes")]
+    public static extern int zan_time_local_offset_minutes(long unixSeconds);
+
     // 自 1970-01-01T00:00:00Z 以来的毫秒数。
     public long epochMs;
     // 自 1970-01-01T00:00:00Z 以来的秒数。
@@ -60,37 +66,9 @@ public class DateTime {
     // 星期几，0=星期日 .. 6=星期六。
     public int dayOfWeek;
 
-    // 内部精确获取当前系统 Unix 纪元毫秒。
+    // 内部精确获取当前系统 Unix 纪元毫秒（零分配原生栈上调用）。
     public static long GetCurrentUnixMilliseconds() {
-        #if WINDOWS
-        nint p = NativeMemory.Alloc(8);
-        long ft = 0;
-        try {
-            GetSystemTimeAsFileTime(p);
-            ft = new Span<long>(p, 1)[0];
-        } finally {
-            NativeMemory.Free(p);
-        }
-        // 100ns 刻度折算为毫秒，减去 1601 到 1970 偏移 (11644473600000 ms)
-        return (ft / 10000) - 11644473600000;
-        #else
-        nint ts = NativeMemory.Alloc(16);
-        long ms = 0;
-        try {
-            // CLOCK_REALTIME = 0 on POSIX
-            int r = clock_gettime(0, ts);
-            if (r == 0) {
-                long sec = new Span<long>(ts, 1)[0];
-                long nsec = new Span<long>(ts + 8, 1)[0];
-                ms = sec * 1000 + (nsec / 1000000);
-            } else {
-                ms = time(0) * 1000;
-            }
-        } finally {
-            NativeMemory.Free(ts);
-        }
-        return ms;
-        #endif
+        return zan_time_epoch_ms();
     }
 
     // 根据 Unix 时间戳（秒，UTC）构造时刻（毫秒置 0）。
@@ -154,43 +132,9 @@ public class DateTime {
     // 本机时区在 <paramref name="unixSeconds"/> 这一时刻相对 UTC 的偏移
     // （分钟，东为正，如东八区 480），含该时刻是否处于夏令时。
     // 时区信息不可用时返回 0（等同 UTC）。
-    // 平台能力集中在 <c>plat_localtime</c>/<c>plat_timegm</c> 两处
-    // DllImport（Windows 的 _localtime64_s/_mkgmtime、POSIX 的
-    // localtime_r/timegm），时区数据由操作系统提供（Windows 注册表 /
-    // POSIX 的 TZ 与 /usr/share/zoneinfo）；本类不内置 IANA 时区库。
+    // 经由 C 运行时栈上 struct tm 与 localtime_r/_localtime64_s 极速计算，零堆内存分配。
     public static int LocalOffsetMinutesAt(long unixSeconds) {
-        nint tbuf = NativeMemory.Alloc(8);
-        nint tm = 0;
-        bool ok = false;
-        try {
-            new Span<long>(tbuf, 1)[0] = unixSeconds;
-            // struct tm 布局平台各异（glibc/Darwin 56 字节、MSVC 36 字节），
-            // 给 128 字节清零缓冲；读端只经 plat_timegm（libc 自己解释布局）。
-            tm = NativeMemory.Alloc(128);
-            NativeMemory.Fill(tm, 0, 128);
-            #if WINDOWS
-            ok = plat_localtime(tm, tbuf) == 0;
-            #else
-            ok = plat_localtime(tbuf, tm) != 0;
-            #endif
-        } finally {
-            NativeMemory.Free(tbuf);
-        }
-
-        if (!ok || tm == 0) {
-            if (tm != 0) { NativeMemory.Free(tm); }
-            return 0;
-        }
-
-        long wall = 0;
-        try {
-            wall = plat_timegm(tm);
-        } finally {
-            NativeMemory.Free(tm);
-        }
-
-        if (wall == 0 - 1) { return 0; }
-        return (int)((wall - unixSeconds) / 60);
+        return zan_time_local_offset_minutes(unixSeconds);
     }
 
     // 本机时区当前相对 UTC 的偏移（分钟，东为正）。
@@ -349,28 +293,94 @@ public class DateTime {
 
     // ---- 格式化 -------------------------------------------------------
 
-    // 类 ISO 文本："YYYY-MM-DD HH:MM:SS"。
+    // 类 ISO 文本："YYYY-MM-DD HH:MM:SS"（19 字节缓冲区直填，零中间字符串分配）。
     public string ToString() {
-        return "" + year + "-" + Pad2(month) + "-" + Pad2(day) + " " +
-               Pad2(hour) + ":" + Pad2(minute) + ":" + Pad2(second);
+        byte[] buf = new byte[19];
+        int y = year < 0 ? 0 - year : year;
+        buf[0] = (byte)(48 + (y / 1000) % 10);
+        buf[1] = (byte)(48 + (y / 100) % 10);
+        buf[2] = (byte)(48 + (y / 10) % 10);
+        buf[3] = (byte)(48 + y % 10);
+        buf[4] = 45; // '-'
+        buf[5] = (byte)(48 + (month / 10));
+        buf[6] = (byte)(48 + (month % 10));
+        buf[7] = 45; // '-'
+        buf[8] = (byte)(48 + (day / 10));
+        buf[9] = (byte)(48 + (day % 10));
+        buf[10] = 32; // ' '
+        buf[11] = (byte)(48 + (hour / 10));
+        buf[12] = (byte)(48 + (hour % 10));
+        buf[13] = 58; // ':'
+        buf[14] = (byte)(48 + (minute / 10));
+        buf[15] = (byte)(48 + (minute % 10));
+        buf[16] = 58; // ':'
+        buf[17] = (byte)(48 + (second / 10));
+        buf[18] = (byte)(48 + (second % 10));
+        return buf.ToStr(0, 19);
     }
 
-    // 带毫秒的类 ISO 文本："YYYY-MM-DD HH:MM:SS.fff"。
+    // 带毫秒的类 ISO 文本："YYYY-MM-DD HH:MM:SS.fff"（23 字节缓冲区直填）。
     public string ToStringWithMillis() {
-        string msStr = Convert.ToString(millisecond);
-        if (millisecond < 10) { msStr = "00" + msStr; }
-        else if (millisecond < 100) { msStr = "0" + msStr; }
-        return this.ToString() + "." + msStr;
+        byte[] buf = new byte[23];
+        int y = year < 0 ? 0 - year : year;
+        buf[0] = (byte)(48 + (y / 1000) % 10);
+        buf[1] = (byte)(48 + (y / 100) % 10);
+        buf[2] = (byte)(48 + (y / 10) % 10);
+        buf[3] = (byte)(48 + y % 10);
+        buf[4] = 45; // '-'
+        buf[5] = (byte)(48 + (month / 10));
+        buf[6] = (byte)(48 + (month % 10));
+        buf[7] = 45; // '-'
+        buf[8] = (byte)(48 + (day / 10));
+        buf[9] = (byte)(48 + (day % 10));
+        buf[10] = 32; // ' '
+        buf[11] = (byte)(48 + (hour / 10));
+        buf[12] = (byte)(48 + (hour % 10));
+        buf[13] = 58; // ':'
+        buf[14] = (byte)(48 + (minute / 10));
+        buf[15] = (byte)(48 + (minute % 10));
+        buf[16] = 58; // ':'
+        buf[17] = (byte)(48 + (second / 10));
+        buf[18] = (byte)(48 + (second % 10));
+        buf[19] = 46; // '.'
+        int ms = millisecond;
+        if (ms < 0) { ms = 0; }
+        if (ms > 999) { ms = 999; }
+        buf[20] = (byte)(48 + (ms / 100));
+        buf[21] = (byte)(48 + ((ms / 10) % 10));
+        buf[22] = (byte)(48 + (ms % 10));
+        return buf.ToStr(0, 23);
     }
 
-    // 仅日期："YYYY-MM-DD"。
+    // 仅日期："YYYY-MM-DD"（10 字节缓冲区直填）。
     public string ToDateString() {
-        return "" + year + "-" + Pad2(month) + "-" + Pad2(day);
+        byte[] buf = new byte[10];
+        int y = year < 0 ? 0 - year : year;
+        buf[0] = (byte)(48 + (y / 1000) % 10);
+        buf[1] = (byte)(48 + (y / 100) % 10);
+        buf[2] = (byte)(48 + (y / 10) % 10);
+        buf[3] = (byte)(48 + y % 10);
+        buf[4] = 45;
+        buf[5] = (byte)(48 + (month / 10));
+        buf[6] = (byte)(48 + (month % 10));
+        buf[7] = 45;
+        buf[8] = (byte)(48 + (day / 10));
+        buf[9] = (byte)(48 + (day % 10));
+        return buf.ToStr(0, 10);
     }
 
-    // 仅时间："HH:MM:SS"。
+    // 仅时间："HH:MM:SS"（8 字节缓冲区直填）。
     public string ToTimeString() {
-        return Pad2(hour) + ":" + Pad2(minute) + ":" + Pad2(second);
+        byte[] buf = new byte[8];
+        buf[0] = (byte)(48 + (hour / 10));
+        buf[1] = (byte)(48 + (hour % 10));
+        buf[2] = 58;
+        buf[3] = (byte)(48 + (minute / 10));
+        buf[4] = (byte)(48 + (minute % 10));
+        buf[5] = 58;
+        buf[6] = (byte)(48 + (second / 10));
+        buf[7] = (byte)(48 + (second % 10));
+        return buf.ToStr(0, 8);
     }
 
     // 解析严格的 "YYYY-MM-DD" 为当天 00:00:00；长度、分隔符或
@@ -500,16 +510,9 @@ public class DateTime {
 
     // 十进制数字字符的值，非数字返回 -1。
     public static int Digit(string c) {
-        if (c == "0") { return 0; }
-        if (c == "1") { return 1; }
-        if (c == "2") { return 2; }
-        if (c == "3") { return 3; }
-        if (c == "4") { return 4; }
-        if (c == "5") { return 5; }
-        if (c == "6") { return 6; }
-        if (c == "7") { return 7; }
-        if (c == "8") { return 8; }
-        if (c == "9") { return 9; }
+        if (c == null || c.Length == 0) { return -1; }
+        int d = (c[0] & 255) - 48;
+        if (d >= 0 && d <= 9) { return d; }
         return -1;
     }
 

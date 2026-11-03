@@ -36,9 +36,31 @@ public class AsciiEncoding : Encoding {
         if (count > avail) { count = avail; }
         if (count == 0) { return ""; }
         // 输出只含 7 位字节（本身即合法 UTF-8），有高位字节才需要拷贝替换。
+        // 采用 64 位 SWAR 8 字节批量探测高位，大幅加速 ASCII 文本扫描。
         bool high = false;
-        for (int i = offset; i < offset + count; i++) {
-            if ((bytes[i] & 255) > 127) { high = true; break; }
+        int i = offset;
+        int end = offset + count;
+        int limit8 = end - 8;
+        while (i <= limit8) {
+            long w = ((long)(bytes[i] & 255)) |
+                     (((long)(bytes[i + 1] & 255)) << 8) |
+                     (((long)(bytes[i + 2] & 255)) << 16) |
+                     (((long)(bytes[i + 3] & 255)) << 24) |
+                     (((long)(bytes[i + 4] & 255)) << 32) |
+                     (((long)(bytes[i + 5] & 255)) << 40) |
+                     (((long)(bytes[i + 6] & 255)) << 48) |
+                     (((long)(bytes[i + 7] & 255)) << 56);
+            if ((w & -9187201950435737472L) != 0L) { // 0x8080808080808080L
+                high = true;
+                break;
+            }
+            i = i + 8;
+        }
+        if (!high) {
+            while (i < end) {
+                if ((bytes[i] & 255) > 127) { high = true; break; }
+                i = i + 1;
+            }
         }
         if (!high) { return bytes.ToStr(offset, count); }
         byte[] copy = new byte[count];

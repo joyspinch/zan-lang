@@ -7,6 +7,11 @@ namespace System;
 // Guid g = new Guid("F47AC10B-...");         // 实例化（规范/花括号/N 三形态）
 // string s = g.ToString();                   // 实例方法（规范小写）
 public class Guid {
+    // 默认构造：供 NewV4 与 Parse 高速直通路径使用。
+    public Guid() {
+        this.text = "";
+    }
+
     // C# 形态实例化：接受规范 36 字符连字符形、{花括号} 包裹形与
     // 32 位无连字符 N 形，不区分大小写，统一归一为规范小写。
     // 文本不合法时抛 FormatException（C# new Guid(bad) 同口径；
@@ -19,6 +24,7 @@ public class Guid {
         if (s == null || (s.Length != 36 && s.Length != 32)) {
             throw new FormatException("Guid: invalid input string format");
         }
+        bool hasUpper = false;
         int hyphenSlots = s.Length == 36 ? 4 : 0;
         for (int i = 0; i < s.Length; i = i + 1) {
             int c = s[i] & 255;
@@ -27,18 +33,27 @@ public class Guid {
             if (isHyphenPos) {
                 if (c != 45) { throw new FormatException("Guid: invalid input string format"); }
             } else {
-                bool hexDigit = (c >= 48 && c <= 57) || (c >= 97 && c <= 102) || (c >= 65 && c <= 70);
-                if (!hexDigit) { throw new FormatException("Guid: invalid input string format"); }
+                if (c >= 48 && c <= 57) {
+                    // 0-9
+                } else if (c >= 97 && c <= 102) {
+                    // a-f
+                } else if (c >= 65 && c <= 70) {
+                    // A-F
+                    hasUpper = true;
+                } else {
+                    throw new FormatException("Guid: invalid input string format");
+                }
             }
         }
         // 归一为规范小写；N 形（32 位无连字符）在 8/13/18/23 补连字符。
-        string norm = s.ToLower();
         if (s.Length == 32) {
-            norm = norm.Substring(0, 8) + "-" + norm.Substring(8, 4)
+            string norm = hasUpper ? s.ToLower() : s;
+            this.text = norm.Substring(0, 8) + "-" + norm.Substring(8, 4)
                 + "-" + norm.Substring(12, 4) + "-" + norm.Substring(16, 4)
                 + "-" + norm.Substring(20, 12);
+        } else {
+            this.text = hasUpper ? s.ToLower() : s;
         }
-        this.text = norm;
     }
 
     // `g` 的规范形式：36 字符小写（"xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"）。
@@ -54,18 +69,30 @@ public class Guid {
 
     // 解析 36 字符的规范 GUID（允许连字符，不区分大小写）。
     // 文本不是合法的 GUID 时返回 null。
+    // 单趟扫描完成校验与大小写探测，无大写时零字符串分配直通。
     public static Guid Parse(string text) {
         if (text == null || text.Length != 36) { return null; }
+        bool hasUpper = false;
         for (int i = 0; i < 36; i = i + 1) {
             int c = text[i] & 255;
             if (i == 8 || i == 13 || i == 18 || i == 23) {
                 if (c != 45) { return null; }
             } else {
-                bool hexDigit = (c >= 48 && c <= 57) || (c >= 97 && c <= 102) || (c >= 65 && c <= 70);
-                if (!hexDigit) { return null; }
+                if (c >= 48 && c <= 57) {
+                    // 0-9
+                } else if (c >= 97 && c <= 102) {
+                    // a-f
+                } else if (c >= 65 && c <= 70) {
+                    // A-F
+                    hasUpper = true;
+                } else {
+                    return null;
+                }
             }
         }
-        return new Guid(text);
+        Guid g = new Guid();
+        g.text = hasUpper ? text.ToLower() : text;
+        return g;
     }
 
     // 使用操作系统 CSPRNG 生成 version-4（随机）UUID：
@@ -76,14 +103,19 @@ public class Guid {
         if (b == null) { return null; }
         b[6] = (byte)((b[6] & 0x0F) | 0x40);  // 版本 4
         b[8] = (byte)((b[8] & 0x3F) | 0x80);  // RFC 4122 变体
-        return new Guid(Guid.Format(b));
+        Guid g = new Guid();
+        g.text = Guid.Format(b);
+        return g;
     }
 
     // 快捷方法：返回新的随机 GUID 字符串，RNG 失败时返回 ""。
+    // 直通 Format 产物，消除冗余 Guid 实例包装与 ToLower 二次扫描。
     public static string New() {
-        Guid g = Guid.NewV4();
-        if (g == null) { return ""; }
-        return g.text;
+        byte[] b = RandomNumberGenerator.GetBytes(16);
+        if (b == null) { return ""; }
+        b[6] = (byte)((b[6] & 0x0F) | 0x40);  // 版本 4
+        b[8] = (byte)((b[8] & 0x3F) | 0x80);  // RFC 4122 变体
+        return Guid.Format(b);
     }
 
     // 两个 GUID 相等时返回 true（可安全处理 null）。
@@ -99,21 +131,22 @@ public class Guid {
     }
 
     // 将 16 字节格式化为规范 GUID 字符串。
+    // 采用紧凑循环与寄存器无分支算术，指令密度高且易于 CPU 指令缓存命中。
     public static string Format(byte[] b) {
         if (b == null || b.Length < 16) { return ""; }
         byte[] buf = new byte[36];
-        string hex = "0123456789abcdef";
-        int pos = 0;
+        int di = 0;
         for (int i = 0; i < 16; i = i + 1) {
             if (i == 4 || i == 6 || i == 8 || i == 10) {
-                buf[pos] = (byte)45;
-                pos = pos + 1;
+                buf[di] = 45; // '-'
+                di = di + 1;
             }
             int v = b[i] & 255;
-            buf[pos] = (byte)(hex[v >> 4] & 255);
-            pos = pos + 1;
-            buf[pos] = (byte)(hex[v & 15] & 255);
-            pos = pos + 1;
+            int h = v >> 4;
+            int l = v & 15;
+            buf[di]     = (byte)(h < 10 ? h + 48 : h + 87);
+            buf[di + 1] = (byte)(l < 10 ? l + 48 : l + 87);
+            di = di + 2;
         }
         return buf.ToStr(0, 36);
     }
