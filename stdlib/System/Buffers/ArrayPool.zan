@@ -1,12 +1,13 @@
 using System;
+using System.Numerics;
 using System.Threading;
 
 namespace System.Buffers;
 
 // 工业级高性能分桶字节缓冲池，消除高频网络 IO、组帧与序列化过程中的频繁堆分配与内存碎片。
+// 内部使用基于硬件 LZCNT / 位运算的 O(1) 桶定位与向量化内存清零。
 public class ArrayPool : IDisposable {
-    static ArrayPool shared;
-    static nint globalLock;
+    static ArrayPool shared = new ArrayPool();
 
     public List<ByteArrayBucket> buckets;
 
@@ -47,19 +48,6 @@ public class ArrayPool : IDisposable {
     // 全局共享缓冲池单例。
     public static ArrayPool Shared {
         get {
-            if (ArrayPool.shared == null) {
-                if (ArrayPool.globalLock == 0) {
-                    ArrayPool.globalLock = Mutex.Create();
-                }
-                Mutex.Lock(ArrayPool.globalLock);
-                try {
-                    if (ArrayPool.shared == null) {
-                        ArrayPool.shared = new ArrayPool();
-                    }
-                } finally {
-                    Mutex.Unlock(ArrayPool.globalLock);
-                }
-            }
             return ArrayPool.shared;
         }
     }
@@ -74,30 +62,38 @@ public class ArrayPool : IDisposable {
         return new ArrayPool(maxArrayLength, maxArraysPerBucket);
     }
 
-    // 租借长度不小于 minimumLength 字节的缓冲区。
+    // 快速计算容量对应的桶下标。由于桶按 2 的整数次幂以 16B 起步倍增：
+    // 16B -> 0, 32B -> 1, 64B -> 2, ..., 1MB -> 16
+    public static int SelectBucketIndex(int bytes) {
+        if (bytes <= 16) { return 0; }
+        return 32 - BitOperations.LeadingZeroCount(bytes - 1) - 4;
+    }
+
+    // 租借长度不小于 minimumLength 字节的缓冲区。O(1) 单周期指令直通。
     public byte[] Rent(int minimumLength) {
         if (minimumLength <= 0) {
             minimumLength = 16;
         }
-        for (int i = 0; i < this.buckets.Count; i = i + 1) {
-            ByteArrayBucket b = this.buckets[i];
-            if (b.bufferLength >= minimumLength) {
-                return b.Rent();
-            }
+        int idx = ArrayPool.SelectBucketIndex(minimumLength);
+        if (idx >= 0 && idx < this.buckets.Count) {
+            return this.buckets[idx].Rent();
         }
         // 超过梯度上限直接分配
         return new byte[minimumLength];
     }
 
-    // 归还缓冲区至池中。
+    // 归还缓冲区至池中。O(1) 单周期指令直通。
     public void Return(byte[] array, bool clearArray) {
         if (array == null) { return; }
         int len = array.Length;
-        for (int i = 0; i < this.buckets.Count; i = i + 1) {
-            ByteArrayBucket b = this.buckets[i];
-            if (b.bufferLength == len) {
-                b.Return(array, clearArray);
-                return;
+        if (len >= 16 && BitOperations.IsPow2(len)) {
+            int idx = ArrayPool.SelectBucketIndex(len);
+            if (idx >= 0 && idx < this.buckets.Count) {
+                ByteArrayBucket b = this.buckets[idx];
+                if (b.bufferLength == len) {
+                    b.Return(array, clearArray);
+                    return;
+                }
             }
         }
     }
