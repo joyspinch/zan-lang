@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Numerics;
 
 namespace System.Collections.Generic;
 
@@ -7,24 +8,20 @@ namespace System.Collections.Generic;
 // 专为高频音视频数据帧、网卡数据包采集与高吞吐协程/线程流水线设计。
 // 容量自动向上对齐到 2 的幂次，以位与运算代替取模操作，消除锁竞争与中间堆分配。
 public class RingBuffer<T> {
-    private List<T> buffer;
-    private int capacity;
-    private int mask;
-    private int head;
-    private int tail;
+    public T[] buffer;
+    public int capacity;
+    public int mask;
+    public int head;
+    public int tail;
 
     public RingBuffer(int capacity) {
-        int cap = 1;
-        while (cap < capacity) {
-            cap = cap * 2;
+        int cap = 2;
+        if (capacity > 2) {
+            cap = BitOperations.RoundUpToPowerOf2(capacity);
         }
-        if (cap < 2) { cap = 2; }
         this.capacity = cap;
         this.mask = cap - 1;
-        this.buffer = new List<T>();
-        for (int i = 0; i < cap; i = i + 1) {
-            this.buffer.Add(null);
-        }
+        this.buffer = new T[cap];
         this.head = 0;
         this.tail = 0;
     }
@@ -87,6 +84,52 @@ public class RingBuffer<T> {
         }
         item = this.buffer[this.head];
         return true;
+    }
+
+    // 批量写入：分至多两段连续高速内存块拷贝，返回实际写入项数
+    public int WriteBatch(T[] source, int offset, int count) {
+        if (source == null || count <= 0 || offset < 0 || offset + count > source.Length) {
+            return 0;
+        }
+        int available = (this.capacity - 1) - this.Count;
+        int toWrite = count < available ? count : available;
+        if (toWrite <= 0) { return 0; }
+
+        int t = this.tail;
+        int firstChunk = this.capacity - t;
+        if (toWrite <= firstChunk) {
+            Array.Copy<T>(source, offset, this.buffer, t, toWrite);
+        } else {
+            Array.Copy<T>(source, offset, this.buffer, t, firstChunk);
+            Array.Copy<T>(source, offset + firstChunk, this.buffer, 0, toWrite - firstChunk);
+        }
+        this.tail = (t + toWrite) & this.mask;
+        return toWrite;
+    }
+
+    // 批量读取：分至多两段连续高速内存块拷贝，返回实际读取项数
+    public int ReadBatch(T[] destination, int offset, int count) {
+        if (destination == null || count <= 0 || offset < 0 || offset + count > destination.Length) {
+            return 0;
+        }
+        int available = this.Count;
+        int toRead = count < available ? count : available;
+        if (toRead <= 0) { return 0; }
+
+        int h = this.head;
+        int firstChunk = this.capacity - h;
+        if (toRead <= firstChunk) {
+            Array.Copy<T>(this.buffer, h, destination, offset, toRead);
+            for (int i = 0; i < toRead; i = i + 1) { this.buffer[h + i] = null; }
+        } else {
+            Array.Copy<T>(this.buffer, h, destination, offset, firstChunk);
+            for (int i = 0; i < firstChunk; i = i + 1) { this.buffer[h + i] = null; }
+            int secondChunk = toRead - firstChunk;
+            Array.Copy<T>(this.buffer, 0, destination, offset + firstChunk, secondChunk);
+            for (int i = 0; i < secondChunk; i = i + 1) { this.buffer[i] = null; }
+        }
+        this.head = (h + toRead) & this.mask;
+        return toRead;
     }
 
     // 清空缓冲区
