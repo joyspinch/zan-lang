@@ -34,6 +34,9 @@ zan_diag_t *zan_diag_new(zan_arena_t *arena) {
     d->dup_line_errors = 0;
     d->dup_line_suppressed = 0;
     d->dup_line_notice_shown = false;
+    d->dedup_sigs = NULL;
+    d->dedup_count = 0;
+    d->dedup_cap = 0;
     return d;
 }
 
@@ -173,6 +176,7 @@ const zan_diag_entry_t *zan_diag_entry_at(const zan_diag_t *diag, int index) {
 }
 
 void zan_diag_free_buffers(zan_diag_t *diag) {
+    if (!diag) return;
     free(diag->entries);
     diag->entries = NULL;
     diag->entry_count = 0;
@@ -185,6 +189,15 @@ void zan_diag_free_buffers(zan_diag_t *diag) {
     diag->pragma_ranges = NULL;
     diag->pragma_count = 0;
     diag->pragma_cap = 0;
+    if (diag->dedup_sigs) {
+        for (int i = 0; i < diag->dedup_count; i++) {
+            free(diag->dedup_sigs[i].msg);
+        }
+        free(diag->dedup_sigs);
+        diag->dedup_sigs = NULL;
+    }
+    diag->dedup_count = 0;
+    diag->dedup_cap = 0;
     free((void *)diag->file_names);
     free((void *)diag->file_sources);
     diag->file_names = NULL;
@@ -247,6 +260,40 @@ static void zan_diag_vemit(zan_diag_t *diag, zan_diag_level_t level,
         if (diag->warn_level == 0) return;
         if (code > 0 && zan_diag_code_suppressed(diag, code)) return;
         if (zan_diag_pragma_suppressed(diag, code, loc)) return;
+    }
+
+    /* B-ID106：精确重复诊断（同 file/line/col/level/消息）去重——回溯重扫
+     * 曾同错重报。在计数前去重，重复不消耗 -ferror-limit 预算、不触发
+     * 单行级联帽；capture 模式（LSP）同口径，结构化表也不再收重复项。
+     * 签名线性表 4096 条封顶（内存有界），超顶不再登记、退化为不去重。 */
+    if (level == DIAG_ERROR || level == DIAG_WARNING) {
+        bool dup = false;
+        for (int i = 0; i < diag->dedup_count; i++) {
+            const zan_diag_dedup_sig_t *s = &diag->dedup_sigs[i];
+            if (s->file_id == loc.file_id && s->line == loc.line &&
+                s->col == loc.col && s->level == (int)level &&
+                strcmp(s->msg, msgbuf) == 0) { dup = true; break; }
+        }
+        if (dup) { return; }
+        if (diag->dedup_count < 4096) {
+            if (diag->dedup_count == diag->dedup_cap) {
+                int ncap = diag->dedup_cap ? diag->dedup_cap * 2 : 64;
+                zan_diag_dedup_sig_t *grown = (zan_diag_dedup_sig_t *)realloc(
+                    diag->dedup_sigs,
+                    sizeof(zan_diag_dedup_sig_t) * (size_t)ncap);
+                if (!grown) return; /* OOM 保守退化：宁重报不误吞 */
+                diag->dedup_sigs = grown;
+                diag->dedup_cap = ncap;
+            }
+            zan_diag_dedup_sig_t *s = &diag->dedup_sigs[diag->dedup_count++];
+            s->file_id = loc.file_id;
+            s->line = loc.line;
+            s->col = loc.col;
+            s->level = (int)level;
+            s->msg = (char *)malloc(strlen(msgbuf) + 1);
+            if (!s->msg) zan_host_oom();
+            strcpy(s->msg, msgbuf);
+        }
     }
 
     if (level == DIAG_ERROR) {

@@ -31,6 +31,16 @@ typedef struct {
     uint32_t to_line;    /* restore 行止（不含），UINT32_MAX = 开放到文件尾 */
 } zan_diag_pragma_range_t;
 
+/* 去重签名（B-ID106）：同 file/line/col/level/消息 的诊断只报一次——
+ * 回溯重扫曾同错重报。msg 为 malloc 副本，zan_diag_free_buffers 释放 */
+typedef struct {
+    uint32_t file_id;
+    uint32_t line;
+    uint32_t col;
+    int      level;
+    char    *msg;
+} zan_diag_dedup_sig_t;
+
 struct zan_diag {
     int error_count;
     int warning_count;
@@ -65,6 +75,12 @@ struct zan_diag {
     int      dup_line_errors;
     int      dup_line_suppressed;
     bool     dup_line_notice_shown;
+
+    /* 精确重复诊断去重（B-ID106）：线性签名表，4096 条封顶（内存有界，
+     * 超顶不再登记、退化为不去重） */
+    zan_diag_dedup_sig_t *dedup_sigs;
+    int      dedup_count;
+    int      dedup_cap;
 };
 
 zan_diag_t *zan_diag_new(zan_arena_t *arena);

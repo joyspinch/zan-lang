@@ -1280,6 +1280,26 @@ if(NOT WIN32)
 endif()
 add_test(NAME unit_ast_visitor COMMAND zan_ast_visitor_test)
 
+# ---- Diag deduplication & UAF protection unit test (B-ID106) ----
+add_executable(zan_diag_dedup_test
+    tests/unit/diag_dedup_test.c
+    src/compiler/diag.c
+    src/compiler/arena.c
+)
+target_include_directories(zan_diag_dedup_test PRIVATE
+    ${CMAKE_SOURCE_DIR}
+    ${CMAKE_SOURCE_DIR}/src/compiler
+    ${CMAKE_SOURCE_DIR}/src/common
+)
+set_target_properties(zan_diag_dedup_test PROPERTIES
+    C_STANDARD 11
+    C_STANDARD_REQUIRED YES
+)
+if(NOT WIN32)
+    target_link_libraries(zan_diag_dedup_test PRIVATE m)
+endif()
+add_test(NAME unit_diag_dedup COMMAND zan_diag_dedup_test)
+
 # ---- package source-tree checksum unit test (B-ID90) ----
 add_executable(zan_package_tree_checksum_test
     tests/unit/package_tree_checksum_test.c

@@ -3487,6 +3487,34 @@ int main(int argc, char **argv) {
         ir_diag->file_names = ir_file_names;
         ir_diag->entries = NULL;
         ir_diag->entry_count = ir_diag->entry_cap = 0;
+        ir_diag->dedup_sigs = NULL;
+        ir_diag->dedup_count = ir_diag->dedup_cap = 0;
+        if (diag->suppress_count > 0 && diag->suppress_codes) {
+            ir_diag->suppress_codes = (int *)malloc(sizeof(int) * (size_t)diag->suppress_count);
+            if (ir_diag->suppress_codes) {
+                memcpy(ir_diag->suppress_codes, diag->suppress_codes, sizeof(int) * (size_t)diag->suppress_count);
+                ir_diag->suppress_cap = diag->suppress_count;
+            } else {
+                ir_diag->suppress_count = ir_diag->suppress_cap = 0;
+            }
+        } else {
+            ir_diag->suppress_codes = NULL;
+            ir_diag->suppress_count = ir_diag->suppress_cap = 0;
+        }
+        if (diag->pragma_count > 0 && diag->pragma_ranges) {
+            ir_diag->pragma_ranges = (zan_diag_pragma_range_t *)malloc(
+                sizeof(zan_diag_pragma_range_t) * (size_t)diag->pragma_count);
+            if (ir_diag->pragma_ranges) {
+                memcpy(ir_diag->pragma_ranges, diag->pragma_ranges,
+                       sizeof(zan_diag_pragma_range_t) * (size_t)diag->pragma_count);
+                ir_diag->pragma_cap = diag->pragma_count;
+            } else {
+                ir_diag->pragma_count = ir_diag->pragma_cap = 0;
+            }
+        } else {
+            ir_diag->pragma_ranges = NULL;
+            ir_diag->pragma_count = ir_diag->pragma_cap = 0;
+        }
         irgen.diag = ir_diag;
         zan_diag_free_buffers(diag);
         zan_arena_free(arena);

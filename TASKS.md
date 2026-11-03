@@ -22,7 +22,7 @@
 
 ### 批次 2 · 独立账（无前置，任一会话可领，按编号序）
 
-- [ ] B-ID106〔独立 · 内部序：diag 去重重做前先定位 0xC0000005〕运行时与公共库结构性收敛余项：rt_crash.h 1413 行实现住头文件被 3 TU 重复编译，拆 .c 为工程项（rt_io/rt_timer 是独立 .obj 定制命令拼链，需动原生/mt/wasm/bare 多条链路）；rt_mem slab 只进不出无归还 OS 路径（长驻进程高水位永不下落）；错误码四种口径并存（rt_file.c:113 返 0 与 epoch 0 不可区分为典型）；diag 精确去重已回退（21dde884c 在 831 文件规模编译触发 zanc 退出 0xC0000005，revert 落地；去重逻辑审读无内存病、单线程、free 序对称，根因未定位——疑大型编译既有堆破坏殃及签名表分配，重做前须先定位崩溃）。json 族/arena/tuple 签名/ferror-limit 已修（git 历史）。
+- [ ] B-ID106〔独立〕运行时与公共库结构性收敛余项：rt_crash.h 1413 行实现住头文件被 3 TU 重复编译，拆 .c 为工程项（rt_io/rt_timer 是独立 .obj 定制命令拼链，需动原生/mt/wasm/bare 多条链路）；rt_mem slab 只进不出无归还 OS 路径（长驻进程高水位永不下落）；错误码四种口径并存（rt_file.c:113 返 0 与 epoch 0 不可区分为典型）。已修子项（git 历史）：diag 0xC0000005 崩溃根因已定性并根治（main.c:3480 浅拷贝 ir_diag 并在 line 3491 提前释放 diag 堆缓冲区致 ir_diag 悬垂指针与退出 double-free，改为独立清零/深拷贝保护；diag 精确去重重做落地且 831 文件编译与单测 unit_diag_dedup 全绿）、json 族/arena/tuple 签名/ferror-limit。
 - [ ] B-ID110〔前置 B-ID60〕Zan.Web 四案余红——routegen 删除后参数元数据无生产者：层1 编译红已修（__AttrRoutes 迁 Zan.Mvc 包致 using 缺失 + 包自带控制器被 Register 隐式发现吞掉；用例补 using + checker 发现跳过 Zan.Web* ns，web 族其余 13 案绿）。余红精确化：api_docs/list_protocol——Route.Param 参数行缺（654a90a7b 删 C11 routegen「收编自举轨」而自举轨未接，见 B-ID109，server-collab 模板同受影响）；typed_binding——__h_* 合成桩随 routegen 删除；menu_attrs——特性命名参数（Icon=/Name=）不进元数据串，B-ID60 同根。修法：从 654a90a7b^ 挖 routegen 参数提取适配新 AttrRoutes 契约重落。原登记：case_web_api_docs、case_web_list_protocol、case_web_menu_attrs、case_web_typed_binding——手编复刻缺 api-docs 参数行（page/limit/order/dir），指向 AttrRoutes 的 ApiDocs 生成链路在近期 MVC/attrs 重构后掉了参数元数据。gallery 两政策案已闭（97c7925dc，git 历史）。
 
 ### 批次 3 · 有前置（前置闭了再领）
