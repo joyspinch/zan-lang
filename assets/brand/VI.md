@@ -1,16 +1,16 @@
-# Zan Visual Identity · Zan 视觉识别系统
+# Zan Visual Identity · Zan 视觉识别系统 (2.0)
 
-> 闪电是 Zan 的心跳：AOT 编译像闪电一样快，代码像 Zanzi 一样软萌可爱。
-> 标语：**AOT. ARC. Adorable.**
+> 闪电是 Zan 的心跳：AOT 编译像闪电一样快，代码像大肥鹅一样战神无畏、寸尘不染。
+> 标语：**AOT. ARC. Unapologetic.**
 
 本目录是 Zan 语言的完整 VI 资产。矢量源（SVG）与全部重建脚本随仓库维护，
-位图均可由源文件或 prompt（`tools/prompts.md`）重新生成（见 §6 重建）。
+位图均可由源文件或 prompt（`tools/prompts.md`）重新生成（见 §5 重建）。
 
 ```
 assets/brand/
 ├── VI.md                  本规范
 ├── logo/                  矢量源（SVG 为唯一权威源）
-│   ├── zan-mark.svg           主图标：电光蓝渐变圆角方 + 白兔头 + 金色火花
+│   ├── zan-mark.svg           主图标：电光蓝渐变圆角方 + 纯白大肥鹅(Z-Goose) + 金色火花
 │   ├── zan-mark-mono.svg      单色墨版（浅底/单色印刷）
 │   ├── zan-mark-white.svg     全白剪影版（深底）
 │   ├── zan-wordmark.svg       "zan" 圆角几何字标（墨）
@@ -18,19 +18,16 @@ assets/brand/
 │   ├── zan-logo-horizontal.svg(-dark)  横排组合
 │   ├── zan-logo-vertical.svg           竖排组合
 │   └── png/                 各尺寸 PNG（512…16）
-├── mascot/                吉祥物 Zanzi（透明底 PNG）
-│   ├── zanzi-glyph.svg       头标 glyph（符号阶梯最低档、矢量锚点）
+├── mascot/                吉祥物与双星体系（透明底 PNG）
+│   ├── zanzi-glyph.svg       大肥鹅头标 glyph（符号阶梯最低档、矢量锚点）
 │   ├── png/                  头标各尺寸 PNG（256…32）
-│   ├── zanzi-hero.png        立绘·挥手（主视觉）
+│   ├── zanzi-hero.png        立绘·赞宝携大肥鹅指 Logo 认证（主视觉）
 │   ├── zanzi-avatar(-round).png  头像（方/圆）
-│   ├── zanzi-run.png         奔跑（构建中/极速）
-│   ├── zanzi-sleep.png       睡觉（空闲/挂机）
-│   ├── zanzi-cheer.png       欢呼·举游戏手柄（发布/成功）
-│   ├── zanzi-code.png        全息键盘+无人机伙伴（编程/智能体）
-│   └── zanzi-battle.png      战斗姿态·能量臂铠+护盾（能打能战）
+│   ├── zanzi-cheer.png       欢呼·工匠妹夹大肥鹅比赞（构建通过/日常通过）
+│   └── zanzi-battle.png      战斗·快拉住狂暴大白鹅（编译报错/战神出击）
 ├── banner/
 │   ├── zan-banner.png        GitHub README 横幅 1500×500
-│   └── zan-palette.png       色板总览卡
+│   └── zan-palette.png       色板总览卡 1600×1180
 └── tools/                 重建脚本（无外部依赖，Python + PIL + Edge）
     ├── render_pngs.py        SVG → 多尺寸 PNG
     ├── compose.py            合成横幅与色板卡
@@ -38,173 +35,73 @@ assets/brand/
     └── prompts.md            image2 生成 prompt 权威存档
 ```
 
-## 1. 品牌理念
+## 1. 品牌理念与清流内核
 
-| 气质 | 视觉转译 |
-|------|----------|
-| 高性能 | 兔子（弹射起步的疾速）、闪电符号、电光蓝渐变 |
-| 科技 | AR 护目镜、全息键盘、无人机伙伴、能量臂铠（Zan Glow 辉光）——全平台编程、智能体、软件、游戏、能打能战 |
-| 干练 | 几何圆角笔画、克制的单点缀、大留白 |
-| 萌 | 吉祥物 Zanzi：圆胖肉感、大眼、粉耳、绒球尾 |
+| 气质 | 视觉转译 | 哲学映射 |
+|------|----------|----------|
+| **低成本与高爆发** | **大肥鹅 (The Z-Goose)** | 吃最便宜的野草（几 MB 微型内存），扑腾起来撵跑恶犬（AOT 机器码暴打臃肿虚拟机） |
+| **寸尘不染** | **纯白羽毛与洁癖** | ARC 自动引用计数，出作用域立即精确释放，水面一尘不染，绝无内存垃圾 |
+| **疾速极简** | **几何 Z 剪影** | 鸟喙金嘴为顶、优雅长颈为斜轴、肥硕身躯与翘起尾翼为底座，浑然天成构成大写字母 **"Z"** |
+| **技术清流** | **工匠少女赞宝 (Zan-chan)** | 挽起袖子的钴蓝工装衬衫 + 米白工匠围裙，围裙正中端正印着官方 Z-Goose 徽标；自信比赞 |
 
 ## 2. 色板
 
 | 名称 | HEX | 用途 |
 |------|-----|------|
-| Zan Volt | `#2B5CFF` | 主色：图标底、链接、强调按钮 |
-| Volt Deep | `#2141E6` | 渐变深端 / hover |
-| Zan Sky | `#7DA2FF` | 浅色 tint：选中态底、暗色环境中的次级文字 |
-| Zan Spark | `#FFC838` | 唯一金色点缀：火花、星光；**不可大面积铺底** |
-| Zan Glow | `#45E6FF` | 科技辉光：护目镜、全息特效、能量武器；**只用于发光小件** |
-| Zan Blush | `#FFB3C7` | 兔耳内耳/鼻头/腮红，柔和点缀；**只用于小面积** |
-| Zan Cream | `#FFF6E8` | 暖色表面（吉祥物毛色同源） |
-| Zan Ink | `#0F1428` | 正文/深色背景 |
+| **Zan Volt** | `#2B5CFF` | 主色：图标底、链接、强调按钮、品牌背景 |
+| **Volt Deep** | `#2141E6` | 渐变深端 / hover 态 |
+| **Zan Sky** | `#7DA2FF` | 浅色 tint：选中态底、暗色环境中的次级文字 |
+| **Zan Spark** | `#FFC838` | 核心点缀色：大肥鹅金嘴、火花、星芒；**不可大面积铺底** |
+| **Zan Beak** | `#FF931E` | 鹅嘴渐变深端暖橙 |
+| **Zan Cream** | `#FFF6E8` | 暖色工匠围裙与高光细节 |
+| **Zan Ink** | `#0F1428` | 正文、大鹅眼睛圆点、深色背景 |
 
 语义色：OK `#2FBF71` · Warning `#FF8A3D` · Error `#FF5C5C` · Info `#2B5CFF`（同 Volt）。
 
-中性灰阶（由 Ink 向 Paper 过渡）：`#F4F6FB / #D9DEEC / #9AA5C0 / #5A6480 / #2A3150`。
+## 3. Logo 系统（Z-Goose）
 
-## 3. Logo
+**大肥鹅圆角方砖图标** = Volt 蓝电光渐变圆角方砖 + 纯白大肥鹅（Z-Goose 实心几何剪影）+ 金色闪电喙 + 右上角 Zan Spark 金色火花星芒。
 
-**兔头砖图标** = 圆角方砖（Volt 渐变）+ 白兔头（长耳、Blush 粉内耳）+ 右上金色火花。
-火花是唯一金色记忆点；粉色只出现在耳内与鼻头，其他一切保持安静——这是"干练"的体现。
+* **超级符号的几何自洽**：
+  * **顶部横轴**：锐利的金色三角形嘴喙（指向左侧）与圆润饱满的鹅头；
+  * **对角斜梁**：向右下方坚决倾斜延伸的优雅长颈；
+  * **底部基座**：圆滚滚的大肥肚皮平贴水线延伸，并在右后方翘起三层利落的极简尾羽；
+  * 剪影轮廓浑然天成构成刚劲有力的英文字母 **“Z”**。
+* **安全区**：图标四周留出砖面宽度 1/8 的空白。
+* **最小尺寸**：16px（favicon / CLI 状态栏仍能清晰辨析白鹅浮水与金嘴；<32px 时视觉退化为优雅的“蓝砖白 Z”）。
+* **变体规则**：
+  * 浅底用 `zan-mark` 或单色墨版 `zan-mark-mono`；
+  * 深底用 `zan-mark` 或全白剪影 `zan-mark-white`；
+  * 横排标准组合：左侧为 0.72 缩放的 Mark，右侧为手绘纯路径几何圆角字标 `zan`。
 
-- **安全区**：图标四周留出砖面宽度 1/8 的空白。
-- **最小尺寸**：带砖图标 16px（耳与火花仍可辨；<32px 时视觉上退化为"蓝砖白点"亦可接受）。
-- **变体规则**：浅底用 `zan-mark` / `-mono`；深底（Ink/深蓝）用 `zan-mark` 或 `zan-mark-white`（全白剪影）；单色印刷/传真场景用 `-mono`（粉耳转墨版挖空）。
-- **组合**：优先横排 `zan-logo-horizontal`；方形容器（头像、App 图标）只用 mark 不带字标。
+## 4. 吉祥物双星体系（大肥鹅 + 赞宝）
 
-**禁用**：拉伸变形 / 更换色相 / 给兔头描彩边或投影 / 火花换成其他符号 /
-字标单独描色 / 把 mark 放在低于 4.5:1 对比度的背景上。
+Zan 采用独创的**“母子同构·双星吉祥物”**架构：
 
-## 4. 字体
+### 4.1 符号母体：大肥鹅 (The Z-Goose)
+* **人设**：一只纯白、肥美、眼神呆滞但战斗力爆表的大白鹅。吃最少的内存，跑最快的机器码；平时人畜无害甚至在发呆，一旦遇到 Bug 或死循环，长脖子一伸瞬间化身全网第一暴躁战神。
+* **表情包与梗**：
+  * **“今天大肥鹅很满意，赏你一个 Zan👍”**（CI 通过 / 编译秒过）；
+  * **“鹅急了！鹅开始拧人了！！”**（语法报错 / 内存越界）；
+  * **“快把分号加上，我快拉不住它了！！”**（流水线红了）。
 
-| 场景 | 首选 | 回退 |
-|------|------|------|
-| 界面/文档标题正文 | Inter | Segoe UI、苹方、微软雅黑、思源黑体 |
-| 代码/终端 | JetBrains Mono | Cascadia Code、Consolas |
-| 中文 | 思源黑体 / 微软雅黑 | — |
+### 4.2 人格化代言：赞宝 (Zan-chan)
+* **人设**：清爽利落、做事一尘不染的“特级抓鹅工匠少女”。
+* **装束与图腾绑定**：
+  * 浅银蓝微风短发，别着一枚金色羽毛闪电发卡（Zan Spark）；
+  * 挽起袖口的钴蓝工装衬衫，平整的米白色工匠背带围裙；
+  * **围裙胸口正中央，端端正正印着纯电光蓝的大肥鹅 Z-Logo**！
+* **角色定位**：她是暴躁战神大白鹅唯一的“理智刹车片与受苦饲养员”。日常自豪地指着围裙上的 Logo 点赞，报错时死死拉住缰绳防止大白鹅暴走去咬开发者。
 
-"zan" 字标是**手绘矢量路径**（圆头几何笔画，笔画宽 38 / x 高 150，见 SVG），
-不依赖任何字体文件，任何环境渲染一致。正文排版不要模仿字标风格。
-
-## 5. 吉祥物 Zanzi（赞崽）
-
-**人设**：一只圆滚滚的科技小兔子。像 AOT 编译一样弹射起步，像 ARC 一样省心，
-像值语义一样不给你添乱；戴着 AR 护目镜写全平台代码、指挥全息无人机当智能体、
-发布软件和游戏，关键时刻举着能量臂铠能打能战。性格：精力充沛、干劲十足、
-编译通过就举爪欢呼，偶尔就地睡着。
-
-**四个锚定特征**（任何二创必须保留，缺一不可）：
-
-1. 长耳 + **Blush 粉内耳**
-2. 脖子上**钴蓝围巾**（Zan Volt 同族色，颈间侧结、结在角色右侧）
-3. **电光蓝绒球尾**（Volt 色相的小圆绒球，闪电的柔软化身）
-4. 额头上推起的**AR 护目镜**（Glow 青辉光；睡觉等姿态也不例外）
-
-**图案规则**（可复制性是这条设计的核心约束，二创请遵守）：
-
-- 身体**圆胖有肉感**：梨形身、圆肚、胖腮、粗短四肢——不许画瘦长体形
-- 毛色**奶油白单色**（#FFF6E8），无斑点无杂纹；粉色只出现在内耳/鼻头/腮红
-- 上色是**柔和体积感**（微渐变 + 高光），不许退回纯平涂
-- 科技件（护目镜/全息/能量武器）一律 **Glow 青辉光小件**，克制、不堆砌
-- 除围巾/绒球尾/粉色/青辉光四处外**不得引入新颜色**
-
-标准姿态六张（见 `mascot/`）：hero 挥手 / run 奔跑 / sleep 睡觉 /
-cheer 举游戏手柄 / code 全息键盘+无人机 / battle 能量臂铠+护盾；
-头像（方/圆）与头标 glyph 从 hero 派生。
-
-**符号阶梯**（从大到小逐级抽象，每级都可独立使用）：
-
-全身立绘 → 头像 → **头标 glyph**（zanzi-glyph.svg，favicon/群头像档）→
-长耳剪影 / 电光蓝绒球 / 护目镜（可单独作装饰符号，与 logo 火花呼应）。
-
-**用法**：透明底 PNG 可直接叠在 Volt、Ink、Cream 底色上。
-建议按语境配姿态：构建中→run，发布成功/游戏通关→cheer，空闲→sleep，
-编程/智能体/教程→code，对战/攻防/安全→battle。
-
-**禁用**：拉伸比例 / 更换色相 / 画瘦 / 去掉四个锚定特征 / 给身体加斑点 /
-科技件堆砌成机甲 / 加上文字气泡或水印 / 用于与 Zan 无关的产品。
-
-## 6. 重建
+## 5. 重建指令
 
 ```bash
-# SVG → PNG（需要 Edge，见 tools/render_pngs.py 顶部常量）
+# 1. SVG → PNG（依赖 Edge 无头渲染，自动生成多尺寸图标）
 python assets/brand/tools/render_pngs.py
-# 吉祥物/ico/iOS 图标：把 image2 原图（绿幕底 1024²）喂给 postprocess
-python assets/brand/tools/postprocess.py <原图目录>   # prompt 见 tools/prompts.md
-# 横幅与色板卡（需要 PIL）
+
+# 2. 合成横幅与色板卡（需要 PIL）
 python assets/brand/tools/compose.py
+
+# 3. 生成应用程序 ico / iOS 资产
+python assets/brand/tools/postprocess.py
 ```
-
-`assets/zan.ico`（编译进 zanc 的默认 exe 图标）与 `assets/zan_ios_icon.png`
-由 `postprocess.py` 从 image2 图标原图产出。吉祥物原图为 AI 生成
-（gpt-image-2），prompt 权威存档在 `tools/prompts.md`；成品即权威资产。
-
-## 7. 资源清单与来源
-
-下面这份清单按**仓库里实际存在的文件**列：像素尺寸读自 PNG 头（IHDR）与
-SVG `viewBox`，不是估算；"引入提交"是 `git log --diff-filter=A` 查到的首个
-入库提交。
-
-### 7.1 矢量源（手绘几何路径 · 唯一权威）
-
-| 文件 | 画布 | 用途 | 引入提交 |
-|------|------|------|----------|
-| `logo/zan-mark.svg` | 512×512 | 主图标：Volt 渐变砖 + 白兔 + 金色火花 | `3f90649c` |
-| `logo/zan-mark-mono.svg` | 512×512 | 单色墨版（浅底/单色印刷） | `3f90649c` |
-| `logo/zan-mark-white.svg` | 512×512 | 全白剪影（深底） | `3f90649c` |
-| `logo/zan-wordmark.svg` | 640×320 | "zan" 圆角几何字标（墨） | `3f90649c` |
-| `logo/zan-wordmark-white.svg` | 640×320 | 字标（白） | `3f90649c` |
-| `logo/zan-logo-horizontal.svg` | 985×512 | 横排组合 | `3f90649c` |
-| `logo/zan-logo-horizontal-dark.svg` | 985×512 | 横排组合（深底） | `3f90649c` |
-| `logo/zan-logo-vertical.svg` | 640×796 | 竖排组合 | `3f90649c` |
-| `mascot/zanzi-glyph.svg` | 256×256 | 头标 glyph（符号阶梯最低档） | `8a25e2aa` |
-
-### 7.2 位图（PNG · 三类来源）
-
-**① 由矢量渲染**（`tools/render_pngs.py`：Edge 无头渲染 → 抠洋红底 →
-PIL 降采样，透明底）：`logo/png/` 下 `zan-mark-16/32/48/64/128/256/512`、
-`zan-mark-mono-256/512`、`zan-mark-white-512`、`zan-wordmark-640`、
-`zan-wordmark-white-640`、`zan-logo-horizontal-985`、
-`zan-logo-horizontal-dark-985`、`zan-logo-vertical-640`，以及
-`mascot/png/zanzi-glyph-32/64/128/256`。这批**可由 SVG 完全再生**。
-
-**② 由 AI 生成原图加工**（`tools/postprocess.py`：绿幕/黑卡自适应抠底 +
-连通域去噪点 + 切尺寸）：`mascot/` 下 `zanzi-hero` 691×1024、`zanzi-run`
-904×918、`zanzi-sleep` 851×828、`zanzi-cheer` 814×1024、`zanzi-code`
-864×1024、`zanzi-battle` 813×1024、`zanzi-avatar` 512×512、
-`zanzi-avatar-round` 512×512。原型为 gpt-image-2 的 1024×1024 原图
-（背景颜色由生成批次决定：绿幕或黑卡，抠底自动识别；黑卡底已用
-硬性绿幕措辞重生成规避），prompt 权威存档在 `tools/prompts.md`；脚本幂等。
-
-**③ 脚本合成**（`tools/compose.py`，需 PIL）：`banner/zan-banner.png`
-1500×500（GitHub 横幅）、`banner/zan-palette.png` 1600×1180（色板总览卡）。
-
-### 7.3 品牌派生物（不在本目录，但同源）
-
-| 文件 | 大小 | 来源 | 引入提交 |
-|------|------|------|----------|
-| `assets/zan.ico` | 105,903 B | `postprocess.py` 从图标原图产出 | `da453a10`（2026-07-06） |
-| `assets/zan_ios_icon.png` | 60,423 B | 同上，iOS 图标 | `0169e32d`（2026-10-16） |
-| `assets/zan.rc` | 18 B | Windows 资源脚本（`1 ICON "zan.ico"`） | `da453a10`（2026-07-06） |
-
-### 7.4 仓库内消费点
-
-| 资源 | 谁在用 |
-|------|--------|
-| `assets/zan.ico` | `CMakeLists.txt:62` 的 `ZAN_DEFAULT_ICON` → 编译进 zanc，所有 zanc 产出的 exe 默认图标；`scripts/build_ide.ps1:192`、`build_gallery.ps1:41`、`build_gallery_single.ps1:73`、`build_charts.ps1:49` 的 `--icon`；`src/ide_zan/src/services/ZanIDE.Scaffold.zan:496` 给新项目脚手架复制；`scripts/stage_dev_toolchain.ps1:192` 随 dev toolchain 分发；`scripts/publish_ide.ps1:176` 进发布包 |
-| `assets/zan_ios_icon.png` | `CMakeLists.txt:63` 的 `ZAN_DEFAULT_IOS_ICON` |
-| `assets/zan.rc` | Windows 资源编译 |
-| 本目录下的 logo/吉祥物/横幅位图 | **仓库内暂无程序消费点**（对外物料）；`zan-site/` 用的是站点自带的 `zan-site/assets/mark.svg`，没有引用本包 |
-
-### 7.5 来源可追溯性
-
-- 品牌体系整体：`3f90649c`（2026-09-23 "Zan VI 体系上线"）；头标与符号
-  阶梯：`8a25e2aa`（同日"吉祥物重塑……矢量母版+符号阶梯"）。
-- `tools/prompts.md`、`tools/postprocess.py` 随 `7c71ecec`（2026-10-20）
-  纳入版本控制——脚本与 prompt 存档都在仓内，重建链不依赖外部凭据。
-- 尺寸的约束力分两类：①③（SVG 渲染 / 脚本合成）由脚本固定；②（AI 原图
-  加工）取决于原图与裁切，换 prompt 重新生成后像素可能变化——下游按
-  **文件名与用途**引用，别按具体像素写死布局。
-

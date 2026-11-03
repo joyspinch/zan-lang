@@ -1,91 +1,30 @@
-# Image2 生成 Prompt 存档（科技兔 VI）
+# Image2 生成 Prompt 存档（Z-Goose 大肥鹅 & 赞宝 VI）
 
-吉祥物与图标原图由 gpt-image-2 一次性生成（1024×1024，纯色绿幕底，
-`#00FF00`），本文件是可复现的权威 prompt。抠底/切尺寸/ico 由
-`postprocess.py` 完成；矢量源（SVG）为手绘几何版，与生成图同一套
-图案规则，两者共同构成权威资产。
+吉祥物与图标原图由 gpt-image-2 生成，本文件是可复现的权威 prompt。
+抠底/切尺寸/ico 由 `postprocess.py` 完成；矢量源（SVG）为手绘几何版，
+与生成图同一套图案规则，两者共同构成权威资产。
 
-## 角色卡（六姿态共用前缀）
-
-```text
-Zanzi the tech bunny: a chubby chibi baby rabbit with an adorably plump
-pear-shaped body, squishy round belly, chubby cheeks and fat round thighs,
-covered in round fluffy cream-white fur (body color #FFF6E8), two long
-upright ears with soft pastel-pink inner ears (#FFB3C7), huge round glossy
-dark-brown eyes, a tiny pink triangle nose, round pink blush cheeks, a cozy
-cobalt-blue scarf (#2B5CFF) tied around the neck with the knot on its right
-side, a tiny round powder-puff tail in electric blue (#2B5CFF), and chunky
-futuristic AR goggles with a soft cyan glow (#45E6FF) pushed up on its
-forehead.
-Cute kawaii chibi sticker illustration, plush-toy softness, soft volumetric
-shading with gentle gradients and glossy highlights, everything round and
-squishy, futuristic tech props with a soft cyan glow, clean uncluttered
-sci-fi accents, bold dark-brown outline around the character, clean white
-die-cut sticker border.
-```
-
-姿态后缀（加在角色卡后）：
-
-- hero：`Pose: standing upright, waving one front paw in a friendly hello,
-  happy open-mouth smile, ears perked up, full body visible.`
-- run：`Pose: sprinting to the right at full speed, body leaning forward,
-  ears streaming back in the wind, determined joyful grin, a faint cyan
-  holographic speed streak trailing behind, full body visible.`
-- sleep：`Pose: curled up peacefully asleep, eyes closed, AR goggles pushed
-  up on the forehead, ears folded down softly, gentle smile, fluffy tail
-  tucked, full body visible.`
-- cheer：`Pose: jumping in joy holding up a tiny retro game controller with
-  one paw, eyes sparkling, big open-mouth cheer, a few small golden
-  four-pointed sparkle stars floating around, full body visible.`
-- code：`Pose: sitting and typing on a floating holographic keyboard glowing
-  soft cyan, a tiny friendly holographic drone buddy hovering beside it,
-  focused happy expression, ears perked up, full body visible.`
-- battle：`Pose: brave battle stance with a chunky glowing cyan energy
-  gauntlet on one front paw and a small round energy shield floating on the
-  other arm, determined confident smile, ears standing tall, full body
-  visible.`
-
-全部以 `Isolated and centered on a solid pure chroma-key green background
-(#00FF00), no ground shadow, no text, no letters, no symbols, no watermark.`
-收尾。
-
-## App 图标（image2 版，zan.ico / zan_ios_icon 的源）
+## 1. 角色卡：赞宝 (Zan-chan) 与大肥鹅 (Z-Goose)
 
 ```text
-Modern flat vector app icon: one rounded-corner square tile filled with a
-smooth diagonal gradient from periwinkle blue (#5E86FF) at the top-left to
-deep electric blue (#2141E6) at the bottom-right; the tile is centered and
-fills 88% of the canvas, on a solid pure chroma-key green background (#00FF00).
-On the tile: a cute minimal white bunny head with plump chubby cheeks and soft
-rounded shapes, two long upright rounded ears with pastel-pink inner ears
-(#FFB3C7), two small dark round eyes, a tiny pink nose, subtle soft shading,
-crisp clean edges. A small golden four-pointed sparkle star at the upper-right
-area of the tile. Clean modern design, no text, no letters, no border, no
-shadow.
+A delightful Japanese anime chibi sticker with a clean white die-cut border.
+An energetic anime craftswoman coder girl with silver-blue short hair and a golden feather hairclip, wearing a clean cream-white apron over a cobalt-blue shirt.
+Prominently, cleanly, and sharply printed on the center chest of her white apron is the brand-new official logo: a minimalist electric-blue geometric chubby goose whose posture forms the bold letter 'Z'.
+Beside her sits the actual physical mascot: an adorable, super-chubby, round, fat white goose with a slightly smug, funny derpy expression, plump like a giant dumpling, with an orange beak.
+The girl is proudly pointing to the goose logo on her apron with one hand and giving an enthusiastic thumbs-up with the other, winking cheerfully.
+High quality anime emote sticker art, crisp vector outlines, rich clean cel-shading, humorous and charming character dynamic, solid white background, no text.
 ```
 
-图标保持几何简笔（兔头 + 火花），**不戴护目镜**——mark 是最小可识别单元，
-科技叙事由吉祥物承担；16px 下护目镜必然糊成一团。
+## 2. 姿态变体
 
-## 踩坑记录
+- **hero（日常通过 / 官方认证）**：
+  `A refreshing anime craftswoman coder girl casually tucking an ultra-chubby, round, plump white battle goose under one arm like a watermelon. The big fat goose looks completely docile and derpy. The girl is proudly giving an energetic thumbs-up gesture, winking playfully.`
+- **battle / rage（报错 / 战神出击）**：
+  `An expressive anime craftswoman girl leaning backward with all her might, desperately pulling and trying to restrain a wildly angry, aggressive, super-chubby white battle goose. The goose has its long neck stretched out forward with beak wide open, furious cartoon eyes, flapping its wings violently, honking in total rage. The girl has a comically sweating and shouting expression.`
 
-- **API 会随机无视绿幕指令返纯黑卡**（一批六张里四张黑）。重生成时把绿幕
-  要求提到 prompt 最前并用硬性措辞（PROFESSIONAL CHROMA-KEY GREEN SCREEN /
-  Absolutely NO black background…），四张全部返绿。抠底脚本保留黑卡泛洪
-  路径兜底：阈值必须盖住 bg→贴纸的过渡环（亮度到 ~160），否则白边外留
-  一圈黑毛边（实测踩过：黑毛边在浅底上一眼可见，用户直接打回）。
-- 输出永远是**不透明 RGB**：透明底靠绿幕 + PIL 色度抠底（`postprocess.py`
-  的 `key_bg`），绿幕路径 `g>150 且 r<170 且 b<170` + 两轮 MinFilter 腐蚀去
-  绿边。贴纸白边 + 深棕描边把角色包了一圈，绿幕才敢用全图色度判断而不
-  是只清边缘。
-- 生成图绿底上会落**白色噪点斑块**（辉光渗出），色度键看不见——
-  `drop_specks` 按连通域面积清（<600px 的孤岛连同羽化晕一起删；无人机、
-  速度拖尾这类大件保留）。
-- 首版 prompt 写 `flat vector / flat cel shading`，生成结果太扁没肉感
-  （用户反馈「没肉感、立体一点圆润一点」）——改成 `plump pear-shaped body,
-  plush-toy softness, soft volumetric shading, everything round and squishy`
-  才出想要的圆胖质感。**风格词决定体积感，角色卡决定一致性**，两段都要。
-- 第二轮用户定位「卡哇伊科技兔：全平台编程、智能体、软件、游戏、能打能战」
-  ——科技感走**道具**（护目镜/全息键盘/无人机/能量臂铠）而不是改身体：
-  身体保持奶油白毛绒，科技件一律 Glow 青辉光小件。把科技感写进体型或
-  换主色调会毁掉贴纸萌系的一致性。
+## 3. App 矢量图标规格（Z-Goose Mark）
+
+```text
+Modern flat vector app icon: one rounded-corner square tile filled with a smooth diagonal gradient from electric blue (#4F79FF) to deep volt (#1D3CDA).
+On the tile: a solid white chubby goose whose head, long neck, and plump floating belly naturally and cleanly trace the bold geometric letter 'Z', featuring a golden-orange lightning beak and an innocent round dark eye. A golden four-pointed spark star at the upper-right corner.
+```
