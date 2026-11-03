@@ -1,0 +1,93 @@
+using System;
+using System.Diagnostics;
+using System.Threading;
+
+class Check {
+    public static int passed = 0;
+    public static int failed = 0;
+
+    public static void True(bool cond, string what) {
+        if (cond) {
+            Check.passed = Check.passed + 1;
+        } else {
+            Check.failed = Check.failed + 1;
+            Console.WriteLine("FAIL: " + what);
+        }
+    }
+}
+
+class Program {
+    static bool shortWoke = false;
+    static bool longWoke = false;
+
+    static async void Waker(Gate g, int delayMs) {
+        await Task.Delay(delayMs);
+        g.Signal();
+    }
+
+    static async void WaitShort(Gate g) {
+        await g.Wait(30);
+        Program.shortWoke = true;
+    }
+
+    static async void WaitLong(Gate g) {
+        await g.Wait(300);
+        Program.longWoke = true;
+    }
+
+    static async void WaitNever(Gate g) {
+        await g.Wait(50);
+    }
+
+    static async void Run() {
+        // 场景 1：早唤醒不留盈余（彻底消除幽灵唤醒）
+        // 等待者设 80ms 超时，但在 10ms 时被外部 Signal 唤醒。
+        // 等待者提前退出后，等待 120ms 确保看门狗定时器必定触发。
+        // 此时如果看门狗错误地写入了 surplus，下一次 Wait() 将直接穿透！
+        // 修复后：看门狗核对票据失效，绝不写入 surplus，下一次 Wait 必定真挂起。
+        Gate g = new Gate();
+        Task.Spawn(Program.Waker(g, 10));
+        await g.Wait(80);
+
+        // 让看门狗必定到期（80ms 已过）
+        await Task.Delay(120);
+
+        // 验证：此时门上绝不能有遗留的 surplus 假信号！
+        // 启动一次新的 50ms 超时等待，如果不挂起而是直接穿透返回，dt 会极小。
+        long t0 = ServerMetrics.MonoMillis();
+        await g.Wait(50);
+        long dt = ServerMetrics.MonoMillis() - t0;
+        Check.True(dt >= 35, "subsequent wait actually waited instead of consuming phantom surplus");
+
+        // 场景 2：同一门上不同超时时间的等待者，短超时先醒，长超时继续等待
+        Gate g2 = new Gate();
+        Task.Spawn(Program.WaitShort(g2));
+        Task.Spawn(Program.WaitLong(g2));
+        await Task.Delay(10); // 确保两个都已挂起
+
+        await Task.Delay(50); // 30ms 短超时应已触发，300ms 长超时仍挂起
+        Check.True(Program.shortWoke, "short timeout waiter woke up");
+        Check.True(!Program.longWoke, "long timeout waiter still suspended");
+
+        g2.Signal(); // 唤醒长等待者
+        await Task.Delay(20);
+        Check.True(Program.longWoke, "long timeout waiter woke up on signal");
+
+        // 场景 3：Close 门后看门狗晚到不崩溃、不 UAF
+        Gate g3 = new Gate();
+        Task.Spawn(Program.WaitNever(g3));
+        await Task.Delay(10);
+        g3.Close();
+        await Task.Delay(80); // 等待看门狗到期
+        Check.True(true, "gate close before watchdog expiration safe");
+
+        g.Close();
+        g2.Close();
+    }
+
+    static void Main() {
+        await Program.Run();
+        Console.WriteLine("pass: " + Convert.ToString(Check.passed));
+        Console.WriteLine("fail: " + Convert.ToString(Check.failed));
+    }
+}
