@@ -439,7 +439,8 @@ static bool emit_span_call(zan_irgen_t *g, zan_ast_node_t *expr,
     LLVMTypeRef i8 = LLVMInt8TypeInContext(g->ctx);
     LLVMTypeRef i8ptr = LLVMPointerType(i8, 0);
     LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
-    if (mm.len == 6 && memcmp(mm.str, "AsSpan", 6) == 0) {
+    if ((mm.len == 6 && memcmp(mm.str, "AsSpan", 6) == 0) ||
+        (mm.len == 14 && memcmp(mm.str, "AsReadOnlySpan", 14) == 0)) {
         zan_type_t *ot = infer_expr_type(g, callee->member.object, locals);
         if (!ot) return false;
         LLVMValueRef base = NULL;
@@ -455,6 +456,7 @@ static bool emit_span_call(zan_irgen_t *g, zan_ast_node_t *expr,
             base = emit_str_nonnull(g, sobj);
             len = emit_string_length(g, base, callee->loc);
             elem_llvm = span_elem_storage_type(g, g->binder->type_char);
+
         } else {
             return false;
         }

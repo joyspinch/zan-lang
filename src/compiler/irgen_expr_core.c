@@ -2142,12 +2142,17 @@ static zan_type_t *infer_expr_type_raw(zan_irgen_t *g, zan_ast_node_t *e,
         }
         if (callee->kind == AST_MEMBER_ACCESS) {
             zan_istr_t mm = callee->member.name;
-            if (mm.len == 6 && memcmp(mm.str, "AsSpan", 6) == 0) {
+            if ((mm.len == 6 && memcmp(mm.str, "AsSpan", 6) == 0) ||
+                (mm.len == 14 && memcmp(mm.str, "AsReadOnlySpan", 14) == 0)) {
+                bool is_ro = (mm.len == 14);
                 zan_type_t *aot = infer_expr_type(g, callee->member.object, locals);
                 if (aot && aot->kind == TYPE_ARRAY && aot->element_type)
-                    return zan_binder_make_span_type(g->binder, aot->element_type);
+                    return is_ro
+                        ? zan_binder_make_readonly_span_type(g->binder, aot->element_type)
+                        : zan_binder_make_span_type(g->binder, aot->element_type);
                 if (aot && aot->kind == TYPE_STRING)
                     return zan_binder_make_readonly_span_type(g->binder, g->binder->type_char);
+
                 if (is_span_type(aot)) return aot;
             }
             if (mm.len == 5 && memcmp(mm.str, "Slice", 5) == 0) {

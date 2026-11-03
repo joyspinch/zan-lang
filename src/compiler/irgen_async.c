@@ -1579,7 +1579,9 @@ static zan_type_t *foreach_proto_enum_type(zan_irgen_t *g, zan_type_t *ct) {
     if (!ct || !ct->sym ||
         (ct->kind != TYPE_CLASS && ct->kind != TYPE_INTERFACE)) return NULL;
     zan_istr_t gi = { (char *)"GetEnumerator", 13 };
-    zan_symbol_t *gm = resolve_overload(ct->sym, gi, 0, 0);
+    zan_symbol_t *gm = ct->kind == TYPE_INTERFACE
+        ? resolve_iface_overload(ct->sym, gi, 0, 0)
+        : resolve_overload(ct->sym, gi, 0, 0);
     zan_type_t *et = NULL;
     if (gm && gm->decl && gm->decl->kind == AST_METHOD_DECL &&
         gm->decl->method_decl.return_type)
@@ -1590,8 +1592,14 @@ static zan_type_t *foreach_proto_enum_type(zan_irgen_t *g, zan_type_t *ct) {
         return NULL;
     zan_istr_t ni = { (char *)"MoveNext", 8 };
     zan_istr_t ci = { (char *)"Current", 7 };
-    if (!resolve_overload(et->sym, ni, 0, 0)) return NULL;
-    if (resolve_overload(et->sym, ci, 0, 0)) return et;
+    zan_symbol_t *next_m = et->kind == TYPE_INTERFACE
+        ? resolve_iface_overload(et->sym, ni, 0, 0)
+        : resolve_overload(et->sym, ni, 0, 0);
+    if (!next_m) return NULL;
+    zan_symbol_t *cur_m = et->kind == TYPE_INTERFACE
+        ? resolve_iface_overload(et->sym, ci, 0, 0)
+        : resolve_overload(et->sym, ci, 0, 0);
+    if (cur_m) return et;
     for (int i = 0; i < et->sym->member_count; i++) {
         zan_symbol_t *m = et->sym->members[i];
         if (m && m->kind == SYM_PROPERTY && member_name_is(m, ci) &&
@@ -1605,7 +1613,9 @@ static zan_type_t *foreach_proto_current_type(zan_irgen_t *g, zan_type_t *ct) {
     zan_type_t *et = foreach_proto_enum_type(g, ct);
     if (!et) return NULL;
     zan_istr_t ci = { (char *)"Current", 7 };
-    zan_symbol_t *cm = resolve_overload(et->sym, ci, 0, 0);
+    zan_symbol_t *cm = et->kind == TYPE_INTERFACE
+        ? resolve_iface_overload(et->sym, ci, 0, 0)
+        : resolve_overload(et->sym, ci, 0, 0);
     if (cm && cm->decl && cm->decl->kind == AST_METHOD_DECL &&
         cm->decl->method_decl.return_type) {
         zan_type_t *cur = resolve_type_ctx(g, cm->decl->method_decl.return_type);

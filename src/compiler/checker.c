@@ -97,14 +97,18 @@ static zan_type_t *builtin_call_result_type(zan_checker_t *c,
     else if (recv->kind == TYPE_CLASS && recv->name.len == 13 &&
              memcmp(recv->name.str, "StringBuilder", 13) == 0)
         bt = "StringBuilder";
-    if (recv->kind == TYPE_STRING && name.len == 6 &&
-        memcmp(name.str, "AsSpan", 6) == 0) {
+    if (recv->kind == TYPE_STRING &&
+        ((name.len == 6 && memcmp(name.str, "AsSpan", 6) == 0) ||
+         (name.len == 14 && memcmp(name.str, "AsReadOnlySpan", 14) == 0))) {
         return zan_binder_make_readonly_span_type(c->binder, c->binder->type_char);
     }
-    if (recv->kind == TYPE_ARRAY && recv->element_type && name.len == 6 &&
-        memcmp(name.str, "AsSpan", 6) == 0) {
-        return zan_binder_make_span_type(c->binder, recv->element_type);
+    if (recv->kind == TYPE_ARRAY && recv->element_type) {
+        if (name.len == 6 && memcmp(name.str, "AsSpan", 6) == 0)
+            return zan_binder_make_span_type(c->binder, recv->element_type);
+        if (name.len == 14 && memcmp(name.str, "AsReadOnlySpan", 14) == 0)
+            return zan_binder_make_readonly_span_type(c->binder, recv->element_type);
     }
+
     if (recv->kind == TYPE_STRUCT &&
         ((recv->name.len == 4 && memcmp(recv->name.str, "Span", 4) == 0) ||
          (recv->name.len == 12 && memcmp(recv->name.str, "ReadOnlySpan", 12) == 0)) &&
@@ -206,6 +210,15 @@ static zan_symbol_t *checker_find_method(zan_symbol_t *type_sym, zan_istr_t name
                 m->name.len == name.len &&
                 memcmp(m->name.str, name.str, (size_t)name.len) == 0)
                 return m;
+        }
+        if (type_sym->kind == SYM_INTERFACE && type_sym->type && type_sym->type->interfaces) {
+            for (int i = 0; i < type_sym->type->interface_count; i++) {
+                zan_type_t *it = type_sym->type->interfaces[i];
+                if (it && it->sym) {
+                    zan_symbol_t *im = checker_find_method(it->sym, name);
+                    if (im) return im;
+                }
+            }
         }
         type_sym = (type_sym->type && type_sym->type->base_type)
             ? type_sym->type->base_type->sym : NULL;
@@ -1413,6 +1426,61 @@ static bool checker_type_assignable(zan_type_t *target, zan_type_t *value) {
         }
         return false;
     case TYPE_INTERFACE:
+        if (target->name.str) {
+            /* 内建集合接口赋值规则（IEnumerable / IReadOnlyCollection / IReadOnlyList / IList / ICollection） */
+            bool is_ro_coll = (target->name.len == 19 && memcmp(target->name.str, "IReadOnlyCollection", 19) == 0);
+            bool is_ro_list = (target->name.len == 13 && memcmp(target->name.str, "IReadOnlyList", 13) == 0);
+            bool is_enumerable = (target->name.len == 11 && memcmp(target->name.str, "IEnumerable", 11) == 0);
+            bool is_list_iface = (target->name.len == 5 && memcmp(target->name.str, "IList", 5) == 0);
+            bool is_coll_iface = (target->name.len == 11 && memcmp(target->name.str, "ICollection", 11) == 0);
+            if (is_ro_coll || is_ro_list || is_enumerable || is_list_iface || is_coll_iface) {
+                zan_type_t *te = (target->type_args && target->type_arg_count > 0) ? target->type_args[0] : NULL;
+                /* List<T> -> 集合接口 */
+                if (value->kind == TYPE_CLASS && value->name.len == 4 && memcmp(value->name.str, "List", 4) == 0) {
+                    zan_type_t *ve = (value->type_args && value->type_arg_count > 0) ? value->type_args[0] : NULL;
+                    if (!te || !ve || checker_type_assignable(te, ve)) return true;
+                }
+                /* T[] -> 集合接口 */
+                if (value->kind == TYPE_ARRAY && value->element_type) {
+                    if (!te || checker_type_assignable(te, value->element_type)) return true;
+                }
+                /* 接口间只读派生关系：IReadOnlyList<T> -> IReadOnlyCollection<T> -> IEnumerable<T> */
+                if (value->kind == TYPE_INTERFACE && value->name.str) {
+                    zan_type_t *ve = (value->type_args && value->type_arg_count > 0) ? value->type_args[0] : NULL;
+                    bool v_is_ro_list = (value->name.len == 13 && memcmp(value->name.str, "IReadOnlyList", 13) == 0);
+                    bool v_is_ro_coll = (value->name.len == 19 && memcmp(value->name.str, "IReadOnlyCollection", 19) == 0);
+                    if (is_enumerable && (v_is_ro_list || v_is_ro_coll)) {
+                        if (!te || !ve || checker_type_assignable(te, ve)) return true;
+                    }
+                    if (is_ro_coll && v_is_ro_list) {
+                        if (!te || !ve || checker_type_assignable(te, ve)) return true;
+                    }
+                }
+            }
+            /* 字典接口规则（IReadOnlyDictionary / IDictionary） */
+            bool is_ro_dict = (target->name.len == 19 && memcmp(target->name.str, "IReadOnlyDictionary", 19) == 0);
+            bool is_dict_iface = (target->name.len == 11 && memcmp(target->name.str, "IDictionary", 11) == 0);
+            if (is_ro_dict || is_dict_iface) {
+                zan_type_t *tk = (target->type_args && target->type_arg_count > 0) ? target->type_args[0] : NULL;
+                zan_type_t *tv = (target->type_args && target->type_arg_count > 1) ? target->type_args[1] : NULL;
+                if (value->kind == TYPE_CLASS && ((value->name.len == 10 && memcmp(value->name.str, "Dictionary", 10) == 0) ||
+                                                  (value->name.len == 4 && memcmp(value->name.str, "Dict", 4) == 0))) {
+                    zan_type_t *vk = (value->type_args && value->type_arg_count > 0) ? value->type_args[0] : NULL;
+                    zan_type_t *vv = (value->type_args && value->type_arg_count > 1) ? value->type_args[1] : NULL;
+                    if ((!tk || !vk || checker_type_assignable(tk, vk)) &&
+                        (!tv || !vv || checker_type_assignable(tv, vv)))
+                        return true;
+                }
+                if (value->kind == TYPE_INTERFACE && is_ro_dict &&
+                    value->name.len == 11 && memcmp(value->name.str, "IDictionary", 11) == 0) {
+                    zan_type_t *vk = (value->type_args && value->type_arg_count > 0) ? value->type_args[0] : NULL;
+                    zan_type_t *vv = (value->type_args && value->type_arg_count > 1) ? value->type_args[1] : NULL;
+                    if ((!tk || !vk || checker_type_assignable(tk, vk)) &&
+                        (!tv || !vv || checker_type_assignable(tv, vv)))
+                        return true;
+                }
+            }
+        }
         if (value->kind == TYPE_INTERFACE || value->kind == TYPE_CLASS ||
             value->kind == TYPE_STRUCT) {
             if (same_generic_container(target, value) &&
@@ -4397,7 +4465,7 @@ void zan_checker_check_stmt(zan_checker_t *c, zan_ast_node_t *stmt) {
             if (col) {
                 if (col->kind == TYPE_ARRAY) {
                     elem = col->element_type;
-                } else if (col->kind == TYPE_CLASS || col->kind == TYPE_STRUCT) {
+                } else if (col->kind == TYPE_CLASS || col->kind == TYPE_STRUCT || col->kind == TYPE_INTERFACE) {
                     zan_symbol_t *csym = col->sym;
                     if (csym) {
                         zan_istr_t gi = { (char *)"GetEnumerator", 13 };
@@ -4428,7 +4496,7 @@ void zan_checker_check_stmt(zan_checker_t *c, zan_ast_node_t *stmt) {
                     }
                     if (elem && elem->kind == TYPE_TYPE_PARAM) {
                         if (col->type_args && col->type_arg_count > 0 && csym && csym->decl &&
-                            (csym->decl->kind == AST_CLASS_DECL || csym->decl->kind == AST_STRUCT_DECL)) {
+                            (csym->decl->kind == AST_CLASS_DECL || csym->decl->kind == AST_STRUCT_DECL || csym->decl->kind == AST_INTERFACE_DECL)) {
                             zan_ast_list_t *tps = &csym->decl->type_decl.type_params;
                             if (tps->count == col->type_arg_count) {
                                 elem = zan_binder_subst_named(c->binder, elem, tps, col->type_args);
@@ -4438,7 +4506,7 @@ void zan_checker_check_stmt(zan_checker_t *c, zan_ast_node_t *stmt) {
                             elem = col->type_args[0];
                         }
                     }
-                    if (!elem && col->kind == TYPE_CLASS && col->type_arg_count == 1) {
+                    if (!elem && (col->kind == TYPE_CLASS || col->kind == TYPE_INTERFACE) && col->type_arg_count == 1) {
                         elem = col->type_args[0];
                     }
                 }
