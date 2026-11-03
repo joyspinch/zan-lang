@@ -1,0 +1,109 @@
+using System;
+using System.Security.Cryptography;
+using Zan.Web3.Types;
+using Zan.Web3.Encoding;
+using Zan.Web3.Rpc;
+
+namespace Zan.Web3.Contracts;
+
+// 智能合约动态交互门面 (Smart Contract Facade)
+// 统一封装智能合约的只读调用 (eth_call)、强类型返回值反序列化，以及状态变更交易的离线签名与节点广播。
+public class Contract {
+
+    public Address ContractAddress;     // 目标智能合约部署地址
+    public Web3Client Client;           // 绑定的 Web3 节点通信客户端
+    public long ChainId;                // 目标区块链网络 ChainId
+
+    public Contract(Address contractAddress, Web3Client client, long chainId) {
+        ContractAddress = contractAddress != null ? contractAddress : Address.Zero;
+        Client = client != null ? client : new Web3Client("http://127.0.0.1:8545");
+        ChainId = chainId > 0 ? chainId : 1;
+    }
+
+    // 组合 4 字节函数选择器与 ABI 编码参数字节流为最终完整的 calldata 字节数组
+    public static byte[] BuildCalldata(string functionSignature, byte[] encodedArgs) {
+        byte[] sel = Abi.GetFunctionSelector(functionSignature);
+        int argLen = encodedArgs != null ? encodedArgs.Length : 0;
+        byte[] calldata = new byte[4 + argLen];
+        for (int i = 0; i < 4; i = i + 1) {
+            calldata[i] = sel[i];
+        }
+        for (int i = 0; i < argLen; i = i + 1) {
+            calldata[4 + i] = encodedArgs[i];
+        }
+        return calldata;
+    }
+
+    // 执行智能合约只读调用并获取原始十六进制响应 (eth_call)
+    public string CallRaw(string functionSignature, byte[] encodedArgs) {
+        byte[] calldata = BuildCalldata(functionSignature, encodedArgs);
+        string calldataHex = "0x" + Hex.Encode(calldata, calldata.Length);
+        return Client.Call(ContractAddress, calldataHex, "latest");
+    }
+
+    // 只读调用并反序列化为 uint256 大整数
+    public BigInt CallUint256(string functionSignature, byte[] encodedArgs) {
+        string resHex = CallRaw(functionSignature, encodedArgs);
+        return Abi.DecodeUint256(resHex);
+    }
+
+    // 只读调用并反序列化为 Address 地址
+    public Address CallAddress(string functionSignature, byte[] encodedArgs) {
+        string resHex = CallRaw(functionSignature, encodedArgs);
+        return Abi.DecodeAddress(resHex);
+    }
+
+    // 只读调用并反序列化为 bool 布尔值
+    public bool CallBool(string functionSignature, byte[] encodedArgs) {
+        string resHex = CallRaw(functionSignature, encodedArgs);
+        return Abi.DecodeBool(resHex);
+    }
+
+    // 只读调用并反序列化为 dynamic string 文本
+    public string CallString(string functionSignature, byte[] encodedArgs) {
+        string resHex = CallRaw(functionSignature, encodedArgs);
+        return Abi.DecodeString(resHex);
+    }
+
+    // 构造、离线签名并广播状态修改型合约交互交易 (EIP-1559 Type-2)
+    // 返回节点接收确认后的交易哈希 (txHash)
+    public string SendTransaction(
+        Account signer,
+        string functionSignature,
+        byte[] encodedArgs,
+        BigInt value,
+        long gasLimit,
+        BigInt maxFeePerGas,
+        BigInt maxPriorityFee
+    ) {
+        if (signer == null || signer.PrivateKey == null) {
+            return null;
+        }
+
+        // 1. 查询签名账户当前在网络中的 Nonce
+        long nonce = Client.GetTransactionCount(signer.Address, "pending");
+
+        // 2. 构造合约调用的 calldata
+        byte[] calldata = BuildCalldata(functionSignature, encodedArgs);
+
+        // 3. 构建 EIP-1559 现代交易实体
+        Transaction tx = new Transaction();
+        tx.ChainId = ChainId;
+        tx.Nonce = nonce;
+        tx.To = ContractAddress;
+        tx.Value = value != null ? value : BigInt.zero();
+        tx.Data = calldata;
+        tx.GasLimit = gasLimit > 0 ? gasLimit : 100000;
+        tx.MaxFeePerGas = maxFeePerGas != null ? maxFeePerGas : EtherUnit.FromGwei(20);
+        tx.MaxPriorityFeePerGas = maxPriorityFee != null ? maxPriorityFee : EtherUnit.FromGwei(2);
+
+        // 4. 账户离线 Secp256k1 签名
+        string rawTxHex = signer.SignTransaction(tx);
+        if (rawTxHex == null) {
+            return null;
+        }
+
+        // 5. 广播至区块链网络
+        return Client.SendRawTransaction(rawTxHex);
+    }
+}
