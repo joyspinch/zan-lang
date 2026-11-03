@@ -154,6 +154,7 @@ static int g_gate_sm3    = 0;
 static int g_gate_aes    = 0;
 static int g_gate_ghash  = 0;
 static int g_gate_crc32c = 0;
+static int g_gate_crc32  = 0;
 static int g_gate_sm4    = 0;
 
 static int zan_hw_gate(int *state, int feature, int (*kat)(void)) {
@@ -174,6 +175,7 @@ int zan_hw_kat_state(int id) {
         case 13:         return g_gate_sha512;
         case 14:         return g_gate_sm3;
         case 16:         return g_gate_crc32c;
+        case 17:         return g_gate_crc32;
         case 15:         return g_gate_sm4;
         default:         return -1;
     }
@@ -1162,12 +1164,13 @@ static int64_t zan_aes_cbc_decrypt_ni(const uint8_t *in, int64_t len,
     }
 
     uint8_t pad_val = out[len - 1];
-    if (pad_val == 0 || pad_val > 16) return -1;
-    int bad = 0;
-    for (int i = 0; i < pad_val; i++) {
-        if (out[len - 1 - i] != pad_val) bad = 1;
+    int bad = (pad_val == 0 || pad_val > 16);
+    for (int i = 0; i < 16; i++) {
+        int diff = (out[len - 1 - i] ^ pad_val);
+        int in_pad = (i < pad_val);
+        if (in_pad && diff != 0) bad = 1;
     }
-    if (bad) return -1;
+    if (bad) return -2;
     return len - pad_val;
 }
 
@@ -1438,12 +1441,13 @@ static int64_t zan_aes_cbc_decrypt_arm(const uint8_t *in, int64_t len,
     }
 
     uint8_t pad_val = out[len - 1];
-    if (pad_val == 0 || pad_val > 16) return -1;
-    int bad = 0;
-    for (int i = 0; i < pad_val; i++) {
-        if (out[len - 1 - i] != pad_val) bad = 1;
+    int bad = (pad_val == 0 || pad_val > 16);
+    for (int i = 0; i < 16; i++) {
+        int diff = (out[len - 1 - i] ^ pad_val);
+        int in_pad = (i < pad_val);
+        if (in_pad && diff != 0) bad = 1;
     }
-    if (bad) return -1;
+    if (bad) return -2;
     return len - pad_val;
 }
 
@@ -1554,6 +1558,17 @@ static uint32_t zan_crc32c_pmull_arm(uint32_t crc, const uint8_t *p, int64_t n) 
     if (n >= 2) { c = __crc32ch((uint32_t)c, *(const uint16_t*)p); p += 2; n -= 2; }
     if (n >= 1) { c = __crc32cb((uint32_t)c, *p); }
     return (uint32_t)c;
+}
+
+__attribute__((target("crc")))
+static uint32_t zan_crc32_arm(uint32_t crc, const uint8_t *p, int64_t n) {
+    uint64_t c = (uint64_t)(crc ^ 0xFFFFFFFFu);
+    while (n >= 8 && ((uintptr_t)p & 7)) { c = __crc32b((uint32_t)c, *p++); n--; }
+    while (n >= 8) { c = __crc32d((uint32_t)c, *(const uint64_t*)p); p += 8; n -= 8; }
+    if (n >= 4) { c = __crc32w((uint32_t)c, *(const uint32_t*)p); p += 4; n -= 4; }
+    if (n >= 2) { c = __crc32h((uint32_t)c, *(const uint16_t*)p); p += 2; n -= 2; }
+    if (n >= 1) { c = __crc32b((uint32_t)c, *p); }
+    return (uint32_t)c ^ 0xFFFFFFFFu;
 }
 
 #endif /* aarch64 aes/ghash/crc32c */
@@ -1701,6 +1716,15 @@ static int zan_crc32c_kat(void) {
     return zan_crc32c_sse42(0xFFFFFFFFu, (const uint8_t*)"123456789", 9) == 0x1CF96D7Cu;
 #elif (defined(__aarch64__) || defined(_M_ARM64)) && (defined(__GNUC__) || defined(__clang__))
     return zan_crc32c_pmull_arm(0xFFFFFFFFu, (const uint8_t*)"123456789", 9) == 0x1CF96D7Cu;
+#else
+    return 1;
+#endif
+}
+
+static int zan_crc32_kat(void) {
+    /* IEEE 802.3: CRC-32("123456789") = 0xCBF43926 */
+#if (defined(__aarch64__) || defined(_M_ARM64)) && (defined(__GNUC__) || defined(__clang__))
+    return zan_crc32_arm(0, (const uint8_t*)"123456789", 9) == 0xCBF43926u;
 #else
     return 1;
 #endif
@@ -2340,6 +2364,66 @@ int64_t zan_hw_crc32c_update(uint32_t crc, const uint8_t *p, int64_t len) {
     }
 #endif
     return -1;
+}
+
+static uint32_t s_zan_crc32_table[8][256];
+static int s_zan_crc32_inited = 0;
+
+static void zan_init_crc32_slice8(void) {
+    if (s_zan_crc32_inited) return;
+    for (uint32_t i = 0; i < 256; i++) {
+        uint32_t c = i;
+        for (int k = 0; k < 8; k++) {
+            c = (c & 1) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
+        }
+        s_zan_crc32_table[0][i] = c;
+    }
+    for (int k = 1; k < 8; k++) {
+        for (uint32_t i = 0; i < 256; i++) {
+            s_zan_crc32_table[k][i] = (s_zan_crc32_table[k - 1][i] >> 8) ^
+                                      s_zan_crc32_table[0][s_zan_crc32_table[k - 1][i] & 0xFF];
+        }
+    }
+    s_zan_crc32_inited = 1;
+}
+
+static uint32_t zan_crc32_slice8(uint32_t crc, const uint8_t *buf, int64_t len) {
+    zan_init_crc32_slice8();
+    uint32_t c = crc ^ 0xFFFFFFFFu;
+    const uint8_t *p = buf;
+    while (len > 0 && ((uintptr_t)p & 7)) {
+        c = s_zan_crc32_table[0][(c ^ *p++) & 0xFF] ^ (c >> 8);
+        len--;
+    }
+    while (len >= 8) {
+        uint32_t one = *(const uint32_t*)p ^ c;
+        uint32_t two = *(const uint32_t*)(p + 4);
+        c = s_zan_crc32_table[7][one & 0xFF] ^
+            s_zan_crc32_table[6][(one >> 8) & 0xFF] ^
+            s_zan_crc32_table[5][(one >> 16) & 0xFF] ^
+            s_zan_crc32_table[4][(one >> 24) & 0xFF] ^
+            s_zan_crc32_table[3][two & 0xFF] ^
+            s_zan_crc32_table[2][(two >> 8) & 0xFF] ^
+            s_zan_crc32_table[1][(two >> 16) & 0xFF] ^
+            s_zan_crc32_table[0][(two >> 24) & 0xFF];
+        p += 8;
+        len -= 8;
+    }
+    while (len > 0) {
+        c = s_zan_crc32_table[0][(c ^ *p++) & 0xFF] ^ (c >> 8);
+        len--;
+    }
+    return c ^ 0xFFFFFFFFu;
+}
+
+int64_t zan_hw_crc32_update(uint32_t crc, const uint8_t *p, int64_t len) {
+    if (len < 0 || !p) return -1;
+#if (defined(__aarch64__) || defined(_M_ARM64)) && (defined(__GNUC__) || defined(__clang__))
+    if (zan_hw_gate(&g_gate_crc32, zan_hw_arm_crc32(), zan_crc32_kat)) {
+        return (int64_t)zan_crc32_arm(crc, p, len);
+    }
+#endif
+    return (int64_t)zan_crc32_slice8(crc, p, len);
 }
 
 static uint8_t zan_aes_inv_sbox[256];
@@ -3764,10 +3848,13 @@ int64_t zan_hw_sm4_cbc_decrypt(const uint8_t *in, int64_t len,
     }
 
     uint8_t pad_val = out[len - 1];
-    if (pad_val == 0 || pad_val > 16) return -1;
-    for (int i = 0; i < pad_val; i++) {
-        if (out[len - 1 - i] != pad_val) return -1;
+    int bad = (pad_val == 0 || pad_val > 16);
+    for (int i = 0; i < 16; i++) {
+        int diff = (out[len - 1 - i] ^ pad_val);
+        int in_pad = (i < pad_val);
+        if (in_pad && diff != 0) bad = 1;
     }
+    if (bad) return -1;
     return len - pad_val;
 }
 
@@ -3786,6 +3873,9 @@ static void zan_b64_init_dec_table(void) {
         ZAN_B64_DEC_TABLE[(uint8_t)ZAN_B64_ENC_TABLE[i]] = (uint8_t)i;
     }
     ZAN_B64_DEC_TABLE['='] = 0;
+    /* URL-safe RFC 4648 §5: '-' -> 62, '_' -> 63 */
+    ZAN_B64_DEC_TABLE[(uint8_t)'-'] = 62;
+    ZAN_B64_DEC_TABLE[(uint8_t)'_'] = 63;
     zan_b64_dec_inited = 1;
 }
 
@@ -3861,18 +3951,18 @@ int64_t zan_hw_base64_decode(const char *src, int64_t len, uint8_t *dst) {
     if (!src || len <= 0 || !dst) return 0;
     zan_b64_init_dec_table();
 
-    if ((len & 3) != 0) return -1;
+    while (len > 0 && src[len - 1] == '=') len--;
+    int rem_mod = (int)(len & 3);
+    if (rem_mod == 1) return -1;
 
-    int pad = 0;
-    if (len > 0 && src[len - 1] == '=') pad++;
-    if (len > 1 && src[len - 2] == '=') pad++;
-
-    int64_t plain_len = (len / 4) * 3 - pad;
+    int64_t full_quads = len / 4;
+    int64_t plain_len = full_quads * 3 + (rem_mod == 2 ? 1 : (rem_mod == 3 ? 2 : 0));
     if (plain_len < 0) return -1;
 
     const uint8_t *s = (const uint8_t *)src;
     uint8_t *d = dst;
-    int64_t rem = len - (pad ? 4 : 0);
+    int64_t rem = full_quads * 4;
+
 
     while (rem >= 16) {
         uint8_t a0 = ZAN_B64_DEC_TABLE[s[0]],  b0 = ZAN_B64_DEC_TABLE[s[1]],  c0 = ZAN_B64_DEC_TABLE[s[2]],  d0 = ZAN_B64_DEC_TABLE[s[3]];
@@ -3913,24 +4003,40 @@ int64_t zan_hw_base64_decode(const char *src, int64_t len, uint8_t *dst) {
         rem -= 4;
     }
 
-    if (pad > 0) {
+    if (rem_mod == 2) {
         uint8_t a = ZAN_B64_DEC_TABLE[s[0]];
         uint8_t b = ZAN_B64_DEC_TABLE[s[1]];
-        uint8_t c = (pad == 2) ? 0 : ZAN_B64_DEC_TABLE[s[2]];
-        uint8_t dd = 0;
+        if ((a | b) & 0x80) return -1;
+        if ((b & 0x0F) != 0) return -1; /* RFC 4648 unused bits */
+        d[0] = (uint8_t)((a << 2) | (b >> 4));
+        d += 1;
+    } else if (rem_mod == 3) {
+        uint8_t a = ZAN_B64_DEC_TABLE[s[0]];
+        uint8_t b = ZAN_B64_DEC_TABLE[s[1]];
+        uint8_t c = ZAN_B64_DEC_TABLE[s[2]];
         if ((a | b | c) & 0x80) return -1;
-        uint32_t n = ((uint32_t)a << 18) | ((uint32_t)b << 12) | ((uint32_t)c << 6) | dd;
-        if (pad == 1) {
-            d[0] = (uint8_t)(n >> 16);
-            d[1] = (uint8_t)(n >> 8);
-            d += 2;
-        } else if (pad == 2) {
-            d[0] = (uint8_t)(n >> 16);
-            d += 1;
-        }
+        if ((c & 0x03) != 0) return -1; /* RFC 4648 unused bits */
+        uint32_t n = ((uint32_t)a << 18) | ((uint32_t)b << 12) | ((uint32_t)c << 6);
+        d[0] = (uint8_t)(n >> 16);
+        d[1] = (uint8_t)(n >> 8);
+        d += 2;
     }
 
     return (int64_t)(d - dst);
+}
+
+static inline int zan_ctz64_local(uint64_t x) {
+#if defined(__GNUC__) || defined(__clang__)
+    return __builtin_ctzll(x);
+#elif defined(_MSC_VER)
+    unsigned long idx;
+    _BitScanForward64(&idx, x);
+    return (int)idx;
+#else
+    int n = 0;
+    while ((x & 1) == 0) { x >>= 1; n++; }
+    return n;
+#endif
 }
 
 static inline int zan_ctz32_local(uint32_t x) {
@@ -4028,6 +4134,32 @@ int64_t zan_hw_json_skip_whitespace(const uint8_t *buf, int64_t pos, int64_t len
         }
         pos += 16;
     }
+#elif (defined(__aarch64__) || defined(_M_ARM64)) && (defined(__GNUC__) || defined(__clang__))
+    if (g_has_neon) {
+        uint8x16_t v_sp = vdupq_n_u8(' ');
+        uint8x16_t v_tb = vdupq_n_u8('\t');
+        uint8x16_t v_nl = vdupq_n_u8('\n');
+        uint8x16_t v_cr = vdupq_n_u8('\r');
+        while (pos + 16 <= len) {
+            uint8x16_t v = vld1q_u8(p + pos);
+            uint8x16_t eq_sp = vceqq_u8(v, v_sp);
+            uint8x16_t eq_tb = vceqq_u8(v, v_tb);
+            uint8x16_t eq_nl = vceqq_u8(v, v_nl);
+            uint8x16_t eq_cr = vceqq_u8(v, v_cr);
+            uint8x16_t is_ws = vorrq_u8(vorrq_u8(eq_sp, eq_tb), vorrq_u8(eq_nl, eq_cr));
+            uint8x16_t non_ws = vmvnq_u8(is_ws);
+            uint64x2_t v64 = vreinterpretq_u64_u8(non_ws);
+            uint64_t lo = vgetq_lane_u64(v64, 0);
+            if (lo != 0) {
+                return pos + (zan_ctz64_local(lo) >> 3);
+            }
+            uint64_t hi = vgetq_lane_u64(v64, 1);
+            if (hi != 0) {
+                return pos + 8 + (zan_ctz64_local(hi) >> 3);
+            }
+            pos += 16;
+        }
+    }
 #endif
 
     while (pos < len) {
@@ -4069,6 +4201,29 @@ int64_t zan_hw_json_scan_string(const uint8_t *buf, int64_t pos, int64_t len) {
             }
         }
         pos += 16;
+    }
+#elif (defined(__aarch64__) || defined(_M_ARM64)) && (defined(__GNUC__) || defined(__clang__))
+    if (g_has_neon) {
+        uint8x16_t v_q = vdupq_n_u8('"');
+        uint8x16_t v_b = vdupq_n_u8('\\');
+        while (pos + 16 <= len) {
+            uint8x16_t v = vld1q_u8(p + pos);
+            uint8x16_t eq_q = vceqq_u8(v, v_q);
+            uint8x16_t eq_b = vceqq_u8(v, v_b);
+            uint8x16_t hit = vorrq_u8(eq_q, eq_b);
+            uint64x2_t v64 = vreinterpretq_u64_u8(hit);
+            uint64_t lo = vgetq_lane_u64(v64, 0);
+            if (lo != 0) {
+                int64_t target = pos + (zan_ctz64_local(lo) >> 3);
+                return (p[target] == '"') ? target : -(target + 1);
+            }
+            uint64_t hi = vgetq_lane_u64(v64, 1);
+            if (hi != 0) {
+                int64_t target = pos + 8 + (zan_ctz64_local(hi) >> 3);
+                return (p[target] == '"') ? target : -(target + 1);
+            }
+            pos += 16;
+        }
     }
 #endif
 

@@ -1,0 +1,173 @@
+using System;
+using System.IO;
+using System.IO.Compression;
+using System.Interop;
+
+class Program {
+    static void WriteU16(byte[] b, ref int off, int v) {
+        b[off] = (byte)(v & 255);
+        b[off + 1] = (byte)((v >> 8) & 255);
+        off = off + 2;
+    }
+
+    static void WriteU32(byte[] b, ref int off, long v) {
+        b[off] = (byte)(v & 255);
+        b[off + 1] = (byte)((v >> 8) & 255);
+        b[off + 2] = (byte)((v >> 16) & 255);
+        b[off + 3] = (byte)((v >> 24) & 255);
+        off = off + 4;
+    }
+
+    // 手工构造一个符合 PKWARE APPNOTE §4.3.9 规范的流式 ZIP 归档包：
+    // 本地文件头中通用位标志 bit 3 置位（0x0008），crc32/csize/usize 全为 0，
+    // 真实尺寸与 CRC32 严格存放于中央目录中。
+    static byte[] BuildStreamingZip(string name, byte[] payload, int method) {
+        byte[] comp = payload;
+        int crc = Crc32.Compute(payload, 0, payload.Length, 0);
+        int usize = payload.Length;
+        int csize = payload.Length;
+
+        if (method == Zip.MethodDeflate) {
+            comp = Deflate.Deflate(payload, 6);
+            csize = comp.Length;
+        }
+
+        int nameLen = name.Length;
+        // 计算各段偏移与总长度
+        int localLen = 30 + nameLen + csize;
+        int cdLen = 46 + nameLen;
+        int eocdLen = 22;
+        int total = localLen + cdLen + eocdLen;
+
+        byte[] zip = new byte[total];
+        int pos = 0;
+
+        // 1. 本地文件头（Local File Header）
+        WriteU32(zip, ref pos, Zip.SigLocal);
+        WriteU16(zip, ref pos, 20);      // 提取所需版本
+        WriteU16(zip, ref pos, 0x0008);  // 通用标志：Bit 3 置位（Data Descriptor 流式标志）
+        WriteU16(zip, ref pos, method);
+        WriteU16(zip, ref pos, 0);       // 修改时间
+        WriteU16(zip, ref pos, 0);       // 修改日期
+        WriteU32(zip, ref pos, 0);       // Bit 3 置位：本地头 CRC-32 必须为 0
+        WriteU32(zip, ref pos, 0);       // Bit 3 置位：本地头压缩大小必须为 0
+        WriteU32(zip, ref pos, 0);       // Bit 3 置位：本地头未压缩大小必须为 0
+        WriteU16(zip, ref pos, nameLen);
+        WriteU16(zip, ref pos, 0);       // 额外字段长度
+
+        for (int i = 0; i < nameLen; i = i + 1) {
+            zip[pos + i] = (byte)name[i];
+        }
+        pos = pos + nameLen;
+
+        // 写入压缩数据载荷
+        NativeMemory.Copy((nint)zip + (nint)pos, (nint)comp, csize);
+        pos = pos + csize;
+
+        int cdStart = pos;
+
+        // 2. 中央目录文件头（Central Directory Header）
+        WriteU32(zip, ref pos, Zip.SigCentral);
+        WriteU16(zip, ref pos, 20);      // 制作版本
+        WriteU16(zip, ref pos, 20);      // 提取所需版本
+        WriteU16(zip, ref pos, 0x0008);  // 通用标志：Bit 3
+        WriteU16(zip, ref pos, method);
+        WriteU16(zip, ref pos, 0);
+        WriteU16(zip, ref pos, 0);
+        WriteU32(zip, ref pos, crc);     // 中央目录存放权威真实 CRC-32
+        WriteU32(zip, ref pos, csize);   // 中央目录存放权威真实压缩大小
+        WriteU32(zip, ref pos, usize);   // 中央目录存放权威真实未压缩大小
+        WriteU16(zip, ref pos, nameLen);
+        WriteU16(zip, ref pos, 0);       // 额外字段
+        WriteU16(zip, ref pos, 0);       // 注释
+        WriteU16(zip, ref pos, 0);       // 磁盘编号
+        WriteU16(zip, ref pos, 0);       // 内部属性
+        WriteU32(zip, ref pos, 0);       // 外部属性
+        WriteU32(zip, ref pos, 0);       // 本地头偏移 0
+
+        for (int i = 0; i < nameLen; i = i + 1) {
+            zip[pos + i] = (byte)name[i];
+        }
+        pos = pos + nameLen;
+
+        // 3. 中央目录结束记录（EOCD）
+        WriteU32(zip, ref pos, Zip.SigEnd);
+        WriteU16(zip, ref pos, 0);       // 当前磁盘
+        WriteU16(zip, ref pos, 0);       // CD 起始磁盘
+        WriteU16(zip, ref pos, 1);       // 本磁盘条目数
+        WriteU16(zip, ref pos, 1);       // 总条目数
+        WriteU32(zip, ref pos, cdLen);   // CD 大小
+        WriteU32(zip, ref pos, cdStart); // CD 起始偏移
+        WriteU16(zip, ref pos, 0);       // 注释长度
+
+        return zip;
+    }
+
+    static void TestStreamingZipDeflate() {
+        string text = "Industrial-grade streaming ZIP archive extraction with Data Descriptor bit 3 in Zan standard library!";
+        byte[] payload = text.ToBytes();
+        string name = "streaming_deflate.txt";
+
+        byte[] zip = BuildStreamingZip(name, payload, Zip.MethodDeflate);
+
+        List<ZipEntry> entries = Zip.Read(zip);
+        if (entries == null || entries.Count != 1) {
+            Console.WriteLine("FAIL: Zip.Read returned null or invalid count");
+            Environment.Exit(1);
+        }
+
+        ZipEntry e = entries[0];
+        if (e.name != name || e.uncompressedSize != payload.Length) {
+            Console.WriteLine("FAIL: Entry metadata mismatch: " + e.name + ", usize=" + Convert.ToString(e.uncompressedSize));
+            Environment.Exit(2);
+        }
+
+        byte[] extracted = Zip.Extract(zip, e);
+        if (extracted == null) {
+            Console.WriteLine("FAIL: Zip.Extract returned null on streaming archive");
+            Environment.Exit(3);
+        }
+
+        string result = extracted.ToStr(0, extracted.Length);
+        if (result != text) {
+            Console.WriteLine("FAIL: Extracted content mismatch: " + result);
+            Environment.Exit(4);
+        }
+
+        Console.WriteLine("streaming zip deflate extract ok");
+    }
+
+    static void TestStreamingZipStored() {
+        string text = "Uncompressed stored payload inside a streaming ZIP container";
+        byte[] payload = text.ToBytes();
+        string name = "streaming_stored.txt";
+
+        byte[] zip = BuildStreamingZip(name, payload, Zip.MethodStored);
+
+        List<ZipEntry> entries = Zip.Read(zip);
+        if (entries == null || entries.Count != 1) {
+            Console.WriteLine("FAIL: Zip.Read stored failed");
+            Environment.Exit(5);
+        }
+
+        byte[] extracted = Zip.Extract(zip, entries[0]);
+        if (extracted == null) {
+            Console.WriteLine("FAIL: Zip.Extract stored returned null");
+            Environment.Exit(6);
+        }
+
+        string result = extracted.ToStr(0, extracted.Length);
+        if (result != text) {
+            Console.WriteLine("FAIL: Extracted stored content mismatch: " + result);
+            Environment.Exit(7);
+        }
+
+        Console.WriteLine("streaming zip stored extract ok");
+    }
+
+    static void Main() {
+        TestStreamingZipDeflate();
+        TestStreamingZipStored();
+        Console.WriteLine("ALL_STREAMING_ZIP_TESTS_OK");
+    }
+}

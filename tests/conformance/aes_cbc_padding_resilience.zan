@@ -1,0 +1,121 @@
+using System;
+using System.Security.Cryptography;
+
+class Program {
+    static void TestAesCbcValid() {
+        string key = "0123456789abcdef0123456789abcdef"; // 32 bytes AES-256
+        string iv = "abcdef9876543210";                   // 16 bytes IV
+        string plain = "Hello, industrial-grade production AES-CBC encryption in Zan!";
+
+        List<int> encOutLen = new List<int>(); encOutLen.Add(0);
+        byte[] enc = Aes.EncryptCbc(key, 32, iv, plain, plain.Length, encOutLen);
+        if (enc == null || enc.Length == 0 || enc.Length % 16 != 0) {
+            Console.WriteLine("FAIL: EncryptCbc returned null or invalid length");
+            Environment.Exit(1);
+        }
+
+        List<int> outLen = new List<int>(); outLen.Add(0);
+        string encStr = enc;
+        byte[] dec = Aes.DecryptCbc(key, 32, iv, encStr, enc.Length, outLen);
+        if (dec == null || outLen[0] != plain.Length) {
+            Console.WriteLine("FAIL: DecryptCbc failed on valid ciphertext");
+            Environment.Exit(2);
+        }
+
+        string decStr = dec.ToStr(0, outLen[0]);
+        if (decStr != plain) {
+            Console.WriteLine("FAIL: Decrypted text mismatch: " + decStr);
+            Environment.Exit(3);
+        }
+
+        Console.WriteLine("aes cbc valid ok");
+    }
+
+    static void TestAesCbcTamperedPadding() {
+        string key = "0123456789abcdef0123456789abcdef";
+        string iv = "abcdef9876543210";
+        string plain = "Confidential payment transaction data $100,000.00";
+
+        List<int> encOutLen = new List<int>(); encOutLen.Add(0);
+        byte[] enc = Aes.EncryptCbc(key, 32, iv, plain, plain.Length, encOutLen);
+        if (enc == null) {
+            Console.WriteLine("FAIL: EncryptCbc returned null");
+            Environment.Exit(30);
+        }
+        int encLen = enc.Length;
+
+        // 篡改最后一个块中的字节，制造非法 PKCS#7 填充
+        for (int offset = 1; offset <= 16; offset = offset + 1) {
+            byte[] tampered = new byte[encLen];
+            for (int k = 0; k < encLen; k = k + 1) { tampered[k] = enc[k]; }
+            // 翻转字节位
+            tampered[encLen - offset] = (byte)((tampered[encLen - offset] & 255) ^ 0x5A);
+
+            List<int> outLen = new List<int>(); outLen.Add(0);
+            string tamperedStr = tampered;
+            byte[] dec = Aes.DecryptCbc(key, 32, iv, tamperedStr, encLen, outLen);
+
+            // 篡改填充必须被检测并立即拒绝返回 null，且 outLen[0] 置为 -1（数据损坏）
+            // 严禁误报为 -2（无硬件错误）或抛出未捕获异常
+            if (dec != null) {
+                Console.WriteLine("FAIL: DecryptCbc accepted tampered ciphertext at offset " + Convert.ToString(offset));
+                Environment.Exit(4);
+            }
+            if (outLen[0] != -1) {
+                Console.WriteLine("FAIL: Expected outLen[0] == -1 for bad padding, got: " + Convert.ToString(outLen[0]));
+                Environment.Exit(5);
+            }
+        }
+
+        Console.WriteLine("aes cbc tampered padding rejected ok");
+    }
+
+    static void TestSm4CbcValidAndTampered() {
+        string key = "0123456789abcdef"; // 16 bytes SM4
+        string iv = "abcdef0123456789";  // 16 bytes IV
+        string plain = "SM4-CBC commercial cryptography standard test string";
+
+        List<int> encOutLen = new List<int>(); encOutLen.Add(0);
+        byte[] enc = Sm4.EncryptCbc(key, iv, plain, plain.Length, encOutLen);
+        if (enc == null || enc.Length == 0 || enc.Length % 16 != 0) {
+            Console.WriteLine("FAIL: Sm4.EncryptCbc returned invalid ciphertext");
+            Environment.Exit(6);
+        }
+
+        List<int> outLen = new List<int>(); outLen.Add(0);
+        string encStr = enc;
+        byte[] dec = Sm4.DecryptCbc(key, iv, encStr, enc.Length, outLen);
+        if (dec == null || outLen[0] != plain.Length) {
+            Console.WriteLine("FAIL: Sm4.DecryptCbc failed on valid ciphertext");
+            Environment.Exit(7);
+        }
+
+        string decStr = dec.ToStr(0, outLen[0]);
+        if (decStr != plain) {
+            Console.WriteLine("FAIL: SM4 decrypted text mismatch: " + decStr);
+            Environment.Exit(8);
+        }
+
+        // 篡改密文末尾字节
+        byte[] tampered = new byte[enc.Length];
+        for (int k = 0; k < enc.Length; k = k + 1) { tampered[k] = enc[k]; }
+        tampered[enc.Length - 1] = (byte)((tampered[enc.Length - 1] & 255) ^ 0xFF);
+
+        outLen[0] = 0;
+        string tamperedStr = tampered;
+        byte[] badDec = Sm4.DecryptCbc(key, iv, tamperedStr, enc.Length, outLen);
+        if (badDec != null || outLen[0] != -1) {
+            Console.WriteLine("FAIL: Sm4.DecryptCbc did not reject bad padding");
+            Environment.Exit(9);
+        }
+
+        Console.WriteLine("sm4 cbc valid and tampered ok");
+    }
+
+    static void Main() {
+        TestAesCbcValid();
+        TestAesCbcTamperedPadding();
+        TestSm4CbcValidAndTampered();
+        Console.WriteLine("ALL_AES_CBC_PADDING_TESTS_OK");
+    }
+}
