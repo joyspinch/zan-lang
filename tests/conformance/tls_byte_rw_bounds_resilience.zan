@@ -1,0 +1,182 @@
+using System;
+using System.Net.Tls;
+
+class Program {
+    static int failures = 0;
+
+    static void Check(bool ok, string name) {
+        if (ok) {
+            Console.WriteLine("ok: " + name);
+        } else {
+            Console.WriteLine("FAIL: " + name);
+            failures = failures + 1;
+        }
+    }
+
+    static void TestTlsByteReaderBounds() {
+        byte[] data = new byte[8];
+        for (int i = 0; i < 8; i = i + 1) { data[i] = (byte)(i + 1); }
+
+        // 1. 构造函数边界校验
+        TlsByteReader rNull = new TlsByteReader(null, 0, 0);
+        Check(rNull.Remaining() == 0, "reader null data remaining is 0");
+        Check(!rNull.Has(1), "reader null data has 1 is false");
+
+        TlsByteReader rNegOff = new TlsByteReader(data, -5, 4);
+        Check(rNegOff.Offset() == 0, "reader negative offset clamped to 0");
+        Check(rNegOff.Remaining() == 4, "reader negative offset remaining clamped");
+
+        TlsByteReader rNegLen = new TlsByteReader(data, 2, -3);
+        Check(rNegLen.Remaining() == 0, "reader negative length remaining is 0");
+
+        TlsByteReader rPastEnd = new TlsByteReader(data, 10, 5);
+        Check(rPastEnd.Remaining() == 0, "reader offset past end remaining is 0");
+
+        TlsByteReader rOverflow = new TlsByteReader(data, 2, 2147483647);
+        Check(rOverflow.Remaining() == 6, "reader integer overflow length clamped to data.Length");
+
+        // 2. Has() 整数溢出与负数防绕过
+        TlsByteReader r = new TlsByteReader(data, 0, 8);
+        Check(!r.Has(-1), "reader Has(-1) returns false");
+        Check(!r.Has(-100), "reader Has(-100) returns false");
+        Check(!r.Has(2147483647), "reader Has(MAX_INT) returns false (no overflow bypass)");
+        Check(r.Has(0), "reader Has(0) returns true");
+        Check(r.Has(8), "reader Has(8) returns true");
+        Check(!r.Has(9), "reader Has(9) returns false");
+
+        // 3. Skip() 负向跳转与溢出防倒退
+        r.Skip(-5);
+        Check(r.Offset() == 0, "reader Skip(-5) does not rewind backwards");
+        r.Skip(2147483647);
+        Check(r.Offset() == 8, "reader Skip(MAX_INT) clamped to limit, not negative");
+        Check(r.Remaining() == 0, "reader remaining is 0 after full skip");
+
+        // 4. ReadBytes() 溢出防护
+        TlsByteReader r2 = new TlsByteReader(data, 0, 8);
+        byte[] bNeg = r2.ReadBytes(-1);
+        Check(bNeg == null, "reader ReadBytes(-1) returns null");
+        byte[] bOver = r2.ReadBytes(2147483647);
+        Check(bOver == null, "reader ReadBytes(MAX_INT) returns null without OOM");
+        byte[] bZero = r2.ReadBytes(0);
+        Check(bZero != null && bZero.Length == 0, "reader ReadBytes(0) returns empty array");
+        byte[] bValid = r2.ReadBytes(4);
+        Check(bValid != null && bValid.Length == 4 && (bValid[0] & 255) == 1, "reader ReadBytes(4) reads valid slice");
+        Check(r2.Offset() == 4, "reader position advanced to 4");
+
+        // 5. ReadU8 / ReadU16 / ReadU24 越界返回 -1
+        Check(r2.ReadU16() == 0x0506, "reader ReadU16 reads correct big-endian");
+        Check(r2.ReadU16() == 0x0708, "reader ReadU16 reads last two bytes");
+        Check(r2.ReadU8() == -1, "reader ReadU8 at EOF returns -1");
+        Check(r2.ReadU16() == -1, "reader ReadU16 at EOF returns -1");
+        Check(r2.ReadU24() == -1, "reader ReadU24 at EOF returns -1");
+    }
+
+    static void TestTlsByteWriterBounds() {
+        TlsByteWriter w = new TlsByteWriter();
+
+        // 1. EnsureCap 负数与溢出不损坏容量
+        int initCap = w.Buffer().Length;
+        w.EnsureCap(-100);
+        Check(w.Buffer().Length >= initCap, "writer EnsureCap negative ignored");
+        w.EnsureCap(0);
+        Check(w.Buffer().Length >= initCap, "writer EnsureCap(0) ignored");
+
+        // 2. WriteBytes 边界保护
+        byte[] src = new byte[] { 10, 20, 30, 40 };
+        w.WriteBytes(null, 0, 4);
+        Check(w.Length() == 0, "writer WriteBytes null data ignored");
+        w.WriteBytes(src, -1, 2);
+        Check(w.Length() == 0, "writer WriteBytes negative offset ignored");
+        w.WriteBytes(src, 0, -2);
+        Check(w.Length() == 0, "writer WriteBytes negative count ignored");
+        w.WriteBytes(src, 3, 2);
+        Check(w.Length() == 0, "writer WriteBytes offset+count past source ignored");
+        w.WriteBytes(src, 2147483647, 1);
+        Check(w.Length() == 0, "writer WriteBytes overflow offset ignored");
+
+        // 正常写入与 Peek
+        w.WriteBytes(src, 1, 2); // 写入 20, 30
+        Check(w.Length() == 2, "writer WriteBytes valid slice written");
+        Check(w.PeekU8(0) == 20, "writer PeekU8(0) == 20");
+        Check(w.PeekU8(1) == 30, "writer PeekU8(1) == 30");
+        Check(w.PeekU8(-1) == -1, "writer PeekU8 negative offset returns -1");
+        Check(w.PeekU8(2) == -1, "writer PeekU8 out of range returns -1");
+        Check(w.PeekU16(0) == 5150, "writer PeekU16(0) correct");
+        Check(w.PeekU16(1) == -1, "writer PeekU16 out of range returns -1");
+
+        // 3. Advance 与 RemovePrefix
+        w.Advance(-5);
+        Check(w.Length() == 2, "writer Advance negative ignored");
+        w.Advance(2147483647);
+        Check(w.Length() == 2, "writer Advance overflow ignored");
+
+        w.RemovePrefix(-5);
+        Check(w.Length() == 2, "writer RemovePrefix negative ignored");
+        w.RemovePrefix(1);
+        Check(w.Length() == 1, "writer RemovePrefix(1) length is 1");
+        Check(w.PeekU8(0) == 30, "writer PeekU8 after prefix removal is 30");
+        w.RemovePrefix(10);
+        Check(w.Length() == 0 && w.Head() == 0, "writer RemovePrefix past length resets head and len");
+    }
+
+    static void TestTlsEngineBounds() {
+        TlsEngine engine = new TlsEngine("example.com", true, true, null, false, null, null, false, "", "");
+
+        // 1. FeedNetwork 边界校验
+        byte[] netData = new byte[] { 22, 3, 3, 0, 5, 1, 2, 3, 4, 5 };
+        engine.FeedNetwork(null, 0, 5);
+        Check(engine.inNet.Length() == 0, "engine FeedNetwork null ignored");
+        engine.FeedNetwork(netData, -1, 5);
+        Check(engine.inNet.Length() == 0, "engine FeedNetwork negative offset ignored");
+        engine.FeedNetwork(netData, 0, -2);
+        Check(engine.inNet.Length() == 0, "engine FeedNetwork negative length ignored");
+        engine.FeedNetwork(netData, 8, 5);
+        Check(engine.inNet.Length() == 0, "engine FeedNetwork past end ignored");
+        engine.FeedNetwork(netData, 2147483647, 1);
+        Check(engine.inNet.Length() == 0, "engine FeedNetwork overflow offset ignored");
+
+        // 2. RecvAppData 边界校验与容量截断保护
+        byte[] payload = new byte[] { 101, 102, 103, 104, 105 };
+        engine.appReadBuf.WriteBytes(payload);
+        Check(engine.AvailableAppData() == 5, "engine has 5 bytes app data");
+
+        byte[] dest = new byte[3];
+        int readNull = engine.RecvAppData(null, 0, 5);
+        Check(readNull == 0, "engine RecvAppData null buffer returns 0");
+
+        int readNeg = engine.RecvAppData(dest, -1, 3);
+        Check(readNeg == 0, "engine RecvAppData negative offset returns 0");
+
+        int readNegLen = engine.RecvAppData(dest, 0, -5);
+        Check(readNegLen == 0, "engine RecvAppData negative maxLen returns 0");
+
+        int readPast = engine.RecvAppData(dest, 4, 1);
+        Check(readPast == 0, "engine RecvAppData offset past buffer returns 0");
+
+        // 目标缓冲区只有 3 字节，即使请求 5 字节，也只能安全读取 3 字节，严禁越界
+        int readClamped = engine.RecvAppData(dest, 0, 5);
+        Check(readClamped == 3, "engine RecvAppData clamped to dest.Length (3 bytes)");
+        Check((dest[0] & 255) == 101 && (dest[1] & 255) == 102 && (dest[2] & 255) == 103, "engine RecvAppData content valid");
+        Check(engine.AvailableAppData() == 2, "engine remaining app data is 2 bytes");
+
+        // 读取剩余 2 字节到大缓冲区
+        byte[] dest2 = new byte[10];
+        int readRem = engine.RecvAppData(dest2, 1, 10);
+        Check(readRem == 2, "engine RecvAppData read remaining 2 bytes");
+        Check((dest2[1] & 255) == 104 && (dest2[2] & 255) == 105, "engine RecvAppData remaining content valid");
+        Check(engine.AvailableAppData() == 0, "engine app data fully consumed");
+    }
+
+    static void Main() {
+        TestTlsByteReaderBounds();
+        TestTlsByteWriterBounds();
+        TestTlsEngineBounds();
+
+        if (failures == 0) {
+            Console.WriteLine("ALL_TLS_BYTE_RW_BOUNDS_TESTS_OK");
+        } else {
+            Console.WriteLine("TOTAL_FAILURES: " + Convert.ToString(failures));
+            Environment.Exit(1);
+        }
+    }
+}
