@@ -6,16 +6,16 @@
 >
 > 平账纪律：闭账条目当批移出，已闭环内容移至 git 历史。
 >
-> 最近平账 2026-11-03（彻底清理）：全账按「只记剩余欠账」压缩，验证流水归 git 历史；B-ID95/98/100/105 闭账移出（导出面 devirt 预修 33f21d49e 落地且场景暂不可达 / OOM 注入钩子+三钉 55367b004 落地 / 预扫缓存收益 ~12ms 低于噪声底不做 / json 消费方 dap_integration+lsp_integration_utf16 绿）；B-ID68/69/70 归并指针行移出（B-ID75 领域点名承接）。同日晚：B-ID113 闭账移出（stdout 二进制模式 25ca931ff，字节钉 stdio_binary_mode 7/7 绿）、B-ID108 闭账移出（JsonDoc 槽位三访问器 9a40bdf88，AppUpdate --emit-lib 77 文件绿 + Json 回归五钉绿）。早前同日：B-ID80 SipHash 落地闭账、B-ID66 闭账移出、B-ID104/105/106/110 各片落地（详 git 历史）。
+> 最近平账 2026-11-03（彻底清理）：全账按「只记剩余欠账」压缩，验证流水归 git 历史；B-ID95/98/100/105 闭账移出（导出面 devirt 预修 33f21d49e 落地且场景暂不可达 / OOM 注入钩子+三钉 55367b004 落地 / 预扫缓存收益 ~12ms 低于噪声底不做 / json 消费方 dap_integration+lsp_integration_utf16 绿）；B-ID68/69/70 归并指针行移出（B-ID75 领域点名承接）。同日晚：B-ID113 闭账移出（stdout 二进制模式 25ca931ff，字节钉 stdio_binary_mode 7/7 绿）、B-ID108 闭账移出（JsonDoc 槽位三访问器 9a40bdf88，AppUpdate --emit-lib 77 文件绿 + Json 回归五钉绿）。早前同日：B-ID80 SipHash 落地闭账、B-ID66 闭账移出、B-ID104/105/106/110 各片落地（详 git 历史）。同日晚 ORM 族平账：orm/linq/diag_orm/dao 35 案实测 31 绿 4 红——B-ID59 余量收敛为两案（"orm 族 ~20 案红"过时移除）、case_orm_upsert（E3023 OnConflict 匿名对象）红面归 B-ID65、B-ID107 症状复核成立（arpg_save_repository `near "."` sqlite 语法错，基线同红）。
 
 ## 未完成
 
-- [ ] B-ID59 ORM 查询链泛型推断断裂（E2108 泛型不变性）：`ToList<RouteStat>(a => new RouteStat {...})` 等链式投影报 cannot convert；余：case_orm_group_aggregate（双案）、case_linq_and_zandb_opt（运行期零输出段错误，接手先 _scratch 直执行定位）及 orm 族 ~20 案红；根修归 B-ID63（方差/泛型环境）。已修片段见 git 历史（diag_orm 三例、E2030 皮下钩）。
+- [ ] B-ID59 ORM 查询链泛型推断断裂（E2108 泛型不变性）：`ToList<RouteStat>(a => new RouteStat {...})` 等链式投影报 cannot convert；余（2026-11-03 实测收敛）：case_orm_group_aggregate（E2108 三处投影）与 case_linq_and_zandb_opt（运行期零输出 access violation，接手先 _scratch 直执行定位）两案；orm/linq 族其余、generic_base_dao_orm、diag_orm 三例全绿（原"orm 族 ~20 案红"过时）；根修归 B-ID63（方差/泛型环境）。已修片段见 git 历史（diag_orm 三例、E2030 皮下钩）。
 - [ ] B-ID60 反射元数据特性体系重构（解耦硬编码字符串）：`irgen_reflect.c` 与 selfhost 镜像目前以 `memcmp` 硬编码匹配有限特性名（Key/Required/NotMapped），命名参数与参数化属性（如 `[Column(IsPrimary = true)]`）无法进入元数据位表。需重构为结构化特性元数据流（Metadata Blob），支持反射面读取完整参数并保留 C11/selfhost 1:1 对齐。
 - [ ] B-ID62 语言内置原语与方法横截重构：`irgen_call_builtins.c` 现存 3200+ 行根据方法名字符串横截调用（nameof/GetValueOrDefault/ToString 等），易与用户自定义符号或重载产生意外冲突。需演进为标准库 `[Intrinsic]` 符号级绑定分发机制，checker 期绑定符号而非 irgen 字符串匹配，C11 与 selfhost 差分保持一致。
 - [ ] B-ID63 泛型系统协变/逆变与调用环境特化：余：接口/委托方差标记（out/in）补全解 E2108；异步状态机与闭包展开帧泛型环境上下文（Meta.For<T> 特化丢失，SyncStructureAll 静态直调绕开扩展分发同根）；selfhost 欠账：checker.zan 表访问器合成（recv.<Entity> → Dao/BaseRepository<E>）与 SyncStructureAll 编译期合成镜像、irgen_async.zan 帧槽接线。已闭子项见 git 历史（a00c09ba3、ed551f707）。
 - [ ] B-ID64 异步状态机帧布局类型化与 ARC 生命周期闭环：`irgen_async.c` 与 `src/selfhost/irgen_async.zan` 目前将异步结果强制打包规整为 64 位整数槽（res.slot），大结构体与聚合槽逻辑复杂；需演进为类型化返回值字段（Typed Result Field），并在状态机终结时自动析构捕获帧，防止长驻异步任务产生 ARC 循环引用与连接泄露。
-- [ ] B-ID65 ORM 强类型表达式树与复合主键支持：余：只读表达式树（Expression Tree）AST 节点体系及 SQL 访问者（Visitor）翻译管线（复合主键 ON CONFLICT 下推）；异步仓储帧捕获链未随任务终结释放（退出 52 对象仍可达：Meta 静态单例链 + 连接内部集合，同步形态零泄漏）。bool-lambda Where/Delete/Update 语义已修见 git 历史。
+- [ ] B-ID65 ORM 强类型表达式树与复合主键支持：余：只读表达式树（Expression Tree）AST 节点体系及 SQL 访问者（Visitor）翻译管线（复合主键 ON CONFLICT 下推）；异步仓储帧捕获链未随任务终结释放（退出 52 对象仍可达：Meta 静态单例链 + 连接内部集合，同步形态零泄漏）。红案面（2026-11-03 实测）：case_orm_upsert——`.OnConflict(a => new { a.minute, a.method, a.path })` 匿名对象键报 E3023（皮下钩只认 GroupBy/ToList/ToAggregate），即 ON CONFLICT 下推未落地的 conformance 直钉。bool-lambda Where/Delete/Update 语义已修见 git 历史。
 - [ ] B-ID67 HTML+CSS 窗口排版与形状协议标准化（解耦魔术字符串与伪排版）：`FormBuilder.zan` 与 `App.Window.zan` 现存逗号分隔字符串传递异形窗口、硬编码 40+ 键名匹配、WinForms 式 Dock 模拟 CSS 的缺陷，在 Linux/macOS 上外观无法一致呈现。需重构为强类型 `WindowShapeDescription` 协议并演进为标准化 Flexbox 布局规范；双轨同步。（SetShape 等能力已进 IPlatformWindow 契约面，本条协议化改造在其上继续。）
 - [ ] B-ID71 SJLJ（setjmp/longjmp）异常机制与 ARC 栈展开资源泄漏/锁死锁：跨函数 throw 直接恢复栈寄存器，绕过被穿越中间帧的析构逻辑（ARC 漏释放、using 不关、zan_monitor_enter 无 exit 全局死锁）；exception_handler_depth 真回归同源——O2 DCE 把 rethrow 路径写入的局部当 dead store 删（setjmp/longjmp 对 LLVM 是不可见控制流边；已证全量 volatile alloca 无效，longjmp 后 volatile store 仍被 CPU 级跳过）。须演进为零开销栈展开（LandingPad）根治；双轨保持一致。
 - [ ] B-ID72 宽字符与文本封送跨平台断裂（Wide.zan 强绑 kernel32）：`stdlib/System/Interop/Wide.zan` 无条件 `[DllImport("kernel32")]` 导入 Win32 API 且写死 2 字节 UTF-16 假定，在 Linux/macOS 上直接崩毁，且违背 POSIX 4 字节 wchar_t 规范。需抽象为支持 POSIX iconv / mbstowcs 与 Windows 多分发的跨平台文本封送器；双轨同步。
@@ -32,7 +32,7 @@
 - [ ] B-ID87 Unicode 规范化（NFC/NFD）与国际化大小写折叠（Case Folding）缺失：标准库缺乏 UAX #15 规范化，`string.ToLower/ToUpper/Equals` 仅基本码点映射，欧洲带重音符/德语等单码点与组合码点无法等价匹配，存在鉴权仿冒越权风险；双轨同步。
 - [ ] B-ID89 生产级内存可观测性与循环引用泄漏分析工具缺失：纯 ARC 模型循环引用必泄漏，全仓缺乏运行时孤儿环探测器（Cycle Detector）与 Heap Snapshot / Dump 导出，长驻服务端与复杂 GUI 内存缓增无定位手段；双轨保持一致。
 - [ ] B-ID92 静态构造（cctor）初始化序——selfhost 镜像欠账：C11 侧已闭（拓扑序发射 + conformance static_init_dependency_order，git 历史）；余：selfhost irgen.zan 的 Main 入口静态初始化仍按声明序，待镜像。惰性首次访问初始化（BeforeFieldInit）不做。
-- [ ] B-ID93 异步调试信息（Debug Info）状态机行映射：调试信息生成现居 irgen.c/irgen_emit.c（DIBuilder）；缺口（`async/await` 闭包状态机帧未建原始行号映射，调试器单步直落 `$resume` 合成代码）待按新位置复核定性；双轨保持一致。
+- [ ] B-ID93 异步调试信息（Debug Info）行映射——定性完成（2026-11-03，范围比原登记更大）：DIBuilder 只建 CU/文件/discope 即 Finalize（irgen.c:98-260），全编译器**没有任何指令附着 DILocation**（唯一一次 SetCurrentDebugLocation2 是 irgen_emit.c:3059 拆除时置 NULL）——不是 async 状态机特缺，是语句/表达式级行号发射整体缺失，async $resume 单步直落合成代码只是显性症状。修法：stmt/expr 发射点统一走「当前源位置→DILocation 挂 builder」管线 + 异步帧把原始调用点位置带进状态机帧；双轨保持一致。
 - [ ] B-ID96 optimizer ARC 对消窗口余量：主洞已保守关窗（git 历史）；余：使关窗更早、提升对消率（纯性能，无正确性影响，无 conformance 直钉，靠代码审查覆盖）。
 - [ ] B-ID102 AST 统一 child-iteration/visitor 基建：tagged union 无 visitor 无统一 child 迭代器，binder/nsresolve/checker/irgen 五套手写遍历器，加一种节点要改 10+ 处 switch（已发生 B-ID101 型真实漏改）；lexer_peek_n 双实现（parser.c:2052 分叉自 lexer.c:1883）同族收敛。
 - [ ] B-ID103 irgen unity build 拆分：irgen.c 把 21 个 irgen_*.c 文本 include 进单 TU（约 52K 行），静态函数靠跨"文件"前向声明网维系插入顺序；main.c 在 main() 函数体内 #include "main_options_parse.c"（驱动不可单测）。修法方向：真 TU 化 + 声明网收编进头文件 + 选项解析独立编译单元。main.c 属并发禁动区，待窗口。
