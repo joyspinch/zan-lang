@@ -11,6 +11,8 @@ public class Transaction {
     public long Nonce = 0;                       // 发送者账户交易序号
     public BigInt MaxPriorityFeePerGas;          // 矿工小费上限 (Tip Cap，Wei)
     public BigInt MaxFeePerGas;                  // 整笔交易最高 Gas 费用单价 (BaseFee + TipCap，Wei)
+    public BigInt GasPrice;                      // 经典 Legacy 交易 Gas 单价 (Wei，BSC / 老链使用)
+    public bool IsLegacy = false;                // 是否为 EIP-155 传统 Type-0 交易 (BSC, TRON, HECO 等强制要求)
     public long GasLimit = 21000;                // Gas 消耗上限 (标准转账为 21000)
     public Address To;                           // 目标接收方地址
     public BigInt Value;                         // 转账金额 (Wei)
@@ -19,6 +21,7 @@ public class Transaction {
     public Transaction() {
         MaxPriorityFeePerGas = BigInt.FromBytesBE(new byte[1], 1);
         MaxFeePerGas = BigInt.FromBytesBE(new byte[1], 1);
+        GasPrice = BigInt.FromBytesBE(new byte[1], 1);
         Value = BigInt.zero();
         Data = new byte[0];
     }
@@ -98,9 +101,75 @@ public class Transaction {
         return Keccak256.Hash(payload, payload.Length);
     }
 
+    // 计算 EIP-155 经典交易 (Type-0) 待签名的 32 字节 Keccak-256 哈希值
+    // 待签结构: rlp([nonce, gasPrice, gasLimit, to, value, data, chainId, 0, 0])
+    public byte[] GetLegacySigningHash() {
+        List<RlpItem> items = new List<RlpItem>();
+        items.Add(RlpItem.FromLong(Nonce));
+        items.Add(RlpItem.FromBytes(toMinimalBytes(GasPrice)));
+        items.Add(RlpItem.FromLong(GasLimit));
+
+        if (To != null && !To.Equals(Address.Zero)) {
+            items.Add(RlpItem.FromBytes(To.ToBytes()));
+        } else {
+            items.Add(RlpItem.FromBytes(new byte[0]));
+        }
+
+        items.Add(RlpItem.FromBytes(toMinimalBytes(Value)));
+        items.Add(RlpItem.FromBytes(Data != null ? Data : new byte[0]));
+
+        // EIP-155 防重放后缀: chainId, 0, 0
+        items.Add(RlpItem.FromLong(ChainId));
+        items.Add(RlpItem.FromLong(0));
+        items.Add(RlpItem.FromLong(0));
+
+        byte[] rlpEncoded = Rlp.Encode(RlpItem.FromList(items));
+        return Keccak256.Hash(rlpEncoded, rlpEncoded.Length);
+    }
+
+    // 签署 EIP-155 传统交易 (Type-0，广泛用于 BSC、TRON EVM 及传统合约链)
+    public string SignLegacy(byte[] privKey32) {
+        if (privKey32 == null || privKey32.Length != 32) { return null; }
+
+        byte[] signingHash = GetLegacySigningHash();
+        Secp256k1Signature sig = Secp256k1.Sign(signingHash, privKey32);
+        if (sig == null) { return null; }
+
+        List<RlpItem> signedItems = new List<RlpItem>();
+        signedItems.Add(RlpItem.FromLong(Nonce));
+        signedItems.Add(RlpItem.FromBytes(toMinimalBytes(GasPrice)));
+        signedItems.Add(RlpItem.FromLong(GasLimit));
+
+        if (To != null && !To.Equals(Address.Zero)) {
+            signedItems.Add(RlpItem.FromBytes(To.ToBytes()));
+        } else {
+            signedItems.Add(RlpItem.FromBytes(new byte[0]));
+        }
+
+        signedItems.Add(RlpItem.FromBytes(toMinimalBytes(Value)));
+        signedItems.Add(RlpItem.FromBytes(Data != null ? Data : new byte[0]));
+
+        // EIP-155 计算: v = chainId * 2 + 35 + recoveryId
+        long vEip155 = ChainId * 2 + 35 + (long)sig.V;
+        signedItems.Add(RlpItem.FromLong(vEip155));
+
+        BigInt rVal = BigInt.FromBytesBE(sig.R, 32);
+        signedItems.Add(RlpItem.FromBytes(toMinimalBytes(rVal)));
+
+        BigInt sVal = BigInt.FromBytesBE(sig.S, 32);
+        signedItems.Add(RlpItem.FromBytes(toMinimalBytes(sVal)));
+
+        byte[] rlpEncoded = Rlp.Encode(RlpItem.FromList(signedItems));
+        // Type-0 交易直接广播 RLP 字节串（不带 0x02 前缀）
+        return "0x" + Hex.Encode(rlpEncoded, rlpEncoded.Length);
+    }
+
     // 使用发送方私钥对该交易进行离线签名，生成可直接在以太坊网络广播的 Raw Transaction 十六进制字符串
     public string Sign(byte[] privKey32) {
         if (privKey32 == null || privKey32.Length != 32) { return null; }
+        if (IsLegacy) {
+            return SignLegacy(privKey32);
+        }
 
         byte[] signingHash = GetSigningHash();
         Secp256k1Signature sig = Secp256k1.Sign(signingHash, privKey32);

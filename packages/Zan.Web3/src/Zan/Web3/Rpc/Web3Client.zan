@@ -5,7 +5,28 @@ using Zan.Web3.Encoding;
 
 namespace Zan.Web3.Rpc;
 
-// RPC 传输驱动抽象接口（允许在真实网络传输与离线单元测试仿真之间无缝切换）
+// 链上交易确认回执实体 (Transaction Receipt)
+public class TransactionReceipt {
+    public string TransactionHash;          // 交易哈希
+    public long BlockNumber;                // 打包该交易的区块高度
+    public int Status;                      // 1 表示成功，0 表示执行 Revert 失败
+    public long GasUsed;                    // 实际消耗的 Gas 总量
+    public Address From;                    // 发送方地址
+    public Address To;                      // 接收方地址
+    public Address ContractAddress;         // 合约部署时产生的新合约地址
+
+    public TransactionReceipt() {
+        TransactionHash = "";
+        BlockNumber = 0;
+        Status = 0;
+        GasUsed = 0;
+        From = Address.Zero;
+        To = Address.Zero;
+        ContractAddress = Address.Zero;
+    }
+}
+
+// RPC 传输驱动抽象接口（允许在真实网络传输、代理与离线仿真之间无缝切换）
 public interface IRpcTransport {
     string Send(string host, int port, bool useTls, string path, string body);
 }
@@ -21,7 +42,7 @@ public class MockRpcTransport : IRpcTransport {
     }
 }
 
-// 以太坊与 Web3 JSON-RPC 高阶客户端，封装节点通信、错误处理、类型转换与智能合约只读调用。
+// 标准以太坊 JSON-RPC 生产客户端，涵盖节点通信、错误穿透、Gas 动态估算与交易确认轮询。
 public class Web3Client {
 
     public string RpcUrl;
@@ -31,11 +52,13 @@ public class Web3Client {
     public string Path;
     public IRpcTransport Transport;
 
+    public string LastError = "";           // 记录最近一次 RPC 调用的服务端错误信息 (Revert / Insufficient funds 等)
+
     private int _requestId = 1;
 
     public Web3Client(string rpcUrl) {
         RpcUrl = rpcUrl != null ? rpcUrl : "http://127.0.0.1:8545";
-        Transport = new MockRpcTransport(); // 默认传输器
+        Transport = new MockRpcTransport(); // 默认传输器，可按需切换为真实 Socket/HTTP 驱动
         parseUrl(RpcUrl);
     }
 
@@ -74,7 +97,6 @@ public class Web3Client {
         if (colonIdx >= 0) {
             string portStr = Host.Substring(colonIdx + 1);
             Host = Host.Substring(0, colonIdx);
-            // 简单解析端口号
             int p = 0;
             for (int i = 0; i < portStr.Length; i = i + 1) {
                 int c = portStr[i] - 48;
@@ -104,9 +126,38 @@ public class Web3Client {
         return val;
     }
 
+    // 从 JSON 响应文本中提取 "error.message"（错误穿透防御，杜绝静默失败）
+    public static string ExtractError(string jsonResponse) {
+        if (jsonResponse == null) { return ""; }
+        string errTag = "\"error\":";
+        int errIdx = jsonResponse.IndexOf(errTag);
+        if (errIdx < 0) { return ""; }
+
+        string msgTag = "\"message\":";
+        int msgIdx = jsonResponse.IndexOf(msgTag, errIdx);
+        if (msgIdx < 0) { return "RPC Error"; }
+
+        int start = msgIdx + msgTag.Length;
+        while (start < jsonResponse.Length && (jsonResponse[start] == ' ' || jsonResponse[start] == '\t')) {
+            start = start + 1;
+        }
+        if (start >= jsonResponse.Length || jsonResponse[start] != '\"') { return "RPC Error"; }
+        start = start + 1;
+        int end = jsonResponse.IndexOf("\"", start);
+        if (end < 0) { return "RPC Error"; }
+        return jsonResponse.Substring(start, end - start);
+    }
+
     // 从 JSON 响应文本中提取 "result" 字段的值（去除外层引号）
     public static string ExtractResult(string jsonResponse) {
         if (jsonResponse == null) { return ""; }
+
+        // 检查是否有错误
+        string errMsg = ExtractError(jsonResponse);
+        if (errMsg.Length > 0) {
+            return "";
+        }
+
         string tag = "\"result\":";
         int idx = jsonResponse.IndexOf(tag);
         if (idx < 0) { return ""; }
@@ -123,7 +174,6 @@ public class Web3Client {
             return jsonResponse.Substring(start, end - start);
         }
 
-        // 非字符串字面量（如数字或布尔）
         int endNonStr = start;
         while (endNonStr < jsonResponse.Length && jsonResponse[endNonStr] != ',' && jsonResponse[endNonStr] != '}' && jsonResponse[endNonStr] != ']') {
             endNonStr = endNonStr + 1;
@@ -137,6 +187,8 @@ public class Web3Client {
         _requestId = _requestId + 1;
         string reqJson = JsonRpcBuilder.BuildRequest(method, paramsJson, id);
         string respJson = Transport.Send(Host, Port, UseTls, Path, reqJson);
+
+        LastError = ExtractError(respJson);
         return ExtractResult(respJson);
     }
 
@@ -152,6 +204,24 @@ public class Web3Client {
         string tag = (blockTag != null && blockTag.Length > 0) ? blockTag : "latest";
         string res = SendRpc("eth_getBalance", "[\"" + addrHex + "\",\"" + tag + "\"]");
         return Abi.DecodeUint256(res);
+    }
+
+    // 查询网络当前实时 Gas 价格 (Wei)
+    public BigInt GetGasPrice() {
+        string res = SendRpc("eth_gasPrice", "[]");
+        return Abi.DecodeUint256(res);
+    }
+
+    // 动态估算交易所需 GasLimit (eth_estimateGas)
+    public long EstimateGas(Address from, Address to, string dataHex, BigInt value) {
+        string fromHex = from != null ? from.ToLowerHex() : "0x0000000000000000000000000000000000000000";
+        string toHex = to != null ? to.ToLowerHex() : "0x0000000000000000000000000000000000000000";
+        string valHex = value != null ? "0x" + Hex.Encode(value.ToBytesBE(32), 32) : "0x0";
+        string dHex = dataHex != null ? dataHex : "0x";
+
+        string callObj = "{\"from\":\"" + fromHex + "\",\"to\":\"" + toHex + "\",\"data\":\"" + dHex + "\",\"value\":\"" + valHex + "\"}";
+        string res = SendRpc("eth_estimateGas", "[" + callObj + "]");
+        return HexToLong(res);
     }
 
     // 查询账户当前确认的交易笔数 (Nonce)
@@ -173,6 +243,70 @@ public class Web3Client {
     // 广播已签名的原始交易十六进制字符串，返回交易哈希 (txHash)
     public string SendRawTransaction(string rawTxHex) {
         return SendRpc("eth_sendRawTransaction", "[\"" + rawTxHex + "\"]");
+    }
+
+    // 查询交易收据 (eth_getTransactionReceipt)
+    public TransactionReceipt GetTransactionReceipt(string txHash) {
+        if (txHash == null || txHash.Length == 0) { return null; }
+        int id = _requestId;
+        _requestId = _requestId + 1;
+        string reqJson = JsonRpcBuilder.BuildRequest("eth_getTransactionReceipt", "[\"" + txHash + "\"]", id);
+        string respJson = Transport.Send(Host, Port, UseTls, Path, reqJson);
+
+        if (respJson == null || respJson.IndexOf("\"result\":null") >= 0 || respJson.IndexOf("\"result\": null") >= 0) {
+            return null;
+        }
+
+        TransactionReceipt receipt = new TransactionReceipt();
+        receipt.TransactionHash = txHash;
+
+        // 提取 blockNumber
+        string bnStr = extractReceiptField(respJson, "blockNumber");
+        receipt.BlockNumber = HexToLong(bnStr);
+
+        // 提取 status (0x1 成功, 0x0 失败)
+        string stStr = extractReceiptField(respJson, "status");
+        receipt.Status = (int)HexToLong(stStr);
+
+        // 提取 gasUsed
+        string guStr = extractReceiptField(respJson, "gasUsed");
+        receipt.GasUsed = HexToLong(guStr);
+
+        return receipt;
+    }
+
+    private static string extractReceiptField(string json, string field) {
+        string pattern = "\"" + field + "\":";
+        int idx = json.IndexOf(pattern);
+        if (idx < 0) { return ""; }
+        int start = idx + pattern.Length;
+        while (start < json.Length && (json[start] == ' ' || json[start] == '\t')) {
+            start = start + 1;
+        }
+        if (start >= json.Length) { return ""; }
+        if (json[start] == '\"') {
+            start = start + 1;
+            int end = json.IndexOf("\"", start);
+            if (end < 0) { return ""; }
+            return json.Substring(start, end - start);
+        }
+        int endNonStr = start;
+        while (endNonStr < json.Length && json[endNonStr] != ',' && json[endNonStr] != '}' && json[endNonStr] != ']') {
+            endNonStr = endNonStr + 1;
+        }
+        return json.Substring(start, endNonStr - start).Trim();
+    }
+
+    // 轮询等待交易上链打包并返回回执 (生产必备)
+    public TransactionReceipt WaitForTransactionReceipt(string txHash, int maxRetries) {
+        int retries = maxRetries > 0 ? maxRetries : 30;
+        for (int i = 0; i < retries; i = i + 1) {
+            TransactionReceipt receipt = GetTransactionReceipt(txHash);
+            if (receipt != null && receipt.BlockNumber > 0) {
+                return receipt;
+            }
+        }
+        return null;
     }
 
     // 查询 ERC-20 代币余额
