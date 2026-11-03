@@ -112,6 +112,22 @@ typedef long LONG;
 #endif
 #endif /* !_WIN32 */
 
+/* 逻辑处理器数（Environment.ProcessorCount 的探针）：Windows 用
+ * GetSystemInfo，POSIX 用 sysconf(_SC_NPROCESSORS_ONLN)，查询失败
+ * 回 1。曾只读 NUMBER_OF_PROCESSORS 环境变量——Linux/macOS 上没有
+ * 这个变量，ProcessorCount 恒 1，线程池全部退化单线程。
+ * 必须所有编译面可见：曾误放 ZAN_CO_DRIVER 门内协同调度段，而仓内
+ * CMake 对象与 selfhost 运行时束不定义该宏，gen2 链接缺符号（B-ID109）。 */
+int32_t zan_cpu_count(void) {
+#if defined(_WIN32)
+    SYSTEM_INFO si;
+    GetSystemInfo(&si);
+    return (si.dwNumberOfProcessors > 0) ? (int32_t)si.dwNumberOfProcessors : 1;
+#else
+    long n = sysconf(_SC_NPROCESSORS_ONLN);
+    return (n > 0) ? (int32_t)n : 1;
+#endif
+}
 
 static volatile LONG g_io_count;
 
@@ -4279,21 +4295,6 @@ int zan_co_poll(void) {
     if (q <= 0 || w->slice_start_us <= 0) return 0;
     long long now = zan_co_precise_us();
     return (now - w->slice_start_us >= q * 1000) ? 1 : 0;
-}
-
-/* 逻辑处理器数（Environment.ProcessorCount 的探针）：Windows 用
- * GetSystemInfo，POSIX 用 sysconf(_SC_NPROCESSORS_ONLN)，查询失败
- * 回 1。曾只读 NUMBER_OF_PROCESSORS 环境变量——Linux/macOS 上没有
- * 这个变量，ProcessorCount 恒 1，线程池全部退化单线程。 */
-int32_t zan_cpu_count(void) {
-#if defined(_WIN32)
-    SYSTEM_INFO si;
-    GetSystemInfo(&si);
-    return (si.dwNumberOfProcessors > 0) ? (int32_t)si.dwNumberOfProcessors : 1;
-#else
-    long n = sysconf(_SC_NPROCESSORS_ONLN);
-    return (n > 0) ? (int32_t)n : 1;
-#endif
 }
 
 static void co_stats_dump(void);
