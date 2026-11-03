@@ -869,6 +869,7 @@ static bool types_equal(zan_type_t *a, zan_type_t *b);
 static LLVMValueRef zan_call2(LLVMBuilderRef b, LLVMTypeRef ty, LLVMValueRef fn,
                               LLVMValueRef *args, unsigned n, const char *nm);
 static void emit_weak_runtime(zan_irgen_t *g);
+static void emit_defer_fallback(zan_irgen_t *g);
 
 static zan_irgen_t *s_current_irgen = NULL;
 
@@ -2728,6 +2729,9 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
             LLVMBuildBr(g->builder, tail_bb);
             LLVMPositionBuilderAtEnd(g->builder, tail_bb);
         }
+        /* B-ID78 回归补丁：defer 三符号在此补弱回退体（必须等声明建成，
+         * 见 irgen_weak.c emit_defer_fallback 注释） */
+        emit_defer_fallback(g);
         LLVMBuildBr(g->builder, ret_bb);
         LLVMPositionBuilderAtEnd(g->builder, fb);
         zan_call2(g->builder, LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), &i8ptr, 1, 0),

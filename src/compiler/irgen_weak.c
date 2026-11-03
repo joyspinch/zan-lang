@@ -463,6 +463,56 @@ static void emit_weak_runtime(zan_irgen_t *g) {
         g->rt_weak_destroy_begin, "entry");
     LLVMPositionBuilderAtEnd(g->builder, begin_entry);
     emit_weak_destroy_begin_body(g, weak_calloc);
+
+    emit_defer_fallback(g);
+}
+
+/* B-ID78 延迟释放队列的形态自足弱回退：rt_release_dyn 的深树防护无条件
+ * 引用 zan_rt_defer_push/pending/drain（类释放胶水），但 rt_mem.o 只在
+ * 原生 exe 与跨端 linux exe 链入——Windows DLL、macOS dylib、Android
+ * 静态链（bionic 上 --wrap=malloc 崩，刻意不链）与 selfhost 对象束都拿
+ * 不到它，B-ID78 后这些形态全部断链（emit_lib 门 2026-11-03 实锤：
+ * dll/dylib undefined reference to zan_rt_defer_*）。这里对 release_dyn
+ * 已建好的三个声明补弱链路 + 函数体：链入 rt_mem.o 的形态由强定义覆盖
+ * （真队列语义不变，与 zan_io_pump 的弱覆盖先例同款）；未链入的形态
+ * 退化为 push 即同步调析构——与真实现自身节点分配失败的 fail-open 路径
+ * 同语义，不泄漏、不挂队列，深树级联在该形态回到 B-ID78 前的同步递归。
+ * 必须在 defer 声明建成之后调用：LLVMAddFunction 不查重名，先建会让
+ * release_dyn 的同名声明被 mangler 改名（zan_rt_defer_push.5）而指空。 */
+static void emit_defer_fallback(zan_irgen_t *g) {
+    if (!g->rt_defer_push || !g->rt_defer_pending || !g->rt_defer_drain)
+        return;
+    /* 调用点位于 rt_release_dyn 构造中段，builder 停在 tail_bb——发完回退体
+     * 必须恢复原插入位置，否则后续 Br 会插进 drain 的 entry。 */
+    LLVMBasicBlockRef saved_bb = LLVMGetInsertBlock(g->builder);
+    LLVMTypeRef i8ptr = weak_i8ptr(g);
+    LLVMSetLinkage(g->rt_defer_push, LLVMWeakAnyLinkage);
+    LLVMSetLinkage(g->rt_defer_pending, LLVMWeakAnyLinkage);
+    LLVMSetLinkage(g->rt_defer_drain, LLVMWeakAnyLinkage);
+
+    /* push(fn, obj)：回退即同步析构（fail-open，同真实现分配失败路径） */
+    LLVMBasicBlockRef push_entry = LLVMAppendBasicBlockInContext(g->ctx,
+        g->rt_defer_push, "entry");
+    LLVMPositionBuilderAtEnd(g->builder, push_entry);
+    LLVMTypeRef dfn_ty = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx),
+        (LLVMTypeRef[]){ i8ptr }, 1, 0);
+    LLVMValueRef dfn = LLVMBuildBitCast(g->builder,
+        LLVMGetParam(g->rt_defer_push, 1), LLVMPointerType(dfn_ty, 0), "dfn");
+    zan_call2(g->builder, dfn_ty, dfn,
+        (LLVMValueRef[]){ LLVMGetParam(g->rt_defer_push, 0) }, 1, "");
+    LLVMBuildRetVoid(g->builder);
+
+    /* pending()：回退形态无队列，恒 0 */
+    LLVMPositionBuilderAtEnd(g->builder, LLVMAppendBasicBlockInContext(
+        g->ctx, g->rt_defer_pending, "entry"));
+    LLVMBuildRet(g->builder, LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 0, 0));
+
+    /* drain()：无队列可排 */
+    LLVMPositionBuilderAtEnd(g->builder, LLVMAppendBasicBlockInContext(
+        g->ctx, g->rt_defer_drain, "entry"));
+    LLVMBuildRetVoid(g->builder);
+
+    LLVMPositionBuilderAtEnd(g->builder, saved_bb);
 }
 
 static void emit_weak_store(zan_irgen_t *g, LLVMValueRef field_ptr,
