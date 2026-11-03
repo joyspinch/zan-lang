@@ -16,7 +16,6 @@
 
 #include "../common/fmt_checked.h"
 #include "../common/host_oom.h"
-#include "package.h" /* zan_pkg_compute_checksum：JRE 下载哈希校验（B-ID104） */
 
 typedef struct {
     unsigned char *p;
@@ -114,7 +113,7 @@ static void zip_start(zip_t *z) {
     z->ents = (zip_ent_t *)calloc((size_t)z->cap, sizeof(*z->ents));
 }
 
-static void zip_end_align(zip_t *z, int boundary) {
+static void __attribute__((unused)) zip_end_align(zip_t *z, int boundary) {
     while (z->out.len % (size_t)boundary) buf_u8(&z->out, 0);
 }
 
@@ -599,6 +598,13 @@ static int find_java(char *out, size_t outsz) {
                             "%s", found) != 0) return -1;
         return 0;
     }
+    const char *uprofile = getenv("USERPROFILE");
+    if (!uprofile || !uprofile[0]) uprofile = getenv("HOME");
+    if (uprofile && uprofile[0]) {
+        if (zan_fmt_checked(out, outsz, "java path (~/.zan/jre-win)",
+                            "%s\\.zan\\jre-win\\bin\\java.exe", uprofile) != 0) return -1;
+        if (file_exists(out)) return 0;
+    }
 #else
     if (file_exists("/usr/bin/java") || file_exists("/usr/local/bin/java")) {
         if (zan_fmt_checked(out, outsz, "java path (standard install)",
@@ -620,159 +626,30 @@ static int find_java(char *out, size_t outsz) {
         }
         pclose(w);
     }
+    const char *uhome = getenv("HOME");
+    if (uhome && uhome[0]) {
+        if (zan_fmt_checked(out, outsz, "java path (~/.zan/jre)",
+                            "%s/.zan/jre/bin/java", uhome) != 0) return -1;
+        if (file_exists(out)) return 0;
+    }
 #endif
     return -1;
 }
 
-#include "stdlib_ext.h"
-
-/* B-ID104：expected_sha256 非空时落盘后哈希校验，不符即删包拒装 */
-static int download_file(const char *url, const char *path,
-                         const char *expected_sha256) {
-    zan_http_response_t *resp = zan_http_get(url);
-    if (!resp || resp->status_code != 200 || !resp->body || resp->body_len == 0) {
-        zan_http_response_free(resp);
-        return -1;
-    }
-    int rc = write_all(path, (const unsigned char *)resp->body, resp->body_len);
-    zan_http_response_free(resp);
-    if (rc != 0) return rc;
-    if (expected_sha256 && expected_sha256[0]) {
-        char got[65];
-        if (!zan_pkg_compute_checksum(path, got)) {
-            fprintf(stderr, "error: could not hash the downloaded file for "
-                    "integrity verification\n");
-            remove(path);
-            return -1;
-        }
-        if (strcmp(got, expected_sha256) != 0) {
-            fprintf(stderr,
-                    "error: downloaded JRE failed the SHA-256 integrity check\n"
-                    "       expected %s\n       got      %s\n"
-                    "       The file was deleted; do not proceed with a "
-                    "tampered runtime.\n",
-                    expected_sha256, got);
-            remove(path);
-            return -1;
-        }
-    }
-    return 0;
-}
-
+/* B-ID104：JRE 下载/安装器职责已整体移出编译器（见 scripts/setup_jdk.ps1）。
+ * 编译器仅负责检测环境与报错引导，杜绝在编译构建管线中隐式拉取二进制。 */
 static int ensure_java(char *out, size_t outsz) {
     if (find_java(out, outsz) == 0) return 0;
 
-#ifdef _WIN32
-    const char *url = getenv("ZAN_JDK_URL");
-    const char *jre_sha = getenv("ZAN_JDK_SHA256");
-    if (!url || !url[0]) {
-        /* B-ID104：钉扎不可变发行版 + SHA-256（与 deps/checksums.txt 同纪律）。
-         * 升级 JRE 时两行同步换：版本号进 URL，摘要取 Adoptium assets API 的
-         * binary.package.checksum（禁用 latest/ga 移动目标）。 */
-        url = "https://api.adoptium.net/v3/binary/version/jdk-21.0.13%2B9/"
-              "windows/x64/jre/hotspot/normal/eclipse?project=jdk";
-        jre_sha = "2332c0b4cff6bed722da3567c91d5e47568bcba863fa4945d0a8d6fc76158628";
-    } else if (!jre_sha || !jre_sha[0]) {
-        fprintf(stderr, "warning: ZAN_JDK_URL set without ZAN_JDK_SHA256 -- "
-                "the downloaded JRE will not be integrity-checked\n");
-    }
-    const char *zdir_name = "jre-win";
-#else
-    const char *url = "";
-    const char *jre_sha = NULL;
     fprintf(stderr,
-        "error: apksigner needs Java, and no java was found on PATH.\n"
-        "       Install a JRE (e.g. your package manager's default-jre) and retry.\n");
+        "error: apksigner needs Java (JDK/JRE 11+), but 'java' was not found on PATH or JAVA_HOME.\n"
+#ifdef _WIN32
+        "       Please install Java, or run 'pwsh scripts/setup_jdk.ps1' to install a portable JRE.\n"
+#else
+        "       Please install a JRE (e.g. your package manager's default-jre or openjdk) and retry.\n"
+#endif
+    );
     return -1;
-#endif
-
-    const char *home = getenv("USERPROFILE");
-    if (!home || !home[0]) home = getenv("HOME");
-    if (!home || !home[0]) {
-        fprintf(stderr, "error: Java is required for APK signing but no java "
-                "was found and no home directory is set\n");
-        return -1;
-    }
-    char zdir[1200], zip_path[1300], done[1300];
-#ifdef _WIN32
-    if (zan_fmt_checked(zdir, sizeof(zdir), "JRE cache dir", "%s\\.zan",
-                        home) != 0) return -1;
-    if (zan_fmt_checked(zip_path, sizeof(zip_path), "JRE download path",
-                        "%s\\jre.zip", zdir) != 0) return -1;
-    if (zan_fmt_checked(done, sizeof(done), "JRE done marker",
-                        "%s\\jre-win\\.done", zdir) != 0) return -1;
-#else
-    if (zan_fmt_checked(zdir, sizeof(zdir), "JRE cache dir", "%s/.zan",
-                        home) != 0) return -1;
-    if (zan_fmt_checked(zip_path, sizeof(zip_path), "JRE download path",
-                        "%s/jre.zip", zdir) != 0) return -1;
-    if (zan_fmt_checked(done, sizeof(done), "JRE done marker",
-                        "%s/jre-win/.done", zdir) != 0) return -1;
-#endif
-    if (!dir_exists(zdir)) {
-#ifdef _WIN32
-        CreateDirectoryA(zdir, NULL);
-#else
-        mkdir(zdir, 0755);
-#endif
-    }
-    if (file_exists(done)) {
-#ifdef _WIN32
-        if (zan_fmt_checked(out, outsz, "JRE java path",
-                            "%s\\jre-win\\bin\\java.exe", zdir) != 0) return -1;
-#else
-        if (zan_fmt_checked(out, outsz, "JRE java path",
-                            "%s/jre-win/bin/java", zdir) != 0) return -1;
-#endif
-        if (file_exists(out)) return 0;
-    }
-
-    printf("  note: no Java found -- downloading a portable JRE (~50 MB, once)\n");
-    if (download_file(url, zip_path, jre_sha) != 0) {
-        fprintf(stderr,
-            "error: could not download the signing runtime (Java).\n"
-            "       Install a JRE and make sure 'java' is on PATH, then retry.\n");
-        return -1;
-    }
-
-    /* PowerShell 单引号串内 `'` 即断串：曾直接拼路径，安装目录/压缩包
-     * 名含单引号时可注入任意命令 */
-    if (strchr(zip_path, '\'') || strchr(zdir, '\'')) {
-        fprintf(stderr, "error: install path contains a single quote\n");
-        remove(zip_path);
-        return -1;
-    }
-
-    char cmd[3000];
-    if (zan_fmt_checked(cmd, sizeof(cmd), "JRE unpack command",
-        "powershell -NoProfile -Command \"$ErrorActionPreference='Stop';"
-        "Expand-Archive -Force -LiteralPath '%s' -DestinationPath '%s'\"",
-        zip_path, zdir) != 0) { remove(zip_path); return -1; }
-    int rc = system(cmd);
-    remove(zip_path);
-    if (rc != 0) {
-        fprintf(stderr, "error: could not unpack the downloaded JRE\n");
-        return -1;
-    }
-    if (zan_fmt_checked(cmd, sizeof(cmd), "JRE move command",
-        "powershell -NoProfile -Command \"$d=Get-ChildItem '%s' -Directory |"
-        "Where-Object Name -like 'jdk-*'; if($d){Move-Item -Force $d.FullName '%s\\jre-win'}\"",
-        zdir, zdir) != 0) return -1;
-    system(cmd);
-    FILE *df = fopen(done, "wb");
-    if (df) { fputs("ok\n", df); fclose(df); }
-#ifdef _WIN32
-    if (zan_fmt_checked(out, outsz, "JRE java path",
-                        "%s\\jre-win\\bin\\java.exe", zdir) != 0) return -1;
-#else
-    if (zan_fmt_checked(out, outsz, "JRE java path",
-                        "%s/jre-win/bin/java", zdir) != 0) return -1;
-#endif
-    if (!file_exists(out)) {
-        fprintf(stderr, "error: JRE download did not produce %s\n", out);
-        return -1;
-    }
-    return 0;
 }
 
 
