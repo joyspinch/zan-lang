@@ -7,6 +7,7 @@
 void  *__wrap_malloc(size_t n);
 void   __wrap_free(void *p);
 size_t zan_mem_slabs(void);
+size_t zan_mem_trim(void);
 
 static int failures;
 
@@ -119,6 +120,20 @@ int main(void) {
         pthread_join(th2, NULL);
     }
     CHECK(zan_mem_slabs() - settled <= 2, "short-lived threads reuse caches");
+
+    size_t trimmed = zan_mem_trim();
+    printf("zan_mem_trim returned %zu bytes\n", trimmed);
+
+    /* Verify allocations after trimming continue to work and recommit safely */
+    for (int r = 0; r < 64; r++) {
+        void *keep[PER_ROUND];
+        for (int i = 0; i < PER_ROUND; i++) {
+            keep[i] = __wrap_malloc(128);
+            CHECK(keep[i] != NULL, "malloc after trim succeeded");
+            memset(keep[i], 0xEF, 128);
+        }
+        for (int i = 0; i < PER_ROUND; i++) __wrap_free(keep[i]);
+    }
 
     if (failures == 0) printf("rt_mem_remote_test: all checks passed\n");
     return failures ? 1 : 0;

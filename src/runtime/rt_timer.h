@@ -33,6 +33,7 @@ void zan_rt_alloc_add(int64_t bytes);
 int64_t zan_rt_alloc_bytes_thread(void);
 int64_t zan_rt_alloc_bytes_total(void);
 size_t zan_mem_slabs(void);
+size_t zan_mem_trim(void);
 void zan_rt_dbl_str(char *buf, unsigned long long cap, double v);
 void zan_rt_flt_str(char *buf, unsigned long long cap, float v);
 /* double */

@@ -55,8 +55,10 @@ typedef struct {
     size_t slab_count;        /* 当前分配的 1MB Slab 数量 */
     size_t slab_bytes;        /* Slab 总占用字节数 (slab_count * 1MB) */
     size_t small_alloc_count; /* 小对象总分配次数 (原子累计) */
+    size_t trimmed_bytes;     /* 已向操作系统归还的物理内存字节数 */
 } zan_mem_stats_t;
 
 void zan_mem_get_stats(zan_mem_stats_t *out);
+size_t zan_mem_trim(void);
 
 #endif /* ZAN_ABI_H */

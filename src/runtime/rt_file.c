@@ -101,7 +101,13 @@ int zan_file_rename(const char *source, const char *dest) {
 #endif
 }
 
-
+/* 文件元数据错误码口径规范（B-ID106 收敛）：
+ * 1. zan_file_time: 成功返回 Unix 秒时间戳；路径不存在或读取失败返回 0
+ *    (与 .NET DateTime.FromFileTime(0) 以及测试集 file_info.out missing_time=0 保持一致)。
+ * 2. zan_file_length: 成功返回文件字节数；路径不存在或读取失败返回 -1。
+ * 3. zan_file_attributes: 成功返回属性位掩码；路径不存在或读取失败返回 -1。
+ * 4. zan_file_set_readonly: 成功返回 0；失败返回 -1。
+ */
 long long zan_file_time(const char *path, int which) {
     if (!path || !path[0]) return 0;
 #ifdef _WIN32

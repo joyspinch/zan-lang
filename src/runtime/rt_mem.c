@@ -65,6 +65,7 @@ static int g_class_ready;
 static uintptr_t g_slab_set[ZAN_MEM_SET_SIZE];
 static size_t g_slab_count;
 static size_t g_small_alloc_count;
+static size_t g_trimmed_bytes;
 
 size_t zan_mem_slabs(void) {
     return __atomic_load_n(&g_slab_count, __ATOMIC_RELAXED);
@@ -76,6 +77,7 @@ void zan_mem_get_stats(zan_mem_stats_t *out) {
     out->slab_count = slabs;
     out->slab_bytes = slabs * (size_t)ZAN_MEM_SLAB;
     out->small_alloc_count = __atomic_load_n(&g_small_alloc_count, __ATOMIC_RELAXED);
+    out->trimmed_bytes = __atomic_load_n(&g_trimmed_bytes, __ATOMIC_RELAXED);
 }
 
 #define ZAN_MEM_REMOTE_STRIPES 8
@@ -84,6 +86,7 @@ typedef struct zan_mem_cache {
     void  *free_list[ZAN_MEM_NCLASS];   /* owner-only */
     char  *bump;                        /* owner-only */
     char  *bump_end;                    /* owner-only */
+    int    bump_decommitted;            /* unallocated bump pages decommitted to OS */
     struct {
         void *head;
         char pad[64 - sizeof(void *)];
@@ -251,6 +254,20 @@ static void zan_mem_drain_remote(zan_mem_cache *c) {
 
 static void zan_mem_retire(zan_mem_cache *c) {
     zan_mem_drain_remote(c);
+    if (c->bump && c->bump_end && !c->bump_decommitted) {
+        uintptr_t start = ((uintptr_t)c->bump + 4095) & ~(uintptr_t)4095;
+        uintptr_t end = (uintptr_t)c->bump_end & ~(uintptr_t)4095;
+        if (end > start && (end - start) >= 65536) {
+            size_t bytes = end - start;
+#if defined(_WIN32)
+            VirtualFree((void *)start, bytes, MEM_DECOMMIT);
+#elif defined(ZAN_MEM_HAVE_MMAP)
+            madvise((void *)start, bytes, MADV_DONTNEED);
+#endif
+            c->bump_decommitted = 1;
+            __atomic_fetch_add(&g_trimmed_bytes, bytes, __ATOMIC_RELAXED);
+        }
+    }
     zan_mem_lock();
     c->next_free = g_cache_pool;
     g_cache_pool = c;
@@ -281,8 +298,10 @@ static int zan_mem_adopt_retired_bump(zan_mem_cache *c, size_t need) {
         if ((size_t)(rc->bump_end - rc->bump) >= need) {
             c->bump = rc->bump;
             c->bump_end = rc->bump_end;
+            c->bump_decommitted = rc->bump_decommitted;
             rc->bump = NULL;
             rc->bump_end = NULL;
+            rc->bump_decommitted = 0;
             zan_mem_unlock();
             return 1;
         }
@@ -307,6 +326,7 @@ static int zan_mem_publish_slab(zan_mem_cache *c, uintptr_t base) {
 
     c->bump = (char *)base;
     c->bump_end = (char *)base + ZAN_MEM_SLAB;
+    c->bump_decommitted = 0;
     return 1;
 }
 
@@ -379,6 +399,18 @@ static void *zan_mem_small(size_t n) {
             if (!zan_mem_new_slab(c)) return NULL;
         }
     }
+#if defined(_WIN32)
+    if (c->bump_decommitted) {
+        uintptr_t start = ((uintptr_t)c->bump + 4095) & ~(uintptr_t)4095;
+        uintptr_t end = (uintptr_t)c->bump_end & ~(uintptr_t)4095;
+        if (end > start) {
+            VirtualAlloc((void *)start, end - start, MEM_COMMIT, PAGE_READWRITE);
+        }
+        c->bump_decommitted = 0;
+    }
+#else
+    c->bump_decommitted = 0;
+#endif
     zan_mem_hdr_t *h = (zan_mem_hdr_t *)c->bump;
     c->bump += need;
     __atomic_store_n(&h->cls, (uint32_t)cls, __ATOMIC_RELAXED);
@@ -386,6 +418,54 @@ static void *zan_mem_small(size_t n) {
     __atomic_store_n(&h->magic, ZAN_MEM_MAGIC, __ATOMIC_RELEASE);
     __atomic_fetch_add(&g_small_alloc_count, 1, __ATOMIC_RELAXED);
     return (char *)h + ZAN_MEM_HDR;
+}
+
+size_t zan_mem_trim(void) {
+    size_t total_trimmed = 0;
+    zan_mem_lock();
+    for (zan_mem_cache *rc = g_cache_pool; rc; rc = rc->next_free) {
+        if (!rc->bump || !rc->bump_end || rc->bump_decommitted) continue;
+        uintptr_t start = ((uintptr_t)rc->bump + 4095) & ~(uintptr_t)4095;
+        uintptr_t end = (uintptr_t)rc->bump_end & ~(uintptr_t)4095;
+        if (end > start) {
+            size_t bytes = end - start;
+#if defined(_WIN32)
+            VirtualFree((void *)start, bytes, MEM_DECOMMIT);
+#elif defined(ZAN_MEM_HAVE_MMAP)
+            madvise((void *)start, bytes, MADV_DONTNEED);
+#endif
+            rc->bump_decommitted = 1;
+            total_trimmed += bytes;
+        }
+    }
+    zan_mem_unlock();
+
+#if defined(_WIN32)
+    DWORD fls = __atomic_load_n(&g_fls, __ATOMIC_ACQUIRE);
+    zan_mem_cache *self = (fls == FLS_OUT_OF_INDEXES)
+                          ? NULL : (zan_mem_cache *)FlsGetValue(fls);
+#else
+    zan_mem_cache *self = t_cache;
+#endif
+    if (self && self->bump && self->bump_end && !self->bump_decommitted) {
+        uintptr_t start = ((uintptr_t)self->bump + 4095) & ~(uintptr_t)4095;
+        uintptr_t end = (uintptr_t)self->bump_end & ~(uintptr_t)4095;
+        if (end > start && (end - start) >= 65536) {
+            size_t bytes = end - start;
+#if defined(_WIN32)
+            VirtualFree((void *)start, bytes, MEM_DECOMMIT);
+#elif defined(ZAN_MEM_HAVE_MMAP)
+            madvise((void *)start, bytes, MADV_DONTNEED);
+#endif
+            self->bump_decommitted = 1;
+            total_trimmed += bytes;
+        }
+    }
+
+    if (total_trimmed > 0) {
+        __atomic_fetch_add(&g_trimmed_bytes, total_trimmed, __ATOMIC_RELAXED);
+    }
+    return total_trimmed;
 }
 
 void *__wrap_malloc(size_t n) {

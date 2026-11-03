@@ -1568,6 +1568,11 @@ size_t zan_mem_slabs(void) {
     return 0;
 }
 
+__attribute__((weak))
+size_t zan_mem_trim(void) {
+    return 0;
+}
+
 
 /* —— Dictionary/HashSet 键哈希（B-ID80）——
  * 曾在 IR 内联定种 FNV-1a（基值写死，irgen_builtins.c）：攻击者可离线
