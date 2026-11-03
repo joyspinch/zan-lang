@@ -170,7 +170,11 @@ public class WssClient : IDisposable {
                 return "";
             }
             if (frame.opcode == WsOpcode.Close) {
-                await this.SendFrame(WsOpcode.Close, "", 0);
+                if (frame.payload != null && frame.payloadLen >= 2) {
+                    await this.SendFrame(WsOpcode.Close, frame.payload, 2);
+                } else {
+                    await this.SendFrame(WsOpcode.Close, "", 0);
+                }
                 this.CloseNow();
                 return "";
             }
@@ -210,7 +214,11 @@ public class WssClient : IDisposable {
                 return null;
             }
             if (frame.opcode == WsOpcode.Close) {
-                await this.SendFrame(WsOpcode.Close, "", 0);
+                if (frame.payload != null && frame.payloadLen >= 2) {
+                    await this.SendFrame(WsOpcode.Close, frame.payload, 2);
+                } else {
+                    await this.SendFrame(WsOpcode.Close, "", 0);
+                }
                 this.CloseNow();
                 return null;
             }
@@ -241,22 +249,38 @@ public class WssClient : IDisposable {
         this.CloseNow();
     }
 
-    async void AcquireSend() {
-        while (this.sendBusy) {
-            AsyncGate g = new AsyncGate();
-            this.sendWaiters.Add(g);
-            await g.Wait();
-            g.Close();
+    void WakeSendWaiters() {
+        while (this.sendWaiters.Count > 0) {
+            AsyncGate g = this.sendWaiters[0];
+            this.sendWaiters.RemoveAt(0);
+            g.Signal();
         }
-        this.sendBusy = true;
+    }
+
+    async bool AcquireSend() {
+        if (!this.connected || this.stream == null) { return false; }
+        if (!this.sendBusy && this.sendWaiters.Count == 0) {
+            this.sendBusy = true;
+            return true;
+        }
+        AsyncGate g = new AsyncGate();
+        this.sendWaiters.Add(g);
+        await g.Wait();
+        g.Close();
+        if (!this.connected || this.stream == null) {
+            this.ReleaseSend();
+            return false;
+        }
+        return true;
     }
 
     void ReleaseSend() {
-        this.sendBusy = false;
         if (this.sendWaiters.Count > 0) {
             AsyncGate g = this.sendWaiters[0];
             this.sendWaiters.RemoveAt(0);
             g.Signal();
+        } else {
+            this.sendBusy = false;
         }
     }
 
@@ -267,8 +291,10 @@ public class WssClient : IDisposable {
             || payloadLen > 16777216
             || opcode < 0 || opcode > WsOpcode.Pong
             || (opcode >= 8 && payloadLen > 125)) { return; }
-        await this.AcquireSend();
+        bool ok = await this.AcquireSend();
+        if (!ok) { return; }
         try {
+            if (!this.connected || this.stream == null) { return; }
             int ext = 0;
             if (payloadLen > 65535) { ext = 8; }
             else if (payloadLen > 125) { ext = 2; }
@@ -358,8 +384,10 @@ public class WssClient : IDisposable {
             || payloadLen > 16777216
             || opcode < 0 || opcode > WsOpcode.Pong
             || (opcode >= 8 && payloadLen > 125)) { return; }
-        await this.AcquireSend();
+        bool ok = await this.AcquireSend();
+        if (!ok) { return; }
         try {
+            if (!this.connected || this.stream == null) { return; }
             int ext = 0;
             if (payloadLen > 65535) { ext = 8; }
             else if (payloadLen > 125) { ext = 2; }
@@ -445,10 +473,12 @@ public class WssClient : IDisposable {
     // 立即断开并释放全部句柄（TLS 流、连接、上下文、reader）。
     public void CloseNow() {
         this.connected = false;
+        this.sendBusy = false;
         if (this.stream != null) { this.stream.Close(); this.stream = null; }
         if (this.conn != null) { this.conn.Close(); this.conn = null; }
         if (this.context != null) { this.context.Free(); this.context = null; }
         this.reader = null;
+        this.WakeSendWaiters();
     }
 
     public void Dispose() {

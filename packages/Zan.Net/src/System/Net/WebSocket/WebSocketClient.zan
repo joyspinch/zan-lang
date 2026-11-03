@@ -153,22 +153,38 @@ public class WebSocketClient : IDisposable {
         return ws;
     }
 
-    async void AcquireSend() {
-        while (this.sendBusy) {
-            AsyncGate g = new AsyncGate();
-            this.sendWaiters.Add(g);
-            await g.Wait();
-            g.Close();
+    void WakeSendWaiters() {
+        while (this.sendWaiters.Count > 0) {
+            AsyncGate g = this.sendWaiters[0];
+            this.sendWaiters.RemoveAt(0);
+            g.Signal();
         }
-        this.sendBusy = true;
+    }
+
+    async bool AcquireSend() {
+        if (!this.connected || this.conn == null) { return false; }
+        if (!this.sendBusy && this.sendWaiters.Count == 0) {
+            this.sendBusy = true;
+            return true;
+        }
+        AsyncGate g = new AsyncGate();
+        this.sendWaiters.Add(g);
+        await g.Wait();
+        g.Close();
+        if (!this.connected || this.conn == null) {
+            this.ReleaseSend();
+            return false;
+        }
+        return true;
     }
 
     void ReleaseSend() {
-        this.sendBusy = false;
         if (this.sendWaiters.Count > 0) {
             AsyncGate g = this.sendWaiters[0];
             this.sendWaiters.RemoveAt(0);
             g.Signal();
+        } else {
+            this.sendBusy = false;
         }
     }
 
@@ -179,8 +195,10 @@ public class WebSocketClient : IDisposable {
             || payloadLen > 16777216
             || (opcode >= 8 && (payloadLen > 125 || opcode > WsOpcode.Pong))
             || (opcode < 0 || opcode > WsOpcode.Pong)) { return false; }
-        await this.AcquireSend();
+        bool ok = await this.AcquireSend();
+        if (!ok) { return false; }
         try {
+            if (!this.connected || this.conn == null) { return false; }
             WsFrame frame = WsFrame.RawFrame(opcode, payload, payloadLen);
             byte[] encoded = frame.EncodeMasked();
             int total = WsFrame.HeaderLen(payloadLen) + 4 + payloadLen;
@@ -199,8 +217,10 @@ public class WebSocketClient : IDisposable {
             || payloadLen > 16777216
             || (opcode >= 8 && (payloadLen > 125 || opcode > WsOpcode.Pong))
             || (opcode < 0 || opcode > WsOpcode.Pong)) { return false; }
-        await this.AcquireSend();
+        bool ok = await this.AcquireSend();
+        if (!ok) { return false; }
         try {
+            if (!this.connected || this.conn == null) { return false; }
             WsFrame frame = WsFrame.RawBytes(opcode, payload, offset, payloadLen);
             byte[] encoded = frame.EncodeMasked();
             int total = WsFrame.HeaderLen(payloadLen) + 4 + payloadLen;
@@ -276,7 +296,11 @@ public class WebSocketClient : IDisposable {
                 return "";
             }
             if (frame.opcode == WsOpcode.Close) {
-                await this.SendFrame(WsOpcode.Close, "", 0);
+                if (frame.payload != null && frame.payloadLen >= 2) {
+                    await this.SendFrame(WsOpcode.Close, frame.payload, 2);
+                } else {
+                    await this.SendFrame(WsOpcode.Close, "", 0);
+                }
                 this.CloseNow();
                 return "";
             }
@@ -325,7 +349,11 @@ public class WebSocketClient : IDisposable {
                 return null;
             }
             if (frame.opcode == WsOpcode.Close) {
-                await this.SendFrame(WsOpcode.Close, "", 0);
+                if (frame.payload != null && frame.payloadLen >= 2) {
+                    await this.SendFrame(WsOpcode.Close, frame.payload, 2);
+                } else {
+                    await this.SendFrame(WsOpcode.Close, "", 0);
+                }
                 this.CloseNow();
                 return null;
             }
@@ -353,7 +381,9 @@ public class WebSocketClient : IDisposable {
     // 立即断开（不发关闭帧）；RecvText 之后返回 ""。
     public void CloseNow() {
         this.connected = false;
+        this.sendBusy = false;
         if (this.conn != null) { this.conn.Close(); }
+        this.WakeSendWaiters();
     }
 
     // 协礼关闭：先发空关闭帧再断开。

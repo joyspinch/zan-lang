@@ -1,0 +1,106 @@
+using System;
+using System.Collections.Generic;
+using System.Net.Sockets;
+using System.Net.WebSocket;
+using System.Threading;
+using System.Web;
+
+class Program {
+    const int PORT = 28981;
+    static TcpListener listener;
+    static bool listening = true;
+
+    static void Check(bool cond, string label) {
+        if (cond) {
+            Console.WriteLine("ok   " + label);
+        } else {
+            Console.WriteLine("BAD  " + label);
+        }
+    }
+
+    static async void WsHandler(HttpContext ctx) {
+        WsSession ws = await WebWs.Upgrade(ctx);
+        if (ws == null) { return; }
+        while (ws.Open()) {
+            string m = await ws.Recv(1000);
+            if (m == null) { break; }
+            if (m == "close_me") {
+                await ws.Close(1000);
+                break;
+            }
+            if (m.Length > 0) {
+                await ws.SendText("ack:" + m);
+            }
+        }
+    }
+
+    static async void Accept(WebApp app) {
+        TcpListener l = new TcpListener("127.0.0.1", PORT);
+        l.Start();
+        Program.listener = l;
+        while (Program.listening) {
+            nint sock = await l.AcceptAsync();
+            if (sock >= 0) { Task.Spawn(app.HandleConnection(sock)); }
+        }
+    }
+
+    static async void ConcurrentSender(WebSocketClient client, string msg, List<string> results) {
+        client.SendText(msg);
+        results.Add(msg);
+    }
+
+    static async int Run() {
+        // 1. 未连接保护
+        WebSocketClient dead = new WebSocketClient();
+        Check(!dead.IsConnected(), "unconnected client reports false");
+        dead.SendText("hello");
+        dead.CloseNow();
+        dead.Dispose();
+        Check(true, "unconnected operations safe");
+
+        // 2. 状态码帧打包与解析
+        WsFrame cf = WsFrame.CloseFrameWithCode(1000);
+        Check(cf.opcode == WsOpcode.Close && cf.payloadLen == 2, "close frame format");
+        int code = ((cf.payload[0] & 255) << 8) | (cf.payload[1] & 255);
+        Check(code == 1000, "close frame code is 1000");
+
+        // 3. 真实服务建立与并发发送
+        Socket.Initialize();
+        WebApp app = new WebApp("127.0.0.1", PORT);
+        Route _r = app.Get("/ws", WsHandler);
+        Task.Spawn(Accept(app));
+        await Task.Delay(150);
+
+        WebSocketClient client = await WebSocketClient.ConnectAsync("127.0.0.1", PORT, "/ws");
+        Check(client != null && client.IsConnected(), "websocket connected");
+
+        // 4. 并发交织发送无死锁
+        List<string> sent = new List<string>();
+        Task.Spawn(ConcurrentSender(client, "msg1", sent));
+        Task.Spawn(ConcurrentSender(client, "msg2", sent));
+        Task.Spawn(ConcurrentSender(client, "msg3", sent));
+
+        await Task.Delay(150);
+        Check(sent.Count == 3, "all concurrent senders completed");
+
+        // 5. 状态码回显与协礼关闭
+        client.SendText("close_me");
+        string reply = "pending";
+        for (int i = 0; i < 10; i = i + 1) {
+            reply = await client.RecvText(2000);
+            if (!client.IsConnected()) { break; }
+        }
+        Check(!client.IsConnected() && reply == "", "client closed after peer close");
+
+        // 6. 收尾清理
+        Program.listening = false;
+        if (Program.listener != null) { Program.listener.Stop(); }
+        for (int i = 0; i < 20; i = i + 1) { await Task.Delay(10); }
+        Console.WriteLine("ws_concurrency_done=true");
+        return 0;
+    }
+
+    static void Main() {
+        int r = await Run();
+    }
+}
