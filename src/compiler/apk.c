@@ -16,6 +16,7 @@
 
 #include "../common/fmt_checked.h"
 #include "../common/host_oom.h"
+#include "package.h" /* zan_pkg_compute_checksum：JRE 下载哈希校验（B-ID104） */
 
 typedef struct {
     unsigned char *p;
@@ -625,7 +626,9 @@ static int find_java(char *out, size_t outsz) {
 
 #include "stdlib_ext.h"
 
-static int download_file(const char *url, const char *path) {
+/* B-ID104：expected_sha256 非空时落盘后哈希校验，不符即删包拒装 */
+static int download_file(const char *url, const char *path,
+                         const char *expected_sha256) {
     zan_http_response_t *resp = zan_http_get(url);
     if (!resp || resp->status_code != 200 || !resp->body || resp->body_len == 0) {
         zan_http_response_free(resp);
@@ -633,7 +636,27 @@ static int download_file(const char *url, const char *path) {
     }
     int rc = write_all(path, (const unsigned char *)resp->body, resp->body_len);
     zan_http_response_free(resp);
-    return rc;
+    if (rc != 0) return rc;
+    if (expected_sha256 && expected_sha256[0]) {
+        char got[65];
+        if (!zan_pkg_compute_checksum(path, got)) {
+            fprintf(stderr, "error: could not hash the downloaded file for "
+                    "integrity verification\n");
+            remove(path);
+            return -1;
+        }
+        if (strcmp(got, expected_sha256) != 0) {
+            fprintf(stderr,
+                    "error: downloaded JRE failed the SHA-256 integrity check\n"
+                    "       expected %s\n       got      %s\n"
+                    "       The file was deleted; do not proceed with a "
+                    "tampered runtime.\n",
+                    expected_sha256, got);
+            remove(path);
+            return -1;
+        }
+    }
+    return 0;
 }
 
 static int ensure_java(char *out, size_t outsz) {
@@ -641,13 +664,22 @@ static int ensure_java(char *out, size_t outsz) {
 
 #ifdef _WIN32
     const char *url = getenv("ZAN_JDK_URL");
+    const char *jre_sha = getenv("ZAN_JDK_SHA256");
     if (!url || !url[0]) {
-        url = "https://api.adoptium.net/v3/binary/latest/21/ga/windows/x64/jre/hotspot/normal/eclipse"
-              "?project=jdk";
+        /* B-ID104：钉扎不可变发行版 + SHA-256（与 deps/checksums.txt 同纪律）。
+         * 升级 JRE 时两行同步换：版本号进 URL，摘要取 Adoptium assets API 的
+         * binary.package.checksum（禁用 latest/ga 移动目标）。 */
+        url = "https://api.adoptium.net/v3/binary/version/jdk-21.0.13%2B9/"
+              "windows/x64/jre/hotspot/normal/eclipse?project=jdk";
+        jre_sha = "2332c0b4cff6bed722da3567c91d5e47568bcba863fa4945d0a8d6fc76158628";
+    } else if (!jre_sha || !jre_sha[0]) {
+        fprintf(stderr, "warning: ZAN_JDK_URL set without ZAN_JDK_SHA256 -- "
+                "the downloaded JRE will not be integrity-checked\n");
     }
     const char *zdir_name = "jre-win";
 #else
     const char *url = "";
+    const char *jre_sha = NULL;
     fprintf(stderr,
         "error: apksigner needs Java, and no java was found on PATH.\n"
         "       Install a JRE (e.g. your package manager's default-jre) and retry.\n");
@@ -696,7 +728,7 @@ static int ensure_java(char *out, size_t outsz) {
     }
 
     printf("  note: no Java found -- downloading a portable JRE (~50 MB, once)\n");
-    if (download_file(url, zip_path) != 0) {
+    if (download_file(url, zip_path, jre_sha) != 0) {
         fprintf(stderr,
             "error: could not download the signing runtime (Java).\n"
             "       Install a JRE and make sure 'java' is on PATH, then retry.\n");
