@@ -76,9 +76,22 @@ public class Model {
         db.Execute(sb.ToString());
     }
 
-    // 创建表（包装方法）。
-    public void CreateTableAsync(IDbExecutor db) {
-        CreateTable(db);
+    // 创建表（异步版本）。
+    public async int CreateTableAsync(IDbExecutor db) {
+        StringBuilder sb = new StringBuilder();
+        sb.Append("CREATE TABLE IF NOT EXISTS ");
+        sb.Append(this.tableName);
+        sb.Append(" (");
+        bool first = true;
+        foreach (ModelColumn col in this.columns) {
+            if (!first) { sb.Append(", "); }
+            sb.Append(col.name);
+            sb.Append(" ");
+            sb.Append(col.type);
+            first = false;
+        }
+        sb.Append(")");
+        return await db.ExecuteAsync(sb.ToString());
     }
 
     // 从数据库中删除表。
@@ -86,12 +99,35 @@ public class Model {
         db.Execute("DROP TABLE IF EXISTS " + this.tableName);
     }
 
-    // 检查表是否存在。（tableName 在 Define 时已通过标识符校验，
-    // 因此这里直接内联是安全的。）
+    // 异步从数据库中删除表。
+    public async int DropTableAsync(IDbExecutor db) {
+        return await db.ExecuteAsync("DROP TABLE IF EXISTS " + this.tableName);
+    }
+
+    // 检查表是否存在（跨数据库方言，参数化查询防注入）。
     public bool TableExists(IDbExecutor db) {
-        string sql = "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='" + this.tableName + "'";
-        string result = db.ExecuteScalar(sql);
-        return result == "1";
+        int prov = db != null ? db.GetProvider() : DbProvider.SQLite;
+        string sql = "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name = ?";
+        if (prov == DbProvider.MySQL || prov == DbProvider.PostgreSQL || prov == DbProvider.SqlServer) {
+            sql = "SELECT COUNT(*) FROM information_schema.tables WHERE table_name = ?";
+        }
+        DbParams ps = new DbParams();
+        ps.Add(this.tableName);
+        string result = db.ExecuteScalar(sql, ps);
+        return Convert.ToInt(result) > 0;
+    }
+
+    // 异步检查表是否存在。
+    public async bool TableExistsAsync(IDbExecutor db) {
+        int prov = db != null ? db.GetProvider() : DbProvider.SQLite;
+        string sql = "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name = ?";
+        if (prov == DbProvider.MySQL || prov == DbProvider.PostgreSQL || prov == DbProvider.SqlServer) {
+            sql = "SELECT COUNT(*) FROM information_schema.tables WHERE table_name = ?";
+        }
+        DbParams ps = new DbParams();
+        ps.Add(this.tableName);
+        string result = await db.ExecuteScalarAsync(sql, ps);
+        return Convert.ToInt(result) > 0;
     }
 
     // 向表中插入一行。
@@ -106,9 +142,16 @@ public class Model {
         return db.Execute(qb.BuildInsertParams(), qb.InsertParams());
     }
 
-    // 插入一行（包装方法）。
-    public int InsertAsync(IDbExecutor db, ModelRow row) {
-        return Insert(db, row);
+    // 插入一行（异步版本）。
+    public async int InsertAsync(IDbExecutor db, ModelRow row) {
+        QueryBuilder qb = QueryBuilder.InsertInto(this.tableName);
+        List<string> keys = row.GetKeys();
+        for (int i = 0; i < keys.Count; i = i + 1) {
+            string key = keys[i];
+            string val = row.Get(key);
+            qb.Set(key, val);
+        }
+        return await db.ExecuteAsync(qb.BuildInsertParams(), qb.InsertParams());
     }
 
     // 为该模型开启 SELECT 查询构建器。
@@ -126,27 +169,45 @@ public class Model {
         return ModelDelete.New(db, this.tableName);
     }
 
-    // 按主键查找一行。
+    // 按主键查找一行（参数化查询）。
     public ModelRow FindById(IDbExecutor db, int id) {
         string pk = this.primaryKey;
         if (pk.Length == 0) { pk = "id"; }
-        string sql = "SELECT * FROM " + this.tableName + " WHERE " + pk + " = " + Convert.ToString(id);
-        DbResult result = db.Query(sql);
+        string sql = "SELECT * FROM " + this.tableName + " WHERE " + pk + " = ?";
+        DbParams ps = new DbParams();
+        ps.AddInt(id);
+        DbResult result = db.Query(sql, ps);
         if (result.RowCount() > 0) {
             return ModelRow.FromDbResult(result, 0);
         }
         return new ModelRow();
     }
 
-    // 按主键查找一行（包装方法）。
-    public ModelRow FindByIdAsync(IDbExecutor db, int id) {
-        return FindById(db, id);
+    // 按主键查找一行（异步版本）。
+    public async ModelRow FindByIdAsync(IDbExecutor db, int id) {
+        string pk = this.primaryKey;
+        if (pk.Length == 0) { pk = "id"; }
+        string sql = "SELECT * FROM " + this.tableName + " WHERE " + pk + " = ?";
+        DbParams ps = new DbParams();
+        ps.AddInt(id);
+        DbResult result = await db.QueryAsync(sql, ps);
+        if (result.RowCount() > 0) {
+            return ModelRow.FromDbResult(result, 0);
+        }
+        return new ModelRow();
     }
 
     // 统计表中的总行数。
     public int Count(IDbExecutor db) {
         string sql = "SELECT COUNT(*) FROM " + this.tableName;
         string result = db.ExecuteScalar(sql);
+        return Convert.ToInt(result);
+    }
+
+    // 异步统计表中的总行数。
+    public async int CountAsync(IDbExecutor db) {
+        string sql = "SELECT COUNT(*) FROM " + this.tableName;
+        string result = await db.ExecuteScalarAsync(sql);
         return Convert.ToInt(result);
     }
 
@@ -157,16 +218,40 @@ public class Model {
         return Convert.ToInt(result);
     }
 
-    // 按主键删除一行。
+    // 异步统计满足条件的行数。
+    public async int CountWhereAsync(IDbExecutor db, string condition) {
+        string sql = "SELECT COUNT(*) FROM " + this.tableName + " WHERE " + condition;
+        string result = await db.ExecuteScalarAsync(sql);
+        return Convert.ToInt(result);
+    }
+
+    // 按主键删除一行（参数化执行）。
     public void DeleteById(IDbExecutor db, int id) {
         string pk = this.primaryKey;
         if (pk.Length == 0) { pk = "id"; }
-        db.Execute("DELETE FROM " + this.tableName + " WHERE " + pk + " = " + Convert.ToString(id));
+        DbParams ps = new DbParams();
+        ps.AddInt(id);
+        db.Execute("DELETE FROM " + this.tableName + " WHERE " + pk + " = ?", ps);
+    }
+
+    // 异步按主键删除一行（参数化执行）。
+    public async int DeleteByIdAsync(IDbExecutor db, int id) {
+        string pk = this.primaryKey;
+        if (pk.Length == 0) { pk = "id"; }
+        DbParams ps = new DbParams();
+        ps.AddInt(id);
+        return await db.ExecuteAsync("DELETE FROM " + this.tableName + " WHERE " + pk + " = ?", ps);
     }
 
     // 返回所有行。
     public List<ModelRow> All(IDbExecutor db) {
         DbResult result = db.Query("SELECT * FROM " + this.tableName);
+        return ModelRow.FromDbResultAll(result);
+    }
+
+    // 异步返回所有行。
+    public async List<ModelRow> AllAsync(IDbExecutor db) {
+        DbResult result = await db.QueryAsync("SELECT * FROM " + this.tableName);
         return ModelRow.FromDbResultAll(result);
     }
 
