@@ -160,17 +160,37 @@ public class HttpServer : IDisposable {
             nint clientSock = await this.listener.AcceptAsync();
             if (clientSock >= 0) {
                 Socket.SetNoDelay(clientSock);
-                if (this.activeConnections >= this.maxConnections) {
+                if (!this.TryAcquireConnection(clientSock)) {
                     // 超过上限：返回 503 并挂断，而不是为无法服务的连接
                     // 堆积协程和缓冲区。
                     Task.Spawn(HttpServer.RejectOverloaded(clientSock));
                 } else {
-                    this.activeConnections = this.activeConnections + 1;
-                    this.activeSockets.Add(clientSock);
                     // 每个连接用独立协程处理，使 accept 循环
                     // 持续接受新连接，而不是一次只服务一个客户端。
                     Task.Spawn(HandleConnection(clientSock));
                 }
+            }
+        }
+    }
+
+    // 互斥申请连接槽位，避免并发 Accept 与断连竞争撕裂 activeSockets 列表。
+    private bool TryAcquireConnection(nint clientSock) {
+        lock (this) {
+            if (this.activeConnections >= this.maxConnections) {
+                return false;
+            }
+            this.activeConnections = this.activeConnections + 1;
+            this.activeSockets.Add(clientSock);
+            return true;
+        }
+    }
+
+    // 互斥释放连接槽位。
+    private void ReleaseConnection(nint clientSock) {
+        lock (this) {
+            this.activeConnections = this.activeConnections - 1;
+            if (this.activeSockets != null) {
+                this.activeSockets.Remove(clientSock);
             }
         }
     }
@@ -205,10 +225,7 @@ public class HttpServer : IDisposable {
             await HttpServer.ServeConnection(clientSock, this.requestHandler,
                 this.maxHeaderBytes, this.maxRequestBytes, this.requestTimeout);
         } finally {
-            this.activeConnections = this.activeConnections - 1;
-            if (this.activeSockets != null) {
-                this.activeSockets.Remove(clientSock);
-            }
+            this.ReleaseConnection(clientSock);
         }
     }
 
@@ -527,11 +544,14 @@ public class HttpServer : IDisposable {
         if (this.listener != null) {
             this.listener.Stop();
         }
-        if (this.activeSockets != null) {
-            for (int i = 0; i < this.activeSockets.Count; i = i + 1) {
-                Socket.Close(this.activeSockets[i]);
+        lock (this) {
+            if (this.activeSockets != null) {
+                for (int i = 0; i < this.activeSockets.Count; i = i + 1) {
+                    Socket.Close(this.activeSockets[i]);
+                }
+                this.activeSockets.Clear();
             }
-            this.activeSockets.Clear();
+            this.activeConnections = 0;
         }
     }
 
@@ -541,7 +561,9 @@ public class HttpServer : IDisposable {
 
     // 返回当前活动连接数。
     public int GetActiveConnections() {
-        return this.activeConnections;
+        lock (this) {
+            return this.activeConnections;
+        }
     }
 
     // 返回服务器是否正在运行。
@@ -549,5 +571,3 @@ public class HttpServer : IDisposable {
         return this.running;
     }
 }
-
-// Arm 返回的截止时间句柄：记录槽位下标与 generation，供 Disarm 使用。
