@@ -75,6 +75,164 @@ char *zan_version_format(const zan_version_t *v, char *buf, int buf_size) {
     return buf;
 }
 
+void zan_dep_to_range(const zan_dependency_t *dep, zan_version_range_t *out) {
+    memset(out, 0, sizeof(*out));
+    if (!dep) {
+        out->min_included = true;
+        return;
+    }
+    switch (dep->kind) {
+    case ZAN_DEP_ANY:
+        out->min.major = 0;
+        out->min.minor = 0;
+        out->min.patch = 0;
+        out->min_included = true;
+        out->has_max = false;
+        break;
+    case ZAN_DEP_EXACT:
+        out->min = dep->min_ver;
+        out->min_included = true;
+        out->max = dep->min_ver;
+        out->max_included = true;
+        out->has_max = true;
+        break;
+    case ZAN_DEP_MINIMUM:
+        out->min = dep->min_ver;
+        out->min_included = true;
+        out->has_max = false;
+        break;
+    case ZAN_DEP_MAXIMUM:
+        out->min.major = 0;
+        out->min.minor = 0;
+        out->min.patch = 0;
+        out->min_included = true;
+        out->max = dep->min_ver;
+        out->max_included = true;
+        out->has_max = true;
+        break;
+    case ZAN_DEP_COMPAT:
+        out->min = dep->min_ver;
+        out->min_included = true;
+        out->max_included = false;
+        out->has_max = true;
+        if (dep->min_ver.major > 0) {
+            out->max.major = dep->min_ver.major + 1;
+            out->max.minor = 0;
+            out->max.patch = 0;
+        } else if (dep->min_ver.minor > 0) {
+            out->max.major = 0;
+            out->max.minor = dep->min_ver.minor + 1;
+            out->max.patch = 0;
+        } else {
+            out->max.major = 0;
+            out->max.minor = 0;
+            out->max.patch = dep->min_ver.patch + 1;
+        }
+        break;
+    case ZAN_DEP_TILDE:
+        out->min = dep->min_ver;
+        out->min_included = true;
+        out->max_included = false;
+        out->has_max = true;
+        out->max.major = dep->min_ver.major;
+        out->max.minor = dep->min_ver.minor + 1;
+        out->max.patch = 0;
+        break;
+    case ZAN_DEP_RANGE:
+        out->min = dep->min_ver;
+        out->min_included = true;
+        out->max = dep->max_ver;
+        out->max_included = false;
+        out->has_max = true;
+        break;
+    }
+}
+
+char *zan_range_format(const zan_version_range_t *r, char *buf, int buf_size) {
+    if (!r || buf_size <= 0) return buf;
+    char min_buf[64], max_buf[64];
+    zan_version_format(&r->min, min_buf, sizeof(min_buf));
+    if (!r->has_max) {
+        snprintf(buf, (size_t)buf_size, ">=%s", min_buf);
+    } else {
+        zan_version_format(&r->max, max_buf, sizeof(max_buf));
+        if (r->min_included && r->max_included && zan_version_compare(&r->min, &r->max) == 0) {
+            snprintf(buf, (size_t)buf_size, "=%s", min_buf);
+        } else {
+            snprintf(buf, (size_t)buf_size, "%s%s, %s%s",
+                     r->min_included ? ">=" : ">", min_buf,
+                     r->max_included ? "<=" : "<", max_buf);
+        }
+    }
+    return buf;
+}
+
+bool zan_range_intersect(const zan_version_range_t *a, const zan_version_range_t *b,
+                         zan_version_range_t *out) {
+    if (!a || !b || !out) return false;
+    memset(out, 0, sizeof(*out));
+
+    /* 下界取较大者 */
+    int cmp_min = zan_version_compare(&a->min, &b->min);
+    if (cmp_min > 0) {
+        out->min = a->min;
+        out->min_included = a->min_included;
+    } else if (cmp_min < 0) {
+        out->min = b->min;
+        out->min_included = b->min_included;
+    } else {
+        out->min = a->min;
+        out->min_included = a->min_included && b->min_included;
+    }
+
+    /* 上界取较小者 */
+    if (!a->has_max && !b->has_max) {
+        out->has_max = false;
+    } else if (a->has_max && !b->has_max) {
+        out->max = a->max;
+        out->max_included = a->max_included;
+        out->has_max = true;
+    } else if (!a->has_max && b->has_max) {
+        out->max = b->max;
+        out->max_included = b->max_included;
+        out->has_max = true;
+    } else {
+        int cmp_max = zan_version_compare(&a->max, &b->max);
+        if (cmp_max < 0) {
+            out->max = a->max;
+            out->max_included = a->max_included;
+        } else if (cmp_max > 0) {
+            out->max = b->max;
+            out->max_included = b->max_included;
+        } else {
+            out->max = a->max;
+            out->max_included = a->max_included && b->max_included;
+        }
+        out->has_max = true;
+    }
+
+    /* 验证非空性 */
+    if (out->has_max) {
+        int cmp = zan_version_compare(&out->min, &out->max);
+        if (cmp > 0) return false;
+        if (cmp == 0 && (!out->min_included || !out->max_included)) return false;
+    }
+    return true;
+}
+
+bool zan_version_satisfies_range(const zan_version_t *v, const zan_version_range_t *r) {
+    if (!v || !r) return false;
+    int cmp_min = zan_version_compare(v, &r->min);
+    if (cmp_min < 0) return false;
+    if (cmp_min == 0 && !r->min_included) return false;
+    if (r->has_max) {
+        int cmp_max = zan_version_compare(v, &r->max);
+        if (cmp_max > 0) return false;
+        if (cmp_max == 0 && !r->max_included) return false;
+    }
+    return true;
+}
+
 /* --- SHA-256 算法实现 --- */
 static const uint32_t K256[64] = {
     0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
@@ -583,29 +741,9 @@ void zan_pkg_init(zan_pkg_registry_t *reg, const char *project_dir) {
 
 bool zan_pkg_version_satisfies(const zan_dependency_t *dep, const zan_version_t *ver) {
     if (!dep || !ver) return false;
-    switch (dep->kind) {
-    case ZAN_DEP_ANY:
-        return true;
-    case ZAN_DEP_EXACT:
-        return zan_version_compare(ver, &dep->min_ver) == 0;
-    case ZAN_DEP_MINIMUM:
-        return zan_version_compare(ver, &dep->min_ver) >= 0;
-    case ZAN_DEP_MAXIMUM:
-        return zan_version_compare(ver, &dep->min_ver) <= 0;
-    case ZAN_DEP_COMPAT: {
-        if (zan_version_compare(ver, &dep->min_ver) < 0) return false;
-        if (dep->min_ver.major > 0) return ver->major == dep->min_ver.major;
-        else if (dep->min_ver.minor > 0) return ver->major == 0 && ver->minor == dep->min_ver.minor;
-        return zan_version_compare(ver, &dep->min_ver) == 0;
-    }
-    case ZAN_DEP_TILDE: {
-        if (zan_version_compare(ver, &dep->min_ver) < 0) return false;
-        return ver->major == dep->min_ver.major && ver->minor == dep->min_ver.minor;
-    }
-    case ZAN_DEP_RANGE:
-        return zan_version_compare(ver, &dep->min_ver) >= 0 && zan_version_compare(ver, &dep->max_ver) < 0;
-    }
-    return false;
+    zan_version_range_t range;
+    zan_dep_to_range(dep, &range);
+    return zan_version_satisfies_range(ver, &range);
 }
 
 static bool pkg_token_is_shell_safe(const char *s) {
@@ -661,17 +799,110 @@ bool zan_pkg_fetch(zan_pkg_registry_t *reg, const zan_dependency_t *dep) {
     return false;
 }
 
+typedef struct {
+    char name[128];
+    char source[512];
+    zan_version_range_t merged_range;
+    zan_version_t resolved_ver;
+    bool has_resolved_ver;
+    char checksum[65];
+    char sources[8][128];
+    zan_version_range_t source_ranges[8];
+    int source_count;
+} zan_solver_entry_t;
+
+typedef struct {
+    zan_solver_entry_t entries[256];
+    int entry_count;
+} zan_diamond_solver_t;
+
+static zan_solver_entry_t *solver_find_entry(zan_diamond_solver_t *solver, const char *name) {
+    if (!solver || !name) return NULL;
+    for (int i = 0; i < solver->entry_count; i++) {
+        if (strcmp(solver->entries[i].name, name) == 0) {
+            return &solver->entries[i];
+        }
+    }
+    return NULL;
+}
+
+static zan_solver_entry_t *solver_get_or_create_entry(zan_diamond_solver_t *solver, const char *name) {
+    zan_solver_entry_t *e = solver_find_entry(solver, name);
+    if (e) return e;
+    if (solver->entry_count >= 256) return NULL;
+    e = &solver->entries[solver->entry_count++];
+    memset(e, 0, sizeof(*e));
+    strncpy(e->name, name, sizeof(e->name) - 1);
+    return e;
+}
+
+static bool solver_add_constraint(zan_diamond_solver_t *solver, const char *pkg_name,
+                                  const char *parent_name, const zan_dependency_t *dep) {
+    zan_solver_entry_t *entry = solver_get_or_create_entry(solver, pkg_name);
+    if (!entry) {
+        fprintf(stderr, "error: dependency solver exceeded maximum package capacity (256)\n");
+        return false;
+    }
+    if (dep->source[0] && !entry->source[0]) {
+        strncpy(entry->source, dep->source, sizeof(entry->source) - 1);
+    }
+    zan_version_range_t new_range;
+    zan_dep_to_range(dep, &new_range);
+
+    if (entry->source_count == 0) {
+        entry->merged_range = new_range;
+        strncpy(entry->sources[0], parent_name ? parent_name : "root", sizeof(entry->sources[0]) - 1);
+        entry->source_ranges[0] = new_range;
+        entry->source_count = 1;
+        return true;
+    }
+
+    zan_version_range_t intersected;
+    if (!zan_range_intersect(&entry->merged_range, &new_range, &intersected)) {
+        char prev_buf[128], new_buf[128];
+        zan_range_format(&entry->merged_range, prev_buf, sizeof(prev_buf));
+        zan_range_format(&new_range, new_buf, sizeof(new_buf));
+        fprintf(stderr, "error: version conflict for package '%s':\n", pkg_name);
+        fprintf(stderr, "       '%s' requires %s %s\n",
+                entry->sources[0], pkg_name, prev_buf);
+        fprintf(stderr, "       '%s' requires %s %s\n",
+                parent_name ? parent_name : "root", pkg_name, new_buf);
+        fprintf(stderr, "       no compatible version satisfies both constraints (empty range intersection)\n");
+        return false;
+    }
+
+    entry->merged_range = intersected;
+    if (entry->source_count < 8) {
+        strncpy(entry->sources[entry->source_count], parent_name ? parent_name : "root", sizeof(entry->sources[0]) - 1);
+        entry->source_ranges[entry->source_count] = new_range;
+        entry->source_count++;
+    }
+    return true;
+}
+
 static bool zan_pkg_resolve_seen(zan_pkg_registry_t *reg, zan_package_t *root,
-                                 char (*seen)[128], int *seen_count) {
+                                 char (*seen)[128], int *seen_count,
+                                 zan_diamond_solver_t *solver) {
     bool all_ok = true;
     for (int i = 0; i < root->dep_count; i++) {
         zan_dependency_t *dep = &root->deps[i];
         fprintf(stderr, "Resolving: %s\n", dep->name);
+
+        /* 1. 约束合并与冲突判定（PubGrub 风格因果链） */
+        if (!solver_add_constraint(solver, dep->name, root->name, dep)) {
+            all_ok = false;
+            continue;
+        }
+
+        zan_solver_entry_t *entry = solver_find_entry(solver, dep->name);
+
+        /* 2. 获取包源 */
         if (!zan_pkg_fetch(reg, dep)) {
             fprintf(stderr, "error: failed to fetch package '%s' from %s\n", dep->name, dep->source);
             all_ok = false;
             continue;
         }
+
         char manifest_path[1024];
         snprintf(manifest_path, sizeof(manifest_path), "%s" PATH_SEP "%s" PATH_SEP "zan.pkg", reg->cache_dir, dep->name);
         char pkg_dir[1024];
@@ -681,15 +912,30 @@ static bool zan_pkg_resolve_seen(zan_pkg_registry_t *reg, zan_package_t *root,
             char computed_hash[65] = {0};
             /* B-ID90: 校验对象从 manifest 升级为整包源码树（防源码篡改） */
             bool has_hash = zan_pkg_compute_tree_checksum(pkg_dir, computed_hash);
-            if (!zan_pkg_version_satisfies(dep, &fetched_pkg.version)) {
-                char ver_buf[64]; zan_version_format(&fetched_pkg.version, ver_buf, sizeof(ver_buf));
-                fprintf(stderr, "warning: package '%s' version %s may not satisfy constraint\n", dep->name, ver_buf);
+
+            /* 3. 针对累计交集约束验证版本满足性 */
+            if (!zan_version_satisfies_range(&fetched_pkg.version, &entry->merged_range)) {
+                char ver_buf[64], range_buf[128];
+                zan_version_format(&fetched_pkg.version, ver_buf, sizeof(ver_buf));
+                zan_range_format(&entry->merged_range, range_buf, sizeof(range_buf));
+                fprintf(stderr, "warning: package '%s' version %s does not satisfy merged constraint %s\n",
+                        dep->name, ver_buf, range_buf);
             }
+
+            /* 4. 记录或更新仲裁解析结果 */
+            entry->resolved_ver = fetched_pkg.version;
+            entry->has_resolved_ver = true;
+            if (has_hash) {
+                strncpy(entry->checksum, computed_hash, sizeof(entry->checksum) - 1);
+            }
+
             if (reg->resolved && reg->resolved_count < 256) {
                 bool already_resolved = false;
                 for (int r = 0; r < reg->resolved_count; r++) {
                     if (reg->resolved[r] && strcmp(reg->resolved[r]->name, fetched_pkg.name) == 0) {
                         already_resolved = true;
+                        /* 钻石依赖仲裁升级：更新为当前仲裁选取的满足版本 */
+                        reg->resolved[r]->version = fetched_pkg.version;
                         if (reg->resolved[r]->checksum[0] && has_hash) {
                             if (strcmp(reg->resolved[r]->checksum, computed_hash) != 0) {
                                 fprintf(stderr, "error: checksum mismatch for package '%s': expected %s, got %s\n",
@@ -715,6 +961,8 @@ static bool zan_pkg_resolve_seen(zan_pkg_registry_t *reg, zan_package_t *root,
                     reg->resolved[reg->resolved_count++] = rp;
                 }
             }
+
+            /* 5. 递归遍历子依赖树 */
             if (fetched_pkg.dep_count > 0) {
                 bool seen_before = false;
                 for (int s = 0; s < *seen_count; s++) {
@@ -727,7 +975,7 @@ static bool zan_pkg_resolve_seen(zan_pkg_registry_t *reg, zan_package_t *root,
                 } else if (*seen_count < 256) {
                     snprintf(seen[*seen_count], 128, "%s", fetched_pkg.name);
                     (*seen_count)++;
-                    if (!zan_pkg_resolve_seen(reg, &fetched_pkg, seen, seen_count))
+                    if (!zan_pkg_resolve_seen(reg, &fetched_pkg, seen, seen_count, solver))
                         all_ok = false;
                 } else {
                     fprintf(stderr, "error: dependency chain deeper than 256 packages\n");
@@ -749,7 +997,9 @@ bool zan_pkg_resolve(zan_pkg_registry_t *reg, zan_package_t *root) {
     if (root->name[0]) {
         snprintf(seen[seen_count++], 128, "%s", root->name);
     }
-    return zan_pkg_resolve_seen(reg, root, seen, &seen_count);
+    zan_diamond_solver_t solver;
+    memset(&solver, 0, sizeof(solver));
+    return zan_pkg_resolve_seen(reg, root, seen, &seen_count, &solver);
 }
 
 char **zan_pkg_get_sources(zan_pkg_registry_t *reg, int *out_count) {
@@ -886,7 +1136,7 @@ static bool pkg_safe_component(const char *s) {
     if (!s || !*s || strcmp(s, ".") == 0 || strcmp(s, "..") == 0) return false;
     for (; *s; s++) {
         unsigned char c = (unsigned char)*s;
-        if (!isalnum(c) && c != '_' && c != '-' && c != '.') return false;
+        if (!isalnum(c) && c != '_' && c != '-' && c != '.' && c != '@') return false;
     }
     return true;
 }
@@ -1046,7 +1296,7 @@ static bool pkg_tree_hash_dir(const char *dir, const char *rel,
         FILE *f = fopen(child, "rb");
         if (!f) { ok = false; break; }
         /* 路径与长度先入账，再回卷读内容——改一个字节必变哈希 */
-        zan_sha256_update(ctx, child_rel, strlen(child_rel));
+        zan_sha256_update(ctx, (const uint8_t *)child_rel, strlen(child_rel));
         uint8_t nul = 0;
         zan_sha256_update(ctx, &nul, 1);
         long sz = -1;

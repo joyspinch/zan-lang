@@ -38,6 +38,28 @@ typedef struct {
     zan_version_t max_ver;
 } zan_dependency_t;
 
+/* 归一化语义版本区间 [min, max)，支持开闭区间与无界 */
+typedef struct {
+    zan_version_t min;
+    bool min_included;
+    zan_version_t max;
+    bool max_included;
+    bool has_max;
+} zan_version_range_t;
+
+/* 将 dependency 转换为归一化区间 */
+void zan_dep_to_range(const zan_dependency_t *dep, zan_version_range_t *out);
+
+/* 格式化输出版本区间至字符串（如 ">=1.2.0, <2.0.0"） */
+char *zan_range_format(const zan_version_range_t *r, char *buf, int buf_size);
+
+/* 计算两个版本区间的交集。若存在有效交集返回 true 并写入 out；若不相容返回 false */
+bool zan_range_intersect(const zan_version_range_t *a, const zan_version_range_t *b,
+                         zan_version_range_t *out);
+
+/* 判定版本是否落在区间内 */
+bool zan_version_satisfies_range(const zan_version_t *v, const zan_version_range_t *r);
+
 typedef struct {
     char name[128];
     char source[512];
