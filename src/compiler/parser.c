@@ -142,10 +142,17 @@ static zan_ast_node_t *parse_delegate_decl(zan_parser_t *p, uint32_t mods) {
     zan_ast_list_init(&dtype_params);
     if (parser_match(p, TK_LESS)) {
         while (!parser_check(p, TK_GREATER) && !parser_check(p, TK_EOF)) {
+            int variance = 0;
+            if (parser_match(p, TK_OUT)) {
+                variance = 1;
+            } else if (parser_match(p, TK_IN)) {
+                variance = -1;
+            }
             if (parser_check(p, TK_IDENT)) {
                 parser_advance(p);
                 zan_ast_node_t *tp = zan_ast_new(p->arena, AST_IDENTIFIER, p->previous.loc);
                 tp->ident.name = p->previous.str_val;
+                tp->ident.variance = variance;
                 zan_ast_list_push(&dtype_params, tp, p->arena);
             }
             if (!parser_match(p, TK_COMMA)) break;
@@ -4172,13 +4179,17 @@ static zan_ast_node_t *parse_type_decl(zan_parser_t *p, uint32_t modifiers) {
     zan_ast_list_init(&type_params);
     if (parser_match(p, TK_LESS)) {
         while (!parser_check(p, TK_GREATER) && !parser_check(p, TK_EOF)) {
-            if (parser_check(p, TK_OUT) || parser_check(p, TK_IN)) {
-                parser_advance(p);
+            int variance = 0;
+            if (parser_match(p, TK_OUT)) {
+                variance = 1;
+            } else if (parser_match(p, TK_IN)) {
+                variance = -1;
             }
             if (parser_check(p, TK_IDENT)) {
                 parser_advance(p);
                 zan_ast_node_t *tp = zan_ast_new(p->arena, AST_IDENTIFIER, p->previous.loc);
                 tp->ident.name = p->previous.str_val;
+                tp->ident.variance = variance;
                 zan_ast_list_push(&type_params, tp, p->arena);
             }
             if (!parser_match(p, TK_COMMA)) break;

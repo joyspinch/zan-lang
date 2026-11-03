@@ -1662,8 +1662,25 @@ static void validate_interface_contract(zan_binder_t *b, zan_symbol_t *cls,
         zan_ast_node_t *bref = iface->type_decl.bases.items[i];
         if (bref->kind != AST_TYPE_REF) continue;
         zan_symbol_t *base = scope_find(b->current_scope, bref->type_ref.name);
-        if (base && base->kind == SYM_INTERFACE && base->decl)
-            validate_interface_contract(b, cls, base->decl, NULL, depth + 1);
+        if (base && base->kind == SYM_INTERFACE && base->decl) {
+            zan_type_t *base_inst = NULL;
+            if (bref->type_ref.type_args.count > 0) {
+                base_inst = make_type(b->arena, TYPE_CLASS, bref->type_ref.name.str, bref->type_ref.name.len);
+                base_inst->sym = base;
+                base_inst->type_arg_count = bref->type_ref.type_args.count;
+                base_inst->type_args = (zan_type_t **)zan_arena_alloc(
+                    b->arena, sizeof(zan_type_t *) * (size_t)base_inst->type_arg_count);
+                for (int k = 0; k < base_inst->type_arg_count; k++) {
+                    zan_ast_node_t *ta_node = bref->type_ref.type_args.items[k];
+                    zan_type_t *resolved_arg = zan_binder_resolve_type(b, ta_node);
+                    if (bind_tps && bind_tps->count > 0 && bind_args) {
+                        resolved_arg = zan_binder_subst_named(b, resolved_arg, bind_tps, bind_args);
+                    }
+                    base_inst->type_args[k] = resolved_arg;
+                }
+            }
+            validate_interface_contract(b, cls, base->decl, base_inst, depth + 1);
+        }
     }
     b->current_scope = saved;
 }

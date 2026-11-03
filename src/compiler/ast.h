@@ -152,6 +152,7 @@ struct zan_ast_node {
         struct {
             zan_istr_t name;
             zan_ast_node_t *inst_type_ref;
+            int variance; /* 0: invariant, 1: covariant (out), -1: contravariant (in) */
         } ident;
 
         /* binary / assignment */

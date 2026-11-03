@@ -38,6 +38,10 @@ zan_ast_node_t *zan_ast_new(zan_arena_t *arena, zan_ast_kind_t kind, zan_loc_t l
     if (kind == AST_ASSIGNMENT || kind == AST_BINARY) {
         node->binary.compound_base = TK_EOF;
     }
+    if (kind == AST_IDENTIFIER) {
+        node->ident.inst_type_ref = NULL;
+        node->ident.variance = 0;
+    }
     if (kind == AST_METHOD_DECL || kind == AST_CONSTRUCTOR_DECL) {
         node->method_decl.is_task_return = false;
         node->method_decl.ext = NULL;

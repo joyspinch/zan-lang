@@ -245,6 +245,7 @@ static zan_symbol_t *checker_find_field(zan_symbol_t *type_sym, zan_istr_t name)
 
 
 static bool checker_type_derives_from(zan_type_t *sub, zan_type_t *sup);
+static bool checker_type_is_ref(zan_type_t *t);
 
 static uint32_t access_module_len(zan_istr_t ns) {
     int dots = 0;
@@ -1264,6 +1265,32 @@ static bool checker_type_derives_from_depth(zan_type_t *sub, zan_type_t *sup,
             (sup->sym->decl->kind == AST_CLASS_DECL || sup->sym->decl->kind == AST_STRUCT_DECL) &&
             sup->sym->decl->type_decl.type_params.count > 0)
             return true;
+        if (sub->sym->decl && sub->sym->decl->kind == AST_INTERFACE_DECL &&
+            sub->type_arg_count == sup->type_arg_count && sub->type_arg_count > 0) {
+            bool all_match = true;
+            for (int i = 0; i < sub->type_arg_count; i++) {
+                int var = zan_type_param_variance(sub->sym, i);
+                zan_type_t *a = sub->type_args[i];
+                zan_type_t *b = sup->type_args[i];
+                if (!a || !b) { all_match = false; break; }
+                if (var == 1) {
+                    if (checker_type_equal(a, b)) continue;
+                    if (checker_type_is_ref(a) && checker_type_is_ref(b) &&
+                        checker_type_derives_from_depth(a, b, depth + 1))
+                        continue;
+                    all_match = false; break;
+                } else if (var == -1) {
+                    if (checker_type_equal(a, b)) continue;
+                    if (checker_type_is_ref(a) && checker_type_is_ref(b) &&
+                        checker_type_derives_from_depth(b, a, depth + 1))
+                        continue;
+                    all_match = false; break;
+                } else {
+                    if (!checker_type_equal(a, b)) { all_match = false; break; }
+                }
+            }
+            if (all_match) return true;
+        }
         return checker_type_equal(sub, sup);
     }
     if (sub->kind == sup->kind && checker_type_equal(sub, sup)) return true;
@@ -1384,9 +1411,54 @@ static bool checker_type_assignable(zan_type_t *target, zan_type_t *value) {
         value->kind != TYPE_OBJECT && target->element_type)
         return checker_type_assignable(target->element_type, value); /* T -> T? */
 
-    if (target->kind == TYPE_DELEGATE)
-        return value->kind == TYPE_OBJECT ||
-               (value->kind == TYPE_DELEGATE && checker_type_equal(target, value));
+    if (target->kind == TYPE_DELEGATE) {
+        if (value->kind == TYPE_OBJECT) return true;
+        if (value->kind == TYPE_DELEGATE) {
+            if (checker_type_equal(target, value)) return true;
+            bool same_delegate = false;
+            if (target->sym && value->sym && target->sym == value->sym) {
+                same_delegate = true;
+            } else if (target->name.len == value->name.len &&
+                       target->name.len > 0 &&
+                       memcmp(target->name.str, value->name.str, target->name.len) == 0) {
+                same_delegate = true;
+            }
+            if (same_delegate && target->type_arg_count == value->type_arg_count && target->type_arg_count > 0) {
+                bool all_match = true;
+                for (int i = 0; i < target->type_arg_count; i++) {
+                    int var = 0;
+                    if (target->sym) {
+                        var = zan_type_param_variance(target->sym, i);
+                    }
+                    if (var == 0 && target->name.len == 4 && memcmp(target->name.str, "Func", 4) == 0) {
+                        var = (i == target->type_arg_count - 1) ? 1 : -1;
+                    } else if (var == 0 && target->name.len == 6 && memcmp(target->name.str, "Action", 6) == 0) {
+                        var = -1;
+                    }
+                    zan_type_t *targ = target->type_args[i];
+                    zan_type_t *varg = value->type_args[i];
+                    if (!targ || !varg) { all_match = false; break; }
+                    if (var == 1) {
+                        if (checker_type_equal(targ, varg)) continue;
+                        if (checker_type_is_ref(targ) && checker_type_is_ref(varg) &&
+                            checker_type_derives_from(varg, targ))
+                            continue;
+                        all_match = false; break;
+                    } else if (var == -1) {
+                        if (checker_type_equal(targ, varg)) continue;
+                        if (checker_type_is_ref(targ) && checker_type_is_ref(varg) &&
+                            checker_type_derives_from(targ, varg))
+                            continue;
+                        all_match = false; break;
+                    } else {
+                        if (!checker_type_equal(targ, varg)) { all_match = false; break; }
+                    }
+                }
+                if (all_match) return true;
+            }
+        }
+        return false;
+    }
 
     if (target->kind == TYPE_TASK && value->kind == TYPE_TASK)
         return value->type_arg_count >= target->type_arg_count;

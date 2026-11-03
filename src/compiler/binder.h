@@ -185,6 +185,27 @@ zan_symbol_t *zan_binder_lookup(zan_binder_t *b, zan_istr_t name);
  * 免得两边对"接口方法算不算这个类型的成员"口径分叉。 */
 bool zan_binder_class_implements_iface(zan_symbol_t *cls, zan_symbol_t *iface);
 
+/* 获取接口或委托类型符号的第 index 个类型形参的变式标记：
+ *  1: 协变 (out)
+ * -1: 逆变 (in)
+ *  0: 不变 (invariant) */
+static inline int zan_type_param_variance(const zan_symbol_t *sym, int index) {
+    if (!sym || !sym->decl || index < 0) return 0;
+    const zan_ast_node_t *d = sym->decl;
+    const zan_ast_list_t *tps = NULL;
+    if (d->kind == AST_INTERFACE_DECL) {
+        tps = &d->type_decl.type_params;
+    } else if (d->kind == AST_DELEGATE_DECL) {
+        tps = &d->method_decl.type_params;
+    }
+    if (!tps || index >= tps->count) return 0;
+    const zan_ast_node_t *tp = tps->items[index];
+    if (tp && tp->kind == AST_IDENTIFIER) {
+        return tp->ident.variance;
+    }
+    return 0;
+}
+
 /* 名为 name 的扩展方法能否作用于 recv_ty。判定口径与 irgen 的
  * find_extension_method 一致（src/compiler/irgen_expr_core.c）。 */
 bool zan_binder_has_extension_method(zan_binder_t *b, zan_type_t *recv_ty,

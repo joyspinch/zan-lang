@@ -520,7 +520,7 @@ static LLVMValueRef emit_parse_str_guard(zan_irgen_t *g, LLVMValueRef s,
         zan_irgen_intern_string(g, ""), s, "parse.ssafe");
 }
 /* A555：检查类边是否与泛型实参匹配以实现目标接口 */
-static bool ifc_edge_matches_inst(zan_ast_node_t *edge_ref, zan_ast_list_t *tps,
+static bool ifc_edge_matches_inst(zan_irgen_t *g, zan_ast_node_t *edge_ref, zan_ast_list_t *tps,
                                    zan_type_t **args, zan_type_t *sup) {
     if (!edge_ref || edge_ref->kind != AST_TYPE_REF || !sup || !sup->sym)
         return false;
@@ -548,14 +548,55 @@ static bool ifc_edge_matches_inst(zan_ast_node_t *edge_ref, zan_ast_list_t *tps,
                 memcmp(tn.str, ename.str, (size_t)tn.len) == 0)
                 break;
         }
+        int var = zan_type_param_variance(sup->sym, j);
         if (k < tps_count) {
-            if (!args || !args[k] || !types_equal(args[k], sup->type_args[j]))
-                return false;
+            zan_type_t *actual = (args != NULL) ? args[k] : NULL;
+            zan_type_t *wanted = sup->type_args[j];
+            if (!actual || !wanted) return false;
+            if (var == 1) {
+                if (!types_equal(actual, wanted)) {
+                    if (!actual->sym || !wanted->sym ||
+                        (!class_derives_from(actual->sym, wanted->sym) &&
+                         !class_implements_iface(actual->sym, wanted->sym)))
+                        return false;
+                }
+            } else if (var == -1) {
+                if (!types_equal(actual, wanted)) {
+                    if (!actual->sym || !wanted->sym ||
+                        !class_derives_from(wanted->sym, actual->sym))
+                        return false;
+                }
+            } else {
+                if (!types_equal(actual, wanted)) return false;
+            }
         } else {
             zan_type_t *sa = sup->type_args[j];
-            if (!sa || ename.len != sa->name.len ||
-                memcmp(ename.str, sa->name.str, (size_t)sa->name.len) != 0)
-                return false;
+            if (!sa) return false;
+            if (var == 1) {
+                if (ename.len == sa->name.len &&
+                    memcmp(ename.str, sa->name.str, (size_t)ename.len) == 0) {
+                    /* match */
+                } else {
+                    zan_symbol_t *asym = g && g->binder ? zan_binder_lookup(g->binder, ename) : NULL;
+                    if (!asym || !sa->sym ||
+                        (!class_derives_from(asym, sa->sym) &&
+                         !class_implements_iface(asym, sa->sym)))
+                        return false;
+                }
+            } else if (var == -1) {
+                if (ename.len == sa->name.len &&
+                    memcmp(ename.str, sa->name.str, (size_t)ename.len) == 0) {
+                    /* match */
+                } else {
+                    zan_symbol_t *asym = g && g->binder ? zan_binder_lookup(g->binder, ename) : NULL;
+                    if (!asym || !sa->sym || !class_derives_from(sa->sym, asym))
+                        return false;
+                }
+            } else {
+                if (ename.len != sa->name.len ||
+                    memcmp(ename.str, sa->name.str, (size_t)ename.len) != 0)
+                    return false;
+            }
         }
     }
     return true;
@@ -573,7 +614,7 @@ static bool class_inst_implements_iface(zan_irgen_t *g, zan_symbol_t *cls,
         zan_ast_list_t *bases = &cls->decl->type_decl.bases;
         zan_type_t **args = inst ? inst->type_args : NULL;
         for (int i = 0; i < bases->count; i++) {
-            if (ifc_edge_matches_inst(bases->items[i], tps, args, obj_ty))
+            if (ifc_edge_matches_inst(g, bases->items[i], tps, args, obj_ty))
                 return true;
             if (bases->items[i] && bases->items[i]->kind == AST_TYPE_REF && g && g->binder) {
                 zan_symbol_t *isym = zan_binder_lookup(g->binder,
