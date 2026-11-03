@@ -6967,6 +6967,14 @@ partial class Irgen {
                 L("  call void @zlist_reverse(i8* " + recv.op + ")");
                 return new ExprVal("0", MkType("void"));
             }
+            // string-method intrinsics win over same-named extensions: the
+            // C host's call pipeline lowers these before any user-visible
+            // method resolution, so s.Equals(',') packs the char argument
+            // instead of binding the 3-arg Unicode Equals extension with a
+            // raw pointer (B-ID109)
+            if (IsStr(recv.ty) && HandlesStrMethod(mname, e.kids.Count)) {
+                return EmitStrMethod(recv, mname, e);
+            }
             // extension methods: static method with a `this` receiver of recv's type
             List<Node> extMs = new List<Node>();
             List<string> extOwners = new List<string>();
@@ -8770,6 +8778,19 @@ partial class Irgen {
         return a;
     }
 
+    // the string-method intrinsics EmitStrMethod lowers: a string receiver
+    // with one of these (name, argc) shapes takes the builtin path before
+    // extension resolution (mirrors the C host's call-pipeline order)
+    bool HandlesStrMethod(string name, int argc) {
+        if (name == "Substring") { return argc >= 1; }
+        if (name == "Equals" || name == "Contains" || name == "LastIndexOf"
+                || name == "StartsWith" || name == "EndsWith") { return argc == 1; }
+        if (name == "IndexOf" || name == "Split") { return argc == 1 || argc == 2; }
+        if (name == "Replace") { return argc == 2; }
+        if (name == "Trim" || name == "ToUpper" || name == "ToLower" || name == "ToString") { return argc == 0; }
+        return false;
+    }
+
     ExprVal EmitStrMethod(ExprVal recv, string name, Node e) {
         if (name == "Substring") {
             ExprVal start = GenExpr(e.kids[0]);
@@ -8787,25 +8808,23 @@ partial class Irgen {
         }
         if (name == "Equals" && e.kids.Count == 1) {
             // the C host compares the *exact* lengths and bytes
-            // (irgen_call.c -> __zan_str_ocmp), not the C-visible prefix
+            // (irgen_call.c -> __zan_str_ocmp), not the C-visible prefix;
+            // a null receiver converges to "" (D20, emit_str_nonnull)
             ExprVal o = StrArg(e.kids[0]);
-            if (recv.op == "null" || o.op == "null") {
-                // a null operand is never equal to a non-null one
-                string c = NT();
-                L("  " + c + " = icmp eq i8* " + recv.op + ", " + o.op);
-                string z = NT();
-                L("  " + z + " = zext i1 " + c + " to i64");
-                return new ExprVal(z, MkType("bool"));
-            }
+            string rn = NT();
+            L("  " + rn + " = icmp eq i8* " + recv.op + ", null");
+            ExprVal ez = GenStr("");
+            string rs = NT();
+            L("  " + rs + " = select i1 " + rn + ", i8* " + ez.op + ", i8* " + recv.op);
             if (!ExternSeen("memcmp")) { externDecls.Add("memcmp"); H("declare i32 @memcmp(i8*, i8*, i64)"); }
-            string la = StrLen(recv.op);
+            string la = StrLen(rs);
             string lb = StrLen(o.op);
             string lt = NT();
             L("  " + lt + " = icmp slt i64 " + la + ", " + lb);
             string m = NT();
             L("  " + m + " = select i1 " + lt + ", i64 " + la + ", i64 " + lb);
             string mc = NT();
-            L("  " + mc + " = call i32 @memcmp(i8* " + recv.op + ", i8* " + o.op + ", i64 " + m + ")");
+            L("  " + mc + " = call i32 @memcmp(i8* " + rs + ", i8* " + o.op + ", i64 " + m + ")");
             string mz = NT();
             L("  " + mz + " = icmp eq i32 " + mc + ", 0");
             string lz = NT();
@@ -9564,8 +9583,8 @@ partial class Irgen {
         if (gv == "") { return "null"; }
         List<int> bytes = DecodeStr(disp);
         int nlen = bytes.Count + 1;
-        string tyDecl = "{ i8*, i8*, i8*, i64, i8*, i64, i8*, i8*, i8*, i64, i64, i64, i64, [" + nlen + " x i8] }";
-        return "getelementptr inbounds (" + tyDecl + ", " + tyDecl + "* " + gv + ", i64 0, i32 13, i64 0)";
+        string tyDecl = "{ i8*, i8*, i8*, i8*, i64, i8*, i64, i8*, i8*, i8*, i64, i64, i64, i64, [" + nlen + " x i8] }";
+        return "getelementptr inbounds (" + tyDecl + ", " + tyDecl + "* " + gv + ", i64 0, i32 14, i64 0)";
     }
 
     ExprVal ReflMetaFor(Node ty, string disp) {
@@ -9574,9 +9593,9 @@ partial class Irgen {
             if (reflMetaNames[i] == disp) {
                 string gv = reflMetaGvs[i];
                 List<int> eb = DecodeStr(disp);
-                string tyDeclExisting = "{ i8*, i8*, i8*, i64, i8*, i64, i8*, i8*, i8*, i64, i64, i64, i64, [" + (eb.Count + 1) + " x i8] }";
+                string tyDeclExisting = "{ i8*, i8*, i8*, i8*, i64, i8*, i64, i8*, i8*, i8*, i64, i64, i64, i64, [" + (eb.Count + 1) + " x i8] }";
                 string te = NT();
-                L("  " + te + " = getelementptr inbounds " + tyDeclExisting + ", " + tyDeclExisting + "* " + gv + ", i64 0, i32 13, i64 0");
+                L("  " + te + " = getelementptr inbounds " + tyDeclExisting + ", " + tyDeclExisting + "* " + gv + ", i64 0, i32 14, i64 0");
                 return new ExprVal(te, MkType("TypeInfo"));
             }
             i = i + 1;
@@ -9884,9 +9903,12 @@ partial class Irgen {
         bodytxt = bodytxt + "\\00";
         int nlen = bytes.Count + 1;
 
-        string tyDecl = "{ i8*, i8*, i8*, i64, i8*, i64, i8*, i8*, i8*, i64, i64, i64, i64, [" + nlen + " x i8] }";
+        string tyDecl = "{ i8*, i8*, i8*, i8*, i64, i8*, i64, i8*, i8*, i8*, i64, i64, i64, i64, [" + nlen + " x i8] }";
         StringBuilder tb = new StringBuilder();
         tb.Append(gvName + " = private unnamed_addr constant " + tyDecl + " {\n");
+        // B-ID107: full_name (-112 slot), ns-qualified like the C host's
+        // render_type_full; type_attrs/table_name stay null (readers fall back)
+        tb.Append("    i8* " + GenConstStr(ReflFullNameOf(disp)) + ",\n");
         tb.Append("    i8* null,\n");
         tb.Append("    i8* null,\n");
         tb.Append("    i8* " + methodsGlobal + ",\n");
@@ -9905,8 +9927,20 @@ partial class Irgen {
         H(tb.ToString());
 
         string t = NT();
-        L("  " + t + " = getelementptr inbounds " + tyDecl + ", " + tyDecl + "* " + gvName + ", i64 0, i32 13, i64 0");
+        L("  " + t + " = getelementptr inbounds " + tyDecl + ", " + tyDecl + "* " + gvName + ", i64 0, i32 14, i64 0");
         return new ExprVal(t, MkType("TypeInfo"));
+    }
+
+    // B-ID107: FullName = ns-qualified name ("System.Json.JsonValue"),
+    // mirroring the C host's render_type_full; primitives/arrays keep the
+    // display spelling, already-qualified names pass through unchanged
+    string ReflFullNameOf(string disp) {
+        if (disp.IndexOf(".") >= 0) { return disp; }
+        Node cls = binder.FindType(disp);
+        if (cls == null) { return disp; }
+        string ns = cls.nsName != null ? cls.nsName : "";
+        if (ns.Length == 0) { return disp; }
+        return ns + "." + disp;
     }
 
     ExprVal EmitTypeInfoProp(ExprVal obj, string name, Node e) {
@@ -10075,6 +10109,19 @@ partial class Irgen {
             string sel = NT();
             L("  " + sel + " = select i1 " + isNull + ", i8* " + obj.op + ", i8* " + ev);
             return new ExprVal(sel, MkType("TypeInfo"));
+        }
+        if (name == "FullName") {
+            string fnp = NT();
+            L("  " + fnp + " = getelementptr inbounds i8, i8* " + obj.op + ", i64 -112");
+            string fnp_ptr = NT();
+            L("  " + fnp_ptr + " = bitcast i8* " + fnp + " to i8**");
+            string fnv = NT();
+            L("  " + fnv + " = load i8*, i8** " + fnp_ptr);
+            string isNull = NT();
+            L("  " + isNull + " = icmp eq i8* " + fnv + ", null");
+            string sel = NT();
+            L("  " + sel + " = select i1 " + isNull + ", i8* " + obj.op + ", i8* " + fnv);
+            return new ExprVal(sel, MkType("string"));
         }
         if (name == "TableName") {
             string tnp = NT();

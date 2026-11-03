@@ -533,6 +533,43 @@ partial class Irgen {
         H("  %fin64 = zext i32 %fin to i64");
         H("  ret i64 %fin64");
         H("}");
+        // the update form (zan_hw_crc32_update): a running crc feeds back,
+        // len<0 / null buffer bails with -1 like the C runtime
+        H("define internal i64 @__zan_nm_crc32_update(i64 %crc, i8* %data, i64 %len) {");
+        H("entry:");
+        H("  %neg = icmp slt i64 %len, 0");
+        H("  %np = icmp eq i8* %data, null");
+        H("  %bad = or i1 %neg, %np");
+        H("  br i1 %bad, label %bail, label %pre");
+        H("bail:");
+        H("  ret i64 -1");
+        H("pre:");
+        H("  %c0 = trunc i64 %crc to i32");
+        H("  %c1 = xor i32 %c0, -1");
+        H("  br label %loop");
+        H("loop:");
+        H("  %i = phi i64 [ 0, %pre ], [ %ni, %body ]");
+        H("  %c = phi i32 [ %c1, %pre ], [ %nc, %body ]");
+        H("  %inr = icmp slt i64 %i, %len");
+        H("  br i1 %inr, label %body, label %done");
+        H("body:");
+        H("  %bp = getelementptr i8, i8* %data, i64 %i");
+        H("  %b = load i8, i8* %bp");
+        H("  %b32 = zext i8 %b to i32");
+        H("  %x = xor i32 %c, %b32");
+        H("  %ti = and i32 %x, 255");
+        H("  %ti64 = zext i32 %ti to i64");
+        H("  %ep = getelementptr [256 x i32], [256 x i32]* @__zan_crc32_table, i64 0, i64 %ti64");
+        H("  %te = load i32, i32* %ep");
+        H("  %sh = lshr i32 %c, 8");
+        H("  %nc = xor i32 %te, %sh");
+        H("  %ni = add i64 %i, 1");
+        H("  br label %loop");
+        H("done:");
+        H("  %fin2 = xor i32 %c, -1");
+        H("  %fin2_64 = zext i32 %fin2 to i64");
+        H("  ret i64 %fin2_64");
+        H("}");
     }
 
     // The NativeMemory digest intrinsic (the C host's emit_nm_digest): the
@@ -731,6 +768,16 @@ partial class Irgen {
             string dp = NmAddr(p, "0");
             string r = NT();
             L("  " + r + " = call i64 @__zan_nm_crc32c_update(i64 " + crc.op + ", i8* " + dp + ", i64 " + len.op + ")");
+            return new ExprVal(r, MkType("int"));
+        }
+        if (m == "Crc32Update" && argc == 3) {
+            EmitCrc32Helper();
+            ExprVal crc = GenExpr(e.kids[0]);
+            ExprVal p = GenExpr(e.kids[1]);
+            ExprVal len = GenExpr(e.kids[2]);
+            string dp = NmAddr(p, "0");
+            string r = NT();
+            L("  " + r + " = call i64 @__zan_nm_crc32_update(i64 " + crc.op + ", i8* " + dp + ", i64 " + len.op + ")");
             return new ExprVal(r, MkType("int"));
         }
         if (m == "Find" && argc == 4) {
@@ -4992,6 +5039,7 @@ partial class Irgen {
                         if (nm == "Alloc" || nm == "Free" || nm == "Copy" || nm == "Fill"
                             || nm == "Compare" || nm == "GetString" || nm == "PutString"
                             || nm == "Crc32" || nm == "Crc32C" || nm == "Crc32CUpdate"
+                            || nm == "Crc32Update"
                             || nm == "Find" || nm == "Base64Encode" || nm == "Base64Decode"
                             || nm == "Sha256" || nm == "Sha1" || nm == "Sha512" || nm == "Sm3") {
                             lowered = true;

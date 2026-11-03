@@ -9,12 +9,17 @@ namespace Zan;
 // printable, concatenable and comparable with no conversion):
 //
 //     offset from the TypeInfo value
+//     -112  full_name*    -104 type_attrs*     -96  table_name*
 //     -88   methods*      -80  method_count
 //     -72   ctors*        -64  ctor_count
 //     -56   elem rec      -48  targs* (null-terminated rec array)
 //     -40   fields*       -32  field_count
 //     -24   kind          -16  string rc sentinel    -8  string tag|length
 //       0   NUL-terminated display name
+//
+// full_name is the ns-qualified spelling (B-ID107, mirrors the oracle's
+// ZAN_REFL_FULLNAME_OFF); the record allocation starts 24 bytes before the
+// front slots so the -112 pointer lands inside it.
 //
 // Field record 32B { name*, type*, kind, value }; method/ctor record 56B
 // { name*, ret*, retkind, param_count, param_types*, thunk*, flags }.
@@ -214,13 +219,23 @@ partial class Ngen {
         return ReflRecIdx(c.name, c.name, kind);
     }
 
+    // B-ID107: FullName = ns-qualified name, mirroring the C host's
+    // render_type_full; already-qualified spellings pass through. Enums keep
+    // the display spelling until the enum table carries namespaces.
+    string ReflFullNameOfNg(string disp, string clsName) {
+        if (clsName == null || disp.IndexOf(".") >= 0) { return disp; }
+        Cls c = FindClass(clsName);
+        if (c == null || c.nsName == null || c.nsName.Length == 0) { return disp; }
+        return c.nsName + "." + disp;
+    }
+
     // ---- type model (StaticTyOf / CallRetTy hooks) ------------------------
 
     // the reflection member a TypeInfo receiver names, or null
     string ReflMemberTy(Node e) {
         if (e == null || e.a == null) { return null; }
         string n = e.sval;
-        if (n == "Name" || n == "Kind" || n == "GetFieldName" || n == "GetFieldType"
+        if (n == "Name" || n == "Kind" || n == "FullName" || n == "GetFieldName" || n == "GetFieldType"
                 || n == "GetMethodName" || n == "GetMethodReturnType"
                 || n == "GetMethodParamType" || n == "GetCtorParamType") {
             if (!IsTypeInfoExpr(e.a)) { return null; }
@@ -1442,6 +1457,7 @@ partial class Ngen {
         }
         int nameIdx = InternStr(disp);
         int nameLen = disp.Length;
+        int fullIdx = InternStr(ReflFullNameOfNg(disp, clsName));
         // ---- plan: fields
         List<string> fNames = new List<string>();
         List<string> fTys = new List<string>();
@@ -1553,10 +1569,14 @@ partial class Ngen {
         LdrU(0, 19, 0);
         int bdone = NL();
         CbnzReg(0, bdone);
-        LoadImm(0, total);
+        LoadImm(0, total + 24);
         LoadImm(1, 0);
         BLInternal("_zan_rt_alloc");                 // zeroed, rc=1
         MovRR(20, 0);
+        AddImm(20, 20, 24);                          // base = alloc+24: full_name (-112) lives at alloc+0
+        // B-ID107: full_name = ns-qualified name pointer at value-112
+        LoadSymRef("l_.str." + fullIdx, 1);
+        StrU(1, 0, 0);
         // string header: rc sentinel + tag|length
         LoadImm(1, -1);
         StrU(1, 20, 72);
