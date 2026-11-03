@@ -47,6 +47,62 @@ public class Checker {
     Node MkType(string name) { Node t = new Node(AK.TypeRef()); t.sval = name; return t; }
     bool HasMod(Node m, int flag) { return (m.mods / flag) - ((m.mods / flag) / 2) * 2 == 1; }
 
+    // ---- B-ID83: `internal` visibility, mirroring the C host (checker.c
+    // access_member_allowed / report_inaccessible). An internal member is
+    // reachable only from its own module, and a module is the first two
+    // namespace segments: `Acc.Inner` vs `Acc.Other` are different modules,
+    // `Zan.Web.Core` vs `Zan.Web.Security` are the same one. The diagnostic
+    // quotes the declaring namespace in full -- same wording as the host's
+    // E2004, so a reject case can pin both compilers to one sentence.
+    string ModuleOf(string ns) {
+        int dots = 0;
+        int i = 0;
+        while (i < ns.Length) {
+            int ch = (int)ns[i];
+            if (ch == 46) { dots = dots + 1; if (dots == 2) { return ns.Substring(0, i); } }
+            i = i + 1;
+        }
+        return ns;
+    }
+    // The class along `cls`'s base chain that declares `name` (field, method
+    // or property accessor); null when nobody does.
+    Node OwnerUp(Node cls, string name) {
+        Node c = cls;
+        int cg = 0;
+        while (c != null) {
+            if (binder.FindField(c, name) != null || binder.FindMethod(c, name) != null || binder.FindMethod(c, "get_" + name) != null) { return c; }
+            c = binder.FindType(c.sval2);
+            cg = cg + 1;
+            if (cg > 512) { c = null; }
+        }
+        return null;
+    }
+    void CheckInternalAccess(Node cls, string name, Node at) {
+        if (cls == null || curClass == null) { return; }
+        Node owner = OwnerUp(cls, name);
+        if (owner == null || owner == curClass) { return; }
+        Node m = binder.FindField(owner, name);
+        if (m == null) { m = binder.FindMethod(owner, name); }
+        if (m == null) { m = binder.FindMethod(owner, "get_" + name); }
+        if (m == null || !HasMod(m, MOD.Internal())) { return; }
+        string ons = owner.nsName != null ? owner.nsName : "";
+        string cns = curClass.nsName != null ? curClass.nsName : "";
+        if (ModuleOf(ons) == ModuleOf(cns)) { return; }
+        string from = cns != "" ? cns : curClass.sval;
+        diags.Error("'" + owner.sval + "." + name + "' is internal to '" + ons + "' and cannot be accessed from '" + from + "'", at.line, at.col);
+    }
+    // Receiver written as a bare type name (`Core.Tag()` / `Core.count`): the
+    // checker cannot infer it as a value, so resolve it as a type for the
+    // visibility check only -- member existence on static receivers stays
+    // with irgen (unresolved call), exactly as before.
+    Node StaticRecv(Node a) {
+        if (a == null || a.kind != AK.Ident() || curClass == null) { return null; }
+        if (ScopeHas(a.sval) || FieldUp(curClass, a.sval) != null || MethodUp(curClass, "get_" + a.sval) != null) { return null; }
+        Node sc = binder.FindType(a.sval);
+        if (sc != null && (sc.kind == AK.ClassDecl() || sc.kind == AK.StructDecl())) { return sc; }
+        return null;
+    }
+
     // ---- Task / Task<T>: the C host's builtin task handle (TYPE_TASK) ----
     // A bare `Task` is a handle that carries NO result (the frame is released
     // by the completion path), `Task<T>` a handle that carries one (the
@@ -1827,6 +1883,8 @@ public class Checker {
         CheckObj(n.a);
         Node ot = InferType(n.a);
         Node cls = ClassOf(ot);
+        if (cls != null) { CheckInternalAccess(cls, n.sval, n); }
+        else { Node sc = StaticRecv(n.a); if (sc != null) { CheckInternalAccess(sc, n.sval, n); } }
         if (cls != null && !HasMember(cls, n.sval) && !HasExt(cls.sval, n.sval)) {
             if (!IsReflInstName(n.sval)) {
                 diags.Error("type '" + cls.sval + "' has no member '" + n.sval + "'", n.line, n.col);
@@ -1858,6 +1916,8 @@ public class Checker {
             CheckObj(callee.a);
             Node ot = InferType(callee.a);
             Node cls = ClassOf(ot);
+            if (cls != null) { CheckInternalAccess(cls, callee.sval, n); }
+            else { Node sc = StaticRecv(callee.a); if (sc != null) { CheckInternalAccess(sc, callee.sval, n); } }
             if (cls != null) {
                 Node mm = null;
                 if (!HasMember(cls, callee.sval) && !HasExt(cls.sval, callee.sval)) {

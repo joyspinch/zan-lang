@@ -212,10 +212,16 @@ foreach(_r IN LISTS _rejects)
   if(NOT EXISTS ${_rsrc})
     message(FATAL_ERROR "reject case source not found: ${_rsrc}")
   endif()
+  # A sibling `<name>_helper.zan` joins the compile (both compilers): a
+  # visibility case needs two namespaces, and a file holds exactly one.
+  set(_rextra)
+  if(EXISTS "${REJECT_DIR}/${_rname}_helper.zan")
+    set(_rextra "${REJECT_DIR}/${_rname}_helper.zan")
+  endif()
   set(_rll "${OUTDIR}/reject_${_rname}.ll")
   file(REMOVE ${_rll})
   execute_process(
-    COMMAND ${GEN1} ${_rll} ${_rsrc}
+    COMMAND ${GEN1} ${_rll} ${_rsrc} ${_rextra}
     WORKING_DIRECTORY ${WORKDIR}
     RESULT_VARIABLE rej_rc
     OUTPUT_VARIABLE rej_out
@@ -250,7 +256,7 @@ foreach(_r IN LISTS _rejects)
     set(_rhexe "${OUTDIR}/reject_${_rname}_host.exe")
     file(REMOVE ${_rhexe})
     execute_process(
-      COMMAND ${ZANC} ${_rsrc} --auto-stdlib -o ${_rhexe}
+      COMMAND ${ZANC} ${_rsrc} ${_rextra} --auto-stdlib -o ${_rhexe}
       WORKING_DIRECTORY ${WORKDIR}
       RESULT_VARIABLE host_rc
       OUTPUT_VARIABLE host_out
