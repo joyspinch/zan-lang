@@ -1,0 +1,195 @@
+using System;
+using System.Security.Cryptography;
+using System.Data.SqlServer;
+using System.Data.Firebird;
+
+class Program {
+    static int failures = 0;
+
+    static void Check(bool ok, string name) {
+        if (ok) {
+            Console.WriteLine("ok: " + name);
+        } else {
+            Console.WriteLine("FAIL: " + name);
+            failures = failures + 1;
+        }
+    }
+
+    static void TestX509ParseDisplayResilience() {
+        // 1. null 与空数据安全拦截
+        Check(X509Certificate.ParseDisplay(null, 0) == null, "ParseDisplay null data returns null");
+        Check(X509Certificate.ParseDisplay(null, -1) == null, "ParseDisplay negative len returns null");
+        byte[] empty = new byte[0];
+        Check(X509Certificate.ParseDisplay(empty, 0) == null, "ParseDisplay 0 length returns null");
+
+        // 2. 截断畸形 DER：头部宣称大长度但实际数据仅 3 字节
+        byte[] badTruncated = new byte[3];
+        badTruncated[0] = 0x30; badTruncated[1] = 0x82; badTruncated[2] = 0x01;
+        Check(X509Certificate.ParseDisplay(badTruncated, 3) == null, "ParseDisplay truncated DER returns null without crash");
+
+        // 3. 畸形长格式长度字段：0xFF (count=127) 尝试触发越界循环与整数溢出
+        byte[] badLengthCount = new byte[8];
+        badLengthCount[0] = 0x30; badLengthCount[1] = 0x06;
+        badLengthCount[2] = 0x30; badLengthCount[3] = 0xFF;
+        Check(X509Certificate.ParseDisplay(badLengthCount, 8) == null, "ParseDisplay 0xFF count length returns null safely");
+
+        // 4. 0x80 不定长编码（DER 严禁）
+        byte[] badIndefinite = new byte[8];
+        badIndefinite[0] = 0x30; badIndefinite[1] = 0x06;
+        badIndefinite[2] = 0x30; badIndefinite[3] = 0x80;
+        Check(X509Certificate.ParseDisplay(badIndefinite, 8) == null, "ParseDisplay 0x80 indefinite length rejected");
+
+        // 5. 真实有效自签证书（LEAF）能正确解析出 Subject 与 Issuer
+        string leafBase64 = "MIIDYzCCAkugAwIBAgIUZe24P8xUgPcI7YTOwFct8qBlc6MwDQYJKoZIhvcNAQELBQAwGDEWMBQGA1UEAwwNVGVzdC1UTFMtUm9vdDAeFw0yNjA5MjgwMDM0MTNaFw0zNjA5MjUwMDM0MTNaMBkxFzAVBgNVBAMMDnNlY3VyZS5leGFtcGxlMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAzq/tpefCjCZqrzaaBQB5m9TbZkoGjINd5Gf2MGbgL5/LyTUKpeCwwZCltT6cnIkfELjk/yuJ6EzOtcsow/7dW20BEuGe/R5+zI3dlWYAcuEYAtwZHikSffjE3JU/+FWfae5xrYctP6TinANKYzF1aJYkqr33wB3FU1+Q7AZ3ZbClOHkYMGhh5UKrR0HSGqKCL681pgS4jtqcfV2jZVPHFTU2GrRV/agvIAU5Sd2HVWYOsj5fVoXYPux+e+BRwd/TBphzt3kwGDLPhphjnsm0A7aEpIGWjUG3iTx5aisl+zWSBcRgI7HkVt4MopYRVSN1CcZ3MJhPHCSiRVspIykIzQIDAQABo4GjMIGgMAwGA1UdEwEB/wQCMAAwDgYDVR0PAQH/BAQDAgeAMBMGA1UdJQQMMAoGCCsGAQUFBwMBMCsGA1UdEQQkMCKCDnNlY3VyZS5leGFtcGxlghAqLnNlY3VyZS5leGFtcGxlMB0GA1UdDgQWBBTL9cG/toN23GjOeTEruOdhUtZ17zAfBgNVHSMEGDAWgBQcw+3YPEG3IMeEKu20a5SCgIiuYTANBgkqhkiG9w0BAQsFAAOCAQEAZb+iFWljfyep7JPC/mirsZ3Zfv5ucvrfaHX2npUj/78cRJs4ehSA3GY+880iQnZhIZS0KMUvcj+vllSJuLbDVN3Wxcl0zYpt0kU0agbvHwAelpaQIaEaKiZDRcZ5E1MgdaZovHbR3I5iNbPVXA3ZUQStTuIBK4f6bdVON2t3/f12h6GQG2d8FkiJz/6ZzMWIUMEzUTmZ+2TUt9Fe3bDNC9PLCy6FV4JPOfPsMqFrItb26ywf/XSXXavgAVv9EVdq2h5gwBU6juolNGLtNokbkPPaXaYtEm4UkfzBZpH1WnBa6CGRoteiNsA9tiTqdFKY5sNmQrFIbkRK2XPhzq+IvQ==";
+        List<int> leafLen = new List<int>(); leafLen.Add(0);
+        byte[] leafDer = Base64.Decode(leafBase64, leafLen);
+        Check(leafDer != null && leafLen[0] > 0, "Base64 decode leaf cert");
+
+        X509Certificate cert = X509Certificate.ParseDisplay(leafDer, leafLen[0]);
+        Check(cert != null, "ParseDisplay valid leaf cert succeeds");
+        if (cert != null) {
+            Check(cert.SubjectCN() == "secure.example", "SubjectCN == secure.example");
+            Check(cert.IssuerCN() == "Test-TLS-Root", "IssuerCN == Test-TLS-Root");
+            Check(cert.DnsNames().Count == 2, "DnsNames.Count == 2");
+            Check(cert.SpkiLength() > 0, "SpkiLength > 0");
+        }
+
+        // 6. 有效证书中途截断测试
+        Check(X509Certificate.ParseDisplay(leafDer, 40) == null, "ParseDisplay truncated leaf cert at 40 bytes returns null");
+        Check(X509Certificate.ParseDisplay(leafDer, 150) == null, "ParseDisplay truncated leaf cert at 150 bytes returns null");
+    }
+
+    static void TestProtocolReadersResilience() {
+        string sample = "ABCDEFGH12345678";
+
+        // ---- TdsReader 测试 ----
+        TdsReader trNull = new TdsReader(null, 5);
+        Check(trNull.Left() == 0, "TdsReader null buf Left() == 0");
+        Check(trNull.U8() == 0, "TdsReader null buf U8() == 0");
+        Check(trNull.Narrow(3) == "", "TdsReader null buf Narrow() == empty");
+
+        TdsReader tr = new TdsReader(sample, sample.Length);
+        Check(tr.Left() == 16, "TdsReader initial Left() == 16");
+
+        // 负偏移防御：Skip(-5) 与 Seek(-1) 绝不回退到负下标
+        tr.Skip(-5);
+        Check(tr.Pos() == 0, "TdsReader Skip(-5) ignored, pos stays 0");
+        tr.Seek(-10);
+        Check(tr.Pos() == 0, "TdsReader Seek(-10) clamped to 0");
+        Check(tr.Left() == 16, "TdsReader Left() intact after negative seek");
+
+        // 正常读取与超限 Skip / Seek
+        Check(tr.U8() == 65, "TdsReader U8() == 'A'");
+        Check(tr.Pos() == 1, "TdsReader Pos() == 1");
+        tr.Skip(2147483647);
+        Check(tr.Pos() == 16, "TdsReader Skip(MAX_INT) clamped to len");
+        Check(tr.Eof(), "TdsReader Eof() == true");
+        Check(tr.U8() == 0, "TdsReader U8() at EOF returns 0");
+
+        tr.Seek(4);
+        Check(tr.Pos() == 4, "TdsReader Seek(4) pos == 4");
+        Check(tr.Narrow(4) == "EFGH", "TdsReader Narrow(4) == EFGH");
+        Check(tr.Pos() == 8, "TdsReader Pos() advanced to 8");
+
+        tr.Seek(100);
+        Check(tr.Pos() == 16, "TdsReader Seek(100) clamped to len");
+
+        // ---- FbReader 测试 ----
+        FbReader frNull = new FbReader(null, 5);
+        Check(frNull.Left() == 0, "FbReader null buf Left() == 0");
+        Check(frNull.U8() == 0, "FbReader null buf U8() == 0");
+        Check(frNull.Text(3) == "", "FbReader null buf Text() == empty");
+
+        FbReader fr = new FbReader(sample, sample.Length);
+        Check(fr.Left() == 16, "FbReader initial Left() == 16");
+
+        fr.Skip(-10);
+        Check(fr.Pos() == 0, "FbReader Skip(-10) ignored, pos stays 0");
+        Check(fr.U8() == 65, "FbReader U8() == 'A'");
+        fr.Skip(2147483647);
+        Check(fr.Pos() == 16, "FbReader Skip(MAX_INT) clamped to len");
+        Check(fr.Eof(), "FbReader Eof() == true");
+        Check(fr.U8() == 0, "FbReader U8() at EOF returns 0");
+
+        FbReader fr2 = new FbReader(sample, sample.Length);
+        fr2.Skip(8);
+        Check(fr2.Text(4) == "1234", "FbReader Text(4) == 1234");
+        Check(fr2.Pos() == 12, "FbReader Pos() advanced to 12");
+    }
+
+    static void TestCryptoGuardsResilience() {
+        string key16 = "0123456789abcdef";
+        string iv12 = "123456789012";
+        string tag16 = "abcdefghijklmnop";
+
+        // ---- AesGcm 参数边界守卫 ----
+        List<int> ok = new List<int>(); ok.Add(-1);
+        // ok 为 null 时绝不崩溃
+        byte[] ptNullOk = AesGcm.Decrypt(key16, 16, iv12, "", 0, "test", 4, tag16, null);
+        Check(ptNullOk == null, "AesGcm.Decrypt null ok returns null without crash");
+
+        // ok 为空列表时绝不崩溃
+        List<int> okEmpty = new List<int>();
+        byte[] ptEmptyOk = AesGcm.Decrypt(key16, 16, iv12, "", 0, "test", 4, tag16, okEmpty);
+        Check(ptEmptyOk == null, "AesGcm.Decrypt empty ok list returns null without crash");
+
+        // 短 IV 与短 tag 拦截
+        byte[] ptShortIv = AesGcm.Decrypt(key16, 16, "short", "", 0, "test", 4, tag16, ok);
+        Check(ptShortIv == null && ok[0] == 0, "AesGcm.Decrypt short IV rejected safely");
+
+        byte[] ptShortTag = AesGcm.Decrypt(key16, 16, iv12, "", 0, "test", 4, "shorttag", ok);
+        Check(ptShortTag == null && ok[0] == 0, "AesGcm.Decrypt short tag rejected safely");
+
+        // AesGcm.Encrypt 短 IV 与短 tagOut 拦截
+        string shortTagOut = "short";
+        byte[] ctShortTagOut = AesGcm.Encrypt(key16, 16, iv12, "", 0, "test", 4, shortTagOut);
+        Check(ctShortTagOut == null, "AesGcm.Encrypt short tagOut rejected safely");
+
+        byte[] ctShortIv = AesGcm.Encrypt(key16, 16, "short", "", 0, "test", 4, tag16);
+        Check(ctShortIv == null, "AesGcm.Encrypt short IV rejected safely");
+
+        // ---- Aes.EncryptCbc / DecryptCbc 参数边界守卫 ----
+        string iv16 = "1234567890123456";
+        byte[] cbcNullOut = Aes.EncryptCbc(key16, 16, iv16, "data", 4, null);
+        Check(cbcNullOut == null, "Aes.EncryptCbc null outLen returns null safely");
+
+        List<int> outLenEmpty = new List<int>();
+        byte[] cbcEmptyOut = Aes.EncryptCbc(key16, 16, iv16, "data", 4, outLenEmpty);
+        Check(cbcEmptyOut == null, "Aes.EncryptCbc empty outLen list returns null safely");
+
+        List<int> outLen = new List<int>(); outLen.Add(0);
+        byte[] cbcShortIv = Aes.EncryptCbc(key16, 16, "short", "data", 4, outLen);
+        Check(cbcShortIv == null && outLen[0] == -1, "Aes.EncryptCbc short IV returns null safely");
+
+        byte[] decNullOut = Aes.DecryptCbc(key16, 16, iv16, "1234567890123456", 16, null);
+        Check(decNullOut == null, "Aes.DecryptCbc null outLen returns null safely");
+
+        byte[] decShortIv = Aes.DecryptCbc(key16, 16, "short", "1234567890123456", 16, outLen);
+        Check(decShortIv == null && outLen[0] == -1, "Aes.DecryptCbc short IV returns null safely");
+
+        // ---- Jwt 参数边界守卫 ----
+        Check(Jwt.CreateHs256(null, "secret", 6) == "", "Jwt.CreateHs256 null payload returns empty string");
+        Check(Jwt.CreateHs256("{}", null, 0) == "", "Jwt.CreateHs256 null secret returns empty string");
+        JwtToken tNullToken = Jwt.ParseHs256(null, "secret", 6, 1000, "", "");
+        Check(tNullToken != null && !tNullToken.valid, "Jwt.ParseHs256 null token rejected safely");
+        JwtToken tNullSecret = Jwt.ParseHs256("a.b.c", null, 0, 1000, "", "");
+        Check(tNullSecret != null && !tNullSecret.valid, "Jwt.ParseHs256 null secret rejected safely");
+        JwtToken tNullIssuer = Jwt.ParseHs256("a.b.c", "secret", 6, 1000, null, null);
+        Check(tNullIssuer != null && !tNullIssuer.valid, "Jwt.ParseHs256 null issuer/audience rejected safely");
+        Check(Jwt.Base64UrlDecode(null, outLen) != null && outLen[0] == -1, "Jwt.Base64UrlDecode null text safely returns -1");
+        Check(Jwt.Base64UrlDecode("abc", null) != null, "Jwt.Base64UrlDecode null outLen safely returns without crash");
+    }
+
+    static void Main() {
+        TestX509ParseDisplayResilience();
+        TestProtocolReadersResilience();
+        TestCryptoGuardsResilience();
+
+        if (failures == 0) {
+            Console.WriteLine("ALL_SECURITY_AUDIT_HARDENING_TESTS_OK");
+        } else {
+            Console.WriteLine("TOTAL_FAILURES: " + Convert.ToString(failures));
+            Environment.Exit(1);
+        }
+    }
+}

@@ -458,69 +458,46 @@ public class X509Certificate {
 
     /* ---- ASN.1 DER 解码引擎 ---- */
 
-    private static int ReadLen(byte[] d, List<int> cur) {
-        int b = d[cur[0]] & 255;
-        cur[0] = cur[0] + 1;
-        if (b < 128) { return b; }
-        int count = b - 128;
-        int val = 0;
-        for (int i = 0; i < count; i = i + 1) {
-            val = (val << 8) | (d[cur[0]] & 255);
-            cur[0] = cur[0] + 1;
-        }
-        return val;
-    }
-
-    private static int Enter(byte[] d, List<int> cur, int tag) {
-        if ((d[cur[0]] & 255) != tag) { return -1; }
-        cur[0] = cur[0] + 1;
-        int len = ReadLen(d, cur);
-        return cur[0] + len;
-    }
-
-    private static void Skip(byte[] d, List<int> cur) {
-        cur[0] = cur[0] + 1;
-        int len = ReadLen(d, cur);
-        cur[0] = cur[0] + len;
-    }
-
     private static string ReadString(byte[] d, int start, int len) {
         if (d == null || len <= 0 || start < 0 || start + len > d.Length) { return ""; }
         return d.ToStr(start, len);
     }
 
-    private static string ParseName(byte[] d, List<int> cur, List<string> outCN) {
+    private static string SafeName(byte[] d, int start, int len, List<string> outCN) {
+        if (d == null || start < 0 || len <= 0 || start + len > d.Length) { return ""; }
+        List<int> p = new List<int>(); p.Add(start);
+        int end = Tlv(d, start + len, p, 48);
+        if (end != start + len) { return ""; }
         StringBuilder oneline = new StringBuilder();
-        int subEnd = Enter(d, cur, 48); // SEQUENCE
-        if (subEnd < 0) { return ""; }
-        while (cur[0] < subEnd) {
-            int setEnd = Enter(d, cur, 49); // SET
-            if (setEnd < 0) { break; }
-            while (cur[0] < setEnd) {
-                int seqEnd = Enter(d, cur, 48); // SEQUENCE
-                if (seqEnd < 0) { break; }
-                int oidTag = d[cur[0]] & 255; cur[0] = cur[0] + 1;
-                int oidLen = ReadLen(d, cur);
-                int oidStart = cur[0];
-                cur[0] = cur[0] + oidLen;
-                int strTag = d[cur[0]] & 255; cur[0] = cur[0] + 1;
-                int strLen = ReadLen(d, cur);
-                string val = ReadString(d, cur[0], strLen);
-                cur[0] = cur[0] + strLen;
-
-                if (oidLen == 3 && (d[oidStart] & 255) == 85 && (d[oidStart+1] & 255) == 4 && (d[oidStart+2] & 255) == 3) {
+        while (p[0] < end) {
+            int setEnd = Tlv(d, end, p, 49);
+            if (setEnd < 0) { return oneline.ToString(); }
+            while (p[0] < setEnd) {
+                int seqEnd = Tlv(d, setEnd, p, 48);
+                if (seqEnd < 0) { return oneline.ToString(); }
+                int oidEnd = Tlv(d, seqEnd, p, 6);
+                if (oidEnd < 0) { return oneline.ToString(); }
+                int oidAt = p[0];
+                int oidLen = oidEnd - oidAt;
+                p[0] = oidEnd;
+                if (p[0] >= seqEnd) { return oneline.ToString(); }
+                int tag = d[p[0]] & 255;
+                int valEnd = Tlv(d, seqEnd, p, tag);
+                if (valEnd != seqEnd) { return oneline.ToString(); }
+                string val = ReadString(d, p[0], valEnd - p[0]);
+                if (Oid(d, oidAt, oidLen, 85, 4, 3)) {
                     oneline.Append("/CN=" + val);
-                    if (outCN.Count > 0) { outCN[0] = val; }
-                } else if (oidLen == 3 && (d[oidStart] & 255) == 85 && (d[oidStart+1] & 255) == 4 && (d[oidStart+2] & 255) == 10) {
-                    // 2.5.4.10 = O (Organization)
+                    if (outCN != null && outCN.Count > 0) { outCN[0] = val; }
+                } else if (Oid(d, oidAt, oidLen, 85, 4, 10)) {
                     oneline.Append("/O=" + val);
-                } else if (oidLen == 3 && (d[oidStart] & 255) == 85 && (d[oidStart+1] & 255) == 4 && (d[oidStart+2] & 255) == 11) {
+                } else if (Oid(d, oidAt, oidLen, 85, 4, 11)) {
                     oneline.Append("/OU=" + val);
-                } else if (oidLen == 3 && (d[oidStart] & 255) == 85 && (d[oidStart+1] & 255) == 4 && (d[oidStart+2] & 255) == 6) {
-                    // 2.5.4.6 = C (Country)
+                } else if (Oid(d, oidAt, oidLen, 85, 4, 6)) {
                     oneline.Append("/C=" + val);
                 }
+                p[0] = seqEnd;
             }
+            p[0] = setEnd;
         }
         return oneline.ToString();
     }
@@ -1017,86 +994,115 @@ public class X509Certificate {
     public static X509Certificate Parse(byte[] der, int len) { return ParseForTls(der, len); }
 
     public static X509Certificate ParseDisplay(byte[] der, int len) {
-        if (der == null || len <= 0) { return null; }
-        X509Certificate cert = new X509Certificate();
-        cert.rawDer = new byte[len];
-        for (int ri = 0; ri < len; ri = ri + 1) { cert.rawDer[ri] = (byte)(der[ri] & 255); }
-        cert.rawDerLen = len;
+        if (der == null || len < 32 || len > der.Length) { return null; }
+        List<int> p = new List<int>(); p.Add(0);
 
-        List<int> cur = new List<int>(); cur.Add(0);
-
-        int certEnd = Enter(der, cur, 48); // Certificate SEQUENCE
-        if (certEnd < 0) { return null; }
-        int tbsEnd = Enter(der, cur, 48); // TBSCertificate SEQUENCE
+        int certEnd = Tlv(der, len, p, 48); // Certificate SEQUENCE
+        if (certEnd != len) { return null; }
+        int tbsStart = p[0];
+        int tbsEnd = Tlv(der, certEnd, p, 48); // TBSCertificate SEQUENCE
         if (tbsEnd < 0) { return null; }
 
+        X509Certificate cert = new X509Certificate();
+        cert.rawDer = new byte[len];
+        NativeMemory.Copy(cert.rawDer, der, len);
+        cert.rawDerLen = len;
+
         // version [0] EXPLICIT
-        if ((der[cur[0]] & 255) == 160) {
-            Skip(der, cur);
+        if (p[0] < tbsEnd && (der[p[0]] & 255) == 160) {
+            int vEnd = Tlv(der, tbsEnd, p, 160);
+            if (vEnd < 0) { return null; }
+            p[0] = vEnd;
         }
-        Skip(der, cur);
-        Skip(der, cur);
 
+        // serialNumber
+        int serialEnd = Tlv(der, tbsEnd, p, 2);
+        if (serialEnd < 0) { return null; }
+        p[0] = serialEnd;
+
+        // signature algorithm
+        int sigEnd = Tlv(der, tbsEnd, p, 48);
+        if (sigEnd < 0) { return null; }
+        p[0] = sigEnd;
+
+        // issuer
+        cert.issuerNameStart = p[0];
+        int issuerEnd = Tlv(der, tbsEnd, p, 48);
+        if (issuerEnd < 0) { return null; }
+        cert.issuerNameLen = issuerEnd - cert.issuerNameStart;
         List<string> issuerCNList = new List<string>(); issuerCNList.Add("");
-        cert.issuer = ParseName(der, cur, issuerCNList);
+        cert.issuer = SafeName(der, cert.issuerNameStart, cert.issuerNameLen, issuerCNList);
         cert.issuerCN = issuerCNList[0];
+        p[0] = issuerEnd;
 
-        Skip(der, cur);
+        // validity
+        int validityEnd = Tlv(der, tbsEnd, p, 48);
+        if (validityEnd < 0) { return null; }
+        p[0] = validityEnd;
 
+        // subject
+        cert.subjectNameStart = p[0];
+        int subjectEnd = Tlv(der, tbsEnd, p, 48);
+        if (subjectEnd < 0) { return null; }
+        cert.subjectNameLen = subjectEnd - cert.subjectNameStart;
         List<string> subjectCNList = new List<string>(); subjectCNList.Add("");
-        cert.subject = ParseName(der, cur, subjectCNList);
+        cert.subject = SafeName(der, cert.subjectNameStart, cert.subjectNameLen, subjectCNList);
         cert.subjectCN = subjectCNList[0];
+        p[0] = subjectEnd;
 
-        int spkiStart = cur[0];
-        int spkiEnd = Enter(der, cur, 48);
-        if (spkiEnd < 0) { return null; }
+        // SPKI
+        int spkiStart = p[0];
+        int spkiEnd = Tlv(der, tbsEnd, p, 48);
+        if (spkiEnd < 0 || spkiEnd <= spkiStart || spkiEnd > tbsEnd) { return null; }
         cert.spkiLen = spkiEnd - spkiStart;
         cert.spki = new byte[cert.spkiLen];
-        for (int k = 0; k < cert.spkiLen; k = k + 1) {
-            cert.spki[k] = der[spkiStart + k] & 255;
-        }
-        cur[0] = spkiEnd;
+        NativeMemory.Copy(cert.spki, (nint)der + (nint)spkiStart, cert.spkiLen);
+        p[0] = spkiEnd;
 
         // extensions [3] EXPLICIT
-        while (cur[0] < tbsEnd) {
-            int tag = der[cur[0]] & 255;
+        while (p[0] < tbsEnd) {
+            int tag = der[p[0]] & 255;
             if (tag == 163) { // [3]
-                int ext3End = Enter(der, cur, 163);
-                int extSeqEnd = Enter(der, cur, 48);
-                while (cur[0] < extSeqEnd) {
-                    int extItemEnd = Enter(der, cur, 48);
-                    int oidTag = der[cur[0]] & 255; cur[0] = cur[0] + 1;
-                    int oidLen = ReadLen(der, cur);
-                    int oidStart = cur[0];
-                    cur[0] = cur[0] + oidLen;
-                    // 2.5.29.17 = SAN (SubjectAltName)
-                    bool isSan = (oidLen == 3 && (der[oidStart]&255) == 85 && (der[oidStart+1]&255) == 29 && (der[oidStart+2]&255) == 17);
-                    if ((der[cur[0]] & 255) == 1) { // boolean critical
-                        Skip(der, cur);
+                int ext3End = Tlv(der, tbsEnd, p, 163);
+                if (ext3End < 0) { break; }
+                int extSeqEnd = Tlv(der, ext3End, p, 48);
+                if (extSeqEnd < 0) { break; }
+                while (p[0] < extSeqEnd) {
+                    int extItemEnd = Tlv(der, extSeqEnd, p, 48);
+                    if (extItemEnd < 0) { break; }
+                    int oidEnd = Tlv(der, extItemEnd, p, 6);
+                    if (oidEnd < 0) { p[0] = extItemEnd; continue; }
+                    int oidAt = p[0]; int oidLen = oidEnd - oidAt;
+                    bool isSan = Oid(der, oidAt, oidLen, 85, 29, 17);
+                    p[0] = oidEnd;
+                    if (p[0] < extItemEnd && (der[p[0]] & 255) == 1) {
+                        int bEnd = Tlv(der, extItemEnd, p, 1);
+                        if (bEnd > 0) { p[0] = bEnd; }
                     }
-                    int octetEnd = Enter(der, cur, 4); // OCTET STRING
+                    int octetEnd = Tlv(der, extItemEnd, p, 4);
                     if (isSan && octetEnd > 0) {
-                        int gnSeqEnd = Enter(der, cur, 48); // GeneralNames SEQUENCE
+                        int gnSeqEnd = Tlv(der, octetEnd, p, 48);
                         if (gnSeqEnd > 0) {
-                            while (cur[0] < gnSeqEnd) {
-                                int gnTag = der[cur[0]] & 255; cur[0] = cur[0] + 1;
-                                int gnLen = ReadLen(der, cur);
-                                if (gnTag == 130) { // dNSName [2]
-                                    string dns = ReadString(der, cur[0], gnLen);
-                                    cert.dnsNames.Add(dns);
-                                } else if (gnTag == 135) { // iPAddress [7]
-                                    if (gnLen == 4 || gnLen == 16) {
-                                        cert.ipAddresses.Add(X509Certificate.IpSanText(der, cur[0], gnLen));
-                                    }
+                            while (p[0] < gnSeqEnd) {
+                                int gnTag = der[p[0]] & 255;
+                                int gnEnd = Tlv(der, gnSeqEnd, p, gnTag);
+                                if (gnEnd < 0) { break; }
+                                if (gnTag == 130) {
+                                    cert.dnsNames.Add(ReadString(der, p[0], gnEnd - p[0]));
+                                } else if (gnTag == 135 && (gnEnd - p[0] == 4 || gnEnd - p[0] == 16)) {
+                                    cert.ipAddresses.Add(X509Certificate.IpSanText(der, p[0], gnEnd - p[0]));
                                 }
-                                cur[0] = cur[0] + gnLen;
+                                p[0] = gnEnd;
                             }
                         }
                     }
-                    cur[0] = extItemEnd;
+                    p[0] = extItemEnd;
                 }
+                p[0] = ext3End;
             } else {
-                Skip(der, cur);
+                int otherEnd = Tlv(der, tbsEnd, p, tag);
+                if (otherEnd < 0) { break; }
+                p[0] = otherEnd;
             }
         }
 

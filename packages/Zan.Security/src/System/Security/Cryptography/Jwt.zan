@@ -1,4 +1,5 @@
 using System;
+using System.Interop;
 using System.Json;
 using System.Text;
 namespace System.Security.Cryptography;
@@ -30,18 +31,42 @@ public class Jwt {
         return -1;
     }
 
-    // 将恰好 <paramref name="len"/> 字节编码为无填充的 RFC 4648 Base64Url。
+    // 将恰好 <paramref name="len"/> 字节编码为无填充的 RFC 4648 Base64Url（4 倍展开）。
     public static string Base64UrlEncode(string bytes, int len) {
         if (bytes == null || len <= 0 || len > bytes.Length) { return ""; }
-        string a = Jwt.urlAlphabet();
+        string a = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
         int rem = len % 3;
         int outLen = (len / 3) * 4 + (rem == 0 ? 0 : (rem == 1 ? 2 : 3));
         byte[] outBuf = new byte[outLen];
         int di = 0;
         int i = 0;
+        while (i + 12 <= len) {
+            int n0 = ((bytes[i] & 255) << 16) | ((bytes[i + 1] & 255) << 8) | (bytes[i + 2] & 255);
+            int n1 = ((bytes[i + 3] & 255) << 16) | ((bytes[i + 4] & 255) << 8) | (bytes[i + 5] & 255);
+            int n2 = ((bytes[i + 6] & 255) << 16) | ((bytes[i + 7] & 255) << 8) | (bytes[i + 8] & 255);
+            int n3 = ((bytes[i + 9] & 255) << 16) | ((bytes[i + 10] & 255) << 8) | (bytes[i + 11] & 255);
+            outBuf[di]      = (byte)(a[(n0 >> 18) & 63] & 255);
+            outBuf[di + 1]  = (byte)(a[(n0 >> 12) & 63] & 255);
+            outBuf[di + 2]  = (byte)(a[(n0 >> 6) & 63] & 255);
+            outBuf[di + 3]  = (byte)(a[n0 & 63] & 255);
+            outBuf[di + 4]  = (byte)(a[(n1 >> 18) & 63] & 255);
+            outBuf[di + 5]  = (byte)(a[(n1 >> 12) & 63] & 255);
+            outBuf[di + 6]  = (byte)(a[(n1 >> 6) & 63] & 255);
+            outBuf[di + 7]  = (byte)(a[n1 & 63] & 255);
+            outBuf[di + 8]  = (byte)(a[(n2 >> 18) & 63] & 255);
+            outBuf[di + 9]  = (byte)(a[(n2 >> 12) & 63] & 255);
+            outBuf[di + 10] = (byte)(a[(n2 >> 6) & 63] & 255);
+            outBuf[di + 11] = (byte)(a[n2 & 63] & 255);
+            outBuf[di + 12] = (byte)(a[(n3 >> 18) & 63] & 255);
+            outBuf[di + 13] = (byte)(a[(n3 >> 12) & 63] & 255);
+            outBuf[di + 14] = (byte)(a[(n3 >> 6) & 63] & 255);
+            outBuf[di + 15] = (byte)(a[n3 & 63] & 255);
+            di = di + 16;
+            i = i + 12;
+        }
         while (i + 3 <= len) {
             int n = ((bytes[i] & 255) << 16) | ((bytes[i + 1] & 255) << 8) | (bytes[i + 2] & 255);
-            outBuf[di] = (byte)(a[(n >> 18) & 63] & 255);
+            outBuf[di]     = (byte)(a[(n >> 18) & 63] & 255);
             outBuf[di + 1] = (byte)(a[(n >> 12) & 63] & 255);
             outBuf[di + 2] = (byte)(a[(n >> 6) & 63] & 255);
             outBuf[di + 3] = (byte)(a[n & 63] & 255);
@@ -50,11 +75,11 @@ public class Jwt {
         }
         if (rem == 1) {
             int n = (bytes[i] & 255) << 16;
-            outBuf[di] = (byte)(a[(n >> 18) & 63] & 255);
+            outBuf[di]     = (byte)(a[(n >> 18) & 63] & 255);
             outBuf[di + 1] = (byte)(a[(n >> 12) & 63] & 255);
         } else if (rem == 2) {
             int n = ((bytes[i] & 255) << 16) | ((bytes[i + 1] & 255) << 8);
-            outBuf[di] = (byte)(a[(n >> 18) & 63] & 255);
+            outBuf[di]     = (byte)(a[(n >> 18) & 63] & 255);
             outBuf[di + 1] = (byte)(a[(n >> 12) & 63] & 255);
             outBuf[di + 2] = (byte)(a[(n >> 6) & 63] & 255);
         }
@@ -63,29 +88,24 @@ public class Jwt {
 
     // 严格解码无填充的 Base64Url。outLen[0] 为字节数，输入格式错误时为 -1。
     public static byte[] Base64UrlDecode(string text, List<int> outLen) {
-        int len = text.Length;
-        byte[] result = new byte[len];
-        if ((len & 3) == 1) { outLen[0] = -1; return result; }
-        int acc = 0;
-        int bits = 0;
-        int count = 0;
-        for (int i = 0; i < len; i = i + 1) {
-            int d = Jwt.urlDigit(text[i] & 255);
-            if (d < 0) { outLen[0] = -1; return result; }
-            acc = (acc << 6) | d;
-            bits = bits + 6;
-            if (bits >= 8) {
-                bits = bits - 8;
-                result[count] = (acc >> bits) & 255;
-                count = count + 1;
-            }
+        if (text == null) {
+            if (outLen != null && outLen.Count > 0) { outLen[0] = -1; }
+            return new byte[0];
         }
-        if (bits > 0 && (acc & ((1 << bits) - 1)) != 0) {
-            outLen[0] = -1;
+        int len = text.Length;
+        if ((len & 3) == 1) {
+            if (outLen != null && outLen.Count > 0) { outLen[0] = -1; }
+            return new byte[len];
+        }
+        int maxDecoded = (len * 3) / 4 + 4;
+        byte[] result = new byte[maxDecoded];
+        long written = NativeMemory.Base64Decode(result, text, (long)len);
+        if (written >= 0) {
+            if (outLen != null && outLen.Count > 0) { outLen[0] = (int)written; }
             return result;
         }
-        outLen[0] = count;
-        return result;
+        if (outLen != null && outLen.Count > 0) { outLen[0] = -1; }
+        return new byte[len];
     }
 
     // 从 `from` 起第一个 '.' 的下标；没有则 -1。
@@ -127,6 +147,63 @@ public class Jwt {
         return false;
     }
 
+    private static bool keysEqual(JsonDoc doc, JsonPair p1, JsonPair p2) {
+        if (p1.keyLen != p2.keyLen) { return false; }
+        int len = p1.keyLen;
+        if (len == 0) { return true; }
+        if (p1.keyStart >= 0 && p2.keyStart >= 0) {
+            byte[] buf = doc.buf;
+            int s1 = p1.keyStart;
+            int s2 = p2.keyStart;
+            if (buf[s1] != buf[s2] || buf[s1 + len - 1] != buf[s2 + len - 1]) {
+                return false;
+            }
+            for (int m = 1; m < len - 1; m = m + 1) {
+                if (buf[s1 + m] != buf[s2 + m]) { return false; }
+            }
+            return true;
+        }
+        string k1 = p1.keyStart >= 0 ? doc.src.Substring(p1.keyStart, len) : doc.escPool[p1.keyLen];
+        string k2 = p2.keyStart >= 0 ? doc.src.Substring(p2.keyStart, len) : doc.escPool[p2.keyLen];
+        return k1 == k2;
+    }
+
+    // JsonDoc 中对象层是否存在重复键（单向链表遍历 + 首尾快筛 + 基元结构剪枝，零堆分配）。
+    public static bool hasDuplicateKeysDoc(JsonDoc doc, int node) {
+        if (doc == null || node < 0 || node >= doc.slotCount) { return false; }
+        int k = doc.KindAt(node);
+        if (k == 5) {
+            int p1 = (int)(doc.slots[node].a >> 8);
+            while (p1 >= 0) {
+                JsonPair pair1 = doc.pairs[p1];
+                int p2 = pair1.nextPair;
+                while (p2 >= 0) {
+                    JsonPair pair2 = doc.pairs[p2];
+                    if (Jwt.keysEqual(doc, pair1, pair2)) { return true; }
+                    p2 = pair2.nextPair;
+                }
+                if (pair1.valueSlot >= 0) {
+                    int vk = doc.KindAt(pair1.valueSlot);
+                    if (vk >= 4 && Jwt.hasDuplicateKeysDoc(doc, pair1.valueSlot)) {
+                        return true;
+                    }
+                }
+                p1 = pair1.nextPair;
+            }
+        } else if (k == 4) {
+            int child = doc.FirstChild(node);
+            int count = doc.Count(node);
+            for (int i = 0; i < count; i = i + 1) {
+                if (child >= 0) {
+                    int ck = doc.KindAt(child);
+                    if (ck >= 4 && Jwt.hasDuplicateKeysDoc(doc, child)) { return true; }
+                    child = doc.NextSibling(child);
+                }
+            }
+        }
+        return false;
+    }
+
     // 读 JWT NumericDate（纯数字串）到 result[0]；非数字或溢出 long 时
     // 返回 false。
     private static bool readNumericDate(JsonValue node, List<long> result) {
@@ -149,6 +226,28 @@ public class Jwt {
         return true;
     }
 
+    // 基于 JsonDoc 的零分配 NumericDate 读取。
+    private static bool readNumericDateDoc(JsonDoc doc, int slot, List<long> result) {
+        if (slot < 0 || doc == null || doc.KindAt(slot) != 2) { return false; }
+        int rawKind = (int)(doc.slots[slot].a & 255);
+        if (rawKind == 2 && doc.slots[slot].b >= 0L) {
+            result[0] = doc.slots[slot].b;
+            return true;
+        }
+        string raw = doc.StrAt(slot, "");
+        if (raw.Length == 0) { return false; }
+        long number = 0;
+        for (int i = 0; i < raw.Length; i = i + 1) {
+            int digit = (raw[i] & 255) - 48;
+            if (digit < 0 || digit > 9) { return false; }
+            if (number > 922337203685477580L ||
+                (number == 922337203685477580L && digit > 7)) { return false; }
+            number = number * 10 + (long)digit;
+        }
+        result[0] = number;
+        return true;
+    }
+
     // 构造校验失败的 JwtToken：valid=false，error 为固定文案，无内容。
     private static JwtToken fail(string error) {
         JwtToken result = new JwtToken();
@@ -162,6 +261,7 @@ public class Jwt {
     // 拆分三段式令牌并解码：限长、Base64Url、JSON 对象、重复键与
     // header.alg 必须恰为 `algorithm`；失败返回带错误文案的 token。
     private static JwtToken parseParts(string token, string algorithm) {
+        if (token == null) { return Jwt.fail("null token"); }
         if (token.Length > Jwt.maxTokenSize()) { return Jwt.fail("token too large"); }
         int first = Jwt.dotAt(token, 0);
         int second = -1;
@@ -186,19 +286,20 @@ public class Jwt {
         result.headerJson = headerJson;
         result.payloadJson = payloadJson;
         try {
-            result.header = JsonValue.Parse(headerJson);
-            result.payload = JsonValue.Parse(payloadJson);
+            result.headerDoc = JsonDoc.Parse(headerJson);
+            result.payloadDoc = JsonDoc.Parse(payloadJson);
         } catch (JsonException e) {
             return Jwt.fail("malformed json");
         }
-        if (!result.header.IsObject() || !result.payload.IsObject()) {
+        if (result.headerDoc == null || result.headerDoc.root < 0 || result.headerDoc.KindAt(result.headerDoc.root) != 5
+            || result.payloadDoc == null || result.payloadDoc.root < 0 || result.payloadDoc.KindAt(result.payloadDoc.root) != 5) {
             return Jwt.fail("jwt json must be objects");
         }
-        if (Jwt.hasDuplicateKeys(result.header) || Jwt.hasDuplicateKeys(result.payload)) {
+        if (Jwt.hasDuplicateKeysDoc(result.headerDoc, result.headerDoc.root) || Jwt.hasDuplicateKeysDoc(result.payloadDoc, result.payloadDoc.root)) {
             return Jwt.fail("duplicate json key");
         }
-        JsonValue alg = result.header.Get("alg");
-        if (alg == null || !alg.IsString() || alg.AsString("") != algorithm) {
+        int algSlot = result.headerDoc.Get(result.headerDoc.root, "alg");
+        if (algSlot < 0 || result.headerDoc.KindAt(algSlot) != 3 || result.headerDoc.StrAt(algSlot, "") != algorithm) {
             return Jwt.fail("algorithm rejected");
         }
         result.error = "";
@@ -208,31 +309,39 @@ public class Jwt {
     // 按调用方提供的 now 校验 exp/nbf（NumericDate）与 iss/aud
     // （空串关闭对应校验）；通过返回 ""，否则返回错误文案。
     private static string validateClaims(JwtToken token, long now, string issuer, string audience) {
-        JsonValue payload = token.payload;
+        JsonDoc payload = token.payloadDoc;
+        if (payload == null || payload.root < 0) { return "malformed json"; }
+        int root = payload.root;
         List<long> numericDate = new List<long>(); numericDate.Add(0);
-        if (payload.Has("exp")) {
-            if (!Jwt.readNumericDate(payload.Get("exp"), numericDate)) { return "invalid exp"; }
+        int expSlot = payload.Get(root, "exp");
+        if (expSlot >= 0) {
+            if (!Jwt.readNumericDateDoc(payload, expSlot, numericDate)) { return "invalid exp"; }
             if (now >= numericDate[0]) { return "token expired"; }
         }
-        if (payload.Has("nbf")) {
-            if (!Jwt.readNumericDate(payload.Get("nbf"), numericDate)) { return "invalid nbf"; }
+        int nbfSlot = payload.Get(root, "nbf");
+        if (nbfSlot >= 0) {
+            if (!Jwt.readNumericDateDoc(payload, nbfSlot, numericDate)) { return "invalid nbf"; }
             if (now < numericDate[0]) { return "token not active"; }
         }
-        if (issuer.Length > 0) {
-            JsonValue iss = payload.Get("iss");
-            if (iss == null || !iss.IsString() || iss.AsString("") != issuer) {
+        if (issuer != null && issuer.Length > 0) {
+            int issSlot = payload.Get(root, "iss");
+            if (issSlot < 0 || payload.KindAt(issSlot) != 3 || payload.StrAt(issSlot, "") != issuer) {
                 return "issuer mismatch";
             }
         }
-        if (audience.Length > 0) {
-            JsonValue aud = payload.Get("aud");
+        if (audience != null && audience.Length > 0) {
+            int audSlot = payload.Get(root, "aud");
             bool match = false;
-            if (aud != null && aud.IsString()) {
-                match = aud.AsString("") == audience;
-            } else if (aud != null && aud.IsArray()) {
-                for (int i = 0; i < aud.Count(); i = i + 1) {
-                    JsonValue item = aud.At(i);
-                    if (item.IsString() && item.AsString("") == audience) { match = true; }
+            if (audSlot >= 0 && payload.KindAt(audSlot) == 3) {
+                match = payload.StrAt(audSlot, "") == audience;
+            } else if (audSlot >= 0 && payload.KindAt(audSlot) == 4) {
+                int child = payload.FirstChild(audSlot);
+                int count = payload.Count(audSlot);
+                for (int i = 0; i < count; i = i + 1) {
+                    if (payload.KindAt(child) == 3 && payload.StrAt(child, "") == audience) {
+                        match = true;
+                    }
+                    child = payload.NextSibling(child);
                 }
             }
             if (!match) { return "audience mismatch"; }
@@ -245,10 +354,11 @@ public class Jwt {
 
     // 由对象形式的 payload JSON 和带字节数的密钥创建 HS256 紧凑 JWT。
     public static string CreateHs256(string payloadJson, string secret, int secretLen) {
-        if (secretLen < 0 || secretLen > secret.Length
+        if (payloadJson == null || secret == null || secretLen < 0 || secretLen > secret.Length
             || payloadJson.Length > Jwt.maxPayloadSize()) { return ""; }
-        JsonValue payload = JsonValue.Parse(payloadJson);
-        if (!payload.IsObject() || Jwt.hasDuplicateKeys(payload)) { return ""; }
+        JsonDoc doc = null;
+        try { doc = JsonDoc.Parse(payloadJson); } catch (Exception e) { return ""; }
+        if (doc == null || doc.root < 0 || doc.KindAt(doc.root) != 5 || Jwt.hasDuplicateKeysDoc(doc, doc.root)) { return ""; }
         string header = Jwt.Hs256Header;
         string signing = Jwt.Base64UrlEncode(header, header.Length) + "."
             + Jwt.Base64UrlEncode(payloadJson, payloadJson.Length);
@@ -259,8 +369,8 @@ public class Jwt {
     // 仅解析并校验 HS256，然后对照显式输入验证 exp、nbf、iss 和 aud。
     public static JwtToken ParseHs256(string token, string secret, int secretLen,
         long now, string issuer, string audience) {
-        if (secretLen < 0 || secretLen > secret.Length) {
-            return Jwt.fail("invalid secret length");
+        if (token == null || secret == null || secretLen < 0 || secretLen > secret.Length) {
+            return Jwt.fail("invalid parameters");
         }
         JwtToken result = Jwt.parseParts(token, "HS256");
         if (result.error.Length > 0) { return result; }
@@ -281,9 +391,10 @@ public class Jwt {
 
     // 用 RSA 私钥创建 RS256 紧凑 JWT；密钥无法签名时返回空。
     public static string CreateRs256(string payloadJson, RsaKey privateKey) {
-        if (payloadJson.Length > Jwt.maxPayloadSize()) { return ""; }
-        JsonValue payload = JsonValue.Parse(payloadJson);
-        if (!payload.IsObject() || Jwt.hasDuplicateKeys(payload) || privateKey == null) { return ""; }
+        if (payloadJson == null || privateKey == null || payloadJson.Length > Jwt.maxPayloadSize()) { return ""; }
+        JsonDoc doc = null;
+        try { doc = JsonDoc.Parse(payloadJson); } catch (Exception e) { return ""; }
+        if (doc == null || doc.root < 0 || doc.KindAt(doc.root) != 5 || Jwt.hasDuplicateKeysDoc(doc, doc.root)) { return ""; }
         string header = Jwt.Rs256Header;
         string signing = Jwt.Base64UrlEncode(header, header.Length) + "."
             + Jwt.Base64UrlEncode(payloadJson, payloadJson.Length);
@@ -297,9 +408,9 @@ public class Jwt {
     // 仅解析并校验 RS256，然后对照显式输入验证 exp、nbf、iss 和 aud。
     public static JwtToken ParseRs256(string token, RsaKey publicKey,
         long now, string issuer, string audience) {
+        if (token == null || publicKey == null) { return Jwt.fail("invalid parameters"); }
         JwtToken result = Jwt.parseParts(token, "RS256");
         if (result.error.Length > 0) { return result; }
-        if (publicKey == null) { return Jwt.fail("signature mismatch"); }
         int second = Jwt.dotAt(token, Jwt.dotAt(token, 0) + 1);
         string signing = token.Substring(0, second);
         string sigText = token.Substring(second + 1, token.Length - second - 1);
