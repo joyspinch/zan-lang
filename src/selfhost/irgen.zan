@@ -2750,11 +2750,114 @@ partial class Irgen {
             i = i + 1;
         }
     }
-    // Run static-field initializers once at program entry (mirrors var-decl init).
-    void EmitStaticInits(Node unit) {
+
+    int SinitTypeIndex(Node unit, string name) {
+        if (name == null || name == "") { return -1; }
         int i = 0;
         while (i < unit.kids.Count) {
             Node d = unit.kids[i];
+            if ((d.kind == AK.ClassDecl() || d.kind == AK.StructDecl()) && d.sval == name) {
+                return i;
+            }
+            i = i + 1;
+        }
+        return -1;
+    }
+
+    void SinitScan(Node unit, int self, Node n, List<int> dep, int nTypes, int depth) {
+        if (n == null || depth > 64) { return; }
+        if (n.kind == AK.Ident()) {
+            int j = SinitTypeIndex(unit, n.sval);
+            if (j >= 0 && j != self) { dep[self * nTypes + j] = 1; }
+            return;
+        }
+        if (n.kind == AK.TypeRef()) {
+            int j = SinitTypeIndex(unit, n.sval);
+            if (j >= 0 && j != self) { dep[self * nTypes + j] = 1; }
+        }
+        SinitScan(unit, self, n.a, dep, nTypes, depth + 1);
+        SinitScan(unit, self, n.b, dep, nTypes, depth + 1);
+        SinitScan(unit, self, n.c, dep, nTypes, depth + 1);
+        SinitScan(unit, self, n.d, dep, nTypes, depth + 1);
+        SinitScan(unit, self, n.type, dep, nTypes, depth + 1);
+        int ki = 0;
+        while (ki < n.kids.Count) {
+            SinitScan(unit, self, n.kids[ki], dep, nTypes, depth + 1);
+            ki = ki + 1;
+        }
+    }
+
+    void SinitVisit(int i, int nTypes, List<int> dep, List<int> color, List<int> order) {
+        if (color[i] != 0) { return; }
+        color[i] = 1;
+        int j = 0;
+        while (j < nTypes) {
+            if (dep[i * nTypes + j] != 0 && color[j] != 1) {
+                SinitVisit(j, nTypes, dep, color, order);
+            }
+            j = j + 1;
+        }
+        color[i] = 2;
+        order.Add(i);
+    }
+
+    List<int> SinitComputeOrder(Node unit) {
+        int n = unit.kids.Count;
+        List<int> order = new List<int>();
+        if (n <= 0) { return order; }
+        List<int> dep = new List<int>();
+        List<int> color = new List<int>();
+        int total = n * n;
+        int idx = 0;
+        while (idx < total) { dep.Add(0); idx = idx + 1; }
+        idx = 0;
+        while (idx < n) { color.Add(0); idx = idx + 1; }
+
+        int i = 0;
+        while (i < n) {
+            Node d = unit.kids[i];
+            if (d.kind == AK.ClassDecl() || d.kind == AK.StructDecl()) {
+                int mi = 0;
+                while (mi < d.kids.Count) {
+                    Node m = d.kids[mi];
+                    if (m.kind == AK.FieldDecl() && IsStatic(m) && m.b != null) {
+                        SinitScan(unit, i, m.b, dep, n, 0);
+                    } else if (m.kind == AK.CtorDecl() && IsStatic(m) && m.d != null) {
+                        SinitScan(unit, i, m.d, dep, n, 0);
+                    }
+                    mi = mi + 1;
+                }
+            }
+            i = i + 1;
+        }
+
+        i = 0;
+        while (i < n) {
+            SinitVisit(i, n, dep, color, order);
+            i = i + 1;
+        }
+
+        i = 0;
+        while (i < n) {
+            bool seen = false;
+            int k = 0;
+            while (k < order.Count) {
+                if (order[k] == i) { seen = true; break; }
+                k = k + 1;
+            }
+            if (!seen) { order.Add(i); }
+            i = i + 1;
+        }
+        return order;
+    }
+
+    // Run static-field initializers once at program entry (mirrors var-decl init).
+    // B-ID92: 按依赖拓扑序发射（对齐 C11 emit_static_init_order），被依赖的类型先初始化。
+    void EmitStaticInits(Node unit) {
+        List<int> order = SinitComputeOrder(unit);
+        int oi = 0;
+        while (oi < order.Count) {
+            Node d = unit.kids[order[oi]];
             if (d.kind == AK.ClassDecl() || d.kind == AK.StructDecl()) {
                 curClass = d.sval; curHasThis = false;
                 locName = new List<string>(); locType = new List<Node>(); locReg = new List<string>();
@@ -2781,7 +2884,7 @@ partial class Irgen {
                     j = j + 1;
                 }
             }
-            i = i + 1;
+            oi = oi + 1;
         }
     }
 
