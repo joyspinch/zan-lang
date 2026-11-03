@@ -6681,18 +6681,22 @@ add_test(NAME tool_zandoc
     -P ${CMAKE_SOURCE_DIR}/tests/run_zandoc.cmake)
 
 # ---- Test tiers -------------------------------------------------------------
-# The suite is over a thousand tests because every conformance program is also
+# The suite is thousands of tests because every conformance program is also
 # built for determinism and leak checking; running all of it for a one-line
 # change is minutes of waiting for nothing. Each test therefore carries a tier
 # label so a run can be scoped to the work at hand:
 #
 #   ctest -L smoke      compiler gates only: goldens, diagnostics, ABI,
 #                       runtimes, tools, GUI cases -- opt-in sanity check
+#                       (428 tests as of 2026-11-04; bare runs are refused by
+#                        scripts/test.ps1's hit-budget guard)
 #   ctest -L standard   smoke + every conformance program + library emission
-#                       -- release gate / CI only (1000+ tests; do NOT run during routine dev)
+#                       -- release gate / CI only (1653 tests; do NOT run during routine dev)
 #   ctest -L full       everything, including the determinism and leakcheck
 #                       twins and self-hosting -- final release gate / CI only
+#                       (2860 tests, ~10.6 CPU-hours measured)
 #
+# Counts drift as cases are added; `ctest -N -L <tier>` is the live number.
 # Labels are derived from the test names so new tests are classified the moment
 # they are added, without touching the add_test() calls above.
 get_property(_all_tests DIRECTORY PROPERTY TESTS)

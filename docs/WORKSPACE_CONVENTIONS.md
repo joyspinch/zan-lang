@@ -63,20 +63,36 @@ hooks 管不住的部分（untracked 堆积、stash 纪律、路径限定 add）
 本地 `main`。仅当验证未通过，或工作区混入了不属于本任务、不可触碰的在途改动
 时才暂缓提交（此时明确说明留了什么、为什么）。
 
-## 8. ctest 整档 opt-in——默认验证是探针 + 受影响单用例
+## 8. ctest 整档 opt-in——默认验证是探针 + 受影响单用例，一轮收口验证一次
 
 ctest 整档（smoke/standard/full，`scripts/test.ps1 <tier>` 或 `ctest -L <tier>`）
 **不是默认验证步骤，包括编译器/运行时/stdlib 改动**：整档把每个核打满几十分钟，
-且重链 `zanc` 会让全部测试产物失效。
+且重链 `zanc` 会让全部测试产物失效（实测 2026-11-04：smoke 428 / standard 1653 /
+full 2860 条，full ≈10.6 CPU·h；数字会漂移，现查 `ctest -N -L <tier>`）。
 
+- **验证节奏（这是行为规则，不是性能调优）**：一轮任务**收口时验证一次**；编辑
+  循环里只做 A 档判定（`zanc` 编译/类型、金样 diff、探针）。"改几行就重跑一组
+  ctest"不是勤奋是内耗——重跑只重跑**输出会变的那一条**（同一 `-Match` 组 10
+  分钟内重复跑会被机检拒绝，`-Force` 才放行）。
 - 默认验证直接且便宜：编译并运行受影响的程序/探针
   （`build\zanc.exe <file.zan> --auto-stdlib -o _scratch\out.exe`）、diff 受影响的
-  金样/诊断，有同名测试用例就**单跑该用例**（`ctest -R conformance_<name>`，秒级；
-  改动面局部时再窄化，如泛型/ARC 改动 `-R "generic|leakcheck_generic"`）。
+  金样/诊断，有同名测试用例就**单跑该用例**（`ctest -R "^case_<name>$"`，秒级）。
+- **命中面预算（机检）**：定向跑一次 ≤ 80 条——`scripts/test.ps1` 对任何档位先
+  `ctest -N` 数命中，超了直接拒绝并给收窄提示；smoke 裸跑（≈428 条）同样被拒。
+  收窄用 `tools\agent\verify.ps1 -Paths <改动文件>`：stdlib/packages/examples 按
+  **import 依赖**现推最小命中面（旧映射 `^conformance_` 一次命中 1181 条，且根本
+  匹配不到 `tests/conformance` 生成的 `case_*`，双重错误，已废）。
+- **单跑用锚定正则**：`ctest -R "^case_<name>$"`。不锚定会误中
+  `case_det_<name>` 孪生（full 档，每案双编译、百秒级）；定向跑（`-Match`）会
+  自动排除 `^case_det_`——那道确定性透镜只属发布门。
 - 不要把整档当 pre-commit 步骤，也不要为小的后续修改重跑整档：只有**用户明确
   要求**或**约定好的发布门槛**（`full`——determinism/leakcheck 孪生 + 自举——仅是
   发布门）才跑整档。
 - 手跑探针 + 受影响单用例就是完整验证，不需要"升级"成整档。
+- **零复制验证**：探针放主树 `_scratch/`，用主树 `build\zanc.exe --auto-stdlib`
+  就地编译；测试在 `tests/` 经 ctest。**为验证把 stdlib/包/源码/构建树复制到任何
+  新目录都是违规**——"另开一份"（§8a）也包括"拉个文件夹拷一堆文件进去跑"；公共
+  机制就位、副本只制造漂移与重复构建。唯一例外是 §2 的二分短命 worktree。
 - **档位运行期间不得并行任何构建**：用例共享 `build\zanc.exe` 与 stdlib stamp，
   并发的 build_gallery/build_ide 会让无关用例成片假红。
 
@@ -88,6 +104,11 @@ ctest 整档（smoke/standard/full，`scripts/test.ps1 <tier>` 或 `ctest -L <ti
 - 测试：`pwsh -File scripts/test.ps1 <tier> [-Match <name>]`。
 - 两把脚本共用一把跨进程锁（`scripts/build_gate.ps1`），拿不到就**排队等**
   （默认 30 分钟超时，超时报错而不是静默绕过）；看谁占着锁：`-Status`。
+- **排队也要看表，别干等**：排队前先 `-Status`。持锁者若已僵死（进程活着但
+  长时间无进展——例如测试子进程挂死），按孤儿处理：杀掉它的进程树，租约按
+  进程存活判定**自动失效**，下一个直接接手。教训（2026-11-04）：一颗卡死的
+  `selfhost_diff` 孙进程把锁占了 10+ 小时，另一会话在闸里陪等 10 小时没超时
+  ——机制写出来了也要看它有没有真在转，锁不是理由，是排队的原因。
 - **为什么是"等"而不是"另建一棵构建树"**：另建（`build_mine`、`zan-pkgs`…）
   是用磁盘换隔离——几百 MB 到 2 GB 的重复构建，公共包一改副本就漂移；副本没有
   让共享状态消失，只是把它藏起来，漂移照旧（实测一次并发多出 2.7 GB 重复构建

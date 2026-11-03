@@ -9,7 +9,9 @@
 #
 # 设计约束：
 #   * 只跑 A 档能判的（fmt / compile）。C/C++ 改动给重建命令，不假装能单文件判。
-#   * ctest 只给"已验证命中"的正则 + 命令，绝不自动跑 standard/full（发布门）。
+#   * ctest 只给"已验证命中"且预算内（policy.maxTargetedHits，默认 80）的正则 +
+#     命令，超预算只报不跑；绝不自动跑 standard/full（发布门）。
+#   * 验收一轮任务只做一次（收口时）：编辑循环里用本工具的 A 档判定 + 探针。
 #   * 退出码：0 全过；1 有 A 档失败；2 环境/参数问题。
 [CmdletBinding()]
 param(
@@ -104,6 +106,38 @@ function Resolve-CtestFromPath([string]$rel) {
         if ($p -and $p.count -gt 0) { return $p }
     }
     return [pscustomobject]@{ regex = $cands[0]; count = 0; sample = @() }
+}
+
+# ---- stdlib/packages/examples 的收窄：按 import 依赖推导，不盲跑粗前缀 -------
+# 旧映射给 stdlib 一律 "^conformance_"：一次命中 1181 条（≈92 CPU 分钟），而且
+# tests/conformance/<b>.zan 生成的用例名是 case_<b>，粗前缀根本匹配不到它们——
+# 双重错误，正是"改几行跑十几分钟"的根因。收窄必须基于真实依赖：
+#   改动文件 -> 命名空间（packages/Zan.Data/src/System/Data/Excel/Models/XlsxBook.zan
+#   -> System.Data.Excel.Models）-> git grep tests/ 找引用它的用例源 -> 锚定正则
+#   （case_<b> / conformance_gui_<b> / tool_<b>，刻意不含 det 孪生）。
+# 从最长命名空间向短试，第一个命中的就是最窄面。
+function Resolve-ImportNarrow([string]$rel) {
+    $m = [regex]::Match($rel, '/src/(.+)\.zan$')
+    if (-not $m.Success) { return $null }
+    $parts = (($m.Groups[1].Value -replace '\\', '/') -split '/')
+    if ($parts.Count -lt 2) { return $null }
+    for ($take = $parts.Count - 2; $take -ge 1; $take--) {
+        $candidate = ($parts[0..$take] -join '.')
+        if ($candidate -eq 'System') { break }   # 'System' 谁都引用，等于没收窄
+        $hitFiles = @(& git -C $Root grep -l -F -- "$candidate" -- tests 2>$null |
+            Where-Object { $_ -match '\.zan$' })
+        if ($hitFiles.Count -eq 0) { continue }
+        $names = @($hitFiles | ForEach-Object {
+            $b = [System.IO.Path]::GetFileNameWithoutExtension($_)
+            if ($_ -match '/tests/gui/') { "conformance_gui_$b" }
+            elseif ($_ -match '/tests/tools/') { "tool_$b" }
+            else { "case_$b" }
+        } | Sort-Object -Unique)
+        $re = '^(' + (($names | ForEach-Object { [regex]::Escape($_) }) -join '|') + ')$'
+        $probe = Get-CtestProbe $re
+        if ($probe -and $probe.count -gt 0) { return $probe }
+    }
+    return $null
 }
 
 # ---- targets -------------------------------------------------------------
@@ -271,23 +305,39 @@ foreach ($rel in $targets) {
 
             'ctest' {
                 $probe = $null
-                if ($ruleHit.rule.ctestFromPath) { $probe = Resolve-CtestFromPath $rel }
-                elseif ($ruleHit.rule.ctest) { $probe = Get-CtestProbe $ruleHit.rule.ctest }
+                $probeSrc = ''
+                if ($ruleHit.rule.ctestFromPath) { $probe = Resolve-CtestFromPath $rel; $probeSrc = 'path' }
+                elseif ($ruleHit.rule.narrowByImport) { $probe = Resolve-ImportNarrow $rel; $probeSrc = 'import' }
+                elseif ($ruleHit.rule.ctest) { $probe = Get-CtestProbe $ruleHit.rule.ctest; $probeSrc = 'rule' }
                 if (-not $probe) {
-                    $results += [pscustomobject]@{ check = 'ctest'; ok = $true; detail = 'build/ 未配置 ctest，跳过测试建议' }
+                    if ($probeSrc -eq 'import') {
+                        $results += [pscustomobject]@{ check = 'ctest'; ok = $true; detail = '非库源文件（无 /src/ 命名空间可推导）：直接编译运行这个程序/探针即可，或手工 -Match 锚定单条' }
+                    } else {
+                        $results += [pscustomobject]@{ check = 'ctest'; ok = $true; detail = 'build/ 未配置 ctest，跳过测试建议' }
+                    }
                     break
                 }
                 if ($probe.count -eq 0) {
                     $results += [pscustomobject]@{ check = 'ctest'; ok = $false; detail = ("映射失效：正则 '$($probe.regex)' 命中 0 条测试（测试改名了？）") }
                     break
                 }
-                $cmd = "scripts/test.ps1 smoke -Match `"$($probe.regex)`""
-                $results += [pscustomobject]@{ check = 'ctest'; ok = $true; detail = ("{0} 条命中 -> {1}" -f $probe.count, $cmd) }
+                # 命中面预算（AGENTS.md Rule 8 的机检闭环）：超预算只报不跑——
+                # test.ps1 那边同样机检，两边一致。
+                $maxHits = if ($Rules.policy.maxTargetedHits) { [int]$Rules.policy.maxTargetedHits } else { 80 }
+                if ($probe.count -gt $maxHits) {
+                    $results += [pscustomobject]@{ check = 'ctest'; ok = $false; detail = ("命中 {0} 条超预算 {1}：先收窄（更长命名空间 / 锚定单条 ^case_x$），不要硬跑大组" -f $probe.count, $maxHits) }
+                    break
+                }
+                $cmd = "scripts/test.ps1 -Match `"$($probe.regex)`""
+                $results += [pscustomobject]@{ check = 'ctest'; ok = $true; detail = ("{0} 条命中（{1} 收窄） -> {2}" -f $probe.count, $probeSrc, $cmd) }
                 $ctestPlans[$rel] = $probe
                 if ($RunTests -and -not $DryRun) {
-                    $rr = Invoke-Tool -Exe 'powershell' -Argv @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $TestEntry, 'smoke', '-Match', $probe.regex) -TimeoutMs 3600000
+                    # 不带档位：-Match 跨档匹配。旧写法 test.ps1 smoke -Match 会把
+                    # standard 档标签的 case_*/conformance_* 全滤掉，永远空跑。
+                    # test.ps1 侧另有预算与重复组机检；20 分钟对 ≤80 条足够。
+                    $rr = Invoke-Tool -Exe 'powershell' -Argv @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $TestEntry, '-Match', $probe.regex) -TimeoutMs 1200000
                     $tOk = ($rr.exit -eq 0)
-                    $results += [pscustomobject]@{ check = 'ctest-run'; ok = $tOk; detail = $(if ($tOk) { 'TEST_OK' } else { (($rr.text -split "`n" | Where-Object { $_ -match 'Fail|FAIL|TEST_FAIL' } | Select-Object -First 2) -join ' | ') }) }
+                    $results += [pscustomobject]@{ check = 'ctest-run'; ok = $tOk; detail = $(if ($tOk) { 'TEST_OK' } else { (($rr.text -split "`n" | Where-Object { $_ -match 'Fail|FAIL|TEST_FAIL|REJECTED' } | Select-Object -First 2) -join ' | ') }) }
                 }
             }
 

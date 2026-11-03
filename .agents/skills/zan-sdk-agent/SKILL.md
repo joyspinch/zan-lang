@@ -9,12 +9,13 @@ description: 在 zan-lang 源仓库里用配套工具干活：地图定位、影
 
 配套工具在 `tools/agent/`（本仓库自用）。它们只做判定得过的事，其余给命令。
 
-## 0. 四条硬规矩
+## 0. 五条硬规矩
 
 1. **定位不读文件，查地图。** 读文件只为了改它。
 2. **改动必有判定器。** 说不出跑哪条命令验证的改动，不做。
-3. **日常只跑 target 化测试。** `standard`/`full` 是发布门（AGENTS.md Rule 8），全套几千条用例，日常跑会占满所有核且与本改动无关。
+3. **日常只跑 target 化测试，一轮收口验证一次。** `standard`/`full` 是发布门（AGENTS.md Rule 8），全套 2860 条、full ≈10.6 CPU·h。**编辑循环里不跑 ctest**（编译/类型判定 + 探针）；一轮改完收口时跑一次收窄后的命中面（≤80 条，`scripts/test.ps1` 机检拒绝超预算；同组 10 分钟内重复跑也被拒）。单跑锚定：`ctest -R "^case_<name>$"`。
 4. **多文件项目必须枚举全部源。** zanc 不自动拉取同项目兄弟 `.zan`，单入口编译必报 `undefined type`。
+5. **验证零复制。** 探针在主树 `_scratch/`，用主树 `build\zanc.exe --auto-stdlib` 就地编译；测试在 `tests/` 经 ctest。为验证拉新目录、复制 stdlib/包/源码堆进去跑，一律不做（副本只制造漂移与重复构建；例外仅 §2 二分短命 worktree）。
 
 ## 1. 定向：地图三问（毫秒级）
 
@@ -65,7 +66,7 @@ tools/agent/verify.ps1 -Paths stdlib/System/IO/File.zan
 # 只预估，不执行
 tools/agent/verify.ps1 -Paths src/compiler/checker.c -DryRun
 
-# 真跑那一组（内部只用 smoke 档 + -Match）
+# 真跑那一组（-Match 跨档匹配 + 预算机检；超预算只报不跑）
 tools/agent/verify.ps1 -Paths tests/conformance/aes_gcm.zan -RunTests
 ```
 
@@ -83,8 +84,11 @@ tools/agent/verify.ps1 -Paths tests/conformance/aes_gcm.zan -RunTests
   `tools/<Tool>`）；多文件项目因此不再假红。**不用 `--deny-warnings`**：
   基线不干净时它会把 stdlib 既有告警升成错误（实测 stdlib/System/Threading
   `TaskCompletionSource.zan:101`），与本次改动无关。告警只报不拦。
-- **ctest**：正则不写死命中数，工具用 `ctest -N` 现场验证；命中 0 就报"映射失效"。
-  已验证的前缀见 `tools/agent/verify.rules.json`。
+- **ctest**：stdlib/packages/examples 按 **import 依赖现推**最小命中面（`narrowByImport`，
+  从最长命名空间向短试），C/C++ 等其余路径用已验证前缀（见 `verify.rules.json`）。
+  正则不写死命中数，工具用 `ctest -N` 现场验证：命中 0 报"映射失效"，**超预算
+  （80 条）只报不跑**。测试名映射：`tests/conformance/<b>.zan` → `case_<b>`（+
+  full 档孪生 `case_det_<b>`，日常别碰）、`tests/gui/<b>.zan` → `conformance_gui_<b>`。
 - **模板**：Windows 用 `tools/agent/gate-templates.ps1`（按 `template.manifest`
   + `zan.proj` 的声明做替换副本）；macOS 用 `scripts/test_all_templates.py`
   （官方脚本，硬编码 macOS 路径）。模板源带 `{{NAME}}` 占位符，**不能直接编译**。
@@ -126,4 +130,11 @@ tools/agent/impact.ps1 -Symbol 'File.ReadAllText'
 - 直接编译 `templates/**/App.zan`，或单文件编译多文件工具 → 必红，且不是真错。
 - 报"编译通过"但没跑判定器（`verify.ps1`，或等效的探针 + 受影响单用例）→ 不算验证。
 - `impact.ps1` 报跨边界，却只跑了单文件编译 → 漏改已发生。
-- 想跑 `scripts/test.ps1 standard` 来"确认一下" → 违反 Rule 8。
+- 想跑 `scripts/test.ps1 standard`（或裸 smoke，≈428 条）来"确认一下" → 违反 Rule 8，
+  预算机检也会直接拒绝。
+- **每改一处就重跑同一组 ctest** → 违反 Rule 8；重跑只重跑输出会变的那条（锚定单条）。
+- **拉新文件夹、复制一堆文件进去"验证"** → 违反 Rule 8 零复制；探针放 `_scratch/`，
+  主树编译。
+- **命中面超预算还硬跑 / 想用 -Force 绕** → 停：先 `verify.ps1 -Paths` 收窄。
+- 排队等构建锁前不看 `build_gate.ps1 -Status`，持锁者僵死还干等 → 先看锁，
+  持锁者进程活着但无进展数小时就是孤儿，杀树让租约自动失效。

@@ -270,18 +270,22 @@ trace 的事件序为准，不要顺着报表的站点名硬找。
 
 | 层级 | 命令 | 规模/时机 |
 |---|---|---|
-| 单例 | `cd build && ctest -R <name>` | 最窄验证，秒级；新增/受影响用例必跑 |
-| 按模式 | `scripts/test.ps1 <tier> -Match "<regex>"` | 再收窄一层 |
-| smoke | `scripts/test.ps1 smoke`（75 例） | 仅用户明确要求或发布门槛时跑 |
-| standard | `scripts/test.ps1 standard`（399 例） | 仅用户明确要求时跑 |
-| full | `scripts/test.ps1 full`（1035 例） | 发布门，几十分钟，绝不顺手跑 |
+| 单例 | `cd build && ctest -R "^<name>$"` | 最窄验证，秒级；**锚定**正则避开 `case_det_` 孪生（full 档双编译） |
+| 按模式 | `scripts/test.ps1 -Match "<regex>"` | 定向跑，**命中面机检 ≤80 条**（超预算拒绝并给收窄提示；不带档位跨档匹配） |
+| smoke | `scripts/test.ps1 smoke`（428 例） | 裸跑被预算机检拒绝；仅发布门（`-ReleaseGate`）或用户点名 |
+| standard | `scripts/test.ps1 standard`（1653 例） | 仅发布门（`-ReleaseGate`）或用户点名 |
+| full | `scripts/test.ps1 full`（2860 例，≈10.6 CPU·h） | 发布门，几十分钟，绝不顺手跑 |
 | 模板门 | `cd build && ctest -R templates_build` | 脚手架全部模板逐一编译 |
 
-纪律（AGENTS.md 规则 8 的命令面）：ctest 不是默认验证步骤——平时直接编
-受影响程序、单跑受影响用例（`ctest -R <name>`，秒级）；整档 smoke/standard/
-full 会把 CPU 打满几十分钟，**只在用户明确要求或发布门槛时跑**，小改之后
-不要复读整档。**测试运行期间不得并行任何构建**（用例共享 build\zanc.exe
-与 stdlib stamp，并发构建会让无关用例成批假红）。
+例数是 2026-11-04 的实测（`ctest -N -L <tier>`），会漂移，现查为准。
+
+纪律（AGENTS.md 规则 8 的命令面）：ctest 不是默认验证步骤，**验收一轮任务
+只做一次（收口时）**——编辑循环里直接编受影响程序/跑探针，改几行就重跑一组
+是违规（同组 10 分钟内重复跑会被机检拒绝）；单跑受影响用例用锚定正则；命中
+面超 80 条先收窄（`tools/agent/verify.ps1 -Paths` 按 import 依赖现推）；整档
+smoke/standard/full 会把 CPU 打满几十分钟，**只在用户明确要求或发布门槛时
+跑**。**测试运行期间不得并行任何构建**（用例共享 build\zanc.exe 与 stdlib
+stamp，并发构建会让无关用例成批假红）。
 
 ### 新增 conformance 用例的最短路径
 1. `tests/conformance/<name>.zan` + 金样 `tests/conformance/<name>.out`

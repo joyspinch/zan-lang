@@ -1,14 +1,19 @@
-﻿# Runs one tier of the test suite (see the "Test tiers" block in CMakeLists).
+﻿# Runs ctest. Tier runs (no -Match) are RELEASE GATES ONLY; routine verification
+# is targeted and budget-checked:
 #
-#   scripts\test.ps1                 # smoke: compiler gates only (~300 cases)
-#   scripts\test.ps1 standard -ReleaseGate  # RELEASE GATE ONLY: 1000+ full programs
-# 契约：测试套件与发布门控调度规范
-#   scripts\test.ps1 smoke -Match gui       # targeted: only tests matching a regex
+#   scripts\test.ps1 -Match "case_xlsx_write"        # targeted, all tiers, ≤80 hits
+#   scripts\test.ps1 -Match "^(case_a|case_b)$"      # anchored: never hits the det twin
+#   scripts\test.ps1 smoke -ReleaseGate              # RELEASE GATE ONLY (~406 cases)
+#   scripts\test.ps1 standard -ReleaseGate           # RELEASE GATE ONLY (~2558 cases)
 #
-# IMPORTANT: Per AGENTS.md Rule 8, full tier runs (standard / full without -Match)
-# are RELEASE GATES ONLY. Do NOT run them as routine or pre-commit checks.
-# Routine verification must be targeted: build a probe or run:
-#   ctest -R <test_name> --output-on-failure
+# IMPORTANT: Per AGENTS.md Rule 8, tier runs without -Match are RELEASE GATES
+# ONLY, NEVER routine verification. Machine-enforced below (机制落地，不靠自觉):
+#   * budget guard: ANY run whose ctest hit count exceeds -MaxMatch (default 80)
+#     is refused — smoke included. 单跑一条是秒级；一组上百条在缓存失效时就是十几分钟。
+#   * rerun guard: the same -Match group twice within -RecheckMin (default 10 min)
+#     is refused — rerun only the single test whose output changed.
+#   * targeted runs (-Match) automatically exclude the full-tier det twins
+#     (^case_det_) — that lens costs two compiles per case and is release-gate only.
 #
 # Nothing else may compile while this runs: the cases share build\zanc.exe and
 # the stdlib stamp, so a concurrent build makes unrelated cases fail.
@@ -17,6 +22,8 @@ param(
     [string]$Tier = 'smoke',
     [string]$Match = '',
     [int]$Jobs = 0,
+    [int]$MaxMatch = 80,
+    [int]$RecheckMin = 10,
     [switch]$ReleaseGate,
     [switch]$Force
 )
@@ -28,22 +35,79 @@ if ($Jobs -le 0) { $Jobs = [Environment]::ProcessorCount }
 # 契约：多平台交叉编译与驱动打包管线
 # 契约：测试套件与发布门控调度规范
 # 契约：工程辅助自动化与脚本执行规范
-if (($Tier -eq 'standard' -or $Tier -eq 'full') -and $Match -eq '' -and -not $ReleaseGate -and -not $Force -and -not $env:CI -and -not $env:ZAN_RELEASE_GATE) {
+$TierExplicit = $PSBoundParameters.ContainsKey('Tier')
+$TierName = if ($TierExplicit) { $Tier } elseif ($Match -ne '') { 'targeted' } else { $Tier }
+$gateSkip = $Force -or $ReleaseGate -or $env:CI -or $env:ZAN_RELEASE_GATE
+$ctestBase = @('--test-dir', (Join-Path $root 'build'), '-C', 'Release')
+
+# ---- 防呆门 1：整档（无 -Match）是发布门，日常验证拒绝 ----------------------
+# （standard/full 裸跑在这里被拒；smoke 裸跑 ≈406 条，由门 2 的预算机检拦住）
+if (($Tier -eq 'standard' -or $Tier -eq 'full') -and $Match -eq '' -and -not $gateSkip) {
     Write-Host "[test] REJECTED: Running '$Tier' tier without -Match compiles 1000+ full programs and saturates all CPU cores." -ForegroundColor Red
     Write-Host "[test] Per AGENTS.md Rule 8, full-tier runs are RELEASE GATES ONLY, NEVER routine development verification." -ForegroundColor Yellow
     Write-Host "[test] - For routine/iterative verification, run the single affected test or probe:" -ForegroundColor Cyan
     Write-Host "    ctest -R <name> --output-on-failure"
-    Write-Host "    scripts\test.ps1 $Tier -Match <name>"
+    Write-Host "    scripts\test.ps1 -Match <name>"
     Write-Host "[test] - If this is an intentional release gate run, add -ReleaseGate:" -ForegroundColor Cyan
     Write-Host "    scripts\test.ps1 $Tier -ReleaseGate"
     exit 1
 }
 
-$ctestArgs = @('--test-dir', (Join-Path $root 'build'), '-C', 'Release',
-               '-j', $Jobs, '--output-on-failure', '-L', $Tier)
-if ($Match -ne '') { $ctestArgs += @('-R', $Match) }
+if (-not $gateSkip) {
+    # ---- 防呆门 2：命中面预算（ctest -N 先数，秒级）-------------------------
+    # 任何档位、任何调用方：命中数超 -MaxMatch 一律拒绝。这不是刁难——
+    # 预算内的一组在缓存命中时是几十秒，超预算的一组在 zanc/stdlib 刚变过时
+    # 就是十几分钟起步。"想确认一下就跑一大组"正是要拦的行为。
+    $probeArgs = $ctestBase + @('-N')
+    if ($TierExplicit -or $Match -eq '') { $probeArgs += @('-L', $Tier) }   # 裸跑 = smoke 档，别全档
+    if ($Match -ne '') { $probeArgs += @('-R', $Match) }
+    $probeOut = (& ctest @probeArgs 2>&1 | Out-String)
+    $hitNames = @([regex]::Matches($probeOut, 'Test\s+#\d+:\s*(\S+)') | ForEach-Object { $_.Groups[1].Value })
+    $hits = $hitNames.Count
+    if ($hits -gt $MaxMatch) {
+        Write-Host "[test] REJECTED: 命中 $hits 条测试，超预算 $MaxMatch（命中面预算机检，AGENTS.md Rule 8）。" -ForegroundColor Red
+        Write-Host "[test] 先收窄再跑，不要硬跑大组：" -ForegroundColor Yellow
+        Write-Host "[test] - 用 tools\agent\verify.ps1 -Paths <改动文件> 按 import 依赖推导最小命中面" -ForegroundColor Cyan
+        Write-Host "[test] - 锚定单条：ctest -R `"^<name>$`"（注意 det 孪生 case_det_* 只属 full，别误中）" -ForegroundColor Cyan
+        Write-Host "[test] - 确要跑大组/整档：加 -Force（发布门用 -ReleaseGate，并先看 build_gate.ps1 -Status）" -ForegroundColor Cyan
+        Write-Host ("[test] 命中样例： " + (($hitNames | Select-Object -First 12) -join ', '))
+        exit 1
+    }
 
-Write-Host "[test] tier=$Tier jobs=$Jobs$(if ($Match) { " match=$Match" })"
+    # ---- 防呆门 3：同组重复跑 -----------------------------------------------
+    # 一轮任务收口时验证一次。"每改一处就重跑整组"不是勤奋是内耗——重跑只重跑
+    # 输出会变的那条。状态记在 build\test-out\，跨会话共享。
+    if ($Match -ne '') {
+        $stateDir = Join-Path $root 'build\test-out'
+        $stateFile = Join-Path $stateDir '.last-targeted.json'
+        $nowUnix = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+        $prev = $null
+        if (Test-Path $stateFile) {
+            try { $prev = Get-Content $stateFile -Raw -ErrorAction Stop | ConvertFrom-Json } catch { }
+        }
+        if ($prev -and "$($prev.match)" -eq $Match -and (($nowUnix - [int64]$prev.unixTime) -lt ($RecheckMin * 60))) {
+            Write-Host "[test] REJECTED: 同一组 -Match '$Match' 在 $RecheckMin 分钟内已跑过（重复组机检）。" -ForegroundColor Red
+            Write-Host "[test] 改动之后只重跑输出会变的那条：ctest -R `"^<name>$`"；确要重跑整组加 -Force。" -ForegroundColor Yellow
+            exit 1
+        }
+        if (-not (Test-Path $stateDir)) { New-Item -ItemType Directory -Force -Path $stateDir | Out-Null }
+        @{ match = $Match; unixTime = $nowUnix } | ConvertTo-Json | Set-Content -Path $stateFile -Encoding ASCII
+    }
+}
+
+# -Match 给了而档位没显式给 → 不加 -L，让 -R 跨档匹配。旧写法 -L smoke 会把
+# conformance/case（standard 档标签）全部滤掉，永远 "No tests were found"，
+# 会话拿不到绿灯就误判升级去跑更大的档。无 -Match 时保留档位过滤（裸跑 = smoke）。
+$ctestArgs = $ctestBase + @('-j', $Jobs, '--output-on-failure')
+if ($TierExplicit -or $Match -eq '') { $ctestArgs += @('-L', $Tier) }
+if (-not $gateSkip -and $Match -ne '') {
+    # det 孪生（determinism lens，每案双编译、百秒级）只属发布门：日常定向跑
+    # 一律排除，别让一条 -Match 悄悄把成本翻倍。
+    $ctestArgs += @('-R', $Match, '-E', '^case_det_')
+}
+elseif ($Match -ne '') { $ctestArgs += @('-R', $Match) }
+
+Write-Host "[test] tier=$TierName jobs=$Jobs$(if ($Match) { " match=$Match" })$(if (-not $gateSkip) { " budget=$MaxMatch" })"
 
 # ---- 产物收口：测试跑完不留垃圾，汇总日志合并成一份 ----------------------
 # 用例产物已经全部收进 build\cases\（CMakeLists 里统一改的路径），跑完只按
@@ -102,7 +166,7 @@ if (Test-Path $logFile) {
     $outDir = Join-Path $buildDir 'test-out'
     New-Item -ItemType Directory -Force -Path $outDir | Out-Null
     $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
-    $archive = Join-Path $outDir "$Tier-$stamp.log"
+    $archive = Join-Path $outDir "$TierName-$stamp.log"
     Copy-Item -LiteralPath $logFile -Destination $archive -Force
     Get-ChildItem -LiteralPath $outDir -File -Filter '*.log' -ErrorAction SilentlyContinue |
         Sort-Object LastWriteTime -Descending | Select-Object -Skip 5 |
@@ -133,6 +197,6 @@ if ($removedMid -gt 0) {
 }
 
 Remove-Item -LiteralPath $logFile -Force -ErrorAction SilentlyContinue
-if ($code -eq 0) { Write-Host "TEST_OK tier=$Tier" }
-else { Write-Host "TEST_FAIL tier=$Tier exit=$code" }
+if ($code -eq 0) { Write-Host "TEST_OK tier=$TierName" }
+else { Write-Host "TEST_FAIL tier=$TierName exit=$code" }
 exit $code
