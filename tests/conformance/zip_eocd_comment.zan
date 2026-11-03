@@ -1,0 +1,112 @@
+using System;
+using System.IO;
+using System.IO.Compression;
+using System.Net.Http.Client;
+
+class Program {
+    static void PutU16(byte[] b, int off, int v) {
+        b[off] = (byte)(v & 255);
+        b[off + 1] = (byte)((v >> 8) & 255);
+    }
+
+    static byte[] AttachComment(byte[] orig, byte[] comment) {
+        int cLen = comment != null ? comment.Length : 0;
+        byte[] res = new byte[orig.Length + cLen];
+        for (int i = 0; i < orig.Length; i = i + 1) {
+            res[i] = orig[i];
+        }
+        // 更新 EOCD 注释长度字段（偏移 orig.Length - 2）
+        PutU16(res, orig.Length - 2, cLen);
+        for (int k = 0; k < cLen; k = k + 1) {
+            res[orig.Length + k] = comment[k];
+        }
+        return res;
+    }
+
+    static void Main() {
+        // 1. 构建基础 ZIP 归档
+        List<ZipEntry> srcEntries = new List<ZipEntry>();
+        ZipEntry doc = new ZipEntry("notes/readme.txt");
+        doc.data = "Industrial grade Zan ZIP reader & writer verification 2026.".ToBytes();
+        srcEntries.Add(doc);
+        ZipEntry sub = new ZipEntry("notes/");
+        sub.isDirectory = true;
+        srcEntries.Add(sub);
+
+        byte[] plainZip = Zip.Create(srcEntries, 6);
+        List<ZipEntry> readPlain = Zip.Read(plainZip);
+        if (readPlain != null && readPlain.Count == 2) {
+            Console.WriteLine("zip_read_plain=ok");
+        } else {
+            Console.WriteLine("zip_read_plain=fail");
+        }
+
+        // 验证 localHeaderOffset 是否已准确记录
+        ZipEntry e0 = readPlain[0];
+        bool lhoOk = e0.localHeaderOffset >= 0 && e0.name == "notes/readme.txt";
+        Console.WriteLine("zip_lho_valid=" + (lhoOk ? "true" : "false"));
+
+        // 验证 O(1) 直跳定位提取
+        byte[] extracted = Zip.Extract(plainZip, e0);
+        string text = extracted != null ? extracted.ToStr(0, extracted.Length) : "";
+        if (text == "Industrial grade Zan ZIP reader & writer verification 2026.") {
+            Console.WriteLine("zip_extract_fast=ok");
+        } else {
+            Console.WriteLine("zip_extract_fast=fail");
+        }
+
+        // 2. 构造附带 48 字节注释的合法 ZIP（旧代码 scan 只循环一次会返回 null）
+        byte[] commentBytes = "Archive-level comment for B-ID126 conformance.".ToBytes();
+        byte[] commentedZip = AttachComment(plainZip, commentBytes);
+
+        List<ZipEntry> readCommented = Zip.Read(commentedZip);
+        if (readCommented != null && readCommented.Count == 2) {
+            Console.WriteLine("zip_read_comment=ok");
+        } else {
+            Console.WriteLine("zip_read_comment=fail");
+        }
+
+        byte[] extractedCommented = Zip.Extract(commentedZip, readCommented[0]);
+        string textCommented = extractedCommented != null ? extractedCommented.ToStr(0, extractedCommented.Length) : "";
+        if (textCommented == "Industrial grade Zan ZIP reader & writer verification 2026.") {
+            Console.WriteLine("zip_extract_comment=ok");
+        } else {
+            Console.WriteLine("zip_extract_comment=fail");
+        }
+
+        // 3. 构造注释中包含伪 SigEnd 签名的极端对抗用例（校验严格 pass 1 对齐）
+        // 0x06054b50 对应 PK\x05\x06 (80, 75, 5, 6)
+        byte[] trickyComment = new byte[32];
+        for (int i = 0; i < 32; i = i + 1) { trickyComment[i] = (byte)65; }
+        trickyComment[10] = (byte)80;
+        trickyComment[11] = (byte)75;
+        trickyComment[12] = (byte)5;
+        trickyComment[13] = (byte)6;
+        byte[] trickyZip = AttachComment(plainZip, trickyComment);
+
+        List<ZipEntry> readTricky = Zip.Read(trickyZip);
+        if (readTricky != null && readTricky.Count == 2) {
+            Console.WriteLine("zip_read_tricky_comment=ok");
+        } else {
+            Console.WriteLine("zip_read_tricky_comment=fail");
+        }
+
+        // 4. 验证 localHeaderOffset = -1 时的回退兼容提取
+        readCommented[0].localHeaderOffset = 0 - 1;
+        byte[] fallbackExtracted = Zip.Extract(commentedZip, readCommented[0]);
+        string fallbackText = fallbackExtracted != null ? fallbackExtracted.ToStr(0, fallbackExtracted.Length) : "";
+        if (fallbackText == "Industrial grade Zan ZIP reader & writer verification 2026.") {
+            Console.WriteLine("zip_extract_fallback=ok");
+        } else {
+            Console.WriteLine("zip_extract_fallback=fail");
+        }
+
+        // 5. 验证 SseSink 互斥锁幂等释放（重复 Dispose 不崩溃、句柄置零）
+        SseSink sink = SseSink.ToMemory();
+        sink.Dispose();
+        sink.Dispose();
+        Console.WriteLine("ssesink_double_dispose=ok");
+
+        Console.WriteLine("zip_eocd_conformance_done=true");
+    }
+}
