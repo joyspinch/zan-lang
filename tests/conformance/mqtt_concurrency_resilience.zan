@@ -1,0 +1,158 @@
+using System;
+using System.Collections.Generic;
+using System.Net;
+using System.Net.Mqtt;
+using System.Net.Sockets;
+using System.Threading;
+
+class Program {
+    const int PORT = 28845;
+
+    static void Check(bool cond, string label) {
+        if (cond) {
+            Console.WriteLine("ok   " + label);
+        } else {
+            Console.WriteLine("BAD  " + label);
+        }
+    }
+
+    static async void BackgroundReceiver(MqttClient sub, List<string> received, int expected) {
+        while (sub.IsConnected() && received.Count < expected) {
+            string msg = await sub.ReceiveAsync();
+            if (msg != null && msg.Length > 0) {
+                received.Add(msg);
+            } else if (!sub.IsConnected()) {
+                break;
+            }
+        }
+    }
+
+    static async void PublishBatchQos1(MqttClient pub, string topicPrefix, int start, int count, List<int> sentCounts) {
+        int ok = 0;
+        for (int i = 0; i < count; i = i + 1) {
+            string msg = "qos1_" + Convert.ToString(start + i);
+            int sent = await pub.PublishAsync(topicPrefix, msg, MqttQos.AtLeastOnce);
+            if (sent > 0) {
+                ok = ok + 1;
+            }
+        }
+        sentCounts.Add(ok);
+    }
+
+    static async void PublishBatchQos2(MqttClient pub, string topicPrefix, int start, int count, List<int> sentCounts) {
+        int ok = 0;
+        for (int i = 0; i < count; i = i + 1) {
+            string msg = "qos2_" + Convert.ToString(start + i);
+            int sent = await pub.PublishAsync(topicPrefix, msg, MqttQos.ExactlyOnce);
+            if (sent > 0) {
+                ok = ok + 1;
+            }
+        }
+        sentCounts.Add(ok);
+    }
+
+    static async int Run() {
+        // 1. 未连接保护
+        MqttClient dead = new MqttClient();
+        Check(!dead.IsConnected(), "unconnected client reports false");
+        int r1 = await dead.PublishAsync("t", "m", 0);
+        int r2 = await dead.SubscribeAsync("t", 0);
+        int r3 = await dead.UnsubscribeAsync("t");
+        int r4 = await dead.PingAsync();
+        int r5 = await dead.DisconnectAsync();
+        string m1 = await dead.ReceiveAsync();
+        byte[] b1 = await dead.ReceiveBytesAsync();
+        dead.Abort();
+        dead.Dispose();
+        Check(r1 < 0 && r2 < 0 && r3 < 0 && r4 < 0 && r5 < 0 && m1 == "" && b1 == null, "unconnected operations safe");
+
+        // 2. 启动 Broker 与全双工测试环境
+        Socket.Initialize();
+        Worker broker = new Worker("mqtt", "127.0.0.1", PORT);
+        WorkerMqtt.Install();
+
+        nint listenSock = broker.BindSocket(false);
+        if (listenSock < 0) {
+            Console.WriteLine("BAD  broker bind failed");
+            return 1;
+        }
+        List<nint> socks = new List<nint>();
+        socks.Add(listenSock);
+        Task.Spawn(Worker.RunAllLoopsOnSockets(socks));
+
+        // 3. 建立连接与订阅
+        MqttClient sub = null;
+        for (int i = 0; i < 50; i = i + 1) {
+            sub = await MqttClient.ConnectAsync("127.0.0.1", PORT, "sub_resilience");
+            if (sub != null && sub.IsConnected()) { break; }
+            Thread.Sleep(20);
+        }
+        Check(sub != null && sub.IsConnected(), "sub client connected");
+
+        int subSent = await sub.SubscribeAsync("test/resilience/#", MqttQos.AtLeastOnce);
+        Check(subSent > 0, "sub subscribed with qos1");
+
+        MqttClient pub = await MqttClient.ConnectAsync("127.0.0.1", PORT, "pub_resilience");
+        Check(pub != null && pub.IsConnected(), "pub client connected");
+
+        // 4. 并发全双工收发与 PID 精确匹配
+        // 启动后台接收协程，等待 12 条消息
+        List<string> received = new List<string>();
+        Task.Spawn(BackgroundReceiver(sub, received, 12));
+
+        // 同时启动 3 个并发发送任务（交织 QoS 1 与 QoS 2 发布）
+        List<int> sentCounts1 = new List<int>();
+        List<int> sentCounts2 = new List<int>();
+        List<int> sentCounts3 = new List<int>();
+
+        Task.Spawn(PublishBatchQos1(pub, "test/resilience/t1", 1, 5, sentCounts1));
+        Task.Spawn(PublishBatchQos1(pub, "test/resilience/t2", 6, 4, sentCounts2));
+        Task.Spawn(PublishBatchQos2(pub, "test/resilience/t3", 10, 3, sentCounts3));
+
+        // 在并发发送期间穿插 Ping 保活
+        int pingSent = await pub.PingAsync();
+        Check(pingSent > 0, "concurrent ping succeeded");
+
+        // 等待所有发送协程完成（总计 12 条）
+        for (int i = 0; i < 100; i = i + 1) {
+            if (sentCounts1.Count > 0 && sentCounts2.Count > 0 && sentCounts3.Count > 0) {
+                break;
+            }
+            await Task.Delay(20);
+        }
+        int totalSent = (sentCounts1.Count > 0 ? sentCounts1[0] : 0) +
+                        (sentCounts2.Count > 0 ? sentCounts2[0] : 0) +
+                        (sentCounts3.Count > 0 ? sentCounts3[0] : 0);
+        Check(totalSent == 12, "all 12 concurrent publishes completed");
+
+        // 等待接收协程收齐 12 条消息
+        for (int i = 0; i < 100; i = i + 1) {
+            if (received.Count >= 12) { break; }
+            await Task.Delay(20);
+        }
+        Check(received.Count == 12, "all 12 messages received via background receiver");
+
+        // 5. 优雅断开与等待者清空唤醒
+        await pub.DisconnectAsync();
+        Check(!pub.IsConnected(), "pub disconnected cleanly");
+
+        sub.Abort();
+        Check(!sub.IsConnected(), "sub aborted cleanly");
+
+        // 6. 宿主资源收尾
+        broker.Stop();
+        Socket.Close(listenSock);
+        WorkerMqtt.Uninstall();
+        for (int i = 0; i < 20; i = i + 1) { await Task.Delay(10); }
+
+        Console.WriteLine("mqtt_concurrency_done=true");
+        return 0;
+    }
+
+    static void Main() {
+        int r = await Run();
+        if (r != 0) {
+            Environment.Exit(r);
+        }
+    }
+}

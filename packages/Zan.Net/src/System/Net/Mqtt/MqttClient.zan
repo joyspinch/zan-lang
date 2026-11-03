@@ -1,9 +1,11 @@
 using System;
+using System.Collections.Generic;
 using System.Net.Sockets;
+using System.Threading;
 
 namespace System.Net.Mqtt;
 
-// MQTT v3.1.1 控制报文类型（固定头第一个字节的高 4 位）。
+// MQTT v3.1.1 客户端（支持全双工、并发发布与协程安全收发）。
 public class MqttClient : IDisposable {
     TcpClient conn;
     MqttReader reader;
@@ -19,6 +21,12 @@ public class MqttClient : IDisposable {
     bool willRetain;
     bool hasWill;
     List<MqttPacket> pendingPackets;
+
+    Mutex stateLock;
+    bool sendBusy;
+    List<AsyncGate> sendWaiters;
+    bool recvBusy;
+    List<AsyncGate> recvWaiters;
 
     [DllImport("crt")]
     private static extern long strlen(string str);
@@ -37,6 +45,11 @@ public class MqttClient : IDisposable {
         this.willRetain = false;
         this.hasWill = false;
         this.pendingPackets = new List<MqttPacket>();
+        this.stateLock = new Mutex();
+        this.sendBusy = false;
+        this.sendWaiters = new List<AsyncGate>();
+        this.recvBusy = false;
+        this.recvWaiters = new List<AsyncGate>();
     }
 
     // 设置客户端遗嘱（LWT）属性，在连接建立前配置。
@@ -48,77 +61,198 @@ public class MqttClient : IDisposable {
         this.hasWill = true;
     }
 
-    // ---- 帧解析辅助 ----
-    // 单次 Socket recv 只返回当前可用的字节，
-    // 可能不足一个完整 MQTT 报文（TCP 是字节流）。这些辅助函数
-    // 会在 reactor 上等待并重读，直到读够精确字节数 / 组装出完整报文，
-    // 使控制报文解析与负载提取
-    // 无论 broker 如何分段写入都能保持对齐。
-
-    // 它们通过真正的重叠接收（RecvOv）读取：单次 recv 只返回
-    // 当前可用的字节，而 ReadReady 的零字节可读性探测会在数据
-    // 尚未到达时立即完成，此时 Recv 返回的 would-block（-1）会被
-    // 误判成对端关闭。RecvOv 投递真正的接收操作，只有读到数据
-    // 或对端关闭时才完成；返回 0（或负数，运行时按对端关闭上报）
-    // 即流结束。MQTT 报文含 NUL 字节，因此也不能用依赖字符串
-    // 长度的接收接口。
-
-    // 精确读取一个字节，对端关闭时返回 -1。
-    async int ReadByteAsync() {
-        nint sock = this.conn.GetSocket();
-        byte[] b = new byte[2];
-        int n = await Socket.RecvOv(sock, b, 1);
-        if (n <= 0) {
-            this.connected = false;
-            return -1;
+    // 线程安全分配下一个报文标识符（Packet Identifier，1-65535）。
+    int GetNextPacketId() {
+        this.stateLock.WaitOne();
+        int pid = this.nextPacketId;
+        this.nextPacketId = this.nextPacketId + 1;
+        if (this.nextPacketId > 65535) {
+            this.nextPacketId = 1;
         }
-        return b[0] & 255;
+        this.stateLock.ReleaseMutex();
+        return pid;
     }
 
-    // 在 IO reactor 上挂起，精确读取 <paramref name="need"/> 字节，
-    // 直到所需的多次 recv 全部完成。
-    async byte[] ReadBytesAsync(int need) {
-        byte[] buf = new byte[need + 1];
-        byte[] tmp = new byte[need + 1];
-        nint sock = this.conn.GetSocket();
-        int got = 0;
-        while (got < need) {
-            int n = await Socket.RecvOv(sock, tmp, need - got);
-            if (n <= 0) {
-                this.connected = false;
-                return buf;
-            }
-            for (int i = 0; i < n; i = i + 1) {
-                buf[got] = (byte)(tmp[i]);
-                got = got + 1;
-            }
+    // ---- 发送互斥锁（协程所有权直接移交，杜绝并发插队与出站报文碎片交错） ----
+    void WakeSendWaiters() {
+        this.stateLock.WaitOne();
+        this.sendBusy = false;
+        while (this.sendWaiters.Count > 0) {
+            AsyncGate g = this.sendWaiters[0];
+            this.sendWaiters.RemoveAt(0);
+            g.Signal();
         }
-        return buf;
+        this.stateLock.ReleaseMutex();
     }
 
-    // 解码 MQTT "remaining length" varint（1-4 字节）。
-    async int ReadRemainingLenAsync() {
-        int multiplier = 1;
-        int acc = 0;
-        int encoded = 128;
-        while ((encoded & 128) != 0) {
-            // MQTT 变长编码最多 4 字节；无上限时一串连续的 0x80
-            // 让本循环无限自旋（恶意 broker 的每连接 CPU DoS）。
-            if (multiplier > 128 * 128 * 128) {
-                this.connected = false;
-                return -1;
-            }
-            encoded = await ReadByteAsync();
-            if (encoded < 0) {
-                // varint 中途对端关闭：把不完整的累计值当成功
-                // 返回会让上层把残包当真报文解析。
-                this.connected = false;
-                return -1;
-            }
-            acc = acc + (encoded & 127) * multiplier;
-            multiplier = multiplier * 128;
+    async bool AcquireSendAsync() {
+        AsyncGate g = null;
+        this.stateLock.WaitOne();
+        if (!this.connected || this.conn == null) {
+            this.stateLock.ReleaseMutex();
+            return false;
         }
-        return acc;
+        if (!this.sendBusy && this.sendWaiters.Count == 0) {
+            this.sendBusy = true;
+            this.stateLock.ReleaseMutex();
+            return true;
+        }
+        g = new AsyncGate();
+        this.sendWaiters.Add(g);
+        this.stateLock.ReleaseMutex();
+
+        await g.Wait();
+        g.Close();
+
+        this.stateLock.WaitOne();
+        if (!this.connected || this.conn == null) {
+            if (this.sendWaiters.Count > 0) {
+                AsyncGate next = this.sendWaiters[0];
+                this.sendWaiters.RemoveAt(0);
+                next.Signal();
+            } else {
+                this.sendBusy = false;
+            }
+            this.stateLock.ReleaseMutex();
+            return false;
+        }
+        this.stateLock.ReleaseMutex();
+        return true;
+    }
+
+    void ReleaseSend() {
+        this.stateLock.WaitOne();
+        if (this.sendWaiters.Count > 0) {
+            AsyncGate next = this.sendWaiters[0];
+            this.sendWaiters.RemoveAt(0);
+            next.Signal();
+        } else {
+            this.sendBusy = false;
+        }
+        this.stateLock.ReleaseMutex();
+    }
+
+    // 在出站互斥保护下串行发送完整报文，消除 TCP 碎片交织。
+    async int SendBytesLockedAsync(byte[] packet, int length) {
+        if (packet == null || length <= 0) { return 0; }
+        if (!await this.AcquireSendAsync()) { return -1; }
+        int sent = -1;
+        if (this.connected && this.conn != null) {
+            sent = await this.conn.SendBytesAsync(packet, length);
+        }
+        this.ReleaseSend();
+        return sent;
+    }
+
+    // ---- 接收互斥锁（串行化底层 MqttReader，杜绝缓冲区指针撕裂与乱序错位） ----
+    void WakeRecvWaiters() {
+        this.stateLock.WaitOne();
+        this.recvBusy = false;
+        while (this.recvWaiters.Count > 0) {
+            AsyncGate g = this.recvWaiters[0];
+            this.recvWaiters.RemoveAt(0);
+            g.Signal();
+        }
+        this.stateLock.ReleaseMutex();
+    }
+
+    async bool AcquireRecvAsync() {
+        AsyncGate g = null;
+        this.stateLock.WaitOne();
+        if (!this.connected || this.conn == null) {
+            this.stateLock.ReleaseMutex();
+            return false;
+        }
+        if (!this.recvBusy && this.recvWaiters.Count == 0) {
+            this.recvBusy = true;
+            this.stateLock.ReleaseMutex();
+            return true;
+        }
+        g = new AsyncGate();
+        this.recvWaiters.Add(g);
+        this.stateLock.ReleaseMutex();
+
+        await g.Wait();
+        g.Close();
+
+        this.stateLock.WaitOne();
+        if (!this.connected || this.conn == null) {
+            if (this.recvWaiters.Count > 0) {
+                AsyncGate next = this.recvWaiters[0];
+                this.recvWaiters.RemoveAt(0);
+                next.Signal();
+            } else {
+                this.recvBusy = false;
+            }
+            this.stateLock.ReleaseMutex();
+            return false;
+        }
+        this.stateLock.ReleaseMutex();
+        return true;
+    }
+
+    void ReleaseRecv() {
+        this.stateLock.WaitOne();
+        if (this.recvWaiters.Count > 0) {
+            AsyncGate next = this.recvWaiters[0];
+            this.recvWaiters.RemoveAt(0);
+            next.Signal();
+        } else {
+            this.recvBusy = false;
+        }
+        this.stateLock.ReleaseMutex();
+    }
+
+    // 校验报文是否满足期望类型与报文标识符（PID）。
+    bool MatchPacket(MqttPacket pkt, int expectedType, int expectedPid) {
+        if (pkt == null) { return false; }
+        if (expectedType < 0) { return true; }
+        if (pkt.packetType != expectedType) { return false; }
+        if (expectedPid < 0) { return true; }
+        if (pkt.packetType == MqttPacketType.PUBLISH) {
+            int qos = (pkt.flags >> 1) & 3;
+            if (qos == 0 || pkt.body == null || pkt.bodyLen < 4) { return false; }
+            int topicLen = ((pkt.body[0] & 255) << 8) | (pkt.body[1] & 255);
+            int offset = 2 + topicLen;
+            if (offset + 2 > pkt.bodyLen) { return false; }
+            int pid = ((pkt.body[offset] & 255) << 8) | (pkt.body[offset + 1] & 255);
+            return pid == expectedPid;
+        }
+        if (pkt.bodyLen >= 2 && pkt.body != null) {
+            int pid = ((pkt.body[0] & 255) << 8) | (pkt.body[1] & 255);
+            return pid == expectedPid;
+        }
+        return false;
+    }
+
+    // 从待处理缓冲队列中原子弹出满足期望的报文。
+    MqttPacket PopPending(int expectedType, int expectedPid) {
+        this.stateLock.WaitOne();
+        if (this.pendingPackets == null || this.pendingPackets.Count == 0) {
+            this.stateLock.ReleaseMutex();
+            return null;
+        }
+        for (int i = 0; i < this.pendingPackets.Count; i = i + 1) {
+            MqttPacket pkt = this.pendingPackets[i];
+            if (this.MatchPacket(pkt, expectedType, expectedPid)) {
+                this.pendingPackets.RemoveAt(i);
+                this.stateLock.ReleaseMutex();
+                return pkt;
+            }
+        }
+        this.stateLock.ReleaseMutex();
+        return null;
+    }
+
+    // 向待处理队列原子放入报文。
+    void PushPending(MqttPacket pkt) {
+        if (pkt == null) { return; }
+        this.stateLock.WaitOne();
+        if (this.pendingPackets == null) {
+            this.pendingPackets = new List<MqttPacket>();
+        }
+        this.pendingPackets.Add(pkt);
+        this.stateLock.ReleaseMutex();
     }
 
     // MQTT "remaining length" varint 编码所需的字节数（1-4）。
@@ -156,53 +290,83 @@ public class MqttClient : IDisposable {
 
     // 从待处理缓冲队列或底层网络流中获取下一个数据报文。
     async MqttPacket NextPacketAsync() {
-        if (this.pendingPackets != null && this.pendingPackets.Count > 0) {
-            MqttPacket pkt = this.pendingPackets[0];
-            this.pendingPackets.RemoveAt(0);
-            return pkt;
-        }
-        if (this.reader == null) { return null; }
-        return await this.reader.ReadPacketAsync();
+        return await this.DrainExpectedPacketAsync(-1, -1);
     }
 
-    // 等待指定类型的控制报文（如 PUBACK / SUBACK / UNSUBACK / PUBREC / PUBCOMP）。
-    // 在等待过程中，如果收到 PUBLISH，将其暂存到 pendingPackets 队列中，
+    // 等待指定类型与 PID 的控制报文（如 PUBACK / SUBACK / UNSUBACK / PUBREC / PUBCOMP）。
+    // 在等待过程中，如果收到 PUBLISH 或其他协程的 ACK，将其暂存到 pendingPackets 队列中，
     // 防止在确认到达之前丢失并发下发的业务消息；收到 PINGREQ 自动回 PINGRESP。
-    async MqttPacket DrainExpectedPacketAsync(int expectedType) {
-        if (this.reader == null) { return null; }
-        if (this.pendingPackets == null) { this.pendingPackets = new List<MqttPacket>(); }
-        while (true) {
-            MqttPacket pkt = await this.reader.ReadPacketAsync();
-            if (pkt == null) {
-                this.connected = false;
+    async MqttPacket DrainExpectedPacketAsync(int expectedType, int expectedPid) {
+        while (this.connected) {
+            MqttPacket cached = this.PopPending(expectedType, expectedPid);
+            if (cached != null) {
+                return cached;
+            }
+            if (!await this.AcquireRecvAsync()) {
                 return null;
             }
-            if (expectedType >= 0 && pkt.packetType == expectedType) {
-                return pkt;
+            // 拿锁后二次检查，防止排队等待期间其他协程已将报文读入并暂存
+            cached = this.PopPending(expectedType, expectedPid);
+            if (cached != null) {
+                this.ReleaseRecv();
+                return cached;
             }
-            if (pkt.packetType == MqttPacketType.PUBLISH) {
-                this.pendingPackets.Add(pkt);
-                continue;
-            } else if (pkt.packetType == MqttPacketType.PINGREQ) {
+
+            if (this.reader == null) {
+                this.ReleaseRecv();
+                return null;
+            }
+
+            MqttPacket pkt = await this.reader.ReadPacketAsync();
+            if (pkt == null) {
+                this.stateLock.WaitOne();
+                this.connected = false;
+                this.stateLock.ReleaseMutex();
+                this.ReleaseRecv();
+                this.WakeRecvWaiters();
+                this.WakeSendWaiters();
+                return null;
+            }
+
+            if (pkt.packetType == MqttPacketType.PINGREQ) {
                 byte[] pong = new byte[2];
                 pong[0] = (byte)(MqttPacketType.PINGRESP << 4);
                 pong[1] = 0;
-                await this.conn.SendBytesAsync(pong, 2);
+                await this.SendBytesLockedAsync(pong, 2);
+                this.ReleaseRecv();
                 continue;
-            } else if (pkt.packetType == MqttPacketType.PINGRESP) {
+            } else if (pkt.packetType == MqttPacketType.PUBREL && expectedType != MqttPacketType.PUBREL) {
+                int rpid = 0;
+                if (pkt.bodyLen >= 2 && pkt.body != null) {
+                    rpid = ((pkt.body[0] & 255) << 8) + (pkt.body[1] & 255);
+                }
+                byte[] pubcomp = new byte[4];
+                pubcomp[0] = (byte)(MqttPacketType.PUBCOMP << 4);
+                pubcomp[1] = 2;
+                pubcomp[2] = (byte)((rpid >> 8) & 255);
+                pubcomp[3] = (byte)(rpid & 255);
+                await this.SendBytesLockedAsync(pubcomp, 4);
+                this.ReleaseRecv();
+                continue;
+            } else if (pkt.packetType == MqttPacketType.PINGRESP && expectedType != MqttPacketType.PINGRESP) {
+                this.ReleaseRecv();
                 continue;
             }
-            if (expectedType < 0) {
+
+            if (this.MatchPacket(pkt, expectedType, expectedPid)) {
+                this.ReleaseRecv();
                 return pkt;
             }
-            return pkt;
+
+            this.PushPending(pkt);
+            this.ReleaseRecv();
         }
+        return null;
     }
 
-    // 读取并丢弃一个完整控制报文（如 SUBACK / PUBACK），
-    // 返回其报文类型以保持流帧同步。
+    // 读取并丢弃一个完整控制报文，返回其报文类型以保持流帧同步。
     async int DrainPacketAsync() {
-        MqttPacket pkt = await this.DrainExpectedPacketAsync(-1);
+        MqttPacket pkt = await this.DrainExpectedPacketAsync(-1, -1);
         if (pkt == null) { return -1; }
         return pkt.packetType;
     }
@@ -232,8 +396,7 @@ public class MqttClient : IDisposable {
         }
 
         mqtt.conn = await TcpClient.ConnectAsync(host, port);
-        // 连接失败/超时按文档返回 null：直接解引用是空对象虚调用，
-        // 进程 SIGSEGV。保持 connected=false 由调用方检查。
+        // 连接失败/超时按文档返回 null：保持 connected=false 由调用方检查。
         if (mqtt.conn == null) { return mqtt; }
 
         mqtt.reader = new MqttReader(mqtt.conn.GetSocket());
@@ -248,7 +411,7 @@ public class MqttClient : IDisposable {
             mqtt.connected = false;
             return mqtt;
         }
-        if (ack.bodyLen >= 2) {
+        if (ack.bodyLen >= 2 && ack.body != null) {
             int returnCode = ack.body[1] & 255;
             if (returnCode == 0) {
                 mqtt.connected = true;
@@ -298,9 +461,9 @@ public class MqttClient : IDisposable {
             offset = offset + 1;
         }
 
+        int pid = 0;
         if (qos > 0) {
-            int pid = this.nextPacketId;
-            this.nextPacketId = this.nextPacketId + 1;
+            pid = this.GetNextPacketId();
             packet[offset] = (byte)((pid >> 8) & 255);
             offset = offset + 1;
             packet[offset] = (byte)(pid & 255);
@@ -314,25 +477,25 @@ public class MqttClient : IDisposable {
             i = i + 1;
         }
 
-        int sent = await this.conn.SendBytesAsync(packet, offset);
+        int sent = await this.SendBytesLockedAsync(packet, offset);
+        if (sent <= 0) { return -1; }
 
         if (qos == MqttQos.AtLeastOnce) {
-            MqttPacket acked = await this.DrainExpectedPacketAsync(MqttPacketType.PUBACK);
+            MqttPacket acked = await this.DrainExpectedPacketAsync(MqttPacketType.PUBACK, pid);
         } else if (qos == MqttQos.ExactlyOnce) {
             // QoS 2 严格四步往返握手：
             // 1. 等待 broker 返回 PUBREC (5)
-            MqttPacket rec = await this.DrainExpectedPacketAsync(MqttPacketType.PUBREC);
+            MqttPacket rec = await this.DrainExpectedPacketAsync(MqttPacketType.PUBREC, pid);
             if (rec != null && rec.packetType == MqttPacketType.PUBREC) {
                 // 2. 发送 PUBREL (6)，固定头必须带 flags=0010 (0x62)
-                int pid = this.nextPacketId - 1;
                 byte[] pubrel = new byte[4];
                 pubrel[0] = 98;  // 0x62 (type=6, flags=0010)
                 pubrel[1] = 2;
                 pubrel[2] = (byte)((pid >> 8) & 255);
                 pubrel[3] = (byte)(pid & 255);
-                await this.conn.SendBytesAsync(pubrel, 4);
+                await this.SendBytesLockedAsync(pubrel, 4);
                 // 3. 等待 broker 返回 PUBCOMP (7)
-                MqttPacket comp = await this.DrainExpectedPacketAsync(MqttPacketType.PUBCOMP);
+                MqttPacket comp = await this.DrainExpectedPacketAsync(MqttPacketType.PUBCOMP, pid);
             }
         }
 
@@ -375,12 +538,9 @@ public class MqttClient : IDisposable {
             poffset = poffset + 1;
         }
 
+        int pid = 0;
         if (qos > 0) {
-            int pid = this.nextPacketId;
-            this.nextPacketId = this.nextPacketId + 1;
-            if (this.nextPacketId > 65535) {
-                this.nextPacketId = 1;
-            }
+            pid = this.GetNextPacketId();
             packet[poffset] = (byte)((pid >> 8) & 255);
             poffset = poffset + 1;
             packet[poffset] = (byte)(pid & 255);
@@ -392,21 +552,21 @@ public class MqttClient : IDisposable {
             poffset = poffset + msgLen;
         }
 
-        int sent = await this.conn.SendBytesAsync(packet, poffset);
+        int sent = await this.SendBytesLockedAsync(packet, poffset);
+        if (sent <= 0) { return -1; }
 
         if (qos == MqttQos.AtLeastOnce) {
-            MqttPacket acked = await this.DrainExpectedPacketAsync(MqttPacketType.PUBACK);
+            MqttPacket acked = await this.DrainExpectedPacketAsync(MqttPacketType.PUBACK, pid);
         } else if (qos == MqttQos.ExactlyOnce) {
-            MqttPacket rec = await this.DrainExpectedPacketAsync(MqttPacketType.PUBREC);
+            MqttPacket rec = await this.DrainExpectedPacketAsync(MqttPacketType.PUBREC, pid);
             if (rec != null && rec.packetType == MqttPacketType.PUBREC) {
-                int pid = this.nextPacketId - 1;
                 byte[] pubrel = new byte[4];
                 pubrel[0] = 98;
                 pubrel[1] = 2;
                 pubrel[2] = (byte)((pid >> 8) & 255);
                 pubrel[3] = (byte)(pid & 255);
-                await this.conn.SendBytesAsync(pubrel, 4);
-                MqttPacket comp = await this.DrainExpectedPacketAsync(MqttPacketType.PUBCOMP);
+                await this.SendBytesLockedAsync(pubrel, 4);
+                MqttPacket comp = await this.DrainExpectedPacketAsync(MqttPacketType.PUBCOMP, pid);
             }
         }
 
@@ -423,8 +583,7 @@ public class MqttClient : IDisposable {
     // reactor 上挂起。返回已发送的字节数。
     public async int SubscribeAsync(string topic, int qos) {
         int topicLen = (int)strlen(topic);
-        int pid = this.nextPacketId;
-        this.nextPacketId = this.nextPacketId + 1;
+        int pid = this.GetNextPacketId();
 
         int remainLen = 2 + 2 + topicLen + 1;
         byte[] packet = new byte[1 + MqttClient.RemainLenBytes(remainLen) + remainLen];
@@ -452,8 +611,9 @@ public class MqttClient : IDisposable {
         packet[offset] = (byte)(qos);
         offset = offset + 1;
 
-        int sent = await this.conn.SendBytesAsync(packet, offset);
-        MqttPacket acked = await this.DrainExpectedPacketAsync(MqttPacketType.SUBACK);
+        int sent = await this.SendBytesLockedAsync(packet, offset);
+        if (sent <= 0) { return -1; }
+        MqttPacket acked = await this.DrainExpectedPacketAsync(MqttPacketType.SUBACK, pid);
         return sent;
     }
 
@@ -461,8 +621,7 @@ public class MqttClient : IDisposable {
     // IO reactor 上挂起。返回已发送的字节数。
     public async int UnsubscribeAsync(string topic) {
         int topicLen = (int)strlen(topic);
-        int pid = this.nextPacketId;
-        this.nextPacketId = this.nextPacketId + 1;
+        int pid = this.GetNextPacketId();
 
         int remainLen = 2 + 2 + topicLen;
         byte[] packet = new byte[1 + MqttClient.RemainLenBytes(remainLen) + remainLen];
@@ -487,8 +646,9 @@ public class MqttClient : IDisposable {
             offset = offset + 1;
         }
 
-        int sent = await this.conn.SendBytesAsync(packet, offset);
-        MqttPacket acked = await this.DrainExpectedPacketAsync(MqttPacketType.UNSUBACK);
+        int sent = await this.SendBytesLockedAsync(packet, offset);
+        if (sent <= 0) { return -1; }
+        MqttPacket acked = await this.DrainExpectedPacketAsync(MqttPacketType.UNSUBACK, pid);
         return sent;
     }
 
@@ -496,171 +656,113 @@ public class MqttClient : IDisposable {
     // 在 IO reactor 上挂起直到数据到达。对 broker 的
     // PINGREQ 透明响应，并继续等待真正的消息。
     public async string ReceiveAsync() {
-        if (this.reader == null) { return ""; }
-        // 循环而非递归：恶意 broker 连发 PINGREQ 会把
-        // 递归版本的协程栈打穿。
-        while (true) {
-            MqttPacket pkt = await this.NextPacketAsync();
+        if (!this.connected) { return ""; }
+        while (this.connected) {
+            MqttPacket pkt = await this.DrainExpectedPacketAsync(MqttPacketType.PUBLISH, -1);
             if (pkt == null) {
-                this.connected = false;
                 return "";
             }
 
             int byte0 = (pkt.packetType << 4) | (pkt.flags & 15);
             int remainLen = pkt.bodyLen;
             byte[] body = pkt.body;
-            int packetType = pkt.packetType;
 
-            if (packetType == MqttPacketType.PUBLISH) {
-                // 请求体：主题长度（2）+ 主题 + [qos>0 时的报文 id（2）] + 负载
-                if (remainLen < 2) { return ""; }
-                int topicLen = ((body[0] & 255) << 8) + (body[1] & 255);
-                int offset = 2 + topicLen;
+            if (remainLen < 2) { return ""; }
+            int topicLen = ((body[0] & 255) << 8) + (body[1] & 255);
+            int offset = 2 + topicLen;
 
-                int qos = (byte0 >> 1) & 3;
-                int incomingPid = 0;
-                if (qos > 0) {
-                    if (offset + 2 > remainLen) { this.connected = false; return ""; }
-                    incomingPid = ((body[offset] & 255) << 8) + (body[offset + 1] & 255);
-                    offset = offset + 2;
-                }
-
-                // 主题/包标识越界说明对端错位（或恶意）：
-                // 此时流已不可信，断开并返回空。
-                if (offset > remainLen) {
-                    this.connected = false;
-                    return "";
-                }
-
-                if (qos == 1) {
-                    byte[] puback = new byte[4];
-                    puback[0] = (byte)(MqttPacketType.PUBACK << 4);
-                    puback[1] = 2;
-                    puback[2] = (byte)((incomingPid >> 8) & 255);
-                    puback[3] = (byte)(incomingPid & 255);
-                    await this.conn.SendBytesAsync(puback, 4);
-                } else if (qos == 2) {
-                    byte[] pubrec = new byte[4];
-                    pubrec[0] = (byte)(MqttPacketType.PUBREC << 4);
-                    pubrec[1] = 2;
-                    pubrec[2] = (byte)((incomingPid >> 8) & 255);
-                    pubrec[3] = (byte)(incomingPid & 255);
-                    await this.conn.SendBytesAsync(pubrec, 4);
-                }
-
-                int payloadLen = remainLen - offset;
-                return body.ToStr(offset, payloadLen);
-            } else if (packetType == MqttPacketType.PUBREL) {
-                // QoS 2 阶段 3：响应 PUBCOMP (7)
-                int pid = 0;
-                if (remainLen >= 2) {
-                    pid = ((body[0] & 255) << 8) + (body[1] & 255);
-                }
-                byte[] pubcomp = new byte[4];
-                pubcomp[0] = (byte)(MqttPacketType.PUBCOMP << 4);
-                pubcomp[1] = 2;
-                pubcomp[2] = (byte)((pid >> 8) & 255);
-                pubcomp[3] = (byte)(pid & 255);
-                await this.conn.SendBytesAsync(pubcomp, 4);
-                continue;
-            } else if (packetType == MqttPacketType.PINGREQ) {
-                byte[] pong = new byte[2];
-                pong[0] = (byte)(MqttPacketType.PINGRESP << 4);
-                pong[1] = 0;
-                int sent = await this.conn.SendBytesAsync(pong, 2);
-                continue;
-            } else if (packetType == MqttPacketType.PINGRESP) {
-                continue;
+            int qos = (byte0 >> 1) & 3;
+            int incomingPid = 0;
+            if (qos > 0) {
+                if (offset + 2 > remainLen) { this.connected = false; return ""; }
+                incomingPid = ((body[offset] & 255) << 8) + (body[offset + 1] & 255);
+                offset = offset + 2;
             }
 
-            return body.ToStr(0, remainLen);
+            // 主题/包标识越界说明对端错位（或恶意）：
+            // 此时流已不可信，断开并返回空。
+            if (offset > remainLen) {
+                this.connected = false;
+                return "";
+            }
+
+            if (qos == 1) {
+                byte[] puback = new byte[4];
+                puback[0] = (byte)(MqttPacketType.PUBACK << 4);
+                puback[1] = 2;
+                puback[2] = (byte)((incomingPid >> 8) & 255);
+                puback[3] = (byte)(incomingPid & 255);
+                await this.SendBytesLockedAsync(puback, 4);
+            } else if (qos == 2) {
+                byte[] pubrec = new byte[4];
+                pubrec[0] = (byte)(MqttPacketType.PUBREC << 4);
+                pubrec[1] = 2;
+                pubrec[2] = (byte)((incomingPid >> 8) & 255);
+                pubrec[3] = (byte)(incomingPid & 255);
+                await this.SendBytesLockedAsync(pubrec, 4);
+            }
+
+            int payloadLen = remainLen - offset;
+            return body.ToStr(offset, payloadLen);
         }
+        return "";
     }
 
     // 等待下一个传入的 PUBLISH 并返回其原生二进制负载，彻底杜绝包含 NUL 字节时被截断。
     // 在 IO reactor 上挂起直到数据到达。对端关闭或出错时返回 null。
     public async byte[] ReceiveBytesAsync() {
-        if (this.reader == null) { return null; }
-        while (true) {
-            MqttPacket pkt = await this.NextPacketAsync();
+        if (!this.connected) { return null; }
+        while (this.connected) {
+            MqttPacket pkt = await this.DrainExpectedPacketAsync(MqttPacketType.PUBLISH, -1);
             if (pkt == null) {
-                this.connected = false;
                 return null;
             }
 
             int byte0 = (pkt.packetType << 4) | (pkt.flags & 15);
             int remainLen = pkt.bodyLen;
             byte[] body = pkt.body;
-            int packetType = pkt.packetType;
 
-            if (packetType == MqttPacketType.PUBLISH) {
-                if (remainLen < 2) { return null; }
-                int topicLen = ((body[0] & 255) << 8) + (body[1] & 255);
-                int offset = 2 + topicLen;
+            if (remainLen < 2) { return null; }
+            int topicLen = ((body[0] & 255) << 8) + (body[1] & 255);
+            int offset = 2 + topicLen;
 
-                int qos = (byte0 >> 1) & 3;
-                int incomingPid = 0;
-                if (qos > 0) {
-                    if (offset + 2 > remainLen) { this.connected = false; return null; }
-                    incomingPid = ((body[offset] & 255) << 8) + (body[offset + 1] & 255);
-                    offset = offset + 2;
-                }
-
-                if (offset > remainLen) {
-                    this.connected = false;
-                    return null;
-                }
-
-                if (qos == 1) {
-                    byte[] puback = new byte[4];
-                    puback[0] = (byte)(MqttPacketType.PUBACK << 4);
-                    puback[1] = 2;
-                    puback[2] = (byte)((incomingPid >> 8) & 255);
-                    puback[3] = (byte)(incomingPid & 255);
-                    await this.conn.SendBytesAsync(puback, 4);
-                } else if (qos == 2) {
-                    byte[] pubrec = new byte[4];
-                    pubrec[0] = (byte)(MqttPacketType.PUBREC << 4);
-                    pubrec[1] = 2;
-                    pubrec[2] = (byte)((incomingPid >> 8) & 255);
-                    pubrec[3] = (byte)(incomingPid & 255);
-                    await this.conn.SendBytesAsync(pubrec, 4);
-                }
-
-                int payloadLen = remainLen - offset;
-                byte[] res = new byte[payloadLen];
-                if (payloadLen > 0) {
-                    NativeMemory.Copy((nint)res, (nint)body + (nint)offset, payloadLen);
-                }
-                return res;
-            } else if (packetType == MqttPacketType.PUBREL) {
-                int pid = 0;
-                if (remainLen >= 2) {
-                    pid = ((body[0] & 255) << 8) + (body[1] & 255);
-                }
-                byte[] pubcomp = new byte[4];
-                pubcomp[0] = (byte)(MqttPacketType.PUBCOMP << 4);
-                pubcomp[1] = 2;
-                pubcomp[2] = (byte)((pid >> 8) & 255);
-                pubcomp[3] = (byte)(pid & 255);
-                await this.conn.SendBytesAsync(pubcomp, 4);
-                continue;
-            } else if (packetType == MqttPacketType.PINGREQ) {
-                byte[] pong = new byte[2];
-                pong[0] = (byte)(MqttPacketType.PINGRESP << 4);
-                pong[1] = 0;
-                int sent = await this.conn.SendBytesAsync(pong, 2);
-                continue;
-            } else if (packetType == MqttPacketType.PINGRESP) {
-                continue;
+            int qos = (byte0 >> 1) & 3;
+            int incomingPid = 0;
+            if (qos > 0) {
+                if (offset + 2 > remainLen) { this.connected = false; return null; }
+                incomingPid = ((body[offset] & 255) << 8) + (body[offset + 1] & 255);
+                offset = offset + 2;
             }
 
-            byte[] rawRes = new byte[remainLen];
-            if (remainLen > 0) {
-                NativeMemory.Copy((nint)rawRes, (nint)body, remainLen);
+            if (offset > remainLen) {
+                this.connected = false;
+                return null;
             }
-            return rawRes;
+
+            if (qos == 1) {
+                byte[] puback = new byte[4];
+                puback[0] = (byte)(MqttPacketType.PUBACK << 4);
+                puback[1] = 2;
+                puback[2] = (byte)((incomingPid >> 8) & 255);
+                puback[3] = (byte)(incomingPid & 255);
+                await this.SendBytesLockedAsync(puback, 4);
+            } else if (qos == 2) {
+                byte[] pubrec = new byte[4];
+                pubrec[0] = (byte)(MqttPacketType.PUBREC << 4);
+                pubrec[1] = 2;
+                pubrec[2] = (byte)((incomingPid >> 8) & 255);
+                pubrec[3] = (byte)(incomingPid & 255);
+                await this.SendBytesLockedAsync(pubrec, 4);
+            }
+
+            int payloadLen = remainLen - offset;
+            byte[] res = new byte[payloadLen];
+            if (payloadLen > 0) {
+                NativeMemory.Copy((nint)res, (nint)body + (nint)offset, payloadLen);
+            }
+            return res;
         }
+        return null;
     }
 
     // 发送 PINGREQ 保活，在 IO reactor 上挂起。
@@ -669,7 +771,7 @@ public class MqttClient : IDisposable {
         byte[] packet = new byte[2];
         packet[0] = (byte)(MqttPacketType.PINGREQ << 4);
         packet[1] = 0;
-        int sent = await this.conn.SendBytesAsync(packet, 2);
+        int sent = await this.SendBytesLockedAsync(packet, 2);
         return sent;
     }
 
@@ -679,22 +781,26 @@ public class MqttClient : IDisposable {
         byte[] packet = new byte[2];
         packet[0] = (byte)(MqttPacketType.DISCONNECT << 4);
         packet[1] = 0;
-        int sent = await this.conn.SendBytesAsync(packet, 2);
-        this.conn.Close();
-        this.connected = false;
+        int sent = await this.SendBytesLockedAsync(packet, 2);
+        this.Abort();
         return sent;
     }
 
     // 强制断开底层连接（不发送 DISCONNECT 报文），用于模拟客户端异常断开并触发遗嘱消息（LWT）。
     public void Abort() {
+        this.stateLock.WaitOne();
+        this.connected = false;
         if (this.conn != null) {
             this.conn.Close();
         }
-        this.connected = false;
+        this.stateLock.ReleaseMutex();
+        this.WakeSendWaiters();
+        this.WakeRecvWaiters();
     }
 
     public void Dispose() {
         this.Abort();
+        this.stateLock.Close();
     }
 
     // 连接是否仍存活：CONNACK 返回码为 0 后为 true，
