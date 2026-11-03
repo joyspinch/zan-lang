@@ -5944,6 +5944,12 @@ static void checker_collect_controllers(zan_checker_t *c,
         if (decl->type_decl.modifiers & MOD_ABSTRACT) continue;
         if (decl->type_decl.type_params.count > 0) continue;
 
+        /* B-ID110：框架包（Zan.Web* ns）自带控制器不参与隐式发现——
+         * 否则 Zan.Mvc 拉入编译集的 200+ 控制器被用户项目的
+         * __AttrRoutes.Register 全量吞掉；框架页归 Boot/显式注册管 */
+        zan_istr_t dns = zan_ast_ns_name(decl);
+        if (dns.len >= 7 && memcmp(dns.str, "Zan.Web", 7) == 0) continue;
+
         /* 排除框架基类本身 */
         uint32_t nl = decl->type_decl.name.len;
         const char *ns = decl->type_decl.name.str;
