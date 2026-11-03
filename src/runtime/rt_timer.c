@@ -20,6 +20,7 @@
 #include <string.h>
 #include <limits.h>
 #include <errno.h>
+#include <time.h>
 #include "../common/host_oom.h"
 #include "../common/zan_abi.h"
 #include "rt_oom.h"  /* B-ID98 站点化 OOM 注入 */
@@ -426,6 +427,7 @@ void zan_rt_fatal(const char *category, const char *message) {
     if (fn) fn(category, message);
     abort();
 }
+
 typedef enum zan_timer_kind {
     ZAN_TIMER_DELAY = 0,
     ZAN_TIMER_PUBLIC = 1
@@ -442,6 +444,7 @@ typedef struct zan_timer_entry {
     int removed;
     int waking;
     zan_timer_callback_t callback;
+    zan_timer_ctx_callback_t callback_ctx;
     void *frame;
     zan_timer_step_t step;
 } zan_timer_entry;
@@ -713,6 +716,29 @@ long long zan_timer_after(long long delay, zan_timer_callback_t callback) {
     return timer_add(delay, callback, 0);
 }
 
+long long zan_timer_after_ctx(long long delay, zan_timer_ctx_callback_t callback, void *arg) {
+    if (delay < 1 || !callback) return 0;
+    zan_timer_entry *entry = (zan_timer_entry *)calloc(1, sizeof(*entry));
+    if (!entry) return 0;
+    entry->callback_ctx = callback;
+    entry->frame = arg;
+    entry->kind = ZAN_TIMER_PUBLIC;
+    timer_lock();
+    g_initialized = 1;
+    entry->id = g_next_id++;
+    if (entry->id <= 0) entry->id = g_next_id = 1;
+    entry->interval = 0;
+    entry->due_us = zan_timer_saturating_due_us(zan_co_precise_us(), delay_ms_to_us(delay));
+    entry->sequence = ++g_sequence;
+    if (heap_push(entry) != 0) {
+        timer_unlock();
+        free(entry);
+        return 0;
+    }
+    timer_unlock();
+    return entry->id;
+}
+
 long long zan_timer_next_timeout(void) {
     long long timeout = -1;
     timer_lock();
@@ -763,7 +789,11 @@ static long long timer_dispatch_due_locked(void) {
                 if (ready) ready(entry->frame, entry->step);
                 else entry->step(entry->frame);
             }
-        } else entry->callback();
+        } else if (entry->callback_ctx) {
+            entry->callback_ctx(entry->frame);
+        } else if (entry->callback) {
+            entry->callback();
+        }
         long long elapsed = zan_co_precise_us() - started_us;
         dispatched++;
 
@@ -935,6 +965,40 @@ void zan_timer_stats(long long *initialized, long long *num, long long *round) {
     if (round) *round = g_round;
     timer_unlock();
 }
+
+int64_t zan_time_epoch_ms(void) {
+#if defined(_WIN32)
+    FILETIME ft;
+    GetSystemTimeAsFileTime(&ft);
+    ULARGE_INTEGER ul;
+    ul.LowPart = ft.dwLowDateTime;
+    ul.HighPart = ft.dwHighDateTime;
+    return (int64_t)((ul.QuadPart / 10000ULL) - 11644473600000ULL);
+#elif defined(CLOCK_REALTIME)
+    struct timespec ts;
+    if (clock_gettime(CLOCK_REALTIME, &ts) == 0) {
+        return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+    }
+    return (int64_t)time(NULL) * 1000;
+#else
+    return (int64_t)time(NULL) * 1000;
+#endif
+}
+
+int32_t zan_time_local_offset_minutes(int64_t unix_seconds) {
+    time_t t = (time_t)unix_seconds;
+    struct tm tm_buf;
+#if defined(_WIN32)
+    if (_localtime64_s(&tm_buf, &t) != 0) return 0;
+    time_t wall = _mkgmtime(&tm_buf);
+#else
+    if (localtime_r(&t, &tm_buf) == NULL) return 0;
+    time_t wall = timegm(&tm_buf);
+#endif
+    if (wall == (time_t)-1) return 0;
+    return (int32_t)((wall - t) / 60);
+}
+
 
 
 #define ZAN_LIVE_DEAD ((void *)(uintptr_t)1)

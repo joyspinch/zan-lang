@@ -335,6 +335,11 @@ long zan_gate_new(void) {
     return 0;
 }
 
+long zan_gate_arm(long h) {
+    (void)h;
+    return 0;
+}
+
 void zan_gate_signal(long h) {
     (void)h;
 }
@@ -345,6 +350,11 @@ void zan_gate_signal_all(long h) {
 
 void zan_gate_free(long h) {
     (void)h;
+}
+
+void zan_gate_ticket_signal_and_release(long h, long ticket) {
+    (void)h;
+    (void)ticket;
 }
 
 long long zan_io_socket_send(long long sock, const char *buf, long long len, int flags) {

@@ -118,4 +118,13 @@ int32_t zan_io_has_pending(void);
 
 int32_t zan_io_set_nonblocking(intptr_t fd);
 
+/* 协程计数信号门原语 */
+long long zan_gate_new(void);
+long long zan_gate_arm(long long handle);
+void zan_gate_park(long long handle, void *frame, zan_co_step_t step);
+void zan_gate_signal(long long handle);
+void zan_gate_signal_all(long long handle);
+void zan_gate_free(long long handle);
+void zan_gate_ticket_signal_and_release(long long handle, long long ticket);
+
 #endif /* ZAN_RT_IO_H */

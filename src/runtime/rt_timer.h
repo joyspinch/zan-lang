@@ -11,6 +11,7 @@ extern "C" {
 #endif
 
 typedef void (*zan_timer_callback_t)(void);
+typedef void (*zan_timer_ctx_callback_t)(void *arg);
 typedef void (*zan_timer_step_t)(void *frame);
 
 void zan_timer_runtime_reset(void);
@@ -52,6 +53,7 @@ long long zan_timer_pending(void);
 
 long long zan_timer_tick(long long interval, zan_timer_callback_t callback);
 long long zan_timer_after(long long delay, zan_timer_callback_t callback);
+long long zan_timer_after_ctx(long long delay, zan_timer_ctx_callback_t callback, void *arg);
 int zan_timer_clear(long long id);
 long long zan_timer_clear_all(void);
 int zan_timer_info(long long id, long long *exec_msec, long long *exec_count,
@@ -59,6 +61,10 @@ int zan_timer_info(long long id, long long *exec_msec, long long *exec_count,
 long long zan_timer_list_count(void);
 long long zan_timer_list_at(long long index);
 void zan_timer_stats(long long *initialized, long long *num, long long *round);
+
+/* Unix 纪元毫秒数与时区偏移（无堆分配栈上直算，供 DateTime 使用） */
+int64_t zan_time_epoch_ms(void);
+int32_t zan_time_local_offset_minutes(int64_t unix_seconds);
 
 #include "rt_hw_accel.h"
 

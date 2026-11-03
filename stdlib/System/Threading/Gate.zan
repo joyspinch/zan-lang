@@ -14,111 +14,107 @@ namespace System.Threading;
 public class Gate {
     public long handle;
 
-    // 看门狗对已 Close 的门 zan_gate_signal 会引发 UAF（句柄已被
-    // zan_gate_free）。静态注册表记录还活着的句柄：Wait(timeout)
-    // 先注册再挂看门狗；看门狗醒后锁内核对，在册才发信号；Close 在
-    // zan_gate_free 之前锁内摘除。signal/free 都不是 await，可以在
-    // 临界区内完成，与协程调度不冲突。
-    public static Dict<long, byte> live = new Dict<long, byte>();
-    public static nint liveLock = Mutex.Create();
-
     public Gate() {
         this.handle = Gate.zan_gate_new();
     }
 
-    // 门是否还持有一个可用的运行时句柄（即尚未
-    // <see cref="Close"/>）。这与"是否已 Signal"无关：刚 new 出来的门
-    // 就是 true，暂存的信号数不可查询。
-    public bool IsValid() { return this.handle != 0; }
+    // 门是否还持有一个可用的运行时句柄（即尚未 <see cref="Close"/>）。
+    public bool IsValid() {
+        lock (this) {
+            return this.handle != 0;
+        }
+    }
 
     // 挂起直到有人 Signal（暂存信号可立即消费）；门已 Close 时返回 false。
     public async bool Wait() {
-        if (this.handle == 0) { return false; }
-        await Gate.Park(this.handle);
+        long h = 0;
+        lock (this) { h = this.handle; }
+        if (h == 0) { return false; }
+        await Gate.Park(h);
         return true;
     }
 
-    // 带超时的等待：至多 <paramref name="timeoutMs"/> 毫秒后
-    // 必然恢复。返回 true 只表示「已恢复」，不区分是 Signal 还是超时
-    // ——调用方一律复查自己的谓词（计数语义本就要求复查循环）。
-    // 超时由看门狗协程实现：到点向本门发一次信号。落在 FIFO 头部的
-    // 等待者被唤醒——可能是调用者自己，也可能是同一门上的别人；对
-    // 「任何等待都有出口」这个目的而言足够：没有谁会永久停在门上，
-    // 丢失的 Signal 最迟 timeoutMs 后也有进展。看门狗不取消：提前
-    // 醒来时它稍后的那次 Signal 存为盈余，由下一个等待者立即消费，
-    // 无副作用。盈余路径只对"仍在册"（未 Close）的门成立：看门狗
-    // 醒后锁内查静态注册表，门已 Close（句柄已 zan_gate_free）就不
-    // 再 signal——对已释放句柄发信号是 UAF，注册表让这条
-    // 路径不可达。timeoutMs <= 0 时退化为无限等待。
+    // 带超时的等待：至多 <paramref name="timeoutMs"/> 毫秒后必然恢复。
+    // 超时看门狗仅捕获标量票据与句柄（零托管对象捕获、零 ARC 泄露）；
+    // 到期后运行时核对等待队列票据精准唤醒，绝不向 surplus 写入幽灵盈余信号。
+    // timeoutMs <= 0 时退化为无超时等待。
     public async bool Wait(int timeoutMs) {
-        if (this.handle == 0) { return false; }
-        if (timeoutMs > 0) {
-            Gate.LiveAdd(this.handle);
-            Task.Spawn(Gate.Watchdog(this.handle, timeoutMs));
+        long h = 0;
+        long ticket = 0;
+        lock (this) {
+            h = this.handle;
+            if (h == 0) { return false; }
+            if (timeoutMs > 0) {
+                ticket = Gate.zan_gate_arm(h);
+            }
         }
-        await Gate.Park(this.handle);
+        if (timeoutMs <= 0) {
+            await Gate.Park(h);
+            return true;
+        }
+        if (ticket == 0) { return false; }
+
+        Task.Spawn(Gate.Watchdog(h, ticket, timeoutMs));
+        await Gate.Park(h);
         return true;
     }
 
-    /* 看门狗协程体：延迟后向句柄发一次信号，然后自然结束。 */
-    // 看门狗协程体：延迟 timeoutMs 后向仍在册的句柄发一次信号。
-    public static async void Watchdog(long handle, int timeoutMs) {
+    // 超时看门狗：仅捕获纯标量（句柄、票据、毫秒），不持有任何托管对象引用，
+    // 零 ARC 泄露；到期后由运行时核对票据精准唤醒对应等待者，无等待者时不注入盈余信号。
+    private static async void Watchdog(long handle, long ticket, int timeoutMs) {
         await Task.Delay(timeoutMs);
-        // signal 不是 await，锁内完成：与 Close 的「摘除 + free」临界区
-        // 互斥——要么门还在册（信号发出，成为盈余），要么已摘除（绝不
-        // 碰已 free 的句柄）。
-        Mutex.Lock(Gate.liveLock);
-        if (Gate.live.ContainsKey(handle)) {
-            Gate.zan_gate_signal(handle);
-        }
-        Mutex.Unlock(Gate.liveLock);
-    }
-
-    // 把句柄登记进存活注册表（Wait(timeout) 挂看门狗前调用）。
-    public static void LiveAdd(long handle) {
-        Mutex.Lock(Gate.liveLock);
-        Gate.live[handle] = 1;
-        Mutex.Unlock(Gate.liveLock);
+        Gate.zan_gate_ticket_signal_and_release(handle, ticket);
     }
 
     // 唤醒一个等待者；无等待者时暂存一次信号（计数语义）。
     public void Signal() {
-        if (this.handle == 0) { return; }
-        Gate.zan_gate_signal(this.handle);
+        lock (this) {
+            if (this.handle != 0) {
+                Gate.zan_gate_signal(this.handle);
+            }
+        }
     }
 
     // 唤醒当前挂在门上的全部等待者（Monitor.PulseAll 口径）。
-    // 无等待者时与 <see cref="Signal"/> 同口径暂存一次信号——先
-    // SignalAll 后 Wait 的组合立即通过。曾只有单唤醒入口：广播
-    // 场景（一批生产者通知一组消费者收摊）只能发 N 次 Signal 或
-    // 让其余等待者靠看门狗超时逃生，无超时的会永久挂起。
+    // 无等待者时与 <see cref="Signal"/> 同口径暂存一次信号。
     public void SignalAll() {
-        if (this.handle == 0) { return; }
-        Gate.zan_gate_signal_all(this.handle);
+        lock (this) {
+            if (this.handle != 0) {
+                Gate.zan_gate_signal_all(this.handle);
+            }
+        }
     }
 
-    // 释放运行时句柄；此后的 Wait 立即返回 false。摘除注册与
-    // zan_gate_free 在同一临界区内完成，看门狗永远追不上一个
-    // 「已摘册但尚未 free」的中间态。
+    // 释放运行时句柄；此后的 Wait 立即返回 false。
     public void Close() {
-        if (this.handle == 0) { return; }
-        Mutex.Lock(Gate.liveLock);
-        Gate.live.Remove(this.handle);
-        Gate.zan_gate_free(this.handle);
-        this.handle = 0;
-        Mutex.Unlock(Gate.liveLock);
+        long h = 0;
+        lock (this) {
+            if (this.handle == 0) { return; }
+            h = this.handle;
+            this.handle = 0;
+        }
+        Gate.zan_gate_free(h);
     }
+
     // 运行时门句柄（0 = 已 Close）。
-    public long Handle() { return this.handle; }
+    public long Handle() {
+        lock (this) {
+            return this.handle;
+        }
+    }
 
     // 运行时 ABI（从 socket 异步 reactor 对象解析）。`Park` 是
     // 编译器的 await 内建（见 irgen.c），故意没有函数体。
     [DllImport("crt", EntryPoint = "zan_gate_new")]
     public static extern long zan_gate_new();
+    [DllImport("crt", EntryPoint = "zan_gate_arm")]
+    public static extern long zan_gate_arm(long h);
     [DllImport("crt", EntryPoint = "zan_gate_signal")]
     public static extern void zan_gate_signal(long h);
     [DllImport("crt", EntryPoint = "zan_gate_signal_all")]
     public static extern void zan_gate_signal_all(long h);
     [DllImport("crt", EntryPoint = "zan_gate_free")]
     public static extern void zan_gate_free(long h);
+    [DllImport("crt", EntryPoint = "zan_gate_ticket_signal_and_release")]
+    public static extern void zan_gate_ticket_signal_and_release(long h, long ticket);
 }
