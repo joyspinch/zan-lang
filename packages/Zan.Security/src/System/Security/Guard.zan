@@ -22,11 +22,7 @@ public class Guard {
     [DllImport("kernel32", EntryPoint = "GetCurrentProcess")]
     private static extern nint WinGetCurrentProcess();
     [DllImport("kernel32", EntryPoint = "CheckRemoteDebuggerPresent")]
-    private static extern int WinCheckRemoteDebuggerPresent(nint hProc, string pbOut);
-    [DllImport("kernel32", EntryPoint = "QueryPerformanceCounter")]
-    private static extern int WinQpc(string outCount);
-    [DllImport("kernel32", EntryPoint = "QueryPerformanceFrequency")]
-    private static extern int WinQpf(string outFreq);
+    private static extern int WinCheckRemoteDebuggerPresent(nint hProc, nint pbOut);
     [DllImport("kernel32", EntryPoint = "GetTickCount64")]
     private static extern long WinGetTickCount64();
     [DllImport("kernel32", EntryPoint = "Sleep")]
@@ -39,12 +35,12 @@ public class Guard {
     private static extern int PosixPtrace(int request, int pid, nint addr, nint data);
     #endif
 
+    [DllImport("crt", EntryPoint = "zan_stopwatch_frequency")]
+    private static extern long ZanStopwatchFrequency();
+    [DllImport("crt", EntryPoint = "zan_stopwatch_ticks")]
+    private static extern long ZanStopwatchTicks();
     [DllImport("crt", EntryPoint = "exit")]
     private static extern void CrtExit(int code);
-    [DllImport("crt", EntryPoint = "calloc")]
-    private static extern string GuardCalloc(long count, long size);
-    [DllImport("crt", EntryPoint = "free")]
-    private static extern void GuardFree(string ptr);
 
     // Guard 是否已启动（Arm 幂等标记）。
     static bool armed;
@@ -53,17 +49,6 @@ public class Guard {
     static long baseTick;  // GetTickCount64 基准（墙上时钟毫秒）
     static long baseQpc;  // QueryPerformanceCounter 基准（ticks）
     static long qpcFreq;  // QueryPerformanceCounter 频率（ticks/秒）
-
-    // 从 8 字节的原生缓冲区中读取小端序 64 位值。
-    private static long Le64(string b) {
-        long v = 0;
-        long mul = 1;
-        for (int k = 0; k < 8; k = k + 1) {
-            v = v + (b[k] & 255) * mul;
-            mul = mul * 256;
-        }
-        return v;
-    }
 
     // 静默终止进程；检测到任何篡改时调用。
     public static void Trip() { Guard.CrtExit(3); }
@@ -76,12 +61,8 @@ public class Guard {
         Guard.strikes = 0;
 
         #if WINDOWS
-        string q = Guard.GuardCalloc(8, 1);
-        Guard.WinQpf(q);
-        Guard.qpcFreq = Guard.Le64(q);
-        Guard.WinQpc(q);
-        Guard.baseQpc = Guard.Le64(q);
-        Guard.GuardFree(q);
+        Guard.qpcFreq = Guard.ZanStopwatchFrequency();
+        Guard.baseQpc = Guard.ZanStopwatchTicks();
         Guard.baseTick = Guard.WinGetTickCount64();
         Guard.CheckOnce();
         #elif MACOS
@@ -99,10 +80,11 @@ public class Guard {
         if (!Guard.armed) { return; }
         #if WINDOWS
         if (Guard.WinIsDebuggerPresent() != 0) { Guard.Trip(); return; }
-        string b = Guard.GuardCalloc(4, 1);
-        Guard.WinCheckRemoteDebuggerPresent(Guard.WinGetCurrentProcess(), b);
-        int present = b[0] & 255;
-        Guard.GuardFree(b);
+        nint p = Marshal.AllocHGlobal(4);
+        Marshal.WriteInt32(p, 0);
+        Guard.WinCheckRemoteDebuggerPresent(Guard.WinGetCurrentProcess(), p);
+        int present = Marshal.ReadInt32(p);
+        Marshal.FreeHGlobal(p);
         if (present != 0) { Guard.Trip(); return; }
         #endif
     }
@@ -122,10 +104,7 @@ public class Guard {
             // 都测量自 Arm() 以来的真实流逝时间；整个运行期间偏差超过 50%
             // 远超出调度器抖动范围。
             if (Guard.qpcFreq > 0) {
-                string q = Guard.GuardCalloc(8, 1);
-                Guard.WinQpc(q);
-                long nowQpc = Guard.Le64(q);
-                Guard.GuardFree(q);
+                long nowQpc = Guard.ZanStopwatchTicks();
                 long qpcMs = (nowQpc - Guard.baseQpc) / (Guard.qpcFreq / 1000);
                 long tickMs = Guard.WinGetTickCount64() - Guard.baseTick;
                 if (tickMs > 3000) {
@@ -143,9 +122,3 @@ public class Guard {
         #endif
     }
 }
-
-// 面向内存扫描器可能针对的值的防篡改整数（分数、
-// 金币、黄金）。明文从不存储：它以 XOR 掩码形式与
-// 冗余的反向副本一起存放，因此工具在内存中找到并覆写该数值时，
-// 会破坏这一不变式，<see cref="Get"/> 将触发防护。请
-// 只用于少数值得保护的值，而不是每帧的热点计算。
