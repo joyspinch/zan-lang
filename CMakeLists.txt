@@ -359,7 +359,8 @@ add_custom_command(
             -I ${CMAKE_SOURCE_DIR}/src/runtime -O2 ${ZAN_RT_OBJ_SECTIONS}
             -c ${CMAKE_SOURCE_DIR}/src/runtime/rt_hw_accel.c
             -o ${ZAN_RT_CRYPTO_OBJ}
-    COMMAND ${CMAKE_AR} qc ${ZAN_RT_CRYPTO_ARCHIVE} ${ZAN_RT_CRYPTO_OBJ}
+    COMMAND ${CMAKE_COMMAND} -E rm -f ${ZAN_RT_CRYPTO_ARCHIVE}
+    COMMAND ${CMAKE_AR} rc ${ZAN_RT_CRYPTO_ARCHIVE} ${ZAN_RT_CRYPTO_OBJ}
     COMMAND ${CMAKE_RANLIB} ${ZAN_RT_CRYPTO_ARCHIVE}
     DEPENDS ${CMAKE_SOURCE_DIR}/src/runtime/rt_hw_accel.c
             ${CMAKE_SOURCE_DIR}/src/runtime/rt_hw_accel.h
@@ -2767,6 +2768,10 @@ foreach(_src ${_conf_srcs})
   elseif(_name STREQUAL "security_cryptography_suite")
     file(GLOB _sec_crypto_srcs "${CMAKE_SOURCE_DIR}/packages/Zan.Security/src/System/Security/Cryptography/*.zan")
     set(_extra_args "${_sec_crypto_srcs};--auto-stdlib")
+  elseif(_name STREQUAL "web3_foundation_suite")
+    file(GLOB_RECURSE _web3_srcs "${CMAKE_SOURCE_DIR}/packages/Zan.Web3/src/*.zan")
+    file(GLOB _sec_crypto_srcs "${CMAKE_SOURCE_DIR}/packages/Zan.Security/src/System/Security/Cryptography/*.zan")
+    set(_extra_args "${_web3_srcs};${_sec_crypto_srcs};--auto-stdlib")
   elseif(_name STREQUAL "crypto_sm4_kat")
     # B-ID85 钉子：GB/T 32907 KAT 压两轨——EncryptBlock 走纯 Zan 恒定时间
     # S 盒，EncryptCbc 走运行时原生路径；Zan.Security 源显式参编。

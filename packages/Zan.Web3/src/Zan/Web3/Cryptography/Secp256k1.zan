@@ -1,0 +1,223 @@
+using System;
+using System.Security.Cryptography;
+
+namespace Zan.Web3.Cryptography;
+
+// SECG secp256k1 椭圆曲线密码学实现（比特币与以太坊公钥基础设施基石）。
+// 曲线方程：y^2 = x^3 + 7 (mod p)，a = 0, b = 7。
+// 内部点运算采用 Jacobian 投影坐标系，倍点公式针对 a = 0 进行模乘优化。
+public class Secp256k1 {
+
+    static string PHEX  = "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F";
+    static string NHEX  = "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141";
+    static string GXHEX = "79BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798";
+    static string GYHEX = "483ADA7726A3C4655DA4FBFC0E1108A8FD17B448A68554199C47D08FFB10D4B8";
+
+    static BigInt P;
+    static BigInt N;
+    static BigInt GX;
+    static BigInt GY;
+    static BigInt TWO;
+    static BigInt THREE;
+    static BigInt FOUR;
+    static BigInt EIGHT;
+    static bool ready = false;
+
+    private static BigInt hb(string h) {
+        return BigInt.FromBytesBE(Hex.Decode(h), 32);
+    }
+
+    private static BigInt fromInt(int v) {
+        byte[] b = new byte[4];
+        b[0] = (byte)((v >> 24) & 255);
+        b[1] = (byte)((v >> 16) & 255);
+        b[2] = (byte)((v >> 8) & 255);
+        b[3] = (byte)(v & 255);
+        return BigInt.FromBytesBE(b, 4);
+    }
+
+    private static void init() {
+        if (ready) { return; }
+        P = hb(PHEX);
+        N = hb(NHEX);
+        GX = hb(GXHEX);
+        GY = hb(GYHEX);
+        TWO = fromInt(2);
+        THREE = fromInt(3);
+        FOUR = fromInt(4);
+        EIGHT = fromInt(8);
+        ready = true;
+    }
+
+    // 模 P 域运算
+    private static BigInt fadd(BigInt x, BigInt y) { return BigInt.mod(BigInt.add(x, y), P); }
+    private static BigInt fsub(BigInt x, BigInt y) { return BigInt.mod(BigInt.add(x, BigInt.sub(P, y)), P); }
+    private static BigInt fmul(BigInt x, BigInt y) { return BigInt.mod(BigInt.mul(x, y), P); }
+    private static BigInt fsqr(BigInt x) { return fmul(x, x); }
+    private static BigInt finv(BigInt x) { return BigInt.ModInverse(x, P); }
+
+    // 模 N 标量运算
+    private static BigInt nmod(BigInt x) { return BigInt.mod(x, N); }
+    private static BigInt nmul(BigInt x, BigInt y) { return BigInt.mod(BigInt.mul(x, y), N); }
+    private static BigInt ninv(BigInt x) { return BigInt.ModInverse(x, N); }
+
+    // Jacobian 投影坐标点 [X, Y, Z]；无穷远点的 Z == 0
+    private static List<BigInt> pt(BigInt x, BigInt y, BigInt z) {
+        List<BigInt> r = new List<BigInt>();
+        r.Add(x);
+        r.Add(y);
+        r.Add(z);
+        return r;
+    }
+
+    private static List<BigInt> inf() {
+        return pt(BigInt.one(), BigInt.one(), BigInt.zero());
+    }
+
+    private static bool isInf(List<BigInt> p) {
+        return p[2].isZero();
+    }
+
+    // a = 0 特化的 Jacobian 倍点算法
+    private static List<BigInt> jdouble(List<BigInt> p) {
+        if (isInf(p)) { return p; }
+        BigInt x1 = p[0];
+        BigInt y1 = p[1];
+        BigInt z1 = p[2];
+
+        // gamma = Y1^2
+        BigInt gamma = fsqr(y1);
+        // beta = 4 * X1 * gamma
+        BigInt beta = fmul(FOUR, fmul(x1, gamma));
+        // alpha = 3 * X1^2 (因 a = 0，省略 a * Z1^4 项)
+        BigInt alpha = fmul(THREE, fsqr(x1));
+        // X3 = alpha^2 - 2 * beta
+        BigInt x3 = fsub(fsqr(alpha), fmul(TWO, beta));
+        // Z3 = 2 * Y1 * Z1
+        BigInt z3 = fmul(TWO, fmul(y1, z1));
+        // Y3 = alpha * (beta - X3) - 8 * gamma^2
+        BigInt y3 = fsub(fmul(alpha, fsub(beta, x3)), fmul(EIGHT, fsqr(gamma)));
+
+        return pt(x3, y3, z3);
+    }
+
+    // Jacobian 点加算法
+    private static List<BigInt> jadd(List<BigInt> pa, List<BigInt> qa) {
+        if (isInf(pa)) { return qa; }
+        if (isInf(qa)) { return pa; }
+
+        BigInt x1 = pa[0]; BigInt y1 = pa[1]; BigInt z1 = pa[2];
+        BigInt x2 = qa[0]; BigInt y2 = qa[1]; BigInt z2 = qa[2];
+
+        BigInt z1z1 = fsqr(z1);
+        BigInt z2z2 = fsqr(z2);
+
+        BigInt u1 = fmul(x1, z2z2);
+        BigInt u2 = fmul(x2, z1z1);
+
+        BigInt s1 = fmul(y1, fmul(z2, z2z2));
+        BigInt s2 = fmul(y2, fmul(z1, z1z1));
+
+        BigInt h = fsub(u2, u1);
+        BigInt r = fsub(s2, s1);
+
+        if (h.isZero()) {
+            if (r.isZero()) {
+                return jdouble(pa);
+            }
+            return inf();
+        }
+
+        BigInt hh = fsqr(h);
+        BigInt hhh = fmul(h, hh);
+        BigInt v = fmul(u1, hh);
+
+        BigInt x3 = fsub(fsub(fsqr(r), hhh), fmul(TWO, v));
+        BigInt y3 = fsub(fmul(r, fsub(v, x3)), fmul(s1, hhh));
+        BigInt z3 = fmul(fmul(z1, z2), h);
+
+        return pt(x3, y3, z3);
+    }
+
+    // 标量乘 k * P
+    private static List<BigInt> scalarMul(BigInt k, List<BigInt> p) {
+        List<BigInt> r = inf();
+        int bits = k.bitLength();
+        for (int i = bits - 1; i >= 0; i = i - 1) {
+            r = jdouble(r);
+            if (k.getBit(i) == 1) {
+                r = jadd(r, p);
+            }
+        }
+        return r;
+    }
+
+    // 转回仿射坐标 (x, y)
+    private static List<BigInt> toAffine(List<BigInt> p) {
+        if (isInf(p)) {
+            return pt(BigInt.zero(), BigInt.zero(), BigInt.zero());
+        }
+        BigInt zinv = finv(p[2]);
+        BigInt zinv2 = fsqr(zinv);
+        BigInt x = fmul(p[0], zinv2);
+        BigInt y = fmul(p[1], fmul(zinv2, zinv));
+        return pt(x, y, BigInt.one());
+    }
+
+    private static List<BigInt> gPoint() {
+        return pt(GX, GY, BigInt.one());
+    }
+
+    // 从 32 字节大端私钥派生 64 字节未压缩公钥坐标 (X || Y)，不带 0x04 前缀。
+    // 这恰好是以太坊 Keccak-256 地址派生的输入格式。
+    public static byte[] GetPublicKeyRaw(byte[] privKey32) {
+        init();
+        if (privKey32 == null || privKey32.Length != 32) { return null; }
+        BigInt d = BigInt.FromBytesBE(privKey32, 32);
+        if (BigInt.cmp(d, BigInt.one()) < 0 || BigInt.cmp(d, N) >= 0) { return null; }
+
+        List<BigInt> aff = toAffine(scalarMul(d, gPoint()));
+        if (isInf(aff)) { return null; }
+
+        byte[] outb = new byte[64];
+        byte[] xb = aff[0].ToBytesBE(32);
+        byte[] yb = aff[1].ToBytesBE(32);
+        for (int i = 0; i < 32; i = i + 1) {
+            outb[i] = (byte)(xb[i] & 255);
+            outb[32 + i] = (byte)(yb[i] & 255);
+        }
+        return outb;
+    }
+
+    // 派生 65 字节完整未压缩公钥（带 0x04 头部）
+    public static byte[] GetPublicKeyUncompressed(byte[] privKey32) {
+        byte[] raw = GetPublicKeyRaw(privKey32);
+        if (raw == null) { return null; }
+        byte[] outb = new byte[65];
+        outb[0] = 4;
+        for (int i = 0; i < 64; i = i + 1) {
+            outb[1 + i] = raw[i];
+        }
+        return outb;
+    }
+
+    // 校验公钥点是否合法地落在 secp256k1 曲线上
+    public static bool VerifyPublicKey(byte[] raw64) {
+        init();
+        if (raw64 == null || raw64.Length != 64) { return false; }
+        byte[] xb = new byte[32];
+        byte[] yb = new byte[32];
+        for (int i = 0; i < 32; i = i + 1) {
+            xb[i] = raw64[i];
+            yb[i] = raw64[32 + i];
+        }
+        BigInt x = BigInt.FromBytesBE(xb, 32);
+        BigInt y = BigInt.FromBytesBE(yb, 32);
+
+        if (BigInt.cmp(x, P) >= 0 || BigInt.cmp(y, P) >= 0) { return false; }
+
+        BigInt lhs = fsqr(y);
+        BigInt rhs = fadd(fmul(x, fsqr(x)), fromInt(7));
+        return BigInt.cmp(lhs, rhs) == 0;
+    }
+}

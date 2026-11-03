@@ -1,0 +1,139 @@
+using System;
+using System.Security.Cryptography;
+using Zan.Web3.Cryptography;
+
+namespace Zan.Web3.Types;
+
+// 以太坊 20 字节账户与智能合约地址实体，支持 EIP-55 大小写校验和格式化。
+public class Address {
+
+    private byte[] _bytes; // 长度恒为 20 字节
+
+    // 零地址 (0x0000000000000000000000000000000000000000)
+    public static Address Zero = new Address(new byte[20]);
+
+    public Address(byte[] raw20) {
+        if (raw20 == null || raw20.Length != 20) {
+            _bytes = new byte[20];
+        } else {
+            _bytes = new byte[20];
+            for (int i = 0; i < 20; i = i + 1) {
+                _bytes[i] = raw20[i];
+            }
+        }
+    }
+
+    // 从 20 字节缓冲区切片构建
+    public static Address FromBytes(byte[] buf, int offset) {
+        if (buf == null || buf.Length < offset + 20) {
+            return Zero;
+        }
+        byte[] b = new byte[20];
+        for (int i = 0; i < 20; i = i + 1) {
+            b[i] = buf[offset + i];
+        }
+        return new Address(b);
+    }
+
+    // 从十六进制字符串（支持带或不带 0x，不区分大小写）解析地址
+    public static Address Parse(string hex) {
+        if (hex == null) { return Zero; }
+        string clean = hex.Trim();
+        if (clean.StartsWith("0x") || clean.StartsWith("0X")) {
+            clean = clean.Substring(2);
+        }
+        if (clean.Length != 40) {
+            return Zero;
+        }
+        byte[] raw = Hex.Decode(clean, 40);
+        if (raw == null || raw.Length != 20) {
+            return Zero;
+        }
+        return new Address(raw);
+    }
+
+    // 从 64 字节未压缩公钥原始坐标 (X || Y) 派生以太坊地址
+    public static Address FromPublicKey(byte[] pubKeyRaw64) {
+        if (pubKeyRaw64 == null || pubKeyRaw64.Length != 64) {
+            return Zero;
+        }
+        byte[] hash = Keccak256.Hash(pubKeyRaw64, 64);
+        byte[] addr = new byte[20];
+        for (int i = 0; i < 20; i = i + 1) {
+            addr[i] = hash[12 + i];
+        }
+        return new Address(addr);
+    }
+
+    // 从 32 字节私钥直接派生以太坊地址
+    public static Address FromPrivateKey(byte[] privKey32) {
+        byte[] pub = Secp256k1.GetPublicKeyRaw(privKey32);
+        if (pub == null) { return Zero; }
+        return FromPublicKey(pub);
+    }
+
+    // 获取 20 字节底层原始数组
+    public byte[] ToBytes() {
+        byte[] copy = new byte[20];
+        for (int i = 0; i < 20; i = i + 1) {
+            copy[i] = _bytes[i];
+        }
+        return copy;
+    }
+
+    // 转为纯小写十六进制字符串（带 0x 前缀）
+    public string ToLowerHex() {
+        return "0x" + Hex.Encode(_bytes, 20);
+    }
+
+    // 格式化为符合 EIP-55 规范的带大小写防错校验和地址（形如 0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed）
+    public string ToChecksumAddress() {
+        string lower = Hex.Encode(_bytes, 20); // 40 字符全小写
+        string hash = Keccak256.HashHex(lower); // 对 40 字符小写字符串计算 keccak
+
+        string res = "0x";
+        for (int i = 0; i < 40; i = i + 1) {
+            int c = lower[i] & 255;
+            int h = hash[i] & 255;
+
+            // 检查哈希位是否 >= 8
+            bool isHigh = false;
+            if (h >= 56 && h <= 57) { isHigh = true; } // '8', '9'
+            else if (h >= 97 && h <= 102) { isHigh = true; } // 'a' - 'f'
+
+            if (isHigh && c >= 97 && c <= 102) {
+                // 小写字母转大写
+                res = res + ((char)(c - 32)).ToString();
+            } else {
+                res = res + ((char)c).ToString();
+            }
+        }
+        return res;
+    }
+
+    // 默认 ToString 输出带 EIP-55 校验和格式
+    public override string ToString() {
+        return ToChecksumAddress();
+    }
+
+    // 校验给定的十六进制字符串是否为合法的 EIP-55 地址
+    public static bool IsValidChecksum(string hex) {
+        if (hex == null) { return false; }
+        string clean = hex.Trim();
+        if (clean.StartsWith("0x") || clean.StartsWith("0X")) {
+            clean = clean.Substring(2);
+        }
+        if (clean.Length != 40) { return false; }
+        Address addr = Parse(clean);
+        return addr.ToChecksumAddress() == ("0x" + clean);
+    }
+
+    // 比较两个地址是否等价（忽略大小写）
+    public bool Equals(Address other) {
+        if (other == null) { return false; }
+        for (int i = 0; i < 20; i = i + 1) {
+            if (_bytes[i] != other._bytes[i]) { return false; }
+        }
+        return true;
+    }
+}
