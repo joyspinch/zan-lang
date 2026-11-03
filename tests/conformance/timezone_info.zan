@@ -1,0 +1,198 @@
+using System;
+using System.Collections.Generic;
+
+public class Program {
+    public static void Main() {
+        TestUtc();
+        TestFindSystemTimeZone();
+        TestConversions();
+        TestCustomTimeZone();
+        TestSyntheticTzif();
+        TestDateTimeUniversalRoundtrip();
+        Console.WriteLine("ALL TIMEZONE TESTS PASSED");
+    }
+
+    private static void Assert(bool cond, string msg) {
+        if (!cond) {
+            Console.WriteLine("ASSERT FAILED: " + msg);
+            throw new Exception("ASSERT FAILED: " + msg);
+        }
+    }
+
+    private static void TestUtc() {
+        TimeZoneInfo utc = TimeZoneInfo.Utc;
+        Assert(utc.Id == "UTC", "utc.Id");
+        Assert(utc.BaseUtcOffset.TotalSeconds() == 0, "utc offset == 0");
+        Assert(!utc.SupportsDaylightSavingTime, "utc dst == false");
+
+        DateTime nowUtc = DateTime.UtcNow();
+        Assert(utc.GetUtcOffset(nowUtc).TotalSeconds() == 0, "utc GetUtcOffset == 0");
+        Assert(!utc.IsDaylightSavingTime(nowUtc), "utc IsDst == false");
+        Console.WriteLine("PASS: TestUtc");
+    }
+
+    private static void TestFindSystemTimeZone() {
+        // Shanghai: UTC+8, no DST
+        TimeZoneInfo sh = TimeZoneInfo.FindSystemTimeZoneById("Asia/Shanghai");
+        Assert(sh.Id == "Asia/Shanghai", "sh.Id");
+        Assert(sh.BaseUtcOffset.TotalHours() == 8, "sh.BaseUtcOffset == 8");
+        Assert(!sh.SupportsDaylightSavingTime, "sh.SupportsDst == false");
+
+        long secWinter = (long)DateTime.DaysFromCivil(2026, 1, 15) * 86400L + 12 * 3600L;
+        long secSummer = (long)DateTime.DaysFromCivil(2026, 6, 15) * 86400L + 12 * 3600L;
+        Assert(sh.GetUtcOffset(secWinter).TotalHours() == 8, "sh winter off == 8");
+        Assert(sh.GetUtcOffset(secSummer).TotalHours() == 8, "sh summer off == 8");
+        Assert(!sh.IsDaylightSavingTime(secWinter), "sh winter dst == false");
+        Assert(!sh.IsDaylightSavingTime(secSummer), "sh summer dst == false");
+
+        // New York: UTC-5, DST = UTC-4
+        TimeZoneInfo ny = TimeZoneInfo.FindSystemTimeZoneById("America/New_York");
+        Assert(ny.Id == "America/New_York", "ny.Id");
+        Assert(ny.BaseUtcOffset.TotalHours() == -5, "ny.BaseUtcOffset == -5");
+        Assert(ny.SupportsDaylightSavingTime, "ny.SupportsDst == true");
+        Assert(ny.GetUtcOffset(secWinter).TotalHours() == -5, "ny winter off == -5");
+        Assert(ny.GetUtcOffset(secSummer).TotalHours() == -4, "ny summer off == -4");
+        Assert(!ny.IsDaylightSavingTime(secWinter), "ny winter dst == false");
+        Assert(ny.IsDaylightSavingTime(secSummer), "ny summer dst == true");
+
+        // London: UTC+0, DST = UTC+1
+        TimeZoneInfo london = TimeZoneInfo.FindSystemTimeZoneById("Europe/London");
+        Assert(london.GetUtcOffset(secWinter).TotalHours() == 0, "london winter == 0");
+        Assert(london.GetUtcOffset(secSummer).TotalHours() == 1, "london summer == 1");
+        Assert(!london.IsDaylightSavingTime(secWinter), "london winter dst == false");
+        Assert(london.IsDaylightSavingTime(secSummer), "london summer dst == true");
+
+        // Sydney: UTC+10, DST = UTC+11 (Southern Hemisphere: Jan is summer/DST, Jun is winter/Standard)
+        TimeZoneInfo sydney = TimeZoneInfo.FindSystemTimeZoneById("Australia/Sydney");
+        Assert(sydney.GetUtcOffset(secWinter).TotalHours() == 11, "sydney Jan == 11");
+        Assert(sydney.GetUtcOffset(secSummer).TotalHours() == 10, "sydney Jun == 10");
+        Assert(sydney.IsDaylightSavingTime(secWinter), "sydney Jan dst == true");
+        Assert(!sydney.IsDaylightSavingTime(secSummer), "sydney Jun dst == false");
+
+        Console.WriteLine("PASS: TestFindSystemTimeZone");
+    }
+
+    private static void TestConversions() {
+        TimeZoneInfo sh = TimeZoneInfo.FindSystemTimeZoneById("Asia/Shanghai");
+        TimeZoneInfo ny = TimeZoneInfo.FindSystemTimeZoneById("America/New_York");
+
+        // Summer 2026-06-15 12:00:00 UTC
+        DateTime utcSummer = DateTime.FromParts(2026, 6, 15, 12, 0, 0);
+        DateTime shSummer = TimeZoneInfo.ConvertTimeFromUtc(utcSummer, sh);
+        DateTime nySummer = TimeZoneInfo.ConvertTimeFromUtc(utcSummer, ny);
+
+        Assert(shSummer.Year() == 2026 && shSummer.Month() == 6 && shSummer.Day() == 15, "shSummer date");
+        Assert(shSummer.Hour() == 20 && shSummer.Minute() == 0 && shSummer.Second() == 0, "shSummer time");
+
+        Assert(nySummer.Year() == 2026 && nySummer.Month() == 6 && nySummer.Day() == 15, "nySummer date");
+        Assert(nySummer.Hour() == 8 && nySummer.Minute() == 0 && nySummer.Second() == 0, "nySummer time");
+
+        // Winter 2026-01-15 12:00:00 UTC
+        DateTime utcWinter = DateTime.FromParts(2026, 1, 15, 12, 0, 0);
+        DateTime shWinter = TimeZoneInfo.ConvertTimeFromUtc(utcWinter, sh);
+        DateTime nyWinter = TimeZoneInfo.ConvertTimeFromUtc(utcWinter, ny);
+
+        Assert(shWinter.Hour() == 20, "shWinter hour == 20");
+        Assert(nyWinter.Hour() == 7, "nyWinter hour == 7 (standard time -5)");
+
+        // Convert between zones: Shanghai 20:00 summer -> NY 08:00 summer
+        DateTime nyFromSh = TimeZoneInfo.ConvertTime(shSummer, sh, ny);
+        Assert(nyFromSh.Hour() == 8 && nyFromSh.Day() == 15, "nyFromSh hour == 8");
+
+        // Convert back to UTC
+        DateTime backUtc = TimeZoneInfo.ConvertTimeToUtc(nySummer, ny);
+        Assert(backUtc.Hour() == 12 && backUtc.Day() == 15, "backUtc == 12:00");
+
+        Console.WriteLine("PASS: TestConversions");
+    }
+
+    private static void TestCustomTimeZone() {
+        TimeZoneInfo custom = TimeZoneInfo.CreateCustomTimeZone("Custom/Test", TimeSpan.FromHours(5), "Custom Display", "Custom Standard");
+        Assert(custom.Id == "Custom/Test", "custom.Id");
+        Assert(custom.BaseUtcOffset.TotalHours() == 5, "custom.BaseUtcOffset == 5");
+        Assert(!custom.SupportsDaylightSavingTime, "custom.SupportsDst == false");
+
+        DateTime dtUtc = DateTime.FromParts(2026, 5, 1, 10, 0, 0);
+        DateTime dtCustom = TimeZoneInfo.ConvertTimeFromUtc(dtUtc, custom);
+        Assert(dtCustom.Hour() == 15, "dtCustom hour == 15");
+        Console.WriteLine("PASS: TestCustomTimeZone");
+    }
+
+    private static void TestSyntheticTzif() {
+        byte[] synthetic = CreateSyntheticTzif();
+        TimeZoneInfo zone = TimeZoneInfo.FromTzData("Custom/Synthetic", synthetic);
+        Assert(zone != null, "zone != null");
+        if (zone == null) { return; }
+        Assert(zone.Id == "Custom/Synthetic", "zone.Id");
+        Assert(zone.BaseUtcOffset.TotalHours() == 2, "zone.BaseUtcOffset == 2");
+        Assert(!zone.SupportsDaylightSavingTime, "zone.SupportsDst == false");
+
+        DateTime dtUtc = DateTime.FromParts(2026, 7, 1, 0, 0, 0);
+        DateTime dtLocal = TimeZoneInfo.ConvertTimeFromUtc(dtUtc, zone);
+        Assert(dtLocal.Hour() == 2, "dtLocal hour == 2");
+        Console.WriteLine("PASS: TestSyntheticTzif");
+    }
+
+    private static void TestDateTimeUniversalRoundtrip() {
+        DateTime now = DateTime.Now();
+        DateTime utc = now.ToUniversalTime();
+        DateTime back = utc.ToLocalTime();
+        Assert(now.Year() == back.Year() && now.Month() == back.Month() && now.Day() == back.Day(), "roundtrip ymd");
+        Assert(now.Hour() == back.Hour() && now.Minute() == back.Minute() && now.Second() == back.Second(), "roundtrip hms");
+        Console.WriteLine("PASS: TestDateTimeUniversalRoundtrip");
+    }
+
+    private static byte[] CreateSyntheticTzif() {
+        List<byte> bytes = new List<byte>();
+
+        // v1 header
+        bytes.Add((byte)'T'); bytes.Add((byte)'Z'); bytes.Add((byte)'i'); bytes.Add((byte)'f');
+        bytes.Add((byte)'2'); // version 2
+        for (int i = 0; i < 15; i++) { bytes.Add(0); }
+        WriteInt32BE(bytes, 0);
+        WriteInt32BE(bytes, 0);
+        WriteInt32BE(bytes, 0);
+        WriteInt32BE(bytes, 0);
+        WriteInt32BE(bytes, 1);
+        WriteInt32BE(bytes, 4);
+        // v1 data
+        WriteInt32BE(bytes, 3600);
+        bytes.Add(0);
+        bytes.Add(0);
+        bytes.Add((byte)'T'); bytes.Add((byte)'S'); bytes.Add((byte)'T'); bytes.Add(0);
+
+        // v2 header
+        bytes.Add((byte)'T'); bytes.Add((byte)'Z'); bytes.Add((byte)'i'); bytes.Add((byte)'f');
+        bytes.Add((byte)'2');
+        for (int i = 0; i < 15; i++) { bytes.Add(0); }
+        WriteInt32BE(bytes, 0);
+        WriteInt32BE(bytes, 0);
+        WriteInt32BE(bytes, 0);
+        WriteInt32BE(bytes, 0);
+        WriteInt32BE(bytes, 1);
+        WriteInt32BE(bytes, 4);
+        // v2 data
+        WriteInt32BE(bytes, 7200); // +2 hours
+        bytes.Add(0);
+        bytes.Add(0);
+        bytes.Add((byte)'T'); bytes.Add((byte)'S'); bytes.Add((byte)'2'); bytes.Add(0);
+
+        // POSIX footer: "\nTST-2\n"
+        bytes.Add(10);
+        bytes.Add((byte)'T'); bytes.Add((byte)'S'); bytes.Add((byte)'T'); bytes.Add((byte)'-'); bytes.Add((byte)'2');
+        bytes.Add(10);
+
+        byte[] arr = new byte[bytes.Count];
+        for (int i = 0; i < bytes.Count; i++) {
+            arr[i] = bytes[i];
+        }
+        return arr;
+    }
+
+    private static void WriteInt32BE(List<byte> list, int val) {
+        list.Add((byte)((val >> 24) & 0xFF));
+        list.Add((byte)((val >> 16) & 0xFF));
+        list.Add((byte)((val >> 8) & 0xFF));
+        list.Add((byte)(val & 0xFF));
+    }
+}

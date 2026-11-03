@@ -1,0 +1,794 @@
+// TimeZoneInfo.zan -- IANA zoneinfo (RFC 8536), POSIX TZ 规则与跨平台时区转换
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Text;
+
+namespace System;
+
+/// <summary>
+/// POSIX TZ 规则中的夏令时起止规则定义（例如 M3.2.0/2 或 Jn 或 n）。
+/// </summary>
+public class PosixTransitionRule {
+    public int type; // 0: Mm.w.d, 1: Jn, 2: n
+    public int month; // 1-12
+    public int week; // 1-5 (5 = 最后一周)
+    public int dayOfWeek; // 0-6 (0 = 星期日)
+    public int julianDay; // 0-365
+    public int timeSec; // 切换时的本地墙钟秒数（默认 7200 = 02:00:00）
+
+    public PosixTransitionRule() {
+        this.type = 0;
+        this.month = 1;
+        this.week = 1;
+        this.dayOfWeek = 0;
+        this.julianDay = 0;
+        this.timeSec = 7200;
+    }
+
+    public static PosixTransitionRule Parse(string s) {
+        if (s == null || s.Length == 0) { return null; }
+        PosixTransitionRule rule = new PosixTransitionRule();
+        int slash = s.IndexOf('/');
+        string rulePart = s;
+        if (slash >= 0) {
+            rulePart = s.Substring(0, slash);
+            string timePart = s.Substring(slash + 1);
+            rule.timeSec = ParseTimeOffset(timePart);
+        }
+
+        if (rulePart.StartsWith("M")) {
+            rule.type = 0;
+            string body = rulePart.Substring(1);
+            int dot1 = body.IndexOf('.');
+            if (dot1 > 0) {
+                int dot2 = body.IndexOf('.', dot1 + 1);
+                if (dot2 > dot1) {
+                    string mStr = body.Substring(0, dot1);
+                    string wStr = body.Substring(dot1 + 1, dot2 - (dot1 + 1));
+                    string dStr = body.Substring(dot2 + 1);
+                    rule.month = int.Parse(mStr);
+                    rule.week = int.Parse(wStr);
+                    rule.dayOfWeek = int.Parse(dStr);
+                }
+            }
+        } else if (rulePart.StartsWith("J")) {
+            rule.type = 1;
+            rule.julianDay = int.Parse(rulePart.Substring(1));
+        } else {
+            rule.type = 2;
+            rule.julianDay = int.Parse(rulePart);
+        }
+        return rule;
+    }
+
+    private static int ParseTimeOffset(string s) {
+        if (s == null || s.Length == 0) { return 7200; }
+        int sign = 1;
+        int i = 0;
+        if (s[0] == '-') { sign = -1; i = 1; }
+        else if (s[0] == '+') { i = 1; }
+        int colon1 = s.IndexOf(':', i);
+        int h = 0, m = 0, sec = 0;
+        if (colon1 < 0) {
+            h = int.Parse(s.Substring(i));
+        } else {
+            h = int.Parse(s.Substring(i, colon1 - i));
+            int colon2 = s.IndexOf(':', colon1 + 1);
+            if (colon2 < 0) {
+                m = int.Parse(s.Substring(colon1 + 1));
+            } else {
+                m = int.Parse(s.Substring(colon1 + 1, colon2 - (colon1 + 1)));
+                sec = int.Parse(s.Substring(colon2 + 1));
+            }
+        }
+        return sign * (h * 3600 + m * 60 + sec);
+    }
+}
+
+/// <summary>
+/// POSIX.1-2017 TZ 规则解析器与评估器（例如 "EST5EDT,M3.2.0,M11.1.0" 或 "CST-8"）。
+/// </summary>
+public class PosixRule {
+    public string stdName;
+    public int stdOffsetSec; // 从本地到 UTC 的偏移秒数（例如东八区 CST 为 +28800）
+    public string dstName;
+    public int dstOffsetSec; // 夏令时期间从本地到 UTC 的偏移秒数
+    public bool hasDst;
+    public PosixTransitionRule dstStart;
+    public PosixTransitionRule dstEnd;
+
+    public PosixRule() {
+        this.stdName = "UTC";
+        this.stdOffsetSec = 0;
+        this.dstName = "";
+        this.dstOffsetSec = 0;
+        this.hasDst = false;
+        this.dstStart = null;
+        this.dstEnd = null;
+    }
+
+    public static PosixRule Parse(string s) {
+        if (s == null || s.Length == 0) { return null; }
+        PosixRule rule = new PosixRule();
+        int idx = 0;
+        int len = s.Length;
+
+        rule.stdName = ParseName(s, ref idx);
+        if (rule.stdName.Length == 0) { return null; }
+
+        int stdPosixOffset = ParseOffset(s, ref idx);
+        // POSIX 符号惯例：西为正、东为负；UTC 偏移与此相反
+        rule.stdOffsetSec = -stdPosixOffset;
+
+        if (idx < len && s[idx] != ',') {
+            rule.dstName = ParseName(s, ref idx);
+            if (rule.dstName.Length > 0) {
+                rule.hasDst = true;
+                if (idx < len && s[idx] != ',') {
+                    int dstPosixOffset = ParseOffset(s, ref idx);
+                    rule.dstOffsetSec = -dstPosixOffset;
+                } else {
+                    // 默认夏令时比标准时间早 1 小时
+                    rule.dstOffsetSec = rule.stdOffsetSec + 3600;
+                }
+            }
+        }
+
+        if (rule.hasDst && idx < len && s[idx] == ',') {
+            idx++;
+            int comma2 = s.IndexOf(',', idx);
+            if (comma2 > idx) {
+                string startStr = s.Substring(idx, comma2 - idx);
+                string endStr = s.Substring(comma2 + 1);
+                rule.dstStart = PosixTransitionRule.Parse(startStr);
+                rule.dstEnd = PosixTransitionRule.Parse(endStr);
+            }
+        }
+        return rule;
+    }
+
+    private static string ParseName(string s, ref int idx) {
+        int len = s.Length;
+        if (idx >= len) { return ""; }
+        if (s[idx] == '<') {
+            idx++;
+            int start = idx;
+            while (idx < len && s[idx] != '>') { idx++; }
+            string name = s.Substring(start, idx - start);
+            if (idx < len && s[idx] == '>') { idx++; }
+            return name;
+        }
+        int st = idx;
+        while (idx < len) {
+            char c = s[idx];
+            if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')) {
+                idx++;
+            } else {
+                break;
+            }
+        }
+        return s.Substring(st, idx - st);
+    }
+
+    private static int ParseOffset(string s, ref int idx) {
+        int len = s.Length;
+        if (idx >= len) { return 0; }
+        int sign = 1;
+        if (s[idx] == '-') {
+            sign = -1;
+            idx++;
+        } else if (s[idx] == '+') {
+            idx++;
+        }
+
+        int h = 0;
+        while (idx < len && s[idx] >= '0' && s[idx] <= '9') {
+            h = h * 10 + ((int)s[idx] - 48);
+            idx++;
+        }
+        int m = 0;
+        if (idx < len && s[idx] == ':') {
+            idx++;
+            while (idx < len && s[idx] >= '0' && s[idx] <= '9') {
+                m = m * 10 + ((int)s[idx] - 48);
+                idx++;
+            }
+        }
+        int sec = 0;
+        if (idx < len && s[idx] == ':') {
+            idx++;
+            while (idx < len && s[idx] >= '0' && s[idx] <= '9') {
+                sec = sec * 10 + ((int)s[idx] - 48);
+                idx++;
+            }
+        }
+        return sign * (h * 3600 + m * 60 + sec);
+    }
+
+    public long ComputeTransitionUtc(int year, PosixTransitionRule tr, int baseOffsetSec) {
+        if (tr == null) { return 0L; }
+        int targetDay = 1;
+        if (tr.type == 0) { // Mm.w.d
+            int days = DateTime.DaysFromCivil(year, tr.month, 1);
+            int wday1 = (days % 7 + 4) % 7;
+            if (wday1 < 0) { wday1 += 7; }
+            int diff = tr.dayOfWeek - wday1;
+            if (diff < 0) { diff += 7; }
+            int day1 = 1 + diff;
+            if (tr.week >= 1 && tr.week <= 4) {
+                targetDay = day1 + (tr.week - 1) * 7;
+            } else {
+                targetDay = day1 + 28;
+                int dim = DateTime.DaysInMonth(year, tr.month);
+                if (targetDay > dim) { targetDay -= 7; }
+            }
+            int totalDays = DateTime.DaysFromCivil(year, tr.month, targetDay);
+            long wallSec = (long)totalDays * 86400L + (long)tr.timeSec;
+            return wallSec - (long)baseOffsetSec;
+        } else if (tr.type == 1) { // Jn
+            int totalDays = DateTime.DaysFromCivil(year, 1, 1) + (tr.julianDay - 1);
+            long wallSec = (long)totalDays * 86400L + (long)tr.timeSec;
+            return wallSec - (long)baseOffsetSec;
+        } else { // n
+            int totalDays = DateTime.DaysFromCivil(year, 1, 1) + tr.julianDay;
+            long wallSec = (long)totalDays * 86400L + (long)tr.timeSec;
+            return wallSec - (long)baseOffsetSec;
+        }
+    }
+
+    public bool IsDaylightSavingTime(long unixSeconds) {
+        if (!this.hasDst || this.dstStart == null || this.dstEnd == null) {
+            return false;
+        }
+        int days = (int)(unixSeconds / 86400L);
+        int year, m, d;
+        DateTime.CivilFromDays(days, out year, out m, out d);
+
+        long startUtc = ComputeTransitionUtc(year, this.dstStart, this.stdOffsetSec);
+        long endUtc = ComputeTransitionUtc(year, this.dstEnd, this.dstOffsetSec);
+
+        if (startUtc < endUtc) {
+            // 北半球夏季夏令时
+            return unixSeconds >= startUtc && unixSeconds < endUtc;
+        } else {
+            // 南半球跨年夏令时
+            return unixSeconds >= startUtc || unixSeconds < endUtc;
+        }
+    }
+
+    public int GetUtcOffsetSeconds(long unixSeconds) {
+        if (IsDaylightSavingTime(unixSeconds)) {
+            return this.dstOffsetSec;
+        }
+        return this.stdOffsetSec;
+    }
+}
+
+/// <summary>
+/// 跨平台时区信息类。支持 IANA TZif (RFC 8536 v1/v2/v3)、POSIX TZ 规则、内建时区库及跨时区转换。
+/// </summary>
+public class TimeZoneInfo {
+    private string id;
+    private string displayName;
+    private string standardName;
+    private string daylightName;
+    private TimeSpan baseUtcOffset;
+    private bool supportsDaylightSavingTime;
+    private List<long> transitionTimes;
+    private List<int> transitionOffsets;
+    private List<bool> transitionIsDst;
+    private List<string> transitionAbbrevs;
+    private PosixRule posixRule;
+
+    public string Id { get { return this.id; } }
+    public string DisplayName { get { return this.displayName; } }
+    public string StandardName { get { return this.standardName; } }
+    public string DaylightName { get { return this.daylightName; } }
+    public TimeSpan BaseUtcOffset { get { return this.baseUtcOffset; } }
+    public bool SupportsDaylightSavingTime { get { return this.supportsDaylightSavingTime; } }
+
+    private static TimeZoneInfo utc;
+    private static TimeZoneInfo local;
+
+    public static TimeZoneInfo Utc {
+        get {
+            if (utc == null) {
+                utc = CreateCustomTimeZone("UTC", TimeSpan.FromSeconds(0), "Coordinated Universal Time", "UTC");
+            }
+            return utc;
+        }
+    }
+
+    public static TimeZoneInfo Local {
+        get {
+            if (local == null) {
+                local = ResolveLocal();
+            }
+            return local;
+        }
+    }
+
+    public TimeZoneInfo() {
+        this.id = "UTC";
+        this.displayName = "UTC";
+        this.standardName = "UTC";
+        this.daylightName = "UTC";
+        this.baseUtcOffset = TimeSpan.FromSeconds(0);
+        this.supportsDaylightSavingTime = false;
+        this.transitionTimes = new List<long>();
+        this.transitionOffsets = new List<int>();
+        this.transitionIsDst = new List<bool>();
+        this.transitionAbbrevs = new List<string>();
+        this.posixRule = null;
+    }
+
+    public static TimeZoneInfo CreateCustomTimeZone(string id, TimeSpan baseUtcOffset, string displayName, string standardDisplayName) {
+        return CreateCustomTimeZone(id, baseUtcOffset, displayName, standardDisplayName, standardDisplayName, TimeSpan.FromSeconds(0));
+    }
+
+    public static TimeZoneInfo CreateCustomTimeZone(string id, TimeSpan baseUtcOffset, string displayName, string standardDisplayName, string daylightDisplayName, TimeSpan daylightDelta) {
+        TimeZoneInfo tzi = new TimeZoneInfo();
+        tzi.id = id;
+        tzi.displayName = displayName;
+        tzi.standardName = standardDisplayName;
+        tzi.daylightName = daylightDisplayName;
+        tzi.baseUtcOffset = baseUtcOffset;
+        tzi.supportsDaylightSavingTime = daylightDelta.TotalSeconds() != 0;
+        return tzi;
+    }
+
+    public static TimeZoneInfo FromPosixString(string id, string posixTz) {
+        PosixRule rule = PosixRule.Parse(posixTz);
+        if (rule == null) { return null; }
+        TimeZoneInfo tzi = new TimeZoneInfo();
+        tzi.id = id;
+        tzi.displayName = id;
+        tzi.standardName = rule.stdName;
+        tzi.daylightName = rule.dstName;
+        tzi.baseUtcOffset = TimeSpan.FromSeconds(rule.stdOffsetSec);
+        tzi.supportsDaylightSavingTime = rule.hasDst;
+        tzi.posixRule = rule;
+        return tzi;
+    }
+
+    private static int ReadInt32BE(byte[] data, int offset) {
+        int b0 = (int)data[offset] & 0xFF;
+        int b1 = (int)data[offset + 1] & 0xFF;
+        int b2 = (int)data[offset + 2] & 0xFF;
+        int b3 = (int)data[offset + 3] & 0xFF;
+        return (b0 << 24) | (b1 << 16) | (b2 << 8) | b3;
+    }
+
+    private static long ReadInt64BE(byte[] data, int offset) {
+        long hi = (long)ReadInt32BE(data, offset);
+        long lo = (long)ReadInt32BE(data, offset + 4);
+        lo = lo & 0xFFFFFFFFL;
+        return (hi << 32) | lo;
+    }
+
+    /// <summary>
+    /// 从 RFC 8536 TZif 二进制字节流解析时区信息（支持 v1/v2/v3，优先提取 64 位转换时间戳与 POSIX 规则）。
+    /// </summary>
+    public static TimeZoneInfo FromTzData(string id, byte[] data) {
+        if (data == null || data.Length < 44) { return null; }
+        if (data[0] != (byte)84 || data[1] != (byte)90 || data[2] != (byte)105 || data[3] != (byte)102) {
+            return null; // Magic 不是 "TZif"
+        }
+        byte ver = data[4];
+        int ttisutccnt = ReadInt32BE(data, 20);
+        int ttisstdcnt = ReadInt32BE(data, 24);
+        int leapcnt    = ReadInt32BE(data, 28);
+        int timecnt    = ReadInt32BE(data, 32);
+        int typecnt    = ReadInt32BE(data, 36);
+        int charcnt    = ReadInt32BE(data, 40);
+
+        int v1DataSize = timecnt * 4 + timecnt + typecnt * 6 + charcnt + leapcnt * 8 + ttisstdcnt + ttisutccnt;
+        bool hasV2 = (ver == (byte)50 || ver == (byte)51 || ver == (byte)52) && (data.Length >= 44 + v1DataSize + 44);
+
+        int hdr = 0;
+        int p = 44;
+        bool use64 = false;
+
+        if (hasV2) {
+            hdr = 44 + v1DataSize;
+            if (data[hdr] == (byte)84 && data[hdr+1] == (byte)90 && data[hdr+2] == (byte)105 && data[hdr+3] == (byte)102) {
+                ttisutccnt = ReadInt32BE(data, hdr + 20);
+                ttisstdcnt = ReadInt32BE(data, hdr + 24);
+                leapcnt    = ReadInt32BE(data, hdr + 28);
+                timecnt    = ReadInt32BE(data, hdr + 32);
+                typecnt    = ReadInt32BE(data, hdr + 36);
+                charcnt    = ReadInt32BE(data, hdr + 40);
+                p = hdr + 44;
+                use64 = true;
+            }
+        }
+
+        List<long> times = new List<long>();
+        for (int i = 0; i < timecnt; i++) {
+            if (use64) {
+                times.Add(ReadInt64BE(data, p));
+                p += 8;
+            } else {
+                times.Add((long)ReadInt32BE(data, p));
+                p += 4;
+            }
+        }
+
+        List<int> typeIndices = new List<int>();
+        for (int i = 0; i < timecnt; i++) {
+            typeIndices.Add((int)data[p] & 0xFF);
+            p += 1;
+        }
+
+        List<int> utoffs = new List<int>();
+        List<bool> isdsts = new List<bool>();
+        List<int> desigidxs = new List<int>();
+        for (int i = 0; i < typecnt; i++) {
+            int utoff = ReadInt32BE(data, p); p += 4;
+            bool isdst = data[p] != 0; p += 1;
+            int desig = (int)data[p] & 0xFF; p += 1;
+            utoffs.Add(utoff);
+            isdsts.Add(isdst);
+            desigidxs.Add(desig);
+        }
+
+        int charStart = p;
+        p += charcnt;
+        p += (use64 ? (leapcnt * 12) : (leapcnt * 8)) + ttisstdcnt + ttisutccnt;
+
+        List<string> abbrevs = new List<string>();
+        for (int i = 0; i < typecnt; i++) {
+            int dIdx = desigidxs[i];
+            int s = charStart + dIdx;
+            int e = s;
+            while (e < charStart + charcnt && data[e] != 0) {
+                e++;
+            }
+            abbrevs.Add(Encoding.GetString(data, s, e - s));
+        }
+
+        PosixRule posix = null;
+        if (use64 && p < data.Length) {
+            int ruleStart = p;
+            int ruleEnd = data.Length;
+            while (ruleStart < ruleEnd && (data[ruleStart] == 10 || data[ruleStart] == 13 || data[ruleStart] == 32)) {
+                ruleStart++;
+            }
+            while (ruleEnd > ruleStart && (data[ruleEnd - 1] == 10 || data[ruleEnd - 1] == 13 || data[ruleEnd - 1] == 32)) {
+                ruleEnd--;
+            }
+            if (ruleEnd > ruleStart) {
+                string posixStr = Encoding.GetString(data, ruleStart, ruleEnd - ruleStart);
+                posix = PosixRule.Parse(posixStr);
+            }
+        }
+
+        List<int> transOffsets = new List<int>();
+        List<bool> transIsDst = new List<bool>();
+        List<string> transAbbrevs = new List<string>();
+        bool anyDst = false;
+        for (int i = 0; i < timecnt; i++) {
+            int tIdx = typeIndices[i];
+            if (tIdx >= 0 && tIdx < utoffs.Count) {
+                transOffsets.Add(utoffs[tIdx]);
+                bool d = isdsts[tIdx];
+                transIsDst.Add(d);
+                if (d) { anyDst = true; }
+                transAbbrevs.Add(abbrevs[tIdx]);
+            } else {
+                transOffsets.Add(0);
+                transIsDst.Add(false);
+                transAbbrevs.Add("");
+            }
+        }
+
+        int baseOffset = 0;
+        string stdName = id;
+        string dstName = id;
+        if (typecnt > 0) {
+            int stdIdx = -1;
+            for (int i = 0; i < typecnt; i++) {
+                if (!isdsts[i]) { stdIdx = i; break; }
+            }
+            if (stdIdx < 0) { stdIdx = 0; }
+            baseOffset = utoffs[stdIdx];
+            stdName = abbrevs[stdIdx];
+            for (int i = 0; i < typecnt; i++) {
+                if (isdsts[i]) { dstName = abbrevs[i]; break; }
+            }
+        }
+        if (posix != null) {
+            if (posix.hasDst) { anyDst = true; }
+            if (posix.stdName != null && posix.stdName.Length > 0) { stdName = posix.stdName; }
+            if (posix.dstName != null && posix.dstName.Length > 0) { dstName = posix.dstName; }
+        }
+
+        TimeZoneInfo tzi = new TimeZoneInfo();
+        tzi.id = id;
+        tzi.displayName = id;
+        tzi.standardName = stdName;
+        tzi.daylightName = dstName;
+        tzi.baseUtcOffset = TimeSpan.FromSeconds(baseOffset);
+        tzi.supportsDaylightSavingTime = anyDst;
+        tzi.transitionTimes = times;
+        tzi.transitionOffsets = transOffsets;
+        tzi.transitionIsDst = transIsDst;
+        tzi.transitionAbbrevs = transAbbrevs;
+        tzi.posixRule = posix;
+        return tzi;
+    }
+
+    public TimeSpan GetUtcOffset(long unixSeconds) {
+        if (this.transitionTimes != null && this.transitionTimes.Count > 0) {
+            if (unixSeconds < this.transitionTimes[0]) {
+                for (int i = 0; i < this.transitionOffsets.Count; i++) {
+                    if (!this.transitionIsDst[i]) {
+                        return TimeSpan.FromSeconds(this.transitionOffsets[i]);
+                    }
+                }
+                return TimeSpan.FromSeconds(this.transitionOffsets[0]);
+            }
+            int lo = 0;
+            int hi = this.transitionTimes.Count - 1;
+            while (lo <= hi) {
+                int mid = (lo + hi) / 2;
+                if (this.transitionTimes[mid] <= unixSeconds) {
+                    lo = mid + 1;
+                } else {
+                    hi = mid - 1;
+                }
+            }
+            int idx = lo - 1;
+            if (idx == this.transitionTimes.Count - 1 && this.posixRule != null) {
+                return TimeSpan.FromSeconds(this.posixRule.GetUtcOffsetSeconds(unixSeconds));
+            }
+            if (idx >= 0 && idx < this.transitionOffsets.Count) {
+                return TimeSpan.FromSeconds(this.transitionOffsets[idx]);
+            }
+        }
+        if (this.posixRule != null) {
+            return TimeSpan.FromSeconds(this.posixRule.GetUtcOffsetSeconds(unixSeconds));
+        }
+        return this.baseUtcOffset;
+    }
+
+    public TimeSpan GetUtcOffset(DateTime dateTime) {
+        return GetUtcOffset(dateTime.ToUnixSeconds());
+    }
+
+    public bool IsDaylightSavingTime(long unixSeconds) {
+        if (this.transitionTimes != null && this.transitionTimes.Count > 0) {
+            if (unixSeconds < this.transitionTimes[0]) {
+                return false;
+            }
+            int lo = 0;
+            int hi = this.transitionTimes.Count - 1;
+            while (lo <= hi) {
+                int mid = (lo + hi) / 2;
+                if (this.transitionTimes[mid] <= unixSeconds) {
+                    lo = mid + 1;
+                } else {
+                    hi = mid - 1;
+                }
+            }
+            int idx = lo - 1;
+            if (idx == this.transitionTimes.Count - 1 && this.posixRule != null) {
+                return this.posixRule.IsDaylightSavingTime(unixSeconds);
+            }
+            if (idx >= 0 && idx < this.transitionIsDst.Count) {
+                return this.transitionIsDst[idx];
+            }
+        }
+        if (this.posixRule != null) {
+            return this.posixRule.IsDaylightSavingTime(unixSeconds);
+        }
+        return false;
+    }
+
+    public bool IsDaylightSavingTime(DateTime dateTime) {
+        return IsDaylightSavingTime(dateTime.ToUnixSeconds());
+    }
+
+    public static DateTime ConvertTimeFromUtc(DateTime dateTime, TimeZoneInfo destinationTimeZone) {
+        if (destinationTimeZone == null) { return dateTime; }
+        long utcSec = dateTime.ToUnixSeconds();
+        TimeSpan offset = destinationTimeZone.GetUtcOffset(utcSec);
+        long destSec = utcSec + offset.TotalSeconds();
+        return DateTime.FromUnixMilliseconds(destSec * 1000 + (long)dateTime.Millisecond());
+    }
+
+    public static DateTime ConvertTimeToUtc(DateTime dateTime) {
+        return ConvertTimeToUtc(dateTime, TimeZoneInfo.Local);
+    }
+
+    public static DateTime ConvertTimeToUtc(DateTime dateTime, TimeZoneInfo sourceTimeZone) {
+        if (sourceTimeZone == null) { return dateTime; }
+        long localSec = dateTime.ToUnixSeconds();
+        TimeSpan baseOff = sourceTimeZone.BaseUtcOffset;
+        long approxUtc = localSec - baseOff.TotalSeconds();
+        TimeSpan exactOff = sourceTimeZone.GetUtcOffset(approxUtc);
+        long utcSec = localSec - exactOff.TotalSeconds();
+        return DateTime.FromUnixMilliseconds(utcSec * 1000 + (long)dateTime.Millisecond());
+    }
+
+    public static DateTime ConvertTime(DateTime dateTime, TimeZoneInfo destinationTimeZone) {
+        return ConvertTime(dateTime, TimeZoneInfo.Local, destinationTimeZone);
+    }
+
+    public static DateTime ConvertTime(DateTime dateTime, TimeZoneInfo sourceTimeZone, TimeZoneInfo destinationTimeZone) {
+        DateTime utc = ConvertTimeToUtc(dateTime, sourceTimeZone);
+        return ConvertTimeFromUtc(utc, destinationTimeZone);
+    }
+
+    private static string GetBuiltinPosixRule(string id) {
+        if (id == null) { return null; }
+        if (id == "UTC" || id == "Etc/UTC" || id == "GMT" || id == "Etc/GMT") {
+            return "UTC0";
+        }
+        if (id == "Asia/Shanghai" || id == "Asia/Chongqing" || id == "Asia/Hong_Kong" || id == "Asia/Taipei" || id == "PRC") {
+            return "CST-8";
+        }
+        if (id == "Asia/Tokyo" || id == "Japan") {
+            return "JST-9";
+        }
+        if (id == "Asia/Seoul" || id == "ROK") {
+            return "KST-9";
+        }
+        if (id == "Asia/Singapore") {
+            return "SGT-8";
+        }
+        if (id == "Asia/Kolkata" || id == "Asia/Calcutta") {
+            return "IST-5:30";
+        }
+        if (id == "Asia/Bangkok" || id == "Asia/Jakarta") {
+            return "ICT-7";
+        }
+        if (id == "Asia/Dubai") {
+            return "GST-4";
+        }
+        if (id == "Europe/London" || id == "GB" || id == "Europe/Belfast") {
+            return "GMT0BST,M3.5.0/1,M10.5.0/2";
+        }
+        if (id == "Europe/Paris" || id == "Europe/Berlin" || id == "Europe/Rome" || id == "Europe/Madrid" ||
+            id == "Europe/Amsterdam" || id == "Europe/Brussels" || id == "Europe/Vienna" || id == "Europe/Stockholm" || id == "CET") {
+            return "CET-1CEST,M3.5.0/2,M10.5.0/3";
+        }
+        if (id == "Europe/Athens" || id == "Europe/Helsinki" || id == "Europe/Kyiv" || id == "Europe/Bucharest" || id == "EET") {
+            return "EET-2EEST,M3.5.0/3,M10.5.0/4";
+        }
+        if (id == "Europe/Moscow") {
+            return "MSK-3";
+        }
+        if (id == "America/New_York" || id == "US/Eastern" || id == "EST5EDT") {
+            return "EST5EDT,M3.2.0,M11.1.0";
+        }
+        if (id == "America/Chicago" || id == "US/Central" || id == "CST6CDT") {
+            return "CST6CDT,M3.2.0,M11.1.0";
+        }
+        if (id == "America/Denver" || id == "US/Mountain" || id == "MST7MDT") {
+            return "MST7MDT,M3.2.0,M11.1.0";
+        }
+        if (id == "America/Los_Angeles" || id == "US/Pacific" || id == "PST8PDT") {
+            return "PST8PDT,M3.2.0,M11.1.0";
+        }
+        if (id == "America/Anchorage" || id == "US/Alaska") {
+            return "AKST9AKDT,M3.2.0,M11.1.0";
+        }
+        if (id == "America/Honolulu" || id == "US/Hawaii") {
+            return "HST10";
+        }
+        if (id == "America/Sao_Paulo") {
+            return "BRT3";
+        }
+        if (id == "America/Argentina/Buenos_Aires") {
+            return "ART3";
+        }
+        if (id == "Australia/Sydney" || id == "Australia/Melbourne") {
+            return "AEST-10AEDT,M10.1.0,M4.1.0/3";
+        }
+        if (id == "Australia/Brisbane") {
+            return "AEST-10";
+        }
+        if (id == "Australia/Perth") {
+            return "AWST-8";
+        }
+        if (id == "Pacific/Auckland") {
+            return "NZST-12NZDT,M9.5.0,M4.1.0/3";
+        }
+
+        if (id.StartsWith("UTC+") || id.StartsWith("GMT+") || id.StartsWith("+")) {
+            string numStr = id.Substring(id.IndexOf('+') + 1);
+            return "UTC-" + numStr;
+        }
+        if (id.StartsWith("UTC-") || id.StartsWith("GMT-") || id.StartsWith("-")) {
+            string numStr = id.Substring(id.IndexOf('-') + 1);
+            return "UTC+" + numStr;
+        }
+        return null;
+    }
+
+    public static bool TryFindSystemTimeZoneById(string id, out TimeZoneInfo result) {
+        result = null;
+        if (id == null || id.Length == 0) { return false; }
+        if (id == "UTC" || id == "Etc/UTC") {
+            result = TimeZoneInfo.Utc;
+            return true;
+        }
+
+        List<string> zoneRoots = new List<string>();
+        string tzDir = Environment.GetEnvironmentVariable("TZDIR");
+        if (tzDir != null && tzDir.Length > 0) {
+            zoneRoots.Add(tzDir);
+        }
+        zoneRoots.Add("/usr/share/zoneinfo");
+        zoneRoots.Add("/usr/lib/zoneinfo");
+        zoneRoots.Add("/etc/zoneinfo");
+        zoneRoots.Add("/var/db/timezone/zoneinfo");
+        zoneRoots.Add("C:/Program Files/Git/usr/share/zoneinfo");
+
+        for (int i = 0; i < zoneRoots.Count; i++) {
+            string root = zoneRoots[i];
+            string path = root + "/" + id;
+            if (File.Exists(path)) {
+                byte[] data = File.ReadAllBytes(path);
+                if (data != null && data.Length >= 44) {
+                    TimeZoneInfo tzi = FromTzData(id, data);
+                    if (tzi != null) {
+                        result = tzi;
+                        return true;
+                    }
+                }
+            }
+        }
+
+        string fallbackPosix = GetBuiltinPosixRule(id);
+        if (fallbackPosix != null) {
+            TimeZoneInfo tzi = FromPosixString(id, fallbackPosix);
+            if (tzi != null) {
+                result = tzi;
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    public static TimeZoneInfo FindSystemTimeZoneById(string id) {
+        TimeZoneInfo result;
+        if (TryFindSystemTimeZoneById(id, out result)) {
+            return result;
+        }
+        throw new Exception("Time zone not found: " + id);
+    }
+
+    private static TimeZoneInfo ResolveLocal() {
+        string tz = Environment.GetEnvironmentVariable("TZ");
+        if (tz != null && tz.Length > 0) {
+            if (tz.StartsWith(":")) {
+                tz = tz.Substring(1);
+            }
+            TimeZoneInfo fromId;
+            if (TryFindSystemTimeZoneById(tz, out fromId)) {
+                return fromId;
+            }
+            TimeZoneInfo fromPosix = FromPosixString("Local", tz);
+            if (fromPosix != null) {
+                return fromPosix;
+            }
+        }
+
+        if (File.Exists("/etc/localtime")) {
+            byte[] data = File.ReadAllBytes("/etc/localtime");
+            if (data != null && data.Length >= 44) {
+                TimeZoneInfo tzi = FromTzData("Local", data);
+                if (tzi != null) {
+                    return tzi;
+                }
+            }
+        }
+
+        int offsetMinutes = DateTime.LocalOffsetMinutes();
+        return CreateCustomTimeZone("Local", TimeSpan.FromMinutes(offsetMinutes), "Local Time", "Local Time");
+    }
+}
