@@ -1,0 +1,128 @@
+using System;
+using System.Collections.Generic;
+using System.Data;
+using System.Data.Orm;
+using System.Data.Sqlite;
+using System.IO;
+
+class Program {
+    static int bad = 0;
+
+    static void Check(bool cond, string name) {
+        if (cond) {
+            Console.WriteLine("ok " + name);
+        } else {
+            bad = bad + 1;
+            Console.WriteLine("FAIL " + name);
+        }
+    }
+
+    static void Main() {
+        // 1. Dialect.QuoteIdentifier 方言转义单元测试
+        Check(Dialect.QuoteIdentifier(DbProvider.MySQL, "order") == "`order`", "mysql quote");
+        Check(Dialect.QuoteIdentifier(DbProvider.MariaDB, "order") == "`order`", "mariadb quote");
+        Check(Dialect.QuoteIdentifier(DbProvider.SqlServer, "order") == "[order]", "sqlserver quote");
+        Check(Dialect.QuoteIdentifier(DbProvider.SQLite, "order") == "\"order\"", "sqlite quote");
+        Check(Dialect.QuoteIdentifier(DbProvider.PostgreSQL, "order") == "\"order\"", "pg quote");
+        Check(Dialect.QuoteIdentifier(DbProvider.Oracle, "order") == "\"order\"", "oracle quote");
+
+        // 复合标识符 a.b.c 转义测试
+        Check(Dialect.QuoteIdentifier(DbProvider.MySQL, "dbo.order.desc") == "`dbo`.`order`.`desc`", "mysql dotted quote");
+        Check(Dialect.QuoteIdentifier(DbProvider.SqlServer, "dbo.order.desc") == "[dbo].[order].[desc]", "sqlserver dotted quote");
+        Check(Dialect.QuoteIdentifier(DbProvider.PostgreSQL, "public.order.desc") == "\"public\".\"order\".\"desc\"", "pg dotted quote");
+
+        // 2. 真实 SQLite 数据库中的关键字表名与关键字列名执行（防崩毁实测）
+        string path = "orm_keyword_ident.tmp.db";
+        File.Delete(path);
+        SqliteConnection db = SqliteConnection.Open(path);
+
+        // 创建全由保留关键字组成的表与列
+        db.Execute("CREATE TABLE \"Order\" (\"id\" INTEGER PRIMARY KEY, \"group\" TEXT, \"desc\" TEXT, \"table\" TEXT, \"key\" INTEGER)");
+
+        // 3. QueryBuilder DML 参数化测试
+        QueryBuilder qbIns = QueryBuilder.InsertInto("Order")
+            .Set("id", "1")
+            .Set("group", "admin")
+            .Set("desc", "vip order")
+            .Set("table", "t1")
+            .SetInt("key", 999);
+        int affIns = db.Execute(qbIns.BuildInsertParams(), qbIns.InsertParams());
+        Check(affIns == 1, "qb insert keyword table & cols");
+
+        QueryBuilder qbSel = QueryBuilder.From("Order").WhereEq("group", "admin");
+        DbResult rSel = db.Query(qbSel.BuildSelectParams("*"), qbSel.SelectParams());
+        Check(rSel.RowCount() == 1, "qb select keyword row count");
+        Check(rSel.GetString(0, 1) == "admin", "qb select col group");
+        Check(rSel.GetString(0, 2) == "vip order", "qb select col desc");
+        Check(rSel.GetInt(0, 4) == 999, "qb select col key");
+
+        QueryBuilder qbUpd = QueryBuilder.Update("Order")
+            .Set("desc", "updated vip order")
+            .WhereEq("group", "admin");
+        int affUpd = db.Execute(qbUpd.BuildUpdateParams(), qbUpd.UpdateParams());
+        Check(affUpd == 1, "qb update keyword table & cols");
+
+        DbResult rUpd = db.Query("SELECT \"desc\" FROM \"Order\" WHERE \"group\" = 'admin'");
+        Check(rUpd.GetString(0, 0) == "updated vip order", "qb updated content verify");
+
+        QueryBuilder qbDel = QueryBuilder.DeleteFrom("Order").WhereEq("group", "admin");
+        int affDel = db.Execute(qbDel.BuildDeleteParams(), qbDel.SelectParams());
+        Check(affDel == 1, "qb delete keyword table & cols");
+
+        DbResult rEmpty = db.Query("SELECT COUNT(*) FROM \"Order\"");
+        Check(rEmpty.GetInt(0, 0) == 0, "qb table empty after delete");
+
+        // 4. ORM 实体层 Meta / Insert / Select / Update / Delete 实体对象闭环
+        Meta m = Meta.Of("Order", "Order");
+        m.Col("id", "id", DbParams.KindInt, true, true, true, true, 0);
+        m.Col("group", "group", DbParams.KindText, false, false, false, true, 50);
+        m.Col("desc", "desc", DbParams.KindText, false, false, false, true, 100);
+        m.Col("table", "table", DbParams.KindText, false, false, false, true, 50);
+        m.Col("key", "key", DbParams.KindInt, false, false, false, true, 0);
+        m.Seal();
+
+        Insert ormIns = Insert.Create(db, m);
+        DbValues v1 = new DbValues();
+        v1.Set("id", 10);
+        v1.Set("group", "eng");
+        v1.Set("desc", "eng order");
+        v1.Set("table", "dev_tbl");
+        v1.Set("key", 1234);
+        ormIns.AddDict(v1);
+        int affOrmIns = ormIns.ExecuteAffrows();
+        Check(affOrmIns == 1, "orm insert keyword entity");
+
+        Select ormSel = Select.Create(db, m);
+        ormSel.WhereEq("group", "eng");
+        DbResult ormRows = ormSel.Rows();
+        Check(ormRows.RowCount() == 1, "orm select keyword entity");
+        Check(ormRows.GetString(0, 2) == "eng order", "orm select desc val");
+
+        Update ormUpd = Update.Create(db, m);
+        ormUpd.SetS("desc", "modified eng order");
+        ormUpd.WhereEq("group", "eng");
+        int affOrmUpd = ormUpd.ExecuteAffrows();
+        Check(affOrmUpd == 1, "orm update keyword entity");
+
+        Select ormSel2 = Select.Create(db, m);
+        ormSel2.WhereEq("group", "eng");
+        DbResult ormRows2 = ormSel2.Rows();
+        Check(ormRows2.GetString(0, 2) == "modified eng order", "orm verify modified desc");
+
+        Delete ormDel = Delete.Create(db, m);
+        ormDel.WhereEq("group", "eng");
+        int affOrmDel = ormDel.ExecuteAffrows();
+        Check(affOrmDel == 1, "orm delete keyword entity");
+
+        Select ormSelFinal = Select.Create(db, m);
+        Check(ormSelFinal.Rows().RowCount() == 0, "orm verify empty after delete");
+
+        File.Delete(path);
+
+        if (bad > 0) {
+            Console.WriteLine("FAIL: " + Convert.ToString(bad));
+        } else {
+            Console.WriteLine("all pass");
+        }
+    }
+}

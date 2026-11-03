@@ -7,6 +7,37 @@ namespace System.Data.Orm;
 // 以前这些文本由代码生成器抄进每个用户产物，现在只有这一份实现，
 // 改 SQL 规则只改这里。
 public class Dialect {
+    // 对表名、列名、索引名等标识符按数据库方言进行转义包装，避免保留关键字（如 Order/User/Group/Key/Desc 等）语法崩毁。
+    public static string QuoteIdentifier(int p, string ident) {
+        if (ident == null || ident.Length == 0) { return ""; }
+        if (ident == "*") { return "*"; }
+        int len = ident.Length;
+        char first = ident[0];
+        char last = ident[len - 1];
+        if (first == '`' && last == '`') { return ident; }
+        if (first == '[' && last == ']') { return ident; }
+        if (first == '"' && last == '"') { return ident; }
+
+        if (ident.Contains(".")) {
+            List<string> parts = ident.Split(".");
+            StringBuilder sb = new StringBuilder();
+            for (int i = 0; i < parts.Count; i = i + 1) {
+                if (i > 0) { sb.Append("."); }
+                sb.Append(Dialect.QuoteIdentifier(p, parts[i]));
+            }
+            return sb.ToString();
+        }
+
+        if (p == DbProvider.MySQL || p == DbProvider.MariaDB) {
+            return "`" + ident + "`";
+        }
+        if (p == DbProvider.SqlServer) {
+            return "[" + ident + "]";
+        }
+        // SQLite, PostgreSQL, Oracle, DuckDB, Firebird, DM, Kingbase, OpenGauss 及默认标准方言
+        return "\"" + ident + "\"";
+    }
+
     // `?, ?, ?` —— n 个占位符（n 为 0 时是 NULL）。
     public static string Marks(int n) {
         StringBuilder sb = new StringBuilder();
@@ -65,9 +96,10 @@ public class Dialect {
                 "Upsert (OnConflict) is not supported on this provider");
         }
         if (my) {
+            string qk0 = Dialect.QuoteIdentifier(p, keys[0]);
             if (nop) {
-                return " ON DUPLICATE KEY UPDATE " + keys[0] + " = "
-                    + keys[0];
+                return " ON DUPLICATE KEY UPDATE " + qk0 + " = "
+                    + qk0;
             }
             return " ON DUPLICATE KEY UPDATE ";
         }
@@ -76,7 +108,7 @@ public class Dialect {
         int i = 0;
         while (i < keys.Count) {
             if (i > 0) { sb.Append(", "); }
-            sb.Append(keys[i]);
+            sb.Append(Dialect.QuoteIdentifier(p, keys[i]));
             i = i + 1;
         }
         sb.Append(")");
@@ -89,14 +121,15 @@ public class Dialect {
     // 取大（2）、取小（3）。
     public static string Excl(int p, string c, int md) {
         bool my = p == DbProvider.MySQL || p == DbProvider.MariaDB;
-        string src = my ? "VALUES(" + c + ")" : "excluded." + c;
-        if (md == 1) { return c + " = " + c + " + " + src; }
+        string qc = Dialect.QuoteIdentifier(p, c);
+        string src = my ? "VALUES(" + qc + ")" : "excluded." + qc;
+        if (md == 1) { return qc + " = " + qc + " + " + src; }
         if (md == 2 || md == 3) {
             string fn = md == 2 ? "GREATEST" : "LEAST";
             if (p == DbProvider.SQLite) { fn = md == 2 ? "max" : "min"; }
-            return c + " = " + fn + "(" + c + ", " + src + ")";
+            return qc + " = " + fn + "(" + qc + ", " + src + ")";
         }
-        return c + " = " + src;
+        return qc + " = " + src;
     }
 
     // 列 c 的冲突更新模式码：累加 1、取大 2、取小 3、覆盖 0
