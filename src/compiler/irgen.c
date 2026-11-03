@@ -2663,7 +2663,71 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
         LLVMPositionBuilderAtEnd(g->builder, calld);
         LLVMTypeRef dfnty = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), &i8ptr, 1, 0);
         LLVMValueRef dfn = LLVMBuildBitCast(g->builder, dpp, LLVMPointerType(dfnty, 0), "dfn");
-        zan_call2(g->builder, dfnty, dfn, &obj, 1, "");
+        /* B-ID78 深树级联析构防护：类释放深度超过阈值时不再同步下钻，
+         * 把 (释放函数, 死对象) 交给延迟队列，最外层出口迭代排空，
+         * 数千层链表/树的释放不再耗尽线程栈 */
+        {
+            LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
+            if (!g->arc_defer_depth) {
+                g->arc_defer_depth = LLVMAddGlobal(g->mod, i32t,
+                                                   "__zan_arc_rel_depth");
+                LLVMSetInitializer(g->arc_defer_depth, LLVMConstNull(i32t));
+                /* TLS 留待多线程释放语义定型；当前普通全局（探针单线程，
+                 * ARC 释放主线程语义下正确） */
+                if (!g->target_is_wasm && getenv("ZAN_ARC_DEFER_TLS"))
+                    LLVMSetThreadLocal(g->arc_defer_depth, 1);
+                LLVMTypeRef push_ty = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx),
+                    (LLVMTypeRef[]){ i8ptr, i8ptr }, 2, 0);
+                g->rt_defer_push = LLVMAddFunction(g->mod, "zan_rt_defer_push", push_ty);
+                LLVMTypeRef pend_ty = LLVMFunctionType(i32t, NULL, 0, 0);
+                g->rt_defer_pending = LLVMAddFunction(g->mod, "zan_rt_defer_pending", pend_ty);
+                LLVMTypeRef drain_ty = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), NULL, 0, 0);
+                g->rt_defer_drain = LLVMAddFunction(g->mod, "zan_rt_defer_drain", drain_ty);
+            }
+            enum { ZAN_ARC_DEFER_DEPTH = 100 };
+            LLVMValueRef dcur = LLVMBuildLoad2(g->builder, i32t,
+                                               g->arc_defer_depth, "adepth");
+            LLVMBasicBlockRef defer_bb = LLVMAppendBasicBlockInContext(g->ctx, g->rt_release_dyn, "adefer");
+            LLVMBasicBlockRef sync_bb = LLVMAppendBasicBlockInContext(g->ctx, g->rt_release_dyn, "async2");
+            LLVMBasicBlockRef drain_bb = LLVMAppendBasicBlockInContext(g->ctx, g->rt_release_dyn, "adrain");
+            LLVMBasicBlockRef tail_bb = LLVMAppendBasicBlockInContext(g->ctx, g->rt_release_dyn, "atail");
+            LLVMBuildCondBr(g->builder,
+                zan_icmp(g->builder, LLVMIntUGE, dcur,
+                         LLVMConstInt(i32t, ZAN_ARC_DEFER_DEPTH, 0), "adeep"),
+                defer_bb, sync_bb);
+            /* 超阈值：挂队列立即返回，不同步下钻 */
+            LLVMPositionBuilderAtEnd(g->builder, defer_bb);
+            zan_call2(g->builder, LLVMGlobalGetValueType(g->rt_defer_push),
+                      g->rt_defer_push, (LLVMValueRef[]){ dpp, obj }, 2, "");
+            LLVMBuildBr(g->builder, ret_bb);
+            /* 同步路径：深度 +1 → 调类释放 → 读回实际值 -1（嵌套内层
+             * 会在本层 call 期间涨落，入口快照不可复用）→ 归零且有
+             * 欠账则排空 */
+            LLVMPositionBuilderAtEnd(g->builder, sync_bb);
+            LLVMBuildStore(g->builder,
+                zan_add(g->builder, dcur, LLVMConstInt(i32t, 1, 0), "aup"),
+                g->arc_defer_depth);
+            zan_call2(g->builder, dfnty, dfn, &obj, 1, "");
+            LLVMValueRef dnow = LLVMBuildLoad2(g->builder, i32t,
+                                               g->arc_defer_depth, "adnow");
+            LLVMValueRef ddown = zan_add(g->builder, dnow,
+                LLVMConstInt(i32t, (unsigned)-1, 0), "adown");
+            LLVMBuildStore(g->builder, ddown, g->arc_defer_depth);
+            LLVMValueRef dzero = zan_icmp(g->builder, LLVMIntEQ, ddown,
+                LLVMConstInt(i32t, 0, 0), "azero");
+            LLVMValueRef pend = zan_call2(g->builder,
+                LLVMGlobalGetValueType(g->rt_defer_pending),
+                g->rt_defer_pending, NULL, 0, "apend");
+            LLVMValueRef pend1 = zan_icmp(g->builder, LLVMIntNE, pend,
+                LLVMConstInt(i32t, 0, 0), "apend1");
+            LLVMBuildCondBr(g->builder, zan_and(g->builder, dzero, pend1, "ado"),
+                drain_bb, tail_bb);
+            LLVMPositionBuilderAtEnd(g->builder, drain_bb);
+            zan_call2(g->builder, LLVMGlobalGetValueType(g->rt_defer_drain),
+                      g->rt_defer_drain, NULL, 0, "");
+            LLVMBuildBr(g->builder, tail_bb);
+            LLVMPositionBuilderAtEnd(g->builder, tail_bb);
+        }
         LLVMBuildBr(g->builder, ret_bb);
         LLVMPositionBuilderAtEnd(g->builder, fb);
         zan_call2(g->builder, LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), &i8ptr, 1, 0),

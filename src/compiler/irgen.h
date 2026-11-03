@@ -344,6 +344,11 @@ struct zan_irgen {
     LLVMValueRef rt_retain;      /* zan_rt_retain(void*) */
     LLVMValueRef rt_release;     /* zan_rt_release(void*) */
     LLVMValueRef rt_release_dyn;
+    /* B-ID78 深树级联析构防护：深度计数 + 延迟释放队列 C 侧三函数 */
+    LLVMValueRef arc_defer_depth;   /* __zan_arc_rel_depth (thread-local i32) */
+    LLVMValueRef rt_defer_push;     /* zan_rt_defer_push(fn, obj) */
+    LLVMValueRef rt_defer_pending;  /* zan_rt_defer_pending() -> i32 */
+    LLVMValueRef rt_defer_drain;    /* zan_rt_defer_drain() */
     LLVMValueRef rt_alloc;       /* zan_rt_alloc(int64_t size) -> void* */
     LLVMValueRef rt_str_retain;  /* zan_rt_str_retain(void*) */
     LLVMValueRef rt_str_release; /* zan_rt_str_release(void*) */

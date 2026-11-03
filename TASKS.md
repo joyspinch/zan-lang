@@ -24,7 +24,6 @@
 ### 批次 2 · 独立账（无前置，任一会话可领，按编号序）
 
 - [~] B-ID73〔独立〕DateTime.Now 本地墙钟时间语义：`Now()`/`UtcNow()` 语义与 DST 边界已闭（conformance datetime_now，git 历史）。余：脱离操作系统时区库的 `TimeZoneInfo` 与 IANA 时区库（`/usr/share/zoneinfo`）统一支持——按任意时区名查询偏移、跨平台规则一致；现仅支持本机时区。
-- [ ] B-ID78〔独立〕ARC 深层对象树级联析构栈溢出防护（迭代式延迟释放队列）：`irgen_arc.c` 中对象析构递归下钻释放子字段，上千层深度的链表/树被 release 时递归耗尽线程栈引发 Stack Overflow。需引入迭代式延迟释放队列（Deferred Drop Queue）；双轨同步。
 - [ ] B-ID81〔独立〕只读与不可变集合契约健全（IReadOnlyList / ReadOnlySpan 等）：标准库集合缺乏只读抽象约束，实体向外暴露内部集合时可被随意篡改或并发破坏。需补全 `IReadOnlyCollection<T>`、`IReadOnlyList<T>`、`IReadOnlyDictionary<K, V>` 接口及切片视图；双轨同步。
 - [ ] B-ID82〔独立〕包管理语义化版本仲裁与钻石依赖求解器（Diamond Dependency Solver）：当前 `.zan-packages/` 仅支持简单扁平安装，同一包不同大版本缺冲突求解。需引入类似 PubGrub 的语义化版本依赖解析与包隔离机制；双轨保持一致。
 - [ ] B-ID87〔独立〕Unicode 规范化（NFC/NFD）与国际化大小写折叠（Case Folding）缺失：标准库缺乏 UAX #15 规范化，`string.ToLower/ToUpper/Equals` 仅基本码点映射，欧洲带重音符/德语等单码点与组合码点无法等价匹配，存在鉴权仿冒越权风险；双轨同步。
