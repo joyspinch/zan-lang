@@ -797,6 +797,20 @@ b.weakF` 每执行一次泄漏一个对象，stdlib `LinkedList.Remove` 的
      真实返回类型（`List<AiMessage>`），不是 `Task`——类型上看不出来，只能
      看方法原型上的 `MOD_ASYNC`。同理接口方法、类名静态接收者也都推不出来，
      必须各自走一条路。
+   - **运行时新增全局符号，必须过全部链接形态门**：rt_mem.o 只在原生 exe
+     与跨端 linux exe 链入——Windows DLL（ld.exe -shared）、macOS dylib
+     （ld64.lld）、Android 静态链（bionic 上 --wrap=malloc 崩，刻意不链
+     mem）、selfhost zanrt_sh 束都拿不到它。B-ID78 把 defer 队列落进
+     rt_mem.c 后这些形态全部断链（ELF .so 靠默认容忍未定义符号**静音带
+     病**，dlopen 才炸——比响的更危险）。修法沿 zan_io_pump 先例：
+     irgen 对已建声明补 WeakAnyLinkage + 函数体（emit_defer_fallback），
+     链入强定义覆盖、未链入退化 fail-open。
+   - **LLVMAddFunction 不查重名**：先建同名函数，后建者不会返回已有的，
+     而是并存，发射时被 mangler 加 `.N` 后缀（如 `zan_rt_defer_push.5`）
+     ——调用指空、链接 undefined reference。要给"延迟建的声明"补体/改
+     链路，必须后挂在 `g->` 字段上（声明建成之后再 LLVMSetLinkage +
+     AppendBasicBlock），不能抢跑。中段发体要用 `LLVMGetInsertBlock`
+     保存恢复 builder 位置，否则后续 Br 插进别的函数。
 
 ---
 
