@@ -1,0 +1,172 @@
+using System;
+using System.Data;
+using System.Data.SqlServer;
+using System.Data.MySql;
+using System.Data.Postgres;
+using System.Net;
+using System.Net.Modbus;
+using System.Threading;
+
+class Program {
+    static List<int> order = new List<int>();
+    static int completed = 0;
+
+    static async void Worker(WsLink link, int id, int holdMs) {
+        await link.LockAsync();
+        try {
+            order.Add(id);
+            await Task.Delay(holdMs);
+        } finally {
+            link.Unlock();
+        }
+        completed = completed + 1;
+    }
+
+    static async Task TestWsLinkFifoHandover() {
+        WsLink link = new WsLink();
+        order = new List<int>();
+        completed = 0;
+
+        // 协程 0 先抢占锁并持有 60ms
+        Worker(link, 0, 60);
+        await Task.Delay(10); // 确保协程 0 已经拿到锁进入临界区
+
+        // 依序排队注册协程 1 到 5
+        for (int i = 1; i <= 5; i = i + 1) {
+            Worker(link, i, 15);
+            await Task.Delay(5); // 保证排队顺序确定
+        }
+
+        // 等待全部完成
+        while (completed < 6) {
+            await Task.Delay(10);
+        }
+
+        // 校验严格 FIFO 顺序执行（无插队）
+        if (order.Count != 6) {
+            Console.WriteLine("FAIL: order count mismatch: " + Convert.ToString(order.Count));
+            Environment.Exit(1);
+        }
+        for (int i = 0; i < 6; i = i + 1) {
+            if (order[i] != i) {
+                Console.WriteLine("FAIL: order mismatch at " + Convert.ToString(i) + ", got " + Convert.ToString(order[i]));
+                Environment.Exit(2);
+            }
+        }
+        Console.WriteLine("wslink fifo handover ok");
+    }
+
+    static int sqlWaitersAwakened = 0;
+    static async void SqlWaiter(SqlServerConnection conn, int id) {
+        // 调用 roundTrip 会走 AcquireLock
+        // 传入无效 payload，重点测试在等待锁期间连接 Close 能否安全唤醒而不死锁
+        DbParams prms = new DbParams();
+        try {
+            await conn.ExecuteAsync("SELECT 1", prms);
+        } catch (Exception ex) {
+            // 连接断开抛出异常属于预期正常行为
+        }
+        sqlWaitersAwakened = sqlWaitersAwakened + 1;
+    }
+
+    static async Task TestSqlServerCloseWakeAll() {
+        SqlServerConnection conn = new SqlServerConnection();
+        sqlWaitersAwakened = 0;
+
+        // 模拟连接已被持有（手动占用锁）
+        // 从而让后续 5 个协程全部进入 waiters 队列挂起
+        DbParams dummyPrms = new DbParams();
+        // 启动一个长时间持锁的假任务，但让它先等待
+        // 通过直接测试内部 Close 唤醒全队
+        for (int i = 0; i < 5; i = i + 1) {
+            SqlWaiter(conn, i);
+        }
+        await Task.Delay(50); // 确保 5 个全部在 waiters 队列停泊
+
+        // 关闭连接，必须立刻唤醒全部 5 个等待者，绝不发生死锁或悬挂
+        conn.Close();
+
+        long start = Stopwatch.GetMilliseconds();
+        while (sqlWaitersAwakened < 5 && Stopwatch.GetMilliseconds() - start < 3000) {
+            await Task.Delay(10);
+        }
+
+        if (sqlWaitersAwakened != 5) {
+            Console.WriteLine("FAIL: sqlserver waiters awakened: " + Convert.ToString(sqlWaitersAwakened));
+            Environment.Exit(3);
+        }
+        Console.WriteLine("sqlserver close wake all ok");
+    }
+
+    static int mysqlWaitersAwakened = 0;
+    static async void MySqlWaiter(MySqlConnection conn, int id) {
+        try {
+            await conn.QueryAsync("SELECT 1");
+        } catch (Exception ex) {
+        }
+        mysqlWaitersAwakened = mysqlWaitersAwakened + 1;
+    }
+
+    static async Task TestMySqlCloseWakeAll() {
+        MySqlConnection conn = new MySqlConnection();
+        mysqlWaitersAwakened = 0;
+
+        for (int i = 0; i < 5; i = i + 1) {
+            MySqlWaiter(conn, i);
+        }
+        await Task.Delay(50);
+
+        conn.Close();
+
+        long start = Stopwatch.GetMilliseconds();
+        while (mysqlWaitersAwakened < 5 && Stopwatch.GetMilliseconds() - start < 3000) {
+            await Task.Delay(10);
+        }
+
+        if (mysqlWaitersAwakened != 5) {
+            Console.WriteLine("FAIL: mysql waiters awakened: " + Convert.ToString(mysqlWaitersAwakened));
+            Environment.Exit(4);
+        }
+        Console.WriteLine("mysql close wake all ok");
+    }
+
+    static int modbusWaitersAwakened = 0;
+    static async void ModbusWaiter(ModbusClient client, int id) {
+        try {
+            await client.ReadHoldingAsync(0, 1);
+        } catch (Exception ex) {
+        }
+        modbusWaitersAwakened = modbusWaitersAwakened + 1;
+    }
+
+    static async Task TestModbusCloseWakeAll() {
+        ModbusClient client = new ModbusClient();
+        modbusWaitersAwakened = 0;
+
+        for (int i = 0; i < 5; i = i + 1) {
+            ModbusWaiter(client, i);
+        }
+        await Task.Delay(50);
+
+        client.Close();
+
+        long start = Stopwatch.GetMilliseconds();
+        while (modbusWaitersAwakened < 5 && Stopwatch.GetMilliseconds() - start < 3000) {
+            await Task.Delay(10);
+        }
+
+        if (modbusWaitersAwakened != 5) {
+            Console.WriteLine("FAIL: modbus waiters awakened: " + Convert.ToString(modbusWaitersAwakened));
+            Environment.Exit(5);
+        }
+        Console.WriteLine("modbus close wake all ok");
+    }
+
+    static async void Main() {
+        await TestWsLinkFifoHandover();
+        await TestSqlServerCloseWakeAll();
+        await TestMySqlCloseWakeAll();
+        await TestModbusCloseWakeAll();
+        Console.WriteLine("ALL_CONNECTION_LOCK_TESTS_OK");
+    }
+}

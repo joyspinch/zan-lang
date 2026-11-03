@@ -41,23 +41,25 @@ public class FirebirdConnection : IDbConnection {
     public bool inTxn;
 
     private async bool AcquireLock() {
-        while (this.busy) {
-            AsyncGate g = new AsyncGate();
-            if (this.waiters == null) { this.waiters = new List<AsyncGate>(); }
-            this.waiters.Add(g);
-            await g.Wait();
-            g.Close();
+        if (!this.busy) {
+            this.busy = true;
+            return true;
         }
-        this.busy = true;
+        AsyncGate g = new AsyncGate();
+        if (this.waiters == null) { this.waiters = new List<AsyncGate>(); }
+        this.waiters.Add(g);
+        await g.Wait();
+        g.Close();
         return true;
     }
 
     private void ReleaseLock() {
-        this.busy = false;
         if (this.waiters != null && this.waiters.Count > 0) {
             AsyncGate g = this.waiters[0];
             this.waiters.RemoveAt(0);
             g.Signal();
+        } else {
+            this.busy = false;
         }
     }
 
@@ -1365,12 +1367,12 @@ public class FirebirdConnection : IDbConnection {
 
     // 不经分离往返直接丢弃连接。安全释放互斥门控并唤醒所有等待者。
     public void Close() {
-        this.ReleaseLock();
         while (this.waiters != null && this.waiters.Count > 0) {
             AsyncGate g = this.waiters[0];
             this.waiters.RemoveAt(0);
             g.Signal();
         }
+        this.busy = false;
         if (this.sock >= 0) {
             Socket.Close(this.sock);
             this.sock = 0 - 1;

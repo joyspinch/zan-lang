@@ -58,23 +58,25 @@ public class MySqlConnection : IDbConnection {
     }
 
     private async bool AcquireLock() {
-        while (this.busy) {
-            AsyncGate g = new AsyncGate();
-            if (this.waiters == null) { this.waiters = new List<AsyncGate>(); }
-            this.waiters.Add(g);
-            await g.Wait();
-            g.Close();
+        if (!this.busy) {
+            this.busy = true;
+            return true;
         }
-        this.busy = true;
+        AsyncGate g = new AsyncGate();
+        if (this.waiters == null) { this.waiters = new List<AsyncGate>(); }
+        this.waiters.Add(g);
+        await g.Wait();
+        g.Close();
         return true;
     }
 
     private void ReleaseLock() {
-        this.busy = false;
         if (this.waiters != null && this.waiters.Count > 0) {
             AsyncGate g = this.waiters[0];
             this.waiters.RemoveAt(0);
             g.Signal();
+        } else {
+            this.busy = false;
         }
     }
 
@@ -1212,19 +1214,19 @@ public class MySqlConnection : IDbConnection {
     // 关闭连接。TLS 通道先发 close_notify 再关套接字
     // （TlsStream.Close 不拥有底层 fd）。安全释放互斥门控并唤醒所有等待者。
     public void Close() {
-        this.ReleaseLock();
+        this.connected = false;
         while (this.waiters != null && this.waiters.Count > 0) {
             AsyncGate g = this.waiters[0];
             this.waiters.RemoveAt(0);
             g.Signal();
         }
+        this.busy = false;
         if (this.tls != null) {
             this.tls.Close();
             this.tls = null;
         }
-        if (this.connected || this.sock >= 0) {
+        if (this.sock >= 0) {
             Socket.Close(this.sock);
-            this.connected = false;
             this.sock = -1;
         }
         // 服务端语句随连接一起销毁。

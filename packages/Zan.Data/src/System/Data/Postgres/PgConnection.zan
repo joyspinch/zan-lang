@@ -58,23 +58,25 @@ public class PgConnection : IDbConnection {
     List<AsyncGate> waiters;
 
     async bool AcquireLock() {
-        while (this.busy) {
-            AsyncGate g = new AsyncGate();
-            if (this.waiters == null) { this.waiters = new List<AsyncGate>(); }
-            this.waiters.Add(g);
-            await g.Wait();
-            g.Close();
+        if (!this.busy) {
+            this.busy = true;
+            return true;
         }
-        this.busy = true;
+        AsyncGate g = new AsyncGate();
+        if (this.waiters == null) { this.waiters = new List<AsyncGate>(); }
+        this.waiters.Add(g);
+        await g.Wait();
+        g.Close();
         return true;
     }
 
     void ReleaseLock() {
-        this.busy = false;
         if (this.waiters != null && this.waiters.Count > 0) {
             AsyncGate g = this.waiters[0];
             this.waiters.RemoveAt(0);
             g.Signal();
+        } else {
+            this.busy = false;
         }
     }
 
@@ -1363,12 +1365,12 @@ public class PgConnection : IDbConnection {
     // Terminate 走 TLS 加密；异步 TLS 通道直接关套接字（对端以
     // EOF 收尾，等价干净），因为 Close 无协程上下文可用。
     public void Close() {
-        this.ReleaseLock();
         while (this.waiters != null && this.waiters.Count > 0) {
             AsyncGate g = this.waiters[0];
             this.waiters.RemoveAt(0);
             g.Signal();
         }
+        this.busy = false;
         if (this.sock >= 0) {
             if (this.connected && this.syncTls != null) {
                 this.sendMessageSync(88, this.bb, 0);  // 'X' Terminate
