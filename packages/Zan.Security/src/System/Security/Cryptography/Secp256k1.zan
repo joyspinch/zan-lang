@@ -1,9 +1,8 @@
 using System;
-using System.Security.Cryptography;
 
-namespace Zan.Web3.Cryptography;
+namespace System.Security.Cryptography;
 
-// SECG secp256k1 椭圆曲线密码学实现（比特币与以太坊公钥基础设施基石）。
+// SECG secp256k1 椭圆曲线密码学实现（Koblitz 曲线 SEC 2 标准，比特币与以太坊基石）。
 // 曲线方程：y^2 = x^3 + 7 (mod p)，a = 0, b = 7。
 // 内部点运算采用 Jacobian 投影坐标系，倍点公式针对 a = 0 进行模乘优化。
 public class Secp256k1 {
@@ -21,6 +20,8 @@ public class Secp256k1 {
     static BigInt THREE;
     static BigInt FOUR;
     static BigInt EIGHT;
+    static BigInt HALF_N;
+    static BigInt P_PLUS_1_DIV_4;
     static bool ready = false;
 
     private static BigInt hb(string h) {
@@ -46,6 +47,13 @@ public class Secp256k1 {
         THREE = fromInt(3);
         FOUR = fromInt(4);
         EIGHT = fromInt(8);
+
+        // HALF_N = N / 2 (用于 EIP-2 低 s 防延展性归约)
+        HALF_N = hb("7FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF5D576E7357A4501DDFE92F46681B20A0");
+
+        // P_PLUS_1_DIV_4 = (P + 1) / 4 (用于 p = 3 mod 4 素数域上的模平方根)
+        P_PLUS_1_DIV_4 = hb("3FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFBFFFFF0C");
+
         ready = true;
     }
 
@@ -169,7 +177,6 @@ public class Secp256k1 {
     }
 
     // 从 32 字节大端私钥派生 64 字节未压缩公钥坐标 (X || Y)，不带 0x04 前缀。
-    // 这恰好是以太坊 Keccak-256 地址派生的输入格式。
     public static byte[] GetPublicKeyRaw(byte[] privKey32) {
         init();
         if (privKey32 == null || privKey32.Length != 32) { return null; }
@@ -219,5 +226,134 @@ public class Secp256k1 {
         BigInt lhs = fsqr(y);
         BigInt rhs = fadd(fmul(x, fsqr(x)), fromInt(7));
         return BigInt.cmp(lhs, rhs) == 0;
+    }
+
+    private static byte[] hmac256(byte[] key, byte[] p1, byte[] p2, byte[] p3, byte[] p4) {
+        int total = p1.Length + (p2 == null ? 0 : p2.Length) + (p3 == null ? 0 : p3.Length) + (p4 == null ? 0 : p4.Length);
+        byte[] msg = new byte[total];
+        int pos = 0;
+        for (int i = 0; i < p1.Length; i = i + 1) { msg[pos] = p1[i] & 255; pos = pos + 1; }
+        if (p2 != null) { for (int i = 0; i < p2.Length; i = i + 1) { msg[pos] = p2[i] & 255; pos = pos + 1; } }
+        if (p3 != null) { for (int i = 0; i < p3.Length; i = i + 1) { msg[pos] = p3[i] & 255; pos = pos + 1; } }
+        if (p4 != null) { for (int i = 0; i < p4.Length; i = i + 1) { msg[pos] = p4[i] & 255; pos = pos + 1; } }
+        return Hmac.Compute(Hmac.SHA256, key.ToStr(0, key.Length), key.Length, msg.ToStr(0, total), total);
+    }
+
+    // RFC 6979 确定性生成针对 32 字节消息哈希的 ECDSA 签名，并强制应用低 s 防延展规范。
+    public static Secp256k1Signature Sign(byte[] hash32, byte[] privKey32) {
+        init();
+        if (hash32 == null || hash32.Length != 32 || privKey32 == null || privKey32.Length != 32) {
+            return null;
+        }
+        BigInt d = BigInt.FromBytesBE(privKey32, 32);
+        if (BigInt.cmp(d, BigInt.one()) < 0 || BigInt.cmp(d, N) >= 0) {
+            return null;
+        }
+
+        BigInt e = nmod(BigInt.FromBytesBE(hash32, 32));
+        byte[] em = e.ToBytesBE(32);
+
+        byte[] v = new byte[32];
+        byte[] k = new byte[32];
+        for (int i = 0; i < 32; i = i + 1) { v[i] = 1; k[i] = 0; }
+
+        byte[] zero = new byte[1];
+        byte[] oneb = new byte[1]; oneb[0] = 1;
+
+        k = hmac256(k, v, zero, privKey32, em);
+        byte[] t = hmac256(k, v, null, null, null);
+        for (int i = 0; i < 32; i = i + 1) { v[i] = t[i] & 255; }
+
+        k = hmac256(k, v, oneb, privKey32, em);
+        t = hmac256(k, v, null, null, null);
+        for (int i = 0; i < 32; i = i + 1) { v[i] = t[i] & 255; }
+
+        while (true) {
+            t = hmac256(k, v, null, null, null);
+            for (int i = 0; i < 32; i = i + 1) { v[i] = t[i] & 255; }
+            BigInt kb = BigInt.FromBytesBE(v, 32);
+
+            if (BigInt.cmp(kb, BigInt.one()) >= 0 && BigInt.cmp(kb, N) < 0) {
+                List<BigInt> aff = toAffine(scalarMul(kb, gPoint()));
+                if (!isInf(aff)) {
+                    BigInt r = nmod(aff[0]);
+                    if (!r.isZero()) {
+                        // s = k^-1 * (e + r * d) mod n
+                        BigInt s = nmul(ninv(kb), nmod(BigInt.add(e, nmul(r, d))));
+                        if (!s.isZero()) {
+                            // 基础恢复位 v: 取点 R 的 y 坐标奇偶性 (0 为偶, 1 为奇)
+                            byte[] yb = aff[1].ToBytesBE(32);
+                            int recId = (yb[31] & 1) != 0 ? 1 : 0;
+
+                            // 低 s 防延展规范: 如果 s > n/2，则将 s 翻转为 n - s，并反转恢复奇偶性
+                            if (BigInt.cmp(s, HALF_N) > 0) {
+                                s = BigInt.sub(N, s);
+                                recId = 1 - recId;
+                            }
+
+                            return new Secp256k1Signature(r.ToBytesBE(32), s.ToBytesBE(32), recId);
+                        }
+                    }
+                }
+            }
+
+            k = hmac256(k, v, zero, null, null);
+            t = hmac256(k, v, null, null, null);
+            for (int i = 0; i < 32; i = i + 1) { v[i] = t[i] & 255; }
+        }
+    }
+
+    // 从 32 字节哈希和签名 (r, s, v) 中恢复未压缩公钥原始坐标 (64 字节)
+    public static byte[] RecoverPublicKey(byte[] hash32, Secp256k1Signature sig) {
+        init();
+        if (hash32 == null || hash32.Length != 32 || sig == null) { return null; }
+        if (sig.V < 0 || sig.V > 3) { return null; }
+
+        BigInt r = BigInt.FromBytesBE(sig.R, 32);
+        BigInt s = BigInt.FromBytesBE(sig.S, 32);
+        if (BigInt.cmp(r, BigInt.one()) < 0 || BigInt.cmp(r, N) >= 0) { return null; }
+        if (BigInt.cmp(s, BigInt.one()) < 0 || BigInt.cmp(s, N) >= 0) { return null; }
+
+        // 1. 横坐标 x = r
+        BigInt x = r;
+        if (BigInt.cmp(x, P) >= 0) { return null; }
+
+        // 2. 求解 y^2 = x^3 + 7 (mod p) 的平方根: y = (x^3 + 7)^((p+1)/4) mod p
+        BigInt rhs = fadd(fmul(x, fsqr(x)), fromInt(7));
+        BigInt y = BigInt.ModPow(rhs, P_PLUS_1_DIV_4, P);
+
+        // 验证平方根有效性
+        if (BigInt.cmp(fsqr(y), rhs) != 0) {
+            return null; // 不是二次剩余，无法在曲线上找到对应的点
+        }
+
+        // 3. 根据 v (低位奇偶性) 匹配 y 的正负
+        byte[] yb = y.ToBytesBE(32);
+        int isOdd = (yb[31] & 1) != 0 ? 1 : 0;
+        int targetOdd = sig.V & 1;
+        if (isOdd != targetOdd) {
+            y = fsub(P, y);
+        }
+
+        List<BigInt> Rpt = pt(x, y, BigInt.one());
+
+        // 4. 计算 Q = r^-1 * (s * R - e * G)
+        BigInt e = nmod(BigInt.FromBytesBE(hash32, 32));
+        BigInt rInv = ninv(r);
+        BigInt u1 = nmod(BigInt.sub(N, nmul(e, rInv)));
+        BigInt u2 = nmul(s, rInv);
+
+        List<BigInt> Qpt = jadd(scalarMul(u1, gPoint()), scalarMul(u2, Rpt));
+        if (isInf(Qpt)) { return null; }
+
+        List<BigInt> aff = toAffine(Qpt);
+        byte[] pub = new byte[64];
+        byte[] qx = aff[0].ToBytesBE(32);
+        byte[] qy = aff[1].ToBytesBE(32);
+        for (int i = 0; i < 32; i = i + 1) {
+            pub[i] = qx[i];
+            pub[32 + i] = qy[i];
+        }
+        return pub;
     }
 }

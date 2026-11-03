@@ -6,9 +6,10 @@ to zanc (project `packages/`, `.zan-packages/`, or a toolchain-relative
 `packages/` store).
 
 `System.Security.Cryptography` — symmetric (AES, AES-GCM, SM4), hashes
-(SHA-1/256/512, MD5, SM3), MAC/KDF (HMAC, HKDF, PBKDF2), public key
-(RSA, ECDSA, Curve25519/x25519, SM2, arbitrary-precision BigInt),
-encodings (Base64, Hex, Crc32C), X.509 certificate parsing, JWT, and OTP.
+(SHA-1/256/512, MD5, SM3, Keccak-256), MAC/KDF (HMAC, HKDF, PBKDF2), public key
+(RSA, ECDSA/P-256, Secp256k1 Koblitz curve with ecrecover, Curve25519/x25519, SM2,
+arbitrary-precision BigInt), encodings (Base64, Hex, Crc32C), X.509 certificate
+parsing, JWT, and OTP.
 Everything is managed Zan — no native crypto library is linked.
 `System.Security.Guard` — integrity/tamper-check helper.
 `System.Security.AntiReverse` (`Mba`, `StatePoisoner`, `HoneyTrap`) — cross-platform anti-reverse engineering and anti-AI analysis toolkit:

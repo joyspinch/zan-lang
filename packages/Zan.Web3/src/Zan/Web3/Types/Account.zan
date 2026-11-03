@@ -1,0 +1,146 @@
+using System;
+using System.Security.Cryptography;
+using Zan.Web3.Encoding;
+
+namespace Zan.Web3.Types;
+
+// 以太坊与 Web3 钱包账户实体（管理私钥、派生地址、处理以太坊消息与交易签名）。
+public class Account {
+
+    public byte[] PrivateKey;     // 32 字节私钥
+    public byte[] PublicKeyRaw;   // 64 字节未压缩公钥 (X || Y)
+    public Address Address;       // 账户以太坊地址
+
+    public Account(byte[] privKey32) {
+        if (privKey32 == null || privKey32.Length != 32) {
+            PrivateKey = new byte[32];
+            PublicKeyRaw = new byte[64];
+            Address = Address.Zero;
+            return;
+        }
+
+        PrivateKey = new byte[32];
+        for (int i = 0; i < 32; i = i + 1) {
+            PrivateKey[i] = privKey32[i];
+        }
+
+        PublicKeyRaw = Secp256k1.GetPublicKeyRaw(PrivateKey);
+        if (PublicKeyRaw != null) {
+            Address = Address.FromPublicKey(PublicKeyRaw);
+        } else {
+            Address = Address.Zero;
+        }
+    }
+
+    // 从 32 字节私钥字节构建账户
+    public static Account FromPrivateKey(byte[] privKey32) {
+        return new Account(privKey32);
+    }
+
+    // 从十六进制私钥字符串（带或不带 0x 前缀）构建账户
+    public static Account FromPrivateKeyHex(string hex) {
+        if (hex == null) { return null; }
+        string clean = hex.Trim();
+        if (clean.StartsWith("0x") || clean.StartsWith("0X")) {
+            clean = clean.Substring(2);
+        }
+        if (clean.Length != 64) { return null; }
+        byte[] raw = Hex.Decode(clean, 64);
+        if (raw == null || raw.Length != 32) { return null; }
+        return new Account(raw);
+    }
+
+    // 随机生成全新的强加密私钥并创建账户
+    public static Account CreateRandom() {
+        byte[] priv = new byte[32];
+        RandomNumberGenerator.Fill(priv, 32);
+        return new Account(priv);
+    }
+
+    // 对 32 字节哈希值进行纯 Secp256k1 ECDSA 签名
+    public Secp256k1Signature SignHash(byte[] hash32) {
+        return Secp256k1.Sign(hash32, PrivateKey);
+    }
+
+    // 符合以太坊 EIP-191 标准的个人文本消息签名 (Personal Sign)
+    // 自动添加前缀 "\x19Ethereum Signed Message:\n" + len + message 并进行 Keccak-256 签名，
+    // 输出包含 v (27 或 28) 的 65 字节十六进制签名串
+    public string SignMessage(string message) {
+        if (message == null) { message = ""; }
+        byte[] msgBytes = message.ToBytes();
+        int msgLen = msgBytes.Length;
+
+        // 构造前缀: "\x19Ethereum Signed Message:\n" + len
+        string prefix = "\x19" + "Ethereum Signed Message:\n" + msgLen.ToString();
+        byte[] pfxBytes = prefix.ToBytes();
+
+        byte[] payload = new byte[pfxBytes.Length + msgLen];
+        for (int i = 0; i < pfxBytes.Length; i = i + 1) {
+            payload[i] = pfxBytes[i];
+        }
+        for (int i = 0; i < msgLen; i = i + 1) {
+            payload[pfxBytes.Length + i] = msgBytes[i];
+        }
+
+        byte[] hash = Keccak256.Hash(payload, payload.Length);
+        Secp256k1Signature sig = Secp256k1.Sign(hash, PrivateKey);
+        if (sig == null) { return null; }
+
+        // 以太坊 Personal Sign 将恢复标识符转换为 27 或 28
+        byte[] compact = new byte[65];
+        for (int i = 0; i < 32; i = i + 1) {
+            compact[i] = sig.R[i];
+            compact[32 + i] = sig.S[i];
+        }
+        compact[64] = (byte)(sig.V + 27);
+
+        return "0x" + Hex.Encode(compact, 65);
+    }
+
+    // 校验以太坊 EIP-191 个人签名并验证签名者是否匹配
+    public static bool VerifyMessage(string message, string signatureHex, Address expectedSigner) {
+        if (message == null || signatureHex == null || expectedSigner == null) { return false; }
+        string clean = signatureHex.Trim();
+        if (clean.StartsWith("0x") || clean.StartsWith("0X")) {
+            clean = clean.Substring(2);
+        }
+        if (clean.Length != 130) { return false; }
+        byte[] sigBytes = Hex.Decode(clean, 130);
+        if (sigBytes == null || sigBytes.Length != 65) { return false; }
+
+        byte[] r = new byte[32];
+        byte[] s = new byte[32];
+        for (int i = 0; i < 32; i = i + 1) {
+            r[i] = sigBytes[i];
+            s[i] = sigBytes[32 + i];
+        }
+        int vRaw = sigBytes[64] & 255;
+        int v = (vRaw >= 27) ? (vRaw - 27) : vRaw;
+
+        Secp256k1Signature sig = new Secp256k1Signature(r, s, v);
+
+        byte[] msgBytes = message.ToBytes();
+        int msgLen = msgBytes.Length;
+        string prefix = "\x19" + "Ethereum Signed Message:\n" + msgLen.ToString();
+        byte[] pfxBytes = prefix.ToBytes();
+
+        byte[] payload = new byte[pfxBytes.Length + msgLen];
+        for (int i = 0; i < pfxBytes.Length; i = i + 1) {
+            payload[i] = pfxBytes[i];
+        }
+        for (int i = 0; i < msgLen; i = i + 1) {
+            payload[pfxBytes.Length + i] = msgBytes[i];
+        }
+        byte[] hash = Keccak256.Hash(payload, payload.Length);
+
+        Address recovered = Address.Recover(hash, sig);
+        if (recovered == null) { return false; }
+        return recovered.Equals(expectedSigner);
+    }
+
+    // 对交易对象进行签名，输出可直接广播的 Raw Transaction 十六进制字符串
+    public string SignTransaction(Transaction tx) {
+        if (tx == null) { return null; }
+        return tx.Sign(PrivateKey);
+    }
+}
