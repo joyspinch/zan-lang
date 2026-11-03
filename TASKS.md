@@ -6,7 +6,7 @@
 >
 > 平账纪律：闭账条目当批移出，已闭环内容移至 git 历史。领账按批次：批次 1 根修优先（闭一条解锁一片），批次 2 独立账可并行，批次 3 等前置闭了再领，批次 4 大工程须独占窗口；同批内按编号序。每条正文前的〔…〕是依赖标签：〔前置 X〕= X 不闭本条闭不了；〔软前置 X〕= 没 X 也能做但成本高；〔根修·解锁 Y〕= 本条闭了 Y 的前置随之解除；〔串行前置 X〕= 与 X 同改一个文件，等 X 落地再动。根修闭账时同批摘掉下游条目的〔前置〕标签并上调批次。领账前 `git status` + 文件 mtime 查在飞——并发会话不一定走调度器注册（2026-11-03 B-ID107 即靠 mtime 抓到撞车）。
 >
-> 最近平账 2026-11-03（彻底清理）：全账按「只记剩余欠账」压缩，验证流水归 git 历史；B-ID95/98/100/105 闭账移出（导出面 devirt 预修 33f21d49e 落地且场景暂不可达 / OOM 注入钩子+三钉 55367b004 落地 / 预扫缓存收益 ~12ms 低于噪声底不做 / json 消费方 dap_integration+lsp_integration_utf16 绿）；B-ID68/69/70 归并指针行移出（B-ID75 领域点名承接）。同日晚：B-ID113 闭账移出（stdout 二进制模式 25ca931ff，字节钉 stdio_binary_mode 7/7 绿）、B-ID108 闭账移出（JsonDoc 槽位三访问器 9a40bdf88，AppUpdate --emit-lib 77 文件绿 + Json 回归五钉绿）。早前同日：B-ID80 SipHash 落地闭账、B-ID66 闭账移出、B-ID104/105/106/110 各片落地（详 git 历史）。同日晚 ORM 族平账：orm/linq/diag_orm/dao 35 案实测 31 绿 4 红——B-ID59 余量收敛为两案（"orm 族 ~20 案红"过时移除）、case_orm_upsert（E3023 OnConflict 匿名对象）红面归 B-ID65、B-ID107 症状复核成立（arpg_save_repository `near "."` sqlite 语法错，基线同红）。同日按前置依赖把全账 33 条重排为四批次（根修 / 独立 / 有前置 / 大工程），每条加〔依赖标签〕，正文不动。同日 B-ID107 闭账移出（Name=短名/FullName/TableName 兜底短名 e75ce25e4，arpg_save_repository 转绿 + 反射三钉金标随契约翻转 + ORM 族 16 绿；selfhost ngen_reflect 镜像同步余项并入 B-ID109）、B-ID104 收窄（JRE 钉扎+哈希校验 bde79b74a 落地，余安装器移出）、B-ID93 定性改写（行号发射整体缺失，非 async 特缺）。
+> 最近平账 2026-11-03（彻底清理）：全账按「只记剩余欠账」压缩，验证流水归 git 历史；B-ID95/98/100/105 闭账移出（导出面 devirt 预修 33f21d49e 落地且场景暂不可达 / OOM 注入钩子+三钉 55367b004 落地 / 预扫缓存收益 ~12ms 低于噪声底不做 / json 消费方 dap_integration+lsp_integration_utf16 绿）；B-ID68/69/70 归并指针行移出（B-ID75 领域点名承接）。同日晚：B-ID113 闭账移出（stdout 二进制模式 25ca931ff，字节钉 stdio_binary_mode 7/7 绿）、B-ID108 闭账移出（JsonDoc 槽位三访问器 9a40bdf88，AppUpdate --emit-lib 77 文件绿 + Json 回归五钉绿）。早前同日：B-ID80 SipHash 落地闭账、B-ID66 闭账移出、B-ID104/105/106/110 各片落地（详 git 历史）。同日晚 ORM 族平账：orm/linq/diag_orm/dao 35 案实测 31 绿 4 红——B-ID59 余量收敛为两案（"orm 族 ~20 案红"过时移除）、case_orm_upsert（E3023 OnConflict 匿名对象）红面归 B-ID65、B-ID107 症状复核成立（arpg_save_repository `near "."` sqlite 语法错，基线同红）。同日按前置依赖把全账 33 条重排为四批次（根修 / 独立 / 有前置 / 大工程），每条加〔依赖标签〕，正文不动。同日 B-ID107 闭账移出（Name=短名/FullName/TableName 兜底短名 e75ce25e4，arpg_save_repository 转绿 + 反射三钉金标随契约翻转 + ORM 族 16 绿；selfhost ngen_reflect 镜像同步余项并入 B-ID109）、B-ID104 收窄（JRE 钉扎+哈希校验 bde79b74a 落地，余安装器移出）、B-ID93 定性改写（行号发射整体缺失，非 async 特缺）、B-ID76 闭账移出（--checked 全局开关落地，同一源双面钉 checked_arith_default/flag，既有 checked_overflow_coverage 回归绿）。
 
 ## 未完成（按平账顺序分批）
 
@@ -24,7 +24,6 @@
 ### 批次 2 · 独立账（无前置，任一会话可领，按编号序）
 
 - [~] B-ID73〔独立〕DateTime.Now 本地墙钟时间语义：`Now()`/`UtcNow()` 语义与 DST 边界已闭（conformance datetime_now，git 历史）。余：脱离操作系统时区库的 `TimeZoneInfo` 与 IANA 时区库（`/usr/share/zoneinfo`）统一支持——按任意时区名查询偏移、跨平台规则一致；现仅支持本机时区。
-- [ ] B-ID76〔独立〕整数算术：余：全局 --checked 编译开关（C# /checked+ 等价物，一键全部算术 nsw + DivByZero 守卫）。checked/unchecked 陷阱与取负 -MIN、++/--、MIN/-1 除法、窄化强转四处缺口已闭（checked_overflow_coverage，git 历史）。
 - [ ] B-ID78〔独立〕ARC 深层对象树级联析构栈溢出防护（迭代式延迟释放队列）：`irgen_arc.c` 中对象析构递归下钻释放子字段，上千层深度的链表/树被 release 时递归耗尽线程栈引发 Stack Overflow。需引入迭代式延迟释放队列（Deferred Drop Queue）；双轨同步。
 - [ ] B-ID81〔独立〕只读与不可变集合契约健全（IReadOnlyList / ReadOnlySpan 等）：标准库集合缺乏只读抽象约束，实体向外暴露内部集合时可被随意篡改或并发破坏。需补全 `IReadOnlyCollection<T>`、`IReadOnlyList<T>`、`IReadOnlyDictionary<K, V>` 接口及切片视图；双轨同步。
 - [ ] B-ID82〔独立〕包管理语义化版本仲裁与钻石依赖求解器（Diamond Dependency Solver）：当前 `.zan-packages/` 仅支持简单扁平安装，同一包不同大版本缺冲突求解。需引入类似 PubGrub 的语义化版本依赖解析与包隔离机制；双轨保持一致。
