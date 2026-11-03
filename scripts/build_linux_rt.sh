@@ -47,6 +47,12 @@ for pair in linux-musl:x86_64 linux-arm64:aarch64 linux-riscv64:riscv64; do
     # so a cross-link needs this object unconditionally (see main.c).
     "$ZIG" cc -target "$arch-linux-musl" -g0 -std=c11 -fPIC \
         -I "$RT" -O2 -ffunction-sections -fdata-sections -c "$RT/rt_timer.c" -o "$out/zanrt_timer.o"
+
+    # Crash reporter: rt_io.o references zan__crash_install (B-ID106,
+    # rt_crash.h split), so the cross link needs this object next to
+    # zanrt_timer.o.
+    "$ZIG" cc -target "$arch-linux-musl" -g0 -std=c11 -fPIC \
+        -I "$RT" -O2 -ffunction-sections -fdata-sections -c "$RT/rt_crash.c" -o "$out/zanrt_crash.o"
     # Hardware-accelerated crypto, shipped as an ARCHIVE member and not as a
     # bare object: a bare .o on the link line is loaded whole, so every
     # program carried the entire SHA/AES/SM3/SM4 block even when it used none
@@ -78,5 +84,5 @@ for pair in linux-musl:x86_64 linux-arm64:aarch64 linux-riscv64:riscv64; do
         "$ZIG" cc -target "$arch-linux-musl" -g0 -std=c11 -fPIC \
             -I "$RT" -O2 -ffunction-sections -fdata-sections -c "$RT/rt_mem.c" -o "$out/zanrt_mem.o"
     fi
-    echo "built toolchain/$sub: zanrt_io.o zanrt_io_mt.o zanrt_sync.o zanrt_file.o zanrt_decimal.o zanrt_timer.o libzancrypto.a zan_embed_api.o zan_inflate.o"
+    echo "built toolchain/$sub: zanrt_io.o zanrt_io_mt.o zanrt_sync.o zanrt_file.o zanrt_decimal.o zanrt_timer.o zanrt_crash.o libzancrypto.a zan_embed_api.o zan_inflate.o"
 done

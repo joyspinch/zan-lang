@@ -94,6 +94,12 @@ for pair in android-x64:x86_64 android-arm64:aarch64; do
         -I "$RT" -O2 -ffunction-sections -fdata-sections -c "$RT/rt_decimal.c" -o "$out/zanrt_decimal.o"
     "$CC" --sysroot="$SYSROOT" -target "$triple" -g0 -std=c11 -fPIC \
         -I "$RT" -O2 -ffunction-sections -fdata-sections -c "$RT/rt_timer.c" -o "$out/zanrt_timer.o"
+
+    # Crash reporter: rt_io.o references zan__crash_install (B-ID106,
+    # rt_crash.h split), so the cross link needs this object next to
+    # zanrt_timer.o.
+    "$CC" --sysroot="$SYSROOT" -target "$triple" -g0 -std=c11 -fPIC \
+        -I "$RT" -O2 -ffunction-sections -fdata-sections -c "$RT/rt_crash.c" -o "$out/zanrt_crash.o"
     # Crypto as an archive member -- see scripts/build_linux_rt.sh for why a
     # bare .o on the link line is wrong here.
     "$CC" --sysroot="$SYSROOT" -target "$triple" -g0 -std=c11 -fPIC \
@@ -138,5 +144,5 @@ for pair in android-x64:x86_64 android-arm64:aarch64; do
     [ -f "$out/libclang_rt.builtins.a" ] || \
         echo "note: libclang_rt.builtins.a not found under $BUILTINS_DIR" >&2
 
-    echo "built toolchain/$sub: zanrt_io.o zanrt_sync.o zanrt_file.o zanrt_decimal.o zanrt_timer.o libzancrypto.a zan_embed_api.o zan_inflate.o + NDK sysroot subset"
+    echo "built toolchain/$sub: zanrt_io.o zanrt_sync.o zanrt_file.o zanrt_decimal.o zanrt_timer.o zanrt_crash.o libzancrypto.a zan_embed_api.o zan_inflate.o + NDK sysroot subset"
 done

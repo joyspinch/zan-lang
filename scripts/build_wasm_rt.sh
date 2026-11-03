@@ -46,6 +46,7 @@ build zanrt_wasm.o    rt_wasm.c    -std=c11  -I "$RT" -O2
 build zanrt_file.o    rt_file.c    -std=c11  -I "$RT" -O2
 build zanrt_decimal.o rt_decimal.c -std=c11  -I "$RT" -O2
 build zanrt_timer.o   rt_timer.c   -std=c11  -I "$RT" -O2
+build zanrt_crash.o    rt_crash.c   -std=c11  -I "$RT" -O2
 # Crypto as an archive member -- a plain zanrt_crypto.o would pull the
 # whole archive into every wasm link; the member form lets the linker
 # drop it for programs without native crypto references (same reason the

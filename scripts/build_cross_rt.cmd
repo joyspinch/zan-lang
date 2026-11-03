@@ -30,6 +30,7 @@ for %%P in (linux-musl:x86_64 linux-arm64:aarch64 linux-riscv64:riscv64) do (
     rem NativeMemory) reference it, and the cross link injects it for them.
     "%ZIG%" cc -target %%B-linux-musl -g0 -std=c11 -fPIC -I %RT% -O2 -c %RT%\rt_decimal.c -o toolchain\%%A\zanrt_decimal.o || exit /b 1
     "%ZIG%" cc -target %%B-linux-musl -g0 -std=c11 -fPIC -I %RT% -O2 -c %RT%\rt_timer.c -o toolchain\%%A\zanrt_timer.o || exit /b 1
+"%ZIG%" cc -target %%B-linux-musl -g0 -std=c11 -fPIC -I %RT% -O2 -c %RT%\rt_crash.c -o toolchain\%%A\zanrt_crash.o || exit /b 1
     rem Hardware-accelerated crypto, shipped as an ARCHIVE member and not as a
     rem bare object: a bare .o on the link line is loaded whole, so every
     rem program carried the entire SHA/AES/SM3/SM4 block even when it used none
@@ -58,6 +59,7 @@ for %%P in (arm64:aarch64 x64:x86_64) do (
     "%ZIG%" cc -target %%B-macos.11.0 -g0 -std=c11 -fPIC -I %RT% -O2 -c %RT%\rt_sync.c  -o toolchain\macos\%%A\zanrt_sync.o  || exit /b 1
     "%ZIG%" cc -target %%B-macos.11.0 -g0 -std=c11 -fPIC -I %RT% -O2 -c %RT%\rt_file.c  -o toolchain\macos\%%A\zanrt_file.o  || exit /b 1
     "%ZIG%" cc -target %%B-macos.11.0 -g0 -std=c11 -fPIC -I %RT% -O2 -c %RT%\rt_timer.c -o toolchain\macos\%%A\zanrt_timer.o || exit /b 1
+"%ZIG%" cc -target %%B-macos.11.0 -g0 -std=c11 -fPIC -I %RT% -O2 -c %RT%\rt_crash.c -o toolchain\macos\%%A\zanrt_crash.o || exit /b 1
     rem 128-bit Decimal runtime: programs that reach System.Numerics reference
     rem __zan_decimal_*, and the cross link injects this object for them.
     "%ZIG%" cc -target %%B-macos.11.0 -g0 -std=c11 -fPIC -I %RT% -O2 -c %RT%\rt_decimal.c -o toolchain\macos\%%A\zanrt_decimal.o || exit /b 1
@@ -88,6 +90,7 @@ rem 128-bit Decimal runtime: programs that reach System.Numerics reference
 rem __zan_decimal_*, and the iOS link injects this object for them.
 "%ZIG%" cc -target aarch64-ios.14.0 -I "%IOSHDR%" -g0 -std=c11 -fPIC -I %RT% -O2 -c %RT%\rt_decimal.c -o toolchain\ios\arm64\zanrt_decimal.o || exit /b 1
 "%ZIG%" cc -target aarch64-ios.14.0 -I "%IOSHDR%" -g0 -std=c11 -fPIC -I %RT% -O2 -c %RT%\rt_timer.c -o toolchain\ios\arm64\zanrt_timer.o || exit /b 1
+"%ZIG%" cc -target aarch64-ios.14.0 -I "%IOSHDR%" -g0 -std=c11 -fPIC -I %RT% -O2 -c %RT%\rt_crash.c -o toolchain\ios\arm64\zanrt_crash.o || exit /b 1
 rem Crypto as an archive member -- see the linux block above for why.
 "%ZIG%" cc -target aarch64-ios.14.0 -I "%IOSHDR%" -g0 -std=c11 -fPIC -I %RT% -O2 -c %RT%\rt_hw_accel.c -o toolchain\ios\arm64\zan_crypto.o || exit /b 1
 if exist toolchain\ios\arm64\libzancrypto.a del /q toolchain\ios\arm64\libzancrypto.a
@@ -116,6 +119,7 @@ rem 128-bit Decimal runtime: programs that reach System.Numerics reference
 rem __zan_decimal_*, and the wasm link injects this object for them.
 "%ZIG%" cc -target wasm32-wasi -g0 -std=c11 -I %RT% -O2 -c %RT%\rt_decimal.c -o toolchain\wasm32\zanrt_decimal.o || exit /b 1
 "%ZIG%" cc -target wasm32-wasi -g0 -std=c11 -I %RT% -O2 -c %RT%\rt_timer.c -o toolchain\wasm32\zanrt_timer.o || exit /b 1
+"%ZIG%" cc -target wasm32-wasi -g0 -std=c11 -I %RT% -O2 -c %RT%\rt_crash.c -o toolchain\wasm32\zanrt_crash.o || exit /b 1
 rem Crypto as an archive member -- see the linux block above for why.
 "%ZIG%" cc -target wasm32-wasi -g0 -std=c11 -I %RT% -O2 -c %RT%\rt_hw_accel.c -o toolchain\wasm32\zan_crypto.o || exit /b 1
 if exist toolchain\wasm32\libzancrypto.a del /q toolchain\wasm32\libzancrypto.a
@@ -197,6 +201,7 @@ for %%P in (android-x64:x86_64 android-arm64:aarch64) do (
     "%NDKBIN%\clang.exe" --sysroot="%ANDROID_NDK%\toolchains\llvm\prebuilt\windows-x86_64\sysroot" -target %%B-linux-android28 -g0 -std=c11 -fPIC -I %RT% -O2 -c %RT%\rt_sync.c  -o toolchain\%%A\zanrt_sync.o  || exit /b 1
     "%NDKBIN%\clang.exe" --sysroot="%ANDROID_NDK%\toolchains\llvm\prebuilt\windows-x86_64\sysroot" -target %%B-linux-android28 -g0 -std=c11 -fPIC -I %RT% -O2 -c %RT%\rt_file.c  -o toolchain\%%A\zanrt_file.o  || exit /b 1
     "%NDKBIN%\clang.exe" --sysroot="%ANDROID_NDK%\toolchains\llvm\prebuilt\windows-x86_64\sysroot" -target %%B-linux-android28 -g0 -std=c11 -fPIC -I %RT% -O2 -c %RT%\rt_timer.c -o toolchain\%%A\zanrt_timer.o || exit /b 1
+"%NDKBIN%\clang.exe" --sysroot="%ANDROID_NDK%\toolchains\llvm\prebuilt\windows-x86_64\sysroot" -target %%B-linux-android28 -g0 -std=c11 -fPIC -I %RT% -O2 -c %RT%\rt_crash.c -o toolchain\%%A\zanrt_crash.o || exit /b 1
     rem Crypto as an archive member -- see the linux block above for why.
     "%NDKBIN%\clang.exe" --sysroot="%ANDROID_NDK%\toolchains\llvm\prebuilt\windows-x86_64\sysroot" -target %%B-linux-android28 -g0 -std=c11 -fPIC -I %RT% -O2 -c %RT%\rt_hw_accel.c -o toolchain\%%A\zan_crypto.o || exit /b 1
     if exist toolchain\%%A\libzancrypto.a del /q toolchain\%%A\libzancrypto.a
@@ -261,6 +266,7 @@ for %%P in (ohos-x64:x86_64-unknown-linux-ohos ohos-arm64:aarch64-unknown-linux-
     rem -- the target("sha2") attribute enables codegen but not the header
     rem guard -- so the timer object needs -march. Handled after the loop;
     %OHOSBIN%\clang.exe --sysroot="%OHOSSYS%" -target %%B -g0 -std=c11 -fPIC -I %RT% -O2 -c %RT%\rt_timer.c -o toolchain\%%A\zanrt_timer.o || if "%%B"=="x86_64-unknown-linux-ohos" exit /b 1
+%OHOSBIN%\clang.exe --sysroot="%OHOSSYS%" -target %%B -g0 -std=c11 -fPIC -I %RT% -O2 -c %RT%\rt_crash.c -o toolchain\%%A\zanrt_crash.o || if "%%B"=="x86_64-unknown-linux-ohos" exit /b 1
     rem Crypto as an archive member -- see the linux block above for why.
     %OHOSBIN%\clang.exe --sysroot="%OHOSSYS%" -target %%B -g0 -std=c11 -fPIC -I %RT% -O2 -c %RT%\rt_hw_accel.c -o toolchain\%%A\zan_crypto.o || exit /b 1
     if exist toolchain\%%A\libzancrypto.a del /q toolchain\%%A\libzancrypto.a
@@ -293,6 +299,7 @@ rem The arm64 timer rebuild promised in the loop: -march turns on the TU-level
 rem crypto feature macro so arm_neon.h declares the SHA-2 intrinsics. Runtime
 rem dispatch is unaffected -- the HWCAP_SHA2 gate plus KAT still decide per CPU.
 "%OHOSBIN%\clang.exe" --sysroot="%OHOSSYS%" -target aarch64-unknown-linux-ohos -g0 -std=c11 -fPIC -march=armv8-a+crypto -I %RT% -O2 -c %RT%\rt_timer.c -o toolchain\ohos-arm64\zanrt_timer.o || exit /b 1
+"%OHOSBIN%\clang.exe" --sysroot="%OHOSSYS%" -target aarch64-unknown-linux-ohos -g0 -std=c11 -fPIC -march=armv8-a+crypto -I %RT% -O2 -c %RT%\rt_crash.c -o toolchain\ohos-arm64\zanrt_crash.o || exit /b 1
 echo built toolchain\ohos-arm64\zanrt_timer.o +crypto
 
 :ohos_done

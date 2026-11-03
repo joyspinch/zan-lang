@@ -45,6 +45,12 @@ for pair in arm64:aarch64 x64:x86_64; do
     # so a cross-link needs this object unconditionally (see main.c).
     "$ZIG" cc -target "$arch-macos.11.0" -g0 -std=c11 -fPIC -I "$RT" -O2 -ffunction-sections -fdata-sections \
         -c "$RT/rt_timer.c" -o "$out/zanrt_timer.o"
+
+    # Crash reporter: rt_io.o references zan__crash_install (B-ID106,
+    # rt_crash.h split), so the cross link needs this object next to
+    # zanrt_timer.o.
+    "$ZIG" cc -target "$arch-macos.11.0" -g0 -std=c11 -fPIC -I "$RT" -O2 -ffunction-sections -fdata-sections \
+        -c "$RT/rt_crash.c" -o "$out/zanrt_crash.o"
     # 128-bit Decimal runtime: programs that reach System.Numerics (and so
     # NativeMemory) reference __zan_decimal_*, and the cross link injects this
     # object for them (main.c injects <toolchain>/macos/<arch>/zanrt_decimal.o).
@@ -80,7 +86,7 @@ for pair in arm64:aarch64 x64:x86_64; do
         -DMINIZ_NO_TIME -DMINIZ_NO_ARCHIVE_WRITERS \
         -I "$ROOT/src/common" \
         -c "$RT/zan_inflate.c" -o "$out/zan_inflate.o"
-    echo "built toolchain/macos/$sub: zanrt_io.o zanrt_io_mt.o zanrt_sync.o zanrt_file.o zanrt_timer.o zanrt_decimal.o libzancrypto.a zanrt_gui.o zan_embed_api.o zan_inflate.o"
+    echo "built toolchain/macos/$sub: zanrt_io.o zanrt_io_mt.o zanrt_sync.o zanrt_file.o zanrt_timer.o zanrt_crash.o zanrt_decimal.o libzancrypto.a zanrt_gui.o zan_embed_api.o zan_inflate.o"
 done
 
 mkdir -p "$ROOT/toolchain/ios/arm64"

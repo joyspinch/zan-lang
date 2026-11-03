@@ -59,6 +59,15 @@ $CC -O2 -g0 -DNDEBUG -ffunction-sections -fdata-sections -fPIC -std=gnu11 \
     -I"$ROOT/src/runtime" \
     -c "$ROOT/src/runtime/gui_runtime.c" -o "$WORK/zan_gui_${ARCH_SUFFIX}.o"
 
+# Crash reporter object: rt_crash.h implementations moved to rt_crash.c
+# (B-ID106); gui_runtime.o now references zan__* instead of baking them in,
+# so the static archive and the shared lib carry this member to stay
+# self-contained exactly as before the split.
+$CC -O2 -g0 -DNDEBUG -ffunction-sections -fdata-sections -fPIC -std=gnu11 \
+    -U_FORTIFY_SOURCE -DZAN_NO_EXECINFO \
+    -I"$ROOT/src/runtime" \
+    -c "$ROOT/src/runtime/rt_crash.c" -o "$WORK/zan_crash_${ARCH_SUFFIX}.o"
+
 for feature in image audio game; do
     $CC -O2 -g0 -DNDEBUG -ffunction-sections -fdata-sections -fPIC -std=gnu11 \
         -U_FORTIFY_SOURCE -DZAN_NO_EXECINFO -D"ZAN_${feature^^}_STATIC" \
@@ -108,8 +117,8 @@ done
 
 echo "== [3/3] Creating merged static archive libzan_gui.a =="
 rm -f "$DEST/libzan_gui.a"
-$AR rcs "$DEST/libzan_gui.a" "$WORK/zan_gui_${ARCH_SUFFIX}.o" "$WORK/zan_fortify_compat.o" "$X_OBJS_DIR"/*/*.o 2>/dev/null || \
-$AR rcs "$DEST/libzan_gui.a" "$WORK/zan_gui_${ARCH_SUFFIX}.o" "$WORK/zan_fortify_compat.o"
+$AR rcs "$DEST/libzan_gui.a" "$WORK/zan_gui_${ARCH_SUFFIX}.o" "$WORK/zan_crash_${ARCH_SUFFIX}.o" "$WORK/zan_fortify_compat.o" "$X_OBJS_DIR"/*/*.o 2>/dev/null || \
+$AR rcs "$DEST/libzan_gui.a" "$WORK/zan_gui_${ARCH_SUFFIX}.o" "$WORK/zan_crash_${ARCH_SUFFIX}.o" "$WORK/zan_fortify_compat.o"
 rm -f "$IMAGE/static/libzan_image.a" "$AUDIO/static/libzan_audio.a" "$GAME/static/libzan_game.a"
 $AR rcs "$IMAGE/static/libzan_image.a" "$WORK/zan_image.o"
 $AR rcs "$AUDIO/static/libzan_audio.a" "$WORK/zan_audio.o"
@@ -123,6 +132,7 @@ printf 'dl\npthread\nm\n' > "$AUDIO/static/zan_audio.libs"
 # published game driver find the two dependent libraries beside it.
 $CC -shared -Wl,-soname,libzan_gui.so -o "$GUI/libzan_gui.so" \
     "$WORK/zan_gui_${ARCH_SUFFIX}.o" \
+    "$WORK/zan_crash_${ARCH_SUFFIX}.o" \
     -lX11 $(pkg-config --libs freetype2 fontconfig) -ldl -lpthread -lm
 $CC -shared -Wl,-soname,libzan_image.so -o "$IMAGE/libzan_image.so" "$WORK/zan_image.o" -lm
 $CC -shared -Wl,-soname,libzan_audio.so -o "$AUDIO/libzan_audio.so" "$WORK/zan_audio.o" -ldl -lpthread -lm

@@ -46,6 +46,10 @@ mkdir -p "$STAGE"
 # Every emitted program calls zan_timer_* from its inline coroutine driver, so a
 # cross-link needs this object unconditionally (see main.c).
 "$CC" -O2 -ffunction-sections -fdata-sections -g0 -std=c11 -I "$RT" -c "$RT/rt_timer.c" -o "$STAGE/zanrt_timer.o"
+# Crash reporter: rt_io.o references zan__crash_install (B-ID106,
+# rt_crash.h split), so native/cross links need this object next to
+# zanrt_timer.o.
+"$CC" -O2 -ffunction-sections -fdata-sections -g0 -std=c11 -I "$RT" -c "$RT/rt_crash.c" -o "$STAGE/zanrt_crash.o"
 # Hardware-accelerated crypto, shipped as an ARCHIVE member and not as a bare
 # object: a bare .o on the link line is loaded whole, so every program carried
 # the entire SHA/AES/SM3/SM4 block even when it used none of it. As an archive
@@ -85,8 +89,8 @@ fi
 # Swap in: every artifact is ready, so the bundle changes generation in one
 # step.
 for f in zanrt_io.o zanrt_io_mt.o zanrt_sync.o zanrt_file.o zanrt_decimal.o \
-         zanrt_timer.o zan_embed_api.o zan_inflate.o libzancrypto.a zan_crypto.o; do
+         zanrt_timer.o zanrt_crash.o zan_embed_api.o zan_inflate.o libzancrypto.a zan_crypto.o; do
     rm -f "$OUT/$f"
     mv "$STAGE/$f" "$OUT/$f"
 done
-echo "built toolchain/$SUB: zanrt_io.o zanrt_io_mt.o zanrt_sync.o zanrt_file.o zanrt_decimal.o zanrt_timer.o libzancrypto.a zan_embed_api.o zan_inflate.o"
+echo "built toolchain/$SUB: zanrt_io.o zanrt_io_mt.o zanrt_sync.o zanrt_file.o zanrt_decimal.o zanrt_timer.o zanrt_crash.o libzancrypto.a zan_embed_api.o zan_inflate.o"
