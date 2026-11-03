@@ -143,4 +143,54 @@ public class Account {
         if (tx == null) { return null; }
         return tx.Sign(PrivateKey);
     }
+
+    // 从 BIP-39 助记词与可选口令派生恢复账户
+    public static Account FromMnemonic(string mnemonic, string passphrase) {
+        return Mnemonic.AccountFromMnemonic(mnemonic, passphrase);
+    }
+
+    // 符合以太坊 EIP-712 标准的结构化类型数据签名 (DeFi 挂单/授权/Permit 规范)
+    public string SignTypedData(Eip712Domain domain, byte[] structHash32) {
+        if (domain == null || structHash32 == null) { return null; }
+        byte[] hash = Eip712.HashTypedData(domain, structHash32);
+        Secp256k1Signature sig = Secp256k1.Sign(hash, PrivateKey);
+        if (sig == null) { return null; }
+
+        byte[] compact = new byte[65];
+        for (int i = 0; i < 32; i = i + 1) {
+            compact[i] = sig.R[i];
+            compact[32 + i] = sig.S[i];
+        }
+        compact[64] = (byte)(sig.V + 27);
+
+        return "0x" + Hex.Encode(compact, 65);
+    }
+
+    // 校验 EIP-712 结构化数据签名是否合法有效
+    public static bool VerifyTypedData(Eip712Domain domain, byte[] structHash32, string signatureHex, Address expectedSigner) {
+        if (domain == null || structHash32 == null || signatureHex == null || expectedSigner == null) { return false; }
+        string clean = signatureHex.Trim();
+        if (clean.StartsWith("0x") || clean.StartsWith("0X")) {
+            clean = clean.Substring(2);
+        }
+        if (clean.Length != 130) { return false; }
+        byte[] sigBytes = Hex.Decode(clean, 130);
+        if (sigBytes == null || sigBytes.Length != 65) { return false; }
+
+        byte[] r = new byte[32];
+        byte[] s = new byte[32];
+        for (int i = 0; i < 32; i = i + 1) {
+            r[i] = sigBytes[i];
+            s[i] = sigBytes[32 + i];
+        }
+        int vRaw = sigBytes[64] & 255;
+        int v = (vRaw >= 27) ? (vRaw - 27) : vRaw;
+
+        Secp256k1Signature sig = new Secp256k1Signature(r, s, v);
+        byte[] hash = Eip712.HashTypedData(domain, structHash32);
+
+        Address recovered = Address.Recover(hash, sig);
+        if (recovered == null) { return false; }
+        return recovered.Equals(expectedSigner);
+    }
 }
