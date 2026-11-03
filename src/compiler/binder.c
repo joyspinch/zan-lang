@@ -1001,6 +1001,28 @@ zan_type_t *zan_binder_resolve_type(zan_binder_t *b, zan_ast_node_t *type_ref) {
                 inst->type_args[i] = zan_binder_resolve_type(
                     b, type_ref->type_ref.type_args.items[i]);
             }
+            /* 实例化类型必须带着按实参替换后的接口列表走：Box<T> : IBox<T>
+             * 实例化成 Box<Dog> 后 interfaces 应是 IBox<Dog>，而不是随
+             * sym 一起指向开泛 IBox<T>（或干脆为空）。否则 derives 走查
+             * 进不了接口方差分支，类→变型接口的协变/逆变转换
+             * （Box<Dog> -> IBox<Animal>）被误拒 E2024（B-ID63）。 */
+            if (user_generic && base->interface_count > 0 && base->sym &&
+                base->sym->decl) {
+                zan_ast_list_t *dtps = NULL;
+                if (base->sym->decl->kind == AST_CLASS_DECL ||
+                    base->sym->decl->kind == AST_STRUCT_DECL ||
+                    base->sym->decl->kind == AST_INTERFACE_DECL)
+                    dtps = &base->sym->decl->type_decl.type_params;
+                if (dtps && dtps->count == nargs) {
+                    inst->interfaces = (zan_type_t **)zan_arena_alloc(
+                        b->arena,
+                        sizeof(zan_type_t *) * (size_t)base->interface_count);
+                    inst->interface_count = base->interface_count;
+                    for (int i = 0; i < base->interface_count; i++)
+                        inst->interfaces[i] = zan_binder_subst_named(
+                            b, base->interfaces[i], dtps, inst->type_args);
+                }
+            }
             base = inst;
         } else if (base->sym && base->sym->decl) {
             int expected_tps = binder_decl_type_param_count(base->sym->decl);

@@ -106,6 +106,9 @@ int64_t zan_hw_x25519(const uint8_t *scalar, const uint8_t *point, uint8_t *out)
 /* CRC-32C 硬件加速计算：基于 SSE4.2 crc32 / ARMv8 CRC 指令 */
 int64_t zan_hw_crc32c_update(uint32_t crc, const uint8_t *p, int64_t len);
 
+/* CRC-32 (IEEE 802.3, 多项式 0xEDB88320) 硬件/切片加速计算：基于 ARMv8 CRC 指令 / x86 Slice-by-8 */
+int64_t zan_hw_crc32_update(uint32_t crc, const uint8_t *p, int64_t len);
+
 void zan_hw_aes_encrypt(const void *val, const void *key, void *out);
 void zan_hw_aes_encrypt_last(const void *val, const void *key, void *out);
 void zan_hw_aes_decrypt(const void *val, const void *key, void *out);

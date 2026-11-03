@@ -23,6 +23,19 @@ static LLVMValueRef coerce_to_frame_result(zan_irgen_t *g, LLVMValueRef v,
     LLVMTypeRef i32 = LLVMInt32TypeInContext(g->ctx);
     LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
     LLVMTypeRef t = LLVMTypeOf(v);
+    /* B-ID64 类型化返回值字段：同步把声明类型的值存入帧尾 RVAL 槽（聚合返回
+     * 的权威存储此前即此槽，标量补齐后终结析构按真实类型释放）。类型对不上
+     * 时跳过，i64 槽仍承载编码。 */
+    if (g->current_async_frame && g->current_async_rval_slot >= 0) {
+        LLVMTypeRef rwant = LLVMStructGetTypeAtIndex(g->current_async_frame_type,
+            (unsigned)g->current_async_rval_slot);
+        if (LLVMTypeOf(v) == rwant) {
+            LLVMValueRef rp = LLVMBuildStructGEP2(g->builder,
+                g->current_async_frame_type, g->current_async_frame,
+                (unsigned)g->current_async_rval_slot, "rval.p");
+            LLVMBuildStore(g->builder, v, rp);
+        }
+    }
     switch (LLVMGetTypeKind(t)) {
     case LLVMIntegerTypeKind: {
         unsigned bits = LLVMGetIntTypeWidth(t);
@@ -36,10 +49,10 @@ static LLVMValueRef coerce_to_frame_result(zan_irgen_t *g, LLVMValueRef v,
         if (ty) {
             LLVMTypeRef want = map_type(g, ty);
             if (want && LLVMGetTypeKind(want) == LLVMStructTypeKind &&
-                g->current_async_frame && g->current_async_ret_agg_slot >= 0) {
+                g->current_async_frame && g->current_async_rval_slot >= 0) {
                 LLVMValueRef slot_ptr = LLVMBuildStructGEP2(g->builder,
                     g->current_async_frame_type, g->current_async_frame,
-                    (unsigned)g->current_async_ret_agg_slot, "ret.agg.slot");
+                    (unsigned)g->current_async_rval_slot, "ret.agg.slot");
                 LLVMValueRef loaded = LLVMBuildLoad2(g->builder, want, v, "ret.agg.load");
                 LLVMBuildStore(g->builder, loaded, slot_ptr);
                 return LLVMBuildPtrToInt(g->builder, slot_ptr, i64, "res.slot");
@@ -48,10 +61,10 @@ static LLVMValueRef coerce_to_frame_result(zan_irgen_t *g, LLVMValueRef v,
         return LLVMBuildPtrToInt(g->builder, v, i64, "res.slot");
     }
     case LLVMStructTypeKind: {
-        if (g->current_async_frame && g->current_async_ret_agg_slot >= 0) {
+        if (g->current_async_frame && g->current_async_rval_slot >= 0) {
             LLVMValueRef slot_ptr = LLVMBuildStructGEP2(g->builder,
                 g->current_async_frame_type, g->current_async_frame,
-                (unsigned)g->current_async_ret_agg_slot, "ret.agg.slot");
+                (unsigned)g->current_async_rval_slot, "ret.agg.slot");
             LLVMBuildStore(g->builder, v, slot_ptr);
             return LLVMBuildPtrToInt(g->builder, slot_ptr, i64, "res.slot");
         }
@@ -397,6 +410,35 @@ static void emit_async_complete(zan_irgen_t *g, local_scope_t *locals,
     LLVMAddIncoming(g->current_async_result_phi, &value, &from, 1);
 }
 
+/* fire-and-forget（自等待者）帧终结时释放无人认领的结果载荷（B-ID64）：
+ * Task.Spawn 带结果协程的返回值在 return 处 retain 后无人读取，帧被 reap
+ * 时载荷滞留即孤儿泄漏（探针 BID64_result_orphan_probe 实证 3 对象）。
+ * 自等待者惯例（AWAITER=自身，emit_detach_async_call keep_result=false）
+ * 是"结果永不经帧读取"的编译期可判形态：完成尾声判 AWAITER==自身时按
+ * 返回类型释放 RVAL 载荷并清槽。句柄/根驱动帧（.Result 延迟读）与真
+ * awaiter 帧不受影响——前者的释放点仍归 reap/.Result 读取方。 */
+static void emit_async_orphan_result_release(zan_irgen_t *g) {
+    zan_type_t *rt = g->current_async_ret_type;
+    if (!rt || rt->kind == TYPE_VOID || g->current_async_rval_slot < 0 ||
+        !g->current_async_frame || !g->current_async_frame_type) return;
+    LLVMTypeRef ft = g->current_async_frame_type;
+    unsigned idx = (unsigned)g->current_async_rval_slot;
+    LLVMTypeRef lt = LLVMStructGetTypeAtIndex(ft, idx);
+    LLVMTypeKind lk = LLVMGetTypeKind(lt);
+    if (lk != LLVMPointerTypeKind && lk != LLVMStructTypeKind) return;
+    LLVMValueRef p = LLVMBuildStructGEP2(g->builder, ft, g->current_async_frame,
+                                         idx, "orphan.rval.p");
+    LLVMValueRef v = LLVMBuildLoad2(g->builder, lt, p, "orphan.rval");
+    LLVMBuildStore(g->builder, LLVMConstNull(lt), p);
+    if (lk == LLVMPointerTypeKind) {
+        if (is_rc_managed_type(rt) || rt->kind == TYPE_OBJECT) {
+            emit_rc_release_for_type(g, rt, v);
+        }
+    } else if (type_contains_collection_rc(g, rt, 0)) {
+        emit_collection_value_release(g, rt, v, 0);
+    }
+}
+
 /* 发射共享完成尾声：存入结果、标记完成、释放持有者、唤醒等待者并 ret void */
 static void emit_async_complete_epilogue(zan_irgen_t *g, local_scope_t *locals) {
     if (!g->current_async_complete_bb) return;
@@ -463,9 +505,24 @@ static void emit_async_complete_epilogue(zan_irgen_t *g, local_scope_t *locals) 
         LLVMAtomicOrderingSequentiallyConsistent, 0);
     LLVMValueRef has_awaiter = zan_icmp(g->builder, LLVMIntUGT, old_aw,
         LLVMConstInt(ptr_int_ty, 1, 0), "has.awaiter");
+    /* B-ID64 终结自动析构：自等待者（AWAITER==自身）即 fire-and-forget 帧，
+     * 结果载荷无人认领，唤醒 reap 前先按类型释放 RVAL。 */
+    LLVMValueRef self_int = LLVMBuildPtrToInt(g->builder, self_i8, ptr_int_ty,
+                                              "orphan.self.int");
+    LLVMValueRef is_orphan = zan_icmp(g->builder, LLVMIntEQ, old_aw, self_int,
+                                      "orphan.selfaw");
     LLVMValueRef fn = g->current_fn;
+    LLVMBasicBlockRef orphan_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "co.orphan");
+    LLVMBasicBlockRef chk_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "co.awchk");
     LLVMBasicBlockRef wake_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "co.wake");
     LLVMBasicBlockRef ret_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "co.ret");
+    LLVMBuildCondBr(g->builder, is_orphan, orphan_bb, chk_bb);
+
+    LLVMPositionBuilderAtEnd(g->builder, orphan_bb);
+    emit_async_orphan_result_release(g);
+    LLVMBuildBr(g->builder, wake_bb);
+
+    LLVMPositionBuilderAtEnd(g->builder, chk_bb);
     LLVMBuildCondBr(g->builder, has_awaiter, wake_bb, ret_bb);
 
     LLVMPositionBuilderAtEnd(g->builder, wake_bb);

@@ -867,10 +867,12 @@ static bool emit_native_memory_call(zan_irgen_t *g, zan_ast_node_t *expr,
     if (is_call_to(expr, "NativeMemory", "Crc32") && expr->call.args.count == 2) {
         LLVMValueRef p = nm_arg(g, expr, 0, locals);
         LLVMValueRef len = nm_arg(g, expr, 1, locals);
-        LLVMTypeRef ty = LLVMFunctionType(i64t, (LLVMTypeRef[]){ i8ptr, i64t }, 2, 0);
-        LLVMValueRef fn = nm_crc32_fn(g);
+        LLVMTypeRef ty = LLVMFunctionType(i64t,
+            (LLVMTypeRef[]){ i32t, i8ptr, i64t }, 3, 0);
+        LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "zan_hw_crc32_update");
+        if (!fn) fn = LLVMAddFunction(g->mod, "zan_hw_crc32_update", ty);
         *out = zan_call2(g->builder, ty, fn, (LLVMValueRef[]){
-            nm_addr(g, p, zero64), len }, 2, "nm.crc");
+            LLVMConstInt(i32t, 0, 0), nm_addr(g, p, zero64), len }, 3, "nm.crc");
         return true;
     }
     if (is_call_to(expr, "NativeMemory", "Crc32C") && expr->call.args.count == 2) {
@@ -1141,6 +1143,18 @@ static bool emit_native_memory_call(zan_irgen_t *g, zan_ast_node_t *expr,
         *out = zan_call2(g->builder, ty, fn, (LLVMValueRef[]){
             nm_addr(g, scalar, zero64), nm_addr(g, point, zero64),
             nm_addr(g, out_buf, zero64) }, 3, "nm.x25519");
+        return true;
+    }
+    if (is_call_to(expr, "NativeMemory", "Crc32Update") && expr->call.args.count == 3) {
+        LLVMValueRef crc = nm_arg(g, expr, 0, locals);
+        LLVMValueRef p = nm_arg(g, expr, 1, locals);
+        LLVMValueRef len = nm_arg(g, expr, 2, locals);
+        LLVMTypeRef ty = LLVMFunctionType(i64t,
+            (LLVMTypeRef[]){ i32t, i8ptr, i64t }, 3, 0);
+        LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "zan_hw_crc32_update");
+        if (!fn) fn = LLVMAddFunction(g->mod, "zan_hw_crc32_update", ty);
+        *out = zan_call2(g->builder, ty, fn, (LLVMValueRef[]){
+            coerce_int_to(g, crc, i32t), nm_addr(g, p, zero64), len }, 3, "nm.crc.u");
         return true;
     }
     if (is_call_to(expr, "NativeMemory", "Crc32CUpdate") && expr->call.args.count == 3) {

@@ -619,7 +619,7 @@ typedef struct {
     async_local_t  *alocals;
     int             alocal_count;
     int             sub_base;
-    int             ret_agg_slot;
+    int             rval_slot;
     int             handler_cap;
     int             try_count;
     int             fin_depth_max;
@@ -725,7 +725,7 @@ static void declare_async_method(zan_irgen_t *g, method_body_work_t *w,
         w->sub_base = locals_base + w->alocal_count;
         int nfields = w->sub_base + (w->await_count > 0 ? 1 : 0);
 
-        int ret_agg_slot = -1;
+        int rval_slot = -1;
         zan_type_t *raw_ret = w->ret_type ? w->ret_type : g->binder->type_void;
         if (member->method_decl.return_type) {
             raw_ret = zan_binder_resolve_type(g->binder, member->method_decl.return_type);
@@ -747,10 +747,14 @@ static void declare_async_method(zan_irgen_t *g, method_body_work_t *w,
         }
         LLVMTypeRef lret = map_type(g, ret_type);
         bool is_agg_ret = (lret && LLVMGetTypeKind(lret) == LLVMStructTypeKind);
-        if (is_agg_ret) {
-            ret_agg_slot = nfields++;
+        /* B-ID64 类型化返回值字段：凡非 void 返回一律在帧尾挂 RVAL 槽（此前
+         * 只有聚合返回才有 ret_agg_slot）。RVAL 是返回值的权威类型化存储，
+         * i64 RESULT 槽保留为兼容协议（头布局/调度器 scratch/Task<T> 轮询）。 */
+        bool has_rval = (ret_type && ret_type->kind != TYPE_VOID && lret);
+        if (has_rval) {
+            rval_slot = nfields++;
         }
-        w->ret_agg_slot = ret_agg_slot;
+        w->rval_slot = rval_slot;
 
         LLVMTypeRef *fields = (LLVMTypeRef *)calloc((size_t)nfields, sizeof(LLVMTypeRef));
         fields[ASYNC_FRAME_SCHED] = i64;
@@ -793,8 +797,8 @@ static void declare_async_method(zan_irgen_t *g, method_body_work_t *w,
         if (w->await_count > 0) {
             fields[w->sub_base] = i8ptr;
         }
-        if (is_agg_ret) {
-            fields[ret_agg_slot] = lret;
+        if (has_rval) {
+            fields[rval_slot] = lret;
         }
         char frame_name[560];
         snprintf(frame_name, sizeof(frame_name), "%s$frame", fn_name);
@@ -1035,7 +1039,7 @@ static void emit_async_method_ir(zan_irgen_t *g, method_body_work_t *w) {
         int saved_next_state = g->current_async_next_state;
         int saved_sub_base = g->current_async_sub_base;
         int saved_sub_next = g->current_async_sub_next;
-        int saved_ret_agg_slot = g->current_async_ret_agg_slot;
+        int saved_rval_slot = g->current_async_rval_slot;
         void *saved_slots = (void *)g->current_async_slots;
         int saved_slot_count = g->current_async_slot_count;
         int saved_frame_local_count = g->current_async_frame_local_count;
@@ -1098,7 +1102,7 @@ static void emit_async_method_ir(zan_irgen_t *g, method_body_work_t *w) {
             g->current_async_ret_type = concretize(g, g->current_async_ret_type->type_args[0]);
         }
         g->current_fn_zan_ret_type = g->current_async_ret_type;
-        g->current_async_ret_agg_slot = w->ret_agg_slot;
+        g->current_async_rval_slot = w->rval_slot;
         g->current_async_next_state = 1;
         g->current_async_sub_base = w->sub_base;
         g->current_async_sub_next = 0;
@@ -1208,7 +1212,7 @@ static void emit_async_method_ir(zan_irgen_t *g, method_body_work_t *w) {
         g->current_async_next_state = saved_next_state;
         g->current_async_sub_base = saved_sub_base;
         g->current_async_sub_next = saved_sub_next;
-        g->current_async_ret_agg_slot = saved_ret_agg_slot;
+        g->current_async_rval_slot = saved_rval_slot;
         g->current_async_slots = saved_slots;
         g->current_async_slot_count = saved_slot_count;
         g->current_async_frame_local_count = saved_frame_local_count;
@@ -1608,7 +1612,7 @@ static method_body_work_t *declare_user_methods(zan_irgen_t *g,
             async_local_t *a_locals = NULL;
             int a_local_count = 0;
             int a_sub_base = 0;
-	            int a_ret_agg_slot = -1;
+	            int a_rval_slot = -1;
 	            int a_handler_cap = 1;
 	            int a_try_count = 0;
 
@@ -1634,7 +1638,7 @@ static method_body_work_t *declare_user_methods(zan_irgen_t *g,
 	                a_locals = adecl.alocals;
 	                a_local_count = adecl.alocal_count;
 	                a_sub_base = adecl.sub_base;
-	                a_ret_agg_slot = adecl.ret_agg_slot;
+	                a_rval_slot = adecl.rval_slot;
 	                a_handler_cap = adecl.handler_cap;
 	                a_try_count = adecl.try_count;
             } else {
@@ -1708,7 +1712,7 @@ static method_body_work_t *declare_user_methods(zan_irgen_t *g,
                 work[work_count].alocals = a_locals;
                 work[work_count].alocal_count = a_local_count;
 	                work[work_count].sub_base = a_sub_base;
-	                work[work_count].ret_agg_slot = a_ret_agg_slot;
+	                work[work_count].rval_slot = a_rval_slot;
 	                work[work_count].handler_cap = a_handler_cap;
 	                work[work_count].try_count = a_try_count;
 	                work[work_count].cur_inst = cur_variant;

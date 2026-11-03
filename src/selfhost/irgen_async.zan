@@ -1024,6 +1024,21 @@ partial class Irgen {
         L("  store i64 -1, i64* " + sp);
         string awp = FrameGep("%ff", 4);
         string awi = NT(); L("  " + awi + " = load i64, i64* " + awp);
+        // B-ID64 镜像：自等待者（Task.Spawn 写 AWAITER=自身）即 fire-and-forget
+        // 帧——结果载荷永不经帧读取，唤醒 reap 前按元素类型释放槽 6 并清槽。
+        // 与宿主 emit_async_complete_epilogue 的 co.orphan 分支同口径。
+        if (curAsyncRetElem != null && ArcManaged(curAsyncRetElem)) {
+            string selfi = NT(); L("  " + selfi + " = ptrtoint i8* %fp to i64");
+            string isself = NT(); L("  " + isself + " = icmp eq i64 " + awi + ", " + selfi);
+            int lor = NL(); int lgo = NL();
+            L("  br i1 " + isself + ", label %L" + lor + ", label %L" + lgo);
+            Label(lor);
+            string orv = NT(); L("  " + orv + " = load i64, i64* " + rp);
+            L("  store i64 0, i64* " + rp);
+            EmitArcRelease(FromI64(orv, MapType(curAsyncRetElem)), curAsyncRetElem);
+            L("  br label %L" + lgo);
+            Label(lgo);
+        }
         string aw = NT(); L("  " + aw + " = inttoptr i64 " + awi + " to i8*");
         string has = NT(); L("  " + has + " = icmp ne i8* " + aw + ", null");
         int lw = NL(); int lr = NL();
@@ -1204,6 +1219,11 @@ partial class Irgen {
         string resumeSym = sym + "$resume";
         Node thisTy = MkType(cls.sval);
         int j = 0;
+        // B-ID64：结果元素类型（Task<T> 的 T）供完成尾声的孤儿载荷释放用。
+        curAsyncRetElem = AsyncElemTyOf(m.type);
+        if (curAsyncRetElem != null && curAsyncRetElem.sval == "void") {
+            curAsyncRetElem = null;
+        }
 
         // ---- ramp: allocate frame, capture (retain) receiver+params, return ----
         StartFn();
@@ -1370,6 +1390,7 @@ partial class Irgen {
         curAsync = false;
         curAsyncThis = false;
         curAsyncThisTy = null;
+        curAsyncRetElem = null;
 
         // ---- cleanup: release every owned rc slot from the heap frame and
         // free it. Called by @__zan_async_unwind when an exception longjmps

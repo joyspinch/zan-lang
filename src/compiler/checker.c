@@ -1372,6 +1372,39 @@ static bool same_generic_container(zan_type_t *a, zan_type_t *b) {
            memcmp(a->name.str, b->name.str, (size_t)a->name.len) == 0;
 }
 
+/* 同名泛型接口的实参兼容：按形参方差位逐位判定（B-ID63，与 derives 的
+ * 接口方差分支同口径）。协变位要求 from 实参 is-a target 实参（且都是
+ * 引用形态），逆变位反向。只在接口显式声明了 out/in 的形参上收紧；
+ * 无任何方差声明（内建接口与未标记的用户接口）保持旧口径放行——
+ * 全面收紧未标记接口是独立语义变更，不随本修。 */
+static bool checker_variant_args_ok(zan_type_t *target, zan_type_t *value) {
+    if (!target->sym || !target->sym->decl) return true;
+    bool any_variance = false;
+    for (int i = 0; i < target->type_arg_count; i++)
+        if (zan_type_param_variance(target->sym, i) != 0) { any_variance = true; break; }
+    if (!any_variance) return true;
+    for (int i = 0; i < target->type_arg_count; i++) {
+        int var = zan_type_param_variance(target->sym, i);
+        zan_type_t *targ = target->type_args[i];
+        zan_type_t *varg = value->type_arg_count > i ? value->type_args[i] : NULL;
+        if (!targ || !varg) return false;
+        if (checker_type_equal(targ, varg)) continue;
+        if (var == 1) {
+            if (checker_type_is_ref(targ) && checker_type_is_ref(varg) &&
+                checker_type_derives_from(varg, targ))
+                continue;
+            return false;
+        } else if (var == -1) {
+            if (checker_type_is_ref(targ) && checker_type_is_ref(varg) &&
+                checker_type_derives_from(targ, varg))
+                continue;
+            return false;
+        }
+        return false;
+    }
+    return true;
+}
+
 static bool checker_is_byte_buffer(zan_type_t *t) {
     if (!t || t->kind != TYPE_ARRAY || !t->element_type) return false;
     return t->element_type->kind == TYPE_BYTE ||
@@ -1556,8 +1589,14 @@ static bool checker_type_assignable(zan_type_t *target, zan_type_t *value) {
         if (value->kind == TYPE_INTERFACE || value->kind == TYPE_CLASS ||
             value->kind == TYPE_STRUCT) {
             if (same_generic_container(target, value) &&
-                !checker_type_equal(target, value))
-                return true;
+                !checker_type_equal(target, value)) {
+                /* 同名泛型接口（value 为接口时才可能命中：same_generic_
+                 * container 先比 kind）实参兼容走方差方向判定，不再无条件
+                 * 放行——否则 IBox<Cat> 能塞进 IBox<Animal> 位（B-ID63）。
+                 * 判不过时不再落 derives：同符号在 derives 里必同判，
+                 * 这里直接给出确定结论。 */
+                return checker_variant_args_ok(target, value);
+            }
             return checker_type_derives_from(value, target);
         }
         return false;

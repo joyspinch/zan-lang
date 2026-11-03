@@ -2338,7 +2338,7 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
     g->current_async_next_state = 1;
     g->current_async_sub_base = 0;
     g->current_async_sub_next = 0;
-    g->current_async_ret_agg_slot = -1;
+    g->current_async_rval_slot = -1;
     g->current_async_slots = NULL;
     g->current_async_slot_count = 0;
     g->current_async_sub_rethrow_bb = NULL;

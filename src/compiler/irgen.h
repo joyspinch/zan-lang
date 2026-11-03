@@ -574,7 +574,7 @@ struct zan_irgen {
     int          current_async_next_state;
     int          current_async_sub_base;
     int          current_async_sub_next;
-    int          current_async_ret_agg_slot;
+    int          current_async_rval_slot;
     zan_async_slot_t *current_async_slots;
     int          current_async_slot_count;
     /* 异步协程完成汇聚块：共享析构局部变量并发布完成状态 */

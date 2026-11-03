@@ -181,7 +181,14 @@ public class Binder {
         int flt = fromTy.IndexOf("<");
         if (flt > 0) { baseFrom = fromTy.Substring(0, flt); }
 
-        if (baseTarget == baseFrom) { return true; }
+        if (baseTarget == baseFrom) {
+            if (targetTy == fromTy) { return true; }
+            // 同名泛型的实参兼容：有形参方差位的用户声明按方向校验
+            // （B-ID63 镜像 C11 checker 的接口/委托方差转换）；无方差
+            // 信息（内建容器/未声明形状）保持名字级口径放行。
+            if (tlt > 0 && flt > 0) { return VariantArgsCompatible(targetTy, fromTy); }
+            return true;
+        }
 
         // Builtin collection interfaces
         if (baseTarget == "IEnumerable" || baseTarget == "IReadOnlyList" ||
@@ -224,6 +231,78 @@ public class Binder {
             }
         }
         return false;
+    }
+
+    // 同名泛型基的实参兼容校验：取出声明形参的方差位（ival：1=out 协变
+    // / -1=in 逆变 / 0=不变），对两侧实参逐位判定——协变位要求
+    // from 实参可赋给 target 实参（Dog -> Animal），逆变位反向
+    // （B-ID63，镜像 C11 checker.c 的接口方差分支）。声明查不到
+    // （内建容器/命名空间限定的形状）时放行，保持旧口径。
+    public bool VariantArgsCompatible(string targetTy, string fromTy) {
+        Node decl = FindType(BaseTypeName(targetTy));
+        if (decl == null) { return true; }
+        List<long> vars = new List<long>();
+        int i = 0;
+        while (i < decl.kids.Count) {
+            Node kd = decl.kids[i];
+            if (kd.kind == AK.TypeParam()) { vars.Add(kd.ival); }
+            i = i + 1;
+        }
+        if (vars.Count == 0) { return true; }
+        // 无任何方差声明的接口保持旧口径放行（与 C11 checker_variant_args_ok
+        // 同规：只在显式 out/in 上收紧）。
+        bool anyVariance = false;
+        int vi = 0;
+        while (vi < vars.Count) { if (vars[vi] != 0) { anyVariance = true; break; } vi = vi + 1; }
+        if (!anyVariance) { return true; }
+        List<string> targs = SplitTypeArgs(targetTy);
+        List<string> fargs = SplitTypeArgs(fromTy);
+        if (targs.Count != vars.Count || fargs.Count != vars.Count) { return false; }
+        int k = 0;
+        while (k < vars.Count) {
+            if (targs[k] == fargs[k]) { k = k + 1; continue; }
+            if (vars[k] == 1) {
+                if (!IsAssignableFrom(targs[k], fargs[k])) { return false; }
+            } else if (vars[k] == -1) {
+                if (!IsAssignableFrom(fargs[k], targs[k])) { return false; }
+            } else {
+                return false;
+            }
+            k = k + 1;
+        }
+        return true;
+    }
+
+    // "IBox<Dog>" -> "IBox"；无 '<' 原样返回。
+    string BaseTypeName(string ty) {
+        int lt = ty.IndexOf("<");
+        if (lt > 0) { return ty.Substring(0, lt); }
+        return ty;
+    }
+
+    // 泛型实参的顶层逗号切分："Dict<string,int>" -> ["string","int"]。
+    // 嵌套 '<' '>' 计深度，逗号只在深度 0 切。
+    List<string> SplitTypeArgs(string ty) {
+        List<string> r = new List<string>();
+        int lt = ty.IndexOf("<");
+        int gt = ty.LastIndexOf(">");
+        if (lt < 0 || gt < 0 || gt <= lt) { return r; }
+        string body = ty.Substring(lt + 1, gt - lt - 1);
+        int depth = 0;
+        int start = 0;
+        int i = 0;
+        while (i < body.Length) {
+            char c = body[i];
+            if (c == '<') { depth = depth + 1; }
+            else if (c == '>') { depth = depth - 1; }
+            else if (c == ',' && depth == 0) {
+                r.Add(body.Substring(start, i - start));
+                start = i + 1;
+            }
+            i = i + 1;
+        }
+        r.Add(body.Substring(start, body.Length - start));
+        return r;
     }
 
     public bool MatchReceiver(Node m, Node p0, string recvTy) {

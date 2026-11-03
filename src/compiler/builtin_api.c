@@ -174,6 +174,7 @@ static const zan_builtin_member_t members_nativemem[] = {
     { "Sha1",   'M', "string Sha1(nint ptr, long size)" },
     { "Sha512", 'M', "string Sha512(nint ptr, long size)" },
     { "Crc32",  'M', "long Crc32(nint ptr, long size)" },
+    { "Crc32Update", 'M', "long Crc32Update(long crc, nint ptr, long size)" },
     { "Crc32C", 'M', "long Crc32C(nint ptr, long size)" },
     { "Crc32CUpdate", 'M', "long Crc32CUpdate(long crc, nint ptr, long size)" },
     { "AesCbcEncrypt", 'M', "long AesCbcEncrypt(nint dst, nint src, long size, nint key, int keybits, nint iv)" },
