@@ -45,17 +45,22 @@ public class FileJobStorage : JobStorage {
 
     // 重新读一遍存储文件（外部改了文件、或要丢弃内存状态时用）。
     public void Reload() {
-        Dictionary<string, JobRecord> fresh = new Dictionary<string, JobRecord>();
-        if (File.Exists(this.path)) {
-            List<string> lines = File.ReadAllLines(this.path);
-            for (int i = 0; i < lines.Count; i++) {
-                JobRecord r = JobRecord.FromJson(lines[i]);
-                if (r == null) { continue; }
-                if (r.id == null || r.id.Length == 0) { continue; }
-                fresh[r.id] = r;
+        writeLock.WaitOne();
+        try {
+            Dictionary<string, JobRecord> fresh = new Dictionary<string, JobRecord>();
+            if (File.Exists(this.path)) {
+                List<string> lines = File.ReadAllLines(this.path);
+                for (int i = 0; i < lines.Count; i++) {
+                    JobRecord r = JobRecord.FromJson(lines[i]);
+                    if (r == null) { continue; }
+                    if (r.id == null || r.id.Length == 0) { continue; }
+                    fresh[r.id] = r;
+                }
             }
+            this.index = fresh;
+        } finally {
+            writeLock.ReleaseMutex();
         }
-        this.index = fresh;
     }
 
     public override void Append(JobRecord record) {
@@ -81,6 +86,15 @@ public class FileJobStorage : JobStorage {
     }
 
     public override List<JobRecord> Snapshot() {
+        writeLock.WaitOne();
+        try {
+            return this.SnapshotInternal();
+        } finally {
+            writeLock.ReleaseMutex();
+        }
+    }
+
+    private List<JobRecord> SnapshotInternal() {
         List<JobRecord> items = new List<JobRecord>();
         List<string> keys = this.index.Keys;
         for (int i = 0; i < keys.Count; i++) {
@@ -94,9 +108,14 @@ public class FileJobStorage : JobStorage {
 
     public override JobRecord Find(string id) {
         if (id == null) { return null; }
-        JobRecord r = null;
-        if (this.index.TryGetValue(id, out r)) { return r; }
-        return null;
+        writeLock.WaitOne();
+        try {
+            JobRecord r = null;
+            if (this.index.TryGetValue(id, out r)) { return r; }
+            return null;
+        } finally {
+            writeLock.ReleaseMutex();
+        }
     }
 
     // 压实：把历史折叠成"每个 id 一行"，只保留当前状态。
@@ -111,16 +130,13 @@ public class FileJobStorage : JobStorage {
             }
             try {
                 StringBuilder sb = new StringBuilder();
-                List<JobRecord> all = this.Snapshot();
+                List<JobRecord> all = this.SnapshotInternal();
                 for (int i = 0; i < all.Count; i++) {
                     sb.Append(all[i].ToJson());
                     sb.Append("\n");
                 }
                 string tmp = this.path + ".tmp";
                 File.WriteAllText(tmp, sb.ToString());
-                if (File.Exists(this.path)) {
-                    File.Delete(this.path);
-                }
                 File.Move(tmp, this.path);
             } finally {
                 File.Unlock(handle);

@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Threading;
 
 namespace System.Jobs;
 
@@ -12,11 +13,13 @@ namespace System.Jobs;
 // 的任务名），而不是等到半夜某个任务静默失败。
 //
 // **线程安全**：注册通常在启动时一次性完成；运行期注册也安全（写操作
-// 走互斥锁）。
+// 与读操作全链路走实例互斥锁）。
 public class JobRegistry {
+    Mutex syncLock;
     Dictionary<string, JobHandler> handlers;
 
     public JobRegistry() {
+        this.syncLock = new Mutex();
         this.handlers = new Dictionary<string, JobHandler>();
     }
 
@@ -67,19 +70,29 @@ public class JobRegistry {
         if (handler.run == null) {
             throw new JobException(JobError.InvalidArgs, handler.name, "handler run is null");
         }
-        if (this.handlers.ContainsKey(handler.name)) {
-            throw new JobException(JobError.DuplicateHandler, handler.name,
-                "handler already registered: " + handler.name);
+        this.syncLock.WaitOne();
+        try {
+            if (this.handlers.ContainsKey(handler.name)) {
+                throw new JobException(JobError.DuplicateHandler, handler.name,
+                    "handler already registered: " + handler.name);
+            }
+            this.handlers[handler.name] = handler;
+        } finally {
+            this.syncLock.ReleaseMutex();
         }
-        this.handlers[handler.name] = handler;
     }
 
     // 按名字找处理器；没注册返回 null。
     public JobHandler Find(string name) {
         if (name == null) { return null; }
-        JobHandler h = null;
-        if (this.handlers.TryGetValue(name, out h)) { return h; }
-        return null;
+        this.syncLock.WaitOne();
+        try {
+            JobHandler h = null;
+            if (this.handlers.TryGetValue(name, out h)) { return h; }
+            return null;
+        } finally {
+            this.syncLock.ReleaseMutex();
+        }
     }
 
     // 是否注册过。
@@ -89,22 +102,37 @@ public class JobRegistry {
 
     // 已注册的任务名。
     public List<string> Names() {
-        List<string> names = new List<string>();
-        List<string> keys = this.handlers.Keys;
-        for (int i = 0; i < keys.Count; i++) { names.Add(keys[i]); }
-        return names;
+        this.syncLock.WaitOne();
+        try {
+            List<string> names = new List<string>();
+            List<string> keys = this.handlers.Keys;
+            for (int i = 0; i < keys.Count; i++) { names.Add(keys[i]); }
+            return names;
+        } finally {
+            this.syncLock.ReleaseMutex();
+        }
     }
 
     // 已注册的任务数。
     public int Count() {
-        return this.handlers.Count;
+        this.syncLock.WaitOne();
+        try {
+            return this.handlers.Count;
+        } finally {
+            this.syncLock.ReleaseMutex();
+        }
     }
 
     // 注销一个处理器；原来没注册返回 false。
     public bool Unregister(string name) {
         if (name == null) { return false; }
-        if (!this.handlers.ContainsKey(name)) { return false; }
-        this.handlers.Remove(name);
-        return true;
+        this.syncLock.WaitOne();
+        try {
+            if (!this.handlers.ContainsKey(name)) { return false; }
+            this.handlers.Remove(name);
+            return true;
+        } finally {
+            this.syncLock.ReleaseMutex();
+        }
     }
 }

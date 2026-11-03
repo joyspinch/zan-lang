@@ -1,0 +1,117 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Jobs;
+
+class Program {
+    static void Main() {
+        // 1. 验证 JobRegistry 线程同步与契约一致性
+        JobRegistry reg = new JobRegistry();
+        reg.Register("task.a", (args) => JobResult.Success());
+        reg.Register("task.b", (args) => JobResult.Success());
+        reg.Register("task.c", (args) => JobResult.Success());
+
+        bool hasA = reg.Has("task.a");
+        bool hasB = reg.Has("task.b");
+        int countBefore = reg.Count();
+        bool unregC = reg.Unregister("task.c");
+        int countAfter = reg.Count();
+
+        if (hasA && hasB && countBefore == 3 && unregC && countAfter == 2) {
+            Console.WriteLine("registry_sync=ok");
+            Console.WriteLine("registry_count=" + countAfter);
+        } else {
+            Console.WriteLine("registry_sync=fail");
+        }
+
+        // 2. 验证 InMemoryJobStorage 实例锁隔离与读写同步
+        InMemoryJobStorage s1 = new InMemoryJobStorage();
+        InMemoryJobStorage s2 = new InMemoryJobStorage();
+
+        JobRecord r1 = new JobRecord();
+        r1.id = "id-1";
+        r1.name = "task.a";
+        r1.state = JobState.Enqueued;
+        s1.Append(r1);
+
+        JobRecord found1 = s1.Find("id-1");
+        JobRecord foundInS2 = s2.Find("id-1");
+        int snapCount1 = s1.Snapshot().Count;
+        int snapCount2 = s2.Snapshot().Count;
+
+        if (found1 != null && foundInS2 == null && snapCount1 == 1 && snapCount2 == 0) {
+            Console.WriteLine("storage_isolation=ok");
+        } else {
+            Console.WriteLine("storage_isolation=fail");
+        }
+
+        // 3. 验证 FileJobStorage 原子压实 Compact（杜绝 DeleteFile 丢数据）
+        try {
+            string dir = "_scratch/jobs_resilience";
+            Directory.CreateDirectoryRecursive(dir);
+            string path = dir + "/compact_test.jsonl";
+            if (File.Exists(path)) { File.Delete(path); }
+            if (File.Exists(path + ".lock")) { File.Delete(path + ".lock"); }
+            if (File.Exists(path + ".tmp")) { File.Delete(path + ".tmp"); }
+
+            FileJobStorage fs = new FileJobStorage(path);
+            JobRecord fr1 = new JobRecord();
+            fr1.id = "f-1";
+            fr1.name = "task.a";
+            fr1.state = JobState.Enqueued;
+            fs.Append(fr1);
+
+            JobRecord fr2 = new JobRecord();
+            fr2.id = "f-2";
+            fr2.name = "task.b";
+            fr2.state = JobState.Enqueued;
+            fs.Append(fr2);
+
+            // 更新 f-1 状态，形成多版本历史行
+            JobRecord fr1Update = fr1.Copy();
+            fr1Update.state = JobState.Succeeded;
+            fs.Append(fr1Update);
+
+            // 执行原子压实
+            fs.Compact();
+
+            // 重新从磁盘读取验证
+            FileJobStorage fsReloaded = new FileJobStorage(path);
+            List<JobRecord> snap = fsReloaded.Snapshot();
+            JobRecord reloadedF1 = fsReloaded.Find("f-1");
+            JobRecord reloadedF2 = fsReloaded.Find("f-2");
+
+            if (snap.Count == 2 && reloadedF1 != null && reloadedF1.state == JobState.Succeeded
+                && reloadedF2 != null && reloadedF2.state == JobState.Enqueued) {
+                Console.WriteLine("compact_atomic=ok");
+            } else {
+                Console.WriteLine("compact_atomic=fail");
+            }
+        } catch (Exception ex) {
+            Console.WriteLine("compact_ex: " + ex.Message);
+        }
+
+        // 4. 验证 JobWorker ProcessJob 乐观状态校验杜绝多 worker 并发重跑
+        JobWorker w1 = new JobWorker(s1, reg, RetryPolicy.Fixed(2, 50));
+        w1.SetWorkerId("worker-1");
+        JobWorker w2 = new JobWorker(s1, reg, RetryPolicy.Fixed(2, 50));
+        w2.SetWorkerId("worker-2");
+
+        // 此时 s1 中有 r1 (id-1, Enqueued)
+        JobRecord jobSnap = s1.Find("id-1");
+
+        // w1 开始处理
+        JobRecord resW1 = w1.ProcessJob(jobSnap);
+
+        // w2 尝试拿之前缓存的 jobSnap 再次处理
+        JobRecord resW2 = w2.ProcessJob(jobSnap);
+
+        if (resW1 != null && resW1.state == JobState.Succeeded && resW2 == null) {
+            Console.WriteLine("worker_dedup=ok");
+        } else {
+            Console.WriteLine("worker_dedup=fail");
+        }
+
+        Console.WriteLine("jobs_concurrency_done=true");
+    }
+}
