@@ -21,7 +21,19 @@ public class MenuBuilder {
         MenuBuilder.labels.Set(segment, label);
     }
 
+    // 内置标准分组默认中文映射（若项目侧未手动声明 Section，以此兜底替代 URL 大写英文回退）
+    public static void InitDefaults() {
+        if (MenuBuilder.labels.Has("system")) { return; }
+        MenuBuilder.Section("content", "内容管理");
+        MenuBuilder.Section("monitor", "运行监控");
+        MenuBuilder.Section("system", "系统管理");
+        MenuBuilder.Section("dev", "开发工具");
+        MenuBuilder.Section("media", "媒体库");
+        MenuBuilder.Section("wiki", "知识库");
+    }
+
     public static async List<MenuNode> ForUser(WebApp app, string uid, string activePath) {
+        MenuBuilder.InitDefaults();
         List<Route> routes = app.router.All();
         List<MenuNode> outp = new List<MenuNode>();
         for (int i = 0; i < routes.Count; i = i + 1) {
@@ -35,9 +47,30 @@ public class MenuBuilder {
             n.title = r.title;
             if (n.title.Length == 0) { n.title = r.action; }
             n.path = r.pattern;
-            n.group = MenuBuilder.GroupOf(r.pattern);
-            n.groupOrder = MenuBuilder.OrderOf(r.pattern);
-            n.order = r.pattern;
+
+            /* 优先采用特性显式声明的分组（[Custom(Group = "...")]），未声明时按 URL 前缀约定回退 */
+            string explicitGroup = r.meta.Get("Group");
+            if (explicitGroup.Length > 0) {
+                n.group = explicitGroup;
+            } else {
+                n.group = MenuBuilder.GroupOf(r.pattern);
+            }
+
+            /* 优先采用特性显式声明的排序（[Custom(GroupOrder = ...)] / [Custom(Order = ...)]） */
+            string explicitGroupOrder = r.meta.Get("GroupOrder");
+            if (explicitGroupOrder.Length > 0) {
+                n.groupOrder = Convert.ToInt32(explicitGroupOrder);
+            } else {
+                n.groupOrder = MenuBuilder.OrderOfGroup(n.group, r.pattern);
+            }
+
+            string explicitOrder = r.meta.Get("Order");
+            if (explicitOrder.Length > 0) {
+                n.order = explicitOrder;
+            } else {
+                n.order = r.pattern;
+            }
+
             n.icon = r.meta.Get("Icon");
             if (n.icon.Length == 0) { n.icon = MenuBuilder.defaultIcon; }
             n.active = MenuBuilder.Matches(r.pattern, activePath);
@@ -101,12 +134,20 @@ public class MenuBuilder {
     }
 
     public static int OrderOf(string path) {
+        return MenuBuilder.OrderOfGroup(MenuBuilder.GroupOf(path), path);
+    }
+
+    public static int OrderOfGroup(string group, string path) {
+        if (group.Length == 0) { return -1; }
         List<string> segs = MenuBuilder.Body(path);
-        if (MenuBuilder.GroupOf(path).Length == 0) { return -1; }
+        string seg = segs.Count > 0 ? segs[0] : "";
         for (int i = 0; i < MenuBuilder.sections.Count; i = i + 1) {
-            if (MenuBuilder.sections[i] == segs[0]) { return i; }
+            string s = MenuBuilder.sections[i];
+            if (s == seg || MenuBuilder.labels.Get(s) == group) {
+                return (i + 1) * 10;
+            }
         }
-        return 0x7FFFFFFF;
+        return 1;
     }
 
     private static List<string> Body(string pattern) {
