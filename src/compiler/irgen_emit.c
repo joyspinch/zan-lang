@@ -2153,7 +2153,12 @@ static void emit_user_method_bodies(zan_irgen_t *g, method_body_work_t *work,
             bool has_tparams = is_method && member->method_decl.type_params.count > 0;
             bool owner_generic = work[w].type_sym && work[w].type_sym->decl &&
                                  work[w].type_sym->decl->type_decl.type_params.count > 0;
-            if (!has_tparams && !owner_generic) {
+            zan_ast_list_t *attrs = zan_ast_attributes(member);
+            bool has_attrs = attrs && attrs->count > 0;
+            zan_ast_list_t *oattrs = work[w].type_sym && work[w].type_sym->decl
+                                     ? zan_ast_attributes(work[w].type_sym->decl) : NULL;
+            bool owner_has_attrs = oattrs && oattrs->count > 0;
+            if (!has_tparams && !owner_generic && !has_attrs && !owner_has_attrs) {
                 member->method_decl.body = NULL;
             }
         }
