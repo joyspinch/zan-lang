@@ -27,7 +27,7 @@
 
 ### 批次 3 · 有前置（前置闭了再领）
 
-- [ ] B-ID59〔前置 B-ID63〕ORM 查询链泛型推断断裂（E2108 泛型不变性）：`ToList<RouteStat>(a => new RouteStat {...})` 等链式投影报 cannot convert；余（2026-11-03 实测收敛）：case_orm_group_aggregate（E2108 三处投影）与 case_linq_and_zandb_opt（运行期零输出 access violation，接手先 _scratch 直执行定位）两案；orm/linq 族其余、generic_base_dao_orm、diag_orm 三例全绿（原"orm 族 ~20 案红"过时）；根修归 B-ID63（方差/泛型环境）。已修片段见 git 历史（diag_orm 三例、E2030 皮下钩）。
+- [ ] B-ID59〔前置 B-ID63〕ORM 查询链泛型推断断裂（E2108 泛型不变性）：`ToList<RouteStat>(a => new RouteStat {...})` 等链式投影报 cannot convert；余（2026-11-03 实测收敛）：case_orm_group_aggregate（E2108 三处投影）单案（case_linq_and_zandb_opt 已转绿闭环：irgen_stmt.c 剔除未特化 TYPE_TYPE_PARAM 盲目 emit_arc_retain，根治值类型返回值被当伪指针访问导致 0xC0000005 崩溃，82 钉全绿且零泄漏）；orm/linq 族其余、generic_base_dao_orm、diag_orm 三例全绿（原"orm 族 ~20 案红"过时）；根修归 B-ID63（方差/泛型环境）。已修片段见 git 历史（diag_orm 三例、E2030 皮下钩）。
 - [ ] B-ID60 反射元数据特性体系重构（解耦硬编码字符串）：`irgen_reflect.c` 与 selfhost 镜像目前以 `memcmp` 硬编码匹配有限特性名（Key/Required/NotMapped），命名参数与参数化属性（如 `[Column(IsPrimary = true)]`）无法进入元数据位表。需重构为结构化特性元数据流（Metadata Blob），支持反射面读取完整参数并保留 C11/selfhost 1:1 对齐。
 - [ ] B-ID62 语言内置原语与方法横截重构：`irgen_call_builtins.c` 现存 3200+ 行根据方法名字符串横截调用（nameof/GetValueOrDefault/ToString 等），易与用户自定义符号或重载产生意外冲突。需演进为标准库 `[Intrinsic]` 符号级绑定分发机制，checker 期绑定符号而非 irgen 字符串匹配，C11 与 selfhost 差分保持一致。
 - [ ] B-ID65〔前置 B-ID64（异步泄漏半）；表达式树/ON CONFLICT 半无前置可先行〕ORM 强类型表达式树与复合主键支持：余：只读表达式树（Expression Tree）AST 节点体系及 SQL 访问者（Visitor）翻译管线（复合主键 ON CONFLICT 下推）；异步仓储帧捕获链未随任务终结释放（退出 52 对象仍可达：Meta 静态单例链 + 连接内部集合，同步形态零泄漏）。红案面（2026-11-03 实测）：case_orm_upsert——`.OnConflict(a => new { a.minute, a.method, a.path })` 匿名对象键报 E3023（皮下钩只认 GroupBy/ToList/ToAggregate），即 ON CONFLICT 下推未落地的 conformance 直钉。bool-lambda Where/Delete/Update 语义已修见 git 历史。

@@ -1681,8 +1681,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                     emit_collection_value_retain(g, value_type, rv, 0);
                 } else if (value_type &&
                     (is_rc_managed_type(value_type) ||
-                     value_type->kind == TYPE_OBJECT ||
-                     value_type->kind == TYPE_TYPE_PARAM) &&
+                     value_type->kind == TYPE_OBJECT) &&
                     !expr_yields_owned_rc_value(g, stmt->ret.value, locals)) {
                     if (is_rc_managed_type(value_type)) {
                         emit_rc_retain_for_type(g, value_type, rv);
@@ -1740,7 +1739,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                 !conv_ret) {
                 emit_rc_retain_for_type(g, ret_type, val);
             } else if (ret_type &&
-                       (ret_type->kind == TYPE_OBJECT || ret_type->kind == TYPE_TYPE_PARAM) &&
+                       ret_type->kind == TYPE_OBJECT &&
                        LLVMGetTypeKind(LLVMTypeOf(val)) == LLVMPointerTypeKind &&
                        !expr_yields_owned_rc_value(g, stmt->ret.value, locals) &&
                        !conv_ret) {
