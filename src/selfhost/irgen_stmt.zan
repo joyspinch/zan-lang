@@ -57,11 +57,18 @@ partial class Irgen {
                     src = NarrowToDeclared(src, curRetTy);
                     string rv = Coerce(src, curRet);
                     // the ownership follows the returned value: a user-defined
-                    // conversion produces a value of the *target* type
-                    if (ArcManaged(src.ty)) {
-                        EmitArcRetain(rv, src.ty);
-                    } else if (curRet == "i8*" || (src.ty != null && src.ty.sval == "object")) {
-                        EmitArcRetainObject(rv);
+                    // conversion produces a value of the *target* type. The
+                    // retain reads the PRE-coercion value -- a generic (erased
+                    // slot) return coerces `null` to the i64 0 first, and the
+                    // object retain would then feed the integer literal to
+                    // `icmp eq i8*` (invalid IR). A literal (null or an
+                    // integer constant) owns nothing, so no retain either.
+                    if (!IsConstOperand(src.op)) {
+                        if (ArcManaged(src.ty)) {
+                            EmitArcRetain(src.op, src.ty);
+                        } else if (curRet == "i8*" || (src.ty != null && src.ty.sval == "object")) {
+                            EmitArcRetainObject(src.op);
+                        }
                     }
                     EmitTempReleases();
                     EmitExitFins(0);
@@ -180,6 +187,15 @@ partial class Irgen {
             return t;
         }
         return v.op;
+    }
+
+    // An LLVM literal operand ("null", an integer constant): a plain value
+    // with no slot to retain or release. The object-return ARC path must not
+    // feed these to `icmp eq i8*` -- an integer is not a pointer constant.
+    bool IsConstOperand(string op) {
+        if (op == null || op.Length == 0) { return true; }
+        if (op == "null" || op == "zeroinitializer" || op == "true" || op == "false") { return true; }
+        return op[0] >= '0' && op[0] <= '9';
     }
 
     // ---- vtable emission for polymorphic classes ----

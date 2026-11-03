@@ -37,11 +37,14 @@ public class Checker {
                                 // is only valid inside a catch block)
     List<string> scopeName;     // value names currently in scope
     List<Node> scopeType;       // parallel declared/inferred types (may be null)
+    List<Node> accReported;     // accessor nodes whose E2095 already fired
+                                // (InferType re-runs on one node many times)
 
     public Checker(Binder b, Diags d) {
         binder = b; diags = d; curClass = null; curMethodNode = null; curRet = null;
         curStatic = false; loopDepth = 0; catchDepth = 0;
         scopeName = new List<string>(); scopeType = new List<Node>();
+        accReported = null;
     }
 
     Node MkType(string name) { Node t = new Node(AK.TypeRef()); t.sval = name; return t; }
@@ -209,6 +212,196 @@ public class Checker {
         Node d = binder.FindType(t.sval);
         if (d != null && (d.kind == AK.ClassDecl() || d.kind == AK.StructDecl())) { return d; }
         return null;
+    }
+
+    // ---- typed data access: recv.<Entity> ("tables as properties") ----
+    //
+    // Mirror of the C host's checker_try_entity_accessor family
+    // (checker.c ~5258, B-ID63 selfhost half): a [Table] class turns
+    // `recv.<Entity>` into a plain member access whose lookup misses, and
+    // the checker then degrades the member node IN PLACE into a new
+    // expression -- `new <Entity>Dao(conn)` when the Dao has a single
+    // connection-assignable constructor parameter, otherwise
+    // `new BaseRepository<Entity>(ZanSql.FromConnection(conn))` (the one
+    // construction seam between the compiler and Zan.Data). Call position
+    // needs no separate hook: `db.User.Read(id)` checks its callee's
+    // object through InferType in VALUE position, so the inner access is
+    // rewritten there and `.Read` binds on the synthesized repository.
+
+    int ParamCountOf(Node m) {
+        int n = 0;
+        int i = 0;
+        while (i < m.kids.Count) { if (m.kids[i].kind == AK.Param()) { n = n + 1; } i = i + 1; }
+        return n;
+    }
+    Node FirstParamOf(Node m) {
+        int i = 0;
+        while (i < m.kids.Count) { if (m.kids[i].kind == AK.Param()) { return m.kids[i]; } i = i + 1; }
+        return null;
+    }
+    bool AccAlreadyReported(Node n) {
+        if (accReported == null) { return false; }
+        int i = 0;
+        while (i < accReported.Count) { if (accReported[i] == n) { return true; } i = i + 1; }
+        return false;
+    }
+
+    // a [Table] entity class under `name` (leading upper case, bounded
+    // length -- the host's checker_is_table_entity guards)
+    bool IsTableEntity(string name) {
+        if (name == null || name.Length == 0 || name.Length > 100) { return false; }
+        if (name[0] < 'A' || name[0] > 'Z') { return false; }
+        Node d = binder.FindType(name);
+        if (d == null || (d.kind != AK.ClassDecl() && d.kind != AK.StructDecl())) { return false; }
+        return d.attrTable;
+    }
+
+    // a value of this type may flow into a connection slot: it IS (or
+    // implements) IDbConnection/IDbExecutor (the host's checker_recv_is_conn)
+    bool RecvIsConn(Node t) {
+        if (t == null || t.sval == null || t.sval == "") { return false; }
+        if (t.sval == "IDbConnection" || t.sval == "IDbExecutor") { return true; }
+        return binder.IsAssignableFrom("IDbConnection", t.sval)
+            || binder.IsAssignableFrom("IDbExecutor", t.sval);
+    }
+
+    // a connection value fits the constructor parameter (interface params
+    // judge by implementation -- the host's checker_conn_fits_param)
+    bool ConnFitsParam(string connTy, string paramTy) {
+        if (connTy == null || paramTy == null) { return false; }
+        if (connTy == paramTy) { return true; }
+        return binder.IsAssignableFrom(paramTy, connTy);
+    }
+
+    // in-place degradation: the member node becomes a new expression.
+    // Member access and new_expr share the one node's fields -- everything
+    // needed from the member side is taken BEFORE the kind flip (the
+    // host's checker_emit_accessor_new).
+    void EmitAccessorNew(Node n, Node ty, Node arg) {
+        n.kind = AK.NewExpr();
+        n.type = ty;
+        n.b = null;
+        n.kids = new List<Node>();
+        n.Add(arg);
+        n.ival = 0;
+        n.op = 1;          // paren-arg count, same convention as the parser
+        n.sval2 = "";
+        n.d = null;
+        n.arrRanks = "";
+    }
+
+    // the synthesis itself. Returns true when the accessor applies: the
+    // node was rewritten (or the host's E2095 was reported). False = not
+    // an accessor; the caller reports its own no-member diagnostic.
+    bool TryEntityAccessor(Node n, Node ot) {
+        if (n == null || n.kind != AK.MemberAccess() || n.a == null) { return false; }
+        if (!IsTableEntity(n.sval)) { return false; }
+        // ② the receiver must yield a connection: itself (or implements)
+        // IDbConnection/IDbExecutor, or its class declares a zero-arg
+        // __Conn() whose return is connection-assignable
+        Node connNode = null;
+        string connTy = null;
+        if (RecvIsConn(ot)) {
+            connNode = n.a;
+            connTy = ot.sval;
+        } else {
+            Node cls = ClassOf(ot);
+            Node cm = cls != null ? MethodUp(cls, "__Conn") : null;
+            if (cm != null && cm.type != null && ParamCountOf(cm) == 0 && RecvIsConn(cm.type)) {
+                Node mc = new Node(AK.MemberAccess());
+                mc.a = n.a;
+                mc.sval = "__Conn";
+                mc.line = n.line; mc.col = n.col;
+                Node call = new Node(AK.Call());
+                call.a = mc;
+                call.line = n.line; call.col = n.col;
+                connNode = call;
+                connTy = cm.type.sval;
+            }
+        }
+        if (connNode == null) { return false; }
+
+        // ③ <Entity>Dao declared with a single connection-assignable
+        // constructor parameter: use it. The synthesized call is compiler
+        // trusted code -- no access check, same treatment as the host.
+        string daoName = n.sval + "Dao";
+        Node dao = binder.FindType(daoName);
+        if (dao != null && (dao.kind == AK.ClassDecl() || dao.kind == AK.StructDecl())) {
+            Node ctor = binder.FindCtorArity(dao, 1);
+            if (ctor != null) {
+                Node p0 = FirstParamOf(ctor);
+                if (p0 != null && p0.type != null && ConnFitsParam(connTy, p0.type.sval)) {
+                    EmitAccessorNew(n, MkType(daoName), connNode);
+                    return true;
+                }
+            }
+            // the host's E2095, fired once per node: InferType re-runs on
+            // the same node many times, and an unrewritten member node
+            // would re-enter the synthesis forever
+            if (!AccAlreadyReported(n)) {
+                diags.Error("'" + n.sval + "' accessor needs a single-parameter constructor on '"
+                    + daoName + "' taking the connection", n.line, n.col);
+                if (accReported == null) { accReported = new List<Node>(); }
+                accReported.Add(n);
+            }
+            return true;
+        }
+
+        // fallback: BaseRepository<Entity>(ZanSql.FromConnection(conn))
+        Node baseCls = binder.FindType("BaseRepository");
+        if (baseCls == null
+                || (baseCls.kind != AK.ClassDecl() && baseCls.kind != AK.StructDecl())) {
+            return false;
+        }
+        Node zid = new Node(AK.Ident());
+        zid.sval = "ZanSql";
+        zid.line = n.line; zid.col = n.col;
+        Node zc = new Node(AK.MemberAccess());
+        zc.a = zid;
+        zc.sval = "FromConnection";
+        zc.line = n.line; zc.col = n.col;
+        Node zcall = new Node(AK.Call());
+        zcall.a = zc;
+        zcall.line = n.line; zcall.col = n.col;
+        zcall.Add(connNode);
+        Node bt = MkType("BaseRepository");
+        bt.Add(MkType(n.sval));
+        EmitAccessorNew(n, bt, zcall);
+        return true;
+    }
+
+    // new Meta[] { Meta.For<E1>(), ... }: the synthesized second argument
+    // of a zero-arg SyncStructureAll(Async) (the host's
+    // checker_synthesize_table_array; same synthetic shape as
+    // ZanSql.FromConnection, plus explicit type args on the calls)
+    Node SynthTableArray(Node at) {
+        Node arr = new Node(AK.NewExpr());
+        arr.ival = 1;
+        arr.type = MkType("Meta");
+        arr.arrRanks = "1";
+        arr.line = at.line; arr.col = at.col;
+        int i = 0;
+        while (i < binder.types.Count) {
+            Node d = binder.types[i];
+            if ((d.kind == AK.ClassDecl() || d.kind == AK.StructDecl()) && d.attrTable) {
+                Node zid = new Node(AK.Ident());
+                zid.sval = "Meta";
+                zid.line = at.line; zid.col = at.col;
+                Node mc = new Node(AK.MemberAccess());
+                mc.a = zid;
+                mc.sval = "For";
+                mc.line = at.line; mc.col = at.col;
+                Node call = new Node(AK.Call());
+                call.a = mc;
+                call.line = at.line; call.col = at.col;
+                Node ta = MkType("__typeargs");
+                ta.Add(MkType(d.sval));
+                call.d = ta;
+                arr.Add(call);
+            }
+            i = i + 1;
+        }
+        return arr;
     }
 
     bool IsEnumMember(string name) {
@@ -519,6 +712,9 @@ public class Checker {
                 Node g = MethodUp(cls, "get_" + e.sval);
                 if (g != null) { return g.type; }
             }
+            // recv.<Entity> table accessor: the lookup missed, so the member
+            // node may degrade in place into the synthesized new expression
+            if (ot != null && TryEntityAccessor(e, ot)) { return e.type; }
             return null;
         }
         if (k == AK.Call()) {
@@ -1887,6 +2083,15 @@ public class Checker {
         else { Node sc = StaticRecv(n.a); if (sc != null) { CheckInternalAccess(sc, n.sval, n); } }
         if (cls != null && !HasMember(cls, n.sval) && !HasExt(cls.sval, n.sval)) {
             if (!IsReflInstName(n.sval)) {
+                // recv.<Entity> table accessor fires before the no-member
+                // diagnostic. Rewritten nodes get checked like any other new
+                // expression (the host calls check_expr on the degraded
+                // node); the E2095 path leaves the node alone -- re-checking
+                // it here would re-enter this very branch forever.
+                if (TryEntityAccessor(n, ot)) {
+                    if (n.kind == AK.NewExpr()) { CheckExpr(n); }
+                    return;
+                }
                 diags.Error("type '" + cls.sval + "' has no member '" + n.sval + "'", n.line, n.col);
             }
         }
@@ -1913,6 +2118,27 @@ public class Checker {
             return;
         }
         if (callee != null && callee.kind == AK.MemberAccess()) {
+            // 零参 SyncStructureAll(Async) 且接收者能当连接：改写为静态
+            // 直调 DbExtensions.<name>(db, new Meta[]{...})，实参补进 kids
+            // 后照常检查。扩展分发 + await 会踩泛型环境失真（体不执行、
+            // 结果槽 0，B-ID63 家族），与宿主 CALL 口的同名改写一致。
+            if (n.kids.Count == 0
+                    && (callee.sval == "SyncStructureAll" || callee.sval == "SyncStructureAllAsync")
+                    && callee.a != null) {
+                Node ot0 = InferType(callee.a);
+                if (ot0 != null && RecvIsConn(ot0)) {
+                    Node recvnode = callee.a;
+                    Node zid = new Node(AK.Ident());
+                    zid.sval = "DbExtensions";
+                    zid.line = callee.line; zid.col = callee.col;
+                    callee.a = zid;
+                    Node metas = SynthTableArray(n);
+                    n.Add(recvnode);
+                    n.Add(metas);
+                    CheckExpr(recvnode);
+                    CheckExpr(metas);
+                }
+            }
             CheckObj(callee.a);
             Node ot = InferType(callee.a);
             Node cls = ClassOf(ot);
