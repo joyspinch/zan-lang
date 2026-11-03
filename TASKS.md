@@ -6,13 +6,12 @@
 >
 > 平账纪律：闭账条目当批移出，已闭环内容移至 git 历史。领账按批次：批次 1 根修优先（闭一条解锁一片），批次 2 独立账可并行，批次 3 等前置闭了再领，批次 4 大工程须独占窗口；同批内按编号序。每条正文前的〔…〕是依赖标签：〔前置 X〕= X 不闭本条闭不了；〔软前置 X〕= 没 X 也能做但成本高；〔根修·解锁 Y〕= 本条闭了 Y 的前置随之解除；〔串行前置 X〕= 与 X 同改一个文件，等 X 落地再动。根修闭账时同批摘掉下游条目的〔前置〕标签并上调批次。领账前 `git status` + 文件 mtime 查在飞——并发会话不一定走调度器注册（2026-11-03 B-ID107 即靠 mtime 抓到撞车）。
 >
-> 最近平账 2026-11-03（彻底清理）：全账按「只记剩余欠账」压缩，验证流水归 git 历史；B-ID95/98/100/105 闭账移出（导出面 devirt 预修 33f21d49e 落地且场景暂不可达 / OOM 注入钩子+三钉 55367b004 落地 / 预扫缓存收益 ~12ms 低于噪声底不做 / json 消费方 dap_integration+lsp_integration_utf16 绿）；B-ID68/69/70 归并指针行移出（B-ID75 领域点名承接）。同日晚：B-ID113 闭账移出（stdout 二进制模式 25ca931ff，字节钉 stdio_binary_mode 7/7 绿）、B-ID108 闭账移出（JsonDoc 槽位三访问器 9a40bdf88，AppUpdate --emit-lib 77 文件绿 + Json 回归五钉绿）。早前同日：B-ID80 SipHash 落地闭账、B-ID66 闭账移出、B-ID104/105/106/110 各片落地（详 git 历史）。同日晚 ORM 族平账：orm/linq/diag_orm/dao 35 案实测 31 绿 4 红——B-ID59 余量收敛为两案（"orm 族 ~20 案红"过时移除）、case_orm_upsert（E3023 OnConflict 匿名对象）红面归 B-ID65、B-ID107 症状复核成立（arpg_save_repository `near "."` sqlite 语法错，基线同红）。同日按前置依赖把全账 33 条重排为四批次（根修 / 独立 / 有前置 / 大工程），每条加〔依赖标签〕，正文不动。
+> 最近平账 2026-11-03（彻底清理）：全账按「只记剩余欠账」压缩，验证流水归 git 历史；B-ID95/98/100/105 闭账移出（导出面 devirt 预修 33f21d49e 落地且场景暂不可达 / OOM 注入钩子+三钉 55367b004 落地 / 预扫缓存收益 ~12ms 低于噪声底不做 / json 消费方 dap_integration+lsp_integration_utf16 绿）；B-ID68/69/70 归并指针行移出（B-ID75 领域点名承接）。同日晚：B-ID113 闭账移出（stdout 二进制模式 25ca931ff，字节钉 stdio_binary_mode 7/7 绿）、B-ID108 闭账移出（JsonDoc 槽位三访问器 9a40bdf88，AppUpdate --emit-lib 77 文件绿 + Json 回归五钉绿）。早前同日：B-ID80 SipHash 落地闭账、B-ID66 闭账移出、B-ID104/105/106/110 各片落地（详 git 历史）。同日晚 ORM 族平账：orm/linq/diag_orm/dao 35 案实测 31 绿 4 红——B-ID59 余量收敛为两案（"orm 族 ~20 案红"过时移除）、case_orm_upsert（E3023 OnConflict 匿名对象）红面归 B-ID65、B-ID107 症状复核成立（arpg_save_repository `near "."` sqlite 语法错，基线同红）。同日按前置依赖把全账 33 条重排为四批次（根修 / 独立 / 有前置 / 大工程），每条加〔依赖标签〕，正文不动。同日 B-ID107 闭账移出（Name=短名/FullName/TableName 兜底短名 e75ce25e4，arpg_save_repository 转绿 + 反射三钉金标随契约翻转 + ORM 族 16 绿；selfhost ngen_reflect 镜像同步余项并入 B-ID109）、B-ID104 收窄（JRE 钉扎+哈希校验 bde79b74a 落地，余安装器移出）、B-ID93 定性改写（行号发射整体缺失，非 async 特缺）。
 
 ## 未完成（按平账顺序分批）
 
 ### 批次 0 · 在飞（持有会话未提交；其他会话勿碰同文件）
 
-- [ ] B-ID107 TypeInfo.Name 返回全限定名打穿 ORM 默认表名与 Json 类型判断契约对齐——selfhost 镜像同步余项：C11 侧已闭（Name=短名/FullName=-112 槽/TableName 兜底短名，去重键维持全名；conformance refl_name_fullname，case_arpg_save_repository 转绿，反射三钉金标随契约翻转更新，ORM 族 16 绿；git 历史）。余：src/selfhost/ngen_reflect.zan 镜像 name 槽仍存全名（TypeFullName），待 B-ID109 自举链闭环后同法同步并验证。
 
 ### 批次 1 · 根修项（闭它解锁下游，优先领）
 
@@ -47,7 +46,7 @@
 - [ ] B-ID72〔前置 B-ID75（先有 PAL 目录结构再迁入）〕宽字符与文本封送跨平台断裂（Wide.zan 强绑 kernel32）：`stdlib/System/Interop/Wide.zan` 无条件 `[DllImport("kernel32")]` 导入 Win32 API 且写死 2 字节 UTF-16 假定，在 Linux/macOS 上直接崩毁，且违背 POSIX 4 字节 wchar_t 规范。需抽象为支持 POSIX iconv / mbstowcs 与 Windows 多分发的跨平台文本封送器；双轨同步。
 - [ ] B-ID77〔软前置 B-ID102；B-ID112 同族随行〕静态空安全（Null-Safety）契约与可空引用类型体系：当前引用类型全部默认为裸指针，全仓依赖运行期判空与空指针异常崩溃。需在类型检查器引入现代空安全语义（如 `string?` 可空与 `string` 非空分离），在编译期截胡潜在空引用；双轨保持一致。
 - [ ] B-ID79〔前置 B-ID64〕结构化并发父子生命周期联动：余：父子任务树联动贯穿 async 调用链——父协程超时或异常退出时子协程取消信号传播与任务树监控（CancellationToken 全家令牌基础设施已落，git 历史）；双轨同步。
-- [ ] B-ID109〔部分前置 B-ID83/B-ID92/B-ID63-selfhost 半（gen1≠gen2 差分含镜像缺口）；gen2≠gen3 不动点另需二分〕selfhost_fixed_point / selfhost_diff 闭环红：gen1 编译通过，但 gen2==gen3 不动点不成立且 gen2/gen3 与 gen1 产物 diff 失败（ctest，预存失败，最早引入点未定位，需向前二分）。修法方向：scripts/bootstrap.sh 复现，diff g2.ll/g3.ll 首个分叉定位（自举 irgen/ngen 与宿主 stdlib 子集语义差）。
+- [ ] B-ID109〔部分前置 B-ID83/B-ID92/B-ID63-selfhost 半（gen1≠gen2 差分含镜像缺口）；gen2≠gen3 不动点另需二分〕selfhost_fixed_point / selfhost_diff 闭环红：gen1 编译通过，但 gen2==gen3 不动点不成立且 gen2/gen3 与 gen1 产物 diff 失败（ctest，预存失败，最早引入点未定位，需向前二分）。修法方向：scripts/bootstrap.sh 复现，diff g2.ll/g3.ll 首个分叉定位（自举 irgen/ngen 与宿主 stdlib 子集语义差）；闭环时同批同步 ngen_reflect.zan 镜像 name 槽为短名 + FullName 槽（B-ID107 C11 侧已闭，自举链红无法单独验证镜像改动）。
 - [ ] B-ID112〔前置 B-ID77 的生命周期/流分析基建 · 登记不修〕string.AsView 悬垂视图——语言级生命周期分析缺口（登记不修）：`StringExtensions.AsView(this string)` 返回非 owning 的视图结构，表达式临时 string 上取视图在语句末被 ARC 释放后即悬垂，后续读取越界/脏数据（探针实证 2026-11-03；同族面 StringBuilder/ByteBuffer.AsView）。根修在编译器生命周期分析（视图与源对象生存期绑定、视图逃逸禁释放），库级不可修；短期约束：文档明示 AsView 结果不得脱离源对象生存期使用。
 
 ### 批次 4 · 大工程 / 独占窗口（无其他 irgen/runtime 改动在飞时领）
