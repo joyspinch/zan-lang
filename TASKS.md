@@ -23,6 +23,8 @@
 ### 批次 2 · 独立账（无前置，任一会话可领，按编号序）
 
 - [ ] B-ID132〔登记不修〕gen1 三段及以上字符串链拉平路径（StrConcatN）布尔串接输出 `True` 与 C11 `true` 不一致：双探针实证 2026-11-03（`"u=" + (u == null) + " v=" + (v == null)` gen1 出 `True`，C11 出 `true`；两段式 pairwise 串接双编译器一致出小写）。根修在 irgen_expr.zan 拉平路径的布尔字面渲染对齐 C11 小写口径；补一条三段布尔链 diff 案随修入册。
+- [ ] B-ID134 AES-CBC 硬件加速解密填充失败返回码混淆（-1 与硬件缺失混用致异常回退慢速软解）与非恒常时间填充校验侧信道：`src/runtime/rt_hw_accel.c` 中 `zan_aes_cbc_decrypt_ni` 与 `zan_aes_cbc_decrypt_arm` 在 PKCS#7 校验失败时返回 `-1`，与"机器不支持硬件 AES"混淆；导致 `packages/Zan.Security/src/System/Security/Cryptography/Aes.zan` 收到 `-1` 误判为无硬件而回退至 10 倍耗时的纯 Zan T-Table，形成严重的 Padding Oracle 时序侧信道与无谓计算消耗；且硬件层填充校验循环直接按 `pad_val` 动态计次泄漏填充值。需修正为硬件填充失败返回独立错误码 `-2`，硬件层对齐恒常时间扫描，并在 `Aes.zan` 中拦截 `-2` 即刻熔断。
+- [ ] B-ID135 ZIP 解压引擎（Zip.Extract）单依本地文件头致流式归档（Data Descriptor / Bit 3）全部解压失败：`packages/Zan.IO/src/System/IO/Compression/Zip.zan` 的 `Extract` 仅从本地文件头（local header）读取 `compressedSize` 与 `uncompressedSize`；而遵循 PKWARE APPNOTE §4.3.9 规范的归档（Java/Android APK/Python zipfile/流式压缩）在通用位标志 bit 3 置位时本地头大小字段恒为 0，真实尺寸记录于中央目录。导致 `Zip.Extract` 遇到流式包时直接分配 0 字节缓冲区并返回 null 损坏。需在本地头字段为 0 时回退使用 `ZipEntry`（中央目录解析结果）中权威的 `compressedSize`、`uncompressedSize` 与 `crc32`。
 
 ### 批次 3 · 有前置（前置闭了再领）
 
