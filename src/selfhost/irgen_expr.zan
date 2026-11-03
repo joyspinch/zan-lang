@@ -4023,6 +4023,15 @@ partial class Irgen {
         Label(lskip);
     }
 
+    // 把 i8/i32/i64 的字符值规整到 i32（镜像 C11 char 静态类的截断/扩展口径）。
+    string CharToI32(ExprVal v) {
+        string vt = MapType(v.ty);
+        if (vt == "i32") { return v.op; }
+        string r = NT();
+        L("  " + r + " = " + (vt == "i64" ? "trunc" : "sext") + " " + vt + " " + v.op + " to i32");
+        return r;
+    }
+
     // The null-string guard in front of every parse (the C host's
     // emit_parse_str_guard, irgen_call.c): strtoll/strtod on null is UB,
     // so the null is reported once and replaced with the empty string.
@@ -6588,6 +6597,49 @@ partial class Irgen {
             Node en = EnumDeclOf(prn);
             if (en != null && callee.sval == "TryParse" && e.kids.Count == 2) {
                 return EmitEnumTryParse(e, en);
+            }
+            // char 的静态类（镜像 C11 irgen_call_builtins.c A525）：谓词走
+            // <ctype.h>（ASCII 口径）；ToUpper/ToLower 在 C11 走烙表
+            // @__zan_case_map，自宿主无烙表通道，重写到 stdlib
+            // UnicodeCase.CaseToUpper/CaseToLower（charcase_table.h 同源
+            // 数据，语义一致）。stdlib 未随载（程序没 pull System.Text）
+            // 时退 libc 口径——ASCII 域两口径相同，仅非 ASCII 有偏差。
+            // 注意：重写路径必须先换节点再 GenExpr，参数只求值一次。
+            bool charRecv = prn == "char" || prn == "Char";
+            if (charRecv && e.kids.Count == 1) {
+                string cm = callee.sval;
+                if (cm == "ToUpper" || cm == "ToLower") {
+                    bool cup = cm == "ToUpper";
+                    if (binder.FindType("UnicodeCase") != null) {
+                        Node fa = new Node(AK.IntLit());
+                        fa.ival = cup ? 1 : 0;
+                        e.kids[0] = fa;
+                        callee.a.sval = "UnicodeCase";
+                        callee.sval = cup ? "CaseToUpper" : "CaseToLower";
+                        return GenExpr(e);
+                    }
+                    ExprVal ca = GenExpr(e.kids[0]);
+                    string cp32 = CharToI32(ca);
+                    string lf = cup ? "toupper" : "tolower";
+                    if (!ExternSeen(lf)) { externDecls.Add(lf); H("declare i32 @" + lf + "(i32)"); }
+                    string mr = NT();
+                    L("  " + mr + " = call i32 @" + lf + "(i32 " + cp32 + ")");
+                    return new ExprVal(mr, MkType("int"));
+                }
+                if (cm == "IsDigit" || cm == "IsLetter" || cm == "IsLetterOrDigit"
+                        || cm == "IsUpper" || cm == "IsLower" || cm == "IsWhiteSpace") {
+                    ExprVal ca = GenExpr(e.kids[0]);
+                    string cp32 = CharToI32(ca);
+                    string lf = cm == "IsDigit" ? "isdigit" : cm == "IsLetter" ? "isalpha"
+                        : cm == "IsLetterOrDigit" ? "isalnum" : cm == "IsUpper" ? "isupper"
+                        : cm == "IsLower" ? "islower" : "isspace";
+                    if (!ExternSeen(lf)) { externDecls.Add(lf); H("declare i32 @" + lf + "(i32)"); }
+                    string pr = NT();
+                    L("  " + pr + " = call i32 @" + lf + "(i32 " + cp32 + ")");
+                    string nz = NT();
+                    L("  " + nz + " = icmp ne i32 " + pr + ", 0");
+                    return new ExprVal(nz, MkType("bool"));
+                }
             }
             if ((intRecv || dblRecv) && callee.sval == "Parse" && e.kids.Count == 1) {
                 ExprVal a = GenExpr(e.kids[0]);
