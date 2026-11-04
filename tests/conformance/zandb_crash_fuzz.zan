@@ -1,0 +1,306 @@
+using System;
+using System.IO;
+using System.Diagnostics;
+using System.Collections.Generic;
+using System.Data.ZanDb;
+using System.Json;
+using System.Threading;
+
+// ZanDB kill -9 式脏崩溃随机化 fuzz（B-ID147 进程外 harness）：
+// 对齐 SQLite crash-test 方法论，模拟真实进程级崩溃：
+//   1. WAL 写帧中段崩溃（torn frame 尾部截断修复与原子回滚）；
+//   2. 固化段写完但清单未发布崩溃（孤儿段跳过与旧清单+完整 WAL 恢复重放）；
+//   3. 双槽清单写一半崩溃（slot 0 vs slot 1 备槽冗余回退与代数选择）；
+//   4. 段归并写完但清单未切换崩溃（旧段权威与索引一致性保证）；
+//   5. 真实异步进程级 kill -9 强杀（持续高频事务写/固化/归并下的无损恢复与零毒化）；
+//   6. ZanDatabase 集合全文/向量检索索引检查点脏崩溃恢复。
+// 运行确定性，与 zandb_crash_fuzz.out 比对。
+class ZanDbCrashFuzzTest {
+    static int checks = 0;
+
+    #if WINDOWS
+    [DllImport("kernel32", EntryPoint = "ExitProcess")]
+    static extern void ExitHard(int code);
+    #else
+    [DllImport("crt", EntryPoint = "_exit")]
+    static extern void ExitHard(int code);
+    #endif
+
+    static void Ok(bool cond, string what) {
+        checks = checks + 1;
+        if (cond) {
+            Console.WriteLine("ok " + Convert.ToString(checks) + " - " + what);
+        } else {
+            Console.WriteLine("FAIL " + Convert.ToString(checks) + " - " + what);
+        }
+    }
+
+    static void Clean(string basePath) {
+        ZanStore.CleanTargetFiles(basePath, 50);
+    }
+
+    static JsonValue NoteDoc(string text) {
+        JsonValue doc = JsonValue.NewObject();
+        doc.Put("body", JsonValue.NewStr(text));
+        return doc;
+    }
+
+    static JsonValue VecDoc(float[] v) {
+        JsonValue doc = JsonValue.NewObject();
+        JsonValue arr = JsonValue.NewArray();
+        for (int i = 0; i < v.Length; i = i + 1) {
+            arr.Append(JsonValue.NewDouble((double)v[i]));
+        }
+        doc.Put("v", arr);
+        return doc;
+    }
+
+    // ===== 子进程工作者模式 =====
+    static void RunWorker(string scenario, string dbPath) {
+        if (scenario == "wal_torn") {
+            ZanStore db = ZanStore.Open(dbPath, ZanStore.DUR_SYNC);
+            for (int i = 1; i <= 5; i = i + 1) {
+                db.Put("k" + Convert.ToString(i), "v" + Convert.ToString(i));
+                db.Commit();
+            }
+            db.Begin();
+            db.Put("k6", "val6_torn_data_that_must_be_rolled_back_on_crash");
+            ZanStore.CrashHook = delegate(string phase) {
+                if (phase == "wal_before_commit") {
+                    ExitHard(99);
+                }
+            };
+            db.Commit();
+            ExitHard(1);
+        } else if (scenario == "flush_orphan_seg") {
+            ZanStore db = ZanStore.Open(dbPath, ZanStore.DUR_SYNC);
+            for (int i = 1; i <= 30; i = i + 1) {
+                db.Put("fk" + Convert.ToString(i), "fv" + Convert.ToString(i));
+                db.Commit();
+            }
+            ZanStore.CrashHook = delegate(string phase) {
+                if (phase == "flush_mid_seg") {
+                    ExitHard(99);
+                }
+            };
+            db.FlushToSegment();
+            ExitHard(1);
+        } else if (scenario == "manifest_mid_slot") {
+            ZanStore db = ZanStore.Open(dbPath, ZanStore.DUR_SYNC);
+            for (int i = 1; i <= 20; i = i + 1) {
+                db.Put("mk" + Convert.ToString(i), "mv" + Convert.ToString(i));
+                db.Commit();
+            }
+            db.FlushToSegment();
+            for (int i = 21; i <= 40; i = i + 1) {
+                db.Put("mk" + Convert.ToString(i), "mv" + Convert.ToString(i));
+                db.Commit();
+            }
+            ZanStore.CrashHook = delegate(string phase) {
+                if (phase == "manifest_mid_slot") {
+                    ExitHard(99);
+                }
+            };
+            db.FlushToSegment();
+            ExitHard(1);
+        } else if (scenario == "merge_orphan_seg") {
+            ZanStore db = ZanStore.Open(dbPath, ZanStore.DUR_SYNC);
+            for (int b = 0; b < 3; b = b + 1) {
+                for (int i = 1; i <= 10; i = i + 1) {
+                    db.Put("mg_" + Convert.ToString(b) + "_" + Convert.ToString(i), "v" + Convert.ToString(i));
+                    db.Commit();
+                }
+                db.FlushToSegment();
+            }
+            ZanStore.CrashHook = delegate(string phase) {
+                if (phase == "merge_mid_seg") {
+                    ExitHard(99);
+                }
+            };
+            db.MergeSegments();
+            ExitHard(1);
+        } else if (scenario == "random_hammer") {
+            ZanStore db = ZanStore.Open(dbPath, ZanStore.DUR_SYNC);
+            int op = 0;
+            while (true) {
+                op = op + 1;
+                db.Put("rk" + Convert.ToString(op % 50), "rv" + Convert.ToString(op));
+                if (op % 5 == 0) { db.Commit(); }
+                if (op % 25 == 0) { db.FlushToSegment(); }
+                if (op % 75 == 0) { db.MergeSegments(); }
+            }
+        } else if (scenario == "zandatabase_crash") {
+            ZanDatabase db = ZanDatabase.Open(dbPath, ZanStore.DUR_SYNC);
+            Collection notes = db.GetCollection("notes");
+            TextTokenizer tok = new TextTokenizer();
+            notes.EnsureFullTextIndex("body", tok);
+            notes.Insert(NoteDoc("ZanDB 数据库脏崩溃恢复"));
+            notes.Insert(NoteDoc("高质量向量检索与倒排图索引"));
+            notes.CheckpointSearchIndexes();
+
+            Collection vecs = db.GetCollection("vecs");
+            VectorIndexOptions vopt = new VectorIndexOptions(4);
+            vecs.EnsureVectorIndex("v", vopt);
+            float[] v1 = new float[] { 1.0f, 0.0f, 0.0f, 0.0f };
+            float[] v2 = new float[] { 0.0f, 1.0f, 0.0f, 0.0f };
+            vecs.Insert(VecDoc(v1));
+            vecs.Insert(VecDoc(v2));
+            vecs.CheckpointSearchIndexes();
+
+            for (int i = 1; i <= 10; i = i + 1) {
+                notes.Insert(NoteDoc("增量文档" + Convert.ToString(i)));
+            }
+            ZanStore.CrashHook = delegate(string phase) {
+                if (phase == "flush_mid_seg") {
+                    ExitHard(99);
+                }
+            };
+            db.Flush();
+            ExitHard(1);
+        }
+    }
+
+    // ===== 父进程监督者 Harness =====
+    static void Main() {
+        if (Environment.ArgCount() >= 3 && Environment.ArgAt(0) == "--worker") {
+            string scenario = Environment.ArgAt(1);
+            string dbPath = Environment.ArgAt(2);
+            RunWorker(scenario, dbPath);
+            return;
+        }
+
+        string self = Environment.ProcessPath;
+        Directory.CreateDirectory("_scratch");
+
+        // ==== 场景 1：WAL 写帧中段崩溃（torn frame 尾部恢复）====
+        string p1 = "_scratch/zdb_crash_wal.zdb";
+        Clean(p1);
+        List<string> a1 = new List<string>();
+        a1.Add("--worker");
+        a1.Add("wal_torn");
+        a1.Add(p1);
+        Process.RunSafe(self, a1);
+
+        ZanStore db1 = ZanStore.Open(p1, ZanStore.DUR_SYNC);
+        Ok(db1.IsOpen(), "wal_torn: reopen db succeeds");
+        List<string> probs1 = db1.IntegrityCheck();
+        Ok(probs1.Count == 0, "wal_torn: integrity check clean");
+        bool k1k5Ok = db1.Get("k1") == "v1" && db1.Get("k5") == "v5";
+        Ok(k1k5Ok, "wal_torn: committed transactions 1..5 intact");
+        Ok(db1.Get("k6") == "", "wal_torn: uncommitted transaction 6 dropped");
+        db1.Put("k7", "v7");
+        db1.Commit();
+        db1.FlushToSegment();
+        Ok(db1.Get("k7") == "v7", "wal_torn: store continues to function after recovery");
+        db1.Close();
+        Clean(p1);
+
+        // ==== 场景 2：固化写完但清单未发布（孤儿段处理）====
+        string p2 = "_scratch/zdb_crash_flush.zdb";
+        Clean(p2);
+        List<string> a2 = new List<string>();
+        a2.Add("--worker");
+        a2.Add("flush_orphan_seg");
+        a2.Add(p2);
+        Process.RunSafe(self, a2);
+
+        string orphanSeg = ZanStore.SegPath(p2, 0);
+        Ok(File.Exists(orphanSeg), "flush_orphan_seg: orphan segment file exists on disk");
+        ZanStore db2 = ZanStore.Open(p2, ZanStore.DUR_SYNC);
+        Ok(db2.IsOpen(), "flush_orphan_seg: reopen db succeeds");
+        Ok(db2.IntegrityCheck().Count == 0, "flush_orphan_seg: integrity clean");
+        Ok(db2.Count() == 30, "flush_orphan_seg: WAL replayed all 30 memtable records");
+        db2.FlushToSegment();
+        Ok(db2.IntegrityCheck().Count == 0, "flush_orphan_seg: flush successfully overwrote and adopted segment");
+        Ok(db2.Count() == 30, "flush_orphan_seg: 30 records verified after flush");
+        db2.Close();
+        Clean(p2);
+
+        // ==== 场景 3：双槽清单写一半崩溃（槽位代数与冗余选择）====
+        string p3 = "_scratch/zdb_crash_man.zdb";
+        Clean(p3);
+        List<string> a3 = new List<string>();
+        a3.Add("--worker");
+        a3.Add("manifest_mid_slot");
+        a3.Add(p3);
+        Process.RunSafe(self, a3);
+
+        ZanStore db3 = ZanStore.Open(p3, ZanStore.DUR_SYNC);
+        Ok(db3.IsOpen(), "manifest_mid_slot: reopen db succeeds via dual-slot fallback");
+        Ok(db3.IntegrityCheck().Count == 0, "manifest_mid_slot: integrity clean");
+        Ok(db3.Count() == 40, "manifest_mid_slot: all 40 records intact");
+        db3.Put("k_after", "v_after");
+        db3.Commit();
+        Ok(db3.Get("k_after") == "v_after", "manifest_mid_slot: store writable after recovery");
+        db3.Close();
+        Clean(p3);
+
+        // ==== 场景 4：段归并中途崩溃（旧段有效与新段重建）====
+        string p4 = "_scratch/zdb_crash_merge.zdb";
+        Clean(p4);
+        List<string> a4 = new List<string>();
+        a4.Add("--worker");
+        a4.Add("merge_orphan_seg");
+        a4.Add(p4);
+        Process.RunSafe(self, a4);
+
+        ZanStore db4 = ZanStore.Open(p4, ZanStore.DUR_SYNC);
+        Ok(db4.IsOpen(), "merge_orphan_seg: reopen db succeeds");
+        Ok(db4.IntegrityCheck().Count == 0, "merge_orphan_seg: integrity clean");
+        Ok(db4.SegCount() == 3, "merge_orphan_seg: manifest still points to original 3 segments");
+        db4.MergeSegments();
+        Ok(db4.SegCount() == 1, "merge_orphan_seg: compaction completed cleanly on next run");
+        Ok(db4.IntegrityCheck().Count == 0, "merge_orphan_seg: integrity clean after merge");
+        db4.Close();
+        Clean(p4);
+
+        // ==== 场景 5：真实异步 kill -9 强杀 fuzz ====
+        string p5 = "_scratch/zdb_crash_hammer.zdb";
+        Clean(p5);
+        List<string> a5 = new List<string>();
+        a5.Add("--worker");
+        a5.Add("random_hammer");
+        a5.Add(p5);
+        // 子进程高频读写事务/固化/归并，35ms 后超时被强行 TerminateProcess/kill
+        Process.RunSafe(self, a5, 35);
+
+        ZanStore db5 = ZanStore.Open(p5, ZanStore.DUR_SYNC);
+        Ok(db5.IsOpen(), "random_hammer_kill: reopen after kill -9 succeeds");
+        List<string> probs5 = db5.IntegrityCheck();
+        Ok(probs5.Count == 0, "random_hammer_kill: integrity check clean after hard kill");
+        db5.Put("k_post_kill", "v_post_kill");
+        db5.Commit();
+        Ok(db5.Get("k_post_kill") == "v_post_kill", "random_hammer_kill: store functional and unpoisoned");
+        db5.Close();
+        Clean(p5);
+
+        // ==== 场景 6：ZanDatabase 集合检索索引脏崩溃恢复 ====
+        string p6 = "_scratch/zdb_crash_coll.zdb";
+        Clean(p6);
+        List<string> a6 = new List<string>();
+        a6.Add("--worker");
+        a6.Add("zandatabase_crash");
+        a6.Add(p6);
+        Process.RunSafe(self, a6);
+
+        ZanDatabase db6 = ZanDatabase.Open(p6, ZanStore.DUR_SYNC);
+        Ok(db6.IsOpen(), "zandatabase_crash: database opens cleanly");
+        Collection cNotes = db6.GetCollection("notes");
+        Collection cVecs = db6.GetCollection("vecs");
+        Ok(db6.IntegrityCheck().Count == 0, "zandatabase_crash: database and search index audit clean");
+        List<Bm25Hit> hits = cNotes.SearchText("body", "脏崩溃", 5);
+        Ok(hits.Count == 1, "zandatabase_crash: fulltext search intact after crash recovery");
+        float[] qv = new float[] { 0.9f, 0.1f, 0.0f, 0.0f };
+        List<VectorHit> vhits = cVecs.SearchVector("v", qv, 2, 32);
+        Ok(vhits.Count == 2, "zandatabase_crash: vector search intact after crash recovery");
+        int docId = cNotes.Insert(NoteDoc("崩溃恢复后新增文档"));
+        JsonValue foundDoc = cNotes.FindById(docId);
+        cNotes.CheckpointSearchIndexes();
+        List<Bm25Hit> hits2 = cNotes.SearchText("body", "恢复后", 5);
+        Ok(foundDoc != null && hits2.Count >= 1 && hits2[0].id == docId, "zandatabase_crash: database writable and search functional");
+        db6.Close();
+        Clean(p6);
+
+        Console.WriteLine("done crash fuzz tests: " + Convert.ToString(checks));
+    }
+}
