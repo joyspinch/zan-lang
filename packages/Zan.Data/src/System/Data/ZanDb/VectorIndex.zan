@@ -1,11 +1,16 @@
 using System;
 using System.Collections.Generic;
 using System.Interop;
+using System.IO;
 using System.Json;
 using System.Threading;
 namespace System.Data.ZanDb;
 
 public delegate bool VectorFilter(int id);
+
+// 二进制快照批次交付回调：payload 是一批槽位记录的编码字节串
+// （可含 NUL，经存储层透明转义），按序交付拼接即完整快照。
+public delegate void VectorBatchSink(string payload);
 
 public class VectorIndex {
     public VectorIndexOptions options;
@@ -17,6 +22,12 @@ public class VectorIndex {
     public int maxLevel;
     public long randomState;
     public AtomicInt lastDistanceCount;
+    // 二进制快照导入期间的待挂边暂存：pendingEdges 按
+    // 「数量, 槽位…」逐层打包，pendingEdgeBase 记每个槽位的起始
+    // 下标。边可指向任意槽位（含后位），故全部记录就位后由
+    // ImportFinish 统一接线。
+    private List<int> pendingEdges;
+    private List<int> pendingEdgeBase;
 
     public VectorIndex(VectorIndexOptions options) {
         if (options == null) { throw new ArgumentException("Missing vector options"); }
@@ -161,7 +172,7 @@ public class VectorIndex {
                 int candidate = neighbors.slots[i];
                 double distance = this.DistanceTo(work, candidate);
                 if (VectorHeap.Before(distance, this.nodes[candidate].id, candidate,
-                        bestDistance, this.nodes[best].id, best)) {
+                bestDistance, this.nodes[best].id, best)) {
                     best = candidate;
                     bestDistance = distance;
                     changed = true;
@@ -172,7 +183,7 @@ public class VectorIndex {
     }
 
     public VectorHeap SearchLayer(VectorWorkspace work, int start, int layer, int ef,
-            bool activeOnly, VectorFilter filter) {
+    bool activeOnly, VectorFilter filter) {
         VectorHeap candidates = new VectorHeap(ef + 1, false);
         VectorHeap nearest = new VectorHeap(ef + 1, true);
         work.epoch = work.epoch + 1;
@@ -500,5 +511,183 @@ public class VectorIndex {
             result.idSlots.ContainsKey(result.nodes[result.entry].id);
         }
         return result;
+    }
+
+    // ===== 二进制快照（格式 v2）：流式导出/导入，全程不物化 JSON 树 =====
+    // 记录布局（依槽位序）：
+    //   U8 active          0/1
+    //   U8 level           0..32
+    //   VarInt id          文档 id（≥0）
+    //   dims×4 字节        float32 向量（原生小端，与存储层一致）
+    //   level+1 组边       VarInt 数量 + 数量×VarInt 槽位
+    // 批次是纯字节流的任意切段，按序拼接后必须落在记录边界上。
+    // 头部信息（options/entry/maxLevel/rng/槽数/批数）由快照头部
+    // JSON 携带，不在本编码内。
+
+    // 就位槽位向量存储：与 CopyIntoSlot 相同的块增长规则。
+    private void EnsureSlotStorage(int slot) {
+        int chunk = slot / this.chunkRows;
+        if (chunk == this.chunks.Count) {
+            this.chunks.Add(new VectorChunk(this.chunkRows * this.options.dimensions));
+        }
+    }
+
+    // 把全部槽位记录流式编码为若干批次载荷（每批约 batchBytes
+    // 字节），经 sink 交付。内存峰值 = 一个批次的编码缓冲；向量
+    // 直接从紧凑块存储上 memcpy，不逐维装箱。
+    public void ExportBatches(VectorBatchSink sink, int batchBytes) {
+        if (sink == null) { throw new ArgumentException("Missing vector batch sink"); }
+        if (batchBytes < 4096) { batchBytes = 4096; }
+        ByteBuffer b = ByteBuffer.Alloc(batchBytes + 4096);
+        for (int slot = 0; slot < this.nodes.Count; slot = slot + 1) {
+            VectorNode node = this.nodes[slot];
+            b.WriteU8(node.active);
+            b.WriteU8(node.level);
+            b.WriteVarInt(node.id);
+            VectorChunk owner = this.chunks[slot / this.chunkRows];
+            int offset = (slot % this.chunkRows) * this.options.dimensions;
+            b.WriteBytes((nint)owner.values + offset * 4, this.options.dimensions * 4);
+            for (int layer = 0; layer <= node.level; layer = layer + 1) {
+                VectorNeighbors neighbors = node.layers[layer];
+                b.WriteVarInt(neighbors.count);
+                for (int i = 0; i < neighbors.count; i = i + 1) {
+                    b.WriteVarInt(neighbors.slots[i]);
+                }
+            }
+            if (b.Length() >= batchBytes) {
+                sink(b.ToStr());
+                b.Clear();
+            }
+        }
+        if (b.Length() > 0) { sink(b.ToStr()); }
+        b.Free();
+    }
+
+    // 解码一个批次载荷，追加到待接线状态。可分任意多次调用，
+    // 但每次交付都必须落在记录边界上。
+    public void ImportBatch(string payload) {
+        if (payload == null || payload.Length == 0) { throw new ArgumentException("Empty vector checkpoint batch"); }
+        if (this.pendingEdges == null) {
+            this.pendingEdges = new List<int>();
+            this.pendingEdgeBase = new List<int>();
+        }
+        ByteBuffer b = ByteBuffer.FromStr(payload);
+        while (b.Remaining() > 0) {
+            int active = b.ReadU8();
+            int level = b.ReadU8();
+            if (active > 1 || level < 0 || level > 32) {
+                b.Free();
+                throw new ArgumentException("Invalid checkpoint record header");
+            }
+            long id = b.ReadVarInt();
+            if (id < 0 || id > 2147483646) {
+                b.Free();
+                throw new ArgumentException("Invalid checkpoint record id");
+            }
+            int bytes = this.options.dimensions * 4;
+            if (!b.CanRead(bytes)) {
+                b.Free();
+                throw new ArgumentException("Truncated checkpoint vector");
+            }
+            int slot = this.nodes.Count;
+            if (slot >= 2147483646) {
+                b.Free();
+                throw new InvalidOperationException("Vector slot capacity exhausted");
+            }
+            this.EnsureSlotStorage(slot);
+            VectorChunk owner = this.chunks[slot / this.chunkRows];
+            int offset = (slot % this.chunkRows) * this.options.dimensions;
+            NativeMemory.Copy((nint)owner.values + offset * 4, b.Raw() + b.ReadPos(), bytes);
+            b.SeekRead(b.ReadPos() + bytes);
+            double inverseNorm = this.ValidateCoordinates(owner.values, offset);
+            VectorNode node = new VectorNode((int)id, level, this.options.m, inverseNorm);
+            if (active == 0) { node.active = 0; }
+            this.nodes.Add(node);
+            if (active == 1) {
+                if (this.idSlots.ContainsKey(node.id)) {
+                    b.Free();
+                    throw new ArgumentException("Duplicate active checkpoint id");
+                }
+                this.idSlots.Add(node.id, slot);
+            }
+            this.pendingEdgeBase.Add(this.pendingEdges.Count);
+            for (int layer = 0; layer <= level; layer = layer + 1) {
+                long count = b.ReadVarInt();
+                // 层容量上界 = m×2 ≤ 256（options.Validate 保证），
+                // 越界即格式损坏，直接拒绝。
+                if (count < 0 || count > 256) {
+                    b.Free();
+                    throw new ArgumentException("Invalid checkpoint edge count");
+                }
+                this.pendingEdges.Add((int)count);
+                for (int i = 0; i < (int)count; i = i + 1) {
+                    this.pendingEdges.Add((int)b.ReadVarInt());
+                }
+            }
+        }
+        b.Free();
+    }
+
+    // 全部批次就位后接线并固化头部校验（与 v1 ImportState 同一口
+    // 径：槽数一致、边指向合法层位、入口层 = 最高层、RNG 在界）。
+    public void ImportFinish(int entry, int maxLevel, int rng, long expectedCount) {
+        if (this.pendingEdges == null) {
+            this.pendingEdges = new List<int>();
+            this.pendingEdgeBase = new List<int>();
+        }
+        if ((long)this.nodes.Count != expectedCount) {
+            throw new ArgumentException("Vector checkpoint slot count mismatch");
+        }
+        int highest = -1;
+        for (int slot = 0; slot < this.nodes.Count; slot = slot + 1) {
+            if (this.nodes[slot].level > highest) { highest = this.nodes[slot].level; }
+        }
+        for (int slot = 0; slot < this.nodes.Count; slot = slot + 1) {
+            VectorNode node = this.nodes[slot];
+            int cursor = this.pendingEdgeBase[slot];
+            for (int layer = 0; layer <= node.level; layer = layer + 1) {
+                int count = this.pendingEdges[cursor];
+                cursor = cursor + 1;
+                VectorNeighbors neighbors = node.layers[layer];
+                if (count > neighbors.slots.Length) {
+                    throw new ArgumentException("Checkpoint neighbor bound exceeded");
+                }
+                for (int i = 0; i < count; i = i + 1) {
+                    int target = this.pendingEdges[cursor];
+                    cursor = cursor + 1;
+                    if (target < 0 || target >= this.nodes.Count || target == slot) {
+                        throw new ArgumentException("Invalid checkpoint edge target");
+                    }
+                    if (this.nodes[target].level < layer || neighbors.Contains(target)) {
+                        throw new ArgumentException("Invalid checkpoint layer edge");
+                    }
+                    neighbors.slots[i] = target;
+                }
+                neighbors.count = count;
+            }
+        }
+        this.pendingEdges = null;
+        this.pendingEdgeBase = null;
+        if (rng < 1 || rng >= 2147483647) {
+            throw new ArgumentException("Invalid checkpoint RNG state");
+        }
+        this.randomState = rng;
+        if (this.nodes.Count == 0) {
+            if (entry != -1 || maxLevel != -1) {
+                throw new ArgumentException("Invalid empty checkpoint entry");
+            }
+            this.entry = -1;
+            this.maxLevel = -1;
+            return;
+        }
+        if (entry < 0 || entry >= this.nodes.Count || maxLevel != highest) {
+            throw new ArgumentException("Invalid checkpoint entry or maximum level");
+        }
+        if (this.nodes[entry].level != maxLevel) {
+            throw new ArgumentException("Checkpoint entry level mismatch");
+        }
+        this.entry = entry;
+        this.maxLevel = maxLevel;
+        this.idSlots.ContainsKey(this.nodes[entry].id);
     }
 }

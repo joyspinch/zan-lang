@@ -1,0 +1,150 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Json;
+using System.Data.ZanDb;
+
+// 向量二进制检查点（代 v2）：
+//   * 快照头部 format=2、批次行数与 snap 行数一致、多批次切分；
+//   * 向量不再落 data 输入行（历史只写不读）；
+//   * 重开流式导入后精确/近邻检索与关库前一致；
+//   * 检查点后增删走 journal 重放，再检查点携带墓碑与新槽位；
+//   * 损坏批次行明确报错，不返回部分结果；
+//   * 空集合检查点/重开路径（0 批次）不炸。
+class ZanDbVecbinTest {
+    static int checks;
+    static void Ok(bool value, string message) {
+        checks = checks + 1;
+        Console.WriteLine((value ? "ok " : "FAIL ") + Convert.ToString(checks) + " - " + message);
+    }
+    static long lcg = 777501;
+    static double NextUnit() {
+        lcg = lcg * 6364136223846793005L + 1442695040888963407L;
+        long v = (lcg >> 33) & 0x7FFFFFFFFFFFFFFFL;
+        return (double)(v % 2000001) / 1000000.0 - 1.0;
+    }
+    static float[] MakeVector(int dimensions, long seed) {
+        long keep = lcg;
+        lcg = seed;
+        float[] vector = new float[dimensions];
+        for (int i = 0; i < dimensions; i = i + 1) { vector[i] = (float)NextUnit(); }
+        lcg = keep;
+        return vector;
+    }
+    static JsonValue Doc(int ordinal, int dimensions, long seed) {
+        JsonValue doc = JsonValue.NewObject();
+        doc.PutStr("title", "条目 " + Convert.ToString(ordinal));
+        float[] vector = MakeVector(dimensions, seed);
+        JsonValue arr = JsonValue.NewArray();
+        for (int i = 0; i < dimensions; i = i + 1) { arr.Append(JsonValue.NewDouble((double)vector[i])); }
+        doc.Put("embedding", arr);
+        return doc;
+    }
+    static void Clean(string path) {
+        File.Delete(path); File.Delete(path + ".lock");
+        File.Delete(path + ".m0"); File.Delete(path + ".m1");
+        for (int i = 0; i < 300; i = i + 1) { File.Delete(path + ".s" + Convert.ToString(i)); }
+    }
+    static int SnapRows(ZanDatabase db, string prefix) {
+        List<KvEntry> rows = new List<KvEntry>();
+        db.Kv().ScanPrefix(prefix, 0, rows);
+        return rows.Count;
+    }
+    static void Main() {
+        Directory.CreateDirectory("_scratch");
+        string path = "_scratch/zandb_vecbin_tmp.zdb";
+        int dimensions = 512;
+        int n = 1500;
+        Clean(path);
+        ZanDatabase db = ZanDatabase.Open(path, ZanStore.DUR_SYNC);
+        Collection docs = db.GetCollection("vec");
+        for (int from = 0; from < n; from = from + 250) {
+            List<JsonValue> batch = new List<JsonValue>();
+            for (int i = 0; i < 250 && from + i < n; i = i + 1) {
+                batch.Add(Doc(from + i, dimensions, 1000003L * (from + i + 1)));
+            }
+            docs.InsertBulk(batch);
+        }
+        docs.EnsureVectorIndex("embedding", new VectorIndexOptions(dimensions));
+        float[] query = MakeVector(dimensions, 424242L);
+        List<VectorHit> before = docs.SearchVectorExact("embedding", query, 5);
+        List<VectorHit> preApprox = docs.SearchVector("embedding", query, 5, 48);
+        docs.CheckpointSearchIndexes();
+        JsonValue header = JsonValue.Parse(db.Kv().Get("q:vec:vector:embedding:snapshot"));
+        Ok(header.Int("format", 0) == 2, "vector checkpoint publishes format 2");
+        int batches = header.Int("batches", 0);
+        Ok(batches >= 2, "payload crosses multiple binary batches (" + Convert.ToString(batches) + ")");
+        Ok(SnapRows(db, "q:vec:vector:embedding:snap:") == (int)batches, "snap row count equals batch count");
+        Ok(SnapRows(db, "q:vec:vector:embedding:data:") == 0, "vector inputs stop writing data rows");
+        db.Close();
+        db = ZanDatabase.Open(path, ZanStore.DUR_SYNC);
+        docs = db.GetCollection("vec");
+        List<VectorHit> after = docs.SearchVectorExact("embedding", query, 5);
+        bool same = after.Count == before.Count;
+        for (int i = 0; i < before.Count; i = i + 1) {
+            if (after.Count <= i || after[i].id != before[i].id) { same = false; }
+        }
+        Ok(same, "binary checkpoint reload keeps exact ranking");
+        List<VectorHit> approx = docs.SearchVector("embedding", query, 5, 48);
+        bool graphSame = approx.Count == preApprox.Count;
+        for (int i = 0; i < preApprox.Count; i = i + 1) {
+            if (approx.Count <= i || approx[i].id != preApprox[i].id) { graphSame = false; }
+        }
+        Ok(graphSame, "reloaded graph matches pre-close nearest neighbors");
+        bool removed = docs.DeleteById(before[0].id);
+        JsonValue moved = docs.FindById(before[4].id);
+        float[] replacement = MakeVector(dimensions, 999983L);
+        JsonValue arr = JsonValue.NewArray();
+        for (int i = 0; i < dimensions; i = i + 1) { arr.Append(JsonValue.NewDouble((double)replacement[i])); }
+        moved.Set("embedding", arr);
+        docs.Update(before[4].id, moved);
+        docs.CheckpointSearchIndexes();
+        db.Close();
+        db = ZanDatabase.Open(path, ZanStore.DUR_SYNC);
+        docs = db.GetCollection("vec");
+        List<VectorHit> pruned = docs.SearchVectorExact("embedding", query, 10);
+        bool absent = true;
+        for (int i = 0; i < pruned.Count; i = i + 1) {
+            if (pruned[i].id == before[0].id) { absent = false; }
+        }
+        Ok(absent, "second checkpoint carries tombstone across reload");
+        float[] movedQuery = replacement;
+        List<VectorHit> ranked = docs.SearchVectorExact("embedding", movedQuery, 1);
+        Ok(ranked.Count == 1 && ranked[0].id == before[4].id, "updated vector ranks itself first after reload");
+        JsonValue corruptHeader = JsonValue.Parse(db.Kv().Get("q:vec:vector:embedding:snapshot"));
+        string genKey = ":snap:" + corruptHeader.Str("generation", "") + ":";
+        List<KvEntry> snapList = new List<KvEntry>();
+        db.Kv().ScanPrefix("q:vec:vector:embedding:snap:", 0, snapList);
+        bool foundLive = false;
+        for (int i = 0; i < snapList.Count; i = i + 1) {
+            if (snapList[i].key.Contains(genKey)) { db.Kv().Put(snapList[i].key, "broken-bytes"); foundLive = true; }
+        }
+        Ok(foundLive, "located current-generation batch row to corrupt");
+        db.Close();
+        db = ZanDatabase.Open(path, ZanStore.DUR_SYNC);
+        docs = db.GetCollection("vec");
+        bool rejected = false;
+        try { docs.SearchVectorExact("embedding", query, 5); } catch { rejected = true; }
+        Ok(rejected, "corrupt binary batch rejects with explicit error");
+        docs.RebuildSearchIndexes();
+        List<VectorHit> repaired = docs.SearchVectorExact("embedding", query, 3);
+        Ok(repaired.Count == 3, "rebuild restores searchable index from documents");
+        db.Close();
+        Clean(path);
+        // 空集合：0 批次检查点/重开路径。
+        db = ZanDatabase.Open(path, ZanStore.DUR_SYNC);
+        docs = db.GetCollection("empty");
+        docs.EnsureVectorIndex("embedding", new VectorIndexOptions(4));
+        docs.CheckpointSearchIndexes();
+        JsonValue emptyHeader = JsonValue.Parse(db.Kv().Get("q:empty:vector:embedding:snapshot"));
+        db.Close();
+        db = ZanDatabase.Open(path, ZanStore.DUR_SYNC);
+        docs = db.GetCollection("empty");
+        float[] tiny = new float[4];
+        tiny[0] = 1;
+        Ok(docs.SearchVectorExact("embedding", tiny, 5).Count == 0, "empty index survives empty checkpoint");
+        db.Close();
+        Clean(path);
+        Console.WriteLine("done " + Convert.ToString(checks) + " checks");
+    }
+}

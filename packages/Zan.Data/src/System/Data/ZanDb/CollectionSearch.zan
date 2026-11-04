@@ -30,18 +30,25 @@ public class CollectionSearch {
         if (value == null) { throw new IOException("invalid search metadata number: " + key); }
         JsonValue v = value.Get(key);
         if (v == null || !v.IsNumber()) { throw new IOException("invalid search metadata number: " + key); }
-        if (v.numIsInt && v.numI >= 0) { return v.numI; }
+        if (v.numIsInt) { return v.numI; }
         string s = v.AsString("");
-        if (s.Length == 0 || s.Length > 19) { throw new IOException("invalid search metadata integer"); }
+        if (s.Length == 0 || s.Length > 20) { throw new IOException("invalid search metadata integer"); }
+        int start = 0;
+        bool negative = false;
+        if (s[0] == 45) {
+            negative = true;
+            start = 1;
+            if (s.Length == 1) { throw new IOException("invalid search metadata integer"); }
+        }
         long n = 0;
-        for (int i = 0; i < s.Length; i = i + 1) {
+        for (int i = start; i < s.Length; i = i + 1) {
             int c = s[i] & 255;
             if (c < 48 || c > 57 || n > (9223372036854775807 - (c - 48)) / 10) {
                 throw new IOException("invalid search metadata integer");
             }
             n = n * 10 + c - 48;
         }
-        return n;
+        return negative ? -n : n;
     }
     public static string RevisionKey(long revision) {
         if (revision < 0) { throw new IOException("invalid search revision"); }
@@ -51,7 +58,7 @@ public class CollectionSearch {
     }
     public static void CheckField(string field) {
         if (field == null || field.Length == 0 || field.IndexOf(":") >= 0 || field.IndexOf("\t") >= 0
-                || field.IndexOf("\n") >= 0 || field.IndexOf("\r") >= 0) {
+        || field.IndexOf("\n") >= 0 || field.IndexOf("\r") >= 0) {
             throw new ArgumentException("invalid search index field");
         }
         for (int i = 0; i < field.Length; i = i + 1) {
@@ -66,7 +73,7 @@ public class CollectionSearch {
 
     public static void CheckDefinition(JsonValue def) {
         if (!def.IsObject() || CollectionSearch.Number(def, "format") != 1
-                || def.Str("status", "") != "ready") {
+        || def.Str("status", "") != "ready") {
             throw new IOException("unsupported or unfinished search index");
         }
         string kind = def.Str("type", "");
@@ -237,7 +244,7 @@ public class CollectionSearch {
             JsonValue catalog = JsonValue.NewArray();
             for (int i = 0; i < old.Count; i = i + 1) {
                 if (old[i].Str("field", "") == field
-                        && old[i].Str("type", "") == kind) { continue; }
+                && old[i].Str("type", "") == kind) { continue; }
                 catalog.Append(old[i].Clone());
             }
             catalog.Append(def.Clone());
@@ -277,7 +284,12 @@ public class CollectionSearch {
                         throw new ArgumentException("text index requires string values");
                     }
                     Apply(state, id, value);
-                    rows.Add(new KvEntry(data + Collection.PadId(id), value.ToJson()));
+                    // 向量输入不再落 data 输入行：重建就是重扫正文
+                    // （本方法即是），该行历史上只写不读，纯浪费一
+                    // 份 JSON 向量副本。
+                    if (state.kind != "vector") {
+                        rows.Add(new KvEntry(data + Collection.PadId(id), value.ToJson()));
+                    }
                 }
             }
             // 扫描回调期间不得提交：归并会替换正在遍历的段和索引。
@@ -336,9 +348,11 @@ public class CollectionSearch {
             change.PutInt("id", id);
             change.Put("value", value != null ? value.Clone() : JsonValue.NewNull());
             string ip = IndexPrefix(kind, field);
-            string dataKey = ip + "data:" + generation + ":" + Collection.PadId(id);
-            if (value == null || value.IsNull()) { this.kv.Delete(dataKey); }
-            else { this.kv.Put(dataKey, value.ToJson()); }
+            if (kind != "vector") {
+                string dataKey = ip + "data:" + generation + ":" + Collection.PadId(id);
+                if (value == null || value.IsNull()) { this.kv.Delete(dataKey); }
+                else { this.kv.Put(dataKey, value.ToJson()); }
+            }
             this.kv.Put(ip + "journal:" + CollectionSearch.RevisionKey(revision) + ":" + Collection.PadId(id), change.ToJson());
             this.kv.Put(ip + "last", Convert.ToString(revision));
         }
@@ -375,9 +389,13 @@ public class CollectionSearch {
             state = new CollectionSearchState(field, kind, defBody, generation);
             state.checkpoint = snapshotBody;
             JsonValue snapshot = JsonValue.Parse(snapshotBody);
-            if (CollectionSearch.Number(snapshot, "format") != 1
-                    || snapshot.Str("definition", "") != defBody) {
+            long format = CollectionSearch.Number(snapshot, "format");
+            if ((format != 1 && format != 2)
+            || snapshot.Str("definition", "") != defBody) {
                 throw new IOException("incompatible search checkpoint; rebuild required");
+            }
+            if (format == 2 && kind != "vector") {
+                throw new IOException("unsupported binary checkpoint; rebuild required");
             }
             state.applied = CollectionSearch.Number(snapshot, "revision");
             if (state.applied > revision) { throw new IOException("search checkpoint ahead of input"); }
@@ -386,26 +404,48 @@ public class CollectionSearch {
             if (rowCount > 2147483647) { throw new IOException("search checkpoint too large"); }
             JsonValue rootNode = snapshot.Get("root");
             JsonValue root = rootNode != null ? rootNode.Clone() : JsonValue.NewNull();
-            JsonValue rows = JsonValue.NewArray();
-            for (int i = 0; i < (int)rowCount; i = i + 1) {
-                string row = this.kv.Get(ip + "snap:" + snapshotGeneration + ":" + Collection.PadId(i));
-                if (row.Length == 0) { throw new IOException("incomplete search checkpoint"); }
-                rows.Append(JsonValue.Parse(row));
-            }
-            root.Set(kind == "text" ? "docs" : "nodes", rows);
-            if (kind == "text") {
-                if (TextTokenizer.ImportState(root.Get("tokenizer")).Fingerprint()
-                        != TextTokenizer.ImportState(config).Fingerprint()) {
-                    throw new IOException("checkpoint tokenizer differs from index definition");
-                }
-                state.text = Bm25Index.ImportState(root);
-            } else {
+            if (format == 2) {
+                // 向量代 v2：逐行流式二进制导入，全程只持一个批次
+                // 载荷与打包边暂存；头部 root 带图元，行序即槽位序。
+                long batchCount = CollectionSearch.Number(snapshot, "batches");
+                if (batchCount > 2147483647) { throw new IOException("search checkpoint too large"); }
                 state.options = VectorIndexOptions.FromJson(config);
                 VectorIndexOptions rootOpts = VectorIndexOptions.FromJson(root.Get("options"));
                 if (!rootOpts.Equals(state.options)) {
                     throw new IOException("checkpoint vector options differ from index definition");
                 }
-                state.vector = VectorIndex.ImportState(root);
+                state.vector = new VectorIndex(state.options);
+                for (int i = 0; i < (int)batchCount; i = i + 1) {
+                    string payload = this.kv.Get(ip + "snap:" + snapshotGeneration + ":" + Collection.PadId(i));
+                    if (payload.Length == 0) { throw new IOException("incomplete search checkpoint"); }
+                    state.vector.ImportBatch(payload);
+                }
+                state.vector.ImportFinish((int)CollectionSearch.Number(root, "entry"),
+                (int)CollectionSearch.Number(root, "maxLevel"),
+                (int)CollectionSearch.Number(root, "rng"), rowCount);
+            } else {
+                // v1：行内 JSON 状态，文本与向量共用（旧库兼容读）。
+                JsonValue rows = JsonValue.NewArray();
+                for (int i = 0; i < (int)rowCount; i = i + 1) {
+                    string row = this.kv.Get(ip + "snap:" + snapshotGeneration + ":" + Collection.PadId(i));
+                    if (row.Length == 0) { throw new IOException("incomplete search checkpoint"); }
+                    rows.Append(JsonValue.Parse(row));
+                }
+                root.Set(kind == "text" ? "docs" : "nodes", rows);
+                if (kind == "text") {
+                    if (TextTokenizer.ImportState(root.Get("tokenizer")).Fingerprint()
+                    != TextTokenizer.ImportState(config).Fingerprint()) {
+                        throw new IOException("checkpoint tokenizer differs from index definition");
+                    }
+                    state.text = Bm25Index.ImportState(root);
+                } else {
+                    state.options = VectorIndexOptions.FromJson(config);
+                    VectorIndexOptions rootOpts = VectorIndexOptions.FromJson(root.Get("options"));
+                    if (!rootOpts.Equals(state.options)) {
+                        throw new IOException("checkpoint vector options differ from index definition");
+                    }
+                    state.vector = VectorIndex.ImportState(root);
+                }
             }
         }
         if (state.applied < revision) {
@@ -445,7 +485,7 @@ public class CollectionSearch {
         return index.SearchFiltered(query, k, efSearch, filter);
     }
     public List<HybridHit> Hybrid(string textField, string query, string vectorField, float[] vector, int k,
-            int efSearch, Bm25Filter textFilter, VectorFilter vectorFilter) {
+    int efSearch, Bm25Filter textFilter, VectorFilter vectorFilter) {
         RequireCommitted();
         List<HybridHit> result = new List<HybridHit>();
         if (k <= 0) { return result; }
@@ -485,10 +525,11 @@ public class CollectionSearch {
     }
 
     public JsonValue StageCheckpoint(CollectionSearchState state, string generation) {
+        if (state.kind == "vector") { return StageVectorCheckpoint(state, generation); }
+        // —— 文本代 v1：原有 JSON 行通道不变 ——
         string ip = IndexPrefix(state.kind, state.field);
-        JsonValue root = state.kind == "text" ? state.text.ExportState() : state.vector.ExportState();
-        string rowKey = state.kind == "text" ? "docs" : "nodes";
-        JsonValue rows = root.Get(rowKey);
+        JsonValue root = state.text.ExportState();
+        JsonValue rows = root.Get("docs");
         if (rows == null) { rows = JsonValue.NewNull(); }
         List<KvEntry> batch = new List<KvEntry>();
         long bytes = 0;
@@ -496,14 +537,14 @@ public class CollectionSearch {
             string key = ip + "snap:" + generation + ":" + Collection.PadId(i);
             string body = rows.At(i).ToJson();
             if (batch.Count > 0 && (batch.Count >= CollectionSearch.BATCH_ROWS
-                    || bytes + key.Length + body.Length + 32 > CollectionSearch.BATCH_BYTES)) {
+            || bytes + key.Length + body.Length + 32 > CollectionSearch.BATCH_BYTES)) {
                 WriteRows(batch); batch.Clear(); bytes = 0;
             }
             batch.Add(new KvEntry(key, body));
             bytes = bytes + key.Length + body.Length + 32;
         }
         WriteRows(batch);
-        root.Set(rowKey, JsonValue.NewNull());
+        root.Set("docs", JsonValue.NewNull());
         JsonValue snapshot = JsonValue.NewObject();
         snapshot.PutInt("format", 1);
         snapshot.PutStr("definition", state.definition);
@@ -513,12 +554,40 @@ public class CollectionSearch {
         snapshot.Put("root", root);
         return snapshot;
     }
+
+    // 向量代 v2：槽位记录以二进制批次行落库（每批约 1 MiB，
+    // ExportBatches 全程只持一个批次缓冲，不再物化整棵 JSON 状态
+    // 树），头部 JSON 只留定义与图元（options/entry/maxLevel/rng
+    // + 槽数/批数）。行载荷是原始字节，段层对含 NUL 的记录透明
+    // 转义；打开时按 format 分流，v1 快照仍可读。
+    public JsonValue StageVectorCheckpoint(CollectionSearchState state, string generation) {
+        string ip = IndexPrefix(state.kind, state.field);
+        JsonValue root = JsonValue.NewObject();
+        root.Put("options", state.vector.Options().ToJson());
+        root.PutInt("entry", state.vector.entry);
+        root.PutInt("maxLevel", state.vector.maxLevel);
+        root.PutInt("rng", (int)state.vector.randomState);
+        List<KvEntry> rows = new List<KvEntry>();
+        state.vector.ExportBatches((string payload) => {
+            rows.Add(new KvEntry(ip + "snap:" + generation + ":" + Collection.PadId(rows.Count), payload));
+        }, 1048576);
+        WriteRows(rows);
+        JsonValue snapshot = JsonValue.NewObject();
+        snapshot.PutInt("format", 2);
+        snapshot.PutStr("definition", state.definition);
+        snapshot.PutInt("revision", state.applied < 0 ? 0 : state.applied);
+        snapshot.PutStr("generation", generation);
+        snapshot.PutInt("count", state.vector.nodes.Count);
+        snapshot.PutInt("batches", rows.Count);
+        snapshot.Put("root", root);
+        return snapshot;
+    }
     public void Checkpoint() {
         RequireCommitted();
         List<JsonValue> defs = Definitions();
         for (int i = 0; i < defs.Count; i = i + 1) {
             CollectionSearchState state = Load(defs[i].Str("type", ""),
-                defs[i].Str("field", ""));
+            defs[i].Str("field", ""));
             string generation = CollectionSearch.RevisionKey(this.kv.GetRevision() + 1);
             try {
                 JsonValue snapshot = StageCheckpoint(state, generation);
@@ -555,7 +624,7 @@ public class CollectionSearch {
                 List<JsonValue> current = Definitions();
                 for (int j = 0; j < current.Count; j = j + 1) {
                     bool same = current[j].Str("type", "") == kind
-                        && current[j].Str("field", "") == field;
+                    && current[j].Str("field", "") == field;
                     catalog.Append(same ? def.Clone() : current[j].Clone());
                 }
                 string ip = IndexPrefix(kind, field);
