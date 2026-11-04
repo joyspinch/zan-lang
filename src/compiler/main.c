@@ -1794,6 +1794,89 @@ static void zan_synth_action_dispatch(zan_ast_node_t *unit, zan_arena_t *arena,
                           synth->comp_unit.decls.items[i], arena);
 }
 
+/* ---------- DocApp.Bootstrap 的入口 shim 合成（B-ID147） ----------
+ *
+ * type=gui 工程（zan.proj）且用户没写 Main 时，合成 __ZanDocMain 类：
+ * 静态 __DesignMain 调 DocApp.Bootstrap()——irgen 的入口回退语义让用户
+ * Main 天然优先（写了就不回退），框架化窗口的 .zan 里因此零胶水。
+ * 工厂数组（VmFactory[]）由 checker 在 Bootstrap 零参调用点按本编译
+ * 单元的用户类合成（checker_collect_vm_classes）。 */
+typedef struct {
+    int bootstrap;   /* 零参 DocApp.Bootstrap / BootstrapOffscreen 调用 */
+    int main;        /* 用户声明的 static Main */
+    int design_main; /* 已有 __DesignMain */
+} zdm_probe_t;
+
+static zan_walk_action_t zdm_probe_walk(zan_ast_node_t *n, void *ud) {
+    zdm_probe_t *p = (zdm_probe_t *)ud;
+    if (!n) return ZAN_WALK_CONTINUE;
+    if (n->kind == AST_CALL && n->call.callee &&
+        n->call.callee->kind == AST_MEMBER_ACCESS &&
+        n->call.args.count == 0) {
+        zan_ast_node_t *obj = n->call.callee->member.object;
+        zan_istr_t nm = n->call.callee->member.name;
+        bool is_docapp = obj && obj->kind == AST_IDENTIFIER &&
+            obj->ident.name.len == 6 &&
+            memcmp(obj->ident.name.str, "DocApp", 6) == 0;
+        if (is_docapp && ((nm.len == 9 &&
+                           memcmp(nm.str, "Bootstrap", 9) == 0) ||
+                          (nm.len == 18 &&
+                           memcmp(nm.str, "BootstrapOffscreen", 18) == 0))) {
+            p->bootstrap = 1;
+            return ZAN_WALK_CONTINUE;
+        }
+    }
+    if (n->kind == AST_METHOD_DECL && n->method_decl.name.str) {
+        zan_istr_t nm = n->method_decl.name;
+        if (nm.len == 4 && memcmp(nm.str, "Main", 4) == 0 &&
+            (n->method_decl.modifiers & MOD_STATIC))
+            p->main = 1;
+        if (nm.len == 12 && memcmp(nm.str, "__DesignMain", 12) == 0)
+            p->design_main = 1;
+    }
+    return ZAN_WALK_CONTINUE;
+}
+
+static void zan_synth_docapp_main(zan_ast_node_t *unit, zan_arena_t *arena,
+                                  zan_diag_t *diag) {
+    if (!unit || unit->kind != AST_COMPILATION_UNIT) return;
+    zdm_probe_t probe = {0};
+    for (int i = 0; i < unit->comp_unit.decls.count; i++)
+        zan_ast_walk(unit->comp_unit.decls.items[i], zdm_probe_walk, NULL,
+                     &probe);
+    if (!probe.bootstrap || probe.main || probe.design_main) return;
+
+    zd_buf_t b;
+    memset(&b, 0, sizeof(b));
+    zd_putf(&b, "/* 由编译器合成的设计稿窗口入口（勿手改）：type=gui 工程无 Main\n");
+    zd_putf(&b, "   时的回退入口；用户写了 Main 即整体优先，本类不参与。 */\n");
+    zd_putf(&b, "using Gui;\n");
+    zd_putf(&b, "static class __ZanDocMain {\n");
+    zd_putf(&b, "    static void __DesignMain() {\n");
+    zd_putf(&b, "        DocApp.Bootstrap();\n");
+    zd_putf(&b, "    }\n}\n");
+    if (!b.buf) return;
+
+    size_t slen = b.len;
+    char *src = zan_arena_strdup(arena, b.buf, slen);
+    free(b.buf);
+    if (!src) return;
+    int file_id = diag->file_count;
+    zan_diag_add_file(diag, "<docapp-main>", src);
+    zan_lexer_t lex;
+    zan_lexer_init(&lex, src, slen, file_id, arena, diag);
+    zan_parser_t parser;
+    zan_parser_init(&parser, &lex, arena, diag);
+    zan_ast_node_t *synth = zan_parser_parse(&parser);
+    if (!synth || synth->kind != AST_COMPILATION_UNIT) return;
+    for (int i = 0; i < synth->comp_unit.usings.count; i++)
+        zan_ast_list_push(&unit->comp_unit.usings,
+                          synth->comp_unit.usings.items[i], arena);
+    for (int i = 0; i < synth->comp_unit.decls.count; i++)
+        zan_ast_list_push(&unit->comp_unit.decls,
+                          synth->comp_unit.decls.items[i], arena);
+}
+
 static void dump_tokens(const char *source, size_t len, const char *filename) {
     zan_arena_t *arena = zan_arena_new();
     zan_diag_t *diag = zan_diag_new(arena);
@@ -3783,6 +3866,10 @@ int main(int argc, char **argv) {
            引用要进解析/裁剪视野），又必须晚于所有输入解析完（控制器齐了）。 */
         zan_compile_trace("synth action dispatch");
         zan_synth_action_dispatch(ast, arena, diag);
+        /* 框架化窗口入口：同一窗口期合成 __ZanDocMain（零参 Bootstrap
+           调用点驱动，见 zan_synth_docapp_main 注释）。 */
+        zan_compile_trace("synth docapp main");
+        zan_synth_docapp_main(ast, arena, diag);
         zan_compile_trace("nsresolve generated");
         zan_nsresolve_run(ast, arena, diag);
         zan_compile_trace("prune");

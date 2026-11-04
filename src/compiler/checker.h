@@ -30,6 +30,12 @@ struct zan_checker {
     int ctrl_ent_count;
     int ctrl_ent_cap;
     bool ctrl_ents_done;
+    /* 用户类名清单：DocApp.Bootstrap() 零参调用点合成 VmFactory[] 实参
+     * 用（B-ID147 框架化窗口引导，逐类真 new 交给框架按名挑 code-behind）。 */
+    zan_istr_t *vm_ents;
+    int vm_ent_count;
+    int vm_ent_cap;
+    bool vm_ents_done;
     zan_ast_node_t *current_body;
     zan_ast_node_t *current_method_decl;
     /* 已经报过"null 绑不上值类型形参"的实参位置：同一个实参只报一次

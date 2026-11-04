@@ -160,6 +160,8 @@ static zan_ast_node_t *checker_synthesize_controllers_array(zan_checker_t *c,
                                                             zan_loc_t loc);
 static zan_ast_node_t *checker_synthesize_dispatcher_ref(zan_checker_t *c,
                                                          zan_loc_t loc);
+static zan_ast_node_t *checker_synthesize_vm_factories(zan_checker_t *c,
+                                                       zan_loc_t loc);
 static bool checker_is_attr_routes(zan_ast_node_t *obj) {
     if (!obj) return false;
     if (obj->kind == AST_IDENTIFIER) {
@@ -169,6 +171,18 @@ static bool checker_is_attr_routes(zan_ast_node_t *obj) {
     if (obj->kind == AST_MEMBER_ACCESS) {
         return obj->member.name.len == 12 &&
                memcmp(obj->member.name.str, "__AttrRoutes", 12) == 0;
+    }
+    return false;
+}
+static bool checker_is_docapp(zan_ast_node_t *obj) {
+    if (!obj) return false;
+    if (obj->kind == AST_IDENTIFIER) {
+        return obj->ident.name.len == 6 &&
+               memcmp(obj->ident.name.str, "DocApp", 6) == 0;
+    }
+    if (obj->kind == AST_MEMBER_ACCESS) {
+        return obj->member.name.len == 6 &&
+               memcmp(obj->member.name.str, "DocApp", 6) == 0;
     }
     return false;
 }
@@ -3571,6 +3585,21 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
                               checker_synthesize_dispatcher_ref(c, expr->loc),
                               c->arena);
         }
+        /* DocApp.Bootstrap()/BootstrapOffscreen() 编译期 code-behind 发现
+         * （B-ID147）：零参调用点原地合成 `new VmFactory[] { () => new C1(),
+         * ... }` 实参——逐类真 new（字段初始化器走 new 路径），框架按
+         * 文档基名挑出 code-behind。 */
+        if (expr->call.callee && expr->call.callee->kind == AST_MEMBER_ACCESS &&
+            expr->call.args.count == 0 &&
+            checker_is_docapp(expr->call.callee->member.object) &&
+            ((expr->call.callee->member.name.len == 9 &&
+              memcmp(expr->call.callee->member.name.str, "Bootstrap", 9) == 0) ||
+             (expr->call.callee->member.name.len == 18 &&
+              memcmp(expr->call.callee->member.name.str, "BootstrapOffscreen", 18) == 0))) {
+            zan_ast_list_push(&expr->call.args,
+                              checker_synthesize_vm_factories(c, expr->loc),
+                              c->arena);
+        }
         zan_type_t *callee_type;
         zan_type_t *recv = NULL;
         int callee_is_method = 0;
@@ -6270,6 +6299,45 @@ static void checker_collect_controllers(zan_checker_t *c,
     }
 }
 
+/* ---------- DocApp.Bootstrap 的编译期 code-behind 发现（B-ID147） ----------
+ *
+ * 收集用户项目自己的类（stdlib/package 来源排除——同控制器发现的 B-ID110
+ * 判据），零参 DocApp.Bootstrap() 调用点合成 VmFactory[] 工厂数组。 */
+
+static void checker_collect_vm_classes(zan_checker_t *c,
+                                       zan_ast_node_t *unit) {
+    if (c->vm_ents_done || !unit || unit->kind != AST_COMPILATION_UNIT) {
+        return;
+    }
+    c->vm_ents_done = true;
+    for (int i = 0; i < unit->comp_unit.decls.count; i++) {
+        zan_ast_node_t *decl = unit->comp_unit.decls.items[i];
+        if (decl->kind != AST_CLASS_DECL || !decl->type_decl.name.str) continue;
+        if (decl->type_decl.modifiers & MOD_ABSTRACT) continue;
+        if (decl->type_decl.type_params.count > 0) continue;
+        if (decl->from_stdlib || decl->from_package) continue;
+        if (decl->type_decl.name.len == 4 &&
+            memcmp(decl->type_decl.name.str, "Main", 4) == 0) continue;
+
+        int dup = 0;
+        for (int k = 0; k < c->vm_ent_count; k++) {
+            if (c->vm_ents[k].len == decl->type_decl.name.len &&
+                memcmp(c->vm_ents[k].str, decl->type_decl.name.str,
+                       (size_t)decl->type_decl.name.len) == 0) { dup = 1; break; }
+        }
+        if (dup) continue;
+        if (c->vm_ent_count >= c->vm_ent_cap) {
+            int ncap = c->vm_ent_cap ? c->vm_ent_cap * 2 : 32;
+            zan_istr_t *nm = (zan_istr_t *)zan_arena_alloc(
+                c->arena, (size_t)ncap * sizeof(zan_istr_t));
+            for (int k = 0; k < c->vm_ent_count; k++) nm[k] = c->vm_ents[k];
+            c->vm_ents = nm;
+            c->vm_ent_cap = ncap;
+        }
+        c->vm_ents[c->vm_ent_count++] = decl->type_decl.name;
+    }
+}
+
 /* __ZanActionDispatch.Dispatch：main.c 为含 __AttrRoutes.Register 的编译单元
  * 合成动作派发类；这里把它的方法组作为 Register 的第三实参传进去。 */
 static zan_ast_node_t *checker_synthesize_dispatcher_ref(zan_checker_t *c,
@@ -6309,11 +6377,52 @@ static zan_ast_node_t *checker_synthesize_controllers_array(zan_checker_t *c,
     return n;
 }
 
+/* new VmFactory[] { () => new C1(), () => new C2(), ... } */
+static zan_ast_node_t *checker_synthesize_vm_factories(zan_checker_t *c,
+                                                       zan_loc_t loc) {
+    zan_ast_node_t *tref = zan_ast_new(c->arena, AST_TYPE_REF, loc);
+    tref->type_ref.name = checker_istr_lit(c->arena, "VmFactory");
+    tref->type_ref.is_nullable = false;
+    tref->type_ref.is_array = true;
+    zan_ast_list_init(&tref->type_ref.type_args);
+    zan_ast_node_t *n = zan_ast_new(c->arena, AST_NEW_EXPR, loc);
+    n->new_expr.type = tref;
+    n->new_expr.call_init = NULL;
+    zan_ast_list_init(&n->new_expr.args);
+    zan_ast_list_init(&n->new_expr.arg_inits);
+    n->new_expr.is_array = true;
+    n->new_expr.array_init = true;
+    n->new_expr.array_rank = 0;
+    n->new_expr.list_copy = false;
+    for (int i = 0; i < c->vm_ent_count; i++) {
+        zan_ast_node_t *cls = zan_ast_new(c->arena, AST_TYPE_REF, loc);
+        cls->type_ref.name = c->vm_ents[i];
+        cls->type_ref.is_nullable = false;
+        cls->type_ref.is_array = false;
+        zan_ast_list_init(&cls->type_ref.type_args);
+        zan_ast_node_t *newc = zan_ast_new(c->arena, AST_NEW_EXPR, loc);
+        newc->new_expr.type = cls;
+        newc->new_expr.call_init = NULL;
+        zan_ast_list_init(&newc->new_expr.args);
+        zan_ast_list_init(&newc->new_expr.arg_inits);
+        newc->new_expr.is_array = false;
+        newc->new_expr.array_init = false;
+        newc->new_expr.array_rank = 0;
+        newc->new_expr.list_copy = false;
+        zan_ast_node_t *lam = zan_ast_new(c->arena, AST_LAMBDA, loc);
+        zan_ast_list_init(&lam->lambda.params);
+        lam->lambda.body = newc;
+        zan_ast_list_push(&n->new_expr.args, lam, c->arena);
+    }
+    return n;
+}
+
 void zan_checker_check(zan_checker_t *c, zan_ast_node_t *unit) {
     if (!unit || unit->kind != AST_COMPILATION_UNIT) return;
 
     checker_collect_table_entities(c, unit);
     checker_collect_controllers(c, unit);
+    checker_collect_vm_classes(c, unit);
     check_all_struct_cycles(c, unit);
 
     for (int i = 0; i < unit->comp_unit.decls.count; i++) {
