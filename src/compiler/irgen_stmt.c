@@ -175,7 +175,9 @@ static void emit_switch_pattern_bind(zan_irgen_t *g, local_scope_t *locals,
         cv = LLVMBuildBitCast(g->builder, cv, ptll, "cpat.cast");
 
     int captured = local_is_lambda_captured(g, locals, g->current_fn_body, sc);
-    if (captured && (pt->kind == TYPE_OBJECT || pt->kind == TYPE_TYPE_PARAM)) {
+    /* object 模式变量捕获解禁（B-ID117，同 var 口径）：rc 指针走
+     * 下方既有 retain/box/arc_owned 通路。开泛形参仍 fail-closed。 */
+    if (captured && pt->kind == TYPE_TYPE_PARAM) {
         zan_diag_emit_code(g->diag, DIAG_ERROR, sc->loc, 3069,
             "cannot capture pattern variable '%.*s' of type '%.*s': "
             "its runtime ownership is not representable yet",
@@ -736,7 +738,11 @@ static int emit_boxed_var_decl(zan_irgen_t *g, zan_ast_node_t *stmt,
     int aggregate_rc = type->kind == TYPE_STRUCT &&
         type_contains_collection_rc(g, type, 0);
     if (!local_is_lambda_captured(g, locals, body, stmt)) return 0;
-    if (type->kind == TYPE_OBJECT || type->kind == TYPE_TYPE_PARAM) {
+    /* object 捕获解禁（B-ID117）：object 是 rc 管理的 i8*，与 CLASS 捕获
+     * 走同一条 box+ARC 通路（dtor 按类型发 release）。只保留开泛形参的
+     * fail-closed 拦截——擦除槽 i64 没有运行期类型信息，闭包若比调用帧
+     * 长寿无法代为持有。 */
+    if (type->kind == TYPE_TYPE_PARAM) {
         zan_diag_emit_code(g->diag, DIAG_ERROR, stmt->loc, 3070,
             "cannot capture local '%.*s' of type '%.*s': its runtime ownership is not representable yet",
             (int)stmt->var_decl.name.len, stmt->var_decl.name.str,

@@ -923,7 +923,9 @@ static void box_captured_parameter(zan_irgen_t *g, local_scope_t *locals,
             "cannot capture a ref or out parameter in a lambda");
         return;
     }
-    if (!type || type->kind == TYPE_OBJECT || type->kind == TYPE_TYPE_PARAM) {
+    /* object 形参捕获解禁（B-ID117，同 var 口径）：rc 指针走下方既有
+     * box+ARC 通路。开泛形参（含 !type 的擦除形态）仍 fail-closed。 */
+    if (!type || type->kind == TYPE_TYPE_PARAM) {
         zan_diag_emit_code(g->diag, DIAG_ERROR, param->loc, 3044,
             "cannot capture parameter '%.*s' of type '%.*s': its runtime ownership is not representable yet",
             (int)param->param.name.len, param->param.name.str,

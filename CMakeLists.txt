@@ -2497,26 +2497,15 @@ foreach(_mode ref out)
   set_tests_properties(diag_closure_${_mode}_capture PROPERTIES TIMEOUT 60)
 endforeach()
 
-# `object` is still a one-word untagged ABI: until it carries dynamic ownership
-# metadata, capturing it must fail explicitly rather than snapshot a potentially
-# dangling pointer. Cover both parameter and local binding paths.
-add_test(NAME diag_closure_object_capture
-  COMMAND ${CMAKE_COMMAND}
-    -DZANC=$<TARGET_FILE:zanc>
-    -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/closure_object_capture.zan
-    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/diag_closure_object_capture${_exe_ext}
-    "-DEXPECT_REGEX=cannot capture parameter .value. of type .object.*runtime ownership is not representable yet"
-    -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
-set_tests_properties(diag_closure_object_capture PROPERTIES TIMEOUT 60)
-
-add_test(NAME diag_closure_object_local_capture
-  COMMAND ${CMAKE_COMMAND}
-    -DZANC=$<TARGET_FILE:zanc>
-    -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/closure_object_local_capture.zan
-    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/diag_closure_object_local_capture${_exe_ext}
-    "-DEXPECT_REGEX=cannot capture local .value. of type .object.*runtime ownership is not representable yet"
-    -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
-set_tests_properties(diag_closure_object_local_capture PROPERTIES TIMEOUT 60)
+# `object` capture in closures is legal since B-ID117: an object is an
+# rc-managed i8* and takes the same box+ARC path as CLASS captures (the
+# closure dtor releases it by type). The old rejection pins
+# (diag_closure_object_capture / diag_closure_object_local_capture) were
+# removed with that change; the live coverage is the positive conformance
+# case `closure_capture_object` (escape, pattern capture, reassignment,
+# capture across an await) plus its leak-checked det twin. The open
+# type-parameter capture stays fail-closed (erased slot carries no runtime
+# type info, so an escaping closure could not hold it).
 
 # The same rule for a string local, which irgen still starts empty so a stray
 # read cannot dereference null: the default is a backstop, not a licence to

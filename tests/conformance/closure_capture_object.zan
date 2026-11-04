@@ -1,0 +1,71 @@
+// B-ID117：object 局部/形参/模式变量被 lambda 闭包捕获解禁。
+// 修前三杀点 E3070/E3044/E3069 对 TYPE_OBJECT 硬性拒捕
+// （"runtime ownership is not representable yet"）；object 是 rc 管理的
+// i8*，与 CLASS 捕获同走 box+ARC 通路（dtor 按类型 release）。
+// 本案钉：闭包逃逸调用帧、pattern 变量捕获、lambda 内重赋值（ARC
+// 释放旧值/保留新值）、async 帧内捕获与 is/as 转型回读。
+// 开泛形参（TYPE_TYPE_PARAM）仍 fail-closed（擦除槽无运行期类型
+// 信息，闭包比帧长寿时无法代持有）——不在本案覆盖面。
+using System;
+
+class Node {
+    public string name;
+    public Node(string n) { this.name = n; }
+    public string Show() { return "N:" + name; }
+}
+
+class Program {
+    // 形参捕获 + 闭包向上逃逸：调用帧结束后闭包仍存活
+    static Func<string> MakeTalker(object payload) {
+        Func<string> f = () => {
+            if (payload is Node) { return ((Node)payload).Show(); }
+            return "s:" + (payload as string);
+        };
+        return f;
+    }
+
+    // 模式变量捕获（E3069 面）
+    static string PatternProbe(object o) {
+        Func<string> f = () => {
+            string r = "?";
+            if (o is Node nn) { r = nn.Show(); }
+            else if (o is string ss) { r = "len:" + ss.Length; }
+            return r;
+        };
+        return f();
+    }
+
+    // lambda 内对捕获 object 重赋值（释放旧/保留新）
+    static string Reassign(object o) {
+        object box = o;
+        Func<string> f = () => {
+            box = new Node("re");
+            return ((Node)box).Show();
+        };
+        string r1 = f();
+        string r2 = (box as Node) != null ? ((Node)box).Show() : "gone";
+        return r1 + "/" + r2;
+    }
+
+    // async 帧内 object 捕获 + 跨 await 回读
+    static async string HoldObj(object o) {
+        Func<object> grab = () => { return o; };
+        await Task.Delay(1);
+        object back = grab();
+        if (back is Node) { return ((Node)back).Show(); }
+        return "plain";
+    }
+
+    static async void Main() {
+        Func<string> t1 = MakeTalker(new Node("esc"));
+        Console.WriteLine(t1());
+        Func<string> t2 = MakeTalker("hi");
+        Console.WriteLine(t2());
+        Console.WriteLine(PatternProbe(new Node("pt")));
+        Console.WriteLine(PatternProbe("abc"));
+        Console.WriteLine(Reassign(new Node("old")));
+        Console.WriteLine(await HoldObj(new Node("cd")));
+        await Task.Delay(1);
+        Console.WriteLine("done");
+    }
+}
