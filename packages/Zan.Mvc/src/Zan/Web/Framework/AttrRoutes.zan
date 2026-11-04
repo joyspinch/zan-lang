@@ -17,10 +17,21 @@ namespace Zan.Web;
       - 无 Web 特性且非公共动作的框架内部钩子天然不注册，绝无方法名黑名单硬编码。
    3. 服务器启动时全量装载入跨进程共享内存路由表（RouteTable）。
    4. 请求进入时直接从共享内存表匹配，没有的路由瞬间抛 404（Fail-Fast）。 */
+public async delegate bool RouteDispatchHandler(HttpContext ctx, string actionKey);
+
 public class __AttrRoutes {
 
+    public static RouteDispatchHandler CustomDispatcher = null;
+
     static async void Dispatch(HttpContext ctx) {
-        ctx.Text("ok");
+        string act = ctx.routeAction;
+        if (__AttrRoutes.CustomDispatcher != null) {
+            if (await __AttrRoutes.CustomDispatcher(ctx, act)) {
+                return;
+            }
+        }
+        ctx.Status(404, "Not Found");
+        ctx.Text("Action not found: " + act);
     }
 
     static string ExtractAttr(string attrs, string prefix) {
@@ -39,6 +50,8 @@ public class __AttrRoutes {
         }
 
         int lastDot = fullName.LastIndexOf(".");
+        int lastUnder = fullName.LastIndexOf("_");
+        if (lastUnder > lastDot) { lastDot = lastUnder; }
         string className = lastDot >= 0 ? fullName.Substring(lastDot + 1) : fullName;
         string ns = lastDot >= 0 ? fullName.Substring(0, lastDot) : "";
 
@@ -60,7 +73,7 @@ public class __AttrRoutes {
         if (ns.Length > 0) {
             int start = 0;
             for (int i = 0; i <= ns.Length; i = i + 1) {
-                if (i == ns.Length || ns[i] == '.') {
+                if (i == ns.Length || ns[i] == '.' || ns[i] == '_') {
                     if (i > start) {
                         string seg = ns.Substring(start, i - start).ToLower();
                         if (seg != "zan" && seg != "web") {
@@ -89,12 +102,18 @@ public class __AttrRoutes {
     }
 
     static void RegisterController(WebApp app, TypeInfo ti) {
-        string fullName = ti.Name;
+        /* 命名空间派生路径取 FullName：B-ID107 之后 TypeInfo.Name 是短名
+           （对齐 C#），拿它推不出 /admin/system 这类命名空间段，约定路由
+           会全部塌到根一级。动作键仍按短名算（见下）。 */
+        string fullName = ti.FullName;
         string classAttrs = ti.GetCustomAttributes();
         string basePath = __AttrRoutes.DeriveControllerPath(fullName, classAttrs);
 
-        int lastDot = fullName.LastIndexOf(".");
-        string shortName = lastDot >= 0 ? fullName.Substring(lastDot + 1) : fullName;
+        string shortSrc = ti.Name;
+        int lastDot = shortSrc.LastIndexOf(".");
+        int lastUnder = shortSrc.LastIndexOf("_");
+        if (lastUnder > lastDot) { lastDot = lastUnder; }
+        string shortName = lastDot >= 0 ? shortSrc.Substring(lastDot + 1) : shortSrc;
 
         bool classNeedsAuth = classAttrs.Contains("Authorization=CustomAuthorization.Grant")
             || classAttrs.Contains("Authorization=Grant")
@@ -188,6 +207,13 @@ public class __AttrRoutes {
             }
             if (isMenu) { r.Menu(); }
 
+            /* 流式文件上传声明 */
+            if (mattrs.Contains("Upload=true") || mattrs.Contains("Upload = true")
+                || mattrs.Contains("Custom.Upload=true") || mattrs.Contains("Custom.Upload = true")
+                || classAttrs.Contains("Upload=true") || classAttrs.Contains("Upload = true")) {
+                r.Upload();
+            }
+
             string methodIcon = __AttrRoutes.ExtractAttr(mattrs, "Custom.Icon=");
             if (methodIcon.Length == 0) { methodIcon = __AttrRoutes.ExtractAttr(mattrs, "Icon="); }
             string icon = methodIcon.Length > 0 ? methodIcon : (isIndex ? classIcon : "");
@@ -275,10 +301,53 @@ public class __AttrRoutes {
         }
     }
 
-    public static void Register(WebApp app, TypeInfo[] controllers = null) {
+    public static void RegisterFramework(WebApp app) {
+        TypeInfo[] f = new TypeInfo[] {
+            typeof(Zan.Web.Admin.LoginController),
+            typeof(Zan.Web.Admin.DashboardController),
+            typeof(Zan.Web.Admin.ProfileController),
+            typeof(Zan.Web.Admin.Media.MediaController),
+            typeof(Zan.Web.Admin.Wiki.WikiController),
+            typeof(Zan.Web.Admin.Content.PostsController),
+            typeof(Zan.Web.Admin.Content.CategoriesController),
+            typeof(Zan.Web.Admin.Content.CommentsController),
+            typeof(Zan.Web.Admin.Dev.CoderController),
+            typeof(Zan.Web.Admin.Dev.AssistantController),
+            typeof(Zan.Web.Admin.Dev.TxProbeController),
+            typeof(Zan.Web.Admin.Monitor.MonitorController),
+            typeof(Zan.Web.Admin.Monitor.DataController),
+            typeof(Zan.Web.Admin.System.DocsController),
+            typeof(Zan.Web.Admin.System.DepartmentsController),
+            typeof(Zan.Web.Admin.System.DictsController),
+            typeof(Zan.Web.Admin.System.JobsController),
+            typeof(Zan.Web.Admin.System.LogsController),
+            typeof(Zan.Web.Admin.System.UsersController),
+            typeof(Zan.Web.Admin.System.SettingsController),
+            typeof(Zan.Web.Admin.System.RolesController),
+            typeof(Zan.Web.Account.LoginController),
+            typeof(Zan.Web.Account.RegisterController),
+            typeof(Zan.Web.Account.ForgotController),
+            typeof(Zan.Web.Health.HealthController)
+        };
+        for (int i = 0; i < f.Length; i = i + 1) {
+            __AttrRoutes.RegisterController(app, f[i]);
+        }
+    }
+
+    public static void Register(WebApp app, TypeInfo[] controllers = null,
+                                RouteDispatchHandler dispatcher = null) {
         if (app == null) { return; }
 
-        /* 1. 动态装载控制器约定路由与属性路由 */
+        /* 0. 动作派发器：约定路由把每条路由的 handler 统一挂到 Dispatch，
+           真正的控制器方法调用按 routeAction 派发。反射 Invoke 拿不到协程
+           句柄（thunk 只回传方法返回值），异步动作无法 await，因此派发器
+           由编译器在 __AttrRoutes.Register 调用点合成后作为第三实参传入
+           （见 src/compiler/main.c 的动作派发合成）。 */
+        if (dispatcher != null) {
+            __AttrRoutes.CustomDispatcher = dispatcher;
+        }
+
+        /* 1. 动态装载应用业务控制器约定路由与属性路由 */
         if (controllers != null) {
             for (int i = 0; i < controllers.Length; i = i + 1) {
                 TypeInfo ti = controllers[i];

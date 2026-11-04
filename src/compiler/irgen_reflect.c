@@ -199,7 +199,7 @@ static LLVMValueRef refl_slot_offset(zan_irgen_t *g, LLVMTypeRef st, int slot) {
 }
 
 static void refl_pack_attrs(zan_ast_list_t *attrs, char *buf, size_t buf_size);
-static void refl_append_method_params(zan_ast_node_t *decl, char *buf, size_t cap);
+static void refl_append_method_params(zan_irgen_t *g, zan_ast_node_t *decl, char *buf, size_t cap);
 static LLVMValueRef refl_empty_string(zan_irgen_t *g);
 
 static void refl_extract_field_attrs(zan_symbol_t *m, const char **custom_name,
@@ -678,7 +678,7 @@ static LLVMValueRef refl_method_record(zan_irgen_t *g, zan_symbol_t *sym,
     char mattrbuf[4096];
     refl_pack_attrs(decl ? zan_ast_attributes(decl) : NULL, mattrbuf, sizeof(mattrbuf));
     if (decl && decl->kind == AST_METHOD_DECL) {
-        refl_append_method_params(decl, mattrbuf, sizeof(mattrbuf));
+        refl_append_method_params(g, decl, mattrbuf, sizeof(mattrbuf));
     }
     LLVMValueRef mattrs = refl_const_string(g, mattrbuf, (int)strlen(mattrbuf));
     return LLVMConstNamedStruct(mrec, (LLVMValueRef[]){
@@ -1178,10 +1178,43 @@ static void refl_rg_scan(zan_ast_node_t *n, refl_param_list_t *ps) {
     }
 }
 
-static void refl_append_method_params(zan_ast_node_t *decl, char *buf, size_t cap) {
+static void refl_append_method_params(zan_irgen_t *g, zan_ast_node_t *decl, char *buf, size_t cap) {
     if (!decl || decl->kind != AST_METHOD_DECL || cap <= 1) return;
     refl_param_list_t ps;
     memset(&ps, 0, sizeof(ps));
+
+    /* 0. 扫描 [Opt("k=v", ...)] 特性 */
+    char opt_names[32][64];
+    char opt_defs[32][64];
+    int opt_count = 0;
+    zan_ast_list_t *attrs = zan_ast_attributes(decl);
+    if (attrs) {
+        for (int i = 0; i < attrs->count; i++) {
+            zan_ast_node_t *a = attrs->items[i];
+            if (!a || a->kind != AST_ATTRIBUTE || !a->attribute.name) continue;
+            if (a->attribute.name->kind != AST_IDENTIFIER) continue;
+            zan_istr_t an = a->attribute.name->ident.name;
+            if (!an.str || an.len == 0) continue;
+            if ((an.len == 3 && memcmp(an.str, "Opt", 3) == 0) ||
+                (an.len == 12 && memcmp(an.str, "OptAttribute", 12) == 0)) {
+                for (int k = 0; k < a->attribute.args.count && opt_count < 32; k++) {
+                    zan_ast_node_t *arg = a->attribute.args.items[k];
+                    if (!arg || arg->kind != AST_STRING_LITERAL || !arg->str_val.str) continue;
+                    char v[192];
+                    snprintf(v, sizeof(v), "%.*s", (int)arg->str_val.len, arg->str_val.str);
+                    char *eq = strchr(v, '=');
+                    if (eq) {
+                        *eq = 0;
+                        snprintf(opt_defs[opt_count], 64, "%s", eq + 1);
+                    } else {
+                        opt_defs[opt_count][0] = 0;
+                    }
+                    snprintf(opt_names[opt_count], 64, "%s", v);
+                    opt_count++;
+                }
+            }
+        }
+    }
 
     /* 1. 签名形参直录 */
     for (int i = 0; i < decl->method_decl.params.count; i++) {
@@ -1193,12 +1226,51 @@ static void refl_append_method_params(zan_ast_node_t *decl, char *buf, size_t ca
         if (param->param.type && param->param.type->kind == AST_TYPE_REF) {
             refl_istr_to(ptype, sizeof(ptype), param->param.type->type_ref.name);
         }
+
+        /* 表单模型类展开：如果参数类型是类且有实例字段，展开为 form 来源字段 */
+        zan_type_t *pt = NULL;
+        if (g && g->binder && param->param.type) {
+            pt = zan_binder_resolve_type(g->binder, param->param.type);
+        }
+        if (pt && pt->kind == TYPE_CLASS && pt->sym && pt->sym->decl) {
+            zan_ast_node_t *fcls = pt->sym->decl;
+            bool is_form = false;
+            if (fcls->kind == AST_CLASS_DECL && fcls->type_decl.members.count > 0) {
+                for (int fi = 0; fi < fcls->type_decl.members.count; fi++) {
+                    zan_ast_node_t *mem = fcls->type_decl.members.items[fi];
+                    if (!mem || mem->kind != AST_FIELD_DECL) continue;
+                    if (mem->field_decl.modifiers & MOD_STATIC) continue;
+                    if (ps.count >= (int)(sizeof(ps.items) / sizeof(ps.items[0]))) break;
+                    char fname[64]; refl_istr_to(fname, sizeof(fname), mem->field_decl.name);
+                    char ftype[64] = "string";
+                    if (mem->field_decl.type && mem->field_decl.type->kind == AST_TYPE_REF) {
+                        refl_istr_to(ftype, sizeof(ftype), mem->field_decl.type->type_ref.name);
+                    }
+                    refl_param_entry_t *p = &ps.items[ps.count++];
+                    memset(p, 0, sizeof(*p));
+                    snprintf(p->name, sizeof(p->name), "%s", fname);
+                    snprintf(p->type, sizeof(p->type), "%s", ftype[0] ? ftype : "string");
+                    p->required = false;
+                    snprintf(p->where, sizeof(p->where), "form");
+                    is_form = true;
+                }
+            }
+            if (is_form) continue;
+        }
+
         refl_param_entry_t *p = &ps.items[ps.count++];
         memset(p, 0, sizeof(*p));
         snprintf(p->name, sizeof(p->name), "%s", pname);
         snprintf(p->type, sizeof(p->type), "%s", ptype[0] ? ptype : "string");
         p->required = true;
         snprintf(p->where, sizeof(p->where), "query");
+        for (int k = 0; k < opt_count; k++) {
+            if (strcmp(opt_names[k], pname) == 0) {
+                p->required = false;
+                snprintf(p->def, sizeof(p->def), "%s", opt_defs[k]);
+                break;
+            }
+        }
     }
 
     /* 2. 体内 In/Need/Paged 扫描 */

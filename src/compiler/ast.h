@@ -136,7 +136,11 @@ struct zan_ast_node {
     uint8_t lit_suffix;
 
     uint8_t lit_radix;
-    unsigned char from_stdlib;
+    /* 声明来源标记（AST 节点有 120 字节预算，两个标志共用一字节）：
+     * from_stdlib = 标准库源文件，from_package = packages/ 下的库代码。
+     * 隐式控制器发现跳过库侧声明，用户项目（含模板/示例）一律参与。 */
+    unsigned char from_stdlib : 1;
+    unsigned char from_package : 1;
     uint8_t in_infer;
 
     zan_decl_meta_t *meta;

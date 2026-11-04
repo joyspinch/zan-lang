@@ -3,6 +3,7 @@ using System.Json;
 using System.Net;
 using System.Net.Http;
 using System.Web;
+using Zan.Web;
 
 [Route("/api/calc")]
 class CalcController : Controller {
@@ -102,40 +103,50 @@ class Program {
         return new HttpContext(r, "127.0.0.1");
     }
 
-    static async List<long> Call(long h) {
-        List<long> hs = new List<long>();
-        hs.Add(h);
-        return hs;
+    static async void Dispatch(WebApp app, HttpContext ctx) {
+        Route r = app.router.Match(ctx);
+        if (r == null) {
+            ctx.Status(404, "Not Found");
+            return;
+        }
+        ctx.routeAction = r.action;
+        ctx.routePattern = r.pattern;
+        try {
+            await r.handler(ctx);
+        } catch (ApiError ae) {
+            if (!ctx.ended) {
+                ctx.Status(ae.Status(), ApiError.Reason(ae.Status()));
+                ctx.Api(ae.Code(), ae.Message, "null");
+            }
+        }
     }
 
     static async int Run() {
+        WebApp app = new WebApp("127.0.0.1", 0);
+        __AttrRoutes.Register(app);
+        List<Route> routes = app.router.All();
+
         HttpContext c1 = Program.Ctx("GET", "/api/calc/sum?a=2&b=40");
-        await Task.WhenAll(await Program.Call(
-            Task.Spawn(__AttrRoutes.__h_CalcController_Sum(c1))));
+        await Program.Dispatch(app, c1);
         string p1 = c1.BuildResponse(true);
         Program.Check(p1.IndexOf("200 OK") >= 0, "sum answers 200");
         Program.Check(p1.IndexOf("\"sum\":42") >= 0, "sum body computed");
 
         HttpContext c2 = Program.Ctx("GET", "/api/calc/sum?a=2");
-        await Task.WhenAll(await Program.Call(
-            Task.Spawn(__AttrRoutes.__h_CalcController_Sum(c2))));
+        await Program.Dispatch(app, c2);
         string p2 = c2.BuildResponse(true);
         Program.Check(p2.IndexOf("400 Bad") >= 0
             && p2.IndexOf("\"0003\"") >= 0,
             "missing param answered 0003");
 
         HttpContext c3 = Program.Ctx("GET", "/api/calc/sum?a=2&b=xyz");
-        await Task.WhenAll(await Program.Call(
-            Task.Spawn(__AttrRoutes.__h_CalcController_Sum(c3))));
+        await Program.Dispatch(app, c3);
         string p3 = c3.BuildResponse(true);
         Program.Check(p3.IndexOf("400 Bad") >= 0
             && p3.IndexOf("\"0003\"") >= 0,
             "malformed int answered 0003");
 
-        WebApp app = new WebApp("127.0.0.1", 0);
-        __AttrRoutes.Register(app);
         Route sum = null;
-        List<Route> routes = app.router.All();
         for (int i = 0; i < routes.Count; i = i + 1) {
             if (routes[i].pattern == "/api/calc/sum") { sum = routes[i]; }
         }
@@ -147,8 +158,7 @@ class Program {
 
         TxLog.Reset();
         HttpContext c5 = Program.Ctx("POST", "/api/tx/save?name=box&qty=3");
-        await Task.WhenAll(await Program.Call(
-            Task.Spawn(__AttrRoutes.__h_DocController_Save(c5))));
+        await Program.Dispatch(app, c5);
         string p5 = c5.BuildResponse(true);
         Program.Check(p5.IndexOf("200 OK") >= 0, "tx save answers 200");
         Program.Check(TxLog.Joined() == "begin,action:box:3,commit",
@@ -156,32 +166,28 @@ class Program {
 
         TxLog.Reset();
         HttpContext c6 = Program.Ctx("POST", "/api/tx/save?name=box&qty=-1");
-        await Task.WhenAll(await Program.Call(
-            Task.Spawn(__AttrRoutes.__h_DocController_Save(c6))));
+        await Program.Dispatch(app, c6);
         string p6 = c6.BuildResponse(true);
         Program.Check(p6.IndexOf("400 Bad") >= 0, "tx failure answers 400");
         Program.Check(TxLog.Joined() == "begin,action:box:-1,rollback",
             "tx rollback order");
 
         HttpContext c7 = Program.Ctx("GET", "/api/items/browse?limit=10&page=7&kw=ab");
-        await Task.WhenAll(await Program.Call(
-            Task.Spawn(__AttrRoutes.__h_ItemController_Browse(c7))));
+        await Program.Dispatch(app, c7);
         string p7 = c7.BuildResponse(true);
         Program.Check(p7.IndexOf("200 OK") >= 0, "opt params answer 200");
         Program.Check(p7.IndexOf("\"page\":7") >= 0, "opt given value wins");
         Program.Check(p7.IndexOf("\"kw\":\"ab\"") >= 0, "opt string given");
 
         HttpContext c8 = Program.Ctx("GET", "/api/items/browse?limit=10");
-        await Task.WhenAll(await Program.Call(
-            Task.Spawn(__AttrRoutes.__h_ItemController_Browse(c8))));
+        await Program.Dispatch(app, c8);
         string p8 = c8.BuildResponse(true);
         Program.Check(p8.IndexOf("200 OK") >= 0, "opt missing answers 200");
         Program.Check(p8.IndexOf("\"page\":1") >= 0, "opt int default used");
         Program.Check(p8.IndexOf("\"kw\":\"\"") >= 0, "opt string default used");
 
         HttpContext c9 = Program.Ctx("GET", "/api/items/browse");
-        await Task.WhenAll(await Program.Call(
-            Task.Spawn(__AttrRoutes.__h_ItemController_Browse(c9))));
+        await Program.Dispatch(app, c9);
         string p9 = c9.BuildResponse(true);
         Program.Check(p9.IndexOf("400 Bad") >= 0
             && p9.IndexOf("\"0003\"") >= 0,
@@ -204,8 +210,7 @@ class Program {
             "opt params documented with defaults");
 
         HttpContext c10 = Program.Ctx("POST", "/api/items/save?sku=box&qty=3");
-        await Task.WhenAll(await Program.Call(
-            Task.Spawn(__AttrRoutes.__h_ItemController_Save(c10))));
+        await Program.Dispatch(app, c10);
         string p10 = c10.BuildResponse(true);
         Program.Check(p10.IndexOf("200 OK") >= 0, "form object answers 200");
         Program.Check(p10.IndexOf("\"sku\":\"box\"") >= 0
@@ -215,8 +220,7 @@ class Program {
             "absent field keeps initializer");
 
         HttpContext c11 = Program.Ctx("POST", "/api/items/save?sku=pen");
-        await Task.WhenAll(await Program.Call(
-            Task.Spawn(__AttrRoutes.__h_ItemController_Save(c11))));
+        await Program.Dispatch(app, c11);
         string p11 = c11.BuildResponse(true);
         Program.Check(p11.IndexOf("\"qty\":0") >= 0
             && p11.IndexOf("\"weight\":0") >= 0,
@@ -231,8 +235,7 @@ class Program {
             "form fields documented as optional form params");
 
         HttpContext c12 = Program.Ctx("POST", "/api/items/save?sku=box&made=99");
-        await Task.WhenAll(await Program.Call(
-            Task.Spawn(__AttrRoutes.__h_ItemController_Save(c12))));
+        await Program.Dispatch(app, c12);
         string p12 = c12.BuildResponse(true);
         Program.Check(p12.IndexOf("\"made\":0") >= 0,
             "static form field ignored");

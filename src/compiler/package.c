@@ -1281,6 +1281,17 @@ typedef struct {
     int count;
 } pkg_dir_entries_t;
 
+typedef struct {
+    char *name;
+    unsigned char flag;
+} pkg_dir_pair_t;
+
+static int pkg_dir_pair_cmp(const void *a, const void *b) {
+    const pkg_dir_pair_t *pa = (const pkg_dir_pair_t *)a;
+    const pkg_dir_pair_t *pb = (const pkg_dir_pair_t *)b;
+    return strcmp(pa->name, pb->name);
+}
+
 static pkg_dir_entries_t *pkg_dir_entries_sorted(const char *dir) {
     pkg_dir_entries_t *e = (pkg_dir_entries_t *)calloc(1, sizeof(*e));
     if (!e) return NULL;
@@ -1360,7 +1371,21 @@ static pkg_dir_entries_t *pkg_dir_entries_sorted(const char *dir) {
         closedir(d);
     }
 #endif
-    if (count > 1) qsort(e->names, (size_t)count, sizeof(char *), pkg_names_cmp);
+    if (count > 1) {
+        pkg_dir_pair_t *pairs = (pkg_dir_pair_t *)malloc((size_t)count * sizeof(pkg_dir_pair_t));
+        if (pairs) {
+            for (int i = 0; i < count; i++) {
+                pairs[i].name = e->names[i];
+                pairs[i].flag = e->flags[i];
+            }
+            qsort(pairs, (size_t)count, sizeof(pkg_dir_pair_t), pkg_dir_pair_cmp);
+            for (int i = 0; i < count; i++) {
+                e->names[i] = pairs[i].name;
+                e->flags[i] = pairs[i].flag;
+            }
+            free(pairs);
+        }
+    }
     e->count = count;
     return e;
 }
@@ -1391,6 +1416,23 @@ static double zan_pkg_now_ms(void) {
     return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1000000.0;
 #endif
 }
+
+static int pkg_cpu_count(void) {
+#ifdef _WIN32
+    SYSTEM_INFO si;
+    GetSystemInfo(&si);
+    return (int)si.dwNumberOfProcessors;
+#else
+    long n = sysconf(_SC_NPROCESSORS_ONLN);
+    return n > 0 ? (int)n : 1;
+#endif
+}
+
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((weak)) void zan_compile_trace(const char *fmt, ...) {
+    (void)fmt;
+}
+#endif
 
 /* 包源索引两阶段构建：阶段一走树只「收集」（uniform 目录内联一个首文
  * 件 probe 定案），阶段二对待 probe 文件并行 probe（纯只读、无共享写，
@@ -1826,7 +1868,7 @@ static void pkg_index_build_from_items(zan_pkg_source_index_t *index,
 
     if (pending_n > 0) {
         double __p0 = zan_pkg_now_ms();
-        int nthreads = zan_cpu_count();
+        int nthreads = pkg_cpu_count();
         if (nthreads > 16) nthreads = 16;
         if (nthreads > pending_n) nthreads = pending_n;
         if (nthreads < 1) nthreads = 1;

@@ -158,6 +158,8 @@ static zan_ast_node_t *checker_synthesize_table_array(zan_checker_t *c,
                                                       zan_loc_t loc);
 static zan_ast_node_t *checker_synthesize_controllers_array(zan_checker_t *c,
                                                             zan_loc_t loc);
+static zan_ast_node_t *checker_synthesize_dispatcher_ref(zan_checker_t *c,
+                                                         zan_loc_t loc);
 static bool checker_is_attr_routes(zan_ast_node_t *obj) {
     if (!obj) return false;
     if (obj->kind == AST_IDENTIFIER) {
@@ -3551,14 +3553,22 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
             }
         }
         /* __AttrRoutes.Register(app) 编译期控制器发现：合成 TypeInfo[] 实参
-         * 注入为第 2 实参，交给 Zan.Mvc 框架动态约定路由引擎遍历计算。 */
+         * 注入为第 2 实参，交给 Zan.Mvc 框架动态约定路由引擎遍历计算；
+         * 第 3 实参是 main.c 合成的动作派发器（约定路由的 handler 统一是
+         * __AttrRoutes.Dispatch，真正的方法调用按 actionKey 在这里展开成
+         * 强类型调用——反射 Invoke 拿不到异步协程句柄，await 不了）。 */
         if (expr->call.callee && expr->call.callee->kind == AST_MEMBER_ACCESS &&
-            expr->call.args.count == 1 &&
+            (expr->call.args.count == 1 || expr->call.args.count == 2) &&
             checker_is_attr_routes(expr->call.callee->member.object) &&
             expr->call.callee->member.name.len == 8 &&
             memcmp(expr->call.callee->member.name.str, "Register", 8) == 0) {
+            if (expr->call.args.count == 1) {
+                zan_ast_list_push(&expr->call.args,
+                                  checker_synthesize_controllers_array(c, expr->loc),
+                                  c->arena);
+            }
             zan_ast_list_push(&expr->call.args,
-                              checker_synthesize_controllers_array(c, expr->loc),
+                              checker_synthesize_dispatcher_ref(c, expr->loc),
                               c->arena);
         }
         zan_type_t *callee_type;
@@ -6202,11 +6212,14 @@ static void checker_collect_controllers(zan_checker_t *c,
         if (decl->type_decl.modifiers & MOD_ABSTRACT) continue;
         if (decl->type_decl.type_params.count > 0) continue;
 
-        /* B-ID110：框架包（Zan.Web* ns）自带控制器不参与隐式发现——
-         * 否则 Zan.Mvc 拉入编译集的 200+ 控制器被用户项目的
-         * __AttrRoutes.Register 全量吞掉；框架页归 Boot/显式注册管 */
-        zan_istr_t dns = zan_ast_ns_name(decl);
-        if (dns.len >= 7 && memcmp(dns.str, "Zan.Web", 7) == 0) continue;
+        /* B-ID110：库侧（stdlib / packages）自带控制器不参与隐式发现——
+         * 否则 Zan.Mvc 拉入编译集的 200+ 框架控制器被用户项目的
+         * __AttrRoutes.Register 全量吞掉；框架页归 Boot/显式注册管。
+         *
+         * 判定按**来源**而不是命名空间：模板/示例项目（用户自己的代码）
+         * 也统一使用 Zan.Web.* 命名空间，按命名空间跳过会把项目自己的
+         * 控制器一并吞掉（server-legend 全体 API 404 就是这么来的）。 */
+        if (decl->from_stdlib || decl->from_package) continue;
 
         /* 排除框架基类本身 */
         uint32_t nl = decl->type_decl.name.len;
@@ -6255,6 +6268,20 @@ static void checker_collect_controllers(zan_checker_t *c,
         }
         c->ctrl_ents[c->ctrl_ent_count++] = decl->type_decl.name;
     }
+}
+
+/* __ZanActionDispatch.Dispatch：main.c 为含 __AttrRoutes.Register 的编译单元
+ * 合成动作派发类；这里把它的方法组作为 Register 的第三实参传进去。 */
+static zan_ast_node_t *checker_synthesize_dispatcher_ref(zan_checker_t *c,
+                                                         zan_loc_t loc) {
+    zan_ast_node_t *id = zan_ast_new(c->arena, AST_IDENTIFIER, loc);
+    id->ident.name = checker_istr_lit(c->arena, "__ZanActionDispatch");
+    id->ident.inst_type_ref = NULL;
+    zan_ast_node_t *m = zan_ast_new(c->arena, AST_MEMBER_ACCESS, loc);
+    m->member.object = id;
+    m->member.name = checker_istr_lit(c->arena, "Dispatch");
+    m->member.null_cond = 0;
+    return m;
 }
 
 /* new TypeInfo[] { typeof(C1), typeof(C2), ... } */
