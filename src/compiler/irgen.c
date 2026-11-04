@@ -3810,24 +3810,41 @@ static bool class_has_virtual_methods(zan_symbol_t *sym) {
     return false;
 }
 
+static int method_declared_param_count(zan_symbol_t *m) {
+    if (!m || !m->decl || m->decl->kind != AST_METHOD_DECL) return -1;
+    return m->decl->method_decl.params.count;
+}
+
+static int get_virtual_method_index(zan_symbol_t *type_sym,
+                                    zan_symbol_t *method_sym);
+
+static bool method_introduces_virtual_slot(zan_symbol_t *type_sym, zan_symbol_t *m) {
+    if (!m || m->kind != SYM_METHOD) return false;
+    if ((m->modifiers & (MOD_VIRTUAL | MOD_ABSTRACT)) &&
+        !(m->modifiers & MOD_OVERRIDE)) {
+        return true;
+    }
+    if (m->modifiers & MOD_OVERRIDE) {
+        zan_symbol_t *base = (type_sym && type_sym->type && type_sym->type->base_type)
+            ? type_sym->type->base_type->sym : NULL;
+        if (!base || get_virtual_method_index(base, m) < 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static int count_virtual_methods(zan_symbol_t *sym) {
     int count = 0;
     if (sym->type && sym->type->base_type && sym->type->base_type->sym) {
         count = count_virtual_methods(sym->type->base_type->sym);
     }
     for (int i = 0; i < sym->member_count; i++) {
-        if (sym->members[i]->kind == SYM_METHOD &&
-            (sym->members[i]->modifiers & (MOD_VIRTUAL | MOD_ABSTRACT)) &&
-            !(sym->members[i]->modifiers & MOD_OVERRIDE)) {
+        if (method_introduces_virtual_slot(sym, sym->members[i])) {
             count++;
         }
     }
     return count;
-}
-
-static int method_declared_param_count(zan_symbol_t *m) {
-    if (!m || !m->decl || m->decl->kind != AST_METHOD_DECL) return -1;
-    return m->decl->method_decl.params.count;
 }
 
 static int get_virtual_method_index(zan_symbol_t *type_sym,
@@ -3845,9 +3862,7 @@ static int get_virtual_method_index(zan_symbol_t *type_sym,
     int idx = base_count;
     for (int i = 0; i < type_sym->member_count; i++) {
         zan_symbol_t *m = type_sym->members[i];
-        if (m->kind == SYM_METHOD &&
-            (m->modifiers & (MOD_VIRTUAL | MOD_ABSTRACT)) &&
-            !(m->modifiers & MOD_OVERRIDE)) {
+        if (method_introduces_virtual_slot(type_sym, m)) {
             if (member_name_is(m, method_sym->name) &&
                 method_declared_param_count(m) == want) {
                 return idx;

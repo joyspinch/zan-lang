@@ -119,6 +119,15 @@ static zan_type_t *builtin_call_result_type(zan_checker_t *c,
         name.len == 17 && memcmp(name.str, "GetValueOrDefault", 17) == 0) {
         return recv->element_type;
     }
+    if (recv->kind == TYPE_OBJECT || recv->kind == TYPE_CLASS ||
+        recv->kind == TYPE_INTERFACE) {
+        if (name.len == 8 && memcmp(name.str, "ToString", 8) == 0)
+            return c->binder->type_string;
+        if (name.len == 6 && memcmp(name.str, "Equals", 6) == 0)
+            return c->binder->type_bool;
+        if (name.len == 11 && memcmp(name.str, "GetHashCode", 11) == 0)
+            return c->binder->type_int;
+    }
     if (!bt) return NULL;
     if (zan_builtin_member_kind(bt, name.str, (int)name.len) != 'M') return NULL;
     const char *res = zan_builtin_member_result(bt, name.str, (int)name.len);
@@ -5286,7 +5295,14 @@ static int checker_call_target_member_state(zan_checker_t *c, zan_type_t *t,
                                               name.str, name.len))
                 return 1;
         }
-        return checker_type_has_member(t, name, 0) ? 1 : 0;
+        if (checker_type_has_member(t, name, 0)) return 1;
+        if ((t->kind == TYPE_CLASS || t->kind == TYPE_INTERFACE) && call && call->kind == AST_CALL) {
+            int argc = call->call.args.count;
+            if (name.len == 8 && memcmp(name.str, "ToString", 8) == 0 && argc == 0) return 1;
+            if (name.len == 6 && memcmp(name.str, "Equals", 6) == 0 && argc == 1) return 1;
+            if (name.len == 11 && memcmp(name.str, "GetHashCode", 11) == 0 && argc == 0) return 1;
+        }
+        return 0;
     default:
         break;
     }
@@ -5849,8 +5865,7 @@ static bool checker_base_has_virtual_slot(zan_symbol_t *base_sym,
     for (int i = 0; i < base_sym->member_count; i++) {
         zan_symbol_t *m = base_sym->members[i];
         if (m && m->kind == SYM_METHOD &&
-            (m->modifiers & MOD_VIRTUAL) &&
-            !(m->modifiers & MOD_OVERRIDE) &&
+            (m->modifiers & (MOD_VIRTUAL | MOD_OVERRIDE | MOD_ABSTRACT)) &&
             m->name.len == name.len &&
             memcmp(m->name.str, name.str, (size_t)name.len) == 0 &&
             checker_method_param_count(m) == arity)
