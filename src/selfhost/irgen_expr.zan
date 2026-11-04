@@ -48,6 +48,7 @@ partial class Irgen {
         if (k == AK.Index()) { return GenIndex(e); }
         if (k == AK.NewExpr()) { return GenNew(e); }
         if (k == AK.CastExpr()) { return GenCast(e); }
+        if (k == AK.AsExpr()) { return GenAs(e); }
         if (k == AK.AwaitExpr()) {
             diags.Error("async/await is parsed but not yet lowered by the self-host compiler", e.line, e.col);
             return GenExpr(e.a);
@@ -3018,15 +3019,31 @@ partial class Irgen {
         string tname = e.type.sval;
         string sty = obj.ty.sval;
         Node scls = binder.FindType(sty);
-        if (e.sval != "") {
+        string reg = "";
+        string plt = "";
+        if (e.sval != null && e.sval.Length > 0) {
             // the bound variable has the pattern's type: a class pointer, or
-            // i8* for `string` (strings are not an LLVM struct type)
-            string plt = MapType(e.type);
-            string reg = AddLocal(e.sval, e.type);
-            EA(reg, plt);
-            string bc = NT();
-            L("  " + bc + " = bitcast " + MapType(obj.ty) + " " + obj.op + " to " + plt);
-            L("  store " + plt + " " + bc + ", " + plt + "* " + reg);
+            // i8* for `string` (strings are not an LLVM struct type).
+            // A pattern variable borrows the tested value: mark it locRef so
+            // ReleaseLocalsFrom does not release it (the tested object is
+            // already released by its owner, matching C11 gen0 semantics).
+            plt = MapType(e.type);
+            int li = LocalIdx(e.sval);
+            if (li >= 0) {
+                reg = locReg[li];
+                locRef[li] = true;
+            } else {
+                reg = AddLocal(e.sval, e.type);
+                locRef[locName.Count - 1] = true;
+                if (ShouldBox(e.sval)) {
+                    reg = BoxLocal(locName.Count - 1);
+                } else {
+                    EA(reg, plt);
+                }
+            }
+            string nullLit = "null";
+            if (!IsPtrLL(plt)) { nullLit = "0"; }
+            L("  store " + plt + " " + nullLit + ", " + plt + "* " + reg);
         }
         string res;
         if (tname == "string") {
@@ -3054,6 +3071,24 @@ partial class Irgen {
                 // a downcast: the runtime class id decides
                 res = Bool64(EmitClassIdTest(obj, tname));
             }
+        }
+        if (e.sval != null && e.sval.Length > 0) {
+            string bc = obj.op;
+            if (MapType(obj.ty) != plt) {
+                if (IsPtrLL(MapType(obj.ty)) && IsPtrLL(plt)) {
+                    bc = NT();
+                    L("  " + bc + " = bitcast " + MapType(obj.ty) + " " + obj.op + " to " + plt);
+                } else {
+                    bc = Coerce(obj, plt);
+                }
+            }
+            string nullLit = "null";
+            if (!IsPtrLL(plt)) { nullLit = "0"; }
+            string isOk = NT();
+            L("  " + isOk + " = icmp ne i64 " + res + ", 0");
+            string safe = NT();
+            L("  " + safe + " = select i1 " + isOk + ", " + plt + " " + bc + ", " + plt + " " + nullLit);
+            L("  store " + plt + " " + safe + ", " + plt + "* " + reg);
         }
         if (e.op == 1) {
             // `x is not T`: negate the test
@@ -4690,6 +4725,47 @@ partial class Irgen {
         return new ExprVal(v.op, tgt);
     }
 
+    // x as T -- like gen0: upcasts/identity and object targets pass the value
+    // through; a downcast or dynamic type test consults the runtime class id
+    // (or string id) and yields null on failure without throwing.
+    ExprVal GenAs(Node e) {
+        ExprVal v = GenExpr(e.a);
+        if (e.type == null || v == null) { return v; }
+        Node tgt = e.type;
+        string tll = MapType(tgt);
+        if (v.ty != null && tgt.ival < 1 && IsPtrLL(MapType(v.ty)) && IsPtrLL(tll)) {
+            string tn = tgt.sval;
+            Node tc = binder.FindType(tn);
+            bool refTarget = tn == "string" || tn == "object" || IsContainerType(tn)
+                || (tc != null && tc.kind == AK.ClassDecl());
+            bool staticOk = tn == "object" || v.ty.sval == tn || IsSubclassName(v.ty.sval, tn);
+            if (staticOk) {
+                string cv = v.op;
+                if (MapType(v.ty) != tll) {
+                    string b = NT();
+                    L("  " + b + " = bitcast " + MapType(v.ty) + " " + v.op + " to " + tll);
+                    cv = b;
+                }
+                return new ExprVal(cv, tgt);
+            }
+            if (refTarget) {
+                string ok;
+                if (tn == "string") { ok = EmitStringIdTest(v); }
+                else { ok = EmitClassIdTest(v, tn); }
+                string cv = v.op;
+                if (MapType(v.ty) != tll) {
+                    string b = NT();
+                    L("  " + b + " = bitcast " + MapType(v.ty) + " " + v.op + " to " + tll);
+                    cv = b;
+                }
+                string safe = NT();
+                L("  " + safe + " = select i1 " + ok + ", " + tll + " " + cv + ", " + tll + " null");
+                return new ExprVal(safe, tgt);
+            }
+        }
+        return v;
+    }
+
     // ---- integer width at typed locations ----
     // The C host keeps an integer value in a 64-bit slot, but a value that
     // enters a *typed location* (a variable, a field, an argument, a return
@@ -5338,6 +5414,9 @@ partial class Irgen {
         if (n == null) { return; }
         if (n.kind == AK.VarDecl()) { if (!Contains(outv, n.sval)) { outv.Add(n.sval); } }
         if (n.kind == AK.Param()) { if (!Contains(outv, n.sval)) { outv.Add(n.sval); } }
+        if (n.kind == AK.IsExpr() && n.sval != null && n.sval.Length > 0) {
+            if (!Contains(outv, n.sval)) { outv.Add(n.sval); }
+        }
         CollectDeclared(n.a, outv); CollectDeclared(n.b, outv);
         CollectDeclared(n.c, outv); CollectDeclared(n.d, outv);
         int i = 0;
