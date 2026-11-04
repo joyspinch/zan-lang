@@ -1413,6 +1413,32 @@ add_test(NAME diag_html_input_rejected
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_html_input_rejected PROPERTIES TIMEOUT 60)
 
+# B-ID147：DocApp 引导的两条边界。用户写了 static Main 时入口 shim
+# 不合成（Main 整体优先——__DesignMain 回退语义），探针的 Bootstrap
+# 调用放在永不执行的死方法里，跑出 USER_MAIN_WINS 即 Main 赢了；
+# 既有 Main 又无 Bootstrap 的程序维持现行缺入口链接错误。
+add_test(NAME conformance_gui_docapp_user_main
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/docapp_user_main.zan
+    "-DZANC_ARGS=--auto-stdlib${_gui_driver_tail}"
+    -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_docapp_user_main.out
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_docapp_user_main${_exe_ext}
+    -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+set_tests_properties(conformance_gui_docapp_user_main PROPERTIES
+    TIMEOUT 120 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+
+add_test(NAME diag_docapp_no_entry
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/docapp_no_entry.zan
+    "-DZANC_ARGS=--auto-stdlib"
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/diag_docapp_no_entry${_exe_ext}
+    "-DEXPECT_REGEX=undefined reference to .WinMain."
+    -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
+set_tests_properties(diag_docapp_no_entry PROPERTIES TIMEOUT 120)
+
+
 # A class that declares constructors has no implicit parameterless one, so
 # `new T()` on it has nothing to run and irgen would hand back a zero-filled
 # object that faults on its first use (the Help page's designed Card).
