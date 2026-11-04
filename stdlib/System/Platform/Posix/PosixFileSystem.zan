@@ -1,0 +1,246 @@
+using System;
+
+namespace System.Platform;
+
+#if !WINDOWS
+// POSIX (Linux / macOS / WASI) 原生文件与路径系统实现。
+public class PosixFileSystem : IPlatformFileSystem {
+    public bool IsCaseSensitive() {
+        return true;
+    }
+
+    [DllImport("crt", EntryPoint = "opendir")]
+    static extern nint opendir(string name);
+
+    [DllImport("crt", EntryPoint = "readdir")]
+    static extern nint readdir(nint dirp);
+
+    [DllImport("crt", EntryPoint = "closedir")]
+    static extern int closedir(nint dirp);
+
+    [DllImport("crt", EntryPoint = "readlink")]
+    static extern long readlink(string path, byte[] buf, int size);
+
+    [DllImport("crt", EntryPoint = "mkdir")]
+    static extern int posix_mkdir(string path, int mode);
+
+    [DllImport("crt", EntryPoint = "rmdir")]
+    static extern int posix_rmdir(string path);
+
+    [DllImport("crt", EntryPoint = "chdir")]
+    static extern int posix_chdir(string path);
+
+    [DllImport("crt", EntryPoint = "getcwd")]
+    static extern string posix_getcwd(byte[] buf, int size);
+
+    [DllImport("crt", EntryPoint = "chmod")]
+    static extern int posix_chmod(string path, int mode);
+
+    [DllImport("crt", EntryPoint = "access")]
+    static extern int posix_access(string path, int mode);
+
+    [DllImport("crt", EntryPoint = "link")]
+    static extern int posix_link(string existing, string newLink);
+
+    [DllImport("crt", EntryPoint = "zan_file_remove")]
+    static extern int zan_file_remove(string path);
+
+    [DllImport("crt", EntryPoint = "zan_file_rename")]
+    static extern int zan_file_rename(string oldname, string newname);
+
+    [DllImport("crt", EntryPoint = "zan_file_length")]
+    static extern long zan_file_length(string path);
+
+    [DllImport("crt", EntryPoint = "zan_file_attributes")]
+    static extern int zan_file_attributes(string path);
+
+    [DllImport("crt", EntryPoint = "zan_file_set_time")]
+    static extern int zan_file_set_time(string path, int which, long unixSec);
+
+    [DllImport("crt", EntryPoint = "zan_file_try_lock")]
+    static extern long zan_file_try_lock(string path);
+
+    [DllImport("crt", EntryPoint = "zan_file_unlock")]
+    static extern int zan_file_unlock(long handle);
+
+    #if WASI
+    static int direntTypeOffset() { return 8; }
+    static int direntNameOffset() { return 9; }
+    static int direntDirType() { return 3; }
+    #elif MACOS
+    static int direntTypeOffset() { return 20; }
+    static int direntNameOffset() { return 21; }
+    static int direntDirType() { return 4; }
+    #else
+    static int direntTypeOffset() { return 18; }
+    static int direntNameOffset() { return 19; }
+    static int direntDirType() { return 4; }
+    #endif
+
+    static string posixName(nint ent) {
+        if (ent == 0) { return ""; }
+        int nameOff = direntNameOffset();
+        Span<byte> sp = new Span<byte>(ent, nameOff + 256);
+        int n = 0;
+        while (n < 255 && (sp[nameOff + n] & 255) != 0) {
+            n = n + 1;
+        }
+        if (n == 0) { return ""; }
+        byte[] b = new byte[n];
+        for (int i = 0; i < n; i = i + 1) {
+            b[i] = sp[nameOff + i];
+        }
+        return b.ToStr(0, n);
+    }
+
+    public bool DirectoryExists(string path) {
+        if (path == null) { return false; }
+        nint d = opendir(path);
+        if (d == 0) { return false; }
+        closedir(d);
+        return true;
+    }
+
+    public void CreateDirectory(string path) {
+        if (path == null || path.Length == 0) { return; }
+        posix_mkdir(path, 511); // 0777 octal
+    }
+
+    public void DeleteDirectory(string path) {
+        if (path == null) { return; }
+        posix_rmdir(path);
+    }
+
+    public string GetCurrentDirectory() {
+        byte[] b = new byte[4096];
+        posix_getcwd(b, 4096);
+        int n = 0;
+        for (; n < 4096 && (b[n] & 255) != 0; n = n + 1) { }
+        return b.ToStr(0, n);
+    }
+
+    public void SetCurrentDirectory(string path) {
+        if (path == null) { return; }
+        posix_chdir(path);
+    }
+
+    public List<string> GetLogicalDrives() {
+        List<string> roots = new List<string>();
+        roots.Add("/");
+        return roots;
+    }
+
+    public List<PlatformFileEntry> EnumerateEntries(string path, bool wantDirs, bool includeHidden) {
+        List<PlatformFileEntry> result = new List<PlatformFileEntry>();
+        if (path == null) { return result; }
+        nint dirp = opendir(path);
+        if (dirp == 0) { return result; }
+        try {
+            int typeOff = direntTypeOffset();
+            int dirType = direntDirType();
+            byte[] linkProbeBuf = new byte[256];
+
+            nint ent = readdir(dirp);
+            while (ent != 0) {
+                string name = posixName(ent);
+                Span<byte> sp = new Span<byte>(ent, typeOff + 1);
+                int dt = sp[typeOff] & 255;
+
+                // 符号链接（Linux DT_LNK=10，Darwin/WASI=7）降级按普通文件处理，防止误递归
+                bool isSymlink = dt == 10 || dt == 7;
+                if (dt == 0 && name != "." && name != "..") {
+                    string fullPath = path + "/" + name;
+                    long sz = readlink(fullPath, linkProbeBuf, 256);
+                    if (sz > 0) {
+                        isSymlink = true;
+                    }
+                }
+
+                bool isDir = !isSymlink && (dt == dirType);
+                bool hidden = name.Length > 0 && name[0] == '.';
+
+                if (name != "." && name != ".."
+                    && isDir == wantDirs
+                    && (includeHidden || !hidden)) {
+                    int normAttrs = (isDir ? 4 : 0) | (hidden ? 2 : 0);
+                    result.Add(new PlatformFileEntry(name, normAttrs, 0, 0));
+                }
+                ent = readdir(dirp);
+            }
+        } finally {
+            closedir(dirp);
+        }
+        return result;
+    }
+
+    public bool FileExists(string path) {
+        if (path == null) { return false; }
+        int attrs = zan_file_attributes(path);
+        if (attrs == -1) { return false; }
+        return (attrs & 4) == 0;
+    }
+
+    public void DeleteFile(string path) {
+        if (path == null) { return; }
+        zan_file_remove(path);
+    }
+
+    public void Move(string src, string dst, bool overwrite) {
+        zan_file_rename(src, dst);
+    }
+
+    public long GetLength(string path) {
+        return zan_file_length(path);
+    }
+
+    public int GetAttributes(string path) {
+        return zan_file_attributes(path);
+    }
+
+    public bool SetAttributes(string path, int attrs) {
+        return false;
+    }
+
+    public long GetTime(string path, int which) {
+        return 0;
+    }
+
+    public bool SetTime(string path, int which, long unixSec) {
+        return zan_file_set_time(path, which, unixSec) == 1;
+    }
+
+    public bool CreateHardLink(string link, string target) {
+        if (link == null || target == null) { return false; }
+        return posix_link(target, link) == 0;
+    }
+
+    public bool IsSymlink(string path) {
+        if (path == null) { return false; }
+        byte[] buf = new byte[256];
+        return readlink(path, buf, 256) > 0;
+    }
+
+    public bool IsReparsePoint(string path) {
+        return false;
+    }
+
+    public bool SetExecutable(string path, bool on) {
+        if (!this.FileExists(path)) { return false; }
+        int mode = on ? 493 : 420; // 0755 / 0644
+        return posix_chmod(path, mode) == 0;
+    }
+
+    public bool IsExecutable(string path) {
+        if (!this.FileExists(path)) { return false; }
+        return posix_access(path, 1 /* X_OK */) == 0;
+    }
+
+    public long TryLock(string path) {
+        return zan_file_try_lock(path);
+    }
+
+    public bool Unlock(long lockHandle) {
+        return zan_file_unlock(lockHandle) == 1;
+    }
+}
+#endif

@@ -1,4 +1,5 @@
 using System;
+using System.Platform;
 
 namespace System.IO;
 
@@ -246,72 +247,25 @@ public class File {
         return zan_file_unlock(handle) != 0;
     }
 
-    #if !WINDOWS
-    [DllImport("crt")]
-    public static extern int chmod(string path, int mode);
-
-    [DllImport("crt")]
-    public static extern int access(string path, int mode);
-    #endif
-
-    // 设置或清除文件的可执行位。POSIX 上按 owner/group/other
-    // 的当前可读位加上（或去掉）对应的 x 位；Windows 没有可执行位
-    // （可执行性由扩展名决定），返回 true 且不做修改。
+    // 设置或清除文件的可执行位（委托 PAL 平台实现）。
     public static bool SetExecutable(string path, bool on) {
-        #if WINDOWS
-        return File.Exists(path);
-        #else
-        if (!File.Exists(path)) { return false; }
-        // 0755 / 0644：可执行时给所有能读的角色加 x。
-        int mode = on ? 493 : 420;
-        return chmod(path, mode) == 0;
-        #endif
+        return Pal.FileSystem.SetExecutable(path, on);
     }
 
-    // 文件存在且当前用户可执行时返回 true。
-    // Windows 上退化为按扩展名判断（.exe/.bat/.cmd/.com）。
+    // 文件存在且当前用户可执行时返回 true（委托 PAL 平台实现）。
     public static bool IsExecutable(string path) {
-        #if WINDOWS
-        string lower = path.ToLower();
-        if (!File.Exists(path)) { return false; }
-        return lower.EndsWith(".exe") || lower.EndsWith(".bat")
-        || lower.EndsWith(".cmd") || lower.EndsWith(".com");
-        #else
-        if (!File.Exists(path)) { return false; }
-        return access(path, 1 /*X_OK*/) == 0;
-        #endif
+        return Pal.FileSystem.IsExecutable(path);
     }
 
-    #if WINDOWS
-    // UTF-8 路径的 Win32 文件属性；路径不存在（INVALID_FILE_ATTRIBUTES）
-    // 与查询失败统一归 -1。
+    // UTF-8 路径的文件属性；路径不存在与查询失败统一归 -1。
     public static int AttrsOfUtf8(string path) {
-        nint wpath = Wide.Of(path);
-        int attrs = GetFileAttributesW(wpath);
-        Wide.Free(wpath);
-        if (attrs == -1 || attrs == 4294967295) { return -1; }
-        return attrs;
+        return Pal.FileSystem.GetAttributes(path);
     }
-    #endif
 
     // 删除指定路径的文件。路径是 reparse point（目录
-    // junction、符号链接）时删链接本身：junction/symlink-to-dir 带
-    // 目录位，remove() 把它当目录拒绝、DeleteFileW 又会拒绝目录位，
-    // 只有 RemoveDirectoryW/DeleteFileW 按位二选一才能拆掉 reparse
-    // point 而不进入目标（POSIX 的 remove/unlink 本来就只摘链接，
-    // 无需特判）。
+    // junction、符号链接）时删链接本身（委托 PAL 平台实现）。
     public static void Delete(string path) {
-        #if WINDOWS
-        int attrs = File.AttrsOfUtf8(path);
-        if (attrs >= 0 && (attrs & 0x400) != 0) {
-            nint wpath = Wide.Of(path);
-            if ((attrs & 16) != 0) { WinRemoveDirectory(wpath); }
-            else { WinDeleteFile(wpath); }
-            Wide.Free(wpath);
-            return;
-        }
-        #endif
-        remove(path);
+        Pal.FileSystem.DeleteFile(path);
     }
 
     // 移动（重命名）文件。源不存在抛 FileNotFoundException；
@@ -657,68 +611,32 @@ public class File {
     [DllImport("crt")]
     public static extern long zan_file_set_time(string path, int which, long unixSec);
 
-    #if WINDOWS
-    [DllImport("kernel32", EntryPoint = "CreateHardLinkW")]
-    public static extern int CreateHardLinkW(nint link, nint target, nint secAttrs);
-
-    [DllImport("kernel32", EntryPoint = "GetFileAttributesW")]
-    public static extern int GetFileAttributesW(nint path);
-
-    [DllImport("kernel32", EntryPoint = "DeleteFileW")]
-    public static extern int WinDeleteFile(nint path);
-
-    [DllImport("kernel32", EntryPoint = "RemoveDirectoryW")]
-    public static extern int WinRemoveDirectory(nint path);
-    #endif
-
-    #if !WINDOWS
-    [DllImport("crt")]
-    public static extern int link(string existing, string newLink);
-    #endif
-
     // 将最后写入时间设置为 Unix 时间戳（秒）。
     // 文件不存在或平台无法设置时返回 false。
     public static bool SetLastWriteTime(string path, long unixSec) {
-        return File.zan_file_set_time(path, 0, unixSec) == 1;
+        return Pal.FileSystem.SetTime(path, 0, unixSec);
     }
 
     // 将最后访问时间设置为 Unix 时间戳（秒）。
     public static bool SetLastAccessTime(string path, long unixSec) {
-        return File.zan_file_set_time(path, 2, unixSec) == 1;
+        return Pal.FileSystem.SetTime(path, 2, unixSec);
     }
 
     // 设置创建时间（仅 Windows；其他平台返回 false）。
     public static bool SetCreationTime(string path, long unixSec) {
-        return File.zan_file_set_time(path, 1, unixSec) == 1;
+        return Pal.FileSystem.SetTime(path, 1, unixSec);
     }
 
     // 在 link 创建指向已有文件 target 的硬链接。
     // 链接创建失败时返回 false（目标不存在、跨卷、权限不足）。
     public static bool CreateHardLink(string link, string target) {
-        #if WINDOWS
-        nint wlink = Wide.Of(link);
-        nint wtarget = Wide.Of(target);
-        int ok = File.CreateHardLinkW(wlink, wtarget, 0);
-        Wide.Free(wlink);
-        Wide.Free(wtarget);
-        return ok != 0;
-        #else
-        return File.link(target, link) == 0;
-        #endif
+        return Pal.FileSystem.CreateHardLink(link, target);
     }
 
     // 当 path 是 reparse point（目录 junction、符号链接或 OneDrive 占位文件）时返回 true。
     // 仅 Windows；其他平台返回 false。
     public static bool IsReparsePoint(string path) {
-        #if WINDOWS
-        nint wpath = Wide.Of(path);
-        int attrs = File.GetFileAttributesW(wpath);
-        Wide.Free(wpath);
-        if (attrs == -1) { return false; }
-        return (attrs & 0x400) != 0;
-        #else
-        return false;
-        #endif
+        return Pal.FileSystem.IsReparsePoint(path);
     }
 
     // 根据文件扩展名（转小写）猜测 MIME 类型。未知扩展名回退为 application/octet-stream。

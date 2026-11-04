@@ -1,0 +1,283 @@
+using System;
+using System.Interop;
+
+namespace System.Platform;
+
+#if WINDOWS
+// Windows Win32 原生文件与路径系统实现。
+public class WindowsFileSystem : IPlatformFileSystem {
+    public bool IsCaseSensitive() {
+        return false;
+    }
+
+    [DllImport("kernel32", EntryPoint = "GetFileAttributesW")]
+    static extern int WinGetFileAttributes(nint path);
+
+    [DllImport("kernel32", EntryPoint = "CreateDirectoryW")]
+    static extern int WinCreateDirectory(nint path, nint secAttrs);
+
+    [DllImport("kernel32", EntryPoint = "RemoveDirectoryW")]
+    static extern int WinRemoveDirectory(nint path);
+
+    [DllImport("kernel32", EntryPoint = "GetCurrentDirectoryW")]
+    static extern int WinGetCurrentDirectory(int bufLen, nint buf);
+
+    [DllImport("kernel32", EntryPoint = "SetCurrentDirectoryW")]
+    static extern int WinSetCurrentDirectory(nint path);
+
+    [DllImport("kernel32", EntryPoint = "FindFirstFileW")]
+    static extern nint WinFindFirstFile(nint pattern, nint findData);
+
+    [DllImport("kernel32", EntryPoint = "FindNextFileW")]
+    static extern int WinFindNextFile(nint handle, nint findData);
+
+    [DllImport("kernel32", EntryPoint = "FindClose")]
+    static extern int WinFindClose(nint handle);
+
+    [DllImport("kernel32", EntryPoint = "GetLogicalDrives")]
+    static extern int WinGetLogicalDrives();
+
+    [DllImport("kernel32", EntryPoint = "CreateHardLinkW")]
+    static extern int WinCreateHardLink(nint link, nint target, nint secAttrs);
+
+    [DllImport("kernel32", EntryPoint = "DeleteFileW")]
+    static extern int WinDeleteFile(nint path);
+
+    [DllImport("crt", EntryPoint = "zan_file_remove")]
+    static extern int zan_file_remove(string path);
+
+    [DllImport("crt", EntryPoint = "zan_file_rename")]
+    static extern int zan_file_rename(string oldname, string newname);
+
+    [DllImport("crt", EntryPoint = "zan_file_length")]
+    static extern long zan_file_length(string path);
+
+    [DllImport("crt", EntryPoint = "zan_file_attributes")]
+    static extern int zan_file_attributes(string path);
+
+    [DllImport("crt", EntryPoint = "zan_file_set_time")]
+    static extern int zan_file_set_time(string path, int which, long unixSec);
+
+    [DllImport("crt", EntryPoint = "zan_file_try_lock")]
+    static extern long zan_file_try_lock(string path);
+
+    [DllImport("crt", EntryPoint = "zan_file_unlock")]
+    static extern int zan_file_unlock(long handle);
+
+    static int WinAttributes(string path) {
+        if (path == null) { return -1; }
+        nint wide = Wide.Of(path);
+        if (wide == 0) { return -1; }
+        int attrs = WinGetFileAttributes(wide);
+        Wide.Free(wide);
+        if (attrs == -1 || attrs == 4294967295) { return -1; }
+        return attrs;
+    }
+
+    public bool DirectoryExists(string path) {
+        int attrs = WinAttributes(path);
+        if (attrs == -1) { return false; }
+        return (attrs & 16) != 0;
+    }
+
+    public void CreateDirectory(string path) {
+        if (path == null || path.Length == 0) { return; }
+        nint wide = Wide.Of(path);
+        if (wide != 0) {
+            WinCreateDirectory(wide, 0);
+            Wide.Free(wide);
+        }
+    }
+
+    public void DeleteDirectory(string path) {
+        if (path == null) { return; }
+        nint wide = Wide.Of(path);
+        if (wide != 0) {
+            WinRemoveDirectory(wide);
+            Wide.Free(wide);
+        }
+    }
+
+    public string GetCurrentDirectory() {
+        nint wide = NativeMemory.Alloc(8192);
+        string buf = "";
+        try {
+            WinGetCurrentDirectory(4096, wide);
+            buf = Wide.Read(wide);
+        } finally {
+            NativeMemory.Free(wide);
+        }
+        return buf;
+    }
+
+    public void SetCurrentDirectory(string path) {
+        if (path == null) { return; }
+        nint wide = Wide.Of(path);
+        if (wide != 0) {
+            WinSetCurrentDirectory(wide);
+            Wide.Free(wide);
+        }
+    }
+
+    public List<string> GetLogicalDrives() {
+        List<string> roots = new List<string>();
+        int mask = WinGetLogicalDrives();
+        string letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+        for (int i = 0; i < 26; i = i + 1) {
+            if ((mask & 1) != 0) {
+                roots.Add(letters.Substring(i, 1) + ":/");
+            }
+            mask = mask / 2;
+        }
+        return roots;
+    }
+
+    public List<PlatformFileEntry> EnumerateEntries(string path, bool wantDirs, bool includeHidden) {
+        List<PlatformFileEntry> result = new List<PlatformFileEntry>();
+        string pattern = path + "\\*";
+        nint widePattern = Wide.Of(pattern);
+        nint findData = NativeMemory.Alloc(592);
+        try {
+            nint handle = -1;
+            if (widePattern != 0) {
+                handle = WinFindFirstFile(widePattern, findData);
+                Wide.Free(widePattern);
+                widePattern = 0;
+            }
+            if (handle != -1) {
+                try {
+                    bool more = true;
+                    while (more) {
+                        string fname = Wide.Read(findData + 44);
+                        Span<byte> attr = new Span<byte>(findData, 4);
+                        int rawAttrs = attr[0] + attr[1] * 256 + attr[2] * 65536 + attr[3] * 16777216;
+
+                        // Junction / Symlink (1024) 降级按普通文件收，避免误递归
+                        bool isDir = (rawAttrs & 1024) == 0 && (rawAttrs & 16) != 0;
+                        bool hidden = (rawAttrs & 2) != 0;
+                        bool readOnly = (rawAttrs & 1) != 0;
+
+                        if (fname != "." && fname != ".."
+                            && isDir == wantDirs
+                            && (includeHidden || !hidden)) {
+                            // 换算 64 位文件尺寸（nFileSizeHigh @ 28, nFileSizeLow @ 32）
+                            Span<byte> szSpan = new Span<byte>(findData + 28, 8);
+                            long high = szSpan[0] + szSpan[1] * 256 + szSpan[2] * 65536 + szSpan[3] * 16777216;
+                            long low = szSpan[4] + szSpan[5] * 256 + szSpan[6] * 65536 + szSpan[7] * 16777216;
+                            long length = (high * 4294967296L) + low;
+
+                            // 换算最后写入时间（ftLastWriteTime @ 20，100ns 间隔转 Unix 秒）
+                            Span<byte> ftSpan = new Span<byte>(findData + 20, 8);
+                            long ftHigh = ftSpan[4] + ftSpan[5] * 256 + ftSpan[6] * 65536 + ftSpan[7] * 16777216;
+                            long ftLow = ftSpan[0] + ftSpan[1] * 256 + ftSpan[2] * 65536 + ftSpan[3] * 16777216;
+                            long ft = (ftHigh * 4294967296L) + ftLow;
+                            long unixSec = 0;
+                            if (ft > 116444736000000000L) {
+                                unixSec = (ft - 116444736000000000L) / 10000000L;
+                            }
+
+                            int normAttrs = (isDir ? 4 : 0) | (hidden ? 2 : 0) | (readOnly ? 1 : 0);
+                            result.Add(new PlatformFileEntry(fname, normAttrs, length, unixSec));
+                        }
+                        if (WinFindNextFile(handle, findData) == 0) {
+                            more = false;
+                        }
+                    }
+                } finally {
+                    WinFindClose(handle);
+                }
+            }
+        } finally {
+            if (widePattern != 0) { Wide.Free(widePattern); }
+            NativeMemory.Free(findData);
+        }
+        return result;
+    }
+
+    public bool FileExists(string path) {
+        int attrs = WinAttributes(path);
+        if (attrs == -1) { return false; }
+        return (attrs & 16) == 0;
+    }
+
+    public void DeleteFile(string path) {
+        if (path == null) { return; }
+        int attrs = WinAttributes(path);
+        // Reparse point (Junction/软链接) 特判，避免误报拒
+        if (attrs >= 0 && (attrs & 0x400) != 0) {
+            nint wpath = Wide.Of(path);
+            if ((attrs & 16) != 0) {
+                WinRemoveDirectory(wpath);
+            } else {
+                WinDeleteFile(wpath);
+            }
+            Wide.Free(wpath);
+            return;
+        }
+        zan_file_remove(path);
+    }
+
+    public void Move(string src, string dst, bool overwrite) {
+        zan_file_rename(src, dst);
+    }
+
+    public long GetLength(string path) {
+        return zan_file_length(path);
+    }
+
+    public int GetAttributes(string path) {
+        return zan_file_attributes(path);
+    }
+
+    public bool SetAttributes(string path, int attrs) {
+        return false;
+    }
+
+    public long GetTime(string path, int which) {
+        return 0;
+    }
+
+    public bool SetTime(string path, int which, long unixSec) {
+        return zan_file_set_time(path, which, unixSec) == 1;
+    }
+
+    public bool CreateHardLink(string link, string target) {
+        if (link == null || target == null) { return false; }
+        nint wlink = Wide.Of(link);
+        nint wtarget = Wide.Of(target);
+        int ok = WinCreateHardLink(wlink, wtarget, 0);
+        Wide.Free(wlink);
+        Wide.Free(wtarget);
+        return ok != 0;
+    }
+
+    public bool IsSymlink(string path) {
+        return this.IsReparsePoint(path);
+    }
+
+    public bool IsReparsePoint(string path) {
+        int attrs = WinAttributes(path);
+        if (attrs == -1) { return false; }
+        return (attrs & 0x400) != 0;
+    }
+
+    public bool SetExecutable(string path, bool on) {
+        return this.FileExists(path);
+    }
+
+    public bool IsExecutable(string path) {
+        if (!this.FileExists(path)) { return false; }
+        string lower = path.ToLower();
+        return lower.EndsWith(".exe") || lower.EndsWith(".bat")
+            || lower.EndsWith(".cmd") || lower.EndsWith(".com");
+    }
+
+    public long TryLock(string path) {
+        return zan_file_try_lock(path);
+    }
+
+    public bool Unlock(long lockHandle) {
+        return zan_file_unlock(lockHandle) == 1;
+    }
+}
+#endif
