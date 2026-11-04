@@ -1,0 +1,218 @@
+#if !WINDOWS
+using System;
+
+namespace System.Platform;
+
+// POSIX 平台的线程休眠与底层同步原语实现（基于 usleep、pthread_mutex_t 与 GCD/sem_t 信号量）。
+public class PosixThreading : IPlatformThreading {
+    #if WASI
+    public void Sleep(int milliseconds) {}
+    public nint CreateMutex() { return -1; }
+    public void LockMutex(nint handle) {}
+    public void UnlockMutex(nint handle) {}
+    public void DestroyMutex(nint handle) {}
+    public nint CreateSemaphore(int initialCount, int maxCount) { return -1; }
+    public void WaitSemaphore(nint handle) {}
+    public bool WaitForSemaphore(nint handle, int timeoutMs) { return false; }
+    public void ReleaseSemaphore(nint handle) {}
+    public void DestroySemaphore(nint handle) {}
+    #else
+
+    [DllImport("crt", EntryPoint = "usleep")]
+    private static extern int PosixUsleep(int microseconds);
+
+    [DllImport("crt", EntryPoint = "calloc")]
+    private static extern nint PosixCalloc(long count, long size);
+
+    [DllImport("crt", EntryPoint = "free")]
+    private static extern void PosixFree(nint ptr);
+
+    [DllImport("crt", EntryPoint = "pthread_mutex_init")]
+    private static extern int PosixMutexInit(nint mutex, nint attr);
+
+    [DllImport("crt", EntryPoint = "pthread_mutex_lock")]
+    private static extern int PosixMutexLock(nint mutex);
+
+    [DllImport("crt", EntryPoint = "pthread_mutex_unlock")]
+    private static extern int PosixMutexUnlock(nint mutex);
+
+    [DllImport("crt", EntryPoint = "pthread_mutex_destroy")]
+    private static extern int PosixMutexDestroy(nint mutex);
+
+    #if MACOS || IOS
+    [DllImport("crt", EntryPoint = "dispatch_semaphore_create")]
+    private static extern nint MacSemCreate(int initValue);
+
+    [DllImport("crt", EntryPoint = "dispatch_semaphore_wait")]
+    private static extern int MacSemWait(nint sem, long timeout);
+
+    [DllImport("crt", EntryPoint = "dispatch_semaphore_signal")]
+    private static extern int MacSemSignal(nint sem);
+
+    [DllImport("crt", EntryPoint = "dispatch_release")]
+    private static extern void MacSemRelease(nint sem);
+
+    [DllImport("crt", EntryPoint = "dispatch_semaphore_wait")]
+    private static extern int MacSemWaitUntil(nint sem, long deadline);
+
+    [DllImport("crt", EntryPoint = "dispatch_time")]
+    private static extern long MacDispatchTime(long baseTime, long deltaNs);
+    #else
+    [DllImport("crt", EntryPoint = "sem_init")]
+    private static extern int LinuxSemInit(nint sem, int pshared, int initValue);
+
+    [DllImport("crt", EntryPoint = "sem_wait")]
+    private static extern int LinuxSemWait(nint sem);
+
+    [DllImport("crt", EntryPoint = "sem_post")]
+    private static extern int LinuxSemPost(nint sem);
+
+    [DllImport("crt", EntryPoint = "sem_destroy")]
+    private static extern int LinuxSemDestroy(nint sem);
+
+    [DllImport("crt", EntryPoint = "sem_timedwait")]
+    private static extern int LinuxSemTimedWait(nint sem, nint absTime);
+
+    [DllImport("crt", EntryPoint = "clock_gettime")]
+    private static extern int LinuxClockGettime(int clkId, nint tp);
+
+    #if ANDROID
+    [DllImport("crt", EntryPoint = "__errno")]
+    private static extern nint PosixErrnoLocation();
+    #else
+    [DllImport("crt", EntryPoint = "__errno_location")]
+    private static extern nint PosixErrnoLocation();
+    #endif
+
+    private static int LinuxSemErrno() {
+        nint loc = PosixThreading.PosixErrnoLocation();
+        if (loc != 0) {
+            return new Span<int>(loc, 1)[0];
+        }
+        return 0;
+    }
+    #endif
+
+    public static void SleepDirect(int milliseconds) {
+        #if !WASI
+        if (milliseconds > 0) {
+            PosixThreading.PosixUsleep(milliseconds * 1000);
+        }
+        #endif
+    }
+
+    public void Sleep(int milliseconds) {
+        PosixThreading.SleepDirect(milliseconds);
+    }
+
+    public nint CreateMutex() {
+        nint mtx = PosixThreading.PosixCalloc(1, 64);
+        if (mtx != 0) {
+            PosixThreading.PosixMutexInit(mtx, 0);
+        }
+        return mtx;
+    }
+
+    public void LockMutex(nint handle) {
+        if (handle != 0) {
+            PosixThreading.PosixMutexLock(handle);
+        }
+    }
+
+    public void UnlockMutex(nint handle) {
+        if (handle != 0) {
+            PosixThreading.PosixMutexUnlock(handle);
+        }
+    }
+
+    public void DestroyMutex(nint handle) {
+        if (handle != 0) {
+            PosixThreading.PosixMutexDestroy(handle);
+            PosixThreading.PosixFree(handle);
+        }
+    }
+
+    public nint CreateSemaphore(int initialCount, int maxCount) {
+        #if MACOS || IOS
+        return PosixThreading.MacSemCreate(initialCount);
+        #else
+        nint sem = PosixThreading.PosixCalloc(1, 64);
+        if (sem != 0) {
+            PosixThreading.LinuxSemInit(sem, 0, initialCount);
+        }
+        return sem;
+        #endif
+    }
+
+    public void WaitSemaphore(nint handle) {
+        if (handle == 0) { return; }
+        #if MACOS || IOS
+        PosixThreading.MacSemWait(handle, -1);
+        #else
+        while (PosixThreading.LinuxSemWait(handle) != 0) {
+            if (PosixThreading.LinuxSemErrno() != 4) { return; } // EINTR = 4
+        }
+        #endif
+    }
+
+    public bool WaitForSemaphore(nint handle, int timeoutMs) {
+        if (handle == 0) { return false; }
+        if (timeoutMs < 0) {
+            this.WaitSemaphore(handle);
+            return true;
+        }
+        #if MACOS || IOS
+        long deadline = PosixThreading.MacDispatchTime(0, (long)timeoutMs * 1000000);
+        return PosixThreading.MacSemWaitUntil(handle, deadline) == 0;
+        #else
+        nint ts = NativeMemory.Alloc(16);
+        if (ts == 0) { return false; }
+        bool ok = false;
+        try {
+            while (true) {
+                PosixThreading.LinuxClockGettime(0, ts); // CLOCK_REALTIME = 0
+                Span<long> s = new Span<long>(ts, 2);
+                long sec = s[0];
+                long nsec = s[1] + (long)timeoutMs * 1000000;
+                sec = sec + nsec / 1000000000;
+                nsec = nsec % 1000000000;
+                s[0] = sec;
+                s[1] = nsec;
+                int r = PosixThreading.LinuxSemTimedWait(handle, ts);
+                if (r == 0) {
+                    ok = true;
+                    break;
+                }
+                if (PosixThreading.LinuxSemErrno() != 4) {
+                    ok = false;
+                    break;
+                }
+            }
+        } finally {
+            NativeMemory.Free(ts);
+        }
+        return ok;
+        #endif
+    }
+
+    public void ReleaseSemaphore(nint handle) {
+        if (handle == 0) { return; }
+        #if MACOS || IOS
+        PosixThreading.MacSemSignal(handle);
+        #else
+        PosixThreading.LinuxSemPost(handle);
+        #endif
+    }
+
+    public void DestroySemaphore(nint handle) {
+        if (handle == 0) { return; }
+        #if MACOS || IOS
+        PosixThreading.MacSemRelease(handle);
+        #else
+        PosixThreading.LinuxSemDestroy(handle);
+        PosixThreading.PosixFree(handle);
+        #endif
+    }
+    #endif
+}
+#endif
