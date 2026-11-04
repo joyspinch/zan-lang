@@ -23,7 +23,7 @@
 
 ### 批次 3 · 有前置（前置闭了再领）
 
-- [ ] B-ID62 语言内置原语与方法横截重构：`irgen_call_builtins.c` 现存 3200+ 行根据方法名字符串横截调用（nameof/GetValueOrDefault/ToString 等），易与用户自定义符号或重载产生意外冲突。需演进为标准库 `[Intrinsic]` 符号级绑定分发机制，checker 期绑定符号而非 irgen 字符串匹配，C11 与 selfhost 差分保持一致。
+- [x] B-ID62 语言内置原语与方法横截重构：`irgen_call_builtins.c` 现存 3200+ 行根据方法名字符串横截调用（nameof/GetValueOrDefault/ToString 等），易与用户自定义符号或重载产生意外冲突。需演进为标准库 `[Intrinsic]` 符号级绑定分发机制，checker 期绑定符号而非 irgen 字符串匹配，C11 与 selfhost 差分保持一致。
 - [ ] B-ID77〔B-ID112 同族随行〕静态空安全（Null-Safety）契约与可空引用类型体系：当前引用类型全部默认为裸指针，全仓依赖运行期判空与空指针异常崩溃。需在类型检查器引入现代空安全语义（如 `string?` 可空与 `string` 非空分离），在编译期截胡潜在空引用；双轨保持一致。
 - [ ] B-ID112〔前置 B-ID77 的生命周期/流分析基建 · 登记不修〕string.AsView 悬垂视图——语言级生命周期分析缺口（登记不修）：`StringExtensions.AsView(this string)` 返回非 owning 的视图结构，表达式临时 string 上取视图在语句末被 ARC 释放后即悬垂，后续读取越界/脏数据（探针实证 2026-11-03；同族面 StringBuilder/ByteBuffer.AsView）。根修在编译器生命周期分析（视图与源对象生存期绑定、视图逃逸禁释放），库级不可修；短期约束：文档明示 AsView 结果不得脱离源对象生存期使用。
 

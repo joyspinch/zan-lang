@@ -172,6 +172,57 @@ static bool checker_is_attr_routes(zan_ast_node_t *obj) {
     }
     return false;
 }
+static bool checker_is_builtin_class_name(zan_istr_t n);
+static bool checker_is_target_builtin_class(zan_ast_node_t *obj) {
+    if (!obj) return false;
+    if (obj->kind == AST_IDENTIFIER) return checker_is_builtin_class_name(obj->ident.name);
+    if (obj->kind == AST_MEMBER_ACCESS) return checker_is_builtin_class_name(obj->member.name);
+    return false;
+}
+static void checker_bind_call_intrinsic(zan_checker_t *c, zan_ast_node_t *expr,
+                                       zan_symbol_t *called_sym, zan_type_t *recv) {
+    if (!expr || expr->kind != AST_CALL) return;
+    expr->call.resolved_sym = called_sym;
+    if (called_sym) {
+        if ((called_sym->modifiers & MOD_INTRINSIC) != 0 ||
+            (called_sym->parent && (called_sym->parent->modifiers & MOD_INTRINSIC) != 0)) {
+            expr->call.is_intrinsic = 1;
+        } else {
+            expr->call.is_intrinsic = 0;
+        }
+        return;
+    }
+    /* called_sym 为 NULL 时：若调用目标为原生内建类（Console/Math/File/BitOperations 等）
+     * 或接收者为标量/原始容器/TypeInfo，标记为内建 Intrinsic；否则为普通未解析调用 */
+    if (expr->call.callee && expr->call.callee->kind == AST_MEMBER_ACCESS) {
+        if (checker_is_target_builtin_class(expr->call.callee->member.object)) {
+            expr->call.is_intrinsic = 1;
+            return;
+        }
+    }
+    if (recv) {
+        if (recv->kind == TYPE_STRING || recv->kind == TYPE_BOOL ||
+            recv->kind == TYPE_BYTE || recv->kind == TYPE_SBYTE ||
+            recv->kind == TYPE_SHORT || recv->kind == TYPE_USHORT ||
+            recv->kind == TYPE_INT || recv->kind == TYPE_UINT ||
+            recv->kind == TYPE_LONG || recv->kind == TYPE_ULONG ||
+            recv->kind == TYPE_FLOAT || recv->kind == TYPE_DOUBLE ||
+            recv->kind == TYPE_CHAR || recv->kind == TYPE_NINT ||
+            recv->kind == TYPE_ARRAY || recv->kind == TYPE_NULLABLE ||
+            zan_refl_is_typeinfo(recv) ||
+            checker_is_builtin_class_name(recv->name)) {
+            expr->call.is_intrinsic = 1;
+            return;
+        }
+        if (recv->name.str &&
+            ((recv->name.len == 4 && memcmp(recv->name.str, "Span", 4) == 0) ||
+             (recv->name.len == 12 && memcmp(recv->name.str, "ReadOnlySpan", 12) == 0))) {
+            expr->call.is_intrinsic = 1;
+            return;
+        }
+    }
+    expr->call.is_intrinsic = 0;
+}
 static zan_istr_t checker_istr_lit(zan_arena_t *arena, const char *s);
 void zan_checker_init(zan_checker_t *c, zan_binder_t *binder,
                       zan_arena_t *arena, zan_diag_t *diag) {
@@ -3505,7 +3556,9 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
         if (expr->call.callee && expr->call.callee->kind == AST_IDENTIFIER &&
             expr->call.callee->ident.name.len == 6 &&
             memcmp(expr->call.callee->ident.name.str, "nameof", 6) == 0 &&
-            expr->call.args.count == 1) {
+            expr->call.args.count == 1 &&
+            !zan_binder_lookup(c->binder, expr->call.callee->ident.name)) {
+            expr->call.is_intrinsic = 1;
             zan_ast_node_t *na = expr->call.args.items[0];
             if (na && (na->kind == AST_IDENTIFIER ||
                        na->kind == AST_MEMBER_ACCESS)) {
@@ -3589,6 +3642,7 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
             if (es && es->kind == SYM_ENUM) {
                 for (int ai = 0; ai < 2; ai++)
                     zan_checker_check_expr(c, expr->call.args.items[ai]);
+                expr->call.is_intrinsic = 1;
                 return c->binder->type_bool;
             }
         }
@@ -3674,8 +3728,15 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
         if (called_sym && called_sym->kind == SYM_METHOD)
             checker_check_method_call_constraints(c, called_sym, expr,
                                                   arg_types);
+        if (!called_sym && expr->call.callee && expr->call.callee->kind == AST_IDENTIFIER) {
+            called_sym = zan_binder_lookup(c->binder, expr->call.callee->ident.name);
+        }
+        if (!called_sym && arg_sig) {
+            called_sym = arg_sig;
+        }
         c->last_call_node = expr;
         c->last_call_method = called_sym;
+        checker_bind_call_intrinsic(c, expr, called_sym, recv);
         check_call_arity(c, expr, recv);
         if (!callee_is_method &&
             (checker_is_task_call(expr, "Run") || checker_is_task_call(expr, "Spawn"))) {

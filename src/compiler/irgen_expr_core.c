@@ -956,6 +956,14 @@ static bool class_derives_from(zan_symbol_t *derived, zan_symbol_t *base) {
     return false;
 }
 
+static bool has_declared_ctor(zan_irgen_t *g, zan_symbol_t *sym) {
+    if (!sym) return false;
+    for (int i = 0; i < g->ctor_count; i++) {
+        if (g->ctors[i].type_sym == sym) return true;
+    }
+    return false;
+}
+
 static struct zan_ctor_entry *find_ctor(zan_irgen_t *g, zan_symbol_t *type_sym,
                                         zan_ast_list_t *args, local_scope_t *locals,
                                         zan_ast_node_t *exclude) {
@@ -2974,17 +2982,42 @@ static LLVMValueRef zan_emit_itoa(zan_irgen_t *g, LLVMValueRef buf,
         3, "itoa.n");
 }
 
+static bool istr_matches_class(zan_istr_t name, const char *cls) {
+    if (!name.str) return false;
+    size_t len = strlen(cls);
+    if (name.len == len && memcmp(name.str, cls, len) == 0) return true;
+    if (name.len > len + 1 && name.str[name.len - len - 1] == '_' &&
+        memcmp(name.str + (name.len - len), cls, len) == 0) {
+        return true;
+    }
+    return false;
+}
+
 static bool is_call_to(zan_ast_node_t *expr, const char *obj, const char *method) {
     if (expr->kind != AST_CALL) return false;
+    if (expr->call.resolved_sym != NULL && !expr->call.is_intrinsic) return false;
     zan_ast_node_t *callee = expr->call.callee;
     if (callee->kind != AST_MEMBER_ACCESS) return false;
-    if (callee->member.object->kind != AST_IDENTIFIER) return false;
 
-    zan_istr_t obj_name = callee->member.object->ident.name;
+    zan_istr_t obj_name = {NULL, 0};
+    if (callee->member.object->kind == AST_IDENTIFIER) {
+        obj_name = callee->member.object->ident.name;
+    } else if (callee->member.object->kind == AST_MEMBER_ACCESS) {
+        obj_name = callee->member.object->member.name;
+    } else {
+        return false;
+    }
+
     zan_istr_t method_name = callee->member.name;
+    size_t method_len = strlen(method);
 
-    return ((int)obj_name.len == (int)strlen(obj) &&
-            memcmp(obj_name.str, obj, (size_t)obj_name.len) == 0 &&
-            (int)method_name.len == (int)strlen(method) &&
-            memcmp(method_name.str, method, (size_t)method_name.len) == 0);
+    bool obj_ok = istr_matches_class(obj_name, obj);
+    if (!obj_ok && expr->call.resolved_sym && expr->call.resolved_sym->parent) {
+        obj_ok = istr_matches_class(expr->call.resolved_sym->parent->name, obj);
+    }
+    if (!obj_ok) return false;
+
+    if (method_name.len != method_len || memcmp(method_name.str, method, method_len) != 0)
+        return false;
+    return true;
 }

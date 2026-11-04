@@ -171,15 +171,24 @@ static zan_ast_node_t *parse_delegate_decl(zan_parser_t *p, uint32_t mods) {
     return ddecl;
 }
 
+static bool is_intrinsic_attr_name(zan_istr_t name) {
+    if (!name.str) return false;
+    if (name.len == 9 && memcmp(name.str, "Intrinsic", 9) == 0) return true;
+    if (name.len == 18 && memcmp(name.str, "IntrinsicAttribute", 18) == 0) return true;
+    return false;
+}
+
 static bool parse_top_level_decl(zan_parser_t *p, zan_ast_node_t *unit) {
     /* 解析类型特性：保留特性元数据，[StructLayout] 触发 C 内存布局对齐 */
     bool has_c_layout = false;
     bool has_explicit_layout = false;
+    bool has_intrinsic = false;
     zan_ast_list_t type_attrs;
     zan_ast_list_init(&type_attrs);
     parse_attr_usages(p, &type_attrs, NULL, NULL, NULL);
     for (int _ai = 0; _ai < type_attrs.count; _ai++) {
         zan_istr_t _n = type_attrs.items[_ai]->attribute.name->ident.name;
+        if (is_intrinsic_attr_name(_n)) has_intrinsic = true;
         if (_n.str && _n.len == 12 && memcmp(_n.str, "StructLayout", 12) == 0) {
             has_c_layout = true;
             /* `LayoutKind */
@@ -196,6 +205,7 @@ static bool parse_top_level_decl(zan_parser_t *p, zan_ast_node_t *unit) {
     }
 
     uint32_t mods = parse_modifiers(p);
+    if (has_intrinsic) mods |= MOD_INTRINSIC;
 
     if (parser_check(p, TK_IDENT) && p->current.str_val.len == 7 &&
         memcmp(p->current.str_val.str, "partial", 7) == 0) {
@@ -3658,8 +3668,26 @@ static zan_ast_node_t *parse_member_decl(zan_parser_t *p) {
     parse_attr_usages(p, &attrs, &dll_import_lib, &dll_entry_point, &dll_variadic);
     zan_ast_node_t *n = parse_member_decl_inner(p, dll_import_lib, dll_entry_point,
                                                 dll_variadic);
-    if (n && attrs.count > 0)
+    if (n && attrs.count > 0) {
         zan_ast_ensure_decl_meta(n, p->arena)->attributes = attrs;
+        for (int _ai = 0; _ai < attrs.count; _ai++) {
+            zan_ast_node_t *a = attrs.items[_ai];
+            if (a && a->kind == AST_ATTRIBUTE && a->attribute.name) {
+                if (is_intrinsic_attr_name(a->attribute.name->ident.name)) {
+                    if (n->kind == AST_METHOD_DECL || n->kind == AST_CONSTRUCTOR_DECL ||
+                        n->kind == AST_DESTRUCTOR_DECL) {
+                        n->method_decl.modifiers |= MOD_INTRINSIC;
+                    } else if (n->kind == AST_FIELD_DECL || n->kind == AST_PROPERTY_DECL) {
+                        n->field_decl.modifiers |= MOD_INTRINSIC;
+                    } else if (n->kind == AST_CLASS_DECL || n->kind == AST_STRUCT_DECL ||
+                               n->kind == AST_INTERFACE_DECL || n->kind == AST_ENUM_DECL) {
+                        n->type_decl.modifiers |= MOD_INTRINSIC;
+                    }
+                    break;
+                }
+            }
+        }
+    }
     return n;
 }
 

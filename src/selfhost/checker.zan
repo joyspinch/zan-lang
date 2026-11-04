@@ -2100,6 +2100,18 @@ public class Checker {
         }
     }
 
+    bool IsBuiltinClassName(string name) {
+        if (name == "Console" || name == "Convert" || name == "Math") { return true; }
+        if (name == "Task" || name == "Gate" || name == "Socket") { return true; }
+        if (name == "Environment" || name == "File" || name == "Directory") { return true; }
+        if (name == "NativeMemory" || name == "BitOperations") { return true; }
+        if (name == "Vector128" || name == "Vector256" || name == "Sse2" || name == "Aes" || name == "Sse42") { return true; }
+        if (name == "string" || name == "String") { return true; }
+        if (name == "int" || name == "long" || name == "double" || name == "float") { return true; }
+        if (name == "Int32" || name == "Int64" || name == "Double" || name == "Single") { return true; }
+        return false;
+    }
+
     void CheckCall(Node n) {
         Node callee = n.a;
         bool hasNamed = false;
@@ -2113,6 +2125,11 @@ public class Checker {
         if (callee != null && callee.kind == AK.Ident()) {
             // bare call: resolve against the enclosing type's methods
             Node cands = MethodUp(curClass, callee.sval);
+            if (cands != null) {
+                n.resolvedSym = cands;
+                n.isIntrinsic = (cands.mods & MOD.Intrinsic()) != 0 ||
+                                (curClass != null && (curClass.mods & MOD.Intrinsic()) != 0);
+            }
             if (cands != null && !hasNamed && !AcceptsArgc(curClass, callee.sval, argc)) {
                 diags.Error("no overload of '" + callee.sval + "' takes " + argc + " argument(s)", n.line, n.col);
             }
@@ -2145,20 +2162,31 @@ public class Checker {
             CheckObj(callee.a);
             Node ot = InferType(callee.a);
             Node cls = ClassOf(ot);
+            Node sc = null;
             if (cls != null) { CheckInternalAccess(cls, callee.sval, n); }
-            else { Node sc = StaticRecv(callee.a); if (sc != null) { CheckInternalAccess(sc, callee.sval, n); } }
+            else { sc = StaticRecv(callee.a); if (sc != null) { CheckInternalAccess(sc, callee.sval, n); } }
+            Node targetCls = cls != null ? cls : sc;
+            Node mm = null;
+            if (targetCls != null) {
+                mm = MethodUp(targetCls, callee.sval);
+            }
             if (cls != null) {
-                Node mm = null;
                 if (!HasMember(cls, callee.sval) && !HasExt(cls.sval, callee.sval)) {
                     if (!IsReflInstName(callee.sval)) {
                         diags.Error("type '" + cls.sval + "' has no member '" + callee.sval + "'", n.line, n.col);
                     }
-                } else if ((mm = MethodUp(cls, callee.sval)) != null && !hasNamed && !AcceptsArgc(cls, callee.sval, argc)) {
+                } else if (mm != null && !hasNamed && !AcceptsArgc(cls, callee.sval, argc)) {
                     diags.Error("no overload of '" + callee.sval + "' takes " + argc + " argument(s)", n.line, n.col);
                 }
-                if (mm == null) { mm = MethodUp(cls, callee.sval); }
                 if (!hasNamed) { CheckTaskArgs(mm, n); }
                 CheckMethodConstraints(mm, n);
+            }
+            if (mm != null) {
+                n.resolvedSym = mm;
+                n.isIntrinsic = (mm.mods & MOD.Intrinsic()) != 0 ||
+                                (targetCls != null && (targetCls.mods & MOD.Intrinsic()) != 0);
+            } else if (callee.a != null && callee.a.kind == AK.Ident() && IsBuiltinClassName(callee.a.sval)) {
+                n.isIntrinsic = true;
             }
             return;
         }

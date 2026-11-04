@@ -1629,16 +1629,21 @@ static bool is_64bit_int_arg(zan_irgen_t *g, zan_ast_node_t *arg, LLVMValueRef v
 static bool emit_bit_operations_call(zan_irgen_t *g, zan_ast_node_t *expr,
                                      local_scope_t *locals, LLVMValueRef *out) {
     if (expr->kind != AST_CALL) return false;
+    if (expr->call.resolved_sym != NULL && !expr->call.is_intrinsic) return false;
     zan_ast_node_t *callee = expr->call.callee;
     if (callee->kind != AST_MEMBER_ACCESS) return false;
 
     zan_ast_node_t *obj = callee->member.object;
     bool is_bitops = false;
     if (obj->kind == AST_IDENTIFIER) {
-        if (obj->ident.name.len == 13 && memcmp(obj->ident.name.str, "BitOperations", 13) == 0)
+        if (istr_matches_class(obj->ident.name, "BitOperations"))
             is_bitops = true;
     } else if (obj->kind == AST_MEMBER_ACCESS) {
-        if (obj->member.name.len == 13 && memcmp(obj->member.name.str, "BitOperations", 13) == 0)
+        if (istr_matches_class(obj->member.name, "BitOperations"))
+            is_bitops = true;
+    }
+    if (!is_bitops && expr->call.resolved_sym && expr->call.resolved_sym->parent) {
+        if (istr_matches_class(expr->call.resolved_sym->parent->name, "BitOperations"))
             is_bitops = true;
     }
     if (!is_bitops) return false;
@@ -1883,11 +1888,12 @@ static bool emit_bit_operations_call(zan_irgen_t *g, zan_ast_node_t *expr,
 
 static bool is_target_class_obj(zan_ast_node_t *obj, const char *name, size_t len, local_scope_t *locals) {
     if (!obj) return false;
+    (void)len;
     if (obj->kind == AST_IDENTIFIER) {
         if (locals && local_find(locals, obj->ident.name)) return false;
-        return obj->ident.name.len == (int)len && memcmp(obj->ident.name.str, name, len) == 0;
+        return istr_matches_class(obj->ident.name, name);
     } else if (obj->kind == AST_MEMBER_ACCESS) {
-        return obj->member.name.len == (int)len && memcmp(obj->member.name.str, name, len) == 0;
+        return istr_matches_class(obj->member.name, name);
     }
     return false;
 }

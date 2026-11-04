@@ -177,6 +177,8 @@ struct zan_ast_node {
             zan_ast_node_t *callee;
             zan_ast_list_t args;
             zan_ast_list_t type_args;
+            struct zan_symbol *resolved_sym;
+            uint8_t is_intrinsic;
         } call;
 
         struct {
@@ -533,6 +535,7 @@ struct zan_ast_node {
 #define MOD_EVENT     0x4000
 #define MOD_PARTIAL   0x8000
 #define MOD_REF       0x10000
+#define MOD_INTRINSIC 0x20000
 
 zan_ast_node_t *zan_ast_new(zan_arena_t *arena, zan_ast_kind_t kind, zan_loc_t loc);
 size_t zan_ast_node_count(void);

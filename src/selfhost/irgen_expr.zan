@@ -6160,6 +6160,12 @@ partial class Irgen {
         return false;
     }
 
+    bool MatchBuiltinClass(string name, string target) {
+        if (name == target) { return true; }
+        if (name.Length > target.Length + 1 && name.EndsWith("_" + target)) { return true; }
+        return false;
+    }
+
     // The static classes the C host exposes as builtins. The self-host
     // lowers only some of their members: a call to a member it does not
     // know is a capability gap, not a typo, and is reported as such.
@@ -6172,6 +6178,12 @@ partial class Irgen {
         if (name == "string" || name == "String") { return true; }
         if (name == "int" || name == "long" || name == "double" || name == "float") { return true; }
         if (name == "Int32" || name == "Int64" || name == "Double" || name == "Single") { return true; }
+        if (MatchBuiltinClass(name, "NativeMemory") || MatchBuiltinClass(name, "BitOperations") ||
+            MatchBuiltinClass(name, "Console") || MatchBuiltinClass(name, "Math") ||
+            MatchBuiltinClass(name, "File") || MatchBuiltinClass(name, "Directory") ||
+            MatchBuiltinClass(name, "Path") || MatchBuiltinClass(name, "Environment")) {
+            return true;
+        }
         return false;
     }
 
@@ -6890,9 +6902,13 @@ partial class Irgen {
                 return EmitStrFormat(e);
             }
         }
+        // B-ID62: 符号级 Intrinsic 门控：若 checker 已解析绑定为非 Intrinsic 用户符号，
+        // 绝不按名称横截，直接跳过内置原语发射
+        bool canIntercept = e.resolvedSym == null || e.isIntrinsic;
+
         // NativeMemory.* -> inline raw-memory intrinsics (no external symbol)
-        if (callee.kind == AK.MemberAccess() && callee.a != null && callee.a.kind == AK.Ident()
-            && callee.a.sval == "NativeMemory" && LocalIdx("NativeMemory") < 0) {
+        if (canIntercept && callee.kind == AK.MemberAccess() && callee.a != null && callee.a.kind == AK.Ident()
+            && MatchBuiltinClass(callee.a.sval, "NativeMemory") && LocalIdx("NativeMemory") < 0) {
             ExprVal nm = GenNativeMemory(callee, e);
             if (nm != null) { return nm; }
         }
@@ -6900,19 +6916,19 @@ partial class Irgen {
         // hardware SIMD (mirrors the C host's emit_builtin_invocation +
         // emit_vector128_call). Only reached when the name is the builtin type,
         // not a local of the same name.
-        if (callee.kind == AK.MemberAccess() && callee.a != null && callee.a.kind == AK.Ident()
+        if (canIntercept && callee.kind == AK.MemberAccess() && callee.a != null && callee.a.kind == AK.Ident()
             && LocalIdx(callee.a.sval) < 0
-            && (callee.a.sval == "BitOperations" || callee.a.sval == "Vector128"
-                || callee.a.sval == "Vector256" || callee.a.sval == "Sse2"
-                || callee.a.sval == "Sse42" || callee.a.sval == "Aes"
-                || callee.a.sval == "PixelOps")) {
+            && (MatchBuiltinClass(callee.a.sval, "BitOperations") || MatchBuiltinClass(callee.a.sval, "Vector128")
+                || MatchBuiltinClass(callee.a.sval, "Vector256") || MatchBuiltinClass(callee.a.sval, "Sse2")
+                || MatchBuiltinClass(callee.a.sval, "Sse42") || MatchBuiltinClass(callee.a.sval, "Aes")
+                || MatchBuiltinClass(callee.a.sval, "PixelOps"))) {
             ExprVal bv = GenBuiltinStatic(callee.a.sval, callee.sval, e);
             if (bv != null) { return bv; }
         }
         // String.CompareOrdinal(a, b) -> strcmp: a compiler intrinsic in the
         // C host (irgen_call.c), not a stdlib method. Byte-wise ordinal
         // compare of two NUL-terminated strings.
-        if (callee.kind == AK.MemberAccess() && callee.a != null && callee.a.kind == AK.Ident()
+        if (canIntercept && callee.kind == AK.MemberAccess() && callee.a != null && callee.a.kind == AK.Ident()
             && LocalIdx(callee.a.sval) < 0
             && (callee.a.sval == "String" || callee.a.sval == "string")
             && callee.sval == "CompareOrdinal" && e.kids.Count == 2) {
