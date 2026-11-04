@@ -1,0 +1,198 @@
+using System;
+using Gui;
+
+namespace Game.Graphics;
+
+// 游戏与 3D 图元在 Canvas 上的扩展方法（绑定 zan_game 原生驱动）。
+// 保持 Zan.Gui 纯净零游戏依赖——纯 GUI 程序绝不加载或打包 zan_game.dll；
+// 引用了 Zan.Game 的游戏程序通过扩展方法无缝直通 3D 网格与 GPU 精灵绘制。
+public static class CanvasGameExtensions {
+    [DllImport("zan_game")]
+    static extern int zan_game_sprite_handle(string key);
+
+    [DllImport("zan_game")]
+    static extern int zan_game_bake_sprite(string key, int surfaceId,
+    int x, int y, int w, int h);
+
+    [DllImport("zan_game")]
+    static extern void zan_game_sprite_batch(int surfaceId, int handle,
+    nint quads, int count);
+
+    [DllImport("zan_game")]
+    static extern int zan_game_mesh_create_ex(int surfaceId, nint verts,
+    int count, nint indices, int indexCount, int flags);
+
+    [DllImport("zan_game")]
+    static extern int zan_game_draw3d(int surfaceId, int mesh, nint mvp,
+    int color, string texture);
+
+    [DllImport("zan_game")]
+    static extern int zan_game_draw3d_batch_begin(int surfaceId);
+
+    [DllImport("zan_game")]
+    static extern int zan_game_draw3d_batch(int surfaceId, int mesh,
+    string texture, nint instances, int count);
+
+    [DllImport("zan_game")]
+    static extern int zan_game_draw3d_batch_end(int surfaceId);
+
+    [DllImport("zan_game")]
+    static extern int zan_game_set_lights3d(int count, nint dirs,
+    nint colors, nint ambient);
+
+    public static int SpriteHandle(this Canvas c, string key) {
+        if (c == null) { return 0; }
+        return zan_game_sprite_handle(key);
+    }
+
+    public static int BakeSprite(this Canvas c, string key, int x, int y, int w, int h) {
+        if (c == null) { return 0; }
+        return zan_game_bake_sprite(key, c.SurfaceId(), x, y, w, h);
+    }
+
+    public static int BakeSprite(this Canvas c, string key) {
+        if (c == null) { return 0; }
+        return zan_game_bake_sprite(key, c.SurfaceId(), 0, 0, c.Width(), c.Height());
+    }
+
+    public static void DrawSprites(this Canvas c, int handle, nint quads, int count) {
+        if (c == null || handle <= 0 || count <= 0) { return; }
+        App.PaintHashOp(41, handle, count, 0, 0);
+        zan_game_sprite_batch(c.SurfaceId(), handle, quads, count);
+    }
+
+    static nint meshUploadVertBuf;
+    static int meshUploadVertCap;
+    static nint meshUploadIdxBuf;
+    static int meshUploadIdxCap;
+
+    public static int MeshUpload(this Canvas c, Mesh3D mesh) {
+        if (c == null || mesh == null) { return 0; }
+        int nv = mesh.VertexCount();
+        int ni = mesh.IndexCount();
+        if (nv <= 0 || ni <= 0) { return 0; }
+        int stride = mesh.StrideFloats();
+        int totalFloats = nv * stride;
+        int vertBytes = totalFloats * 4;
+        if (vertBytes > meshUploadVertCap) {
+            if (meshUploadVertBuf != 0) {
+                NativeMemory.Free(meshUploadVertBuf);
+            }
+            int newCap = vertBytes < 65536 ? 65536 : vertBytes * 2;
+            meshUploadVertBuf = NativeMemory.Alloc(newCap);
+            meshUploadVertCap = newCap;
+        }
+        mesh.CopyVerticesTo(meshUploadVertBuf);
+
+        int idxBytes = ni * 2;
+        if (idxBytes > meshUploadIdxCap) {
+            if (meshUploadIdxBuf != 0) {
+                NativeMemory.Free(meshUploadIdxBuf);
+            }
+            int newCap = idxBytes < 32768 ? 32768 : idxBytes * 2;
+            meshUploadIdxBuf = NativeMemory.Alloc(newCap);
+            meshUploadIdxCap = newCap;
+        }
+        mesh.CopyIndicesTo(meshUploadIdxBuf);
+
+        return zan_game_mesh_create_ex(c.SurfaceId(), meshUploadVertBuf, nv,
+        meshUploadIdxBuf, ni, mesh.Colored() ? 1 : 0);
+    }
+
+    static nint cachedMvpPtr;
+    static nint lightDirsBuf;
+    static int lightDirsCap;
+    static nint lightColorsBuf;
+    static int lightColorsCap;
+    static nint lightAmbientBuf;
+
+    public static int DrawMesh3D(this Canvas c, int mesh, float[] mvpColumnMajor, int color,
+    string texture) {
+        if (c == null || mvpColumnMajor == null || mvpColumnMajor.Length < 16) { return 0; }
+        if (cachedMvpPtr == 0) {
+            cachedMvpPtr = NativeMemory.Alloc(64);
+        }
+        Span<float> ms = new Span<float>(cachedMvpPtr, 16);
+        for (int i = 0; i < 16; i = i + 1) { ms[i] = mvpColumnMajor[i]; }
+        string texKey = texture == null ? "" : texture;
+        return zan_game_draw3d(c.SurfaceId(), mesh, cachedMvpPtr, color, texKey);
+    }
+
+    public static int DrawMesh3D(this Canvas c, int mesh, Mat4 mvp, int color, string texture) {
+        if (c == null || mvp == null || mvp.m == null || mvp.m.Length < 16) { return 0; }
+        if (cachedMvpPtr == 0) {
+            cachedMvpPtr = NativeMemory.Alloc(64);
+        }
+        Span<float> ms = new Span<float>(cachedMvpPtr, 16);
+        float[] m = mvp.m;
+        ms[0] = m[0];  ms[1] = m[4];  ms[2] = m[8];   ms[3] = m[12];
+        ms[4] = m[1];  ms[5] = m[5];  ms[6] = m[9];   ms[7] = m[13];
+        ms[8] = m[2];  ms[9] = m[6];  ms[10] = m[10]; ms[11] = m[14];
+        ms[12] = m[3]; ms[13] = m[7]; ms[14] = m[11]; ms[15] = m[15];
+        string texKey = texture == null ? "" : texture;
+        return zan_game_draw3d(c.SurfaceId(), mesh, cachedMvpPtr, color, texKey);
+    }
+
+    public static int SetLights3D(this Canvas c, float[] dirs, float[] colors, float[] ambient) {
+        if (c == null) { return 0; }
+        int count = dirs == null ? 0 : dirs.Length / 3;
+        if (count > 4) { return 0; }
+        if (count > 0 &&
+        (colors == null || colors.Length < count * 3)) { return 0; }
+        int dirBytes = count * 3 * 4;
+        if (dirBytes > lightDirsCap) {
+            if (lightDirsBuf != 0) {
+                NativeMemory.Free(lightDirsBuf);
+            }
+            lightDirsBuf = NativeMemory.Alloc(dirBytes < 96 ? 96 : dirBytes * 2);
+            lightDirsCap = dirBytes < 96 ? 96 : dirBytes * 2;
+        }
+        if (count > 0) {
+            Span<float> ds = new Span<float>(lightDirsBuf, count * 3);
+            for (int i = 0; i < count * 3; i = i + 1) { ds[i] = dirs[i]; }
+            int colorBytes = colors.Length * 4;
+            if (colorBytes > lightColorsCap) {
+                if (lightColorsBuf != 0) {
+                    NativeMemory.Free(lightColorsBuf);
+                }
+                lightColorsBuf = NativeMemory.Alloc(
+                colorBytes < 96 ? 96 : colorBytes * 2);
+                lightColorsCap = colorBytes < 96 ? 96 : colorBytes * 2;
+            }
+            Span<float> cs = new Span<float>(lightColorsBuf, colors.Length);
+            for (int i = 0; i < colors.Length; i = i + 1) { cs[i] = colors[i]; }
+        }
+        if (lightAmbientBuf == 0) {
+            lightAmbientBuf = NativeMemory.Alloc(12);
+        }
+        nint ambientPtr = 0;
+        if (ambient != null && ambient.Length >= 3) {
+            Span<float> ab = new Span<float>(lightAmbientBuf, 3);
+            ab[0] = ambient[0];
+            ab[1] = ambient[1];
+            ab[2] = ambient[2];
+            ambientPtr = lightAmbientBuf;
+        }
+        return zan_game_set_lights3d(count, lightDirsBuf, lightColorsBuf,
+        ambientPtr);
+    }
+
+    public static int DrawMesh3DBatchBegin(this Canvas c) {
+        if (c == null) { return 0; }
+        return zan_game_draw3d_batch_begin(c.SurfaceId());
+    }
+
+    public static int DrawMesh3DBatch(this Canvas c, int mesh, string texture, nint instances,
+    int count) {
+        if (c == null || instances == 0 || count <= 0) { return 0; }
+        App.PaintHashOp(42, mesh, count, 0, 0);
+        string texKey = texture == null ? "" : texture;
+        return zan_game_draw3d_batch(c.SurfaceId(), mesh, texKey, instances,
+        count);
+    }
+
+    public static int DrawMesh3DBatchEnd(this Canvas c) {
+        if (c == null) { return 0; }
+        return zan_game_draw3d_batch_end(c.SurfaceId());
+    }
+}
