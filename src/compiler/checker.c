@@ -2889,6 +2889,30 @@ static void check_call_arg_type(zan_checker_t *c, zan_symbol_t *sig, int index,
         checker_report_null_arg_mismatch(c, arg, pt, index, sig->name);
         return;
     }
+    /* 方法组当值实参（B-ID151）：裸方法名/成员方法名在 checking 阶段
+     * 定型为 type_error，mismatch 检查对 error 静默——漏到发码侧变
+     * 裸函数指针。形参非委托时报 E2039；形参是委托时验签名兼容（与
+     * 上面 void 实参分支同规，B-ID48 兜底）；泛型形参 T 可能是委托，
+     * 交重载/实例化路径裁决。成员访问形态已在 check_member_access
+     * 报过（E2039 同消息同位置，diag 去重不会双报）。 */
+    {
+        zan_ast_node_t *vg = arg;
+        while (vg && vg->kind == AST_CAST_EXPR) vg = vg->cast.expr;
+        zan_symbol_t *vmg = expr_method_group(c, vg);
+        if (vmg && pt && pt->kind != TYPE_TYPE_PARAM) {
+            if (pt->kind != TYPE_DELEGATE) {
+                reject_method_group(c, vg);
+                return;
+            }
+            if (!method_group_matches_delegate(c, vmg, pt)) {
+                zan_diag_emit_code(c->diag, DIAG_ERROR, arg->loc, 2098,
+                    "method '%.*s' cannot be converted to delegate type "
+                    "'%s': signature is not compatible",
+                    (int)vmg->name.len, vmg->name.str, type_name(pt));
+                return;
+            }
+        }
+    }
     if (!checker_arg_type_mismatch(c, pt, arg_type)) return;
     zan_diag_emit_code(c->diag, DIAG_ERROR, arg->loc, 2035,
                   "cannot convert '%s' to '%s' in argument %d of '%.*s': "
@@ -3272,6 +3296,14 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
                 reject_method_group(c, expr->binary.left);
             if (left->kind != TYPE_DELEGATE)
                 reject_method_group(c, expr->binary.right);
+        } else {
+            /* 算术/逻辑/位运算：方法组当操作数永远是错（没有委托目标
+             * 可救）。裸方法名/成员方法名在 checking 阶段定型为
+             * type_error 被静默放行，漏到发码侧变裸函数指针，按
+             * E3090（i64+ptr 混算）炸 LLVM（B-ID151）。比较运算上面
+             * 单独处理——另一侧是委托时属合法委托比较。 */
+            reject_method_group(c, expr->binary.left);
+            reject_method_group(c, expr->binary.right);
         }
 
         switch (expr->binary.op) {
@@ -4552,8 +4584,16 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
     }
 
     case AST_CAST_EXPR: {
-        zan_type_t *src = zan_checker_check_expr(c, expr->cast.expr);
         zan_type_t *dst = zan_binder_resolve_type(c->binder, expr->cast.type);
+        if (dst && dst->kind != TYPE_DELEGATE && dst->kind != TYPE_TYPE_PARAM) {
+            /* 方法组 cast 到非委托类型永远是错：裸方法名在 checking
+             * 阶段定型为 type_error 静默放行，漏到发码侧变裸函数
+             * 指针，运行期按腐坏对象解引用段错误（B-ID151）。cast 到
+             * 委托类型的显式转换放行；泛型 T 可能是委托，交实例化点
+             * 裁决。 */
+            reject_method_group(c, expr->cast.expr);
+        }
+        zan_type_t *src = zan_checker_check_expr(c, expr->cast.expr);
         if (!dst) return c->binder->type_error;
         if (!checker_cast_is_valid(c, dst, src)) {
             if (dst->kind == TYPE_OBJECT && !checker_type_is_ref(src))
@@ -5831,7 +5871,16 @@ static zan_type_t *check_member_access(zan_checker_t *c, zan_ast_node_t *expr,
             return mt ? mt : c->binder->type_error;
         }
         if (saw_method) {
-            /* 只命中方法/构造器：方法组不能当值用（老语义保持） */
+            /* 只命中方法/构造器：方法组不能当值用。取值位置必须报
+             * （E2039）——静默 type_error 曾被下游（if 条件、内建实
+             * 参等）当「已报过错误」跳过，裸方法名漏到发码侧按
+             * E3090 炸 LLVM 或当值传参运行期腐坏（B-ID151）。调用
+             * 位置保持静默：合法方法调用走 check_call 的重载路径。
+             * diag 按 file/line/col/消息去重（B-ID106），binary 等
+             * 先报的场合不会双报。 */
+            if (!in_call_callee) {
+                reject_method_group(c, expr);
+            }
             return c->binder->type_error;
         }
     }
