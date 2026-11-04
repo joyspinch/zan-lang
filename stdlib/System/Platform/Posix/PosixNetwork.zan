@@ -1,0 +1,249 @@
+#if !WINDOWS
+using System;
+
+namespace System.Platform;
+
+// POSIX 平台的套接字与网络系统调用实现（基于 libc socket 与 fcntl）。
+public class PosixNetwork : IPlatformNetwork {
+    #if WASI
+    public void Initialize() {}
+    public void Cleanup() {}
+    public nint CreateTcpSocket(bool ipv6) { return -1; }
+    public nint CreateUdpSocket(bool ipv6) { return -1; }
+    public nint CreateSocket(int af, int type, int protocol) { return -1; }
+    public int CloseSocket(nint s) { return -1; }
+    public int Shutdown(nint s, int how) { return -1; }
+    public int Bind(nint s, string addr, int addrlen) { return -1; }
+    public int Listen(nint s, int backlog) { return -1; }
+    public nint Accept(nint s, string addr, string addrlen) { return -1; }
+    public int Connect(nint s, string addr, int addrlen) { return -1; }
+    public int SetNonBlocking(nint s) { return -1; }
+    public void CancelPendingIo(nint s) {}
+    public int SetSocketOption(nint s, int level, int optname, string optval, int optlen) { return -1; }
+    public void SetReuseAddress(nint s, bool on) {}
+    public void SetReusePort(nint s, bool on) {}
+    public void SetNoDelay(nint s, bool on) {}
+    public void SetBroadcast(nint s, bool on) {}
+    public int SendTo(nint s, string buf, int len, int flags, string to, int tolen) { return -1; }
+    public int RecvFrom(nint s, string buf, int len, int flags, string from, string fromlen) { return -1; }
+    public int GetLastSocketError() { return 0; }
+    public bool IsIpv6Family(int family) { return family == 10; }
+    public bool IsUdpResetError(int error) { return false; }
+    public bool SupportsAsyncAcceptOv() { return false; }
+    public bool IsTransientAcceptError(int error) { return false; }
+    public byte[] CreateSockAddrV4(int ipAddr, int port) { return new byte[16]; }
+    #else
+
+    [DllImport("crt")]
+    public static extern int socket(int af, int type, int protocol);
+
+    [DllImport("crt", EntryPoint = "close")]
+    private static extern int close(int fd);
+
+    [DllImport("crt")]
+    private static extern int shutdown(int fd, int how);
+
+    [DllImport("crt")]
+    private static extern int bind(int fd, string addr, int addrlen);
+
+    [DllImport("crt")]
+    private static extern int listen(int fd, int backlog);
+
+    [DllImport("crt")]
+    private static extern int accept(int fd, string addr, string addrlen);
+
+    [DllImport("crt")]
+    private static extern int connect(int fd, string addr, int addrlen);
+
+    [DllImport("crt")]
+    private static extern int setsockopt(int fd, int level, int optname, string optval, int optlen);
+
+    [DllImport("crt")]
+    private static extern int fcntl(int fd, int cmd, int arg);
+
+    [DllImport("crt")]
+    private static extern int sendto(int fd, string buf, int len, int flags, string to, int tolen);
+
+    [DllImport("crt")]
+    private static extern int recvfrom(int fd, string buf, int len, int flags, string from, string fromlen);
+
+    #if ANDROID
+    [DllImport("crt", EntryPoint = "__errno")]
+    private static extern nint NativeErrnoLocation();
+    #elif LINUX
+    [DllImport("crt", EntryPoint = "__errno_location")]
+    private static extern nint NativeErrnoLocation();
+    #elif MACOS || IOS
+    [DllImport("crt", EntryPoint = "__error")]
+    private static extern nint NativeErrnoLocation();
+    #else
+    private static nint NativeErrnoLocation() { return 0; }
+    #endif
+
+    public void Initialize() {}
+    public void Cleanup() {}
+
+    public nint CreateTcpSocket(bool ipv6) {
+        int af = ipv6 ? 10 : 2; // AF_INET6=10, AF_INET=2
+        return (nint)PosixNetwork.socket(af, 1, 6);
+    }
+
+    public nint CreateUdpSocket(bool ipv6) {
+        int af = ipv6 ? 10 : 2; // AF_INET6=10, AF_INET=2
+        return (nint)PosixNetwork.socket(af, 2, 17);
+    }
+
+    public nint CreateSocket(int af, int type, int protocol) {
+        return (nint)PosixNetwork.socket(af, type, protocol);
+    }
+
+    public int CloseSocket(nint s) {
+        return PosixNetwork.close((int)s);
+    }
+
+    public int Shutdown(nint s, int how) {
+        return PosixNetwork.shutdown((int)s, how);
+    }
+
+    public int Bind(nint s, string addr, int addrlen) {
+        return PosixNetwork.bind((int)s, addr, addrlen);
+    }
+
+    public int Listen(nint s, int backlog) {
+        return PosixNetwork.listen((int)s, backlog);
+    }
+
+    public nint Accept(nint s, string addr, string addrlen) {
+        return (nint)PosixNetwork.accept((int)s, addr, addrlen);
+    }
+
+    public int Connect(nint s, string addr, int addrlen) {
+        return PosixNetwork.connect((int)s, addr, addrlen);
+    }
+
+    public int SetNonBlocking(nint s) {
+        int fd = (int)s;
+        int flags = PosixNetwork.fcntl(fd, 3, 0); // F_GETFL = 3
+        #if MACOS || IOS
+        // macOS O_NONBLOCK = 4
+        return PosixNetwork.fcntl(fd, 4, flags | 4); // F_SETFL = 4
+        #else
+        // Linux O_NONBLOCK = 2048 (0x800)
+        return PosixNetwork.fcntl(fd, 4, flags | 2048);
+        #endif
+    }
+
+    public void CancelPendingIo(nint s) {}
+
+    public int SetSocketOption(nint s, int level, int optname, string optval, int optlen) {
+        return PosixNetwork.setsockopt((int)s, level, optname, optval, optlen);
+    }
+
+    public void SetReuseAddress(nint s, bool on) {
+        byte[] optval = new byte[4];
+        if (on) { optval[0] = 1; }
+        #if MACOS || IOS
+        // macOS SOL_SOCKET = 65535, SO_REUSEADDR = 4
+        PosixNetwork.setsockopt((int)s, 65535, 4, optval, 4);
+        #else
+        // Linux SOL_SOCKET = 1, SO_REUSEADDR = 2
+        PosixNetwork.setsockopt((int)s, 1, 2, optval, 4);
+        #endif
+    }
+
+    public void SetReusePort(nint s, bool on) {
+        byte[] optval = new byte[4];
+        if (on) { optval[0] = 1; }
+        #if MACOS || IOS
+        // macOS SOL_SOCKET = 65535, SO_REUSEPORT = 512
+        PosixNetwork.setsockopt((int)s, 65535, 512, optval, 4);
+        #else
+        // Linux SOL_SOCKET = 1, SO_REUSEPORT = 15
+        PosixNetwork.setsockopt((int)s, 1, 15, optval, 4);
+        #endif
+    }
+
+    public void SetNoDelay(nint s, bool on) {
+        byte[] optval = new byte[4];
+        if (on) { optval[0] = 1; }
+        // IPPROTO_TCP = 6, TCP_NODELAY = 1
+        PosixNetwork.setsockopt((int)s, 6, 1, optval, 4);
+    }
+
+    public void SetBroadcast(nint s, bool on) {
+        byte[] optval = new byte[4];
+        if (on) { optval[0] = 1; }
+        #if MACOS || IOS
+        // macOS SOL_SOCKET = 65535, SO_BROADCAST = 32
+        PosixNetwork.setsockopt((int)s, 65535, 32, optval, 4);
+        #else
+        // Linux SOL_SOCKET = 1, SO_BROADCAST = 6
+        PosixNetwork.setsockopt((int)s, 1, 6, optval, 4);
+        #endif
+    }
+
+    public int SendTo(nint s, string buf, int len, int flags, string to, int tolen) {
+        return PosixNetwork.sendto((int)s, buf, len, flags, to, tolen);
+    }
+
+    public int RecvFrom(nint s, string buf, int len, int flags, string from, string fromlen) {
+        return PosixNetwork.recvfrom((int)s, buf, len, flags, from, fromlen);
+    }
+
+    public int GetLastSocketError() {
+        nint loc = PosixNetwork.NativeErrnoLocation();
+        if (loc != 0) {
+            return new Span<int>(loc, 1)[0];
+        }
+        return 0;
+    }
+
+    public bool IsIpv6Family(int family) {
+        #if MACOS || IOS
+        return family == 30;
+        #else
+        return family == 10;
+        #endif
+    }
+
+    public bool IsUdpResetError(int error) {
+        return false;
+    }
+
+    public bool SupportsAsyncAcceptOv() {
+        return false;
+    }
+
+    public bool IsTransientAcceptError(int error) {
+        #if LINUX
+        return error == 4 || error == 11 || error == 103 || error == 100 ||
+            error == 71 || error == 92 || error == 112 || error == 64 ||
+            error == 113 || error == 95 || error == 101;
+        #elif MACOS || IOS
+        return error == 4 || error == 35 || error == 53;
+        #else
+        return false;
+        #endif
+    }
+
+    public byte[] CreateSockAddrV4(int ipAddr, int port) {
+        byte[] addr = new byte[16];
+        #if MACOS || IOS
+        addr[0] = 16; // sin_len = 16
+        addr[1] = 2;  // sin_family = AF_INET (2)
+        #else
+        addr[0] = 2;  // sin_family = AF_INET (2)
+        addr[1] = 0;
+        #endif
+        int nport = ((port & 255) << 8) | ((port >> 8) & 255);
+        addr[2] = (byte)(nport & 255);
+        addr[3] = (byte)((nport >> 8) & 255);
+        addr[4] = (byte)(ipAddr & 255);
+        addr[5] = (byte)((ipAddr >> 8) & 255);
+        addr[6] = (byte)((ipAddr >> 16) & 255);
+        addr[7] = (byte)((ipAddr >> 24) & 255);
+        return addr;
+    }
+    #endif
+}
+#endif

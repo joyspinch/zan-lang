@@ -1,0 +1,195 @@
+#if WINDOWS
+using System;
+
+namespace System.Platform;
+
+// Windows 平台的套接字与网络系统调用实现（基于 WinSock2 ws2_32 与 kernel32）。
+public class WindowsNetwork : IPlatformNetwork {
+    [DllImport("ws2_32", EntryPoint = "WSAStartup")]
+    private static extern int WinWSAStartup(ushort version, string wsaData);
+
+    [DllImport("ws2_32", EntryPoint = "socket")]
+    public static extern nint WinSocket(int af, int type, int protocol);
+
+    [DllImport("ws2_32", EntryPoint = "closesocket")]
+    private static extern int WinCloseSocket(nint s);
+
+    [DllImport("ws2_32", EntryPoint = "shutdown")]
+    private static extern int WinShutdown(nint s, int how);
+
+    [DllImport("ws2_32", EntryPoint = "bind")]
+    private static extern int WinBind(nint s, string addr, int addrlen);
+
+    [DllImport("ws2_32", EntryPoint = "listen")]
+    private static extern int WinListen(nint s, int backlog);
+
+    [DllImport("ws2_32", EntryPoint = "accept")]
+    private static extern nint WinAccept(nint s, string addr, string addrlen);
+
+    [DllImport("ws2_32", EntryPoint = "connect")]
+    private static extern int WinConnect(nint s, string addr, int addrlen);
+
+    [DllImport("ws2_32", EntryPoint = "setsockopt")]
+    private static extern int WinSetSockOpt(nint s, int level, int optname, string optval, int optlen);
+
+    [DllImport("ws2_32", EntryPoint = "ioctlsocket")]
+    private static extern int WinIoctlSocket(nint s, int cmd, string argp);
+
+    [DllImport("kernel32", EntryPoint = "CancelIoEx")]
+    private static extern int WinCancelIoEx(nint handle, nint overlapped);
+
+    [DllImport("ws2_32", EntryPoint = "sendto")]
+    private static extern int WinSendTo(nint s, string buf, int len, int flags, string to, int tolen);
+
+    [DllImport("ws2_32", EntryPoint = "recvfrom")]
+    private static extern int WinRecvFrom(nint s, string buf, int len, int flags, string from, string fromlen);
+
+    [DllImport("ws2_32", EntryPoint = "WSAGetLastError")]
+    private static extern int WinLastError();
+
+    [DllImport("crt", EntryPoint = "zan_io_socket_cleanup")]
+    private static extern void ReactorCleanup();
+
+    bool initialized = false;
+
+    public void Initialize() {
+        if (!this.initialized) {
+            byte[] wsaData = new byte[512];
+            WindowsNetwork.WinWSAStartup(514, wsaData);
+            this.initialized = true;
+        }
+    }
+
+    public void Cleanup() {
+        if (this.initialized) {
+            WindowsNetwork.ReactorCleanup();
+            this.initialized = false;
+        }
+    }
+
+    public nint CreateTcpSocket(bool ipv6) {
+        this.Initialize();
+        int af = ipv6 ? 23 : 2; // AF_INET6=23, AF_INET=2
+        return WindowsNetwork.WinSocket(af, 1, 6); // SOCK_STREAM=1, IPPROTO_TCP=6
+    }
+
+    public nint CreateUdpSocket(bool ipv6) {
+        this.Initialize();
+        int af = ipv6 ? 23 : 2; // AF_INET6=23, AF_INET=2
+        return WindowsNetwork.WinSocket(af, 2, 17); // SOCK_DGRAM=2, IPPROTO_UDP=17
+    }
+
+    public nint CreateSocket(int af, int type, int protocol) {
+        this.Initialize();
+        return WindowsNetwork.WinSocket(af, type, protocol);
+    }
+
+    public int CloseSocket(nint s) {
+        return WindowsNetwork.WinCloseSocket(s);
+    }
+
+    public int Shutdown(nint s, int how) {
+        return WindowsNetwork.WinShutdown(s, how);
+    }
+
+    public int Bind(nint s, string addr, int addrlen) {
+        return WindowsNetwork.WinBind(s, addr, addrlen);
+    }
+
+    public int Listen(nint s, int backlog) {
+        return WindowsNetwork.WinListen(s, backlog);
+    }
+
+    public nint Accept(nint s, string addr, string addrlen) {
+        return WindowsNetwork.WinAccept(s, addr, addrlen);
+    }
+
+    public int Connect(nint s, string addr, int addrlen) {
+        return WindowsNetwork.WinConnect(s, addr, addrlen);
+    }
+
+    public int SetNonBlocking(nint s) {
+        byte[] argp = new byte[4];
+        argp[0] = 1;
+        // FIONBIO = 0x8004667e = -2147195266
+        return WindowsNetwork.WinIoctlSocket(s, -2147195266, argp);
+    }
+
+    public void CancelPendingIo(nint s) {
+        if (s >= 0) {
+            WindowsNetwork.WinCancelIoEx(s, 0);
+        }
+    }
+
+    public int SetSocketOption(nint s, int level, int optname, string optval, int optlen) {
+        return WindowsNetwork.WinSetSockOpt(s, level, optname, optval, optlen);
+    }
+
+    public void SetReuseAddress(nint s, bool on) {
+        byte[] optval = new byte[4];
+        if (on) { optval[0] = 1; }
+        // SOL_SOCKET = 65535, SO_REUSEADDR = 4
+        WindowsNetwork.WinSetSockOpt(s, 65535, 4, optval, 4);
+    }
+
+    public void SetReusePort(nint s, bool on) {
+        // Windows SO_REUSEADDR 默认具有多播/单播端口复用语义，无单独 SO_REUSEPORT
+    }
+
+    public void SetNoDelay(nint s, bool on) {
+        byte[] optval = new byte[4];
+        if (on) { optval[0] = 1; }
+        // IPPROTO_TCP = 6, TCP_NODELAY = 1
+        WindowsNetwork.WinSetSockOpt(s, 6, 1, optval, 4);
+    }
+
+    public void SetBroadcast(nint s, bool on) {
+        byte[] optval = new byte[4];
+        if (on) { optval[0] = 1; }
+        // SOL_SOCKET = 65535, SO_BROADCAST = 32
+        WindowsNetwork.WinSetSockOpt(s, 65535, 32, optval, 4);
+    }
+
+    public int SendTo(nint s, string buf, int len, int flags, string to, int tolen) {
+        return WindowsNetwork.WinSendTo(s, buf, len, flags, to, tolen);
+    }
+
+    public int RecvFrom(nint s, string buf, int len, int flags, string from, string fromlen) {
+        return WindowsNetwork.WinRecvFrom(s, buf, len, flags, from, fromlen);
+    }
+
+    public int GetLastSocketError() {
+        return WindowsNetwork.WinLastError();
+    }
+
+    public bool IsIpv6Family(int family) {
+        return family == 23;
+    }
+
+    public bool IsUdpResetError(int error) {
+        return error == 10054;
+    }
+
+    public bool SupportsAsyncAcceptOv() {
+        return true;
+    }
+
+    public bool IsTransientAcceptError(int error) {
+        return false;
+    }
+
+    public byte[] CreateSockAddrV4(int ipAddr, int port) {
+        byte[] addr = new byte[16];
+        addr[0] = 2; // AF_INET
+        addr[1] = 0;
+        int nport = ((port & 255) << 8) | ((port >> 8) & 255);
+        addr[2] = (byte)(nport & 255);
+        addr[3] = (byte)((nport >> 8) & 255);
+        addr[4] = (byte)(ipAddr & 255);
+        addr[5] = (byte)((ipAddr >> 8) & 255);
+        addr[6] = (byte)((ipAddr >> 16) & 255);
+        addr[7] = (byte)((ipAddr >> 24) & 255);
+        return addr;
+    }
+}
+#endif
