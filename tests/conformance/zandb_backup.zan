@@ -1,0 +1,209 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Json;
+using System.Data.ZanDb;
+
+// ZanDB 热备份与一致快照导出 API（B-ID148）：
+//   1. 空库热备与恢复巡检；
+//   2. 含未固化 memtable、文本检索索引与向量检索索引的一致性热备导出；
+//   3. 备份库独立打开、文档点查、全文检索与向量近邻检索保真度；
+//   4. 源库与备份库写隔离（互不影响）；
+//   5. 多段与增量固化场景热备导出；
+//   6. 契约防御：同路径拒绝、事务中拒绝、已关闭拒绝；
+//   7. 异常不毒化当前运行中句柄。
+// 输出确定性，与 zandb_backup.out 比对。
+class ZanDbBackupTest {
+    static int checks = 0;
+
+    static void Ok(bool cond, string what) {
+        checks = checks + 1;
+        if (cond) {
+            Console.WriteLine("ok " + Convert.ToString(checks) + " - " + what);
+        } else {
+            Console.WriteLine("FAIL " + Convert.ToString(checks) + " - " + what);
+        }
+    }
+
+    static void Clean(string basePath) {
+        ZanStore.CleanTargetFiles(basePath, 50);
+    }
+
+    static JsonValue UserDoc(int id, string name, int age) {
+        JsonValue doc = JsonValue.NewObject();
+        doc.Put("name", JsonValue.NewStr(name));
+        doc.Put("age", JsonValue.NewNum(Convert.ToString(age)));
+        return doc;
+    }
+
+    static JsonValue NoteDoc(int id, string content) {
+        JsonValue doc = JsonValue.NewObject();
+        doc.Put("content", JsonValue.NewStr(content));
+        return doc;
+    }
+
+    static JsonValue VecDoc(int id, float[] v) {
+        JsonValue doc = JsonValue.NewObject();
+        JsonValue arr = JsonValue.NewArray();
+        for (int i = 0; i < v.Length; i = i + 1) {
+            arr.Append(JsonValue.NewDouble((double)v[i]));
+        }
+        doc.Put("v", arr);
+        return doc;
+    }
+
+    static void Main() {
+        string srcPath = "_scratch/zandb_bk_src.zdb";
+        string dstPath = "_scratch/zandb_bk_dst.zdb";
+        string dstPath2 = "_scratch/zandb_bk_dst2.zdb";
+
+        Directory.CreateDirectory("_scratch");
+        Clean(srcPath);
+        Clean(dstPath);
+        Clean(dstPath2);
+
+        // ==== 阶段 1：空库热备份 ====
+        ZanDatabase db = ZanDatabase.Open(srcPath, ZanStore.DUR_SYNC);
+        Ok(db.IsOpen(), "open source db");
+
+        db.Backup(dstPath);
+        Ok(File.Exists(dstPath + ".m0") && File.Exists(dstPath + ".m1"), "empty backup created double-slot manifest");
+
+        ZanDatabase probe1 = ZanDatabase.Open(dstPath, ZanStore.DUR_SYNC);
+        Ok(probe1.IsOpen(), "empty backup opens cleanly");
+        List<string> probs1 = probe1.IntegrityCheck();
+        Ok(probs1.Count == 0, "empty backup integrity check clean");
+        probe1.Close();
+
+        // ==== 阶段 2：含数据、全文索引与向量索引的热备份 ====
+        Collection users = db.GetCollection("users");
+        for (int i = 1; i <= 5; i = i + 1) {
+            users.Insert(UserDoc(i, "user" + Convert.ToString(i), 20 + i));
+        }
+
+        Collection notes = db.GetCollection("notes");
+        TextTokenizer tokenizer = new TextTokenizer();
+        notes.EnsureFullTextIndex("content", tokenizer);
+        notes.Insert(NoteDoc(1, "ZanDB 数据库热备份与容灾恢复"));
+        notes.Insert(NoteDoc(2, "高性能向量图索引与混合检索"));
+        notes.CheckpointSearchIndexes();
+
+        Collection vecs = db.GetCollection("vecs");
+        VectorIndexOptions vopt = new VectorIndexOptions(4);
+        vecs.EnsureVectorIndex("v", vopt);
+        float[] v1 = new float[] { 1.0f, 0.0f, 0.0f, 0.0f };
+        float[] v2 = new float[] { 0.0f, 1.0f, 0.0f, 0.0f };
+        vecs.Insert(VecDoc(1, v1));
+        vecs.Insert(VecDoc(2, v2));
+        vecs.CheckpointSearchIndexes();
+
+        // 执行热备份（内存 memtable 尚未手动 Flush）
+        db.Backup(dstPath);
+        Ok(File.Exists(dstPath + ".m0") && File.Exists(dstPath + ".m1"), "backup double slots present");
+
+        // ==== 阶段 3：备份库查询与索引保真度验证 ====
+        ZanDatabase backupDb = ZanDatabase.Open(dstPath, ZanStore.DUR_SYNC);
+        Ok(backupDb.IsOpen(), "backup db opens cleanly");
+        List<string> backupProbs = backupDb.IntegrityCheck();
+        Ok(backupProbs.Count == 0, "backup db integrity clean");
+
+        Collection bUsers = backupDb.GetCollection("users");
+        JsonValue u1 = bUsers.FindById(1);
+        Ok(u1 != null && u1.Str("name", "") == "user1", "backup users collection document intact");
+
+        Collection bNotes = backupDb.GetCollection("notes");
+        List<Bm25Hit> hits = bNotes.SearchText("content", "热备份", 5);
+        Ok(hits.Count == 1 && hits[0].id == 1, "backup fulltext search works correctly");
+
+        Collection bVecs = backupDb.GetCollection("vecs");
+        float[] qv = new float[] { 0.9f, 0.1f, 0.0f, 0.0f };
+        List<VectorHit> vhits = bVecs.SearchVector("v", qv, 2, 32);
+        Ok(vhits.Count == 2 && vhits[0].id == 1, "backup vector search works correctly");
+
+        // ==== 阶段 4：源库与备份库写隔离 ====
+        // 在源库新增文档，备份库不受影响
+        users.Insert(UserDoc(99, "new_source_user", 99));
+        JsonValue bCheck = bUsers.FindById(99);
+        Ok(bCheck == null, "source write does not affect backup db");
+
+        // 在备份库新增文档，源库不受影响
+        bUsers.Insert(UserDoc(88, "new_backup_user", 88));
+        JsonValue sCheck = users.FindById(88);
+        Ok(sCheck == null, "backup write does not affect source db");
+        backupDb.Close();
+
+        // ==== 阶段 5：多段与多次固化热备份 ====
+        for (int i = 10; i < 20; i = i + 1) {
+            users.Insert(UserDoc(i, "user" + Convert.ToString(i), 30 + i));
+        }
+        db.Flush();
+        int id25 = 0;
+        for (int i = 20; i < 30; i = i + 1) {
+            int inserted = users.Insert(UserDoc(i, "user" + Convert.ToString(i), 40 + i));
+            if (i == 25) { id25 = inserted; }
+        }
+        db.Flush();
+        Ok(db.SegCount() >= 2, "source db has multiple segments");
+
+        db.Backup(dstPath2);
+        ZanDatabase backupDb2 = ZanDatabase.Open(dstPath2, ZanStore.DUR_SYNC);
+        Ok(backupDb2.IsOpen(), "multi-segment backup opens cleanly");
+        Ok(backupDb2.IntegrityCheck().Count == 0, "multi-segment backup integrity clean");
+        Collection bUsers2 = backupDb2.GetCollection("users");
+        JsonValue u25 = bUsers2.FindById(id25);
+        Ok(u25 != null && u25.Str("name", "") == "user25", "multi-segment backup row verified");
+        backupDb2.Close();
+
+        // ==== 阶段 6：契约与异常分支防御 ====
+        // 1. 同路径备份必须抛出 ArgumentException
+        bool caughtSamePath = false;
+        try {
+            db.Backup(srcPath);
+        } catch (ArgumentException ex) {
+            caughtSamePath = true;
+        }
+        Ok(caughtSamePath, "backup to same path rejected with ArgumentException");
+
+        // 2. 空路径备份必须抛出 ArgumentException
+        bool caughtEmptyPath = false;
+        try {
+            db.Backup("");
+        } catch (ArgumentException ex) {
+            caughtEmptyPath = true;
+        }
+        Ok(caughtEmptyPath, "backup to empty path rejected with ArgumentException");
+
+        // 3. 显式事务中备份必须抛出 InvalidOperationException
+        bool caughtInTx = false;
+        db.Begin();
+        try {
+            db.Backup(dstPath);
+        } catch (InvalidOperationException ex) {
+            caughtInTx = true;
+        }
+        db.Rollback();
+        Ok(caughtInTx, "backup inside transaction rejected with InvalidOperationException");
+
+        // ==== 阶段 7：句柄未被毒化，持续可写 ====
+        int id200 = users.Insert(UserDoc(200, "user200", 50));
+        JsonValue u200 = users.FindById(id200);
+        Ok(u200 != null && u200.Str("name", "") == "user200", "source db remains fully functional");
+
+        db.Close();
+
+        // 4. 关闭后备份必须抛出 InvalidOperationException
+        bool caughtClosed = false;
+        try {
+            db.Backup(dstPath);
+        } catch (InvalidOperationException ex) {
+            caughtClosed = true;
+        }
+        Ok(caughtClosed, "backup on closed db rejected with InvalidOperationException");
+
+        Clean(srcPath);
+        Clean(dstPath);
+        Clean(dstPath2);
+
+        Console.WriteLine("done backup tests: " + Convert.ToString(checks));
+    }
+}

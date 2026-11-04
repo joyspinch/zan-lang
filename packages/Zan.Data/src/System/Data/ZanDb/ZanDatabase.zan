@@ -104,6 +104,48 @@ public class ZanDatabase : IDisposable {
     // 最老 mergeK 段（0 = 关闭，默认）。见
     public void SetAutoMerge(int atSegs, int mergeK) { this.kv.SetAutoMerge(atSegs, mergeK); }
 
+    // 热备份 / 一致快照导出（SQLite backup API 对位）：
+    // 锁内原子截取底层 KV 存储与检索检查点，导出到目标路径并执行全库巡检审计。
+    public void Backup(string targetPath) {
+        if (!this.IsOpen()) {
+            throw new InvalidOperationException("cannot backup closed database: " + this.GetError());
+        }
+        string target = Path.Normalize(targetPath);
+        this.kv.Backup(target);
+        // 对导出的数据库做全库巡检审计（包含已注册集合的索引代审计）
+        ZanDatabase probe = ZanDatabase.Open(target, ZanStore.DUR_SYNC);
+        if (!probe.IsOpen()) {
+            string err = probe.GetError();
+            probe.Close();
+            ZanStore.CleanTargetFiles(target, 256);
+            throw new IOException("backup database probe failed: " + err);
+        }
+        for (int i = 0; i < this.entries.Count; i = i + 1) {
+            probe.GetCollection(this.entries[i].name);
+        }
+        List<string> problems = probe.IntegrityCheck();
+        probe.Close();
+        if (problems.Count > 0) {
+            ZanStore.CleanTargetFiles(target, 256);
+            string msg = "";
+            for (int i = 0; i < problems.Count; i = i + 1) {
+                if (i > 0) { msg = msg + "; "; }
+                msg = msg + problems[i];
+            }
+            throw new IOException("backup database integrity check failed: " + msg);
+        }
+    }
+
+    // 协程异步热备份（排他写锁保护）
+    public async void BackupAsync(string targetPath) {
+        await this.rw.EnterWrite();
+        try {
+            this.Backup(targetPath);
+        } finally {
+            this.rw.ExitWrite();
+        }
+    }
+
     // 关闭底层存储与读写锁。
     public void Close() {
         this.kv.Close();
