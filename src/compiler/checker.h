@@ -36,6 +36,11 @@ struct zan_checker {
      * （唯一方法路径与重载路径会撞上同一处）。 */
     zan_loc_t null_arg_reported;
     bool has_null_arg_reported;
+    /* 正在检查调用实参（B-ID65）：显式 (ExprNode/Expr<T>) 型 lambda 形参
+     * 的体在此刻不查——树 lambda 在 irgen 发射口降级为 ExprNode 构造树，
+     * 体里的 x.F 在此查会误报 ExprNode 上无成员（E2084 假阳性）。
+     * 非调用位置照旧查体。 */
+    int in_call_args;
 };
 
 void zan_checker_init(zan_checker_t *c, zan_binder_t *binder,

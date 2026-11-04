@@ -4390,6 +4390,8 @@ static void zan_irgen_compact_completed(zan_irgen_t *g, LLVMValueRef fn) {
 static LLVMValueRef emit_implicit_box(zan_irgen_t *g, zan_type_t *lt,
                                       LLVMValueRef val, zan_ast_node_t *rhs,
                                       local_scope_t *locals);
+/* B-ID65 树 lambda 判定（定义在 irgen_expr_lambda.c） */
+static bool irgen_is_tree_lambda(zan_irgen_t *g, zan_ast_node_t *expr);
 
 #include "irgen_expr_core.c"
 #include "irgen_weak.c"

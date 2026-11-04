@@ -21,7 +21,29 @@ public class ExprSql {
         if (n == null) { return ""; }
         if (n.Kind == 1 && n.TVal == 2) { return n.SVal; }
         if (n.Kind == 1 && n.TVal == 0) { return Convert.ToString(n.IVal); }
+        if (n.Kind == 1 && n.TVal == 5) { return Convert.ToString(n.LVal); }
         return "";
+    }
+
+    // n 是否 null 常量节点（TVal 4）。等值比较撞上它必须译
+    // IS [NOT] NULL——SQL 三值逻辑下 `= NULL` 永不命中。
+    public static bool IsNullConst(ExprNode n) {
+        return n != null && n.Kind == 1 && n.TVal == 4;
+    }
+
+    // LIKE 模式转义：用户文本里的 \ % _ 原义化（前置 \），
+    // 通配语义只留给调用形态补的 %；拼 ESCAPE '\' 子句使用。
+    public static string EscapeLike(string s) {
+        if (s == null) { return s; }
+        if (s.IndexOf("\\") < 0 && s.IndexOf("%") < 0 &&
+            s.IndexOf("_") < 0) { return s; }
+        StringBuilder e = new StringBuilder();
+        for (int i = 0; i < s.Length; i++) {
+            char c = s[i];
+            if (c == '\\' || c == '%' || c == '_') { e.Append("\\"); }
+            e.Append(c);
+        }
+        return e.ToString();
     }
 
     // Zan 比较运算符对应的 SQL 写法。SQLite 恰好
@@ -49,12 +71,38 @@ public class ExprSql {
                 ps.AddInt(n.BVal ? 1 : 0);
             } else if (n.TVal == 1) {
                 ps.AddDouble(n.DVal);
+            } else if (n.TVal == 4) {
+                ps.AddNull();
+            } else if (n.TVal == 5) {
+                ps.AddLong(n.LVal);
             } else {
                 ps.AddInt(n.IVal);
             }
             sb.Append("?");
         } else if (n.Kind == 2) {
-            if (n.Name == "&&") {
+            if (n.Name == "==" || n.Name == "!=") {
+                // 等值撞 null 常量（B-ID65）：`= NULL` 在三值逻辑下永不
+                // 命中，必须译 IS [NOT] NULL；两边全 null 是常量谓词。
+                bool la = IsNullConst(n.A);
+                bool lb = IsNullConst(n.B);
+                if (la && lb) {
+                    sb.Append(n.Name == "==" ? "1=1" : "1=0");
+                } else if (la || lb) {
+                    sb.Append("(");
+                    Build(la ? n.B : n.A, sb, ps);
+                    sb.Append(" IS ");
+                    if (n.Name == "!=") { sb.Append("NOT "); }
+                    sb.Append("NULL)");
+                } else {
+                    sb.Append("(");
+                    Build(n.A, sb, ps);
+                    sb.Append(" ");
+                    sb.Append(SqlOp(n.Name));
+                    sb.Append(" ");
+                    Build(n.B, sb, ps);
+                    sb.Append(")");
+                }
+            } else if (n.Name == "&&") {
                 sb.Append("(");
                 Build(n.A, sb, ps);
                 sb.Append(" AND ");
@@ -83,8 +131,10 @@ public class ExprSql {
             if (n.Name == "StartsWith" || n.Name == "EndsWith" ||
                 n.Name == "Contains") {
                 Build(n.A, sb, ps);
-                sb.Append(" LIKE ?");
-                string pat = EvalText(n.B);
+                // ESCAPE '\'（B-ID65）：用户文本经 EscapeLike 原义化，
+                // 通配语义只留给这里补的 %。
+                sb.Append(" LIKE ? ESCAPE '\\'");
+                string pat = EscapeLike(EvalText(n.B));
                 if (n.Name == "StartsWith") {
                     pat = pat + "%";
                 } else if (n.Name == "EndsWith") {

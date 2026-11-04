@@ -1232,6 +1232,10 @@ static int concrete_arg_score(zan_irgen_t *g, zan_type_t *pt,
     return -1;
 }
 
+/* B-ID65 只读表达式树：树目标类型判定。实现在 irgen_expr_lambda.c
+ * （同一编译单元，irgen.c 先包含本文件后包含它，这里前置声明）。 */
+static bool irgen_type_is_tree_target(zan_type_t *t);
+
 static int method_args_score(zan_irgen_t *g, zan_symbol_t *m,
                              zan_ast_node_t *call, zan_ast_node_t *recv_expr,
                              local_scope_t *locals, int p0) {
@@ -1279,6 +1283,25 @@ static int method_args_score(zan_irgen_t *g, zan_symbol_t *m,
             zan_type_t *dp = method_param_type_at(g, m, j, call, recv_expr, locals);
             if (!dp) continue;                        /* 判不出来：宽容放过 */
             if (dp->kind == TYPE_TYPE_PARAM || type_mentions_tp(dp)) continue;
+            /* B-ID65：ExprNode / Expr<T> 形参收树 lambda。显式树形参 +
+             * 表达式体单参 lambda → +8 压过 Func 候选；其余 lambda 对
+             * 树形参一律判死——无类型 lambda 继续走 Func（内存过滤，
+             * 存量行为零变化），块体不可树译 fail-closed。门面链的过载
+             * 决议在 checker 不可达（接收者类型降级），这里的打分是
+             * 此类调用唯一的决议点；checker 侧同名分支
+             * （checker_find_method_typed）只服务接收者类型完好的调用。 */
+            if (irgen_type_is_tree_target(dp)) {
+                zan_ast_node_t *lp0 = (lam->lambda.params.count == 1)
+                    ? lam->lambda.params.items[0] : NULL;
+                if (lam->lambda.body && lam->lambda.body->kind != AST_BLOCK &&
+                    lp0 && lp0->kind == AST_PARAM && lp0->param.type &&
+                    irgen_type_is_tree_target(
+                        resolve_type_ctx(g, lp0->param.type))) {
+                    score += 8;
+                    continue;
+                }
+                return -1;
+            }
             if (dp->kind != TYPE_DELEGATE) return -1; /* lambda 只能转委托 */
             if (lam->lambda.params.count != dp->delegate_param_count) return -1;
             score += 2;
@@ -1889,6 +1912,12 @@ static zan_type_t *infer_expr_type_raw(zan_irgen_t *g, zan_ast_node_t *e,
         return g->current_type_sym ? g->current_type_sym->type : NULL;
     case AST_AWAIT_EXPR:
         return infer_expr_type(g, e->await_expr.expr, locals);
+    case AST_LAMBDA:
+        if (irgen_is_tree_lambda(g, e) && e->lambda.params.count == 1 &&
+            e->lambda.params.items[0]->param.type) {
+            return resolve_type_ctx(g, e->lambda.params.items[0]->param.type);
+        }
+        return NULL;
     case AST_QUERY_EXPR: {
         zan_type_t *src_ty = infer_expr_type(g, e->query.source, locals);
         zan_type_t *elem = container_elem_type(src_ty);

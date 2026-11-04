@@ -6231,10 +6231,13 @@ set(_new_diag_cases
   ctor_interface_arg_mismatch
   call_interface_arg_mismatch
   abstract_not_implemented
-  abstract_instantiation)
+  abstract_instantiation
+  expr_tree_untranslatable)
 foreach(_case ${_new_diag_cases})
   if(_case STREQUAL cyclic_inheritance)
     set(_diag_regex "cyclic inheritance")
+  elseif(_case STREQUAL expr_tree_untranslatable)
+    set(_diag_regex "expression tree lambda: outer variables cannot be captured")
   elseif(_case STREQUAL ctor_interface_arg_mismatch)
     set(_diag_regex "cannot convert 'DbContext' to 'IDbConnection' in argument 1 of 'CategoryDao' constructor")
   elseif(_case STREQUAL call_interface_arg_mismatch)

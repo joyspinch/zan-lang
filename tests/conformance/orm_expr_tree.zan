@@ -1,0 +1,86 @@
+// B-ID65：ORM 强类型表达式树——显式 `(ExprNode x) => …` 单参表达式体
+// lambda 在 irgen 发射口降级为 ExprNode 构造树，绑定既有
+// Where(ExprNode) 门面，由访问者译成参数化 SQL（服务端过滤，不再
+// 掉进 Func 内存过滤的全表扫）。钉住：比较/算术/&&/||/!/负号字面/
+// IS NULL / IS NOT NULL/LIKE/TVal5 long 列/SQL 文本快照/无类型
+// lambda 仍走 Func（行为零变化）。
+using System;
+using System.Data;
+using System.Data.Orm;
+using System.Data.Sqlite;
+using System.IO;
+using System.Linq;
+
+[Table("et_users")]
+class EtUser {
+    [Column(IsIdentity = true)]
+    public int id;
+
+    [Column(StringLength = 50)]
+    public string name;
+
+    public int age;
+
+    public long big;
+}
+
+class Program {
+    static void Main() {
+        string path = "_scratch/orm_expr_tree.tmp.db";
+        if (File.Exists(path)) { File.Delete(path); }
+        SqliteConnection db = SqliteConnection.Open(path);
+        db.SyncStructure<EtUser>();
+
+        // alice/bob/dave 有名字，carol 名字为 NULL（IS NULL 面）。
+        string[] names = new string[] { "alice", "bob", null, "dave" };
+        int[] ages = new int[] { 30, 17, 40, 25 };
+        long[] bigs = new long[] { 5, 7000000000, 3, 9 };
+        for (int i = 0; i < 4; i = i + 1) {
+            EtUser u = new EtUser();
+            u.name = names[i];
+            u.age = ages[i];
+            u.big = bigs[i];
+            db.Insert<EtUser>(u).ExecuteAffrows();
+        }
+
+        // 比较：> 与 <=（服务端 WHERE，不是全表扫内存过滤）
+        int q1 = db.Select<EtUser>().Where((ExprNode x) => x.age > 18).Count();
+        Console.WriteLine("q1>18: " + Convert.ToString(q1));
+        int q2 = db.Select<EtUser>().Where((ExprNode x) => x.age <= 17).Count();
+        Console.WriteLine("q2<=17: " + Convert.ToString(q2));
+
+        // null 语义：= NULL 永不命中，访问者必须译 IS [NOT] NULL
+        EtUser q3 = db.Select<EtUser>().Where((ExprNode x) => x.name == null).First();
+        Console.WriteLine("q3null: " + Convert.ToString(q3.age));
+        int q4 = db.Select<EtUser>().Where((ExprNode x) => x.name != null).Count();
+        Console.WriteLine("q4notnull: " + Convert.ToString(q4));
+
+        // LIKE：StartsWith 与 Contains + && + 算术
+        EtUser q5 = db.Select<EtUser>().Where((ExprNode x) => x.name.StartsWith("al")).First();
+        Console.WriteLine("q5sw: " + q5.name);
+        EtUser q6 = db.Select<EtUser>().Where((ExprNode x) => x.name.Contains("li") && x.age + 1 > 30).First();
+        Console.WriteLine("q6mix: " + q6.name);
+
+        // || 与 !、负号字面量
+        int q7 = db.Select<EtUser>().Where((ExprNode x) => !(x.age < 18) || x.age == 17).Count();
+        Console.WriteLine("q7or: " + Convert.ToString(q7));
+        int q8 = db.Select<EtUser>().Where((ExprNode x) => x.age > -1).Count();
+        Console.WriteLine("q8neg: " + Convert.ToString(q8));
+
+        // long 列比较：字面量超 int 范围自动升 long（TVal5 绑定）
+        EtUser q9 = db.Select<EtUser>().Where((ExprNode x) => x.big > 1000000).First();
+        Console.WriteLine("q9long: " + q9.name);
+
+        // SQL 文本快照：IS NOT NULL 形态与参数化占位符
+        SelectQuery<EtUser> sq = db.Select<EtUser>().Where((ExprNode x) => x.name != null && x.age > 18);
+        Console.WriteLine("sql: " + sq.inner.w);
+
+        // 无类型 lambda 仍是 Func（内存过滤）——存量行为零变化
+        int q10 = db.Select<EtUser>().Where(x => x.age > 18).Count();
+        Console.WriteLine("q10func: " + Convert.ToString(q10));
+
+        db.Close();
+        if (File.Exists(path)) { File.Delete(path); }
+        Console.WriteLine("done");
+    }
+}

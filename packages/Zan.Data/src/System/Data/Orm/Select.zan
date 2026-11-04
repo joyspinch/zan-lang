@@ -81,13 +81,46 @@ public class Select {
     }
 
     // lambda 降级出的表达式树：SQL 片段与绑定值都由
-    // <see cref="ExprSql"/> 产出。
+    // <see cref="ExprSql"/> 产出。成员引用先过实体元数据
+    // （B-ID65 fail-closed）：字段名翻译成物理列名（[Column] 改名
+    // 实体不落错列），未知列名抛异常——树与实体形状失配必须在
+    // 构建期现形，不能落成 `t.未知列` 等数据库报错。
     public void WExpr(ExprNode root) {
         if (!this.on) { return; }
         if (root == null) { return; }
+        this.BindTreeCols(root);
         StringBuilder sb = new StringBuilder();
         ExprSql.Build(root, sb, this.ps);
         this.W(sb.ToString());
+    }
+
+    // 递归解析树里的成员引用：字段名 → 物理列名（就地改写
+    // Name，同一棵树重复使用无碍——解析是幂等的），也接受
+    // 手工拼树直接写列名；两者都不是就抛异常。
+    public void BindTreeCols(ExprNode n) {
+        if (n == null) { return; }
+        if (n.Kind == 0) {
+            Col c = this.ColByField(n.Name);
+            if (c == null) { c = this.meta.Find(n.Name); }
+            if (c == null) {
+                throw new Exception(this.meta.Table +
+                                    " has no column: " + n.Name);
+            }
+            n.Name = c.Col;
+            return;
+        }
+        this.BindTreeCols(n.A);
+        this.BindTreeCols(n.B);
+    }
+
+    // 按实体字段名找列（byCol 键是物理列名，字段名走线性表；
+    // 列数是实体规模，逐节点解析的代价可忽略）。
+    public Col ColByField(string f) {
+        for (int i = 0; i < this.meta.Cols.Count; i = i + 1) {
+            Col c = this.meta.Cols[i];
+            if (c.Field == f) { return c; }
+        }
+        return null;
     }
 
     // 动态列集合等值条件：列名按实体校验，值按列声明类型

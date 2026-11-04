@@ -353,6 +353,7 @@
 | E3100 | E | generic instantiation did not reach a fixed point within %d iterations; the type graph may be recursively dependent or too large |
 | E3101 | E | out of memory recording obfuscated string literals (%d recorded) |
 | E3102 | E | entry point 'Main' cannot be declared in a generic class -- move it to a non-generic type (C# parity) |
+| E3103 | E | expression tree lambda: …（树 lambda 不可译形状 fail-closed——decimal 字面、不支持的运算符/方法、lambda 参数自身引用、外层变量捕获、非 `x.F` 直接成员访问、LIKE 实参非常量等；见 src/compiler/irgen_expr_lambda.c。树 lambda = 显式 `(ExprNode x) => …` / `(Expr&lt;T&gt; x) => …` 单参表达式体，在 irgen emit_lambda_typed 降级为 ExprNode 构造树，静默降级会把 ORM 谓词变成全表扫） |
 
 ### 互操作/运行时契约（src/compiler/irgen_abi.c + irgen_expr_core.c + checker.c，段 4000–4999）
 

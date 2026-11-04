@@ -1859,6 +1859,10 @@ static bool checker_cast_is_valid(zan_checker_t *c, zan_type_t *dst,
 static zan_symbol_t *expr_method_group(zan_checker_t *c, zan_ast_node_t *e);
 static void reject_method_group(zan_checker_t *c, zan_ast_node_t *e);
 
+/* B-ID65 只读表达式树：树类型识别；lambda 的树降级在 irgen 发射口
+ * （irgen_expr_lambda.c emit_lambda_typed），实现体在文件尾。 */
+static bool checker_type_is_expr_tree_target(zan_type_t *t);
+
 /* 方法组 → 委托的签名兼容性（C# 方法组转换规则的收窄版）：
  * 参数个数一致、每个委托形参可赋给方法形参（逆变方向）、
  * 返回值 void 对 void，否则方法返回类型可赋给委托返回类型（协变）。
@@ -2260,6 +2264,26 @@ static zan_symbol_t *checker_find_method_typed(zan_checker_t *c,
                 if (lam) {
                     if (!pt || pt->kind == TYPE_ERROR) continue;
                     if (pt->kind == TYPE_TYPE_PARAM) continue; /* T 可能是委托 */
+                    if (checker_type_is_expr_tree_target(pt)) {
+                        /* B-ID65：ExprNode / Expr<T> 形参收树 lambda。只有
+                         * 显式标了树类型形参（`(ExprNode x) => …`）的表达
+                         * 式体单参 lambda 才给 +8 压过 Func 候选（+4）——
+                         * 无类型 lambda 只给 +2，存量 `Where(x => …)` 继续
+                         * 走委托（内存过滤），行为零变化。块体不可树译。 */
+                        if (lam->lambda.params.count != 1 || !lam->lambda.body ||
+                            lam->lambda.body->kind == AST_BLOCK) {
+                            compatible = false;
+                            break;
+                        }
+                        zan_ast_node_t *lp0 = lam->lambda.params.items[0];
+                        bool want_tree = lp0 && lp0->kind == AST_PARAM &&
+                            lp0->param.type &&
+                            checker_type_is_expr_tree_target(
+                                zan_binder_resolve_type(c->binder,
+                                                        lp0->param.type));
+                        score += want_tree ? 8 : 2;
+                        continue;
+                    }
                     if (pt->kind != TYPE_DELEGATE) { compatible = false; break; }
                     if (lam->lambda.params.count != pt->delegate_param_count) {
                         compatible = false;
@@ -3586,6 +3610,7 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
             callee_type = zan_checker_check_expr(c, expr->call.callee);
         }
         zan_symbol_t *arg_sig = call_arg_signature(c, expr, recv);
+        c->in_call_args = 1;
         for (int i = 0; i < expr->call.args.count; i++) {
             zan_ast_node_t *arg = expr->call.args.items[i];
             if (arg && arg->kind == AST_NAMED_ARG) arg = arg->named_arg.expr;
@@ -3601,6 +3626,7 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
             if (arg_sig && arg)
                 check_call_arg_type(c, arg_sig, i, arg, arg_type);
         }
+        c->in_call_args = 0;
         /* 内建泛型容器（List<T> / Dict<K,V>）的成员没有 sym，签名拼不到
          * → 实参类型从来没被检查过。单独走一条路（见
          * check_builtin_generic_call_args 的注释）。 */
@@ -4151,6 +4177,21 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
 
     case AST_LAMBDA:
         no_runtime_reject(c, expr->loc, "a lambda");
+        /* B-ID65：调用实参位置的显式树类型 lambda（`(ExprNode x) => …` /
+         * `(Expr<T> x) => …`）不查体——树 lambda 在 irgen 发射口降级为
+         * ExprNode 构造树；此刻查体会把 x.F 误报成 ExprNode 上无成员
+         * （E2084 假阳性，探针 p1 实证）。返回形参的树类型让绑定侧正常
+         * 比对；非调用位置（局部赋值等）不在此列，照旧查体按旧语义报
+         * 错（局部赋值位置 v1 不支持，文档见 irgen_expr_lambda.c）。 */
+        if (c->in_call_args && expr->lambda.params.count == 1 &&
+            expr->lambda.body && expr->lambda.body->kind != AST_BLOCK) {
+            zan_ast_node_t *p0 = expr->lambda.params.items[0];
+            if (p0 && p0->kind == AST_PARAM && p0->param.type) {
+                zan_type_t *p0t =
+                    zan_binder_resolve_type(c->binder, p0->param.type);
+                if (checker_type_is_expr_tree_target(p0t)) return p0t;
+            }
+        }
         /* lambda 体要过类型检查：它有自己的作用域（形参 + 局部变量），并且
          * **不受外层方法的返回类型约束**——lambda 的返回类型在检查器这里还
          * 不知道（委托类型是从使用现场推出来的），拿外层方法的返回类型去判
@@ -5322,8 +5363,9 @@ static int checker_call_target_member_state(zan_checker_t *c, zan_type_t *t,
  * 命中条件全部满足才接管（宁可漏配、不可错配——普通成员永远优先，
  * 本函数只在常规成员查找落空后到达）：
  *   ① 成员名按类型解析得到带 [Table] 的类；
- *   ② 接收者能给出连接：本身是（或实现）IDbConnection，或其类声明
- *      了无参 __Conn()；
+ *   ② 接收者能给出连接：本身是（或实现）IDbConnection，或其类自身或
+ *      基类链上声明了无参 __Conn()（控制器基类声明一次，全部派生类
+ *      的表访问器共用）；
  *   ③ <Entity>Dao 已声明且有"单个连接可赋值参数"的构造器 —— 用它
  *      （合成调用属编译器可信代码，与反射取值口同等待遇，不做访问
  *      检查）；否则回退 BaseRepository<Entity>，经
@@ -5393,32 +5435,40 @@ static zan_ast_node_t *checker_accessor_conn_expr(zan_checker_t *c,
         return expr->member.object;
     }
     if (idbc && obj_type->kind == TYPE_CLASS && obj_type->sym) {
-        zan_symbol_t *cls = obj_type->sym;
-        for (int i = 0; i < cls->member_count; i++) {
-            zan_symbol_t *m = cls->members[i];
-            if (m->kind != SYM_METHOD || m->name.len != 6 ||
-                memcmp(m->name.str, "__Conn", 6) != 0) continue;
-            if (!m->decl || m->decl->kind != AST_METHOD_DECL ||
-                m->decl->method_decl.params.count != 0) continue;
-            zan_type_t *rt = zan_binder_resolve_type(
-                c->binder, m->decl->method_decl.return_type);
-            if (!rt || !(rt->sym == idbc->sym ||
-                         ((rt->kind == TYPE_CLASS ||
-                           rt->kind == TYPE_STRUCT) &&
-                          zan_binder_class_implements_iface(rt->sym,
-                                                            idbc->sym))))
-                continue;
-            zan_ast_node_t *callee = zan_ast_new(c->arena,
-                                                 AST_MEMBER_ACCESS, expr->loc);
-            callee->member.object = expr->member.object;
-            callee->member.name = m->name;
-            callee->member.null_cond = 0;
-            zan_ast_node_t *call = zan_ast_new(c->arena, AST_CALL, expr->loc);
-            call->call.callee = callee;
-            zan_ast_list_init(&call->call.args);
-            zan_ast_list_init(&call->call.type_args);
-            *conn_out = rt;
-            return call;
+        /* 沿基类链逐层找：__Conn() 的常见落点是控制器基类（AppController），
+         * 派生控制器（Dashboard : AdminController : AppController）上的
+         * this.<Entity> 同样要落到该连接上——只扫自身成员会让每个子类都被
+         * 迫重复声明一份访问器。基类链按派生优先走，override 形态先命中。 */
+        for (zan_symbol_t *cls = obj_type->sym; cls;
+             cls = (cls->type && cls->type->base_type)
+                       ? cls->type->base_type->sym
+                       : NULL) {
+            for (int i = 0; i < cls->member_count; i++) {
+                zan_symbol_t *m = cls->members[i];
+                if (m->kind != SYM_METHOD || m->name.len != 6 ||
+                    memcmp(m->name.str, "__Conn", 6) != 0) continue;
+                if (!m->decl || m->decl->kind != AST_METHOD_DECL ||
+                    m->decl->method_decl.params.count != 0) continue;
+                zan_type_t *rt = zan_binder_resolve_type(
+                    c->binder, m->decl->method_decl.return_type);
+                if (!rt || !(rt->sym == idbc->sym ||
+                             ((rt->kind == TYPE_CLASS ||
+                               rt->kind == TYPE_STRUCT) &&
+                              zan_binder_class_implements_iface(rt->sym,
+                                                                idbc->sym))))
+                    continue;
+                zan_ast_node_t *callee = zan_ast_new(c->arena,
+                                                     AST_MEMBER_ACCESS, expr->loc);
+                callee->member.object = expr->member.object;
+                callee->member.name = m->name;
+                callee->member.null_cond = 0;
+                zan_ast_node_t *call = zan_ast_new(c->arena, AST_CALL, expr->loc);
+                call->call.callee = callee;
+                zan_ast_list_init(&call->call.args);
+                zan_ast_list_init(&call->call.type_args);
+                *conn_out = rt;
+                return call;
+            }
         }
     }
     return NULL;
@@ -5437,6 +5487,20 @@ static bool checker_conn_fits_param(zan_checker_t *c, zan_type_t *conn,
 
 /* 原地降级：成员节点改写为 new <Dao 或 BaseRepository<E>>(...)。成员与
  * new_expr 是同一 union 的两个臂，必须先取尽 member 侧数据再落笔。 */
+/* 树类型：System.Linq.ExprNode（ORM 门面既有重载 Where(ExprNode)）或
+ * System.Linq.Expr<T>（用户 API 的装箱形态）。B-ID65 的树降级在 irgen
+ * 发射口做（irgen_expr_lambda.c emit_lambda_typed），checker 侧只负责
+ * 预检跳过与打分放行。 */
+static bool checker_type_is_expr_tree_target(zan_type_t *t) {
+    if (!t || t->kind != TYPE_CLASS || !t->sym) return false;
+    if (t->sym->name.len == 8 &&
+        memcmp(t->sym->name.str, "ExprNode", 8) == 0)
+        return true;
+    return t->sym->name.len == 4 &&
+           memcmp(t->sym->name.str, "Expr", 4) == 0 &&
+           t->type_arg_count == 1 && t->type_args && t->type_args[0];
+}
+
 static zan_type_t *checker_emit_accessor_new(zan_checker_t *c,
                                              zan_ast_node_t *expr,
                                              zan_ast_node_t *type_ref,

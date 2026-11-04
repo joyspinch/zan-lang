@@ -450,7 +450,7 @@ static int expr_member_of_owned_temp(zan_irgen_t *g, zan_ast_node_t *e,
 static int expr_yields_delegate_value(zan_irgen_t *g, zan_ast_node_t *e,
                                       local_scope_t *locals) {
     if (!e) return 0;
-    if (e->kind == AST_LAMBDA) return 1;
+    if (e->kind == AST_LAMBDA) return !irgen_is_tree_lambda(g, e);
     if (e->kind != AST_MEMBER_ACCESS) return 0;
     zan_symbol_t *cls = expr_class_sym(g, e->member.object, locals);
     zan_symbol_t *ms = cls ? get_method_sym(cls, e->member.name) : NULL;
@@ -585,6 +585,7 @@ static int expr_yields_owned_rc_value(zan_irgen_t *g, zan_ast_node_t *e,
     if (e->kind == AST_SWITCH_EXPR) return 1;
     if (e->kind == AST_WITH_EXPR) return 1;
     if (expr_yields_delegate_value(g, e, locals)) return 1;
+    if (irgen_is_tree_lambda(g, e)) return 1;
     if (e->kind == AST_CONDITIONAL) {
         return expr_yields_owned_rc_value(g, e->conditional.then_expr, locals) ||
                expr_yields_owned_rc_value(g, e->conditional.else_expr, locals);
@@ -706,6 +707,7 @@ static int call_arg_is_owned_temp(zan_irgen_t *g, zan_ast_node_t *arg,
                                   zan_type_t *at, local_scope_t *locals) {
     if (!arg) return 0;
     if (expr_is_local_ident(arg, locals)) return 0;
+    if (irgen_is_tree_lambda(g, arg)) return 1;
     if (expr_yields_delegate_value(g, arg, locals)) return 1;
     if (!at || !is_rc_managed_type(at)) return 0;
     return expr_yields_owned_rc_value(g, arg, locals);
@@ -718,6 +720,11 @@ static void emit_release_owned_call_temp(zan_irgen_t *g, zan_ast_node_t *arg,
      * 被调方按借用协议不释放参数，调用方在调用后释放。必须先于
      * local-ident 早退（装箱的正是那个局部变量的临时箱）。 */
     if (irgen_expr_was_boxed(g, arg)) {
+        emit_release_obj_value(g, val);
+        return;
+    }
+    /* B-ID65：树 lambda 在发射口降级为 ExprNode 堆对象，作为实参临时量用完后释放。 */
+    if (irgen_is_tree_lambda(g, arg)) {
         emit_release_obj_value(g, val);
         return;
     }
