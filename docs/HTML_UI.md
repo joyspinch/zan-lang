@@ -36,6 +36,32 @@ packages/Zan.Gui `Form.Show.zan`）。
 `diag_html_input_rejected`（ctest）与 `tests/conformance/file_embed_*`
 钉住。
 
+## 窗口键与子窗（B-ID149）
+
+**窗口即对象**：`class X : Form` 即声明式窗口。`Show()`/`ShowOffscreen()`
+装配期由 `Form.FindDoc(类名)` 定位同目录同名 `.html`（内嵌 VFS 优先，
+大小写不敏感 basename 匹配，多命中 fail-fast），`Html.Parse` 一跳建树。
+事件 `@click="OnOk"` 对窗口实例按名反射接线（方法缺失编译期对账缺失即
+fail-fast），`data-bind` 路径启动期对账。编译器对 `type=gui` 且无用户
+`Main` 的工程合成 `new <入口基名>().Show()` 入口，用户 `Main` 存在时
+整体优先。
+
+**窗口键**：根元素（body 兜底，两级都看）上的 data-* 属性，装配期静态
+读一次；`:data-win-*` 动态绑定走根控件 bindProps 通用泵。
+
+| 键 | 语义 |
+|---|---|
+| `data-win-title` | 窗口标题，缺省取窗口类名 |
+| `data-win-w` / `data-win-h` | 初始客户区尺寸，缺省 480×520 |
+| `data-win-center="true"` | 装配后居中屏幕 |
+| `data-win-chrome="false"` | 隐藏系统边框（无边框窗） |
+| `data-win-round="true"` | 异形整圆窗（按 winW×winH 内切椭圆） |
+
+**子窗与模态**：子窗在事件处理器里 `new` + `Show()`（owner 可选）。需要
+归属语义时设 `w.owner = this` 后调 `w.ShowDialog()`——装载进泵，关闭后
+把重绘交还宿主（对 owner 补一次 `MarkDirty()`）。`Show()` 保持非模态
+语义不变。
+
 ## 元素映射
 
 | HTML | 控件 | 文本/属性去向 |
