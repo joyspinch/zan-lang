@@ -658,6 +658,7 @@ struct zan_irgen {
     int              di_file_cap;
     uint32_t         di_cur_line;
     uint32_t         di_cur_file;
+    uint32_t         di_cur_col;
     /* 最近一次设置过的调试位置（di_clear 只清"当前"位置，不动这两个）。
        惰性构建的辅助函数——类的释放体、集合/数组的释放体——会在用户
        代码中间被建出来，入口 di_clear 把当前位置清掉后不恢复，于是同
@@ -722,6 +723,28 @@ static inline void zan_set_odr_comdat(zan_irgen_t *g, LLVMValueRef val, const ch
         LLVMSetComdatSelectionKind(group, LLVMAnyComdatSelectionKind);
         LLVMSetComdat(val, group);
     }
+}
+
+/* 构建位置与调试信息保护栈（B-ID93）：跨块/跨函数插入辅助指令后 1:1 恢复 */
+typedef struct {
+    LLVMBasicBlockRef bb;
+    LLVMValueRef      fn;
+    LLVMMetadataRef   dl;
+} zan_builder_point_t;
+
+static inline zan_builder_point_t zan_builder_save(zan_irgen_t *g) {
+    zan_builder_point_t pt;
+    pt.bb = (g && g->builder) ? LLVMGetInsertBlock(g->builder) : NULL;
+    pt.fn = g ? g->current_fn : NULL;
+    pt.dl = (g && g->emit_debug && g->builder) ? LLVMGetCurrentDebugLocation2(g->builder) : NULL;
+    return pt;
+}
+
+static inline void zan_builder_restore(zan_irgen_t *g, zan_builder_point_t pt) {
+    if (!g || !g->builder) return;
+    g->current_fn = pt.fn;
+    if (pt.bb) LLVMPositionBuilderAtEnd(g->builder, pt.bb);
+    if (g->emit_debug) LLVMSetCurrentDebugLocation2(g->builder, pt.dl);
 }
 
 zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,

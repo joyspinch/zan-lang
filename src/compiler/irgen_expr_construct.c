@@ -2532,6 +2532,7 @@ static LLVMValueRef emit_expr_await_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                     g->current_async_resume_fn, "co.resume");
                 LLVMAddCase(g->current_async_switch, LLVMConstInt(di32, (unsigned)k, 0), rk);
                 LLVMPositionBuilderAtEnd(g->builder, rk);
+                di_set_loc(g, expr->loc);
                 return LLVMConstInt(di64, 0, 0);
             }
             return LLVMConstInt(LLVMInt64TypeInContext(g->ctx), 0, 0);
@@ -2559,6 +2560,7 @@ static LLVMValueRef emit_expr_await_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                     g->current_async_resume_fn, "co.resume");
                 LLVMAddCase(g->current_async_switch, LLVMConstInt(di32, (unsigned)k, 0), rk);
                 LLVMPositionBuilderAtEnd(g->builder, rk);
+                di_set_loc(g, expr->loc);
                 return LLVMConstInt(di64, 0, 0);
             }
             /* 顶层非异步上下文：同步休眠等待。
@@ -2634,6 +2636,7 @@ static LLVMValueRef emit_expr_await_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                 g->current_async_resume_fn, "co.resume");
             LLVMAddCase(g->current_async_switch, LLVMConstInt(di32, (unsigned)k, 0), rk);
             LLVMPositionBuilderAtEnd(g->builder, rk);
+            di_set_loc(g, expr->loc);
             return LLVMConstInt(di64, 0, 0);
         }
 
@@ -2667,10 +2670,12 @@ static LLVMValueRef emit_expr_await_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                     g->current_async_resume_fn, "co.resume");
                 LLVMBuildCondBr(g->builder, must_suspend, susp_bb, rk);
                 LLVMPositionBuilderAtEnd(g->builder, susp_bb);
+                di_set_loc(g, expr->loc);
                 zan_store_fit(g, LLVMConstInt(di32, (unsigned)k, 0), get_async_state_ptr(g));
                 LLVMBuildBr(g->builder, get_async_suspend_ret_bb(g));
                 LLVMAddCase(g->current_async_switch, LLVMConstInt(di32, (unsigned)k, 0), rk);
                 LLVMPositionBuilderAtEnd(g->builder, rk);
+                di_set_loc(g, expr->loc);
                 return LLVMBuildLoad2(g->builder, di64, get_async_result_ptr(g), "join.r2");
             }
             LLVMValueRef r2 = zan_call2(g->builder, jw_type, jw,
@@ -2712,6 +2717,7 @@ static LLVMValueRef emit_expr_await_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                     g->current_async_resume_fn, "co.resume");
                 LLVMAddCase(g->current_async_switch, LLVMConstInt(di32, (unsigned)k, 0), rk);
                 LLVMPositionBuilderAtEnd(g->builder, rk);
+                di_set_loc(g, expr->loc);
                 return LLVMConstInt(di64, 0, 0);
             }
         }
@@ -2756,6 +2762,7 @@ static LLVMValueRef emit_expr_await_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                     g->current_async_resume_fn, "co.resume");
                 LLVMAddCase(g->current_async_switch, LLVMConstInt(di32, (unsigned)k, 0), rk);
                 LLVMPositionBuilderAtEnd(g->builder, rk);
+                di_set_loc(g, expr->loc);
                 return LLVMBuildLoad2(g->builder, di64, get_async_result_ptr(g), "recvn");
             }
         }
@@ -2803,6 +2810,7 @@ static LLVMValueRef emit_expr_await_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                     g->current_async_resume_fn, "co.resume");
                 LLVMAddCase(g->current_async_switch, LLVMConstInt(di32, (unsigned)k, 0), rk);
                 LLVMPositionBuilderAtEnd(g->builder, rk);
+                di_set_loc(g, expr->loc);
                 return LLVMBuildLoad2(g->builder, di64, get_async_result_ptr(g), "recvton");
             }
         }
@@ -2838,6 +2846,7 @@ static LLVMValueRef emit_expr_await_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                 LLVMAddCase(g->current_async_switch,
                     LLVMConstInt(di32, (unsigned)k, 0), rk);
                 LLVMPositionBuilderAtEnd(g->builder, rk);
+                di_set_loc(g, expr->loc);
                 return LLVMBuildLoad2(g->builder, di64, get_async_result_ptr(g), "acceptfd");
             }
         }
@@ -2876,6 +2885,7 @@ static LLVMValueRef emit_expr_await_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                 LLVMAddCase(g->current_async_switch,
                     LLVMConstInt(di32, (unsigned)k, 0), rk);
                 LLVMPositionBuilderAtEnd(g->builder, rk);
+                di_set_loc(g, expr->loc);
                 LLVMValueRef res_slot = LLVMBuildBitCast(g->builder,
                     get_async_result_ptr(g),
                     LLVMPointerType(di32, 0), "self.dnsout2");
@@ -2925,6 +2935,7 @@ static LLVMValueRef emit_expr_await_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                 LLVMAddCase(g->current_async_switch,
                     LLVMConstInt(di32, (unsigned)k, 0), rk);
                 LLVMPositionBuilderAtEnd(g->builder, rk);
+                di_set_loc(g, expr->loc);
                 LLVMValueRef res_slot = LLVMBuildBitCast(g->builder,
                     get_async_result_ptr(g),
                     LLVMPointerType(di32, 0), "self.saout2");
@@ -3012,6 +3023,7 @@ static LLVMValueRef emit_expr_await_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                 LLVMBuildCondBr(g->builder, fast_cond, cont_bb, prep_bb);
 
                 LLVMPositionBuilderAtEnd(g->builder, prep_bb);
+                di_set_loc(g, expr->loc);
                 zan_store_fit(g, g->current_async_resume_fn,
                     LLVMBuildStructGEP2(g->builder, hdr, sub_i8, ASYNC_FRAME_AWAITER_STEP, "sub.aws"));
                 LLVMValueRef aw_ptr = LLVMBuildStructGEP2(g->builder, hdr, sub_i8,
@@ -3028,6 +3040,7 @@ static LLVMValueRef emit_expr_await_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                 LLVMBuildCondBr(g->builder, won, suspend_bb, cont_bb);
 
                 LLVMPositionBuilderAtEnd(g->builder, suspend_bb);
+                di_set_loc(g, expr->loc);
                 LLVMValueRef sub_slot = get_async_sub_slot_ptr(g);
                 zan_store_fit(g, sub_i8, sub_slot);
                 zan_store_fit(g, sub_i8, get_async_child_ptr(g));
@@ -3037,10 +3050,12 @@ static LLVMValueRef emit_expr_await_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                 LLVMBuildBr(g->builder, get_async_suspend_ret_bb(g));
 
                 LLVMPositionBuilderAtEnd(g->builder, rk);
+                di_set_loc(g, expr->loc);
                 LLVMValueRef sub_rl = LLVMBuildLoad2(g->builder, i8ptr, sub_slot, "sub.rl");
                 LLVMBuildBr(g->builder, cont_bb);
 
                 LLVMPositionBuilderAtEnd(g->builder, cont_bb);
+                di_set_loc(g, expr->loc);
                 LLVMValueRef completed_sub = LLVMBuildPhi(g->builder, i8ptr, "sub.completed");
                 LLVMValueRef sub_vals[] = { sub_i8, sub_i8, sub_rl };
                 LLVMBasicBlockRef sub_bbs[] = { probe_bb, prep_bb, rk };
@@ -3069,6 +3084,7 @@ static LLVMValueRef emit_expr_await_expr(zan_irgen_t *g, zan_ast_node_t *expr,
             LLVMBuildCondBr(g->builder, need_pump, pump_bb, fin_bb);
 
             LLVMPositionBuilderAtEnd(g->builder, pump_bb);
+            di_set_loc(g, expr->loc);
             LLVMValueRef sched_args[] = { sub_i8, sub_resume };
             zan_call2(g->builder, g->rt_co_ready_type, g->rt_co_ready, sched_args, 2, "");
             /* 单协程调度循环：轮询驱动直至当前协程执行完成 */
@@ -3077,6 +3093,7 @@ static LLVMValueRef emit_expr_await_expr(zan_irgen_t *g, zan_ast_node_t *expr,
             LLVMBuildBr(g->builder, fin_bb);
 
             LLVMPositionBuilderAtEnd(g->builder, fin_bb);
+            di_set_loc(g, expr->loc);
             emit_async_check_sub_exc(g, sub_i8, aw_tmp_mark);
             LLVMValueRef rptr = LLVMBuildStructGEP2(g->builder, hdr, sub_i8,
                 ASYNC_FRAME_RESULT, "sub.result");
@@ -3093,11 +3110,13 @@ static LLVMValueRef emit_expr_await_expr(zan_irgen_t *g, zan_ast_node_t *expr,
             LLVMBasicBlockRef done_bb = LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "aw.done");
             LLVMBuildBr(g->builder, poll_bb);
             LLVMPositionBuilderAtEnd(g->builder, poll_bb);
+            di_set_loc(g, expr->loc);
             LLVMValueRef comp_ptr = LLVMBuildStructGEP2(g->builder, g->task_struct_type, task_ptr, 0, "comp");
             LLVMValueRef comp = LLVMBuildLoad2(g->builder, i64, comp_ptr, "cv");
             LLVMValueRef is_done = zan_icmp(g->builder, LLVMIntNE, comp, LLVMConstInt(i64, 0, 0), "done");
             LLVMBuildCondBr(g->builder, is_done, done_bb, poll_bb);
             LLVMPositionBuilderAtEnd(g->builder, done_bb);
+            di_set_loc(g, expr->loc);
             LLVMValueRef res_ptr = LLVMBuildStructGEP2(g->builder, g->task_struct_type, task_ptr, 1, "resp");
             return coerce_await_result(g, expr,
                 LLVMBuildLoad2(g->builder, i64, res_ptr, "awres"), locals);

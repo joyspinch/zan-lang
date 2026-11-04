@@ -1,6 +1,9 @@
 static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_t *locals) {
     if (!expr) return LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 0, 0);
     if (locals) g->current_locals = locals;
+    if (g->emit_debug && expr->loc.line > 0) {
+        di_set_loc(g, expr->loc);
+    }
 
     if (expr->kind == AST_REF_ARG) {
         return emit_ref_arg(g, expr, locals); }

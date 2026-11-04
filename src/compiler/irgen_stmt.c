@@ -2611,9 +2611,9 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
             async_hid < g->current_async_handler_cap) {
             LLVMValueRef cidx[2] = { LLVMConstInt(i32t, 0, 0),
                                      LLVMConstInt(i32t, (unsigned)async_hid, 0) };
-            LLVMBasicBlockRef cur_bb = LLVMGetInsertBlock(g->builder);
+            zan_builder_point_t pt = zan_builder_save(g);
             LLVMBasicBlockRef entry_bb = LLVMGetEntryBasicBlock(
-                LLVMGetBasicBlockParent(cur_bb));
+                LLVMGetBasicBlockParent(pt.bb));
             LLVMValueRef entry_term = LLVMGetBasicBlockTerminator(entry_bb);
             if (entry_term) LLVMPositionBuilderBefore(g->builder, entry_term);
             else LLVMPositionBuilderAtEnd(g->builder, entry_bb);
@@ -2632,7 +2632,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                 LLVMBuildStructGEP2(g->builder, g->current_async_frame_type,
                     g->current_async_frame, ASYNC_FRAME_CEXC_TID, "eh.cexctid"),
                 cidx, 2, "eh.exctid.slot");
-            LLVMPositionBuilderAtEnd(g->builder, cur_bb);
+            zan_builder_restore(g, pt);
         } else {
             exc_slot = emit_entry_alloca(g, i8ptr, "eh.exc.slot");
             exc_owned_slot = emit_entry_alloca(g, i32t, "eh.excown.slot");

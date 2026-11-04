@@ -1351,12 +1351,13 @@ static LLVMValueRef emit_eh_state(zan_irgen_t *g) {
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
     LLVMValueRef state_fn = get_eh_state_fast_fn(g);
     wasm_note_state_fn(g, state_fn);
+    zan_builder_point_t pt = zan_builder_save(g);
     eh_enter_entry_block(g);
     LLVMValueRef p = zan_call2(g->builder, LLVMFunctionType(i8ptr, NULL, 0, 0),
         state_fn, NULL, 0, "eh.st");
     LLVMValueRef typed = LLVMBuildBitCast(g->builder, p,
         LLVMPointerType(get_eh_state_ty(g), 0), "eh.stp");
-    LLVMPositionBuilderAtEnd(g->builder, cur);
+    zan_builder_restore(g, pt);
     g->eh_state_owner = fn;
     g->eh_state_cached = typed;
     for (int i = 0; i < EH_F_COUNT; i++) g->eh_state_fields[i] = NULL;

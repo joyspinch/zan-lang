@@ -1756,7 +1756,7 @@ static LLVMValueRef emit_soft_scratch_cached(zan_irgen_t *g) {
     LLVMTypeRef i8p = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
     if (!g->soft_scratch_slot || g->soft_scratch_fn != fn) {
         g->soft_scratch_slot = emit_entry_alloca(g, i8p, "soft.scratch.slot");
-        LLVMBasicBlockRef saved = LLVMGetInsertBlock(g->builder);
+        zan_builder_point_t pt = zan_builder_save(g);
         LLVMBasicBlockRef entry = LLVMGetEntryBasicBlock(fn);
         LLVMValueRef term = LLVMGetBasicBlockTerminator(entry);
         if (term) LLVMPositionBuilderBefore(g->builder, term);
@@ -1767,7 +1767,7 @@ static LLVMValueRef emit_soft_scratch_cached(zan_irgen_t *g) {
         LLVMValueRef scratch = zan_call2(g->builder, fn_ty, sf, NULL, 0,
                                          "soft.scratch.init");
         LLVMBuildStore(g->builder, scratch, g->soft_scratch_slot);
-        LLVMPositionBuilderAtEnd(g->builder, saved);
+        zan_builder_restore(g, pt);
         g->soft_scratch_fn = fn;
     }
     return LLVMBuildLoad2(g->builder, i8p, g->soft_scratch_slot, "soft.scratch");

@@ -271,15 +271,24 @@ static void di_clear(zan_irgen_t *g) {
     if (!g->emit_debug || !g->builder) return;
     LLVMSetCurrentDebugLocation2(g->builder, NULL);
     g->di_cur_line = 0;
-    g->di_cur_file = 0;
+    g->di_cur_file = UINT32_MAX;
+    g->di_cur_col = 0;
 }
 
 static void di_set_loc(zan_irgen_t *g, zan_loc_t loc) {
     if (!g->emit_debug || !g->builder) return;
+    if (loc.line == 0) return;
+    if (g->diag && (int)loc.file_id >= g->diag->file_count) return;
+    if (loc.file_id == g->di_cur_file && loc.line == g->di_cur_line &&
+        loc.col == g->di_cur_col && g->di_last_loc_fn == g->current_fn &&
+        LLVMGetCurrentDebugLocation2(g->builder) == g->di_last_loc) {
+        return;
+    }
     LLVMMetadataRef sp = di_ensure_sp(g, loc.file_id, loc.line);
     if (!sp) return;
     g->di_cur_line = loc.line;
     g->di_cur_file = loc.file_id;
+    g->di_cur_col = loc.col;
     unsigned line = loc.line ? loc.line : 1;
     LLVMMetadataRef dl = LLVMDIBuilderCreateDebugLocation(
         g->ctx, line, loc.col, sp, NULL);
@@ -1645,7 +1654,7 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
     g->di_files = NULL;
     g->di_file_cap = 0;
     g->di_cur_line = 0;
-    g->di_cur_file = 0;
+    g->di_cur_file = UINT32_MAX;
 
     g->src_file = module_name;
 
@@ -4002,8 +4011,8 @@ static void local_add(local_scope_t *scope, zan_istr_t name, LLVMValueRef alloca
 }
 
 static LLVMValueRef emit_entry_alloca(zan_irgen_t *g, LLVMTypeRef ty, const char *name) {
-    LLVMBasicBlockRef cur = LLVMGetInsertBlock(g->builder);
-    LLVMValueRef fn = LLVMGetBasicBlockParent(cur);
+    zan_builder_point_t pt = zan_builder_save(g);
+    LLVMValueRef fn = pt.bb ? LLVMGetBasicBlockParent(pt.bb) : g->current_fn;
     LLVMBasicBlockRef entry = LLVMGetEntryBasicBlock(fn);
     LLVMValueRef term = LLVMGetBasicBlockTerminator(entry);
     if (term) LLVMPositionBuilderBefore(g->builder, term);
@@ -4011,7 +4020,7 @@ static LLVMValueRef emit_entry_alloca(zan_irgen_t *g, LLVMTypeRef ty, const char
     LLVMValueRef alloca = LLVMBuildAlloca(g->builder, ty, name);
     if (LLVMGetTypeKind(ty) == LLVMPointerTypeKind)
         LLVMBuildStore(g->builder, LLVMConstNull(ty), alloca);
-    LLVMPositionBuilderAtEnd(g->builder, cur);
+    zan_builder_restore(g, pt);
     return alloca;
 }
 

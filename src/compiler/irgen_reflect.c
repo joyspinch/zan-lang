@@ -693,6 +693,14 @@ static LLVMValueRef refl_method_record(zan_irgen_t *g, zan_symbol_t *sym,
         mattrs }, 8);
 }
 
+/* Unity 前向声明：定义在 irgen_builtins.c / irgen_expr_ops.c（unity 序列
+   在本文件之后）。 */
+static void emit_eh_tmp_push(zan_irgen_t *g, LLVMValueRef obj);
+static void emit_eh_tmp_pop(zan_irgen_t *g);
+static void emit_implicit_field_initializers(zan_irgen_t *g,
+    zan_symbol_t *type_sym, zan_type_t *recv_type, LLVMValueRef object_ptr,
+    local_scope_t *locals);
+
 static LLVMValueRef refl_make_ctor_thunk(zan_irgen_t *g, zan_symbol_t *sym,
                                          LLVMValueRef ctor_fn,
                                          LLVMTypeRef ctor_ty) {
@@ -765,6 +773,15 @@ static LLVMValueRef refl_make_ctor_thunk(zan_irgen_t *g, zan_symbol_t *sym,
             return NULL;
         }
         zan_call2(g->builder, ctor_ty, ctor_fn, args, total, "");
+    } else if (sym->type->kind == TYPE_CLASS) {
+        /* 无显式构造的类：new 路径在调用点内联发字段初始化器
+         * （emit_implicit_field_initializers），反射造对象没有调用点——
+         * thunk 里补发同一份（EH 语义同 new 路径），CreateInstance 与
+         * new 对齐。 */
+        emit_eh_tmp_push(g, obj);
+        local_scope_t *locals = local_scope_new(g->arena);
+        emit_implicit_field_initializers(g, sym, sym->type, obj, locals);
+        emit_eh_tmp_pop(g);
     }
     LLVMBuildStore(g->builder,
         LLVMBuildPtrToInt(g->builder, raw, i64, "refl.newi"),

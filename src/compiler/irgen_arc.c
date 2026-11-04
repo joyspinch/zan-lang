@@ -751,6 +751,7 @@ static LLVMValueRef get_array_release_decl(zan_irgen_t *g, zan_type_t *elem_type
     LLVMSetLinkage(fn, LLVMInternalLinkage);
 
     LLVMBasicBlockRef saved_bb = LLVMGetInsertBlock(g->builder);
+    zan_builder_point_t pt = zan_builder_save(g);
     di_clear(g);
     LLVMBuilderRef b = g->builder;
     LLVMValueRef arr = LLVMGetParam(fn, 0);
@@ -797,7 +798,7 @@ static LLVMValueRef get_array_release_decl(zan_irgen_t *g, zan_type_t *elem_type
     LLVMBuildBr(b, ret);
     LLVMPositionBuilderAtEnd(b, ret);
     LLVMBuildRetVoid(b);
-    if (saved_bb) LLVMPositionBuilderAtEnd(b, saved_bb);
+    zan_builder_restore(g, pt);
     return fn;
 }
 

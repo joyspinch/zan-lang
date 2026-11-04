@@ -867,6 +867,7 @@ static void emit_async_method_ir(zan_irgen_t *g, method_body_work_t *w) {
         }
 
         /* ---- ramp ---- */
+        g->current_fn = ramp_fn;
         LLVMBasicBlockRef ramp_entry = LLVMAppendBasicBlockInContext(g->ctx, ramp_fn, "entry");
         LLVMPositionBuilderAtEnd(g->builder, ramp_entry);
         di_set_loc(g, member->loc);
@@ -947,6 +948,8 @@ static void emit_async_method_ir(zan_irgen_t *g, method_body_work_t *w) {
         LLVMBuildRet(g->builder, raw);
 
         /* ---- resume ---- */
+        LLVMValueRef saved_fn = g->current_fn;
+        g->current_fn = resume_fn;
         LLVMBasicBlockRef res_entry = LLVMAppendBasicBlockInContext(g->ctx, resume_fn, "entry");
         LLVMPositionBuilderAtEnd(g->builder, res_entry);
         di_set_loc(g, member->loc);
@@ -1035,7 +1038,6 @@ static void emit_async_method_ir(zan_irgen_t *g, method_body_work_t *w) {
             si++;
         }
 
-        LLVMValueRef saved_fn = g->current_fn;
         LLVMTypeRef saved_fn_ret = g->current_fn_ret_type;
         zan_type_t *saved_fn_zan_ret = g->current_fn_zan_ret_type;
         LLVMValueRef saved_this = g->current_this;
@@ -1078,7 +1080,6 @@ static void emit_async_method_ir(zan_irgen_t *g, method_body_work_t *w) {
         int saved_this_owned = g->current_async_this_owned;
         zan_type_t *saved_this_owned_type = g->current_async_this_type;
 
-        g->current_fn = resume_fn;
         g->current_fn_ret_type = LLVMVoidTypeInContext(g->ctx);
         int saved_throw_base = g->throw_locals_base;
         int saved_catch_cc = g->catch_cleanup_count;
@@ -1128,13 +1129,22 @@ static void emit_async_method_ir(zan_irgen_t *g, method_body_work_t *w) {
         g->current_async_sub_rethrow_bb = NULL;
         g->current_async_sub_rethrow_phi_sub = NULL;
         g->current_async_sub_rethrow_phi_ev = NULL;
-        g->current_async_state_ptr = NULL;
-        g->current_async_cancel_ptr = NULL;
-        g->current_async_self_i8 = NULL;
-        g->current_async_self_int = NULL;
-        g->current_async_child_ptr = NULL;
-        g->current_async_sub_slot_ptr = NULL;
-        g->current_async_result_ptr = NULL;
+        g->current_async_self_i8 = LLVMBuildBitCast(g->builder, sframe, i8ptr, "self.i8");
+        g->current_async_state_ptr = LLVMBuildStructGEP2(g->builder, frame_type, sframe,
+            ASYNC_FRAME_STATE, "self.state");
+        g->current_async_cancel_ptr = LLVMBuildStructGEP2(g->builder, frame_type, sframe,
+            ASYNC_FRAME_CANCEL, "fr.cancel.p");
+        g->current_async_child_ptr = LLVMBuildStructGEP2(g->builder, frame_type, sframe,
+            ASYNC_FRAME_CHILD, "self.child");
+        g->current_async_sub_slot_ptr = LLVMBuildStructGEP2(g->builder, frame_type, sframe,
+            (unsigned)w->sub_base, "self.sub_slot");
+        g->current_async_result_ptr = LLVMBuildStructGEP2(g->builder, frame_type, sframe,
+            ASYNC_FRAME_RESULT, "self.res_slot");
+        {
+            LLVMTypeRef ptr_int_ty = g->target_is_wasm ? i32 : i64;
+            g->current_async_self_int = LLVMBuildPtrToInt(g->builder, g->current_async_self_i8,
+                ptr_int_ty, "self.int");
+        }
         g->current_async_eh_entry = NULL;
         g->current_async_exc_bb = NULL;
         g->current_async_rearm_switch = NULL;

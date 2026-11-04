@@ -569,15 +569,14 @@ static void emit_co_cancel_delay(zan_irgen_t *g, LLVMValueRef frame) {
 
 /* 创建内部辅助函数 `void f(i8*)` 并将 builder 定位到 entry 块 */
 static bool open_co_helper(zan_irgen_t *g, const char *name, LLVMValueRef *fn,
-                           LLVMBasicBlockRef *saved, LLVMValueRef *saved_fn) {
+                           zan_builder_point_t *saved_pt) {
     LLVMValueRef existing = LLVMGetNamedFunction(g->mod, name);
     if (existing) { *fn = existing; return false; }
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
     *fn = LLVMAddFunction(g->mod, name,
         LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), &i8ptr, 1, 0));
     LLVMSetLinkage(*fn, LLVMInternalLinkage);
-    *saved = LLVMGetInsertBlock(g->builder);
-    *saved_fn = g->current_fn;
+    *saved_pt = zan_builder_save(g);
     g->current_fn = *fn;
     LLVMPositionBuilderAtEnd(g->builder,
         LLVMAppendBasicBlockInContext(g->ctx, *fn, "entry"));
@@ -585,33 +584,31 @@ static bool open_co_helper(zan_irgen_t *g, const char *name, LLVMValueRef *fn,
     return true;
 }
 
-static void close_co_helper(zan_irgen_t *g, LLVMBasicBlockRef saved,
-                            LLVMValueRef saved_fn) {
-    g->current_fn = saved_fn;
-    if (saved) LLVMPositionBuilderAtEnd(g->builder, saved);
+static void close_co_helper(zan_irgen_t *g, zan_builder_point_t saved_pt) {
+    zan_builder_restore(g, saved_pt);
 }
 
 static LLVMValueRef get_co_track_fn(zan_irgen_t *g) {
-    LLVMValueRef fn; LLVMBasicBlockRef saved; LLVMValueRef saved_fn;
-    if (!open_co_helper(g, "__zan_co_track", &fn, &saved, &saved_fn)) return fn;
+    LLVMValueRef fn; zan_builder_point_t saved_pt;
+    if (!open_co_helper(g, "__zan_co_track", &fn, &saved_pt)) return fn;
     LLVMTypeRef ty;
     LLVMValueRef add = get_co_live_fn(g, "zan_co_live_add", false, &ty);
     LLVMValueRef f = LLVMGetParam(fn, 0);
     zan_call2(g->builder, ty, add, &f, 1, "");
     LLVMBuildRetVoid(g->builder);
-    close_co_helper(g, saved, saved_fn);
+    close_co_helper(g, saved_pt);
     return fn;
 }
 
 static LLVMValueRef get_co_untrack_fn(zan_irgen_t *g) {
-    LLVMValueRef fn; LLVMBasicBlockRef saved; LLVMValueRef saved_fn;
-    if (!open_co_helper(g, "__zan_co_untrack", &fn, &saved, &saved_fn)) return fn;
+    LLVMValueRef fn; zan_builder_point_t saved_pt;
+    if (!open_co_helper(g, "__zan_co_untrack", &fn, &saved_pt)) return fn;
     LLVMTypeRef ty;
     LLVMValueRef del = get_co_live_fn(g, "zan_co_live_del", false, &ty);
     LLVMValueRef f = LLVMGetParam(fn, 0);
     zan_call2(g->builder, ty, del, &f, 1, "");
     LLVMBuildRetVoid(g->builder);
-    close_co_helper(g, saved, saved_fn);
+    close_co_helper(g, saved_pt);
     return fn;
 }
 
@@ -626,8 +623,7 @@ static LLVMValueRef get_co_cancel_fn(zan_irgen_t *g) {
         LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), &i8ptr, 1, 0));
     LLVMSetLinkage(fn, LLVMInternalLinkage);
 
-    LLVMBasicBlockRef saved = LLVMGetInsertBlock(g->builder);
-    LLVMValueRef saved_fn = g->current_fn;
+    zan_builder_point_t saved_pt = zan_builder_save(g);
     g->current_fn = fn;
     LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(g->ctx, fn, "entry");
     LLVMBasicBlockRef head_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "cc.head");
@@ -660,8 +656,7 @@ static LLVMValueRef get_co_cancel_fn(zan_irgen_t *g) {
     LLVMPositionBuilderAtEnd(g->builder, ret_bb);
     LLVMBuildRetVoid(g->builder);
 
-    g->current_fn = saved_fn;
-    if (saved) LLVMPositionBuilderAtEnd(g->builder, saved);
+    zan_builder_restore(g, saved_pt);
     return fn;
 }
 
@@ -679,8 +674,7 @@ static LLVMValueRef get_co_isdone_fn(zan_irgen_t *g) {
         LLVMFunctionType(i32, &i8ptr, 1, 0));
     LLVMSetLinkage(fn, LLVMInternalLinkage);
 
-    LLVMBasicBlockRef saved = LLVMGetInsertBlock(g->builder);
-    LLVMValueRef saved_fn = g->current_fn;
+    zan_builder_point_t saved_pt = zan_builder_save(g);
     g->current_fn = fn;
     LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(g->ctx, fn, "entry");
     LLVMBasicBlockRef live_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "id.live");
@@ -708,9 +702,9 @@ static LLVMValueRef get_co_isdone_fn(zan_irgen_t *g) {
         gone_bb, alive_bb);
 
     LLVMPositionBuilderAtEnd(g->builder, alive_bb);
-    LLVMValueRef done = LLVMBuildLoad2(g->builder, i32,
-        LLVMBuildStructGEP2(g->builder, hdr, arg, ASYNC_FRAME_DONE, "id.done.p"),
-        "id.done");
+    LLVMValueRef dp = LLVMBuildStructGEP2(g->builder, hdr, arg, ASYNC_FRAME_DONE, "id.dp");
+    LLVMValueRef done = LLVMBuildLoad2(g->builder, i32, dp, "id.done");
+    LLVMSetOrdering(done, LLVMAtomicOrderingAcquire);
     LLVMBuildRet(g->builder, LLVMBuildZExt(g->builder,
         zan_icmp(g->builder, LLVMIntNE, done, LLVMConstInt(i32, 0, 0), "id.isdone"),
         i32, "id.r"));
@@ -718,8 +712,7 @@ static LLVMValueRef get_co_isdone_fn(zan_irgen_t *g) {
     LLVMPositionBuilderAtEnd(g->builder, gone_bb);
     LLVMBuildRet(g->builder, LLVMConstInt(i32, 1, 0));
 
-    g->current_fn = saved_fn;
-    if (saved) LLVMPositionBuilderAtEnd(g->builder, saved);
+    zan_builder_restore(g, saved_pt);
     return fn;
 }
 
@@ -737,36 +730,36 @@ static void position_before_entry_terminator(zan_irgen_t *g) {
 static LLVMValueRef get_async_self_i8(zan_irgen_t *g) {
     if (g->current_async_self_i8) return g->current_async_self_i8;
     if (!g->current_async_frame) return NULL;
-    LLVMBasicBlockRef here = LLVMGetInsertBlock(g->builder);
+    zan_builder_point_t pt = zan_builder_save(g);
     position_before_entry_terminator(g);
     LLVMTypeRef di8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
     g->current_async_self_i8 = LLVMBuildBitCast(g->builder,
         g->current_async_frame, di8ptr, "self.i8");
-    if (here) LLVMPositionBuilderAtEnd(g->builder, here);
+    zan_builder_restore(g, pt);
     return g->current_async_self_i8;
 }
 
 static LLVMValueRef get_async_state_ptr(zan_irgen_t *g) {
     if (g->current_async_state_ptr) return g->current_async_state_ptr;
     if (!g->current_async_frame || !g->current_async_frame_type) return NULL;
-    LLVMBasicBlockRef here = LLVMGetInsertBlock(g->builder);
+    zan_builder_point_t pt = zan_builder_save(g);
     position_before_entry_terminator(g);
     g->current_async_state_ptr = LLVMBuildStructGEP2(g->builder,
         g->current_async_frame_type, g->current_async_frame,
         ASYNC_FRAME_STATE, "self.state");
-    if (here) LLVMPositionBuilderAtEnd(g->builder, here);
+    zan_builder_restore(g, pt);
     return g->current_async_state_ptr;
 }
 
 static LLVMValueRef get_async_cancel_ptr(zan_irgen_t *g) {
     if (g->current_async_cancel_ptr) return g->current_async_cancel_ptr;
     if (!g->current_async_frame || !g->current_async_frame_type) return NULL;
-    LLVMBasicBlockRef here = LLVMGetInsertBlock(g->builder);
+    zan_builder_point_t pt = zan_builder_save(g);
     position_before_entry_terminator(g);
     g->current_async_cancel_ptr = LLVMBuildStructGEP2(g->builder,
         g->current_async_frame_type, g->current_async_frame,
         ASYNC_FRAME_CANCEL, "fr.cancel.p");
-    if (here) LLVMPositionBuilderAtEnd(g->builder, here);
+    zan_builder_restore(g, pt);
     return g->current_async_cancel_ptr;
 }
 
@@ -774,46 +767,46 @@ static LLVMValueRef get_async_self_int(zan_irgen_t *g, LLVMTypeRef ptr_int_ty) {
     if (g->current_async_self_int) return g->current_async_self_int;
     LLVMValueRef self_i8 = get_async_self_i8(g);
     if (!self_i8) return NULL;
-    LLVMBasicBlockRef here = LLVMGetInsertBlock(g->builder);
+    zan_builder_point_t pt = zan_builder_save(g);
     position_before_entry_terminator(g);
     g->current_async_self_int = LLVMBuildPtrToInt(g->builder, self_i8, ptr_int_ty, "self.int");
-    if (here) LLVMPositionBuilderAtEnd(g->builder, here);
+    zan_builder_restore(g, pt);
     return g->current_async_self_int;
 }
 
 static LLVMValueRef get_async_child_ptr(zan_irgen_t *g) {
     if (g->current_async_child_ptr) return g->current_async_child_ptr;
     if (!g->current_async_frame || !g->current_async_frame_type) return NULL;
-    LLVMBasicBlockRef here = LLVMGetInsertBlock(g->builder);
+    zan_builder_point_t pt = zan_builder_save(g);
     position_before_entry_terminator(g);
     g->current_async_child_ptr = LLVMBuildStructGEP2(g->builder,
         g->current_async_frame_type, g->current_async_frame,
         ASYNC_FRAME_CHILD, "self.child");
-    if (here) LLVMPositionBuilderAtEnd(g->builder, here);
+    zan_builder_restore(g, pt);
     return g->current_async_child_ptr;
 }
 
 static LLVMValueRef get_async_sub_slot_ptr(zan_irgen_t *g) {
     if (g->current_async_sub_slot_ptr) return g->current_async_sub_slot_ptr;
     if (!g->current_async_frame || !g->current_async_frame_type) return NULL;
-    LLVMBasicBlockRef here = LLVMGetInsertBlock(g->builder);
+    zan_builder_point_t pt = zan_builder_save(g);
     position_before_entry_terminator(g);
     g->current_async_sub_slot_ptr = LLVMBuildStructGEP2(g->builder,
         g->current_async_frame_type, g->current_async_frame,
         (unsigned)g->current_async_sub_base, "self.sub_slot");
-    if (here) LLVMPositionBuilderAtEnd(g->builder, here);
+    zan_builder_restore(g, pt);
     return g->current_async_sub_slot_ptr;
 }
 
 static LLVMValueRef get_async_result_ptr(zan_irgen_t *g) {
     if (g->current_async_result_ptr) return g->current_async_result_ptr;
     if (!g->current_async_frame || !g->current_async_frame_type) return NULL;
-    LLVMBasicBlockRef here = LLVMGetInsertBlock(g->builder);
+    zan_builder_point_t pt = zan_builder_save(g);
     position_before_entry_terminator(g);
     g->current_async_result_ptr = LLVMBuildStructGEP2(g->builder,
         g->current_async_frame_type, g->current_async_frame,
         ASYNC_FRAME_RESULT, "self.res_slot");
-    if (here) LLVMPositionBuilderAtEnd(g->builder, here);
+    zan_builder_restore(g, pt);
     return g->current_async_result_ptr;
 }
 
@@ -911,7 +904,7 @@ static LLVMBasicBlockRef get_async_suspend_ret_bb(zan_irgen_t *g) {
 
 /* 代理 alloca 替换为帧字段前完成指针类型提取与校验 */
 static void emit_async_finalize_slots(zan_irgen_t *g) {
-    LLVMBasicBlockRef here = LLVMGetInsertBlock(g->builder);
+    zan_builder_point_t pt = zan_builder_save(g);
     for (int i = 0; i < g->current_async_slot_count; i++) {
         zan_async_slot_t *slot = &g->current_async_slots[i];
         LLVMValueRef proxy = slot->slot_alloca;
@@ -925,7 +918,7 @@ static void emit_async_finalize_slots(zan_irgen_t *g) {
         slot->slot_alloca = NULL;
         LLVMInstructionEraseFromParent(proxy);
     }
-    if (here) LLVMPositionBuilderAtEnd(g->builder, here);
+    zan_builder_restore(g, pt);
 }
 
 /* 循环回边协作式抢占点：时间片用尽时重新排队当前帧并让出控制权 */
