@@ -3464,8 +3464,15 @@ static LLVMValueRef promote_loaded(zan_irgen_t *g, LLVMValueRef v,
     if (LLVMGetIntTypeWidth(LLVMTypeOf(v)) >= 64) return v;
     LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
     switch (type->kind) {
+    case TYPE_BYTE:
+        /* byte 是无符号窄整型：装载值必须零拓宽到规范 i64 表示，
+         * 否则裸 i8 落进下游 SIToFP 会按符号位解释（255 → -1.0）。 */
+        return LLVMBuildZExt(g->builder, v, i64t, "zx.u8");
     case TYPE_SBYTE:
         return LLVMBuildSExt(g->builder, v, i64t, "sx.i8");
+    case TYPE_CHAR:
+        /* char 语义 = 无符号 UTF-16 码元（0..65535），同 byte 零拓宽。 */
+        return LLVMBuildZExt(g->builder, v, i64t, "zx.char");
     case TYPE_USHORT:
         return LLVMBuildZExt(g->builder, v, i64t, "zx.u16");
     case TYPE_UINT:
