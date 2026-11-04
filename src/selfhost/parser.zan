@@ -26,6 +26,8 @@ public class Parser {
     public string attrFieldCustom;
     public long attrFieldFlags;
     public string attrFieldDefault;
+    public string attrBlob;
+    public string attrTableName;
     public Node curClsNode;   // class being parsed: local functions hoist here
     public int synthUsing;    // counter for `using (expr)` temp names
     public int chkMode;       // 0 default, 1 checked, 2 unchecked (for + - *)
@@ -37,7 +39,7 @@ public class Parser {
     public List<int> fileStarts; // first source line of each input file
     public List<string> curFileUsings; // usings of the current file
 
-    public Parser(List<Token> t, Diags d) { toks = t; pos = 0; diags = d; lastErrPos = -1; attrDll = false; attrEntry = ""; curClsNode = null; synthUsing = 0; curNs = ""; curFile = -1; fileStarts = null; curFileUsings = new List<string>(); attrStaticAddr = ""; }
+    public Parser(List<Token> t, Diags d) { toks = t; pos = 0; diags = d; lastErrPos = -1; attrDll = false; attrEntry = ""; curClsNode = null; synthUsing = 0; curNs = ""; curFile = -1; fileStarts = null; curFileUsings = new List<string>(); attrStaticAddr = ""; attrBlob = ""; attrTableName = ""; }
 
     // main.zan knows where each input file starts in the concatenated source
     // (1-based line numbers); with it the parser can give every declaration
@@ -71,8 +73,31 @@ public class Parser {
 
     bool HasModBit(int mods, int bit) { return (mods / bit) - ((mods / bit) / 2) * 2 == 1; }
 
+    string ParseAttrVal() {
+        if (At(TK.StringLit())) { return Next().text; }
+        if (At(TK.True())) { Next(); return "true"; }
+        if (At(TK.False())) { Next(); return "false"; }
+        if (At(TK.IntLit())) { return "" + Next().intVal; }
+        if (At(TK.FloatLit())) { return Next().text; }
+        if (At(TK.Ident())) {
+            string s = Next().text;
+            while (Eat(TK.Dot())) {
+                if (At(TK.Ident())) { s = s + "." + Next().text; }
+            }
+            if (Eat(TK.Pipe())) {
+                s = s + "|" + ParseAttrVal();
+            }
+            return s;
+        }
+        string fallback = "";
+        while (!At(TK.Comma()) && !At(TK.RParen()) && !At(TK.RBracket()) && !At(TK.Eof())) {
+            fallback = fallback + Next().text;
+        }
+        return fallback;
+    }
+
     // Attributes: [DllImport("lib")] / [DllImport("lib", EntryPoint="n")] /
-    // [StructLayout(...)] / [FieldOffset(...)] ... all other attributes are skipped.
+    // [StructLayout(...)] / [FieldOffset(...)] ... formatted into attrBlob.
     void ParseAttrs() {
         attrDll = false;
         attrTable = false;
@@ -88,133 +113,91 @@ public class Parser {
         attrFieldCustom = "";
         attrFieldFlags = 0;
         attrFieldDefault = "";
+        attrBlob = "";
+        attrTableName = "";
         while (At(TK.LBracket())) {
             Next(); // [
-            if (At(TK.Ident()) && Cur().text == "DllImport") {
-                attrDll = true;
-                Next();
-                if (Eat(TK.LParen())) {
-                    if (At(TK.StringLit())) { Next(); }
-                    while (Eat(TK.Comma())) {
-                        if (At(TK.Ident()) && Cur().text == "EntryPoint") {
-                            Next();
-                            Eat(TK.Eq());
-                            if (At(TK.StringLit())) { attrEntry = Next().text; }
-                        } else if (At(TK.Ident()) && Cur().text == "Variadic") {
-                            Next();
-                            Eat(TK.Eq());
-                            if (At(TK.True())) { attrVariadic = true; Next(); }
-                            else if (At(TK.Ident()) || At(TK.False())) { Next(); }
-                        } else {
-                            while (!At(TK.RParen()) && !At(TK.Comma()) && !At(TK.Eof())) { Next(); }
-                        }
-                    }
-                    Expect(TK.RParen());
-                }
-            } else if (At(TK.Ident()) && Cur().text == "Table") {
-                // ORM table entity: the checker's recv.<Entity> accessor and
-                // the zero-arg SyncStructureAll(Async) synthesis read this
-                // (mirrors the C host's zan_ast_has_attr(decl, "Table"))
-                attrTable = true;
-                Next();
-                if (Eat(TK.LParen())) {
-                    while (!At(TK.RParen()) && !At(TK.RBracket()) && !At(TK.Eof())) { Next(); }
-                    Expect(TK.RParen());
-                }
-            } else if (At(TK.Ident()) && Cur().text == "ThreadEntry") {
-                // POSIX thread entry: the prologue/epilogue additionally
-                // save/restore x19-x28 (libpthread's start routine keeps
-                // its own state in callee-saved registers)
-                attrThreadEntry = true;
-                Next();
-            } else if (At(TK.Ident()) && Cur().text == "AtomicCas") {
-                // body replaced by `casal x1, x2, [x0]`: seq_cst
-                // compare-exchange whose return is the value seen at the
-                // comparison (the oracle __atomic semantics)
-                attrAtomicCas = true;
-                Next();
-            } else if (At(TK.Ident()) && Cur().text == "AtomicLoad") {
-                attrAtomicLoad = true;
-                Next();
-            } else if (At(TK.Ident()) && Cur().text == "AtomicStore") {
-                attrAtomicStore = true;
-                Next();
-            } else if (At(TK.Ident()) && Cur().text == "StaticAddr") {
-                // body replaced by `adrp+add` of the named static data
-                // global: lets runtime code pass the address of a static
-                // cell to OSAtomic/pthread (spin locks, once controls)
-                Next();
-                Expect(TK.LParen());
-                if (At(TK.StringLit())) { attrStaticAddr = Next().text; }
-                while (!At(TK.RParen()) && !At(TK.RBracket()) && !At(TK.Eof())) { Next(); }
-                Expect(TK.RParen());
-            } else if (At(TK.Ident()) && Cur().text == "StructLayout") {
-                Next();
-                if (Eat(TK.LParen())) {
-                    // Preserve layout kind, not unrelated named attribute args.
-                    if (At(TK.Ident()) && Cur().text == "LayoutKind") {
-                        Next(); Expect(TK.Dot());
-                        if (At(TK.Ident()) && Cur().text == "Explicit") { attrLayoutExplicit = true; }
-                    }
-                    while (!At(TK.RParen()) && !At(TK.RBracket()) && !At(TK.Eof())) { Next(); }
-                    Expect(TK.RParen());
-                }
-            } else if (At(TK.Ident()) && Cur().text == "FieldOffset") {
-                Token attr = Next();
-                Expect(TK.LParen());
-                if (At(TK.IntLit()) && Cur().intVal >= 0) { attrFieldOffset = (int)Next().intVal; }
-                else { diags.Error("FieldOffset requires a nonnegative integer literal", attr.line, attr.col); }
-                while (!At(TK.RParen()) && !At(TK.RBracket()) && !At(TK.Eof())) { Next(); }
-                Expect(TK.RParen());
-            } else if (At(TK.Ident()) && (Cur().text == "JsonProperty" || Cur().text == "JsonPropertyAttribute" || Cur().text == "JsonPropertyName" || Cur().text == "Column")) {
-                Next();
-                if (Eat(TK.LParen())) {
-                    if (At(TK.StringLit())) { attrFieldCustom = Next().text; }
-                    while (!At(TK.RParen()) && !At(TK.RBracket()) && !At(TK.Eof())) { Next(); }
-                    Expect(TK.RParen());
-                }
-            } else if (At(TK.Ident()) && (Cur().text == "JsonIgnore" || Cur().text == "JsonIgnoreAttribute" || Cur().text == "Ignore" || Cur().text == "NotMapped")) {
-                attrFieldFlags = attrFieldFlags | 1;
-                Next();
-                if (Eat(TK.LParen())) {
-                    while (!At(TK.RParen()) && !At(TK.RBracket()) && !At(TK.Eof())) { Next(); }
-                    Expect(TK.RParen());
-                }
-            } else if (At(TK.Ident()) && (Cur().text == "JsonRequired" || Cur().text == "Required")) {
-                attrFieldFlags = attrFieldFlags | 2;
-                Next();
-                if (Eat(TK.LParen())) {
-                    while (!At(TK.RParen()) && !At(TK.RBracket()) && !At(TK.Eof())) { Next(); }
-                    Expect(TK.RParen());
-                }
-            } else if (At(TK.Ident()) && (Cur().text == "Key" || Cur().text == "PrimaryKey")) {
-                attrFieldFlags = attrFieldFlags | 4;
-                Next();
-                if (Eat(TK.LParen())) {
-                    while (!At(TK.RParen()) && !At(TK.RBracket()) && !At(TK.Eof())) { Next(); }
-                    Expect(TK.RParen());
-                }
-            } else if (At(TK.Ident()) && (Cur().text == "DefaultValue" || Cur().text == "JsonDefault" || Cur().text == "Default")) {
-                Next();
-                if (Eat(TK.LParen())) {
-                    if (At(TK.StringLit())) { attrFieldDefault = Next().text; }
-                    else if (At(TK.IntLit())) { attrFieldDefault = "" + Next().intVal; }
-                    else if (At(TK.FloatLit())) { attrFieldDefault = Next().text; }
-                    else if (At(TK.True())) { attrFieldDefault = "true"; Next(); }
-                    else if (At(TK.False())) { attrFieldDefault = "false"; Next(); }
-                    while (!At(TK.RParen()) && !At(TK.RBracket()) && !At(TK.Eof())) { Next(); }
-                    Expect(TK.RParen());
-                }
-            } else {
-                int depth = 0;
-                while (!At(TK.Eof())) {
-                    if (At(TK.LBracket())) { depth = depth + 1; }
-                    else if (At(TK.RBracket())) {
-                        if (depth == 0) { break; }
-                        depth = depth - 1;
-                    }
+            while (!At(TK.RBracket()) && !At(TK.Eof())) {
+                if (!At(TK.Ident())) {
                     Next();
+                    continue;
                 }
+                string aname = Next().text;
+                while (Eat(TK.Dot())) {
+                    if (At(TK.Ident())) { aname = Next().text; }
+                }
+                string aShort = aname;
+                if (aShort.Length > 9 && aShort.EndsWith("Attribute")) {
+                    aShort = aShort.Substring(0, aShort.Length - 9);
+                }
+                if (aname == "DllImport") { attrDll = true; }
+                else if (aname == "Table" || aname == "TableAttribute") { attrTable = true; }
+                else if (aname == "ThreadEntry") { attrThreadEntry = true; }
+                else if (aname == "AtomicCas") { attrAtomicCas = true; }
+                else if (aname == "AtomicLoad") { attrAtomicLoad = true; }
+                else if (aname == "AtomicStore") { attrAtomicStore = true; }
+                else if (aname == "JsonIgnore" || aname == "JsonIgnoreAttribute" || aname == "Ignore" || aname == "NotMapped" || aname == "NotMappedAttribute") {
+                    attrFieldFlags = attrFieldFlags | 1;
+                }
+                else if (aname == "JsonRequired" || aname == "JsonRequiredAttribute" || aname == "Required" || aname == "RequiredAttribute") {
+                    attrFieldFlags = attrFieldFlags | 2;
+                }
+                else if (aname == "Key" || aname == "KeyAttribute" || aname == "PrimaryKey" || aname == "PrimaryKeyAttribute") {
+                    attrFieldFlags = attrFieldFlags | 4;
+                }
+
+                if (Eat(TK.LParen())) {
+                    bool hasArgs = false;
+                    while (!At(TK.RParen()) && !At(TK.Eof())) {
+                        hasArgs = true;
+                        if (At(TK.Ident()) && K1() == TK.Eq()) {
+                            string k = Next().text;
+                            Next(); // =
+                            string v = ParseAttrVal();
+                            attrBlob = attrBlob + aShort + "." + k + "=" + v + ";";
+                            if (aname == "DllImport") {
+                                if (k == "EntryPoint") { attrEntry = v; }
+                                else if (k == "Variadic" && v == "true") { attrVariadic = true; }
+                            } else if (aname == "Table" || aname == "TableAttribute") {
+                                if (k == "Name" || k == "TableName") { attrTableName = v; }
+                            } else if (aname == "Column" || aname == "ColumnAttribute" ||
+                                       aname == "JsonProperty" || aname == "JsonPropertyAttribute" ||
+                                       aname == "JsonPropertyName" || aname == "JsonPropertyNameAttribute") {
+                                if (k == "Name") { attrFieldCustom = v; }
+                                else if (k == "Ignore" && v == "true") { attrFieldFlags = attrFieldFlags | 1; }
+                                else if (k == "Required" && v == "true") { attrFieldFlags = attrFieldFlags | 2; }
+                                else if ((k == "IsPrimary" || k == "PrimaryKey") && v == "true") { attrFieldFlags = attrFieldFlags | 4; }
+                                else if (k == "IsIdentity" && v == "true") { attrFieldFlags = attrFieldFlags | 8; }
+                            }
+                        } else {
+                            string v = ParseAttrVal();
+                            attrBlob = attrBlob + aShort + "=" + v + ";";
+                            if (aname == "StaticAddr") { attrStaticAddr = v; }
+                            else if (aname == "StructLayout" && v == "LayoutKind.Explicit") { attrLayoutExplicit = true; }
+                            else if (aname == "FieldOffset") {
+                                attrFieldOffset = Convert.ToInt32(v);
+                            } else if (aname == "Table" || aname == "TableAttribute") {
+                                attrTableName = v;
+                            } else if (aname == "Column" || aname == "ColumnAttribute" ||
+                                       aname == "JsonProperty" || aname == "JsonPropertyAttribute" ||
+                                       aname == "JsonPropertyName" || aname == "JsonPropertyNameAttribute") {
+                                if (attrFieldCustom == "") { attrFieldCustom = v; }
+                            } else if (aname == "DefaultValue" || aname == "DefaultValueAttribute" ||
+                                       aname == "JsonDefault" || aname == "JsonDefaultAttribute" ||
+                                       aname == "Default") {
+                                attrFieldDefault = v;
+                            }
+                        }
+                        if (!Eat(TK.Comma())) { break; }
+                    }
+                    if (!hasArgs) {
+                        attrBlob = attrBlob + aShort + "=true;";
+                    }
+                    Expect(TK.RParen());
+                } else {
+                    attrBlob = attrBlob + aShort + "=true;";
+                }
+                Eat(TK.Comma());
             }
             Expect(TK.RBracket());
         }
@@ -1707,10 +1690,14 @@ public class Parser {
     Node ParseClass(int mods, int kw) {
         bool explicitLayout = attrLayoutExplicit;
         bool hasTable = attrTable;
+        string blob = attrBlob;
+        string tblName = attrTableName;
         Next(); // class/struct
         Node cls = new Node(AK.ClassDecl());
         cls.layoutExplicit = explicitLayout;
         cls.attrTable = hasTable;
+        cls.attrBlob = blob;
+        cls.attrTableName = tblName;
         if (kw == TK.Struct()) { cls.kind = AK.StructDecl(); }
         cls.mods = mods;
         if (At(TK.Ident())) { cls.sval = Next().text; }
@@ -1898,6 +1885,7 @@ public class Parser {
         string fieldCustom = attrFieldCustom;
         long fieldFlags = attrFieldFlags;
         string fieldDefault = attrFieldDefault;
+        string blob = attrBlob;
         int mods = ParseMods();
         if (attrThreadEntry) { mods = mods + MOD.ThreadEntry(); }
         if (attrAtomicCas) { mods = mods + MOD.AtomicCas(); }
@@ -1980,6 +1968,7 @@ public class Parser {
         member.attrFieldCustom = fieldCustom;
         member.attrFieldFlags = fieldFlags;
         member.attrFieldDefault = fieldDefault;
+        member.attrBlob = blob;
         member.line = Cur().line; member.col = Cur().col;
         if (HasModBit(mods, MOD.Weak())) { type.mods = type.mods + MOD.Weak(); }
         if (At(TK.Ident()) || At(TK.Get()) || At(TK.Set())) { member.sval = Next().text; }
@@ -2039,7 +2028,7 @@ public class Parser {
         }
         // property:  T Name { get; set; } | { get {..} set {..} } | => expr;
         if (At(TK.LBrace()) || At(TK.Arrow())) {
-            return ParseProperty(type, member.sval, mods);
+            return ParseProperty(member);
         }
         // field (multi-declarator: `int a, b = 7, c;` -- extra declarators
         // ride as FieldDecl kids; the class-body loop flattens them)
@@ -2048,7 +2037,7 @@ public class Parser {
             Next();
             Node fd = new Node(AK.FieldDecl());
             fd.mods = mods; fd.type = type; fd.fieldOffset = fieldOffset;
-            fd.attrFieldCustom = fieldCustom; fd.attrFieldFlags = fieldFlags; fd.attrFieldDefault = fieldDefault;
+            fd.attrFieldCustom = fieldCustom; fd.attrFieldFlags = fieldFlags; fd.attrFieldDefault = fieldDefault; fd.attrBlob = blob;
             fd.line = Cur().line; fd.col = Cur().col;
             if (HasModBit(mods, MOD.Weak())) { fd.type.mods = fd.type.mods + MOD.Weak(); }
             if (At(TK.Ident()) || At(TK.Get()) || At(TK.Set())) { fd.sval = Next().text; }
@@ -2157,8 +2146,12 @@ public class Parser {
 
     // Desugar a property into a backing field (auto) or accessor methods
     // (get_Name / set_Name). Returns a Block whose kids the class splices in.
-    Node ParseProperty(Node type, string name, int mods) {
+    Node ParseProperty(Node member) {
+        Node type = member.type;
+        string name = member.sval;
+        int mods = member.mods;
         Node group = new Node(AK.Block());
+        group.attrBlob = member.attrBlob;
         if (At(TK.Arrow())) {
             Next();
             Node body = new Node(AK.Block());
@@ -2186,6 +2179,11 @@ public class Parser {
         if (getBody == null && setBody == null) {
             Node f = new Node(AK.FieldDecl());
             f.mods = mods; f.type = type; f.sval = name;
+            f.fieldOffset = member.fieldOffset;
+            f.attrFieldCustom = member.attrFieldCustom;
+            f.attrFieldFlags = member.attrFieldFlags;
+            f.attrFieldDefault = member.attrFieldDefault;
+            f.attrBlob = member.attrBlob;
             // auto-property initializer:  T Name { get; set; } = expr;
             if (Eat(TK.Eq())) { f.b = ParseExpr(); }
             Eat(TK.Semicolon());

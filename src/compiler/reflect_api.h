@@ -275,6 +275,7 @@ static inline zan_type_t *zan_refl_result_type(zan_binder_t *b, int code) {
     case ZAN_REFL_M_FIGNORED:
     case ZAN_REFL_M_FREQUIRED:
     case ZAN_REFL_M_FPK:
+    case ZAN_REFL_M_FIDENT:
     case ZAN_REFL_M_OMHAS:   return b->type_bool;
     case ZAN_REFL_M_ODOUBLE:
     case ZAN_REFL_M_IDOUBLE: return b->type_double;
