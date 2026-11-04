@@ -404,6 +404,9 @@ static void emit_weak_load_retain_body(zan_irgen_t *g) {
     LLVMBuildRet(b, v);
 }
 
+static void emit_defer_fallback(zan_irgen_t *g);
+static void emit_live_registry_fallback(zan_irgen_t *g);
+
 static void emit_weak_runtime(zan_irgen_t *g) {
     LLVMTypeRef i8ptr = weak_i8ptr(g);
     LLVMTypeRef slot_t = weak_slot_type(g);
@@ -465,6 +468,8 @@ static void emit_weak_runtime(zan_irgen_t *g) {
     emit_weak_destroy_begin_body(g, weak_calloc);
 
     emit_defer_fallback(g);
+
+    emit_live_registry_fallback(g);
 }
 
 /* B-ID78 延迟释放队列的形态自足弱回退：rt_release_dyn 的深树防护无条件
@@ -513,6 +518,65 @@ static void emit_defer_fallback(zan_irgen_t *g) {
     LLVMBuildRetVoid(g->builder);
 
     LLVMPositionBuilderAtEnd(g->builder, saved_bb);
+}
+
+/* B-ID89 活对象注册表与 GC 探测器的弱符号兜底：
+ * 当 rt_mem.o 未链入时（如 DLL / macOS / 未开启 fast-alloc），
+ * 注册/反注册降级为空操作，探测与快照返回 0，确保符号完备不报链接错误。 */
+static void emit_live_registry_fallback(zan_irgen_t *g) {
+    if (!g->rt_live_register || !g->rt_live_unregister) return;
+    LLVMBasicBlockRef saved_bb = LLVMGetInsertBlock(g->builder);
+
+    LLVMSetLinkage(g->rt_live_register, LLVMWeakAnyLinkage);
+    LLVMBasicBlockRef reg_entry = LLVMAppendBasicBlockInContext(g->ctx,
+        g->rt_live_register, "entry");
+    LLVMPositionBuilderAtEnd(g->builder, reg_entry);
+    LLVMBuildRetVoid(g->builder);
+
+    LLVMSetLinkage(g->rt_live_unregister, LLVMWeakAnyLinkage);
+    LLVMBasicBlockRef unreg_entry = LLVMAppendBasicBlockInContext(g->ctx,
+        g->rt_live_unregister, "entry");
+    LLVMPositionBuilderAtEnd(g->builder, unreg_entry);
+    LLVMBuildRetVoid(g->builder);
+
+    LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
+    LLVMTypeRef i8p = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+
+    LLVMValueRef cyc_fn = LLVMGetNamedFunction(g->mod, "zan_gc_detect_cycles");
+    if (!cyc_fn) {
+        cyc_fn = LLVMAddFunction(g->mod, "zan_gc_detect_cycles",
+            LLVMFunctionType(i64t, NULL, 0, 0));
+    }
+    LLVMSetLinkage(cyc_fn, LLVMWeakAnyLinkage);
+    LLVMBasicBlockRef cyc_entry = LLVMAppendBasicBlockInContext(g->ctx,
+        cyc_fn, "entry");
+    LLVMPositionBuilderAtEnd(g->builder, cyc_entry);
+    LLVMBuildRet(g->builder, LLVMConstInt(i64t, 0, 0));
+
+    LLVMValueRef snap_fn = LLVMGetNamedFunction(g->mod, "zan_gc_write_heap_snapshot");
+    if (!snap_fn) {
+        snap_fn = LLVMAddFunction(g->mod, "zan_gc_write_heap_snapshot",
+            LLVMFunctionType(i64t, (LLVMTypeRef[]){ i8p }, 1, 0));
+    }
+    LLVMSetLinkage(snap_fn, LLVMWeakAnyLinkage);
+    LLVMBasicBlockRef snap_entry = LLVMAppendBasicBlockInContext(g->ctx,
+        snap_fn, "entry");
+    LLVMPositionBuilderAtEnd(g->builder, snap_entry);
+    LLVMBuildRet(g->builder, LLVMConstInt(i64t, 0, 0));
+
+    LLVMValueRef reg_fg_fn = LLVMGetNamedFunction(g->mod, "zan_rt_register_site_field_graphs");
+    if (!reg_fg_fn) {
+        LLVMTypeRef rfg_args[] = { LLVMPointerType(i8p, 0), LLVMPointerType(i8p, 0), i64t };
+        reg_fg_fn = LLVMAddFunction(g->mod, "zan_rt_register_site_field_graphs",
+            LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), rfg_args, 3, 0));
+    }
+    LLVMSetLinkage(reg_fg_fn, LLVMWeakAnyLinkage);
+    LLVMBasicBlockRef rfg_entry = LLVMAppendBasicBlockInContext(g->ctx,
+        reg_fg_fn, "entry");
+    LLVMPositionBuilderAtEnd(g->builder, rfg_entry);
+    LLVMBuildRetVoid(g->builder);
+
+    if (saved_bb) LLVMPositionBuilderAtEnd(g->builder, saved_bb);
 }
 
 static void emit_weak_store(zan_irgen_t *g, LLVMValueRef field_ptr,

@@ -2795,7 +2795,12 @@ static LLVMValueRef zan_array_alloc_impl(zan_irgen_t *g, LLVMValueRef total,
                           LLVMConstInt(i64, ZAN_ARRAY_MAGIC, 0), "arr.magic");
     }
     LLVMValueRef off = LLVMConstInt(i64, ZAN_ARR_HDR_SIZE, 0);
-    return LLVMBuildGEP2(g->builder, i8, raw, &off, 1, "arr");
+    LLVMValueRef arr_ptr = LLVMBuildGEP2(g->builder, i8, raw, &off, 1, "arr");
+    if (g->rt_live_register) {
+        zan_call2(g->builder, LLVMGlobalGetValueType(g->rt_live_register),
+            g->rt_live_register, (LLVMValueRef[]){ arr_ptr, bytes }, 2, "");
+    }
+    return arr_ptr;
 }
 
 static LLVMValueRef zan_array_alloc_typed(zan_irgen_t *g, LLVMValueRef total,
@@ -2862,7 +2867,12 @@ static LLVMValueRef zan_mdarray_alloc(zan_irgen_t *g, LLVMValueRef *dims,
             LLVMBuildGEP2(g->builder, i64, hdri64, &off, 1, "md.dim"));
     }
     LLVMValueRef hdr_off = LLVMConstInt(i64, ZAN_ARR_HDR_SIZE, 0);
-    return LLVMBuildGEP2(g->builder, i8, raw, &hdr_off, 1, "md.arr");
+    LLVMValueRef arr_ptr = LLVMBuildGEP2(g->builder, i8, raw, &hdr_off, 1, "md.arr");
+    if (g->rt_live_register) {
+        zan_call2(g->builder, LLVMGlobalGetValueType(g->rt_live_register),
+            g->rt_live_register, (LLVMValueRef[]){ arr_ptr, bytes }, 2, "");
+    }
+    return arr_ptr;
 }
 
 static LLVMValueRef zan_itoa_fn(zan_irgen_t *g) {

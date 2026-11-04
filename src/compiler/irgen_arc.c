@@ -822,7 +822,7 @@ static LLVMValueRef get_array_desc(zan_irgen_t *g, zan_type_t *elem_type) {
     LLVMValueRef z = LLVMConstNull(i8p);
     LLVMValueRef dtor_c = LLVMConstBitCast(dtor, i8p);
     LLVMSetInitializer(dg, LLVMConstNamedStruct(dt,
-        (LLVMValueRef[]){ dtor_c, z, z }, 3));
+        (LLVMValueRef[]){ dtor_c, z, z, z }, 4));
     return dg;
 }
 
@@ -867,6 +867,10 @@ static LLVMValueRef get_arc_free_decl(zan_irgen_t *g) {
             g->g_site_live, "ltbl");
         LLVMValueRef sc_ptr = LLVMBuildGEP2(b, i64, ltbl, &site, 1, "scptr");
         emit_leak_counter_add(g, sc_ptr, -1);
+    }
+    if (g->rt_live_unregister) {
+        zan_call2(b, LLVMGlobalGetValueType(g->rt_live_unregister),
+            g->rt_live_unregister, &obj, 1, "");
     }
     if (g->arc_guard) {
         LLVMValueRef neg16 = LLVMConstInt(i64, (unsigned long long)ZAN_OBJ_RC_OFF, 1);
@@ -1237,6 +1241,137 @@ static void emit_site_tyname_table(zan_irgen_t *g) {
     LLVMSetLinkage(arr, LLVMInternalLinkage);
     LLVMSetInitializer(g->g_site_tynames,
         LLVMConstBitCast(arr, LLVMPointerType(i8ptr, 0)));
+    free(elems);
+}
+
+static LLVMValueRef build_site_field_graph(zan_irgen_t *g, int site_idx) {
+    char fg_name[64];
+    snprintf(fg_name, sizeof(fg_name), "__zan_fg_%d", site_idx);
+    LLVMValueRef existing = LLVMGetNamedGlobal(g->mod, fg_name);
+    LLVMTypeRef i8p = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    if (existing) return LLVMConstBitCast(existing, i8p);
+
+    LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
+    uint32_t kind = 3;
+    uint32_t ref_count = 0;
+    uint32_t instance_size = 0;
+    uint32_t offsets[256];
+
+    if (g->site_coll && g->site_coll[site_idx]) {
+        int ck = g->site_coll[site_idx];
+        if (ck == 1) { /* List */
+            zan_type_t *elem_type = g->site_coll_elem ? g->site_coll_elem[site_idx] : NULL;
+            if (elem_type && (is_arc_managed_type(elem_type) ||
+                              elem_type->kind == TYPE_STRING ||
+                              elem_type->kind == TYPE_DELEGATE ||
+                              elem_type->kind == TYPE_ARRAY ||
+                              elem_type->kind == TYPE_OBJECT)) {
+                kind = 1;
+                ref_count = 1;
+            } else {
+                kind = 3;
+                ref_count = 0;
+            }
+        } else if (ck == 3) { /* Dict */
+            kind = 2;
+            ref_count = 3;
+        } else {
+            kind = 3;
+            ref_count = 0;
+        }
+    } else if (g->site_syms && g->site_syms[site_idx]) {
+        zan_symbol_t *sym = g->site_syms[site_idx];
+        zan_type_t *inst = g->site_inst ? g->site_inst[site_idx] : NULL;
+        struct zan_struct_type_entry *e = get_struct_entry(g, sym);
+        if (e && e->field_llvm) {
+            int vptr = class_vptr_offset(sym);
+            unsigned long cursor = vptr ? 8 : 0;
+            int slot = vptr;
+            for (int i = 0; i < sym->member_count; i++) {
+                zan_symbol_t *m = sym->members[i];
+                if ((m->kind != SYM_FIELD && m->kind != SYM_PROPERTY) || field_member_is_static(m))
+                    continue;
+                unsigned long fa = abi_align_of(e->field_llvm[slot]);
+                unsigned long off = e->explicit_layout ? e->field_offsets[slot] : di_align_up(cursor, fa);
+                unsigned long fsize = abi_size_of(e->field_llvm[slot]);
+                if (!e->explicit_layout) cursor = off + fsize;
+                slot++;
+
+                zan_type_t *ft = m->type;
+                if (inst) ft = subst_type_param_deep(g, ft, inst);
+                if (!ft) continue;
+                if (!(m->modifiers & MOD_WEAK)) {
+                    bool is_rc = (ft->kind == TYPE_STRING ||
+                                  ft->kind == TYPE_DELEGATE ||
+                                  ft->kind == TYPE_ARRAY ||
+                                  is_arc_managed_type(ft) ||
+                                  ft->kind == TYPE_OBJECT);
+                    if (is_rc && ref_count < 256) {
+                        offsets[ref_count++] = (uint32_t)off;
+                    }
+                }
+            }
+            instance_size = (uint32_t)cursor;
+            kind = (ref_count > 0) ? 0 : 3;
+        }
+    } else {
+        /* Closure or unknown site */
+        kind = 0;
+        ref_count = 1;
+        offsets[0] = 16;
+        instance_size = 24;
+    }
+
+    LLVMTypeRef ref_ty = LLVMStructType((LLVMTypeRef[]){ i32t, i32t }, 2, 0);
+    LLVMTypeRef refs_arr_ty = LLVMArrayType(ref_ty, (unsigned)ref_count);
+    LLVMTypeRef fg_fields_ty[5] = { i32t, i32t, i32t, i32t, refs_arr_ty };
+    LLVMTypeRef fg_ty = LLVMStructType(fg_fields_ty, 5, 0);
+
+    LLVMValueRef fg_gv = LLVMAddGlobal(g->mod, fg_ty, fg_name);
+    LLVMSetLinkage(fg_gv, LLVMInternalLinkage);
+    LLVMSetGlobalConstant(fg_gv, 1);
+
+    LLVMValueRef *ref_elems = NULL;
+    if (ref_count > 0) {
+        ref_elems = (LLVMValueRef *)calloc((size_t)ref_count, sizeof(LLVMValueRef));
+        for (uint32_t k = 0; k < ref_count; k++) {
+            LLVMValueRef rvals[2] = {
+                LLVMConstInt(i32t, offsets[k], 0),
+                LLVMConstInt(i32t, 1, 0)
+            };
+            ref_elems[k] = LLVMConstStruct(rvals, 2, 0);
+        }
+    }
+    LLVMValueRef refs_val = LLVMConstArray(ref_ty, ref_elems, (unsigned)ref_count);
+    if (ref_elems) free(ref_elems);
+
+    LLVMValueRef fg_init[5] = {
+        LLVMConstInt(i32t, kind, 0),
+        LLVMConstInt(i32t, ref_count, 0),
+        LLVMConstInt(i32t, instance_size, 0),
+        LLVMConstInt(i32t, 0, 0),
+        refs_val
+    };
+    LLVMSetInitializer(fg_gv, LLVMConstStruct(fg_init, 5, 0));
+    return LLVMConstBitCast(fg_gv, i8p);
+}
+
+static void emit_site_field_graph_table(zan_irgen_t *g) {
+    LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    int n = g->leak_site_count;
+    if (n <= 0) return;
+    LLVMValueRef *elems = (LLVMValueRef *)calloc((size_t)n, sizeof(LLVMValueRef));
+    for (int i = 0; i < n; i++) {
+        elems[i] = build_site_field_graph(g, i);
+    }
+    LLVMTypeRef at = LLVMArrayType(i8ptr, (unsigned)n);
+    LLVMValueRef arr = LLVMAddGlobal(g->mod, at, "__zan_site_field_graph_tbl");
+    LLVMSetInitializer(arr, LLVMConstArray(i8ptr, elems, (unsigned)n));
+    LLVMSetLinkage(arr, LLVMInternalLinkage);
+    if (g->g_site_field_graphs) {
+        LLVMSetInitializer(g->g_site_field_graphs,
+            LLVMConstBitCast(arr, LLVMPointerType(i8ptr, 0)));
+    }
     free(elems);
 }
 

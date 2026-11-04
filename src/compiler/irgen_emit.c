@@ -367,6 +367,20 @@ static void emit_main_method(zan_irgen_t *g, zan_ast_node_t *method, zan_symbol_
                        &g->fn_report_leaks, 1, "");
     }
 
+    if (!g->desc_hdr && g->g_site_field_graphs) {
+        LLVMTypeRef i8p = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+        LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
+        LLVMTypeRef reg_args[] = { LLVMPointerType(i8p, 0), LLVMPointerType(i8p, 0), i64t };
+        LLVMTypeRef reg_ty = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), reg_args, 3, 0);
+        LLVMValueRef reg_fn = LLVMGetNamedFunction(g->mod, "zan_rt_register_site_field_graphs");
+        if (!reg_fn) reg_fn = LLVMAddFunction(g->mod, "zan_rt_register_site_field_graphs", reg_ty);
+        LLVMValueRef tbl = LLVMBuildLoad2(g->builder, LLVMPointerType(i8p, 0), g->g_site_field_graphs, "fgtbl");
+        LLVMValueRef tntbl = g->g_site_tynames ? LLVMBuildLoad2(g->builder, LLVMPointerType(i8p, 0), g->g_site_tynames, "tntbl")
+                                               : LLVMConstNull(LLVMPointerType(i8p, 0));
+        LLVMValueRef sc = LLVMConstInt(i64t, (uint64_t)g->leak_site_count, 0);
+        zan_call2(g->builder, reg_ty, reg_fn, (LLVMValueRef[]){ tbl, tntbl, sc }, 3, "");
+    }
+
     /* 协程工作窃取调度器 */
     zan_call2(g->builder, g->rt_co_sched_init_type, g->rt_co_sched_init, NULL, 0, "");
 
@@ -3027,6 +3041,7 @@ done:
     emit_site_dtor_table(g);
     emit_site_tyname_table(g);
     emit_site_meta_table(g);
+    emit_site_field_graph_table(g);
     zan_irgen_emit_arc_desc_init(g);
     refl_finalize_mtabs(g);
     if (!prune_stdlib_bodies) emit_vtables(g);

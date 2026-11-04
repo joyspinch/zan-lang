@@ -946,12 +946,11 @@ static LLVMValueRef zan_hdr_read_ok(zan_irgen_t *g, LLVMValueRef obj) {
 }
 
 static LLVMTypeRef arc_desc_type(zan_irgen_t *g) {
-    /* 3 字段：{dtor_fn, tynames_arr_ptr, meta_ptr}，共 24 字节。
-     * 历史上第 4 字段 site_idx(i64, offset 24) 已在 desc_hdr=true 模式下
-     * 从未被 runtime 读取——arc_site_arg 传的是 desc 指针而非 site 整数，
-     * 故移除之。前 3 字段偏移不变，不影响 runtime 硬编码 GEP(8)/GEP(16)。 */
+    /* 4 字段：{dtor_fn, tynames_arr_ptr, meta_ptr, field_graph_ptr}，共 32 字节。
+     * 前 3 字段偏移不变 (0, 8, 16)，不影响 runtime 硬编码 GEP(8)/GEP(16)。
+     * 第 4 字段 (offset 24) 承载 B-ID89 字段走图元数据指针。 */
     LLVMTypeRef i8p = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
-    return LLVMStructType((LLVMTypeRef[]){ i8p, i8p, i8p }, 3, 0);
+    return LLVMStructType((LLVMTypeRef[]){ i8p, i8p, i8p, i8p }, 4, 0);
 }
 
 static LLVMValueRef create_arc_desc(zan_irgen_t *g, int site_idx) {
@@ -965,7 +964,7 @@ static LLVMValueRef create_arc_desc(zan_irgen_t *g, int site_idx) {
     LLVMSetGlobalConstant(dg, 1);
     LLVMValueRef z = LLVMConstNull(i8p);
     LLVMSetInitializer(dg, LLVMConstNamedStruct(dt,
-        (LLVMValueRef[]){ z, z, z }, 3));
+        (LLVMValueRef[]){ z, z, z, z }, 4));
     g->desc_gv[site_idx] = dg;
     return dg;
 }
@@ -1683,10 +1682,13 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
             g->g_site_tynames = LLVMAddGlobal(g->mod, LLVMPointerType(i8p, 0), "__zan_site_tynames");
             LLVMSetInitializer(g->g_site_tynames, LLVMConstNull(LLVMPointerType(i8p, 0)));
             LLVMSetLinkage(g->g_site_tynames, LLVMInternalLinkage);
-            g->g_site_meta = LLVMAddGlobal(g->mod, LLVMPointerType(i8p, 0), "__zan_site_meta");
-            LLVMSetInitializer(g->g_site_meta, LLVMConstNull(LLVMPointerType(i8p, 0)));
-            LLVMSetLinkage(g->g_site_meta, LLVMInternalLinkage);
-        }
+	            g->g_site_meta = LLVMAddGlobal(g->mod, LLVMPointerType(i8p, 0), "__zan_site_meta");
+	            LLVMSetInitializer(g->g_site_meta, LLVMConstNull(LLVMPointerType(i8p, 0)));
+	            LLVMSetLinkage(g->g_site_meta, LLVMInternalLinkage);
+	            g->g_site_field_graphs = LLVMAddGlobal(g->mod, LLVMPointerType(i8p, 0), "__zan_site_field_graphs");
+	            LLVMSetInitializer(g->g_site_field_graphs, LLVMConstNull(LLVMPointerType(i8p, 0)));
+	            LLVMSetLinkage(g->g_site_field_graphs, LLVMInternalLinkage);
+	        }
         g->site_syms = (zan_symbol_t **)calloc(g->leak_site_cap, sizeof(zan_symbol_t *));
         g->site_coll = (int *)calloc(g->leak_site_cap, sizeof(int));
         g->site_coll_elem = (zan_type_t **)calloc(g->leak_site_cap, sizeof(zan_type_t *));
@@ -2434,6 +2436,15 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
         (void)ev_tag;
     }
 
+    {
+        LLVMTypeRef live_reg_args[] = { i8ptr, i64 };
+        g->rt_live_register = LLVMAddFunction(g->mod, "zan_rt_live_register",
+            LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), live_reg_args, 2, 0));
+        LLVMTypeRef live_unreg_args[] = { i8ptr };
+        g->rt_live_unregister = LLVMAddFunction(g->mod, "zan_rt_live_unregister",
+            LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), live_unreg_args, 1, 0));
+    }
+
     LLVMTypeRef retain_args[] = { i8ptr };
     LLVMTypeRef retain_type = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), retain_args, 1, 0);
     g->rt_retain = LLVMAddFunction(g->mod, "zan_rt_retain", retain_type);
@@ -2765,6 +2776,10 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
         LLVMBuildStore(g->builder, site, site_iptr);
         LLVMValueRef hdr_off = LLVMConstInt(i64, ZAN_OBJ_HDR_SIZE, 0);
         LLVMValueRef user_ptr = LLVMBuildGEP2(g->builder, LLVMInt8TypeInContext(g->ctx), raw, &hdr_off, 1, "usr");
+        if (g->rt_live_register) {
+            zan_call2(g->builder, LLVMGlobalGetValueType(g->rt_live_register),
+                g->rt_live_register, (LLVMValueRef[]){ user_ptr, total }, 2, "");
+        }
         if (g->check_leaks) {
             emit_leak_counter_add(g, g->g_live, 1);
             LLVMValueRef ltbl = LLVMBuildLoad2(g->builder,
@@ -2803,6 +2818,10 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
                        magic_iptr);
         LLVMValueRef hdr_off = LLVMConstInt(i64, ZAN_OBJ_HDR_SIZE, 0);
         LLVMValueRef user_ptr = LLVMBuildGEP2(g->builder, LLVMInt8TypeInContext(g->ctx), raw, &hdr_off, 1, "usr");
+        if (g->rt_live_register) {
+            zan_call2(g->builder, LLVMGlobalGetValueType(g->rt_live_register),
+                g->rt_live_register, (LLVMValueRef[]){ user_ptr, total }, 2, "");
+        }
         if (g->check_leaks) {
             emit_leak_counter_add(g, g->g_live, 1);
         }
@@ -2867,6 +2886,10 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
                 zan_icmp(g->builder, LLVMIntEQ, rc1, LLVMConstInt(i64t, 0, 0), "iszero"),
                 free_bb, ret_bb);
             LLVMPositionBuilderAtEnd(g->builder, free_bb);
+            if (g->rt_live_unregister) {
+                zan_call2(g->builder, LLVMGlobalGetValueType(g->rt_live_unregister),
+                    g->rt_live_unregister, &obj, 1, "");
+            }
             if (g->arc_guard) {
                 emit_arc_quarantine(g, obj, rc_iptr);
             } else {
@@ -2979,6 +3002,10 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
         LLVMBasicBlockRef free_bb = LLVMAppendBasicBlockInContext(g->ctx, g->rt_str_release, "dofree");
         LLVMBuildCondBr(g->builder, is_zero, free_bb, ret_bb);
         LLVMPositionBuilderAtEnd(g->builder, free_bb);
+        if (g->rt_live_unregister) {
+            zan_call2(g->builder, LLVMGlobalGetValueType(g->rt_live_unregister),
+                g->rt_live_unregister, &obj, 1, "");
+        }
         LLVMValueRef header_ptr = LLVMBuildGEP2(g->builder, LLVMInt8TypeInContext(g->ctx), obj, &neg16, 1, "hdr");
         LLVMTypeRef free_fn_type = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx),
             (LLVMTypeRef[]){ i8p }, 1, 0);

@@ -355,6 +355,9 @@ struct zan_irgen {
     LLVMValueRef rt_str_alloc;
     LLVMValueRef rt_arr_retain;  /* zan_rt_arr_retain(void*) */
     LLVMValueRef rt_arr_release; /* zan_rt_arr_release(void*) */
+    /* B-ID89 活对象注册表挂钩 */
+    LLVMValueRef rt_live_register;   /* zan_rt_live_register(void*, int64_t) */
+    LLVMValueRef rt_live_unregister; /* zan_rt_live_unregister(void*) */
     LLVMTypeRef weak_node_type;  /* { next, target, slot } */
     LLVMValueRef weak_buckets;
     LLVMValueRef weak_lock;      /* zan_weak_lock */
@@ -382,6 +385,7 @@ struct zan_irgen {
     LLVMValueRef g_site_dtors;
     LLVMValueRef g_site_tynames;  /* 祖先类型名称数组指针，供运行时 is/as 检查 */
     LLVMValueRef g_site_meta;     /* 分配点反射类型记录，供 GetType() 获取具体运行期类型 */
+    LLVMValueRef g_site_field_graphs; /* 字段走图表指针数组 (B-ID89) */
     LLVMValueRef g_site_count;
     zan_symbol_t **site_syms;
     zan_type_t   **site_inst;    /* 分配点特化类类型：确保泛型析构释放对应字段 */

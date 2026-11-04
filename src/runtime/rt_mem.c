@@ -657,3 +657,534 @@ void zan_rt_defer_drain(void) {
         fn(obj);
     }
 }
+
+/* =========================================================================
+ * B-ID89: 运行时活对象注册表、孤儿环探测器与堆快照导出
+ * ========================================================================= */
+
+#define ZAN_LIVE_STRIPES 32
+
+typedef struct zan_live_entry {
+    void                  *obj;
+    size_t                 size;
+    struct zan_live_entry *next;
+} zan_live_entry_t;
+
+typedef struct {
+#if defined(_WIN32)
+    SRWLOCK            lock;
+#else
+    pthread_mutex_t    lock;
+#endif
+    zan_live_entry_t **buckets;
+    size_t             bucket_count;
+    size_t             count;
+    zan_live_entry_t  *free_list;
+} zan_live_stripe_t;
+
+static zan_live_stripe_t g_live_stripes[ZAN_LIVE_STRIPES];
+static int g_live_stripes_inited = 0;
+
+static inline void zan_live_lock_init(zan_live_stripe_t *s) {
+#if defined(_WIN32)
+    (void)s;
+#else
+    pthread_mutex_init(&s->lock, NULL);
+#endif
+}
+
+static inline void zan_live_lock(zan_live_stripe_t *s) {
+#if defined(_WIN32)
+    AcquireSRWLockExclusive(&s->lock);
+#else
+    pthread_mutex_lock(&s->lock);
+#endif
+}
+
+static inline void zan_live_unlock(zan_live_stripe_t *s) {
+#if defined(_WIN32)
+    ReleaseSRWLockExclusive(&s->lock);
+#else
+    pthread_mutex_unlock(&s->lock);
+#endif
+}
+
+static inline unsigned zan_live_hash(uintptr_t ptr) {
+    uintptr_t x = ptr >> 4;
+    x ^= (x >> 16);
+    x ^= (x >> 8);
+    return (unsigned)x;
+}
+
+static void zan_live_ensure_init(void) {
+    if (__atomic_load_n(&g_live_stripes_inited, __ATOMIC_ACQUIRE)) return;
+    static volatile long init_lock = 0;
+    while (__sync_lock_test_and_set(&init_lock, 1)) {
+        /* spin */
+    }
+    if (!g_live_stripes_inited) {
+        for (int i = 0; i < ZAN_LIVE_STRIPES; i++) {
+            zan_live_lock_init(&g_live_stripes[i]);
+            g_live_stripes[i].bucket_count = 64;
+            g_live_stripes[i].buckets = (zan_live_entry_t **)__real_calloc(64, sizeof(zan_live_entry_t *));
+            g_live_stripes[i].count = 0;
+            g_live_stripes[i].free_list = NULL;
+        }
+        __atomic_store_n(&g_live_stripes_inited, 1, __ATOMIC_RELEASE);
+    }
+    __sync_lock_release(&init_lock);
+}
+
+void zan_rt_live_register(void *obj, size_t size) {
+    if (!obj) return;
+    zan_live_ensure_init();
+    unsigned h = zan_live_hash((uintptr_t)obj);
+    unsigned stripe_idx = h & (ZAN_LIVE_STRIPES - 1);
+    zan_live_stripe_t *s = &g_live_stripes[stripe_idx];
+
+    zan_live_lock(s);
+    if (!s->buckets) {
+        s->bucket_count = 64;
+        s->buckets = (zan_live_entry_t **)__real_calloc(64, sizeof(zan_live_entry_t *));
+    }
+
+    /* Grow buckets if load factor > 2 */
+    if (s->count > s->bucket_count * 2 && s->bucket_count < (1u << 24)) {
+        size_t new_cap = s->bucket_count * 2;
+        zan_live_entry_t **new_buckets = (zan_live_entry_t **)__real_calloc(new_cap, sizeof(zan_live_entry_t *));
+        if (new_buckets) {
+            for (size_t b = 0; b < s->bucket_count; b++) {
+                zan_live_entry_t *curr = s->buckets[b];
+                while (curr) {
+                    zan_live_entry_t *nxt = curr->next;
+                    unsigned b_idx = (zan_live_hash((uintptr_t)curr->obj) / ZAN_LIVE_STRIPES) & (new_cap - 1);
+                    curr->next = new_buckets[b_idx];
+                    new_buckets[b_idx] = curr;
+                    curr = nxt;
+                }
+            }
+            __real_free(s->buckets);
+            s->buckets = new_buckets;
+            s->bucket_count = new_cap;
+        }
+    }
+
+    unsigned b_idx = (h / ZAN_LIVE_STRIPES) & (s->bucket_count - 1);
+    zan_live_entry_t *entry = s->free_list;
+    if (entry) {
+        s->free_list = entry->next;
+    } else {
+        entry = (zan_live_entry_t *)__real_malloc(sizeof(zan_live_entry_t));
+        if (!entry) {
+            zan_live_unlock(s);
+            return;
+        }
+    }
+    entry->obj = obj;
+    entry->size = size;
+    entry->next = s->buckets[b_idx];
+    s->buckets[b_idx] = entry;
+    s->count++;
+    zan_live_unlock(s);
+}
+
+void zan_rt_live_unregister(void *obj) {
+    if (!obj) return;
+    if (!__atomic_load_n(&g_live_stripes_inited, __ATOMIC_ACQUIRE)) return;
+    unsigned h = zan_live_hash((uintptr_t)obj);
+    unsigned stripe_idx = h & (ZAN_LIVE_STRIPES - 1);
+    zan_live_stripe_t *s = &g_live_stripes[stripe_idx];
+
+    zan_live_lock(s);
+    if (!s->buckets || s->count == 0) {
+        zan_live_unlock(s);
+        return;
+    }
+
+    unsigned b_idx = (h / ZAN_LIVE_STRIPES) & (s->bucket_count - 1);
+    zan_live_entry_t **prev = &s->buckets[b_idx];
+    zan_live_entry_t *curr = *prev;
+    while (curr) {
+        if (curr->obj == obj) {
+            *prev = curr->next;
+            curr->next = s->free_list;
+            s->free_list = curr;
+            s->count--;
+            break;
+        }
+        prev = &curr->next;
+        curr = curr->next;
+    }
+    zan_live_unlock(s);
+}
+
+static void **g_site_field_graphs_reg = NULL;
+static void **g_site_tynames_reg = NULL;
+static int64_t g_site_reg_count = 0;
+
+void zan_rt_register_site_field_graphs(void **graphs, void **tynames, int64_t count) {
+    g_site_field_graphs_reg = graphs;
+    g_site_tynames_reg = tynames;
+    g_site_reg_count = count;
+}
+
+static const char *zan_get_object_tyname(void *obj) {
+    if (!obj) return "null";
+    uint64_t site = *(uint64_t *)((char *)obj + ZAN_OBJ_SITE_OFF);
+    if ((site >> 32) == ZAN_STRING_TAG) {
+        return "string";
+    }
+    uint64_t arr_rc_magic = *(uint64_t *)((char *)obj + ZAN_ARR_RC_MAGIC_OFF);
+    if (arr_rc_magic == ZAN_ARRAY_RC_MAGIC) {
+        if (site == ZAN_ARRAY_MAGIC) return "Array";
+        if (site >= 4096) {
+            zan_arc_desc_t *desc = (zan_arc_desc_t *)(uintptr_t)site;
+            if (desc && desc->tynames_arr) {
+                const char **tns = (const char **)desc->tynames_arr;
+                if (tns[0]) return tns[0];
+            }
+        }
+        return "Array";
+    }
+    if (site >= 4096) {
+        zan_arc_desc_t *desc = (zan_arc_desc_t *)(uintptr_t)site;
+        if (desc && desc->tynames_arr) {
+            const char **tns = (const char **)desc->tynames_arr;
+            if (tns[0]) return tns[0];
+        }
+    } else if (g_site_tynames_reg && site > 0 && site < (uint64_t)g_site_reg_count) {
+        const char **tns = (const char **)g_site_tynames_reg[site];
+        if (tns && tns[0]) return tns[0];
+    }
+    return "object";
+}
+
+typedef void (*zan_edge_cb_t)(void *from, void *to, void *ctx);
+
+static void zan_walk_object_edges(void *obj, zan_edge_cb_t cb, void *ctx) {
+    if (!obj) return;
+    uint64_t site = *(uint64_t *)((char *)obj + ZAN_OBJ_SITE_OFF);
+    if ((site >> 32) == ZAN_STRING_TAG) {
+        return;
+    }
+    uint64_t arr_rc_magic = *(uint64_t *)((char *)obj + ZAN_ARR_RC_MAGIC_OFF);
+    if (arr_rc_magic == ZAN_ARRAY_RC_MAGIC) {
+        if (site == ZAN_ARRAY_MAGIC) return;
+        int64_t count = *(int64_t *)((char *)obj + ZAN_OBJ_RC_OFF);
+        if (count <= 0) return;
+        void **elems = (void **)obj;
+        for (int64_t i = 0; i < count; i++) {
+            void *child = elems[i];
+            if (child) cb(obj, child, ctx);
+        }
+        return;
+    }
+    zan_field_graph_t *fg = NULL;
+    if (site >= 4096) {
+        zan_arc_desc_t *desc = (zan_arc_desc_t *)(uintptr_t)site;
+        if (desc) fg = desc->field_graph;
+    } else if (g_site_field_graphs_reg && site > 0 && site < (uint64_t)g_site_reg_count) {
+        fg = (zan_field_graph_t *)g_site_field_graphs_reg[site];
+    }
+    if (!fg) return;
+    if (fg->kind == 0) {
+        for (uint32_t k = 0; k < fg->ref_count; k++) {
+            uint32_t off = fg->refs[k].offset;
+            void *child = *(void **)((char *)obj + off);
+            if (child) cb(obj, child, ctx);
+        }
+    } else if (fg->kind == 1) { /* List<T> */
+            int64_t count = *(int64_t *)obj;
+            void **data = *(void ***)((char *)obj + 16);
+            if (data && count > 0) {
+                for (int64_t j = 0; j < count; j++) {
+                    void *child = data[j];
+                    if (child) cb(obj, child, ctx);
+                }
+            }
+        } else if (fg->kind == 2) { /* Dict<K,V> */
+            int64_t count = *(int64_t *)obj;
+            void **ks = *(void ***)((char *)obj + 16);
+            void **vs = *(void ***)((char *)obj + 24);
+            int key_is_rc = fg->ref_count & 1;
+            int val_is_rc = (fg->ref_count >> 1) & 1;
+            for (int64_t j = 0; j < count; j++) {
+                if (key_is_rc && ks && ks[j]) cb(obj, ks[j], ctx);
+                if (val_is_rc && vs && vs[j]) cb(obj, vs[j], ctx);
+            }
+        }
+    }
+
+typedef struct {
+    void *key;
+    int   val;
+} zan_map_entry_t;
+
+typedef struct {
+    zan_map_entry_t *entries;
+    size_t           capacity;
+    size_t           mask;
+} zan_obj_map_t;
+
+static inline void zan_obj_map_init(zan_obj_map_t *map, size_t min_cap) {
+    size_t cap = 64;
+    while (cap < min_cap * 2) cap *= 2;
+    map->capacity = cap;
+    map->mask = cap - 1;
+    map->entries = (zan_map_entry_t *)__real_calloc(cap, sizeof(zan_map_entry_t));
+}
+
+static inline void zan_obj_map_free(zan_obj_map_t *map) {
+    if (map->entries) __real_free(map->entries);
+    map->entries = NULL;
+}
+
+static inline void zan_obj_map_put(zan_obj_map_t *map, void *key, int val) {
+    if (!key || !map->entries) return;
+    size_t idx = zan_live_hash((uintptr_t)key) & map->mask;
+    while (map->entries[idx].key && map->entries[idx].key != key) {
+        idx = (idx + 1) & map->mask;
+    }
+    map->entries[idx].key = key;
+    map->entries[idx].val = val;
+}
+
+static inline int zan_obj_map_get(const zan_obj_map_t *map, void *key) {
+    if (!key || !map->entries) return -1;
+    size_t idx = zan_live_hash((uintptr_t)key) & map->mask;
+    while (map->entries[idx].key) {
+        if (map->entries[idx].key == key) return map->entries[idx].val;
+        idx = (idx + 1) & map->mask;
+    }
+    return -1;
+}
+
+typedef struct {
+    void       *obj;
+    int64_t     rc;
+    int64_t     internal_rc;
+    int         marked;
+    size_t      size;
+} zan_cycle_node_t;
+
+typedef struct {
+    zan_cycle_node_t *nodes;
+    zan_obj_map_t    *map;
+} zan_cycle_ctx_t;
+
+static void zan_cycle_edge_count_cb(void *from, void *to, void *ctx) {
+    (void)from;
+    zan_cycle_ctx_t *c = (zan_cycle_ctx_t *)ctx;
+    int j = zan_obj_map_get(c->map, to);
+    if (j >= 0) {
+        c->nodes[j].internal_rc++;
+    }
+}
+
+typedef struct {
+    zan_cycle_node_t *nodes;
+    zan_obj_map_t    *map;
+    int              *queue;
+    size_t           *qtail;
+} zan_bfs_ctx_t;
+
+static void zan_cycle_bfs_cb(void *from, void *to, void *ctx) {
+    (void)from;
+    zan_bfs_ctx_t *b = (zan_bfs_ctx_t *)ctx;
+    int v = zan_obj_map_get(b->map, to);
+    if (v >= 0 && !b->nodes[v].marked) {
+        b->nodes[v].marked = 1;
+        b->queue[(*b->qtail)++] = v;
+    }
+}
+
+int64_t zan_gc_detect_cycles(void) {
+    if (!__atomic_load_n(&g_live_stripes_inited, __ATOMIC_ACQUIRE)) return 0;
+
+    for (int s = 0; s < ZAN_LIVE_STRIPES; s++) {
+        zan_live_lock(&g_live_stripes[s]);
+    }
+
+    size_t total_count = 0;
+    for (int s = 0; s < ZAN_LIVE_STRIPES; s++) {
+        total_count += g_live_stripes[s].count;
+    }
+    if (total_count == 0) {
+        for (int s = ZAN_LIVE_STRIPES - 1; s >= 0; s--) {
+            zan_live_unlock(&g_live_stripes[s]);
+        }
+        return 0;
+    }
+
+    zan_cycle_node_t *nodes = (zan_cycle_node_t *)__real_malloc(total_count * sizeof(zan_cycle_node_t));
+    if (!nodes) {
+        for (int s = ZAN_LIVE_STRIPES - 1; s >= 0; s--) {
+            zan_live_unlock(&g_live_stripes[s]);
+        }
+        return 0;
+    }
+
+    zan_obj_map_t map;
+    zan_obj_map_init(&map, total_count);
+
+    size_t idx = 0;
+    for (int s = 0; s < ZAN_LIVE_STRIPES; s++) {
+        for (size_t b = 0; b < g_live_stripes[s].bucket_count; b++) {
+            zan_live_entry_t *entry = g_live_stripes[s].buckets[b];
+            while (entry && idx < total_count) {
+                nodes[idx].obj = entry->obj;
+                nodes[idx].rc = *(int64_t *)((char *)entry->obj + ZAN_OBJ_RC_OFF);
+                nodes[idx].internal_rc = 0;
+                nodes[idx].marked = 0;
+                nodes[idx].size = entry->size;
+                zan_obj_map_put(&map, entry->obj, (int)idx);
+                idx++;
+                entry = entry->next;
+            }
+        }
+    }
+    size_t actual_count = idx;
+
+    zan_cycle_ctx_t ctx = { nodes, &map };
+    for (size_t i = 0; i < actual_count; i++) {
+        zan_walk_object_edges(nodes[i].obj, zan_cycle_edge_count_cb, &ctx);
+    }
+
+    int *queue = (int *)__real_malloc(actual_count * sizeof(int));
+    size_t qhead = 0, qtail = 0;
+    if (queue) {
+        for (size_t i = 0; i < actual_count; i++) {
+            if (nodes[i].rc > nodes[i].internal_rc) {
+                nodes[i].marked = 1;
+                queue[qtail++] = (int)i;
+            }
+        }
+
+        zan_bfs_ctx_t bfs_ctx = { nodes, &map, queue, &qtail };
+        while (qhead < qtail) {
+            int u = queue[qhead++];
+            zan_walk_object_edges(nodes[u].obj, zan_cycle_bfs_cb, &bfs_ctx);
+        }
+    }
+
+    int64_t orphan_count = 0;
+    size_t orphan_bytes = 0;
+    for (size_t i = 0; i < actual_count; i++) {
+        if (!nodes[i].marked) {
+            orphan_count++;
+            orphan_bytes += nodes[i].size;
+        }
+    }
+
+    if (orphan_count > 0) {
+        fprintf(stderr,
+            "[zan-gc] cycle detection: %lld unreachable object(s) in orphan cycles (%zu bytes)\n",
+            (long long)orphan_count, orphan_bytes);
+    }
+
+    if (queue) __real_free(queue);
+    zan_obj_map_free(&map);
+    __real_free(nodes);
+
+    for (int s = ZAN_LIVE_STRIPES - 1; s >= 0; s--) {
+        zan_live_unlock(&g_live_stripes[s]);
+    }
+
+    return orphan_count;
+}
+
+typedef struct {
+    const char *tyname;
+    size_t      count;
+    size_t      bytes;
+} zan_heap_type_stat_t;
+
+int64_t zan_gc_write_heap_snapshot(const char *path) {
+    if (!path || !path[0]) return -1;
+    if (!__atomic_load_n(&g_live_stripes_inited, __ATOMIC_ACQUIRE)) return 0;
+
+    for (int s = 0; s < ZAN_LIVE_STRIPES; s++) {
+        zan_live_lock(&g_live_stripes[s]);
+    }
+
+    size_t total_count = 0;
+    size_t total_bytes = 0;
+    for (int s = 0; s < ZAN_LIVE_STRIPES; s++) {
+        total_count += g_live_stripes[s].count;
+    }
+
+    size_t stat_cap = 256;
+    size_t stat_count = 0;
+    zan_heap_type_stat_t *stats = (zan_heap_type_stat_t *)__real_malloc(stat_cap * sizeof(zan_heap_type_stat_t));
+
+    for (int s = 0; s < ZAN_LIVE_STRIPES; s++) {
+        for (size_t b = 0; b < g_live_stripes[s].bucket_count; b++) {
+            zan_live_entry_t *entry = g_live_stripes[s].buckets[b];
+            while (entry) {
+                total_bytes += entry->size;
+                const char *tn = zan_get_object_tyname(entry->obj);
+                int found = 0;
+                for (size_t k = 0; k < stat_count; k++) {
+                    if (strcmp(stats[k].tyname, tn) == 0) {
+                        stats[k].count++;
+                        stats[k].bytes += entry->size;
+                        found = 1;
+                        break;
+                    }
+                }
+                if (!found && stats) {
+                    if (stat_count >= stat_cap) {
+                        stat_cap *= 2;
+                        zan_heap_type_stat_t *ns = (zan_heap_type_stat_t *)__real_realloc(stats, stat_cap * sizeof(zan_heap_type_stat_t));
+                        if (ns) stats = ns;
+                    }
+                    if (stat_count < stat_cap) {
+                        stats[stat_count].tyname = tn;
+                        stats[stat_count].count = 1;
+                        stats[stat_count].bytes = entry->size;
+                        stat_count++;
+                    }
+                }
+                entry = entry->next;
+            }
+        }
+    }
+
+    for (int s = ZAN_LIVE_STRIPES - 1; s >= 0; s--) {
+        zan_live_unlock(&g_live_stripes[s]);
+    }
+
+    if (stats) {
+        for (size_t i = 0; i < stat_count; i++) {
+            for (size_t j = i + 1; j < stat_count; j++) {
+                if (stats[j].bytes > stats[i].bytes) {
+                    zan_heap_type_stat_t tmp = stats[i];
+                    stats[i] = stats[j];
+                    stats[j] = tmp;
+                }
+            }
+        }
+    }
+
+    FILE *f = fopen(path, "w");
+    if (!f) {
+        if (stats) __real_free(stats);
+        return -1;
+    }
+
+    fprintf(f, "# Zan Heap Snapshot\n");
+    fprintf(f, "# Total Live Objects: %zu\n", total_count);
+    fprintf(f, "# Total Allocated Bytes: %zu\n\n", total_bytes);
+    fprintf(f, "%-40s %15s %15s\n", "Type", "Count", "Bytes");
+    fprintf(f, "--------------------------------------------------------------------------------\n");
+    if (stats) {
+        for (size_t k = 0; k < stat_count; k++) {
+            fprintf(f, "%-40s %15zu %15zu\n", stats[k].tyname, stats[k].count, stats[k].bytes);
+        }
+    }
+    fprintf(f, "--------------------------------------------------------------------------------\n");
+    fclose(f);
+
+    if (stats) __real_free(stats);
+    return (int64_t)total_count;
+}
