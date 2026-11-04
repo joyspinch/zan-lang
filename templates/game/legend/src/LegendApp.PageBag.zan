@@ -20,6 +20,9 @@ partial class LegendApp {
     // 加锁/使用(A) 无对应玩法后端，本轮保持诚实占位（提示进聊天）。
     bool whMode = false;
     bool whPick = false;
+    // 物品栏选中格（-1 = 未选）。使用(A)/卖出(X) 作用于它；点空格或再点
+    // 一次同一格取消。
+    int bagSel = -1;
 
     /* ---- 本页局部实测尺寸 ----
        尺寸常量全在 `Spec.Bag*`（唯一事实来源，逻辑像素 → Spec.Px 设备
@@ -81,9 +84,8 @@ partial class LegendApp {
            （自己画会跟底图的框差几个像素，正是「装备格子显示有问题」）。 */
         Image pic = new Image("assets/ui/00009.jpg", "人物+装备环", "cover");
         pic.Grow(); portrait.Add(pic);
-        for (int i = 0; i < 12; i = i + 1) {
-            Equipment worn = g != null ? g.equipped[i] : null;
-            Panel cell = EquipArt(Spec.BagSlotW(), Spec.BagSlotH(), worn);
+        for (int i = 0; i < Spec.BagEquipCount(); i = i + 1) {
+            Panel cell = BagEquipCell(Spec.BagEquipSlot(i));
             cell.Float(Spec.BagEquipX(i), Spec.BagEquipY(i));
             portrait.Add(cell);
         }
@@ -137,12 +139,29 @@ partial class LegendApp {
     // 联机 live-first：背包/仓库格直接读服务端行（PageRecycle 同款），
     // 离线才读本地存档 `g.bag`/`g.storage`。有道具的格子可点：
     // 入库选择模式点背包物品=入库，仓库视图点物品=取回。
+    // 一个穿戴格：联机按 self.worn 的穿戴位代码取真装备（服务端记账），
+    // 离线才读本地存档 g.equipped[slot]。点一下卸下（takeoff / Unequip）。
+    Panel BagEquipCell(int slot) {
+        if (net.Self() != null) {
+            JsonValue w = net.WornInSlot(slot);
+            Panel c = SlotArt(Spec.BagSlotW(), Spec.BagSlotH(),
+                w != null ? ItemArtById(w.Int("id", 0)) : "", "", "");
+            if (w != null) { int s = slot; c.OnClick(() => { net.TakeOff(s); }); }
+            return c;
+        }
+        Equipment worn = g != null ? g.equipped[slot] : null;
+        Panel c = EquipArt(Spec.BagSlotW(), Spec.BagSlotH(), worn);
+        if (worn != null) { int s = slot; c.OnClick(() => { g.Unequip(s); this.Rebuild(); }); }
+        return c;
+    }
+
     Panel BagCellView(int i, int w, int h) {
         if (net.Self() != null) {
             BagItem bi = whMode ? net.TypedWhAt(i) : net.TypedBagAt(i);
             if (bi != null) {
                 if (bi.ItemId <= 0 || bi.Count <= 0) { return SlotArt(w, h, "", "", ""); }
                 Panel cTyped = ItemArtCell(w, h, bi.ItemId, bi.Count);
+                if (this.bagSel == i) { cTyped.Class = "bag-sel"; }
                 int idxTyped = i;
                 cTyped.OnClick(() => { BagCellTap(idxTyped); });
                 return cTyped;
@@ -153,6 +172,7 @@ partial class LegendApp {
         if (whMode) { if (i >= 0 && i < g.storage.Count) { e = g.storage[i]; } }
         else if (g != null && i >= 0 && i < g.bag.Count) { e = g.bag[i]; }
         Panel p = EquipArt(w, h, e);
+        if (this.bagSel == i) { p.Class = "bag-sel"; }
         if (e != null) { int idx = i; p.OnClick(() => { BagCellTap(idx); }); }
         return p;
     }
@@ -174,14 +194,18 @@ partial class LegendApp {
                 int id = bi.ItemId;
                 int cnt = bi.Count;
                 if (id <= 0 || cnt <= 0) { return; }
-                if (whMode) { net.WhMove(id, cnt, false); }
-                else if (whPick) { net.WhMove(id, cnt, true); }
+                if (whMode) { net.WhMove(id, cnt, false); return; }
+                if (whPick) { net.WhMove(id, cnt, true); return; }
+                this.bagSel = (this.bagSel == i) ? -1 : i;
+                this.Rebuild();
                 return;
             }
             return;
         }
-        if (whMode) { g.Store(i, true); this.Rebuild(); }
-        else if (whPick) { g.Store(i, false); this.Rebuild(); }
+        if (whMode) { g.Store(i, true); this.Rebuild(); return; }
+        if (whPick) { g.Store(i, false); this.Rebuild(); return; }
+        this.bagSel = (this.bagSel == i) ? -1 : i;
+        this.Rebuild();
     }
 
     // 下段：tab 行 + 内容（左固定面板随 tab 变）
@@ -249,7 +273,20 @@ partial class LegendApp {
 
     // 「min - max」——原版战斗属性行是「2 - 10」这种带空格的写法；
     // `Game.StatPair` 用的是无空格短横，别直接拿来拼这一页。
+    // 联机取服务端 self 的区间（atkLo..atk / defLo..def / macLo..mac）：
+    // 服务端只有一条主属性曲线（战 DC / 法 MC / 道 SC），按 self.job 落到
+    // 攻击/魔法/道术对应那一行，另两行 0 - 0（原版战士也是 0）。离线才回退
+    // 本地存档 g.Stat（attributes.csv）。
     string BagPair(string group) {
+        PlayerState st = net.SelfState();
+        if (net.Self() != null && st != null && st.Id > 0) {
+            string main = Rules.N(st.AtkLo) + " - " + Rules.N(st.Atk);
+            if (group == "attack") { return st.Job == 0 ? main : "0 - 0"; }
+            if (group == "magic") { return st.Job == 1 ? main : "0 - 0"; }
+            if (group == "tao") { return st.Job == 2 ? main : "0 - 0"; }
+            if (group == "defense") { return Rules.N(st.DefLo) + " - " + Rules.N(st.Def); }
+            return Rules.N(st.MacLo) + " - " + Rules.N(st.Mac);
+        }
         return Rules.N(g.Stat(group + "_min")) + " - " + Rules.N(g.StatMax(group));
     }
 
@@ -482,7 +519,7 @@ partial class LegendApp {
 
         List<BagSkillEntry> skills = new List<BagSkillEntry>();
         for (int i = 0; i < 8; i = i + 1) {
-            DataRow ability = g != null ? g.SkillAtSlot(i) : null;
+            CfgRow ability = g != null ? g.SkillAtSlot(i) : null;
             string sName = ability != null ? ability.Text("name") : ("技能" + Rules.N(i + 1));
             int sRank = g != null ? g.SkillRank(i) : 0;
             int sMax = ability != null ? ability.Int("max_level") : 100;
@@ -563,10 +600,44 @@ partial class LegendApp {
             this.Rebuild();
             return;
         }
-        string stub = idx == 2 ? "加锁/解锁。"
-            : idx == 3 ? "使用(A)。"
-            : idx == 5 ? "放入图鉴。"
-            : idx == 6 ? "一键熔炼。" : "卖出(X)。";
+        /* 使用(A) / 卖出(X)：作用于物品栏里点选的格子。服务端 use 只收
+           消耗品、equip 收装备，两个 op 分开——这里按物品 kind 分流。 */
+        if (idx == 3 || idx == 7) {
+            if (!online) {
+                if (this.bagSel < 0 || this.bagSel >= g.bag.Count) {
+                    g.Log("先点背包里的道具选中，再点使用/卖出。");
+                    return;
+                }
+                if (idx == 3) { g.Wear(this.bagSel); } else { g.Sell(this.bagSel); }
+                this.bagSel = -1;
+                this.Rebuild();
+                return;
+            }
+            if (this.whMode || this.whPick) {
+                net.AddChat("[系统]", "先返回背包视图，再对道具使用/卖出。");
+                return;
+            }
+            BagItem sel = this.bagSel >= 0 ? net.TypedBagAt(this.bagSel) : null;
+            if (sel == null || sel.ItemId <= 0) {
+                net.AddChat("[系统]", idx == 3
+                    ? "先点物品栏里的道具选中，再点「使用(A)」。"
+                    : "先点物品栏里的道具选中，再点「卖出(X)」。");
+                return;
+            }
+            this.bagSel = -1;
+            if (idx == 7) { net.SellItem(sel.ItemId); return; }
+            if (sel.Kind == 1 || sel.Kind == 2) { net.EquipItem(sel.ItemId); }
+            else { net.UseItem(sel.ItemId); }
+            return;
+        }
+        /* 一键熔炼：服务端 recycle（全部可回收材料换金币）。 */
+        if (idx == 6) {
+            if (online) { this.bagSel = -1; net.RecycleAll(); return; }
+            g.Log("一键熔炼。");
+            return;
+        }
+        string stub = idx == 2 ? "加锁/解锁：服务端还没有装备锁字段，本版不加假锁。"
+            : "放入图鉴：服务端还没有收录接口，本版不做假收录。";
         if (online) { net.AddChat("[系统]", stub); return; }
         g.Log(stub);
     }

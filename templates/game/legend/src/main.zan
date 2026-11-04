@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.IO;
 using System.Diagnostics;
 using Gui;
@@ -22,7 +22,7 @@ partial class LegendApp {
 
     /* ---- 数据 ---- */
     Game g; SaveStore saves; GameNet net;
-    DataTable navigationData;
+    CfgTable navigationData;
     List<NavItem> navItems = new List<NavItem>();
     CombatFxEngine combatFx = new CombatFxEngine();
     BurstDropEngine burstDrops = new BurstDropEngine();
@@ -57,10 +57,10 @@ partial class LegendApp {
         string dataDir = KnownFolders.GetEnv("LEGEND_DATA_DIR");
         if (dataDir.Length == 0) { dataDir = "data"; }
         GameTables.Initialize(dataDir);
-        navigationData = DataTable.Load(dataDir + "/navigation.csv", "id:0:30,name,icon,label,x,w");
+        navigationData = CfgTable.Load(dataDir + "/navigation.csv", "id:0:30,name,icon,label,x,w");
         navItems.Clear();
         for (int ni = 0; ni <= 30; ni = ni + 1) {
-            DataRow r = navigationData.At(ni);
+            CfgRow r = navigationData.At(ni);
             if (r != null) {
                 navItems.Add(new NavItem(
                     ni,
@@ -270,7 +270,7 @@ partial class LegendApp {
         chatPanel.Prefer(Spec.ChatW(), 0); chatPanel.AnchorRight();
         root.Add(chatPanel); BuildChat(chatPanel);
 
-        mainCol = Panel.Column(); mainCol.Pad(0); mainCol.Gap(0);
+        mainCol = Panel.Column(); mainCol.Class = "main-col"; mainCol.Pad(0); mainCol.Gap(0);
         mainCol.Grow(); root.Add(mainCol);
 
         /* 顶部导航：2 行 × 10 格 + 第 1 行行末的设置齿轮。 */
@@ -283,22 +283,27 @@ partial class LegendApp {
         Panel navTail = Panel.Column(); navTail.Grow(); topNav.With(navTail);
 
         /* 中段：左栏（含底簇）+ 主区（含底瓦片行）。 */
-        Panel body = Panel.Row(); body.Gap(0); body.Grow(); mainCol.With(body);
+        Panel body = Panel.Row(); body.Class = "body-row"; body.Gap(0); body.Grow(); mainCol.With(body);
         body.With(SpacerW(Spec.LeftPad()));
         Panel sidebar = Panel.Column(); sidebar.Class = "sidebar";
         sidebar.Prefer(Spec.LeftW(), 0); sidebar.Gap(0); body.With(sidebar);
         BuildProfile(sidebar);
         BuildBottomLeft(sidebar);
 
-        Panel right = Panel.Column(); right.Gap(0); right.Grow(); body.With(right);
-        Panel tileStrip = Panel.Column(); tileStrip.Pad(0); tileStrip.Gap(0);
-        tileStrip.Prefer(0, Spec.BotTileRowH() + Spec.BotTileBottom());
-        /* 底瓦片行贴内容区底：AnchorBottom */
-        tileStrip.AnchorBottom(); right.Add(tileStrip);
-        tileStrip.With(BottomTileRow());
-        Panel tilesFill = Panel.Row(); tilesFill.Grow(); tileStrip.With(tilesFill);
+        Panel right = Panel.Column(); right.Class = "right-col"; right.Gap(0); right.Grow(); body.With(right);
+        /* 页面本体在前、底瓦片带在后：`right` 是 flex 列，flex 排布**不看**
+           `AnchorBottom()`（那是停靠布局的语义）——先加谁谁就在上面。
+           底瓦片带必须贴在内容区底（Spec §底部导航带 y 564.7..597.3），
+           所以先 `With(content)`（Grow 吃掉剩余高），再把 55 高的瓦片带
+           追加在末尾。原来先加瓦片带，实测它骑到了页面区顶上（y 164），
+           整页被推下 55 设备、底瓦片跑到了顶部导航下面。 */
         content = Panel.Column(); content.Class = "page-surface";
         content.Pad(0); content.Gap(0); content.Grow(); right.With(content);
+        Panel tileStrip = Panel.Column(); tileStrip.Class = "tile-strip"; tileStrip.Pad(0); tileStrip.Gap(0);
+        tileStrip.Prefer(0, Spec.BotTileRowH() + Spec.BotTileBottom());
+        right.Add(tileStrip);
+        tileStrip.With(BottomTileRow());
+        Panel tilesFill = Panel.Row(); tilesFill.Class = "tile-fill"; tilesFill.Grow(); tileStrip.With(tilesFill);
     }
 
     NavItem NavAt(int n) {
@@ -491,7 +496,17 @@ partial class LegendApp {
         }
     }
 
-    void Rebuild() { BuildPage(); Refresh(); }
+    /* 按钮/弹窗触发的重建都走这里：异常不能让进程退出（实测：回收页
+       `def.Int("kind")` 抛 missing column，点「发红包」→ RpShow → Rebuild
+       没有 catch，异常冒到顶层，窗口直接消失）。异常照旧挂 probe，页面停在
+       上一次成功的树上，用户还能继续点别的。 */
+    void Rebuild() {
+        try { BuildPage(); Refresh(); } catch (Exception e) {
+            if (UiDriver.Active()) {
+                try { UiDriver.SetProbe("rebuild-err", e.ToString()); } catch (Exception e2) { }
+            }
+        }
+    }
 
     void BuildPage() {
         content.RemoveAll();
