@@ -49,7 +49,7 @@ public class LogFile {
 
     public bool IsOpen() {
         return this.lastError == "" && this.file != null && this.file.IsOpen()
-            && this.pending != null;
+        && this.pending != null;
     }
 
     public string GetError() { return this.lastError; }
@@ -70,7 +70,7 @@ public class LogFile {
         if (!this.Ready()) { return false; }
         int plen = payload.Length();
         if (plen <= 0 || plen > LogFile.MAX_FRAME
-                || (long)this.pending.Length() + LogFile.HEADER_LEN + plen > 2147483647) {
+        || (long)this.pending.Length() + LogFile.HEADER_LEN + plen > 2147483647) {
             this.lastError = "log frame exceeds bounds";
             return false;
         }
@@ -166,6 +166,42 @@ public class LogFile {
             }
             this.logicalEnd = off;
             return off;
+        } finally {
+            h.Free();
+            body.Free();
+        }
+    }
+
+    // 只读校验：逐帧走 CRC，不修改文件、不动逻辑水位、不触碰
+    // lastError（巡检不得毒化运行中句柄的 IsOpen 状态）。返回
+    // "" = 干净；非空 = 损坏描述。尾部不满一帧或尾帧 CRC 坏视为
+    // 撕裂尾——崩溃残留，重放时截断修复，不算损坏。
+    public string Verify() {
+        if (!this.IsOpen()) { return "log is closed"; }
+        long size = this.file.Size();
+        if (size < 0) { return "log size failed: " + this.file.GetError(); }
+        long off = 0;
+        ByteBuffer h = ByteBuffer.Alloc(LogFile.HEADER_LEN);
+        ByteBuffer body = ByteBuffer.Alloc(256);
+        try {
+            while (size - off >= LogFile.HEADER_LEN) {
+                int got = this.file.ReadAt(off, h, LogFile.HEADER_LEN);
+                if (got != LogFile.HEADER_LEN) { return "log header read failed: " + this.file.GetError(); }
+                h.SeekRead(0);
+                long plen = h.ReadU32();
+                long crc = h.ReadU32();
+                if (plen > LogFile.MAX_FRAME || plen > size - off - LogFile.HEADER_LEN) { break; }
+                got = this.file.ReadAt(off + LogFile.HEADER_LEN, body, (int)plen);
+                if (got != (int)plen) { return "log payload read failed: " + this.file.GetError(); }
+                if (body.Crc32(got) != crc) {
+                    if (off + LogFile.HEADER_LEN + plen < size) {
+                        return "log frame CRC corrupt before tail";
+                    }
+                    break;
+                }
+                off = off + LogFile.HEADER_LEN + plen;
+            }
+            return "";
         } finally {
             h.Free();
             body.Free();

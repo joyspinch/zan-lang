@@ -19,7 +19,7 @@
 
 ### 批次 2 · 独立账（无前置，任一会话可领，按编号序）
 
-（暂空）
+- [ ] B-ID148 ZanDB 热备份/快照导出 API：锁内一致快照（固定段清单 → 逐段拷贝 → 拷贝清单双槽）与恢复校验，SQLite backup API 对位；运行中拷贝文件堆会撕裂，2026-11-04 灾备审计（三层数据结构 CRC、清单双槽、DirSync 固化序列、`IntegrityCheck()` 巡检落地）登记欠账，语义见 ZanDb README「灾备与损坏防护」。
 
 ### 批次 3 · 有前置（前置闭了再领）
 
@@ -33,3 +33,4 @@
 - [ ] B-ID71〔大工程 · 独占窗口；关联 B-ID64 异常路径帧析构〕SJLJ（setjmp/longjmp）异常机制与 ARC 栈展开资源泄漏/锁死锁：跨函数 throw 直接恢复栈寄存器，绕过被穿越中间帧的析构逻辑（ARC 漏释放、using 不关、zan_monitor_enter 无 exit 全局死锁）；exception_handler_depth 真回归同源——O2 DCE 把 rethrow 路径写入的局部当 dead store 删（setjmp/longjmp 对 LLVM 是不可见控制流边；已证全量 volatile alloca 无效，longjmp 后 volatile store 仍被 CPU 级跳过）。须演进为零开销栈展开（LandingPad）根治；双轨保持一致。
 - [ ] B-ID93〔大工程 · 独占窗口 · 横跨全部 stmt/expr 发射点〕异步调试信息（Debug Info）行映射——定性完成（2026-11-03，范围比原登记更大）：DIBuilder 只建 CU/文件/discope 即 Finalize（irgen.c:98-260），全编译器**没有任何指令附着 DILocation**（唯一一次 SetCurrentDebugLocation2 是 irgen_emit.c:3059 拆除时置 NULL）——不是 async 状态机特缺，是语句/表达式级行号发射整体缺失，async $resume 单步直落合成代码只是显性症状。修法：stmt/expr 发射点统一走「当前源位置→DILocation 挂 builder」管线 + 异步帧把原始调用点位置带进状态机帧；双轨保持一致。
 - [ ] B-ID103〔大工程 · 独占窗口 · main.c 并发禁动区〕irgen unity build 拆分：irgen.c 把 21 个 irgen_*.c 文本 include 进单 TU（约 52K 行），静态函数靠跨"文件"前向声明网维系插入顺序；main.c 在 main() 函数体内 #include "main_options_parse.c"（驱动不可单测）。修法方向：真 TU 化 + 声明网收编进头文件 + 选项解析独立编译单元。main.c 属并发禁动区，待窗口。
+- [ ] B-ID147〔大工程 · 进程外 harness〕ZanDB kill -9 式脏崩溃随机化 fuzz：现有崩溃面钉子是手工构造（撕裂尾/撕裂批/坏块/坏清单槽，zandb_store/zandb_atomic/zandb_segment）+ zandb_fuzz 干净边界重开 DST；真实进程级崩溃（WAL 写帧中段 kill、固化各步 kill、归并各步 kill、清单槽写一半 kill）需进程外 harness（父进程构造状态 → kill → 子进程重开与参照模型对账），对齐 SQLite crash-test 方法论。2026-11-04 灾备审计登记欠账。

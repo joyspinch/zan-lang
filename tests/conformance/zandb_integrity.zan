@@ -1,0 +1,165 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Json;
+using System.Data.ZanDb;
+
+// 全库巡检 IntegrityCheck：
+//   * 健康库（多段 + WAL 残帧 + 已发布向量检查点）问题清单为空；
+//   * 段块翻字节 → 逐块 CRC 扫描报出段号；
+//   * WAL 中帧翻字节 → 报损坏（撕裂尾语义之外）；
+//   * 快照头垃圾 → 报不可解析；批次行缺失 → 报行数与声明不符；
+//   * 清单备槽翻字节 → 报冗余降级（当前槽完好库仍可用）。
+// 每个破坏性场景独立小库，输出确定性。
+class ZanDbIntegrityTest {
+    static int checks;
+    static void Ok(bool value, string message) {
+        checks = checks + 1;
+        Console.WriteLine((value ? "ok " : "FAIL ") + Convert.ToString(checks) + " - " + message);
+    }
+    static void Clean(string path) {
+        File.Delete(path); File.Delete(path + ".lock");
+        File.Delete(path + ".m0"); File.Delete(path + ".m1");
+        for (int i = 0; i < 40; i = i + 1) { File.Delete(path + ".s" + Convert.ToString(i)); }
+    }
+    static JsonValue TextDoc(int ordinal) {
+        JsonValue doc = JsonValue.NewObject();
+        doc.PutStr("text", "巡检样例资料 " + Convert.ToString(ordinal));
+        JsonValue v = JsonValue.NewArray();
+        v.Append(JsonValue.NewDouble(ordinal * 0.1));
+        v.Append(JsonValue.NewDouble(1.0 - ordinal * 0.1));
+        doc.Put("v", v);
+        return doc;
+    }
+    static void AddDocs(Collection docs, int from, int count) {
+        List<JsonValue> batch = new List<JsonValue>();
+        for (int i = 0; i < count; i = i + 1) { batch.Add(TextDoc(from + i)); }
+        docs.InsertBulk(batch);
+    }
+    static List<string> Audit(ZanDatabase db, string label) {
+        List<string> problems = db.IntegrityCheck();
+        for (int i = 0; i < problems.Count; i = i + 1) {
+            Console.WriteLine("    [" + label + "] " + problems[i]);
+        }
+        return problems;
+    }
+    static void FlipByte(string path, long offset) {
+        PageFile pf = PageFile.Open(path);
+        if (!pf.IsOpen()) { throw new IOException("flip open failed: " + pf.GetError()); }
+        ByteBuffer one = ByteBuffer.Alloc(1);
+        ByteBuffer rd = ByteBuffer.Alloc(1);
+        pf.ReadAt(offset, rd, 1);
+        rd.SeekRead(0);
+        one.WriteU8((rd.ReadU8() ^ 255) & 255);
+        one.SeekRead(0);
+        pf.WriteAt(offset, one.Raw(), 1);
+        pf.Sync();
+        pf.Close();
+        one.Free(); rd.Free();
+    }
+    static void Main() {
+        Directory.CreateDirectory("_scratch");
+        string path = "_scratch/zandb_integrity_tmp.zdb";
+
+        // 1. 健康库：两段固化 + WAL 残帧 + 已发布向量检查点。
+        Clean(path);
+        ZanDatabase db = ZanDatabase.Open(path, ZanStore.DUR_SYNC);
+        Collection docs = db.GetCollection("ic");
+        docs.EnsureFullTextIndex("text");
+        docs.EnsureVectorIndex("v", new VectorIndexOptions(2));
+        AddDocs(docs, 0, 4);
+        db.Kv().FlushToSegment();
+        AddDocs(docs, 4, 4);
+        db.Kv().FlushToSegment();
+        docs.CheckpointSearchIndexes();
+        AddDocs(docs, 8, 2);
+        List<string> cleanProblems = Audit(db, "clean");
+        Ok(cleanProblems.Count == 0, "healthy store audits clean");
+        db.Close();
+
+        // 2. 段块损坏：翻字节后逐块 CRC 扫描报出段号。
+        db = ZanDatabase.Open(path, ZanStore.DUR_SYNC);
+        docs = db.GetCollection("ic");
+        AddDocs(docs, 100, 3);
+        db.Kv().FlushToSegment();
+        List<long> segIds = db.Kv().SegIdList();
+        FlipByte(ZanStore.SegPath(path, segIds[0]), 40);
+        List<string> segProblems = Audit(db, "seg");
+        bool segFlagged = false;
+        for (int i = 0; i < segProblems.Count; i = i + 1) {
+            if (segProblems[i].Contains("segment")) { segFlagged = true; }
+        }
+        Ok(segFlagged, "corrupt segment block is reported");
+        db.Close();
+        Clean(path);
+
+        // 3. WAL 中帧损坏：撕裂尾语义之外的帧 CRC 错误必须报出。
+        db = ZanDatabase.Open(path, ZanStore.DUR_SYNC);
+        docs = db.GetCollection("ic");
+        docs.EnsureFullTextIndex("text");
+        AddDocs(docs, 0, 5);
+        FlipByte(path, 12);
+        List<string> logProblems = Audit(db, "log");
+        bool logFlagged = false;
+        for (int i = 0; i < logProblems.Count; i = i + 1) {
+            if (logProblems[i].Contains("log:")) { logFlagged = true; }
+        }
+        Ok(logFlagged, "corrupt mid-log frame is reported");
+        Ok(docs.Count() == 5 && db.Kv().Get("q:ic:text:text:snapshot") != "",
+        "audit leaves the handle fully usable");
+        db.Close();
+        Clean(path);
+
+        // 4. 快照头垃圾：已加载索引的检查点头不可解析。
+        db = ZanDatabase.Open(path, ZanStore.DUR_SYNC);
+        docs = db.GetCollection("ic");
+        docs.EnsureVectorIndex("v", new VectorIndexOptions(2));
+        AddDocs(docs, 0, 2);
+        docs.CheckpointSearchIndexes();
+        db.Kv().Put("q:ic:vector:v:snapshot", "{oops");
+        List<string> headProblems = Audit(db, "head");
+        bool headFlagged = false;
+        for (int i = 0; i < headProblems.Count; i = i + 1) {
+            if (headProblems[i].Contains("unparseable")) { headFlagged = true; }
+        }
+        Ok(headFlagged, "corrupt snapshot header is reported");
+        db.Close();
+        Clean(path);
+
+        // 5. 批次行缺失：v2 声明批次数与 snap 行数不符。
+        db = ZanDatabase.Open(path, ZanStore.DUR_SYNC);
+        docs = db.GetCollection("ic");
+        docs.EnsureVectorIndex("v", new VectorIndexOptions(2));
+        AddDocs(docs, 0, 6);
+        docs.CheckpointSearchIndexes();
+        List<KvEntry> snapRows = new List<KvEntry>();
+        db.Kv().ScanPrefix("q:ic:vector:v:snap:", 0, snapRows);
+        db.Kv().Delete(snapRows[0].key);
+        List<string> batchProblems = Audit(db, "batch");
+        bool batchFlagged = false;
+        for (int i = 0; i < batchProblems.Count; i = i + 1) {
+            if (batchProblems[i].Contains("batch rows")) { batchFlagged = true; }
+        }
+        Ok(batchFlagged, "missing snapshot batch row is reported");
+        db.Close();
+        Clean(path);
+
+        // 6. 清单备槽损坏：当前槽完好，冗余降级必须报出。
+        db = ZanDatabase.Open(path, ZanStore.DUR_SYNC);
+        docs = db.GetCollection("ic");
+        AddDocs(docs, 0, 4);
+        db.Kv().FlushToSegment();
+        int curSlot = db.Kv().man.curSlot;
+        FlipByte(Manifest.SlotPath(path, curSlot == 0 ? 1 : 0), 4);
+        List<string> slotProblems = Audit(db, "slot");
+        bool slotFlagged = false;
+        for (int i = 0; i < slotProblems.Count; i = i + 1) {
+            if (slotProblems[i].Contains("manifest slot")) { slotFlagged = true; }
+        }
+        Ok(slotFlagged && docs.Count() == 4, "degraded manifest redundancy is reported");
+        db.Close();
+        Clean(path);
+
+        Console.WriteLine("done " + Convert.ToString(checks) + " checks");
+    }
+}

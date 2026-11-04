@@ -71,6 +71,41 @@ public class CollectionSearch {
         return IndexPrefix(state.kind, state.field) + "data:" + state.generation + ":";
     }
 
+    // 审计已物化搜索索引的当前代：快照头可解析、v2 声明批次数与
+    // snap 行数一致。未物化索引不审计——首次加载本就会校验失败
+    // 拒绝。问题追加进 problems；须在写侧串行环境调用。
+    public void AuditSnapshots(List<string> problems) {
+        List<string> cacheKeys = this.states.Keys;
+        for (int i = 0; i < cacheKeys.Count; i = i + 1) {
+            CollectionSearchState st = null;
+            if (!this.states.TryGetValue(cacheKeys[i], out st) || st == null) { continue; }
+            string headKey = this.IndexPrefix(st.kind, st.field) + "snapshot";
+            string raw = this.kv.Get(headKey);
+            if (raw == "") {
+                problems.Add(headKey + " missing for a loaded index");
+                continue;
+            }
+            JsonValue head = null;
+            try { head = JsonValue.Parse(raw); } catch { }
+            if (head == null) {
+                problems.Add(headKey + " unparseable");
+                continue;
+            }
+            int batches = head.Int("batches", -1);
+            if (batches < 0) { continue; }  // v1 头无批次声明
+            // 快照代以头为权威：内存态 generation 是初建定义代，
+            // 重新检查点会推进代号而不回写该字段。
+            string snapGen = head.Str("generation", "");
+            string ip = this.IndexPrefix(st.kind, st.field);
+            List<KvEntry> rows = new List<KvEntry>();
+            this.kv.ScanPrefix(ip + "snap:" + snapGen + ":", 0, rows);
+            if (rows.Count != batches) {
+                problems.Add(ip + "snap batch rows " + Convert.ToString(rows.Count)
+                + " != declared " + Convert.ToString(batches));
+            }
+        }
+    }
+
     public static void CheckDefinition(JsonValue def) {
         if (!def.IsObject() || CollectionSearch.Number(def, "format") != 1
         || def.Str("status", "") != "ready") {

@@ -1163,6 +1163,58 @@ public class ZanStore {
         return ids;
     }
 
+    // 全库巡检：段逐块 CRC 全扫、索引段号指向、WAL 帧、清单双槽
+    // 冗余。只读不修复不截断；返回问题清单，空 = 健康。撕裂尾与
+    // 尚未落盘的缓冲不算问题。须在写侧串行环境调用。
+    public List<string> IntegrityCheck() {
+        List<string> problems = new List<string>();
+        // 段：独立句柄重开全扫描，走块级 CRC（不经块缓存）。
+        List<long> ids = this.SegIdList();
+        for (int i = 0; i < ids.Count; i = i + 1) {
+            SegmentFile sf = SegmentFile.Open(ZanStore.SegPath(this.basePath, ids[i]));
+            if (sf.GetError() != "") {
+                problems.Add("segment " + Convert.ToString(ids[i]) + " open: " + sf.GetError());
+                continue;
+            }
+            sf.Scan("", ZanStore.KeepVisit);
+            if (sf.GetError() != "") {
+                problems.Add("segment " + Convert.ToString(ids[i]) + " scan: " + sf.GetError());
+            }
+            sf.Close();
+        }
+        // 索引：每个键的段号必须在清单段列表内。
+        List<string> keys = this.index.Keys;
+        for (int i = 0; i < keys.Count; i = i + 1) {
+            long seg = 0;
+            this.index.TryGetValue(keys[i], out seg);
+            if (!ids.Contains(seg)) {
+                problems.Add("index key " + keys[i] + " points to missing segment "
+                + Convert.ToString(seg));
+            }
+        }
+        // 日志帧（撕裂尾不算损坏）；Verify 只读不碰句柄错误态。
+        string logError = this.log.Verify();
+        if (logError != "") {
+            problems.Add("log: " + logError);
+        }
+        // 清单：当前槽开库已验证必好；另一槽不可读且文件在
+        // = 冗余降级。
+        int other = this.man.curSlot == 0 ? 1 : 0;
+        string otherPath = Manifest.SlotPath(this.basePath, other);
+        if (File.Exists(otherPath)) {
+            Manifest probe = new Manifest();
+            List<long> probeIds = new List<long>();
+            long gen = 0;
+            long seq = 0;
+            long nextId = 0;
+            if (!probe.ParseSlot(otherPath, out gen, out seq, out nextId, probeIds)) {
+                problems.Add("manifest slot " + Convert.ToString(other) + " unreadable: "
+                + probe.GetError());
+            }
+        }
+        return problems;
+    }
+
     // 按段号找段句柄。
     public SegRef FindSeg(long id) {
         for (int i = 0; i < this.segs.Count; i = i + 1) {
