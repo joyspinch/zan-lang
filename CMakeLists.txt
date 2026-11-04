@@ -5036,6 +5036,20 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
   set_tests_properties(conformance_gui_html_runtime PROPERTIES
     TIMEOUT 120 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
 
+  # DocApp 框架化引导（B-ID147）：类 ↔ 文档同目录同名自动发现 + 按名
+  # 构造 code-behind + AutoWire 接线 + POCO 双向绑定泵 + data-for 展开
+  # + OnLoad 钩子，全部框架层（测试体无任何 Install/Register 胶水）。
+  add_test(NAME conformance_gui_docapp
+    COMMAND ${CMAKE_COMMAND}
+      -DZANC=$<TARGET_FILE:zanc>
+      -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/docapp_test.zan
+      "-DZANC_ARGS=--embed;tests/gui/docapp_test.html;--auto-stdlib${_gui_driver_tail}"
+      -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_docapp.out
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_docapp${_exe_ext}
+      -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+  set_tests_properties(conformance_gui_docapp PROPERTIES
+    TIMEOUT 120 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+
   # <label> 的 UA 归类契约（A546）：普通 HTML 的 <label> 经 Html.Build
   # 建成 Label 控件（文本自测自绘），块流容器里照常排版；而 UA 表不给
   # label 声明 display——加了 display:block 反而把块流容器里的 Label

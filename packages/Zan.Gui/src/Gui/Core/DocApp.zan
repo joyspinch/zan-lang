@@ -1,0 +1,327 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Json;
+using Gui.Markup;
+using Gui.Widget;
+
+namespace Gui;
+
+// .html 设计稿窗口引导器（B-ID147）：初始化/装载/接线/绑定泵/窗口键全在
+// 框架层，code-behind 只写业务字段（= ViewModel，对 data-bind/data-for
+// 路径）与事件方法（对 @click 处理器名）。两条通道：
+//   Bootstrap()            零参自动通道：设计稿与代码同目录同名
+//                          （App.html ↔ class App），factories 由编译器
+//                          在调用点合成（VmFactory[]，逐类真 new——
+//                          字段初始化器走 new 路径，同 __AttrRoutes 机制）。
+//   Run/Prepare(path, vm)  手工通道：多文档/自定义宿主显式给路径与模型。
+// 失败一律 DOCAPP: 前缀 fail-fast（事件名拼错、绑定路径不存在开窗前暴露）。
+// v1 边界：Bootstrap 接线的事件方法必须同步（反射 Invoke 拿不到协程）；
+// 列表字段用 List<object>；HandleSender/行级事件走手工通道。
+public static class DocApp {
+    public static DocAppHost Run(string docPath, object vm, Action<DocAppHost> setup = null) {
+        DocAppHost host = DocApp.Prepare(docPath, vm, setup, false);
+        host.Form.Run();
+        return host;
+    }
+
+    // 只装配不跑循环（离屏测试/宿主自管帧）。
+    public static DocAppHost Prepare(string docPath, object vm, Action<DocAppHost> setup = null,
+                                     bool offscreen = false) {
+        if (docPath == null || docPath == "") {
+            return DocApp.FailHost("doc path is empty");
+        }
+        JsonValue doc = DesignDoc.Load(docPath);
+        if (doc == null) {
+            return DocApp.FailHost("design not found: " + docPath);
+        }
+        return DocApp.PrepareDoc(doc, docPath, vm, setup, offscreen);
+    }
+
+    public static void Bootstrap(VmFactory[] factories = null) {
+        DocAppHost host = DocApp.Launch(factories, false);
+        if (host == null) { return; }
+        host.Form.Run();
+    }
+
+    // Bootstrap 的离屏形态：同一条发现/构造/装配路，不进消息循环。
+    public static DocAppHost BootstrapOffscreen(VmFactory[] factories = null) {
+        return DocApp.Launch(factories, true);
+    }
+
+    static DocAppHost Launch(VmFactory[] factories, bool offscreen) {
+        string docPath = DocApp.DiscoverDoc();
+        if (docPath == null) {
+            return DocApp.FailHost("no design doc (*.html) found under src/");
+        }
+        JsonValue doc = DesignDoc.Load(docPath);
+        if (doc == null) {
+            return DocApp.FailHost("design not found: " + docPath);
+        }
+        // 类名：data-zan-code-behind 优先，缺省 = 文档基名帕斯卡化。
+        string cls = doc.Str("zanCodeBehind", "");
+        if (cls == "") { cls = DocApp.PascalBase(docPath); }
+        object vm = null;
+        if (factories != null) {
+            for (int i = 0; i < factories.Length; i++) {
+                VmFactory f = factories[i];
+                if (f == null) { continue; }
+                object cand = f();
+                if (cand != null && cand.GetType().Name == cls) {
+                    vm = cand;
+                    break;
+                }
+            }
+        }
+        if (vm == null) {
+            return DocApp.FailHost("code-behind class not found: " + cls +
+                                   " (declare 'class " + cls +
+                                   "' next to the doc, or set data-zan-code-behind on the doc root)");
+        }
+        return DocApp.PrepareDoc(doc, docPath, vm, null, offscreen);
+    }
+
+    static DocAppHost PrepareDoc(JsonValue doc, string docPath, object vm,
+                                 Action<DocAppHost> setup, bool offscreen) {
+        // 声明层（装载/模板行克隆槽）与控件 kind 名单，两通道共同必经
+        // 点，均幂等。
+        Html.Install();
+        ControlBootstrap.Install();
+        Form form = offscreen
+            ? Form.CreateOffscreen(doc.Str("winTitle", "App"),
+                                   doc.Int("winW", 480), doc.Int("winH", 520))
+            : Form.Create(doc.Str("winTitle", "App"),
+                          doc.Int("winW", 480), doc.Int("winH", 520));
+        App app = form.GetApp();
+        // 窗口形状/边框/透明度等文档键（winShape/winChrome/winOpacity…）；
+        // 离屏无原生窗口，这些原生外观操作全跳过。
+        if (!offscreen) {
+            FormBuilder.ConfigureWindow(app, doc);
+            if (doc.Bool("winCenter", false)) { app.CenterWindow(); }
+        }
+
+        Control tree = FormBuilder.BuildWith(doc, null);
+        if (tree == null) {
+            return DocApp.FailHost("build failed: " + docPath);
+        }
+        form.Add(tree);
+
+        ModelBinder binder = new ModelBinder();
+        DocAppHost host = new DocAppHost(form, tree, binder, vm);
+        // 注册先于 SetRoot/Wire（Wire 时按名快照闭包，后注册的名字失效）。
+        if (setup != null) { setup(host); }
+        if (vm != null && setup == null) {
+            DocApp.AutoWire(tree, binder, vm, docPath);
+        }
+        binder.SetRoot(tree, vm);
+        binder.Wire();
+        // 每帧泵，主窗与离屏同一条路（离屏出帧即泵）。
+        ModelHosts.Register(app, binder);
+        if (vm != null) {
+            DocApp.CheckBinds(tree, vm, docPath);
+            if (vm.HasMethod("OnLoad")) { vm.Invoke("OnLoad", form); }
+        }
+        return host;
+    }
+
+    // 按名自动接线：树上的处理器名逐个 HasMethod 对账（缺失即 fail-fast），
+    // 注册 plain + arg 双槽（arg 槽只在控件声明 handlerArg 时被选中）。
+    static void AutoWire(Control tree, ModelBinder binder, object vm, string docPath) {
+        List<string> names = new List<string>();
+        DocApp.CollectHandlers(tree, names);
+        List<string> missing = new List<string>();
+        for (int i = 0; i < names.Count; i++) {
+            string h = names[i];
+            if (!vm.HasMethod(h)) { missing.Add(h); continue; }
+            string evt = h;
+            binder.Handle(h, () => { vm.Invoke(evt); });
+            binder.HandleArg(h, (string s) => { vm.Invoke(evt, s); });
+        }
+        if (missing.Count > 0) {
+            string list = "";
+            for (int i = 0; i < missing.Count; i++) {
+                list = list + (i > 0 ? ", " : "") + missing[i];
+            }
+            DocApp.FailHost("handlers declared in doc but missing on " +
+                            vm.GetType().Name + ": " + list + " (" + docPath + ")");
+        }
+    }
+
+    // 启动期绑定对账：data-bind/data-if/data-disabled 路径解析不到 vm
+    // 字段的，开窗前一次性列出。
+    static void CheckBinds(Control tree, object vm, string docPath) {
+        List<string> bad = new List<string>();
+        DocApp.CollectBinds(tree, vm, bad);
+        if (bad.Count > 0) {
+            string list = "";
+            for (int i = 0; i < bad.Count; i++) {
+                list = list + (i > 0 ? ", " : "") + bad[i];
+            }
+            DocApp.FailHost("bind paths not found on " + vm.GetType().Name +
+                            ": " + list + " (" + docPath + ")");
+        }
+    }
+
+    static void CollectHandlers(Control c, List<string> names) {
+        for (int i = 0; i < c.events.Count; i++) {
+            string h = c.events[i].val;
+            if (h != "" && !names.Contains(h)) { names.Add(h); }
+        }
+        for (int j = 0; j < c.children.Count; j++) {
+            DocApp.CollectHandlers(c.children[j], names);
+        }
+    }
+
+    static void CollectBinds(Control c, object vm, List<string> bad) {
+        // 模板行内绑定以行项为作用域，对根模型校验会假失败——子树跳过。
+        if (c.Kind() == "template") { return; }
+        if (c.bindPath != "" && !DocApp.FieldExists(vm, c.bindPath)) {
+            bad.Add(c.bindPath);
+        }
+        if (DocApp.IsPlainPath(c.bindIf) && !DocApp.FieldExists(vm, c.bindIf)) {
+            bad.Add(c.bindIf);
+        }
+        if (DocApp.IsPlainPath(c.bindDisabled) && !DocApp.FieldExists(vm, c.bindDisabled)) {
+            bad.Add(c.bindDisabled);
+        }
+        for (int j = 0; j < c.children.Count; j++) {
+            DocApp.CollectBinds(c.children[j], vm, bad);
+        }
+    }
+
+    static bool FieldExists(object vm, string path) {
+        string leaf = "";
+        object target = ModelBinder.ResolveFieldScope(vm, path, out leaf);
+        return target != null && target.HasField(leaf);
+    }
+
+    // 纯路径（ident[.ident]*）才校验；带运算符的是表达式，归 binder 语义。
+    static bool IsPlainPath(string s) {
+        if (s == null || s == "") { return false; }
+        for (int i = 0; i < s.Length; i++) {
+            char ch = s[i];
+            bool ok = (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
+                      (ch >= '0' && ch <= '9') || ch == '_' || ch == '.';
+            if (!ok) { return false; }
+        }
+        return true;
+    }
+
+    // 设计稿发现：内嵌 VFS 全量 + 磁盘 src 树（开发态）合并去重；唯一
+    // 一份直接用，多份取 App.html，仍不唯一就列出候选。
+    static string DiscoverDoc() {
+        List<string> names = new List<string>();
+        List<string> emb = File.EmbeddedNames("");
+        if (emb != null) {
+            for (int i = 0; i < emb.Count; i++) {
+                string n = emb[i];
+                if (n.EndsWith(".html") && !names.Contains(n)) { names.Add(n); }
+            }
+        }
+        DocApp.CollectDisk("src", names);
+        if (names.Count == 0) { DocApp.CollectDisk("../src", names); }
+        if (names.Count == 0) { DocApp.CollectDisk(".build/src", names); }
+        if (names.Count == 1) { return names[0]; }
+        if (names.Count > 1) {
+            for (int i = 0; i < names.Count; i++) {
+                if (DocApp.BaseName(names[i]) == "App") { return names[i]; }
+            }
+            string list = "";
+            for (int i = 0; i < names.Count; i++) {
+                list = list + (i > 0 ? ", " : "") + names[i];
+            }
+            DocApp.FailHost("multiple design docs found, name the entry doc App.html" +
+                            " or set data-zan-code-behind: " + list);
+        }
+        return null;
+    }
+
+    static void CollectDisk(string dir, List<string> names) {
+        try {
+            if (!Directory.Exists(dir)) { return; }
+            List<string> files = Directory.GetFiles(dir);
+            if (files != null) {
+                for (int i = 0; i < files.Count; i++) {
+                    string f = files[i].Replace("\\", "/");
+                    if (f.EndsWith(".html") && !names.Contains(f)) { names.Add(f); }
+                }
+            }
+            List<string> subdirs = Directory.GetDirectories(dir);
+            if (subdirs != null) {
+                for (int i = 0; i < subdirs.Count; i++) {
+                    string d = subdirs[i];
+                    string leaf = DocApp.BaseName(d);
+                    if (leaf == "bin" || leaf == "obj" || leaf == "tools" ||
+                        leaf == "assets" || leaf == ".build") { continue; }
+                    DocApp.CollectDisk(d, names);
+                }
+            }
+        } catch (Exception) {
+        }
+    }
+
+    static string BaseName(string path) {
+        string s = path.Replace("\\", "/");
+        int slash = s.LastIndexOf("/");
+        if (slash >= 0) { s = s.Substring(slash + 1, s.Length - slash - 1); }
+        int dot = s.LastIndexOf(".");
+        if (dot > 0) { s = s.Substring(0, dot); }
+        return s;
+    }
+
+    static string PascalBase(string path) {
+        string s = DocApp.BaseName(path);
+        if (s.Length > 0 && s[0] >= 'a' && s[0] <= 'z') {
+            s = (char)(s[0] - 32) + s.Substring(1, s.Length - 1);
+        }
+        return s;
+    }
+
+    static Form Fail(string msg) {
+        Console.WriteLine("DOCAPP: " + msg);
+        Environment.Exit(1);
+        return null;
+    }
+
+    static DocAppHost FailHost(string msg) {
+        DocApp.Fail(msg);
+        return null;
+    }
+}
+
+// Run/Bootstrap 的宿主句柄：事件注册、控件定位、诊断访问。
+public class DocAppHost {
+    public Form Form;
+    public Control Root;
+    public ModelBinder Binder;
+    public object Vm;
+
+    public DocAppHost(Form form, Control root, ModelBinder binder, object vm) {
+        this.Form = form;
+        this.Root = root;
+        this.Binder = binder;
+        this.Vm = vm;
+    }
+
+    public void Handle(string name, Action a) {
+        this.Binder.Handle(name, a);
+    }
+
+    public void HandleArg(string name, Action<string> a) {
+        this.Binder.HandleArg(name, a);
+    }
+
+    public void HandleSender(string name, ControlEvent a) {
+        this.Binder.HandleSender(name, a);
+    }
+
+    public Control Ctl(string id) {
+        return this.Root.Find(id);
+    }
+
+    public T Ctl<T>(string id) where T : Control {
+        Control c = this.Root.Find(id);
+        if (c is T) { return (T)c; }
+        return null;
+    }
+}
