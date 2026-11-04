@@ -1,0 +1,101 @@
+using System;
+using System.Security.Cryptography;
+
+public class Secure {
+    /* 本方向 32 字节密钥。*/
+    byte[] key;
+    /* 下一帧使用的序号 / 期望的对端序号。调度器协作单线程，无需加锁。*/
+    long txSeq;
+    long rxSeq;
+
+    static string DirS2C = "S";
+    static string DirC2S = "C";
+
+    /* ---- 握手与派生 ---- */
+
+    /* 用共享 secret 与双向随机数派生两个方向密钥；secret 过空返回 null。*/
+    public static Secure ForSend(string secret, string cnonce, string snonce, bool serverSide) {
+        if (secret.Length == 0) { return null; }
+        byte[] master = Hkdf.Derive(cnonce + snonce, (cnonce + snonce).Length,
+            secret, secret.Length,
+            "zan-game-v2", "zan-game-v2".Length, 32);
+        string info = serverSide ? "zan-game-s2c" : "zan-game-c2s";
+        Secure c = new Secure();
+        c.key = Hkdf.Expand(master, info, info.Length, 32);
+        c.txSeq = 0;
+        c.rxSeq = 0;
+        return c;
+    }
+
+    /* 服务端发送方向（客户端收）的密钥。*/
+    public static Secure S2C(string secret, string cnonce, string snonce) {
+        return Secure.ForSend(secret, cnonce, snonce, true);
+    }
+
+    /* 服务端接收方向（客户端发）的密钥。*/
+    public static Secure C2S(string secret, string cnonce, string snonce) {
+        return Secure.ForSend(secret, cnonce, snonce, false);
+    }
+
+    /* ---- 帧收发 ---- */
+
+    /* 加密一条明文（JSON 文本），返回一行 Base64 帧（不含行尾）。*/
+    public string Seal(string plain) {
+        long seq = this.txSeq;
+        this.txSeq = seq + 1;
+        byte[] iv = Secure.Iv(seq);
+        string aad = Secure.Aad(DirS2C, seq);
+        byte[] tag = new byte[16];
+        byte[] ct = AesGcm.Encrypt(this.key, 32, iv, aad, aad.Length,
+            plain, plain.Length, tag);
+        /* keyLen=32、IV=12 均合法，Encrypt 不会返回 null；判空过 checker。 */
+        if (ct == null) { return ""; }
+        byte[] frame = new byte[ct.Length + 16];
+        for (int i = 0; i < ct.Length; i = i + 1) { frame[i] = ct[i] & 255; }
+        for (int i = 0; i < 16; i = i + 1) { frame[ct.Length + i] = tag[i] & 255; }
+        return Base64.Encode(frame, frame.Length);
+    }
+
+    /* 解一条帧；序号不连续或认证失败返回 null（调用方必须断开）。
+       outLen 列表必须先 Add(0) 预置容量——Base64.Decode 成功与出错
+       路径都会写 outLen[0]，空列表会触发越界运行时错误。*/
+    public string Open(string frame) {
+        List<int> n = new List<int>();
+        n.Add(0);
+        byte[] buf = Base64.Decode(frame, n);
+        if (buf == null || n[0] < 16) { return null; }
+        int ctLen = n[0] - 16;
+        byte[] tag = new byte[16];
+        for (int i = 0; i < 16; i = i + 1) { tag[i] = buf[ctLen + i] & 255; }
+        long seq = this.rxSeq;
+        byte[] iv = Secure.Iv(seq);
+        string aad = Secure.Aad(DirC2S, seq);
+        List<int> ok = new List<int>();
+        ok.Add(0);
+        byte[] pt = AesGcm.Decrypt(this.key, 32, iv, aad, aad.Length,
+            buf, ctLen, tag, ok);
+        /* ok[0] == -1 且非 null 才算通过；认证失败绝不产出明文。 */
+        if (pt == null || ok[0] != -1) { return null; }
+        this.rxSeq = seq + 1;
+        return pt.ToStr(0, ctLen);
+    }
+
+    /* IV：8 字节大端序号 ‖ 4 字节 0。同一密钥下序号唯一 → IV 唯一。*/
+    public static byte[] Iv(long seq) {
+        byte[] iv = new byte[12];
+        for (int i = 0; i < 8; i = i + 1) {
+            iv[i] = Bits.Shr64(seq, 8 * (7 - i)) & 255;
+        }
+        return iv;
+    }
+
+    /* AAD：方向字节 ‖ 8 字节大端序号，共 9 字节。*/
+    public static string Aad(string dir, long seq) {
+        byte[] a = new byte[9];
+        a[0] = dir[0] & 255;
+        for (int i = 0; i < 8; i = i + 1) {
+            a[1 + i] = Bits.Shr64(seq, 8 * (7 - i)) & 255;
+        }
+        return a.ToStr(0, 9);
+    }
+}

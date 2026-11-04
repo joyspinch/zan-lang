@@ -1,0 +1,63 @@
+using System;
+using System.IO;
+using System.Security.Cryptography;
+namespace Wuwei;
+
+public class SaveStore {
+    string path; string lastError=""; bool blocked=false;
+    string key="wuwei-v1:jade-ink:local-save-key!!";
+    public SaveStore(string p) { path=p; }
+    public static string DefaultPath() {
+        string d=KnownFolders.GetEnv("WUWEI_SAVE_DIR");
+        if (d=="") { d=KnownFolders.GetEnv("LOCALAPPDATA"); if (d=="") { throw new Exception("LOCALAPPDATA unavailable; set WUWEI_SAVE_DIR"); } d=d+"/ZanWuwei"; }
+        Directory.CreateDirectoryRecursive(d); return d+"/save.wsv";
+    }
+    public string Error() { return lastError; }
+    string ReadEnvelope(string file) {
+        FileInfo info=new FileInfo(file);
+        if (info.Length()<=0 || info.Length()>4194304) { throw new Exception("Invalid save file size"); }
+        return File.ReadAllText(file);
+    }
+    public string Decode(string text) {
+        if (text.Length>4194304 || !text.StartsWith("WUW1|")) { throw new Exception("Invalid save header or size"); }
+        List<string> p=text.Split("|"); if (p.Count!=4) { throw new Exception("Invalid save envelope"); }
+        List<int> n=new List<int>(); n.Add(0); List<int> c=new List<int>(); c.Add(0); List<int> t=new List<int>(); t.Add(0);
+        byte[] iv=Base64.Decode(p[1],n); byte[] ct=Base64.Decode(p[2],c); byte[] tag=Base64.Decode(p[3],t);
+        if (n[0]!=12 || t[0]!=16 || c[0]<=0 || iv==null || ct==null || tag==null) { throw new Exception("Invalid save lengths"); }
+        List<int> ok=new List<int>(); ok.Add(0);
+        byte[] plain=AesGcm.Decrypt(key,32,iv,"wuwei-save-v1",13,ct,c[0],tag,ok);
+        if (ok[0]!=-1 || plain==null) { throw new Exception("Save authentication failed"); }
+        return plain.ToStr(0,c[0]);
+    }
+    public bool Write(string payload) {
+        if (blocked) { lastError="检测到损坏存档，已禁止覆盖；请先备份并处理原文件。"; return false; }
+        if (payload.Length==0 || payload.Length>2097152) { lastError="存档数据长度无效。"; return false; }
+        try {
+            if (File.Exists(path)) { Decode(ReadEnvelope(path)); }
+            byte[] iv=RandomNumberGenerator.GetBytes(12); byte[] tag=new byte[16];
+            byte[] ct=AesGcm.Encrypt(key,32,iv,"wuwei-save-v1",13,payload,payload.Length,tag);
+            if (ct==null) { throw new Exception("Encryption failed"); }
+            string text="WUW1|"+Base64.Encode(iv,12)+"|"+Base64.Encode(ct,payload.Length)+"|"+Base64.Encode(tag,16);
+            string tmp=path+".tmp"; File.WriteAllText(tmp,text);
+            if (Decode(File.ReadAllText(tmp))!=payload) { throw new Exception("Temporary save verification failed"); }
+            if (File.Exists(path)) {
+                string previous=ReadEnvelope(path); Decode(previous);
+                File.WriteAllText(path+".bak.tmp",previous); Decode(File.ReadAllText(path+".bak.tmp"));
+                File.Move(path+".bak.tmp",path+".bak");
+            }
+            File.Move(tmp,path); lastError=""; return true;
+        } catch (Exception ex) { lastError="保存失败：原文件保持不变，请检查目录权限或存档完整性。"; return false; }
+    }
+    public string Read() {
+        lastError="";
+        if (File.Exists(path)) {
+            try { return Decode(ReadEnvelope(path)); }
+            catch (Exception ex) { blocked=true; lastError="主存档校验失败，已禁止覆盖。"; }
+        }
+        if (File.Exists(path+".bak")) {
+            try { string payload=Decode(ReadEnvelope(path+".bak")); blocked=true; lastError="已从备份恢复；请保留原文件，处理主存档后再保存。"; return payload; }
+            catch (Exception ex) { blocked=true; lastError="存档与备份无法校验，已保留文件并禁止覆盖。"; }
+        }
+        return "";
+    }
+}

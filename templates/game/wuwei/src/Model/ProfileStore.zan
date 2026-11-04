@@ -1,0 +1,103 @@
+using System;
+using System.IO;
+using System.Json;
+
+public class ProfileStore {
+    string root; string lastError="";
+    List<SaveStore> slots=new List<SaveStore>();
+    List<bool> blocked=new List<bool>();
+    SaveStore legacyMetadata; SaveStore settings;
+    public ProfileStore() { Init(Path.GetDirectoryName(SaveStore.DefaultPath())); }
+    public ProfileStore(string baseDirectory) { Init(baseDirectory); }
+    void Init(string baseDirectory) {
+        root=baseDirectory; Directory.CreateDirectoryRecursive(root+"/profiles");
+        for (int i=1;i<=5;i++) { slots.Add(new SaveStore(SlotPath(i))); blocked.Add(false); }
+        legacyMetadata=new SaveStore(root+"/profiles/slot1-meta.wsv");
+        settings=new SaveStore(root+"/profiles/settings.wsv");
+    }
+    public string Error() { return lastError; }
+    bool Valid(int slot) { lastError=""; if (slot<1 || slot>5) { lastError="存档槽必须为 1 到 5。"; return false; } return true; }
+    public string SlotPath(int slot) {
+        if (slot<1 || slot>5) { return ""; }
+        if (slot==1) { return root+"/save.wsv"; }
+        return root+"/profiles/slot"+slot.ToString()+".wsv";
+    }
+    bool Present(string path) { return File.Exists(path) || File.Exists(path+".bak"); }
+    JsonValue ParseRecord(string text, bool withState) {
+        JsonValue record=JsonValue.Parse(text);
+        if (!record.IsObject() || record.Str("format","")!="wuwei-profile-1") { throw new Exception("Invalid profile format"); }
+        string[] keys=new string[] {"name","summary","lastPlayed"};
+        foreach (string key in keys) {
+            JsonValue value=record.Get(key);
+            if (value==null || !value.IsString()) { throw new Exception("Invalid profile metadata"); }
+        }
+        if (withState) {
+            JsonValue state=record.Get("state");
+            if (state==null || !state.IsString() || state.AsString("")=="") { throw new Exception("Invalid profile state"); }
+        }
+        return record;
+    }
+    public string Read(int slot) {
+        if (!Valid(slot)) { return ""; }
+        SaveStore store=slots[slot-1]; string text=store.Read(); lastError=store.Error();
+        if (lastError!="") { blocked[slot-1]=true; }
+        if (slot==1 || text=="") { return text; }
+        try { return ParseRecord(text,true).Str("state",""); }
+        catch (Exception ex) { blocked[slot-1]=true; lastError="存档内容格式损坏，已禁止覆盖。"; return ""; }
+    }
+    public ProfileInfo Metadata(int slot) {
+        ProfileInfo info=new ProfileInfo(); if (!Valid(slot)) { info.Error=lastError; return info; }
+        // 空存档位回退缺省标题显示。
+        info.Name=""; info.Exists=Present(SlotPath(slot));
+        string state=Read(slot); info.Error=lastError;
+        if (!info.Exists && (slot!=1 || !Present(root+"/profiles/slot1-meta.wsv"))) { return info; }
+        try {
+            string text="";
+            if (slot==1) { text=legacyMetadata.Read(); if (legacyMetadata.Error()!="") { info.Error=legacyMetadata.Error(); blocked[0]=true; } }
+            else { text=slots[slot-1].Read(); }
+            if (text!="") {
+                JsonValue record=ParseRecord(text,slot!=1);
+                info.Name=record.Str("name",info.Name); info.Summary=record.Str("summary",""); info.LastPlayed=record.Str("lastPlayed","");
+            }
+        } catch (Exception ex) { info.Error="存档元数据损坏，已禁止覆盖。"; blocked[slot-1]=true; }
+        lastError=info.Error; return info;
+    }
+    public bool Write(int slot,string payload,string name,string summary) {
+        if (!Valid(slot)) { return false; }
+        if (payload=="" || name.Length>256 || summary.Length>4096) { lastError="存档或名称摘要长度无效。"; return false; }
+        // 优先读取已有存档记录，自动过滤格式错误或受损条目。
+        ProfileInfo old=Metadata(slot);
+        if (blocked[slot-1] || old.Error!="") { lastError="存档或元数据损坏，已禁止覆盖；请先备份并处理原文件。"; return false; }
+        JsonValue record=JsonValue.NewObject(); record.Put("format",JsonValue.NewStr("wuwei-profile-1"));
+        record.Put("name",JsonValue.NewStr(name)); record.Put("summary",JsonValue.NewStr(summary));
+        record.Put("lastPlayed",JsonValue.NewStr(DateTime.Now().ToString()));
+        SaveStore store=slots[slot-1];
+        if (slot==1) {
+            // 旧版存档向前字节级兼容。
+            if (!store.Write(payload)) { lastError=store.Error(); return false; }
+            if (!legacyMetadata.Write(record.ToJson())) { lastError="角色已保存，但元数据保存失败："+legacyMetadata.Error(); return false; }
+        } else {
+            record.Put("state",JsonValue.NewStr(payload));
+            if (!store.Write(record.ToJson())) { lastError=store.Error(); return false; }
+        }
+        lastError=""; return true;
+    }
+    // 彻底清除一个槽位：主档、备份与槽 1 的旧版元数据一并删除。
+    // 删除后槽位回到"空白"状态：阻塞标记清掉，SaveStore 重新指向
+    // 同一路径，后续 Read/Write 与全新槽位行为一致。
+    public bool Delete(int slot) {
+        if (!Valid(slot)) { return false; }
+        try {
+            if (File.Exists(SlotPath(slot))) { File.Delete(SlotPath(slot)); }
+            if (File.Exists(SlotPath(slot)+".bak")) { File.Delete(SlotPath(slot)+".bak"); }
+            if (slot==1 && File.Exists(root+"/profiles/slot1-meta.wsv")) { File.Delete(root+"/profiles/slot1-meta.wsv"); }
+        } catch (Exception ex) { lastError="删除失败：文件被占用或无权限，原文件保留。"; return false; }
+        blocked[slot-1]=false; lastError=""; slots[slot-1]=new SaveStore(SlotPath(slot));
+        return true;
+    }
+    public string SettingsRead() { string text=settings.Read(); lastError=settings.Error(); return text; }
+    public bool SettingsWrite(string text) {
+        settings.Read(); if (settings.Error()!="") { lastError=settings.Error(); return false; }
+        bool ok=settings.Write(text); lastError=settings.Error(); return ok;
+    }
+}
