@@ -51,7 +51,7 @@ d = ImageDraw.Draw(banner)
 lock = Image.open(BRAND / "logo/png/zan-logo-horizontal-dark-985.png").resize((700, 364), Image.LANCZOS)
 banner.paste(lock, (64, 44), lock)
 f_tag = font("consola.ttf", 44)
-d.text((88, 424), "AOT. ARC. Adorable.", font=f_tag, fill=(143, 163, 216))
+d.text((88, 424), "AOT. ARC. Unapologetic.", font=f_tag, fill=(143, 163, 216))
 
 # right: mascot hero, feet landing on the volt baseline
 hero = Image.open(BRAND / "mascot/zanzi-hero.png")
@@ -78,11 +78,11 @@ swatches = [
     ("Zan Volt",     "#2B5CFF", "Primary · 主色",  VOLT),
     ("Volt Deep",    "#2141E6", "Gradient / Hover", VOLT_DEEP),
     ("Zan Sky",      "#7DA2FF", "Tint · 浅底",     SKY),
-    ("Zan Spark",    "#FFC838", "Accent · 点缀",   SPARK),
-    ("Zan Glow",     "#45E6FF", "Tech · 科技辉光", (69, 230, 255)),
-    ("Zan Blush",    "#FFB3C7", "Accent 2 · 耳尖", (255, 179, 199)),
-    ("Zan Cream",    "#FFF6E8", "Surface · 毛色",  (255, 246, 232)),
+    ("Zan Spark",    "#FFC838", "Accent · 鹅嘴/星", SPARK),
+    ("Zan Beak",     "#FF931E", "Beak · 鹅嘴渐变",  (255, 147, 30)),
+    ("Zan Cream",    "#FFF6E8", "Surface · 围裙",  (255, 246, 232)),
     ("Zan Ink",      "#0F1428", "Text / Dark bg",  INK),
+    ("Zan White",    "#FFFFFF", "Goose · 纯白鹅羽", (255, 255, 255)),
 ]
 sx, sy, sw, sh, gap = 90, 260, 350, 240, 30
 for i, (name, hexc, role, rgb) in enumerate(swatches):
@@ -108,16 +108,18 @@ for i, (name, hexc, rgb) in enumerate(sem):
     cd.text((x + 22, y + 16), name, font=font("segoeuib.ttf", 26), fill=(255, 255, 255))
     cd.text((x + 22, y + 54), hexc.upper(), font=font("consola.ttf", 24), fill=(255, 255, 255))
 
-# mascot strip at the bottom, below the semantic row
-strip_names = ["zanzi-run", "zanzi-battle", "zanzi-sleep", "zanzi-cheer", "zanzi-code"]
+# mascot strip at the bottom, below the semantic row: display the new Z-Goose & Zan-chan duo postures
+strip_names = ["zanzi-hero", "zanzi-cheer", "zanzi-battle"]
 strip_x = PW - 90
 strip_y = PH - 36 - 160
 for n in reversed(strip_names):
-    im = Image.open(BRAND / f"mascot/{n}.png")
-    th = 160
-    im = im.resize((int(im.width * th / im.height), th), Image.LANCZOS)
-    strip_x -= im.width + 18
-    card.paste(im, (strip_x, strip_y), im)
+    p = BRAND / f"mascot/{n}.png"
+    if p.exists():
+        im = Image.open(p)
+        th = 160
+        im = im.resize((int(im.width * th / im.height), th), Image.LANCZOS)
+        strip_x -= im.width + 18
+        card.paste(im, (strip_x, strip_y), im)
 
 card.save(OUT / "zan-palette.png")
 print("palette ok", card.size)
