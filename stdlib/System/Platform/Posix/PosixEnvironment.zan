@@ -1,0 +1,119 @@
+using System;
+using System.Interop;
+
+namespace System.Platform;
+
+#if !WINDOWS
+// POSIX (Linux / macOS / WASI) 原生进程环境与系统实现。
+public class PosixEnvironment : IPlatformEnvironment {
+    #if WASI
+    [DllImport("crt", EntryPoint = "__wasi_random_get")]
+    static extern int WasiRandomGet(string buf, int len);
+    #else
+    [DllImport("crt", EntryPoint = "getpid")]
+    static extern int posix_getpid();
+
+    [DllImport("crt", EntryPoint = "readlink")]
+    static extern int readlink(string path, byte[] buf, int size);
+    #endif
+
+    #if MACOS || IOS
+    [DllImport("crt", EntryPoint = "_NSGetExecutablePath")]
+    static extern int NSGetExecutablePath(nint buf, nint size);
+    #endif
+
+    [DllImport("crt", EntryPoint = "setenv")]
+    static extern int posix_setenv(string name, string val, int overwrite);
+
+    [DllImport("crt", EntryPoint = "unsetenv")]
+    static extern int posix_unsetenv(string name);
+
+    [DllImport("crt", EntryPoint = "fopen")]
+    static extern nint urandOpen(string path, string mode);
+
+    [DllImport("crt", EntryPoint = "fread")]
+    static extern long urandRead(string buf, long size, long count, nint fp);
+
+    [DllImport("crt", EntryPoint = "fclose")]
+    static extern int urandClose(nint fp);
+
+    [DllImport("crt", EntryPoint = "zan_cpu_count")]
+    static extern int NativeCpuCount();
+
+    public string NewLine() {
+        return "\n";
+    }
+
+    public int ProcessId() {
+        #if WASI
+        return 0;
+        #else
+        return posix_getpid();
+        #endif
+    }
+
+    public string ExecutablePath() {
+        #if LINUX
+        byte[] buf = new byte[4097];
+        int n = readlink("/proc/self/exe", buf, 4096);
+        if (n <= 0 || n > 4096) { return ""; }
+        return buf.ToStr(0, n);
+        #elif MACOS || IOS
+        nint sizeBuf = NativeMemory.Alloc(4);
+        nint pathBuf = 0;
+        string exe = "";
+        try {
+            new Span<int>(sizeBuf, 1)[0] = 4096;
+            pathBuf = NativeMemory.Alloc(4096);
+            NativeMemory.Fill(pathBuf, 0, 4096);
+            int ok = NSGetExecutablePath(pathBuf, sizeBuf);
+            if (ok == 0) {
+                int len = NativeMemory.Find(pathBuf, 0, 0, 4096);
+                if (len >= 0 && len < 4096) {
+                    exe = NativeMemory.GetString(pathBuf, 0, len);
+                }
+            }
+        } finally {
+            if (pathBuf != 0) { NativeMemory.Free(pathBuf); }
+            NativeMemory.Free(sizeBuf);
+        }
+        return exe;
+        #else
+        return "";
+        #endif
+    }
+
+    public string GetEnvironmentVariable(string name) {
+        if (name == null || name == "") { return ""; }
+        return Interop.EnvVar(name);
+    }
+
+    public bool SetEnvironmentVariable(string name, string value) {
+        if (name == null || name == "") { return false; }
+        if (value == null) {
+            return posix_unsetenv(name) == 0;
+        }
+        return posix_setenv(name, value, 1) == 0;
+    }
+
+    public int GetRandomBytes(string buf, int count) {
+        if (buf == null || count <= 0) { return 0; }
+        #if WASM32
+        if (WasiRandomGet(buf, count) != 0) { return 0; }
+        return count;
+        #else
+        nint fp = urandOpen("/dev/urandom", "rb");
+        if (fp == 0) { return 0; }
+        long got = urandRead(buf, 1, count, fp);
+        urandClose(fp);
+        return (int)got;
+        #endif
+    }
+
+    public int ProcessorCount() {
+        int n = NativeCpuCount();
+        if (n > 0) { return n; }
+        return 1;
+    }
+}
+#endif
