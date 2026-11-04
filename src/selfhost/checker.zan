@@ -30,6 +30,7 @@ public class Checker {
     Node curClass;              // type declaration whose body is being checked
     Node curMethodNode;
     Node curRet;                // return type of the current method (null=void)
+    Node curTargetType;         // expected type of the expression being checked (delegate etc.)
     bool curStatic;             // is the current method static
     int infCount;
     int loopDepth;              // enclosing loop/switch nesting
@@ -41,7 +42,7 @@ public class Checker {
                                 // (InferType re-runs on one node many times)
 
     public Checker(Binder b, Diags d) {
-        binder = b; diags = d; curClass = null; curMethodNode = null; curRet = null;
+        binder = b; diags = d; curClass = null; curMethodNode = null; curRet = null; curTargetType = null;
         curStatic = false; loopDepth = 0; catchDepth = 0;
         scopeName = new List<string>(); scopeType = new List<Node>();
         accReported = null;
@@ -237,6 +238,19 @@ public class Checker {
     Node FirstParamOf(Node m) {
         int i = 0;
         while (i < m.kids.Count) { if (m.kids[i].kind == AK.Param()) { return m.kids[i]; } i = i + 1; }
+        return null;
+    }
+    Node NthParamType(Node m, int idx) {
+        if (m == null) { return null; }
+        int cur = 0;
+        int i = 0;
+        while (i < m.kids.Count) {
+            if (m.kids[i].kind == AK.Param()) {
+                if (cur == idx) { return m.kids[i].type; }
+                cur = cur + 1;
+            }
+            i = i + 1;
+        }
         return null;
     }
     bool AccAlreadyReported(Node n) {
@@ -1671,7 +1685,10 @@ public class Checker {
         }
         if (k == AK.VarDecl()) {
             CheckType(n.type);
+            Node prevTarget = curTargetType;
+            curTargetType = n.type;
             CheckExpr(n.b);
+            curTargetType = prevTarget;
             if (n.type != null) {
                 // the C host points at the *type* of the declaration when it
                 // reports a conversion failure there
@@ -1688,7 +1705,10 @@ public class Checker {
             int di = 0;
             while (di < n.kids.Count) {
                 Node d = n.kids[di];
+                Node prevDTarget = curTargetType;
+                curTargetType = d.type;
                 CheckExpr(d.b);
+                curTargetType = prevDTarget;
                 if (d.type != null) {
                     Node dv = InferType(d.b);
                     CheckTaskNoResult(d.type, dv, "initializer", d.type.line, d.type.col);
@@ -1718,7 +1738,10 @@ public class Checker {
         if (k == AK.GotoStmt() || k == AK.LabelStmt()) { return; }
         if (k == AK.ExprStmt()) { CheckExpr(n.a); return; }
         if (k == AK.ReturnStmt()) {
+            Node prevRetTarget = curTargetType;
+            curTargetType = curRet;
             CheckExpr(n.a);
+            curTargetType = prevRetTarget;
             // The C host has NEITHER "cannot return a value from a void method"
             // NOR "must return a value" (grep src/compiler: no such
             // diagnostic). `static void Main() { ...; return 0; }` is a
@@ -1930,7 +1953,29 @@ public class Checker {
                 CheckExpr(n.b);
                 return;
             }
-            CheckExpr(n.a); CheckExpr(n.b);
+            if (k == AK.Assignment()) {
+                CheckExpr(n.a);
+                Node prevAsgTarget = curTargetType;
+                curTargetType = InferType(n.a);
+                if (curTargetType != null && (n.op == TK.PlusEq() || n.op == TK.MinusEq())) {
+                    Node opCls = ClassOf(curTargetType);
+                    if (opCls != null) {
+                        string opName = "op_add";
+                        if (n.op == TK.MinusEq()) { opName = "op_sub"; }
+                        Node opM = MethodUp(opCls, opName);
+                        if (opM != null) {
+                            Node paramType = NthParamType(opM, 1);
+                            if (paramType != null) {
+                                curTargetType = paramType;
+                            }
+                        }
+                    }
+                }
+                CheckExpr(n.b);
+                curTargetType = prevAsgTarget;
+            } else {
+                CheckExpr(n.a); CheckExpr(n.b);
+            }
             // decimal 与 float/double 的混合算术是 C# CS0019 编译错，宿主
             // checker.c 的 +/-/*// 百分号组当场拒绝（TASKS.md A511②）——
             // double 位模式被按 decimal 重解读会产出垃圾数。自举把 decimal
@@ -2004,7 +2049,14 @@ public class Checker {
             }
             return;
         }
-        if (k == AK.CastExpr()) { CheckType(n.type); CheckExpr(n.b); return; }
+        if (k == AK.CastExpr()) {
+            CheckType(n.type);
+            Node prevCastTarget = curTargetType;
+            curTargetType = n.type;
+            CheckExpr(n.b);
+            curTargetType = prevCastTarget;
+            return;
+        }
         if (k == AK.IsExpr()) {
             CheckExpr(n.a);
             CheckType(n.type);
@@ -2106,6 +2158,22 @@ public class Checker {
                 }
                 diags.Error("type '" + cls.sval + "' has no member '" + n.sval + "'", n.line, n.col);
             }
+        } else if (cls != null && FieldUp(cls, n.sval) == null && MethodUp(cls, "get_" + n.sval) == null && MethodUp(cls, n.sval) != null) {
+            // 方法组当值拦截（B-ID151）：非属性方法未调用且未作为委托使用时报错
+            bool okTarget = false;
+            if (curTargetType != null) {
+                if (binder.IsDelegateName(curTargetType.sval)) {
+                    okTarget = true;
+                } else if (curTargetType.sval == "nint" || curTargetType.sval == "ulong" || curTargetType.sval == "long") {
+                    Node m = MethodUp(cls, n.sval);
+                    if (m != null && (m.mods & AK.Static()) != 0) {
+                        okTarget = true;
+                    }
+                }
+            }
+            if (!okTarget) {
+                diags.Error("[E2039] '" + n.sval + "' is a method, not a value; call it as '" + n.sval + "()'", n.line, n.col);
+            }
         }
     }
 
@@ -2124,10 +2192,27 @@ public class Checker {
     void CheckCall(Node n) {
         Node callee = n.a;
         bool hasNamed = false;
+        Node callTargetMethod = null;
+        if (callee != null) {
+            if (callee.kind == AK.Ident()) {
+                callTargetMethod = MethodUp(curClass, callee.sval);
+            } else if (callee.kind == AK.MemberAccess()) {
+                Node ot = InferType(callee.a);
+                Node cls = ClassOf(ot);
+                if (cls != null) {
+                    callTargetMethod = MethodUpCall(cls, callee.sval, n);
+                }
+            }
+        }
         int i = 0;
         while (i < n.kids.Count) {
             if (n.kids[i].argName != "") { hasNamed = true; }
+            Node prevArgTarget = curTargetType;
+            if (callTargetMethod != null) {
+                curTargetType = NthParamType(callTargetMethod, i);
+            }
             CheckExpr(n.kids[i]);
+            curTargetType = prevArgTarget;
             i = i + 1;
         }
         int argc = n.kids.Count;

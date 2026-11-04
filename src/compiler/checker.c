@@ -2318,6 +2318,13 @@ static zan_symbol_t *checker_find_method_typed(zan_checker_t *c,
                 zan_type_t *pt = zan_binder_resolve_type(c->binder, param->param.type);
                 if (param->param.is_params && pt && pt->kind == TYPE_ARRAY)
                     pt = pt->element_type;
+                if (pt && recv_type && recv_type->type_arg_count > 0 && s && s->decl &&
+                    (s->decl->kind == AST_CLASS_DECL || s->decl->kind == AST_STRUCT_DECL)) {
+                    zan_ast_list_t *tps = &s->decl->type_decl.type_params;
+                    if (tps->count == recv_type->type_arg_count) {
+                        pt = zan_binder_subst_named(c->binder, pt, tps, recv_type->type_args);
+                    }
+                }
                 zan_type_t *at = args[j];
                 /* lambda 实参：lambda 自己没有类型（类型由目标委托形参决定），
                  * 所以这里不能拿 at 比——at 是 error，比不出结果，只能按
@@ -2410,7 +2417,10 @@ static zan_symbol_t *checker_find_method_typed(zan_checker_t *c,
                 zan_ast_node_t *mg_probe = arg;
                 while (mg_probe && mg_probe->kind == AST_CAST_EXPR)
                     mg_probe = mg_probe->cast.expr;
-                zan_symbol_t *mgs = expr_method_group(c, mg_probe);
+                /* 最外层是 cast 的实参不在此裁决（豁免目标有意转换，
+                 * 非豁免已由 AST_CAST_EXPR 报过，同 check_call_arg_type）。 */
+                zan_symbol_t *mgs = (arg && arg->kind == AST_CAST_EXPR)
+                    ? NULL : expr_method_group(c, mg_probe);
                 if (mgs) {
                     /* 方法组实参：与 lambda 同规——按目标委托形参的签名
                      * 兼容性打分，不兼容的候选直接出局。裸方法名在
@@ -2483,7 +2493,10 @@ static zan_symbol_t *checker_find_method_typed(zan_checker_t *c,
             if (arg->kind == AST_NAMED_ARG) arg = arg->named_arg.expr;
             zan_ast_node_t *vg = arg;
             while (vg && vg->kind == AST_CAST_EXPR) vg = vg->cast.expr;
-            zan_symbol_t *mgs = expr_method_group(c, vg);
+            /* 最外层是 cast 的实参不在此裁决（豁免目标有意转换，
+             * 非豁免已由 AST_CAST_EXPR 报过，同 check_call_arg_type）。 */
+            zan_symbol_t *mgs = (arg && arg->kind == AST_CAST_EXPR)
+                ? NULL : expr_method_group(c, vg);
             if (mgs) {
                 /* 没有任何重载接受此方法组：若有候选形参为委托但签名不匹配，
                  * 报 E2098；若候选形参均非委托（如 Convert.ToString(sw.ElapsedMilliseconds)），

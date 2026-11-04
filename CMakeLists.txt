@@ -1469,7 +1469,6 @@ add_test(NAME diag_method_group_as_value_rejected
   COMMAND ${CMAKE_COMMAND}
     -DZANC=$<TARGET_FILE:zanc>
     -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/method_group_as_value_rejected.zan
-    "-DZANC_ARGS=--auto-stdlib"
     -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/diag_method_group_as_value_rejected${_exe_ext}
     "-DEXPECT_REGEX=\\[E2039\\] .Value. is a method, not a value; call it as .Value\\(\\)."
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
@@ -1479,11 +1478,20 @@ add_test(NAME diag_method_group_binary_rejected
   COMMAND ${CMAKE_COMMAND}
     -DZANC=$<TARGET_FILE:zanc>
     -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/method_group_binary_rejected.zan
-    "-DZANC_ARGS=--auto-stdlib"
     -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/diag_method_group_binary_rejected${_exe_ext}
     "-DEXPECT_REGEX=\\[E2039\\] .Value. is a method, not a value; call it as .Value\\(\\)."
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_method_group_binary_rejected PROPERTIES TIMEOUT 60)
+
+add_test(NAME diag_method_group_call_arg_rejected
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/method_group_call_arg_rejected.zan
+    "-DZANC_ARGS=--auto-stdlib"
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/diag_method_group_call_arg_rejected${_exe_ext}
+    "-DEXPECT_REGEX=\\[E2039\\] .Value. is a method, not a value; call it as .Value\\(\\)."
+    -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
+set_tests_properties(diag_method_group_call_arg_rejected PROPERTIES TIMEOUT 60)
 
 # A unary operator applied to a class/struct without a matching overload must
 # fail with a readable diagnostic. The old path fell into the built-in integer
