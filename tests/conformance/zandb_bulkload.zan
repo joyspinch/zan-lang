@@ -1,0 +1,142 @@
+using System;
+using System.Data.ZanDb;
+using System.Json;
+using System.IO;
+
+// 批量直写段提交（刀5 CommitBulk）一致性用例：InsertBulk 走
+// 事务覆盖层排序直写段——免 WAL 数据帧（日志保持空）、免
+// memtable 常驻。钉死：导入后点查/扫描/索引/检索一致、日志为
+// 空（无数据帧）、段数推进、重开恢复、与既有 memtable 数据
+// 混合（先固化再直写）、普通写入仍走 WAL（阈值固化不变）、
+// 混写归并稳定、墓碑与删除、崩溃窗口原子性（空日志 + 旧清单
+// = 回导前）由重开校验兜底。输出确定性，与 zandb_bulkload.out
+// 比对。
+class ZanDbBulkLoadTest {
+    static int checks = 0;
+
+    static void Ok(bool cond, string what) {
+        checks = checks + 1;
+        if (cond) {
+            Console.WriteLine("ok " + Convert.ToString(checks) + " - " + what);
+        } else {
+            Console.WriteLine("FAIL " + Convert.ToString(checks) + " - " + what);
+        }
+    }
+
+    static void Clean(string basePath) {
+        File.Delete(basePath);
+        File.Delete(basePath + ".m0");
+        File.Delete(basePath + ".m1");
+        for (int i = 0; i < 60; i = i + 1) {
+            File.Delete(basePath + ".s" + Convert.ToString(i));
+        }
+    }
+
+    static JsonValue Doc(int i) {
+        JsonValue u = JsonValue.NewObject();
+        u.Put("name", JsonValue.NewStr("user" + Convert.ToString(i).PadLeft(3, "0")));
+        u.Put("age", JsonValue.NewInt(20 + (i % 40)));
+        u.Put("city", JsonValue.NewStr(i % 2 == 0 ? "sh" : "bj"));
+        return u;
+    }
+
+    static void Main() {
+        string path = "_scratch/zandb_bulkload_tmp.zdb";
+        Directory.CreateDirectory("_scratch");
+        Clean(path);
+
+        ZanDatabase db = ZanDatabase.Open(path, ZanStore.DUR_SYNC);
+        Ok(db.IsOpen(), "open");
+        db.Kv().SetFlushThreshold(200);
+        Collection users = db.GetCollection("users");
+
+        // 1) 先走普通插入（WAL/memtable 路径），让 store 带脏态。
+        List<JsonValue> warm = new List<JsonValue>();
+        for (int i = 0; i < 10; i = i + 1) { warm.Add(Doc(i)); }
+        users.InsertBulk(warm);
+        for (int i = 0; i < 5; i = i + 1) { users.Insert(Doc(90 + i)); }
+        Ok(users.Count() == 15, "warm-up inserts");
+
+        // 2) 大批量 InsertBulk 走直写段通道（id 接着 warm 批续）。
+        List<JsonValue> batch = new List<JsonValue>();
+        for (int i = 10; i < 60; i = i + 1) { batch.Add(Doc(i)); }
+        int first = users.InsertBulk(batch);
+        Ok(first == 16, "bulk insert continues id sequence");
+        Ok(users.Count() == 65, "count after bulk insert");
+
+        // 3) 直写通道不留 WAL 数据帧：日志字节为 0（Sync 档全落盘）。
+        Ok(db.Kv().LogBytes() == 0, "log empty after bulk commit");
+
+        // 4) 点查/索引/等值过滤/求和与全量读对照一致（不依赖
+        //    手工算术，双计数源互证）。
+        JsonValue doc = users.FindById(first);
+        JsonValue docName = doc != null ? doc.Get("name") : null;
+        Ok(docName != null && docName.AsString("") == "user010", "point get first bulk row");
+        int countSh = 0;
+        int countBj = 0;
+        long sumAge = 0;
+        int minBj = 0;
+        List<JsonValue> all = users.FindAll();
+        for (int i = 0; i < all.Count; i = i + 1) {
+            string city = all[i].Get("city").AsString("");
+            if (city == "sh") { countSh = countSh + 1; }
+            if (city == "bj") {
+                countBj = countBj + 1;
+                if (minBj == 0) { minBj = (int)all[i].Get("_id").AsDouble(0); }
+            }
+            sumAge = sumAge + all[i].Get("age").AsInt(0);
+        }
+        Ok(users.CountByField("city", "sh") == countSh, "CountByField matches full scan");
+        List<int> ids = users.FindIdsByField("city", "bj");
+        Ok(ids.Count == countBj && ids[0] == minBj, "FindIdsByField matches full scan");
+        Ok(users.SumField("age") == sumAge, "SumField matches full scan");
+
+        // 5) 重开恢复：段清单 + 空日志形态。
+        db.Close();
+        db = ZanDatabase.Open(path, ZanStore.DUR_SYNC);
+        users = db.GetCollection("users");
+        Ok(users.Count() == 65, "count survives reopen");
+        JsonValue reopen = users.FindById(first + 5);
+        JsonValue reopenName = reopen != null ? reopen.Get("name") : null;
+        Ok(reopenName != null && reopenName.AsString("") == "user015", "bulk row survives reopen");
+        Ok(db.Kv().LogBytes() == 0, "log still empty after reopen");
+
+        // 6) 混写：普通 Put/Update/Delete 与直写段共存，计数以
+        //    全量读为对照。
+        users.Insert(Doc(70));
+        Ok(users.Update(first, Doc(10)), "update bulk row");
+        Ok(users.DeleteById(first + 1), "delete bulk row");
+        Ok(users.Count() == 65, "count after mixed writes");
+        int countSh2 = 0;
+        long sumAge2 = 0;
+        List<JsonValue> all2 = users.FindAll();
+        for (int i = 0; i < all2.Count; i = i + 1) {
+            if (all2[i].Get("city").AsString("") == "sh") { countSh2 = countSh2 + 1; }
+            sumAge2 = sumAge2 + all2[i].Get("age").AsInt(0);
+        }
+        Ok(users.CountByField("city", "sh") == countSh2, "mixed count matches full scan");
+        Ok(users.SumField("age") == sumAge2, "mixed sum matches full scan");
+
+        // 7) 归并后一切照旧。
+        db.Flush();
+        db.MergeSegments();
+        db.Close();
+        db = ZanDatabase.Open(path, ZanStore.DUR_SYNC);
+        users = db.GetCollection("users");
+        Ok(users.Count() == 65, "count stable after merge+reopen");
+        Ok(users.CountByField("city", "sh") == countSh2, "count stable after merge");
+        Ok(users.SumField("age") == sumAge2, "sum stable after merge");
+        Ok(users.Exists(first + 1) == false, "deleted row stays gone after merge");
+
+        // 8) 普通逐条插入仍走 WAL 路径（阈值固化行为不变）：
+        //    插入后日志有数据帧，Flush 后归零。
+        users.Insert(Doc(80));
+        Ok(db.Kv().LogBytes() > 0, "single insert still writes WAL");
+        db.Flush();
+        Ok(db.Kv().LogBytes() == 0, "flush resets log");
+
+        db.Close();
+        Clean(path);
+        Console.WriteLine("done " + Convert.ToString(checks));
+    }
+}
