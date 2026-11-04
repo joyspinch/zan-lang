@@ -1,4 +1,5 @@
 using System;
+using System.Threading;
 
 namespace System;
 
@@ -123,5 +124,46 @@ public class TaskJoin {
             if (Task.IsDone(handles[i]) != 0) { done = done + 1; }
         }
         return done;
+    }
+
+    private static async void DelayHelper(int ms) {
+        await Task.Delay(ms);
+    }
+
+    // 为单个异步协程提供带超时的等待门面。
+    // 至多等待 timeoutMs 毫秒：若任务在超时前完成，返回 true；
+    // 若超时到期而任务未完成，自动调用 Task.Cancel(handle) 级联取消该任务并返回 false。
+    // timeoutMs <= 0 时退化为永久等待。
+    public static async bool WithTimeout(long handle, int timeoutMs) {
+        if (handle == 0) { return true; }
+        if (Task.IsDone(handle) != 0) { return true; }
+        if (timeoutMs <= 0) {
+            List<long> single = new List<long>();
+            single.Add(handle);
+            await TaskJoin.WhenAll(single);
+            return true;
+        }
+
+        long timerH = Task.Spawn(TaskJoin.DelayHelper(timeoutMs));
+        List<long> waitBoth = new List<long>();
+        waitBoth.Add(handle);
+        waitBoth.Add(timerH);
+        int winner = await TaskJoin.WhenAny(waitBoth);
+        if (winner == 0) {
+            Task.Cancel(timerH);
+            return true;
+        } else {
+            Task.Cancel(handle);
+            return false;
+        }
+    }
+
+    // 将托管取消令牌与底层协程句柄绑定。当 token 被取消时，自动触发 Task.Cancel(handle)。
+    // 返回注册句柄以便外部注销。
+    public static CancellationTokenRegistration AttachCancellation(long handle, CancellationToken token) {
+        if (token == null || handle == 0) { return null; }
+        return token.Register(() => {
+            Task.Cancel(handle);
+        });
     }
 }

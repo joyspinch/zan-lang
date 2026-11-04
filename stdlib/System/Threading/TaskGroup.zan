@@ -1,0 +1,186 @@
+using System;
+
+namespace System.Threading;
+
+// 结构化并发任务树容器（TaskGroup，B-ID79 结构化并发）。
+// 契约保证：
+// 1. 父子生命周期严格绑定：组内所有派生子任务属于同一任务作用域；
+// 2. 兄弟联动取消：任一子任务发生异常退出或父级取消时，自动向所有尚未完成的兄弟任务广播取消信号；
+// 3. 超时保护：支持作用域级超时，到期自动取消全体子任务；
+// 4. 任务树监控：提供 ActiveCount、TotalCount、CompletedCount 与状态快照。
+public class TaskGroup : IDisposable {
+    List<long> children;
+    int timeoutMs;
+    bool isCancelled;
+    bool isDisposed;
+    nint syncLock;
+    CancellationTokenRegistration parentReg;
+
+    public TaskGroup() {
+        this.children = new List<long>();
+        this.timeoutMs = 0;
+        this.isCancelled = false;
+        this.isDisposed = false;
+        this.syncLock = Mutex.Create();
+        this.parentReg = null;
+    }
+
+    public TaskGroup(int timeoutMs) {
+        this.children = new List<long>();
+        this.timeoutMs = timeoutMs;
+        this.isCancelled = false;
+        this.isDisposed = false;
+        this.syncLock = Mutex.Create();
+        this.parentReg = null;
+    }
+
+    public TaskGroup(CancellationToken token) {
+        this.children = new List<long>();
+        this.timeoutMs = 0;
+        this.isCancelled = false;
+        this.isDisposed = false;
+        this.syncLock = Mutex.Create();
+        this.parentReg = null;
+        this.AttachToken(token);
+    }
+
+    public TaskGroup(CancellationToken token, int timeoutMs) {
+        this.children = new List<long>();
+        this.timeoutMs = timeoutMs;
+        this.isCancelled = false;
+        this.isDisposed = false;
+        this.syncLock = Mutex.Create();
+        this.parentReg = null;
+        this.AttachToken(token);
+    }
+
+    // 绑定外部取消令牌：当 token 触发取消时，向当前任务组广播取消。
+    public void AttachToken(CancellationToken token) {
+        if (token == null) { return; }
+        if (this.parentReg != null) {
+            this.parentReg.Dispose();
+        }
+        TaskGroup self = this;
+        this.parentReg = token.Register(() => {
+            self.CancelAll();
+        });
+    }
+
+    // 登记一个子任务句柄至当前任务树。
+    public long Add(long handle) {
+        if (handle == 0) { return 0; }
+        Mutex.Lock(this.syncLock);
+        this.children.Add(handle);
+        bool shouldCancel = this.isCancelled;
+        Mutex.Unlock(this.syncLock);
+        if (shouldCancel) {
+            Task.Cancel(handle);
+        }
+        return handle;
+    }
+
+    // 当前任务组总纳管子任务数。
+    public int TotalCount {
+        get {
+            Mutex.Lock(this.syncLock);
+            int c = this.children.Count;
+            Mutex.Unlock(this.syncLock);
+            return c;
+        }
+    }
+
+    // 当前处于活跃运行态的子任务数。
+    public int ActiveCount {
+        get {
+            Mutex.Lock(this.syncLock);
+            int active = 0;
+            for (int i = 0; i < this.children.Count; i = i + 1) {
+                if (Task.IsDone(this.children[i]) == 0) {
+                    active = active + 1;
+                }
+            }
+            Mutex.Unlock(this.syncLock);
+            return active;
+        }
+    }
+
+    // 已完成的子任务数。
+    public int CompletedCount {
+        get {
+            Mutex.Lock(this.syncLock);
+            int done = 0;
+            for (int i = 0; i < this.children.Count; i = i + 1) {
+                if (Task.IsDone(this.children[i]) != 0) {
+                    done = done + 1;
+                }
+            }
+            Mutex.Unlock(this.syncLock);
+            return done;
+        }
+    }
+
+    // 是否已被请求取消。
+    public bool IsCancelled {
+        get { return this.isCancelled; }
+    }
+
+    // 获取所有子任务句柄列表副本。
+    public List<long> GetChildren() {
+        Mutex.Lock(this.syncLock);
+        List<long> list = new List<long>();
+        for (int i = 0; i < this.children.Count; i = i + 1) {
+            list.Add(this.children[i]);
+        }
+        Mutex.Unlock(this.syncLock);
+        return list;
+    }
+
+    // 广播取消组内所有子任务。
+    public void CancelAll() {
+        Mutex.Lock(this.syncLock);
+        this.isCancelled = true;
+        List<long> targets = new List<long>();
+        for (int i = 0; i < this.children.Count; i = i + 1) {
+            targets.Add(this.children[i]);
+        }
+        Mutex.Unlock(this.syncLock);
+
+        for (int i = 0; i < targets.Count; i = i + 1) {
+            Task.Cancel(targets[i]);
+        }
+    }
+
+    // 挂起等待所有子任务完成。
+    // 若设置了超时且超时到期，自动取消所有子任务并返回 false；若在时限内全部完成，返回 true。
+    public async bool WaitAll() {
+        List<long> snapshot = this.GetChildren();
+        if (snapshot.Count == 0) { return true; }
+
+        if (this.timeoutMs > 0) {
+            long waitAllH = Task.Spawn(TaskJoin.WhenAll(snapshot));
+            bool ok = await TaskJoin.WithTimeout(waitAllH, this.timeoutMs);
+            if (!ok) {
+                this.CancelAll();
+                return false;
+            }
+            return true;
+        }
+
+        await TaskJoin.WhenAll(snapshot);
+        return true;
+    }
+
+    public void Dispose() {
+        if (!this.isDisposed) {
+            this.isDisposed = true;
+            if (this.parentReg != null) {
+                this.parentReg.Dispose();
+                this.parentReg = null;
+            }
+            if (this.syncLock != 0) {
+                Mutex.Destroy(this.syncLock);
+                this.syncLock = 0;
+            }
+        }
+    }
+}

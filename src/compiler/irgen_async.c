@@ -2027,6 +2027,14 @@ static void emit_async_exc_epilogue(zan_irgen_t *g, local_scope_t *locals) {
         LLVMBuildStructGEP2(g->builder, ft, frame, ASYNC_FRAME_EXC_OWNED, "fr.exc.own"));
     LLVMBuildStore(g->builder, LLVMConstNull(i8ptr), exc_g);
     LLVMBuildStore(g->builder, LLVMConstInt(i32, 0, 0), get_eh_exc_owned_global(g));
+    /* B-ID79：结构化并发父子联动——父协程异常退出时，级联取消当前正挂起等待的子协程链路，
+     * 避免子协程沦为无主孤儿在后台空转。 */
+    LLVMValueRef child_ptr = get_async_child_ptr(g);
+    if (child_ptr) {
+        LLVMValueRef child = LLVMBuildLoad2(g->builder, i8ptr, child_ptr, "exc.child");
+        LLVMValueRef cf = get_co_cancel_fn(g);
+        zan_call2(g->builder, LLVMGlobalGetValueType(cf), cf, &child, 1, "");
+    }
     emit_async_complete(g, locals, NULL);
 }
 

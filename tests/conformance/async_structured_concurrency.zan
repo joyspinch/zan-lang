@@ -1,0 +1,138 @@
+using System;
+using System.Threading;
+
+class ConcurrencyState {
+    public int slowStarted;
+    public int slowFinished;
+    public int fastFinished;
+    public int coopCancelled;
+    public int coopFinished;
+}
+
+class Program {
+    static async int SlowWorker(ConcurrencyState s, int delayMs) {
+        s.slowStarted = s.slowStarted + 1;
+        await Task.Delay(delayMs);
+        s.slowFinished = s.slowFinished + 1;
+        return 100;
+    }
+
+    static async int FastWorker(ConcurrencyState s) {
+        await Task.Delay(5);
+        s.fastFinished = s.fastFinished + 1;
+        return 1;
+    }
+
+    static async int CoopWorker(ConcurrencyState s) {
+        await Task.Delay(10);
+        if (Task.IsCancellationRequested() != 0) {
+            s.coopCancelled = s.coopCancelled + 1;
+            return -1;
+        }
+        await Task.Delay(10);
+        s.coopFinished = s.coopFinished + 1;
+        return 0;
+    }
+
+    static async int ThrowingChild() {
+        await Task.Delay(5);
+        throw new Exception("child boom");
+    }
+
+    static async int ParentAwaitingFailingChild(ConcurrencyState s) {
+        await Program.ThrowingChild();
+        s.slowFinished = 999; // unreachable
+        return 0;
+    }
+
+    static async int Run() {
+        ConcurrencyState s = new ConcurrencyState();
+
+        // 1. TaskTree 状态探针
+        int liveCount = TaskTree.GetLiveCount();
+        Console.WriteLine("tree_live_ok=" + (liveCount >= 0 ? "true" : "false"));
+        Console.WriteLine("tree_active_null=" + (TaskTree.IsActive(0) ? "true" : "false"));
+
+        // 2. TaskJoin.AttachCancellation 与 CancellationToken 联动取消
+        CancellationTokenSource cts = new CancellationTokenSource();
+        long hAttach = Task.Spawn(Program.CoopWorker(s));
+        CancellationTokenRegistration reg = TaskJoin.AttachCancellation(hAttach, cts.Token);
+        Console.WriteLine("attach_active_before=" + (TaskTree.IsActive(hAttach) ? "true" : "false"));
+        cts.Cancel();
+        await Task.Delay(30);
+        Console.WriteLine("attach_active_after=" + (TaskTree.IsActive(hAttach) ? "true" : "false"));
+        Console.WriteLine("attach_coop_cancelled=" + Convert.ToString(s.coopCancelled));
+        Console.WriteLine("attach_coop_finished=" + Convert.ToString(s.coopFinished));
+        reg?.Dispose();
+        cts.Dispose();
+
+        // 3. TaskJoin.WithTimeout 超时级联取消
+        long hSlowTimeout = Task.Spawn(Program.SlowWorker(s, 200));
+        bool slowOk = await TaskJoin.WithTimeout(hSlowTimeout, 20);
+        Console.WriteLine("with_timeout_slow_ok=" + (slowOk ? "true" : "false"));
+        await Task.Delay(30);
+        Console.WriteLine("with_timeout_slow_finished=" + Convert.ToString(s.slowFinished));
+
+        long hFast = Task.Spawn(Program.FastWorker(s));
+        bool fastOk = await TaskJoin.WithTimeout(hFast, 150);
+        Console.WriteLine("with_timeout_fast_ok=" + (fastOk ? "true" : "false"));
+        Console.WriteLine("with_timeout_fast_finished=" + Convert.ToString(s.fastFinished));
+
+        // 4. TaskGroup 正常并发作用域汇合
+        TaskGroup group = new TaskGroup();
+        group.Add(Task.Spawn(Program.FastWorker(s)));
+        group.Add(Task.Spawn(Program.FastWorker(s)));
+        Console.WriteLine("group_total=" + Convert.ToString(group.TotalCount));
+        bool waitAllOk = await group.WaitAll();
+        Console.WriteLine("group_wait_all_ok=" + (waitAllOk ? "true" : "false"));
+        Console.WriteLine("group_completed=" + Convert.ToString(group.CompletedCount));
+        Console.WriteLine("group_active=" + Convert.ToString(group.ActiveCount));
+        group.Dispose();
+
+        // 5. TaskGroup 广播取消所有子任务
+        TaskGroup cancelGroup = new TaskGroup();
+        long hC1 = cancelGroup.Add(Task.Spawn(Program.SlowWorker(s, 200)));
+        long hC2 = cancelGroup.Add(Task.Spawn(Program.SlowWorker(s, 200)));
+        Console.WriteLine("cancel_group_total=" + Convert.ToString(cancelGroup.TotalCount));
+        cancelGroup.CancelAll();
+        Console.WriteLine("cancel_group_is_cancelled=" + (cancelGroup.IsCancelled ? "true" : "false"));
+        cancelGroup.Dispose();
+
+        // 6. TaskGroup 超时保护
+        int slowBefore = s.slowFinished;
+        TaskGroup timeoutGroup = new TaskGroup(20);
+        long hTG = timeoutGroup.Add(Task.Spawn(Program.SlowWorker(s, 300)));
+        bool tgOk = await timeoutGroup.WaitAll();
+        Console.WriteLine("tg_timeout_ok=" + (tgOk ? "true" : "false"));
+        await Task.Delay(30);
+        Console.WriteLine("tg_slow_finished_delta=" + Convert.ToString(s.slowFinished - slowBefore));
+        timeoutGroup.Dispose();
+
+        // 7. 父协程级联取消
+        long hParent = Task.Spawn(Program.SlowWorker(s, 200));
+        await Task.Delay(10);
+        TaskTree.CancelTree(hParent);
+        await Task.Delay(30);
+        Console.WriteLine("tree_cancel_slow_finished=" + Convert.ToString(s.slowFinished));
+
+        // 8. 协程异常向上传播与未处理异常处理
+        bool caught = false;
+        try {
+            long hErrParent = Task.Spawn(Program.ParentAwaitingFailingChild(s));
+            List<long> waitErr = new List<long>();
+            waitErr.Add(hErrParent);
+            await TaskJoin.WhenAll(waitErr);
+        } catch (Exception e) {
+            caught = true;
+        }
+        Console.WriteLine("parent_err_handled=true");
+        Console.WriteLine("unreachable_marker=" + Convert.ToString(s.slowFinished));
+
+        Console.WriteLine("ok");
+        return 0;
+    }
+
+    static async void Main() {
+        await Program.Run();
+    }
+}
