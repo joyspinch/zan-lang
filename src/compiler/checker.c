@@ -3190,6 +3190,64 @@ static void reject_method_group(zan_checker_t *c, zan_ast_node_t *e) {
                   (int)m->name.len, m->name.str);
 }
 
+/* 内建类成员调用的方法组实参裁决（B-ID151）。内建类（Console/Math/
+ * List/…）没有 sym，call_arg_signature 拿不到签名，check_call_arg_type
+ * 从不运行——check_member_access 在实参位置静默后，方法组实参
+ * （WriteLine(fi.Length)）原本唯一的一道闸就没了。按 builtin_api 的
+ * 签名串解析目标形参：能解析出来时按形参裁决（非委托 E2039，委托验
+ * 签名兼容 E2098）；解析不出放行——宁可漏检也不误报。
+ * 表名来源：实例接收者用 recv->name（裸名，type_name 会带 "<T>" 后缀
+ * 对不上表）；静态内建类（Console/Convert/…）的接收者定型为 error，
+ * 用 AST 上的类名标识符。 */
+static void checker_builtin_mg_args(zan_checker_t *c, zan_type_t *recv,
+                                    zan_istr_t name, zan_ast_node_t *call) {
+    if (!call || !call->call.callee ||
+        call->call.callee->kind != AST_MEMBER_ACCESS) return;
+    char buf[64];
+    const char *tn = NULL;
+    if (recv && recv->kind != TYPE_ERROR && recv->name.len > 0 &&
+        recv->name.len < (int)sizeof(buf)) {
+        memcpy(buf, recv->name.str, (size_t)recv->name.len);
+        buf[recv->name.len] = 0;
+        tn = buf;
+    }
+    zan_ast_node_t *robj = call->call.callee->member.object;
+    if ((!tn || (recv && recv->kind == TYPE_ERROR)) && robj &&
+        robj->kind == AST_IDENTIFIER &&
+        robj->ident.name.len > 0 &&
+        robj->ident.name.len < (int)sizeof(buf)) {
+        memcpy(buf, robj->ident.name.str, (size_t)robj->ident.name.len);
+        buf[robj->ident.name.len] = 0;
+        tn = buf;
+    }
+    if (!tn) return;
+    const char *params[8];
+    int np = zan_builtin_member_params(tn, name.str, (int)name.len, params, 8);
+    if (np <= 0) return;
+    int argc = call->call.args.count;
+    for (int i = 0; i < argc && i < np; i++) {
+        zan_ast_node_t *arg = call->call.args.items[i];
+        if (arg && arg->kind == AST_NAMED_ARG) arg = arg->named_arg.expr;
+        if (!arg || arg->kind == AST_REF_ARG) continue;
+        zan_ast_node_t *vg = arg;
+        while (vg && vg->kind == AST_CAST_EXPR) vg = vg->cast.expr;
+        zan_symbol_t *vmg = expr_method_group(c, vg);
+        if (!vmg) continue;
+        zan_type_t *pt = checker_builtin_param_type(c, recv, params[i]);
+        if (!pt || pt->kind == TYPE_TYPE_PARAM) continue;
+        if (pt->kind != TYPE_DELEGATE) {
+            reject_method_group(c, vg);
+            continue;
+        }
+        if (!method_group_matches_delegate(c, vmg, pt)) {
+            zan_diag_emit_code(c->diag, DIAG_ERROR, arg->loc, 2098,
+                "method '%.*s' cannot be converted to delegate type "
+                "'%s': signature is not compatible",
+                (int)vmg->name.len, vmg->name.str, type_name(pt));
+        }
+    }
+}
+
 static bool patterns_match_same(zan_ast_node_t *a, zan_ast_node_t *b) {
     if (!a && !b) return true;
     if (!a || !b) return false;
@@ -3758,6 +3816,10 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
             expr->call.callee->kind == AST_MEMBER_ACCESS) {
             check_builtin_generic_call_args(c, recv,
                 expr->call.callee->member.name, expr, arg_types);
+            /* 方法组实参裁决：内建成员没有签名路径，单独兜
+             * （B-ID151——check_member_access 实参位置静默后的闸）。 */
+            checker_builtin_mg_args(c, recv,
+                expr->call.callee->member.name, expr);
         }
         if (callee_is_method && recv && recv->sym) {
             zan_symbol_t *typed = checker_find_method_typed(c, recv, recv->sym,
@@ -5872,13 +5934,16 @@ static zan_type_t *check_member_access(zan_checker_t *c, zan_ast_node_t *expr,
         }
         if (saw_method) {
             /* 只命中方法/构造器：方法组不能当值用。取值位置必须报
-             * （E2039）——静默 type_error 曾被下游（if 条件、内建实
-             * 参等）当「已报过错误」跳过，裸方法名漏到发码侧按
+             * （E2039）——静默 type_error 曾被下游（if 条件、二元
+             * 操作数等）当「已报过错误」跳过，裸方法名漏到发码侧按
              * E3090 炸 LLVM 或当值传参运行期腐坏（B-ID151）。调用
-             * 位置保持静默：合法方法调用走 check_call 的重载路径。
-             * diag 按 file/line/col/消息去重（B-ID106），binary 等
-             * 先报的场合不会双报。 */
-            if (!in_call_callee) {
+             * 位置与实参位置保持静默：前者合法方法调用走 check_call
+             * 的重载路径；后者实参的合法性（委托形参的签名兼容、
+             * 非委托形参的 E2039/E2098）由 check_call_arg_type 与
+             * 重载评分按目标形参裁决——这里抢报会把「方法组 → 委托
+             * 实参」（sf.Scan("", s.RecoverRecord)）误杀。diag 按
+             * file/line/col/消息去重（B-ID106），先报的场合不双报。 */
+            if (!in_call_callee && !c->in_call_args) {
                 reject_method_group(c, expr);
             }
             return c->binder->type_error;
