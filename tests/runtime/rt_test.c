@@ -372,6 +372,89 @@ static void test_timer(void) {
     CHECK(g_delay_elapsed < 2000, "delay(80ms) took way too long: %lldms", (long long)g_delay_elapsed);
 }
 
+/* ================= B-ID86: 时间片与协作抢占防饥饿测试 ================= */
+
+static void test_sched_quantum_api(void) {
+    banner("scheduler: quantum configuration API (B-ID86)");
+    zan_sched_init();
+    CHECK(zan_sched_get_quantum_ms() == 10, "default quantum should be 10ms, got %lld",
+          (long long)zan_sched_get_quantum_ms());
+    zan_sched_set_quantum_ms(25);
+    CHECK(zan_sched_get_quantum_ms() == 25, "quantum should be 25ms, got %lld",
+          (long long)zan_sched_get_quantum_ms());
+    zan_sched_set_quantum_ms(0);
+    CHECK(zan_sched_get_quantum_ms() == 1, "quantum should be clamped to 1ms, got %lld",
+          (long long)zan_sched_get_quantum_ms());
+    zan_sched_set_quantum_ms(-10);
+    CHECK(zan_sched_get_quantum_ms() == 1, "negative quantum clamped to 1ms, got %lld",
+          (long long)zan_sched_get_quantum_ms());
+    zan_sched_shutdown();
+}
+
+static volatile int g_preempt_task_b_ran_while_a_running = 0;
+static volatile int g_preempt_task_a_done = 0;
+static volatile int g_preempt_task_b_done = 0;
+
+static void preempt_cpu_task_A(zan_task_t *t) {
+    int64_t t0 = now_ms();
+    int64_t sum = 0;
+    while (now_ms() - t0 < 30) {
+        for (int i = 0; i < 1000; i++) {
+            sum += (i & 0x7f);
+        }
+        zan_task_check_preempt();
+    }
+    g_preempt_task_a_done = 1;
+    zan_task_return(t, sum);
+}
+
+static void preempt_task_B(zan_task_t *t) {
+    if (!g_preempt_task_a_done) {
+        g_preempt_task_b_ran_while_a_running = 1;
+    }
+    g_preempt_task_b_done = 1;
+    zan_task_return(t, 42);
+}
+
+static void preempt_main(zan_task_t *t) {
+    g_preempt_task_b_ran_while_a_running = 0;
+    g_preempt_task_a_done = 0;
+    g_preempt_task_b_done = 0;
+
+    zan_task_t *ta = zan_spawn(preempt_cpu_task_A, NULL);
+    zan_task_t *tb = zan_spawn(preempt_task_B, NULL);
+
+    int64_t ra = zan_task_await(ta);
+    int64_t rb = zan_task_await(tb);
+    (void)ra; (void)rb;
+
+    zan_task_release(ta);
+    zan_task_release(tb);
+    zan_task_return(t, 0);
+}
+
+static void test_task_preemption(void) {
+    banner("scheduler: time-slice preemption & anti-starvation (B-ID86)");
+#if defined(_WIN32)
+    _putenv("ZAN_SCHED_WORKERS=1");
+#else
+    setenv("ZAN_SCHED_WORKERS", "1", 1);
+#endif
+    zan_sched_init();
+    zan_sched_set_quantum_ms(3);
+
+    zan_task_t *main_task = zan_spawn(preempt_main, NULL);
+    zan_sched_run();
+    zan_task_release(main_task);
+    CHECK(zan_task_live() == 0, "tasks leaked: %zu still tracked", zan_task_live());
+    zan_sched_shutdown();
+
+    CHECK(g_preempt_task_b_done == 1, "task B should complete");
+    CHECK(g_preempt_task_a_done == 1, "task A should complete");
+    CHECK(g_preempt_task_b_ran_while_a_running == 1,
+          "task B must run while task A is still executing due to time-slice preemption");
+}
+
 
 static int64_t g_echo_bytes = -1;
 static void echo_body(zan_task_t *t) {
@@ -495,6 +578,70 @@ static void test_io_concurrent(int port) {
     closesock(g_listen); g_listen = BAD_SOCK;
     zan_sched_shutdown();
     CHECK(g_conc_ok == CONC_N, "only %d/%d concurrent connections echoed", g_conc_ok, CONC_N);
+}
+
+static volatile int g_io_starve_cpu_done = 0;
+static volatile int g_io_starve_echo_done = 0;
+
+static void io_starve_cpu_task(zan_task_t *t) {
+    int64_t sum = 0;
+    for (int i = 0; i < 200000; i++) {
+        sum += (i & 0x3f);
+        zan_task_check_preempt();
+    }
+    g_io_starve_cpu_done = 1;
+    zan_task_return(t, sum);
+}
+
+static void io_starve_main(zan_task_t *t) {
+    int port = (int)(intptr_t)zan_task_arg(t);
+    g_io_starve_cpu_done = 0;
+    g_io_starve_echo_done = 0;
+
+    zan_task_t *cpu_t = zan_spawn(io_starve_cpu_task, NULL);
+    zan_task_t *echo_t = zan_spawn(echo_body, (void *)(intptr_t)port);
+
+    int64_t r_cpu = zan_task_await(cpu_t);
+    int64_t r_echo = zan_task_await(echo_t);
+    (void)r_cpu;
+    if (r_echo == 5 * 18) {
+        g_io_starve_echo_done = 1;
+    }
+
+    zan_task_release(cpu_t);
+    zan_task_release(echo_t);
+    zan_task_return(t, 0);
+}
+
+static void test_io_starvation_preempt(int port) {
+    banner("async-io: IO anti-starvation during compute-heavy task (B-ID86)");
+#if defined(_WIN32)
+    _putenv("ZAN_SCHED_WORKERS=1");
+#else
+    setenv("ZAN_SCHED_WORKERS", "1", 1);
+#endif
+    zan_sched_init();
+    zan_sched_set_quantum_ms(4);
+
+    g_listen = make_listener(port);
+    CHECK(g_listen != BAD_SOCK, "could not bind echo server on port %d", port);
+    if (g_listen == BAD_SOCK) { zan_sched_shutdown(); return; }
+
+    thread_t srv;
+#if defined(_WIN32)
+    srv = CreateThread(NULL, 0, server_thread, NULL, 0, NULL); (void)srv;
+#else
+    pthread_create(&srv, NULL, server_thread, NULL); (void)srv;
+#endif
+
+    zan_task_t *main_task = zan_spawn(io_starve_main, (void *)(intptr_t)port);
+    zan_sched_run();
+    zan_task_release(main_task);
+    closesock(g_listen); g_listen = BAD_SOCK;
+    zan_sched_shutdown();
+
+    CHECK(g_io_starve_echo_done == 1, "echo client should complete without starvation");
+    CHECK(g_io_starve_cpu_done == 1, "cpu loop should complete");
 }
 
 
@@ -727,11 +874,14 @@ int main(void) {
     test_scheduler_concurrent_workers();
     test_scheduler_concurrent_high_load();
     test_timer();
+    test_sched_quantum_api();
+    test_task_preemption();
     test_mem_stats();
     test_co_statemachine();
     test_co_io(19803);
     test_io_echo(19801);
     test_io_concurrent(19802);
+    test_io_starvation_preempt(19804);
     test_connect_refused(19899);
 
     printf("--- %d checks, %d failures ---\n", g_checks, g_fails);

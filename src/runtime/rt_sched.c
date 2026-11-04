@@ -32,7 +32,12 @@
 #if !defined(MAP_ANONYMOUS) && defined(MAP_ANON)
 #define MAP_ANONYMOUS MAP_ANON
 #endif
+#if defined(ZAN_USE_UCONTEXT) || (!defined(__x86_64__) && !defined(_M_X64) && !defined(__aarch64__) && !defined(_M_ARM64))
 #include <ucontext.h>
+#define ZAN_POSIX_UCONTEXT 1
+#else
+#define ZAN_POSIX_ASM_FIBER 1
+#endif
 #include <time.h>
 #include <unistd.h>
 #endif
@@ -112,6 +117,10 @@ typedef struct zan_co {
     int            finished;
     volatile int   running;
     int32_t        last_error;
+    /* B-ID86: 时间片与协作抢占跟踪 */
+    int64_t        slice_start_ms;
+    uint32_t       slice_ticks;
+    volatile int   preempt_requested;
     struct zan_co *next;
 } zan_co_t;
 
@@ -175,6 +184,8 @@ typedef struct ZAN_CACHELINE_ALIGN zan_worker {
     zan_co_t    *local_head;
     zan_co_t    *local_tail;
     int          local_count;
+    /* B-ID86: 正在该 Worker 上执行的当前协程（供 Watchdog 采样检测超时） */
+    zan_co_t    * volatile running_co;
 #ifdef _WIN32
     HANDLE       thread;
     HANDLE       wake_event;
@@ -229,14 +240,120 @@ static void plat_sleep(int64_t ms) {
 static int64_t plat_now_ms(void)       { return (int64_t)GetTickCount64(); }
 
 #else
+
+#if ZAN_POSIX_ASM_FIBER
+
+typedef struct {
+    void   *sp;
+    char   *stack;
+    size_t  stack_size;
+} posix_fiber_t;
+
+static ZAN_THREAD_LOCAL void *g_sched_sp;
+
+extern void zan_fiber_switch(void **from_sp, void *to_sp);
+extern void zan_fiber_entry(void);
+void co_trampoline_posix(zan_co_t *co);
+
+#if defined(__APPLE__)
+#define ZAN_ASM_SYM(name) "_" #name
+#define ZAN_ASM_TYPE(name) ""
+#else
+#define ZAN_ASM_SYM(name) #name
+#define ZAN_ASM_TYPE(name) ".type " #name ", @function\n"
+#endif
+
+#if defined(__x86_64__) || defined(_M_X64)
+
+__asm__(
+    ".text\n"
+    ".globl " ZAN_ASM_SYM(zan_fiber_switch) "\n"
+    ZAN_ASM_TYPE(zan_fiber_switch)
+    ZAN_ASM_SYM(zan_fiber_switch) ":\n"
+    "    pushq %rbp\n"
+    "    pushq %rbx\n"
+    "    pushq %r12\n"
+    "    pushq %r13\n"
+    "    pushq %r14\n"
+    "    pushq %r15\n"
+    "    movq  %rsp, (%rdi)\n"
+    "    movq  %rsi, %rsp\n"
+    "    popq  %r15\n"
+    "    popq  %r14\n"
+    "    popq  %r13\n"
+    "    popq  %r12\n"
+    "    popq  %rbx\n"
+    "    popq  %rbp\n"
+    "    ret\n"
+);
+
+__asm__(
+    ".text\n"
+    ".globl " ZAN_ASM_SYM(zan_fiber_entry) "\n"
+    ZAN_ASM_TYPE(zan_fiber_entry)
+    ZAN_ASM_SYM(zan_fiber_entry) ":\n"
+    "    movq %rbx, %rdi\n"
+    "    call " ZAN_ASM_SYM(co_trampoline_posix) "\n"
+    "    ud2\n"
+);
+
+#elif defined(__aarch64__) || defined(_M_ARM64)
+
+__asm__(
+    ".text\n"
+    ".globl " ZAN_ASM_SYM(zan_fiber_switch) "\n"
+    ZAN_ASM_TYPE(zan_fiber_switch)
+    ZAN_ASM_SYM(zan_fiber_switch) ":\n"
+    "    stp  x19, x20, [sp, #-16]!\n"
+    "    stp  x21, x22, [sp, #-16]!\n"
+    "    stp  x23, x24, [sp, #-16]!\n"
+    "    stp  x25, x26, [sp, #-16]!\n"
+    "    stp  x27, x28, [sp, #-16]!\n"
+    "    stp  x29, x30, [sp, #-16]!\n"
+    "    stp  d8,  d9,  [sp, #-16]!\n"
+    "    stp  d10, d11, [sp, #-16]!\n"
+    "    stp  d12, d13, [sp, #-16]!\n"
+    "    stp  d14, d15, [sp, #-16]!\n"
+    "    mov  x2, sp\n"
+    "    str  x2, [x0]\n"
+    "    mov  sp, x1\n"
+    "    ldp  d14, d15, [sp], #16\n"
+    "    ldp  d12, d13, [sp], #16\n"
+    "    ldp  d10, d11, [sp], #16\n"
+    "    ldp  d8,  d9,  [sp], #16\n"
+    "    ldp  x29, x30, [sp], #16\n"
+    "    ldp  x27, x28, [sp], #16\n"
+    "    ldp  x25, x26, [sp], #16\n"
+    "    ldp  x23, x24, [sp], #16\n"
+    "    ldp  x21, x22, [sp], #16\n"
+    "    ldp  x19, x20, [sp], #16\n"
+    "    ret\n"
+);
+
+__asm__(
+    ".text\n"
+    ".globl " ZAN_ASM_SYM(zan_fiber_entry) "\n"
+    ZAN_ASM_TYPE(zan_fiber_entry)
+    ZAN_ASM_SYM(zan_fiber_entry) ":\n"
+    "    mov  x0, x19\n"
+    "    bl   " ZAN_ASM_SYM(co_trampoline_posix) "\n"
+    "    brk  #0\n"
+);
+
+#endif /* Arch */
+
+#else /* ZAN_POSIX_UCONTEXT */
+
 static ZAN_THREAD_LOCAL ucontext_t g_sched_ctx;
 #if UINTPTR_MAX > 0xFFFFFFFFu
-static void co_trampoline_posix(unsigned hi, unsigned lo);
+static void co_trampoline_posix_ucontext(unsigned hi, unsigned lo);
 #else
-static void co_trampoline_posix(unsigned ptr);
+static void co_trampoline_posix_ucontext(unsigned ptr);
 #endif
 
 typedef struct { ucontext_t ctx; char *stack; } posix_fiber_t;
+
+#endif /* ZAN_POSIX_ASM_FIBER */
 
 #define ZAN_CO_STACK_POOL_MAX 256
 
@@ -290,35 +407,77 @@ static void plat_stack_free(char *stack) {
     munmap((char *)stack - page, co_stack_size() + (size_t)page);
 }
 
+#if ZAN_POSIX_ASM_FIBER
+static void plat_sched_enter(void) { g_sched_sp = NULL; }
+static void plat_sched_leave(void) {}
+#else
 static void plat_sched_enter(void) { g_sched_fiber = &g_sched_ctx; }
 static void plat_sched_leave(void) {}
+#endif
+
 static void *plat_fiber_new(zan_co_t *co) {
     posix_fiber_t *pf = (posix_fiber_t *)calloc(1, sizeof(*pf));
     if (!pf) zan_rt_fatal("oom", "scheduler: fiber control block alloc failed");
     pf->stack = plat_stack_alloc();
     if (!pf->stack) zan_rt_fatal("oom", "scheduler: fiber stack alloc failed");
+#if ZAN_POSIX_ASM_FIBER
+    pf->stack_size = co_stack_size();
+    char *stack_top = pf->stack + pf->stack_size;
+#if defined(__x86_64__) || defined(_M_X64)
+    uintptr_t sp = (uintptr_t)stack_top & ~15ULL;
+    uintptr_t *s = (uintptr_t *)sp;
+    s[-1] = (uintptr_t)zan_fiber_entry;
+    s[-2] = 0;                  /* rbp */
+    s[-3] = (uintptr_t)co;      /* rbx -> co argument passed to trampoline */
+    s[-4] = 0;                  /* r12 */
+    s[-5] = 0;                  /* r13 */
+    s[-6] = 0;                  /* r14 */
+    s[-7] = 0;                  /* r15 */
+    pf->sp = (void *)(s - 7);
+#elif defined(__aarch64__) || defined(_M_ARM64)
+    uintptr_t sp = (uintptr_t)stack_top & ~15ULL;
+    uintptr_t *s = (uintptr_t *)(sp - 160);
+    memset(s, 0, 160);
+    s[0] = (uintptr_t)co;              /* x19 */
+    s[10] = 0;                         /* x29 (fp) */
+    s[11] = (uintptr_t)zan_fiber_entry;/* x30 (lr) */
+    pf->sp = (void *)s;
+#endif
+#else /* UCONTEXT */
     getcontext(&pf->ctx);
     pf->ctx.uc_stack.ss_sp = pf->stack;
     pf->ctx.uc_stack.ss_size = co_stack_size();
     pf->ctx.uc_link = &g_sched_ctx;
 #if UINTPTR_MAX > 0xFFFFFFFFu
     uintptr_t p = (uintptr_t)co;
-    makecontext(&pf->ctx, (void (*)(void))co_trampoline_posix, 2,
+    makecontext(&pf->ctx, (void (*)(void))co_trampoline_posix_ucontext, 2,
                 (unsigned)(p >> 32), (unsigned)(p & 0xffffffffu));
 #else
-    makecontext(&pf->ctx, (void (*)(void))co_trampoline_posix, 1,
+    makecontext(&pf->ctx, (void (*)(void))co_trampoline_posix_ucontext, 1,
                 (unsigned)(uintptr_t)co);
+#endif
 #endif
     return pf;
 }
+
 static void plat_fiber_delete(void *f) {
     posix_fiber_t *pf = (posix_fiber_t *)f;
     plat_stack_free(pf->stack);
     free(pf);
 }
+
 static void plat_switch(void *to) {
 #ifndef _WIN32
     posix_fiber_t *pf = (posix_fiber_t *)to;
+#if ZAN_POSIX_ASM_FIBER
+#if ZAN_ASAN_FIBER
+    __sanitizer_start_switch_fiber(NULL, pf->stack, pf->stack_size);
+    zan_fiber_switch(&g_sched_sp, pf->sp);
+    __sanitizer_finish_switch_fiber(NULL, NULL, NULL);
+#else
+    zan_fiber_switch(&g_sched_sp, pf->sp);
+#endif
+#else /* UCONTEXT */
     pf->ctx.uc_link = &g_sched_ctx;
 #if ZAN_ASAN_FIBER
     __sanitizer_start_switch_fiber(NULL, pf->stack, co_stack_size());
@@ -328,12 +487,15 @@ static void plat_switch(void *to) {
     swapcontext(&g_sched_ctx, &pf->ctx);
 #endif
 #endif
+#endif
 }
+
 static void plat_sleep(int64_t ms) {
     if (ms < 0) ms = 0;
     struct timespec ts = { ms / 1000, (ms % 1000) * 1000000L };
     nanosleep(&ts, NULL);
 }
+
 static int64_t plat_now_ms(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -355,6 +517,15 @@ static void switch_to_sched(void) {
         g_current->last_error = (int32_t)errno;
     }
     posix_fiber_t *pf = (posix_fiber_t *)g_current->fiber;
+#if ZAN_POSIX_ASM_FIBER
+#if ZAN_ASAN_FIBER
+    __sanitizer_start_switch_fiber(NULL, NULL, 0);
+    zan_fiber_switch(&pf->sp, g_sched_sp);
+    __sanitizer_finish_switch_fiber(NULL, NULL, NULL);
+#else
+    zan_fiber_switch(&pf->sp, g_sched_sp);
+#endif
+#else /* UCONTEXT */
 #if ZAN_ASAN_FIBER
     __sanitizer_start_switch_fiber(NULL, NULL, 0);
     swapcontext(&pf->ctx, &g_sched_ctx);
@@ -362,21 +533,27 @@ static void switch_to_sched(void) {
 #else
     swapcontext(&pf->ctx, &g_sched_ctx);
 #endif
+#endif
     if (g_current) {
         errno = (int)g_current->last_error;
     }
 #endif
 }
 
-static inline void co_switch_to(zan_co_t *co) {
+static inline void co_switch_to(zan_worker_t *w, zan_co_t *co) {
     co_acquire(co);
     g_current = co;
+    co->slice_start_ms = plat_now_ms();
+    co->slice_ticks = 0;
+    co->preempt_requested = 0;
+    if (w) w->running_co = co;
 #ifdef _WIN32
     SetLastError((DWORD)co->last_error);
 #else
     errno = (int)co->last_error;
 #endif
     plat_switch(co->fiber);
+    if (w) w->running_co = NULL;
     g_current = NULL;
 }
 
@@ -670,7 +847,7 @@ static DWORD WINAPI worker_thread_main(LPVOID arg) {
     while (!g_sched_stop) {
         zan_co_t *co = ready_pop_worker(w->id);
         if (co) {
-            co_switch_to(co);
+            co_switch_to(w, co);
             if (co->finished) {
                 plat_fiber_delete(co->fiber);
                 free(co);
@@ -679,6 +856,22 @@ static DWORD WINAPI worker_thread_main(LPVOID arg) {
                 co_release(co);
             }
         } else {
+            /* 空闲 Worker 协助轮询就绪 IO，杜绝 IO 假死 */
+            if (zan_io_has_pending()) {
+                zan_io_poll(0);
+                co = ready_pop_worker(w->id);
+                if (co) {
+                    co_switch_to(w, co);
+                    if (co->finished) {
+                        plat_fiber_delete(co->fiber);
+                        free(co);
+                        zan_atomic_dec(&g_live);
+                    } else {
+                        co_release(co);
+                    }
+                    continue;
+                }
+            }
             worker_wait(w, 2);
         }
     }
@@ -687,11 +880,23 @@ static DWORD WINAPI worker_thread_main(LPVOID arg) {
     return 0;
 }
 #else
+#if ZAN_POSIX_ASM_FIBER
+void co_trampoline_posix(zan_co_t *co) {
+#if ZAN_ASAN_FIBER
+    __sanitizer_finish_switch_fiber(NULL, NULL, NULL);
+#endif
+    errno = 0;
+    co->body(co->task);
+    co->finished = 1;
+    complete_task(co->task, 0);
+    switch_to_sched();
+}
+#else
 #if UINTPTR_MAX > 0xFFFFFFFFu
-static void co_trampoline_posix(unsigned hi, unsigned lo) {
+static void co_trampoline_posix_ucontext(unsigned hi, unsigned lo) {
     zan_co_t *co = (zan_co_t *)(((uintptr_t)hi << 32) | (uintptr_t)lo);
 #else
-static void co_trampoline_posix(unsigned ptr) {
+static void co_trampoline_posix_ucontext(unsigned ptr) {
     zan_co_t *co = (zan_co_t *)(uintptr_t)ptr;
 #endif
 #if ZAN_ASAN_FIBER
@@ -703,6 +908,7 @@ static void co_trampoline_posix(unsigned ptr) {
     complete_task(co->task, 0);
     switch_to_sched();
 }
+#endif
 
 static void *worker_thread_main(void *arg) {
     zan_worker_t *w = (zan_worker_t *)arg;
@@ -712,7 +918,7 @@ static void *worker_thread_main(void *arg) {
     while (!g_sched_stop) {
         zan_co_t *co = ready_pop_worker(w->id);
         if (co) {
-            co_switch_to(co);
+            co_switch_to(w, co);
             if (co->finished) {
                 plat_fiber_delete(co->fiber);
                 free(co);
@@ -721,6 +927,22 @@ static void *worker_thread_main(void *arg) {
                 co_release(co);
             }
         } else {
+            /* 空闲 Worker 协助轮询就绪 IO，杜绝 IO 假死 */
+            if (zan_io_has_pending()) {
+                zan_io_poll(0);
+                co = ready_pop_worker(w->id);
+                if (co) {
+                    co_switch_to(w, co);
+                    if (co->finished) {
+                        plat_fiber_delete(co->fiber);
+                        free(co);
+                        zan_atomic_dec(&g_live);
+                    } else {
+                        co_release(co);
+                    }
+                    continue;
+                }
+            }
             worker_wait(w, 2);
         }
     }
@@ -783,6 +1005,80 @@ void zan_task_yield(void) {
 
 int64_t zan_task_result(zan_task_t *task) { return task ? task->result : 0; }
 
+/* ================= Time-slice & Preemption (B-ID86) ================= */
+
+static int64_t g_sched_quantum_ms = 10;
+
+void zan_sched_set_quantum_ms(int64_t ms) {
+    if (ms <= 0) ms = 1;
+    g_sched_quantum_ms = ms;
+}
+
+int64_t zan_sched_get_quantum_ms(void) {
+    return g_sched_quantum_ms;
+}
+
+int zan_task_should_preempt(void) {
+    zan_co_t *co = g_current;
+    if (!co) return 0;
+    if (co->preempt_requested) return 1;
+
+    /* 周期性采样时钟（每 64 次调用检测一次系统时钟，兼顾微秒响应与零开销） */
+    if ((++co->slice_ticks & 63) == 0) {
+        int64_t now = plat_now_ms();
+        if (now - co->slice_start_ms >= g_sched_quantum_ms) {
+            co->preempt_requested = 1;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+void zan_task_check_preempt(void) {
+    if (zan_task_should_preempt()) {
+        zan_task_yield();
+    }
+}
+
+#ifdef _WIN32
+static HANDLE g_watchdog_thread = NULL;
+static DWORD WINAPI watchdog_thread_main(LPVOID arg) {
+    (void)arg;
+    while (!g_sched_stop) {
+        plat_sleep(2);
+        int64_t now = plat_now_ms();
+        for (int i = 0; i < g_worker_count; i++) {
+            zan_co_t *co = g_workers[i].running_co;
+            if (co && !co->preempt_requested) {
+                if (now - co->slice_start_ms >= g_sched_quantum_ms) {
+                    co->preempt_requested = 1;
+                }
+            }
+        }
+    }
+    return 0;
+}
+#else
+static pthread_t g_watchdog_thread;
+static volatile int g_watchdog_active = 0;
+static void *watchdog_thread_main(void *arg) {
+    (void)arg;
+    while (!g_sched_stop) {
+        plat_sleep(2);
+        int64_t now = plat_now_ms();
+        for (int i = 0; i < g_worker_count; i++) {
+            zan_co_t *co = g_workers[i].running_co;
+            if (co && !co->preempt_requested) {
+                if (now - co->slice_start_ms >= g_sched_quantum_ms) {
+                    co->preempt_requested = 1;
+                }
+            }
+        }
+    }
+    return NULL;
+}
+#endif
+
 /* ================= IO integration ================= */
 
 void zan_io_suspend_current(void) {
@@ -816,11 +1112,18 @@ void zan_sched_init(void) {
     g_all_tasks = NULL;
     g_live = 0;
     g_sched_stop = 0;
+    g_sched_quantum_ms = 10;
+    const char *qenv = getenv("ZAN_SCHED_QUANTUM");
+    if (qenv && qenv[0]) {
+        int q = atoi(qenv);
+        if (q > 0) g_sched_quantum_ms = q;
+    }
 
     for (int i = 0; i < ZAN_MAX_WORKERS; i++) {
         g_workers[i].id = i;
         g_workers[i].active = 0;
         g_workers[i].sleeping = 0;
+        g_workers[i].running_co = NULL;
         zan_mutex_init(&g_workers[i].lock);
         g_workers[i].local_head = NULL;
         g_workers[i].local_tail = NULL;
@@ -864,6 +1167,14 @@ void zan_sched_run(void) {
         g_worker_count = cfg_w;
     }
 
+    /* 启动 Watchdog 抢占巡检后台线程 */
+#ifdef _WIN32
+    g_watchdog_thread = CreateThread(NULL, 0, watchdog_thread_main, NULL, 0, NULL);
+#else
+    g_watchdog_active = 1;
+    pthread_create(&g_watchdog_thread, NULL, watchdog_thread_main, NULL);
+#endif
+
     /* 启动多 Worker 辅助线程 */
     for (int i = 1; i < g_worker_count; i++) {
         g_workers[i].id = i;
@@ -904,7 +1215,7 @@ void zan_sched_run(void) {
         }
 
         if (co) {
-            co_switch_to(co);
+            co_switch_to(&g_workers[0], co);
             if (co->finished) {
                 plat_fiber_delete(co->fiber);
                 free(co);
@@ -915,9 +1226,21 @@ void zan_sched_run(void) {
         }
     }
 
-    /* 通知并等待所有辅助 Worker 退出 */
+    /* 通知并等待所有辅助 Worker 与 Watchdog 退出 */
     g_sched_stop = 1;
     wake_all_workers();
+#ifdef _WIN32
+    if (g_watchdog_thread) {
+        WaitForSingleObject(g_watchdog_thread, INFINITE);
+        CloseHandle(g_watchdog_thread);
+        g_watchdog_thread = NULL;
+    }
+#else
+    if (g_watchdog_active) {
+        pthread_join(g_watchdog_thread, NULL);
+        g_watchdog_active = 0;
+    }
+#endif
     for (int i = 1; i < g_worker_count; i++) {
         if (g_workers[i].active) {
 #ifdef _WIN32

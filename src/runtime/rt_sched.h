@@ -28,4 +28,10 @@ void  zan_io_suspend_current(void);
 void  zan_io_resume(void *co);
 void *zan_io_get_current_co(void);
 
+/* ---- Time-slice & cooperative preemption (B-ID86) ---- */
+void    zan_task_check_preempt(void);
+int     zan_task_should_preempt(void);
+void    zan_sched_set_quantum_ms(int64_t ms);
+int64_t zan_sched_get_quantum_ms(void);
+
 #endif /* ZAN_RT_SCHED_H */
