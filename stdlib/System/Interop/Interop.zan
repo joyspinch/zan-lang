@@ -1,42 +1,21 @@
 using System;
+using System.Platform;
 
 namespace System;
 
-// 并通过 delegate 调用，而不声明 `[DllImport]`
-// （加载时即需存在）。
-// MessageBoxW box = (MessageBoxW)addr;      // 地址 -> 可调用
-// `(Delegate)address` 转换及其逆操作 `(nint)handler` 是编译器的
-// 原语，因此可选依赖（一个可能未安装的运行时）
-// 无需 C shim：先探测，缺失时回退即可。
+// 动态链接库加载、符号解析与系统调用的跨平台互操作门面。
+// 底层原生调用与系统错误码均下沉至平台抽象层（Pal.Library / Pal.Environment），
+// 统一提供强类型、零 #if WINDOWS 条件编译的共享库生命周期管理与 SafeHandle 作用域释放。
 public class Interop {
-#if WINDOWS
-    [DllImport("kernel32", EntryPoint = "LoadLibraryA")]
-    public static extern nint WinLoad(string name);
+    // 兼容历史调用方（WebViewBackend 等）
+    public static nint PosixLoad(string name, int flags) {
+        return Pal.Library.LoadLibrary(name);
+    }
 
-    [DllImport("kernel32", EntryPoint = "GetProcAddress")]
-    public static extern nint WinSymbol(nint mod, string name);
+    public static nint WinLoad(string name) {
+        return Pal.Library.LoadLibrary(name);
+    }
 
-    [DllImport("kernel32", EntryPoint = "FreeLibrary")]
-    public static extern int WinUnload(nint mod);
-
-    [DllImport("kernel32", EntryPoint = "GetLastError")]
-    public static extern int WinLastError();
-#else
-    [DllImport("crt", EntryPoint = "dlopen")]
-    public static extern nint PosixLoad(string name, int flags);
-
-    [DllImport("crt", EntryPoint = "dlsym")]
-    public static extern nint PosixSymbol(nint mod, string name);
-
-    [DllImport("crt", EntryPoint = "dlclose")]
-    public static extern int PosixUnload(nint mod);
-
-    [DllImport("crt", EntryPoint = "dlerror")]
-    public static extern string PosixError();
-
-    // RTLD_NOW | RTLD_LOCAL 的整数值：Linux/musl 上 RTLD_LOCAL 为 0
-    // （RTLD_NOW=2），Darwin 上 RTLD_LOCAL=4（RTLD_NOW=2），所以
-    // 不能只写一次硬编码常量。
     public static int RtldNowLocal() {
         #if LINUX
         return 2;
@@ -44,7 +23,6 @@ public class Interop {
         return 6;
         #endif
     }
-#endif
 
     // 最近一次 Load/Symbol 失败的原因文本。
     public static string lastError = "";
@@ -52,49 +30,33 @@ public class Interop {
     // 上次失败加载的原生加载器错误文本（dlerror / Win32 错误码）；
     // 没有失败时为空字符串。
     public static string LastError() {
-        return Interop.lastError;
+        return Pal.Library.GetLastError();
     }
 
     // 按名称或路径加载共享库；不存在时返回 0。
     public static nint Load(string name) {
-        #if WINDOWS
-        nint m = Interop.WinLoad(name);
-        Interop.lastError = "";
-        if (m == 0) {
-            Interop.lastError = "win32 error " +
-                                Convert.ToString(Interop.WinLastError());
-        }
+        nint m = Pal.Library.LoadLibrary(name);
+        Interop.lastError = Pal.Library.GetLastError();
         return m;
-        #else
-        // dlerror() 是线程局部的，且会被后续任何 dl* 调用清空，
-        // 所以必须在失败的检查点立即读走。
-        nint m = Interop.PosixLoad(name, Interop.RtldNowLocal());
-        Interop.lastError = "";
-        if (m == 0) { Interop.lastError = Interop.PosixError(); }
-        return m;
-        #endif
+    }
+
+    // 安全加载共享库并返回受 SafeHandle 保护的句柄；可配合 using 语句在离开作用域时自动卸载。
+    public static SafeLibraryHandle LoadLibrarySafe(string name) {
+        nint mod = Interop.Load(name);
+        return new SafeLibraryHandle(mod);
     }
 
     // 导出入口点的地址；库中没有时返回 0
     // （一种以 ABI 兼容方式探测新运行时特性的做法）。
     public static nint Symbol(nint mod, string name) {
-        if (mod == 0) { return 0; }
-        #if WINDOWS
-        return Interop.WinSymbol(mod, name);
-        #else
-        return Interop.PosixSymbol(mod, name);
-        #endif
+        nint s = Pal.Library.GetSymbol(mod, name);
+        Interop.lastError = Pal.Library.GetLastError();
+        return s;
     }
 
     // 卸载共享库；句柄为 0 时忽略。
     public static void Unload(nint mod) {
-        if (mod != 0) {
-            #if WINDOWS
-            Interop.WinUnload(mod);
-            #else
-            Interop.PosixUnload(mod);
-            #endif
-        }
+        Pal.Library.FreeLibrary(mod);
     }
 
     // 一步加载 `name` 并解析 `entry`；任一失败返回 0。
@@ -102,49 +64,13 @@ public class Interop {
         return Interop.Symbol(Interop.Load(name), entry);
     }
 
-    public static extern string getenv(string name);
+    // 将跨平台共享库名规范化为平台本地文件名（例如 "sqlite3" -> "sqlite3.dll" / "libsqlite3.so" / "libsqlite3.dylib"）。
+    public static string MapLibraryName(string name) {
+        return Pal.Library.MapLibraryName(name);
+    }
 
-    // 从活动进程块读取环境变量，未设置时返回
-    // 空字符串。
+    // 从活动进程块读取环境变量，未设置时返回空字符串。
     public static string EnvVar(string name) {
-        #if WINDOWS
-        nint fn = Interop.Entry("kernel32.dll", "GetEnvironmentVariableW");
-        if (fn == 0) { return ""; }
-        GetEnvironmentVariableWFn call = (GetEnvironmentVariableWFn)fn;
-        nint wname = Wide.Of(name);
-        nint buf = 0;
-        string text = "";
-        try {
-            buf = NativeMemory.Alloc(2048);
-            new Span<short>(buf, 1)[0] = 0;
-            int size = 1023;
-            int units = call(wname, buf, size);
-            // 截断探测：值放不下时 Win32 返回所需码元数而非报错，
-            // 避免长 PATH/TZ 环境变量静默截断。按所需尺寸重试一次，
-            // 上限 32K 码元，满足 Windows 环境变量上限要求。
-            if (units >= size && units < 32768) {
-                NativeMemory.Free(buf);
-                buf = 0;
-                size = units + 1;
-                buf = NativeMemory.Alloc(size * 2);
-                units = call(wname, buf, size);
-            }
-            if (units > 0 && units < size) { text = Wide.Read(buf); }
-        } finally {
-            if (buf != 0) { NativeMemory.Free(buf); }
-            Wide.Free(wname);
-        }
-        return text;
-        #else
-        // 非 Windows 平台下 kernel32 导入在链接时被 stub，因此
-        // 改为通过 libc 读取环境变量。
-        string v = Interop.getenv(name);
-        if (v == null) { return ""; }
-        return v;
-        #endif
+        return Pal.Environment.GetEnvironmentVariable(name);
     }
 }
-
-// GetEnvironmentVariableW 的调用形式（name/buf 为宽字符指针，
-// size 为缓冲区的 UTF-16 码元容量，返回写入的码元数）。
-public delegate int GetEnvironmentVariableWFn(nint name, nint buf, int size);

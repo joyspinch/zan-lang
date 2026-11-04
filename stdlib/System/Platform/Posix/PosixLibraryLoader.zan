@@ -1,0 +1,115 @@
+#if !WINDOWS
+using System;
+
+namespace System.Platform;
+
+// POSIX 平台的动态链接库与系统错误码实现（基于 libdl 与 libc）。
+public class PosixLibraryLoader : IPlatformLibraryLoader {
+    [DllImport("crt", EntryPoint = "dlopen")]
+    private static extern nint PosixDlopen(string name, int flags);
+
+    [DllImport("crt", EntryPoint = "dlsym")]
+    private static extern nint PosixDlsym(nint mod, string name);
+
+    [DllImport("crt", EntryPoint = "dlclose")]
+    private static extern int PosixDlclose(nint mod);
+
+    [DllImport("crt", EntryPoint = "dlerror")]
+    private static extern string PosixDlerror();
+
+    #if LINUX
+    [DllImport("crt", EntryPoint = "__errno_location")]
+    private static extern nint PosixErrnoLocation();
+    #elif MACOS
+    [DllImport("crt", EntryPoint = "__error")]
+    private static extern nint PosixErrnoLocation();
+    #else
+    private static nint PosixErrnoLocation() { return 0; }
+    #endif
+
+    string lastError = "";
+
+    // RTLD_NOW | RTLD_LOCAL: Linux 2, Darwin 6
+    private static int RtldNowLocal() {
+        #if LINUX
+        return 2;
+        #else
+        return 6;
+        #endif
+    }
+
+    public nint LoadLibrary(string name) {
+        nint m = PosixLibraryLoader.PosixDlopen(name, PosixLibraryLoader.RtldNowLocal());
+        if (m == 0) {
+            string err = PosixLibraryLoader.PosixDlerror();
+            if (err == null || err.Length == 0) { err = "dlopen failed"; }
+            this.lastError = err;
+        } else {
+            this.lastError = "";
+        }
+        return m;
+    }
+
+    public nint GetSymbol(nint handle, string name) {
+        if (handle == 0 || name == null) { return 0; }
+        nint sym = PosixLibraryLoader.PosixDlsym(handle, name);
+        if (sym == 0) {
+            string err = PosixLibraryLoader.PosixDlerror();
+            if (err != null && err.Length > 0) {
+                this.lastError = err;
+            } else {
+                this.lastError = "symbol not found: " + name;
+            }
+        } else {
+            this.lastError = "";
+        }
+        return sym;
+    }
+
+    public bool FreeLibrary(nint handle) {
+        if (handle == 0) { return true; }
+        int res = PosixLibraryLoader.PosixDlclose(handle);
+        return res == 0;
+    }
+
+    public string GetLastError() {
+        return this.lastError;
+    }
+
+    public int GetLastSystemError() {
+        nint loc = PosixLibraryLoader.PosixErrnoLocation();
+        if (loc != 0) {
+            return new Span<int>(loc, 1)[0];
+        }
+        return 0;
+    }
+
+    public void SetLastSystemError(int error) {
+        nint loc = PosixLibraryLoader.PosixErrnoLocation();
+        if (loc != 0) {
+            new Span<int>(loc, 1)[0] = error;
+        }
+    }
+
+    public string MapLibraryName(string name) {
+        if (name == null || name.Length == 0) { return ""; }
+        if (name.IndexOf("/") >= 0 || name.IndexOf("\\") >= 0) {
+            return name;
+        }
+        string mapped = name;
+        if (!mapped.StartsWith("lib")) {
+            mapped = "lib" + mapped;
+        }
+        #if MACOS
+        if (!mapped.EndsWith(".dylib")) {
+            mapped = mapped + ".dylib";
+        }
+        #else
+        if (!mapped.EndsWith(".so")) {
+            mapped = mapped + ".so";
+        }
+        #endif
+        return mapped;
+    }
+}
+#endif
