@@ -522,6 +522,30 @@ public class CollectionSearch {
         if (exact) { return index.SearchExactFiltered(query, k, filter); }
         return index.SearchFiltered(query, k, efSearch, filter);
     }
+
+    // 两段式重打分（刀3b）：量化索引近似召回后从文档行取原向量
+    // 精排。精排 source 与检查点导出同模式——文档行点查
+    // （tag 11 float32 数组经指针/字符串解码）→ ReadVector。
+    // 非量化索引转发普通搜索（其距离本就精确）。
+    public List<VectorHit> VectorRescore(Collection collection, string field, float[] query, int k, int efSearch, VectorFilter filter) {
+        RequireCommitted();
+        CollectionSearchState state = Load("vector", field);
+        VectorIndex index = state.vector;
+        if (!index.IsQuantized()) { return index.SearchFiltered(query, k, efSearch, filter); }
+        int kid = collection.KeyIdOf(field);
+        if (kid == 0) {
+            throw new ArgumentException("vector field is not part of the collection schema");
+        }
+        ZanStore store = this.kv;
+        VectorSource source = (int id) => {
+            string body = store.Get(collection.DocKey(id));
+            if (body == null || body.Length == 0) { return null; }
+            JsonValue value = collection.FieldOf(body, kid);
+            if (value == null || value.IsNull()) { return null; }
+            return CollectionSearch.ReadVector(value, state.options);
+        };
+        return index.SearchRescoreFiltered(query, k, efSearch, filter, source);
+    }
     public List<HybridHit> Hybrid(string textField, string query, string vectorField, float[] vector, int k,
     int efSearch, Bm25Filter textFilter, VectorFilter vectorFilter) {
         RequireCommitted();

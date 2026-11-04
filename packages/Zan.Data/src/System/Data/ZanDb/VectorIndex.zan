@@ -501,6 +501,59 @@ public class VectorIndex {
         return hits;
     }
 
+    // 原向量精确距离（重打分内核）：查询 workspace + 原向量，
+    // 与 <see cref="SearchExactFiltered"/> 同式——余弦
+    // 1 - dot·invNq·(1/√nv)，L2 逐维差平方和。
+    public double RescoreDistance(VectorWorkspace work, float[] vector) {
+        double dot = 0;
+        double nv = 0;
+        if (this.options.metric == 1) {
+            for (int i = 0; i < this.options.dimensions; i = i + 1) {
+                double delta = (double)work.query[work.offset + i] - (double)vector[i];
+                dot = dot + delta * delta;
+            }
+            return dot;
+        }
+        for (int i = 0; i < this.options.dimensions; i = i + 1) {
+            dot = dot + (double)work.query[work.offset + i] * (double)vector[i];
+            nv = nv + (double)vector[i] * (double)vector[i];
+        }
+        double distance = 1.0 - dot * work.inverseNorm / Math.Sqrt(nv);
+        if (distance < 0) { return 0; }
+        if (distance > 2) { return 2; }
+        return distance;
+    }
+
+    // 两段式重打分（刀3b）：量化索引的召回补全——近召回段用
+    // ADC 距离取 k×4 候选（图遍历照常），精排段对每个候选 id 经
+    // source 从文档行取回原向量重算精确距离，按精确距离排序取
+    // top-k。候选数放大是召回上限，非量化索引直接走普通近似
+    // 搜索（其距离本就精确，重打分无意义）。source 缺失或返回
+    // 维度不符抛 IOException——精排段拿不到原向量就是错误配置。
+    public List<VectorHit> SearchRescoreFiltered(float[] query, int k, int efSearch, VectorFilter filter, VectorSource source) {
+        if (!this.options.quantize) { return this.SearchFiltered(query, k, efSearch, filter); }
+        if (source == null) { throw new IOException("rescore requires a vector source"); }
+        int limit = this.QueryLimit(k);
+        if (limit == 0) { return new List<VectorHit>(); }
+        int candidates = limit * 4;
+        int active = this.Count();
+        if (candidates > active) { candidates = active; }
+        List<VectorHit> recalled = this.SearchFiltered(query, candidates, efSearch, filter);
+        VectorWorkspace work = this.QueryWorkspace(query);
+        VectorHeap best = new VectorHeap(limit + 1, true);
+        for (int i = 0; i < recalled.Count; i = i + 1) {
+            int id = recalled[i].id;
+            float[] vector = source(id);
+            if (vector == null || vector.Length != this.options.dimensions) {
+                throw new IOException("rescore vector source returned invalid vector");
+            }
+            double distance = this.RescoreDistance(work, vector);
+            best.Push(id, id, distance);
+            if (best.count > limit) { best.Pop(); }
+        }
+        return this.Hits(best, limit);
+    }
+
     public List<VectorHit> SearchExact(float[] query, int k) {
         return this.SearchExactFiltered(query, k, null);
     }
