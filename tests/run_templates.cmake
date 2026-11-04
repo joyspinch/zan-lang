@@ -87,8 +87,8 @@ foreach(_proj IN LISTS _projs)
         file(RENAME ${_out}/src/App.${_ext} ${_out}/src/${NAME}.${_ext})
       endif()
     endforeach()
-    if(EXISTS ${_out}/src/${NAME}.html)
-      set(_entry "src/${NAME}.html")
+    if(_entry STREQUAL "src/App.zan" AND EXISTS ${_out}/src/${NAME}.zan)
+      set(_entry "src/${NAME}.zan")
     endif()
   endif()
 
@@ -98,25 +98,14 @@ foreach(_proj IN LISTS _projs)
   endif()
 
   # The entry is ALWAYS the first input: zanc emits Main from the first
-  # input on the command line (for a design entry it is the entry design's
-  # Main; for a .zan entry the entry's own Main must win -- a side design
-  # in front would project a second Main, "duplicate method 'Main'").
+  # input on the command line (for a .zan entry the entry's own Main must win).
+  # Compile-time HTML generation channel has been removed (de208fe98): design
+  # documents (.html) are runtime assets loaded via DesignDoc/LoadHtml or
+  # baked in via --embed; they are NOT compiler inputs.
   set(_srcs "")
   list(APPEND _srcs ${_out}/${_entry})
   file(GLOB_RECURSE _zan ${_out}/src/*.zan)
-  file(GLOB_RECURSE _designs ${_out}/src/*.html ${_out}/src/*.htm)
   list(SORT _zan)
-  list(SORT _designs)
-  # Side design documents (.html next to the entry, e.g. gui-wechat's
-  # WeChatFavs/WeChatMoments run-time windows) ride the same command line --
-  # ZanIDE.GatherZanFiles puts them into every whole-project build the same
-  # way, and a design doc not on the command line projects no class at all,
-  # so any `XxxHtml.Build` reference in the .zan half fails to resolve.
-  foreach(_d IN LISTS _designs)
-    if(NOT _d STREQUAL "${_out}/${_entry}")
-      list(APPEND _srcs ${_d})
-    endif()
-  endforeach()
   list(APPEND _srcs ${_zan})
   list(REMOVE_DUPLICATES _srcs)
 
