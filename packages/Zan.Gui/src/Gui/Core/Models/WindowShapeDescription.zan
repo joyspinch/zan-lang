@@ -1,0 +1,228 @@
+using System;
+using System.Collections.Generic;
+using System.Text;
+
+namespace Gui;
+
+// 强类型窗口形状与阴影排版协议描述对象（标准化 HTML+CSS / 跨平台几何协议）。
+// 替代旧有的逗号/分号拼接魔术字符串，解耦窗口几何与底层物理渲染，实现全平台统一外观。
+// 纯强类型原生内存布局，完全零 JsonValue / 零动态哈希查找开销。
+public class WindowShapeDescription {
+    public List<WindowShapeRegion> regions;
+    public int shadow;
+    public int offsetX;
+    public int offsetY;
+
+    public WindowShapeDescription() {
+        this.regions = new List<WindowShapeRegion>();
+        this.shadow = 0;
+        this.offsetX = 0;
+        this.offsetY = 0;
+    }
+
+    public WindowShapeDescription(List<WindowShapeRegion> regions, int shadow) {
+        this.regions = regions != null ? regions : new List<WindowShapeRegion>();
+        this.shadow = shadow >= 0 ? shadow : 0;
+        this.offsetX = 0;
+        this.offsetY = 0;
+        this.RecalculateOffsets();
+    }
+
+    // 默认空形状（标准矩形窗口）
+    public static WindowShapeDescription Empty() {
+        return new WindowShapeDescription();
+    }
+
+    // 工厂方法：基于指定尺寸和圆角半径构造圆角矩形窗口形状
+    public static WindowShapeDescription FromRoundedRect(int width, int height, int radius) {
+        WindowShapeDescription desc = new WindowShapeDescription();
+        if (width > 0 && height > 0) {
+            desc.regions.Add(new WindowShapeRegion(
+                WindowShapeKind.RoundedRect,
+                0,
+                0,
+                width,
+                height,
+                radius > 0 ? radius : 0
+            ));
+        }
+        return desc;
+    }
+
+    // 工厂方法：基于指定尺寸构造椭圆窗口形状
+    public static WindowShapeDescription FromEllipse(int width, int height) {
+        WindowShapeDescription desc = new WindowShapeDescription();
+        if (width > 0 && height > 0) {
+            desc.regions.Add(new WindowShapeRegion(
+                WindowShapeKind.Ellipse,
+                0,
+                0,
+                width,
+                height,
+                0
+            ));
+        }
+        return desc;
+    }
+
+    // 从向后兼容的分号/逗号分隔魔术字符串解析（如 "1,0,0,800,600,16;3,..."）
+    public static WindowShapeDescription ParseSpec(string spec) {
+        WindowShapeDescription desc = new WindowShapeDescription();
+        if (spec == null || spec.Length == 0) {
+            return desc;
+        }
+        List<string> parts = spec.Split(";");
+        for (int i = 0; i < parts.Count; i = i + 1) {
+            string part = parts[i];
+            if (part.Length == 0) { continue; }
+            List<string> nums = part.Split(",");
+            if (nums.Count >= 6) {
+                int k = Convert.ToInt32(nums[0]);
+                int x = Convert.ToInt32(nums[1]);
+                int y = Convert.ToInt32(nums[2]);
+                int w = Convert.ToInt32(nums[3]);
+                int h = Convert.ToInt32(nums[4]);
+                int r = Convert.ToInt32(nums[5]);
+                desc.regions.Add(new WindowShapeRegion(k, x, y, w, h, r));
+            }
+        }
+        desc.RecalculateOffsets();
+        return desc;
+    }
+
+    // 添加子区域
+    public void AddRegion(int kind, int x, int y, int width, int height, int radius) {
+        if (width <= 0 || height <= 0) { return; }
+        this.regions.Add(new WindowShapeRegion(kind, x, y, width, height, radius));
+        this.RecalculateOffsets();
+    }
+
+    // 检查是否为空形状（无子区域，即普通直角矩形窗口）
+    public bool IsEmpty() {
+        return this.regions.Count == 0;
+    }
+
+    // 检查是否已包含类型 3（阴影带）区域
+    public bool HasShadowBand() {
+        for (int i = 0; i < this.regions.Count; i = i + 1) {
+            if (this.regions[i].kind == WindowShapeKind.ShadowBand) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // 获取首个内容几何区域的圆角半径
+    public int GetEffectiveRadius() {
+        for (int i = 0; i < this.regions.Count; i = i + 1) {
+            WindowShapeRegion r = this.regions[i];
+            if (r.kind != WindowShapeKind.ShadowBand && r.radius > 0) {
+                return r.radius;
+            }
+        }
+        return 0;
+    }
+
+    // 重新根据阴影带计算内容区相对窗口左上角的偏移
+    public void RecalculateOffsets() {
+        this.offsetX = 0;
+        this.offsetY = 0;
+        for (int i = 0; i < this.regions.Count; i = i + 1) {
+            WindowShapeRegion r = this.regions[i];
+            if (r.kind == WindowShapeKind.ShadowBand) {
+                this.offsetX = r.radius;
+                this.offsetY = r.radius;
+                this.shadow = r.radius;
+                return;
+            }
+        }
+    }
+
+    // 为几何轮廓包裹阴影带，并自动平移修正，确保阴影带外扩对齐 (0, 0)
+    public WindowShapeDescription WithShadow(int px) {
+        if (px <= 0) {
+            return this.Clone();
+        }
+        if (this.HasShadowBand()) {
+            WindowShapeDescription existing = this.Clone();
+            existing.shadow = px;
+            existing.offsetX = px;
+            existing.offsetY = px;
+            return existing;
+        }
+
+        int minX = 2147483647;
+        int minY = 2147483647;
+        int maxX = 0 - 2147483647 - 1;
+        int maxY = 0 - 2147483647 - 1;
+
+        for (int ri = 0; ri < this.regions.Count; ri = ri + 1) {
+            WindowShapeRegion reg = this.regions[ri];
+            if (reg.kind != WindowShapeKind.ShadowBand) {
+                int x = reg.x;
+                int y = reg.y;
+                int x2 = x + reg.width;
+                int y2 = y + reg.height;
+                if (x < minX) { minX = x; }
+                if (y < minY) { minY = y; }
+                if (x2 > maxX) { maxX = x2; }
+                if (y2 > maxY) { maxY = y2; }
+            }
+        }
+
+        if (minX > maxX || minY > maxY) {
+            return this.Clone();
+        }
+
+        WindowShapeDescription res = new WindowShapeDescription();
+        res.shadow = px;
+        res.offsetX = px;
+        res.offsetY = px;
+
+        // 阴影带放置在开头 (kind = 3)
+        int bandW = maxX - minX + px * 2;
+        int bandH = maxY - minY + px * 2;
+        res.regions.Add(new WindowShapeRegion(WindowShapeKind.ShadowBand, 0, 0, bandW, bandH, px));
+
+        // 原几何区域平移 (px - minX, px - minY)
+        for (int ri = 0; ri < this.regions.Count; ri = ri + 1) {
+            WindowShapeRegion reg = this.regions[ri];
+            if (reg.kind == WindowShapeKind.ShadowBand) { continue; }
+            res.regions.Add(new WindowShapeRegion(
+                reg.kind,
+                reg.x - minX + px,
+                reg.y - minY + px,
+                reg.width,
+                reg.height,
+                reg.radius
+            ));
+        }
+
+        return res;
+    }
+
+    // 转换为向后兼容的分号/逗号分隔魔术字符串表示（仅在与旧 C 驱动交互时调用）
+    public string ToSpec() {
+        if (this.regions.Count == 0) {
+            return "";
+        }
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < this.regions.Count; i = i + 1) {
+            if (i > 0) { sb.Append(";"); }
+            sb.Append(this.regions[i].ToSpecPart());
+        }
+        return sb.ToString();
+    }
+
+    // 深拷贝
+    public WindowShapeDescription Clone() {
+        WindowShapeDescription copy = new WindowShapeDescription();
+        copy.shadow = this.shadow;
+        copy.offsetX = this.offsetX;
+        copy.offsetY = this.offsetY;
+        for (int i = 0; i < this.regions.Count; i = i + 1) {
+            copy.regions.Add(this.regions[i].Clone());
+        }
+        return copy;
+    }
+}

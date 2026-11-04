@@ -2347,36 +2347,11 @@ public class Win32Shell {
     // "t,x,y,w,h,r;t,x,y,w,h,r;..."（逻辑像素；type 1 = 圆角矩形，
     // r 为圆角半径；type 2 = 椭圆，w/h 为包围盒；r 忽略）。
     // "" 恢复为普通不透明矩形。两条路径都兼容 Windows 7：
-    // DWM 合成开启时窗口为分层并逐像素合成
-    // （抗锯齿边缘，外部像素点击穿透）；DWM 关闭时
-    // 回退为合并的 SetWindowRgn（硬边，同样点击穿透）。
-    // 不涉及 SetWindowCompositionAttribute（仅 Win8+）。
-    static void SetShape(nint hwnd, string spec) {
+    // 强类型窗口几何排版协议入口
+    static void SetShapeDescription(nint hwnd, WindowShapeDescription desc) {
         Win32Shell.Init();
         if (hwnd == 0) { return; }
-        List<Win32ShapeRegion> regs = new List<Win32ShapeRegion>();
-        List<WindowShapeRegion> maskRegions = new List<WindowShapeRegion>();
-        if (spec.Length > 0) {
-            List<string> parts = spec.Split(";");
-            for (int i = 0; i < parts.Count; i = i + 1) {
-                List<string> nums = parts[i].Split(",");
-                if (nums.Count >= 6) {
-                    Win32ShapeRegion reg = new Win32ShapeRegion(
-                        Convert.ToInt32(nums[0]),
-                        Convert.ToInt32(nums[1]),
-                        Convert.ToInt32(nums[2]),
-                        Convert.ToInt32(nums[3]),
-                        Convert.ToInt32(nums[4]),
-                        Convert.ToInt32(nums[5])
-                    );
-                    regs.Add(reg);
-                    maskRegions.Add(new WindowShapeRegion(reg.kind, reg.x, reg.y,
-                        reg.w, reg.h, reg.r));
-                }
-            }
-        }
-        Win32Shell.shapeMaskRegions = maskRegions;
-        if (regs.Count == 0) {
+        if (desc == null || desc.IsEmpty()) {
             // 恢复普通不透明窗口：清除所有区域 + 分层样式。
             Win32Shell.hasShadowBand = false;
             Win32Shell.SetWindowRgn(hwnd, 0, true);
@@ -2387,16 +2362,23 @@ public class Win32Shell {
             }
             Win32Shell.shapeMode = 0;
             Win32Shell.shapeRegionList = new List<Win32ShapeRegion>();
+            Win32Shell.shapeMaskRegions = new List<WindowShapeRegion>();
             Win32Shell.shapeMask = new WindowShapeMask();
             Win32Shell.glassOn = false;
             return;
         }
-        Win32Shell.shapeRegionList = regs;
-        bool sb = false;
-        for (int si = 0; si < regs.Count; si = si + 1) {
-            if (regs[si].kind == 3) { sb = true; }
+
+        List<Win32ShapeRegion> regs = new List<Win32ShapeRegion>();
+        List<WindowShapeRegion> maskRegions = new List<WindowShapeRegion>();
+        for (int i = 0; i < desc.regions.Count; i = i + 1) {
+            WindowShapeRegion r = desc.regions[i];
+            regs.Add(new Win32ShapeRegion(r.kind, r.x, r.y, r.width, r.height, r.radius));
+            maskRegions.Add(r.Clone());
         }
-        Win32Shell.hasShadowBand = sb;
+
+        Win32Shell.shapeRegionList = regs;
+        Win32Shell.shapeMaskRegions = maskRegions;
+        Win32Shell.hasShadowBand = desc.HasShadowBand();
         Win32Shell.shapeMask = new WindowShapeMask();
         // 在缩小之前标记异形：FitShapeWindow 的 SetWindowPos
         // 不能被主框架 800x600 的 WM_GETMINMAXINFO 最小值夹紧。
@@ -2424,6 +2406,14 @@ public class Win32Shell {
             int own = Win32Shell.SurfaceOf(hwnd);
             if (own >= 0) { Win32Shell.Blit(hwnd, own); }
         }
+    }
+
+    // DWM 合成开启时窗口为分层并逐像素合成
+    // （抗锯齿边缘，外部像素点击穿透）；DWM 关闭时
+    // 回退为合并的 SetWindowRgn（硬边，同样点击穿透）。
+    // 兼容旧接口：由 ParseSpec 转为强类型协议后下发。
+    static void SetShape(nint hwnd, string spec) {
+        Win32Shell.SetShapeDescription(hwnd, WindowShapeDescription.ParseSpec(spec));
     }
 
     // 缩小（或放大）窗口，使客户区与形状区域的

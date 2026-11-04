@@ -106,7 +106,7 @@ public class FormBuilder {
         if (height <= 0) { height = 520; }
         int shape = root.Int("winShape", 0);
         int radius = root.Int("winShapeRadius", 0);
-        if (shape == 1 && radius <= 0) { radius = 12; }
+        if (shape == WindowShapeKind.RoundedRect && radius <= 0) { radius = 12; }
         bool round = root.Bool("winRound", false);
         int shadow = 0;
         JsonValue shadowValue = root.Get("winShadow");
@@ -115,30 +115,35 @@ public class FormBuilder {
         } else if (shape != 0 || round) {
             shadow = 10;
         }
-        string spec = "";
+
+        WindowShapeDescription shapeDesc = new WindowShapeDescription();
         JsonValue regions = root.Get("winShape");
         if (regions != null && regions.IsArray()) {
             for (int i = 0; i < regions.Count(); i = i + 1) {
                 JsonValue region = regions.At(i);
+                if (region == null) { continue; }
                 int rw = region.Int("w", 0);
                 int rh = region.Int("h", 0);
                 if (rw <= 0 || rh <= 0) { continue; }
-                if (spec != "") { spec = spec + ";"; }
-                spec = spec + Convert.ToString(region.Int("t", 1)) + ","
-                    + Convert.ToString(region.Int("x", 0)) + ","
-                    + Convert.ToString(region.Int("y", 0)) + ","
-                    + Convert.ToString(rw) + "," + Convert.ToString(rh) + ","
-                    + Convert.ToString(region.Int("r", 0));
+                shapeDesc.AddRegion(
+                    region.Int("t", WindowShapeKind.RoundedRect),
+                    region.Int("x", 0),
+                    region.Int("y", 0),
+                    rw,
+                    rh,
+                    region.Int("r", 0)
+                );
             }
-        } else if (shape == 1) {
-            spec = "1,0,0," + Convert.ToString(width) + ","
-                + Convert.ToString(height) + "," + Convert.ToString(radius);
-        } else if (shape == 2 || round) {
-            spec = "2,0,0," + Convert.ToString(width) + ","
-                + Convert.ToString(height) + ",0";
+        } else if (shape == WindowShapeKind.RoundedRect) {
+            shapeDesc = WindowShapeDescription.FromRoundedRect(width, height, radius);
+        } else if (shape == WindowShapeKind.Ellipse || round) {
+            shapeDesc = WindowShapeDescription.FromEllipse(width, height);
         }
-        app.SetWindowShape(spec);
-        app.SetWindowShadow(shadow);
+
+        app.SetWindowShape(shapeDesc);
+        if (shadow > 0) {
+            app.SetWindowShadow(shadow);
+        }
         app.SetChromeVisible(root.Bool("winChrome", true));
         bool resizable = root.Bool("winResizable", true);
         app.SetResizable(resizable);
@@ -347,7 +352,7 @@ public class FormBuilder {
             || key == "class" || key == "style" || key == "props"
             || key == "kids" || key == "dock" || key == "dockSide"
             || key == "fx" || key == "fy" || key == "fw" || key == "fh"
-            || key == "position" || key == "anchor" || key == "flexGrow"
+            || key == "position" || key == "anchor" || key == "flexGrow" || key == "flex-grow"
             || key == "span" || key == "childTab" || key == "ph"
             || key == "pad" || key == "gap" || key == "bind"
             || key == "bindProp" || key == "if" || key == "for"
@@ -356,7 +361,17 @@ public class FormBuilder {
             || key == "compAnon" || key == "arg" || key == "rowFactory"
             || key == "locked" || key == "pvOff" || key == "activeTab"
             || key == "zModel" || key == "zShow" || key == "zHide" || key == "zText"
-            || key == "bindPath" || key == "bindIf";
+            || key == "bindPath" || key == "bindIf"
+            || key == "margin" || key == "padding"
+            || key == "flexDir" || key == "flexDirection" || key == "flex-direction"
+            || key == "justify" || key == "justifyContent" || key == "justify-content"
+            || key == "alignItems" || key == "align-items"
+            || key == "alignContent" || key == "align-content"
+            || key == "alignSelf" || key == "align-self"
+            || key == "flexWrap" || key == "flex-wrap"
+            || key == "flexShrink" || key == "flex-shrink"
+            || key == "flexBasis" || key == "flex-basis"
+            || key == "winShape" || key == "winShapeRadius" || key == "winRound" || key == "winShadow";
     }
 
     static string ScalarText(JsonValue value) {
@@ -459,42 +474,95 @@ public class FormBuilder {
         ctl.bindIf = bif;
         ctl.handlerArg = anon ? "" : o.Str("arg", "");
         string style = o.Str("style", "");
-        if (o.Has("flexGrow")) {
-            style = style + ";flex-grow:" + Convert.ToString(o.Int("flexGrow", 0));
+        // Flexbox 布局属性标准化解析（解耦伪排版，双轨对齐 HTML+CSS）
+        if (o.Has("flexGrow") || o.Has("flex-grow")) {
+            int fg = o.Int("flexGrow", o.Int("flex-grow", 0));
+            style = style + ";flex-grow:" + Convert.ToString(fg);
         }
         if (o.Has("margin")) {
-            style = style + ";margin:" + Convert.ToString(o.Int("margin", 0)) + "px";
+            JsonValue mv = o.Get("margin");
+            if (mv != null && mv.IsNumber()) {
+                style = style + ";margin:" + Convert.ToString(mv.AsInt(0)) + "px";
+            } else if (mv != null && mv.IsString()) {
+                string ms = mv.AsString("");
+                style = style + ";margin:" + (ms.EndsWith("px") || ms.EndsWith("%") ? ms : ms + "px");
+            }
         }
-        if (o.Has("padding")) {
-            style = style + ";padding:" + Convert.ToString(o.Int("padding", 0)) + "px";
-        } else if (o.Has("pad")) {
-            style = style + ";padding:" + Convert.ToString(o.Int("pad", 0)) + "px";
+        if (o.Has("padding") || o.Has("pad")) {
+            JsonValue pv = o.Get("padding");
+            if (pv == null) { pv = o.Get("pad"); }
+            if (pv != null && pv.IsNumber()) {
+                style = style + ";padding:" + Convert.ToString(pv.AsInt(0)) + "px";
+            } else if (pv != null && pv.IsString()) {
+                string ps = pv.AsString("");
+                style = style + ";padding:" + (ps.EndsWith("px") || ps.EndsWith("%") ? ps : ps + "px");
+            }
         }
         if (o.Has("gap")) {
-            style = style + ";gap:" + Convert.ToString(o.Int("gap", 0)) + "px";
+            JsonValue gv = o.Get("gap");
+            if (gv != null && gv.IsNumber()) {
+                style = style + ";gap:" + Convert.ToString(gv.AsInt(0)) + "px";
+            } else if (gv != null && gv.IsString()) {
+                string gs = gv.AsString("");
+                style = style + ";gap:" + (gs.EndsWith("px") || gs.EndsWith("%") ? gs : gs + "px");
+            }
         }
-        if (o.Has("flexDir")) {
-            int fd = o.Int("flexDir", 0);
+        if (o.Has("flexDir") || o.Has("flexDirection") || o.Has("flex-direction")) {
             style = style + ";display:flex";
-            if (fd == 1) { style = style + ";flex-direction:row"; }
-            else { style = style + ";flex-direction:column"; }
+            string dirStr = o.Str("flexDirection", o.Str("flex-direction", ""));
+            if (dirStr != "") {
+                style = style + ";flex-direction:" + dirStr;
+            } else {
+                int fd = o.Int("flexDir", 0);
+                if (fd == 1) { style = style + ";flex-direction:row"; }
+                else if (fd == 2) { style = style + ";flex-direction:row-reverse"; }
+                else if (fd == 3) { style = style + ";flex-direction:column-reverse"; }
+                else { style = style + ";flex-direction:column"; }
+            }
         }
-        if (o.Has("justify")) {
-            int ju = o.Int("justify", 0);
-            if (ju == 1) { style = style + ";justify-content:center"; }
-            else if (ju == 2) { style = style + ";justify-content:flex-end"; }
-            else if (ju == 3) { style = style + ";justify-content:space-between"; }
-            else { style = style + ";justify-content:flex-start"; }
+        if (o.Has("justify") || o.Has("justifyContent") || o.Has("justify-content")) {
+            string jStr = o.Str("justifyContent", o.Str("justify-content", ""));
+            if (jStr != "") {
+                style = style + ";justify-content:" + jStr;
+            } else {
+                int ju = o.Int("justify", 0);
+                if (ju == 1) { style = style + ";justify-content:center"; }
+                else if (ju == 2) { style = style + ";justify-content:flex-end"; }
+                else if (ju == 3) { style = style + ";justify-content:space-between"; }
+                else if (ju == 4) { style = style + ";justify-content:space-around"; }
+                else if (ju == 5) { style = style + ";justify-content:space-evenly"; }
+                else { style = style + ";justify-content:flex-start"; }
+            }
         }
-        if (o.Has("alignItems")) {
-            int ai = o.Int("alignItems", 0);
-            if (ai == 1) { style = style + ";align-items:center"; }
-            else if (ai == 2) { style = style + ";align-items:flex-end"; }
-            else if (ai == 3) { style = style + ";align-items:stretch"; }
-            else { style = style + ";align-items:flex-start"; }
+        if (o.Has("alignItems") || o.Has("align-items")) {
+            string aStr = o.Str("alignItems", o.Str("align-items", ""));
+            if (aStr != "") {
+                if (aStr == "0" || aStr == "1" || aStr == "2" || aStr == "3" || aStr == "4") {
+                    int aiNum = Convert.ToInt32(aStr);
+                    if (aiNum == 1) { style = style + ";align-items:center"; }
+                    else if (aiNum == 2) { style = style + ";align-items:flex-end"; }
+                    else if (aiNum == 3) { style = style + ";align-items:stretch"; }
+                    else if (aiNum == 4) { style = style + ";align-items:baseline"; }
+                    else { style = style + ";align-items:flex-start"; }
+                } else {
+                    style = style + ";align-items:" + aStr;
+                }
+            } else {
+                int ai = o.Int("alignItems", 0);
+                if (ai == 1) { style = style + ";align-items:center"; }
+                else if (ai == 2) { style = style + ";align-items:flex-end"; }
+                else if (ai == 3) { style = style + ";align-items:stretch"; }
+                else if (ai == 4) { style = style + ";align-items:baseline"; }
+                else { style = style + ";align-items:flex-start"; }
+            }
         }
-        if (o.Has("flexWrap") && o.Bool("flexWrap", false)) {
-            style = style + ";flex-wrap:wrap";
+        if (o.Has("flexWrap") || o.Has("flex-wrap")) {
+            string wStr = o.Str("flex-wrap", "");
+            if (wStr != "") {
+                style = style + ";flex-wrap:" + wStr;
+            } else if (o.Bool("flexWrap", false) || o.Int("flexWrap", 0) == 1) {
+                style = style + ";flex-wrap:wrap";
+            }
         }
         if (style != "") { ctl.SetProp("style", style); }
         if (o.Has("padding")) { ctl.logPad = o.Int("padding", 0); }

@@ -45,43 +45,46 @@ public partial class App {
     // 逐像素 alpha 组合（无 DWM 时回退为区域，仍兼容 Win7）；
     // 所有区域之外的区域对绘制和点击都透明。
     // 与原生玻璃互斥。在 Run 之前调用。
-    void SetWindowShape(string spec) {
-        shapeSpec = spec;
-        this.ParseShapeSpec(spec);
-        // 新规格以 (0,0) 为原点，重置阴影带偏移（SetWindowShadow
-        // 在此外扩时会把整份规格平移并再次累加偏移）。
-        shapeOffX = 0;
-        shapeOffY = 0;
-        if (spec.Length == 0) {
+    // 强类型窗口几何与形状排版协议设置（推荐）
+    void SetWindowShape(WindowShapeDescription desc) {
+        if (desc == null || desc.IsEmpty()) {
+            shapeDescription = WindowShapeDescription.Empty();
+            shapeSpec = "";
+            shapeRegions = new List<WindowShapeRegion>();
             shapeMode = 0;
             shapeRadius = 0;
+            shapeShadow = 0;
+            shapeOffX = 0;
+            shapeOffY = 0;
         } else {
+            shapeDescription = desc.Clone();
+            shapeSpec = shapeDescription.ToSpec();
+            shapeRegions = shapeDescription.regions;
             shapeMode = 1;
-            shapeRadius = 0;
-            // 暴露首个非阴影带（kind!=3）有效内容区域的圆角半径，供 WindowShapeRadius() 使用。
-            // 若包含类型 3 阴影带（例如最大化恢复带阴影规格），同步恢复原点偏移。
-            if (shapeRegions != null) {
-                for (int i = 0; i < shapeRegions.Count; i = i + 1) {
-                    WindowShapeRegion r = shapeRegions[i];
-                    if (r.kind == 3) {
-                        shapeOffX = r.radius;
-                        shapeOffY = r.radius;
-                    } else if (shapeRadius == 0) {
-                        shapeRadius = r.radius;
-                    }
-                }
-            }
+            shapeRadius = shapeDescription.GetEffectiveRadius();
+            shapeShadow = shapeDescription.shadow;
+            shapeOffX = shapeDescription.offsetX;
+            shapeOffY = shapeDescription.offsetY;
         }
+
         if (shapeMode != 0 && glassNative) {
             window.DisableGlass();
             glassNative = false;
         }
-        window.SetShape(spec);
+        window.SetShapeDescription(shapeDescription);
         // 异形窗口轮廓自带圆角（掩码/区域几何），DWM 圆角不参与；
         // 恢复矩形（spec = ""）时按需恢复上一请求的圆角策略。
-        if (spec.Length == 0) { this.ApplyRoundCorners(); }
+        if (shapeMode == 0) { this.ApplyRoundCorners(); }
         this.NoteRedrawWhy("SetWindowShape");
         needsRedraw = true;
+    }
+
+    // 窗口轮廓为各形状区域的并集。`spec` 为
+    // 逻辑像素下的 "t,x,y,w,h,r;t,x,y,w,h,r;..."：类型 1 = 圆角矩形
+    // （r = 圆角半径），类型 2 = 椭圆（w/h = 包围盒）。"" 恢复
+    // 为普通不透明矩形。兼容旧接口：由 ParseSpec 统一进入强类型协议。
+    void SetWindowShape(string spec) {
+        this.SetWindowShape(WindowShapeDescription.ParseSpec(spec));
     }
 
     // 围绕异形轮廓的柔和投影。`px` 是阴影的逻辑
@@ -94,64 +97,23 @@ public partial class App {
     void SetWindowShadow(int px) {
         if (px < 0) { px = 0; }
         shapeShadow = px;
-        if (px > 0 && shapeMode != 0 && shapeSpec.Length > 0
-                && !this.HasShadowBand()) {
-            int minX = 2147483647;
-            int minY = 2147483647;
-            int maxX = 0 - 2147483647 - 1;
-            int maxY = 0 - 2147483647 - 1;
-            if (shapeRegions != null) {
-                for (int ri = 0; ri < shapeRegions.Count; ri = ri + 1) {
-                    WindowShapeRegion reg = shapeRegions[ri];
-                    if (reg.kind != 3) {
-                        int x = reg.x;
-                        int y = reg.y;
-                        int x2 = x + reg.width;
-                        int y2 = y + reg.height;
-                        if (x < minX) { minX = x; }
-                        if (y < minY) { minY = y; }
-                        if (x2 > maxX) { maxX = x2; }
-                        if (y2 > maxY) { maxY = y2; }
-                    }
-                }
+        if (shapeDescription == null) {
+            shapeDescription = WindowShapeDescription.ParseSpec(shapeSpec);
+        }
+        if (px > 0 && shapeMode != 0 && !shapeDescription.IsEmpty()) {
+            WindowShapeDescription withShadow = shapeDescription.WithShadow(px);
+            this.SetWindowShape(withShadow);
+        } else if (px == 0 && shapeMode != 0 && shapeDescription.HasShadowBand()) {
+            // 清除阴影带恢复原本几何
+            WindowShapeDescription clean = new WindowShapeDescription();
+            int offX = shapeOffX;
+            int offY = shapeOffY;
+            for (int i = 0; i < shapeDescription.regions.Count; i = i + 1) {
+                WindowShapeRegion reg = shapeDescription.regions[i];
+                if (reg.kind == WindowShapeKind.ShadowBand) { continue; }
+                clean.regions.Add(new WindowShapeRegion(reg.kind, reg.x - offX, reg.y - offY, reg.width, reg.height, reg.radius));
             }
-            if (minX <= maxX && minY <= maxY && shapeRegions != null) {
-                // FitShapeWindow 拒绝负坐标的包围盒（"超出窗口上方/
-                // 左方的形状保持不变"），外扩必须同时平移：把整份
-                // 规格平移 (px, px)，band 从 (0,0) 起，内容轮廓
-                // 相应右移下移，屏幕上的合成结果不变。
-                StringBuilder shifted = new StringBuilder();
-                for (int ri = 0; ri < shapeRegions.Count; ri = ri + 1) {
-                    WindowShapeRegion reg = shapeRegions[ri];
-                    if (reg.kind == 3) { continue; }
-                    if (shifted.Length > 0) { shifted.Append(";"); }
-                    shifted.Append(Convert.ToString(reg.kind));
-                    shifted.Append(",");
-                    shifted.Append(Convert.ToString(reg.x - minX + px));
-                    shifted.Append(",");
-                    shifted.Append(Convert.ToString(reg.y - minY + px));
-                    shifted.Append(",");
-                    shifted.Append(Convert.ToString(reg.width));
-                    shifted.Append(",");
-                    shifted.Append(Convert.ToString(reg.height));
-                    shifted.Append(",");
-                    shifted.Append(Convert.ToString(reg.radius));
-                }
-                string band = "3,0,0,"
-                    + Convert.ToString(maxX - minX + px * 2) + ","
-                    + Convert.ToString(maxY - minY + px * 2) + ","
-                    + Convert.ToString(px);
-                shapeSpec = band + ";" + shifted.ToString();
-                this.ParseShapeSpec(shapeSpec);
-                // 记下内容轮廓的新原点：PaintShapeShadow / PaintShapeFill /
-                // RenderChrome 都按 (shapeOffX, shapeOffY) 定位。
-                shapeOffX = px;
-                shapeOffY = px;
-                window.SetShape(shapeSpec);
-            }
-        } else if (px > 0 && this.HasShadowBand()) {
-            shapeOffX = px;
-            shapeOffY = px;
+            this.SetWindowShape(clean);
         }
         this.NoteRedrawWhy("SetWindowShadow");
         needsRedraw = true;
@@ -159,33 +121,21 @@ public partial class App {
 
     // 当形状规格已包含类型 3 阴影带区域时返回 true。
     bool HasShadowBand() {
+        if (shapeDescription != null) {
+            return shapeDescription.HasShadowBand();
+        }
         if (shapeRegions != null) {
             for (int ri = 0; ri < shapeRegions.Count; ri = ri + 1) {
-                if (shapeRegions[ri].kind == 3) { return true; }
+                if (shapeRegions[ri].kind == WindowShapeKind.ShadowBand) { return true; }
             }
         }
         return false;
     }
 
-    // 将形状规格解析为 shapeRegions（由 SetWindowShape 与
-    // SetWindowShadow 自动前置的阴影带共用）。
+    // 将形状规格解析为 shapeRegions（兼容保留供反射与测试调用）。
     void ParseShapeSpec(string spec) {
-        shapeRegions = new List<WindowShapeRegion>();
-        if (spec.Length > 0) {
-            List<string> parts = spec.Split(";");
-            for (int i = 0; i < parts.Count; i = i + 1) {
-                List<string> nums = parts[i].Split(",");
-                if (nums.Count >= 6) {
-                    int k = Convert.ToInt32(nums[0]);
-                    int x = Convert.ToInt32(nums[1]);
-                    int y = Convert.ToInt32(nums[2]);
-                    int w = Convert.ToInt32(nums[3]);
-                    int h = Convert.ToInt32(nums[4]);
-                    int r = Convert.ToInt32(nums[5]);
-                    shapeRegions.Add(new WindowShapeRegion(k, x, y, w, h, r));
-                }
-            }
-        }
+        WindowShapeDescription desc = WindowShapeDescription.ParseSpec(spec);
+        shapeRegions = desc.regions;
     }
 
     // 异形轮廓的阴影扩展范围（逻辑像素，0 = 无）。
