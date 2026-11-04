@@ -1,0 +1,110 @@
+using System;
+using System.Data.ZanDb;
+using System.Json;
+using System.IO;
+
+// 块缓存驱逐一致性用例：默认 32MiB 缓存上限，小行大批量
+// （约 2500 块 > cap）触发驱逐路径。历史缺陷：Insert 返回的
+// pin 未置 pins=1，cap 触发的回收把「使用中」新块当闲置块
+// buf.Free()，点查拿到已释放缓冲静默 miss。钉死：驱逐发生后
+// 全键点查零丢失、驱逐前后读取一致、重开一致。输出确定性，
+// 与 zandb_cacheevict.out 比对。
+class ZanDbCacheEvictTest {
+    static int checks = 0;
+
+    static void Ok(bool cond, string what) {
+        checks = checks + 1;
+        if (cond) {
+            Console.WriteLine("ok " + Convert.ToString(checks) + " - " + what);
+        } else {
+            Console.WriteLine("FAIL " + Convert.ToString(checks) + " - " + what);
+        }
+    }
+
+    static void Clean(string basePath) {
+        File.Delete(basePath);
+        File.Delete(basePath + ".m0");
+        File.Delete(basePath + ".m1");
+        for (int i = 0; i < 40; i = i + 1) {
+            File.Delete(basePath + ".s" + Convert.ToString(i));
+        }
+    }
+
+    static JsonValue Doc(int i) {
+        JsonValue doc = JsonValue.NewObject();
+        doc.Put("name", JsonValue.NewStr("row" + Convert.ToString(i)));
+        JsonValue arr = JsonValue.NewArray();
+        for (int j = 0; j < 200; j = j + 1) {
+            arr.Append(JsonValue.NewDouble((double)(float)(((i * 7 + j * 13) % 200) / 100.0 - 1.0)));
+        }
+        doc.Put("vec", arr);
+        return doc;
+    }
+
+    static void Main() {
+        string path = "_scratch/zandb_cacheevict_tmp.zdb";
+        Directory.CreateDirectory("_scratch");
+        Clean(path);
+
+        ZanDatabase db = ZanDatabase.Open(path, ZanStore.DUR_SYNC);
+        Ok(db.IsOpen(), "open");
+        Collection docs = db.GetCollection("docs");
+
+        // ~1500 字节/行 × 16 行/块 ≈ 24KB/块；36000 行 ≈ 2250 块
+        // ≈ 55MB，越过 32MiB 默认 cap，驱逐路径必经。
+        int n = 36000;
+        List<JsonValue> batch = new List<JsonValue>();
+        for (int i = 0; i < n; i = i + 1) {
+            batch.Add(Doc(i));
+            if (batch.Count == 4000) {
+                docs.InsertBulk(batch);
+                batch = new List<JsonValue>();
+            }
+        }
+        if (batch.Count > 0) { docs.InsertBulk(batch); }
+        Ok(docs.Count() == n, "inserted 36000 rows");
+
+        // 全键点查：驱逐路径上的读取必须零丢失且内容匹配。
+        int missing = 0;
+        int mismatch = 0;
+        int firstBad = -1;
+        for (int i = 1; i <= n; i = i + 1) {
+            JsonValue doc = docs.FindById(i);
+            if (doc == null) {
+                if (firstBad < 0) { firstBad = i; }
+                missing = missing + 1;
+                continue;
+            }
+            JsonValue vec = doc.Get("vec");
+            if (vec == null || vec.Count() != 200 || vec.At(0).AsDouble(-9) != (double)(float)((((i - 1) * 7) % 200) / 100.0 - 1.0)) {
+                if (firstBad < 0) {
+                    firstBad = i;
+                }
+                mismatch = mismatch + 1;
+            }
+        }
+        Ok(missing == 0, "no missing rows under cache eviction");
+        Ok(mismatch == 0, "no content mismatch under cache eviction");
+
+        // 跨 cap 边界的第二次全量读（缓存已稳定）。
+        int second = 0;
+        for (int i = 1; i <= n; i = i + 1) {
+            if (docs.FindById(i) == null) { second = second + 1; }
+        }
+        Ok(second == 0, "second full pass also clean");
+
+        // 重开（缓存重建）后一致。
+        db.Close();
+        db = ZanDatabase.Open(path, ZanStore.DUR_SYNC);
+        docs = db.GetCollection("docs");
+        int reopened = 0;
+        for (int i = 1; i <= n; i = i + 1) {
+            if (docs.FindById(i) == null) { reopened = reopened + 1; }
+        }
+        Ok(reopened == 0 && docs.Count() == n, "reopen clean");
+
+        db.Close();
+        Clean(path);
+        Console.WriteLine("done " + Convert.ToString(checks));
+    }
+}
