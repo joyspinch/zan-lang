@@ -1,0 +1,133 @@
+using System;
+using System.Data.ZanDb;
+using System.Json;
+using System.IO;
+
+// 行视图指针 tape 解码（刀4）一致性用例：零拷贝段游标行不经
+// 整行字符串物化直接走读。双路径等价——指针快答与字符串权威
+// 走读在同一数据集上逐字段比对；转义行（值含 0x00/null、kid>127、
+// 嵌入控制字节的字符串）、退化模式（多源归并）全部钉死。
+// 输出确定性，与 zandb_ptrdecode.out 比对。
+class ZanDbPtrDecodeTest {
+    static int checks = 0;
+
+    static void Ok(bool cond, string what) {
+        checks = checks + 1;
+        if (cond) {
+            Console.WriteLine("ok " + Convert.ToString(checks) + " - " + what);
+        } else {
+            Console.WriteLine("FAIL " + Convert.ToString(checks) + " - " + what);
+        }
+    }
+
+    static void Clean(string basePath) {
+        File.Delete(basePath);
+        File.Delete(basePath + ".m0");
+        File.Delete(basePath + ".m1");
+        for (int i = 0; i < 40; i = i + 1) {
+            File.Delete(basePath + ".s" + Convert.ToString(i));
+        }
+    }
+
+    static JsonValue Doc(int i) {
+        JsonValue doc = JsonValue.NewObject();
+        doc.Put("city", JsonValue.NewStr(i % 2 == 0 ? "sh" : "bj"));
+        doc.Put("age", JsonValue.NewInt(20 + (i % 40)));
+        doc.Put("score", JsonValue.NewDouble((double)(i % 7) + 0.5));
+        doc.Put("active", JsonValue.NewBool(i % 3 == 0));
+        doc.Put("note", JsonValue.NewStr("note-" + Convert.ToString(i)));
+        // 转义行触发源：null（tag 0 → 0x00）与 >127 的键字典 id。
+        if (i % 4 == 0) { doc.Put("remark", JsonValue.NewNull()); }
+        doc.Put("zzz" + Convert.ToString(200 + i % 3), JsonValue.NewStr("tail" + Convert.ToString(i)));
+        return doc;
+    }
+
+    static void Main() {
+        string path = "_scratch/zandb_ptrdecode_tmp.zdb";
+        Directory.CreateDirectory("_scratch");
+        Clean(path);
+
+        ZanDatabase db = ZanDatabase.Open(path, ZanStore.DUR_SYNC);
+        Ok(db.IsOpen(), "open");
+        Collection users = db.GetCollection("users");
+
+        // >127 字典 id 行 + null 字段行 + 控制字符行并存：常态
+        // 直读与转义回退两条路径都要踩到。
+        for (int i = 0; i < 40; i = i + 1) {
+            users.Insert(Doc(i));
+        }
+        JsonValue ctrl = JsonValue.NewObject();
+        ctrl.Put("city", JsonValue.NewStr("cx"));
+        ctrl.Put("note", JsonValue.NewStr("a\u0001b"));
+        ctrl.Put("age", JsonValue.NewInt(1));
+        users.Insert(ctrl);
+        Ok(users.Count() == 41, "inserted 41 docs");
+
+        // 1) FieldEqualsRow 指针快答：字符串零分配比较、整数直比、
+        //    布尔字面比；转义行回退权威走读。口径 = CountByField。
+        Ok(users.CountByField("city", "sh") == 20, "city=sh count via fast path");
+        Ok(users.CountByField("city", "cx") == 1, "city=cx count on control-char row");
+        Ok(users.CountByField("age", "20") == 1, "integer equality on escaped row (authority)");
+        Ok(users.CountByField("age", "21") == 1, "integer equality via pointer compare");
+        Ok(users.CountByField("active", "true") == 14, "boolean equality via pointer");
+        Ok(users.CountByField("note", "note-7") == 1, "string needle equality");
+        Ok(users.CountByField("note", "a\u0001b") == 1, "needle with control byte");
+        Ok(users.CountByField("score", "0.5") == 6, "text-number equality");
+
+        // 2) FieldOfRow 指针物化（ScanField 走行视图）vs 点查权威
+        //    解码：全行全字段比对。
+        Dictionary<int, long> ages = new Dictionary<int, long>();
+        users.ScanField("age", (int id, JsonValue v) => {
+            ages.Add(id, v.AsInt(-1));
+            return true;
+        });
+        Ok(ages.Count == 41, "ScanField visits every row");
+        bool mismatch = false;
+        List<int> ids = ages.Keys;
+        for (int i = 0; i < ids.Count; i = i + 1) {
+            JsonValue doc = users.FindById(ids[i]);
+            JsonValue age = doc.Get("age");
+            if (age == null || age.AsInt(-2) != ages[ids[i]]) { mismatch = true; }
+        }
+        Ok(!mismatch, "FieldOfRow age matches point-get on all rows");
+
+        // 3) FieldNumPtr 直还原（ScanNumField/SumField）vs 手工累加；
+        //    FieldTextPtr 直取（ScanStrField/CountGroups）含转义行。
+        long sum = users.SumField("age");
+        long manual = 0;
+        for (int i = 0; i < 40; i = i + 1) { manual = manual + 20 + (i % 40); }
+        manual = manual + 1;  // 控制字符行 age=1
+        Ok(sum == manual, "SumField via pointer walk: " + Convert.ToString(sum));
+        List<string> texts = new List<string>();
+        users.ScanStrField("city", (int id, string s) => {
+            texts.Add(s);
+            return true;
+        });
+        Ok(texts.Count == 41, "ScanStrField visits every row");
+
+        // 4) FindRange 分组走 FieldTextRow（含转义行回退）。
+        Dictionary<string, int> groups = users.CountGroups("city");
+        int total = 0;
+        List<string> keys = groups.Keys;
+        for (int i = 0; i < keys.Count; i = i + 1) { total = total + groups[keys[i]]; }
+        Ok(total == 41 && groups.ContainsKey("sh") && groups.ContainsKey("cx"),
+        "field groups cover all rows including escaped ones");
+
+        // 5) 归并成多段后（段游标零拷贝路径为常态）再验一轮。
+        db.Flush();
+        db.MergeSegments();
+        Ok(users.CountByField("city", "sh") == 20, "count stable after merge");
+        Ok(users.SumField("age") == manual, "SumField stable after merge");
+        List<int> hits = users.FindIdsByField("note", "a\u0001b");
+        Ok(hits.Count == 1, "control-char needle after merge");
+
+        // 6) 删除后墓碑不参与计数/投影。
+        users.DeleteById(ids[0]);
+        Ok(users.CountByField("city", "sh") == 19, "count excludes tombstone");
+        Ok(users.SumField("age") == manual - 20, "sum excludes tombstone");
+
+        db.Close();
+        Clean(path);
+        Console.WriteLine("done " + Convert.ToString(checks));
+    }
+}

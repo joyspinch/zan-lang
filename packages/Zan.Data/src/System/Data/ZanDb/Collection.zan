@@ -637,19 +637,60 @@ public class Collection {
     }
 
     // <see cref="FieldEquals"/> 的行视图版：满足
-    // <see cref="EqFastReject"/> 的 needle 先做针线否证（零物化），
-    // 未否决才物化值走权威走读；不满足直接走权威走读。
+    // <see cref="EqFastReject"/> 的 needle 先做针线否证（零物化）；
+    // 零拷贝段游标行走 <see cref="FieldEqualsPtr"/> 指针快答
+    // （字符串零分配比较、整数直比），转义/非直比形态回退权威
+    // 走读；不满足或退化模式直接走权威走读。
     public bool FieldEqualsRow(ScanRow row, int kid, string val, bool fastReject) {
         if (kid == 0) { return false; }
         if (fastReject && row.Block() != null && NeedleAbsent(row, val)) { return false; }
+        if (row.Block() != null) {
+            int verdict = Collection.FieldEqualsPtr(row.ValPtr(), 0, row.ValLen(), kid, val);
+            if (verdict == 1) { return true; }
+            if (verdict == 0) { return false; }
+        }
         return FieldEquals(row.Val(), kid, val);
     }
 
-    // <see cref="FieldOf"/> 的行视图版：值按需物化，
-    // 走读落在静态字符串路径（物化实测比 ByteBuffer 有状态
-    // 方法逐字节走读便宜）。
+    // <see cref="FieldNum"/> 的行视图版：零拷贝段游标行走
+    // <see cref="FieldNumPtr"/> 指针直还原，转义/异常回退权威走读；
+    // 退化模式直接走字符串路径。
+    public bool FieldNumRow(ScanRow row, int kid, out long v) {
+        v = 0;
+        if (kid == 0) { return false; }
+        if (row.Block() != null) {
+            int verdict = Collection.FieldNumPtr(row.ValPtr(), row.ValLen(), kid, out v);
+            if (verdict == 1) { return true; }
+            if (verdict == 0) { return false; }
+            v = 0;
+        }
+        return FieldNum(row.Val(), kid, out v);
+    }
+
+    // <see cref="FieldText"/> 的行视图版：零拷贝段游标行走
+    // <see cref="FieldTextPtr"/> 指针直取，转义/异常回退权威走读；
+    // 退化模式直接走字符串路径。
+    public string FieldTextRow(ScanRow row, int kid) {
+        if (kid == 0) { return null; }
+        if (row.Block() != null) {
+            string s;
+            int verdict = Collection.FieldTextPtr(row.ValPtr(), row.ValLen(), kid, out s);
+            if (verdict == 1) { return s; }
+            if (verdict == 0) { return null; }
+        }
+        return FieldText(row.Val(), kid);
+    }
+
+    // <see cref="FieldOf"/> 的行视图版：零拷贝段游标行直接在
+    // 块缓冲上指针走读（免整行字符串物化），转义/格式异常回退
+    // 权威走读；退化模式（无块缓冲）直接走字符串路径。
     public JsonValue FieldOfRow(ScanRow row, int kid) {
         if (kid == 0) { return null; }
+        if (row.Block() == null) { return FieldOf(row.Val(), kid); }
+        JsonValue value;
+        int verdict = this.FieldValuePtr(row.ValPtr(), row.ValLen(), kid, out value);
+        if (verdict == 1) { return value; }
+        if (verdict == 0) { return null; }
         return FieldOf(row.Val(), kid);
     }
 
@@ -711,6 +752,176 @@ public class Collection {
         return null;
     }
 
+    // ===== 行视图指针解码：段游标零拷贝行直接在块缓冲上走读，=====
+    // 免整行字符串物化（行视图此前每行经 row.Val() 物化一次串 +
+    // 一次转义探测 memchr）。仅声音于不含转义（值区无 0xFF）的
+    // 行——一次 memchr 检出即回退字符串权威走读（与
+    // <see cref="RecAccNum"/> 的回退口径一致）；容器字段（tag 6/7）
+    // 跳读不支持同样回退（<see cref="SkipValRaw"/> 口径）。退化
+    // 模式（BindMem，无块缓冲）直接走字符串路径。basePtr 一律为
+    // 值起点，p/end 为相对偏移——与 ReadVarIntRaw/SkipValRaw 的
+    // 现有契约对齐。
+
+    // 行视图字段定位：1 = 命中（p 指向 tag 字节，未消费）、
+    // 0 = 字段缺失、-1 = 转义/格式异常（调用方回退权威走读）。
+    public static int FieldLocatePtr(nint basePtr, int valLen, int kid, out int p) {
+        p = 0;
+        if (valLen < 1 || Collection.PeekB(basePtr) != 66) { return -1; }
+        if (Collection.MemChr(basePtr, 255, valLen) != 0) { return -1; }
+        int end = valLen;
+        p = 1;
+        long n = Collection.ReadVarIntRaw(basePtr, ref p, end);
+        if (n < 0 || n > 4096) { return -1; }
+        for (int i = 0; i < (int)n; i = i + 1) {
+            long k = Collection.ReadVarIntRaw(basePtr, ref p, end);
+            if (k < 0) { return -1; }
+            if ((int)k == kid) {
+                if (p >= end) { return -1; }
+                return 1;
+            }
+            if (!Collection.SkipValRaw(basePtr, ref p, end)) { return -1; }
+        }
+        return 0;
+    }
+
+    // 指针版值物化（<see cref="ReadValS"/> 的裸指针对偶）：
+    // 字符串载荷零转写取出（GetString 直读块缓冲），嵌套容器
+    // 递归。格式异常返回 null（调用方回退权威走读）。
+    public JsonValue ReadValPtr(nint basePtr, int p, int end, out int np) {
+        np = p;
+        if (p >= end) { return null; }
+        int tag = Collection.PeekB(basePtr + p);
+        p = p + 1;
+        if (tag == 0) { np = p; return JsonValue.NewNull(); }
+        if (tag == 1) { np = p; return JsonValue.NewBool(false); }
+        if (tag == 2) { np = p; return JsonValue.NewBool(true); }
+        if (tag == 3) {
+            long v = Collection.ReadVarIntRaw(basePtr, ref p, end);
+            if (v < 0) { return null; }
+            np = p;
+            return JsonValue.NewNum(Convert.ToString(v));
+        }
+        if (tag == 8) {
+            long v = Collection.ReadVarIntRaw(basePtr, ref p, end);
+            if (v < 0) { return null; }
+            np = p;
+            return JsonValue.NewNum(Convert.ToString(0 - v));
+        }
+        if (tag == 9) { np = p; return JsonValue.NewNum("0"); }
+        if (tag == 4 || tag == 5) {
+            long len = Collection.ReadVarIntRaw(basePtr, ref p, end);
+            if (len < 0 || p + (int)len > end) { return null; }
+            string t = NativeMemory.GetString(basePtr, p, (int)len);
+            p = p + (int)len;
+            np = p;
+            if (tag == 4) { return JsonValue.NewNum(t); }
+            return JsonValue.NewStr(t);
+        }
+        if (tag == 10) { np = p; return JsonValue.NewStr(""); }
+        if (tag == 6) {
+            long c = Collection.ReadVarIntRaw(basePtr, ref p, end);
+            if (c < 0) { return null; }
+            JsonValue a = JsonValue.NewArray();
+            for (int i = 0; i < (int)c; i = i + 1) {
+                JsonValue v = this.ReadValPtr(basePtr, p, end, out p);
+                if (v == null) { return null; }
+                a.Append(v);
+            }
+            np = p;
+            return a;
+        }
+        if (tag == 7) {
+            long c = Collection.ReadVarIntRaw(basePtr, ref p, end);
+            if (c < 0) { return null; }
+            JsonValue obj = JsonValue.NewObject();
+            for (int i = 0; i < (int)c; i = i + 1) {
+                long k = Collection.ReadVarIntRaw(basePtr, ref p, end);
+                if (k < 0) { return null; }
+                JsonValue v = this.ReadValPtr(basePtr, p, end, out p);
+                if (v == null) { return null; }
+                obj.Set(this.KeyName((int)k), v);
+            }
+            np = p;
+            return obj;
+        }
+        return null;
+    }
+
+    // 行视图单字段物化（<see cref="FieldOf"/> 的裸指针对偶）：
+    // 1 = value 就绪、0 = 字段缺失（null）、-1 = 回退权威。
+    public int FieldValuePtr(nint basePtr, int valLen, int kid, out JsonValue value) {
+        value = null;
+        int verdict = Collection.FieldLocatePtr(basePtr, valLen, kid, out int p);
+        if (verdict != 1) { return verdict; }
+        value = this.ReadValPtr(basePtr, p, valLen, out p);
+        return value != null ? 1 : -1;
+    }
+
+    // 行视图数值形态（<see cref="FieldNum"/> 的裸指针对偶）：
+    // 1 = 数值就绪、0 = 非数值或缺字段、-1 = 回退权威。
+    public static int FieldNumPtr(nint basePtr, int valLen, int kid, out long v) {
+        v = 0;
+        int verdict = Collection.FieldLocatePtr(basePtr, valLen, kid, out int p);
+        if (verdict != 1) { return verdict; }
+        int end = valLen;
+        int tag = Collection.PeekB(basePtr + p);
+        p = p + 1;
+        if (tag == 3) {
+            long x = Collection.ReadVarIntRaw(basePtr, ref p, end);
+            if (x < 0) { return -1; }
+            v = x;
+            return 1;
+        }
+        if (tag == 8) {
+            long x = Collection.ReadVarIntRaw(basePtr, ref p, end);
+            if (x < 0) { return -1; }
+            v = 0 - x;
+            return 1;
+        }
+        if (tag == 9) { v = 0; return 1; }
+        if (tag == 4) {
+            long len = Collection.ReadVarIntRaw(basePtr, ref p, end);
+            if (len < 0 || p + (int)len > end) { return -1; }
+            v = NativeMemory.GetString(basePtr, p, (int)len).ToInt64();
+            return 1;
+        }
+        return 0;
+    }
+
+    // 行视图文本形态（<see cref="FieldText"/> 的裸指针对偶）：
+    // 1 = 文本就绪、0 = 无文本形态或缺字段、-1 = 回退权威。
+    public static int FieldTextPtr(nint basePtr, int valLen, int kid, out string s) {
+        s = null;
+        int verdict = Collection.FieldLocatePtr(basePtr, valLen, kid, out int p);
+        if (verdict != 1) { return verdict; }
+        int end = valLen;
+        int tag = Collection.PeekB(basePtr + p);
+        p = p + 1;
+        if (tag == 5 || tag == 4) {
+            long len = Collection.ReadVarIntRaw(basePtr, ref p, end);
+            if (len < 0 || p + (int)len > end) { return -1; }
+            s = NativeMemory.GetString(basePtr, p, (int)len);
+            return 1;
+        }
+        if (tag == 10) { s = ""; return 1; }
+        if (tag == 3) {
+            long x = Collection.ReadVarIntRaw(basePtr, ref p, end);
+            if (x < 0) { return -1; }
+            s = Convert.ToString(x);
+            return 1;
+        }
+        if (tag == 8) {
+            long x = Collection.ReadVarIntRaw(basePtr, ref p, end);
+            if (x < 0) { return -1; }
+            s = Convert.ToString(0 - x);
+            return 1;
+        }
+        if (tag == 9) { s = "0"; return 1; }
+        if (tag == 1) { s = "false"; return 1; }
+        if (tag == 2) { s = "true"; return 1; }
+        return 0;
+    }
+
     // 数值字段投影扫描：每条含 field 的文档以 (id, 数值)
     // 调用一次 visit，不构建任何 JsonValue（varint 直接还原，
     // 文本数值才解析）；visit 返回 false 提前结束。返回 visit
@@ -723,7 +934,7 @@ public class Collection {
         int n = 0;
         this.kv.ScanRows("c:" + this.name + ":", hi, delegate(ScanRow row) {
             long v;
-            if (FieldNum(row.Val(), kid, out v)) {
+            if (FieldNumRow(row, kid, out v)) {
                 n = n + 1;
                 if (!visit(Collection.IdOfKey(row.Key()), v)) { return false; }
             }
@@ -742,7 +953,7 @@ public class Collection {
         string hi = "c:" + this.name + ";";
         int n = 0;
         this.kv.ScanRows("c:" + this.name + ":", hi, delegate(ScanRow row) {
-            string s = FieldText(row.Val(), kid);
+            string s = FieldTextRow(row, kid);
             if (s != null) {
                 n = n + 1;
                 if (!visit(Collection.IdOfKey(row.Key()), s)) { return false; }
@@ -794,7 +1005,7 @@ public class Collection {
         string fromKey = kernelN >= 0 ? DocKey((int)skipUntilId[0] + 1) : lo;
         this.kv.ScanRows(fromKey, hi, delegate(ScanRow row) {
             long v;
-            if (FieldNum(row.Val(), kid, out v)) { sum = sum + v; }
+            if (FieldNumRow(row, kid, out v)) { sum = sum + v; }
             return true;
         });
         return sum;
@@ -876,7 +1087,7 @@ public class Collection {
         }
         string docHi = "c:" + this.name + ";";
         this.kv.ScanRows("c:" + this.name + ":", docHi, delegate(ScanRow row) {
-            string s = FieldText(row.Val(), kid);
+            string s = FieldTextRow(row, kid);
             if (s != null) {
                 int c;
                 if (groups.TryGetValue(s, out c)) {
@@ -1729,7 +1940,7 @@ public class Collection {
         // 内核让出部分行：剩余行走权威路径（有界：本集合段内）。
         this.kv.ScanRows(DocKey(fromId), hi, delegate(ScanRow row) {
             long x;
-            if (FieldNum(row.Val(), kid, out x)) { acc.Add(x); }
+            if (FieldNumRow(row, kid, out x)) { acc.Add(x); }
             return true;
         });
         return true;
@@ -1755,7 +1966,7 @@ public class Collection {
         // 内核不可用（多源/未固化数据）：全量权威路径。
         this.kv.ScanRows("c:" + this.name + ":", hi, delegate(ScanRow row) {
             long x;
-            if (FieldNum(row.Val(), kid, out x)) {
+            if (FieldNumRow(row, kid, out x)) {
                 if (!has || x < acc) { acc = x; has = true; }
             }
             return true;
@@ -1782,7 +1993,7 @@ public class Collection {
         }
         this.kv.ScanRows("c:" + this.name + ":", hi, delegate(ScanRow row) {
             long x;
-            if (FieldNum(row.Val(), kid, out x)) {
+            if (FieldNumRow(row, kid, out x)) {
                 if (!has || x > acc) { acc = x; has = true; }
             }
             return true;
@@ -1807,7 +2018,7 @@ public class Collection {
         string hi = "c:" + this.name + ";";
         this.kv.ScanRows("c:" + this.name + ":", hi, delegate(ScanRow row) {
             long x;
-            if (FieldNum(row.Val(), kid, out x)) {
+            if (FieldNumRow(row, kid, out x)) {
                 sum = sum + x;
                 cnt = cnt + 1;
             }
@@ -1831,7 +2042,7 @@ public class Collection {
         string hi = "c:" + this.name + ";";
         this.kv.ScanRows("c:" + this.name + ":", hi, delegate(ScanRow row) {
             long v;
-            if (FieldNum(row.Val(), kid, out v)) {
+            if (FieldNumRow(row, kid, out v)) {
                 int id = Collection.IdOfKey(row.Key());
                 if (heapVal.Count < n) {
                     HeapPush(heapVal, heapId, v, id);
