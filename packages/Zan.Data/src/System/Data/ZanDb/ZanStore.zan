@@ -95,6 +95,19 @@ public class ZanStore {
         return basePath + ".s" + Convert.ToString(id);
     }
 
+    // 基础路径的目录段：无分隔符视为当前目录。
+    public static string DirOf(string basePath) {
+        int cut = -1;
+        for (int i = 0; i < basePath.Length; i = i + 1) {
+            char ch = basePath[i];
+            if (ch == '/' || ch == 92) { cut = i; }  // 92 = 反斜杠
+        }
+        return cut < 0 ? "." : basePath.Substring(0, cut);
+    }
+
+    // 巡检用恒真扫描回调：只驱动逐块 CRC 校验，不收集内容。
+    public static SegVisit KeepVisit = (string key, string val, int op) => { return true; };
+
     // 打开（必要时创建）分组提交档的存储。
     public static ZanStore Open(string path) {
         return ZanStore.Open(path, ZanStore.DUR_GROUP);
@@ -431,7 +444,7 @@ public class ZanStore {
             string v = "";
             this.txPut.TryGetValue(pk[i], out v);
             size = size + 1 + ZanStore.VarIntBytes(pk[i].Length) + pk[i].Length
-                + ZanStore.VarIntBytes(v.Length) + v.Length;
+            + ZanStore.VarIntBytes(v.Length) + v.Length;
             if (size > LogFile.MAX_FRAME) { this.Fail("WAL batch exceeds maximum payload"); return null; }
         }
         ByteBuffer b = ByteBuffer.Alloc((int)size);
@@ -547,6 +560,12 @@ public class ZanStore {
             if (!wtr.Finish()) { this.Fail(wtr.GetError()); return; }
             seg = SegmentFile.Open(segPath);
             if (seg.GetError() != "") { this.Fail(seg.GetError()); return; }
+            // 段目录项持久化后再发布清单：断电最坏留下孤儿段
+            // （同号覆盖），旧槽 + 完整日志仍可恢复。
+            if (!PageFile.DirSync(ZanStore.DirOf(this.basePath))) {
+                this.Fail("segment dir sync failed");
+                return;
+            }
             List<long> ids = this.SegIdList();
             ids.Add(segId);
             // 第一槽成功后新段已可能被引用，之后失败必须保留新段。
@@ -582,10 +601,14 @@ public class ZanStore {
     // 覆盖两个 fallback 槽后，旧段/日志才能退休。第二次失败时
     // 第一份已发布，不可删除它引用的新段，也不可截断/删除旧介质。
     public bool PublishBoth(long logSeq, long nextId, List<long> ids) {
-        if (!this.man.Save(logSeq, nextId, ids) || !this.man.Save(logSeq, nextId, ids)) {
-            this.Fail(this.man.GetError());
+        if (!this.man.Save(logSeq, nextId, ids)) { this.Fail(this.man.GetError()); return false; }
+        // 第一槽目录项持久化后才能发布第二槽：POSIX 上新建文件的
+        // fsync 不保证目录项落盘，两槽皆失等于整库拒开。
+        if (!PageFile.DirSync(ZanStore.DirOf(this.basePath))) {
+            this.Fail("manifest slot dir sync failed");
             return false;
         }
+        if (!this.man.Save(logSeq, nextId, ids)) { this.Fail(this.man.GetError()); return false; }
         return true;
     }
 
@@ -679,7 +702,7 @@ public class ZanStore {
                         decided = true;
                         long curSeg = 0;
                         bool mine = this.index.TryGetValue(minKey, out curSeg)
-                            && ZanStore.IdInList(chosenIds, curSeg);
+                        && ZanStore.IdInList(chosenIds, curSeg);
                         if (c.Op() == 1 && mine && !this.tombstones.ContainsKey(minKey)) {
                             wtr.Add(minKey, c.Val(), 1);
                             mergedIndex.Add(minKey, newId);
@@ -698,6 +721,12 @@ public class ZanStore {
             if (!wtr.Finish()) { this.Fail(wtr.GetError()); return 0; }
             seg = SegmentFile.Open(segPath);
             if (seg.GetError() != "") { this.Fail(seg.GetError()); return 0; }
+            // 段目录项持久化后再发布清单：断电最坏留下孤儿段
+            // （同号覆盖），旧槽 + 完整日志仍可恢复。
+            if (!PageFile.DirSync(ZanStore.DirOf(this.basePath))) {
+                this.Fail("segment dir sync failed");
+                return 0;
+            }
             // 新段载最老数据，列表排前；未归并新段保持相对年龄序。
             List<long> ids = new List<long>();
             ids.Add(newId);
@@ -738,7 +767,7 @@ public class ZanStore {
     public bool WriteReady() {
         if (this.IsOpen()) { return true; }
         this.Fail(this.lastError != "" ? this.lastError
-            : (this.log != null && this.log.GetError() != "" ? this.log.GetError() : "store is closed"));
+        : (this.log != null && this.log.GetError() != "" ? this.log.GetError() : "store is closed"));
         return false;
     }
 
@@ -898,9 +927,9 @@ public class ZanStore {
         List<string> src = this.memtable.Keys;
         if (this.segs.Count == 1 && src.Count == 0) {
             return ScanKernel(this.segs[0].seg, startKey, endKey,
-                delegate(nint basePtr, int keyOff, int keyLen, int valOff, int valLen) {
-                    return true;
-                });
+            delegate(nint basePtr, int keyOff, int keyLen, int valOff, int valLen) {
+                return true;
+            });
         }
         return ScanBetween(startKey, endKey, delegate(string k, string v) {
             return true;
@@ -941,7 +970,7 @@ public class ZanStore {
             int endBlock = blockIdx + 1;
             long spanLen = seg.BlockLen(blockIdx);
             while (endBlock < blockTotal
-                    && spanLen + seg.BlockLen(endBlock) <= ZanStore.KERNEL_SPAN_BYTES) {
+            && spanLen + seg.BlockLen(endBlock) <= ZanStore.KERNEL_SPAN_BYTES) {
                 spanLen = spanLen + seg.BlockLen(endBlock);
                 endBlock = endBlock + 1;
             }
@@ -1059,7 +1088,7 @@ public class ZanStore {
             int endBlock = blockIdx + 1;
             long spanLen = seg.BlockLen(blockIdx);
             while (endBlock < blockTotal
-                    && spanLen + seg.BlockLen(endBlock) <= ZanStore.KERNEL_SPAN_BYTES) {
+            && spanLen + seg.BlockLen(endBlock) <= ZanStore.KERNEL_SPAN_BYTES) {
                 spanLen = spanLen + seg.BlockLen(endBlock);
                 endBlock = endBlock + 1;
             }
