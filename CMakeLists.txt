@@ -1463,6 +1463,28 @@ add_test(NAME diag_method_group_signature_mismatch
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_method_group_signature_mismatch PROPERTIES TIMEOUT 60)
 
+# B-ID151: Method groups cannot be used as values without calling or converting to a delegate.
+# Overload resolution must not fall back to passing function pointers as values.
+add_test(NAME diag_method_group_as_value_rejected
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/method_group_as_value_rejected.zan
+    "-DZANC_ARGS=--auto-stdlib"
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/diag_method_group_as_value_rejected${_exe_ext}
+    "-DEXPECT_REGEX=\\[E2039\\] .Value. is a method, not a value; call it as .Value\\(\\)."
+    -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
+set_tests_properties(diag_method_group_as_value_rejected PROPERTIES TIMEOUT 60)
+
+add_test(NAME diag_method_group_binary_rejected
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/method_group_binary_rejected.zan
+    "-DZANC_ARGS=--auto-stdlib"
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/diag_method_group_binary_rejected${_exe_ext}
+    "-DEXPECT_REGEX=\\[E2039\\] .Value. is a method, not a value; call it as .Value\\(\\)."
+    -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
+set_tests_properties(diag_method_group_binary_rejected PROPERTIES TIMEOUT 60)
+
 # A unary operator applied to a class/struct without a matching overload must
 # fail with a readable diagnostic. The old path fell into the built-in integer
 # arithmetic and subtracted two struct pointers, which the LLVM verifier
@@ -5075,6 +5097,19 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
   set_tests_properties(conformance_gui_docapp PROPERTIES
     TIMEOUT 120 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
 
+  # <include> 组合（B-ID149②）：装载期片段展开 + 片段内事件/绑定照常
+  # 对宿主窗口按名接线。
+  add_test(NAME conformance_gui_include
+    COMMAND ${CMAKE_COMMAND}
+      -DZANC=$<TARGET_FILE:zanc>
+      -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/include_test.zan
+      "-DZANC_ARGS=--embed;tests/gui/include_test.html;--embed;tests/gui/include_frag.html;--auto-stdlib${_gui_driver_tail}"
+      -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_include.out
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_include${_exe_ext}
+      -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+  set_tests_properties(conformance_gui_include PROPERTIES
+    TIMEOUT 120 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+
   # <label> 的 UA 归类契约（A546）：普通 HTML 的 <label> 经 Html.Build
   # 建成 Label 控件（文本自测自绘），块流容器里照常排版；而 UA 表不给
   # label 声明 display——加了 display:block 反而把块流容器里的 Label
@@ -5637,7 +5672,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
     COMMAND ${CMAKE_COMMAND}
       -DZANC=$<TARGET_FILE:zanc>
       -DSRC=${CMAKE_SOURCE_DIR}/tests/templates/trap-cat/single_tap_test.zan
-      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/templates/game/trap-cat/src/TrapCat.html;${CMAKE_SOURCE_DIR}/templates/game/trap-cat/src/TrapCatSprite.zan;${CMAKE_SOURCE_DIR}/templates/game/trap-cat/src/TrapCatBoard.zan;--auto-stdlib;--subsystem;console${_gui_driver_tail}"
+      "-DZANC_ARGS=--embed;templates/game/trap-cat/src/TrapCat.html;${CMAKE_SOURCE_DIR}/templates/game/trap-cat/src/TrapCatSprite.zan;${CMAKE_SOURCE_DIR}/templates/game/trap-cat/src/TrapCatBoard.zan;--auto-stdlib;--subsystem;console${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/trap_cat_single_tap.out
       -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_trap_cat_single_tap${_exe_ext}
       -DSTDLIB_STAMP=${_stdlib_stamp}
@@ -6551,7 +6586,7 @@ add_test(NAME conformance_embed_compress COMMAND ${CMAKE_COMMAND}
 set_tests_properties(conformance_embed_compress PROPERTIES TIMEOUT 180)
 
 # ---- publish-time design html auto-embed ----
-# A project whose source carries the DesignDoc. token gets its src/*.html
+# A project whose source carries the " : Form" window-class token gets its src/*.html
 # discovered and encrypted into the publish image automatically (no
 # --embed). The runner stages a mini project, fails if the design's
 # plaintext survives in the exe, and runs it from a directory without

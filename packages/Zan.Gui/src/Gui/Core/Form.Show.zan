@@ -33,6 +33,20 @@ public partial class Form {
         return this;
     }
 
+    // 归属窗（可选）：`SettingsWin w = new SettingsWin(); w.owner = this;`
+    // 子窗关闭后框架把重绘交还归属窗。
+    public Form owner;
+
+    // 模态子窗：装配（找同名 html → Html.Parse 一跳建树）后进自己的
+    // 消息循环，阻塞到子窗关闭——归属窗的循环嵌在调用栈里自然挂起，
+    // 关闭后恢复并把重绘交还 owner。
+    public void ShowDialog() {
+        this.assembleDoc(false);
+        this.Run();
+        Form host = this.owner;
+        if (host != null) { host.MarkDirty(); }
+    }
+
     // ---- 装配 ----
 
     void assembleDoc(bool offscreen) {
@@ -50,18 +64,31 @@ public partial class Form {
             HtmlDoc doc = Html.Parse(html, "", null);
             tree = doc.root;
             // 窗口键是根元素的普通属性：静态初值读一次，:data-win-* 动态
-            // 绑定走根控件 bindProps 的通用泵。
-            string t = tree.CssAttr("data-win-title");
+            // 绑定走根控件 bindProps 的通用泵。设计稿方言把键写在 body
+            // 上——根优先，两级都看。
+            string t = Form.WinKey(tree, "data-win-title");
             if (t != "") { title = t; }
-            string w = tree.CssAttr("data-win-w");
+            string w = Form.WinKey(tree, "data-win-w");
             if (w != "") { winW = Convert.ToInt32(w); }
-            string h = tree.CssAttr("data-win-h");
+            string h = Form.WinKey(tree, "data-win-h");
             if (h != "") { winH = Convert.ToInt32(h); }
             scopedCss = doc.css;
         }
 
         this.InitForm(title, winW, winH, offscreen);
         App app = this.GetApp();
+        if (html != null && tree != null) {
+            // 旧管线 ConfigureWindow 的窗口键全集里，模板真正用到的
+            // 三键随方言收敛进来（winZoom 旧管线也无消费者，不收）。
+            string center = Form.WinKey(tree, "data-win-center");
+            if (center == "true" || center == "1") { app.CenterWindow(); }
+            string chrome = Form.WinKey(tree, "data-win-chrome");
+            if (chrome == "false" || chrome == "0") { app.SetChromeVisible(false); }
+            string round = Form.WinKey(tree, "data-win-round");
+            if (round == "true" || round == "1") {
+                app.SetWindowShape(WindowShapeDescription.FromEllipse(winW, winH));
+            }
+        }
         if (tree == null) {
             tree = new Panel();
         } else if (scopedCss != "") {
@@ -84,6 +111,18 @@ public partial class Form {
         this.CheckBindsDoc(tree);
         if (this.HasMethod("OnLoad")) { this.Invoke("OnLoad", this); }
     }
+
+    // 窗口键读取：根元素优先，其次首层子元素（html→body）。
+    static string WinKey(Control tree, string key) {
+        string v = tree.CssAttr(key);
+        if (v != "") { return v; }
+        for (int i = 0; i < tree.children.Count; i = i + 1) {
+            v = tree.children[i].CssAttr(key);
+            if (v != "") { return v; }
+        }
+        return "";
+    }
+
     // 按名自动接线：树上的处理器名逐个 HasMethod 对账（缺失即 fail-fast），
     // 注册 plain + arg 双槽（arg 槽只在控件声明 handlerArg 时被选中）。
     bool AutoWireDoc() {
@@ -94,8 +133,8 @@ public partial class Form {
             string h = names[i];
             if (!this.HasMethod(h)) { missing.Add(h); continue; }
             string evt = h;
-            this.docBinder.Handle(h, () => { this.Invoke(evt); });
-            this.docBinder.HandleArg(h, (string s) => { this.Invoke(evt, s); });
+            this.docBinder.Handle(h, () => { this.Invoke(evt); this.MarkDirty(); });
+            this.docBinder.HandleArg(h, (string s) => { this.Invoke(evt, s); this.MarkDirty(); });
         }
         if (missing.Count > 0) {
             string list = "";
@@ -172,7 +211,7 @@ public partial class Form {
     // 类名 ↔ 同目录同名 .html：内嵌 VFS 命中即用（发布态权威），退回
     // 工作目录裸名、磁盘 src 树（开发态）；大小写不敏感 basename 匹配，
     // 命中多份取大小写精确者，仍不唯一就列候选 fail-fast。
-    static string FindDoc(string cls) {
+    public static string FindDoc(string cls) {
         List<string> names = new List<string>();
         List<string> emb = File.EmbeddedNames("");
         if (emb != null) {
@@ -218,7 +257,7 @@ public partial class Form {
         return null;
     }
 
-    static string ReadDoc(string rel) {
+    public static string ReadDoc(string rel) {
         string html = Form.ReadText(rel);
         if (html != null) { return html; }
         string bare = rel;

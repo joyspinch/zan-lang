@@ -725,7 +725,9 @@ Cookie，"对照组"就不成立了。
      5) **主轴滚动容器 flex-shrink 锁定**：当 Flex 容器声明了 `overflow-y: auto` / `overflow-x: auto` 时，它是滚动容器，排布引擎必须跳过主轴收缩压缩（否则 7 项会按 `room/7`、8 项会按 `room/8` 强制压扁，导致切换分类时列表行高剧烈跳变）。行模板根节点必须显式锁定偏好与弹性收缩尺寸（如 `row.Prefer(0, 54)` 并配 `flex: 0 0 54px; flex-shrink: 0;`），确保无论多少条目行高均严格恒定在像素基准线。
      6) **Flex-wrap 换行网格与滚动延伸（Scroll Extent）全貌闭环**：当卡片采用百分比宽度（如 `width: 31%` 或 `flex: 0 0 31%`）并声明 `flex-wrap: wrap` 时，排布测量引擎必须根据宿主换行宽度解析子项百分比尺寸（`StyleWidthIn(wrapMain)`）并累计多行交叉轴跨度（`crossSum + crossGap * (lines - 1)`）。滚动容器（如 `.tools-scroll`）依靠此真实高度计算完整的 `scrollExtent` 并唤出原生纵向滚动条，彻底根除因高度虚低导致下方卡片被窗口硬生生裁切成半截且无法滚动的恶性排版缺陷。
 
-
-
-
+22. **声明式窗口与单管线装载规范（B-ID149：`class X : Form`、`<include>` 组合与零胶水建树）**：
+   - **`class X : Form` 窗口即对象**：业务类直接继承 `Form`，框架通过 `Form.FindDoc(cls)` 自动定位同名 `X.html`（发布态权威内嵌 VFS 优先，开发态源码 src 树回退），`Html.Parse` 一跳建树，消除一切 `DesignDoc.Load`/`FormBuilder.BuildWith` 门面胶水代码。
+   - **事件反射按名自动接线与绑定对账**：树上所有事件（`@click="OnSave"`）按名自动匹配实例方法，缺失即 fail-fast 退出；`data-bind` 路径由 `CheckBindsDoc` 启动期静态对账，杜绝静默失败。
+   - **模板脚手架约束**：新建项目模板中的入口类必须声明为 `partial class {{NAME}} : Form`，严禁遗漏 `{{NAME}}` 占位符或 `: Form` 继承，否则编译器入口合成（`new <基名>().Show()`）将因类型未定义中断。
+   - **`<include src="...">` 组合化**：支持在 HTML 中通过 `<include src="fragment.html" />` 组合引入组件化片段，装载期展开（深度 8 封顶防环），片段内事件与数据绑定对宿主窗口类同构生效。
 

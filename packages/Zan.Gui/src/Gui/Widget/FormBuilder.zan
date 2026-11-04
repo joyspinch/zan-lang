@@ -1014,4 +1014,156 @@ public class FormBuilder {
         }
         return ctl;
     }
+
+    // data-kind 的别名归一（与 Kind() 的旧键收束同表）。
+    public static string HtmlKindAlias(string k) {
+        if (k == "Table" || k == "DataTable") { return "DataGrid"; }
+        if (k == "Scrollbar" || k == "Layer") { return "Panel"; }
+        if (k == "Chart") { return "ChartHost"; }
+        if (k == "Ellipsis") { return "Label"; }
+        if (k == "Ribbon") { return "ToolStrip"; }
+        if (k == "Alert") { return "AlertBox"; }
+        return k;
+    }
+}
+
+// ---- Html 方言挂接（B-ID149：设计稿方言收敛进 Html.Parse 单跳管线） ----
+
+// Html 子节点的设计几何标量。Html.zan 从节点属性提取纯标量打包进来，
+// 挂接逻辑与本类 AttachNode/WrapCell/SetupLayout 同语义——旧 JSON 管线
+// 与新 Html 单跳管线共用同一套布局原语，不再各养一份。
+public class HtmlKidSpec {
+    // 控件 kind（data-kind 或 tag 推导，已过别名归一）。
+    public string kind = "";
+    // 子节点带元素子节点（容器；span 恒 24，ph 优先声明高）。
+    public bool isContainer;
+    // 文档根声明了 data-layout-mode=1（自由画布）。
+    public bool free;
+    // 该节点真的带设计方言标记（无标记的子节点走直接挂接）。
+    public bool dialect;
+    // data-span（0=未声明；容器按 24）。
+    public int span;
+    // data-child-tab（0=未声明）。
+    public int childTab;
+    // data-label（标题文案，空=无）。
+    public string label = "";
+    public bool hasFx;
+    public bool hasFy;
+    public int fx;
+    public int fy;
+    public int fw;
+    public int fh;
+    public int ph;
+    public int anchor;
+    public int position;
+    public int dock;
+    public bool hasPad;
+    public int pad;
+    public bool hasGap;
+    public int gap;
+    public bool hasMar;
+    public int mar;
+}
+
+public class HtmlKidAttach {
+    // 一批兄弟子节点按文档序挂到 parent（Html 装配阶段每个真控件父
+    // 调一次）。非方言子节点保持 Html 语义直接挂接；方言子节点按
+    // 浮动/停靠/流式单元三条路与 AttachNode 全同构。
+    public static void Kids(Control parent, List<Control> kids, List<HtmlKidSpec> specs) {
+        List<FbSlotFlow> flows = new List<FbSlotFlow>();
+        for (int i = 0; i < kids.Count; i = i + 1) {
+            Control kid = kids[i];
+            if (kid == null) { continue; }
+            HtmlKidSpec s = specs[i];
+            // 槽位宿主：Tabs/SplitPanel 的孩子与声明 childTab 的孩子。
+            Control host = parent;
+            if (s.childTab > 0 || parent is Tabs || parent is SplitPanel) {
+                host = parent.SlotHost(s.childTab);
+            }
+            if (kid.slotName != "" && host.MountSlot(kid.slotName, kid)) {
+                continue;
+            }
+            bool isStatusBar = s.kind == "StatusBar";
+            bool isToolStrip = s.kind == "ToolStrip";
+            if (isStatusBar) {
+                kid.dock = Dock.Bottom();
+                AddKid(host, kid);
+                continue;
+            }
+            if (isToolStrip) {
+                kid.dock = s.dock > 0 ? s.dock : Dock.Top();
+                AddKid(host, kid);
+                continue;
+            }
+            if (s.dock > 0) {
+                kid.dock = s.dock;
+                AddKid(host, kid);
+                continue;
+            }
+            // 浮动：声明 position=1，或自由画布下声明了 fx/fy。
+            bool floating = s.position == 1 || (s.free && (s.hasFx || s.hasFy));
+            if (floating) {
+                kid.Dock(Dock.Manual());
+                kid.designFloat = true;
+                kid.designAnchor = s.anchor;
+                kid.logPlaceSet = true;
+                kid.logX = s.fx;
+                kid.logY = s.fy;
+                AddKid(host, kid);
+                continue;
+            }
+            // 几何声明（自由/流式都生效）：fw 自然宽、fh 作者声明高、
+            // ph 容器画布高、pad/gap/margin 布局内距。
+            if (s.fw > 0) { kid.logW = s.fw; }
+            if (s.fh > 0) { kid.DeclareHeight(s.fh); }
+            if (s.hasPad) { kid.logPad = s.pad; }
+            if (s.hasGap) { kid.logGap = s.gap; }
+            if (s.hasMar) { kid.logMar = s.mar; }
+            if (!s.dialect) {
+                AddKid(host, kid);
+                continue;
+            }
+            // 流式单元：方言子节点进宿主唯一的 24 列流（span/标题/
+            // 声明高在 WrapCell 里落）。
+            FbFlow flow = null;
+            for (int j = 0; j < flows.Count; j = j + 1) {
+                if (flows[j].host == host) { flow = flows[j].flow; break; }
+            }
+            if (flow == null) {
+                flow = new FbFlow();
+                flow.Dock(Dock.Top());
+                flows.Add(new FbSlotFlow(host, flow));
+                AddKid(host, flow);
+            }
+            int span = s.isContainer ? 24 : FormBuilder.ClampSpan(s.span);
+            flow.AddCell(HtmlKidAttach.WrapCell(s, kid), span);
+        }
+    }
+
+    // 与 FormBuilder.WrapCell 同语义：容器高用 ph/fh，叶子声明高走
+    // logH，声明了 data-label 且控件不自带 label → FbStack{标题, 控件}。
+    static Control WrapCell(HtmlKidSpec s, Control ctl) {
+        if (s.isContainer) {
+            int h = s.ph > 0 ? s.ph : s.fh;
+            if (h > 0) { ctl.logH = h; }
+            return ctl;
+        }
+        if (ctl is ChoiceGroup && s.fh > 0) {
+            ((ChoiceGroup)ctl).SetRowHeight(s.fh);
+        } else if (s.fh > 0) { ctl.logH = s.fh; }
+        if (s.label == "" || FormBuilder.OwnsLabel(ctl)) { return ctl; }
+        FbStack cell = new FbStack();
+        Label caption = new Label(s.label);
+        caption.Dock(Dock.Top());
+        caption.logH = 18;
+        cell.Add(caption);
+        ctl.Dock(Dock.Fill());
+        cell.Add(ctl);
+        return cell;
+    }
+
+    static void AddKid(Control host, Control kid) {
+        if (host is Element) { ((Element)host).AddKid(kid); }
+        else { host.Add(kid); }
+    }
 }

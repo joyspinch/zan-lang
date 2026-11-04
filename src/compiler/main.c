@@ -2956,8 +2956,9 @@ static bool zan_file_exists(const char *path) {
 
 /* ---------- 发布态设计稿自动内嵌（门控与工程根解析） ---------- */
 
-/* 输入源里出现 Gui 设计稿通道的记号（DesignDoc.）才启用自动内嵌：
- * 服务端/web 程序的 html 是运行期盘上资产，绝不能烘死进 exe。 */
+/* 输入源里出现 Gui 窗口类记号（" : Form"，B-ID149 窗口即对象形态）
+ * 才启用自动内嵌：服务端/web 程序的 html 是运行期盘上资产，绝不能
+ * 烘死进 exe。 */
 static bool zan_inputs_use_design_doc(const char *const *input_files,
                                       int input_count) {
     for (int fi = 0; fi < input_count; fi++) {
@@ -2965,7 +2966,7 @@ static bool zan_inputs_use_design_doc(const char *const *input_files,
         size_t len = 0;
         char *src = read_file(input_files[fi], &len);
         if (!src) continue;
-        bool hit = strstr(src, "DesignDoc.") != NULL;
+        bool hit = strstr(src, " : Form") != NULL;
         free(src);
         if (hit) return true;
     }
@@ -4795,8 +4796,9 @@ int main(int argc, char **argv) {
             }
         }
 
-        /* 设计稿：--publish 且源码走 DesignDoc 通道时，把工程 src/ 下的
-         * *.html 自动加密内嵌进 exe——发布态界面资产不留在盘上。 */
+        /* 设计稿：--publish 且源码是窗口类形态（" : Form"）时，把工程
+         * src/ 下的 *.html 自动加密内嵌进 exe——发布态界面资产不留在
+         * 盘上。 */
         if (publish_mode && zan_inputs_use_design_doc(input_files, input_count)) {
             char design_root[1024];
             zan_design_root_for(input_files[0], design_root, sizeof(design_root));

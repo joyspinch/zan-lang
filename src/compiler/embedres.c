@@ -245,9 +245,9 @@ static void embed_walk_filtered(zan_embed_list_t *l, const char *dir,
  *   - 只扫 <root>/src（设计稿与源码同源的工程布局约定）；
  *   - 跳表排除构建产物、依赖副本与文档测试等非设计稿 html；
  *   - spec 形如 "<绝对路径>=<工程根相对路径>"，相对段用 '/'，
- *     与 DesignDoc.Load 的查找名一致。
- * 是否启用由 main.c 的门控决定（publish 模式 + 源码出现 DesignDoc.
- * 记号）——服务端/web 程序的 html 是运行期盘上资产，绝不自动内嵌。 */
+ *     与 Form.Show 的 FindDoc 查找名一致。
+ * 是否启用由 main.c 的门控决定（publish 模式 + 源码出现 " : Form"
+ * 窗口类记号）——服务端/web 程序的 html 是运行期盘上资产，绝不自动内嵌。 */
 
 static int embed_design_dir_skipped(const char *leaf) {
     static const char *const skip[] = {

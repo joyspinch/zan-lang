@@ -100,8 +100,9 @@ foreach(_proj IN LISTS _projs)
   # The entry is ALWAYS the first input: zanc emits Main from the first
   # input on the command line (for a .zan entry the entry's own Main must win).
   # Compile-time HTML generation channel has been removed (de208fe98): design
-  # documents (.html) are runtime assets loaded via DesignDoc/LoadHtml or
-  # baked in via --embed; they are NOT compiler inputs.
+  # documents (.html) are runtime assets loaded via Html.Parse (Form.Show /
+  # Form.ReadDoc, B-ID149) or baked in via --embed; they are NOT compiler
+  # inputs.
   set(_srcs "")
   list(APPEND _srcs ${_out}/${_entry})
   file(GLOB_RECURSE _zan ${_out}/src/*.zan)

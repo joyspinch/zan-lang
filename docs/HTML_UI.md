@@ -27,8 +27,11 @@ style 属性合成规则）并进 appCss 再建树。`root` 恒为 body 元素�
 exe（`File.ReadAllText` 内嵌优先），烘入内容先压缩、再以按文件名派生的
 密钥流加密存放（防 strings 抠源，不对抗逆向专家；密钥种子由全部内嵌
 文件确定性推导，确定性孪生测试不受影响）。装载全程内存内解密+解压，
-**不解压到任何临时路径**。设计稿同理：`DesignerHtml.ToJsonDoc` +
-`FormBuilder.Build` 在运行期投影成控件树（见「设计器文档格式」）。
+**不解压到任何临时路径**。装载投影只有一个通道：`Html.Parse` 一跳建树
+（B-ID149 方言收敛——设计稿方言键 data-kind/data-span/fx/fy 等由同一
+解析直接消费；`DesignerHtml.ToJsonDoc` 只剩设计器存取格式，见
+「设计器文档格式」；窗口装配与 `Form.Show`/`Form.ReadDoc` 见
+packages/Zan.Gui `Form.Show.zan`）。
 编译器对 `.html` 输入的显式拒绝与内嵌通道的契约分别由
 `diag_html_input_rejected`（ctest）与 `tests/conformance/file_embed_*`
 钉住。
@@ -153,8 +156,8 @@ conformance 用例互为镜像）：
 
 | 通道 | data-if | data-for |
 |------|---------|----------|
-| 运行时 `App.LoadHtml` | 属性协议 → bindIf | Element 属性表 |
-| 设计稿投影（`DesignerHtml.ToJsonDoc` → `FormBuilder.Build`） | JSON `"if"` 键 → bindIf | JSON `"for"` 键 → `SetAttr("data-for")` |
+| `Html.Parse`（运行期 UI 与设计稿同一管线，B-ID149） | 属性协议 → bindIf | Element 属性表 |
+| 设计器存取格式（`DesignerHtml.ToJsonDoc` 往返，仅设计器内部） | JSON `"if"` 键 → bindIf | JSON `"for"` 键 → `SetAttr("data-for")` |
 
 设计器存取格式里模板字段的形态（"tag"/"for"/"if" 都不在
 IsModeledKey 名单，Inspector 经 extra 原样透传保真）：
@@ -255,10 +258,12 @@ P0-P4 节）。CSS 支持面（含 grid/flex/float）见 TASKS.md A16。
 ## 设计器文档格式（P7a）
 
 窗口设计器的存取格式就是本文件的 HTML 子集：文档 `<body>` 带裸属性
-`data-zan-design`（区分设计稿与运行期 UI 文档——前者由
-`DesignerHtml.ToJsonDoc` + `FormBuilder.Build` 在运行期投影成控件树，
-后者走 `Html.Parse`/`LoadHtmlWith`；IDE 里前者开设计器）。同一份 JSON 文档模型
-经 `System.Web.DesignerHtml` 与 HTML 解析：
+`data-zan-design`（区分设计稿与运行期 UI 文档；IDE 里前者开设计器）。
+**装载投影两条路已归一（B-ID149）**：设计稿与运行期 UI 都走
+`Html.Parse` 一跳建树，方言键（data-kind/data-span/data-fx/fy/…）由
+同一解析直接消费；`DesignerHtml.ToJsonDoc`/`FromJsonDoc` 只在设计器
+内部做存取往返，不再出现在应用装载路径上。JSON 文档模型经
+`System.Web.DesignerHtml` 与 HTML 解析：
 
 - 文档级键（winW/role/layoutMode/…）→ `<body>` 的 `data-<kebab>` 属性；
   `name` 另发 `<body id>`；裸属性即 `true`；`0`/`""`/`false` 不发（读端有

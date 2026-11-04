@@ -1,5 +1,6 @@
 using System;
 using System.Diagnostics;
+using System.Json;
 using Gui.Markup;
 // 控件映射用的是裸 Button/TextArea/Checkbox/Input/Image——这些类型在
 // Gui.Widget 命名空间里，必须显式 import；不写的话只靠 binder 的全局
@@ -55,10 +56,116 @@ public class Html {
         return doc.root;
     }
 
+    // ---- <include> 组合（B-ID149②）：把一个窗口拆成多份 html 复用 ----
+    //
+    // html 是数据：组合发生在装载期，`<include src="Views/Nav.html" />`
+    // 装载前展开为被引文件内容（整文档取 body 内层，片段原样），递归
+    // 展开（深度 8 封顶防环）。查找口与窗口文档同源（Form.ReadDoc：
+    // 工程根直引 → 裸名 → src/），发布态走同一份内嵌 VFS。注释、
+    // <style>、<script> 内不展开——那里出现 include 字样是文案不是
+    // 组合指令。
+
+    static string ExpandIncludes(string html, int depth) {
+        if (depth > 8) { return html; }
+        string outp = "";
+        int i = 0;
+        while (i < html.Length) {
+            int nxt = i;
+            int kind = 0;   // 0 文本尾, 1 include, 2 注释, 3 style/script
+            int scan = i;
+            while (scan < html.Length) {
+                if (html[scan] != 60) { scan = scan + 1; continue; }   // '<'
+                if (html.IndexOf("<!--", scan) == scan) {
+                    nxt = html.IndexOf("-->", scan + 4);
+                    kind = 2;
+                    break;
+                }
+                if (html.IndexOf("<include", scan) == scan) {
+                    nxt = scan;
+                    kind = 1;
+                    break;
+                }
+                if (html.IndexOf("<style", scan) == scan || html.IndexOf("<script", scan) == scan) {
+                    int nameEnd = html.IndexOf(">", scan);
+                    if (nameEnd < 0) { nxt = html.Length; kind = 3; break; }
+                    string tag = html.Substring(scan + 1, nameEnd - scan - 1).Trim();
+                    string close = "</" + tag.Split(" ")[0] + ">";
+                    int ce = html.IndexOf(close, nameEnd);
+                    nxt = ce < 0 ? html.Length : ce + close.Length;
+                    kind = 3;
+                    break;
+                }
+                scan = scan + 1;
+            }
+            if (kind == 0 || nxt <= i) {
+                outp = outp + html.Substring(i);
+                break;
+            }
+            if (kind != 1) {
+                outp = outp + html.Substring(i, nxt - i);
+                i = nxt;
+                continue;
+            }
+            int lt = nxt;
+            int gt = html.IndexOf(">", lt);
+            if (gt < 0) {
+                outp = outp + html.Substring(i);
+                break;
+            }
+            string srcVal = Html.IncludeSrc(html.Substring(lt, gt - lt + 1));
+            outp = outp + html.Substring(i, lt - i);
+            if (srcVal == "") {
+                Console.WriteLine("HTML include without src");
+            } else {
+                string frag = Form.ReadDoc(srcVal);
+                if (frag == null) {
+                    Console.WriteLine("HTML include not found: " + srcVal);
+                } else {
+                    outp = outp + Html.ExpandIncludes(Html.BodyInner(frag), depth + 1);
+                }
+            }
+            i = gt + 1;
+        }
+        return outp;
+    }
+
+    // include 标签文本里的 src 属性（引号用字符码 34/39——Zan 字符串
+    // 不吃反斜杠转义）。
+    static string IncludeSrc(string tag) {
+        int a = tag.IndexOf("src=");
+        if (a < 0) { return ""; }
+        int vs = a + 4;
+        if (vs >= tag.Length) { return ""; }
+        char q = tag[vs];
+        if (q == 34 || q == 39) {
+            int ve = tag.IndexOf(q, vs + 1);
+            if (ve < 0) { return ""; }
+            return tag.Substring(vs + 1, ve - vs - 1).Trim();
+        }
+        int e = vs;
+        while (e < tag.Length) {
+            char ch = tag[e];
+            if (ch == 32 || ch == 62 || ch == 47) { break; }
+            e = e + 1;
+        }
+        return tag.Substring(vs, e - vs).Trim();
+    }
+
+    // 整文档取 body 内层；片段原样返回。
+    static string BodyInner(string html) {
+        int bs = html.IndexOf("<body");
+        if (bs < 0) { return html; }
+        int contentStart = html.IndexOf(">", bs);
+        int be = html.IndexOf("</body>", contentStart);
+        if (contentStart < 0 || be < 0) { return html; }
+        return html.Substring(contentStart + 1, be - contentStart - 1);
+    }
+
     // 解析 `html`（整文档或片段）并建树。`baseDir` 是 `<link>`
     // 相对路径的基目录（空 = 不解析 link）。`handlers` 可为 null。
     static HtmlDoc Parse(string html, string baseDir, HtmlHandlers handlers) {
         Install();
+        html = Html.ExpandIncludes(html, 0);
         WDoc wd = HtmlParser.Parse(html, baseDir);
         HtmlDoc doc = new HtmlDoc();
         doc.css = wd.css;
@@ -66,6 +173,15 @@ public class Html {
         List<Control> built = new List<Control>();
         for (int i = 0; i < wd.nodes.Count; i = i + 1) {
             built.Add(Html.Build(wd, wd.nodes[i], doc, handlers));
+        }
+        // 文档级自由画布标记（旧管线 layoutMode=1 同语义）：声明了
+        // fx/fy 的方言子节点浮动定位。
+        bool docFree = false;
+        for (int i = 0; i < wd.nodes.Count; i = i + 1) {
+            if (HtmlText.NodeAttr(wd.nodes[i].attrs, "data-layout-mode") == "1") {
+                docFree = true;
+                break;
+            }
         }
         // 装配：逐父按 items 文档序走一遍——AddText 与 AddChild 的
         // 交错顺序就是 HTML 的行内内容顺序（混排行盒依赖）。
@@ -75,6 +191,8 @@ public class Html {
             if (n.tag == "tab" || n.tag == "tab-pane" || n.tag == "tabpane" || n.tag == "option") {
                 continue;
             }
+            List<Control> flowKids = null;
+            List<HtmlKidSpec> flowSpecs = null;
             for (int k = 0; k < n.items.Count; k = k + 1) {
                 WItem it = n.items[k];
                 if (it.kid < 0) {
@@ -109,12 +227,188 @@ public class Html {
                         }
                         continue;
                     }
-                    Html.AddChild(c, built[it.kid]);
+                    Control kidCtl = built[it.kid];
+                    if (c is Element) {
+                        // Element 父保持行内文档序（AddText 交错依赖）。
+                        Html.AddChild(c, kidCtl);
+                    } else {
+                        // 真控件父：方言几何（span/fx/fy/标题/停靠）在
+                        // FormBuilder.HtmlKidAttach 落——与旧 JSON 管线
+                        // AttachNode 全同构。
+                        if (flowKids == null) {
+                            flowKids = new List<Control>();
+                            flowSpecs = new List<HtmlKidSpec>();
+                        }
+                        flowKids.Add(kidCtl);
+                        flowSpecs.Add(Html.SpecOf(kidNode, docFree));
+                    }
                 }
+            }
+            if (flowKids != null) {
+                HtmlKidAttach.Kids(c, flowKids, flowSpecs);
             }
         }
         doc.root = built.Count > 0 ? built[0] : null;
         return doc;
+    }
+
+    // 节点 → 设计几何标量（属性提取在这里，布局语义在 FormBuilder
+    // 的 HtmlKidAttach——旧 JSON 管线与新 Html 单跳管线共用一套）。
+    static HtmlKidSpec SpecOf(WNode n, bool free) {
+        HtmlKidSpec s = new HtmlKidSpec();
+        string dk = HtmlText.NodeAttr(n.attrs, "data-kind");
+        s.kind = dk != "" ? FormBuilder.HtmlKindAlias(dk) : TagToKind(n.tag);
+        s.free = free;
+        s.label = HtmlText.NodeAttr(n.attrs, "data-label");
+        s.span = Html.NodeInt(n, "data-span");
+        s.childTab = Html.NodeInt(n, "data-child-tab");
+        s.fw = Html.NodeInt(n, "data-fw");
+        s.fh = Html.NodeInt(n, "data-fh");
+        s.ph = Html.NodeInt(n, "data-ph");
+        s.anchor = Html.NodeInt(n, "data-anchor");
+        s.position = Html.NodeInt(n, "data-position");
+        string dv = HtmlText.NodeAttr(n.attrs, "data-dock");
+        if (Html.IsIntText(dv)) { s.dock = Convert.ToInt32(dv); }
+        s.hasFx = Html.HasAttr(n, "data-fx");
+        if (s.hasFx) { s.fx = Html.NodeInt(n, "data-fx"); }
+        s.hasFy = Html.HasAttr(n, "data-fy");
+        if (s.hasFy) { s.fy = Html.NodeInt(n, "data-fy"); }
+        s.hasPad = Html.HasAttr(n, "data-padding");
+        if (s.hasPad) { s.pad = Html.NodeInt(n, "data-padding"); }
+        s.hasGap = Html.HasAttr(n, "data-gap");
+        if (s.hasGap) { s.gap = Html.NodeInt(n, "data-gap"); }
+        s.hasMar = Html.HasAttr(n, "data-margin");
+        if (s.hasMar) { s.mar = Html.NodeInt(n, "data-margin"); }
+        s.isContainer = false;
+        for (int i = 0; i < n.items.Count; i = i + 1) {
+            if (n.items[i].kid >= 0) { s.isContainer = true; break; }
+        }
+        s.dialect = dk != "" || s.span > 0 || s.childTab > 0 || s.label != ""
+            || s.hasFx || s.hasFy || s.fw > 0 || s.fh > 0 || s.ph > 0
+            || s.position == 1 || s.dock > 0 || s.hasPad || s.hasGap || s.hasMar;
+        return s;
+    }
+
+    // 节点属性整数（缺失/非法 → 0）。
+    static int NodeInt(WNode n, string key) {
+        string v = HtmlText.NodeAttr(n.attrs, key);
+        if (!Html.IsIntText(v)) { return 0; }
+        return Convert.ToInt32(v);
+    }
+
+    static bool HasAttr(WNode n, string key) {
+        return HtmlText.NodeAttr(n.attrs, key) != "";
+    }
+
+    // 整数字面量（可选负号 + 纯数字）。
+    static bool IsIntText(string s) {
+        if (s == null || s == "") { return false; }
+        int i = 0;
+        if (s[0] == 45) { i = 1; }
+        if (i >= s.Length) { return false; }
+        while (i < s.Length) {
+            int ch = s[i] & 255;
+            if (ch < 48 || ch > 57) { return false; }
+            i = i + 1;
+        }
+        return true;
+    }
+
+    // data-<kebab> → camelCase 属性键（row-factory → rowFactory）。
+    static string UnkebabKey(string s) {
+        string outp = "";
+        bool up = false;
+        for (int i = 0; i < s.Length; i = i + 1) {
+            char ch = s[i];
+            if (ch == 45) { up = true; continue; }
+            if (up && ch >= 97 && ch <= 122) { outp = outp + (char)(ch - 32); }
+            else { outp = outp + ch; }
+            up = false;
+        }
+        return outp;
+    }
+
+    // 设计方言结构键：语义在构造/装配层消费，不落属性表。
+    static bool IsDialectKey(string k) {
+        switch (k) {
+            case "kind":
+            case "span":
+            case "child-tab":
+            case "ph":
+            case "fx":
+            case "fy":
+            case "fw":
+            case "fh":
+            case "anchor":
+            case "position":
+            case "padding":
+            case "pad":
+            case "gap":
+            case "margin":
+            case "label":
+            case "text":
+            case "layout-mode":
+            case "for":
+            case "html-tag":
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    // data-x-<key> 复合值（PutAttr 同语义）：options 数组拼 "a|b|c"，
+    // columns 数组拼 "width,title|..."，props 对象逐键落属性，其余
+    // JSON 序列化直落。
+    static void ApplyXProp(Control c, string key, string v) {
+        if (v == "" || (v[0] != 123 && v[0] != 91)) { c.SetProp(key, v); return; }
+        JsonValue parsed = null;
+        try { parsed = JsonValue.Parse(v); } catch (Exception ex) {
+            parsed = null;
+        }
+        if (parsed == null) { c.SetProp(key, v); return; }
+        if (key == "options" && parsed.IsArray()) {
+            c.SetProp("options", Html.JsonJoinOpts(parsed));
+            return;
+        }
+        if (key == "columns" && parsed.IsArray()) {
+            c.SetProp("columns", Html.JsonGridSpec(parsed));
+            return;
+        }
+        if (key == "props" && parsed.IsObject()) {
+            for (int i = 0; i < parsed.Count(); i = i + 1) {
+                JsonValue val = parsed.ValAt(i);
+                if (val == null) { continue; }
+                if (val.IsString()) { c.SetProp(parsed.KeyAt(i), val.AsString("")); }
+                else if (val.IsBool()) { c.SetProp(parsed.KeyAt(i), val.AsBool(false) ? "true" : "false"); }
+                else if (val.IsNumber()) { c.SetProp(parsed.KeyAt(i), val.ToJson()); }
+            }
+            return;
+        }
+        c.SetProp(key, parsed.ToJson());
+    }
+
+    static string JsonJoinOpts(JsonValue opts) {
+        if (opts.IsString()) { return opts.AsString(""); }
+        if (!opts.IsArray() || opts.Count() == 0) { return ""; }
+        string outp = "";
+        for (int i = 0; i < opts.Count(); i = i + 1) {
+            outp = outp + (i > 0 ? "|" : "") + opts.At(i).AsString("");
+        }
+        return outp;
+    }
+
+    static string JsonGridSpec(JsonValue cols) {
+        string spec = "";
+        for (int i = 0; i < cols.Count(); i = i + 1) {
+            JsonValue col = cols.At(i);
+            if (col == null || !col.IsObject()) { continue; }
+            string title = col.Str("title", "");
+            if (title == "") { title = col.Str("field", ""); }
+            if (title == "") { continue; }
+            spec = spec + (spec != "" ? "|" : "")
+                + Convert.ToString(col.Int("width", 100)) + "," + title;
+        }
+        return spec;
     }
 
     // 一条记录 → 一个控件（构造 + 属性协议）。容器自己的文本不在这
@@ -303,6 +597,10 @@ public class Html {
                 // 通用动态解析：优先通过 ControlFactory 与已注册组件族（ControlBootstrap,
                 // DataTableBootstrap, ChartBootstrap 等）实例化，杜绝死硬编码
                 string kind = TagToKind(tag);
+                // 设计稿方言：data-kind 是控件 kind 的权威标记（B-ID149
+                // 方言收敛）——`<div data-kind="Gauge">` 建真控件而非占位。
+                string dkind = HtmlText.NodeAttr(n.attrs, "data-kind");
+                if (dkind != "") { kind = FormBuilder.HtmlKindAlias(dkind); }
                 Control created = ControlFactory.Create(kind);
                 if (created != null) {
                     c = created;
@@ -470,6 +768,22 @@ public class Html {
                     c.SetProp("tip-side", v);
                     continue;
                 }
+                case "data-label": {
+                    // 设计稿标题通道：控件自画或装配层补标题行
+                    //（FormBuilder.WrapCell 同语义）。
+                    if (!(c is Element)) { c.SetDesignText(v); }
+                    continue;
+                }
+                case "data-text": {
+                    // 设计稿精确文案：防空白塌缩，直落控件 text。
+                    if (!(c is Element)) { c.SetProp("text", v); }
+                    continue;
+                }
+                case "data-layout-mode": {
+                    // 自由画布（旧管线 layoutMode=1 同语义）。
+                    if (v == "1") { c.FreeLayout(); }
+                    continue;
+                }
                 case "free-layout":
                 case "data-free-layout": {
                     c.FreeLayout();
@@ -481,6 +795,9 @@ public class Html {
                 }
                 case "dock":
                 case "data-dock": {
+                    // 数字停靠值（旧管线 Dock 值语义）留给装配层，与
+                    // 字面（fill/left/...）共用一个入口。
+                    if (Html.IsIntText(v)) { break; }
                     string dlow = v.ToLower();
                     switch (dlow) {
                         case "fill":   c.DockFill(); break;
@@ -497,9 +814,23 @@ public class Html {
                     continue;
                 }
                 default: {
-                    if (!(c is Element)) {
-                        c.SetProp(k, v);
+                    if (c is Element) { break; }
+                    // 设计稿复合值：data-x-options/x-props/x-columns（JSON
+                    // 直落 options/columns/props，PutAttr 同语义）。
+                    if (k.Length > 7 && HtmlText.StartsWith(k, "data-x-")) {
+                        Html.ApplyXProp(c, Html.UnkebabKey(k.Substring(7)), v);
+                        break;
                     }
+                    if (k.Length > 5 && HtmlText.StartsWith(k, "data-")) {
+                        string dkey = k.Substring(5);
+                        // 方言结构键：语义在构造/装配层消费，不落属性表。
+                        if (Html.IsDialectKey(dkey)) { break; }
+                        // 其余 data-<kebab> 解包成 camelCase 属性键
+                        // （data-placeholder → placeholder）。
+                        c.SetProp(Html.UnkebabKey(dkey), v);
+                        break;
+                    }
+                    c.SetProp(k, v);
                     break;
                 }
             }

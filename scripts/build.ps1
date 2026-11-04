@@ -76,8 +76,15 @@ $doBuild = {
             throw "cmake --build 失败 exit=$rc"
         }
         $out | Select-Object -Last 4 | Write-Host
-        Write-Host "[build] zanc.exe 正被占用（第 $try/$maxTry 次），2 秒后重试……" -ForegroundColor Yellow
-        Start-Sleep -Seconds 2
+        Write-Host "[build] zanc.exe 正被占用（第 $try/$maxTry 次），移走旧文件并重试……" -ForegroundColor Yellow
+        # Windows 上运行中的 exe 虽不可被写/删，但允许被 Move/Rename。
+        # 移走旧 exe 使其不占文件名，下次链接即可原子生成新 zanc.exe，原进程不受影响。
+        $oldExe = Join-Path $buildDir "zanc.exe.old-$([System.Guid]::NewGuid().ToString('N'))"
+        Move-Item -Force (Join-Path $buildDir 'zanc.exe') $oldExe -ErrorAction SilentlyContinue
+        Get-ChildItem $buildDir -Filter 'zanc.exe.old-*' -ErrorAction SilentlyContinue | ForEach-Object {
+            Remove-Item -Force $_.FullName -ErrorAction SilentlyContinue
+        }
+        Start-Sleep -Seconds 1
     }
 }
 
