@@ -31,8 +31,11 @@ struct zan_checker {
     int ctrl_ent_cap;
     bool ctrl_ents_done;
     /* 用户类名清单：DocApp.Bootstrap() 零参调用点合成 VmFactory[] 实参
-     * 用（B-ID147 框架化窗口引导，逐类真 new 交给框架按名挑 code-behind）。 */
+     * 用（B-ID147 框架化窗口引导，逐类真 new 交给框架按名挑 code-behind）。
+     * vm_decls 与 vm_ents 平行：合成时按 decl 判断有无可参构造——只有
+     * 无参（显式或隐式）的类才值得造工厂（模型类必参构造 new 不出来）。 */
     zan_istr_t *vm_ents;
+    zan_ast_node_t **vm_decls;
     int vm_ent_count;
     int vm_ent_cap;
     bool vm_ents_done;

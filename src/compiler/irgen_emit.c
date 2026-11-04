@@ -1136,8 +1136,15 @@ static void emit_async_method_ir(zan_irgen_t *g, method_body_work_t *w) {
             ASYNC_FRAME_CANCEL, "fr.cancel.p");
         g->current_async_child_ptr = LLVMBuildStructGEP2(g->builder, frame_type, sframe,
             ASYNC_FRAME_CHILD, "self.child");
-        g->current_async_sub_slot_ptr = LLVMBuildStructGEP2(g->builder, frame_type, sframe,
-            (unsigned)w->sub_base, "self.sub_slot");
+        /* sub 槽字段只在有 await 的方法里进 frame 布局（nfields = sub_base +
+         * (await_count > 0 ? 1 : 0)）：await-free 的 async（如只包一层的
+         * 包装方法）frame 没有这个字段，无条件 GEP sub_base 是越界索引，
+         * LLVM 校验器直接拒绝模块（E3090）。没 await 就永远没有子协程
+         * 挂载点，置空即可——懒取路径见 get_async_sub_slot_ptr。 */
+        g->current_async_sub_slot_ptr = w->await_count > 0
+            ? LLVMBuildStructGEP2(g->builder, frame_type, sframe,
+                  (unsigned)w->sub_base, "self.sub_slot")
+            : NULL;
         g->current_async_result_ptr = LLVMBuildStructGEP2(g->builder, frame_type, sframe,
             ASYNC_FRAME_RESULT, "self.res_slot");
         {

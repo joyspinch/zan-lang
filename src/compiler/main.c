@@ -1059,6 +1059,9 @@ static int proj_android_perm_count = 0;
 static char proj_skin_names[128][64];
 static int proj_skin_name_count = 0;
 static bool proj_skins_enabled = false;
+/* zan.proj 的 type 键（"gui" 等）：DocApp 入口 shim 的工程级门控——
+ * type=gui 且用户没写 Main 时合成 __ZanDocMain（B-ID147）。 */
+static char proj_app_type[16] = "";
 static bool load_proj_android_keys_done = false;
 static const char **skin_filter = NULL;
 static int skin_filter_count = 0;
@@ -1085,6 +1088,8 @@ static void load_proj_android_keys(void) {
         char *val = proj_trim(eq + 1);
         if (strcmp(key, "skins") == 0) {
             proj_skins_enabled = strcmp(val, "1") == 0;
+        } else if (strcmp(key, "type") == 0) {
+            snprintf(proj_app_type, sizeof(proj_app_type), "%s", val);
         } else if (strcmp(key, "androidPackage") == 0) {
             if (strlen(val) >= sizeof(proj_android_package)) {
                 fprintf(stderr, "error: zan.proj androidPackage exceeds "
@@ -1796,9 +1801,13 @@ static void zan_synth_action_dispatch(zan_ast_node_t *unit, zan_arena_t *arena,
 
 /* ---------- DocApp.Bootstrap 的入口 shim 合成（B-ID147） ----------
  *
- * type=gui 工程（zan.proj）且用户没写 Main 时，合成 __ZanDocMain 类：
- * 静态 __DesignMain 调 DocApp.Bootstrap()——irgen 的入口回退语义让用户
- * Main 天然优先（写了就不回退），框架化窗口的 .zan 里因此零胶水。
+ * 两条触发路径，用户没写 Main 且没有 __DesignMain 时合成 __ZanDocMain
+ * 类：静态 __DesignMain 调 DocApp.Bootstrap()——irgen 的入口回退语义让
+ * 用户 Main 天然优先（写了就不回退），框架化窗口的 .zan 里因此零胶水：
+ *   1) 调用点驱动：编译单元里有零参 DocApp.Bootstrap()/BootstrapOffscreen()
+ *      调用（散文件、测试探针，无工程形态也活）；
+ *   2) 工程门控：zan.proj type=gui（模板族/示例的零胶水形态——用户代码
+ *      只有字段与事件方法，哪来的 Bootstrap 调用）。
  * 工厂数组（VmFactory[]）由 checker 在 Bootstrap 零参调用点按本编译
  * 单元的用户类合成（checker_collect_vm_classes）。 */
 typedef struct {
@@ -1844,7 +1853,15 @@ static void zan_synth_docapp_main(zan_ast_node_t *unit, zan_arena_t *arena,
     for (int i = 0; i < unit->comp_unit.decls.count; i++)
         zan_ast_walk(unit->comp_unit.decls.items[i], zdm_probe_walk, NULL,
                      &probe);
-    if (!probe.bootstrap || probe.main || probe.design_main) return;
+    if (probe.main || probe.design_main) return;
+    if (!probe.bootstrap) {
+        /* 工程门控路径：type=gui 且没写 Main = 想要 DocApp 窗口。 */
+        if (!load_proj_android_keys_done) {
+            load_proj_android_keys();
+            load_proj_android_keys_done = true;
+        }
+        if (strcmp(proj_app_type, "gui") != 0) return;
+    }
 
     zd_buf_t b;
     memset(&b, 0, sizeof(b));
@@ -3566,6 +3583,17 @@ int main(int argc, char **argv) {
 
         explicit_input_count = input_count;
 
+        /* type=gui 工程的零胶水形态：用户代码没有 using（字段+事件方法
+         * 而已），Zan.Gui 包不会被按需拉取——工程门控直接把 Gui 命名
+         * 空间灌进拉取集（B-ID147；文件去重由 add_stdlib_input 保证）。 */
+        if (!load_proj_android_keys_done && project_root_has_manifest()) {
+            load_proj_android_keys();
+            load_proj_android_keys_done = true;
+        }
+        if (strcmp(proj_app_type, "gui") == 0) {
+            auto_include_namespace(stdlib_root, "Gui",
+                                   &input_files, &input_count, &input_cap);
+        }
         pi_filter_active = !emit_symbols_path &&
                            getenv("ZAN_NO_PULLIN_FILTER") == NULL;
         if (pi_filter_active) {

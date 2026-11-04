@@ -6330,11 +6330,19 @@ static void checker_collect_vm_classes(zan_checker_t *c,
             int ncap = c->vm_ent_cap ? c->vm_ent_cap * 2 : 32;
             zan_istr_t *nm = (zan_istr_t *)zan_arena_alloc(
                 c->arena, (size_t)ncap * sizeof(zan_istr_t));
-            for (int k = 0; k < c->vm_ent_count; k++) nm[k] = c->vm_ents[k];
+            zan_ast_node_t **nd = (zan_ast_node_t **)zan_arena_alloc(
+                c->arena, (size_t)ncap * sizeof(zan_ast_node_t *));
+            for (int k = 0; k < c->vm_ent_count; k++) {
+                nm[k] = c->vm_ents[k];
+                nd[k] = c->vm_decls[k];
+            }
             c->vm_ents = nm;
+            c->vm_decls = nd;
             c->vm_ent_cap = ncap;
         }
-        c->vm_ents[c->vm_ent_count++] = decl->type_decl.name;
+        c->vm_ents[c->vm_ent_count] = decl->type_decl.name;
+        c->vm_decls[c->vm_ent_count] = decl;
+        c->vm_ent_count++;
     }
 }
 
@@ -6395,6 +6403,20 @@ static zan_ast_node_t *checker_synthesize_vm_factories(zan_checker_t *c,
     n->new_expr.array_rank = 0;
     n->new_expr.list_copy = false;
     for (int i = 0; i < c->vm_ent_count; i++) {
+        zan_ast_node_t *decl = c->vm_decls[i];
+        if (!decl) continue;
+        /* 只有可无参构造（未声明构造，或显式 0 参构造）的类才值得造
+         * 工厂：模型类全是必参构造，new 不出来（E2018）。code-behind
+         * 走的恰是无参形态，过滤不伤目标语义。 */
+        bool emit = true;
+        for (int m = 0; m < decl->type_decl.members.count; m++) {
+            zan_ast_node_t *mem = decl->type_decl.members.items[m];
+            if (!mem || mem->kind != AST_CONSTRUCTOR_DECL) continue;
+            if (mem->method_decl.params.count == 0) { emit = true; break; }
+            emit = false;
+        }
+        if (!emit) continue;
+
         zan_ast_node_t *cls = zan_ast_new(c->arena, AST_TYPE_REF, loc);
         cls->type_ref.name = c->vm_ents[i];
         cls->type_ref.is_nullable = false;
