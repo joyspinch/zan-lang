@@ -1,0 +1,220 @@
+using System;
+using System.Data.ZanDb;
+using System.Json;
+using System.IO;
+
+// SQ8 量化码驻留（VectorIndexOptions.quantize）一致性用例：
+// 量化建索引 + 近似检索对暴力余弦的召回重叠、量化模式拒绝精确
+// 全扫、检查点导出（原向量经文档流取回）/导入（建码不驻留）
+// 重开往返等价、墓碑槽全零码、量化关闭重建后精确扫描恢复。
+// 输出确定性，与 zandb_quantize.out 比对。
+class ZanDbQuantizeTest {
+    static int checks = 0;
+    static long seed = 123456789;
+
+    static void Ok(bool cond, string what) {
+        checks = checks + 1;
+        if (cond) {
+            Console.WriteLine("ok " + Convert.ToString(checks) + " - " + what);
+        } else {
+            Console.WriteLine("FAIL " + Convert.ToString(checks) + " - " + what);
+        }
+    }
+
+    static float Next() {
+        seed = (seed * 1103515245 + 12345) % 2147483648;
+        double v = (double)(seed % 2001) / 1000.0 - 1.0;
+        return (float)v;
+    }
+
+    static float[] Vector(int i) {
+        float[] vector = new float[4];
+        for (int j = 0; j < 4; j = j + 1) { vector[j] = Next(); }
+        vector[0] = vector[0] + 0.25f;
+        return vector;
+    }
+
+    static JsonValue Doc(int i, float[] vector) {
+        JsonValue doc = JsonValue.NewObject();
+        doc.Put("name", JsonValue.NewStr("doc" + Convert.ToString(i)));
+        JsonValue arr = JsonValue.NewArray();
+        for (int j = 0; j < vector.Length; j = j + 1) {
+            arr.Append(JsonValue.NewDouble((double)vector[j]));
+        }
+        doc.Put("embedding", arr);
+        return doc;
+    }
+
+    // 暴力余弦 top-k（距离升序、id 升序），探针内的真值参照。
+    static List<int> Truth(List<int> ids, List<float[]> vectors, float[] query, int k) {
+        List<int> order = new List<int>();
+        List<double> dist = new List<double>();
+        double nq = 0;
+        for (int j = 0; j < query.Length; j = j + 1) { nq = nq + query[j] * query[j]; }
+        nq = Math.Sqrt(nq);
+        for (int i = 0; i < ids.Count; i = i + 1) {
+            double dot = 0;
+            double nv = 0;
+            for (int j = 0; j < 4; j = j + 1) {
+                dot = dot + query[j] * vectors[i][j];
+                nv = nv + vectors[i][j] * vectors[i][j];
+            }
+            nv = Math.Sqrt(nv);
+            double d = 1.0 - dot / (nq * nv);
+            int at = 0;
+            while (at < order.Count && (dist[at] < d
+            || (dist[at] == d && ids[at] < ids[i]))) { at = at + 1; }
+            order.Insert(at, ids[i]);
+            dist.Insert(at, d);
+        }
+        List<int> top = new List<int>();
+        for (int i = 0; i < k && i < order.Count; i = i + 1) { top.Add(order[i]); }
+        return top;
+    }
+
+    static int Overlap(List<VectorHit> hits, List<int> truth) {
+        int overlap = 0;
+        for (int i = 0; i < hits.Count; i = i + 1) {
+            for (int j = 0; j < truth.Count; j = j + 1) {
+                if (hits[i].id == truth[j]) { overlap = overlap + 1; }
+            }
+        }
+        return overlap;
+    }
+
+    static string Ids(List<VectorHit> hits) {
+        string text = "";
+        for (int i = 0; i < hits.Count; i = i + 1) {
+            if (i > 0) { text = text + ","; }
+            text = text + Convert.ToString(hits[i].id);
+        }
+        return text;
+    }
+
+    static void Clean(string basePath) {
+        File.Delete(basePath);
+        File.Delete(basePath + ".m0");
+        File.Delete(basePath + ".m1");
+        for (int i = 0; i < 40; i = i + 1) {
+            File.Delete(basePath + ".s" + Convert.ToString(i));
+        }
+    }
+
+    static void Main() {
+        string path = "_scratch/zandb_quantize_tmp.zdb";
+        Directory.CreateDirectory("_scratch");
+        Clean(path);
+
+        float[] query = new float[4];
+        query[0] = 0.5f;
+        query[1] = -0.25f;
+        query[2] = 0.75f;
+        query[3] = 0.125f;
+
+        ZanDatabase db = ZanDatabase.Open(path, ZanStore.DUR_SYNC);
+        Ok(db.IsOpen(), "open");
+        Collection docs = db.GetCollection("docs");
+
+        List<int> ids = new List<int>();
+        List<float[]> vectors = new List<float[]>();
+        for (int i = 0; i < 40; i = i + 1) {
+            float[] vector = Vector(i);
+            ids.Add(docs.Insert(Doc(i, vector)));
+            vectors.Add(vector);
+        }
+        VectorIndexOptions options = new VectorIndexOptions(4);
+        options.quantize = true;
+        docs.EnsureVectorIndex("embedding", options);
+
+        List<int> truth = Truth(ids, vectors, query, 5);
+        List<VectorHit> hits = docs.SearchVector("embedding", query, 5, 64);
+        Ok(hits.Count == 5, "quantize search returns 5");
+        int overlap = Overlap(hits, truth);
+        Ok(overlap >= 3, "quantize top5 overlaps truth: " + Convert.ToString(overlap) + "/5");
+
+        bool rejected = false;
+        try { docs.SearchVectorExact("embedding", query, 5); }
+        catch { rejected = true; }
+        Ok(rejected, "quantize mode rejects exact scan");
+
+        string before = Ids(hits);
+
+        // 检查点往返：量化导出从文档流取回原向量，导入重建码。
+        db.Checkpoint();
+        docs.CheckpointSearchIndexes();
+        db.Close();
+        db = ZanDatabase.Open(path, ZanStore.DUR_SYNC);
+        docs = db.GetCollection("docs");
+        List<VectorHit> after = docs.SearchVector("embedding", query, 5, 64);
+        Ok(after.Count == 5, "quantize search after reopen");
+        Ok(Ids(after) == before, "reopen round-trip preserves top5 ids");
+
+        // 墓碑：删除后不出现在结果里；再走一次检查点往返，
+        // 墓碑槽以全零码导入（跳过范数校验）仍不影响检索。
+        int removed = after[0].id;
+        Ok(docs.DeleteById(removed), "delete top hit");
+        List<VectorHit> minus = docs.SearchVector("embedding", query, 5, 64);
+        bool gone = true;
+        for (int i = 0; i < minus.Count; i = i + 1) {
+            if (minus[i].id == removed) { gone = false; }
+        }
+        Ok(gone && minus.Count == 5, "removed id absent from results");
+
+        db.Checkpoint();
+        docs.CheckpointSearchIndexes();
+        db.Close();
+        db = ZanDatabase.Open(path, ZanStore.DUR_SYNC);
+        docs = db.GetCollection("docs");
+        List<VectorHit> resumed = docs.SearchVector("embedding", query, 5, 64);
+        gone = true;
+        for (int i = 0; i < resumed.Count; i = i + 1) {
+            if (resumed[i].id == removed) { gone = false; }
+        }
+        Ok(gone && resumed.Count == 5, "tombstone survives zero-code import");
+
+        // 增量插入（检查点重放后的量化 Add 路径）：贴近查询的
+        // 新文档应排到首位。
+        float[] near = new float[4];
+        near[0] = 0.5f;
+        near[1] = -0.25f;
+        near[2] = 0.75f;
+        near[3] = 0.125f;
+        int nearId = docs.Insert(Doc(40, near));
+        List<VectorHit> topped = docs.SearchVector("embedding", query, 5, 64);
+        Ok(topped.Count == 5 && topped[0].id == nearId, "incremental add tops the query");
+
+        // 指纹失效：quantize=false 重建后精确扫描恢复，且与真值
+        // 完全一致（真值在现役文档集 + 新文档上重算）。
+        VectorIndexOptions plain = new VectorIndexOptions(4);
+        docs.EnsureVectorIndex("embedding", plain);
+        List<VectorHit> exact = docs.SearchVectorExact("embedding", query, 5);
+        List<int> activeIds = new List<int>();
+        List<float[]> activeVectors = new List<float[]>();
+        for (int i = 0; i < ids.Count; i = i + 1) {
+            if (ids[i] != removed) {
+                activeIds.Add(ids[i]);
+                activeVectors.Add(vectors[i]);
+            }
+        }
+        activeIds.Add(nearId);
+        activeVectors.Add(near);
+        List<int> plainTruth = Truth(activeIds, activeVectors, query, 5);
+        Ok(Overlap(exact, plainTruth) == 5, "rebuild without quantize restores exact scan");
+
+        // 非量化索引不受新闸门影响（回归守卫）。
+        Collection plainDocs = db.GetCollection("plain");
+        float[] pv = new float[4];
+        pv[0] = 1.0f;
+        pv[1] = 0.0f;
+        pv[2] = 0.0f;
+        pv[3] = 0.0f;
+        plainDocs.Insert(Doc(0, pv));
+        plainDocs.EnsureVectorIndex("embedding", new VectorIndexOptions(4));
+        Ok(plainDocs.SearchVectorExact("embedding", query, 1).Count == 1,
+        "float32 index keeps exact scan");
+
+        db.Close();
+        Clean(path);
+        Console.WriteLine("done " + Convert.ToString(checks));
+    }
+}

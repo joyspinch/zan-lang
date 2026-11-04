@@ -272,7 +272,7 @@ public class CollectionSearch {
         string ip = IndexPrefix(kind, field);
         try {
             BuildInputs(collection, state);
-            JsonValue snapshot = StageCheckpoint(state, generation);
+            JsonValue snapshot = StageCheckpoint(collection, state, generation);
             state.applied = this.kv.GetRevision() + 1;
             snapshot.Set("revision", JsonValue.NewInt(state.applied));
             List<JsonValue> old = Definitions();
@@ -516,6 +516,9 @@ public class CollectionSearch {
     public List<VectorHit> Vector(string field, float[] query, int k, int efSearch, bool exact, VectorFilter filter) {
         RequireCommitted();
         VectorIndex index = Load("vector", field).vector;
+        if (exact && index.IsQuantized()) {
+            throw new ArgumentException("quantized vector index has no exact scan; rebuild with quantize disabled");
+        }
         if (exact) { return index.SearchExactFiltered(query, k, filter); }
         return index.SearchFiltered(query, k, efSearch, filter);
     }
@@ -559,8 +562,8 @@ public class CollectionSearch {
         if (left < hi) { CollectionSearch.SortHits(hits, left, hi); }
     }
 
-    public JsonValue StageCheckpoint(CollectionSearchState state, string generation) {
-        if (state.kind == "vector") { return StageVectorCheckpoint(state, generation); }
+    public JsonValue StageCheckpoint(Collection collection, CollectionSearchState state, string generation) {
+        if (state.kind == "vector") { return StageVectorCheckpoint(collection, state, generation); }
         // —— 文本代 v1：原有 JSON 行通道不变 ——
         string ip = IndexPrefix(state.kind, state.field);
         JsonValue root = state.text.ExportState();
@@ -595,7 +598,7 @@ public class CollectionSearch {
     // 树），头部 JSON 只留定义与图元（options/entry/maxLevel/rng
     // + 槽数/批数）。行载荷是原始字节，段层对含 NUL 的记录透明
     // 转义；打开时按 format 分流，v1 快照仍可读。
-    public JsonValue StageVectorCheckpoint(CollectionSearchState state, string generation) {
+    public JsonValue StageVectorCheckpoint(Collection collection, CollectionSearchState state, string generation) {
         string ip = IndexPrefix(state.kind, state.field);
         JsonValue root = JsonValue.NewObject();
         root.Put("options", state.vector.Options().ToJson());
@@ -603,9 +606,23 @@ public class CollectionSearch {
         root.PutInt("maxLevel", state.vector.maxLevel);
         root.PutInt("rng", (int)state.vector.randomState);
         List<KvEntry> rows = new List<KvEntry>();
+        // 量化模式 float 块不驻留：原向量经 source 现场从文档行取
+        // 回（active 槽逐个点查），墓碑槽由导出层写全零记录。
+        int kid = collection.KeyIdOf(state.field);
+        ZanStore store = this.kv;
         state.vector.ExportBatches((string payload) => {
             rows.Add(new KvEntry(ip + "snap:" + generation + ":" + Collection.PadId(rows.Count), payload));
-        }, 1048576);
+        }, 1048576, (int id) => {
+            string body = store.Get(collection.DocKey(id));
+            if (body == null || body.Length == 0) {
+                throw new IOException("checkpoint vector source missing document " + Convert.ToString(id));
+            }
+            JsonValue value = collection.FieldOf(body, kid);
+            if (value == null || value.IsNull()) {
+                throw new IOException("checkpoint vector source missing field " + Convert.ToString(id));
+            }
+            return CollectionSearch.ReadVector(value, state.options);
+        });
         WriteRows(rows);
         JsonValue snapshot = JsonValue.NewObject();
         snapshot.PutInt("format", 2);
@@ -617,7 +634,7 @@ public class CollectionSearch {
         snapshot.Put("root", root);
         return snapshot;
     }
-    public void Checkpoint() {
+    public void Checkpoint(Collection collection) {
         RequireCommitted();
         List<JsonValue> defs = Definitions();
         for (int i = 0; i < defs.Count; i = i + 1) {
@@ -625,7 +642,7 @@ public class CollectionSearch {
             defs[i].Str("field", ""));
             string generation = CollectionSearch.RevisionKey(this.kv.GetRevision() + 1);
             try {
-                JsonValue snapshot = StageCheckpoint(state, generation);
+                JsonValue snapshot = StageCheckpoint(collection, state, generation);
                 string checkpoint = snapshot.ToJson();
                 this.kv.Begin();
                 this.kv.Put(IndexPrefix(state.kind, state.field) + "snapshot", checkpoint);
@@ -652,7 +669,7 @@ public class CollectionSearch {
             CollectionSearchState state = Create(field, kind, def.ToJson(), generation, config);
             try {
                 BuildInputs(collection, state);
-                JsonValue snapshot = StageCheckpoint(state, generation);
+                JsonValue snapshot = StageCheckpoint(collection, state, generation);
                 state.applied = this.kv.GetRevision() + 1;
                 snapshot.Set("revision", JsonValue.NewInt(state.applied));
                 JsonValue catalog = JsonValue.NewArray();

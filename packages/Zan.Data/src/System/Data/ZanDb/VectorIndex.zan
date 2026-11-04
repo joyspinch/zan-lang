@@ -12,9 +12,15 @@ public delegate bool VectorFilter(int id);
 // （可含 NUL，经存储层透明转义），按序交付拼接即完整快照。
 public delegate void VectorBatchSink(string payload);
 
+// 量化模式的批次导出向量供给：活性槽位按 id 从正文流式解析原向量
+// （驻留只有量化码），返回 null 视为文档缺失，明确报错。
+public delegate float[] VectorSource(int id);
+
 public class VectorIndex {
     public VectorIndexOptions options;
     public List<VectorChunk> chunks;
+    // 量化码平行存储（options.quantize 时独占，float 块不驻留）。
+    public List<VectorCodeChunk> codeChunks;
     public List<VectorNode> nodes;
     public Dict<int, int> idSlots;
     public int chunkRows;
@@ -22,6 +28,8 @@ public class VectorIndex {
     public int maxLevel;
     public long randomState;
     public AtomicInt lastDistanceCount;
+    // 导入期间复用的向量暂存（量化路径逐槽解码用，避免批量堆垃圾）。
+    private float[] importScratch;
     // 二进制快照导入期间的待挂边暂存：pendingEdges 按
     // 「数量, 槽位…」逐层打包，pendingEdgeBase 记每个槽位的起始
     // 下标。边可指向任意槽位（含后位），故全部记录就位后由
@@ -34,6 +42,7 @@ public class VectorIndex {
         options.Validate();
         this.options = options.Clone();
         this.chunks = new List<VectorChunk>();
+        this.codeChunks = new List<VectorCodeChunk>();
         this.nodes = new List<VectorNode>();
         this.idSlots = new Dict<int, int>();
         this.chunkRows = 65536 / options.dimensions;
@@ -96,7 +105,76 @@ public class VectorIndex {
         }
     }
 
+    // 槽位量化码存储就位：与 CopyIntoSlot 相同的块增长规则。
+    public void EnsureCodeStorage(int slot) {
+        int chunk = slot / this.chunkRows;
+        if (chunk == this.codeChunks.Count) {
+            this.codeChunks.Add(new VectorCodeChunk(this.chunkRows * this.options.dimensions));
+        }
+    }
+
+    // SQ8 量化写入：每向量 min-max 归一到 [0,255]。返回 inverseNorm
+    //（与 ValidateCoordinates 同口径），scale/offset 经 out 交付。
+    // 非退化向量（max==min）按 1e-12 量程处理，码全落 0。
+    public double QuantizeIntoSlot(int slot, float[] vector, out double scale, out double offset) {
+        double min = vector[0];
+        double max = vector[0];
+        for (int i = 1; i < this.options.dimensions; i = i + 1) {
+            double v = vector[i];
+            if (v < min) { min = v; }
+            if (v > max) { max = v; }
+        }
+        double range = max - min;
+        if (range <= 0) { range = 1e-12; }
+        scale = range / 255;
+        offset = min;
+        this.EnsureCodeStorage(slot);
+        VectorCodeChunk owner = this.codeChunks[slot / this.chunkRows];
+        int at = (slot % this.chunkRows) * this.options.dimensions;
+        for (int i = 0; i < this.options.dimensions; i = i + 1) {
+            double q = (vector[i] - min) / scale;
+            if (q < 0) { q = 0; }
+            if (q > 255) { q = 255; }
+            owner.values[at + i] = (byte)q;
+        }
+        return this.ValidateCoordinates(vector, 0);
+    }
+
+    // 槽位是否持有量化码（量化模式）。
+    public bool IsQuantized() { return this.options.quantize; }
+
+    // 量化码反量化距离：查询向量 work.query 对槽位码的近似距离。
+    // cosine: 1 - invNq·invNs·(s·Σq·code + o·Σq)，Σq 预存 work.sumQuery；
+    // L2: Σ (q - (code·s + o))² 逐维。
+    public double DistanceToCode(VectorWorkspace work, int slot) {
+        VectorCodeChunk owner = this.codeChunks[slot / this.chunkRows];
+        int offset = (slot % this.chunkRows) * this.options.dimensions;
+        VectorNode node = this.nodes[slot];
+        double scale = node.quantScale;
+        double shift = node.quantOffset;
+        double sum = 0;
+        if (this.options.metric == 1) {
+            for (int i = 0; i < this.options.dimensions; i = i + 1) {
+                double delta = (double)work.query[work.offset + i]
+                - ((double)owner.values[offset + i] * scale + shift);
+                sum = sum + delta * delta;
+            }
+            return sum;
+        }
+        for (int i = 0; i < this.options.dimensions; i = i + 1) {
+            sum = sum + (double)work.query[work.offset + i] * (double)owner.values[offset + i];
+        }
+        double approx = sum * scale + shift * work.sumQuery;
+        double distance = 1.0 - approx * work.inverseNorm * node.inverseNorm;
+        if (distance < 0) { return 0; }
+        if (distance > 2) { return 2; }
+        return distance;
+    }
+
     public float[] CopyVector(int slot) {
+        if (this.options.quantize) {
+            throw new IOException("quantized index has no resident vector to copy");
+        }
         VectorChunk owner = this.chunks[slot / this.chunkRows];
         int offset = (slot % this.chunkRows) * this.options.dimensions;
         float[] vector = new float[this.options.dimensions];
@@ -106,6 +184,7 @@ public class VectorIndex {
 
     public double DistanceTo(VectorWorkspace work, int slot) {
         work.distanceCount = work.distanceCount + 1;
+        if (this.options.quantize) { return this.DistanceToCode(work, slot); }
         VectorChunk owner = this.chunks[slot / this.chunkRows];
         int offset = (slot % this.chunkRows) * this.options.dimensions;
         double sum = 0;
@@ -126,6 +205,7 @@ public class VectorIndex {
     }
 
     public double DistanceBetween(int a, int b) {
+        if (this.options.quantize) { return this.DistanceBetweenCode(a, b); }
         VectorChunk ca = this.chunks[a / this.chunkRows];
         VectorChunk cb = this.chunks[b / this.chunkRows];
         int oa = (a % this.chunkRows) * this.options.dimensions;
@@ -142,6 +222,45 @@ public class VectorIndex {
             sum = sum + (double)ca.values[oa + i] * (double)cb.values[ob + i];
         }
         double distance = 1.0 - sum * this.nodes[a].inverseNorm * this.nodes[b].inverseNorm;
+        if (distance < 0) { return 0; }
+        if (distance > 2) { return 2; }
+        return distance;
+    }
+
+    // 码间反量化距离（图构建互距）。展开 (ca·sA+oA) 与 (cb·sB+oB)
+    // 的组合项，逐维只扫一遍码。
+    public double DistanceBetweenCode(int a, int b) {
+        VectorCodeChunk ca = this.codeChunks[a / this.chunkRows];
+        VectorCodeChunk cb = this.codeChunks[b / this.chunkRows];
+        int oa = (a % this.chunkRows) * this.options.dimensions;
+        int ob = (b % this.chunkRows) * this.options.dimensions;
+        VectorNode na = this.nodes[a];
+        VectorNode nb = this.nodes[b];
+        double sumAB = 0;
+        double sumA = 0;
+        double sumB = 0;
+        if (this.options.metric == 1) {
+            double sum = 0;
+            for (int i = 0; i < this.options.dimensions; i = i + 1) {
+                double va = (double)ca.values[oa + i] * na.quantScale + na.quantOffset;
+                double vb = (double)cb.values[ob + i] * nb.quantScale + nb.quantOffset;
+                double delta = va - vb;
+                sum = sum + delta * delta;
+            }
+            return sum;
+        }
+        for (int i = 0; i < this.options.dimensions; i = i + 1) {
+            double va = (double)ca.values[oa + i];
+            double vb = (double)cb.values[ob + i];
+            sumAB = sumAB + va * vb;
+            sumA = sumA + va;
+            sumB = sumB + vb;
+        }
+        double approx = na.quantScale * nb.quantScale * sumAB
+        + na.quantScale * nb.quantOffset * sumB
+        + na.quantOffset * nb.quantScale * sumA
+        + na.quantOffset * nb.quantOffset * this.options.dimensions;
+        double distance = 1.0 - approx * na.inverseNorm * nb.inverseNorm;
         if (distance < 0) { return 0; }
         if (distance > 2) { return 2; }
         return distance;
@@ -268,18 +387,37 @@ public class VectorIndex {
         this.ValidateDimensions(vector);
         int slot = this.nodes.Count;
         if (slot >= 2147483646) { throw new InvalidOperationException("Vector slot capacity exhausted"); }
-        this.CopyIntoSlot(slot, vector);
-        VectorChunk owner = this.chunks[slot / this.chunkRows];
-        int offset = (slot % this.chunkRows) * this.options.dimensions;
-        double inverseNorm = this.ValidateCoordinates(owner.values, offset);
+        double inverseNorm;
+        double quantScale = 0;
+        double quantOffset = 0;
+        if (this.options.quantize) {
+            // 量化模式不驻留 float 块：码 + scale/offset 即全部驻留。
+            inverseNorm = this.QuantizeIntoSlot(slot, vector, out quantScale, out quantOffset);
+        } else {
+            this.CopyIntoSlot(slot, vector);
+            VectorChunk owner = this.chunks[slot / this.chunkRows];
+            int offset = (slot % this.chunkRows) * this.options.dimensions;
+            inverseNorm = this.ValidateCoordinates(owner.values, offset);
+        }
         int level = this.NextLevel();
         VectorNode node = new VectorNode(id, level, this.options.m, inverseNorm);
+        if (this.options.quantize) { node.quantScale = quantScale; node.quantOffset = quantOffset; }
         this.nodes.Add(node);
         if (this.idSlots.ContainsKey(id)) { this.nodes[this.idSlots[id]].active = 0; }
         this.idSlots[id] = slot;
         this.idSlots.ContainsKey(id);
         if (this.entry < 0) { this.entry = slot; this.maxLevel = level; return; }
-        VectorWorkspace work = new VectorWorkspace(owner.values, offset, inverseNorm, this.nodes.Count);
+        VectorWorkspace work;
+        if (this.options.quantize) {
+            work = new VectorWorkspace(vector, 0, inverseNorm, this.nodes.Count);
+            double sumQuery = 0;
+            for (int i = 0; i < this.options.dimensions; i = i + 1) { sumQuery = sumQuery + vector[i]; }
+            work.sumQuery = sumQuery;
+        } else {
+            VectorChunk owner = this.chunks[slot / this.chunkRows];
+            int offset = (slot % this.chunkRows) * this.options.dimensions;
+            work = new VectorWorkspace(owner.values, offset, inverseNorm, this.nodes.Count);
+        }
         int current = this.entry;
         for (int layer = this.maxLevel; layer > level; layer = layer - 1) {
             current = this.Greedy(work, current, layer);
@@ -315,7 +453,13 @@ public class VectorIndex {
         float[] owned = new float[this.options.dimensions];
         NativeMemory.Copy((nint)owned, (nint)query, owned.Length * 4);
         double inverseNorm = this.ValidateCoordinates(owned, 0);
-        return new VectorWorkspace(owned, 0, inverseNorm, this.nodes.Count);
+        VectorWorkspace work = new VectorWorkspace(owned, 0, inverseNorm, this.nodes.Count);
+        if (this.options.quantize) {
+            double sumQuery = 0;
+            for (int i = 0; i < this.options.dimensions; i = i + 1) { sumQuery = sumQuery + owned[i]; }
+            work.sumQuery = sumQuery;
+        }
+        return work;
     }
 
     public int QueryLimit(int k) {
@@ -532,6 +676,17 @@ public class VectorIndex {
         }
     }
 
+    // 记录的层边段编码（两种导出通道共用）。
+    private void WriteNodeEdges(ByteBuffer b, VectorNode node) {
+        for (int layer = 0; layer <= node.level; layer = layer + 1) {
+            VectorNeighbors neighbors = node.layers[layer];
+            b.WriteVarInt(neighbors.count);
+            for (int i = 0; i < neighbors.count; i = i + 1) {
+                b.WriteVarInt(neighbors.slots[i]);
+            }
+        }
+    }
+
     // 把全部槽位记录流式编码为若干批次载荷（每批约 batchBytes
     // 字节），经 sink 交付。内存峰值 = 一个批次的编码缓冲；向量
     // 直接从紧凑块存储上 memcpy，不逐维装箱。
@@ -547,13 +702,43 @@ public class VectorIndex {
             VectorChunk owner = this.chunks[slot / this.chunkRows];
             int offset = (slot % this.chunkRows) * this.options.dimensions;
             b.WriteBytes((nint)owner.values + offset * 4, this.options.dimensions * 4);
-            for (int layer = 0; layer <= node.level; layer = layer + 1) {
-                VectorNeighbors neighbors = node.layers[layer];
-                b.WriteVarInt(neighbors.count);
-                for (int i = 0; i < neighbors.count; i = i + 1) {
-                    b.WriteVarInt(neighbors.slots[i]);
+            this.WriteNodeEdges(b, node);
+            if (b.Length() >= batchBytes) {
+                sink(b.ToStr());
+                b.Clear();
+            }
+        }
+        if (b.Length() > 0) { sink(b.ToStr()); }
+        b.Free();
+    }
+
+    // 量化模式导出：float 块不驻留，原向量经 source 从文档流式
+    // 取回（只对 active 槽调用）；墓碑槽写全零向量，导入侧按码
+    // 重建。载荷格式与非量化完全一致（canonical float32），两种
+    // 模式的检查点可以互换。
+    public void ExportBatches(VectorBatchSink sink, int batchBytes, VectorSource source) {
+        if (sink == null) { throw new ArgumentException("Missing vector batch sink"); }
+        if (!this.options.quantize) { this.ExportBatches(sink, batchBytes); return; }
+        if (source == null) { throw new ArgumentException("quantized checkpoint export requires a vector source"); }
+        if (batchBytes < 4096) { batchBytes = 4096; }
+        int bytes = this.options.dimensions * 4;
+        float[] zero = new float[this.options.dimensions];
+        ByteBuffer b = ByteBuffer.Alloc(batchBytes + 4096);
+        for (int slot = 0; slot < this.nodes.Count; slot = slot + 1) {
+            VectorNode node = this.nodes[slot];
+            b.WriteU8(node.active);
+            b.WriteU8(node.level);
+            b.WriteVarInt(node.id);
+            float[] vector = zero;
+            if (node.active == 1) {
+                vector = source(node.id);
+                if (vector == null || vector.Length != this.options.dimensions) {
+                    b.Free();
+                    throw new IOException("checkpoint vector source returned invalid vector");
                 }
             }
+            b.WriteBytes((nint)vector, bytes);
+            this.WriteNodeEdges(b, node);
             if (b.Length() >= batchBytes) {
                 sink(b.ToStr());
                 b.Clear();
@@ -594,13 +779,34 @@ public class VectorIndex {
                 b.Free();
                 throw new InvalidOperationException("Vector slot capacity exhausted");
             }
-            this.EnsureSlotStorage(slot);
-            VectorChunk owner = this.chunks[slot / this.chunkRows];
-            int offset = (slot % this.chunkRows) * this.options.dimensions;
-            NativeMemory.Copy((nint)owner.values + offset * 4, b.Raw() + b.ReadPos(), bytes);
-            b.SeekRead(b.ReadPos() + bytes);
-            double inverseNorm = this.ValidateCoordinates(owner.values, offset);
-            VectorNode node = new VectorNode((int)id, level, this.options.m, inverseNorm);
+            VectorNode node;
+            if (this.options.quantize) {
+                // 量化模式：float 块不驻留，码由暂存向量现建。墓碑槽
+                // 码全零、scale/offset 失效——零向量过不了余弦范数
+                // 校验，必须跳过校验（搜索不会把它当结果返回）。
+                if (this.importScratch == null) { this.importScratch = new float[this.options.dimensions]; }
+                NativeMemory.Copy((nint)this.importScratch, b.Raw() + b.ReadPos(), bytes);
+                b.SeekRead(b.ReadPos() + bytes);
+                double scale = 0;
+                double shift = 0;
+                double inverseNorm = 0;
+                if (active == 1) {
+                    inverseNorm = this.QuantizeIntoSlot(slot, this.importScratch, out scale, out shift);
+                } else {
+                    this.EnsureCodeStorage(slot);
+                }
+                node = new VectorNode((int)id, level, this.options.m, inverseNorm);
+                node.quantScale = scale;
+                node.quantOffset = shift;
+            } else {
+                this.EnsureSlotStorage(slot);
+                VectorChunk owner = this.chunks[slot / this.chunkRows];
+                int offset = (slot % this.chunkRows) * this.options.dimensions;
+                NativeMemory.Copy((nint)owner.values + offset * 4, b.Raw() + b.ReadPos(), bytes);
+                b.SeekRead(b.ReadPos() + bytes);
+                double inverseNorm = this.ValidateCoordinates(owner.values, offset);
+                node = new VectorNode((int)id, level, this.options.m, inverseNorm);
+            }
             if (active == 0) { node.active = 0; }
             this.nodes.Add(node);
             if (active == 1) {
