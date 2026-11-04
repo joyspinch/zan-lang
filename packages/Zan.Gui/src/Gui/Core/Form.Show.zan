@@ -1,0 +1,292 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Json;
+using Gui.Markup;
+
+namespace Gui;
+
+// 声明式窗口半边（B-ID147，Form 的 partial）：子类即窗口——业务字段即
+// ViewModel（data-bind 路径直接对上），方法即事件（@click 按名接线到本
+// 实例）。Show() 按"类名 ↔ 同目录同名 .html"约定装载界面并进消息循环；
+// 没有 html 的窗口走纯代码 Add 建树。owner 与标题/尺寸等窗口键都在
+// html 根属性上，动态绑定走 bindProps 通用泵。
+public partial class Form {
+    // 按名接线与绑定泵共用；Show() 装配时创建。
+    public ModelBinder docBinder;
+
+    // 装配出的整棵树根（markup 文档的 body 或代码建的容器）。
+    public Control docRoot;
+
+    // 显示窗口：装配（找同名 html → Html.Parse 一跳建树 → 绑 this →
+    // 挂泵 → OnLoad 钩子）后进消息循环，阻塞到窗口关闭。主窗由编译器
+    // 合成的入口调用；子窗在事件处理器里 new + Show（owner 可选）。
+    public void Show() {
+        this.assembleDoc(false);
+        this.Run();
+    }
+
+    // 只装配不跑循环（离屏测试/宿主自管帧）。出帧即泵，CaptureSnapshot
+    // 一次就是一次完整的双向同步。
+    public Form ShowOffscreen() {
+        this.assembleDoc(true);
+        return this;
+    }
+
+    // ---- 装配 ----
+
+    void assembleDoc(bool offscreen) {
+        // 声明层与控件 kind 名单（data-for 行克隆按 kind 重建），均幂等。
+        Html.Install();
+        ControlBootstrap.Install();
+
+        string html = Form.FindDoc(this.GetType().Name);
+        string title = this.GetType().Name;
+        int winW = 480;
+        int winH = 520;
+        Control tree = null;
+        string scopedCss = "";
+        if (html != null) {
+            HtmlDoc doc = Html.Parse(html, "", null);
+            tree = doc.root;
+            // 窗口键是根元素的普通属性：静态初值读一次，:data-win-* 动态
+            // 绑定走根控件 bindProps 的通用泵。
+            string t = tree.CssAttr("data-win-title");
+            if (t != "") { title = t; }
+            string w = tree.CssAttr("data-win-w");
+            if (w != "") { winW = Convert.ToInt32(w); }
+            string h = tree.CssAttr("data-win-h");
+            if (h != "") { winH = Convert.ToInt32(h); }
+            scopedCss = doc.css;
+        }
+
+        this.InitForm(title, winW, winH, offscreen);
+        App app = this.GetApp();
+        if (tree == null) {
+            tree = new Panel();
+        } else if (scopedCss != "") {
+            string zs = app.NextLoadScope();
+            app.ApplyScopedTree(tree, HtmlScope.Styles(scopedCss, zs), zs);
+        }
+        // 运行期装载的文档要客户区填充，否则整树缩在左上角按内容排版。
+        if (html != null && tree is Element) {
+            ((Element)tree).DockFill();
+        }
+        this.Add(tree);
+
+        this.docRoot = tree;
+        this.docBinder = new ModelBinder();
+        if (this.AutoWireDoc()) {
+            this.docBinder.SetRoot(tree, this);
+            this.docBinder.Wire();
+        }
+        ModelHosts.Register(app, this.docBinder);
+        this.CheckBindsDoc(tree);
+        if (this.HasMethod("OnLoad")) { this.Invoke("OnLoad", this); }
+    }
+    // 按名自动接线：树上的处理器名逐个 HasMethod 对账（缺失即 fail-fast），
+    // 注册 plain + arg 双槽（arg 槽只在控件声明 handlerArg 时被选中）。
+    bool AutoWireDoc() {
+        List<string> names = new List<string>();
+        Form.CollectHandlers(this, names);
+        List<string> missing = new List<string>();
+        for (int i = 0; i < names.Count; i++) {
+            string h = names[i];
+            if (!this.HasMethod(h)) { missing.Add(h); continue; }
+            string evt = h;
+            this.docBinder.Handle(h, () => { this.Invoke(evt); });
+            this.docBinder.HandleArg(h, (string s) => { this.Invoke(evt, s); });
+        }
+        if (missing.Count > 0) {
+            string list = "";
+            for (int i = 0; i < missing.Count; i++) {
+                list = list + (i > 0 ? ", " : "") + missing[i];
+            }
+            Console.WriteLine("WINDOW: handlers declared in doc but missing on " +
+                              this.GetType().Name + ": " + list);
+            Environment.Exit(1);
+        }
+        return true;
+    }
+
+    // 启动期绑定对账：bind 路径解析不到本实例字段的，开窗前一次性列出。
+    void CheckBindsDoc(Control tree) {
+        List<string> bad = new List<string>();
+        Form.CollectBinds(tree, this, bad);
+        if (bad.Count > 0) {
+            string list = "";
+            for (int i = 0; i < bad.Count; i++) {
+                list = list + (i > 0 ? ", " : "") + bad[i];
+            }
+            Console.WriteLine("WINDOW: bind paths not found on " +
+                              this.GetType().Name + ": " + list);
+            Environment.Exit(1);
+        }
+    }
+
+    static void CollectHandlers(Control c, List<string> names) {
+        for (int i = 0; i < c.events.Count; i++) {
+            string h = c.events[i].val;
+            if (h != "" && !names.Contains(h)) { names.Add(h); }
+        }
+        for (int j = 0; j < c.children.Count; j++) {
+            Form.CollectHandlers(c.children[j], names);
+        }
+    }
+
+    static void CollectBinds(Control c, object vm, List<string> bad) {
+        // 模板行内绑定以行项为作用域，对根模型校验会假失败——子树跳过。
+        if (c.Kind() == "template") { return; }
+        if (c.bindPath != "" && !Form.FieldExists(vm, c.bindPath)) {
+            bad.Add(c.bindPath);
+        }
+        if (Form.IsPlainPath(c.bindIf) && !Form.FieldExists(vm, c.bindIf)) {
+            bad.Add(c.bindIf);
+        }
+        if (Form.IsPlainPath(c.bindDisabled) && !Form.FieldExists(vm, c.bindDisabled)) {
+            bad.Add(c.bindDisabled);
+        }
+        for (int j = 0; j < c.children.Count; j++) {
+            Form.CollectBinds(c.children[j], vm, bad);
+        }
+    }
+
+    static bool FieldExists(object vm, string path) {
+        string leaf = "";
+        object target = ModelBinder.ResolveFieldScope(vm, path, out leaf);
+        return target != null && target.HasField(leaf);
+    }
+
+    // 纯路径（ident[.ident]*）才校验；带运算符的是表达式，归 binder 语义。
+    static bool IsPlainPath(string s) {
+        if (s == null || s == "") { return false; }
+        for (int i = 0; i < s.Length; i++) {
+            char ch = s[i];
+            bool ok = (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
+                      (ch >= '0' && ch <= '9') || ch == '_' || ch == '.';
+            if (!ok) { return false; }
+        }
+        return true;
+    }
+
+    // 类名 ↔ 同目录同名 .html：内嵌 VFS 命中即用（发布态权威），退回
+    // 工作目录裸名、磁盘 src 树（开发态）；大小写不敏感 basename 匹配，
+    // 命中多份取大小写精确者，仍不唯一就列候选 fail-fast。
+    static string FindDoc(string cls) {
+        List<string> names = new List<string>();
+        List<string> emb = File.EmbeddedNames("");
+        if (emb != null) {
+            for (int i = 0; i < emb.Count; i++) {
+                string n = emb[i];
+                if (n.EndsWith(".html") && !names.Contains(n)) { names.Add(n); }
+            }
+        }
+        string exact = "";
+        List<string> hits = new List<string>();
+        for (int i = 0; i < names.Count; i++) {
+            string baseName = Form.Basename(names[i]);
+            if (baseName == cls) { exact = names[i]; break; }
+            if (baseName.ToLower() == cls.ToLower()) { hits.Add(names[i]); }
+        }
+        if (exact != "") { return Form.ReadDoc(exact); }
+        if (hits.Count == 1) { return Form.ReadDoc(hits[0]); }
+        if (hits.Count > 1) {
+            string list = "";
+            for (int i = 0; i < hits.Count; i++) {
+                list = list + (i > 0 ? ", " : "") + hits[i];
+            }
+            Console.WriteLine("WINDOW: multiple docs match class '" + cls +
+                              "': " + list);
+            Environment.Exit(1);
+        }
+        if (hits.Count == 0) {
+            // 开发态散盘：工作目录裸名，再扫工程 src 树。
+            string local = cls + ".html";
+            string lower = cls.ToLower() + ".html";
+            if (Form.ReadText(local) != null) { return local; }
+            if (Form.ReadText(lower) != null) { return lower; }
+            Form.CollectDisk("src", names);
+            if (names.Count == 0) { Form.CollectDisk("../src", names); }
+            for (int i = 0; i < names.Count; i++) {
+                string baseName = Form.Basename(names[i]);
+                if (baseName == cls) { exact = names[i]; break; }
+                if (baseName.ToLower() == cls.ToLower()) { hits.Add(names[i]); }
+            }
+            if (exact != "") { return Form.ReadDoc(exact); }
+            if (hits.Count == 1) { return Form.ReadDoc(hits[0]); }
+        }
+        return null;
+    }
+
+    static string ReadDoc(string rel) {
+        string html = Form.ReadText(rel);
+        if (html != null) { return html; }
+        string bare = rel;
+        int slash = bare.LastIndexOf("/");
+        if (slash >= 0) { bare = bare.Substring(slash + 1); }
+        html = Form.ReadText(bare);
+        if (html != null) { return html; }
+        string hit = Form.FindInTree("src", bare);
+        if (hit == null) { hit = Form.FindInTree("../src", bare); }
+        return hit;
+    }
+
+    static string FindInTree(string dir, string target) {
+        try {
+            if (!Directory.Exists(dir)) { return null; }
+            List<string> files = Directory.GetFiles(dir);
+            for (int i = 0; files != null && i < files.Count; i++) {
+                string f = files[i];
+                int slash = f.LastIndexOf("/");
+                int bs = f.LastIndexOf("\\");
+                if (bs > slash) { slash = bs; }
+                if (slash >= 0 && f.Substring(slash + 1) == target) {
+                    return Form.ReadText(f);
+                }
+            }
+            List<string> subdirs = Directory.GetDirectories(dir);
+            for (int i = 0; subdirs != null && i < subdirs.Count; i++) {
+                string hit = Form.FindInTree(subdirs[i], target);
+                if (hit != null) { return hit; }
+            }
+        } catch (Exception) {
+        }
+        return null;
+    }
+
+    static void CollectDisk(string dir, List<string> names) {
+        try {
+            if (!Directory.Exists(dir)) { return; }
+            List<string> files = Directory.GetFiles(dir);
+            for (int i = 0; files != null && i < files.Count; i++) {
+                string f = files[i].Replace("\\", "/");
+                if (f.EndsWith(".html") && !names.Contains(f)) { names.Add(f); }
+            }
+            List<string> subdirs = Directory.GetDirectories(dir);
+            for (int i = 0; subdirs != null && i < subdirs.Count; i++) {
+                string leaf = Form.Basename(subdirs[i]);
+                if (leaf == "bin" || leaf == "obj" || leaf == "tools" ||
+                    leaf == "assets" || leaf == ".build") { continue; }
+                Form.CollectDisk(subdirs[i], names);
+            }
+        } catch (Exception) {
+        }
+    }
+
+    static string ReadText(string rel) {
+        try {
+            if (File.Exists(rel)) { return File.ReadAllText(rel); }
+        } catch (Exception) {
+        }
+        return null;
+    }
+
+    static string Basename(string path) {
+        string s = path.Replace("\\", "/");
+        int slash = s.LastIndexOf("/");
+        if (slash >= 0) { s = s.Substring(slash + 1); }
+        int dot = s.LastIndexOf(".");
+        if (dot > 0) { s = s.Substring(0, dot); }
+        return s;
+    }
+}

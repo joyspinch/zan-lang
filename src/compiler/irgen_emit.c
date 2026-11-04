@@ -2062,7 +2062,8 @@ static void emit_user_method_bodies(zan_irgen_t *g, method_body_work_t *work,
                     if (specialized) target_fn = specialized;
                 }
                 if (!target) {
-                    if (this_init || member->method_decl.has_base_init) {
+                    if (this_init || member->method_decl.has_base_init ||
+                        has_declared_ctor(g, target_sym)) {
                         zan_diag_emit_code(g->diag, DIAG_ERROR, member->loc, 3088,
                             "no matching %s constructor with %d argument(s)",
                             this_init ? "this" : "base", init_args->count);

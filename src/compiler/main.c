@@ -1799,19 +1799,14 @@ static void zan_synth_action_dispatch(zan_ast_node_t *unit, zan_arena_t *arena,
                           synth->comp_unit.decls.items[i], arena);
 }
 
-/* ---------- DocApp.Bootstrap 的入口 shim 合成（B-ID147） ----------
+/* ---------- gui 工程的入口 shim 合成（B-ID147） ----------
  *
- * 两条触发路径，用户没写 Main 且没有 __DesignMain 时合成 __ZanDocMain
- * 类：静态 __DesignMain 调 DocApp.Bootstrap()——irgen 的入口回退语义让
- * 用户 Main 天然优先（写了就不回退），框架化窗口的 .zan 里因此零胶水：
- *   1) 调用点驱动：编译单元里有零参 DocApp.Bootstrap()/BootstrapOffscreen()
- *      调用（散文件、测试探针，无工程形态也活）；
- *   2) 工程门控：zan.proj type=gui（模板族/示例的零胶水形态——用户代码
- *      只有字段与事件方法，哪来的 Bootstrap 调用）。
- * 工厂数组（VmFactory[]）由 checker 在 Bootstrap 零参调用点按本编译
- * 单元的用户类合成（checker_collect_vm_classes）。 */
+ * zan.proj type=gui 且用户没写 Main、没有 __DesignMain 时，合成一个
+ * `new <入口文件基名>().show()` 调用——窗口即对象（类继承框架的
+ * Window 基类，show 装载同目录同名 .html 并绑定自身）。编译器不认识
+ * 任何框架类型：`show` 只是类型检查自然会过的方法调用；用户写了
+ * Main 即整体优先（__DesignMain 回退语义）。 */
 typedef struct {
-    int bootstrap;   /* 零参 DocApp.Bootstrap / BootstrapOffscreen 调用 */
     int main;        /* 用户声明的 static Main */
     int design_main; /* 已有 __DesignMain */
 } zdm_probe_t;
@@ -1819,22 +1814,6 @@ typedef struct {
 static zan_walk_action_t zdm_probe_walk(zan_ast_node_t *n, void *ud) {
     zdm_probe_t *p = (zdm_probe_t *)ud;
     if (!n) return ZAN_WALK_CONTINUE;
-    if (n->kind == AST_CALL && n->call.callee &&
-        n->call.callee->kind == AST_MEMBER_ACCESS &&
-        n->call.args.count == 0) {
-        zan_ast_node_t *obj = n->call.callee->member.object;
-        zan_istr_t nm = n->call.callee->member.name;
-        bool is_docapp = obj && obj->kind == AST_IDENTIFIER &&
-            obj->ident.name.len == 6 &&
-            memcmp(obj->ident.name.str, "DocApp", 6) == 0;
-        if (is_docapp && ((nm.len == 9 &&
-                           memcmp(nm.str, "Bootstrap", 9) == 0) ||
-                          (nm.len == 18 &&
-                           memcmp(nm.str, "BootstrapOffscreen", 18) == 0))) {
-            p->bootstrap = 1;
-            return ZAN_WALK_CONTINUE;
-        }
-    }
     if (n->kind == AST_METHOD_DECL && n->method_decl.name.str) {
         zan_istr_t nm = n->method_decl.name;
         if (nm.len == 4 && memcmp(nm.str, "Main", 4) == 0 &&
@@ -1847,30 +1826,42 @@ static zan_walk_action_t zdm_probe_walk(zan_ast_node_t *n, void *ud) {
 }
 
 static void zan_synth_docapp_main(zan_ast_node_t *unit, zan_arena_t *arena,
-                                  zan_diag_t *diag) {
+                                  zan_diag_t *diag, const char *entry_file) {
     if (!unit || unit->kind != AST_COMPILATION_UNIT) return;
     zdm_probe_t probe = {0};
     for (int i = 0; i < unit->comp_unit.decls.count; i++)
         zan_ast_walk(unit->comp_unit.decls.items[i], zdm_probe_walk, NULL,
                      &probe);
     if (probe.main || probe.design_main) return;
-    if (!probe.bootstrap) {
-        /* 工程门控路径：type=gui 且没写 Main = 想要 DocApp 窗口。 */
-        if (!load_proj_android_keys_done) {
-            load_proj_android_keys();
-            load_proj_android_keys_done = true;
-        }
-        if (strcmp(proj_app_type, "gui") != 0) return;
+    if (!load_proj_android_keys_done) {
+        load_proj_android_keys();
+        load_proj_android_keys_done = true;
     }
+    if (strcmp(proj_app_type, "gui") != 0) return;
+
+    /* 入口类名 = 入口文件基名帕斯卡化（App.zan ↔ class App 约定）。 */
+    const char *entry = entry_file;
+    const char *slash = strrchr(entry, '/');
+    const char *bslash = strrchr(entry, '\\');
+    if (bslash > slash) slash = bslash;
+    const char *base = slash ? slash + 1 : entry;
+    char cls[256];
+    size_t blen = strlen(base);
+    if (blen >= sizeof(cls)) blen = sizeof(cls) - 1;
+    memcpy(cls, base, blen);
+    cls[blen] = 0;
+    char *dot = strrchr(cls, '.');
+    if (dot) *dot = 0;
+    if (cls[0] >= 'a' && cls[0] <= 'z') cls[0] = (char)(cls[0] - 32);
+    if (cls[0] == 0) return;
 
     zd_buf_t b;
     memset(&b, 0, sizeof(b));
-    zd_putf(&b, "/* 由编译器合成的设计稿窗口入口（勿手改）：type=gui 工程无 Main\n");
+    zd_putf(&b, "/* 由编译器合成的窗口入口（勿手改）：type=gui 工程无 Main\n");
     zd_putf(&b, "   时的回退入口；用户写了 Main 即整体优先，本类不参与。 */\n");
-    zd_putf(&b, "using Gui;\n");
     zd_putf(&b, "static class __ZanDocMain {\n");
     zd_putf(&b, "    static void __DesignMain() {\n");
-    zd_putf(&b, "        DocApp.Bootstrap();\n");
+    zd_putf(&b, "        new %s().Show();\n", cls);
     zd_putf(&b, "    }\n}\n");
     if (!b.buf) return;
 
@@ -3583,17 +3574,6 @@ int main(int argc, char **argv) {
 
         explicit_input_count = input_count;
 
-        /* type=gui 工程的零胶水形态：用户代码没有 using（字段+事件方法
-         * 而已），Zan.Gui 包不会被按需拉取——工程门控直接把 Gui 命名
-         * 空间灌进拉取集（B-ID147；文件去重由 add_stdlib_input 保证）。 */
-        if (!load_proj_android_keys_done && project_root_has_manifest()) {
-            load_proj_android_keys();
-            load_proj_android_keys_done = true;
-        }
-        if (strcmp(proj_app_type, "gui") == 0) {
-            auto_include_namespace(stdlib_root, "Gui",
-                                   &input_files, &input_count, &input_cap);
-        }
         pi_filter_active = !emit_symbols_path &&
                            getenv("ZAN_NO_PULLIN_FILTER") == NULL;
         if (pi_filter_active) {
@@ -3897,7 +3877,7 @@ int main(int argc, char **argv) {
         /* 框架化窗口入口：同一窗口期合成 __ZanDocMain（零参 Bootstrap
            调用点驱动，见 zan_synth_docapp_main 注释）。 */
         zan_compile_trace("synth docapp main");
-        zan_synth_docapp_main(ast, arena, diag);
+        zan_synth_docapp_main(ast, arena, diag, input_file);
         zan_compile_trace("nsresolve generated");
         zan_nsresolve_run(ast, arena, diag);
         zan_compile_trace("prune");

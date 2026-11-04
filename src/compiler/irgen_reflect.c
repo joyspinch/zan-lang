@@ -334,11 +334,36 @@ static LLVMValueRef refl_emit_fields_class(zan_irgen_t *g, zan_symbol_t *sym,
     if (!recs) return NULL;
     int n = 0;
     int slot = class_vptr_offset(sym);
+    /* shadow 语义（B-ID147 绑定对账踩实）：派生类声明与继承同名的字段
+     * 时，反射只认最派生那个——先扫一遍名字，被更派生声明遮蔽的基类
+     * 条目不进表（否则 linear find 先命中基类槽位，子类字段读成基类值）。 */
+    char *shadowed = (char *)calloc((size_t)(sym->member_count > 0 ? sym->member_count : 1), 1);
+    if (shadowed) {
+        for (int i = 0; i < sym->member_count; i++) {
+            zan_symbol_t *m = sym->members[i];
+            if ((m->kind != SYM_FIELD && m->kind != SYM_PROPERTY) ||
+                field_member_is_static(m))
+                continue;
+            for (int j = i + 1; j < sym->member_count && !shadowed[i]; j++) {
+                zan_symbol_t *w = sym->members[j];
+                if ((w->kind != SYM_FIELD && w->kind != SYM_PROPERTY) ||
+                    field_member_is_static(w))
+                    continue;
+                if (w->name.len == m->name.len &&
+                    memcmp(w->name.str, m->name.str, (size_t)m->name.len) == 0)
+                    shadowed[i] = 1;
+            }
+        }
+    }
     for (int i = 0; i < sym->member_count; i++) {
         zan_symbol_t *m = sym->members[i];
         if ((m->kind != SYM_FIELD && m->kind != SYM_PROPERTY) ||
             field_member_is_static(m))
             continue;
+        if (shadowed && shadowed[i]) {
+            slot++;
+            continue;
+        }
         if (g->publish_mode) {
             /* 在 publish 模式下：
              * 私有字段（非 public 且不是属性）既不参与外部反射，也不参与 HTML 数据绑定，
@@ -394,6 +419,7 @@ static LLVMValueRef refl_emit_fields_class(zan_irgen_t *g, zan_symbol_t *sym,
         *out_count = n;
     }
     free(recs);
+    free(shadowed);
     return arr;
 }
 
