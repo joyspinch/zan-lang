@@ -396,12 +396,14 @@ static zan_ast_node_t *parse_type_ref(zan_parser_t *p) {
     int ranks[16];
     int nranks = 0;
     bool seen_array = false;
+    bool array_nullable = false;
     for (;;) {
         if (nn_top && parser_check(p, TK_QUESTION)) {
             break;
         }
         if (parser_match(p, TK_QUESTION)) {
             if (seen_array) {
+                array_nullable = true;
             } else {
                 type_node->type_ref.is_nullable = true;
             }
@@ -433,6 +435,7 @@ static zan_ast_node_t *parse_type_ref(zan_parser_t *p) {
             zan_ast_list_init(&w->type_ref.type_args);
             cur = w;
         }
+        cur->type_ref.is_nullable = array_nullable;
         p->type_depth--;
         return cur;
     }

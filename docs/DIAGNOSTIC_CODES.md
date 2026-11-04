@@ -243,6 +243,7 @@
 | E2106 | E | cannot convert '%s' to '%s' in %s: value types cannot be boxed into a reference type |
 | E2107 | E | cannot convert '%s' to '%s' in %s: a reference type cannot be converted to a value type |
 | E2108 | E | cannot convert '%s' to '%s' in %s: generic type arguments are invariant and must match exactly |
+| E2109 | E | possible null reference dereference: '%.*s' is a nullable type '%s'; access via '?.' or assert via '!' or check for null first |
 
 > E2022（窄化转换）为跨文件一号的首例：`checker.c` 与 `irgen_expr_core.c`
 > 的同文案站点共享同号（规则 3——号键在消息语义上，不在文件或站点上）。

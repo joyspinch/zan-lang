@@ -263,6 +263,13 @@ static zan_type_t *checker_nullable_base(zan_type_t *t) {
         ? t->element_type : t;
 }
 
+static zan_type_t *checker_clone_type(zan_checker_t *c, zan_type_t *src) {
+    if (!src) return NULL;
+    zan_type_t *t = (zan_type_t *)zan_arena_alloc(c->arena, sizeof(zan_type_t));
+    *t = *src;
+    return t;
+}
+
 /* 查找a named method (e */
 static zan_symbol_t *checker_find_method(zan_symbol_t *type_sym, zan_istr_t name) {
     while (type_sym) {
@@ -1490,6 +1497,12 @@ static bool checker_type_assignable(zan_type_t *target, zan_type_t *value) {
     if (target->kind == TYPE_ERROR || value->kind == TYPE_ERROR) return true;
     if (target->kind == TYPE_TYPE_PARAM || value->kind == TYPE_TYPE_PARAM)
         return true;
+
+    /* 可空引用类型安全契约：可空引用 (T?) 不能隐式赋给非空引用目标 (T) */
+    if (value->is_nullable && !target->is_nullable) {
+        return false;
+    }
+
     if (target->kind == value->kind && checker_type_equal(target, value))
         return true;
 
@@ -3479,6 +3492,11 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
                                                               left->element_type,
                                                               right);
                 if (merged) return merged;
+            } else if (left->is_nullable) {
+                zan_type_t *non_null = checker_clone_type(c, left);
+                non_null->is_nullable = 0;
+                zan_type_t *merged = merge_conditional_types(c, non_null, right);
+                if (merged) return merged;
             } else if (checker_type_is_ref(left) || checker_type_is_ref(right) ||
                        right->kind == TYPE_OBJECT ||
                        right->kind == TYPE_NULLABLE) {
@@ -3544,8 +3562,18 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
 
     case AST_POSTFIX_UNARY: {
         zan_type_t *operand = zan_checker_check_expr(c, expr->unary.operand);
-        if (expr->unary.op == TK_BANG)
-            return operand ? operand : c->binder->type_error;
+        if (expr->unary.op == TK_BANG) {
+            if (!operand) return c->binder->type_error;
+            if (operand->kind == TYPE_NULLABLE && operand->element_type) {
+                return operand->element_type;
+            }
+            if (operand->is_nullable) {
+                zan_type_t *non_null = checker_clone_type(c, operand);
+                non_null->is_nullable = 0;
+                return non_null;
+            }
+            return operand;
+        }
         check_readonly_incdec(c, expr);
         if (type_is_numeric(operand)) return operand;
         return c->binder->type_error;
@@ -5050,6 +5078,13 @@ static bool node_guards_null(zan_ast_node_t *n, zan_istr_t name, int depth,
         if (n->member.null_cond && is_named_ident(n->member.object, name))
             return true;
         return node_guards_null(n->member.object, name, depth + 1, use);
+    case AST_NEW_EXPR:
+    case AST_STRING_LITERAL:
+        return true;
+    case AST_POSTFIX_UNARY:
+        if (n->unary.op == TK_BANG && is_named_ident(n->unary.operand, name))
+            return true;
+        return node_guards_null(n->unary.operand, name, depth + 1, use);
     case AST_UNARY:
         return node_guards_null(n->unary.operand, name, depth + 1, use);
     case AST_CAST_EXPR:
@@ -5065,6 +5100,14 @@ static bool node_guards_null(zan_ast_node_t *n, zan_istr_t name, int depth,
                node_guards_null(n->conditional.then_expr, name, depth + 1, use) ||
                node_guards_null(n->conditional.else_expr, name, depth + 1, use);
     case AST_ASSIGNMENT:
+        if (is_named_ident(n->binary.left, name)) {
+            if (n->binary.right &&
+                (n->binary.right->kind == AST_NEW_EXPR ||
+                 n->binary.right->kind == AST_STRING_LITERAL ||
+                 (n->binary.right->kind == AST_POSTFIX_UNARY &&
+                  n->binary.right->unary.op == TK_BANG)))
+                return true;
+        }
         return node_guards_null(n->binary.left, name, depth + 1, use) ||
                node_guards_null(n->binary.right, name, depth + 1, use);
     case AST_BLOCK:
@@ -5076,6 +5119,15 @@ static bool node_guards_null(zan_ast_node_t *n, zan_istr_t name, int depth,
     case AST_THROW_STMT:
         return node_guards_null(n->throw_stmt.value, name, depth + 1, use);
     case AST_VAR_DECL:
+        if (n->var_decl.name.len == name.len &&
+            memcmp(n->var_decl.name.str, name.str, (size_t)name.len) == 0) {
+            if (n->var_decl.initializer &&
+                (n->var_decl.initializer->kind == AST_NEW_EXPR ||
+                 n->var_decl.initializer->kind == AST_STRING_LITERAL ||
+                 (n->var_decl.initializer->kind == AST_POSTFIX_UNARY &&
+                  n->var_decl.initializer->unary.op == TK_BANG)))
+                return true;
+        }
         return node_guards_null(n->var_decl.initializer, name, depth + 1, use);
     case AST_IF_STMT:
         return node_guards_null(n->if_stmt.cond, name, depth + 1, use) ||
@@ -5141,6 +5193,16 @@ static void checker_reject_null_receiver(zan_checker_t *c, zan_ast_node_t *expr)
         m = c->last_call_method;
     } else if (obj->kind == AST_IDENTIFIER) {
         struct checker_local *l = checker_find_local_slot(c, obj->ident.name);
+        if (l && l->type && l->type->is_nullable) {
+            if (c->current_body && !node_guards_null(c->current_body, obj->ident.name, 0, expr->loc)) {
+                zan_diag_emit_code(c->diag, DIAG_ERROR, expr->loc, 2109,
+                              "possible null reference dereference: '%.*s' is a nullable type '%s'; "
+                              "access via '?.' or assert via '!' or check for null first",
+                              (int)obj->ident.name.len, obj->ident.name.str,
+                              type_name(l->type));
+                return;
+            }
+        }
         if (!l || !l->null_src) return;
         if (!c->current_body) return;
         if (node_guards_null(c->current_body, obj->ident.name, 0, expr->loc))

@@ -561,7 +561,11 @@ static size_t type_display_rec(const zan_type_t *t, char *buf, size_t cap,
         int rank = t->array_rank > 1 ? t->array_rank : 1;
         for (int r = 1; r < rank; r++)
             used = display_append(buf, cap, used, ",", 1);
-        return display_append(buf, cap, used, "]", 1);
+        used = display_append(buf, cap, used, "]", 1);
+        if (t->is_nullable) {
+            used = display_append(buf, cap, used, "?", 1);
+        }
+        return used;
     }
     if (t->name.str)
         used = display_append(buf, cap, used, t->name.str, t->name.len);
@@ -572,6 +576,9 @@ static size_t type_display_rec(const zan_type_t *t, char *buf, size_t cap,
             used = type_display_rec(t->type_args[i], buf, cap, used);
         }
         used = display_append(buf, cap, used, ">", 1);
+    }
+    if (t->is_nullable) {
+        used = display_append(buf, cap, used, "?", 1);
     }
     return used;
 }
@@ -850,12 +857,18 @@ int zan_null_arg_score(zan_type_t *pt) {
 }
 
 zan_type_t *zan_binder_make_nullable_type(zan_binder_t *b, zan_type_t *elem) {
-    if (!elem || elem == b->type_error || elem->kind == TYPE_NULLABLE ||
-        !type_is_value_kind(elem))
+    if (!elem || elem == b->type_error || elem->kind == TYPE_NULLABLE || elem->is_nullable)
         return elem;
-    zan_type_t *t = make_type(b->arena, TYPE_NULLABLE, elem->name.str, elem->name.len);
-    t->element_type = elem;
-    return t;
+    if (type_is_value_kind(elem)) {
+        zan_type_t *t = make_type(b->arena, TYPE_NULLABLE, elem->name.str, elem->name.len);
+        t->element_type = elem;
+        return t;
+    } else {
+        zan_type_t *t = make_type(b->arena, elem->kind, elem->name.str, elem->name.len);
+        *t = *elem;
+        t->is_nullable = 1;
+        return t;
+    }
 }
 
 static inline int binder_decl_type_param_count(const zan_ast_node_t *d) {
@@ -1102,14 +1115,6 @@ zan_type_t *zan_binder_resolve_type(zan_binder_t *b, zan_ast_node_t *type_ref) {
     }
 
     zan_type_t *resolved = base;
-    if (type_ref->type_ref.is_nullable) {
-        if (resolved && resolved != b->type_error &&
-            type_is_value_kind(resolved)) {
-            zan_type_t *nullable = make_type(b->arena, TYPE_NULLABLE, name.str, name.len);
-            nullable->element_type = resolved;
-            resolved = nullable;
-        }
-    }
     if (type_ref->type_ref.is_array) {
         zan_type_t *elem = resolved;
         if (type_ref->type_ref.array_element)
@@ -1120,6 +1125,20 @@ zan_type_t *zan_binder_resolve_type(zan_binder_t *b, zan_ast_node_t *type_ref) {
         arr->array_rank = type_ref->type_ref.array_rank > 0
             ? type_ref->type_ref.array_rank : 1;
         resolved = arr;
+    }
+    if (type_ref->type_ref.is_nullable) {
+        if (resolved && resolved != b->type_error) {
+            if (type_is_value_kind(resolved)) {
+                zan_type_t *nullable = make_type(b->arena, TYPE_NULLABLE, resolved->name.str, resolved->name.len);
+                nullable->element_type = resolved;
+                resolved = nullable;
+            } else if (!resolved->is_nullable) {
+                zan_type_t *nullable = make_type(b->arena, resolved->kind, resolved->name.str, resolved->name.len);
+                *nullable = *resolved;
+                nullable->is_nullable = 1;
+                resolved = nullable;
+            }
+        }
     }
     if (b->binding_done && resolved && resolved != b->type_error) {
         type_ref->type_ref.rt_type = resolved;

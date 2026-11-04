@@ -70,6 +70,7 @@ struct zan_type {
     zan_type_t **delegate_param_types;
     int delegate_param_count;
     int delegate_is_async;
+    uint8_t is_nullable;
 };
 
 typedef struct zan_symbol zan_symbol_t;
