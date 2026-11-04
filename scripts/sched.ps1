@@ -133,7 +133,13 @@ function Get-LockLease([string]$n) {
 # 拿不到准入互斥就短暂退避重试（临界区极短，正常不会发生）。
 function Invoke-WithAdmission([scriptblock]$block) {
     for ($i = 0; $i -lt 100; $i++) {
-        if ($admitMutex.WaitOne(200)) {
+        $acquired = $false
+        try {
+            $acquired = $admitMutex.WaitOne(200)
+        } catch [System.Threading.AbandonedMutexException] {
+            $acquired = $true
+        }
+        if ($acquired) {
             try { return & $block } finally { try { $admitMutex.ReleaseMutex() } catch { } }
         }
     }

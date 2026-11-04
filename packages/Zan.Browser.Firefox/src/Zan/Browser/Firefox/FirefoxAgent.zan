@@ -26,6 +26,10 @@ public delegate int GeckoGetIntFn(nint viewHandle);
 public delegate void GeckoSetFingerprintFn(nint viewHandle, string configJson);
 public delegate void GeckoClipByIdFn(int viewId, string spec);
 public delegate void GeckoClearDataFn(int userContextId);
+public delegate nint GeckoCreateViewExFn(
+    nint parentHwnd, int x, int y, int w, int h,
+    string profileDir, ref GeckoViewConfig config);
+public delegate void GeckoDefaultViewConfigFn(ref GeckoViewConfig outConfig);
 
 /// <summary>
 /// 语义交互元素 (面向 AI Agent 的压缩结构)
@@ -140,6 +144,7 @@ public class GeckoNative {
     #endif
 
     public static nint XulMod = 0;
+    public static nint EmbedMod = 0;
     static bool loaded = false;
 
     public static nint PfnInit = 0;
@@ -164,42 +169,89 @@ public class GeckoNative {
     public static nint PfnSetClipById = 0;
     public static nint PfnGetViewId = 0;
     public static nint PfnClearOriginData = 0;
+    public static nint PfnCreateViewEx = 0;
+    public static nint PfnDefaultViewConfig = 0;
 
     public static bool EnsureLoaded() {
-        if (loaded && XulMod != 0) return true;
+        if (loaded && (XulMod != 0 || EmbedMod != 0)) return true;
         loaded = true;
 
         string[] searchPaths = new string[] {
             ".",
             "bin",
+            "D:/project/firefox/sdk/bin/Release",
+            "D:/project/firefox/sdk/bin",
             "D:/project/firefox/dist/bin",
             "D:/project/firefox/dist/zan-browser-windows-x64",
             "D:/project/firefox/obj-x86_64-pc-windows-msvc/dist/bin",
-            "../dist/zan-browser-windows-x64"
+            "../dist/zan-browser-windows-x64",
+            "/Applications/Firefox.app/Contents/MacOS",
+            "/usr/lib/firefox",
+            "/usr/local/lib"
         };
 
+        string[] embedNames = new string[] {
+            "gecko_embed.dll",
+            "libgecko_embed.dylib",
+            "libgecko_embed.so",
+            "gecko_embed"
+        };
+
+        string[] xulNames = new string[] {
+            "xul.dll",
+            "XUL",
+            "libxul.dylib",
+            "libxul.so",
+            "xul"
+        };
+
+        // 优先尝试装载高可配置化的跨平台 gecko_embed 动态库 (.dll / .dylib / .so)
         for (int i = 0; i < searchPaths.Length; i = i + 1) {
             string p = searchPaths[i];
-            string xulPath = Path.Combine(p, "xul.dll");
-            if (File.Exists(xulPath)) {
-                #if WINDOWS
-                SetDllDirectoryA(p);
-                #endif
-                XulMod = Interop.Load(xulPath);
-                if (XulMod != 0) {
-                    ResolveSymbols();
-                    return true;
+            for (int j = 0; j < embedNames.Length; j = j + 1) {
+                string embedPath = Path.Combine(p, embedNames[j]);
+                if (File.Exists(embedPath)) {
+                    #if WINDOWS
+                    SetDllDirectoryA(p);
+                    #endif
+                    EmbedMod = Interop.Load(embedPath);
+                    if (EmbedMod != 0) {
+                        PfnCreateViewEx = Interop.Symbol(EmbedMod, "gecko_create_view_ex");
+                        PfnDefaultViewConfig = Interop.Symbol(EmbedMod, "gecko_default_view_config");
+                        break;
+                    }
+                }
+            }
+            if (EmbedMod != 0) break;
+        }
+
+        // 装载 C-ABI 核心 xul 动态库
+        for (int i = 0; i < searchPaths.Length; i = i + 1) {
+            string p = searchPaths[i];
+            for (int j = 0; j < xulNames.Length; j = j + 1) {
+                string xulPath = Path.Combine(p, xulNames[j]);
+                if (File.Exists(xulPath)) {
+                    #if WINDOWS
+                    SetDllDirectoryA(p);
+                    #endif
+                    XulMod = Interop.Load(xulPath);
+                    if (XulMod != 0) {
+                        ResolveSymbols();
+                        return true;
+                    }
                 }
             }
         }
 
-        XulMod = Interop.Load("xul.dll");
-        if (XulMod != 0) {
-            ResolveSymbols();
-            return true;
+        for (int j = 0; j < xulNames.Length; j = j + 1) {
+            XulMod = Interop.Load(xulNames[j]);
+            if (XulMod != 0) {
+                ResolveSymbols();
+                return true;
+            }
         }
 
-        return false;
+        return EmbedMod != 0;
     }
 
     static void ResolveSymbols() {
@@ -551,5 +603,21 @@ public class FirefoxAgentSession {
         }
 
         return new FirefoxAgentTab(handle, contextId);
+    }
+
+    /// <summary>
+    /// 基于高级全维度配置创建智能体标签页 (支持动态无头、图片屏蔽、WebRTC隔离、性能限帧与内存限额)
+    /// </summary>
+    public static FirefoxAgentTab CreateTabEx(nint parentHwnd, int x, int y, int w, int h, string profileDir, GeckoViewConfig config) {
+        if (!GeckoNative.EnsureLoaded()) return null;
+
+        if (GeckoNative.PfnCreateViewEx != 0) {
+            GeckoCreateViewExFn fn = (GeckoCreateViewExFn)GeckoNative.PfnCreateViewEx;
+            nint handle = fn(parentHwnd, x, y, w, h, profileDir, ref config);
+            if (handle == 0) return null;
+            return new FirefoxAgentTab(handle, 0);
+        }
+
+        return null;
     }
 }
