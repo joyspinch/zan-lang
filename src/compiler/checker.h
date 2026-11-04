@@ -41,6 +41,12 @@ struct zan_checker {
      * 体里的 x.F 在此查会误报 ExprNode 上无成员（E2084 假阳性）。
      * 非调用位置照旧查体。 */
     int in_call_args;
+    /* 正在检查「有委托目标可裁决」的右值（B-ID151）：赋值右值 / 带类型
+     * var_decl 初始化 / return 值 / with 与对象初始化器右值。方法组在这
+     * 些位置不能当场拒绝——目标类型是委托且签名兼容时合法
+     * （inR.Submit += ColorPicker.SubmitR），由 checker_check_assignable
+     * 按目标裁决。check_member_access 的 saw_method 分支在此静默。 */
+    int in_assignable_ctx;
 };
 
 void zan_checker_init(zan_checker_t *c, zan_binder_t *binder,

@@ -2293,6 +2293,7 @@ static zan_symbol_t *checker_find_method_typed(zan_checker_t *c,
     /* null 实参把候选判死的现场：留一份用于报错（见函数末尾）。 */
     zan_type_t *null_bad_type = NULL;
     int null_bad_index = -1;
+    zan_type_t *mg_delegate_candidates[16] = {0};
     int argc = call->call.args.count;
     int type_arg_count = call->call.type_args.count;
     for (zan_symbol_t *s = type_sym; s;
@@ -2419,13 +2420,18 @@ static zan_symbol_t *checker_find_method_typed(zan_checker_t *c,
                      * 形参）。 */
                     if (!pt || pt->kind == TYPE_ERROR) continue;
                     if (pt->kind == TYPE_TYPE_PARAM) continue; /* T 可能是委托 */
-                    if (pt->kind != TYPE_DELEGATE) { compatible = false; break; }
-                    if (!method_group_matches_delegate(c, mgs, pt)) {
-                        compatible = false;
-                        break;
+                    if (pt->kind == TYPE_DELEGATE) {
+                        if (j < 16 && !mg_delegate_candidates[j])
+                            mg_delegate_candidates[j] = pt;
+                        if (!method_group_matches_delegate(c, mgs, pt)) {
+                            compatible = false;
+                            break;
+                        }
+                        score += 4;
+                        continue;
                     }
-                    score += 4;
-                    continue;
+                    compatible = false;
+                    break;
                 }
                 if (!pt || !at || pt->kind == TYPE_ERROR ||
                     at->kind == TYPE_ERROR || pt->kind == TYPE_TYPE_PARAM ||
@@ -2460,15 +2466,40 @@ static zan_symbol_t *checker_find_method_typed(zan_checker_t *c,
             }
         }
     }
-    if (!best && null_bad_type) {
-        /* 没有任何重载接得住这个 null：报错，不要退回"第一个同名方法"，
-         * 否则 null 又会被悄悄当成值类型实参传下去。 */
-        zan_ast_node_t *bad_arg =
-            (null_bad_index >= 0 && null_bad_index < argc)
-                ? call->call.args.items[null_bad_index] : NULL;
-        checker_report_null_arg_mismatch(c, bad_arg, null_bad_type,
-                                         null_bad_index, name);
-        return NULL;
+    if (!best) {
+        if (null_bad_type) {
+            /* 没有任何重载接得住这个 null：报错，不要退回"第一个同名方法"，
+             * 否则 null 又会被悄悄当成值类型实参传下去。 */
+            zan_ast_node_t *bad_arg =
+                (null_bad_index >= 0 && null_bad_index < argc)
+                    ? call->call.args.items[null_bad_index] : NULL;
+            checker_report_null_arg_mismatch(c, bad_arg, null_bad_type,
+                                             null_bad_index, name);
+            return NULL;
+        }
+        for (int j = 0; j < argc; j++) {
+            zan_ast_node_t *arg = call->call.args.items[j];
+            if (!arg) continue;
+            if (arg->kind == AST_NAMED_ARG) arg = arg->named_arg.expr;
+            zan_ast_node_t *vg = arg;
+            while (vg && vg->kind == AST_CAST_EXPR) vg = vg->cast.expr;
+            zan_symbol_t *mgs = expr_method_group(c, vg);
+            if (mgs) {
+                /* 没有任何重载接受此方法组：若有候选形参为委托但签名不匹配，
+                 * 报 E2098；若候选形参均非委托（如 Convert.ToString(sw.ElapsedMilliseconds)），
+                 * 报 E2039。绝不能退回"第一个同名方法"把裸函数指针当值传下去（B-ID151）。 */
+                zan_type_t *dlg = (j < 16) ? mg_delegate_candidates[j] : NULL;
+                if (dlg) {
+                    zan_diag_emit_code(c->diag, DIAG_ERROR, vg->loc, 2098,
+                        "method '%.*s' cannot be converted to delegate type "
+                        "'%s': signature is not compatible",
+                        (int)mgs->name.len, mgs->name.str, type_name(dlg));
+                } else {
+                    reject_method_group(c, vg);
+                }
+                return NULL;
+            }
+        }
     }
     return best ? best : checker_find_method_call(type_sym, name, argc, type_arg_count);
 }
@@ -2898,7 +2929,11 @@ static void check_call_arg_type(zan_checker_t *c, zan_symbol_t *sig, int index,
     {
         zan_ast_node_t *vg = arg;
         while (vg && vg->kind == AST_CAST_EXPR) vg = vg->cast.expr;
-        zan_symbol_t *vmg = expr_method_group(c, vg);
+        /* 最外层是 cast 的实参不在此裁决：豁免目标（委托/泛型 T/
+         * nint/ulong）是有意转换（(nint)App.GuardBody 函数指针互操），
+         * 非豁免目标已由 AST_CAST_EXPR 的方法组检查报过（B-ID151）。 */
+        zan_symbol_t *vmg = (arg && arg->kind == AST_CAST_EXPR)
+            ? NULL : expr_method_group(c, vg);
         if (vmg && pt && pt->kind != TYPE_TYPE_PARAM) {
             if (pt->kind != TYPE_DELEGATE) {
                 reject_method_group(c, vg);
@@ -3190,6 +3225,44 @@ static void reject_method_group(zan_checker_t *c, zan_ast_node_t *e) {
                   (int)m->name.len, m->name.str);
 }
 
+/* 运算符重载委托形参判定（B-ID151）。a += b 在 parser 侧被脱糖为
+ * a = a + b；当 a 为事件类（如 UiEvent）时，其重载 static op_add(UiEvent self, Action handler)
+ * 的实参 b 是合法方法组。若左操作数类型定义了形参为委托且与方法组
+ * 签名兼容的 op_add/op_sub，放行方法组操作数。 */
+static bool class_has_op_delegate(zan_checker_t *c, zan_type_t *left,
+                                  zan_token_kind_t op, zan_ast_node_t *right_node) {
+    if (!left || (left->kind != TYPE_CLASS && left->kind != TYPE_STRUCT) || !left->sym)
+        return false;
+    zan_symbol_t *mg = expr_method_group(c, right_node);
+    if (!mg) return false;
+    const char *op_name = NULL;
+    if (op == TK_PLUS) op_name = "op_add";
+    else if (op == TK_MINUS) op_name = "op_sub";
+    if (!op_name) return false;
+    zan_istr_t name = { (char *)op_name, (int)strlen(op_name) };
+    for (zan_symbol_t *s = left->sym; s;
+         s = (s->type && s->type->base_type) ? s->type->base_type->sym : NULL) {
+        for (int i = 0; i < s->member_count; i++) {
+            zan_symbol_t *m = s->members[i];
+            if (!m || m->kind != SYM_METHOD || m->name.len != name.len ||
+                memcmp(m->name.str, name.str, (size_t)name.len) != 0)
+                continue;
+            if (!m->decl || m->decl->kind != AST_METHOD_DECL) continue;
+            zan_ast_list_t *ps = &m->decl->method_decl.params;
+            bool is_static = (m->decl->method_decl.modifiers & MOD_STATIC) != 0;
+            int param_idx = is_static ? 1 : 0;
+            if (ps->count <= param_idx) continue;
+            zan_ast_node_t *pnode = ps->items[param_idx];
+            if (!pnode || pnode->kind != AST_PARAM || !pnode->param.type) continue;
+            zan_type_t *pt = zan_binder_resolve_type(c->binder, pnode->param.type);
+            if (pt && pt->kind == TYPE_DELEGATE) {
+                if (method_group_matches_delegate(c, mg, pt)) return true;
+            }
+        }
+    }
+    return false;
+}
+
 /* 内建类成员调用的方法组实参裁决（B-ID151）。内建类（Console/Math/
  * List/…）没有 sym，call_arg_signature 拿不到签名，check_call_arg_type
  * 从不运行——check_member_access 在实参位置静默后，方法组实参
@@ -3231,7 +3304,10 @@ static void checker_builtin_mg_args(zan_checker_t *c, zan_type_t *recv,
         if (!arg || arg->kind == AST_REF_ARG) continue;
         zan_ast_node_t *vg = arg;
         while (vg && vg->kind == AST_CAST_EXPR) vg = vg->cast.expr;
-        zan_symbol_t *vmg = expr_method_group(c, vg);
+        /* 最外层是 cast 的实参不在此裁决——豁免目标是有意转换，
+         * 非豁免已由 AST_CAST_EXPR 报过（B-ID151，同 check_call_arg_type）。 */
+        zan_symbol_t *vmg = (arg && arg->kind == AST_CAST_EXPR)
+            ? NULL : expr_method_group(c, vg);
         if (!vmg) continue;
         zan_type_t *pt = checker_builtin_param_type(c, recv, params[i]);
         if (!pt || pt->kind == TYPE_TYPE_PARAM) continue;
@@ -3355,13 +3431,16 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
             if (left->kind != TYPE_DELEGATE)
                 reject_method_group(c, expr->binary.right);
         } else {
-            /* 算术/逻辑/位运算：方法组当操作数永远是错（没有委托目标
+            /* 算术/逻辑/位运算：方法组当操作数通常是错（没有委托目标
              * 可救）。裸方法名/成员方法名在 checking 阶段定型为
              * type_error 被静默放行，漏到发码侧变裸函数指针，按
-             * E3090（i64+ptr 混算）炸 LLVM（B-ID151）。比较运算上面
-             * 单独处理——另一侧是委托时属合法委托比较。 */
+             * E3090（i64+ptr 混算）炸 LLVM（B-ID151）。
+             * 特例：类/结构体重载了委托形参的 op_add/op_sub（如事件
+             * 类型的 `event += OnClick` 脱糖为 `event = event + OnClick`），
+             * 放行该右操作数。 */
             reject_method_group(c, expr->binary.left);
-            reject_method_group(c, expr->binary.right);
+            if (!class_has_op_delegate(c, left, expr->binary.op, expr->binary.right))
+                reject_method_group(c, expr->binary.right);
         }
 
         switch (expr->binary.op) {
@@ -3824,7 +3903,10 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
         if (callee_is_method && recv && recv->sym) {
             zan_symbol_t *typed = checker_find_method_typed(c, recv, recv->sym,
                 expr->call.callee->member.name, expr, arg_types);
-            if (typed && typed != called_sym) {
+            if (!typed) {
+                called_sym = NULL;
+                callee_type = c->binder->type_error;
+            } else if (typed != called_sym) {
                 if (!access_member_allowed(c, typed)) {
                     report_inaccessible(c, typed, expr->call.callee->loc);
                     return c->binder->type_error;
@@ -3844,7 +3926,12 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
                 c->current_type_sym ? c->current_type_sym->type : NULL,
                 c->current_type_sym, expr->call.callee->ident.name,
                 expr, arg_types);
-            if (resolved) called_sym = resolved;
+            if (resolved) {
+                called_sym = resolved;
+            } else {
+                called_sym = NULL;
+                callee_type = c->binder->type_error;
+            }
         }
         /* 泛型方法调用点的 where 约束（A518）：符号定了就查，别等运行期 */
         if (called_sym && called_sym->kind == SYM_METHOD)
@@ -4099,7 +4186,11 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
 
     case AST_ASSIGNMENT: {
         zan_type_t *left = zan_checker_check_expr(c, expr->binary.left);
+        /* 右值有赋值目标做委托裁决（事件 += 处理器等）：方法组在此
+         * 静默，合法性由下面 check_assignable 判（B-ID151）。 */
+        c->in_assignable_ctx = 1;
         zan_type_t *right = zan_checker_check_expr(c, expr->binary.right);
+        c->in_assignable_ctx = 0;
         check_readonly_assignment(c, expr);
         zan_type_t *target = checker_assignment_target_type(c, expr->binary.left);
         if (!target && expr->binary.left->kind == AST_INDEX) {
@@ -4318,15 +4409,23 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
                     continue;
                 }
                 if (field && field->type) {
+                    /* 对象初始化器右值有字段类型做委托裁决（B-ID151） */
+                    c->in_assignable_ctx = 1;
                     zan_type_t *right = zan_checker_check_expr(
                         c, arg->binary.right);
+                    c->in_assignable_ctx = 0;
                     checker_check_assignable(c, field->type, right,
                                              arg->binary.right, arg->loc,
                                              "object initializer");
                     continue;
                 }
             }
+            /* 构造器实参：与方法调用实参同规（可能有委托形参，
+             * 如 new Thread(Run)——方法组在此静默，交构造器候选
+             * 评分按形参裁决）。 */
+            c->in_call_args = 1;
             zan_type_t *arg_type = zan_checker_check_expr(c, arg);
+            c->in_call_args = 0;
             if (li == 0 && i < ctor_argc) {
                 ctor_arg_types[i] = arg_type;
             }
@@ -4638,7 +4737,10 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
                 zan_checker_check_expr(c, asg->binary.right);
                 continue;
             }
+            /* with 右值有字段类型做委托裁决（B-ID151） */
+            c->in_assignable_ctx = 1;
             zan_type_t *val = zan_checker_check_expr(c, asg->binary.right);
+            c->in_assignable_ctx = 0;
             checker_check_assignable(c, field->type, val,
                                      asg->binary.right, asg->loc, "with");
         }
@@ -4647,15 +4749,24 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
 
     case AST_CAST_EXPR: {
         zan_type_t *dst = zan_binder_resolve_type(c->binder, expr->cast.type);
-        if (dst && dst->kind != TYPE_DELEGATE && dst->kind != TYPE_TYPE_PARAM) {
+        if (dst && dst->kind != TYPE_DELEGATE && dst->kind != TYPE_TYPE_PARAM &&
+            dst->kind != TYPE_NINT && dst->kind != TYPE_ULONG) {
             /* 方法组 cast 到非委托类型永远是错：裸方法名在 checking
              * 阶段定型为 type_error 静默放行，漏到发码侧变裸函数
-             * 指针，运行期按腐坏对象解引用段错误（B-ID151）。cast 到
-             * 委托类型的显式转换放行；泛型 T 可能是委托，交实例化点
-             * 裁决。 */
+             * 指针，运行期按腐坏对象解引用段错误（B-ID151）。例外：
+             * cast 到委托类型的显式转换、泛型 T（可能是委托）、
+             * nint/ulong——(nint)App.GuardBody 是方法指针进原生互操
+             * 的惯用法（Window.GuardCall((nint)App.GuardBody, 0)）。 */
             reject_method_group(c, expr->cast.expr);
         }
+        if (dst && (dst->kind == TYPE_DELEGATE || dst->kind == TYPE_TYPE_PARAM ||
+                    dst->kind == TYPE_NINT || dst->kind == TYPE_ULONG)) {
+            /* 豁免目标：内层操作数可能是合法方法组（委托转换/泛型 T/
+             * 函数指针互操）——内层 check 静默，别让 saw_method 抢报。 */
+            c->in_assignable_ctx = 1;
+        }
         zan_type_t *src = zan_checker_check_expr(c, expr->cast.expr);
+        c->in_assignable_ctx = 0;
         if (!dst) return c->binder->type_error;
         if (!checker_cast_is_valid(c, dst, src)) {
             if (dst->kind == TYPE_OBJECT && !checker_type_is_ref(src))
@@ -4735,7 +4846,11 @@ void zan_checker_check_stmt(zan_checker_t *c, zan_ast_node_t *stmt) {
             : NULL;
         zan_type_t *iv = NULL;
         if (stmt->var_decl.initializer) {
+            /* 初始化器有声明类型做委托目标裁决：方法组在此静默，
+             * 合法性由下面 check_assignable 判（B-ID151）。 */
+            c->in_assignable_ctx = 1;
             iv = zan_checker_check_expr(c, stmt->var_decl.initializer);
+            c->in_assignable_ctx = 0;
         }
         if (dt) {
             check_generic_constraints(c, dt, stmt->loc);
@@ -4770,7 +4885,11 @@ void zan_checker_check_stmt(zan_checker_t *c, zan_ast_node_t *stmt) {
 
     case AST_RETURN_STMT:
         if (stmt->ret.value) {
+            /* 返回值有 current_return_type 做委托目标裁决：方法组在此
+             * 静默，合法性由 check_assignable 判（B-ID151）。 */
+            c->in_assignable_ctx = 1;
             zan_type_t *rv = zan_checker_check_expr(c, stmt->ret.value);
+            c->in_assignable_ctx = 0;
             if (c->current_return_type &&
                 c->current_return_type->kind != TYPE_VOID)
                 checker_check_assignable(c, c->current_return_type, rv,
@@ -5943,7 +6062,8 @@ static zan_type_t *check_member_access(zan_checker_t *c, zan_ast_node_t *expr,
              * 重载评分按目标形参裁决——这里抢报会把「方法组 → 委托
              * 实参」（sf.Scan("", s.RecoverRecord)）误杀。diag 按
              * file/line/col/消息去重（B-ID106），先报的场合不双报。 */
-            if (!in_call_callee && !c->in_call_args) {
+            if (!in_call_callee && !c->in_call_args &&
+                !c->in_assignable_ctx) {
                 reject_method_group(c, expr);
             }
             return c->binder->type_error;
