@@ -322,9 +322,26 @@ public class Collection {
             return;
         }
         if (v.IsArray()) {
+            // 刀7 float32 数组直编码（tag 11）：大数值数组（嵌入
+            // 向量场景）从逐元素文本（~8-16 字节/值）压到 4 字节/
+            // 维，编码/解码免逐元素 JSON 化。判据零谎报：元素
+            // ≥ 32、全数值、且每个值位级无损转 float32——缓存
+            // 命中（原 double）与落盘读回（float32）因此位级一
+            // 致；不可无损收敛的 double 数组保持 tag 6 文本保真
+            // （纯整数数组自然落入 tag 6，整数值不经 float32 渲
+            // 染变形）。
+            int cnt = v.Count();
+            if (cnt >= 32 && Collection.ArrayIsF32Encodable(v)) {
+                b.WriteU8(11);
+                b.WriteVarInt(cnt);
+                for (int i = 0; i < cnt; i = i + 1) {
+                    b.WriteF32((float)v.At(i).AsDouble(0));
+                }
+                return;
+            }
             b.WriteU8(6);
-            b.WriteVarInt(v.Count());
-            for (int i = 0; i < v.Count(); i = i + 1) { WriteVal(b, v.At(i)); }
+            b.WriteVarInt(cnt);
+            for (int i = 0; i < cnt; i = i + 1) { WriteVal(b, v.At(i)); }
             return;
         }
         b.WriteU8(7);
@@ -333,6 +350,28 @@ public class Collection {
             b.WriteVarInt(KeyId(v.KeyAt(i)));
             WriteVal(b, v.ValAt(i));
         }
+    }
+
+    // tag 11 编码判据：元素 ≥ 32、全数值、每个值位级无损转
+    // float32（写读一致：缓存 double 原值 = 磁盘 float32 读回）、
+    // 且至少一个非整数文本——纯整数数组保持 tag 6 文本（varint
+    // 1-5 字节/值本就 ≤ 4 字节/值，且整数值的 float32 位形
+    // （如 0x40400000）低字节系统性含 0x00，经转义反膨胀）。
+    // 溢出/NaN 拒绝（|v| 超出 float32 成 Inf 或 NaN 时整体放弃
+    // ——tag 6 文本路径保真）。
+    public static bool ArrayIsF32Encodable(JsonValue v) {
+        int cnt = v.Count();
+        bool hasDecimal = false;
+        for (int i = 0; i < cnt; i = i + 1) {
+            JsonValue e = v.At(i);
+            if (!e.IsNumber()) { return false; }
+            if (!Collection.IsIntStr(e.AsString(""))) { hasDecimal = true; }
+            double d = e.AsDouble(0);
+            if (d != d || d - d != 0) { return false; }
+            float f = (float)d;
+            if ((double)f != d) { return false; }
+        }
+        return hasDecimal;
     }
 
     // doc 的 from 之后是否还存在同名键。
@@ -502,6 +541,21 @@ public class Collection {
             return JsonValue.NewStr(t);
         }
         if (tag == 10) { np = p; return JsonValue.NewStr(""); }
+        if (tag == 11) {
+            // 刀7 float32 数组直编码：dims + dims×4 字节小端。
+            long c = Collection.RecVarInt(s, p, out p);
+            JsonValue a = JsonValue.NewArray();
+            for (int i = 0; i < (int)c; i = i + 1) {
+                int bits = (s[p] & 255)
+                + ((s[p + 1] & 255) << 8)
+                + ((s[p + 2] & 255) << 16)
+                + ((s[p + 3] & 255) << 24);
+                a.Append(JsonValue.NewDouble((double)NativeMemory.AsF32(bits)));
+                p = p + 4;
+            }
+            np = p;
+            return a;
+        }
         if (tag == 6) {
             long c = Collection.RecVarInt(s, p, out p);
             JsonValue a = JsonValue.NewArray();
@@ -530,6 +584,11 @@ public class Collection {
         int tag = s[p] & 255;
         p = p + 1;
         if (tag == 3 || tag == 8) { Collection.RecVarInt(s, p, out np); return; }
+        if (tag == 11) {
+            long c = Collection.RecVarInt(s, p, out np);
+            np = np + (int)c * 4;
+            return;
+        }
         if (tag == 4 || tag == 5) {
             long n = Collection.RecVarInt(s, p, out p);
             np = p + (int)n;
@@ -831,6 +890,22 @@ public class Collection {
             return JsonValue.NewStr(t);
         }
         if (tag == 10) { np = p; return JsonValue.NewStr(""); }
+        if (tag == 11) {
+            // 刀7 float32 数组直编码（指针版）：dims + dims×4 字节小端。
+            long c = Collection.ReadVarIntRaw(basePtr, ref p, end);
+            if (c < 0 || p + (int)c * 4 > end) { return null; }
+            JsonValue a = JsonValue.NewArray();
+            for (int i = 0; i < (int)c; i = i + 1) {
+                int bits = Collection.PeekB(basePtr + p)
+                + (Collection.PeekB(basePtr + p + 1) << 8)
+                + (Collection.PeekB(basePtr + p + 2) << 16)
+                + (Collection.PeekB(basePtr + p + 3) << 24);
+                a.Append(JsonValue.NewDouble((double)NativeMemory.AsF32(bits)));
+                p = p + 4;
+            }
+            np = p;
+            return a;
+        }
         if (tag == 6) {
             long c = Collection.ReadVarIntRaw(basePtr, ref p, end);
             if (c < 0) { return null; }
@@ -1733,6 +1808,12 @@ public class Collection {
         p = p + 1;
         if (tag == 3 || tag == 8) {
             return Collection.ReadVarIntRaw(basePtr, ref p, end) >= 0;
+        }
+        if (tag == 11) {
+            long n = Collection.ReadVarIntRaw(basePtr, ref p, end);
+            if (n < 0 || p + (int)n * 4 > end) { return false; }
+            p = p + (int)n * 4;
+            return true;
         }
         if (tag == 4 || tag == 5) {
             long n = Collection.ReadVarIntRaw(basePtr, ref p, end);

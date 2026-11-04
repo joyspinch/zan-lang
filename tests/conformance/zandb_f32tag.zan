@@ -1,0 +1,181 @@
+using System;
+using System.Data.ZanDb;
+using System.Json;
+using System.IO;
+
+// 刀7 float32 数组直编码（tag 11）一致性用例：大数值数组
+// （≥32 元素、全数值、含小数）以 dims + dims×4 字节原生 float32
+// 编码，体积与编解码双降；纯整数数组、小数组、混合类型数组
+// 保持 tag 6 文本编码。钉死：位级往返等价、指针解码一致、
+// SkipValRaw 走读、溢出回退（超 float32 范围保文本）、量化
+// 向量检查点全链（VectorSource 经文档行读向量）、重开往返。
+// 输出确定性，与 zandb_f32tag.out 比对。
+class ZanDbF32TagTest {
+    static int checks = 0;
+
+    static void Ok(bool cond, string what) {
+        checks = checks + 1;
+        if (cond) {
+            Console.WriteLine("ok " + Convert.ToString(checks) + " - " + what);
+        } else {
+            Console.WriteLine("FAIL " + Convert.ToString(checks) + " - " + what);
+        }
+    }
+
+    static void Clean(string basePath) {
+        File.Delete(basePath);
+        File.Delete(basePath + ".m0");
+        File.Delete(basePath + ".m1");
+        for (int i = 0; i < 40; i = i + 1) {
+            File.Delete(basePath + ".s" + Convert.ToString(i));
+        }
+    }
+
+    static JsonValue VectorDoc(int i, int dims) {
+        JsonValue doc = JsonValue.NewObject();
+        doc.Put("name", JsonValue.NewStr("doc" + Convert.ToString(i)));
+        JsonValue arr = JsonValue.NewArray();
+        for (int j = 0; j < dims; j = j + 1) {
+            double v = ((i * 7 + j * 13) % 200) / 100.0 - 1.0;
+            v = v + 0.25;
+            // 嵌入管线语义：模型输出本就是 float32,写
+            // float32-exact double(位级无损判据的命中前提)。
+            arr.Append(JsonValue.NewDouble((double)(float)v));
+        }
+        doc.Put("embedding", arr);
+        return doc;
+    }
+
+    static void Main() {
+        string path = "_scratch/zandb_f32tag_tmp.zdb";
+        Directory.CreateDirectory("_scratch");
+        Clean(path);
+
+        ZanDatabase db = ZanDatabase.Open(path, ZanStore.DUR_SYNC);
+        Ok(db.IsOpen(), "open");
+        Collection docs = db.GetCollection("docs");
+
+        // 1) tag 11 命中：64 维浮点数组（≥32、含小数）插入 +
+        //    往返位级等价。
+        int dims = 64;
+        List<int> ids = new List<int>();
+        for (int i = 0; i < 8; i = i + 1) {
+            ids.Add(docs.Insert(VectorDoc(i, dims)));
+        }
+        docs.ClearCache();
+        bool bitExact = true;
+        for (int i = 0; i < 8; i = i + 1) {
+            JsonValue doc = docs.FindById(ids[i]);
+            JsonValue arr = doc.Get("embedding");
+            if (arr == null || !arr.IsArray() || arr.Count() != dims) { bitExact = false; break; }
+            for (int j = 0; j < dims; j = j + 1) {
+                double want = ((i * 7 + j * 13) % 200) / 100.0 - 1.0;
+                want = want + 0.25;
+                double got = arr.At(j).AsDouble(-999);
+                float wf = (float)want;
+                if (got != (double)wf) { bitExact = false; }
+            }
+        }
+        Ok(bitExact, "tag11 vector round-trip bit-exact");
+
+        // 2) tag 6 保持：整数数组、小数组、混合类型数组语义不变。
+        JsonValue mixed = JsonValue.NewObject();
+        JsonValue small = JsonValue.NewArray();
+        small.Append(JsonValue.NewDouble(1.5));
+        small.Append(JsonValue.NewDouble(2.5));
+        mixed.Put("small", small);
+        JsonValue ints = JsonValue.NewArray();
+        for (int j = 0; j < 40; j = j + 1) { ints.Append(JsonValue.NewNum(Convert.ToString(j))); }
+        mixed.Put("ints", ints);
+        JsonValue tags = JsonValue.NewArray();
+        tags.Append(JsonValue.NewStr("a"));
+        tags.Append(JsonValue.NewDouble(3.0));
+        mixed.Put("tags", tags);
+        mixed.Put("name", JsonValue.NewStr("mixed"));
+        int mid = docs.Insert(mixed);
+        JsonValue back = docs.FindById(mid);
+        JsonValue smallBack = back.Get("small");
+        JsonValue intsBack = back.Get("ints");
+        JsonValue tagsBack = back.Get("tags");
+        Ok(smallBack != null && smallBack.Count() == 2 && smallBack.At(0).AsDouble(0) == 1.5,
+        "small array round-trip");
+        bool intsOk = intsBack != null && intsBack.Count() == 40;
+        for (int j = 0; j < 40 && intsOk; j = j + 1) {
+            if (intsBack.At(j).AsInt(-1) != j) { intsOk = false; }
+        }
+        Ok(intsOk, "pure integer array keeps exact ints");
+        Ok(tagsBack != null && tagsBack.At(0).AsString("") == "a" && tagsBack.At(1).AsDouble(0) == 3.0,
+        "mixed-type array round-trip");
+
+        // 3) 溢出回退：超 float32 范围的浮点走 tag 6 文本保真。
+        JsonValue huge = JsonValue.NewObject();
+        JsonValue big = JsonValue.NewArray();
+        for (int j = 0; j < 40; j = j + 1) {
+            big.Append(j == 0 ? JsonValue.NewNum("1e40") : JsonValue.NewDouble(0.5));
+        }
+        huge.Put("big", big);
+        huge.Put("name", JsonValue.NewStr("huge"));
+        int hid = docs.Insert(huge);
+        JsonValue hugeBack = docs.FindById(hid);
+        JsonValue bigBack = hugeBack != null ? hugeBack.Get("big") : null;
+        Ok(bigBack != null && bigBack.At(0).AsDouble(0) == 1e40,
+        "out-of-float32 array falls back to text fidelity");
+
+        // 4) 指针解码（刀4 行视图）：ScanField 取向量数组与点查
+        //    一致；SkipValRaw 跨 tag 11 字段走读（name 在前）。
+        Dictionary<int, int> dimCounts = new Dictionary<int, int>();
+        docs.ScanField("embedding", (int id, JsonValue v) => {
+            dimCounts.Add(id, v.IsArray() ? v.Count() : -1);
+            return true;
+        });
+        // mid/hid 无 embedding 字段，不回调——回调数 = 8 个向量行。
+        bool scanOk = dimCounts.Count == 8;
+        for (int i = 0; i < 8 && scanOk; i = i + 1) {
+            if (!dimCounts.ContainsKey(ids[i]) || dimCounts[ids[i]] != dims) { scanOk = false; }
+        }
+        Ok(scanOk, "pointer decode reads tag11 arrays on vector rows");
+
+        // 5) 量化检查点全链：tag 11 行 → ReadVector → 量化索引
+        //    建图 → 检查点导出（VectorSource 读行）→ 重开检索。
+        VectorIndexOptions options = new VectorIndexOptions(dims);
+        options.quantize = true;
+        docs.EnsureVectorIndex("embedding", options);
+        float[] probe = new float[dims];
+        for (int j = 0; j < dims; j = j + 1) {
+            double v = ((3 * 7 + j * 13) % 200) / 100.0 - 1.0;
+            probe[j] = (float)(v + 0.25);
+        }
+        List<VectorHit> hits = docs.SearchVector("embedding", probe, 3, 64);
+        Ok(hits.Count == 3 && hits[0].id == ids[3],
+        "quantize search over tag11 rows tops the probe row");
+        db.Checkpoint();
+        docs.CheckpointSearchIndexes();
+        db.Close();
+        db = ZanDatabase.Open(path, ZanStore.DUR_SYNC);
+        docs = db.GetCollection("docs");
+        List<VectorHit> after = docs.SearchVector("embedding", probe, 3, 64);
+        Ok(after.Count == 3 && after[0].id == ids[3],
+        "tag11 rows survive checkpoint round-trip");
+        JsonValue reopenDoc = docs.FindById(ids[5]);
+        JsonValue reopenArr = reopenDoc != null ? reopenDoc.Get("embedding") : null;
+        Ok(reopenArr != null && reopenArr.Count() == dims,
+        "tag11 array intact after reopen");
+
+        // 6) 编码体积：64 维浮点数组的行编码走 tag 11（数组区
+        //    = 2 + 64×4 ≈ 258 字节），远小于逐元素文本路径
+        //    （每值 ≥ 8 字节 → ≥ 512 字节）。
+        JsonValue probeDoc = VectorDoc(0, dims);
+        int encodedLen = docs.EncodeDoc(probeDoc).Length;
+        Ok(encodedLen < 400, "tag11 encoded length: " + Convert.ToString(encodedLen) + " < 400");
+        JsonValue intDoc = JsonValue.NewObject();
+        JsonValue intArr = JsonValue.NewArray();
+        for (int j = 0; j < dims; j = j + 1) { intArr.Append(JsonValue.NewNum(Convert.ToString(j))); }
+        intDoc.Put("embedding", intArr);
+        int intLen = docs.EncodeDoc(intDoc).Length;
+        Ok(intLen > 128 && intLen < encodedLen,
+        "integer array keeps text encoding: " + Convert.ToString(intLen) + " (tag11 would be " + Convert.ToString(encodedLen) + ")");
+
+        Clean(path);
+        Console.WriteLine("done " + Convert.ToString(checks));
+    }
+}
