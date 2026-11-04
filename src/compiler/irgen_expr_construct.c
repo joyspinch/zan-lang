@@ -1818,9 +1818,83 @@ static LLVMValueRef emit_expr_new_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                             emit_eh_tmp_push(g, alloca);
                             fields_eh_pushed = 1;
                         }
-                        emit_implicit_field_initializers(
-                            g, sym, new_inst ? new_inst : sym->type,
-                            alloca, locals);
+
+                        /* 派生类未声明构造函数时，沿继承链寻找最近的基类构造函数调用 */
+                        struct zan_ctor_entry *bctor = NULL;
+                        zan_symbol_t *base_sym = (sym->type && sym->type->base_type)
+                            ? sym->type->base_type->sym : NULL;
+                        zan_ast_list_t empty_args;
+                        zan_ast_list_init(&empty_args);
+                        zan_ast_list_t filled_args;
+                        zan_ast_list_init(&filled_args);
+                        zan_ast_list_t *actual_bargs = &empty_args;
+
+                        while (base_sym) {
+                            bctor = find_ctor(g, base_sym, &empty_args, locals, NULL);
+                            if (!bctor) {
+                                if (fill_ctor_default_args(g, base_sym, &empty_args, &filled_args)) {
+                                    bctor = find_ctor(g, base_sym, &filled_args, locals, NULL);
+                                    if (bctor) actual_bargs = &filled_args;
+                                }
+                            }
+                            if (bctor) break;
+                            if (has_declared_ctor(g, base_sym)) {
+                                zan_diag_emit_code(g->diag, DIAG_ERROR, expr->loc, 3024,
+                                    "base class '%.*s' of '%.*s' has no constructor accepting 0 arguments",
+                                    (int)base_sym->name.len, base_sym->name.str,
+                                    (int)sym->name.len, sym->name.str);
+                                break;
+                            }
+                            base_sym = (base_sym->type && base_sym->type->base_type)
+                                ? base_sym->type->base_type->sym : NULL;
+                        }
+
+                        if (bctor && bctor->fn) {
+                            /* A516 顺序：派生类与所有中间类字段初始化器 -> 基类构造链（含基类字段初始化与基类构造体） */
+                            zan_symbol_t *cur_init = sym;
+                            while (cur_init && cur_init != bctor->type_sym) {
+                                emit_decl_field_initializers(
+                                    g, cur_init,
+                                    cur_init == sym && new_inst ? new_inst : cur_init->type,
+                                    alloca, locals);
+                                cur_init = (cur_init->type && cur_init->type->base_type)
+                                    ? cur_init->type->base_type->sym : NULL;
+                            }
+
+                            LLVMTypeRef bst = get_struct_llvm_type(g, bctor->type_sym);
+                            LLVMValueRef base_this = alloca;
+                            if (bst) {
+                                base_this = LLVMBuildBitCast(
+                                    g->builder, alloca,
+                                    LLVMPointerType(bst, 0), "base.this");
+                            }
+                            int b_argc = actual_bargs->count + 1;
+                            LLVMValueRef *bcall_args = (LLVMValueRef *)calloc(
+                                (size_t)b_argc, sizeof(LLVMValueRef));
+                            bcall_args[0] = base_this;
+                            for (int k = 0; k < actual_bargs->count; k++) {
+                                zan_ast_node_t *param =
+                                    bctor->decl->method_decl.params.items[k];
+                                zan_type_t *pt = zan_binder_resolve_type(
+                                    g->binder, param->param.type);
+                                bcall_args[k + 1] = emit_arg_typed(
+                                    g, actual_bargs->items[k], pt, locals);
+                            }
+                            coerce_args_to_params(g, bctor->fn_type, bcall_args, b_argc);
+                            zan_call2(g->builder, bctor->fn_type, bctor->fn,
+                                      bcall_args, (unsigned)b_argc, "");
+                            for (int k = 0; k < actual_bargs->count; k++) {
+                                emit_release_owned_call_temp(
+                                    g, actual_bargs->items[k], bcall_args[k + 1], locals);
+                            }
+                            free(bcall_args);
+                        } else {
+                            /* 基类链上无显式声明的构造函数时，兜底递归发射全继承链字段初始化器 */
+                            emit_implicit_field_initializers(
+                                g, sym, new_inst ? new_inst : sym->type,
+                                alloca, locals);
+                        }
+
                         if (fields_eh_pushed) emit_eh_tmp_pop(g);
                     }
 

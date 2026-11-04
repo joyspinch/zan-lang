@@ -1173,7 +1173,8 @@ static LLVMValueRef emit_builtin_call_intercept(zan_irgen_t *g, zan_ast_node_t *
                            (rn.len == 5 && memcmp(rn.str, "float", 5) == 0) ||
                            (rn.len == 6 && memcmp(rn.str, "Double", 6) == 0) ||
                            (rn.len == 6 && memcmp(rn.str, "Single", 6) == 0);
-            int bool_recv = (rn.len == 4 && memcmp(rn.str, "bool", 4) == 0);
+            int bool_recv = (rn.len == 4 && memcmp(rn.str, "bool", 4) == 0) ||
+                            (rn.len == 7 && memcmp(rn.str, "Boolean", 7) == 0);
             if ((int_recv || dbl_recv || bool_recv) &&
                 pm.len == 5 && memcmp(pm.str, "Parse", 5) == 0 &&
                 expr->call.args.count == 1) {                LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
@@ -1297,7 +1298,7 @@ static LLVMValueRef emit_builtin_call_intercept(zan_irgen_t *g, zan_ast_node_t *
                 emit_release_owned_call_temp(g, expr->call.args.items[0], s, locals);
                 return r;
             }
-            if ((int_recv || dbl_recv) &&
+            if ((int_recv || dbl_recv || bool_recv) &&
                 pm.len == 8 && memcmp(pm.str, "TryParse", 8) == 0 &&
                 expr->call.args.count == 2) {
                 LLVMTypeRef i8 = LLVMInt8TypeInContext(g->ctx);
@@ -1306,14 +1307,20 @@ static LLVMValueRef emit_builtin_call_intercept(zan_irgen_t *g, zan_ast_node_t *
                 LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
                 LLVMTypeRef dbl = LLVMDoubleTypeInContext(g->ctx);
                 LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
+                LLVMTypeRef i1t = LLVMInt1TypeInContext(g->ctx);
                 LLVMValueRef s = emit_expr(g, expr->call.args.items[0], locals);
                 zan_type_t *at = infer_expr_type(g, expr->call.args.items[0], locals);
                 if (!type_is_text_arg(at)) {
                     zan_diag_emit_code(g->diag, DIAG_ERROR, expr->loc, 3058,
                                   "%.*s.TryParse requires a string argument",
                                   (int)rn.len, rn.str);
-                    return LLVMConstInt(LLVMInt1TypeInContext(g->ctx), 0, 0);
+                    return LLVMConstInt(i1t, 0, 0);
                 }
+                /* null 文本不抛异常，按标准语义 TryParse 失败返回 false */
+                LLVMValueRef isnull = zan_icmp(g->builder, LLVMIntEQ, s,
+                    LLVMConstNull(LLVMTypeOf(s)), "tp.snull");
+                LLVMValueRef s_safe = LLVMBuildSelect(g->builder, isnull,
+                    zan_irgen_intern_string(g, ""), s, "tp.ssafe");
                 /* out 实参取槽位地址而非值：AST_REF_ARG 由 emit_ref_arg 直接
                  * 给地址，裸标识符查局部槽 alloca。曾按值 emit_expr——类型
                  * 非指针被下方守卫静默跳过写入，out 变量永远不更新
@@ -1329,29 +1336,83 @@ static LLVMValueRef emit_builtin_call_intercept(zan_irgen_t *g, zan_ast_node_t *
                     local_var_t *ol = local_find(locals, out_arg->ident.name);
                     if (ol) { outp = ol->alloca; out_ty = ol->type; }
                 }
+
+                if (bool_recv) {
+                    LLVMTypeRef sc_ty = LLVMFunctionType(i32t,
+                        (LLVMTypeRef[]){ i8ptr, i8ptr }, 2, 0);
+                    LLVMValueRef f = get_libc_fn(g, "strcasecmp", sc_ty);
+                    LLVMValueRef s_true = LLVMBuildGlobalStringPtr(
+                        g->builder, "true", "btp.ptrue");
+                    LLVMValueRef s_false = LLVMBuildGlobalStringPtr(
+                        g->builder, "false", "btp.pfalse");
+                    LLVMValueRef st = zan_call2(g->builder, sc_ty, f,
+                        (LLVMValueRef[]){ s_safe, s_true }, 2, "btp.pt");
+                    LLVMValueRef sf = zan_call2(g->builder, sc_ty, f,
+                        (LLVMValueRef[]){ s_safe, s_false }, 2, "btp.pf");
+                    LLVMValueRef is_t = zan_icmp(g->builder, LLVMIntEQ, st,
+                        LLVMConstInt(i32t, 0, 0), "btp.ist");
+                    LLVMValueRef is_f = zan_icmp(g->builder, LLVMIntEQ, sf,
+                        LLVMConstInt(i32t, 0, 0), "btp.isf");
+                    LLVMValueRef ok = LLVMBuildOr(g->builder, is_t, is_f, "btp.ok");
+                    LLVMValueRef not_null = LLVMBuildNot(g->builder, isnull, "btp.notnull");
+                    ok = zan_and(g->builder, not_null, ok, "btp.valid");
+                    LLVMValueRef stored = LLVMBuildSelect(g->builder, is_t,
+                        LLVMConstInt(i1t, 1, 0),
+                        LLVMConstInt(i1t, 0, 0), "btp.v");
+                    if (outp) {
+                        if (out_ty) {
+                            emit_typed_out_store(g, out_ty, outp, stored);
+                        } else if (LLVMGetTypeKind(LLVMTypeOf(outp)) == LLVMPointerTypeKind) {
+                            LLVMBuildStore(g->builder, stored, outp);
+                        }
+                    }
+                    emit_release_owned_call_temp(g, expr->call.args.items[0], s, locals);
+                    return ok;
+                }
+
                 LLVMValueRef endp = emit_entry_alloca(g, i8ptr, "endp");
                 LLVMBuildStore(g->builder, LLVMConstNull(i8ptr), endp);
                 LLVMValueRef v;
+                LLVMValueRef over = NULL;
                 if (int_recv) {
+                    int is64 = (rn.len == 4 && memcmp(rn.str, "long", 4) == 0) ||
+                               (rn.len == 5 && memcmp(rn.str, "Int64", 5) == 0);
+                    LLVMValueRef errnop = emit_errno_preset(g, i32t);
                     LLVMTypeRef strtoll_ty = LLVMFunctionType(i64,
                         (LLVMTypeRef[]){ i8ptr, i8pp, i32t }, 3, 0);
                     LLVMValueRef f = get_libc_fn(g, "strtoll", strtoll_ty);
                     v = zan_call2(g->builder, strtoll_ty, f,
-                        (LLVMValueRef[]){ s, endp, LLVMConstInt(i32t, 10, 0) }, 3, "tp");
+                        (LLVMValueRef[]){ s_safe, endp, LLVMConstInt(i32t, 10, 0) }, 3, "tp");
+                    LLVMValueRef er = LLVMBuildLoad2(g->builder, i32t, errnop, "tp.errno");
+                    over = zan_icmp(g->builder, LLVMIntEQ, er, LLVMConstInt(i32t, 34, 0), "tp.erange");
+                    if (!is64) {
+                        over = LLVMBuildOr(g->builder, over, LLVMBuildOr(g->builder,
+                            zan_icmp(g->builder, LLVMIntSLT, v,
+                                LLVMConstInt(i64, (int64_t)INT32_MIN, 0), "tp.lo"),
+                            zan_icmp(g->builder, LLVMIntSGT, v,
+                                LLVMConstInt(i64, INT32_MAX, 0), "tp.hi"),
+                            "tp.over32"), "tp.over");
+                    }
                 } else {
                     LLVMTypeRef strtod_ty = LLVMFunctionType(dbl,
                         (LLVMTypeRef[]){ i8ptr, i8pp }, 2, 0);
                     LLVMValueRef f = LLVMGetNamedFunction(g->mod, "zan_rt_dbl_parse");
                     if (!f) f = LLVMAddFunction(g->mod, "zan_rt_dbl_parse", strtod_ty);
                     v = zan_call2(g->builder, strtod_ty, f,
-                        (LLVMValueRef[]){ s, endp }, 2, "tp");
+                        (LLVMValueRef[]){ s_safe, endp }, 2, "tp");
                 }
                 LLVMValueRef e = LLVMBuildLoad2(g->builder, i8ptr, endp, "e");
-                LLVMValueRef moved = zan_icmp(g->builder, LLVMIntNE, e, s, "moved");
+                LLVMValueRef moved = zan_icmp(g->builder, LLVMIntNE, e, s_safe, "moved");
                 LLVMValueRef ch = LLVMBuildLoad2(g->builder, i8, e, "ch");
                 LLVMValueRef at_end = zan_icmp(g->builder, LLVMIntEQ, ch,
                     LLVMConstInt(i8, 0, 0), "atend");
-                LLVMValueRef ok = zan_and(g->builder, moved, at_end, "ok");
+                LLVMValueRef not_null = LLVMBuildNot(g->builder, isnull, "tp.notnull");
+                LLVMValueRef ok = zan_and(g->builder, not_null,
+                    zan_and(g->builder, moved, at_end, "moved_end"), "ok");
+                if (over) {
+                    LLVMValueRef not_over = LLVMBuildNot(g->builder, over, "tp.notover");
+                    ok = zan_and(g->builder, ok, not_over, "ok2");
+                }
                 LLVMValueRef stored = LLVMBuildSelect(g->builder, ok, v,
                     int_recv ? LLVMConstInt(i64, 0, 0) : (LLVMValueRef)LLVMConstReal(dbl, 0.0), "tpv");
                 if (outp) {

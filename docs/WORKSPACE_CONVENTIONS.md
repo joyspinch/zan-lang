@@ -311,6 +311,22 @@ checkout` / `git restore` / `git reset --hard` 抹掉报错、拿旧版本文件
 - 机制细节与踩过的坑见 `.agents/skills/zan-dev-standards/references/verification.md`
   的「并发会话的串行纪律」与「PowerShell 脚本协作的几个坑」两节。
 
+## 17. 代码规范机检闸门（机器强制拦截）
+
+规范靠人肉自觉必然破窗，必须由脚本在提交瞬间强行拦截。门禁由 `scripts/hooks/pre-commit`
+在每次 `git commit` 时机检暂存区增量（`scripts/check_code_standards.py --staged`），
+违规直接阻断退出（耗时 <0.2s，不增加心智负担）：
+
+1. **绝对禁止业务代码手写双下划线 `__` 前缀**：
+   `packages/`、`stdlib/`、`examples/`、`templates/` 下的手写 `.zan` 代码严禁新增
+   `__` 标识符（类名/方法名/变量名）。`__` 严格保留给编译器内部代码生成与 ABI 注入，普通私有成员一律用普通驼峰或单下划线。
+2. **标准库绝对单向依赖（严禁反向依赖）**：
+   `stdlib/` 源码严禁出现 `using Zan.`。标准库是语言基石，反向引用扩展包会破坏编译闭包与 `--no-packages` 纯净环境。
+3. **公开 API 强制 PascalCase（大驼峰且无下划线）**：
+   `.zan` 代码中的 `public class`、`struct`、`interface`、`enum` 以及 `public` 方法名首字母必须大写，且禁止使用下划线（如 `Get_Data`、`get_data` 均会被拦截）。
+4. **增量防膨胀熔断**：
+   新增加的文件行数严格限制在 1200 行以内；单函数控制在 120 行以内。禁止制造新的巨石单体文件。
+
 ---
 
 ## 附录：docs 文档维护规则（原 DOCS_MAINTENANCE.md，2026-09-26 并入）

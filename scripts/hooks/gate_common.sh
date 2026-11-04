@@ -128,3 +128,31 @@ gate_check_blob_size() {
     fi
     return 0
 }
+
+# ---- check: code standards (scripts/check_code_standards.py) -------------
+# WORKSPACE_CONVENTIONS.md §17:
+#   1. No hand-written '__' double underscore identifiers in userland .zan sources.
+#   2. Strict unidirectional dependencies: stdlib/ must never depend on packages/.
+#   3. PascalCase naming for public types and methods in .zan.
+#   4. Newly added files must not exceed 1200 lines.
+gate_check_code_standards() {
+    _gcs_mode="$1"
+    _gcs_py=""
+    if command -v python3 >/dev/null 2>&1; then
+        _gcs_py="python3"
+    elif command -v python >/dev/null 2>&1; then
+        _gcs_py="python"
+    fi
+    if [ -z "$_gcs_py" ]; then
+        return 0
+    fi
+    _gcs_top="$(git rev-parse --show-toplevel 2>/dev/null)" || return 0
+    _gcs_script="$_gcs_top/scripts/check_code_standards.py"
+    if [ ! -f "$_gcs_script" ]; then
+        return 0
+    fi
+    if [ "$_gcs_mode" = "staged" ]; then
+        "$_gcs_py" "$_gcs_script" --staged || return 1
+    fi
+    return 0
+}
