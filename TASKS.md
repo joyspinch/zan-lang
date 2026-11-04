@@ -35,3 +35,4 @@
 - [ ] B-ID150【独立】zanc --publish 压缩派发 E3097「Both operands to a binary operator are not of the same type」：q3bench（ByteBuffer.WriteF32 循环 + long/double 混算）等发布档构建触发 LLVM 校验失败（debug 档同源通过），irgen_compact shard 优化对某类混合精度算术生成非法 IR；最小复现与修复。
 - [ ] B-ID151【独立】checker 漏拦方法组当值：`fi.Length`（FileInfo.Length 是方法，非属性）不带调用括号通过类型检查，代码生成产出 i64+ptr 混算 IR 触发 E3090 LLVM 校验失败或经重载解析静默把方法指针当值传参（实测 Convert.ToString(sw.ElapsedMilliseconds) 输出乱码）。应在类型检查期拒绝「实例方法引用未调用」。
 - [ ] B-ID154〔依赖挂账〕内建 List<T> 反射面：探针实测 HF/HM 全零（_scratch/tlist_probe/），绑定通道 data-for 的 List<T> 强类型行（Count/索引器成员访问、HasMethod/Invoke）无反射面可用，需编译器给内建泛型补 mtab；等 B-ID93/B-ID151 反射与 checker 区收口后做，避免对撞。
+- [ ] B-ID155〔裁定搁置〕zanc 编译缓存重做：旧缓存架构因产物散落源码树、无界堆积成巨量垃圾文件被移除；每次全量重编（GUI 程序 726 文件，Zan.Gui 包 387 文件/23MB 源码）是其接受代价，不是遗漏。重提必须先满足四约束：产物只进单一 git-ignored 固定目录、容量有界（LRU 封顶驱逐）、内容哈希键失效（杜绝陈旧产物）、带一键清理入口。实测 hello+stdlib 30 文件峰值 18MB——进程基线轻，内存大头是包编译面；包缓存收益随 Gui 包肥大持续增长。
