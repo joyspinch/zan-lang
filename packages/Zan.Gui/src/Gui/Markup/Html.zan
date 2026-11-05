@@ -249,15 +249,59 @@ public class Html {
             }
         }
         doc.root = built.Count > 0 ? built[0] : null;
+        doc.src = wd;
+        doc.built = built;
         return doc;
+    }
+
+    // 设计半件直挂（DesignedControl.Design 用）：body 子节点按方言几何
+    // （span/fx/fy/dock…）直接挂进宿主控件——宿主自己就是设计根，不经
+    // body 占位包装。与 Form 装配循环同构：真控件宿主走 HtmlKidAttach，
+    // Element 宿主保持行内序。
+    public static void ProjectBody(Control host, HtmlDoc doc) {
+        Install();
+        if (host == null || doc == null || doc.root == null
+            || doc.src == null || doc.built == null) { return; }
+        WDoc wd = doc.src;
+        if (wd.nodes.Count == 0) { return; }
+        WNode body = wd.nodes[0];
+        Control bodyCtl = doc.built[0];
+        bool docFree = false;
+        for (int i = 0; i < wd.nodes.Count; i = i + 1) {
+            if (HtmlText.NodeAttr(wd.nodes[i].attrs, "data-layout-mode") == "1") {
+                docFree = true;
+                break;
+            }
+        }
+        List<Control> kids = new List<Control>();
+        List<HtmlKidSpec> specs = new List<HtmlKidSpec>();
+        for (int k = 0; k < body.items.Count; k = k + 1) {
+            WItem it = body.items[k];
+            if (it.kid < 0) {
+                // 游离文本：Element 宿主收（body 占位即废，重复无碍）；
+                // 真控件宿主无处安放（与装配循环同契约）。
+                if (host is Element) { ((Element)host).AddText(it.text); }
+                continue;
+            }
+            kids.Add(doc.built[it.kid]);
+            specs.Add(Html.SpecOf(wd.nodes[it.kid], docFree));
+        }
+        bodyCtl.RemoveAll();
+        if (kids.Count == 0) { return; }
+        if (host is Element) {
+            for (int i = 0; i < kids.Count; i = i + 1) {
+                Html.AddChild(host, kids[i]);
+            }
+            return;
+        }
+        HtmlKidAttach.Kids(host, kids, specs);
     }
 
     // 节点 → 设计几何标量（属性提取在这里，布局语义在 FormBuilder
     // 的 HtmlKidAttach——旧 JSON 管线与新 Html 单跳管线共用一套）。
     static HtmlKidSpec SpecOf(WNode n, bool free) {
         HtmlKidSpec s = new HtmlKidSpec();
-        string dk = HtmlText.NodeAttr(n.attrs, "data-kind");
-        s.kind = dk != "" ? FormBuilder.HtmlKindAlias(dk) : TagToKind(n.tag);
+        s.kind = TagToKind(n.tag);
         s.free = free;
         s.label = HtmlText.NodeAttr(n.attrs, "data-label");
         s.span = Html.NodeInt(n, "data-span");
@@ -283,7 +327,7 @@ public class Html {
         for (int i = 0; i < n.items.Count; i = i + 1) {
             if (n.items[i].kid >= 0) { s.isContainer = true; break; }
         }
-        s.dialect = dk != "" || s.span > 0 || s.childTab > 0 || s.label != ""
+        s.dialect = s.span > 0 || s.childTab > 0 || s.label != ""
             || s.hasFx || s.hasFy || s.fw > 0 || s.fh > 0 || s.ph > 0
             || s.position == 1 || s.dock > 0 || s.hasPad || s.hasGap || s.hasMar;
         return s;
@@ -596,11 +640,9 @@ public class Html {
             default: {
                 // 通用动态解析：优先通过 ControlFactory 与已注册组件族（ControlBootstrap,
                 // DataTableBootstrap, ChartBootstrap 等）实例化，杜绝死硬编码
+                // 控件 kind 一律由标签承载（映射表 + zan-<kebab> 帕斯卡
+                // 还原 + 自定义族标签直通），没有属性旁路。
                 string kind = TagToKind(tag);
-                // 设计稿方言：data-kind 是控件 kind 的权威标记（B-ID149
-                // 方言收敛）——`<div data-kind="Gauge">` 建真控件而非占位。
-                string dkind = HtmlText.NodeAttr(n.attrs, "data-kind");
-                if (dkind != "") { kind = FormBuilder.HtmlKindAlias(dkind); }
                 Control created = ControlFactory.Create(kind);
                 if (created != null) {
                     c = created;
@@ -1152,17 +1194,33 @@ public class Html {
             || HtmlText.StartsWith(low, "https://");
     }
 
+    // zan-<kebab> → PascalCase kind（ide-surface → IdeSurface）。
+    static string ZanKind(string kebab) {
+        string outp = "";
+        bool up = true;
+        for (int i = 0; i < kebab.Length; i = i + 1) {
+            char ch = kebab[i];
+            if (ch == 45) { up = true; continue; }
+            if (up && ch >= 97 && ch <= 122) { outp = outp + (char)(ch - 32); }
+            else { outp = outp + ch; }
+            up = false;
+        }
+        return outp;
+    }
+
     // HTML 标签到控件 Kind 类型的归一化映射
     static string TagToKind(string tag) {
         if (tag == "") { return ""; }
         string t = tag.ToLower();
-        if (HtmlText.StartsWith(t, "zan-")) {
+        bool zan = HtmlText.StartsWith(t, "zan-");
+        if (zan) {
             t = t.Substring(4, t.Length - 4);
         }
         switch (t) {
             case "datatable":
             case "grid":
             case "data-grid":
+            case "table":
                 return "DataGrid";
             case "tabs":
             case "tab-control":
@@ -1281,8 +1339,20 @@ public class Html {
             case "drawer":
                 return "Drawer";
             case "panel":
+            case "scrollbar":
+            case "layer":
                 return "Panel";
+            case "ellipsis":
+            case "label":
+                return "Label";
+            case "ribbon":
+                return "ToolStrip";
+            case "checkbox-group":
+            case "checkboxgroup":
+                return "CheckboxGroup";
             default:
+                // zan-<kebab> 自定义族：还原 PascalCase kind 供工厂查表。
+                if (zan) { return ZanKind(t); }
                 return tag;
         }
     }
