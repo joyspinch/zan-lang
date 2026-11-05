@@ -660,7 +660,21 @@ static LLVMValueRef refl_make_thunk(zan_irgen_t *g, LLVMValueRef fn,
     LLVMValueRef th = LLVMAddFunction(g->mod, nm, th_ty);
     LLVMSetLinkage(th, LLVMInternalLinkage);
 
-    LLVMBasicBlockRef save = LLVMGetInsertBlock(g->builder);
+    zan_builder_point_t pt = zan_builder_save(g);
+    LLVMValueRef saved_fn = g->current_fn;
+    LLVMTypeRef saved_fn_ret = g->current_fn_ret_type;
+    zan_type_t *saved_fn_zan_ret = g->current_fn_zan_ret_type;
+    zan_ast_node_t *saved_fn_body = g->current_fn_body;
+    bool saved_fn_is_main = g->current_fn_is_main;
+    bool saved_fn_is_ctor = g->current_fn_is_ctor;
+
+    g->current_fn = th;
+    g->current_fn_ret_type = vd;
+    g->current_fn_zan_ret_type = g->binder->type_void;
+    g->current_fn_body = NULL;
+    g->current_fn_is_main = false;
+    g->current_fn_is_ctor = false;
+
     LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(g->ctx, th, "entry");
     LLVMPositionBuilderAtEnd(g->builder, entry);
 
@@ -685,7 +699,13 @@ static LLVMValueRef refl_make_thunk(zan_irgen_t *g, LLVMValueRef fn,
         ok = false;
     if (!ok) {
         LLVMDeleteFunction(th);
-        if (save) LLVMPositionBuilderAtEnd(g->builder, save);
+        g->current_fn = saved_fn;
+        g->current_fn_ret_type = saved_fn_ret;
+        g->current_fn_zan_ret_type = saved_fn_zan_ret;
+        g->current_fn_body = saved_fn_body;
+        g->current_fn_is_main = saved_fn_is_main;
+        g->current_fn_is_ctor = saved_fn_is_ctor;
+        zan_builder_restore(g, pt);
         return NULL;
     }
 
@@ -694,7 +714,13 @@ static LLVMValueRef refl_make_thunk(zan_irgen_t *g, LLVMValueRef fn,
         ? LLVMConstInt(i64, 0, 0) : refl_to_slot(g, res);
     LLVMBuildStore(g->builder, slot, LLVMGetParam(th, 2));
     LLVMBuildRetVoid(g->builder);
-    if (save) LLVMPositionBuilderAtEnd(g->builder, save);
+    g->current_fn = saved_fn;
+    g->current_fn_ret_type = saved_fn_ret;
+    g->current_fn_zan_ret_type = saved_fn_zan_ret;
+    g->current_fn_body = saved_fn_body;
+    g->current_fn_is_main = saved_fn_is_main;
+    g->current_fn_is_ctor = saved_fn_is_ctor;
+    zan_builder_restore(g, pt);
     return LLVMConstBitCast(th, i8ptr);
 }
 
@@ -803,7 +829,21 @@ static LLVMValueRef refl_make_ctor_thunk(zan_irgen_t *g, zan_symbol_t *sym,
                          (LLVMTypeRef[]){ i8ptr, i64ptr, i64ptr }, 3, 0));
     LLVMSetLinkage(th, LLVMInternalLinkage);
 
-    LLVMBasicBlockRef save = LLVMGetInsertBlock(g->builder);
+    zan_builder_point_t pt = zan_builder_save(g);
+    LLVMValueRef saved_fn = g->current_fn;
+    LLVMTypeRef saved_fn_ret = g->current_fn_ret_type;
+    zan_type_t *saved_fn_zan_ret = g->current_fn_zan_ret_type;
+    zan_ast_node_t *saved_fn_body = g->current_fn_body;
+    bool saved_fn_is_main = g->current_fn_is_main;
+    bool saved_fn_is_ctor = g->current_fn_is_ctor;
+
+    g->current_fn = th;
+    g->current_fn_ret_type = LLVMVoidTypeInContext(g->ctx);
+    g->current_fn_zan_ret_type = g->binder->type_void;
+    g->current_fn_body = NULL;
+    g->current_fn_is_main = false;
+    g->current_fn_is_ctor = false;
+
     LLVMPositionBuilderAtEnd(g->builder,
         LLVMAppendBasicBlockInContext(g->ctx, th, "entry"));
 
@@ -848,7 +888,13 @@ static LLVMValueRef refl_make_ctor_thunk(zan_irgen_t *g, zan_symbol_t *sym,
         }
         if (!ok) {
             LLVMDeleteFunction(th);
-            if (save) LLVMPositionBuilderAtEnd(g->builder, save);
+            g->current_fn = saved_fn;
+            g->current_fn_ret_type = saved_fn_ret;
+            g->current_fn_zan_ret_type = saved_fn_zan_ret;
+            g->current_fn_body = saved_fn_body;
+            g->current_fn_is_main = saved_fn_is_main;
+            g->current_fn_is_ctor = saved_fn_is_ctor;
+            zan_builder_restore(g, pt);
             return NULL;
         }
         zan_call2(g->builder, ctor_ty, ctor_fn, args, total, "");
@@ -866,7 +912,13 @@ static LLVMValueRef refl_make_ctor_thunk(zan_irgen_t *g, zan_symbol_t *sym,
         LLVMBuildPtrToInt(g->builder, raw, i64, "refl.newi"),
         LLVMGetParam(th, 2));
     LLVMBuildRetVoid(g->builder);
-    if (save) LLVMPositionBuilderAtEnd(g->builder, save);
+    g->current_fn = saved_fn;
+    g->current_fn_ret_type = saved_fn_ret;
+    g->current_fn_zan_ret_type = saved_fn_zan_ret;
+    g->current_fn_body = saved_fn_body;
+    g->current_fn_is_main = saved_fn_is_main;
+    g->current_fn_is_ctor = saved_fn_is_ctor;
+    zan_builder_restore(g, pt);
     return LLVMConstBitCast(th, i8ptr);
 }
 

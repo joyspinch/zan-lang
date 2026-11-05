@@ -837,7 +837,7 @@ static int auto_include_namespace(const char *stdlib_root, const char *subdir,
                                                   &args, hierarchical);
     found = found || package_count > 0;
     if (!found && package_project_root[0] != '\0' &&
-        strcmp(subdir, "System") != 0 &&
+        !stdlib_has_dir(stdlib_root, subdir) &&
         !project_namespace_declared(subdir)) {
         fprintf(stderr, "ZANPKG_MISSING namespace=%s\n", subdir);
         missing_namespace_count++;
@@ -1062,6 +1062,7 @@ static bool proj_skins_enabled = false;
 /* zan.proj 的 type 键（"gui" 等）：DocApp 入口 shim 的工程级门控——
  * type=gui 且用户没写 Main 时合成 __ZanDocMain（B-ID147）。 */
 static char proj_app_type[16] = "";
+static char proj_entry_file[1400] = "";   /* zan.proj entry：窗口入口合成优先于 CLI 基名 */
 static bool load_proj_android_keys_done = false;
 static const char **skin_filter = NULL;
 static int skin_filter_count = 0;
@@ -1090,6 +1091,8 @@ static void load_proj_android_keys(void) {
             proj_skins_enabled = strcmp(val, "1") == 0;
         } else if (strcmp(key, "type") == 0) {
             snprintf(proj_app_type, sizeof(proj_app_type), "%s", val);
+        } else if (strcmp(key, "entry") == 0) {
+            snprintf(proj_entry_file, sizeof(proj_entry_file), "%s", val);
         } else if (strcmp(key, "androidPackage") == 0) {
             if (strlen(val) >= sizeof(proj_android_package)) {
                 fprintf(stderr, "error: zan.proj androidPackage exceeds "
@@ -1839,8 +1842,10 @@ static void zan_synth_docapp_main(zan_ast_node_t *unit, zan_arena_t *arena,
     }
     if (strcmp(proj_app_type, "gui") != 0) return;
 
-    /* 入口类名 = 入口文件基名帕斯卡化（App.zan ↔ class App 约定）。 */
-    const char *entry = entry_file;
+    /* 入口类名 = 入口文件基名帕斯卡化（App.zan ↔ class App 约定）。
+       zan.proj 声明了 entry 键时优先（多文件工程的入口不在排序首位，
+       如 src/Models/ 辅助类排在窗口类之前）。 */
+    const char *entry = proj_entry_file[0] ? proj_entry_file : entry_file;
     const char *slash = strrchr(entry, '/');
     const char *bslash = strrchr(entry, '\\');
     if (bslash > slash) slash = bslash;

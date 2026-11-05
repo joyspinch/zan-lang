@@ -1938,8 +1938,8 @@ static bool checker_type_is_expr_tree_target(zan_type_t *t);
  * 返回值 void 对 void，否则方法返回类型可赋给委托返回类型（协变）。
  * 不兼容绝不能静默放行——发码侧裸函数指针按错误签名调用时，
  * 形参读到的就是寄存器残渣（B-ID48 的运行期腐坏）。 */
-static bool method_group_matches_delegate(zan_checker_t *c, zan_symbol_t *m,
-                                         zan_type_t *dlg) {
+static bool method_matches_delegate_sig(zan_checker_t *c, zan_symbol_t *m,
+                                        zan_type_t *dlg) {
     if (!m || !m->decl || m->decl->kind != AST_METHOD_DECL ||
         !dlg || dlg->kind != TYPE_DELEGATE)
         return false;
@@ -1970,6 +1970,25 @@ static bool method_group_matches_delegate(zan_checker_t *c, zan_symbol_t *m,
     if (!mret || mret->kind == TYPE_VOID) return false;
     return checker_type_equal(dret, mret) ||
            checker_type_assignable(dret, mret);
+}
+
+static bool method_group_matches_delegate(zan_checker_t *c, zan_symbol_t *m,
+                                         zan_type_t *dlg) {
+    if (!m || !dlg) return false;
+    if (method_matches_delegate_sig(c, m, dlg)) return true;
+    for (zan_symbol_t *ts = m->parent; ts;
+         ts = (ts->type && ts->type->base_type) ? ts->type->base_type->sym : NULL) {
+        for (int i = 0; i < ts->member_count; i++) {
+            zan_symbol_t *cand = ts->members[i];
+            if (!cand || cand == m || cand->kind != SYM_METHOD) continue;
+            if (cand->name.len == m->name.len &&
+                memcmp(cand->name.str, m->name.str, (size_t)m->name.len) == 0) {
+                if (method_matches_delegate_sig(c, cand, dlg))
+                    return true;
+            }
+        }
+    }
+    return false;
 }
 
 static void checker_check_assignable(zan_checker_t *c, zan_type_t *target,
@@ -3888,6 +3907,7 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
             callee_type = zan_checker_check_expr(c, expr->call.callee);
         }
         zan_symbol_t *arg_sig = call_arg_signature(c, expr, recv);
+        int prev_in_call_args = c->in_call_args;
         c->in_call_args = 1;
         for (int i = 0; i < expr->call.args.count; i++) {
             zan_ast_node_t *arg = expr->call.args.items[i];
@@ -3904,7 +3924,7 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
             if (arg_sig && arg)
                 check_call_arg_type(c, arg_sig, i, arg, arg_type);
         }
-        c->in_call_args = 0;
+        c->in_call_args = prev_in_call_args;
         /* 内建泛型容器（List<T> / Dict<K,V>）的成员没有 sym，签名拼不到
          * → 实参类型从来没被检查过。单独走一条路（见
          * check_builtin_generic_call_args 的注释）。 */
@@ -4205,9 +4225,10 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
         zan_type_t *left = zan_checker_check_expr(c, expr->binary.left);
         /* 右值有赋值目标做委托裁决（事件 += 处理器等）：方法组在此
          * 静默，合法性由下面 check_assignable 判（B-ID151）。 */
+        int prev_assign = c->in_assignable_ctx;
         c->in_assignable_ctx = 1;
         zan_type_t *right = zan_checker_check_expr(c, expr->binary.right);
-        c->in_assignable_ctx = 0;
+        c->in_assignable_ctx = prev_assign;
         check_readonly_assignment(c, expr);
         zan_type_t *target = checker_assignment_target_type(c, expr->binary.left);
         if (!target && expr->binary.left->kind == AST_INDEX) {
@@ -4427,10 +4448,11 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
                 }
                 if (field && field->type) {
                     /* 对象初始化器右值有字段类型做委托裁决（B-ID151） */
+                    int prev_assign = c->in_assignable_ctx;
                     c->in_assignable_ctx = 1;
                     zan_type_t *right = zan_checker_check_expr(
                         c, arg->binary.right);
-                    c->in_assignable_ctx = 0;
+                    c->in_assignable_ctx = prev_assign;
                     checker_check_assignable(c, field->type, right,
                                              arg->binary.right, arg->loc,
                                              "object initializer");
@@ -4440,9 +4462,10 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
             /* 构造器实参：与方法调用实参同规（可能有委托形参，
              * 如 new Thread(Run)——方法组在此静默，交构造器候选
              * 评分按形参裁决）。 */
+            int prev_in_call_args = c->in_call_args;
             c->in_call_args = 1;
             zan_type_t *arg_type = zan_checker_check_expr(c, arg);
-            c->in_call_args = 0;
+            c->in_call_args = prev_in_call_args;
             if (li == 0 && i < ctor_argc) {
                 ctor_arg_types[i] = arg_type;
             }
@@ -4755,9 +4778,10 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
                 continue;
             }
             /* with 右值有字段类型做委托裁决（B-ID151） */
+            int prev_assign = c->in_assignable_ctx;
             c->in_assignable_ctx = 1;
             zan_type_t *val = zan_checker_check_expr(c, asg->binary.right);
-            c->in_assignable_ctx = 0;
+            c->in_assignable_ctx = prev_assign;
             checker_check_assignable(c, field->type, val,
                                      asg->binary.right, asg->loc, "with");
         }
@@ -4776,6 +4800,7 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
              * 的惯用法（Window.GuardCall((nint)App.GuardBody, 0)）。 */
             reject_method_group(c, expr->cast.expr);
         }
+        int prev_assign = c->in_assignable_ctx;
         if (dst && (dst->kind == TYPE_DELEGATE || dst->kind == TYPE_TYPE_PARAM ||
                     dst->kind == TYPE_NINT || dst->kind == TYPE_ULONG)) {
             /* 豁免目标：内层操作数可能是合法方法组（委托转换/泛型 T/
@@ -4783,7 +4808,7 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
             c->in_assignable_ctx = 1;
         }
         zan_type_t *src = zan_checker_check_expr(c, expr->cast.expr);
-        c->in_assignable_ctx = 0;
+        c->in_assignable_ctx = prev_assign;
         if (!dst) return c->binder->type_error;
         if (!checker_cast_is_valid(c, dst, src)) {
             if (dst->kind == TYPE_OBJECT && !checker_type_is_ref(src))
@@ -4865,9 +4890,10 @@ void zan_checker_check_stmt(zan_checker_t *c, zan_ast_node_t *stmt) {
         if (stmt->var_decl.initializer) {
             /* 初始化器有声明类型做委托目标裁决：方法组在此静默，
              * 合法性由下面 check_assignable 判（B-ID151）。 */
+            int prev_assign = c->in_assignable_ctx;
             c->in_assignable_ctx = 1;
             iv = zan_checker_check_expr(c, stmt->var_decl.initializer);
-            c->in_assignable_ctx = 0;
+            c->in_assignable_ctx = prev_assign;
         }
         if (dt) {
             check_generic_constraints(c, dt, stmt->loc);
@@ -4904,9 +4930,10 @@ void zan_checker_check_stmt(zan_checker_t *c, zan_ast_node_t *stmt) {
         if (stmt->ret.value) {
             /* 返回值有 current_return_type 做委托目标裁决：方法组在此
              * 静默，合法性由 check_assignable 判（B-ID151）。 */
+            int prev_assign = c->in_assignable_ctx;
             c->in_assignable_ctx = 1;
             zan_type_t *rv = zan_checker_check_expr(c, stmt->ret.value);
-            c->in_assignable_ctx = 0;
+            c->in_assignable_ctx = prev_assign;
             if (c->current_return_type &&
                 c->current_return_type->kind != TYPE_VOID)
                 checker_check_assignable(c, c->current_return_type, rv,

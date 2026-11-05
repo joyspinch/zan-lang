@@ -1204,7 +1204,7 @@ static void pi_process_dir(pi_dir_t *d, const char *stdlib_root) {
             d->files[i].gate_live = 1;
     }
     if (!found && package_project_root[0] != '\0' &&
-        strcmp(d->subdir, "System") != 0 &&
+        !stdlib_has_dir(stdlib_root, d->subdir) &&
         !project_namespace_declared(d->subdir)) {
         fprintf(stderr, "ZANPKG_MISSING namespace=%s\n", d->subdir);
         missing_namespace_count++;

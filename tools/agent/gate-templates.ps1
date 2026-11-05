@@ -146,12 +146,10 @@ foreach ($t in $tpls) {
         }
     }
 
-    # 输入：src 下全部 .zan（多文件必须逐一枚举）+ 全部 .html 设计稿
-    # （zanc 不自动发现入口旁的 .html，设计器生成的控件字段全靠它）
+    # （.html 设计稿是运行期资产，由 Html.Parse/--embed 加载，不作编译输入）
     $srcDir = Join-Path $dst 'src'
     $scan = if (Test-Path $srcDir) { $srcDir } else { $dst }
     $inputs = @(Get-ChildItem -Recurse -File -Filter *.zan $scan | ForEach-Object { $_.FullName -replace '\\', '/' })
-    $inputs += @(Get-ChildItem -Recurse -File $scan -Include *.html, *.htm -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName -replace '\\', '/' })
     $inputs = $inputs | Where-Object { $_ } | Sort-Object -Unique
     if ($entryRel) { $entryRel = $entryRel.Replace('{{NAME}}', $Name) }
     if ($inputs.Count -eq 0) {
