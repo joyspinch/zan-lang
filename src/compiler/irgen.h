@@ -485,6 +485,7 @@ struct zan_irgen {
                                      *      i64* kindout) */
     LLVMValueRef fn_refl_cfind;     /* i64 (i8* ti, i64 nargs) */
     LLVMValueRef fn_refl_tainfo;    /* i64 (i8* ti, i64 idx, i64 which) */
+    LLVMValueRef fn_list_count_thunk;
 
     bool obfuscate_strings;
     unsigned char obf_key[16];

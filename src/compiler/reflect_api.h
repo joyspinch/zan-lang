@@ -64,6 +64,7 @@
 #define ZAN_REFL_M_SETOBJECT   57   /* obj.SetFieldObject(name, v)    -> bool */
 #define ZAN_REFL_M_FTYPEINFO   58   /* TypeInfo.GetFieldTypeInfo(i)   -> TypeInfo */
 #define ZAN_REFL_M_FIDENT      59   /* TypeInfo.IsFieldIdentity(i)    -> bool */
+#define ZAN_REFL_M_IOBJECT     62   /* obj.InvokeObject(name[, arg])  -> object */
 
 static inline bool zan_refl_is_typeinfo(const zan_type_t *t) {
     return t && t->kind == TYPE_STRUCT && t->name.len == 8 &&
@@ -143,6 +144,7 @@ static inline bool zan_refl_instance_method(zan_istr_t n, int *out) {
         { "InvokeLong",     10, ZAN_REFL_M_ILONG },
         { "InvokeDouble",   12, ZAN_REFL_M_IDOUBLE },
         { "InvokeString",   12, ZAN_REFL_M_ISTRING },
+        { "InvokeObject",   12, ZAN_REFL_M_IOBJECT },
         { "HasMethod",       9, ZAN_REFL_M_OMHAS },
     };
     for (int i = 0; i < (int)(sizeof(tbl) / sizeof(tbl[0])); i++)
@@ -186,6 +188,7 @@ static inline bool zan_refl_member_takes_arg(int code) {
     case ZAN_REFL_M_ILONG:
     case ZAN_REFL_M_IDOUBLE:
     case ZAN_REFL_M_ISTRING:
+    case ZAN_REFL_M_IOBJECT:
     case ZAN_REFL_M_OMHAS:
     case ZAN_REFL_M_FATTRS:
     case ZAN_REFL_M_MATTRS:
@@ -212,6 +215,7 @@ static inline int zan_refl_member_max_args(int code) {
     case ZAN_REFL_M_ILONG:
     case ZAN_REFL_M_IDOUBLE:
     case ZAN_REFL_M_ISTRING:
+    case ZAN_REFL_M_IOBJECT:
         return 65;
     case ZAN_REFL_M_CNEW:
         return 64;
@@ -284,13 +288,14 @@ static inline zan_type_t *zan_refl_result_type(zan_binder_t *b, int code) {
     case ZAN_REFL_M_FTYPEINFO:
     case ZAN_REFL_M_TARG:    return b->type_typeinfo;
     case ZAN_REFL_M_OOBJECT:
+    case ZAN_REFL_M_IOBJECT:
     case ZAN_REFL_M_CNEW:    return b->type_object;
     default:                 return b->type_long;
     }
 }
 
 static inline bool zan_refl_is_reflectable(const zan_type_t *t) {
-    static const char *builtins[] = { "List", "Dict", "StringBuilder", "Span",
+    static const char *builtins[] = { "Dict", "StringBuilder", "Span",
                                       "Task", "Grouping" };
     if (!t) return false;
     if (t->kind == TYPE_OBJECT) return true;

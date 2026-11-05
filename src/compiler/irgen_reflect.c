@@ -471,6 +471,51 @@ static LLVMValueRef refl_emit_fields_enum(zan_irgen_t *g, zan_symbol_t *sym,
     return arr;
 }
 
+static inline bool refl_is_builtin_list(zan_type_t *t) {
+    return t && t->kind == TYPE_CLASS && t->name.len == 4 &&
+           memcmp(t->name.str, "List", 4) == 0;
+}
+
+static LLVMValueRef refl_emit_fields_builtin_list(zan_irgen_t *g, zan_type_t *t,
+                                                 int *out_count) {
+    *out_count = 0;
+    if (!t) return NULL;
+    LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
+    LLVMTypeRef frec = refl_field_type(g);
+
+    LLVMValueRef recs[2];
+    recs[0] = LLVMConstNamedStruct(frec, (LLVMValueRef[]){
+        refl_const_string(g, "Count", 5),
+        refl_field_type_name(g, g->binder->type_int),
+        LLVMConstInt(i64, (unsigned long long)refl_field_kind(g->binder->type_int), 0),
+        LLVMConstInt(i64, 0, 0), /* offset 0 in list struct */
+        refl_const_string(g, "", 0),
+        LLVMConstInt(i64, 0, 0),
+        refl_const_string(g, "", 0),
+        refl_meta_for(g, g->binder->type_int, NULL, 0),
+        refl_const_string(g, "", 0) }, 9);
+    recs[1] = LLVMConstNamedStruct(frec, (LLVMValueRef[]){
+        refl_const_string(g, "count", 5),
+        refl_field_type_name(g, g->binder->type_int),
+        LLVMConstInt(i64, (unsigned long long)refl_field_kind(g->binder->type_int), 0),
+        LLVMConstInt(i64, 0, 0), /* offset 0 in list struct */
+        refl_const_string(g, "", 0),
+        LLVMConstInt(i64, 0, 0),
+        refl_const_string(g, "", 0),
+        refl_meta_for(g, g->binder->type_int, NULL, 0),
+        refl_const_string(g, "", 0) }, 9);
+
+    LLVMTypeRef arr_ty = LLVMArrayType(frec, 2);
+    char nm[96];
+    snprintf(nm, sizeof(nm), "__zan.refl.fields.List.%d", g->refl_meta_count);
+    LLVMValueRef gv = LLVMAddGlobal(g->mod, arr_ty, nm);
+    LLVMSetInitializer(gv, LLVMConstArray(frec, recs, 2));
+    LLVMSetLinkage(gv, LLVMPrivateLinkage);
+    LLVMSetGlobalConstant(gv, 1);
+    *out_count = 2;
+    return LLVMConstBitCast(gv, LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0));
+}
+
 static LLVMTypeRef refl_method_type(zan_irgen_t *g) {
     if (!g->refl_method_type) {
         LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
@@ -864,6 +909,188 @@ static LLVMValueRef refl_ctor_record(zan_irgen_t *g, zan_symbol_t *sym,
         thunk,
         LLVMConstInt(i64, 0, 0),
         refl_empty_string(g) }, 8);
+}
+
+static LLVMValueRef refl_make_list_count_thunk(zan_irgen_t *g) {
+    if (g->fn_list_count_thunk) return g->fn_list_count_thunk;
+    LLVMTypeRef i8 = LLVMInt8TypeInContext(g->ctx);
+    LLVMTypeRef i8ptr = LLVMPointerType(i8, 0);
+    LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
+    LLVMTypeRef i64ptr = LLVMPointerType(i64, 0);
+    LLVMTypeRef vd = LLVMVoidTypeInContext(g->ctx);
+
+    LLVMTypeRef th_ty = LLVMFunctionType(vd, (LLVMTypeRef[]){ i8ptr, i64ptr, i64ptr }, 3, 0);
+    LLVMValueRef th = LLVMAddFunction(g->mod, "__zan.refl.thunk.list_count", th_ty);
+    LLVMSetLinkage(th, LLVMInternalLinkage);
+    g->fn_list_count_thunk = th;
+
+    LLVMBasicBlockRef save = LLVMGetInsertBlock(g->builder);
+    LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(g->ctx, th, "entry");
+    LLVMPositionBuilderAtEnd(g->builder, entry);
+
+    LLVMValueRef self = LLVMGetParam(th, 0);
+    LLVMValueRef ret_slot = LLVMGetParam(th, 2);
+
+    LLVMValueRef lp = LLVMBuildBitCast(g->builder, self,
+        LLVMPointerType(g->list_struct_type, 0), "refl.lp");
+    LLVMValueRef cntp = LLVMBuildStructGEP2(g->builder, g->list_struct_type, lp, 0, "refl.cntp");
+    LLVMValueRef cnt = LLVMBuildLoad2(g->builder, i64, cntp, "refl.cnt");
+
+    LLVMBuildStore(g->builder, cnt, ret_slot);
+    LLVMBuildRetVoid(g->builder);
+
+    if (save) LLVMPositionBuilderAtEnd(g->builder, save);
+    return LLVMConstBitCast(th, i8ptr);
+}
+
+static LLVMValueRef refl_make_list_get_thunk(zan_irgen_t *g, zan_type_t *elem_type) {
+    LLVMTypeRef i8 = LLVMInt8TypeInContext(g->ctx);
+    LLVMTypeRef i8ptr = LLVMPointerType(i8, 0);
+    LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
+    LLVMTypeRef i64ptr = LLVMPointerType(i64, 0);
+    LLVMTypeRef vd = LLVMVoidTypeInContext(g->ctx);
+
+    char nm[128];
+    snprintf(nm, sizeof(nm), "__zan.refl.thunk.list_get.%d", g->refl_thunk_count++);
+    LLVMTypeRef th_ty = LLVMFunctionType(vd, (LLVMTypeRef[]){ i8ptr, i64ptr, i64ptr }, 3, 0);
+    LLVMValueRef th = LLVMAddFunction(g->mod, nm, th_ty);
+    LLVMSetLinkage(th, LLVMInternalLinkage);
+
+    LLVMBasicBlockRef save = LLVMGetInsertBlock(g->builder);
+    LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(g->ctx, th, "entry");
+    LLVMBasicBlockRef in_b  = LLVMAppendBasicBlockInContext(g->ctx, th, "in_bounds");
+    LLVMBasicBlockRef out_b = LLVMAppendBasicBlockInContext(g->ctx, th, "out_bounds");
+
+    LLVMPositionBuilderAtEnd(g->builder, entry);
+    LLVMValueRef self = LLVMGetParam(th, 0);
+    LLVMValueRef args = LLVMGetParam(th, 1);
+    LLVMValueRef ret_slot = LLVMGetParam(th, 2);
+
+    LLVMValueRef idx = LLVMBuildLoad2(g->builder, i64, args, "refl.idx");
+
+    LLVMValueRef lp = LLVMBuildBitCast(g->builder, self,
+        LLVMPointerType(g->list_struct_type, 0), "refl.lp");
+    LLVMValueRef cntp = LLVMBuildStructGEP2(g->builder, g->list_struct_type, lp, 0, "refl.cntp");
+    LLVMValueRef cnt = LLVMBuildLoad2(g->builder, i64, cntp, "refl.cnt");
+
+    LLVMValueRef c1 = LLVMBuildICmp(g->builder, LLVMIntSGE, idx, LLVMConstInt(i64, 0, 0), "refl.c1");
+    LLVMValueRef c2 = LLVMBuildICmp(g->builder, LLVMIntSLT, idx, cnt, "refl.c2");
+    LLVMValueRef ok = LLVMBuildAnd(g->builder, c1, c2, "refl.ok");
+    LLVMBuildCondBr(g->builder, ok, in_b, out_b);
+
+    LLVMPositionBuilderAtEnd(g->builder, out_b);
+    LLVMBuildStore(g->builder, LLVMConstInt(i64, 0, 0), ret_slot);
+    LLVMBuildRetVoid(g->builder);
+
+    LLVMPositionBuilderAtEnd(g->builder, in_b);
+    LLVMValueRef datap = LLVMBuildStructGEP2(g->builder, g->list_struct_type, lp, 2, "refl.datap");
+    LLVMValueRef data = LLVMBuildLoad2(g->builder, LLVMPointerType(i64, 0), datap, "refl.data");
+
+    int slot_words = (int)elem_slot_words(g, elem_type);
+    LLVMValueRef widx = slot_word_index(g, idx, (unsigned)slot_words);
+    LLVMValueRef ep = LLVMBuildGEP2(g->builder, i64, data, &widx, 1, "refl.ep");
+    LLVMValueRef raw = LLVMBuildLoad2(g->builder, i64, ep, "refl.raw");
+
+    bool is_ref = elem_type && (
+        elem_type->kind == TYPE_CLASS ||
+        elem_type->kind == TYPE_STRING ||
+        elem_type->kind == TYPE_ARRAY ||
+        elem_type->kind == TYPE_INTERFACE ||
+        elem_type->kind == TYPE_OBJECT ||
+        elem_type->kind == TYPE_DELEGATE ||
+        elem_type->kind == TYPE_TASK);
+
+    if (is_ref) {
+        LLVMBasicBlockRef do_ret = LLVMAppendBasicBlockInContext(g->ctx, th, "do_retain");
+        LLVMBasicBlockRef done   = LLVMAppendBasicBlockInContext(g->ctx, th, "done");
+        LLVMValueRef nz = LLVMBuildICmp(g->builder, LLVMIntNE, raw, LLVMConstInt(i64, 0, 0), "refl.nz");
+        LLVMBuildCondBr(g->builder, nz, do_ret, done);
+
+        LLVMPositionBuilderAtEnd(g->builder, do_ret);
+        LLVMValueRef obj_ptr = LLVMBuildIntToPtr(g->builder, raw, i8ptr, "refl.op");
+        LLVMTypeRef arc_ty = LLVMFunctionType(vd, (LLVMTypeRef[]){ i8ptr }, 1, 0);
+        zan_call2(g->builder, arc_ty, g->rt_retain, &obj_ptr, 1, "");
+        LLVMBuildBr(g->builder, done);
+
+        LLVMPositionBuilderAtEnd(g->builder, done);
+    }
+
+    LLVMBuildStore(g->builder, raw, ret_slot);
+    LLVMBuildRetVoid(g->builder);
+
+    if (save) LLVMPositionBuilderAtEnd(g->builder, save);
+    return LLVMConstBitCast(th, i8ptr);
+}
+
+static LLVMValueRef refl_emit_methods_builtin_list(zan_irgen_t *g, zan_type_t *t,
+                                                  int *out_count) {
+    *out_count = 0;
+    if (!t) return NULL;
+    LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
+    LLVMTypeRef mrec = refl_method_type(g);
+
+    zan_type_t *elem_type = (t->type_arg_count > 0 && t->type_args)
+        ? t->type_args[0] : g->binder->type_object;
+
+    LLVMValueRef count_thunk = refl_make_list_count_thunk(g);
+    LLVMValueRef get_thunk = refl_make_list_get_thunk(g, elem_type);
+
+    /* 参数名 index */
+    LLVMValueRef pnames[1] = { refl_const_string(g, "index", 5) };
+    LLVMTypeRef pat = LLVMArrayType(i8ptr, 1);
+    char pnm[64];
+    snprintf(pnm, sizeof(pnm), "__zan.refl.pnames.list.%d", g->refl_str_count++);
+    LLVMValueRef pgv = LLVMAddGlobal(g->mod, pat, pnm);
+    LLVMSetInitializer(pgv, LLVMConstArray(i8ptr, pnames, 1));
+    LLVMSetLinkage(pgv, LLVMPrivateLinkage);
+    LLVMSetGlobalConstant(pgv, 1);
+    LLVMValueRef pidx[2] = { LLVMConstInt(i64, 0, 0), LLVMConstInt(i64, 0, 0) };
+    LLVMValueRef param_names_ptr = LLVMConstGEP2(pat, pgv, pidx, 2);
+
+    LLVMValueRef recs[3];
+    /* 0: Count() -> int */
+    recs[0] = LLVMConstNamedStruct(mrec, (LLVMValueRef[]){
+        refl_const_string(g, "Count", 5),
+        refl_field_type_name(g, g->binder->type_int),
+        LLVMConstInt(i64, (unsigned long long)refl_field_kind(g->binder->type_int), 0),
+        LLVMConstInt(i64, 0, 0),
+        LLVMConstNull(i8ptr),
+        count_thunk,
+        LLVMConstInt(i64, 0, 0),
+        refl_empty_string(g) }, 8);
+
+    /* 1: Get(int index) -> elem_type */
+    recs[1] = LLVMConstNamedStruct(mrec, (LLVMValueRef[]){
+        refl_const_string(g, "Get", 3),
+        refl_field_type_name(g, elem_type),
+        LLVMConstInt(i64, (unsigned long long)refl_field_kind(elem_type), 0),
+        LLVMConstInt(i64, 1, 0),
+        param_names_ptr,
+        get_thunk,
+        LLVMConstInt(i64, 0, 0),
+        refl_empty_string(g) }, 8);
+
+    /* 2: At(int index) -> elem_type */
+    recs[2] = LLVMConstNamedStruct(mrec, (LLVMValueRef[]){
+        refl_const_string(g, "At", 2),
+        refl_field_type_name(g, elem_type),
+        LLVMConstInt(i64, (unsigned long long)refl_field_kind(elem_type), 0),
+        LLVMConstInt(i64, 1, 0),
+        param_names_ptr,
+        get_thunk,
+        LLVMConstInt(i64, 0, 0),
+        refl_empty_string(g) }, 8);
+
+    LLVMTypeRef arr_ty = LLVMArrayType(mrec, 3);
+    char nm[96];
+    snprintf(nm, sizeof(nm), "__zan.refl.mtab.List.%d", g->refl_meta_count);
+    LLVMValueRef gv = LLVMAddGlobal(g->mod, arr_ty, nm);
+    LLVMSetInitializer(gv, LLVMConstArray(mrec, recs, 3));
+    LLVMSetLinkage(gv, LLVMPrivateLinkage);
+    LLVMSetGlobalConstant(gv, 1);
+    *out_count = 3;
+    return LLVMConstBitCast(gv, i8ptr);
 }
 
 static LLVMValueRef refl_mtab_init(zan_irgen_t *g, zan_symbol_t *sym,
@@ -1598,6 +1825,9 @@ static LLVMValueRef refl_meta_for(zan_irgen_t *g, zan_type_t *t,
         else if (t->kind == TYPE_CLASS || t->kind == TYPE_STRUCT)
             fields = refl_emit_fields_class(g, sym, &field_count);
     }
+    if (!fields && refl_is_builtin_list(t)) {
+        fields = refl_emit_fields_builtin_list(g, t, &field_count);
+    }
     if (!fields) fields = LLVMConstNull(i8ptr);
 
     int method_count = 0, ctor_count = 0;
@@ -1606,12 +1836,16 @@ static LLVMValueRef refl_meta_for(zan_irgen_t *g, zan_type_t *t,
                      t->kind == TYPE_INTERFACE)) {
         methods = refl_shape_mtab(g, sym, false, &method_count);
         ctors = refl_shape_mtab(g, sym, true, &ctor_count);
+    } else if (refl_is_builtin_list(t)) {
+        methods = refl_emit_methods_builtin_list(g, t, &method_count);
     }
 
     LLVMValueRef elem = LLVMConstNull(i8ptr);
     if (t && (t->kind == TYPE_ARRAY || t->kind == TYPE_NULLABLE) &&
         t->element_type)
         elem = refl_meta_for(g, t->element_type, NULL, 0);
+    else if (refl_is_builtin_list(t) && t->type_arg_count > 0 && t->type_args)
+        elem = refl_meta_for(g, t->type_args[0], NULL, 0);
 
     LLVMValueRef targs = LLVMConstNull(i8ptr);
     if (t && t->type_arg_count > 0 && t->type_args) {
@@ -3498,7 +3732,7 @@ static bool refl_emit_instance_call_1(zan_irgen_t *g, zan_type_t *rt,
     }
     if (code == ZAN_REFL_M_IVOID || code == ZAN_REFL_M_IINT ||
         code == ZAN_REFL_M_ILONG || code == ZAN_REFL_M_IDOUBLE ||
-        code == ZAN_REFL_M_ISTRING) {
+        code == ZAN_REFL_M_ISTRING || code == ZAN_REFL_M_IOBJECT) {
         LLVMValueRef idx = refl_mfind(g, ti, nm, 0);
         LLVMValueRef slots = refl_pack_args(g, args, argc, 1, locals);
         LLVMValueRef kout = LLVMBuildAlloca(g->builder, i64, "refl.ik");
@@ -3512,6 +3746,12 @@ static bool refl_emit_instance_call_1(zan_irgen_t *g, zan_type_t *rt,
         LLVMValueRef called = LLVMBuildICmp(g->builder, LLVMIntNE, kv,
             LLVMConstInt(i64, 0, 0), "refl.icalled");
         if (code == ZAN_REFL_M_IVOID) { *out = called; return true; }
+        if (code == ZAN_REFL_M_IOBJECT) {
+            LLVMValueRef obj_ret = LLVMBuildIntToPtr(g->builder, v, i8ptr, "refl.iobj");
+            *out = LLVMBuildSelect(g->builder, called, obj_ret,
+                                   LLVMConstNull(i8ptr), "refl.ires");
+            return true;
+        }
         LLVMValueRef k = LLVMBuildSub(g->builder, kv, LLVMConstInt(i64, 1, 0),
                                       "refl.ik1");
         if (code == ZAN_REFL_M_ISTRING) {
@@ -3598,7 +3838,14 @@ static void emit_site_meta_table(zan_irgen_t *g) {
     if (!elems) return;
     for (int i = 0; i < n; i++) {
         elems[i] = LLVMConstNull(i8ptr);
-        if (g->site_coll && g->site_coll[i]) continue;   /* List/Dict/... */
+        if (g->site_coll && g->site_coll[i]) {
+            if (g->site_coll[i] == 1) {
+                zan_type_t *elem_type = g->site_coll_elem ? g->site_coll_elem[i] : NULL;
+                zan_type_t *lt = zan_binder_make_list_type(g->binder, elem_type);
+                elems[i] = refl_meta_for(g, lt, NULL, 0);
+            }
+            continue;
+        }
         zan_symbol_t *sym = g->site_syms[i];
         if (!sym || !sym->type) continue;
         zan_type_t *t = (g->site_inst && g->site_inst[i])
@@ -3664,6 +3911,11 @@ void zan_irgen_emit_arc_desc_init(zan_irgen_t *g) {
             LLVMValueRef idxs[] = { LLVMConstInt(i64, 0, 0),
                                     LLVMConstInt(i64, 0, 0) };
             tynames = LLVMBuildGEP2(g->builder, at, gv, idxs, 2, "tn.ptr");
+            if (g->refl_used && g->site_coll[i] == 1) {
+                zan_type_t *elem_type = g->site_coll_elem ? g->site_coll_elem[i] : NULL;
+                zan_type_t *lt = zan_binder_make_list_type(g->binder, elem_type);
+                meta = refl_meta_for(g, lt, NULL, 0);
+            }
         } else if (g->site_syms[i]) {
             zan_symbol_t *sym = g->site_syms[i];
             LLVMValueRef fn = get_class_release_decl(g, sym,

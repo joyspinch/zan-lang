@@ -128,6 +128,10 @@ static zan_type_t *builtin_call_result_type(zan_checker_t *c,
         if (name.len == 11 && memcmp(name.str, "GetHashCode", 11) == 0)
             return c->binder->type_int;
     }
+    {
+        zan_type_t *rt = zan_refl_member_type(c->binder, recv, name);
+        if (rt) return rt;
+    }
     if (!bt) return NULL;
     if (zan_builtin_member_kind(bt, name.str, (int)name.len) != 'M') return NULL;
     const char *res = zan_builtin_member_result(bt, name.str, (int)name.len);
