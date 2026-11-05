@@ -563,16 +563,73 @@ static bool refl_method_should_export(zan_irgen_t *g, zan_symbol_t *sym, zan_sym
     return true;
 }
 
-static int refl_collect_methods(zan_irgen_t *g, zan_symbol_t *sym, zan_symbol_t **out, int cap) {
+/* 反射方法表条目收集：本类声明 + 沿 base_type 基类链补收继承方法。
+ *
+ * 字段表本来就含继承条目（sym->members 摊平了基类字段），方法此前
+ * 只收本类声明——派生类实例 HasMethod/Invoke 对基类方法全部 miss
+ * （基类批量架构的 html @click 处理器声明在基类上即全灭）。
+ *
+ * 遮蔽语义：名字级、最近声明胜出——与 refl_mfind 按名首中、字段表
+ * B-ID147 shadow 口径对齐。基类条目排除静态（实例反射语义）；本类
+ * 条目保持旧口径不动（含静态）。
+ *
+ * out==NULL 时纯计数，供 refl_shape_mtab 定容量；填充与计数共用本
+ * 遍历，两处口径永不漂移。 */
+static int refl_methods_walk(zan_irgen_t *g, zan_symbol_t *sym,
+                             zan_symbol_t **out, int cap) {
     int n = 0;
     if (!sym) return 0;
-    for (int i = 0; i < sym->member_count && n < cap; i++) {
-        zan_symbol_t *m = sym->members[i];
-        if (!refl_method_should_export(g, sym, m))
-            continue;
-        out[n++] = m;
+    zan_symbol_t **reg = (zan_symbol_t **)calloc(64, sizeof(zan_symbol_t *));
+    int rn = 0, rcap = 64;
+    for (int pass = 0; pass < 2; pass++) {
+        if (pass == 1 && !reg) break; /* 登记表分配失败：退化回本类口径 */
+        zan_symbol_t *owner = sym;
+        zan_type_t *bt = sym->type ? sym->type->base_type : NULL;
+        int depth = 0;
+        for (; pass == 0 || (bt && bt->sym && bt->sym != sym && depth < 32);
+             bt = bt ? bt->base_type : NULL, depth++) {
+            if (pass == 1) owner = bt->sym;
+            for (int i = 0; i < owner->member_count; i++) {
+                zan_symbol_t *m = owner->members[i];
+                if (!refl_method_should_export(g, owner, m))
+                    continue;
+                if (pass == 1 && (m->modifiers & MOD_STATIC))
+                    continue;
+                int dup = 0;
+                for (int r = 0; r < rn && !dup; r++) {
+                    if (reg[r]->name.len == m->name.len &&
+                        memcmp(reg[r]->name.str, m->name.str,
+                               (size_t)m->name.len) == 0)
+                        dup = 1;
+                }
+                if (dup) continue;
+                if (reg) {
+                    if (rn == rcap) {
+                        int ncap = rcap * 2;
+                        zan_symbol_t **nreg =
+                            (zan_symbol_t **)realloc(reg,
+                                (size_t)ncap * sizeof(*nreg));
+                        if (!nreg) break;
+                        reg = nreg;
+                        rcap = ncap;
+                    }
+                    reg[rn++] = m;
+                }
+                if (out) {
+                    if (n >= cap) break;
+                    out[n] = m;
+                }
+                n++;
+            }
+            if (pass == 0) break;
+        }
     }
+    free(reg);
     return n;
+}
+
+static int refl_collect_methods(zan_irgen_t *g, zan_symbol_t *sym, zan_symbol_t **out, int cap) {
+    return refl_methods_walk(g, sym, out, cap);
 }
 
 static int refl_collect_ctors(zan_symbol_t *sym, zan_ast_node_t **out, int cap) {
@@ -1163,6 +1220,7 @@ static LLVMValueRef refl_mtab_init(zan_irgen_t *g, zan_symbol_t *sym,
         zan_symbol_t **msyms = (zan_symbol_t **)calloc((size_t)n,
                                                     sizeof(zan_symbol_t *));
         int got = msyms ? refl_collect_methods(g, sym, msyms, n) : 0;
+        if (got > n) got = n;
         for (int i = 0; i < n; i++)
             recs[i] = i < got ? refl_method_record(g, sym, msyms[i], late)
                               : LLVMConstNull(mrec);
@@ -1189,11 +1247,7 @@ static LLVMValueRef refl_shape_mtab(zan_irgen_t *g, zan_symbol_t *sym,
         if (n == 0 && sym->type && (sym->type->kind == TYPE_CLASS || sym->type->kind == TYPE_STRUCT))
             n = 1;
     } else {
-        for (int i = 0; i < sym->member_count; i++) {
-            zan_symbol_t *m = sym->members[i];
-            if (refl_method_should_export(g, sym, m))
-                n++;
-        }
+        n = refl_methods_walk(g, sym, NULL, 0);
     }
     if (n <= 0) return LLVMConstNull(i8ptr);
 
