@@ -1464,6 +1464,22 @@ add_test(NAME conformance_gui_heavy_caseless_lookup
 set_tests_properties(conformance_gui_heavy_caseless_lookup PROPERTIES
     TIMEOUT 120 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
 
+# ChildWindow.EnsureDesign 类名回退 + 开发态散盘递归扫描：子窗设计稿
+# 装载与 Form.Show 同一约定（DesignName 覆写优先，否则类名同名 html）；
+# Directory.GetDirectories 裸名口径下递归必须拼回父路径，否则 Forms/**
+# 嵌套设计稿在 plain（开发态）构建下永远 MISS。
+add_test(NAME conformance_gui_cw_docscan
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/cwdocscan/cwdocscan_test.zan
+    "-DZANC_ARGS=--auto-stdlib${_gui_driver_tail}"
+    -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/gui/cwdocscan/cwdocscan.out
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_cw_docscan${_exe_ext}
+    -DWORKDIR=${CMAKE_SOURCE_DIR}/tests/gui/cwdocscan
+    -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+set_tests_properties(conformance_gui_cw_docscan PROPERTIES
+    TIMEOUT 120 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+
 add_test(NAME diag_docapp_no_entry
   COMMAND ${CMAKE_COMMAND}
     -DZANC=$<TARGET_FILE:zanc>
