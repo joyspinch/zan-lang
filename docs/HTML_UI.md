@@ -28,9 +28,9 @@ exe（`File.ReadAllText` 内嵌优先），烘入内容先压缩、再以按文�
 密钥流加密存放（防 strings 抠源，不对抗逆向专家；密钥种子由全部内嵌
 文件确定性推导，确定性孪生测试不受影响）。装载全程内存内解密+解压，
 **不解压到任何临时路径**。装载投影只有一个通道：`Html.Parse` 一跳建树
-（B-ID149 方言收敛——设计稿方言键 data-kind/data-span/fx/fy 等由同一
-解析直接消费；`DesignerHtml.ToJsonDoc` 只剩设计器存取格式，见
-「设计器文档格式」；窗口装配与 `Form.Show`/`Form.ReadDoc` 见
+（B-ID149/B-ID159：全面纯正典标签模式，如 `<button>`、`<switch>`、
+`<zan-tabs>` 等；窗口 JSON 管线与 `data-kind` 旁路彻底废除；
+`DesignerHtml.ToJsonDoc` 彻底退役；窗口装配与 `Form.Show`/`Form.ReadDoc` 见
 packages/Zan.Gui `Form.Show.zan`）。
 编译器对 `.html` 输入的显式拒绝与内嵌通道的契约分别由
 `diag_html_input_rejected`（ctest）与 `tests/conformance/file_embed_*`
@@ -177,20 +177,18 @@ UI、设计器画布、主窗口 `LoadHtmlWith` 装载的树）一律惰性。
 **Element 的缺省绑定属性是 text**：行里 `<span data-bind="name">`
 由 ChildWindow 按 `SetText` 通道推送/读回（真控件缺省是 value）。
 
-**两条通道同语义**（同一份文档在 HTML 装载与设计稿投影下行为一致，
-conformance 用例互为镜像）：
+**单通道正典语义**（运行期 UI 与设计器离屏预览共用 `Html.Parse` 同一管线）：
 
-| 通道 | data-if | data-for |
+| 特性 | data-if | data-for |
 |------|---------|----------|
-| `Html.Parse`（运行期 UI 与设计稿同一管线，B-ID149） | 属性协议 → bindIf | Element 属性表 |
-| 设计器存取格式（`DesignerHtml.ToJsonDoc` 往返，仅设计器内部） | JSON `"if"` 键 → bindIf | JSON `"for"` 键 → `SetAttr("data-for")` |
+| `Html.Parse`（纯正典标签单跳通道，B-ID159） | 属性协议 → bindIf | Element 属性表 |
 
-设计器存取格式里模板字段的形态（"tag"/"for"/"if" 都不在
-IsModeledKey 名单，Inspector 经 extra 原样透传保真）：
+HTML 模板在设计稿中直接以正典标签声明：
 
-```json
-{ "kind": "Element", "tag": "template", "for": "items", "name": "Rows",
-  "kids": [ { "kind": "Element", "tag": "li", ... } ] }
+```html
+<template data-for="items" id="Rows">
+  <li>...</li>
+</template>
 ```
 
 **语义边界（台账）**：
@@ -285,26 +283,26 @@ P0-P4 节）。CSS 支持面（含 grid/flex/float）见 TASKS.md A16。
 
 窗口设计器的存取格式就是本文件的 HTML 子集：文档 `<body>` 带裸属性
 `data-zan-design`（区分设计稿与运行期 UI 文档；IDE 里前者开设计器）。
-**装载投影两条路已归一（B-ID149）**：设计稿与运行期 UI 都走
-`Html.Parse` 一跳建树，方言键（data-kind/data-span/data-fx/fy/…）由
-同一解析直接消费；`DesignerHtml.ToJsonDoc`/`FromJsonDoc` 只在设计器
-内部做存取往返，不再出现在应用装载路径上。JSON 文档模型经
-`System.Web.DesignerHtml` 与 HTML 解析：
+**装载投影两条路已归一（B-ID149/B-ID159）**：设计稿与运行期 UI 都走
+`Html.Parse` 纯正典标签单跳建树，方言键（data-span/data-fx/fy/…）由
+同一解析直接消费；运行时与设计器预览彻底拆除旧的 JSON 建树管线与
+`DesignerHtml.ToJsonDoc`，所有组件直接以正典标签（`<button>`、`<switch>`、
+`<select>`、`<zan-*>` 等）声明。HTML 与设计器双向映射：
 
 - 文档级键（winW/role/layoutMode/…）→ `<body>` 的 `data-<kebab>` 属性；
   `name` 另发 `<body id>`；裸属性即 `true`；`0`/`""`/`false` 不发（读端有
   缺省）。
-- 字段 → 元素：`kind` 决定 tag（Panel/自定义→div、Label→label、Button→
-  button、Input→input、TextArea→textarea、Image→img），`data-kind` 是权
-  威标记；`name` → `id`、`class` → `class`、`style` → `style`、`kids` →
-  子元素。
+- 字段 → 元素：标签名即控件语义（原生标签如 `<button>`、`<input>`、`<textarea>`、
+  `<select>`、`<switch>`、`<progress>`、`<img>`；自定义或高级组件如
+  `<zan-tabs>`、`<zan-card>`、`<zan-data-grid>` 等）。彻底废除 `data-kind` 属性旁路；
+  `name` → `id`、`class` → `class`、`style` → `style`、`kids` → 子元素。
 - 标量键 → `data-<kebab>`（camelCase kebab 化，读端还原）；数字/布尔自动
   嗅探。
-- 事件键 `onClick` 等 → `data-on-click`（与运行时 data-on-* 协议同形）。
+- 事件键 `onClick` 等 → `@click` 或 `data-on-click`（按名反射接线）。
 - 复合值（props 直通表、DataGrid columns、winShape）→
   `data-x-<kebab>` = 紧凑 JSON；字符串值不作数字嗅探（`"min":"0"` 不漂）。
 - `options`（SelectBox 等）→ `data-options="a|b|c"`（`|` 分隔，与
-  JoinOpts 同约定）。
+  JoinOpts 同约定）或 `<option>` 子标签。
 
 设计器侧 API：`Designer.SaveHtml()` / `LoadHtmlText(text)`；IDE 的 .html
 设计稿标签页（body 有标记）自动进设计器并回存 HTML。JSON 文档模型仍是

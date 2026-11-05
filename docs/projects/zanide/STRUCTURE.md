@@ -11,12 +11,12 @@
 | `Xxx.zan`   | code-behind：`partial class Xxx`，只放数据绑定与事件逻辑 |
 | `Xxx.design.zan` | 运行期投影半件：由 `scripts/gen_design_halves.py` 自动生成，暴露类型化控件访问器 |
 
-* **运行期投影单通道**：编译期 HTML 通道已彻底废除（zanc 显式拒绝 `.html` 作为编译源文件）。所有设计稿（`.html`）通过 `--embed` 烘入可执行文件（内嵌优先读回、发布自动压缩加密），程序启动时在内存中经 `DesignerHtml.ToJsonDoc` + `FormBuilder` 投影。
+* **运行期投影单通道**：编译期 HTML 通道已彻底废除（zanc 显式拒绝 `.html` 作为编译源文件）。所有设计稿（`.html`）通过 `--embed` 烘入可执行文件（内嵌优先读回、发布自动压缩加密），程序启动时在内存中经 `Html.Parse` 纯正典标签单跳通道投影建树。
 * **程序入口**：`zan.proj` 的 `entry` 指向主 `.zan` 文件（如 `src/IdeForm.zan`）。程序 `Main()` 落在手写 Zan 代码里，启动时解析主窗体设计稿、建树、挂载 `OnLoad` 后进入消息循环。
-* **可嵌入控件（role="control"）**：面板 / 页 / 卡片等可嵌入单元在设计稿中声明 `data-role="control"`，其半件继承 `DesignedControl`（`partial class Xxx : DesignedControl`）。构造时自动调 `this.Design(kind, docPath)` 将设计文档投影进自身控件树，命名控件以强类型属性暴露（`this.Tree` 等），并在建树后调用 code-behind 的 `void OnInit()`。可以在其它设计稿中直接以其类名作为 `data-kind` 嵌套引用：
+* **可嵌入控件（role="control"）**：面板 / 页 / 卡片等可嵌入单元在设计稿中声明 `data-role="control"`，其半件继承 `DesignedControl`（`partial class Xxx : DesignedControl`）。构造时自动调 `this.Design(kind, docPath)` 将设计文档投影进自身控件树，命名控件以强类型属性暴露（`this.Tree` 等），并在建树后调用 code-behind 的 `void OnInit()`。可以在其它设计稿中直接以其正典标签嵌套引用：
 
-  ```json
-  { "kind": "ExplorerPanel", "name": "Explorer", "dock": 3, "fw": 260 }
+  ```html
+  <explorer-panel id="Explorer" data-dock="3" data-fw="260"></explorer-panel>
   ```
 
 * **禁止自绘**：控件树只能由标准库 GUI 组件（`Gui` / `Gui.Widget` / `Gui.Component`）构成。

@@ -4,7 +4,7 @@
 规则（2026-09 第二轮重设计）：
   - 真 HTML 语义优先：button/label/input/textarea/img 五种有原生标签的
     组件一律用原生标签 + 原生属性/文本内容（src、placeholder、元素文本），
-    其余组件用 div + data-kind 扩展（设计稿协议的 custom-element 通道）。
+    其余组件用正典标签模式扩展（如 <zan-card>、<zan-tabs> 等）。
   - 演示尺寸按组件自身特性配置，按 1560×920 逻辑窗口 4 列瀑布流布局：
     同页高卡降序先行，每列独立记账、卡片落"最矮位置"，页底收平；
     DataGrid/Transfer 等大组件跨两列，断言不超出内容区（不裁切）。

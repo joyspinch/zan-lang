@@ -294,6 +294,138 @@ static bool intel_html_has(const char *line, size_t len, const char *needle) {
     return false;
 }
 
+static bool intel_html_extract_tag(const char *line, size_t len,
+                                   char *tag_out, size_t tag_cap) {
+    size_t i = 0;
+    while (i < len && (line[i] == ' ' || line[i] == '\t')) i++;
+    if (i >= len || line[i] != '<') return false;
+    i++;
+    if (i < len && (line[i] == '/' || line[i] == '!')) return false;
+    size_t start = i;
+    while (i < len && (isalnum((unsigned char)line[i]) || line[i] == '-' || line[i] == '_')) i++;
+    size_t tlen = i - start;
+    if (tlen == 0 || tlen >= tag_cap) return false;
+    memcpy(tag_out, line + start, tlen);
+    tag_out[tlen] = '\0';
+    return true;
+}
+
+static bool intel_html_tag_to_kind(const char *tag, size_t tag_len,
+                                   const char *line, size_t len,
+                                   char *out, size_t cap) {
+    if (tag_len == 0 || cap < 16) return false;
+    char t[64];
+    if (tag_len >= sizeof(t)) tag_len = sizeof(t) - 1;
+    for (size_t i = 0; i < tag_len; i++) {
+        t[i] = (char)tolower((unsigned char)tag[i]);
+    }
+    t[tag_len] = '\0';
+
+    if (strcmp(t, "body") == 0 || strcmp(t, "html") == 0 ||
+        strcmp(t, "head") == 0 || strcmp(t, "style") == 0 ||
+        strcmp(t, "script") == 0 || strcmp(t, "meta") == 0 ||
+        strcmp(t, "title") == 0 || strcmp(t, "link") == 0) {
+        return false;
+    }
+
+    /* zan-* 标签：转 PascalCase，如 zan-tabs -> Tabs, zan-date-picker -> DatePicker */
+    if (strncmp(t, "zan-", 4) == 0) {
+        const char *p = t + 4;
+        size_t w = 0;
+        bool up = true;
+        while (*p && w + 1 < cap) {
+            if (*p == '-') {
+                up = true;
+            } else if (up) {
+                out[w++] = (char)toupper((unsigned char)*p);
+                up = false;
+            } else {
+                out[w++] = *p;
+            }
+            p++;
+        }
+        out[w] = '\0';
+        return w > 0;
+    }
+
+    /* 原生/标准标签映射 */
+    if (strcmp(t, "button") == 0) { snprintf(out, cap, "Button"); return true; }
+    if (strcmp(t, "textarea") == 0) { snprintf(out, cap, "TextArea"); return true; }
+    if (strcmp(t, "select") == 0) { snprintf(out, cap, "SelectBox"); return true; }
+    if (strcmp(t, "img") == 0) { snprintf(out, cap, "Image"); return true; }
+    if (strcmp(t, "progress") == 0) { snprintf(out, cap, "Progress"); return true; }
+    if (strcmp(t, "label") == 0) { snprintf(out, cap, "Label"); return true; }
+    if (strcmp(t, "hr") == 0 || strcmp(t, "divider") == 0) { snprintf(out, cap, "Divider"); return true; }
+    if (strcmp(t, "p") == 0 || (t[0] == 'h' && t[1] >= '1' && t[1] <= '6' && t[2] == '\0')) {
+        snprintf(out, cap, "Typography"); return true;
+    }
+    if (strcmp(t, "switch") == 0) { snprintf(out, cap, "Switch"); return true; }
+    if (strcmp(t, "checkbox") == 0) { snprintf(out, cap, "Checkbox"); return true; }
+    if (strcmp(t, "radio") == 0) { snprintf(out, cap, "Radio"); return true; }
+    if (strcmp(t, "slider") == 0) { snprintf(out, cap, "Slider"); return true; }
+    if (strcmp(t, "tabs") == 0) { snprintf(out, cap, "Tabs"); return true; }
+    if (strcmp(t, "card") == 0) { snprintf(out, cap, "Card"); return true; }
+    if (strcmp(t, "panel") == 0) { snprintf(out, cap, "Panel"); return true; }
+    if (strcmp(t, "modal") == 0 || strcmp(t, "dialog") == 0) { snprintf(out, cap, "Modal"); return true; }
+    if (strcmp(t, "drawer") == 0) { snprintf(out, cap, "Drawer"); return true; }
+    if (strcmp(t, "form") == 0 || strcmp(t, "form-group") == 0) { snprintf(out, cap, "FormGroup"); return true; }
+    if (strcmp(t, "table") == 0 || strcmp(t, "grid") == 0 ||
+        strcmp(t, "datagrid") == 0 || strcmp(t, "data-grid") == 0) { snprintf(out, cap, "DataGrid"); return true; }
+    if (strcmp(t, "tree") == 0 || strcmp(t, "treeview") == 0) { snprintf(out, cap, "TreeView"); return true; }
+    if (strcmp(t, "list") == 0 || strcmp(t, "listview") == 0) { snprintf(out, cap, "ListView"); return true; }
+
+    if (strcmp(t, "input") == 0) {
+        char ty[32] = {0};
+        if (intel_html_attr(line, len, "type", ty, sizeof(ty))) {
+            for (char *c = ty; *c; c++) *c = (char)tolower((unsigned char)*c);
+            if (strcmp(ty, "checkbox") == 0) { snprintf(out, cap, "Checkbox"); return true; }
+            if (strcmp(ty, "radio") == 0) { snprintf(out, cap, "Radio"); return true; }
+            if (strcmp(ty, "range") == 0) { snprintf(out, cap, "Slider"); return true; }
+            if (strcmp(ty, "color") == 0) { snprintf(out, cap, "ColorPicker"); return true; }
+            if (strcmp(ty, "number") == 0) { snprintf(out, cap, "InputNumber"); return true; }
+            if (strcmp(ty, "date") == 0 || strcmp(ty, "time") == 0) { snprintf(out, cap, "DatePicker"); return true; }
+            if (strcmp(ty, "file") == 0) { snprintf(out, cap, "Upload"); return true; }
+        }
+        snprintf(out, cap, "Input");
+        return true;
+    }
+
+    if (strcmp(t, "div") == 0) {
+        snprintf(out, cap, "Panel");
+        return true;
+    }
+
+    /* 其他带连字符的标签，转 PascalCase */
+    if (strchr(t, '-')) {
+        const char *p = t;
+        size_t w = 0;
+        bool up = true;
+        while (*p && w + 1 < cap) {
+            if (*p == '-') {
+                up = true;
+            } else if (up) {
+                out[w++] = (char)toupper((unsigned char)*p);
+                up = false;
+            } else {
+                out[w++] = *p;
+            }
+            p++;
+        }
+        out[w] = '\0';
+        return w > 0;
+    }
+
+    if (tag_len > 0 && isupper((unsigned char)tag[0])) {
+        size_t w = tag_len < cap - 1 ? tag_len : cap - 1;
+        memcpy(out, tag, w);
+        out[w] = '\0';
+        return true;
+    }
+
+    snprintf(out, cap, "Element");
+    return true;
+}
+
 static int intel_html_handlers(const char *line, size_t len,
                                char outs[][128], int max) {
     static const char kOn[] = "data-on-";
@@ -317,6 +449,46 @@ static int intel_html_handlers(const char *line, size_t len,
         }
         i = (size_t)(v - line) + m + 1;
     }
+
+    /* 扫描 @evt="Handler" 或 @evt="Handler(arg)" */
+    i = 0;
+    while (i + 3 < len && n < max) {
+        if (line[i] == '@' && (i == 0 || line[i - 1] == ' ' || line[i - 1] == '\t')) {
+            size_t j = i + 1;
+            while (j < len && (isalnum((unsigned char)line[j]) || line[j] == '-' || line[j] == '_')) j++;
+            if (j < len && line[j] == '=') {
+                char q = '\0';
+                size_t vstart = j + 1;
+                if (vstart < len && (line[vstart] == '"' || line[vstart] == '\'')) {
+                    q = line[vstart];
+                    vstart++;
+                }
+                if (q != '\0') {
+                    size_t vend = vstart;
+                    while (vend < len && line[vend] != q) vend++;
+                    size_t vlen = vend - vstart;
+                    const char *paren = memchr(line + vstart, '(', vlen);
+                    if (paren) {
+                        vlen = (size_t)(paren - (line + vstart));
+                    }
+                    while (vlen > 0 && (line[vstart] == ' ' || line[vstart] == '\t')) {
+                        vstart++; vlen--;
+                    }
+                    while (vlen > 0 && (line[vstart + vlen - 1] == ' ' || line[vstart + vlen - 1] == '\t')) {
+                        vlen--;
+                    }
+                    if (vlen > 0 && vlen < 128) {
+                        memcpy(outs[n], line + vstart, vlen);
+                        outs[n][vlen] = '\0';
+                        n++;
+                    }
+                    i = vend;
+                }
+            }
+        }
+        i++;
+    }
+
     return n;
 }
 
@@ -397,28 +569,41 @@ static void intel_parse_design_html(intellisense_t *is, const char *filepath,
     while (p < end) {
         const char *nl = memchr(p, '\n', (size_t)(end - p));
         size_t ll = (size_t)((nl ? nl : end) - p);
-        char kind[128];
-        if (intel_html_attr(p, ll, "data-kind", kind, sizeof(kind)) &&
-            kind[0]) {
+
+        char tag[64] = {0};
+        char wtype[64] = {0};
+        bool has_tag = intel_html_extract_tag(p, ll, tag, sizeof(tag));
+        char kind[128] = {0};
+        bool has_kind = intel_html_attr(p, ll, "data-kind", kind, sizeof(kind)) && kind[0];
+
+        if (has_kind) {
+            if (isalpha((unsigned char)kind[0])) {
+                snprintf(wtype, sizeof(wtype), "%s", kind);
+            } else if (kind[0] >= '0' && kind[0] <= '9') {
+                snprintf(wtype, sizeof(wtype), "%s", intel_design_widget(atoi(kind)));
+            } else {
+                snprintf(wtype, sizeof(wtype), "Panel");
+            }
+        } else if (has_tag) {
+            intel_html_tag_to_kind(tag, strlen(tag), p, ll, wtype, sizeof(wtype));
+        }
+
+        if (wtype[0]) {
             char fname[128];
             if (intel_html_attr(p, ll, "id", fname, sizeof(fname)) &&
                 fname[0] && isalpha((unsigned char)fname[0])) {
-                const char *wtype = "Panel";
-                if (isalpha((unsigned char)kind[0])) {
-                    wtype = kind;
-                } else if (kind[0] >= '0' && kind[0] <= '9') {
-                    wtype = intel_design_widget(atoi(kind));
-                }
                 add_symbol(is, fname, wtype, class_name, NULL,
                            filepath, ISYM_FIELD, line, 0);
             }
-            char hs[8][128];
-            int hn = intel_html_handlers(p, ll, hs, 8);
-            for (int h = 0; h < hn; h++) {
-                add_symbol(is, hs[h], "void", class_name, "void handler()",
-                           filepath, ISYM_METHOD, line, 0);
-            }
         }
+
+        char hs[8][128];
+        int hn = intel_html_handlers(p, ll, hs, 8);
+        for (int h = 0; h < hn; h++) {
+            add_symbol(is, hs[h], "void", class_name, "void handler()",
+                       filepath, ISYM_METHOD, line, 0);
+        }
+
         if (!nl) break;
         p = nl + 1;
         line++;

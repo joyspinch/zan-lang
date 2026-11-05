@@ -260,19 +260,13 @@ description: Zan GUI（Zan.Gui 包）审美与排版规范——对齐、间距�
   value max>`→Progress(折算 percent)、`<p>正文`→Typography。
   **没有原生等价物的组件写成 `zan-<kebab>` 自定义元素**(`zan-avatar`、
   `zan-data-grid`、`zan-tabs`——HTML5 合法标签名,tokenizer 收连字符,
-  读端 TagKind 逐段大写反解回 Pascal kind);`data-kind` 只在"不标就
-  看不出"时发(裸 div 承载非 Panel kind、span 上的 Element 覆写),
-  裸 `<div>` 的 kind 兜底就是 Panel——布局壳(页面/卡片/格子)不标
-  任何 kind。原生属性与 `data-x-*` 通道等价可混用(图片内容就该放
-  src);复合属性(props/columns)才用 `data-x-<键>='<JSON>'`。
-  旧稿的 div+data-kind 写法导入通道永久保留,不必追改。
-- **裸 `<div>` 的 kind 兜底就是 Panel**:布局壳(页面/卡片/格子)不写
-  `data-kind="Panel"`,剥掉后模型逐字节不变——只有"演示本尊"才值得
-  标 kind。协议侧扩了原生映射后旧稿不会自动跟上:用
-  `grep '<div[^>]*data-kind='` 普查各 .html 设计稿,把有原生等价物的
-  控件换成原生标签;批量转换用探针校验——新旧稿各过
-  `DesignerHtml.ToJsonDoc` 比模型,除有意的形状变化(如滑条 min/max
-  从 props 袋提为原生属性)外应逐字节 SAME。
+  读端 TagKind 逐段大写反解回 Pascal kind)。彻底废除 `data-kind` 属性旁路与
+  `DesignerHtml.ToJsonDoc` 旧 JSON 管线，纯正典标签模式为全仓唯一通道。
+  原生属性与 `data-x-*` 通道等价可混用(图片内容就该放 src);
+  复合属性(props/columns)才用 `data-x-<键>='<JSON>'`。
+- **裸 `<div>` 的 kind 兜底就是 Panel**:布局壳(页面/卡片/格子)直接用 `<div>`，
+  不写任何属性旁路。有原生等价物的控件一律用正典标签（`<button>`、`<switch>`、
+  `<select>`、`<input>` 等），自定义或高级组件用 `<zan-*>` 或连字符标签。
 - **`<a href>` 自带导航语义,别再手接 data-on-click 当链接用**（起,此前 `<a>` 只是行内 Element、href 静默忽略):http/https 链接建树时
   自动接缺省导航——缺省进内嵌 WebView(宿主 `app.UseWebview(box)` 注册过
   就地图,没注册懒开 App 级链接窗口复用),`target="_blank"` 弹系统浏览器;

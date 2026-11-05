@@ -1,6 +1,6 @@
 # html_gallery —— HTML 设计稿组件全量画廊
 
-用 **.html 设计稿**（原生 HTML 语义 + `data-kind` 协议）声明组件库全部
+用 **.html 设计稿**（纯正典标签模式，如 `<button>`、`<switch>`、`<zan-tabs>` 等）声明组件库全部
 可声明组件的演示：**86 张卡片、8 个分类页**（组件目录 78 个 + 目录漏登的
 CheckboxGroup/ListView + 目录外可独立演示的 Dropdown/RichText/ChatView/
 PropertyGrid/Grid/FileTree/ScrollColumn/Flex/FormGroup），顶部 Tabs 点
@@ -20,7 +20,7 @@ html_gallery.exe
   窗口与控件字段；漏了它 GenForm 不运行，报一片 undeclared identifier）。
 - 编译没加 `--subsystem windows`，故意保留控制台：启动自检会逐组件
   打印结果，最后一行 `SELFTEST fails=0 of 86` 即全部建成且类型正确
-  （`data-kind` 拼错会静默落 Element 占位，自检让它变成可机检事实）。
+  （标签名拼错会回退 Element 占位，自检让它变成可机检事实）。
   正式发布想要纯窗口，加 `--subsystem windows` 重编即可。
 - DPI 自动处理：设计坐标是逻辑像素，150% 缩放下窗口即 2362×1436 物理，
   无需任何代码。
@@ -31,7 +31,7 @@ html_gallery.exe
 （Dropdown/RichText/ChatView/PropertyGrid/Grid/FileTree/ScrollColumn/
 Flex/FormGroup，都是可独立实例化演示的真控件）。其中 Flex/FormGroup 与
 Grid/GridItem/ScrollColumn/CheckboxGroup/ChartHost 这些布局容器/宿主类
-`data-kind` 声明与 ControlFactory 创建都认它们。
+正典标签声明（如 `<flex>`、`<form-group>`、`<grid>`）与 ControlFactory 创建都认它们。
 剔除的组件与原因：
 
 | 组件 | 原因 |
@@ -67,13 +67,13 @@ Grid/GridItem/ScrollColumn/CheckboxGroup/ChartHost 这些布局容器/宿主类
    的定式填进真控件。其中 Wizard/FormField 卡演示的是组件的真实用法：
    Wizard 的全窗 Render/Show 不是可 Dock 的子控件，卡内嵌它的
    `Wizard.RenderList` 子件 + 实时描述；FormField 是设计器文档节点
-   本身无运行时绘制，运行时形态是 `FormBuilder.Build(设计 JSON)`
+   本身无运行时绘制，运行时形态是 `Html.Parse(表单 HTML).root`
    实例化的真控件树——卡里按同样方式喂一张迷你表单。
 3. 启动自检（`Check(字段, 期望 Kind, id)`）逐组件断言构造正确。
 
 ## 这个示例教的事
 
-- `data-kind="组件类名"` 直接实例化注册组件；原生标签按上节语义映射。
+- 正典标签（原生标签或 `<zan-*>`）直接实例化注册组件。
 - code-behind 是 `partial class <设计稿 body id>` + `static void
   OnLoad(Form form)`：设计稿里每个带 id 的节点都是生成的同名字段
   （`Cats`、`Page0..7`、`DemoButton`…），直接引用即可。

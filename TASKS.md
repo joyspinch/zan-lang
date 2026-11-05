@@ -6,13 +6,13 @@
 >
 > 平账纪律：闭账条目当批移出，已闭环内容移至 git 历史。领账按批次：批次 1 根修优先（闭一条解锁一片），批次 2 独立账可并行，批次 3 等前置闭了再领，批次 4 大工程须独占窗口；同批内按编号序。每条正文前的〔…〕是依赖标签：〔前置 X〕= X 不闭本条闭不了；〔软前置 X〕= 没 X 也能做但成本高；〔根修·解锁 Y〕= 本条闭了 Y 的前置随之解除；〔串行前置 X〕= 与 X 同改一个文件，等 X 落地再动。根修闭账时同批摘掉下游条目的〔前置〕标签并上调批次。领账前 `git status` + 文件 mtime 查在飞——并发会话不一定走调度器注册（2026-11-03 B-ID107 即靠 mtime 抓到撞车）。
 >
-> 2026-11-05 平账：移出已闭账 [x] 七条（B-ID149/150/151/154/156/157/158），结论与验证证据由对应提交正文承担。
+> 2026-11-05 平账：移出已闭账 [x] 八条（B-ID149/150/151/154/156/157/158 与 B-ID159 窗口声明面纯正典标签化三刀全量闭环），结论与验证证据由对应提交正文承担。
 >
 ## 未完成（按平账顺序分批）
 
 ### 批次 0 · 在飞（持有会话未提交；其他会话勿碰同文件）
 
-- [ ] B-ID159〔批次 2 独立账〕窗口声明面标签化三刀：刀1 已提交（6a7208a04）；刀2 已提交（DesignerHtml.ToJsonDoc + 读侧 orphan 函数删除、设计器 writer 去 data-kind legacy 分支、TagKind 共享映射收口、DesignLoad/Designer.Html.LoadHtmlText/Designer.Prepared/Preview/PvCompCtl 重切 Html 通道、UserComponentRegistry 与 .zcomp 换 html、FormBuilder Build(JsonValue) 子图 + FbBuildContext 删除、NormalizeEventName 归一化行为新家、form_grid/genform/design_form_size/form_control/compref/batchjob/designer_wysiwyg/formbuild/rich_events 测试重切或删、roundtrip golden 更新；受影响 8 项 ctest 100% Passed，designer_html_roundtrip 41 项全绿与 golden 0 diff）；刀3 过渡态清仓——docs（HTML_UI/STRUCTURE/STDLIB_COMPONENT_STANDARDS）与 skills（gui-design/html-window/zan-development/zan-workflow/game-dev）三副本同提交改写、html_gallery 及 gui_charts/gui_excel_export/gui_browser/gui_cef_browser/gui_wallpaper 声明化、intellisense.c zan-* tag 解析、gen_design_halves.py 改读标签、gallery.json 与 examples-catalog regen、_scratch 无 README 探针目录清扫。
+（暂空）
 
 
 ### 批次 1 · 根修项（闭它解锁下游，优先领）

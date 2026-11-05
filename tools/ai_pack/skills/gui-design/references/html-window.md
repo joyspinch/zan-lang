@@ -7,18 +7,17 @@ zanc 对 .html 显式拒绝；唯一通道是运行期装载（2026-10-31，B-ID
 ## 唯一建树通道：运行期装载
 
 - **装载**：`Html.Install()` 后 `app.LoadHtmlWith(html, handlers,
-  baseDir)`（html 文本可来自文件/网络/字符串，窗口根文档也可用
-  `FormBuilder.BuildWith(doc, null)` 投影）。装载器自己把 html 根
+  baseDir)`（html 文本可来自文件/网络/字符串，窗口装配走 `Form.Show` /
+  `Html.Parse` 纯正典标签单跳通道）。装载器自己把 html 根
   `Dock(Fill)` 挂进宿主——GenHtml 时代"必须补一句 root.DockFill"的
-  树根坑已成历史；定制宿主（设计类控件）走
-  `FormBuilder.ProjectInto(host, doc)`。
+  树根坑已成历史；旧 JSON 建树管线（FormBuilder.BuildWith 等）已彻底拆除。
 - **发布保护**：设计稿用 `--embed <file>=<别名>` 随 exe 烘入（压缩 +
   加密，运行期 `File.ReadAllText` 内嵌优先、内存解出，**不落盘**、
   不解压临时文件）。
 - **窗口属性**：`data-win-title/win-w/win-h/win-chrome/win-center` 等
   是文档键，由入口代码读键后调 `Form.Create`/`SetChromeVisible` 等
   落地（一份手写入口，业务代码不碰建树）。
-- **组件零清单扩展**：文档里 `zan-*`/`data-kind` 引用的组件，其类
+- **组件零清单扩展**：文档里正典标签（`<button>`、`<switch>`、`<zan-*>` 等）引用的组件，其类
   自声明 `static void Install()`（内部 `HeavyControls.Register`）即被
   构建期扫描自动收进注册表；设计类视图的半件与注册表由
   生成脚本扫描 .html 自动产出——新增组件不加任何清单。
