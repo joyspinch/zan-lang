@@ -32,6 +32,11 @@ public class JsonValue {
     public string strVal;
     // kind 4 时的数组元素。
     public List<JsonValue> items;
+    // kind 4 的数值直存形态（刀11），与 items 互斥：numArr != null
+    // 即数值形态。读路径（Count/At/Clone/序列化）双形态透明；
+    // 变异操作先经 MaterializeItems 降级，序列化输出与装箱形态
+    // 逐字节等价（元素按 NewDouble 的 numD 分支渲染）。
+    public double[] numArr;
     // kind 5 时的键列表。
     public List<string> keys;
     // kind 5 时与 keys 并置的值列表。
@@ -67,6 +72,7 @@ public class JsonValue {
         this.numRaw = "";
         this.strVal = "";
         this.items = null;
+        this.numArr = null;
         this.keys = null;
         this.vals = null;
         this.keyIndex = null;
@@ -129,6 +135,19 @@ public class JsonValue {
         return v;
     }
 
+    // 构造数值直存数组（kind 4 数值形态）：对 src 做一次防御拷贝，
+    // 调用方事后改动原数组不渗入本值。
+    public static JsonValue NewDoubleArray(double[] src) {
+        int n = src != null ? src.Length : 0;
+        double[] copy = new double[n];
+        for (int i = 0; i < n; i = i + 1) { copy[i] = src[i]; }
+        JsonValue v = new JsonValue();
+        v.kind = 4;
+        v.items = null;
+        v.numArr = copy;
+        return v;
+    }
+
     // 构造空对象（kind 5）。
     public static JsonValue NewObject() {
         JsonValue v = new JsonValue();
@@ -153,6 +172,7 @@ public class JsonValue {
         }
         if (this.kind == 3) { return JsonValue.NewStr(this.strVal); }
         if (this.kind == 4) {
+            if (this.numArr != null) { return JsonValue.NewDoubleArray(this.numArr); }
             JsonValue arr = JsonValue.NewArray();
             int n = this.items.Count;
             for (int i = 0; i < n; i = i + 1) {
@@ -335,7 +355,9 @@ public class JsonValue {
         if (kind == 4) {
             // 数组的元素在 items 里（vals 是对象的值列表）——删错列表
             // 会让 RemoveAt 变成静默的空操作。
-            if (items != null && index >= 0 && index < items.Count) {
+            int n = this.numArr != null ? this.numArr.Length : (items != null ? items.Count : 0);
+            if (index >= 0 && index < n) {
+                this.MaterializeItems();
                 items.RemoveAt(index);
             }
         }
@@ -496,26 +518,41 @@ public class JsonValue {
 
     // ---- 数组访问 -----------------------------------------------------
 
-    // 数组末尾追加元素（数组）。
-    public void Append(JsonValue v) { items.Add(v); }
+    // 数值直存形态降级为装箱形态（变异操作进入时调用），值语义不变。
+    public void MaterializeItems() {
+        if (this.numArr == null) { return; }
+        double[] arr = this.numArr;
+        this.numArr = null;
+        this.items = new List<JsonValue>();
+        this.items.Reserve(arr.Length);
+        for (int i = 0; i < arr.Length; i = i + 1) { this.items.Add(JsonValue.NewDouble(arr[i])); }
+    }
+
+    // 数组末尾追加元素（数组）。数值直存形态先降级。
+    public void Append(JsonValue v) {
+        this.MaterializeItems();
+        items.Add(v);
+    }
 
     // 元素数量（数组元素或对象条目数；其他情况为 0）。
     public int Count() {
-        if (kind == 4) { return items.Count; }
+        if (kind == 4) { return this.numArr != null ? this.numArr.Length : items.Count; }
         if (kind == 5) { return keys.Count; }
         return 0;
     }
 
     // 第 i 个数组元素。非数组或越界抛 JsonException——历史版本此处是
     // 裸 items[i]：把 At 用在对象（items=null）上直接段崩 0xC0000005
-    // 且无任何诊断（P2-17）。
+    // 且无任何诊断（P2-17）。数值直存形态按需懒装箱。
     public JsonValue At(int i) {
-        if (kind != 4 || items == null) {
+        if (kind != 4 || (items == null && this.numArr == null)) {
             throw new JsonException("At(" + Convert.ToString(i) + ") on non-array value (kind=" + Convert.ToString(kind) + ")");
         }
-        if (i < 0 || i >= items.Count) {
-            throw new JsonException("At(" + Convert.ToString(i) + ") out of range (count=" + Convert.ToString(items.Count) + ")");
+        int n = this.numArr != null ? this.numArr.Length : items.Count;
+        if (i < 0 || i >= n) {
+            throw new JsonException("At(" + Convert.ToString(i) + ") out of range (count=" + Convert.ToString(n) + ")");
         }
+        if (this.numArr != null) { return JsonValue.NewDouble(this.numArr[i]); }
         return items[i];
     }
 
@@ -524,7 +561,10 @@ public class JsonValue {
     // 自行校验过，把这里改成抛错等于给它们加一遍重复检查。新代码拿
     // 不准下标时请先校验，别依赖静默语义。
     public void SetAt(int i, JsonValue val) {
-        if (kind == 4 && items != null && i >= 0 && i < items.Count) {
+        if (kind != 4) { return; }
+        int n = this.numArr != null ? this.numArr.Length : (items != null ? items.Count : 0);
+        if (i >= 0 && i < n) {
+            this.MaterializeItems();
             items[i] = val;
         }
     }
@@ -600,6 +640,17 @@ public class JsonValue {
         }
         if (kind == 4) {
             sb.Append("[");
+            if (this.numArr != null) {
+                // 元素按 NewDouble 的 numD 分支渲染（NaN/±Inf → null）。
+                for (int i = 0; i < this.numArr.Length; i = i + 1) {
+                    if (i > 0) { sb.Append(","); }
+                    double d = this.numArr[i];
+                    if (d != d || d - d != 0) { sb.Append("null"); }
+                    else { sb.Append(d); }
+                }
+                sb.Append("]");
+                return;
+            }
             for (int i = 0; i < items.Count; i = i + 1) {
                 if (i > 0) { sb.Append(","); }
                 items[i].WriteToAt(sb, depth + 1);
@@ -664,6 +715,22 @@ public class JsonValue {
             return;
         }
         if (kind == 4) {
+            if (this.numArr != null) {
+                // 元素渲染同 WriteToAt 的 numArr 分支（numD 分支）。
+                if (this.numArr.Length == 0) { sb.Append("[]"); return; }
+                sb.Append("[\n");
+                for (int i = 0; i < this.numArr.Length; i = i + 1) {
+                    sb.Append(JsonValue.PrettyIndent(depth + 1));
+                    double d = this.numArr[i];
+                    if (d != d || d - d != 0) { sb.Append("null"); }
+                    else { sb.Append(d); }
+                    if (i < this.numArr.Length - 1) { sb.Append(","); }
+                    sb.Append("\n");
+                }
+                sb.Append(JsonValue.PrettyIndent(depth));
+                sb.Append("]");
+                return;
+            }
             if (items.Count == 0) { sb.Append("[]"); return; }
             sb.Append("[\n");
             for (int i = 0; i < items.Count; i = i + 1) {

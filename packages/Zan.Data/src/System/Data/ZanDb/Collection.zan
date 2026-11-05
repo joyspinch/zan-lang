@@ -334,6 +334,13 @@ public class Collection {
             if (cnt >= 32 && Collection.ArrayIsF32Encodable(v)) {
                 b.WriteU8(11);
                 b.WriteVarInt(cnt);
+                // 刀11 数值直存形态：直读 double[]，免 At 逐元素懒装箱。
+                if (v.numArr != null) {
+                    for (int i = 0; i < cnt; i = i + 1) {
+                        b.WriteF32((float)v.numArr[i]);
+                    }
+                    return;
+                }
                 for (int i = 0; i < cnt; i = i + 1) {
                     b.WriteF32((float)v.At(i).AsDouble(0));
                 }
@@ -360,6 +367,20 @@ public class Collection {
     // 溢出/NaN 拒绝（|v| 超出 float32 成 Inf 或 NaN 时整体放弃
     // ——tag 6 文本路径保真）。
     public static bool ArrayIsF32Encodable(JsonValue v) {
+        // 刀11 数值直存形态：免 At 懒装箱，谓词与装箱形态逐条对齐
+        // （文本判定输入同为 Convert.ToString(d)）。
+        double[] arr = v.numArr;
+        if (arr != null) {
+            bool dec = false;
+            for (int i = 0; i < arr.Length; i = i + 1) {
+                double d = arr[i];
+                if (!Collection.IsIntStr(Convert.ToString(d))) { dec = true; }
+                if (d != d || d - d != 0) { return false; }
+                float f = (float)d;
+                if ((double)f != d) { return false; }
+            }
+            return dec;
+        }
         int cnt = v.Count();
         bool hasDecimal = false;
         for (int i = 0; i < cnt; i = i + 1) {
@@ -421,8 +442,14 @@ public class Collection {
             i = i + 1;
         }
         PersistKeyDict();
-        // 常态快速路径：记录不含 0x00/0xFF 时无需转义，直接成串——
-        // 省去逐字节扫描重写与第二个缓冲区（文本型文档几乎总命中）。
+        return Collection.EscapeRecord(b);
+    }
+
+    // 记录缓冲 → 存储字符串（刀10 从 EncodeDoc 抽出，直写通道
+    // 复用同一转义段，两条写入路径位级一致）：不含 0x00/0xFF 直接
+    // 成串；否则 0x00 -> FF 01、0xFF -> FF 02（字符串遇 0x00 截断，
+    // 必须转义）。拿走并释放传入缓冲的所有权。
+    public static string EscapeRecord(ByteBuffer b) {
         long blen = b.Length();
         if (Collection.MemChr(b.Raw(), 0, blen) == 0
         && Collection.MemChr(b.Raw(), 255, blen) == 0) {
@@ -430,12 +457,6 @@ public class Collection {
             b.Free();
             return s0;
         }
-        // 转义为不含 NUL 的字节流。运行时字符串类型（以及
-        // ToStr 和 B+Tree 自带的 ReadString 都在使用的
-        // NativeMemory.GetString）遇到第一个 0x00 即停止，因此原始记录——
-        // 它通常包含 0x00 字节（例如整数 0、空字符串、
-        // 零计数）——无法经受字符串的往返。0xFF 是
-        // 转义字节：0x00 -> FF 01，0xFF -> FF 02；其余字节原样通过。
         ByteBuffer e = ByteBuffer.Alloc(b.Length() + 8);
         b.SeekRead(0);
         while (b.Remaining() > 0) {
@@ -543,18 +564,19 @@ public class Collection {
         if (tag == 10) { np = p; return JsonValue.NewStr(""); }
         if (tag == 11) {
             // 刀7 float32 数组直编码：dims + dims×4 字节小端。
+            // 刀11：直还数值形态，免逐元素装箱。
             long c = Collection.RecVarInt(s, p, out p);
-            JsonValue a = JsonValue.NewArray();
+            double[] arr = new double[(int)c];
             for (int i = 0; i < (int)c; i = i + 1) {
                 int bits = (s[p] & 255)
                 + ((s[p + 1] & 255) << 8)
                 + ((s[p + 2] & 255) << 16)
                 + ((s[p + 3] & 255) << 24);
-                a.Append(JsonValue.NewDouble((double)NativeMemory.AsF32(bits)));
+                arr[i] = (double)NativeMemory.AsF32(bits);
                 p = p + 4;
             }
             np = p;
-            return a;
+            return JsonValue.NewDoubleArray(arr);
         }
         if (tag == 6) {
             long c = Collection.RecVarInt(s, p, out p);
@@ -632,6 +654,52 @@ public class Collection {
             i = i + 1;
         }
         return null;
+    }
+
+    // 行视图 float32 数组直读（刀10）：tag 11 载荷直接还原
+    // float[dims]，免逐元素 JsonValue 装箱/解箱。1 = 向量就绪
+    // （有限、维度相符、非全零）；0 = 字段缺失/非 tag 11、-1 =
+    // 格式/维度/NaN 异常——两者一律由调用方回退 FieldOf+ReadVector
+    // 权威通道，null/ArgumentException 语义与既有路径一致。
+    public int FieldF32(string body, int kid, int dims, out float[] vec) {
+        vec = null;
+        if (kid == 0 || dims <= 0) { return 0; }
+        if (StrMemChr(body, 255, body.Length) != 0) { body = Collection.UnescapeRecord(body); }
+        int p = 1;  // 'B'
+        long n = Collection.RecVarInt(body, p, out p);
+        if (n < 0 || n > 4096) { return -1; }
+        int i = 0;
+        while (i < (int)n) {
+            long k = Collection.RecVarInt(body, p, out p);
+            if (k < 0) { return -1; }
+            if ((int)k == kid) {
+                int tag = body[p] & 255;
+                if (tag != 11) { return 0; }
+                p = p + 1;
+                long c = Collection.RecVarInt(body, p, out p);
+                if (c != dims) { return -1; }
+                if (p + dims * 4 > body.Length) { return -1; }
+                float[] v = new float[dims];
+                bool any = false;
+                for (int j = 0; j < dims; j = j + 1) {
+                    int bits = (body[p] & 255)
+                    + ((body[p + 1] & 255) << 8)
+                    + ((body[p + 2] & 255) << 16)
+                    + ((body[p + 3] & 255) << 24);
+                    float f = NativeMemory.AsF32(bits);
+                    if (f != f || f - f != 0) { return -1; }
+                    if (f != 0.0f) { any = true; }
+                    v[j] = f;
+                    p = p + 4;
+                }
+                if (!any) { return -1; }
+                vec = v;
+                return 1;
+            }
+            Collection.SkipValS(body, p, out p);
+            i = i + 1;
+        }
+        return 0;
     }
 
     // 字段等值判定（<see cref="FindIdsByField"/> 与
@@ -892,19 +960,20 @@ public class Collection {
         if (tag == 10) { np = p; return JsonValue.NewStr(""); }
         if (tag == 11) {
             // 刀7 float32 数组直编码（指针版）：dims + dims×4 字节小端。
+            // 刀11：直还数值形态，免逐元素装箱。
             long c = Collection.ReadVarIntRaw(basePtr, ref p, end);
             if (c < 0 || p + (int)c * 4 > end) { return null; }
-            JsonValue a = JsonValue.NewArray();
+            double[] arr = new double[(int)c];
             for (int i = 0; i < (int)c; i = i + 1) {
                 int bits = Collection.PeekB(basePtr + p)
                 + (Collection.PeekB(basePtr + p + 1) << 8)
                 + (Collection.PeekB(basePtr + p + 2) << 16)
                 + (Collection.PeekB(basePtr + p + 3) << 24);
-                a.Append(JsonValue.NewDouble((double)NativeMemory.AsF32(bits)));
+                arr[i] = (double)NativeMemory.AsF32(bits);
                 p = p + 4;
             }
             np = p;
-            return a;
+            return JsonValue.NewDoubleArray(arr);
         }
         if (tag == 6) {
             long c = Collection.ReadVarIntRaw(basePtr, ref p, end);
@@ -1374,6 +1443,72 @@ public class Collection {
             }
             CommitWriteBulk();
             for (int i = 0; i < docs.Count; i = i + 1) { CachePut(first + i, docs[i]); }
+            return first;
+        } catch {
+            this.kv.Rollback();
+            SyncMeta();
+            throw;
+        }
+    }
+
+    // 类型化向量批量直插（刀10）：「名 + float32 向量」两字段行直接
+    // 编码成记录 tape，全程不经 JsonValue。行格式与 EncodeDoc 逐字节
+    // 一致（同字典 id、同转义段），两路插入可位级比对；索引/搜索
+    // 定义在册时喂两字段轻量文档走 Validate/AddIndexEntries/Stage
+    // 常规通道。整批单事务提交（崩溃窗口全有或全无）。
+    // 返回第一个分配的 id。
+    public int InsertVectorBulk(List<string> names, List<float[]> vectors, string nameField, string vecField) {
+        if (names == null || vectors == null || names.Count != vectors.Count) {
+            throw new ArgumentException("InsertVectorBulk: names and vectors must be same non-null length");
+        }
+        int dims = 0;
+        for (int i = 0; i < vectors.Count; i = i + 1) {
+            if (vectors[i] == null) {
+                throw new ArgumentException("InsertVectorBulk: null vector at " + Convert.ToString(i));
+            }
+            if (i == 0) { dims = vectors[0].Length; }
+            else if (vectors[i].Length != dims) {
+                throw new ArgumentException("InsertVectorBulk: vector dimensions differ at " + Convert.ToString(i));
+            }
+            if (dims <= 0) {
+                // 零维直写会出 tag 11 空数组，与装箱路的 tag 6 判据分叉。
+                throw new ArgumentException("InsertVectorBulk: zero-dimension vector");
+            }
+        }
+        SyncMeta();
+        this.kv.Begin();
+        List<JsonValue> cacheDocs = new List<JsonValue>();
+        try {
+            int first = 0;
+            for (int i = 0; i < names.Count; i = i + 1) {
+                int id = NextId();
+                if (first == 0) { first = id; }
+                ByteBuffer b = ByteBuffer.Alloc(64 + names[i].Length + dims * 4);
+                b.WriteU8(66);  // 'B'
+                b.WriteVarInt(2);
+                b.WriteVarInt(KeyId(nameField));
+                if (names[i].Length == 0) { b.WriteU8(10); }
+                else { b.WriteU8(5); b.WriteString(names[i]); }
+                b.WriteVarInt(KeyId(vecField));
+                b.WriteU8(11);
+                b.WriteVarInt(dims);
+                for (int j = 0; j < dims; j = j + 1) { b.WriteF32(vectors[i][j]); }
+                this.kv.Put(DocKey(id), Collection.EscapeRecord(b));
+                // 轻量文档只服务索引维护、搜索 staging 与缓存。
+                JsonValue doc = JsonValue.NewObject();
+                doc.Set(nameField, JsonValue.NewStr(names[i]));
+                double[] dv = new double[dims];
+                for (int j = 0; j < dims; j = j + 1) { dv[j] = vectors[i][j]; }
+                doc.Set(vecField, JsonValue.NewDoubleArray(dv));
+                doc.Set("_id", JsonValue.NewNum(Convert.ToString(id)));
+                this.search.Validate(doc);
+                AddIndexEntries(id, doc);
+                this.search.Stage(id, doc);
+                cacheDocs.Add(doc);
+            }
+            PersistKeyDict();
+            CommitWriteBulk();
+            for (int i = 0; i < cacheDocs.Count; i = i + 1) { CachePut(first + i, cacheDocs[i]); }
             return first;
         } catch {
             this.kv.Rollback();

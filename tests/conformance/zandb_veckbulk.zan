@@ -1,0 +1,250 @@
+using System;
+using System.Data.ZanDb;
+using System.Json;
+using System.IO;
+
+// 刀10 类型化向量直写/直读 + 刀11 JsonValue 数值直存形态一致性用例：
+// InsertVectorBulk 与 InsertBulk 的行字节级一致；numArr 双形态
+// （Count/At/ToJson/PrettyToJson/Clone）与装箱逐字节等价、变异降级；
+// tag 11 解码直还数值形态；量化索引全链（建图/检查点/重开/重打分）
+// 经 FieldF32 直读结果不变。输出确定性，与 .out 比对。
+class ZanDbVecBulkTest {
+    static int checks = 0;
+
+    static void Ok(bool cond, string what) {
+        checks = checks + 1;
+        if (cond) {
+            Console.WriteLine("ok " + Convert.ToString(checks) + " - " + what);
+        } else {
+            Console.WriteLine("FAIL " + Convert.ToString(checks) + " - " + what);
+        }
+    }
+
+    static void Clean(string basePath) {
+        File.Delete(basePath);
+        File.Delete(basePath + ".m0");
+        File.Delete(basePath + ".m1");
+        for (int i = 0; i < 40; i = i + 1) {
+            File.Delete(basePath + ".s" + Convert.ToString(i));
+        }
+    }
+
+    // 两路插入的位级同源数据：第 i 行名字 + 40 维 float32-exact double。
+    static double VecAt(int i, int j) {
+        double v = ((i * 7 + j * 13) % 200) / 100.0 - 1.0;
+        return (double)(float)(v + 0.25);
+    }
+
+    static JsonValue BoxedDoc(int i, int dims) {
+        JsonValue doc = JsonValue.NewObject();
+        doc.Put("name", JsonValue.NewStr("doc" + Convert.ToString(i)));
+        JsonValue arr = JsonValue.NewArray();
+        for (int j = 0; j < dims; j = j + 1) { arr.Append(JsonValue.NewDouble(VecAt(i, j))); }
+        doc.Put("embedding", arr);
+        return doc;
+    }
+
+    static float[] TypedVec(int i, int dims) {
+        float[] v = new float[dims];
+        for (int j = 0; j < dims; j = j + 1) { v[j] = (float)VecAt(i, j); }
+        return v;
+    }
+
+    static float[] ProbeVec(int dims) {
+        return TypedVec(3, dims);
+    }
+
+    static void Main() {
+        string pathA = "_scratch/zandb_veckbulk_a_tmp.zdb";
+        string pathB = "_scratch/zandb_veckbulk_b_tmp.zdb";
+        Directory.CreateDirectory("_scratch");
+        Clean(pathA);
+        Clean(pathB);
+
+        // 1) 刀11 双形态：数值数组与装箱孪生全等（值访问 + 两种
+        //    序列化 + 克隆），NaN 元素同样对齐（null 字面量）。
+        double[] raw = new double[5];
+        raw[0] = 0.25;
+        raw[1] = -1.5;
+        raw[2] = 3.0;
+        raw[3] = 1e21;
+        raw[4] = 0.0 / 0.0;
+        JsonValue na = JsonValue.NewDoubleArray(raw);
+        JsonValue bx = JsonValue.NewArray();
+        for (int i = 0; i < 5; i = i + 1) { bx.Append(JsonValue.NewDouble(raw[i])); }
+        bool atOk = na.Count() == 5 && na.numArr != null
+        && na.At(0).AsDouble(9) == 0.25 && na.At(1).AsDouble(9) == -1.5
+        && na.At(2).AsDouble(9) == 3.0 && na.At(2).IsNumber();
+        Ok(atOk, "numArr count/at dual form");
+        Ok(na.ToJson() == bx.ToJson(), "numArr ToJson byte-equal boxed");
+        Ok(na.PrettyToJson() == bx.PrettyToJson(), "numArr PrettyToJson byte-equal boxed");
+        Ok(na.Clone().ToJson() == bx.Clone().ToJson(), "numArr clone dual form");
+
+        // 2) 变异降级：Append/SetAt/RemoveAt 进装箱形态，值语义不变。
+        JsonValue na2 = JsonValue.NewDoubleArray(raw);
+        na2.Append(JsonValue.NewStr("x"));
+        Ok(na2.numArr == null && na2.Count() == 6 && na2.At(5).AsString("") == "x"
+        && na2.At(1).AsDouble(9) == -1.5, "append demotes numArr");
+        JsonValue na3 = JsonValue.NewDoubleArray(raw);
+        na3.SetAt(0, JsonValue.NewStr("y"));
+        Ok(na3.numArr == null && na3.At(0).AsString("") == "y", "setAt demotes numArr");
+        JsonValue na4 = JsonValue.NewDoubleArray(raw);
+        na4.RemoveAt(1);
+        Ok(na4.numArr == null && na4.Count() == 4 && na4.At(1).AsDouble(9) == 3.0,
+        "removeAt demotes numArr");
+        double[] intRaw = new double[3];
+        intRaw[0] = 1.0;
+        intRaw[1] = 2.0;
+        intRaw[2] = 3.0;
+        JsonValue ia = JsonValue.NewDoubleArray(intRaw);
+        ia.AppendDouble(4.5);
+        Ok(ia.Count() == 4 && ia.At(0).AsDouble(9) == 1.0 && ia.At(3).AsDouble(9) == 4.5,
+        "appendDouble demotes numArr");
+
+        // 3) 防御拷贝：改原数组不渗入；越界 At 抛 JsonException。
+        double[] mut = new double[2];
+        mut[0] = 1.0;
+        mut[1] = 2.0;
+        JsonValue na5 = JsonValue.NewDoubleArray(mut);
+        mut[0] = 99.0;
+        Ok(na5.At(0).AsDouble(9) == 1.0, "newDoubleArray defensive copy");
+        bool threw = false;
+        try {
+            na5.At(5);
+        } catch (JsonException) {
+            threw = true;
+        }
+        Ok(threw, "numArr At out of range throws");
+
+        // 4) 刀10 位级一致：同一数据走 InsertBulk（装箱）与
+        //    InsertVectorBulk（直写），行字节、文档 JSON 全等。
+        int dims = 40;
+        ZanDatabase dbA = ZanDatabase.Open(pathA, ZanStore.DUR_SYNC);
+        ZanDatabase dbB = ZanDatabase.Open(pathB, ZanStore.DUR_SYNC);
+        Collection docsA = dbA.GetCollection("docs");
+        Collection docsB = dbB.GetCollection("docs");
+        List<JsonValue> boxed = new List<JsonValue>();
+        List<string> names = new List<string>();
+        List<float[]> vectors = new List<float[]>();
+        for (int i = 0; i < 8; i = i + 1) {
+            boxed.Add(BoxedDoc(i, dims));
+            names.Add("doc" + Convert.ToString(i));
+            vectors.Add(TypedVec(i, dims));
+        }
+        docsA.InsertBulk(boxed);
+        int firstB = docsB.InsertVectorBulk(names, vectors, "name", "embedding");
+        bool rowsEqual = firstB == 1;
+        for (int i = 1; i <= 8; i = i + 1) {
+            string ra = docsA.kv.Get(docsA.DocKey(i));
+            string rb = docsB.kv.Get(docsB.DocKey(i));
+            if (ra != rb) { rowsEqual = false; }
+        }
+        Ok(rowsEqual, "typed rows byte-equal JsonValue rows");
+        docsA.ClearCache();
+        docsB.ClearCache();
+        bool docsEqual = true;
+        JsonValue embB = null;
+        for (int i = 1; i <= 8; i = i + 1) {
+            JsonValue da = docsA.FindById(i);
+            JsonValue dbv = docsB.FindById(i);
+            if (da.ToJson() != dbv.ToJson()) { docsEqual = false; }
+            if (i == 1) { embB = dbv.Get("embedding"); }
+        }
+        Ok(docsEqual, "typed docs ToJson-equal after disk decode");
+        Ok(embB != null && embB.numArr != null && embB.Count() == dims,
+        "tag11 decode returns numeric form");
+
+        // 5) 刀11 编码判定不谎报：整数值 numArr 保持 tag 6 文本
+        //    （float32 位形 0x00 反膨胀）；超 float32 元素同样回退。
+        //    （回退文档用非向量字段，避免 1e40 进量化建图。）
+        double[] intArr = new double[dims];
+        for (int j = 0; j < dims; j = j + 1) { intArr[j] = (double)j; }
+        JsonValue intDoc = JsonValue.NewObject();
+        intDoc.Put("name", JsonValue.NewStr("ints"));
+        intDoc.Put("embedding", JsonValue.NewDoubleArray(intArr));
+        int intLen = docsB.EncodeDoc(intDoc).Length;
+        double[] bigArr = new double[dims];
+        for (int j = 0; j < dims; j = j + 1) { bigArr[j] = j == 0 ? 1e40 : 0.5; }
+        JsonValue bigDoc = JsonValue.NewObject();
+        bigDoc.Put("name", JsonValue.NewStr("big"));
+        bigDoc.Put("payload", JsonValue.NewDoubleArray(bigArr));
+        JsonValue back = docsB.FindById(docsB.Insert(bigDoc));
+        JsonValue backPayload = back != null ? back.Get("payload") : null;
+        Ok(intLen > dims && intLen < dims * 4, "integer numArr keeps text encoding");
+        Ok(backPayload != null && backPayload.At(0).AsDouble(0) == 1e40,
+        "out-of-float32 numArr falls back to text");
+        docsB.ClearCache();
+        JsonValue backDisk = docsB.FindById(9);
+        JsonValue diskPayload = backDisk != null ? backDisk.Get("payload") : null;
+        Ok(diskPayload != null && diskPayload.At(0).AsDouble(0) == 1e40 && diskPayload.numArr == null,
+        "fallback row decodes boxed");
+
+        // 6) 直插校验：长度不齐 / 维度不齐 / 空向量抛 ArgumentException。
+        bool err1 = false;
+        try {
+            List<string> badNames = new List<string>();
+            badNames.Add("a");
+            List<float[]> badVecs = new List<float[]>();
+            docsB.InsertVectorBulk(badNames, badVecs, "name", "embedding");
+        } catch (ArgumentException) {
+            err1 = true;
+        }
+        bool err2 = false;
+        try {
+            List<string> n2 = new List<string>();
+            n2.Add("a");
+            n2.Add("b");
+            List<float[]> v2 = new List<float[]>();
+            v2.Add(TypedVec(0, dims));
+            float[] mismatched = new float[dims - 1];
+            for (int j = 0; j < dims - 1; j = j + 1) { mismatched[j] = 0.5f; }
+            v2.Add(mismatched);
+            docsB.InsertVectorBulk(n2, v2, "name", "embedding");
+        } catch (ArgumentException) {
+            err2 = true;
+        }
+        Ok(err1 && err2, "typed insert validates lengths and dimensions");
+        bool err3 = false;
+        try {
+            List<string> n3 = new List<string>();
+            n3.Add("z");
+            List<float[]> v3 = new List<float[]>();
+            v3.Add(new float[0]);
+            docsB.InsertVectorBulk(n3, v3, "name", "embedding");
+        } catch (ArgumentException) {
+            err3 = true;
+        }
+        Ok(err3, "typed insert rejects zero-dimension vectors");
+
+        // 7) 量化索引全链（检查点导出与重打分走 FieldF32 直读）：
+        //    建图 → 近似检索 → 精排 → 检查点 → 重开两检索。
+        VectorIndexOptions options = new VectorIndexOptions(dims);
+        options.quantize = true;
+        docsB.EnsureVectorIndex("embedding", options);
+        float[] probe = ProbeVec(dims);
+        List<VectorHit> hits = docsB.SearchVector("embedding", probe, 3, 64);
+        List<VectorHit> rescored = docsB.SearchVectorRescore("embedding", probe, 3, 64);
+        Ok(hits.Count == 3 && hits[0].id == 4, "typed rows quantize search tops probe");
+        Ok(rescored.Count == 3 && rescored[0].id == 4, "typed rows rescore tops probe");
+        dbB.Checkpoint();
+        docsB.CheckpointSearchIndexes();
+        dbB.Close();
+        dbB = ZanDatabase.Open(pathB, ZanStore.DUR_SYNC);
+        Collection docsB2 = dbB.GetCollection("docs");
+        List<VectorHit> after = docsB2.SearchVector("embedding", probe, 3, 64);
+        List<VectorHit> afterRescore = docsB2.SearchVectorRescore("embedding", probe, 3, 64);
+        Ok(after.Count == 3 && after[0].id == 4, "typed rows survive checkpoint reopen");
+        Ok(afterRescore.Count == 3 && afterRescore[0].id == 4, "typed rows rescore after reopen");
+        JsonValue reopenDoc = docsB2.FindById(2);
+        JsonValue reopenEmb = reopenDoc != null ? reopenDoc.Get("embedding") : null;
+        JsonValue reopenName = reopenDoc != null ? reopenDoc.Get("name") : null;
+        Ok(reopenEmb != null && reopenEmb.Count() == dims && reopenName != null
+        && reopenName.AsString("") == "doc1", "typed doc intact after reopen");
+
+        dbA.Close();
+        dbB.Close();
+        Clean(pathA);
+        Clean(pathB);
+        Console.WriteLine("done " + Convert.ToString(checks));
+    }
+}
