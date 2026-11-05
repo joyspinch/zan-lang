@@ -730,4 +730,5 @@ Cookie，"对照组"就不成立了。
    - **模板脚手架约束**：新建项目模板中的入口类必须声明为 `partial class {{NAME}} : Form`，严禁遗漏 `{{NAME}}` 占位符或 `: Form` 继承，否则编译器入口合成（`new <基名>().Show()`）将因类型未定义中断。
    - **`<include src="...">` 组合化**：支持在 HTML 中通过 `<include src="fragment.html" />` 组合引入组件化片段，装载期展开（深度 8 封顶防环），片段内事件与数据绑定对宿主窗口类同构生效。
    - **窗口键与子窗模态**：根/body 的 `data-win-title/w/h/center/chrome/round` 装配期消费（`:data-win-*` 走 bindProps 泵）；子窗 `new` + `Show()`，归属语义设 `w.owner = this` 后 `w.ShowDialog()`（关闭后宿主补 `MarkDirty()` 重绘），`Show()` 恒为非模态。
+   - **publish 构建钩子必须带 `[Custom]` 注解（不遵守 = 静默失效）**：`OnLoad(Form)` 等框架按字符串名反射回调的钩子方法，在 `--publish` 形态下若不加注解会**哑火**——publish 档只为属性访问器与带注解方法生成 Invoke thunk（编译器反射元数据 need_thunk 门控，防 `--gc-sections` 锚定死代码），表现为 `HasMethod("OnLoad")` 返回真、`Invoke` 无效果：plain 形态一切正常、publish 形态钩子整段丢失、无任何诊断。写法：`[Custom] public void OnLoad(Form f) { ... }`。排查口诀：**plain 好 publish 坏、HasMethod 真回调假，先查钩子注解**。
 

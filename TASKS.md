@@ -17,11 +17,12 @@
 
 ### 批次 1 · 根修项（闭它解锁下游，优先领）
 
-（暂空）
+- [ ] B-ID160 publish 反射 thunk 门控使框架字符串钩子哑火：`irgen_reflect.c` need_thunk 判定（约 :769-777）为 `!publish_mode || (flags & (MF_PROPGET|MF_PROPSET)) || attrs->count>0`——publish 档只为属性访问器/带注解方法生成 Invoke thunk（防 --gc-sections 锚定死代码），于是 `GetType().HasMethod("OnLoad")` 真而 Invoke 哑火，框架按字符串名回调的钩子（Form.Show 的 OnLoad 等）在 publish 形态静默丢失。证据链：同一程序 plain 形态钩子正常、publish 形态不触发、ZAN_NO_SHARD/nostrip 均无关、加 `[Custom]` 注解后 publish 全绿。现行契约（已写进 gui-design/html-window.md）：框架钩子方法必须带 `[Custom]` 注解。根修方向二选一：框架钩子默认保留 thunk；或编译期收集字符串字面量中的方法名作为 thunk 保留清单。单文件改动，不与任何在飞冲突。
 
 ### 批次 2 · 独立账（无前置，任一会话可领，按编号序）
 
-（暂空——本批次全部闭账移出。）
+- [ ] B-ID161 examples/html_gallery 源级损坏：Page0-7 类全仓无定义、无 zan.proj、入口 .zan 引用它们必然 unresolved（HEAD snapshot 与实验编译器一致报错），主类曾于 d364a8167 恢复但引用页未随之恢复；且 CLI 拒收 .html 直编，模板门不覆盖它。修复 = 补齐 Page0-7 定义与 zan.proj 或删净引用，纳入模板门。
+- [ ] B-ID162 zanc `--debug` 档编译 oneplus 图形程序段崩溃（rc=139，无诊断输出）：HEAD 快照编译器（`git archive HEAD` 实体落盘）复现，hello --debug 正常——oneplus 图特有（疑与设计稿内嵌/WebView 相关的 irgen 路径）。2026-11-05 当日实验树 zanc（B-ID71 在飞态）plain/publish 也段崩溃，B-ID71 落地后未复测；修复时先拿当前 HEAD 复测两个崩溃面再定位。
 
 ### 批次 3 · 有前置（前置闭了再领）
 

@@ -1450,6 +1450,20 @@ add_test(NAME conformance_gui_docapp_user_main
 set_tests_properties(conformance_gui_docapp_user_main PROPERTIES
     TIMEOUT 120 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
 
+# HeavyControls 查表大小写不敏感（HTML 标签规范小写化 vs PascalCase
+# 注册键）：精确 miss 后必须走不敏感兜底，否则自定义控件静默回落
+# Element——kind 串还在、无任何诊断，事件/布局整体失效。
+add_test(NAME conformance_gui_heavy_caseless_lookup
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/heavy_caseless_lookup_test.zan
+    "-DZANC_ARGS=--auto-stdlib${_gui_driver_tail}"
+    -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/heavy_caseless_lookup.out
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_heavy_caseless${_exe_ext}
+    -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+set_tests_properties(conformance_gui_heavy_caseless_lookup PROPERTIES
+    TIMEOUT 120 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+
 add_test(NAME diag_docapp_no_entry
   COMMAND ${CMAKE_COMMAND}
     -DZANC=$<TARGET_FILE:zanc>
