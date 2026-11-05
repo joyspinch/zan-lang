@@ -70,12 +70,66 @@ def _has_placement(attrs):
     return False
 
 
+TAG_MAP = {
+    'datatable': 'DataGrid', 'grid': 'DataGrid', 'data-grid': 'DataGrid', 'table': 'DataGrid',
+    'tabs': 'Tabs', 'tab-control': 'Tabs',
+    'splitpanel': 'SplitPanel', 'split-panel': 'SplitPanel', 'splitter': 'SplitPanel',
+    'treeview': 'TreeView', 'tree': 'TreeView',
+    'pagination': 'Pagination', 'pager': 'Pagination',
+    'checkbox': 'Checkbox', 'check-box': 'Checkbox',
+    'inputnumber': 'InputNumber', 'input-number': 'InputNumber',
+    'choicegroup': 'ChoiceGroup', 'choice-group': 'ChoiceGroup',
+    'radiogroup': 'ChoiceGroup', 'radio-group': 'ChoiceGroup',
+    'switch': 'Switch',
+    'radio': 'Radio',
+    'slider': 'Slider',
+    'colorpicker': 'ColorPicker', 'color-picker': 'ColorPicker',
+    'datepicker': 'DatePicker', 'date-picker': 'DatePicker',
+    'upload': 'Upload',
+    'listview': 'ListView', 'list': 'ListView',
+    'virtuallist': 'VirtualList', 'virtual-list': 'VirtualList',
+    'rate': 'Rate',
+    'chart': 'ChartHost',
+    'avatar': 'Avatar',
+    'badge': 'Badge',
+    'card': 'Card',
+    'alert': 'AlertBox', 'alert-box': 'AlertBox', 'alertbox': 'AlertBox',
+    'tag': 'Tag',
+    'divider': 'Divider', 'hr': 'Divider',
+    'toolstrip': 'ToolStrip', 'toolbar': 'ToolStrip', 'tool-strip': 'ToolStrip', 'ribbon': 'ToolStrip',
+    'statusbar': 'StatusBar', 'status-bar': 'StatusBar',
+    'collapse': 'Collapse',
+    'breadcrumb': 'Breadcrumb',
+    'steps': 'Steps',
+    'timeline': 'Timeline',
+    'carousel': 'Carousel',
+    'qrcode': 'QrCode', 'qr-code': 'QrCode',
+    'statistic': 'Statistic',
+    'countdown': 'Countdown',
+    'empty': 'Empty',
+    'result': 'Result',
+    'skeleton': 'Skeleton',
+    'spin': 'Spin',
+    'watermark': 'Watermark',
+    'flex': 'Flex',
+    'row': 'Row',
+    'spacer': 'Spacer',
+    'form': 'FormGroup', 'form-group': 'FormGroup', 'formgroup': 'FormGroup',
+    'form-item': 'FormItem', 'formitem': 'FormItem', 'form-row': 'FormItem', 'formrow': 'FormItem',
+    'modal': 'Modal', 'dialog': 'Modal',
+    'drawer': 'Drawer',
+    'panel': 'Panel', 'scrollbar': 'Panel', 'layer': 'Panel',
+    'ellipsis': 'Label', 'label': 'Label',
+    'checkbox-group': 'CheckboxGroup', 'checkboxgroup': 'CheckboxGroup',
+    'button': 'Button',
+    'textarea': 'TextArea',
+    'select': 'SelectBox',
+    'img': 'Image',
+    'progress': 'Progress',
+}
+
+
 def tag_kind(tag, attrs):
-    """与 DesignerHtml.FieldJson/TagKind 同表：data-kind 权威，zan-* 恢复
-    Pascal，p/h1-h6 → Typography，未知名兜底 Panel。裸容器（无 data-kind、
-    兜底 Panel、非 zan-*、div 无定位属性）FieldJson 会保留 htmlTag，
-    运行时 IsElement 建 **Element**——访问器类型必须跟着是 Element，
-    否则 (Panel) 强转即 InvalidCastException（AiPanel.ModelHost 实证）。"""
     t = tag.lower()
     if t == 'body':
         return None
@@ -83,36 +137,27 @@ def tag_kind(tag, attrs):
     if km:
         return km.group(1)
     if t.startswith('zan-'):
-        kind = ''.join(p[:1].upper() + p[1:] for p in t[4:].split('-') if p)
-    elif t == 'label':
-        kind = 'Label'
-    elif t == 'button':
-        kind = 'Button'
-    elif t == 'input':
+        return ''.join(p[:1].upper() + p[1:] for p in t[4:].split('-') if p)
+    if t in TAG_MAP:
+        return TAG_MAP[t]
+    if t in ('p', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6'):
+        return 'Typography'
+    if t == 'input':
         tm = re.search(r'type="([A-Za-z0-9_]+)"', attrs)
         ty = tm.group(1).lower() if tm else ''
-        kind = {'checkbox': 'Checkbox', 'radio': 'Radio', 'range': 'Slider',
+        return {'checkbox': 'Checkbox', 'radio': 'Radio', 'range': 'Slider',
                 'color': 'ColorPicker', 'number': 'InputNumber',
                 'date': 'DatePicker', 'month': 'DatePicker', 'week': 'DatePicker',
                 'time': 'DatePicker', 'file': 'Upload'}.get(ty, 'Input')
-    elif t == 'textarea':
-        kind = 'TextArea'
-    elif t == 'img':
-        kind = 'Image'
-    elif t == 'hr':
-        kind = 'Divider'
-    elif t == 'progress':
-        kind = 'Progress'
-    elif t == 'select':
-        kind = 'SelectBox'
-    elif t in ('p', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6'):
-        kind = 'Typography'
-    else:
-        kind = 'Panel'
-    if kind == 'Panel' and (t != 'div' or not _has_placement(attrs)
-                            or re.search(r'data-html-tag="div"', attrs)):
+    if t == 'div':
+        if _has_placement(attrs) and not re.search(r'data-html-tag="div"', attrs):
+            return 'Panel'
         return 'Element'
-    return kind
+    if any(c.isupper() for c in tag):
+        return tag
+    if '-' in tag:
+        return ''.join(p[:1].upper() + p[1:] for p in tag.split('-') if p)
+    return 'Element'
 
 
 def named_fields(html):

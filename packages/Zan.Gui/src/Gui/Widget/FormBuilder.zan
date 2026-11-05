@@ -10,84 +10,6 @@ namespace Gui.Widget;
 // 同一棵树放进 Form。因此“所见即所得”天然成立，自定义组件也走
 // 同一条实例化路径（HeavyControls 注册工厂 / 注入工厂）。
 public class FormBuilder {
-    // fields/kids 的文档序深度优先；混排的显示次序不改变预建槽序。
-    static Control Build(JsonValue root) {
-        return FormBuilder.BuildWith(root, null);
-    }
-
-    static Control BuildWith(JsonValue root, List<Control> prepared) {
-        Control host;
-        if (FormBuilder.IsHtmlRoot(root)) {
-            Element body = new Element();
-            body.InitElement("body", "root");
-            host = body;
-        } else {
-            host = Panel.Root("root");
-        }
-        FormBuilder.BuildInto(host, root, prepared);
-        return host;
-    }
-
-    // HTML 文档保留真实 body 根；可嵌入 partial Control 作为其外层宿主。
-    static void BuildInto(Control host, JsonValue root, List<Control> prepared) {
-        if (!(host is Element) && FormBuilder.IsHtmlRoot(root)) {
-            host.Dock(Dock.Fill());
-            FormBuilder.AddChild(host, FormBuilder.BuildWith(root, prepared));
-            return;
-        }
-        FormBuilder.SetupRoot(host, root);
-        if (root == null) { return; }
-        JsonValue arr = root.Get("fields");
-        if (arr == null || !arr.IsArray()) { return; }
-        FbBuildContext ctx = new FbBuildContext();
-        ctx.prepared = prepared;
-        if (prepared != null) { FormBuilder.CollectNodes(arr, ctx.originalNodes); }
-        string expansionError = FormBuilder.ExpandRefs(arr, 0);
-        if (expansionError != "") { throw new Exception(expansionError); }
-        ctx.sizeClass = FormBuilder.DefaultSizeClass(root);
-        bool free = root.Int("layoutMode", 0) == 1;
-        FormBuilder.BuildArray(host, arr, root.Get("bodyContent"), free,
-            FormBuilder.IsHtmlRoot(root), false, ctx);
-    }
-
-    static bool IsHtmlRoot(JsonValue root) {
-        return root != null && (root.Has("docCss") || root.Has("bodyClass")
-            || root.Has("bodyStyle") || root.Has("bodyContent"));
-    }
-
-    // 设计稿宿主通道（B-ID44）：把 HTML 根文档的 fields/bodyContent
-    // 直建进宿主控件——不经 body 元素包装，宿主自己充当设计根
-    // （designCss 落宿主、Kind 保持宿主类名），运行期复刻生成器时代
-    // partial class : Control 的建树契约。 DesignedControl 用它投影；
-    // 组件 .zcomp 引用在宿主启动前必须注册好工厂（HeavyControls）。
-    public static void ProjectInto(Control host, JsonValue root) {
-        FormBuilder.SetupRoot(host, root);
-        if (root == null) { return; }
-        JsonValue arr = root.Get("fields");
-        if (arr == null || !arr.IsArray()) { return; }
-        string expansionError = FormBuilder.ExpandRefs(arr, 0);
-        if (expansionError != "") { throw new Exception(expansionError); }
-        FbBuildContext ctx = new FbBuildContext();
-        ctx.sizeClass = FormBuilder.DefaultSizeClass(root);
-        bool free = root.Int("layoutMode", 0) == 1;
-        FormBuilder.BuildArray(host, arr, root.Get("bodyContent"), free,
-            FormBuilder.IsHtmlRoot(root), false, ctx);
-    }
-
-    // 不钉死 padding/gap：根和所有子节点都消费同一皮肤/CSS。
-    static void SetupRoot(Control host, JsonValue root) {
-        host.Dock(Dock.Fill());
-        if (root == null) { return; }
-        if (!FormBuilder.IsHtmlRoot(root)) {
-            host.AddClass("designroot");
-        }
-        host.designCss = root.Str("docCss", "");
-        string cls = root.Str("bodyClass", "");
-        if (cls != "") { host.AddClass(cls); }
-        string sty = root.Str("bodyStyle", "");
-        if (sty != "") { host.SetProp("style", sty); }
-    }
-
     // 每个窗口/离屏 App 在测量前安装文档 CSS。
     // 替换应用层而非合并，避免宿主的同名类进入设计稿。
     static string ApplyStyles(App app, JsonValue root) {
@@ -210,12 +132,6 @@ public class FormBuilder {
         return "";
     }
 
-    // 设计对象是否带 kids 数组（即容器）。
-    static bool IsContainer(JsonValue o) {
-        JsonValue kids = o.Get("kids");
-        return kids != null && kids.IsArray();
-    }
-
     // 控件是否自带 `label` 属性（Checkbox / Radio 那样把标题画在框
     // 旁边）。自带的交给控件，不自带的由表单在它上面补一行标题。
     static bool OwnsLabel(Control ctl) {
@@ -228,55 +144,11 @@ public class FormBuilder {
         return false;
     }
 
-    // 字段需不需要表单替它画标题。以前这里是一张写死的白名单
-    // （Input / TextArea / SelectBox），于是 Switch、Slider、Rate 这些
-    // 字段的 label 既没进控件、也没画成标题，直接丢了；Checkbox 和
-    // Radio 明明自带 label 属性也拿不到值。改成问控件自己有没有
-    // label：没有就由表单补标题，两边都不会再漏。
-    static bool NeedsCaption(JsonValue o, Control ctl) {
-        // 只有设计文档真的写了 `label` 才由表单补标题行。`Caption` 在没有
-        // label 时会回退到 `name`，那是给自带 label 的控件兜底用的——若这里
-        // 也认那个回退，任何只写了 `name` 的字段都会被套一层
-        // `FbStack{Label, 控件}`，控件树凭空深一层：设计文档里
-        // `host.children[0].children[0]` 拿到的就不再是字段控件本身
-        // （CheckboxGroup 的聚合 API 因此全部落到 FbStack 上）。
-        if (o.Str("label", "") == "") { return false; }
-        return !FormBuilder.OwnsLabel(ctl);
-    }
-
-    // 字段高度（设计文档 fh；缺省 / 非法 32）。
-    static int PrefH(JsonValue o) {
-        int h = o.Int("fh", 32);
-        return h > 0 ? h : 32;
-    }
-
-    // 工具条 / 状态栏的默认停靠边（Top / Bottom），其余 Manual。
-    static int DefaultDock(JsonValue o) {
-        string k = FormBuilder.Kind(o);
-        if (k == "ToolStrip") { return 1; }
-        if (k == "StatusBar") { return 2; }
-        return 0;
-    }
-
     // span 钳制到 [1,24]。
     static int ClampSpan(int s) {
         if (s < 1) { return 1; }
         if (s > 24) { return 24; }
         return s;
-    }
-
-    // 标题文案：label 优先，为空回退 name。
-    static string Caption(JsonValue o) {
-        string label = o.Str("label", "");
-        if (label != "") { return label; }
-        return o.Str("name", "");
-    }
-
-    // kids 数组长度（非容器 0）。
-    static int ChildCount(JsonValue o) {
-        JsonValue kids = o.Get("kids");
-        if (kids != null && kids.IsArray()) { return kids.Count(); }
-        return 0;
     }
 
     // 第 i 个选项文本（缺失 / 非字符串回退 def）。
@@ -589,391 +461,7 @@ public class FormBuilder {
         return spec;
     }
 
-    static Control SlotOf(Control parent, JsonValue o) {
-        if (o.Has("childTab") || parent is Tabs || parent is SplitPanel) {
-            int slot = o.Int("childTab", 0);
-            if (slot < 0) { slot = 0; }
-            return parent.SlotHost(slot);
-        }
-        return parent;
-    }
 
-    static void AddChild(Control parent, Control child) {
-        if (parent is Element) { ((Element)parent).AddKid(child); }
-        else { parent.Add(child); }
-    }
-
-    // 先按字段序建子树，后按混排序装配。重复/越界引用不重复挂树。
-    static void BuildArray(Control parent, JsonValue arr, JsonValue content,
-                           bool free, bool natural, bool anon, FbBuildContext ctx) {
-        List<Control> nodes = new List<Control>();
-        for (int i = 0; i < arr.Count(); i = i + 1) {
-            JsonValue o = arr.At(i);
-            nodes.Add(FormBuilder.BuildNode(o, free, anon, ctx));
-        }
-        bool[] added = new bool[arr.Count()];
-        List<FbSlotFlow> flows = new List<FbSlotFlow>();
-        if (content != null && content.IsArray()) {
-            for (int i = 0; i < content.Count(); i = i + 1) {
-                JsonValue item = content.At(i);
-                if (item.IsString()) {
-                    if (parent is Element) { ((Element)parent).AddText(item.AsString("")); }
-                } else if (item.IsNumber()) {
-                    int idx = item.AsInt(0 - 1);
-                    if (idx >= 0 && idx < nodes.Count && !added[idx]) {
-                        FormBuilder.AttachNode(parent, arr.At(idx), nodes[idx],
-                            free, true, flows);
-                        added[idx] = true;
-                    }
-                }
-            }
-        }
-        for (int i = 0; i < nodes.Count; i = i + 1) {
-            if (!added[i]) {
-                FormBuilder.AttachNode(parent, arr.At(i), nodes[i], free, natural, flows);
-            }
-        }
-    }
-
-    static void CollectNodes(JsonValue arr, List<JsonValue> nodes) {
-        for (int i = 0; i < arr.Count(); i = i + 1) {
-            JsonValue o = arr.At(i);
-            nodes.Add(o);
-            JsonValue kids = o.Get("kids");
-            if (kids != null && kids.IsArray()) { FormBuilder.CollectNodes(kids, nodes); }
-        }
-    }
-
-    static Control BuildNode(JsonValue o, bool free, bool anon, FbBuildContext ctx) {
-        Control ctl = null;
-        if (ctx.prepared != null) {
-            for (int i = 0; i < ctx.originalNodes.Count; i = i + 1) {
-                if (ctx.originalNodes[i] == o) {
-                    if (i < ctx.prepared.Count) { ctl = ctx.prepared[i]; }
-                    break;
-                }
-            }
-        }
-        bool supplied = ctl != null;
-        if (ctl == null) { ctl = FormBuilder.CreateControl(o); }
-        if (ctl == null) { return null; }
-        FormBuilder.SetupControl(ctl, o, ctx.sizeClass, anon);
-        if (!supplied && FormBuilder.Kind(o) == "DataGrid") {
-            if (ctl.GetProp("previewColumns") == "") {
-                string spec = FormBuilder.GridColumnsSpec(o);
-                if (spec != "") { ctl.SetProp("previewColumns", spec); }
-            }
-        }
-        FormBuilder.SetupLayout(ctl, o, free);
-        JsonValue kids = o.Get("kids");
-        if (kids != null && kids.IsArray()) {
-            bool kidsFree = free;
-            if (o.Bool("compAnon", false)) { kidsFree = o.Bool("compAbs", false); }
-            if (!free && !FormBuilder.IsElement(o)) { ctl.AddClass("designgroup"); }
-            FormBuilder.BuildArray(ctl, kids, o.Get("htmlContent"), kidsFree,
-                ctl is Element, anon || o.Bool("compAnon", false), ctx);
-        } else {
-            JsonValue content = o.Get("htmlContent");
-            if (content != null && content.IsArray()) {
-                FormBuilder.BuildArray(ctl, JsonValue.NewArray(), content, free, true, anon, ctx);
-            }
-        }
-        return ctl;
-    }
-
-    // 只有声明了位置（fx/fy）才算浮动几何：fw/fh 是自然尺寸声明，
-    // free 布局里必须留在流内继续参与 flex。曾经把 fh 也算进来，
-    // 「声明高的分隔线 + grow 填充行」的带子里分隔线被当成浮动拽出
-    // 流外钉在 (0,0)——填充行吃满整条带、两者重叠、总高溢出
-    // （RunStrip line=22 rule=3，带高只有 22）。
-    static bool HasGeometry(JsonValue o) {
-        return o.Has("fx") || o.Has("fy");
-    }
-
-    // 无声明不制造默认尺寸。Float 与 CSS absolute 共用定位出口。
-    static void SetupLayout(Control ctl, JsonValue o, bool free) {
-        ctl.designFloat = false;
-        ctl.designAnchor = 0;
-        bool floating = false;
-        int dock = 0;
-        if (o.Has("dock") || o.Has("dockSide")) {
-            dock = o.Int("dock", o.Int("dockSide", 0));
-        }
-        int flexGrow = o.Int("flexGrow", 0);
-        int fh = o.Int("fh", 0);
-
-        string nodeKind = FormBuilder.Kind(o);
-        bool isStatusBar = (nodeKind == "StatusBar" || o.Int("ftype", 0) == 59);
-        bool isToolStrip = (nodeKind == "ToolStrip" || o.Int("ftype", 0) == 58);
-
-        if (isStatusBar) {
-            ctl.dock = Dock.Bottom();
-            floating = false;
-        } else if (isToolStrip) {
-            ctl.dock = (dock > 0) ? dock : Dock.Top();
-            floating = false;
-        } else if (o.Has("position")) {
-            floating = o.Int("position", 0) == 1;
-            if (!floating) {
-                if (dock > 0) {
-                    ctl.dock = dock;
-                } else if (flexGrow > 0 && fh == 0) {
-                    ctl.dock = Dock.Fill();
-                } else {
-                    ctl.dock = FormBuilder.DefaultDock(o);
-                    if (ctl.dock == 0) { ctl.dock = Dock.Top(); }
-                }
-            }
-        } else if (dock > 0) {
-            ctl.dock = dock;
-        } else if (o.Has("dock") || o.Has("dockSide")) {
-            floating = dock == 0;
-        } else if (free && FormBuilder.HasGeometry(o)) {
-            floating = true;
-        } else if (flexGrow > 0 && fh == 0) {
-            ctl.dock = Dock.Fill();
-        }
-        if (floating && !isStatusBar && !isToolStrip) {
-            ctl.Dock(Dock.Manual());
-            ctl.designFloat = true;
-            ctl.designAnchor = o.Int("anchor", 0);
-            ctl.logPlaceSet = true;
-            ctl.logX = o.Int("fx", 0);
-            ctl.logY = o.Int("fy", 0);
-        }
-        ctl.grow = flexGrow > 0;
-        if (o.Int("fw", 0) > 0) { ctl.logW = o.Int("fw", 0); }
-        // 文档声明的高度走"作者声明"通道：优先于样式表的 height，
-        // 否则皮肤的默认高度（`input { height: 32px }`）会把设计器里
-        // 定下的行高压回去，字段与下一行叠在一起。文档没写高度时
-        // 不声明——容器按内容自适应，皮肤定高的类型归尺寸档。
-        if (fh > 0) { ctl.DeclareHeight(fh); }
-        if (o.Has("padding")) { ctl.logPad = o.Int("padding", 0 - 1); }
-        else if (o.Has("pad")) { ctl.logPad = o.Int("pad", 0 - 1); }
-        if (o.Has("gap")) { ctl.logGap = o.Int("gap", 0 - 1); }
-        if (o.Has("margin")) { ctl.logMar = o.Int("margin", 0 - 1); }
-    }
-
-    static void AttachNode(Control parent, JsonValue o, Control ctl,
-                           bool free, bool natural, List<FbSlotFlow> flows) {
-        if (ctl == null) { return; }
-        Control host = FormBuilder.SlotOf(parent, o);
-        string nodeKind = FormBuilder.Kind(o);
-        bool isStatusBar = (nodeKind == "StatusBar" || o.Int("ftype", 0) == 59);
-        bool isToolStrip = (nodeKind == "ToolStrip" || o.Int("ftype", 0) == 58);
-        bool isDocked = false;
-        if (isStatusBar || isToolStrip) {
-            isDocked = true;
-        } else if (o.Has("dock") || o.Has("dockSide")) {
-            isDocked = o.Int("dock", o.Int("dockSide", 0)) > 0;
-        } else if (FormBuilder.DefaultDock(o) > 0) {
-            isDocked = true;
-        }
-        if (o.Has("position") && o.Int("position", 0) == 1 && !isStatusBar && !isToolStrip) {
-            isDocked = false;
-        }
-        if (free || natural || ctl.designFloat || parent is Element
-                || FormBuilder.IsElement(o)
-                || isDocked) {
-            FormBuilder.AddChild(host, ctl);
-            return;
-        }
-        FbFlow flow = null;
-        for (int i = 0; i < flows.Count; i = i + 1) {
-            if (flows[i].host == host) { flow = flows[i].flow; break; }
-        }
-        if (flow == null) {
-            flow = new FbFlow();
-            flow.Dock(Dock.Top());
-            flows.Add(new FbSlotFlow(host, flow));
-            FormBuilder.AddChild(host, flow);
-        }
-        int span = FormBuilder.IsContainer(o) ? 24 : FormBuilder.ClampSpan(o.Int("span", 24));
-        flow.AddCell(FormBuilder.WrapCell(o, ctl), span);
-    }
-
-    static Control WrapCell(JsonValue o, Control ctl) {
-        if (FormBuilder.IsContainer(o)) {
-            int h = o.Int("ph", o.Int("fh", 0));
-            if (h > 0) { ctl.logH = h; }
-            return ctl;
-        }
-        if (ctl is ChoiceGroup) {
-            if (o.Int("fh", 0) > 0) { ((ChoiceGroup)ctl).SetRowHeight(o.Int("fh", 0)); }
-        } else if (o.Int("fh", 0) > 0) { ctl.logH = o.Int("fh", 0); }
-        if (!FormBuilder.NeedsCaption(o, ctl)) { return ctl; }
-        FbStack cell = new FbStack();
-        Label caption = new Label(FormBuilder.Caption(o));
-        caption.Dock(Dock.Top());
-        caption.logH = 18;
-        cell.Add(caption);
-        ctl.Dock(Dock.Fill());
-        cell.Add(ctl);
-        return cell;
-    }
-
-    static void FillKids(Control parent, JsonValue o, bool free) {
-        JsonValue kids = o.Get("kids");
-        if (kids != null && kids.IsArray()) {
-            FormBuilder.BuildArray(parent, kids, o.Get("htmlContent"), free,
-                parent is Element, false, new FbBuildContext());
-        }
-    }
-
-    static void BuildFlow(Control parent, JsonValue arr) {
-        FormBuilder.BuildArray(parent, arr, null, false, false, false, new FbBuildContext());
-    }
-
-    static Control BuildCell(JsonValue o) {
-        Control ctl = FormBuilder.BuildNode(o, false, false, new FbBuildContext());
-        if (ctl == null) { return null; }
-        return FormBuilder.WrapCell(o, ctl);
-    }
-
-    static void BuildFlowOne(Control parent, JsonValue kid) {
-        JsonValue arr = JsonValue.NewArray();
-        arr.Append(kid);
-        FormBuilder.BuildFlow(parent, arr);
-    }
-
-    static void BuildFree(Control parent, JsonValue o) {
-        Control ctl = FormBuilder.BuildNode(o, true, false, new FbBuildContext());
-        if (ctl != null) { FormBuilder.AddChild(FormBuilder.SlotOf(parent, o), ctl); }
-    }
-
-    static JsonValue CompDoc(string name) {
-        string text = UserComponentRegistry.JsonOf(name);
-        if (text == "") { return null; }
-        return JsonValue.ParseLenient(text);
-    }
-
-    static string CompStr(JsonValue o, string key) { return o.Str(key, ""); }
-
-    static JsonValue DeepCopy(JsonValue v) {
-        if (v == null) { return v; }
-        if (v.IsObject()) {
-            JsonValue r = JsonValue.NewObject();
-            for (int i = 0; i < v.Count(); i = i + 1) {
-                r.Put(v.KeyAt(i), FormBuilder.DeepCopy(v.ValAt(i)));
-            }
-            return r;
-        }
-        if (v.IsArray()) {
-            JsonValue r = JsonValue.NewArray();
-            for (int i = 0; i < v.Count(); i = i + 1) {
-                r.Append(FormBuilder.DeepCopy(v.At(i)));
-            }
-            return r;
-        }
-        return v;
-    }
-
-    // 展开字段数组里的用户组件引用节点（带 "ref" 键）。就地
-    // 改写：引用节点变成 Panel 外壳（名字/几何/停靠/绑定等
-    // 自身键全部保留），组件文档的字段匿名挂进 kids——内部名
-    // 不进宿主命名空间、内部事件不接线（组件内部是引用的黑
-    // 盒；宿主要接的是引用节点自己的 on* 绑定）。组件文档是
-    // 流式时，其顶层字段标 dock=1 让生成代码竖排；自由时保持
-    // 绝对坐标。组件可引用组件（递归，防环）。返回 "" 或错误。
-    static string ExpandRefs(JsonValue arr, int depth) {
-        if (depth > 8) {
-            return "user component references nested too deeply (cycle?)";
-        }
-        for (int i = 0; i < arr.Count(); i = i + 1) {
-            JsonValue o = arr.At(i);
-            if (o == null || !o.IsObject()) { continue; }
-            JsonValue kids = o.Get("kids");
-            if (kids != null && kids.IsArray()) {
-                string e = FormBuilder.ExpandRefs(kids, depth);
-                if (e != "") { return e; }
-            }
-            string rk = FormBuilder.CompStr(o, "ref");
-            if (rk == "" || o.Bool("compAnon", false)) { continue; }
-            JsonValue doc = FormBuilder.CompDoc(rk);
-            if (doc == null) {
-                return "unknown component '" + rk + "' (pass components/"
-                    + rk + ".zcomp on the compile line)";
-            }
-            JsonValue cf = doc.Get("fields");
-            if (cf == null || !cf.IsArray()) { cf = JsonValue.NewArray(); }
-            /* 组件文档是全部实例共享的解析缓存，展开会原地改写字段 （dock、壳名前缀、props 直通）——不深拷贝，第一个实例 的改名会漏进后续实例（第二个拿到 "Card2_Card1_InnerBtn" 这样的叠前缀名）。标量节点不可变，共享无妨。 */
-            cf = FormBuilder.DeepCopy(cf);
-            string e2 = FormBuilder.ExpandRefs(cf, depth + 1);
-            if (e2 != "") { return e2; }
-            bool compFree = doc.Int("layoutMode", 0) == 1;
-            string shellName = o.Str("name", rk);
-            JsonValue anonKids = JsonValue.NewArray();
-            for (int k = 0; k < cf.Count(); k = k + 1) {
-                JsonValue kid = cf.At(k);
-                if (kid == null || !kid.IsObject()) { continue; }
-                if (!compFree && !kid.Has("dock")) {
-                    /* 流式组件文档的顶层字段：竖排。 */
-                    kid.Put("dock", JsonValue.NewNum("1"));
-                }
-                /* 内部控件保留设计名但加壳名前缀：不与其它实例撞名， 运行期 Find() 仍可达，只是不生成具名声明。改已有键 必须走 Set（Put 是追加不去重，Get 只认第一个）。 */
-                string kn = kid.Str("name", "");
-                if (kn != "") {
-                    kid.Set("name", JsonValue.NewStr(shellName + "_" + kn));
-                }
-                anonKids.Append(kid);
-            }
-            /* 组件声明的对外属性（组件文档根上 "props": [{key,target,prop,def}]）：实例值（引用节点自己的 "props" 直通对象，键 = 声明 key）优先，缺省取 def， 落给目标内部控件的 props 直通——EmitField 本来就会 对 kid 的 props 发 SetProp。壳上消费过的实例 props 必须清空，否则 EmitField 把它们发到 Panel 壳上会 退化成样式类。目标控件不存在是组件作者的错，报错 指名道姓。 */
-            JsonValue instProps = o.Get("props");
-            JsonValue decls = doc.Get("props");
-            if (decls != null && decls.IsArray() && decls.Count() > 0) {
-                for (int d = 0; d < decls.Count(); d = d + 1) {
-                    JsonValue dd = decls.At(d);
-                    if (dd == null || !dd.IsObject()) { continue; }
-                    string target = dd.Str("target", "");
-                    if (target == "") { continue; }
-                    string dkey = dd.Str("key", "");
-                    string val = instProps != null && instProps.IsObject()
-                        ? instProps.Str(dkey, dd.Str("def", ""))
-                        : dd.Str("def", "");
-                    if (val == "") { continue; }
-                    string tn = shellName + "_" + target;
-                    JsonValue tk = null;
-                    for (int k = 0; k < anonKids.Count(); k = k + 1) {
-                        JsonValue kd = anonKids.At(k);
-                        if (kd != null && kd.Str("name", "") == tn) { tk = kd; break; }
-                    }
-                    if (tk == null) {
-                        return "component '" + rk + "' prop '" + dkey
-                            + "' targets missing control '" + target + "'";
-                    }
-                    JsonValue tp = tk.Get("props");
-                    if (tp == null || !tp.IsObject()) {
-                        tp = JsonValue.NewObject();
-                        tk.Put("props", tp);
-                    }
-                    tp.Set(dd.Str("prop", "text"), JsonValue.NewStr(val));
-                }
-            }
-            if (instProps != null && instProps.IsObject()) {
-                o.Set("props", JsonValue.NewObject());
-            }
-            /* 同上：引用节点自身这些键都已存在，一律 Set 覆盖。 */
-            o.Set("kind", JsonValue.NewStr("Panel"));
-            if (!o.Has("name")) { o.Put("name", JsonValue.NewStr(rk)); }
-            if (o.Str("label", "") == "") { o.Set("label", JsonValue.NewStr(rk)); }
-            if (!o.Has("fw")) {
-                int ww = doc.Int("winW", 240);
-                o.Put("fw", JsonValue.NewNum(Convert.ToString(ww)));
-            }
-            if (!o.Has("fh")) {
-                int wh = doc.Int("winH", 0);
-                if (wh <= 0) { wh = 48; }
-                o.Put("fh", JsonValue.NewNum(Convert.ToString(wh)));
-            }
-            /* 流式分支的容器高度用组件画布高，而不是 44+44*子数。 */
-            o.Set("ph", JsonValue.NewNum(Convert.ToString(doc.Int("winH", 0))));
-            o.Set("kids", anonKids);
-            /* EmitField 的展开标记：壳自己是具名字段，子树匿名。 */
-            o.Set("compAbs", JsonValue.NewBool(compFree));
-            o.Set("compAnon", JsonValue.NewBool(true));
-        }
-        return "";
-    }
 
     // 从设计器的 FormField 构建单个叶子控件（不含标题标签——标题由
     // 设计器/表单布局单独绘制）。设计器预览用它渲染真控件，与运行时的
@@ -1057,6 +545,27 @@ public class HtmlKidSpec {
 }
 
 public class HtmlKidAttach {
+    public static void ApplyDialect(Control kid, HtmlKidSpec s) {
+        if (kid == null || s == null) { return; }
+        if (s.dock > 0) {
+            kid.dock = s.dock;
+        }
+        bool floating = s.position == 1 || (s.free && (s.hasFx || s.hasFy));
+        if (floating && s.dock == 0) {
+            kid.Dock(Dock.Manual());
+            kid.designFloat = true;
+            kid.designAnchor = s.anchor;
+            kid.logPlaceSet = true;
+            kid.logX = s.fx;
+            kid.logY = s.fy;
+        }
+        if (s.fw > 0) { kid.logW = s.fw; }
+        if (s.fh > 0) { kid.DeclareHeight(s.fh); }
+        if (s.hasPad) { kid.logPad = s.pad; }
+        if (s.hasGap) { kid.logGap = s.gap; }
+        if (s.hasMar) { kid.logMar = s.mar; }
+    }
+
     // 一批兄弟子节点按文档序挂到 parent（Html 装配阶段每个真控件父
     // 调一次）。非方言子节点保持 Html 语义直接挂接；方言子节点按
     // 浮动/停靠/流式单元三条路与 AttachNode 全同构。
@@ -1110,7 +619,7 @@ public class HtmlKidAttach {
             if (s.hasPad) { kid.logPad = s.pad; }
             if (s.hasGap) { kid.logGap = s.gap; }
             if (s.hasMar) { kid.logMar = s.mar; }
-            if (!s.dialect) {
+            if (s.free || !s.dialect) {
                 AddKid(host, kid);
                 continue;
             }

@@ -14,8 +14,9 @@ namespace Gui.Markup;
 // 据此区分设计稿与普通 HTML UI 文档）。docCss 单独发 <style>，
 // bodyClass/bodyStyle 发原生壳属性，不占文档 class/style 的键。
 // - 字段对象 → 元素：kind 决定 tag，能原生就原生（Panel→div、
-// DatePicker→input+type=…，其余 div），kind 本身存 data-kind
-// （自定义组件/共享控件的权威标记，读端优先于 tag 兜底）；
+// DatePicker→input+type=…），自定义组件/共享控件发 zan-<kebab>
+// 标签（读端 TagKind 与运行期 TagToKind 共享映射还原）——kind
+// 由标签承载，data-kind 属性旁路已废除（B-ID159 刀2）；
 // name → id；class → class；style → style；kids → 子元素。Element
 // 用 tag；未显式标组件的原生容器用 htmlTag 保留标签，旧带定位键的
 // 裸 div 仍是 Panel。纯文本沿用 text；htmlContent/bodyContent 是
@@ -161,9 +162,10 @@ public class DesignerHtml {
         return false;
     }
 
-    // HTML 文本 → 设计器 JSON 文档（PrettyToJson 字符串）。
-    public static string ToJsonDoc(string html) {
-        WDoc wd = HtmlParser.Parse(html, "");
+    // HTML 解析树 → 设计器 JSON 文档（PrettyToJson 字符串）。入口吃
+    // HtmlParser.Parse 的产物——解析一次全链共用，不再收原文；原
+    // ToJsonDoc(string) 已随窗口 JSON 构建管线退役（B-ID159 刀2）。
+    public static string DocOf(WDoc wd) {
         WNode body = wd.nodes.Count > 0 ? wd.nodes[0] : null;
         for (int i = 0; i < wd.nodes.Count; i = i + 1) {
             if (wd.nodes[i].tag == "body") { body = wd.nodes[i]; break; }
@@ -346,13 +348,9 @@ public class DesignerHtml {
         b.Append(pad + "<" + tag);
         string nm = o.Str("name", "");
         if (nm != "") { b.Append(" id=\"" + EscapeAttr(nm) + "\""); }
-        // zan-* 或带旧定位键的 div 能恢复组件 kind；其余 Panel 必须
-        // 显式打标，才能和无定位信息的原生 div 区分。htmlTag 保持原生。
-        bool kindFromTag = (HtmlText.StartsWith(tag, "zan-") && TagKind(tag) == kind)
-            || (tag == "div" && kind == "Panel" && HasPlacementKeys(o));
-        if (nativeTag == "" && !kindFromTag) {
-            b.Append(" data-kind=\"" + EscapeAttr(kind) + "\"");
-        }
+        // zan-<kebab> 自定义族与带定位键的 div-Panel 都能从标签恢复
+        // kind；data-kind 属性旁路已废除（B-ID159 刀2）——kind 一律
+        // 由标签承载（KindTag/TagKind 共享映射保证往返）。
         if (nativeTag == "div" && HasPlacementKeys(o)) {
             // 原生 div 加了设计几何后仍是 Element；只记来源，正文/样式
             // 仍沿原生通道，不让旧裸 div 的 Panel 判定改变实例类型。
@@ -589,23 +587,22 @@ public class DesignerHtml {
 
     public static JsonValue FieldJson(WDoc doc, WNode n) {
         JsonValue o = JsonValue.NewObject();
-        string kind = HtmlText.NodeAttr(n.attrs, "data-kind");
-        if (kind == "" && n.tag == "template") { kind = "Element"; }
-        if (kind == "") { kind = TagKind(n.tag); }
-        if (kind == "") { kind = "Panel"; }
-        // （data-kind 缺失才兜底，见 InputTypeKind）。
-        if (kind == "Input" && n.tag == "input" && !HasNodeAttr(n, "data-kind")) {
+        // kind 由标签承载（与运行期通道共享同一张映射，无属性旁路）：
+        // template 节点是行展开结构声明，落 Element；input 按 type
+        // 细分七态；其余经 TagKind（zan-<kebab> 还原 + 正典表），
+        // 无名标签落 Panel。
+        string kind = n.tag == "template" ? "Element" : TagKind(n.tag);
+        if (kind == "Input" && n.tag == "input") {
             kind = DesignerHtml.InputTypeKind(
                 HtmlText.NodeAttr(n.attrs, "type"));
         }
         o.Put("kind", JsonValue.NewStr(kind));
         string id = HtmlText.NodeAttr(n.attrs, "id");
         if (id != "") { o.Put("name", JsonValue.NewStr(id)); }
-        // 保留旧 tag→kind 映射，同时让新导入的原生容器保有真实标签。
-        // 旧设计器把带定位键的裸 div 当 Panel，不能改它的实例类型。
+        // 让导入的原生容器保有真实标签；旧设计器把带定位键的裸 div
+        // 当 Panel，不能改它的实例类型。
         if (kind == "Element") { o.Put("tag", JsonValue.NewStr(n.tag)); }
-        else if (!HasNodeAttr(n, "data-kind")
-            && TagKind(n.tag) == "Panel" && !HtmlText.StartsWith(n.tag, "zan-")
+        else if (TagKind(n.tag) == "Panel" && !HtmlText.StartsWith(n.tag, "zan-")
             && (n.tag != "div" || !HasPlacementAttrs(n)
                 || HtmlText.NodeAttr(n.attrs, "data-html-tag") == "div")) {
             o.Put("htmlTag", JsonValue.NewStr(n.tag));
@@ -617,6 +614,8 @@ public class DesignerHtml {
             string v = n.attrs[i].val;
             if (a == "id" || a == "data-kind" || a == "data-html-tag"
                 || a == "data-x-html-tag") { continue; }
+            // data-kind 是已废除的属性旁路（B-ID159 刀2）：旧文档遗留
+            // 的读入即弃，kind 只认标签。
             if (a == "class") {
                 if (v != "") { o.Put("class", JsonValue.NewStr(v)); }
                 continue;
@@ -1079,85 +1078,28 @@ public class DesignerHtml {
         return "zan-" + KebabKey(kind);
     }
 
-    // tag → kind（读端兜底；data-kind 缺失时）。zan-<kebab> 自定义
-    // 元素反解回 Pascal kind，与 KindTag 的默认分支互逆。
+    // tag → kind：与运行期装配通道共用 Html.TagToKind 一张表（含
+    // zan-<kebab> 帕斯卡还原与正典标签折入别名），映射零漂移。表外
+    // 的 bespoke 标签（button/textarea/img/select/progress/input 与
+    // p/h1-h6）与无名标签在此收口；无表面的原生容器落 Panel。
     public static string TagKind(string tag) {
-        if (HtmlText.StartsWith(tag, "zan-")) {
-            // 标签名经 tokenizer 全小写，逐段首字母大写复原 Pascal
-            // kind（Unkebab 不动首段，这里不能用）："zan-qr-code" →
-            // "QrCode"，与 KebabKey 互逆。
-            string pascal = "";
-            List<string> ks = tag.Substring(4).Split("-");
-            for (int ki = 0; ki < ks.Count; ki = ki + 1) {
-                string kp = ks[ki];
-                if (kp.Length == 0) { continue; }
-                int c0 = kp[0];
-                if (c0 >= 97 && c0 <= 122) {
-                    pascal = pascal + (char)(c0 - 32) + kp.Substring(1);
-                } else {
-                    pascal = pascal + kp;
-                }
-            }
-            return pascal;
-        }
-        if (tag == "label") { return "Label"; }
+        string k = Html.TagToKind(tag);
+        if (k != tag) { return k; }  // 表内命中
         if (tag == "button") { return "Button"; }
-        if (tag == "input") { return "Input"; }
         if (tag == "textarea") { return "TextArea"; }
         if (tag == "img") { return "Image"; }
-        if (tag == "hr") { return "Divider"; }
-        if (tag == "progress") { return "Progress"; }
         if (tag == "select") { return "SelectBox"; }
+        if (tag == "progress") { return "Progress"; }
+        if (tag == "input") { return "Input"; }
         if (tag == "p" || tag == "h1" || tag == "h2" || tag == "h3"
             || tag == "h4" || tag == "h5" || tag == "h6") { return "Typography"; }
-
-        // 首类组件标签映射（自然声明式：<WebViewBox>、<StatusBar>、<DatePicker>、<CommandBarHost> 等）
-        if (tag == "statusbar") { return "StatusBar"; }
-        if (tag == "webviewbox") { return "WebViewBox"; }
-        if (tag == "datepicker") { return "DatePicker"; }
-        if (tag == "colorpicker") { return "ColorPicker"; }
-        if (tag == "tabs") { return "Tabs"; }
-        if (tag == "commandbarhost") { return "CommandBarHost"; }
-        if (tag == "documenttabhost") { return "DocumentTabHost"; }
-        if (tag == "chatview") { return "ChatView"; }
-        if (tag == "gauge") { return "Gauge"; }
-        if (tag == "toolstrip") { return "ToolStrip"; }
-        if (tag == "switch") { return "Switch"; }
-        if (tag == "checkbox") { return "Checkbox"; }
-        if (tag == "radio") { return "Radio"; }
-        if (tag == "slider") { return "Slider"; }
-        if (tag == "rate") { return "Rate"; }
-        if (tag == "pagination") { return "Pagination"; }
-        if (tag == "virtuallist") { return "VirtualList"; }
-        if (tag == "datagrid") { return "DataGrid"; }
-        if (tag == "alertbox") { return "AlertBox"; }
-        if (tag == "splitpanel") { return "SplitPanel"; }
-        if (tag == "floatbutton") { return "FloatButton"; }
-        if (tag == "radiogroup") { return "RadioGroup"; }
-        if (tag == "checkboxgroup") { return "CheckboxGroup"; }
-        if (tag == "avatar") { return "Avatar"; }
-        if (tag == "badge") { return "Badge"; }
-        if (tag == "card") { return "Card"; }
-        if (tag == "calendar") { return "Calendar"; }
-        if (tag == "countdown") { return "Countdown"; }
-        if (tag == "qrcode") { return "QrCode"; }
-        if (tag == "upload") { return "Upload"; }
-        if (tag == "led") { return "Led"; }
-        if (tag == "digital") { return "Digital"; }
-        if (tag == "bargraph") { return "Bargraph"; }
-        if (tag == "trend") { return "Trend"; }
-        if (tag == "numpad") { return "NumPad"; }
-        if (tag == "collapse") { return "Collapse"; }
-        if (tag == "steps") { return "Steps"; }
-        if (tag == "listview") { return "ListView"; }
-        if (tag == "charthost") { return "ChartHost"; }
-
-        return "Panel";
+        if (tag == "div") { return "Panel"; }
+        return "Element";
     }
 
     // input 的 type 属性 → 组件 kind（<input type=checkbox> 是 Checkbox
-    // 而不是 Input）。只在 data-kind 缺失、kind 从标签兜底而来时细化：
-    // data-kind 是权威标记，写了就不改写。
+    // 而不是 Input）。input 标签一律按 type 细分（kind 由标签承载，
+    // 见 FieldJson）。
     public static string InputTypeKind(string ty) {
         if (ty == "checkbox") { return "Checkbox"; }
         if (ty == "radio") { return "Radio"; }
