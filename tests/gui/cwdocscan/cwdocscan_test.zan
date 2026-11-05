@@ -1,29 +1,45 @@
-// ChildWindow.EnsureDesign 类名回退 + 开发态散盘递归扫描回归：
-// 1) DesignName() 未覆写时按"类名 ↔ 同名 .html"装载（此前默认 "" 恒
-//    no-op，114 个子窗全数断供）；
-// 2) 裸 html 在工作目录顶层命中（FlatCw.html）；
-// 3) 嵌套 html 经 src/Deep/ 递归命中——Directory.GetDirectories 返回
-//    裸目录名（stdlib 刻意口径），递归必须手动拼回父路径，此前子目录
-//    永远按 CWD 相对名解析失败。
+// ChildWindow 声明式装配回归（子窗收官）：
+// 1) DesignName 未覆写时按"类名 ↔ 同名 .html"装载——顶层裸名（FlatCw.html）
+//    与 src/Deep 嵌套递归（NestedCw.html，GetDirectories 裸名口径须拼父路径）；
+// 2) EnsureDesign 默认挂窗自身为模型：data-bind="greeting" 对实例字段
+//    初始推送 + 改字段后一帧同步（model→UI）；
+// 3) OpenHost 装配序：@click 自动接线到实例方法（UiEvent.Raise 模拟点击）、
+//    OnLoad 钩子按名 Invoke；
+// 4) html 声明了不存在的方法/路径时 fail-fast exit 1（DocWire.AutoWire/
+//    CheckBinds，与 Form.AutoWireDoc 同语义）——由同目录 diag 子用例钉住。
 using System;
+using System.Json;
 using Gui;
 using Gui.Widget;
 
 class FlatCw : ChildWindow {
+    public int hits = 0;
+    public string greeting = "hi";
+    public bool loaded = false;
     public Control seen;
+
     public void Grab() { this.seen = this.root; }
+
+    [Custom]
+    public void OnLoad(ChildWindow w) { this.loaded = true; }
+
+    public void HitMe() { this.hits = this.hits + 1; }
 }
 
 class NestedCw : ChildWindow {
     public Control seen;
+
     public void Grab() { this.seen = this.root; }
 }
 
-class App {
+class CaseMain {
     static int Main() {
         Html.Install();
         ControlBootstrap.Install();
         int bad = 0;
+
+        // 1+2+3：装配全链
+        App host = App.CreateDark("cwdocscan", 320, 240);
         FlatCw f = new FlatCw();
         f.EnsureDesign();
         f.Grab();
@@ -31,6 +47,40 @@ class App {
             Console.WriteLine("FLAT_MISS");
             bad = bad + 1;
         }
+        f.OpenHost(host);
+        if (!f.loaded) {
+            Console.WriteLine("ONLOAD_MISS");
+            bad = bad + 1;
+        }
+        Label fl = (Label)f.seen.Find("flabel");
+        if (fl == null || fl.GetText() != "hi") {
+            Console.WriteLine("BIND_INIT_MISS");
+            bad = bad + 1;
+        }
+        Button fb = (Button)f.seen.Find("fbtn");
+        if (fb == null) {
+            Console.WriteLine("BTN_MISS");
+            bad = bad + 1;
+        } else {
+            fb.Click.Raise();
+            if (f.hits != 1) {
+                Console.WriteLine("WIRE_MISS");
+                bad = bad + 1;
+            }
+        }
+        f.greeting = "yo";
+        f.MarkDirty();
+        f.RequestRedraw();
+        f.Render();
+        if (fl.GetText() != "yo") {
+            Console.WriteLine("BIND_SYNC_MISS");
+            bad = bad + 1;
+        }
+        f.Close();
+
+        // 1b：嵌套递归装载 + JsonValue 模型跳过 bind 对账（JsonValue 的
+        // 键不是反射字段，CheckBinds 若不跳过必假失败 exit 1——ghostkey
+        // 在 JsonValue 模型上不存在于反射面，能走到 OK 即证明跳过生效）
         NestedCw n = new NestedCw();
         n.EnsureDesign();
         n.Grab();
@@ -38,6 +88,12 @@ class App {
             Console.WriteLine("NESTED_MISS");
             bad = bad + 1;
         }
+        JsonValue mdl = JsonValue.NewObject();
+        mdl.PathSet("k", "v");
+        n.SetRoot(n.seen, mdl);
+        n.OpenHost(host);
+        n.Close();
+
         if (bad == 0) {
             Console.WriteLine("CWDOCSCAN_OK");
             return 0;

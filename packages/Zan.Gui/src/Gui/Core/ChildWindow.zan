@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Json;
 using Gui;
 using Gui.Backend;
 using Gui.Widget;
@@ -73,6 +74,8 @@ public class ChildWindow {
     // 工程 src 树，歧义 fail-fast）。此前只认 DesignName() 且默认返回 ""，
     // 全仓没有一个子窗覆写它——EnsureDesign 成了永久 no-op，Build 里
     // 首个设计稿字段访问即 null 崩溃（oneplus 114 窗全数命中）。
+    // 模型默认挂窗自身（实例字段即 ViewModel、方法即事件处理器）；窗在
+    // Build 里再调 SetRoot(root, mdl) 换挂 JsonValue 等模型的，尊重之。
     public virtual void EnsureDesign() {
         if (this.root != null) { return; }
         string tname = this.DesignName();
@@ -81,8 +84,32 @@ public class ChildWindow {
         if (html != null) {
             HtmlDoc doc = Html.Parse(html, "", null);
             if (doc.root != null) {
-                this.SetRoot(doc.root, null);
+                this.SetRoot(doc.root, this);
             }
+        }
+    }
+
+    // 声明式装配（子窗收官，与 Form.assembleDoc 同一语义）：事件按名
+    // 对账接线（缺失 fail-fast exit 1）、bind 路径启动期对账、OnLoad
+    // 钩子（publish 形态钩子须带 [Custom] 注解，见 B-ID160 契约）。
+    // 必须在 host 就绪后调用——Wire 的 SetApp 与触发闭包都要 host。
+    // 事件处理器恒解析窗实例方法；bind 模型用 binder 当前模型
+    // （EnsureDesign 挂的 this，或窗自换的 JsonValue 等）。JsonValue
+    // 模型的键不是反射字段，bind 对账跳过（运行期 binder 自会软兜底）。
+    void AssembleDoc() {
+        if (this.root == null) { return; }
+        ModelBinder b = this.Binder();
+        if (b.Model() == null) { b.SetRoot(this.root, this); }
+        object bm = b.Model();
+        DocWire.AutoWire(this.root, this, b, () => { this.MarkDirty(); });
+        if (!(bm is JsonValue)) {
+            DocWire.CheckBinds(this.root, bm, this.GetType().Name);
+        }
+        b.SetApp(host);
+        b.Wire();
+        if (this.HasMethod("OnLoad")) {
+            this.Invoke("OnLoad", this);
+            b.MarkDirty();
         }
     }
 
@@ -169,6 +196,7 @@ public class ChildWindow {
             host.SetUserWallpaper(parent.UserWallpaperPath(),
                                   parent.UserWallpaperOpacity());
         }
+        this.AssembleDoc();
         host.Show();
         host.RequestRedraw();
         ChildWindows.Register(this);
@@ -191,6 +219,7 @@ public class ChildWindow {
         host.ApplySkinName(this.StandaloneSkin());
         host.SetChromeButtons(this.ShowTheme(), this.ShowPin(), this.ShowMinimize(),
                               this.ShowMaximize());
+        this.AssembleDoc();
         host.Show();
         host.RequestRedraw();
     }

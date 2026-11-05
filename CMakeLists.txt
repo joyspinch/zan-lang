@@ -1480,6 +1480,21 @@ add_test(NAME conformance_gui_cw_docscan
 set_tests_properties(conformance_gui_cw_docscan PROPERTIES
     TIMEOUT 120 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
 
+# 运行期诊断：子窗 html 声明了窗上不存在的处理器 → OpenHost 装配期
+# fail-fast exit 1 并列出缺失名（DocWire.AutoWire，与 Form 同语义）。
+add_test(NAME diag_cw_missing_handler
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/cwdocscan/diag_missing_handler.zan
+    "-DZANC_ARGS=--auto-stdlib${_gui_driver_tail}"
+    -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/gui/cwdocscan/diag_missing_handler.out
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/diag_cw_missing_handler${_exe_ext}
+    -DWORKDIR=${CMAKE_SOURCE_DIR}/tests/gui/cwdocscan
+    -DEXPECT_RC=1
+    -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+set_tests_properties(diag_cw_missing_handler PROPERTIES
+    TIMEOUT 120 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+
 add_test(NAME diag_docapp_no_entry
   COMMAND ${CMAKE_COMMAND}
     -DZANC=$<TARGET_FILE:zanc>

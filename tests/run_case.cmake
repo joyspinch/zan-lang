@@ -103,10 +103,16 @@ while(TRUE)
   endif()
   break()
 endwhile()
-if(NOT run_rc EQUAL 0)
-  zan_drop_artifact()
-  message(FATAL_ERROR "program exited with ${run_rc}\noutput:\n${actual}")
-endif()
+  # 运行期诊断类用例（fail-fast 开窗对账等）以非零码退出属预期：
+  # -DEXPECT_RC=<n> 声明期望退出码（缺省 0），输出仍按 golden 对账。
+  set(_expect_rc 0)
+  if(EXPECT_RC)
+    set(_expect_rc ${EXPECT_RC})
+  endif()
+  if(NOT run_rc EQUAL _expect_rc)
+    zan_drop_artifact()
+    message(FATAL_ERROR "program exited with ${run_rc}\noutput:\n${actual}")
+  endif()
 
 # ---- compare (normalize CRLF and trailing whitespace) ----
 file(READ ${EXPECTED} expected)

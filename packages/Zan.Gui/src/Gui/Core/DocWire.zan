@@ -1,0 +1,98 @@
+using System;
+using System.Collections.Generic;
+
+namespace Gui;
+
+// 声明式文档装配的共享底座：Form.Show 与 ChildWindow 的同一装配语义——
+// 树上处理器名收集、按名对账接线（缺失 fail-fast）、bind 路径启动期对账。
+// vm 同时是处理器方法与 bind 路径的解析对象；afterInvoke 在每次处理器
+// 触发后调用（窗各自标脏：Form 走 ModelHosts，ChildWindow 走本窗泵）。
+// 注意：FieldExists 是 POCO 反射（HasField），JsonValue 模型的键不是
+// 反射字段——调用方须对 JsonValue 模型跳过 CheckBinds。
+public class DocWire {
+    // 按名自动接线：树上处理器名逐个对 vm HasMethod（缺失即 exit 1 列出），
+    // 注册 plain + arg 双槽（arg 槽只在控件声明 handlerArg 时被选中），
+    // 每次触发后调 afterInvoke 标脏。返回值恒 true（对账失败不返回）。
+    public static bool AutoWire(Control tree, object vm, ModelBinder b, Action afterInvoke) {
+        List<string> names = new List<string>();
+        DocWire.CollectHandlers(tree, names);
+        List<string> missing = new List<string>();
+        for (int i = 0; i < names.Count; i++) {
+            string h = names[i];
+            if (!vm.HasMethod(h)) { missing.Add(h); continue; }
+            string evt = h;
+            b.Handle(h, () => { vm.Invoke(evt); afterInvoke(); });
+            b.HandleArg(h, (string s) => { vm.Invoke(evt, s); afterInvoke(); });
+        }
+        if (missing.Count > 0) {
+            string list = "";
+            for (int i = 0; i < missing.Count; i++) {
+                list = list + (i > 0 ? ", " : "") + missing[i];
+            }
+            Console.WriteLine("WINDOW: handlers declared in doc but missing on " +
+                              vm.GetType().Name + ": " + list);
+            Environment.Exit(1);
+        }
+        return true;
+    }
+
+    // 启动期绑定对账：bind 路径解析不到 vm 字段的，开窗前一次性列出 exit 1。
+    public static void CheckBinds(Control tree, object vm, string ownerName) {
+        List<string> bad = new List<string>();
+        DocWire.CollectBinds(tree, vm, bad);
+        if (bad.Count > 0) {
+            string list = "";
+            for (int i = 0; i < bad.Count; i++) {
+                list = list + (i > 0 ? ", " : "") + bad[i];
+            }
+            Console.WriteLine("WINDOW: bind paths not found on " +
+                              ownerName + ": " + list);
+            Environment.Exit(1);
+        }
+    }
+
+    public static void CollectHandlers(Control c, List<string> names) {
+        for (int i = 0; i < c.events.Count; i++) {
+            string h = c.events[i].val;
+            if (h != "" && !names.Contains(h)) { names.Add(h); }
+        }
+        for (int j = 0; j < c.children.Count; j++) {
+            DocWire.CollectHandlers(c.children[j], names);
+        }
+    }
+
+    public static void CollectBinds(Control c, object vm, List<string> bad) {
+        // 模板行内绑定以行项为作用域，对根模型校验会假失败——子树跳过。
+        if (c.Kind() == "template") { return; }
+        if (c.bindPath != "" && !DocWire.FieldExists(vm, c.bindPath)) {
+            bad.Add(c.bindPath);
+        }
+        if (DocWire.IsPlainPath(c.bindIf) && !DocWire.FieldExists(vm, c.bindIf)) {
+            bad.Add(c.bindIf);
+        }
+        if (DocWire.IsPlainPath(c.bindDisabled) && !DocWire.FieldExists(vm, c.bindDisabled)) {
+            bad.Add(c.bindDisabled);
+        }
+        for (int j = 0; j < c.children.Count; j++) {
+            DocWire.CollectBinds(c.children[j], vm, bad);
+        }
+    }
+
+    public static bool FieldExists(object vm, string path) {
+        string leaf = "";
+        object target = ModelBinder.ResolveFieldScope(vm, path, out leaf);
+        return target != null && target.HasField(leaf);
+    }
+
+    // 纯路径（ident[.ident]*）才校验；带运算符的是表达式，归 binder 语义。
+    public static bool IsPlainPath(string s) {
+        if (s == null || s == "") { return false; }
+        for (int i = 0; i < s.Length; i++) {
+            char ch = s[i];
+            bool ok = (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
+                      (ch >= '0' && ch <= '9') || ch == '_' || ch == '.';
+            if (!ok) { return false; }
+        }
+        return true;
+    }
+}
