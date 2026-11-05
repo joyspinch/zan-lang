@@ -5,7 +5,11 @@ using System.Text;
 
 namespace System.Data.ZanDb;
 
+public delegate void RecordRowUpdater(RecordRow r);
+public delegate void RecordIdVisitor(int id, RecordRow r);
+
 // 强类型查询构造器：基于 System.Linq.ExprNode 编译期语法树下推
+// 支持两段式延迟分页、自适应多表关联、流式标量聚合与事务级批量更新删除
 // 0% JsonValue 装箱，0 运行时 SQL 文本解析，天然防 SQL 注入
 public class RecordQuery {
     public RecordTable table;
@@ -56,9 +60,18 @@ public class RecordQuery {
         return this;
     }
 
+    // 纯索引覆盖 Count 优化：完全命中索引且无残余内存谓词时 0 磁盘 I/O
     public int Count() {
-        List<RecordRow> list = this.ToList();
-        return list.Count;
+        if (this.table == null || !this.table.IsOpen()) { return 0; }
+        List<int> candidateIds = this.PlanCandidateIds();
+        if (candidateIds != null && !this.HasResidual(this.expr)) {
+            return candidateIds.Count;
+        }
+        int cnt = 0;
+        this.ExecuteMatchedRows((int id, RecordRow r) => {
+            cnt = cnt + 1;
+        });
+        return cnt;
     }
 
     public RecordRow FirstOrDefault() {
@@ -67,7 +80,7 @@ public class RecordQuery {
         return list.Count > 0 ? list[0] : null;
     }
 
-    // 执行查询计划并物化结果
+    // 执行查询计划并物化结果（两段式延迟关联分页）
     public List<RecordRow> ToList() {
         List<RecordRow> results = new List<RecordRow>();
         if (this.table == null || !this.table.IsOpen()) {
@@ -75,8 +88,54 @@ public class RecordQuery {
         }
 
         List<int> candidateIds = this.PlanCandidateIds();
+        bool hasResidual = this.HasResidual(this.expr);
+
+        // 两段式分页判定：若无需按非主键列自定义重排序（自然自增主键序）
+        bool isDefaultOrder = (this.orderCol == null || this.orderCol.Length == 0 || this.orderCol == "id" || this.orderCol == "Id");
+
+        if (isDefaultOrder) {
+            // 两段式优化路径（Phase 1: ID 序列切片；Phase 2: 仅物化切片后目标行）
+            List<int> matchedIds = new List<int>();
+            if (candidateIds != null) {
+                if (!hasResidual) {
+                    matchedIds = candidateIds;
+                } else {
+                    for (int i = 0; i < candidateIds.Count; i = i + 1) {
+                        int id = candidateIds[i];
+                        RecordRow r = this.table.Get(id);
+                        if (r != null && (this.expr == null || this.EvalNode(this.expr, r))) {
+                            matchedIds.Add(id);
+                        }
+                    }
+                }
+            } else {
+                this.table.Scan((int id, RecordRow r) => {
+                    if (this.expr == null || this.EvalNode(this.expr, r)) {
+                        matchedIds.Add(id);
+                    }
+                    return true;
+                });
+            }
+
+            if (this.orderDesc && matchedIds.Count > 1) {
+                matchedIds = this.ReverseIds(matchedIds);
+            }
+
+            // Phase 1: 切片 ID 列表
+            List<int> targetIds = this.SliceIds(matchedIds, this.skipN, this.takeN);
+
+            // Phase 2: 仅物化 targetIds 对应的行
+            for (int i = 0; i < targetIds.Count; i = i + 1) {
+                RecordRow r = this.table.Get(targetIds[i]);
+                if (r != null) {
+                    results.Add(r);
+                }
+            }
+            return results;
+        }
+
+        // 指定非主键排序列路径（先物化候选行再执行排序切片）
         if (candidateIds != null) {
-            // 走索引候选集路径
             for (int i = 0; i < candidateIds.Count; i = i + 1) {
                 int id = candidateIds[i];
                 RecordRow r = this.table.Get(id);
@@ -87,7 +146,6 @@ public class RecordQuery {
                 }
             }
         } else {
-            // 无索引命中：全表扫描路径
             this.table.Scan((int id, RecordRow r) => {
                 if (this.expr == null || this.EvalNode(this.expr, r)) {
                     results.Add(r);
@@ -96,12 +154,10 @@ public class RecordQuery {
             });
         }
 
-        // 排序
-        if (this.orderCol != null && this.orderCol.Length > 0 && results.Count > 1) {
+        if (results.Count > 1) {
             this.SortResults(results);
         }
 
-        // 分页 Skip & Take
         if (this.skipN > 0 || (this.takeN > 0 && this.takeN < results.Count)) {
             List<RecordRow> paged = new List<RecordRow>();
             int start = this.skipN;
@@ -118,7 +174,328 @@ public class RecordQuery {
         return results;
     }
 
-    // 查询优化器：识别谓词中可下推至二级索引 / 范围索引的列
+    public List<int> ReverseIds(List<int> ids) {
+        List<int> rev = new List<int>();
+        for (int i = ids.Count - 1; i >= 0; i = i - 1) {
+            rev.Add(ids[i]);
+        }
+        return rev;
+    }
+
+    public List<int> SliceIds(List<int> ids, int skip, int take) {
+        List<int> res = new List<int>();
+        int start = skip > 0 ? skip : 0;
+        int end = ids.Count;
+        if (take > 0 && start + take < end) {
+            end = start + take;
+        }
+        for (int i = start; i < end; i = i + 1) {
+            res.Add(ids[i]);
+        }
+        return res;
+    }
+
+    // ----------------------------------------------------
+    // 流式标量聚合引擎（Sum / Avg / Min / Max）
+    // ----------------------------------------------------
+
+    public void ExecuteMatchedRows(RecordIdVisitor visitor) {
+        if (this.table == null || !this.table.IsOpen() || visitor == null) { return; }
+        List<int> candidateIds = this.PlanCandidateIds();
+        if (candidateIds != null) {
+            for (int i = 0; i < candidateIds.Count; i = i + 1) {
+                int id = candidateIds[i];
+                RecordRow r = this.table.Get(id);
+                if (r != null) {
+                    if (this.expr == null || this.EvalNode(this.expr, r)) {
+                        visitor(id, r);
+                    }
+                }
+            }
+        } else {
+            this.table.Scan((int id, RecordRow r) => {
+                if (this.expr == null || this.EvalNode(this.expr, r)) {
+                    visitor(id, r);
+                }
+                return true;
+            });
+        }
+    }
+
+    public int SumInt(string colName) {
+        int sum = 0;
+        this.ExecuteMatchedRows((int id, RecordRow r) => {
+            sum = sum + r.GetInt32(colName);
+        });
+        return sum;
+    }
+
+    public long SumLong(string colName) {
+        long sum = 0L;
+        this.ExecuteMatchedRows((int id, RecordRow r) => {
+            sum = sum + r.GetInt64(colName);
+        });
+        return sum;
+    }
+
+    public double SumDouble(string colName) {
+        double sum = 0.0;
+        RecordColumn col = this.table.Schema().FindColumn(colName);
+        if (col == null) { return 0.0; }
+        this.ExecuteMatchedRows((int id, RecordRow r) => {
+            sum = sum + this.GetNum(r, col);
+        });
+        return sum;
+    }
+
+    public double Avg(string colName) {
+        double sum = 0.0;
+        int cnt = 0;
+        RecordColumn col = this.table.Schema().FindColumn(colName);
+        if (col == null) { return 0.0; }
+        this.ExecuteMatchedRows((int id, RecordRow r) => {
+            sum = sum + this.GetNum(r, col);
+            cnt = cnt + 1;
+        });
+        if (cnt == 0) { return 0.0; }
+        return sum / (double)cnt;
+    }
+
+    public double Min(string colName) {
+        double minVal = 0.0;
+        bool hasVal = false;
+        RecordColumn col = this.table.Schema().FindColumn(colName);
+        if (col == null) { return 0.0; }
+        this.ExecuteMatchedRows((int id, RecordRow r) => {
+            double v = this.GetNum(r, col);
+            if (!hasVal || v < minVal) {
+                minVal = v;
+                hasVal = true;
+            }
+        });
+        return minVal;
+    }
+
+    public double Max(string colName) {
+        double maxVal = 0.0;
+        bool hasVal = false;
+        RecordColumn col = this.table.Schema().FindColumn(colName);
+        if (col == null) { return 0.0; }
+        this.ExecuteMatchedRows((int id, RecordRow r) => {
+            double v = this.GetNum(r, col);
+            if (!hasVal || v > maxVal) {
+                maxVal = v;
+                hasVal = true;
+            }
+        });
+        return maxVal;
+    }
+
+    // ----------------------------------------------------
+    // 自适应多表关联（Join / LeftJoin）
+    // ----------------------------------------------------
+
+    public List<RecordJoinResult> Join(RecordTable rightTable, string leftKeyCol, string rightKeyCol) {
+        return this.ExecuteJoin(rightTable, leftKeyCol, rightKeyCol, false);
+    }
+
+    public List<RecordJoinResult> LeftJoin(RecordTable rightTable, string leftKeyCol, string rightKeyCol) {
+        return this.ExecuteJoin(rightTable, leftKeyCol, rightKeyCol, true);
+    }
+
+    public List<RecordJoinResult> ExecuteJoin(RecordTable rightTable, string leftKeyCol, string rightKeyCol, bool isLeftJoin) {
+        List<RecordJoinResult> results = new List<RecordJoinResult>();
+        if (this.table == null || !this.table.IsOpen() || rightTable == null || !rightTable.IsOpen()) {
+            return results;
+        }
+
+        List<RecordRow> leftRows = this.ToList();
+        if (leftRows.Count == 0) { return results; }
+
+        bool rightIsId = rightKeyCol == "id" || rightKeyCol == "Id";
+        bool rightHasIndex = rightTable.HasIndex(rightKeyCol);
+
+        if (rightIsId) {
+            // Index-Nested-Loop Join on Primary Key
+            for (int i = 0; i < leftRows.Count; i = i + 1) {
+                RecordRow left = leftRows[i];
+                string kStr = this.GetColStr(left, leftKeyCol);
+                int rId = Convert.ToInt32(kStr);
+                RecordRow right = rightTable.Get(rId);
+                if (right != null) {
+                    results.Add(new RecordJoinResult(left, right));
+                } else if (isLeftJoin) {
+                    results.Add(new RecordJoinResult(left, null));
+                }
+            }
+            return results;
+        }
+
+        if (rightHasIndex) {
+            // Index-Nested-Loop Join on Secondary Index
+            for (int i = 0; i < leftRows.Count; i = i + 1) {
+                RecordRow left = leftRows[i];
+                string kStr = this.GetColStr(left, leftKeyCol);
+                List<RecordRow> rightMatches = rightTable.FindByIndex(rightKeyCol, kStr);
+                if (rightMatches != null && rightMatches.Count > 0) {
+                    for (int j = 0; j < rightMatches.Count; j = j + 1) {
+                        results.Add(new RecordJoinResult(left, rightMatches[j]));
+                    }
+                } else if (isLeftJoin) {
+                    results.Add(new RecordJoinResult(left, null));
+                }
+            }
+            return results;
+        }
+
+        // Hash Join fallback: O(M + N)
+        Dictionary<string, List<RecordRow>> leftBuckets = new Dictionary<string, List<RecordRow>>();
+        Dictionary<int, bool> matchedLeftIds = new Dictionary<int, bool>();
+
+        for (int i = 0; i < leftRows.Count; i = i + 1) {
+            RecordRow left = leftRows[i];
+            string k = this.GetColStr(left, leftKeyCol);
+            if (!leftBuckets.ContainsKey(k)) {
+                leftBuckets[k] = new List<RecordRow>();
+            }
+            leftBuckets[k].Add(left);
+        }
+
+        rightTable.Scan((int rightId, RecordRow rightRow) => {
+            string rKey = this.GetColStr(rightRow, rightKeyCol);
+            if (leftBuckets.ContainsKey(rKey)) {
+                List<RecordRow> bucket = leftBuckets[rKey];
+                for (int b = 0; b < bucket.Count; b = b + 1) {
+                    results.Add(new RecordJoinResult(bucket[b], rightRow));
+                    if (isLeftJoin) {
+                        matchedLeftIds[bucket[b].id] = true;
+                    }
+                }
+            }
+            return true;
+        });
+
+        if (isLeftJoin) {
+            for (int i = 0; i < leftRows.Count; i = i + 1) {
+                RecordRow left = leftRows[i];
+                if (!matchedLeftIds.ContainsKey(left.id)) {
+                    results.Add(new RecordJoinResult(left, null));
+                }
+            }
+        }
+
+        return results;
+    }
+
+    public string GetColStr(RecordRow r, string colName) {
+        if (r == null || colName == null) { return ""; }
+        if (colName == "id" || colName == "Id") {
+            return Convert.ToString(r.id);
+        }
+        RecordColumn col = r.schema.FindColumn(colName);
+        if (col == null) { return ""; }
+        if (col.dataType == RecordDataType.Int32) { return Convert.ToString(r.GetInt32(colName)); }
+        if (col.dataType == RecordDataType.Int64) { return Convert.ToString(r.GetInt64(colName)); }
+        if (col.dataType == RecordDataType.Float32) { return Convert.ToString((double)r.GetFloat32(colName)); }
+        if (col.dataType == RecordDataType.Float64) { return Convert.ToString(r.GetFloat64(colName)); }
+        if (col.dataType == RecordDataType.Bool) { return r.GetBool(colName) ? "1" : "0"; }
+        if (col.dataType == RecordDataType.FixedStr) { return r.GetStr(colName); }
+        if (col.dataType == RecordDataType.VarStr) { return r.GetVarStr(colName); }
+        return "";
+    }
+
+    // ----------------------------------------------------
+    // 条件批量操作（Update / Delete）
+    // ----------------------------------------------------
+
+    public int Delete() {
+        List<RecordRow> rows = this.ToList();
+        if (rows.Count == 0) { return 0; }
+
+        bool localTx = !this.table.inTx;
+        if (localTx) {
+            this.table.BeginTransaction();
+        }
+        int affected = 0;
+        try {
+            for (int i = 0; i < rows.Count; i = i + 1) {
+                bool ok = this.table.Delete(rows[i].id);
+                if (ok) { affected = affected + 1; }
+            }
+            if (localTx) {
+                this.table.Commit();
+            }
+        } catch (Exception ex) {
+            if (localTx) {
+                this.table.Rollback();
+            }
+            throw ex;
+        }
+        return affected;
+    }
+
+    public int Update(RecordRowUpdater updater) {
+        if (updater == null) { return 0; }
+        List<RecordRow> rows = this.ToList();
+        if (rows.Count == 0) { return 0; }
+
+        bool localTx = !this.table.inTx;
+        if (localTx) {
+            this.table.BeginTransaction();
+        }
+        int affected = 0;
+        try {
+            for (int i = 0; i < rows.Count; i = i + 1) {
+                RecordRow r = rows[i];
+                updater(r);
+                bool ok = this.table.Update(r.id, r);
+                if (ok) { affected = affected + 1; }
+            }
+            if (localTx) {
+                this.table.Commit();
+            }
+        } catch (Exception ex) {
+            if (localTx) {
+                this.table.Rollback();
+            }
+            throw ex;
+        }
+        return affected;
+    }
+
+    // ----------------------------------------------------
+    // 索引计划与残余谓词识别
+    // ----------------------------------------------------
+
+    public bool HasResidual(ExprNode n) {
+        if (n == null) { return false; }
+        if (n.Kind == 4) { // Lambda
+            return this.HasResidual(n.A);
+        }
+        if (n.Kind == 2) { // Binary
+            if (n.Name == "==") {
+                if (n.A != null && n.A.Kind == 0 && n.B != null && n.B.Kind == 1) {
+                    return !this.table.HasIndex(n.A.Name);
+                }
+                if (n.B != null && n.B.Kind == 0 && n.A != null && n.A.Kind == 1) {
+                    return !this.table.HasIndex(n.B.Name);
+                }
+                return true;
+            }
+            if (n.Name == ">=" || n.Name == ">" || n.Name == "<=" || n.Name == "<") {
+                if (n.A != null && n.A.Kind == 0 && n.B != null && n.B.Kind == 1) {
+                    return !this.table.HasIndex(n.A.Name);
+                }
+                return true;
+            }
+            if (n.Name == "&&") {
+                return this.HasResidual(n.A) || this.HasResidual(n.B);
+            }
+            return true;
+        }
+        return true;
+    }
+
     public List<int> PlanCandidateIds() {
         if (this.expr == null) { return null; }
         return this.ExtractIndexIds(this.expr);
@@ -272,6 +649,12 @@ public class RecordQuery {
 
         if (n.Kind == 0) { // Member access
             string colName = n.Name;
+            if (colName == "id" || colName == "Id") {
+                numVal = (double)r.id;
+                isNum = true;
+                strVal = Convert.ToString(r.id);
+                return;
+            }
             RecordColumn col = this.table.Schema().FindColumn(colName);
             if (col == null) { return; }
 

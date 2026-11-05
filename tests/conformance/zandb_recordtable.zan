@@ -33,6 +33,10 @@ class ZanDbRecordTableTest {
         if (File.Exists(basePath + ".emp.zblob")) { File.Delete(basePath + ".emp.zblob"); }
         if (File.Exists(basePath + ".emp.zidx")) { File.Delete(basePath + ".emp.zidx"); }
         if (File.Exists(basePath + ".emp.zwal")) { File.Delete(basePath + ".emp.zwal"); }
+        if (File.Exists(basePath + ".departments.ztab")) { File.Delete(basePath + ".departments.ztab"); }
+        if (File.Exists(basePath + ".departments.zblob")) { File.Delete(basePath + ".departments.zblob"); }
+        if (File.Exists(basePath + ".departments.zidx")) { File.Delete(basePath + ".departments.zidx"); }
+        if (File.Exists(basePath + ".departments.zwal")) { File.Delete(basePath + ".departments.zwal"); }
         if (File.Exists(basePath + ".emp.ztab.vac")) { File.Delete(basePath + ".emp.ztab.vac"); }
         if (File.Exists(basePath + ".emp.ztab.vac.emp.ztab")) { File.Delete(basePath + ".emp.ztab.vac.emp.ztab"); }
         if (File.Exists(basePath + ".emp.ztab.vac.emp.zblob")) { File.Delete(basePath + ".emp.ztab.vac.emp.zblob"); }
@@ -292,6 +296,92 @@ class ZanDbRecordTableTest {
             }
         }
         Ok(sortedDesc, "results are strictly sorted in descending order of salary");
+
+        // 14. 纯索引覆盖 Count 与两段式延迟分页 (Two-Phase Pagination)
+        int techCount = rtTx.Where((ExprNode x) => x.dept == "tech").Count();
+        Ok(techCount == 11, "pure-index Count returns exact 11 without full row load");
+
+        List<RecordRow> pagedTech = rtTx.Where((ExprNode x) => x.dept == "tech").Skip(2).Take(3).ToList();
+        Ok(pagedTech.Count == 3, "two-phase pagination Skip 2 Take 3 returns exactly 3 rows");
+        bool pagedValid = true;
+        for (int i = 0; i < pagedTech.Count; i = i + 1) {
+            if (pagedTech[i].GetStr("dept") != "tech") { pagedValid = false; }
+        }
+        Ok(pagedValid, "paged rows strictly match dept == 'tech'");
+
+        // 15. 流式标量聚合引擎 (SumInt, Avg, Min, Max)
+        int techAgeSum = rtTx.Where((ExprNode x) => x.dept == "tech").SumInt("age");
+        Ok(techAgeSum > 200, "SumInt age for tech department > 200");
+
+        double techAvgSalary = rtTx.Where((ExprNode x) => x.dept == "tech").Avg("salary");
+        Ok(techAvgSalary > 5000.0, "Avg salary for tech department > 5000.0");
+
+        double techMinSalary = rtTx.Where((ExprNode x) => x.dept == "tech").Min("salary");
+        double techMaxSalary = rtTx.Where((ExprNode x) => x.dept == "tech").Max("salary");
+        Ok(techMinSalary > 0.0, "Min salary > 0.0");
+        Ok(techMinSalary <= techMaxSalary, "Min salary <= Max salary");
+
+        // 16. 自适应多表关联 (Join 与 LeftJoin)
+        string deptDbPath = "_scratch/test_rt_depts";
+        Clean(deptDbPath);
+        RecordSchema deptSchema = new RecordSchema();
+        deptSchema.AddFixedStr("code", 16);
+        deptSchema.AddFixedStr("name", 64);
+        deptSchema.AddFloat64("budget");
+
+        RecordTable deptTable = RecordTable.Open(deptDbPath, "departments", deptSchema);
+        deptTable.EnsureIndex("code");
+
+        RecordRow d1 = new RecordRow(deptSchema);
+        d1.SetStr("code", "tech");
+        d1.SetStr("name", "Technology Dept");
+        d1.SetFloat64("budget", 500000.0);
+        deptTable.Add(d1);
+
+        RecordRow d2 = new RecordRow(deptSchema);
+        d2.SetStr("code", "finance");
+        d2.SetStr("name", "Finance Dept");
+        d2.SetFloat64("budget", 300000.0);
+        deptTable.Add(d2);
+
+        // 执行 Inner Join
+        List<RecordJoinResult> joinRes = rtTx.Where((ExprNode x) => x.dept == "tech").Join(deptTable, "dept", "code");
+        Ok(joinRes.Count == 11, "Join matched exactly 11 employees with Technology Dept");
+        bool joinValid = true;
+        for (int i = 0; i < joinRes.Count; i = i + 1) {
+            if (joinRes[i].left.GetStr("dept") != "tech" || joinRes[i].right.GetStr("name") != "Technology Dept") {
+                joinValid = false;
+            }
+        }
+        Ok(joinValid, "Join results strictly hold both employee and department fields");
+
+        // 执行 Left Join (包含无匹配右表的行)
+        RecordRow hrEmp = new RecordRow(schema);
+        hrEmp.SetStr("name", "Eve");
+        hrEmp.SetStr("dept", "hr");
+        hrEmp.SetInt32("age", 28);
+        hrEmp.SetFloat64("salary", 6500.0);
+        int hrId = rtTx.Add(hrEmp);
+
+        List<RecordJoinResult> leftJoinRes = rtTx.Where((ExprNode x) => x.name == "Eve").LeftJoin(deptTable, "dept", "code");
+        Ok(leftJoinRes.Count == 1, "LeftJoin returns 1 row for Eve");
+        Ok(!leftJoinRes[0].HasRight(), "Eve has no matching department and right is null");
+
+        // 17. 事务级条件批量更新与批量删除
+        int updatedCount = rtTx.Where((ExprNode x) => x.dept == "tech").Update((RecordRow r) => {
+            r.SetInt32("age", 88);
+        });
+        Ok(updatedCount == 11, "batch Update affected 11 tech employees");
+        double newMinAge = rtTx.Where((ExprNode x) => x.dept == "tech").Min("age");
+        Ok(Math.Abs(newMinAge - 88.0) < 1e-6, "batch Update reflected: min age is now 88");
+
+        int deletedCount = rtTx.Where((ExprNode x) => x.age == 88).Delete();
+        Ok(deletedCount == 11, "batch Delete removed 11 tech employees");
+        int countAfterDelete = rtTx.Where((ExprNode x) => x.dept == "tech").Count();
+        Ok(countAfterDelete == 0, "tech employees count is now 0 after batch Delete");
+
+        deptTable.Close();
+        Clean(deptDbPath);
 
         rtTx.Close();
 

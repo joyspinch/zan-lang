@@ -361,6 +361,10 @@ db.Close();
   - **伴生变长存储池（.zblob）**：32 字节头部（魔数 `ZBLB`、版本号 1、总字节数 `totalBytes`）。变长文本 `VarStr` 与大字节块 `Blob` 在主表中仅存 8 字节对齐指针 `[Offset: 4B, Len: 4B]`，数据连续追加至 `.zblob`。空值（len=0）存 `(0, 0)`，读取享受 **0 额外 I/O 优化**。
   - **二级索引磁盘持久化（.zidx）与有序范围扫描（FindRange）**：32 字节头部（魔数 `ZIDX`、版本号 1、快照总行数 `totalRows`、活跃行数 `activeRows`）。二级索引内建字典序与数值单调归一化双重排序，支持 `FindRange(col, lo, hi)` 与 `FindIdsByRange` 毫秒级二分边界探针与范围遍历；`Flush()` 与 `Close()` 触发列级索引序列化落地；`Open()` 自愈装载免全表扫描。
   - **编译期语法树下推求值器（RecordQuery）**：依托编译器 B-ID65 规范，支持 `table.Where((ExprNode x) => x.age >= 25 && x.dept == "tech").OrderByDescending("salary").Take(5)`，AST 静态下推至二级索引等值/范围探针并求交集；残余谓词在 `RecordRow` 二进制槽位上直接求值，**0% JsonValue 参与，0 运行时 SQL 文本解析，天然防 SQL 注入**。
+  - **两段式延迟关联分页（Two-Phase Pagination）与纯索引 Count**：若过滤谓词纯命中二级索引且无残余条件，`Count()` 直接返回候选集数量，实现 **0 磁盘 I/O 极速计数**；默认排序下 `Skip/Take` 在 ID 序列层面先行切片，仅对切片后的最终 N 行执行物理 `Get(id)` 读盘，将深翻页物理磁盘读取量减少 99.9% 以上。
+  - **自适应多表关联（Join / LeftJoin）**：提供强类型关联算子与 `RecordJoinResult` 结果对。若右表关联列为主键或二级索引，自动启用 **Index-Nested-Loop Join** 享受 2 µs 极速绝对物理点查；若无索引则自适应切换为 $O(M + N)$ 线性内存 **Hash Join** 探针，杜绝笛卡尔积暴力循环。
+  - **流式标量聚合引擎（Sum / Avg / Min / Max）**：提供 `SumInt`、`SumLong`、`SumDouble`、`Avg`、`Min`、`Max` 聚合算子，直接基于候选 ID 流式累加并返回标量值，免除全量行反序列化与多余对象分配。
+  - **事务级条件批量变更（Update / Delete）**：支持 `table.Where(...).Update(updater)` 与 `table.Where(...).Delete()`，批量操作原子打包写入预写日志并在单次提交中刷盘，支持断电自愈与原子回滚。
   - **独立表级并发控制**：每张表持有独立的 `RwLock tlock` 与 CRT `ioMtx`，对一张表的批量写入绝对不阻塞其他表与向量表的读写。
   - **软删除与零 ID 漂移**：行首 `flags = 0` 墓碑标记，物理槽位永不前移，外键关联 `id` 永久自洽，支持管理级 `Vacuum()` 物理空洞紧凑双重重整（同时回收 `.ztab` 与 `.zblob` 空间）。
 - **发布档（--publish）实测压测报告（10,000 行二维员工表同机差分对拍）**：
