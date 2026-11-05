@@ -1,0 +1,99 @@
+using System;
+using System.Data.ZanDb;
+using System.Json;
+using System.IO;
+
+// 刀12 自动归并用例：开 SetAutoMerge 后批量固化段数被钳在阈值内且
+// 数据零丢失；关闭时段数线性增长，MergeSomeSegments 手动收敛为单
+// 段后数据仍完整。输出确定性，与 .out 比对。
+class ZanDbAutoMergeTest {
+    static int checks = 0;
+
+    static void Ok(bool cond, string what) {
+        checks = checks + 1;
+        if (cond) {
+            Console.WriteLine("ok " + Convert.ToString(checks) + " - " + what);
+        } else {
+            Console.WriteLine("FAIL " + Convert.ToString(checks) + " - " + what);
+        }
+    }
+
+    static void Clean(string basePath) {
+        File.Delete(basePath);
+        File.Delete(basePath + ".m0");
+        File.Delete(basePath + ".m1");
+        for (int i = 0; i < 40; i = i + 1) {
+            File.Delete(basePath + ".s" + Convert.ToString(i));
+        }
+    }
+
+    static JsonValue Doc(int i) {
+        JsonValue doc = JsonValue.NewObject();
+        doc.Put("name", JsonValue.NewStr("doc" + Convert.ToString(i)));
+        doc.Put("val", JsonValue.NewDouble((double)i));
+        return doc;
+    }
+
+    static void Main() {
+        string pathA = "_scratch/zandb_automerge_a_tmp.zdb";
+        string pathB = "_scratch/zandb_automerge_b_tmp.zdb";
+        Directory.CreateDirectory("_scratch");
+        Clean(pathA);
+        Clean(pathB);
+
+        // 1) 自动归并开：每批 40 篇后固化，共 10 批；段数达 4 即
+        //    归并最老 4 段，段数全程被钳住，数据零丢失。
+        ZanDatabase dbA = ZanDatabase.Open(pathA, ZanStore.DUR_NONE);
+        dbA.SetAutoMerge(5, 4);
+        Collection docsA = dbA.GetCollection("docs");
+        long wantSum = 0;
+        for (int b = 0; b < 10; b = b + 1) {
+            for (int i = 1; i <= 40; i = i + 1) {
+                int id = (b * 40 + i);
+                docsA.Insert(Doc(id));
+                wantSum = wantSum + id;
+            }
+            dbA.Flush();
+        }
+        int segsA = dbA.SegCount();
+        Ok(segsA <= 5, "auto merge clamps segment count");
+        Ok(docsA.Count() == 400, "auto merge loses no docs");
+        long sum = docsA.SumField("val");
+        Ok(sum == wantSum, "aggregate intact across auto merged segments");
+        JsonValue probe = docsA.FindById(400);
+        JsonValue pname = probe != null ? probe.Get("name") : null;
+        Ok(pname != null && pname.AsString("") == "doc400", "last doc readable after auto merge");
+        dbA.Close();
+
+        // 2) 自动归并关（默认）：同样负载段数线性增长；再手动
+        //    MergeSomeSegments 收敛为单段，数据仍完整。
+        ZanDatabase dbB = ZanDatabase.Open(pathB, ZanStore.DUR_NONE);
+        Collection docsB = dbB.GetCollection("docs");
+        for (int b = 0; b < 6; b = b + 1) {
+            for (int i = 1; i <= 40; i = i + 1) {
+                docsB.Insert(Doc(b * 40 + i));
+            }
+            dbB.Flush();
+        }
+        int segsB = dbB.SegCount();
+        Ok(segsB == 6, "no auto merge by default keeps every segment");
+        Ok(docsB.Count() == 240, "plain flushes lose no docs");
+        int merged = 0;
+        while (true) {
+            int n = dbB.MergeSomeSegments(3);
+            if (n == 0) { break; }
+            merged = merged + n;
+        }
+        Ok(dbB.SegCount() == 1, "manual merge converges to single segment");
+        Ok(merged >= 6, "every segment passed through merge");
+        Ok(docsB.Count() == 240, "docs intact after manual merge");
+        JsonValue probeB = docsB.FindById(240);
+        JsonValue pval = probeB != null ? probeB.Get("val") : null;
+        Ok(pval != null && pval.AsDouble(0) == 240.0, "value field intact after merge");
+
+        dbB.Close();
+        Clean(pathA);
+        Clean(pathB);
+        Console.WriteLine("done " + Convert.ToString(checks));
+    }
+}

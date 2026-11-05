@@ -1,0 +1,69 @@
+using System;
+using System.Threading;
+
+// 刀12 线程阻塞型 RwLock 用例：写互斥（无锁必丢更新的共享递增收敛到
+// 精确值）、读快照一致（写侧只做 +2，读者看到的值恒为偶数）。输出确
+// 定性，与 .out 比对。锁与计数器用局部变量，退出前 Close，不触泄漏。
+class RwLockConcTest {
+    static int checks = 0;
+
+    static void Ok(bool cond, string what) {
+        checks = checks + 1;
+        if (cond) {
+            Console.WriteLine("ok " + Convert.ToString(checks) + " - " + what);
+        } else {
+            Console.WriteLine("FAIL " + Convert.ToString(checks) + " - " + what);
+        }
+    }
+
+    static void Main() {
+        RwLock lk = new RwLock();
+        int[] shared = new int[1];
+
+        // 1) 写互斥：4 线程各 500 次 EnterWrite 递增（读改写非原子，
+        //    全靠写锁串行），终值必须精确等于 2000。
+        AtomicInt writersDone = new AtomicInt(0);
+        for (int w = 0; w < 4; w = w + 1) {
+            Thread.Start(delegate() {
+                for (int i = 0; i < 500; i = i + 1) {
+                    lk.EnterWrite();
+                    shared[0] = shared[0] + 1;
+                    lk.ExitWrite();
+                }
+                writersDone.Increment();
+            });
+        }
+        while (writersDone.Load() < 4) { Thread.Sleep(5); }
+        Ok(shared[0] == 2000, "write mutual exclusion converges exactly");
+
+        // 2) 读快照一致：单写者只做 +2（值恒偶），3 读者在 EnterRead
+        //    下校验偶数性直到写者收工；任何撕裂读都会记为坏快照。
+        shared[0] = 0;
+        AtomicInt writerDone = new AtomicInt(0);
+        AtomicInt badSnapshots = new AtomicInt(0);
+        Thread.Start(delegate() {
+            for (int i = 0; i < 2000; i = i + 1) {
+                    lk.EnterWrite();
+                    shared[0] = shared[0] + 2;
+                    lk.ExitWrite();
+            }
+            writerDone.Increment();
+        });
+        for (int r = 0; r < 3; r = r + 1) {
+            Thread.Start(delegate() {
+                while (writerDone.Load() == 0) {
+                    lk.EnterRead();
+                    if (shared[0] % 2 != 0) { badSnapshots.Increment(); }
+                    lk.ExitRead();
+                    Thread.Sleep(1);
+                }
+            });
+        }
+        while (writerDone.Load() == 0) { Thread.Sleep(5); }
+        Ok(badSnapshots.Load() == 0, "readers never observe torn snapshots");
+        Ok(shared[0] == 4000, "writer converges exactly under concurrent readers");
+
+        lk.Close();
+        Console.WriteLine("done " + Convert.ToString(checks));
+    }
+}

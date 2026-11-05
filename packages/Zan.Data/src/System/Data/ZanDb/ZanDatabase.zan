@@ -4,8 +4,13 @@ using System.Threading;
 namespace System.Data.ZanDb;
 
 public class ZanDatabase : IDisposable {
+    // 并发模型：rw 是协程闸（配 await），tlock 是线程读写锁（读共享/
+    // 写排他、写优先）。集合与检索门面都在 tlock 下运行；Begin/Commit/
+    // Rollback/InTransaction/GetRevision/CacheVersion/SetSyncEvery/Close
+    // 直通 kv 原语不受锁保护——调用方自行串行（手工事务纪律不变）。
     public ZanStore kv;
     public AsyncRwLock rw;
+    public RwLock tlock;
     public List<CollectionEntry> entries;
     public string lastError;
 
@@ -30,6 +35,7 @@ public class ZanDatabase : IDisposable {
         d.kv = ZanStore.Open(path, durability);
         if (!d.kv.IsOpen()) { d.lastError = d.kv.GetError(); }
         d.rw = new AsyncRwLock();
+        d.tlock = new RwLock();
         return d;
     }
 
@@ -46,10 +52,18 @@ public class ZanDatabase : IDisposable {
 
     // 返回指定名称的文档集合（惰性创建）。
     public Collection GetCollection(string name) {
+        this.tlock.EnterWrite();
+        try {
+        return GetCollectionLocked(name);
+        } finally { this.tlock.ExitWrite(); }
+    }
+
+    // 刀12：GetCollection 的持锁实现（公开壳持有整库线程读写锁；内部互调走本变体）。
+    public Collection GetCollectionLocked(string name) {
         for (int i = 0; i < this.entries.Count; i = i + 1) {
             if (this.entries[i].name == name) { return this.entries[i].collection; }
         }
-        Collection c = Collection.Attach(this.kv, this.rw, name);
+        Collection c = Collection.Attach(this.kv, this.rw, this.tlock, name);
         this.entries.Add(new CollectionEntry(name, c));
         return c;
     }
@@ -60,11 +74,14 @@ public class ZanDatabase : IDisposable {
     // 全库巡检：内核段 CRC/WAL/清单双槽 + 已加载集合的快照代
     // 审计。只读不修复；返回问题清单，空 = 健康。
     public List<string> IntegrityCheck() {
+        this.tlock.EnterRead();
+        try {
         List<string> problems = this.kv.IntegrityCheck();
         for (int i = 0; i < this.entries.Count; i = i + 1) {
             this.entries[i].collection.search.AuditSnapshots(problems);
         }
         return problems;
+        } finally { this.tlock.ExitRead(); }
     }
 
     // 将后续写入批量合并为一次原子提交。
@@ -81,32 +98,67 @@ public class ZanDatabase : IDisposable {
     public long CacheVersion() { return this.kv.CacheVersion(); }
 
     // 将迄今写入的内容强制落盘到稳定存储。
-    public void Checkpoint() { this.kv.Checkpoint(); }
+    public void Checkpoint() {
+        this.tlock.EnterWrite();
+        try {
+        this.kv.Checkpoint();
+        } finally { this.tlock.ExitWrite(); }
+    }
 
     // 把 memtable 中尚未固化的写入立即固化为新段
     // （不归并）：归并/维护与「稳态查询」前置步骤——memtable
     // 空了聚合与计数才走块级内核，否则退化为归并扫描。见
-    public void Flush() { this.kv.FlushToSegment(); }
+    public void Flush() {
+        this.tlock.EnterWrite();
+        try {
+        this.kv.FlushToSegment();
+        } finally { this.tlock.ExitWrite(); }
+    }
 
     // 把全部已固化段归并为一个段：掉落被新版压住的
     // 旧版本与已无意义的墓碑，回收存储空间。见
-    public void MergeSegments() { this.kv.MergeSegments(); }
+    public void MergeSegments() {
+        this.tlock.EnterWrite();
+        try {
+        this.kv.MergeSegments();
+        } finally { this.tlock.ExitWrite(); }
+    }
 
     // 当前已固化段数（观测/运维用）。
-    public int SegCount() { return this.kv.SegCount(); }
+    public int SegCount() {
+        this.tlock.EnterRead();
+        try { return this.kv.SegCount(); }
+        finally { this.tlock.ExitRead(); }
+    }
 
     // 增量归并：把最老 maxMerge（≥2）个段归并为一个，
     // 写阻塞被归并集规模封顶，反复调用收敛为单段。返回实际归并
     // 的段数（0 = 段不足 2 或在事务中）。见
-    public int MergeSomeSegments(int maxMerge) { return this.kv.MergeSomeSegments(maxMerge); }
+    public int MergeSomeSegments(int maxMerge) {
+        this.tlock.EnterWrite();
+        try { return this.kv.MergeSomeSegments(maxMerge); }
+        finally { this.tlock.ExitWrite(); }
+    }
 
     // 开启自动增量归并：固化新段后段数达 atSegs 就归并
     // 最老 mergeK 段（0 = 关闭，默认）。见
-    public void SetAutoMerge(int atSegs, int mergeK) { this.kv.SetAutoMerge(atSegs, mergeK); }
+    public void SetAutoMerge(int atSegs, int mergeK) {
+        this.tlock.EnterWrite();
+        try { this.kv.SetAutoMerge(atSegs, mergeK); }
+        finally { this.tlock.ExitWrite(); }
+    }
 
     // 热备份 / 一致快照导出（SQLite backup API 对位）：
     // 锁内原子截取底层 KV 存储与检索检查点，导出到目标路径并执行全库巡检审计。
     public void Backup(string targetPath) {
+        this.tlock.EnterWrite();
+        try {
+        BackupLocked(targetPath);
+        } finally { this.tlock.ExitWrite(); }
+    }
+
+    // 刀12：Backup 的持锁实现（公开壳持有整库线程读写锁；内部互调走本变体）。
+    public void BackupLocked(string targetPath) {
         if (!this.IsOpen()) {
             throw new InvalidOperationException("cannot backup closed database: " + this.GetError());
         }
@@ -139,9 +191,11 @@ public class ZanDatabase : IDisposable {
     // 协程异步热备份（排他写锁保护）
     public async void BackupAsync(string targetPath) {
         await this.rw.EnterWrite();
+        this.tlock.EnterWrite();
         try {
-            this.Backup(targetPath);
+            this.BackupLocked(targetPath);
         } finally {
+            this.tlock.ExitWrite();
             this.rw.ExitWrite();
         }
     }
@@ -150,6 +204,7 @@ public class ZanDatabase : IDisposable {
     public void Close() {
         this.kv.Close();
         this.rw.Close();
+        this.tlock.Close();
     }
 
     public void Dispose() {

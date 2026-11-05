@@ -1,0 +1,210 @@
+using System;
+using System.Data.ZanDb;
+using System.Json;
+using System.IO;
+using System.Threading;
+
+// 刀12 ZanDB 线程级并发读写用例：多写线程并发插入不丢文档（计数精确
+// 收敛）、读者在写并发下只见完好文档、向量检索与写入并发不崩、更新/
+// 删除竞态后结构精确、GetCollection 并发登记归一。输出确定性，与
+// .out 比对。同步 API 在整库线程读写锁下运行；协程 API（Async 后缀）
+// 不在原始线程上使用。
+class ZanDbConcurrentTest {
+    static int checks = 0;
+
+    static void Ok(bool cond, string what) {
+        checks = checks + 1;
+        if (cond) {
+            Console.WriteLine("ok " + Convert.ToString(checks) + " - " + what);
+        } else {
+            Console.WriteLine("FAIL " + Convert.ToString(checks) + " - " + what);
+        }
+    }
+
+    static void Clean(string basePath) {
+        File.Delete(basePath);
+        File.Delete(basePath + ".m0");
+        File.Delete(basePath + ".m1");
+        for (int i = 0; i < 40; i = i + 1) {
+            File.Delete(basePath + ".s" + Convert.ToString(i));
+        }
+    }
+
+    static double VecAt(int i, int j) {
+        double v = ((i * 7 + j * 13) % 200) / 100.0 - 1.0;
+        return (double)(float)(v + 0.25);
+    }
+
+    static JsonValue SeedDoc(int i, int dims) {
+        JsonValue doc = JsonValue.NewObject();
+        doc.Put("name", JsonValue.NewStr("seed" + Convert.ToString(i)));
+        doc.Put("val", JsonValue.NewDouble((double)i));
+        JsonValue arr = JsonValue.NewArray();
+        for (int j = 0; j < dims; j = j + 1) { arr.Append(JsonValue.NewDouble(VecAt(i, j))); }
+        doc.Put("embedding", arr);
+        return doc;
+    }
+
+    static float[] TypedVec(int i, int dims) {
+        float[] v = new float[dims];
+        for (int j = 0; j < dims; j = j + 1) { v[j] = (float)VecAt(i, j); }
+        return v;
+    }
+
+    static void Main() {
+        string path = "_scratch/zandb_concurrent_tmp.zdb";
+        Directory.CreateDirectory("_scratch");
+        Clean(path);
+        int dims = 40;
+
+        ZanDatabase db = ZanDatabase.Open(path, ZanStore.DUR_NONE);
+        Collection docs = db.GetCollection("docs");
+        for (int i = 1; i <= 50; i = i + 1) { docs.Insert(SeedDoc(i, dims)); }
+
+        // 1) 并发写不丢文档：4 写线程各插 200 篇（id 序列分配完全
+        //    串行化），读者全程校验种子文档完好；收工后计数精确。
+        AtomicInt writersDone = new AtomicInt(0);
+        AtomicInt badReads = new AtomicInt(0);
+        AtomicInt readRounds = new AtomicInt(0);
+        for (int w = 0; w < 4; w = w + 1) {
+            int lo = w * 1000;
+            Thread.Start(delegate() {
+                for (int n = 0; n < 200; n = n + 1) {
+                    JsonValue doc = JsonValue.NewObject();
+                    doc.Put("name", JsonValue.NewStr("w" + Convert.ToString(lo + n)));
+                    doc.Put("val", JsonValue.NewDouble(1.0));
+                    docs.Insert(doc);
+                }
+                writersDone.Increment();
+            });
+        }
+        for (int r = 0; r < 3; r = r + 1) {
+            Thread.Start(delegate() {
+                while (writersDone.Load() < 4) {
+                    for (int i = 1; i <= 50; i = i + 8) {
+                        JsonValue d = docs.FindById(i);
+                        JsonValue dn = d != null ? d.Get("name") : null;
+                        if (dn == null || dn.AsString("") != "seed" + Convert.ToString(i)) {
+                            badReads.Increment();
+                        }
+                    }
+                    if (docs.Count() < 50) { badReads.Increment(); }
+                    readRounds.Increment();
+                    Thread.Sleep(1);
+                }
+            });
+        }
+        while (writersDone.Load() < 4) { Thread.Sleep(5); }
+        while (readRounds.Load() == 0) { Thread.Sleep(5); }
+        Ok(badReads.Load() == 0, "readers only observe intact docs during writes");
+        Ok(docs.Count() == 850, "concurrent inserts converge exactly to 850");
+        JsonValue wprobe = docs.FindAll().Count > 0 ? docs.FindById(docs.Count()) : null;
+        JsonValue wname = wprobe != null ? wprobe.Get("name") : null;
+        bool wprobeOk = wname != null && wname.AsString("").Length > 0;
+        Ok(wprobeOk, "last doc resolvable after concurrent inserts");
+        int seedHits = docs.FindIdsByField("name", "seed13").Count;
+        Ok(seedHits == 1, "secondary index unique hit after insert storm");
+
+        // 2) 检索与写并发：建量化向量索引后，写线程继续插带向量
+        //    文档，两读者持续近似检索；每次命中数恒为 k。
+        VectorIndexOptions options = new VectorIndexOptions(dims);
+        options.quantize = true;
+        docs.EnsureVectorIndex("embedding", options);
+        float[] probe = TypedVec(3, dims);
+        List<VectorHit> pre = docs.SearchVector("embedding", probe, 3, 64);
+        Ok(pre.Count == 3, "vector search ready before concurrent phase");
+        AtomicInt vecWriterDone = new AtomicInt(0);
+        AtomicInt badSearch = new AtomicInt(0);
+        Thread.Start(delegate() {
+            for (int n = 0; n < 100; n = n + 1) {
+                JsonValue doc = JsonValue.NewObject();
+                doc.Put("name", JsonValue.NewStr("vw" + Convert.ToString(n)));
+                JsonValue arr = JsonValue.NewArray();
+                for (int j = 0; j < dims; j = j + 1) { arr.Append(JsonValue.NewDouble(VecAt(60 + n, j))); }
+                doc.Put("embedding", arr);
+                docs.Insert(doc);
+            }
+            vecWriterDone.Increment();
+        });
+        AtomicInt vecReaderRounds = new AtomicInt(0);
+        for (int r = 0; r < 2; r = r + 1) {
+            Thread.Start(delegate() {
+                while (vecWriterDone.Load() == 0) {
+                    List<VectorHit> hits = docs.SearchVector("embedding", probe, 3, 64);
+                    if (hits.Count != 3) { badSearch.Increment(); }
+                    vecReaderRounds.Increment();
+                    Thread.Sleep(1);
+                }
+            });
+        }
+        while (vecWriterDone.Load() == 0) { Thread.Sleep(5); }
+        while (vecReaderRounds.Load() == 0) { Thread.Sleep(5); }
+        Ok(badSearch.Load() == 0, "vector search stays consistent under concurrent writes");
+        Ok(docs.Count() == 950, "vector writer docs all landed");
+        List<VectorHit> post = docs.SearchVectorRescore("embedding", probe, 3, 64);
+        Ok(post.Count == 3, "rescore works after concurrent inserts");
+
+        // 3) 更新/删除竞态：更新者改写 1..24 并删除 25..50，读者
+        //    全程允许"不存在或完好"两种形态；收工后状态精确。
+        AtomicInt updDone = new AtomicInt(0);
+        AtomicInt badUpdReads = new AtomicInt(0);
+        Thread.Start(delegate() {
+            for (int i = 1; i <= 24; i = i + 1) {
+                JsonValue doc = JsonValue.NewObject();
+                doc.Put("name", JsonValue.NewStr("u" + Convert.ToString(i)));
+                doc.Put("val", JsonValue.NewDouble((double)(i * 2)));
+                docs.Update(i, doc);
+            }
+            for (int i = 25; i <= 50; i = i + 1) {
+                docs.DeleteById(i);
+            }
+            updDone.Increment();
+        });
+        AtomicInt updRounds = new AtomicInt(0);
+        for (int r = 0; r < 2; r = r + 1) {
+            Thread.Start(delegate() {
+                while (updDone.Load() == 0) {
+                    JsonValue d = docs.FindById(1 + (int)(readRounds.Load() % 50));
+                    JsonValue dn = d != null ? d.Get("name") : null;
+                    if (d != null && (dn == null || dn.AsString("") == "")) { badUpdReads.Increment(); }
+                    updRounds.Increment();
+                    Thread.Sleep(1);
+                }
+            });
+        }
+        while (updDone.Load() == 0) { Thread.Sleep(5); }
+        while (updRounds.Load() == 0) { Thread.Sleep(5); }
+        Ok(badUpdReads.Load() == 0, "no torn docs observed during update/delete race");
+        bool finalState = docs.Count() == 950 - 26;
+        for (int i = 1; i <= 24; i = i + 1) {
+            JsonValue d = docs.FindById(i);
+            JsonValue dn = d != null ? d.Get("name") : null;
+            if (dn == null || dn.AsString("") != "u" + Convert.ToString(i)) { finalState = false; }
+        }
+        for (int i = 25; i <= 50; i = i + 1) {
+            if (docs.FindById(i) != null) { finalState = false; }
+        }
+        Ok(finalState, "update/delete race converges to exact state");
+
+        // 4) 门面并发：多线程同时 GetCollection（同名单例归一 +
+        //    新名登记），End IntegrityCheck 全绿。
+        AtomicInt gcDone = new AtomicInt(0);
+        for (int g = 0; g < 4; g = g + 1) {
+            Thread.Start(delegate() {
+                Collection a = db.GetCollection("docs");
+                Collection b = db.GetCollection("other");
+                if (a == null || b == null) { badReads.Increment(); }
+                gcDone.Increment();
+            });
+        }
+        while (gcDone.Load() < 4) { Thread.Sleep(5); }
+        Ok(db.GetCollection("docs") == docs, "same-name GetCollection returns one instance");
+        Ok(db.GetCollection("other") != null, "new-name collection registered");
+        List<string> problems = db.IntegrityCheck();
+        Ok(problems.Count == 0, "integrity check green after concurrent phases");
+
+        db.Close();
+        Clean(path);
+        Console.WriteLine("done " + Convert.ToString(checks));
+    }
+}

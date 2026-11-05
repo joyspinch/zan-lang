@@ -27,6 +27,11 @@ public class Collection {
     public List<int> docCacheOrder;
     public int docCacheCapacity;
     public CollectionSearch search;
+    // 刀12 线程级并发：整库共享的线程阻塞读写锁（ZanDatabase 持有并下发），
+    // 公开门面读走 EnterRead、写走 EnterWrite；协程 Async 包装在 rw 之上同序套用。
+    // cacheMtx 只护文档缓存与惰性元数据装载的短临界区。
+    public RwLock tlock;
+    public nint cacheMtx;
 
     // 批量索引构建中每个事务索引的文档数。
     public static int INDEX_BATCH = 500;
@@ -49,10 +54,12 @@ public class Collection {
         this.docCache = new Dict<int, JsonValue>();
         this.docCacheOrder = new List<int>();
         this.docCacheCapacity = 256;
+        this.tlock = new RwLock();
+        this.cacheMtx = Mutex.Create();
     }
 
     // 绑定到底层 ZanStore 的一个命名空间，并加载索引列表与字段名字典。
-    public static Collection Attach(ZanStore kv, AsyncRwLock rw, string name) {
+    public static Collection Attach(ZanStore kv, AsyncRwLock rw, RwLock tlock, string name) {
         Collection c = new Collection();
         c.kv = kv;
         c.rw = rw;
@@ -60,6 +67,8 @@ public class Collection {
         c.docCache = new Dict<int, JsonValue>();
         c.docCacheOrder = new List<int>();
         c.docCacheCapacity = 256;
+        c.tlock.Close();
+        c.tlock = tlock;
         c.LoadIndexMeta();
         c.LoadKeyDict();
         c.metaVersion = kv.CacheVersion();
@@ -1084,6 +1093,8 @@ public class Collection {
     // 文本数值才解析）；visit 返回 false 提前结束。返回 visit
     // 被调用的次数。
     public int ScanNumField(string field, NumVisit visit) {
+        this.tlock.EnterRead();
+        try {
         SyncMeta();
         int kid = KeyIdOf(field);
         if (kid == 0) { return 0; }
@@ -1098,12 +1109,15 @@ public class Collection {
             return true;
         });
         return n;
+        } finally { this.tlock.ExitRead(); }
     }
 
     // 文本字段投影扫描：每条含 field 的文档以 (id, 文本)
     // 调用一次 visit，只物化该字段的字符串（不建 JsonValue 包装）；
     // visit 返回 false 提前结束。返回 visit 被调用的次数。
     public int ScanStrField(string field, StrVisit visit) {
+        this.tlock.EnterRead();
+        try {
         SyncMeta();
         int kid = KeyIdOf(field);
         if (kid == 0) { return 0; }
@@ -1118,6 +1132,7 @@ public class Collection {
             return true;
         });
         return n;
+        } finally { this.tlock.ExitRead(); }
     }
 
     // 数值字段的全文求和：单段稳态走块级聚合内核
@@ -1127,6 +1142,8 @@ public class Collection {
     // 标签直接还原累加，非数值型文档跳过。字段不存在或全非
     // 数值时返回 0。
     public long SumField(string field) {
+        this.tlock.EnterRead();
+        try {
         SyncMeta();
         int kid = KeyIdOf(field);
         long sum = 0;
@@ -1166,6 +1183,7 @@ public class Collection {
             return true;
         });
         return sum;
+        } finally { this.tlock.ExitRead(); }
     }
 
     // 字段值的分组计数（GROUP BY field 的 COUNT）：
@@ -1174,11 +1192,19 @@ public class Collection {
     // 字段的条目键序 = （值, id）序，值相同的条目天然连片——扫
     // 索引前缀范围、按值切段计数即可。
     public Dictionary<string, int> CountGroups(string field) {
+        this.tlock.EnterRead();
+        try {
+        return CountGroupsLocked(field);
+        } finally { this.tlock.ExitRead(); }
+    }
+
+    // 刀12：CountGroups 的持锁实现（公开壳持有整库线程读写锁；内部互调走本变体）。
+    public Dictionary<string, int> CountGroupsLocked(string field) {
         SyncMeta();
         Dictionary<string, int> groups = new Dictionary<string, int>();
         int kid = KeyIdOf(field);
         if (kid == 0) { return groups; }
-        if (IndexReady(field)) {
+        if (IndexReadyLocked(field)) {
             // 索引条目键 = "i:{coll}:{kid}:{value}\t{id}"；范围扫该
             // 字段的全部条目，键中 \t 前的部分即组值。单段稳态走
             // 键只读内核：条目（基址+偏移+长）零拷贝交付，值段
@@ -1302,6 +1328,14 @@ public class Collection {
     // 序列键本身仍随本次分配 Put 落盘，崩溃后重开时缓存作废重读。
     // 省掉每次分配一次 Get——实测它随段数增长，占插入路径大头。
     public int NextId() {
+        this.tlock.EnterWrite();
+        try {
+        return NextIdLocked();
+        } finally { this.tlock.ExitWrite(); }
+    }
+
+    // 刀12：NextId 的持锁实现（公开壳持有整库线程读写锁；内部互调走本变体）。
+    public int NextIdLocked() {
         if (this.nextIdCache < 1) {
             string cur = this.kv.Get(SeqKey());
             this.nextIdCache = 1;
@@ -1317,10 +1351,13 @@ public class Collection {
 
     // 设置集合的文档缓存池容量（0 为关闭缓存，默认 256）。
     public void SetCacheCapacity(int capacity) {
+        Mutex.Lock(this.cacheMtx);
+        try {
         if (capacity < 0) { capacity = 0; }
         this.docCacheCapacity = capacity;
         if (capacity == 0) {
-            ClearCache();
+            this.docCache.Clear();
+            this.docCacheOrder.Clear();
         } else {
             int pruneMax = this.docCacheOrder.Count;
             for (int i = 0; i < pruneMax; i = i + 1) {
@@ -1330,22 +1367,36 @@ public class Collection {
                 this.docCache.Remove(evictId);
             }
         }
+        } finally { Mutex.Unlock(this.cacheMtx); }
     }
 
     // 获取当前集合文档缓存池的缓存容量。
-    public int GetCacheCapacity() { return this.docCacheCapacity; }
+    public int GetCacheCapacity() {
+        Mutex.Lock(this.cacheMtx);
+        try { return this.docCacheCapacity; }
+        finally { Mutex.Unlock(this.cacheMtx); }
+    }
 
     // 获取当前集合文档缓存池中已缓存的文档数。
-    public int CachedDocCount() { return this.docCache.Count; }
+    public int CachedDocCount() {
+        Mutex.Lock(this.cacheMtx);
+        try { return this.docCache.Count; }
+        finally { Mutex.Unlock(this.cacheMtx); }
+    }
 
     // 清空文档缓存池。
     public void ClearCache() {
+        Mutex.Lock(this.cacheMtx);
+        try {
         this.docCache.Clear();
         this.docCacheOrder.Clear();
+        } finally { Mutex.Unlock(this.cacheMtx); }
     }
 
     // 从文档缓存中获取文档，若存在则更新 LRU 访问热度并返回其只读副本。
     public JsonValue CacheGet(int id) {
+        Mutex.Lock(this.cacheMtx);
+        try {
         if (this.kv.InTransaction() || this.docCacheCapacity <= 0 || !this.docCache.ContainsKey(id)) {
             JsonValue miss = null;
             return miss;
@@ -1361,10 +1412,13 @@ public class Collection {
             }
         }
         return this.docCache[id];
+        } finally { Mutex.Unlock(this.cacheMtx); }
     }
 
     // 将文档放入 LRU 缓存池；超过容量时淘汰最久未访问的条目。
     public void CachePut(int id, JsonValue doc) {
+        Mutex.Lock(this.cacheMtx);
+        try {
         if (this.kv.InTransaction() || this.docCacheCapacity <= 0 || doc == null) { return; }
         if (this.docCache.ContainsKey(id)) {
             this.docCache[id] = doc.Clone();
@@ -1387,10 +1441,13 @@ public class Collection {
         }
         this.docCache[id] = doc.Clone();
         this.docCacheOrder.Add(id);
+        } finally { Mutex.Unlock(this.cacheMtx); }
     }
 
     // 从缓存池中显式失效指定文档。
     public void CacheEvict(int id) {
+        Mutex.Lock(this.cacheMtx);
+        try {
         if (this.docCacheCapacity <= 0) { return; }
         if (this.docCache.ContainsKey(id)) {
             this.docCache.Remove(id);
@@ -1401,16 +1458,24 @@ public class Collection {
                 }
             }
         }
+        } finally { Mutex.Unlock(this.cacheMtx); }
     }
 
     // 存储新文档，分配并返回其 _id
     // （同时写入文档中）。
     public int Insert(JsonValue doc) {
+        this.tlock.EnterWrite();
+        try {
+            return this.InsertLocked(doc);
+        } finally { this.tlock.ExitWrite(); }
+    }
+    // 刀12：Insert 的持锁实现（公开壳持有整库线程读写锁；内部互调走本变体）。
+    public int InsertLocked(JsonValue doc) {
         SyncMeta();
         PrepareDoc(doc);
         this.kv.Begin();
         try {
-            int id = NextId();
+            int id = NextIdLocked();
             doc.Set("_id", JsonValue.NewNum(Convert.ToString(id)));
             this.kv.Put(DocKey(id), EncodeDoc(doc));
             AddIndexEntries(id, doc);
@@ -1428,13 +1493,15 @@ public class Collection {
     // 在单个原子提交中批量插入（整个批次
     // 只做一次 WAL 刷新）。返回第一个分配的 id。
     public int InsertBulk(List<JsonValue> docs) {
+        this.tlock.EnterWrite();
+        try {
         SyncMeta();
         for (int i = 0; i < docs.Count; i = i + 1) { PrepareDoc(docs[i]); }
         this.kv.Begin();
         try {
             int first = 0;
             for (int i = 0; i < docs.Count; i = i + 1) {
-                int id = NextId();
+                int id = NextIdLocked();
                 if (first == 0) { first = id; }
                 docs[i].Set("_id", JsonValue.NewNum(Convert.ToString(id)));
                 this.kv.Put(DocKey(id), EncodeDoc(docs[i]));
@@ -1449,6 +1516,7 @@ public class Collection {
             SyncMeta();
             throw;
         }
+        } finally { this.tlock.ExitWrite(); }
     }
 
     // 类型化向量批量直插（刀10）：「名 + float32 向量」两字段行直接
@@ -1458,6 +1526,8 @@ public class Collection {
     // 常规通道。整批单事务提交（崩溃窗口全有或全无）。
     // 返回第一个分配的 id。
     public int InsertVectorBulk(List<string> names, List<float[]> vectors, string nameField, string vecField) {
+        this.tlock.EnterWrite();
+        try {
         if (names == null || vectors == null || names.Count != vectors.Count) {
             throw new ArgumentException("InsertVectorBulk: names and vectors must be same non-null length");
         }
@@ -1481,7 +1551,7 @@ public class Collection {
         try {
             int first = 0;
             for (int i = 0; i < names.Count; i = i + 1) {
-                int id = NextId();
+                int id = NextIdLocked();
                 if (first == 0) { first = id; }
                 ByteBuffer b = ByteBuffer.Alloc(64 + names[i].Length + dims * 4);
                 b.WriteU8(66);  // 'B'
@@ -1515,10 +1585,18 @@ public class Collection {
             SyncMeta();
             throw;
         }
+        } finally { this.tlock.ExitWrite(); }
     }
 
     // 返回文档；优先走内存 LRU Buffer Pool，未命中则反序列化；不存在则返回 null。
     public JsonValue FindById(int id) {
+        this.tlock.EnterRead();
+        try {
+            return this.FindByIdLocked(id);
+        } finally { this.tlock.ExitRead(); }
+    }
+    // 刀12：FindById 的持锁实现（公开壳持有整库线程读写锁；内部互调走本变体）。
+    public JsonValue FindByIdLocked(int id) {
         SyncMeta();
         JsonValue cached = CacheGet(id);
         if (cached != null) {
@@ -1536,16 +1614,28 @@ public class Collection {
     }
 
     // 文档 id 是否存在。
-    public bool Exists(int id) { return this.kv.Contains(DocKey(id)); }
+    public bool Exists(int id) {
+        this.tlock.EnterRead();
+        try {
+             return this.kv.Contains(DocKey(id));
+        } finally { this.tlock.ExitRead(); }
+    }
 
     // 替换现有文档；id 不存在时返回 false。
     public bool Update(int id, JsonValue doc) {
+        this.tlock.EnterWrite();
+        try {
+            return this.UpdateLocked(id, doc);
+        } finally { this.tlock.ExitWrite(); }
+    }
+    // 刀12：Update 的持锁实现（公开壳持有整库线程读写锁；内部互调走本变体）。
+    public bool UpdateLocked(int id, JsonValue doc) {
         if (!this.kv.Contains(DocKey(id))) { return false; }
         SyncMeta();
         PrepareDoc(doc);
         this.kv.Begin();
         try {
-            if (this.indexedFields.Count > 0) { RemoveIndexEntries(id, FindById(id)); }
+            if (this.indexedFields.Count > 0) { RemoveIndexEntries(id, FindByIdLocked(id)); }
             doc.Set("_id", JsonValue.NewNum(Convert.ToString(id)));
             this.kv.Put(DocKey(id), EncodeDoc(doc));
             AddIndexEntries(id, doc);
@@ -1563,6 +1653,14 @@ public class Collection {
     // 在显式 id 下插入或替换。推进自增 id
     // 序列越过该 id，避免后续插入冲突。
     public void Upsert(int id, JsonValue doc) {
+        this.tlock.EnterWrite();
+        try {
+        UpsertLocked(id, doc);
+        } finally { this.tlock.ExitWrite(); }
+    }
+
+    // 刀12：Upsert 的持锁实现（公开壳持有整库线程读写锁；内部互调走本变体）。
+    public void UpsertLocked(int id, JsonValue doc) {
         if (id < 1) { throw new ArgumentException("document id must be positive"); }
         SyncMeta();
         PrepareDoc(doc);
@@ -1575,7 +1673,7 @@ public class Collection {
                 if (this.nextIdCache < id) { this.nextIdCache = id; }
             }
             if (this.indexedFields.Count > 0 && this.kv.Contains(DocKey(id))) {
-                RemoveIndexEntries(id, FindById(id));
+                RemoveIndexEntries(id, FindByIdLocked(id));
             }
             doc.Set("_id", JsonValue.NewNum(Convert.ToString(id)));
             this.kv.Put(DocKey(id), EncodeDoc(doc));
@@ -1592,10 +1690,17 @@ public class Collection {
 
     // 删除文档及其索引条目；返回该 id 是否原本存在。
     public bool DeleteById(int id) {
+        this.tlock.EnterWrite();
+        try {
+            return this.DeleteByIdLocked(id);
+        } finally { this.tlock.ExitWrite(); }
+    }
+    // 刀12：DeleteById 的持锁实现（公开壳持有整库线程读写锁；内部互调走本变体）。
+    public bool DeleteByIdLocked(int id) {
         SyncMeta();
         this.kv.Begin();
         try {
-            if (this.indexedFields.Count > 0) { RemoveIndexEntries(id, FindById(id)); }
+            if (this.indexedFields.Count > 0) { RemoveIndexEntries(id, FindByIdLocked(id)); }
             bool existed = this.kv.Delete(DocKey(id));
             if (existed) { this.search.Stage(id, null); }
             CommitWrite();
@@ -1609,43 +1714,100 @@ public class Collection {
     }
 
     // 索引字段文本，支持中文词典与未知词召回。
-    public void EnsureFullTextIndex(string field) { this.search.EnsureText(this, field, new TextTokenizer()); }
-    public void EnsureFullTextIndex(string field, TextTokenizer tokenizer) { this.search.EnsureText(this, field, tokenizer); }
-    public void EnsureVectorIndex(string field, VectorIndexOptions options) { this.search.EnsureVector(this, field, options); }
-    public List<Bm25Hit> SearchText(string field, string query, int k) { return this.search.Text(field, query, k, null); }
+    public void EnsureFullTextIndex(string field) {
+        this.tlock.EnterWrite();
+        try {
+             this.search.EnsureText(this, field, new TextTokenizer());
+        } finally { this.tlock.ExitWrite(); }
+    }
+    public void EnsureFullTextIndex(string field, TextTokenizer tokenizer) {
+        this.tlock.EnterWrite();
+        try {
+             this.search.EnsureText(this, field, tokenizer);
+        } finally { this.tlock.ExitWrite(); }
+    }
+    public void EnsureVectorIndex(string field, VectorIndexOptions options) {
+        this.tlock.EnterWrite();
+        try {
+             this.search.EnsureVector(this, field, options);
+        } finally { this.tlock.ExitWrite(); }
+    }
+    public List<Bm25Hit> SearchText(string field, string query, int k) {
+        this.tlock.EnterRead();
+        try { return this.search.Text(field, query, k, null); }
+        finally { this.tlock.ExitRead(); }
+    }
     public List<Bm25Hit> SearchTextFiltered(string field, string query, int k, Bm25Filter filter) {
+        this.tlock.EnterRead();
+        try {
         return this.search.Text(field, query, k, filter);
+        } finally { this.tlock.ExitRead(); }
     }
     public List<VectorHit> SearchVector(string field, float[] query, int k, int efSearch) {
+        this.tlock.EnterRead();
+        try {
         return this.search.Vector(field, query, k, efSearch, false, null);
+        } finally { this.tlock.ExitRead(); }
     }
     public List<VectorHit> SearchVectorFiltered(string field, float[] query, int k, int efSearch, VectorFilter filter) {
+        this.tlock.EnterRead();
+        try {
         return this.search.Vector(field, query, k, efSearch, false, filter);
+        } finally { this.tlock.ExitRead(); }
     }
     public List<VectorHit> SearchVectorExact(string field, float[] query, int k) {
+        this.tlock.EnterRead();
+        try {
         return this.search.Vector(field, query, k, 0, true, null);
+        } finally { this.tlock.ExitRead(); }
     }
     public List<VectorHit> SearchVectorExactFiltered(string field, float[] query, int k, VectorFilter filter) {
+        this.tlock.EnterRead();
+        try {
         return this.search.Vector(field, query, k, 0, true, filter);
+        } finally { this.tlock.ExitRead(); }
     }
     // 两段式重打分（刀3b）：量化索引近似召回 + 文档行原向量精排。
     // 非量化索引转发普通搜索。
     public List<VectorHit> SearchVectorRescore(string field, float[] query, int k, int efSearch) {
+        this.tlock.EnterRead();
+        try {
         return this.search.VectorRescore(this, field, query, k, efSearch, null);
+        } finally { this.tlock.ExitRead(); }
     }
     public List<VectorHit> SearchVectorRescoreFiltered(string field, float[] query, int k, int efSearch, VectorFilter filter) {
+        this.tlock.EnterRead();
+        try {
         return this.search.VectorRescore(this, field, query, k, efSearch, filter);
+        } finally { this.tlock.ExitRead(); }
     }
     public List<HybridHit> SearchHybrid(string textField, string query, string vectorField, float[] vector, int k, int efSearch) {
+        this.tlock.EnterRead();
+        try {
         return this.search.Hybrid(textField, query, vectorField, vector, k, efSearch, null, null);
+        } finally { this.tlock.ExitRead(); }
     }
-    public List<HybridHit> SearchHybridFiltered(string textField, string query, string vectorField, float[] vector,
-    int k, int efSearch, Bm25Filter textFilter, VectorFilter vectorFilter) {
+    public List<HybridHit> SearchHybridFiltered(string textField, string query, string vectorField, float[] vector, int k, int efSearch, Bm25Filter textFilter, VectorFilter vectorFilter) {
+        this.tlock.EnterRead();
+        try {
         return this.search.Hybrid(textField, query, vectorField, vector, k, efSearch, textFilter, vectorFilter);
+        } finally { this.tlock.ExitRead(); }
     }
-    public void RebuildSearchIndexes() { this.search.Rebuild(this); }
-    public void CheckpointSearchIndexes() { this.search.Checkpoint(this); }
+    public void RebuildSearchIndexes() {
+        this.tlock.EnterWrite();
+        try {
+             this.search.Rebuild(this);
+        } finally { this.tlock.ExitWrite(); }
+    }
+    public void CheckpointSearchIndexes() {
+        this.tlock.EnterWrite();
+        try {
+             this.search.Checkpoint(this);
+        } finally { this.tlock.ExitWrite(); }
+    }
     public JsonValue ListSearchIndexes() {
+        this.tlock.EnterRead();
+        try {
         SyncMeta();
         JsonValue list = this.search.ListIndexes();
         for (int i = 0; i < this.indexedFields.Count; i = i + 1) {
@@ -1655,6 +1817,7 @@ public class Collection {
             list.Append(item);
         }
         return list;
+        } finally { this.tlock.ExitRead(); }
     }
 
     // ===== 二级索引 =====
@@ -1674,14 +1837,25 @@ public class Collection {
     // 中断的构建会继续执行，而不是
     // 重新开始。
     public void EnsureIndex(string field) {
-        EnsureIndex(field, Collection.INDEX_BATCH);
+        this.tlock.EnterWrite();
+        try {
+        EnsureIndexLocked(field, Collection.INDEX_BATCH);
+        } finally { this.tlock.ExitWrite(); }
     }
 
     // 带显式批次大小的 EnsureIndex（每
     // 个事务处理的文档数）。
     public void EnsureIndex(string field, int batchSize) {
+        this.tlock.EnterWrite();
+        try {
+        EnsureIndexLocked(field, batchSize);
+        } finally { this.tlock.ExitWrite(); }
+    }
+
+    // 刀12：EnsureIndex 的持锁实现（公开壳持有整库线程读写锁；内部互调走本变体）。
+    public void EnsureIndexLocked(string field, int batchSize) {
         bool done = false;
-        while (!done) { done = BuildIndexStep(field, batchSize); }
+        while (!done) { done = BuildIndexStepLocked(field, batchSize); }
     }
 
     // 索引下一批文档，每次调用一个事务，
@@ -1691,11 +1865,19 @@ public class Collection {
     // 索引列表，持库服务中的后续写入也会维护条目。构建完成前
     // IndexReady 为 false，FindByIndex 回退为扫描。
     public bool BuildIndexStep(string field, int batchSize) {
+        this.tlock.EnterWrite();
+        try {
+        return BuildIndexStepLocked(field, batchSize);
+        } finally { this.tlock.ExitWrite(); }
+    }
+
+    // 刀12：BuildIndexStep 的持锁实现（公开壳持有整库线程读写锁；内部互调走本变体）。
+    public bool BuildIndexStepLocked(string field, int batchSize) {
         if (batchSize <= 0) { batchSize = Collection.INDEX_BATCH; }
         SyncMeta();
         this.kv.Begin();
         try {
-            if (!HasIndex(field)) {
+            if (!HasIndexLocked(field)) {
                 this.indexedFields.Add(field);
                 PersistIndexMeta();
             }
@@ -1726,6 +1908,14 @@ public class Collection {
 
     // 字段是否已在索引列表中（含批量构建尚未完成的）。
     public bool HasIndex(string field) {
+        this.tlock.EnterRead();
+        try {
+        return HasIndexLocked(field);
+        } finally { this.tlock.ExitRead(); }
+    }
+
+    // 刀12：HasIndex 的持锁实现（公开壳持有整库线程读写锁；内部互调走本变体）。
+    public bool HasIndexLocked(string field) {
         for (int i = 0; i < this.indexedFields.Count; i = i + 1) {
             if (this.indexedFields[i] == field) { return true; }
         }
@@ -1735,26 +1925,37 @@ public class Collection {
     // 当字段已被索引且其批次构建
     // 完成（即索引覆盖所有文档）时为 true。
     public bool IndexReady(string field) {
+        this.tlock.EnterRead();
+        try {
+        return IndexReadyLocked(field);
+        } finally { this.tlock.ExitRead(); }
+    }
+
+    // 刀12：IndexReady 的持锁实现（公开壳持有整库线程读写锁；内部互调走本变体）。
+    public bool IndexReadyLocked(string field) {
         SyncMeta();
-        return HasIndex(field) && !this.kv.Contains(IdxPosKey(field));
+        return HasIndexLocked(field) && !this.kv.Contains(IdxPosKey(field));
     }
 
     // 索引查找：字段等于 val（字符串形式）的文档，
     // 通过二级索引实现——无需全表扫描。索引仍在构建时
     // 回退为扫描，因此结果总是完整的。
     public List<JsonValue> FindByIndex(string field, string val) {
+        this.tlock.EnterRead();
+        try {
         SyncMeta();
         List<JsonValue> docs = new List<JsonValue>();
-        if (HasIndex(field) && !this.kv.Contains(IdxPosKey(field))) {
+        if (HasIndexLocked(field) && !this.kv.Contains(IdxPosKey(field))) {
             List<KvEntry> entries = new List<KvEntry>();
             this.kv.ScanPrefix(IdxPrefix(field, val), 0, entries);
             for (int i = 0; i < entries.Count; i = i + 1) {
-                JsonValue d = FindById(Collection.IdOfKey(entries[i].key));
+                JsonValue d = FindByIdLocked(Collection.IdOfKey(entries[i].key));
                 if (d != null) { docs.Add(d); }
             }
             return docs;
         }
         return FindByFieldScan(field, val);
+        } finally { this.tlock.ExitRead(); }
     }
 
     // 通过扫描找出字段等于 val 的文档：每条
@@ -1762,6 +1963,14 @@ public class Collection {
     // 只有匹配项会被完整解码，全程流式。用于字段没有
     // 可用索引的情况。
     public List<JsonValue> FindByFieldScan(string field, string val) {
+        this.tlock.EnterRead();
+        try {
+        return FindByFieldScanLocked(field, val);
+        } finally { this.tlock.ExitRead(); }
+    }
+
+    // 刀12：FindByFieldScan 的持锁实现（公开壳持有整库线程读写锁；内部互调走本变体）。
+    public List<JsonValue> FindByFieldScanLocked(string field, string val) {
         SyncMeta();
         List<JsonValue> docs = new List<JsonValue>();
         int kid = KeyIdOf(field);
@@ -1784,9 +1993,11 @@ public class Collection {
     // 字段值等于 val 的文档数，无需具体化
     // 任何文档：字符串值零分配比较，全程流式计数。
     public int CountByField(string field, string val) {
+        this.tlock.EnterRead();
+        try {
         SyncMeta();
         int n = 0;
-        if (HasIndex(field) && !this.kv.Contains(IdxPosKey(field))) {
+        if (HasIndexLocked(field) && !this.kv.Contains(IdxPosKey(field))) {
             // 已就绪的索引仅凭其键即可作答：无需读取任何文档。
             List<KvEntry> entries = new List<KvEntry>();
             return this.kv.ScanPrefix(IdxPrefix(field, val), 0, entries);
@@ -1802,12 +2013,16 @@ public class Collection {
             return true;
         });
         return n;
+        } finally { this.tlock.ExitRead(); }
     }
 
     // 文档总数（命名空间的键范围直数）。上界判定
     // 与存活判定都在存储层循环内，无回调、大集合不按文档数分配。
     public int Count() {
+        this.tlock.EnterRead();
+        try {
         return this.kv.CountRange("c:" + this.name + ":", "c:" + this.name + ";");
+        } finally { this.tlock.ExitRead(); }
     }
 
     // 裸记录走读（静态、免 this）：从记录起始位置解析
@@ -1971,12 +2186,23 @@ public class Collection {
 
     // 按 id 顺序返回所有文档。
     public List<JsonValue> FindAll() {
-        return FindRange(0, 0, 0);
+        this.tlock.EnterRead();
+        try {
+        return FindRangeLocked(0, 0, 0);
+        } finally { this.tlock.ExitRead(); }
     }
 
     // 满足 fromId <= _id <= toId 的文档（0 表示无界），
     // limit 0 表示不限数量，按 id 顺序返回。
     public List<JsonValue> FindRange(int fromId, int toId, int limit) {
+        this.tlock.EnterRead();
+        try {
+        return FindRangeLocked(fromId, toId, limit);
+        } finally { this.tlock.ExitRead(); }
+    }
+
+    // 刀12：FindRange 的持锁实现（公开壳持有整库线程读写锁；内部互调走本变体）。
+    public List<JsonValue> FindRangeLocked(int fromId, int toId, int limit) {
         SyncMeta();
         string lo = DocKey(fromId);
         string hi = "";
@@ -2000,6 +2226,8 @@ public class Collection {
     // 文档树、不物化文档，单字段聚合/过滤的每文档成本与文档的
     // 字段数无关。返回 visit 被调用的次数。
     public int ScanField(string field, FieldVisit visit) {
+        this.tlock.EnterRead();
+        try {
         SyncMeta();
         int kid = KeyIdOf(field);
         if (kid == 0) { return 0; }
@@ -2014,6 +2242,7 @@ public class Collection {
             return true;
         });
         return n;
+        } finally { this.tlock.ExitRead(); }
     }
 
     // 字段值等于 val 的所有文档 id，按 id 序。
@@ -2021,9 +2250,11 @@ public class Collection {
     // 否则流式扫描、每条记录只解码这一个字段（零拷贝），
     // 匹配才物化键收 id——全程不构建文档树。
     public List<int> FindIdsByField(string field, string val) {
+        this.tlock.EnterRead();
+        try {
         SyncMeta();
         List<int> ids = new List<int>();
-        if (HasIndex(field) && !this.kv.Contains(IdxPosKey(field))) {
+        if (HasIndexLocked(field) && !this.kv.Contains(IdxPosKey(field))) {
             List<KvEntry> entries = new List<KvEntry>();
             this.kv.ScanPrefix(IdxPrefix(field, val), 0, entries);
             for (int i = 0; i < entries.Count; i = i + 1) {
@@ -2095,6 +2326,7 @@ public class Collection {
             return true;
         });
         return ids;
+        } finally { this.tlock.ExitRead(); }
     }
 
     // 字段值落在 [lo, hi]（双端含）的所有文档 id。
@@ -2105,11 +2337,19 @@ public class Collection {
     // 值不应含 &lt; \t 的控制字符。lo 为空串 = 无下界，hi 为空串 =
     // 无上界。
     public List<int> FindIdsByFieldRange(string field, string lo, string hi) {
+        this.tlock.EnterRead();
+        try {
+        return FindIdsByFieldRangeLocked(field, lo, hi);
+        } finally { this.tlock.ExitRead(); }
+    }
+
+    // 刀12：FindIdsByFieldRange 的持锁实现（公开壳持有整库线程读写锁；内部互调走本变体）。
+    public List<int> FindIdsByFieldRangeLocked(string field, string lo, string hi) {
         SyncMeta();
         List<int> ids = new List<int>();
         int kid = KeyIdOf(field);
         if (kid == 0) { return ids; }
-        if (HasIndex(field) && !this.kv.Contains(IdxPosKey(field))) {
+        if (HasIndexLocked(field) && !this.kv.Contains(IdxPosKey(field))) {
             string head = "i:" + this.name + ":" + Collection.PadId(kid) + ":";
             string startKey = head + lo + "\t";
             string endKey;
@@ -2152,6 +2392,14 @@ public class Collection {
     // 之间保持一致。返回 false = 内核不可用（多源/未固化数据），
     // 调用方直接全量走权威路径。
     public bool NumAggregate(string field, NumAcc acc, out int fromId) {
+        this.tlock.EnterRead();
+        try {
+        return NumAggregateLocked(field, acc, out fromId);
+        } finally { this.tlock.ExitRead(); }
+    }
+
+    // 刀12：NumAggregate 的持锁实现（公开壳持有整库线程读写锁；内部互调走本变体）。
+    public bool NumAggregateLocked(string field, NumAcc acc, out int fromId) {
         fromId = 0;
         int kid = KeyIdOf(field);
         if (kid == 0) { return true; }
@@ -2187,6 +2435,8 @@ public class Collection {
     // 无 JsonValue；无数值文档时返回 false。out 参数被闭包捕获
     // 时不回传（捕获的是副本），先累计到局部变量、扫完再写回。
     public bool MinField(string field, out long v) {
+        this.tlock.EnterRead();
+        try {
         v = 0;
         int kid = KeyIdOf(field);
         if (kid == 0) { return false; }
@@ -2195,7 +2445,7 @@ public class Collection {
         string hi = "c:" + this.name + ";";
         NumAcc a = new NumAcc();
         int fromId;
-        bool ok = NumAggregate(field, a, out fromId);
+        bool ok = NumAggregateLocked(field, a, out fromId);
         if (ok && a.Count() > 0) {
             v = a.Min();
             return true;
@@ -2210,11 +2460,14 @@ public class Collection {
         });
         if (has) { v = acc; }
         return has;
+        } finally { this.tlock.ExitRead(); }
     }
 
     // 数值字段的最大值：块级内核直算（带权威回退），
     // 无 JsonValue；无数值文档时返回 false。
     public bool MaxField(string field, out long v) {
+        this.tlock.EnterRead();
+        try {
         v = 0;
         int kid = KeyIdOf(field);
         if (kid == 0) { return false; }
@@ -2223,7 +2476,7 @@ public class Collection {
         string hi = "c:" + this.name + ";";
         NumAcc a = new NumAcc();
         int fromId;
-        bool ok = NumAggregate(field, a, out fromId);
+        bool ok = NumAggregateLocked(field, a, out fromId);
         if (ok && a.Count() > 0) {
             v = a.Max();
             return true;
@@ -2237,16 +2490,19 @@ public class Collection {
         });
         if (has) { v = acc; }
         return has;
+        } finally { this.tlock.ExitRead(); }
     }
 
     // 数值字段的平均值：一遍流式同时累计和与计数
     // （块级内核，带权威回退）；无数值文档时返回 0。
     public double AvgField(string field) {
+        this.tlock.EnterRead();
+        try {
         int kid = KeyIdOf(field);
         if (kid == 0) { return 0.0; }
         NumAcc a = new NumAcc();
         int fromId;
-        bool ok = NumAggregate(field, a, out fromId);
+        bool ok = NumAggregateLocked(field, a, out fromId);
         if (ok) {
             return a.Count() == 0 ? 0.0 : (double)a.Sum() / (double)a.Count();
         }
@@ -2263,6 +2519,7 @@ public class Collection {
         });
         if (cnt == 0) { return 0.0; }
         return (double)sum / (double)cnt;
+        } finally { this.tlock.ExitRead(); }
     }
 
     // 数值字段 TopN：按字段值降序的前 n 个文档 id
@@ -2270,6 +2527,14 @@ public class Collection {
     // 只驻留 n 项，内存 O(n) 与文档数无关；非数值/缺字段文档
     // 不参与。n ≤ 0 返回空表。排行榜类负载免全排序。
     public List<int> FindTopIds(string field, int n) {
+        this.tlock.EnterRead();
+        try {
+        return FindTopIdsLocked(field, n);
+        } finally { this.tlock.ExitRead(); }
+    }
+
+    // 刀12：FindTopIds 的持锁实现（公开壳持有整库线程读写锁；内部互调走本变体）。
+    public List<int> FindTopIdsLocked(string field, int n) {
         List<int> tops = new List<int>();
         if (n <= 0) { return tops; }
         int kid = KeyIdOf(field);
@@ -2357,29 +2622,33 @@ public class Collection {
     // <see cref="FindById"/> 的协程版本：读操作会维护缓存，因此也独占锁。
     public async JsonValue FindByIdAsync(int id) {
         await this.rw.EnterWrite();
-        try { return FindById(id); }
-        finally { this.rw.ExitWrite(); }
+        this.tlock.EnterWrite();
+        try { return FindByIdLocked(id); }
+        finally { this.tlock.ExitWrite(); this.rw.ExitWrite(); }
     }
 
     // <see cref="Insert"/> 的协程版本：在共享读写锁的写侧执行。
     public async int InsertAsync(JsonValue doc) {
         await this.rw.EnterWrite();
-        try { return Insert(doc); }
-        finally { this.rw.ExitWrite(); }
+        this.tlock.EnterWrite();
+        try { return InsertLocked(doc); }
+        finally { this.tlock.ExitWrite(); this.rw.ExitWrite(); }
     }
 
     // <see cref="Update"/> 的协程版本：在共享读写锁的写侧执行。
     public async bool UpdateAsync(int id, JsonValue doc) {
         await this.rw.EnterWrite();
-        try { return Update(id, doc); }
-        finally { this.rw.ExitWrite(); }
+        this.tlock.EnterWrite();
+        try { return UpdateLocked(id, doc); }
+        finally { this.tlock.ExitWrite(); this.rw.ExitWrite(); }
     }
 
     // <see cref="DeleteById"/> 的协程版本：在共享读写锁的写侧执行。
     public async bool DeleteByIdAsync(int id) {
         await this.rw.EnterWrite();
-        try { return DeleteById(id); }
-        finally { this.rw.ExitWrite(); }
+        this.tlock.EnterWrite();
+        try { return DeleteByIdLocked(id); }
+        finally { this.tlock.ExitWrite(); this.rw.ExitWrite(); }
     }
 
     // 对单篇文档的原子读改写：fn 在
@@ -2389,12 +2658,13 @@ public class Collection {
     // 返回了替换值时返回 true。
     public async bool UpdateAtomic(int id, DocUpdater fn) {
         await this.rw.EnterWrite();
+        this.tlock.EnterWrite();
         try {
-            JsonValue cur = FindById(id);
+            JsonValue cur = FindByIdLocked(id);
             if (cur == null) { return false; }
             JsonValue next = fn(cur);
             if (next == null) { return false; }
-            return Update(id, next);
-        } finally { this.rw.ExitWrite(); }
+            return UpdateLocked(id, next);
+        } finally { this.tlock.ExitWrite(); this.rw.ExitWrite(); }
     }
 }

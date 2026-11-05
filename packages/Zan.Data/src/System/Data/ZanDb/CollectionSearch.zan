@@ -12,6 +12,7 @@ public class CollectionSearch {
     public Dictionary<string, CollectionSearchState> states;
     public string catalogBody;
     public List<JsonValue> catalog;
+    public nint smtx;
 
     public CollectionSearch(ZanStore kv, string name) {
         this.kv = kv;
@@ -19,6 +20,7 @@ public class CollectionSearch {
         this.states = new Dictionary<string, CollectionSearchState>();
         this.catalogBody = "";
         this.catalog = new List<JsonValue>();
+        this.smtx = Mutex.Create();
     }
 
     public static JsonValue Member(JsonValue value, string key) {
@@ -75,6 +77,8 @@ public class CollectionSearch {
     // snap 行数一致。未物化索引不审计——首次加载本就会校验失败
     // 拒绝。问题追加进 problems；须在写侧串行环境调用。
     public void AuditSnapshots(List<string> problems) {
+        Mutex.Lock(this.smtx);
+        try {
         List<string> cacheKeys = this.states.Keys;
         for (int i = 0; i < cacheKeys.Count; i = i + 1) {
             CollectionSearchState st = null;
@@ -104,6 +108,7 @@ public class CollectionSearch {
                 + " != declared " + Convert.ToString(batches));
             }
         }
+        } finally { Mutex.Unlock(this.smtx); }
     }
 
     public static void CheckDefinition(JsonValue def) {
@@ -403,6 +408,9 @@ public class CollectionSearch {
     }
 
     public CollectionSearchState Load(string kind, string field) {
+        // 刀12：states 惰性重载对并发读者互斥（读壳之间也会并发进入）。
+        Mutex.Lock(this.smtx);
+        try {
         CollectionSearch.CheckField(field);
         string defBody = this.kv.Get(DefinitionKey(kind, field));
         if (defBody.Length == 0) { throw new InvalidOperationException("search index does not exist: " + field); }
@@ -504,6 +512,7 @@ public class CollectionSearch {
         }
         this.states[cacheKey] = state;
         return state;
+        } finally { Mutex.Unlock(this.smtx); }
     }
 
     public void RequireCommitted() {

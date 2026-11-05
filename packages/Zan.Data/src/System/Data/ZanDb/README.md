@@ -268,6 +268,29 @@ db.Close();
   权威走读，双路径语义一致（zandb_ptrdecode 钉死）；退化模式（多源归并）直接走
   字符串路径。
 
+## 并发模型（线程级读写锁）
+
+- 双层锁：`AsyncRwLock rw` 是协程闸（配 `await`，协程间互斥），`RwLock tlock`
+  是线程阻塞型读写锁（读共享/写排他、写优先，原始线程/并行 worker 用）。
+  锁序恒为 rw → tlock，从不反转。
+- 集合与检索的全部公开门面（CRUD/扫描/聚合/全文与向量检索/索引构建/缓存）
+  在 tlock 下运行；内部互调走 `*Locked` 变体。RwLock 非可重入——写优先语义
+  下读者重入会与排队写者互锁，嵌套调用一律进变体而不是公开壳。文档缓存由
+  独立 `cacheMtx` 保护，检索状态（states）的并发惰性重载由 `smtx` 串行化。
+- ZanDatabase 门面：Checkpoint/Flush/MergeSegments/MergeSomeSegments/
+  SetAutoMerge/Backup（含 BackupAsync）走写侧，IntegrityCheck/SegCount 走
+  读侧，GetCollection 走写侧（集合登记 + kv 元数据加载需串行）。
+- 不受锁保护的 kv 原语契约：Begin/Commit/Rollback/InTransaction/GetRevision/
+  CacheVersion/SetSyncEvery/Close 直通存储层，调用方自行串行（手工事务纪律
+  不变）；Close 要求调用方保证无在飞操作。行级原语（EncodeDoc/FieldOf/
+  FieldF32/行指针解码族）只在持锁上下文内运行，不单独加锁。
+- 一致性语义：单条读/写操作原子（锁内完成）；DocQuery 链式执行的多次存储
+  访问之间可能看到其他线程已提交的写入——逐条一致，非快照隔离；跨多条的
+  事务性读写用手工事务并自行排他。
+- 用例：rwlock_concurrency（写互斥精确收敛、读快照一致）、zandb_concurrent
+  （并发插入不丢档、检索与写并发、更新/删除竞态、门面并发）、
+  zandb_automerge（SetAutoMerge 段数钳制、手动归并收敛）。
+
 ## 架构（ZanStore 内核）
 
 ```
