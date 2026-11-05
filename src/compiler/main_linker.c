@@ -587,7 +587,7 @@
                     }
                     argv[a++] = "--start-group";
                     static const char *const dllcrt[] = {
-                        "-lmingw32", "-lgcc", "-lmoldname", "-lmingwex",
+                        "-lmingw32", "-lgcc", "-lgcc_eh", "-lsupc++", "-lmoldname", "-lmingwex",
                         "-lmsvcrt", "-lkernel32", "-lshell32",
                         "-l:libwinpthread.a", NULL };
                     for (int li = 0; dllcrt[li]; li++) {
@@ -1488,7 +1488,7 @@
                 cmd_appendf(cmd, sizeof(cmd), " -lws2_32");
             }
             { cmd_appendf(cmd, sizeof(cmd), have_gcc
-                       ? " -lgcc -lgcc_eh"
+                       ? " -lgcc -lgcc_eh -lsupc++"
                        : " -lclang_rt.builtins-aarch64 -lunwind -lucrt"); }
             for (int ei = 0; ei < extra_link_lib_count; ei++) {
                 cmd_appendf(cmd, sizeof(cmd), " -l%s",
@@ -2081,6 +2081,7 @@
                 argv[a++] = elibbufs[neb++];
             }
             argv[a++] = "-lmingw32"; argv[a++] = "-lgcc";
+            argv[a++] = "-lgcc_eh";  argv[a++] = "-lsupc++";
             argv[a++] = "-lmoldname"; argv[a++] = "-lmingwex";
             argv[a++] = "-lmsvcrt";   argv[a++] = "-lkernel32";
             argv[a++] = "-ladvapi32"; argv[a++] = "-lshell32";

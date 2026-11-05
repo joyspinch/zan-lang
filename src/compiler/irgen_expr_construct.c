@@ -1792,7 +1792,7 @@ LLVMValueRef emit_expr_new_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                                 locals);
                         }
                         coerce_args_to_params(g, ctor_ft, call_args, argc);
-                        zan_call2(g->builder, ctor_ft, ctor_fn, call_args, (unsigned)argc, "");
+                        zan_call_or_invoke(g, g->builder, ctor_ft, ctor_fn, call_args, (unsigned)argc, "");
                         /* 逆序弹出：实参槽先进后进（后进先出），对象槽最后弹 */
                         for (int k = argc - 1; k >= 0; k--)
                             if (arg_eh_pushed[k]) emit_eh_tmp_pop(g);
@@ -1879,7 +1879,7 @@ LLVMValueRef emit_expr_new_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                                     g, actual_bargs->items[k], pt, locals);
                             }
                             coerce_args_to_params(g, bctor->fn_type, bcall_args, b_argc);
-                            zan_call2(g->builder, bctor->fn_type, bctor->fn,
+                            zan_call_or_invoke(g, g->builder, bctor->fn_type, bctor->fn,
                                       bcall_args, (unsigned)b_argc, "");
                             for (int k = 0; k < actual_bargs->count; k++) {
                                 emit_release_owned_call_temp(

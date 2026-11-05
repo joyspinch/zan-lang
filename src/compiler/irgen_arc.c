@@ -185,14 +185,14 @@ LLVMValueRef emit_delegate_invoke(zan_irgen_t *g, LLVMValueRef dv,
     LLVMValueRef *cargs = (LLVMValueRef *)calloc((size_t)argc + 1, sizeof(LLVMValueRef));
     cargs[0] = rec;
     for (int i = 0; i < argc; i++) cargs[i + 1] = args[i];
-    LLVMValueRef rclo = zan_call2(g->builder, clo_fn_type, cfn, cargs,
+    LLVMValueRef rclo = zan_call_or_invoke(g, g->builder, clo_fn_type, cfn, cargs,
                                   (unsigned)argc + 1, is_void ? "" : "dlg.rc");
     free(cargs);
     LLVMBasicBlockRef clo_end = LLVMGetInsertBlock(g->builder);
     LLVMBuildBr(g->builder, join_bb);
 
     LLVMPositionBuilderAtEnd(g->builder, bare_bb);
-    LLVMValueRef rbare = zan_call2(g->builder, fn_type, dv, args,
+    LLVMValueRef rbare = zan_call_or_invoke(g, g->builder, fn_type, dv, args,
                                    (unsigned)argc, is_void ? "" : "dlg.rb");
     LLVMBasicBlockRef bare_end = LLVMGetInsertBlock(g->builder);
     LLVMBuildBr(g->builder, join_bb);

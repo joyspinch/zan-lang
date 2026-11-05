@@ -1269,7 +1269,7 @@ LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                                     method_sym, g->functions[fi].fn, sft, &sft);
                                 const char *cn = (LLVMGetTypeKind(LLVMGetReturnType(sft)) == LLVMVoidTypeKind) ? "" : "scall";
                                 coerce_args_to_params(g, sft, call_args, argc);
-                                LLVMValueRef result = zan_call2(g->builder, sft,
+                                LLVMValueRef result = zan_call_or_invoke(g, g->builder, sft,
                                     sfn, call_args, (unsigned)argc, cn);
                                 zan_type_t *gret = generic_method_ret(g, method_sym, expr, locals);
                                 if (!gret && method_ret_is_bare_tp(method_sym)) {
@@ -1620,7 +1620,7 @@ LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                             ca[k + 1] = (k + 1 < (int)npar)
                                 ? emit_boundary_coerce(g, avals[k], pts[k + 1]) : avals[k];
                         const char *cn = has_res ? "ifccall" : "";
-                        LLVMValueRef r = zan_call2(g->builder, cands[ci].fnty, cands[ci].fn, ca, (unsigned)cargc, cn);
+                        LLVMValueRef r = zan_call_or_invoke(g, g->builder, cands[ci].fnty, cands[ci].fn, ca, (unsigned)cargc, cn);
                         if (has_res) {
                             r = emit_boundary_coerce(g, r, res_ty);
                             phi_vals[np] = r; phi_bbs[np] = LLVMGetInsertBlock(g->builder); np++;
@@ -1706,7 +1706,7 @@ LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                                 }
                                 const char *cn = (LLVMGetTypeKind(LLVMGetReturnType(g->functions[fi].fn_type)) == LLVMVoidTypeKind) ? "" : "scall";
                                 coerce_args_to_params(g, g->functions[fi].fn_type, call_args, argc);
-                                LLVMValueRef result = zan_call2(g->builder, g->functions[fi].fn_type,
+                                LLVMValueRef result = zan_call_or_invoke(g, g->builder, g->functions[fi].fn_type,
                                     g->functions[fi].fn, call_args, (unsigned)argc, cn);
                                 zan_type_t *gret = generic_method_ret(g, method_sym, expr, locals);
                                 if (!gret && method_ret_is_bare_tp(method_sym)) {
@@ -1775,7 +1775,7 @@ LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                         }
                         const char *cn = (LLVMGetTypeKind(LLVMGetReturnType(g->functions[fi].fn_type)) == LLVMVoidTypeKind) ? "" : "extcall";
                         coerce_args_to_params(g, g->functions[fi].fn_type, call_args, argc);
-                        LLVMValueRef result = zan_call2(g->builder, g->functions[fi].fn_type,
+                        LLVMValueRef result = zan_call_or_invoke(g, g->builder, g->functions[fi].fn_type,
                             g->functions[fi].fn, call_args, (unsigned)argc, cn);
                         if (method_ret_is_bare_tp(method_sym)) {
                             zan_type_t *gret = method_ret_type_at(g, method_sym,
@@ -1976,7 +1976,7 @@ LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                     }
                 }
                 const char *gcn = (LLVMGetTypeKind(LLVMGetReturnType(fn_type)) == LLVMVoidTypeKind) ? "" : "gcall";
-                LLVMValueRef result = zan_call2(g->builder, fn_type,
+                LLVMValueRef result = zan_call_or_invoke(g, g->builder, fn_type,
                     global_fn, call_args, (unsigned)argc, gcn);
                 int consumes_free_arg =
                     argc == 1 && call_consumes_free_arg(global_fn);

@@ -233,6 +233,12 @@ struct zan_struct_type_entry *get_struct_entry(zan_irgen_t *g, zan_symbol_t *typ
 /* ========================================================================= */
 
 /* --- From irgen.c (82 functions) --- */
+LLVMValueRef get_eh_personality_fn(zan_irgen_t *g);
+void ensure_function_personality(zan_irgen_t *g, LLVMValueRef fn);
+void emit_raise_exception(zan_irgen_t *g);
+LLVMValueRef zan_call_or_invoke(zan_irgen_t *g, LLVMBuilderRef b, LLVMTypeRef ty,
+                                LLVMValueRef fn, LLVMValueRef *args, unsigned n,
+                                const char *nm);
 LLVMTypeRef arc_desc_type(zan_irgen_t *g);
 LLVMValueRef arc_site_arg(zan_irgen_t *g, int site_idx);
 bool class_has_virtual_methods(zan_symbol_t *sym);

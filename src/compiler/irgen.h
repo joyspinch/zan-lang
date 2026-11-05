@@ -23,6 +23,14 @@ typedef struct {
     int          frame_index;
 } zan_async_slot_t;
 
+typedef struct {
+    LLVMBasicBlockRef lpad_bb;
+    LLVMBasicBlockRef catch_bb;
+    LLVMValueRef fn;
+    int throw_locals_base;
+    int fin_idx;
+} zan_lpad_entry_t;
+
 /* 编译器生成的保护文本驻留表项 */
 typedef struct zan_str_intern {
     char *text;
@@ -260,6 +268,12 @@ struct zan_irgen {
     /* 当前函数体拥有的作用域清理项 */
     int eh_armed_base;
     int eh_armed_loop_base;
+
+    zan_lpad_entry_t lpad_stack[ZAN_MAX_ARMED_TRY];
+    int lpad_depth;
+    LLVMValueRef eh_personality_fn;
+    LLVMValueRef fn_cxa_allocate_exception;
+    LLVMValueRef fn_cxa_throw;
 
     LLVMBasicBlockRef wasm_lpad_stack[ZAN_MAX_ARMED_TRY];
     int wasm_try_depth;

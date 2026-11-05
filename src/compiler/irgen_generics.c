@@ -422,11 +422,11 @@ LLVMValueRef emit_dispatch_call(zan_irgen_t *g, zan_symbol_t *static_sym,
                 LLVMValueRef sp = LLVMBuildGEP2(b, i8ptr, vt, &sidx, 1, "vsp");
                 LLVMValueRef fn8 = LLVMBuildLoad2(b, i8ptr, sp, "vfn8");
                 LLVMValueRef fnp = LLVMBuildBitCast(b, fn8, LLVMPointerType(fn_type, 0), "vfnp");
-                return zan_call2(b, fn_type, fnp, call_args, (unsigned)argc, cn);
+                return zan_call_or_invoke(g, b, fn_type, fnp, call_args, (unsigned)argc, cn);
             }
         }
     }
-    return zan_call2(g->builder, fn_type, static_fn, call_args, (unsigned)argc, cn);
+    return zan_call_or_invoke(g, g->builder, fn_type, static_fn, call_args, (unsigned)argc, cn);
 }
 
 static int expr_is_arc_object(zan_irgen_t *g, zan_ast_node_t *e, local_scope_t *locals) {
@@ -1480,14 +1480,8 @@ static void emit_throw_guard_exception(zan_irgen_t *g, zan_symbol_t *sym,
         if (LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(g->builder))) return;
     }
 
-    LLVMValueRef top_val = LLVMBuildLoad2(g->builder, i32t, top_g, "eh.top");
-
-    /* Unwind temporary allocations and jump to handler */
-    if (!g->current_async_frame) {
-        emit_eh_unwind_to_handler(g, top_val);
-    }
-    emit_eh_longjmp(g, emit_eh_buf_ptr(g, top_val));
-    LLVMBuildUnreachable(g->builder);
+    (void)top_g;
+    emit_raise_exception(g);
 }
 void emit_runtime_check(zan_irgen_t *g, LLVMValueRef is_error,
                                zan_loc_t loc, const char *msg) {

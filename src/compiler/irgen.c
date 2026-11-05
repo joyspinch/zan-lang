@@ -1046,6 +1046,125 @@ void emit_rt_alloc_add(zan_irgen_t *g, LLVMValueRef bytes) {
     }
     zan_call2(g->builder, fn_ty, fn, &b_val, 1, "");
 }
+LLVMValueRef get_eh_personality_fn(zan_irgen_t *g) {
+    if (g->eh_personality_fn) return g->eh_personality_fn;
+    const char *pers_name;
+    if (g->target_is_wasm) {
+        pers_name = "__gxx_wasm_personality_v0";
+    } else if (g->target_is_windows) {
+        pers_name = "__gxx_personality_seh0";
+    } else {
+        pers_name = "__gxx_personality_v0";
+    }
+    LLVMValueRef fn = LLVMGetNamedFunction(g->mod, pers_name);
+    if (!fn) {
+        LLVMTypeRef pers_ty = LLVMFunctionType(LLVMInt32TypeInContext(g->ctx), NULL, 0, 1);
+        fn = LLVMAddFunction(g->mod, pers_name, pers_ty);
+    }
+    g->eh_personality_fn = fn;
+    return fn;
+}
+
+void ensure_function_personality(zan_irgen_t *g, LLVMValueRef fn) {
+    if (!fn || !LLVMIsAFunction(fn)) return;
+    if (!LLVMHasPersonalityFn(fn)) {
+        LLVMSetPersonalityFn(fn, get_eh_personality_fn(g));
+    }
+}
+
+void emit_raise_exception(zan_irgen_t *g) {
+    LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
+    if (!g->fn_cxa_allocate_exception) {
+        LLVMTypeRef alloc_ty = LLVMFunctionType(i8ptr, &i64t, 1, 0);
+        g->fn_cxa_allocate_exception = LLVMGetNamedFunction(g->mod, "__cxa_allocate_exception");
+        if (!g->fn_cxa_allocate_exception) {
+            g->fn_cxa_allocate_exception = LLVMAddFunction(g->mod, "__cxa_allocate_exception", alloc_ty);
+        }
+    }
+    if (!g->fn_cxa_throw) {
+        LLVMTypeRef throw_params[] = { i8ptr, i8ptr, i8ptr };
+        LLVMTypeRef throw_ty = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), throw_params, 3, 0);
+        g->fn_cxa_throw = LLVMGetNamedFunction(g->mod, "__cxa_throw");
+        if (!g->fn_cxa_throw) {
+            g->fn_cxa_throw = LLVMAddFunction(g->mod, "__cxa_throw", throw_ty);
+        }
+    }
+
+    LLVMTypeRef alloc_ty = LLVMFunctionType(i8ptr, &i64t, 1, 0);
+    LLVMValueRef exc_mem = zan_call2(g->builder, alloc_ty, g->fn_cxa_allocate_exception,
+        (LLVMValueRef[]){ LLVMConstInt(i64t, 8, 0) }, 1, "exc.mem");
+
+    LLVMTypeRef throw_params[] = { i8ptr, i8ptr, i8ptr };
+    LLVMTypeRef throw_ty = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), throw_params, 3, 0);
+
+    LLVMBasicBlockRef cur_bb = LLVMGetInsertBlock(g->builder);
+    LLVMValueRef cur_fn = cur_bb ? LLVMGetBasicBlockParent(cur_bb) : NULL;
+    if (cur_fn) ensure_function_personality(g, cur_fn);
+
+    if (g->lpad_depth > 0) {
+        for (int i = g->lpad_depth - 1; i >= 0; i--) {
+            zan_lpad_entry_t *top = &g->lpad_stack[i];
+            if (top->fn != cur_fn) break;
+            if (top->lpad_bb && top->catch_bb) {
+                LLVMBasicBlockRef unreach_bb = LLVMAppendBasicBlockInContext(g->ctx, cur_fn, "throw.unreach");
+                LLVMBuildInvoke2(g->builder, throw_ty, g->fn_cxa_throw,
+                    (LLVMValueRef[]){ exc_mem, LLVMConstNull(i8ptr), LLVMConstNull(i8ptr) }, 3,
+                    unreach_bb, top->lpad_bb, "");
+                LLVMPositionBuilderAtEnd(g->builder, unreach_bb);
+                LLVMBuildUnreachable(g->builder);
+                return;
+            }
+        }
+    }
+
+    zan_call2(g->builder, throw_ty, g->fn_cxa_throw,
+        (LLVMValueRef[]){ exc_mem, LLVMConstNull(i8ptr), LLVMConstNull(i8ptr) }, 3, "");
+    LLVMBuildUnreachable(g->builder);
+}
+
+LLVMValueRef zan_call_or_invoke(zan_irgen_t *g, LLVMBuilderRef b, LLVMTypeRef ty,
+                                LLVMValueRef fn, LLVMValueRef *args, unsigned n,
+                                const char *nm) {
+    if (g && g->lpad_depth > 0) {
+        zan_lpad_entry_t *top = &g->lpad_stack[g->lpad_depth - 1];
+        LLVMBasicBlockRef cur_bb = LLVMGetInsertBlock(b);
+        LLVMValueRef cur_fn = cur_bb ? LLVMGetBasicBlockParent(cur_bb) : NULL;
+        if (cur_fn && top->fn == cur_fn && top->lpad_bb) {
+            di_ensure_loc(b);
+            ensure_function_personality(g, cur_fn);
+            LLVMBasicBlockRef norm_bb = LLVMAppendBasicBlockInContext(g->ctx, cur_fn, "inv.norm");
+            LLVMBasicBlockRef lpad_bb = top->lpad_bb;
+
+            LLVMValueRef callee = fn;
+            if (fn && LLVMIsAFunction(fn) && LLVMGlobalGetValueType(fn) != ty) {
+                fn = LLVMConstBitCast(fn, LLVMPointerType(ty, 0));
+            } else if (fn && !LLVMIsAFunction(fn) &&
+                       LLVMGetTypeKind(LLVMTypeOf(fn)) == LLVMPointerTypeKind &&
+                       LLVMTypeOf(fn) != LLVMPointerType(ty, 0)) {
+                fn = LLVMBuildBitCast(b, fn, LLVMPointerType(ty, 0), "callee.fp");
+            }
+            LLVMValueRef inv = LLVMBuildInvoke2(b, ty, fn, args, n, norm_bb, lpad_bb, nm);
+            if (callee && LLVMIsAFunction(callee)) {
+                static const char *ext[2] = { "signext", "zeroext" };
+                for (int e = 0; e < 2; e++) {
+                    unsigned kind = LLVMGetEnumAttributeKindForName(ext[e], strlen(ext[e]));
+                    if (!kind) continue;
+                    for (unsigned idx = 0; idx <= n; idx++) {
+                        unsigned at = idx == 0 ? (unsigned)LLVMAttributeReturnIndex : idx;
+                        if (!LLVMGetEnumAttributeAtIndex(callee, at, kind)) continue;
+                        LLVMAddCallSiteAttribute(inv, at,
+                            LLVMCreateEnumAttribute(LLVMGetTypeContext(ty), kind, 0));
+                    }
+                }
+            }
+            LLVMPositionBuilderAtEnd(b, norm_bb);
+            return inv;
+        }
+    }
+    return zan_call2(b, ty, fn, args, n, nm);
+}
+
 void *irgen_grow(void *base, int *cap, int need, size_t elem) {
     if (need <= *cap) return base;
     int ncap = *cap ? *cap * 2 : 256;

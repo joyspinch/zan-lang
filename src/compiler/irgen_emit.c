@@ -240,6 +240,86 @@ static int *emit_static_init_order(zan_ast_node_t *unit) {
     return order;
 }
 
+static void emit_eh_terminate_setup(zan_irgen_t *g) {
+    if (g->target_is_wasm) return;
+    LLVMValueRef term_fn = LLVMGetNamedFunction(g->mod, "__zan_eh_terminate");
+    if (!term_fn) {
+        LLVMTypeRef void_ty = LLVMVoidTypeInContext(g->ctx);
+        LLVMTypeRef term_fn_ty = LLVMFunctionType(void_ty, NULL, 0, 0);
+        term_fn = LLVMAddFunction(g->mod, "__zan_eh_terminate", term_fn_ty);
+        LLVMBasicBlockRef tbb = LLVMAppendBasicBlockInContext(g->ctx, term_fn, "entry");
+        zan_builder_point_t pt = zan_builder_save(g);
+        LLVMPositionBuilderAtEnd(g->builder, tbb);
+        emit_eh_hook_call(g, "__zan_eh_unhandled");
+        LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+        LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
+        LLVMValueRef top_g, bufs_g, exc_g;
+        get_eh_globals(g, &top_g, &bufs_g, &exc_g);
+        LLVMValueRef printf_fn = get_libc_fn(g, "printf", LLVMFunctionType(i32t, &i8ptr, 1, 1));
+        LLVMValueRef exc = LLVMBuildLoad2(g->builder, i8ptr, exc_g, "term.exc");
+        LLVMValueRef tid = LLVMBuildLoad2(g->builder, i8ptr, get_eh_exc_tid_global(g), "term.tid");
+        LLVMValueRef hasExc = zan_icmp(g->builder, LLVMIntNE, exc, LLVMConstNull(i8ptr), "term.has");
+        LLVMValueRef isStr = zan_icmp(g->builder, LLVMIntEQ, tid, LLVMConstNull(i8ptr), "term.isstr");
+        LLVMBasicBlockRef fn_bb = LLVMGetInsertBlock(g->builder);
+        LLVMValueRef cur_fn = LLVMGetBasicBlockParent(fn_bb);
+        LLVMBasicBlockRef check_bb = LLVMAppendBasicBlockInContext(g->ctx, cur_fn, "term.check");
+        LLVMBasicBlockRef str_bb = LLVMAppendBasicBlockInContext(g->ctx, cur_fn, "term.str");
+        LLVMBasicBlockRef cls_bb = LLVMAppendBasicBlockInContext(g->ctx, cur_fn, "term.cls");
+        LLVMBasicBlockRef none_bb = LLVMAppendBasicBlockInContext(g->ctx, cur_fn, "term.none");
+        LLVMBasicBlockRef cont_bb = LLVMAppendBasicBlockInContext(g->ctx, cur_fn, "term.cont");
+        LLVMBuildCondBr(g->builder, hasExc, check_bb, none_bb);
+        LLVMPositionBuilderAtEnd(g->builder, check_bb);
+        LLVMBuildCondBr(g->builder, isStr, str_bb, cls_bb);
+        LLVMPositionBuilderAtEnd(g->builder, str_bb);
+        {
+            LLVMValueRef sfmt = zan_irgen_intern_string(g, "Unhandled exception: %s\n");
+            zan_call2(g->builder, LLVMFunctionType(i32t, &i8ptr, 1, 1), printf_fn,
+                (LLVMValueRef[]){ sfmt, exc }, 2, "");
+            LLVMBuildBr(g->builder, cont_bb);
+        }
+        LLVMPositionBuilderAtEnd(g->builder, cls_bb);
+        {
+            LLVMValueRef name_fn = get_eh_tid_name_fn(g);
+            LLVMValueRef cname = zan_call2(g->builder,
+                LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i8ptr }, 1, 0),
+                name_fn, (LLVMValueRef[]){ tid }, 1, "term.cname");
+            LLVMValueRef found = zan_icmp(g->builder, LLVMIntNE, cname,
+                LLVMConstNull(i8ptr), "term.cfound");
+            LLVMBasicBlockRef named_bb = LLVMAppendBasicBlockInContext(g->ctx, cur_fn, "term.named");
+            LLVMBasicBlockRef anon_bb = LLVMAppendBasicBlockInContext(g->ctx, cur_fn, "term.anon");
+            LLVMBuildCondBr(g->builder, found, named_bb, anon_bb);
+            LLVMPositionBuilderAtEnd(g->builder, named_bb);
+            emit_unhandled_class_exc_print(g, cur_fn, LLVMFunctionType(i32t, &i8ptr, 1, 1),
+                printf_fn, cname, exc, tid, cont_bb);
+            LLVMPositionBuilderAtEnd(g->builder, anon_bb);
+            LLVMValueRef afmt = zan_irgen_intern_string(g, "Unhandled exception: class instance\n");
+            zan_call2(g->builder, LLVMFunctionType(i32t, &i8ptr, 1, 1), printf_fn,
+                (LLVMValueRef[]){ afmt }, 1, "");
+            LLVMBuildBr(g->builder, cont_bb);
+        }
+        LLVMPositionBuilderAtEnd(g->builder, none_bb);
+        {
+            LLVMValueRef nfmt = zan_irgen_intern_string(g, "Unhandled exception\n");
+            zan_call2(g->builder, LLVMFunctionType(i32t, &i8ptr, 1, 1), printf_fn,
+                (LLVMValueRef[]){ nfmt }, 1, "");
+            LLVMBuildBr(g->builder, cont_bb);
+        }
+        LLVMPositionBuilderAtEnd(g->builder, cont_bb);
+        LLVMValueRef exit_fn = get_libc_fn(g, "exit", LLVMFunctionType(void_ty, &i32t, 1, 0));
+        LLVMValueRef code1 = LLVMConstInt(i32t, 1, 0);
+        zan_call2(g->builder, LLVMFunctionType(void_ty, &i32t, 1, 0), exit_fn, &code1, 1, "");
+        LLVMBuildUnreachable(g->builder);
+        zan_builder_restore(g, pt);
+    }
+
+    LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    LLVMTypeRef st_ty = LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i8ptr }, 1, 0);
+    LLVMValueRef set_term = LLVMGetNamedFunction(g->mod, "_ZSt13set_terminatePFvvE");
+    if (!set_term) set_term = LLVMAddFunction(g->mod, "_ZSt13set_terminatePFvvE", st_ty);
+    LLVMValueRef term_ptr = LLVMBuildBitCast(g->builder, term_fn, i8ptr, "term.fp");
+    zan_call2(g->builder, st_ty, set_term, &term_ptr, 1, "");
+}
+
 static void emit_main_method(zan_irgen_t *g, zan_ast_node_t *method, zan_symbol_t *type_sym,
                              zan_ast_node_t *unit) {
     LLVMTypeRef i32ty = LLVMInt32TypeInContext(g->ctx);
@@ -252,6 +332,7 @@ static void emit_main_method(zan_irgen_t *g, zan_ast_node_t *method, zan_symbol_
     LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(g->ctx, main_fn, "entry");
     LLVMPositionBuilderAtEnd(g->builder, entry);
     di_clear(g);
+    emit_eh_terminate_setup(g);
 
     if (g->target_is_windows) {
         LLVMTypeRef uintt = LLVMInt32TypeInContext(g->ctx);
@@ -1079,6 +1160,7 @@ static void emit_async_method_ir(zan_irgen_t *g, method_body_work_t *w) {
         int saved_foreach_next = g->current_async_foreach_next;
         int saved_this_owned = g->current_async_this_owned;
         zan_type_t *saved_this_owned_type = g->current_async_this_type;
+        int saved_lpad_depth = g->lpad_depth;
 
         g->current_fn_ret_type = LLVMVoidTypeInContext(g->ctx);
         int saved_throw_base = g->throw_locals_base;
@@ -1228,6 +1310,7 @@ static void emit_async_method_ir(zan_irgen_t *g, method_body_work_t *w) {
         g->eh_armed_count = saved_eh_c;
         g->eh_armed_base = saved_eh_b;
         g->eh_armed_loop_base = saved_eh_lb;
+        g->lpad_depth = saved_lpad_depth;
         g->current_this = saved_this;
         g->current_type_sym = saved_type_sym;
         g->current_async_frame = saved_async_frame;
@@ -1983,6 +2066,17 @@ static void emit_user_method_bodies(zan_irgen_t *g, method_body_work_t *work,
         int saved_eh_c = g->eh_armed_count;
         int saved_eh_b = g->eh_armed_base;
         int saved_eh_lb = g->eh_armed_loop_base;
+        int saved_lpad_depth = g->lpad_depth;
+        LLVMBasicBlockRef fn_cleanup_bb = NULL;
+        if (!g->current_async_frame && g->lpad_depth < ZAN_MAX_ARMED_TRY) {
+            fn_cleanup_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "fn.lpad");
+            g->lpad_stack[g->lpad_depth].fn = fn;
+            g->lpad_stack[g->lpad_depth].lpad_bb = fn_cleanup_bb;
+            g->lpad_stack[g->lpad_depth].catch_bb = NULL;
+            g->lpad_stack[g->lpad_depth].throw_locals_base = 0;
+            g->lpad_stack[g->lpad_depth].fin_idx = -1;
+            g->lpad_depth++;
+        }
         g->throw_locals_base = 0;
         g->catch_cleanup_count = 0;
         g->throw_catch_base = 0;
@@ -2153,6 +2247,25 @@ static void emit_user_method_bodies(zan_irgen_t *g, method_body_work_t *work,
                 LLVMBuildRetVoid(g->builder);
             } else {
                 LLVMBuildRet(g->builder, LLVMConstNull(llvm_ret));
+            }
+        }
+
+        g->lpad_depth = saved_lpad_depth;
+        if (fn_cleanup_bb) {
+            if (LLVMGetFirstUse(LLVMBasicBlockAsValue(fn_cleanup_bb)) != NULL) {
+                zan_builder_point_t cl_pt = zan_builder_save(g);
+                LLVMPositionBuilderAtEnd(g->builder, fn_cleanup_bb);
+                ensure_function_personality(g, fn);
+                LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+                LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
+                LLVMTypeRef lp_ret_ty = LLVMStructTypeInContext(g->ctx, (LLVMTypeRef[]){ i8ptr, i32t }, 2, 0);
+                LLVMValueRef lp = LLVMBuildLandingPad(g->builder, lp_ret_ty, get_eh_personality_fn(g), 0, "fn.lp");
+                LLVMSetCleanup(lp, 1);
+                emit_release_owned_locals(g, locals);
+                LLVMBuildResume(g->builder, lp);
+                zan_builder_restore(g, cl_pt);
+            } else {
+                LLVMDeleteBasicBlock(fn_cleanup_bb);
             }
         }
 

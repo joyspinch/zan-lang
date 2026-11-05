@@ -1787,11 +1787,8 @@ void emit_eh_hook_call(zan_irgen_t *g, const char *name);
 void emit_async_eh_prologue(zan_irgen_t *g) {
     LLVMTypeRef i32 = LLVMInt32TypeInContext(g->ctx);
     LLVMValueRef fn = g->current_async_resume_fn;
-    LLVMValueRef frame = g->current_async_frame;
-    LLVMTypeRef ft = g->current_async_frame_type;
     LLVMValueRef top_g, bufs_g, exc_g;
     get_eh_globals(g, &top_g, &bufs_g, &exc_g);
-    LLVMValueRef zero = LLVMConstInt(i32, 0, 0);
 
     LLVMValueRef entry_slot = LLVMBuildAlloca(g->builder, i32, "eh.co.entry");
     g->current_async_eh_entry = entry_slot;
@@ -1802,135 +1799,27 @@ void emit_async_eh_prologue(zan_irgen_t *g) {
     LLVMBasicBlockRef disp_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "co.dispatch");
     g->current_async_exc_bb = exc_bb;
 
-    if (g->current_async_try_count == 0) {
-        /* 无内部 try 语句时直接跳转至分发块 */
-        LLVMValueRef t = LLVMBuildLoad2(g->builder, i32, top_g, "eh.t");
-        LLVMValueRef t1 = zan_add(g->builder, t, LLVMConstInt(i32, 1, 0), "eh.t1");
-        LLVMBuildStore(g->builder, t1, top_g);
-        LLVMBuildStore(g->builder,
-            LLVMBuildLoad2(g->builder, i32, get_eh_tmp_top_global(g), "eh.t0"),
-            emit_eh_mark_ptr(g, t1));
-        LLVMValueRef r = emit_eh_setjmp(g, emit_eh_buf_ptr(g, t1));
-        LLVMValueRef took = zan_icmp(g->builder, LLVMIntEQ, r, zero, "eh.took");
-        LLVMBuildCondBr(g->builder, took, disp_bb, exc_bb);
+    LLVMBasicBlockRef lpad_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "co.lpad");
+    zan_builder_point_t lpad_pt = zan_builder_save(g);
+    LLVMPositionBuilderAtEnd(g->builder, lpad_bb);
+    ensure_function_personality(g, fn);
+    LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    LLVMTypeRef lp_ret_ty = LLVMStructTypeInContext(g->ctx, (LLVMTypeRef[]){ i8ptr, i32 }, 2, 0);
+    LLVMValueRef lp_val = LLVMBuildLandingPad(g->builder, lp_ret_ty, get_eh_personality_fn(g), 1, "lp");
+    LLVMAddClause(lp_val, LLVMConstNull(i8ptr));
+    LLVMSetCleanup(lp_val, 1);
+    LLVMBuildBr(g->builder, exc_bb);
+    zan_builder_restore(g, lpad_pt);
 
-        LLVMPositionBuilderAtEnd(g->builder, disp_bb);
-        return;
+    if (g->lpad_depth < ZAN_MAX_ARMED_TRY) {
+        g->lpad_stack[g->lpad_depth].lpad_bb = lpad_bb;
+        g->lpad_stack[g->lpad_depth].catch_bb = exc_bb;
+        g->lpad_stack[g->lpad_depth].fn = fn;
+        g->lpad_stack[g->lpad_depth].throw_locals_base = 0;
+        g->lpad_depth++;
     }
 
-    LLVMValueRef idx_slot = LLVMBuildAlloca(g->builder, i32, "eh.co.i");
-    LLVMValueRef id_slot = LLVMBuildAlloca(g->builder, i32, "eh.co.id");
-    LLVMBuildStore(g->builder, zero, idx_slot);
-
-    LLVMBasicBlockRef head_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "eh.rearm");
-    LLVMBasicBlockRef arm_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "eh.arm");
-    LLVMBasicBlockRef init_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "eh.init");
-    LLVMBasicBlockRef next_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "eh.next");
-    LLVMBasicBlockRef land_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "eh.land");
-
-    {
-        LLVMValueRef t = LLVMBuildLoad2(g->builder, i32, top_g, "eh.t");
-        LLVMValueRef t1 = zan_add(g->builder, t, LLVMConstInt(i32, 1, 0), "eh.t1");
-        LLVMBuildStore(g->builder, t1, top_g);
-        /* 记录处理器挂载时的临时变量栈深度，供异常展开时清理 */
-        LLVMBuildStore(g->builder,
-            LLVMBuildLoad2(g->builder, i32, get_eh_tmp_top_global(g), "eh.t0"),
-            emit_eh_mark_ptr(g, t1));
-        LLVMValueRef r = emit_eh_setjmp(g, emit_eh_buf_ptr(g, t1));
-        LLVMValueRef took = zan_icmp(g->builder, LLVMIntEQ, r, zero, "eh.took");
-        LLVMBuildCondBr(g->builder, took, head_bb, exc_bb);
-    }
-
-    LLVMPositionBuilderAtEnd(g->builder, head_bb);
-    {
-        LLVMValueRef i = LLVMBuildLoad2(g->builder, i32, idx_slot, "eh.i");
-        LLVMValueRef hc = LLVMBuildLoad2(g->builder, i32,
-            LLVMBuildStructGEP2(g->builder, ft, frame, ASYNC_FRAME_HCOUNT, "hc.p"), "hc");
-        /* 限制活跃处理器计数不超过帧分配的容量上限 */
-        LLVMValueRef cap = LLVMConstInt(i32, g->current_async_handler_cap, 0);
-        hc = LLVMBuildSelect(g->builder,
-            zan_icmp(g->builder, LLVMIntSLT, hc, cap, "hc.fits"), hc, cap, "hc.cap");
-        LLVMValueRef more = zan_icmp(g->builder, LLVMIntSLT, i, hc, "eh.more");
-        LLVMBuildCondBr(g->builder, more, arm_bb, disp_bb);
-    }
-
-    LLVMPositionBuilderAtEnd(g->builder, arm_bb);
-    {
-        LLVMValueRef i = LLVMBuildLoad2(g->builder, i32, idx_slot, "eh.i2");
-        LLVMValueRef hs_idx[2] = { zero, i };
-        LLVMValueRef hs = LLVMBuildStructGEP2(g->builder, ft, frame,
-            ASYNC_FRAME_HSTACK, "hs");
-        LLVMValueRef slot = LLVMBuildGEP2(g->builder,
-            LLVMArrayType(i32, (unsigned)g->current_async_handler_cap),
-            hs, hs_idx, 2, "hs.slot");
-        LLVMBuildStore(g->builder,
-            LLVMBuildLoad2(g->builder, i32, slot, "hs.id"), id_slot);
-        LLVMValueRef t = LLVMBuildLoad2(g->builder, i32, top_g, "eh.t2");
-        LLVMValueRef t1 = zan_add(g->builder, t, LLVMConstInt(i32, 1, 0), "eh.t3");
-        LLVMBuildStore(g->builder, t1, top_g);
-        LLVMBuildStore(g->builder,
-            LLVMBuildLoad2(g->builder, i32, get_eh_tmp_top_global(g), "eh.t3m"),
-            emit_eh_mark_ptr(g, t1));
-        LLVMValueRef r = emit_eh_setjmp(g, emit_eh_buf_ptr(g, t1));
-        LLVMValueRef took = zan_icmp(g->builder, LLVMIntEQ, r, zero, "eh.took2");
-        LLVMBuildCondBr(g->builder, took, init_bb, land_bb);
-    }
-
-    /* 恢复此前 invocation 挂载的异常处理器标记 */
-    LLVMPositionBuilderAtEnd(g->builder, init_bb);
-    g->current_async_rearm_next_bb = next_bb;
-    g->current_async_rearm_init_switch = LLVMBuildSwitch(g->builder,
-        LLVMBuildLoad2(g->builder, i32, id_slot, "eh.id0"), next_bb,
-        (unsigned)g->current_async_handler_cap);
-
-    LLVMPositionBuilderAtEnd(g->builder, next_bb);
-    {
-        LLVMValueRef i = LLVMBuildLoad2(g->builder, i32, idx_slot, "eh.i3");
-        LLVMBuildStore(g->builder,
-            zan_add(g->builder, i, LLVMConstInt(i32, 1, 0), "eh.i4"), idx_slot);
-        LLVMBuildBr(g->builder, head_bb);
-    }
-
-    /* 命中恢复挂载的异常处理器：分发至对应 try 块的 catch 分支 */
-    LLVMPositionBuilderAtEnd(g->builder, land_bb);
-    {
-        /* 根据 longjmp 跳转目标深度反查命中的处理器索引 k */
-        LLVMValueRef t = LLVMBuildLoad2(g->builder, i32, top_g, "eh.land.top");
-        LLVMValueRef e = LLVMBuildLoad2(g->builder, i32, entry_slot, "eh.land.entry");
-        LLVMValueRef k = zan_sub(g->builder,
-            zan_sub(g->builder, t, e, "eh.land.d"),
-            LLVMConstInt(i32, 2, 0), "eh.land.k");
-        LLVMValueRef ok = zan_and(g->builder,
-            zan_icmp(g->builder, LLVMIntSGE, k, zero, "eh.land.lo"),
-            zan_icmp(g->builder, LLVMIntSLT, k,
-                LLVMConstInt(i32, g->current_async_handler_cap, 0), "eh.land.hi"),
-            "eh.land.ok");
-        LLVMValueRef ksafe = LLVMBuildSelect(g->builder, ok, k, zero, "eh.land.ks");
-        LLVMBuildStore(g->builder, ksafe, idx_slot);
-        LLVMValueRef hs = LLVMBuildStructGEP2(g->builder, ft, frame,
-            ASYNC_FRAME_HSTACK, "hs.l");
-        LLVMValueRef hs_idx[2] = { zero, ksafe };
-        LLVMValueRef slot = LLVMBuildGEP2(g->builder,
-            LLVMArrayType(i32, (unsigned)g->current_async_handler_cap),
-            hs, hs_idx, 2, "hs.lslot");
-        LLVMValueRef id = LLVMBuildSelect(g->builder, ok,
-            LLVMBuildLoad2(g->builder, i32, slot, "hs.lid"),
-            LLVMConstInt(i32, -1, 1), "eh.land.id");
-        LLVMBuildStore(g->builder, id, id_slot);
-        LLVMBuildStore(g->builder,
-            zan_add(g->builder, ksafe, LLVMConstInt(i32, 1, 0), "eh.land.hc"),
-            LLVMBuildStructGEP2(g->builder, ft, frame, ASYNC_FRAME_HCOUNT, "hc.l"));
-        /* 展开并释放捕获处理器之上的临时分配变量 */
-        emit_eh_unwind_to_handler(g,
-            zan_add(g->builder,
-                zan_add(g->builder, e, LLVMConstInt(i32, 2, 0), "eh.land.a2"),
-                ksafe, "eh.land.arm"));
-    }
-    /* longjmp 捕获后从帧中重载局部变量最新值供 catch 块读取 */
-    g->current_async_rearm_switch = LLVMBuildSwitch(g->builder,
-        LLVMBuildLoad2(g->builder, i32, id_slot, "eh.id"), exc_bb,
-        (unsigned)g->current_async_handler_cap);
-
+    LLVMBuildBr(g->builder, disp_bb);
     LLVMPositionBuilderAtEnd(g->builder, disp_bb);
 }
 
@@ -2033,96 +1922,9 @@ void emit_unhandled_class_exc_print(zan_irgen_t *g, LLVMValueRef fn,
     LLVMBuildBr(g->builder, cont_bb);
 }
 
-/* 重抛全局异常：跳转至最近挂载的处理器或终止进程 */
+/* 重抛全局异常：通过 LandingPad 零开销异常系统沿调用栈或协程帧展开 */
 static void emit_eh_rethrow_current(zan_irgen_t *g) {
-    LLVMTypeRef i32 = LLVMInt32TypeInContext(g->ctx);
-    LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
-    LLVMValueRef top_g, bufs_g, exc_g;
-    get_eh_globals(g, &top_g, &bufs_g, &exc_g);
-    LLVMValueRef fn = LLVMGetBasicBlockParent(LLVMGetInsertBlock(g->builder));
-    LLVMValueRef top = LLVMBuildLoad2(g->builder, i32, top_g, "reh.top");
-    LLVMValueRef has = zan_icmp(g->builder, LLVMIntSGE, top,
-        LLVMConstInt(i32, 0, 0), "reh.has");
-    LLVMBasicBlockRef jmp_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "aeh.jmp");
-    LLVMBasicBlockRef die_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "aeh.die");
-    /* wasm32 不挂载异常处理器，直接进入未捕获异常终止分支 */
-    if (g->target_is_wasm) {
-        LLVMBuildBr(g->builder, die_bb);
-        LLVMPositionBuilderAtEnd(g->builder, jmp_bb);
-        LLVMBuildUnreachable(g->builder);
-        LLVMPositionBuilderAtEnd(g->builder, die_bb);
-    } else {
-        LLVMBuildCondBr(g->builder, has, jmp_bb, die_bb);
-        LLVMPositionBuilderAtEnd(g->builder, jmp_bb);
-        emit_eh_longjmp(g, emit_eh_buf_ptr(g, top));
-        LLVMBuildUnreachable(g->builder);
-        LLVMPositionBuilderAtEnd(g->builder, die_bb);
-    }
-    {
-        emit_eh_hook_call(g, "__zan_eh_unhandled");
-        LLVMValueRef printf_fn = LLVMGetNamedFunction(g->mod, "printf");
-        if (printf_fn) {
-            LLVMTypeRef printf_ty = LLVMFunctionType(i32, &i8ptr, 1, 1);
-            /* 打印未捕获异常详细类型与调用栈信息 */
-            LLVMValueRef exc = LLVMBuildLoad2(g->builder, i8ptr, exc_g, "aeh.exc");
-            LLVMValueRef tid = LLVMBuildLoad2(g->builder, i8ptr,
-                get_eh_exc_tid_global(g), "aeh.tid");
-            LLVMValueRef hasExc = zan_icmp(g->builder, LLVMIntNE, exc,
-                LLVMConstNull(i8ptr), "aeh.has");
-            LLVMValueRef isStr = zan_icmp(g->builder, LLVMIntEQ, tid,
-                LLVMConstNull(i8ptr), "aeh.isstr");
-            LLVMBasicBlockRef str_bb =
-                LLVMAppendBasicBlockInContext(g->ctx, fn, "aeh.str");
-            LLVMBasicBlockRef cls_bb =
-                LLVMAppendBasicBlockInContext(g->ctx, fn, "aeh.cls");
-            LLVMBasicBlockRef msg_bb =
-                LLVMAppendBasicBlockInContext(g->ctx, fn, "aeh.msg");
-            LLVMBasicBlockRef plain_bb =
-                LLVMAppendBasicBlockInContext(g->ctx, fn, "aeh.plain");
-            LLVMBasicBlockRef done_bb =
-                LLVMAppendBasicBlockInContext(g->ctx, fn, "aeh.done");
-            LLVMBuildCondBr(g->builder, hasExc, str_bb, plain_bb);
-            LLVMPositionBuilderAtEnd(g->builder, plain_bb);
-            {
-                LLVMValueRef pfmt = zan_irgen_intern_string(g,
-                    "Unhandled exception\n");
-                zan_call2(g->builder, printf_ty, printf_fn, &pfmt, 1, "");
-                LLVMBuildBr(g->builder, done_bb);
-            }
-            LLVMPositionBuilderAtEnd(g->builder, str_bb);
-            LLVMBuildCondBr(g->builder, isStr, msg_bb, cls_bb);
-            LLVMPositionBuilderAtEnd(g->builder, msg_bb);
-            {
-                LLVMValueRef sfmt = zan_irgen_intern_string(g,
-                    "Unhandled exception: %s\n");
-                LLVMValueRef sargs[2] = { sfmt, exc };
-                zan_call2(g->builder, printf_ty, printf_fn, sargs, 2, "");
-                LLVMBuildBr(g->builder, done_bb);
-            }
-            LLVMPositionBuilderAtEnd(g->builder, cls_bb);
-            {
-                LLVMValueRef name_fn = get_eh_tid_name_fn(g);
-                LLVMValueRef cname = zan_call2(g->builder,
-                    LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i8ptr }, 1, 0),
-                    name_fn, (LLVMValueRef[]){ tid }, 1, "aeh.cname");
-                LLVMValueRef empty = LLVMBuildICmp(g->builder, LLVMIntEQ,
-                    cname, LLVMConstNull(i8ptr), "aeh.noname");
-                LLVMValueRef use = LLVMBuildSelect(g->builder, empty,
-                    zan_irgen_intern_string(g, "unknown"),
-                    cname, "aeh.use");
-                emit_unhandled_class_exc_print(g, fn, printf_ty, printf_fn, use, exc, tid, done_bb);
-            }
-            LLVMPositionBuilderAtEnd(g->builder, done_bb);
-        }
-        LLVMTypeRef exit_ty = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), &i32, 1, 0);
-        LLVMValueRef exit_fn = get_libc_fn(g, "exit", exit_ty);
-        LLVMValueRef one = LLVMConstInt(i32, 1, 0);
-        zan_call2(g->builder, exit_ty, exit_fn, &one, 1, "");
-        LLVMBuildUnreachable(g->builder);
-    }
-
-    LLVMBasicBlockRef cont = LLVMAppendBasicBlockInContext(g->ctx, fn, "aeh.cont");
-    LLVMPositionBuilderAtEnd(g->builder, cont);
+    emit_raise_exception(g);
 }
 
 /* 单次 resume 调用内子协程异常传播的共享重抛块 */
@@ -2202,19 +2004,7 @@ void emit_async_check_sub_exc(zan_irgen_t *g, LLVMValueRef sub,
     LLVMValueRef threw = zan_icmp(g->builder, LLVMIntNE, ev,
         LLVMConstNull(i8ptr), "sub.threw");
 
-    LLVMBasicBlockRef cur_bb = LLVMGetInsertBlock(g->builder);
     LLVMBasicBlockRef ok_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "sub.ok");
-
-    if (!tmp_mark && g->current_async_resume_fn) {
-        /* 路由异常处理至共享子重抛块 */
-        LLVMBasicBlockRef sub_rethrow_bb = get_async_sub_rethrow_bb(g);
-        LLVMAddIncoming(g->current_async_sub_rethrow_phi_sub, &sub, &cur_bb, 1);
-        LLVMAddIncoming(g->current_async_sub_rethrow_phi_ev, &ev, &cur_bb, 1);
-        LLVMBuildCondBr(g->builder, threw, sub_rethrow_bb, ok_bb);
-        LLVMPositionBuilderAtEnd(g->builder, ok_bb);
-        return;
-    }
-
     LLVMBasicBlockRef thr_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "sub.rethrow");
     LLVMBuildCondBr(g->builder, threw, thr_bb, ok_bb);
 
@@ -2232,14 +2022,7 @@ void emit_async_check_sub_exc(zan_irgen_t *g, LLVMValueRef sub,
         zan_call2(g->builder, uwty, get_eh_tmp_unwind_fn(g), &tmp_mark, 1, "");
     }
     zan_emit_frame_free(g, sub);
-    LLVMBasicBlockRef rethrow_bb = get_async_rethrow_bb(g);
-    if (rethrow_bb) {
-        LLVMBuildBr(g->builder, rethrow_bb);
-    } else {
-        emit_eh_rethrow_current(g);
-        if (!LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(g->builder)))
-            LLVMBuildUnreachable(g->builder);
-    }
+    emit_raise_exception(g);
 
     LLVMPositionBuilderAtEnd(g->builder, ok_bb);
 }

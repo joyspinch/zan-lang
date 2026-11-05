@@ -29,7 +29,7 @@
 
 ### 批次 4 · 大工程 / 独占窗口（无其他 irgen/runtime 改动在飞时领）
 
-- [ ] B-ID71〔大工程 · 独占窗口；关联 B-ID64 异常路径帧析构〕SJLJ（setjmp/longjmp）异常机制与 ARC 栈展开资源泄漏/锁死锁：跨函数 throw 直接恢复栈寄存器，绕过被穿越中间帧的析构逻辑（ARC 漏释放、using 不关、zan_monitor_enter 无 exit 全局死锁）；exception_handler_depth 真回归同源——O2 DCE 把 rethrow 路径写入的局部当 dead store 删（setjmp/longjmp 对 LLVM 是不可见控制流边；已证全量 volatile alloca 无效，longjmp 后 volatile store 仍被 CPU 级跳过）。须演进为零开销栈展开（LandingPad）根治；双轨保持一致。
+- [x] B-ID71〔大工程 · 独占窗口；关联 B-ID64 异常路径帧析构〕SJLJ（setjmp/longjmp）异常机制与 ARC 栈展开资源泄漏/锁死锁：跨函数 throw 直接恢复栈寄存器，绕过被穿越中间帧的析构逻辑（ARC 漏释放、using 不关、zan_monitor_enter 无 exit 全局死锁）；exception_handler_depth 真回归同源——O2 DCE 把 rethrow 路径写入的局部当 dead store 删（setjmp/longjmp 对 LLVM 是不可见控制流边；已证全量 volatile alloca 无效，longjmp 后 volatile store 仍被 CPU 级跳过）。须演进为零开销栈展开（LandingPad）根治；双轨保持一致。
 - [x] B-ID103〔大工程 · 独占窗口 · main.c 并发禁动区〕irgen unity build 拆分：irgen.c 把 21 个 irgen_*.c 文本 include 进单 TU（约 52K 行），静态函数靠跨"文件"前向声明网维系插入顺序；main.c 在 main() 函数体内 #include "main_options_parse.c"（驱动不可单测）。修法方向：真 TU 化 + 声明网收编进头文件 + 选项解析独立编译单元。main.c 属并发禁动区，待窗口。
 - [ ] B-ID152〔裁定搁置〕ZanDB 刀8 段 zstd 压缩：stdlib 无压缩绑定，需引入外部库链接与三平台分发——与自包含分发架构相抵；且压缩块缓存仍需解压驻留，对 2G 内存机目标无益。数据面收益已被 tag 11 行编码（4×↓）替代大半，除非出现大文本字段压缩需求，不领。
 - [ ] B-ID153〔裁定搁置〕ZanDB 刀9 SIMD 距离内核：运行时只有 CPU 特性探测（System.Runtime.Intrinsics.Cpu）无向量算术内建，落地须编译器/运行时新增 AVX2/NEON 内建——超出 ZanDB 数据面范围。评估前置已满足：发布档基线实测 approx 2ms/20k 库（debug 9.9ms，约 5×，见 ZanDb README 量化检索实测），而真实查询延迟由重打分文档行点查主导（12ms，IO 不随构建档变），SIMD 对端到端收益被摊薄；除非出现纯 ADC 高 QPS 场景，不领。
