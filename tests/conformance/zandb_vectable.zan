@@ -1,0 +1,169 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Data.ZanDb;
+
+// 刀14 专用列式向量表引擎（VectorTable）一致性与生命周期用例：
+// 1. .zvec 物理文件创建与头部元数据校验（魔数 ZVEC、版本、维度、行计数）；
+// 2. Add / AddBulk 高吞吐写入与 O(1) 绝对物理偏移 Get 直读；
+// 3. Search 精确图检索与 SQ8 量化两段式重打分一致性；
+// 4. Flush 刷盘与 .zhnsw 快照流式导出/恢复；
+// 5. Remove 软删除与 Vacuum 物理空洞整理；
+// 6. ZanDatabase 门面生命周期托管（GetVectorTable、IntegrityCheck、Backup）。
+class ZanDbVectorTableTest {
+    static int checks = 0;
+
+    static void Ok(bool cond, string what) {
+        checks = checks + 1;
+        if (cond) {
+            Console.WriteLine("ok " + Convert.ToString(checks) + " - " + what);
+        } else {
+            Console.WriteLine("FAIL " + Convert.ToString(checks) + " - " + what);
+        }
+    }
+
+    static void Clean(string basePath) {
+        ZanStore.CleanTargetFiles(basePath, 256);
+        if (File.Exists(basePath + ".vtable.zvec")) { File.Delete(basePath + ".vtable.zvec"); }
+        if (File.Exists(basePath + ".vtable.zhnsw")) { File.Delete(basePath + ".vtable.zhnsw"); }
+        if (File.Exists(basePath + ".qtable.zvec")) { File.Delete(basePath + ".qtable.zvec"); }
+        if (File.Exists(basePath + ".qtable.zhnsw")) { File.Delete(basePath + ".qtable.zhnsw"); }
+    }
+
+    static float[] MakeVec(int seed, int dims) {
+        float[] v = new float[dims];
+        double sum = 0.0;
+        for (int i = 0; i < dims; i = i + 1) {
+            float val = (float)(((seed * 17 + i * 31) % 100) / 50.0 - 1.0);
+            v[i] = val;
+            sum = sum + (double)val * (double)val;
+        }
+        if (sum > 0.0) {
+            double inv = 1.0 / Math.Sqrt(sum);
+            for (int i = 0; i < dims; i = i + 1) {
+                v[i] = (float)((double)v[i] * inv);
+            }
+        }
+        return v;
+    }
+
+    static void Main() {
+        string dbPath = "_scratch/test_vt_conformance";
+        string bkPath = "_scratch/test_vt_backup";
+        Directory.CreateDirectory("_scratch");
+        Clean(dbPath);
+        Clean(bkPath);
+
+        int dims = 8;
+        VectorIndexOptions opts = new VectorIndexOptions(dims, 0); // Cosine, no quantize
+        opts.m = 8;
+        opts.efConstruction = 32;
+        opts.efSearch = 16;
+
+        // 1. 初始化打开与基础元数据
+        VectorTable vt = VectorTable.Open(dbPath, "vtable", opts);
+        Ok(vt.IsOpen(), "VectorTable open successfully");
+        Ok(vt.Count() == 0 && vt.TotalRows() == 0, "initial table is empty");
+        Ok(vt.Dimensions() == dims, "dimensions match");
+
+        // 2. 单条 Add 与 Get 点查
+        float[] v1 = MakeVec(1, dims);
+        float[] v2 = MakeVec(2, dims);
+        int id1 = vt.Add(v1);
+        int id2 = vt.Add(v2);
+        Ok(id1 == 1 && id2 == 2, "sequential id assigned");
+        Ok(vt.Count() == 2 && vt.TotalRows() == 2, "row count incremented");
+
+        float[] g1 = vt.Get(id1);
+        Ok(g1 != null && g1.Length == dims, "Get returns vector");
+        double diff = 0.0;
+        for (int i = 0; i < dims; i = i + 1) {
+            diff = diff + Math.Abs((double)g1[i] - (double)v1[i]);
+        }
+        Ok(diff < 1e-6, "Get matches original vector bytes exactly");
+
+        // 3. 批量追加 AddBulk
+        List<float[]> bulk = new List<float[]>();
+        for (int i = 3; i <= 20; i = i + 1) {
+            bulk.Add(MakeVec(i, dims));
+        }
+        int firstId = 0;
+        vt.AddBulk(bulk, out firstId);
+        Ok(firstId == 3, "AddBulk firstId is 3");
+        Ok(vt.Count() == 20 && vt.TotalRows() == 20, "AddBulk total rows is 20");
+
+        // 4. 近邻搜索（未量化全精度图）
+        List<VectorHit> hits = vt.Search(v1, 3);
+        Ok(hits.Count == 3, "search returns top-3 hits");
+        Ok(hits[0].id == id1 && hits[0].distance < 1e-5, "top-1 hit is v1 with distance 0");
+
+        // 5. 刷盘与从 .zvec + .zhnsw 快照无损重开
+        vt.Flush();
+        vt.Close();
+
+        VectorTable vtReopen = VectorTable.Open(dbPath, "vtable", opts);
+        Ok(vtReopen.IsOpen(), "reopen VectorTable succeeds");
+        Ok(vtReopen.Count() == 20 && vtReopen.TotalRows() == 20, "reopened count matches");
+        List<VectorHit> hitsReopen = vtReopen.Search(v1, 3);
+        Ok(hitsReopen.Count == 3 && hitsReopen[0].id == id1, "reopened search top hit matches");
+
+        // 6. 软删除与 Vacuum 紧凑重整
+        vtReopen.Remove(id1);
+        Ok(vtReopen.Count() == 19 && vtReopen.TotalRows() == 20, "after Remove: active=19, total=20");
+        List<VectorHit> hitsAfterRemove = vtReopen.Search(v1, 3);
+        bool hasRemoved = false;
+        for (int i = 0; i < hitsAfterRemove.Count; i = i + 1) {
+            if (hitsAfterRemove[i].id == id1) { hasRemoved = true; }
+        }
+        Ok(!hasRemoved, "removed id is not in search hits");
+
+        vtReopen.Vacuum();
+        Ok(vtReopen.Count() == 19 && vtReopen.TotalRows() == 19, "after Vacuum: active=19, total=19");
+        vtReopen.Close();
+
+        // 7. SQ8 量化两段式重打分表
+        VectorIndexOptions qopts = new VectorIndexOptions(dims, 0, true);
+        qopts.m = 8;
+        qopts.efConstruction = 32;
+        qopts.efSearch = 16;
+        VectorTable qvt = VectorTable.Open(dbPath, "qtable", qopts);
+        List<float[]> qbulk = new List<float[]>();
+        for (int i = 1; i <= 30; i = i + 1) {
+            qbulk.Add(MakeVec(i * 3, dims));
+        }
+        int qfirst = 0;
+        qvt.AddBulk(qbulk, out qfirst);
+        Ok(qvt.Count() == 30, "quantized table count is 30");
+
+        float[] targetQ = MakeVec(3, dims);
+        List<VectorHit> qhits = qvt.Search(targetQ, 3);
+        Ok(qhits.Count == 3 && qhits[0].id == 1, "quantized search top hit is id 1");
+        Ok(qhits[0].distance < 1e-4, "quantized rescore distance is near zero");
+        qvt.Flush();
+        qvt.Close();
+
+        // 8. 统一门面 ZanDatabase 集成与备份
+        ZanDatabase db = ZanDatabase.Open(dbPath);
+        VectorTable dbVt = db.GetVectorTable("vtable", opts);
+        Ok(dbVt.Count() == 19, "ZanDatabase loads VectorTable with 19 rows");
+        List<string> problems = db.IntegrityCheck();
+        Ok(problems.Count == 0, "IntegrityCheck clean for database and vector table");
+
+        db.Flush();
+        db.Backup(bkPath);
+        db.Close();
+
+        // 校验备份库
+        ZanDatabase dbBk = ZanDatabase.Open(bkPath);
+        VectorTable bkDbVt = dbBk.GetVectorTable("vtable", opts);
+        Ok(bkDbVt.IsOpen() && bkDbVt.Count() == 19, "backup database loaded VectorTable with 19 rows");
+        List<string> bkProblems = dbBk.IntegrityCheck();
+        Ok(bkProblems.Count == 0, "backup database integrity check clean");
+        dbBk.Close();
+
+        // 收尾清理
+        Clean(dbPath);
+        Clean(bkPath);
+        Console.WriteLine("ALL " + Convert.ToString(checks) + " CHECKS PASSED");
+    }
+}

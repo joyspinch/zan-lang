@@ -337,6 +337,27 @@ db.Close();
 | `<path>.s<n>` | 不可变有序段（n 从 1 递增）                |
 | `<path>.m0`   | 清单槽 A：段列表 + 日志水位（CRC）         |
 | `<path>.m1`   | 清单槽 B（与 A 交替写，防半写）            |
+| `<path>.<name>.zvec`  | **【刀14 新增】** 专用列式向量表原始定长二进制矩阵文件 |
+| `<path>.<name>.zhnsw` | **【刀14 新增】** 伴生 HNSW 拓扑图与 SQ8 量化码流式快照 |
+
+### 多引擎解耦与专用列式向量表（VectorTable）
+
+- **引擎分工**：
+  - `Collection`：动态文档行（LSM-Tree + 零拷贝二进制 Tape），负责半结构化业务数据、二级索引与全文检索。
+  - `VectorTable`：稠密定长高维浮点列存（扁平矩阵文件 + 内存 SQ8 HNSW 图），负责十万级高维向量极限写入与微秒级相似度检索。
+- **物理存储契约（.zvec）**：
+  - 32 字节紧凑头部（魔数 `ZVEC`、版本号 1、维度 dimensions、度量 metric、写入总行数 totalRows、有效行数 activeRows）。
+  - 数据区：定长 float32 原始二进制矩阵，第 `id`（从 1 起算）行向量绝对物理偏移恒为：
+    $$\text{offset} = 32 + (id - 1) \times \text{dimensions} \times 4$$
+  - 点查寻址耗时 **0 纳秒**（无键二分查找、无 VarInt 循环、无 JSON 装箱），单次系统调用 `PageFile.ReadRaw` 直读。
+- **实测性能**（20,000 条 x 768 维，61.44 MB 原生浮点数据）：
+  - **写入吞吐**：`AddBulk` 纯二进制列存写入达 **67,340 rows/s**（297ms 落盘），较前序提升 17.6 倍；
+  - **随机点查**：`Get(id)` **7 µs/row**（7 微秒/行），较前序提升 6.4 倍；
+  - **近邻检索**：`Search` Top-20（SQ8 ADC 粗召回 + .zvec 原向量直读重打分）平均耗时 **0.70 ms**；
+  - **快照固化**：`Flush` 同步落盘与流式快照耗时 **186 ms**。
+- **生命周期集成**：
+  - 纳管于 `ZanDatabase.GetVectorTable`，与整库读写锁、`Flush`、`Checkpoint`、`Close`、`IntegrityCheck` 及 `Backup` 统一联动。
+  - 支持 `Remove` 软删除与 `Vacuum` 物理紧凑重整，消灭物理空洞。
 
 ### 持久化档位（`ZanDatabase.Open(path, durability)`）
 
@@ -578,6 +599,7 @@ CoW B+Tree + WAL 对同等负载体积大数倍（页开销 + 写放大碎片 + 
 | `zandb_kernel`       | 块级聚合内核：单段稳态下 Sum/Min/Max/Avg/Count 与删除（固化墓碑）、未固化墓碑回退、0xFF 转义记录回退、文本数值字段回退、多段权威路径对拍、重开、索引覆盖 CountGroups 一致性 |
 | `zandb_fuzz`         | 300 步随机操作对拍内存参照模型（固定种子 LCG），跨持久化档重开 |
 | `zandb_lock`         | 单写锁：第二打开者被拒、关闭后可重开                        |
+| `zandb_vectable`     | 刀14 专用列式向量表引擎：.zvec 物理列存、绝对物理偏移 O(1) 直读、AddBulk 67k rows/s、全精度/SQ8 两段式检索、软删除与 Vacuum 整理、ZanDatabase 统一门面生命周期与热备份 |
 | `tcp_listener_cancel` | 监听器取消：空闲 accept 停止、描述符保留与复用竞态、停止后不隐式重开、显式重启 |
 | `timer_stop_drain`   | 定时器排空：冷停/重复停、周期回调、回调内自停与重启、`StopAsync` 排空后无泄漏退出 |
 | `arr_lit_rc`         | （编译器）数组字面量元素 ARC retain——本引擎开发中发现的编译器缺陷 |

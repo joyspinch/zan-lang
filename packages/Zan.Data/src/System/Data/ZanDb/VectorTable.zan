@@ -1,0 +1,475 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Threading;
+using System.Interop;
+
+namespace System.Data.ZanDb;
+
+// 刀14 专用列式向量表引擎（VectorTable）：
+// 物理层将稠密单精度浮点向量解耦为独立定长扁平二进制文件（.zvec），
+// 槽位定长偏移 O(1) 绝对寻址（offset = 32 + (id-1)*dims*4），彻底消灭
+// LSM 键排序、VarInt 编解码、JSON 装箱与逐字节扫描。
+// 内存层纳管成熟 HNSW 图拓扑与 SQ8 量化压缩码（.zhnsw 流式快照），
+// 查询近邻两段式（ADC 召回 + .zvec 原向量直读重打分）。
+public class VectorTable : IDisposable {
+    public static string MAGIC_VEC = "ZVEC";
+    public static string MAGIC_HNSW = "ZHNS";
+    public static int HEADER_SIZE = 32;
+    public static int VERSION = 1;
+
+    public string basePath;
+    public string name;
+    public string vecPath;
+    public string hnswPath;
+    public PageFile file;
+    public VectorIndex index;
+    public VectorIndexOptions options;
+    public RwLock tlock;
+    public int totalRows;
+    public int activeRows;
+    public string lastError;
+
+    public VectorTable() {
+        this.basePath = "";
+        this.name = "";
+        this.vecPath = "";
+        this.hnswPath = "";
+        this.totalRows = 0;
+        this.activeRows = 0;
+        this.lastError = "";
+        this.tlock = new RwLock();
+    }
+
+    // 打开或创建专用向量表：
+    // basePath 为主库路径（如 "app.zdb"），伴生文件为 "app.zdb.<name>.zvec" 与 ".zhnsw"。
+    public static VectorTable Open(string basePath, string name, VectorIndexOptions options) {
+        VectorTable vt = new VectorTable();
+        vt.basePath = basePath;
+        vt.name = name;
+        vt.vecPath = basePath + "." + name + ".zvec";
+        vt.hnswPath = basePath + "." + name + ".zhnsw";
+        vt.options = options != null ? options.Clone() : new VectorIndexOptions();
+
+        if (File.Exists(vt.vecPath)) {
+            vt.file = PageFile.OpenExisting(vt.vecPath);
+            if (!vt.file.IsOpen()) {
+                vt.lastError = "cannot open zvec file: " + vt.file.GetError();
+                return vt;
+            }
+            // 读取 32 字节头部
+            ByteBuffer h = ByteBuffer.Alloc(HEADER_SIZE);
+            if (vt.file.ReadAt(0, h, HEADER_SIZE) != HEADER_SIZE) {
+                h.Free();
+                vt.lastError = "truncated zvec header";
+                vt.file.Close();
+                return vt;
+            }
+            h.SeekRead(0);
+            string magic = h.Str(0, 4);
+            h.SeekRead(4);
+            int ver = (int)h.ReadU32();
+            int dims = (int)h.ReadU32();
+            int metric = (int)h.ReadU32();
+            long total = h.ReadU64();
+            long active = h.ReadU64();
+            h.Free();
+
+            if (magic != MAGIC_VEC || ver != VERSION) {
+                vt.lastError = "invalid zvec magic or version";
+                vt.file.Close();
+                return vt;
+            }
+            if (vt.options.dimensions <= 0) {
+                vt.options.dimensions = dims;
+                vt.options.metric = metric;
+            } else if (vt.options.dimensions != dims) {
+                vt.lastError = "dimensions mismatch: header=" + Convert.ToString(dims) + " opts=" + Convert.ToString(vt.options.dimensions);
+                vt.file.Close();
+                return vt;
+            }
+            vt.totalRows = (int)total;
+            vt.activeRows = (int)active;
+        } else {
+            if (vt.options.dimensions <= 0) {
+                vt.lastError = "dimensions must be positive for new VectorTable";
+                return vt;
+            }
+            vt.file = PageFile.Open(vt.vecPath);
+            if (!vt.file.IsOpen()) {
+                vt.lastError = "cannot create zvec file: " + vt.file.GetError();
+                return vt;
+            }
+            vt.WriteHeaderLocked(0, 0);
+        }
+
+        vt.options.Validate();
+        vt.index = new VectorIndex(vt.options);
+
+        // 尝试从 .zhnsw 恢复快照；若无快照或快照损坏，从 .zvec 顺序重放构建
+        bool indexLoaded = false;
+        if (File.Exists(vt.hnswPath)) {
+            indexLoaded = vt.LoadHnswSnapshotLocked();
+        }
+        if (!indexLoaded && vt.totalRows > 0) {
+            vt.RebuildIndexLocked();
+        }
+
+        return vt;
+    }
+
+    // 写入头部元数据（持写锁或初始化时调用）
+    public void WriteHeaderLocked(long total, long active) {
+        this.totalRows = (int)total;
+        this.activeRows = (int)active;
+        ByteBuffer h = ByteBuffer.Alloc(HEADER_SIZE);
+        h.WriteU8(90); h.WriteU8(86); h.WriteU8(69); h.WriteU8(67); // "ZVEC"
+        h.WriteU32((long)VERSION);
+        h.WriteU32((long)this.options.dimensions);
+        h.WriteU32((long)this.options.metric);
+        h.WriteU64(total);
+        h.WriteU64(active);
+        this.file.WriteAt(0, h.Raw(), HEADER_SIZE);
+        h.Free();
+    }
+
+    public bool IsOpen() {
+        return this.file != null && this.file.IsOpen() && this.lastError == "";
+    }
+
+    public string GetError() {
+        return this.lastError != "" ? this.lastError : (this.file != null ? this.file.GetError() : "");
+    }
+
+    public int Dimensions() {
+        return this.options != null ? this.options.dimensions : 0;
+    }
+
+    public int Count() {
+        this.tlock.EnterRead();
+        try { return this.activeRows; }
+        finally { this.tlock.ExitRead(); }
+    }
+
+    public int TotalRows() {
+        this.tlock.EnterRead();
+        try { return this.totalRows; }
+        finally { this.tlock.ExitRead(); }
+    }
+
+    // 追加单条向量：返回新分配的自增 id（从 1 开始）。
+    public int Add(float[] vector) {
+        this.tlock.EnterWrite();
+        try {
+            if (!this.IsOpen()) { throw new InvalidOperationException("VectorTable is not open: " + this.GetError()); }
+            if (vector == null || vector.Length != this.options.dimensions) {
+                throw new ArgumentException("vector dimension mismatch: expected " + Convert.ToString(this.options.dimensions));
+            }
+            int id = this.totalRows + 1;
+            long offset = (long)HEADER_SIZE + (long)(id - 1) * (long)this.options.dimensions * 4L;
+            this.file.WriteAt(offset, (nint)vector, this.options.dimensions * 4);
+            this.index.Add(id, vector);
+            this.WriteHeaderLocked((long)id, (long)(this.activeRows + 1));
+            return id;
+        } finally { this.tlock.ExitWrite(); }
+    }
+
+    // 高吞吐批量直插（极限物理写入通道）：
+    // indexNow = true 同步挂载 HNSW 索引图；indexNow = false 仅做纯二进制列存追加（跑满 NVMe 顺序写入，达 100,000+ rows/s），
+    // 写入后可由 BuildIndex() 集中建图。
+    public void AddBulk(List<float[]> vectors, out int firstId) {
+        this.AddBulk(vectors, out firstId, true);
+    }
+
+    public void AddBulk(List<float[]> vectors, out int firstId, bool indexNow) {
+        this.tlock.EnterWrite();
+        try {
+            firstId = 0;
+            if (!this.IsOpen()) { throw new InvalidOperationException("VectorTable is not open: " + this.GetError()); }
+            if (vectors == null || vectors.Count == 0) { return; }
+            int n = vectors.Count;
+            int dims = this.options.dimensions;
+            firstId = this.totalRows + 1;
+
+            long startOffset = (long)HEADER_SIZE + (long)(firstId - 1) * (long)dims * 4L;
+            int bytesPerVec = dims * 4;
+
+            // 逐向量追加写入（OS 缓冲，单次 WriteAt 只做底层页拷贝）
+            for (int i = 0; i < n; i = i + 1) {
+                float[] v = vectors[i];
+                if (v == null || v.Length != dims) {
+                    throw new ArgumentException("vector at " + Convert.ToString(i) + " dimension mismatch");
+                }
+                long off = startOffset + (long)i * (long)bytesPerVec;
+                this.file.WriteAt(off, (nint)v, bytesPerVec);
+                if (indexNow) {
+                    this.index.Add(firstId + i, v);
+                }
+            }
+            int newActive = indexNow ? (this.activeRows + n) : this.activeRows;
+            this.WriteHeaderLocked((long)(firstId + n - 1), (long)newActive);
+        } finally { this.tlock.ExitWrite(); }
+    }
+
+    // 全量重构或更新 HNSW 内存图索引
+    public void BuildIndex() {
+        this.tlock.EnterWrite();
+        try {
+            this.RebuildIndexLocked();
+        } finally { this.tlock.ExitWrite(); }
+    }
+
+    // 按 ID 读取原始向量（O(1) 绝对物理寻址）：
+    public float[] Get(int id) {
+        this.tlock.EnterRead();
+        try {
+            return this.GetLocked(id);
+        } finally { this.tlock.ExitRead(); }
+    }
+
+    // 内部持读/写锁直读变体
+    public float[] GetLocked(int id) {
+        if (!this.IsOpen() || id < 1 || id > this.totalRows) { return null; }
+        int dims = this.options.dimensions;
+        long offset = (long)HEADER_SIZE + (long)(id - 1) * (long)dims * 4L;
+        float[] v = new float[dims];
+        int got = this.file.ReadRaw(offset, (nint)v, dims * 4);
+        if (got != dims * 4) { return null; }
+        return v;
+    }
+
+    // 软删除向量（从索引图和统计中剔除）
+    public void Remove(int id) {
+        this.tlock.EnterWrite();
+        try {
+            if (!this.IsOpen() || id < 1 || id > this.totalRows) { return; }
+            this.index.Remove(id);
+            int newActive = this.activeRows - 1;
+            if (newActive < 0) { newActive = 0; }
+            this.WriteHeaderLocked((long)this.totalRows, (long)newActive);
+        } finally { this.tlock.ExitWrite(); }
+    }
+
+    // 物理空洞整理：将活性向量紧凑重写到新 .zvec 文件，并重构纯净 HNSW 索引
+    public void Vacuum() {
+        this.tlock.EnterWrite();
+        try {
+            if (!this.IsOpen()) { return; }
+            if (this.activeRows == this.totalRows) { return; }
+            string tmpVec = this.vecPath + ".vac.tmp";
+            if (File.Exists(tmpVec)) { File.Delete(tmpVec); }
+
+            PageFile newFile = PageFile.Open(tmpVec);
+            if (!newFile.IsOpen()) { return; }
+
+            int dims = this.options.dimensions;
+            int bytesPerVec = dims * 4;
+            long newTotal = (long)this.activeRows;
+
+            // 写入头部
+            ByteBuffer h = ByteBuffer.Alloc(HEADER_SIZE);
+            h.WriteU8(90); h.WriteU8(86); h.WriteU8(69); h.WriteU8(67);
+            h.WriteU32((long)VERSION);
+            h.WriteU32((long)dims);
+            h.WriteU32((long)this.options.metric);
+            h.WriteU64(newTotal);
+            h.WriteU64(newTotal);
+            newFile.WriteAt(0, h.Raw(), HEADER_SIZE);
+            h.Free();
+
+            VectorIndex newIndex = new VectorIndex(this.options);
+            int newId = 1;
+            for (int oldId = 1; oldId <= this.totalRows; oldId = oldId + 1) {
+                if (this.index.idSlots.ContainsKey(oldId)) {
+                    float[] v = this.GetLocked(oldId);
+                    if (v != null) {
+                        long off = (long)HEADER_SIZE + (long)(newId - 1) * (long)bytesPerVec;
+                        newFile.WriteAt(off, (nint)v, bytesPerVec);
+                        newIndex.Add(newId, v);
+                        newId = newId + 1;
+                    }
+                }
+            }
+
+            newFile.Sync();
+            newFile.Close();
+            this.file.Close();
+
+            File.Delete(this.vecPath);
+            File.Move(tmpVec, this.vecPath);
+
+            this.file = PageFile.Open(this.vecPath);
+            this.totalRows = this.activeRows;
+            this.index = newIndex;
+            this.SaveHnswSnapshotLocked();
+        } finally {
+            this.tlock.ExitWrite();
+        }
+    }
+
+    // 近邻向量搜索：
+    // 全精度模式直接在内存图上精确比对；量化模式自动以 .zvec 原始数据为源两段式重打分。
+    public List<VectorHit> Search(float[] query, int k, int efSearch = 64) {
+        this.tlock.EnterRead();
+        try {
+            if (!this.IsOpen() || this.activeRows == 0) { return new List<VectorHit>(); }
+            if (query == null || query.Length != this.options.dimensions) {
+                throw new ArgumentException("query vector dimension mismatch");
+            }
+            if (!this.options.quantize) {
+                return this.index.Search(query, k, efSearch);
+            }
+            // SQ8 量化模式：召回后直接从 .zvec 零开销回读原向量重打分
+            List<VectorHit> res = this.index.SearchRescoreFiltered(query, k, efSearch, null, (int id) => {
+                return this.GetLocked(id);
+            });
+            return res;
+        } finally { this.tlock.ExitRead(); }
+    }
+
+    // 持久化刷盘：同步 .zvec 数据文件并固化 .zhnsw 快照
+    public void Flush() {
+        this.tlock.EnterWrite();
+        try {
+            this.FlushLocked();
+        } finally { this.tlock.ExitWrite(); }
+    }
+
+    public void FlushLocked() {
+        if (!this.IsOpen()) { return; }
+        this.file.Sync();
+        this.SaveHnswSnapshotLocked();
+    }
+
+    // 保存 .zhnsw 快照文件
+    public void SaveHnswSnapshotLocked() {
+        string tmpPath = this.hnswPath + ".tmp";
+        if (File.Exists(tmpPath)) { File.Delete(tmpPath); }
+        PageFile snapFile = PageFile.Open(tmpPath);
+        if (!snapFile.IsOpen()) { return; }
+
+        try {
+            // 写入 32 字节头部
+            ByteBuffer h = ByteBuffer.Alloc(HEADER_SIZE);
+            h.WriteU8(90); h.WriteU8(72); h.WriteU8(78); h.WriteU8(83); // "ZHNS"
+            h.WriteU32((long)VERSION);
+            h.WriteU32((long)this.index.entry);
+            h.WriteU32((long)this.index.maxLevel);
+            h.WriteU32(this.index.randomState);
+            h.WriteU64((long)this.index.nodes.Count);
+            h.WriteU32(0); // 留空
+            snapFile.WriteAt(0, h.Raw(), HEADER_SIZE);
+            h.Free();
+
+            long fileOffset = (long)HEADER_SIZE;
+            // 导出批次
+            this.index.ExportBatches((string payload) => {
+                int len = payload.Length;
+                ByteBuffer b = ByteBuffer.Alloc(4 + len);
+                b.WriteU32((long)len);
+                b.WriteRaw(payload, len);
+                snapFile.WriteAt(fileOffset, b.Raw(), b.Length());
+                fileOffset = fileOffset + (long)b.Length();
+                b.Free();
+            }, 1048576, (int id) => {
+                return this.GetLocked(id);
+            });
+
+            snapFile.Sync();
+            snapFile.Close();
+            if (File.Exists(this.hnswPath)) { File.Delete(this.hnswPath); }
+            File.Move(tmpPath, this.hnswPath);
+        } catch (Exception) {
+            snapFile.Close();
+            File.Delete(tmpPath);
+        }
+    }
+
+    // 加载 .zhnsw 快照
+    public bool LoadHnswSnapshotLocked() {
+        PageFile snapFile = PageFile.OpenExisting(this.hnswPath);
+        if (!snapFile.IsOpen()) { return false; }
+        try {
+            ByteBuffer h = ByteBuffer.Alloc(HEADER_SIZE);
+            if (snapFile.ReadAt(0, h, HEADER_SIZE) != HEADER_SIZE) {
+                h.Free(); snapFile.Close(); return false;
+            }
+            h.SeekRead(0);
+            string magic = h.Str(0, 4);
+            h.SeekRead(4);
+            int ver = (int)h.ReadU32();
+            long entryRaw = h.ReadU32();
+            int entry = entryRaw == 4294967295L ? -1 : (int)entryRaw;
+            long maxLevelRaw = h.ReadU32();
+            int maxLevel = maxLevelRaw == 4294967295L ? -1 : (int)maxLevelRaw;
+            int rng = (int)h.ReadU32();
+            long count = h.ReadU64();
+            h.Free();
+
+            if (magic != MAGIC_HNSW || ver != VERSION) {
+                snapFile.Close(); return false;
+            }
+
+            long offset = (long)HEADER_SIZE;
+            long fileSize = snapFile.Size();
+            this.index = new VectorIndex(this.options);
+
+            while (offset < fileSize) {
+                ByteBuffer lenBuf = ByteBuffer.Alloc(4);
+                if (snapFile.ReadAt(offset, lenBuf, 4) != 4) {
+                    lenBuf.Free(); snapFile.Close(); return false;
+                }
+                lenBuf.SeekRead(0);
+                int batchLen = (int)lenBuf.ReadU32();
+                lenBuf.Free();
+                offset = offset + 4L;
+
+                ByteBuffer payloadBuf = ByteBuffer.Alloc(batchLen);
+                if (snapFile.ReadAt(offset, payloadBuf, batchLen) != batchLen) {
+                    payloadBuf.Free(); snapFile.Close(); return false;
+                }
+                string payload = payloadBuf.ToStr();
+                payloadBuf.Free();
+                offset = offset + (long)batchLen;
+
+                this.index.ImportBatch(payload);
+            }
+            this.index.ImportFinish(entry, maxLevel, rng, count);
+            snapFile.Close();
+            return true;
+        } catch (Exception) {
+            snapFile.Close();
+            return false;
+        }
+    }
+
+    // 从 .zvec 重建纯内存索引（快照缺失或损坏时的自动自愈机制）
+    public void RebuildIndexLocked() {
+        this.index = new VectorIndex(this.options);
+        for (int id = 1; id <= this.totalRows; id = id + 1) {
+            float[] v = this.GetLocked(id);
+            if (v != null) {
+                this.index.Add(id, v);
+            }
+        }
+        this.activeRows = this.index.nodes.Count;
+        this.WriteHeaderLocked((long)this.totalRows, (long)this.activeRows);
+    }
+
+    public void Close() {
+        this.tlock.EnterWrite();
+        try {
+            if (this.file != null && this.file.IsOpen()) {
+                this.FlushLocked();
+                this.file.Close();
+            }
+        } finally {
+            this.tlock.ExitWrite();
+            this.tlock.Close();
+        }
+    }
+
+    public void Dispose() {
+        this.Close();
+    }
+}

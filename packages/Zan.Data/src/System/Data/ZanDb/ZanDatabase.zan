@@ -12,10 +12,12 @@ public class ZanDatabase : IDisposable {
     public AsyncRwLock rw;
     public RwLock tlock;
     public List<CollectionEntry> entries;
+    public List<VectorTableEntry> vectorTables;
     public string lastError;
 
     public ZanDatabase() {
         this.entries = new List<CollectionEntry>();
+        this.vectorTables = new List<VectorTableEntry>();
         this.lastError = "";
     }
 
@@ -68,6 +70,28 @@ public class ZanDatabase : IDisposable {
         return c;
     }
 
+    // 刀14：返回指定名称的专用列式向量表（惰性打开或创建）。
+    public VectorTable GetVectorTable(string name, int dimensions, int metric = 0, bool quantize = true) {
+        return this.GetVectorTable(name, new VectorIndexOptions(dimensions, metric, quantize));
+    }
+
+    public VectorTable GetVectorTable(string name, VectorIndexOptions options) {
+        this.tlock.EnterWrite();
+        try {
+            return this.GetVectorTableLocked(name, options);
+        } finally { this.tlock.ExitWrite(); }
+    }
+
+    public VectorTable GetVectorTableLocked(string name, VectorIndexOptions options) {
+        for (int i = 0; i < this.vectorTables.Count; i = i + 1) {
+            if (this.vectorTables[i].name == name) { return this.vectorTables[i].table; }
+        }
+        string basePath = this.kv != null ? this.kv.basePath : "";
+        VectorTable vt = VectorTable.Open(basePath, name, options);
+        this.vectorTables.Add(new VectorTableEntry(name, vt));
+        return vt;
+    }
+
     // 直接访问底层的键/值存储。
     public ZanStore Kv() { return this.kv; }
 
@@ -79,6 +103,14 @@ public class ZanDatabase : IDisposable {
         List<string> problems = this.kv.IntegrityCheck();
         for (int i = 0; i < this.entries.Count; i = i + 1) {
             this.entries[i].collection.search.AuditSnapshots(problems);
+        }
+        for (int i = 0; i < this.vectorTables.Count; i = i + 1) {
+            VectorTable vt = this.vectorTables[i].table;
+            if (!vt.IsOpen()) {
+                problems.Add("vector table " + this.vectorTables[i].name + " is not open: " + vt.GetError());
+            } else if (vt.TotalRows() < vt.Count()) {
+                problems.Add("vector table " + this.vectorTables[i].name + " count inconsistent");
+            }
         }
         return problems;
         } finally { this.tlock.ExitRead(); }
@@ -101,7 +133,10 @@ public class ZanDatabase : IDisposable {
     public void Checkpoint() {
         this.tlock.EnterWrite();
         try {
-        this.kv.Checkpoint();
+            this.kv.Checkpoint();
+            for (int i = 0; i < this.vectorTables.Count; i = i + 1) {
+                this.vectorTables[i].table.Flush();
+            }
         } finally { this.tlock.ExitWrite(); }
     }
 
@@ -111,7 +146,10 @@ public class ZanDatabase : IDisposable {
     public void Flush() {
         this.tlock.EnterWrite();
         try {
-        this.kv.FlushToSegment();
+            this.kv.FlushToSegment();
+            for (int i = 0; i < this.vectorTables.Count; i = i + 1) {
+                this.vectorTables[i].table.Flush();
+            }
         } finally { this.tlock.ExitWrite(); }
     }
 
@@ -164,27 +202,60 @@ public class ZanDatabase : IDisposable {
         }
         string target = Path.Normalize(targetPath);
         this.kv.Backup(target);
-        // 对导出的数据库做全库巡检审计（包含已注册集合的索引代审计）
+
+        // 刀14：备份伴生的 VectorTable 物理文件
+        for (int i = 0; i < this.vectorTables.Count; i = i + 1) {
+            VectorTable vt = this.vectorTables[i].table;
+            vt.Flush();
+            string srcVec = vt.vecPath;
+            string dstVec = target + "." + this.vectorTables[i].name + ".zvec";
+            if (File.Exists(srcVec)) {
+                if (File.Exists(dstVec)) { File.Delete(dstVec); }
+                File.Copy(srcVec, dstVec);
+            }
+            string srcHnsw = vt.hnswPath;
+            string dstHnsw = target + "." + this.vectorTables[i].name + ".zhnsw";
+            if (File.Exists(srcHnsw)) {
+                if (File.Exists(dstHnsw)) { File.Delete(dstHnsw); }
+                File.Copy(srcHnsw, dstHnsw);
+            }
+        }
+
+        // 对导出的数据库做全库巡检审计（包含已注册集合的索引代审计与向量表校验）
         ZanDatabase probe = ZanDatabase.Open(target, ZanStore.DUR_SYNC);
         if (!probe.IsOpen()) {
             string err = probe.GetError();
             probe.Close();
             ZanStore.CleanTargetFiles(target, 256);
+            this.CleanTargetVectorFiles(target);
             throw new IOException("backup database probe failed: " + err);
         }
         for (int i = 0; i < this.entries.Count; i = i + 1) {
             probe.GetCollection(this.entries[i].name);
         }
+        for (int i = 0; i < this.vectorTables.Count; i = i + 1) {
+            probe.GetVectorTable(this.vectorTables[i].name, this.vectorTables[i].table.options);
+        }
         List<string> problems = probe.IntegrityCheck();
         probe.Close();
         if (problems.Count > 0) {
             ZanStore.CleanTargetFiles(target, 256);
+            this.CleanTargetVectorFiles(target);
             string msg = "";
             for (int i = 0; i < problems.Count; i = i + 1) {
                 if (i > 0) { msg = msg + "; "; }
                 msg = msg + problems[i];
             }
             throw new IOException("backup database integrity check failed: " + msg);
+        }
+    }
+
+    public void CleanTargetVectorFiles(string target) {
+        for (int i = 0; i < this.vectorTables.Count; i = i + 1) {
+            string dstVec = target + "." + this.vectorTables[i].name + ".zvec";
+            if (File.Exists(dstVec)) { File.Delete(dstVec); }
+            string dstHnsw = target + "." + this.vectorTables[i].name + ".zhnsw";
+            if (File.Exists(dstHnsw)) { File.Delete(dstHnsw); }
         }
     }
 
@@ -202,6 +273,9 @@ public class ZanDatabase : IDisposable {
 
     // 关闭底层存储与读写锁。
     public void Close() {
+        for (int i = 0; i < this.vectorTables.Count; i = i + 1) {
+            this.vectorTables[i].table.Close();
+        }
         this.kv.Close();
         this.rw.Close();
         this.tlock.Close();
