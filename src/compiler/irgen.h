@@ -23,12 +23,16 @@ typedef struct {
     int          frame_index;
 } zan_async_slot_t;
 
+struct local_var;
 typedef struct {
     LLVMBasicBlockRef lpad_bb;
     LLVMBasicBlockRef catch_bb;
     LLVMValueRef fn;
     int throw_locals_base;
     int fin_idx;
+    struct local_var *cleanups;
+    int cleanup_count;
+    int cleanup_cap;
 } zan_lpad_entry_t;
 
 /* 编译器生成的保护文本驻留表项 */

@@ -468,9 +468,18 @@ public class VectorTable : IDisposable {
             // 3. 旁路：扫描 appendBuf 增量队列
             int appCount = this.appendBuf.Count;
             if (appCount > 0) {
+                float[] scratch = new float[4];
+                int simdLimit = dims - (dims % 4);
                 double queryNormSq = 0.0;
                 if (metric == 0) { // Cosine
-                    for (int d = 0; d < dims; d = d + 1) {
+                    Vector128 accQn = Vector128.Zero;
+                    for (int d = 0; d < simdLimit; d = d + 4) {
+                        Vector128 q = Vector128.Load(query, d);
+                        accQn = Vector128.MultiplyAdd(q, q, accQn);
+                    }
+                    Vector128.Store(scratch, 0, accQn);
+                    queryNormSq = (double)scratch[0] + (double)scratch[1] + (double)scratch[2] + (double)scratch[3];
+                    for (int d = simdLimit; d < dims; d = d + 1) {
                         double qv = (double)query[d];
                         queryNormSq = queryNormSq + qv * qv;
                     }
@@ -483,16 +492,34 @@ public class VectorTable : IDisposable {
 
                     double dist = 0.0;
                     if (metric == 1) { // L2
-                        double sumSq = 0.0;
-                        for (int d = 0; d < dims; d = d + 1) {
+                        Vector128 acc = Vector128.Zero;
+                        for (int d = 0; d < simdLimit; d = d + 4) {
+                            Vector128 q = Vector128.Load(query, d);
+                            Vector128 vv = Vector128.Load(v, d);
+                            Vector128 diff = Vector128.SubtractFloat(q, vv);
+                            acc = Vector128.MultiplyAdd(diff, diff, acc);
+                        }
+                        Vector128.Store(scratch, 0, acc);
+                        double sumSq = (double)scratch[0] + (double)scratch[1] + (double)scratch[2] + (double)scratch[3];
+                        for (int d = simdLimit; d < dims; d = d + 1) {
                             double delta = (double)query[d] - (double)v[d];
                             sumSq = sumSq + delta * delta;
                         }
                         dist = sumSq;
                     } else { // Cosine
-                        double dot = 0.0;
-                        double vNormSq = 0.0;
-                        for (int d = 0; d < dims; d = d + 1) {
+                        Vector128 accDot = Vector128.Zero;
+                        Vector128 accVn = Vector128.Zero;
+                        for (int d = 0; d < simdLimit; d = d + 4) {
+                            Vector128 q = Vector128.Load(query, d);
+                            Vector128 vv = Vector128.Load(v, d);
+                            accDot = Vector128.MultiplyAdd(q, vv, accDot);
+                            accVn = Vector128.MultiplyAdd(vv, vv, accVn);
+                        }
+                        Vector128.Store(scratch, 0, accDot);
+                        double dot = (double)scratch[0] + (double)scratch[1] + (double)scratch[2] + (double)scratch[3];
+                        Vector128.Store(scratch, 0, accVn);
+                        double vNormSq = (double)scratch[0] + (double)scratch[1] + (double)scratch[2] + (double)scratch[3];
+                        for (int d = simdLimit; d < dims; d = d + 1) {
                             double qv = (double)query[d];
                             double vv = (double)v[d];
                             dot = dot + qv * vv;

@@ -28,6 +28,7 @@ public class VectorIndex {
     public int maxLevel;
     public long randomState;
     public AtomicInt lastDistanceCount;
+    public float[] scratch;
     // 导入期间复用的向量暂存（量化路径逐槽解码用，避免批量堆垃圾）。
     private float[] importScratch;
     // 二进制快照导入期间的待挂边暂存：pendingEdges 按
@@ -53,6 +54,7 @@ public class VectorIndex {
         if (seedValue < 0) { seedValue = seedValue + 2147483646; }
         this.randomState = seedValue + 1;
         this.lastDistanceCount = new AtomicInt(0);
+        this.scratch = new float[4];
     }
 
     public VectorIndexOptions Options() { return this.options.Clone(); }
@@ -188,14 +190,33 @@ public class VectorIndex {
         VectorChunk owner = this.chunks[slot / this.chunkRows];
         int offset = (slot % this.chunkRows) * this.options.dimensions;
         double sum = 0;
+        int dims = this.options.dimensions;
+        int simdLimit = dims - (dims % 4);
         if (this.options.metric == 1) {
-            for (int i = 0; i < this.options.dimensions; i = i + 1) {
+            Vector128 acc = Vector128.Zero;
+            for (int i = 0; i < simdLimit; i = i + 4) {
+                Vector128 q = Vector128.Load(work.query, work.offset + i);
+                Vector128 v = Vector128.Load(owner.values, offset + i);
+                Vector128 diff = Vector128.SubtractFloat(q, v);
+                acc = Vector128.MultiplyAdd(diff, diff, acc);
+            }
+            Vector128.Store(work.scratch, 0, acc);
+            sum = (double)work.scratch[0] + (double)work.scratch[1] + (double)work.scratch[2] + (double)work.scratch[3];
+            for (int i = simdLimit; i < dims; i = i + 1) {
                 double delta = (double)work.query[work.offset + i] - (double)owner.values[offset + i];
                 sum = sum + delta * delta;
             }
             return sum;
         }
-        for (int i = 0; i < this.options.dimensions; i = i + 1) {
+        Vector128 dotAcc = Vector128.Zero;
+        for (int i = 0; i < simdLimit; i = i + 4) {
+            Vector128 q = Vector128.Load(work.query, work.offset + i);
+            Vector128 v = Vector128.Load(owner.values, offset + i);
+            dotAcc = Vector128.MultiplyAdd(q, v, dotAcc);
+        }
+        Vector128.Store(work.scratch, 0, dotAcc);
+        sum = (double)work.scratch[0] + (double)work.scratch[1] + (double)work.scratch[2] + (double)work.scratch[3];
+        for (int i = simdLimit; i < dims; i = i + 1) {
             sum = sum + (double)work.query[work.offset + i] * (double)owner.values[offset + i];
         }
         double distance = 1.0 - sum * work.inverseNorm * this.nodes[slot].inverseNorm;
@@ -211,14 +232,33 @@ public class VectorIndex {
         int oa = (a % this.chunkRows) * this.options.dimensions;
         int ob = (b % this.chunkRows) * this.options.dimensions;
         double sum = 0;
+        int dims = this.options.dimensions;
+        int simdLimit = dims - (dims % 4);
         if (this.options.metric == 1) {
-            for (int i = 0; i < this.options.dimensions; i = i + 1) {
+            Vector128 acc = Vector128.Zero;
+            for (int i = 0; i < simdLimit; i = i + 4) {
+                Vector128 va = Vector128.Load(ca.values, oa + i);
+                Vector128 vb = Vector128.Load(cb.values, ob + i);
+                Vector128 diff = Vector128.SubtractFloat(va, vb);
+                acc = Vector128.MultiplyAdd(diff, diff, acc);
+            }
+            Vector128.Store(this.scratch, 0, acc);
+            sum = (double)this.scratch[0] + (double)this.scratch[1] + (double)this.scratch[2] + (double)this.scratch[3];
+            for (int i = simdLimit; i < dims; i = i + 1) {
                 double delta = (double)ca.values[oa + i] - (double)cb.values[ob + i];
                 sum = sum + delta * delta;
             }
             return sum;
         }
-        for (int i = 0; i < this.options.dimensions; i = i + 1) {
+        Vector128 dotAcc = Vector128.Zero;
+        for (int i = 0; i < simdLimit; i = i + 4) {
+            Vector128 va = Vector128.Load(ca.values, oa + i);
+            Vector128 vb = Vector128.Load(cb.values, ob + i);
+            dotAcc = Vector128.MultiplyAdd(va, vb, dotAcc);
+        }
+        Vector128.Store(this.scratch, 0, dotAcc);
+        sum = (double)this.scratch[0] + (double)this.scratch[1] + (double)this.scratch[2] + (double)this.scratch[3];
+        for (int i = simdLimit; i < dims; i = i + 1) {
             sum = sum + (double)ca.values[oa + i] * (double)cb.values[ob + i];
         }
         double distance = 1.0 - sum * this.nodes[a].inverseNorm * this.nodes[b].inverseNorm;
@@ -384,20 +424,16 @@ public class VectorIndex {
 
     // 将传入向量一次性复制至紧凑连续存储；更新时保留旧槽位可达性。
     public void Add(int id, float[] vector) {
-        this.ValidateDimensions(vector);
+        double inverseNorm = this.ValidateVector(vector);
         int slot = this.nodes.Count;
         if (slot >= 2147483646) { throw new InvalidOperationException("Vector slot capacity exhausted"); }
-        double inverseNorm;
         double quantScale = 0;
         double quantOffset = 0;
         if (this.options.quantize) {
             // 量化模式不驻留 float 块：码 + scale/offset 即全部驻留。
-            inverseNorm = this.QuantizeIntoSlot(slot, vector, out quantScale, out quantOffset);
+            this.QuantizeIntoSlot(slot, vector, out quantScale, out quantOffset);
         } else {
             this.CopyIntoSlot(slot, vector);
-            VectorChunk owner = this.chunks[slot / this.chunkRows];
-            int offset = (slot % this.chunkRows) * this.options.dimensions;
-            inverseNorm = this.ValidateCoordinates(owner.values, offset);
         }
         int level = this.NextLevel();
         VectorNode node = new VectorNode(id, level, this.options.m, inverseNorm);
@@ -507,14 +543,37 @@ public class VectorIndex {
     public double RescoreDistance(VectorWorkspace work, float[] vector) {
         double dot = 0;
         double nv = 0;
+        int dims = this.options.dimensions;
+        int simdLimit = dims - (dims % 4);
         if (this.options.metric == 1) {
-            for (int i = 0; i < this.options.dimensions; i = i + 1) {
+            Vector128 acc = Vector128.Zero;
+            for (int i = 0; i < simdLimit; i = i + 4) {
+                Vector128 q = Vector128.Load(work.query, work.offset + i);
+                Vector128 v = Vector128.Load(vector, i);
+                Vector128 diff = Vector128.SubtractFloat(q, v);
+                acc = Vector128.MultiplyAdd(diff, diff, acc);
+            }
+            Vector128.Store(work.scratch, 0, acc);
+            dot = (double)work.scratch[0] + (double)work.scratch[1] + (double)work.scratch[2] + (double)work.scratch[3];
+            for (int i = simdLimit; i < dims; i = i + 1) {
                 double delta = (double)work.query[work.offset + i] - (double)vector[i];
                 dot = dot + delta * delta;
             }
             return dot;
         }
-        for (int i = 0; i < this.options.dimensions; i = i + 1) {
+        Vector128 accDot = Vector128.Zero;
+        Vector128 accNv = Vector128.Zero;
+        for (int i = 0; i < simdLimit; i = i + 4) {
+            Vector128 q = Vector128.Load(work.query, work.offset + i);
+            Vector128 v = Vector128.Load(vector, i);
+            accDot = Vector128.MultiplyAdd(q, v, accDot);
+            accNv = Vector128.MultiplyAdd(v, v, accNv);
+        }
+        Vector128.Store(work.scratch, 0, accDot);
+        dot = (double)work.scratch[0] + (double)work.scratch[1] + (double)work.scratch[2] + (double)work.scratch[3];
+        Vector128.Store(work.scratch, 0, accNv);
+        nv = (double)work.scratch[0] + (double)work.scratch[1] + (double)work.scratch[2] + (double)work.scratch[3];
+        for (int i = simdLimit; i < dims; i = i + 1) {
             dot = dot + (double)work.query[work.offset + i] * (double)vector[i];
             nv = nv + (double)vector[i] * (double)vector[i];
         }

@@ -904,10 +904,7 @@ void own_box_cell(zan_irgen_t *g, local_var_t *v, LLVMValueRef cell) {
     v->box_cell = cell;
     v->box_owner_slot = owner;
     v->box_owned = 1;
-    if (!g->current_async_frame) {
-        emit_eh_tmp_push_slot(g, owner, ZAN_EH_SLOT_DLG);
-        v->eh_slot = 1;
-    }
+    lpad_register_local(g, v);
 }
 
 /* 将按值传递的形参移动至闭包共享 cell */
@@ -951,6 +948,7 @@ void box_captured_parameter(zan_irgen_t *g, local_scope_t *locals,
     own_box_cell(g, v, cell);
     if (rc) v->arc_owned = 1;
     if (aggregate_rc) v->struct_rc = 1;
+    lpad_register_local(g, v);
 }
 
 /* 实例方法组转委托：将接收者绑定入方法组记录 */

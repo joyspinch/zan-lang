@@ -206,12 +206,8 @@ static void emit_switch_pattern_bind(zan_irgen_t *g, local_scope_t *locals,
                     LLVMBuildPtrToInt(g->builder, pb->cell, i64, "cpat.i"),
                     LLVMConstInt(i64, ZAN_CLOSURE_TAG, 0), "cpat.tag"),
                 i8ptr, "cpat.owner.v");
-            LLVMBuildStore(g->builder, tagged, pb->owner_slot);
-            if (!g->current_async_frame) {
-                emit_eh_tmp_push_slot(g, pb->owner_slot, ZAN_EH_SLOT_DLG);
-                pb->eh_slot = 1;
-            }
-        }
+	            LLVMBuildStore(g->builder, tagged, pb->owner_slot);
+	        }
         local_var_t *prior = local_find_binding_decl(locals, sc);
         LLVMValueRef slot = box_value_ptr(g, pb->cell, ptll);
         local_add(locals, sc->switch_case.var_name, slot, pt);
@@ -222,8 +218,10 @@ static void emit_switch_pattern_bind(zan_irgen_t *g, local_scope_t *locals,
         v->box_owned = prior == NULL;
         v->eh_slot = v->box_owned ? pb->eh_slot : 0;
         if (is_rc_managed_type(pt)) v->arc_owned = 1;
-        if (pt->kind == TYPE_STRUCT && type_contains_collection_rc(g, pt, 0))
+        if (pt->kind == TYPE_STRUCT && type_contains_collection_rc(g, pt, 0)) {
             v->struct_rc = 1;
+            lpad_register_local(g, v);
+        }
         return;
     }
 
@@ -637,7 +635,9 @@ static void emit_eh_propagate_tail_lpad(zan_irgen_t *g,
         emit_release_owned_locals(g, locals);
         emit_raise_exception(g);
     } else {
-        emit_release_owned_locals(g, locals);
+        if (g->lpad_depth > 0) {
+            emit_lpad_cleanups(g, &g->lpad_stack[0]);
+        }
         LLVMValueRef cur_lp = LLVMBuildLoad2(g->builder, lp_ret_ty, lp_slot, "lp.prop");
         LLVMBuildResume(g->builder, cur_lp);
     }
@@ -720,7 +720,10 @@ static int emit_boxed_var_decl(zan_irgen_t *g, zan_ast_node_t *stmt,
         own_box_cell(g, &locals->vars[locals->count - 1], cell);
     }
     if (rc) locals->vars[locals->count - 1].arc_owned = 1;
-    if (aggregate_rc) locals->vars[locals->count - 1].struct_rc = 1;
+    if (aggregate_rc) {
+        locals->vars[locals->count - 1].struct_rc = 1;
+        lpad_register_local(g, &locals->vars[locals->count - 1]);
+    }
     if (type && type->kind == TYPE_STRING && stmt->var_decl.initializer &&
         call_targets_extern(g, stmt->var_decl.initializer))
         locals->vars[locals->count - 1].opaque_string = 1;
@@ -1170,8 +1173,10 @@ void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *locals) {
                             }
                             local_add(locals, stmt->var_decl.name, alloca, type);
                             if (type && type->kind == TYPE_STRUCT &&
-                                type_contains_collection_rc(g, type, 0))
+                                type_contains_collection_rc(g, type, 0)) {
                                 locals->vars[locals->count - 1].struct_rc = 1;
+                                lpad_register_local(g, &locals->vars[locals->count - 1]);
+                            }
                             return;
                         }
                     }
@@ -1193,8 +1198,10 @@ void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *locals) {
                                 : tup;
                         zan_store_fit(g, tupval, alloca);
                         local_add(locals, stmt->var_decl.name, alloca, ttype);
-                        if (type_contains_collection_rc(g, ttype, 0))
+                        if (type_contains_collection_rc(g, ttype, 0)) {
                             locals->vars[locals->count - 1].struct_rc = 1;
+                            lpad_register_local(g, &locals->vars[locals->count - 1]);
+                        }
                         return;
                     }
                 }
@@ -1396,8 +1403,10 @@ void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *locals) {
         if (type && type->kind == TYPE_STRING && stmt->var_decl.initializer &&
             call_targets_extern(g, stmt->var_decl.initializer))
             locals->vars[locals->count - 1].opaque_string = 1;
-        if (struct_own)
+        if (struct_own) {
             locals->vars[locals->count - 1].struct_rc = 1;
+            lpad_register_local(g, &locals->vars[locals->count - 1]);
+        }
         if (arc_own) arc_own_local(g, locals);
         if (obj_own)
             locals->vars[locals->count - 1].obj_rc_flag = obj_slot.obj_rc_flag;
@@ -1540,6 +1549,7 @@ void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *locals) {
                 if (!de_src_owns && de_fval)
                     emit_collection_value_retain(g, et, de_fval, 0);
                 locals->vars[locals->count - 1].struct_rc = 1;
+                lpad_register_local(g, &locals->vars[locals->count - 1]);
             }
             if (fi >= 0 && fi < 64) de_consumed[fi] = true;
         }
@@ -2345,6 +2355,9 @@ void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *locals) {
             LLVMValueRef new_top = zan_add(g->builder, old_top,
                 LLVMConstInt(i32t, 1, 0), "eh.new");
             zan_store_fit(g, new_top, top_g);
+
+            tmp_mark_slot = emit_entry_alloca(g, i32t, "try.tmp.slot");
+            zan_store_fit(g, LLVMBuildLoad2(g->builder, i32t, eh_tmptop_g, "try.tmp.cur"), tmp_mark_slot);
         }
         if (g->current_async_frame) {
             LLVMValueRef hc_ptr = LLVMBuildStructGEP2(g->builder,
@@ -2488,12 +2501,17 @@ void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *locals) {
         }
 
         int saved_lpad_depth = g->lpad_depth;
+        zan_lpad_entry_t *try_lpad_entry = NULL;
         if (g->lpad_depth < ZAN_MAX_ARMED_TRY) {
-            g->lpad_stack[g->lpad_depth].lpad_bb = lpad_bb;
-            g->lpad_stack[g->lpad_depth].catch_bb = (ncatch > 0) ? catch_bb : NULL;
-            g->lpad_stack[g->lpad_depth].fn = fn;
-            g->lpad_stack[g->lpad_depth].throw_locals_base = try_start;
-            g->lpad_stack[g->lpad_depth].fin_idx = fin_idx;
+            try_lpad_entry = &g->lpad_stack[g->lpad_depth];
+            try_lpad_entry->lpad_bb = lpad_bb;
+            try_lpad_entry->catch_bb = (ncatch > 0) ? catch_bb : NULL;
+            try_lpad_entry->fn = fn;
+            try_lpad_entry->throw_locals_base = try_start;
+            try_lpad_entry->fin_idx = fin_idx;
+            try_lpad_entry->cleanups = NULL;
+            try_lpad_entry->cleanup_count = 0;
+            try_lpad_entry->cleanup_cap = 0;
             g->lpad_depth++;
         }
         int armed_idx = -1;
@@ -2532,22 +2550,13 @@ void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *locals) {
             LLVMValueRef ot = LLVMBuildLoad2(g->builder, i32t, old_top_slot, "eh.old.catch");
             zan_store_fit(g, ot, top_g);
         }
-        if (!g->current_async_frame) {
-            for (int i = try_locals_end - 1; i >= try_start; i--) {
-                if (locals->vars[i].obj_rc_flag) {
-                    emit_release_obj_local(g, &locals->vars[i]);
-                } else if (locals->vars[i].box_cell) {
-                    release_boxed_local(g, &locals->vars[i]);
-                } else if (locals->vars[i].struct_rc) {
-                    emit_struct_local_release(g, locals->vars[i].type,
-                                              locals->vars[i].alloca);
-                } else if (local_owns_arc(&locals->vars[i])) {
-                    LLVMValueRef cur = LLVMBuildLoad2(g->builder, i8ptr,
-                                                      locals->vars[i].alloca, "arc.rel");
-                    emit_rc_release_for_type(g, locals->vars[i].type, cur);
-                }
-            }
-        } else {
+        if (!g->current_async_frame && tmp_mark_slot) {
+            LLVMValueRef mark = LLVMBuildLoad2(g->builder, i32t, tmp_mark_slot, "try.tmp.mark");
+            emit_eh_tmp_unwind_to(g, mark);
+        }
+        if (!g->current_async_frame && try_lpad_entry) {
+            emit_lpad_cleanups(g, try_lpad_entry);
+        } else if (g->current_async_frame) {
             LLVMValueRef hc_ptr = LLVMBuildStructGEP2(g->builder,
                 g->current_async_frame_type, g->current_async_frame,
                 ASYNC_FRAME_HCOUNT, "eh.hc");
@@ -2742,6 +2751,12 @@ void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *locals) {
         if (stmt->try_stmt.finally_body) {
             zan_irgen_finally_entry_t entry = g->finallys[fin_idx];
             emit_finally_body(g, locals, &entry);
+        }
+        if (try_lpad_entry) {
+            free(try_lpad_entry->cleanups);
+            try_lpad_entry->cleanups = NULL;
+            try_lpad_entry->cleanup_count = 0;
+            try_lpad_entry->cleanup_cap = 0;
         }
         break;
     }

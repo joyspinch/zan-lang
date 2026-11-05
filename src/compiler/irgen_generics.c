@@ -946,9 +946,65 @@ void arc_own_local(zan_irgen_t *g, local_scope_t *locals) {
     if (!locals || locals->count == 0) return;
     local_var_t *v = &locals->vars[locals->count - 1];
     v->arc_owned = 1;
-    if (v->eh_slot || g->current_async_frame || !local_owns_arc(v)) return;
-    emit_eh_tmp_push_slot(g, v->alloca, eh_slot_kind_of(v->type));
-    v->eh_slot = 1;
+    lpad_register_local(g, v);
+}
+
+void lpad_register_local(zan_irgen_t *g, local_var_t *v) {
+    if (!g || !v || !v->alloca || g->current_async_frame) return;
+    if (g->lpad_depth <= 0) return;
+    LLVMValueRef alloca_fn = NULL;
+    if (LLVMIsAAllocaInst(v->alloca)) {
+        LLVMBasicBlockRef abb = LLVMGetInstructionParent(v->alloca);
+        if (abb) alloca_fn = LLVMGetBasicBlockParent(abb);
+    }
+    if (!alloca_fn) {
+        alloca_fn = g->current_fn;
+        if (!alloca_fn && LLVMGetInsertBlock(g->builder))
+            alloca_fn = LLVMGetBasicBlockParent(LLVMGetInsertBlock(g->builder));
+    }
+    if (!alloca_fn) return;
+    for (int d = 0; d < g->lpad_depth; d++) {
+        zan_lpad_entry_t *entry = &g->lpad_stack[d];
+        if (entry->fn != alloca_fn) continue;
+        int found = 0;
+        for (int i = 0; i < entry->cleanup_count; i++) {
+            if (entry->cleanups[i].alloca == v->alloca) {
+                entry->cleanups[i] = *v;
+                found = 1;
+                break;
+            }
+        }
+        if (!found) {
+            if (ZAN_TAB_ENSURE(entry->cleanups, entry->cleanup_count, entry->cleanup_cap, 8)) {
+                entry->cleanups[entry->cleanup_count++] = *v;
+            }
+        }
+    }
+}
+
+void emit_lpad_cleanups(zan_irgen_t *g, zan_lpad_entry_t *entry) {
+    if (!g || !entry || !entry->cleanups) return;
+    LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    for (int i = entry->cleanup_count - 1; i >= 0; i--) {
+        local_var_t *cl = &entry->cleanups[i];
+        if (cl->obj_rc_flag) {
+            emit_release_obj_local(g, cl);
+        } else if (cl->box_cell) {
+            release_boxed_local(g, cl);
+        } else if (cl->struct_rc) {
+            emit_struct_local_release(g, cl->type, cl->alloca);
+            LLVMTypeRef st = LLVMIsAAllocaInst(cl->alloca)
+                ? LLVMGetAllocatedType(cl->alloca) : LLVMTypeOf(cl->alloca);
+            if (st && LLVMGetTypeKind(st) == LLVMStructTypeKind)
+                LLVMBuildStore(g->builder, LLVMConstNull(st), cl->alloca);
+        } else if (local_owns_arc(cl)) {
+            LLVMValueRef cur = LLVMBuildLoad2(g->builder, i8ptr, cl->alloca, "arc.rel");
+            emit_rc_release_for_type(g, cl->type, cur);
+            LLVMTypeRef alloc_ty = LLVMIsAAllocaInst(cl->alloca)
+                ? LLVMGetAllocatedType(cl->alloca) : i8ptr;
+            LLVMBuildStore(g->builder, LLVMConstNull(alloc_ty), cl->alloca);
+        }
+    }
 }
 
 static void pop_eh_slot(zan_irgen_t *g, local_var_t *v) {
@@ -980,6 +1036,24 @@ static void emit_release_owned_locals_except(zan_irgen_t *g, local_scope_t *loca
 }
 void emit_release_owned_locals(zan_irgen_t *g, local_scope_t *locals) {
     emit_release_owned_locals_except(g, locals, NULL);
+}
+void emit_release_owned_locals_no_pop(zan_irgen_t *g, local_scope_t *locals) {
+    if (!locals) return;
+    LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    for (int i = locals->count - 1; i >= 0; i--) {
+        if (locals->vars[i].obj_rc_flag) {
+            emit_release_obj_local(g, &locals->vars[i]);
+        } else if (locals->vars[i].box_cell) {
+            release_boxed_local(g, &locals->vars[i]);
+        } else if (locals->vars[i].struct_rc) {
+            emit_struct_local_release(g, locals->vars[i].type,
+                                      locals->vars[i].alloca);
+        } else if (local_owns_arc(&locals->vars[i])) {
+            LLVMValueRef cur = LLVMBuildLoad2(g->builder, i8ptr,
+                                              locals->vars[i].alloca, "arc.rel");
+            emit_rc_release_for_type(g, locals->vars[i].type, cur);
+        }
+    }
 }
 void emit_release_owned_locals_range(zan_irgen_t *g, local_scope_t *locals, int start) {
     if (!locals) return;
@@ -1058,6 +1132,7 @@ void emit_release_owned_locals_from(zan_irgen_t *g, local_scope_t *locals, int s
             LLVMValueRef cur = LLVMBuildLoad2(g->builder, i8ptr,
                                               locals->vars[i].alloca, "arc.rel");
             emit_rc_release_for_type(g, locals->vars[i].type, cur);
+            LLVMBuildStore(g->builder, LLVMConstNull(i8ptr), locals->vars[i].alloca);
         }
         locals->vars[i].arc_owned = 0;
     }
@@ -1071,6 +1146,7 @@ static LLVMValueRef obj_rc_flag_slot(zan_irgen_t *g, local_var_t *v) {
         v->obj_rc_flag = emit_entry_alloca(g, i1, "obj.owns");
         LLVMPositionBuilderAtEnd(g->builder, here);
         LLVMBuildStore(g->builder, LLVMConstInt(i1, 0, 0), v->obj_rc_flag);
+        lpad_register_local(g, v);
     }
     return v->obj_rc_flag;
 }
@@ -1224,7 +1300,7 @@ void emit_rc_store_field(zan_irgen_t *g, zan_type_t *type,
     if (g->current_fn_is_ctor && !g->current_async_frame &&
         g->current_type_sym && g->current_type_sym->type &&
         g->current_type_sym->type->kind == TYPE_STRUCT && !is_weak) {
-        emit_eh_tmp_push_slot(g, field_ptr, eh_slot_kind_of(type));
+        emit_eh_tmp_push_slot(g, v, eh_slot_kind_of(type));
     }
 }
 
@@ -2875,9 +2951,7 @@ LLVMValueRef emit_str_concat_n(zan_irgen_t *g, zan_ast_node_t *expr,
              * ZAN_EH_SLOT_STR。若按源操作数的类型取种类，整数操作数会
              * 落到 ZAN_EH_SLOT_OBJ，异常展开时 zan_rt_release_dyn 会把
              * 字符串头字当成 site 下标去查析构表——读坏内存。 */
-            LLVMValueRef slot = emit_entry_alloca(g, LLVMTypeOf(s), "ct.eh");
-            LLVMBuildStore(g->builder, s, slot);
-            emit_eh_tmp_push_slot(g, slot, ZAN_EH_SLOT_STR);
+            emit_eh_tmp_push_slot(g, s, ZAN_EH_SLOT_STR);
         }
         lens[i] = emit_cstr_len_of(g, s, ops[i]);
         total = zan_add(g->builder, total, lens[i], "ct");

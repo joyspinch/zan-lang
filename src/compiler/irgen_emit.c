@@ -2068,6 +2068,7 @@ static void emit_user_method_bodies(zan_irgen_t *g, method_body_work_t *work,
         int saved_eh_lb = g->eh_armed_loop_base;
         int saved_lpad_depth = g->lpad_depth;
         LLVMBasicBlockRef fn_cleanup_bb = NULL;
+        LLVMValueRef fn_tmp_mark = NULL;
         if (!g->current_async_frame && g->lpad_depth < ZAN_MAX_ARMED_TRY) {
             fn_cleanup_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "fn.lpad");
             g->lpad_stack[g->lpad_depth].fn = fn;
@@ -2075,7 +2076,17 @@ static void emit_user_method_bodies(zan_irgen_t *g, method_body_work_t *work,
             g->lpad_stack[g->lpad_depth].catch_bb = NULL;
             g->lpad_stack[g->lpad_depth].throw_locals_base = 0;
             g->lpad_stack[g->lpad_depth].fin_idx = -1;
+            g->lpad_stack[g->lpad_depth].cleanups = NULL;
+            g->lpad_stack[g->lpad_depth].cleanup_count = 0;
+            g->lpad_stack[g->lpad_depth].cleanup_cap = 0;
             g->lpad_depth++;
+            for (int pi = 0; pi < locals->count; pi++) {
+                if (local_needs_cleanup(&locals->vars[pi]))
+                    lpad_register_local(g, &locals->vars[pi]);
+            }
+            LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
+            fn_tmp_mark = emit_entry_alloca(g, i32t, "fn.tmp.mark");
+            zan_store_fit(g, LLVMBuildLoad2(g->builder, i32t, get_eh_tmp_top_global(g), "fn.tmp.top0"), fn_tmp_mark);
         }
         g->throw_locals_base = 0;
         g->catch_cleanup_count = 0;
@@ -2252,6 +2263,7 @@ static void emit_user_method_bodies(zan_irgen_t *g, method_body_work_t *work,
 
         g->lpad_depth = saved_lpad_depth;
         if (fn_cleanup_bb) {
+            zan_lpad_entry_t *fn_entry = &g->lpad_stack[saved_lpad_depth];
             if (LLVMGetFirstUse(LLVMBasicBlockAsValue(fn_cleanup_bb)) != NULL) {
                 zan_builder_point_t cl_pt = zan_builder_save(g);
                 LLVMPositionBuilderAtEnd(g->builder, fn_cleanup_bb);
@@ -2261,12 +2273,20 @@ static void emit_user_method_bodies(zan_irgen_t *g, method_body_work_t *work,
                 LLVMTypeRef lp_ret_ty = LLVMStructTypeInContext(g->ctx, (LLVMTypeRef[]){ i8ptr, i32t }, 2, 0);
                 LLVMValueRef lp = LLVMBuildLandingPad(g->builder, lp_ret_ty, get_eh_personality_fn(g), 0, "fn.lp");
                 LLVMSetCleanup(lp, 1);
-                emit_release_owned_locals(g, locals);
+                if (fn_tmp_mark) {
+                    LLVMValueRef mark = LLVMBuildLoad2(g->builder, i32t, fn_tmp_mark, "fn.tmp.mark.val");
+                    emit_eh_tmp_unwind_to(g, mark);
+                }
+                emit_lpad_cleanups(g, fn_entry);
                 LLVMBuildResume(g->builder, lp);
                 zan_builder_restore(g, cl_pt);
             } else {
                 LLVMDeleteBasicBlock(fn_cleanup_bb);
             }
+            free(fn_entry->cleanups);
+            fn_entry->cleanups = NULL;
+            fn_entry->cleanup_count = 0;
+            fn_entry->cleanup_cap = 0;
         }
 
         g->current_fn = saved_fn;
@@ -2814,6 +2834,28 @@ static void emit_method_spec_body(zan_irgen_t *g, int idx) {
     int saved_eh_c = g->eh_armed_count;
     int saved_eh_b = g->eh_armed_base;
     int saved_eh_lb = g->eh_armed_loop_base;
+    int saved_lpad_depth = g->lpad_depth;
+    LLVMBasicBlockRef fn_cleanup_bb = NULL;
+    LLVMValueRef fn_tmp_mark = NULL;
+    if (!g->current_async_frame && g->lpad_depth < ZAN_MAX_ARMED_TRY) {
+        fn_cleanup_bb = LLVMAppendBasicBlockInContext(g->ctx, sp.fn, "fn.lpad");
+        g->lpad_stack[g->lpad_depth].fn = sp.fn;
+        g->lpad_stack[g->lpad_depth].lpad_bb = fn_cleanup_bb;
+        g->lpad_stack[g->lpad_depth].catch_bb = NULL;
+        g->lpad_stack[g->lpad_depth].throw_locals_base = 0;
+        g->lpad_stack[g->lpad_depth].fin_idx = -1;
+        g->lpad_stack[g->lpad_depth].cleanups = NULL;
+        g->lpad_stack[g->lpad_depth].cleanup_count = 0;
+        g->lpad_stack[g->lpad_depth].cleanup_cap = 0;
+        g->lpad_depth++;
+        for (int pi = 0; pi < locals->count; pi++) {
+            if (local_needs_cleanup(&locals->vars[pi]))
+                lpad_register_local(g, &locals->vars[pi]);
+        }
+        LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
+        fn_tmp_mark = emit_entry_alloca(g, i32t, "fn.tmp.mark");
+        zan_store_fit(g, LLVMBuildLoad2(g->builder, i32t, get_eh_tmp_top_global(g), "fn.tmp.top0"), fn_tmp_mark);
+    }
     g->throw_locals_base = 0;
     g->catch_cleanup_count = 0;
     g->throw_catch_base = 0;
@@ -2864,6 +2906,34 @@ static void emit_method_spec_body(zan_irgen_t *g, int idx) {
         } else {
             LLVMBuildRet(g->builder, LLVMConstNull(llvm_ret));
         }
+    }
+
+    g->lpad_depth = saved_lpad_depth;
+    if (fn_cleanup_bb) {
+        zan_lpad_entry_t *fn_entry = &g->lpad_stack[saved_lpad_depth];
+        if (LLVMGetFirstUse(LLVMBasicBlockAsValue(fn_cleanup_bb)) != NULL) {
+            zan_builder_point_t cl_pt = zan_builder_save(g);
+            LLVMPositionBuilderAtEnd(g->builder, fn_cleanup_bb);
+            ensure_function_personality(g, sp.fn);
+            LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+            LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
+            LLVMTypeRef lp_ret_ty = LLVMStructTypeInContext(g->ctx, (LLVMTypeRef[]){ i8ptr, i32t }, 2, 0);
+            LLVMValueRef lp = LLVMBuildLandingPad(g->builder, lp_ret_ty, get_eh_personality_fn(g), 0, "fn.lp");
+            LLVMSetCleanup(lp, 1);
+            if (fn_tmp_mark) {
+                LLVMValueRef mark = LLVMBuildLoad2(g->builder, i32t, fn_tmp_mark, "fn.tmp.mark.val");
+                emit_eh_tmp_unwind_to(g, mark);
+            }
+            emit_lpad_cleanups(g, fn_entry);
+            LLVMBuildResume(g->builder, lp);
+            zan_builder_restore(g, cl_pt);
+        } else {
+            LLVMDeleteBasicBlock(fn_cleanup_bb);
+        }
+        free(fn_entry->cleanups);
+        fn_entry->cleanups = NULL;
+        fn_entry->cleanup_count = 0;
+        fn_entry->cleanup_cap = 0;
     }
 
     g->current_fn = saved_fn;

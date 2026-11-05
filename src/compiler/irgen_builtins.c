@@ -2294,12 +2294,10 @@ LLVMValueRef get_eh_tmp_unwind_fn(zan_irgen_t *g) {
     LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
     LLVMValueRef kind = zan_and(g->builder, obj_i,
         LLVMConstInt(i64t, 6, 0), "eh.kind");
-    LLVMValueRef untag = LLVMBuildIntToPtr(g->builder,
+    LLVMValueRef vobj = LLVMBuildIntToPtr(g->builder,
         zan_and(g->builder, obj_i,
             LLVMConstInt(i64t, ~(uint64_t)7, 0), "untag"),
-        LLVMPointerType(i8ptr, 0), "vslot");
-    LLVMValueRef vobj = LLVMBuildLoad2(g->builder, i8ptr, untag, "vobj");
-    LLVMBuildStore(g->builder, LLVMConstNull(i8ptr), untag);
+        i8ptr, "vobj");
     LLVMBuildCondBr(g->builder,
         zan_icmp(g->builder, LLVMIntEQ, kind,
             LLVMConstInt(i64t, ZAN_EH_SLOT_DLG << 1, 0), "isdlg"),
@@ -2398,6 +2396,8 @@ void emit_eh_tmp_push_slot(zan_irgen_t *g, LLVMValueRef slot, int kind) {
     if (!slot || LLVMGetTypeKind(LLVMTypeOf(slot)) != LLVMPointerTypeKind) return;
     LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    if (LLVMTypeOf(slot) != i8ptr)
+        slot = LLVMBuildBitCast(g->builder, slot, i8ptr, "eh.slotp");
     uint64_t tag = 1u | ((uint64_t)kind << 1);
     LLVMValueRef tagged = LLVMBuildIntToPtr(g->builder,
         zan_or(g->builder, LLVMBuildPtrToInt(g->builder, slot, i64t, "slot.i"),
@@ -2416,6 +2416,12 @@ void emit_eh_unwind_to_handler(zan_irgen_t *g, LLVMValueRef top) {
 void emit_eh_tmp_pop(zan_irgen_t *g) {
     LLVMTypeRef fnty = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), NULL, 0, 0);
     zan_call2(g->builder, fnty, get_eh_tmp_pop_fn(g), NULL, 0, "");
+}
+void emit_eh_tmp_unwind_to(zan_irgen_t *g, LLVMValueRef mark) {
+    if (!g || !mark) return;
+    LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
+    LLVMTypeRef uwty = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), &i32t, 1, 0);
+    zan_call2(g->builder, uwty, get_eh_tmp_unwind_fn(g), &mark, 1, "");
 }
 
 static LLVMValueRef get_eh_tmp_drop_fn(zan_irgen_t *g) {
@@ -2454,8 +2460,14 @@ static LLVMValueRef get_eh_tmp_drop_fn(zan_irgen_t *g) {
     LLVMBuildStore(g->builder, idx, i_slot);
     LLVMValueRef slot = emit_eh_tmp_slot_ptr(g, idx);
     LLVMValueRef obj = LLVMBuildLoad2(g->builder, i8ptr, slot, "obj");
+    LLVMValueRef obj_i = LLVMBuildPtrToInt(g->builder, obj,
+        LLVMInt64TypeInContext(g->ctx), "obji");
+    LLVMValueRef untag = LLVMBuildIntToPtr(g->builder,
+        zan_and(g->builder, obj_i,
+            LLVMConstInt(LLVMInt64TypeInContext(g->ctx), ~(uint64_t)7, 0), "untag"),
+        i8ptr, "uobj");
     LLVMBuildCondBr(g->builder,
-        zan_icmp(g->builder, LLVMIntEQ, obj, LLVMGetParam(fn, 0), "same"),
+        zan_icmp(g->builder, LLVMIntEQ, untag, LLVMGetParam(fn, 0), "same"),
         hit, next);
 
     LLVMPositionBuilderAtEnd(g->builder, hit);

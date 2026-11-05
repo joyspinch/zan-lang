@@ -110,7 +110,7 @@ static inline bool target_is_wasm32(zan_irgen_t *g) {
 #define INITIAL_LOCALS 16
 #define ZAN_CLOSURE_HDR_FIELDS 3
 
-typedef struct {
+typedef struct local_var {
     zan_istr_t name;
     LLVMValueRef alloca;
     zan_type_t *type;
@@ -130,6 +130,10 @@ typedef struct {
     int struct_rc;
     int per_iteration;
 } local_var_t;
+
+static inline bool local_needs_cleanup(local_var_t *v) {
+    return v && (v->arc_owned || v->struct_rc || v->box_cell || v->obj_rc_flag);
+}
 
 typedef struct {
     zan_ast_node_t *decl;
@@ -453,6 +457,7 @@ void emit_eh_tmp_pop(zan_irgen_t *g);
 void emit_eh_tmp_push(zan_irgen_t *g, LLVMValueRef obj);
 void emit_eh_tmp_push_slot(zan_irgen_t *g, LLVMValueRef slot, int kind);
 void emit_eh_unwind_to_handler(zan_irgen_t *g, LLVMValueRef top);
+void emit_eh_tmp_unwind_to(zan_irgen_t *g, LLVMValueRef mark);
 void emit_invalidate_freed_string(zan_irgen_t *g, zan_ast_node_t *arg, local_scope_t *locals);
 LLVMValueRef emit_null_cond(zan_irgen_t *g, zan_ast_node_t *expr, zan_ast_node_t *qmem, local_scope_t *locals);
 void fill_default_args(zan_irgen_t *g, zan_ast_node_t *call, zan_symbol_t *method_sym);
@@ -718,8 +723,11 @@ void emit_release_obj_local(zan_irgen_t *g, local_var_t *v);
 void emit_release_obj_value(zan_irgen_t *g, LLVMValueRef cur);
 void emit_release_owned_call_temp(zan_irgen_t *g, zan_ast_node_t *arg, LLVMValueRef val, local_scope_t *locals);
 void emit_release_owned_locals(zan_irgen_t *g, local_scope_t *locals);
+void emit_release_owned_locals_no_pop(zan_irgen_t *g, local_scope_t *locals);
 void emit_release_owned_locals_from(zan_irgen_t *g, local_scope_t *locals, int start);
 void emit_release_owned_locals_range(zan_irgen_t *g, local_scope_t *locals, int start);
+void lpad_register_local(zan_irgen_t *g, local_var_t *v);
+void emit_lpad_cleanups(zan_irgen_t *g, zan_lpad_entry_t *entry);
 void emit_runtime_check(zan_irgen_t *g, LLVMValueRef is_error, zan_loc_t loc, const char *msg);
 void emit_sb_append_bytes(zan_irgen_t *g, LLVMValueRef sbp, LLVMValueRef s, LLVMValueRef slen);
 LLVMValueRef emit_soft_base_select(zan_irgen_t *g, LLVMValueRef base, LLVMValueRef isnull, zan_loc_t loc);

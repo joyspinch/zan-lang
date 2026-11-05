@@ -191,8 +191,8 @@ LLVMValueRef emit_method_spec_call(zan_irgen_t *g, int idx,
     coerce_args_to_params(g, sp.fn_type, call_args, total);
     const char *cn = (LLVMGetTypeKind(LLVMGetReturnType(sp.fn_type)) ==
                       LLVMVoidTypeKind) ? "" : "gspec";
-    LLVMValueRef result = zan_call2(g->builder, sp.fn_type, sp.fn,
-                                    call_args, (unsigned)total, cn);
+    LLVMValueRef result = zan_call_or_invoke(g, g->builder, sp.fn_type, sp.fn,
+                                             call_args, (unsigned)total, cn);
     for (int j = total - 1; j >= 0; j--)
         if (arg_eh_pushed[j]) emit_eh_tmp_pop(g);
     for (int j = 0; j < total; j++)
@@ -324,21 +324,14 @@ int emit_call_arg_eh_push(zan_irgen_t *g, zan_ast_node_t *arg,
     if (!call_arg_is_owned_temp(g, arg, at, locals) ||
         LLVMGetTypeKind(LLVMTypeOf(val)) != LLVMPointerTypeKind) return 0;
     if (expr_yields_delegate_value(g, arg, locals)) {
-        /* 委托实参：闭包在 IR 里是函数指针，而展开器按 i8ptr 取回闭包
-           指针来跑它的析构，所以槽里存的是位转换后的 i8ptr。 */
         LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
-        LLVMValueRef slot = emit_entry_alloca(g, i8ptr, "arg.eh");
-        LLVMBuildStore(g->builder,
-            LLVMBuildBitCast(g->builder, val, i8ptr, "arg.dlg"), slot);
-        emit_eh_tmp_push_slot(g, slot, ZAN_EH_SLOT_DLG);
+        emit_eh_tmp_push_slot(g,
+            LLVMBuildBitCast(g->builder, val, i8ptr, "arg.dlg"), ZAN_EH_SLOT_DLG);
         return 1;
     }
     int ehk = eh_slot_kind_of(at);
     if (ehk != ZAN_EH_SLOT_OBJ) {
-        LLVMValueRef slot = emit_entry_alloca(g,
-            LLVMTypeOf(val), "arg.eh");
-        LLVMBuildStore(g->builder, val, slot);
-        emit_eh_tmp_push_slot(g, slot, ehk);
+        emit_eh_tmp_push_slot(g, val, ehk);
     } else {
         emit_eh_tmp_push(g, val);
     }
@@ -911,7 +904,7 @@ LLVMValueRef emit_object_family_call(zan_irgen_t *g,
                 : thisv;
             if (fam == 1 && npar > 1)
                 ca[1] = emit_boundary_coerce(g, aval, pts[1]);
-            LLVMValueRef r = zan_call2(g->builder, cands[ci].fnty,
+            LLVMValueRef r = zan_call_or_invoke(g, g->builder, cands[ci].fnty,
                 cands[ci].fn, ca, (unsigned)cargc, "objf.call");
             r = emit_boundary_coerce(g, r, res_ty);
             phi_vals[np] = r;

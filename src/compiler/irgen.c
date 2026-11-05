@@ -3945,6 +3945,8 @@ LLVMValueRef emit_entry_alloca(zan_irgen_t *g, LLVMTypeRef ty, const char *name)
     LLVMValueRef alloca = LLVMBuildAlloca(g->builder, ty, name);
     if (LLVMGetTypeKind(ty) == LLVMPointerTypeKind)
         LLVMBuildStore(g->builder, LLVMConstNull(ty), alloca);
+    else if (LLVMGetTypeKind(ty) == LLVMStructTypeKind)
+        LLVMBuildStore(g->builder, LLVMConstNull(ty), alloca);
     zan_builder_restore(g, pt);
     return alloca;
 }
