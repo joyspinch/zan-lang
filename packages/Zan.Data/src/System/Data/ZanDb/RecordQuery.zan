@@ -1,0 +1,385 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+
+namespace System.Data.ZanDb;
+
+// 强类型查询构造器：基于 System.Linq.ExprNode 编译期语法树下推
+// 0% JsonValue 装箱，0 运行时 SQL 文本解析，天然防 SQL 注入
+public class RecordQuery {
+    public RecordTable table;
+    public ExprNode expr;
+    public int skipN;
+    public int takeN;
+    public string orderCol;
+    public bool orderDesc;
+
+    public RecordQuery(RecordTable table) {
+        this.table = table;
+        this.expr = null;
+        this.skipN = 0;
+        this.takeN = 0;
+        this.orderCol = null;
+        this.orderDesc = false;
+    }
+
+    public RecordQuery Where(ExprNode predicate) {
+        if (predicate == null) { return this; }
+        if (this.expr == null) {
+            this.expr = predicate;
+        } else {
+            this.expr = ExprNode.Binary("&&", this.expr, predicate);
+        }
+        return this;
+    }
+
+    public RecordQuery Skip(int n) {
+        this.skipN = n > 0 ? n : 0;
+        return this;
+    }
+
+    public RecordQuery Take(int n) {
+        this.takeN = n > 0 ? n : 0;
+        return this;
+    }
+
+    public RecordQuery OrderBy(string col) {
+        this.orderCol = col;
+        this.orderDesc = false;
+        return this;
+    }
+
+    public RecordQuery OrderByDescending(string col) {
+        this.orderCol = col;
+        this.orderDesc = true;
+        return this;
+    }
+
+    public int Count() {
+        List<RecordRow> list = this.ToList();
+        return list.Count;
+    }
+
+    public RecordRow FirstOrDefault() {
+        this.takeN = 1;
+        List<RecordRow> list = this.ToList();
+        return list.Count > 0 ? list[0] : null;
+    }
+
+    // 执行查询计划并物化结果
+    public List<RecordRow> ToList() {
+        List<RecordRow> results = new List<RecordRow>();
+        if (this.table == null || !this.table.IsOpen()) {
+            return results;
+        }
+
+        List<int> candidateIds = this.PlanCandidateIds();
+        if (candidateIds != null) {
+            // 走索引候选集路径
+            for (int i = 0; i < candidateIds.Count; i = i + 1) {
+                int id = candidateIds[i];
+                RecordRow r = this.table.Get(id);
+                if (r != null) {
+                    if (this.expr == null || this.EvalNode(this.expr, r)) {
+                        results.Add(r);
+                    }
+                }
+            }
+        } else {
+            // 无索引命中：全表扫描路径
+            this.table.Scan((int id, RecordRow r) => {
+                if (this.expr == null || this.EvalNode(this.expr, r)) {
+                    results.Add(r);
+                }
+                return true;
+            });
+        }
+
+        // 排序
+        if (this.orderCol != null && this.orderCol.Length > 0 && results.Count > 1) {
+            this.SortResults(results);
+        }
+
+        // 分页 Skip & Take
+        if (this.skipN > 0 || (this.takeN > 0 && this.takeN < results.Count)) {
+            List<RecordRow> paged = new List<RecordRow>();
+            int start = this.skipN;
+            int end = results.Count;
+            if (this.takeN > 0 && start + this.takeN < end) {
+                end = start + this.takeN;
+            }
+            for (int i = start; i < end; i = i + 1) {
+                paged.Add(results[i]);
+            }
+            return paged;
+        }
+
+        return results;
+    }
+
+    // 查询优化器：识别谓词中可下推至二级索引 / 范围索引的列
+    public List<int> PlanCandidateIds() {
+        if (this.expr == null) { return null; }
+        return this.ExtractIndexIds(this.expr);
+    }
+
+    public List<int> ExtractIndexIds(ExprNode n) {
+        if (n == null) { return null; }
+        if (n.Kind == 4) { // Lambda
+            return this.ExtractIndexIds(n.A);
+        }
+        if (n.Kind == 2) { // Binary
+            if (n.Name == "==") {
+                if (n.A != null && n.A.Kind == 0 && n.B != null && n.B.Kind == 1) {
+                    string col = n.A.Name;
+                    if (this.table.HasIndex(col)) {
+                        string val = this.ConstToString(n.B);
+                        return this.table.FindIdsByIndex(col, val);
+                    }
+                } else if (n.B != null && n.B.Kind == 0 && n.A != null && n.A.Kind == 1) {
+                    string col = n.B.Name;
+                    if (this.table.HasIndex(col)) {
+                        string val = this.ConstToString(n.A);
+                        return this.table.FindIdsByIndex(col, val);
+                    }
+                }
+            } else if (n.Name == ">=" || n.Name == ">" || n.Name == "<=" || n.Name == "<") {
+                if (n.A != null && n.A.Kind == 0 && n.B != null && n.B.Kind == 1) {
+                    string col = n.A.Name;
+                    if (this.table.HasIndex(col)) {
+                        string lo = "";
+                        string hi = "";
+                        string val = this.ConstToString(n.B);
+                        if (n.Name == ">=" || n.Name == ">") {
+                            lo = val;
+                        } else {
+                            hi = val;
+                        }
+                        return this.table.FindIdsByRange(col, lo, hi);
+                    }
+                }
+            } else if (n.Name == "&&") {
+                List<int> leftIds = this.ExtractIndexIds(n.A);
+                List<int> rightIds = this.ExtractIndexIds(n.B);
+                if (leftIds != null && rightIds != null) {
+                    return this.IntersectIds(leftIds, rightIds);
+                }
+                if (leftIds != null) { return leftIds; }
+                if (rightIds != null) { return rightIds; }
+            }
+        }
+        return null;
+    }
+
+    public List<int> IntersectIds(List<int> a, List<int> b) {
+        List<int> res = new List<int>();
+        if (a == null || b == null) { return res; }
+        Dictionary<int, bool> idSet = new Dictionary<int, bool>();
+        for (int i = 0; i < a.Count; i = i + 1) {
+            idSet[a[i]] = true;
+        }
+        for (int i = 0; i < b.Count; i = i + 1) {
+            if (idSet.ContainsKey(b[i])) {
+                res.Add(b[i]);
+            }
+        }
+        return res;
+    }
+
+    public string ConstToString(ExprNode c) {
+        if (c == null) { return ""; }
+        if (c.TVal == 0) { return Convert.ToString(c.IVal); }
+        if (c.TVal == 1) { return Convert.ToString(c.DVal); }
+        if (c.TVal == 2) { return c.SVal != null ? c.SVal : ""; }
+        if (c.TVal == 3) { return c.BVal ? "1" : "0"; }
+        if (c.TVal == 5) { return Convert.ToString(c.LVal); }
+        return "";
+    }
+
+    // 内存强类型语法树求值器（0 装箱，直接走读 RecordRow 二进制数据）
+    public bool EvalNode(ExprNode n, RecordRow r) {
+        if (n == null) { return true; }
+        if (n.Kind == 4) { // Lambda: p => body
+            return this.EvalNode(n.A, r);
+        }
+        if (n.Kind == 5) { // Unary Not: !expr
+            return !this.EvalNode(n.A, r);
+        }
+        if (n.Kind == 2) { // Binary
+            if (n.Name == "&&") {
+                return this.EvalNode(n.A, r) && this.EvalNode(n.B, r);
+            }
+            if (n.Name == "||") {
+                return this.EvalNode(n.A, r) || this.EvalNode(n.B, r);
+            }
+
+            // 比较运算
+            double numA = 0.0;
+            double numB = 0.0;
+            bool isNumA = false;
+            bool isNumB = false;
+            string strA = "";
+            string strB = "";
+
+            this.EvalVal(n.A, r, out numA, out isNumA, out strA);
+            this.EvalVal(n.B, r, out numB, out isNumB, out strB);
+
+            if (isNumA && isNumB) {
+                if (n.Name == "==") { return Math.Abs(numA - numB) < 1e-9; }
+                if (n.Name == "!=") { return Math.Abs(numA - numB) >= 1e-9; }
+                if (n.Name == "<") { return numA < numB; }
+                if (n.Name == "<=") { return numA <= numB; }
+                if (n.Name == ">") { return numA > numB; }
+                if (n.Name == ">=") { return numA >= numB; }
+            } else {
+                int cmp = String.CompareOrdinal(strA, strB);
+                if (n.Name == "==") { return cmp == 0; }
+                if (n.Name == "!=") { return cmp != 0; }
+                if (n.Name == "<") { return cmp < 0; }
+                if (n.Name == "<=") { return cmp <= 0; }
+                if (n.Name == ">") { return cmp > 0; }
+                if (n.Name == ">=") { return cmp >= 0; }
+            }
+            return false;
+        }
+        if (n.Kind == 3) { // Method call: StartsWith / EndsWith / Contains
+            double ignored = 0.0;
+            bool isNum = false;
+            string target = "";
+            this.EvalVal(n.A, r, out ignored, out isNum, out target);
+            string arg = "";
+            this.EvalVal(n.B, r, out ignored, out isNum, out arg);
+
+            if (n.Name == "StartsWith") {
+                return target.StartsWith(arg);
+            }
+            if (n.Name == "EndsWith") {
+                return target.EndsWith(arg);
+            }
+            if (n.Name == "Contains") {
+                return target.Contains(arg);
+            }
+        }
+        return true;
+    }
+
+    public void EvalVal(ExprNode n, RecordRow r, out double numVal, out bool isNum, out string strVal) {
+        numVal = 0.0;
+        isNum = false;
+        strVal = "";
+        if (n == null) { return; }
+
+        if (n.Kind == 0) { // Member access
+            string colName = n.Name;
+            RecordColumn col = this.table.Schema().FindColumn(colName);
+            if (col == null) { return; }
+
+            if (col.dataType == RecordDataType.Int32) {
+                numVal = (double)r.GetInt32(colName);
+                isNum = true;
+                strVal = Convert.ToString(r.GetInt32(colName));
+            } else if (col.dataType == RecordDataType.Int64) {
+                numVal = (double)r.GetInt64(colName);
+                isNum = true;
+                strVal = Convert.ToString(r.GetInt64(colName));
+            } else if (col.dataType == RecordDataType.Float32) {
+                numVal = (double)r.GetFloat32(colName);
+                isNum = true;
+                strVal = Convert.ToString(numVal);
+            } else if (col.dataType == RecordDataType.Float64) {
+                numVal = r.GetFloat64(colName);
+                isNum = true;
+                strVal = Convert.ToString(numVal);
+            } else if (col.dataType == RecordDataType.Bool) {
+                bool b = r.GetBool(colName);
+                numVal = b ? 1.0 : 0.0;
+                isNum = true;
+                strVal = b ? "1" : "0";
+            } else if (col.dataType == RecordDataType.FixedStr) {
+                strVal = r.GetStr(colName);
+                isNum = false;
+            } else if (col.dataType == RecordDataType.VarStr) {
+                strVal = r.GetVarStr(colName);
+                isNum = false;
+            }
+        } else if (n.Kind == 1) { // Constant
+            if (n.TVal == 0) {
+                numVal = (double)n.IVal;
+                isNum = true;
+                strVal = Convert.ToString(n.IVal);
+            } else if (n.TVal == 1) {
+                numVal = n.DVal;
+                isNum = true;
+                strVal = Convert.ToString(n.DVal);
+            } else if (n.TVal == 2) {
+                strVal = n.SVal != null ? n.SVal : "";
+                isNum = false;
+            } else if (n.TVal == 3) {
+                numVal = n.BVal ? 1.0 : 0.0;
+                isNum = true;
+                strVal = n.BVal ? "1" : "0";
+            } else if (n.TVal == 5) {
+                numVal = (double)n.LVal;
+                isNum = true;
+                strVal = Convert.ToString(n.LVal);
+            }
+        }
+    }
+
+    public void SortResults(List<RecordRow> list) {
+        RecordColumn col = this.table.Schema().FindColumn(this.orderCol);
+        if (col == null) { return; }
+
+        bool isNum = col.dataType == RecordDataType.Int32 || col.dataType == RecordDataType.Int64 ||
+                     col.dataType == RecordDataType.Float32 || col.dataType == RecordDataType.Float64 ||
+                     col.dataType == RecordDataType.Bool;
+
+        // 插入排序
+        int n = list.Count;
+        for (int i = 1; i < n; i = i + 1) {
+            RecordRow keyRow = list[i];
+            int j = i - 1;
+            while (j >= 0) {
+                RecordRow curRow = list[j];
+                int cmp = 0;
+                if (isNum) {
+                    double vA = this.GetNum(curRow, col);
+                    double vB = this.GetNum(keyRow, col);
+                    if (vA < vB) { cmp = 0 - 1; }
+                    else if (vA > vB) { cmp = 1; }
+                    else { cmp = 0; }
+                } else {
+                    string sA = this.GetStr(curRow, col);
+                    string sB = this.GetStr(keyRow, col);
+                    cmp = String.CompareOrdinal(sA, sB);
+                }
+
+                if (this.orderDesc) { cmp = 0 - cmp; }
+
+                if (cmp > 0) {
+                    list[j + 1] = list[j];
+                    j = j - 1;
+                } else {
+                    break;
+                }
+            }
+            list[j + 1] = keyRow;
+        }
+    }
+
+    public double GetNum(RecordRow r, RecordColumn col) {
+        if (col.dataType == RecordDataType.Int32) { return (double)r.GetInt32(col.name); }
+        if (col.dataType == RecordDataType.Int64) { return (double)r.GetInt64(col.name); }
+        if (col.dataType == RecordDataType.Float32) { return (double)r.GetFloat32(col.name); }
+        if (col.dataType == RecordDataType.Float64) { return r.GetFloat64(col.name); }
+        if (col.dataType == RecordDataType.Bool) { return r.GetBool(col.name) ? 1.0 : 0.0; }
+        return 0.0;
+    }
+
+    public string GetStr(RecordRow r, RecordColumn col) {
+        if (col.dataType == RecordDataType.FixedStr) { return r.GetStr(col.name); }
+        if (col.dataType == RecordDataType.VarStr) { return r.GetVarStr(col.name); }
+        return "";
+    }
+}

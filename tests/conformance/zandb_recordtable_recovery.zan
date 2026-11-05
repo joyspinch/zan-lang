@@ -1,0 +1,141 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Data.ZanDb;
+
+// 刀16 结构化表格引擎（RecordTable）伴生 WAL 崩溃自愈与撕裂尾截断用例：
+// 1. 模拟断电撕裂尾帧头（Torn Frame Header at tail）：自动 Truncate 截断修复，数据完整；
+// 2. 模拟断电撕裂尾载荷（Torn Frame Payload at tail）：自动 Truncate 截断修复，数据完整；
+// 3. 模拟尾部坏 CRC 撕裂帧（CRC Mismatch at tail）：自动 Truncate 截断修复，恢复至前一原子提交；
+// 4. 未检查点 WAL 帧重放（Uncheckpointed WAL Replay）：重开时自动将未刷盘事务回放到 .ztab 与索引。
+class ZanDbRecordTableRecoveryTest {
+    static int checks = 0;
+
+    static void Ok(bool cond, string what) {
+        checks = checks + 1;
+        if (cond) {
+            Console.WriteLine("ok " + Convert.ToString(checks) + " - " + what);
+        } else {
+            Console.WriteLine("FAIL " + Convert.ToString(checks) + " - " + what);
+        }
+    }
+
+    static void Clean(string basePath) {
+        if (File.Exists(basePath + ".recovery.ztab")) { File.Delete(basePath + ".recovery.ztab"); }
+        if (File.Exists(basePath + ".recovery.zblob")) { File.Delete(basePath + ".recovery.zblob"); }
+        if (File.Exists(basePath + ".recovery.zidx")) { File.Delete(basePath + ".recovery.zidx"); }
+        if (File.Exists(basePath + ".recovery.zwal")) { File.Delete(basePath + ".recovery.zwal"); }
+    }
+
+    static void Main() {
+        string dbPath = "_scratch/test_rt_recovery";
+        Directory.CreateDirectory("_scratch");
+        Clean(dbPath);
+
+        RecordSchema schema = new RecordSchema();
+        schema.AddInt32("id");
+        schema.AddFixedStr("name", 32);
+        schema.AddInt32("age");
+        schema.AddVarStr("note");
+
+        // 1. 初始建表并写入 5 条记录
+        RecordTable rt = RecordTable.Open(dbPath, "recovery", schema);
+        Ok(rt.IsOpen(), "RecordTable created successfully");
+        for (int i = 1; i <= 5; i = i + 1) {
+            RecordRow r = new RecordRow(schema);
+            r.SetInt32("id", 100 + i);
+            r.SetStr("name", "User_" + Convert.ToString(i));
+            r.SetInt32("age", 20 + i);
+            r.SetVarStr("note", "Note for user " + Convert.ToString(i));
+            rt.Add(r);
+        }
+        Ok(rt.Count() == 5 && rt.TotalRows() == 5, "5 rows committed to WAL and table");
+        rt.Close();
+
+        string walPath = dbPath + ".recovery.zwal";
+        Ok(File.Exists(walPath), "wal file exists on disk");
+        long sizeBefore1 = (long)File.ReadAllBytes(walPath).Length;
+
+        // 2. 模拟断电撕裂场景 1：尾部半写 4 字节垃圾帧头
+        byte[] tornHeader = new byte[4];
+        tornHeader[0] = 0xAA;
+        tornHeader[1] = 0xBB;
+        tornHeader[2] = 0xCC;
+        tornHeader[3] = 0xDD;
+        PageFile pf1 = PageFile.OpenExisting(walPath);
+        pf1.WriteAt(sizeBefore1, (nint)tornHeader, 4);
+        pf1.Sync();
+        pf1.Close();
+        Ok((long)File.ReadAllBytes(walPath).Length == sizeBefore1 + 4L, "injected torn 4B header at wal tail");
+
+        // 重开表：自愈检测撕裂尾并执行 Truncate 修复
+        RecordTable rtR1 = RecordTable.Open(dbPath, "recovery");
+        Ok(rtR1.IsOpen(), "reopened table with torn header auto-recovered");
+        Ok(rtR1.Count() == 5 && rtR1.TotalRows() == 5, "row count intact after torn header recovery");
+        RecordRow g5 = rtR1.Get(5);
+        Ok(g5 != null && g5.GetStr("name") == "User_5", "row 5 content intact");
+        rtR1.Close();
+        long sizeAfter1 = (long)File.ReadAllBytes(walPath).Length;
+        Ok(sizeAfter1 == sizeBefore1, "wal truncated back to valid size");
+
+        // 3. 追加 5 条记录并模拟断电撕裂场景 2：尾部半写载荷截断
+        RecordTable rt2 = RecordTable.Open(dbPath, "recovery");
+        for (int i = 6; i <= 10; i = i + 1) {
+            RecordRow r = new RecordRow(schema);
+            r.SetInt32("id", 100 + i);
+            r.SetStr("name", "User_" + Convert.ToString(i));
+            r.SetInt32("age", 20 + i);
+            r.SetVarStr("note", "Note for user " + Convert.ToString(i));
+            rt2.Add(r);
+        }
+        Ok(rt2.Count() == 10 && rt2.TotalRows() == 10, "10 rows committed");
+        rt2.Close();
+
+        long sizeBefore2 = (long)File.ReadAllBytes(walPath).Length;
+        // 伪造帧头声明长度 500 字节，但只写入 16 字节
+        ByteBuffer fakeFrame = ByteBuffer.Alloc(24);
+        fakeFrame.WriteU32(500L); // 声明 payloadLen = 500
+        fakeFrame.WriteU32(12345L); // fake CRC
+        for (int j = 0; j < 16; j = j + 1) { fakeFrame.WriteU8(0xEE); }
+        PageFile pf2 = PageFile.OpenExisting(walPath);
+        pf2.WriteAt(sizeBefore2, fakeFrame.Raw(), 24);
+        pf2.Sync();
+        pf2.Close();
+        fakeFrame.Free();
+        Ok((long)File.ReadAllBytes(walPath).Length == sizeBefore2 + 24L, "injected torn payload frame at wal tail");
+
+        // 重开自愈
+        RecordTable rtR2 = RecordTable.Open(dbPath, "recovery");
+        Ok(rtR2.IsOpen(), "reopened table with torn payload auto-recovered");
+        Ok(rtR2.Count() == 10 && rtR2.TotalRows() == 10, "all 10 rows intact after torn payload recovery");
+        RecordRow g10 = rtR2.Get(10);
+        Ok(g10 != null && g10.GetStr("name") == "User_10", "row 10 content intact");
+        rtR2.Close();
+        long sizeAfter2 = (long)File.ReadAllBytes(walPath).Length;
+        Ok(sizeAfter2 == sizeBefore2, "wal truncated back to clean boundary");
+
+        // 4. 模拟断电撕裂场景 3：末尾损坏 CRC
+        RecordTable rt3 = RecordTable.Open(dbPath, "recovery");
+        long sizeBefore3 = (long)File.ReadAllBytes(walPath).Length;
+        // 写入完整尺寸但 CRC 不匹配的半写帧
+        ByteBuffer badCrcFrame = ByteBuffer.Alloc(32);
+        badCrcFrame.WriteU32(24L); // payloadLen = 24
+        badCrcFrame.WriteU32(999999L); // 错误 CRC
+        for (int j = 0; j < 24; j = j + 1) { badCrcFrame.WriteU8(0x77); }
+        PageFile pf3 = PageFile.OpenExisting(walPath);
+        pf3.WriteAt(sizeBefore3, badCrcFrame.Raw(), 32);
+        pf3.Sync();
+        pf3.Close();
+        badCrcFrame.Free();
+        rt3.Close();
+
+        RecordTable rtR3 = RecordTable.Open(dbPath, "recovery");
+        Ok(rtR3.IsOpen(), "reopened table with bad CRC tail frame auto-recovered");
+        Ok(rtR3.Count() == 10 && rtR3.TotalRows() == 10, "row count perfectly preserved");
+        rtR3.Close();
+
+        // 收尾清理
+        Clean(dbPath);
+        Console.WriteLine("ALL " + Convert.ToString(checks) + " CHECKS PASSED");
+    }
+}

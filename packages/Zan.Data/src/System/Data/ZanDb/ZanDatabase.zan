@@ -144,15 +144,31 @@ public class ZanDatabase : IDisposable {
         } finally { this.tlock.ExitRead(); }
     }
 
-    // 将后续写入批量合并为一次原子提交。
-    public void Begin() { this.kv.Begin(); }
+    // 将后续写入批量合并为一次原子提交（协调底座 KV 与所有已挂载 RecordTable）。
+    public void Begin() {
+        this.kv.Begin();
+        for (int i = 0; i < this.recordTables.Count; i = i + 1) {
+            this.recordTables[i].table.BeginTransaction();
+        }
+    }
 
     // 外层非空提交推进修订号；嵌套 true 仅表示仍暂存。
     // 可比较 GetRevision/CacheVersion 的前后值决定是否通知外部缓存。
-    public bool Commit() { return this.kv.Commit(); }
+    public bool Commit() {
+        bool ok = this.kv.Commit();
+        for (int i = 0; i < this.recordTables.Count; i = i + 1) {
+            this.recordTables[i].table.Commit();
+        }
+        return ok;
+    }
 
     // 丢弃最外层批次的全部暂存写入，同时使事务读缓存失效。
-    public void Rollback() { this.kv.Rollback(); }
+    public void Rollback() {
+        this.kv.Rollback();
+        for (int i = 0; i < this.recordTables.Count; i = i + 1) {
+            this.recordTables[i].table.Rollback();
+        }
+    }
     public bool InTransaction() { return this.kv.InTransaction(); }
     public long GetRevision() { return this.kv.GetRevision(); }
     public long CacheVersion() { return this.kv.CacheVersion(); }
@@ -279,6 +295,12 @@ public class ZanDatabase : IDisposable {
                 if (File.Exists(dstIdx)) { File.Delete(dstIdx); }
                 File.Copy(srcIdx, dstIdx);
             }
+            string srcWal = rt.walPath;
+            string dstWal = target + "." + this.recordTables[i].name + ".zwal";
+            if (File.Exists(srcWal)) {
+                if (File.Exists(dstWal)) { File.Delete(dstWal); }
+                File.Copy(srcWal, dstWal);
+            }
         }
 
         // 对导出的数据库做全库巡检审计（包含已注册集合的索引代审计、向量表与表格校验）
@@ -332,6 +354,8 @@ public class ZanDatabase : IDisposable {
             if (File.Exists(dstBlob)) { File.Delete(dstBlob); }
             string dstIdx = target + "." + this.recordTables[i].name + ".zidx";
             if (File.Exists(dstIdx)) { File.Delete(dstIdx); }
+            string dstWal = target + "." + this.recordTables[i].name + ".zwal";
+            if (File.Exists(dstWal)) { File.Delete(dstWal); }
         }
     }
 

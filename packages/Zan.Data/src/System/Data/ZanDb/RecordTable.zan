@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using System.Text;
 using System.Threading;
 namespace System.Data.ZanDb;
@@ -159,7 +160,7 @@ public class RecordSchema {
     }
 }
 
-// 强类型定长记录行（零 JsonValue，零装箱分配）
+// 零装箱物理数据行
 public class RecordRow {
     public RecordSchema schema;
     public byte[] data;
@@ -167,24 +168,24 @@ public class RecordRow {
     public bool isActive;
     public RecordTable table;
 
-    // 暂存未落盘或已缓存读取的变长内容
+    // 变长字段写时缓冲（落盘前暂存，落盘后生成 8 字节 offset/len 指针）
     public Dictionary<string, string> varStrs;
     public Dictionary<string, byte[]> blobs;
 
     public RecordRow(RecordSchema schema) {
         this.schema = schema;
         this.data = new byte[schema.rowBytes];
+        this.data[0] = 1; // 默认标志位：活跃有效
         this.id = 0;
         this.isActive = true;
         this.table = null;
         this.varStrs = new Dictionary<string, string>();
         this.blobs = new Dictionary<string, byte[]>();
-        this.data[0] = 1; // 默认活跃有效
     }
 
-    public RecordRow(RecordSchema schema, byte[] data, int id, bool isActive, RecordTable table = null) {
+    public RecordRow(RecordSchema schema, byte[] raw, int id, bool isActive, RecordTable table = null) {
         this.schema = schema;
-        this.data = data;
+        this.data = raw;
         this.id = id;
         this.isActive = isActive;
         this.table = table;
@@ -211,10 +212,10 @@ public class RecordRow {
         }
         int off = col.offset;
         int b0 = (int)this.data[off] & 255;
-        int b1 = (int)this.data[off + 1] & 255;
-        int b2 = (int)this.data[off + 2] & 255;
-        int b3 = (int)this.data[off + 3] & 255;
-        return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
+        int b1 = ((int)this.data[off + 1] & 255) << 8;
+        int b2 = ((int)this.data[off + 2] & 255) << 16;
+        int b3 = ((int)this.data[off + 3] & 255) << 24;
+        return b0 | b1 | b2 | b3;
     }
 
     public void SetInt64(string colName, long val) {
@@ -224,7 +225,7 @@ public class RecordRow {
         }
         int off = col.offset;
         for (int i = 0; i < 8; i = i + 1) {
-            this.data[off + i] = (byte)((int)(val >> (i * 8)) & 255);
+            this.data[off + i] = (byte)((val >> (i * 8)) & 255L);
         }
     }
 
@@ -236,23 +237,22 @@ public class RecordRow {
         int off = col.offset;
         long res = 0L;
         for (int i = 0; i < 8; i = i + 1) {
-            long b = (long)((int)this.data[off + i] & 255);
-            res = res | (b << (i * 8));
+            res = res | (((long)this.data[off + i] & 255L) << (i * 8));
         }
         return res;
     }
 
     public void SetFloat32(string colName, float val) {
-        int bits = NativeMemory.AsI32(val);
         RecordColumn col = this.schema.FindColumn(colName);
         if (col == null || col.dataType != RecordDataType.Float32) {
             throw new ArgumentException("invalid column or type mismatch for: " + colName);
         }
+        int u = BitConverter.SingleToInt32Bits(val);
         int off = col.offset;
-        this.data[off] = (byte)(bits & 255);
-        this.data[off + 1] = (byte)((bits >> 8) & 255);
-        this.data[off + 2] = (byte)((bits >> 16) & 255);
-        this.data[off + 3] = (byte)((bits >> 24) & 255);
+        this.data[off] = (byte)(u & 255);
+        this.data[off + 1] = (byte)((u >> 8) & 255);
+        this.data[off + 2] = (byte)((u >> 16) & 255);
+        this.data[off + 3] = (byte)((u >> 24) & 255);
     }
 
     public float GetFloat32(string colName) {
@@ -261,23 +261,20 @@ public class RecordRow {
             throw new ArgumentException("invalid column or type mismatch for: " + colName);
         }
         int off = col.offset;
-        int b0 = (int)this.data[off] & 255;
-        int b1 = (int)this.data[off + 1] & 255;
-        int b2 = (int)this.data[off + 2] & 255;
-        int b3 = (int)this.data[off + 3] & 255;
-        int bits = b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
-        return NativeMemory.AsF32(bits);
+        int u = ((int)this.data[off] & 255) | (((int)this.data[off + 1] & 255) << 8) |
+                (((int)this.data[off + 2] & 255) << 16) | (((int)this.data[off + 3] & 255) << 24);
+        return BitConverter.Int32BitsToSingle(u);
     }
 
     public void SetFloat64(string colName, double val) {
-        long bits = NativeMemory.AsI64(val);
         RecordColumn col = this.schema.FindColumn(colName);
         if (col == null || col.dataType != RecordDataType.Float64) {
             throw new ArgumentException("invalid column or type mismatch for: " + colName);
         }
+        long u = BitConverter.DoubleToInt64Bits(val);
         int off = col.offset;
         for (int i = 0; i < 8; i = i + 1) {
-            this.data[off + i] = (byte)((int)(bits >> (i * 8)) & 255);
+            this.data[off + i] = (byte)((u >> (i * 8)) & 255L);
         }
     }
 
@@ -287,12 +284,11 @@ public class RecordRow {
             throw new ArgumentException("invalid column or type mismatch for: " + colName);
         }
         int off = col.offset;
-        long res = 0L;
+        long u = 0L;
         for (int i = 0; i < 8; i = i + 1) {
-            long b = (long)((int)this.data[off + i] & 255);
-            res = res | (b << (i * 8));
+            u = u | (((long)this.data[off + i] & 255L) << (i * 8));
         }
-        return NativeMemory.AsF64(res);
+        return BitConverter.Int64BitsToDouble(u);
     }
 
     public void SetStr(string colName, string val) {
@@ -309,13 +305,13 @@ public class RecordRow {
         }
         int off = col.offset;
         int max = col.fixedLen;
-        byte[] src = val != null ? Encoding.GetBytes(val) : new byte[0];
-        int copyLen = src.Length > max ? max : src.Length;
-        for (int i = 0; i < copyLen; i = i + 1) {
-            this.data[off + i] = src[i];
+        byte[] bytes = val != null ? Encoding.GetBytes(val) : new byte[0];
+        int len = bytes != null ? bytes.Length : 0;
+        if (len > max) { len = max; }
+        for (int i = 0; i < len; i = i + 1) {
+            this.data[off + i] = bytes[i];
         }
-        // 零填充尾部
-        for (int i = copyLen; i < max; i = i + 1) {
+        for (int i = len; i < max; i = i + 1) {
             this.data[off + i] = 0;
         }
     }
@@ -431,29 +427,44 @@ public class RecordRow {
 // 1. .ztab 扁平二进制文件，O(1) 绝对物理寻址：offset = DataOffset + (id - 1) * RowBytes
 // 2. 彻底绝缘 JsonValue，0 堆装箱，0 Tape 转义
 // 3. 伴生 .zblob 变长文本与 BLOB 存储池，8 字节行内指针，Vacuum 紧凑回收
-// 4. 伴生 .zidx 二级索引文件持久化，O(1) 启动直读与脏退出自愈重建
-// 5. 独立表级并发读写锁（RwLock tlock）与 CRT I/O 原子锁（ioMtx），彻底解耦整库大锁
-// 6. 墓碑软删除防 ID 漂移 + 内存二级索引
+// 4. 伴生 .zidx 二级索引文件持久化，O(1) 启动直读与脏退出自愈重建；支持有序索引与范围查询
+// 5. 伴生 .zwal 预写日志与事务屏障：CRC32 校验帧、Torn Tail 截断自愈、Commit/Rollback 原子回滚
+// 6. 独立表级并发读写锁（RwLock tlock）与 CRT I/O 原子锁（ioMtx），彻底解耦整库大锁
+// 7. 墓碑软删除防 ID 漂移 + System.Linq.ExprNode 编译期语法树下推求值器
 public class RecordTable {
     public static string MAGIC_TAB = "ZTAB";
     public static string MAGIC_BLOB = "ZBLB";
     public static string MAGIC_IDX = "ZIDX";
+    public static string MAGIC_WAL = "ZWAL";
     public static int VERSION = 1;
     public static int HEADER_SIZE = 64;
     public static int BLOB_HEADER_SIZE = 32;
     public static int IDX_HEADER_SIZE = 32;
+    public static int WAL_HEADER_SIZE = 32;
+
+    public static int OP_ADD = 1;
+    public static int OP_UPDATE = 2;
+    public static int OP_DELETE = 3;
+    public static int OP_BATCH = 4;
+    public static int WAL_MAX_FRAME = 67108864; // 64MB
 
     public string name;
     public string tabPath;
     public string blobPath;
     public string idxPath;
+    public string walPath;
     public PageFile file;
     public PageFile blobFile;
+    public PageFile walFile;
     public RecordSchema schema;
     public int totalRows;
     public int activeRows;
     public long dataOffset;
     public long blobTotalBytes;
+    public long walValidSize;
+    public long lastTxSeq;
+    public bool inTx;
+    public List<RecordTxOp> txOps;
     public RwLock tlock;
     public nint ioMtx;
     public string lastError;
@@ -462,24 +473,33 @@ public class RecordTable {
     public Dictionary<int, bool> tombstones;
     // 内存二级索引映射：colName -> (colVal -> List<id>)
     public Dictionary<string, Dictionary<string, List<int>>> indexes;
+    // 内存有序键序列：colName -> List<sortedKey>
+    public Dictionary<string, List<string>> indexKeysSorted;
 
     public RecordTable() {
         this.name = "";
         this.tabPath = "";
         this.blobPath = "";
         this.idxPath = "";
+        this.walPath = "";
         this.file = null;
         this.blobFile = null;
+        this.walFile = null;
         this.schema = null;
         this.totalRows = 0;
         this.activeRows = 0;
         this.dataOffset = 64;
         this.blobTotalBytes = 32L;
+        this.walValidSize = 32L;
+        this.lastTxSeq = 0L;
+        this.inTx = false;
+        this.txOps = new List<RecordTxOp>();
         this.tlock = new RwLock();
         this.ioMtx = Mutex.Create();
         this.lastError = "";
         this.tombstones = new Dictionary<int, bool>();
         this.indexes = new Dictionary<string, Dictionary<string, List<int>>>();
+        this.indexKeysSorted = new Dictionary<string, List<string>>();
     }
 
     public bool IsOpen() {
@@ -498,6 +518,7 @@ public class RecordTable {
         rt.tabPath = basePath + "." + name + ".ztab";
         rt.blobPath = basePath + "." + name + ".zblob";
         rt.idxPath = basePath + "." + name + ".zidx";
+        rt.walPath = basePath + "." + name + ".zwal";
 
         bool exists = File.Exists(rt.tabPath);
         if (exists) {
@@ -568,6 +589,9 @@ public class RecordTable {
 
             // 尝试从 .zidx 持久化文件极速恢复二级索引
             rt.LoadIndexesLocked();
+
+            // 打开伴生 .zwal 预写日志并自愈重放
+            rt.OpenOrCreateWalFileLocked();
         } else {
             if (schema == null || schema.columns.Count == 0) {
                 rt.lastError = "schema must be provided for new RecordTable";
@@ -601,6 +625,9 @@ public class RecordTable {
 
             // 初始化伴生 .zblob
             rt.OpenOrCreateBlobFileLocked();
+
+            // 初始化伴生 .zwal 预写日志
+            rt.OpenOrCreateWalFileLocked();
         }
         return rt;
     }
@@ -678,6 +705,313 @@ public class RecordTable {
         } finally {
             Mutex.Unlock(this.ioMtx);
             h.Free();
+        }
+    }
+
+    // 打开或创建伴生 .zwal 预写日志
+    public void OpenOrCreateWalFileLocked() {
+        bool walExists = File.Exists(this.walPath);
+        if (walExists) {
+            this.walFile = PageFile.OpenExisting(this.walPath);
+            if (this.walFile != null && this.walFile.IsOpen()) {
+                int fsize = this.walFile.Size();
+                if (fsize < WAL_HEADER_SIZE) {
+                    this.ResetWalLocked();
+                } else {
+                    ByteBuffer wh = ByteBuffer.Alloc(WAL_HEADER_SIZE);
+                    if (this.walFile.ReadAt(0, wh, WAL_HEADER_SIZE) == WAL_HEADER_SIZE) {
+                        wh.SeekRead(0);
+                        string wMagic = wh.Str(0, 4);
+                        wh.SeekRead(4);
+                        int wVer = (int)wh.ReadU32();
+                        long cpSeq = wh.ReadU64();
+                        wh.Free();
+                        if (wMagic == MAGIC_WAL && wVer == VERSION) {
+                            this.lastTxSeq = cpSeq;
+                            this.walValidSize = (long)fsize;
+                            // 重放未检查点日志并截断自愈撕裂尾
+                            this.ReplayWalLocked();
+                        } else {
+                            this.ResetWalLocked();
+                        }
+                    } else {
+                        wh.Free();
+                        this.ResetWalLocked();
+                    }
+                }
+            }
+        } else {
+            this.walFile = PageFile.Open(this.walPath);
+            if (this.walFile != null && this.walFile.IsOpen()) {
+                this.ResetWalLocked();
+            }
+        }
+    }
+
+    // 重放 WAL 日志并物理截断断电留下的撕裂尾
+    public void ReplayWalLocked() {
+        if (this.walFile == null || !this.walFile.IsOpen()) { return; }
+        long fsize = (long)this.walFile.Size();
+        if (fsize < (long)WAL_HEADER_SIZE) {
+            this.walValidSize = 32L;
+            return;
+        }
+        long off = (long)WAL_HEADER_SIZE;
+        ByteBuffer hbuf = ByteBuffer.Alloc(8);
+        bool replayedAny = false;
+
+        while (off < fsize) {
+            if (fsize - off < 8L) {
+                // 尾部半写撕裂帧头，截断修复
+                Mutex.Lock(this.ioMtx);
+                this.walFile.Truncate(off);
+                this.walFile.Sync();
+                Mutex.Unlock(this.ioMtx);
+                this.walValidSize = off;
+                break;
+            }
+
+            this.walFile.ReadAt(off, hbuf, 8);
+            hbuf.SeekRead(0);
+            int plen = (int)hbuf.ReadU32();
+            long crc = hbuf.ReadU32();
+
+            if (plen <= 0 || plen > WAL_MAX_FRAME || (long)plen > fsize - off - 8L) {
+                // 尾部半写撕裂，截断修复
+                Mutex.Lock(this.ioMtx);
+                this.walFile.Truncate(off);
+                this.walFile.Sync();
+                Mutex.Unlock(this.ioMtx);
+                this.walValidSize = off;
+                break;
+            }
+
+            ByteBuffer payload = ByteBuffer.Alloc(plen);
+            this.walFile.ReadAt(off + 8L, payload, plen);
+            int computedCrc = payload.Crc32(plen);
+            if ((long)computedCrc != crc) {
+                payload.Free();
+                if (off + 8L + (long)plen == fsize) {
+                    // 正好在末尾损坏，撕裂尾截断修复
+                    Mutex.Lock(this.ioMtx);
+                    this.walFile.Truncate(off);
+                    this.walFile.Sync();
+                    Mutex.Unlock(this.ioMtx);
+                    this.walValidSize = off;
+                    break;
+                } else {
+                    // 中段损坏，拒绝隐蔽故障
+                    throw new InvalidOperationException("corrupt WAL frame detected before tail in " + this.walPath);
+                }
+            }
+
+            payload.SeekRead(0);
+            long seq = payload.ReadU64();
+            int op = payload.ReadU8();
+
+            if (seq > this.lastTxSeq) {
+                this.lastTxSeq = seq;
+            }
+
+            int rbytes = this.schema.rowBytes;
+            if (op == OP_ADD || op == OP_UPDATE) {
+                int id = (int)payload.ReadU32();
+                byte[] rdata = new byte[rbytes];
+                for (int j = 0; j < rbytes; j = j + 1) {
+                    rdata[j] = (byte)payload.ReadU8();
+                }
+                long tabOff = this.dataOffset + (long)(id - 1) * (long)rbytes;
+                Mutex.Lock(this.ioMtx);
+                this.file.WriteAt(tabOff, (nint)rdata, rbytes);
+                Mutex.Unlock(this.ioMtx);
+                if (id > this.totalRows) { this.totalRows = id; }
+                this.tombstones.Remove(id);
+                RecordRow r = new RecordRow(this.schema, rdata, id, true, this);
+                this.IndexRowLocked(r);
+                replayedAny = true;
+            } else if (op == OP_DELETE) {
+                int id = (int)payload.ReadU32();
+                this.tombstones[id] = true;
+                long tabOff = this.dataOffset + (long)(id - 1) * (long)rbytes;
+                byte[] zeroFlag = new byte[1];
+                zeroFlag[0] = 0;
+                Mutex.Lock(this.ioMtx);
+                this.file.WriteAt(tabOff, (nint)zeroFlag, 1);
+                Mutex.Unlock(this.ioMtx);
+                replayedAny = true;
+            } else if (op == OP_BATCH) {
+                int count = (int)payload.ReadU32();
+                for (int k = 0; k < count; k = k + 1) {
+                    int subOp = payload.ReadU8();
+                    int id = (int)payload.ReadU32();
+                    if (subOp == OP_ADD || subOp == OP_UPDATE) {
+                        byte[] rdata = new byte[rbytes];
+                        for (int j = 0; j < rbytes; j = j + 1) {
+                            rdata[j] = (byte)payload.ReadU8();
+                        }
+                        long tabOff = this.dataOffset + (long)(id - 1) * (long)rbytes;
+                        Mutex.Lock(this.ioMtx);
+                        this.file.WriteAt(tabOff, (nint)rdata, rbytes);
+                        Mutex.Unlock(this.ioMtx);
+                        if (id > this.totalRows) { this.totalRows = id; }
+                        this.tombstones.Remove(id);
+                        RecordRow r = new RecordRow(this.schema, rdata, id, true, this);
+                        this.IndexRowLocked(r);
+                    } else if (subOp == OP_DELETE) {
+                        this.tombstones[id] = true;
+                        long tabOff = this.dataOffset + (long)(id - 1) * (long)rbytes;
+                        byte[] zeroFlag = new byte[1];
+                        zeroFlag[0] = 0;
+                        Mutex.Lock(this.ioMtx);
+                        this.file.WriteAt(tabOff, (nint)zeroFlag, 1);
+                        Mutex.Unlock(this.ioMtx);
+                    }
+                }
+                replayedAny = true;
+            }
+
+            payload.Free();
+            off = off + 8L + (long)plen;
+            this.walValidSize = off;
+        }
+        hbuf.Free();
+
+        if (replayedAny) {
+            this.activeRows = this.totalRows - this.tombstones.Count;
+            this.WriteHeaderLocked();
+        }
+    }
+
+    // 追加带 CRC32 校验帧的 WAL 记录并强制落盘
+    public void AppendWalFrameLocked(long seq, int op, ByteBuffer payload) {
+        if (this.walFile == null || !this.walFile.IsOpen()) { return; }
+        int plen = payload.Length();
+        int crc = payload.Crc32(plen);
+        ByteBuffer frame = ByteBuffer.Alloc(8 + plen);
+        frame.WriteU32((long)plen);
+        frame.WriteU32((long)crc);
+        frame.WriteRaw(payload.Raw(), plen);
+        long off = this.walValidSize;
+        Mutex.Lock(this.ioMtx);
+        try {
+            this.walFile.WriteAt(off, frame.Raw(), 8 + plen);
+            this.walValidSize = off + 8L + (long)plen;
+            this.walFile.Sync();
+        } finally {
+            Mutex.Unlock(this.ioMtx);
+            frame.Free();
+        }
+    }
+
+    // 重置 WAL 预写日志（在 Checkpoint / Flush 时安全截断）
+    public void ResetWalLocked() {
+        if (this.walFile == null || !this.walFile.IsOpen()) { return; }
+        ByteBuffer h = ByteBuffer.Alloc(WAL_HEADER_SIZE);
+        h.WriteRaw(MAGIC_WAL, 4);
+        h.WriteU32((long)VERSION);
+        h.WriteU64(this.lastTxSeq);
+        h.WriteU64(0L); // reserved
+        h.WriteU64(0L);
+        Mutex.Lock(this.ioMtx);
+        try {
+            this.walFile.WriteAt(0, h.Raw(), WAL_HEADER_SIZE);
+            this.walFile.Truncate(32L);
+            this.walFile.Sync();
+            this.walValidSize = 32L;
+        } finally {
+            Mutex.Unlock(this.ioMtx);
+            h.Free();
+        }
+    }
+
+    // 开启事务
+    public void BeginTransaction() {
+        this.tlock.EnterWrite();
+        try {
+            this.inTx = true;
+            this.txOps = new List<RecordTxOp>();
+        } finally {
+            this.tlock.ExitWrite();
+        }
+    }
+
+    // 提交事务：将事务内所有暂存操作打包为一个原子 WAL 帧落盘并应用
+    public void Commit() {
+        this.tlock.EnterWrite();
+        try {
+            if (!this.inTx || this.txOps == null || this.txOps.Count == 0) {
+                this.inTx = false;
+                return;
+            }
+
+            int n = this.txOps.Count;
+            int rbytes = this.schema.rowBytes;
+            this.lastTxSeq = this.lastTxSeq + 1L;
+
+            // 1. 打包原子 Batch 帧
+            ByteBuffer b = ByteBuffer.Alloc(17 + n * (5 + rbytes));
+            b.WriteU64(this.lastTxSeq);
+            b.WriteU8(OP_BATCH);
+            b.WriteU32((long)n);
+            for (int i = 0; i < n; i = i + 1) {
+                RecordTxOp op = this.txOps[i];
+                b.WriteU8(op.opType);
+                b.WriteU32((long)op.id);
+                if (op.opType == OP_ADD || op.opType == OP_UPDATE) {
+                    b.WriteRaw(op.row.data, rbytes);
+                }
+            }
+            this.AppendWalFrameLocked(this.lastTxSeq, OP_BATCH, b);
+            b.Free();
+
+            // 2. 批量物理应用至 .ztab 文件
+            Mutex.Lock(this.ioMtx);
+            try {
+                for (int i = 0; i < n; i = i + 1) {
+                    RecordTxOp op = this.txOps[i];
+                    long off = this.dataOffset + (long)(op.id - 1) * (long)rbytes;
+                    if (op.opType == OP_ADD || op.opType == OP_UPDATE) {
+                        this.file.WriteAt(off, (nint)op.row.data, rbytes);
+                        this.IndexRowLocked(op.row);
+                    } else if (op.opType == OP_DELETE) {
+                        byte[] zeroFlag = new byte[1];
+                        zeroFlag[0] = 0;
+                        this.file.WriteAt(off, (nint)zeroFlag, 1);
+                    }
+                }
+            } finally {
+                Mutex.Unlock(this.ioMtx);
+            }
+
+            this.WriteHeaderLocked();
+            this.txOps.Clear();
+            this.inTx = false;
+        } finally {
+            this.tlock.ExitWrite();
+        }
+    }
+
+    // 回滚事务：丢弃全部暂存，零磁盘脏写
+    public void Rollback() {
+        this.tlock.EnterWrite();
+        try {
+            if (!this.inTx) { return; }
+            if (this.txOps != null) {
+                for (int i = 0; i < this.txOps.Count; i = i + 1) {
+                    RecordTxOp op = this.txOps[i];
+                    if (op.opType == OP_ADD) {
+                        this.totalRows = this.totalRows - 1;
+                        this.activeRows = this.activeRows - 1;
+                    } else if (op.opType == OP_DELETE) {
+                        this.tombstones.Remove(op.id);
+                        this.activeRows = this.activeRows + 1;
+                    }
+                }
+                this.txOps.Clear();
+            }
+            this.inTx = false;
+        } finally {
+            this.tlock.ExitWrite();
         }
     }
 
@@ -759,7 +1093,7 @@ public class RecordTable {
         }
     }
 
-    // 单行插入：分配自增 ID，纯二进制直写盘，零 JsonValue
+    // 单行插入：分配自增 ID，纯二进制直写盘，WAL 顺序预写保障防撕裂
     public int Add(RecordRow row) {
         this.tlock.EnterWrite();
         try {
@@ -775,9 +1109,26 @@ public class RecordTable {
             // 刷盘变长大字段
             this.FlushRowBlobsLocked(row);
 
-            long off = this.dataOffset + (long)(id - 1) * (long)this.schema.rowBytes;
-            int rbytes = this.schema.rowBytes;
+            if (this.inTx) {
+                RecordTxOp op = new RecordTxOp(OP_ADD, id, row);
+                this.txOps.Add(op);
+                this.totalRows = id;
+                this.activeRows = this.activeRows + 1;
+                return id;
+            }
 
+            // 非事务：先写入带 CRC32 帧的 WAL 预写日志
+            this.lastTxSeq = this.lastTxSeq + 1L;
+            int rbytes = this.schema.rowBytes;
+            ByteBuffer b = ByteBuffer.Alloc(13 + rbytes);
+            b.WriteU64(this.lastTxSeq);
+            b.WriteU8(OP_ADD);
+            b.WriteU32((long)id);
+            b.WriteRaw(row.data, rbytes);
+            this.AppendWalFrameLocked(this.lastTxSeq, OP_ADD, b);
+            b.Free();
+
+            long off = this.dataOffset + (long)(id - 1) * (long)rbytes;
             Mutex.Lock(this.ioMtx);
             try {
                 this.file.WriteAt(off, (nint)row.data, rbytes);
@@ -795,7 +1146,7 @@ public class RecordTable {
         }
     }
 
-    // 批量直写盘：顺序物理写，跑满几十万行/秒
+    // 批量直写盘：顺序物理写，WAL 批次帧保障原子性
     public void AddBulk(List<RecordRow> rows, out int firstId) {
         this.tlock.EnterWrite();
         try {
@@ -818,7 +1169,22 @@ public class RecordTable {
                 this.FlushRowBlobsLocked(r);
             }
 
-            // 2. 批量物理写主表记录槽位
+            // 2. 批量 WAL 帧写入
+            this.lastTxSeq = this.lastTxSeq + 1L;
+            ByteBuffer b = ByteBuffer.Alloc(17 + n * (5 + rbytes));
+            b.WriteU64(this.lastTxSeq);
+            b.WriteU8(OP_BATCH);
+            b.WriteU32((long)n);
+            for (int i = 0; i < n; i = i + 1) {
+                RecordRow r = rows[i];
+                b.WriteU8(OP_ADD);
+                b.WriteU32((long)r.id);
+                b.WriteRaw(r.data, rbytes);
+            }
+            this.AppendWalFrameLocked(this.lastTxSeq, OP_BATCH, b);
+            b.Free();
+
+            // 3. 批量物理写主表记录槽位
             Mutex.Lock(this.ioMtx);
             try {
                 for (int i = 0; i < n; i = i + 1) {
@@ -886,9 +1252,23 @@ public class RecordTable {
 
             this.FlushRowBlobsLocked(row);
 
-            long off = this.dataOffset + (long)(id - 1) * (long)this.schema.rowBytes;
-            int rbytes = this.schema.rowBytes;
+            if (this.inTx) {
+                RecordTxOp op = new RecordTxOp(OP_UPDATE, id, row);
+                this.txOps.Add(op);
+                return true;
+            }
 
+            this.lastTxSeq = this.lastTxSeq + 1L;
+            int rbytes = this.schema.rowBytes;
+            ByteBuffer b = ByteBuffer.Alloc(13 + rbytes);
+            b.WriteU64(this.lastTxSeq);
+            b.WriteU8(OP_UPDATE);
+            b.WriteU32((long)id);
+            b.WriteRaw(row.data, rbytes);
+            this.AppendWalFrameLocked(this.lastTxSeq, OP_UPDATE, b);
+            b.Free();
+
+            long off = this.dataOffset + (long)(id - 1) * (long)rbytes;
             Mutex.Lock(this.ioMtx);
             try {
                 this.file.WriteAt(off, (nint)row.data, rbytes);
@@ -911,6 +1291,20 @@ public class RecordTable {
             }
             this.tombstones[id] = true;
             this.activeRows = this.activeRows - 1;
+
+            if (this.inTx) {
+                RecordTxOp op = new RecordTxOp(OP_DELETE, id, null);
+                this.txOps.Add(op);
+                return true;
+            }
+
+            this.lastTxSeq = this.lastTxSeq + 1L;
+            ByteBuffer b = ByteBuffer.Alloc(13);
+            b.WriteU64(this.lastTxSeq);
+            b.WriteU8(OP_DELETE);
+            b.WriteU32((long)id);
+            this.AppendWalFrameLocked(this.lastTxSeq, OP_DELETE, b);
+            b.Free();
 
             long off = this.dataOffset + (long)(id - 1) * (long)this.schema.rowBytes;
             byte[] zeroFlag = new byte[1];
@@ -936,6 +1330,9 @@ public class RecordTable {
             if (this.indexes.ContainsKey(colName)) { return; }
             Dictionary<string, List<int>> idx = new Dictionary<string, List<int>>();
             this.indexes[colName] = idx;
+            List<string> sortedKeys = new List<string>();
+            this.indexKeysSorted[colName] = sortedKeys;
+
             // 扫描当前所有活跃行填充索引
             for (int id = 1; id <= this.totalRows; id = id + 1) {
                 if (!this.tombstones.ContainsKey(id)) {
@@ -943,7 +1340,10 @@ public class RecordTable {
                     if (r != null) {
                         string key = this.ExtractColKey(r, colName);
                         if (key != null) {
-                            if (!idx.ContainsKey(key)) { idx[key] = new List<int>(); }
+                            if (!idx.ContainsKey(key)) {
+                                idx[key] = new List<int>();
+                                RecordTable.InsertSortedKey(sortedKeys, key);
+                            }
                             idx[key].Add(id);
                         }
                     }
@@ -957,17 +1357,64 @@ public class RecordTable {
 
     public void IndexRowLocked(RecordRow r) {
         if (this.indexes.Count == 0 || r == null) { return; }
-        // 遍历所有已建索引
         for (int i = 0; i < this.schema.columns.Count; i = i + 1) {
             string colName = this.schema.columns[i].name;
             if (this.indexes.ContainsKey(colName)) {
                 Dictionary<string, List<int>> idx = this.indexes[colName];
                 string key = this.ExtractColKey(r, colName);
                 if (key != null) {
-                    if (!idx.ContainsKey(key)) { idx[key] = new List<int>(); }
+                    if (!idx.ContainsKey(key)) {
+                        idx[key] = new List<int>();
+                        if (this.indexKeysSorted.ContainsKey(colName)) {
+                            RecordTable.InsertSortedKey(this.indexKeysSorted[colName], key);
+                        }
+                    }
                     idx[key].Add(r.id);
                 }
             }
+        }
+    }
+
+    public static string FormatIntKey(int v) {
+        long u = (long)v + 2147483648L;
+        return Convert.ToString(u).PadLeft(10, "0");
+    }
+
+    public string NormalizeIndexKey(string colName, string val) {
+        if (val == null) { return ""; }
+        RecordColumn col = this.schema.FindColumn(colName);
+        if (col == null) { return val; }
+        if (col.dataType == RecordDataType.Int32) {
+            try {
+                return RecordTable.FormatIntKey(Convert.ToInt32(val));
+            } catch (Exception e) {
+                return val;
+            }
+        }
+        return val;
+    }
+
+    public static void InsertSortedKey(List<string> list, string key) {
+        if (list == null || key == null) { return; }
+        int lo = 0;
+        int hi = list.Count - 1;
+        int ins = list.Count;
+        while (lo <= hi) {
+            int mid = (lo + hi) / 2;
+            int cmp = String.CompareOrdinal(list[mid], key);
+            if (cmp == 0) { return; }
+            if (cmp < 0) {
+                lo = mid + 1;
+            } else {
+                ins = mid;
+                hi = mid - 1;
+            }
+        }
+        if (lo > ins) { ins = lo; }
+        if (ins >= list.Count) {
+            list.Add(key);
+        } else {
+            list.Insert(ins, key);
         }
     }
 
@@ -975,7 +1422,7 @@ public class RecordTable {
         RecordColumn col = this.schema.FindColumn(colName);
         if (col == null) { return null; }
         if (col.dataType == RecordDataType.Int32) {
-            return Convert.ToString(r.GetInt32(colName));
+            return RecordTable.FormatIntKey(r.GetInt32(colName));
         } else if (col.dataType == RecordDataType.FixedStr) {
             return r.GetStr(colName);
         } else if (col.dataType == RecordDataType.VarStr) {
@@ -988,28 +1435,124 @@ public class RecordTable {
         return null;
     }
 
-    // 基于二级索引极速反查
-    public List<RecordRow> FindByIndex(string colName, string val) {
+    public bool HasIndex(string colName) {
+        return this.indexes != null && this.indexes.ContainsKey(colName);
+    }
+
+    // 二级索引键匹配 ID 列表
+    public List<int> FindIdsByIndex(string colName, string val) {
         this.tlock.EnterRead();
         try {
-            List<RecordRow> res = new List<RecordRow>();
+            List<int> res = new List<int>();
             if (!this.indexes.ContainsKey(colName)) {
                 throw new InvalidOperationException("index not found on column: " + colName);
             }
+            string searchKey = this.NormalizeIndexKey(colName, val);
             Dictionary<string, List<int>> idx = this.indexes[colName];
-            if (!idx.ContainsKey(val)) { return res; }
-            List<int> ids = idx[val];
+            if (!idx.ContainsKey(searchKey)) { return res; }
+            List<int> ids = idx[searchKey];
             for (int i = 0; i < ids.Count; i = i + 1) {
                 int id = ids[i];
                 if (!this.tombstones.ContainsKey(id)) {
-                    RecordRow r = this.GetLocked(id);
-                    if (r != null) { res.Add(r); }
+                    res.Add(id);
                 }
             }
             return res;
         } finally {
             this.tlock.ExitRead();
         }
+    }
+
+    // 基于二级索引等值查找
+    public List<RecordRow> FindByIndex(string colName, string val) {
+        List<int> ids = this.FindIdsByIndex(colName, val);
+        List<RecordRow> res = new List<RecordRow>();
+        for (int i = 0; i < ids.Count; i = i + 1) {
+            RecordRow r = this.Get(ids[i]);
+            if (r != null) { res.Add(r); }
+        }
+        return res;
+    }
+
+    // 范围索引匹配 ID 列表（支持 <, <=, >, >=, BETWEEN）
+    public List<int> FindIdsByRange(string colName, string lo, string hi) {
+        this.tlock.EnterRead();
+        try {
+            List<int> res = new List<int>();
+            if (!this.indexes.ContainsKey(colName)) {
+                throw new InvalidOperationException("index not found on column: " + colName);
+            }
+            string loKey = this.NormalizeIndexKey(colName, lo);
+            string hiKey = this.NormalizeIndexKey(colName, hi);
+
+            if (!this.indexKeysSorted.ContainsKey(colName)) {
+                return res;
+            }
+            List<string> keys = this.indexKeysSorted[colName];
+            Dictionary<string, List<int>> map = this.indexes[colName];
+
+            int startIdx = 0;
+            int endIdx = keys.Count - 1;
+
+            if (lo != null && lo.Length > 0) {
+                int loPos = 0;
+                int hiPos = keys.Count - 1;
+                startIdx = keys.Count;
+                while (loPos <= hiPos) {
+                    int mid = (loPos + hiPos) / 2;
+                    int cmp = String.CompareOrdinal(keys[mid], loKey);
+                    if (cmp >= 0) {
+                        startIdx = mid;
+                        hiPos = mid - 1;
+                    } else {
+                        loPos = mid + 1;
+                    }
+                }
+            }
+
+            if (hi != null && hi.Length > 0) {
+                int loPos = 0;
+                int hiPos = keys.Count - 1;
+                endIdx = 0 - 1;
+                while (loPos <= hiPos) {
+                    int mid = (loPos + hiPos) / 2;
+                    int cmp = String.CompareOrdinal(keys[mid], hiKey);
+                    if (cmp <= 0) {
+                        endIdx = mid;
+                        loPos = mid + 1;
+                    } else {
+                        hiPos = mid - 1;
+                    }
+                }
+            }
+
+            for (int k = startIdx; k <= endIdx; k = k + 1) {
+                string key = keys[k];
+                if (map.ContainsKey(key)) {
+                    List<int> ids = map[key];
+                    for (int i = 0; i < ids.Count; i = i + 1) {
+                        int id = ids[i];
+                        if (!this.tombstones.ContainsKey(id)) {
+                            res.Add(id);
+                        }
+                    }
+                }
+            }
+            return res;
+        } finally {
+            this.tlock.ExitRead();
+        }
+    }
+
+    // 范围索引检索（支持 <, <=, >, >=）
+    public List<RecordRow> FindRange(string colName, string lo, string hi) {
+        List<int> ids = this.FindIdsByRange(colName, lo, hi);
+        List<RecordRow> rows = new List<RecordRow>();
+        for (int i = 0; i < ids.Count; i = i + 1) {
+            RecordRow r = this.Get(ids[i]);
+            if (r != null) { rows.Add(r); }
+        }
+        return rows;
     }
 
     // 二级索引持久化写入 .zidx 文件
@@ -1097,6 +1640,7 @@ public class RecordTable {
         }
 
         this.indexes.Clear();
+        this.indexKeysSorted.Clear();
         for (int c = 0; c < idxColCount; c = c + 1) {
             int nlen = b.ReadU8();
             byte[] nb = new byte[nlen];
@@ -1104,6 +1648,7 @@ public class RecordTable {
             string colName = Encoding.GetString(nb, 0, nlen);
 
             Dictionary<string, List<int>> map = new Dictionary<string, List<int>>();
+            List<string> sortedKeys = new List<string>();
             int kCount = (int)b.ReadU32();
             for (int k = 0; k < kCount; k = k + 1) {
                 int klen = b.ReadU16();
@@ -1117,8 +1662,10 @@ public class RecordTable {
                     ids.Add((int)b.ReadU32());
                 }
                 map[key] = ids;
+                RecordTable.InsertSortedKey(sortedKeys, key);
             }
             this.indexes[colName] = map;
+            this.indexKeysSorted[colName] = sortedKeys;
         }
         b.Free();
         return true;
@@ -1141,6 +1688,15 @@ public class RecordTable {
         } finally {
             this.tlock.ExitRead();
         }
+    }
+
+    // 强类型查询构造器入口
+    public RecordQuery Query() {
+        return new RecordQuery(this);
+    }
+
+    public RecordQuery Where(ExprNode expr) {
+        return new RecordQuery(this).Where(expr);
     }
 
     // 物理整理（Vacuum）：回收墓碑空洞与 .zblob 垃圾空间，并重建并持久化二级索引
@@ -1178,10 +1734,15 @@ public class RecordTable {
             if (this.blobFile != null && this.blobFile.IsOpen()) {
                 this.blobFile.Close();
             }
+            if (this.walFile != null && this.walFile.IsOpen()) {
+                this.walFile.Close();
+            }
 
             string tmpFile = vacBase + "." + this.name + ".ztab";
             string tmpBlob = vacBase + "." + this.name + ".zblob";
             string tmpIdx = vacBase + "." + this.name + ".zidx";
+            string tmpWal = vacBase + "." + this.name + ".zwal";
+
             if (File.Exists(this.tabPath)) { File.Delete(this.tabPath); }
             File.Move(tmpFile, this.tabPath);
             if (File.Exists(tmpBlob)) {
@@ -1194,10 +1755,13 @@ public class RecordTable {
             } else if (File.Exists(this.idxPath)) {
                 File.Delete(this.idxPath);
             }
+            if (File.Exists(tmpWal)) { File.Delete(tmpWal); }
+            if (File.Exists(this.walPath)) { File.Delete(this.walPath); }
 
             // 重新挂接文件
             this.file = PageFile.OpenExisting(this.tabPath);
             this.OpenOrCreateBlobFileLocked();
+            this.OpenOrCreateWalFileLocked();
             this.totalRows = tmp.TotalRows();
             this.activeRows = tmp.Count();
             this.tombstones.Clear();
@@ -1222,6 +1786,7 @@ public class RecordTable {
                     Mutex.Unlock(this.ioMtx);
                 }
                 this.SaveIndexesLocked();
+                this.ResetWalLocked();
             }
         } finally {
             this.tlock.ExitWrite();
@@ -1241,6 +1806,10 @@ public class RecordTable {
                 this.WriteBlobHeaderLocked();
                 this.blobFile.Sync();
                 this.blobFile.Close();
+            }
+            if (this.walFile != null && this.walFile.IsOpen()) {
+                this.ResetWalLocked();
+                this.walFile.Close();
             }
             if (this.ioMtx != 0) {
                 Mutex.Destroy(this.ioMtx);

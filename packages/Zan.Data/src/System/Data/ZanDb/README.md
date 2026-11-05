@@ -350,14 +350,17 @@ db.Close();
   2. **纯二进制关系表格引擎（RecordTable）**：**【刀16 彻底根治业务装箱硬伤】** 彻底 0% 绝缘 JsonValue、0 堆装箱、0 Tape 字符串转义。基于定长行物理连续排列，单机批量写入跑满 **510,000+ rows/s**，点查仅 **2 µs/row**，单表独立读写锁，彻底拆除整库全局排他大锁；
   3. **稠密列式向量表引擎（VectorTable）**：**【刀14/15 向量专用】** 稠密定长高维浮点列存（.zvec + AppendBuffer），67,340 rows/s 批量直写，0.70 ms 向量近邻检索；
   4. *Collection（文档集合）*：仅保留作为半结构化、字段高度动态的非结构化 JSON 文档引擎。
-- **RecordTable 物理存储契约（.ztab / .zblob / .zidx）**：
+- **RecordTable 物理存储契约（.ztab / .zblob / .zidx / .zwal）**：
   - 64 字节表头（魔数 `ZTAB`、版本号 1、行宽 `rowBytes`、列数 `colCount`、总行数 `totalRows`、活跃行数 `activeRows`、数据区绝对起始偏移 `dataOffset`）。
   - 自描述 Schema 块：紧凑序列化列定义（Int32/Int64/Float32/Float64/FixedStr/Bool/VarStr/Blob），重开支持无参自愈加载。
   - 绝对物理寻址：
     $$\text{offset} = \text{DataOffset} + (id - 1) \times \text{rowBytes}$$
     点查寻址耗时 **0 纳秒**，单次系统调用 `PageFile.ReadAt` 直读物理扇区。
+  - **伴生预写日志与断电撕裂自愈（.zwal）**：32 字节头部（魔数 `ZWAL`、版本号 1、检查点水位 `lastCheckpointSeq`）。所有增删改走 CRC32 校验帧原子顺序追加；`Open()` 时若检测到断电撕裂尾或未写满的异常帧，引擎自动调用 `walFile.Truncate(validOffset)` 与 `Sync()`，零脏写安全回滚到上一次原子提交；未检查点有效提交自动重放入 `.ztab`/`.zblob` 并重建索引。
+  - **完整 ACID 事务保障（Begin / Commit / Rollback）**：事务开启后突变操作全部进入内存缓冲队列，`Rollback()` 直接丢弃缓冲零磁盘污染；`Commit()` 将批量操作统一打包为单帧 `OP_BATCH` 写入 WAL 并执行操作系统级 `fsync`，随后一次性刷入磁盘槽位。
   - **伴生变长存储池（.zblob）**：32 字节头部（魔数 `ZBLB`、版本号 1、总字节数 `totalBytes`）。变长文本 `VarStr` 与大字节块 `Blob` 在主表中仅存 8 字节对齐指针 `[Offset: 4B, Len: 4B]`，数据连续追加至 `.zblob`。空值（len=0）存 `(0, 0)`，读取享受 **0 额外 I/O 优化**。
-  - **二级索引磁盘持久化（.zidx）**：32 字节头部（魔数 `ZIDX`、版本号 1、快照总行数 `totalRows`、活跃行数 `activeRows`）。`Flush()` 与 `Close()` 触发列级索引序列化落地；`Open()` 时若总行数与版本自洽，直接二进制反序列化装载，**免全表扫描耗时直接进入就绪态**。
+  - **二级索引磁盘持久化（.zidx）与有序范围扫描（FindRange）**：32 字节头部（魔数 `ZIDX`、版本号 1、快照总行数 `totalRows`、活跃行数 `activeRows`）。二级索引内建字典序与数值单调归一化双重排序，支持 `FindRange(col, lo, hi)` 与 `FindIdsByRange` 毫秒级二分边界探针与范围遍历；`Flush()` 与 `Close()` 触发列级索引序列化落地；`Open()` 自愈装载免全表扫描。
+  - **编译期语法树下推求值器（RecordQuery）**：依托编译器 B-ID65 规范，支持 `table.Where((ExprNode x) => x.age >= 25 && x.dept == "tech").OrderByDescending("salary").Take(5)`，AST 静态下推至二级索引等值/范围探针并求交集；残余谓词在 `RecordRow` 二进制槽位上直接求值，**0% JsonValue 参与，0 运行时 SQL 文本解析，天然防 SQL 注入**。
   - **独立表级并发控制**：每张表持有独立的 `RwLock tlock` 与 CRT `ioMtx`，对一张表的批量写入绝对不阻塞其他表与向量表的读写。
   - **软删除与零 ID 漂移**：行首 `flags = 0` 墓碑标记，物理槽位永不前移，外键关联 `id` 永久自洽，支持管理级 `Vacuum()` 物理空洞紧凑双重重整（同时回收 `.ztab` 与 `.zblob` 空间）。
 - **发布档（--publish）实测压测报告（10,000 行二维员工表同机差分对拍）**：

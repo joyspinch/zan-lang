@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using System.Data.ZanDb;
 
 // 刀16 纯二进制结构化表格引擎（RecordTable）工业级深化用例：
@@ -31,10 +32,12 @@ class ZanDbRecordTableTest {
         if (File.Exists(basePath + ".emp.ztab")) { File.Delete(basePath + ".emp.ztab"); }
         if (File.Exists(basePath + ".emp.zblob")) { File.Delete(basePath + ".emp.zblob"); }
         if (File.Exists(basePath + ".emp.zidx")) { File.Delete(basePath + ".emp.zidx"); }
+        if (File.Exists(basePath + ".emp.zwal")) { File.Delete(basePath + ".emp.zwal"); }
         if (File.Exists(basePath + ".emp.ztab.vac")) { File.Delete(basePath + ".emp.ztab.vac"); }
         if (File.Exists(basePath + ".emp.ztab.vac.emp.ztab")) { File.Delete(basePath + ".emp.ztab.vac.emp.ztab"); }
         if (File.Exists(basePath + ".emp.ztab.vac.emp.zblob")) { File.Delete(basePath + ".emp.ztab.vac.emp.zblob"); }
         if (File.Exists(basePath + ".emp.ztab.vac.emp.zidx")) { File.Delete(basePath + ".emp.ztab.vac.emp.zidx"); }
+        if (File.Exists(basePath + ".emp.ztab.vac.emp.zwal")) { File.Delete(basePath + ".emp.ztab.vac.emp.zwal"); }
     }
 
     static void Main() {
@@ -206,6 +209,7 @@ class ZanDbRecordTableTest {
         // 校验备份库伴生文件完整性与数据可读性
         Ok(File.Exists(bkPath + ".emp.zblob"), "backup copied companion zblob file");
         Ok(File.Exists(bkPath + ".emp.zidx"), "backup copied companion zidx file");
+        Ok(File.Exists(bkPath + ".emp.zwal"), "backup copied companion zwal file");
 
         ZanDatabase dbBk = ZanDatabase.Open(bkPath);
         RecordTable bkRt = dbBk.GetRecordTable("emp");
@@ -217,6 +221,79 @@ class ZanDbRecordTableTest {
         byte[] bAv = bRow != null ? bRow.GetBlob("avatar") : null;
         Ok(bAv != null && bAv.Length == 1 && bAv[0] == 99, "backup database reads blob accurately");
         dbBk.Close();
+
+        // 11. 伴生预写日志 (.zwal) 与事务 ACID 原子回滚保障
+        RecordTable rtTx = RecordTable.Open(dbPath, "emp");
+        Ok(File.Exists(dbPath + ".emp.zwal"), "companion zwal log file exists");
+        rtTx.BeginTransaction();
+        RecordRow rRoll = new RecordRow(schema);
+        rRoll.SetInt32("id", 8888);
+        rRoll.SetStr("name", "RollbackUser");
+        rRoll.SetStr("dept", "legal");
+        rRoll.SetInt32("age", 40);
+        rRoll.SetFloat64("salary", 30000.0);
+        rRoll.SetBool("isActive", true);
+        rRoll.SetVarStr("bio", "Will be rolled back");
+        int rId = rtTx.Add(rRoll);
+        Ok(rId == 22, "in-tx add returns next id 22");
+        rtTx.Rollback();
+        Ok(rtTx.Count() == 21 && rtTx.TotalRows() == 21, "after Rollback: counts revert to 21");
+        Ok(rtTx.Get(22) == null, "after Rollback: row 22 is non-existent");
+
+        // 事务提交
+        rtTx.BeginTransaction();
+        RecordRow rCommit = new RecordRow(schema);
+        rCommit.SetInt32("id", 7777);
+        rCommit.SetStr("name", "CommitUser");
+        rCommit.SetStr("dept", "tech");
+        rCommit.SetInt32("age", 32);
+        rCommit.SetFloat64("salary", 25000.0);
+        rCommit.SetBool("isActive", true);
+        rCommit.SetVarStr("bio", "Committed successfully");
+        int cId = rtTx.Add(rCommit);
+        Ok(cId == 22, "second in-tx add returns id 22");
+        rtTx.Commit();
+        Ok(rtTx.Count() == 22 && rtTx.TotalRows() == 22, "after Commit: counts increment to 22");
+        RecordRow gC = rtTx.Get(22);
+        Ok(gC != null && gC.GetStr("name") == "CommitUser", "after Commit: row 22 data persistent");
+        Ok(gC.GetVarStr("bio") == "Committed successfully", "after Commit: varStr bio intact");
+
+        // 12. 磁盘有序索引与范围查询 (FindRange 支持 <, <=, >, >=)
+        rtTx.EnsureIndex("age");
+        List<RecordRow> rangeAge = rtTx.FindRange("age", "25", "30");
+        Ok(rangeAge.Count > 0, "FindRange on age [25, 30] returns rows");
+        bool allInRange = true;
+        for (int i = 0; i < rangeAge.Count; i = i + 1) {
+            int a = rangeAge[i].GetInt32("age");
+            if (a < 25 || a > 30) { allInRange = false; }
+        }
+        Ok(allInRange, "all rows returned by FindRange are strictly within [25, 30]");
+
+        // 13. System.Linq.ExprNode 编译期语法树下推求值器 (0% JsonValue, 0 SQL 字符串解析)
+        RecordQuery q1 = rtTx.Where((ExprNode x) => x.age >= 25 && x.dept == "tech");
+        List<RecordRow> qRes1 = q1.ToList();
+        Ok(qRes1.Count > 0, "ExprNode query (age >= 25 && dept == 'tech') returns matching rows");
+        bool q1Valid = true;
+        for (int i = 0; i < qRes1.Count; i = i + 1) {
+            if (qRes1[i].GetInt32("age") < 25 || qRes1[i].GetStr("dept") != "tech") {
+                q1Valid = false;
+            }
+        }
+        Ok(q1Valid, "ExprNode query results 100% fulfill predicate conditions");
+
+        // 带有排序与分页的语法树查询
+        RecordQuery q2 = rtTx.Where((ExprNode x) => x.salary > 10000.0).OrderByDescending("salary").Take(5);
+        List<RecordRow> top5 = q2.ToList();
+        Ok(top5.Count == 5, "OrderByDescending salary Take 5 returns 5 rows");
+        bool sortedDesc = true;
+        for (int i = 0; i < top5.Count - 1; i = i + 1) {
+            if (top5[i].GetFloat64("salary") < top5[i + 1].GetFloat64("salary")) {
+                sortedDesc = false;
+            }
+        }
+        Ok(sortedDesc, "results are strictly sorted in descending order of salary");
+
+        rtTx.Close();
 
         // 收尾清理
         Clean(dbPath);
