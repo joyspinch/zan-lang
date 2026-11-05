@@ -616,7 +616,8 @@ static void emit_eh_propagate_tail(zan_irgen_t *g) {
 static void emit_eh_propagate_tail_lpad(zan_irgen_t *g,
                                         local_scope_t *locals,
                                         LLVMValueRef lp_slot,
-                                        LLVMTypeRef lp_ret_ty) {
+                                        LLVMTypeRef lp_ret_ty,
+                                        bool is_catch_rethrow) {
     if (g->current_async_frame) {
         emit_eh_propagate_tail(g);
         return;
@@ -632,6 +633,9 @@ static void emit_eh_propagate_tail_lpad(zan_irgen_t *g,
     }
     if (enclosing) {
         LLVMBuildBr(g->builder, enclosing->catch_bb);
+    } else if (is_catch_rethrow) {
+        emit_release_owned_locals(g, locals);
+        emit_raise_exception(g);
     } else {
         emit_release_owned_locals(g, locals);
         LLVMValueRef cur_lp = LLVMBuildLoad2(g->builder, lp_ret_ty, lp_slot, "lp.prop");
@@ -2438,8 +2442,10 @@ void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *locals) {
         ensure_function_personality(g, fn);
         LLVMTypeRef lp_ret_ty = LLVMStructTypeInContext(g->ctx, (LLVMTypeRef[]){ i8ptr, i32t }, 2, 0);
         LLVMValueRef lp_slot = emit_entry_alloca(g, lp_ret_ty, "lp.slot");
-        LLVMValueRef lp_val = LLVMBuildLandingPad(g->builder, lp_ret_ty, get_eh_personality_fn(g), 1, "lp");
-        LLVMAddClause(lp_val, LLVMConstNull(i8ptr));
+        LLVMValueRef lp_val = LLVMBuildLandingPad(g->builder, lp_ret_ty, get_eh_personality_fn(g), (ncatch > 0) ? 1 : 0, "lp");
+        if (ncatch > 0) {
+            LLVMAddClause(lp_val, LLVMConstNull(i8ptr));
+        }
         LLVMSetCleanup(lp_val, 1);
         LLVMBuildStore(g->builder, lp_val, lp_slot);
         LLVMBuildBr(g->builder, catch_bb);
@@ -2698,14 +2704,14 @@ void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *locals) {
             emit_finally_on_exception_path(g, locals, fin_idx);
             emit_finallys_below_for_propagate(g, locals, fin_idx);
             if (!LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(g->builder)))
-                emit_eh_propagate_tail_lpad(g, locals, lp_slot, lp_ret_ty);
+                emit_eh_propagate_tail_lpad(g, locals, lp_slot, lp_ret_ty, true);
 
             LLVMPositionBuilderAtEnd(g->builder, done_bb);
         } else {
             emit_finally_on_exception_path(g, locals, fin_idx);
             emit_finallys_below_for_propagate(g, locals, fin_idx);
             if (!LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(g->builder)))
-                emit_eh_propagate_tail_lpad(g, locals, lp_slot, lp_ret_ty);
+                emit_eh_propagate_tail_lpad(g, locals, lp_slot, lp_ret_ty, false);
         }
         locals->count = catch_start;
         if (!LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(g->builder))) {

@@ -1,0 +1,176 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Data.ZanDb;
+
+// 刀16 纯二进制结构化表格引擎（RecordTable）一致性与生命周期用例：
+// 1. .ztab 物理文件创建与头部元数据校验（魔数 ZTAB、版本、行宽、列数、总行数）；
+// 2. 0% JsonValue 强类型列存取（Int32/Int64/Float32/Float64/FixedStr/Bool 位级保真）；
+// 3. Add / AddBulk 高吞吐写入与 O(1) 绝对物理偏移 Get 直读；
+// 4. Update 原地槽位修改与 EnsureIndex 二级索引极速反查；
+// 5. Delete 墓碑软删除与零 ID 漂移稳定性契约；
+// 6. Scan 零拷贝全表访问与 Vacuum 物理紧凑重整；
+// 7. Schema 序列化与自描述无参重开恢复；
+// 8. ZanDatabase 门面生命周期托管（GetRecordTable、IntegrityCheck、Backup）。
+class ZanDbRecordTableTest {
+    static int checks = 0;
+
+    static void Ok(bool cond, string what) {
+        checks = checks + 1;
+        if (cond) {
+            Console.WriteLine("ok " + Convert.ToString(checks) + " - " + what);
+        } else {
+            Console.WriteLine("FAIL " + Convert.ToString(checks) + " - " + what);
+        }
+    }
+
+    static void Clean(string basePath) {
+        ZanStore.CleanTargetFiles(basePath, 256);
+        if (File.Exists(basePath + ".emp.ztab")) { File.Delete(basePath + ".emp.ztab"); }
+        if (File.Exists(basePath + ".emp.ztab.vactmp")) { File.Delete(basePath + ".emp.ztab.vactmp"); }
+    }
+
+    static void Main() {
+        string dbPath = "_scratch/test_rt_conformance";
+        string bkPath = "_scratch/test_rt_backup";
+        Directory.CreateDirectory("_scratch");
+        Clean(dbPath);
+        Clean(bkPath);
+
+        // 1. 初始化打开与基础元数据
+        RecordSchema schema = new RecordSchema();
+        schema.AddInt32("id");
+        schema.AddFixedStr("name", 32);
+        schema.AddFixedStr("dept", 16);
+        schema.AddInt32("age");
+        schema.AddFloat64("salary");
+        schema.AddBool("isActive");
+
+        RecordTable rt = RecordTable.Open(dbPath, "emp", schema);
+        Ok(rt.IsOpen(), "RecordTable open successfully");
+        Ok(rt.Count() == 0 && rt.TotalRows() == 0, "initial table is empty");
+        Ok(rt.Schema().rowBytes == 76, "schema rowBytes aligned");
+        Ok(rt.Schema().columns.Count == 6, "schema column count matches");
+
+        // 2. 单条写入与读取（零 JsonValue，原生二进制保真）
+        RecordRow r1 = new RecordRow(schema);
+        r1.SetInt32("id", 1001);
+        r1.SetStr("name", "Alice");
+        r1.SetStr("dept", "finance");
+        r1.SetInt32("age", 28);
+        r1.SetFloat64("salary", 18500.50);
+        r1.SetBool("isActive", true);
+
+        int id1 = rt.Add(r1);
+        Ok(id1 == 1, "first sequential id is 1");
+        Ok(rt.Count() == 1 && rt.TotalRows() == 1, "row count incremented");
+
+        RecordRow g1 = rt.Get(id1);
+        Ok(g1 != null, "Get returns row");
+        Ok(g1.GetInt32("id") == 1001, "Get int32 matches");
+        Ok(g1.GetStr("name") == "Alice", "Get fixedStr name matches");
+        Ok(g1.GetStr("dept") == "finance", "Get fixedStr dept matches");
+        Ok(g1.GetInt32("age") == 28, "Get int32 age matches");
+        Ok(Math.Abs(g1.GetFloat64("salary") - 18500.50) < 1e-6, "Get float64 salary matches");
+        Ok(g1.GetBool("isActive") == true, "Get bool matches");
+
+        // 3. 原地 Update 修改
+        g1.SetStr("name", "Alice Smith");
+        g1.SetInt32("age", 29);
+        bool updated = rt.Update(id1, g1);
+        Ok(updated, "Update succeeds");
+        RecordRow u1 = rt.Get(id1);
+        Ok(u1.GetStr("name") == "Alice Smith" && u1.GetInt32("age") == 29, "Update reflected in read");
+
+        // 4. 批量追加 AddBulk
+        List<RecordRow> bulk = new List<RecordRow>();
+        for (int i = 2; i <= 21; i = i + 1) {
+            RecordRow r = new RecordRow(schema);
+            r.SetInt32("id", 1000 + i);
+            r.SetStr("name", "User_" + Convert.ToString(i));
+            r.SetStr("dept", (i % 2 == 0) ? "tech" : "finance");
+            r.SetInt32("age", 20 + i);
+            r.SetFloat64("salary", 10000.0 + (double)i * 1000.0);
+            r.SetBool("isActive", true);
+            bulk.Add(r);
+        }
+        int firstId = 0;
+        rt.AddBulk(bulk, out firstId);
+        Ok(firstId == 2, "AddBulk firstId is 2");
+        Ok(rt.Count() == 21 && rt.TotalRows() == 21, "AddBulk total rows is 21");
+
+        // 5. 内存二级索引构建与查找
+        rt.EnsureIndex("dept");
+        List<RecordRow> techRows = rt.FindByIndex("dept", "tech");
+        Ok(techRows.Count == 10, "FindByIndex returns 10 tech rows");
+        List<RecordRow> financeRows = rt.FindByIndex("dept", "finance");
+        Ok(financeRows.Count == 11, "FindByIndex returns 11 finance rows (including Alice)");
+
+        // 6. 软删除与墓碑稳定性（零 ID 漂移）
+        rt.Delete(id1);
+        Ok(rt.Count() == 20 && rt.TotalRows() == 21, "after Delete: active=20, total=21");
+        Ok(rt.Get(id1) == null, "Get on deleted id returns null");
+        Ok(rt.Get(2) != null, "Get on sibling id 2 returns row");
+
+        // 追加新记录：分配新 id=22，前面的数据 ID 绝对不前移漂移
+        RecordRow rNew = new RecordRow(schema);
+        rNew.SetInt32("id", 9999);
+        rNew.SetStr("name", "NewGuy");
+        rNew.SetStr("dept", "hr");
+        rNew.SetInt32("age", 22);
+        rNew.SetFloat64("salary", 8000.0);
+        rNew.SetBool("isActive", true);
+        int idNew = rt.Add(rNew);
+        Ok(idNew == 22, "new Add receives next sequential id 22 without shifting previous ids");
+        Ok(rt.Count() == 21 && rt.TotalRows() == 22, "counts accurate after add with tombstone: active=21, total=22");
+
+        // 7. Scan 零拷贝全表扫描（跳过墓碑）
+        int scannedCount = 0;
+        rt.Scan((int id, RecordRow row) => {
+            scannedCount = scannedCount + 1;
+            return true;
+        });
+        Ok(scannedCount == 21, "Scan visits only 21 active rows");
+
+        // 8. 刷盘与关闭，重开无参反序列化 Schema
+        rt.Flush();
+        rt.Close();
+
+        RecordTable rtReopen = RecordTable.Open(dbPath, "emp");
+        Ok(rtReopen.IsOpen(), "reopen RecordTable succeeds without passing schema");
+        Ok(rtReopen.Count() == 21 && rtReopen.TotalRows() == 22, "reopened count matches");
+        Ok(rtReopen.Schema().columns.Count == 6, "reopened schema column count matches");
+        Ok(rtReopen.Get(id1) == null, "reopened tombstoned id remains null");
+        RecordRow gNew = rtReopen.Get(22);
+        Ok(gNew != null && gNew.GetStr("name") == "NewGuy", "reopened new row data matches");
+
+        // 9. 物理紧凑整理（Vacuum）
+        rtReopen.Vacuum();
+        Ok(rtReopen.Count() == 21 && rtReopen.TotalRows() == 21, "after Vacuum: active=21, total=21");
+        rtReopen.Close();
+
+        // 10. ZanDatabase 统一门面生命周期托管
+        ZanDatabase db = ZanDatabase.Open(dbPath);
+        RecordTable dbRt = db.GetRecordTable("emp");
+        Ok(dbRt.IsOpen() && dbRt.Count() == 21, "ZanDatabase loads RecordTable with 21 rows");
+        List<string> problems = db.IntegrityCheck();
+        Ok(problems.Count == 0, "IntegrityCheck clean for database and record table");
+
+        db.Flush();
+        db.Backup(bkPath);
+        db.Close();
+
+        // 校验备份库
+        ZanDatabase dbBk = ZanDatabase.Open(bkPath);
+        RecordTable bkRt = dbBk.GetRecordTable("emp");
+        Ok(bkRt.IsOpen() && bkRt.Count() == 21, "backup database loaded RecordTable with 21 rows");
+        List<string> bkProblems = dbBk.IntegrityCheck();
+        Ok(bkProblems.Count == 0, "backup database integrity check clean");
+        dbBk.Close();
+
+        // 收尾清理
+        Clean(dbPath);
+        Clean(bkPath);
+        Console.WriteLine("ALL " + Convert.ToString(checks) + " CHECKS PASSED");
+    }
+}

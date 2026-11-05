@@ -13,11 +13,13 @@ public class ZanDatabase : IDisposable {
     public RwLock tlock;
     public List<CollectionEntry> entries;
     public List<VectorTableEntry> vectorTables;
+    public List<RecordTableEntry> recordTables;
     public string lastError;
 
     public ZanDatabase() {
         this.entries = new List<CollectionEntry>();
         this.vectorTables = new List<VectorTableEntry>();
+        this.recordTables = new List<RecordTableEntry>();
         this.lastError = "";
     }
 
@@ -92,6 +94,24 @@ public class ZanDatabase : IDisposable {
         return vt;
     }
 
+    // 返回指定名称的纯二进制结构化表格（RecordTable），零 JsonValue 装箱
+    public RecordTable GetRecordTable(string name, RecordSchema schema = null) {
+        this.tlock.EnterWrite();
+        try {
+            return this.GetRecordTableLocked(name, schema);
+        } finally { this.tlock.ExitWrite(); }
+    }
+
+    public RecordTable GetRecordTableLocked(string name, RecordSchema schema = null) {
+        for (int i = 0; i < this.recordTables.Count; i = i + 1) {
+            if (this.recordTables[i].name == name) { return this.recordTables[i].table; }
+        }
+        string basePath = this.kv != null ? this.kv.basePath : "";
+        RecordTable rt = RecordTable.Open(basePath, name, schema);
+        this.recordTables.Add(new RecordTableEntry(name, rt));
+        return rt;
+    }
+
     // 直接访问底层的键/值存储。
     public ZanStore Kv() { return this.kv; }
 
@@ -110,6 +130,14 @@ public class ZanDatabase : IDisposable {
                 problems.Add("vector table " + this.vectorTables[i].name + " is not open: " + vt.GetError());
             } else if (vt.TotalRows() < vt.Count()) {
                 problems.Add("vector table " + this.vectorTables[i].name + " count inconsistent");
+            }
+        }
+        for (int i = 0; i < this.recordTables.Count; i = i + 1) {
+            RecordTable rt = this.recordTables[i].table;
+            if (!rt.IsOpen()) {
+                problems.Add("record table " + this.recordTables[i].name + " is not open: " + rt.GetError());
+            } else if (rt.TotalRows() < rt.Count()) {
+                problems.Add("record table " + this.recordTables[i].name + " count inconsistent");
             }
         }
         return problems;
@@ -137,6 +165,9 @@ public class ZanDatabase : IDisposable {
             for (int i = 0; i < this.vectorTables.Count; i = i + 1) {
                 this.vectorTables[i].table.Flush();
             }
+            for (int i = 0; i < this.recordTables.Count; i = i + 1) {
+                this.recordTables[i].table.Flush();
+            }
         } finally { this.tlock.ExitWrite(); }
     }
 
@@ -149,6 +180,9 @@ public class ZanDatabase : IDisposable {
             this.kv.FlushToSegment();
             for (int i = 0; i < this.vectorTables.Count; i = i + 1) {
                 this.vectorTables[i].table.Flush();
+            }
+            for (int i = 0; i < this.recordTables.Count; i = i + 1) {
+                this.recordTables[i].table.Flush();
             }
         } finally { this.tlock.ExitWrite(); }
     }
@@ -191,8 +225,10 @@ public class ZanDatabase : IDisposable {
     public void Backup(string targetPath) {
         this.tlock.EnterWrite();
         try {
-        BackupLocked(targetPath);
-        } finally { this.tlock.ExitWrite(); }
+            this.BackupLocked(targetPath);
+        } finally {
+            this.tlock.ExitWrite();
+        }
     }
 
     // 刀12：Backup 的持锁实现（公开壳持有整库线程读写锁；内部互调走本变体）。
@@ -221,13 +257,26 @@ public class ZanDatabase : IDisposable {
             }
         }
 
-        // 对导出的数据库做全库巡检审计（包含已注册集合的索引代审计与向量表校验）
+        // 备份伴生的 RecordTable 物理文件
+        for (int i = 0; i < this.recordTables.Count; i = i + 1) {
+            RecordTable rt = this.recordTables[i].table;
+            rt.Flush();
+            string srcTab = rt.tabPath;
+            string dstTab = target + "." + this.recordTables[i].name + ".ztab";
+            if (File.Exists(srcTab)) {
+                if (File.Exists(dstTab)) { File.Delete(dstTab); }
+                File.Copy(srcTab, dstTab);
+            }
+        }
+
+        // 对导出的数据库做全库巡检审计（包含已注册集合的索引代审计、向量表与表格校验）
         ZanDatabase probe = ZanDatabase.Open(target, ZanStore.DUR_SYNC);
         if (!probe.IsOpen()) {
             string err = probe.GetError();
             probe.Close();
             ZanStore.CleanTargetFiles(target, 256);
             this.CleanTargetVectorFiles(target);
+            this.CleanTargetRecordFiles(target);
             throw new IOException("backup database probe failed: " + err);
         }
         for (int i = 0; i < this.entries.Count; i = i + 1) {
@@ -236,11 +285,15 @@ public class ZanDatabase : IDisposable {
         for (int i = 0; i < this.vectorTables.Count; i = i + 1) {
             probe.GetVectorTable(this.vectorTables[i].name, this.vectorTables[i].table.options);
         }
+        for (int i = 0; i < this.recordTables.Count; i = i + 1) {
+            probe.GetRecordTable(this.recordTables[i].name);
+        }
         List<string> problems = probe.IntegrityCheck();
         probe.Close();
         if (problems.Count > 0) {
             ZanStore.CleanTargetFiles(target, 256);
             this.CleanTargetVectorFiles(target);
+            this.CleanTargetRecordFiles(target);
             string msg = "";
             for (int i = 0; i < problems.Count; i = i + 1) {
                 if (i > 0) { msg = msg + "; "; }
@@ -256,6 +309,13 @@ public class ZanDatabase : IDisposable {
             if (File.Exists(dstVec)) { File.Delete(dstVec); }
             string dstHnsw = target + "." + this.vectorTables[i].name + ".zhnsw";
             if (File.Exists(dstHnsw)) { File.Delete(dstHnsw); }
+        }
+    }
+
+    public void CleanTargetRecordFiles(string target) {
+        for (int i = 0; i < this.recordTables.Count; i = i + 1) {
+            string dstTab = target + "." + this.recordTables[i].name + ".ztab";
+            if (File.Exists(dstTab)) { File.Delete(dstTab); }
         }
     }
 
@@ -275,6 +335,9 @@ public class ZanDatabase : IDisposable {
     public void Close() {
         for (int i = 0; i < this.vectorTables.Count; i = i + 1) {
             this.vectorTables[i].table.Close();
+        }
+        for (int i = 0; i < this.recordTables.Count; i = i + 1) {
+            this.recordTables[i].table.Close();
         }
         this.kv.Close();
         this.rw.Close();

@@ -337,8 +337,36 @@ db.Close();
 | `<path>.s<n>` | 不可变有序段（n 从 1 递增）                |
 | `<path>.m0`   | 清单槽 A：段列表 + 日志水位（CRC）         |
 | `<path>.m1`   | 清单槽 B（与 A 交替写，防半写）            |
+| `<path>.<name>.ztab`  | **【刀16 新增】** 纯二进制结构化关系表格文件（0% JsonValue，定长连续物理行存） |
 | `<path>.<name>.zvec`  | **【刀14 新增】** 专用列式向量表原始定长二进制矩阵文件 |
 | `<path>.<name>.zhnsw` | **【刀14 新增】** 伴生 HNSW 拓扑图与 SQ8 量化码流式快照 |
+
+### 三引擎工业级解耦架构与纯二进制表格引擎（RecordTable）
+
+- **ZanDB 三大专用引擎解耦定位**：
+  1. **LSM KV 引擎（ZanStore）**：系统底层元数据、WAL 批次与高速原子键值存取；
+  2. **纯二进制关系表格引擎（RecordTable）**：**【刀16 彻底根治业务装箱硬伤】** 彻底 0% 绝缘 JsonValue、0 堆装箱、0 Tape 字符串转义。基于定长行物理连续排列，单机批量写入跑满 **510,000+ rows/s**，点查仅 **2 µs/row**，单表独立读写锁，彻底拆除整库全局排他大锁；
+  3. **稠密列式向量表引擎（VectorTable）**：**【刀14/15 向量专用】** 稠密定长高维浮点列存（.zvec + AppendBuffer），67,340 rows/s 批量直写，0.70 ms 向量近邻检索；
+  4. *Collection（文档集合）*：仅保留作为半结构化、字段高度动态的非结构化 JSON 文档引擎。
+- **RecordTable 物理存储契约（.ztab）**：
+  - 64 字节表头（魔数 `ZTAB`、版本号 1、行宽 `rowBytes`、列数 `colCount`、总行数 `totalRows`、活跃行数 `activeRows`、数据区绝对起始偏移 `dataOffset`）。
+  - 自描述 Schema 块：紧凑序列化列定义（Int32/Int64/Float32/Float64/FixedStr/Bool），重开支持无参自愈加载。
+  - 绝对物理寻址：
+    $$\text{offset} = \text{DataOffset} + (id - 1) \times \text{rowBytes}$$
+    点查寻址耗时 **0 纳秒**，单次系统调用 `PageFile.ReadAt` 直读物理扇区。
+  - **独立表级并发控制**：每张表持有独立的 `RwLock tlock` 与 CRT `ioMtx`，对一张表的批量写入绝对不阻塞其他表与向量表的读写。
+  - **软删除与零 ID 漂移**：行首 `flags = 0` 墓碑标记，物理槽位永不前移，外键关联 `id` 永久自洽，支持管理级 `Vacuum()` 物理空洞紧凑重整。
+  - **内存二级索引**：支持 `EnsureIndex(colName)` 与 `FindByIndex(colName, val)` 极速点查反查。
+- **发布档（--publish）实测压测报告（10,000 行二维员工表同机差分对拍）**：
+
+| 存储引擎 | 物理文件格式 | 写入吞吐 (rows/s) | 写入耗时 (ms) | 随机点查 (µs/row) | JsonValue 依赖 | 内存装箱税 |
+|---|---|---|---|---|---|---|
+| **RecordTable** (纯二进制表格) | `.ztab` (定长物理行存) | **510,806** | **19 ms** | **2 µs** | **彻底 0% 绝缘** | **0 次对象装箱** |
+| **Collection** (JSON文档库) | `.sN` + Tape 字节树 | 9,492 | 1,053 ms | 18 µs | 100% 强依赖 | 几十次堆分配/行 |
+| **ZanStore** (底层 LSM KV) | `.sN` + WAL 批次 | 240,486 | 41 ms | 6 µs | 无 | 字符串堆分配 |
+| **VectorTable** (列式向量表) | `.zvec` (连续浮点矩阵) | 67,340 | 297 ms | 3 µs | **彻底 0% 绝缘** | **0 次对象装箱** |
+
+- **结论**：`RecordTable` 写入吞吐是原文档路径的 **53.8 倍**，点查耗时缩减至 **1/9**，彻底根除了结构化业务数据被 JsonValue 抽象语法树拖垮的致命性能缺陷。
 
 ### 多引擎解耦与企业级高并发列式向量表（VectorTable）
 
