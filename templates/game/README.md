@@ -20,7 +20,6 @@ IDE 的"新建项目"按这个标签分组。
 | 策略塔防 Strategy | [rts](rts/) | `Game.Tactics` | 即时战术：流场寻路 + RVO 群体避障 + 小地图 |
 | 益智解谜 Puzzle | [trap-cat](trap-cat/) | `Game.Board` | 围住神经猫：逐点封堵、撤销、最短路 AI |
 | 休闲益智 Puzzle | [match3](match3/) | `Game.Match3` + `Game.Kit` | 经典三消：滑块交换、重力掉落填充、连击消除与飘字计分 |
-| 动作平台 Action | [platformer](platformer/) | `Game.Arcade2D` | 2D 横版平台：零分配循环、土狼时间、跳跃缓冲 |
 | 肉鸽动作 Action | [survivor](survivor/) | `Game.Kit` + `Game.Graphics` | 幸存者割草：自动瞄准弹幕、怪物蜂拥波次、深度遮挡排序、打击顿帧与震屏 |
 | 3D 漫游交互 Action3D | [fps-3d](fps-3d/) | `Game.Render3D` | 3D 第一人称漫游：GPU 网格批次渲染、视锥裁剪、平滑漫游与 3D 射线拾取 |
 | 放置挂机 Idle | [idle](idle/) | `Game.Idle` | 放置矿工：Gui + SpriteBatch + 弹性反馈 |
@@ -42,6 +41,7 @@ IDE 的"新建项目"按这个标签分组。
 | `D:/project/games/ddz` | 斗地主 | 叫地主、牌型组合出牌、牌面动画，与两家 AI 对战 |
 | `D:/project/games/goldminer` | 黄金矿工 | 摆钩抓金、连击 FEVER、收线/拆弹 QTE、TNT 连锁 |
 | `D:/project/games/breakout` | 打砖块 | 发光砖块、道具掉落、多球乱斗 |
+| `D:/project/games/platformer` | 2D 横版平台跳跃 | SuperTux 素材路线：零分配帧循环、土狼时间、跳跃缓冲与 2D 瓦片碰撞；素材 91 张贴图 + 14 音频 |
 
 搬迁用 [`scripts/export_game_project.ps1`](../../scripts/export_game_project.ps1)
 （复制 + 改写仓库路径引用 + 退模板身份 + `git init`）。仓库里若还需要留一份
