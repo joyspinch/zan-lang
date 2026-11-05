@@ -1495,6 +1495,18 @@ add_test(NAME diag_cw_missing_handler
 set_tests_properties(diag_cw_missing_handler PROPERTIES
     TIMEOUT 120 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
 
+add_test(NAME conformance_gui_cw_publish_handlers
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/cwpublish/cwpublish_test.zan
+    "-DZANC_ARGS=--auto-stdlib;--publish${_gui_driver_tail}"
+    -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/gui/cwpublish/cwpublish.out
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_cw_publish_handlers${_exe_ext}
+    -DWORKDIR=${CMAKE_SOURCE_DIR}/tests/gui/cwpublish
+    -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+set_tests_properties(conformance_gui_cw_publish_handlers PROPERTIES
+    TIMEOUT 180 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+
 add_test(NAME diag_docapp_no_entry
   COMMAND ${CMAKE_COMMAND}
     -DZANC=$<TARGET_FILE:zanc>

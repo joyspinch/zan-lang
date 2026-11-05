@@ -2021,3 +2021,4 @@
   marker 鸡生蛋；`GetDirectories` 裸名致缓存检测 miss），每一层都会
   单独复现"重装"表象，修一层以为好了下一层又来。
 
+- **Git Bash 里别用 `cmd //c "x & echo %ERRORLEVEL%"` 取退出码**：`%ERRORLEVEL%` 在整行解析时就展开，恒为运行前的旧值，会把失败报成 0。直接读 `$?`；批量跑窗口用例时同时断言 case 行和结束行，rc=0 不等于跑过（未知 case 名也是 rc=0）。

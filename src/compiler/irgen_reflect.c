@@ -542,10 +542,27 @@ static int refl_accessor_flag(zan_symbol_t *sym, zan_symbol_t *msym) {
     return 0;
 }
 
+/* 设计稿事件处理器只经 Invoke 按名调用：publish 不保留的话 HasMethod
+ * 对账通过、点击却静默不执行。 */
+bool refl_is_html_handler_name(zan_irgen_t *g, const char *s, size_t n) {
+    for (int i = 0; i < g->html_handler_count; i++) {
+        const char *h = g->html_handlers[i];
+        if (strlen(h) == n && memcmp(h, s, n) == 0)
+            return true;
+    }
+    return false;
+}
+
+static bool refl_is_html_handler(zan_irgen_t *g, zan_symbol_t *m) {
+    return refl_is_html_handler_name(g, (const char *)m->name.str, (size_t)m->name.len);
+}
+
 static bool refl_method_should_export(zan_irgen_t *g, zan_symbol_t *sym, zan_symbol_t *m) {
     if (!m || m->kind != SYM_METHOD || !m->decl || m->decl->kind != AST_METHOD_DECL)
         return false;
     if (!g->publish_mode)
+        return true;
+    if (refl_is_html_handler(g, m))
         return true;
     /* publish 模式下：
      * 1. 属性访问器（get_/set_）必须保留，支持运行期动态数据绑定
@@ -826,7 +843,8 @@ static LLVMValueRef refl_method_record(zan_irgen_t *g, zan_symbol_t *sym,
         zan_ast_list_t *attrs = zan_ast_attributes(decl);
         bool need_thunk = !g->publish_mode ||
                           (flags & (ZAN_REFL_MF_PROPGET | ZAN_REFL_MF_PROPSET)) != 0 ||
-                          (attrs && attrs->count > 0);
+                          (attrs && attrs->count > 0) ||
+                          refl_is_html_handler(g, msym);
         if (need_thunk) {
             int fi = irgen_find_function(g, msym);
             if (fi >= 0) {

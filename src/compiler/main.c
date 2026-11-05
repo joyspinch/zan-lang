@@ -2970,7 +2970,8 @@ static bool zan_inputs_use_design_doc(const char *const *input_files,
         size_t len = 0;
         char *src = read_file(input_files[fi], &len);
         if (!src) continue;
-        bool hit = strstr(src, " : Form") != NULL;
+        bool hit = strstr(src, " : Form") != NULL ||
+                   strstr(src, " : ChildWindow") != NULL;
         free(src);
         if (hit) return true;
     }
@@ -4095,6 +4096,14 @@ int main(int argc, char **argv) {
     irgen.emit_debug = debug_info;
     irgen.strict_runtime = strict_runtime;
     irgen.publish_mode = publish_mode;
+    if (publish_mode && zan_inputs_use_design_doc(input_files, input_count)) {
+        char handler_root[1024];
+        zan_design_root_for(input_files[0], handler_root, sizeof(handler_root));
+        irgen.html_handler_count =
+            zan_embed_collect_html_handlers(handler_root, &irgen.html_handlers);
+        fprintf(stderr, "note: retained %d html event handler name(s) from %s/src\n",
+                irgen.html_handler_count, handler_root);
+    }
     irgen.irgen_checked_depth = checked_arith ? 1 : 0; /* B-ID76 */
     irgen.rt_guard_split = !cross_compiling;
     const char *obf_env = getenv("ZAN_OBF");

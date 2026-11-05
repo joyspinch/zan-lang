@@ -24,4 +24,10 @@ int zan_embed_driver_spec(const char *path, const char *file, char *out,
 int zan_embed_collect_design_html(const char *project_root,
                                   char (*specs)[1300], int max_specs);
 
+/* 发布态设计稿事件处理器名收集：扫同一批 html 的 @x / v-on:x / z-on:x /
+ * data-on-x / onx 属性（口径同 Html.Parse 建树期归一），去重后写入
+ * *out_names（malloc，进程期持有）。这些方法运行期只经 Invoke 按名调用，
+ * 静态上不可见，publish 须据此保留反射条目与 thunk。返回个数。 */
+int zan_embed_collect_html_handlers(const char *project_root, char ***out_names);
+
 #endif /* ZAN_EMBEDRES_H */

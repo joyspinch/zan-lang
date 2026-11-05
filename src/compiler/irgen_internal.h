@@ -779,6 +779,7 @@ LLVMValueRef refl_meta_for(zan_irgen_t *g, zan_type_t *t, const char *disp, int 
 LLVMValueRef refl_obj_type_fn(zan_irgen_t *g);
 void refl_reserve_thunk_sites(zan_irgen_t *g);
 bool refl_type_needs_site_meta(zan_irgen_t *g, zan_symbol_t *sym);
+bool refl_is_html_handler_name(zan_irgen_t *g, const char *s, size_t n);
 void zan_irgen_emit_arc_desc_init(zan_irgen_t *g);
 
 

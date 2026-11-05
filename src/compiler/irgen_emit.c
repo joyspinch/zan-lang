@@ -3197,7 +3197,11 @@ done:
             bool root = (g->emit_lib &&
                          ((member->method_decl.modifiers & MOD_PUBLIC) ||
                           member->kind == AST_CONSTRUCTOR_DECL)) ||
-                        is_refl_root;
+                        is_refl_root ||
+                        (member->kind == AST_METHOD_DECL &&
+                         refl_is_html_handler_name(g,
+                             (const char *)member->method_decl.name.str,
+                             (size_t)member->method_decl.name.len));
             if (!root)
                 root = body_has_live_use(work[w].fn, live, &work_ix);
             if (root) { live[w] = 1; pending++; }

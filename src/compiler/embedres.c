@@ -361,6 +361,86 @@ int zan_embed_collect_design_html(const char *project_root,
     return s.truncated ? -1 : s.count;
 }
 
+static int handler_attr_is_event(const char *s, size_t n) {
+    if (n > 1 && s[0] == '@') return 1;
+    if (n > 5 && (memcmp(s, "v-on:", 5) == 0 || memcmp(s, "z-on:", 5) == 0)) return 1;
+    if (n > 8 && memcmp(s, "data-on-", 8) == 0) return 1;
+    if (n > 2 && s[0] == 'o' && s[1] == 'n') {
+        for (size_t i = 2; i < n; i++)
+            if (s[i] < 'a' || s[i] > 'z') return 0;
+        return 1;
+    }
+    return 0;
+}
+
+static int handler_is_attr_char(char c) {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+           (c >= '0' && c <= '9') || c == '-' || c == '_' || c == ':' || c == '@';
+}
+
+static int handler_is_ident_char(char c, int first) {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_' ||
+           (!first && c >= '0' && c <= '9');
+}
+
+static void handler_add(char ***names, int *count, int *cap,
+                        const char *s, size_t n) {
+    for (int i = 0; i < *count; i++)
+        if (strlen((*names)[i]) == n && memcmp((*names)[i], s, n) == 0) return;
+    if (*count == *cap) {
+        int ncap = *cap ? *cap * 2 : 64;
+        char **nn = (char **)realloc(*names, (size_t)ncap * sizeof(char *));
+        if (!nn) return;
+        *names = nn;
+        *cap = ncap;
+    }
+    char *d = (char *)malloc(n + 1);
+    if (!d) return;
+    memcpy(d, s, n);
+    d[n] = 0;
+    (*names)[(*count)++] = d;
+}
+
+static void handler_scan_text(const char *t, size_t len, char ***names,
+                              int *count, int *cap) {
+    for (size_t i = 1; i + 1 < len; i++) {
+        if (t[i] != '=' || (t[i + 1] != '"' && t[i + 1] != 39)) continue;
+        size_t a = i;
+        while (a > 0 && handler_is_attr_char(t[a - 1])) a--;
+        if (!handler_attr_is_event(t + a, i - a)) continue;
+        size_t v = i + 2, e = v;
+        while (e < len && handler_is_ident_char(t[e], e == v)) e++;
+        if (e > v && e < len && (t[e] == t[i + 1] || t[e] == '('))
+            handler_add(names, count, cap, t + v, e - v);
+    }
+}
+
+int zan_embed_collect_html_handlers(const char *project_root, char ***out_names) {
+    static char specs[256][1300];
+    int nd = zan_embed_collect_design_html(project_root, specs, 256);
+    if (nd < 0) nd = 256;
+    char **names = NULL;
+    int count = 0, cap = 0;
+    for (int i = 0; i < nd; i++) {
+        char *eq = strrchr(specs[i], '=');
+        if (!eq) continue;
+        *eq = 0;
+        FILE *f = fopen(specs[i], "rb");
+        *eq = '=';
+        if (!f) continue;
+        fseek(f, 0, SEEK_END);
+        long sz = ftell(f);
+        fseek(f, 0, SEEK_SET);
+        char *buf = sz > 0 ? (char *)malloc((size_t)sz) : NULL;
+        if (buf && fread(buf, 1, (size_t)sz, f) == (size_t)sz)
+            handler_scan_text(buf, (size_t)sz, &names, &count, &cap);
+        free(buf);
+        fclose(f);
+    }
+    *out_names = names;
+    return count;
+}
+
 static int embed_is_dir(const char *path) {
 #ifdef _WIN32
     DWORD a = zan_utf8_get_file_attributes(path);

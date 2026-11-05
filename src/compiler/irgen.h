@@ -426,6 +426,8 @@ struct zan_irgen {
     LLVMValueRef soft_scratch_slot; /* 函数入口轻量刮擦页指针 */
     LLVMValueRef soft_scratch_fn;
     bool         publish_mode;
+    char       **html_handlers;      /* publish：设计稿事件处理器名，按名保留反射 */
+    int          html_handler_count;
     bool         strict_runtime;
     bool         check_leaks;
     bool         arc_guard;       /* 释放对象隔离区 (UAF 检测) */
