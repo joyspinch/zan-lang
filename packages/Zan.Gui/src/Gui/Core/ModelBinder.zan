@@ -871,6 +871,7 @@ public class ModelBinder {
             JsonValue arr = null;
             JsonDoc doc = null;
             List<object> objList = null;
+            object strongList = null;
             int docArrSlot = -1;
             int n = 0;
 
@@ -901,6 +902,12 @@ public class ModelBinder {
                         if (fo != null && fo is List<object>) {
                             objList = (List<object>)fo;
                             n = objList.Count;
+                        } else if (fo != null && fo.HasMethod("Count") && fo.HasMethod("Get")) {
+                            // 强类型 List<T>（B-ID154）：反射 Count 数行，展开循环逐行
+                            // InvokeObject("Get", k) 取元素；行对象为用户类实例，
+                            // 行内 bind 与 data-key 走既有反射字段通道。
+                            strongList = fo;
+                            n = fo.InvokeInt("Count");
                         }
                     }
                 }
@@ -908,9 +915,9 @@ public class ModelBinder {
 
             string keyAttr = t.CssAttr("data-key");
 
-            if (keyAttr != "" && (arr != null || (doc != null && docArrSlot >= 0) || objList != null)) {
+            if (keyAttr != "" && (arr != null || (doc != null && docArrSlot >= 0) || objList != null || strongList != null)) {
                 if (!this.dirty && this.tmplMetas[i].lastCount == n) { continue; }
-                this.EnsureExpandedKeyed(t, arr, doc, docArrSlot, objList, n, keyAttr, this.tmplMetas[i]);
+                this.EnsureExpandedKeyed(t, arr, doc, docArrSlot, objList, strongList, n, keyAttr, this.tmplMetas[i]);
             } else {
                 if (this.tmplMetas[i].lastCount == n) { continue; }
                 this.RemoveRows(t);
@@ -927,6 +934,8 @@ public class ModelBinder {
                         item = new JsonDocCursor(doc, doc.At(docArrSlot, k));
                     } else if (objList != null) {
                         item = objList[k];
+                    } else if (strongList != null) {
+                        item = strongList.InvokeObject("Get", k);
                     }
                     for (int j = 0; j < t.children.Count; j = j + 1) {
                         Control row = App.CloneTree(t.children[j]);
@@ -945,7 +954,7 @@ public class ModelBinder {
         }
     }
 
-    void EnsureExpandedKeyed(Control t, JsonValue arr, JsonDoc doc, int docArrSlot, List<object> objList, int n, string keyAttr, ChildTemplateMeta meta) {
+    void EnsureExpandedKeyed(Control t, JsonValue arr, JsonDoc doc, int docArrSlot, List<object> objList, object strongList, int n, string keyAttr, ChildTemplateMeta meta) {
         Control p = t.parent;
         if (p == null) { return; }
         meta.lastCount = n;
@@ -991,8 +1000,8 @@ public class ModelBinder {
                         }
                     }
                 }
-            } else if (objList != null) {
-                object item = objList[k];
+            } else if (objList != null || strongList != null) {
+                object item = objList != null ? objList[k] : strongList.InvokeObject("Get", k);
                 if (item != null) {
                     if (item is Dictionary<string, string>) {
                         Dictionary<string, string> d = (Dictionary<string, string>)item;
@@ -1042,6 +1051,8 @@ public class ModelBinder {
                 item = new JsonDocCursor(doc, doc.At(docArrSlot, k));
             } else if (objList != null) {
                 item = objList[k];
+            } else if (strongList != null) {
+                item = strongList.InvokeObject("Get", k);
             }
             string keyVal = newKeys[k];
 

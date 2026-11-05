@@ -4898,6 +4898,19 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
   set_tests_properties(conformance_gui_vue_binding_contract PROPERTIES
     TIMEOUT 120 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
 
+  add_test(NAME conformance_gui_strongfor
+    COMMAND ${CMAKE_COMMAND}
+      -DZANC=$<TARGET_FILE:zanc>
+      -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/strongfor_test.zan
+      "-DZANC_ARGS=--embed;tests/gui/strongfor_test.html;--auto-stdlib${_gui_driver_tail}"
+      -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_strongfor.out
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_strongfor${_exe_ext}
+      -DSTDLIB_STAMP=${_stdlib_stamp}
+      -DWORKDIR=${CMAKE_SOURCE_DIR}
+      -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+  set_tests_properties(conformance_gui_strongfor PROPERTIES
+    TIMEOUT 120 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+
   add_test(NAME conformance_gui_designer_interaction
     COMMAND ${CMAKE_COMMAND}
       -DZANC=$<TARGET_FILE:zanc>
