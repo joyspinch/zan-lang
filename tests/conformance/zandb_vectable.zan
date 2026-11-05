@@ -91,6 +91,14 @@ class ZanDbVectorTableTest {
         vt.AddBulk(bulk, out firstId);
         Ok(firstId == 3, "AddBulk firstId is 3");
         Ok(vt.Count() == 20 && vt.TotalRows() == 20, "AddBulk total rows is 20");
+        Ok(vt.PendingAppendCount() == 20, "Add and AddBulk leave 20 rows in appendBuf without blocking");
+
+        // 验证 刀15 增量立即可读（Read-Your-Writes）：未建大图前直接双路融合检索
+        float[] probeBulk = bulk[5]; // id = 8
+        List<VectorHit> bulkHits = vt.Search(probeBulk, 1);
+        Ok(bulkHits.Count == 1 && bulkHits[0].id == 8 && bulkHits[0].distance < 1e-5, "unindexed appendBuf vector immediately searchable (Read-Your-Writes)");
+        float[] probeGet = vt.Get(8);
+        Ok(probeGet != null && probeGet.Length == dims, "Get retrieves vector from appendBuf before indexing");
 
         // 4. 近邻搜索（未量化全精度图）
         List<VectorHit> hits = vt.Search(v1, 3);
@@ -107,9 +115,11 @@ class ZanDbVectorTableTest {
         List<VectorHit> hitsReopen = vtReopen.Search(v1, 3);
         Ok(hitsReopen.Count == 3 && hitsReopen[0].id == id1, "reopened search top hit matches");
 
-        // 6. 软删除与 Vacuum 紧凑重整
+        // 6. 软删除与墓碑稳定性（刀15 零 ID 漂移）与 Vacuum 紧凑重整
         vtReopen.Remove(id1);
         Ok(vtReopen.Count() == 19 && vtReopen.TotalRows() == 20, "after Remove: active=19, total=20");
+        Ok(vtReopen.Get(id1) == null, "Get on tombstoned id returns null");
+        Ok(vtReopen.Get(id2) != null, "Get on active sibling id returns vector");
         List<VectorHit> hitsAfterRemove = vtReopen.Search(v1, 3);
         bool hasRemoved = false;
         for (int i = 0; i < hitsAfterRemove.Count; i = i + 1) {
@@ -117,8 +127,17 @@ class ZanDbVectorTableTest {
         }
         Ok(!hasRemoved, "removed id is not in search hits");
 
+        // 追加新记录：分配新 id=21，原有 id 不发生任何错位漂移
+        float[] vNew = MakeVec(99, dims);
+        int idNew = vtReopen.Add(vNew);
+        Ok(idNew == 21, "new Add receives next sequential id 21 without shifting previous ids");
+        Ok(vtReopen.Count() == 20 && vtReopen.TotalRows() == 21, "counts accurate after add with tombstone: active=20, total=21");
+        vtReopen.Remove(idNew);
+        Ok(vtReopen.Count() == 19 && vtReopen.TotalRows() == 21, "counts accurate after remove of new id: active=19, total=21");
+
         vtReopen.Vacuum();
         Ok(vtReopen.Count() == 19 && vtReopen.TotalRows() == 19, "after Vacuum: active=19, total=19");
+        Ok(vtReopen.PendingAppendCount() == 0, "Vacuum drains appendBuf completely");
         vtReopen.Close();
 
         // 7. SQ8 量化两段式重打分表
