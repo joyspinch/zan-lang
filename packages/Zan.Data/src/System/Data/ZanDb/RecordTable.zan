@@ -15,6 +15,8 @@ public class RecordDataType {
     public static int Float64 = 4;
     public static int FixedStr = 5;
     public static int Bool = 6;
+    public static int VarStr = 7; // 变长字符串（行内存 8B 指针: offset 4B + len 4B，数据存 .zblob）
+    public static int Blob = 8;   // 原始字节块（行内存 8B 指针: offset 4B + len 4B，数据存 .zblob）
 }
 
 // 结构化表列定义
@@ -35,7 +37,7 @@ public class RecordColumn {
 // 表结构元数据
 public class RecordSchema {
     public List<RecordColumn> columns;
-    public int rowBytes; // 定长行宽（4 字节或 8 字节对齐）
+    public int rowBytes; // 定长行宽（4 字节对齐）
 
     public RecordSchema() {
         this.columns = new List<RecordColumn>();
@@ -82,6 +84,20 @@ public class RecordSchema {
         int off = this.rowBytes;
         this.columns.Add(new RecordColumn(name, RecordDataType.Bool, 4, off));
         this.rowBytes = this.rowBytes + 4;
+    }
+
+    // 变长字符串：行内存 8 字节指针 (4B blobOffset + 4B blobLen)
+    public void AddVarStr(string name) {
+        int off = this.rowBytes;
+        this.columns.Add(new RecordColumn(name, RecordDataType.VarStr, 8, off));
+        this.rowBytes = this.rowBytes + 8;
+    }
+
+    // 原始大二进制字节块：行内存 8 字节指针 (4B blobOffset + 4B blobLen)
+    public void AddBlob(string name) {
+        int off = this.rowBytes;
+        this.columns.Add(new RecordColumn(name, RecordDataType.Blob, 8, off));
+        this.rowBytes = this.rowBytes + 8;
     }
 
     public RecordColumn FindColumn(string name) {
@@ -149,20 +165,31 @@ public class RecordRow {
     public byte[] data;
     public int id;
     public bool isActive;
+    public RecordTable table;
+
+    // 暂存未落盘或已缓存读取的变长内容
+    public Dictionary<string, string> varStrs;
+    public Dictionary<string, byte[]> blobs;
 
     public RecordRow(RecordSchema schema) {
         this.schema = schema;
         this.data = new byte[schema.rowBytes];
         this.id = 0;
         this.isActive = true;
+        this.table = null;
+        this.varStrs = new Dictionary<string, string>();
+        this.blobs = new Dictionary<string, byte[]>();
         this.data[0] = 1; // 默认活跃有效
     }
 
-    public RecordRow(RecordSchema schema, byte[] data, int id, bool isActive) {
+    public RecordRow(RecordSchema schema, byte[] data, int id, bool isActive, RecordTable table = null) {
         this.schema = schema;
         this.data = data;
         this.id = id;
         this.isActive = isActive;
+        this.table = table;
+        this.varStrs = new Dictionary<string, string>();
+        this.blobs = new Dictionary<string, byte[]>();
     }
 
     public void SetInt32(string colName, int val) {
@@ -270,8 +297,15 @@ public class RecordRow {
 
     public void SetStr(string colName, string val) {
         RecordColumn col = this.schema.FindColumn(colName);
-        if (col == null || col.dataType != RecordDataType.FixedStr) {
-            throw new ArgumentException("invalid column or type mismatch for: " + colName);
+        if (col == null) {
+            throw new ArgumentException("invalid column: " + colName);
+        }
+        if (col.dataType == RecordDataType.VarStr) {
+            this.SetVarStr(colName, val);
+            return;
+        }
+        if (col.dataType != RecordDataType.FixedStr) {
+            throw new ArgumentException("column is not string type: " + colName);
         }
         int off = col.offset;
         int max = col.fixedLen;
@@ -288,8 +322,14 @@ public class RecordRow {
 
     public string GetStr(string colName) {
         RecordColumn col = this.schema.FindColumn(colName);
-        if (col == null || col.dataType != RecordDataType.FixedStr) {
-            throw new ArgumentException("invalid column or type mismatch for: " + colName);
+        if (col == null) {
+            throw new ArgumentException("invalid column: " + colName);
+        }
+        if (col.dataType == RecordDataType.VarStr) {
+            return this.GetVarStr(colName);
+        }
+        if (col.dataType != RecordDataType.FixedStr) {
+            throw new ArgumentException("column is not string type: " + colName);
         }
         int off = col.offset;
         int max = col.fixedLen;
@@ -320,25 +360,100 @@ public class RecordRow {
         }
         return this.data[col.offset] != 0;
     }
+
+    // 变长文本写入：暂存内容，落盘时追加至 .zblob 并回写 (offset, len)
+    public void SetVarStr(string colName, string val) {
+        RecordColumn col = this.schema.FindColumn(colName);
+        if (col == null || col.dataType != RecordDataType.VarStr) {
+            throw new ArgumentException("invalid column or type mismatch for: " + colName);
+        }
+        this.varStrs[colName] = val != null ? val : "";
+    }
+
+    // 变长文本读取：若有缓存则直接返回，否则直读 .zblob
+    public string GetVarStr(string colName) {
+        RecordColumn col = this.schema.FindColumn(colName);
+        if (col == null || col.dataType != RecordDataType.VarStr) {
+            throw new ArgumentException("invalid column or type mismatch for: " + colName);
+        }
+        if (this.varStrs.ContainsKey(colName)) {
+            return this.varStrs[colName];
+        }
+        int off = col.offset;
+        int bOff = ((int)this.data[off] & 255) | (((int)this.data[off + 1] & 255) << 8) |
+                   (((int)this.data[off + 2] & 255) << 16) | (((int)this.data[off + 3] & 255) << 24);
+        int bLen = ((int)this.data[off + 4] & 255) | (((int)this.data[off + 5] & 255) << 8) |
+                   (((int)this.data[off + 6] & 255) << 16) | (((int)this.data[off + 7] & 255) << 24);
+        if (bLen <= 0) { return ""; }
+        if (this.table == null || !this.table.IsOpen()) {
+            throw new InvalidOperationException("cannot fetch VarStr without open RecordTable connection");
+        }
+        byte[] raw = this.table.ReadBlobBytesLocked((long)bOff, bLen);
+        string res = raw != null ? Encoding.GetString(raw, 0, raw.Length) : "";
+        this.varStrs[colName] = res;
+        return res;
+    }
+
+    // 原始字节块写入
+    public void SetBlob(string colName, byte[] val) {
+        RecordColumn col = this.schema.FindColumn(colName);
+        if (col == null || col.dataType != RecordDataType.Blob) {
+            throw new ArgumentException("invalid column or type mismatch for: " + colName);
+        }
+        this.blobs[colName] = val != null ? val : new byte[0];
+    }
+
+    // 原始字节块读取
+    public byte[] GetBlob(string colName) {
+        RecordColumn col = this.schema.FindColumn(colName);
+        if (col == null || col.dataType != RecordDataType.Blob) {
+            throw new ArgumentException("invalid column or type mismatch for: " + colName);
+        }
+        if (this.blobs.ContainsKey(colName)) {
+            return this.blobs[colName];
+        }
+        int off = col.offset;
+        int bOff = ((int)this.data[off] & 255) | (((int)this.data[off + 1] & 255) << 8) |
+                   (((int)this.data[off + 2] & 255) << 16) | (((int)this.data[off + 3] & 255) << 24);
+        int bLen = ((int)this.data[off + 4] & 255) | (((int)this.data[off + 5] & 255) << 8) |
+                   (((int)this.data[off + 6] & 255) << 16) | (((int)this.data[off + 7] & 255) << 24);
+        if (bLen <= 0) { return new byte[0]; }
+        if (this.table == null || !this.table.IsOpen()) {
+            throw new InvalidOperationException("cannot fetch Blob without open RecordTable connection");
+        }
+        byte[] raw = this.table.ReadBlobBytesLocked((long)bOff, bLen);
+        this.blobs[colName] = raw;
+        return raw;
+    }
 }
 
 // 工业级纯二进制结构化表格引擎（RecordTable）
 // 1. .ztab 扁平二进制文件，O(1) 绝对物理寻址：offset = DataOffset + (id - 1) * RowBytes
 // 2. 彻底绝缘 JsonValue，0 堆装箱，0 Tape 转义
-// 3. 独立表级并发读写锁（RwLock tlock）与 CRT I/O 原子锁（ioMtx），彻底解耦整库大锁
-// 4. 墓碑软删除防 ID 漂移 + 内存二级索引
+// 3. 伴生 .zblob 变长文本与 BLOB 存储池，8 字节行内指针，Vacuum 紧凑回收
+// 4. 伴生 .zidx 二级索引文件持久化，O(1) 启动直读与脏退出自愈重建
+// 5. 独立表级并发读写锁（RwLock tlock）与 CRT I/O 原子锁（ioMtx），彻底解耦整库大锁
+// 6. 墓碑软删除防 ID 漂移 + 内存二级索引
 public class RecordTable {
     public static string MAGIC_TAB = "ZTAB";
+    public static string MAGIC_BLOB = "ZBLB";
+    public static string MAGIC_IDX = "ZIDX";
     public static int VERSION = 1;
     public static int HEADER_SIZE = 64;
+    public static int BLOB_HEADER_SIZE = 32;
+    public static int IDX_HEADER_SIZE = 32;
 
     public string name;
     public string tabPath;
+    public string blobPath;
+    public string idxPath;
     public PageFile file;
+    public PageFile blobFile;
     public RecordSchema schema;
     public int totalRows;
     public int activeRows;
     public long dataOffset;
+    public long blobTotalBytes;
     public RwLock tlock;
     public nint ioMtx;
     public string lastError;
@@ -351,11 +466,15 @@ public class RecordTable {
     public RecordTable() {
         this.name = "";
         this.tabPath = "";
+        this.blobPath = "";
+        this.idxPath = "";
         this.file = null;
+        this.blobFile = null;
         this.schema = null;
         this.totalRows = 0;
         this.activeRows = 0;
         this.dataOffset = 64;
+        this.blobTotalBytes = 32L;
         this.tlock = new RwLock();
         this.ioMtx = Mutex.Create();
         this.lastError = "";
@@ -377,6 +496,8 @@ public class RecordTable {
         RecordTable rt = new RecordTable();
         rt.name = name;
         rt.tabPath = basePath + "." + name + ".ztab";
+        rt.blobPath = basePath + "." + name + ".zblob";
+        rt.idxPath = basePath + "." + name + ".zidx";
 
         bool exists = File.Exists(rt.tabPath);
         if (exists) {
@@ -441,6 +562,12 @@ public class RecordTable {
                 }
                 flagBuf.Free();
             }
+
+            // 打开伴生 .zblob
+            rt.OpenOrCreateBlobFileLocked();
+
+            // 尝试从 .zidx 持久化文件极速恢复二级索引
+            rt.LoadIndexesLocked();
         } else {
             if (schema == null || schema.columns.Count == 0) {
                 rt.lastError = "schema must be provided for new RecordTable";
@@ -471,8 +598,66 @@ public class RecordTable {
 
             // 写入 64 字节头部
             rt.WriteHeaderLocked();
+
+            // 初始化伴生 .zblob
+            rt.OpenOrCreateBlobFileLocked();
         }
         return rt;
+    }
+
+    public void OpenOrCreateBlobFileLocked() {
+        bool blobExists = File.Exists(this.blobPath);
+        if (blobExists) {
+            this.blobFile = PageFile.OpenExisting(this.blobPath);
+            if (this.blobFile != null && this.blobFile.IsOpen()) {
+                ByteBuffer bh = ByteBuffer.Alloc(BLOB_HEADER_SIZE);
+                if (this.blobFile.ReadAt(0, bh, BLOB_HEADER_SIZE) == BLOB_HEADER_SIZE) {
+                    bh.SeekRead(0);
+                    string bMagic = bh.Str(0, 4);
+                    bh.SeekRead(4);
+                    int bVer = (int)bh.ReadU32();
+                    long tBytes = bh.ReadU64();
+                    if (bMagic == MAGIC_BLOB && bVer == VERSION && tBytes >= (long)BLOB_HEADER_SIZE) {
+                        this.blobTotalBytes = tBytes;
+                    } else {
+                        this.blobTotalBytes = (long)this.blobFile.Size();
+                    }
+                } else {
+                    this.blobTotalBytes = (long)this.blobFile.Size();
+                }
+                bh.Free();
+            }
+        } else {
+            this.blobFile = PageFile.Open(this.blobPath);
+            if (this.blobFile != null && this.blobFile.IsOpen()) {
+                this.blobTotalBytes = 32L;
+                ByteBuffer bh = ByteBuffer.Alloc(BLOB_HEADER_SIZE);
+                bh.WriteRaw(MAGIC_BLOB, 4);
+                bh.WriteU32((long)VERSION);
+                bh.WriteU64(32L);
+                bh.WriteU64(0L); // reserved
+                bh.WriteU64(0L);
+                this.blobFile.WriteAt(0, bh.Raw(), BLOB_HEADER_SIZE);
+                bh.Free();
+            }
+        }
+    }
+
+    public void WriteBlobHeaderLocked() {
+        if (this.blobFile == null || !this.blobFile.IsOpen()) { return; }
+        ByteBuffer bh = ByteBuffer.Alloc(BLOB_HEADER_SIZE);
+        bh.WriteRaw(MAGIC_BLOB, 4);
+        bh.WriteU32((long)VERSION);
+        bh.WriteU64(this.blobTotalBytes);
+        bh.WriteU64(0L);
+        bh.WriteU64(0L);
+        Mutex.Lock(this.ioMtx);
+        try {
+            this.blobFile.WriteAt(0, bh.Raw(), BLOB_HEADER_SIZE);
+        } finally {
+            Mutex.Unlock(this.ioMtx);
+            bh.Free();
+        }
     }
 
     public void WriteHeaderLocked() {
@@ -496,6 +681,84 @@ public class RecordTable {
         }
     }
 
+    // 追加 Blob 字节到 .zblob 文件
+    public void AppendBlobBytesLocked(byte[] bytes, out int blobOffset, out int blobLen) {
+        if (bytes == null || bytes.Length == 0) {
+            blobOffset = 0;
+            blobLen = 0;
+            return;
+        }
+        if (this.blobFile == null || !this.blobFile.IsOpen()) {
+            this.OpenOrCreateBlobFileLocked();
+        }
+        long off = this.blobTotalBytes;
+        int len = bytes.Length;
+        this.blobFile.WriteAt(off, (nint)bytes, len);
+        this.blobTotalBytes = off + (long)len;
+        this.WriteBlobHeaderLocked();
+        blobOffset = (int)off;
+        blobLen = len;
+    }
+
+    // 从 .zblob 读取 Blob 字节
+    public byte[] ReadBlobBytesLocked(long offset, int len) {
+        if (len <= 0 || offset <= 0L) { return new byte[0]; }
+        if (this.blobFile == null || !this.blobFile.IsOpen()) {
+            this.OpenOrCreateBlobFileLocked();
+        }
+        byte[] buf = new byte[len];
+        Mutex.Lock(this.ioMtx);
+        try {
+            int n = this.blobFile.ReadRaw(offset, (nint)buf, len);
+            if (n != len) { return new byte[0]; }
+        } finally {
+            Mutex.Unlock(this.ioMtx);
+        }
+        return buf;
+    }
+
+    // 辅助：将行的变长字段落盘到 .zblob 并把 (offset, len) 刷进行内存
+    public void FlushRowBlobsLocked(RecordRow row) {
+        if (row == null || this.schema == null) { return; }
+        for (int i = 0; i < this.schema.columns.Count; i = i + 1) {
+            RecordColumn col = this.schema.columns[i];
+            if (col.dataType == RecordDataType.VarStr) {
+                if (row.varStrs != null && row.varStrs.ContainsKey(col.name)) {
+                    string s = row.varStrs[col.name];
+                    byte[] bytes = s != null && s.Length > 0 ? Encoding.GetBytes(s) : new byte[0];
+                    int bOff = 0;
+                    int bLen = 0;
+                    this.AppendBlobBytesLocked(bytes, out bOff, out bLen);
+                    int off = col.offset;
+                    row.data[off] = (byte)(bOff & 255);
+                    row.data[off + 1] = (byte)((bOff >> 8) & 255);
+                    row.data[off + 2] = (byte)((bOff >> 16) & 255);
+                    row.data[off + 3] = (byte)((bOff >> 24) & 255);
+                    row.data[off + 4] = (byte)(bLen & 255);
+                    row.data[off + 5] = (byte)((bLen >> 8) & 255);
+                    row.data[off + 6] = (byte)((bLen >> 16) & 255);
+                    row.data[off + 7] = (byte)((bLen >> 24) & 255);
+                }
+            } else if (col.dataType == RecordDataType.Blob) {
+                if (row.blobs != null && row.blobs.ContainsKey(col.name)) {
+                    byte[] bytes = row.blobs[col.name];
+                    int bOff = 0;
+                    int bLen = 0;
+                    this.AppendBlobBytesLocked(bytes, out bOff, out bLen);
+                    int off = col.offset;
+                    row.data[off] = (byte)(bOff & 255);
+                    row.data[off + 1] = (byte)((bOff >> 8) & 255);
+                    row.data[off + 2] = (byte)((bOff >> 16) & 255);
+                    row.data[off + 3] = (byte)((bOff >> 24) & 255);
+                    row.data[off + 4] = (byte)(bLen & 255);
+                    row.data[off + 5] = (byte)((bLen >> 8) & 255);
+                    row.data[off + 6] = (byte)((bLen >> 16) & 255);
+                    row.data[off + 7] = (byte)((bLen >> 24) & 255);
+                }
+            }
+        }
+    }
+
     // 单行插入：分配自增 ID，纯二进制直写盘，零 JsonValue
     public int Add(RecordRow row) {
         this.tlock.EnterWrite();
@@ -506,7 +769,11 @@ public class RecordTable {
             int id = this.totalRows + 1;
             row.id = id;
             row.isActive = true;
+            row.table = this;
             row.data[0] = 1; // 活跃标志
+
+            // 刷盘变长大字段
+            this.FlushRowBlobsLocked(row);
 
             long off = this.dataOffset + (long)(id - 1) * (long)this.schema.rowBytes;
             int rbytes = this.schema.rowBytes;
@@ -540,15 +807,23 @@ public class RecordTable {
             int rbytes = this.schema.rowBytes;
             firstId = this.totalRows + 1;
 
+            // 1. 先写大字段 blob 存储（自管理原子锁，避免与后续表文件锁重入）
+            for (int i = 0; i < n; i = i + 1) {
+                RecordRow r = rows[i];
+                int id = firstId + i;
+                r.id = id;
+                r.isActive = true;
+                r.table = this;
+                r.data[0] = 1;
+                this.FlushRowBlobsLocked(r);
+            }
+
+            // 2. 批量物理写主表记录槽位
             Mutex.Lock(this.ioMtx);
             try {
                 for (int i = 0; i < n; i = i + 1) {
                     RecordRow r = rows[i];
-                    int id = firstId + i;
-                    r.id = id;
-                    r.isActive = true;
-                    r.data[0] = 1;
-                    long off = this.dataOffset + (long)(id - 1) * (long)rbytes;
+                    long off = this.dataOffset + (long)(r.id - 1) * (long)rbytes;
                     this.file.WriteAt(off, (nint)r.data, rbytes);
                     this.IndexRowLocked(r);
                 }
@@ -594,7 +869,7 @@ public class RecordTable {
             this.tombstones[id] = true;
             return null;
         }
-        return new RecordRow(this.schema, buf, id, true);
+        return new RecordRow(this.schema, buf, id, true, this);
     }
 
     // 按主键就地更新：修改物理文件对应槽位
@@ -606,7 +881,11 @@ public class RecordTable {
             }
             row.id = id;
             row.isActive = true;
+            row.table = this;
             row.data[0] = 1;
+
+            this.FlushRowBlobsLocked(row);
+
             long off = this.dataOffset + (long)(id - 1) * (long)this.schema.rowBytes;
             int rbytes = this.schema.rowBytes;
 
@@ -650,7 +929,7 @@ public class RecordTable {
         }
     }
 
-    // 为列构建内存二级索引
+    // 为列构建二级索引
     public void EnsureIndex(string colName) {
         this.tlock.EnterWrite();
         try {
@@ -670,6 +949,7 @@ public class RecordTable {
                     }
                 }
             }
+            this.SaveIndexesLocked();
         } finally {
             this.tlock.ExitWrite();
         }
@@ -698,6 +978,8 @@ public class RecordTable {
             return Convert.ToString(r.GetInt32(colName));
         } else if (col.dataType == RecordDataType.FixedStr) {
             return r.GetStr(colName);
+        } else if (col.dataType == RecordDataType.VarStr) {
+            return r.GetVarStr(colName);
         } else if (col.dataType == RecordDataType.Int64) {
             return Convert.ToString(r.GetInt64(colName));
         } else if (col.dataType == RecordDataType.Bool) {
@@ -730,6 +1012,118 @@ public class RecordTable {
         }
     }
 
+    // 二级索引持久化写入 .zidx 文件
+    public void SaveIndexesLocked() {
+        if (this.indexes == null || this.indexes.Count == 0) {
+            if (File.Exists(this.idxPath)) { File.Delete(this.idxPath); }
+            return;
+        }
+        ByteBuffer b = ByteBuffer.Alloc(1024);
+        b.WriteRaw(MAGIC_IDX, 4);
+        b.WriteU32((long)VERSION);
+        b.WriteU32((long)this.indexes.Count);
+        b.WriteU64((long)this.totalRows);
+        b.WriteU64((long)this.activeRows);
+        b.WriteU32(0L); // reserved
+
+        for (int i = 0; i < this.schema.columns.Count; i = i + 1) {
+            string colName = this.schema.columns[i].name;
+            if (this.indexes.ContainsKey(colName)) {
+                Dictionary<string, List<int>> map = this.indexes[colName];
+                byte[] nb = Encoding.GetBytes(colName);
+                int nlen = nb != null ? nb.Length : 0;
+                b.WriteU8(nlen);
+                for (int j = 0; j < nlen; j = j + 1) { b.WriteU8((int)nb[j]); }
+
+                List<string> keys = map.Keys;
+                b.WriteU32((long)keys.Count);
+                for (int k = 0; k < keys.Count; k = k + 1) {
+                    string key = keys[k];
+                    byte[] kb = Encoding.GetBytes(key);
+                    int klen = kb != null ? kb.Length : 0;
+                    b.WriteU16(klen);
+                    for (int j = 0; j < klen; j = j + 1) { b.WriteU8((int)kb[j]); }
+                    List<int> idList = map[key];
+                    int idCount = idList != null ? idList.Count : 0;
+                    b.WriteU32((long)idCount);
+                    for (int j = 0; j < idCount; j = j + 1) {
+                        b.WriteU32((long)idList[j]);
+                    }
+                }
+            }
+        }
+
+        PageFile pf = PageFile.Open(this.idxPath);
+        if (pf != null && pf.IsOpen()) {
+            pf.WriteAt(0, b.Raw(), b.Length());
+            pf.Sync();
+            pf.Close();
+        }
+        b.Free();
+    }
+
+    // 从 .zidx 文件装载二级索引
+    public bool LoadIndexesLocked() {
+        if (!File.Exists(this.idxPath)) { return false; }
+        PageFile pf = PageFile.OpenExisting(this.idxPath);
+        if (pf == null || !pf.IsOpen()) { return false; }
+
+        int fsize = pf.Size();
+        if (fsize < IDX_HEADER_SIZE) {
+            pf.Close();
+            return false;
+        }
+
+        ByteBuffer b = ByteBuffer.Alloc(fsize);
+        if (pf.ReadAt(0, b, fsize) != fsize) {
+            b.Free();
+            pf.Close();
+            return false;
+        }
+        pf.Close();
+
+        b.SeekRead(0);
+        string magic = b.Str(0, 4);
+        b.SeekRead(4);
+        int ver = (int)b.ReadU32();
+        int idxColCount = (int)b.ReadU32();
+        long tRows = b.ReadU64();
+        long aRows = b.ReadU64();
+        b.ReadU32(); // reserved
+
+        if (magic != MAGIC_IDX || ver != VERSION || (int)tRows != this.totalRows || (int)aRows != this.activeRows) {
+            b.Free();
+            return false;
+        }
+
+        this.indexes.Clear();
+        for (int c = 0; c < idxColCount; c = c + 1) {
+            int nlen = b.ReadU8();
+            byte[] nb = new byte[nlen];
+            for (int j = 0; j < nlen; j = j + 1) { nb[j] = (byte)b.ReadU8(); }
+            string colName = Encoding.GetString(nb, 0, nlen);
+
+            Dictionary<string, List<int>> map = new Dictionary<string, List<int>>();
+            int kCount = (int)b.ReadU32();
+            for (int k = 0; k < kCount; k = k + 1) {
+                int klen = b.ReadU16();
+                byte[] kb = new byte[klen];
+                for (int j = 0; j < klen; j = j + 1) { kb[j] = (byte)b.ReadU8(); }
+                string key = Encoding.GetString(kb, 0, klen);
+
+                int idCount = (int)b.ReadU32();
+                List<int> ids = new List<int>();
+                for (int j = 0; j < idCount; j = j + 1) {
+                    ids.Add((int)b.ReadU32());
+                }
+                map[key] = ids;
+            }
+            this.indexes[colName] = map;
+        }
+        b.Free();
+        return true;
+    }
+
     // 零拷贝全表顺序扫描
     public void Scan(RecordRowVisitor visitor) {
         this.tlock.EnterRead();
@@ -749,31 +1143,65 @@ public class RecordTable {
         }
     }
 
-    // 物理整理（Vacuum）：回收墓碑空洞
+    // 物理整理（Vacuum）：回收墓碑空洞与 .zblob 垃圾空间，并重建并持久化二级索引
     public void Vacuum() {
         this.tlock.EnterWrite();
         try {
-            if (!this.IsOpen() || this.tombstones.Count == 0) { return; }
+            if (!this.IsOpen()) { return; }
+            List<string> oldIndexCols = this.indexes.Keys;
             string vacBase = this.tabPath + ".vac";
             RecordTable tmp = RecordTable.Open(vacBase, this.name, this.schema);
             for (int id = 1; id <= this.totalRows; id = id + 1) {
                 if (!this.tombstones.ContainsKey(id)) {
                     RecordRow r = this.GetLocked(id);
-                    if (r != null) { tmp.Add(r); }
+                    if (r != null) {
+                        // 预先取出变长内容，确保搬迁至新库新 blob 文件
+                        for (int i = 0; i < this.schema.columns.Count; i = i + 1) {
+                            RecordColumn col = this.schema.columns[i];
+                            if (col.dataType == RecordDataType.VarStr) {
+                                r.varStrs[col.name] = r.GetVarStr(col.name);
+                            } else if (col.dataType == RecordDataType.Blob) {
+                                r.blobs[col.name] = r.GetBlob(col.name);
+                            }
+                        }
+                        tmp.Add(r);
+                    }
                 }
+            }
+            // 为新紧凑表重建原有二级索引
+            for (int i = 0; i < oldIndexCols.Count; i = i + 1) {
+                tmp.EnsureIndex(oldIndexCols[i]);
             }
             tmp.Flush();
             tmp.Close();
             this.file.Close();
+            if (this.blobFile != null && this.blobFile.IsOpen()) {
+                this.blobFile.Close();
+            }
+
             string tmpFile = vacBase + "." + this.name + ".ztab";
+            string tmpBlob = vacBase + "." + this.name + ".zblob";
+            string tmpIdx = vacBase + "." + this.name + ".zidx";
             if (File.Exists(this.tabPath)) { File.Delete(this.tabPath); }
             File.Move(tmpFile, this.tabPath);
+            if (File.Exists(tmpBlob)) {
+                if (File.Exists(this.blobPath)) { File.Delete(this.blobPath); }
+                File.Move(tmpBlob, this.blobPath);
+            }
+            if (File.Exists(tmpIdx)) {
+                if (File.Exists(this.idxPath)) { File.Delete(this.idxPath); }
+                File.Move(tmpIdx, this.idxPath);
+            } else if (File.Exists(this.idxPath)) {
+                File.Delete(this.idxPath);
+            }
+
             // 重新挂接文件
             this.file = PageFile.OpenExisting(this.tabPath);
+            this.OpenOrCreateBlobFileLocked();
             this.totalRows = tmp.TotalRows();
             this.activeRows = tmp.Count();
             this.tombstones.Clear();
-            this.indexes.Clear();
+            this.LoadIndexesLocked();
         } finally {
             this.tlock.ExitWrite();
         }
@@ -787,9 +1215,13 @@ public class RecordTable {
                 Mutex.Lock(this.ioMtx);
                 try {
                     this.file.Sync();
+                    if (this.blobFile != null && this.blobFile.IsOpen()) {
+                        this.blobFile.Sync();
+                    }
                 } finally {
                     Mutex.Unlock(this.ioMtx);
                 }
+                this.SaveIndexesLocked();
             }
         } finally {
             this.tlock.ExitWrite();
@@ -801,8 +1233,14 @@ public class RecordTable {
         try {
             if (this.file != null && this.file.IsOpen()) {
                 this.WriteHeaderLocked();
+                this.SaveIndexesLocked();
                 this.file.Sync();
                 this.file.Close();
+            }
+            if (this.blobFile != null && this.blobFile.IsOpen()) {
+                this.WriteBlobHeaderLocked();
+                this.blobFile.Sync();
+                this.blobFile.Close();
             }
             if (this.ioMtx != 0) {
                 Mutex.Destroy(this.ioMtx);
