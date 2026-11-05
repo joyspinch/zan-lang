@@ -1,3 +1,4 @@
+#include "main_options_parse.h"
 /* main */
 
 #include "zan.h"
@@ -61,8 +62,6 @@
 #include "../common/host_oom.h"
 
 #define ZAN_LINK_MAX_ARGV        8192
-#define ZAN_LINK_MAX_LIBS        2048
-#define ZAN_LINK_MAX_DIRS        1024
 #define ZAN_MAX_USED_DRIVERS     1024
 #define ZAN_MAX_STATIC_DRV_LIBS  2048
 #define ZAN_LINK_ARGV_TAIL        32
@@ -169,8 +168,8 @@ static void cmd_appendf(char *cmd, size_t cap, const char *fmt, ...) {
     }
 }
 
-static bool g_time_phases = false;
-static double g_phase_start = 0.0;
+bool g_time_phases = false;
+double g_phase_start = 0.0;
 
 typedef struct {
     size_t file_reads;
@@ -189,7 +188,7 @@ typedef struct {
 
 static zan_scale_stats_t g_scale_stats;
 
-static double now_ms(void) {
+double now_ms(void) {
 #ifdef _WIN32
     LARGE_INTEGER f, c;
     QueryPerformanceFrequency(&f);
@@ -486,7 +485,7 @@ static int input_file_present(const char *cand) {
     return 0;
 }
 
-static void input_files_push(const char ***files, int *count, int *cap,
+void input_files_push(const char ***files, int *count, int *cap,
                              const char *path) {
     if (*count == *cap) {
         int ncap = *cap ? *cap * 2 : 16;
@@ -585,7 +584,7 @@ static char **globbed_dirs = NULL;
 static int globbed_dir_count = 0;
 static int globbed_dir_cap = 0;
 static int missing_namespace_count = 0;
-static char package_project_root[1024] = ".";
+char package_project_root[1024] = ".";
 static char **project_namespaces = NULL;
 static int project_namespace_count = 0;
 static int project_namespace_cap = 0;
@@ -900,11 +899,11 @@ static int skip_project_dir(const char *name) {
  * 展开结果按路径字典序排序：目录遍历的原始顺序在 Windows 上不确定，而
  * 输入顺序会影响合并单元里 decl 的先后——可复现构建与差分门都要求稳定。
  */
-static int zan_path_cmp(const void *a, const void *b) {
+int zan_path_cmp(const void *a, const void *b) {
     return strcmp(*(const char *const *)a, *(const char *const *)b);
 }
 
-static bool zan_path_is_directory(const char *path) {
+bool zan_path_is_directory(const char *path) {
 #ifdef _WIN32
     return zan_utf8_is_directory(path) != 0;
 #else
@@ -913,7 +912,7 @@ static bool zan_path_is_directory(const char *path) {
 #endif
 }
 
-static void zan_collect_dir_sources(const char *dir, const char ***files,
+void zan_collect_dir_sources(const char *dir, const char ***files,
                                     int *count, int *cap) {
 #ifdef _WIN32
     char pattern[1024];
@@ -2287,7 +2286,7 @@ static void dump_ast_node(zan_ast_node_t *node, int depth) {
     }
 }
 
-static bool zan_dllimport_name_is_safe(const char *name, int len) {
+bool zan_dllimport_name_is_safe(const char *name, int len) {
     if (!name || len <= 0) return false;
     for (int i = 0; i < len; i++) {
         unsigned char c = (unsigned char)name[i];
@@ -3059,7 +3058,7 @@ static const char *zan_strcasestr(const char *haystack, const char *needle) {
     return NULL;
 }
 
-static int zan_query_api(const char *symbol_query) {
+int zan_query_api(const char *symbol_query) {
     if (!symbol_query || !*symbol_query) {
         fprintf(stderr, "error: --api requires a symbol name or fragment (e.g. 'Button' or 'File.ReadAllText')\n");
         return 1;
@@ -3441,23 +3440,74 @@ int main(int argc, char **argv) {
         LLVMParseCommandLineOptions(2, cl, "");
     }
     expand_arg_files(&argc, &argv);
-    for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "--version") == 0 || strcmp(argv[i], "-v") == 0) {
-            printf("zanc %s\n", ZAN_VERSION);
-            return 0;
-        }
-        if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
-            print_usage();
-            return 0;
-        }
-    }
-    if (argc < 2) {
-        print_usage();
-        return 1;
+        zan_options_t opts;
+    zan_options_status_t opt_st = zan_options_parse(argc, argv, &opts);
+    if (opt_st != ZAN_OPTIONS_OK) {
+        return opts.exit_code;
     }
 
-
-#include "main_options_parse.c"
+    const char *input_file = opts.input_file;
+    const char **input_files = opts.input_files;
+    int input_count = opts.input_count;
+    int input_cap = opts.input_cap;
+    int explicit_input_count = opts.explicit_input_count;
+    const char *output_file = opts.output_file;
+    bool do_dump_tokens = opts.do_dump_tokens;
+    bool do_dump_ast = opts.do_dump_ast;
+    const char *emit_symbols_path = opts.emit_symbols_path;
+    const char *gen_meta_path = opts.gen_meta_path;
+    bool do_emit_ir = opts.do_emit_ir;
+    int check_leaks_opt = opts.check_leaks_opt;
+    bool checked_arith = opts.checked_arith;
+    int arc_guard_opt = opts.arc_guard_opt;
+    int runtime_checks_opt = opts.runtime_checks_opt;
+    bool runtime_checks = opts.runtime_checks;
+    bool strict_runtime = opts.strict_runtime;
+    bool publish_mode = opts.publish_mode;
+    int obfuscate_strings_opt = opts.obfuscate_strings_opt;
+    bool hide_diagnostics = opts.hide_diagnostics;
+    const char *site_map_path = opts.site_map_path;
+    bool strip_symbols = opts.strip_symbols;
+    int error_limit = opts.error_limit;
+    bool debug_info = opts.debug_info;
+    int fast_alloc_opt = opts.fast_alloc_opt;
+    const char *stdlib_path = opts.stdlib_path;
+    bool auto_stdlib = opts.auto_stdlib;
+    bool packages_disabled = opts.packages_disabled;
+    bool quiet = opts.quiet;
+    const char *package_project = opts.package_project;
+    bool package_list_missing = opts.package_list_missing;
+    bool do_deny_warnings = opts.do_deny_warnings;
+    const char *warn_level_arg = opts.warn_level_arg;
+    const char *suppress_arg = opts.suppress_arg;
+    int opt_level = opts.opt_level;
+    const char **pp_defines = (const char **)opts.pp_defines;
+    int pp_define_count = opts.pp_define_count;
+    const char *target_name = opts.target_name;
+    bool link_static_drivers = opts.link_static_drivers;
+    const char *driver_dir_override = opts.driver_dir_override;
+    const char *link_subsystem = opts.link_subsystem;
+    const char *icon_path = opts.icon_path;
+    bool no_icon = opts.no_icon;
+    bool default_icon_explicit = opts.default_icon_explicit;
+    bool emit_lib = opts.emit_lib;
+    bool lib_shared = opts.lib_shared;
+    const char *apk_path = opts.apk_path;
+    const char *apk_package = opts.apk_package;
+    const char *apk_label = opts.apk_label;
+    const char *ipa_path = opts.ipa_path;
+    const char *ipa_bundle_id = opts.ipa_bundle_id;
+    const char *ipa_name = opts.ipa_name;
+    const char **extra_link_inputs = (const char **)opts.extra_link_inputs;
+    int extra_link_input_count = opts.extra_link_input_count;
+    const char **embed_specs = (const char **)opts.embed_specs;
+    int embed_spec_count = opts.embed_spec_count;
+    const char **extra_link_libs = (const char **)opts.extra_link_libs;
+    int extra_link_lib_count = opts.extra_link_lib_count;
+    const char **extra_lib_paths = (const char **)opts.extra_lib_paths;
+    int extra_lib_path_count = opts.extra_lib_path_count;
+    char resolved_stdlib_root[1024];
+    memcpy(resolved_stdlib_root, opts.resolved_stdlib_root, sizeof(resolved_stdlib_root));
 
     if (input_count == 0) {
         fprintf(stderr, "error: no input file\n");

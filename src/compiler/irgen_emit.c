@@ -1,3 +1,4 @@
+#include "irgen_internal.h"
 
 
 /* ---- B-ID92: 静态初始化依赖拓扑排序 ----
@@ -649,8 +650,7 @@ static int generic_variant_count(zan_irgen_t *g, zan_symbol_t *type_sym) {
         if (g->generic_insts[i].type_sym == type_sym) n++;
     return n;
 }
-
-static bool method_is_tp_template(zan_irgen_t *g, zan_ast_node_t *member);
+bool method_is_tp_template(zan_irgen_t *g, zan_ast_node_t *member);
 static bool class_member_uses_tp(zan_irgen_t *g, zan_ast_node_t *decl,
                                  zan_ast_node_t *member);
 
@@ -2401,8 +2401,7 @@ static void tp_scan_stmt(tp_use_scan_t *s, zan_ast_node_t *st) {
         return;
     }
 }
-
-static bool method_is_tp_template(zan_irgen_t *g, zan_ast_node_t *member) {
+bool method_is_tp_template(zan_irgen_t *g, zan_ast_node_t *member) {
     if (!member || member->kind != AST_METHOD_DECL) return false;
     zan_ast_list_t *tps = &member->method_decl.type_params;
     if (tps->count == 0 || !member->method_decl.body) return false;
@@ -2471,8 +2470,7 @@ static bool mspec_owner_eq(zan_type_t *a, zan_type_t *b) {
     return type_arglists_equal(a->type_args, a->type_arg_count,
                                b->type_args, b->type_arg_count);
 }
-
-static int get_or_create_method_spec(zan_irgen_t *g, zan_symbol_t *msym,
+int get_or_create_method_spec(zan_irgen_t *g, zan_symbol_t *msym,
                                      zan_type_t **bind, int bindc,
                                      zan_type_t *owner_inst) {
     if (!msym || !msym->decl || msym->decl->kind != AST_METHOD_DECL) return -1;
@@ -2777,8 +2775,7 @@ static void emit_method_spec_body(zan_irgen_t *g, int idx) {
     else if (g->function_compactor) LLVMClearInsertionPosition(g->builder);
     zan_irgen_compact_completed(g, sp.fn);
 }
-
-static void emit_pending_method_specs(zan_irgen_t *g) {
+void emit_pending_method_specs(zan_irgen_t *g) {
     while (g->method_spec_emitted < g->method_spec_count) {
         int i = g->method_spec_emitted++;
         emit_method_spec_body(g, i);
@@ -3421,8 +3418,7 @@ void zan_irgen_init_llvm_targets(void) {
     LLVMInitializeRISCVAsmPrinter();
 #endif
 }
-
-static zan_status_t zan_bind_target_layout(zan_irgen_t *g,
+zan_status_t zan_bind_target_layout(zan_irgen_t *g,
                                            LLVMTargetMachineRef *out_tm) {
     char *triple;
     if (g->target_triple[0]) {

@@ -1,3 +1,4 @@
+#include "irgen_internal.h"
 
 #define ZAN_WEAK_BUCKET_COUNT 8192
 
@@ -403,11 +404,9 @@ static void emit_weak_load_retain_body(zan_irgen_t *g) {
     emit_weak_unlock(g);
     LLVMBuildRet(b, v);
 }
-
-static void emit_defer_fallback(zan_irgen_t *g);
+void emit_defer_fallback(zan_irgen_t *g);
 static void emit_live_registry_fallback(zan_irgen_t *g);
-
-static void emit_weak_runtime(zan_irgen_t *g) {
+void emit_weak_runtime(zan_irgen_t *g) {
     LLVMTypeRef i8ptr = weak_i8ptr(g);
     LLVMTypeRef slot_t = weak_slot_type(g);
     LLVMTypeRef i32 = LLVMInt32TypeInContext(g->ctx);
@@ -484,7 +483,7 @@ static void emit_weak_runtime(zan_irgen_t *g) {
  * 同语义，不泄漏、不挂队列，深树级联在该形态回到 B-ID78 前的同步递归。
  * 必须在 defer 声明建成之后调用：LLVMAddFunction 不查重名，先建会让
  * release_dyn 的同名声明被 mangler 改名（zan_rt_defer_push.5）而指空。 */
-static void emit_defer_fallback(zan_irgen_t *g) {
+void emit_defer_fallback(zan_irgen_t *g) {
     if (!g->rt_defer_push || !g->rt_defer_pending || !g->rt_defer_drain)
         return;
     /* 调用点位于 rt_release_dyn 构造中段，builder 停在 tail_bb——发完回退体
@@ -578,8 +577,7 @@ static void emit_live_registry_fallback(zan_irgen_t *g) {
 
     if (saved_bb) LLVMPositionBuilderAtEnd(g->builder, saved_bb);
 }
-
-static void emit_weak_store(zan_irgen_t *g, LLVMValueRef field_ptr,
+void emit_weak_store(zan_irgen_t *g, LLVMValueRef field_ptr,
                             LLVMValueRef value) {
     LLVMTypeRef i8ptr = weak_i8ptr(g);
     LLVMTypeRef slot_t = weak_slot_type(g);
@@ -592,8 +590,7 @@ static void emit_weak_store(zan_irgen_t *g, LLVMValueRef field_ptr,
     zan_call2(g->builder, LLVMGlobalGetValueType(g->rt_weak_store),
               g->rt_weak_store, args, 2, "");
 }
-
-static LLVMValueRef emit_weak_field_load(zan_irgen_t *g, LLVMValueRef field_ptr,
+LLVMValueRef emit_weak_field_load(zan_irgen_t *g, LLVMValueRef field_ptr,
                                          LLVMTypeRef val_ty) {
     LLVMTypeRef i8ptr = weak_i8ptr(g);
     LLVMTypeRef slot_t = weak_slot_type(g);

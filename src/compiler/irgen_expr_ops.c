@@ -1,6 +1,6 @@
+#include "irgen_internal.h"
 /* 表达式 AST 节点发射器实现 */
-
-static LLVMValueRef emit_expr_identifier(zan_irgen_t *g, zan_ast_node_t *expr,
+LLVMValueRef emit_expr_identifier(zan_irgen_t *g, zan_ast_node_t *expr,
         local_scope_t *locals) {
         local_var_t *local = local_find(locals, expr->ident.name);
         if (local) {
@@ -109,8 +109,7 @@ static LLVMValueRef emit_expr_identifier(zan_irgen_t *g, zan_ast_node_t *expr,
         return LLVMConstInt(LLVMInt64TypeInContext(g->ctx), 0, 0);
     return LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 0, 0);
 }
-
-static LLVMValueRef load_collection_slot_value(zan_irgen_t *g,
+LLVMValueRef load_collection_slot_value(zan_irgen_t *g,
                                                 zan_type_t *elem_type,
                                                 LLVMValueRef slot_ptr) {
     LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
@@ -133,8 +132,7 @@ static LLVMValueRef load_collection_slot_value(zan_irgen_t *g,
         return LLVMBuildTrunc(g->builder, raw, elem_llvm, "slot.int");
     return raw;
 }
-
-static void emit_dict_value_set(zan_irgen_t *g, zan_type_t *dict_type,
+void emit_dict_value_set(zan_irgen_t *g, zan_type_t *dict_type,
                                 LLVMValueRef raw, LLVMValueRef key,
                                 LLVMValueRef value, zan_ast_node_t *key_expr,
                                 zan_ast_node_t *value_expr,
@@ -180,8 +178,7 @@ static void emit_dict_value_set(zan_irgen_t *g, zan_type_t *dict_type,
     LLVMBuildBr(g->builder, done_bb);
     LLVMPositionBuilderAtEnd(g->builder, done_bb);
 }
-
-static LLVMValueRef emit_typed_equality(zan_irgen_t *g, zan_type_t *type,
+LLVMValueRef emit_typed_equality(zan_irgen_t *g, zan_type_t *type,
                                          LLVMValueRef left,
                                          LLVMValueRef right) {
     type = concretize(g, type);
@@ -311,8 +308,7 @@ static LLVMValueRef emit_nullable_binary(zan_irgen_t *g, zan_ast_node_t *expr,
  * 返回 NULL 表示形态覆盖不了，调用方回退旧的急切两臂路径。 */
 static LLVMValueRef emit_null_coalesce(zan_irgen_t *g, zan_ast_node_t *expr,
                                        local_scope_t *locals);
-
-static LLVMValueRef coerce_to_decimal(zan_irgen_t *g, LLVMValueRef val) {
+LLVMValueRef coerce_to_decimal(zan_irgen_t *g, LLVMValueRef val) {
     LLVMTypeRef dec_ty = get_decimal_type(g);
     if (!val || LLVMTypeOf(val) == dec_ty) return val;
     LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
@@ -410,8 +406,7 @@ static LLVMValueRef emit_decimal_binary(zan_irgen_t *g, zan_ast_node_t *expr,
     }
     return left;
 }
-
-static LLVMValueRef emit_expr_binary(zan_irgen_t *g, zan_ast_node_t *expr,
+LLVMValueRef emit_expr_binary(zan_irgen_t *g, zan_ast_node_t *expr,
         local_scope_t *locals) {
         /* 短路逻辑运算符（&& / ||）：左操作数满足短路条件时不求值右操作数 */
         if (expr->binary.op == TK_AMP_AMP || expr->binary.op == TK_PIPE_PIPE) {
@@ -751,7 +746,7 @@ static LLVMValueRef emit_expr_binary(zan_irgen_t *g, zan_ast_node_t *expr,
 }
 
 /* 判断表达式运行时是否可能包含 string 对象 */
-static bool recv_is_stringlike(zan_irgen_t *g, zan_ast_node_t *e,
+bool recv_is_stringlike(zan_irgen_t *g, zan_ast_node_t *e,
                                local_scope_t *locals) {
     zan_type_t *t = infer_expr_type(g, e, locals);
     if (!t) return true;
@@ -1303,8 +1298,7 @@ static LLVMValueRef emit_nullable_binary(zan_irgen_t *g, zan_ast_node_t *expr,
     if (!some) return res;
     return LLVMBuildSelect(g->builder, both, some, nullable_none(nty), "nv.lift");
 }
-
-static LLVMValueRef emit_incdec_expr(zan_irgen_t *g, zan_ast_node_t *expr,
+LLVMValueRef emit_incdec_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                                      local_scope_t *locals, int is_prefix);
 
 /* 一元运算符重载：类/结构体上的 static `operator -` / `operator +`。
@@ -1398,8 +1392,7 @@ static LLVMValueRef emit_unary_op_overload(zan_irgen_t *g, zan_ast_node_t *expr,
     emit_release_owned_call_temp(g, expr->unary.operand, arg, locals);
     return res;
 }
-
-static LLVMValueRef emit_expr_unary(zan_irgen_t *g, zan_ast_node_t *expr,
+LLVMValueRef emit_expr_unary(zan_irgen_t *g, zan_ast_node_t *expr,
         local_scope_t *locals) {
     if (expr->unary.op == TK_PLUS_PLUS || expr->unary.op == TK_MINUS_MINUS)
         return emit_incdec_expr(g, expr, locals, 1);
@@ -1470,14 +1463,13 @@ static LLVMValueRef emit_expr_unary(zan_irgen_t *g, zan_ast_node_t *expr,
 }
 
 /* Binding<T> 属性与字段双向绑定原语降解 */
-
-static int type_is_binding(zan_type_t *t) {
+int type_is_binding(zan_type_t *t) {
     return t && t->kind == TYPE_CLASS && t->name.len == 7 &&
            memcmp(t->name.str, "Binding", 7) == 0;
 }
 
 /* 泛型类上的委托字段签名特化与解析 */
-static zan_type_t *subst_delegate_sig(zan_irgen_t *g, zan_type_t *t,
+zan_type_t *subst_delegate_sig(zan_irgen_t *g, zan_type_t *t,
                                       zan_type_t *recv) {
     if (!t || t->kind != TYPE_DELEGATE || !recv || recv->type_arg_count <= 0)
         return t;
@@ -1605,7 +1597,7 @@ static void get_binding_accessors(zan_irgen_t *g, zan_symbol_t *cls,
 }
 
 /* 为右值构建 Binding<T> 实例对象（返回 +1 持有引用） */
-static LLVMValueRef emit_binding_value(zan_irgen_t *g, zan_type_t *bind_t,
+LLVMValueRef emit_binding_value(zan_irgen_t *g, zan_type_t *bind_t,
         zan_ast_node_t *rhs, local_scope_t *locals) {
     /* b = null 清除数据绑定状态 */
     if (rhs && rhs->kind == AST_NULL_LITERAL) return NULL;
@@ -1761,13 +1753,11 @@ static LLVMValueRef console_color_slot(zan_irgen_t *g, int is_bg) {
     }
     return slot;
 }
-
-static LLVMValueRef emit_console_color_get(zan_irgen_t *g, int is_bg) {
+LLVMValueRef emit_console_color_get(zan_irgen_t *g, int is_bg) {
     return LLVMBuildLoad2(g->builder, LLVMInt64TypeInContext(g->ctx),
                           console_color_slot(g, is_bg), "concolor");
 }
-
-static void emit_console_color_reset(zan_irgen_t *g) {
+void emit_console_color_reset(zan_irgen_t *g) {
     LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
     LLVMBuildStore(g->builder,
         LLVMConstInt(i64, ZAN_CONSOLE_FG_DEFAULT, 0), console_color_slot(g, 0));
@@ -1822,7 +1812,7 @@ static void emit_console_title(zan_irgen_t *g, LLVMValueRef s) {
 }
 
 /* 字段写入操作所需处理的真实存储类型推导 */
-static zan_type_t *field_store_type(zan_irgen_t *g, zan_symbol_t *fsym,
+zan_type_t *field_store_type(zan_irgen_t *g, zan_symbol_t *fsym,
                                     zan_type_t *recv) {
     zan_type_t *t = field_type_at(g, fsym, recv);
     if (!t) return NULL;
@@ -1839,8 +1829,7 @@ static zan_symbol_t *field_sym_for_decl(zan_symbol_t *type_sym,
     }
     return NULL;
 }
-
-static void emit_decl_field_initializers(zan_irgen_t *g,
+void emit_decl_field_initializers(zan_irgen_t *g,
                                          zan_symbol_t *type_sym,
                                          zan_type_t *recv_type,
                                          LLVMValueRef object_ptr,
@@ -1909,8 +1898,7 @@ static void emit_decl_field_initializers(zan_irgen_t *g,
     g->current_this = saved_this;
     g->current_type_sym = saved_type_sym;
 }
-
-static void emit_implicit_field_initializers(zan_irgen_t *g,
+void emit_implicit_field_initializers(zan_irgen_t *g,
                                              zan_symbol_t *type_sym,
                                              zan_type_t *recv_type,
                                              LLVMValueRef object_ptr,
@@ -1925,7 +1913,7 @@ static void emit_implicit_field_initializers(zan_irgen_t *g,
 }
 
 /* 判断接收者表达式是否持有消费方需释放的所有权引用 */
-static int receiver_is_owned_temp(zan_irgen_t *g, zan_ast_node_t *object,
+int receiver_is_owned_temp(zan_irgen_t *g, zan_ast_node_t *object,
                                   local_scope_t *locals, zan_type_t *obj_type,
                                   LLVMValueRef obj_val) {
     return obj_val && obj_type && is_rc_managed_type(obj_type) &&
@@ -1934,7 +1922,7 @@ static int receiver_is_owned_temp(zan_irgen_t *g, zan_ast_node_t *object,
 }
 
 /* 链式调用中的临时接收者对象在访问完成后及时释放 */
-static LLVMValueRef finish_member_of_temp(zan_irgen_t *g, zan_ast_node_t *expr,
+LLVMValueRef finish_member_of_temp(zan_irgen_t *g, zan_ast_node_t *expr,
                                           local_scope_t *locals,
                                           zan_type_t *obj_type,
                                           LLVMValueRef obj_val, LLVMValueRef fv) {
@@ -1969,16 +1957,16 @@ static void check_readonly_store(zan_irgen_t *g, zan_ast_node_t *lhs,
 }
 
 /* 用户自定义隐式/显式类型转换运算符 */
-static zan_symbol_t *find_user_conversion(zan_irgen_t *g, zan_type_t *from_type,
+zan_symbol_t *find_user_conversion(zan_irgen_t *g, zan_type_t *from_type,
                                           zan_type_t *to_type,
                                           const char *op_name);
-static LLVMValueRef emit_user_conversion(zan_irgen_t *g, zan_type_t *from_type,
+LLVMValueRef emit_user_conversion(zan_irgen_t *g, zan_type_t *from_type,
                                          zan_type_t *to_type, const char *op_name,
                                          LLVMValueRef val, zan_ast_node_t *val_expr,
                                          local_scope_t *locals);
 
 /* 多维矩形数组元素寻址：结合各维度形状计算一维平铺偏移 */
-static LLVMValueRef emit_mdarray_elem_ptr(zan_irgen_t *g, LLVMValueRef arr_ptr,
+LLVMValueRef emit_mdarray_elem_ptr(zan_irgen_t *g, LLVMValueRef arr_ptr,
         zan_ast_node_t *expr, LLVMTypeRef elem_llvm, local_scope_t *locals,
         LLVMValueRef *out_oob) {
     LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
@@ -2089,7 +2077,7 @@ static void ca_hoist_spine(zan_irgen_t *g, zan_ast_node_t **slot,
 }
 
 /* 计算索引表达式 (AST_INDEX) 选中的目标元素内存地址 */
-static LLVMValueRef emit_struct_elem_ptr(zan_irgen_t *g, zan_ast_node_t *expr,
+LLVMValueRef emit_struct_elem_ptr(zan_irgen_t *g, zan_ast_node_t *expr,
                                          local_scope_t *locals) {
     zan_ast_node_t *base = expr->index.object;
     zan_type_t *bt = infer_expr_type(g, base, locals);
@@ -2143,11 +2131,10 @@ static LLVMValueRef emit_struct_elem_ptr(zan_irgen_t *g, zan_ast_node_t *expr,
     }
     return NULL;
 }
-
-static LLVMValueRef emit_ref_lvalue_ptr(zan_irgen_t *g, zan_ast_node_t *tgt,
+LLVMValueRef emit_ref_lvalue_ptr(zan_irgen_t *g, zan_ast_node_t *tgt,
                                         local_scope_t *locals);
-static bool irgen_boxed_eligible_struct(zan_irgen_t *g, zan_type_t *t);
-static LLVMValueRef emit_box_struct(zan_irgen_t *g, zan_type_t *st,
+bool irgen_boxed_eligible_struct(zan_irgen_t *g, zan_type_t *t);
+LLVMValueRef emit_box_struct(zan_irgen_t *g, zan_type_t *st,
                                     zan_ast_node_t *src_expr,
                                     LLVMValueRef val, local_scope_t *locals);
 
@@ -2157,7 +2144,7 @@ static LLVMValueRef emit_box_struct(zan_irgen_t *g, zan_type_t *st,
  * 由 emit_box_struct 按操作数 owned 性处理。目标不是引用槽或值已是
  * 指针时原样返回。装箱发生后把 RHS 节点登记进 boxed 集合
  * （irgen_note_boxed_expr），下游所有权判定按 owned 走。 */
-static LLVMValueRef emit_implicit_box(zan_irgen_t *g, zan_type_t *lt,
+LLVMValueRef emit_implicit_box(zan_irgen_t *g, zan_type_t *lt,
                                       LLVMValueRef val, zan_ast_node_t *rhs,
                                       local_scope_t *locals) {
     if (!val || !lt || !rhs) return val;
@@ -2180,9 +2167,7 @@ static LLVMValueRef emit_implicit_box(zan_irgen_t *g, zan_type_t *lt,
     irgen_note_boxed_expr(g, rhs);
     return emit_box_struct(g, st, rhs, val, locals);
 }
-
-
-    static LLVMValueRef emit_expr_assignment(zan_irgen_t *g, zan_ast_node_t *expr,
+LLVMValueRef emit_expr_assignment(zan_irgen_t *g, zan_ast_node_t *expr,
             local_scope_t *locals) {
             LLVMValueRef right;
             /* 元组解构赋值降解处理 */
@@ -3208,12 +3193,11 @@ binding_lowered:
         return right;
     return LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 0, 0);
 }
-
-static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
+LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
         local_scope_t *locals);
 
 /* 前缀/后缀自增自减 (++ / --) 共享降解发射：操作数原地更新 */
-static LLVMValueRef emit_incdec_expr(zan_irgen_t *g, zan_ast_node_t *expr,
+LLVMValueRef emit_incdec_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                                      local_scope_t *locals, int is_prefix) {
     zan_ast_node_t *operand = expr->unary.operand;
     LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);

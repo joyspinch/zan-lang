@@ -1,3 +1,4 @@
+#include "irgen_internal.h"
 
 #define ZAN_REFL_FULLNAME_OFF (-112) /* B-ID107：头部 i8ptr，尾部倒数 OFF 不变 */
 #define ZAN_REFL_ATTRS_OFF   (-104)
@@ -85,8 +86,7 @@
 #define ZAN_REFL_WHICH_CUSTOM 2
 #define ZAN_REFL_WHICH_DEFAULT 3
 #define ZAN_REFL_WHICH_ATTRS 4
-
-static LLVMValueRef refl_meta_for(zan_irgen_t *g, zan_type_t *t,
+LLVMValueRef refl_meta_for(zan_irgen_t *g, zan_type_t *t,
                                   const char *disp, int disp_len);
 
 static LLVMTypeRef refl_field_type(zan_irgen_t *g) {
@@ -800,9 +800,9 @@ static LLVMValueRef refl_method_record(zan_irgen_t *g, zan_symbol_t *sym,
 
 /* Unity 前向声明：定义在 irgen_builtins.c / irgen_expr_ops.c（unity 序列
    在本文件之后）。 */
-static void emit_eh_tmp_push(zan_irgen_t *g, LLVMValueRef obj);
-static void emit_eh_tmp_pop(zan_irgen_t *g);
-static void emit_implicit_field_initializers(zan_irgen_t *g,
+void emit_eh_tmp_push(zan_irgen_t *g, LLVMValueRef obj);
+void emit_eh_tmp_pop(zan_irgen_t *g);
+void emit_implicit_field_initializers(zan_irgen_t *g,
     zan_symbol_t *type_sym, zan_type_t *recv_type, LLVMValueRef object_ptr,
     local_scope_t *locals);
 
@@ -1782,8 +1782,7 @@ static int render_type_short(zan_type_t *t, char *buf, int cap) {
     if (n < cap) buf[n] = '\0';
     return n;
 }
-
-static LLVMValueRef refl_meta_for(zan_irgen_t *g, zan_type_t *t,
+LLVMValueRef refl_meta_for(zan_irgen_t *g, zan_type_t *t,
                                   const char *disp, int disp_len) {
     char namebuf[256];
     if (!disp || disp_len <= 0) {
@@ -1961,8 +1960,7 @@ void refl_reserve_thunk_sites(zan_irgen_t *g) {
         g->refl_mtabs[i].site = reserve_arc_site(g, sym, sym->type, 0, NULL);
     }
 }
-
-static void refl_finalize_mtabs(zan_irgen_t *g) {
+void refl_finalize_mtabs(zan_irgen_t *g) {
     for (int i = 0; i < g->refl_mtab_count; i++) {
         LLVMValueRef init = refl_mtab_init(g, g->refl_mtabs[i].sym,
                                            g->refl_mtabs[i].ctors,
@@ -2566,8 +2564,7 @@ static LLVMValueRef refl_fname_fn(zan_irgen_t *g) {
     if (save) LLVMPositionBuilderAtEnd(g->builder, save);
     return fn;
 }
-
-static LLVMValueRef refl_obj_type_fn(zan_irgen_t *g) {
+LLVMValueRef refl_obj_type_fn(zan_irgen_t *g) {
     if (g->fn_refl_obj_type) return g->fn_refl_obj_type;
     LLVMTypeRef i8 = LLVMInt8TypeInContext(g->ctx);
     LLVMTypeRef i8ptr = LLVMPointerType(i8, 0);
@@ -3432,7 +3429,7 @@ static LLVMValueRef refl_pack_args(zan_irgen_t *g, zan_ast_node_t **args,
 }
 
 /* `ti */
-static bool refl_emit_typeinfo_member(zan_irgen_t *g, LLVMValueRef ti,
+bool refl_emit_typeinfo_member(zan_irgen_t *g, LLVMValueRef ti,
                                       zan_istr_t name,
                                       zan_ast_node_t **args, int argc,
                                       local_scope_t *locals,
@@ -3865,8 +3862,7 @@ static bool refl_emit_instance_call_1(zan_irgen_t *g, zan_type_t *rt,
     *out = code == ZAN_REFL_M_OINT ? LLVMBuildTrunc(g->builder, v, i32, "refl.i32") : v;
     return true;
 }
-
-static bool refl_emit_instance_call(zan_irgen_t *g, zan_type_t *rt,
+bool refl_emit_instance_call(zan_irgen_t *g, zan_type_t *rt,
                                     LLVMValueRef recv, zan_istr_t name,
                                     zan_ast_node_t **args, int argc,
                                     local_scope_t *locals, LLVMValueRef *out) {
@@ -3880,8 +3876,7 @@ static bool refl_emit_instance_call(zan_irgen_t *g, zan_type_t *rt,
         emit_release_owned_call_temp(g, args[1], val_tmp, locals);
     return true;
 }
-
-static void emit_site_meta_table(zan_irgen_t *g) {
+void emit_site_meta_table(zan_irgen_t *g) {
     if (!g->refl_used || !g->g_site_meta || !g->site_syms) return;
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
     int n = g->leak_site_count;
@@ -3912,8 +3907,7 @@ static void emit_site_meta_table(zan_irgen_t *g) {
         LLVMConstBitCast(arr, LLVMPointerType(i8ptr, 0)));
     free(elems);
 }
-
-static bool refl_type_needs_site_meta(zan_irgen_t *g, zan_symbol_t *sym) {
+bool refl_type_needs_site_meta(zan_irgen_t *g, zan_symbol_t *sym) {
     if (!g->publish_mode) return true;
     if (!sym || !sym->type) return false;
     /* 1. 带注解特性的类型必须保留 */

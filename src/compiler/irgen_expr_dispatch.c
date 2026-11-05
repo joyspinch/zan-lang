@@ -1,4 +1,5 @@
-static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_t *locals) {
+#include "irgen_internal.h"
+LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_t *locals) {
     if (!expr) return LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 0, 0);
     if (locals) g->current_locals = locals;
     if (g->emit_debug && expr->loc.line > 0) {

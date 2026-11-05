@@ -1,5 +1,6 @@
+#include "irgen_internal.h"
 /* irgen_call.c - 表达式调用求值、虚表与实例分发、方法重载解析与未解析诊断 */
-static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
+LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
         local_scope_t *locals) {
     bool matched = false;
     /* B-ID62: 符号级 Intrinsic 分发门控。

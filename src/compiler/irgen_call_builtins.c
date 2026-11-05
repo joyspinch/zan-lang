@@ -1,3 +1,4 @@
+#include "irgen_internal.h"
 /* irgen_call_builtins.c - 语言内置原语、数学、字符串、IO 与系统调用求值拦截 */
 
 /* 按**目标**平台选 TLS errno 取址函数并清零，返回 errno 槽位指针。
@@ -22,8 +23,7 @@ static LLVMValueRef emit_errno_preset(zan_irgen_t *g, LLVMTypeRef i32t) {
     LLVMBuildStore(g->builder, LLVMConstInt(i32t, 0, 0), errnop);
     return errnop;
 }
-
-static LLVMValueRef emit_builtin_call_intercept(zan_irgen_t *g, zan_ast_node_t *expr,
+LLVMValueRef emit_builtin_call_intercept(zan_irgen_t *g, zan_ast_node_t *expr,
                                                 local_scope_t *locals, bool *matched) {
     if (matched) *matched = true;
         if (expr->call.callee && expr->call.callee->kind == AST_IDENTIFIER &&

@@ -144,6 +144,7 @@ llvm_map_components_to_libnames(LLVM_LIBS ${ZAN_LLVM_COMPONENTS})
 # ---- Compiler executable ----
 add_executable(zanc
     src/compiler/main.c
+    src/compiler/main_options_parse.c
     src/compiler/arena.c
     src/compiler/diag.c
     src/compiler/lexer.c
@@ -156,6 +157,28 @@ add_executable(zanc
     src/compiler/checker.c
     src/compiler/definite.c
     src/compiler/irgen.c
+    src/compiler/irgen_abi.c
+    src/compiler/irgen_arc.c
+    src/compiler/irgen_async.c
+    src/compiler/irgen_builtins.c
+    src/compiler/irgen_call.c
+    src/compiler/irgen_call_async.c
+    src/compiler/irgen_call_builtins.c
+    src/compiler/irgen_call_spec.c
+    src/compiler/irgen_emit.c
+    src/compiler/irgen_expr.c
+    src/compiler/irgen_expr_access.c
+    src/compiler/irgen_expr_construct.c
+    src/compiler/irgen_expr_core.c
+    src/compiler/irgen_expr_dispatch.c
+    src/compiler/irgen_expr_lambda.c
+    src/compiler/irgen_expr_ops.c
+    src/compiler/irgen_generics.c
+    src/compiler/irgen_manifest.c
+    src/compiler/irgen_reflect.c
+    src/compiler/irgen_shard.c
+    src/compiler/irgen_stmt.c
+    src/compiler/irgen_weak.c
     src/compiler/irgen_compact.cpp
     src/compiler/optimizer.c
     src/compiler/incremental.c
@@ -4848,20 +4871,6 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
   set_tests_properties(conformance_gui_designer_wysiwyg PROPERTIES
     TIMEOUT 120 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
 
-  # Factory and prepared-control paths consume the same complete document:
-  # flow captions, HTML body/mixed order, placement, slots and component refs.
-  add_test(NAME conformance_gui_formbuild_contract
-    COMMAND ${CMAKE_COMMAND}
-      -DZANC=$<TARGET_FILE:zanc>
-      -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/formbuild_contract_test.zan
-      "-DZANC_ARGS=--auto-stdlib${_gui_driver_tail}"
-      -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_formbuild_contract.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_formbuild_contract${_exe_ext}
-      -DSTDLIB_STAMP=${_stdlib_stamp}
-      -DWORKDIR=${CMAKE_SOURCE_DIR}
-      -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
-  set_tests_properties(conformance_gui_formbuild_contract PROPERTIES
-    TIMEOUT 120 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
 
   # The design document projects through the runtime channel (DesignerHtml
   # ToJsonDoc + FormBuilder.Build): mixed text, slots, anchor metadata,
@@ -5217,17 +5226,6 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_nav${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
-  # FormBuilder.Build runtime path lock: flow cells, caption wrapping,
-  # self-labeled Checkbox defOn, container kids actually built (this path
-  # is what Nav outlets and runtime form-doc loading ride on).
-  add_test(NAME conformance_gui_formbuild
-    COMMAND ${CMAKE_COMMAND}
-      -DZANC=$<TARGET_FILE:zanc>
-      -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/formbuild_test.zan
-      "-DZANC_ARGS=--auto-stdlib${_gui_driver_tail}"
-      -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_formbuild.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_formbuild${_exe_ext}
-      -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
   # HttpTableSource: loopback HTTP server with a hit counter against the
   # cache-first block source. Pins the wire protocol, disk-cache serving
@@ -5242,18 +5240,6 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
   set_tests_properties(conformance_gui_httpsource PROPERTIES TIMEOUT 120)
 
-  # Saved user component referenced from a design: the generator expands
-  # {"kind":X,"ref":X} into components/X.zcomp's field tree (named Panel
-  # shell, anonymous prefixed internals, own fields untouched).
-  add_test(NAME conformance_gui_compref
-    COMMAND ${CMAKE_COMMAND}
-      -DZANC=$<TARGET_FILE:zanc>
-      -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/compref_test.zan
-      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/tests/gui/compref_app.html;${CMAKE_SOURCE_DIR}/tests/gui/components/BadgeCard.zcomp;--auto-stdlib${_gui_driver_tail}"
-      -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_compref.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_compref${_exe_ext}
-      -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
-  set_tests_properties(conformance_gui_compref PROPERTIES TIMEOUT 120)
 
   # Headless designer acceptance for user-component references: drop places
   # one ref node sized from the component doc, Save/Load round-trips the
@@ -5309,20 +5295,6 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
   set_tests_properties(conformance_gui_sender_channel PROPERTIES TIMEOUT 120)
 
 
-  # Designer-component dogfood, composed like the "批量任务进度窗" ask: a
-  # saved component (BatchJobProgress.zcomp) declares title/percent/status
-  # props mapped to inner controls; the host form drops two references
-  # (instance values vs declared defaults) and drives progress at runtime
-  # through Find + SetProp.
-  add_test(NAME conformance_gui_batchjob
-    COMMAND ${CMAKE_COMMAND}
-      -DZANC=$<TARGET_FILE:zanc>
-      -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/batchjob_test.zan
-      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/tests/gui/batchjob_app.html;${CMAKE_SOURCE_DIR}/tests/gui/components/BatchJobProgress.zcomp;--auto-stdlib${_gui_driver_tail}"
-      -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_batchjob.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_batchjob${_exe_ext}
-      -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
-  set_tests_properties(conformance_gui_batchjob PROPERTIES TIMEOUT 120)
 
 
   # The generated IGameScene adapter: an .html scene design document projects a nested

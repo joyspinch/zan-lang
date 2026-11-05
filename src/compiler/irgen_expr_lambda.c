@@ -1,3 +1,4 @@
+#include "irgen_internal.h"
 /* Lambda 表达式变量捕获与闭包环境生成 */
 typedef struct {
     zan_istr_t   name;
@@ -453,10 +454,10 @@ static LLVMValueRef build_closure_dtor(zan_irgen_t *g, const char *lname,
 }
 
 /* 在当前帧分配并初始化闭包记录 */
-static LLVMValueRef emit_box_cell(zan_irgen_t *g, zan_loc_t loc,
+LLVMValueRef emit_box_cell(zan_irgen_t *g, zan_loc_t loc,
                                   LLVMTypeRef payload, zan_type_t *vtype,
                                   LLVMValueRef init);
-static LLVMValueRef box_value_ptr(zan_irgen_t *g, LLVMValueRef cell,
+LLVMValueRef box_value_ptr(zan_irgen_t *g, LLVMValueRef cell,
                                   LLVMTypeRef payload);
 static LLVMValueRef emit_closure_record(zan_irgen_t *g, zan_loc_t loc,
                                         const char *lname, LLVMTypeRef rec_ty,
@@ -793,15 +794,14 @@ static int body_writes_ident_scan(zan_irgen_t *g, zan_ast_node_t *body,
     cap_scan_free(&cs);
     return found;
 }
-
-static int body_writes_ident(zan_irgen_t *g, zan_ast_node_t *body,
+int body_writes_ident(zan_irgen_t *g, zan_ast_node_t *body,
                              zan_istr_t name) {
     if (!body || !name.len) return 0;
     return body_writes_ident_memo(g, body, name);
 }
 
 /* 判断当前编译函数内的 Lambda 是否捕获了该声明变量 */
-static int local_is_lambda_captured(zan_irgen_t *g, local_scope_t *locals,
+int local_is_lambda_captured(zan_irgen_t *g, local_scope_t *locals,
                                     zan_ast_node_t *body,
                                     zan_ast_node_t *decl) {
     (void)locals;
@@ -843,8 +843,7 @@ static int local_is_lambda_captured(zan_irgen_t *g, local_scope_t *locals,
     cap_scan_free(&cs);
     return found;
 }
-
-static LLVMValueRef emit_box_cell(zan_irgen_t *g, zan_loc_t loc,
+LLVMValueRef emit_box_cell(zan_irgen_t *g, zan_loc_t loc,
                                   LLVMTypeRef payload, zan_type_t *vtype,
                                   LLVMValueRef init) {
     LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
@@ -885,14 +884,14 @@ static LLVMValueRef emit_box_cell(zan_irgen_t *g, zan_loc_t loc,
 }
 
 /* 装箱局部变量存储槽：指针直达 cell 内部的值字段 */
-static LLVMValueRef box_value_ptr(zan_irgen_t *g, LLVMValueRef cell,
+LLVMValueRef box_value_ptr(zan_irgen_t *g, LLVMValueRef cell,
                                   LLVMTypeRef payload) {
     return LLVMBuildStructGEP2(g->builder, box_cell_type(g, payload), cell,
                                ZAN_BOX_VALUE_FIELD, "box.v");
 }
 
 /* 作用域绑定接管共享 cell 所有权，异常展开时统一释放 */
-static void own_box_cell(zan_irgen_t *g, local_var_t *v, LLVMValueRef cell) {
+void own_box_cell(zan_irgen_t *g, local_var_t *v, LLVMValueRef cell) {
     LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
     LLVMValueRef tagged_i = LLVMBuildOr(g->builder,
@@ -912,7 +911,7 @@ static void own_box_cell(zan_irgen_t *g, local_var_t *v, LLVMValueRef cell) {
 }
 
 /* 将按值传递的形参移动至闭包共享 cell */
-static void box_captured_parameter(zan_irgen_t *g, local_scope_t *locals,
+void box_captured_parameter(zan_irgen_t *g, local_scope_t *locals,
                                    zan_ast_node_t *param, zan_type_t *type,
                                    LLVMTypeRef payload, LLVMValueRef value,
                                    zan_ast_node_t *body) {
@@ -955,7 +954,7 @@ static void box_captured_parameter(zan_irgen_t *g, local_scope_t *locals,
 }
 
 /* 实例方法组转委托：将接收者绑定入方法组记录 */
-static LLVMValueRef emit_method_group_closure(zan_irgen_t *g, zan_symbol_t *msym,
+LLVMValueRef emit_method_group_closure(zan_irgen_t *g, zan_symbol_t *msym,
                                               LLVMValueRef recv, zan_loc_t loc) {
     int fi = irgen_find_function(g, msym);
     if (fi < 0) return NULL;
@@ -1037,7 +1036,7 @@ static LLVMValueRef emit_method_group_closure(zan_irgen_t *g, zan_symbol_t *msym
 }
 
 /* 为静态方法组构建闭包记录 */
-static LLVMValueRef build_static_mg_record(zan_irgen_t *g, zan_loc_t loc,
+LLVMValueRef build_static_mg_record(zan_irgen_t *g, zan_loc_t loc,
                                            const char *lname, LLVMTypeRef rec_ty,
                                            LLVMValueRef thunk) {
     build_closure_dtor(g, lname, rec_ty, NULL, 0, 0, false);
@@ -1046,7 +1045,7 @@ static LLVMValueRef build_static_mg_record(zan_irgen_t *g, zan_loc_t loc,
 }
 
 /* 合成双向数据绑定属性访问器 */
-static LLVMValueRef emit_binding_acc_delegate(zan_irgen_t *g, LLVMValueRef acc,
+LLVMValueRef emit_binding_acc_delegate(zan_irgen_t *g, LLVMValueRef acc,
                                               LLVMTypeRef acc_ty) {
     if (!target_is_wasm32(g)) return acc;
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
@@ -1159,7 +1158,7 @@ static zan_ast_node_t *irgen_tree_from(zan_irgen_t *g, zan_type_t *wt,
 /* 树目标类型（B-ID65）：System.Linq.ExprNode 或 System.Linq.Expr<T>。
  * irgen_expr_core.c（同编译单元、先于本文件包含）的过载打分也要判——
  * 前置声明在那边。 */
-static bool irgen_type_is_tree_target(zan_type_t *t) {
+bool irgen_type_is_tree_target(zan_type_t *t) {
     if (!t || t->kind != TYPE_CLASS || !t->sym) return false;
     if (t->sym->name.len == 8 &&
         memcmp(t->sym->name.str, "ExprNode", 8) == 0)
@@ -1173,8 +1172,7 @@ static bool irgen_tree_target_type(zan_irgen_t *g, zan_ast_node_t *ptype) {
     if (!ptype) return false;
     return irgen_type_is_tree_target(resolve_type_ctx(g, ptype));
 }
-
-static bool irgen_is_tree_lambda(zan_irgen_t *g, zan_ast_node_t *expr) {
+bool irgen_is_tree_lambda(zan_irgen_t *g, zan_ast_node_t *expr) {
     if (!expr || expr->kind != AST_LAMBDA || expr->lambda.params.count != 1)
         return false;
     return irgen_tree_target_type(g, expr->lambda.params.items[0]->param.type);
@@ -1378,8 +1376,7 @@ static zan_ast_node_t *irgen_build_expr_tree(zan_irgen_t *g,
         return NULL;
     }
 }
-
-static LLVMValueRef emit_lambda_typed(zan_irgen_t *g, zan_ast_node_t *expr,
+LLVMValueRef emit_lambda_typed(zan_irgen_t *g, zan_ast_node_t *expr,
                                       zan_type_t *expected, local_scope_t *locals) {
     LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
     int pc = expr->lambda.params.count;
@@ -1720,8 +1717,7 @@ static LLVMValueRef emit_lambda_typed(zan_irgen_t *g, zan_ast_node_t *expr,
     cap_scan_free(&cs);
     return clo;
 }
-
-static zan_type_t *method_param_type(zan_irgen_t *g, zan_symbol_t *msym, int idx) {
+zan_type_t *method_param_type(zan_irgen_t *g, zan_symbol_t *msym, int idx) {
     if (!msym || !msym->decl || msym->decl->kind != AST_METHOD_DECL) return NULL;
     zan_ast_list_t *params = &msym->decl->method_decl.params;
     if (idx < 0 || idx >= params->count) return NULL;
@@ -1734,8 +1730,7 @@ static zan_type_t *method_param_type(zan_irgen_t *g, zan_symbol_t *msym, int idx
     }
     return zan_binder_resolve_type(g->binder, p->param.type);
 }
-
-static bool type_mentions_tp(zan_type_t *t) {
+bool type_mentions_tp(zan_type_t *t) {
     if (!t) return false;
     if (t->kind == TYPE_TYPE_PARAM) return true;
     if (t->kind == TYPE_ARRAY || t->kind == TYPE_NULLABLE)
@@ -1772,8 +1767,7 @@ static void unify_method_tp(zan_type_t *dp, zan_type_t *at,
     for (int i = 0; i < dp->type_arg_count && i < at->type_arg_count; i++)
         unify_method_tp(dp->type_args[i], at->type_args[i], tps, bind);
 }
-
-static zan_type_t *subst_method_tp(zan_irgen_t *g, zan_type_t *t,
+zan_type_t *subst_method_tp(zan_irgen_t *g, zan_type_t *t,
                                    zan_ast_list_t *tps, zan_type_t **bind) {
     if (!t || !type_mentions_tp(t)) return t;
     if (t->kind == TYPE_TYPE_PARAM) {
@@ -1811,7 +1805,7 @@ static zan_type_t *subst_method_tp(zan_irgen_t *g, zan_type_t *t,
 }
 
 /* 泛型方法调用点推导类型实参绑定 */
-static void infer_method_tp_bindings(zan_irgen_t *g, zan_symbol_t *msym,
+void infer_method_tp_bindings(zan_irgen_t *g, zan_symbol_t *msym,
                                      zan_ast_node_t *call,
                                      zan_ast_node_t *recv_expr,
                                      local_scope_t *locals,
@@ -1906,7 +1900,7 @@ static void infer_method_tp_bindings(zan_irgen_t *g, zan_symbol_t *msym,
 }
 
 /* 泛型形参类型实参代换 */
-static zan_type_t *method_param_type_at(zan_irgen_t *g, zan_symbol_t *msym,
+zan_type_t *method_param_type_at(zan_irgen_t *g, zan_symbol_t *msym,
                                         int idx, zan_ast_node_t *call,
                                         zan_ast_node_t *recv_expr,
                                         local_scope_t *locals) {
@@ -1932,7 +1926,7 @@ static zan_type_t *method_param_type_at(zan_irgen_t *g, zan_symbol_t *msym,
 }
 
 /* 判断方法返回类型是否为该方法自身声明的泛型类型形参 */
-static bool method_ret_is_bare_tp(zan_symbol_t *msym) {
+bool method_ret_is_bare_tp(zan_symbol_t *msym) {
     if (!msym || !msym->decl || msym->decl->kind != AST_METHOD_DECL) return false;
     zan_ast_list_t *tps = &msym->decl->method_decl.type_params;
     if (tps->count == 0) return false;
@@ -1948,8 +1942,7 @@ static bool method_ret_is_bare_tp(zan_symbol_t *msym) {
     }
     return false;
 }
-
-static zan_type_t *method_ret_type_at(zan_irgen_t *g, zan_symbol_t *msym,
+zan_type_t *method_ret_type_at(zan_irgen_t *g, zan_symbol_t *msym,
                                       zan_ast_node_t *call,
                                       zan_ast_node_t *recv_expr,
                                       local_scope_t *locals) {
@@ -1965,7 +1958,7 @@ static zan_type_t *method_ret_type_at(zan_irgen_t *g, zan_symbol_t *msym,
 }
 
 /* async 委托调用：调用生成协程帧并在原地 await 挂起等待结果 */
-static void check_delegate_async_match(zan_irgen_t *g, zan_ast_node_t *e,
+void check_delegate_async_match(zan_irgen_t *g, zan_ast_node_t *e,
                                        zan_type_t *dt, local_scope_t *locals) {
     if (!e || !dt || dt->kind != TYPE_DELEGATE) return;
     zan_symbol_t *m = NULL;
@@ -2031,8 +2024,7 @@ static bool wrap_implicit_ctor_arg(zan_irgen_t *g, zan_ast_node_t *arg,
     infer_cache_invalidate();
     return true;
 }
-
-static LLVMValueRef emit_arg_typed(zan_irgen_t *g, zan_ast_node_t *arg,
+LLVMValueRef emit_arg_typed(zan_irgen_t *g, zan_ast_node_t *arg,
                                    zan_type_t *ptype, local_scope_t *locals) {
     zan_type_t *atype = infer_expr_type(g, arg, locals);
     check_implicit_narrowing(g, ptype, atype, arg, "argument");
@@ -2070,7 +2062,7 @@ static LLVMValueRef emit_arg_typed(zan_irgen_t *g, zan_ast_node_t *arg,
 }
 
 /* ref / out 实参处理：传递局部变量或存储槽的内存地址 */
-static LLVMValueRef emit_ref_lvalue_ptr(zan_irgen_t *g, zan_ast_node_t *tgt,
+LLVMValueRef emit_ref_lvalue_ptr(zan_irgen_t *g, zan_ast_node_t *tgt,
                                         local_scope_t *locals) {
     if (!tgt) return NULL;
     if (tgt->kind == AST_THIS_EXPR) {
@@ -2140,8 +2132,7 @@ static LLVMValueRef emit_ref_lvalue_ptr(zan_irgen_t *g, zan_ast_node_t *tgt,
 
     return NULL;
 }
-
-static LLVMValueRef emit_ref_arg(zan_irgen_t *g, zan_ast_node_t *arg,
+LLVMValueRef emit_ref_arg(zan_irgen_t *g, zan_ast_node_t *arg,
                                  local_scope_t *locals) {
     zan_ast_node_t *tgt = arg->ref_arg.expr;
     if (arg->ref_arg.decl_type && tgt && tgt->kind == AST_IDENTIFIER) {

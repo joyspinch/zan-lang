@@ -1,3 +1,5 @@
+#include "irgen_internal.h"
+#include "irgen_internal.h"
 /* irgen_async.c: 异步函数 CPS 变换、await ANF 正规化与协程帧生成 (由 irgen.c 包含) */
 
 /* 判断类型写入 64 位帧结果槽时是否需零扩展（无符号标量类型） */
@@ -17,7 +19,7 @@ static bool type_is_unsigned_scalar(zan_type_t *t) {
 }
 
 /* 将协程返回值编码写入 64 位帧结果槽，与 coerce_from_frame_result 互为逆操作 */
-static LLVMValueRef coerce_to_frame_result(zan_irgen_t *g, LLVMValueRef v,
+LLVMValueRef coerce_to_frame_result(zan_irgen_t *g, LLVMValueRef v,
                                            zan_type_t *ty) {
     if (!v) return NULL;
     LLVMTypeRef i32 = LLVMInt32TypeInContext(g->ctx);
@@ -84,7 +86,7 @@ static LLVMValueRef coerce_to_frame_result(zan_irgen_t *g, LLVMValueRef v,
 }
 
 /* 将返回值转换为方法声明的返回类型，确保帧结果编码类型一致 */
-static LLVMValueRef coerce_async_ret(zan_irgen_t *g, LLVMValueRef val) {
+LLVMValueRef coerce_async_ret(zan_irgen_t *g, LLVMValueRef val) {
     zan_type_t *rt = g->current_async_ret_type;
     if (!val || !rt || rt->kind == TYPE_VOID) return val;
     LLVMTypeRef want = map_type(g, rt);
@@ -119,7 +121,7 @@ static LLVMValueRef coerce_async_ret(zan_irgen_t *g, LLVMValueRef val) {
 }
 
 /* 将 64 位帧结果槽中的位解码还原为声明类型 ty */
-static LLVMValueRef coerce_from_frame_result(zan_irgen_t *g, LLVMValueRef res,
+LLVMValueRef coerce_from_frame_result(zan_irgen_t *g, LLVMValueRef res,
                                              zan_type_t *ty) {
     if (!res || !ty) return res;
     if (ty && ty->type_arg_count > 0) {
@@ -160,7 +162,7 @@ static LLVMValueRef coerce_from_frame_result(zan_irgen_t *g, LLVMValueRef res,
 }
 
 /* 无声明返回类型时标量值到 i64 帧结果槽的强制转换兜底 */
-static LLVMValueRef coerce_to_i64(zan_irgen_t *g, LLVMValueRef v) {
+LLVMValueRef coerce_to_i64(zan_irgen_t *g, LLVMValueRef v) {
     LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
     LLVMTypeRef t = LLVMTypeOf(v);
     switch (LLVMGetTypeKind(t)) {
@@ -183,11 +185,7 @@ static LLVMValueRef coerce_to_i64(zan_irgen_t *g, LLVMValueRef v) {
         return LLVMConstInt(i64, 0, 0);
     }
 }
-
-enum { ASYNC_PENDING_EXCEPTION = 1, ASYNC_PENDING_RETURN = 2,
-       ASYNC_PENDING_BORROWED_EXCEPTION = 3 };
-
-static LLVMValueRef async_pending_count_ptr(zan_irgen_t *g, LLVMValueRef frame,
+LLVMValueRef async_pending_count_ptr(zan_irgen_t *g, LLVMValueRef frame,
                                             LLVMTypeRef ft) {
     return LLVMBuildStructGEP2(g->builder, ft, frame,
                               ASYNC_FRAME_PENDING_COUNT, "pending.count.p");
@@ -202,15 +200,13 @@ static LLVMValueRef async_pending_record(zan_irgen_t *g, LLVMValueRef frame,
         LLVMBuildStructGEP2(g->builder, ft, frame, ASYNC_FRAME_PENDING, "pending.p"),
         indices, 2, "pending.record");
 }
-
-static LLVMValueRef async_pending_field(zan_irgen_t *g, LLVMTypeRef ft,
+LLVMValueRef async_pending_field(zan_irgen_t *g, LLVMTypeRef ft,
                                         LLVMValueRef record, unsigned field) {
     LLVMTypeRef rt = LLVMGetElementType(
         LLVMStructGetTypeAtIndex(ft, ASYNC_FRAME_PENDING));
     return LLVMBuildStructGEP2(g->builder, rt, record, field, "pending.field");
 }
-
-static LLVMValueRef async_pending_discard_fn(zan_irgen_t *g, LLVMTypeRef ft) {
+LLVMValueRef async_pending_discard_fn(zan_irgen_t *g, LLVMTypeRef ft) {
     char name[640];
     snprintf(name, sizeof(name), "%s$pending.discard", LLVMGetStructName(ft));
     LLVMValueRef fn = LLVMGetNamedFunction(g->mod, name);
@@ -222,8 +218,7 @@ static LLVMValueRef async_pending_discard_fn(zan_irgen_t *g, LLVMTypeRef ft) {
     }
     return fn;
 }
-
-static void emit_async_pending_discard(zan_irgen_t *g, LLVMValueRef frame,
+void emit_async_pending_discard(zan_irgen_t *g, LLVMValueRef frame,
                                        LLVMTypeRef ft, LLVMValueRef depth) {
     if (!LLVMGetArrayLength(LLVMStructGetTypeAtIndex(ft, ASYNC_FRAME_PENDING))) return;
     LLVMValueRef fn = async_pending_discard_fn(g, ft);
@@ -232,7 +227,7 @@ static void emit_async_pending_discard(zan_irgen_t *g, LLVMValueRef frame,
 }
 
 /* 待定引用所有权账本：在移动或作用域丢弃前持有引用，catch 处清理中断分支未决引用 */
-static LLVMValueRef emit_async_pending_push(zan_irgen_t *g, LLVMValueRef value,
+LLVMValueRef emit_async_pending_push(zan_irgen_t *g, LLVMValueRef value,
                                             LLVMValueRef tid, LLVMValueRef kind) {
     LLVMTypeRef i32 = LLVMInt32TypeInContext(g->ctx);
     LLVMTypeRef ft = g->current_async_frame_type;
@@ -257,8 +252,7 @@ static LLVMValueRef emit_async_pending_push(zan_irgen_t *g, LLVMValueRef value,
         LLVMConstInt(i32, 1, 0), "pending.next"), cp);
     return record;
 }
-
-static LLVMValueRef emit_async_pending_top(zan_irgen_t *g) {
+LLVMValueRef emit_async_pending_top(zan_irgen_t *g) {
     LLVMTypeRef i32 = LLVMInt32TypeInContext(g->ctx);
     LLVMValueRef count = LLVMBuildLoad2(g->builder, i32,
         async_pending_count_ptr(g, g->current_async_frame,
@@ -266,8 +260,7 @@ static LLVMValueRef emit_async_pending_top(zan_irgen_t *g) {
     return async_pending_record(g, g->current_async_frame, g->current_async_frame_type,
         LLVMBuildSub(g->builder, count, LLVMConstInt(i32, 1, 0), "pending.last"));
 }
-
-static void emit_async_pending_pop(zan_irgen_t *g, LLVMValueRef record) {
+void emit_async_pending_pop(zan_irgen_t *g, LLVMValueRef record) {
     LLVMTypeRef i32 = LLVMInt32TypeInContext(g->ctx);
     LLVMTypeRef ft = g->current_async_frame_type;
     LLVMBuildStore(g->builder, LLVMConstInt(i32, 0, 0),
@@ -277,8 +270,7 @@ static void emit_async_pending_pop(zan_irgen_t *g, LLVMValueRef record) {
         LLVMBuildLoad2(g->builder, i32, cp, "pending.count"),
         LLVMConstInt(i32, 1, 0), "pending.previous"), cp);
 }
-
-static void emit_async_pending_discard_preserving(zan_irgen_t *g,
+void emit_async_pending_discard_preserving(zan_irgen_t *g,
                                                  LLVMValueRef depth) {
     LLVMTypeRef ft = g->current_async_frame_type;
     LLVMTypeRef record_ty = LLVMGetElementType(
@@ -296,8 +288,7 @@ static void emit_async_pending_discard_preserving(zan_irgen_t *g,
     LLVMBuildStore(g->builder, LLVMBuildAdd(g->builder, count,
         LLVMConstInt(i32, 1, 0), "pending.restored"), cp);
 }
-
-static void emit_async_pending_return(zan_irgen_t *g, LLVMValueRef value) {
+void emit_async_pending_return(zan_irgen_t *g, LLVMValueRef value) {
     LLVMTypeRef i32 = LLVMInt32TypeInContext(g->ctx);
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
     zan_type_t *ty = g->current_async_ret_type;
@@ -312,8 +303,7 @@ static void emit_async_pending_return(zan_irgen_t *g, LLVMValueRef value) {
         LLVMBuildStore(g->builder, value, payload);
     }
 }
-
-static LLVMValueRef emit_async_pending_take_return(zan_irgen_t *g) {
+LLVMValueRef emit_async_pending_take_return(zan_irgen_t *g) {
     LLVMValueRef record = emit_async_pending_top(g);
     LLVMTypeRef ft = g->current_async_frame_type;
     zan_type_t *ty = g->current_async_ret_type;
@@ -331,7 +321,7 @@ static LLVMValueRef emit_async_pending_take_return(zan_irgen_t *g) {
 }
 
 /* 单个帧类型的统一丢弃循环，供 catch、正常完成与协程放弃共享调用 */
-static void emit_async_pending_discard_body(zan_irgen_t *g, LLVMTypeRef ft,
+void emit_async_pending_discard_body(zan_irgen_t *g, LLVMTypeRef ft,
                                             zan_type_t *ret_type) {
     LLVMValueRef fn = async_pending_discard_fn(g, ft);
     LLVMValueRef saved_fn = g->current_fn;
@@ -391,7 +381,7 @@ static void emit_async_pending_discard_body(zan_irgen_t *g, LLVMTypeRef ft,
 }
 
 /* 汇合 return、取消或未捕获异常至统一步骤：完成清理与帧释放 */
-static void emit_async_complete(zan_irgen_t *g, local_scope_t *locals,
+void emit_async_complete(zan_irgen_t *g, local_scope_t *locals,
                                 LLVMValueRef result_i64) {
     LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
     if (!g->current_async_complete_bb) {
@@ -440,7 +430,7 @@ static void emit_async_orphan_result_release(zan_irgen_t *g) {
 }
 
 /* 发射共享完成尾声：存入结果、标记完成、释放持有者、唤醒等待者并 ret void */
-static void emit_async_complete_epilogue(zan_irgen_t *g, local_scope_t *locals) {
+void emit_async_complete_epilogue(zan_irgen_t *g, local_scope_t *locals) {
     if (!g->current_async_complete_bb) return;
     LLVMPositionBuilderAtEnd(g->builder, g->current_async_complete_bb);
     LLVMValueRef result_i64 = g->current_async_result_phi;
@@ -558,7 +548,7 @@ static LLVMValueRef emit_co_live_has(zan_irgen_t *g, LLVMValueRef frame) {
 }
 
 /* 发射 zan_timer_cancel_delay(frame)，从定时器堆中移除该帧的未决延迟任务 */
-static void emit_co_cancel_delay(zan_irgen_t *g, LLVMValueRef frame) {
+void emit_co_cancel_delay(zan_irgen_t *g, LLVMValueRef frame) {
     /* 运行时定义返回取消数量 i32，为兼容 wasm32 链接签名必须严格匹配 */
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
     LLVMTypeRef ty = LLVMFunctionType(LLVMInt32TypeInContext(g->ctx), &i8ptr, 1, 0);
@@ -587,8 +577,7 @@ static bool open_co_helper(zan_irgen_t *g, const char *name, LLVMValueRef *fn,
 static void close_co_helper(zan_irgen_t *g, zan_builder_point_t saved_pt) {
     zan_builder_restore(g, saved_pt);
 }
-
-static LLVMValueRef get_co_track_fn(zan_irgen_t *g) {
+LLVMValueRef get_co_track_fn(zan_irgen_t *g) {
     LLVMValueRef fn; zan_builder_point_t saved_pt;
     if (!open_co_helper(g, "__zan_co_track", &fn, &saved_pt)) return fn;
     LLVMTypeRef ty;
@@ -599,8 +588,7 @@ static LLVMValueRef get_co_track_fn(zan_irgen_t *g) {
     close_co_helper(g, saved_pt);
     return fn;
 }
-
-static LLVMValueRef get_co_untrack_fn(zan_irgen_t *g) {
+LLVMValueRef get_co_untrack_fn(zan_irgen_t *g) {
     LLVMValueRef fn; zan_builder_point_t saved_pt;
     if (!open_co_helper(g, "__zan_co_untrack", &fn, &saved_pt)) return fn;
     LLVMTypeRef ty;
@@ -613,7 +601,7 @@ static LLVMValueRef get_co_untrack_fn(zan_irgen_t *g) {
 }
 
 /* 获取或声明模块内部的 `__zan_co_cancel(i8*)`（协作式取消标记置位） */
-static LLVMValueRef get_co_cancel_fn(zan_irgen_t *g) {
+LLVMValueRef get_co_cancel_fn(zan_irgen_t *g) {
     LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "__zan_co_cancel");
     if (fn) return fn;
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
@@ -663,7 +651,7 @@ static LLVMValueRef get_co_cancel_fn(zan_irgen_t *g) {
 /* 获取或声明模块内部的 `__zan_co_isdone(i8*)`（查询协程完成状态） */
 /* 帧首 sched 字段的 CO_DEAD 位（rt_io.c 同名宏的镜像，运行时拥有语义） */
 #define ZAN_CO_DEAD_BIT 8LL
-static LLVMValueRef get_co_isdone_fn(zan_irgen_t *g) {
+LLVMValueRef get_co_isdone_fn(zan_irgen_t *g) {
     LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "__zan_co_isdone");
     if (fn) return fn;
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
@@ -726,8 +714,7 @@ static void position_before_entry_terminator(zan_irgen_t *g) {
         LLVMPositionBuilderAtEnd(g->builder, entry);
     }
 }
-
-static LLVMValueRef get_async_self_i8(zan_irgen_t *g) {
+LLVMValueRef get_async_self_i8(zan_irgen_t *g) {
     if (g->current_async_self_i8) return g->current_async_self_i8;
     if (!g->current_async_frame) return NULL;
     zan_builder_point_t pt = zan_builder_save(g);
@@ -738,8 +725,7 @@ static LLVMValueRef get_async_self_i8(zan_irgen_t *g) {
     zan_builder_restore(g, pt);
     return g->current_async_self_i8;
 }
-
-static LLVMValueRef get_async_state_ptr(zan_irgen_t *g) {
+LLVMValueRef get_async_state_ptr(zan_irgen_t *g) {
     if (g->current_async_state_ptr) return g->current_async_state_ptr;
     if (!g->current_async_frame || !g->current_async_frame_type) return NULL;
     zan_builder_point_t pt = zan_builder_save(g);
@@ -750,8 +736,7 @@ static LLVMValueRef get_async_state_ptr(zan_irgen_t *g) {
     zan_builder_restore(g, pt);
     return g->current_async_state_ptr;
 }
-
-static LLVMValueRef get_async_cancel_ptr(zan_irgen_t *g) {
+LLVMValueRef get_async_cancel_ptr(zan_irgen_t *g) {
     if (g->current_async_cancel_ptr) return g->current_async_cancel_ptr;
     if (!g->current_async_frame || !g->current_async_frame_type) return NULL;
     zan_builder_point_t pt = zan_builder_save(g);
@@ -762,8 +747,7 @@ static LLVMValueRef get_async_cancel_ptr(zan_irgen_t *g) {
     zan_builder_restore(g, pt);
     return g->current_async_cancel_ptr;
 }
-
-static LLVMValueRef get_async_self_int(zan_irgen_t *g, LLVMTypeRef ptr_int_ty) {
+LLVMValueRef get_async_self_int(zan_irgen_t *g, LLVMTypeRef ptr_int_ty) {
     if (g->current_async_self_int) return g->current_async_self_int;
     LLVMValueRef self_i8 = get_async_self_i8(g);
     if (!self_i8) return NULL;
@@ -773,8 +757,7 @@ static LLVMValueRef get_async_self_int(zan_irgen_t *g, LLVMTypeRef ptr_int_ty) {
     zan_builder_restore(g, pt);
     return g->current_async_self_int;
 }
-
-static LLVMValueRef get_async_child_ptr(zan_irgen_t *g) {
+LLVMValueRef get_async_child_ptr(zan_irgen_t *g) {
     if (g->current_async_child_ptr) return g->current_async_child_ptr;
     if (!g->current_async_frame || !g->current_async_frame_type) return NULL;
     zan_builder_point_t pt = zan_builder_save(g);
@@ -785,8 +768,7 @@ static LLVMValueRef get_async_child_ptr(zan_irgen_t *g) {
     zan_builder_restore(g, pt);
     return g->current_async_child_ptr;
 }
-
-static LLVMValueRef get_async_sub_slot_ptr(zan_irgen_t *g) {
+LLVMValueRef get_async_sub_slot_ptr(zan_irgen_t *g) {
     if (g->current_async_sub_slot_ptr) return g->current_async_sub_slot_ptr;
     if (!g->current_async_frame || !g->current_async_frame_type) return NULL;
     zan_builder_point_t pt = zan_builder_save(g);
@@ -797,8 +779,7 @@ static LLVMValueRef get_async_sub_slot_ptr(zan_irgen_t *g) {
     zan_builder_restore(g, pt);
     return g->current_async_sub_slot_ptr;
 }
-
-static LLVMValueRef get_async_result_ptr(zan_irgen_t *g) {
+LLVMValueRef get_async_result_ptr(zan_irgen_t *g) {
     if (g->current_async_result_ptr) return g->current_async_result_ptr;
     if (!g->current_async_frame || !g->current_async_frame_type) return NULL;
     zan_builder_point_t pt = zan_builder_save(g);
@@ -811,7 +792,7 @@ static LLVMValueRef get_async_result_ptr(zan_irgen_t *g) {
 }
 
 /* 协作式抢占与 Task.Yield 重新入队块（共享于所有让出点） */
-static LLVMBasicBlockRef get_async_requeue_bb(zan_irgen_t *g) {
+LLVMBasicBlockRef get_async_requeue_bb(zan_irgen_t *g) {
     if (!g->current_async_frame || !g->current_async_resume_fn) return NULL;
     if (g->current_async_requeue_bb) return g->current_async_requeue_bb;
     LLVMBasicBlockRef here = LLVMGetInsertBlock(g->builder);
@@ -841,7 +822,7 @@ static bool scope_has_owned_cleanups(zan_irgen_t *g, local_scope_t *locals, int 
 }
 
 /* 共享顶层取消退出块：无词法作用域未决局部变量时直接跳转完成块 */
-static LLVMBasicBlockRef get_async_cancel_bb(zan_irgen_t *g, local_scope_t *locals) {
+LLVMBasicBlockRef get_async_cancel_bb(zan_irgen_t *g, local_scope_t *locals) {
     if (scope_has_owned_cleanups(g, locals, g->current_async_frame_local_count)) return NULL;
     if (g->current_async_cancel_bb) return g->current_async_cancel_bb;
     LLVMBasicBlockRef here = LLVMGetInsertBlock(g->builder);
@@ -855,7 +836,7 @@ static LLVMBasicBlockRef get_async_cancel_bb(zan_irgen_t *g, local_scope_t *loca
 }
 
 /* 发射取消检查：若已请求取消则进入完成路径释放作用域变量并退出 */
-static void emit_async_cancel_check(zan_irgen_t *g, local_scope_t *locals) {
+void emit_async_cancel_check(zan_irgen_t *g, local_scope_t *locals) {
     if (!g->current_async_frame) return;
     /* 在 finally 保护块内暂缓退出，等待离开 finally 后再响应取消 */
     if (g->finally_count > 0 || g->catch_cleanup_count > 0) return;
@@ -878,7 +859,7 @@ static void emit_async_cancel_check(zan_irgen_t *g, local_scope_t *locals) {
 }
 
 /* 弹出本次 resume 挂载的异常处理器并恢复栈上下文 */
-static void emit_async_eh_unarm(zan_irgen_t *g) {
+void emit_async_eh_unarm(zan_irgen_t *g) {
     if (!g->current_async_eh_entry) return;
     LLVMTypeRef i32 = LLVMInt32TypeInContext(g->ctx);
     LLVMValueRef top_g, bufs_g, exc_g;
@@ -887,8 +868,7 @@ static void emit_async_eh_unarm(zan_irgen_t *g) {
         g->current_async_eh_entry, "eh.entry");
     LLVMBuildStore(g->builder, entry, top_g);
 }
-
-static LLVMBasicBlockRef get_async_suspend_ret_bb(zan_irgen_t *g) {
+LLVMBasicBlockRef get_async_suspend_ret_bb(zan_irgen_t *g) {
     if (!g->current_async_frame || !g->current_async_resume_fn) return NULL;
     if (g->current_async_suspend_ret_bb) return g->current_async_suspend_ret_bb;
     LLVMBasicBlockRef here = LLVMGetInsertBlock(g->builder);
@@ -903,7 +883,7 @@ static LLVMBasicBlockRef get_async_suspend_ret_bb(zan_irgen_t *g) {
 }
 
 /* 代理 alloca 替换为帧字段前完成指针类型提取与校验 */
-static void emit_async_finalize_slots(zan_irgen_t *g) {
+void emit_async_finalize_slots(zan_irgen_t *g) {
     zan_builder_point_t pt = zan_builder_save(g);
     for (int i = 0; i < g->current_async_slot_count; i++) {
         zan_async_slot_t *slot = &g->current_async_slots[i];
@@ -922,7 +902,7 @@ static void emit_async_finalize_slots(zan_irgen_t *g) {
 }
 
 /* 循环回边协作式抢占点：时间片用尽时重新排队当前帧并让出控制权 */
-static bool emit_async_preempt_site(zan_irgen_t *g, LLVMBasicBlockRef resume_target) {
+bool emit_async_preempt_site(zan_irgen_t *g, LLVMBasicBlockRef resume_target) {
     if (!g->current_async_frame || !g->current_async_switch) return false;
     LLVMTypeRef di32 = LLVMInt32TypeInContext(g->ctx);
     LLVMBasicBlockRef preempt_bb = LLVMAppendBasicBlockInContext(g->ctx,
@@ -1166,11 +1146,10 @@ static zan_ast_node_t *anf_expr(anf_ctx_t *c, zan_ast_node_t *e) {
         return e;
     }
 }
-
-static void anf_normalize_block(zan_irgen_t *g, zan_ast_node_t *block, int *counter);
+void anf_normalize_block(zan_irgen_t *g, zan_ast_node_t *block, int *counter);
 
 /* 递归判断语句子树中是否包含任何 await 节点 */
-static bool anf_stmt_contains_await(zan_ast_node_t *st) {
+bool anf_stmt_contains_await(zan_ast_node_t *st) {
     if (!st) return false;
     switch (st->kind) {
     case AST_VAR_DECL:    return anf_expr_contains_await(st->var_decl.initializer);
@@ -1387,7 +1366,7 @@ static void anf_normalize_stmt(zan_irgen_t *g, zan_ast_node_t *st,
 }
 
 /* 重构块语句列表，将提升出的临时变量声明插入在所属语句之前 */
-static void anf_normalize_block(zan_irgen_t *g, zan_ast_node_t *block, int *counter) {
+void anf_normalize_block(zan_irgen_t *g, zan_ast_node_t *block, int *counter) {
     if (!block || block->kind != AST_BLOCK) return;
     zan_ast_list_t nl;
     zan_ast_list_init(&nl);
@@ -1398,39 +1377,6 @@ static void anf_normalize_block(zan_irgen_t *g, zan_ast_node_t *block, int *coun
     }
     block->block.stmts = nl;
 }
-
-/* 异步方法需在堆帧中跨挂起点保持的局部变量记录 */
-typedef struct {
-    zan_istr_t   name;
-    LLVMTypeRef  llvm;
-    zan_type_t  *ztype;
-    int          frame_index;
-    /* 借用槽标记：帧仅跨挂起点保存位模式而不持有所有权（如 foreach 循环变量） */
-    bool         no_arc;
-    /* 捕获变量存储标记 cell 所有者，多次 resume 借用同一 cell */
-    bool         boxed;
-    /* 关联的 AST 声明节点（按节点区分同名遮蔽变量的独立槽位） */
-    zan_ast_node_t *decl;
-    int role;
-} async_local_t;
-
-typedef struct {
-    zan_irgen_t   *g;
-    int            await_count;
-    async_local_t *locals;
-    int            local_count;
-    int            local_cap;
-    /* 局部变量类型推断环境表 */
-    local_scope_t *scope;
-    int            foreach_next;
-    /* 待降解 try 块数量（决定帧内异常处理槽数组容量） */
-    int            try_count;
-    /* 词法 try/finally 与 lock 嵌套深度 */
-    int            fin_depth;
-    int            fin_depth_max;
-    /* 捕获分析所用的异步方法体 AST 节点 */
-    zan_ast_node_t *body;
-} async_scan_t;
 
 static bool async_type_is_scalar(LLVMTypeRef t) {
     switch (LLVMGetTypeKind(t)) {
@@ -1450,7 +1396,7 @@ static bool async_type_is_frame_resident(LLVMTypeRef t) {
 }
 
 static void async_scan_expr(async_scan_t *s, zan_ast_node_t *e);
-static void async_scan_stmt(async_scan_t *s, zan_ast_node_t *st);
+void async_scan_stmt(async_scan_t *s, zan_ast_node_t *st);
 
 static int async_scan_add_local_role(async_scan_t *s, zan_istr_t name, LLVMTypeRef llvm,
                                       zan_type_t *zt, zan_ast_node_t *decl, int role) {
@@ -1576,7 +1522,7 @@ static void async_scan_expr(async_scan_t *s, zan_ast_node_t *e) {
 }
 
 /* 统计提前离开 try 块的跳转语句数（用于估算内联 finally 体数量） */
-static int async_count_transfers(zan_ast_node_t *st) {
+int async_count_transfers(zan_ast_node_t *st) {
     if (!st) return 0;
     switch (st->kind) {
     case AST_RETURN_STMT:
@@ -1625,7 +1571,7 @@ static int async_count_transfers(zan_ast_node_t *st) {
 /* foreach 迭代协议接口判断（GetEnumerator / MoveNext / Current）。
  * 枚举器返回类型允许具体类，也允许接口；集合本身也允许是接口
  * （A381 lazy iterators：IEnumerable<T> 型集合/方法调用结果直接 foreach）。 */
-static zan_type_t *foreach_proto_enum_type(zan_irgen_t *g, zan_type_t *ct) {
+zan_type_t *foreach_proto_enum_type(zan_irgen_t *g, zan_type_t *ct) {
     if (!ct || !ct->sym ||
         (ct->kind != TYPE_CLASS && ct->kind != TYPE_INTERFACE)) return NULL;
     zan_istr_t gi = { (char *)"GetEnumerator", 13 };
@@ -1658,8 +1604,7 @@ static zan_type_t *foreach_proto_enum_type(zan_irgen_t *g, zan_type_t *ct) {
     }
     return NULL;
 }
-
-static zan_type_t *foreach_proto_current_type(zan_irgen_t *g, zan_type_t *ct) {
+zan_type_t *foreach_proto_current_type(zan_irgen_t *g, zan_type_t *ct) {
     zan_type_t *et = foreach_proto_enum_type(g, ct);
     if (!et) return NULL;
     zan_istr_t ci = { (char *)"Current", 7 };
@@ -1689,8 +1634,7 @@ static zan_type_t *foreach_proto_current_type(zan_irgen_t *g, zan_type_t *ct) {
     }
     return NULL;
 }
-
-static void async_scan_stmt(async_scan_t *s, zan_ast_node_t *st) {
+void async_scan_stmt(async_scan_t *s, zan_ast_node_t *st) {
     if (!st) return;
     switch (st->kind) {
     case AST_BLOCK:
@@ -1835,13 +1779,12 @@ static void async_scan_stmt(async_scan_t *s, zan_ast_node_t *st) {
         break;
     }
 }
-
-static void emit_eh_hook_call(zan_irgen_t *g, const char *name);
+void emit_eh_hook_call(zan_irgen_t *g, const char *name);
 
 /* 异步异常传播：未捕获异常存放于帧 exc_val 槽供 awaiter 唤醒时重抛 */
 
 /* resume 入口发射：挂载蹦床与帧内活跃的异常处理器，随后分发至当前 step 块 */
-static void emit_async_eh_prologue(zan_irgen_t *g) {
+void emit_async_eh_prologue(zan_irgen_t *g) {
     LLVMTypeRef i32 = LLVMInt32TypeInContext(g->ctx);
     LLVMValueRef fn = g->current_async_resume_fn;
     LLVMValueRef frame = g->current_async_frame;
@@ -1992,7 +1935,7 @@ static void emit_async_eh_prologue(zan_irgen_t *g) {
 }
 
 /* 蹦床着陆块：将未捕获异常存入帧并完成协程，供 awaiter 重新抛出 */
-static void emit_async_exc_epilogue(zan_irgen_t *g, local_scope_t *locals) {
+void emit_async_exc_epilogue(zan_irgen_t *g, local_scope_t *locals) {
     if (!g->current_async_exc_bb) return;
     LLVMTypeRef i32 = LLVMInt32TypeInContext(g->ctx);
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
@@ -2030,8 +1973,7 @@ static void emit_async_exc_epilogue(zan_irgen_t *g, local_scope_t *locals) {
     }
     emit_async_complete(g, locals, NULL);
 }
-
-static void emit_unhandled_class_exc_print(zan_irgen_t *g, LLVMValueRef fn,
+void emit_unhandled_class_exc_print(zan_irgen_t *g, LLVMValueRef fn,
                                            LLVMTypeRef printf_ty,
                                            LLVMValueRef printf_fn,
                                            LLVMValueRef cname,
@@ -2246,7 +2188,7 @@ static LLVMBasicBlockRef get_async_sub_rethrow_bb(zan_irgen_t *g) {
 }
 
 /* await 恢复点检查：若被等待子协程异常退出，提取异常并在当前上下文重抛 */
-static void emit_async_check_sub_exc(zan_irgen_t *g, LLVMValueRef sub,
+void emit_async_check_sub_exc(zan_irgen_t *g, LLVMValueRef sub,
                                      LLVMValueRef tmp_mark) {
     LLVMTypeRef i32 = LLVMInt32TypeInContext(g->ctx);
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);

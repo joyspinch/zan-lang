@@ -1,5 +1,5 @@
-
-static void emit_release_static_rc_fields(zan_irgen_t *g, zan_ast_node_t *unit);
+#include "irgen_internal.h"
+void emit_release_static_rc_fields(zan_irgen_t *g, zan_ast_node_t *unit);
 static bool async_slot_type_compatible(zan_type_t *a, zan_type_t *b) {
     if (a == b) return true;
     if (!a || !b) return false;
@@ -119,15 +119,13 @@ static LLVMValueRef get_eh_hook_fn(zan_irgen_t *g, const char *name) {
     if (saved) LLVMPositionBuilderAtEnd(g->builder, saved);
     return f;
 }
-
-static void emit_eh_hook_call(zan_irgen_t *g, const char *name) {
+void emit_eh_hook_call(zan_irgen_t *g, const char *name) {
     if (!g->emit_debug) return;
     LLVMValueRef f = get_eh_hook_fn(g, name);
     LLVMTypeRef fty = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), NULL, 0, 0);
     zan_call2(g->builder, fty, f, NULL, 0, "");
 }
-
-static bool call_is_async_callee(zan_irgen_t *g, zan_ast_node_t *call, local_scope_t *locals) {
+bool call_is_async_callee(zan_irgen_t *g, zan_ast_node_t *call, local_scope_t *locals) {
     if (!call || call->kind != AST_CALL) return false;
     zan_ast_node_t *callee = call->call.callee;
     if (!callee) return false;
@@ -159,8 +157,7 @@ static bool call_is_async_callee(zan_irgen_t *g, zan_ast_node_t *call, local_sco
     }
     return false;
 }
-
-static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *locals);
+void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *locals);
 
 static void emit_switch_pattern_bind(zan_irgen_t *g, local_scope_t *locals,
                                      zan_ast_node_t *sc, LLVMValueRef switch_val) {
@@ -254,8 +251,7 @@ static void emit_monitor_exit(zan_irgen_t *g, LLVMValueRef obj_slot) {
     LLVMValueRef obj = LLVMBuildLoad2(g->builder, i8ptr, obj_slot, "lock.obj");
     zan_call2(g->builder, mon_ty, exit_fn, &obj, 1, "");
 }
-
-static void emit_eh_disarm_from(zan_irgen_t *g, int base) {
+void emit_eh_disarm_from(zan_irgen_t *g, int base) {
     if (base < g->eh_armed_base) base = g->eh_armed_base;
     if (g->eh_armed_count <= base) return;
     LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
@@ -311,8 +307,7 @@ static void emit_pending_scope_exit(zan_irgen_t *g,
     else
         emit_async_pending_discard(g, g->current_async_frame, ft, depth);
 }
-
-static void emit_finally_body(zan_irgen_t *g, local_scope_t *locals,
+void emit_finally_body(zan_irgen_t *g, local_scope_t *locals,
                               const zan_irgen_finally_entry_t *entry) {
     zan_irgen_pending_scope_t *saved = g->pending.scope;
     zan_irgen_pending_scope_t *scope = NULL;
@@ -585,8 +580,7 @@ static void emit_finally_on_exception_path(zan_irgen_t *g, local_scope_t *locals
         zan_store_fit(g, LLVMBuildLoad2(g->builder, i8ptr, s_tid, "fin.tid.r"), tid_g);
     }
 }
-
-static void emit_finallys_left_by_throw(zan_irgen_t *g, local_scope_t *locals) {
+void emit_finallys_left_by_throw(zan_irgen_t *g, local_scope_t *locals) {
     int base = g->finally_count;
     while (base > 0 && !g->finallys[base - 1].in_try_body) base--;
     for (int i = g->finally_count - 1; i >= base; i--) {
@@ -850,8 +844,7 @@ static LLVMValueRef emit_iface_call0(zan_irgen_t *g, zan_type_t *iface_ty,
     locals->count = saved;
     return r;
 }
-
-static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *locals) {
+void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *locals) {
     if (!stmt) return;
     if (locals) g->current_locals = locals;
 
@@ -3815,8 +3808,7 @@ throw_unwind:
 
     if (arc_nested) g->arc_stmt_depth--;
 }
-
-static void emit_release_static_rc_fields(zan_irgen_t *g, zan_ast_node_t *unit) {
+void emit_release_static_rc_fields(zan_irgen_t *g, zan_ast_node_t *unit) {
     (void)unit;
     for (int i = 0; i < g->static_field_count; i++) {
         zan_type_t *ft = g->static_fields[i].type;

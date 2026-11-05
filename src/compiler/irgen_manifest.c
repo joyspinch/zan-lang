@@ -1,3 +1,4 @@
+#include "irgen_internal.h"
 
 enum {
     ZAN_MF_USER = 0,

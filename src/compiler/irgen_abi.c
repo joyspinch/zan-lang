@@ -1,3 +1,4 @@
+#include "irgen_internal.h"
 /* irgen_abi */
 
 typedef enum {
@@ -52,10 +53,8 @@ static bool abi_target_is_apple(zan_irgen_t *g) {
     return false;
 #endif
 }
-
-static unsigned long abi_size_of(LLVMTypeRef t);
-
-static unsigned long abi_align_of(LLVMTypeRef t) {
+unsigned long abi_size_of(LLVMTypeRef t);
+unsigned long abi_align_of(LLVMTypeRef t) {
     switch (LLVMGetTypeKind(t)) {
     case LLVMIntegerTypeKind: {
         unsigned long b = (LLVMGetIntTypeWidth(t) + 7) / 8;
@@ -111,8 +110,7 @@ static uint64_t abi_size_of64(LLVMTypeRef t) {
     default: return 8;
     }
 }
-
-static unsigned long abi_size_of(LLVMTypeRef t) {
+unsigned long abi_size_of(LLVMTypeRef t) {
     uint64_t s = abi_size_of64(t);
     if (s > 0xFFFFFFFFULL) s = 0xFFFFFFFFULL;
     return (unsigned long)s;
@@ -331,8 +329,7 @@ static const char *abi_int_ext_attr(zan_type_t *t) {
     default:          return NULL;
     }
 }
-
-static void abi_add_int_ext_attrs(zan_irgen_t *g, LLVMValueRef fn,
+void abi_add_int_ext_attrs(zan_irgen_t *g, LLVMValueRef fn,
                                   zan_type_t *ret, zan_type_t **ptypes,
                                   int pc) {
     const char *r = abi_int_ext_attr(ret);
@@ -362,8 +359,7 @@ static void abi_pending_add(zan_irgen_t *g, const char *name) {
     memcpy(copy, name, n);
     g->abi_pending[g->abi_pending_count++] = copy;
 }
-
-static void abi_pending_report(zan_irgen_t *g) {
+void abi_pending_report(zan_irgen_t *g) {
     if (g->abi_pending_count == 0) return;
     for (LLVMValueRef f = LLVMGetFirstFunction(g->mod); f;
          f = LLVMGetNextFunction(f)) {
@@ -390,8 +386,7 @@ static void abi_pending_report(zan_irgen_t *g) {
         }
     }
 }
-
-static LLVMValueRef abi_extern_thunk(zan_irgen_t *g, const char *name,
+LLVMValueRef abi_extern_thunk(zan_irgen_t *g, const char *name,
                                      LLVMTypeRef zan_ft) {
     unsigned pc = LLVMCountParamTypes(zan_ft);
     LLVMTypeRef *zan_params =

@@ -1,3 +1,4 @@
+#include "irgen_internal.h"
 
 /* 转换字符串插值格式化说明符（如冒号后的格式标记）。插值与标量
  * ToString("F2") 调用两条路共用（irgen.h 声明，irgen_call.c 也用）。 */
@@ -66,8 +67,7 @@ int interp_format_to_printf(const zan_istr_t *spec, bool is_float,
     }
     return 0;
 }
-
-static LLVMValueRef emit_expr_string_interp(zan_irgen_t *g, zan_ast_node_t *expr,
+LLVMValueRef emit_expr_string_interp(zan_irgen_t *g, zan_ast_node_t *expr,
         local_scope_t *locals) {
         /* 字符串插值：将各子表达式格式化为字符串后统一拼接 */
         LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
@@ -297,8 +297,7 @@ static LLVMValueRef emit_expr_string_interp(zan_irgen_t *g, zan_ast_node_t *expr
         return result;
     return LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 0, 0);
 }
-
-static LLVMValueRef emit_expr_member_access(zan_irgen_t *g, zan_ast_node_t *expr,
+LLVMValueRef emit_expr_member_access(zan_irgen_t *g, zan_ast_node_t *expr,
         local_scope_t *locals) {
         /* 读取控制台当前前景色与背景色属性 */
         if (expr->member.object->kind == AST_IDENTIFIER &&
@@ -1057,8 +1056,7 @@ static LLVMValueRef finish_index_of_temp(zan_irgen_t *g, zan_ast_node_t *expr,
     emit_rc_release_for_type(g, container_type, container);
     return elem;
 }
-
-static LLVMValueRef emit_expr_index(zan_irgen_t *g, zan_ast_node_t *expr,
+LLVMValueRef emit_expr_index(zan_irgen_t *g, zan_ast_node_t *expr,
         local_scope_t *locals) {
         /* 实例索引器 obj[i] 降解为 op_index 方法调用 */
         {

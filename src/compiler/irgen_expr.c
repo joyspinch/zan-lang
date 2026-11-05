@@ -1,31 +1,31 @@
+#include "irgen_internal.h"
 /* irgen_expr.c: 表达式代码生成、NativeMemory 原语、Lambda 发射与泛型方法推导 (由 irgen.c 包含) */
-
-static LLVMValueRef get_async_result_ptr(zan_irgen_t *g);
-static LLVMValueRef get_async_sub_slot_ptr(zan_irgen_t *g);
+LLVMValueRef get_async_result_ptr(zan_irgen_t *g);
+LLVMValueRef get_async_sub_slot_ptr(zan_irgen_t *g);
 
 /* 实参里"拥有型临时量"的 EH 临时槽登记（定义在 irgen_call.c，晚于本文件
    被包含）：普通方法调用路径用它保证"调用抛异常时由展开器释放临时量"，
    构造路径此前漏了这一步，构造函数一抛，实参里的临时量就泄漏了。 */
-static int emit_call_arg_eh_push(zan_irgen_t *g, zan_ast_node_t *arg,
+int emit_call_arg_eh_push(zan_irgen_t *g, zan_ast_node_t *arg,
                                  LLVMValueRef val, local_scope_t *locals);
 
 /* NativeMemory 原语：堆外内存操作，地址使用 nint (i64)，不计入 ARC */
 
 /* 将实例接收者绑定至方法组闭包记录；recv 为 NULL 时生成静态方法组 */
-static LLVMValueRef emit_method_group_closure(zan_irgen_t *g, zan_symbol_t *msym,
+LLVMValueRef emit_method_group_closure(zan_irgen_t *g, zan_symbol_t *msym,
                                               LLVMValueRef recv, zan_loc_t loc);
 
 /* 静态方法组记录构建器 */
-static LLVMValueRef build_static_mg_record(zan_irgen_t *g, zan_loc_t loc,
+LLVMValueRef build_static_mg_record(zan_irgen_t *g, zan_loc_t loc,
                                            const char *lname, LLVMTypeRef rec_ty,
                                            LLVMValueRef thunk);
 
 /* 合成的 Binding<T> 访问器委托：原生平台使用纯函数指针，wasm32 采用静态方法组记录 */
-static LLVMValueRef emit_binding_acc_delegate(zan_irgen_t *g, LLVMValueRef acc,
+LLVMValueRef emit_binding_acc_delegate(zan_irgen_t *g, LLVMValueRef acc,
                                               LLVMTypeRef acc_ty);
 
 /* 检查类或其基类中是否声明了指定名称的成员（字段/方法/属性/事件/常量） */
-static int type_declares_member(zan_symbol_t *cls, zan_istr_t name) {
+int type_declares_member(zan_symbol_t *cls, zan_istr_t name) {
     while (cls) {
         for (int i = 0; i < cls->member_count; i++) {
             zan_symbol_t *m = cls->members[i];
@@ -41,7 +41,7 @@ static int type_declares_member(zan_symbol_t *cls, zan_istr_t name) {
 }
 
 /* 字符串边界安全判断：字面量与非透明局部变量可信任 NUL 终止符作为有效边界 */
-static int expr_has_reliable_string_bounds(zan_ast_node_t *expr,
+int expr_has_reliable_string_bounds(zan_ast_node_t *expr,
                                            local_scope_t *locals) {
     if (!expr) return 0;
     if (expr->kind == AST_STRING_LITERAL) return 1;
@@ -423,15 +423,14 @@ static LLVMValueRef nm_copy2d_fn(zan_irgen_t *g) {
     if (saved) LLVMPositionBuilderAtEnd(g->builder, saved);
     return fn;
 }
-
-static LLVMTypeRef span_elem_storage_type(zan_irgen_t *g, zan_type_t *elem_type) {
+LLVMTypeRef span_elem_storage_type(zan_irgen_t *g, zan_type_t *elem_type) {
     if (!elem_type) return LLVMInt32TypeInContext(g->ctx);
     if (elem_type->kind == TYPE_CHAR) return LLVMInt8TypeInContext(g->ctx);
     return map_type(g, elem_type);
 }
 
 /* Span<T> 原语：将切片操作降解为 { i8* base, i64 len } 胖指针视图 */
-static bool emit_span_call(zan_irgen_t *g, zan_ast_node_t *expr,
+bool emit_span_call(zan_irgen_t *g, zan_ast_node_t *expr,
                            local_scope_t *locals, LLVMValueRef *out) {
     zan_ast_node_t *callee = expr->call.callee;
     if (!callee || callee->kind != AST_MEMBER_ACCESS) return false;
@@ -507,7 +506,7 @@ static bool emit_span_call(zan_irgen_t *g, zan_ast_node_t *expr,
 }
 
 /* byte[] 与 string 零拷贝互转桥接原语（ToBytes / ToStr） */
-static bool emit_bytes_call(zan_irgen_t *g, zan_ast_node_t *expr,
+bool emit_bytes_call(zan_irgen_t *g, zan_ast_node_t *expr,
                             local_scope_t *locals, LLVMValueRef *out) {
     zan_ast_node_t *callee = expr->call.callee;
     if (!callee || callee->kind != AST_MEMBER_ACCESS) return false;
@@ -580,8 +579,7 @@ static bool emit_bytes_call(zan_irgen_t *g, zan_ast_node_t *expr,
     *out = s;
     return true;
 }
-
-static bool emit_native_memory_call(zan_irgen_t *g, zan_ast_node_t *expr,
+bool emit_native_memory_call(zan_irgen_t *g, zan_ast_node_t *expr,
                                     local_scope_t *locals, LLVMValueRef *out) {
     LLVMTypeRef i8 = LLVMInt8TypeInContext(g->ctx);
     LLVMTypeRef i8ptr = LLVMPointerType(i8, 0);
@@ -1399,8 +1397,7 @@ static LLVMValueRef pixel_resample_bilinear_row_fn(zan_irgen_t *g) {
         (LLVMTypeRef[]){ i8ptr, i8ptr, i8ptr, i8ptr, i8ptr, i32t, i64t }, 7, 0);
     return LLVMAddFunction(g->mod, "zan_hw_pixel_resample_bilinear_row", fn_ty);
 }
-
-static bool emit_pixel_ops_call(zan_irgen_t *g, zan_ast_node_t *expr,
+bool emit_pixel_ops_call(zan_irgen_t *g, zan_ast_node_t *expr,
                                 local_scope_t *locals, LLVMValueRef *out) {
     if (expr->kind != AST_CALL) return false;
     zan_ast_node_t *callee = expr->call.callee;
@@ -1489,7 +1486,7 @@ static bool emit_pixel_ops_call(zan_irgen_t *g, zan_ast_node_t *expr,
 }
 
 /* __zan_cpu_feature(i32 id): 底层 CPUID 特性探测接口 */
-static LLVMValueRef cpu_feature_fn(zan_irgen_t *g) {
+LLVMValueRef cpu_feature_fn(zan_irgen_t *g) {
     LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "__zan_cpu_feature");
     if (fn) return fn;
     LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
@@ -1570,8 +1567,7 @@ static LLVMValueRef cpu_feature_fn(zan_irgen_t *g) {
     if (saved) LLVMPositionBuilderAtEnd(g->builder, saved);
     return fn;
 }
-
-static bool emit_cpu_call(zan_irgen_t *g, zan_ast_node_t *expr,
+bool emit_cpu_call(zan_irgen_t *g, zan_ast_node_t *expr,
                           local_scope_t *locals, LLVMValueRef *out) {
     if (expr->kind != AST_CALL) return false;
     zan_ast_node_t *callee = expr->call.callee;
@@ -1625,8 +1621,7 @@ static bool is_64bit_int_arg(zan_irgen_t *g, zan_ast_node_t *arg, LLVMValueRef v
     }
     return (LLVMGetTypeKind(LLVMTypeOf(v)) == LLVMIntegerTypeKind && LLVMGetIntTypeWidth(LLVMTypeOf(v)) == 64);
 }
-
-static bool emit_bit_operations_call(zan_irgen_t *g, zan_ast_node_t *expr,
+bool emit_bit_operations_call(zan_irgen_t *g, zan_ast_node_t *expr,
                                      local_scope_t *locals, LLVMValueRef *out) {
     if (expr->kind != AST_CALL) return false;
     if (expr->call.resolved_sym != NULL && !expr->call.is_intrinsic) return false;
@@ -1885,8 +1880,7 @@ static bool emit_bit_operations_call(zan_irgen_t *g, zan_ast_node_t *expr,
 
     return false;
 }
-
-static bool is_target_class_obj(zan_ast_node_t *obj, const char *name, size_t len, local_scope_t *locals) {
+bool is_target_class_obj(zan_ast_node_t *obj, const char *name, size_t len, local_scope_t *locals) {
     if (!obj) return false;
     (void)len;
     if (obj->kind == AST_IDENTIFIER) {
@@ -1935,8 +1929,7 @@ static LLVMValueRef vec128_to_v16i8(zan_irgen_t *g, LLVMValueRef val) {
     }
     return val;
 }
-
-static LLVMValueRef v16i8_to_vec128(zan_irgen_t *g, LLVMValueRef v16) {
+LLVMValueRef v16i8_to_vec128(zan_irgen_t *g, LLVMValueRef v16) {
     LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
     LLVMTypeRef v2i64 = LLVMVectorType(LLVMInt64TypeInContext(g->ctx), 2);
     LLVMValueRef v2 = LLVMBuildBitCast(g->builder, v16, v2i64, "v2");
@@ -2242,8 +2235,7 @@ static LLVMValueRef emit_byte_sgt_mask_i64(zan_irgen_t *g, LLVMValueRef a,
                             LLVMVectorType(LLVMInt8TypeInContext(g->ctx), lanes),
                             "vsgt.mask");
 }
-
-static bool emit_vector128_call(zan_irgen_t *g, zan_ast_node_t *expr,
+bool emit_vector128_call(zan_irgen_t *g, zan_ast_node_t *expr,
                                 local_scope_t *locals, LLVMValueRef *out) {
     if (expr->kind != AST_CALL) return false;
     zan_ast_node_t *callee = expr->call.callee;
@@ -2727,8 +2719,7 @@ static LLVMValueRef v32i8_to_vec256(zan_irgen_t *g, LLVMValueRef v32) {
     res = LLVMBuildInsertValue(g->builder, res, v2, 2, "s2");
     return LLVMBuildInsertValue(g->builder, res, v3, 3, "s3");
 }
-
-static bool emit_vector256_call(zan_irgen_t *g, zan_ast_node_t *expr,
+bool emit_vector256_call(zan_irgen_t *g, zan_ast_node_t *expr,
                                 local_scope_t *locals, LLVMValueRef *out) {
     if (expr->kind != AST_CALL) return false;
     zan_ast_node_t *callee = expr->call.callee;
@@ -3016,8 +3007,7 @@ static bool emit_vector256_call(zan_irgen_t *g, zan_ast_node_t *expr,
 
     return false;
 }
-
-static bool emit_sse2_call(zan_irgen_t *g, zan_ast_node_t *expr,
+bool emit_sse2_call(zan_irgen_t *g, zan_ast_node_t *expr,
                            local_scope_t *locals, LLVMValueRef *out) {
     if (expr->kind != AST_CALL) return false;
     zan_ast_node_t *callee = expr->call.callee;
@@ -3100,8 +3090,7 @@ static bool emit_sse2_call(zan_irgen_t *g, zan_ast_node_t *expr,
 
     return false;
 }
-
-static bool emit_sse42_call(zan_irgen_t *g, zan_ast_node_t *expr,
+bool emit_sse42_call(zan_irgen_t *g, zan_ast_node_t *expr,
                             local_scope_t *locals, LLVMValueRef *out) {
     if (expr->kind != AST_CALL) return false;
     zan_ast_node_t *callee = expr->call.callee;
@@ -3264,8 +3253,7 @@ static bool emit_aes_arm(zan_irgen_t *g, zan_ast_node_t *expr,
     }
     return false;
 }
-
-static bool emit_aes_call(zan_irgen_t *g, zan_ast_node_t *expr,
+bool emit_aes_call(zan_irgen_t *g, zan_ast_node_t *expr,
                           local_scope_t *locals, LLVMValueRef *out) {
     if (expr->kind != AST_CALL) return false;
     zan_ast_node_t *callee = expr->call.callee;
@@ -3348,7 +3336,7 @@ static bool emit_aes_call(zan_irgen_t *g, zan_ast_node_t *expr,
 }
 
 /* 自定义 getter 属性降解为方法调用，读取时发射其专用 getter 函数 */
-static zan_symbol_t *property_getter_sym(zan_irgen_t *g, zan_symbol_t *prop) {
+zan_symbol_t *property_getter_sym(zan_irgen_t *g, zan_symbol_t *prop) {
     if (!prop || prop->kind != SYM_PROPERTY || !prop->decl) return NULL;
     if (!prop->decl->field_decl.getter_body) return NULL;
     zan_symbol_t *type_sym = prop->parent;
@@ -3367,7 +3355,7 @@ static zan_symbol_t *property_getter_sym(zan_irgen_t *g, zan_symbol_t *prop) {
 }
 
 /* 在已求值的接收者上发射属性 getter 方法调用 */
-static LLVMValueRef emit_property_getter_call(zan_irgen_t *g,
+LLVMValueRef emit_property_getter_call(zan_irgen_t *g,
                                               zan_symbol_t *getter,
                                               zan_type_t *recv_type,
                                               LLVMValueRef recv,
@@ -3412,7 +3400,7 @@ static LLVMValueRef emit_property_getter_call(zan_irgen_t *g,
 }
 
 /* 获取属性 setter 方法符号 */
-static zan_symbol_t *property_setter_sym(zan_irgen_t *g, zan_symbol_t *prop) {
+zan_symbol_t *property_setter_sym(zan_irgen_t *g, zan_symbol_t *prop) {
     if (!prop || prop->kind != SYM_PROPERTY || !prop->decl) return NULL;
     if (!prop->decl->field_decl.setter_body) return NULL;
     zan_symbol_t *type_sym = prop->parent;
@@ -3431,7 +3419,7 @@ static zan_symbol_t *property_setter_sym(zan_irgen_t *g, zan_symbol_t *prop) {
 }
 
 /* 在接收者上发射 set_Prop(value) 调用，传入右值作为实参 */
-static void emit_property_setter_call(zan_irgen_t *g, zan_symbol_t *setter,
+void emit_property_setter_call(zan_irgen_t *g, zan_symbol_t *setter,
                                       zan_type_t *recv_type, LLVMValueRef recv,
                                       LLVMValueRef value,
                                       zan_ast_node_t *obj_ast,

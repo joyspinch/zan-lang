@@ -1,4 +1,44 @@
-/* main_options_parse.c - 编译器 CLI 选项声明与命令行解析循环 */
+/* main_options_parse.c - 独立 CLI 选项解析编译单元 (B-ID103) */
+
+#include "main_options_parse.h"
+#include "crosscomp.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+void zan_options_init(zan_options_t *opts) {
+    memset(opts, 0, sizeof(*opts));
+    opts->check_leaks_opt = -1;
+    opts->arc_guard_opt = -1;
+    opts->runtime_checks_opt = -1;
+    opts->runtime_checks = true;
+    opts->obfuscate_strings_opt = -1;
+    opts->error_limit = -1;
+    opts->auto_stdlib = true;
+    opts->package_scope = ZAN_PKG_SCOPE_PROJECT;
+    opts->opt_level = -1;
+}
+
+zan_options_status_t zan_options_parse(int argc, char **argv, zan_options_t *opts) {
+    zan_options_init(opts);
+
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--version") == 0 || strcmp(argv[i], "-v") == 0) {
+            printf("zanc %s\n", ZAN_VERSION);
+            opts->exit_code = 0;
+            return ZAN_OPTIONS_EXIT;
+        }
+        if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
+            print_usage();
+            opts->exit_code = 0;
+            return ZAN_OPTIONS_EXIT;
+        }
+    }
+    if (argc < 2) {
+        print_usage();
+        opts->exit_code = 1;
+        return ZAN_OPTIONS_ERROR;
+    }
 
     const char *input_file = NULL;
     const char **input_files = NULL;
@@ -66,6 +106,8 @@
     const char *extra_lib_paths[ZAN_LINK_MAX_DIRS]; int extra_lib_path_count = 0;
     char resolved_stdlib_root[1024] = {0};
 
+
+
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--dump-tokens") == 0) {
             do_dump_tokens = true;
@@ -131,7 +173,7 @@
             const char *m = argv[++i];
             if (strcmp(m, "static") == 0) link_static_drivers = true;
             else if (strcmp(m, "shared") == 0) link_static_drivers = false;
-            else { fprintf(stderr, "error: --link-mode must be 'static' or 'shared'\n"); return 1; }
+            else { fprintf(stderr, "error: --link-mode must be 'static' or 'shared'\n"); opts->exit_code = 1; return ZAN_OPTIONS_ERROR; }
         } else if (strcmp(argv[i], "--driver-dir") == 0 && i + 1 < argc) {
             driver_dir_override = argv[++i];
         } else if (strcmp(argv[i], "--target") == 0 && i + 1 < argc) {
@@ -142,9 +184,9 @@
             printf("Available cross-compilation targets:\n");
             for (int t = 0; t < nt; t++)
                 printf("  %-12s %-30s %s\n", ts[t].name, ts[t].triple, ts[t].desc);
-            return 0;
+            opts->exit_code = 0; return ZAN_OPTIONS_EXIT;
         } else if (strcmp(argv[i], "--api") == 0 && i + 1 < argc) {
-            return zan_query_api(argv[++i]);
+            opts->exit_code = zan_query_api(argv[++i]); return ZAN_OPTIONS_EXIT;
         } else if (strcmp(argv[i], "--stdlib-path") == 0 && i + 1 < argc) {
             stdlib_path = argv[++i];
         } else if (strcmp(argv[i], "--auto-stdlib") == 0) {
@@ -168,7 +210,7 @@
             const char *scope = argv[++i];
             if (strcmp(scope, "project") == 0) package_scope = ZAN_PKG_SCOPE_PROJECT;
             else if (strcmp(scope, "global") == 0) package_scope = ZAN_PKG_SCOPE_GLOBAL;
-            else { fprintf(stderr, "ZANPKG_STATUS action=install status=invalid_scope\n"); return 1; }
+            else { fprintf(stderr, "ZANPKG_STATUS action=install status=invalid_scope\n"); opts->exit_code = 1; return ZAN_OPTIONS_ERROR; }
         } else if (strcmp(argv[i], "-o") == 0 && i + 1 < argc) {
             output_file = argv[++i];
         } else if (strcmp(argv[i], "-O0") == 0) {
@@ -193,7 +235,7 @@
                 lv < 0 || lv > INT_MAX) {
                 fprintf(stderr, "zanc: invalid value '%s' in '-ferror-limit='\n",
                         lim);
-                return 1;
+                opts->exit_code = 1; return ZAN_OPTIONS_ERROR;
             }
             error_limit = (int)lv;
         } else if (strcmp(argv[i], "--subsystem") == 0 && i + 1 < argc) {
@@ -224,16 +266,16 @@
             icon_path = argv[++i];
         } else if (strcmp(argv[i], "--embed") == 0 && i + 1 < argc) {
             if (embed_spec_count < ZAN_MAX_EMBED_SPECS) embed_specs[embed_spec_count++] = argv[++i];
-            else { fprintf(stderr, "error: too many --embed (max %d)\n", ZAN_MAX_EMBED_SPECS); return 1; }
+            else { fprintf(stderr, "error: too many --embed (max %d)\n", ZAN_MAX_EMBED_SPECS); opts->exit_code = 1; return ZAN_OPTIONS_ERROR; }
         } else if (strcmp(argv[i], "--link-input") == 0 && i + 1 < argc) {
             if (!zan_link_path_is_safe(argv[i + 1])) {
                 fprintf(stderr,
                         "error: --link-input value may not contain double"
                         " quotes or control characters\n");
-                return 1;
+                opts->exit_code = 1; return ZAN_OPTIONS_ERROR;
             }
             if (extra_link_input_count < ZAN_MAX_LINK_INPUTS) extra_link_inputs[extra_link_input_count++] = argv[++i];
-            else { fprintf(stderr, "error: too many --link-input (max %d)\n", ZAN_MAX_LINK_INPUTS); return 1; }
+            else { fprintf(stderr, "error: too many --link-input (max %d)\n", ZAN_MAX_LINK_INPUTS); opts->exit_code = 1; return ZAN_OPTIONS_ERROR; }
         } else if (strcmp(argv[i], "--link-lib") == 0 && i + 1 < argc) {
             /* 该值会被原样拼进链接命令行（-l<lib>）后经 system() 执行：
              * 引号/空格/&/| 等元字符就是命令注入面（审计 P1-9）。库名
@@ -250,33 +292,33 @@
             if (extra_link_lib_count < ZAN_LINK_MAX_LIBS)
                 extra_link_libs[extra_link_lib_count++] = argv[++i];
             else { fprintf(stderr, "error: too many --link-lib (max %d)\n",
-                           ZAN_LINK_MAX_LIBS); return 1; }
+                           ZAN_LINK_MAX_LIBS); opts->exit_code = 1; return ZAN_OPTIONS_ERROR; }
         } else if (strcmp(argv[i], "--libpath") == 0 && i + 1 < argc) {
             if (!zan_link_path_is_safe(argv[i + 1])) {
                 fprintf(stderr,
                         "error: --libpath value may not contain double"
                         " quotes or control characters\n");
-                return 1;
+                opts->exit_code = 1; return ZAN_OPTIONS_ERROR;
             }
             if (extra_lib_path_count < ZAN_LINK_MAX_DIRS)
                 extra_lib_paths[extra_lib_path_count++] = argv[++i];
             else { fprintf(stderr, "error: too many --libpath (max %d)\n",
-                           ZAN_LINK_MAX_DIRS); return 1; }
+                           ZAN_LINK_MAX_DIRS); opts->exit_code = 1; return ZAN_OPTIONS_ERROR; }
         } else if (strncmp(argv[i], "-L", 2) == 0 && argv[i][2] != '\0') {
             if (!zan_link_path_is_safe(argv[i] + 2)) {
                 fprintf(stderr,
                         "error: -L value may not contain double quotes"
                         " or control characters\n");
-                return 1;
+                opts->exit_code = 1; return ZAN_OPTIONS_ERROR;
             }
             if (extra_lib_path_count < ZAN_LINK_MAX_DIRS)
                 extra_lib_paths[extra_lib_path_count++] = argv[i] + 2;
             else { fprintf(stderr, "error: too many -L dirs (max %d)\n",
-                           ZAN_LINK_MAX_DIRS); return 1; }
+                           ZAN_LINK_MAX_DIRS); opts->exit_code = 1; return ZAN_OPTIONS_ERROR; }
         } else if (strncmp(argv[i], "-D", 2) == 0 && argv[i][2] != '\0') {
             if (pp_define_count < ZAN_MAX_PP_DEFINES) pp_defines[pp_define_count++] = argv[i] + 2;
             else { fprintf(stderr, "error: too many -D defines (max %d)\n", ZAN_MAX_PP_DEFINES);
-                   return 1; }
+                   opts->exit_code = 1; return ZAN_OPTIONS_ERROR; }
         } else if (argv[i][0] != '-') {
             /* 位置参数可以是源文件，也可以是目录：目录递归展开成 .zan 列表。
                命令行长度因此与项目规模解耦（见 zan_collect_dir_sources）。 */
@@ -287,7 +329,7 @@
                 if (input_count == before) {
                     fprintf(stderr,
                             "error: no .zan source files under '%s'\n", argv[i]);
-                    return 1;
+                    opts->exit_code = 1; return ZAN_OPTIONS_ERROR;
                 }
                 qsort(input_files + before, (size_t)(input_count - before),
                       sizeof(*input_files), zan_path_cmp);
@@ -296,23 +338,24 @@
             }
         } else {
             fprintf(stderr, "unknown option: %s\n", argv[i]);
-            return 1;
+            opts->exit_code = 1; return ZAN_OPTIONS_ERROR;
         }
     }
+
 
     if (package_api) {
         char status[256];
         if (!zan_pkg_api_validate(package_api, status, sizeof(status))) {
-            fprintf(stderr, "%s\n", status); return 1;
+            fprintf(stderr, "%s\n", status); opts->exit_code = 1; return ZAN_OPTIONS_ERROR;
         }
         if (!package_install_dir) {
-            fprintf(stderr, "%s\n", status); return 2;
+            fprintf(stderr, "%s\n", status); opts->exit_code = 2; return ZAN_OPTIONS_ERROR;
         }
     }
     if (package_install_dir) {
         char status[512];
         if (!package_name) {
-            fprintf(stderr, "ZANPKG_STATUS action=install status=missing_name\n"); return 1;
+            fprintf(stderr, "ZANPKG_STATUS action=install status=missing_name\n"); opts->exit_code = 1; return ZAN_OPTIONS_ERROR;
         }
         const char *install_project = package_project ? package_project : ".";
         zan_package_t package_manifest;
@@ -329,6 +372,78 @@
                     package_manifest.plugin_id, package_name,
                     package_scope == ZAN_PKG_SCOPE_GLOBAL ? "global" : "project");
         if (manifest_ok) { zan_pkg_destroy(&package_manifest); }
-        return ok ? 0 : 1;
+        opts->exit_code = ok ? 0 : 1; return ZAN_OPTIONS_EXIT;
     }
 
+
+
+
+    opts->input_file = input_file;
+    opts->input_files = input_files;
+    opts->input_count = input_count;
+    opts->input_cap = input_cap;
+    opts->explicit_input_count = explicit_input_count;
+    opts->output_file = output_file;
+    opts->do_dump_tokens = do_dump_tokens;
+    opts->do_dump_ast = do_dump_ast;
+    opts->emit_symbols_path = emit_symbols_path;
+    opts->gen_meta_path = gen_meta_path;
+    opts->do_emit_ir = do_emit_ir;
+    opts->check_leaks_opt = check_leaks_opt;
+    opts->checked_arith = checked_arith;
+    opts->arc_guard_opt = arc_guard_opt;
+    opts->runtime_checks_opt = runtime_checks_opt;
+    opts->runtime_checks = runtime_checks;
+    opts->strict_runtime = strict_runtime;
+    opts->publish_mode = publish_mode;
+    opts->obfuscate_strings_opt = obfuscate_strings_opt;
+    opts->hide_diagnostics = hide_diagnostics;
+    opts->site_map_path = site_map_path;
+    opts->strip_symbols = strip_symbols;
+    opts->error_limit = error_limit;
+    opts->debug_info = debug_info;
+    opts->fast_alloc_opt = fast_alloc_opt;
+    opts->stdlib_path = stdlib_path;
+    opts->auto_stdlib = auto_stdlib;
+    opts->packages_disabled = packages_disabled;
+    opts->quiet = quiet;
+    opts->package_api = package_api;
+    opts->package_install_dir = package_install_dir;
+    opts->package_name = package_name;
+    opts->package_project = package_project;
+    opts->package_list_missing = package_list_missing;
+    opts->do_deny_warnings = do_deny_warnings;
+    opts->warn_level_arg = warn_level_arg;
+    opts->suppress_arg = suppress_arg;
+    opts->package_scope = package_scope;
+    opts->opt_level = opt_level;
+    for (int k = 0; k < pp_define_count && k < ZAN_MAX_PP_DEFINES; k++) opts->pp_defines[k] = pp_defines[k];
+    opts->pp_define_count = pp_define_count;
+    opts->target_name = target_name;
+    opts->link_static_drivers = link_static_drivers;
+    opts->driver_dir_override = driver_dir_override;
+    opts->link_subsystem = link_subsystem;
+    opts->icon_path = icon_path;
+    opts->no_icon = no_icon;
+    opts->default_icon_explicit = default_icon_explicit;
+    opts->emit_lib = emit_lib;
+    opts->lib_shared = lib_shared;
+    opts->apk_path = apk_path;
+    opts->apk_package = apk_package;
+    opts->apk_label = apk_label;
+    opts->ipa_path = ipa_path;
+    opts->ipa_bundle_id = ipa_bundle_id;
+    opts->ipa_name = ipa_name;
+    for (int k = 0; k < extra_link_input_count && k < ZAN_MAX_LINK_INPUTS; k++) opts->extra_link_inputs[k] = extra_link_inputs[k];
+    opts->extra_link_input_count = extra_link_input_count;
+    for (int k = 0; k < embed_spec_count && k < ZAN_MAX_EMBED_SPECS; k++) opts->embed_specs[k] = embed_specs[k];
+    opts->embed_spec_count = embed_spec_count;
+    for (int k = 0; k < extra_link_lib_count && k < ZAN_LINK_MAX_LIBS; k++) opts->extra_link_libs[k] = extra_link_libs[k];
+    opts->extra_link_lib_count = extra_link_lib_count;
+    for (int k = 0; k < extra_lib_path_count && k < ZAN_LINK_MAX_DIRS; k++) opts->extra_lib_paths[k] = extra_lib_paths[k];
+    opts->extra_lib_path_count = extra_lib_path_count;
+    memcpy(opts->resolved_stdlib_root, resolved_stdlib_root, sizeof(opts->resolved_stdlib_root));
+    opts->exit_code = 0;
+    return ZAN_OPTIONS_OK;
+
+}

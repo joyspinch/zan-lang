@@ -1,3 +1,4 @@
+#include "irgen_internal.h"
 
 #include <llvm-c/IRReader.h>
 #include <limits.h>

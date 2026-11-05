@@ -1,6 +1,6 @@
 /* main_options.c - 命令行帮助、@argfile 响应档展开与参数路径安全校验 */
 
-static void print_usage(void) {
+void print_usage(void) {
     fprintf(stderr, "Zan Compiler v%s\n", ZAN_VERSION);
     fprintf(stderr, "Usage: zanc <source.zan|dir...> [options]\n");
     fprintf(stderr, "Options:\n");
@@ -210,7 +210,7 @@ static void expand_arg_files(int *argc, char ***argv) {
  * （Windows 文件名非法字符；POSIX 上也从未必要——参数经 argv 传递，
  * 空格无需引号包裹），控制字符同理一律拒绝。不做转义：转义层要同时
  * 伺候 cmd 与 /bin/sh 两套规则，漏一条就是注入。 */
-static bool zan_link_path_is_safe(const char *v) {
+bool zan_link_path_is_safe(const char *v) {
     for (const char *p = v; *p; p++) {
         if (*p == '"' || (unsigned char)*p < 0x20) {
             return false;

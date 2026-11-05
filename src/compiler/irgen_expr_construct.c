@@ -1,3 +1,4 @@
+#include "irgen_internal.h"
 
 /* LINQ 查询表达式完整降解实现 */
 
@@ -794,8 +795,7 @@ static void query_group_into_pass(zan_irgen_t *g, zan_ast_node_t *expr,
     locals->count = lmark;
     query_loop_close(g, &l);
 }
-
-static LLVMValueRef emit_expr_query_expr(zan_irgen_t *g, zan_ast_node_t *expr,
+LLVMValueRef emit_expr_query_expr(zan_irgen_t *g, zan_ast_node_t *expr,
         local_scope_t *locals) {
     LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
     LLVMValueRef fn = LLVMGetBasicBlockParent(LLVMGetInsertBlock(g->builder));
@@ -956,7 +956,7 @@ static LLVMValueRef emit_expr_query_expr(zan_irgen_t *g, zan_ast_node_t *expr,
 }
 
 /* 元组字面量 (a, b, ...)：分配并填充合成的匿名元组结构体值 */
-static LLVMValueRef emit_expr_tuple(zan_irgen_t *g, zan_ast_node_t *expr,
+LLVMValueRef emit_expr_tuple(zan_irgen_t *g, zan_ast_node_t *expr,
                                     local_scope_t *locals) {
     zan_type_t *ttype = infer_expr_type(g, expr, locals);
     if (!ttype || ttype->kind != TYPE_STRUCT || !ttype->sym) {
@@ -999,10 +999,8 @@ static LLVMValueRef emit_expr_tuple(zan_irgen_t *g, zan_ast_node_t *expr,
     }
     return alloca;
 }
-
-static zan_ast_node_t *owned_rhs_marker(zan_irgen_t *g, zan_loc_t loc);
-
-static LLVMValueRef emit_expr_new_expr(zan_irgen_t *g, zan_ast_node_t *expr,
+zan_ast_node_t *owned_rhs_marker(zan_irgen_t *g, zan_loc_t loc);
+LLVMValueRef emit_expr_new_expr(zan_irgen_t *g, zan_ast_node_t *expr,
         local_scope_t *locals) {
         /* 工厂调用接对象初始化式 */
         if (!expr->new_expr.type && expr->new_expr.call_init) {
@@ -2076,8 +2074,7 @@ static LLVMValueRef coerce_ternary_value(zan_irgen_t *g, LLVMValueRef v,
         return LLVMBuildFPToSI(g->builder, v, target, "tern.fptosi");
     return coerce_int_to(g, v, target);
 }
-
-static LLVMValueRef emit_expr_conditional(zan_irgen_t *g, zan_ast_node_t *expr,
+LLVMValueRef emit_expr_conditional(zan_irgen_t *g, zan_ast_node_t *expr,
         local_scope_t *locals) {
         LLVMValueRef cond = emit_expr(g, expr->conditional.cond, locals);
         /* normalize to i1 */
@@ -2181,7 +2178,7 @@ static LLVMValueRef emit_expr_conditional(zan_irgen_t *g, zan_ast_node_t *expr,
 }
 
 /* switch 表达式 (expr switch { pattern => result, ... }) 模式匹配降解 */
-static LLVMValueRef emit_expr_switch_expr(zan_irgen_t *g, zan_ast_node_t *expr,
+LLVMValueRef emit_expr_switch_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                                           local_scope_t *locals) {
     zan_type_t *rty = infer_expr_type(g, expr, locals);
     if (!rty || rty->kind == TYPE_ERROR || rty->kind == TYPE_VOID)
@@ -2244,7 +2241,7 @@ static LLVMValueRef emit_expr_switch_expr(zan_irgen_t *g, zan_ast_node_t *expr,
 }
 
 /* record with 表达式：非破坏性浅拷贝并覆盖指定字段 */
-static LLVMValueRef emit_expr_with_expr(zan_irgen_t *g, zan_ast_node_t *expr,
+LLVMValueRef emit_expr_with_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                                         local_scope_t *locals) {
     zan_istr_t cm = { (char *)"__CloneWith", 11 };
     zan_type_t *rty = concretize(g, infer_expr_type(g, expr->with_expr.expr,
@@ -2578,8 +2575,7 @@ static bool await_target_is_async(zan_irgen_t *g, zan_ast_node_t *expr,
     }
     return false;
 }
-
-static LLVMValueRef emit_expr_await_expr(zan_irgen_t *g, zan_ast_node_t *expr,
+LLVMValueRef emit_expr_await_expr(zan_irgen_t *g, zan_ast_node_t *expr,
         local_scope_t *locals) {
         /* await 落在 async 方法的 lambda 体内：lambda 不是协程，没有自己的帧可挂
          * ——硬降级会把外层协程的块当自己的用（跨函数的 br，LLVM 校验直接失败：
@@ -3226,11 +3222,10 @@ static zan_symbol_t *find_conversion_method(zan_irgen_t *g, zan_symbol_t *sym,
 }
 
 /* 合成 new 节点作为所有权标记 */
-static zan_ast_node_t *owned_rhs_marker(zan_irgen_t *g, zan_loc_t loc) {
+zan_ast_node_t *owned_rhs_marker(zan_irgen_t *g, zan_loc_t loc) {
     return zan_ast_new(g->arena, AST_NEW_EXPR, loc);
 }
-
-static zan_symbol_t *find_user_conversion(zan_irgen_t *g, zan_type_t *from_type,
+zan_symbol_t *find_user_conversion(zan_irgen_t *g, zan_type_t *from_type,
                                           zan_type_t *to_type,
                                           const char *op_name) {
     if (!from_type || !to_type) return NULL;
@@ -3246,8 +3241,7 @@ static zan_symbol_t *find_user_conversion(zan_irgen_t *g, zan_type_t *from_type,
     }
     return NULL;
 }
-
-static LLVMValueRef emit_user_conversion(zan_irgen_t *g, zan_type_t *from_type,
+LLVMValueRef emit_user_conversion(zan_irgen_t *g, zan_type_t *from_type,
                                          zan_type_t *to_type, const char *op_name,
                                          LLVMValueRef val, zan_ast_node_t *val_expr,
                                          local_scope_t *locals) {
@@ -3355,23 +3349,20 @@ static LLVMValueRef emit_wasm_cb_thunk(zan_irgen_t *g, LLVMValueRef fn) {
     LLVMPositionBuilderAtEnd(g->builder, saved_bb);
     return thunk;
 }
-
-static int type_is_or_derives(zan_type_t *s, zan_type_t *t);
-static LLVMValueRef emit_runtime_is_check_name(zan_irgen_t *g, LLVMValueRef x,
+int type_is_or_derives(zan_type_t *s, zan_type_t *t);
+LLVMValueRef emit_runtime_is_check_name(zan_irgen_t *g, LLVMValueRef x,
                                                zan_type_t *tt);
-
-static LLVMValueRef emit_runtime_is_check_name(zan_irgen_t *g, LLVMValueRef x,
+LLVMValueRef emit_runtime_is_check_name(zan_irgen_t *g, LLVMValueRef x,
                                                zan_type_t *tt);
 
 /* A454 装箱三助手（定义在 emit_runtime_is_check_name 之后） */
-static bool irgen_boxed_eligible_struct(zan_irgen_t *g, zan_type_t *t);
-static LLVMValueRef emit_box_struct(zan_irgen_t *g, zan_type_t *st,
+bool irgen_boxed_eligible_struct(zan_irgen_t *g, zan_type_t *t);
+LLVMValueRef emit_box_struct(zan_irgen_t *g, zan_type_t *st,
                                     zan_ast_node_t *src_expr,
                                     LLVMValueRef val, local_scope_t *locals);
 static LLVMValueRef emit_unbox_struct(zan_irgen_t *g, zan_type_t *tt,
                                       LLVMValueRef val, zan_ast_node_t *expr);
-
-static LLVMValueRef emit_expr_cast_expr(zan_irgen_t *g, zan_ast_node_t *expr,
+LLVMValueRef emit_expr_cast_expr(zan_irgen_t *g, zan_ast_node_t *expr,
         local_scope_t *locals) {
         zan_type_t *tt0 = resolve_type_ctx(g, expr->cast.type);
         /* 传递裸函数指针供外部原生代码调用 */
@@ -3602,8 +3593,7 @@ static LLVMValueRef emit_expr_cast_expr(zan_irgen_t *g, zan_ast_node_t *expr,
         return val;
     return LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 0, 0);
 }
-
-static int type_is_or_derives(zan_type_t *s, zan_type_t *t) {
+int type_is_or_derives(zan_type_t *s, zan_type_t *t) {
     if (!s || !t) return 0;
     if (types_equal(s, t)) return 1;
     if (s->kind != TYPE_CLASS || t->kind != TYPE_CLASS) return 0;
@@ -3617,11 +3607,11 @@ static int type_is_or_derives(zan_type_t *s, zan_type_t *t) {
 }
 
 /* 运行时 x is T 严格祖先类型继承检查 */
-static LLVMValueRef emit_runtime_is_check(zan_irgen_t *g, LLVMValueRef x,
+LLVMValueRef emit_runtime_is_check(zan_irgen_t *g, LLVMValueRef x,
                                           const char *tname);
 
 /* 运行时 x is T 类型检查辅助封装 */
-static LLVMValueRef emit_runtime_is_check_name(zan_irgen_t *g, LLVMValueRef x,
+LLVMValueRef emit_runtime_is_check_name(zan_irgen_t *g, LLVMValueRef x,
                                                zan_type_t *tt) {
     char tbuf[320];
     const char *ns = NULL;
@@ -3638,8 +3628,7 @@ static LLVMValueRef emit_runtime_is_check_name(zan_irgen_t *g, LLVMValueRef x,
     tbuf[nlen] = 0;
     return emit_runtime_is_check(g, x, tbuf);
 }
-
-static LLVMValueRef emit_runtime_is_check(zan_irgen_t *g, LLVMValueRef x,
+LLVMValueRef emit_runtime_is_check(zan_irgen_t *g, LLVMValueRef x,
                                           const char *tname) {
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
     LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
@@ -3767,7 +3756,7 @@ static LLVMValueRef emit_runtime_is_check(zan_irgen_t *g, LLVMValueRef x,
 /* A454 装箱资格：用户声明的 struct、无显式布局、字段（含嵌套）不含
  * 托管引用。判定与 checker 侧 checker_struct_boxable 同口径——irgen 侧
  * 复用现成的 type_contains_collection_rc（含嵌套展开与 weak 跳过）。 */
-static bool irgen_boxed_eligible_struct(zan_irgen_t *g, zan_type_t *t) {
+bool irgen_boxed_eligible_struct(zan_irgen_t *g, zan_type_t *t) {
     if (!t || t->kind != TYPE_STRUCT || !t->sym) return false;
     zan_symbol_t *sym = t->sym;
     if (!sym->decl || sym->decl->kind != AST_STRUCT_DECL) return false;
@@ -3786,7 +3775,7 @@ static bool irgen_boxed_eligible_struct(zan_irgen_t *g, zan_type_t *t) {
  * raw[8..15]=site 字。托管字段结构体（A556-3）同一协议：来源非 owned
  * 时对托管字段 retain，箱的释放函数按字段 walk 释放（含嵌套结构体
  * 下钻）。 */
-static LLVMValueRef emit_box_struct(zan_irgen_t *g, zan_type_t *st,
+LLVMValueRef emit_box_struct(zan_irgen_t *g, zan_type_t *st,
                                     zan_ast_node_t *src_expr,
                                     LLVMValueRef val, local_scope_t *locals) {
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);

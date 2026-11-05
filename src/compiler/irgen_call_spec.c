@@ -1,4 +1,5 @@
-static bool ident_names_own_field(zan_irgen_t *g, zan_ast_node_t *e) {
+#include "irgen_internal.h"
+bool ident_names_own_field(zan_irgen_t *g, zan_ast_node_t *e) {
     if (!e || e->kind != AST_IDENTIFIER) return false;
     if (!g->current_type_sym) return false;
     if (g->current_this &&
@@ -17,8 +18,7 @@ static bool type_mentions_type_param(zan_type_t *t, int depth) {
         if (type_mentions_type_param(t->type_args[i], depth + 1)) return true;
     return false;
 }
-
-static bool call_receiver_is_open_generic(zan_irgen_t *g, zan_ast_node_t *call,
+bool call_receiver_is_open_generic(zan_irgen_t *g, zan_ast_node_t *call,
                                          local_scope_t *locals) {
     if (g->current_type_sym && g->current_type_sym->decl &&
         (g->current_type_sym->decl->kind == AST_CLASS_DECL ||
@@ -36,8 +36,7 @@ static bool call_receiver_is_open_generic(zan_irgen_t *g, zan_ast_node_t *call,
             return true;
     return false;
 }
-
-static void diagnose_unresolved_static_chain(zan_irgen_t *g,
+void diagnose_unresolved_static_chain(zan_irgen_t *g,
                                              zan_ast_node_t *recv) {
     while (recv && recv->kind == AST_CALL) {
         zan_ast_node_t *callee = recv->call.callee;
@@ -60,8 +59,7 @@ static void diagnose_unresolved_static_chain(zan_irgen_t *g,
         recv = obj;
     }
 }
-
-static int format_name_path(zan_ast_node_t *n, char *buf, int cap) {
+int format_name_path(zan_ast_node_t *n, char *buf, int cap) {
     if (!n || cap <= 0) return 0;
     if (n->kind == AST_IDENTIFIER) {
         int l = (int)n->ident.name.len;
@@ -82,8 +80,7 @@ static int format_name_path(zan_ast_node_t *n, char *buf, int cap) {
     }
     return 0;
 }
-
-static bool src_method_takes_over(zan_irgen_t *g, zan_ast_node_t *expr,
+bool src_method_takes_over(zan_irgen_t *g, zan_ast_node_t *expr,
         local_scope_t *locals) {
     zan_ast_node_t *callee = expr->call.callee;
     if (callee->kind != AST_MEMBER_ACCESS ||
@@ -94,8 +91,7 @@ static bool src_method_takes_over(zan_irgen_t *g, zan_ast_node_t *expr,
     if (!ts || (ts->kind != SYM_CLASS && ts->kind != SYM_STRUCT)) return false;
     return get_method_sym(ts, callee->member.name) != NULL;
 }
-
-static int try_method_spec(zan_irgen_t *g, zan_symbol_t *msym,
+int try_method_spec(zan_irgen_t *g, zan_symbol_t *msym,
                            zan_ast_node_t *call, zan_ast_node_t *recv_expr,
                            local_scope_t *locals) {
     if (!msym || !msym->decl || msym->decl->kind != AST_METHOD_DECL) return -1;
@@ -131,10 +127,9 @@ static int try_method_spec(zan_irgen_t *g, zan_symbol_t *msym,
 }
 
 /* 实参入异常展开栈（临时量的所有权在调用方，调用抛异常时要释放） */
-static int emit_call_arg_eh_push(zan_irgen_t *g, zan_ast_node_t *arg,
+int emit_call_arg_eh_push(zan_irgen_t *g, zan_ast_node_t *arg,
                                  LLVMValueRef val, local_scope_t *locals);
-
-static LLVMValueRef emit_method_spec_call(zan_irgen_t *g, int idx,
+LLVMValueRef emit_method_spec_call(zan_irgen_t *g, int idx,
                                           zan_ast_node_t *call,
                                           zan_ast_node_t *recv_expr,
                                           local_scope_t *locals) {
@@ -208,8 +203,7 @@ static LLVMValueRef emit_method_spec_call(zan_irgen_t *g, int idx,
     free(call_args);
     return result;
 }
-
-static LLVMValueRef emit_string_copy_range(zan_irgen_t *g,
+LLVMValueRef emit_string_copy_range(zan_irgen_t *g,
         LLVMValueRef start, LLVMValueRef end) {
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
     LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
@@ -231,7 +225,7 @@ static LLVMValueRef emit_string_copy_range(zan_irgen_t *g,
 }
 
 /* 检查 Lambda 函数体内是否包含显式带值返回 (return <expr>;) */
-static bool lambda_body_has_value_return(zan_ast_node_t *n) {
+bool lambda_body_has_value_return(zan_ast_node_t *n) {
     if (!n) return false;
     switch (n->kind) {
     case AST_RETURN_STMT:
@@ -266,14 +260,13 @@ static bool lambda_body_has_value_return(zan_ast_node_t *n) {
         return false;
     }
 }
-
-static int is_string_like_expr(zan_irgen_t *g, zan_ast_node_t *e,
+int is_string_like_expr(zan_irgen_t *g, zan_ast_node_t *e,
                                local_scope_t *locals) {
     return is_string_expr(g, e, locals) || expr_is_char(g, e, locals);
 }
 
 /* 发射`e` as a C string */
-static LLVMValueRef emit_string_like_arg(zan_irgen_t *g, zan_ast_node_t *e,
+LLVMValueRef emit_string_like_arg(zan_irgen_t *g, zan_ast_node_t *e,
                                          local_scope_t *locals, int *owned) {
     LLVMValueRef v = emit_expr(g, e, locals);
     *owned = 0;
@@ -284,15 +277,13 @@ static LLVMValueRef emit_string_like_arg(zan_irgen_t *g, zan_ast_node_t *e,
     }
     return v;
 }
-
-static void release_string_like_arg(zan_irgen_t *g, zan_ast_node_t *e,
+void release_string_like_arg(zan_irgen_t *g, zan_ast_node_t *e,
                                     LLVMValueRef v, int owned,
                                     local_scope_t *locals) {
     if (owned) emit_string_release(g, v);
     else emit_release_owned_call_temp(g, e, v, locals);
 }
-
-static int irgen_enum_members(zan_symbol_t *sym, zan_symbol_t **out_syms,
+int irgen_enum_members(zan_symbol_t *sym, zan_symbol_t **out_syms,
                               long long *out_vals, int cap) {
     if (!sym) { return 0; }
     long long val = 0;
@@ -312,8 +303,7 @@ static int irgen_enum_members(zan_symbol_t *sym, zan_symbol_t **out_syms,
     }
     return n;
 }
-
-static int emit_intrinsic_own_recv(zan_irgen_t *g, zan_ast_node_t *lobj,
+int emit_intrinsic_own_recv(zan_irgen_t *g, zan_ast_node_t *lobj,
                                    LLVMValueRef recv, local_scope_t *locals) {
     zan_type_t *lt = infer_expr_type(g, lobj, locals);
     if (!lt || !is_rc_managed_type(lt) ||
@@ -322,15 +312,13 @@ static int emit_intrinsic_own_recv(zan_irgen_t *g, zan_ast_node_t *lobj,
     emit_eh_tmp_push(g, recv);
     return 1;
 }
-
-static void emit_intrinsic_drop_recv(zan_irgen_t *g, zan_ast_node_t *lobj,
+void emit_intrinsic_drop_recv(zan_irgen_t *g, zan_ast_node_t *lobj,
                                      LLVMValueRef recv, local_scope_t *locals,
                                      int pushed) {
     if (pushed) emit_eh_tmp_pop(g);
     emit_release_owned_call_temp(g, lobj, recv, locals);
 }
-
-static int emit_call_arg_eh_push(zan_irgen_t *g, zan_ast_node_t *arg,
+int emit_call_arg_eh_push(zan_irgen_t *g, zan_ast_node_t *arg,
                                  LLVMValueRef val, local_scope_t *locals) {
     zan_type_t *at = infer_expr_type(g, arg, locals);
     if (!call_arg_is_owned_temp(g, arg, at, locals) ||
@@ -364,7 +352,7 @@ static int emit_call_arg_eh_push(zan_irgen_t *g, zan_ast_node_t *arg,
  * 早先这里固定返回 i32 0，于是调用点拿 i32 去和字符串指针比较，
  * LLVM 校验直接报 "Both operands to ICmp instruction are not of the same
  * type"，整份程序编不出来。这里按返回类型给同类型的默认值。 */
-static LLVMValueRef emit_unresolved_call_result(zan_irgen_t *g,
+LLVMValueRef emit_unresolved_call_result(zan_irgen_t *g,
                                                  zan_ast_node_t *expr,
                                                  local_scope_t *locals) {
     LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
@@ -405,7 +393,7 @@ static LLVMValueRef emit_unresolved_call_result(zan_irgen_t *g,
    放行 object 的代价是它仍按 C 字符串读：里面装的是字符串时结果正确，装
    的是类实例时仍会越界读；治本要等 object 的通用 ToString 或把
    Convert.ToString 声明进 stdlib（A443），两边一起做。 */
-static bool type_is_textual_or_numeric(zan_type_t *t) {
+bool type_is_textual_or_numeric(zan_type_t *t) {
     if (!t) return true;
     switch (t->kind) {
     case TYPE_STRING: case TYPE_CHAR: case TYPE_ENUM: case TYPE_BOOL:
@@ -424,7 +412,7 @@ static bool type_is_textual_or_numeric(zan_type_t *t) {
 /* 纯文本解析型内建（int.Parse / double.Parse / TryParse）的实参必须是字符串。
    指针一路走到 strtoll/strtod 就是把对象的字节当文本读；数值实参更糟——
    strtoll 收 i8*，传 i64 进去直接生成非法 IR（LLVM 校验失败）。 */
-static bool type_is_text_arg(zan_type_t *t) {
+bool type_is_text_arg(zan_type_t *t) {
     if (!t) return true;
     switch (t->kind) {
     case TYPE_STRING: case TYPE_OBJECT: case TYPE_ERROR: case TYPE_TYPE_PARAM:
@@ -439,7 +427,7 @@ static bool type_is_text_arg(zan_type_t *t) {
 /* Math.* 的实参必须是数值。指针/结构体落进 SIToFP 会生成非法 IR——LLVM 校验
    失败（"Call parameter type does not match function signature"），编译直接
    死在代码生成阶段，用户看到的是内部错误而不是人话诊断。 */
-static bool math_arg_is_numeric(LLVMValueRef v) {
+bool math_arg_is_numeric(LLVMValueRef v) {
     LLVMTypeKind k = LLVMGetTypeKind(LLVMTypeOf(v));
     /* bool 降成 i1：C# 里 bool 没有到 double 的隐式转换，Math.Sqrt(true)
      * 应编译期拒绝（i1 的 SIToFP 是符号扩展，true 曾被当成 -1.0 →
@@ -464,7 +452,7 @@ static bool math_arg_is_bool(zan_irgen_t *g, zan_ast_node_t *arg_ast,
 }
 
 /* 数值实参统一成 double（int 走 sitofp，float 走 fpext）。 */
-static LLVMValueRef math_arg_to_double(zan_irgen_t *g, LLVMValueRef v) {
+LLVMValueRef math_arg_to_double(zan_irgen_t *g, LLVMValueRef v) {
     LLVMTypeRef dbl = LLVMDoubleTypeInContext(g->ctx);
     LLVMTypeKind k = LLVMGetTypeKind(LLVMTypeOf(v));
     if (k == LLVMFloatTypeKind) return LLVMBuildFPExt(g->builder, v, dbl, "ext");
@@ -475,7 +463,7 @@ static LLVMValueRef math_arg_to_double(zan_irgen_t *g, LLVMValueRef v) {
 /* 不是数值就报人话诊断（fail-closed），返回 false 让调用方回一个 0 值。
  * arg_ast 是实参的 AST 节点：bool 的判决按语义类型做（见 math_arg_is_bool），
  * 宽度判 i1 只是兜底（expr_is_bool 判不出的类型仍按降级后的宽度拒）。 */
-static bool math_require_numeric(zan_irgen_t *g, zan_ast_node_t *expr,
+bool math_require_numeric(zan_irgen_t *g, zan_ast_node_t *expr,
                                   zan_ast_node_t *arg_ast, LLVMValueRef v,
                                   local_scope_t *locals, const char *name) {
     if (math_arg_is_numeric(v) && !math_arg_is_bool(g, arg_ast, locals))
@@ -489,7 +477,7 @@ static bool math_require_numeric(zan_irgen_t *g, zan_ast_node_t *expr,
  * 直落 strtoll/strtod——"abc" 返 0 静默继续，"2147483648" 溢出静默接受。
  * 失败语义与 TryParse 对齐：软诊断（stderr 一次 + file:line）+ 安全值 0，
  * --strict-runtime 下 exit 70。 */
-static LLVMValueRef emit_parse_bad_pred(zan_irgen_t *g, LLVMValueRef s,
+LLVMValueRef emit_parse_bad_pred(zan_irgen_t *g, LLVMValueRef s,
                                         LLVMValueRef ep) {
     if (!g->runtime_checks || !g->current_fn)
         return LLVMConstInt(LLVMInt1TypeInContext(g->ctx), 0, 0);
@@ -509,7 +497,7 @@ static LLVMValueRef emit_parse_bad_pred(zan_irgen_t *g, LLVMValueRef s,
 }
 
 /* null 串进 strtoll 是 UB：先 guard（软诊断 + 空串替身） */
-static LLVMValueRef emit_parse_str_guard(zan_irgen_t *g, LLVMValueRef s,
+LLVMValueRef emit_parse_str_guard(zan_irgen_t *g, LLVMValueRef s,
                                          zan_loc_t loc) {
     if (!g->runtime_checks || !g->current_fn) return s;
     LLVMValueRef isnull = zan_icmp(g->builder, LLVMIntEQ, s,
@@ -601,8 +589,7 @@ static bool ifc_edge_matches_inst(zan_irgen_t *g, zan_ast_node_t *edge_ref, zan_
     }
     return true;
 }
-
-static bool class_inst_implements_iface(zan_irgen_t *g, zan_symbol_t *cls,
+bool class_inst_implements_iface(zan_irgen_t *g, zan_symbol_t *cls,
                                         zan_type_t *inst, zan_type_t *obj_ty) {
     if (!cls || !obj_ty || !obj_ty->sym) return false;
     if (!class_implements_iface(cls, obj_ty->sym)) return false;
@@ -673,8 +660,7 @@ static int objfam_ref_kind(zan_type_t *t) {
                  t->kind == TYPE_ARRAY || t->kind == TYPE_DELEGATE ||
                  t->kind == TYPE_TASK);
 }
-
-static LLVMValueRef emit_object_family_call(zan_irgen_t *g,
+LLVMValueRef emit_object_family_call(zan_irgen_t *g,
                                             zan_ast_node_t *expr, int fam,
                                             local_scope_t *locals) {
     LLVMContextRef c = g->ctx;
