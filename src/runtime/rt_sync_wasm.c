@@ -48,35 +48,59 @@ void zan_atomic_int_destroy(i64 handle) {
 
 i64 zan_atomic_int_load(i64 handle) {
     zan_wasm_atomic *a = (zan_wasm_atomic *)(intptr_t)handle;
-    return a ? a->value : 0;
+    if (!a) return 0;
+#if defined(__clang__) || defined(__GNUC__)
+    return __atomic_load_n(&a->value, __ATOMIC_SEQ_CST);
+#else
+    return a->value;
+#endif
 }
 
 void zan_atomic_int_store(i64 handle, i64 value) {
     zan_wasm_atomic *a = (zan_wasm_atomic *)(intptr_t)handle;
-    if (a) a->value = value;
+    if (!a) return;
+#if defined(__clang__) || defined(__GNUC__)
+    __atomic_store_n(&a->value, value, __ATOMIC_SEQ_CST);
+#else
+    a->value = value;
+#endif
 }
 
 i64 zan_atomic_int_exchange(i64 handle, i64 value) {
     zan_wasm_atomic *a = (zan_wasm_atomic *)(intptr_t)handle;
     if (!a) return 0;
+#if defined(__clang__) || defined(__GNUC__)
+    return __atomic_exchange_n(&a->value, value, __ATOMIC_SEQ_CST);
+#else
     i64 old = a->value;
     a->value = value;
     return old;
+#endif
 }
 
 i64 zan_atomic_int_compare_exchange(i64 handle, i64 expected, i64 desired) {
     zan_wasm_atomic *a = (zan_wasm_atomic *)(intptr_t)handle;
     if (!a) return 0;
+#if defined(__clang__) || defined(__GNUC__)
+    __atomic_compare_exchange_n(&a->value, &expected, desired, 0,
+                                __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+    return expected;
+#else
     if (a->value == expected) { a->value = desired; return expected; }
     return a->value;
+#endif
 }
 
 i64 zan_atomic_int_add(i64 handle, i64 delta) {
     zan_wasm_atomic *a = (zan_wasm_atomic *)(intptr_t)handle;
     if (!a) return 0;
+#if defined(__clang__) || defined(__GNUC__)
+    return __atomic_add_fetch(&a->value, delta, __ATOMIC_SEQ_CST);
+#else
     i64 old = a->value;
     a->value = old + delta;
     return old + delta; /* AtomicInt.Add 契约=加后新值：与原生 add_fetch 对齐 */
+#endif
 }
 
 

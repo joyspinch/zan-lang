@@ -10,6 +10,9 @@
 #if defined(__APPLE__) && !defined(_DARWIN_C_SOURCE)
 #define _DARWIN_C_SOURCE
 #endif
+#if (defined(__FreeBSD__) || defined(__DragonFly__)) && !defined(_BSD_SOURCE)
+#define _BSD_SOURCE 1
+#endif
 #if defined(__linux__) && !defined(_GNU_SOURCE)
 #define _GNU_SOURCE 1
 #endif
@@ -40,6 +43,12 @@
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#if defined(__FreeBSD__) || defined(__DragonFly__)
+#include <pthread_np.h>
+#endif
+#if defined(__NetBSD__)
+#include <lwp.h>
+#endif
 #endif
 
 #if defined(__linux__) && !defined(__GLIBC_PREREQ)
@@ -350,9 +359,7 @@ static void zan_lock_word_acquire(volatile uint32_t *word) {
         if (InterlockedCompareExchange((volatile LONG *)word, mine, 0) == 0)
             return;
         if (spin < 64) {
-#if defined(__i386__) || defined(__x86_64__)
-            __builtin_ia32_pause();
-#endif
+            YieldProcessor();
         } else if (spin < 4096 || (spin & 1023u) != 0) {
             SwitchToThread();
         } else {
@@ -382,6 +389,10 @@ static void zan_lock_word_acquire(volatile uint32_t *word) {
         if (spin < 64) {
 #if defined(__i386__) || defined(__x86_64__)
             __builtin_ia32_pause();
+#elif defined(__aarch64__) || defined(__arm__)
+            __asm__ __volatile__("yield" ::: "memory");
+#elif defined(__riscv)
+            __asm__ __volatile__(".insn i 0x0F, 0, x0, x0, 0x010" ::: "memory");
 #endif
         } else if (spin < 4096 || (spin & 1023u) != 0) {
             sched_yield();
@@ -866,6 +877,12 @@ int64_t zan_thread_current_id(void) {
     uint64_t tid = 0;
     if (pthread_threadid_np(NULL, &tid) != 0) return 0;
     return (int64_t)tid;
+#elif defined(__FreeBSD__) || defined(__DragonFly__)
+    return (int64_t)pthread_getthreadid_np();
+#elif defined(__OpenBSD__)
+    return (int64_t)getthrid();
+#elif defined(__NetBSD__)
+    return (int64_t)_lwp_self();
 #else
     uintptr_t self = (uintptr_t)pthread_self();
     return (int64_t)((self >> 16) ^ (self & 0xffffffffu));
