@@ -20,6 +20,9 @@ public class MqttClient : IDisposable {
     int willQos;
     bool willRetain;
     bool hasWill;
+    string username;
+    string password;
+    int lastReturnCode;
     List<MqttPacket> pendingPackets;
 
     Mutex stateLock;
@@ -44,12 +47,26 @@ public class MqttClient : IDisposable {
         this.willQos = 0;
         this.willRetain = false;
         this.hasWill = false;
+        this.username = "";
+        this.password = "";
+        this.lastReturnCode = 0;
         this.pendingPackets = new List<MqttPacket>();
         this.stateLock = new Mutex();
         this.sendBusy = false;
         this.sendWaiters = new List<AsyncGate>();
         this.recvBusy = false;
         this.recvWaiters = new List<AsyncGate>();
+    }
+
+    // 设置客户端连接鉴权凭据（用户名/密码，RFC/OASIS MQTT v3.1.1 §3.1.3.4-§3.1.3.5）
+    public void SetCredentials(string username, string password) {
+        this.username = username;
+        this.password = password;
+    }
+
+    // 获取上一次握手连接返回码（CONNACK Return Code；0 为连接成功，4 为密码错误，5 为未授权等）
+    public int ReturnCode() {
+        return this.lastReturnCode;
     }
 
     // 设置客户端遗嘱（LWT）属性，在连接建立前配置。
@@ -378,16 +395,26 @@ public class MqttClient : IDisposable {
     // 连接 broker 并执行 MQTT CONNECT/CONNACK
     // 握手，每个网络步骤都在 IO reactor 上挂起。
     public static async MqttClient ConnectAsync(string host, int port, string clientId) {
-        return await MqttClient.ConnectAsync(host, port, clientId, "", "", 0, false);
+        return await MqttClient.ConnectAsync(host, port, clientId, 60, "", "", 0, false, "", "");
+    }
+
+    // 带鉴权凭据连接 broker 并执行 MQTT CONNECT/CONNACK 握手。
+    public static async MqttClient ConnectAsync(string host, int port, string clientId, string username, string password) {
+        return await MqttClient.ConnectAsync(host, port, clientId, 60, "", "", 0, false, username, password);
     }
 
     // 带遗嘱（LWT）配置连接 broker 并执行 MQTT CONNECT/CONNACK 握手。
     public static async MqttClient ConnectAsync(string host, int port, string clientId, string willTopic, string willMessage, int willQos, bool willRetain) {
-        return await MqttClient.ConnectAsync(host, port, clientId, 60, willTopic, willMessage, willQos, willRetain);
+        return await MqttClient.ConnectAsync(host, port, clientId, 60, willTopic, willMessage, willQos, willRetain, "", "");
     }
 
     // 带遗嘱（LWT）与自定义 KeepAlive 秒数连接 broker 并执行 MQTT CONNECT/CONNACK 握手。
     public static async MqttClient ConnectAsync(string host, int port, string clientId, int keepAlive, string willTopic, string willMessage, int willQos, bool willRetain) {
+        return await MqttClient.ConnectAsync(host, port, clientId, keepAlive, willTopic, willMessage, willQos, willRetain, "", "");
+    }
+
+    // 带遗嘱（LWT）、自定义 KeepAlive 秒数与鉴权凭据连接 broker 并执行 MQTT CONNECT/CONNACK 握手。
+    public static async MqttClient ConnectAsync(string host, int port, string clientId, int keepAlive, string willTopic, string willMessage, int willQos, bool willRetain, string username, string password) {
         MqttClient mqtt = new MqttClient();
         mqtt.host = host;
         mqtt.port = port;
@@ -398,6 +425,7 @@ public class MqttClient : IDisposable {
         if (willTopic != null && willTopic.Length > 0) {
             mqtt.SetWill(willTopic, willMessage, willQos, willRetain);
         }
+        mqtt.SetCredentials(username, password);
 
         mqtt.conn = await TcpClient.ConnectAsync(host, port);
         // 连接失败/超时按文档返回 null：保持 connected=false 由调用方检查。
@@ -409,7 +437,7 @@ public class MqttClient : IDisposable {
         int sent = await mqtt.conn.SendBytesAsync(packet, packet.Length);
 
         // CONNACK：固定头（2 字节）+ 可变头（2 字节）；
-        // body 的第 2 字节为连接返回码（0 = 已接受）。
+        // body 的第 2 字节为连接返回码（0 = 已接受，4 = 用户名/密码错误，5 = 未授权）。
         MqttPacket ack = await mqtt.reader.ReadPacketAsync();
         if (ack == null || ack.packetType != MqttPacketType.CONNACK) {
             mqtt.connected = false;
@@ -417,6 +445,7 @@ public class MqttClient : IDisposable {
         }
         if (ack.bodyLen >= 2 && ack.body != null) {
             int returnCode = ack.body[1] & 255;
+            mqtt.lastReturnCode = returnCode;
             if (returnCode == 0) {
                 mqtt.connected = true;
             }
@@ -830,9 +859,28 @@ public class MqttClient : IDisposable {
         }
 
         int clientIdLen = (int)strlen(this.clientId);
+        int userLen = 0;
+        int passLen = 0;
+        bool hasUser = this.username != null && this.username.Length > 0;
+        bool hasPass = this.password != null && this.password.Length > 0;
+        if (hasUser) {
+            flags = flags | 128;
+            userLen = (int)strlen(this.username);
+        }
+        if (hasPass) {
+            flags = flags | 64;
+            passLen = (int)strlen(this.password);
+        }
+
         int remainLen = 10 + 2 + clientIdLen;
         if (this.hasWill) {
             remainLen = remainLen + 2 + willTopicLen + 2 + willMsgLen;
+        }
+        if (hasUser) {
+            remainLen = remainLen + 2 + userLen;
+        }
+        if (hasPass) {
+            remainLen = remainLen + 2 + passLen;
         }
 
         byte[] packet = new byte[1 + MqttClient.RemainLenBytes(remainLen) + remainLen];
@@ -892,6 +940,28 @@ public class MqttClient : IDisposable {
             offset = offset + 1;
             for (int i = 0; i < willMsgLen; i = i + 1) {
                 packet[offset] = (byte)(this.willMessage[i]);
+                offset = offset + 1;
+            }
+        }
+
+        if (hasUser) {
+            packet[offset] = (byte)((userLen >> 8) & 255);
+            offset = offset + 1;
+            packet[offset] = (byte)(userLen & 255);
+            offset = offset + 1;
+            for (int i = 0; i < userLen; i = i + 1) {
+                packet[offset] = (byte)(this.username[i]);
+                offset = offset + 1;
+            }
+        }
+
+        if (hasPass) {
+            packet[offset] = (byte)((passLen >> 8) & 255);
+            offset = offset + 1;
+            packet[offset] = (byte)(passLen & 255);
+            offset = offset + 1;
+            for (int i = 0; i < passLen; i = i + 1) {
+                packet[offset] = (byte)(this.password[i]);
                 offset = offset + 1;
             }
         }

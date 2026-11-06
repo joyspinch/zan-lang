@@ -6,6 +6,10 @@ using System.Json;
 
 namespace System.Net.Mqtt;
 
+// 客户端 CONNECT 身份鉴权委托（RFC/OASIS MQTT v3.1.1 §3.1.3.4-§3.1.3.5）
+// 返回 true 放行连接，返回 false 回复 CONNACK 0x04 (Bad user name or password) 并断开连接。
+public delegate bool MqttAuthHandler(string clientId, string username, string password);
+
 // 会话订阅的主题过滤器及授予的 QoS 实体记录。
 public class MqttBroker {
     public List<MqttSession> sessions;
@@ -13,6 +17,7 @@ public class MqttBroker {
     public List<MqttRetainedMessage> retainedMessages;
     public List<MqttInflightMessage> inflightMessages;
     public MqttWal wal;
+    public MqttAuthHandler authHandler;
     bool keepAliveRunning;
     MqttSharedBus sharedBus;
 
@@ -36,6 +41,7 @@ public class MqttBroker {
         this.retainedMessages = new List<MqttRetainedMessage>();
         this.inflightMessages = new List<MqttInflightMessage>();
         this.wal = null;
+        this.authHandler = null;
         this.keepAliveRunning = false;
         this.nextId = 0;
         this.startedAt = MqttBroker.Now();
@@ -44,6 +50,11 @@ public class MqttBroker {
         this.msgsOut = 0;
         this.bytesIn = 0;
         this.bytesOut = 0;
+    }
+
+    // 设置客户端连接鉴权委托
+    public void SetAuthHandler(MqttAuthHandler handler) {
+        this.authHandler = handler;
     }
 
     // 启用磁盘预写日志（WAL）与崩溃恢复引擎。
@@ -730,8 +741,36 @@ public class MqttBroker {
                             }
                         }
                     }
+                    bool hasUser = (connFlags & 128) != 0;
+                    bool hasPass = (connFlags & 64) != 0;
+                    if (!hasUser && hasPass) { break; } // MQTT-3.1.2-22: password flag must be 0 if username flag is 0
+                    if (hasUser && cur + 2 <= remainLen) {
+                        int uLen = ((body[cur] & 255) << 8) + (body[cur + 1] & 255);
+                        cur = cur + 2;
+                        if (cur + uLen <= remainLen) {
+                            sess.username = body.ToStr(cur, uLen);
+                            cur = cur + uLen;
+                        }
+                    }
+                    if (hasPass && cur + 2 <= remainLen) {
+                        int pLen = ((body[cur] & 255) << 8) + (body[cur + 1] & 255);
+                        cur = cur + 2;
+                        if (cur + pLen <= remainLen) {
+                            sess.password = body.ToStr(cur, pLen);
+                            cur = cur + pLen;
+                        }
+                    }
                 if (sess.clientId.Length == 0) {
                     sess.clientId = "anon-" + Convert.ToString(sess.id);
+                }
+                if (this.authHandler != null && !this.authHandler(sess.clientId, sess.username, sess.password)) {
+                    byte[] unauth = new byte[4];
+                    unauth[0] = (byte)(MqttPacketType.CONNACK << 4);
+                    unauth[1] = 2;
+                    unauth[2] = 0;
+                    unauth[3] = 4; // 0x04: Bad user name or password (MQTT 3.1.1 §3.2.2.3)
+                    int _una = await Socket.SendAsync(sock, unauth, 4);
+                    break;
                 }
                 // 同一 clientId 的旧会话还在表里（客户端未发 DISCONNECT
                 // 就重连）：shutdown 旧套接字让其属主协程走 EOF 清理路径，
