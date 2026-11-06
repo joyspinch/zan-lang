@@ -1464,10 +1464,11 @@ add_test(NAME conformance_gui_heavy_caseless_lookup
 set_tests_properties(conformance_gui_heavy_caseless_lookup PROPERTIES
     TIMEOUT 120 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
 
-# ChildWindow.EnsureDesign 类名回退 + 开发态散盘递归扫描：子窗设计稿
-# 装载与 Form.Show 同一约定（DesignName 覆写优先，否则类名同名 html）；
-# Directory.GetDirectories 裸名口径下递归必须拼回父路径，否则 Forms/**
-# 嵌套设计稿在 plain（开发态）构建下永远 MISS。
+# ChildWindow 装配全在框架（窗代码零装载语句，EnsureDesign 为 private）：
+# OpenHost 自动装载（DesignName 覆写优先，否则类名同名 html）→ OnCreate
+# 钩子 → ViewModel() 换挂 → z-mount 挂载 → 声明式接线；:options 绑
+# List<string>、:disabled 绑 bool。Directory.GetDirectories 裸名口径下递归
+# 必须拼回父路径，否则 Forms/** 嵌套设计稿在 plain 构建下永远 MISS。
 add_test(NAME conformance_gui_cw_docscan
   COMMAND ${CMAKE_COMMAND}
     -DZANC=$<TARGET_FILE:zanc>
@@ -1493,6 +1494,36 @@ add_test(NAME diag_cw_missing_handler
     -DEXPECT_RC=1
     -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 set_tests_properties(diag_cw_missing_handler PROPERTIES
+    TIMEOUT 120 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+
+# 运行期诊断：z-mount 槽位的窗字段缺失或 OnCreate 后仍为 null → 装配期
+# fail-fast exit 1，一次性列出坏槽位（DocWire.MountSlots）。
+add_test(NAME diag_cw_bad_mount
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/cwdocscan/diag_bad_mount.zan
+    "-DZANC_ARGS=--auto-stdlib${_gui_driver_tail}"
+    -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/gui/cwdocscan/diag_bad_mount.out
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/diag_cw_bad_mount${_exe_ext}
+    -DWORKDIR=${CMAKE_SOURCE_DIR}/tests/gui/cwdocscan
+    -DEXPECT_RC=1
+    -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+set_tests_properties(diag_cw_bad_mount PROPERTIES
+    TIMEOUT 120 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+
+# 运行期诊断：:prop="field" 引用不存在的字段 → 启动期 bind 对账 exit 1
+# （DocWire.CheckBinds；字面量/关键字/表达式不校验）。
+add_test(NAME diag_cw_bad_bindprop
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/cwdocscan/diag_bad_bindprop.zan
+    "-DZANC_ARGS=--auto-stdlib${_gui_driver_tail}"
+    -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/gui/cwdocscan/diag_bad_bindprop.out
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/diag_cw_bad_bindprop${_exe_ext}
+    -DWORKDIR=${CMAKE_SOURCE_DIR}/tests/gui/cwdocscan
+    -DEXPECT_RC=1
+    -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+set_tests_properties(diag_cw_bad_bindprop PROPERTIES
     TIMEOUT 120 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
 
 add_test(NAME conformance_gui_cw_publish_handlers
