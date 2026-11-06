@@ -31,6 +31,7 @@ public class SmtpClient : IDisposable {
     int port;
     int timeoutMs;
     bool implicitTls;
+    bool requireTls;
     string user;
     string pass;
     string localDomain;
@@ -58,6 +59,7 @@ public class SmtpClient : IDisposable {
         this.port = port;
         this.timeoutMs = 30000;
         this.implicitTls = false;
+        this.requireTls = port == 587;
         this.user = "";
         this.pass = "";
         this.localDomain = "";
@@ -79,6 +81,17 @@ public class SmtpClient : IDisposable {
     public SmtpClient UseImplicitTls() {
         this.implicitTls = true;
         return this;
+    }
+
+    // 设置是否强制要求 TLS 加密通道（防明文窃听与 STARTTLS 剥离降级攻击）。
+    public SmtpClient RequireTls(bool require) {
+        this.requireTls = require;
+        return this;
+    }
+
+    // 查询当前底层传输是否处于 TLS 加密中。
+    public bool IsTlsActive() {
+        return this.tls != null;
     }
 
     // 设置 AUTH PLAIN/LOGIN 凭据。
@@ -107,6 +120,8 @@ public class SmtpClient : IDisposable {
         this.inbuf = null;
         this.inhead = 0;
         this.intail = 0;
+        this.user = "";
+        this.pass = "";
     }
 
     public void Dispose() { this.Close(); }
@@ -246,6 +261,39 @@ public class SmtpClient : IDisposable {
         return HeaderWord(displayName) + " <" + addr + ">";
     }
 
+    // 提取并强校验 RFC 5321 信封邮箱地址（防 CRLF 命令走私与注入）。
+    // 支持 "user@host"、"<user@host>" 或 "Name <user@host>"；
+    // 严禁包含 \r、\n、\0、控制字符、多余的 '<' / '>'、未闭合引号或空格。
+    public static string CleanEnvelopeAddress(string raw) {
+        if (raw == null) { return null; }
+        // 任何位置严禁出现控制字符、\r、\n、\0（先于 Trim 校验，杜绝尾部 CRLF 绕过）
+        for (int i = 0; i < raw.Length; i = i + 1) {
+            int c = raw[i] & 255;
+            if (c <= 31 || c == 127) { return null; }
+        }
+        string s = raw.Trim();
+        if (s.Length == 0 || s.Length > 320) { return null; }
+        int left = s.IndexOf("<", 0);
+        int right = s.LastIndexOf(">");
+        string mail = s;
+        if (left >= 0 && right > left) {
+            mail = s.Substring(left + 1, right - left - 1).Trim();
+        } else if (left >= 0 || right >= 0) {
+            return null;
+        }
+        if (mail.Length == 0 || mail.Length > 256) { return null; }
+        for (int i = 0; i < mail.Length; i = i + 1) {
+            int c = mail[i] & 255;
+            if (c <= 32 || c == 127 || c == 60 || c == 62 || c == 34) {
+                return null;
+            }
+        }
+        int at = mail.IndexOf("@", 0);
+        if (at <= 0 || at >= mail.Length - 1) { return null; }
+        if (mail.IndexOf("@", at + 1) >= 0) { return null; }
+        return mail;
+    }
+
     // 把任意文本切成 ≤76 字符的行并做 quoted-printable 软换行。
     // 禁止跨多字节字符切断：按码点边界回退。
     static void QpAppend(StringBuilder sb, string text) {
@@ -303,8 +351,13 @@ public class SmtpClient : IDisposable {
     // 仍做一次防冲突校验。
     public string MimeText(MailMessage msg, string boundary, string dateLine, string messageId) {
         StringBuilder sb = new StringBuilder();
+        string fromHdr = msg.from;
+        if (fromHdr != null && (fromHdr.IndexOf("\r", 0) >= 0 || fromHdr.IndexOf("\n", 0) >= 0)) {
+            string safeFrom = CleanEnvelopeAddress(fromHdr);
+            fromHdr = safeFrom != null ? safeFrom : "invalid@localhost";
+        }
         sb.Append("From: ");
-        sb.Append(msg.from);
+        sb.Append(fromHdr);
         sb.Append("\r\n");
         this.AppendAddrList(sb, "To", msg.to);
         this.AppendAddrList(sb, "Cc", msg.cc);
@@ -319,7 +372,12 @@ public class SmtpClient : IDisposable {
         sb.Append(">\r\n");
         sb.Append("MIME-Version: 1.0\r\n");
         for (int i = 0; i < msg.extraHeaders.Count; i = i + 1) {
-            sb.Append(msg.extraHeaders[i]);
+            string eh = msg.extraHeaders[i];
+            if (eh == null || eh.Length == 0) { continue; }
+            if (eh.IndexOf("\r", 0) >= 0 || eh.IndexOf("\n", 0) >= 0) {
+                continue; // 过滤含换行符的非法附加头，阻止 MIME 头部走私
+            }
+            sb.Append(eh);
             sb.Append("\r\n");
         }
         if (msg.parts.Count == 1 && msg.parts[0].kind != 2) {
@@ -378,12 +436,18 @@ public class SmtpClient : IDisposable {
     }
 
     void AppendAddrList(StringBuilder sb, string header, List<string> addrs) {
-        if (addrs.Count == 0) { return; }
+        if (addrs == null || addrs.Count == 0) { return; }
         sb.Append(header);
         sb.Append(": ");
+        int emitted = 0;
         for (int i = 0; i < addrs.Count; i = i + 1) {
-            if (i > 0) { sb.Append(", "); }
-            sb.Append(addrs[i]);
+            string a = addrs[i];
+            if (a == null || a.IndexOf("\r", 0) >= 0 || a.IndexOf("\n", 0) >= 0) {
+                continue;
+            }
+            if (emitted > 0) { sb.Append(", "); }
+            sb.Append(a);
+            emitted = emitted + 1;
         }
         sb.Append("\r\n");
     }
@@ -447,11 +511,39 @@ public class SmtpClient : IDisposable {
         if (msg == null || msg.from.Length == 0 || msg.to.Count == 0) {
             return SmtpResult.Fail("envelope", 0, "缺少发件人或收件人");
         }
+        string fromClean = CleanEnvelopeAddress(msg.from);
+        if (fromClean == null) {
+            return SmtpResult.Fail("envelope", 0, "发件人地址非法或包含危险控制字符/CRLF: " + msg.from);
+        }
+        List<string> toClean = new List<string>();
+        for (int i = 0; i < msg.to.Count; i = i + 1) {
+            string c = CleanEnvelopeAddress(msg.to[i]);
+            if (c == null) {
+                return SmtpResult.Fail("envelope", 0, "收件人地址非法或包含危险控制字符/CRLF: " + msg.to[i]);
+            }
+            toClean.Add(c);
+        }
+        List<string> ccClean = new List<string>();
+        for (int i = 0; i < msg.cc.Count; i = i + 1) {
+            string c = CleanEnvelopeAddress(msg.cc[i]);
+            if (c == null) {
+                return SmtpResult.Fail("envelope", 0, "抄送地址非法或包含危险控制字符/CRLF: " + msg.cc[i]);
+            }
+            ccClean.Add(c);
+        }
+        List<string> bccClean = new List<string>();
+        for (int i = 0; i < msg.bcc.Count; i = i + 1) {
+            string c = CleanEnvelopeAddress(msg.bcc[i]);
+            if (c == null) {
+                return SmtpResult.Fail("envelope", 0, "密送地址非法或包含危险控制字符/CRLF: " + msg.bcc[i]);
+            }
+            bccClean.Add(c);
+        }
         if (!this.open) {
             SmtpResult up = await this.ConnectHandshakeAsync();
             if (!up.ok) { return up; }
         }
-        // EHLO 能力在握手时已取；若服务器要 STARTTLS 而我们还没升，
+        // EHLO 能力在握手时已取；若服务器支持 STARTTLS 而我们还没升，
         // 这里补一次升级重握手。
         if (this.serverStartTls && this.tls == null) {
             if (!await this.writeLine("STARTTLS")) {
@@ -473,13 +565,20 @@ public class SmtpClient : IDisposable {
             SmtpResult eh = await this.EhloAsync();
             if (!eh.ok) { return eh; }
         }
+        if (this.requireTls && this.tls == null) {
+            return SmtpResult.Fail("starttls", 0, "强制要求 TLS 但链路未加密，拒绝明文发送凭据与邮件 (防降级剥离攻击)");
+        }
         // AUTH。
         if (this.serverAuth && this.user.Length > 0) {
             SmtpResult ar = await this.AuthAsync();
             if (!ar.ok) { return ar; }
         }
-        // MAIL FROM。
-        if (!await this.writeLine("MAIL FROM:<" + msg.from + "> BODY=8BITMIME")) {
+        // MAIL FROM (依对端 8BITMIME 能力自适应协商)。
+        string mailCmd = "MAIL FROM:<" + fromClean + ">";
+        if (this.serverEightBitMime) {
+            mailCmd = mailCmd + " BODY=8BITMIME";
+        }
+        if (!await this.writeLine(mailCmd)) {
             return SmtpResult.Fail("mail", 0, "写入失败");
         }
         await this.readResponse();
@@ -487,16 +586,16 @@ public class SmtpClient : IDisposable {
             return SmtpResult.Fail("mail", this.lastCode, this.lastResponse);
         }
         // RCPT TO（to+cc+bcc）。
-        for (int i = 0; i < msg.to.Count; i = i + 1) {
-            SmtpResult rr = await this.RcptAsync(msg.to[i]);
+        for (int i = 0; i < toClean.Count; i = i + 1) {
+            SmtpResult rr = await this.RcptAsync(toClean[i]);
             if (!rr.ok) { return rr; }
         }
-        for (int i = 0; i < msg.cc.Count; i = i + 1) {
-            SmtpResult rr = await this.RcptAsync(msg.cc[i]);
+        for (int i = 0; i < ccClean.Count; i = i + 1) {
+            SmtpResult rr = await this.RcptAsync(ccClean[i]);
             if (!rr.ok) { return rr; }
         }
-        for (int i = 0; i < msg.bcc.Count; i = i + 1) {
-            SmtpResult rr = await this.RcptAsync(msg.bcc[i]);
+        for (int i = 0; i < bccClean.Count; i = i + 1) {
+            SmtpResult rr = await this.RcptAsync(bccClean[i]);
             if (!rr.ok) { return rr; }
         }
         // DATA。
@@ -568,6 +667,10 @@ public class SmtpClient : IDisposable {
         }
         SmtpResult eh = await this.EhloAsync();
         if (!eh.ok) { this.Close(); return eh; }
+        if (this.requireTls && !this.implicitTls && !this.serverStartTls) {
+            this.Close();
+            return SmtpResult.Fail("starttls", 0, "安全策略强制要求 TLS，但服务器在 EHLO 中未宣告 STARTTLS 支持 (拒绝明文降级)");
+        }
         SmtpResult done = new SmtpResult();
         done.ok = true;
         return done;
@@ -673,15 +776,16 @@ public class SmtpClient : IDisposable {
     string MakeDateLine() {
         // RFC 5322 日期：Thu, 01 Jan 2026 12:00:00 +0000。
         DateTime dt = DateTime.UtcNow();
-        return SmtpClient.Weekday(dt.DayOfWeek) + ", " +
+        return SmtpClient.Weekday(dt.DayOfWeek()) + ", " +
             SmtpClient.Pad2(dt.Day()) + " " + SmtpClient.MonthName(dt.Month()) + " " +
-            Convert.ToString(dt.Year()) + " " + SmtpClient.Pad2(dt.Hour()) + ":" +
+            dt.Year().ToString() + " " + SmtpClient.Pad2(dt.Hour()) + ":" +
             SmtpClient.Pad2(dt.Minute()) + ":" + SmtpClient.Pad2(dt.Second()) + " +0000";
     }
 
     string MakeMessageId(MailMessage msg) {
         long us = ServerMetrics.MonoMicros();
-        string dom = msg.from;
+        string dom = CleanEnvelopeAddress(msg.from);
+        if (dom == null) { dom = msg.from; }
         int at = dom.IndexOf("@", 0);
         if (at >= 0) { dom = dom.Substring(at + 1); }
         if (dom.Length == 0) { dom = "local"; }
