@@ -1,0 +1,433 @@
+using System;
+using System.Collections.Generic;
+using Gui;
+
+namespace Gui.Backend;
+
+public partial class Win32Shell {
+    // 当前按下的修饰键位组合：1=Ctrl、2=Shift、4=Alt（可叠加）。
+    static int ModsNow() {
+        int mods = 0;
+        if ((Win32Shell.GetKeyState(17) & 0x8000) != 0) { mods = mods | 1; }
+        if ((Win32Shell.GetKeyState(16) & 0x8000) != 0) { mods = mods | 2; }
+        if ((Win32Shell.GetKeyState(18) & 0x8000) != 0) { mods = mods | 4; }
+        return mods;
+    }
+
+    // LPARAM 坐标对的低/高有符号 16 位半部。
+    static int LoWord(nint v) {
+        int raw = ((int)v) & 65535;
+        if (raw >= 32768) { return raw - 65536; }
+        return raw;
+    }
+
+    // LPARAM 高半部的有符号 16 位值（与 LoWord 配对）。
+    static int HiWord(nint v) {
+        int raw = (((int)v) >> 16) & 65535;
+        if (raw >= 32768) { return raw - 65536; }
+        return raw;
+    }
+
+    // 发布一个输入事件供循环消费。`hwnd` 与事件
+    // 一起存储：产生此事件的窗口，这正是
+    // 多窗口路由所需的。仅 `eventHwnd` 记录的是窗口过程
+    // 最后一次运行所属的窗口，而发布之后（或嵌套其中）
+    // 分发的消息——如兄弟窗口的 WM_NCHITTEST/WM_SETCURSOR/WM_PAINT，
+    // 都不会发布——会把事件重定向到错误的窗口，
+    // 因此子窗口一旦存在，父级点击就被当作"不是我的"丢弃。
+    static void Post(nint hwnd, int kind, int x, int y, int button, int keycode,
+                     int mods) {
+        if (Win32Shell.postEvents == null) {
+            Win32Shell.postEvents = new List<Win32QueuedEvent>();
+        }
+        int n = Win32Shell.postEvents.Count;
+        // 鼠标移动（kind 1）只有最新位置有意义：与队尾的移动合并，
+        // 免得一次嵌套泵攒出几十帧的陈旧轨迹。
+        if (kind == 1 && n > 0) {
+            Win32QueuedEvent last = Win32Shell.postEvents[n - 1];
+            if (last.kind == 1 && last.hwnd == hwnd) {
+                last.x = x;
+                last.y = y;
+                last.button = button;
+                last.keycode = keycode;
+                last.mods = mods;
+                return;
+            }
+        }
+        // 鼠标滚轮（kind 13）高频到达时：同窗口同修饰键合并累加 delta 并更新位置，
+        // 免得触控板平滑滚动或无级滚轮一瞬间产生几十帧排队重绘导致严重滞后与 CPU 飙满。
+        if (kind == 13 && n > 0) {
+            Win32QueuedEvent last = Win32Shell.postEvents[n - 1];
+            if (last.kind == 13 && last.hwnd == hwnd && last.mods == mods) {
+                last.x = x;
+                last.y = y;
+                last.keycode = last.keycode + keycode;
+                return;
+            }
+        }
+        // 应用长时间不取（例如卡在一次很慢的绘制里）时丢最老的，
+        // 队列有界优先于无限增长。
+        if (n >= 512) {
+            Win32Shell.postEvents.RemoveAt(0);
+        }
+        Win32Shell.postEvents.Add(new Win32QueuedEvent(hwnd, kind, x, y, button, keycode, mods));
+    }
+
+    // 收集文件拖放的路径，并在
+    // 拖放点（客户端像素）发布为 kind-9 事件，
+    // 应用可将其路由到光标下的任意控件。路径在 `dropped` 中等待被取走。
+    static void OnDropFiles(nint hwnd, nint hdrop) {
+        if (Win32Shell.dropped == null) {
+            Win32Shell.dropped = new List<string>();
+        }
+        // 索引 -1（0xFFFFFFFF）用于查询文件数量。
+        int n = Win32Shell.DragQueryFileW(hdrop, 0 - 1, 0, 0);
+        nint buf = NativeMemory.Alloc(2048);
+        for (int i = 0; i < n; i = i + 1) {
+            int len = Win32Shell.DragQueryFileW(hdrop, i, buf, 1024);
+            if (len > 0) { Win32Shell.dropped.Add(Wide.Read(buf)); }
+        }
+        NativeMemory.Free(buf);
+        nint pt = NativeMemory.Alloc(8);
+        new Span<int>(pt, 1)[0] = 0;
+        new Span<int>(pt + 4, 1)[0] = 0;
+        // 资源管理器投递的 hdrop 带的是屏幕坐标（fClient=0），而
+        // 事件坐标约定是窗口客户区——不归一，落点永远进不了
+        // 控件自己的矩形（Upload 拖放区按客户区命中）。
+        int fClient = Win32Shell.DragQueryPoint(hdrop, pt);
+        if (fClient == 0) { Win32Shell.ScreenToClient(hwnd, pt); }
+        int px = Win32Shell.S32(pt, 0);
+        int py = Win32Shell.S32(pt, 4);
+        NativeMemory.Free(pt);
+        Win32Shell.DragFinish(hdrop);
+        Win32Shell.Post(hwnd, 9, px, py, 0, 0, 0);
+    }
+
+    // 拖放后是否有尚未被 TakeDropped 取走的路径（只看不删）。
+    // kind 9 兼作 blur，应用据此区分真拖放与失焦。
+    static bool DropPending() {
+        return Win32Shell.dropped != null && Win32Shell.dropped.Count > 0;
+    }
+
+    // 交出（并清除）上次拖放的路径。
+    static List<string> TakeDropped() {
+        List<string> outp = new List<string>();
+        if (Win32Shell.dropped == null) { return outp; }
+        for (int i = 0; i < Win32Shell.dropped.Count; i = i + 1) {
+            outp.Add(Win32Shell.dropped[i]);
+        }
+        Win32Shell.dropped = new List<string>();
+        return outp;
+    }
+
+    // 系统模态尺寸调整/移动循环里就地重绘一帧的回调，
+    // 由 Window.SetSizePaint 注册；未注册时为 null。
+    static SizePaintBody sizePaint;
+    // 是否正处在系统模态尺寸调整/移动循环中
+    // （WM_ENTERSIZEMOVE .. WM_EXITSIZEMOVE）。
+    static bool inSizeMove;
+
+    // 注册尺寸循环就地重绘回调（窗口拖动/缩放期间保持画面）。
+    static void SetSizePaint(SizePaintBody body) { Win32Shell.sizePaint = body; }
+
+    // 窗口过程：把 Win32 消息翻译成事件六元组投进队列（见 Post），
+    // 并承载无边框外壳的全部平台行为——WM_NCHITTEST 命中测试、
+
+    // 清空当前事件槽为“无事件”状态（kind 0，句柄 0）。
+    // 每次 PollEvent/WaitEvent 取事件前调用。
+    static void ClearEvent() {
+        Win32Shell.hasEvent = false;
+        Win32Shell.evHwnd = 0;
+        Win32Shell.evKind = 0;
+        Win32Shell.evX = 0;
+        Win32Shell.evY = 0;
+        Win32Shell.evButton = 0;
+        Win32Shell.evKeyCode = 0;
+        Win32Shell.evMods = 0;
+    }
+
+    // 若自动化驱动留有排队的合成事件，则取出一个处理。
+    static bool DrainInjected() {
+        bool got = false;
+        Win32Shell.EnterCriticalSection(Win32Shell.injectCs);
+        if (Win32Shell.injectEvents != null && Win32Shell.injectEvents.Count > 0) {
+            Win32QueuedEvent ev = Win32Shell.injectEvents[0];
+            Win32Shell.injectEvents.RemoveAt(0);
+            Win32Shell.evKind = ev.kind;
+            Win32Shell.evX = ev.x;
+            Win32Shell.evY = ev.y;
+            Win32Shell.evButton = ev.button;
+            Win32Shell.evKeyCode = ev.keycode;
+            Win32Shell.evMods = ev.mods;
+            nint target = ev.hwnd;
+            if (target == 0) { target = Win32Shell.mainHwnd; }
+            Win32Shell.evHwnd = target;
+            Win32Shell.hasEvent = true;
+            Win32Shell.evSeq = Win32Shell.evSeq + 1;
+            got = true;
+        }
+        Win32Shell.LeaveCriticalSection(Win32Shell.injectCs);
+        return got;
+    }
+
+    // 取出窗口过程排队的一个事件（队列空则 false）。
+    static bool DrainPosted() {
+        if (Win32Shell.postEvents == null || Win32Shell.postEvents.Count == 0) {
+            return false;
+        }
+        Win32QueuedEvent ev = Win32Shell.postEvents[0];
+        Win32Shell.postEvents.RemoveAt(0);
+        Win32Shell.evKind = ev.kind;
+        Win32Shell.evX = ev.x;
+        Win32Shell.evY = ev.y;
+        Win32Shell.evButton = ev.button;
+        Win32Shell.evKeyCode = ev.keycode;
+        Win32Shell.evMods = ev.mods;
+        Win32Shell.evHwnd = ev.hwnd;
+        Win32Shell.hasEvent = true;
+        Win32Shell.evSeq = Win32Shell.evSeq + 1;
+        return true;
+    }
+
+    // 不阻塞取事件：优先自动化注入队列，再是窗口过程队列，最后
+    // 泵尽线程队列里的全部 Win32 消息（其间窗口过程会补充事件）。
+    // 返回 0 = 取到事件（EventKindValue 等读取）、1 = 无事件、
+    // -1 = WM_QUIT。
+    static int PollEvent() {
+        Win32Shell.Init();
+        Win32Shell.ClearEvent();
+        if (Win32Shell.DrainInjected()) { return 0; }
+        // 先把上一帧（含嵌套消息泵）攒下的事件排空，再泵新消息。
+        if (Win32Shell.DrainPosted()) { return 0; }
+        nint msg = Win32Shell.scratchMsg;
+        while (Win32Shell.PeekMessageW(msg, 0, 0, 0, 1) != 0) {
+            if (Win32Shell.S32(msg, 8) == 18) { return 0 - 1; }  // WM_QUIT
+            Win32Shell.TranslateMessage(msg);
+            Win32Shell.DispatchMessageW(msg);
+        }
+        if (Win32Shell.DrainPosted()) { return 0; }
+        return 1;
+    }
+
+    // 阻塞直到下一个消息到达（GetMessageW，内核空闲）。
+    // 返回 0 = 取到事件、-1 = WM_QUIT 或错误。
+    static int WaitEvent() {
+        Win32Shell.Init();
+        Win32Shell.ClearEvent();
+        if (Win32Shell.DrainInjected()) { return 0; }
+        if (Win32Shell.DrainPosted()) { return 0; }
+        nint msg = Win32Shell.scratchMsg;
+        if (Win32Shell.GetMessageW(msg, 0, 0, 0) <= 0) { return 0 - 1; }
+        Win32Shell.TranslateMessage(msg);
+        Win32Shell.DispatchMessageW(msg);
+        Win32Shell.DrainPosted();
+        return 0;
+    }
+
+    // 阻塞到事件到达或 `ms` 毫秒过去（PeekMessage +
+    // MsgWaitForMultipleObjects，内核空闲）。返回 0 = 取到事件、
+    // 1 = 超时、-1 = 退出；ms < 0 按 0。
+    static int WaitEventTimeout(int ms) {
+        Win32Shell.Init();
+        Win32Shell.ClearEvent();
+        if (Win32Shell.DrainInjected()) { return 0; }
+        if (Win32Shell.DrainPosted()) { return 0; }
+        if (ms < 0) { ms = 0; }
+        int start = Win32Shell.TickMs();
+        nint msg = Win32Shell.scratchMsg;
+        while (true) {
+            while (Win32Shell.PeekMessageW(msg, 0, 0, 0, 1) != 0) {
+                int message = Win32Shell.S32(msg, 8);
+                if (message == 18) { return 0 - 1; }
+                if (message == 0) {
+                    if (!Win32Shell.DrainInjected()) { Win32Shell.DrainPosted(); }
+                    return 0;
+                }
+                Win32Shell.TranslateMessage(msg);
+                Win32Shell.DispatchMessageW(msg);
+            }
+            if (Win32Shell.DrainPosted()) { return 0; }
+            int elapsed = Win32Shell.TickMs() - start;
+            if (elapsed >= ms) { return 1; }
+            // QS_ALLINPUT = 0x04FF; WAIT_TIMEOUT = 258
+            int wr = Win32Shell.MsgWaitForMultipleObjects(0, 0, 0,
+                ms - elapsed, 0x04FF);
+            if (wr == 258) { return 1; }
+        }
+        return 1;
+    }
+
+    // 向主窗口投递 WM_NULL，唤醒阻塞在消息等待中的 UI 线程
+    // （App.Post 从任意线程调用）。
+    static void Wake() {
+        Win32Shell.Init();
+        if (Win32Shell.mainHwnd != 0) {
+            Win32Shell.PostMessageW(Win32Shell.mainHwnd, 0, 0, 0);
+        }
+    }
+
+    // 把一个合成事件排队（临界区保护，可从任意线程调用），编码
+    // 与窗口过程 Post 的事件一致；hwnd 为 0 时投给主窗口。
+    // 入队后 Wake 主线程。
+    static void InjectEvent(nint hwnd, int kind, int x, int y, int button,
+                            int keycode, int mods) {
+        Win32Shell.Init();
+        Win32Shell.EnterCriticalSection(Win32Shell.injectCs);
+        if (Win32Shell.injectEvents == null) {
+            Win32Shell.injectEvents = new List<Win32QueuedEvent>();
+        }
+        Win32Shell.injectEvents.Add(new Win32QueuedEvent(hwnd, kind, x, y, button, keycode, mods));
+        Win32Shell.LeaveCriticalSection(Win32Shell.injectCs);
+        Win32Shell.Wake();
+    }
+
+    // 尚未被取走的合成事件数量。
+    static int InjectPending() {
+        Win32Shell.Init();
+        Win32Shell.EnterCriticalSection(Win32Shell.injectCs);
+        int n = 0;
+        if (Win32Shell.injectEvents != null) {
+            n = Win32Shell.injectEvents.Count;
+        }
+        Win32Shell.LeaveCriticalSection(Win32Shell.injectCs);
+        return n;
+    }
+
+    // 最近取出事件的类型（EventKind 编码）。
+    static int EventKindValue() { return Win32Shell.evKind; }
+    // 事件单调序号：每取到一个新事件 +1，没有新事件保持不变，
+    // 用于区分“新事件”与“陈旧回读”。
+    static long EventSeqValue() { return Win32Shell.evSeq; }
+    // 最近事件 X（客户端像素；键盘类为 0）。
+    static int EventXValue() { return Win32Shell.evX; }
+    // 最近事件 Y（客户端像素；键盘类为 0）。
+    static int EventYValue() { return Win32Shell.evY; }
+    // 最近事件的鼠标键：0 左键、1 右键；非鼠标事件为 0。
+    static int EventButtonValue() { return Win32Shell.evButton; }
+    // 最近事件的键码：KeyDown/KeyUp 为虚拟键码，WM_CHAR 为字符码，
+    // 滚轮为滚动 delta。
+    static int EventKeyCodeValue() { return Win32Shell.evKeyCode; }
+    // 最近事件按下时的修饰键组合（1 Ctrl、2 Shift、4 Alt）。
+    static int EventModsValue() { return Win32Shell.evMods; }
+    // 最近取出事件所属的窗口句柄（Post 时记录；无事件为 0）。
+    static nint EventWindow() { return Win32Shell.evHwnd; }
+
+    // 窗口过程当前正在处理的消息所属的窗口。与 EventWindow()
+    // 不同：那一个只在应用泵出事件时更新，而模态尺寸调整循环
+    // 期间应用拿不到事件，sizePaint 回调（窗口过程里触发）必须
+    // 用这一个才能知道"正在缩放的是哪个窗口"。
+    static nint WndProcWindow() { return Win32Shell.eventHwnd; }
+
+    // 来自性能计数器的单调毫秒：GetTickCount 仅每约 15 ms
+    // 变化一次，这会使每帧动画步长抖动。
+    static int TickMs() {
+        Win32Shell.Init();
+        nint slot = NativeMemory.Alloc(16);
+        Win32Shell.QueryPerformanceFrequency(slot);
+        long freq = new Span<long>(slot, 1)[0];
+        Win32Shell.QueryPerformanceCounter(slot);
+        long now = new Span<long>(slot, 1)[0];
+        NativeMemory.Free(slot);
+        if (freq <= 0) { return Win32Shell.GetTickCount(); }
+        return (int)(now * 1000 / freq);
+    }
+
+    // 来自同一个性能计数器的单调微秒，用于分相位计时：一帧只有几
+    // 毫秒，按毫秒取整时每个相位都被截成 0 或 1，看不出谁贵。
+    // 返回低 32 位（约 71.6 分钟回绕）：回绕周期整除 int 的模长，
+    // 跨回绕的带符号差值仍然精确（±35.7 分钟内）。不能换成任意
+    // 周期（比如 1000 秒）——跨点的差值会错出整整一圈，UiDriver
+    // 的 wait 就要多等一整圈才超时。
+    static int TickUs() {
+        Win32Shell.Init();
+        nint slot = NativeMemory.Alloc(16);
+        Win32Shell.QueryPerformanceFrequency(slot);
+        long freq = new Span<long>(slot, 1)[0];
+        Win32Shell.QueryPerformanceCounter(slot);
+        long now = new Span<long>(slot, 1)[0];
+        NativeMemory.Free(slot);
+        if (freq <= 0) { return Win32Shell.GetTickCount() * 1000; }
+        long secs = now / freq;
+        long rem = now % freq;
+        long us = secs * 1000000 + rem * 1000000 / freq;
+        return (int)us;
+    }
+
+    // 让调用线程休眠 `ms` 毫秒；ms <= 0 不休眠。
+    static void Sleep(int ms) {
+        if (ms > 0) { Win32Shell.SleepW(ms); }
+    }
+
+    // ---- 剪贴板 ----------------------------------------------------------
+
+    // 剪贴板同一时刻只能被一个进程打开，而剪贴板查看器、
+    // 输入法、浏览器都会在内容变化后瞬间打开它。只试一次就
+    // 放弃，就是“复制粘贴时灵时不灵”的来源：短暂重试几次，
+    // 对方用完就轮到我们。
+    static bool OpenClipboardRetry() {
+        int tries = 0;
+        while (tries < 12) {
+            if (Win32Shell.OpenClipboard(Win32Shell.mainHwnd) != 0) {
+                return true;
+            }
+            Win32Shell.SleepW(10);
+            tries = tries + 1;
+        }
+        return false;
+    }
+
+    // 把 UTF-16 文本以 CF_UNICODETEXT（GMEM_MOVEABLE）放入剪贴板：
+    // 成功后内存所有权归剪贴板；打不开剪贴板（被其他进程占用）时
+    // 短暂重试，仍失败返回 false。
+    static bool SetClipboard(string text) {
+        Win32Shell.Init();
+        nint wide = Wide.Of(text);
+        int units = Wide.Length(wide);
+        // GMEM_MOVEABLE；成功时剪贴板接管所有权。
+        nint mem = Win32Shell.GlobalAlloc(2, (units + 1) * 2);
+        if (mem == 0) { Wide.Free(wide); return false; }
+        nint dst = Win32Shell.GlobalLock(mem);
+        if (dst == 0) {
+            Win32Shell.GlobalFree(mem);
+            Wide.Free(wide);
+            return false;
+        }
+        NativeMemory.Copy(dst, wide, (units + 1) * 2);
+        Win32Shell.GlobalUnlock(mem);
+        Wide.Free(wide);
+        if (!Win32Shell.OpenClipboardRetry()) {
+            Win32Shell.GlobalFree(mem);
+            return false;
+        }
+        Win32Shell.EmptyClipboard();
+        nint ok = Win32Shell.SetClipboardData(13, mem);   // CF_UNICODETEXT
+        Win32Shell.CloseClipboard();
+        if (ok == 0) {
+            Win32Shell.GlobalFree(mem);
+            return false;
+        }
+        return true;
+    }
+
+    // 读取剪贴板 CF_UNICODETEXT 文本；格式不存在、打不开剪贴板
+    // 或取不到数据时返回 ""。
+    static string GetClipboard() {
+        Win32Shell.Init();
+        if (Win32Shell.IsClipboardFormatAvailable(13) == 0) { return ""; }
+        if (!Win32Shell.OpenClipboardRetry()) { return ""; }
+        nint handle = Win32Shell.GetClipboardData(13);
+        if (handle == 0) {
+            Win32Shell.CloseClipboard();
+            return "";
+        }
+        nint text = Win32Shell.GlobalLock(handle);
+        string text2 = "";
+        if (text != 0) {
+            text2 = Wide.Read(text);
+            Win32Shell.GlobalUnlock(handle);
+        }
+        Win32Shell.CloseClipboard();
+        return text2;
+    }
+
+}

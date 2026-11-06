@@ -1,0 +1,475 @@
+using System;
+using System.Collections.Generic;
+using Gui;
+
+namespace Gui.Backend;
+
+public partial class Win32Shell {
+    // WM_SIZE/WM_PAINT 呈现、IME 重定位、文件拖放、模态尺寸循环
+    // 与最小尺寸约束；未识别的消息交给 DefWindowProcW。
+    // 经护栏包装注册（见 Init），单条消息内的硬故障只丢这条消息。
+    static nint OnMessage(nint hwnd, int msg, nint wp, nint lp) {
+        Win32Shell.eventHwnd = hwnd;
+        if (msg == 0x007C && wp == (nint)(0 - 20)
+                && Win32Shell.IsLayerHost(hwnd)) {
+            // WM_STYLECHANGING(GWL_EXSTYLE)：宿主了原生子窗口的窗口一旦
+            // 带上 WS_EX_LAYERED，重定向表面/ULW 呈现就不合成子 HWND——
+            // 网页内容黑屏、DWM 阴影消失。玻璃、异形、透明度这些进程内
+            // 写入方都有 IsLayerHost 守卫，但外部工具会跨进程直接写这个
+            // 位，每帧"加位→SweepLayered 剥位"的拉锯本身就是闪屏。在
+            // 样式生效前就地拒绝，位根本落不了地（跨进程调用同样会先
+            // 经过目标窗口过程，所以这里拦得住）。只改 styleNew，消息
+            // 照常走完后续链路。
+            int exNew = Win32Shell.S32(lp, 4);          // STYLESTRUCT.styleNew
+            if ((exNew & 0x00080000) != 0) {
+                new Span<int>(lp + 4, 1)[0] = exNew & ~0x00080000;
+            }
+        }
+        if (msg == 0x010D || msg == 0x010F || msg == 0x0281) {
+            Win32Shell.ImeReposition(hwnd);
+        } else if (msg == 2) {                     // WM_DESTROY
+            Win32Shell.Post(hwnd, 8, 0, 0, 0, 0, 0);
+            if (hwnd == Win32Shell.mainHwnd) { Win32Shell.PostQuitMessage(0); }
+            else if (Win32Shell.mainHwnd != 0) {
+                // 将激活交还给打开此窗口的主框架。
+                // 否则进程将没有活动窗口，
+                // 对话框关闭后主窗口收不到键盘输入（且因失焦
+                // 也停止动画）。
+                Win32Shell.SetForegroundWindow(Win32Shell.mainHwnd);
+                Win32Shell.SetFocus(Win32Shell.mainHwnd);
+            }
+            return 0;
+        } else if (msg == 0x0231) {                // WM_ENTERSIZEMOVE
+            Win32Shell.inSizeMove = true;
+            if (Win32Shell.glassOn && Win32Shell.shapeMode == 0) {
+                Win32Shell.AcrylicApply(hwnd, 3, Win32Shell.glassTint);
+            }
+        } else if (msg == 0x0232) {                // WM_EXITSIZEMOVE
+            Win32Shell.inSizeMove = false;
+            if (Win32Shell.glassOn && Win32Shell.shapeMode == 0) {
+                Win32Shell.AcrylicApply(hwnd, 4, Win32Shell.glassTint);
+            }
+            if (Win32Shell.glassOn) {
+                if (Win32Shell.lastSurface >= 0) {
+                    Win32Shell.PresentLayered(hwnd, Win32Shell.lastSurface);
+                }
+            }
+        } else if (msg == 0x007E) {                // WM_DISPLAYCHANGE
+            Win32Shell.displayChangeSerial++;
+            Win32Shell.Post(hwnd, 14, 0, 0, 0, 0, 0);
+        } else if (msg == 0x02E0) {                // WM_DPICHANGED
+            Win32CaptionConfig cfg = Win32Shell.DpiConfigOf(hwnd);
+            int oldW = Win32Shell.ClientWidth(hwnd);
+            int oldH = Win32Shell.ClientHeight(hwnd);
+            int oldBar = cfg.titlebarH;
+            // SetWindowPos 会同步发送 WM_SIZE 并可能就地绘制，先发布度量。
+            Win32Shell.UpdateWindowDpi(cfg, Win32Shell.LoWord(wp) & 65535);
+            if (lp != 0) {
+                int w = Win32Shell.S32(lp, 8) - Win32Shell.S32(lp, 0);
+                int h = Win32Shell.S32(lp, 12) - Win32Shell.S32(lp, 4);
+                if (cfg.physicalStage && oldW > 0 && oldH > oldBar) {
+                    w = oldW;
+                    h = oldH - oldBar + cfg.titlebarH;
+                }
+                Win32Shell.SetWindowPos(hwnd, 0, Win32Shell.S32(lp, 0),
+                    Win32Shell.S32(lp, 4), w, h, 0x4 | 0x10);
+            }
+            int curW = Win32Shell.ClientWidth(hwnd);
+            int curH = Win32Shell.ClientHeight(hwnd);
+            // 相同设备尺寸也必须唤醒 App：DPI/字体变化不一定伴随 WM_SIZE。
+            if (curW == oldW && curH == oldH) {
+                Win32Shell.Post(hwnd, 7, curW, curH, 0, 0, 0);
+            }
+            return 0;
+        } else if (msg == 5) {                     // WM_SIZE
+            int sizeType = (int)wp;
+            if (sizeType == 2) {
+                // 最大化：强制取消 DWM 圆角，直角贴满屏幕
+                Win32Shell.ApplyDwmRound(hwnd, false);
+            } else if (sizeType == 0) {
+                // 还原：恢复用户设置的圆角偏好
+                Win32CaptionConfig cfg = Win32Shell.DpiConfigOf(hwnd);
+                if (cfg != null && cfg.roundCorner) {
+                    Win32Shell.ApplyDwmRound(hwnd, true);
+                }
+            }
+            Win32Shell.windowWidth = Win32Shell.LoWord(lp) & 65535;
+            Win32Shell.windowHeight = (((int)lp) >> 16) & 65535;
+            int own = Win32Shell.SurfaceOf(hwnd);
+            if (!Win32Shell.glassOn && own >= 0) {
+                Win32Shell.Blit(hwnd, own);
+            }
+            Win32Shell.Post(hwnd, 7, Win32Shell.windowWidth, Win32Shell.windowHeight,
+                0, 0, 0);
+            // 拖动窗口边框：这条 WM_SIZE 来自 OS 的模态尺寸调整
+            // 循环，应用的事件循环在松手前拿不回控制权，因此
+            // 在这里就地画一帧，新露出的一条才不会一直空白。
+            if (Win32Shell.inSizeMove && Win32Shell.sizePaint != null) {
+                Win32Shell.sizePaint();
+            }
+            return 0;
+        } else if (msg == 0x0024 && hwnd == Win32Shell.mainHwnd
+                && Win32Shell.shapeMode == 0) {
+            // WM_GETMINMAXINFO：MINMAXINFO.ptMinTrackSize（偏移 24）。
+            // 外壳布局低于 800x600 逻辑像素后不可用，因此主框架拒绝
+            // 被拖得更小（子窗口保持默认限制）；但下限不会大于窗口
+            // 创建时的尺寸，否则小窗口程序一开就被撑成 800x600。
+            // 异形窗口例外：其尺寸为形状的包围盒
+            // （SetShape 调用 FitShapeWindow），通常远小于 800x600。
+            int scale = Win32Shell.DpiScale(hwnd);
+            int mtW = Win32Shell.minTrackW;
+            int mtH = Win32Shell.minTrackH;
+            if (mtW <= 0) { mtW = 800 * scale / 100; }
+            if (mtH <= 0) { mtH = 600 * scale / 100; }
+            new Span<int>(lp + 24, 1)[0] = mtW;
+            new Span<int>(lp + 28, 1)[0] = mtH;
+            return 0;
+        } else if (msg == 0x0233) {                // WM_DROPFILES
+            Win32Shell.OnDropFiles(hwnd, wp);
+            return 0;
+        } else if (msg == 8) {                     // WM_KILLFOCUS
+            // 事件类型 9（失焦）：浮动弹层（右键菜单、下拉）
+            // 收到后自行关闭，避免残留在非活动窗口之上。
+            Win32Shell.Post(hwnd, 9, 0, 0, 0, 0, 0);
+        } else if (msg == 512) {                   // WM_MOUSEMOVE
+            Win32Shell.Post(hwnd, 1, Win32Shell.LoWord(lp), Win32Shell.HiWord(lp),
+                0, 0, 0);
+            return 0;
+        } else if (msg == 513) {                   // WM_LBUTTONDOWN
+            Win32Shell.Post(hwnd, 2, Win32Shell.LoWord(lp), Win32Shell.HiWord(lp),
+                0, 0, Win32Shell.ModsNow());
+            Win32Shell.SetCapture(hwnd);
+            return 0;
+        } else if (msg == 515) {                   // WM_LBUTTONDBLCLK
+            // 类以 CS_DBLCLKS 注册，因此 Windows 将双击的
+            // 第二次点击作为此消息而非另一个
+            // WM_LBUTTONDOWN 投递。不加处理它就被丢弃，
+            // 应用中所有双击手势（选中光标下的词、
+            // Ui.DoubleClicked）将永远只见单击。按它的真实身份发布：
+            // 它是一个按下：这些手势计数的是按下/释放/按下/释放。
+            Win32Shell.Post(hwnd, 2, Win32Shell.LoWord(lp), Win32Shell.HiWord(lp),
+                0, 0, Win32Shell.ModsNow());
+            Win32Shell.SetCapture(hwnd);
+            return 0;
+        } else if (msg == 514) {                   // WM_LBUTTONUP
+            Win32Shell.Post(hwnd, 3, Win32Shell.LoWord(lp), Win32Shell.HiWord(lp),
+                0, 0, Win32Shell.ModsNow());
+            Win32Shell.ReleaseCapture();
+            return 0;
+        } else if (msg == 516) {                   // WM_RBUTTONDOWN
+            Win32Shell.Post(hwnd, 2, Win32Shell.LoWord(lp), Win32Shell.HiWord(lp),
+                1, 0, Win32Shell.ModsNow());
+            Win32Shell.SetCapture(hwnd);
+            return 0;
+        } else if (msg == 518) {                   // WM_RBUTTONDBLCLK
+            Win32Shell.Post(hwnd, 2, Win32Shell.LoWord(lp), Win32Shell.HiWord(lp),
+                1, 0, Win32Shell.ModsNow());
+            Win32Shell.SetCapture(hwnd);
+            return 0;
+        } else if (msg == 517) {                   // WM_RBUTTONUP
+            Win32Shell.Post(hwnd, 3, Win32Shell.LoWord(lp), Win32Shell.HiWord(lp),
+                1, 0, 0);
+            Win32Shell.ReleaseCapture();
+            return 0;
+        } else if (msg == 256) {                   // WM_KEYDOWN
+            Win32Shell.Post(hwnd, 4, 0, 0, 0, (int)wp, Win32Shell.ModsNow());
+            return 0;
+        } else if (msg == 257) {                   // WM_KEYUP
+            // 抬起时也要带上修饰键：IDE 的 Shift+F12（查找引用）、
+            // Shift+F8（上一个结果）这类"在抬起事件里判定修饰键"的
+            // 快捷键靠它区分组合键——按键总是先于修饰键松开，抬起
+            // 那一刻修饰键还按着。之前这里固定传 0，等于告诉上层
+            // "没有任何修饰键"，组合键全部退化成裸键。
+            Win32Shell.Post(hwnd, 5, 0, 0, 0, (int)wp, Win32Shell.ModsNow());
+            return 0;
+        } else if (msg == 258) {                   // WM_CHAR
+            // 控制字符（Ctrl+F = 6、Ctrl+Shift+R = 18）本身不携带
+            // 修饰键状态，必须补上实时状态，上层才能把 Ctrl+F 与
+            // Ctrl+Shift+F、Ctrl+Alt+F 分开（也才认得出 Ctrl+Space）。
+            Win32Shell.Post(hwnd, 6, 0, 0, 0, (int)wp, Win32Shell.ModsNow());
+            return 0;
+        } else if (msg == 522) {                   // WM_MOUSEWHEEL
+            nint pt = Win32Shell.scratchRect;
+            new Span<int>(pt, 1)[0] = Win32Shell.LoWord(lp);
+            new Span<int>(pt + 4, 1)[0] = Win32Shell.HiWord(lp);
+            Win32Shell.ScreenToClient(hwnd, pt);
+            int delta = (((int)wp) >> 16) & 65535;
+            if (delta >= 32768) { delta = delta - 65536; }
+            Win32Shell.Post(hwnd, 13, Win32Shell.S32(pt, 0),
+                Win32Shell.S32(pt, 4), 0, delta, Win32Shell.ModsNow());
+            return 0;
+        } else if (msg == 526) {                   // WM_MOUSEHWHEEL
+            // 横向滚轮（P6 横滚）：同为 kind 13，delta 走同一键码槽，
+            // 交给渲染期滚动声明者按 shift 语义路由——触控板横扫
+            // （合成 shift+滚轮）与真横滚轮走同一条消费路径。
+            nint pt = Win32Shell.scratchRect;
+            new Span<int>(pt, 1)[0] = Win32Shell.LoWord(lp);
+            new Span<int>(pt + 4, 1)[0] = Win32Shell.HiWord(lp);
+            Win32Shell.ScreenToClient(hwnd, pt);
+            int delta = (((int)wp) >> 16) & 65535;
+            if (delta >= 32768) { delta = delta - 65536; }
+            Win32Shell.Post(hwnd, 13, Win32Shell.S32(pt, 0),
+                Win32Shell.S32(pt, 4), 0, delta,
+                Win32Shell.ModsNow() | 2);
+            return 0;
+        } else if (msg == 0x0083) {                // WM_NCCALCSIZE
+            if (wp != 0) {
+                if (Win32Shell.IsMaximized(hwnd)) {
+                    int fx = Win32Shell.GetSystemMetrics(32)
+                        + Win32Shell.GetSystemMetrics(92);
+                    int fy = Win32Shell.GetSystemMetrics(33)
+                        + Win32Shell.GetSystemMetrics(92);
+                    new Span<int>(lp, 1)[0] = Win32Shell.S32(lp, 0) + fx;
+                    new Span<int>(lp + 4, 1)[0] = Win32Shell.S32(lp, 4) + fy;
+                    new Span<int>(lp + 8, 1)[0] = Win32Shell.S32(lp, 8) - fx;
+                    new Span<int>(lp + 12, 1)[0] = Win32Shell.S32(lp, 12) - fy;
+                }
+                return 0;
+            }
+        } else if (msg == 0x0084) {                // WM_NCHITTEST
+            return Win32Shell.HitTest(hwnd, Win32Shell.LoWord(lp),
+                Win32Shell.HiWord(lp));
+        } else if (msg == 0x0085) {                // WM_NCPAINT
+            if (Win32Shell.shapeMode != 0) {
+                return 0;                          // 异形分层窗口阻止系统绘制默认方形非客户区边框
+            }
+            return Win32Shell.DefWindowProcW(hwnd, msg, wp, lp);
+        } else if (msg == 0x0086) {                // WM_NCACTIVATE
+            if (Win32Shell.shapeMode != 0) {
+                // 异形分层窗口阻止 DefWindowProc 绘制默认方形激活/非激活边框高亮（消灭点击激活时的方角）
+                return 1;
+            }
+            // 普通无边框窗口：将 lParam 置为 -1 传给 DefWindowProc，
+            // 既通知 DWM 维持窗口投影和状态更新，又阻止绘制默认方形非客户区边框
+            return Win32Shell.DefWindowProcW(hwnd, msg, wp, (nint)(0 - 1));
+        } else if (msg == 0x00A3) {                // WM_NCLBUTTONDBLCLK
+            // 双击标题栏默认最大化；固定尺寸的窗口吃掉它，
+            // 关闭了最大化按钮的窗口同样吃掉。已经最大的窗口
+            // 放行，让 DefWindowProc 走 SC_RESTORE 双击还原。
+            if (!Win32Shell.ResizableOf(hwnd)) { return 0; }
+            if (!Win32Shell.MaximizableOf(hwnd)
+                && !Win32Shell.IsMaximized(hwnd)) { return 0; }
+        } else if (msg == 16) {                    // WM_CLOSE
+            // 关闭请求。此前本消息无人接管，落 DefWindowProcW 会当场
+            // DestroyWindow——等 App 收到通知时窗口已经没了，应用就
+            // 再也无法「问一句再关」（弹确认框、取消后继续用）。
+            //
+            // 开了拦截（App.OnCloseGuard）时改为：投递 kind-8 事件、
+            // **不**销毁窗口，等 App 明确同意后再由 App 调 Destroy。
+            // 这与 macOS/X11 的原生层一致：那两边本来就只投递关闭
+            // 事件、不销毁窗口（gui_runtime_mac.m 的 windowShouldClose:
+            // 返回 NO；X11 的 ClientMessage 分支只 evq_push）。
+            //
+            // 没开拦截时行为与从前完全一致：照旧交给 DefWindowProcW。
+            if (hwnd == Win32Shell.closeInterceptHwnd) {
+                Win32Shell.Post(hwnd, 8, 0, 0, 0, 0, 0);
+                return 0;
+            }
+        } else if (msg == 0x0112) {                // WM_SYSCOMMAND
+            int cmd = ((int)wp) & 0xFFF0;
+            if (!Win32Shell.ResizableOf(hwnd) && cmd == 0xF000) {
+                return 0;                          // SC_SIZE
+            }
+            if (cmd == 0xF030 && (!Win32Shell.ResizableOf(hwnd)
+                || !Win32Shell.MaximizableOf(hwnd))) {
+                return 0;                          // SC_MAXIMIZE
+            }
+        } else if (msg == 15) {                    // WM_PAINT
+            nint ps = NativeMemory.Alloc(72);
+            Win32Shell.BeginPaint(hwnd, ps);
+            int own = Win32Shell.SurfaceOf(hwnd);
+            if (!Win32Shell.glassOn && own >= 0) {
+                Win32Shell.wmPaintBlit = true;
+                Win32Shell.Blit(hwnd, own);
+                Win32Shell.wmPaintBlit = false;
+            }
+            Win32Shell.EndPaint(hwnd, ps);
+            NativeMemory.Free(ps);
+            return 0;
+        } else if (msg == 32) {                    // WM_SETCURSOR
+            int hit = ((int)lp) & 65535;
+            if (hit == 1) {                        // HTCLIENT
+                int k = Win32Shell.desiredCursorKind;
+                if (k < 0) { k = 0; }
+                Win32Shell.SetCursor(Win32Shell.CursorHandleOf(k));
+                Win32Shell.appliedCursorKind = k;
+                return 1;
+            } else {
+                // 处于非客户区（边框、标题栏等），交给 DefWindowProcW 呈现系统缩放/移动光标。
+                // 此时系统光标被改变，标记 applied 状态失效，确保鼠标重新移入客户区时能立即应用目标光标。
+                Win32Shell.appliedCursorKind = -1;
+            }
+        } else if (msg == 20) {                    // WM_ERASEBKGND
+            return 1;
+        }
+        return Win32Shell.DefWindowProcW(hwnd, msg, wp, lp);
+    }
+
+    // 无边框外壳：边缘为边框尺寸手柄，标题条
+    // 除应用绘制标题按钮处外均可拖拽。
+    static nint HitTest(nint hwnd, int screenX, int screenY) {
+        nint rc = Win32Shell.scratchRect;
+        if (Win32Shell.GetWindowRect(hwnd, rc) == 0) { return 1; }
+        int left = Win32Shell.S32(rc, 0);
+        int top = Win32Shell.S32(rc, 4);
+        int w = Win32Shell.S32(rc, 8) - left;
+        int h = Win32Shell.S32(rc, 12) - top;
+        int x = screenX - left;
+        int y = screenY - top;
+        // 细边缘手柄、粗角手柄：应用把控件
+        // 紧贴窗口边缘绘制（滚动条位于最后约 15px），因此
+        // 宽边框条会吞掉所有发给它们的点击，而
+        // 对角拖拽仍需要舒适的靶区。
+        int scale = Win32Shell.DpiScale(hwnd);
+        int bar = Win32Shell.TitlebarHeight(hwnd);
+        int button = Win32Shell.CaptionButtonWidth(hwnd);
+        int b = 4 * scale / 100;
+        int cb = 12 * scale / 100;
+        bool maxed = Win32Shell.IsMaximized(hwnd);
+        // 异形阴影带把内容轮廓推离窗口原点 (off, off)：命中坐标
+        // 先换算回内容坐标再判标题条，否则条带与画出来的标题栏
+        // 错开一圈带宽（按下去全错位）。无异形带时 off = 0，
+        // 行为与普通窗口完全一致。缩放手柄仍贴原始窗口边——
+        // 阴影带本身就是最好的缩放靶区。
+        int off = Win32Shell.ShapeBandPx() * scale / 100;
+        int cx = x - off;
+        int cy = y - off;
+        int cw = w - off * 2;
+        bool inButtons = cy >= 0 && cy < bar
+            && (cx >= cw - Win32Shell.CaptionButtonsOf(hwnd) * button
+                || cx >= cw - Win32Shell.CaptionZoneOf(hwnd));
+        if (!maxed && !inButtons && Win32Shell.ResizableOf(hwnd)) {
+            bool onLeft = x < b;
+            bool onRight = x >= w - b;
+            bool onTop = y < b;
+            bool onBottom = y >= h - b;
+            bool cLeft = x < cb;
+            bool cRight = x >= w - cb;
+            bool cTop = y < cb;
+            bool cBottom = y >= h - cb;
+            if (cTop && cLeft) { return 13; }
+            if (cTop && cRight) { return 14; }
+            if (cBottom && cLeft) { return 16; }
+            if (cBottom && cRight) { return 17; }
+            if (!Win32Shell.InHitGuard(hwnd, x, y)) {
+                if (onLeft) { return 10; }
+                if (onRight) { return 11; }
+                if (onTop) { return 12; }
+                if (onBottom) { return 15; }
+            }
+        }
+        if (inButtons) { return 1; }
+        if (cy >= 0 && cy < bar) { return 2; }
+        return 1;
+    }
+
+    // 异形阴影带把内容轮廓推离窗口客户区原点的偏移（逻辑
+    // 像素）。SetWindowShadow 外扩时整份规格被平移 (px,px)——
+    // 类型 3 阴影带从 (0,0) 起、内容区域右移下移——因此非带
+    // 区域的最小 x/y 就是这个偏移（横竖同值）。规格不含阴影带
+    // （普通异形）或未启用异形时返回 0：命中测试按 0 换算，
+    // 条带行为与普通窗口一致。
+    static int ShapeBandPx() {
+        if (Win32Shell.shapeMode == 0) { return 0; }
+        List<Win32ShapeRegion> regs = Win32Shell.shapeRegionList;
+        if (regs == null || regs.Count < 2 || regs[0].kind != 3) { return 0; }
+        int minX = 2147483647;
+        int minY = 2147483647;
+        for (int i = 1; i < regs.Count; i = i + 1) {
+            if (regs[i].x < minX) { minX = regs[i].x; }
+            if (regs[i].y < minY) { minY = regs[i].y; }
+        }
+        if (minY < minX) { minX = minY; }
+        if (minX == 2147483647 || minX < 0) { return 0; }
+        return minX;
+    }
+
+    // 清除上一帧的客户端优先条带。在渲染重新注册
+    // 仍在屏幕上的条带之前，每帧调用一次。
+    static void ClearHitGuards(nint hwnd) {
+        Win32Shell.Init();
+        if (Win32Shell.hitGuardEntries != null) {
+            List<Win32HitGuardEntry> keepEntries = new List<Win32HitGuardEntry>();
+            for (int e = 0; e < Win32Shell.hitGuardEntries.Count; e = e + 1) {
+                if (Win32Shell.hitGuardEntries[e].hwnd != hwnd) {
+                    keepEntries.Add(Win32Shell.hitGuardEntries[e]);
+                }
+            }
+            Win32Shell.hitGuardEntries = keepEntries;
+        }
+    }
+
+    // 以客户端坐标在 (`x`, `y`) 处为客户端区域抢占 `w` x `h`，
+    // 使边框边缘手柄不遮挡绘制在该处的控件。
+    static void AddHitGuard(nint hwnd, int x, int y, int w, int h) {
+        Win32Shell.Init();
+        if (w <= 0 || h <= 0) { return; }
+        if (Win32Shell.hitGuardEntries == null) {
+            Win32Shell.hitGuardEntries = new List<Win32HitGuardEntry>();
+        }
+        Win32Shell.hitGuardEntries.Add(new Win32HitGuardEntry(hwnd, x, y, w, h));
+    }
+
+    // 只有 `hwnd` 自己的条带有效：每个窗口以自身的
+    // 客户端坐标注册矩形，否则子窗口的条带会以相同的偏移
+    // 遮蔽父窗口的边框。
+    static bool InHitGuard(nint hwnd, int x, int y) {
+        if (Win32Shell.hitGuardEntries != null && Win32Shell.hitGuardEntries.Count > 0) {
+            for (int i = 0; i < Win32Shell.hitGuardEntries.Count; i = i + 1) {
+                Win32HitGuardEntry hg = Win32Shell.hitGuardEntries[i];
+                if (hg.hwnd == hwnd && x >= hg.x && x < hg.x + hg.w && y >= hg.y && y < hg.y + hg.h) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    // 窗口处于最大化（GetWindowPlacement 的 showCmd 为 SW_SHOWMAXIMIZED）
+    // 时为 true；查询失败为 false。
+    static bool IsMaximized(nint hwnd) {
+        nint wpl = NativeMemory.Alloc(48);
+        NativeMemory.Fill(wpl, 0, 48);
+        new Span<int>(wpl, 1)[0] = 44;
+        int ok = Win32Shell.GetWindowPlacement(hwnd, wpl);
+        int show = Win32Shell.S32(wpl, 8);
+        NativeMemory.Free(wpl);
+        return ok != 0 && show == 3;
+    }
+
+    // ---- IME ----------------------------------------------------------------
+
+    // 把 IME 组合窗口与候选窗定位到最近 SetImePos 记录的客户端
+    // 坐标（CFS_POINT + CFS_CANDIDATEPOS）；窗口没有输入上下文时
+    // 空操作。由 WM_IME_* 消息与 SetImePos 触发。
+    static void ImeReposition(nint hwnd) {
+        nint imc = Win32Shell.ImmGetContext(hwnd);
+        if (imc == 0) { return; }
+        nint form = NativeMemory.Alloc(48);
+        NativeMemory.Fill(form, 0, 48);
+        new Span<int>(form, 1)[0] = 2;           // CFS_POINT
+        new Span<int>(form + 4, 1)[0] = Win32Shell.imeX;
+        new Span<int>(form + 8, 1)[0] = Win32Shell.imeY;
+        Win32Shell.ImmSetCompositionWindow(imc, form);
+        NativeMemory.Fill(form, 0, 48);
+        new Span<int>(form, 1)[0] = 0;           // dwIndex
+        new Span<int>(form + 4, 1)[0] = 64;          // CFS_CANDIDATEPOS
+        new Span<int>(form + 8, 1)[0] = Win32Shell.imeX;
+        new Span<int>(form + 12, 1)[0] = Win32Shell.imeY;
+        Win32Shell.ImmSetCandidateWindow(imc, form);
+        NativeMemory.Free(form);
+        Win32Shell.ImmReleaseContext(hwnd, imc);
+    }
+
+    // 记录输入光标的客户端坐标 (x, y) 并立即对当前事件窗口
+    // 重定位 IME；此后每次 WM_IME_* 消息都按该坐标重定位。
+    static void SetImePos(int x, int y) {
+        Win32Shell.Init();
+        Win32Shell.imeX = x;
+        Win32Shell.imeY = y;
+        if (Win32Shell.eventHwnd != 0) {
+            Win32Shell.ImeReposition(Win32Shell.eventHwnd);
+        }
+    }
+
+}

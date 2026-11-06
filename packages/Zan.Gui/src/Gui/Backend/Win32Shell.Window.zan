@@ -1,0 +1,1143 @@
+using System;
+using System.Collections.Generic;
+using Gui;
+
+namespace Gui.Backend;
+
+public partial class Win32Shell {
+    // 所在显示器工作区的 82%，下限只保证画得下标题栏；首个窗口
+    // 居中并成为主框架，后续窗口归主框架所有并在其上方居中。
+    // 窗口接受文件拖放（WM_DROPFILES），并带 1px DWM 框架扩展以
+    // 恢复系统投影与圆角。
+    static nint CreateWindow(string title, int width, int height) {
+        Win32Shell.Init();
+        int deviceDpi = Win32Shell.WindowDpi(Win32Shell.mainHwnd);
+        nint hwnd = Win32Shell.CreateWindowSized(title,
+            Win32Shell.ScaleForDpi(width, deviceDpi),
+            Win32Shell.ScaleForDpi(height, deviceDpi), deviceDpi, false);
+        return Win32Shell.FinishWindowDpi(hwnd, width, height, false);
+    }
+
+    // 游戏舞台变体（统一 DPI 契约）：width/height 是内容区（舞台）
+    // 的物理像素，不做显示器 DPI 放大；窗口客户区 = 舞台 + 标准标
+    // 题条（App.RenderChrome 把 chrome 画在条里，内容从 App.
+    // ContentTop() 之下开始；全屏收起标题栏后舞台即整个客户区）。
+    // ① 不参与工作区 82% 与最小尺寸钳制——舞台分辨率是模板的契约，
+    // 被钳小后画布小于请求值（实测副屏工作区 82% 钳制把
+    // 1280x720 压成 868x517，模板画满全屏的右/下边整块出界）；
+    // ② 与逻辑尺寸路径共用无边框客户区契约——WM_NCCALCSIZE 把客户
+    // 区扩成整个窗口矩形，不再追加系统框架补偿。
+    // 高 DPI 屏上窗口视觉尺寸变小（物理 1:1）。
+    static nint CreateWindowPhysical(string title, int width, int height) {
+        Win32Shell.Init();
+        int deviceDpi = Win32Shell.WindowDpi(Win32Shell.mainHwnd);
+        int tb = Win32Shell.ScaleForDpi(32, deviceDpi);
+        nint hwnd = Win32Shell.CreateWindowSized(title,
+            width, height + tb, deviceDpi, true);
+        return Win32Shell.FinishWindowDpi(hwnd, width, height, true);
+    }
+
+    // 共同尾段：clientW/H 是客户区物理像素；deviceDpi 只用于外壳
+    // 度量；stage=true 时客户区一个像素不差（游戏舞台契约）。
+    static nint CreateWindowSized(string title, int clientW, int clientH,
+                                  int deviceDpi, bool stage) {
+        if (Win32Shell.mainHwnd == 0) {
+            Win32Shell.dpi = deviceDpi;
+            Win32Shell.titlebarH = Win32Shell.ScaleForDpi(32, deviceDpi);
+            Win32Shell.buttonW = Win32Shell.ScaleForDpi(46, deviceDpi);
+        }
+
+        int scaledW = clientW;
+        int scaledH = clientH;
+        if (!stage) {
+            // 按显示器 DPI 放大的逻辑尺寸很容易超过
+            // 屏幕（150% 缩放下还原的 2133x1293 会请求 3200x1940），因此窗口
+            // 打开时不会大于其显示器的大部分工作区。
+            if (Win32Shell.WorkArea(0, 1)) {
+                int maxW = (Win32Shell.S32(Win32Shell.scratchRect, 8)
+                    - Win32Shell.S32(Win32Shell.scratchRect, 0)) * 82 / 100;
+                int maxH = (Win32Shell.S32(Win32Shell.scratchRect, 12)
+                    - Win32Shell.S32(Win32Shell.scratchRect, 4)) * 82 / 100;
+                if (maxW > 0 && scaledW > maxW) { scaledW = maxW; }
+                if (maxH > 0 && scaledH > maxH) { scaledH = maxH; }
+            }
+            // ……下限只保证窗口还画得出标题栏和一点客户区。设计出
+            // 160x450 这种窄窗口就得开成 160x450：以前主窗口被强行抬到
+            // 800x600，设计器里设的尺寸在运行时一律失效。
+            int minW = Win32Shell.ScaleForDpi(120, deviceDpi);
+            int minH = Win32Shell.ScaleForDpi(32, deviceDpi)
+                + Win32Shell.ScaleForDpi(40, deviceDpi);
+            if (scaledW < minW) { scaledW = minW; }
+            if (scaledH < minH) { scaledH = minH; }
+        }
+        Win32Shell.windowWidth = scaledW;
+        Win32Shell.windowHeight = scaledH;
+        if (Win32Shell.mainHwnd == 0) {
+            // 主框架拖小的下限：外壳布局低于 800x600 就不能用了，
+            // 但本来就比它小的窗口（设计器里的 160x450）不能反过来
+            // 被这个下限撑大。
+            int trackW = Win32Shell.ScaleForDpi(800, deviceDpi);
+            int trackH = Win32Shell.ScaleForDpi(600, deviceDpi);
+            if (scaledW < trackW) { trackW = scaledW; }
+            if (scaledH < trackH) { trackH = scaledH; }
+            Win32Shell.minTrackW = trackW;
+            Win32Shell.minTrackH = trackH;
+        }
+
+        // WM_NCCALCSIZE 已把客户区扩成整个窗口矩形，不能再加系统边框。
+        int frameW = scaledW;
+        int frameH = scaledH;
+
+        nint wtitle = Wide.Of(title);
+        // 次要窗口由主框架 OWNED：系统会保持它们在主框架之上，
+        // 随其一并最小化/还原，而且——最重要的是——
+        // 当被拥有的窗口关闭时重新激活主框架。
+        nint owner = Win32Shell.mainHwnd;
+        // WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN：原生子窗口（WebView2 的
+        // 宿主）所占区域从本窗口的绘制中排除，否则每帧提交画布都会
+        // 覆盖网页一遍，网页持续闪烁。没有子窗口时该标志无副作用。
+        nint hwnd = Win32Shell.CreateWindowExW(0, Win32Shell.className, wtitle,
+            13565952 | 0x02000000, (nint)0x80000000, (nint)0x80000000, frameW, frameH, owner, 0,
+            Win32Shell.instance, 0);
+        Wide.Free(wtitle);
+        if (hwnd == 0) { return 0; }
+        // 接受从资源管理器拖入的文件（以 WM_DROPFILES 到达）。
+        Win32Shell.DragAcceptFiles(hwnd, 1);
+
+        if (Win32Shell.mainHwnd == 0) {
+            Win32Shell.mainHwnd = hwnd;
+            Win32Shell.CenterWindow(hwnd);
+        } else {
+            Win32Shell.CenterOnOwner(hwnd);
+        }
+
+        // 1px 扩展框架恢复系统投影和圆角，
+        // 作用于无边框窗口。
+        nint margins = NativeMemory.Alloc(16);
+        new Span<int>(margins, 1)[0] = 0;
+        new Span<int>(margins + 4, 1)[0] = 0;
+        new Span<int>(margins + 8, 1)[0] = 0;
+        new Span<int>(margins + 12, 1)[0] = 1;
+        Win32Shell.DwmExtendFrameIntoClientArea(hwnd, margins);
+        NativeMemory.Free(margins);
+        Win32Shell.ApplyDwmRound(hwnd, true);
+        Win32Shell.SetWindowPos(hwnd, 0, 0, 0, 0, 0, 0x0020 | 2 | 1 | 4 | 16);
+        return hwnd;
+    }
+
+    // Win32 SDK: MONITORINFOEXW=104 字节，DEVMODEW=220 字节；
+    // dmSize 为偏移 68 的 WORD，dmDisplayFrequency 为偏移 184 的 DWORD。
+    static double MonitorRefreshRate(nint monitor) {
+        if (monitor == 0) { return 60.0; }
+        nint info = NativeMemory.Alloc(104);
+        nint mode = NativeMemory.Alloc(220);
+        double hz = 60.0;
+        try {
+            NativeMemory.Fill(info, 0, 104);
+            NativeMemory.Fill(mode, 0, 220);
+            new Span<int>(info, 1)[0] = 104;
+            new Span<short>(mode + 68, 1)[0] = 220;
+            if (Win32Shell.GetMonitorInfoW(monitor, info) != 0 &&
+                Win32Shell.EnumDisplaySettingsW(info + 40, 0 - 1, mode) != 0) {
+                int rate = Win32Shell.S32(mode, 184);
+                // 0/1 表示驱动默认频率，不能当作实际显示节奏。
+                if (rate > 1 && rate <= 1000) { hz = (double)rate; }
+            }
+        } finally {
+            NativeMemory.Free(mode);
+            NativeMemory.Free(info);
+        }
+        return hz;
+    }
+
+    // 窗口所在显示器的（可用）工作区矩形，写入 scratchRect。
+    static bool WorkArea(nint hwnd, int flags) {
+        nint monitor = Win32Shell.MonitorFromWindow(hwnd, flags);
+        nint mi = NativeMemory.Alloc(40);
+        NativeMemory.Fill(mi, 0, 40);
+        new Span<int>(mi, 1)[0] = 40;
+        int ok = Win32Shell.GetMonitorInfoW(monitor, mi);
+        if (ok != 0) {
+            new Span<int>(Win32Shell.scratchRect, 1)[0] = Win32Shell.S32(mi, 20);
+            new Span<int>(Win32Shell.scratchRect + 4, 1)[0] = Win32Shell.S32(mi, 24);
+            new Span<int>(Win32Shell.scratchRect + 8, 1)[0] = Win32Shell.S32(mi, 28);
+            new Span<int>(Win32Shell.scratchRect + 12, 1)[0] = Win32Shell.S32(mi, 32);
+        }
+        NativeMemory.Free(mi);
+        return ok != 0;
+    }
+
+    // 把窗口居中到所在显示器工作区（不会小于工作区左上角）。
+    // 成功返回 true；取不到窗口矩形或工作区时返回 false。
+    static bool CenterWindow(nint hwnd) {
+        nint wr = NativeMemory.Alloc(16);
+        if (Win32Shell.GetWindowRect(hwnd, wr) == 0) {
+            NativeMemory.Free(wr);
+            return false;
+        }
+        int winW = Win32Shell.S32(wr, 8) - Win32Shell.S32(wr, 0);
+        int winH = Win32Shell.S32(wr, 12) - Win32Shell.S32(wr, 4);
+        NativeMemory.Free(wr);
+        if (!Win32Shell.WorkArea(hwnd, 1)) { return false; }
+        int waL = Win32Shell.S32(Win32Shell.scratchRect, 0);
+        int waT = Win32Shell.S32(Win32Shell.scratchRect, 4);
+        int waR = Win32Shell.S32(Win32Shell.scratchRect, 8);
+        int waB = Win32Shell.S32(Win32Shell.scratchRect, 12);
+        int x = waL + (waR - waL - winW) / 2;
+        int y = waT + (waB - waT - winH) / 2;
+        if (x < waL) { x = waL; }
+        if (y < waT) { y = waT; }
+        Win32Shell.SetWindowPos(hwnd, 0, x, y, 0, 0, 1 | 4 | 16);
+        return true;
+    }
+
+    // 次要窗口（对话框）在主窗口上方居中打开，
+    // 并保持在显示器工作区内。
+    static void CenterOnOwner(nint hwnd) {
+        nint pr = NativeMemory.Alloc(16);
+        nint cr = NativeMemory.Alloc(16);
+        int okP = Win32Shell.GetWindowRect(Win32Shell.mainHwnd, pr);
+        int okC = Win32Shell.GetWindowRect(hwnd, cr);
+        if (okP != 0 && okC != 0) {
+            int childW = Win32Shell.S32(cr, 8) - Win32Shell.S32(cr, 0);
+            int childH = Win32Shell.S32(cr, 12) - Win32Shell.S32(cr, 4);
+            int x = Win32Shell.S32(pr, 0)
+                + (Win32Shell.S32(pr, 8) - Win32Shell.S32(pr, 0)
+                    - childW) / 2;
+            int y = Win32Shell.S32(pr, 4)
+                + (Win32Shell.S32(pr, 12) - Win32Shell.S32(pr, 4)
+                    - childH) / 2;
+            if (Win32Shell.WorkArea(Win32Shell.mainHwnd, 2)) {
+                int waL = Win32Shell.S32(Win32Shell.scratchRect, 0);
+                int waT = Win32Shell.S32(Win32Shell.scratchRect, 4);
+                int waR = Win32Shell.S32(Win32Shell.scratchRect, 8);
+                int waB = Win32Shell.S32(Win32Shell.scratchRect, 12);
+                if (x < waL) { x = waL; }
+                if (y < waT) { y = waT; }
+                if (x + childW > waR) { x = waR - childW; }
+                if (y + childH > waB) { y = waB - childH; }
+            }
+            Win32Shell.SetWindowPos(hwnd, 0, x, y, 0, 0, 1 | 4 | 16);
+        }
+        NativeMemory.Free(cr);
+        NativeMemory.Free(pr);
+    }
+
+    // 显示并激活窗口（SW_SHOW + UpdateWindow + 前台 + 焦点）。
+    static void ShowWindowNow(nint hwnd) {
+        Win32Shell.ShowWindow(hwnd, 5);
+        Win32Shell.UpdateWindow(hwnd);
+        Win32Shell.SetForegroundWindow(hwnd);
+        Win32Shell.SetFocus(hwnd);
+    }
+
+    // 把窗口左上角移动到屏幕工作区坐标 (x, y)，不改尺寸与
+    // Z 序；hwnd 为 0 时空操作。
+    static void SetWindowPosition(nint hwnd, int x, int y) {
+        if (hwnd == 0) { return; }
+        Win32Shell.SetWindowPos(hwnd, 0, x, y, 0, 0, 1 | 4 | 16);
+    }
+
+    // 把窗口客户区调整为 (scaledW, scaledH) 设备像素（外框随之
+    // 伸缩，位置不变）。WM_SIZE 走正常路径，应用的画布与布局
+    // 下一帧自动跟上。登录小窗 → 主窗口这类形态切换用。
+    static void ResizeClient(nint hwnd, int scaledW, int scaledH) {
+        Win32Shell.ResizeClientExact(hwnd, scaledW, scaledH);
+    }
+
+    // 把无边框窗口客户区调整为 (scaledW, scaledH) 设备像素。
+    // WM_NCCALCSIZE 已移除系统边框，创建和调整尺寸共用这个契约。
+    static void ResizeClientExact(nint hwnd, int scaledW, int scaledH) {
+        if (hwnd == 0 || scaledW <= 0 || scaledH <= 0) { return; }
+        Win32Shell.SetWindowPos(hwnd, 0, 0, 0, scaledW, scaledH,
+                                0x2 | 0x4 | 0x10);      // NOMOVE|NOZORDER|NOACTIVATE
+    }
+
+    // 最小化窗口（SW_MINIMIZE）。
+    static void Minimize(nint hwnd) { Win32Shell.ShowWindow(hwnd, 6); }
+
+    // 最大/还原切换（SW_MAXIMIZE 3 / SW_RESTORE 9）。
+    static void ToggleMaximize(nint hwnd) {
+        if (Win32Shell.IsMaximized(hwnd)) {
+            Win32Shell.ShowWindow(hwnd, 9);
+        } else {
+            Win32Shell.ShowWindow(hwnd, 3);
+        }
+    }
+
+    // 投递 WM_CLOSE：走正常关闭流程——窗口过程把它翻译成
+    // kind-8 事件，是否真正销毁由应用决定（见 Destroy）。
+    static void CloseWindow(nint hwnd) {
+        Win32Shell.PostMessageW(hwnd, 16, 0, 0);   // WM_CLOSE
+    }
+
+    // 开/关关窗拦截。开了以后 WM_CLOSE 不再当场销毁窗口：窗口过程
+    // 只投递 kind-8 事件，等应用同意后再调 Destroy 关掉。
+    // 没开时 WM_CLOSE 照旧交给 DefWindowProcW 当场销毁。
+    // hwnd = 0 表示关掉拦截。
+    static void SetCloseIntercept(nint hwnd, bool on) {
+        Win32Shell.closeInterceptHwnd = on ? hwnd : 0;
+    }
+
+    // 彻底拆除窗口：清理标题按钮/工具窗口登记，释放光栅化器与
+    // GDI 呈现阴影挂在该句柄上的资源，再销毁 OS 窗口（触发
+    // WM_DESTROY → kind-8 事件）。
+    static void Destroy(nint hwnd) {
+        Win32Shell.ForgetCaptionButtons(hwnd);
+        Win32Shell.zan_gui_release_window(hwnd);
+        Win32Shell.zan_gui_gdi_present_drop(hwnd);
+        Win32Shell.DestroyWindow(hwnd);
+    }
+
+    // 窗口是否最大化（IsMaximized 的公开别名）。
+    static bool Maximized(nint hwnd) { return Win32Shell.IsMaximized(hwnd); }
+
+    // 窗口任意部分可见（未最小化且 IsWindowVisible）时为 true。
+    static bool Visible(nint hwnd) {
+        if (Win32Shell.IsIconic(hwnd) != 0) { return false; }
+        return Win32Shell.IsWindowVisible(hwnd) != 0;
+    }
+
+    // 窗口是前台窗口（持有键盘焦点）时为 true；hwnd 为 0 恒为 false。
+    static bool Focused(nint hwnd) {
+        if (hwnd == 0) { return false; }
+        return Win32Shell.GetForegroundWindow() == hwnd;
+    }
+
+    // 置顶（HWND_TOPMOST）/取消置顶（HWND_NOTOPMOST），
+    // 不改位置、尺寸与激活状态。
+    static void SetTopmost(nint hwnd, bool on) {
+        nint after = 0 - 2;                        // HWND_NOTOPMOST
+        if (on) { after = 0 - 1; }                 // HWND_TOPMOST
+        Win32Shell.SetWindowPos(hwnd, after, 0, 0, 0, 0, 2 | 1 | 16);
+    }
+
+    // 设置 OS 窗口标题（任务栏 / Alt-Tab 显示的文本）。
+    static void SetTitle(nint hwnd, string title) {
+        nint wtitle = Wide.Of(title);
+        Win32Shell.SetWindowTextW(hwnd, wtitle);
+        Wide.Free(wtitle);
+    }
+
+    // 为 `hwnd` 注册的标题按钮数量（在设置前默认为 5）。
+    static int CaptionButtonsOf(nint hwnd) {
+        Win32Shell.Init();
+        if (Win32Shell.captionConfigs != null) {
+            for (int i = 0; i < Win32Shell.captionConfigs.Count; i = i + 1) {
+                if (Win32Shell.captionConfigs[i].hwnd == hwnd) {
+                    return Win32Shell.captionConfigs[i].capCount;
+                }
+            }
+        }
+        return 5;
+    }
+
+    // 为窗口登记标题栏右侧客户区保护带宽度（设备像素）：标题栏
+    // 高度以内、窗口右缘向左 width 的条带 [w-width, w) 内的按下
+    // 交给客户区（应用按钮/胶囊命中区），不当作窗口拖动；
+    // 0 = 缺省（只有右侧系统按钮区交给客户区）。
+    static void SetCaptionZone(nint hwnd, int width) {
+        Win32Shell.Init();
+        if (width < 0) { width = 0; }
+        if (Win32Shell.captionConfigs == null) {
+            Win32Shell.captionConfigs = new List<Win32CaptionConfig>();
+        }
+        for (int i = 0; i < Win32Shell.captionConfigs.Count; i = i + 1) {
+            if (Win32Shell.captionConfigs[i].hwnd == hwnd) {
+                Win32Shell.captionConfigs[i].zoneWidth = width;
+                return;
+            }
+        }
+        Win32Shell.captionConfigs.Add(new Win32CaptionConfig(hwnd, 5, width));
+    }
+
+    // `hwnd` 的标题栏客户区保护带宽度（未登记默认 0）。
+    static int CaptionZoneOf(nint hwnd) {
+        Win32Shell.Init();
+        if (Win32Shell.captionConfigs != null) {
+            for (int i = 0; i < Win32Shell.captionConfigs.Count; i = i + 1) {
+                if (Win32Shell.captionConfigs[i].hwnd == hwnd) {
+                    return Win32Shell.captionConfigs[i].zoneWidth;
+                }
+            }
+        }
+        return 0;
+    }
+
+    // 窗口是否允许用户拖边框 / 最大化改变尺寸（默认允许）。
+    static bool ResizableOf(nint hwnd) {
+        Win32Shell.Init();
+        for (int i = 0; i < Win32Shell.fixedHwnd.Count; i = i + 1) {
+            if (Win32Shell.fixedHwnd[i] == hwnd) { return false; }
+        }
+        return true;
+    }
+
+    // 登记窗口是否允许用户改变尺寸；false 时 WM_NCHITTEST 不再
+    // 报告边缘/角手柄，双击标题栏与 SC_MAXIMIZE/SC_SIZE 也被吞掉。
+    // 重复设置同值无副作用。
+    static void SetResizable(nint hwnd, bool on) {
+        Win32Shell.Init();
+        List<nint> keep = new List<nint>();
+        for (int i = 0; i < Win32Shell.fixedHwnd.Count; i = i + 1) {
+            if (Win32Shell.fixedHwnd[i] != hwnd) { keep.Add(Win32Shell.fixedHwnd[i]); }
+        }
+        if (!on) { keep.Add(hwnd); }
+        Win32Shell.fixedHwnd = keep;
+    }
+
+    // 窗口是否允许最大化（默认允许）。关闭了最大化按钮的窗口
+    // 必须登记 false，否则双击标题栏 / SC_MAXIMIZE 照样放大窗口。
+    static bool MaximizableOf(nint hwnd) {
+        if (Win32Shell.noMaxHwnd == null) { return true; }
+        for (int i = 0; i < Win32Shell.noMaxHwnd.Count; i = i + 1) {
+            if (Win32Shell.noMaxHwnd[i] == hwnd) { return false; }
+        }
+        return true;
+    }
+
+    // 登记窗口是否允许最大化；false 时双击标题栏与
+    // SC_MAXIMIZE（Win+Up、系统菜单）不再放大窗口，双击
+    // 已最大的窗口仍可还原。重复设置同值无副作用。
+    static void SetMaximizable(nint hwnd, bool on) {
+        if (Win32Shell.noMaxHwnd == null) {
+            Win32Shell.noMaxHwnd = new List<nint>();
+        }
+        List<nint> keep = new List<nint>();
+        for (int i = 0; i < Win32Shell.noMaxHwnd.Count; i = i + 1) {
+            if (Win32Shell.noMaxHwnd[i] != hwnd) { keep.Add(Win32Shell.noMaxHwnd[i]); }
+        }
+        if (!on) { keep.Add(hwnd); }
+        Win32Shell.noMaxHwnd = keep;
+    }
+
+    // 工具窗口（WS_EX_TOOLWINDOW）hwnd 登记表：SetToolWindow 翻转
+    // 扩展样式位，IsToolWindow 查登记表（样式位读回来也可靠，但
+    // 登记表让查询与重置不依赖 GetWindowLongPtrW 的平台可用性）。
+    static List<nint> toolHwnd;
+
+    // 工具窗口样式：细标题栏、任务栏与 Alt-Tab 列表不显示。
+    // 幂等：重复设置同值不重写样式。
+    static void SetToolWindow(nint hwnd, bool on) {
+        Win32Shell.Init();
+        if (hwnd == 0) { return; }
+        if (Win32Shell.toolHwnd == null) { Win32Shell.toolHwnd = new List<nint>(); }
+        bool has = false;
+        for (int i = 0; i < Win32Shell.toolHwnd.Count; i = i + 1) {
+            if (Win32Shell.toolHwnd[i] == hwnd) { has = true; break; }
+        }
+        if (has == on) { return; }
+        nint ex = Win32Shell.GetWindowLongPtrW(hwnd, 0 - 20);
+        if (on) {
+            Win32Shell.SetWindowLongPtrW(hwnd, 0 - 20, ex | 0x00000080);
+            Win32Shell.toolHwnd.Add(hwnd);
+        } else {
+            Win32Shell.SetWindowLongPtrW(hwnd, 0 - 20, ex & ~0x00000080);
+            for (int i = Win32Shell.toolHwnd.Count - 1; i >= 0; i = i - 1) {
+                if (Win32Shell.toolHwnd[i] == hwnd) { Win32Shell.toolHwnd.RemoveAt(i); }
+            }
+        }
+        // 样式位变了要广播一次框架变化，标题栏立即变细。
+        Win32Shell.SetWindowPos(hwnd, 0, 0, 0, 0, 0, 0x0020 | 2 | 4 | 16);
+    }
+
+    // hwnd 是否被 SetToolWindow(true) 标记为工具窗口。
+    static bool IsToolWindow(nint hwnd) {
+        if (Win32Shell.toolHwnd == null) { return false; }
+        for (int i = 0; i < Win32Shell.toolHwnd.Count; i = i + 1) {
+            if (Win32Shell.toolHwnd[i] == hwnd) { return true; }
+        }
+        return false;
+    }
+
+    // DwmSetWindowAttribute（dwmapi，Vista+）：Win11 22000+ 认识
+    // DWMWA_WINDOW_CORNER_PREFERENCE(33)，旧系统返回错误码——懒解析
+    // 加调用失败忽略，等价于安全空操作。
+
+    // DWM 物理写入窗口外轮廓圆角属性。Win11 由 DWM 合成，
+    // 旧系统安全忽略。
+    static void ApplyDwmRound(nint hwnd, bool on) {
+        Win32Shell.Init();
+        if (hwnd == 0) { return; }
+        nint fn = Interop.Entry("dwmapi.dll", "DwmSetWindowAttribute");
+        if (fn == 0) { return; }
+        nint slot = NativeMemory.Alloc(4);
+        // DWMWA_WINDOW_CORNER_PREFERENCE (33):
+        // 1 = DWMWCP_DONOTROUND (方角)
+        // 2 = DWMWCP_ROUND (系统默认大圆角)
+        // 3 = DWMWCP_ROUNDSMALL (紧凑桌面小圆角，工业级 4px)
+        new Span<int>(slot, 1)[0] = on ? 3 : 1;
+        DwmSetWindowAttrFn call = (DwmSetWindowAttrFn)fn;
+        call(hwnd, 33, slot, 4);
+        NativeMemory.Free(slot);
+        if (on) {
+            nint margins = NativeMemory.Alloc(16);
+            new Span<int>(margins, 1)[0] = 0;
+            new Span<int>(margins + 4, 1)[0] = 0;
+            new Span<int>(margins + 8, 1)[0] = 0;
+            new Span<int>(margins + 12, 1)[0] = 1;
+            Win32Shell.DwmExtendFrameIntoClientArea(hwnd, margins);
+            NativeMemory.Free(margins);
+        }
+        Win32Shell.SetWindowPos(hwnd, 0, 0, 0, 0, 0, 0x0020 | 2 | 1 | 4 | 16);
+    }
+
+    // 窗口外轮廓圆角。Win11 由 DWM 合成：抗锯齿、与系统投影一致，
+    // 不吃性能；无边框窗口需保持 1px DWM 框架扩展（创建时已加）。
+    // `on` 为 false 时写 DWMWCP_DONOTROUND 恢复方角。Win10 及更早
+    // 系统上属性不存在，调用失败即无操作。最大化时自动切回方角，还原时复原。
+    static void SetRoundCorners(nint hwnd, bool on) {
+        if (hwnd == 0) { return; }
+        Win32CaptionConfig cfg = Win32Shell.DpiConfigOf(hwnd);
+        cfg.roundCorner = on;
+        if (Win32Shell.IsMaximized(hwnd)) {
+            Win32Shell.ApplyDwmRound(hwnd, false);
+        } else {
+            Win32Shell.ApplyDwmRound(hwnd, on);
+        }
+    }
+
+    // 为窗口登记客户区自绘标题按钮数（0..8，越界忽略），
+    // WM_NCHITTEST 据此在标题栏右侧保留条带（未登记默认 5，
+    // 见 CaptionButtonsOf）。
+    static void SetCaptionButtons(nint hwnd, int count) {
+        Win32Shell.Init();
+        if (count < 0 || count > 8) { return; }
+        if (Win32Shell.captionConfigs == null) {
+            Win32Shell.captionConfigs = new List<Win32CaptionConfig>();
+        }
+        for (int i = 0; i < Win32Shell.captionConfigs.Count; i = i + 1) {
+            if (Win32Shell.captionConfigs[i].hwnd == hwnd) {
+                Win32Shell.captionConfigs[i].capCount = count;
+                return;
+            }
+        }
+        Win32Shell.captionConfigs.Add(new Win32CaptionConfig(hwnd, count, 0));
+    }
+
+    // 遗忘已关闭窗口的标题按钮条带与相关句柄登记。
+    static void ForgetCaptionButtons(nint hwnd) {
+        Win32Shell.Init();
+        if (Win32Shell.captionConfigs != null) {
+            for (int i = 0; i < Win32Shell.captionConfigs.Count; i = i + 1) {
+                if (Win32Shell.captionConfigs[i].hwnd == hwnd) {
+                    Win32Shell.captionConfigs.RemoveAt(i);
+                    break;
+                }
+            }
+        }
+        if (Win32Shell.toolHwnd != null) {
+            for (int i = Win32Shell.toolHwnd.Count - 1; i >= 0; i = i - 1) {
+                if (Win32Shell.toolHwnd[i] == hwnd) { Win32Shell.toolHwnd.RemoveAt(i); }
+            }
+        }
+        if (Win32Shell.surfaceBindings != null) {
+            for (int i = Win32Shell.surfaceBindings.Count - 1; i >= 0; i = i - 1) {
+                if (Win32Shell.surfaceBindings[i].hwnd == hwnd) { Win32Shell.surfaceBindings.RemoveAt(i); }
+            }
+        }
+        if (Win32Shell.fixedHwnd != null) {
+            for (int i = Win32Shell.fixedHwnd.Count - 1; i >= 0; i = i - 1) {
+                if (Win32Shell.fixedHwnd[i] == hwnd) { Win32Shell.fixedHwnd.RemoveAt(i); }
+            }
+        }
+        if (Win32Shell.noMaxHwnd != null) {
+            for (int i = Win32Shell.noMaxHwnd.Count - 1; i >= 0; i = i - 1) {
+                if (Win32Shell.noMaxHwnd[i] == hwnd) { Win32Shell.noMaxHwnd.RemoveAt(i); }
+            }
+        }
+        if (Win32Shell.dirtyLost != null) {
+            for (int i = Win32Shell.dirtyLost.Count - 1; i >= 0; i = i - 1) {
+                if (Win32Shell.dirtyLost[i] == hwnd) { Win32Shell.dirtyLost.RemoveAt(i); }
+            }
+        }
+        if (Win32Shell.dirtyHwnd == hwnd) { Win32Shell.dirtyHwnd = 0; }
+        if (Win32Shell.forceFullHwnd == hwnd) { Win32Shell.forceFullHwnd = 0; }
+    }
+
+    // 自绘标题栏保留高度（设备像素，按 DPI 缩放，默认 32@96）。
+    static int TitlebarHeight() { return Win32Shell.TitlebarHeight(Win32Shell.mainHwnd); }
+
+    static int TitlebarHeight(nint hwnd) {
+        return Win32Shell.DpiConfigOf(hwnd).titlebarH;
+    }
+
+    // 运行期加高自绘标题栏保留带（设备像素，只增不减）：命中
+    // 测试的拖动条带与标题按钮布局读到的是同一个 titlebarH。
+    static void SetTitlebarHeight(int devicePx) {
+        Win32Shell.SetTitlebarHeight(Win32Shell.mainHwnd, devicePx);
+    }
+
+    static void SetTitlebarHeight(nint hwnd, int devicePx) {
+        Win32CaptionConfig cfg = Win32Shell.DpiConfigOf(hwnd);
+        if (devicePx <= cfg.titlebarH) { return; }
+        int scale = Win32Shell.DpiPercent(cfg.dpi);
+        cfg.titlebarLogical = (devicePx * 100 + scale - 1) / scale;
+        cfg.titlebarH = devicePx;
+        if (hwnd == Win32Shell.mainHwnd) { Win32Shell.titlebarH = devicePx; }
+    }
+
+    // 单个标题按钮的保留宽度（设备像素，默认 46@96）。
+    static int CaptionButtonWidth() {
+        return Win32Shell.CaptionButtonWidth(Win32Shell.mainHwnd);
+    }
+
+    static int CaptionButtonWidth(nint hwnd) {
+        return Win32Shell.DpiConfigOf(hwnd).buttonW;
+    }
+
+    // 窗口客户区宽（设备像素）；hwnd 为 0 或查询失败返回 0。
+    static int ClientWidth(nint hwnd) {
+        if (hwnd == 0) { return 0; }
+        nint rc = Win32Shell.scratchRect;
+        if (Win32Shell.GetClientRect(hwnd, rc) == 0) { return 0; }
+        return Win32Shell.S32(rc, 8) - Win32Shell.S32(rc, 0);
+    }
+
+    // 窗口客户区高（设备像素）；hwnd 为 0 或查询失败返回 0。
+    static int ClientHeight(nint hwnd) {
+        if (hwnd == 0) { return 0; }
+        nint rc = Win32Shell.scratchRect;
+        if (Win32Shell.GetClientRect(hwnd, rc) == 0) { return 0; }
+        return Win32Shell.S32(rc, 12) - Win32Shell.S32(rc, 4);
+    }
+
+    // 最近一次 WM_SIZE 上报的窗口客户区宽（设备像素）。外壳全局
+    // 只记一个“当前窗口”，多窗口时以最后调整者为准；按句柄精确
+    // 查询用 ClientWidth。
+    static int WindowWidth() { return Win32Shell.windowWidth; }
+    // 最近一次 WM_SIZE 上报的窗口客户区高（设备像素），同 WindowWidth。
+    static int WindowHeight() { return Win32Shell.windowHeight; }
+
+    static int desiredCursorKind = 0;
+    static int appliedCursorKind = -1;
+    static nint[] cursorCache;
+
+    // 获取对应形状的 Win32 光标句柄（预缓存避免重复加载）。
+    static nint CursorHandleOf(int kind) {
+        if (Win32Shell.cursorCache == null) {
+            Win32Shell.cursorCache = new nint[9];
+            Win32Shell.cursorCache[0] = Win32Shell.LoadCursorW(0, 32512); // 默认箭头 IDC_ARROW
+            Win32Shell.cursorCache[1] = Win32Shell.LoadCursorW(0, 32649); // 手型 IDC_HAND
+            Win32Shell.cursorCache[2] = Win32Shell.LoadCursorW(0, 32513); // I-beam IDC_IBEAM
+            Win32Shell.cursorCache[3] = Win32Shell.LoadCursorW(0, 32644); // 水平缩放 IDC_SIZEWE
+            Win32Shell.cursorCache[4] = Win32Shell.LoadCursorW(0, 32645); // 垂直缩放 IDC_SIZENS
+            Win32Shell.cursorCache[5] = Win32Shell.LoadCursorW(0, 32515); // 十字 IDC_CROSS
+            Win32Shell.cursorCache[6] = Win32Shell.LoadCursorW(0, 32646); // 四向移动 IDC_SIZEALL
+            Win32Shell.cursorCache[7] = Win32Shell.LoadCursorW(0, 32642); // 对角缩放 IDC_SIZENWSE
+            Win32Shell.cursorCache[8] = Win32Shell.LoadCursorW(0, 32643); // 对角缩放 IDC_SIZENESW
+        }
+        if (kind >= 0 && kind < 9) {
+            nint h = Win32Shell.cursorCache[kind];
+            if (h != 0) { return h; }
+        }
+        return Win32Shell.cursorCache[0];
+    }
+
+    // 设置鼠标光标形状：0 默认箭头，1 手型，2 I-beam（文本），
+    // 3/4 水平/垂直缩放，5 十字，6 四向移动，7/8 两种对角缩放。
+    static void SetCursorShape(int kind) {
+        if (kind < 0) { kind = 0; }
+        Win32Shell.desiredCursorKind = kind;
+        if (kind == Win32Shell.appliedCursorKind) { return; }
+        Win32Shell.appliedCursorKind = kind;
+        Win32Shell.SetCursor(Win32Shell.CursorHandleOf(kind));
+    }
+
+    // ---- 原生子窗口宿主与分层窗口互斥 ---------------------------------
+
+    // 宿主了原生子窗口（CEF / WebView2 的子 HWND）的窗口句柄。分层
+    // 窗口以 UpdateLayeredWindow 呈现时 OS 永远不合成其子窗口——子
+    // HWND 的表面全零透明，网页内容一帧都上不了屏。这类窗口必须
+    // 一直走 GDI/GL 直通呈现，并拒绝任何把 WS_EX_LAYERED 加回来的
+    // 尝试（呈现路径、玻璃或系统工具都可能写这个位）。
+    static List<long> noLayerHosts;
+
+    // `hwnd` 是否登记为原生子窗口宿主。
+    static bool IsLayerHost(nint hwnd) {
+        if (hwnd == 0 || Win32Shell.noLayerHosts == null) { return false; }
+        long key = (long)hwnd;
+        for (int i = 0; i < Win32Shell.noLayerHosts.Count; i = i + 1) {
+            if (Win32Shell.noLayerHosts[i] == key) { return true; }
+        }
+        return false;
+    }
+
+    // 声明 `hwnd` 宿主了原生子窗口：立刻清掉分层位并登记，之后
+    // 每帧经 SweepLayered 继续拒绝。
+    static void ForbidLayered(nint hwnd) {
+        Win32Shell.Init();
+        if (hwnd == 0 || Win32Shell.IsLayerHost(hwnd)) { return; }
+        if (Win32Shell.noLayerHosts == null) {
+            Win32Shell.noLayerHosts = new List<long>();
+        }
+        Win32Shell.noLayerHosts.Add((long)hwnd);
+        Win32Shell.StripLayered(hwnd);
+    }
+
+    // 清掉 `hwnd` 的分层位。返回是否真的清了（外面有人加回来过），
+    // 调用方据此请求一次全帧重绘——被 ULW 呈现过的那一帧子窗口
+    // 没有上屏，不能留着。
+    static bool StripLayered(nint hwnd) {
+        nint ex = Win32Shell.GetWindowLongPtrW(hwnd, 0 - 20);
+        if ((ex & 0x00080000) == 0) { return false; }
+        Win32Shell.SetWindowLongPtrW(hwnd, 0 - 20, ex & ~0x00080000);
+        return true;
+    }
+
+    // 每帧清扫一次：宿主原生子窗口的窗口若又被加上分层位则清掉。
+    // 返回是否清过（供调用方请求重绘）。
+    static bool SweepLayered() {
+        if (Win32Shell.noLayerHosts == null) {
+            return false;
+        }
+        bool cleaned = false;
+        for (int i = 0; i < Win32Shell.noLayerHosts.Count; i = i + 1) {
+            if (Win32Shell.StripLayered((nint)Win32Shell.noLayerHosts[i])) {
+                cleaned = true;
+            }
+        }
+        return cleaned;
+    }
+
+    // 启用系统亚克力玻璃并把窗口转入分层呈现路径：此后 Present
+    // 经 PresentLayered 预乘 alpha 交给 DWM 合成模糊。`tintArgb`
+    // 为 ARGB 着色。宿主原生子窗口的窗口保持 GDI 呈现，仅设置
+    // accent（分层窗的 ULW 呈现不合成子 HWND）。
+    static void EnableGlass(nint hwnd, int tintArgb) {
+        Win32Shell.Init();
+        if (hwnd == 0) { return; }
+        if (Win32Shell.IsLayerHost(hwnd)) {
+            // 宿主了原生子窗口的窗口绝不能变成分层窗口（ULW 呈现时 OS
+            // 不合成子窗口）。亚克力 accent 走 SetWindowCompositionAttribute，
+            // 不需要 WS_EX_LAYERED；呈现由 Present 的 GDI 分支接管。
+            Win32Shell.glassTint = tintArgb;
+            Win32Shell.AcrylicApply(hwnd, 4, tintArgb);
+            Win32Shell.glassOn = true;
+            return;
+        }
+        nint ex = Win32Shell.GetWindowLongPtrW(hwnd, 0 - 20);
+        if ((ex & 0x00080000) == 0) {              // WS_EX_LAYERED
+            Win32Shell.SetWindowLongPtrW(hwnd, 0 - 20, ex | 0x00080000);
+        }
+        Win32Shell.glassTint = tintArgb;
+        Win32Shell.AcrylicApply(hwnd, 4, tintArgb);
+        Win32Shell.glassOn = true;
+        int own = Win32Shell.SurfaceOf(hwnd);
+        if (own >= 0) { Win32Shell.PresentLayered(hwnd, own); }
+    }
+
+    // 关闭亚克力 accent（状态 0）并摘掉 WS_EX_LAYERED，恢复普通
+    // GDI/直通呈现；hwnd 为 0 时空操作。
+    static void DisableGlass(nint hwnd) {
+        Win32Shell.Init();
+        if (hwnd == 0) { return; }
+        Win32Shell.AcrylicApply(hwnd, 0, 0);
+        nint ex = Win32Shell.GetWindowLongPtrW(hwnd, 0 - 20);
+        Win32Shell.SetWindowLongPtrW(hwnd, 0 - 20, ex & ~0x00080000);
+        Win32Shell.glassOn = false;
+    }
+
+    // 设置整窗不透明度：percent 钳制到 10..100（100 = 不透明），
+    // 经 SetLayeredWindowAttributes 实现，因此窗口必须分层；
+    // percent 为 100 且未开玻璃时恢复不透明并摘掉分层位。
+    // 宿主原生子窗口的窗口不支持（分层会连子窗口一起藏掉），
+    // 空操作。
+    static void SetOpacity(nint hwnd, int percent) {
+        Win32Shell.Init();
+        if (hwnd == 0) { return; }
+        // 半透明靠 SetLayeredWindowAttributes 或 UpdateLayeredWindow，必须分层；分层会连
+        // 原生子窗口一起藏掉，宿主窗口只能整窗不透明。
+        if (Win32Shell.IsLayerHost(hwnd)) { return; }
+        if (percent < 10) { percent = 10; }
+        if (percent > 100) { percent = 100; }
+        Win32Shell.winOpacityPercent = percent;
+
+        // 若当前窗口使用异形/圆角或原生玻璃等逐像素分层呈现模式，
+        // 绝不可调用 SetLayeredWindowAttributes，否则会导致与 UpdateLayeredWindow 互斥失败，
+        // 使得渲染管道损坏并将所有组件刷白；亦不可在 percent == 100 时摘掉 WS_EX_LAYERED。
+        // 通过 UpdateLayeredWindow 的 SourceConstantAlpha 完成整窗混合。
+        if (Win32Shell.shapeMode != 0 || Win32Shell.glassOn) {
+            int own = Win32Shell.SurfaceOf(hwnd);
+            if (own >= 0) {
+                Win32Shell.PresentLayered(hwnd, own);
+            }
+            return;
+        }
+
+        nint ex = Win32Shell.GetWindowLongPtrW(hwnd, 0 - 20);
+        if (percent >= 100) {
+            if (!Win32Shell.glassOn && (ex & 0x00080000) != 0) {
+                Win32Shell.SetLayeredWindowAttributes(hwnd, 0, 255, 2);
+                Win32Shell.SetWindowLongPtrW(hwnd, 0 - 20, ex & ~0x00080000);
+            }
+            return;
+        }
+        if ((ex & 0x00080000) == 0) {
+            Win32Shell.SetWindowLongPtrW(hwnd, 0 - 20, ex | 0x00080000);
+        }
+        Win32Shell.SetLayeredWindowAttributes(hwnd, 0,
+            (byte)(percent * 255 / 100), 2);
+    }
+
+    // 窗口轮廓为形状区域的并集。`spec` 格式：
+    // "t,x,y,w,h,r;t,x,y,w,h,r;..."（逻辑像素；type 1 = 圆角矩形，
+    // r 为圆角半径；type 2 = 椭圆，w/h 为包围盒；r 忽略）。
+    // "" 恢复为普通不透明矩形。两条路径都兼容 Windows 7：
+    // 强类型窗口几何排版协议入口
+    static void SetShapeDescription(nint hwnd, WindowShapeDescription desc) {
+        Win32Shell.Init();
+        if (hwnd == 0) { return; }
+        if (desc == null || desc.IsEmpty()) {
+            // 恢复普通不透明窗口：清除所有区域 + 分层样式。
+            Win32Shell.hasShadowBand = false;
+            Win32Shell.SetWindowRgn(hwnd, 0, true);
+            nint ex = Win32Shell.GetWindowLongPtrW(hwnd, 0 - 20);
+            if ((ex & 0x00080000) != 0) {
+                Win32Shell.SetLayeredWindowAttributes(hwnd, 0, 255, 2);
+                Win32Shell.SetWindowLongPtrW(hwnd, 0 - 20, ex & ~0x00080000);
+            }
+            Win32Shell.shapeMode = 0;
+            Win32Shell.shapeRegionList = new List<Win32ShapeRegion>();
+            Win32Shell.shapeMaskRegions = new List<WindowShapeRegion>();
+            Win32Shell.shapeMask = new WindowShapeMask();
+            Win32Shell.glassOn = false;
+            return;
+        }
+
+        List<Win32ShapeRegion> regs = new List<Win32ShapeRegion>();
+        List<WindowShapeRegion> maskRegions = new List<WindowShapeRegion>();
+        for (int i = 0; i < desc.regions.Count; i = i + 1) {
+            WindowShapeRegion r = desc.regions[i];
+            regs.Add(new Win32ShapeRegion(r.kind, r.x, r.y, r.width, r.height, r.radius));
+            maskRegions.Add(r.Clone());
+        }
+
+        Win32Shell.shapeRegionList = regs;
+        Win32Shell.shapeMaskRegions = maskRegions;
+        Win32Shell.hasShadowBand = desc.HasShadowBand();
+        Win32Shell.shapeMask = new WindowShapeMask();
+        // 在缩小之前标记异形：FitShapeWindow 的 SetWindowPos
+        // 不能被主框架 800x600 的 WM_GETMINMAXINFO 最小值夹紧。
+        Win32Shell.shapeMode = 1;
+        Win32Shell.FitShapeWindow(hwnd, regs);
+        if (Win32Shell.DwmComposited() && !Win32Shell.IsLayerHost(hwnd)) {
+            // 分层逐像素 alpha 路径：无亚克力模糊，仅形状。
+            // 宿主了原生子窗口的窗口走下面的经典区域路径——分层窗口
+            // 的 OS 不合成其子 HWND。
+            nint ex = Win32Shell.GetWindowLongPtrW(hwnd, 0 - 20);
+            if ((ex & 0x00080000) == 0) {              // WS_EX_LAYERED
+                Win32Shell.SetWindowLongPtrW(hwnd, 0 - 20, ex | 0x00080000);
+            }
+            Win32Shell.glassOn = true;                 // 将 Present 路由到 PresentLayered
+        } else {
+            // 无 DWM（如 Win7 关闭合成）：经典区域
+            // 窗口。区域坐标为客户端像素（按物理像素缩放）。
+            Win32Shell.glassOn = false;
+            nint ex = Win32Shell.GetWindowLongPtrW(hwnd, 0 - 20);
+            if ((ex & 0x00080000) != 0) {
+                Win32Shell.SetLayeredWindowAttributes(hwnd, 0, 255, 2);
+                Win32Shell.SetWindowLongPtrW(hwnd, 0 - 20, ex & ~0x00080000);
+            }
+            Win32Shell.SetShapeRgn(hwnd, regs);
+            int own = Win32Shell.SurfaceOf(hwnd);
+            if (own >= 0) { Win32Shell.Blit(hwnd, own); }
+        }
+    }
+
+    // DWM 合成开启时窗口为分层并逐像素合成
+    // （抗锯齿边缘，外部像素点击穿透）；DWM 关闭时
+    // 回退为合并的 SetWindowRgn（硬边，同样点击穿透）。
+    // 兼容旧接口：由 ParseSpec 转为强类型协议后下发。
+    static void SetShape(nint hwnd, string spec) {
+        Win32Shell.SetShapeDescription(hwnd, WindowShapeDescription.ParseSpec(spec));
+    }
+
+    // 缩小（或放大）窗口，使客户区与形状区域的
+    // 包围盒精确匹配（缩放到物理像素）。没有这一步，
+    // 小的异形设计会被填充到主框架 800x600 的最小值，
+    // 轮廓尺寸也会出错。保持窗口居中。
+    // 区域预期为窗口相对坐标（最小 x/y >= 0）；
+    // 超出窗口上方/左方的形状保持不变。
+    static void FitShapeWindow(nint hwnd, List<Win32ShapeRegion> regs) {
+        if (regs.Count == 0) { return; }
+        int minX = 2147483647;
+        int minY = 2147483647;
+        int maxX = 0 - 2147483647 - 1;
+        int maxY = 0 - 2147483647 - 1;
+        for (int i = 0; i < regs.Count; i = i + 1) {
+            int x = regs[i].x;
+            int y = regs[i].y;
+            int w = regs[i].w;
+            int h = regs[i].h;
+            if (x < minX) { minX = x; }
+            if (y < minY) { minY = y; }
+            int x2 = x + w;
+            if (x2 > maxX) { maxX = x2; }
+            int y2 = y + h;
+            if (y2 > maxY) { maxY = y2; }
+        }
+        if (minX < 0 || minY < 0) { return; }
+        int scale = Win32Shell.DpiScale();
+        int cw = (maxX - minX) * scale / 100;
+        int ch = (maxY - minY) * scale / 100;
+        if (cw <= 0 || ch <= 0) { return; }
+        nint rc = NativeMemory.Alloc(16);
+        Win32Shell.GetWindowRect(hwnd, rc);
+        int winW = Win32Shell.S32(rc, 8) - Win32Shell.S32(rc, 0);
+        int winH = Win32Shell.S32(rc, 12) - Win32Shell.S32(rc, 4);
+        int cx = Win32Shell.S32(rc, 0) + winW / 2;
+        int cy = Win32Shell.S32(rc, 4) + winH / 2;
+        NativeMemory.Free(rc);
+        // 产生所需客户尺寸的外部尺寸（客户区 = 包围盒）。
+        // 测量实际的边框差值（DWM 框架扩展吃掉边框，
+        // AdjustWindowRect 的估算不准）并加到目标上。
+        nint cr = NativeMemory.Alloc(16);
+        Win32Shell.GetClientRect(hwnd, cr);
+        int curCw = Win32Shell.S32(cr, 8) - Win32Shell.S32(cr, 0);
+        int curCh = Win32Shell.S32(cr, 12) - Win32Shell.S32(cr, 4);
+        NativeMemory.Free(cr);
+        int outerW = cw + (winW - curCw);
+        int outerH = ch + (winH - curCh);
+        if (outerW == winW && outerH == winH) { return; }
+        // SWP_NOZORDER | SWP_NOACTIVATE：调整尺寸 + 位置，保持居中。
+        Win32Shell.SetWindowPos(hwnd, 0, cx - outerW / 2, cy - outerH / 2,
+            outerW, outerH, 4 | 16);
+    }
+
+    // DWM 桌面合成启用时为真（Vista+；Win7 通常返回 true，
+    // 仅当用户关闭时才返回 false）。
+    static bool DwmComposited() {
+        nint fn = Interop.Entry("dwmapi.dll", "DwmIsCompositionEnabled");
+        if (fn == 0) { return true; }   // 未知时假定已合成
+        nint slot = NativeMemory.Alloc(4);
+        DwmIsCompFn call = (DwmIsCompFn)fn;
+        call(slot);
+        int enabled = new Span<int>(slot, 1)[0];
+        NativeMemory.Free(slot);
+        return enabled != 0;
+    }
+
+    // 经典区域回退（Win7 无 DWM）：圆角矩形与
+    // 椭圆区域的并集。SetWindowRgn 之后窗口拥有合并区域。
+    static void SetShapeRgn(nint hwnd, List<Win32ShapeRegion> regs) {
+        int scale = Win32Shell.DpiScale();
+        nint merged = 0;
+        for (int i = 0; i < regs.Count; i = i + 1) {
+            Win32ShapeRegion reg = regs[i];
+            int t = reg.kind;
+            if (t == 3) {
+                // 类型 3（阴影带）仅用于分层外扩，不属于窗口可交互实体区域
+                continue;
+            }
+            int x = reg.x * scale / 100;
+            int y = reg.y * scale / 100;
+            int w = reg.w * scale / 100;
+            int h = reg.h * scale / 100;
+            int r = reg.r * scale / 100;
+            nint rgn = 0;
+            if (t == 2) {
+                rgn = Win32Shell.CreateEllipticRgn(x, y, x + w, y + h);
+            } else {
+                if (r < 0) { r = 0; }
+                rgn = Win32Shell.CreateRoundRectRgn(x, y, x + w, y + h, r, r);
+            }
+            if (rgn != 0) {
+                if (merged == 0) { merged = rgn; }
+                else {
+                    Win32Shell.CombineRgn(merged, merged, rgn, 2); // RGN_OR
+                    Win32Shell.DeleteObject(rgn);
+                }
+            }
+        }
+        if (merged != 0) { Win32Shell.SetWindowRgn(hwnd, merged, true); }
+    }
+
+    // 后端只提供自己的规格与 DPI；窗形数学及缓存由纯 helper 持有。
+    static byte[] ShapeMask(int sw, int sh) {
+        if (Win32Shell.shapeMask == null) {
+            Win32Shell.shapeMask = new WindowShapeMask();
+        }
+        return Win32Shell.shapeMask.Coverage(sw, sh, Win32Shell.DpiScale(),
+            Win32Shell.shapeMaskRegions);
+    }
+
+    // 呈现一帧：登记 hwnd 与 surface 的对应关系并记住 lastSurface
+    // 后，异形窗口走 PresentLayered（逐像素 alpha 合成），普通
+
+    // 屏幕 DPI 相对于 96 的百分比（144 dpi 显示器上为 150）。
+    static int DpiScale() { return Win32Shell.DpiScale(Win32Shell.mainHwnd); }
+
+    static int DpiPercent(int deviceDpi) {
+        if (deviceDpi <= 0) { return 100; }
+        return deviceDpi * 100 / 96;
+    }
+
+    static int ScaleForDpi(int logical, int deviceDpi) {
+        // App 的百分比是整数；窗口几何同样先量化，避免两种比率漂移。
+        return logical * Win32Shell.DpiPercent(deviceDpi) / 100;
+    }
+
+    static int DpiScale(nint hwnd) {
+        return Win32Shell.DpiPercent(Win32Shell.WindowDpi(hwnd));
+    }
+
+    static int WindowDpi(nint hwnd) {
+        if (hwnd == 0) { return Win32Shell.QueryWindowDpi(0); }
+        return Win32Shell.DpiConfigOf(hwnd).dpi;
+    }
+
+    static int QueryWindowDpi(nint hwnd) {
+        nint fn = Interop.Entry("user32.dll", "GetDpiForWindow");
+        if (hwnd != 0 && fn != 0) {
+            GetDpiForWindowFn getDpi = (GetDpiForWindowFn)fn;
+            int value = getDpi(hwnd);
+            if (value > 0) { return value; }
+        }
+        // Windows 8.1 的进程级 per-monitor 回退；Win7 没有 Shcore。
+        fn = Interop.Entry("Shcore.dll", "GetDpiForMonitor");
+        if (fn != 0) {
+            GetDpiForMonitorFn getMonitorDpi = (GetDpiForMonitorFn)fn;
+            nint values = NativeMemory.Alloc(8);
+            NativeMemory.Fill(values, 0, 8);
+            int ok = getMonitorDpi(Win32Shell.MonitorFromWindow(hwnd, 2), 0,
+                                  values, values + 4);
+            int value = Win32Shell.S32(values, 0);
+            NativeMemory.Free(values);
+            if (ok == 0 && value > 0) { return value; }
+        }
+        nint dc = Win32Shell.GetDC(0);
+        int deviceDpi = Win32Shell.GetDeviceCaps(dc, 88);
+        Win32Shell.ReleaseDC(0, dc);
+        return deviceDpi > 0 ? deviceDpi : 96;
+    }
+
+    static Win32CaptionConfig DpiConfigOf(nint hwnd) {
+        Win32Shell.Init();
+        for (int i = 0; i < Win32Shell.captionConfigs.Count; i = i + 1) {
+            Win32CaptionConfig cfg = Win32Shell.captionConfigs[i];
+            if (cfg.hwnd == hwnd) {
+                if (cfg.dpi <= 0) {
+                    Win32Shell.UpdateWindowDpi(cfg, Win32Shell.QueryWindowDpi(hwnd));
+                }
+                return cfg;
+            }
+        }
+        Win32CaptionConfig cfg = new Win32CaptionConfig(hwnd, 5, 0);
+        Win32Shell.UpdateWindowDpi(cfg, Win32Shell.QueryWindowDpi(hwnd));
+        if (hwnd != 0) { Win32Shell.captionConfigs.Add(cfg); }
+        return cfg;
+    }
+
+    static void UpdateWindowDpi(Win32CaptionConfig cfg, int deviceDpi) {
+        int oldScale = Win32Shell.DpiPercent(cfg.dpi);
+        cfg.dpi = deviceDpi > 0 ? deviceDpi : 96;
+        int scale = Win32Shell.DpiPercent(cfg.dpi);
+        cfg.titlebarH = cfg.titlebarLogical * scale / 100;
+        cfg.buttonW = 46 * scale / 100;
+        if (oldScale != scale) { cfg.zoneWidth = cfg.zoneWidth * scale / oldScale; }
+        // 无句柄的旧 API 仍代表主窗；兄弟窗口不能覆盖主窗的度量。
+        if (cfg.hwnd == Win32Shell.mainHwnd || Win32Shell.mainHwnd == 0) {
+            Win32Shell.dpi = cfg.dpi;
+            Win32Shell.titlebarH = cfg.titlebarH;
+            Win32Shell.buttonW = cfg.buttonW;
+            if (cfg.physicalStage && cfg.minTrackPhysicalW > 0) {
+                // 主舞台的内容下限是物理基线，只有 chrome 随 DPI 改变。
+                Win32Shell.minTrackW = cfg.minTrackPhysicalW;
+                Win32Shell.minTrackH = cfg.minTrackPhysicalH + cfg.titlebarH;
+            } else if (cfg.minTrackLogicalW > 0) {
+                Win32Shell.minTrackW = cfg.minTrackLogicalW * scale / 100;
+                Win32Shell.minTrackH = cfg.minTrackLogicalH * scale / 100;
+            }
+        }
+    }
+
+    static nint FinishWindowDpi(nint hwnd, int width, int height, bool stage) {
+        if (hwnd == 0) { return 0; }
+        Win32CaptionConfig cfg = Win32Shell.DpiConfigOf(hwnd);
+        cfg.physicalStage = stage;
+        Win32Shell.UpdateWindowDpi(cfg, Win32Shell.QueryWindowDpi(hwnd));
+        int scale = Win32Shell.DpiPercent(cfg.dpi);
+        int w = stage ? width : width * scale / 100;
+        int h = stage ? height + cfg.titlebarH : height * scale / 100;
+        if (!stage) {
+            if (Win32Shell.WorkArea(hwnd, 2)) {
+                int maxW = (Win32Shell.S32(Win32Shell.scratchRect, 8)
+                    - Win32Shell.S32(Win32Shell.scratchRect, 0)) * 82 / 100;
+                int maxH = (Win32Shell.S32(Win32Shell.scratchRect, 12)
+                    - Win32Shell.S32(Win32Shell.scratchRect, 4)) * 82 / 100;
+                if (maxW > 0 && w > maxW) { w = maxW; }
+                if (maxH > 0 && h > maxH) { h = maxH; }
+            }
+            if (w < 120 * scale / 100) { w = 120 * scale / 100; }
+            if (h < cfg.titlebarH + 40 * scale / 100) {
+                h = cfg.titlebarH + 40 * scale / 100;
+            }
+        }
+        if (hwnd == Win32Shell.mainHwnd) {
+            int trackW = w < 800 * scale / 100 ? w : 800 * scale / 100;
+            int trackH = h < 600 * scale / 100 ? h : 600 * scale / 100;
+            if (stage) {
+                cfg.minTrackPhysicalW = trackW;
+                cfg.minTrackPhysicalH = trackH - cfg.titlebarH;
+            } else {
+                cfg.minTrackLogicalW = (trackW * 100 + scale - 1) / scale;
+                cfg.minTrackLogicalH = (trackH * 100 + scale - 1) / scale;
+            }
+            Win32Shell.minTrackW = trackW;
+            Win32Shell.minTrackH = trackH;
+        }
+        Win32Shell.ResizeClientExact(hwnd, w, h);
+        if (hwnd == Win32Shell.mainHwnd) { Win32Shell.CenterWindow(hwnd); }
+        else { Win32Shell.CenterOnOwner(hwnd); }
+        return hwnd;
+    }
+
+    // 设置窗口最小允许尺寸（逻辑像素）。
+    static void SetMinTrackSize(nint hwnd, int minW, int minH) {
+        if (hwnd == 0) { return; }
+        Win32CaptionConfig cfg = Win32Shell.DpiConfigOf(hwnd);
+        int scale = Win32Shell.DpiPercent(cfg.dpi);
+        if (scale <= 0) { scale = 100; }
+        cfg.minTrackLogicalW = minW;
+        cfg.minTrackLogicalH = minH;
+        if (hwnd == Win32Shell.mainHwnd || Win32Shell.mainHwnd == 0) {
+            Win32Shell.minTrackW = minW > 0 ? minW * scale / 100 : 0;
+            Win32Shell.minTrackH = minH > 0 ? minH * scale / 100 : 0;
+        }
+    }
+
+    // 用 UTF-8 文本覆盖文件，加 BOM 前缀，
+    // 使电子表格应用识别导出 CJK CSV 的编码。
+    static bool WriteTextFile(string path, string content) {
+        nint wpath = Wide.Of(path);
+        nint file = Win32Shell.CreateFileW(wpath, 0x40000000, 0, 0, 2, 128, 0);
+        Wide.Free(wpath);
+        if (file == 0 - 1 || file == 0) { return false; }
+        nint written = NativeMemory.Alloc(8);
+        nint bom = NativeMemory.Alloc(4);
+        new Span<byte>(bom, 1)[0] = 239;
+        new Span<byte>(bom + 1, 1)[0] = 187;
+        new Span<byte>(bom + 2, 1)[0] = 191;
+        Win32Shell.WriteFile(file, bom, 3, written, 0);
+        NativeMemory.Free(bom);
+        int bytes = content.Length;
+        int ok = 1;
+        if (bytes > 0) {
+            nint buf = NativeMemory.Alloc(bytes + 1);
+            NativeMemory.PutString(buf, 0, content, bytes);
+            ok = Win32Shell.WriteFile(file, buf, bytes, written, 0);
+            NativeMemory.Free(buf);
+        }
+        NativeMemory.Free(written);
+        Win32Shell.CloseHandle(file);
+        return ok != 0;
+    }
+
+    // 用于填充实时调整大小暴露出的边距区域的背景色，
+    // 在应用重绘前生效，由画布清除保持同步。
+    static void SetBackground(int color) {
+        Win32Shell.Init();
+        Win32Shell.bgColor = color;
+    }
+}
