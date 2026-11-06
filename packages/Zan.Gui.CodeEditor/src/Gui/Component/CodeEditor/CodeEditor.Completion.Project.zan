@@ -1,0 +1,415 @@
+using System;
+using Gui;
+
+namespace Gui.Component.CodeEditor;
+
+partial class CodeEditor {
+    void SetProjectFiles(List<string> contents) {
+        // 防宿主随后增删输入集合；字符串本身只读。
+        projFileSrc = CodeEditor.CloneLines(contents);
+        projectVersion = projectVersion + 1;
+        projScanDirty = true;
+        extRefDirty = true;
+        sigMemoName = "";
+        muLineCaches = null;
+        RequestAnalysis();
+    }
+
+    // 若 SetProjectFiles() 留下待处理的跨文件类型扫描
+    // 则执行之。由补全路径惰性调用，使切换标签页
+    // 本身保持低成本。
+    void EnsureProjectScan() {
+        if (analysisApp != null) { RequestAnalysis(); return; }
+        if (!projScanDirty) { return; }
+        projScanDirty = false;
+        candBaseGen = candBaseGen + 1;
+        projTypes = new List<ProjType>();
+        for (int i = 0; i < projFileSrc.Count; i = i + 1) {
+            if (AnalysisCancelled()) { return; }
+            List<string> tn = new List<string>();
+            List<string> tm = new List<string>();
+            CodeEditor.ScanTypesInto(projFileSrc[i], tn, tm);
+            for (int k = 0; k < tn.Count; k = k + 1) {
+                string mm = "";
+                if (k < tm.Count) { mm = tm[k]; }
+                projTypes.Add(new ProjType(tn[k], mm));
+            }
+        }
+    }
+
+    // 项目类型列表包含名为 `name` 的类型时返回 true。
+    public static bool HasProjType(List<ProjType> ps, string name) {
+        for (int i = 0; i < ps.Count; i = i + 1) {
+            if (ps[i].name == name) { return true; }
+        }
+        return false;
+    }
+
+    // 收集当前缓冲区 `using` 行导入的命名空间。
+    void ParseUsingsInto(List<string> outNs) {
+        if (analysisApp != null || (workerSnapshot != null && analysisImports != null)) {
+            if (analysisApp != null) { RequestAnalysis(); }
+            if (analysisImports != null) {
+                for (int i = 0; i < analysisImports.Count; i = i + 1) { outNs.Add(analysisImports[i]); }
+            }
+            return;
+        }
+        for (int i = 0; i < lines.Count; i = i + 1) {
+            string tr = CodeEditor.TrimStr(lines[i]);
+            if (CodeEditor.StartsWithP(tr, "using ")) {
+                string rest = CodeEditor.LTrim(tr.Substring(6, tr.Length - 6));
+                if (CodeEditor.StartsWithP(rest, "static ")) {
+                    rest = CodeEditor.LTrim(rest.Substring(7, rest.Length - 7));
+                }
+                int endJ = 0;
+                while (endJ < rest.Length) {
+                    int b = rest[endJ] & 255;
+                    if (b == 59 || b == 61 || b == 32) { break; }
+                    endJ = endJ + 1;
+                }
+                string ns = rest.Substring(0, endJ);
+                if (ns.Length > 0 && !CodeEditor.Has(outNs, ns)) { outNs.Add(ns); }
+            }
+        }
+    }
+
+    // 当前缓冲区声明的命名空间（`namespace X;`），无则 ""。
+    string FileNamespace() {
+        if (analysisApp != null || (workerSnapshot != null && analysisImports != null)) {
+            if (analysisApp != null) { RequestAnalysis(); }
+            return analysisNamespace;
+        }
+        for (int i = 0; i < lines.Count; i = i + 1) {
+            string tr = CodeEditor.TrimStr(lines[i]);
+            if (CodeEditor.StartsWithP(tr, "namespace ")) {
+                string rest = CodeEditor.LTrim(tr.Substring(10, tr.Length - 10));
+                int endJ = 0;
+                while (endJ < rest.Length) {
+                    int b = rest[endJ] & 255;
+                    if (b == 59 || b == 32 || b == 123) { break; }
+                    endJ = endJ + 1;
+                }
+                return rest.Substring(0, endJ);
+            }
+        }
+        return "";
+    }
+
+    // 命名空间 `ns` 在当前缓冲区可见时返回 true：通过
+    // `using` 导入，或是文件自身命名空间（的祖先）。
+    bool NsVisible(string ns) {
+        List<string> u = new List<string>();
+        ParseUsingsInto(u);
+        if (CodeEditor.Has(u, ns)) { return true; }
+        string fn = FileNamespace();
+        if (fn.Length > 0) {
+            if (fn == ns) { return true; }
+            if (fn.Length > ns.Length && CodeEditor.StartsWithP(fn, ns + ".")) { return true; }
+        }
+        return false;
+    }
+
+    // 文件导入 System.Linq 时返回 true（控制 LINQ 查询运算符）。
+    bool UsesLinq() {
+        List<string> u = new List<string>();
+        ParseUsingsInto(u);
+        return CodeEditor.Has(u, "System.Linq");
+    }
+
+    // 编辑器拥有硬编码成员数据的 stdlib 类型。
+    public static bool IsKnownStdlibType(string name) {
+        if (CodeEditor.HasSymbolType(name)) { return true; }
+        string known = " Console Math File Directory Path Convert Environment string List Dictionary StringBuilder DateTime Array Process App Canvas Theme Window LayoutKind StatusBar ToolStrip Button Input Label Panel Control Tabs Table DataTable ";
+        return CodeEditor.Find(known, " " + name + " ") >= 0;
+    }
+
+    // 规范化类型名以便成员查找（String -> string）。
+    public static string NormalizeStdlibType(string name) {
+        if (name == "String") { return "string"; }
+        return name;
+    }
+
+    // 对在 System.Linq 下暴露 LINQ 的内置集合类型返回 true。
+    public static bool IsCollectionType(string name) {
+        return name == "List" || name == "Array" || name == "Dictionary";
+    }
+
+    // 完整的命名空间 -> 类型目录，用于把作用域内的 stdlib 类型加入
+    // 补全。每行一个条目："Namespace=Type Type Type"。
+    public static string StdlibNsData() {
+        return "System.IO=File Directory Path;"
+            + "System.Text=Encoding;"
+            + "System.Json=JsonValue;"
+            + "System.Threading=Thread Mutex Semaphore Stopwatch Channel AtomicInt SharedTable;"
+            + "System.Net.Sockets=Socket AsyncSocket TcpListener TcpClient UdpClient;"
+            + "System.Net.Http=HttpClient HttpRequest HttpResponse HttpServer HttpRouter;"
+            + "System.Net.WebSocket=WebSocketClient WsFrame WsOpcode;"
+            + "System.Net.Mqtt=MqttClient MqttPacketType MqttQos;"
+            + "System.Net=IPAddress Worker Connection;"
+            + "System.Data.Orm=Model ModelQuery ModelRow ModelUpdate ModelDelete Migration QueryBuilder;"
+            + "System.Data.Sqlite=SqliteConnection;"
+            + "System.Data.Postgres=PgConnection;"
+            + "System.Data=DbProvider DbResult;"
+            + "System.Data.Odbc=DbConnection OdbcConnector;"
+            + "System.Diagnostics=Process;"
+            + "System.Drawing=ImageBuffer PixelOps Point Size Rectangle Color;"
+            + "Platform=Posix Runtime Win32;"
+            + "Gui=App Canvas Theme Window Icon Text StackLayout Ui SignalInt SignalBool SignalString FocusManager HitRegion HitTester Clipboard Keys Modifiers Cursor Insets FlexNode FlexStyle;"
+            + "Gui.Widget=Avatar Badge Breadcrumb Button Card Carousel Chart Checkbox CodeEditor Collapse DataTable Dialog Divider Drawer Dropdown Empty FloatButton Input Label ListView Menu Message Modal Notification Pagination Panel Popover Progress Radio Rate Result Ribbon RibbonCmd Scrollbar Skeleton Slider Spin Split StatusBar Statistic Steps Switch Table Tabs Tag Timeline ToolStrip Tooltip TreeNode TreeView Typography Wizard;"
+            + "System.Windows.Forms=MessageBox TextBox;";
+    }
+
+    // 把命名空间 `ns` 中声明的类型名追加到 `out2`。
+    public static void StdlibTypesForNs(string ns, List<string> out2) {
+        string data = CodeEditor.StdlibNsData();
+        string cur = "";
+        for (int i = 0; i <= data.Length; i = i + 1) {
+            string ch = "";
+            if (i < data.Length) { ch = data.Substring(i, 1); }
+            if (ch == ";" || i == data.Length) {
+                int eq = CodeEditor.Find(cur, "=");
+                if (eq > 0) {
+                    string key = cur.Substring(0, eq);
+                    if (key == ns) {
+                        CodeEditor.AddWords(out2, cur.Substring(eq + 1, cur.Length - eq - 1));
+                    }
+                }
+                cur = "";
+            } else {
+                cur = cur + ch;
+            }
+        }
+    }
+
+    static List<CeStdlibTypeEntry> nsTypeTable;
+
+    public static void EnsureNsTable() {
+        if (CodeEditor.nsTypeTable != null) { return; }
+        List<CeStdlibTypeEntry> table = new List<CeStdlibTypeEntry>();
+        CodeEditor.AddNsGroup(table, "System.IO", "File Directory Path");
+        CodeEditor.AddNsGroup(table, "System.Diagnostics", "Process");
+        CodeEditor.AddNsGroup(table, "System.Text", "Encoding");
+        CodeEditor.AddNsGroup(table, "System.Json", "JsonValue");
+        CodeEditor.AddNsGroup(table, "System.Threading",
+            "Thread Mutex Semaphore Stopwatch AtomicInt SharedTable");
+        CodeEditor.AddNsGroup(table, "System.Net.Sockets",
+            "Socket TcpListener TcpClient UdpClient AsyncSocket");
+        CodeEditor.AddNsGroup(table, "System.Net.Http",
+            "HttpClient HttpRequest HttpResponse HttpServer HttpRouter");
+        CodeEditor.AddNsGroup(table, "System.Net.WebSocket",
+            "WebSocketClient");
+        CodeEditor.AddNsGroup(table, "System.Data", "DbConnection DbResult");
+        CodeEditor.AddNsGroup(table, "System.Data.Orm", "QueryBuilder");
+        CodeEditor.AddNsGroup(table, "Gui", "App Canvas Theme");
+        CodeEditor.AddNsGroup(table, "Gui.Widget",
+            "CodeEditor TreeView Ribbon Modal DataTable Dropdown Carousel Pagination");
+        CodeEditor.nsTypeTable = table;
+    }
+
+    public static void AddNsGroup(List<CeStdlibTypeEntry> table, string ns, string words) {
+        int i = 0;
+        int n = words.Length;
+        while (i < n) {
+            while (i < n && words[i] == 32) { i = i + 1; }
+            int s2 = i;
+            while (i < n && words[i] != 32) { i = i + 1; }
+            if (i > s2) {
+                table.Add(new CeStdlibTypeEntry(words.Substring(s2, i - s2), ns));
+            }
+        }
+    }
+
+    // 使用 stdlib 类型 `name` 必须导入的命名空间，
+    // `name` 是内置 / 有歧义 / 非 stdlib 类型时返回 ""。刻意只收录
+    // 独特无歧义的名称，使缺失 using 的诊断绝不
+    // 误报在用户自己的标识符上。
+    public static string NsForStdlibType(string name) {
+        CodeEditor.EnsureNsTable();
+        List<CeStdlibTypeEntry> table = CodeEditor.nsTypeTable;
+        for (int i = 0; i < table.Count; i = i + 1) {
+            if (table[i].name == name) { return table[i].ns; }
+        }
+        return "";
+    }
+
+    // `name` 是项目（其他文件）或
+    // 当前缓冲区中声明的类型时返回 true。
+    bool IsProjectType(string name) {
+        EnsureProjectScan();
+        if (CodeEditor.HasProjType(projTypes, name)) { return true; }
+        EnsureBufTypes();
+        for (int i = 0; i < muTypes.Count; i = i + 1) {
+            if (muTypes[i].name == name) { return true; }
+        }
+        return false;
+    }
+
+    // 查找用户类型 `typeName` 的声明成员（先项目文件，后
+    // 当前缓冲区）。找到时返回 true 并填充 `outMem`。
+    bool FindTypeMembers(string typeName, List<string> outMem) {
+        EnsureProjectScan();
+        for (int i = 0; i < projTypes.Count; i = i + 1) {
+            if (projTypes[i].name == typeName) {
+                CodeEditor.AddWords(outMem, projTypes[i].members);
+                return true;
+            }
+        }
+        EnsureBufTypes();
+        for (int j = 0; j < muTypes.Count; j = j + 1) {
+            if (muTypes[j].name == typeName) {
+                CodeEditor.AddWords(outMem, muTypes[j].members);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // 尽力解析局部变量的声明类型：扫描
+    // 缓冲区中的 `Type name` 声明。返回基础类型（剥离泛型），
+    // 无则 ""。
+    string ResolveVarType(string name) {
+        if (name.Length == 0) { return ""; }
+        if (name == "this") {
+            if (curLine >= 0 && curLine < lines.Count) {
+                return CodeEditor.EnclosingTypeAt(lines, curLine);
+            }
+            return "";
+        }
+        if (name == "base") {
+            if (curLine >= 0 && curLine < lines.Count) {
+                string encl = CodeEditor.EnclosingTypeAt(lines, curLine);
+                if (encl.Length > 0) {
+                    string b = CodeEditor.SymbolFirstBase(encl);
+                    if (b.Length > 0) { return b; }
+                    for (int li = 0; li < lines.Count; li = li + 1) {
+                        string sln = CodeEditor.TrimStr(lines[li]);
+                        if (sln.StartsWith("class " + encl) || sln.StartsWith("partial class " + encl)) {
+                            int colon = sln.IndexOf(":");
+                            if (colon >= 0) {
+                                string rest = CodeEditor.TrimStr(sln.Substring(colon + 1));
+                                int sp = rest.IndexOf(" ");
+                                int lt = rest.IndexOf("<");
+                                int br = rest.IndexOf("{");
+                                int end = rest.Length;
+                                if (sp >= 0 && sp < end) { end = sp; }
+                                if (lt >= 0 && lt < end) { end = lt; }
+                                if (br >= 0 && br < end) { end = br; }
+                                return rest.Substring(0, end);
+                            }
+                        }
+                    }
+                }
+            }
+            return "";
+        }
+        for (int li = 0; li < lines.Count; li = li + 1) {
+            string s = CodeEditor.TrimStr(lines[li]);
+            int from = 0;
+            while (true) {
+                int p = CodeEditor.FindFrom(s, name, from);
+                if (p < 0) { break; }
+                bool lok = (p > 0 && (s[p - 1] & 255) == 32);
+                int rp = p + name.Length;
+                bool rok = false;
+                if (rp < s.Length) {
+                    int rc = s[rp] & 255;
+                    if (rc == 32 || rc == 61 || rc == 59) { rok = true; }
+                }
+                if (lok && rok) {
+                    // `name` 紧邻之前的 token 必须是类型引用
+                    int te = p - 1;
+                    while (te > 0 && (s[te - 1] & 255) == 32) { te = te - 1; }
+                    int ts = te;
+                    while (ts > 0 && CodeEditor.IsIdentByte(s[ts - 1] & 255)) { ts = ts - 1; }
+                    // 允许类型后带泛型实参列表：List<int>
+                    int gts = ts;
+                    if (te > ts) {
+                        string tok = s.Substring(ts, te - ts);
+                        // 若名称 token 前一个字符是 '>' 则剥离泛型收尾
+                        string typeTok = tok;
+                        int lt = CodeEditor.Find(typeTok, "<");
+                        if (lt > 0) { typeTok = typeTok.Substring(0, lt); }
+                        if (typeTok.Length > 0 && !CodeEditor.IsControlWord(typeTok)
+                            && !CodeEditor.StartsWithP(typeTok, "return")) {
+                            int fc = typeTok[0] & 255;
+                            if (fc < 48 || fc > 57) { return typeTok; }
+                        }
+                    }
+                }
+                from = p + name.Length;
+            }
+        }
+        if (name.EndsWith("StatusBar") || name == "StatusBar") { return "StatusBar"; }
+        if (name.EndsWith("ToolStrip") || name == "ToolStrip") { return "ToolStrip"; }
+        if (name.EndsWith("Button") || name.EndsWith("Btn")) { return "Button"; }
+        if (name.EndsWith("Input") || name.EndsWith("TextBox")) { return "Input"; }
+        if (name.EndsWith("Label") || name.EndsWith("Lbl")) { return "Label"; }
+        if (name.EndsWith("Panel")) { return "Panel"; }
+        if (name.EndsWith("Tabs")) { return "Tabs"; }
+        if (name.EndsWith("Table") || name.EndsWith("Grid")) { return "Table"; }
+        return "";
+    }
+
+    // 把作用域内的 stdlib 类型名加入补全：始终包含内置类型，
+    // 加上每个已导入（或自身）命名空间的类型。
+    void AddStdlibCandidates(List<string> cand, List<string> kinds) {
+        CodeEditor.AddKindWords(cand, kinds,
+            "Console Math Convert Environment String Array List Dictionary Dict StringBuilder DateTime TimeSpan Task Object Exception Tuple Random", "T");
+        List<string> ns = new List<string>();
+        ParseUsingsInto(ns);
+        string fn = FileNamespace();
+        if (fn.Length > 0 && !CodeEditor.Has(ns, fn)) { ns.Add(fn); }
+        for (int i = 0; i < ns.Count; i = i + 1) {
+            List<string> types = new List<string>();
+            CodeEditor.StdlibTypesForNs(ns[i], types);
+            for (int j = 0; j < types.Count; j = j + 1) {
+                if (!CodeEditor.Has(cand, types[j])) { cand.Add(types[j]); kinds.Add("T"); }
+            }
+        }
+    }
+
+    // 已在候选表里的词的哈希集。项目类型和成员动辄上千，逐个对
+    // 候选表线性查重会把一次补全变成平方级。
+    static Dict<string, bool> SeenOf(List<string> cand) {
+        Dict<string, bool> seen = new Dict<string, bool>();
+        for (int i = 0; i < cand.Count; i = i + 1) {
+            if (!seen.ContainsKey(cand[i])) { seen.Add(cand[i], true); }
+        }
+        return seen;
+    }
+
+    // 词去重后追加进候选表（空词与已存在的词跳过）。
+    public static void AddCand(List<string> cand, List<string> kinds,
+                        Dict<string, bool> seen, string w, string kind) {
+        if (w.Length == 0 || seen.ContainsKey(w)) { return; }
+        seen.Add(w, true);
+        cand.Add(w);
+        kinds.Add(kind);
+    }
+
+    // 把项目声明的类型（及其成员）加入补全。
+    void AddProjectCandidates(List<string> cand, List<string> kinds) {
+        EnsureProjectScan();
+        Dict<string, bool> seen = CodeEditor.SeenOf(cand);
+        for (int i = 0; i < projTypes.Count; i = i + 1) {
+            CodeEditor.AddCand(cand, kinds, seen, projTypes[i].name, "T");
+            List<string> mem = new List<string>();
+            CodeEditor.AddWords(mem, projTypes[i].members);
+            for (int j = 0; j < mem.Count; j = j + 1) {
+                CodeEditor.AddCand(cand, kinds, seen, mem[j], "M");
+            }
+        }
+        EnsureBufTypes();
+        for (int a = 0; a < muTypes.Count; a = a + 1) {
+            CodeEditor.AddCand(cand, kinds, seen, muTypes[a].name, "T");
+            List<string> mem2 = new List<string>();
+            CodeEditor.AddWords(mem2, muTypes[a].members);
+            for (int b = 0; b < mem2.Count; b = b + 1) {
+                CodeEditor.AddCand(cand, kinds, seen, mem2[b], "M");
+            }
+        }
+    }
+
+    // 当 (curLine 行、curCol 之前) 正在输入的字词位于
+    // 特性括号内时返回 true —— 即该行上最近的未匹配 '[' 在它之前。
+}

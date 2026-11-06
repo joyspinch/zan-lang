@@ -1,0 +1,603 @@
+using System;
+using Gui;
+
+namespace Gui.Component.CodeEditor;
+
+partial class CodeEditor {
+    string ReceiverBefore(string ln, int dotPos) {
+        int pos = dotPos;
+        if (pos > 0 && (ln[pos - 1] & 255) == 41) {
+            int depth = 1;
+            pos = pos - 1;
+            while (pos > 0 && depth > 0) {
+                pos = pos - 1;
+                int pc = ln[pos] & 255;
+                if (pc == 41) { depth = depth + 1; }
+                else if (pc == 40) { depth = depth - 1; }
+            }
+        }
+        int end = pos;
+        while (pos > 0 && CodeEditor.IsIdentByte(ln[pos - 1] & 255)) {
+            pos = pos - 1;
+        }
+        string word = ln.Substring(pos, end - pos);
+        if (word.Length > 0) { return word; }
+        // 前面只有点号（跨行断开的链式调用后的 `.Select`）：
+        // 回退到该点号之前的片段。
+        if (pos > 0 && (ln[pos - 1] & 255) == 46) {
+            int oEnd = pos - 1;
+            int oStart = oEnd;
+            while (oStart > 0 && CodeEditor.IsIdentByte(ln[oStart - 1] & 255)) {
+                oStart = oStart - 1;
+            }
+            return ln.Substring(oStart, oEnd - oStart);
+        }
+        return "";
+    }
+
+    // 声明光标下成员的类型，通过其前面的接收者解析：
+    // `WebApp.Create` 和 `app.MaxBody`（`app` 声明为 `WebApp`）都得到 `WebApp`，
+    // 成员为继承所得时则得到基类型。
+    // 符号不是成员访问或接收者无法解析时返回空，
+    // 调用方随后回退为仅按名称搜索。
+    // 这使转到定义 / 查找引用不会命中
+    // 无关类型的同名成员。
+    string OwnerTypeAtCaret() {
+        if (curLine < 0 || curLine >= lines.Count) { return ""; }
+        string s = lines[curLine];
+        int col = curCol;
+        if (col >= s.Length) { col = s.Length - 1; }
+        if (col < 0) { return ""; }
+        if (!CodeEditor.IsIdentByte(s[col] & 255)) { return ""; }
+        int a = col;
+        while (a > 0 && CodeEditor.IsIdentByte(s[a - 1] & 255)) { a = a - 1; }
+        if (a == 0 || (s[a - 1] & 255) != 46) { return ""; }
+        string member = CodeEditor.WordAt(s, col);
+        string recv = ReceiverBefore(s, a - 1);
+        if (recv.Length == 0) { return ""; }
+        string t = CodeEditor.NormalizeStdlibType(recv);
+        if (!CodeEditor.HasSymbolType(t) && !IsProjectType(t)) {
+            // 不是类型名，则是值：取其声明类型。
+            string vt = ResolveVarType(recv);
+            if (vt.Length == 0) { return ""; }
+            t = CodeEditor.NormalizeStdlibType(vt);
+        }
+        string decl = CodeEditor.SymbolDeclaringType(t, member);
+        if (decl.Length > 0) { return decl; }
+        return t;
+    }
+
+    // 光标正位于其声明上的成员所属的类型，
+    // 使从声明发起的查找引用也限定在该类型内。
+    // 光标不在成员声明上时返回 ""。
+    string EnclosingTypeOfCaretDecl() {
+        if (curLine < 0 || curLine >= lines.Count) { return ""; }
+        string w = WordAtCaret();
+        if (w.Length == 0) { return ""; }
+        if (!CodeEditor.IsMemberDeclOf(lines[curLine], w)) { return ""; }
+        return CodeEditor.EnclosingTypeAt(lines, curLine);
+    }
+
+    // 用户输入 '.' 时触发。查看点号前的字词并
+    // 建议该类型的已知成员，或链式调用的返回类型。
+    void DotCompletion() {
+        if (!acForced && InStringOrCommentContext()) {
+            acActive = false;
+            acDot = false;
+            acAllCandidates = new List<CeCandidateItem>();
+            acItems = new List<string>();
+            acKinds = new List<string>();
+            CancelSemanticCompletion();
+            return;
+        }
+        string ln = lines[curLine];
+        int dotPos = curCol - 1;
+        while (dotPos >= 0 && CodeEditor.IsIdentByte(ln[dotPos] & 255)) { dotPos = dotPos - 1; }
+        if (dotPos < 0 || (ln[dotPos] & 255) != 46) { acActive = false; return; }
+
+        // 在 `using X.` 指令中，补全子命名空间而非成员。
+        if (CodeEditor.StartsWithP(CodeEditor.TrimStr(ln), "using ")) {
+            UsingDotCompletion();
+            return;
+        }
+
+        // 基于识别出的类型构建成员列表
+        acStart = dotPos + 1;
+        acFull = new List<string>();
+        acDot = true;
+        acDotReceiverType = "";
+
+        // 解析接收者类型，然后只列出该类型的真实成员。
+        // 优先级：硬编码 stdlib 静态类型 -> 用户/项目类型 ->
+        // 局部变量声明类型 -> 通用对象成员。
+        // 对无法解析的接收者，绝不臆测地罗列字符串/集合/LINQ 辅助方法
+        // （那会产出虚假的 `Utils.OrderByDescending`）。
+        string recv = ReceiverBefore(ln, dotPos);
+        string norm = CodeEditor.NormalizeStdlibType(recv);
+        if (CodeEditor.IsKnownStdlibType(norm)) {
+            // 接收者就是类型本身，只能访问其静态成员。
+            acDotReceiverType = norm;
+            CodeEditor.AddMembersIn(acFull, norm, 1);
+        } else {
+            List<string> mem = new List<string>();
+            bool found = FindTypeMembers(recv, mem);
+            bool coll = false;
+            if (found) {
+                acDotReceiverType = recv;
+            } else {
+                string vt = ResolveVarType(recv);
+                if (vt.Length > 0) {
+                    string nvt = CodeEditor.NormalizeStdlibType(vt);
+                    acDotReceiverType = nvt;
+                    if (CodeEditor.IsKnownStdlibType(nvt)) {
+                        // 接收者是值：列出其实例成员。
+                        CodeEditor.AddMembersIn(acFull, nvt, 0);
+                        found = true;
+                        if (CodeEditor.IsCollectionType(nvt)) { coll = true; }
+                    } else if (FindTypeMembers(vt, mem)) {
+                        found = true;
+                    }
+                }
+            }
+            if (found) {
+                for (int mi = 0; mi < mem.Count; mi = mi + 1) {
+                    if (!CodeEditor.Has(acFull, mem[mi])) { acFull.Add(mem[mi]); }
+                }
+                // 所有对象都继承的通用成员。
+                if (!CodeEditor.Has(acFull, "ToString")) { acFull.Add("ToString"); }
+                if (!CodeEditor.Has(acFull, "Equals")) { acFull.Add("Equals"); }
+                if (!CodeEditor.Has(acFull, "GetHashCode")) { acFull.Add("GetHashCode"); }
+                if (!CodeEditor.Has(acFull, "GetType")) { acFull.Add("GetType"); }
+            } else {
+                acFull.Add("ToString"); acFull.Add("Equals");
+                acFull.Add("GetHashCode"); acFull.Add("GetType");
+            }
+        }
+
+        acFilter = "";
+        UpdateCompletion();
+    }
+
+    // `using X.` 指令的命名空间补全：列出已输入前缀的
+    // 子命名空间（如 `using System.` -> Data、
+    // Net、IO、Text 等）。源自 stdlib 命名空间目录，
+    // 绝不臆造成员，也绝不落入类型成员路径。
+    void UsingDotCompletion() {
+        string ln = lines[curLine];
+        int dotPos = curCol - 1;
+        while (dotPos >= 0 && CodeEditor.IsIdentByte(ln[dotPos] & 255)) { dotPos = dotPos - 1; }
+        int s = dotPos;
+        while (s > 0) {
+            int c = ln[s - 1] & 255;
+            if (CodeEditor.IsIdentByte(c) || c == 46) {
+                s = s - 1;
+            } else {
+                break;
+            }
+        }
+        string prefix = ln.Substring(s, dotPos - s);
+        while (prefix.Length > 0 && (prefix[prefix.Length - 1] & 255) == 46) {
+            prefix = prefix.Substring(0, prefix.Length - 1);
+        }
+        acStart = dotPos + 1;
+        acDot = true;
+        acFull = new List<string>();
+        List<string> kids = new List<string>();
+        CodeEditor.ChildNamespaces(prefix, kids);
+        for (int ki = 0; ki < kids.Count; ki = ki + 1) { acFull.Add(kids[ki]); }
+        acFilter = "";
+        UpdateCompletion();
+    }
+
+    // 把 `prefix` 去重后的下一段子命名空间追加到 `out2`，
+    // 来自 stdlib 目录（如前缀 "System.Data" -> Orm、Sqlite、
+    // Postgres）。
+    public static void ChildNamespaces(string prefix, List<string> out2) {
+        string data = CodeEditor.StdlibNsData();
+        string pre = prefix + ".";
+        string cur = "";
+        for (int i = 0; i <= data.Length; i = i + 1) {
+            string ch = "";
+            if (i < data.Length) { ch = data.Substring(i, 1); }
+            if (ch == ";" || i == data.Length) {
+                string key = cur;
+                int eq = CodeEditor.Find(cur, "=");
+                if (eq > 0) { key = cur.Substring(0, eq); }
+                if (key.Length > pre.Length && CodeEditor.StartsWithP(key, pre)) {
+                    string rest = key.Substring(pre.Length, key.Length - pre.Length);
+                    string seg = rest;
+                    int dotp = CodeEditor.Find(rest, ".");
+                    if (dotp > 0) { seg = rest.Substring(0, dotp); }
+                    if (seg.Length > 0 && !CodeEditor.Has(out2, seg)) { out2.Add(seg); }
+                }
+                cur = "";
+            } else {
+                cur = cur + ch;
+            }
+        }
+    }
+
+    // 通过一种接收者可访问的 `typeName` 成员：
+    // `wantStatic` 为 1 表示类型本身（`WebApp.`），0 表示值（`app.`）。
+    // 索引未描述的内容回退到 AddMembers，
+    // 其手写表不区分静态/实例。
+    public static void AddMembersIn(List<string> out2, string typeName, int wantStatic) {
+        if (!CodeEditor.HasSymbolType(typeName)) {
+            CodeEditor.AddMembers(out2, typeName);
+            return;
+        }
+        CodeEditor.SymbolMembersIn(typeName, out2, wantStatic);
+        if (wantStatic != 1) { CodeEditor.SymbolExtensionsFor(typeName, out2); }
+        if (out2.Count > 0) { return; }
+        // 内置类型目录按类型而非按成员标记静态性，
+        // 因此内置类型在请求的上下文中可能没有任何成员。
+        // 索引拥有的任何内容都胜过空弹窗。
+        CodeEditor.SymbolMembersIn(typeName, out2, 0 - 1);
+        CodeEditor.SymbolExtensionsFor(typeName, out2);
+        if (out2.Count == 0) {
+            CodeEditor.AddMembers(out2, typeName);
+        }
+    }
+
+    // 为已知类型填充成员列表。
+    public static void AddMembers(List<string> out2, string typeName) {
+        // 编译器生成的索引优先：它列出编译器
+        // 真正拥有的成员，而下面的表已与其脱节。它们保留为
+        // 尚未建立索引的工作区的回退方案。
+        if (CodeEditor.HasSymbolType(typeName)) {
+            CodeEditor.SymbolMembers(typeName, out2);
+            CodeEditor.SymbolExtensionsFor(typeName, out2);
+            if (out2.Count > 0) { return; }
+        }
+        if (typeName == "Console") {
+            out2.Add("WriteLine"); out2.Add("Write"); out2.Add("PrintLine");
+            out2.Add("ReadLine"); out2.Add("Read"); out2.Add("ReadKey");
+            out2.Add("Clear"); out2.Add("ResetColor");
+            out2.Add("ForegroundColor"); out2.Add("BackgroundColor"); out2.Add("Title");
+        } else if (typeName == "Math") {
+            out2.Add("Abs"); out2.Add("Max"); out2.Add("Min"); out2.Add("Pow");
+            out2.Add("Sqrt"); out2.Add("Round"); out2.Add("Floor"); out2.Add("Ceiling");
+            out2.Add("Sin"); out2.Add("Cos"); out2.Add("Tan");
+            out2.Add("Atan2"); out2.Add("Atan"); out2.Add("Asin"); out2.Add("Acos");
+        } else if (typeName == "File") {
+            out2.Add("Exists"); out2.Add("ReadAllText"); out2.Add("WriteAllText");
+            out2.Add("AppendAllText"); out2.Add("Delete"); out2.Add("Copy");
+            out2.Add("Move"); out2.Add("GetSize");
+        } else if (typeName == "Directory") {
+            out2.Add("Exists"); out2.Add("CreateDirectory"); out2.Add("Delete");
+            out2.Add("ListNames"); out2.Add("GetCurrentDirectory"); out2.Add("SetCurrentDirectory");
+        } else if (typeName == "Path") {
+            out2.Add("Combine"); out2.Add("GetFileName"); out2.Add("GetFileNameWithoutExtension");
+            out2.Add("GetDirectoryName"); out2.Add("GetExtension"); out2.Add("HasExtension");
+            out2.Add("GetTempPath");
+        } else if (typeName == "Convert") {
+            out2.Add("ToDouble"); out2.Add("ToInt32"); out2.Add("ToInt64");
+            out2.Add("ToString");
+        } else if (typeName == "Environment") {
+            out2.Add("ArgCount"); out2.Add("ArgAt"); out2.Add("ExeDir");
+        } else if (typeName == "string" || typeName == "String") {
+            out2.Add("Length"); out2.Add("Substring"); out2.Add("IndexOf");
+            out2.Add("LastIndexOf"); out2.Add("Contains"); out2.Add("StartsWith");
+            out2.Add("EndsWith"); out2.Add("Replace"); out2.Add("Trim");
+            out2.Add("ToUpper"); out2.Add("ToLower"); out2.Add("Split");
+            out2.Add("Equals"); out2.Add("ToString");
+            out2.Add("Format"); out2.Add("Join"); out2.Add("IsNullOrEmpty");
+            out2.Add("CompareOrdinal");
+        } else if (typeName == "List") {
+            out2.Add("Count"); out2.Add("Add"); out2.Add("Reserve");
+            out2.Add("AddRange"); out2.Add("Insert"); out2.Add("RemoveAt");
+            out2.Add("Clear"); out2.Add("Contains"); out2.Add("IndexOf");
+            out2.Add("LastIndexOf"); out2.Add("Reverse"); out2.Add("ToArray");
+        } else if (typeName == "Dictionary" || typeName == "Dict") {
+            out2.Add("Count"); out2.Add("Keys"); out2.Add("Values");
+            out2.Add("Add"); out2.Add("Remove"); out2.Add("Clear");
+            out2.Add("ContainsKey"); out2.Add("TryGetValue");
+        } else if (typeName == "StringBuilder") {
+            out2.Add("Append"); out2.Add("AppendLine"); out2.Add("Clear");
+            out2.Add("Length"); out2.Add("ToString");
+        } else if (typeName == "DateTime") {
+            out2.Add("Now"); out2.Add("UtcNow"); out2.Add("LocalNow");
+            out2.Add("LocalOffsetMinutes");
+            out2.Add("FromUnixSeconds"); out2.Add("FromUnixMilliseconds");
+            out2.Add("FromDate"); out2.Add("FromParts");
+            out2.Add("DaysInMonth"); out2.Add("IsLeapYear"); out2.Add("ParseDate");
+            out2.Add("Year"); out2.Add("Month"); out2.Add("Day");
+            out2.Add("Hour"); out2.Add("Minute"); out2.Add("Second");
+            out2.Add("DayOfWeek"); out2.Add("Millisecond");
+            out2.Add("ToUnixSeconds"); out2.Add("ToUnixMilliseconds");
+            out2.Add("ToLocalTime");
+            out2.Add("AddMilliseconds"); out2.Add("AddSeconds"); out2.Add("AddMinutes");
+            out2.Add("AddHours"); out2.Add("AddDays"); out2.Add("Subtract");
+            out2.Add("Equals"); out2.Add("IsBefore"); out2.Add("IsAfter");
+            out2.Add("ToString"); out2.Add("ToStringWithMillis");
+            out2.Add("ToDateString"); out2.Add("ToTimeString");
+        } else if (typeName == "Array") {
+            out2.Add("Length"); out2.Add("Sort"); out2.Add("Reverse");
+            out2.Add("IndexOf"); out2.Add("Copy"); out2.Add("Clear");
+            out2.Add("Resize"); out2.Add("Find"); out2.Add("FindAll");
+            out2.Add("Exists"); out2.Add("ForEach"); out2.Add("ConvertAll");
+        } else if (typeName == "Process") {
+            out2.Add("Start"); out2.Add("Kill"); out2.Add("WaitForExit");
+            out2.Add("RunCapture"); out2.Add("ExitCode"); out2.Add("HasExited");
+            out2.Add("Id"); out2.Add("ProcessName"); out2.Add("GetCurrentProcess");
+            out2.Add("GetProcesses"); out2.Add("GetProcessesByName");
+            out2.Add("StandardOutput"); out2.Add("StandardError"); out2.Add("StandardInput");
+        } else if (typeName == "App") {
+            out2.Add("CreateDark"); out2.Add("Create"); out2.Add("Show");
+            out2.Add("BeginFrame"); out2.Add("PresentFrame"); out2.Add("RenderChrome");
+            out2.Add("ProcessEvent"); out2.Add("RequestRedraw"); out2.Add("Scale");
+            out2.Add("isRunning"); out2.Add("needsRedraw"); out2.Add("canvas");
+            out2.Add("theme"); out2.Add("window"); out2.Add("titlebarH");
+            out2.Add("mouseX"); out2.Add("mouseY"); out2.Add("focus");
+            out2.Add("hitTester"); out2.Add("ApplyEvent"); out2.Add("WindowHandle");
+            out2.Add("CaptureWheel");
+        } else if (typeName == "Canvas") {
+            out2.Add("DrawText"); out2.Add("FillRect"); out2.Add("DrawRect");
+            out2.Add("FillRoundRect"); out2.Add("Width"); out2.Add("Height");
+            out2.Add("MeasureText"); out2.Add("FontHeight"); out2.Add("Create");
+            out2.Add("Destroy"); out2.Add("DrawLine"); out2.Add("DrawCircle");
+            out2.Add("FillCircle"); out2.Add("SetClip"); out2.Add("ResetClip");
+        } else if (typeName == "Theme") {
+            out2.Add("bgPrimary"); out2.Add("bgSecondary"); out2.Add("bgTertiary");
+            out2.Add("bgHover"); out2.Add("bgActive"); out2.Add("textPrimary");
+            out2.Add("textSecondary"); out2.Add("textTertiary"); out2.Add("primary");
+            out2.Add("error"); out2.Add("warning"); out2.Add("success");
+            out2.Add("divider"); out2.Add("borderPrimary"); out2.Add("borderRadiusMedium");
+            out2.Add("borderRadiusSmall"); out2.Add("fontSizeSmall"); out2.Add("fontSizeMedium");
+            out2.Add("fontSizeLarge"); out2.Add("iconSizeLarge"); out2.Add("paddingSmall");
+            out2.Add("paddingMedium"); out2.Add("paddingLarge"); out2.Add("paddingTiny");
+            out2.Add("gapMedium"); out2.Add("heightMedium");
+        } else if (typeName == "Window") {
+            out2.Add("EventKind"); out2.Add("EventKeyCode"); out2.Add("EventX");
+            out2.Add("EventY"); out2.Add("PollEvent"); out2.Add("WaitEvent");
+            out2.Add("GetWidth"); out2.Add("GetHeight"); out2.Add("Close");
+            out2.Add("SetCursor"); out2.Add("GetTickMs"); out2.Add("SleepMs");
+        } else if (typeName == "LayoutKind") {
+            // [StructLayout(LayoutKind.Sequential)] —— FFI/封送特性
+            // 唯一使用的真实成员。
+            out2.Add("Sequential"); out2.Add("Explicit"); out2.Add("Auto");
+        } else if (typeName == "StatusBar") {
+            out2.Add("SetText"); out2.Add("SetColor"); out2.Add("SetTint");
+            out2.Add("AddLeft"); out2.Add("AddRight"); out2.Add("Clear");
+            out2.Add("SetItemsText"); out2.Add("Kind");
+            out2.Add("Dock"); out2.Add("DockBottom"); out2.Add("DockTop");
+            out2.Add("AddClass"); out2.Add("RemoveClass"); out2.Add("HasClass");
+            out2.Add("SetProp"); out2.Add("GetProp");
+            out2.Add("Visible"); out2.Add("Show"); out2.Add("Hide");
+        } else if (typeName == "ToolStrip") {
+            out2.Add("LastIndex"); out2.Add("SelectedIndex"); out2.Add("OnItemClick");
+            out2.Add("SetItemsText"); out2.Add("Clear"); out2.Add("Kind");
+            out2.Add("Dock"); out2.Add("DockTop"); out2.Add("DockBottom");
+            out2.Add("AddClass"); out2.Add("RemoveClass"); out2.Add("HasClass");
+            out2.Add("SetProp"); out2.Add("GetProp"); out2.Add("SetTint");
+            out2.Add("Visible"); out2.Add("Show"); out2.Add("Hide");
+        } else if (typeName == "Button") {
+            out2.Add("Text"); out2.Add("Icon"); out2.Add("Disabled");
+            out2.Add("OnClick"); out2.Add("Kind");
+            out2.Add("Dock"); out2.Add("AddClass"); out2.Add("RemoveClass");
+            out2.Add("SetProp"); out2.Add("GetProp");
+            out2.Add("Visible"); out2.Add("Show"); out2.Add("Hide");
+        } else if (typeName == "Input" || typeName == "TextBox") {
+            out2.Add("Text"); out2.Add("Placeholder"); out2.Add("Value");
+            out2.Add("SetText"); out2.Add("GetText"); out2.Add("Clear");
+            out2.Add("OnChange"); out2.Add("OnSubmit"); out2.Add("Disabled");
+            out2.Add("Dock"); out2.Add("AddClass"); out2.Add("RemoveClass");
+            out2.Add("SetProp"); out2.Add("GetProp");
+            out2.Add("Visible"); out2.Add("Show"); out2.Add("Hide");
+        } else if (typeName == "Label") {
+            out2.Add("Text"); out2.Add("TextColor"); out2.Add("FontPx");
+            out2.Add("Dock"); out2.Add("AddClass"); out2.Add("RemoveClass");
+            out2.Add("SetProp"); out2.Add("GetProp");
+            out2.Add("Visible"); out2.Add("Show"); out2.Add("Hide");
+        } else if (typeName == "Tabs") {
+            out2.Add("SelectedIndex"); out2.Add("SetSelectedIndex");
+            out2.Add("TabCount"); out2.Add("AddTab"); out2.Add("RemoveTabAt");
+            out2.Add("GetTabTitle"); out2.Add("SetTabTitle");
+            out2.Add("Dock"); out2.Add("DockTop"); out2.Add("DockBottom"); out2.Add("DockFill");
+            out2.Add("AddClass"); out2.Add("RemoveClass"); out2.Add("HasClass");
+            out2.Add("SetProp"); out2.Add("GetProp"); out2.Add("SetTint");
+            out2.Add("Visible"); out2.Add("Show"); out2.Add("Hide");
+        } else if (typeName == "Table" || typeName == "DataTable") {
+            out2.Add("SetData"); out2.Add("GetData"); out2.Add("RowCount"); out2.Add("ColCount");
+            out2.Add("Clear"); out2.Add("AddRow"); out2.Add("RemoveRowAt");
+            out2.Add("Dock"); out2.Add("DockFill");
+            out2.Add("AddClass"); out2.Add("RemoveClass"); out2.Add("HasClass");
+            out2.Add("Visible"); out2.Add("Show"); out2.Add("Hide");
+        } else if (typeName == "Control" || typeName == "Panel") {
+            out2.Add("Dock"); out2.Add("DockTop"); out2.Add("DockBottom");
+            out2.Add("DockLeft"); out2.Add("DockRight"); out2.Add("DockFill");
+            out2.Add("AddClass"); out2.Add("RemoveClass"); out2.Add("HasClass");
+            out2.Add("SetProp"); out2.Add("GetProp");
+            out2.Add("Visible"); out2.Add("Show"); out2.Add("Hide");
+            out2.Add("Width"); out2.Add("Height"); out2.Add("Kind");
+        } else {
+            // 未知 / 无法解析的接收者：只列出普遍可用的
+            // 对象成员。我们故意不猜测字符串 / 集合 /
+            // LINQ 辅助方法，因为那样会显示类型可能没有的
+            // 方法（如 `Utils.OrderByDescending`）。DotCompletion 按名称/using 解析用户和
+            // stdlib 类型，仅在对接收者一无所知时才
+            // 回退到这里。
+            out2.Add("ToString"); out2.Add("Equals");
+            out2.Add("GetHashCode"); out2.Add("GetType");
+        }
+    }
+
+    // 追加 LINQ 查询运算符方法（保留为空，Zan 仅支持 LINQ 查询表达式而非方法调用链）。
+    public static void AddLinqMembers(List<string> out2) {
+    }
+
+    // ============================================================
+    // 符号索引与感知 using 的精确补全
+    // ============================================================
+
+    // 把空格分隔的字符串拆分为 token 追加到 `out2`。
+    public static void AddWords(List<string> out2, string s) {
+        if (s == null) { return; }
+        int n = s.Length;
+        int i = 0;
+        while (i < n) {
+            while (i < n && (s[i] & 255) == 32) { i = i + 1; }
+            if (i >= n) { break; }
+            int start = i;
+            while (i < n && (s[i] & 255) != 32) { i = i + 1; }
+            out2.Add(s.Substring(start, i - start));
+        }
+    }
+
+    // 把 `s` 中每个空格分隔的 token 追加到 `cand`（种类 `kind`），
+    // 跳过已存在的重复项。
+    public static void AddKindWords(List<string> cand, List<string> kinds, string s, string kind) {
+        List<string> tmp = new List<string>();
+        CodeEditor.AddWords(tmp, s);
+        for (int i = 0; i < tmp.Count; i = i + 1) {
+            if (!CodeEditor.Has(cand, tmp[i])) { cand.Add(tmp[i]); kinds.Add(kind); }
+        }
+    }
+
+    // 从去除首尾空白的行中剥离开头的声明修饰符（public/static/…），
+    // 返回剩余部分（如从 "public class Foo {" 得 "class Foo {"）。
+    public static string StripModifiers(string trimmed) {
+        string mods = " public private protected internal static abstract sealed partial file virtual override readonly const async unsafe extern new ";
+        string s = trimmed;
+        while (true) {
+            int sp = CodeEditor.Find(s, " ");
+            if (sp <= 0) { break; }
+            string first = s.Substring(0, sp);
+            if (CodeEditor.Find(mods, " " + first + " ") >= 0) {
+                s = CodeEditor.LTrim(s.Substring(sp, s.Length - sp));
+            } else { break; }
+        }
+        return s;
+    }
+
+    // 若 `trimmed` 声明了 class/struct/enum/interface 则返回其名称，
+    // 否则 ""。
+    public static string TypeDeclName(string trimmed) {
+        string s = CodeEditor.StripModifiers(trimmed);
+        string kw = "";
+        if (CodeEditor.StartsWithP(s, "class ")) { kw = "class "; }
+        else if (CodeEditor.StartsWithP(s, "struct ")) { kw = "struct "; }
+        else if (CodeEditor.StartsWithP(s, "enum ")) { kw = "enum "; }
+        else if (CodeEditor.StartsWithP(s, "interface ")) { kw = "interface "; }
+        else { return ""; }
+        string rest = CodeEditor.LTrim(s.Substring(kw.Length, s.Length - kw.Length));
+        int i = 0;
+        int rlen = rest.Length;
+        while (i < rlen && CodeEditor.IsIdentByte(rest[i] & 255)) {
+            i = i + 1;
+        }
+        return rest.Substring(0, i);
+    }
+
+    // 当 `head`（后跟 `(` 的名称之前的文本）
+    // 可以是声明的返回类型而非接收者表达式时返回 true。
+    // 像 `app.MaxBody(x);` 这样的调用前面有 `app.`，因此不能
+    // 将其报告为 `MaxBody` 的声明。
+    public static bool DeclHeadOk(string head) {
+        if (head == null) { return false; }
+        int hlen = head.Length;
+        int end = hlen;
+        while (end > 0) {
+            int c = head[end - 1] & 255;
+            if (c != 32 && c != 9) { break; }
+            end = end - 1;
+        }
+        if (end == 0) { return false; }
+        // 类型 token 必须与名称以空白分隔……
+        if (end == hlen) { return false; }
+        // ……且不能以成员访问或运算符结尾。
+        int last = head[end - 1] & 255;
+        return CodeEditor.IsIdentByte(last) || last == 62 || last == 93;
+    }
+
+    // 若 `trimmed` 是直接成员声明（方法 / 字段 / 属性）
+    // 则返回成员名，否则 ""。
+    public static string MemberDeclName(string trimmed) {
+        string s = CodeEditor.StripModifiers(trimmed);
+        if (s.Length == 0) { return ""; }
+        string f = s.Substring(0, 1);
+        if (f == "/" || f == "*" || f == "#" || f == "@" || f == "[" || f == "}" || f == "{") { return ""; }
+        if (CodeEditor.TypeDeclName(trimmed).Length > 0) { return ""; }
+        // 方法：标识符后紧跟 '('。
+        int paren = CodeEditor.Find(s, "(");
+        if (paren > 0) {
+            int e = paren;
+            while (e > 0 && CodeEditor.IsIdentByte(s[e - 1] & 255)) { e = e - 1; }
+            string mname = s.Substring(e, paren - e);
+            if (mname.Length == 0) { return ""; }
+            if (e == 0) { return ""; }
+            if (CodeEditor.IsControlWord(mname)) { return ""; }
+            return mname;
+        }
+        int term = -1;
+        for (int ti = 0; ti < s.Length; ti = ti + 1) {
+            int c = s[ti] & 255;
+            if (c == 59 || c == 61 || c == 123) { term = ti; break; }
+        }
+        if (term < 0) { return ""; }
+        string head = CodeEditor.TrimStr(s.Substring(0, term));
+        int b = head.Length;
+        while (b > 0 && !CodeEditor.IsIdentByte(head[b - 1] & 255)) { b = b - 1; }
+        int a = b;
+        while (a > 0 && CodeEditor.IsIdentByte(head[a - 1] & 255)) { a = a - 1; }
+        if (b <= a) { return ""; }
+        string name = head.Substring(a, b - a);
+        string before = CodeEditor.TrimStr(head.Substring(0, a));
+        if (before.Length == 0) { return ""; }        // 前面需要有类型 token
+        if (CodeEditor.IsControlWord(name)) { return ""; }
+        int fc = name[0] & 255;
+        if (fc >= 48 && fc <= 57) { return ""; }
+        return name;
+    }
+
+    // 扫描 `src` 中每个 class/struct/enum 声明，把每个类型名
+    // 追加到 `names`，其空格分隔的直接成员名追加到 `membersJoined`。
+    public static void ScanTypesInto(string src, List<string> names, List<string> membersJoined) {
+        CodeEditor.ScanTypeLinesInto(CodeEditor.SplitLines(src), names, membersJoined);
+    }
+
+    // 同上，但直接吃行表：编辑器自己的缓冲区本来就是行表，
+    // 先 GetText() 拼成一个整文档字符串再 SplitLines() 拆回去，在 30 万行
+    // 上就是每次重扫都要分配十兆级的字符串。
+    public static void ScanTypeLinesInto(List<string> ls, List<string> names,
+                                  List<string> membersJoined) {
+        int i = 0;
+        while (i < ls.Count) {
+            string tr = CodeEditor.TrimStr(ls[i]);
+            string tname = CodeEditor.TypeDeclName(tr);
+            if (tname.Length > 0) {
+                List<string> members = new List<string>();
+                Dict<string, bool> seen = new Dict<string, bool>();
+                int depth = 0;
+                bool started = false;
+                int j = i;
+                while (j < ls.Count) {
+                    string lj = ls[j];
+                    if (started && depth == 1 && j != i) {
+                        string mn = CodeEditor.MemberDeclName(CodeEditor.TrimStr(lj));
+                        if (mn.Length > 0 && !seen.ContainsKey(mn)) {
+                            seen.Add(mn, true);
+                            members.Add(mn);
+                        }
+                    }
+                    int n = lj.Length;
+                    for (int k = 0; k < n; k = k + 1) {
+                        int ch = lj[k];
+                        if (ch == 123) { depth = depth + 1; started = true; }
+                        else if (ch == 125) { depth = depth - 1; }
+                    }
+                    j = j + 1;
+                    if (started && depth <= 0) { break; }
+                }
+                names.Add(tname);
+                membersJoined.Add(String.Join(" ", members));
+                i = j;
+            } else {
+                i = i + 1;
+            }
+        }
+    }
+
+    // 宿主 IDE 钩子：提供所有其他项目文件的源码，使
+    // 编辑器能解析跨文件类型（如 utils.zan 中的 `Utils` 类）。
+}

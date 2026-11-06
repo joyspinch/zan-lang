@@ -1,0 +1,360 @@
+using System;
+using Gui;
+
+namespace Gui.Component.CodeEditor;
+
+partial class CodeEditor {
+    bool InAttributeContext() {
+        if (curLine < 0 || curLine >= lines.Count) { return false; }
+        string s = lines[curLine];
+        int i = curCol - 1;
+        if (i >= s.Length) { i = s.Length - 1; }
+        while (i >= 0) {
+            string ch = s.Substring(i, 1);
+            if (ch == "[") { return true; }
+            if (ch == "]") { return false; }
+            i = i - 1;
+        }
+        return false;
+    }
+
+    // 检查光标是否处于字符串字面量或单行/块注释内部，避免在引号或注释中弹出无意义的代码补全
+    bool InStringOrCommentContext() {
+        if (curLine < 0 || curLine >= lines.Count) { return false; }
+        string ln = lines[curLine];
+        int n = ln.Length;
+        int limit = curCol;
+        if (limit > n) { limit = n; }
+
+        // 检查前序多行块注释（未闭合的 /*）
+        int pLine = curLine - 1;
+        int checkStart = pLine - 25;
+        if (checkStart < 0) { checkStart = 0; }
+        bool priorBlockComment = false;
+        for (int pl = checkStart; pl <= pLine; pl = pl + 1) {
+            string pln = lines[pl];
+            int pn = pln.Length;
+            int pi = 0;
+            while (pi < pn) {
+                int pb = pln[pi] & 255;
+                if (!priorBlockComment) {
+                    if (pb == 47 && pi + 1 < pn && (pln[pi + 1] & 255) == 42) {
+                        priorBlockComment = true;
+                        pi = pi + 2;
+                        continue;
+                    }
+                } else {
+                    if (pb == 42 && pi + 1 < pn && (pln[pi + 1] & 255) == 47) {
+                        priorBlockComment = false;
+                        pi = pi + 2;
+                        continue;
+                    }
+                }
+                pi = pi + 1;
+            }
+        }
+
+        int i = 0;
+        bool inBlockComment = priorBlockComment;
+        while (i < n) {
+            int b = ln[i] & 255;
+            if (inBlockComment) {
+                if (b == 42 && i + 1 < n && (ln[i + 1] & 255) == 47) {
+                    inBlockComment = false;
+                    i = i + 2;
+                    continue;
+                }
+                if (limit <= i) { return true; }
+                i = i + 1;
+                continue;
+            }
+
+            // 检查行注释（Zan // 或 Python # 或 Lua --）
+            if (syntaxLang == 0 && b == 47 && i + 1 < n && (ln[i + 1] & 255) == 47) {
+                if (limit > i) { return true; }
+                break;
+            }
+            if (syntaxLang == 0 && b == 47 && i + 1 < n && (ln[i + 1] & 255) == 42) {
+                inBlockComment = true;
+                i = i + 2;
+                if (limit <= i) { return true; }
+                continue;
+            }
+            if (syntaxLang == 1 && b == 45 && i + 1 < n && (ln[i + 1] & 255) == 45) {
+                if (limit > i) { return true; }
+                break;
+            }
+            if (syntaxLang == 2 && b == 35) {
+                if (limit > i) { return true; }
+                break;
+            }
+
+            // 检查双引号字符串区间 "..."
+            if (b == 34) {
+                int qStart = i;
+                int qEnd = 0 - 1;
+                int j = i + 1;
+                while (j < n) {
+                    int jb = ln[j] & 255;
+                    if (jb == 92 && j + 1 < n) {
+                        j = j + 2;
+                        continue;
+                    }
+                    if (jb == 34) {
+                        qEnd = j;
+                        break;
+                    }
+                    j = j + 1;
+                }
+                if (qEnd >= 0) {
+                    if (limit > qStart && limit <= qEnd) { return true; }
+                    i = qEnd + 1;
+                    continue;
+                } else {
+                    // 未闭合字符串延伸至行尾
+                    if (limit > qStart) { return true; }
+                    break;
+                }
+            }
+
+            // 检查单引号字符字面量 '...'（Zan 语言仅作为单字符）
+            if (b == 39) {
+                int cStart = i;
+                int cEnd = 0 - 1;
+                int j = i + 1;
+                while (j < n && j <= i + 5) {
+                    int jb = ln[j] & 255;
+                    if (jb == 92 && j + 1 < n) {
+                        j = j + 2;
+                        continue;
+                    }
+                    if (jb == 39) {
+                        cEnd = j;
+                        break;
+                    }
+                    j = j + 1;
+                }
+                if (cEnd >= 0) {
+                    if (limit > cStart && limit <= cEnd) { return true; }
+                    i = cEnd + 1;
+                    continue;
+                }
+            }
+
+            i = i + 1;
+        }
+
+        if (inBlockComment) { return true; }
+        // 兜底检查：若当前光标左右紧邻引号（如刚刚自动成对补全的 "" 或 ''），一律属于字符串内部
+        if (limit > 0 && limit < n) {
+            int prevB = ln[limit - 1] & 255;
+            int nextB = ln[limit] & 255;
+            if ((prevB == 34 && nextB == 34) || (prevB == 39 && nextB == 39)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // 扫描缓冲区中使用 `using X;` 类型却缺少所需导入之处，
+    // 为每个出错行记录诊断 + 快速修复。
+    // 当前缓冲区声明的类型名（及其成员）。补全与诊断每次击键、
+    // 每次光标移动都要用到它，而重扫是一整篇解析，因此只在结构
+    // 真的变了时重扫（见 BufTypesStructuralChange）。
+    void EnsureBufTypes() {
+        if (analysisApp != null) {
+            RequestAnalysis();
+            if (muTypes == null) { muTypes = new List<CeBufType>(); }
+            return;
+        }
+        if (workerSnapshot != null && workerBufferTypesReady) { return; }
+        if (muTypes != null && !BufTypesStructuralChange()) { return; }
+        List<string> names = new List<string>();
+        List<string> membersJoined = new List<string>();
+        CodeEditor.ScanTypeLinesInto(lines, names, membersJoined);
+        muTypes = new List<CeBufType>();
+        for (int k = 0; k < names.Count && k < membersJoined.Count; k = k + 1) {
+            muTypes.Add(new CeBufType(names[k], membersJoined[k]));
+        }
+        candBaseGen = candBaseGen + 1;
+        if (workerSnapshot != null) { workerBufferTypesReady = true; return; }
+        btLineSrc = new List<string>();
+        for (int i = 0; i < lines.Count; i = i + 1) { btLineSrc.Add(lines[i]); }
+    }
+
+    // 自上次扫描以来，缓冲区里发生了能改变类型表的变化时返回 true。
+    // 类型表只取决于声明行和花括号层次，所以在方法体里敲一个字
+    // （最常见的编辑）不必重扫：只有声明形状或花括号变了才算数。
+    bool BufTypesStructuralChange() {
+        if (btLineSrc == null || btLineSrc.Count != lines.Count) { return true; }
+        for (int i = 0; i < lines.Count; i = i + 1) {
+            string now = lines[i];
+            string was = btLineSrc[i];
+            if (now == was) { continue; }
+            if (CodeEditor.BraceKey(now) != CodeEditor.BraceKey(was)) { return true; }
+            string trNow = CodeEditor.TrimStr(now);
+            string trWas = CodeEditor.TrimStr(was);
+            if (CodeEditor.TypeDeclName(trNow) != CodeEditor.TypeDeclName(trWas)) { return true; }
+            if (CodeEditor.MemberDeclName(trNow) != CodeEditor.MemberDeclName(trWas)) { return true; }
+            btLineSrc[i] = now;
+        }
+        return false;
+    }
+
+    // 一行里 '{' 与 '}' 的个数，合成一个可比较的键。
+    public static int BraceKey(string s) {
+        int open = 0;
+        int close = 0;
+        int n = s.Length;
+        for (int i = 0; i < n; i = i + 1) {
+            int ch = s[i];
+            if (ch == 123) { open = open + 1; }
+            else if (ch == 125) { close = close + 1; }
+        }
+        return open * 1048576 + close;
+    }
+
+    // 对构成标识符的字节（ASCII 字母、数字、
+    // 下划线）返回 true。用字节测试替代 InSet(str, Substring(p, 1))，后者
+    // 会为文档中每个字符分配字符串并重扫 63 字符集合，
+    // 开销很大。
+    public static bool IdentByte(int b) {
+        if (b >= 97 && b <= 122) { return true; }
+        if (b >= 65 && b <= 90) { return true; }
+        if (b >= 48 && b <= 57) { return true; }
+        return b == 95;
+    }
+
+    void AnalyzeMissingUsings() {
+        if (analysisApp != null) { RequestAnalysis(); return; }
+        if (ReplayMissingUsings()) { return; }
+        EnsureProjectScan();
+        List<string> usings = new List<string>();
+        ParseUsingsInto(usings);
+        string fileNs = FileNamespace();
+        EnsureBufTypes();
+        string ctx = fileNs + "|" + string.Join(",", usings) + "|"
+            + Convert.ToString(muTypes.Count) + ":"
+            + Convert.ToString(projTypes.Count);
+        if (muCtx != ctx || muLineCaches == null) {
+            muCtx = ctx;
+            muLineCaches = new List<CeMissingUsingLine>();
+        }
+        fixes = new List<QuickFix>();
+        int li = 0;
+        while (li < lines.Count) {
+            if (AnalysisCancelled()) { return; }
+            while (muLineCaches.Count <= li) {
+                muLineCaches.Add(new CeMissingUsingLine(null, "", ""));
+            }
+            if (muLineCaches[li].src != lines[li]) {
+                ScanLineMissingUsing(li, usings, fileNs);
+            }
+            if (muLineCaches[li].ns.Length > 0) {
+                errors.Add(new Diagnostic(li, "'" + muLineCaches[li].word
+                    + "' needs 'using " + muLineCaches[li].ns + ";'"));
+                fixes.Add(new QuickFix(li, muLineCaches[li].ns));
+            }
+            li = li + 1;
+        }
+        while (muLineCaches.Count > lines.Count) {
+            muLineCaches.RemoveAt(muLineCaches.Count - 1);
+        }
+        muStamp = TextStamp();
+    }
+
+    bool ReplayMissingUsings() {
+        if (muLineCaches == null || muLineCaches.Count != lines.Count) { return false; }
+        for (int i = 0; i < lines.Count; i = i + 1) {
+            if (muLineCaches[i].src != lines[i]) { return false; }
+        }
+        fixes = new List<QuickFix>();
+        for (int j = 0; j < lines.Count; j = j + 1) {
+            if (muLineCaches[j].ns.Length > 0) {
+                errors.Add(new Diagnostic(j, "'" + muLineCaches[j].word
+                    + "' needs 'using " + muLineCaches[j].ns + ";'"));
+                fixes.Add(new QuickFix(j, muLineCaches[j].ns));
+            }
+        }
+        return true;
+    }
+
+    void ScanLineMissingUsing(int li, List<string> usings, string fileNs) {
+        muLineCaches[li].src = lines[li];
+        muLineCaches[li].ns = "";
+        muLineCaches[li].word = "";
+        string tr = CodeEditor.TrimStr(lines[li]);
+        if (tr.Length == 0 || tr.Substring(0, 1) == "/" || tr.Substring(0, 1) == "*"
+            || CodeEditor.StartsWithP(tr, "using ") || CodeEditor.StartsWithP(tr, "namespace ")) {
+            return;
+        }
+        string ln = lines[li];
+        int p = 0;
+        int n = ln.Length;
+        while (p < n) {
+            if (CodeEditor.IdentByte(ln[p])) {
+                int s2 = p;
+                while (p < n && CodeEditor.IdentByte(ln[p])) { p = p + 1; }
+                bool dotAfter = (p < n && ln[p] == 46);
+                bool dotBefore = (s2 > 0 && ln[s2 - 1] == 46);
+                int first = ln[s2];
+                bool cap = (first >= 65 && first <= 90);
+                if (dotAfter && !dotBefore && cap) {
+                    string w = ln.Substring(s2, p - s2);
+                    string ns = CodeEditor.NsForStdlibType(w);
+                    if (ns.Length > 0) {
+                        bool imported = CodeEditor.Has(usings, ns);
+                        if (!imported && fileNs.Length > 0) {
+                            if (fileNs == ns) { imported = true; }
+                            else if (fileNs.Length > ns.Length && CodeEditor.StartsWithP(fileNs, ns + ".")) { imported = true; }
+                        }
+                        bool userType = IsProjectType(w);
+                        if (!imported && !userType) {
+                            muLineCaches[li].ns = ns;
+                            muLineCaches[li].word = w;
+                            return;
+                        }
+                    }
+                }
+            } else {
+                p = p + 1;
+            }
+        }
+    }
+
+    // 缺失 using 的快速修复会为光标行添加的命名空间，无则 ""。
+    string QuickFixNs() {
+        for (int i = 0; i < fixes.Count; i = i + 1) {
+            if (fixes[i].line == curLine) { return fixes[i].ns; }
+        }
+        return "";
+    }
+
+    // 光标行存在缺失 using 的快速修复时返回 true。
+    bool HasQuickFix() { return QuickFixNs().Length > 0; }
+
+    // 在最后一个现有 using 之后（或顶部）插入 `using ns;`，
+    // 除非已存在。
+    void AddUsing(string ns) {
+        if (ns.Length == 0) { return; }
+        List<string> cur = new List<string>();
+        ParseUsingsInto(cur);
+        if (CodeEditor.Has(cur, ns)) { return; }
+        int lastUsing = -1;
+        for (int i = 0; i < lines.Count; i = i + 1) {
+            if (CodeEditor.StartsWithP(CodeEditor.TrimStr(lines[i]), "using ")) { lastUsing = i; }
+        }
+        SaveUndo();
+        int at = 0;
+        if (lastUsing >= 0) { at = lastUsing + 1; }
+        lines.Insert(at, "using " + ns + ";");
+        if (at <= curLine) { curLine = curLine + 1; }
+        lastDiagLine = -1;
+        CheckErrors();
+    }
+
+    // 若有则对光标行应用缺失 using 的快速修复。
+    void ApplyQuickFix() {
+        AddUsing(QuickFixNs());
+    }
+}

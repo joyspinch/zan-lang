@@ -1,0 +1,606 @@
+using System;
+using Gui;
+
+namespace Gui.Component.CodeEditor;
+
+partial class CodeEditor {
+    public static string MemberKind(string name) {
+        if (name.Length == 0) { return "M"; }
+        int fc = name[0] & 255;
+        if (fc >= 97 && fc <= 122) { return "F"; }
+        if (CodeEditor.Find(name, "Changed") >= 0 || CodeEditor.Find(name, "Click") >= 0) { return "E"; }
+        string props = " Count Length Keys Values Now Today UtcNow Year Month Day Hour Minute Second DayOfWeek DayOfYear Ticks PI E Capacity Empty Chars ForegroundColor BackgroundColor ResetColor Title WindowWidth WindowHeight ExitCode HasExited Id ProcessName StandardOutput StandardError StandardInput NewLine MachineName UserName OSVersion ProcessorCount TickCount StackTrace CommandLine CurrentDirectory Is64BitOperatingSystem DirectorySeparatorChar AltDirectorySeparatorChar ";
+        if (CodeEditor.Find(props, " " + name + " ") >= 0) { return "P"; }
+        return "M";
+    }
+
+    // `w` 是看似调用的控制流关键字时返回 true。
+    public static bool IsControlWord(string w) {
+        string ctrl = " if for while switch catch foreach using lock return sizeof typeof new ";
+        return CodeEditor.Find(ctrl, " " + w + " ") >= 0;
+    }
+
+    // `trimmed` 中 `at` 位置之前声明的标识符（`at` 是其后的
+    // '(' 或 '{' 的位置）；没有或前面无内容时返回 ""
+    // —— 声明前总有类型或修饰符，
+    // 这正是它与调用或裸代码块的区别。
+    public static string DeclIdentBefore(string trimmed, int at) {
+        int e = at;
+        while (e > 0 && CodeEditor.IsIdentByte(trimmed[e - 1] & 255)) {
+            e = e - 1;
+        }
+        string name = trimmed.Substring(e, at - e);
+        if (name.Length == 0 || e == 0) { return ""; }
+        if (CodeEditor.IsControlWord(name)) { return ""; }
+        return name;
+    }
+
+    // `line` 声明的属性名（如 `public int page { get; set; } = 1;`），未声明则返回 ""
+    // 访问器是区分属性与类型声明
+    // 或普通代码块的关键：'{' 前的头部不含 '('（那是
+    // 方法或控制语句）、不含 '='（赋值）也不含 '['
+    // （索引器），花括号内是 get / set。
+    public static string PropNameAt(string trimmed) {
+        int bo = CodeEditor.Find(trimmed, "{");
+        if (bo <= 0) { return ""; }
+        string head = trimmed.Substring(0, bo);
+        if (CodeEditor.Find(head, "(") >= 0) { return ""; }
+        if (CodeEditor.Find(head, "=") >= 0) { return ""; }
+        if (CodeEditor.Find(head, "[") >= 0) { return ""; }
+        if (CodeEditor.Find(head, ":") >= 0) { return ""; }
+        string body = trimmed.Substring(bo + 1, trimmed.Length - bo - 1);
+        if (CodeEditor.Find(body, "get") < 0
+            && CodeEditor.Find(body, "set") < 0) {
+            return "";
+        }
+        int he = bo;
+        while (he > 0) {
+            int ch = trimmed[he - 1] & 255;
+            if (ch != 32 && ch != 9) { break; }
+            he = he - 1;
+        }
+        string name = CodeEditor.DeclIdentBefore(trimmed, he);
+        if (name.Length == 0) { return ""; }
+        string before = CodeEditor.TrimStr(
+            trimmed.Substring(0, he - name.Length));
+        if (before.Length == 0) { return ""; }
+        // 名称之前的内容必须以类型或修饰符结尾。`} else {`
+        // 以花括号结尾，其内部可能有 "set"（如 "settings.Save()"），
+        // 这就是代码块被误判为属性的原因。
+        int tc = before[before.Length - 1] & 255;
+        if (!CodeEditor.IsIdentByte(tc) && tc != 62 && tc != 93
+            && tc != 63) {
+            return "";
+        }
+        // `class A { get; }` 不是属性，且类型名已由
+        // 大纲而非引用计数报告。
+        string types = " class struct interface enum namespace ";
+        if (CodeEditor.Find(types, " " + before + " ") >= 0) { return ""; }
+        return name;
+    }
+
+    // 快速前置判断：绝大多数语句、注释、控制流与空行都不可能声明成员，
+    // 避免每行都去 TrimStr 和字符循环。
+    public static bool MightBeDecl(string line) {
+        if (line.Length < 6) { return false; }
+        if (CodeEditor.Find(line, "{") < 0) { return false; }
+        return true;
+    }
+
+    // 若 `line` 声明了成员则返回其名称，否则返回 ""。
+    // 方法是标识符后跟参数列表，其匹配的 ')'
+    // 后跟方法体的 '{'，且不是控制语句；
+    // 属性是标识符后跟 get / set 访问器。
+    public static string DeclNameAt(string line) {
+        if (!CodeEditor.MightBeDecl(line)) { return ""; }
+        string trimmed = CodeEditor.TrimStr(line);
+        if (trimmed.Length == 0) { return ""; }
+        // 必须包含一个 '('，其匹配的 ')' 后跟方法体的 '{'。
+        // 这样的单行访问器同样是声明，
+        // 与花括号结束行尾的声明无异。
+        // 先判断属性：其初始化器可能包含该行唯一的
+        // 圆括号（如 `{ get; set; } = new List<T>();`），方法路径
+        // 会误将其读作参数列表。
+        string prop = CodeEditor.PropNameAt(trimmed);
+        if (prop.Length > 0) { return prop; }
+        int paren = CodeEditor.Find(trimmed, "(");
+        if (paren <= 0) { return ""; }
+        int depth = 0;
+        int close = 0 - 1;
+        int ci = paren;
+        while (ci < trimmed.Length) {
+            int b = trimmed[ci] & 255;
+            if (b == 40) { depth = depth + 1; }
+            else if (b == 41) {
+                depth = depth - 1;
+                if (depth == 0) { close = ci; break; }
+            }
+            ci = ci + 1;
+        }
+        if (close < 0) { return ""; }
+        int bo = close + 1;
+        while (bo < trimmed.Length) {
+            int b = trimmed[bo] & 255;
+            if (b != 32 && b != 9) { break; }
+            bo = bo + 1;
+        }
+        if (bo >= trimmed.Length || (trimmed[bo] & 255) != 123) { return ""; }
+        // 拒绝明显的非声明：参数列表前有赋值。
+        string dhead = trimmed.Substring(0, paren);
+        if (CodeEditor.Find(dhead, "=") >= 0) { return ""; }
+        return CodeEditor.DeclIdentBefore(trimmed, paren);
+    }
+
+    // `line` 中注释与字符串/字符字面量被抹除后的版本（长度
+    // 不变，偏移仍可映射回原文），扫描因此永远不会
+    // 匹配到注释文字或字面量中的名称。
+    public static string StripCode(string line) {
+        // 绝大多数行既无字面量也无注释：先按字节看一眼，那样的行
+        // 原串就是结果，不必逐字符重建一份。扫描把整个
+        // 项目的每一行都过一遍，这里的分配量就是总体开销。
+        bool plain = true;
+        int n = line.Length;
+        for (int s = 0; s < n; s = s + 1) {
+            int b = line[s];
+            if (b == 34 || b == 39 || b == 47) { plain = false; break; }
+        }
+        if (plain) { return line; }
+        StringBuilder outp = new StringBuilder();
+        int i = 0;
+        bool inStr = false;
+        bool inChr = false;
+        while (i < n) {
+            int b = line[i] & 255;
+            if (inStr || inChr) {
+                outp.Append(" ");
+                if (b == 92 && i + 1 < n) {
+                    outp.Append(" ");
+                    i = i + 2;
+                    continue;
+                }
+                if (inStr && b == 34) { inStr = false; }
+                if (inChr && b == 39) { inChr = false; }
+                i = i + 1;
+                continue;
+            }
+            if (b == 47 && i + 1 < n && (line[i + 1] & 255) == 47) {
+                while (i < n) { outp.Append(" "); i = i + 1; }
+                return outp.ToString();
+            }
+            if (b == 34) { inStr = true; outp.Append(" "); i = i + 1; continue; }
+            if (b == 39) { inChr = true; outp.Append(" "); i = i + 1; continue; }
+            int runStart = i;
+            while (i < n) {
+                int cb = line[i] & 255;
+                if (cb == 34 || cb == 39 || (cb == 47 && i + 1 < n && (line[i + 1] & 255) == 47)) {
+                    break;
+                }
+                i = i + 1;
+            }
+            outp.Append(line.Substring(runStart, i - runStart));
+        }
+        return outp.ToString();
+    }
+
+    // `code` 中从 `from` 起 `name` 第一个调用点的偏移，
+    // 无则 -1。调用点是后跟 `(` 的整词出现，这正是
+    // 真实引用与命名实参（`Upload = true`）、
+    // 类型名（`class Index`）或同名成员声明的区别。
+    public static int FindCallSite(string code, string name, int from) {
+        int at = from;
+        while (true) {
+            int p = CodeEditor.FindFrom(code, name, at);
+            if (p < 0) { return -1; }
+            at = p + name.Length;
+            bool word = true;
+            if (p > 0 && CodeEditor.IsIdentByte(code[p - 1] & 255)) { word = false; }
+            if (at < code.Length && CodeEditor.IsIdentByte(code[at] & 255)) { word = false; }
+            if (word) {
+                int q = at;
+                while (q < code.Length && (code[q] & 255) == 32) { q = q + 1; }
+                if (q < code.Length && (code[q] & 255) == 40) { return p; }
+            }
+        }
+    }
+
+    // 统计 `name` 在 `declLine` 上的声明（及其他同名声明）之外的
+    // 调用点数量，给定 `outLines` 时把每处
+    // 行号追加到其中。
+    int ScanRefs(string name, int declLine, List<int> outLines) {
+        if (analysisApp != null) {
+            RequestAnalysis();
+            return CopyCachedReferenceLines(name, declLine, outLines);
+        }
+        // 成员的引用应通过其所属类型到达。仅按名称
+        // 时，`WebApp.Create` 的列表曾包含其他所有类型的 `Create`。
+        EnsureRefIndex();
+        string owner = "";
+        if (declLine >= 0 && declLine < refIdx.owners.Count) {
+            owner = refIdx.owners[declLine];
+        }
+        if (owner.Length > 0) {
+            List<string> family = new List<string>();
+            List<string> receivers = new List<string>();
+            AnalysisMemberRecvs(refIdx, owner, family, receivers);
+            return CodeEditor.CountMemberRefsWith(refIdx, family, receivers, name, outLines);
+        }
+        int total = 0;
+        for (int li = 0; li < lines.Count && li < refIdx.stripped.Count;
+             li = li + 1) {
+            if (li != declLine && refIdx.decls[li] != name) {
+                string s = refIdx.stripped[li];
+                int from = 0;
+                while (true) {
+                    int p = CodeEditor.FindCallSite(s, name, from);
+                    if (p < 0) { break; }
+                    from = p + name.Length;
+                    total = total + 1;
+                    if (outLines != null) { outLines.Add(li); }
+                }
+            }
+        }
+        return total;
+    }
+
+    // 本缓冲区声明的成员的跨文件调用点计数，
+    // 以 "Owner.member" 为键。一次性遍历其他项目源码构建
+    // —— 每个声明只拆分一次 —— 并保留到宿主重新提供
+    // 源码或加载其他文件为止。
+    void EnsureExternRefs() { StepExternRefs(0); }
+
+    // 当前缓冲区的扫描索引，按 TextStamp() 记忆。跳转、CodeLens
+    // 和引用列表都靠它，而它与被查的成员无关：一屏几十个声明
+    // 各自重建一份时，单个声明的统计就要 50 ms。
+    void EnsureRefIndex() {
+        if (analysisApp != null) { RequestAnalysis(); return; }
+        int stamp = TextStamp();
+        if (refIdx != null && refStamp == stamp) { return; }
+        refIdx = CeFileIndex.Of(lines);
+        refStamp = stamp;
+    }
+
+    // 开始一轮跨文件统计：收集本缓冲区的声明，计数清零。
+    void BeginExternRefs() {
+        extRefDirty = false;
+        extRefCounts = new List<CeExtRefCount>();
+        extRefDecls = new List<CeExtRefDecl>();
+        // 上一轮可能停在某个文件中间，那份进度对新一轮无效。
+        extRefFileIdx = null;
+        extRefDeclAt = 0;
+        extRefOwnerCur = "";
+        extRefFamily = null;
+        extRefRecvs = null;
+        EnsureRefIndex();
+        for (int li = 0; li < refIdx.decls.Count; li = li + 1) {
+            string dn = refIdx.decls[li];
+            if (dn.Length == 0) { continue; }
+            if (li >= refIdx.owners.Count || refIdx.owners[li].Length == 0) {
+                continue;
+            }
+            string key = refIdx.owners[li] + "." + dn;
+            bool exists = false;
+            for (int k = 0; k < extRefCounts.Count; k = k + 1) {
+                if (extRefCounts[k].key == key) { exists = true; break; }
+            }
+            if (exists) { continue; }
+            extRefCounts.Add(new CeExtRefCount(key, 0));
+            extRefDecls.Add(new CeExtRefDecl(refIdx.owners[li], dn));
+        }
+        extRefAt = 0;
+        if (extRefDecls.Count == 0) { extRefAt = 0 - 1; }
+    }
+
+    // 独立分析器的跨文件统计；<=0 表示整批完成。
+    // KB 只计工作量，不限制单个文件扫描耗时，因此绑定后的 UI 不执行这里。
+    void StepExternRefs(int kbBudget) {
+        if (analysisApp != null) { RequestAnalysis(); return; }
+        if (extRefDirty) { BeginExternRefs(); }
+        if (extRefAt < 0) { return; }
+        int spent = 0;
+        while (extRefAt < projFileSrc.Count) {
+            if (AnalysisCancelled()) { return; }
+            string body = projFileSrc[extRefAt];
+            int kb = body.Length / 1024 + 1;
+            if (extRefFileIdx == null) {
+                if (kbBudget > 0 && spent >= kbBudget) { return; }
+                extRefFileIdx = CeFileIndex.OfText(body);
+                extRefDeclAt = 0;
+                extRefOwnerCur = "";
+                extRefFamily = null;
+                extRefRecvs = null;
+                // 建索引要拆行、抹除、划分 owner、逐行取声明名。
+                spent = spent + kb * 4;
+            }
+            while (extRefDeclAt < extRefDecls.Count) {
+                if (AnalysisCancelled()) { return; }
+                if (kbBudget > 0 && spent >= kbBudget) { return; }
+                // 同一声明类型的接收者在一个文件里只收集一次
+                // （声明按行序归类，同类型的连成一段）。
+                if (extRefFamily == null
+                    || extRefDecls[extRefDeclAt].owner != extRefOwnerCur) {
+                    extRefOwnerCur = extRefDecls[extRefDeclAt].owner;
+                    extRefFamily = new List<string>();
+                    extRefRecvs = new List<string>();
+                    AnalysisMemberRecvs(extRefFileIdx,
+                        extRefOwnerCur, extRefFamily, extRefRecvs);
+                    // 收集接收者要为类型家族的每个成员扫一遍本文件。
+                    spent = spent + kb * extRefFamily.Count;
+                }
+                extRefCounts[extRefDeclAt].count = extRefCounts[extRefDeclAt].count
+                    + CodeEditor.CountMemberRefsWith(extRefFileIdx,
+                        extRefFamily, extRefRecvs,
+                        extRefDecls[extRefDeclAt].name, null);
+                extRefDeclAt = extRefDeclAt + 1;
+                spent = spent + kb;
+            }
+            extRefAt = extRefAt + 1;
+            extRefFileIdx = null;
+        }
+        extRefAt = 0 - 1;
+        extRefFileIdx = null;
+    }
+
+    // 本缓冲区之外 `owner.member` 的调用点数（未知为 0）；跨文件
+    // 统计尚未算完时返回 -1。
+    int ExternRefCount(string owner, string member) {
+        // 同步兼容分析器可分批推进；绑定后的绘制只读取已发布计数。
+        StepExternRefs(512);
+        if (extRefAt >= 0) { return 0 - 1; }
+        string key = owner + "." + member;
+        for (int i = 0; i < extRefCounts.Count; i = i + 1) {
+            if (extRefCounts[i].key == key) { return extRefCounts[i].count; }
+        }
+        return 0;
+    }
+
+    // CodeLens 显示的计数：本缓冲区内的使用数加
+    // 项目其他文件中的。只统计缓冲区时，调用方在其他文件的方法
+    // 会显示 "0 references"，而这正是
+    // 项目对外暴露内容的常态。
+    // 跨文件统计还没算完时返回 -1，与预算耗尽同义：调用方
+    // 不绘制未统计完的数字。
+    int LensRefCount(string name, int declLine) {
+        if (analysisApp != null) { RequestAnalysis(); return CachedLensRefCount(declLine); }
+        EnsureRefIndex();
+        string owner = "";
+        if (declLine >= 0 && declLine < refIdx.owners.Count) {
+            owner = refIdx.owners[declLine];
+        }
+        if (owner.Length == 0) { return ScanRefs(name, declLine, null); }
+        // 先推进跨文件统计：没算完就不必扫本缓冲区，
+        // 这一帧的数字反正画不出来。
+        int ext = ExternRefCount(owner, name);
+        if (ext < 0) { return 0 - 1; }
+        return ScanRefs(name, declLine, null) + ext;
+    }
+
+    // LensRefCount() 按成员名记忆化，每帧至多重算 `lensBudget`
+    // 个成员。预算耗尽时返回记忆的计数，
+    // 连过期值都没有则返回 -1，调用方不绘制
+    // 未经统计的数字。
+    int LensRefCountBudgeted(string name, int declLine) {
+        if (analysisApp != null) { return CachedLensRefCount(declLine); }
+        int at = 0 - 1;
+        for (int k = 0; k < lensMemos.Count; k = k + 1) {
+            if (lensMemos[k].name == name) { at = k; break; }
+        }
+        if (at >= 0 && lensMemos[at].fresh == 1) { return lensMemos[at].count; }
+        if (lensBudget <= 0) {
+            if (at >= 0) { return lensMemos[at].count; }
+            lensPending = true;
+            return 0 - 1;
+        }
+        lensBudget = lensBudget - 1;
+        int v = LensRefCount(name, declLine);
+        // 跨文件统计还在分批推进：本帧没有可写入的计数，
+        // 保留上次的值（或先不画），下一帧接着算。
+        if (v < 0) {
+            lensPending = true;
+            if (at >= 0) { return lensMemos[at].count; }
+            return 0 - 1;
+        }
+        if (at >= 0) {
+            lensMemos[at].count = v;
+            lensMemos[at].fresh = 1;
+            return v;
+        }
+        // 浏览大型项目时记忆表不能无界增长。
+        if (lensMemos.Count >= 512) {
+            lensMemos = new List<CeLensMemo>();
+        }
+        lensMemos.Add(new CeLensMemo(name, v, 1));
+        return v;
+    }
+
+    // 同步兼容路径的 CodeLens 预算；TextStamp 为 O(1)。
+    // 绑定后的 UI 不推进统计，后台 Post 到达时自然重绘。
+    // // 重算等待输入停止：每次击键都会使
+    // 所有计数失效，每帧统计两个也要各遍历
+    // 整个缓冲区。缓冲区静置片刻前，面板显示
+    // 上次的计数，即一次击键前的值。
+    void BeginLensFrame(App app) {
+        if (analysisApp != null) { lensPending = false; return; }
+        lensPending = false;
+        int stamp = TextStamp();
+        if (lensStamp != stamp) {
+            lensStamp = stamp;
+            lensQuietMs = app.nowMs;
+            for (int i = 0; i < lensMemos.Count; i = i + 1) { lensMemos[i].fresh = 0; }
+        }
+        // 滚动中或刚停止滚动（200ms 内）：视口正在移动，
+        // 优先保证 60fps 丝滑滚动体验，暂停重度符号扫描。
+        if (app.nowMs - lastScrollMs < 200) {
+            lensBudget = 0;
+            return;
+        }
+        if (app.nowMs - lensQuietMs < 250) {
+            lensBudget = 0;
+        } else {
+            lensBudget = 2;
+        }
+    }
+
+    // 本帧有 CodeLens 计数未统计时返回 true，调用方
+    // 据此请求再算一次。
+    bool LensPending() { return lensPending; }
+
+    // 把光标移到 `declLine` 之后 `name` 的下一个调用点
+    // （循环回绕）并选中。没有则不做任何事。
+    void JumpToNextRef(string name, int declLine) {
+        int total = lines.Count;
+        int li = declLine + 1;
+        for (int scanned = 0; scanned < total; scanned = scanned + 1) {
+            if (li >= lines.Count) { li = 0; }
+            if (li != declLine && CodeEditor.DeclNameAt(lines[li]) != name) {
+                int p = CodeEditor.FindCallSite(CodeEditor.StripCode(lines[li]), name, 0);
+                if (p >= 0) {
+                    ClearExtraCarets();
+                    selActive = true;
+                    selAnchorLine = li; selAnchorCol = p;
+                    curLine = li; curCol = p + name.Length;
+                    return;
+                }
+            }
+            li = li + 1;
+        }
+    }
+
+    // 收集 `name` 每个调用点的行号（排除其在 `declLine` 上的
+    // 声明），按文件顺序存入 `outLines`。
+    void CollectRefs(string name, int declLine, List<int> outLines) {
+        ScanRefs(name, declLine, outLines);
+    }
+
+    // 把光标移到 `targetLine` 上 `name` 的第一个调用点并
+    // 选中（供引用列表弹窗使用）。
+    void JumpToRefLine(string name, int targetLine) {
+        if (targetLine < 0 || targetLine >= lines.Count) { return; }
+        int p = CodeEditor.FindCallSite(
+            CodeEditor.StripCode(lines[targetLine]), name, 0);
+        if (p < 0) { return; }
+        ClearExtraCarets();
+        selActive = true;
+        selAnchorLine = targetLine; selAnchorCol = p;
+        curLine = targetLine; curCol = p + name.Length;
+        if (curLine < scrollLine || curLine >= scrollLine + 4) {
+            scrollLine = curLine - 4;
+            if (scrollLine < 0) { scrollLine = 0; }
+        }
+    }
+
+    // `s` 中从 `start` 起 `sub` 首次出现的索引，无则 -1。
+    // 先比首字节再逐字节比，不为每个位置切一个子串。
+    public static int FindFrom(string s, string sub, int start) {
+        int m = sub.Length;
+        if (m == 0) { return start; }
+        int limit = s.Length - m;
+        int i = start;
+        if (i < 0) { i = 0; }
+        int first = sub[0];
+        while (i <= limit) {
+            if (s[i] == first) {
+                int k = 1;
+                while (k < m && s[i + k] == sub[k]) { k = k + 1; }
+                if (k == m) { return i; }
+            }
+            i = i + 1;
+        }
+        return 0 - 1;
+    }
+
+    // 去除 `s` 首尾的空格和制表符。整个编辑器的扫描都逐行调用它，
+    // 因此按字节定界，且无需裁剪时直接返回原串（不分配）。
+    public static string TrimStr(string s) {
+        int len = s.Length;
+        int a = 0;
+        while (a < len) {
+            int ch = s[a];
+            if (ch == 32 || ch == 9) { a = a + 1; }
+            else { break; }
+        }
+        int b = len;
+        while (b > a) {
+            int ch = s[b - 1];
+            if (ch == 32 || ch == 9 || ch == 13) { b = b - 1; }
+            else { break; }
+        }
+        if (a == 0 && b == len) { return s; }
+        return s.Substring(a, b - a);
+    }
+
+    // 返回鼠标指针下的标识符，没有则 ""。
+    string WordAtMouse(App app, Rect area, int gutterW, int fontSize) {
+        int textX = area.x + gutterW + app.theme.paddingSmall;
+        if (app.mouseX < textX || app.mouseX >= area.x + area.width) { return ""; }
+        if (app.mouseY < area.y || app.mouseY >= area.y + area.height) { return ""; }
+        int ln = LineAtY(Canvas.FontHeight(fontSize) + app.Scale(4), app.mouseY);
+        if (ln < 0 || ln >= lines.Count) { return ""; }
+        string s = lines[ln];
+        int relX = app.mouseX - textX;
+        int lineW = Canvas.MeasureText(s, fontSize);
+        if (relX > lineW + app.Scale(2)) { return ""; }
+        int col = CodeEditor.ColFromX(s, relX, fontSize);
+        if (col < 0 || col > s.Length) { return ""; }
+        bool onId = false;
+        if (col < s.Length && CodeEditor.IsIdentByte(s[col] & 255)) {
+            onId = true;
+        } else if (col > 0 && CodeEditor.IsIdentByte(s[col - 1] & 255)) {
+            onId = true;
+        }
+        if (!onId) { return ""; }
+        int a = col;
+        while (a > 0 && CodeEditor.IsIdentByte(s[a - 1] & 255)) { a = a - 1; }
+        int b = col;
+        while (b < s.Length && CodeEditor.IsIdentByte(s[b] & 255)) { b = b + 1; }
+        if (b <= a) { return ""; }
+        return s.Substring(a, b - a);
+    }
+
+    // 关键字候选（种类统一 "K"）。
+    public static void KeywordListK(List<string> outk, List<string> kinds) {
+        List<string> tmp = new List<string>();
+        CodeEditor.KeywordList(tmp);
+        for (int i = 0; i < tmp.Count; i = i + 1) {
+            outk.Add(tmp[i]);
+            kinds.Add("K");
+        }
+    }
+
+    // 收集整份行列表的词（种类统一 "W"）。
+    public static void CollectWordsK(List<string> ls, List<string> outw, List<string> kinds) {
+        CodeEditor.CollectWordsRangeK(ls, 0, ls.Count, outw, kinds);
+    }
+
+    // 收集 [from, to) 行范围内的词，缺的种类位补 "W"。
+    public static void CollectWordsRangeK(List<string> ls, int from, int to,
+                                   List<string> outw, List<string> kinds) {
+        CodeEditor.CollectWordsRange(ls, from, to, outw);
+        while (kinds.Count < outw.Count) { kinds.Add("W"); }
+    }
+
+    // 词补全向光标上下各看多少行。整篇扫描会让每次击键的代价随文件
+    // 规模增长（30 万行时是秒级），而窗口外的符号本来就由项目扫描、
+    // 缓冲区类型表和符号索引提供，这里只补“刚写过的局部标识符”。
+    public static int WordScanRadius() { return 1200; }
+
+    // ASCII 大写字母折叠为小写，其余字节原样返回。
+    public static int LowerByte(int b) {
+        if (b >= 65 && b <= 90) { return b + 32; }
+        return b;
+    }
+
+    // 不区分大小写的 StartsWith 检查（按字节；匹配函数会对每个候选
+    // 逐字符调用，为每个字符分配字符串太贵）。
+    public static bool StartsWithI(string s, string pre) {
+        if (pre.Length > s.Length) { return false; }
+        for (int i = 0; i < pre.Length; i = i + 1) {
+            if (CodeEditor.LowerByte(s[i]) != CodeEditor.LowerByte(pre[i])) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    // 用选中的候选项替换正在输入的字词。`viaTab`
+    // 为 true 且候选项为代码片段时展开其模板。
+}
