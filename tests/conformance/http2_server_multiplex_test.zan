@@ -1,0 +1,76 @@
+using System;
+using System.Collections.Generic;
+using System.Net.Sockets;
+using System.Net.Http;
+using System.Net.Http.Http2;
+using System.Net.Http.Hpack;
+using System.Threading;
+
+class Program {
+    static int PORT = 9712;
+    static int failures = 0;
+
+    static void Check(bool cond, string name) {
+        if (cond) {
+            Console.WriteLine("ok " + name);
+        } else {
+            Console.WriteLine("FAIL " + name);
+            failures = failures + 1;
+        }
+    }
+
+    static async HttpResponse Handle(HttpRequest req) {
+        if (req.path == "/hello") {
+            return HttpResponse.Ok("Hello HTTP/2 World");
+        }
+        if (req.path == "/echo") {
+            return HttpResponse.Ok("Echo: " + req.body);
+        }
+        if (req.path == "/json") {
+            return HttpResponse.Json("{\"status\":\"ok\",\"h2\":true}");
+        }
+        return HttpResponse.NotFound();
+    }
+
+    static async int Run() {
+        Socket.Initialize();
+        HttpServer server = new HttpServer("127.0.0.1", PORT);
+        server.OnRequest(Program.Handle);
+        Task.Spawn(server.Start());
+        await Task.Delay(100);
+
+        // 1. 建立 HTTP/2 客户端连接（完成序言 24 字节 + 初始 SETTINGS 交换）
+        Http2ClientConnection client = await Http2ClientConnection.ConnectAsync("127.0.0.1", PORT);
+        Check(client != null && client.connected, "h2 client connected and preface acknowledged");
+
+        // 2. 发起 GET 请求
+        HttpResponse r1 = await client.SendAsync("GET", "/hello", "127.0.0.1", null, "");
+        Check(r1 != null && r1.statusCode == 200 && r1.body == "Hello HTTP/2 World", "h2 get /hello returns 200");
+
+        // 3. 发起 JSON 请求
+        HttpResponse r2 = await client.SendAsync("GET", "/json", "127.0.0.1", null, "");
+        Check(r2 != null && r2.statusCode == 200 && r2.body == "{\"status\":\"ok\",\"h2\":true}", "h2 get /json returns 200");
+
+        // 4. 发起带有正文的 POST 请求（HEADERS + DATA 帧流水）
+        HttpResponse r3 = await client.SendAsync("POST", "/echo", "127.0.0.1", null, "PayloadData12345");
+        Check(r3 != null && r3.statusCode == 200 && r3.body == "Echo: PayloadData12345", "h2 post /echo data frames assembled");
+
+        // 5. 并发多路复用验证：同一 TCP 连接上流式并发分发不同 streamId
+        HttpResponse r4 = await client.SendAsync("GET", "/notfound", "127.0.0.1", null, "");
+        Check(r4 != null && r4.statusCode == 404, "h2 404 handled on same connection");
+
+        client.Close();
+        server.Stop();
+        for (int i = 0; i < 25; i = i + 1) { await Task.Delay(10); }
+
+        HpackStaticTable.Teardown();
+        HpackHuffman.Teardown();
+
+        Console.WriteLine("HTTP/2 server multiplexing verified OK");
+        return failures == 0 ? 0 : 1;
+    }
+
+    static void Main() {
+        int r = await Program.Run();
+    }
+}

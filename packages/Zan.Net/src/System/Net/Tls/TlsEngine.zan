@@ -63,6 +63,9 @@ public class TlsEngine {
     public OcspResponse stapledOcsp;
     public bool clientOfferedStatusRequest;
     public byte[] serverOcspResponse;
+    public List<string> clientAlpnList;
+    public List<string> serverAlpnList;
+    public string negotiatedAlpn;
 
     public int negotiatedVersion;
     public int negotiatedCipherSuite;
@@ -133,6 +136,9 @@ public class TlsEngine {
         this.stapledOcsp = null;
         this.clientOfferedStatusRequest = false;
         this.serverOcspResponse = null;
+        this.clientAlpnList = new List<string>();
+        this.serverAlpnList = new List<string>();
+        this.negotiatedAlpn = "";
 
         this.negotiatedVersion = 0;
         this.negotiatedCipherSuite = 0;
@@ -225,6 +231,31 @@ public class TlsEngine {
         priv[31] = (byte)((priv[31] & 127) | 64);
         publicKey = Curve25519.GetPublicKey(priv);
         return publicKey == null ? null : priv;
+    }
+
+    public void SetAlpnProtocols(List<string> protos) {
+        if (this.isServer) {
+            this.serverAlpnList = protos;
+        } else {
+            this.clientAlpnList = protos;
+        }
+    }
+
+    public string GetNegotiatedAlpn() {
+        return this.negotiatedAlpn;
+    }
+
+    public void SelectAlpn() {
+        if (this.serverAlpnList == null || this.clientAlpnList == null) { return; }
+        for (int i = 0; i < this.serverAlpnList.Count; i = i + 1) {
+            string sp = this.serverAlpnList[i];
+            for (int j = 0; j < this.clientAlpnList.Count; j = j + 1) {
+                if (sp == this.clientAlpnList[j]) {
+                    this.negotiatedAlpn = sp;
+                    return;
+                }
+            }
+        }
     }
 
     // 启动 TLS 握手。客户端产出 ClientHello 记录，服务端置待接收状态。
@@ -513,6 +544,21 @@ public class TlsEngine {
                         this.Fail("EncryptedExtensions supported_groups 非法"); return -1;
                     }
                     for (int gi = 0; gi < n; gi = gi + 2) { extensions.ReadU16(); }
+                } else if (kind == 16) {
+                    // application_layer_protocol_negotiation (RFC 7301 §3.1)
+                    if (size < 3) {
+                        this.Fail("EncryptedExtensions ALPN 长度非法"); return -1;
+                    }
+                    int listLen = extensions.ReadU16();
+                    if (listLen + 2 != size) {
+                        this.Fail("EncryptedExtensions ALPN 列表长度非法"); return -1;
+                    }
+                    int pLen = extensions.ReadU8();
+                    if (pLen + 1 != listLen || !extensions.Has(pLen)) {
+                        this.Fail("EncryptedExtensions ALPN 协议名截断"); return -1;
+                    }
+                    byte[] pBytes = extensions.ReadBytes(pLen);
+                    this.negotiatedAlpn = pBytes.ToStr(0, pLen);
                 } else {
                     this.Fail("EncryptedExtensions 含未支持扩展: " + kind); return -1;
                 }
@@ -608,6 +654,19 @@ public class TlsEngine {
                     serverShare = r.ReadBytes(32);
                     if (serverShare == null) {
                         this.Fail("ServerHello X25519 key_share 截断"); return -1;
+                    }
+                } else if (extType == 16) {  // alpn (0x0010)
+                    if (extLen >= 3) {
+                        int listLen = r.ReadU16();
+                        int pLen = r.ReadU8();
+                        if (pLen > 0 && pLen <= r.Remaining()) {
+                            byte[] pBytes = r.ReadBytes(pLen);
+                            this.negotiatedAlpn = pBytes.ToStr(0, pLen);
+                        } else {
+                            r.Skip(extLen - 3);
+                        }
+                    } else {
+                        r.Skip(extLen);
                     }
                 } else {
                     r.Skip(extLen);
@@ -1265,6 +1324,19 @@ public class TlsEngine {
                             clientShare = r.ReadBytes(klen);
                         } else { r.Skip(klen); }
                     }
+                } else if (extType == 16) {  // alpn (0x0010)
+                    if (extLen >= 2) {
+                        int listLen = r.ReadU16();
+                        int aEnd = r.Offset() + listLen;
+                        if (aEnd <= extEnd) {
+                            while (r.Offset() < aEnd) {
+                                int pLen = r.ReadU8();
+                                if (pLen <= 0 || r.Offset() + pLen > aEnd) { break; }
+                                byte[] pBytes = r.ReadBytes(pLen);
+                                this.clientAlpnList.Add(pBytes.ToStr(0, pLen));
+                            }
+                        }
+                    }
                 }
                 if (r.Offset() > extEnd) { this.Fail("ClientHello extension 越界"); return -1; }
                 r.Skip(extEnd - r.Offset());
@@ -1375,10 +1447,28 @@ public class TlsEngine {
         this.readCipher = new TlsCipherState(TlsRecord.VersionTls13, clientHsKey, clientHsIv);
 
         // 构造并发送 EncryptedExtensions (0x08)
-        byte[] eeMsg = new byte[6];
+        this.SelectAlpn();
+        TlsByteWriter eeExtWriter = new TlsByteWriter();
+        if (this.negotiatedAlpn != null && this.negotiatedAlpn.Length > 0) {
+            int pLen = this.negotiatedAlpn.Length;
+            eeExtWriter.WriteU16(16); // alpn
+            eeExtWriter.WriteU16(pLen + 3);
+            eeExtWriter.WriteU16(pLen + 1);
+            eeExtWriter.WriteU8(pLen);
+            eeExtWriter.WriteBytes(this.negotiatedAlpn.ToBytes());
+        }
+        byte[] eeExtBytes = eeExtWriter.ToArray();
+        byte[] eeMsg = new byte[4 + 2 + eeExtBytes.Length];
         eeMsg[0] = (byte)TlsRecord.HandshakeEncryptedExtensions;
-        eeMsg[1] = 0; eeMsg[2] = 0; eeMsg[3] = 2;
-        eeMsg[4] = 0; eeMsg[5] = 0;  // extensions vector length
+        int eeBodyLen = 2 + eeExtBytes.Length;
+        eeMsg[1] = (byte)((eeBodyLen >> 16) & 255);
+        eeMsg[2] = (byte)((eeBodyLen >> 8) & 255);
+        eeMsg[3] = (byte)(eeBodyLen & 255);
+        eeMsg[4] = (byte)((eeExtBytes.Length >> 8) & 255);
+        eeMsg[5] = (byte)(eeExtBytes.Length & 255);
+        if (eeExtBytes.Length > 0) {
+            NativeMemory.Copy((nint)eeMsg + 6, (nint)eeExtBytes, eeExtBytes.Length);
+        }
         this.transcript.Update(eeMsg);
         byte[] recEE = this.writeCipher.Encrypt(TlsRecord.ContentTypeHandshake, eeMsg, 0, eeMsg.Length);
         this.outNet.WriteBytes(recEE);
@@ -1556,15 +1646,32 @@ public class TlsEngine {
         if (this.serverRandom == null) { this.Fail("TLS 1.2 随机数生成失败"); return -1; }
 
         // 1. ServerHello
+        this.SelectAlpn();
+        TlsByteWriter shExt = new TlsByteWriter();
+        if (this.negotiatedAlpn != null && this.negotiatedAlpn.Length > 0) {
+            int pLen = this.negotiatedAlpn.Length;
+            shExt.WriteU16(16); // alpn
+            shExt.WriteU16(pLen + 3);
+            shExt.WriteU16(pLen + 1);
+            shExt.WriteU8(pLen);
+            shExt.WriteBytes(this.negotiatedAlpn.ToBytes());
+        }
+        byte[] shExtBytes = shExt.ToArray();
+        int extTotal = shExtBytes.Length > 0 ? 2 + shExtBytes.Length : 0;
+
         TlsByteWriter sh = new TlsByteWriter();
         sh.WriteU8(TlsRecord.HandshakeServerHello);
-        sh.WriteU24(38 + this.sessionId.Length);
+        sh.WriteU24(38 + this.sessionId.Length + extTotal);
         sh.WriteU16(TlsRecord.VersionTls12);
         sh.WriteBytes(this.serverRandom);
         sh.WriteU8(this.sessionId.Length);
         sh.WriteBytes(this.sessionId);
         sh.WriteU16(this.negotiatedCipherSuite);
         sh.WriteU8(0);
+        if (extTotal > 0) {
+            sh.WriteU16(shExtBytes.Length);
+            sh.WriteBytes(shExtBytes);
+        }
         byte[] shBytes = sh.ToArray();
         this.transcript.Update(shBytes);
         byte[] recSH = TlsRecord.FormatPlaintext(TlsRecord.ContentTypeHandshake, TlsRecord.VersionTls12, shBytes, 0, shBytes.Length);
@@ -2003,6 +2110,22 @@ public class TlsEngine {
         extWriter.WriteU8(1);   // ocsp (1)
         extWriter.WriteU16(0);  // responder_id_list length = 0
         extWriter.WriteU16(0);  // request_extensions length = 0
+
+        // 7.7 alpn (0x0010) - RFC 7301
+        if (this.clientAlpnList != null && this.clientAlpnList.Count > 0) {
+            int totalProtoBytes = 0;
+            for (int i = 0; i < this.clientAlpnList.Count; i = i + 1) {
+                totalProtoBytes = totalProtoBytes + 1 + this.clientAlpnList[i].Length;
+            }
+            extWriter.WriteU16(16); // 0x0010
+            extWriter.WriteU16(totalProtoBytes + 2);
+            extWriter.WriteU16(totalProtoBytes);
+            for (int j = 0; j < this.clientAlpnList.Count; j = j + 1) {
+                string proto = this.clientAlpnList[j];
+                extWriter.WriteU8(proto.Length);
+                extWriter.WriteBytes(proto.ToBytes());
+            }
+        }
 
         w.WriteU16(extWriter.Length());
         w.WriteBytes(extWriter.ToArray());

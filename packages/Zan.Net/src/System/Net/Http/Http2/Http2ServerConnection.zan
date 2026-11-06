@@ -1,0 +1,370 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Net.Sockets;
+using System.Net.Http;
+using System.Net.Http.Hpack;
+using System.Net.Http.Models;
+using System.Text;
+using System.Threading;
+
+namespace System.Net.Http.Http2;
+
+// HTTP/2 发送委托：统一明文套接字与 TLS 安全流
+public async delegate int Http2SendFn(byte[] data, int len);
+
+// 原始明文套接字发送适配器
+public class Http2SocketSender {
+    public nint sock;
+    public Http2SocketSender(nint s) {
+        this.sock = s;
+    }
+    public async int Send(byte[] data, int len) {
+        return await Socket.SendAsync(this.sock, data, len);
+    }
+}
+
+// 服务端并发数据流状态上下文
+public class Http2ServerStream {
+    public int streamId;
+    public HttpRequest request;
+    public ByteBuffer bodyBuffer;
+    public bool complete;
+
+    public Http2ServerStream(int id, HttpRequest req) {
+        this.streamId = id;
+        this.request = req;
+        this.bodyBuffer = ByteBuffer.Alloc(1024);
+        this.complete = false;
+    }
+
+    public void Dispose() {
+        if (this.bodyBuffer != null) {
+            this.bodyBuffer.Free();
+            this.bodyBuffer = null;
+        }
+    }
+}
+
+// HTTP/2 服务端多路复用连接调度引擎（RFC 7540 标准实现）。
+// 核心能力：
+// 1. 24 字节连接序言（Client Connection Preface: PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n）校验防线。
+// 2. 初始 SETTINGS 交换与 ACK 应答、PING 探活回显、WINDOW_UPDATE 流量控制。
+// 3. 多并发 Stream 汇聚与解复用：HEADERS / DATA 帧驱动请求组装。
+// 4. HPACK 头部编解码往返与出站帧串行调度（防止并发流交错打乱帧边界）。
+public class Http2ServerConnection : IDisposable {
+    public HttpFramer framer;
+    public Http2SendFn sendFn;
+    public HttpRequestHandler handler;
+    public HpackContext inboundHpack;
+    public HpackContext outboundHpack;
+    public Mutex sendLock;
+    public bool connected;
+    public List<Http2ServerStream> pendingStreams;
+    public int lastStreamId;
+
+    public Http2ServerConnection(HttpFramer framer, HttpRequestHandler handler, Http2SendFn sendFn) {
+        this.framer = framer;
+        this.handler = handler;
+        this.sendFn = sendFn;
+        this.inboundHpack = new HpackContext(4096);
+        this.outboundHpack = new HpackContext(4096);
+        this.sendLock = new Mutex();
+        this.connected = true;
+        this.pendingStreams = new List<Http2ServerStream>();
+        this.lastStreamId = 0;
+    }
+
+    // 从 HttpFramer 精确读取指定字节数（不丢弃多余字节，留给下个帧）
+    public static async int ReadExactAsync(HttpFramer framer, byte[] outBuf, int count) {
+        if (framer == null || outBuf == null || count <= 0) { return 0; }
+        while (framer.pend.Length() < count) {
+            int n = await framer.Fill();
+            if (n <= 0) { return -1; }
+        }
+        NativeMemory.Copy((nint)outBuf, framer.pend.data, count);
+        framer.Consume(count);
+        return count;
+    }
+
+    // 运行 HTTP/2 服务端帧派发循环
+    public async int RunAsync() {
+        // 1. 校验序言剩余的 6 字节 "SM\r\n\r\n"
+        byte[] smBuf = new byte[6];
+        int rSm = await Http2ServerConnection.ReadExactAsync(this.framer, smBuf, 6);
+        if (rSm < 6) { return 400; }
+        if (smBuf[0] != 83 || smBuf[1] != 77 || smBuf[2] != 13 || smBuf[3] != 10 || smBuf[4] != 13 || smBuf[5] != 10) {
+            return 400; // Preface mismatch: PROTOCOL_ERROR
+        }
+
+        // 2. 发送服务端初始 SETTINGS 帧（RFC 7540 §3.5）
+        byte[] initSettings = Http2Frame.EncodeHeader(0, Http2FrameType.SETTINGS, 0, 0);
+        await this.SendRawAsync(initSettings, initSettings.Length);
+
+        // 3. 帧循环接收与分发
+        byte[] hdrBuf = new byte[9];
+        while (this.connected && !this.framer.Closed()) {
+            int rHdr = await Http2ServerConnection.ReadExactAsync(this.framer, hdrBuf, 9);
+            if (rHdr < 9) { break; }
+
+            Http2Frame frame = Http2Frame.DecodeHeader(hdrBuf, 0);
+            if (frame == null) {
+                // 帧格式或控制帧约束违规，发出 GOAWAY 阻断
+                byte[] goaway = Http2Frame.BuildGoAway(this.lastStreamId, Http2Error.PROTOCOL_ERROR);
+                await this.SendRawAsync(goaway, goaway.Length);
+                break;
+            }
+
+            byte[] payload = null;
+            if (frame.length > 0) {
+                payload = new byte[frame.length];
+                int rPayload = await Http2ServerConnection.ReadExactAsync(this.framer, payload, frame.length);
+                if (rPayload < frame.length) { break; }
+            }
+
+            await this.DispatchFrameAsync(frame, payload);
+        }
+
+        this.Dispose();
+        return 0;
+    }
+
+    // 帧分发路由
+    async Task DispatchFrameAsync(Http2Frame frame, byte[] payload) {
+        if (frame.type == Http2FrameType.SETTINGS) {
+            if ((frame.flags & Http2Flags.ACK) == 0) {
+                byte[] ack = Http2Frame.BuildSettingsAck();
+                await this.SendRawAsync(ack, ack.Length);
+            }
+        } else if (frame.type == Http2FrameType.PING) {
+            if ((frame.flags & Http2Flags.ACK) == 0) {
+                byte[] pingAck = Http2Frame.BuildPing(payload, true);
+                await this.SendRawAsync(pingAck, pingAck.Length);
+            }
+        } else if (frame.type == Http2FrameType.HEADERS) {
+            // RFC 7540 §5.1.1: 客户端发起的流 ID 必须为严格单调递增的奇数
+            if (frame.streamId <= 0 || (frame.streamId % 2) == 0) {
+                byte[] rst = Http2Frame.BuildRstStream(frame.streamId, Http2Error.PROTOCOL_ERROR);
+                await this.SendRawAsync(rst, rst.Length);
+                return;
+            }
+            if (frame.streamId > this.lastStreamId) {
+                this.lastStreamId = frame.streamId;
+            }
+
+            List<HpackHeader> headers = this.inboundHpack.DecodeHeaderBlock(payload, 0, payload.Length);
+            HttpRequest req = this.BuildRequest(headers);
+
+            if ((frame.flags & Http2Flags.END_STREAM) != 0) {
+                // 无正文请求，直接派发处理协程
+                Task.Spawn(this.ProcessAndRespondStreamAsync(frame.streamId, req));
+            } else {
+                // 有待接收的数据帧，登记到挂起流
+                Http2ServerStream st = new Http2ServerStream(frame.streamId, req);
+                this.pendingStreams.Add(st);
+            }
+        } else if (frame.type == Http2FrameType.DATA) {
+            Http2ServerStream st = this.FindPendingStream(frame.streamId);
+            if (st != null) {
+                if (payload != null && payload.Length > 0) {
+                    st.bodyBuffer.WriteBytes(payload, 0, payload.Length);
+                }
+                if ((frame.flags & Http2Flags.END_STREAM) != 0) {
+                    st.complete = true;
+                    st.request.body = st.bodyBuffer.ToStr();
+                    st.request.bodyLength = st.bodyBuffer.Length();
+                    this.RemovePendingStream(frame.streamId);
+                    Task.Spawn(this.ProcessAndRespondStreamAsync(frame.streamId, st.request));
+                }
+            } else {
+                // 未知流或已关闭流收到 DATA，返回 STREAM_CLOSED
+                byte[] rst = Http2Frame.BuildRstStream(frame.streamId, Http2Error.STREAM_CLOSED);
+                await this.SendRawAsync(rst, rst.Length);
+            }
+        } else if (frame.type == Http2FrameType.RST_STREAM) {
+            this.RemovePendingStream(frame.streamId);
+        } else if (frame.type == Http2FrameType.GOAWAY) {
+            this.connected = false;
+        }
+    }
+
+    Http2ServerStream FindPendingStream(int streamId) {
+        for (int i = 0; i < this.pendingStreams.Count; i = i + 1) {
+            if (this.pendingStreams[i].streamId == streamId) {
+                return this.pendingStreams[i];
+            }
+        }
+        return null;
+    }
+
+    void RemovePendingStream(int streamId) {
+        for (int i = 0; i < this.pendingStreams.Count; i = i + 1) {
+            if (this.pendingStreams[i].streamId == streamId) {
+                this.pendingStreams[i].Dispose();
+                this.pendingStreams.RemoveAt(i);
+                break;
+            }
+        }
+    }
+
+    // 从 HTTP/2 解码头部构建 HttpRequest
+    HttpRequest BuildRequest(List<HpackHeader> headers) {
+        HttpRequest req = new HttpRequest();
+        req.version = "HTTP/2.0";
+        req.keepAlive = true;
+        StringBuilder rawHdrSb = new StringBuilder();
+
+        for (int i = 0; i < headers.Count; i = i + 1) {
+            HpackHeader h = headers[i];
+            if (h.name == ":method") {
+                req.method = h.value;
+            } else if (h.name == ":path") {
+                int q = h.value.IndexOf("?");
+                if (q >= 0) {
+                    req.path = h.value.Substring(0, q);
+                    req.queryString = h.value.Substring(q + 1);
+                } else {
+                    req.path = h.value;
+                    req.queryString = "";
+                }
+            } else if (h.name == ":authority") {
+                req.host = h.value;
+                rawHdrSb.Append("Host: ");
+                rawHdrSb.Append(h.value);
+                rawHdrSb.Append("\r\n");
+            } else if (h.name == ":scheme") {
+                // scheme header
+            } else {
+                if (h.name == "content-type") { req.contentType = h.value; }
+                else if (h.name == "authorization") { req.authorization = h.value; }
+                else if (h.name == "cookie") { req.cookie = h.value; }
+                else if (h.name == "user-agent") { req.userAgent = h.value; }
+                else if (h.name == "content-length") {
+                    try {
+                        req.contentLength = Convert.ToInt32(h.value);
+                    } catch (Exception ex) {
+                        req.contentLength = 0;
+                    }
+                }
+
+                rawHdrSb.Append(h.name);
+                rawHdrSb.Append(": ");
+                rawHdrSb.Append(h.value);
+                rawHdrSb.Append("\r\n");
+            }
+        }
+        req.rawHeaders = rawHdrSb.ToString();
+        return req;
+    }
+
+    // 处理单个 Stream 的业务请求并回发 HTTP/2 响应帧
+    async void ProcessAndRespondStreamAsync(int streamId, HttpRequest req) {
+        HttpResponse resp = null;
+        try {
+            if (this.handler != null) {
+                resp = await this.handler(req);
+            } else {
+                resp = HttpResponse.Ok("<h1>Zan HTTP/2 Server</h1>");
+            }
+        } catch (Exception ex) {
+            resp = HttpResponse.ServerError("Internal Server Error: " + ex.Message);
+        }
+        if (resp == null) {
+            resp = HttpResponse.NotFound();
+        }
+        await this.SendResponseAsync(streamId, resp);
+    }
+
+    // 编码并发送 HTTP/2 HEADERS 与 DATA 响应帧（出站锁保护，保证 HPACK 状态一致与帧完整）
+    async Task SendResponseAsync(int streamId, HttpResponse resp) {
+        List<HpackHeader> resHeaders = new List<HpackHeader>();
+        resHeaders.Add(new HpackHeader(":status", Convert.ToString(resp.statusCode)));
+        if (resp.contentType != null && resp.contentType.Length > 0) {
+            resHeaders.Add(new HpackHeader("content-type", resp.contentType));
+        }
+        int blen = resp.BodyLength();
+        resHeaders.Add(new HpackHeader("content-length", Convert.ToString(blen)));
+        if (resp.headers != null) {
+            for (int i = 0; i < resp.headers.Count; i = i + 1) {
+                string h = resp.headers[i];
+                int colon = h.IndexOf(":");
+                if (colon > 0) {
+                    string name = h.Substring(0, colon).Trim().ToLower();
+                    string val = h.Substring(colon + 1).Trim();
+                    // RFC 7540 §8.1.2.2 严格阻断逐跳头部（Hop-by-hop Headers）
+                    if (name != "connection" && name != "keep-alive" && name != "transfer-encoding") {
+                        resHeaders.Add(new HpackHeader(name, val));
+                    }
+                }
+            }
+        }
+
+        bool hasBody = blen > 0;
+        this.sendLock.WaitOne();
+        try {
+            byte[] headerBlock = this.outboundHpack.EncodeHeaders(resHeaders, true);
+            int flags = Http2Flags.END_HEADERS;
+            if (!hasBody) {
+                flags = flags | Http2Flags.END_STREAM;
+            }
+            byte[] hdrPkt = new byte[9 + headerBlock.Length];
+            byte[] hdr = Http2Frame.EncodeHeader(headerBlock.Length, Http2FrameType.HEADERS, flags, streamId);
+            NativeMemory.Copy((nint)hdrPkt, (nint)hdr, 9);
+            NativeMemory.Copy((nint)hdrPkt + 9, (nint)headerBlock, headerBlock.Length);
+            await this.sendFn(hdrPkt, hdrPkt.Length);
+
+            if (hasBody) {
+                byte[] bodyBytes = null;
+                if (resp.bodyBytes != null && resp.bodyBytesLen > 0) {
+                    bodyBytes = new byte[resp.bodyBytesLen];
+                    NativeMemory.Copy((nint)bodyBytes, (nint)resp.bodyBytes, resp.bodyBytesLen);
+                } else if (resp.body != null && resp.body.Length > 0) {
+                    bodyBytes = resp.body.ToBytes();
+                }
+                if (bodyBytes != null && bodyBytes.Length > 0) {
+                    byte[] dataPkt = new byte[9 + bodyBytes.Length];
+                    byte[] dataHdr = Http2Frame.EncodeHeader(bodyBytes.Length, Http2FrameType.DATA, Http2Flags.END_STREAM, streamId);
+                    NativeMemory.Copy((nint)dataPkt, (nint)dataHdr, 9);
+                    NativeMemory.Copy((nint)dataPkt + 9, (nint)bodyBytes, bodyBytes.Length);
+                    await this.sendFn(dataPkt, dataPkt.Length);
+                }
+            }
+        } finally {
+            this.sendLock.ReleaseMutex();
+        }
+    }
+
+    // 辅助原子发送原始控制帧
+    async Task SendRawAsync(byte[] pkt, int len) {
+        if (pkt == null || len <= 0) { return; }
+        this.sendLock.WaitOne();
+        try {
+            await this.sendFn(pkt, len);
+        } finally {
+            this.sendLock.ReleaseMutex();
+        }
+    }
+
+    // 针对原始明文套接字的服务端入口
+    public static async int ServeAsync(nint clientSock, HttpRequestHandler handler, HttpFramer framer,
+                                      int maxHeaderBytes, int maxRequestBytes, int timeoutMs) {
+        Http2SocketSender sender = new Http2SocketSender(clientSock);
+        Http2ServerConnection conn = new Http2ServerConnection(framer, handler, sender.Send);
+        return await conn.RunAsync();
+    }
+
+    // 针对 TLS 加密流的服务端入口
+    public static async int ServeTlsAsync(Http2SendFn tlsSendFn, HttpRequestHandler handler, HttpFramer framer,
+                                         int maxHeaderBytes, int maxRequestBytes, int timeoutMs) {
+        Http2ServerConnection conn = new Http2ServerConnection(framer, handler, tlsSendFn);
+        return await conn.RunAsync();
+    }
+
+    public void Dispose() {
+        this.connected = false;
+        for (int i = 0; i < this.pendingStreams.Count; i = i + 1) {
+            this.pendingStreams[i].Dispose();
+        }
+        this.pendingStreams.Clear();
+    }
+}

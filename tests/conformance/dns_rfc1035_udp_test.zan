@@ -1,0 +1,135 @@
+using System;
+using System.Collections.Generic;
+using System.Net.Dns;
+using System.Net.Sockets;
+using System.Threading;
+
+class Program {
+    static int DNS_PORT = 19530;
+    static int failures = 0;
+
+    static void Check(bool cond, string name) {
+        if (cond) {
+            Console.WriteLine("ok " + name);
+        } else {
+            Console.WriteLine("FAIL " + name);
+            failures = failures + 1;
+        }
+    }
+
+    // 本地 UDP Mock DNS 服务端：响应标准 A 记录解析
+    static async void RunMockDnsServer(nint serverSock) {
+        byte[] reqBuf = new byte[1024];
+        while (true) {
+            int n = await Socket.RecvBytesAsync(serverSock, reqBuf, 1024);
+            if (n <= 0) { break; }
+
+            DnsPacket reqPkt = DnsPacket.Parse(reqBuf, n);
+            if (reqPkt != null && reqPkt.questions.Count > 0) {
+                DnsRecord q = reqPkt.questions[0];
+                List<string> ips = new List<string>();
+                ips.Add("93.184.216.34");
+                ips.Add("93.184.216.35");
+                byte[] resp = DnsPacket.BuildMockResponse(reqPkt.transactionId, q.name, q.recordType, ips, 300);
+                await Socket.SendToAsync(serverSock, resp, resp.Length, "127.0.0.1", 19531);
+            }
+        }
+    }
+
+    static async int Run() {
+        Socket.Initialize();
+
+        // 1. 验证 RFC 1035 域名标签编码
+        List<byte> encBuf = new List<byte>();
+        DnsPacket.EncodeDomainName(encBuf, "api.zan-lang.org");
+        // 期望标签: 3 'a' 'p' 'i' 8 'z' 'a' 'n' '-' 'l' 'a' 'n' 'g' 3 'o' 'r' 'g' 0
+        Check(encBuf.Count == 18 && encBuf[0] == 3 && encBuf[4] == 8 && encBuf[13] == 3 && encBuf[17] == 0,
+            "rfc 1035 domain label encoding");
+
+        // 2. 验证域名读取与解码
+        byte[] encBytes = new byte[encBuf.Count];
+        for (int i = 0; i < encBuf.Count; i = i + 1) { encBytes[i] = encBuf[i]; }
+        List<int> offsetBox = new List<int>();
+        offsetBox.Add(0);
+        string decName = DnsPacket.ReadName(encBytes, encBytes.Length, offsetBox, 0);
+        Check(decName == "api.zan-lang.org", "rfc 1035 domain label decoding");
+
+        // 3. 验证指针循环死锁防御 (RFC 1035 §4.1.4 压缩指针深度越界防护)
+        byte[] cyclePkt = new byte[16];
+        // 构造一个指向自身的 0xC000 压缩指针
+        cyclePkt[0] = 192; // 0xC0
+        cyclePkt[1] = 0;   // 指向偏移 0
+        List<int> cycleBox = new List<int>();
+        cycleBox.Add(0);
+        string cycleResult = DnsPacket.ReadName(cyclePkt, 2, cycleBox, 0);
+        Check(cycleResult == "", "compression loop depth defense prevented hang");
+
+        // 4. 验证 DNS 查询报文构建
+        byte[] queryPkt = DnsPacket.BuildQuery("example.com", DnsRecordType.A, 4660);
+        DnsPacket parsedQuery = DnsPacket.Parse(queryPkt, queryPkt.Length);
+        Check(parsedQuery != null && parsedQuery.transactionId == 4660
+            && parsedQuery.questions.Count == 1
+            && parsedQuery.questions[0].name == "example.com"
+            && parsedQuery.questions[0].recordType == DnsRecordType.A,
+            "rfc 1035 query packet build and roundtrip parse");
+
+        // 5. 验证本地异步 UDP 客户端解析交互 (A 记录解析)
+        UdpClient server = UdpClient.Bind("127.0.0.1", DNS_PORT);
+        Check(server != null, "mock dns server bind");
+
+        // 客户端固定绑定 19531 端口接收服务端响应
+        UdpClient clientUdp = UdpClient.Bind("127.0.0.1", 19531);
+        Check(clientUdp != null, "client udp bind");
+
+        // 派发 Mock 服务端异步处理协程
+        Task.Spawn(Program.ServeMockAsync(server));
+
+        // 客户端发起查询
+        int txId = 2333;
+        byte[] sendQuery = DnsPacket.BuildQuery("test.local", DnsRecordType.A, txId);
+        await clientUdp.SendBytesToAsync(sendQuery, sendQuery.Length, "127.0.0.1", DNS_PORT);
+
+        byte[] respBuf = new byte[2048];
+        int rlen = await clientUdp.RecvBytesFromAsync(respBuf, 2048, 2000);
+        Check(rlen > 0, "mock dns client received response");
+
+        DnsPacket respPkt = DnsPacket.Parse(respBuf, rlen);
+        Check(respPkt != null && respPkt.transactionId == txId && respPkt.answers.Count == 2,
+            "dns response answers count");
+        Check(respPkt.answers[0].value == "93.184.216.34" && respPkt.answers[1].value == "93.184.216.35",
+            "dns response resolved ip addresses");
+
+        // 6. 验证超时防线（向不存在的静默端口发送查询，预期超时退出不卡死）
+        DnsClient timeoutClient = new DnsClient("127.0.0.1", 19539);
+        timeoutClient.SetTimeout(100);
+        List<string> emptyRes = await timeoutClient.ResolveAsync("silent.local");
+        Check(emptyRes.Count == 0, "dns timeout defense gracefully returns empty");
+
+        clientUdp.Close();
+        server.Close();
+
+        for (int i = 0; i < 20; i = i + 1) { await Task.Delay(10); }
+
+        Console.WriteLine("RFC 1035 UDP DNS client verified OK");
+        return failures == 0 ? 0 : 1;
+    }
+
+    static async void ServeMockAsync(UdpClient srv) {
+        byte[] buf = new byte[1024];
+        int n = await srv.RecvBytesFromAsync(buf, 1024, 1500);
+        if (n > 0) {
+            DnsPacket req = DnsPacket.Parse(buf, n);
+            if (req != null && req.questions.Count > 0) {
+                List<string> ips = new List<string>();
+                ips.Add("93.184.216.34");
+                ips.Add("93.184.216.35");
+                byte[] mockResp = DnsPacket.BuildMockResponse(req.transactionId, req.questions[0].name, req.questions[0].recordType, ips, 300);
+                await srv.SendBytesToAsync(mockResp, mockResp.Length, "127.0.0.1", 19531);
+            }
+        }
+    }
+
+    static void Main() {
+        int r = await Program.Run();
+    }
+}

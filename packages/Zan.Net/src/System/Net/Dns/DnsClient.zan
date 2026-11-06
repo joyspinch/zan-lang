@@ -1,0 +1,104 @@
+using System;
+using System.Collections.Generic;
+using System.Net.Sockets;
+
+namespace System.Net.Dns;
+
+// 纯 Zan 原生全异步 UDP DNS 客户端（RFC 1035 标准实现）。
+// 核心能力：
+// 1. 无 OS 同步 getaddrinfo / C 运行时 FFI 依赖，真正纯非阻塞事件循环就绪等待。
+// 2. 毫秒级超时防线，查询挂起在 reactor 定时器，杜绝因上游 DNS 宕机瘫痪事件循环。
+// 3. 完整的报文事务 ID 校验与响应匹配防线。
+// 4. 支持 A、AAAA、CNAME 等多记录类型查询。
+public class DnsClient : IDisposable {
+    public string dnsServer;
+    public int dnsPort;
+    public int timeoutMs;
+    private int nextId;
+
+    public DnsClient() {
+        this.dnsServer = "8.8.8.8";
+        this.dnsPort = 53;
+        this.timeoutMs = 3000;
+        this.nextId = 1000;
+    }
+
+    public DnsClient(string server, int port) {
+        this.dnsServer = server;
+        this.dnsPort = port;
+        this.timeoutMs = 3000;
+        this.nextId = 1000;
+    }
+
+    public DnsClient SetTimeout(int ms) {
+        if (ms < 100) { ms = 100; }
+        this.timeoutMs = ms;
+        return this;
+    }
+
+    private int NextTxId() {
+        this.nextId = (this.nextId + 1) & 65535;
+        if (this.nextId == 0) { this.nextId = 1; }
+        return this.nextId;
+    }
+
+    // 异步解析 IPv4 地址列表 (Type A)
+    public async List<string> ResolveAsync(string domain) {
+        List<DnsRecord> records = await this.QueryAsync(domain, DnsRecordType.A);
+        List<string> ips = new List<string>();
+        for (int i = 0; i < records.Count; i = i + 1) {
+            if (records[i].recordType == DnsRecordType.A && records[i].value.Length > 0) {
+                ips.Add(records[i].value);
+            }
+        }
+        return ips;
+    }
+
+    // 异步解析 IPv6 地址列表 (Type AAAA)
+    public async List<string> ResolveAaaaAsync(string domain) {
+        List<DnsRecord> records = await this.QueryAsync(domain, DnsRecordType.AAAA);
+        List<string> ips = new List<string>();
+        for (int i = 0; i < records.Count; i = i + 1) {
+            if (records[i].recordType == DnsRecordType.AAAA && records[i].value.Length > 0) {
+                ips.Add(records[i].value);
+            }
+        }
+        return ips;
+    }
+
+    // 异步发送 RFC 1035 UDP DNS 查询报文，并等待对端回显应答
+    public async List<DnsRecord> QueryAsync(string domain, int queryType) {
+        if (domain == null || domain.Length == 0) {
+            return new List<DnsRecord>();
+        }
+
+        int txId = this.NextTxId();
+        byte[] queryPkt = DnsPacket.BuildQuery(domain, queryType, txId);
+
+        UdpClient udp = new UdpClient();
+        try {
+            int sent = await udp.SendBytesToAsync(queryPkt, queryPkt.Length, this.dnsServer, this.dnsPort);
+            if (sent <= 0) {
+                return new List<DnsRecord>();
+            }
+
+            byte[] respBuf = new byte[2048];
+            int rlen = await udp.RecvBytesFromAsync(respBuf, respBuf.Length, this.timeoutMs);
+            if (rlen <= 0) {
+                return new List<DnsRecord>(); // 超时或对端异常
+            }
+
+            DnsPacket pkt = DnsPacket.Parse(respBuf, rlen);
+            if (pkt == null || pkt.transactionId != txId || !pkt.isResponse) {
+                return new List<DnsRecord>();
+            }
+
+            return pkt.answers;
+        } finally {
+            udp.Close();
+        }
+    }
+
+    public void Dispose() {
+    }
+}

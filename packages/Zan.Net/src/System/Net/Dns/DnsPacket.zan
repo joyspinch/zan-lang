@@ -1,0 +1,298 @@
+using System;
+using System.Collections.Generic;
+using System.Text;
+
+namespace System.Net.Dns;
+
+// RFC 1035 标准 DNS 报文编解码器。
+// 核心安全特性：
+// 1. RFC 1035 §4.1.4 域名压缩指针跳转深度限制（最大 16 跳），彻底阻断恶意循环指针死循环 / DoS 攻击。
+// 2. 严格的边界检查（每一处标签长度、报文长度与 RDATA 长度越界校验）。
+// 3. 支持 A (IPv4)、AAAA (IPv6)、CNAME (规范别名) 记录解析与标准查询报文构建。
+public class DnsPacket {
+    public int transactionId;
+    public int flags;
+    public int responseCode;
+    public bool isResponse;
+    public bool isTruncated;
+    public bool recursionDesired;
+    public bool recursionAvailable;
+    public List<DnsRecord> questions;
+    public List<DnsRecord> answers;
+
+    public DnsPacket() {
+        this.transactionId = 0;
+        this.flags = 0;
+        this.responseCode = 0;
+        this.isResponse = false;
+        this.isTruncated = false;
+        this.recursionDesired = false;
+        this.recursionAvailable = false;
+        this.questions = new List<DnsRecord>();
+        this.answers = new List<DnsRecord>();
+    }
+
+    private static string ToHex16(int val) {
+        string hex = "0123456789abcdef";
+        StringBuilder sb = new StringBuilder();
+        sb.Append(hex[(val >> 12) & 15]);
+        sb.Append(hex[(val >> 8) & 15]);
+        sb.Append(hex[(val >> 4) & 15]);
+        sb.Append(hex[val & 15]);
+        return sb.ToString();
+    }
+
+    // 编码域名为 RFC 1035 格式（以标签长度前缀，以 0 字节结尾）
+    public static void EncodeDomainName(List<byte> buf, string domain) {
+        if (domain == null || domain.Length == 0) {
+            buf.Add(0);
+            return;
+        }
+        List<string> parts = domain.Split(".");
+        for (int p = 0; p < parts.Count; p = p + 1) {
+            string label = parts[p];
+            if (label.Length > 0) {
+                int len = label.Length;
+                if (len > 63) { len = 63; } // RFC 1035 规定单标签最长 63 字节
+                buf.Add((byte)len);
+                for (int i = 0; i < len; i = i + 1) {
+                    buf.Add((byte)(label[i] & 255));
+                }
+            }
+        }
+        buf.Add(0); // 根标签结尾
+    }
+
+    // 构建 RFC 1035 标准递归 DNS 查询包
+    public static byte[] BuildQuery(string domain, int queryType, int txId) {
+        List<byte> buf = new List<byte>();
+
+        // 1. Header (12 字节)
+        buf.Add((byte)((txId >> 8) & 255));
+        buf.Add((byte)(txId & 255));
+        // Flags: 0x0100 (RD = 1, 标准递归查询)
+        buf.Add(1);
+        buf.Add(0);
+        // QDCOUNT = 1 (1 个问题)
+        buf.Add(0);
+        buf.Add(1);
+        // ANCOUNT = 0
+        buf.Add(0);
+        buf.Add(0);
+        // NSCOUNT = 0
+        buf.Add(0);
+        buf.Add(0);
+        // ARCOUNT = 0
+        buf.Add(0);
+        buf.Add(0);
+
+        // 2. Question Section
+        DnsPacket.EncodeDomainName(buf, domain);
+        // QTYPE
+        buf.Add((byte)((queryType >> 8) & 255));
+        buf.Add((byte)(queryType & 255));
+        // QCLASS = 1 (IN)
+        buf.Add(0);
+        buf.Add(1);
+
+        byte[] res = new byte[buf.Count];
+        for (int i = 0; i < buf.Count; i = i + 1) {
+            res[i] = buf[i];
+        }
+        return res;
+    }
+
+    // 读取解压 RFC 1035 域名标签（含压缩指针 0xC0 处理与循环死锁防御）
+    public static string ReadName(byte[] data, int len, List<int> offsetBox, int depth) {
+        if (depth > 16 || offsetBox == null || offsetBox.Count == 0) {
+            return ""; // 递归超过 16 跳，强制阻断死循环
+        }
+        int pos = offsetBox[0];
+        StringBuilder sb = new StringBuilder();
+        bool jumped = false;
+
+        while (pos < len) {
+            int b = data[pos] & 255;
+            if (b == 0) {
+                if (!jumped) {
+                    offsetBox[0] = pos + 1;
+                }
+                break;
+            }
+
+            // 0xC0: RFC 1035 §4.1.4 压缩指针标记
+            if ((b & 0xC0) == 0xC0) {
+                if (pos + 1 >= len) { break; }
+                int ptr = ((b & 0x3F) << 8) | (data[pos + 1] & 255);
+                if (!jumped) {
+                    offsetBox[0] = pos + 2;
+                    jumped = true;
+                }
+                List<int> ptrBox = new List<int>();
+                ptrBox.Add(ptr);
+                string rest = DnsPacket.ReadName(data, len, ptrBox, depth + 1);
+                if (sb.Length > 0 && rest.Length > 0) {
+                    sb.Append(".");
+                }
+                sb.Append(rest);
+                break;
+            } else {
+                pos = pos + 1;
+                if (pos + b > len) { break; }
+                if (sb.Length > 0) {
+                    sb.Append(".");
+                }
+                for (int i = 0; i < b; i = i + 1) {
+                    sb.Append((char)(data[pos + i] & 255));
+                }
+                pos = pos + b;
+                if (!jumped) {
+                    offsetBox[0] = pos;
+                }
+            }
+        }
+
+        return sb.ToString();
+    }
+
+    // 解析 DNS 响应报文
+    public static DnsPacket Parse(byte[] data, int length) {
+        if (data == null || length < 12) {
+            return null;
+        }
+
+        DnsPacket pkt = new DnsPacket();
+        pkt.transactionId = ((data[0] & 255) << 8) | (data[1] & 255);
+        pkt.flags = ((data[2] & 255) << 8) | (data[3] & 255);
+        int qdCount = ((data[4] & 255) << 8) | (data[5] & 255);
+        int anCount = ((data[6] & 255) << 8) | (data[7] & 255);
+        int nsCount = ((data[8] & 255) << 8) | (data[9] & 255);
+        int arCount = ((data[10] & 255) << 8) | (data[11] & 255);
+
+        pkt.isResponse = (pkt.flags & 32768) != 0;      // QR bit
+        pkt.isTruncated = (pkt.flags & 512) != 0;       // TC bit
+        pkt.recursionDesired = (pkt.flags & 256) != 0;  // RD bit
+        pkt.recursionAvailable = (pkt.flags & 128) != 0;// RA bit
+        pkt.responseCode = pkt.flags & 15;              // RCODE 4 bits
+
+        List<int> offsetBox = new List<int>();
+        offsetBox.Add(12);
+
+        // 1. 解析 Question 区段
+        for (int q = 0; q < qdCount; q = q + 1) {
+            string qname = DnsPacket.ReadName(data, length, offsetBox, 0);
+            int pos = offsetBox[0];
+            if (pos + 4 > length) { return null; }
+            int qtype = ((data[pos] & 255) << 8) | (data[pos + 1] & 255);
+            int qclass = ((data[pos + 2] & 255) << 8) | (data[pos + 3] & 255);
+            offsetBox[0] = pos + 4;
+
+            DnsRecord qRec = new DnsRecord();
+            qRec.name = qname;
+            qRec.recordType = qtype;
+            qRec.recordClass = qclass;
+            pkt.questions.Add(qRec);
+        }
+
+        // 2. 解析 Answer 区段
+        for (int a = 0; a < anCount; a = a + 1) {
+            string name = DnsPacket.ReadName(data, length, offsetBox, 0);
+            int pos = offsetBox[0];
+            if (pos + 10 > length) { break; }
+            int rtype = ((data[pos] & 255) << 8) | (data[pos + 1] & 255);
+            int rclass = ((data[pos + 2] & 255) << 8) | (data[pos + 3] & 255);
+            int ttl = ((data[pos + 4] & 255) << 24) | ((data[pos + 5] & 255) << 16)
+                    | ((data[pos + 6] & 255) << 8) | (data[pos + 7] & 255);
+            int rdlen = ((data[pos + 8] & 255) << 8) | (data[pos + 9] & 255);
+            pos = pos + 10;
+            offsetBox[0] = pos + rdlen;
+
+            if (pos + rdlen > length) { break; }
+
+            string val = "";
+            if (rtype == DnsRecordType.A && rdlen == 4) {
+                val = Convert.ToString(data[pos] & 255) + "."
+                    + Convert.ToString(data[pos + 1] & 255) + "."
+                    + Convert.ToString(data[pos + 2] & 255) + "."
+                    + Convert.ToString(data[pos + 3] & 255);
+            } else if (rtype == DnsRecordType.AAAA && rdlen == 16) {
+                StringBuilder sb = new StringBuilder();
+                for (int i = 0; i < 16; i = i + 2) {
+                    if (i > 0) { sb.Append(":"); }
+                    int piece = ((data[pos + i] & 255) << 8) | (data[pos + i + 1] & 255);
+                    sb.Append(DnsPacket.ToHex16(piece));
+                }
+                val = sb.ToString();
+            } else if (rtype == DnsRecordType.CNAME) {
+                List<int> cnameBox = new List<int>();
+                cnameBox.Add(pos);
+                val = DnsPacket.ReadName(data, length, cnameBox, 0);
+            }
+
+            DnsRecord rec = new DnsRecord(name, rtype, ttl, val);
+            rec.recordClass = rclass;
+            pkt.answers.Add(rec);
+        }
+
+        return pkt;
+    }
+
+    // 辅助构造用于自测或 Mock 的标准 DNS 应答报文
+    public static byte[] BuildMockResponse(int txId, string domain, int qtype, List<string> ipList, int ttl) {
+        List<byte> buf = new List<byte>();
+
+        // Header: QR=1, RD=1, RA=1, RCODE=0 -> 0x8180
+        buf.Add((byte)((txId >> 8) & 255));
+        buf.Add((byte)(txId & 255));
+        buf.Add(129); // 0x81
+        buf.Add(128); // 0x80
+        // QDCOUNT = 1
+        buf.Add(0);
+        buf.Add(1);
+        // ANCOUNT = ipList.Count
+        int anCount = ipList != null ? ipList.Count : 0;
+        buf.Add((byte)((anCount >> 8) & 255));
+        buf.Add((byte)(anCount & 255));
+        // NSCOUNT = 0, ARCOUNT = 0
+        buf.Add(0); buf.Add(0);
+        buf.Add(0); buf.Add(0);
+
+        // Question:
+        int nameStartOffset = buf.Count;
+        DnsPacket.EncodeDomainName(buf, domain);
+        buf.Add((byte)((qtype >> 8) & 255));
+        buf.Add((byte)(qtype & 255));
+        buf.Add(0); buf.Add(1); // CLASS IN
+
+        // Answers: 使用指针压缩指向前面的 Question 域名 (0xC0 | nameStartOffset)
+        for (int a = 0; a < anCount; a = a + 1) {
+            buf.Add((byte)(192 | ((nameStartOffset >> 8) & 63)));
+            buf.Add((byte)(nameStartOffset & 255));
+            // TYPE
+            buf.Add((byte)((qtype >> 8) & 255));
+            buf.Add((byte)(qtype & 255));
+            // CLASS IN
+            buf.Add(0); buf.Add(1);
+            // TTL
+            buf.Add((byte)((ttl >> 24) & 255));
+            buf.Add((byte)((ttl >> 16) & 255));
+            buf.Add((byte)((ttl >> 8) & 255));
+            buf.Add((byte)(ttl & 255));
+
+            string ip = ipList[a];
+            if (qtype == DnsRecordType.A) {
+                List<string> segs = ip.Split(".");
+                buf.Add(0); buf.Add(4); // RDLENGTH = 4
+                for (int s = 0; s < segs.Count; s = s + 1) {
+                    buf.Add((byte)Convert.ToInt32(segs[s]));
+                }
+            }
+        }
+
+        byte[] res = new byte[buf.Count];
+        for (int i = 0; i < buf.Count; i = i + 1) {
+            res[i] = buf[i];
+        }
+        return res;
+    }
+}
