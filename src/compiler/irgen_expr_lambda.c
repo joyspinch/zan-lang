@@ -1510,7 +1510,9 @@ LLVMValueRef emit_lambda_typed(zan_irgen_t *g, zan_ast_node_t *expr,
     uint32_t saved_di_file = g->di_cur_file;
     if (g->emit_debug) {
         saved_dl = LLVMGetCurrentDebugLocation2(g->builder);
-        di_set_loc(g, expr->loc);
+        /* 先清空 builder 继承自外层函数的 !dbg，防止 lambda 头部捕获展开指令
+         * 泄漏外层函数的 !DISubprogram 导致 LLVM verification 失败（B-ID162） */
+        LLVMSetCurrentDebugLocation2(g->builder, NULL);
     }
 
     /* Lambda 函数体在独立的函数上下文中生成控制流基本块 */
@@ -1527,6 +1529,15 @@ LLVMValueRef emit_lambda_typed(zan_irgen_t *g, zan_ast_node_t *expr,
     g->current_fn = lambda_fn;
     g->current_fn_ret_type = ret_type;
     g->current_fn_zan_ret_type = rett;
+
+    /* 切换到 lambda_fn 之后，再为 lambda 函数体建立归属于自身的独立调试作用域 */
+    if (g->emit_debug) {
+        if (expr->loc.line > 0) {
+            di_set_loc(g, expr->loc);
+        } else {
+            di_clear(g);
+        }
+    }
     int saved_throw_base = g->throw_locals_base;
     int saved_catch_cc = g->catch_cleanup_count;
     int saved_throw_cb = g->throw_catch_base;
@@ -1710,6 +1721,8 @@ LLVMValueRef emit_lambda_typed(zan_irgen_t *g, zan_ast_node_t *expr,
         LLVMSetCurrentDebugLocation2(g->builder, saved_dl);
         g->di_cur_line = saved_di_line;
         g->di_cur_file = saved_di_file;
+        g->di_last_loc = saved_dl;
+        g->di_last_loc_fn = saved_fn;
     }
     free(param_types);
     free(ptypes);

@@ -56,6 +56,7 @@ static inline bool zan_tab_grow(void **items, int *cap, size_t elem,
 /* 确保表容量覆盖指定索引，新扩展槽位清零 */
 static inline bool zan_tab_reserve(void **items, int *cap, size_t elem,
                                   int index, int initial) {
+    if (index < 0) return false;
     if (index < *cap) return true;
     int ncap = *cap ? *cap : initial;
     while (ncap <= index) ncap *= 2;
