@@ -1,0 +1,440 @@
+using System;
+using System.Collections.Generic;
+using System.Text;
+
+namespace System.Text.RegularExpressions;
+
+// RegexProgram.ClassEscape.zan - 字符类构建器 ([...]、POSIX 类、取反) 与转义序列解析 (\x、\u、\c、简写集合)
+public partial class RegexProgram {
+    // 类 `ci` 是否只覆盖 ASCII（定长回顾用）。
+    public bool ClassIsAscii(int ci) {
+        if (this.clsNeg[ci] == 1) { return false; }
+        int from = this.clsStart[ci];
+        int to = from + this.clsCount[ci];
+        for (int i = from; i < to; i = i + 1) {
+            if (this.clsKind[i] != RegexProgram.MemRange()) { return false; }
+            if (this.clsHi[i] > 127) { return false; }
+        }
+        return true;
+    }
+
+    // 开始一个字符类并返回其索引。
+    public int BeginClass(bool negate) {
+        int ci = this.clsStart.Count;
+        this.clsStart.Add(this.clsLo.Count);
+        this.clsCount.Add(0);
+        int n = 0;
+        if (negate) { n = 1; }
+        this.clsNeg.Add(n);
+        return ci;
+    }
+
+    // 给类 ci 追加一个成员（kind 取 MemRange/MemNotSet）。
+    public void AddMember(int ci, int kind, int lo, int hi) {
+        this.clsKind.Add(kind);
+        this.clsLo.Add(lo);
+        this.clsHi.Add(hi);
+        this.clsCount[ci] = this.clsCount[ci] + 1;
+    }
+
+    // 给类 ci 追加码点范围 [lo, hi]。
+    public void AddRange(int ci, int lo, int hi) {
+        this.AddMember(ci, RegexProgram.MemRange(), lo, hi);
+    }
+
+    // 添加 `\d \w \s` 简写的范围。`kind` 用小写字母的
+    // 码值表示。
+    public void AddShorthand(int ci, int kind) {
+        if (kind == 100) {  // 'd'
+            this.AddRange(ci, 48, 57);
+        } else if (kind == 119) {  // 'w'
+            this.AddRange(ci, 48, 57);
+            this.AddRange(ci, 65, 90);
+            this.AddRange(ci, 97, 122);
+            this.AddRange(ci, 95, 95);
+        } else if (kind == 115) {  // 's'
+            this.AddRange(ci, 32, 32);
+            this.AddRange(ci, 9, 13);
+        }
+    }
+
+    // POSIX 类 `[:name:]` 的范围。未知名字返回 false。
+    public bool AddPosixClass(int ci, string name, bool negate) {
+        int sub = -1;
+        if (name == "digit") { sub = 100; }
+        if (name == "space") { sub = 115; }
+        if (name == "word") { sub = 119; }
+        if (sub > 0) {
+            if (negate) {
+                this.AddMember(ci, RegexProgram.MemNotSet(), sub, 0);
+            } else {
+                this.AddShorthand(ci, sub);
+            }
+            return true;
+        }
+        // 其余 POSIX 类展开成范围；取反形式只在整类取反时才可表达，
+        // 因此这里用 MemNotSet 之外的办法：把取反的 POSIX 类拒掉。
+        if (negate) { return false; }
+        if (name == "alpha") {
+            this.AddRange(ci, 65, 90);
+            this.AddRange(ci, 97, 122);
+            return true;
+        }
+        if (name == "alnum") {
+            this.AddRange(ci, 48, 57);
+            this.AddRange(ci, 65, 90);
+            this.AddRange(ci, 97, 122);
+            return true;
+        }
+        if (name == "upper") { this.AddRange(ci, 65, 90); return true; }
+        if (name == "lower") { this.AddRange(ci, 97, 122); return true; }
+        if (name == "xdigit") {
+            this.AddRange(ci, 48, 57);
+            this.AddRange(ci, 65, 70);
+            this.AddRange(ci, 97, 102);
+            return true;
+        }
+        if (name == "blank") {
+            this.AddRange(ci, 32, 32);
+            this.AddRange(ci, 9, 9);
+            return true;
+        }
+        if (name == "cntrl") {
+            this.AddRange(ci, 0, 31);
+            this.AddRange(ci, 127, 127);
+            return true;
+        }
+        if (name == "print") { this.AddRange(ci, 32, 126); return true; }
+        if (name == "graph") { this.AddRange(ci, 33, 126); return true; }
+        if (name == "punct") {
+            this.AddRange(ci, 33, 47);
+            this.AddRange(ci, 58, 64);
+            this.AddRange(ci, 91, 96);
+            this.AddRange(ci, 123, 126);
+            return true;
+        }
+        return false;
+    }
+
+    // `[` 已消耗。类成员按码点收集，因此 `[中文]` 合法。
+    public void ParseClass() {
+        bool negate = false;
+        if (this.Peek() == 94) {  // '^'
+            this.ppos = this.ppos + 1;
+            negate = true;
+        }
+        int ci = this.BeginClass(negate);
+        bool first = true;
+        bool done = false;
+        while (!done) {
+            int c = this.Peek();
+            if (c < 0) {
+                this.error = "missing ']' at " + this.ppos;
+                return;
+            }
+            if (c == 93 && !first) {  // ']'
+                this.ppos = this.ppos + 1;
+                done = true;
+                continue;
+            }
+            first = false;
+            if (c == 91 && this.PeekAt(this.ppos + 1) == 58) {  // "[:name:]"
+                if (!this.ParsePosixInClass(ci)) { return; }
+                continue;
+            }
+            int lo = 0;
+            if (c == 92) {  // '\'
+                this.ppos = this.ppos + 1;
+                int e = this.Next();
+                if (e < 0) {
+                    this.error = "trailing backslash in character class";
+                    return;
+                }
+                if (e == 100 || e == 119 || e == 115) {  // \d \w \s
+                    this.AddShorthand(ci, e);
+                    continue;
+                }
+                if (e == 68 || e == 87 || e == 83) {  // \D \W \S
+                    // 类内的取反简写不能折成范围（那样会把整类含义
+                    // 弄反），单独作为"不属于此集合"的成员保存。
+                    this.AddMember(ci, RegexProgram.MemNotSet(), e + 32, 0);
+                    continue;
+                }
+                if (e == 98) {  // 类内 \b = 退格
+                    this.AddRange(ci, 8, 8);
+                    continue;
+                }
+                lo = this.EscapeValue(e);
+                if (this.error.Length > 0) { return; }
+            } else {
+                lo = this.NextCp();
+            }
+            // 范围 lo-hi（'-' 在末尾时是字面量）
+            if (this.Peek() == 45 && this.PeekAt(this.ppos + 1) != 93
+                && this.PeekAt(this.ppos + 1) >= 0) {
+                this.ppos = this.ppos + 1;
+                int hi = 0;
+                if (this.Peek() == 92) {
+                    this.ppos = this.ppos + 1;
+                    int e2 = this.Next();
+                    if (e2 == 100 || e2 == 119 || e2 == 115 || e2 == 68
+                        || e2 == 87 || e2 == 83) {
+                        this.error = "shorthand class cannot be a range endpoint at "
+                            + this.ppos;
+                        return;
+                    }
+                    hi = this.EscapeValue(e2);
+                    if (this.error.Length > 0) { return; }
+                } else {
+                    hi = this.NextCp();
+                }
+                if (hi < lo) {
+                    this.error = "character range is out of order at " + this.ppos;
+                    return;
+                }
+                this.AddRange(ci, lo, hi);
+            } else {
+                this.AddRange(ci, lo, lo);
+            }
+        }
+        if (this.clsCount[ci] == 0) {
+            this.error = "empty character class at " + this.ppos;
+            return;
+        }
+        this.Emit(RegexProgram.OpClass(), ci, 0, 0);
+    }
+
+    // 解析类内的 `[:name:]` / `[:^name:]`。
+    public bool ParsePosixInClass(int ci) {
+        int save = this.ppos;
+        this.ppos = this.ppos + 2;
+        bool neg = false;
+        if (this.Peek() == 94) {
+            this.ppos = this.ppos + 1;
+            neg = true;
+        }
+        StringBuilder sb = new StringBuilder();
+        while (this.Peek() >= 97 && this.Peek() <= 122) {
+            sb.Append(this.CharText(this.Peek()));
+            this.ppos = this.ppos + 1;
+        }
+        if (this.Peek() != 58 || this.PeekAt(this.ppos + 1) != 93) {
+            this.ppos = save;
+            this.error = "malformed POSIX character class at " + save;
+            return false;
+        }
+        this.ppos = this.ppos + 2;
+        if (!this.AddPosixClass(ci, sb.ToString(), neg)) {
+            this.error = "unsupported POSIX character class '[:" + sb.ToString()
+                + ":]' at " + save;
+            return false;
+        }
+        return true;
+    }
+
+    // 转义序列代表的码点（`\n` -> 10，`\x41` -> 65）。
+    // 反斜杠已消耗，`e` 是其后的那个字节。
+    public int EscapeValue(int e) {
+        if (e == 110) { return 10; }  // \n
+        if (e == 114) { return 13; }  // \r
+        if (e == 116) { return 9; }  // \t
+        if (e == 102) { return 12; }  // \f
+        if (e == 118) { return 11; }  // \v
+        if (e == 97) { return 7; }  // \a
+        if (e == 101) { return 27; }  // \e
+        if (e == 48) {  // \0
+            // PCRE 里 `\012` 是八进制；这里只支持 `\0` = NUL，后面再跟
+            // 八进制数字时明确报错，而不是静默当成 NUL 加字面数字
+            int nxt = this.Peek();
+            if (nxt >= 48 && nxt <= 55) {
+                this.error = "octal escapes are not supported at " + this.ppos
+                    + "; use \\xHH";
+                return 0;
+            }
+            return 0;
+        }
+        if (e == 120) { return this.ParseHexEscape(); }  // \xHH / \x{...}
+        if (e == 117) { return this.ParseFixedHex(4); }  // \uXXXX
+        if (e == 85) { return this.ParseFixedHex(8); }  // \UXXXXXXXX
+        if (e == 99) { return this.ParseControlEscape(); }  // \cX
+        if (e == 112 || e == 80) {  // \p{..} \P{..}
+            this.error = "Unicode property escapes (\\p) are not supported at "
+                + this.ppos;
+            return 0;
+        }
+        if (e >= 48 && e <= 57) {
+            this.error = "octal escapes are not supported at " + this.ppos
+                + "; use \\xHH";
+            return 0;
+        }
+        if ((e >= 97 && e <= 122) || (e >= 65 && e <= 90)) {
+            this.error = "unsupported escape '\\" + this.CharText(e) + "' at "
+                + this.ppos;
+            return 0;
+        }
+        if (e < 0) { return 92; }
+        return e;
+    }
+
+    // 十六进制数字的数值；不是十六进制字符返回 -1。
+    public static int HexDigit(int c) {
+        if (c >= 48 && c <= 57) { return c - 48; }
+        if (c >= 97 && c <= 102) { return c - 87; }
+        if (c >= 65 && c <= 70) { return c - 55; }
+        return -1;
+    }
+
+    // `\xHH` / `\x{HH..}` 的码点；畸形、为空或超出 Unicode 范围时报错
+    // 并返回 0。
+    public int ParseHexEscape() {
+        if (this.Peek() == 123) {  // \x{1F600}
+            this.ppos = this.ppos + 1;
+            int v = 0;
+            int n = 0;
+            while (RegexProgram.HexDigit(this.Peek()) >= 0) {
+                v = v * 16 + RegexProgram.HexDigit(this.Peek());
+                this.ppos = this.ppos + 1;
+                n = n + 1;
+            }
+            if (n == 0 || this.Peek() != 125) {
+                this.error = "malformed \\x{...} escape at " + this.ppos;
+                return 0;
+            }
+            this.ppos = this.ppos + 1;
+            if (v > 1114111) {
+                this.error = "code point out of range in \\x{...} at " + this.ppos;
+                return 0;
+            }
+            return v;
+        }
+        return this.ParseFixedHex(2);
+    }
+
+    // 读取 digits 位定长十六进制转义（\uXXXX、\UXXXXXXXX）；
+    // 缺数字或超出 Unicode 范围时报错并返回 0。
+    public int ParseFixedHex(int digits) {
+        int v = 0;
+        for (int i = 0; i < digits; i = i + 1) {
+            int d = RegexProgram.HexDigit(this.Peek());
+            if (d < 0) {
+                this.error = "expected " + digits + " hex digits at " + this.ppos;
+                return 0;
+            }
+            v = v * 16 + d;
+            this.ppos = this.ppos + 1;
+        }
+        if (v > 1114111) {
+            this.error = "code point out of range at " + this.ppos;
+            return 0;
+        }
+        return v;
+    }
+
+    // `\cX` 的控制字符码点（X 统一大写后减 '@'）；X 缺失或不是
+    // 字母时报错并返回 0。
+    public int ParseControlEscape() {
+        int c = this.Next();
+        if (c < 0) {
+            this.error = "\\c needs a letter at " + this.ppos;
+            return 0;
+        }
+        int up = c;
+        if (up >= 97 && up <= 122) { up = up - 32; }
+        if (up < 64 || up > 95) {
+            this.error = "\\c needs a letter at " + this.ppos;
+            return 0;
+        }
+        return up - 64;
+    }
+
+    // 模式级反斜杠序列：简写类（\d\w\s 及取反）、锚点（\b\B\A\z\Z\G）、
+    // 命名/编号反向引用，其余交给 EscapeValue 作字面量转义。
+    public void ParseEscape() {
+        int e = this.Next();
+        if (e < 0) {
+            this.error = "trailing backslash";
+            return;
+        }
+        if (e == 100 || e == 119 || e == 115) {  // \d \w \s
+            int ci = this.BeginClass(false);
+            this.AddShorthand(ci, e);
+            this.Emit(RegexProgram.OpClass(), ci, 0, 0);
+            return;
+        }
+        if (e == 68 || e == 87 || e == 83) {  // \D \W \S
+            int ci = this.BeginClass(true);
+            this.AddShorthand(ci, e + 32);
+            this.Emit(RegexProgram.OpClass(), ci, 0, 0);
+            return;
+        }
+        if (e == 98) {  // \b
+            this.Emit(RegexProgram.OpWordB(), 1, 0, 0);
+            return;
+        }
+        if (e == 66) {  // \B
+            this.Emit(RegexProgram.OpWordB(), 0, 0, 0);
+            return;
+        }
+        if (e == 65) {  // \A
+            this.Emit(RegexProgram.OpBos(), 0, 0, 0);
+            return;
+        }
+        if (e == 122) {  // \z
+            this.Emit(RegexProgram.OpEos(), 0, 0, 0);
+            return;
+        }
+        if (e == 90) {  // \Z
+            this.Emit(RegexProgram.OpEos(), 1, 0, 0);
+            return;
+        }
+        if (e == 71) {  // \G
+            this.Emit(RegexProgram.OpGpos(), 0, 0, 0);
+            return;
+        }
+        if (e == 107) {  // \k<name>
+            int closer = -1;
+            if (this.Peek() == 60) { closer = 62; }
+            if (this.Peek() == 39) { closer = 39; }
+            if (closer < 0) {
+                this.error = "\\k must be followed by <name> at " + this.ppos;
+                return;
+            }
+            this.ppos = this.ppos + 1;
+            string name = this.ParseGroupName(closer);
+            if (this.error.Length > 0) { return; }
+            int gi = this.GroupNumber(name);
+            if (gi < 0) {
+                this.error = "reference to undefined group name '" + name + "' at "
+                    + this.ppos;
+                return;
+            }
+            this.Emit(RegexProgram.OpBackref(), gi, 0, 0);
+            return;
+        }
+        if (e >= 49 && e <= 57) {  // \1 - \99
+            int g = e - 48;
+            while (this.Peek() >= 48 && this.Peek() <= 57
+                   && g * 10 + (this.Peek() - 48) < this.groups) {
+                g = g * 10 + (this.Next() - 48);
+            }
+            if (g >= this.groups) {
+                if (e <= 55 && this.Peek() >= 48 && this.Peek() <= 55) {
+                    // `\101` 在 Perl 里是八进制，这里不支持；单说
+                    // "组不存在" 会让人以为是数错了组号
+                    this.error = "octal escapes are not supported at "
+                        + this.ppos + "; use \\xHH";
+                    return;
+                }
+                this.error = "reference to undefined group \\" + g + " at "
+                    + this.ppos;
+                return;
+            }
+            this.Emit(RegexProgram.OpBackref(), g, 0, 0);
+            return;
+        }
+        int v = this.EscapeValue(e);
+        if (this.error.Length > 0) { return; }
+        this.Emit(RegexProgram.OpChar(), v, 0, 0);
+    }
+
+}

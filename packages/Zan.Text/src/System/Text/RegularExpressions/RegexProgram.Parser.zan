@@ -1,0 +1,626 @@
+using System;
+using System.Collections.Generic;
+using System.Text;
+
+namespace System.Text.RegularExpressions;
+
+// RegexProgram.Parser.zan - 正则表达式递归下降语法分析器（序列、交替、量词、分组、环视与定长回顾校验）
+public partial class RegexProgram {
+    // ---- 模式游标 --------------------------------------------------
+
+    // 查看模式第 i 个字节，越界返回 -1。
+    public int PeekAt(int i) {
+        if (i < 0 || i >= this.plen) { return -1; }
+        return new Span<byte>(this.pbuf + i, 1)[0];
+    }
+
+    // 查看当前字节，模式末尾返回 -1。
+    int Peek() { return this.PeekAt(this.ppos); }
+
+    // 消耗并返回当前字节，模式末尾返回 -1。
+    public int Next() {
+        int c = this.Peek();
+        this.ppos = this.ppos + 1;
+        return c;
+    }
+
+    // 读取一个码点（多字节字面量按整体处理）。
+    public int NextCp() {
+        int packed = RegexProgram.DecodeAt(this.pbuf, this.plen, this.ppos);
+        if (packed < 0) {
+            this.ppos = this.ppos + 1;
+            return -1;
+        }
+        this.ppos = this.ppos + (packed & 7);
+        return packed / 8;
+    }
+
+    // ---- 解析器 ----------------------------------------------------------
+
+    // 只识别位于模式最开头的 `(?imsx...)`。作用域内联标志
+    // （`(?i:...)`）没有实现，会在 ParseGroup 里明确报错，而不是
+    // 被当成普通组"接受但永不匹配"。
+    public void ParseInlineFlags() {
+        while (this.Peek() == 40 && this.PeekAt(this.ppos + 1) == 63) {  // "(?"
+            int scan = this.ppos + 2;
+            bool onlyFlags = false;
+            while (scan < this.plen) {
+                int c = this.PeekAt(scan);
+                if (c == 105 || c == 109 || c == 115) {  // i m s
+                    scan = scan + 1;
+                } else if (c == 41) {  // ')'
+                    onlyFlags = scan > this.ppos + 2;
+                    break;
+                } else {
+                    break;
+                }
+            }
+            if (!onlyFlags) { return; }
+            for (int i = this.ppos + 2; i < scan; i = i + 1) {
+                int c = this.PeekAt(i);
+                if (c == 105) { this.ignoreCase = true; }
+                if (c == 109) { this.multiline = true; }
+                if (c == 115) { this.dotAll = true; }
+            }
+            this.ppos = scan + 1;
+        }
+    }
+
+    // right ; end。重复的备选分支向左嵌套。
+    public void ParseAlt() {
+        int start = this.Here();
+        this.ParseSeq();
+        while (this.Peek() == 124 && this.error.Length == 0) {  // '|'
+            this.ppos = this.ppos + 1;
+            int len = this.Here() - start;
+            this.Shift(start, len, 1);
+            int jmpOut = this.Emit(RegexProgram.OpJmp(), 0, 0, 0);
+            this.op[start] = RegexProgram.OpSplit();
+            this.ax[start] = start + 1;
+            this.ay[start] = this.Here();
+            this.ParseSeq();
+            this.ax[jmpOut] = this.Here();
+        }
+    }
+
+    public void ParseSeq() {
+        bool more = true;
+        while (more) {
+            int c = this.Peek();
+            if (c < 0 || c == 124 || c == 41) {  // 结束，或 '|'、')'
+                more = false;
+            } else {
+                this.ParseTerm();
+                if (this.error.Length > 0) { more = false; }
+            }
+        }
+    }
+
+    public void ParseTerm() {
+        int start = this.Here();
+        this.ParseAtom();
+        if (this.error.Length > 0) { return; }
+        this.ParseQuantifier(start);
+    }
+
+    // 解析量词 `* + ? {n} {n,m}` 及惰性 `?` 后缀；`{` 后不是数字时
+    // 整体按字面量回退，占有量词 `+` 明确报错。
+    public void ParseQuantifier(int start) {
+        int c = this.Peek();
+        int min = -1;
+        int max = -1;
+        if (c == 42) {  // '*'
+            this.ppos = this.ppos + 1;
+            min = 0;
+            max = -1;
+        } else if (c == 43) {  // '+'
+            this.ppos = this.ppos + 1;
+            min = 1;
+            max = -1;
+        } else if (c == 63) {  // '?'
+            this.ppos = this.ppos + 1;
+            min = 0;
+            max = 1;
+        } else if (c == 123) {  // '{'
+            int save = this.ppos;
+            this.ppos = this.ppos + 1;
+            int lo = this.ParseInt();
+            if (lo < 0) {
+                // '{' 后面不是数字：按字面量处理（PCRE 同）
+                this.ppos = save;
+                return;
+            }
+            if (lo > 65535) {
+                this.error = "quantifier out of range (max 65535) at " + save;
+                return;
+            }
+            int hi = lo;
+            if (this.Peek() == 44) {  // ','
+                this.ppos = this.ppos + 1;
+                if (this.Peek() == 125) {  // '}' -> {n,}
+                    hi = -1;
+                } else {
+                    hi = this.ParseInt();
+                    if (hi < 0) {
+                        // "{2,x"：{ 后已有数字，缺上界是错误而不是字面量
+                        this.error = "malformed quantifier at " + save;
+                        return;
+                    }
+                    if (hi > 65535) {
+                        this.error = "quantifier out of range (max 65535) at "
+                            + save;
+                        return;
+                    }
+                }
+            }
+            if (this.Peek() != 125) {
+                // "a{2" / "a{2,3"：PCRE/.NET 都当作写了一半的量词报错
+                this.error = "missing '}' for quantifier at " + save;
+                return;
+            }
+            this.ppos = this.ppos + 1;
+            if (hi >= 0 && hi < lo) {
+                this.error = "quantifier {" + lo + "," + hi + "} is out of order at "
+                    + this.ppos;
+                return;
+            }
+            min = lo;
+            max = hi;
+        } else {
+            return;
+        }
+        bool lazy = false;
+        if (this.Peek() == 63) {  // '?' -> 惰性
+            this.ppos = this.ppos + 1;
+            lazy = true;
+        } else if (this.Peek() == 43) {  // '+' -> 占有量词
+            this.error = "possessive quantifiers are not supported at " + this.ppos
+                + "; use an atomic group (?>...)";
+            return;
+        }
+        this.ApplyQuantifier(start, min, max, lazy);
+    }
+
+    // 读取十进制数字串；一个数字都没有时返回 -1。
+    public int ParseInt() {
+        int v = -1;
+        int c = this.Peek();
+        while (c >= 48 && c <= 57) {
+            if (v < 0) { v = 0; }
+            v = v * 10 + (c - 48);
+            this.ppos = this.ppos + 1;
+            c = this.Peek();
+        }
+        return v;
+    }
+
+    // 把已发射到 [start, end) 的原子改写成其重复形式。
+    public void ApplyQuantifier(int start, int min, int max, bool lazy) {
+        int end = this.Here();
+        int len = end - start;
+        if (len <= 0) {
+            this.error = "quantifier with nothing to repeat at " + this.ppos;
+            return;
+        }
+        if (min == 0 && max == -1) {
+            this.StarAt(start, len, lazy);
+            return;
+        }
+        if (min == 1 && max == -1) {
+            this.PlusAt(start, len, lazy);
+            return;
+        }
+        if (min == 0 && max == 1) {
+            this.OptionalAt(start, len, lazy);
+            return;
+        }
+        if (max == 0) {
+            // {0} / {0,0}：整段不参与匹配
+            this.Truncate(start);
+            return;
+        }
+        // {n,m}：保留已发射的副本作为第一次重复
+        if (min == 0) {
+            // 丢弃已发射的主体，重新添加为可选副本
+            List<int> bo = new List<int>();
+            List<int> bx = new List<int>();
+            List<int> by = new List<int>();
+            List<int> bz = new List<int>();
+            for (int i = 0; i < len; i = i + 1) {
+                bo.Add(this.op[start + i]);
+                bx.Add(this.ax[start + i]);
+                by.Add(this.ay[start + i]);
+                bz.Add(this.az[start + i]);
+            }
+            this.Truncate(start);
+            int reps = max;
+            if (reps < 0) { reps = 1; }
+            for (int r = 0; r < reps; r = r + 1) {
+                int s = this.Here();
+                this.AppendBody(bo, bx, by, bz, s - start);
+                this.OptionalAt(s, len, lazy);
+            }
+            return;
+        }
+        int copies = min - 1;
+        for (int k = 0; k < copies; k = k + 1) {
+            this.CopyRange(start, start + len);
+        }
+        if (max == -1) {
+            int s = this.Here();
+            this.CopyRange(start, start + len);
+            this.StarAt(s, len, lazy);
+        } else {
+            int extra = max - min;
+            for (int e = 0; e < extra; e = e + 1) {
+                int s = this.Here();
+                this.CopyRange(start, start + len);
+                this.OptionalAt(s, len, lazy);
+            }
+        }
+    }
+
+    // 把保存下来的主体指令重定位 delta 后重新发射一份。
+    void AppendBody(List<int> bo, List<int> bx, List<int> by, List<int> bz,
+                    int delta) {
+        for (int i = 0; i < bo.Count; i = i + 1) {
+            int o = bo[i];
+            int x = bx[i];
+            int y = by[i];
+            if (RegexProgram.XIsPc(o)) { x = x + delta; }
+            if (RegexProgram.YIsPc(o)) { y = y + delta; }
+            this.Emit(o, x, y, bz[i]);
+        }
+    }
+
+    // 把指令列表截断到 n 条（丢弃 n 之后的所有指令）。
+    public void Truncate(int n) {
+        while (this.op.Count > n) {
+            this.op.RemoveAt(this.op.Count - 1);
+            this.ax.RemoveAt(this.ax.Count - 1);
+            this.ay.RemoveAt(this.ay.Count - 1);
+            this.az.RemoveAt(this.az.Count - 1);
+        }
+    }
+
+    // 将 [start, start+len) 处的主体转换为 `body*`：
+    // mark/emptychk 这一对负责空循环检查：主体这一轮没有前进
+    // （`(a*)*`）就直接跳出循环，
+    // 否则会无限迭代下去。
+    public void StarAt(int start, int len, bool lazy) {
+        int slot = this.marks;
+        this.marks = this.marks + 1;
+        this.Shift(start, len, 2);
+        int chk = this.Emit(RegexProgram.OpEmptyChk(), slot, 0, 0);
+        this.Emit(RegexProgram.OpJmp(), start, 0, 0);
+        int outPc = this.Here();
+        this.ay[chk] = outPc;
+        this.op[start + 1] = RegexProgram.OpMark();
+        this.ax[start + 1] = slot;
+        this.ay[start + 1] = 0;
+        this.op[start] = RegexProgram.OpSplit();
+        if (lazy) {
+            this.ax[start] = outPc;
+            this.ay[start] = start + 1;
+        } else {
+            this.ax[start] = start + 1;
+            this.ay[start] = outPc;
+        }
+    }
+
+    // 将 [start, start+len) 处的主体转换为 `body+`：
+    public void PlusAt(int start, int len, bool lazy) {
+        int slot = this.marks;
+        this.marks = this.marks + 1;
+        this.Shift(start, len, 1);
+        this.op[start] = RegexProgram.OpMark();
+        this.ax[start] = slot;
+        this.ay[start] = 0;
+        int chk = this.Emit(RegexProgram.OpEmptyChk(), slot, 0, 0);
+        int sp = this.Emit(RegexProgram.OpSplit(), 0, 0, 0);
+        this.ay[chk] = sp + 1;
+        if (lazy) {
+            this.ax[sp] = sp + 1;
+            this.ay[sp] = start;
+        } else {
+            this.ax[sp] = start;
+            this.ay[sp] = sp + 1;
+        }
+    }
+
+    // 将 [start, start+len) 处的主体转换为 `body?`。
+    public void OptionalAt(int start, int len, bool lazy) {
+        this.Shift(start, len, 1);
+        int outPc = this.Here();
+        this.op[start] = RegexProgram.OpSplit();
+        if (lazy) {
+            this.ax[start] = outPc;
+            this.ay[start] = start + 1;
+        } else {
+            this.ax[start] = start + 1;
+            this.ay[start] = outPc;
+        }
+    }
+
+    // 在 [start, start+len) 处的主体前为 `n` 条指令腾出空间，
+    // 并重定位 start 处及之后的跳转目标。
+    public void Shift(int start, int len, int n) {
+        int i = 0;
+        for (; i < n; i = i + 1) {
+            this.Emit(RegexProgram.OpJmp(), 0, 0, 0);
+        }
+        // 从末尾开始把主体上移 n 位，避免覆盖
+        i = len - 1;
+        while (i >= 0) {
+            int o = this.op[start + i];
+            int x = this.ax[start + i];
+            int y = this.ay[start + i];
+            if (RegexProgram.XIsPc(o) && x >= start) { x = x + n; }
+            if (RegexProgram.YIsPc(o) && y >= start) { y = y + n; }
+            this.op[start + n + i] = o;
+            this.ax[start + n + i] = x;
+            this.ay[start + n + i] = y;
+            this.az[start + n + i] = this.az[start + i];
+            i = i - 1;
+        }
+    }
+
+    // atom := 分组 | '.' | '^' | '$' | '[' | 反斜杠转义 | 字面量码点；
+    // 前置量词、模式提前结束均报错。
+    public void ParseAtom() {
+        int c = this.Peek();
+        if (c == 40) {  // '('
+            this.ppos = this.ppos + 1;
+            this.ParseGroup();
+            return;
+        }
+        if (c == 46) {  // '.'
+            this.ppos = this.ppos + 1;
+            this.Emit(RegexProgram.OpAny(), 0, 0, 0);
+            return;
+        }
+        if (c == 94) {  // '^'
+            this.ppos = this.ppos + 1;
+            this.Emit(RegexProgram.OpBol(), 0, 0, 0);
+            return;
+        }
+        if (c == 36) {  // '$'
+            this.ppos = this.ppos + 1;
+            this.Emit(RegexProgram.OpEol(), 0, 0, 0);
+            return;
+        }
+        if (c == 91) {  // '['
+            this.ppos = this.ppos + 1;
+            this.ParseClass();
+            return;
+        }
+        if (c == 92) {  // '\'
+            this.ppos = this.ppos + 1;
+            this.ParseEscape();
+            return;
+        }
+        if (c == 42 || c == 43 || c == 63) {  // '*' '+' '?'
+            this.error = "quantifier with nothing to repeat at " + this.ppos;
+            return;
+        }
+        if (c < 0) {
+            this.error = "unexpected end of pattern";
+            return;
+        }
+        int cp = this.NextCp();
+        this.Emit(RegexProgram.OpChar(), cp, 0, 0);
+    }
+
+    // '(' 已消耗。处理捕获组、`(?:`、`(?#`、`(?=` `(?!`
+    // `(?&lt;=` `(?&lt;!`、`(?&gt;` 和 `(?&lt;name&gt;`。
+    public void ParseGroup() {
+        if (this.Peek() != 63) {  // 普通捕获组
+            this.ParseCaptureBody(this.NewGroup(""));
+            return;
+        }
+        int k = this.PeekAt(this.ppos + 1);
+        if (k == 58) {  // "(?:"
+            this.ppos = this.ppos + 2;
+            this.ParseGroupTail(-1);
+            return;
+        }
+        if (k == 35) {  // "(?#" 注释
+            this.ppos = this.ppos + 2;
+            while (this.Peek() >= 0 && this.Peek() != 41) {
+                this.ppos = this.ppos + 1;
+            }
+            if (this.Peek() != 41) {
+                this.error = "missing ')' closing comment at " + this.ppos;
+                return;
+            }
+            this.ppos = this.ppos + 1;
+            return;
+        }
+        if (k == 61) {  // "(?="
+            this.ppos = this.ppos + 2;
+            this.ParseLook(RegexProgram.LookAhead());
+            return;
+        }
+        if (k == 33) {  // "(?!"
+            this.ppos = this.ppos + 2;
+            this.ParseLook(RegexProgram.LookAheadNeg());
+            return;
+        }
+        if (k == 62) {  // "(?>"
+            this.ppos = this.ppos + 2;
+            this.ParseLook(RegexProgram.LookAtomic());
+            return;
+        }
+        if (k == 60) {  // "(?<..."
+            int k2 = this.PeekAt(this.ppos + 2);
+            if (k2 == 61) {  // "(?<="
+                this.ppos = this.ppos + 3;
+                this.ParseLook(RegexProgram.LookBehind());
+                return;
+            }
+            if (k2 == 33) {  // "(?<!"
+                this.ppos = this.ppos + 3;
+                this.ParseLook(RegexProgram.LookBehindNeg());
+                return;
+            }
+            this.ppos = this.ppos + 2;
+            string name = this.ParseGroupName(62);  // '>'
+            if (this.error.Length > 0) { return; }
+            this.ParseCaptureBody(this.NewGroup(name));
+            return;
+        }
+        if (k == 39) {  // "(?'name'"
+            this.ppos = this.ppos + 2;
+            string name = this.ParseGroupName(39);
+            if (this.error.Length > 0) { return; }
+            this.ParseCaptureBody(this.NewGroup(name));
+            return;
+        }
+        if (k == 80 && this.PeekAt(this.ppos + 2) == 60) {  // "(?P<name>"
+            this.ppos = this.ppos + 3;
+            string name = this.ParseGroupName(62);
+            if (this.error.Length > 0) { return; }
+            this.ParseCaptureBody(this.NewGroup(name));
+            return;
+        }
+        if (k == 105 || k == 109 || k == 115) {  // i m s
+            this.error = "inline flags are only supported at the start of the "
+                + "pattern (at " + this.ppos + ")";
+            return;
+        }
+        this.error = "unsupported group syntax '(?" + this.CharText(k)
+            + "' at " + this.ppos;
+    }
+
+    // 字节的诊断显示形式：ASCII 字符原样，其余为 \xHH。
+    public string CharText(int c) {
+        if (c < 0) { return ""; }
+        if (c < 128) { return Encoding.CharFromCode(c); }
+        return "\\x" + RegexProgram.Hex2(c);
+    }
+
+    // 0-255 的两位小写十六进制文本。
+    public static string Hex2(int v) {
+        int hi = (v >> 4) & 15;
+        int lo = v & 15;
+        byte[] b = new byte[2];
+        b[0] = (byte)(hi < 10 ? hi + 48 : hi + 87);
+        b[1] = (byte)(lo < 10 ? lo + 48 : lo + 87);
+        return b.ToStr(0, 2);
+    }
+
+    // 登记一个捕获组，返回组号。
+    public int NewGroup(string name) {
+        int gi = this.groups;
+        this.groups = this.groups + 1;
+        if (name.Length > 0) {
+            if (this.GroupNumber(name) >= 0) {
+                this.error = "duplicate group name '" + name + "' at " + this.ppos;
+            }
+            if (this.namedGroups == null) {
+                this.namedGroups = new List<RegexNamedGroup>();
+            }
+            this.namedGroups.Add(new RegexNamedGroup(name, gi));
+        }
+        return gi;
+    }
+
+    // 读取组名直到 closer（'>' 或 '''）；只允许 ASCII 字母、数字与
+    // 下划线，为空、含非法字符或未闭合时报错并返回 ""。
+    public string ParseGroupName(int closer) {
+        StringBuilder sb = new StringBuilder();
+        int c = this.Peek();
+        while (c >= 0 && c != closer) {
+            bool ok = (c >= 48 && c <= 57) || (c >= 65 && c <= 90)
+                || (c >= 97 && c <= 122) || c == 95;
+            if (!ok) {
+                this.error = "invalid character in group name at " + this.ppos;
+                return "";
+            }
+            sb.Append(this.CharText(c));
+            this.ppos = this.ppos + 1;
+            c = this.Peek();
+        }
+        if (c != closer) {
+            this.error = "unterminated group name at " + this.ppos;
+            return "";
+        }
+        this.ppos = this.ppos + 1;
+        string name = sb.ToString();
+        if (name.Length == 0) {
+            this.error = "empty group name at " + this.ppos;
+        }
+        return name;
+    }
+
+    // 捕获组体：先发射左 Save（槽位 gi*2），再解析组体与 ')'。
+    public void ParseCaptureBody(int gi) {
+        if (this.error.Length > 0) { return; }
+        this.Emit(RegexProgram.OpSave(), gi * 2, 0, 0);
+        this.ParseGroupTail(gi);
+    }
+
+    // 解析组体与 ')'；gi >= 0 时补上收尾的 Save。
+    public void ParseGroupTail(int gi) {
+        this.ParseAlt();
+        if (this.error.Length > 0) { return; }
+        if (this.Peek() != 41) {
+            this.error = "missing ')' at " + this.ppos;
+            return;
+        }
+        this.ppos = this.ppos + 1;
+        if (gi >= 0) {
+            this.Emit(RegexProgram.OpSave(), gi * 2 + 1, 0, 0);
+        }
+    }
+
+    // 环视 / 原子组：`look ; body ; lookend ; 继续`。
+    public void ParseLook(int kind) {
+        int look = this.Emit(RegexProgram.OpLook(), kind, 0, 0);
+        int bodyStart = this.Here();
+        this.ParseAlt();
+        if (this.error.Length > 0) { return; }
+        if (this.Peek() != 41) {
+            this.error = "missing ')' at " + this.ppos;
+            return;
+        }
+        this.ppos = this.ppos + 1;
+        int bodyEnd = this.Here();
+        this.Emit(RegexProgram.OpLookEnd(), 0, 0, 0);
+        this.ay[look] = this.Here();  // 断言之后继续执行的位置
+        if (kind == RegexProgram.LookBehind() || kind == RegexProgram.LookBehindNeg()) {
+            int width = this.FixedWidth(bodyStart, bodyEnd);
+            if (width < 0) {
+                this.error = "lookbehind must have a fixed width (literals and "
+                    + "ASCII classes only) at " + this.ppos;
+                return;
+            }
+            this.az[look] = width;
+        }
+    }
+
+    // [from, to) 匹配的固定字节数；宽度不定时返回 -1。
+    // 定长回顾靠它算出起点，做不到就编译期报错，而不是
+    // 悄悄给个错答案。
+    public int FixedWidth(int from, int to) {
+        int w = 0;
+        for (int i = from; i < to; i = i + 1) {
+            int o = this.op[i];
+            if (o == RegexProgram.OpChar()) {
+                w = w + RegexProgram.Utf8Len(this.ax[i]);
+            } else if (o == RegexProgram.OpClass()) {
+                if (!this.ClassIsAscii(this.ax[i])) { return -1; }
+                w = w + 1;
+            } else if (o == RegexProgram.OpSave() || o == RegexProgram.OpBol()
+                       || o == RegexProgram.OpEol() || o == RegexProgram.OpWordB()
+                       || o == RegexProgram.OpBos() || o == RegexProgram.OpEos()
+                       || o == RegexProgram.OpGpos()) {
+                // 零宽
+            } else {
+                return -1;  // 量词、交替、反向引用、`.`、嵌套环视
+            }
+        }
+        return w;
+    }
+
+}
