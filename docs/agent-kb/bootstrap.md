@@ -52,7 +52,7 @@ may be absent; it is **not** the reference semantics.
 
 ## Architecture
 
-`src/selfhost/` (32 files, plus 2 runtime shims under `src/selfhost_runtime/`)
+`src/selfhost/` (36 files, including native code generation under `ngen*.zan`)
 mirrors the module structure of the C host in `src/compiler/`:
 
 | File          | Role                                                       |

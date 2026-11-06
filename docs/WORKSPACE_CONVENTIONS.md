@@ -330,8 +330,8 @@ checkout` / `git restore` / `git reset --hard` 抹掉报错、拿旧版本文件
    `scripts/gui_layer_rules.py` 逐文件比对暂存版内容与 `scripts/gui_layers_baseline.json`，计数超出基线即拦截：
    Zan.Gui 包内向上依赖（按目录判层，含引用兄弟包命名空间）、Widget/Component 新增即时模式入口
    `Render(App …)`、新增 App 输入仲裁调用（ClaimClick、BlockHitsRect…）、设计器文档以外的 html 新增
-   `data-dock/fx/fy/fw/fh/span`、Zan.Gui 以外新建 `Signal*`。修掉违规后运行
-   `python scripts/gui_layer_rules.py --baseline` 锁定收紧；基线总数上升会被拦截，确属必要时设置
+   `data-dock/fx/fy/fw/fh/span`、Zan.Gui 以外新建 `Signal*`。修掉违规后对改动文件运行
+   `python scripts/gui_layer_rules.py --update <文件…>` 锁定收紧（`git mv` 时新旧路径都传）；基线总数上升会被拦截，确属必要时设置
    `ZAN_GUI_BASELINE_RAISE=1` 并在提交说明写明理由。全树核对：`--report`。依据见 `docs/GUI_ARCHITECTURE.md`。
    暂存了 Zan.Gui 源码时要扫一遍 Gui 家族声明建类型表，这类提交的机检约 1 秒。
 
