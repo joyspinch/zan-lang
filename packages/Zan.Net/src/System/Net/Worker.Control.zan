@@ -1,0 +1,459 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Net.Sockets;
+using System.Security.Cryptography;
+using System.Threading;
+
+namespace System.Net;
+
+// Worker.Control.zan - 命令行指令派发 (start/stop/reload/status)、控制端口认领、探针与单进程控制循环
+public partial class Worker {
+    static const int CTL_FREE = 0;
+    static const int CTL_OURS = 1;
+    static const int CTL_FOREIGN = 2;
+    static const int CTL_UNKNOWN = 3;
+
+    static string appId = "";
+    static string ctlToken = "";
+    static int ctlProbeMs = 1500;
+    static int ctlCmdMs = 10000;
+    static string lastCtlErr = "";
+
+    // 控制端口取值顺序：显式指定 > 环境变量 ZAN_CTL_PORT > 首 Worker 端口+10000（无 Worker 时 19999）。
+    private static int ControlPort() {
+        if (controlPort > 0) { return controlPort; }
+        string env = ProcessHost.Env("ZAN_CTL_PORT");
+        if (env != "") {
+            controlPort = Convert.ToInt32(env);
+            ctlPortFixed = true;
+            return controlPort;
+        }
+        if (workers.Count > 0) { return workers[0].port + 10000; }
+        return 19999;
+    }
+
+    // 服务器实例标识：自身可执行文件路径的哈希（同副本重启即同实例，与端口无关）。
+    private static string AppId() {
+        if (appId == "") {
+            long h = SharedTable.Hash(ProcessHost.SelfExe());
+            if (h < 0) { h = 0 - h; }
+            appId = Convert.ToString(h);
+        }
+        return appId;
+    }
+
+    private static string CtlPortFile() {
+        return Path.Combine(Path.GetTempPath(),
+            "zan-worker-" + AppId() + ".ctl");
+    }
+
+    // master 把实际认领的控制端口与实例令牌写入记录文件，供 stop/status/reload 寻址。
+    private static void RecordControlPort() {
+        File.WriteAllText(CtlPortFile(), Convert.ToString(ControlPort())
+            + " " + CtlToken());
+        #if !WINDOWS
+        // POSIX 上 temp 里的新文件默认 0644，任何本机用户可读走令牌、
+        // 进而伪造 PONG 冒充本实例 master。收紧到 0600（仅属主可读写）。
+        // Windows 无需处理：%TEMP% 在用户 profile 下，ACL 天然仅本用户。
+        chmod(CtlPortFile(), 384);
+        #endif
+    }
+
+    // 停机时删除控制端口记录文件。
+    private static void ForgetControlPort() {
+        File.Delete(CtlPortFile());
+    }
+
+    private static int RecordedControlPort() {
+        string f = CtlPortFile();
+        if (!File.Exists(f)) { return 0; }
+        string body = File.ReadAllText(f);
+        int port = 0;
+        for (int i = 0; i < body.Length; i = i + 1) {
+            int c = body[i] & 255;
+            if (c < 48 || c > 57) { break; }
+            port = port * 10 + (c - 48);
+        }
+        if (port < 1 || port > 65535) { return 0; }
+        return port;
+    }
+
+    // 本实例令牌：CSPRNG 16 字节的 32 位 hex。原先的
+    // "<pid>-<unix秒>" 可被本机任何进程按进程表+时间预算出来，从而在
+    // 控制端口上伪造 PONG 冒充本实例 master（影响 start 的占用判定与
+    // stop/status 的寻址结论）。令牌只做身份甄别，不是控制命令的鉴权
+    // 凭据——CSPRNG 不可用时退回旧形态，甄别仍然工作。
+    private static string CtlToken() {
+        if (ctlToken == "") {
+            byte[] rnd = RandomNumberGenerator.GetBytes(16);
+            if (rnd != null) {
+                ctlToken = ByteHex(rnd, 16);
+            } else {
+                ctlToken = Convert.ToString(ProcessHost.Pid()) + "-"
+                    + Convert.ToString(DateTime.UtcNow().ToUnixSeconds());
+            }
+        }
+        return ctlToken;
+    }
+
+    // 字节数组的低位在前 hex 编码（每字节两位）。
+    private static string ByteHex(byte[] b, int n) {
+        if (b == null || n <= 0) { return ""; }
+        return Convert.ToHexString(b, 0, n);
+    }
+
+    private static string RecordedCtlToken() {
+        string f = CtlPortFile();
+        if (!File.Exists(f)) { return ""; }
+        string body = File.ReadAllText(f);
+        int sp = 0 - 1;
+        for (int i = 0; i < body.Length; i = i + 1) {
+            if ((body[i] & 255) == 32) { sp = i; break; }
+        }
+        if (sp < 0) { return ""; }
+        return Worker.TrimEol(body.Substring(sp + 1));
+    }
+
+    // 去除字符串尾部的换行、空格与制表符。
+    private static string TrimEol(string s) {
+        int n = s.Length;
+        while (n > 0) {
+            int c = s[n - 1] & 255;
+            if (c != 10 && c != 13 && c != 32 && c != 9) { break; }
+            n = n - 1;
+        }
+        return s.Substring(0, n);
+    }
+
+    private static nint BindCtl(int port, bool reuse) {
+        nint s = Socket.CreateTcp();
+        if (s < 0) {
+            lastCtlErr = SocketErr();
+            return -1;
+        }
+        if (reuse) { Socket.SetReuseAddr(s); }
+        if (Socket.Bind(s, "127.0.0.1", port) != 0) {
+            lastCtlErr = SocketErr();
+            Socket.Close(s);
+            return -1;
+        }
+        return s;
+    }
+
+    static async nint ClaimControlPort() {
+        int want = ControlPort();
+        #if WINDOWS
+        nint s = BindCtl(want, false);
+        #else
+        nint s = BindCtl(want, true);
+        #endif
+        if (s >= 0) { return s; }
+        string wantErr = lastCtlErr;
+
+        int probed = await ProbeControlPort();
+        if (probed == Worker.CTL_OURS) {
+            Console.WriteLine("[Worker] FATAL: control port "
+                + Convert.ToString(want)
+                + " is served by a running master; stop it first"
+                + " (<app> stop), or start this one with --ctl-port N");
+            exit(1);
+        }
+
+        if (probed == Worker.CTL_FOREIGN || probed == Worker.CTL_UNKNOWN) {
+            if (ctlPortFixed) {
+                Console.WriteLine("[Worker] FATAL: control port "
+                    + Convert.ToString(want) + " is held by another program"
+                    + " that is not this app's master (" + wantErr
+                    + "); name a free one with --ctl-port N");
+                exit(1);
+            }
+            return MoveOffControlPort(want, wantErr);
+        }
+
+        s = BindCtl(want, true);
+        if (s >= 0) {
+            Console.WriteLine("[Worker] control port " + Convert.ToString(want)
+                + " was left behind by a previous run; reclaimed it");
+            return s;
+        }
+
+        if (ctlPortFixed) {
+            Console.WriteLine("[Worker] FATAL: cannot bind control port "
+                + Convert.ToString(want) + " (" + wantErr + ", retry: "
+                + lastCtlErr + "); nothing answers on it, so it is not a"
+                + " running master -- name a free one with --ctl-port N");
+            exit(1);
+        }
+
+        return MoveOffControlPort(want, wantErr);
+    }
+
+    private static nint MoveOffControlPort(int want, string wantErr) {
+        int probe = want + 1;
+        while (probe <= want + 64) {
+            nint s = BindCtl(probe, false);
+            if (s >= 0) {
+                controlPort = probe;
+                Console.WriteLine("[Worker] control port "
+                    + Convert.ToString(want) + " is taken (" + wantErr
+                    + "); using " + Convert.ToString(probe) + " instead");
+                return s;
+            }
+            probe = probe + 1;
+        }
+        Console.WriteLine("[Worker] FATAL: no free control port in "
+            + Convert.ToString(want) + "-" + Convert.ToString(want + 64)
+            + " (" + lastCtlErr + "); name one with --ctl-port N");
+        exit(1);
+        return -1;
+    }
+
+    // 运行 CLI 模式指令（start/stop/restart/reload/status）。
+    public static async void RunCommand() {
+        cliMode = true;
+        string cmd = "start";
+        bool detach = false;
+        for (int i = 0; i < Environment.ArgCount(); i = i + 1) {
+            string a = Environment.ArgAt(i);
+            if (a == "-d" || a == "--daemon") {
+                detach = true;
+            } else if (a == "--ctl-port" && i + 1 < Environment.ArgCount()) {
+                SetControlPort(Convert.ToInt32(Environment.ArgAt(i + 1)));
+            } else if (i == 0) {
+                cmd = a;
+            }
+        }
+
+        if (cmd == "stop") {
+            await SendCommand("STOP");
+            return;
+        }
+        if (cmd == "reload") {
+            await SendCommand("RELOAD");
+            return;
+        }
+        if (cmd == "status") {
+            await SendCommand("STATUS");
+            return;
+        }
+        if (cmd == "restart") {
+            await SendCommand("STOP");
+            await Task.Delay(1500);
+            if (!ctlPortFixed) { controlPort = 0; }
+            cmd = "start";
+        }
+        if (cmd != "start") {
+            Console.WriteLine("usage: " + Worker.Usage());
+            return;
+        }
+        if (detach) { daemonize = true; }
+        await RunAll();
+    }
+
+    static async void SendCommand(string cmd) {
+        Socket.Initialize();
+        if (!ctlPortFixed) {
+            int recorded = RecordedControlPort();
+            if (recorded > 0) { controlPort = recorded; }
+        }
+        if (await ProbeControlPort() == Worker.CTL_FOREIGN) {
+            Console.WriteLine("[Worker] control port "
+                + Convert.ToString(ControlPort()) + " is answered by another"
+                + " program, not by this app -- ignoring " + cmd);
+            return;
+        }
+        TcpClient c = await TcpClient.ConnectAsync("127.0.0.1", ControlPort(),
+            ctlProbeMs);
+        if (c == null || !c.IsConnected()) {
+            Console.WriteLine("[Worker] no server on control port "
+                + Convert.ToString(ControlPort()));
+            return;
+        }
+        int _s = await c.SendAsync(cmd + "\n");
+        string reply = "";
+        bool timedOut = false;
+        while (true) {
+            string chunk = await c.RecvAsync(4096, ctlCmdMs);
+            if (chunk.Length == 0) {
+                timedOut = Socket.LastRecvTimedOut();
+                break;
+            }
+            reply = reply + chunk;
+        }
+        c.Close();
+        if (reply.Length > 0) { Console.Write(reply); }
+        if (timedOut) {
+            Console.WriteLine("[Worker] control port "
+                + Convert.ToString(ControlPort()) + " accepted the connection"
+                + " but did not answer " + cmd + " within "
+                + Convert.ToString(ctlCmdMs / 1000) + "s; it is not a live"
+                + " master (leftover listening socket?)");
+        }
+    }
+
+    // 向控制端口发 PING 并按应答（含令牌核对）返回 CTL_FREE/CTL_OURS/CTL_FOREIGN/CTL_UNKNOWN。
+    static async int ProbeControlPort() {
+        TcpClient probe = await TcpClient.ConnectAsync("127.0.0.1",
+            ControlPort(), ctlProbeMs);
+        if (probe == null || !probe.IsConnected()) { return Worker.CTL_FREE; }
+        int _s = await probe.SendAsync("PING\n");
+        string reply = await probe.RecvAsync(64, ctlProbeMs);
+        probe.Close();
+        if (reply.Length < 4 || reply.Substring(0, 4) != "PONG") {
+            return Worker.CTL_FOREIGN;
+        }
+        List<string> f = SplitWords(reply);
+        if (f.Count < 3) { return Worker.CTL_UNKNOWN; }
+        string mine = RecordedCtlToken();
+        if (mine != "" && f[2] == mine) { return Worker.CTL_OURS; }
+        if (ctlToken != "" && f[2] == ctlToken) { return Worker.CTL_OURS; }
+        return Worker.CTL_FOREIGN;
+    }
+
+    // 诊断口：探当前控制端口被谁占着。
+    //   0 = 空闲（连不上，谁都没在监听）
+    //   1 = 本应用的 master 在监听
+    //   2 = 外来进程在监听（应答不是本应用的 PING/PONG 协议）
+    //   3 = 状态不明（应答像本应用的协议，但字段不足）
+    public static async int ProbeControlPortStatus() {
+        return await ProbeControlPort();
+    }
+
+    static async void SingleProcessControlLoop() {
+        #if WINDOWS
+        nint ctlSock = BindCtl(ControlPort(), false);
+        #else
+        nint ctlSock = BindCtl(ControlPort(), true);
+        #endif
+        if (ctlSock < 0) {
+            if (await ProbeControlPort() != Worker.CTL_FREE) { return; }
+            ctlSock = BindCtl(ControlPort(), true);
+        }
+        if (ctlSock < 0 && !ctlPortFixed) {
+            int want = ControlPort();
+            int probe = want + 1;
+            while (probe <= want + 64 && ctlSock < 0) {
+                ctlSock = BindCtl(probe, false);
+                if (ctlSock >= 0) { controlPort = probe; }
+                probe = probe + 1;
+            }
+        }
+        if (ctlSock < 0) { return; }
+        RecordControlPort();
+        Socket.Listen(ctlSock, 16);
+        Socket.SetNonBlocking(ctlSock);
+        while (true) {
+            nint s = await Socket.AcceptAsync(ctlSock);
+            if (s < 0) { continue; }
+            Socket.SetNonBlocking(s);
+            Task.Spawn(HandleSelfCommand(s));
+        }
+    }
+
+    // 单进程服务器的控制命令处理：与 master 相同的 PING/STATUS/STOP/
+    // RELOAD；RELOAD 回复提示改用 restart（没有可替换的 worker 进程）。
+    static async void HandleSelfCommand(nint sock) {
+        TcpClient conn = TcpClient.FromSocket(sock);
+        string line = "";
+        while (true) {
+            int nl = IndexOfByte(line, 10);
+            if (nl >= 0) { line = line.Substring(0, nl); break; }
+            string chunk = await conn.RecvAsync(64);
+            if (chunk.Length == 0) { conn.Close(); return; }
+            line = line + chunk;
+        }
+        List<string> f = SplitWords(line);
+        if (f.Count == 0) { conn.Close(); return; }
+        if (f[0] == "PING") {
+            int _p = await conn.SendAsync("PONG "
+                + Convert.ToString(ProcessHost.Pid()) + " " + CtlToken()
+                + "\n");
+            conn.Close();
+            return;
+        }
+        if (f[0] == "STATUS") {
+            int _s = await conn.SendAsync(StatusText());
+            conn.Close();
+            return;
+        }
+        if (f[0] == "STOP") {
+            StopAll();
+            int _r = await conn.SendAsync("stopped\n");
+            conn.Close();
+            await DrainThenExit();
+            return;
+        }
+        if (f[0] == "RELOAD") {
+            int _l = await conn.SendAsync("single-process server: use restart\n");
+            conn.Close();
+            return;
+        }
+        conn.Close();
+    }
+
+    static async void HandleCliCommand(TcpClient conn, string cmd) {
+        if (cmd == "PING") {
+            int _p = await conn.SendAsync("PONG "
+                + Convert.ToString(ProcessHost.Pid()) + " " + CtlToken()
+                + "\n");
+            conn.Close();
+            return;
+        }
+        if (cmd == "STATUS") {
+            int _s = await conn.SendAsync(StatusText());
+            conn.Close();
+            return;
+        }
+        if (cmd == "STOP") {
+            stopping = true;
+            int _r = await conn.SendAsync("stopping "
+                + Convert.ToString(ctlConn.Count) + " worker(s)\n");
+            conn.Close();
+            await StopWorkersAndExit();
+            return;
+        }
+        int _l = await conn.SendAsync("reloading "
+            + Convert.ToString(ctlConn.Count) + " worker(s)\n");
+        conn.Close();
+        Task.Spawn(ReloadWorkers());
+    }
+
+    // 依次向所有 worker 发 QUIT，等待它们的控制连接关闭（上限 30s）后
+    // 清理端口记录与统计表并 exit(0)。
+    static async void StopWorkersAndExit() {
+        for (int i = 0; i < ctlConn.Count; i = i + 1) {
+            int _q = await ctlConn[i].SendAsync("QUIT\n");
+        }
+        int waited = 0;
+        while (ctlConn.Count > 0 && waited < 30000) {
+            await Task.Delay(200);
+            waited = waited + 200;
+        }
+        ForgetControlPort();
+        StatsDestroy();
+        await RunShutdownHooks();
+        Console.WriteLine("[Worker] master stopped");
+        exit(0);
+    }
+
+    static async void ReloadWorkers() {
+        int total = ctlConn.Count;
+        int done = 0;
+        while (done < total && ctlConn.Count > 0) {
+            TcpClient victim = ctlConn[0];
+            int wid = ctlWid[0];
+            int before = ctlConn.Count;
+            int _q = await victim.SendAsync("QUIT\n");
+            int waited = 0;
+            while (waited < 30000 && ctlConn.Count >= before) {
+                await Task.Delay(100);
+                waited = waited + 100;
+            }
+            Console.WriteLine("[Worker] reloaded worker " + Convert.ToString(wid));
+            done = done + 1;
+            await Task.Delay(1500);
+        }
+        Console.WriteLine("[Worker] reload complete");
+    }
+}

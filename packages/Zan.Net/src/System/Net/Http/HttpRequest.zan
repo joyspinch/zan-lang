@@ -109,27 +109,19 @@ public class HttpRequest {
     // 个字节解析为请求。字节数由调用方给出：连接循环从套接字
     // 得到的是精确计数，而 <c>raw.Length</c> 会在正文的第一个 NUL
     // 处停下，据此切分正文会把二进制上传截断。
-    public static HttpRequest Parse(string raw, int rawLen) {
-        HttpRequest req = new HttpRequest();
-        req.raw = raw;
-        int len = rawLen;
-        if (len < 0) { len = 0; }
-        if (len == 0) { return req; }
-
-        // 请求行：扫描到 '\n'，再去掉末尾的 '\r'。
-        int lineEnd = 0;
+    // 解析 HTTP 请求行：抽取请求方法、路径、查询串与协议版本。
+    private static bool ParseRequestLine(HttpRequest req, string raw, int len, out int lineEnd) {
+        lineEnd = 0;
         for (; lineEnd < len && (raw[lineEnd] & 255) != 10; lineEnd = lineEnd + 1) {
         }
         if (lineEnd >= len || lineEnd == 0 || (raw[lineEnd - 1] & 255) != 13) {
-            req.parseStatus = 400;
-            return req;
+            return false;
         }
         int rlEnd = lineEnd - 1;
         for (int ri = 0; ri < rlEnd; ri = ri + 1) {
             int b = raw[ri] & 255;
             if (b < 32 && b != 9 || b == 127) {
-                req.parseStatus = 400;
-                return req;
+                return false;
             }
         }
 
@@ -177,10 +169,10 @@ public class HttpRequest {
         } else if (versionStart < versionStop) {
             req.version = raw.Substring(versionStart, versionStop - versionStart);
         } else {
-            req.parseStatus = 400;
+            return false;
         }
         if (req.method.Length == 0 || pathStart >= pathEnd) {
-            req.parseStatus = 400;
+            return false;
         }
 
         // 拆分路径和查询字符串
@@ -227,25 +219,24 @@ public class HttpRequest {
             }
             req.queryString = "";
         }
+        return true;
+    }
 
-        // 原地解析头部：常见字段按字节
-        // （大小写不敏感）与缓冲区匹配，rawHeaders 是整个区块的
-        // 一个切片——不按行或按名称/值分配内存。
-        int pos = lineEnd + 1;
-        int headersStart = pos;
-        int headersStop = pos;
-        bool headersEnded = false;
-        // 定界状态：Content-Length 用 64 位累加并检查溢出，
-        // 重复出现必须一致，Transfer-Encoding 绝不静默忽略
-        // （见各分支）——这三者是请求走私（RFC 7230 §3.3.2/§3.3.3）
-        // 的入口，一旦发现立即置 parseStatus，服务器据此拒绝。
+    // 解析请求头块：验证语法、提取核心字段并检查走私定界。返回正文起始下标，失败置 parseStatus 返回 -1。
+    private static int ParseHeadersBlock(HttpRequest req, string raw, int len, int pos,
+            out bool clSeen, out bool teSeen, out int hostCount, out bool connClose, out bool connKeep,
+            out int headersStart, out int headersStop) {
+        headersStart = pos;
+        headersStop = pos;
+        clSeen = false;
+        teSeen = false;
+        hostCount = 0;
+        connClose = false;
+        connKeep = false;
         long clAcc = 0;
-        bool clSeen = false;
         long firstCl = 0;
-        bool teSeen = false;
-        int hostCount = 0;
-        bool connClose = false;
-        bool connKeep = false;
+        bool headersEnded = false;
+
         while (pos < len) {
             int hEnd = pos;
             while (hEnd < len && (raw[hEnd] & 255) != 10) {
@@ -253,11 +244,10 @@ public class HttpRequest {
             }
             if (hEnd >= len || hEnd == pos || (raw[hEnd - 1] & 255) != 13) {
                 req.parseStatus = 400;
-                return req;
+                return -1;
             }
             int lineStop = hEnd - 1;
             if (lineStop == pos) {
-                // 空行 = 头部结束
                 pos = hEnd + 1;
                 headersEnded = true;
                 break;
@@ -268,161 +258,123 @@ public class HttpRequest {
                 int hb = raw[hi] & 255;
                 if ((hb < 32 && hb != 9) || hb == 127) {
                     req.parseStatus = 400;
-                    return req;
+                    return -1;
                 }
             }
-            // 解析常见头部
             int colonPos = pos;
             while (colonPos < lineStop && (raw[colonPos] & 255) != 58) {
                 colonPos = colonPos + 1;
             }
             if (colonPos >= lineStop || colonPos == pos) {
-                // 非空行无冒号或冒号位于行首（空字段名）：废弃的 obs-fold 折行或畸形头部行，
-                // RFC 7230 §3.2.4 / RFC 9112 §5.1 要求拒绝。
                 req.parseStatus = 400;
-                return req;
+                return -1;
             }
-            if (true) {
-                // 冒号之前出现 SP/HTAB = "space before colon" 混淆头
-                // （RFC 9112 §5.1 要求拒绝）：`Content-Length : 5` 之类的
-                // 行按原名分流会落进未知头分支，clSeen/teSeen 置不上，
-                // 在容忍这种行数的中间件后面就是请求走私前置条件。
-                bool obfuscated = false;
-                for (int si = pos; si < colonPos; si = si + 1) {
-                    int sc = raw[si] & 255;
-                    bool token = (sc >= 48 && sc <= 57)
-                        || (sc >= 65 && sc <= 90) || (sc >= 97 && sc <= 122)
-                        || sc == 33 || sc == 35 || sc == 36 || sc == 37
-                        || sc == 38 || sc == 39 || sc == 42 || sc == 43
-                        || sc == 45 || sc == 46 || sc == 94 || sc == 95
-                        || sc == 96 || sc == 124 || sc == 126;
-                    if (!token) { obfuscated = true; break; }
+
+            bool obfuscated = false;
+            for (int si = pos; si < colonPos; si = si + 1) {
+                int sc = raw[si] & 255;
+                bool token = (sc >= 48 && sc <= 57)
+                    || (sc >= 65 && sc <= 90) || (sc >= 97 && sc <= 122)
+                    || sc == 33 || sc == 35 || sc == 36 || sc == 37
+                    || sc == 38 || sc == 39 || sc == 42 || sc == 43
+                    || sc == 45 || sc == 46 || sc == 94 || sc == 95
+                    || sc == 96 || sc == 124 || sc == 126;
+                if (!token) { obfuscated = true; break; }
+            }
+            if (obfuscated) {
+                req.parseStatus = 400;
+                return -1;
+            }
+            int vStart = HttpRequest.TrimOwsStart(raw, colonPos + 1, lineStop);
+            int vStop = HttpRequest.TrimOwsStop(raw, vStart, lineStop);
+            int nameLen = colonPos - pos;
+
+            if (nameLen == 4 && RegionIs(raw, pos, colonPos, "host")) {
+                hostCount = hostCount + 1;
+                if (hostCount > 1 || vStart == vStop) { req.parseStatus = 400; }
+                req.host = raw.Substring(vStart, vStop - vStart);
+            } else if (nameLen == 12 && RegionIs(raw, pos, colonPos, "content-type")) {
+                req.contentType = raw.Substring(vStart, vStop - vStart);
+            } else if (nameLen == 13 && RegionIs(raw, pos, colonPos, "authorization")) {
+                if (req.authorization.Length == 0) {
+                    req.authorization = raw.Substring(vStart, vStop - vStart);
                 }
-                if (obfuscated) {
-                    req.parseStatus = 400;
-                    return req;
+            } else if (nameLen == 6 && RegionIs(raw, pos, colonPos, "cookie")) {
+                if (req.cookie.Length == 0) {
+                    req.cookie = raw.Substring(vStart, vStop - vStart);
                 }
-                int vStart = HttpRequest.TrimOwsStart(raw, colonPos + 1,
-                    lineStop);
-                int vStop = HttpRequest.TrimOwsStop(raw, vStart, lineStop);
-                // 头名先按长度分流：本方法关心的七个头名长度互不相同
-                // （4/6/10/12/13/14/17），所以每行最多做一次 RegionIs。
-                // 逐个 RegionIs 试下去的话，每个头名都要把余下的候选串
-                // 全量 strlen 一遍——实测每请求 36 次比较、36 次 strlen。
-                int nameLen = colonPos - pos;
-                if (nameLen == 4 && RegionIs(raw, pos, colonPos, "host")) {
-                    hostCount = hostCount + 1;
-                    if (hostCount > 1 || vStart == vStop) { req.parseStatus = 400; }
-                    req.host = raw.Substring(vStart, vStop - vStart);
-                } else if (nameLen == 12
-                           && RegionIs(raw, pos, colonPos, "content-type")) {
-                    req.contentType = raw.Substring(vStart, vStop - vStart);
-                } else if (nameLen == 13
-                           && RegionIs(raw, pos, colonPos, "authorization")) {
-                    // 重复出现取第一条，与按名查找的结果一致。
-                    if (req.authorization.Length == 0) {
-                        req.authorization = raw.Substring(vStart, vStop - vStart);
+            } else if (nameLen == 10 && RegionIs(raw, pos, colonPos, "user-agent")) {
+                if (req.userAgent.Length == 0) {
+                    req.userAgent = raw.Substring(vStart, vStop - vStart);
+                }
+            } else if (nameLen == 14 && RegionIs(raw, pos, colonPos, "content-length")) {
+                clAcc = 0;
+                bool bad = vStart == vStop;
+                int di = vStart;
+                while (di < vStop) {
+                    int d = raw[di] & 255;
+                    if (d < 48 || d > 57) { bad = true; break; }
+                    clAcc = clAcc * 10 + (d - 48);
+                    if (clAcc > 2147483647) { bad = true; break; }
+                    di = di + 1;
+                }
+                if (bad) {
+                    bool overflow = vStart != vStop;
+                    int ci = vStart;
+                    while (ci < vStop) {
+                        int dd = raw[ci] & 255;
+                        if (dd < 48 || dd > 57) { overflow = false; break; }
+                        ci = ci + 1;
                     }
-                } else if (nameLen == 6
-                           && RegionIs(raw, pos, colonPos, "cookie")) {
-                    if (req.cookie.Length == 0) {
-                        req.cookie = raw.Substring(vStart, vStop - vStart);
-                    }
-                } else if (nameLen == 10
-                           && RegionIs(raw, pos, colonPos, "user-agent")) {
-                    if (req.userAgent.Length == 0) {
-                        req.userAgent = raw.Substring(vStart, vStop - vStart);
-                    }
-                } else if (nameLen == 14
-                           && RegionIs(raw, pos, colonPos, "content-length")) {
-                    // 用 64 位累加：32 位 int 下 `4294967297` 会回绕成 1，
-                    // 剩下的正文就被当成下一条流水线请求（经典走私）。
-                    // 任何非数字字符、或超出 int 上限的值都置 413/400，
-                    // 绝不静默截断。
-                    clAcc = 0;
-                    bool bad = vStart == vStop;
-                    int di = vStart;
-                    while (di < vStop) {
-                        int d = raw[di] & 255;
-                        if (d < 48 || d > 57) { bad = true; break; }
-                        clAcc = clAcc * 10 + (d - 48);
-                        if (clAcc > 2147483647) { bad = true; break; }
-                        di = di + 1;
-                    }
-                    if (bad) {
-                        // 非数字 = 畸形头部；溢出 = 超限。区分以便给
-                        // 更精确的状态码，但两者都禁止继续信任该值。
-                        bool overflow = vStart != vStop;
-                        int ci = vStart;
-                        while (ci < vStop) {
-                            int dd = raw[ci] & 255;
-                            if (dd < 48 || dd > 57) { overflow = false; break; }
-                            ci = ci + 1;
-                        }
-                        if (overflow) {
-                            req.parseStatus = 413;
-                        } else {
-                            req.parseStatus = 400;
-                        }
-                    } else if (clSeen) {
-                        // 第二个 Content-Length：与第一个不一致即走私
-                        // （RFC 7230 §3.3.2）。相同值按合法处理。
-                        if (firstCl != clAcc) { req.parseStatus = 400; }
+                    if (overflow) {
+                        req.parseStatus = 413;
                     } else {
-                        clSeen = true;
-                        firstCl = clAcc;
-                        req.contentLength = (int)clAcc;
+                        req.parseStatus = 400;
                     }
-                } else if (nameLen == 17
-                           && RegionIs(raw, pos, colonPos, "transfer-encoding")) {
-                    // 只有值恰好是 chunked 时正文才自定界
-                    // （RFC 7230 §3.3.3）。其它编码（gzip 等）或
-                    // 叠加编码无法据此找到正文结尾，仍按未实现处理。
-                    // 解码器只实现单个 chunked；重复字段和编码列表
-                    // 必须拒绝，不能选择性忽略与下一跳不一致的编码。
-                    req.chunked = !teSeen && HttpRequest.RegionIs(raw,
-                        vStart, vStop, "chunked");
-                    // 服务器不实现 chunked 解码，绝不能忽略
-                    // Transfer-Encoding——否则按 Content-Length（或无）
-                    // 切分正文，而真实正文是分块编码，剩余 chunk 就被
-                    // 当成下一条请求。RFC 7230 §3.3.3：TE 与 CL 同时
-                    // 出现 → 400（冲突）；单独 TE（chunked）→ 501。
-                    // 顺序无关，循环结束后统一裁决。
-                    teSeen = true;
-                } else if (nameLen == 10
-                           && RegionIs(raw, pos, colonPos, "connection")) {
-                    int t = vStart;
-                    while (t < lineStop) {
-                        int tEnd = t;
-                        while (tEnd < lineStop && (raw[tEnd] & 255) != 44) {
-                            tEnd = tEnd + 1;
-                        }
-                        int tStop = HttpRequest.TrimOwsStop(raw, t, tEnd);
-                        t = HttpRequest.TrimOwsStart(raw, t, tStop);
-                        if (RegionIs(raw, t, tStop, "close")) { connClose = true; }
-                        if (RegionIs(raw, t, tStop, "keep-alive")) { connKeep = true; }
-                        t = tEnd + 1;
-                        t = HttpRequest.TrimOwsStart(raw, t, lineStop);
+                } else if (clSeen) {
+                    if (firstCl != clAcc) { req.parseStatus = 400; }
+                } else {
+                    clSeen = true;
+                    firstCl = clAcc;
+                    req.contentLength = (int)clAcc;
+                }
+            } else if (nameLen == 17 && RegionIs(raw, pos, colonPos, "transfer-encoding")) {
+                req.chunked = !teSeen && HttpRequest.RegionIs(raw, vStart, vStop, "chunked");
+                teSeen = true;
+            } else if (nameLen == 10 && RegionIs(raw, pos, colonPos, "connection")) {
+                int t = vStart;
+                while (t < lineStop) {
+                    int tEnd = t;
+                    while (tEnd < lineStop && (raw[tEnd] & 255) != 44) {
+                        tEnd = tEnd + 1;
                     }
+                    int tStop = HttpRequest.TrimOwsStop(raw, t, tEnd);
+                    t = HttpRequest.TrimOwsStart(raw, t, tStop);
+                    if (RegionIs(raw, t, tStop, "close")) { connClose = true; }
+                    if (RegionIs(raw, t, tStop, "keep-alive")) { connKeep = true; }
+                    t = tEnd + 1;
+                    t = HttpRequest.TrimOwsStart(raw, t, lineStop);
                 }
             }
             pos = hEnd + 1;
         }
         if (!headersEnded) {
             req.parseStatus = 400;
-            return req;
+            return -1;
         }
-        // Transfer-Encoding 与 Content-Length 的共存裁决
-        // （RFC 7230 §3.3.3）：两者同时出现是走私特征 → 400；
-        // 只有 TE（chunked，未实现）→ 501。
+        return pos;
+    }
+
+    // 裁决请求语义、校验 RFC 7230 定界共存规则并切分正文。
+    private static void FinalizeBodyAndSemantics(HttpRequest req, string raw, int len, int pos,
+            bool clSeen, bool teSeen, int hostCount, bool connClose, bool connKeep,
+            int headersStart, int headersStop) {
         if (RegionIs(req.version, 0, req.version.Length, "http/1.0")) {
             req.keepAlive = connKeep;
         } else {
             req.keepAlive = !connClose;
         }
         if (teSeen && req.parseStatus == 0) {
-            // TE 与 CL 同时出现是走私特征 → 400。单独的 chunked
-            // 由连接循环解码；其它编码找不到正文边界 → 501。
             if (clSeen) {
                 req.parseStatus = 400;
                 req.chunked = false;
@@ -440,10 +392,6 @@ public class HttpRequest {
             req.rawHeaders = raw.Substring(headersStart, headersStop - headersStart);
         }
 
-        // 正文。pos 此时指向头部块之后的第一个字节；缓冲区里的
-        // 剩余字节在流水线连接上是"本请求正文 + 下一条请求"，因此
-        // 最多取 contentLength 字节；剩下的由调用方（连接循环）
-        // 按 bodyStart/bodyLength 切分并留到下轮。
         req.bodyStart = pos;
         if (pos < len && !req.chunked) {
             int avail = len - pos;
@@ -452,7 +400,39 @@ public class HttpRequest {
             req.body = raw.Substring(pos, take);
             req.bodyLength = take;
         }
+    }
 
+    // 把 raw 开头的 rawLen 个字节解析为请求。
+    public static HttpRequest Parse(string raw, int rawLen) {
+        HttpRequest req = new HttpRequest();
+        req.raw = raw;
+        int len = rawLen;
+        if (len < 0) { len = 0; }
+        if (len == 0) { return req; }
+
+        int lineEnd = 0;
+        if (!HttpRequest.ParseRequestLine(req, raw, len, out lineEnd)) {
+            req.parseStatus = 400;
+            return req;
+        }
+
+        bool clSeen = false;
+        bool teSeen = false;
+        int hostCount = 0;
+        bool connClose = false;
+        bool connKeep = false;
+        int headersStart = 0;
+        int headersStop = 0;
+        int pos = HttpRequest.ParseHeadersBlock(req, raw, len, lineEnd + 1,
+            out clSeen, out teSeen, out hostCount, out connClose, out connKeep,
+            out headersStart, out headersStop);
+        if (pos < 0) {
+            return req;
+        }
+
+        HttpRequest.FinalizeBodyAndSemantics(req, raw, len, pos,
+            clSeen, teSeen, hostCount, connClose, connKeep,
+            headersStart, headersStop);
         return req;
     }
 
