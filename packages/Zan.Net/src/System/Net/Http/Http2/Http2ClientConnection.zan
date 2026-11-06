@@ -218,14 +218,27 @@ public class Http2ClientConnection : IDisposable {
         NativeMemory.Copy((nint)fullHdrPkt + 9, (nint)hpackBlock, hpackBlock.Length);
         await this.SendRawAsync(fullHdrPkt, fullHdrPkt.Length);
 
-        // 4. 发送可选的 DATA 帧
+        // 4. 发送可选的 DATA 帧（RFC 7540 §4.1: 严格切片为不超过 16KB 帧上限的序列）
         if (hasBody) {
             byte[] bodyBytes = body.ToBytes();
-            byte[] dataFrameHdr = Http2Frame.EncodeHeader(bodyBytes.Length, Http2FrameType.DATA, Http2Flags.END_STREAM, sid);
-            byte[] fullDataPkt = new byte[9 + bodyBytes.Length];
-            NativeMemory.Copy((nint)fullDataPkt, (nint)dataFrameHdr, 9);
-            NativeMemory.Copy((nint)fullDataPkt + 9, (nint)bodyBytes, bodyBytes.Length);
-            await this.SendRawAsync(fullDataPkt, fullDataPkt.Length);
+            int offset = 0;
+            int totalLen = bodyBytes.Length;
+            int maxChunk = 16384; // RFC 7540 默认单帧上限
+
+            while (offset < totalLen) {
+                int remaining = totalLen - offset;
+                int chunkSize = remaining < maxChunk ? remaining : maxChunk;
+                bool isLast = (offset + chunkSize >= totalLen);
+                int dataFlags = isLast ? Http2Flags.END_STREAM : 0;
+
+                byte[] dataFrameHdr = Http2Frame.EncodeHeader(chunkSize, Http2FrameType.DATA, dataFlags, sid);
+                byte[] fullDataPkt = new byte[9 + chunkSize];
+                NativeMemory.Copy((nint)fullDataPkt, (nint)dataFrameHdr, 9);
+                NativeMemory.Copy((nint)fullDataPkt + 9, (nint)bodyBytes + offset, chunkSize);
+                await this.SendRawAsync(fullDataPkt, fullDataPkt.Length);
+
+                offset = offset + chunkSize;
+            }
         }
 
         // 5. 在当前流的专属门语上异步挂起，等待响应数据到达唤醒

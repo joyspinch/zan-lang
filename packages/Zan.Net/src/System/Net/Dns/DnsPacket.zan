@@ -19,6 +19,8 @@ public class DnsPacket {
     public bool recursionAvailable;
     public List<DnsRecord> questions;
     public List<DnsRecord> answers;
+    public List<DnsRecord> additionals;
+    public int ednsPayloadSize;
 
     public DnsPacket() {
         this.transactionId = 0;
@@ -30,6 +32,8 @@ public class DnsPacket {
         this.recursionAvailable = false;
         this.questions = new List<DnsRecord>();
         this.answers = new List<DnsRecord>();
+        this.additionals = new List<DnsRecord>();
+        this.ednsPayloadSize = 512;
     }
 
     private static string ToHex16(int val) {
@@ -63,8 +67,13 @@ public class DnsPacket {
         buf.Add(0); // 根标签结尾
     }
 
-    // 构建 RFC 1035 标准递归 DNS 查询包
+    // 构建 RFC 1035 / RFC 6891 标准递归 DNS 查询包（默认附带 EDNS0 4096 字节载荷通告）
     public static byte[] BuildQuery(string domain, int queryType, int txId) {
+        return DnsPacket.BuildQuery(domain, queryType, txId, 4096);
+    }
+
+    // 构建指定 EDNS0 UDP 接收缓冲区上限的 DNS 查询包（ednsPayloadSize <= 512 时退化为标准 RFC 1035 基础报文）
+    public static byte[] BuildQuery(string domain, int queryType, int txId, int ednsPayloadSize) {
         List<byte> buf = new List<byte>();
 
         // 1. Header (12 字节)
@@ -82,9 +91,15 @@ public class DnsPacket {
         // NSCOUNT = 0
         buf.Add(0);
         buf.Add(0);
-        // ARCOUNT = 0
-        buf.Add(0);
-        buf.Add(0);
+        // ARCOUNT = (ednsPayloadSize > 512) ? 1 : 0
+        bool hasEdns = ednsPayloadSize > 512;
+        if (hasEdns) {
+            buf.Add(0);
+            buf.Add(1);
+        } else {
+            buf.Add(0);
+            buf.Add(0);
+        }
 
         // 2. Question Section
         DnsPacket.EncodeDomainName(buf, domain);
@@ -94,6 +109,21 @@ public class DnsPacket {
         // QCLASS = 1 (IN)
         buf.Add(0);
         buf.Add(1);
+
+        // 3. RFC 6891 EDNS0 OPT 伪资源记录（附加在 Additional Section）
+        if (hasEdns) {
+            buf.Add(0); // 根域名空标签 (Root)
+            buf.Add(0);
+            buf.Add(41); // TYPE = OPT (41)
+            buf.Add((byte)((ednsPayloadSize >> 8) & 255));
+            buf.Add((byte)(ednsPayloadSize & 255)); // CLASS = UDP Payload Size (4096)
+            buf.Add(0);
+            buf.Add(0);
+            buf.Add(0);
+            buf.Add(0); // EXT-RCODE / VERSION(0) / FLAGS
+            buf.Add(0);
+            buf.Add(0); // RDLENGTH = 0 (无额外 Option 键值对)
+        }
 
         byte[] res = new byte[buf.Count];
         for (int i = 0; i < buf.Count; i = i + 1) {
@@ -232,6 +262,38 @@ public class DnsPacket {
             DnsRecord rec = new DnsRecord(name, rtype, ttl, val);
             rec.recordClass = rclass;
             pkt.answers.Add(rec);
+        }
+
+        // 3. 跳过 NS Authority 区段
+        for (int s = 0; s < nsCount; s = s + 1) {
+            DnsPacket.ReadName(data, length, offsetBox, 0);
+            int pos = offsetBox[0];
+            if (pos + 10 > length) { break; }
+            int rdlen = ((data[pos + 8] & 255) << 8) | (data[pos + 9] & 255);
+            offsetBox[0] = pos + 10 + rdlen;
+        }
+
+        // 4. 解析 Additional 区段（提取 RFC 6891 EDNS0 OPT 伪记录）
+        for (int r = 0; r < arCount; r = r + 1) {
+            string name = DnsPacket.ReadName(data, length, offsetBox, 0);
+            int pos = offsetBox[0];
+            if (pos + 10 > length) { break; }
+            int rtype = ((data[pos] & 255) << 8) | (data[pos + 1] & 255);
+            int rclass = ((data[pos + 2] & 255) << 8) | (data[pos + 3] & 255);
+            int ttl = ((data[pos + 4] & 255) << 24) | ((data[pos + 5] & 255) << 16)
+                    | ((data[pos + 6] & 255) << 8) | (data[pos + 7] & 255);
+            int rdlen = ((data[pos + 8] & 255) << 8) | (data[pos + 9] & 255);
+            pos = pos + 10;
+            offsetBox[0] = pos + rdlen;
+
+            DnsRecord arRec = new DnsRecord(name, rtype, ttl, "");
+            arRec.recordClass = rclass;
+            pkt.additionals.Add(arRec);
+
+            if (rtype == DnsRecordType.OPT) {
+                // RFC 6891 §6.1.2: CLASS 字段在 OPT RR 中承载请求方通告的 UDP Payload Size
+                pkt.ednsPayloadSize = rclass;
+            }
         }
 
         return pkt;
