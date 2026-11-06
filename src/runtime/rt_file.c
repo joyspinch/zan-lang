@@ -37,6 +37,10 @@
 #ifdef __APPLE__
 #include <mach-o/dyld.h>   /* _NSGetExecutablePath */
 #endif
+#if defined(__FreeBSD__) || defined(__DragonFly__) || defined(__OpenBSD__) || defined(__NetBSD__)
+#include <sys/types.h>
+#include <sys/sysctl.h>
+#endif
 #endif
 
 #if !defined(_WIN32) && !defined(O_NOFOLLOW)
@@ -127,7 +131,11 @@ long long zan_file_time(const char *path, int which) {
 #else
     struct stat st;
     if (stat(path, &st) != 0) return 0;
+#if defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__)
+    if (which == 1) return (long long)st.st_birthtime;
+#else
     if (which == 1) return (long long)st.st_ctime;
+#endif
     if (which == 2) return (long long)st.st_atime;
     return (long long)st.st_mtime;
 #endif
@@ -210,6 +218,13 @@ const char *zan_file_app_dir(void) {
         ssize_t n = readlink("/proc/self/exe", exe, sizeof(exe) - 1);
         if (n <= 0) exe[0] = 0;
         else exe[n] = 0;
+#elif defined(__FreeBSD__) || defined(__DragonFly__)
+        int mib[4] = { CTL_KERN, KERN_PROC, KERN_PROC_PATHNAME, -1 };
+        size_t cb = sizeof(exe);
+        if (sysctl(mib, 4, exe, &cb, NULL, 0) != 0) exe[0] = 0;
+#elif defined(__sun)
+        const char *p = getexecname();
+        if (p && strlen(p) < sizeof(exe)) strcpy(exe, p);
 #endif
         if (exe[0]) {
             char *fwd = strrchr(exe, '/');
@@ -307,7 +322,7 @@ static long long zan_file_attributes_at(const char *path) {
     struct stat st;
     if (stat(path, &st) != 0) return -1;
     long long r = 0;
-    if (access(path, W_OK) != 0) r |= 1;
+    if (!(st.st_mode & (S_IWUSR | S_IWGRP | S_IWOTH))) r |= 1;
     { const char *base = strrchr(path, '/');
       base = base ? base + 1 : path;
       if (base[0] == '.') r |= 2; }
