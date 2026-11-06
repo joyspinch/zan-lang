@@ -128,16 +128,16 @@ if (ui == null) { ui = new Panel(); }
             WxNetReq mr = WxNet.NewReq();
             WxNet.ApiGet(mr, "/api/auth/me", () => {
                 try {
-                    // 应答里没有 data 节点时 DataOf 返回 null——先存局部量再判空。
-                    JsonValue mrData = WxNet.DataOf(mr);
-                    if (WxNet.OkOf(mr) && mrData != null) {
-                        myId = mrData.Str("uid", "0");
-                        // 详情「发起人」按注册表解析人名，联系人端点
-                        // 不含自己——把自己的显示名补登记（幂等）。
-                        if (myId.Length > 0 && myId != "0") {
-                            WxData.WhoOnce("u:" + myId, WxNet.Account(),
-                                StyledText.Initial(WxNet.Account()));
-                        }
+                    if (WxNet.OkOf(mr)) {
+                        WxNet.ParseData(mr, (JsonDoc doc, int slot) => {
+                            myId = doc.Str(slot, "uid", "0");
+                            // 详情「发起人」按注册表解析人名，联系人端点
+                            // 不含自己——把自己的显示名补登记（幂等）。
+                            if (myId.Length > 0 && myId != "0") {
+                                WxData.WhoOnce("u:" + myId, WxNet.Account(),
+                                    StyledText.Initial(WxNet.Account()));
+                            }
+                        });
                     }
                 } catch (Exception ex) { this.Note(ex.Message); }
                 this.LoadAll();
@@ -155,11 +155,12 @@ if (ui == null) { ui = new Panel(); }
                 mine.Clear();
                 pool.Clear();
                 accept.Clear();
-                JsonValue aData = WxNet.DataOf(a);
-                if (WxNet.OkOf(a) && aData != null) {
-                    this.Fill(mine, aData.Get("mine"), 0);
-                    this.Fill(pool, aData.Get("pool"), 0);
-                    this.Fill(accept, aData.Get("accept"), 0);
+                if (WxNet.OkOf(a)) {
+                    WxNet.ParseData(a, (JsonDoc doc, int slot) => {
+                        this.Fill(mine, doc, doc.Get(slot, "mine"), 0);
+                        this.Fill(pool, doc, doc.Get(slot, "pool"), 0);
+                        this.Fill(accept, doc, doc.Get(slot, "accept"), 0);
+                    });
                 }
             } catch (Exception ex) { this.Note(ex.Message); }
             this.LoadTpls();
@@ -172,15 +173,19 @@ if (ui == null) { ui = new Panel(); }
             try {
                 tpls.Clear();
                 depts.Clear();
-                JsonValue bData = WxNet.DataOf(b);
-                if (WxNet.OkOf(b) && bData != null) {
-                    this.Fill(tpls, bData.Get("defs"), 1);
-                    JsonValue ds = bData.Get("depts");
-                    int dn = ds == null ? 0 : ds.Count();
-                    for (int i = 0; i < dn; i = i + 1) {
-                        depts.Add(WxDept.Of(ds.At(i).Str("id", ""),
-                            ds.At(i).Str("name", "")));
-                    }
+                if (WxNet.OkOf(b)) {
+                    WxNet.ParseData(b, (JsonDoc doc, int slot) => {
+                        this.Fill(tpls, doc, doc.Get(slot, "defs"), 1);
+                        int ds = doc.Get(slot, "depts");
+                        int dn = (ds >= 0 && doc.KindAt(ds) == 4) ? doc.Count(ds) : 0;
+                        for (int i = 0; i < dn; i = i + 1) {
+                            int it = doc.At(ds, i);
+                            if (it >= 0) {
+                                depts.Add(WxDept.Of(doc.Str(it, "id", ""),
+                                    doc.Str(it, "name", "")));
+                            }
+                        }
+                    });
                 }
             } catch (Exception ex) { this.Note(ex.Message); }
             this.LoadLifecycleProjects();
@@ -192,9 +197,10 @@ if (ui == null) { ui = new Panel(); }
         WxNet.ApiGet(c, "/api/lifecycle/projects", () => {
             try {
                 lifecycles.Clear();
-                JsonValue cData = WxNet.DataOf(c);
-                if (WxNet.OkOf(c) && cData != null) {
-                    this.Fill(lifecycles, cData.Get("projects"), 2);
+                if (WxNet.OkOf(c)) {
+                    WxNet.ParseData(c, (JsonDoc doc, int slot) => {
+                        this.Fill(lifecycles, doc, doc.Get(slot, "projects"), 2);
+                    });
                 }
             } catch (Exception ex) { this.Note(ex.Message); }
             this.Rebind();
@@ -202,10 +208,11 @@ if (ui == null) { ui = new Panel(); }
     }
 
     // 行数组 → 模型（kind 0 任务行 / 1 模板行 / 2 全生命周期项目）。
-    void Fill(List<WxWorkItem> into, JsonValue rows, int kind) {
-        int n = rows == null ? 0 : rows.Count();
+    void Fill(List<WxWorkItem> into, JsonDoc doc, int arrSlot, int kind) {
+        if (doc == null || arrSlot < 0 || doc.KindAt(arrSlot) != 4) { return; }
+        int n = doc.Count(arrSlot);
         for (int i = 0; i < n; i = i + 1) {
-            into.Add(WxWorkItem.Of(rows.At(i), kind));
+            into.Add(WxWorkItem.FromDoc(doc, doc.At(arrSlot, i), kind));
         }
     }
 
@@ -221,7 +228,7 @@ if (ui == null) { ui = new Panel(); }
             : tab == 2 ? "待我验收" : tab == 3 ? "模板" : "全链路项目";
         if (titleEl != null) {
             titleEl.SetProp("text", label
-                + "（" + Convert.ToString(shown.Count) + "）");
+                + "（" + shown.Count.ToString() + "）");
         }
         list.Bind(shown);
     }
@@ -246,11 +253,13 @@ if (ui == null) { ui = new Panel(); }
         WxNet.ApiGet(r, "/api/flow/flowinst?id="
             + Encoding.UrlEncode(instId), () => {
                 try {
-                    if (!WxNet.OkOf(r) || WxNet.DataOf(r) == null) {
+                    if (!WxNet.OkOf(r)) {
                         this.Note("详情拉取失败：" + WxNet.ErrOf(r));
                         return;
                     }
-                    this.BuildInstPanelDetail(WxFlowInstDetail.FromJson(WxNet.DataOf(r)));
+                    WxNet.ParseData(r, (JsonDoc doc, int slot) => {
+                        this.BuildInstPanelDetail(WxFlowInstDetail.FromDoc(doc, slot));
+                    });
                 } catch (Exception ex) { this.Note(ex.Message); }
             });
     }
@@ -260,11 +269,13 @@ if (ui == null) { ui = new Panel(); }
         WxNet.ApiGet(r, "/api/flow/flowtemplate?id="
             + Encoding.UrlEncode(id), () => {
                 try {
-                    if (!WxNet.OkOf(r) || WxNet.DataOf(r) == null) {
+                    if (!WxNet.OkOf(r)) {
                         this.Note("模板拉取失败：" + WxNet.ErrOf(r));
                         return;
                     }
-                    this.BuildTplPanelDetail(WxFlowDefDetail.FromJson(WxNet.DataOf(r)));
+                    WxNet.ParseData(r, (JsonDoc doc, int slot) => {
+                        this.BuildTplPanelDetail(WxFlowDefDetail.FromDoc(doc, slot));
+                    });
                 } catch (Exception ex) { this.Note(ex.Message); }
             });
     }
@@ -357,7 +368,7 @@ if (ui == null) { ui = new Panel(); }
         body.Add(Wx.Line());
         for (int i = 0; i < nn; i = i + 1) {
             WxFlowNodeItem n = d.nodes[i];
-            string line = Convert.ToString(i + 1) + ". " + n.name;
+            string line = (i + 1).ToString() + ". " + n.name;
             int tn = n.tasks != null ? n.tasks.Count : 0;
             if (tn > 0) {
                 WxFlowTaskItem t = n.tasks[tn - 1];
@@ -442,10 +453,6 @@ if (ui == null) { ui = new Panel(); }
         this.RequestRedrawHost();
     }
 
-    void BuildInstPanel(JsonValue d) {
-        this.BuildInstPanelDetail(WxFlowInstDetail.FromJson(d));
-    }
-
     /* ---- 形态二：模板详情 + 发起 ---- */
 
     void BuildTplPanelDetail(WxFlowDefDetail d) {
@@ -464,7 +471,7 @@ if (ui == null) { ui = new Panel(); }
         body.Add(Wx.Line());
         for (int i = 0; i < nn; i = i + 1) {
             WxFlowNodeItem n = d.nodes[i];
-            string line = Convert.ToString(i + 1) + ". " + n.name;
+            string line = (i + 1).ToString() + ". " + n.name;
             string uid = n.assignUserId;
             if (uid != "0") {
                 line = line + " · " + WxTaskSheet.Who(uid);
@@ -496,10 +503,6 @@ if (ui == null) { ui = new Panel(); }
 
         if (detailCol != null) { detailCol.visible = true; }
         this.RequestRedrawHost();
-    }
-
-    void BuildTplPanel(JsonValue d) {
-        this.BuildTplPanelDetail(WxFlowDefDetail.FromJson(d));
     }
 
     /* ---- 形态三：模板编辑器（新建 / 复用改造）----
@@ -601,19 +604,25 @@ if (ui == null) { ui = new Panel(); }
             this.Note("至少一个环节");
             return;
         }
-        string nodes = "[";
+        JsonWriter w = new JsonWriter();
+        w.StartArray();
         for (int i = 0; i < stages.Count; i = i + 1) {
             WxStageData d = stages[i];
             if (d.name.Length == 0) {
-                this.Note("第 " + Convert.ToString(i + 1) + " 个环节缺名称");
+                this.Note("第 " + (i + 1).ToString() + " 个环节缺名称");
                 return;
             }
-            if (i > 0) { nodes = nodes + ","; }
-            nodes = nodes + "{\"name\":\""
-                + Encoding.UrlEncode(d.name) + "\",\"assignUserId\":\""
-                + d.userId + "\",\"deptId\":\"" + d.deptId + "\"}";
+            w.StartObject();
+            w.WriteKey("name");
+            w.WriteValue(Encoding.UrlEncode(d.name));
+            w.WriteKey("assignUserId");
+            w.WriteValue(d.userId);
+            w.WriteKey("deptId");
+            w.WriteValue(d.deptId);
+            w.EndObject();
         }
-        nodes = nodes + "]";
+        w.EndArray();
+        string nodes = w.ToJson();
         WxNetReq r2 = WxNet.NewReq();
         WxNet.ApiPost(r2, "/api/flow/flowsave",
             "id=" + editDefId
@@ -643,17 +652,21 @@ if (ui == null) { ui = new Panel(); }
         WxNetReq r = WxNet.NewReq();
         WxNet.Get(r, "contacts", () => {
             try {
-                JsonValue rData = WxNet.DataOf(r);
-                if (!WxNet.OkOf(r) || rData == null) {
+                if (!WxNet.OkOf(r)) {
                     this.Note("联系人拉取失败：" + WxNet.ErrOf(r));
                     return;
                 }
-                JsonValue items = rData.Get("contacts");
-                int n = items == null ? 0 : items.Count();
-                for (int i = 0; i < n; i = i + 1) {
-                    contacts.Add(WxDept.Of(items.At(i).Str("id", "0"),
-                        items.At(i).Str("name", "?")));
-                }
+                WxNet.ParseData(r, (JsonDoc doc, int slot) => {
+                    int items = doc.Get(slot, "contacts");
+                    int n = (items >= 0 && doc.KindAt(items) == 4) ? doc.Count(items) : 0;
+                    for (int i = 0; i < n; i = i + 1) {
+                        int it = doc.At(items, i);
+                        if (it >= 0) {
+                            contacts.Add(WxDept.Of(doc.Str(it, "id", "0"),
+                                doc.Str(it, "name", "?")));
+                        }
+                    }
+                });
                 this.BuildPickPanel();
             } catch (Exception ex) { this.Note(ex.Message); }
         });
@@ -747,16 +760,18 @@ if (ui == null) { ui = new Panel(); }
         WxNet.ApiGet(r, "/api/lifecycle/detail?projectId="
             + Encoding.UrlEncode(projectId), () => {
                 try {
-                    if (!WxNet.OkOf(r) || WxNet.DataOf(r) == null) {
+                    if (!WxNet.OkOf(r)) {
                         this.Note("项目详情拉取失败：" + WxNet.ErrOf(r));
                         return;
                     }
-                    this.BuildLifecycleDetail(WxNet.DataOf(r));
+                    WxNet.ParseData(r, (JsonDoc doc, int slot) => {
+                        this.BuildLifecycleDetail(doc, slot);
+                    });
                 } catch (Exception ex) { this.Note(ex.Message); }
             });
     }
 
-    void BuildLifecycleDetail(JsonValue d) {
+    void BuildLifecycleDetail(JsonDoc d, int slot) {
         this.EnsureDetailBody();
         detailBody.RemoveAll();
         statusLbl = null;
@@ -764,19 +779,19 @@ if (ui == null) { ui = new Panel(); }
         Flex card = Flex.Column();
         card.name = "wxworkcard";
         card.AddClass("grow");
-        string pName = d.Str("name", "全生命周期项目");
+        string pName = d.Str(slot, "name", "全生命周期项目");
         Flex body = this.CardHead(pName, card);
 
-        string pId = d.Str("id", "");
-        string pNo = d.Str("projectNo", "");
-        string pCat = d.Str("category", "");
-        string pOwner = d.Str("ownerName", "");
-        string pStageName = d.Str("currentStageName", "");
-        string pGmv = d.Str("targetGmv", "0");
-        string pRoi = d.Str("targetRoi", "0");
-        string actGmv = d.Str("actualGmv", "0");
-        string actRoi = d.Str("actualRoi", "0");
-        string convId = d.Str("conversationId", "0");
+        string pId = d.Str(slot, "id", "");
+        string pNo = d.Str(slot, "projectNo", "");
+        string pCat = d.Str(slot, "category", "");
+        string pOwner = d.Str(slot, "ownerName", "");
+        string pStageName = d.Str(slot, "currentStageName", "");
+        string pGmv = d.Str(slot, "targetGmv", "0");
+        string pRoi = d.Str(slot, "targetRoi", "0");
+        string actGmv = d.Str(slot, "actualGmv", "0");
+        string actRoi = d.Str(slot, "actualRoi", "0");
+        string convId = d.Str(slot, "conversationId", "0");
 
         body.Add(Wx.Lbl("编号: " + pNo + " · 品类: " + pCat + " · 操盘总负责人: " + pOwner, "wxpsub"));
         body.Add(Wx.Lbl("当前阶段: " + pStageName + " | 目标GMV: ¥" + pGmv + " | 目标ROI: " + pRoi, "wxfavname"));
@@ -812,17 +827,18 @@ if (ui == null) { ui = new Panel(); }
         body.Add(btnRow);
         body.Add(Wx.Line());
 
-        JsonValue nodes = d.Get("nodes");
-        int count = nodes == null ? 0 : nodes.Count();
+        int nodes = d.Get(slot, "nodes");
+        int count = (nodes >= 0 && d.KindAt(nodes) == 4) ? d.Count(nodes) : 0;
         for (int i = 0; i < count; i = i + 1) {
-            JsonValue n = nodes.At(i);
-            string st = n.Str("stage", "");
-            string stName = n.Str("stageName", "");
-            string rName = n.Str("responsibleName", "待指派");
-            string aiRole = n.Str("aiAgentRole", "");
-            string nStatus = n.Str("status", "pending");
-            string aiAdvice = n.Str("aiSuggestion", "");
-            string summary = n.Str("deliverableSummary", "");
+            int n = d.At(nodes, i);
+            if (n < 0) { continue; }
+            string st = d.Str(n, "stage", "");
+            string stName = d.Str(n, "stageName", "");
+            string rName = d.Str(n, "responsibleName", "待指派");
+            string aiRole = d.Str(n, "aiAgentRole", "");
+            string nStatus = d.Str(n, "status", "pending");
+            string aiAdvice = d.Str(n, "aiSuggestion", "");
+            string summary = d.Str(n, "deliverableSummary", "");
 
             string statusZh = nStatus == "passed" ? "【已核准通过】"
                 : (nStatus == "in_progress" ? "【正在推进中】"

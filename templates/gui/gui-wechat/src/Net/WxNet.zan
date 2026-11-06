@@ -170,7 +170,7 @@ public class WxNet {
                 long fl = FileInfo.GetLength(r.localPath);
                 if (fl <= 0 || fl > 32 * 1024 * 1024) {
                     throw new Exception("file size out of range: "
-                        + Convert.ToString(fl));
+                        + fl.ToString());
                 }
                 int fileLen = (int)fl;
                 nh.SetCallPolicy(ExternalCallPolicy.Default()
@@ -269,39 +269,62 @@ public class WxNet {
        回调闭包直接捕获 req 引用读） ---- */
 
     // 本次请求是否成功（HTTP 200 且 body 的 code 是成功值）。
-    //
-    // 服务端有两代信封：老的 Zan.Web 用字符串 "0000"，现在的
-    // ApiController 用数字 0。客户端只认一种就会把另一代的成功应答
-    // 当成失败（页面永远空着，还看不出错在哪）。两个都认。
-    static bool OkOf(WxNetReq r) {
-        if (r.err != null && r.err.Length > 0) { return false; }
+    public static bool OkOf(WxNetReq r) {
+        if (r == null || (r.err != null && r.err.Length > 0)) { return false; }
         if (r.status != 200) { return false; }
-        JsonValue v = JsonValue.ParseLenient(r.respBody == null ? "" : r.respBody);
-        if (v == null) { return false; }
-        string code = v.Str("code", "");
-        return code == "0000" || code == "0";
+        string body = r.respBody == null ? "" : r.respBody.Trim();
+        if (body.Length == 0) { return false; }
+        bool ok = false;
+        try {
+            JsonDoc.ParseScoped(body, (JsonDoc doc) => {
+                if (doc.KindAt(0) == 5) {
+                    string code = doc.Str(0, "code", "");
+                    if (code == "0000" || code == "0") { ok = true; }
+                    else if (doc.Long(0, "code", -1L) == 0L) { ok = true; }
+                }
+            });
+        } catch (Exception) { }
+        return ok;
     }
 
     // 请求错误文案（网络 err > HTTP 状态 > body msg）。
-    static string ErrOf(WxNetReq r) {
+    public static string ErrOf(WxNetReq r) {
+        if (r == null) { return ""; }
         if (r.err != null && r.err.Length > 0) { return r.err; }
         if (r.status != 200) {
             if (r.status == 401) { WxNet.DropSession(); }
-            JsonValue v = JsonValue.ParseLenient(r.respBody == null ? "" : r.respBody);
-            if (v != null) {
-                string m = v.Str("msg", "");
-                if (m.Length > 0) { return m; }
+            string body = r.respBody == null ? "" : r.respBody.Trim();
+            string m = "";
+            if (body.Length > 0) {
+                try {
+                    JsonDoc.ParseScoped(body, (JsonDoc doc) => {
+                        if (doc.KindAt(0) == 5) {
+                            m = doc.Str(0, "msg", "");
+                        }
+                    });
+                } catch (Exception) { }
             }
-            return "HTTP " + Convert.ToString(r.status);
+            if (m.Length > 0) { return m; }
+            return "HTTP " + r.status.ToString();
         }
         return "";
     }
 
-    // 成功应答的 data 节点（失败返回 null）。
-    static JsonValue DataOf(WxNetReq r) {
-        if (!WxNet.OkOf(r)) { return null; }
-        JsonValue v = JsonValue.ParseLenient(r.respBody);
-        return v.Get("data");
+    // 零分配解析成功应答的 data 节点。
+    public static void ParseData(WxNetReq r, Action<JsonDoc, int> cb) {
+        if (!WxNet.OkOf(r) || cb == null) { return; }
+        string body = r.respBody == null ? "" : r.respBody.Trim();
+        if (body.Length == 0) { return; }
+        try {
+            JsonDoc.ParseScoped(body, (JsonDoc doc) => {
+                if (doc.KindAt(0) == 5) {
+                    int dataSlot = doc.Get(0, "data");
+                    if (dataSlot >= 0) {
+                        cb(doc, dataSlot);
+                    }
+                }
+            });
+        } catch (Exception) { }
     }
 }
 

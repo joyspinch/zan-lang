@@ -15,7 +15,7 @@ static class WxIm {
     // 当前打开的会话：1:1 对端 id 或 collab 会话 id（"" = 没开）。
     static string openPeer = "";
     static string openConv = "";
-    // 两源快照：实体列表，Merge() 消费（彻底消除旧动态 JsonValue 数组散布）。
+    // 两源快照：强类型实体列表，Merge() 消费。
     static List<WxChatSnapshot> typedChats = new List<WxChatSnapshot>();
     static List<WxGroupSnapshot> typedGroups = new List<WxGroupSnapshot>();
     // collab 群聊未读合计（徽标 = 旧域 unread + 群聊合计）。
@@ -40,53 +40,36 @@ static class WxIm {
         WxNetReq req = WxNet.NewReq();
         WxNet.Get(req, "chats", () => {
             if (WxNet.OkOf(req)) {
-                JsonValue d = WxNet.DataOf(req);
-                JsonValue chats = d == null ? null : d.Get("chats");
-                WxIm.typedChats.Clear();
-                if (chats != null) {
-                    for (int ci = 0; ci < chats.Count(); ci = ci + 1) {
-                        JsonValue o = chats.At(ci);
-                        if (o != null) {
-                            WxIm.typedChats.Add(new WxChatSnapshot(
-                                o.Str("peerId", ""),
-                                o.Str("peerName", "?"),
-                                o.Str("lastText", ""),
-                                o.Str("lastAt", "0"),
-                                Convert.ToInt32(o.Str("unread", "0")),
-                                Convert.ToInt32(o.Str("sentUnread", "0")),
-                                o.Str("readed", "0") == "1" ? 1 : 0,
-                                o.Str("acked", "0") == "1" ? 1 : 0,
-                                o.Str("ackId", "0")
-                            ));
+                WxNet.ParseData(req, (JsonDoc doc, int d) => {
+                    int chats = doc.Get(d, "chats");
+                    WxIm.typedChats.Clear();
+                    int count = (chats >= 0 && doc.KindAt(chats) == 4) ? doc.Count(chats) : 0;
+                    for (int ci = 0; ci < count; ci = ci + 1) {
+                        int o = doc.At(chats, ci);
+                        if (o >= 0) {
+                            WxIm.typedChats.Add(WxChatSnapshot.FromDoc(doc, o));
                         }
                     }
-                }
-                WxIm.Merge();
+                    WxIm.Merge();
+                });
             }
             if (done != null) { done(); }
         });
         WxNetReq gr = WxNet.NewReq();
         WxNet.ApiGet(gr, "/api/collab/conversations", () => {
             if (!WxNet.OkOf(gr)) { return; }
-            JsonValue d = WxNet.DataOf(gr);
-            JsonValue convs = d == null ? null : d.Get("conversations");
-            WxIm.typedGroups.Clear();
-            if (convs != null) {
-                for (int gi = 0; gi < convs.Count(); gi = gi + 1) {
-                    JsonValue o = convs.At(gi);
-                    if (o != null) {
-                        WxIm.typedGroups.Add(new WxGroupSnapshot(
-                            o.Str("id", ""),
-                            o.Str("title", "?"),
-                            o.Str("lastText", ""),
-                            o.Str("lastAt", "0"),
-                            Convert.ToInt32(o.Str("unread", "0")),
-                            Convert.ToInt32(o.Str("members", "0"))
-                        ));
+            WxNet.ParseData(gr, (JsonDoc doc, int d) => {
+                int convs = doc.Get(d, "conversations");
+                WxIm.typedGroups.Clear();
+                int count = (convs >= 0 && doc.KindAt(convs) == 4) ? doc.Count(convs) : 0;
+                for (int gi = 0; gi < count; gi = gi + 1) {
+                    int o = doc.At(convs, gi);
+                    if (o >= 0) {
+                        WxIm.typedGroups.Add(WxGroupSnapshot.FromDoc(doc, o));
                     }
                 }
-            }
-            WxIm.Merge();
+                WxIm.Merge();
+            });
         });
     }
 
@@ -203,16 +186,18 @@ static class WxIm {
         WxNet.Post(req, "stream", "peer=" + Encoding.UrlEncode(peer), () => {
             if (done != null) { done(); }
             if (!WxNet.OkOf(req)) { return; }
-            JsonValue d = WxNet.DataOf(req);
-            if (d == null) { return; }
-            JsonValue msgs = d.Get("msgs");
-            List<WxMessageSnapshot> list = new List<WxMessageSnapshot>();
-            if (msgs != null) {
-                for (int i = 0; i < msgs.Count(); i = i + 1) {
-                    list.Add(WxMessageSnapshot.FromJson(msgs.At(i)));
+            WxNet.ParseData(req, (JsonDoc doc, int d) => {
+                int msgs = doc.Get(d, "msgs");
+                List<WxMessageSnapshot> list = new List<WxMessageSnapshot>();
+                int count = (msgs >= 0 && doc.KindAt(msgs) == 4) ? doc.Count(msgs) : 0;
+                for (int i = 0; i < count; i = i + 1) {
+                    int it = doc.At(msgs, i);
+                    if (it >= 0) {
+                        list.Add(WxMessageSnapshot.FromDoc(doc, it));
+                    }
                 }
-            }
-            WxIm.ApplyTypedStream(d.Str("peer", ""), list);
+                WxIm.ApplyTypedStream(doc.Str(d, "peer", ""), list);
+            });
         });
     }
 
@@ -224,20 +209,22 @@ static class WxIm {
             + Encoding.UrlEncode(conv) + "&limit=200", () => {
             if (done != null) { done(); }
             if (!WxNet.OkOf(req)) { return; }
-            JsonValue d = WxNet.DataOf(req);
-            if (d == null) { return; }
-            JsonValue msgs = d.Get("msgs");
-            List<WxMessageSnapshot> list = new List<WxMessageSnapshot>();
-            if (msgs != null) {
-                for (int i = 0; i < msgs.Count(); i = i + 1) {
-                    list.Add(WxMessageSnapshot.FromJson(msgs.At(i)));
+            WxNet.ParseData(req, (JsonDoc doc, int d) => {
+                int msgs = doc.Get(d, "msgs");
+                List<WxMessageSnapshot> list = new List<WxMessageSnapshot>();
+                int count = (msgs >= 0 && doc.KindAt(msgs) == 4) ? doc.Count(msgs) : 0;
+                for (int i = 0; i < count; i = i + 1) {
+                    int it = doc.At(msgs, i);
+                    if (it >= 0) {
+                        list.Add(WxMessageSnapshot.FromDoc(doc, it));
+                    }
                 }
-            }
-            WxIm.ApplyTypedConvStream(d.Str("conversationId", ""), list);
+                WxIm.ApplyTypedConvStream(doc.Str(d, "conversationId", ""), list);
+            });
         });
     }
 
-    // 把流并进会话模型：强类型实体版本（消除动态遍历 JsonValue 树散布）。
+    // 把流并进会话模型：强类型实体版本。
     static void ApplyTypedStream(string peer, List<WxMessageSnapshot> msgs) {
         if (WxIm.sessions == null || msgs == null) { return; }
         WxSession s = WxIm.ByPeer(peer);
@@ -277,7 +264,7 @@ static class WxIm {
         WxIm.AfterStream(s, peer == openPeer);
     }
 
-    // collab 群聊流并入：强类型实体版本（消除动态遍历 JsonValue 树散布）。
+    // collab 群聊流并入：强类型实体版本。
     static void ApplyTypedConvStream(string conv, List<WxMessageSnapshot> msgs) {
         if (WxIm.sessions == null || msgs == null) { return; }
         WxSession s = WxIm.ByConv(conv);
@@ -335,56 +322,44 @@ static class WxIm {
                 nm.taskId = o.taskId;
             }
             if (kind == "lifecycle_card") {
-                JsonValue cj = JsonValue.Parse(body);
-                if (cj != null) {
-                    string pId = cj.Str("projectId", "");
-                    string pNo = cj.Str("projectNo", "");
-                    string pName = cj.Str("projectName", "");
-                    string st = cj.Str("stage", "");
-                    string stName = cj.Str("stageName", "");
-                    string rName = cj.Str("responsibleName", "");
-                    string aiRole = cj.Str("aiAgentRole", "");
-                    string cStatus = cj.Str("status", "in_progress");
-                    string m1 = cj.Str("metric1", "");
-                    string m2 = cj.Str("metric2", "");
-                    string m3 = cj.Str("metric3", "");
-                    string aiAdvice = cj.Str("aiAdvice", "");
-                    string summary = cj.Str("summary", "");
+                try {
+                    JsonDoc.ParseScoped(body, (JsonDoc cj) => {
+                        string pId = cj.Str(0, "projectId", "");
+                        string pNo = cj.Str(0, "projectNo", "");
+                        string pName = cj.Str(0, "projectName", "");
+                        string st = cj.Str(0, "stage", "");
+                        string stName = cj.Str(0, "stageName", "");
+                        string rName = cj.Str(0, "responsibleName", "");
+                        string aiRole = cj.Str(0, "aiAgentRole", "");
+                        string cStatus = cj.Str(0, "status", "in_progress");
+                        string m1 = cj.Str(0, "metric1", "");
+                        string m2 = cj.Str(0, "metric2", "");
+                        string m3 = cj.Str(0, "metric3", "");
+                        string aiAdvice = cj.Str(0, "aiAdvice", "");
+                        string summary = cj.Str(0, "summary", "");
 
-                    string titleTag = cStatus == "rejected" ? "⚠️【阶段驳回预警卡】" : "【项目协同流转卡】";
-                    string cardText = titleTag + pNo + " · " + pName + "\n"
-                        + "🎯 当前阶段: " + stName + (cStatus == "rejected" ? " [已驳回]" : "") + "\n"
-                        + "👤 责任人: @" + rName + " | 🤖 赋能: " + aiRole + "\n"
-                        + "📊 核心指标: " + m1 + " | " + m2 + " | " + m3 + "\n"
-                        + "💡 AI建议: " + aiAdvice;
-                    if (summary.Length > 0) {
-                        cardText = cardText + "\n📌 阶段摘要: " + summary;
-                    }
-                    cardText = cardText + "\n👉 [点击卡片展开审批操作面板]";
+                        string titleTag = cStatus == "rejected" ? "⚠️【阶段驳回预警卡】" : "【项目协同流转卡】";
+                        string cardText = titleTag + pNo + " · " + pName + "\n"
+                            + "🎯 当前阶段: " + stName + (cStatus == "rejected" ? " [已驳回]" : "") + "\n"
+                            + "👤 责任人: @" + rName + " | 🤖 赋能: " + aiRole + "\n"
+                            + "📊 核心指标: " + m1 + " | " + m2 + " | " + m3 + "\n"
+                            + "💡 AI建议: " + aiAdvice;
+                        if (summary.Length > 0) {
+                            cardText = cardText + "\n📌 阶段摘要: " + summary;
+                        }
+                        cardText = cardText + "\n👉 [点击卡片展开审批操作面板]";
 
-                    nm.text = cardText;
-                    nm.card = true;
-                    nm.call = body;
-                    nm.taskId = "prj:" + pId + ":" + st;
-                }
+                        nm.text = cardText;
+                        nm.card = true;
+                        nm.call = body;
+                        nm.taskId = "prj:" + pId + ":" + st;
+                    });
+                } catch (Exception) { }
             }
             s.msgs.Add(nm);
         }
         WxIm.AfterStream(s, conv == openConv);
         if (appended > 0 && conv == openConv) { WxIm.PostRead(conv); }
-    }
-
-    // collab 群聊流并入：字段与旧域对齐（服务端已把发送者显示名、
-    // 引用解析、附件/任务卡元数据都回在行上）。已撤回消息 kind=
-    // deleted、正文为空——气泡显示「已撤回」占位。回执位不翻
-    // （collab 域没有送达/已读小字）。附件与任务卡以图片气泡/文件行/卡片呈现。
-    static void ApplyConvStream(string conv, JsonValue msgs) {
-        if (WxIm.sessions == null || msgs == null) { return; }
-        List<WxMessageSnapshot> list = new List<WxMessageSnapshot>();
-        for (int i = 0; i < msgs.Count(); i = i + 1) {
-            list.Add(WxMessageSnapshot.FromJson(msgs.At(i)));
-        }
-        WxIm.ApplyTypedConvStream(conv, list);
     }
 
     // 流并入后的共同收尾：摘要/时间跟最新一条、列表回执位取最后
@@ -394,7 +369,7 @@ static class WxIm {
         if (s.msgs.Count > 0) {
             ChatMessage last = s.msgs[s.msgs.Count - 1];
             s.snippet = last.text;
-            s.time = WxIm.ClockOf(Convert.ToString(last.at));
+            s.time = WxIm.ClockOf(last.at.ToString());
             for (int i = s.msgs.Count - 1; i >= 0; i = i - 1) {
                 if (s.msgs[i].role == "user" && s.msgs[i].msgId.Length > 0) {
                     lastMineMark = s.msgs[i].mark;
@@ -472,12 +447,17 @@ static class WxIm {
     // Send 应答的共同定稿：成功拿 id/at，失败气泡翻红。
     static void SettleSend(WxSession s, ChatMessage m, WxNetReq req) {
         if (WxNet.OkOf(req)) {
-            JsonValue d = WxNet.DataOf(req);
-            m.msgId = d == null ? "" : d.Str("id", "");
-            if (d != null) {
-                long at = Convert.ToInt64(d.Str("at", "0"));
-                if (at > 0) { m.at = at; }
-            }
+            WxNet.ParseData(req, (JsonDoc doc, int d) => {
+                m.msgId = doc.Str(d, "id", "");
+                long at = doc.Long(d, "at", 0L);
+                if (at == 0L) {
+                    string atStr = doc.Str(d, "at", "0");
+                    if (atStr != "0") {
+                        try { at = long.Parse(atStr); } catch (Exception) { }
+                    }
+                }
+                if (at > 0L) { m.at = at; }
+            });
             // 送达/已读回执等轮询翻；先按"已发出"画。
             m.mark = 0;
             s.lastMark = 0;
@@ -494,8 +474,8 @@ static class WxIm {
 
     static string NextCrid() {
         WxIm.cridSeq = WxIm.cridSeq + 1;
-        return "wx-" + Convert.ToString(DateTime.UtcNow().ToUnixSeconds())
-            + "-" + Convert.ToString(WxIm.cridSeq);
+        return "wx-" + DateTime.UtcNow().ToUnixSeconds().ToString()
+            + "-" + WxIm.cridSeq.ToString();
     }
 
     /* ---- 附件：真上传/真下载 ---- 旧域 /api/im 没有附件端点，附件只走 collab 域（conv 会话）： 发送 = uploadattachment（原始字节，元数据走 query）→ send 带 attachmentId；接收 = 流行的行带 attachmentId/fileName/size/mime/ width/height（服务端嗅探 PNG/JPEG 回填宽高），图片下载落缓存后 画缩略图（ChatView 按自然尺寸缩放不放大），文件画「[文件] 名字（大小）」行。 */
@@ -540,17 +520,18 @@ static class WxIm {
         WxNet.Upload(up, "/api/collab/uploadattachment",
             "name=" + Encoding.UrlEncode(name)
             + "&clientRequestId=" + WxIm.NextCrid(), localPath, () => {
-                // 应答里没有 data 节点时 DataOf 返回 null——先存局部量再判空，
-                // 直接 `WxNet.DataOf(up).Str(...)` 运行期会空指针。
-                JsonValue upData = WxNet.DataOf(up);
-                if (!WxNet.OkOf(up) || upData == null
-                    || upData.Str("id", "").Length == 0) {
+                string attId = "";
+                if (WxNet.OkOf(up)) {
+                    WxNet.ParseData(up, (JsonDoc doc, int d) => {
+                        attId = doc.Str(d, "id", "");
+                    });
+                }
+                if (!WxNet.OkOf(up) || attId.Length == 0) {
                     if (m.img.Length > 0) { m.img = ""; m.text = "[图片]"; }
                     m.role = "error";
                     WxIm.RefreshViews();
                     return;
                 }
-                string attId = upData.Str("id", "");
                 WxNetReq req = WxNet.NewReq();
                 WxNet.ApiPost(req, "/api/collab/send",
                     "conversationId=" + Encoding.UrlEncode(s.conv)
@@ -586,13 +567,18 @@ static class WxIm {
 
     /* ---- 任务卡片 ---- */
 
-    // 拉任务详情（强类型实体回调，内部在网络边界完成 JsonValue -> WxTaskDetail 解析）。
+    // 拉任务详情（强类型实体回调，内部在网络边界完成 JsonDoc -> WxTaskDetail 解析）。
     static void FetchTaskCard(string taskId, Action<WxTaskDetail> cb) {
         WxNetReq r = WxNet.NewReq();
         WxNet.ApiGet(r, "/api/collab/taskdetail?id="
             + Encoding.UrlEncode(taskId), () => {
-                JsonValue d = WxNet.OkOf(r) ? WxNet.DataOf(r) : null;
-                cb(d != null ? WxTaskDetail.FromJson(d) : null);
+                if (!WxNet.OkOf(r) || cb == null) {
+                    if (cb != null) { cb(null); }
+                    return;
+                }
+                WxNet.ParseData(r, (JsonDoc doc, int slot) => {
+                    cb(WxTaskDetail.FromDoc(doc, slot));
+                });
             });
     }
 
@@ -640,13 +626,13 @@ static class WxIm {
         if (n >= 1048576) {
             int whole = (int)(n / 1048576);
             int frac = (int)((n % 1048576) * 10 / 1048576);
-            return Convert.ToString(whole) + "."
-                + Convert.ToString(frac) + "MB";
+            return whole.ToString() + "."
+                + frac.ToString() + "MB";
         }
         if (n >= 1024) {
-            return Convert.ToString(n / 1024) + "KB";
+            return (n / 1024).ToString() + "KB";
         }
-        return Convert.ToString(n) + "B";
+        return n.ToString() + "B";
     }
 
     /* ---- 引用草稿（输入区上方的引用条） ---- */
@@ -705,31 +691,34 @@ static class WxIm {
 
     static void OnLiveEvent(string eventJson) {
         WxIm.liveEvents = WxIm.liveEvents + 1;
-        JsonValue v = JsonValue.ParseLenient(eventJson);
-        if (v == null) { return; }
-        string ev = v.Str("event", "");
-        if (ev == "message.created") {
-            string conv = v.Str("conversationId", "");
-            if (conv.Length == 0) { return; }
-            if (conv == WxIm.openConv) {
-                WxIm.PullConvStream(conv, null);
-                return;
-            }
-            WxSession s = WxIm.ByConv(conv);
-            if (s != null) {
-                s.snippet = v.Str("excerpt", "");
-                s.time = "刚刚";
-                s.unread = s.unread + 1;
-                WxIm.groupUnread = WxIm.groupUnread + 1;
-                WxIm.RefreshBadge();
-                WxIm.RefreshViews();
-            }
-            return;
-        }
-        if (ev == "conversation.created" || ev == "member.joined"
-            || ev == "member.left") {
-            WxIm.RefreshChats(null);
-        }
+        if (eventJson == null || eventJson.Length == 0) { return; }
+        try {
+            JsonDoc.ParseScoped(eventJson, (JsonDoc v) => {
+                string ev = v.Str(0, "event", "");
+                if (ev == "message.created") {
+                    string conv = v.Str(0, "conversationId", "");
+                    if (conv.Length == 0) { return; }
+                    if (conv == WxIm.openConv) {
+                        WxIm.PullConvStream(conv, null);
+                        return;
+                    }
+                    WxSession s = WxIm.ByConv(conv);
+                    if (s != null) {
+                        s.snippet = v.Str(0, "excerpt", "");
+                        s.time = "刚刚";
+                        s.unread = s.unread + 1;
+                        WxIm.groupUnread = WxIm.groupUnread + 1;
+                        WxIm.RefreshBadge();
+                        WxIm.RefreshViews();
+                    }
+                    return;
+                }
+                if (ev == "conversation.created" || ev == "member.joined"
+                    || ev == "member.left") {
+                    WxIm.RefreshChats(null);
+                }
+            });
+        } catch (Exception) { }
     }
 
     // 未读总数（Rail 徽标；App 轮询后读它刷新）。
@@ -765,9 +754,16 @@ static class WxIm {
         WxNetReq req = WxNet.NewReq();
         WxNet.Get(req, "unread", () => {
             if (!WxNet.OkOf(req)) { return; }
-            JsonValue d = WxNet.DataOf(req);
-            if (d == null) { return; }
-            WxIm.SyncBadge(Convert.ToInt32(d.Str("count", "0")));
+            WxNet.ParseData(req, (JsonDoc doc, int d) => {
+                int count = (int)doc.Long(d, "count", 0);
+                if (count == 0) {
+                    string countStr = doc.Str(d, "count", "0");
+                    if (countStr != "0") {
+                        try { count = int.Parse(countStr); } catch (Exception) { }
+                    }
+                }
+                WxIm.SyncBadge(count);
+            });
         });
     }
 
@@ -780,9 +776,6 @@ static class WxIm {
             WxIm.RefreshBadge();
         }
     }
-
-    // 一次拉流的应答体（WxNet.DataOf 的薄包装，回调里读得顺一些）。
-    static JsonValue WxDataOf(WxNetReq r) { return WxNet.DataOf(r); }
 
     /* ---- 待回执的对端队列 ---- */
 
@@ -874,7 +867,10 @@ static class WxIm {
 
     // Unix 秒 → 列表时间：今天显示 HH:MM，更早显示 MM-dd。
     static string ClockOf(string atStr) {
-        long at = Convert.ToInt64(atStr);
+        long at = 0L;
+        if (atStr != null && atStr.Length > 0) {
+            try { at = long.Parse(atStr); } catch (Exception) { }
+        }
         if (at <= 0) { return ""; }
         long now = DateTime.UtcNow().ToUnixSeconds();
         DateTime t = DateTime.FromUnixSeconds(at).ToLocalTime();

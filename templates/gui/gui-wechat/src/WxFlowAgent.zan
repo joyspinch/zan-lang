@@ -125,27 +125,23 @@ public class WxFlowAgent : Control {
                     this.Foot("加载失败：" + WxNet.ErrOf(r));
                     return;
                 }
-                JsonValue d = WxNet.DataOf(r);
-                if (d == null) {
-                    this.Foot("加载失败：应答里没有数据");
-                    return;
-                }
-                defs.Clear();
-                JsonValue arr = d.Get("defs");
-                int n = arr == null ? 0 : arr.Count();
-                for (int i = 0; i < n; i = i + 1) {
-                    defs.Add(WxFlowDefItem.FromJson(arr.At(i)));
-                }
-                if (defList != null) { defList.Bind(defs); }
-                // 原来选中的流程还在就接着用（流程可能被删了）。
-                if (this.FindDef(curDef) != null) {
-                    this.OpenDef(curDef);
-                } else if (n > 0) {
-                    this.PickDef(0);
-                } else {
-                    this.ClearAll("这个租户还没有流程");
-                    this.Foot("没有可分配的流程");
-                }
+                WxNet.ParseData(r, (JsonDoc doc, int d) => {
+                    defs.Clear();
+                    int arr = doc.Get(d, "defs");
+                    int n = (arr >= 0 && doc.KindAt(arr) == 4) ? doc.Count(arr) : 0;
+                    for (int i = 0; i < n; i = i + 1) {
+                        defs.Add(WxFlowDefItem.FromDoc(doc, doc.At(arr, i)));
+                    }
+                    if (defList != null) { defList.Bind(defs); }
+                    if (this.FindDef(curDef) != null) {
+                        this.OpenDef(curDef);
+                    } else if (n > 0) {
+                        this.PickDef(0);
+                    } else {
+                        this.ClearAll("这个租户还没有流程");
+                        this.Foot("没有可分配的流程");
+                    }
+                });
             } catch (Exception ex) { this.Foot(ex.Message); }
         });
     }
@@ -166,40 +162,37 @@ public class WxFlowAgent : Control {
                     this.Foot("加载节点失败：" + WxNet.ErrOf(r));
                     return;
                 }
-                JsonValue d = WxNet.DataOf(r);
-                if (d == null) {
-                    this.Foot("加载节点失败：应答里没有数据");
-                    return;
-                }
-                this.ApplyNodes(d);
+                WxNet.ParseData(r, (JsonDoc doc, int d) => {
+                    this.ApplyNodes(doc, d);
+                });
             } catch (Exception ex) { this.Foot(ex.Message); }
         });
     }
 
     // 把节点链铺进中栏，并选一个节点（优先 AI 节点——只有它们能分配工具）。
-    void ApplyNodes(JsonValue d) {
+    void ApplyNodes(JsonDoc doc, int d) {
         nodes.Clear();
-        JsonValue arr = d.Get("nodes");
-        int n = arr == null ? 0 : arr.Count();
+        int arr = doc.Get(d, "nodes");
+        int n = (arr >= 0 && doc.KindAt(arr) == 4) ? doc.Count(arr) : 0;
         int ai = 0;
         for (int i = 0; i < n; i = i + 1) {
-            WxFlowAgentNode it = WxFlowAgentNode.FromJson(arr.At(i));
+            WxFlowAgentNode it = WxFlowAgentNode.FromDoc(doc, doc.At(arr, i));
             nodes.Add(it);
             if (it.kind == "ai") { ai = ai + 1; }
         }
         catalog.Clear();
-        JsonValue cat = d.Get("catalog");
-        int cn = cat == null ? 0 : cat.Count();
+        int cat = doc.Get(d, "catalog");
+        int cn = (cat >= 0 && doc.KindAt(cat) == 4) ? doc.Count(cat) : 0;
         for (int i = 0; i < cn; i = i + 1) {
-            catalog.Add(WxFlowTool.FromJson(cat.At(i)));
+            catalog.Add(WxFlowTool.FromDoc(doc, doc.At(cat, i)));
         }
         if (nodeList != null) { nodeList.Bind(nodes); }
-        if (title != null) { title.SetProp("text", d.Str("name", "未命名流程")); }
+        if (title != null) { title.SetProp("text", doc.Str(d, "name", "未命名流程")); }
         if (summary != null) {
-            summary.SetProp("text", Convert.ToString(n) + " 节点 · "
-                + Convert.ToString(ai) + " AI · 健康 "
-                + Convert.ToString(this.HealthyCount()) + "/"
-                + Convert.ToString(catalog.Count));
+            summary.SetProp("text", n.ToString() + " 节点 · "
+                + ai.ToString() + " AI · 健康 "
+                + this.HealthyCount().ToString() + "/"
+                + catalog.Count.ToString());
         }
         // 原来选中的节点还在就接着用；否则先落在一个 AI 节点上。
         if (this.FindNode(curNode) != null) {
@@ -299,7 +292,7 @@ public class WxFlowAgent : Control {
     // 一个已分配工具的一行：优先级 + 名称 + 健康状态 + 四个动作钮。
     Flex BindRow(WxFlowAgentNode node, WxFlowBind bind) {
         Flex row = Wx.Row("wxflowrow");
-        row.Add(Wx.Lbl("#" + Convert.ToString(bind.priority), "wxflowpri"));
+        row.Add(Wx.Lbl("#" + bind.priority.ToString(), "wxflowpri"));
         row.Add(Wx.Lbl(this.ToolName(bind.agentCode), "wxflowname"));
         row.Add(Wx.Lbl(bind.StateZh(), "wxflowstate " + bind.StateCls()));
         if (!bind.On()) {
@@ -374,7 +367,7 @@ public class WxFlowAgent : Control {
         WxNetReq r = WxNet.NewReq();
         WxNet.ApiPost(r, "/api/flowagent/toggle",
             "id=" + Encoding.UrlEncode(bind.id)
-            + "&enabled=" + Convert.ToString(on), () => {
+            + "&enabled=" + on.ToString(), () => {
                 try {
                     if (!WxNet.OkOf(r)) {
                         this.Foot("操作失败：" + WxNet.ErrOf(r));
@@ -392,13 +385,13 @@ public class WxFlowAgent : Control {
         WxNetReq r = WxNet.NewReq();
         WxNet.ApiPost(r, "/api/flowagent/priority",
             "id=" + Encoding.UrlEncode(bind.id)
-            + "&priority=" + Convert.ToString(p), () => {
+            + "&priority=" + p.ToString(), () => {
                 try {
                     if (!WxNet.OkOf(r)) {
                         this.Foot("调序失败：" + WxNet.ErrOf(r));
                         return;
                     }
-                    this.Foot("优先级已设为 " + Convert.ToString(p));
+                    this.Foot("优先级已设为 " + p.ToString());
                     this.OpenDef(curDef);
                 } catch (Exception ex) { this.Foot(ex.Message); }
             });
@@ -424,33 +417,30 @@ public class WxFlowAgent : Control {
                         this.Redraw();
                         return;
                     }
-                    JsonValue d = WxNet.DataOf(r);
-                    if (d == null) {
-                        this.Foot("派发失败：应答里没有数据");
-                        return;
-                    }
-                    string who = d.Str("agent", "");
-                    string att = d.Str("attempts", "1");
-                    string text = d.Str("text", "");
-                    string chain = "";
-                    JsonValue deg = d.Get("degraded");
-                    int dn = deg == null ? 0 : deg.Count();
-                    for (int i = 0; i < dn; i = i + 1) {
-                        JsonValue it = deg.At(i);
-                        if (it == null) { continue; }
-                        if (chain.Length > 0) { chain = chain + "；"; }
-                        chain = chain + it.Str("agent", "") + ": " + it.Str("error", "");
-                    }
-                    lastRun = "命中 " + this.ToolName(who) + "（试了 " + att + " 次）";
-                    if (chain.Length > 0) {
-                        lastRun = lastRun + "\n降级链：" + chain;
-                    }
-                    if (text.Length > 0) {
-                        lastRun = lastRun + "\n" + text;
-                    }
-                    this.Foot("试跑完成");
-                    this.BuildPanel();
-                    this.Redraw();
+                    WxNet.ParseData(r, (JsonDoc doc, int d) => {
+                        string who = doc.Str(d, "agent", "");
+                        string att = doc.Str(d, "attempts", "1");
+                        string text = doc.Str(d, "text", "");
+                        string chain = "";
+                        int deg = doc.Get(d, "degraded");
+                        int dn = (deg >= 0 && doc.KindAt(deg) == 4) ? doc.Count(deg) : 0;
+                        for (int i = 0; i < dn; i = i + 1) {
+                            int it = doc.At(deg, i);
+                            if (it < 0) { continue; }
+                            if (chain.Length > 0) { chain = chain + "；"; }
+                            chain = chain + doc.Str(it, "agent", "") + ": " + doc.Str(it, "error", "");
+                        }
+                        lastRun = "命中 " + this.ToolName(who) + "（试了 " + att + " 次）";
+                        if (chain.Length > 0) {
+                            lastRun = lastRun + "\n降级链：" + chain;
+                        }
+                        if (text.Length > 0) {
+                            lastRun = lastRun + "\n" + text;
+                        }
+                        this.Foot("试跑完成");
+                        this.BuildPanel();
+                        this.Redraw();
+                    });
                 } catch (Exception ex) { this.Foot(ex.Message); }
             });
     }

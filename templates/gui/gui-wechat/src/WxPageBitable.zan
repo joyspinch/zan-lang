@@ -113,25 +113,21 @@ public class WxPageBitable : Control {
                     this.Foot("加载失败：" + WxNet.ErrOf(r));
                     return;
                 }
-                JsonValue d = WxNet.DataOf(r);
-                if (d == null) {
-                    this.Foot("加载失败：应答里没有数据");
-                    return;
-                }
-                apps.Clear();
-                JsonValue items = d.Get("items");
-                int n = items == null ? 0 : items.Count();
-                for (int i = 0; i < n; i = i + 1) {
-                    apps.Add(WxBitableItem.FromJson(items.At(i)));
-                }
-                if (list != null) { list.Bind(apps); }
-                this.Foot("共 " + Convert.ToString(n) + " 张表");
-                // 原来选中的表还在就接着显示（表可能被删了）。
-                if (this.FindApp(curId) != null) {
-                    this.OpenAppById(curId);
-                } else if (n > 0) {
-                    this.OpenApp(0);
-                }
+                WxNet.ParseData(r, (JsonDoc doc, int d) => {
+                    apps.Clear();
+                    int items = doc.Get(d, "items");
+                    int n = (items >= 0 && doc.KindAt(items) == 4) ? doc.Count(items) : 0;
+                    for (int i = 0; i < n; i = i + 1) {
+                        apps.Add(WxBitableItem.FromDoc(doc, doc.At(items, i)));
+                    }
+                    if (list != null) { list.Bind(apps); }
+                    this.Foot("共 " + n.ToString() + " 张表");
+                    if (this.FindApp(curId) != null) {
+                        this.OpenAppById(curId);
+                    } else if (n > 0) {
+                        this.OpenApp(0);
+                    }
+                });
             } catch (Exception ex) { this.Foot(ex.Message); }
         });
     }
@@ -152,52 +148,52 @@ public class WxPageBitable : Control {
                     this.Foot("打开失败：" + WxNet.ErrOf(r));
                     return;
                 }
-                JsonValue d = WxNet.DataOf(r);
-                if (d == null) { this.Foot("打开失败：应答里没有数据"); return; }
-                this.ApplyTable(d);
+                WxNet.ParseData(r, (JsonDoc doc, int d) => {
+                    this.ApplyTable(doc, d);
+                });
             } catch (Exception ex) { this.Foot(ex.Message); }
         });
     }
 
     // 把服务端的表详情铺进网格：列定义 → 列，行 → DataRow.cells。
-    void ApplyTable(JsonValue d) {
+    void ApplyTable(JsonDoc doc, int d) {
         colNames.Clear();
-        JsonValue fs = d.Get("fields");
-        int fn = fs == null ? 0 : fs.Count();
+        int fs = doc.Get(d, "fields");
+        int fn = (fs >= 0 && doc.KindAt(fs) == 4) ? doc.Count(fs) : 0;
         for (int i = 0; i < fn; i = i + 1) {
-            JsonValue f = fs.At(i);
-            if (f == null) { continue; }
-            colNames.Add(f.Str("name", "列" + Convert.ToString(i + 1)));
+            int f = doc.At(fs, i);
+            if (f < 0) { continue; }
+            colNames.Add(doc.Str(f, "name", "列" + (i + 1).ToString()));
         }
         recIds.Clear();
         rows.Clear();
-        JsonValue rec = d.Get("records");
-        JsonValue items = rec == null ? null : rec.Get("items");
-        int rn = items == null ? 0 : items.Count();
+        int rec = doc.Get(d, "records");
+        int items = rec >= 0 ? doc.Get(rec, "items") : -1;
+        int rn = (items >= 0 && doc.KindAt(items) == 4) ? doc.Count(items) : 0;
         for (int i = 0; i < rn; i = i + 1) {
-            JsonValue it = items.At(i);
-            if (it == null) { continue; }
-            recIds.Add(it.Str("id", ""));
+            int it = doc.At(items, i);
+            if (it < 0) { continue; }
+            recIds.Add(doc.Str(it, "id", ""));
             DataRow row = new DataRow();
-            JsonValue cells = it.Get("cells");
-            int cn = cells == null ? 0 : cells.Count();
+            int cells = doc.Get(it, "cells");
+            int cn = (cells >= 0 && doc.KindAt(cells) == 4) ? doc.Count(cells) : 0;
             for (int k = 0; k < colNames.Count; k = k + 1) {
                 string v = "";
                 if (k < cn) {
-                    JsonValue c = cells.At(k);
-                    if (c != null) { v = c.AsString(""); }
+                    int c = doc.At(cells, k);
+                    if (c >= 0) { v = doc.StrAt(c, ""); }
                 }
                 row.Push(v);
             }
             rows.Add(row);
         }
         this.BuildGrid();
-        JsonValue app = d.Get("app");
-        string name = app == null ? "" : app.Str("name", "");
+        int app = doc.Get(d, "app");
+        string name = app >= 0 ? doc.Str(app, "name", "") : "";
         if (title != null) { title.SetProp("text", name); }
         if (count != null) {
-            count.SetProp("text", Convert.ToString(colNames.Count) + " 列 · "
-                + Convert.ToString(rows.Count) + " 行");
+            count.SetProp("text", colNames.Count.ToString() + " 列 · "
+                + rows.Count.ToString() + " 行");
         }
         this.Foot("就绪");
         this.Redraw();
@@ -245,7 +241,7 @@ public class WxPageBitable : Control {
     // 新增一列：默认文本列（列名按当前列数顺延）。
     void AddCol() {
         if (curId == "") { this.Foot("先选一张表"); return; }
-        string name = "新列 " + Convert.ToString(colNames.Count + 1);
+        string name = "新列 " + (colNames.Count + 1).ToString();
         WxNetReq r = WxNet.NewReq();
         WxNet.ApiPost(r, "/api/bitable/fields",
             "appId=" + Encoding.UrlEncode(curId)
@@ -264,7 +260,7 @@ public class WxPageBitable : Control {
 
     // 新建一张表（默认名按现有张数顺延；改名/删表留给后续迭代）。
     void CreateApp() {
-        string name = "新建表格 " + Convert.ToString(apps.Count + 1);
+        string name = "新建表格 " + (apps.Count + 1).ToString();
         WxNetReq r = WxNet.NewReq();
         WxNet.ApiPost(r, "/api/bitable/create",
             "name=" + Encoding.UrlEncode(name) + "&icon=table", () => {
@@ -273,8 +269,10 @@ public class WxPageBitable : Control {
                         this.Foot("新建失败：" + WxNet.ErrOf(r));
                         return;
                     }
-                    JsonValue d = WxNet.DataOf(r);
-                    string id = d == null ? "" : d.Str("id", "");
+                    string id = "";
+                    WxNet.ParseData(r, (JsonDoc doc, int d) => {
+                        id = doc.Str(d, "id", "");
+                    });
                     this.Foot("已新建：" + name);
                     this.LoadApps();
                     if (id != "") { this.OpenAppById(id); }
@@ -320,30 +318,15 @@ public class WxPageBitable : Control {
         return null;
     }
 
-    // 单元格数组 → JSON 数组文本（服务端按 JSON 数组收）。
+    // 单元格数组 → JSON 数组文本（流式 JsonWriter 序列化）。
     static string CellsJson(List<string> cells) {
-        StringBuilder b = new StringBuilder();
-        b.Append("[");
+        JsonWriter w = new JsonWriter();
+        w.StartArray();
         for (int i = 0; i < cells.Count; i = i + 1) {
-            if (i > 0) { b.Append(","); }
-            b.Append("\"");
-            b.Append(WxPageBitable.Escape(cells[i]));
-            b.Append("\"");
+            w.WriteValue(cells[i]);
         }
-        b.Append("]");
-        return b.ToString();
-    }
-
-    // JSON 字符串里的引号与反斜杠要转义，否则一行里有引号就整行废掉。
-    static string Escape(string s) {
-        if (s == null) { return ""; }
-        StringBuilder b = new StringBuilder();
-        for (int i = 0; i < s.Length; i = i + 1) {
-            string ch = s.Substring(i, 1);
-            if (ch == "\\" || ch == "\"") { b.Append("\\"); }
-            b.Append(ch);
-        }
-        return b.ToString();
+        w.EndArray();
+        return w.ToJson();
     }
 
     // 状态行（错误/提示共用一行）。

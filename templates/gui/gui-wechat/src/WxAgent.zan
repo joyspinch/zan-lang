@@ -105,32 +105,28 @@ public class WxAgent : Control {
                     this.Foot("加载失败：" + WxNet.ErrOf(r));
                     return;
                 }
-                JsonValue d = WxNet.DataOf(r);
-                if (d == null) {
-                    this.Foot("加载失败：应答里没有数据");
-                    return;
-                }
-                agents.Clear();
-                JsonValue arr = d.Get("agents");
-                int n = arr == null ? 0 : arr.Count();
-                for (int i = 0; i < n; i = i + 1) {
-                    agents.Add(WxAgentItem.FromJson(arr.At(i)));
-                }
-                if (list != null) { list.Bind(agents); }
-                bool ready = d.Str("ready", "") == "true";
-                if (!ready) {
-                    this.Foot("服务端尚未配置 AI 助手（管理后台 → AI 助手）");
-                } else if (n == 0) {
-                    this.Foot("服务端没有可用的智能体");
-                } else {
-                    this.Foot("共 " + Convert.ToString(n) + " 个智能体");
-                }
-                // 原来选中的还在就接着用。
-                if (this.FindAgent(cur) != null) {
-                    this.PickAgent(cur);
-                } else if (n > 0) {
-                    this.Pick(0);
-                }
+                WxNet.ParseData(r, (JsonDoc doc, int d) => {
+                    agents.Clear();
+                    int arr = doc.Get(d, "agents");
+                    int n = (arr >= 0 && doc.KindAt(arr) == 4) ? doc.Count(arr) : 0;
+                    for (int i = 0; i < n; i = i + 1) {
+                        agents.Add(WxAgentItem.FromDoc(doc, doc.At(arr, i)));
+                    }
+                    if (list != null) { list.Bind(agents); }
+                    bool ready = doc.Str(d, "ready", "") == "true" || doc.Bool(d, "ready", false);
+                    if (!ready) {
+                        this.Foot("服务端尚未配置 AI 助手（管理后台 → AI 助手）");
+                    } else if (n == 0) {
+                        this.Foot("服务端没有可用的智能体");
+                    } else {
+                        this.Foot("共 " + n.ToString() + " 个智能体");
+                    }
+                    if (this.FindAgent(cur) != null) {
+                        this.PickAgent(cur);
+                    } else if (n > 0) {
+                        this.Pick(0);
+                    }
+                });
             } catch (Exception ex) { this.Foot(ex.Message); }
         });
     }
@@ -185,15 +181,12 @@ public class WxAgent : Control {
                         this.Foot("发送失败：" + WxNet.ErrOf(r));
                         return;
                     }
-                    JsonValue d = WxNet.DataOf(r);
-                    if (d == null) {
-                        this.Foot("发送失败：应答里没有数据");
-                        return;
-                    }
-                    string text = d.Str("text", "");
-                    if (text.Length == 0) { text = "（智能体没有回答）"; }
-                    this.Append("assistant", text);
-                    this.Foot("就绪");
+                    WxNet.ParseData(r, (JsonDoc doc, int d) => {
+                        string text = doc.Str(d, "text", "");
+                        if (text.Length == 0) { text = "（智能体没有回答）"; }
+                        this.Append("assistant", text);
+                        this.Foot("就绪");
+                    });
                 } catch (Exception ex) { this.Foot(ex.Message); }
             });
     }
@@ -203,34 +196,25 @@ public class WxAgent : Control {
         ChatMessage m = ChatMessage.Create(role, text);
         msgs.Add(m);
         if (chat != null) { chat.Bind(msgs); }
-        hist.Add("{\"role\":\"" + role + "\",\"content\":\""
-            + WxAgent.Escape(text) + "\"}");
-        while (hist.Count > 20) { hist.RemoveAt(0); }
         this.Redraw();
     }
 
-    // 历史 → JSON 数组文本（服务端按 role/content 收）。
+    // 历史 → JSON 数组文本（流式 JsonWriter 序列化）。
     string HistoryJson() {
-        StringBuilder b = new StringBuilder();
-        b.Append("[");
-        for (int i = 0; i < hist.Count; i = i + 1) {
-            if (i > 0) { b.Append(","); }
-            b.Append(hist[i]);
+        JsonWriter w = new JsonWriter();
+        w.StartArray();
+        int start = msgs.Count > 20 ? msgs.Count - 20 : 0;
+        for (int i = start; i < msgs.Count; i = i + 1) {
+            ChatMessage m = msgs[i];
+            w.StartObject();
+            w.WriteKey("role");
+            w.WriteValue(m.role);
+            w.WriteKey("content");
+            w.WriteValue(m.text);
+            w.EndObject();
         }
-        b.Append("]");
-        return b.ToString();
-    }
-
-    // JSON 字符串里的引号与反斜杠要转义。
-    static string Escape(string s) {
-        if (s == null) { return ""; }
-        StringBuilder b = new StringBuilder();
-        for (int i = 0; i < s.Length; i = i + 1) {
-            string ch = s.Substring(i, 1);
-            if (ch == "\\" || ch == "\"") { b.Append("\\"); }
-            b.Append(ch);
-        }
-        return b.ToString();
+        w.EndArray();
+        return w.ToJson();
     }
 
     // 状态行（错误/提示共用一行）。
