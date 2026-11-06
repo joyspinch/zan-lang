@@ -2579,59 +2579,8 @@ public partial class ChartOption {
         return false;
     }
 
-    public static ChartOption FromJsonValue(JsonValue v) {
-        ChartOption o = ChartOption.Create();
-        if (v == null) { return o; }
-        // A383 第一步：解析前先对账——用户 option 里引擎从未读过的键
-        // 走 Console.ErrorWriteLine 告警（stderr，同名键只报一次）。
-        // 见 ChartOptionWarn 的口径说明（与 chart_gap_audit.py 同源）。
-        ChartOptionWarn.WarnUnknown(v);
-        // ECharts timeline/media 顶层形态：顶层没有 series 而
-        // baseOption + options[] 在。取 baseOption 骨架，并入
-        // options 首项的系列（时间轴第一帧）；media 查询忽略。
-        if (v.Get("series") == null && v.Get("baseOption") != null) {
-            ChartOption base0 = ChartOption.FromJsonValue(v.Get("baseOption"));
-            JsonValue opts = v.Get("options");
-            if (opts != null && opts.IsArray() && opts.Count() > 0) {
-                ChartOption step0 = ChartOption.FromJsonValue(opts.At(0));
-                if (step0.series.Count > 0) {
-                    bool baseEmpty = true;
-                    for (int bi = 0; bi < base0.series.Count; bi = bi + 1) {
-                        if (base0.series[bi].Count() > 0 || base0.series[bi].points.Count > 0) {
-                            baseEmpty = false;
-                            break;
-                        }
-                    }
-                    if (baseEmpty) { base0.series.Clear(); }
-                    for (int so = 0; so < step0.series.Count; so = so + 1) {
-                        base0.series.Add(ChartSeries.Clone(step0.series[so]));
-                    }
-                }
-            }
-            return base0;
-        }
-        // media 缺省项（无 query 的 entry = 官方响应式的缺省形态）先
-        // 扫出：matrix 必须先于 title/grid/geo 解析——三者的 matrix
-        // 锚定 coord 都要查格查找表。带 query 的规则（maxWidth 等）
-        // 不评估，挂账。
-        JsonValue mediaOpt = null;
-        JsonValue mdv = v.Get("media");
-        if (mdv != null && mdv.IsArray()) {
-            for (int mi3 = 0; mi3 < mdv.Count(); mi3 = mi3 + 1) {
-                JsonValue ment = mdv.At(mi3);
-                if (ment == null || !ment.IsObject()) { continue; }
-                if (ment.Has("query")) { continue; }
-                JsonValue mo = ment.Get("option");
-                if (mo != null && mo.IsObject()) { mediaOpt = mo; }
-            }
-        }
-        JsonValue matOvr = mediaOpt != null ? mediaOpt.Get("matrix") : null;
-        JsonValue mxv = v.Get("matrix");
-        if (mxv != null && mxv.IsObject()) {
-            o.matrix = ChartMatrixSpec.ParseOne(mxv,
-                matOvr != null ? matOvr.Get("x") : null,
-                matOvr != null ? matOvr.Get("y") : null);
-        }
+    // B-ID166(C6): 自 FromJsonValue 提取(原位顺序保留,纯搬家零逻辑改动)。
+    private static void ParseTitleInto(ChartOption o, JsonValue v, JsonValue mediaOpt) {
         JsonValue tj = v.Get("title");
         if (tj != null && tj.IsArray()) {
             // title 数组（line-gradient 双标题）：逐项位置/文本。
@@ -2679,31 +2628,10 @@ public partial class ChartOption {
         } else {
             o.title = v.Str("title", "");
         }
-        if (v.Has("backgroundColor")) {
-            JsonValue bg = v.Get("backgroundColor");
-            if (bg != null && bg.IsObject()) {
-                List<int> gs = ChartOption.ParseGradStops(bg);
-                if (gs != null && gs.Count > 0) {
-                    o.backgroundGradStops = gs;
-                    o.backgroundColor = gs[0];
-                }
-            } else {
-                o.backgroundColor = ChartOption.ParseColor(bg, o.backgroundColor);
-            }
-        }
-        // ECharts 根级 color：string 数组，整图替换定性调色板。
-        JsonValue palv = v.Get("color");
-        if (palv != null && palv.IsArray()) {
-            List<int> pal = new List<int>();
-            for (int pi = 0; pi < palv.Count(); pi = pi + 1) {
-                int pc = ChartOption.ParseColor(palv.At(pi), 0);
-                if (pc != 0) { pal.Add(pc); }
-            }
-            if (pal.Count > 0) { o.colorPal = pal; }
-        }
-        o.roamWheelMode = ChartKinds.RoamWheelModeSanitize(
-            v.Str("roamWheelMode", o.roamWheelMode));
-        ChartOption.ParseGrid(v.Get("grid"), o);
+    }
+
+    // B-ID166(C6): 自 FromJsonValue 提取(原位顺序保留,纯搬家零逻辑改动)。
+    private static void ParseGridMediaInto(ChartOption o, JsonValue mediaOpt) {
         if (mediaOpt != null) {
             // media 缺省项按 id 覆盖 grid coord（grid-layout 骨架）。
             JsonValue gov = mediaOpt.Get("grid");
@@ -2723,8 +2651,10 @@ public partial class ChartOption {
                 }
             }
         }
-        ChartOption.ParseDataZoom(v.Get("dataZoom"), o);
+    }
 
+    // B-ID166(C6): 自 FromJsonValue 提取(原位顺序保留,纯搬家零逻辑改动)。
+    private static void ParseLegendInto(ChartOption o, JsonValue v) {
         // ECharts：未声明的组件不渲染。legend/tooltip 只有 JSON
         // 真的写了才出现（对象 API 保持 Create 的开箱即用默认）。
         o.showLegend = false;
@@ -2754,7 +2684,10 @@ public partial class ChartOption {
                     lgts.Get("color"), o.legendTextColor);
             }
         }
+    }
 
+    // B-ID166(C6): 自 FromJsonValue 提取(原位顺序保留,纯搬家零逻辑改动)。
+    private static void ParseDataRangeInto(ChartOption o, JsonValue v) {
         JsonValue dr = v.Get("dataRange");
         if (dr != null && dr.IsObject()) {
             o.dataRangeShow = dr.Bool("show", true);
@@ -2782,6 +2715,10 @@ public partial class ChartOption {
                 }
             }
         }
+    }
+
+    // B-ID166(C6): 自 FromJsonValue 提取(原位顺序保留,纯搬家零逻辑改动)。
+    private static void ParseTooltipInto(ChartOption o, JsonValue v) {
         // ECharts：未声明 tooltip 组件就没有提示框；trigger 记下
         // 供渲染器区分 item/axis。
         o.showTooltip = false;
@@ -2814,6 +2751,10 @@ public partial class ChartOption {
                 }
             }
         }
+    }
+
+    // B-ID166(C6): 自 FromJsonValue 提取(原位顺序保留,纯搬家零逻辑改动)。
+    private static void ParseToolboxInto(ChartOption o, JsonValue v) {
         // ECharts toolbox：声明了组件才渲染，且只渲染 feature 中
         // 声明的按钮（未声明 feature = 空工具箱）。
         JsonValue tbj = v.Get("toolbox");
@@ -2852,76 +2793,10 @@ public partial class ChartOption {
                 }
             }
         }
-        // connect 组（ECharts connect(group)）：非 0 组号参与多图联动。
-        o.connectGroup = v.Int("connectGroup", o.connectGroup);
-        if (v.Has("markLine")) { o.markLine = v.Int("markLine", o.markLine); }
-        // markPoint 同时支持旧 bool 形式和 ECharts 对象 {data:[...]}。
-        // 对象形式的数据项解析推迟到系列构建之后（见本函数末尾），
-        // 以便挂接到第一个 line/bar 系列。
-        JsonValue mpj = v.Get("markPoint");
-        if (mpj != null && mpj.IsObject()) { o.markPoint = true; }
-        else { o.markPoint = v.Bool("markPoint", o.markPoint); }
-        o.markLabel = v.Str("markLabel", o.markLabel);
-        ChartOption.ParseMarkArea(v.Get("markArea"), o);
-        o.animation = v.Bool("animation", o.animation);
-        o.animationDuration = v.Int("animationDuration", o.animationDuration);
-        o.animationDurationUpdate = v.Int("animationDurationUpdate", o.animationDurationUpdate);
-        o.animationEasing = v.Str("animationEasing", o.animationEasing);
-        o.animationEasingUpdate = v.Str("animationEasingUpdate", o.animationEasingUpdate);
-        o.animationThreshold = v.Int("animationThreshold", o.animationThreshold);
-        o.useUTC = v.Bool("useUTC", o.useUTC);
-        o.blendMode = v.Str("blendMode", o.blendMode);
-        JsonValue bmv = v.Get("bmap");
-        if (bmv != null && bmv.IsObject()) {
-            JsonValue bmc = bmv.Get("center");
-            double bmZoom = bmv.Double("zoom", 1.0);
-            bool bmRoam = bmv.Bool("roam", false);
-            JsonValue bmst = bmv.Get("mapStyle");
-            if (bmst != null && bmst.IsObject()) {
-                JsonValue bmsj = bmst.Get("styleJson");
-            }
-        }
-        JsonValue brv = v.Get("brush");
-        if (brv != null && brv.IsObject()) {
-            JsonValue brTb = brv.Get("toolbox");
-            JsonValue brX = brv.Get("xAxisIndex");
-            JsonValue brY = brv.Get("yAxisIndex");
-            JsonValue brLink = brv.Get("brushLink");
-            string brType = brv.Str("brushType", "rect");
-            string brMode = brv.Str("brushMode", "single");
-            JsonValue brOob = brv.Get("outOfBrush");
-            if (brOob != null && brOob.IsObject()) {
-                double oobAlpha = brOob.Double("colorAlpha", 0.1);
-                if (brOob.Has("color")) {
-                    int oobCol = ChartOption.ParseColor(brOob.Get("color"), 0);
-                }
-            }
-            JsonValue brIn = brv.Get("inBrush");
-            if (brIn != null && brIn.IsObject()) {
-                if (brIn.Has("color")) {
-                    int inCol = ChartOption.ParseColor(brIn.Get("color"), 0);
-                }
-            }
-        }
-        JsonValue sav = v.Get("singleAxis");
-        if (sav != null) {
-            int nsa = sav.IsArray() ? sav.Count() : 1;
-            for (int sai = 0; sai < nsa; sai = sai + 1) {
-                JsonValue sa = sav.IsArray() ? sav.At(sai) : sav;
-                if (sa == null || !sa.IsObject()) { continue; }
-                string saTy = sa.Str("type", "value");
-                int saTop = sa.Int("top", 0);
-                int saBot = sa.Int("bottom", 0);
-                int saH = sa.Int("height", 0);
-                string saOr = sa.Str("orient", "horizontal");
-                JsonValue saAx = sa.Get("axisLabel");
-                if (saAx != null && saAx.IsObject()) {
-                    bool saSh = saAx.Bool("show", true);
-                    int saIv = saAx.Int("interval", 0);
-                }
-            }
-        }
+    }
 
+    // B-ID166(C6): 自 FromJsonValue 提取(原位顺序保留,纯搬家零逻辑改动)。
+    private static void ParseRadarInto(ChartOption o, JsonValue v) {
         // radar.indicator[].max -> radarIndicators（结构化实体解析）
         JsonValue rj = v.Get("radar");
         if (rj != null && rj.IsObject()) {
@@ -3011,7 +2886,10 @@ public partial class ChartOption {
                 o.polars.Add(p);
             }
         }
+    }
 
+    // B-ID166(C6): 自 FromJsonValue 提取(原位顺序保留,纯搬家零逻辑改动)。
+    private static void ParsePolarInto(ChartOption o, JsonValue v) {
         // ECharts polar[]：多雷达坐标系。radius 数组的 [min,max]
         // 形式取外径（内环雷达不支持，与单 polar 一致）。
         JsonValue pj = v.Get("polar");
@@ -3111,10 +2989,10 @@ public partial class ChartOption {
             }
             o.polars.Add(p);
         }
+    }
 
-        ChartOption.ParseAxis(v.Get("xAxis"), o.xAxes, true);
-        ChartOption.ParseAxis(v.Get("yAxis"), o.yAxes, false);
-        ChartOption.ParseVisualMap(v.Get("visualMap"), o.visualMaps);
+    // B-ID166(C6): 自 FromJsonValue 提取(原位顺序保留,纯搬家零逻辑改动)。
+    private static void SyncRampFromVisualMap(ChartOption o) {
         // visualMap.inRange.color → 全局色带。地图/热力图/散点/日历渲染器
         // 读的是 o.rampColors + o.rampLo/rampHi（单条全局色带），而
         // visualMap 的色带此前只进 visualMaps[]，两边从不交汇——29 个带
@@ -3137,7 +3015,10 @@ public partial class ChartOption {
                 break;
             }
         }
+    }
 
+    // B-ID166(C6): 自 FromJsonValue 提取(原位顺序保留,纯搬家零逻辑改动)。
+    private static void ParseDatasetInto(ChartOption o, JsonValue v) {
         // ECharts dataset：数据集与 transform 先于系列解析——系列用
         // datasetId/datasetIndex + encode 绑定列（缺省绑 index 0）。
         // dataset 支持数组与单对象两种形态（官方基础例全是对象形态）。
@@ -3222,25 +3103,133 @@ public partial class ChartOption {
             }
             o.datasets.Add(ds);
         }
+    }
 
-        // ECharts geo 组件：底图地图（对象或数组），系列解析后
-        // 由合成块挂载。
-        ChartOption.ParseGeo(v.Get("geo"), o);
-        ChartOption.ParseCalendar(v.Get("calendar"), o);
-        ChartOption.ParseGraphic(v.Get("graphic"), o);
-        // 锚定 coord 依赖格查找表）。
-        ChartOption.ParseParAxes(v.Get("parallelAxis"), o);
-        // ECharts 极坐标轴（angleAxis/radiusAxis）：对象或数组形态，
-        // polarIndex 绑定到 polar[]（coordinateSystem:"polar" 系列）。
-        ChartOption.ParsePolarAxes(v.Get("angleAxis"), o, true);
-        ChartOption.ParsePolarAxes(v.Get("radiusAxis"), o, false);
-        // parallel 组件块：layout 命名轴排布方向（'vertical' = 轴横
-        // 置自上而下堆叠，nutrients 官方图；'horizontal'/缺省 = 既有
-        // 竖轴从左到右）。
-        JsonValue parj = v.Get("parallel");
-        if (parj != null && parj.IsObject()) {
-            o.parLayout = parj.Str("layout", o.parLayout);
+    // B-ID166(C6): 自 FromJsonValue 提取(原位顺序保留,纯搬家零逻辑改动)。
+    private static void ApplyPostSeriesFixups(ChartOption o, JsonValue v) {
+        // 全局 markPoint 语义）。bool 形式仅置位标志，渲染器自动推导
+        // max/min；对象形式的显式数据项优先于自动推导。
+        JsonValue mpOpt = v.Get("markPoint");
+        if (mpOpt != null && mpOpt.IsObject()) {
+            for (int mi = 0; mi < o.series.Count; mi = mi + 1) {
+                ChartSeries ms = o.series[mi];
+                if (ms.type == ChartType.Line || ms.type == ChartType.Bar) {
+                    ChartOption.ParseMarks(mpOpt, ms.marks);
+                    break;
+                }
+            }
         }
+
+        // ECharts：类目轴未给 data 时，类目来自系列数据（[名, 值]
+        // 对或 dataset x 列）。取首个有名字的折线/柱系列按序回填
+        // （dataset 绑定的裸柱系列类目全在这里落地）。
+        // 竖轴同理：dataset-encode0 的 yAxis:{type:category} 无 data，
+        // 类目来自 encode.y 绑定列（product）。官方按系列 data 名回填，
+        // 方向不影响回填本身，只影响后续 hbar 分派。
+        bool xCatEmpty = o.xAxes.Count > 0
+            && o.xAxes[0].type == ChartAxisType.Category
+            && o.xAxes[0].categories.Count == 0;
+        bool yCatEmpty = o.yAxes.Count > 0
+            && o.yAxes[0].type == ChartAxisType.Category
+            && o.yAxes[0].categories.Count == 0;
+        if (xCatEmpty || yCatEmpty) {
+            for (int sf = 0; sf < o.series.Count; sf = sf + 1) {
+                ChartSeries s3 = o.series[sf];
+                if (s3.type != ChartType.Line && s3.type != ChartType.Bar) { continue; }
+                if (s3.data.Count == 0) { continue; }
+                bool anyName = false;
+                for (int df = 0; df < s3.data.Count; df = df + 1) {
+                    if (s3.data[df].name.Length > 0) {
+                        if (xCatEmpty) { o.xAxes[0].categories.Add(s3.data[df].name); }
+                        else { o.yAxes[0].categories.Add(s3.data[df].name); }
+                        anyName = true;
+                    }
+                }
+                if (anyName) { break; }
+            }
+        }
+        // 旧格式：顶层 labels -> x 轴分类
+        JsonValue labels = v.Get("labels");
+        if (labels != null && labels.IsArray() && o.xAxes.Count == 0) {
+            List<string> cats = new List<string>();
+            for (int i2 = 0; i2 < labels.Count(); i2 = i2 + 1) { cats.Add(labels.At(i2).AsString("")); }
+            o.xAxes.Add(ChartAxis.Category(cats));
+        }
+        // ECharts 柱状族方向语义：yAxis category 且 x 侧不是"带类目
+        // 的 category 轴"（值轴、无 data 的空类目轴）= 横条
+        // （bar-y-category、dataset-encode0）。渲染分派按系列
+        // hbar 标志走 HBar。
+        if (o.yAxes.Count > 0 && o.yAxes[0].type == ChartAxisType.Category
+            && (o.xAxes.Count == 0
+                || o.xAxes[0].type != ChartAxisType.Category
+                || o.xAxes[0].categories.Count == 0)) {
+            for (int hb = 0; hb < o.series.Count; hb = hb + 1) {
+                ChartSeries hs = o.series[hb];
+                if (hs.type == ChartType.Bar && !hs.hbar) { hs.hbar = true; }
+            }
+        }
+    }
+
+    // B-ID166(C6): 自 FromJsonValue 提取(原位顺序保留,纯搬家零逻辑改动)。
+    private static void ParseBMapAndBrush(ChartOption o, JsonValue v) {
+        JsonValue bmv = v.Get("bmap");
+        if (bmv != null && bmv.IsObject()) {
+            JsonValue bmc = bmv.Get("center");
+            double bmZoom = bmv.Double("zoom", 1.0);
+            bool bmRoam = bmv.Bool("roam", false);
+            JsonValue bmst = bmv.Get("mapStyle");
+            if (bmst != null && bmst.IsObject()) {
+                JsonValue bmsj = bmst.Get("styleJson");
+            }
+        }
+        JsonValue brv = v.Get("brush");
+        if (brv != null && brv.IsObject()) {
+            JsonValue brTb = brv.Get("toolbox");
+            JsonValue brX = brv.Get("xAxisIndex");
+            JsonValue brY = brv.Get("yAxisIndex");
+            JsonValue brLink = brv.Get("brushLink");
+            string brType = brv.Str("brushType", "rect");
+            string brMode = brv.Str("brushMode", "single");
+            JsonValue brOob = brv.Get("outOfBrush");
+            if (brOob != null && brOob.IsObject()) {
+                double oobAlpha = brOob.Double("colorAlpha", 0.1);
+                if (brOob.Has("color")) {
+                    int oobCol = ChartOption.ParseColor(brOob.Get("color"), 0);
+                }
+            }
+            JsonValue brIn = brv.Get("inBrush");
+            if (brIn != null && brIn.IsObject()) {
+                if (brIn.Has("color")) {
+                    int inCol = ChartOption.ParseColor(brIn.Get("color"), 0);
+                }
+            }
+        }
+    }
+
+    // B-ID166(C6): 自 FromJsonValue 提取(原位顺序保留,纯搬家零逻辑改动)。
+    private static void ParseSingleAxis(ChartOption o, JsonValue v) {
+        JsonValue sav = v.Get("singleAxis");
+        if (sav != null) {
+            int nsa = sav.IsArray() ? sav.Count() : 1;
+            for (int sai = 0; sai < nsa; sai = sai + 1) {
+                JsonValue sa = sav.IsArray() ? sav.At(sai) : sav;
+                if (sa == null || !sa.IsObject()) { continue; }
+                string saTy = sa.Str("type", "value");
+                int saTop = sa.Int("top", 0);
+                int saBot = sa.Int("bottom", 0);
+                int saH = sa.Int("height", 0);
+                string saOr = sa.Str("orient", "horizontal");
+                JsonValue saAx = sa.Get("axisLabel");
+                if (saAx != null && saAx.IsObject()) {
+                    bool saSh = saAx.Bool("show", true);
+                    int saIv = saAx.Int("interval", 0);
+                }
+            }
+        }
+    }
+
+    // B-ID166(C6): 自 FromJsonValue 提取(原位顺序保留,纯搬家零逻辑改动)。
+    private static void ParseSeriesInto(ChartOption o, JsonValue v) {
         JsonValue series = v.Get("series");
         // ECharts 单系列可以把 series 直接写成对象（line-aqi），
         // 与数组形态同一路解析，否则整图被当空数据画 "(no data)"。
@@ -4885,11 +4874,10 @@ public partial class ChartOption {
                 }
             }
         }
+    }
 
-        // geo 组件合成底图系列：每个 geo 一个 type=Map 的载体系列
-        // （isGeoBase）。没有用户 map 系列时插到队首（lead=Map，分发
-        // "map"）；有则追加。geo 绑定的散点/路线叠加渲染在
-        // DrawGeoMap（后续批次）。
+    // B-ID166(C6): 自 FromJsonValue 提取(原位顺序保留,纯搬家零逻辑改动)。
+    private static void SynthesizeGeoBaseSeries(ChartOption o) {
         if (o.geos.Count > 0) {
             for (int gi = 0; gi < o.geos.Count; gi = gi + 1) {
                 ChartGeo g = o.geos[gi];
@@ -4932,68 +4920,155 @@ public partial class ChartOption {
                 else { o.series.Add(gs); }
             }
         }
+    }
 
-        // 全局 markPoint 语义）。bool 形式仅置位标志，渲染器自动推导
-        // max/min；对象形式的显式数据项优先于自动推导。
-        JsonValue mpOpt = v.Get("markPoint");
-        if (mpOpt != null && mpOpt.IsObject()) {
-            for (int mi = 0; mi < o.series.Count; mi = mi + 1) {
-                ChartSeries ms = o.series[mi];
-                if (ms.type == ChartType.Line || ms.type == ChartType.Bar) {
-                    ChartOption.ParseMarks(mpOpt, ms.marks);
-                    break;
-                }
-            }
-        }
-
-        // ECharts：类目轴未给 data 时，类目来自系列数据（[名, 值]
-        // 对或 dataset x 列）。取首个有名字的折线/柱系列按序回填
-        // （dataset 绑定的裸柱系列类目全在这里落地）。
-        // 竖轴同理：dataset-encode0 的 yAxis:{type:category} 无 data，
-        // 类目来自 encode.y 绑定列（product）。官方按系列 data 名回填，
-        // 方向不影响回填本身，只影响后续 hbar 分派。
-        bool xCatEmpty = o.xAxes.Count > 0
-            && o.xAxes[0].type == ChartAxisType.Category
-            && o.xAxes[0].categories.Count == 0;
-        bool yCatEmpty = o.yAxes.Count > 0
-            && o.yAxes[0].type == ChartAxisType.Category
-            && o.yAxes[0].categories.Count == 0;
-        if (xCatEmpty || yCatEmpty) {
-            for (int sf = 0; sf < o.series.Count; sf = sf + 1) {
-                ChartSeries s3 = o.series[sf];
-                if (s3.type != ChartType.Line && s3.type != ChartType.Bar) { continue; }
-                if (s3.data.Count == 0) { continue; }
-                bool anyName = false;
-                for (int df = 0; df < s3.data.Count; df = df + 1) {
-                    if (s3.data[df].name.Length > 0) {
-                        if (xCatEmpty) { o.xAxes[0].categories.Add(s3.data[df].name); }
-                        else { o.yAxes[0].categories.Add(s3.data[df].name); }
-                        anyName = true;
+    public static ChartOption FromJsonValue(JsonValue v) {
+        ChartOption o = ChartOption.Create();
+        if (v == null) { return o; }
+        // A383 第一步：解析前先对账——用户 option 里引擎从未读过的键
+        // 走 Console.ErrorWriteLine 告警（stderr，同名键只报一次）。
+        // 见 ChartOptionWarn 的口径说明（与 chart_gap_audit.py 同源）。
+        ChartOptionWarn.WarnUnknown(v);
+        // ECharts timeline/media 顶层形态：顶层没有 series 而
+        // baseOption + options[] 在。取 baseOption 骨架，并入
+        // options 首项的系列（时间轴第一帧）；media 查询忽略。
+        if (v.Get("series") == null && v.Get("baseOption") != null) {
+            ChartOption base0 = ChartOption.FromJsonValue(v.Get("baseOption"));
+            JsonValue opts = v.Get("options");
+            if (opts != null && opts.IsArray() && opts.Count() > 0) {
+                ChartOption step0 = ChartOption.FromJsonValue(opts.At(0));
+                if (step0.series.Count > 0) {
+                    bool baseEmpty = true;
+                    for (int bi = 0; bi < base0.series.Count; bi = bi + 1) {
+                        if (base0.series[bi].Count() > 0 || base0.series[bi].points.Count > 0) {
+                            baseEmpty = false;
+                            break;
+                        }
+                    }
+                    if (baseEmpty) { base0.series.Clear(); }
+                    for (int so = 0; so < step0.series.Count; so = so + 1) {
+                        base0.series.Add(ChartSeries.Clone(step0.series[so]));
                     }
                 }
-                if (anyName) { break; }
+            }
+            return base0;
+        }
+        // media 缺省项（无 query 的 entry = 官方响应式的缺省形态）先
+        // 扫出：matrix 必须先于 title/grid/geo 解析——三者的 matrix
+        // 锚定 coord 都要查格查找表。带 query 的规则（maxWidth 等）
+        // 不评估，挂账。
+        JsonValue mediaOpt = null;
+        JsonValue mdv = v.Get("media");
+        if (mdv != null && mdv.IsArray()) {
+            for (int mi3 = 0; mi3 < mdv.Count(); mi3 = mi3 + 1) {
+                JsonValue ment = mdv.At(mi3);
+                if (ment == null || !ment.IsObject()) { continue; }
+                if (ment.Has("query")) { continue; }
+                JsonValue mo = ment.Get("option");
+                if (mo != null && mo.IsObject()) { mediaOpt = mo; }
             }
         }
-        // 旧格式：顶层 labels -> x 轴分类
-        JsonValue labels = v.Get("labels");
-        if (labels != null && labels.IsArray() && o.xAxes.Count == 0) {
-            List<string> cats = new List<string>();
-            for (int i2 = 0; i2 < labels.Count(); i2 = i2 + 1) { cats.Add(labels.At(i2).AsString("")); }
-            o.xAxes.Add(ChartAxis.Category(cats));
+        JsonValue matOvr = mediaOpt != null ? mediaOpt.Get("matrix") : null;
+        JsonValue mxv = v.Get("matrix");
+        if (mxv != null && mxv.IsObject()) {
+            o.matrix = ChartMatrixSpec.ParseOne(mxv,
+                matOvr != null ? matOvr.Get("x") : null,
+                matOvr != null ? matOvr.Get("y") : null);
         }
-        // ECharts 柱状族方向语义：yAxis category 且 x 侧不是"带类目
-        // 的 category 轴"（值轴、无 data 的空类目轴）= 横条
-        // （bar-y-category、dataset-encode0）。渲染分派按系列
-        // hbar 标志走 HBar。
-        if (o.yAxes.Count > 0 && o.yAxes[0].type == ChartAxisType.Category
-            && (o.xAxes.Count == 0
-                || o.xAxes[0].type != ChartAxisType.Category
-                || o.xAxes[0].categories.Count == 0)) {
-            for (int hb = 0; hb < o.series.Count; hb = hb + 1) {
-                ChartSeries hs = o.series[hb];
-                if (hs.type == ChartType.Bar && !hs.hbar) { hs.hbar = true; }
+        ChartOption.ParseTitleInto(o, v, mediaOpt);
+        if (v.Has("backgroundColor")) {
+            JsonValue bg = v.Get("backgroundColor");
+            if (bg != null && bg.IsObject()) {
+                List<int> gs = ChartOption.ParseGradStops(bg);
+                if (gs != null && gs.Count > 0) {
+                    o.backgroundGradStops = gs;
+                    o.backgroundColor = gs[0];
+                }
+            } else {
+                o.backgroundColor = ChartOption.ParseColor(bg, o.backgroundColor);
             }
         }
+        // ECharts 根级 color：string 数组，整图替换定性调色板。
+        JsonValue palv = v.Get("color");
+        if (palv != null && palv.IsArray()) {
+            List<int> pal = new List<int>();
+            for (int pi = 0; pi < palv.Count(); pi = pi + 1) {
+                int pc = ChartOption.ParseColor(palv.At(pi), 0);
+                if (pc != 0) { pal.Add(pc); }
+            }
+            if (pal.Count > 0) { o.colorPal = pal; }
+        }
+        o.roamWheelMode = ChartKinds.RoamWheelModeSanitize(
+            v.Str("roamWheelMode", o.roamWheelMode));
+        ChartOption.ParseGrid(v.Get("grid"), o);
+        ChartOption.ParseGridMediaInto(o, mediaOpt);
+        ChartOption.ParseDataZoom(v.Get("dataZoom"), o);
+
+        ChartOption.ParseLegendInto(o, v);
+
+        ChartOption.ParseDataRangeInto(o, v);
+        ChartOption.ParseTooltipInto(o, v);
+        ChartOption.ParseToolboxInto(o, v);
+        // connect 组（ECharts connect(group)）：非 0 组号参与多图联动。
+        o.connectGroup = v.Int("connectGroup", o.connectGroup);
+        if (v.Has("markLine")) { o.markLine = v.Int("markLine", o.markLine); }
+        // markPoint 同时支持旧 bool 形式和 ECharts 对象 {data:[...]}。
+        // 对象形式的数据项解析推迟到系列构建之后（见本函数末尾），
+        // 以便挂接到第一个 line/bar 系列。
+        JsonValue mpj = v.Get("markPoint");
+        if (mpj != null && mpj.IsObject()) { o.markPoint = true; }
+        else { o.markPoint = v.Bool("markPoint", o.markPoint); }
+        o.markLabel = v.Str("markLabel", o.markLabel);
+        ChartOption.ParseMarkArea(v.Get("markArea"), o);
+        o.animation = v.Bool("animation", o.animation);
+        o.animationDuration = v.Int("animationDuration", o.animationDuration);
+        o.animationDurationUpdate = v.Int("animationDurationUpdate", o.animationDurationUpdate);
+        o.animationEasing = v.Str("animationEasing", o.animationEasing);
+        o.animationEasingUpdate = v.Str("animationEasingUpdate", o.animationEasingUpdate);
+        o.animationThreshold = v.Int("animationThreshold", o.animationThreshold);
+        o.useUTC = v.Bool("useUTC", o.useUTC);
+        o.blendMode = v.Str("blendMode", o.blendMode);
+        ChartOption.ParseBMapAndBrush(o, v);
+        ChartOption.ParseSingleAxis(o, v);
+
+        ChartOption.ParseRadarInto(o, v);
+
+        ChartOption.ParsePolarInto(o, v);
+
+        ChartOption.ParseAxis(v.Get("xAxis"), o.xAxes, true);
+        ChartOption.ParseAxis(v.Get("yAxis"), o.yAxes, false);
+        ChartOption.ParseVisualMap(v.Get("visualMap"), o.visualMaps);
+        ChartOption.SyncRampFromVisualMap(o);
+
+        ChartOption.ParseDatasetInto(o, v);
+
+        // ECharts geo 组件：底图地图（对象或数组），系列解析后
+        // 由合成块挂载。
+        ChartOption.ParseGeo(v.Get("geo"), o);
+        ChartOption.ParseCalendar(v.Get("calendar"), o);
+        ChartOption.ParseGraphic(v.Get("graphic"), o);
+        // 锚定 coord 依赖格查找表）。
+        ChartOption.ParseParAxes(v.Get("parallelAxis"), o);
+        // ECharts 极坐标轴（angleAxis/radiusAxis）：对象或数组形态，
+        // polarIndex 绑定到 polar[]（coordinateSystem:"polar" 系列）。
+        ChartOption.ParsePolarAxes(v.Get("angleAxis"), o, true);
+        ChartOption.ParsePolarAxes(v.Get("radiusAxis"), o, false);
+        // parallel 组件块：layout 命名轴排布方向（'vertical' = 轴横
+        // 置自上而下堆叠，nutrients 官方图；'horizontal'/缺省 = 既有
+        // 竖轴从左到右）。
+        JsonValue parj = v.Get("parallel");
+        if (parj != null && parj.IsObject()) {
+            o.parLayout = parj.Str("layout", o.parLayout);
+        }
+        ChartOption.ParseSeriesInto(o, v);
+
+        // geo 组件合成底图系列：每个 geo 一个 type=Map 的载体系列
+        // （isGeoBase）。没有用户 map 系列时插到队首（lead=Map，分发
+        // "map"）；有则追加。geo 绑定的散点/路线叠加渲染在
+        // DrawGeoMap（后续批次）。
+        ChartOption.SynthesizeGeoBaseSeries(o);
+
+        ChartOption.ApplyPostSeriesFixups(o, v);
         return o;
     }
 
