@@ -1225,8 +1225,21 @@ static int zan__crash_logpath_for(const struct tm *tmv, char *out, size_t cap) {
     month[0] = '\0';
     day[0] = '\0';
     if (tmv) {
-        strftime(month, sizeof month, "%Y%m", tmv);
-        strftime(day, sizeof day, "%d", tmv);
+        int y = tmv->tm_year + 1900;
+        unsigned mo = (unsigned)(tmv->tm_mon + 1);
+        unsigned da = (unsigned)tmv->tm_mday;
+        if (y < 0 || y > 9999) y = 1970;
+        if (mo > 12) mo = 1;
+        if (da > 31) da = 1;
+        char *p = month;
+        p[0] = (char)('0' + (y / 1000) % 10);
+        p[1] = (char)('0' + (y / 100) % 10);
+        p = zan__crash_put2(p + 2, (unsigned)(y % 100));
+        p = zan__crash_put2(p, mo);
+        *p = '\0';
+        p = day;
+        p = zan__crash_put2(p, da);
+        *p = '\0';
     }
     if (!month[0] || !day[0]) return 0;
     char dir[4096];

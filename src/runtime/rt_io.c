@@ -1281,10 +1281,18 @@ static int io_shard_open(int i) {
     io_shards_prime();
     zan_io_shard_t *sh = &g_ioshard[i];
     if (sh->poll_fd >= 0) return 1;
+#if defined(EPOLL_CLOEXEC)
+    sh->poll_fd = epoll_create1(EPOLL_CLOEXEC);
+#else
     sh->poll_fd = epoll_create1(0);
+#endif
     if (sh->poll_fd < 0) return 0;
     zan_io_fd_cloexec(sh->poll_fd);
+#if defined(EFD_CLOEXEC)
+    sh->wake_rfd = sh->wake_wfd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+#else
     sh->wake_rfd = sh->wake_wfd = eventfd(0, EFD_NONBLOCK);
+#endif
     zan_io_fd_cloexec(sh->wake_rfd);
     if (sh->wake_rfd >= 0) {
         struct epoll_event ev;
@@ -1294,7 +1302,11 @@ static int io_shard_open(int i) {
         epoll_ctl(sh->poll_fd, EPOLL_CTL_ADD, sh->wake_rfd, &ev);
     }
     if (i == 0) {
+#if defined(EFD_CLOEXEC)
+        g_dns_wake_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+#else
         g_dns_wake_fd = eventfd(0, EFD_NONBLOCK);
+#endif
         zan_io_fd_cloexec(g_dns_wake_fd);
         if (g_dns_wake_fd >= 0) {
             struct epoll_event ev;
