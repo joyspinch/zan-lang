@@ -1,0 +1,364 @@
+using System;
+using System.Collections.Generic;
+using System.Text;
+using System.Net.Sockets;
+using System.Net.Tls;
+
+namespace System.Net.Mail;
+
+// POP3 邮件客户端（RFC 1939），纯 Zan 实现，无原生第三方依赖。
+//
+// 支持明文（端口 110）与 POP3S 隐式 TLS（端口 995）；
+// 实现了标准的 USER/PASS 认证、STAT 统计、LIST 列表、RETR 获取正文、
+// DELE 标记删除、RSET 重置、NOOP 保活以及 QUIT 退出会话。
+// 遵循 RFC 1939 规范处理多行响应中的点转义（Byte-Stuffing 解包）。
+public class Pop3Client : IDisposable {
+    string host;
+    int port;
+    int timeoutMs;
+    bool useTls;
+    bool verifyTls;
+    TcpClient conn;
+    TlsStream tls;
+    bool open;
+
+    byte[] inbuf;
+    int inhead;
+    int intail;
+    int incap;
+    string lastResponse;
+
+    public Pop3Client(string host, int port) {
+        this.host = host;
+        this.port = port;
+        this.timeoutMs = 30000;
+        this.useTls = port == 995;
+        this.verifyTls = true;
+        this.conn = null;
+        this.tls = null;
+        this.open = false;
+        this.inbuf = null;
+        this.inhead = 0;
+        this.intail = 0;
+        this.incap = 0;
+        this.lastResponse = "";
+    }
+
+    public void SetTimeout(int ms) {
+        if (ms > 0) { this.timeoutMs = ms; }
+    }
+
+    public void EnableTls(bool enable) {
+        this.useTls = enable;
+    }
+
+    public void DisableTlsVerify() {
+        this.verifyTls = false;
+    }
+
+    public bool IsConnected() {
+        return this.open;
+    }
+
+    public string LastResponse() {
+        return this.lastResponse;
+    }
+
+    // 建立连接并接收服务器欢迎语（必须以 +OK 开头）。
+    public async Pop3Result ConnectAsync() {
+        if (this.open) {
+            return Pop3Result.Ok("Already connected");
+        }
+        Socket.Initialize();
+        TcpClient c = await TcpClient.ConnectAsync(this.host, this.port);
+        if (c == null) {
+            return Pop3Result.Fail("connect", "无法连接到 POP3 服务器: " + this.host + ":" + Convert.ToString(this.port));
+        }
+        this.conn = c;
+
+        if (this.useTls) {
+            TlsContext ctx = TlsContext.CreateClient();
+            if (!this.verifyTls) { ctx.DisableVerify(); }
+            TlsStream ts = await TlsStream.ConnectAsync(ctx, c.GetSocket(), this.host, this.timeoutMs);
+            if (ts == null) {
+                this.Close();
+                return Pop3Result.Fail("tls", "POP3S TLS 握手失败: " + ctx.error);
+            }
+            this.tls = ts;
+        }
+
+        this.open = true;
+        this.inhead = 0;
+        this.intail = 0;
+
+        string greeting = await this.readResponse();
+        if (greeting == null || !Pop3Client.IsOk(greeting)) {
+            this.Close();
+            return Pop3Result.Fail("greeting", "POP3 问候失败: " + this.lastResponse);
+        }
+
+        return Pop3Result.Ok(greeting);
+    }
+
+    // 用户名与密码身份鉴权（USER/PASS）。
+    public async Pop3Result LoginAsync(string user, string pass) {
+        if (!this.open) {
+            Pop3Result cr = await this.ConnectAsync();
+            if (!cr.ok) { return cr; }
+        }
+
+        if (!await this.writeLine("USER " + user)) {
+            return Pop3Result.Fail("user", "发送 USER 命令失败");
+        }
+        string userResp = await this.readResponse();
+        if (userResp == null || !Pop3Client.IsOk(userResp)) {
+            return Pop3Result.Fail("user", "USER 鉴权失败: " + this.lastResponse);
+        }
+
+        if (!await this.writeLine("PASS " + pass)) {
+            return Pop3Result.Fail("pass", "发送 PASS 命令失败");
+        }
+        string passResp = await this.readResponse();
+        if (passResp == null || !Pop3Client.IsOk(passResp)) {
+            return Pop3Result.Fail("pass", "PASS 鉴权失败: " + this.lastResponse);
+        }
+
+        return Pop3Result.Ok("登录成功");
+    }
+
+    // 查询邮箱总邮件数与总字节大小（STAT）。
+    public async Pop3Result StatAsync() {
+        if (!this.open) {
+            return Pop3Result.Fail("stat", "未连接到服务器");
+        }
+        if (!await this.writeLine("STAT")) {
+            return Pop3Result.Fail("stat", "发送 STAT 失败");
+        }
+        string resp = await this.readResponse();
+        if (resp == null || !Pop3Client.IsOk(resp)) {
+            return Pop3Result.Fail("stat", "STAT 查询失败: " + this.lastResponse);
+        }
+
+        // "+OK 2 320" -> 解析 count 和 totalBytes
+        int count = 0;
+        int totalBytes = 0;
+        int sp1 = resp.IndexOf(" ", 0);
+        if (sp1 > 0) {
+            int sp2 = resp.IndexOf(" ", sp1 + 1);
+            if (sp2 > sp1) {
+                count = Pop3Client.ParseInt(resp.Substring(sp1 + 1, sp2 - sp1 - 1).Trim());
+                totalBytes = Pop3Client.ParseInt(resp.Substring(sp2 + 1, resp.Length - sp2 - 1).Trim());
+            } else {
+                count = Pop3Client.ParseInt(resp.Substring(sp1 + 1, resp.Length - sp1 - 1).Trim());
+            }
+        }
+
+        Pop3Result r = Pop3Result.Ok(resp);
+        r.count = count;
+        r.totalBytes = totalBytes;
+        return r;
+    }
+
+    // 列出所有邮件的编号与大小（LIST）。
+    public async List<Pop3MessageInfo> ListAsync() {
+        List<Pop3MessageInfo> list = new List<Pop3MessageInfo>();
+        if (!this.open) { return list; }
+        if (!await this.writeLine("LIST")) { return list; }
+
+        string resp = await this.readResponse();
+        if (resp == null || !Pop3Client.IsOk(resp)) { return list; }
+
+        while (true) {
+            string line = await this.readLineRaw();
+            if (line == null || line == ".") { break; }
+            int sp = line.IndexOf(" ", 0);
+            if (sp > 0) {
+                int id = Pop3Client.ParseInt(line.Substring(0, sp).Trim());
+                int sz = Pop3Client.ParseInt(line.Substring(sp + 1, line.Length - sp - 1).Trim());
+                if (id > 0) {
+                    list.Add(new Pop3MessageInfo(id, sz));
+                }
+            }
+        }
+        return list;
+    }
+
+    // 获取指定编号邮件的全文（RETR）。
+    // 自动按 RFC 1939 处理点转义（Byte-Unstuffing：多行中以 ".." 开头的行脱掉前导点）。
+    public async string RetrAsync(int msgId) {
+        if (!this.open || msgId <= 0) { return null; }
+        if (!await this.writeLine("RETR " + Convert.ToString(msgId))) { return null; }
+
+        string resp = await this.readResponse();
+        if (resp == null || !Pop3Client.IsOk(resp)) { return null; }
+
+        return await this.readMultiLineAsync();
+    }
+
+    // 标记删除指定编号的邮件（DELE）。
+    public async bool DeleAsync(int msgId) {
+        if (!this.open || msgId <= 0) { return false; }
+        if (!await this.writeLine("DELE " + Convert.ToString(msgId))) { return false; }
+        string resp = await this.readResponse();
+        return Pop3Client.IsOk(resp);
+    }
+
+    // 重置当前会话中标记的所有删除状态（RSET）。
+    public async bool RsetAsync() {
+        if (!this.open) { return false; }
+        if (!await this.writeLine("RSET")) { return false; }
+        string resp = await this.readResponse();
+        return Pop3Client.IsOk(resp);
+    }
+
+    // 心跳保活探测（NOOP）。
+    public async bool NoopAsync() {
+        if (!this.open) { return false; }
+        if (!await this.writeLine("NOOP")) { return false; }
+        string resp = await this.readResponse();
+        return Pop3Client.IsOk(resp);
+    }
+
+    // 发送退出命令并提交修改，随后关闭连接（QUIT）。
+    public async bool QuitAsync() {
+        if (!this.open) { return true; }
+        await this.writeLine("QUIT");
+        string resp = await this.readResponse();
+        this.Close();
+        return Pop3Client.IsOk(resp);
+    }
+
+    public void Close() {
+        this.open = false;
+        if (this.tls != null) {
+            this.tls.Close();
+            this.tls = null;
+        }
+        if (this.conn != null) {
+            this.conn.Close();
+            this.conn = null;
+        }
+        this.inbuf = null;
+        this.inhead = 0;
+        this.intail = 0;
+        this.incap = 0;
+    }
+
+    public void Dispose() {
+        this.Close();
+    }
+
+    public static bool IsOk(string resp) {
+        return resp != null && resp.StartsWith("+OK");
+    }
+
+    public static int ParseInt(string s) {
+        if (s == null || s.Length == 0) { return 0; }
+        int v = 0;
+        for (int i = 0; i < s.Length; i = i + 1) {
+            int c = s[i] & 255;
+            if (c >= 48 && c <= 57) {
+                v = v * 10 + (c - 48);
+            } else {
+                break;
+            }
+        }
+        return v;
+    }
+
+    // ---- 底层 IO 与协议读写 ----
+
+    void ensureRoom(int need) {
+        if (this.inhead > 0) {
+            int rem = this.intail - this.inhead;
+            if (rem > 0) {
+                NativeMemory.Copy((nint)this.inbuf, (nint)this.inbuf + (nint)this.inhead, rem);
+            }
+            this.intail = rem;
+            this.inhead = 0;
+        }
+        if (this.incap - this.intail >= need) { return; }
+        int ncap = this.incap > 0 ? this.incap * 2 : 16384;
+        while (ncap - this.intail < need) { ncap = ncap * 2; }
+        byte[] nb = new byte[ncap + 1];
+        if (this.intail > 0) {
+            NativeMemory.Copy((nint)nb, (nint)this.inbuf, this.intail);
+        }
+        this.inbuf = nb;
+        this.incap = ncap;
+    }
+
+    async int fillMore() {
+        if (this.tls != null) {
+            byte[] tmp = new byte[16385];
+            int n = await this.tls.RecvBytesAsync(tmp, 0, 16384);
+            if (n <= 0) { return 0; }
+            this.ensureRoom(n);
+            NativeMemory.Copy((nint)this.inbuf + (nint)this.intail, (nint)tmp, n);
+            this.intail = this.intail + n;
+            return n;
+        }
+        this.ensureRoom(16384);
+        nint sock = this.conn.GetSocket();
+        byte[] tmp2 = new byte[16385];
+        int n2 = await Socket.RecvOv(sock, tmp2, 16384);
+        if (n2 <= 0) { return 0; }
+        this.ensureRoom(n2);
+        NativeMemory.Copy((nint)this.inbuf + (nint)this.intail, (nint)tmp2, n2);
+        this.intail = this.intail + n2;
+        return n2;
+    }
+
+    async string readLineRaw() {
+        int scan = this.inhead;
+        while (true) {
+            while (scan + 1 < this.intail) {
+                if ((this.inbuf[scan] & 255) == 13 && (this.inbuf[scan + 1] & 255) == 10) {
+                    string line = Encoding.UTF8.GetString(this.inbuf, this.inhead, scan - this.inhead);
+                    this.inhead = scan + 2;
+                    return line;
+                }
+                scan = scan + 1;
+            }
+            int got = await this.fillMore();
+            if (got <= 0) { return null; }
+            scan = this.inhead;
+        }
+    }
+
+    async string readResponse() {
+        string line = await this.readLineRaw();
+        if (line == null) { return null; }
+        this.lastResponse = line;
+        return line;
+    }
+
+    async string readMultiLineAsync() {
+        StringBuilder sb = new StringBuilder();
+        while (true) {
+            string line = await this.readLineRaw();
+            if (line == null || line == ".") { break; }
+            if (line.Length >= 2 && (line[0] & 255) == 46 && (line[1] & 255) == 46) {
+                // Byte-unstuffing RFC 1939
+                line = line.Substring(1);
+            }
+            if (sb.Length > 0) { sb.Append("\r\n"); }
+            sb.Append(line);
+        }
+        return sb.ToString();
+    }
+
+    async bool writeLine(string line) {
+        byte[] buf = Encoding.UTF8.GetBytes(line + "\r\n");
+        int n = await this.sendBytes(buf, buf.Length);
+        return n == buf.Length;
+    }
+
+    async int sendBytes(byte[] buf, int len) {
+        if (this.tls != null) {
+            return await this.tls.SendBytesAsync(buf, 0, len);
+        }
+        nint sock = this.conn.GetSocket();
+        return await Socket.SendBytesAsync(sock, buf, 0, len);
+    }
+}
