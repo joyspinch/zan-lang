@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Net.Sockets;
+using System.Net.Tls;
 using System.Threading;
 
 namespace System.Net.Mqtt;
@@ -8,6 +9,10 @@ namespace System.Net.Mqtt;
 // MQTT v3.1.1 客户端（支持全双工、并发发布与协程安全收发）。
 public class MqttClient : IDisposable {
     TcpClient conn;
+    TlsStream tls;
+    TlsContext tlsCtx;
+    bool useTls;
+    bool verifyTls;
     MqttReader reader;
     string clientId;
     string host;
@@ -50,12 +55,21 @@ public class MqttClient : IDisposable {
         this.username = "";
         this.password = "";
         this.lastReturnCode = 0;
+        this.tls = null;
+        this.tlsCtx = null;
+        this.useTls = false;
+        this.verifyTls = true;
         this.pendingPackets = new List<MqttPacket>();
         this.stateLock = new Mutex();
         this.sendBusy = false;
         this.sendWaiters = new List<AsyncGate>();
         this.recvBusy = false;
         this.recvWaiters = new List<AsyncGate>();
+    }
+
+    // 查询当前底层传输是否处于 TLS 加密中（MQTTS）。
+    public bool IsTlsActive() {
+        return this.tls != null && this.tls.IsConnected();
     }
 
     // 设置客户端连接鉴权凭据（用户名/密码，RFC/OASIS MQTT v3.1.1 §3.1.3.4-§3.1.3.5）
@@ -154,8 +168,12 @@ public class MqttClient : IDisposable {
         if (packet == null || length <= 0) { return 0; }
         if (!await this.AcquireSendAsync()) { return -1; }
         int sent = -1;
-        if (this.connected && this.conn != null) {
-            sent = await this.conn.SendBytesAsync(packet, length);
+        if (this.connected) {
+            if (this.tls != null) {
+                sent = await this.tls.SendBytesAsync(packet, length);
+            } else if (this.conn != null) {
+                sent = await this.conn.SendBytesAsync(packet, length);
+            }
         }
         this.ReleaseSend();
         return sent;
@@ -438,6 +456,66 @@ public class MqttClient : IDisposable {
 
         // CONNACK：固定头（2 字节）+ 可变头（2 字节）；
         // body 的第 2 字节为连接返回码（0 = 已接受，4 = 用户名/密码错误，5 = 未授权）。
+        MqttPacket ack = await mqtt.reader.ReadPacketAsync();
+        if (ack == null || ack.packetType != MqttPacketType.CONNACK) {
+            mqtt.connected = false;
+            return mqtt;
+        }
+        if (ack.bodyLen >= 2 && ack.body != null) {
+            int returnCode = ack.body[1] & 255;
+            mqtt.lastReturnCode = returnCode;
+            if (returnCode == 0) {
+                mqtt.connected = true;
+            }
+        }
+        return mqtt;
+    }
+
+    // 通过 TLS 安全加密通道（MQTTS，默认 8883 端口）连接 broker 并执行 MQTT CONNECT/CONNACK 握手。
+    public static async MqttClient ConnectTlsAsync(string host, int port, string clientId) {
+        return await MqttClient.ConnectTlsAsync(host, port, clientId, 60, "", "", 0, false, "", "", true);
+    }
+
+    // 通过 TLS 安全加密通道带凭据连接 broker 并执行 MQTT CONNECT/CONNACK 握手。
+    public static async MqttClient ConnectTlsAsync(string host, int port, string clientId, string username, string password) {
+        return await MqttClient.ConnectTlsAsync(host, port, clientId, 60, "", "", 0, false, username, password, true);
+    }
+
+    // 通过 TLS 安全加密通道带遗嘱、自定义 KeepAlive 秒数、凭据及证书校验控制连接 broker。
+    public static async MqttClient ConnectTlsAsync(string host, int port, string clientId, int keepAlive, string willTopic, string willMessage, int willQos, bool willRetain, string username, string password, bool verifyCert) {
+        MqttClient mqtt = new MqttClient();
+        mqtt.host = host;
+        mqtt.port = port;
+        mqtt.clientId = clientId;
+        mqtt.useTls = true;
+        mqtt.verifyTls = verifyCert;
+        if (keepAlive > 0) {
+            mqtt.keepAlive = keepAlive;
+        }
+        if (willTopic != null && willTopic.Length > 0) {
+            mqtt.SetWill(willTopic, willMessage, willQos, willRetain);
+        }
+        mqtt.SetCredentials(username, password);
+
+        mqtt.conn = await TcpClient.ConnectAsync(host, port);
+        if (mqtt.conn == null) { return mqtt; }
+
+        mqtt.tlsCtx = TlsContext.CreateClient();
+        if (!verifyCert) {
+            mqtt.tlsCtx.DisableVerify();
+        }
+        TlsStream ts = await TlsStream.ConnectAsync(mqtt.tlsCtx, mqtt.conn.GetSocket(), host, 10000);
+        if (ts == null) {
+            mqtt.Abort();
+            return mqtt;
+        }
+        mqtt.tls = ts;
+        mqtt.reader = new MqttReader(mqtt.conn.GetSocket());
+        mqtt.reader.SetTls(ts);
+
+        byte[] packet = mqtt.BuildConnectPacket();
+        int sent = await mqtt.tls.SendBytesAsync(packet, packet.Length);
+
         MqttPacket ack = await mqtt.reader.ReadPacketAsync();
         if (ack == null || ack.packetType != MqttPacketType.CONNACK) {
             mqtt.connected = false;
@@ -823,8 +901,17 @@ public class MqttClient : IDisposable {
     public void Abort() {
         this.stateLock.WaitOne();
         this.connected = false;
+        if (this.tls != null) {
+            this.tls.Close();
+            this.tls = null;
+        }
+        if (this.tlsCtx != null) {
+            this.tlsCtx.Free();
+            this.tlsCtx = null;
+        }
         if (this.conn != null) {
             this.conn.Close();
+            this.conn = null;
         }
         this.stateLock.ReleaseMutex();
         this.WakeSendWaiters();
