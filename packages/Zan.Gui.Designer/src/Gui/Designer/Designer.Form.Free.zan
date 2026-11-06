@@ -1,0 +1,615 @@
+using System;
+using System.Collections.Generic;
+using System.Json;
+using Gui;
+using Gui.Widget;
+using Gui.Component;
+using Gui.Backend;
+
+namespace Gui.Designer;
+
+partial class Designer {
+
+    FormField FreePick(List<FormField> lst, int mx, int my, int px, int py) {
+        return this.DesignPickDevice(this.DesignDevice(mx), this.DesignDevice(my));
+    }
+
+    int AbsOriginX(FormField f) {
+        DesignPreviewNode node = this.PreviewNode(f);
+        return node == null ? this.ContOriginX(null) : node.originX;
+    }
+
+    int AbsOriginY(FormField f) {
+        DesignPreviewNode node = this.PreviewNode(f);
+        return node == null ? this.ContOriginY(null) : node.originY;
+    }
+
+    // 按当前 sel 重算拖拽基（父内容框原点）。基过去只在
+    // FreePick 直接命中时顺带写入——框选、撤销或代码置选中之后
+    // 基还是旧值，嵌套子级一拖就按画布原点算，组件“瞬移”出容器。
+    void SyncFreeSelBase() {
+        if (sel == null) { freeSelPX = 0; freeSelPY = 0; return; }
+        freeSelPX = this.AbsOriginX(sel);
+        freeSelPY = this.AbsOriginY(sel);
+    }
+
+    // `anc` 是否是 `f` 的严格祖先容器。
+    bool IsAncestorOf(FormField anc, FormField f) {
+        FormField p = DesignOwnerOf(f);
+        while (p != null) {
+            if (p == anc) { return true; }
+            p = DesignOwnerOf(p);
+        }
+        return false;
+    }
+
+    // 映射已经包含真实 SlotHost、边框/内边距和滚动偏移。
+    int ContOriginX(FormField cont) {
+        if (cont == null) { return this.DesignSlotOriginX(pvDocRoot); }
+        DesignPreviewNode node = this.PreviewNode(cont);
+        if (node == null || node.control == null) { return 0; }
+        return this.DesignLogical(node.control.bx) + node.insetX;
+    }
+
+    int ContOriginY(FormField cont) {
+        if (cont == null) { return this.DesignSlotOriginY(pvDocRoot); }
+        DesignPreviewNode node = this.PreviewNode(cont);
+        if (node == null || node.control == null) { return 0; }
+        return this.DesignLogical(node.control.by) + node.insetY;
+    }
+
+    // 换父时维持世界位置；组拖动只改同组选中祖先之外的根。
+    void FreeReparentSel(FormField cont) {
+        if (sel == null || designMoves == null) { return; }
+        for (int i = 0; i < designMoves.Count; i = i + 1) {
+            FormField f = designMoves[i].field;
+            if (cont == f || this.DesignInSubtree(f, cont)) { return; }
+        }
+        Control host = this.DesignSlot(cont, designDropSlot);
+        int newBaseX = this.DesignSlotOriginX(host);
+        int newBaseY = this.DesignSlotOriginY(host);
+        bool moved = false;
+        for (int i = 0; i < designMoves.Count; i = i + 1) {
+            FormField f = designMoves[i].field;
+            FormField pc = this.DesignOwnerOf(f);
+            if (pc == cont && (cont == null || f.childTab == designDropSlot)) {
+                // 同容器内部拖拽调序：按 FlowDropTarget 探测到的精确插槽 dropIndex 重新插入
+                if (cont != null && dropIndex >= 0 && dropIndex <= cont.kids.Count) {
+                    int oldIdx = IndexIn(cont.kids, f);
+                    if (oldIdx >= 0 && oldIdx != dropIndex) {
+                        cont.kids = ListRemove(cont.kids, f);
+                        int targetIdx = dropIndex;
+                        if (targetIdx > oldIdx) { targetIdx = targetIdx - 1; }
+                        if (targetIdx < 0) { targetIdx = 0; }
+                        if (targetIdx > cont.kids.Count) { targetIdx = cont.kids.Count; }
+                        cont.kids.Insert(targetIdx, f);
+                        moved = true;
+                    }
+                } else if (cont == null && dropIndex >= 0 && dropIndex <= fields.Count) {
+                    int oldIdx = IndexIn(fields, f);
+                    if (oldIdx >= 0 && oldIdx != dropIndex) {
+                        fields = ListRemove(fields, f);
+                        int targetIdx = dropIndex;
+                        if (targetIdx > oldIdx) { targetIdx = targetIdx - 1; }
+                        if (targetIdx < 0) { targetIdx = 0; }
+                        if (targetIdx > fields.Count) { targetIdx = fields.Count; }
+                        fields.Insert(targetIdx, f);
+                        moved = true;
+                    }
+                }
+                continue;
+            }
+            int absX = this.DesignEditOriginX(f) + f.fx;
+            int absY = this.DesignEditOriginY(f) + f.fy;
+            if (pc == null) { fields = ListRemove(fields, f); }
+            else { pc.kids = ListRemove(pc.kids, f); }
+            f.childTab = cont == null ? 0 : designDropSlot;
+            if (cont == null) {
+                if (dropIndex >= 0 && dropIndex <= fields.Count) {
+                    fields.Insert(dropIndex, f);
+                } else {
+                    fields.Add(f);
+                }
+            } else {
+                if (dropIndex >= 0 && dropIndex <= cont.kids.Count) {
+                    cont.kids.Insert(dropIndex, f);
+                } else {
+                    cont.kids.Add(f);
+                }
+            }
+            f.fx = absX - newBaseX;
+            f.fy = absY - newBaseY;
+            if (f.fx < 0) { f.fx = 0; }
+            if (f.fy < 0) { f.fy = 0; }
+            this.DesignDeclareRect(f);
+            moved = true;
+        }
+        activeContainer = cont;
+        if (cont != null && cont.kind == "SplitPanel") { cont.uiState.Set(designDropSlot); }
+        this.SyncFreeSelBase();
+        if (moved) {
+            this.MarkDocDirty();
+            string cname = cont == null ? "" : (cont.fname != "" ? cont.fname : cont.KindName());
+            msg = cont == null ? Designer.T("moved to canvas", "已移回画布根层")
+                : Designer.T("moved into ", "已移入 ") + cname;
+        }
+    }
+
+    void DrawFreeDropHi(App app, Canvas c, int ox, int oy, int psMilli,
+            FormField hi) {
+        if (hi == null || !this.DesignVisible(hi)) { return; }
+        Control host = this.DesignSlot(hi, designDropSlot);
+        Rect content = this.DesignContentRect(host);
+        int left = ox + this.DesignViewPx(content.x, psMilli);
+        int top = oy + this.DesignViewPx(content.y, psMilli);
+        int right = ox + this.DesignViewPx(content.Right(), psMilli);
+        int bottom = oy + this.DesignViewPx(content.Bottom(), psMilli);
+        int dw = right - left;
+        int dh = bottom - top;
+        if (dw <= 0 || dh <= 0) { return; }
+        int acc = Style.Part(app, "designer", "accent", "", "", "", Style.SNormal()).BgOr(0x2288EE);
+        c.FillRect(left, top, dw, dh, Style.Fade(acc, 40));
+        c.DrawRect(left - 2, top - 2, dw + 4, dh + 4, acc, 2);
+
+        // 浮动容器名称与类型提示徽标
+        string title = hi.fname;
+        if (title == "") { title = FormField.TypeName(hi.ftype); }
+        string tip = Designer.T("↳ Drop into: ", "↳ 移入容器: ") + title;
+        if (hi.kind == "Tabs") {
+            tip = tip + " (" + Designer.T("Tab ", "标签页 ") + Convert.ToString(designDropSlot + 1) + ")";
+        }
+        int fs = Style.FontFallback(app, "tiny");
+        if (fs <= 0) { fs = Style.FontFallback(app, "small"); }
+        int tw = Canvas.MeasureText(tip, fs) + app.Scale(12);
+        int th = app.Scale(20);
+        int bx = left + app.Scale(4);
+        int by = top - th - app.Scale(2);
+        if (by < oy + app.Scale(2)) { by = top + app.Scale(4); }
+        c.FillRoundRect(bx, by, tw, th, app.Scale(3), 0xEE1E1E1E);
+        c.DrawRoundRect(bx, by, tw, th, app.Scale(3), acc, 1);
+        c.DrawText(bx + app.Scale(6), by + app.Scale(3), tip, 0xFFFFFFFF, fs);
+    }
+
+    void DrawFreeDropRootHi(App app, Canvas c, int ox, int oy, int psMilli, int cw2, int ch2) {
+        int acc = Style.Part(app, "designer", "accent", "", "", "", Style.SNormal()).BgOr(0x2288EE);
+        c.DrawRect(ox, oy, cw2, ch2, acc, 2);
+        string tip = "⇪ " + Designer.T("Move to Form Root", "移回窗口根层");
+        int fs = Style.FontFallback(app, "tiny");
+        if (fs <= 0) { fs = Style.FontFallback(app, "small"); }
+        int tw = Canvas.MeasureText(tip, fs) + app.Scale(12);
+        int th = app.Scale(20);
+        int bx = ox + app.Scale(8);
+        int by = oy + app.Scale(8);
+        c.FillRoundRect(bx, by, tw, th, app.Scale(3), 0xEE1E1E1E);
+        c.DrawRoundRect(bx, by, tw, th, app.Scale(3), acc, 1);
+        c.DrawText(bx + app.Scale(6), by + app.Scale(3), tip, 0xFFFFFFFF, fs);
+    }
+
+    // 框选直接比较目标设备矩形；普通 HTML Element 的 kids 同样递归。
+    void MarqueeCollect(List<FormField> lst, int selL, int selT,
+            int selR, int selB, List<FormField> got) {
+        for (int i = 0; i < lst.Count; i = i + 1) {
+            FormField f = lst[i];
+            DesignPreviewNode node = this.PreviewNode(f);
+            if (node == null || !node.visible || node.control == null) { continue; }
+            Control ctl = node.control;
+            int left = ctl.bx;
+            int top = ctl.by;
+            int right = ctl.bx + ctl.bw;
+            int bottom = ctl.by + ctl.bh;
+            Control parent = ctl.parent;
+            while (parent != null) {
+                if (parent.computedStyle == null || parent.computedStyle.overflow != 0) {
+                    int pl = parent.bx;
+                    int pt = parent.by;
+                    int pr = parent.bx + parent.bw;
+                    int pb = parent.by + parent.bh;
+                    if (parent.IsScrollContainer() && parent.computedStyle != null) {
+                        pl = pl + parent.computedStyle.BorderLeftPx();
+                        pt = pt + parent.computedStyle.BorderTopPx();
+                        pr = pr - parent.computedStyle.BorderRightPx();
+                        pb = pb - parent.computedStyle.BorderBottomPx();
+                    }
+                    if (left < pl) { left = pl; }
+                    if (top < pt) { top = pt; }
+                    if (right > pr) { right = pr; }
+                    if (bottom > pb) { bottom = pb; }
+                }
+                parent = parent.parent;
+            }
+            if (left < right && top < bottom && left < selR && right > selL
+                    && top < selB && bottom > selT) { got.Add(f); }
+            this.MarqueeCollect(f.kids, selL, selT, selR, selB, got);
+        }
+    }
+
+    // `f` 的某个祖先是否也在 `got` 里——框选时容器和它的子级
+    // 同时相交只留容器：拖动父级本来就带着子级，两组一起选
+    // 会把子级移两次。
+    bool HasAncestorIn(FormField f, List<FormField> got) {
+        FormField pc = DesignOwnerOf(f);
+        while (pc != null) {
+            for (int i = 0; i < got.Count; i = i + 1) {
+                if (got[i] == pc) { return true; }
+            }
+            pc = DesignOwnerOf(pc);
+        }
+        return false;
+    }
+
+    // 判断选中组件 f 是否允许显示/响应第 hn 号调整大小手柄：
+    // hn 对应：0 左上 1 上 2 右上 3 右 4 右下 5 下 6 左下 7 左。
+    static bool FreeHandleAllowed(FormField f, int hn) {
+        if (f == null) { return false; }
+        // 1. 通栏横幅型控件（工具条、状态栏、菜单栏、横向分割线等）：
+        // 横向始终填满父容器宽度，禁止左右调整宽度。
+        if (f.IsFullWidthBanner()) {
+            // 若高度也是固定的（如状态栏、分割线），则完全不开放调整大小手柄。
+            if (f.IsFixedHeight()) { return false; }
+            // 工具条等允许微调高度的横幅控件仅开放下手柄（5）。
+            return hn == 5;
+        }
+        // 2. 固定尺寸控件（如开关、头像、单图标）：不开放随意拉伸。
+        if (f.IsFixedWidth()) {
+            return false;
+        }
+        // 3. 固定单行高度型控件（输入框、单选/多选、下拉框、滑块、分页等）：
+        // 高度由规格与标准行高严格约束，禁止拉伸高度；仅开放左右手柄（3 右、7 左）。
+        if (f.IsFixedHeight()) {
+            return hn == 3 || hn == 7;
+        }
+        // 4. 自由容器与复杂组件（Panel、DataGrid、TreeView、TextArea、Chart、Tabs 等）：
+        // 8 个方位手柄全部开放自由调整。
+        return true;
+    }
+
+    // 第 hn 号调整大小手柄（0 左上 1 上 2 右上 3 右 4 右下 5 下
+    // 6 左下 7 左）的 X：右手柄贴右边、左手柄贴左边，上/下手柄取中线。
+    static int FreeHandleX(int hn, int ex, int ew) {
+        if (hn == 2 || hn == 3 || hn == 4) { return ex + ew; }
+        if (hn == 0 || hn == 6 || hn == 7) { return ex; }
+        return ex + ew / 2;
+    }
+
+    // 第 hn 号手柄的 Y：上手柄（0/1/2）贴顶边、下手柄（4/5/6）
+    // 贴底边，左/右手柄取中线。
+    static int FreeHandleY(int hn, int ey, int eh) {
+        if (hn == 0 || hn == 1 || hn == 2) { return ey; }
+        if (hn == 4 || hn == 5 || hn == 6) { return ey + eh; }
+        return ey + eh / 2;
+    }
+
+    // 磁吸阈值：屏幕上约 6px 换算回设计像素，于是任何显示/视图缩放下手感一致
+    // （放大后要贴得更近才吸，缩小后更远就吸），而不是写死设计像素。
+    int FreeSnapTol(App app, int psMilli) {
+        int tol = app.Scale(6) * 1000 / psMilli;
+        if (tol < 1) { tol = 1; }
+        return tol;
+    }
+
+    // 参考线取真实父内容框及同一 SlotHost 内可见兄弟的矩形。
+    List<int> FreeSnapLines(bool horiz, FormField self) {
+        List<int> lines = new List<int>();
+        Control host = this.DesignParentHost(self);
+        Rect content = this.DesignContentRect(host);
+        int origin = horiz ? this.DesignEditOriginX(self) : this.DesignEditOriginY(self);
+        int first = this.DesignLogical(horiz ? content.x : content.y) - origin;
+        int last = this.DesignLogical(horiz ? content.Right() : content.Bottom()) - origin;
+        lines.Add(first);
+        lines.Add(first + (last - first) / 2);
+        lines.Add(last);
+        if (pvDocForm != null && pvDocForm.GetApp() != null && pvDocForm.GetApp().canvas != null) {
+            Canvas sc = pvDocForm.GetApp().canvas;
+            int winFirst = 0 - origin;
+            int winLast = this.DesignLogical(horiz ? sc.Width() : sc.Height()) - origin;
+            int winMid = winFirst + (winLast - winFirst) / 2;
+            lines.Add(winMid);
+        }
+        FormField pc = this.DesignOwnerOf(self);
+        List<FormField> sibs = pc == null ? fields : pc.kids;
+        List<int> sLefts = new List<int>();
+        List<int> sRights = new List<int>();
+        for (int i = 0; i < sibs.Count; i = i + 1) {
+            FormField f = sibs[i];
+            if (f == self || this.IsExtraSel(f) || !this.DesignVisible(f)
+                    || this.DesignParentHost(f) != host) { continue; }
+            DesignPreviewNode node = this.PreviewNode(f);
+            if (node == null || node.control == null || !node.visible) { continue; }
+            Control ctl = node.control;
+            int left = this.DesignLogical(horiz ? ctl.bx : ctl.by) - origin;
+            int right = this.DesignLogical(horiz ? ctl.bx + ctl.bw : ctl.by + ctl.bh) - origin;
+            lines.Add(left);
+            lines.Add(left + (right - left) / 2);
+            lines.Add(right);
+            sLefts.Add(left);
+            sRights.Add(right);
+        }
+        // 等间距（Equal Spacing）推导：探测兄弟控件两两之间的间隙，推导下一个等间距对齐候选线
+        for (int i = 0; i < sLefts.Count; i = i + 1) {
+            for (int j = 0; j < sLefts.Count; j = j + 1) {
+                if (i == j) { continue; }
+                int gap = sLefts[j] - sRights[i];
+                if (gap >= 4 && gap <= 240) {
+                    lines.Add(sRights[j] + gap);
+                }
+            }
+        }
+        // 辅助参考线（Guides）优先吸附
+        if (showGuides) {
+            if (horiz && vGuides != null) {
+                for (int i = 0; i < vGuides.Count; i = i + 1) {
+                    lines.Add(vGuides[i] - origin);
+                }
+            } else if (!horiz && hGuides != null) {
+                for (int i = 0; i < hGuides.Count; i = i + 1) {
+                    lines.Add(hGuides[i] - origin);
+                }
+            }
+        }
+        return lines;
+    }
+
+    // 一根轴上的磁吸：把移动元素的起点/中点/终点三个锚点吸到最近的候选线，
+    // 取三者里最近的那一次命中，所以「贴边、居中、和另一个控件对齐」都能触发。
+    // // 返回两个值：[0] = 校正后的起点（没命中就是原值），[1] = 命中的参考线坐标
+    // （-1 = 没命中，调用方据此决定画不画线）。纯几何、无 App，方便无窗口回归。
+    static List<int> SnapAxis(int start, int size, List<int> lines, int tol) {
+        List<int> r = new List<int>();
+        int best = tol + 1;
+        int adj = start;
+        int guide = 0 - 1;
+        for (int a = 0; a < 3; a = a + 1) {
+            int off = 0;
+            if (a == 1) { off = size / 2; }
+            if (a == 2) { off = size; }
+            int anchor = start + off;
+            for (int li = 0; li < lines.Count; li = li + 1) {
+                int d = anchor - lines[li];
+                if (d < 0) { d = 0 - d; }
+                if (d < best) {
+                    best = d;
+                    adj = lines[li] - off;
+                    guide = lines[li];
+                }
+            }
+        }
+        r.Add(adj);
+        r.Add(guide);
+        return r;
+    }
+
+
+    // 拖动中的树不遮住落点；仍按真实 retained children 的 z-index 和可见性挑选。
+    Control DesignDropHit(Control ctl, int x, int y) {
+        if (ctl == null || !ctl.StyleVisible() || x < ctl.bx || y < ctl.by
+                || x >= ctl.bx + ctl.bw || y >= ctl.by + ctl.bh) { return null; }
+        if (freeDragging && freeDragHasMoved && designMoves != null) {
+            for (int i = 0; i < designMoves.Count; i = i + 1) {
+                DesignPreviewNode node = this.PreviewNode(designMoves[i].field);
+                if (node != null && node.control == ctl) { return null; }
+            }
+        } else if (dragging && !dragFromPalette && dragIndex >= 0 && dragIndex < fields.Count) {
+            DesignPreviewNode node = this.PreviewNode(fields[dragIndex]);
+            if (node != null && node.control == ctl) { return null; }
+        }
+        Control best = null;
+        int bestZ = 0;
+        for (int i = ctl.children.Count - 1; i >= 0; i = i - 1) {
+            Control child = ctl.children[i];
+            Control hit = this.DesignDropHit(child, x, y);
+            if (hit == null) { continue; }
+            int z = child.StyleZIndex();
+            if (best == null || z > bestZ) { best = hit; bestZ = z; }
+        }
+        return best == null ? ctl : best;
+    }
+
+    FormField FreeDropContainerDevice(int x, int y) {
+        freeDropPX = this.ContOriginX(null);
+        freeDropPY = this.ContOriginY(null);
+        designDropSlot = 0;
+        if (!this.PreviewHasLayout()) { return null; }
+        Control hit = this.DesignDropHit(pvDocRoot, x, y);
+        while (hit != null) {
+            for (int i = pvDocNodes.Count - 1; i >= 0; i = i - 1) {
+                DesignPreviewNode node = pvDocNodes[i];
+                FormField f = node.field;
+                if (!node.visible || node.control != hit || !this.DesignCanContain(f)) { continue; }
+                int slot = this.DesignActiveSlot(f);
+                if (hit is SplitPanel) {
+                    SplitPanel split = (SplitPanel)hit;
+                    Rect second = this.DesignContentRect(split.Second());
+                    Rect first = this.DesignContentRect(split.First());
+                    if (second.Contains(x, y)) { slot = 1; }
+                    else if (first.Contains(x, y)) { slot = 0; }
+                    else { continue; }
+                }
+                Control host = this.DesignSlot(f, slot);
+                Rect content = this.DesignContentRect(host);
+                if (!content.Contains(x, y)) { continue; }
+                designDropSlot = slot;
+                freeDropPX = this.DesignSlotOriginX(host);
+                freeDropPY = this.DesignSlotOriginY(host);
+                return f;
+            }
+            hit = hit.parent;
+        }
+        return null;
+    }
+
+    // 新浮动组件的位置以真实父内容框为参考。
+    void PlaceFree(FormField f, FormField cont, int lx, int ly) {
+        if (f.ftype == 58 || f.ftype == 59) {
+            cont = null; // 工具条与状态栏必须属于顶层窗口 (root window)，直接在窗口顶端/底端停靠
+        }
+        if (f.ftype == 58) {
+            // 工具栏 (ToolStrip)：默认顶部停靠 (Dock.Top)，参与停靠/文档流避免被后续流式容器覆盖
+            f.position = 0;
+            f.dockSide = 1;
+            f.anchor = 0;
+            f.flexGrow = 0;
+            f.fx = 0;
+            f.fy = 0;
+            f.fw = winW;
+        } else if (f.ftype == 59) {
+            // 状态栏 (StatusBar)：默认底部停靠 (Dock.Bottom)，参与停靠/文档流
+            f.position = 0;
+            f.dockSide = 2;
+            f.anchor = 0;
+            f.flexGrow = 0;
+            if (f.fh <= 0) { f.fh = FormField.DefaultHFor(f.ftype); }
+            f.fx = 0;
+            f.fy = this.DesignRootContentHeight() - f.fh;
+            if (f.fy < 0) { f.fy = 0; }
+            f.fw = winW;
+        } else {
+            f.position = 1;
+            f.anchor = 0;
+            f.dockSide = 0;
+            f.flexGrow = 0;
+            f.fx = lx - f.fw / 2;
+            f.fy = ly - f.fh / 2;
+            if (f.fx < 0) { f.fx = 0; }
+            if (f.fy < 0) { f.fy = 0; }
+        }
+        int slot = this.DesignActiveSlot(cont);
+        f.childTab = slot;
+        if (cont == null) { fields.Add(f); }
+        else { cont.kids.Add(f); }
+        this.DesignDeclareRect(f);
+        activeContainer = cont;
+        Control host = this.DesignSlot(cont, slot);
+        freeSelPX = this.DesignSlotOriginX(host);
+        freeSelPY = this.DesignSlotOriginY(host);
+        sel = f;
+        inspTab = 0;
+        this.ClearExtraSel();
+    }
+
+    // 在设计空间 (dx, dy) 处把面板字段添加到自由画布，
+    // 新元素以光标为中心；光标下有容器则成为它的子级。
+    void DropFreePalette(int dx, int dy, int deviceX, int deviceY) {
+        this.PushUndo();
+        int ftype = dragKind;
+        FormField cont = this.FreeDropContainerDevice(deviceX, deviceY);
+        if (cont != null && cont.kind == "SplitPanel") { cont.uiState.Set(designDropSlot); }
+        int cx = freeDropPX;
+        int cy = freeDropPY;
+        if (ftype == 100) {
+            FormField nf = FormField.NewCustom(dragCustomKind, seq);
+            seq = seq + 1;
+            this.PlaceFree(nf, cont, dx - cx, dy - cy);
+            msg = Designer.T("added ", "已添加 ") + dragCustomKind;
+            return;
+        }
+        if (ftype == 200) {
+            activeContainer = cont;
+            if (cont != null && cont.kind == "SplitPanel") { cont.uiState.Set(designDropSlot); }
+            AddUserComponent(dragUserComp);
+            if (sel != null) {
+                sel.position = 1;
+                sel.anchor = 0;
+                sel.dockSide = 0;
+                sel.flexGrow = 0;
+                sel.childTab = this.DesignActiveSlot(cont);
+                sel.fx = dx - cx - sel.fw / 2;
+                sel.fy = dy - cy - sel.fh / 2;
+                if (sel.fx < 0) { sel.fx = 0; }
+                if (sel.fy < 0) { sel.fy = 0; }
+                this.DesignDeclareRect(sel);
+                this.ClearExtraSel();
+            }
+            return;
+        }
+        FormField f = FormField.New(ftype, seq);
+        seq = seq + 1;
+        if (FormField.IsNonVisualOf(ftype)) {
+            fields.Add(f);
+            sel = f;
+            inspTab = 0;
+            msg = Designer.T("added ", "已添加 ") + FormField.TypeName(ftype);
+            return;
+        }
+        f.fw = DefaultFreeW(f);
+        f.fh = DefaultFreeH(f);
+        this.PlaceFree(f, cont, dx - cx, dy - cy);
+        if (f.IsContainer()) { activeContainer = f; }
+        msg = Designer.T("added ", "已添加 ") + FormField.TypeName(ftype);
+    }
+
+    // 新拖入自由画布组件的默认宽度：依据各控件标准尺寸与内容度量确定，
+    // 确保点选、选中框手柄与实际呈现区域严丝合缝。
+    static int DefaultFreeW(FormField f) {
+        int ft = f.ftype;
+        if (ft == 7) { return 50; }                         // 开关
+        if (ft == 8) { return 120; }                        // 评分
+        if (ft == 11) { return 48; }                        // 拾色器
+        if (ft == 19) { return 72; }                        // 标签
+        if (ft == 20) { return 64; }                        // 徽章
+        if (ft == 21) { return 40; }                        // 头像
+        if (ft == 22) { return 140; }                       // 统计数值
+        if (ft == 29) { return 260; }                       // 进度条
+        if (ft == 31) { return 440; }                       // 步骤条
+        if (ft == 35) { return 420; }                       // 穿梭框
+        if (ft == 37) { return 520; }                       // 分页器
+        if (ft == 50 || ft == 51) { return 200; }           // 气泡卡片 / 气泡确认
+        if (ft == 54) { return 40; }                        // 图标
+        if (ft == 62) { return 36; }                        // 指示灯
+        if (ft == 63) { return 150; }                       // 数显表
+        if (ft == 64) { return 160; }                       // 圆盘仪表
+        if (ft == 65) { return 64; }                        // 棒图
+        if (ft == 66) { return 320; }                       // 趋势曲线
+        if (ft == 67) { return 400; }                       // 报警横幅
+        if (ft == 68) { return 400; }                       // 报警列表
+        if (ft == 69) { return 200; }                       // 数字键盘
+        if (ft == 70) { return 240; }                       // 设备卡
+        if (ft == 71) { return 360; }                       // 设备面板
+        if (ft == 75) { return 160; }                       // 图片
+        if (ft == 76) { return 300; }                       // 日历
+        if (ft == 78) { return 120; }                       // 二维码
+        if (f.kind == "Tabs" || ft == 23 || ft == 24 || ft == 25
+            || ft == 38 || ft == 40 || ft == 41 || ft == 42
+            || ft == 43 || ft == 45 || ft == 46) { return 320; }
+        if (ft == 15) { return 480; }
+        // 外壳类（工具条 / 状态栏 / 分栏 / 停靠面板）默认铺开，
+        // 因为它们总是沿窗口边缘或充满内容区。
+        if (FormField.IsShellOf(ft)) { return 480; }
+        return 200;
+    }
+
+    // 新拖入自由画布组件的默认高度：依据各控件标准尺寸与内容度量确定。
+    static int DefaultFreeH(FormField f) {
+        int ft = f.ftype;
+        if (ft == 7) { return 28; }                         // 开关
+        if (ft == 8) { return 28; }                         // 评分
+        if (ft == 11) { return 32; }                        // 拾色器
+        if (ft == 19) { return 28; }                        // 标签
+        if (ft == 20) { return 28; }                        // 徽章
+        if (ft == 21) { return 40; }                        // 头像
+        if (ft == 22) { return 60; }                        // 统计数值
+        if (ft == 29) { return 24; }                        // 进度条
+        if (ft == 31) { return 60; }                        // 步骤条
+        if (ft == 35) { return 220; }                       // 穿梭框
+        if (ft == 37) { return 36; }                        // 分页器
+        if (ft == 50) { return 70; }                        // 气泡卡片
+        if (ft == 51) { return 80; }                        // 气泡确认
+        if (ft == 54) { return 40; }                        // 图标
+        if (ft == 62) { return 36; }                        // 指示灯
+        if (ft == 63) { return 72; }                        // 数显表
+        if (ft == 64) { return 160; }                       // 圆盘仪表
+        if (ft == 65) { return 180; }                       // 棒图
+        if (ft == 66) { return 200; }                       // 趋势曲线
+        if (ft == 67) { return 36; }                        // 报警横幅
+        if (ft == 68) { return 200; }                       // 报警列表
+        if (ft == 69) { return 260; }                       // 数字键盘
+        if (ft == 70) { return 140; }                       // 设备卡
+        if (ft == 71) { return 300; }                       // 设备面板
+        if (ft == 75) { return 120; }                       // 图片
+        if (ft == 76) { return 280; }                       // 日历
+        if (ft == 78) { return 120; }                       // 二维码
+        int rh = f.RowUnits();
+        if (rh > 0) { return rh; }
+        return 32;
+    }
+
+}

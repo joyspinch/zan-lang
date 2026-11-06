@@ -1,0 +1,967 @@
+using System;
+using System.Collections.Generic;
+using System.Json;
+using Gui;
+using Gui.Widget;
+using Gui.Component;
+using Gui.Backend;
+
+namespace Gui.Designer;
+
+partial class Designer {
+    // 画字段的标签文本：必填字段前置红色星号（hideStar 时省略），
+    // align 为 1 时右对齐到给定宽度，其余左对齐。
+    void DrawLabel(App app, Canvas c, Theme t, FormField f, int lx, int ly, int lw, int align) {
+        int fs = PvFont(Style.FontFallback(app, "small"));
+        string star = "";
+        if (f.required && !hideStar) { star = "* "; }
+        int starW = 0;
+        if (star != "") { starW = Canvas.MeasureText("* ", fs); }
+        int textW = Canvas.MeasureText(f.label, fs);
+        int total = starW + textW;
+        int tx = lx;
+        if (align == 1) { tx = lx + lw - total; }
+        if (star != "") {
+            c.DrawText(tx, ly, "*", Style.Part(app, "designer", "accent", "", "error", "", Style.SNormal()).BgOr(0), fs);
+            tx = tx + starW;
+        }
+        c.DrawText(tx, ly, f.label, Style.Part(app, "designer", "label", "", "", "", Style.SNormal()).FgOr(0), fs);
+    }
+
+    // ---- 感知缩放的预览度量 ----
+    // 自由画布按画布缩放渲染控件预览（pvScale，
+    // 千分比）；流式模式保持 1000，预览按 1:1 渲染。
+    // 夹在 BeginCtrlZoom 里时 app.dpiScale 与主题度量已经带上了视图
+    // 缩放，再乘 pvScale 就是第二次缩放，所以这里直接用已缩放的值。
+    // 预览度量换算：把 v 按画布缩放（pvScale 千分比）折算成屏幕
+    // 像素；已夹在 BeginCtrlZoom 里时度量自带缩放，直接走 app.Scale。
+    int PvS(App app, int v) {
+        if (czDepth > 0) { return app.Scale(v); }
+        return app.Scale(v) * pvScale / 1000;
+    }
+    // PvS 的字号版：乘 pvScale（BeginCtrlZoom 里跳过）并钳制下限 7。
+    int PvFont(int fsz) {
+        int f2 = fsz;
+        if (czDepth == 0) { f2 = fsz * pvScale / 1000; }
+        if (f2 < 7) { f2 = 7; }
+        return f2;
+    }
+
+    // 表单级尺寸逐节点补给没有显式 tiny/small/medium/large 的控件；
+    // 容器自己显式定档不应阻断后代，与挂载期的递归展开规则一致。
+    void ApplyPreviewFormSize(Control ctl, int size) {
+        if (ctl == null) { return; }
+        string cls = ctl.GetProp("class");
+        bool explicitSize = false;
+        List<string> xs = cls.Split(" ");
+        for (int i = 0; i < xs.Count; i = i + 1) {
+            string x = xs[i].Trim();
+            if (x == "tiny" || x == "small" || x == "medium" || x == "large") {
+                explicitSize = true;
+            }
+        }
+        if (!explicitSize) {
+            if (size == 0) { ctl.AddClass("large"); }
+            else if (size == 2) { ctl.AddClass("small"); }
+        }
+        for (int i = 0; i < ctl.children.Count; i = i + 1) {
+            this.ApplyPreviewFormSize(ctl.children[i], size);
+        }
+    }
+
+    // 绘制字段输入控件的非交互预览。
+    void PreviewControl(App app, Canvas c, Theme t, FormField f, int x, int y, int w, int avail) {
+        string sizeName = "medium";
+        int lineBase = 34;
+        if (formSize == 0) { sizeName = "large"; lineBase = 40; }
+        else if (formSize == 2) { sizeName = "small"; lineBase = 28; }
+        int fs = PvFont(Style.FontFallback(app, sizeName));
+        int line = PvS(app, lineBase);
+        if (w < PvS(app, 40)) { w = PvS(app, 40); }
+        int ft = f.ftype;
+
+        // 基础输入控件走真控件渲染（与运行时同一套），彻底所见即所得。
+        if (PvBasic(app, f, x, y, w, avail, line)) { return; }
+
+        // 显示/布局/反馈/导航组件（ftype >= 15）。
+        if (ft >= 15) {
+            // 自 ui 状态设置后选项可能已被删除；保持
+            // 索引在范围内，选项驱动的预览不会越界。
+            if (f.UsesOptions() && f.uiState.Get() >= f.OptionCount()) { f.uiState.Set(0); }
+            PreviewDisplay(app, c, t, f, x, y, w, avail, line);
+            return;
+        }
+
+        if (ft == 1) {                       // 多行文本框
+            int bh = avail - PvS(app, 6);
+            if (bh < line) { bh = line; }
+            Box(app, c, t, x, y, w, bh);
+            c.DrawText(x + PvS(app, 8), y + PvS(app, 6), f.placeholder, Style.Part(app, "designer", "hint", "", "", "", Style.SNormal()).FgOr(0), fs);
+            return;
+        }
+        if (ft == 12) {                      // 上传
+            int bh = avail - PvS(app, 6);
+            if (bh < line) { bh = line; }
+            c.FillRoundRect(x, y, w, bh, t.borderRadiusMedium, Style.Part(app, "designer", "field", "", "", "", Style.SNormal()).BgOr(0));
+            c.DrawRoundRect(x, y, w, bh, t.borderRadiusMedium, Style.Part(app, "designer", "field", "", "", "", Style.SNormal()).BorderOr(0), 1);
+            c.DrawTextCentered(x, y, w, bh, "+  " + f.placeholder, Style.Part(app, "designer", "hint", "", "", "", Style.SNormal()).FgOr(0), fs);
+            return;
+        }
+        if (ft == 14) {                      // 富文本
+            int bh = avail - PvS(app, 6);
+            if (bh < line * 2) { bh = line * 2; }
+            Box(app, c, t, x, y, w, bh);
+            c.FillRect(x, y + PvS(app, 24), w, 1, Style.Part(app, "designer", "grid", "", "", "", Style.SNormal()).BgOr(0));
+            c.DrawText(x + PvS(app, 8), y + PvS(app, 5), "B  I  U  •", Style.Part(app, "designer", "hint", "", "", "", Style.SNormal()).FgOr(0), fs);
+            c.DrawText(x + PvS(app, 8), y + PvS(app, 30), f.placeholder, Style.Part(app, "designer", "hint", "", "", "", Style.SNormal()).FgOr(0), fs);
+            return;
+        }
+
+        if (ft == 4 || ft == 5) {            // 单选 / 复选
+            PreviewChoice(app, c, t, f, x, y, w, line);
+            return;
+        }
+        if (ft == 7) {                       // 开关
+            int sw = PvS(app, 40);
+            int sh = PvS(app, 20);
+            int syy = y + (line - sh) / 2;
+            int track = Style.Part(app, "designer", "track", "", "", "", Style.SNormal()).BgOr(0);
+            int knobX = x + sh / 2;
+            if (f.defOn) {
+                track = Style.Part(app, "designer", "accent", "", "", "", Style.SNormal()).BgOr(0);
+                knobX = x + sw - sh / 2;
+            }
+            c.FillRoundRect(x, syy, sw, sh, sh / 2, track);
+            c.FillCircle(knobX, syy + sh / 2, sh / 2 - PvS(app, 2), Style.Full(app, "designer", "", "", Style.SNormal()).BgOr(0));
+            return;
+        }
+        if (ft == 8) {                       // 评分
+            int r = PvS(app, 6);
+            int syy = y + line / 2;
+            int sx = x + r;
+            for (int k = 0; k < 5; k = k + 1) {
+                int col = Style.Part(app, "designer", "field", "", "", "", Style.SNormal()).BorderOr(0);
+                if (k < 3) { col = Style.Part(app, "designer", "accent", "", "warning", "", Style.SNormal()).BgOr(0); }
+                c.FillCircle(sx, syy, r, col);
+                sx = sx + r * 2 + PvS(app, 6);
+            }
+            return;
+        }
+        if (ft == 9) {                       // 滑块
+            int syy = y + line / 2;
+            c.FillRect(x, syy, w, PvS(app, 3), Style.Part(app, "designer", "track", "", "", "", Style.SNormal()).BgOr(0));
+            c.FillRect(x, syy, w * 2 / 5, PvS(app, 3), Style.Part(app, "designer", "accent", "", "", "", Style.SNormal()).BgOr(0));
+            c.FillCircle(x + w * 2 / 5, syy + PvS(app, 1), PvS(app, 7), Style.Part(app, "designer", "accent", "", "", "", Style.SNormal()).BgOr(0));
+            return;
+        }
+        if (ft == 13) {                      // 颜色
+            Box(app, c, t, x, y, w, line);
+            c.FillRoundRect(x + PvS(app, 6), y + PvS(app, 6), PvS(app, 16), line - PvS(app, 12),
+                t.borderRadiusSmall, Style.Part(app, "designer", "accent", "", "", "", Style.SNormal()).BgOr(0));
+            c.DrawText(x + PvS(app, 30), y + PvS(app, 6), "#3366FF", Style.Part(app, "designer", "label", "", "", "", Style.SNormal()).FgOr(0), fs);
+            return;
+        }
+
+        // 默认单行框（输入/密码/数字/下拉/日期/时间）。
+        Box(app, c, t, x, y, w, line);
+        string txt = f.placeholder;
+        int txtCol = Style.Part(app, "designer", "hint", "", "", "", Style.SNormal()).FgOr(0);
+        if (ft == 2) { txt = "••••••••"; }
+        if (ft == 6 && f.OptionCount() > 0) { txt = f.OptionAt(0); txtCol = Style.Part(app, "designer", "label", "", "", "", Style.SNormal()).FgOr(0); }
+        c.DrawText(x + PvS(app, 8), y + PvS(app, 6), txt, txtCol, fs);
+        if (ft == 6 || ft == 10 || ft == 11) {
+            c.DrawGlyphIn("chevron-down", x + w - PvS(app, 20), y, PvS(app, 16), line,
+                PvS(app, 11), Style.Part(app, "designer", "hint", "", "", "", Style.SNormal()).FgOr(0));
+        }
+        if (ft == 3) {
+            c.DrawGlyphIn("chevron-up", x + w - PvS(app, 18), y,
+                PvS(app, 14), line / 2, PvS(app, 9), Style.Part(app, "designer", "hint", "", "", "", Style.SNormal()).FgOr(0));
+            c.DrawGlyphIn("chevron-down", x + w - PvS(app, 18), y + line / 2,
+                PvS(app, 14), line / 2, PvS(app, 9), Style.Part(app, "designer", "hint", "", "", "", Style.SNormal()).FgOr(0));
+        }
+    }
+
+    // 为显示/布局/反馈/
+    // 导航组件（ftype >= 15）绘制非交互预览。每个分支绘制对应 stdlib 控件的
+    // 可辨识的缩略图。
+    void PreviewDisplay(App app, Canvas c, Theme t, FormField f, int x, int y, int w, int avail, int line) {
+        int fs = PvFont(Style.FontFallback(app, "small"));
+        int ft = f.ftype;
+
+        if (f.IsCustom()) {                   // 项目自定义组件
+            // 用户组件引用且开了预览：按组件文档用 FormBuilder
+            // 建出的真控件渲染（与运行时同一套，所见即所得）；
+            // 找不到组件 / 关了开关则退回占位块。
+            if (f.compRef && f.pvPreview) {
+                int ph2 = avail - PvS(app, 4);
+                if (ph2 < PvS(app, 28)) { ph2 = PvS(app, 28); }
+                Control pc = this.PvCompCtl(app, f, w, ph2);
+                if (pc != null) {
+                    PvCtrlPrepared(app, pc, x, y, w, ph2);
+                    return;
+                }
+            }
+            int bh = line + PvS(app, 8);
+            c.FillRoundRect(x, y, w, bh, t.borderRadiusMedium, Style.Part(app, "designer", "field", "", "", "", Style.SNormal()).BgOr(0));
+            c.DrawRoundRect(x, y, w, bh, t.borderRadiusMedium, Style.Part(app, "designer", "accent", "", "", "", Style.SNormal()).BgOr(0), 1);
+            string icon = "puzzle";
+            c.DrawGlyphIn(icon, x + PvS(app, 6), y, PvS(app, 20), bh,
+                PvS(app, 13), Style.Part(app, "designer", "accent", "", "", "", Style.SNormal()).BgOr(0));
+            c.DrawText(x + PvS(app, 30), y + (bh - fs) / 2, f.customKind, Style.Part(app, "designer", "label", "", "", "", Style.SNormal()).FgOr(0), fs);
+            return;
+        }
+        if (ft == 15) {                      // 标题 / 题头
+            Typography.Heading(app, x, y, f.label, 4);
+            return;
+        }
+        if (ft == 16) {                      // 静态段落文本
+            Typography.Paragraph(app, x, y, f.label);
+            return;
+        }
+        if (ft == 17) {                      // 分隔线
+            if (f.label == "") { app.canvas.FillRect(x, y + line / 2, w,
+                                     Style.Of(app, "divider", "", Style.SNormal()).HeightOr(1),
+                                     Style.Of(app, "divider", "", Style.SNormal()).BgOr(0)); }
+            else {
+                new Divider(f.label).RenderInside(app,
+                    new Rect(x, y + PvS(app, 2), w, line));
+            }
+            return;
+        }
+        if (ft == 18) {                      // 卡片
+            int bh = avail - PvS(app, 6);
+            if (bh < PvS(app, 56)) { bh = PvS(app, 56); }
+            c.FillRoundRect(x, y, w, bh, t.borderRadiusMedium, Style.Full(app, "designer", "", "", Style.SNormal()).BgOr(0));
+            c.DrawRoundRect(x, y, w, bh, t.borderRadiusMedium, Style.Full(app, "designer", "", "", Style.SNormal()).BorderOr(0), 1);
+            c.DrawText(x + PvS(app, 10), y + PvS(app, 8), f.label, Style.Part(app, "designer", "value", "", "", "", Style.SNormal()).FgOr(0), PvFont(Style.FontFallback(app, "medium")));
+            c.FillRect(x, y + PvS(app, 30), w, 1, Style.Part(app, "designer", "grid", "", "", "", Style.SNormal()).BgOr(0));
+            c.DrawText(x + PvS(app, 10), y + PvS(app, 38), Designer.T("Card body content", "卡片内容"), Style.Part(app, "designer", "hint", "", "", "", Style.SNormal()).FgOr(0), fs);
+            return;
+        }
+        if (ft == 19) {                      // 标签
+            Tag.Chip(app, x, y + PvS(app, 3), f.label, "primary");
+            return;
+        }
+        if (ft == 20) {                      // 徽章
+            c.DrawText(x, y + PvS(app, 6), f.label, Style.Part(app, "designer", "value", "", "", "", Style.SNormal()).FgOr(0), fs);
+            int bw = Canvas.MeasureText(f.label, fs);
+            Badge.CountAt(app, x + bw + PvS(app, 10), y + PvS(app, 2), 5);
+            return;
+        }
+        if (ft == 21) {                      // 头像
+            new Avatar(f.label).RenderInside(app,
+                new Rect(x, y + PvS(app, 2), PvS(app, 34),
+                            PvS(app, 34)));
+            return;
+        }
+        if (ft == 22) {                      // 统计
+            new Statistic(f.label, "12,480").RenderAt(app, x, y);
+            return;
+        }
+        if (ft == 23) {                      // 表格
+            PreviewTable(app, c, t, f, x, y, w, avail);
+            return;
+        }
+        if (ft == 24) {                      // 时间线
+            List<TimelineItem> items = new List<TimelineItem>();
+            for (int i = 0; i < f.OptionCount(); i = i + 1) {
+                items.Add(new TimelineItem("", f.OptionAt(i), "", ""));
+            }
+            Timeline.Of(items).RenderAt(app, x, y + PvS(app, 2), w);
+            return;
+        }
+        if (ft == 25) {                      // 树
+            List<TreeNode> nodes = new List<TreeNode>();
+            for (int i = 0; i < f.OptionCount(); i = i + 1) {
+                if (i == 0) { nodes.Add(TreeNode.Dir(f.OptionAt(i), 0, true)); }
+                else { nodes.Add(TreeNode.File(f.OptionAt(i), 1)); }
+            }
+            Rect area = new Rect(x, y + PvS(app, 2), w, avail - PvS(app, 6));
+            TreeView tv = new TreeView();
+            tv.BindSel(f.uiState).Bind(nodes);
+            tv.RenderInside(app, area);
+            return;
+        }
+        if (ft == 26) {                      // 折叠
+            List<CollapsePanel> panels = new List<CollapsePanel>();
+            for (int i = 0; i < f.OptionCount(); i = i + 1) {
+                panels.Add(new CollapsePanel(f.OptionAt(i),
+                    Designer.T("Panel content", "面板内容")));
+            }
+            Collapse col = Collapse.Of(panels, f.uiState);
+            // 设计器画布在排布表单期间拥有点击所有权。
+            col.Disabled = preview;
+            col.RenderAt(app, x, y + PvS(app, 2), w);
+            return;
+        }
+        if (ft == 27) {                      // 空状态
+            int eh = avail - PvS(app, 6);
+            if (eh < PvS(app, 56)) { eh = PvS(app, 56); }
+            new Empty(f.label).RenderInside(app, new Rect(x, y, w, eh));
+            return;
+        }
+        if (ft == 28) {                      // 告警横幅（AlertBox 预览）
+            Layer.DrawNotify(app, x, y, w, f.label,
+                             AlertLevelOf(CompPropValue(f, "type", "info")));
+            return;
+        }
+        if (ft == 29) {                      // 进度
+            new Progress(60, 1).RenderAt(app, x, y + PvS(app, 8), w);
+            return;
+        }
+        if (ft == 30) {                      // 结果
+            Result rs = new Result(f.label,
+                Designer.T("Operation completed", "操作已完成"));
+            rs.Class = Result.StatusClass(1);
+            rs.RenderAt(app, x, y, w);
+            return;
+        }
+        if (ft == 73) {                      // 弹性容器：真实 Flex 排一行示例件
+            Flex fx = Flex.Row().Gap(PvS(app, 8));
+            fx.With(new Tag("Flex"));
+            fx.With(new Tag("Row"));
+            fx.With(new Badge(3));
+            fx.Disabled = preview;
+            fx.RenderInside(app, new Rect(x, y, w, avail - PvS(app, 6)));
+            return;
+        }
+        if (ft == 74) {                      // 等宽网格：两列各一格
+            Grid gg = Grid.Of(2);
+            gg.With(new Statistic(Designer.T("Column A", "列 A"), "128"));
+            gg.With(new Statistic(Designer.T("Column B", "列 B"), "256"));
+            gg.Disabled = preview;
+            gg.RenderInside(app, new Rect(x, y, w, avail - PvS(app, 6)));
+            return;
+        }
+        if (ft == 75) {                      // 图片：空源时控件自带占位
+            int ih = avail - PvS(app, 6);
+            if (ih < PvS(app, 20)) { ih = PvS(app, 20); }
+            Image im = new Image(f.bindPath, f.label);
+            this.ApplyFieldProps(im, f);
+            im.RenderInside(app, new Rect(x, y, w, ih));
+            return;
+        }
+        if (ft == 76) {                      // 月历
+            Calendar cal = new Calendar();
+            cal.Disabled = preview;
+            cal.RenderInside(app, new Rect(x, y, w, avail - PvS(app, 6)));
+            return;
+        }
+        if (ft == 77) {                      // 倒计时
+            Countdown cd = new Countdown(90 * 1000);
+            this.ApplyFieldProps(cd, f);
+            cd.Disabled = preview;
+            cd.RenderInside(app, new Rect(x, y, w, PvS(app, 36)));
+            return;
+        }
+        if (ft == 78) {                      // 二维码：内容取标签，缺省给示例
+            string qr = f.label;
+            if (qr == "") { qr = "https://zan.design"; }
+            int qs = w < avail ? w : avail;
+            new QrCode(qr).RenderInside(app, new Rect(x, y, qs, qs));
+            return;
+        }
+        if (ft == 79) {                      // 平铺水印：内容取标签
+            string wm = f.label;
+            if (wm == "") { wm = Designer.T("CONFIDENTIAL", "内部资料"); }
+            new Watermark(wm).RenderInside(app,
+                new Rect(x, y, w, avail - PvS(app, 6)));
+            return;
+        }
+        if (ft == 80) {                      // 滚动公告：内容取标签
+            string mq = f.label;
+            if (mq == "") {
+                mq = Designer.T("Scrolling announcement text",
+                    "这是一条滚动的公告文本……");
+            }
+            Marquee mar = new Marquee(mq);
+            mar.Disabled = preview;
+            mar.RenderInside(app, new Rect(x, y, w, PvS(app, 34)));
+            return;
+        }
+        if (ft == 81) {                      // 动态标签：选项即可编辑的标签集
+            List<string> tags = new List<string>();
+            for (int i = 0; i < f.OptionCount(); i = i + 1) {
+                tags.Add(f.OptionAt(i));
+            }
+            if (tags.Count == 0) {
+                tags.Add(Designer.T("Tag A", "标签甲"));
+                tags.Add(Designer.T("Tag B", "标签乙"));
+                tags.Add(Designer.T("Tag C", "标签丙"));
+            }
+            DynamicTags dt = new DynamicTags(tags);
+            dt.Disabled = preview;
+            dt.RenderInside(app, new Rect(x, y, w, PvS(app, 34)));
+            return;
+        }
+        if (ft == 82) {                      // 数字滚动
+            NumberAnimation na = new NumberAnimation(0, 4096, 1600);
+            this.ApplyFieldProps(na, f);
+            na.Disabled = preview;
+            na.RenderInside(app, new Rect(x, y, w, PvS(app, 42)));
+            return;
+        }
+        if (ft == 83) {                      // OTP 输入
+            InputOtp otp = new InputOtp(6);
+            this.ApplyFieldProps(otp, f);
+            otp.Disabled = preview;
+            otp.RenderInside(app, new Rect(x, y, w, PvS(app, 40)));
+            return;
+        }
+        if (ft == 84) {                      // 穿梭框：左右各放示例项
+            List<string> src = new List<string>();
+            src.Add(Designer.T("Left item 1", "左项一"));
+            src.Add(Designer.T("Left item 2", "左项二"));
+            src.Add(Designer.T("Left item 3", "左项三"));
+            List<string> tgt = new List<string>();
+            tgt.Add(Designer.T("Right item 1", "右项一"));
+            Transfer<string> tf = new Transfer<string>(src, tgt);
+            tf.Disabled = preview;
+            tf.RenderInside(app, new Rect(x, y, w, avail - PvS(app, 6)));
+            return;
+        }
+        if (ft == 85) {                      // 虚拟列表：塞几行示例数据
+            VirtualList vl = new VirtualList();
+            List<string> rows = new List<string>();
+            for (int i = 1; i <= 24; i = i + 1) {
+                rows.Add(Designer.T("Row ", "第 ") + Convert.ToString(i));
+            }
+            vl.SetItems(rows);
+            vl.Disabled = preview;
+            vl.RenderInside(app, new Rect(x, y, w, avail - PvS(app, 6)));
+            return;
+        }
+        if (ft == 31) {                      // 骨架屏
+            Skeleton.Line(app, w).RenderAt(app, x, y + PvS(app, 4));
+            Skeleton.Line(app, w).RenderAt(app, x, y + PvS(app, 24));
+            Skeleton.Line(app, w * 3 / 5).RenderAt(app, x, y + PvS(app, 44));
+            return;
+        }
+        if (ft == 32) {                      // 旋转加载
+            new Spin(20).RenderInside(app, new Rect(x + PvS(app, 2),
+                y + PvS(app, 6), PvS(app, 20), PvS(app, 20)));
+            c.DrawText(x + PvS(app, 30), y + PvS(app, 10), Designer.T("Loading...", "加载中..."), Style.Part(app, "designer", "hint", "", "", "", Style.SNormal()).FgOr(0), fs);
+            return;
+        }
+        if (ft == 33) {                      // 提示触发器
+            int bw = Canvas.MeasureText(f.label, fs) + PvS(app, 20);
+            c.FillRoundRect(x, y + PvS(app, 2), bw, PvS(app, 24), t.borderRadiusMedium, Style.Part(app, "designer", "field", "", "", "", Style.SNormal()).BgOr(0));
+            c.DrawRoundRect(x, y + PvS(app, 2), bw, PvS(app, 24), t.borderRadiusMedium, Style.Part(app, "designer", "field", "", "", "", Style.SNormal()).BorderOr(0), 1);
+            c.DrawText(x + PvS(app, 10), y + PvS(app, 7), f.label, Style.Part(app, "designer", "label", "", "", "", Style.SNormal()).FgOr(0), fs);
+            return;
+        }
+        if (ft == 34) {                      // 步骤条
+            List<string> labels = new List<string>();
+            for (int i = 0; i < f.OptionCount(); i = i + 1) { labels.Add(f.OptionAt(i)); }
+            Steps.Of(labels, f.uiState).RenderAt(app, x, y + PvS(app, 2), w);
+            return;
+        }
+        if (ft == 35) {                      // 面包屑
+            List<string> items = new List<string>();
+            for (int i = 0; i < f.OptionCount(); i = i + 1) { items.Add(f.OptionAt(i)); }
+            Breadcrumb.Of(items).RenderAt(app, x, y + PvS(app, 4), w);
+            return;
+        }
+        if (ft == 36) {                      // 标签页
+            int nn = f.OptionCount(); if (nn < 1) { nn = 3; }
+            int gx = x;
+            for (int i = 0; i < nn; i = i + 1) {
+                string it = "Tab"; if (i < f.OptionCount()) { it = f.OptionAt(i); }
+                int tw = Canvas.MeasureText(it, fs) + PvS(app, 16);
+                int col = Style.Part(app, "designer", "hint", "", "", "", Style.SNormal()).FgOr(0);
+                if (i == 0) { col = Style.Part(app, "designer", "accent", "", "", "", Style.SNormal()).BgOr(0); }
+                c.DrawText(gx + PvS(app, 8), y + PvS(app, 4), it, col, fs);
+                if (i == 0) { c.FillRect(gx, y + PvS(app, 24), tw, PvS(app, 2), Style.Part(app, "designer", "accent", "", "", "", Style.SNormal()).BgOr(0)); }
+                gx = gx + tw;
+            }
+            c.FillRect(x, y + PvS(app, 25), w, 1, Style.Part(app, "designer", "grid", "", "", "", Style.SNormal()).BgOr(0));
+            c.DrawText(x + PvS(app, 4), y + PvS(app, 38), Designer.T("Tab panel content", "标签页内容"), Style.Part(app, "designer", "hint", "", "", "", Style.SNormal()).FgOr(0), fs);
+            return;
+        }
+        if (ft == 37) {                      // 分页
+            Pagination pg = Pagination.Of(10, f.uiState);
+            // 设计器画布在排布表单期间拥有点击所有权。
+            pg.Disabled = preview;
+            PvCtrl(app, pg, x, y + PvS(app, 2), w, avail - PvS(app, 4));
+            return;
+        }
+        if (ft == 38) {                      // 菜单
+            List<string> items = new List<string>();
+            for (int i = 0; i < f.OptionCount(); i = i + 1) { items.Add(f.OptionAt(i)); }
+            int mh = avail - PvS(app, 4);
+            Menu.RenderVertical(app, x, y + PvS(app, 2), w, y + PvS(app, 2) + mh,
+                t.heightMedium, items, f.uiState, 0);
+            return;
+        }
+        if (ft == 39) {                      // 页头
+            new PageHeader(f.label,
+                Designer.T("Subtitle / description", "副标题 / 描述"))
+                .RenderAt(app, x, y, w);
+            return;
+        }
+        if (ft == 40) {                      // 列表视图
+            List<string> items = new List<string>();
+            for (int i = 0; i < f.OptionCount(); i = i + 1) { items.Add(f.OptionAt(i)); }
+            ListView<string> lv = new ListView<string>(
+                new ListColumn<string>("", s => s));
+            lv.Class = "flat";
+            lv.Bind(items);
+            lv.RenderInside(app, new Rect(x, y + PvS(app, 2), w,
+                items.Count * app.theme.heightLarge));
+            return;
+        }
+        if (ft == 41) {                      // 数据表格
+            PreviewTable(app, c, t, f, x, y, w, avail);
+            return;
+        }
+        if (ft == 42) {                      // 轮播
+            List<string> slides = new List<string>();
+            for (int i = 0; i < f.OptionCount(); i = i + 1) { slides.Add(f.OptionAt(i)); }
+            if (slides.Count == 0) { slides.Add("Slide 1"); }
+            int chh = avail - PvS(app, 6);
+            if (chh < PvS(app, 70)) { chh = PvS(app, 70); }
+            Carousel car = Carousel.Of(slides, f.uiState);
+            car.Disabled = preview;
+            car.RenderInside(app, new Rect(x, y, w, chh));
+            return;
+        }
+        if (ft == 43) {                      // 图表
+            PreviewChart(app, c, t, f, x, y, w, avail);
+            return;
+        }
+        if (ft == 44) {                      // 省略号
+            Ellipsis.Render(app, x, y + PvS(app, 4), w, f.label);
+            return;
+        }
+        if (ft == 45) {                      // 面板
+            int ph = avail - PvS(app, 6);
+            if (ph < PvS(app, 70)) { ph = PvS(app, 70); }
+            Panel p = new Panel(f.label).Titled(f.label);
+            p.RenderInside(app, new Rect(x, y, w, ph));
+            Rect r = p.Inner();
+            c.DrawText(r.x, r.y, Designer.T("Panel content", "面板内容"), Style.Part(app, "designer", "hint", "", "", "", Style.SNormal()).FgOr(0), fs);
+            return;
+        }
+        if (ft == 46) {                      // 滚动条
+            int sh = avail - PvS(app, 6);
+            if (sh < PvS(app, 70)) { sh = PvS(app, 70); }
+            c.DrawRect(x, y, w, sh, Style.Full(app, "designer", "", "", Style.SNormal()).BorderOr(0), 1);
+            c.DrawText(x + PvS(app, 8), y + PvS(app, 8),
+                Designer.T("Scrollable content", "可滚动内容"), Style.Part(app, "designer", "hint", "", "", "", Style.SNormal()).FgOr(0), fs);
+            Scrollbar.RenderVertical(app, x + w - PvS(app, 10), y, sh,
+                sh * 3, PvS(app, 20));
+            return;
+        }
+        if (ft == 47) {                      // 加载中
+            int r = PvS(app, 12);
+            new Spin(24).RenderInside(app, new Rect(x + PvS(app, 4),
+                y + PvS(app, 8), r * 2, r * 2));
+            c.DrawText(x + r * 2 + PvS(app, 16), y + r,
+                Designer.T("Loading...", "加载中..."), Style.Part(app, "designer", "hint", "", "", "", Style.SNormal()).FgOr(0), fs);
+            return;
+        }
+        if (ft == 48) {                      // 下拉触发器
+            DropdownChrome.PaintTrigger(app, app.focus.AllocId(),
+                x, y + PvS(app, 2), PvS(app, 180), t.heightMedium,
+                f.label, false);
+            return;
+        }
+        if (ft == 49) {                      // 浮动按钮
+            new FloatButton("plus") { Class = "primary" }
+                .Render(app, x, y + PvS(app, 2));
+            return;
+        }
+        if (ft == 50) {                      // 气泡卡片
+            Popover.Render(app, x, y,
+                w, avail, f.label, Designer.T("Popover body text", "气泡内容"));
+            return;
+        }
+        if (ft == 51) {                      // 气泡确认
+            Layer.DrawPopconfirm(app, x, y, f.label, Designer.T("OK", "确定"), Designer.T("Cancel", "取消"));
+            return;
+        }
+        if (ft == 52) {                      // 通知
+            Layer.DrawNotify(app, x, y + PvS(app, 2), w, f.label, 3);
+            return;
+        }
+        if (ft == 53) {                      // Ribbon 工具栏
+            // 画布预览跟随设计：选项为空给一组示例命令，有选项时
+            // 每项 "图标|标题"（与 ToolStrip 的 标题:图标 同语义、
+            // 顺带兼容 "标题" 单段），分隔条 "-" 画成分组线。
+            List<RibbonCmd> cmds = new List<RibbonCmd>();
+            if (f.OptionCount() == 0) {
+                cmds.Add(RibbonCmd.Group("save", Designer.T("Save", "保存")));
+                cmds.Add(new RibbonCmd("copy", Designer.T("Copy", "复制")));
+                cmds.Add(new RibbonCmd("paste", Designer.T("Paste", "粘贴")));
+                cmds.Add(new RibbonCmd("cut", Designer.T("Cut", "剪切")));
+            } else {
+                for (int i = 0; i < f.OptionCount(); i = i + 1) {
+                    string it = f.OptionAt(i);
+                    if (it == "-") { continue; }
+                    string icon = it;
+                    string text = it;
+                    int p = Designer.IndexOfColon(it);
+                    if (p > 0) {
+                        icon = it.Substring(0, p);
+                        text = it.Substring(p + 1, it.Length - p - 1);
+                    }
+                    if (i == 0 || cmds.Count == 0) {
+                        cmds.Add(RibbonCmd.Group(icon, text));
+                    } else {
+                        cmds.Add(new RibbonCmd(icon, text));
+                    }
+                }
+                if (cmds.Count == 0) {
+                    cmds.Add(RibbonCmd.Group("file", f.label));
+                }
+            }
+            Ribbon.Render(app, x, y, w, Ribbon.Height(app), cmds);
+            return;
+        }
+        if (ft == 54) {                      // 图标
+            int sz = PvS(app, 24);
+            c.DrawGlyphIn("star", x, y, sz, sz, t.iconSizeLarge, Style.Part(app, "designer", "accent", "", "", "", Style.SNormal()).BgOr(0));
+            c.DrawText(x + sz + PvS(app, 8), y + PvS(app, 4),
+                f.label, Style.Part(app, "designer", "label", "", "", "", Style.SNormal()).FgOr(0), fs);
+            return;
+        }
+        if (ft == 58) {                      // 工具条
+            ToolStrip ts = new ToolStrip();
+            ts.SetItemsText(f.JoinOptions());
+            this.ApplyFieldProps(ts, f);
+            ts.RenderAt(app, x, y, w, PvS(app, 34));
+            return;
+        }
+        if (ft == 59) {                      // 状态栏
+            StatusBar sb = new StatusBar();
+            for (int i = 0; i < f.OptionCount(); i = i + 1) {
+                string it = f.OptionAt(i);
+                if (it.Length > 1 && it.Substring(0, 1) == ">") {
+                    sb.AddRight(it.Substring(1, it.Length - 1));
+                } else {
+                    sb.AddLeft(it);
+                }
+            }
+            this.ApplyFieldProps(sb, f);
+            sb.RenderAt(app, x, y, w, PvS(app, 24));
+            return;
+        }
+        if (ft == 62) {                      // 指示灯
+            Led led = new Led(f.label, f.uiState);
+            PvCtrl(app, led, x, y, w, avail);
+            return;
+        }
+        if (ft == 63) {                      // 数显表
+            Digital dg = new Digital(f.label, f.uiState, 10,
+                                     Designer.T("C", "℃"));
+            PvCtrl(app, dg, x, y, w, avail);
+            return;
+        }
+        if (ft == 64) {                      // 圆盘仪表
+            Gauge gg = new Gauge(f.label, f.uiState, 0, 100);
+            gg.Limits(20, 80);
+            PvCtrl(app, gg, x, y, w, avail);
+            return;
+        }
+        if (ft == 65) {                      // 棒图
+            Bargraph bg = new Bargraph(f.label, f.uiState, 0, 100);
+            bg.Limits(20, 80);
+            PvCtrl(app, bg, x, y, w, avail);
+            return;
+        }
+        if (ft == 66) {                      // 趋势曲线
+            Trend tr = new Trend(f.label, 0, 100, 1, 60);
+            TrendPen pen = tr.Add(Designer.T("PV", "测量值"),
+                                  new IoTag("PV"), Style.Part(app, "designer", "accent", "", "success", "", Style.SNormal()).BgOr(0));
+            // 设计期用一段确定的锯齿波占位，预览才有形状可看。
+            for (int i = 0; i < 60; i = i + 1) {
+                pen.Push(50 + (i % 20) * 2 - 20);
+            }
+            PvCtrl(app, tr, x, y, w, avail);
+            return;
+        }
+        if (ft == 67) {                      // 报警横幅
+            AlarmBuffer ab = new AlarmBuffer();
+            ab.Raise(Designer.T("PT101", "PT101"), f.label, 2);
+            AlarmBanner bn = new AlarmBanner(ab);
+            PvCtrl(app, bn, x, y, w, avail);
+            return;
+        }
+        if (ft == 68) {                      // 报警列表
+            AlarmBuffer ab = new AlarmBuffer();
+            ab.Raise("PT101", Designer.T("Pressure high", "压力高"), 2);
+            ab.Raise("TIC101", Designer.T("Temp warning", "温度偏高"), 1);
+            AlarmList al = new AlarmList(ab);
+            PvCtrl(app, al, x, y, w, avail);
+            return;
+        }
+        if (ft == 69) {                      // 数字键盘
+            NumPad kp = new NumPad();
+            kp.SetText("0");
+            PvCtrl(app, kp, x, y, w, avail);
+            return;
+        }
+        if (ft == 70) {                      // 设备状态卡
+            DeviceCard dc = new DeviceCard(f.label);
+            dc.Set(f.uiState.Get());
+            IoTag demo = new IoTag(Designer.T("Current", "电流"), "A", 10);
+            demo.SetRaw(1234);
+            dc.Row(Designer.T("Current", "电流"), demo);
+            PvCtrl(app, dc, x, y, w, avail);
+            return;
+        }
+        if (ft == 71) {                      // 设备状态面板
+            EquipPanel ep = new EquipPanel();
+            if (f.options.Count > 0) {
+                for (int i = 0; i < f.options.Count; i = i + 1) {
+                    ep.AddDevice(f.options[i]);
+                }
+            } else {
+                ep.AddDevice(Designer.T("Pump 1", "1# 泵")).Set(1);
+                ep.AddDevice(Designer.T("Pump 2", "2# 泵")).Set(2);
+                ep.AddDevice(Designer.T("Fan", "风机")).Set(0);
+            }
+            PvCtrl(app, ep, x, y, w, avail);
+            return;
+        }
+        if (ft == 72) {                      // 网页视图
+            // 设计期不启动真浏览器：原生视图是浮在窗口之上的
+            // OS 兄弟层，放进设计画布会盖住整个编辑器（而且每个字段
+            // 一个浏览器进程），因此画与运行时同尺寸的占位。
+            int wh = avail - PvS(app, 6);
+            if (wh < PvS(app, 90)) { wh = PvS(app, 90); }
+            c.FillRect(x, y, w, wh, Style.Part(app, "designer", "field", "", "", "", Style.SNormal()).BgOr(0));
+            c.DrawRect(x, y, w, wh, Style.Full(app, "designer", "", "", Style.SNormal()).BorderOr(0), 1);
+            c.DrawGlyphIn("globe", x, y - PvS(app, 14), w, wh,
+                PvS(app, 22), Style.Part(app, "designer", "hint", "", "", "", Style.SNormal()).FgOr(0));
+            string purl = f.placeholder;
+            if (purl == "") { purl = Designer.T("Web View", "网页视图"); }
+            c.DrawTextCentered(x, y + PvS(app, 18), w, wh, purl,
+                Style.Part(app, "designer", "label", "", "", "", Style.SNormal()).FgOr(0), fs);
+            return;
+        }
+    }
+
+    // 在设计画布上按给定矩形绘制一个保留式控件的实时预览。
+    // 用 BeginCtrlZoom/EndCtrlZoom 夹住渲染：真控件内部只认 app.dpiScale
+    // 和主题度量，本身不知道画布视图缩放，因此临时把两者按视图缩放放大/
+    // 缩小，控件的字号、内边距就随画布一起等比缩放（放大不再「有的变有的
+    // 不变」）。给定矩形 x/y/w/h 已是缩放后的屏幕坐标，渲染完精确还原。
+    // 与 PvCtrl 相同，但高度取控件自己测量出来的（不小于 `h`）：
+    // 换行的容器在设计器里也能完整显示。
+    void PvCtrlAuto(App app, Control ctl, int x, int y, int w, int h) {
+        this.ApplyPreviewFormSize(ctl, formSize);
+        BeginCtrlZoom(app);
+        ctl.MeasureTree(app);
+        ctl.Arrange(x, y, w, h);
+        // 首次测量拿不到可用宽度（自动换行的行数依赖它），
+        // 排布一次后再测一遍就是最终行数。
+        ctl.MeasureTree(app);
+        int hh = ctl.prefH;
+        if (hh < h) { hh = h; }
+        ctl.Arrange(x, y, w, hh);
+        ctl.RenderTree(app);
+        EndCtrlZoom(app);
+    }
+
+    // 在给定矩形里渲染一个保留式控件的实时预览：量测、按给定矩形
+    // 排布、渲染，全程夹在 BeginCtrlZoom/EndCtrlZoom 里随画布等比
+    // 缩放（PvCtrlAuto 是高度按测量结果重排的版本）。
+    void PvCtrl(App app, Control ctl, int x, int y, int w, int h) {
+        this.ApplyPreviewFormSize(ctl, formSize);
+        this.PvCtrlPrepared(app, ctl, x, y, w, h);
+    }
+
+    // 已按自己的文档应用过尺寸默认值的组件树只负责渲染，不能再被
+    // 宿主设计稿的 formSize 覆盖。
+    void PvCtrlPrepared(App app, Control ctl, int x, int y, int w, int h) {
+        BeginCtrlZoom(app);
+        ctl.MeasureTree(app);
+        ctl.Arrange(x, y, w, h);
+        ctl.RenderTree(app);
+        EndCtrlZoom(app);
+    }
+
+    // 进入真控件等比缩放：按视图缩放（winZoom，50%–200%）临时放大/缩小
+    // app.dpiScale 和主题度量。100% 时为恒等变换，真控件保持 1:1 清晰。
+    void BeginCtrlZoom(App app) {
+        czDepth = czDepth + 1;
+        if (czDepth > 1) { return; }
+        Theme t = app.theme;
+        czSnapshot = t.Snapshot();
+        czBase = t.SnapshotMetrics();
+        czDpi = app.dpiScale;
+        int z = winZoom;
+        if (z <= 0) { z = lastFitPct; }
+        if (z < 250) { z = 250; }
+        if (z > 2000) { z = 2000; }
+        int d = czDpi;
+        if (d < 1) { d = 100; }
+        if (czSnapshot != null) {
+            t.ApplySnapshotScaled(czSnapshot, z, d * 10);
+        } else {
+            t.ApplyMetricsScaled(czBase, z, d * 10);
+        }
+        app.dpiScale = z / 10;
+        if (app.dpiScale < 1) { app.dpiScale = 1; }
+        // 样式缓存按缩放分桶（不递增 bgThemeGen）：递增代次会把整张
+        // 样式表和 base.css 的解析结果作废，而 Begin/End 每个预览控件
+        // 各走一次，于是一帧重解析几十遍 CSS（数百毫秒）。
+        czScale = app.metricsScale;
+        app.metricsScale = z;
+    }
+
+    // 退出真控件等比缩放：从基线精确还原主题度量与 app.dpiScale。
+    void EndCtrlZoom(App app) {
+        czDepth = czDepth - 1;
+        if (czDepth > 0) { return; }
+        Theme t = app.theme;
+        if (czSnapshot != null) {
+            t.ApplySnapshotScaled(czSnapshot, 1000, 1000);
+        } else {
+            t.ApplyMetricsScaled(czBase, 1000, 1000);
+        }
+        app.dpiScale = czDpi;
+        app.metricsScale = czScale;
+    }
+
+    // 基础输入控件（输入/多行/密码/数字/下拉/开关/评分/滑块）用
+    // FormBuilder 构造的真控件渲染预览，取代仿画，使设计与运行完全
+    // 一致。这些类型不把标题嵌进控件（标题由 DrawLabel 单独绘制），
+    // 故不会重复。返回 true 表示已处理。
+    bool PvBasic(App app, FormField f, int x, int y, int w, int avail, int line) {
+        int ft = f.ftype;
+        if (ft != 0 && ft != 1 && ft != 2 && ft != 3 && ft != 4 && ft != 5
+            && ft != 6 && ft != 7 && ft != 8 && ft != 9) {
+            return false;
+        }
+        Control ctl = FormBuilder.FromField(f);
+        if (ctl == null) { return false; }
+        int h = line;
+        if (ft == 1) {
+            h = avail - PvS(app, 6);
+            if (h < line) { h = line; }
+        }
+        // 选项组按自己算出的高度（行数 x 行高）渲染：字段高度在这里
+        // 是行高，若当成整体高度，换行的第二行在设计器里就看不见。
+        if (ctl is ChoiceGroup) {
+            ((ChoiceGroup)ctl).SetRowHeight(line);
+            PvCtrlAuto(app, ctl, x, y, w, h);
+            return true;
+        }
+        PvCtrl(app, ctl, x, y, w, h);
+        return true;
+    }
+
+    // 旧 uiState 图型序号（0 柱状 .. 7 散点）到 SampleOf 别名
+    // 字符串的映射（存量设计稿的直通行还没有 "type" 时回退用）。
+    static string ChartKindAlias(int k) {
+        if (k == 1) { return "line"; }
+        if (k == 2) { return "area"; }
+        if (k == 3) { return "stacked"; }
+        if (k == 4) { return "hbar"; }
+        if (k == 5) { return "pie"; }
+        if (k == 6) { return "donut"; }
+        if (k == 7) { return "scatter"; }
+        return "bar";
+    }
+
+    // Chart 组件的画布预览。类型优先取直通行（extra["props"] 的
+    // "type"，ECharts 注册表字符串/别名，经 ChartHost.SampleOf 现拼
+    // 示例——与生成代码 ChartHost.SetProp("type") 同一份示例数据，
+    // 设计器所见即发布窗体初见）；旧设计稿类型存 uiState
+    // （0 柱状 .. 7 散点），回退映射。
+    void PreviewChart(App app, Canvas c, Theme t, FormField f, int x, int y, int w, int avail) {
+        int hh = avail - PvS(app, 6);
+        if (hh < PvS(app, 120)) { hh = PvS(app, 120); }
+        string ts = CompPropValue(f, "type", "");
+        if (ts == "") { ts = ChartKindAlias(f.uiState.Get()); }
+        Control ch = HeavyControls.Create("ChartHost");
+        if (ch != null) {
+            ch.SetProp("type", ts);
+            ch.SetProp("title", f.label);
+            BeginCtrlZoom(app);
+            ch.RenderInside(app, new Rect(x, y, w, hh));
+            EndCtrlZoom(app);
+            return;
+        }
+        c.FillRoundRect(x, y, w, hh, PvS(app, 4), t.bgSecondary);
+        c.DrawRoundRect(x, y, w, hh, PvS(app, 4), t.borderPrimary, 1);
+        int fs = Style.FontFallback(app, "small");
+        c.DrawGlyphIn("chart", x + PvS(app, 8), y + PvS(app, 8), PvS(app, 16), PvS(app, 16), PvS(app, 16), t.primary);
+        c.DrawText(x + PvS(app, 30), y + PvS(app, 10), (f.label != "" ? f.label : "Chart") + " (" + ts + ")", t.textPrimary, fs);
+    }
+
+    // 渲染表格字段的紧凑非交互预览：由字段选项（其列）构建的
+    // 表头行加上几行占位行。
+    void PreviewTable(App app, Canvas c, Theme t, FormField f, int x, int y, int w, int avail) {
+        int nc = f.OptionCount();
+        if (nc < 1) { nc = 3; }
+        List<TableColumnSpec> colSpecs = new List<TableColumnSpec>();
+        List<TableCellItem> cellItems = new List<TableCellItem>();
+        int colW = w / nc;
+        for (int i = 0; i < nc; i = i + 1) {
+            string h = "Col " + Convert.ToString(i + 1);
+            if (i < f.OptionCount()) { h = Designer.ColTitle(f.OptionAt(i)); }
+            // 声明了列宽（extra["columns"][i].width）就用声明值，
+            // 没声明的列均分剩余宽度（0/缺省 = 自适应）。
+            int wv = 0;
+            JsonValue ce = Designer.ColEntry(f, i);
+            if (ce != null) { wv = ce.Int("width", 0); }
+            int actualW = wv > 0 ? PvS(app, wv) : colW;
+            colSpecs.Add(TableColumnSpec.Of(h, actualW));
+            cellItems.Add(TableCellItem.Of("—", actualW));
+        }
+        int totalW = colW * nc;
+        int bh = avail - PvS(app, 6);
+        // 表格内部只认 dpi/主题，同样用 BeginCtrlZoom 让行高/字号随视图
+        // 缩放等比变化；bh 是屏幕空间的外框高（已含缩放），先算好。
+        BeginCtrlZoom(app);
+        int rowH = t.heightMedium;
+        if (bh < rowH * 3) { bh = rowH * 3; }
+        c.PushClip(x, y, totalW, bh);
+        Table.RenderHeaderCols(app, x, y, colSpecs);
+        int ry = y + rowH;
+        bool striped = true;
+        while (ry + rowH <= y + bh) {
+            Table.RenderRowCells(app, x, ry, cellItems, striped);
+            striped = !striped;
+            ry = ry + rowH;
+        }
+        c.PopClip();
+        EndCtrlZoom(app);
+        c.DrawRect(x, y, totalW, bh, Style.Full(app, "designer", "", "", Style.SNormal()).BorderOr(0), 1);
+    }
+
+    // 水平渲染单选/复选字段选项的预览。
+    void PreviewChoice(App app, Canvas c, Theme t, FormField f, int x, int y, int w, int line) {
+        int fs = PvFont(Style.FontFallback(app, "small"));
+        bool radio = (f.ftype == 4);
+        int cy = y + line / 2;
+        int gx = x;
+        int mark = PvS(app, 14);
+        for (int i = 0; i < f.OptionCount(); i = i + 1) {
+            string opt = f.OptionAt(i);
+            if (radio) {
+                c.FillCircle(gx + mark / 2, cy, mark / 2, Style.Full(app, "designer", "", "", Style.SNormal()).BgOr(0));
+                c.DrawRect(gx, cy - mark / 2, mark, mark, Style.Full(app, "designer", "", "", Style.SNormal()).BorderOr(0), 1);
+                if (i == 0) { c.FillCircle(gx + mark / 2, cy, mark / 4, Style.Part(app, "designer", "accent", "", "", "", Style.SNormal()).BgOr(0)); }
+            } else {
+                c.FillRoundRect(gx, cy - mark / 2, mark, mark, t.borderRadiusSmall, Style.Full(app, "designer", "", "", Style.SNormal()).BgOr(0));
+                c.DrawRoundRect(gx, cy - mark / 2, mark, mark, t.borderRadiusSmall, Style.Full(app, "designer", "", "", Style.SNormal()).BorderOr(0), 1);
+            }
+            int tx = gx + mark + PvS(app, 4);
+            c.DrawText(tx, y + PvS(app, 6), opt, Style.Part(app, "designer", "label", "", "", "", Style.SNormal()).FgOr(0), fs);
+            int ow = mark + PvS(app, 8) + Canvas.MeasureText(opt, fs) + PvS(app, 12);
+            gx = gx + ow;
+            if (gx > x + w - PvS(app, 30)) { i = f.OptionCount(); }
+        }
+    }
+
+    // 画预览里单行输入框的底：圆角填充 + 边框，各仿画控件共用。
+    void Box(App app, Canvas c, Theme t, int x, int y, int w, int h) {
+        c.FillRoundRect(x, y, w, h, t.borderRadiusMedium, Style.Full(app, "designer", "", "", Style.SNormal()).BgOr(0));
+        c.DrawRoundRect(x, y, w, h, t.borderRadiusMedium, Style.Full(app, "designer", "", "", Style.SNormal()).BorderOr(0), 1);
+    }
+
+}

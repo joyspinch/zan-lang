@@ -1,0 +1,1094 @@
+using System;
+using System.Collections.Generic;
+using System.Json;
+using Gui;
+using Gui.Widget;
+using Gui.Component;
+using Gui.Backend;
+
+namespace Gui.Designer;
+
+partial class Designer {
+    // 设计画布：信箱式窗口 + 网格 + 字段 + 场景设计器那套交互
+    // 模型（选择 / 拖拽 / 框选 / 抓手平移 / 缩放 / 面板放置）。
+    // 表单（自动吸附）和自由窗口共用这一份实现。
+    void RenderDesignCanvas(App app, Canvas c, Theme t, int cx, int cy, int cw, int ch) {
+        int fs = Style.FontFallback(app, "small");
+        bool free = layoutMode == 1;
+        // 浮层窗口（大编辑器、右键菜单、快速插入或帮助）开着时画布的裸指针路径整体让位：
+        // 窗口矩形只护得住走命中测试的控件，选中/拖拽/滚轮这些直接读指针
+        // 事件的路径会从浮层底下穿透到画布，因此必须联合锁定。
+        bool locked = this.BigEditorOpen() || canvasMenuOpen || quickInsertOpen || keymapHelpOpen
+            || zoomMenuOpen || dpiMenuOpen || activeEventDropdown != ""
+            || app.HasOverlays();
+        int canvasId = app.focus.AllocId();
+        app.hitTester.RegisterRect(canvasId, cx, cy, cw, ch, 0);
+        c.FillRoundRect(cx, cy, cw, ch, app.Scale(6), Style.Full(app, "designer", "", "", Style.SNormal()).BgOr(0));
+        c.DrawRoundRect(cx, cy, cw, ch, app.Scale(6), Style.Full(app, "designer", "", "", Style.SNormal()).BorderOr(0), 1);
+
+        // 只由独立 Form 按目标窗口尺寸/DPI 量测布局，视图比例不进入树。
+        if (!this.PrepareDesignPreview(app) || !this.PreviewHasLayout()) {
+            hoverField = null;
+            tabHits = new List<TabHeaderHit>();
+            c.DrawText(cx + app.Scale(12), cy + app.Scale(10),
+                Designer.T("Preview unavailable", "预览暂不可用"),
+                Style.Part(app, "designer", "hint", "", "", "", Style.SNormal()).FgOr(0), fs);
+            return;
+        }
+        int dw = winW < 40 ? 40 : winW;
+        int dh = winH < 40 ? 40 : winH;
+        Canvas source = pvDocForm.GetApp().canvas;
+
+        int inX = cx + app.Scale(12);
+        int inY = cy + app.Scale(10);
+        int inW = cw - app.Scale(24);
+        int inH = ch - app.Scale(20);
+        if (inW < 20) { inW = 20; }
+        if (inH < 20) { inH = 20; }
+
+        int psMilli;
+        int effZoom = winZoom;
+        if (effZoom <= 0) {
+            int fitX = inW * 1000 / source.Width();
+            int fitY = inH * 1000 / source.Height();
+            effZoom = fitX;
+            if (fitY < effZoom) { effZoom = fitY; }
+            if (effZoom > 1000) { effZoom = 1000; }
+        }
+        if (effZoom < 250) { effZoom = 250; }
+        if (effZoom > 2000) { effZoom = 2000; }
+        lastFitPct = effZoom;
+        psMilli = effZoom * this.DesignDpi() / 100;
+        if (psMilli < 1) { psMilli = 1; }
+        int cw2 = this.DesignViewPx(source.Width(), psMilli);
+        int ch2 = this.DesignViewPx(source.Height(), psMilli);
+
+        int ek = app.EventKind();
+        if (app.PointerCaptured() || locked) { ek = 0; }
+
+        int panMaxX = (cw2 - inW) / 2 + inW / 2;
+        int panMaxY = (ch2 - inH) / 2 + inH / 2;
+        if (panMaxX < inW / 2) { panMaxX = inW / 2; }
+        if (panMaxY < inH / 2) { panMaxY = inH / 2; }
+        if (freePanX > panMaxX) { freePanX = panMaxX; }
+        if (freePanX < 0 - panMaxX) { freePanX = 0 - panMaxX; }
+        if (freePanY > panMaxY) { freePanY = panMaxY; }
+        if (freePanY < 0 - panMaxY) { freePanY = 0 - panMaxY; }
+        int ox = inX + (inW - cw2) / 2 - freePanX;
+        int oy = inY + (inH - ch2) / 2 - freePanY;
+
+        c.PushClip(inX, inY, inW, inH);
+
+        if (preview) {
+            bool inside = !locked && !app.PointerCaptured() && !freeHand && !freePanning
+                && InRect(app.mouseX, app.mouseY, inX, inY, inW, inH)
+                && InRect(app.mouseX, app.mouseY, ox, oy, cw2, ch2);
+            this.ProcessDesignPreviewInput(app,
+                this.DesignPointerPx(app.mouseX, ox, psMilli),
+                this.DesignPointerPx(app.mouseY, oy, psMilli), inside);
+        }
+        this.PaintDesignPreview(c, ox, oy, cw2, ch2);
+        if (UiDriver.Active()) {
+            UiDriver.SetProbe("designer", this.DesignPreviewProbe(ox, oy, cw2, ch2));
+        }
+
+        this.HandleCanvasZoom(app, locked, inX, inY, inW, inH, ox, oy, source);
+        this.HandleCanvasMiddlePan(app, locked, ek, inX, inY, inW, inH);
+
+        c.PushClip(ox, oy, cw2, ch2);
+        this.RegisterDesignTabs(ox, oy, psMilli);
+        this.UpdateCanvasHover(app, locked, ox, oy, cw2, ch2, inX, inY, inW, inH, psMilli);
+        this.RenderCanvasGrid(app, c, free, ox, oy, psMilli, dw, dh);
+        if (!preview) {
+            for (int i = 0; i < fields.Count; i = i + 1) {
+                this.RenderDesignOverlay(app, c, fields[i], ox, oy, psMilli);
+            }
+            this.RenderMultiSelBounds(app, c, ox, oy, psMilli);
+        }
+        c.PopClip();
+
+        this.HandleCanvasDropTarget(app, c, t, locked, free, ek, inX, inY, inW, inH, ox, oy, psMilli, dw, cw2, ch2);
+        bool activeHand = this.HandleCanvasHandMode(app, locked, ek, inX, inY, inW, inH);
+        this.HandleCanvasContextMenu(app, locked, activeHand, ek, inX, inY, inW, inH, ox, oy, psMilli, cw2, ch2);
+        this.HandleCanvasPointerDown(app, locked, activeHand, free, ek, inX, inY, inW, inH, ox, oy, psMilli, cw2, ch2);
+
+        if (freePanning) { Window.SetCursor(1); }
+        if (freePanning && ek == 1) {
+            freePanX = freePanOX - (app.mouseX - freePanSX);
+            freePanY = freePanOY - (app.mouseY - freePanSY);
+            app.RequestRedraw();
+        }
+
+        this.HandleCanvasDragMove(app, free, ek, ox, oy, psMilli);
+        this.HandleCanvasResizeMove(app, free, ek, ox, oy, psMilli);
+        this.HandleCanvasMarquee(app, c, ek, ox, oy, psMilli);
+        this.HandleCanvasPointerUp(app, locked, inX, inY, inW, inH);
+        this.RenderCanvasHudsAndGuides(app, c, ox, oy, psMilli, cw2, ch2);
+
+        if (!preview && showGuides) {
+            this.RenderCanvasGuides(app, c, inX, inY, inW, inH, ox, oy, psMilli, dw, dh);
+        }
+        if (!preview && showRulers) {
+            this.DrawCanvasRulers(app, c, inX, inY, inW, inH, ox, oy, psMilli, dw, dh, sel);
+        }
+
+        c.PopClip();
+    }
+
+    void HandleCanvasZoom(App app, bool locked, int inX, int inY, int inW, int inH, int ox, int oy, Canvas source) {
+        // Ctrl+滚轮以光标所在的设计物理位置为锚点平滑缩放画布（Fit 从
+        // 实际适配比例起步，因此从 Fit 缩出时平滑且无漂移）。
+        // 编辑器窗口开着时让位（locked），滚轮别穿透到画布。
+        if (!locked && InRect(app.mouseX, app.mouseY, inX, inY, inW, inH)
+                && Modifiers.HasCtrl(app.window.EventMods())) {
+            if (app.CaptureWheel(inX, inY, inW, inH)) {
+                int wdelta = app.window.EventKeyCode();
+                int z = winZoom;
+                if (z <= 0) { z = lastFitPct; }
+                int oldZ = z;
+                if (wdelta > 0) { z = z + 100; }
+                else if (wdelta < 0) { z = z - 100; }
+                if (z < 250) { z = 250; }
+                if (z > 2000) { z = 2000; }
+                if (z != oldZ) {
+                    int oldPs = oldZ * this.DesignDpi() / 100;
+                    int newPs = z * this.DesignDpi() / 100;
+                    if (oldPs > 0 && newPs > 0) {
+                        int cw2New = this.DesignViewPx(source.Width(), newPs);
+                        int ch2New = this.DesignViewPx(source.Height(), newPs);
+                        int relXOld = app.mouseX - ox;
+                        int relYOld = app.mouseY - oy;
+                        int relXNew = relXOld * newPs / oldPs;
+                        int relYNew = relYOld * newPs / oldPs;
+                        freePanX = relXNew - (app.mouseX - (inX + (inW - cw2New) / 2));
+                        freePanY = relYNew - (app.mouseY - (inY + (inH - ch2New) / 2));
+                    }
+                    winZoom = z;
+                    app.RequestRedraw();
+                }
+            }
+        } else if (!locked && !preview && InRect(app.mouseX, app.mouseY, inX, inY, inW, inH)) {
+            // 普通滚轮垂直平移，Shift+滚轮水平平移。
+            if (app.CaptureWheel(inX, inY, inW, inH)) {
+                int wdelta = app.window.EventKeyCode();
+                int step = app.Scale(48);
+                if (Modifiers.HasShift(app.window.EventMods())) {
+                    if (wdelta > 0) { freePanX = freePanX - step; }
+                    else if (wdelta < 0) { freePanX = freePanX + step; }
+                } else {
+                    if (wdelta > 0) { freePanY = freePanY - step; }
+                    else if (wdelta < 0) { freePanY = freePanY + step; }
+                }
+                app.RequestRedraw();
+            }
+        }
+
+    }
+
+    void HandleCanvasMiddlePan(App app, bool locked, int ek, int inX, int inY, int inW, int inH) {
+        // 抓手：中键在视口任意处按下即抓住画布拖动，
+        // 和场景设计器一致（左键留给选择和框选）。
+        if (!locked && ek == 2 && app.window.EventButton() == 2
+                && InRect(app.mouseX, app.mouseY, inX, inY, inW, inH)) {
+            freePanning = true;
+            freePanSX = app.mouseX;
+            freePanSY = app.mouseY;
+            freePanOX = freePanX;
+            freePanOY = freePanY;
+        }
+
+    }
+
+    void UpdateCanvasHover(App app, bool locked, int ox, int oy, int cw2, int ch2, int inX, int inY, int inW, int inH, int psMilli) {
+        if (!locked && !preview && InRect(app.mouseX, app.mouseY, ox, oy, cw2, ch2)
+                && InRect(app.mouseX, app.mouseY, inX, inY, inW, inH)
+                && !dragging && !freeDragging && !freePanning) {
+            FormField picked = this.DesignPickView(app.mouseX, app.mouseY, ox, oy, psMilli);
+            if (picked != hoverField) {
+                hoverField = picked;
+                app.RequestRedraw();
+            }
+        } else if (hoverField != null) {
+            hoverField = null;
+            app.RequestRedraw();
+        }
+    }
+
+    void RenderCanvasGrid(App app, Canvas c, bool free, int ox, int oy, int psMilli, int dw, int dh) {
+        if (!preview && showGrid && gridSize > 0 && free) {
+            int step = gridSize;
+            while (step * psMilli / 1000 < app.Scale(6)) { step = step * 2; }
+            int gridCol = Style.Part(app, "designer", "grid", "", "", "", Style.SNormal()).BgOr(0);
+            if (gridCol == 0) {
+                gridCol = Style.Fade(Style.Part(app, "designer", "hint", "", "", "", Style.SNormal()).FgOr(0x808080), 85);
+            } else {
+                gridCol = Style.Fade(gridCol, 90);
+            }
+            int dotSz = app.Scale(2);
+            if (dotSz < 1) { dotSz = 1; }
+            for (int gy = 0; gy <= dh; gy = gy + step) {
+                int py = oy + gy * psMilli / 1000;
+                for (int gx = 0; gx <= dw; gx = gx + step) {
+                    bool hitLeaf = false;
+                    for (int fi = 0; fi < fields.Count; fi = fi + 1) {
+                        FormField f = fields[fi];
+                        if (!f.IsContainer() && gx >= f.fx && gx < f.fx + f.fw && gy >= f.fy && gy < f.fy + f.fh) {
+                            hitLeaf = true;
+                            break;
+                        }
+                    }
+                    if (!hitLeaf) {
+                        c.FillRect(ox + gx * psMilli / 1000, py, dotSz, dotSz, gridCol);
+                    }
+                }
+            }
+        }
+    }
+
+    void HandleCanvasDropTarget(App app, Canvas c, Theme t, bool locked, bool free, int ek, int inX, int inY, int inW, int inH, int ox, int oy, int psMilli, int dw, int cw2, int ch2) {
+        // 放置目标：自由布局落在光标处；流式布局解析插入位置
+        // 或指针下的容器，并画出插入线。自由画布拖拽（面板拖入或
+        // 画布内拖动）给光标下的容器描边预告落点；画布内拖动松手
+        // 即换父——组件从此可以拖进/拖出容器，坐标自动换算。
+        if (!locked && !preview && free) {
+            if (dragging && dragFromPalette && ek == 3
+                    && InRect(app.mouseX, app.mouseY, inX, inY, inW, inH)
+                    && InRect(app.mouseX, app.mouseY, ox, oy, cw2, ch2)) {
+                int mDesX = (app.mouseX - ox) * 1000 / psMilli;
+                int mDesY = (app.mouseY - oy) * 1000 / psMilli;
+                DropFreePalette(mDesX, mDesY, this.DesignPointerPx(app.mouseX, ox, psMilli),
+                    this.DesignPointerPx(app.mouseY, oy, psMilli));
+            } else if (dragging && dragFromPalette) {
+                int mDesX = (app.mouseX - ox) * 1000 / psMilli;
+                int mDesY = (app.mouseY - oy) * 1000 / psMilli;
+                this.DrawFreeDropHi(app, c, ox, oy, psMilli,
+                    this.FreeDropContainerDevice(this.DesignPointerPx(app.mouseX, ox, psMilli),
+                        this.DesignPointerPx(app.mouseY, oy, psMilli)));
+            } else if (freeDragging && freeDragHasMoved && sel != null) {
+                int mDesX = (app.mouseX - ox) * 1000 / psMilli;
+                int mDesY = (app.mouseY - oy) * 1000 / psMilli;
+                FormField cont = this.FreeDropContainerDevice(this.DesignPointerPx(app.mouseX, ox, psMilli),
+                        this.DesignPointerPx(app.mouseY, oy, psMilli));
+                FormField currentParent = this.DesignOwnerOf(sel);
+                bool invalidDrop = false;
+                if (cont != null) {
+                    if (cont == sel || this.DesignInSubtree(sel, cont)) { invalidDrop = true; }
+                    for (int ei = 0; ei < freeExtra.Count; ei = ei + 1) {
+                        FormField ef = freeExtra[ei];
+                        if (ef != null && (cont == ef || this.DesignInSubtree(ef, cont))) {
+                            invalidDrop = true;
+                            break;
+                        }
+                    }
+                }
+                if (invalidDrop) {
+                    cont = currentParent;
+                }
+                if (cont != null) {
+                    this.FlowDropTarget(app, c, t, ox, oy, psMilli, dw);
+                } else if (cont == null && currentParent != null) {
+                    this.DrawFreeDropRootHi(app, c, ox, oy, psMilli, cw2, ch2);
+                }
+                if (ek == 3) {
+                    // 只在画布内松手才换父：拖到画布外（工具条/检查器
+                    // 上）松手不算拖出，免得组件被意外拽成顶层。
+                    if (InRect(app.mouseX, app.mouseY, ox, oy, cw2, ch2)
+                            && InRect(app.mouseX, app.mouseY, inX, inY, inW, inH)) {
+                        this.FreeReparentSel(cont);
+                    }
+                    app.RequestRedraw();
+                }
+            }
+        } else if (!locked && !preview && !free && dragging && (dragFromPalette || dragMoved)
+                && InRect(app.mouseX, app.mouseY, inX, inY, inW, inH)
+                && InRect(app.mouseX, app.mouseY, ox, oy, cw2, ch2)) {
+            this.FlowDropTarget(app, c, t, ox, oy, psMilli, dw);
+            if (ek == 3) { DropField(); app.RequestRedraw(); }
+        }
+
+    }
+
+    bool HandleCanvasHandMode(App app, bool locked, int ek, int inX, int inY, int inW, int inH) {
+        bool activeHand = freeHand || spacePressed;
+        if (activeHand) { freeDragging = false; freeResizing = false; freeMarquee = false; }
+        if (!locked && activeHand && InRect(app.mouseX, app.mouseY, inX, inY, inW, inH)) {
+            Window.SetCursor(1);
+            if (ek == 2 && app.window.EventButton() == 0) {
+                app.focus.ClearFocus();
+                freePanning = true;
+                freePanSX = app.mouseX;
+                freePanSY = app.mouseY;
+                freePanOX = freePanX;
+                freePanOY = freePanY;
+            }
+        }
+        return activeHand;
+    }
+
+    void HandleCanvasContextMenu(App app, bool locked, bool activeHand, int ek, int inX, int inY, int inW, int inH, int ox, int oy, int psMilli, int cw2, int ch2) {
+        // 画板右键菜单触发：在画板内右键点击，命中控件则选中该控件并弹出上下文菜单，点在空白处则弹出全局画布菜单
+        if (!locked && !preview && !activeHand && !dragging && ek == 2 && app.window.EventButton() == 1
+                && InRect(app.mouseX, app.mouseY, inX, inY, inW, inH)) {
+            app.focus.ClearFocus();
+            int mDesX = (app.mouseX - ox) * 1000 / psMilli;
+            int mDesY = (app.mouseY - oy) * 1000 / psMilli;
+            FormField hit = InRect(app.mouseX, app.mouseY, ox, oy, cw2, ch2)
+                ? this.DesignPickView(app.mouseX, app.mouseY, ox, oy, psMilli) : null;
+            if (hit != null) {
+                if (hit != sel && !this.IsExtraSel(hit)) {
+                    this.ClearExtraSel();
+                    sel = hit;
+                    inspTab = 0;
+                    if (this.DesignCanContain(hit)) { activeContainer = hit; }
+                    else { activeContainer = DesignOwnerOf(hit); }
+                }
+                canvasMenuHit = hit;
+            } else {
+                this.ClearExtraSel();
+                sel = null;
+                canvasMenuHit = null;
+            }
+            canvasMenuOpen = true;
+            canvasMenuArm = false;
+            canvasMenuX = app.mouseX;
+            canvasMenuY = app.mouseY;
+            app.RequestRedraw();
+        }
+
+        // 指针按下：选中的调整大小手柄优先，否则选择并
+    }
+
+    void HandleCanvasPointerDown(App app, bool locked, bool activeHand, bool free, int ek, int inX, int inY, int inW, int inH, int ox, int oy, int psMilli, int cw2, int ch2) {
+        // 开始拖拽；按在空白处清除选择。编辑器窗口开着时让位。
+        if (!locked && !activeHand && !dragging && ek == 2 && app.window.EventButton() == 0
+                && InRect(app.mouseX, app.mouseY, inX, inY, inW, inH)) {
+            app.focus.ClearFocus();
+            bool started = false;
+            // 拖拽基先对齐当前选中项：框选/撤销/换父之后存的旧基
+            // 会让手柄命中测试与随后的拖拽全部错位。
+            if (free) { this.SyncFreeSelBase(); }
+            TabHeaderHit th = preview || !InRect(app.mouseX, app.mouseY, ox, oy, cw2, ch2) ? null
+                : this.PickTabHeader(app.mouseX, app.mouseY, ox, oy, psMilli);
+            if (th != null) {
+                // 点页签就是翻页：顺带把这个 Tabs 设为活动容器，
+                // 接着添加/放下的组件落在正看着的这一页上。
+                th.tabs.uiState.Set(th.page);
+                sel = th.tabs;
+                inspTab = 0;
+                activeContainer = th.tabs;
+                this.ClearExtraSel();
+                this.MarkDocDirty();
+                msg = Designer.T("tab ", "标签页 ") + Convert.ToString(th.page + 1);
+                started = true;
+            }
+            if (!started && !preview && free && sel != null && !sel.locked && this.DesignVisible(sel)) {
+                List<FormField> mItems = this.GetMultiSelItems();
+                if (mItems.Count > 1) {
+                    Rect mw = this.GetMultiSelWorldRect(mItems);
+                    int sx = ox + mw.x * psMilli / 1000;
+                    int sy = oy + mw.y * psMilli / 1000;
+                    int sw2 = mw.width * psMilli / 1000;
+                    int sh2 = mw.height * psMilli / 1000;
+                    int hs = app.Scale(10);
+                    for (int hn = 0; hn < 8 && !started; hn = hn + 1) {
+                        int hx = FreeHandleX(hn, sx, sw2);
+                        int hy = FreeHandleY(hn, sy, sh2);
+                        if (InRect(app.mouseX, app.mouseY, hx - hs, hy - hs, hs * 2, hs * 2)) {
+                            freeResizing = true;
+                            freeResizeH = hn;
+                            designResizeMoved = false;
+                            designResizeMouseX = (app.mouseX - ox) * 1000 / psMilli;
+                            designResizeMouseY = (app.mouseY - oy) * 1000 / psMilli;
+                            designResizeLeft = mw.x;
+                            designResizeTop = mw.y;
+                            designResizeRight = mw.x + mw.width;
+                            designResizeBottom = mw.y + mw.height;
+                            multiResizeStarts = new List<MultiResizeItem>();
+                            for (int mi = 0; mi < mItems.Count; mi = mi + 1) {
+                                FormField mf = mItems[mi];
+                                multiResizeStarts.Add(new MultiResizeItem(mf,
+                                    this.DesignWorldX(mf), this.DesignWorldY(mf),
+                                    mf.LayoutW(), mf.LayoutH()));
+                            }
+                            started = true;
+                        }
+                    }
+                } else {
+                    Rect selected = this.DesignViewRect(sel, ox, oy, psMilli);
+                    int sx = selected.x;
+                    int sy = selected.y;
+                    int sw2 = selected.width;
+                    int sh2 = selected.height;
+                    int hs = app.Scale(10);
+                    for (int hn = 0; hn < 8 && !started; hn = hn + 1) {
+                        if (!Designer.FreeHandleAllowed(sel, hn)) { continue; }
+                        int hx = FreeHandleX(hn, sx, sw2);
+                        int hy = FreeHandleY(hn, sy, sh2);
+                        if (InRect(app.mouseX, app.mouseY,
+                                hx - hs, hy - hs, hs * 2, hs * 2)) {
+                            freeResizing = true;
+                            freeResizeH = hn;
+                            designResizeMoved = false;
+                            designResizeMouseX = (app.mouseX - ox) * 1000 / psMilli;
+                            designResizeMouseY = (app.mouseY - oy) * 1000 / psMilli;
+                            designResizeLeft = this.DesignWorldX(sel);
+                            designResizeTop = this.DesignWorldY(sel);
+                            designResizeRight = designResizeLeft + sel.LayoutW();
+                            designResizeBottom = designResizeTop + sel.LayoutH();
+                            multiResizeStarts = null;
+                            started = true;
+                        }
+                    }
+                }
+            }
+            if (!started && preview) { started = true; }
+            if (!started) {
+                int mDesX = (app.mouseX - ox) * 1000 / psMilli;
+                int mDesY = (app.mouseY - oy) * 1000 / psMilli;
+                FormField hit = InRect(app.mouseX, app.mouseY, ox, oy, cw2, ch2)
+                ? this.DesignPickView(app.mouseX, app.mouseY, ox, oy, psMilli) : null;
+                bool ctrl = Modifiers.HasCtrl(app.window.EventMods());
+                if (hit != null && ctrl) {
+                    // Ctrl+点击：加入/移出多选（第一个点中的成为主选中项）。
+                    if (sel == null) { sel = hit; }
+                    else if (hit != sel) { this.ToggleExtraSel(hit); }
+                } else if (hit != null) {
+                    // 按住多选中的任一成员整组一起拖。
+                    if (hit != sel && !this.IsExtraSel(hit)) {
+                        this.ClearExtraSel();
+                    } else if (hit != sel && this.IsExtraSel(hit)) {
+                        this.ToggleExtraSel(hit);
+                        if (sel != null) { freeExtra.Add(sel); }
+                    }
+                    sel = hit;
+                    inspTab = 0;
+                    if (this.DesignCanContain(hit)) { activeContainer = hit; }
+                    else { activeContainer = DesignOwnerOf(hit); }
+                    this.SyncOutlineSelection();
+                    if (hit.locked) {
+                        // 锁定：选得中、改得了属性，就是拖不动。
+                        msg = Designer.T("Component is locked — press Ctrl+L to unlock", "组件已锁定 (按 Ctrl+L 解锁)");
+                    } else if (free) {
+                        // 记录拖拽预备状态与起点坐标，只有产生真实位移时才解除停靠与压 Undo 栈，
+                        // 避免单纯点击或切换属性时误将组件的“填充/停靠”还原为自由定位。
+                        freeDragging = true;
+                        freeDragStartX = mDesX;
+                        freeDragStartY = mDesY;
+                        freeDragHasMoved = false;
+                        designDragLeft = this.DesignWorldX(hit);
+                        designDragTop = this.DesignWorldY(hit);
+                        designDragWidth = hit.LayoutW();
+                        designDragHeight = hit.LayoutH();
+                        freeDragDx = mDesX - designDragLeft;
+                        freeDragDy = mDesY - designDragTop;
+                    } else {
+                        // 流式布局：拖动就是重排（拖到容器上则移入）。
+                        int ti = IndexIn(fields, this.TopLevelOf(hit));
+                        if (ti >= 0) {
+                            this.PushUndo();
+                            dragging = true;
+                            dragFromPalette = false;
+                            dragMoved = false;
+                            dragIndex = ti;
+                            dragMouseX = app.mouseX;
+                            dragMouseY = app.mouseY;
+                        }
+                    }
+                } else {
+                    // 按在空白处拉框选（松开时选中框到的组件），
+                    // 和场景设计器一致；平移用中键或设计窗口外的空白。
+                    sel = null;
+                    activeContainer = null;
+                    if (!ctrl) { this.ClearExtraSel(); }
+                    freeMarquee = true;
+                    freeMqSX = app.mouseX;
+                    freeMqSY = app.mouseY;
+                }
+            }
+            app.RequestRedraw();
+        }
+
+        // 平移拖拽：跟随指针移动视口。
+    }
+
+    void HandleCanvasDragMove(App app, bool free, int ek, int ox, int oy, int psMilli) {
+        if (!preview && freeDragging && free && ek == 1 && sel != null) {
+            int mDesX = (app.mouseX - ox) * 1000 / psMilli;
+            int mDesY = (app.mouseY - oy) * 1000 / psMilli;
+            if (!freeDragHasMoved) {
+                int dx = mDesX - freeDragStartX;
+                int dy = mDesY - freeDragStartY;
+                if (dx >= 4 || dx <= 0 - 4 || dy >= 4 || dy <= 0 - 4) {
+                    if (Modifiers.HasAlt(app.window.EventMods())) {
+                        // 按住 Alt 拖拽：原地复制克隆副本并拖动新副本 (Alt+Drag Clone)
+                        this.DuplicateSel();
+                        msg = Designer.T("Alt+Drag: Cloned component", "Alt+拖拽: 已克隆副本并移动");
+                    } else {
+                        this.PushUndo();
+                    }
+                    this.DesignBeginMove();
+                    freeDragHasMoved = true;
+                }
+            }
+            if (freeDragHasMoved && designMoves != null) {
+                int baseX = this.DesignEditOriginX(sel);
+                int baseY = this.DesignEditOriginY(sel);
+                int left = mDesX - freeDragDx;
+                int top = mDesY - freeDragDy;
+                if (snapGrid && gridSize > 0) {
+                    left = baseX + (left - baseX + gridSize / 2) / gridSize * gridSize;
+                    top = baseY + (top - baseY + gridSize / 2) / gridSize * gridSize;
+                }
+                freeGuideX = 0 - 1;
+                freeGuideY = 0 - 1;
+                if (showGuides && !Modifiers.HasAlt(app.window.EventMods())) {
+                    int tol = this.FreeSnapTol(app, psMilli);
+                    List<int> rx = Designer.SnapAxis(left - baseX, designDragWidth,
+                        this.FreeSnapLines(true, sel), tol);
+                    List<int> ry = Designer.SnapAxis(top - baseY, designDragHeight,
+                        this.FreeSnapLines(false, sel), tol);
+                    left = rx[0] + baseX;
+                    top = ry[0] + baseY;
+                    if (rx[1] >= 0) { freeGuideX = rx[1] + baseX; }
+                    if (ry[1] >= 0) { freeGuideY = ry[1] + baseY; }
+                }
+                int dx = left - designDragLeft;
+                int dy = top - designDragTop;
+
+                // Shift 键正交轴向平移锁定：大位移轴锁定，另一轴位移清零
+                if (Modifiers.HasShift(app.window.EventMods())) {
+                    int absDx = dx < 0 ? 0 - dx : dx;
+                    int absDy = dy < 0 ? 0 - dy : dy;
+                    if (absDx >= absDy) {
+                        dy = 0;
+                        msg = Designer.T("Shift: Locked to Horizontal", "Shift: 锁定水平平移");
+                    } else {
+                        dx = 0;
+                        msg = Designer.T("Shift: Locked to Vertical", "Shift: 锁定垂直平移");
+                    }
+                }
+
+                for (int i = 0; i < designMoves.Count; i = i + 1) {
+                    DesignMoveStart move = designMoves[i];
+                    bool isStatusBar = (move.field.ftype == 59 || move.field.kind == "StatusBar");
+                    bool isToolStrip = (move.field.ftype == 58 || move.field.kind == "ToolStrip");
+                    if (move.field.dockSide == 1 || isToolStrip) {
+                        move.field.dockSide = 1;
+                        move.field.position = 0;
+                        move.field.fx = 0;
+                        move.field.fy = 0;
+                        move.field.fw = winW;
+                    } else if (move.field.dockSide == 2 || isStatusBar) {
+                        move.field.dockSide = 2;
+                        move.field.position = 0;
+                        move.field.fx = 0;
+                        move.field.fw = winW;
+                        if (move.field.fh <= 0) { move.field.fh = FormField.DefaultHFor(move.field.ftype); }
+                        move.field.fy = this.DesignRootContentHeight() - move.field.fh;
+                        if (move.field.fy < 0) { move.field.fy = 0; }
+                    } else if (move.field.IsFullWidthBanner()) {
+                        move.field.fx = 0;
+                        move.field.fy = move.y + dy - this.DesignEditOriginY(move.field);
+                    } else {
+                        move.field.fx = move.x + dx - this.DesignEditOriginX(move.field);
+                        move.field.fy = move.y + dy - this.DesignEditOriginY(move.field);
+                    }
+                    if (move.field.fx < 0) { move.field.fx = 0; }
+                    if (move.field.fy < 0) { move.field.fy = 0; }
+                    this.DesignDeclareRect(move.field);
+                }
+                this.MarkDocDirty();
+            }
+            app.RequestRedraw();
+        }
+
+        // Resize 使用按下时的真实起点与指针增量，对边不会随下一帧布局漂移。
+    }
+
+    void HandleCanvasResizeMove(App app, bool free, int ek, int ox, int oy, int psMilli) {
+        if (!preview && freeResizing && free && ek == 1 && sel != null) {
+            int dx = (app.mouseX - ox) * 1000 / psMilli - designResizeMouseX;
+            int dy = (app.mouseY - oy) * 1000 / psMilli - designResizeMouseY;
+            if (!designResizeMoved && (dx != 0 || dy != 0)) {
+                this.PushUndo();
+                if (multiResizeStarts != null && multiResizeStarts.Count > 1) {
+                    for (int mi = 0; mi < multiResizeStarts.Count; mi = mi + 1) {
+                        this.DesignMakeFloat(multiResizeStarts[mi].field);
+                    }
+                } else {
+                    this.DesignMakeFloat(sel);
+                }
+                designResizeMoved = true;
+            }
+            if (designResizeMoved) {
+                int left = designResizeLeft;
+                int top = designResizeTop;
+                int right = designResizeRight;
+                int bottom = designResizeBottom;
+                int hn = freeResizeH;
+                bool moveL = hn == 0 || hn == 6 || hn == 7;
+                bool moveT = hn == 0 || hn == 1 || hn == 2;
+                bool moveR = hn == 2 || hn == 3 || hn == 4;
+                bool moveB = hn == 4 || hn == 5 || hn == 6;
+                bool isMulti = (multiResizeStarts != null && multiResizeStarts.Count > 1);
+
+                if (!isMulti && sel.IsFullWidthBanner()) {
+                    moveL = false;
+                    moveR = false;
+                }
+                if (!isMulti && sel.IsFixedHeight()) {
+                    moveT = false;
+                    moveB = false;
+                }
+                if (moveL) { left = left + dx; }
+                if (moveT) { top = top + dy; }
+                if (moveR) { right = right + dx; }
+                if (moveB) { bottom = bottom + dy; }
+                int baseX = this.DesignEditOriginX(sel);
+                int baseY = this.DesignEditOriginY(sel);
+                if (snapGrid && gridSize > 0) {
+                    if (moveL) { left = baseX + (left - baseX + gridSize / 2) / gridSize * gridSize; }
+                    if (moveR) { right = baseX + (right - baseX + gridSize / 2) / gridSize * gridSize; }
+                    if (moveT) { top = baseY + (top - baseY + gridSize / 2) / gridSize * gridSize; }
+                    if (moveB) { bottom = baseY + (bottom - baseY + gridSize / 2) / gridSize * gridSize; }
+                }
+                freeGuideX = 0 - 1;
+                freeGuideY = 0 - 1;
+                if (showGuides && !Modifiers.HasAlt(app.window.EventMods())) {
+                    int tol = this.FreeSnapTol(app, psMilli);
+                    if (moveL || moveR) {
+                        List<int> r = Designer.SnapAxis((moveL ? left : right) - baseX, 0,
+                            this.FreeSnapLines(true, sel), tol);
+                        if (moveL) { left = r[0] + baseX; } else { right = r[0] + baseX; }
+                        if (r[1] >= 0) { freeGuideX = r[1] + baseX; }
+                    }
+                    if (moveT || moveB) {
+                        List<int> r = Designer.SnapAxis((moveT ? top : bottom) - baseY, 0,
+                            this.FreeSnapLines(false, sel), tol);
+                        if (moveT) { top = r[0] + baseY; } else { bottom = r[0] + baseY; }
+                        if (r[1] >= 0) { freeGuideY = r[1] + baseY; }
+                    }
+                }
+                if (isMulti) {
+                    // 多选联合等比 / 自由比例缩放
+                    int origW = designResizeRight - designResizeLeft;
+                    int origH = designResizeBottom - designResizeTop;
+                    int newW = right - left;
+                    int newH = bottom - top;
+                    if (newW < 20) { newW = 20; }
+                    if (newH < 20) { newH = 20; }
+                    // Shift 等比约束
+                    if (Modifiers.HasShift(app.window.EventMods()) && (hn == 0 || hn == 2 || hn == 4 || hn == 6)) {
+                        if (origW > 0 && origH > 0) {
+                            newH = origH * newW / origW;
+                            if (hn == 0 || hn == 2) { top = bottom - newH; }
+                            else { bottom = top + newH; }
+                        }
+                    }
+                    for (int mi = 0; mi < multiResizeStarts.Count; mi = mi + 1) {
+                        MultiResizeItem it = multiResizeStarts[mi];
+                        int relX = it.x - designResizeLeft;
+                        int relY = it.y - designResizeTop;
+                        int newX = origW > 0 ? left + relX * newW / origW : left;
+                        int newY = origH > 0 ? top + relY * newH / origH : top;
+                        int newFieldW = origW > 0 ? it.w * newW / origW : it.w;
+                        int newFieldH = origH > 0 ? it.h * newH / origH : it.h;
+                        if (newFieldW < 10) { newFieldW = 10; }
+                        if (newFieldH < 10) { newFieldH = 10; }
+                        int itBaseX = this.DesignEditOriginX(it.field);
+                        int itBaseY = this.DesignEditOriginY(it.field);
+                        bool isItemSb = (it.field.ftype == 59 || it.field.kind == "StatusBar");
+                        bool isItemTs = (it.field.ftype == 58 || it.field.kind == "ToolStrip");
+                        if (isItemSb) {
+                            it.field.dockSide = 2;
+                            it.field.position = 0;
+                            it.field.fx = 0;
+                            it.field.fw = winW;
+                            if (it.field.fh <= 0) { it.field.fh = FormField.DefaultHFor(it.field.ftype); }
+                            it.field.fy = this.DesignRootContentHeight() - it.field.fh;
+                            if (it.field.fy < 0) { it.field.fy = 0; }
+                        } else if (isItemTs) {
+                            if (it.field.dockSide == 0) { it.field.dockSide = 1; }
+                            it.field.position = 0;
+                            it.field.fx = 0;
+                            it.field.fw = winW;
+                            if (it.field.dockSide == 1) { it.field.fy = 0; }
+                            else if (it.field.dockSide == 2) {
+                                if (it.field.fh <= 0) { it.field.fh = FormField.DefaultHFor(it.field.ftype); }
+                                it.field.fy = this.DesignRootContentHeight() - it.field.fh;
+                                if (it.field.fy < 0) { it.field.fy = 0; }
+                            }
+                        } else {
+                            it.field.fx = newX - itBaseX;
+                            it.field.fy = newY - itBaseY;
+                            it.field.fw = newFieldW;
+                            it.field.fh = newFieldH;
+                        }
+                        this.DesignDeclareRect(it.field);
+                    }
+                    this.MarkDocDirty();
+                } else {
+                    int minW = 8;
+                    int minH = 8;
+                    if (right - left < minW) {
+                        if (moveL) { left = right - minW; } else { right = left + minW; }
+                    }
+                    if (bottom - top < minH) {
+                        if (moveT) { top = bottom - minH; } else { bottom = top + minH; }
+                    }
+                    if (sel.IsFullWidthBanner()) {
+                        Rect content = this.DesignContentRect(this.DesignParentHost(sel));
+                        int hostW = this.DesignLogical(content.width);
+                        if (hostW <= 0) { hostW = sel.LayoutW(); }
+                        left = baseX;
+                        right = baseX + hostW;
+                    }
+                    if (sel.IsFixedHeight()) {
+                        bottom = top + FormField.DefaultHFor(sel.ftype);
+                    }
+                    bool isSb = (sel.ftype == 59 || sel.kind == "StatusBar");
+                    bool isTs = (sel.ftype == 58 || sel.kind == "ToolStrip");
+                    if (isSb) {
+                        sel.dockSide = 2;
+                        sel.position = 0;
+                        sel.fx = 0;
+                        sel.fw = winW;
+                        if (sel.fh <= 0) { sel.fh = FormField.DefaultHFor(sel.ftype); }
+                        sel.fy = this.DesignRootContentHeight() - sel.fh;
+                        if (sel.fy < 0) { sel.fy = 0; }
+                    } else if (isTs) {
+                        if (sel.dockSide == 0) { sel.dockSide = 1; }
+                        sel.position = 0;
+                        sel.fx = 0;
+                        sel.fw = winW;
+                        if (sel.dockSide == 1) { sel.fy = 0; }
+                        else if (sel.dockSide == 2) {
+                            if (sel.fh <= 0) { sel.fh = FormField.DefaultHFor(sel.ftype); }
+                            sel.fy = this.DesignRootContentHeight() - sel.fh;
+                            if (sel.fy < 0) { sel.fy = 0; }
+                        }
+                    } else {
+                        sel.fx = left - baseX;
+                        sel.fy = top - baseY;
+                        if (sel.fx < 0) { sel.fx = 0; }
+                        if (sel.fy < 0) { sel.fy = 0; }
+                        sel.fw = right - left;
+                        sel.fh = bottom - top;
+                    }
+                    this.DesignDeclareRect(sel);
+                    this.MarkDocDirty();
+                }
+            }
+            app.RequestRedraw();
+        }
+
+        // 框选：拉框时画出选框，松开时选中与框相交的顶层组件。
+    }
+
+    void HandleCanvasMarquee(App app, Canvas c, int ek, int ox, int oy, int psMilli) {
+        if (!preview && freeMarquee) {
+            int mqx = freeMqSX;
+            int mqy = freeMqSY;
+            int mqw = app.mouseX - freeMqSX;
+            int mqh = app.mouseY - freeMqSY;
+            if (mqw < 0) { mqx = app.mouseX; mqw = 0 - mqw; }
+            if (mqh < 0) { mqy = app.mouseY; mqh = 0 - mqh; }
+            if (ek == 1) { app.RequestRedraw(); }
+            int mqAcc = Style.Part(app, "designer", "accent", "", "", "", Style.SNormal()).BgOr(0);
+            c.FillRect(mqx, mqy, mqw, mqh, Style.Fade(mqAcc, 80));
+            c.DrawRect(mqx, mqy, mqw, mqh, mqAcc, 1);
+            if (ek == 3) {
+                int selL = this.DesignPointerPx(mqx, ox, psMilli);
+                int selT = this.DesignPointerPx(mqy, oy, psMilli);
+                int selR = this.DesignPointerPx(mqx + mqw, ox, psMilli);
+                int selB = this.DesignPointerPx(mqy + mqh, oy, psMilli);
+                this.ClearExtraSel();
+                sel = null;
+                // 递归收集：容器里的子组件同样框得中（Tabs 只看
+                // 当前页），和场景设计器、点选的行为一致。
+                List<FormField> got = new List<FormField>();
+                this.MarqueeCollect(fields, selL, selT, selR, selB, got);
+                for (int gi = 0; gi < got.Count; gi = gi + 1) {
+                    if (this.HasAncestorIn(got[gi], got)) { continue; }
+                    if (sel == null) { sel = got[gi]; } else { freeExtra.Add(got[gi]); }
+                }
+                // 框选也改变选中项：基必须跟着重算，否则框选中的
+                // 嵌套子级一拖就按旧基（通常是画布原点）瞬移。
+                this.SyncFreeSelBase();
+                freeMarquee = false;
+                if (sel != null) {
+                    msg = Designer.T("selected ", "已选中 ")
+                        + Convert.ToString(freeExtra.Count + 1)
+                        + Designer.T(" component(s)", " 个组件");
+                }
+                app.RequestRedraw();
+            }
+        }
+
+        // 任意位置松开指针即结束拖拽/调整大小/平移，并撤掉参考线。
+    }
+
+    void HandleCanvasPointerUp(App app, bool locked, int inX, int inY, int inW, int inH) {
+        // 指针没动过（一次点击）的话设计没变，把按下时压的栈退掉。
+        // PointerCaptured 与按下的那条路径同源：浮层拥有指针时，
+        // 释放不得再跑画布的双击判定（缩放/DPI 下拉开着时在画布
+        // 上双击，会顺手进入代码桩或原地改文案）。
+        if (!locked && !app.PointerCaptured() && app.EventKind() == 3) {
+            if (!dragging && (freeDragHasMoved || designResizeMoved)) { this.PopUndoIfUnchanged(); }
+	            // 精准双击处理：松开且没有发生任何位移，并在 400ms 与 5px 位移容差内两次点击同一组件，且满足业务控件白名单才触发进入代码或打开自定义组件
+		            if (!preview && !freeHand && InRect(app.mouseX, app.mouseY, inX, inY, inW, inH)
+		                    && !dragging && !freeDragHasMoved && !designResizeMoved) {
+		                int nowMs = Window.GetTickMs();
+		                int cdx = app.mouseX - canvasLastClickX;
+		                if (cdx < 0) { cdx = 0 - cdx; }
+		                int cdy = app.mouseY - canvasLastClickY;
+		                if (cdy < 0) { cdy = 0 - cdy; }
+			                int tol = app.Scale(6);
+			                bool inDist = (cdx <= tol && cdy <= tol);
+						                if (sel != null && sel == canvasLastClickField && (nowMs - canvasLastClickMs) <= 320 && inDist) {
+						                    if (sel.compRef) {
+						                        openCompName = sel.customKind;
+						                        openCompRequested = true;
+						                        msg = Designer.T("opening component ", "打开组件 ") + sel.customKind;
+						                    } else if (Designer.CanNavigateCodeBehind(sel)) {
+						                        // 经典 IDE (VS/WinForms) 体验：交互控件双击直达默认事件处理器（自动绑定并跳转/生成代码桩）
+						                        string defEv = Designer.DefaultEventName(sel);
+						                        string h = sel.GetHandler(defEv);
+						                        if (h == "") {
+						                            h = Designer.SuggestHandler(sel, defEv);
+						                            sel.SetHandler(defEv, h);
+						                            this.MarkDocDirty();
+						                        }
+						                        this.RequestOpenCodeBehindHandler(h);
+						                    } else if (Designer.HasDisplayText(sel)) {
+						                        // 静态文本/展示型组件双击原地行内改文案
+						                        this.StartInlineRename();
+						                    }
+						                    canvasLastClickField = null;
+						                    canvasLastClickMs = 0;
+						                    canvasLastClickX = 0;
+						                    canvasLastClickY = 0;
+						                } else {
+		                    canvasLastClickField = sel;
+		                    canvasLastClickMs = nowMs;
+		                    canvasLastClickX = app.mouseX;
+		                    canvasLastClickY = app.mouseY;
+		                }
+		            }
+            if (freePanning) {
+                app.ClaimClick();
+            }
+            freeDragging = false;
+            freeDragHasMoved = false;
+            freeResizing = false;
+            designResizeMoved = false;
+            multiResizeStarts = null;
+            designMoves = null;
+            freePanning = false;
+            this.freeGuideX = 0 - 1;
+            this.freeGuideY = 0 - 1;
+            app.RequestRedraw();
+        }
+
+        // 磁吸参考线与智能吸附坐标 HUD：
+    }
+
+    void RenderCanvasHudsAndGuides(App app, Canvas c, int ox, int oy, int psMilli, int cw2, int ch2) {
+        // 贯穿画布的高亮竖线 / 横线，并在边缘浮动坐标 Badge；
+        // 拖拽过程中在当前控件角落浮动尺寸与坐标 HUD。
+        int accentColor = Style.Part(app, "designer", "accent", "", "", "", Style.SNormal()).BgOr(0);
+        int badgeFg = Style.Part(app, "designer", "badge", "", "", "", Style.SNormal()).FgOr(0);
+        int fsTiny = Style.FontFallback(app, "tiny");
+        if (fsTiny <= 0) { fsTiny = Style.FontFallback(app, "small"); }
+
+        if (!preview && this.freeGuideX >= 0) {
+            int gxp = ox + this.freeGuideX * psMilli / 1000;
+            c.FillRect(gxp, oy, 1, ch2, accentColor);
+            string txtX = "X: " + Convert.ToString(this.freeGuideX);
+            int twX = Canvas.MeasureText(txtX, fsTiny) + app.Scale(8);
+            int thX = app.Scale(16);
+            int bxX = gxp + app.Scale(4);
+            if (bxX + twX > ox + cw2) { bxX = gxp - twX - app.Scale(4); }
+            int byX = oy + app.Scale(4);
+            c.FillRoundRect(bxX, byX, twX, thX, app.Scale(3), accentColor);
+            c.DrawText(bxX + app.Scale(4), byX + app.Scale(2), txtX, badgeFg, fsTiny);
+        }
+        if (!preview && this.freeGuideY >= 0) {
+            int gyp = oy + this.freeGuideY * psMilli / 1000;
+            c.FillRect(ox, gyp, cw2, 1, accentColor);
+            string txtY = "Y: " + Convert.ToString(this.freeGuideY);
+            int twY = Canvas.MeasureText(txtY, fsTiny) + app.Scale(8);
+            int thY = app.Scale(16);
+            int bxY = ox + app.Scale(4);
+            int byY = gyp + app.Scale(4);
+            if (byY + thY > oy + ch2) { byY = gyp - thY - app.Scale(4); }
+            c.FillRoundRect(bxY, byY, twY, thY, app.Scale(3), accentColor);
+            c.DrawText(bxY + app.Scale(4), byY + app.Scale(2), txtY, badgeFg, fsTiny);
+        }
+
+        // 拖拽/缩放实时几何状态浮动 HUD
+        if (!preview && sel != null && ((freeDragging && freeDragHasMoved) || (freeResizing && designResizeMoved))) {
+            string hudTxt = Convert.ToString(sel.fx) + ", " + Convert.ToString(sel.fy)
+                + " · " + Convert.ToString(sel.fw) + "x" + Convert.ToString(sel.fh);
+            int hudW = Canvas.MeasureText(hudTxt, fsTiny) + app.Scale(12);
+            int hudH = app.Scale(18);
+            int hudX = app.mouseX + app.Scale(12);
+            int hudY = app.mouseY + app.Scale(16);
+            if (hudX + hudW > ox + cw2) { hudX = app.mouseX - hudW - app.Scale(8); }
+            if (hudY + hudH > oy + ch2) { hudY = app.mouseY - hudH - app.Scale(8); }
+            c.FillRoundRect(hudX + 1, hudY + 1, hudW, hudH, app.Scale(4),
+                Style.Part(app, "designer", "shadow", "", "", "", Style.SNormal()).BgOr(0));
+            c.FillRoundRect(hudX, hudY, hudW, hudH, app.Scale(4),
+                Style.Part(app, "designer", "accent", "", "", "", Style.SNormal()).BgOr(0));
+            c.DrawText(hudX + app.Scale(6), hudY + app.Scale(2), hudTxt, badgeFg, fsTiny);
+        }
+
+        // Alt 键悬停间距测量标尺 (Alt Spacing Inspection)：
+        // 当按住 Alt 且有选中项 sel，光标悬停在另一个控件 hoverField 上时，
+        // 动态绘制两者在世界坐标系下的间距连线与数字标尺。
+        if (!preview && sel != null && hoverField != null && hoverField != sel
+                && Modifiers.HasAlt(app.window.EventMods())
+                && !freeDragging && !freeResizing && !freePanning) {
+            Rect r1 = this.DesignViewRect(sel, ox, oy, psMilli);
+            Rect r2 = this.DesignViewRect(hoverField, ox, oy, psMilli);
+            int mCol = Style.Part(app, "designer", "accent", "", "", "", Style.SNormal()).BgOr(0);
+            int lineCol = Style.Fade(mCol, 20);
+
+            // 绘制 hoverField 高亮外框
+            c.DrawRect(r2.x, r2.y, r2.width, r2.height, mCol, 1);
+
+            int x1 = r1.x; int y1 = r1.y; int w1 = r1.width; int h1 = r1.height;
+            int x2 = r2.x; int y2 = r2.y; int w2 = r2.width; int h2 = r2.height;
+
+            // 水平间距：r2 在 r1 右侧
+            if (x2 > x1 + w1) {
+                int gapX = (x2 - (x1 + w1)) * 1000 / psMilli;
+                int ly = (y1 + h1 / 2 + y2 + h2 / 2) / 2;
+                c.FillRect(x1 + w1, ly, x2 - (x1 + w1), 1, lineCol);
+                string gt = Convert.ToString(gapX);
+                int gtw = Canvas.MeasureText(gt, fsTiny) + app.Scale(6);
+                int gth = app.Scale(14);
+                int gtx = (x1 + w1 + x2) / 2 - gtw / 2;
+                int gty = ly - gth / 2;
+                c.FillRoundRect(gtx, gty, gtw, gth, app.Scale(2), mCol);
+                c.DrawText(gtx + app.Scale(3), gty + app.Scale(1), gt, badgeFg, fsTiny);
+            } else if (x1 > x2 + w2) { // 水平间距：r2 在 r1 左侧
+                int gapX = (x1 - (x2 + w2)) * 1000 / psMilli;
+                int ly = (y1 + h1 / 2 + y2 + h2 / 2) / 2;
+                c.FillRect(x2 + w2, ly, x1 - (x2 + w2), 1, lineCol);
+                string gt = Convert.ToString(gapX);
+                int gtw = Canvas.MeasureText(gt, fsTiny) + app.Scale(6);
+                int gth = app.Scale(14);
+                int gtx = (x2 + w2 + x1) / 2 - gtw / 2;
+                int gty = ly - gth / 2;
+                c.FillRoundRect(gtx, gty, gtw, gth, app.Scale(2), mCol);
+                c.DrawText(gtx + app.Scale(3), gty + app.Scale(1), gt, badgeFg, fsTiny);
+            }
+
+            // 垂直间距：r2 在 r1 下方
+            if (y2 > y1 + h1) {
+                int gapY = (y2 - (y1 + h1)) * 1000 / psMilli;
+                int lx = (x1 + w1 / 2 + x2 + w2 / 2) / 2;
+                c.FillRect(lx, y1 + h1, 1, y2 - (y1 + h1), lineCol);
+                string gt = Convert.ToString(gapY);
+                int gtw = Canvas.MeasureText(gt, fsTiny) + app.Scale(6);
+                int gth = app.Scale(14);
+                int gtx = lx - gtw / 2;
+                int gty = (y1 + h1 + y2) / 2 - gth / 2;
+                c.FillRoundRect(gtx, gty, gtw, gth, app.Scale(2), mCol);
+                c.DrawText(gtx + app.Scale(3), gty + app.Scale(1), gt, badgeFg, fsTiny);
+            } else if (y1 > y2 + h2) { // 垂直间距：r2 在 r1 上方
+                int gapY = (y1 - (y2 + h2)) * 1000 / psMilli;
+                int lx = (x1 + w1 / 2 + x2 + w2 / 2) / 2;
+                c.FillRect(lx, y2 + h2, 1, y1 - (y2 + h2), lineCol);
+                string gt = Convert.ToString(gapY);
+                int gtw = Canvas.MeasureText(gt, fsTiny) + app.Scale(6);
+                int gth = app.Scale(14);
+                int gtx = lx - gtw / 2;
+                int gty = (y2 + h2 + y1) / 2 - gth / 2;
+                c.FillRoundRect(gtx, gty, gtw, gth, app.Scale(2), mCol);
+                c.DrawText(gtx + app.Scale(3), gty + app.Scale(1), gt, badgeFg, fsTiny);
+            }
+        } else if (!preview && sel != null && Modifiers.HasAlt(app.window.EventMods())
+                && !freeDragging && !freeResizing && !freePanning) {
+            // Alt 悬停在空白处或父容器上时，动态测量当前组件相对父容器四边的内缩距离（Parent Inset Guides）
+            FormField p = this.DesignOwnerOf(sel);
+            Rect rParent = null;
+            if (p != null) {
+                Control host = this.DesignSlot(p, sel.childTab);
+                Rect pContent = this.DesignContentRect(host);
+                rParent = new Rect(ox + this.DesignViewPx(pContent.x, psMilli),
+                    oy + this.DesignViewPx(pContent.y, psMilli),
+                    this.DesignViewPx(pContent.width, psMilli),
+                    this.DesignViewPx(pContent.height, psMilli));
+            } else {
+                rParent = new Rect(ox, oy, cw2, ch2);
+            }
+            Rect r1 = this.DesignViewRect(sel, ox, oy, psMilli);
+            int mCol = Style.Part(app, "designer", "accent", "", "", "", Style.SNormal()).BgOr(0);
+            int lineCol = Style.Fade(mCol, 30);
+            c.DrawRect(rParent.x, rParent.y, rParent.width, rParent.height, lineCol, 1);
+
+            int x1 = r1.x; int y1 = r1.y; int w1 = r1.width; int h1 = r1.height;
+            int px = rParent.x; int py = rParent.y; int pw = rParent.width; int ph = rParent.height;
+
+            // 1. 顶部距离 (Top Inset)
+            if (y1 > py) {
+                int padT = (y1 - py) * 1000 / psMilli;
+                int lx = x1 + w1 / 2;
+                c.FillRect(lx, py, 1, y1 - py, lineCol);
+                string gt = Convert.ToString(padT);
+                int gtw = Canvas.MeasureText(gt, fsTiny) + app.Scale(6);
+                int gth = app.Scale(14);
+                int gtx = lx - gtw / 2;
+                int gty = (py + y1) / 2 - gth / 2;
+                c.FillRoundRect(gtx, gty, gtw, gth, app.Scale(2), mCol);
+                c.DrawText(gtx + app.Scale(3), gty + app.Scale(1), gt, badgeFg, fsTiny);
+            }
+
+            // 2. 底部距离 (Bottom Inset)
+            if (py + ph > y1 + h1) {
+                int padB = ((py + ph) - (y1 + h1)) * 1000 / psMilli;
+                int lx = x1 + w1 / 2;
+                c.FillRect(lx, y1 + h1, 1, (py + ph) - (y1 + h1), lineCol);
+                string gt = Convert.ToString(padB);
+                int gtw = Canvas.MeasureText(gt, fsTiny) + app.Scale(6);
+                int gth = app.Scale(14);
+                int gtx = lx - gtw / 2;
+                int gty = (y1 + h1 + py + ph) / 2 - gth / 2;
+                c.FillRoundRect(gtx, gty, gtw, gth, app.Scale(2), mCol);
+                c.DrawText(gtx + app.Scale(3), gty + app.Scale(1), gt, badgeFg, fsTiny);
+            }
+
+            // 3. 左侧距离 (Left Inset)
+            if (x1 > px) {
+                int padL = (x1 - px) * 1000 / psMilli;
+                int ly = y1 + h1 / 2;
+                c.FillRect(px, ly, x1 - px, 1, lineCol);
+                string gt = Convert.ToString(padL);
+                int gtw = Canvas.MeasureText(gt, fsTiny) + app.Scale(6);
+                int gth = app.Scale(14);
+                int gtx = (px + x1) / 2 - gtw / 2;
+                int gty = ly - gth / 2;
+                c.FillRoundRect(gtx, gty, gtw, gth, app.Scale(2), mCol);
+                c.DrawText(gtx + app.Scale(3), gty + app.Scale(1), gt, badgeFg, fsTiny);
+            }
+
+            // 4. 右侧距离 (Right Inset)
+            if (px + pw > x1 + w1) {
+                int padR = ((px + pw) - (x1 + w1)) * 1000 / psMilli;
+                int ly = y1 + h1 / 2;
+                c.FillRect(x1 + w1, ly, (px + pw) - (x1 + w1), 1, lineCol);
+                string gt = Convert.ToString(padR);
+                int gtw = Canvas.MeasureText(gt, fsTiny) + app.Scale(6);
+                int gth = app.Scale(14);
+                int gtx = (x1 + w1 + px + pw) / 2 - gtw / 2;
+                int gty = ly - gth / 2;
+                c.FillRoundRect(gtx, gty, gtw, gth, app.Scale(2), mCol);
+                c.DrawText(gtx + app.Scale(3), gty + app.Scale(1), gt, badgeFg, fsTiny);
+            }
+        }
+
+        // 画布辅助参考线 (Canvas Guide Lines)
+    }
+}

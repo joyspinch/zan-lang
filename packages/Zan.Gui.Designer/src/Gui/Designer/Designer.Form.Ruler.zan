@@ -1,0 +1,264 @@
+using System;
+using System.Collections.Generic;
+using System.Json;
+using Gui;
+using Gui.Widget;
+using Gui.Component;
+using Gui.Backend;
+
+namespace Gui.Designer;
+
+partial class Designer {
+    void RenderCanvasGuides(App app, Canvas c, int inX, int inY, int inW, int inH,
+                            int ox, int oy, int psMilli, int dw, int dh) {
+        bool locked = this.BigEditorOpen() || canvasMenuOpen || quickInsertOpen || keymapHelpOpen
+            || zoomMenuOpen || dpiMenuOpen || activeEventDropdown != ""
+            || app.HasOverlays();
+        int rThick = showRulers ? app.Scale(16) : 0;
+        int guideCol = 0xFF4A90E2; // 经典专业参考线天蓝色
+        int lineCol = Style.Fade(guideCol, 150);
+        int anchorCol = guideCol;
+
+        // 绘制水平参考线
+        if (hGuides != null) {
+            for (int i = 0; i < hGuides.Count; i = i + 1) {
+                int gy = hGuides[i];
+                int sy = oy + gy * psMilli / 1000;
+                if (sy >= inY + rThick && sy <= inY + inH) {
+                    c.FillRect(inX + rThick, sy, inW - rThick, 1, lineCol);
+                    if (showRulers) {
+                        c.FillRect(inX + rThick - app.Scale(4), sy - app.Scale(2), app.Scale(4), app.Scale(5), anchorCol);
+                    }
+                    int dy = app.mouseY - sy;
+                    if (dy < 0) { dy = 0 - dy; }
+                    if (!locked && draggingGuideAxis < 0 && dy <= 3 && app.mouseX >= inX + rThick && app.mouseX <= inX + inW) {
+                        c.FillRect(inX + rThick, sy - 1, inW - rThick, 3, guideCol);
+                        if (app.EventKind() == 2 && app.window.EventButton() == 0) {
+                            draggingGuideAxis = 1;
+                            draggingGuideIdx = i;
+                            draggingGuidePos = gy;
+                        }
+                    }
+                }
+            }
+        }
+
+        // 绘制垂直参考线
+        if (vGuides != null) {
+            for (int i = 0; i < vGuides.Count; i = i + 1) {
+                int gx = vGuides[i];
+                int sx = ox + gx * psMilli / 1000;
+                if (sx >= inX + rThick && sx <= inX + inW) {
+                    c.FillRect(sx, inY + rThick, 1, inH - rThick, lineCol);
+                    if (showRulers) {
+                        c.FillRect(sx - app.Scale(2), inY + rThick - app.Scale(4), app.Scale(5), app.Scale(4), anchorCol);
+                    }
+                    int dx = app.mouseX - sx;
+                    if (dx < 0) { dx = 0 - dx; }
+                    if (!locked && draggingGuideAxis < 0 && dx <= 3 && app.mouseY >= inY + rThick && app.mouseY <= inY + inH) {
+                        c.FillRect(sx - 1, inY + rThick, 3, inH - rThick, guideCol);
+                        if (app.EventKind() == 2 && app.window.EventButton() == 0) {
+                            draggingGuideAxis = 0;
+                            draggingGuideIdx = i;
+                            draggingGuidePos = gx;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 绘制画布顶部与左侧动态像素标尺（含光标游标、刻度数字、选中项跨度高亮投影及从标尺拖出参考线）
+    void DrawCanvasRulers(App app, Canvas c, int inX, int inY, int inW, int inH,
+                          int ox, int oy, int psMilli, int dw, int dh, FormField sel) {
+        bool locked = this.BigEditorOpen() || canvasMenuOpen || quickInsertOpen || keymapHelpOpen
+            || zoomMenuOpen || dpiMenuOpen || activeEventDropdown != ""
+            || app.HasOverlays();
+        int rThick = app.Scale(16);
+        int fsTiny = Style.FontFallback(app, "tiny");
+        if (fsTiny <= 0) { fsTiny = Style.FontFallback(app, "small"); }
+
+        int bg = Style.Full(app, "designer", "", "", Style.SNormal()).BgOr(0);
+        int border = Style.Part(app, "designer", "accent", "", "", "", Style.SNormal()).BorderOr(0);
+        int tickCol = Style.Part(app, "designer", "hint", "", "", "", Style.SNormal()).FgOr(0);
+        int accentCol = Style.Part(app, "designer", "accent", "", "", "", Style.SNormal()).BgOr(0);
+
+        // 顶标尺区域: inX + rThick, inY, inW - rThick, rThick
+        // 左标尺区域: inX, inY + rThick, rThick, inH - rThick
+        // 左上角块: inX, inY, rThick, rThick
+        c.FillRect(inX, inY, rThick, rThick, bg);
+        c.DrawRect(inX, inY, rThick, rThick, Style.Fade(border, 40), 1);
+        c.DrawText(inX + app.Scale(2), inY + app.Scale(2), "px", tickCol, fsTiny);
+
+        // 顶标尺底色与底边线
+        c.FillRect(inX + rThick, inY, inW - rThick, rThick, bg);
+        c.FillRect(inX + rThick, inY + rThick - 1, inW - rThick, 1, Style.Fade(border, 40));
+
+        // 左标尺底色与右边线
+        c.FillRect(inX, inY + rThick, rThick, inH - rThick, bg);
+        c.FillRect(inX + rThick - 1, inY + rThick, 1, inH - rThick, Style.Fade(border, 40));
+
+        // 从标尺拖拽生成参考线
+        if (!locked && app.EventKind() == 2 && app.window.EventButton() == 0 && draggingGuideAxis < 0) {
+            if (InRect(app.mouseX, app.mouseY, inX + rThick, inY, inW - rThick, rThick)) {
+                draggingGuideAxis = 1;
+                draggingGuideIdx = 0 - 1;
+                draggingGuidePos = (app.mouseY - oy) * 1000 / psMilli;
+            } else if (InRect(app.mouseX, app.mouseY, inX, inY + rThick, rThick, inH - rThick)) {
+                draggingGuideAxis = 0;
+                draggingGuideIdx = 0 - 1;
+                draggingGuidePos = (app.mouseX - ox) * 1000 / psMilli;
+            }
+        }
+
+        // 选中控件在标尺上的投影高亮
+        if (sel != null) {
+            int sx1 = ox + sel.fx * psMilli / 1000;
+            int sx2 = ox + (sel.fx + sel.fw) * psMilli / 1000;
+            if (sx2 > inX + rThick && sx1 < inX + inW) {
+                int hx = sx1;
+                if (hx < inX + rThick) { hx = inX + rThick; }
+                int hw = sx2 - hx;
+                if (hx + hw > inX + inW) { hw = inX + inW - hx; }
+                if (hw > 0) {
+                    c.FillRect(hx, inY, hw, rThick, Style.Fade(accentCol, 40));
+                }
+            }
+
+            int sy1 = oy + sel.fy * psMilli / 1000;
+            int sy2 = oy + (sel.fy + sel.fh) * psMilli / 1000;
+            if (sy2 > inY + rThick && sy1 < inY + inH) {
+                int hy = sy1;
+                if (hy < inY + rThick) { hy = inY + rThick; }
+                int hh = sy2 - hy;
+                if (hy + hh > inY + inH) { hh = inY + inH - hy; }
+                if (hh > 0) {
+                    c.FillRect(inX, hy, rThick, hh, Style.Fade(accentCol, 40));
+                }
+            }
+        }
+
+        // 根据缩放档位确定标尺主步长
+        int step = 100;
+        int subStep = 20;
+        if (psMilli >= 1400) { step = 50; subStep = 10; }
+        else if (psMilli <= 500) { step = 200; subStep = 50; }
+
+        // 顶标尺刻度
+        int minLx = (inX + rThick - ox) * 1000 / psMilli;
+        int maxLx = (inX + inW - ox) * 1000 / psMilli;
+        minLx = (minLx / subStep) * subStep - subStep;
+        for (int lx = minLx; lx <= maxLx + subStep; lx = lx + subStep) {
+            int sx = ox + lx * psMilli / 1000;
+            if (sx < inX + rThick || sx > inX + inW) { continue; }
+            bool isMajor = (lx % step == 0);
+            int tickH = isMajor ? rThick - app.Scale(3) : app.Scale(4);
+            c.FillRect(sx, inY + rThick - tickH, 1, tickH, isMajor ? border : tickCol);
+            if (isMajor) {
+                string lbl = Convert.ToString(lx);
+                c.DrawText(sx + app.Scale(2), inY + app.Scale(1), lbl, tickCol, fsTiny);
+            }
+        }
+
+        // 左标尺刻度
+        int minLy = (inY + rThick - oy) * 1000 / psMilli;
+        int maxLy = (inY + inH - oy) * 1000 / psMilli;
+        minLy = (minLy / subStep) * subStep - subStep;
+        for (int ly = minLy; ly <= maxLy + subStep; ly = ly + subStep) {
+            int sy = oy + ly * psMilli / 1000;
+            if (sy < inY + rThick || sy > inY + inH) { continue; }
+            bool isMajor = (ly % step == 0);
+            int tickW = isMajor ? rThick - app.Scale(3) : app.Scale(4);
+            c.FillRect(inX + rThick - tickW, sy, tickW, 1, isMajor ? border : tickCol);
+            if (isMajor && ly % (step * 2) == 0) {
+                string lbl = Convert.ToString(ly);
+                c.DrawText(inX + app.Scale(2), sy + app.Scale(2), lbl, tickCol, fsTiny);
+            }
+        }
+
+        // 鼠标光标在标尺上的游标跟踪指示线
+        if (InRect(app.mouseX, app.mouseY, inX + rThick, inY + rThick, inW - rThick, inH - rThick)) {
+            c.FillRect(app.mouseX, inY, 1, rThick, accentCol);
+            c.FillRect(inX, app.mouseY, rThick, 1, accentCol);
+        }
+
+        // 处理正在拖拽中的参考线渲染与松开落地
+        if (draggingGuideAxis >= 0) {
+            int gLineCol = 0xFF4A90E2;
+            if (draggingGuideAxis == 1) {
+                int rawPos = (app.mouseY - oy) * 1000 / psMilli;
+                if (snapGrid && gridSize > 0) {
+                    rawPos = ((rawPos + gridSize / 2) / gridSize) * gridSize;
+                }
+                draggingGuidePos = rawPos;
+                int sy = oy + draggingGuidePos * psMilli / 1000;
+                c.FillRect(inX, sy, inW, 1, gLineCol);
+
+                string tip = "Y: " + Convert.ToString(draggingGuidePos) + "px";
+                int tipW = Canvas.MeasureText(tip, fsTiny) + app.Scale(10);
+                int tipH = app.Scale(18);
+                int tx = app.mouseX + app.Scale(12);
+                int ty = sy - tipH / 2;
+                if (tx + tipW > inX + inW) { tx = app.mouseX - tipW - app.Scale(12); }
+                c.FillRoundRect(tx, ty, tipW, tipH, app.Scale(3), 0xEE1E1E1E);
+                c.DrawRoundRect(tx, ty, tipW, tipH, app.Scale(3), gLineCol, 1);
+                c.DrawText(tx + app.Scale(5), ty + app.Scale(2), tip, 0xFFFFFFFF, fsTiny);
+            } else {
+                int rawPos = (app.mouseX - ox) * 1000 / psMilli;
+                if (snapGrid && gridSize > 0) {
+                    rawPos = ((rawPos + gridSize / 2) / gridSize) * gridSize;
+                }
+                draggingGuidePos = rawPos;
+                int sx = ox + draggingGuidePos * psMilli / 1000;
+                c.FillRect(sx, inY, 1, inH, gLineCol);
+
+                string tip = "X: " + Convert.ToString(draggingGuidePos) + "px";
+                int tipW = Canvas.MeasureText(tip, fsTiny) + app.Scale(10);
+                int tipH = app.Scale(18);
+                int tx = sx - tipW / 2;
+                int ty = app.mouseY + app.Scale(12);
+                if (ty + tipH > inY + inH) { ty = app.mouseY - tipH - app.Scale(12); }
+                c.FillRoundRect(tx, ty, tipW, tipH, app.Scale(3), 0xEE1E1E1E);
+                c.DrawRoundRect(tx, ty, tipW, tipH, app.Scale(3), gLineCol, 1);
+                c.DrawText(tx + app.Scale(5), ty + app.Scale(2), tip, 0xFFFFFFFF, fsTiny);
+            }
+
+            if (app.EventKind() == 3) {
+                if (draggingGuideAxis == 1) {
+                    if (app.mouseY < inY + rThick || app.mouseY > inY + inH) {
+                        if (draggingGuideIdx >= 0 && draggingGuideIdx < hGuides.Count) {
+                            hGuides.RemoveAt(draggingGuideIdx);
+                            msg = Designer.T("Guide removed", "已移除水平参考线");
+                        }
+                    } else {
+                        if (draggingGuideIdx >= 0 && draggingGuideIdx < hGuides.Count) {
+                            hGuides[draggingGuideIdx] = draggingGuidePos;
+                        } else {
+                            hGuides.Add(draggingGuidePos);
+                            msg = Designer.T("Guide added: Y ", "已添加水平参考线: Y ") + Convert.ToString(draggingGuidePos) + "px";
+                        }
+                    }
+                } else {
+                    if (app.mouseX < inX + rThick || app.mouseX > inX + inW) {
+                        if (draggingGuideIdx >= 0 && draggingGuideIdx < vGuides.Count) {
+                            vGuides.RemoveAt(draggingGuideIdx);
+                            msg = Designer.T("Guide removed", "已移除垂直参考线");
+                        }
+                    } else {
+                        if (draggingGuideIdx >= 0 && draggingGuideIdx < vGuides.Count) {
+                            vGuides[draggingGuideIdx] = draggingGuidePos;
+                        } else {
+                            vGuides.Add(draggingGuidePos);
+                            msg = Designer.T("Guide added: X ", "已添加垂直参考线: X ") + Convert.ToString(draggingGuidePos) + "px";
+                        }
+                    }
+                }
+                draggingGuideAxis = 0 - 1;
+                draggingGuideIdx = 0 - 1;
+                this.MarkDocDirty();
+                app.RequestRedraw();
+            }
+        }
+    }
+
+}
