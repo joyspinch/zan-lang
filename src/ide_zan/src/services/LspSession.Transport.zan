@@ -115,11 +115,15 @@ partial class LspSession {
     }
 
     void Notify(string method, string paramsJson) {
-        LspNotification o = new LspNotification();
-        o.jsonrpc = "2.0";
-        o.method = method;
-        if (paramsJson.Length > 0) { o.params = JsonValue.ParseLenient(paramsJson); }
-        this.SendMsg(Json.Serialize<LspNotification>(o));
+        JsonWriter w = new JsonWriter();
+        w.StartObject();
+        w.WriteProperty("jsonrpc", "2.0");
+        w.WriteProperty("method", method);
+        if (paramsJson != null && paramsJson.Length > 0) {
+            w.WriteRawProperty("params", paramsJson);
+        }
+        w.EndObject();
+        this.SendMsg(w.ToJson());
     }
 
     LspPendingRequest NewRequest(string method) {
@@ -137,12 +141,16 @@ partial class LspSession {
     }
 
     void SendRequest(LspPendingRequest request, string paramsJson) {
-        LspRequest envelope = new LspRequest();
-        envelope.jsonrpc = "2.0";
-        envelope.id = request.id;
-        envelope.method = request.method;
-        if (paramsJson.Length > 0) { envelope.params = JsonValue.ParseLenient(paramsJson); }
-        this.SendMsg(Json.Serialize<LspRequest>(envelope), request.id);
+        JsonWriter w = new JsonWriter();
+        w.StartObject();
+        w.WriteProperty("jsonrpc", "2.0");
+        w.WriteProperty("id", request.id);
+        w.WriteProperty("method", request.method);
+        if (paramsJson != null && paramsJson.Length > 0) {
+            w.WriteRawProperty("params", paramsJson);
+        }
+        w.EndObject();
+        this.SendMsg(w.ToJson(), request.id);
     }
 
     // 显式导航等待也分发所有 ID，不会吞掉在途的日常提示响应。
@@ -170,9 +178,11 @@ partial class LspSession {
                 request.state = LspPendingState.Cancelled;
                 pending.Remove(request.id);
                 if (!DropUnsentRequest(request.id)) {
-                    JsonValue cancellation = JsonValue.NewObject();
-                    cancellation.PutInt("id", request.id);
-                    Notify("$/cancelRequest", cancellation.ToJson());
+                    JsonWriter cw = new JsonWriter();
+                    cw.StartObject();
+                    cw.WriteProperty("id", request.id);
+                    cw.EndObject();
+                    Notify("$/cancelRequest", cw.ToJson());
                 }
                 return;
             }
@@ -199,74 +209,152 @@ partial class LspSession {
     }
 
     void DispatchResponse(string message) {
-        JsonValue root = null;
-        try { root = JsonValue.ParseLenient(message); } catch (Exception) { return; }
-        if (root == null || !root.IsObject()) { return; }
-        JsonValue id = root.Get("id");
-        if (id == null || !id.IsInt()) {
-            // 服务器主动推送的通知（没有 id，带 method）。此前这里
-            // 直接 return，诊断推送（textDocument/publishDiagnostics）
-            // 就被整条扔掉了。
-            this.DispatchNotification(root);
-            return;
-        }
-                if (!pending.ContainsKey(id.AsInt(-1))) { return; }
-        LspPendingRequest request = pending[id.AsInt(-1)];
-        pending.Remove(request.id);
-        if (Stopwatch.GetMilliseconds() >= request.deadline) {
-            request.state = LspPendingState.Timeout;
-            return;
-        }
-        if (root.Has("error") || !root.Has("result")) {
-            request.state = LspPendingState.Error;
-            return;
-        }
-        request.state = LspPendingState.Ready;
-        if (request.editor == null) { request.message = message; return; }
-        JsonValue result = root.Get("result");
-        if (request.method == "textDocument/completion") {
-            request.completions = new List<LspCompletionItem>();
-            if (result != null && result.IsObject()) { result = result.Get("items"); }
-            if (result != null && result.IsArray()) {
-                for (int i = 0; i < result.Count(); i = i + 1) {
-                    LspCompletionItem item = Json.Deserialize<LspCompletionItem>(result.At(i).ToJson());
-                    if (item != null) { request.completions.Add(item); }
+        try {
+            JsonDoc.ParseScoped(message, doc => {
+                int root = doc.root;
+                if (doc.KindAt(root) != 5) { return; }
+                int idNode = doc.Get(root, "id");
+                if (idNode < 0 || doc.KindAt(idNode) != 2) {
+                    this.DispatchNotification(doc, root);
+                    return;
                 }
-            }
-            List<string> lines = CodeEditor.SplitLines(request.text);
-            string sourceLine = request.line >= 0 && request.line < lines.Count ? lines[request.line] : "";
-            request.editorCompletions = LspSession.EditorCompletions(request.completions, sourceLine, request.line, request.col);
-            if (request.editorCompletions == null || request.editorCompletions.Count == 0) { request.state = LspPendingState.Empty; }
-        } else if (request.method == "textDocument/signatureHelp") {
-            if (result != null && result.IsObject()) {
-                request.signature = Json.Deserialize<LspSignatureHelp>(result.ToJson());
-            }
-            request.signatureLabel = LspSession.SignatureLabel(request.signature);
-            if (request.signatureLabel.Length == 0) { request.state = LspPendingState.Empty; }
-        } else if (request.method == "textDocument/hover") {
-            if (result != null && result.IsObject()) { request.hover = LspSession.MarkupText(result.Get("contents")); }
-            if (request.hover.Length == 0) { request.state = LspPendingState.Empty; }
+                int reqId = (int)doc.LongAt(idNode, -1L);
+                if (!pending.ContainsKey(reqId)) { return; }
+                LspPendingRequest request = pending[reqId];
+                pending.Remove(request.id);
+                if (Stopwatch.GetMilliseconds() >= request.deadline) {
+                    request.state = LspPendingState.Timeout;
+                    return;
+                }
+                int errNode = doc.Get(root, "error");
+                int resNode = doc.Get(root, "result");
+                if (errNode >= 0 || resNode < 0) {
+                    request.state = LspPendingState.Error;
+                    return;
+                }
+                request.state = LspPendingState.Ready;
+                if (request.editor == null) { request.message = message; return; }
+                if (request.method == "textDocument/completion") {
+                    request.completions = new List<LspCompletionItem>();
+                    int itemsNode = resNode;
+                    if (doc.KindAt(itemsNode) == 5) { itemsNode = doc.Get(itemsNode, "items"); }
+                    if (itemsNode >= 0 && doc.KindAt(itemsNode) == 4) {
+                        int it = doc.FirstChild(itemsNode);
+                        while (it >= 0) {
+                            if (doc.KindAt(it) == 5) {
+                                LspCompletionItem item = new LspCompletionItem();
+                                item.label = doc.Str(it, "label", "");
+                                item.kind = (int)doc.Long(it, "kind", 0L);
+                                item.detail = doc.Str(it, "detail", "");
+                                item.insertText = doc.Str(it, "insertText", "");
+                                item.insertTextFormat = (int)doc.Long(it, "insertTextFormat", 1L);
+                                item.sortText = doc.Str(it, "sortText", "");
+                                int docNode = doc.Get(it, "documentation");
+                                if (docNode >= 0) {
+                                    item.documentation = LspSession.ExtractMarkupText(doc, docNode);
+                                }
+                                int teNode = doc.Get(it, "textEdit");
+                                if (teNode >= 0 && doc.KindAt(teNode) == 5) {
+                                    LspTextEdit te = new LspTextEdit();
+                                    te.newText = doc.Str(teNode, "newText", "");
+                                    int rNode = doc.Get(teNode, "range");
+                                    if (rNode < 0) { rNode = doc.Get(teNode, "replace"); }
+                                    if (rNode >= 0 && doc.KindAt(rNode) == 5) {
+                                        te.range = new LspRange();
+                                        int sNode = doc.Get(rNode, "start");
+                                        if (sNode >= 0 && doc.KindAt(sNode) == 5) {
+                                            te.range.start = new LspPosition();
+                                            te.range.start.line = (int)doc.Long(sNode, "line", 0L);
+                                            te.range.start.character = (int)doc.Long(sNode, "character", 0L);
+                                        }
+                                        int eNode = doc.Get(rNode, "end");
+                                        if (eNode >= 0 && doc.KindAt(eNode) == 5) {
+                                            te.range.end = new LspPosition();
+                                            te.range.end.line = (int)doc.Long(eNode, "line", 0L);
+                                            te.range.end.character = (int)doc.Long(eNode, "character", 0L);
+                                        }
+                                    }
+                                    item.textEdit = te;
+                                }
+                                request.completions.Add(item);
+                            }
+                            it = doc.NextSibling(it);
+                        }
+                    }
+                    List<string> lines = CodeEditor.SplitLines(request.text);
+                    string sourceLine = request.line >= 0 && request.line < lines.Count ? lines[request.line] : "";
+                    request.editorCompletions = LspSession.EditorCompletions(request.completions, sourceLine, request.line, request.col);
+                    if (request.editorCompletions == null || request.editorCompletions.Count == 0) { request.state = LspPendingState.Empty; }
+                } else if (request.method == "textDocument/signatureHelp") {
+                    if (doc.KindAt(resNode) == 5) {
+                        LspSignatureHelp sh = new LspSignatureHelp();
+                        sh.activeSignature = (int)doc.Long(resNode, "activeSignature", 0L);
+                        sh.activeParameter = (int)doc.Long(resNode, "activeParameter", 0L);
+                        sh.signatures = new List<LspSignatureInformation>();
+                        int sigs = doc.Get(resNode, "signatures");
+                        if (sigs >= 0 && doc.KindAt(sigs) == 4) {
+                            int sig = doc.FirstChild(sigs);
+                            while (sig >= 0) {
+                                if (doc.KindAt(sig) == 5) {
+                                    LspSignatureInformation si = new LspSignatureInformation();
+                                    si.label = doc.Str(sig, "label", "");
+                                    int docNode = doc.Get(sig, "documentation");
+                                    if (docNode >= 0) { si.documentation = LspSession.ExtractMarkupText(doc, docNode); }
+                                    si.parameters = new List<LspParameterInformation>();
+                                    int pars = doc.Get(sig, "parameters");
+                                    if (pars >= 0 && doc.KindAt(pars) == 4) {
+                                        int par = doc.FirstChild(pars);
+                                        while (par >= 0) {
+                                            if (doc.KindAt(par) == 5) {
+                                                LspParameterInformation pi = new LspParameterInformation();
+                                                pi.label = doc.Str(par, "label", "");
+                                                int pdocNode = doc.Get(par, "documentation");
+                                                if (pdocNode >= 0) { pi.documentation = LspSession.ExtractMarkupText(doc, pdocNode); }
+                                                si.parameters.Add(pi);
+                                            }
+                                            par = doc.NextSibling(par);
+                                        }
+                                    }
+                                    sh.signatures.Add(si);
+                                }
+                                sig = doc.NextSibling(sig);
+                            }
+                        }
+                        request.signature = sh;
+                    }
+                    request.signatureLabel = LspSession.SignatureLabel(request.signature);
+                    if (request.signatureLabel.Length == 0) { request.state = LspPendingState.Empty; }
+                } else if (request.method == "textDocument/hover") {
+                    if (doc.KindAt(resNode) == 5) {
+                        int contents = doc.Get(resNode, "contents");
+                        if (contents >= 0) {
+                            request.hover = LspSession.ExtractMarkupText(doc, contents);
+                        }
+                    }
+                    if (request.hover == null || request.hover.Length == 0) { request.state = LspPendingState.Empty; }
+                }
+                RefreshEditor(request);
+            });
+        } catch (Exception) {
+            return;
         }
-        RefreshEditor(request);
     }
 
     // 服务器主动推送的通知（没有 id）。目前只有诊断：
     // textDocument/publishDiagnostics —— 服务端在输入停顿后把这一份
     // 文档的词法/语法错误推过来。
-    void DispatchNotification(JsonValue root) {
-        JsonValue method = root.Get("method");
-        if (method == null || !method.IsString()) { return; }
-        if (method.AsString("") != "textDocument/publishDiagnostics") { return; }
-        JsonValue params = root.Get("params");
-        if (params == null || !params.IsObject()) { return; }
-        JsonValue uri = params.Get("uri");
-        if (uri == null || !uri.IsString()) { return; }
-        string key = uri.AsString("");
+    void DispatchNotification(JsonDoc doc, int root) {
+        string method = doc.Str(root, "method", "");
+        if (method != "textDocument/publishDiagnostics") { return; }
+        int paramsNode = doc.Get(root, "params");
+        if (paramsNode < 0 || doc.KindAt(paramsNode) != 5) { return; }
+        string key = doc.Str(paramsNode, "uri", "");
+        if (key.Length == 0) { return; }
         List<string> lines = null;
         if (documents != null && documents.ContainsKey(key)) {
             lines = documents[key].lines;
         }
-        List<Diagnostic> diags = LspSession.ParsePublishDiagnostics(params, lines);
+        List<Diagnostic> diags = LspSession.ParsePublishDiagnostics(doc, paramsNode, lines);
         if (onDiagnostics != null) { onDiagnostics(key, diags); }
     }
 
@@ -346,9 +434,11 @@ partial class LspSession {
             if (background) {
                 if (request.cancellation != null) { request.cancellation.Cancel(); }
             } else if (!DropUnsentRequest(request.id)) {
-                JsonValue cancellation = JsonValue.NewObject();
-                cancellation.PutInt("id", request.id);
-                Notify("$/cancelRequest", cancellation.ToJson());
+                JsonWriter cw = new JsonWriter();
+                cw.StartObject();
+                cw.WriteProperty("id", request.id);
+                cw.EndObject();
+                Notify("$/cancelRequest", cw.ToJson());
             }
         }
     }

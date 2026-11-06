@@ -150,19 +150,26 @@ partial class AiAgent {
     // 真正的块。write_file / edit_file 的正文不留（一整个文件重复一遍只是烧
     // 上下文，内容在上面的工具结果里），只留格式和路径。
     static string ArchiveCall(string call) {
-        JsonValue v = JsonValue.ParseLenient(call);
-        if (v == null) { return ""; }
-        string tool = v.Str("tool", "");
-        if (tool == "") { return ""; }
-        if (!AiAgent.IsMutating(tool)) {
-            return AiAgent.Fence() + "\n" + AiAgent.Trim(call) + "\n```";
-        }
-        StringBuilder sb = new StringBuilder();
-        sb.Append(AiAgent.Fence() + "\n{\"tool\": \"" + tool + "\"");
-        string path = v.Str("path", "");
-        if (path != "") { sb.Append(", \"path\": \"" + path + "\""); }
-        sb.Append(", \"...\": \"(正文见上面这次调用的结果，不重复)\"}\n```");
-        return sb.ToString();
+        if (call == null || call.Length == 0) { return ""; }
+        string result = "";
+        JsonDoc.ParseScoped(call, (JsonDoc v) => {
+            if (v.KindAt(0) != 5) { return; }
+            string tool = v.Str(0, "tool", "");
+            if (tool == "") { return; }
+            if (!AiAgent.IsMutating(tool)) {
+                result = AiAgent.Fence() + "\n" + AiAgent.Trim(call) + "\n```";
+                return;
+            }
+            JsonWriter w = new JsonWriter();
+            w.StartObject();
+            w.WriteProperty("tool", tool);
+            string path = v.Str(0, "path", "");
+            if (path != "") { w.WriteProperty("path", path); }
+            w.WriteProperty("...", "(正文见上面这次调用的结果，不重复)");
+            w.EndObject();
+            result = AiAgent.Fence() + "\n" + w.ToJson() + "\n```";
+        });
+        return result;
     }
 
     static int StepsSinceUser(List<ChatMessage> msgs) {
@@ -349,24 +356,33 @@ partial class AiAgent {
     // 一个查询调用的身份：工具名加上真正决定结果的那几个参数。签名相同就是
     // 同一次查询，调用方据此拦掉重复的第二次（见 ZanIDE.AiSeenTool）。
     static string CallSig(string json) {
-        JsonValue v = JsonValue.ParseLenient(json);
-        if (v == null) { return ""; }
-        StringBuilder sb = new StringBuilder();
-        sb.Append(v.Str("tool", ""));
-        sb.Append("|" + v.Str("path", ""));
-        sb.Append("|" + v.Str("pattern", ""));
-        sb.Append("|" + v.Str("ext", ""));
-        sb.Append("|" + v.Str("query", ""));
-        sb.Append("|" + v.Str("topic", ""));
-        sb.Append("|" + Convert.ToString(v.Int("offset", 1)));
-        sb.Append("|" + Convert.ToString(v.Int("limit", 0)));
-        return sb.ToString();
+        if (json == null || json.Length == 0) { return ""; }
+        string result = "";
+        JsonDoc.ParseScoped(json, (JsonDoc v) => {
+            if (v.KindAt(0) != 5) { return; }
+            StringBuilder sb = new StringBuilder();
+            sb.Append(v.Str(0, "tool", ""));
+            sb.Append("|" + v.Str(0, "path", ""));
+            sb.Append("|" + v.Str(0, "pattern", ""));
+            sb.Append("|" + v.Str(0, "ext", ""));
+            sb.Append("|" + v.Str(0, "query", ""));
+            sb.Append("|" + v.Str(0, "topic", ""));
+            sb.Append("|" + v.Long(0, "offset", 1L).ToString());
+            sb.Append("|" + v.Long(0, "limit", 0L).ToString());
+            result = sb.ToString();
+        });
+        return result;
     }
 
     static string ToolName(string json) {
-        JsonValue v = JsonValue.ParseLenient(json);
-        if (v == null) { return ""; }
-        return v.Str("tool", "");
+        if (json == null || json.Length == 0) { return ""; }
+        string result = "";
+        JsonDoc.ParseScoped(json, (JsonDoc v) => {
+            if (v.KindAt(0) == 5) {
+                result = v.Str(0, "tool", "");
+            }
+        });
+        return result;
     }
 
     // 工具名在界面上的叫法：聊天区是给人看的，“read_file”“edit_file”是协议
@@ -399,25 +415,38 @@ partial class AiAgent {
     }
 
     static string Describe(string json) {
-        JsonValue v = JsonValue.ParseLenient(json);
-        if (v == null) { return ZanIDE.T("tool", "工具"); }
-        string tool = v.Str("tool", "?");
-        string name = AiAgent.ToolLabel(tool);
-        if (tool == "grep" || tool == "stdlib_grep") {
-            return name + " \"" + v.Str("pattern", "") + "\"";
-        }
-        if (tool == "api_search") {
-            return name + " \"" + v.Str("query", "") + "\"";
-        }
-        if (tool == "example") {
-            return name + " " + v.Str("topic", "");
-        }
-        if (tool == "repo_map" || tool == "plan" || tool == "build"
-            || tool == "run" || tool == "ui_check" || tool == "ui_tree"
-            || tool == "diff" || tool == "run_errors") {
-            return name;
-        }
-        return name + " " + v.Str("path", "");
+        if (json == null || json.Length == 0) { return ZanIDE.T("tool", "工具"); }
+        string result = ZanIDE.T("tool", "工具");
+        JsonDoc.ParseScoped(json, (JsonDoc v) => {
+            if (v.KindAt(0) != 5) { return; }
+            string tool = v.Str(0, "tool", "?");
+            string name = AiAgent.ToolLabel(tool);
+            if (tool == "grep" || tool == "stdlib_grep") {
+                result = name + " \"" + v.Str(0, "pattern", "") + "\"";
+                return;
+            }
+            if (tool == "api_search") {
+                result = name + " \"" + v.Str(0, "query", "") + "\"";
+                return;
+            }
+            if (tool == "example") {
+                result = name + " " + v.Str(0, "topic", "");
+                return;
+            }
+            if (tool == "repo_map" || tool == "plan" || tool == "build"
+                || tool == "run" || tool == "ui_check" || tool == "ui_tree"
+                || tool == "diff" || tool == "run_errors") {
+                result = name;
+                return;
+            }
+            string path = v.Str(0, "path", "");
+            if (path != "") {
+                result = name + " " + path;
+                return;
+            }
+            result = name;
+        });
+        return result;
     }
 
     // NormalizeUiScript, UiResult, ReadFile, Grep, EditFile, WriteFile, etc. moved to AiAgent.Tools.zan

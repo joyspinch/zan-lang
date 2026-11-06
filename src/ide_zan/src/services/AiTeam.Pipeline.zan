@@ -238,52 +238,49 @@ partial class AiTeam {
     // 图信息，状态和进度留给协议信封推进——重发一次计划不该把进行中的节点
     // 打回待办。返回图里的节点总数。
     static int ParseGraph(string json, List<AiTask> tasks) {
-        JsonValue v = JsonValue.ParseLenient(json);
-        if (v == null) { return tasks.Count; }
-        JsonValue items = v.Get("items");
-        if (items == null || !items.IsArray()) { return tasks.Count; }
-        // 本次计划里出现的节点次序，以及模型到底有没有说过前置：没说过和
-        // 说了「没有前置」是两件事，前者才需要 IDE 替它连线。
-        List<string> order = new List<string>();
-        bool told = false;
-        for (int i = 0; i < items.Count(); i = i + 1) {
-            JsonValue it = items.At(i);
-            if (!it.IsObject()) { continue; }
-            string id = AiAgent.Trim(it.Str("id", ""));
-            string title = AiAgent.Trim(it.Str("t", it.Str("text",
-                it.Str("title", ""))));
-            if (id == "" && title == "") { continue; }
-            if (id == "") { id = "T-" + Convert.ToString(i + 1); }
-            AiTask t = AiTeam.TaskOf(tasks, id);
-            if (t == null) {
-                t = AiTask.Create(id, title, "");
-                tasks.Add(t);
-            } else if (title != "") {
-                t.title = title;
+        if (json == null || json.Length == 0) { return tasks.Count; }
+        JsonDoc.ParseScoped(json, (JsonDoc v) => {
+            int items = v.Get(0, "items");
+            if (items < 0 || v.KindAt(items) != 4) { return; }
+            List<string> order = new List<string>();
+            bool told = false;
+            int it = v.FirstChild(items);
+            int idx = 0;
+            while (it >= 0) {
+                if (v.KindAt(it) == 5) {
+                    string id = AiAgent.Trim(v.Str(it, "id", ""));
+                    string title = AiAgent.Trim(v.Str(it, "t", v.Str(it, "text", v.Str(it, "title", ""))));
+                    if (id != "" || title != "") {
+                        if (id == "") { id = "T-" + (idx + 1).ToString(); }
+                        AiTask t = AiTeam.TaskOf(tasks, id);
+                        if (t == null) {
+                            t = AiTask.Create(id, title, "");
+                            tasks.Add(t);
+                        } else if (title != "") {
+                            t.title = title;
+                        }
+                        string owner = AiTeam.RoleIdArg(v.Str(it, "owner", v.Str(it, "o", "")));
+                        if (owner != "") { t.owner = owner; }
+                        string accept = AiAgent.Trim(v.Str(it, "accept", v.Str(it, "ac", "")));
+                        if (accept != "") { t.accept = accept; }
+                        if (v.Get(it, "deps") >= 0) { told = true; }
+                        int sub = v.Get(it, "tasks");
+                        if (sub < 0) { sub = v.Get(it, "items"); }
+                        if (sub < 0) { sub = v.Get(it, "steps"); }
+                        AiTaskPlan.ReadItems(v, sub, t);
+                        AiTeam.ReadIds(v, v.Get(it, "deps"), t, true);
+                        AiTeam.ReadIds(v, v.Get(it, "parts"), t, false);
+                        AiTeam.AddOnce(order, id);
+                        idx = idx + 1;
+                    }
+                }
+                it = v.NextSibling(it);
             }
-            string owner = AiTeam.RoleIdArg(it.Str("owner", it.Str("o", "")));
-            if (owner != "") { t.owner = owner; }
-            string accept = AiAgent.Trim(it.Str("accept", it.Str("ac", "")));
-            if (accept != "") { t.accept = accept; }
-            if (it.Get("deps") != null) { told = true; }
-            // 节点内的开发任务清单：功能节点下面那几件具体的活。
-            JsonValue sub = it.Get("tasks");
-            if (sub == null) { sub = it.Get("items"); }
-            if (sub == null) { sub = it.Get("steps"); }
-            AiTaskPlan.ReadItems(sub, t);
-            AiTeam.ReadIds(it.Get("deps"), t, true);
-            AiTeam.ReadIds(it.Get("parts"), t, false);
-            AiTeam.AddOnce(order, id);
-        }
-        if (!told) { AiTeam.ChainOrder(tasks, order); }
+            if (!told) { AiTeam.ChainOrder(tasks, order); }
+        });
         return tasks.Count;
     }
 
-    // 一个 `deps` 都没写的计划：把这次列出的节点按给出的次序串成一条链。
-    // 没有连线的任务图退化成一排卡片——看不出先后，也就没有「谁在等谁」
-    // 和「现在能开工的是哪个」，而列出来的次序正是模型心里的顺序。只补
-    // 空缺：已经有前置的节点不动，所以下一次带 deps 的重发能把链改成真
-    // 正的分叉。
     static void ChainOrder(List<AiTask> tasks, List<string> ids) {
         if (ids == null || ids.Count < 2) { return; }
         for (int i = 1; i < ids.Count; i = i + 1) {
@@ -294,30 +291,39 @@ partial class AiTeam {
         }
     }
 
-    static void ReadIds(JsonValue v, AiTask t, bool asDeps) {
-        if (v == null) { return; }
+    static void ReadIds(JsonDoc doc, int node, AiTask t, bool asDeps) {
+        if (node < 0) { return; }
         List<string> ids = new List<string>();
-        if (v.IsArray()) {
-            for (int i = 0; i < v.Count(); i = i + 1) {
-                ids.Add(AiAgent.Trim(v.At(i).AsString("")));
+        if (doc.KindAt(node) == 4) {
+            int it = doc.FirstChild(node);
+            while (it >= 0) {
+                ids.Add(AiAgent.Trim(doc.StrAt(it, "")));
+                it = doc.NextSibling(it);
             }
-        } else {
-            string s = v.AsString("");
+        } else if (doc.KindAt(node) == 3) {
+            string s = doc.StrAt(node, "");
             int start = 0;
             for (int i = 0; i <= s.Length; i = i + 1) {
                 bool end = i == s.Length;
                 bool comma = false;
-                if (!end) { comma = (s[i] & 255) == 44; }
+                if (!end) {
+                    char ch = s[i];
+                    if (ch == ',' || ch == ';' || ch == ' ') { comma = true; }
+                }
                 if (end || comma) {
-                    ids.Add(AiAgent.Trim(s.Substring(start, i - start)));
+                    if (i > start) {
+                        string piece = AiAgent.Trim(s.Substring(start, i - start));
+                        if (piece != "") { ids.Add(piece); }
+                    }
                     start = i + 1;
                 }
             }
         }
-        for (int k = 0; k < ids.Count; k = k + 1) {
-            if (ids[k] == "") { continue; }
-            if (asDeps) { AiTeam.AddDep(t, ids[k]); }
-            else { AiTeam.AddPart(t, AiTeam.RoleIdArg(ids[k])); }
+        for (int i = 0; i < ids.Count; i = i + 1) {
+            string id = ids[i];
+            if (id == "" || id == t.id) { continue; }
+            if (asDeps) { AiTeam.AddDep(t, id); }
+            else { AiTeam.AddPart(t, AiTeam.RoleIdArg(id)); }
         }
     }
 
@@ -573,18 +579,27 @@ partial class AiTeam {
     // 示例任务节点（提示词用）：树构建一次再序列化，字段值转义交给
     // ToJson，文本改动不会写出非法 JSON。
     static string SampleNode() {
-        JsonValue deps = JsonValue.NewArray(); deps.AppendStr("T-1");
-        JsonValue parts = JsonValue.NewArray(); parts.AppendStr("测试工程师");
-        JsonValue tasks = JsonValue.NewArray();
-        tasks.AppendStr("商品列表页"); tasks.AppendStr("商品详情页"); tasks.AppendStr("关键字搜索");
-        JsonValue n = JsonValue.NewObject();
-        n.PutStr("id", "T-2");
-        n.PutStr("t", "前台商品展示");
-        n.PutStr("owner", "开发者");
-        n.Put("deps", deps);
-        n.Put("parts", parts);
-        n.PutStr("accept", "列表、详情、搜索都能用真实数据打开");
-        n.Put("tasks", tasks);
-        return n.ToJson();
+        JsonWriter w = new JsonWriter();
+        w.StartObject();
+        w.WriteProperty("id", "T-2");
+        w.WriteProperty("t", "前台商品展示");
+        w.WriteProperty("owner", "开发者");
+        w.WriteKey("deps");
+        w.StartArray();
+        w.WriteString("T-1");
+        w.EndArray();
+        w.WriteKey("parts");
+        w.StartArray();
+        w.WriteString("测试工程师");
+        w.EndArray();
+        w.WriteProperty("accept", "列表、详情、搜索都能用真实数据打开");
+        w.WriteKey("tasks");
+        w.StartArray();
+        w.WriteString("商品列表页");
+        w.WriteString("商品详情页");
+        w.WriteString("关键字搜索");
+        w.EndArray();
+        w.EndObject();
+        return w.ToJson();
     }
 }

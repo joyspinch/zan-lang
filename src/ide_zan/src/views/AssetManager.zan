@@ -193,44 +193,46 @@ public class AssetManager {
     }
 
     static int importManifest(string mf, string srcDir, string root, List<string> log) {
-        JsonValue doc = JsonValue.ParseLenient(File.ReadAllText(mf));
-        if (doc == null) { return 0; }
-        JsonValue entries = doc.Get("entries");
-        if (entries == null || !entries.IsArray()) { return 0; }
+        if (!File.Exists(mf)) { return 0; }
         int n = 0;
-        int i = 0;
-        while (i < entries.Count()) {
-            JsonValue e = entries.At(i);
-            string src = e.Str("src", "");
-            string name = e.Str("name", "");
-            if (src == "" || !File.Exists(srcDir + "/" + src)) {
-                log.Add("> WARNING: manifest entry missing: " + src);
-                i = i + 1;
-                continue;
+        JsonDoc.ParseScoped(File.ReadAllText(mf), (JsonDoc doc) => {
+            int entries = doc.Get(0, "entries");
+            if (entries < 0 || doc.KindAt(entries) != 4) { return; }
+            int e = doc.FirstChild(entries);
+            while (e >= 0) {
+                if (doc.KindAt(e) == 5) {
+                    string src = doc.Str(e, "src", "");
+                    string name = doc.Str(e, "name", "");
+                    if (src == "" || !File.Exists(srcDir + "/" + src)) {
+                        log.Add("> WARNING: manifest entry missing: " + src);
+                        e = doc.NextSibling(e);
+                        continue;
+                    }
+                    if (name == "") { name = src; }
+                    string rel = name;
+                    string ext = extOf(src);
+                    if (extOf(name) == "") { rel = name + ext; }
+                    string dstDir = root + "/assets";
+                    string dp = dirPart(rel);
+                    if (dp.Length > 0) { dstDir = dstDir + "/" + dp; }
+                    Directory.CreateDirectoryRecursive(dstDir);
+                    File.Copy(srcDir + "/" + src, root + "/assets/" + rel);
+                    n = n + 1;
+                    int an = doc.Get(e, "anim");
+                    if (an >= 0 && doc.KindAt(an) == 5) {
+                        string image = Path.GetFileName(rel);
+                        string loop = doc.Str(an, "loop", "loop");
+                        writeAnim(root, stripExt(rel), image,
+                            (int)doc.Long(an, "frameW", 0L), (int)doc.Long(an, "frameH", 0L),
+                            (int)doc.Long(an, "dirs", 8L), (int)doc.Long(an, "framesPerDir", 1L),
+                            (int)doc.Long(an, "fps", 12L), loop, (int)doc.Long(an, "loopStart", 0L));
+                        n = n + 1;
+                    }
+                }
+                e = doc.NextSibling(e);
             }
-            if (name == "") { name = src; }
-            string rel = name;
-            string ext = extOf(src);
-            if (extOf(name) == "") { rel = name + ext; }
-            string dstDir = root + "/assets";
-            string dp = dirPart(rel);
-            if (dp.Length > 0) { dstDir = dstDir + "/" + dp; }
-            Directory.CreateDirectoryRecursive(dstDir);
-            File.Copy(srcDir + "/" + src, root + "/assets/" + rel);
-            n = n + 1;
-            JsonValue an = e.Get("anim");
-            if (an != null && an.IsObject()) {
-                string image = Path.GetFileName(rel);
-                string loop = an.Str("loop", "loop");
-                writeAnim(root, stripExt(rel), image,
-                    an.Int("frameW", 0), an.Int("frameH", 0),
-                    an.Int("dirs", 8), an.Int("framesPerDir", 1),
-                    an.Int("fps", 12), loop, an.Int("loopStart", 0));
-                n = n + 1;
-            }
-            i = i + 1;
-        }
-        log.Add("> Manifest import: " + Convert.ToString(n) + " item(s) from " + srcDir);
+        });
+        log.Add("> Manifest import: " + n.ToString() + " item(s) from " + srcDir);
         return n;
     }
 
@@ -243,18 +245,19 @@ public class AssetManager {
     static void writeAnim(string root, string relNoExt, string image,
                           int fw, int fh, int dirs, int fpd, int fps,
                           string loop, int loopStart) {
-        string o = "{\n";
-        o = o + "  \"version\": 1,\n";
-        o = o + "  \"image\": \"" + image + "\",\n";
-        o = o + "  \"frameW\": " + Convert.ToString(fw) + ",\n";
-        o = o + "  \"frameH\": " + Convert.ToString(fh) + ",\n";
-        o = o + "  \"dirs\": " + Convert.ToString(dirs) + ",\n";
-        o = o + "  \"framesPerDir\": " + Convert.ToString(fpd) + ",\n";
-        o = o + "  \"fps\": " + Convert.ToString(fps) + ",\n";
-        o = o + "  \"loop\": \"" + loop + "\",\n";
-        o = o + "  \"loopStart\": " + Convert.ToString(loopStart) + "\n";
-        o = o + "}\n";
-        File.WriteAllText(root + "/assets/" + relNoExt + ".anim", o);
+        JsonWriter w = new JsonWriter();
+        w.StartObject();
+        w.WriteProperty("version", 1);
+        w.WriteProperty("image", image);
+        w.WriteProperty("frameW", fw);
+        w.WriteProperty("frameH", fh);
+        w.WriteProperty("dirs", dirs);
+        w.WriteProperty("framesPerDir", fpd);
+        w.WriteProperty("fps", fps);
+        w.WriteProperty("loop", loop);
+        w.WriteProperty("loopStart", loopStart);
+        w.EndObject();
+        File.WriteAllText(root + "/assets/" + relNoExt + ".anim", w.ToJson());
     }
 
 
@@ -658,17 +661,18 @@ public class AssetManager {
         this.loopMode = 1;
         string af = ad + "/" + stripExt(imgName) + ".anim";
         if (!File.Exists(af)) { return; }
-        JsonValue v = JsonValue.ParseLenient(File.ReadAllText(af));
-        if (v == null) { return; }
-        this.panel.FpdIn.SetText(Convert.ToString(v.Int("framesPerDir", 6)));
-        this.panel.DirsIn.SetText(Convert.ToString(v.Int("dirs", 8)));
-        this.panel.FpsIn.SetText(Convert.ToString(v.Int("fps", 12)));
-        this.panel.StartIn.SetText(Convert.ToString(v.Int("loopStart", 0)));
-        this.panel.FrameWIn.SetText(Convert.ToString(v.Int("frameW", 0)));
-        this.panel.FrameHIn.SetText(Convert.ToString(v.Int("frameH", 0)));
-        string loop = v.Str("loop", "loop");
-        this.loopMode = 1;
-        if (loop == "once") { this.loopMode = 0; }
-        if (loop == "section") { this.loopMode = 2; }
+        JsonDoc.ParseScoped(File.ReadAllText(af), (JsonDoc v) => {
+            if (v.KindAt(0) != 5) { return; }
+            this.panel.FpdIn.SetText(v.Long(0, "framesPerDir", 6L).ToString());
+            this.panel.DirsIn.SetText(v.Long(0, "dirs", 8L).ToString());
+            this.panel.FpsIn.SetText(v.Long(0, "fps", 12L).ToString());
+            this.panel.StartIn.SetText(v.Long(0, "loopStart", 0L).ToString());
+            this.panel.FrameWIn.SetText(v.Long(0, "frameW", 0L).ToString());
+            this.panel.FrameHIn.SetText(v.Long(0, "frameH", 0L).ToString());
+            string loop = v.Str(0, "loop", "loop");
+            this.loopMode = 1;
+            if (loop == "once") { this.loopMode = 0; }
+            if (loop == "section") { this.loopMode = 2; }
+        });
     }
 }

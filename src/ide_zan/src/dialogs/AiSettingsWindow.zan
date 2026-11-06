@@ -1,16 +1,14 @@
 using System;
 using System.IO;
-using System.Json;
+using System.Collections.Generic;
 using Gui;
 using Gui.Backend;
 using Gui.Component.DataTable;
 
-// 「小赞配置」子窗口：只做宿主——配置的读写、选择、增删、模型列表
-// 抓取与持久化（ai_profiles.json，经 ZanIDE.AiProfilesSave）。界面由
-// `AiSettingsDialog.html` 声明。
+// 「小赞配置」子窗口宿主：管理 AI 服务商配置、预设与参数持久化
 public class AiSettingsWindow : ChildWindow {
     bool saved;
-    string lang;        // UI language code: "zh" / "en"
+    string lang;
 
     List<AiProfile> profiles;
     List<AiProfile> hold;
@@ -19,13 +17,10 @@ public class AiSettingsWindow : ChildWindow {
     int active;
     int sel;
     int modelSel;
-    // 当前页签：0 = 模型配置，i>0 = 第 i 个助手，最后一页 = 行为。
     int tab;
-    // 自动继续预算（-1 = 没配过，跟着内置默认；0 = 不限）。跟服务商无关，
-    // 所以存在 ai_behavior.json 而不是某个配置里。
     int autoCont;
-    // 当前助手页对应的成员 id（模型页时为 ""）。
     string curRoleId;
+    Dictionary<string, string> state;
 
     AiSettingsDialog content;
     ListView<AiProfile> profileList;
@@ -44,6 +39,17 @@ public class AiSettingsWindow : ChildWindow {
     static bool fetch;
     static bool preAdd;
     static bool reg;
+
+    string Get(string key, string dflt) {
+        if (state != null && state.ContainsKey(key)) { return state[key]; }
+        return dflt;
+    }
+
+    int GetInt(string key, int dflt) {
+        string s = this.Get(key, "");
+        if (s == "") { return dflt; }
+        return Convert.ToInt32(s);
+    }
 
     static string T(string lang, string en, string zh) {
         if (lang == "zh") { return zh; }
@@ -75,10 +81,6 @@ public class AiSettingsWindow : ChildWindow {
         return sel;
     }
 
-    // 把这一刻列表里的每个配置都在 `hold` 里留一份引用。`hold` 是为那个还没根治
-    // 的 ARC 过度释放兜底的（见 ZanIDE.AiProfilesHold），而它只在打开窗口时建过
-    // 一次：运行中新增出来的配置从来没被 hold 住，于是「新增」和「点新增出来的
-    // 那条」都会读到已经被回收的对象——就是那个闪退。新增之后必须补上。
     void Hold() {
         for (int i = 0; i < profiles.Count; i = i + 1) {
             hold.Add(profiles[i]);
@@ -87,7 +89,7 @@ public class AiSettingsWindow : ChildWindow {
 
     void BuildUi() {
         content = new AiSettingsDialog();
-        this.SetRoot(content, model);
+        this.SetRoot(content, state);
         this.Handle("aiProfileAdd", AiSettingsWindow.OnAdd);
         this.Handle("aiProfileDelete", AiSettingsWindow.OnDel);
         this.Handle("aiProfileSave", AiSettingsWindow.OnSave);
@@ -183,14 +185,14 @@ public class AiSettingsWindow : ChildWindow {
     void ProfileSelected() {
         int idx = profileList.SelectedIndex();
         if (idx >= 0 && idx != sel) {
-            model.Set("sel", JsonValue.NewNum(Convert.ToString(idx)));
+            state["sel"] = idx.ToString();
         }
     }
 
     void PresetSelected() {
         int idx = presetList.SelectedIndex();
         if (idx >= 0) {
-            model.Set("preset", JsonValue.NewNum(Convert.ToString(idx)));
+            state["preset"] = idx.ToString();
         }
     }
 
@@ -199,16 +201,16 @@ public class AiSettingsWindow : ChildWindow {
         if (row >= 0 && row < modelRows.Count) {
             string m = modelRows[row].model;
             profiles[SelClamped()].model = m;
-            model.Set("model", JsonValue.NewStr(m));
+            state["model"] = m;
         }
     }
 
     void LoadFields() {
         AiProfile profile = profiles[SelClamped()];
-        model.Set("name", JsonValue.NewStr(profile.name));
-        model.Set("base", JsonValue.NewStr(profile.baseUrl));
-        model.Set("key", JsonValue.NewStr(profile.key));
-        model.Set("model", JsonValue.NewStr(profile.model));
+        state["name"] = profile.name;
+        state["base"] = profile.baseUrl;
+        state["key"] = profile.key;
+        state["model"] = profile.model;
         curRoleId = "";
         this.SeedModelLimits();
         this.SeedRoleModels();
@@ -220,7 +222,7 @@ public class AiSettingsWindow : ChildWindow {
         for (int r = 0; r < rs.Count; r = r + 1) {
             string text = ZanIDE.AiRoleModel(rolePrompts, rs[r].id);
             if (text == "") { text = AiTeam.DefaultDuty(rs[r].id); }
-            model.Set("roleprompt_" + rs[r].id, JsonValue.NewStr(text));
+            state["roleprompt_" + rs[r].id] = text;
         }
     }
 
@@ -229,7 +231,7 @@ public class AiSettingsWindow : ChildWindow {
         AiProfile profile = profiles[SelClamped()];
         profile.roles = ZanIDE.AiRoleModelSet(profile.roles, curRoleId,
             content.RoleModelValue());
-        string text = model.PathStr("roleprompt_" + curRoleId, "");
+        string text = this.Get("roleprompt_" + curRoleId, "");
         if (text == AiTeam.DefaultDuty(curRoleId)) { text = ""; }
         rolePrompts = ZanIDE.AiRoleModelSet(rolePrompts, curRoleId, text);
     }
@@ -269,16 +271,16 @@ public class AiSettingsWindow : ChildWindow {
             if (mopts[m] == profile.model) { idx = m; break; }
         }
         modelSel = idx;
-        model.Set("modelsel", JsonValue.NewNum(Convert.ToString(idx)));
+        state["modelsel"] = idx.ToString();
     }
 
     void CommitFields() {
         AiProfile profile = profiles[SelClamped()];
-        profile.name = model.PathStr("name", profile.name);
-        profile.baseUrl = model.PathStr("base", profile.baseUrl);
-        profile.key = model.PathStr("key", profile.key);
+        profile.name = this.Get("name", profile.name);
+        profile.baseUrl = this.Get("base", profile.baseUrl);
+        profile.key = this.Get("key", profile.key);
         profile.model = content.ModelValue(
-            model.PathStr("model", profile.model));
+            this.Get("model", profile.model));
         this.CommitModelLimits();
         this.CommitRoleModels();
         this.CommitAct();
@@ -286,7 +288,7 @@ public class AiSettingsWindow : ChildWindow {
 
     // 行为页读回：留空 = 没配过（跟内置默认走），0 = 不限，其余就是拍数。
     void CommitAct() {
-        string text = AiAgent.Trim(model.PathStr("autocont", ""));
+        string text = AiAgent.Trim(this.Get("autocont", ""));
         if (text == "") { autoCont = 0 - 1; return; }
         autoCont = ZanIDE.ParseInt(text);
     }
@@ -299,7 +301,7 @@ public class AiSettingsWindow : ChildWindow {
     }
 
     void SetStatus(string text) {
-        model.Set("status", JsonValue.NewStr(text));
+        state["status"] = text;
     }
 
     static AiSettingsWindow Open(App parent, string uiLang) {
@@ -322,16 +324,16 @@ public class AiSettingsWindow : ChildWindow {
         w.rolePrompts = ZanIDE.AiRolePromptsLoad();
         w.sel = w.active;
         w.presets = ZanIDE.AiPresets();
-        w.model = JsonValue.NewObject();
-        w.model.Set("sel", JsonValue.NewNum(Convert.ToString(w.sel)));
-        w.model.Set("preset", JsonValue.NewNum("0"));
-        w.model.Set("status", JsonValue.NewStr(""));
-        w.model.Set("ctx", JsonValue.NewStr(""));
-        w.model.Set("out", JsonValue.NewStr(""));
+        w.state = new Dictionary<string, string>();
+        w.state["sel"] = w.sel.ToString();
+        w.state["preset"] = "0";
+        w.state["status"] = "";
+        w.state["ctx"] = "";
+        w.state["out"] = "";
         w.autoCont = ZanIDE.AiAutoContLoad();
         string contText = "";
-        if (w.autoCont >= 0) { contText = Convert.ToString(w.autoCont); }
-        w.model.Set("autocont", JsonValue.NewStr(contText));
+        if (w.autoCont >= 0) { contText = w.autoCont.ToString(); }
+        w.state["autocont"] = contText;
         w.tab = 0;
         w.curRoleId = "";
         w.LoadFields();
@@ -363,7 +365,7 @@ public class AiSettingsWindow : ChildWindow {
     }
 
     int PresetIndex() {
-        int p = model.PathInt("preset", 0);
+        int p = this.GetInt("preset", 0);
         if (p < 0 || p >= presets.Count) { p = 0; }
         return p;
     }
@@ -378,7 +380,7 @@ public class AiSettingsWindow : ChildWindow {
             this.Rebuild();
         }
 
-        int nextSel = model.PathInt("sel", sel);
+        int nextSel = this.GetInt("sel", sel);
         if (nextSel != sel && nextSel >= 0 && nextSel < profiles.Count) {
             this.CommitFields();
             sel = nextSel;
@@ -390,11 +392,11 @@ public class AiSettingsWindow : ChildWindow {
             AiSettingsWindow.add = false;
             this.CommitFields();
             profiles.Add(AiProfile.Create(AiSettingsWindow.T(lang, "AI ", "配置 ")
-                + Convert.ToString(profiles.Count + 1),
+                + (profiles.Count + 1).ToString(),
                 "https://api.openai.com/v1", "", "", "", "{}"));
             this.Hold();
             sel = profiles.Count - 1;
-            model.Set("sel", JsonValue.NewNum(Convert.ToString(sel)));
+            state["sel"] = sel.ToString();
             this.LoadFields();
             this.Persist();
             this.Rebuild();
@@ -408,7 +410,7 @@ public class AiSettingsWindow : ChildWindow {
                 "", "{}"));
             this.Hold();
             sel = profiles.Count - 1;
-            model.Set("sel", JsonValue.NewNum(Convert.ToString(sel)));
+            state["sel"] = sel.ToString();
             this.LoadFields();
             this.Persist();
             this.SetStatus(AiSettingsWindow.T(
@@ -427,7 +429,7 @@ public class AiSettingsWindow : ChildWindow {
                 profiles.RemoveAt(i);
                 if (active >= profiles.Count) { active = 0; }
                 if (sel >= profiles.Count) { sel = profiles.Count - 1; }
-                model.Set("sel", JsonValue.NewNum(Convert.ToString(sel)));
+                state["sel"] = sel.ToString();
                 this.LoadFields();
                 this.Persist();
                 this.Rebuild();
@@ -479,12 +481,12 @@ public class AiSettingsWindow : ChildWindow {
                     List<string> gm = ZanIDE.SplitList(gotModels);
                     if (profile.model == "") {
                         profile.model = gm[0];
-                        model.Set("model", JsonValue.NewStr(gm[0]));
+                        state["model"] = gm[0];
                     }
                     this.Persist();
                     this.SyncModelSel();
                     this.SetStatus(AiSettingsWindow.T(lang, "Fetched ", "已获取 ")
-                        + Convert.ToString(gm.Count)
+                        + gm.Count.ToString()
                         + AiSettingsWindow.T(lang, " models.", " 个模型。"));
                 } else {
                     this.SetStatus(AiSettingsWindow.T(

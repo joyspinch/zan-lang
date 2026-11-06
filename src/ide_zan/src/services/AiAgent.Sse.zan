@@ -4,10 +4,7 @@ using System.Json;
 
 // SSE 帧的折叠：把一帧 JSON 里的增量文本 / 错误 / 用量折进 SseAnswer。
 //
-// 单独成文件（而不是塞在 AiAgent.Context.zan 里）是为了能**单独编译**：
-// Context.zan 里的其它方法依赖整个 IDE（ZanIDE 的成员、设置表、数据库），
-// 而这一段是纯函数——只依赖 JsonValue 与 SseAnswer。拆出来就能给它写
-// 独立的用例，不必把整个 IDE 拖进来。
+// 单独成文件是为了能独立测试：纯函数提取，仅依赖 SseAnswer 与 JsonDoc。
 partial class AiAgent {
     // 去首尾空白（空格 / 换行 / 回车 / 制表）。SSE 的 `data:` 载荷前后
     // 常常有空白，解析前要剪掉。放在这个文件里是为了让 SSE 相关的那几
@@ -26,38 +23,53 @@ partial class AiAgent {
         return s.Substring(a, b - a);
     }
 
-    static void FoldChunk(SseAnswer a, StringBuilder c, StringBuilder r,
-            JsonValue v, string raw) {
-        if (v == null) { return; }
-        JsonValue err = v.Get("error");
-        if (err != null && a.error == "") {
-            if (err.IsObject()) { a.error = err.Str("message", raw); }
-            else { a.error = err.AsString(raw); }
-        }
-        JsonValue ch = v.Get("choices");
-        if (ch != null && ch.IsArray() && ch.Count() > 0) {
-            JsonValue delta = ch.At(0).Get("delta");
-            if (delta != null) {
-                c.Append(delta.Str("content", ""));
-                r.Append(delta.Str("reasoning_content", ""));
-            } else {
-                JsonValue full = ch.At(0).Get("message");
-                if (full != null) {
-                    c.Append(full.Str("content", ""));
-                    r.Append(full.Str("reasoning_content", ""));
+    public static void FoldChunk(SseAnswer a, StringBuilder c, StringBuilder r, string raw) {
+        if (raw == null || raw.Length == 0) { return; }
+        try {
+            JsonDoc.ParseScoped(raw, doc => {
+                int root = doc.root;
+                if (doc.KindAt(root) != 5) { return; }
+
+                int errSlot = doc.Get(root, "error");
+                if (errSlot >= 0 && a.error == "") {
+                    if (doc.KindAt(errSlot) == 5) {
+                        a.error = doc.Str(errSlot, "message", raw);
+                    } else {
+                        a.error = doc.StrAt(errSlot, raw);
+                    }
                 }
-            }
-        }
-        JsonValue us = v.Get("usage");
-        if (us != null && us.IsObject()) {
-            a.promptTokens = us.Int("prompt_tokens", a.promptTokens);
-            a.completionTokens = us.Int("completion_tokens", a.completionTokens);
-            a.totalTokens = us.Int("total_tokens", a.totalTokens);
-            a.cachedTokens = us.Int("prompt_cache_hit_tokens", a.cachedTokens);
-            JsonValue pd = us.Get("prompt_tokens_details");
-            if (pd != null && pd.IsObject()) {
-                a.cachedTokens = pd.Int("cached_tokens", a.cachedTokens);
-            }
+
+                int chSlot = doc.Get(root, "choices");
+                if (chSlot >= 0 && doc.KindAt(chSlot) == 4 && doc.Count(chSlot) > 0) {
+                    int firstChoice = doc.FirstChild(chSlot);
+                    if (firstChoice >= 0 && doc.KindAt(firstChoice) == 5) {
+                        int deltaSlot = doc.Get(firstChoice, "delta");
+                        if (deltaSlot >= 0 && doc.KindAt(deltaSlot) == 5) {
+                            c.Append(doc.Str(deltaSlot, "content", ""));
+                            r.Append(doc.Str(deltaSlot, "reasoning_content", ""));
+                        } else {
+                            int msgSlot = doc.Get(firstChoice, "message");
+                            if (msgSlot >= 0 && doc.KindAt(msgSlot) == 5) {
+                                c.Append(doc.Str(msgSlot, "content", ""));
+                                r.Append(doc.Str(msgSlot, "reasoning_content", ""));
+                            }
+                        }
+                    }
+                }
+
+                int usSlot = doc.Get(root, "usage");
+                if (usSlot >= 0 && doc.KindAt(usSlot) == 5) {
+                    a.promptTokens = (int)doc.Long(usSlot, "prompt_tokens", (long)a.promptTokens);
+                    a.completionTokens = (int)doc.Long(usSlot, "completion_tokens", (long)a.completionTokens);
+                    a.totalTokens = (int)doc.Long(usSlot, "total_tokens", (long)a.totalTokens);
+                    a.cachedTokens = (int)doc.Long(usSlot, "prompt_cache_hit_tokens", (long)a.cachedTokens);
+                    int pdSlot = doc.Get(usSlot, "prompt_tokens_details");
+                    if (pdSlot >= 0 && doc.KindAt(pdSlot) == 5) {
+                        a.cachedTokens = (int)doc.Long(pdSlot, "cached_tokens", (long)a.cachedTokens);
+                    }
+                }
+            });
+        } catch (Exception) {
         }
     }
 }

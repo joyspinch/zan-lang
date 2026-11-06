@@ -49,125 +49,145 @@ partial class LspSession {
         return lines;
     }
 
-    static LspPosition ParsePosition(JsonValue value) {
-        if (value == null || !value.IsObject()) { return null; }
-        JsonValue lineValue = value.Get("line");
-        JsonValue characterValue = value.Get("character");
-        if (lineValue == null || characterValue == null || !lineValue.IsInt() || !characterValue.IsInt()) { return null; }
-        int line = lineValue.AsInt(-1);
-        int character = characterValue.AsInt(-1);
-        if (line < 0 || character < 0) { return null; }
-        return LspSession.PosObj(line, character);
-    }
-
-    static LspDefinitionTarget ParseDefinitionLocation(JsonValue value) {
-        if (value == null || !value.IsObject()) { return null; }
-        string uri = value.Str("uri", "");
-        JsonValue range = value.Get("range");
+    static LspDefinitionTarget ExtractDefinitionLocation(JsonDoc doc, int loc) {
+        if (loc < 0 || doc.KindAt(loc) != 5) { return null; }
+        string uri = doc.Str(loc, "uri", "");
+        int range = doc.Get(loc, "range");
         if (uri.Length == 0) {
-            uri = value.Str("targetUri", "");
-            range = value.Get("targetSelectionRange");
-            if (range == null) { range = value.Get("targetRange"); }
+            uri = doc.Str(loc, "targetUri", "");
+            range = doc.Get(loc, "targetSelectionRange");
+            if (range < 0) { range = doc.Get(loc, "targetRange"); }
         }
-        if (uri.Length == 0 || range == null || !range.IsObject()) { return null; }
-        LspPosition start = LspSession.ParsePosition(range.Get("start"));
-        LspPosition end = LspSession.ParsePosition(range.Get("end"));
-        if (start == null || end == null || end.line < start.line
-            || (end.line == start.line && end.character < start.character)) { return null; }
+        if (uri.Length == 0 || range < 0 || doc.KindAt(range) != 5) { return null; }
+        int start = doc.Get(range, "start");
+        int end = doc.Get(range, "end");
+        if (start < 0 || end < 0 || doc.KindAt(start) != 5 || doc.KindAt(end) != 5) { return null; }
+        int startLine = (int)doc.Long(start, "line", -1L);
+        int startChar = (int)doc.Long(start, "character", -1L);
+        int endLine = (int)doc.Long(end, "line", -1L);
+        int endChar = (int)doc.Long(end, "character", -1L);
+        if (startLine < 0 || startChar < 0 || endLine < startLine
+            || (endLine == startLine && endChar < startChar)) { return null; }
+        string path = LspSession.UriToPath(uri);
+        if (path.Length == 0) { return null; }
         LspDefinitionTarget target = new LspDefinitionTarget();
-        target.path = LspSession.UriToPath(uri);
-        if (target.path.Length == 0) { return null; }
-        target.line = start.line;
-        target.column = start.character;
+        target.path = path;
+        target.line = startLine;
+        target.column = startChar;
         return target;
     }
 
-    static JsonValue ParseResponse(string message) {
-        JsonValue root = null;
-        try { root = JsonValue.ParseLenient(message); } catch (Exception) { return null; }
-        if (root == null || !root.IsObject() || root.Has("error")) { return null; }
-        return root;
-    }
-
     static LspDefinitionTarget ParseDefinition(string message) {
-        JsonValue root = LspSession.ParseResponse(message);
-        if (root == null) { return null; }
-        JsonValue result = root.Get("result");
-        if (result == null || result.IsNull()) { return null; }
-        if (!result.IsArray()) { return LspSession.ParseDefinitionLocation(result); }
-        for (int i = 0; i < result.Count(); i = i + 1) {
-            LspDefinitionTarget target = LspSession.ParseDefinitionLocation(result.At(i));
-            if (target != null) { return target; }
+        if (message == null || message.Length == 0) { return null; }
+        LspDefinitionTarget target = null;
+        try {
+            JsonDoc.ParseScoped(message, doc => {
+                int root = doc.root;
+                if (doc.KindAt(root) != 5 || doc.Get(root, "error") >= 0) { return; }
+                int result = doc.Get(root, "result");
+                if (result < 0 || doc.KindAt(result) == 0) { return; }
+                if (doc.KindAt(result) == 4) {
+                    int loc = doc.FirstChild(result);
+                    while (loc >= 0) {
+                        LspDefinitionTarget t = LspSession.ExtractDefinitionLocation(doc, loc);
+                        if (t != null) { target = t; return; }
+                        loc = doc.NextSibling(loc);
+                    }
+                } else if (doc.KindAt(result) == 5) {
+                    target = LspSession.ExtractDefinitionLocation(doc, result);
+                }
+            });
+        } catch (Exception) {
+            return null;
         }
-        return null;
+        return target;
     }
 
-    static bool AppendRenameEdits(List<LspRenameEdit> output, string uri, JsonValue edits, int version) {
-        if (uri.Length == 0 || edits == null || !edits.IsArray()) { return false; }
+    static bool AppendRenameEditsFromDoc(List<LspRenameEdit> output, string uri, JsonDoc doc, int editsNode, int version) {
+        if (uri.Length == 0 || editsNode < 0 || doc.KindAt(editsNode) != 4) { return false; }
         string path = LspSession.UriToPath(uri);
         if (path.Length == 0) { return false; }
-        for (int i = 0; i < edits.Count(); i = i + 1) {
-            JsonValue edit = edits.At(i);
-            if (edit == null || !edit.IsObject()) { return false; }
-            JsonValue range = edit.Get("range");
-            JsonValue newText = edit.Get("newText");
-            if (range == null || !range.IsObject() || newText == null || !newText.IsString()) { return false; }
-            LspPosition start = LspSession.ParsePosition(range.Get("start"));
-            LspPosition end = LspSession.ParsePosition(range.Get("end"));
-            if (start == null || end == null || end.line < start.line
-                || (end.line == start.line && end.character < start.character)) { return false; }
-            LspRenameEdit item = new LspRenameEdit();
-            item.path = path; item.start = start; item.end = end;
-            item.newText = newText.AsString(""); item.version = version;
-            output.Add(item);
+        int edit = doc.FirstChild(editsNode);
+        while (edit >= 0) {
+            if (doc.KindAt(edit) == 5) {
+                int range = doc.Get(edit, "range");
+                string newText = doc.Str(edit, "newText", "");
+                if (range >= 0 && doc.KindAt(range) == 5) {
+                    int start = doc.Get(range, "start");
+                    int end = doc.Get(range, "end");
+                    if (start >= 0 && end >= 0 && doc.KindAt(start) == 5 && doc.KindAt(end) == 5) {
+                        int sLine = (int)doc.Long(start, "line", -1L);
+                        int sChar = (int)doc.Long(start, "character", -1L);
+                        int eLine = (int)doc.Long(end, "line", -1L);
+                        int eChar = (int)doc.Long(end, "character", -1L);
+                        if (sLine >= 0 && sChar >= 0 && (eLine > sLine || (eLine == sLine && eChar >= sChar))) {
+                            LspRenameEdit item = new LspRenameEdit();
+                            item.path = path;
+                            item.start = LspSession.PosObj(sLine, sChar);
+                            item.end = LspSession.PosObj(eLine, eChar);
+                            item.newText = newText;
+                            item.version = version;
+                            output.Add(item);
+                        }
+                    }
+                }
+            }
+            edit = doc.NextSibling(edit);
         }
         return true;
     }
 
+    static void ExtractWorkspaceEdit(JsonDoc doc, int resNode, List<LspRenameEdit> output) {
+        if (resNode < 0 || doc.KindAt(resNode) != 5) { return; }
+        int changes = doc.Get(resNode, "changes");
+        int docChanges = doc.Get(resNode, "documentChanges");
+        if (changes >= 0 && docChanges >= 0) { return; }
+        if (changes >= 0 && doc.KindAt(changes) == 5) {
+            int p = (int)(doc.slots[changes].a >> 8);
+            while (p >= 0) {
+                JsonPair pair = doc.pairs[p];
+                string uri = pair.keyStart >= 0
+                    ? doc.src.Substring(pair.keyStart, pair.keyLen)
+                    : doc.escPool[pair.keyLen];
+                int edits = pair.valueSlot;
+                if (edits >= 0 && doc.KindAt(edits) == 4) {
+                    LspSession.AppendRenameEditsFromDoc(output, uri, doc, edits, -1);
+                }
+                p = pair.nextPair;
+            }
+        } else if (docChanges >= 0 && doc.KindAt(docChanges) == 4) {
+            int entry = doc.FirstChild(docChanges);
+            while (entry >= 0) {
+                if (doc.KindAt(entry) == 5 && doc.Get(entry, "kind") < 0) {
+                    int document = doc.Get(entry, "textDocument");
+                    if (document >= 0 && doc.KindAt(document) == 5) {
+                        string uri = doc.Str(document, "uri", "");
+                        int version = (int)doc.Long(document, "version", -1L);
+                        int edits = doc.Get(entry, "edits");
+                        if (edits >= 0 && doc.KindAt(edits) == 4) {
+                            LspSession.AppendRenameEditsFromDoc(output, uri, doc, edits, version);
+                        }
+                    }
+                }
+                entry = doc.NextSibling(entry);
+            }
+        }
+    }
+
     static List<LspRenameEdit> ParseWorkspaceEdit(string m) {
         List<LspRenameEdit> output = new List<LspRenameEdit>();
-        JsonValue root = LspSession.ParseResponse(m);
-        if (root == null) { return null; }
-        JsonValue result = root.Get("result");
-        if (result == null) { return null; }
-        return LspSession.ParseWorkspaceEditValue(result, output);
-    }
-
-    // codeAction 拿到的是内嵌的 WorkspaceEdit 对象（不带外层响应壳）。
-    static List<LspRenameEdit> ParseWorkspaceEditEdit(JsonValue editObj) {
-        if (editObj == null || !editObj.IsObject()) { return null; }
-        List<LspRenameEdit> output = new List<LspRenameEdit>();
-        return LspSession.ParseWorkspaceEditValue(editObj, output);
-    }
-
-    static List<LspRenameEdit> ParseWorkspaceEditValue(JsonValue result,
-            List<LspRenameEdit> output) {
-        if (result.IsNull()) { return output; }
-        if (!result.IsObject()) { return null; }
-        JsonValue changes = result.Get("changes");
-        JsonValue documentChanges = result.Get("documentChanges");
-        if (changes != null && documentChanges != null) { return null; }
-        if (changes != null) {
-            if (!changes.IsObject()) { return null; }
-            for (int f = 0; f < changes.Count(); f = f + 1) {
-                if (!LspSession.AppendRenameEdits(output, changes.KeyAt(f), changes.ValAt(f), -1)) { return null; }
-            }
-        } else if (documentChanges != null) {
-            if (!documentChanges.IsArray()) { return null; }
-            for (int f = 0; f < documentChanges.Count(); f = f + 1) {
-                JsonValue entry = documentChanges.At(f);
-                if (entry == null || !entry.IsObject() || entry.Has("kind")) { return null; }
-                JsonValue document = entry.Get("textDocument");
-                if (document == null || !document.IsObject()) { return null; }
-                JsonValue versionValue = document.Get("version");
-                int version = -1;
-                if (versionValue != null && !versionValue.IsNull()) {
-                    if (!versionValue.IsInt()) { return null; }
-                    version = versionValue.AsInt(-1);
-                    if (version < 0) { return null; }
+        if (m == null || m.Length == 0) { return null; }
+        try {
+            JsonDoc.ParseScoped(m, doc => {
+                int root = doc.root;
+                if (doc.KindAt(root) != 5 || doc.Get(root, "error") >= 0) { return; }
+                int result = doc.Get(root, "result");
+                if (result >= 0 && doc.KindAt(result) == 5) {
+                    LspSession.ExtractWorkspaceEdit(doc, result, output);
                 }
-                if (!LspSession.AppendRenameEdits(output, document.Str("uri", ""), entry.Get("edits"), version)) { return null; }
-            }
+            });
+        } catch (Exception) {
+            return null;
         }
         return output;
     }
@@ -231,82 +251,111 @@ partial class LspSession {
         return left == right;
     }
 
-    // workspace/symbol 响应数组 -> 符号列表。行/列统一换算成
-    // 编辑器的 0 基行 + 字节列；URI 解析失败的条目整条丢弃。
     static List<LspWorkspaceSymbol> ParseWorkspaceSymbols(string message) {
         List<LspWorkspaceSymbol> outp = new List<LspWorkspaceSymbol>();
-        JsonValue root = LspSession.ParseResponse(message);
-        if (root == null) { return outp; }
-        JsonValue result = root.Get("result");
-        if (result == null || result.IsNull() || !result.IsArray()) { return outp; }
-        for (int i = 0; i < result.Count(); i = i + 1) {
-            JsonValue item = result.At(i);
-            if (item == null || !item.IsObject()) { continue; }
-            string name = item.Str("name", "");
-            if (name.Length == 0) { continue; }
-            JsonValue location = item.Get("location");
-            if (location == null || !location.IsObject()) { continue; }
-            string path = LspSession.UriToPath(location.Str("uri", ""));
-            if (path.Length == 0) { continue; }
-            int line = 0;
-            int col = 0;
-            JsonValue range = location.Get("range");
-            if (range != null && range.IsObject()) {
-                JsonValue start = range.Get("start");
-                if (start != null && start.IsObject()) {
-                    line = start.Int("line", 0);
-                    col = start.Int("character", 0);
+        if (message == null || message.Length == 0) { return outp; }
+        try {
+            JsonDoc.ParseScoped(message, doc => {
+                int root = doc.root;
+                if (doc.KindAt(root) != 5 || doc.Get(root, "error") >= 0) { return; }
+                int result = doc.Get(root, "result");
+                if (result < 0 || doc.KindAt(result) != 4) { return; }
+                int item = doc.FirstChild(result);
+                while (item >= 0) {
+                    if (doc.KindAt(item) == 5) {
+                        string name = doc.Str(item, "name", "");
+                        int location = doc.Get(item, "location");
+                        if (name.Length > 0 && location >= 0 && doc.KindAt(location) == 5) {
+                            string path = LspSession.UriToPath(doc.Str(location, "uri", ""));
+                            if (path.Length > 0) {
+                                int line = 0;
+                                int col = 0;
+                                int range = doc.Get(location, "range");
+                                if (range >= 0 && doc.KindAt(range) == 5) {
+                                    int start = doc.Get(range, "start");
+                                    if (start >= 0 && doc.KindAt(start) == 5) {
+                                        line = (int)doc.Long(start, "line", 0L);
+                                        col = (int)doc.Long(start, "character", 0L);
+                                    }
+                                }
+                                if (line < 0) { line = 0; }
+                                if (col < 0) { col = 0; }
+                                LspWorkspaceSymbol symbol = new LspWorkspaceSymbol();
+                                symbol.name = name;
+                                symbol.kind = (int)doc.Long(item, "kind", 0L);
+                                symbol.containerName = doc.Str(item, "containerName", "");
+                                symbol.path = path;
+                                symbol.line = line;
+                                symbol.column = col;
+                                outp.Add(symbol);
+                            }
+                        }
+                    }
+                    item = doc.NextSibling(item);
                 }
-            }
-            if (line < 0) { line = 0; }
-            if (col < 0) { col = 0; }
-            LspWorkspaceSymbol symbol = new LspWorkspaceSymbol();
-            symbol.name = name;
-            symbol.kind = item.Int("kind", 0);
-            symbol.containerName = item.Str("containerName", "");
-            symbol.path = path;
-            symbol.line = line;
-            symbol.column = col;
-            outp.Add(symbol);
-        }
+            });
+        } catch (Exception) {}
         return outp;
     }
 
-    // textDocument/codeAction 响应数组 -> 动作列表。只收带编辑的动作
-    // （命令型动作本服务端不产生）；edit 保留原始 JSON，应用时再展开。
     static List<LspCodeAction> ParseCodeActions(string message) {
         List<LspCodeAction> outp = new List<LspCodeAction>();
-        JsonValue root = LspSession.ParseResponse(message);
-        if (root == null) { return outp; }
-        JsonValue result = root.Get("result");
-        if (result == null || result.IsNull() || !result.IsArray()) { return outp; }
-        for (int i = 0; i < result.Count(); i = i + 1) {
-            JsonValue item = result.At(i);
-            if (item == null || !item.IsObject()) { continue; }
-            string title = item.Str("title", "");
-            if (title.Length == 0) { continue; }
-            JsonValue edit = item.Get("edit");
-            if (edit == null || !edit.IsObject()) { continue; }
-            LspCodeAction action = new LspCodeAction();
-            action.title = title;
-            action.kind = item.Str("kind", "");
-            action.edit = edit;
-            outp.Add(action);
-        }
+        if (message == null || message.Length == 0) { return outp; }
+        try {
+            JsonDoc.ParseScoped(message, doc => {
+                int root = doc.root;
+                if (doc.KindAt(root) != 5 || doc.Get(root, "error") >= 0) { return; }
+                int result = doc.Get(root, "result");
+                if (result < 0 || doc.KindAt(result) != 4) { return; }
+                int item = doc.FirstChild(result);
+                while (item >= 0) {
+                    if (doc.KindAt(item) == 5) {
+                        string title = doc.Str(item, "title", "");
+                        if (title.Length > 0) {
+                            int edit = doc.Get(item, "edit");
+                            if (edit >= 0 && doc.KindAt(edit) == 5) {
+                                LspCodeAction action = new LspCodeAction();
+                                action.title = title;
+                                action.kind = doc.Str(item, "kind", "");
+                                action.edits = new List<LspRenameEdit>();
+                                LspSession.ExtractWorkspaceEdit(doc, edit, action.edits);
+                                outp.Add(action);
+                            }
+                        }
+                    }
+                    item = doc.NextSibling(item);
+                }
+            });
+        } catch (Exception) {}
         return outp;
     }
 
-    static string MarkupText(JsonValue value) {
-        if (value == null) { return ""; }
-        if (value.IsString()) { return value.AsString(""); }
-        if (value.IsArray()) {
+    static string MarkupText(object docObj) {
+        if (docObj == null) { return ""; }
+        if (docObj is string) { return (string)docObj; }
+        if (docObj is Dict<string, string>) {
+            Dict<string, string> d = (Dict<string, string>)docObj;
+            if (d.ContainsKey("value")) { return d["value"]; }
+        }
+        return "";
+    }
+
+    static string ExtractMarkupText(JsonDoc doc, int node) {
+        if (node < 0) { return ""; }
+        int kind = doc.KindAt(node);
+        if (kind == 3) { return doc.StrAt(node, ""); }
+        if (kind == 5) { return doc.Str(node, "value", ""); }
+        if (kind == 4) {
             List<string> parts = new List<string>();
-            for (int i = 0; i < value.Count(); i = i + 1) {
-                parts.Add(LspSession.MarkupText(value.At(i)));
+            int child = doc.FirstChild(node);
+            while (child >= 0) {
+                string t = LspSession.ExtractMarkupText(doc, child);
+                if (t.Length > 0) { parts.Add(t); }
+                child = doc.NextSibling(child);
             }
             return string.Join("\n", parts);
         }
-        return value.Str("value", "");
+        return "";
     }
 
     static string PosParams(string path, int line0, int col0) {

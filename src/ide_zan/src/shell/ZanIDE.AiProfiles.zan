@@ -64,44 +64,54 @@ partial class ZanIDE {
     static string AiModelsRespPath() { return ZanIDE.WindowCacheDir() + "/ai_models.json"; }
     static string AiModelsDonePath() { return ZanIDE.WindowCacheDir() + "/ai_models_done.txt"; }
 
+    static string ExtractObjectJson(JsonDoc doc, int node) {
+        if (node < 0 || doc.KindAt(node) != 5) { return "{}"; }
+        return doc.ToJson(node);
+    }
+
     static int AiProfilesLoad(List<AiProfile> profiles) {
         int active = 0;
         if (File.Exists(ZanIDE.AiProfilesPath())) {
-            JsonValue v = JsonValue.ParseLenient(File.ReadAllText(ZanIDE.AiProfilesPath()));
-            if (v != null) {
-                active = v.Int("active", 0);
-                JsonValue ps = v.Get("profiles");
-                if (ps != null && ps.IsArray()) {
-                    for (int i = 0; i < ps.Count(); i = i + 1) {
-                        JsonValue p = ps.At(i);
-                        if (p == null || !p.IsObject()) { continue; }
-                        string modelList = "";
-                        JsonValue ms = p.Get("models");
-                        if (ms != null && ms.IsArray()) {
-                            for (int j = 0; j < ms.Count(); j = j + 1) {
-                                JsonValue mv = ms.At(j);
-                                if (mv == null || !mv.IsString()) { continue; }
-                                string mid = mv.AsString("");
-                                if (mid != "") {
-                                    if (modelList != "") { modelList = modelList + ";"; }
-                                    modelList = modelList + mid;
+            string text = File.ReadAllText(ZanIDE.AiProfilesPath());
+            if (text != "") {
+                JsonDoc.ParseScoped(text, (JsonDoc v) => {
+                    if (v.KindAt(0) != 5) { return; }
+                    active = (int)v.Long(0, "active", 0L);
+                    int ps = v.Get(0, "profiles");
+                    if (ps >= 0 && v.KindAt(ps) == 4) {
+                        int p = v.FirstChild(ps);
+                        int idx = 0;
+                        while (p >= 0) {
+                            if (v.KindAt(p) == 5) {
+                                string modelList = "";
+                                int ms = v.Get(p, "models");
+                                if (ms >= 0 && v.KindAt(ms) == 4) {
+                                    int mv = v.FirstChild(ms);
+                                    while (mv >= 0) {
+                                        if (v.KindAt(mv) == 3) {
+                                            string mid = v.StrAt(mv, "");
+                                            if (mid != "") {
+                                                if (modelList != "") { modelList = modelList + ";"; }
+                                                modelList = modelList + mid;
+                                            }
+                                        }
+                                        mv = v.NextSibling(mv);
+                                    }
                                 }
+                                string limitMap = ZanIDE.ExtractObjectJson(v, v.Get(p, "limits"));
+                                string roleMap = ZanIDE.ExtractObjectJson(v, v.Get(p, "roles"));
+                                AiProfile loaded = AiProfile.Create(
+                                    v.Str(p, "name", "AI " + (idx + 1).ToString()),
+                                    v.Str(p, "base", ""), v.Str(p, "key", ""),
+                                    v.Str(p, "model", ""), modelList, limitMap);
+                                loaded.roles = roleMap;
+                                profiles.Add(loaded);
+                                idx = idx + 1;
                             }
+                            p = v.NextSibling(p);
                         }
-                        string limitMap = "{}";
-                        JsonValue lim = p.Get("limits");
-                        if (lim != null && lim.IsObject()) { limitMap = lim.ToJson(); }
-                        string roleMap = "{}";
-                        JsonValue rls = p.Get("roles");
-                        if (rls != null && rls.IsObject()) { roleMap = rls.ToJson(); }
-                        AiProfile loaded = AiProfile.Create(
-                            p.Str("name", "AI " + Convert.ToString(i + 1)),
-                            p.Str("base", ""), p.Str("key", ""),
-                            p.Str("model", ""), modelList, limitMap);
-                        loaded.roles = roleMap;
-                        profiles.Add(loaded);
                     }
-                }
+                });
             }
         }
         if (profiles.Count == 0) {
@@ -124,37 +134,37 @@ partial class ZanIDE {
     }
 
     static void AiProfilesSave(int active, List<AiProfile> profiles) {
-        JsonValue arr = JsonValue.NewArray();
+        JsonWriter w = new JsonWriter();
+        w.StartObject();
+        w.WriteProperty("active", active);
+        w.WriteKey("profiles");
+        w.StartArray();
         for (int i = 0; i < profiles.Count; i = i + 1) {
             AiProfile profile = profiles[i];
-            JsonValue o = JsonValue.NewObject();
-            o.Put("name", JsonValue.NewStr(profile.name));
-            o.Put("base", JsonValue.NewStr(profile.baseUrl));
-            o.Put("key", JsonValue.NewStr(profile.key));
-            o.Put("model", JsonValue.NewStr(profile.model));
-            JsonValue ms = JsonValue.NewArray();
+            w.StartObject();
+            w.WriteProperty("name", profile.name);
+            w.WriteProperty("base", profile.baseUrl);
+            w.WriteProperty("key", profile.key);
+            w.WriteProperty("model", profile.model);
+            w.WriteKey("models");
+            w.StartArray();
             List<string> models = ZanIDE.SplitList(profile.models);
             for (int j = 0; j < models.Count; j = j + 1) {
-                ms.Append(JsonValue.NewStr(models[j]));
+                w.WriteString(models[j]);
             }
-            o.Put("models", ms);
+            w.EndArray();
             string limitMap = profile.limits;
             if (limitMap.IsNullOrEmpty()) { limitMap = "{}"; }
-            JsonValue lm = JsonValue.ParseLenient(limitMap);
-            if (lm == null) { lm = JsonValue.NewObject(); }
-            o.Put("limits", lm);
+            w.WriteRawProperty("limits", limitMap);
             string roleMap = profile.roles;
             if (roleMap.IsNullOrEmpty()) { roleMap = "{}"; }
-            JsonValue rm = JsonValue.ParseLenient(roleMap);
-            if (rm == null) { rm = JsonValue.NewObject(); }
-            o.Put("roles", rm);
-            arr.Append(o);
+            w.WriteRawProperty("roles", roleMap);
+            w.EndObject();
         }
-        JsonValue root = JsonValue.NewObject();
-        root.Put("active", JsonValue.NewNum(Convert.ToString(active)));
-        root.Put("profiles", arr);
+        w.EndArray();
+        w.EndObject();
         Directory.CreateDirectoryRecursive(ZanIDE.UserConfigDir());
-        File.WriteAllText(ZanIDE.AiProfilesPath(), root.ToJson());
+        File.WriteAllText(ZanIDE.AiProfilesPath(), w.ToJson());
     }
 
     static int ParseIntSafe(string s) {
@@ -174,53 +184,108 @@ partial class ZanIDE {
     }
 
     static int AiLimitInt(string mapJson, string model, string field) {
-        // 配置里 limits / model 可能是未设置的 null；用 IsNullOrEmpty 判空
-        // （对 null 安全，不解引用）。直接写 `mapJson == ""` 会在原生层对
-        // 空指针做字符串比较直接崩溃（AI 面板每帧都调用它，几秒后必崩）。
         if (mapJson.IsNullOrEmpty() || model.IsNullOrEmpty()) { return 0; }
-        JsonValue v = JsonValue.ParseLenient(mapJson);
-        if (v == null || !v.IsObject()) { return 0; }
-        JsonValue mo = v.Get(model);
-        if (mo == null || !mo.IsObject()) { return 0; }
-        return mo.Int(field, 0);
+        int result = 0;
+        JsonDoc.ParseScoped(mapJson, (JsonDoc v) => {
+            if (v.KindAt(0) != 5) { return; }
+            int mo = v.Get(0, model);
+            if (mo >= 0 && v.KindAt(mo) == 5) {
+                result = (int)v.Long(mo, field, 0L);
+            }
+        });
+        return result;
     }
 
     static string AiLimitStr(string mapJson, string model, string field) {
         int n = ZanIDE.AiLimitInt(mapJson, model, field);
         if (n <= 0) { return ""; }
-        return Convert.ToString(n);
+        return n.ToString();
     }
 
     static string AiLimitSet(string mapJson, string model, string field, string val) {
         if (model.IsNullOrEmpty()) { return mapJson; }
-        if (mapJson == null) { mapJson = ""; }
-        JsonValue v = JsonValue.ParseLenient(mapJson);
-        if (v == null || !v.IsObject()) { v = JsonValue.NewObject(); }
-        JsonValue mo = v.Get(model);
-        if (mo == null || !mo.IsObject()) {
-            mo = JsonValue.NewObject();
-            v.Set(model, mo);
-        }
         int n = ZanIDE.ParseIntSafe(val);
-        mo.Set(field, JsonValue.NewNum(Convert.ToString(n)));
-        return v.ToJson();
+        Dictionary<string, Dictionary<string, int>> dict = new Dictionary<string, Dictionary<string, int>>();
+        if (!mapJson.IsNullOrEmpty() && mapJson != "{}") {
+            JsonDoc.ParseScoped(mapJson, (JsonDoc v) => {
+                if (v.KindAt(0) != 5) { return; }
+                int cnt = v.Count(0);
+                for (int i = 0; i < cnt; i = i + 1) {
+                    string mod = v.KeyAt(0, i);
+                    int p = v.ValAt(0, i);
+                    if (v.KindAt(p) == 5) {
+                        Dictionary<string, int> sub = new Dictionary<string, int>();
+                        int fcnt = v.Count(p);
+                        for (int j = 0; j < fcnt; j = j + 1) {
+                            string fk = v.KeyAt(p, j);
+                            int fval = v.ValAt(p, j);
+                            sub[fk] = (int)v.LongAt(fval, 0L);
+                        }
+                        dict[mod] = sub;
+                    }
+                }
+            });
+        }
+        Dictionary<string, int> target = null;
+        if (!dict.TryGetValue(model, out target) || target == null) {
+            target = new Dictionary<string, int>();
+            dict[model] = target;
+        }
+        target[field] = n;
+        JsonWriter w = new JsonWriter();
+        w.StartObject();
+        List<string> models = dict.Keys;
+        for (int i = 0; i < models.Count; i = i + 1) {
+            string m = models[i];
+            w.WriteKey(m);
+            w.StartObject();
+            Dictionary<string, int> sub = dict[m];
+            List<string> fields = sub.Keys;
+            for (int j = 0; j < fields.Count; j = j + 1) {
+                w.WriteProperty(fields[j], sub[fields[j]]);
+            }
+            w.EndObject();
+        }
+        w.EndObject();
+        return w.ToJson();
     }
 
     static string AiRoleModel(string mapJson, string roleId) {
         if (mapJson.IsNullOrEmpty() || roleId.IsNullOrEmpty()) { return ""; }
-        JsonValue v = JsonValue.ParseLenient(mapJson);
-        if (v == null || !v.IsObject()) { return ""; }
-        return v.Str(roleId, "");
+        string result = "";
+        JsonDoc.ParseScoped(mapJson, (JsonDoc v) => {
+            if (v.KindAt(0) == 5) {
+                result = v.Str(0, roleId, "");
+            }
+        });
+        return result;
     }
 
     static string AiRoleModelSet(string mapJson, string roleId, string model) {
         if (roleId.IsNullOrEmpty()) { return mapJson; }
-        if (mapJson == null) { mapJson = ""; }
         if (model == null) { model = ""; }
-        JsonValue v = JsonValue.ParseLenient(mapJson);
-        if (v == null || !v.IsObject()) { v = JsonValue.NewObject(); }
-        v.Set(roleId, JsonValue.NewStr(model));
-        return v.ToJson();
+        Dictionary<string, string> dict = new Dictionary<string, string>();
+        if (!mapJson.IsNullOrEmpty() && mapJson != "{}") {
+            JsonDoc.ParseScoped(mapJson, (JsonDoc v) => {
+                if (v.KindAt(0) == 5) {
+                    int cnt = v.Count(0);
+                    for (int i = 0; i < cnt; i = i + 1) {
+                        string k = v.KeyAt(0, i);
+                        int valSlot = v.ValAt(0, i);
+                        dict[k] = v.StrAt(valSlot, "");
+                    }
+                }
+            });
+        }
+        dict[roleId] = model;
+        JsonWriter w = new JsonWriter();
+        w.StartObject();
+        List<string> keys = dict.Keys;
+        for (int i = 0; i < keys.Count; i = i + 1) {
+            w.WriteProperty(keys[i], dict[keys[i]]);
+        }
+        w.EndObject();
+        return w.ToJson();
     }
 
     static string AiRolePromptsPath() {
@@ -229,18 +294,15 @@ partial class ZanIDE {
 
     static string AiRolePromptsLoad() {
         if (!File.Exists(ZanIDE.AiRolePromptsPath())) { return "{}"; }
-        JsonValue v = JsonValue.ParseLenient(
-            File.ReadAllText(ZanIDE.AiRolePromptsPath()));
-        if (v == null || !v.IsObject()) { return "{}"; }
-        return v.ToJson();
+        string text = File.ReadAllText(ZanIDE.AiRolePromptsPath());
+        if (text.IsNullOrEmpty()) { return "{}"; }
+        return text;
     }
 
     static void AiRolePromptsSave(string mapJson) {
         if (mapJson.IsNullOrEmpty()) { mapJson = "{}"; }
-        JsonValue v = JsonValue.ParseLenient(mapJson);
-        if (v == null || !v.IsObject()) { v = JsonValue.NewObject(); }
         Directory.CreateDirectoryRecursive(ZanIDE.UserConfigDir());
-        File.WriteAllText(ZanIDE.AiRolePromptsPath(), v.ToJson());
+        File.WriteAllText(ZanIDE.AiRolePromptsPath(), mapJson);
     }
 
     // ---- 助手行为（ai_behavior.json）----
@@ -255,18 +317,25 @@ partial class ZanIDE {
     // 配置里的自动继续上限，-1 表示没配过。
     static int AiAutoContLoad() {
         if (!File.Exists(ZanIDE.AiBehaviorPath())) { return 0 - 1; }
-        JsonValue v = JsonValue.ParseLenient(
-            File.ReadAllText(ZanIDE.AiBehaviorPath()));
-        if (v == null || !v.IsObject()) { return 0 - 1; }
-        return v.Int("autoCont", 0 - 1);
+        string text = File.ReadAllText(ZanIDE.AiBehaviorPath());
+        if (text == "") { return 0 - 1; }
+        int result = 0 - 1;
+        JsonDoc.ParseScoped(text, (JsonDoc v) => {
+            if (v.KindAt(0) == 5) {
+                result = (int)v.Long(0, "autoCont", -1L);
+            }
+        });
+        return result;
     }
 
     static void AiAutoContSave(int configured) {
         if (configured < 0) { configured = 0 - 1; }
-        JsonValue root = JsonValue.NewObject();
-        root.Put("autoCont", JsonValue.NewNum(Convert.ToString(configured)));
+        JsonWriter w = new JsonWriter();
+        w.StartObject();
+        w.WriteProperty("autoCont", configured);
+        w.EndObject();
         Directory.CreateDirectoryRecursive(ZanIDE.UserConfigDir());
-        File.WriteAllText(ZanIDE.AiBehaviorPath(), root.ToJson());
+        File.WriteAllText(ZanIDE.AiBehaviorPath(), w.ToJson());
     }
 
     // 一个服务商在模型选择器里应当出现的模型：默认模型在最前，其后是
@@ -409,19 +478,23 @@ partial class ZanIDE {
         if (!File.Exists(ZanIDE.AiModelsRespPath())) { return ""; }
         string raw = File.ReadAllText(ZanIDE.AiModelsRespPath());
         if (raw == "") { return ""; }
-        JsonValue v = JsonValue.ParseLenient(raw);
-        if (v == null) { return ""; }
-        JsonValue data = v.Get("data");
         string outp = "";
-        if (data != null && data.IsArray()) {
-            for (int i = 0; i < data.Count(); i = i + 1) {
-                string id = data.At(i).Str("id", "");
-                if (id != "") {
-                    if (outp != "") { outp = outp + ";"; }
-                    outp = outp + id;
+        JsonDoc.ParseScoped(raw, (JsonDoc v) => {
+            if (v.KindAt(0) == 5) {
+                int dataNode = v.Get(0, "data");
+                if (dataNode >= 0 && v.KindAt(dataNode) == 4) {
+                    int p = v.FirstChild(dataNode);
+                    while (p >= 0) {
+                        string id = v.Str(p, "id", "");
+                        if (id != "") {
+                            if (outp != "") { outp = outp + ";"; }
+                            outp = outp + id;
+                        }
+                        p = v.NextSibling(p);
+                    }
                 }
             }
-        }
+        });
         return outp;
     }
 
@@ -662,14 +735,32 @@ partial class ZanIDE {
             return ZanIDE.T("[error] Empty response from the AI endpoint.",
                 "[错误] AI 服务返回为空。");
         }
-        JsonValue v = JsonValue.ParseLenient(raw);
-        JsonValue ch = v.Get("choices");
-        if (ch != null && ch.IsArray() && ch.Count() > 0) {
-            JsonValue msg = ch.At(0).Get("message");
-            if (msg != null) { return msg.Str("content", ""); }
-        }
-        JsonValue err = v.Get("error");
-        if (err != null) { return "[error] " + err.Str("message", raw); }
+        string content = "";
+        string errMsg = "";
+        bool foundContent = false;
+        bool foundErr = false;
+        JsonDoc.ParseScoped(raw, (JsonDoc v) => {
+            if (v.KindAt(0) == 5) {
+                int ch = v.Get(0, "choices");
+                if (ch >= 0 && v.KindAt(ch) == 4) {
+                    int first = v.FirstChild(ch);
+                    if (first >= 0) {
+                        int msg = v.Get(first, "message");
+                        if (msg >= 0) {
+                            content = v.Str(msg, "content", "");
+                            foundContent = true;
+                        }
+                    }
+                }
+                int err = v.Get(0, "error");
+                if (err >= 0) {
+                    errMsg = v.Str(err, "message", raw);
+                    foundErr = true;
+                }
+            }
+        });
+        if (foundContent) { return content; }
+        if (foundErr) { return "[error] " + errMsg; }
         if (raw.Length > 400) { raw = AiAgent.Clip(raw, 400) + "..."; }
         return "[error] " + raw;
     }

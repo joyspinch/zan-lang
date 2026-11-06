@@ -28,10 +28,20 @@ partial class AiAgent {
     static string PkgList(string root) {
         string pkgDir = root + "/.zan-packages";
         if (!Directory.Exists(pkgDir)) {
-            return "{\"installed\": [], \"count\": 0, \"tip\": \"No packages installed in this project (.zan-packages/ does not exist).\"}";
+            JsonWriter emptyW = new JsonWriter();
+            emptyW.StartObject();
+            emptyW.WriteKey("installed");
+            emptyW.StartArray();
+            emptyW.EndArray();
+            emptyW.WriteProperty("count", 0);
+            emptyW.WriteProperty("tip", "No packages installed in this project (.zan-packages/ does not exist).");
+            emptyW.EndObject();
+            return emptyW.ToJson();
         }
-        JsonValue o = JsonValue.NewObject();
-        JsonValue list = JsonValue.NewArray();
+        JsonWriter w = new JsonWriter();
+        w.StartObject();
+        w.WriteKey("installed");
+        w.StartArray();
         List<string> subdirs = Directory.GetDirectories(pkgDir);
         for (int i = 0; i < subdirs.Count; i = i + 1) {
             string name = subdirs[i];
@@ -40,54 +50,69 @@ partial class AiAgent {
             string ver = "1.0.0";
             string desc = "";
             if (File.Exists(manifestPath)) {
-                JsonValue parsed = JsonValue.ParseLenient(File.ReadAllText(manifestPath));
-                if (parsed != null) {
-                    ver = parsed.Str("version", "1.0.0");
-                    desc = parsed.Str("description", "");
-                }
+                JsonDoc.ParseScoped(File.ReadAllText(manifestPath), (JsonDoc doc) => {
+                    ver = doc.Str(0, "version", "1.0.0");
+                    desc = doc.Str(0, "description", "");
+                });
             }
-            JsonValue item = JsonValue.NewObject();
-            item.Put("name", JsonValue.NewStr(name));
-            item.Put("version", JsonValue.NewStr(ver));
-            item.Put("description", JsonValue.NewStr(desc));
-            item.Put("path", JsonValue.NewStr(".zan-packages/" + name));
-            list.Append(item);
+            w.StartObject();
+            w.WriteProperty("name", name);
+            w.WriteProperty("version", ver);
+            w.WriteProperty("description", desc);
+            w.WriteProperty("path", ".zan-packages/" + name);
+            w.EndObject();
         }
-        o.Put("installed", list);
-        o.Put("count", JsonValue.NewNum(Convert.ToString(list.Count())));
-        return o.ToJson();
+        w.EndArray();
+        w.WriteProperty("count", subdirs.Count);
+        w.EndObject();
+        return w.ToJson();
     }
 
     static string PkgSearch(string query) {
         string kdir = AiAgent.KnowledgeDir();
         string catalogPath = kdir + "/packages-catalog.json";
-        JsonValue o = JsonValue.NewObject();
-        JsonValue results = JsonValue.NewArray();
+        JsonWriter w = new JsonWriter();
+        w.StartObject();
+        w.WriteKey("packages");
+        w.StartArray();
+        int count = 0;
         if (File.Exists(catalogPath)) {
-            JsonValue root = JsonValue.ParseLenient(File.ReadAllText(catalogPath));
-            if (root != null && root.IsArray()) {
+            JsonDoc.ParseScoped(File.ReadAllText(catalogPath), (JsonDoc root) => {
+                if (root.KindAt(0) != 4) { return; }
                 string qLower = query.ToLower();
-                for (int i = 0; i < root.Count(); i = i + 1) {
-                    JsonValue p = root.At(i);
-                    string name = p.Str("name", "");
-                    string desc = p.Str("description", "");
-                    bool match = query == ""
-                        || ZanIDE.IndexOfStr(name.ToLower(), qLower) >= 0
-                        || ZanIDE.IndexOfStr(desc.ToLower(), qLower) >= 0;
-                    if (!match) {
-                        JsonValue nsArr = p.Get("namespaces");
-                        if (nsArr != null && nsArr.IsArray()) {
-                            for (int j = 0; j < nsArr.Count(); j = j + 1) {
-                                if (ZanIDE.IndexOfStr(nsArr.At(j).AsString("").ToLower(), qLower) >= 0) {
-                                    match = true;
-                                    break;
+                int p = root.FirstChild(0);
+                while (p >= 0) {
+                    if (root.KindAt(p) == 5) {
+                        string name = root.Str(p, "name", "");
+                        string desc = root.Str(p, "description", "");
+                        bool match = query == ""
+                            || ZanIDE.IndexOfStr(name.ToLower(), qLower) >= 0
+                            || ZanIDE.IndexOfStr(desc.ToLower(), qLower) >= 0;
+                        if (!match) {
+                            int nsArr = root.Get(p, "namespaces");
+                            if (nsArr >= 0 && root.KindAt(nsArr) == 4) {
+                                int it = root.FirstChild(nsArr);
+                                while (it >= 0) {
+                                    if (ZanIDE.IndexOfStr(root.StrAt(it, "").ToLower(), qLower) >= 0) {
+                                        match = true;
+                                        break;
+                                    }
+                                    it = root.NextSibling(it);
                                 }
                             }
                         }
+                        if (match) {
+                            w.StartObject();
+                            w.WriteProperty("name", name);
+                            w.WriteProperty("version", root.Str(p, "version", "1.0.0"));
+                            w.WriteProperty("description", desc);
+                            w.EndObject();
+                            count = count + 1;
+                        }
                     }
-                    if (match) { results.Append(p); }
+                    p = root.NextSibling(p);
                 }
-            }
+            });
         } else {
             string pkgsDir = AiAgent.PackagesDir();
             if (pkgsDir != "" && Directory.Exists(pkgsDir)) {
@@ -96,18 +121,20 @@ partial class AiAgent {
                 for (int i = 0; i < subs.Count; i = i + 1) {
                     string name = subs[i];
                     if (query == "" || ZanIDE.IndexOfStr(name.ToLower(), qLower) >= 0) {
-                        JsonValue p = JsonValue.NewObject();
-                        p.Put("name", JsonValue.NewStr(name));
-                        p.Put("version", JsonValue.NewStr("1.0.0"));
-                        p.Put("description", JsonValue.NewStr("Discovered in local packages/ cache"));
-                        results.Append(p);
+                        w.StartObject();
+                        w.WriteProperty("name", name);
+                        w.WriteProperty("version", "1.0.0");
+                        w.WriteProperty("description", "Discovered in local packages/ cache");
+                        w.EndObject();
+                        count = count + 1;
                     }
                 }
             }
         }
-        o.Put("packages", results);
-        o.Put("count", JsonValue.NewNum(Convert.ToString(results.Count())));
-        return o.ToJson();
+        w.EndArray();
+        w.WriteProperty("count", count);
+        w.EndObject();
+        return w.ToJson();
     }
 
     static void CopyDir(string src, string dest) {
@@ -135,12 +162,14 @@ partial class AiAgent {
         string dstPkg = root + "/.zan-packages/" + name;
         try {
             AiAgent.CopyDir(srcPkg, dstPkg);
-            JsonValue o = JsonValue.NewObject();
-            o.Put("ok", JsonValue.NewBool(true));
-            o.Put("package", JsonValue.NewStr(name));
-            o.Put("path", JsonValue.NewStr(".zan-packages/" + name));
-            o.Put("message", JsonValue.NewStr("Package installed into project successfully."));
-            return o.ToJson();
+            JsonWriter w = new JsonWriter();
+            w.StartObject();
+            w.WriteProperty("ok", true);
+            w.WriteProperty("package", name);
+            w.WriteProperty("path", ".zan-packages/" + name);
+            w.WriteProperty("message", "Package installed into project successfully.");
+            w.EndObject();
+            return w.ToJson();
         } catch (Exception e) {
             return "error: failed to install package " + name + ": " + e.Message;
         }
@@ -206,70 +235,87 @@ partial class AiAgent {
         if (!File.Exists(gp)) {
             return "error: knowledge/gallery.json is missing.";
         }
-        JsonValue man = JsonValue.ParseLenient(File.ReadAllText(gp));
-        if (man == null) {
-            return "error: knowledge/gallery.json is not valid JSON.";
-        }
-        JsonValue entries = man.Get("entries");
-        if (entries == null || !entries.IsArray()) {
-            return "error: knowledge/gallery.json has no 'entries' array.";
-        }
-        string want = AiAgent.Trim(topic);
-        if (want == "") {
-            StringBuilder sb = new StringBuilder();
-            sb.Append("example catalog -- call example {\"topic\":\"<one"
-                + " below>\"} to get the verbatim file(s):\n");
-            for (int i = 0; i < entries.Count(); i = i + 1) {
-                JsonValue e = entries.At(i);
-                sb.Append("- " + e.Str("topic", "") + "  [" + e.Str("kind", "")
-                    + "]  " + e.Str("summary", "") + "\n");
+        string result = "";
+        JsonDoc.ParseScoped(File.ReadAllText(gp), (JsonDoc man) => {
+            if (man.KindAt(0) != 5) {
+                result = "error: knowledge/gallery.json is not valid JSON.";
+                return;
             }
-            return sb.ToString();
-        }
-        JsonValue match = null;
-        for (int i = 0; i < entries.Count(); i = i + 1) {
-            if (entries.At(i).Str("topic", "") == want) {
-                match = entries.At(i);
-                break;
+            int entries = man.Get(0, "entries");
+            if (entries < 0 || man.KindAt(entries) != 4) {
+                result = "error: knowledge/gallery.json has no 'entries' array.";
+                return;
             }
-        }
-        if (match == null) {
-            string wLower = want.ToLower();
-            for (int i = 0; i < entries.Count(); i = i + 1) {
-                if (ZanIDE.IndexOfStr(entries.At(i).Str("topic", "").ToLower(), wLower) >= 0) {
-                    match = entries.At(i);
+            string want = AiAgent.Trim(topic);
+            if (want == "") {
+                StringBuilder sb = new StringBuilder();
+                sb.Append("example catalog -- call example {\"topic\":\"<one"
+                    + " below>\"} to get the verbatim file(s):\n");
+                int e = man.FirstChild(entries);
+                while (e >= 0) {
+                    if (man.KindAt(e) == 5) {
+                        sb.Append("- " + man.Str(e, "topic", "") + "  [" + man.Str(e, "kind", "")
+                            + "]  " + man.Str(e, "summary", "") + "\n");
+                    }
+                    e = man.NextSibling(e);
+                }
+                result = sb.ToString();
+                return;
+            }
+            int match = -1;
+            int cur = man.FirstChild(entries);
+            while (cur >= 0) {
+                if (man.KindAt(cur) == 5 && man.Str(cur, "topic", "") == want) {
+                    match = cur;
                     break;
                 }
+                cur = man.NextSibling(cur);
             }
-        }
-        if (match == null) {
-            return "error: no example for topic '" + topic + "'. Call example"
-                + " with no topic to list the catalog.";
-        }
-        string kind = match.Str("kind", "");
-        StringBuilder sb = new StringBuilder();
-        sb.Append("example topic \"" + match.Str("topic", "") + "\" [" + kind
-            + "]: " + match.Str("summary", "") + "\n");
-        string bld = match.Str("build", "");
-        if (bld != "") { sb.Append("build: " + bld + "\n"); }
-        JsonValue models = man.Get("models");
-        if (models != null && models.Has(kind)) {
-            sb.Append("model: " + models.Str(kind, "") + "\n");
-        }
-        JsonValue files = match.Get("files");
-        if (files != null && files.IsArray()) {
-            for (int i = 0; i < files.Count(); i = i + 1) {
-                string rel = files.At(i).AsString("");
-                sb.Append("\n===== " + rel + " =====\n");
-                string full = AiAgent.ShippedFile(rel);
-                if (full == "") {
-                    sb.Append("(file missing next to the IDE)\n");
-                } else {
-                    sb.Append(File.ReadAllText(full));
-                    sb.Append("\n");
+            if (match < 0) {
+                string wLower = want.ToLower();
+                cur = man.FirstChild(entries);
+                while (cur >= 0) {
+                    if (man.KindAt(cur) == 5 && ZanIDE.IndexOfStr(man.Str(cur, "topic", "").ToLower(), wLower) >= 0) {
+                        match = cur;
+                        break;
+                    }
+                    cur = man.NextSibling(cur);
                 }
             }
-        }
-        return sb.ToString();
+            if (match < 0) {
+                result = "error: no example for topic '" + topic + "'. Call example"
+                    + " with no topic to list the catalog.";
+                return;
+            }
+            string kind = man.Str(match, "kind", "");
+            StringBuilder sbMatch = new StringBuilder();
+            sbMatch.Append("example topic \"" + man.Str(match, "topic", "") + "\" [" + kind
+                + "]: " + man.Str(match, "summary", "") + "\n");
+            string bld = man.Str(match, "build", "");
+            if (bld != "") { sbMatch.Append("build: " + bld + "\n"); }
+            int models = man.Get(0, "models");
+            if (models >= 0 && man.KindAt(models) == 5) {
+                string mod = man.Str(models, kind, "");
+                if (mod != "") { sbMatch.Append("model: " + mod + "\n"); }
+            }
+            int files = man.Get(match, "files");
+            if (files >= 0 && man.KindAt(files) == 4) {
+                int f = man.FirstChild(files);
+                while (f >= 0) {
+                    string rel = man.StrAt(f, "");
+                    sbMatch.Append("\n===== " + rel + " =====\n");
+                    string full = AiAgent.ShippedFile(rel);
+                    if (full == "") {
+                        sbMatch.Append("(file missing next to the IDE)\n");
+                    } else {
+                        sbMatch.Append(File.ReadAllText(full));
+                        sbMatch.Append("\n");
+                    }
+                    f = man.NextSibling(f);
+                }
+            }
+            result = sbMatch.ToString();
+        });
+        return result;
     }
 }

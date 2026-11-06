@@ -539,11 +539,15 @@ partial class LspSession {
         d.alive = true;
 
         d.waitBudget = 240;
-        LspInitParams init = new LspInitParams();
-        init.processId = JsonValue.NewNull();
-        init.rootUri = LspSession.PathToUri(root);
-        init.capabilities = JsonValue.NewObject();
-        string m = d.RequestWait("initialize", Json.Serialize<LspInitParams>(init));
+        JsonWriter iw = new JsonWriter();
+        iw.StartObject();
+        iw.WriteNullProperty("processId");
+        iw.WriteProperty("rootUri", LspSession.PathToUri(root));
+        iw.WriteKey("capabilities");
+        iw.StartObject();
+        iw.EndObject();
+        iw.EndObject();
+        string m = d.RequestWait("initialize", iw.ToJson());
         if (m.Length == 0) {
             // 连上了但 initialize 没回：服务起来了却不按协议应答
             // （版本不匹配、端口上蹲着别的服务）。这是"握手超时"，
@@ -731,12 +735,11 @@ partial class LspSession {
         for (int i = 0; i < r.result.Count; i = i + 1) {
             if (r.result[i].uri.Length == 0) { continue; }
             int ln = 0;
-            if (r.result[i].range != null) {
-                JsonValue start = r.result[i].range.Get("start");
-                if (start != null) { ln = start.Int("line", 0); }
+            if (r.result[i].range != null && r.result[i].range.start != null) {
+                ln = r.result[i].range.start.line;
             }
             outp.Add(LspSession.UriToPath(r.result[i].uri) + "\t"
-                + Convert.ToString(ln));
+                + ln.ToString());
         }
         return outp;
     }
@@ -768,11 +771,22 @@ partial class LspSession {
         string m = this.RequestWait("textDocument/hover",
             this.DocPosParams(path, line0, col0));
         if (m.Length == 0 || this.DocVersion(path) != version) { return ""; }
-        LspHoverResult r = Json.Deserialize<LspHoverResult>(m);
-        if (r == null || r.result == null) { return ""; }
-        JsonValue contents = r.result.Get("contents");
-        if (contents == null) { return ""; }
-        return LspSession.MarkupText(contents);
+        string result = "";
+        try {
+            JsonDoc.ParseScoped(m, doc => {
+                int root = doc.root;
+                if (doc.KindAt(root) != 5) { return; }
+                int res = doc.Get(root, "result");
+                if (res < 0 || doc.KindAt(res) != 5) { return; }
+                int contents = doc.Get(res, "contents");
+                if (contents >= 0) {
+                    result = LspSession.ExtractMarkupText(doc, contents);
+                }
+            });
+        } catch (Exception) {
+            return "";
+        }
+        return result;
     }
 
     List<LspCompletionItem> Completion(string path, int line0, int col0) {
@@ -782,14 +796,58 @@ partial class LspSession {
         string m = this.RequestWait("textDocument/completion",
             this.DocPosParams(path, line0, col0));
         if (m.Length == 0 || this.DocVersion(path) != version) { return empty; }
-        JsonValue root = JsonValue.ParseLenient(m);
-        JsonValue result = root != null ? root.Get("result") : null;
-        if (result == null) { return empty; }
-        if (result.IsObject()) { result = result.Get("items"); }
-        if (result == null || !result.IsArray()) { return empty; }
-        for (int i = 0; i < result.Count(); i = i + 1) {
-            LspCompletionItem item = Json.Deserialize<LspCompletionItem>(result.At(i).ToJson());
-            if (item != null) { empty.Add(item); }
+        try {
+            JsonDoc.ParseScoped(m, doc => {
+                int root = doc.root;
+                if (doc.KindAt(root) != 5) { return; }
+                int result = doc.Get(root, "result");
+                if (result < 0) { return; }
+                if (doc.KindAt(result) == 5) { result = doc.Get(result, "items"); }
+                if (result < 0 || doc.KindAt(result) != 4) { return; }
+                int it = doc.FirstChild(result);
+                while (it >= 0) {
+                    if (doc.KindAt(it) == 5) {
+                        LspCompletionItem item = new LspCompletionItem();
+                        item.label = doc.Str(it, "label", "");
+                        item.kind = (int)doc.Long(it, "kind", 0L);
+                        item.detail = doc.Str(it, "detail", "");
+                        item.insertText = doc.Str(it, "insertText", "");
+                        item.insertTextFormat = (int)doc.Long(it, "insertTextFormat", 1L);
+                        item.sortText = doc.Str(it, "sortText", "");
+                        int docNode = doc.Get(it, "documentation");
+                        if (docNode >= 0) {
+                            item.documentation = LspSession.ExtractMarkupText(doc, docNode);
+                        }
+                        int teNode = doc.Get(it, "textEdit");
+                        if (teNode >= 0 && doc.KindAt(teNode) == 5) {
+                            LspTextEdit te = new LspTextEdit();
+                            te.newText = doc.Str(teNode, "newText", "");
+                            int rNode = doc.Get(teNode, "range");
+                            if (rNode < 0) { rNode = doc.Get(teNode, "replace"); }
+                            if (rNode >= 0 && doc.KindAt(rNode) == 5) {
+                                te.range = new LspRange();
+                                int sNode = doc.Get(rNode, "start");
+                                if (sNode >= 0 && doc.KindAt(sNode) == 5) {
+                                    te.range.start = new LspPosition();
+                                    te.range.start.line = (int)doc.Long(sNode, "line", 0L);
+                                    te.range.start.character = (int)doc.Long(sNode, "character", 0L);
+                                }
+                                int eNode = doc.Get(rNode, "end");
+                                if (eNode >= 0 && doc.KindAt(eNode) == 5) {
+                                    te.range.end = new LspPosition();
+                                    te.range.end.line = (int)doc.Long(eNode, "line", 0L);
+                                    te.range.end.character = (int)doc.Long(eNode, "character", 0L);
+                                }
+                            }
+                            item.textEdit = te;
+                        }
+                        empty.Add(item);
+                    }
+                    it = doc.NextSibling(it);
+                }
+            });
+        } catch (Exception) {
+            return empty;
         }
         return empty;
     }
@@ -808,9 +866,11 @@ partial class LspSession {
     List<LspWorkspaceSymbol> WorkspaceSymbols(string query) {
         if (background) { throw new Exception("Use WorkspaceSymbolsAsync on the UI LSP facade."); }
         List<LspWorkspaceSymbol> outp = new List<LspWorkspaceSymbol>();
-        JsonValue p = JsonValue.NewObject();
-        p.PutStr("query", query != null ? query : "");
-        string m = this.RequestWait("workspace/symbol", p.ToJson());
+        JsonWriter w = new JsonWriter();
+        w.StartObject();
+        w.WriteProperty("query", query != null ? query : "");
+        w.EndObject();
+        string m = this.RequestWait("workspace/symbol", w.ToJson());
         if (m.Length == 0) { return outp; }
         return LspSession.ParseWorkspaceSymbols(m);
     }
@@ -818,16 +878,33 @@ partial class LspSession {
     List<LspCodeAction> CodeActions(string path, int line0, int col0) {
         if (background) { throw new Exception("Use CodeActionsAsync on the UI LSP facade."); }
         List<LspCodeAction> outp = new List<LspCodeAction>();
-        JsonValue p = JsonValue.NewObject();
-        p.Put("textDocument", LspSession.UriObj(path).ToJson());
-        JsonValue range = JsonValue.NewObject();
-        range.Put("start", LspSession.PosObj(line0, col0).ToJson());
-        range.Put("end", LspSession.PosObj(line0, col0).ToJson());
-        p.Put("range", range);
-        JsonValue ctx = JsonValue.NewObject();
-        ctx.Put("diagnostics", JsonValue.NewArray());
-        p.Put("context", ctx);
-        string m = this.RequestWait("textDocument/codeAction", p.ToJson());
+        JsonWriter w = new JsonWriter();
+        w.StartObject();
+        w.WriteKey("textDocument");
+        w.StartObject();
+        w.WriteProperty("uri", LspSession.PathToUri(path));
+        w.EndObject();
+        w.WriteKey("range");
+        w.StartObject();
+        w.WriteKey("start");
+        w.StartObject();
+        w.WriteProperty("line", line0);
+        w.WriteProperty("character", col0);
+        w.EndObject();
+        w.WriteKey("end");
+        w.StartObject();
+        w.WriteProperty("line", line0);
+        w.WriteProperty("character", col0);
+        w.EndObject();
+        w.EndObject();
+        w.WriteKey("context");
+        w.StartObject();
+        w.WriteKey("diagnostics");
+        w.StartArray();
+        w.EndArray();
+        w.EndObject();
+        w.EndObject();
+        string m = this.RequestWait("textDocument/codeAction", w.ToJson());
         if (m.Length == 0) { return outp; }
         return LspSession.ParseCodeActions(m);
     }
@@ -840,16 +917,23 @@ partial class LspSession {
         string m = this.RequestWait("textDocument/foldingRange",
             Json.Serialize<LspDocParams>(p));
         if (m.Length == 0) { return outp; }
-        JsonValue root = null;
-        try { root = JsonValue.ParseLenient(m); } catch (Exception) { root = null; }
-        JsonValue arr = root != null ? root.Get("result") : null;
-        if (arr == null || !arr.IsArray()) { return outp; }
-        for (int i = 0; i < arr.Count(); i = i + 1) {
-            JsonValue fr = arr.At(i);
-            if (fr == null) { continue; }
-            outp.Add(Convert.ToString(fr.Int("startLine", 0)) + "\t"
-                + Convert.ToString(fr.Int("endLine", 0)));
-        }
+        try {
+            JsonDoc.ParseScoped(m, doc => {
+                int root = doc.root;
+                if (doc.KindAt(root) != 5) { return; }
+                int arr = doc.Get(root, "result");
+                if (arr < 0 || doc.KindAt(arr) != 4) { return; }
+                int fr = doc.FirstChild(arr);
+                while (fr >= 0) {
+                    if (doc.KindAt(fr) == 5) {
+                        int sl = (int)doc.Long(fr, "startLine", 0L);
+                        int el = (int)doc.Long(fr, "endLine", 0L);
+                        outp.Add(sl.ToString() + "\t" + el.ToString());
+                    }
+                    fr = doc.NextSibling(fr);
+                }
+            });
+        } catch (Exception) {}
         return outp;
     }
 }

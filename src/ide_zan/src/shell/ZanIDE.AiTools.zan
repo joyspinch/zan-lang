@@ -259,11 +259,12 @@ partial class ZanIDE {
                 return;
             }
             if (tool == "ui_check" || tool == "ui_tree" || tool == "ui_snapshot") {
-                // 驱动脚本由构建作业的工作线程按快照落盘（input.aiUiScript）；
-                // 这里只清掉上一轮的结果文件，防止 ui 通道读到旧结论。
-                JsonValue uv = JsonValue.ParseLenient(call);
                 string script = "";
-                if (uv != null) { script = uv.Str("script", ""); }
+                JsonDoc.ParseScoped(call, (JsonDoc uv) => {
+                    if (uv.KindAt(0) == 5) {
+                        script = uv.Str(0, "script", "");
+                    }
+                });
                 aiUiTool = tool;
                 aiUiScript = AiAgent.NormalizeUiScript(script,
                     tool == "ui_tree" || tool == "ui_snapshot");
@@ -357,14 +358,19 @@ partial class ZanIDE {
     // 字节都拿不到。已经被某次读覆盖住的区间返回 true（该拒），否则记下这次
     // 的覆盖范围并返回 false（该读）。
     bool AiSeenRead(string call) {
-        JsonValue v = JsonValue.ParseLenient(call);
-        if (v == null) { return false; }
-        string path = v.Str("path", "");
+        if (call == null || call.Length == 0) { return false; }
+        string path = "";
+        int from = 1;
+        int limit = 0;
+        JsonDoc.ParseScoped(call, (JsonDoc v) => {
+            if (v.KindAt(0) == 5) {
+                path = v.Str(0, "path", "");
+                from = (int)v.Long(0, "offset", 1L);
+                limit = (int)v.Long(0, "limit", 0L);
+            }
+        });
         if (path == "") { return false; }
-        int from = v.Int("offset", 1);
         if (from < 1) { from = 1; }
-        int limit = v.Int("limit", 0);
-        // limit 省了 / <=0 就是「整个文件」：用一个比任何文件都大的行号收尾。
         int to = ZanIDE.AiWholeFileTo();
         if (limit > 0) { to = from + limit - 1; }
         if (aiReadSpans == null) {
@@ -379,15 +385,16 @@ partial class ZanIDE {
         return false;
     }
 
-    // 这次 read_file 读的就是用户正打开的那个文件，而它的完整正文已经作为
-    // 一条 note 钉在对话里（见 `AiAgent.PinNotes`）。正文被截断过就不算：那
-    // 时文件比钉进去的那一段长，后面的行确实还没给过，读是应该的。
     bool AiPinnedRead(string call) {
         if (aiRunCtxName == "") { return false; }
         if (aiRunCtxCode.Length > AiAgent.MaxPinChars()) { return false; }
-        JsonValue v = JsonValue.ParseLenient(call);
-        if (v == null) { return false; }
-        string p = v.Str("path", "").Replace("\\", "/");
+        if (call == null || call.Length == 0) { return false; }
+        string p = "";
+        JsonDoc.ParseScoped(call, (JsonDoc v) => {
+            if (v.KindAt(0) == 5) {
+                p = v.Str(0, "path", "").Replace("\\", "/");
+            }
+        });
         return p != "" && p == aiRunCtxName.Replace("\\", "/");
     }
 
@@ -444,9 +451,14 @@ partial class ZanIDE {
     // 写工具的目标路径；不是写工具就是空串。
     static string AiWritePath(string tool, string call) {
         if (tool != "write_file" && tool != "edit_file") { return ""; }
-        JsonValue v = JsonValue.ParseLenient(call);
-        if (v == null) { return ""; }
-        return v.Str("path", "");
+        if (call == null || call.Length == 0) { return ""; }
+        string path = "";
+        JsonDoc.ParseScoped(call, (JsonDoc v) => {
+            if (v.KindAt(0) == 5) {
+                path = v.Str(0, "path", "");
+            }
+        });
+        return path;
     }
 
     // 能不能给这个路径量行数。大文件不量：为一个数字把上兆的文件读两遍不值，

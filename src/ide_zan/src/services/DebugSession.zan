@@ -194,9 +194,18 @@ public class DebugSession {
         this.Request("evaluate", Json.Serialize<DapEvaluateArgs>(args));
         string m = this.AwaitResponseMsg("evaluate");
         if (m.Length == 0) { return "<error>"; }
-        DapEvalResponse r = Json.Deserialize<DapEvalResponse>(m);
-        if (r == null || !r.success || r.body == null) { return "<error>"; }
-        return r.body.Str("result", "");
+        try {
+            return JsonDoc.ParseScoped<string>(m, doc => {
+                int root = doc.root;
+                if (doc.KindAt(root) != 5) { return "<error>"; }
+                if (!doc.Bool(root, "success", false)) { return "<error>"; }
+                int body = doc.Get(root, "body");
+                if (body < 0 || doc.KindAt(body) != 5) { return "<error>"; }
+                return doc.Str(body, "result", "<error>");
+            });
+        } catch (Exception) {
+            return "<error>";
+        }
     }
 
     void Resume(string cmd) {
@@ -221,13 +230,9 @@ public class DebugSession {
             if (this.alive) {
                 DapDisconnectArgs args = new DapDisconnectArgs();
                 args.terminateDebuggee = true;
-                DapRequest request = new DapRequest();
-                request.seq = this.seq;
-                request.type = "request";
-                request.command = "disconnect";
-                request.arguments = JsonValue.ParseLenient(Json.Serialize<DapDisconnectArgs>(args));
-                string body = Json.Serialize<DapRequest>(request);
-                string message = "Content-Length: " + Convert.ToString(strlen(body)) + "\r\n\r\n" + body;
+                string argsJson = Json.Serialize<DapDisconnectArgs>(args);
+                string body = "{\"seq\":" + this.seq.ToString() + ",\"type\":\"request\",\"command\":\"disconnect\",\"arguments\":" + argsJson + "}";
+                string message = "Content-Length: " + strlen(body).ToString() + "\r\n\r\n" + body;
                 long sent = Socket.ReactorSend(this.sock, message, strlen(message), 0);
             }
             Socket.ReactorCloseNotify(this.sock);
@@ -254,21 +259,19 @@ public class DebugSession {
     }
 
     void SendMsg(string body) {
-        string msg = "Content-Length: " + Convert.ToString(strlen(body))
+        string msg = "Content-Length: " + strlen(body).ToString()
             + "\r\n\r\n" + body;
         this.SendAll(msg);
     }
 
     void Request(string cmd, string argsJson) {
-        DapRequest o = new DapRequest();
-        o.seq = this.seq;
-        o.type = "request";
-        o.command = cmd;
+        string argsPart = "";
         if (argsJson.Length > 0) {
-            o.arguments = JsonValue.ParseLenient(argsJson);
+            argsPart = ",\"arguments\":" + argsJson;
         }
+        string body = "{\"seq\":" + this.seq.ToString() + ",\"type\":\"request\",\"command\":\"" + cmd + "\"" + argsPart + "}";
         this.seq = this.seq + 1;
-        this.SendMsg(Json.Serialize<DapRequest>(o));
+        this.SendMsg(body);
     }
 
     string RecvChunk() {
@@ -308,31 +311,47 @@ public class DebugSession {
 
 
     void Aside(string m) {
-        DapEvent ev = Json.Deserialize<DapEvent>(m);
-        if (ev == null) { return; }
-        if (ev.event == "output") {
-            string txt = "";
-            if (ev.body != null) { txt = ev.body.Str("output", ""); }
-            if (txt.Length > 0) { this.console.Add(DebugSession.RTrimNl(txt)); }
-        } else if (ev.event == "exited") {
-            int ec = 0;
-            if (ev.body != null) { ec = ev.body.Int("exitCode", 0); }
-            this.exitCode = ec;
-            this.alive = false;
-            this.paused = false;
-        } else if (ev.event == "terminated") {
-            this.alive = false;
-            this.paused = false;
+        if (m == null || m.Length == 0) { return; }
+        try {
+            JsonDoc.ParseScoped(m, doc => {
+                int root = doc.root;
+                if (doc.KindAt(root) != 5) { return; }
+                string ev = doc.Str(root, "event", "");
+                int body = doc.Get(root, "body");
+                if (ev == "output") {
+                    string txt = "";
+                    if (body >= 0 && doc.KindAt(body) == 5) { txt = doc.Str(body, "output", ""); }
+                    if (txt.Length > 0) { this.console.Add(DebugSession.RTrimNl(txt)); }
+                } else if (ev == "exited") {
+                    int ec = 0;
+                    if (body >= 0 && doc.KindAt(body) == 5) { ec = (int)doc.Long(body, "exitCode", 0L); }
+                    this.exitCode = ec;
+                    this.alive = false;
+                    this.paused = false;
+                } else if (ev == "terminated") {
+                    this.alive = false;
+                    this.paused = false;
+                }
+            });
+        } catch (Exception) {
         }
     }
 
     // `value`（树解析取值，杜绝引号子串匹配——值里含引号或字段名
     // 是别的键的子串时，子串匹配会误判）。
+    // 基于 JsonDoc.ParseScoped 瞬时零分配提取，杜绝消息泵每秒产生海量 JsonValue 垃圾。
     static bool FieldIs(string m, string key, string value) {
-        JsonValue v = null;
-        try { v = JsonValue.ParseLenient(m); } catch (Exception) { v = null; }
-        if (v == null || !v.IsObject()) { return false; }
-        return v.Str(key, "") == value;
+        if (m == null || m.Length == 0) { return false; }
+        try {
+            return JsonDoc.ParseScoped<bool>(m, doc => {
+                if (doc.KindAt(doc.root) != 5) { return false; }
+                int slot = doc.Get(doc.root, key);
+                if (slot < 0) { return false; }
+                return doc.StrAt(slot, "") == value;
+            });
+        } catch (Exception) {
+            return false;
+        }
     }
 
     string AwaitResponseMsg(string cmd) {

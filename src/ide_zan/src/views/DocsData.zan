@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Json;
 using Gui;
@@ -51,57 +52,68 @@ public class DocsData {
             DocsData.loadError = "docs/topics.json not found";
             return DocsData.cache;
         }
-        JsonValue doc = JsonValue.ParseLenient(text);
-        if (doc == null || !doc.IsObject()) {
-            DocsData.loadError = "docs/topics.json is not valid JSON";
-            return DocsData.cache;
-        }
-        DocsData.ParseSections(doc.Get("sections"));
-        DocsData.ParseCategories(doc.Get("categories"));
-        DocsData.ParseTopics(doc.Get("topics"));
+        JsonDoc.ParseScoped(text, (JsonDoc doc) => {
+            if (doc.KindAt(0) != 5) {
+                DocsData.loadError = "docs/topics.json is not valid JSON";
+                return;
+            }
+            DocsData.ParseSections(doc, doc.Get(0, "sections"));
+            DocsData.ParseCategories(doc, doc.Get(0, "categories"));
+            DocsData.ParseTopics(doc, doc.Get(0, "topics"));
+        });
         return DocsData.cache;
     }
 
-    static void ParseSections(JsonValue arr) {
-        if (arr == null || !arr.IsArray()) { return; }
-        for (int i = 0; i < arr.Count(); i = i + 1) {
-            JsonValue s = arr.At(i);
-            DocSectionDef def = new DocSectionDef();
-            def.en = s.Str("en", "");
-            def.zh = s.Str("zh", def.en);
-            def.cats = new List<string>();
-            JsonValue cats = s.Get("cats");
-            if (cats != null && cats.IsArray()) {
-                for (int c = 0; c < cats.Count(); c = c + 1) {
-                    def.cats.Add(cats.At(c).AsString(""));
+    static void ParseSections(JsonDoc doc, int arr) {
+        if (arr < 0 || doc.KindAt(arr) != 4) { return; }
+        int s = doc.FirstChild(arr);
+        while (s >= 0) {
+            if (doc.KindAt(s) == 5) {
+                DocSectionDef def = new DocSectionDef();
+                def.en = doc.Str(s, "en", "");
+                def.zh = doc.Str(s, "zh", def.en);
+                def.cats = new List<string>();
+                int cats = doc.Get(s, "cats");
+                if (cats >= 0 && doc.KindAt(cats) == 4) {
+                    int c = doc.FirstChild(cats);
+                    while (c >= 0) {
+                        def.cats.Add(doc.StrAt(c, ""));
+                        c = doc.NextSibling(c);
+                    }
                 }
+                DocsData.sections.Add(def);
             }
-            DocsData.sections.Add(def);
+            s = doc.NextSibling(s);
         }
     }
 
-    static void ParseCategories(JsonValue arr) {
-        if (arr == null || !arr.IsArray()) { return; }
-        for (int i = 0; i < arr.Count(); i = i + 1) {
-            JsonValue c = arr.At(i);
-            DocCategoryDef def = new DocCategoryDef();
-            def.en = c.Str("en", "");
-            def.imports = DocsData.Strings(c.Get("imports"));
-            DocsData.categories.Add(def);
+    static void ParseCategories(JsonDoc doc, int arr) {
+        if (arr < 0 || doc.KindAt(arr) != 4) { return; }
+        int c = doc.FirstChild(arr);
+        while (c >= 0) {
+            if (doc.KindAt(c) == 5) {
+                DocCategoryDef def = new DocCategoryDef();
+                def.en = doc.Str(c, "en", "");
+                def.imports = DocsData.Strings(doc, doc.Get(c, "imports"));
+                DocsData.categories.Add(def);
+            }
+            c = doc.NextSibling(c);
         }
     }
 
-    static List<string> Strings(JsonValue arr) {
-        if (arr == null || !arr.IsArray()) { return null; }
+    static List<string> Strings(JsonDoc doc, int arr) {
+        if (arr < 0 || doc.KindAt(arr) != 4) { return null; }
         List<string> lines = new List<string>();
-        for (int i = 0; i < arr.Count(); i = i + 1) {
-            lines.Add(arr.At(i).AsString(""));
+        int it = doc.FirstChild(arr);
+        while (it >= 0) {
+            lines.Add(doc.StrAt(it, ""));
+            it = doc.NextSibling(it);
         }
         return lines;
     }
 
-    static List<string> ImportsFor(JsonValue topic, string catEn) {
-        List<string> own = DocsData.Strings(topic.Get("imports"));
+    static List<string> ImportsFor(JsonDoc doc, int topic, string catEn) {
+        List<string> own = DocsData.Strings(doc, doc.Get(topic, "imports"));
         if (own != null) { return own; }
         for (int i = 0; i < DocsData.categories.Count; i = i + 1) {
             if (DocsData.categories[i].en == catEn) {
@@ -111,25 +123,28 @@ public class DocsData {
         return null;
     }
 
-    static void ParseTopics(JsonValue arr) {
-        if (arr == null || !arr.IsArray()) { return; }
-        for (int i = 0; i < arr.Count(); i = i + 1) {
-            JsonValue t = arr.At(i);
-            string catEn = DocsData.Text(t, "cat", "en");
-            DocsData.cache.Add(DocEntry.Of(
-                catEn, DocsData.Text(t, "cat", "zh"),
-                DocsData.Text(t, "title", "en"), DocsData.Text(t, "title", "zh"),
-                DocsData.Text(t, "body", "en"), DocsData.Text(t, "body", "zh"),
-                t.Str("code", ""), DocsData.ImportsFor(t, catEn),
-                t.Str("preview", "")));
+    static void ParseTopics(JsonDoc doc, int arr) {
+        if (arr < 0 || doc.KindAt(arr) != 4) { return; }
+        int t = doc.FirstChild(arr);
+        while (t >= 0) {
+            if (doc.KindAt(t) == 5) {
+                string catEn = DocsData.Text(doc, t, "cat", "en");
+                DocsData.cache.Add(DocEntry.Of(
+                    catEn, DocsData.Text(doc, t, "cat", "zh"),
+                    DocsData.Text(doc, t, "title", "en"), DocsData.Text(doc, t, "title", "zh"),
+                    DocsData.Text(doc, t, "body", "en"), DocsData.Text(doc, t, "body", "zh"),
+                    doc.Str(t, "code", ""), DocsData.ImportsFor(doc, t, catEn),
+                    doc.Str(t, "preview", "")));
+            }
+            t = doc.NextSibling(t);
         }
     }
 
-    static string Text(JsonValue topic, string field, string lang) {
-        JsonValue pair = topic.Get(field);
-        if (pair == null) { return ""; }
-        string value = pair.Str(lang, "");
-        if (value == "") { value = pair.Str("en", ""); }
+    static string Text(JsonDoc doc, int topic, string field, string lang) {
+        int pair = doc.Get(topic, field);
+        if (pair < 0) { return ""; }
+        string value = doc.Str(pair, lang, "");
+        if (value == "") { value = doc.Str(pair, "en", ""); }
         return value;
     }
 
