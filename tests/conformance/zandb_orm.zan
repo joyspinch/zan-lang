@@ -188,6 +188,41 @@ class ZanDbOrmTest {
         byte[] underflowBlob = repoReopen.Table.ReadBlobBytesLocked(10L, 10);
         Ok(underflowBlob != null && underflowBlob.Length == 0, "RecordTable rejects blob offset within header");
 
+        // 17. 索引空键物理回收验证（UnindexRowLocked 幽灵键清理）
+        string deptCol = repo.Table.indexes.ContainsKey("Dept") ? "Dept" : "dept";
+        Ok(!repo.Table.indexes[deptCol].ContainsKey("tech"), "UnindexRowLocked cleaned up empty key 'tech' from index dictionary");
+        bool techInSorted = false;
+        List<string> sortedDeptKeys = repo.Table.indexKeysSorted[deptCol];
+        for (int i = 0; i < sortedDeptKeys.Count; i = i + 1) {
+            if (sortedDeptKeys[i] == "tech") { techInSorted = true; }
+        }
+        Ok(!techInSorted, "UnindexRowLocked cleaned up empty key 'tech' from indexKeysSorted");
+
+        // 18. Int64 与 Float64 数值序编码单调性验证
+        long v1 = -500L; long v2 = 5L; long v3 = 100L;
+        string k1 = RecordTable.FormatInt64Key(v1);
+        string k2 = RecordTable.FormatInt64Key(v2);
+        string k3 = RecordTable.FormatInt64Key(v3);
+        Ok(String.CompareOrdinal(k1, k2) < 0 && String.CompareOrdinal(k2, k3) < 0, "FormatInt64Key maintains strict numerical order for negative, small and large values");
+
+        double f1 = -100.5; double f2 = 0.0; double f3 = 50.25; double f4 = 1000.0;
+        string kf1 = RecordTable.FormatFloat64Key(f1);
+        string kf2 = RecordTable.FormatFloat64Key(f2);
+        string kf3 = RecordTable.FormatFloat64Key(f3);
+        string kf4 = RecordTable.FormatFloat64Key(f4);
+        Ok(String.CompareOrdinal(kf1, kf2) < 0 && String.CompareOrdinal(kf2, kf3) < 0 && String.CompareOrdinal(kf3, kf4) < 0, "FormatFloat64Key maintains strict IEEE 754 order across negative, zero and positive");
+
+        // 19. Float64 字段建立二级索引与范围检索验证
+        repoReopen.EnsureIndex("Salary");
+        Ok(repoReopen.Table.HasIndex("salary"), "EnsureIndex created secondary index on Float64 column Salary");
+        List<OrmStaff> salRange = repoReopen.Where((ExprNode x) => x.Salary >= 5000.0 && x.Salary <= 7500.0).ToList();
+        Ok(salRange.Count > 0, "Float64 index range query returns matching entities");
+        bool allSalMatch = true;
+        for (int i = 0; i < salRange.Count; i = i + 1) {
+            if (salRange[i].Salary < 5000.0 || salRange[i].Salary > 7500.0) { allSalMatch = false; }
+        }
+        Ok(allSalMatch, "All entities returned by Float64 index strictly match salary range [5000.0, 7500.0]");
+
         Clean(basePath);
         Console.WriteLine("ALL " + Convert.ToString(checks) + " CHECKS PASSED");
     }

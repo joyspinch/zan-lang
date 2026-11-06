@@ -1021,6 +1021,10 @@ public class RecordTable {
                 replayedAny = true;
             } else if (op == OP_DELETE) {
                 int id = (int)payload.ReadU32();
+                RecordRow oldRow = this.GetLocked(id);
+                if (oldRow != null) {
+                    this.UnindexRowLocked(oldRow);
+                }
                 this.tombstones[id] = true;
                 long tabOff = this.dataOffset + (long)(id - 1) * (long)rbytes;
                 byte[] zeroFlag = new byte[1];
@@ -1048,6 +1052,10 @@ public class RecordTable {
                         RecordRow r = new RecordRow(this.schema, rdata, id, true, this);
                         this.IndexRowLocked(r);
                     } else if (subOp == OP_DELETE) {
+                        RecordRow oldRow = this.GetLocked(id);
+                        if (oldRow != null) {
+                            this.UnindexRowLocked(oldRow);
+                        }
                         this.tombstones[id] = true;
                         long tabOff = this.dataOffset + (long)(id - 1) * (long)rbytes;
                         byte[] zeroFlag = new byte[1];
@@ -1619,6 +1627,12 @@ public class RecordTable {
                             break;
                         }
                     }
+                    if (list.Count == 0) {
+                        idx.Remove(key);
+                        if (this.indexKeysSorted != null && this.indexKeysSorted.ContainsKey(colName)) {
+                            RecordTable.RemoveSortedKey(this.indexKeysSorted[colName], key);
+                        }
+                    }
                 }
             }
         }
@@ -1627,6 +1641,24 @@ public class RecordTable {
     public static string FormatIntKey(int v) {
         long u = (long)v + 2147483648L;
         return Convert.ToString(u).PadLeft(10, "0");
+    }
+
+    public static string FormatInt64Key(long v) {
+        int hi = (int)(v >> 32);
+        int lo = (int)(v & 4294967295L);
+        long uHi = (long)hi + 2147483648L;
+        long uLo = (long)lo & 4294967295L;
+        return Convert.ToString(uHi).PadLeft(10, "0") + "_" + Convert.ToString(uLo).PadLeft(10, "0");
+    }
+
+    public static string FormatFloat64Key(double v) {
+        long bits = BitConverter.DoubleToInt64Bits(v);
+        if (bits < 0L) {
+            long inv = ~bits;
+            return "0_" + Convert.ToString(inv).PadLeft(19, "0");
+        } else {
+            return "1_" + Convert.ToString(bits).PadLeft(19, "0");
+        }
     }
 
     public string NormalizeIndexKey(string colName, string val) {
@@ -1639,8 +1671,39 @@ public class RecordTable {
             } catch (Exception e) {
                 return val;
             }
+        } else if (col.dataType == RecordDataType.Int64) {
+            try {
+                return RecordTable.FormatInt64Key(Convert.ToInt64(val));
+            } catch (Exception e) {
+                return val;
+            }
+        } else if (col.dataType == RecordDataType.Float64) {
+            try {
+                return RecordTable.FormatFloat64Key(Convert.ToDouble(val));
+            } catch (Exception e) {
+                return val;
+            }
         }
         return val;
+    }
+
+    public static void RemoveSortedKey(List<string> list, string key) {
+        if (list == null || key == null) { return; }
+        int lo = 0;
+        int hi = list.Count - 1;
+        while (lo <= hi) {
+            int mid = (lo + hi) / 2;
+            int cmp = String.CompareOrdinal(list[mid], key);
+            if (cmp == 0) {
+                list.RemoveAt(mid);
+                return;
+            }
+            if (cmp < 0) {
+                lo = mid + 1;
+            } else {
+                hi = mid - 1;
+            }
+        }
     }
 
     public static void InsertSortedKey(List<string> list, string key) {
@@ -1677,7 +1740,9 @@ public class RecordTable {
         } else if (col.dataType == RecordDataType.VarStr) {
             return r.GetVarStr(colName);
         } else if (col.dataType == RecordDataType.Int64) {
-            return Convert.ToString(r.GetInt64(colName));
+            return RecordTable.FormatInt64Key(r.GetInt64(colName));
+        } else if (col.dataType == RecordDataType.Float64) {
+            return RecordTable.FormatFloat64Key(r.GetFloat64(colName));
         } else if (col.dataType == RecordDataType.Bool) {
             return r.GetBool(colName) ? "1" : "0";
         }
