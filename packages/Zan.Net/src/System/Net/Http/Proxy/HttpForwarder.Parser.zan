@@ -1,0 +1,466 @@
+using System;
+using System.IO;
+using System.Collections.Generic;
+
+namespace System.Net.Http.Proxy;
+
+// HttpForwarder.Parser.zan - HTTP 代理协议头部语法校验、定界判别 (TE/CL) 与防走私解析
+public partial class HttpForwarder {
+
+    // 头块按行切分（不含各行 CRLF，也不含结束空行）。
+    private static List<string> HeadLines(string head) {
+        List<string> outv = new List<string>();
+        int start = 0;
+        int n = head.Length;
+        for (int i = 0; i < n; i = i + 1) {
+            if ((head[i] & 255) == 10) {
+                int end = i;
+                if (end > start && (head[end - 1] & 255) == 13) { end = end - 1; }
+                if (end > start) {
+                    outv.Add(head.Substring(start, end - start));
+                }
+                start = i + 1;
+            }
+        }
+        return outv;
+    }
+
+    // 请求行的方法（大写形式原样返回）。
+    private static string MethodOf(string head) {
+        int n = head.Length;
+        for (int i = 0; i < n; i = i + 1) {
+            int b = head[i] & 255;
+            if (b == 32) { return head.Substring(0, i); }
+            if (b == 13 || b == 10) { return ""; }
+        }
+        return "";
+    }
+
+    // 状态行的状态码；状态行不是严格的
+    // "HTTP/1.0|1.1 SP 3DIGIT [SP reason]"（版本后缀如 HTTP/1.1x、
+    // 缺空格、非数字）时返回 0——调用方按 <100 拒收，不按
+    // 数字前缀猜。
+    private static int StatusOf(string head) {
+        if (head.Length < 12) { return 0; }
+        string ver = head.Substring(0, 9);
+        if (ver != "HTTP/1.0 " && ver != "HTTP/1.1 ") { return 0; }
+        int code = 0;
+        for (int i = 9; i < 12; i = i + 1) {
+            int b = head[i] & 255;
+            if (b < 48 || b > 57) { return 0; }
+            code = code * 10 + (b - 48);
+        }
+        if (head.Length > 12 && (head[12] & 255) != 32) { return 0; }
+        return code;
+    }
+
+    // 响应头块语法（含严格状态行）。IsHeadSyntaxValid 不校验
+    // 首行（请求/响应共用），响应侧在它之上加 IsStatusLineValid。
+    private static bool IsResponseHeadValid(string head) {
+        List<string> lines = HttpForwarder.HeadLines(head);
+        if (lines.Count == 0) { return false; }
+        string line = lines[0];
+        if (line.Length < 12) { return false; }
+        string ver = line.Substring(0, 9);
+        if (ver != "HTTP/1.0 " && ver != "HTTP/1.1 ") { return false; }
+        for (int i = 9; i < 12; i = i + 1) {
+            int b = line[i] & 255;
+            if (b < 48 || b > 57) { return false; }
+        }
+        if (((line[9] & 255) - 48) < 1 || ((line[9] & 255) - 48) > 5) {
+            return false;
+        }
+        if (line.Length > 12 && (line[12] & 255) != 32) { return false; }
+        for (int i = 13; i < line.Length; i = i + 1) {
+            int b = line[i] & 255;
+            if ((b < 32 && b != 9) || b == 127) { return false; }
+        }
+        return HttpForwarder.IsHeadSyntaxValid(head);
+    }
+
+    // 头部行的字段名（小写）；不是头部行时返回空串。
+    // 冒号前含空格/制表符的行（如 "Transfer-Encoding :"）返回空串——
+    // 这种混淆名此前会绕过所有 TE/逐跳判定后被原样转发，是教科书级
+    // 走私向量；RFC 7230 要求拒收。
+    private static string LowerName(string line) {
+        int colon = HttpForwarder.IndexOf(line, ":", 0);
+        if (colon <= 0) { return ""; }
+        for (int i = 0; i < colon; i = i + 1) {
+            int b = line[i] & 255;
+            if (b == 32 || b == 9) { return ""; }
+        }
+        return HttpForwarder.Lower(line.Substring(0, colon));
+    }
+
+    // 头部行的字段值（两端空白已去除）。
+    private static string HeaderValueOfLine(string line) {
+        int colon = HttpForwarder.IndexOf(line, ":", 0);
+        if (colon < 0) { return ""; }
+        string v = line.Substring(colon + 1, line.Length - colon - 1);
+        return HttpForwarder.Trim(v);
+    }
+
+    // 头块中 `name`（小写）的值，缺失时为空串。
+    private static string HeaderValue(string head, string name) {
+        List<string> lines = HttpForwarder.HeadLines(head);
+        for (int i = 1; i < lines.Count; i = i + 1) {
+            if (HttpForwarder.LowerName(lines[i]) == name) {
+                return HttpForwarder.HeaderValueOfLine(lines[i]);
+            }
+        }
+        return "";
+    }
+
+    // HTTP token 字节（字段名、方法、Connection 成员）。
+    private static bool IsTokenByte(int b) {
+        return (b >= 65 && b <= 90) || (b >= 97 && b <= 122)
+            || (b >= 48 && b <= 57) || b == 33 || b == 35
+            || b == 36 || b == 37 || b == 38 || b == 39
+            || b == 42 || b == 43 || b == 45 || b == 46
+            || b == 94 || b == 95 || b == 96 || b == 124 || b == 126;
+    }
+
+    private static bool IsToken(string s) {
+        if (s.Length == 0) { return false; }
+        for (int i = 0; i < s.Length; i = i + 1) {
+            if (!HttpForwarder.IsTokenByte(s[i] & 255)) { return false; }
+        }
+        return true;
+    }
+
+    // 检查字段行及裸 CR/LF，拒绝上游与代理不同的解析结果。
+    private static bool IsHeaderLineValid(string line) {
+        int colon = HttpForwarder.IndexOf(line, ":", 0);
+        if (colon <= 0 || !HttpForwarder.IsToken(line.Substring(0, colon))) {
+            return false;
+        }
+        for (int i = colon + 1; i < line.Length; i = i + 1) {
+            int b = line[i] & 255;
+            if ((b < 32 && b != 9) || b == 127) { return false; }
+        }
+        return true;
+    }
+
+    // trailer 字段行校验。除固定禁区（Content-Length/TE/Host/
+    // 逐跳）外，还拒绝响应 Connection 头动态提名的字段——RFC 7230 §4.1.2：
+    // "Connection: X-Foo" 把 X-Foo 降为逐跳语义，出现在 trailer 里再
+    // 被原样转发，宽容的下游会把它当普通头解释（走私向量）。
+    private static bool IsTrailerLineValid(string line, string head) {
+        if (line.Length < 4 || line.Substring(line.Length - 2, 2) != "\r\n") {
+            return false;
+        }
+        string field = line.Substring(0, line.Length - 2);
+        if (!HttpForwarder.IsHeaderLineValid(field)) { return false; }
+        string name = HttpForwarder.LowerName(field);
+        if (name.Length == 0) { return false; }
+        if (name == "content-length" || name == "transfer-encoding"
+            || name == "host" || HttpForwarder.IsHopByHop(name)) {
+            return false;
+        }
+        return !HttpForwarder.HasHeaderToken(head, "connection", name)
+            && !HttpForwarder.HasHeaderToken(head, "proxy-connection", name);
+    }
+
+    private static bool IsHeadSyntaxValid(string head) {
+        if (head.Length < 4 || head.Substring(head.Length - 4, 4) != "\r\n\r\n") {
+            return false;
+        }
+        for (int i = 0; i < head.Length; i = i + 1) {
+            int b = head[i] & 255;
+            if (b == 0 || b == 127) { return false; }
+            if (b == 13 && (i + 1 >= head.Length || (head[i + 1] & 255) != 10)) {
+                return false;
+            }
+            if (b == 10 && (i == 0 || (head[i - 1] & 255) != 13)) {
+                return false;
+            }
+            if (i + 3 < head.Length && head.Substring(i, 4) == "\r\n\r\n"
+                && i != head.Length - 4) { return false; }
+            if ((b < 32 && b != 9 && b != 13 && b != 10)) { return false; }
+        }
+        List<string> lines = HttpForwarder.HeadLines(head);
+        if (lines.Count == 0) { return false; }
+        for (int i = 1; i < lines.Count; i = i + 1) {
+            if (!HttpForwarder.IsHeaderLineValid(lines[i])) { return false; }
+        }
+        return true;
+    }
+
+    private static bool HasHeaderToken(string head, string field, string token) {
+        List<string> lines = HttpForwarder.HeadLines(head);
+        for (int i = 1; i < lines.Count; i = i + 1) {
+            if (HttpForwarder.LowerName(lines[i]) != field) { continue; }
+            List<string> parts = HttpForwarder.SplitCsv(
+                HttpForwarder.Lower(HttpForwarder.HeaderValueOfLine(lines[i])));
+            for (int j = 0; j < parts.Count; j = j + 1) {
+                if (parts[j] == token) { return true; }
+            }
+        }
+        return false;
+    }
+
+    private static bool AreConnectionTokensValid(string head) {
+        List<string> lines = HttpForwarder.HeadLines(head);
+        for (int i = 1; i < lines.Count; i = i + 1) {
+            string name = HttpForwarder.LowerName(lines[i]);
+            if (name != "connection" && name != "proxy-connection") { continue; }
+            List<string> parts = HttpForwarder.SplitCsv(
+                HttpForwarder.HeaderValueOfLine(lines[i]));
+            if (parts.Count == 0) { return false; }
+            for (int j = 0; j < parts.Count; j = j + 1) {
+                if (!HttpForwarder.IsToken(parts[j])) { return false; }
+                string nominated = HttpForwarder.Lower(parts[j]);
+                if (nominated == "content-length" || nominated == "transfer-encoding") {
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+
+    private static bool IsRequestValid(string head) {
+        if (!HttpForwarder.IsHeadSyntaxValid(head)
+            || !HttpForwarder.IsBodyFramingValid(head, true)
+            || !HttpForwarder.AreConnectionTokensValid(head)) { return false; }
+        List<string> lines = HttpForwarder.HeadLines(head);
+        string requestLine = lines[0];
+        int first = HttpForwarder.IndexOf(requestLine, " ", 0);
+        if (first <= 0 || !HttpForwarder.IsToken(requestLine.Substring(0, first))) {
+            return false;
+        }
+        int second = HttpForwarder.IndexOf(requestLine, " ", first + 1);
+        if (second <= first + 1 || (second + 1 < requestLine.Length
+            && HttpForwarder.IndexOf(requestLine, " ", second + 1) >= 0)) {
+            return false;
+        }
+        string version = requestLine.Substring(second + 1);
+        if (version != "HTTP/1.1" && version != "HTTP/1.0") { return false; }
+        for (int i = first + 1; i < second; i = i + 1) {
+            int b = requestLine[i] & 255;
+            if (b <= 32 || b >= 127) { return false; }
+        }
+        int hosts = 0;
+        for (int i = 1; i < lines.Count; i = i + 1) {
+            string name = HttpForwarder.LowerName(lines[i]);
+            if (name == "host") {
+                hosts = hosts + 1;
+                if (HttpForwarder.HeaderValueOfLine(lines[i]).Length == 0) { return false; }
+            }
+            if ((name == "connection" || name == "proxy-connection")
+                && HttpForwarder.HasHeaderToken(head, name, "expect")) { return false; }
+        }
+        return hosts <= 1 && (version == "HTTP/1.0" || hosts == 1);
+    }
+
+    // 逐跳头部（RFC 7230 6.1）：只对单段连接有意义，
+    // 不应转发给上游。
+    private static bool IsHopByHop(string name) {
+        return name == "connection" || name == "proxy-connection"
+            || name == "keep-alive" || name == "te" || name == "trailer"
+            || name == "transfer-encoding" || name == "upgrade"
+            || name == "proxy-authenticate" || name == "proxy-authorization";
+    }
+
+    // 头块声明了分块传输编码。
+    // 按 RFC 7230，只有列表最后一项严格等于 "chunked" 时才成立，
+    // 且 "chunked" 之后不能再有其他编码。
+    private static bool HeadIsChunked(string head) {
+        List<string> lines = HttpForwarder.HeadLines(head);
+        string lastVal = "";
+        for (int i = 1; i < lines.Count; i = i + 1) {
+            if (HttpForwarder.LowerName(lines[i]) == "transfer-encoding") {
+                lastVal = HttpForwarder.HeaderValueOfLine(lines[i]);
+            }
+        }
+        if (lastVal.Length == 0) { return false; }
+        List<string> parts = HttpForwarder.SplitCsv(HttpForwarder.Lower(lastVal));
+        if (parts.Count == 0) { return false; }
+        string last = HttpForwarder.Trim(parts[parts.Count - 1]);
+        return last == "chunked";
+    }
+
+    // Content-Length 的值；未声明时返回 -1，
+    // 包含非数字字符时返回 -2（非法）。
+    private static long ContentLengthOf(string head) {
+        string v = HttpForwarder.HeaderValue(head, "content-length");
+        if (v.Length == 0) { return -1; }
+        long n = 0;
+        for (int i = 0; i < v.Length; i = i + 1) {
+            int b = v[i] & 255;
+            if (b < 48 || b > 57) { return -2; }
+            // 检查溢出：n > (LLONG_MAX - digit) / 10
+            if (n > 922337203685477580L
+                || (n == 922337203685477580L && b > 55)) { return -2; }
+            n = n * 10 + (long)(b - 48);
+        }
+        return n;
+    }
+
+    // 检查请求/响应头块的正文定界是否合法。
+    // 非法定界（TE+CL 冲突、非 chunked 的 TE、chunked 不在最后、
+    // 非法/重复的 Content-Length、冒号前含空白的混淆字段名）
+    // 返回 false，调用方应返回 400。
+    private static bool IsBodyFramingValid(string head, bool isRequest) {
+        List<string> lines = HttpForwarder.HeadLines(head);
+        int clCount = 0;
+        int teCount = 0;
+        string combinedTe = "";
+        for (int i = 1; i < lines.Count; i = i + 1) {
+            string line = lines[i];
+            int colon = HttpForwarder.IndexOf(line, ":", 0);
+            if (colon <= 0) { return false; }
+            // 混淆字段名："Transfer-Encoding :" 这类冒号前带空白的行
+            // 不匹配任何已知名，此前会绕过全部判定后被原样转发，
+            // 由容忍该空格的上游按 TE 解析——走私。RFC 要求拒收。
+            bool badName = false;
+            for (int k = 0; k < colon; k = k + 1) {
+                int b = line[k] & 255;
+                if (b == 32 || b == 9) { badName = true; break; }
+            }
+            if (badName) { return false; }
+            string name = HttpForwarder.Lower(line.Substring(0, colon));
+            if (name == "content-length") {
+                clCount = clCount + 1;
+            } else if (name == "transfer-encoding") {
+                teCount = teCount + 1;
+                combinedTe = HttpForwarder.Trim(
+                    line.Substring(colon + 1, line.Length - colon - 1));
+            }
+        }
+        // 多个 Content-Length 行：即使值相同也拒绝（RFC 允许合并，
+        // 但转发器选择 fail-closed——上游与我们对合并语义的理解
+        // 一旦分歧就是请求走私）。
+        if (clCount > 1 || teCount > 1) { return false; }
+
+        bool hasCl = clCount == 1;
+        if (teCount > 0 && hasCl) { return false; }
+        if (teCount > 0) {
+            // 只支持单一 chunked；周围的 OWS 是合法的。
+            if (HttpForwarder.Lower(HttpForwarder.Trim(combinedTe)) != "chunked") {
+                return false;
+            }
+        }
+        long cl = HttpForwarder.ContentLengthOf(head);
+        if (cl == -2 || (hasCl && cl < 0)) { return false; }
+        return true;
+    }
+
+    // 按 ',' 拆分 TE/CL 等逗号分隔值，并 trim 每项。
+    private static List<string> SplitCsv(string s) {
+        List<string> parts = new List<string>();
+        int i = 0;
+        while (i < s.Length) {
+            int j = i;
+            while (j < s.Length && s[j] != ',') { j = j + 1; }
+            parts.Add(HttpForwarder.Trim(s.Substring(i, j - i)));
+            i = j + 1;
+        }
+        return parts;
+    }
+
+    // 分块长度行（十六进制，可带 ";ext"）的字节数；
+    // 非法时返回 -1。位数超过 13 即按非法处理：13 位十六进制已覆盖
+    // 8TiB，合法分块远小于此，无上限的累加会回绕出小正数值，
+    // 把转发器的分块定界悄悄打乱。
+    private static long ParseChunkSize(string line) {
+        long n = 0;
+        bool any = false;
+        int digits = 0;
+        if (line.Length < 3 || line.Substring(line.Length - 2, 2) != "\r\n") {
+            return -1;
+        }
+        int end = line.Length - 2;
+        int i = 0;
+        while (i < end) {
+            int b = line[i] & 255;
+            int d = -1;
+            if (b >= 48 && b <= 57) { d = b - 48; }
+            else if (b >= 97 && b <= 102) { d = b - 87; }
+            else if (b >= 65 && b <= 70) { d = b - 55; }
+            else { break; }
+            digits = digits + 1;
+            if (digits > 13) { return -1; }
+            n = n * 16 + (long)d;
+            any = true;
+            i = i + 1;
+        }
+        if (!any) { return -1; }
+        while (i < end) {
+            if ((line[i] & 255) != 59) { return -1; }
+            i = i + 1;
+            int start = i;
+            while (i < end && HttpForwarder.IsTokenByte(line[i] & 255)) {
+                i = i + 1;
+            }
+            if (i == start) { return -1; }
+            if (i < end && (line[i] & 255) == 61) {
+                i = i + 1;
+                if (i < end && (line[i] & 255) == 34) {
+                    i = i + 1;
+                    bool closed = false;
+                    while (i < end) {
+                        int b = line[i] & 255;
+                        i = i + 1;
+                        if (b == 34) { closed = true; break; }
+                        if (b == 92) {
+                            if (i == end) { return -1; }
+                            b = line[i] & 255;
+                            i = i + 1;
+                            if (b < 32 || b == 127) { return -1; }
+                        } else if (b < 32 || b == 127) { return -1; }
+                    }
+                    if (!closed) { return -1; }
+                } else {
+                    start = i;
+                    while (i < end && HttpForwarder.IsTokenByte(line[i] & 255)) {
+                        i = i + 1;
+                    }
+                    if (i == start) { return -1; }
+                }
+            }
+        }
+        return n;
+    }
+
+    // ASCII 大写转小写。
+    private static string Lower(string s) {
+        if (s == null) { return ""; }
+        return s.ToLower();
+    }
+
+    // 去除两端的空格/制表符/CRLF。
+    private static string Trim(string s) {
+        int a = 0;
+        int b = s.Length;
+        while (a < b) {
+            int c = s[a] & 255;
+            if (c == 32 || c == 9) { a = a + 1; } else { break; }
+        }
+        while (b > a) {
+            int c = s[b - 1] & 255;
+            if (c == 32 || c == 9 || c == 13 || c == 10) { b = b - 1; }
+            else { break; }
+        }
+        return s.Substring(a, b - a);
+    }
+
+    // 是否以 `prefix` 开头。
+    private static bool StartsWith(string s, string prefix) {
+        if (s.Length < prefix.Length) { return false; }
+        return s.Substring(0, prefix.Length) == prefix;
+    }
+
+    // 从 <paramref name="from"/> 起查找子串首次出现的下标；未找到为 -1。
+    private static int IndexOf(string hay, string needle, int from) {
+        if (hay == null || needle == null) { return -1; }
+        if (from < 0) { from = 0; }
+        if (from > hay.Length) { return -1; }
+        return hay.IndexOf(needle, from);
+    }
+
+    // 子串最后一次出现的下标；未找到为 -1。
+    private static int LastIndexOf(string hay, string needle) {
+        if (hay == null || needle == null) { return -1; }
+        return hay.LastIndexOf(needle);
+    }
+}
