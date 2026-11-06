@@ -2,7 +2,6 @@ using System;
 using System.Collections;
 using System.Data;
 using System.Data.Orm;
-using System.Json;
 using System.Web;
 using Zan.Web.Model.Flow;
 using Zan.Web.Model.Oa;
@@ -10,14 +9,9 @@ using Zan.Web.Model;
 
 namespace Zan.Web.Admin.Oa;
 
-/* 表单定义（T14，架构定案 #70）：TEXT 存 JSON 拒 EAV。schemaJson 经
-   FormSchema.Parse 结构校验非法不入库（错误清单 toast 回显）；
-   code 租户内 UNIQUE（先查后插 + 库约束双保险）。
-   有提交记录禁删改 schema（防 OaFormData.schemaSnapshot 失对照）——
-   Delete 直接拒、Save 拒绝 schema 变更，名称/描述/流程绑定/启停照常。
-   schemaJson 读法用 InRaw（Bug#8 同族：pretty JSON 的换行不得被
-   Filter.Clean 剥除；Parse 本身容忍空白，但入库原文保真）。
-   预览与填报/详情共用 FormSchema.Render（三用同源）。 */
+/* 表单定义：TEXT 存 JSON。schemaJson 经 FormSchema.Parse 结构校验非法不入库；
+   code 租户内 UNIQUE。有提交记录禁删改 schema。
+   预览与填报/详情共用 FormSchema.Render。 */
 [Route("admin/oa/forms/[action]")]
 [Custom(Authorization = CustomAuthorization.Grant)]
 [Description("表单定义")]
@@ -26,7 +20,7 @@ public class Forms : CollabAdminController {
     [Route("/admin/oa/forms")]
     [Custom(IsMenu = true, Icon = "mdi:form-textbox", Perm = PermBit.View)]
     [Description("表单定义")]
-    async void Index() {
+    public async void Index() {
         SysUser me = await this.Admin();
         ViewData d = await this.Layout("表单定义");
         if (!this.DbReady()) { d.Set("dbDown", "1"); this.Page(d); return; }
@@ -45,14 +39,13 @@ public class Forms : CollabAdminController {
         d.Set("canCreate", this.Can(PermBit.Create) ? "1" : "");
         d.Set("canUpdate", this.Can(PermBit.Update) ? "1" : "");
         d.Set("canDelete", this.Can(PermBit.Delete) ? "1" : "");
-        /* 流程绑定名映射。 */
         List<FlowDef> defs = await this.FlowDef
             .Where(a => a.tenantId == Tenant.Cur()).ToListAsync();
         List<StrMap> items = d.AddList("rows");
         for (int i = 0; i < rows.Count; i = i + 1) {
             OaFormDef r = rows[i];
             StrMap m = new StrMap();
-            m.Set("id", Convert.ToString(r.id));
+            m.Set("id", r.id.ToString());
             m.Set("code", r.code);
             m.Set("name", r.name);
             m.Set("description", r.description);
@@ -64,7 +57,7 @@ public class Forms : CollabAdminController {
             int subs = await this.OaFormData
                 .Where(a => a.tenantId == Tenant.Cur() && a.formId == r.id)
                 .CountAsync();
-            m.Set("subs", Convert.ToString(subs));
+            m.Set("subs", subs.ToString());
             m.Set("locked", subs > 0 ? "1" : "");
             m.Set("canEdit", this.Can(PermBit.Update) ? "1" : "");
             m.Set("canDel", this.Can(PermBit.Delete) ? "1" : "");
@@ -74,12 +67,10 @@ public class Forms : CollabAdminController {
         this.Page(d);
     }
 
-    /* 新建/编辑弹窗：locked（有提交记录）时 schema 只读展示，Save 侧
-       双重校验（视图锁可绕，服务端不可绕）。 */
     [HttpGet]
     [Custom(IsMenu = false, Perm = PermBit.View)]
     [Description("表单定义表单")]
-    async void Form() {
+    public async void Form() {
         int id = this.InInt("id", 0);
         OaFormDef r = null;
         if (id > 0) {
@@ -95,13 +86,13 @@ public class Forms : CollabAdminController {
                 .CountAsync();
         }
         ViewData d = new ViewData();
-        d.Set("id", Convert.ToString(id));
+        d.Set("id", id.ToString());
         d.Set("dialogTitle", id > 0 ? "编辑表单" : "新建表单");
         d.Set("code", r == null ? "" : r.code);
         d.Set("name", r == null ? "" : r.name);
         d.Set("description", r == null ? "" : r.description);
         d.Set("schemaJson", r == null ? "" : r.schemaJson);
-        d.Set("flowDefId", r == null ? "0" : Convert.ToString(r.flowDefId));
+        d.Set("flowDefId", r == null ? "0" : r.flowDefId.ToString());
         d.Set("locked", subs > 0 ? "1" : "");
         List<FlowDef> defs = await this.FlowDef
             .Where(a => a.tenantId == Tenant.Cur() && a.status == 1)
@@ -111,19 +102,18 @@ public class Forms : CollabAdminController {
         for (int i = 0; i < defs.Count; i = i + 1) {
             if (defs[i].id == curFlow) { continue; }
             StrMap m = new StrMap();
-            m.Set("id", Convert.ToString(defs[i].id));
+            m.Set("id", defs[i].id.ToString());
             m.Set("name", defs[i].name);
             m.Set("sel", "");
             flows.Add(m);
         }
         if (curFlow > 0) {
-            /* 当前绑定即使是停用流程也要出现在下拉里（否则回显丢失）。 */
             FlowDef cur = await this.FlowDef
                 .Where(a => a.id == curFlow && a.tenantId == Tenant.Cur())
                 .FirstAsync();
             if (cur != null) {
                 StrMap m = new StrMap();
-                m.Set("id", Convert.ToString(cur.id));
+                m.Set("id", cur.id.ToString());
                 m.Set("name", cur.name + "（已停用）");
                 m.Set("sel", "1");
                 flows.Add(m);
@@ -132,12 +122,10 @@ public class Forms : CollabAdminController {
         this.Dialog(d);
     }
 
-    /* 保存：Parse 校验（非法=字段级清单 toast）+ UNIQUE 先查 + 行限软上限。
-       有提交记录时拒绝 schema 变更（原文比对），其余字段照常。 */
     [HttpPost]
     [Custom(Perm = PermBit.Create | PermBit.Update)]
     [Description("保存表单定义")]
-    async void Save() {
+    public async void Save() {
         SysUser me = await this.Admin();
         int id = this.InInt("id", 0);
         string code = this.Need("code", "表单标识");
@@ -153,7 +141,7 @@ public class Forms : CollabAdminController {
             this.Fail(400, "0004", "schema 过大（60000 字符上限，MySQL 行限兜底）");
             return;
         }
-        JsonValue _schema = FormSchema.Parse(schemaJson);
+        FormSchemaDef _schema = FormSchema.Parse(schemaJson);
         int flowDefId = this.InInt("flowDefId", 0);
         if (flowDefId > 0) {
             FlowDef fd = await this.FlowDef
@@ -210,11 +198,10 @@ public class Forms : CollabAdminController {
         this.Saved(newId > 0 ? "表单已创建" : "保存失败");
     }
 
-    /* 启停：翻转位。停用后填报入口不可再提交，历史提交与详情不受影响。 */
     [HttpPost]
     [Custom(Perm = PermBit.Update)]
     [Description("表单启停")]
-    async void Status() {
+    public async void Status() {
         int id = this.InInt("id", 0);
         OaFormDef r = await this.OaFormDef
             .Where(a => a.id == id && a.tenantId == Tenant.Cur())
@@ -229,11 +216,10 @@ public class Forms : CollabAdminController {
         this.Saved(next == 1 ? "已启用" : "已停用");
     }
 
-    /* 删除：有提交记录一律拒（快照失对照风险），提示停用替代。 */
     [HttpPost]
     [Custom(Perm = PermBit.Delete)]
     [Description("删除表单定义")]
-    async void Delete() {
+    public async void Delete() {
         int id = this.InInt("id", 0);
         OaFormDef r = await this.OaFormDef
             .Where(a => a.id == id && a.tenantId == Tenant.Cur())
@@ -243,7 +229,7 @@ public class Forms : CollabAdminController {
             .Where(a => a.tenantId == Tenant.Cur() && a.formId == r.id)
             .CountAsync();
         if (subs > 0) {
-            this.Fail(400, "0004", "已有 " + Convert.ToString(subs)
+            this.Fail(400, "0004", "已有 " + subs.ToString()
                 + " 条提交记录，不可删除；如需收敛入口请停用");
             return;
         }
@@ -254,30 +240,29 @@ public class Forms : CollabAdminController {
         this.Saved("表单已删除");
     }
 
-    /* 预览（弹窗片段）：空数据渲染 8 种控件形态，字典选项实拉。 */
     [HttpGet]
     [Custom(IsMenu = false, Perm = PermBit.View)]
     [Description("表单预览")]
-    async void Preview() {
+    public async void Preview() {
         int id = this.InInt("id", 0);
         OaFormDef r = await this.OaFormDef
             .Where(a => a.id == id && a.tenantId == Tenant.Cur())
             .FirstAsync();
         if (r == null) { this.Fail(404, "0404", "表单不存在"); return; }
-        JsonValue schema = FormSchema.Parse(r.schemaJson);
+        FormSchemaDef schema = FormSchema.Parse(r.schemaJson);
         List<SysDictItem> dicts = await FormSchema.DictsFor(this.Held(), schema);
         ViewData d = new ViewData();
         d.Set("dialogTitle", "预览：" + r.name);
         d.Set("name", r.name);
-        FormSchema.Render(d, schema, null, 0, dicts);
+        FormSchema.Render(d, schema, "", 0, dicts);
         this.Dialog(d);
     }
 
-    static string FlowName(List<FlowDef> defs, int flowDefId) {
+    public static string FlowName(List<FlowDef> defs, int flowDefId) {
         if (flowDefId <= 0) { return "不绑流程"; }
         for (int i = 0; i < defs.Count; i = i + 1) {
             if (defs[i].id == flowDefId) { return defs[i].name; }
         }
-        return "流程#" + Convert.ToString(flowDefId);
+        return "流程#" + flowDefId.ToString();
     }
 }

@@ -25,7 +25,7 @@ public class Notifies : CollabAdminController {
     [Route("/admin/oa/notifies")]
     [Custom(IsMenu = true, Icon = "mdi:bell", Perm = PermBit.View)]
     [Description("通知中心")]
-    async void Index() {
+    public async void Index() {
         SysUser me = await this.Admin();
         ViewData d = await this.Layout("通知中心");
         if (!this.DbReady()) { d.Set("dbDown", "1"); this.Page(d); return; }
@@ -48,7 +48,7 @@ public class Notifies : CollabAdminController {
         for (int i = 0; i < rows.Count; i = i + 1) {
             SysNotify n = rows[i];
             StrMap m = new StrMap();
-            m.Set("id", Convert.ToString(n.id));
+            m.Set("id", n.id.ToString());
             m.Set("kind", n.kind);
             m.Set("kindText", n.kind == "assign" ? "派工"
                 : (n.kind == "mention" ? "提及"
@@ -70,7 +70,7 @@ public class Notifies : CollabAdminController {
     [HttpGet]
     [Custom(IsMenu = false, Perm = PermBit.View)]
     [Description("未读通知")]
-    async void Unread() {
+    public async void Unread() {
         SysUser me = await this.Admin();
         /* Bug#6（本体 B）：未读数与未读列表同补租户闸（铃铛数据源）。 */
         List<SysNotify> rows = await this.SysNotify
@@ -80,17 +80,20 @@ public class Notifies : CollabAdminController {
         int total = await this.SysNotify
             .Where(a => a.tenantId == Tenant.Cur() && a.userId == me.id
                 && a.isRead == 0).CountAsync();
-        JsonValue items = JsonValue.NewArray();
+        JsonWriter w = new JsonWriter();
+        w.StartObject();
+        w.WriteProperty("count", total.ToString());
+        w.WriteKey("items");
+        w.StartArray();
         for (int i = 0; i < rows.Count; i = i + 1) {
-            JsonValue o = JsonValue.NewObject();
-            o.Put("content", JsonValue.NewStr(rows[i].content));
-            o.Put("link", JsonValue.NewStr(rows[i].link));
-            items.Append(o);
+            w.StartObject();
+            w.WriteProperty("content", rows[i].content);
+            w.WriteProperty("link", rows[i].link);
+            w.EndObject();
         }
-        JsonValue body = JsonValue.NewObject();
-        body.Put("count", JsonValue.NewStr(Convert.ToString(total)));
-        body.Put("items", items);
-        this.Ctx().Json(body.ToJson());
+        w.EndArray();
+        w.EndObject();
+        this.Ctx().Json(w.ToJson());
     }
 
     /* 实时通知通道：WebSocket 长连接为主——ctx.WsUpgrade() 在路由/权限之后升级，
@@ -101,7 +104,7 @@ public class Notifies : CollabAdminController {
     [HttpGet]
     [Custom(IsMenu = false, Perm = PermBit.View)]
     [Description("通知事件流")]
-    async void Stream() {
+    public async void Stream() {
         SysUser me = await this.Admin();
         HttpContext ctx = this.Ctx();
         WsSession ws = await WebWs.Upgrade(ctx);
@@ -111,9 +114,11 @@ public class Notifies : CollabAdminController {
             int unread = await this.SysNotify
                 .Where(a => a.tenantId == Tenant.Cur() && a.userId == me.id
                     && a.isRead == 0).CountAsync();
-            JsonValue first = JsonValue.NewObject();
-            first.PutStr("type", "unread");
-            first.PutInt("count", unread);
+            JsonWriter first = new JsonWriter();
+            first.StartObject();
+            first.WriteProperty("type", "unread");
+            first.WriteProperty("count", unread);
+            first.EndObject();
             if (!await ws.SendText(first.ToJson())) { return; }
             Zan.Web.NotifyHub.JoinWs(me.id, ws);
             long started = WebApp.NowSeconds();
@@ -136,8 +141,11 @@ public class Notifies : CollabAdminController {
         int unread2 = await this.SysNotify
             .Where(a => a.tenantId == Tenant.Cur() && a.userId == me.id
                 && a.isRead == 0).CountAsync();
-        if (!await ctx.SseSend("unread", "{\"count\":"
-                + Convert.ToString(unread2) + "}")) {
+        JsonWriter firstSse = new JsonWriter();
+        firstSse.StartObject();
+        firstSse.WriteProperty("count", unread2);
+        firstSse.EndObject();
+        if (!await ctx.SseSend("unread", firstSse.ToJson())) {
             Zan.Web.NotifyHub.LeaveSse(ctx);
             return;
         }
@@ -156,7 +164,7 @@ public class Notifies : CollabAdminController {
     [HttpPost]
     [Custom(Perm = PermBit.Update)]
     [Description("标记已读")]
-    async void Read() {
+    public async void Read() {
         SysUser me = await this.Admin();
         int id = this.InInt("id", 0);
         long now = WebApp.NowSeconds();
@@ -169,6 +177,7 @@ public class Notifies : CollabAdminController {
                     && a.userId == me.id)
                 .ExecuteAffrowsAsync();
         } else {
+            /* Bug#6（本体 B）：全部已读随读面补租户闸。 */
             int _n = await this.SysNotify.Update()
                 .Set(a => a.isRead, 1)
                 .Where(a => a.tenantId == Tenant.Cur() && a.userId == me.id)
@@ -183,7 +192,7 @@ public class Notifies : CollabAdminController {
     [HttpPost]
     [Custom(Perm = PermBit.Update)]
     [Description("免打扰开关")]
-    async void Mute() {
+    public async void Mute() {
         SysUser me = await this.Admin();
         string module = Fmt.Text(this.In("module"), "flow");
         int on = this.InInt("on", 0);

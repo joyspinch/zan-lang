@@ -24,13 +24,14 @@ public class Attachments : CollabAdminController {
     [HttpPost]
     [Custom(Perm = PermBit.Create, ApiMax = 30, Upload = true)]
     [Description("上传附件")]
-    async void Upload() {
+    public async void Upload() {
         SysUser me = await this.Admin();
         if (this.ctx.uploadPath.Length == 0) {
             this.Fail(400, "1002", "没有上传内容");
+            return;
         }
         string module = Fmt.Text(this.In("module"), "");
-        if (module.Length == 0) { this.Fail(400, "0003", "module 不能为空"); }
+        if (module.Length == 0) { this.Fail(400, "0003", "module 不能为空"); return; }
         int relatedId = this.InInt("relatedId", 0);
         string name = Attachment.BaseName(this.In("name"));
         string mime = Attachment.MimeOf(name, this.In("mime"));
@@ -38,11 +39,13 @@ public class Attachments : CollabAdminController {
             module, relatedId, name, mime, this.ctx.uploadPath,
             this.ctx.uploadSize);
         await this.Note("上传附件", name, true, "");
-        JsonValue o = JsonValue.NewObject();
-        o.Put("id", JsonValue.NewStr(Convert.ToString(id)));
-        o.Put("name", JsonValue.NewStr(name));
-        o.Put("size", JsonValue.NewNum(Convert.ToString(this.ctx.uploadSize)));
-        this.Ok(o.ToJson());
+        JsonWriter w = new JsonWriter();
+        w.StartObject();
+        w.WriteProperty("id", id.ToString());
+        w.WriteProperty("name", name);
+        w.WriteProperty("size", this.ctx.uploadSize.ToString());
+        w.EndObject();
+        this.Ok(w.ToJson());
     }
 
     /* 列表（JSON）：租户 + 挂载键双过滤是本动作的隔离边界——跨租户行
@@ -50,7 +53,7 @@ public class Attachments : CollabAdminController {
     [HttpGet]
     [Custom(Perm = PermBit.View)]
     [Description("附件列表")]
-    async void List() {
+    public async void List() {
         SysUser me = await this.Admin();
         string module = Fmt.Text(this.In("module"), "");
         int relatedId = this.InInt("relatedId", 0);
@@ -58,18 +61,20 @@ public class Attachments : CollabAdminController {
             .Where(a => a.tenantId == Tenant.Cur() && a.module == module
                 && a.relatedId == relatedId)
             .OrderByDescending(a => a.id).ToListAsync();
-        JsonValue items = JsonValue.NewArray();
+        JsonWriter w = new JsonWriter();
+        w.StartArray();
         for (int i = 0; i < rows.Count; i = i + 1) {
             OaAttachment a = rows[i];
-            JsonValue o = JsonValue.NewObject();
-            o.Put("id", JsonValue.NewStr(Convert.ToString(a.id)));
-            o.Put("fileName", JsonValue.NewStr(a.fileName));
-            o.Put("mime", JsonValue.NewStr(a.mime));
-            o.Put("size", JsonValue.NewNum(Convert.ToString(a.size)));
-            o.Put("createdAt", JsonValue.NewStr(Fmt.Day(a.createdAt)));
-            items.Append(o);
+            w.StartObject();
+            w.WriteProperty("id", a.id.ToString());
+            w.WriteProperty("fileName", a.fileName);
+            w.WriteProperty("mime", a.mime);
+            w.WriteProperty("size", a.size.ToString());
+            w.WriteProperty("createdAt", Fmt.Day(a.createdAt));
+            w.EndObject();
         }
-        this.Ctx().Json(items.ToJson());
+        w.EndArray();
+        this.Ctx().Json(w.ToJson());
     }
 
     /* 下载：授权 -> 存在性 -> 字节应答。文件名经 Attachment.BaseName 清洗
@@ -77,16 +82,17 @@ public class Attachments : CollabAdminController {
     [HttpGet]
     [Custom(Perm = PermBit.View)]
     [Description("下载附件")]
-    async void Download() {
+    public async void Download() {
         SysUser me = await this.Admin();
         int id = this.InInt("id", 0);
         OaAttachment att = await this.OaAttachment.ById(id);
-        if (att == null) { this.Fail(404, "0404", "附件不存在"); }
+        if (att == null) { this.Fail(404, "0404", "附件不存在"); return; }
         DataScope sc = await this.Scope();
         if (!await Attachment.CanDownload(me, sc, this.uid, att)) {
             this.Fail(403, "0403", "无权下载该附件");
+            return;
         }
-        if (!File.Exists(att.path)) { this.Fail(404, "0404", "附件文件已丢失"); }
+        if (!File.Exists(att.path)) { this.Fail(404, "0404", "附件文件已丢失"); return; }
         byte[] data = File.ReadAllBytes(att.path);
         this.Ctx().SetHeader("Content-Disposition",
             "attachment; filename=\"" + Attachment.BaseName(att.fileName) + "\"");
@@ -98,17 +104,19 @@ public class Attachments : CollabAdminController {
     [HttpPost]
     [Custom(Perm = PermBit.Delete)]
     [Description("删除附件")]
-    async void Delete() {
+    public async void Delete() {
         SysUser me = await this.Admin();
         int id = this.InInt("id", 0);
         OaAttachment att = await this.OaAttachment.ById(id);
-        if (att == null) { this.Fail(404, "0404", "附件不存在"); }
+        if (att == null) { this.Fail(404, "0404", "附件不存在"); return; }
         if (me.isSuper != 1) {
             if (att.tenantId != Tenant.Cur()) {
                 this.Fail(403, "0403", "无权删除该附件");
+                return;
             }
             if (att.uploaderId != me.id) {
                 this.Fail(403, "0403", "仅上传者或管理员可删除");
+                return;
             }
         }
         int _n = await this.OaAttachment.Delete()
@@ -125,7 +133,7 @@ public class Attachments : CollabAdminController {
     [HttpGet]
     [Custom(Perm = PermBit.View)]
     [Description("附件区")]
-    async void Blob() {
+    public async void Blob() {
         SysUser me = await this.Admin();
         string module = Fmt.Text(this.In("module"), "");
         int relatedId = this.InInt("relatedId", 0);
@@ -138,7 +146,7 @@ public class Attachments : CollabAdminController {
         for (int i = 0; i < rows.Count; i = i + 1) {
             OaAttachment a = rows[i];
             StrMap m = new StrMap();
-            m.Set("id", Convert.ToString(a.id));
+            m.Set("id", a.id.ToString());
             m.Set("fileName", a.fileName);
             m.Set("sizeText", Fmt.Bytes(a.size));
             m.Set("createdAt", Fmt.Day(a.createdAt));
@@ -148,7 +156,7 @@ public class Attachments : CollabAdminController {
         }
         d.Set("empty", rows.Count == 0 ? "1" : "");
         d.Set("module", module);
-        d.Set("relatedId", Convert.ToString(relatedId));
+        d.Set("relatedId", relatedId.ToString());
         this.FragmentOf("Admin.Oa.Attachments.Blob", d);
     }
 }

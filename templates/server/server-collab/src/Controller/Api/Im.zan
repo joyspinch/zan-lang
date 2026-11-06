@@ -17,7 +17,7 @@ namespace Zan.Web.Api;
 [Route("api/im/[action]")]
 [Custom(Authorization = CustomAuthorization.ApiAuth)]
 [Description("桌面客户端 IM")]
-class Im : ApiController {
+public class Im : ApiController {
     OaMessageDao OaMessage { get { return new OaMessageDao(this.Held()); } }
     SysUserDao SysUser { get { return new SysUserDao(this.Held()); } }
     /* 会话列表：按对端分组的最新一条 + 未读数 + 我发消息的已读/送达摘要
@@ -27,7 +27,7 @@ class Im : ApiController {
     [HttpGet]
     [Description("会话列表")]
     [Custom(Perm = PermBit.View)]
-    async void Chats() {
+    public async void Chats() {
         SysUser me = await this.Me();
         // 轮询端点（客户端每 4.5s 拉一次）：限最新 2000 条让扫描成本
         // 有界。未读与回执都落在"新近"消息上，窗口外的老账不影响列表页。
@@ -47,7 +47,7 @@ class Im : ApiController {
                 s = new ChatSlot();
                 s.peer = peer;
                 s.lastText = Im.Excerpt(r.content, 60);
-                s.lastAt = Convert.ToString(r.createdAt);
+                s.lastAt = r.createdAt.ToString();
                 s.mine = r.fromId == me.id;
                 s.readed = s.mine && r.isRead == 1;
                 s.acked = s.mine && (r.isRead == 1 || r.isAcked == 1);
@@ -65,25 +65,28 @@ class Im : ApiController {
                 s.sentUnread = s.sentUnread + 1;
             }
         }
-        JsonValue items = JsonValue.NewArray();
+        JsonWriter w = new JsonWriter();
+        w.StartObject();
+        w.WriteKey("chats");
+        w.StartArray();
         for (int i = 0; i < slots.Count; i = i + 1) {
             ChatSlot s = slots[i];
-            JsonValue o = JsonValue.NewObject();
-            o.Put("peerId", JsonValue.NewStr(Convert.ToString(s.peer)));
-            o.Put("peerName", JsonValue.NewStr(Im.NameOf(users, s.peer)));
-            o.Put("lastText", JsonValue.NewStr(s.lastText));
-            o.Put("lastAt", JsonValue.NewStr(s.lastAt));
-            o.Put("mine", JsonValue.NewStr(s.mine ? "1" : "0"));
-            o.Put("readed", JsonValue.NewStr(s.readed ? "1" : "0"));
-            o.Put("acked", JsonValue.NewStr(s.acked ? "1" : "0"));
-            o.Put("unread", JsonValue.NewStr(Convert.ToString(s.unread)));
-            o.Put("sentUnread", JsonValue.NewStr(Convert.ToString(s.sentUnread)));
-            o.Put("ackId", JsonValue.NewStr(Convert.ToString(s.ackId)));
-            items.Append(o);
+            w.StartObject();
+            w.WriteProperty("peerId", s.peer.ToString());
+            w.WriteProperty("peerName", Im.NameOf(users, s.peer));
+            w.WriteProperty("lastText", s.lastText);
+            w.WriteProperty("lastAt", s.lastAt);
+            w.WriteProperty("mine", s.mine ? "1" : "0");
+            w.WriteProperty("readed", s.readed ? "1" : "0");
+            w.WriteProperty("acked", s.acked ? "1" : "0");
+            w.WriteProperty("unread", s.unread.ToString());
+            w.WriteProperty("sentUnread", s.sentUnread.ToString());
+            w.WriteProperty("ackId", s.ackId.ToString());
+            w.EndObject();
         }
-        JsonValue body = JsonValue.NewObject();
-        body.Put("chats", items);
-        this.Ok(body.ToJson());
+        w.EndArray();
+        w.EndObject();
+        this.Ok(w.ToJson());
     }
 
     /* 与某人的双向流（时间正序）；对端必须本租户启用账号（404 口径同 Chat）。
@@ -91,7 +94,7 @@ class Im : ApiController {
     [HttpPost]
     [Description("对话流")]
     [Custom(Perm = PermBit.View)]
-    async void Stream() {
+    public async void Stream() {
         SysUser me = await this.Me();
         int peerId = this.InInt("peer", 0);
         SysUser peer = await this.SysUser
@@ -107,43 +110,44 @@ class Im : ApiController {
         // 引用回复的发送者名字要在这里解析：先按 id 建索引，回填 O(1)。
         Dict<int, OaMessage> byId = new Dict<int, OaMessage>();
         for (int i = 0; i < rows.Count; i = i + 1) { byId[rows[i].id] = rows[i]; }
-        JsonValue items = JsonValue.NewArray();
+        JsonWriter w = new JsonWriter();
+        w.StartObject();
+        w.WriteProperty("peer", peer.id.ToString());
+        w.WriteProperty("peerName", Im.NameOf(peerList, peer.id));
+        w.WriteKey("msgs");
+        w.StartArray();
         int maxUnread = 0;
         for (int i = 0; i < rows.Count; i = i + 1) {
             OaMessage r = rows[i];
-            JsonValue o = JsonValue.NewObject();
-            o.Put("id", JsonValue.NewStr(Convert.ToString(r.id)));
-            o.Put("content", JsonValue.NewStr(r.content));
-            o.Put("mine", JsonValue.NewStr(r.fromId == me.id ? "1" : "0"));
-            o.Put("at", JsonValue.NewStr(Convert.ToString(r.createdAt)));
-            o.Put("readed", JsonValue.NewStr(
-                (r.fromId == me.id && r.isRead == 1) ? "1" : "0"));
-            o.Put("acked", JsonValue.NewStr(
-                (r.fromId == me.id && (r.isRead == 1 || r.isAcked == 1)) ? "1" : "0"));
+            w.StartObject();
+            w.WriteProperty("id", r.id.ToString());
+            w.WriteProperty("content", r.content);
+            w.WriteProperty("mine", r.fromId == me.id ? "1" : "0");
+            w.WriteProperty("at", r.createdAt.ToString());
+            w.WriteProperty("readed", (r.fromId == me.id && r.isRead == 1) ? "1" : "0");
+            w.WriteProperty("acked", (r.fromId == me.id && (r.isRead == 1 || r.isAcked == 1)) ? "1" : "0");
             /* 引用回复：被引消息还在本会话里就回 发送者名 + 摘要，
                客户端拿去画引用条；被引消息已删则照带 replyTo、
                文本为空（客户端按"引用已失效"处理）。 */
             if (r.replyTo > 0) {
-                o.Put("replyTo", JsonValue.NewStr(Convert.ToString(r.replyTo)));
+                w.WriteProperty("replyTo", r.replyTo.ToString());
                 OaMessage q = byId.ContainsKey(r.replyTo) ? byId[r.replyTo] : null;
                 if (q != null) {
                     // 被引人只有两种：我（显示"我"）或对端（显示其昵称）。
                     // 两个人的会话里 NameOf 只需要 user 表里的对端一行。
                     string who = q.fromId == me.id
                         ? "我" : Im.NameOf(peerList, q.fromId);
-                    o.Put("quoteWho", JsonValue.NewStr(who));
-                    o.Put("quoteText", JsonValue.NewStr(Im.Excerpt(q.content, 60)));
+                    w.WriteProperty("quoteWho", who);
+                    w.WriteProperty("quoteText", Im.Excerpt(q.content, 60));
                 }
             }
-            items.Append(o);
+            w.EndObject();
             if (r.toId == me.id && r.isRead == 0 && r.id > maxUnread) {
                 maxUnread = r.id;
             }
         }
-        JsonValue body = JsonValue.NewObject();
-        body.Put("peer", JsonValue.NewStr(Convert.ToString(peer.id)));
-        body.Put("peerName", JsonValue.NewStr(Im.NameOf(peerList, peer.id)));
-        body.Put("msgs", items);
+        w.EndArray();
+        w.EndObject();
         /* 打开即批量已读 + 送达位（只清 toId==me 侧）；确有新已读落事件。 */
         int n = await this.OaMessage.Update()
             .Set(a => a.isRead, 1)
@@ -154,14 +158,14 @@ class Im : ApiController {
             await Im.Receipt(this.Held(), Tenant.Cur(), maxUnread,
                 peer.id, me.id, 2);
         }
-        this.Ok(body.ToJson());
+        this.Ok(w.ToJson());
     }
 
     /* 发送：语义同 /admin/oa/messages/send（正文 2048 上限、通知走铃铛）。 */
     [HttpPost]
     [Description("发送私信")]
     [Custom(Perm = PermBit.View)]
-    async void Send() {
+    public async void Send() {
         SysUser me = await this.Me();
         int peerId = this.InInt("peer", 0);
         string content = this.InRaw("content");
@@ -195,10 +199,12 @@ class Im : ApiController {
         await Notify.Send(this.Held(), Tenant.Cur(), peer.id, "oa", "message",
             "新私信：" + Fmt.Text(me.nickname, me.username),
             Im.Excerpt(content, 50),
-            "/admin/oa/messages/chat?peer=" + Convert.ToString(me.id));
-        JsonValue body = JsonValue.NewObject();
-        body.Put("id", JsonValue.NewStr(Convert.ToString(msgId)));
-        body.Put("at", JsonValue.NewStr(Convert.ToString(r.createdAt)));
+            "/admin/oa/messages/chat?peer=" + me.id.ToString());
+        JsonWriter body = new JsonWriter();
+        body.StartObject();
+        body.WriteProperty("id", msgId.ToString());
+        body.WriteProperty("at", r.createdAt.ToString());
+        body.EndObject();
         this.Ok(body.ToJson());
     }
 
@@ -211,7 +217,7 @@ class Im : ApiController {
     [HttpPost]
     [Description("送达回执")]
     [Custom(Perm = PermBit.View)]
-    async void Ack() {
+    public async void Ack() {
         SysUser me = await this.Me();
         int peerId = this.InInt("peer", 0);
         if (peerId > 0) { await this.AckPeer(me, peerId); return; }
@@ -232,23 +238,28 @@ class Im : ApiController {
             await Im.Receipt(this.Held(), Tenant.Cur(), r.id,
                 r.fromId, me.id, 1);
         }
-        JsonValue body = JsonValue.NewObject();
-        body.Put("ok", JsonValue.NewStr("1"));
+        JsonWriter body = new JsonWriter();
+        body.StartObject();
+        body.WriteProperty("ok", "1");
+        body.EndObject();
         this.Ok(body.ToJson());
     }
 
     /* 批量送达：某对端发给我且还没送达的那些，一次打点。回执事件按
        最大 id 记一条（与 Stream 的已读批量同一口径——事件表记的是
        "这批到哪"，不是逐条流水）。 */
-    private async  void AckPeer(SysUser me, int peerId) {
+    private async void AckPeer(SysUser me, int peerId) {
         List<OaMessage> rows = await this.OaMessage
             .Where(a => a.toId == me.id
                 && a.fromId == peerId && a.isAcked == 0)
             .OrderByDescending(a => a.id).ToListAsync();
         if (rows.Count == 0) {
-            JsonValue zero = JsonValue.NewObject();
-            zero.Put("ok", JsonValue.NewStr("1"));
+            JsonWriter zero = new JsonWriter();
+            zero.StartObject();
+            zero.WriteProperty("ok", "1");
+            zero.EndObject();
             this.Ok(zero.ToJson());
+            return;
         }
         int maxId = rows[0].id;
         await this.OaMessage.Update()
@@ -258,8 +269,10 @@ class Im : ApiController {
             .ExecuteAffrowsAsync();
         await Im.Receipt(this.Held(), Tenant.Cur(), maxId,
             peerId, me.id, 1);
-        JsonValue body = JsonValue.NewObject();
-        body.Put("ok", JsonValue.NewStr("1"));
+        JsonWriter body = new JsonWriter();
+        body.StartObject();
+        body.WriteProperty("ok", "1");
+        body.EndObject();
         this.Ok(body.ToJson());
     }
 
@@ -267,12 +280,14 @@ class Im : ApiController {
     [HttpGet]
     [Description("未读数")]
     [Custom(Perm = PermBit.View)]
-    async void Unread() {
+    public async void Unread() {
         SysUser me = await this.Me();
         int total = await this.OaMessage
             .Where(a => a.toId == me.id && a.isRead == 0).CountAsync();
-        JsonValue body = JsonValue.NewObject();
-        body.Put("count", JsonValue.NewStr(Convert.ToString(total)));
+        JsonWriter body = new JsonWriter();
+        body.StartObject();
+        body.WriteProperty("count", total.ToString());
+        body.EndObject();
         this.Ok(body.ToJson());
     }
 
@@ -280,31 +295,34 @@ class Im : ApiController {
     [HttpGet]
     [Description("联系人")]
     [Custom(Perm = PermBit.View)]
-    async void Contacts() {
+    public async void Contacts() {
         SysUser me = await this.Me();
         List<SysUser> users = await this.SysUser
             .Where(a => a.status == 1)
             .OrderBy(a => a.id).ToListAsync();
-        JsonValue items = JsonValue.NewArray();
+        JsonWriter w = new JsonWriter();
+        w.StartObject();
+        w.WriteKey("contacts");
+        w.StartArray();
         for (int i = 0; i < users.Count; i = i + 1) {
             SysUser u = users[i];
             if (u.id == me.id) { continue; }
-            JsonValue o = JsonValue.NewObject();
-            o.Put("id", JsonValue.NewStr(Convert.ToString(u.id)));
-            o.Put("name", JsonValue.NewStr(Fmt.Text(u.nickname, u.username)));
+            w.StartObject();
+            w.WriteProperty("id", u.id.ToString());
+            w.WriteProperty("name", Fmt.Text(u.nickname, u.username));
             // 登录名（客户端资料卡的"微信号"一栏显示它）。
-            o.Put("username", JsonValue.NewStr(u.username));
-            items.Append(o);
+            w.WriteProperty("username", u.username);
+            w.EndObject();
         }
-        JsonValue body = JsonValue.NewObject();
-        body.Put("contacts", items);
-        this.Ok(body.ToJson());
+        w.EndArray();
+        w.EndObject();
+        this.Ok(w.ToJson());
     }
 
     /* ---- helpers ---- */
 
     /* 当前登录账号（ApiAuth 下 uid 必在；查不到即 401——token 版本失效等）。 */
-    private async  SysUser Me() {
+    private async SysUser Me() {
         SysUser me = await this.SysUser
             .Where(a => a.id == Filter.ToInt(this.uid, 0)).FirstAsync();
         if (me == null || me.status != 1) {
@@ -329,23 +347,23 @@ class Im : ApiController {
 
     // Chats() 的按对端聚合槽：一行消息把最新一条与计数一次算清，
     // 不再要四个平行数组按下标对位。
-    class ChatSlot {
-        int peer;
-        string lastText;
-        string lastAt;
-        bool mine;
-        bool readed;
-        bool acked;
-        int unread;
-        int sentUnread;
-        int ackId;
+    public class ChatSlot {
+        public int peer;
+        public string lastText;
+        public string lastAt;
+        public bool mine;
+        public bool readed;
+        public bool acked;
+        public int unread;
+        public int sentUnread;
+        public int ackId;
     }
 
     static string NameOf(List<SysUser> users, int id) {
         for (int i = 0; i < users.Count; i = i + 1) {
             if (users[i].id == id) { return Fmt.Text(users[i].nickname, users[i].username); }
         }
-        return "用户" + Convert.ToString(id);
+        return "用户" + id.ToString();
     }
 
     /* 会话列表/联系人摘要统一走 Fmt.Excerpt：按字节截断前先回退到

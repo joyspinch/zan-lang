@@ -47,12 +47,15 @@ class CollabApi : ApiController {
     [HttpGet]
     [Description("我的会话")]
     [Custom(Perm = PermBit.View)]
-    async void Conversations() {
+    public async void Conversations() {
         SysUser me = await this.Me();
         List<CollabMember> mine = await this.CollabMember
             .Where(a => a.userId == me.id
                 && a.status == "active").ToListAsync();
-        JsonValue items = JsonValue.NewArray();
+        JsonWriter w = new JsonWriter();
+        w.StartObject();
+        w.WriteKey("conversations");
+        w.StartArray();
         for (int i = 0; i < mine.Count; i = i + 1) {
             CollabMember m = mine[i];
             CollabConversation c = await Policy.Conversation(this.Held(),
@@ -66,30 +69,30 @@ class CollabApi : ApiController {
             int unread = await this.CollabMessage
                 .Where(a => a.conversationId == c.id && a.id > m.lastReadMsgId
                     && a.senderId != me.id).CountAsync();
-            JsonValue o = JsonValue.NewObject();
-            o.Put("id", JsonValue.NewStr(Convert.ToString(c.id)));
-            o.Put("type", JsonValue.NewStr(c.type));
-            o.Put("title", JsonValue.NewStr(c.title));
-            o.Put("role", JsonValue.NewStr(m.role));
-            o.Put("members", JsonValue.NewStr(Convert.ToString(members)));
-            o.Put("unread", JsonValue.NewStr(Convert.ToString(unread)));
-            o.Put("lastText", JsonValue.NewStr(last == null
-                ? "" : WebFmt.Excerpt(last.body, 60)));
-            o.Put("lastAt", JsonValue.NewStr(last == null
-                ? "0" : Convert.ToString(last.createdAt)));
-            o.Put("createdAt", JsonValue.NewStr(Convert.ToString(c.createdAt)));
-            items.Append(o);
+            w.StartObject();
+            w.WriteProperty("id", c.id.ToString());
+            w.WriteProperty("type", c.type);
+            w.WriteProperty("title", c.title);
+            w.WriteProperty("role", m.role);
+            w.WriteProperty("members", members.ToString());
+            w.WriteProperty("unread", unread.ToString());
+            w.WriteProperty("lastText", last == null
+                ? "" : WebFmt.Excerpt(last.body, 60));
+            w.WriteProperty("lastAt", last == null
+                ? "0" : last.createdAt.ToString());
+            w.WriteProperty("createdAt", c.createdAt.ToString());
+            w.EndObject();
         }
-        JsonValue body = JsonValue.NewObject();
-        body.Put("conversations", items);
-        this.Ok(body.ToJson());
+        w.EndArray();
+        w.EndObject();
+        this.Ok(w.ToJson());
     }
 
     /* 创建群聊：创建者即 owner；ids 为初始成员（本租户启用账号，重复/自邀忽略）。 */
     [HttpPost]
     [Description("创建群聊")]
     [Custom(Perm = PermBit.Create)]
-    async void Create() {
+    public async void Create() {
         SysUser me = await this.Me();
         string title = this.Need("title", "群聊名称");
         if (title.Length > 64) { title = title.Substring(0, 64); }
@@ -117,25 +120,29 @@ class CollabApi : ApiController {
             await this.InsertMember(Tenant.Cur(), id, invitees[i].id, "member", now);
             added = added + 1;
         }
-        JsonValue cev = JsonValue.NewObject();
-        cev.Put("conversationId", JsonValue.NewStr(Convert.ToString(id)));
-        cev.Put("creatorId", JsonValue.NewStr(Convert.ToString(me.id)));
+        JsonWriter wev = new JsonWriter();
+        wev.StartObject();
+        wev.WriteProperty("conversationId", id.ToString());
+        wev.WriteProperty("creatorId", me.id.ToString());
+        wev.EndObject();
         await this.InsertEvent("conversation.created", "conversation", id,
-            id, me.id, cev);
-        JsonValue body = JsonValue.NewObject();
-        body.Put("id", JsonValue.NewStr(Convert.ToString(id)));
-        body.Put("added", JsonValue.NewStr(Convert.ToString(added)));
+            id, me.id, wev.ToJson());
+        JsonWriter w = new JsonWriter();
+        w.StartObject();
+        w.WriteProperty("id", id.ToString());
+        w.WriteProperty("added", added.ToString());
+        w.EndObject();
         await this.IdemFinish(me.id, "conversation.create", crid,
-            "conversation", id, body);
+            "conversation", id, w.ToJson());
         await this.Commit();
-        this.Ok(body.ToJson());
+        this.Ok(w.ToJson());
     }
 
     /* 成员列表（active）：仅会话成员可见；跨租户/不存在同答 404。 */
     [HttpGet]
     [Description("成员列表")]
     [Custom(Perm = PermBit.View)]
-    async void Members() {
+    public async void Members() {
         SysUser me = await this.Me();
         int conversationId = this.InInt("conversationId", 0);
         CollabConversation c = await Policy.Conversation(this.Held(),
@@ -149,20 +156,23 @@ class CollabApi : ApiController {
             .OrderBy(a => a.id).ToListAsync();
         List<SysUser> users = await this.SysUser
             .ToListAsync();
-        JsonValue items = JsonValue.NewArray();
+        JsonWriter w = new JsonWriter();
+        w.StartObject();
+        w.WriteProperty("conversationId", conversationId.ToString());
+        w.WriteKey("members");
+        w.StartArray();
         for (int i = 0; i < rows.Count; i = i + 1) {
             CollabMember m = rows[i];
-            JsonValue o = JsonValue.NewObject();
-            o.Put("userId", JsonValue.NewStr(Convert.ToString(m.userId)));
-            o.Put("name", JsonValue.NewStr(CollabApi.NameOf(users, m.userId)));
-            o.Put("role", JsonValue.NewStr(m.role));
-            o.Put("joinedAt", JsonValue.NewStr(Convert.ToString(m.joinedAt)));
-            items.Append(o);
+            w.StartObject();
+            w.WriteProperty("userId", m.userId.ToString());
+            w.WriteProperty("name", CollabApi.NameOf(users, m.userId));
+            w.WriteProperty("role", m.role);
+            w.WriteProperty("joinedAt", m.joinedAt.ToString());
+            w.EndObject();
         }
-        JsonValue body = JsonValue.NewObject();
-        body.Put("conversationId", JsonValue.NewStr(Convert.ToString(conversationId)));
-        body.Put("members", items);
-        this.Ok(body.ToJson());
+        w.EndArray();
+        w.EndObject();
+        this.Ok(w.ToJson());
     }
 
     /* 加人：owner|admin；对象须本租户启用账号；已在会话者跳过（added 只计
@@ -170,7 +180,7 @@ class CollabApi : ApiController {
     [HttpPost]
     [Description("加人")]
     [Custom(Perm = PermBit.Update)]
-    async void Invite() {
+    public async void Invite() {
         SysUser me = await this.Me();
         int conversationId = this.InInt("conversationId", 0);
         string crid = this.Crid();
@@ -192,26 +202,30 @@ class CollabApi : ApiController {
             int j = await this.Join(conversationId, invitees[i].id, now);
             if (j == 0) { continue; }
             added = added + j;
-            JsonValue jev = JsonValue.NewObject();
-            jev.Put("conversationId", JsonValue.NewStr(Convert.ToString(conversationId)));
-            jev.Put("userId", JsonValue.NewStr(Convert.ToString(invitees[i].id)));
+            JsonWriter wev = new JsonWriter();
+            wev.StartObject();
+            wev.WriteProperty("conversationId", conversationId.ToString());
+            wev.WriteProperty("userId", invitees[i].id.ToString());
+            wev.EndObject();
             await this.InsertEvent("member.joined", "conversation",
-                conversationId, conversationId, me.id, jev);
+                conversationId, conversationId, me.id, wev.ToJson());
         }
-        JsonValue body = JsonValue.NewObject();
-        body.Put("ok", JsonValue.NewStr("1"));
-        body.Put("added", JsonValue.NewStr(Convert.ToString(added)));
+        JsonWriter w = new JsonWriter();
+        w.StartObject();
+        w.WriteProperty("ok", "1");
+        w.WriteProperty("added", added.ToString());
+        w.EndObject();
         await this.IdemFinish(me.id, "member.invite", crid,
-            "conversation", conversationId, body);
+            "conversation", conversationId, w.ToJson());
         await this.Commit();
-        this.Ok(body.ToJson());
+        this.Ok(w.ToJson());
     }
 
     /* 退出会话：owner 需先转让；已不在会话按幂等成功。 */
     [HttpPost]
     [Description("退出会话")]
     [Custom(Perm = PermBit.Update)]
-    async void Leave() {
+    public async void Leave() {
         SysUser me = await this.Me();
         int conversationId = this.InInt("conversationId", 0);
         string crid = this.Crid();
@@ -221,9 +235,12 @@ class CollabApi : ApiController {
         CollabMember mine = await Policy.Member(this.Held(), Tenant.Cur(),
             conversationId, me.id);
         if (!Policy.IsActive(mine)) {
-            JsonValue gone = JsonValue.NewObject();
-            gone.Put("ok", JsonValue.NewStr("1"));
-            this.Ok(gone.ToJson());
+            JsonWriter wgone = new JsonWriter();
+            wgone.StartObject();
+            wgone.WriteProperty("ok", "1");
+            wgone.EndObject();
+            this.Ok(wgone.ToJson());
+            return;
         }
         if (Policy.IsOwner(mine)) { this.Fail(403, "0403", "群主不能退出，请先转让群主"); }
         await this.Begin();
@@ -235,17 +252,21 @@ class CollabApi : ApiController {
             .Set(a => a.leftAt, now)
             .Where(a => a.id == mine.id && a.status == "active")
             .ExecuteAffrowsAsync();
-        JsonValue lev = JsonValue.NewObject();
-        lev.Put("conversationId", JsonValue.NewStr(Convert.ToString(conversationId)));
-        lev.Put("userId", JsonValue.NewStr(Convert.ToString(me.id)));
+        JsonWriter wev = new JsonWriter();
+        wev.StartObject();
+        wev.WriteProperty("conversationId", conversationId.ToString());
+        wev.WriteProperty("userId", me.id.ToString());
+        wev.EndObject();
         await this.InsertEvent("member.left", "conversation",
-            conversationId, conversationId, me.id, lev);
-        JsonValue body = JsonValue.NewObject();
-        body.Put("ok", JsonValue.NewStr("1"));
+            conversationId, conversationId, me.id, wev.ToJson());
+        JsonWriter w = new JsonWriter();
+        w.StartObject();
+        w.WriteProperty("ok", "1");
+        w.EndObject();
         await this.IdemFinish(me.id, "member.leave", crid,
-            "conversation", conversationId, body);
+            "conversation", conversationId, w.ToJson());
         await this.Commit();
-        this.Ok(body.ToJson());
+        this.Ok(w.ToJson());
     }
 
     /* 移除成员：owner|admin；admin 只能移除 member；owner 不可被移除；
@@ -253,7 +274,7 @@ class CollabApi : ApiController {
     [HttpPost]
     [Description("移除成员")]
     [Custom(Perm = PermBit.Update)]
-    async void Kick() {
+    public async void Kick() {
         SysUser me = await this.Me();
         int conversationId = this.InInt("conversationId", 0);
         int targetId = this.InInt("userId", 0);
@@ -267,9 +288,12 @@ class CollabApi : ApiController {
         CollabMember target = await Policy.Member(this.Held(), Tenant.Cur(),
             conversationId, targetId);
         if (!Policy.IsActive(target)) {
-            JsonValue gone = JsonValue.NewObject();
-            gone.Put("ok", JsonValue.NewStr("1"));
-            this.Ok(gone.ToJson());
+            JsonWriter wgone = new JsonWriter();
+            wgone.StartObject();
+            wgone.WriteProperty("ok", "1");
+            wgone.EndObject();
+            this.Ok(wgone.ToJson());
+            return;
         }
         if (Policy.IsOwner(target)) { this.Fail(403, "0403", "群主不能被移除"); }
         if (target.userId == me.id) { this.Fail(400, "0004", "移除自己请使用退出会话"); }
@@ -285,18 +309,22 @@ class CollabApi : ApiController {
             .Set(a => a.leftAt, now)
             .Where(a => a.id == target.id && a.status == "active")
             .ExecuteAffrowsAsync();
-        JsonValue kev = JsonValue.NewObject();
-        kev.Put("conversationId", JsonValue.NewStr(Convert.ToString(conversationId)));
-        kev.Put("userId", JsonValue.NewStr(Convert.ToString(targetId)));
-        kev.Put("kicked", JsonValue.NewStr("1"));
+        JsonWriter wev = new JsonWriter();
+        wev.StartObject();
+        wev.WriteProperty("conversationId", conversationId.ToString());
+        wev.WriteProperty("userId", targetId.ToString());
+        wev.WriteProperty("kicked", "1");
+        wev.EndObject();
         await this.InsertEvent("member.left", "conversation",
-            conversationId, conversationId, me.id, kev);
-        JsonValue body = JsonValue.NewObject();
-        body.Put("ok", JsonValue.NewStr("1"));
+            conversationId, conversationId, me.id, wev.ToJson());
+        JsonWriter w = new JsonWriter();
+        w.StartObject();
+        w.WriteProperty("ok", "1");
+        w.EndObject();
         await this.IdemFinish(me.id, "member.kick", crid,
-            "conversation", conversationId, body);
+            "conversation", conversationId, w.ToJson());
         await this.Commit();
-        this.Ok(body.ToJson());
+        this.Ok(w.ToJson());
     }
 
     /* 发送消息（text）：成员闸；replyTo 必须本会话内既有消息，否则按 0 收下
@@ -305,7 +333,7 @@ class CollabApi : ApiController {
     [HttpPost]
     [Description("发送消息")]
     [Custom(Perm = PermBit.Update)]
-    async void Send() {
+    public async void Send() {
         SysUser me = await this.Me();
         int conversationId = this.InInt("conversationId", 0);
         string crid = this.Crid();
@@ -392,19 +420,23 @@ class CollabApi : ApiController {
             .Set(a => a.updatedAt, now)
             .Where(a => a.id == conversationId)
             .ExecuteAffrowsAsync();
-        JsonValue ev = JsonValue.NewObject();
-        ev.Put("conversationId", JsonValue.NewStr(Convert.ToString(conversationId)));
-        ev.Put("messageId", JsonValue.NewStr(Convert.ToString(msgId)));
-        ev.Put("senderId", JsonValue.NewStr(Convert.ToString(me.id)));
-        ev.Put("excerpt", JsonValue.NewStr(WebFmt.Excerpt(content, 50)));
+        JsonWriter wev = new JsonWriter();
+        wev.StartObject();
+        wev.WriteProperty("conversationId", conversationId.ToString());
+        wev.WriteProperty("messageId", msgId.ToString());
+        wev.WriteProperty("senderId", me.id.ToString());
+        wev.WriteProperty("excerpt", WebFmt.Excerpt(content, 50));
+        wev.EndObject();
         await this.InsertEvent("message.created", "message", msgId,
-            conversationId, me.id, ev);
-        JsonValue body = JsonValue.NewObject();
-        body.Put("id", JsonValue.NewStr(Convert.ToString(msgId)));
-        body.Put("at", JsonValue.NewStr(Convert.ToString(now)));
-        await this.IdemFinish(me.id, "message.send", crid, "message", msgId, body);
+            conversationId, me.id, wev.ToJson());
+        JsonWriter w = new JsonWriter();
+        w.StartObject();
+        w.WriteProperty("id", msgId.ToString());
+        w.WriteProperty("at", now.ToString());
+        w.EndObject();
+        await this.IdemFinish(me.id, "message.send", crid, "message", msgId, w.ToJson());
         await this.Commit();
-        this.Ok(body.ToJson());
+        this.Ok(w.ToJson());
     }
 
     /* 消息历史（游标分页）：before=起始消息 id（缺省=最新一页），limit ≤200
@@ -415,7 +447,7 @@ class CollabApi : ApiController {
     [HttpGet]
     [Description("消息历史")]
     [Custom(Perm = PermBit.View)]
-    async void Messages() {
+    public async void Messages() {
         SysUser me = await this.Me();
         int conversationId = this.InInt("conversationId", 0);
         int before = this.InInt("before", 0);
@@ -494,54 +526,57 @@ class CollabApi : ApiController {
         }
         List<SysUser> users = await this.SysUser
             .ToListAsync();
-        JsonValue items = JsonValue.NewArray();
+        JsonWriter w = new JsonWriter();
+        w.StartObject();
+        w.WriteProperty("conversationId", conversationId.ToString());
+        w.WriteKey("msgs");
+        w.StartArray();
         for (int i = 0; i < rows.Count; i = i + 1) {
             CollabMessage r = rows[i];
-            JsonValue o = JsonValue.NewObject();
-            o.Put("id", JsonValue.NewStr(Convert.ToString(r.id)));
-            o.Put("from", JsonValue.NewStr(Convert.ToString(r.senderId)));
-            o.Put("name", JsonValue.NewStr(CollabApi.NameOf(users, r.senderId)));
-            o.Put("mine", JsonValue.NewStr(r.senderId == me.id ? "1" : "0"));
+            w.StartObject();
+            w.WriteProperty("id", r.id.ToString());
+            w.WriteProperty("from", r.senderId.ToString());
+            w.WriteProperty("name", CollabApi.NameOf(users, r.senderId));
+            w.WriteProperty("mine", r.senderId == me.id ? "1" : "0");
             if (r.deletedAt > 0) {
-                o.Put("kind", JsonValue.NewStr("deleted"));
-                o.Put("content", JsonValue.NewStr(""));
+                w.WriteProperty("kind", "deleted");
+                w.WriteProperty("content", "");
             } else {
-                o.Put("kind", JsonValue.NewStr(r.kind));
-                o.Put("content", JsonValue.NewStr(r.body));
+                w.WriteProperty("kind", r.kind);
+                w.WriteProperty("content", r.body);
             }
-            o.Put("at", JsonValue.NewStr(Convert.ToString(r.createdAt)));
+            w.WriteProperty("at", r.createdAt.ToString());
             if (r.replyTo > 0 && quoted.ContainsKey(r.replyTo)) {
                 CollabMessage q = quoted[r.replyTo];
                 if (q.deletedAt == 0) {
-                    o.Put("replyTo", JsonValue.NewStr(Convert.ToString(r.replyTo)));
-                    o.Put("quoteWho", JsonValue.NewStr(q.senderId == me.id
-                        ? "我" : CollabApi.NameOf(users, q.senderId)));
-                    o.Put("quoteText", JsonValue.NewStr(WebFmt.Excerpt(q.body, 60)));
+                    w.WriteProperty("replyTo", r.replyTo.ToString());
+                    w.WriteProperty("quoteWho", q.senderId == me.id
+                        ? "我" : CollabApi.NameOf(users, q.senderId));
+                    w.WriteProperty("quoteText", WebFmt.Excerpt(q.body, 60));
                 }
             }
             if (atts.ContainsKey(r.id)) {
                 OaAttachment a0 = atts[r.id];
-                o.Put("attachmentId", JsonValue.NewStr(Convert.ToString(a0.id)));
-                o.Put("fileName", JsonValue.NewStr(a0.fileName));
-                o.Put("size", JsonValue.NewStr(Convert.ToString(a0.size)));
-                o.Put("mime", JsonValue.NewStr(a0.mime));
+                w.WriteProperty("attachmentId", a0.id.ToString());
+                w.WriteProperty("fileName", a0.fileName);
+                w.WriteProperty("size", a0.size.ToString());
+                w.WriteProperty("mime", a0.mime);
                 if (a0.imgWidth > 0) {
-                    o.Put("width", JsonValue.NewStr(Convert.ToString(a0.imgWidth)));
-                    o.Put("height", JsonValue.NewStr(Convert.ToString(a0.imgHeight)));
+                    w.WriteProperty("width", a0.imgWidth.ToString());
+                    w.WriteProperty("height", a0.imgHeight.ToString());
                 }
             }
             if (r.kind == "task" && cards.ContainsKey(r.taskId)) {
                 CollabTask ct = cards[r.taskId];
-                o.Put("taskId", JsonValue.NewStr(Convert.ToString(ct.id)));
-                o.Put("taskTitle", JsonValue.NewStr(ct.title));
-                o.Put("taskStatus", JsonValue.NewStr(ct.status));
+                w.WriteProperty("taskId", ct.id.ToString());
+                w.WriteProperty("taskTitle", ct.title);
+                w.WriteProperty("taskStatus", ct.status);
             }
-            items.Append(o);
+            w.EndObject();
         }
-        JsonValue body = JsonValue.NewObject();
-        body.Put("conversationId", JsonValue.NewStr(Convert.ToString(conversationId)));
-        body.Put("msgs", items);
-        this.Ok(body.ToJson());
+        w.EndArray();
+        w.EndObject();
+        this.Ok(w.ToJson());
     }
 
     /* 已读水位：推进到本会话当前最大消息 id（客户端打开会话时调用一次）。
@@ -549,7 +584,7 @@ class CollabApi : ApiController {
     [HttpPost]
     [Description("已读")]
     [Custom(Perm = PermBit.Update)]
-    async void Read() {
+    public async void Read() {
         SysUser me = await this.Me();
         int conversationId = this.InInt("conversationId", 0);
         CollabConversation c = await Policy.Conversation(this.Held(),
@@ -568,10 +603,12 @@ class CollabApi : ApiController {
                 .Where(a => a.id == mine.id && a.lastReadMsgId < maxId)
                 .ExecuteAffrowsAsync();
         }
-        JsonValue body = JsonValue.NewObject();
-        body.Put("ok", JsonValue.NewStr("1"));
-        body.Put("readUpTo", JsonValue.NewStr(Convert.ToString(maxId)));
-        this.Ok(body.ToJson());
+        JsonWriter w = new JsonWriter();
+        w.StartObject();
+        w.WriteProperty("ok", "1");
+        w.WriteProperty("readUpTo", maxId.ToString());
+        w.EndObject();
+        this.Ok(w.ToJson());
     }
 
     /* 事件补拉（cursor）：after=客户端已见的最大事件 id，返回增量
@@ -582,7 +619,7 @@ class CollabApi : ApiController {
     [HttpGet]
     [Description("事件补拉")]
     [Custom(Perm = PermBit.View)]
-    async void Events() {
+    public async void Events() {
         SysUser me = await this.Me();
         int after = this.InInt("after", 0);
         int limit = this.InInt("limit", 100);
@@ -597,7 +634,10 @@ class CollabApi : ApiController {
                 convs.Add(mine[i].conversationId);
             }
         }
-        JsonValue items = JsonValue.NewArray();
+        JsonWriter w = new JsonWriter();
+        w.StartObject();
+        w.WriteKey("events");
+        w.StartArray();
         int next = after;
         if (convs.Count > 0) {
             List<CollabEvent> rows = await this.CollabEvent
@@ -605,18 +645,15 @@ class CollabApi : ApiController {
                     && convs.Contains(a.conversationId))
                 .OrderBy(a => a.id).Take(limit).ToListAsync();
             for (int i = 0; i < rows.Count; i = i + 1) {
-                JsonValue fr = Policy.Frame(rows[i]);
-                /* 在线帧经 NotifyHub.PushTyped 会带 type="collab"（通道分派键），
-                   补拉在此补齐同一个键——客户端两通道拿到的形状完全一致。 */
-                fr.Put("type", JsonValue.NewStr("collab"));
-                items.Append(fr);
+                string fr = Policy.Frame(rows[i]);
+                w.WriteRaw(fr);
                 next = rows[i].id;
             }
         }
-        JsonValue body = JsonValue.NewObject();
-        body.Put("events", items);
-        body.Put("next", JsonValue.NewStr(Convert.ToString(next)));
-        this.Ok(body.ToJson());
+        w.EndArray();
+        w.WriteProperty("next", next.ToString());
+        w.EndObject();
+        this.Ok(w.ToJson());
     }
 
     /* 实时事件通道：WS 主 + SSE 回退同一端点（Notifies.Stream
@@ -627,15 +664,17 @@ class CollabApi : ApiController {
     [HttpGet]
     [Description("实时事件流")]
     [Custom(Perm = PermBit.View)]
-    async void Listen() {
+    public async void Listen() {
         SysUser me = await this.Me();
         HttpContext ctx = this.Ctx();
         WsSession ws = await WebWs.Upgrade(ctx);
         if (ws != null) {
-            JsonValue first = JsonValue.NewObject();
-            first.PutStr("type", "collab.hello");
-            first.PutStr("userId", Convert.ToString(me.id));
-            if (!await ws.SendText(first.ToJson())) { return; }
+            JsonWriter w = new JsonWriter();
+            w.StartObject();
+            w.WriteProperty("type", "collab.hello");
+            w.WriteProperty("userId", me.id.ToString());
+            w.EndObject();
+            if (!await ws.SendText(w.ToJson())) { return; }
             Zan.Web.NotifyHub.JoinWs(me.id, ws);
             long started = WebApp.NowSeconds();
             while (ws.Open()) {
@@ -662,8 +701,11 @@ class CollabApi : ApiController {
         /* SSE 回退通道：与 WS 同一端点，按 Upgrade 头自动分流。 */
         if (!await ctx.SseOpen()) { return; }
         Zan.Web.NotifyHub.JoinSse(me.id, ctx);
-        if (!await ctx.SseSend("collab.hello", "{\"userId\":"
-                + Convert.ToString(me.id) + "}")) {
+        JsonWriter whello = new JsonWriter();
+        whello.StartObject();
+        whello.WriteProperty("userId", me.id.ToString());
+        whello.EndObject();
+        if (!await ctx.SseSend("collab.hello", whello.ToJson())) {
             Zan.Web.NotifyHub.LeaveSse(ctx);
             return;
         }
@@ -685,7 +727,7 @@ class CollabApi : ApiController {
     [HttpPost]
     [Custom(Perm = PermBit.Create, ApiMax = 30, Upload = true)]
     [Description("上传附件")]
-    async void UploadAttachment() {
+    public async void UploadAttachment() {
         SysUser me = await this.Me();
         if (this.ctx.uploadPath.Length == 0) {
             this.Fail(400, "1002", "没有上传内容");
@@ -708,17 +750,19 @@ class CollabApi : ApiController {
             .Set(a => a.imgHeight, dim.height)
             .Set(a => a.scanStatus, "clean")
             .Where(a => a.id == id).ExecuteAffrowsAsync();
-        JsonValue body = JsonValue.NewObject();
-        body.Put("id", JsonValue.NewStr(Convert.ToString(id)));
-        body.Put("name", JsonValue.NewStr(name));
-        body.Put("size", JsonValue.NewStr(Convert.ToString(size)));
-        body.Put("mime", JsonValue.NewStr(mime));
-        body.Put("width", JsonValue.NewStr(Convert.ToString(dim.width)));
-        body.Put("height", JsonValue.NewStr(Convert.ToString(dim.height)));
+        JsonWriter w = new JsonWriter();
+        w.StartObject();
+        w.WriteProperty("id", id.ToString());
+        w.WriteProperty("name", name);
+        w.WriteProperty("size", size.ToString());
+        w.WriteProperty("mime", mime);
+        w.WriteProperty("width", dim.width.ToString());
+        w.WriteProperty("height", dim.height.ToString());
+        w.EndObject();
         await this.IdemFinish(me.id, "attachment.upload", crid,
-            "attachment", id, body);
+            "attachment", id, w.ToJson());
         await this.Commit();
-        this.Ok(body.ToJson());
+        this.Ok(w.ToJson());
     }
 
     /* 下载附件：授权链 = 租户闸（跨租户与不存在同 404，不泄露
@@ -729,7 +773,7 @@ class CollabApi : ApiController {
     [HttpGet]
     [Description("下载附件")]
     [Custom(Perm = PermBit.View)]
-    async void DownloadAttachment() {
+    public async void DownloadAttachment() {
         SysUser me = await this.Me();
         int id = this.InInt("id", 0);
         OaAttachment att = await this.OaAttachment
@@ -800,12 +844,14 @@ class CollabApi : ApiController {
         if (n == 0) { this.Fail(409, "0409", "任务状态已变化，请刷新后重试"); }
         await this.TaskLog(t, t.id, eventType, me.id, toStatus, t.assigneeId,
             t.ownerId, t.progress, "", this.In("content"), crid);
-        JsonValue body = JsonValue.NewObject();
-        body.Put("ok", JsonValue.NewStr("1"));
-        body.Put("status", JsonValue.NewStr(toStatus));
-        await this.IdemFinish(me.id, op, crid, "task", t.id, body);
+        JsonWriter w = new JsonWriter();
+        w.StartObject();
+        w.WriteProperty("ok", "1");
+        w.WriteProperty("status", toStatus);
+        w.EndObject();
+        await this.IdemFinish(me.id, op, crid, "task", t.id, w.ToJson());
         await this.Commit();
-        this.Ok(body.ToJson());
+        this.Ok(w.ToJson());
     }
 
     /* 任务事件追加（只增不改）：from* 从迁移前快照取。 */
@@ -858,7 +904,7 @@ class CollabApi : ApiController {
     [HttpPost]
     [Description("创建任务")]
     [Custom(Perm = PermBit.Create)]
-    async void TaskCreate() {
+    public async void TaskCreate() {
         SysUser me = await this.Me();
         string title = this.Need("title", "任务标题");
         if (title.Length > 128) { title = title.Substring(0, 128); }
@@ -878,9 +924,9 @@ class CollabApi : ApiController {
             assignee = await this.SysUser
                 .Where(a => a.id == assigneeId
                     && a.status == 1).FirstAsync();
-            if (assignee == null) { this.Fail(404, "0404", "执行人不存在或已停用"); }
+            if (assignee == null) { this.Fail(404, "0404", "指定执行人不存在或已停用"); }
         }
-        int priority = this.InInt("priority", 0);
+        int priority = this.InInt("priority", 1);
         if (priority < 0) { priority = 0; }
         if (priority > 3) { priority = 3; }
         await this.Begin();
@@ -908,12 +954,14 @@ class CollabApi : ApiController {
         int id = await this.CollabTask.Insert(t).ExecuteIdentityAsync();
         await this.TaskLog(t, id, "created", me.id, t.status, t.assigneeId,
             t.ownerId, 0, "", "", crid);
-        JsonValue body = JsonValue.NewObject();
-        body.Put("id", JsonValue.NewStr(Convert.ToString(id)));
-        body.Put("status", JsonValue.NewStr(t.status));
-        await this.IdemFinish(me.id, "task.create", crid, "task", id, body);
+        JsonWriter w = new JsonWriter();
+        w.StartObject();
+        w.WriteProperty("id", id.ToString());
+        w.WriteProperty("status", t.status);
+        w.EndObject();
+        await this.IdemFinish(me.id, "task.create", crid, "task", id, w.ToJson());
         await this.Commit();
-        this.Ok(body.ToJson());
+        this.Ok(w.ToJson());
     }
 
     /* 我的任务：执行人或责任侧；status 过滤（缺省全部）；overdue 由 dueAt
@@ -921,7 +969,7 @@ class CollabApi : ApiController {
     [HttpGet]
     [Description("我的任务")]
     [Custom(Perm = PermBit.View)]
-    async void TasksMine() {
+    public async void TasksMine() {
         SysUser me = await this.Me();
         string status = this.In("status");
         long now = WebApp.NowSeconds();
@@ -929,55 +977,61 @@ class CollabApi : ApiController {
             .Where(a => (a.assigneeId == me.id || a.ownerId == me.id))
             .WhereIf(status.Length > 0 && status != "all", a => a.status == status)
             .OrderBy(a => a.id).Take(100).ToListAsync();
-        JsonValue items = JsonValue.NewArray();
+        JsonWriter w = new JsonWriter();
+        w.StartObject();
+        w.WriteKey("tasks");
+        w.StartArray();
         for (int i = 0; i < rows.Count; i = i + 1) {
             CollabTask t = rows[i];
-            JsonValue o = JsonValue.NewObject();
-            o.Put("id", JsonValue.NewStr(Convert.ToString(t.id)));
-            o.Put("title", JsonValue.NewStr(t.title));
-            o.Put("status", JsonValue.NewStr(t.status));
-            o.Put("priority", JsonValue.NewStr(Convert.ToString(t.priority)));
-            o.Put("progress", JsonValue.NewStr(Convert.ToString(t.progress)));
-            o.Put("ownerId", JsonValue.NewStr(Convert.ToString(t.ownerId)));
-            o.Put("assigneeId", JsonValue.NewStr(Convert.ToString(t.assigneeId)));
-            o.Put("mine", JsonValue.NewStr(t.assigneeId == me.id ? "1" : "0"));
-            o.Put("overdue", JsonValue.NewStr(
+            w.StartObject();
+            w.WriteProperty("id", t.id.ToString());
+            w.WriteProperty("title", t.title);
+            w.WriteProperty("status", t.status);
+            w.WriteProperty("priority", t.priority.ToString());
+            w.WriteProperty("progress", t.progress.ToString());
+            w.WriteProperty("ownerId", t.ownerId.ToString());
+            w.WriteProperty("assigneeId", t.assigneeId.ToString());
+            w.WriteProperty("mine", t.assigneeId == me.id ? "1" : "0");
+            w.WriteProperty("overdue",
                 t.dueAt > 0 && t.dueAt < now && t.status != "done"
-                    && t.status != "cancelled" ? "1" : "0"));
-            o.Put("dueAt", JsonValue.NewStr(Convert.ToString(t.dueAt)));
-            o.Put("version", JsonValue.NewStr(Convert.ToString(t.version)));
-            items.Append(o);
+                    && t.status != "cancelled" ? "1" : "0");
+            w.WriteProperty("dueAt", t.dueAt.ToString());
+            w.WriteProperty("version", t.version.ToString());
+            w.EndObject();
         }
-        JsonValue body = JsonValue.NewObject();
-        body.Put("tasks", items);
-        this.Ok(body.ToJson());
+        w.EndArray();
+        w.EndObject();
+        this.Ok(w.ToJson());
     }
 
     /* 任务池：未分配任务（可按会话过滤），认领入口。 */
     [HttpGet]
     [Description("任务池")]
     [Custom(Perm = PermBit.View)]
-    async void TasksPool() {
+    public async void TasksPool() {
         SysUser me = await this.Me();
         int conversationId = this.InInt("conversationId", 0);
         List<CollabTask> rows = await this.CollabTask
             .Where(a => a.status == "unassigned")
             .WhereIf(conversationId > 0, a => a.conversationId == conversationId)
             .OrderBy(a => a.id).Take(100).ToListAsync();
-        JsonValue items = JsonValue.NewArray();
+        JsonWriter w = new JsonWriter();
+        w.StartObject();
+        w.WriteKey("tasks");
+        w.StartArray();
         for (int i = 0; i < rows.Count; i = i + 1) {
             CollabTask t = rows[i];
-            JsonValue o = JsonValue.NewObject();
-            o.Put("id", JsonValue.NewStr(Convert.ToString(t.id)));
-            o.Put("title", JsonValue.NewStr(t.title));
-            o.Put("conversationId", JsonValue.NewStr(Convert.ToString(t.conversationId)));
-            o.Put("priority", JsonValue.NewStr(Convert.ToString(t.priority)));
-            o.Put("dueAt", JsonValue.NewStr(Convert.ToString(t.dueAt)));
-            items.Append(o);
+            w.StartObject();
+            w.WriteProperty("id", t.id.ToString());
+            w.WriteProperty("title", t.title);
+            w.WriteProperty("conversationId", t.conversationId.ToString());
+            w.WriteProperty("priority", t.priority.ToString());
+            w.WriteProperty("dueAt", t.dueAt.ToString());
+            w.EndObject();
         }
-        JsonValue body = JsonValue.NewObject();
-        body.Put("tasks", items);
-        this.Ok(body.ToJson());
+        w.EndArray();
+        w.EndObject();
+        this.Ok(w.ToJson());
     }
 
     /* 任务详情 + 不可变时间线（最近 100 条，升序）。参与可见：责任侧/
@@ -985,43 +1039,13 @@ class CollabApi : ApiController {
     [HttpGet]
     [Description("任务详情")]
     [Custom(Perm = PermBit.View)]
-    async void TaskDetail() {
+    public async void TaskDetail() {
         SysUser me = await this.Me();
         CollabTask t = await this.LoadTask(this.InInt("id", 0));
         if (!await this.TaskSees(t, me)) { this.Fail(403, "0403", "无权查看该任务"); }
         List<CollabTaskEvent> evs = await this.CollabTaskEvent
             .Where(a => a.taskId == t.id)
             .OrderBy(a => a.id).Take(100).ToListAsync();
-        JsonValue items = JsonValue.NewArray();
-        for (int i = 0; i < evs.Count; i = i + 1) {
-            CollabTaskEvent e = evs[i];
-            JsonValue o = JsonValue.NewObject();
-            o.Put("id", JsonValue.NewStr(Convert.ToString(e.id)));
-            o.Put("event", JsonValue.NewStr(e.eventType));
-            o.Put("actorId", JsonValue.NewStr(Convert.ToString(e.actorId)));
-            o.Put("fromStatus", JsonValue.NewStr(e.fromStatus));
-            o.Put("toStatus", JsonValue.NewStr(e.toStatus));
-            o.Put("fromAssigneeId", JsonValue.NewStr(Convert.ToString(e.fromAssigneeId)));
-            o.Put("toAssigneeId", JsonValue.NewStr(Convert.ToString(e.toAssigneeId)));
-            o.Put("fromProgress", JsonValue.NewStr(Convert.ToString(e.fromProgress)));
-            o.Put("toProgress", JsonValue.NewStr(Convert.ToString(e.toProgress)));
-            o.Put("reason", JsonValue.NewStr(e.reason));
-            o.Put("content", JsonValue.NewStr(e.content));
-            o.Put("at", JsonValue.NewStr(Convert.ToString(e.createdAt)));
-            items.Append(o);
-        }
-        JsonValue body = JsonValue.NewObject();
-        body.Put("id", JsonValue.NewStr(Convert.ToString(t.id)));
-        body.Put("title", JsonValue.NewStr(t.title));
-        body.Put("description", JsonValue.NewStr(t.description));
-        body.Put("status", JsonValue.NewStr(t.status));
-        body.Put("progress", JsonValue.NewStr(Convert.ToString(t.progress)));
-        body.Put("ownerId", JsonValue.NewStr(Convert.ToString(t.ownerId)));
-        body.Put("assigneeId", JsonValue.NewStr(Convert.ToString(t.assigneeId)));
-        body.Put("blockedReason", JsonValue.NewStr(t.blockedReason));
-        body.Put("dueAt", JsonValue.NewStr(Convert.ToString(t.dueAt)));
-        body.Put("version", JsonValue.NewStr(Convert.ToString(t.version)));
-        /* 任务附件：task 绑定的附件行，与消息附件同字段形态。 */
         List<CollabAttachmentLink> tlinks = await this.CollabAttachmentLink
             .Where(a => a.ownerType == "task"
                 && a.ownerId == t.id).ToListAsync();
@@ -1029,27 +1053,65 @@ class CollabApi : ApiController {
         for (int i = 0; i < tlinks.Count; i = i + 1) {
             taids.Add(tlinks[i].attachmentId);
         }
-        JsonValue atts2 = JsonValue.NewArray();
+        List<OaAttachment> trows = new List<OaAttachment>();
         if (taids.Count > 0) {
-            List<OaAttachment> trows = await this.OaAttachment
+            trows = await this.OaAttachment
                 .Where(a => taids.Contains(a.id)).ToListAsync();
-            for (int i = 0; i < trows.Count; i = i + 1) {
-                OaAttachment a1 = trows[i];
-                JsonValue o2 = JsonValue.NewObject();
-                o2.Put("attachmentId", JsonValue.NewStr(Convert.ToString(a1.id)));
-                o2.Put("fileName", JsonValue.NewStr(a1.fileName));
-                o2.Put("size", JsonValue.NewStr(Convert.ToString(a1.size)));
-                o2.Put("mime", JsonValue.NewStr(a1.mime));
-                if (a1.imgWidth > 0) {
-                    o2.Put("width", JsonValue.NewStr(Convert.ToString(a1.imgWidth)));
-                    o2.Put("height", JsonValue.NewStr(Convert.ToString(a1.imgHeight)));
-                }
-                atts2.Append(o2);
-            }
         }
-        body.Put("attachments", atts2);
-        body.Put("events", items);
-        this.Ok(body.ToJson());
+
+        JsonWriter w = new JsonWriter();
+        w.StartObject();
+        w.WriteProperty("id", t.id.ToString());
+        w.WriteProperty("title", t.title);
+        w.WriteProperty("description", t.description);
+        w.WriteProperty("status", t.status);
+        w.WriteProperty("progress", t.progress.ToString());
+        w.WriteProperty("ownerId", t.ownerId.ToString());
+        w.WriteProperty("assigneeId", t.assigneeId.ToString());
+        w.WriteProperty("blockedReason", t.blockedReason);
+        w.WriteProperty("dueAt", t.dueAt.ToString());
+        w.WriteProperty("version", t.version.ToString());
+
+        w.WriteKey("attachments");
+        w.StartArray();
+        for (int i = 0; i < trows.Count; i = i + 1) {
+            OaAttachment a1 = trows[i];
+            w.StartObject();
+            w.WriteProperty("attachmentId", a1.id.ToString());
+            w.WriteProperty("fileName", a1.fileName);
+            w.WriteProperty("size", a1.size.ToString());
+            w.WriteProperty("mime", a1.mime);
+            if (a1.imgWidth > 0) {
+                w.WriteProperty("width", a1.imgWidth.ToString());
+                w.WriteProperty("height", a1.imgHeight.ToString());
+            }
+            w.EndObject();
+        }
+        w.EndArray();
+
+        w.WriteKey("events");
+        w.StartArray();
+        for (int i = 0; i < evs.Count; i = i + 1) {
+            CollabTaskEvent e = evs[i];
+            w.StartObject();
+            w.WriteProperty("id", e.id.ToString());
+            w.WriteProperty("event", e.eventType);
+            w.WriteProperty("actorId", e.actorId.ToString());
+            w.WriteProperty("fromStatus", e.fromStatus);
+            w.WriteProperty("toStatus", e.toStatus);
+            w.WriteProperty("fromAssigneeId", e.fromAssigneeId.ToString());
+            w.WriteProperty("toAssigneeId", e.toAssigneeId.ToString());
+            w.WriteProperty("fromProgress", e.fromProgress.ToString());
+            w.WriteProperty("toProgress", e.toProgress.ToString());
+            w.WriteProperty("reason", e.reason);
+            w.WriteProperty("content", e.content);
+            w.WriteProperty("at", e.createdAt.ToString());
+            w.EndObject();
+        }
+        w.EndArray();
+
+        w.EndObject();
+        this.Ok(w.ToJson());
     }
 
     /* 认领：CAS——unassigned 且 assignee=0 且 version 相符才生效，
@@ -1057,7 +1119,7 @@ class CollabApi : ApiController {
     [HttpPost]
     [Description("认领任务")]
     [Custom(Perm = PermBit.Update)]
-    async void TaskClaim() {
+    public async void TaskClaim() {
         SysUser me = await this.Me();
         CollabTask t = await this.LoadTask(this.InInt("id", 0));
         string crid = this.Crid();
@@ -1082,12 +1144,14 @@ class CollabApi : ApiController {
         if (n == 0) { this.Fail(409, "0409", "任务已被他人认领或状态已变化"); }
         await this.TaskLog(t, t.id, "claimed", me.id, "claimed", me.id,
             t.ownerId, t.progress, "", "", crid);
-        JsonValue body = JsonValue.NewObject();
-        body.Put("ok", JsonValue.NewStr("1"));
-        body.Put("status", JsonValue.NewStr("claimed"));
-        await this.IdemFinish(me.id, "task.claim", crid, "task", t.id, body);
+        JsonWriter w = new JsonWriter();
+        w.StartObject();
+        w.WriteProperty("ok", "1");
+        w.WriteProperty("status", "claimed");
+        w.EndObject();
+        await this.IdemFinish(me.id, "task.claim", crid, "task", t.id, w.ToJson());
         await this.Commit();
-        this.Ok(body.ToJson());
+        this.Ok(w.ToJson());
     }
 
     /* 分配（unassigned→claimed）或转交（claimed/in_progress/blocked 内换人，
@@ -1095,7 +1159,7 @@ class CollabApi : ApiController {
     [HttpPost]
     [Description("分配或转交任务")]
     [Custom(Perm = PermBit.Update)]
-    async void TaskAssign() {
+    public async void TaskAssign() {
         SysUser me = await this.Me();
         CollabTask t = await this.LoadTask(this.InInt("id", 0));
         string crid = this.Crid();
@@ -1131,19 +1195,21 @@ class CollabApi : ApiController {
         if (n == 0) { this.Fail(409, "0409", "任务状态已变化，请刷新后重试"); }
         await this.TaskLog(t, t.id, isAssign ? "assigned" : "transferred", me.id,
             toStatus, target.id, t.ownerId, t.progress, reason, "", crid);
-        JsonValue body = JsonValue.NewObject();
-        body.Put("ok", JsonValue.NewStr("1"));
-        body.Put("assigneeId", JsonValue.NewStr(Convert.ToString(target.id)));
-        await this.IdemFinish(me.id, "task.assign", crid, "task", t.id, body);
+        JsonWriter w = new JsonWriter();
+        w.StartObject();
+        w.WriteProperty("ok", "1");
+        w.WriteProperty("assigneeId", target.id.ToString());
+        w.EndObject();
+        await this.IdemFinish(me.id, "task.assign", crid, "task", t.id, w.ToJson());
         await this.Commit();
-        this.Ok(body.ToJson());
+        this.Ok(w.ToJson());
     }
 
     /* 开始：claimed→in_progress（执行人）。 */
     [HttpPost]
     [Description("开始任务")]
     [Custom(Perm = PermBit.Update)]
-    async void TaskStart() {
+    public async void TaskStart() {
         await this.Transition("task.start", "started", "claimed", "in_progress");
     }
 
@@ -1151,7 +1217,7 @@ class CollabApi : ApiController {
     [HttpPost]
     [Description("更新进度")]
     [Custom(Perm = PermBit.Update)]
-    async void TaskProgress() {
+    public async void TaskProgress() {
         SysUser me = await this.Me();
         CollabTask t = await this.LoadTask(this.InInt("id", 0));
         string crid = this.Crid();
@@ -1173,12 +1239,14 @@ class CollabApi : ApiController {
         if (n == 0) { this.Fail(409, "0409", "任务状态已变化，请刷新后重试"); }
         await this.TaskLog(t, t.id, "progress", me.id, "in_progress", me.id,
             t.ownerId, progress, "", this.In("content"), crid);
-        JsonValue body = JsonValue.NewObject();
-        body.Put("ok", JsonValue.NewStr("1"));
-        body.Put("progress", JsonValue.NewStr(Convert.ToString(progress)));
-        await this.IdemFinish(me.id, "task.progress", crid, "task", t.id, body);
+        JsonWriter w = new JsonWriter();
+        w.StartObject();
+        w.WriteProperty("ok", "1");
+        w.WriteProperty("progress", progress.ToString());
+        w.EndObject();
+        await this.IdemFinish(me.id, "task.progress", crid, "task", t.id, w.ToJson());
         await this.Commit();
-        this.Ok(body.ToJson());
+        this.Ok(w.ToJson());
     }
 
     /* 阻塞（必填原因）/解除阻塞：in_progress→blocked→in_progress
@@ -1186,7 +1254,7 @@ class CollabApi : ApiController {
     [HttpPost]
     [Description("标记阻塞")]
     [Custom(Perm = PermBit.Update)]
-    async void TaskBlock() {
+    public async void TaskBlock() {
         SysUser me = await this.Me();
         CollabTask t = await this.LoadTask(this.InInt("id", 0));
         string crid = this.Crid();
@@ -1210,18 +1278,20 @@ class CollabApi : ApiController {
         if (n == 0) { this.Fail(409, "0409", "任务状态已变化，请刷新后重试"); }
         await this.TaskLog(t, t.id, "blocked", me.id, "blocked", t.assigneeId,
             t.ownerId, t.progress, reason, "", crid);
-        JsonValue body = JsonValue.NewObject();
-        body.Put("ok", JsonValue.NewStr("1"));
-        body.Put("status", JsonValue.NewStr("blocked"));
-        await this.IdemFinish(me.id, "task.block", crid, "task", t.id, body);
+        JsonWriter w = new JsonWriter();
+        w.StartObject();
+        w.WriteProperty("ok", "1");
+        w.WriteProperty("status", "blocked");
+        w.EndObject();
+        await this.IdemFinish(me.id, "task.block", crid, "task", t.id, w.ToJson());
         await this.Commit();
-        this.Ok(body.ToJson());
+        this.Ok(w.ToJson());
     }
 
     [HttpPost]
     [Description("解除阻塞")]
     [Custom(Perm = PermBit.Update)]
-    async void TaskUnblock() {
+    public async void TaskUnblock() {
         await this.Transition("task.unblock", "unblocked", "blocked", "in_progress");
     }
 
@@ -1229,7 +1299,7 @@ class CollabApi : ApiController {
     [HttpPost]
     [Description("提交验收")]
     [Custom(Perm = PermBit.Update)]
-    async void TaskSubmit() {
+    public async void TaskSubmit() {
         await this.Transition("task.submit", "submitted", "in_progress", "review");
     }
 
@@ -1237,7 +1307,7 @@ class CollabApi : ApiController {
     [HttpPost]
     [Description("验收通过")]
     [Custom(Perm = PermBit.Update)]
-    async void TaskApprove() {
+    public async void TaskApprove() {
         SysUser me = await this.Me();
         CollabTask t = await this.LoadTask(this.InInt("id", 0));
         string crid = this.Crid();
@@ -1259,19 +1329,22 @@ class CollabApi : ApiController {
         if (n == 0) { this.Fail(409, "0409", "任务状态已变化，请刷新后重试"); }
         await this.TaskLog(t, t.id, "approved", me.id, "done", t.assigneeId,
             t.ownerId, 100, "", this.In("content"), crid);
-        JsonValue body = JsonValue.NewObject();
-        body.Put("ok", JsonValue.NewStr("1"));
-        body.Put("status", JsonValue.NewStr("done"));
-        await this.IdemFinish(me.id, "task.approve", crid, "task", t.id, body);
+        JsonWriter body = new JsonWriter();
+        body.StartObject();
+        body.WriteProperty("ok", "1");
+        body.WriteProperty("status", "done");
+        body.EndObject();
+        string bodyJson = body.ToJson();
+        await this.IdemFinish(me.id, "task.approve", crid, "task", t.id, bodyJson);
         await this.Commit();
-        this.Ok(body.ToJson());
+        this.Ok(bodyJson);
     }
 
     /* 驳回返工（必填理由）：review→in_progress（owner/creator）。 */
     [HttpPost]
     [Description("驳回返工")]
     [Custom(Perm = PermBit.Update)]
-    async void TaskReject() {
+    public async void TaskReject() {
         SysUser me = await this.Me();
         CollabTask t = await this.LoadTask(this.InInt("id", 0));
         string crid = this.Crid();
@@ -1292,12 +1365,15 @@ class CollabApi : ApiController {
         if (n == 0) { this.Fail(409, "0409", "任务状态已变化，请刷新后重试"); }
         await this.TaskLog(t, t.id, "rejected", me.id, "in_progress", t.assigneeId,
             t.ownerId, t.progress, reason, "", crid);
-        JsonValue body = JsonValue.NewObject();
-        body.Put("ok", JsonValue.NewStr("1"));
-        body.Put("status", JsonValue.NewStr("in_progress"));
-        await this.IdemFinish(me.id, "task.reject", crid, "task", t.id, body);
+        JsonWriter body = new JsonWriter();
+        body.StartObject();
+        body.WriteProperty("ok", "1");
+        body.WriteProperty("status", "in_progress");
+        body.EndObject();
+        string bodyJson = body.ToJson();
+        await this.IdemFinish(me.id, "task.reject", crid, "task", t.id, bodyJson);
         await this.Commit();
-        this.Ok(body.ToJson());
+        this.Ok(bodyJson);
     }
 
     /* 取消（owner/creator；done/cancelled 不可取消）：删除=取消+事件，
@@ -1305,7 +1381,7 @@ class CollabApi : ApiController {
     [HttpPost]
     [Description("取消任务")]
     [Custom(Perm = PermBit.Update)]
-    async void TaskCancel() {
+    public async void TaskCancel() {
         SysUser me = await this.Me();
         CollabTask t = await this.LoadTask(this.InInt("id", 0));
         string crid = this.Crid();
@@ -1328,12 +1404,15 @@ class CollabApi : ApiController {
         if (n == 0) { this.Fail(409, "0409", "任务状态已变化，请刷新后重试"); }
         await this.TaskLog(t, t.id, "cancelled", me.id, "cancelled", t.assigneeId,
             t.ownerId, t.progress, reason, "", crid);
-        JsonValue body = JsonValue.NewObject();
-        body.Put("ok", JsonValue.NewStr("1"));
-        body.Put("status", JsonValue.NewStr("cancelled"));
-        await this.IdemFinish(me.id, "task.cancel", crid, "task", t.id, body);
+        JsonWriter body = new JsonWriter();
+        body.StartObject();
+        body.WriteProperty("ok", "1");
+        body.WriteProperty("status", "cancelled");
+        body.EndObject();
+        string bodyJson = body.ToJson();
+        await this.IdemFinish(me.id, "task.cancel", crid, "task", t.id, bodyJson);
         await this.Commit();
-        this.Ok(body.ToJson());
+        this.Ok(bodyJson);
     }
 
     /* 任务附件：上传在 /uploadattachment（先传后绑，一字节
@@ -1343,7 +1422,7 @@ class CollabApi : ApiController {
     [HttpPost]
     [Description("任务挂附件")]
     [Custom(Perm = PermBit.Update)]
-    async void TaskAttach() {
+    public async void TaskAttach() {
         SysUser me = await this.Me();
         CollabTask t = await this.LoadTask(this.InInt("id", 0));
         if (!CollabApi.TaskOwns(t, me) && t.assigneeId != me.id) {
@@ -1371,11 +1450,14 @@ class CollabApi : ApiController {
         await this.CollabAttachmentLink.Insert(link).ExecuteIdentityAsync();
         await this.TaskLog(t, t.id, "attached", me.id, t.status, t.assigneeId,
             t.ownerId, t.progress, "", att.fileName, crid);
-        JsonValue body = JsonValue.NewObject();
-        body.Put("ok", JsonValue.NewStr("1"));
-        await this.IdemFinish(me.id, "task.attach", crid, "task", t.id, body);
+        JsonWriter body = new JsonWriter();
+        body.StartObject();
+        body.WriteProperty("ok", "1");
+        body.EndObject();
+        string bodyJson = body.ToJson();
+        await this.IdemFinish(me.id, "task.attach", crid, "task", t.id, bodyJson);
         await this.Commit();
-        this.Ok(body.ToJson());
+        this.Ok(bodyJson);
     }
 
     /* 撤回：仅发送者本人；deletedAt 置时不抹行，历史按
@@ -1383,7 +1465,7 @@ class CollabApi : ApiController {
     [HttpPost]
     [Description("撤回消息")]
     [Custom(Perm = PermBit.Update)]
-    async void Recall() {
+    public async void Recall() {
         SysUser me = await this.Me();
         string crid = this.Crid();
         CollabMessage r = await this.CollabMessage
@@ -1395,9 +1477,12 @@ class CollabApi : ApiController {
             r.conversationId, me.id);
         if (!Policy.IsActive(mine)) { this.Fail(403, "0403", "仅会话成员可撤回"); }
         if (r.deletedAt > 0) {
-            JsonValue gone = JsonValue.NewObject();
-            gone.Put("ok", JsonValue.NewStr("1"));
+            JsonWriter gone = new JsonWriter();
+            gone.StartObject();
+            gone.WriteProperty("ok", "1");
+            gone.EndObject();
             this.Ok(gone.ToJson());
+            return;
         }
         await this.Begin();
         string stored = await this.IdemBegin(me.id, "message.recall", crid);
@@ -1408,16 +1493,21 @@ class CollabApi : ApiController {
             .Where(a => a.id == r.id && a.deletedAt == 0)
             .ExecuteAffrowsAsync();
         if (n == 0) { this.Fail(409, "0409", "消息状态已变化"); }
-        JsonValue ev = JsonValue.NewObject();
-        ev.Put("conversationId", JsonValue.NewStr(Convert.ToString(r.conversationId)));
-        ev.Put("messageId", JsonValue.NewStr(Convert.ToString(r.id)));
+        JsonWriter ev = new JsonWriter();
+        ev.StartObject();
+        ev.WriteProperty("conversationId", r.conversationId.ToString());
+        ev.WriteProperty("messageId", r.id.ToString());
+        ev.EndObject();
         await this.InsertEvent("message.recalled", "message", r.id,
-            r.conversationId, me.id, ev);
-        JsonValue body = JsonValue.NewObject();
-        body.Put("ok", JsonValue.NewStr("1"));
-        await this.IdemFinish(me.id, "message.recall", crid, "message", r.id, body);
+            r.conversationId, me.id, ev.ToJson());
+        JsonWriter body = new JsonWriter();
+        body.StartObject();
+        body.WriteProperty("ok", "1");
+        body.EndObject();
+        string bodyJson = body.ToJson();
+        await this.IdemFinish(me.id, "message.recall", crid, "message", r.id, bodyJson);
         await this.Commit();
-        this.Ok(body.ToJson());
+        this.Ok(bodyJson);
     }
 
     /* ---- helpers ---- */
@@ -1517,10 +1607,10 @@ class CollabApi : ApiController {
     }
 
     /* 事务收尾：回填应答与资源回链（提交前，与事实行同生共死）。 */
-    private async  void IdemFinish(int actorId, string operation, string crid,
-                          string resourceType, int resourceId, JsonValue body) {
+    private async void IdemFinish(int actorId, string operation, string crid,
+                          string resourceType, int resourceId, string bodyJson) {
         await this.CollabIdem.Update()
-            .Set(a => a.response, body.ToJson())
+            .Set(a => a.response, bodyJson)
             .Set(a => a.resourceType, resourceType)
             .Set(a => a.resourceId, resourceId)
             .Where(a => a.actorId == actorId
@@ -1528,16 +1618,36 @@ class CollabApi : ApiController {
             .ExecuteAffrowsAsync();
     }
 
-    /* 重放收尾：原应答 + replayed=1；空串 = 占位未完成 → 409。
-       Set 非 Put（Put 追加不去重）。 */
+    /* 重放收尾：原应答 + replayed=1；空串 = 占位未完成 → 409。 */
     private void Replay(string stored) {
         if (stored.Length == 0) {
             this.Fail(409, "0009", "上次请求仍在处理，请稍后重试");
+            return;
         }
-        JsonValue body = JsonValue.ParseLenient(stored);
-        if (body == null) { body = JsonValue.NewObject(); }
-        body.Set("replayed", JsonValue.NewStr("1"));
-        this.Ok(body.ToJson());
+        JsonWriter w = new JsonWriter();
+        try {
+            JsonDoc.ParseScoped(stored, (JsonDoc doc) => {
+                w.StartObject();
+                if (doc.KindAt(0) == 5) {
+                    int count = doc.Count(0);
+                    for (int i = 0; i < count; i = i + 1) {
+                        string k = doc.KeyAt(0, i);
+                        if (k != "replayed") {
+                            int slot = doc.ValAt(0, i);
+                            w.WriteRawProperty(k, doc.ToJson(slot));
+                        }
+                    }
+                }
+                w.WriteProperty("replayed", "1");
+                w.EndObject();
+            });
+        } catch (Exception) {
+            w.Reset();
+            w.StartObject();
+            w.WriteProperty("replayed", "1");
+            w.EndObject();
+        }
+        this.Ok(w.ToJson());
     }
 
     /* "1,2,3" → 去重正整数表；空/脏片段忽略。 */
@@ -1561,14 +1671,14 @@ class CollabApi : ApiController {
         for (int i = 0; i < users.Count; i = i + 1) {
             if (users[i].id == id) { return Fmt.Text(users[i].nickname, users[i].username); }
         }
-        return "用户" + Convert.ToString(id);
+        return "用户" + id.ToString();
     }
 
     /* 领域事件落库：必须在事实所在请求事务内调用，
        同生共死；payload 只放紧凑摘要；conversationId 供补拉与扇出做
        成员资格过滤。 */
-    private async  void InsertEvent(string type, string aggregateType, int aggregateId,
-                           int conversationId, int actorId, JsonValue payload) {
+    private async void InsertEvent(string type, string aggregateType, int aggregateId,
+                           int conversationId, int actorId, string payloadJson) {
         CollabEvent e = new CollabEvent();
         e.tenantId = Tenant.Cur();
         e.type = type;
@@ -1576,7 +1686,7 @@ class CollabApi : ApiController {
         e.aggregateId = aggregateId;
         e.conversationId = conversationId;
         e.actorId = actorId;
-        e.payload = payload.ToJson();
+        e.payload = payloadJson;
         e.createdAt = WebApp.NowSeconds();
         await this.CollabEvent.Insert(e).ExecuteIdentityAsync();
     }
