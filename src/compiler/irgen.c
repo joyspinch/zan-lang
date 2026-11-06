@@ -28,6 +28,14 @@ static void di_ensure(zan_irgen_t *g) {
 
 static LLVMMetadataRef di_file_for(zan_irgen_t *g, uint32_t file_id) {
     if (!g->emit_debug) return NULL;
+    /* B-ID162：di_clear 将 di_cur_file 置为 UINT32_MAX。当在作用域初始化或局部
+     * 变量发射（di_declare_var）等尚未设立当前源码位置时，传入 UINT32_MAX
+     * 被强转为 (int)-1，zan_tab_reserve 误判未超 cap 直接返回，后续
+     * g->di_files[UINT32_MAX] 越界读引发 SIGSEGV (rc=139)。
+     * 此处强力归一化防线：任何非法或越界 file_id 均回退至默认主源文件（0 号）。 */
+    if (file_id == UINT32_MAX || (g->diag && file_id >= (uint32_t)g->diag->file_count)) {
+        file_id = 0;
+    }
     if (!zan_tab_reserve((void **)&g->di_files, &g->di_file_cap,
                          sizeof(*g->di_files), (int)file_id, 64))
         return NULL;
@@ -815,42 +823,12 @@ LLVMValueRef zan_hdr_is_string(zan_irgen_t *g, LLVMValueRef word,
                     LLVMConstInt(i64, ZAN_STRING_TAG, 0), nm);
 }
 LLVMValueRef zan_hdr_read_ok(zan_irgen_t *g, LLVMValueRef obj) {
-    if (!g->target_is_windows) return NULL;
-    LLVMTypeRef i1t = LLVMInt1TypeInContext(g->ctx);
-    LLVMTypeRef i8t = LLVMInt8TypeInContext(g->ctx);
-    LLVMTypeRef i8p = LLVMPointerType(i8t, 0);
-    LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
-    LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
-    LLVMTypeRef args[] = { i8p, i64t };
-    LLVMTypeRef fnty = LLVMFunctionType(i32t, args, 2, 0);
-    LLVMValueRef isbad = LLVMGetNamedFunction(g->mod, "IsBadReadPtr");
-    if (!isbad) isbad = LLVMAddFunction(g->mod, "IsBadReadPtr", fnty);
-    LLVMBasicBlockRef entry_bb = LLVMGetInsertBlock(g->builder);
-    LLVMValueRef fn = LLVMGetBasicBlockParent(entry_bb);
-    LLVMBasicBlockRef probe_bb = LLVMAppendBasicBlockInContext(g->ctx, fn,
-        "hdr.probe");
-    LLVMBasicBlockRef join_bb = LLVMAppendBasicBlockInContext(g->ctx, fn,
-        "hdr.join");
-    LLVMBuildCondBr(g->builder,
-        zan_icmp(g->builder, LLVMIntEQ, obj, LLVMConstNull(LLVMTypeOf(obj)),
-                 "hdr.isnull"),
-        join_bb, probe_bb);
-    LLVMPositionBuilderAtEnd(g->builder, probe_bb);
-    LLVMValueRef ptr8 = LLVMBuildGEP2(g->builder, i8t, obj,
-        &(LLVMValueRef){ LLVMConstInt(i64t, (uint64_t)ZAN_OBJ_SITE_OFF, 1) },
-        1, "hdr.ptr8");
-    LLVMValueRef cargs[] = { ptr8, LLVMConstInt(i64t, 8, 0) };
-    LLVMValueRef bad = zan_call2(g->builder, fnty, isbad, cargs, 2,
-        "hdr.badread");
-    LLVMValueRef ok = zan_icmp(g->builder, LLVMIntEQ, bad,
-        LLVMConstInt(i32t, 0, 0), "hdr.readok");
-    LLVMBuildBr(g->builder, join_bb);
-    LLVMPositionBuilderAtEnd(g->builder, join_bb);
-    LLVMValueRef phi = LLVMBuildPhi(g->builder, i1t, "hdr.ok");
-    LLVMValueRef vals[] = { LLVMConstInt(i1t, 0, 0), ok };
-    LLVMBasicBlockRef preds[] = { entry_bb, probe_bb };
-    LLVMAddIncoming(phi, vals, preds, 2);
-    return phi;
+    /* 移除已过时且危险的 Win32 IsBadReadPtr API 调用。
+     * IsBadReadPtr 会破坏 Windows 线程栈增长保护页机制并引入多线程竞态与高昂系统调用开销。
+     * 保持与 Linux/macOS/POSIX 平台统一的行为：返回 NULL，仅依靠非空判定与魔数校验。 */
+    (void)g;
+    (void)obj;
+    return NULL;
 }
 LLVMTypeRef arc_desc_type(zan_irgen_t *g) {
     /* 4 字段：{dtor_fn, tynames_arr_ptr, meta_ptr, field_graph_ptr}，共 32 字节。
@@ -1532,22 +1510,13 @@ void emit_arc_quarantine(zan_irgen_t *g, LLVMValueRef obj,
 }
 void emit_header_read_guard(zan_irgen_t *g, LLVMValueRef fn,
                                    LLVMValueRef ptr8, LLVMBasicBlockRef ret_bb) {
-    if (!g->target_is_windows) return;
-    LLVMTypeRef i8p = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
-    LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
-    LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
-    LLVMTypeRef args[] = { i8p, i64t };
-    LLVMTypeRef fnty = LLVMFunctionType(i32t, args, 2, 0);
-    LLVMValueRef isbad = LLVMGetNamedFunction(g->mod, "IsBadReadPtr");
-    if (!isbad) isbad = LLVMAddFunction(g->mod, "IsBadReadPtr", fnty);
-    LLVMValueRef cargs[] = { ptr8, LLVMConstInt(i64t, 8, 0) };
-    LLVMValueRef bad = zan_call2(g->builder, fnty, isbad, cargs, 2, "badread");
-    LLVMValueRef isbadnz = zan_icmp(g->builder, LLVMIntNE, bad,
-        LLVMConstInt(i32t, 0, 0), "isbadnz");
-    LLVMBasicBlockRef readable_bb =
-        LLVMAppendBasicBlockInContext(g->ctx, fn, "readable");
-    LLVMBuildCondBr(g->builder, isbadnz, ret_bb, readable_bb);
-    LLVMPositionBuilderAtEnd(g->builder, readable_bb);
+    /* 移除已过时且危险的 Win32 IsBadReadPtr API 调用。
+     * IsBadReadPtr 会破坏 Windows 线程栈增长保护页机制并引入多线程竞态与高昂系统调用开销。
+     * 保持与 Linux/macOS/POSIX 平台统一的行为：直接放行至魔数校验。 */
+    (void)g;
+    (void)fn;
+    (void)ptr8;
+    (void)ret_bb;
 }
 
 static void emit_arc_trace_call(zan_irgen_t *g, LLVMValueRef ev_fn,

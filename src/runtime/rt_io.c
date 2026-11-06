@@ -2143,8 +2143,18 @@ static int ensure_assoc(SOCKET s) {
     }
 #if defined(ZAN_CO_DRIVER)
     if (!syncfast_on()) return 0;
-    return SetFileCompletionNotificationModes(
-               (HANDLE)s, FILE_SKIP_COMPLETION_PORT_ON_SUCCESS) ? 1 : 0;
+    if (SetFileCompletionNotificationModes(
+               (HANDLE)s, FILE_SKIP_COMPLETION_PORT_ON_SUCCESS)) {
+        return 1;
+    }
+    /* SetFileCompletionNotificationModes 按 Win32 规范对同一句柄仅允许设置一次，
+     * 后续调用必返回 FALSE 且 GetLastError() == ERROR_INVALID_PARAMETER。
+     * 该状态下跳过 IOCP 成功通知依然处于生效状态，必须返回 1，
+     * 否则后续同步成功 (r == 0) 会因 skip==0 误判而丢弃协程唤醒并永久挂起。 */
+    if (GetLastError() == ERROR_INVALID_PARAMETER) {
+        return 1;
+    }
+    return 0;
 #else
     return 0;
 #endif

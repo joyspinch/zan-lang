@@ -105,25 +105,39 @@ static const unsigned char zan_font_6x10[96][10] = {
 
 static u32 utf8_next(const char **text) {
     const unsigned char *p = (const unsigned char *)*text;
-    if (!*p) return 0;
+    if (!p || !*p) return 0;
     if (*p < 0x80) {
         *text += 1;
         return *p;
     }
-    if ((*p & 0xE0) == 0xC0 && (p[1] & 0xC0) == 0x80) {
+    if ((*p & 0xE0) == 0xC0) {
+        if (!p[1] || (p[1] & 0xC0) != 0x80) {
+            *text += 1;
+            return 0xFFFD;
+        }
         u32 cp = ((u32)(p[0] & 0x1F) << 6) | (u32)(p[1] & 0x3F);
         *text += 2;
         return cp >= 0x80 ? cp : 0xFFFD;
     }
-    if ((*p & 0xF0) == 0xE0 && (p[1] & 0xC0) == 0x80 &&
-        (p[2] & 0xC0) == 0x80) {
+    if ((*p & 0xF0) == 0xE0) {
+        if (!p[1] || (p[1] & 0xC0) != 0x80 ||
+            !p[2] || (p[2] & 0xC0) != 0x80) {
+            *text += 1;
+            return 0xFFFD;
+        }
         u32 cp = ((u32)(p[0] & 0x0F) << 12) |
                  ((u32)(p[1] & 0x3F) << 6) | (u32)(p[2] & 0x3F);
         *text += 3;
+        if (cp >= 0xD800 && cp <= 0xDFFF) return 0xFFFD;
         return cp >= 0x800 ? cp : 0xFFFD;
     }
-    if ((*p & 0xF8) == 0xF0 && (p[1] & 0xC0) == 0x80 &&
-        (p[2] & 0xC0) == 0x80 && (p[3] & 0xC0) == 0x80) {
+    if ((*p & 0xF8) == 0xF0) {
+        if (!p[1] || (p[1] & 0xC0) != 0x80 ||
+            !p[2] || (p[2] & 0xC0) != 0x80 ||
+            !p[3] || (p[3] & 0xC0) != 0x80) {
+            *text += 1;
+            return 0xFFFD;
+        }
         u32 cp = ((u32)(p[0] & 0x07) << 18) |
                  ((u32)(p[1] & 0x3F) << 12) |
                  ((u32)(p[2] & 0x3F) << 6) | (u32)(p[3] & 0x3F);

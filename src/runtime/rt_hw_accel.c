@@ -22,7 +22,7 @@
   #endif
 #endif
 
-static int g_cpuid_inited = 0;
+static volatile int g_cpuid_state = 0; /* 0: uninit, 1: initing, 2: ready */
 static int g_has_popcnt   = 0;
 static int g_has_lzcnt    = 0;
 static int g_has_sse42    = 0;
@@ -98,8 +98,23 @@ static int zan_hw_soft_forced(void) {
     return e != NULL && e[0] != '\0' && e[0] != '0';
 }
 
-static void zan_hw_init_cpu_features(void) {
-    if (g_cpuid_inited) return;
+static uint64_t zan_xgetbv_safe(void) {
+#if (defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86))
+#if defined(__GNUC__) || defined(__clang__)
+    uint32_t eax, edx;
+    __asm__ volatile(".byte 0x0f, 0x01, 0xd0" : "=a"(eax), "=d"(edx) : "c"(0));
+    return ((uint64_t)edx << 32) | eax;
+#elif defined(_MSC_VER)
+    return _xgetbv(0);
+#else
+    return 0;
+#endif
+#else
+    return 0;
+#endif
+}
+
+static void zan_hw_init_cpu_features_impl(void) {
 #if (defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)) && (defined(__GNUC__) || defined(__clang__))
     uint32_t eax, ebx, ecx, edx;
     // EAX=1: Features
@@ -108,9 +123,12 @@ static void zan_hw_init_cpu_features(void) {
     g_has_popcnt  = (ecx & (1u << 23)) != 0;
     g_has_aesni   = (ecx & (1u << 25)) != 0;
     g_has_pclmul  = (ecx & (1u << 1)) != 0;
+    int osxsave   = (ecx & (1u << 27)) != 0;
 
     __asm__ volatile("cpuid" : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx) : "a"(7), "c"(0));
-    g_has_avx2  = (ebx & (1u << 5)) != 0;
+    int avx2_hw   = (ebx & (1u << 5)) != 0;
+    int os_avx_ok = osxsave && ((zan_xgetbv_safe() & 6) == 6);
+    g_has_avx2  = avx2_hw && os_avx_ok;
     g_has_shani = (ebx & (1u << 29)) != 0;
     g_has_vaes  = ((ecx & (1u << 9)) != 0) && g_has_avx2 && g_has_aesni;
 
@@ -124,9 +142,12 @@ static void zan_hw_init_cpu_features(void) {
     g_has_popcnt  = (info[2] & (1 << 23)) != 0;
     g_has_aesni   = (info[2] & (1 << 25)) != 0;
     g_has_pclmul  = (info[2] & (1 << 1)) != 0;
+    int osxsave   = (info[2] & (1 << 27)) != 0;
 
     __cpuidex(info, 7, 0);
-    g_has_avx2  = (info[1] & (1 << 5)) != 0;
+    int avx2_hw   = (info[1] & (1 << 5)) != 0;
+    int os_avx_ok = osxsave && ((zan_xgetbv_safe() & 6) == 6);
+    g_has_avx2  = avx2_hw && os_avx_ok;
     g_has_shani = (info[1] & (1 << 29)) != 0;
     g_has_vaes  = ((info[2] & (1 << 9)) != 0) && g_has_avx2 && g_has_aesni;
 
@@ -144,7 +165,22 @@ static void zan_hw_init_cpu_features(void) {
         g_a_hw_sha512 = g_a_hw_sm3 = g_a_hw_sm4 = g_a_hw_crc32 = 0;
 #endif
     }
-    g_cpuid_inited = 1;
+}
+
+static void zan_hw_init_cpu_features(void) {
+    if (__atomic_load_n(&g_cpuid_state, __ATOMIC_ACQUIRE) == 2) return;
+    int expected = 0;
+    if (__atomic_compare_exchange_n(&g_cpuid_state, &expected, 1, 0,
+                                    __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+        zan_hw_init_cpu_features_impl();
+        __atomic_store_n(&g_cpuid_state, 2, __ATOMIC_RELEASE);
+    } else {
+        while (__atomic_load_n(&g_cpuid_state, __ATOMIC_ACQUIRE) != 2) {
+#if defined(__i386__) || defined(__x86_64__)
+            __builtin_ia32_pause();
+#endif
+        }
+    }
 }
 
 static int g_gate_sha256 = 0;

@@ -323,7 +323,8 @@ static int zan_wav_parse(const unsigned char *b, int n, ZanAudioClip *c) {
     }
     {
         int frame_bytes = (fmt_bits / 8) * fmt_ch;
-        int frames, i;
+        int frames;
+        int64_t total_samples;
         short *pcm;
         if (frame_bytes <= 0 || data_len % frame_bytes != 0) {
             zan_audio_set_err("wav data size not frame aligned");
@@ -334,10 +335,15 @@ static int zan_wav_parse(const unsigned char *b, int n, ZanAudioClip *c) {
             zan_audio_set_err("wav has no samples");
             return 0;
         }
-        pcm = (short *)malloc((size_t)frames * (size_t)fmt_ch * sizeof(short));
+        total_samples = (int64_t)frames * (int64_t)fmt_ch;
+        if (total_samples <= 0 || total_samples > (int64_t)(SIZE_MAX / sizeof(short)) || total_samples > 0x7FFFFFFFLL) {
+            zan_audio_set_err("wav sample count out of range");
+            return 0;
+        }
+        pcm = (short *)malloc((size_t)total_samples * sizeof(short));
         if (!pcm) { zan_audio_set_err("out of memory"); return 0; }
-        for (i = 0; i < frames * fmt_ch; i++) {
-            const unsigned char *s = data + (size_t)i * (fmt_bits / 8);
+        for (int64_t i = 0; i < total_samples; i++) {
+            const unsigned char *s = data + (size_t)i * (size_t)(fmt_bits / 8);
             pcm[i] = (fmt_tag == 3) ? zan_wav_f32_to_s16(s)
                                     : zan_wav_int_to_s16(fmt_bits, s);
         }
@@ -403,7 +409,7 @@ static void zan_audio_mix(unsigned char *dst, UINT32 frames) {
                 int i0, i1;
                 double frac;
                 if (v->loop) {
-                    while (cur >= (double)nf) cur -= (double)nf;
+                    if (cur >= (double)nf) cur = fmod(cur, (double)nf);
                 } else if (cur >= (double)nf) {
                     break;
                 }
@@ -651,7 +657,7 @@ static void zan_audio_mix_s16(unsigned char *dst, int frames, int devch) {
                 int i0, i1;
                 double frac;
                 if (v->loop) {
-                    while (cur >= (double)nf) cur -= (double)nf;
+                    if (cur >= (double)nf) cur = fmod(cur, (double)nf);
                 } else if (cur >= (double)nf) {
                     break;
                 }
@@ -716,7 +722,7 @@ static void zan_audio_mix_f32(float *dst, int frames, int devch) {
                 int i0, i1;
                 double frac;
                 if (v->loop) {
-                    while (cur >= (double)nf) cur -= (double)nf;
+                    if (cur >= (double)nf) cur = fmod(cur, (double)nf);
                 } else if (cur >= (double)nf) {
                     break;
                 }

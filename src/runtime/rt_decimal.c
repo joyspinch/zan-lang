@@ -3,6 +3,7 @@
 #include <string.h>
 #include <ctype.h>
 #include <math.h>
+#include <signal.h>
 
 #define DECIMAL_SIGN_MASK  0x80000000U
 #define DECIMAL_SCALE_MASK 0x00FF0000U
@@ -334,7 +335,10 @@ zan_decimal_t zan_decimal_mul(zan_decimal_t a, zan_decimal_t b) {
 
 zan_decimal_t zan_decimal_div(zan_decimal_t a, zan_decimal_t b) {
     uint128_t mb = get_m128(b);
-    if (mb == 0) return zan_decimal_zero(); /* 除零安全退化 */
+    if (mb == 0) {
+        raise(SIGFPE);
+        return zan_decimal_zero();
+    }
 
     bool neg = dec_is_neg(a) ^ dec_is_neg(b);
     uint128_t ma = get_m128(a);
@@ -373,7 +377,10 @@ zan_decimal_t zan_decimal_div(zan_decimal_t a, zan_decimal_t b) {
 
 zan_decimal_t zan_decimal_rem(zan_decimal_t a, zan_decimal_t b) {
     uint128_t mb = get_m128(b);
-    if (mb == 0) return zan_decimal_zero();
+    if (mb == 0) {
+        raise(SIGFPE);
+        return zan_decimal_zero();
+    }
     uint128_t ma = get_m128(a);
     uint8_t sa = dec_scale(a);
     uint8_t sb = dec_scale(b);
@@ -400,10 +407,14 @@ zan_decimal_t zan_decimal_mul(zan_decimal_t a, zan_decimal_t b) {
 }
 zan_decimal_t zan_decimal_div(zan_decimal_t a, zan_decimal_t b) {
     double db = zan_decimal_to_double(b);
-    if (db == 0.0) return zan_decimal_zero();
+    if (db == 0.0) {
+        raise(SIGFPE);
+        return zan_decimal_zero();
+    }
     return zan_decimal_from_double(zan_decimal_to_double(a) / db);
 }
 zan_decimal_t zan_decimal_rem(zan_decimal_t a, zan_decimal_t b) {
+    raise(SIGFPE);
     return zan_decimal_zero();
 }
 #endif
