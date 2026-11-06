@@ -1,0 +1,817 @@
+// Chart.Scale.zan - 数值轴比例辅助（nice/smartSteps 量程、ECharts 6.1 scale 基元、对数与时间刻度）
+using System;
+using System.Json;
+using Gui;
+
+namespace Gui.Component.Chart;
+
+public partial class Chart {
+    // ---- 比例辅助 ----
+
+    // 将原始最大值向上取整为友好的轴上界（2/5/10 * 10^n）：
+    // 37 -> 50、830 -> 1000。<=5 时返回 5。
+    public static int NiceMax(int v) {
+        if (v <= 5) { return 5; }
+        int mag = 1;
+        while (mag * 10 <= v) { mag = mag * 10; }
+        int unit = v / mag;
+        int nice = 10;
+        if (unit < 2) { nice = 2; } else if (unit < 5) { nice = 5; }
+        return nice * mag;
+    }
+
+    // ======== ECharts 6.1 scale 基元（逐函数照抄，勿改语义）========
+    // 上面那个 NiceMax(int) 是本仓库手写的旧近似（`<=5 → 5` 特例 +
+    // 2/5/10 阶梯），与 ECharts 不符；下面 NiceD/NiceMode 才是对照源
+    // 的忠实物。保留旧函数以便逐步迁移调用点。
+
+    // `number.ts:581 quantityExponent(val)`——十进制指数。
+    // 9876→3，0.09876→-2，0.0012→-3。val=0 按源码返回 0。
+    // 注意源码用 mathFloor；(int) 是向零截断，负数会差 1
+    // （log10(0.0012) = -2.92，必须 -3），故显式下取整。
+    public static int QuantityExponent(double val) {
+        if (val == 0.0) { return 0; }
+        double av = val < 0.0 ? 0.0 - val : val;
+        double lg = Math.Log(av) / 2.302585092994046;
+        int exp = (int)lg;
+        if ((double)exp > lg) { exp = exp - 1; }
+        // 源码 :594——Math.log 精度损失用 10^exp 还原，必要时 +1
+        if (av / Chart.Pow10D(exp) >= 10.0) { exp = exp + 1; }
+        return exp;
+    }
+
+    // 10 的整数次幂（源码 Math.pow(10,e)，整数指数无舍入误差）。
+    // D 后缀避开本文件既有的 int 版 Pow10。
+    public static double Pow10D(int e) {
+        double r = 1.0;
+        int n = e < 0 ? 0 - e : e;
+        for (int i = 0; i < n; i = i + 1) { r = r * 10.0; }
+        return e < 0 ? 1.0 / r : r;
+    }
+
+    // precision 钳到 [0,20]（TO_FIXED_SUPPORTED_PRECISION_MAX）。
+    public static double RoundP(double x, int precision) {
+        int p = precision < 0 ? 0 : precision;
+        if (p > 20) { p = 20; }
+        double sc = Chart.Pow10D(p);
+        double v = x * sc;
+        double r = v >= 0.0 ? (double)(long)(v + 0.5) : (double)(long)(v - 0.5);
+        return r / sc;
+    }
+
+    // `number.ts:297 getPrecisionSafe(val)`——字符串法小数位数。
+    public static int GetPrecisionSafe(double val) {
+        string s = val.ToString();
+        int eIdx = s.IndexOf('e');
+        if (eIdx < 0) { eIdx = s.IndexOf('E'); }
+        int exp = 0;
+        int sigLen = s.Length;
+        if (eIdx > 0) {
+            exp = int.Parse(s.Substring(eIdx + 1));
+            sigLen = eIdx;
+        }
+        int dot = s.IndexOf('.');
+        int decLen = dot < 0 ? 0 : sigLen - 1 - dot;
+        int r = decLen - exp;
+        return r > 0 ? r : 0;
+    }
+
+    // `number.ts:265 getPrecision(val)`——快路径 15 次循环，
+    // 否则退字符串法。
+    public static int GetPrecision(double val) {
+        double av = val < 0.0 ? 0.0 - val : val;
+        if (av > 1e-14) {
+            double e = 1.0;
+            for (int i = 0; i < 15; i = i + 1) {
+                double v = av * e;
+                double r = v >= 0.0 ? (double)(long)(v + 0.5) : (double)(long)(v - 0.5);
+                if (r / e == av) { return i; }
+                e = e * 10.0;
+            }
+        }
+        return Chart.GetPrecisionSafe(av);
+    }
+
+    // `helper.ts:147 getIntervalPrecision(niceInterval)`
+    // = getPrecision(interval) + 2。刻度标签小数位数由它决定。
+    public static int GetIntervalPrecision(double niceInterval) {
+        return Chart.GetPrecision(niceInterval) + 2;
+    }
+
+    // `number.ts:613 nice(val, mode)`。roundMode=true 走
+    // NICE_MODE_ROUND（helper.ts:103 的调用点）：
+    // f<1.5→1  f<2.5→2  f<4→3  f<7→5  else→10
+    // false 走 mode=0 分支：f<1→1 f<2→2 f<3→3 f<5→5 else→10。
+    // 校验值（已对源逐值核过）：nice(1.4)=1 nice(3.7)=3 nice(7.2)=10
+    // nice(0.36)=0.3 nice(0.0012)=0.001 nice(70.1598)=100
+    public static double NiceMode(double val, bool roundMode) {
+        double av = val < 0.0 ? 0.0 - val : val;
+        if (av == 0.0) { return 0.0; }
+        int exponent = Chart.QuantityExponent(av);
+        double exp10 = Chart.Pow10D(exponent);
+        double f = av / exp10;
+        double nf = 10.0;
+        if (roundMode) {
+            if (f < 1.5) { nf = 1.0; }
+            else if (f < 2.5) { nf = 2.0; }
+            else if (f < 4.0) { nf = 3.0; }
+            else if (f < 7.0) { nf = 5.0; }
+            else { nf = 10.0; }
+        } else {
+            if (f < 1.0) { nf = 1.0; }
+            else if (f < 2.0) { nf = 2.0; }
+            else if (f < 3.0) { nf = 3.0; }
+            else if (f < 5.0) { nf = 5.0; }
+            else { nf = 10.0; }
+        }
+        int p = 0 - exponent;
+        if (p < 0) { p = 0; }
+        double r = Chart.RoundP(nf * exp10, p);
+        return val < 0.0 ? 0.0 - r : r;
+    }
+
+    // minInterval, maxInterval)`。
+    // precision = getIntervalPrecision(interval)
+    // minInterval/maxInterval 传 ChartOption.AutoD() 表示不设。
+    public static void IntervalScaleNiceTicks(double e0, double e1, int splitNumber,
+                                       double minInterval, double maxInterval,
+                                       out double interval, out int precision,
+                                       out double nt0, out double nt1) {
+        double span = e1 - e0;
+        double sp = splitNumber > 0 ? span / (double)splitNumber : span;
+        interval = Chart.NiceMode(sp, true);
+        if (!ChartOption.IsAutoD(minInterval) && interval < minInterval) {
+            interval = minInterval;
+        }
+        if (!ChartOption.IsAutoD(maxInterval) && interval > maxInterval) {
+            interval = maxInterval;
+        }
+        precision = Chart.GetIntervalPrecision(interval);
+        if (interval == 0.0) { nt0 = e0; nt1 = e1; return; }
+        nt0 = Chart.RoundP(Math.Ceiling(e0 / interval) * interval, precision);
+        nt1 = Chart.RoundP(Math.Floor(e1 / interval) * interval, precision);
+    }
+
+
+    // `scale/helper.ts:125 increaseInterval(niceInterval)`：把 nice 步长
+    // 抬到下一个 nice 值（f 是十进制系数）——1→2、2→3、3→5、5→10。
+    // 用于 alignTicks 的 `loopIncreaseInterval` 搜索。
+    public static double IncreaseInterval(double iv) {
+        if (iv <= 0.0) { return 1.0; }
+        int e = Chart.QuantityExponent(iv);
+        double exp10 = Chart.Pow10D(e);
+        double f = Chart.RoundP(iv / exp10, 0);
+        if (f == 0.0) { f = 1.0; }
+        else if (f == 2.0) { f = 3.0; }
+        else if (f == 3.0) { f = 5.0; }
+        else { f = f * 2.0; }
+        return Chart.RoundP(f * exp10, e < 0 ? 0 - e : 0);
+    }
+
+    // A11：`axisNiceTicks.ts:130-138` 的 minInterval/maxInterval 钳制。
+    // 先按 NiceRange 解出引擎自己的 nice 区间，算出等效步长
+    // interval = (hi−lo)/ticks；若被钳制改变，则用钳后的步长重解端点
+    // （`niceExtent = [ceil(e0/iv)·iv, floor(e1/iv)·iv]`，出处同文件
+    // :140-143）。**未声明钳制的轴走原路，逐像素不变**。
+    // 注意本引擎 nice 是 ECharts smartSteps（1/2/2.5/5），
+    // 与 6.1 的 1/2/5 端点天然不同——钳制语义（往哪边推）才是可移植的。
+    public static ChartSpan ClampNiceRange(int dataLo, int dataHi, bool scale,
+                                    double minInterval, double maxInterval) {
+        ChartSpan s = Chart.NiceRange(dataLo, dataHi, scale);
+        if (ChartOption.IsAutoD(minInterval) && ChartOption.IsAutoD(maxInterval)) { return s; }
+        if (s.ticks < 1) { return s; }
+        double iv0 = (double)(s.hi - s.lo) / (double)s.ticks;
+        if (iv0 <= 0.0) { return s; }
+        double iv = iv0;
+        if (!ChartOption.IsAutoD(minInterval) && iv < minInterval) { iv = minInterval; }
+        if (!ChartOption.IsAutoD(maxInterval) && iv > maxInterval) { iv = maxInterval; }
+        if (iv == iv0) { return s; }
+        int p = Chart.GetIntervalPrecision(iv);
+        // niceExtent = [ceil(e0/iv)·iv, floor(e1/iv)·iv] 落在数据域内部；
+        // 但轴的 extent 不得被缩小（Interval.ts:238-282 的
+        // 两个补 tick 分支：域外的那一格被推
+        // 成 niceExtent ± interval）——数据超出的那一格
+        // 必须补回来（min=2 时 0..3 官方出 0..4）。
+        double nlo = Chart.RoundP(Math.Ceiling((double)dataLo / iv) * iv, p);
+        double nhi = Chart.RoundP(Math.Floor((double)dataHi / iv) * iv, p);
+        if (nlo > (double)dataLo) { nlo = Chart.RoundP(nlo - iv, p); }
+        if (nhi < (double)dataHi) { nhi = Chart.RoundP(nhi + iv, p); }
+        if (nhi <= nlo) { nhi = nlo + iv; }
+        ChartSpan r = new ChartSpan();
+        r.lo = (int)(nlo >= 0.0 ? nlo + 0.5 : nlo - 0.5);
+        r.hi = (int)(nhi >= 0.0 ? nhi + 0.5 : nhi - 0.5);
+        if (r.hi <= r.lo) { r.hi = r.lo + 1; }
+        int nt = (int)Chart.RoundP(((double)r.hi - (double)r.lo) / iv, 0);
+        r.ticks = nt < 1 ? 1 : nt;
+        return r;
+    }
+
+    // ECharts 6.1 IntervalScale 自动量程（源对抄 scale/helper.js
+    // Interval.js getTicks 的两个域外补格分支）。SSR 校准 8 组数据
+    // 逐例复现：interval = nice(span/5, round)——round 档是
+    // 1/2/3/5/10（f 阈值 1.5/2.5/4/7；smartSteps 智能阶梯
+    // 官方 300 步 → 0..1500）；
+    // 刻度界向内取整（ceil lo / floor hi），原始域溢出端向外补一格。
+    // minInterval/maxInterval 非 Auto 时按 helper.js 钳制步长。
+    // 0 锚不在此做（AxisLo/AxisHi 已按 scale 语义并入）。
+    public static ChartSpan NiceSpan6(int dataLo, int dataHi, double minInterval,
+                               double maxInterval) {
+        long span = (long)dataHi - (long)dataLo;
+        if (span <= 0) { span = 1; }
+        long rough = span / 5;
+        if (rough < 1) { rough = 1; }
+        // 档位判据用 ×10 定点整数——f 的实数阈值 1.5/2.5/4/7，
+        // 截断到整数会把 1.564 误判进 1 档。
+        long exp10 = 1;
+        while (rough / exp10 >= 10) { exp10 = exp10 * 10; }
+        long f10 = rough * 10 / exp10;
+        long nf;
+        if (f10 < 15) { nf = 1; }
+        else if (f10 < 25) { nf = 2; }
+        else if (f10 < 40) { nf = 3; }
+        else if (f10 < 70) { nf = 5; }
+        else { nf = 10; }
+        long iv = nf * exp10;
+        if (!ChartOption.IsAutoD(minInterval) && (double)iv < minInterval) {
+            iv = (long)minInterval;
+        }
+        if (!ChartOption.IsAutoD(maxInterval) && (double)iv > maxInterval) {
+            iv = (long)maxInterval;
+        }
+        if (iv < 1) { iv = 1; }
+        // 向内取整（helper.js niceTickExtent）；负值要数学 ceil/floor，
+        // Zan 的 / 向零截断，走 FloorDivQ/CeilDivQ。
+        long loT = (long)Chart.CeilDivQ(dataLo, (int)iv) * iv;
+        long hiT = (long)Chart.FloorDivQ(dataHi, (int)iv) * iv;
+        // 原始域溢出端向外补一格（Interval.js getTicks 的
+        // extent[0] < niceExtent[0] / extent[1] > lastNiceTick 分支；
+        // 向内取整保证各至多一格）。
+        if (loT > dataLo) { loT = loT - iv; }
+        if (hiT < dataHi) { hiT = hiT + iv; }
+        ChartSpan r = new ChartSpan();
+        r.lo = (int)loT;
+        r.hi = (int)hiT;
+        r.ticks = (int)((hiT - loT) / iv);
+        if (r.ticks < 1) { r.ticks = 1; }
+        return r;
+    }
+
+    // A12：`coord/axisAlignTicks.ts scaleCalcAlign` 的单侧实现——把目标轴
+    // 解成与对齐轴**段数相同、刻度对齐**的量程。`alignToSegs` = 对齐轴
+    // 的段数；`dataLo/dataHi` 是目标轴的原始 extent（incl0 已并入）。
+    // 对应源码 :250-300 的 `targetMinMaxFixed` 双 false 分支：
+    // 段数不足 alignToNiceSegCount 时按 incl0/居中规则向两侧补格，
+    // 直到 [min,max] 覆盖原 extent。
+    // 调用方给的单位是"轴自己的单位"（整数轴=值，小数轴=×1000 定点，
+    // 时间轴=天），因此同一函数三处复用。
+    public static ChartSpan AlignRange(double dataLo, double dataHi, int alignToSegs,
+                                bool incl0) {
+        if (alignToSegs < 1) { alignToSegs = 1; }
+        // incl0 时先做与 NiceRange 同一个零锚定
+        // （Chart.zan 的 NiceRange 原文 :1552-1555，出处 valueAxis
+        // _reformValue）：全正数据下界归零、
+        // 全负数据上界归零。不做这一步
+        // 就会把 2000..23400 对成 -10000..30000
+        // （官方 0..40000）——零锚定是
+        // incl0 的前提，不是可选补丁。
+        if (incl0) {
+            if (dataLo >= 0.0 && dataHi >= 0.0) { dataLo = 0.0; }
+            if (dataLo <= 0.0 && dataHi <= 0.0) { dataHi = 0.0; }
+        }
+        double span = dataHi - dataLo;
+        if (span <= 0.0) { span = 1.0; }
+        double iv = Chart.NiceMode(span / (double)alignToSegs, false);
+        if (iv <= 0.0) { iv = 1.0; }
+        double nlo = dataLo;
+        double nhi = dataHi;
+        for (int guard = 0; guard < 64; guard = guard + 1) {
+            int p = Chart.GetIntervalPrecision(iv);
+            nlo = Chart.RoundP(Math.Ceiling(dataLo / iv) * iv, p);
+            nhi = Chart.RoundP(Math.Floor(dataHi / iv) * iv, p);
+            int cnt = (int)Chart.RoundP((nhi - nlo) / iv, 0);
+            if (cnt <= alignToSegs) {
+                int more = alignToSegs - cnt;
+                double mlo = 0.0;
+                double mhi = 0.0;
+                if (incl0 && dataLo == 0.0) { mlo = 0.0; mhi = (double)more; }
+                else if (incl0 && dataHi == 0.0) { mlo = (double)more; mhi = 0.0; }
+                else {
+                    int half = more / 2;
+                    if (more % 2 == 0) { mlo = (double)half; mhi = (double)half; }
+                    else if (nlo + nhi < dataLo + dataHi) {
+                        mlo = (double)half; mhi = (double)(half + 1);
+                    } else {
+                        mlo = (double)(half + 1); mhi = (double)half;
+                    }
+                }
+                nlo = Chart.RoundP(nlo - iv * mlo, p);
+                nhi = Chart.RoundP(nhi + iv * mhi, p);
+                if (nlo <= dataLo && nhi >= dataHi) { break; }
+            }
+            iv = Chart.IncreaseInterval(iv);
+        }
+        ChartSpan r = new ChartSpan();
+        r.lo = (int)(nlo >= 0.0 ? nlo + 0.5 : nlo - 0.5);
+        r.hi = (int)(nhi >= 0.0 ? nhi + 0.5 : nhi - 0.5);
+        if (r.hi <= r.lo) { r.hi = r.lo + 1; }
+        r.ticks = alignToSegs;
+        return r;
+    }
+
+    // A12 minorTick 的刻度序列：scale/minorTicks.ts:22-81
+    // 每两个相邻 nice 刻度之间均分 splitNumber
+    // 段，取内部点，且严格落在
+    // [extent0, extent1] 内（源码 :50 `minorTick > extent[0] &&
+    // minorTick < extent[1]`）——首末段因数不足而被
+    // 截掉的点就是这条规则。
+    // 入参域与 splitNumber 均为轴自己的单位
+    // （整数轴=值，小数轴=×1000 定点）。
+    // 对数轴版：刻度不等距（每个十倍），
+    // 不能用均分版。源码同 minorTicks.ts:41-63
+    // 的对点循环：逐对在**原值**空间插值
+    // （minorTick = prev + (c+1)*interval/splitNumber），再经对数映射落像素
+    // ——所以 1..10 的细分点是 2.8/4.6/6.4/8.2
+    // 而不是对数均分点（官方
+    // _scratch/a12_log.js 实测）。
+    public static void MinorTickValuesPairs(List<int> ticks, int splitNumber,
+                                    List<double> into) {
+        if (splitNumber < 2 || ticks.Count < 2) { return; }
+        double e0 = (double)ticks[0];
+        double e1 = (double)ticks[ticks.Count - 1];
+        for (int i = 1; i < ticks.Count; i = i + 1) {
+            double prev = (double)ticks[i - 1];
+            double interval = (double)ticks[i] - prev;
+            if (interval <= 0.0) { continue; }
+            double minorInterval = interval / (double)splitNumber;
+            int p = Chart.GetIntervalPrecision(minorInterval);
+            for (int c = 1; c < splitNumber; c = c + 1) {
+                double mt = Chart.RoundP(prev + (double)c * minorInterval, p);
+                if (mt > e0 && mt < e1) { into.Add(mt); }
+            }
+        }
+    }
+
+    public static void MinorTickValues(double e0, double e1, int segs, int splitNumber,
+                                List<double> into) {
+        if (segs < 1 || splitNumber < 2) { return; }
+        double interval = (e1 - e0) / (double)segs;
+        if (interval == 0.0) { return; }
+        double minorInterval = interval / (double)splitNumber;
+        int p = Chart.GetIntervalPrecision(minorInterval);
+        for (int g = 0; g < segs; g = g + 1) {
+            double prev = e0 + interval * (double)g;
+            for (int c = 1; c < splitNumber; c = c + 1) {
+                double mt = Chart.RoundP(prev + (double)c * minorInterval, p);
+                if (mt > e0 && mt < e1) { into.Add(mt); }
+            }
+        }
+    }
+
+    // a / b 的数学 floor（Zan 的 / 与 % 向零截断）。
+    public static int FloorDivQ(int a, int b) {
+        int q = a / b;
+        if (a % b != 0 && a < 0) { q = q - 1; }
+        return q;
+    }
+
+    // a / b 的数学 ceil。
+    public static int CeilDivQ(int a, int b) {
+        int q = a / b;
+        if (a % b != 0 && a > 0) { q = q + 1; }
+        return q;
+    }
+
+    // 十进制位数（v ≥ 1）。
+    public static int DecDigits(int v) {
+        int n = 1;
+        while (v >= 10) { v = v / 10; n = n + 1; }
+        return n;
+    }
+
+    // 去掉十进制尾部 0（全精度有效位计数用）。
+    public static int StripZeros(int v) {
+        while (v > 0 && v % 10 == 0) { v = v / 10; }
+        return v;
+    }
+
+    // JS Math.round(q / 2)（半数朝 +∞，q 可为负）。
+    public static int JSRoundHalf(int q) {
+        if (q >= 0) { return (q + 1) / 2; }
+        return q / 2;
+    }
+
+    // expNum(num/den, 2 位精度，向上)：v = num/den ≥ 0 的两位有效数
+    // 上近似。对应 smartSteps 里 getCeil/expSpan 的 expNum(v, 2)。
+    public static ChartExp ExpNum2Rat(int num, int den) {
+        ChartExp r = new ChartExp();
+        r.c = 0;
+        r.e = 0;
+        if (num <= 0 || den <= 0) { return r; }
+        int k;
+        if (num >= den) {
+            k = Chart.DecDigits(num / den) - 1;
+        } else {
+            k = 0;
+            int p = num;
+            while (p < den) { p = p * 10; k = k - 1; }
+        }
+        int expon = k - 1;
+        // Pow10 只服务非负指数，k ≥ 1 时改走除法表达 10^(1-k)。
+        int scaled;
+        if (k >= 1) {
+            scaled = Chart.CeilDivQ(num, den * Chart.Pow10(k - 1));
+        } else {
+            scaled = Chart.CeilDivQ(num * Chart.Pow10(1 - k), den);
+        }
+        if (scaled >= 100) { scaled = scaled / 10; expon = expon + 1; }
+        r.c = scaled;
+        r.e = expon;
+        return r;
+    }
+
+    // expNum(n, 全精度)：整数 n 的精确分解（c × 10^e = n）。
+    // byFloor 只在指数对齐除法时区分 floor/ceil。
+    public static ChartExp ExpNumFull(int n, bool byFloor) {
+        ChartExp r = new ChartExp();
+        r.c = 0;
+        r.e = 0;
+        if (n == 0) { return r; }
+        int ad = n < 0 ? 0 - n : n;
+        int digit = Chart.DecDigits(Chart.StripZeros(ad));
+        int expon = Chart.DecDigits(ad) - digit;
+        r.e = expon;
+        r.c = n / Chart.Pow10(expon);
+        return r;
+    }
+
+    // getCeil：两位尾数向上吸附到步长备选 [10,20,25,50]。
+    public static void SmartCeilStep(ChartExp n) {
+        if (n.c <= 10) { n.c = 10; return; }
+        if (n.c <= 20) { n.c = 20; return; }
+        if (n.c <= 25) { n.c = 25; return; }
+        if (n.c <= 50) { n.c = 50; return; }
+        n.e = n.e + 1;
+        n.c = 10;
+    }
+
+    // expFixTo：把 x 的指数对齐到 ref（缩指数乘 10 精确，升指数
+    // 按 byFloor floor / 否则 ceil 除）。
+    public static void ExpAlign(ChartExp x, ChartExp refx, bool byFloor) {
+        int delta = refx.e - x.e;
+        if (delta == 0) { return; }
+        x.e = refx.e;
+        if (delta < 0) {
+            x.c = x.c * Chart.Pow10(0 - delta);
+        } else {
+            int q = Chart.Pow10(delta);
+            x.c = byFloor ? Chart.FloorDivQ(x.c, q) : Chart.CeilDivQ(x.c, q);
+        }
+    }
+
+    // smartSteps 的 forInteger：跨度小于段数时向两侧延展跨度
+    // （section ≤ 0 时取 5 段），输出压回与原数据同侧。
+    public static ChartSpan SmartForInteger(int min, int max, int section) {
+        if (section < 1) { section = 5; }
+        int delta = section - (max - min);
+        int newMin = Chart.JSRoundHalf(min * 2 - delta);
+        int newMax = Chart.JSRoundHalf(max * 2 + delta);
+        if (min >= 0 && newMin < 0) {
+            newMax = newMax - newMin;
+            newMin = 0;
+        } else if (max <= 0 && newMax > 0) {
+            newMin = newMin - newMax;
+            newMax = 0;
+        }
+        ChartSpan s = new ChartSpan();
+        s.lo = newMin;
+        s.hi = newMax;
+        s.ticks = section;
+        return s;
+    }
+
+    // smartSteps 的 tryForInt：原最值同号（含 0）时尽量取整数步长，
+    // 剩余误差向两侧均衡（可能改写 expMin/expMax 并强制 e = 0）。
+    public static int SmartTryForInt(int min, int max, ChartExp expMin, ChartExp expMax, int secs) {
+        int span = expMax.c - expMin.c;
+        int expon = expMax.e;
+        int step;
+        bool stepInt;
+        if (expon >= 0) {
+            int num = span * Chart.Pow10(expon);
+            step = num / secs;
+            stepInt = num % secs == 0;
+        } else {
+            int den = secs * Chart.Pow10(0 - expon);
+            step = span / den;
+            stepInt = span % den == 0;
+        }
+        if (stepInt) { return secs; }
+        int spanN = step * secs;
+        if (spanN < max - min) {
+            step = step + 1;
+            spanN = step * secs;
+            // section = 0（自适应段数）恒走这一支。
+            if (step * (secs - 1) >= max - min) {
+                secs = secs - 1;
+                spanN = step * secs;
+            }
+        }
+        if (spanN >= max - min) {
+            int delta = spanN - (max - min);
+            expMin.c = Chart.JSRoundHalf(min * 2 - delta);
+            expMax.c = Chart.JSRoundHalf(max * 2 + delta);
+            expMin.e = 0;
+            expMax.e = 0;
+        }
+        return secs;
+    }
+
+    // smartSteps 的 coreCalc（section = 0 自适应路径）：
+    // 步长基准取 ceil(span/6)，段数在 [6,5,4] 中选（调整后跨度最小、
+    // 同跨度步长小者胜），整数输入尽量整数步长并均衡误差。
+    public static ChartSpan SmartCoreCalc(int min, int max) {
+        ChartExp expStep = Chart.ExpNum2Rat(max - min, 6);
+        Chart.SmartCeilStep(expStep);
+        ChartExp expSpan = Chart.ExpNum2Rat(max - min, 1);
+        ChartExp expMin = Chart.ExpNumFull(min, true);
+        ChartExp expMax = Chart.ExpNumFull(max, false);
+        Chart.ExpAlign(expSpan, expStep, false);
+        Chart.ExpAlign(expMin, expStep, true);
+        Chart.ExpAlign(expMax, expStep, false);
+
+        // look4sections。对齐单位可能是 10^e（e < 0 的细步长），
+        // 整体放大 100 倍参与整数运算，随后把指数一并回退 2。
+        int baseC = expMin.c * 100;
+        int spanC = (expMax.c - expMin.c) * 100;
+        int bestSpan = 0;
+        int bestStep = 0;
+        int bestMin = 0;
+        int bestMax = 0;
+        for (int section = 6; section >= 4; section = section - 1) {
+            ChartExp ts = Chart.ExpNum2Rat(spanC, section);
+            Chart.SmartCeilStep(ts);
+            int stepN = ts.c * Chart.Pow10(ts.e);
+            int tMin = Chart.FloorDivQ(baseC, stepN) * stepN;
+            int tMax = Chart.CeilDivQ(baseC + spanC, stepN) * stepN;
+            int sp = tMax - tMin;
+            if (section == 6 || sp < bestSpan || (sp == bestSpan && stepN < bestStep)) {
+                bestSpan = sp;
+                bestStep = stepN;
+                bestMin = tMin;
+                bestMax = tMax;
+            }
+        }
+        int secs = bestSpan / bestStep;
+        if (secs < 3) { secs = secs * 2; }
+        expMin.c = bestMin;
+        expMin.e = expStep.e - 2;
+        expMax.c = bestMax;
+        expMax.e = expStep.e - 2;
+
+        // 原最值同号（reform 后必有一端为 0）时尝试整数步长。
+        if (min * max >= 0) {
+            if (max - min < secs) { return Chart.SmartForInteger(min, max, secs); }
+            secs = Chart.SmartTryForInt(min, max, expMin, expMax, secs);
+        }
+        // cross0：原数据在某侧时输出压回同侧。
+        if (min >= 0 && expMin.c < 0) {
+            expMax.c = expMax.c - expMin.c;
+            expMin.c = 0;
+        } else if (max <= 0 && expMax.c > 0) {
+            expMin.c = expMin.c - expMax.c;
+            expMax.c = 0;
+        }
+        // makeResult 对整数输入在 lo/hi 上是恒等（只影响小数位与
+        // 标签数组），按各自指数还原即可。
+        ChartSpan sp2 = new ChartSpan();
+        sp2.lo = Chart.ExpRestore(expMin);
+        sp2.hi = Chart.ExpRestore(expMax);
+        sp2.ticks = secs;
+        return sp2;
+    }
+
+    // c × 10^e 的整数还原（e < 0 时 c 必是 10^-e 的倍数）。
+    public static int ExpRestore(ChartExp x) {
+        if (x.e >= 0) { return x.c * Chart.Pow10(x.e); }
+        return x.c / Chart.Pow10(0 - x.e);
+    }
+
+    // ECharts valueAxis 自动刻度（与演示站一致）：
+    // 内层是 src/util/smartSteps.js（section=0 自适应路径）的忠实
+    // 移植，外层套 valueAxis._reformValue 的非 scale 规则——
+    // 同号数据一端归零（全正 min→0、全负 max→0）与 min==max 整形。
+    // -2..15 → -5..15/4 段、0..1320 → 0..1500/6 段、0..2570 →
+    // 0..3000/6 段。固定 min/max 不走此函数（尊重不取整）。
+    public static ChartSpan NiceRange(int lo, int hi) {
+        return Chart.NiceRange(lo, hi, false);
+    }
+
+    // scale 版（axis.scale:true）：跳过 `_reformValue` 的同号归零——
+    // 出处 ECharts `component/valueAxis.js:666 _reformValue(scale)`：
+    // 其余（min==max 整形、smartSteps）与 !scale 完全一致。
+    public static ChartSpan NiceRange(int lo, int hi, bool scale) {
+        int min = lo;
+        int max = hi;
+        if (max < min) {
+            int tmp = min;
+            min = max;
+            max = tmp;
+        }
+        if (min == max) {
+            // valueAxis 的 min==max 修复：全 0 → max=1；正数把 min
+            // 压到 0（源码 splitNumber ?? 5 实际取 null→0）；负数把
+            // max 抬到 0。此段在源码里位于 _reformValue 之前
+            // （_calculateValue 内），不受 scale 影响。
+            if (max == 0) {
+                max = 1;
+            } else if (max > 0) {
+                min = 0;
+            } else {
+                max = 0;
+            }
+        }
+        if (!scale) {
+            if (min >= 0 && max >= 0) { min = 0; }
+            if (min <= 0 && max <= 0) { max = 0; }
+        }
+        if (min == max) { max = min + 1; }
+        if (max - min < 5) {
+            return Chart.SmartForInteger(min, max, 0);
+        }
+        return Chart.SmartCoreCalc(min, max);
+    }
+
+    // ECharts valueAxis scale:true（不强制含 0）+ boundaryGap
+    // [0.01,0.01] 的量程：数据域两端各外扩 1% 后对齐 nice 步长
+    // （1/2/2.5/5×10^k，splitNumber 5 预估），一端不归零——若按
+    // NiceRange 的非 scale 规则把全正数据零锚定，2200..2450 的
+    // 蜡烛会被压进 0..2500 步长 500 的底部。k1 原版 → 2200..2450
+    // 步长 50。
+    public static ChartSpan ScaleRange(int lo, int hi) {
+        if (hi < lo) {
+            int tmp = lo;
+            lo = hi;
+            hi = tmp;
+        }
+        if (lo == hi) { hi = lo + 1; }
+        int pad = (hi - lo) / 100;
+        if (pad < 1) { pad = 1; }
+        return Chart.ScatterAutoRange(lo - pad, hi + pad);
+    }
+
+    // ---- 轴类型：Time / Log ----
+
+    // 10 的整数对数（floor log10），仅正值（v < 1 → 0）。
+    public static int Log10(int v) {
+        if (v < 1) { return 0; }
+        int e = 0;
+        int p = 1;
+        while (p * 10 <= v) { p = p * 10; e = e + 1; }
+        return e;
+    }
+
+    // floor(log10) 的确定性整数逆；超出 int 范围时饱和为 2147483647。
+    public static int Pow10(int e) {
+        if (e <= 0) { return 1; }
+        int p = 1;
+        for (int i = 0; i < e; i = i + 1) {
+            if (p > 214748364) { return 2147483647; }
+            p = p * 10;
+        }
+        return p;
+    }
+
+    // 对数轴刻度：lo/hi 边界 + 中间的 10 的幂（去重，升序）。
+    public static List<int> LogTicks(int lo, int hi) {
+        if (hi < lo) { int tmp = lo; lo = hi; hi = tmp; }
+        if (lo < 1) { lo = 1; }
+        if (hi < lo) { hi = lo; }
+        List<int> ts = new List<int>();
+        ts.Add(lo);
+        int p = 1;
+        while (p * 10 <= hi) {
+            p = p * 10;
+            if (p > lo) { ts.Add(p); }
+        }
+        if (ts[ts.Count - 1] != hi) { ts.Add(hi); }
+        return ts;
+    }
+
+    // 官方 LogScale.getExtent 的十进位对齐：下界 = 10^floor(log10 v)、
+    // 上界 = 10^ceil(log10 v)（line-log 数据 0.002..2000 → 0.001..10000）。
+    // F 后缀作用于 ×1000 定点域（sub-1 十进位只有定点能承载）。
+    // log 轴小数十进位标签：‰ 域 → "0.001"/"0.01"/"0.1"/"1"/"10,000"。
+    // FracText 只有两位小数（1‰ → "0"），log 轴底档需要三位。
+    public static string LogFracText(long vF) {
+        if (vF >= 1000L) { return Chart.Commas((int)(vF / 1000L)); }
+        string fs = Convert.ToString((int)vF);
+        string pad = "";
+        while (pad.Length + fs.Length < 3) { pad = pad + "0"; }
+        return "0." + pad + fs;
+    }
+
+    public static int LogFloorI(int v) {
+        if (v < 1) { return 1; }
+        int b = 1;
+        while ((long)b * 10L <= (long)v) { b = b * 10; }
+        return b;
+    }
+    public static int LogCeilI(int v) {
+        if (v < 1) { return 1; }
+        int b = 1;
+        while (b < v) {
+            if (b > 100000000) { return 1000000000; }
+            b = b * 10;
+        }
+        return b;
+    }
+    public static long LogFloorF(long vF) {
+        if (vF <= 0) { return 1; }
+        long b = 1000;
+        while (b * 10L <= vF) { b = b * 10L; }
+        while (b > vF) { b = b / 10L; }
+        return b < 1 ? 1 : b;
+    }
+    public static long LogCeilF(long vF) {
+        if (vF <= 0) { return 1000; }
+        long b = 1000;
+        while (b < vF) { b = b * 10L; }
+        return b;
+    }
+
+    // 从 epoch 天生成确定性短日期 "YYYY-MM-DD"（真实公历，经
+    // DateTime 的 civil-from-days；t = 0 是 1970-01-01）。纯表
+    // 驱动、无系统时间依赖，供图表演示与 conformance 断言。
+    public static string TimeLabel(int t) {
+        if (t < 0) { t = 0; }
+        DateTime d = DateTime.FromUnixSeconds((long)t * 86400);
+        string mm = Convert.ToString(d.Month());
+        if (mm.Length < 2) { mm = "0" + mm; }
+        string dd = Convert.ToString(d.Day());
+        if (dd.Length < 2) { dd = "0" + dd; }
+        return Convert.ToString(d.Year()) + "-" + mm + "-" + dd;
+    }
+
+    // 时间轴刻度：从 {1,2,5}×10^n 阶梯选步长，使
+    // (t1-t0)/step ≤ maxTicks-1；生成 t0 起等距点，
+    // 末点不落在网格上则补 t1。跨度全程 64 位——int32 域
+    // 相减回绕成负会让步长卡在 1、循环 43 亿次撑爆内存。
+    public static List<int> TimeTicks(int t0, int t1, int maxTicks) {
+        if (t1 < t0) { int tmp = t0; t0 = t1; t1 = tmp; }
+        if (maxTicks < 2) { maxTicks = 2; }
+        long span = (long)t1 - (long)t0;
+        long step = 1;
+        while (span / step + 1 > maxTicks) {
+            long mag = 1;
+            while (step >= mag * 10) { mag = mag * 10; }
+            long unit = step / mag;
+            if (unit == 1) { step = 2 * mag; }
+            else if (unit == 2) { step = 5 * mag; }
+            else { step = 10 * mag; }
+        }
+        List<int> ts = new List<int>();
+        for (long t = t0; t <= t1; t = t + step) { ts.Add((int)t); }
+        if (ts[ts.Count - 1] != t1) { ts.Add(t1); }
+        return ts;
+    }
+
+    // ≥ v 的最小 1/2/2.5/5 × 10^k（nice 步长候选）。
+    public static int NiceStepUp(int v) {
+        if (v < 1) { return 1; }
+        int d = 1;
+        while (d * 10 <= v) { d = d * 10; }
+        if (v <= d) { return d; }
+        if (v <= 2 * d) { return 2 * d; }
+        if (v <= 25 * d / 10) { return 25 * d / 10; }
+        if (v <= 5 * d) { return 5 * d; }
+        return 10 * d;
+    }
+
+    // 将原始最小值向下取整为友好的负轴下界（-2/-5/-10 * 10^n）；
+    // 没有负数需要覆盖时返回 0。
+    public static int NiceMin(int v) {
+        if (v >= 0) { return 0; }
+        int av = 0 - v;
+        if (av <= 5) { return 0 - 5; }
+        int mag = 1;
+        while (mag * 10 <= av) { mag = mag * 10; }
+        int unit = av / mag;
+        int nice = 10;
+        if (unit < 2) { nice = 2; } else if (unit < 5) { nice = 5; }
+        return 0 - nice * mag;
+    }
+
+    // double 重载：显式界可能是 -0.4 这类小数（line-easing），
+    // 走 int 会截断成 0。语义改用 ECharts 的 NICE_MODE_MIN
+    // （number.ts:633 `mode===NICE_MODE_MIN` 恒取 nf=1，即 10^exponent
+    // 向上覆盖到 |v|），而不是旧的 2/5/10 阶梯。
+    public static double NiceMin(double v) {
+        if (v >= 0.0) { return 0.0; }
+        double av = 0.0 - v;
+        int exponent = Chart.QuantityExponent(av);
+        double n = Chart.Pow10D(exponent);
+        if (n < av) { n = n * 10.0; }
+        return 0.0 - n;
+    }
+
+}

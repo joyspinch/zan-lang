@@ -1,0 +1,554 @@
+// Chart.Label.zan - 标签与图例（饼标签矩阵、富文本、legend/title 帧内访问器、数值文本格式化）
+using System;
+using System.Json;
+using Gui;
+
+namespace Gui.Component.Chart;
+
+public partial class Chart {
+    // ---- 饼标签矩阵（ECharts PieSeries.ts:265-300 缺省 +
+    // labelLayout.ts 布局；系列型缺省差异经三态传到这里解析） ----
+
+    // label.show 三态 → 画不画：饼缺省 true（PieSeries.ts:269）。
+    // 线柱缺省 false，走 labelShow 布尔不经此函数。
+    public static bool PieLabelShows(int showT) {
+        return showT != 0;
+    }
+
+    // position 属内位（不出引线）：'inside'/'inner'（同义，
+    // PieSeries.ts:285 注）/ 'center'。
+    public static bool PieLabelInside(string pos) {
+        return pos == "inside" || pos == "inner" || pos == "center";
+    }
+
+    // labelLine.show 三态 → 画不画引线：缺省 true（PieSeries.ts:289）；
+    // false 只藏线，文本仍落在 x3（labelLayout.ts:226 只判 linePoints）。
+    public static bool PieLeaderDraws(int lineShowT) {
+        return lineShowT != 0;
+    }
+
+    // alignTo:'edge' 时水平段终点 x3（labelLayout.ts:236-243）：
+    // 左半球 = 视口左缘 + edgeDistance + 文本宽 + 文距，右半球镜像
+    // （百分比 edgeDistance 按 viewWidth 折算后传入 px）。
+    public static int PieEdgeX3(bool rightSide, int viewL, int viewW, int edgeDist,
+                         int textW, int dist) {
+        if (rightSide) {
+            return viewL + viewW - edgeDist - textW - dist;
+        }
+        return viewL + edgeDist + textW + dist;
+    }
+
+    // 扇区百分比：ECharts percent = Math.round(v/sum*100)
+    // （乘 200 加 tot 除 2tot = 正数域四舍五入）。
+    public static int PiePct(int v, long tot) {
+        if (tot <= 0) { return 0; }
+        return (int)((v * 200 + tot) / (tot * 2));
+    }
+
+    // ---- 富文本标签（ECharts label.rich + {style|content} 令牌） ----
+    // 源语义：官方"富文本标签"文档 + zrender rich 段排版——按 \n 分
+    // 行，行内 {name|content} 段用 rich.name 样式，行高 = 段声明
+    // lineHeight / height 或字号行盒的最大值，width:'100%' 随整块
+    // 宽。分词在 Chart（纯字符串，conformance 可测），量测/绘制在
+    // ChartView（要 App 缩放与 Canvas 度量）。
+
+    // 展开模板令牌 {a}{b}{c}{d}{@dim}（**保留** {style|...} 壳——
+    // 是否剥壳由调用方按有无 rich 样式表决定）。
+    public static string RichFmtRaw(ChartSeries s, string fmt,
+                             string name, int val, int pct) {
+        string f = fmt;
+        if (f.Length == 0) { return name; }
+        f = f.Replace("{a}", s.name);
+        f = f.Replace("{b}", name);
+        f = f.Replace("{c}", Convert.ToString(val));
+        f = f.Replace("{d}", Convert.ToString(pct));
+        while (true) {
+            int at = f.IndexOf("{@");
+            if (at < 0) { break; }
+            int cb = f.IndexOf("}", at);
+            if (cb < 0) { break; }
+            f = f.Substring(0, at) + Convert.ToString(val) + f.Substring(cb + 1);
+        }
+        return f;
+    }
+
+    // rich 样式表里按名取样式；没有返回 null。
+    public static ChartRichStyle RichStyleOf(ChartTextStyle st, string nm) {
+        if (st == null || st.rich == null || nm.Length == 0) { return null; }
+        for (int i = 0; i < st.rich.Count; i = i + 1) {
+            if (st.rich[i].name == nm) { return st.rich[i]; }
+        }
+        return null;
+    }
+
+    // 富文本分词：按 \n 分行（行号记 seg.line），{name|content} 段
+    // 挂样式（查表挂 st 引用，纯文本段 st=null）。未知样式名按纯
+    // 文本段处理但保留内容。返回扁平段表（顺序 = 阅读序）。
+    // 约定：空段（{hr|}）text = ""，调用方靠 width/borderWidth 识别
+    // 线块。
+    public static List<RichSeg> RichTokenize(string f, ChartTextStyle st) {
+        List<RichSeg> outSegs = new List<RichSeg>();
+        int line = 0;
+        int i = 0;
+        int segLineStart = 0;
+        bool lineHasSeg = false;
+        while (i < f.Length) {
+            char ch = f[i];
+            if (ch == '\n') {
+                // 行尾文本（非空）或整行空行——空行也要占行号。
+                if (i > segLineStart || !lineHasSeg) {
+                    RichSeg done = new RichSeg();
+                    done.text = f.Substring(segLineStart, i - segLineStart);
+                    done.line = line;
+                    done.st = null;
+                    outSegs.Add(done);
+                }
+                line = line + 1;
+                i = i + 1;
+                segLineStart = i;
+                lineHasSeg = false;
+                continue;
+            }
+            if (ch == '{') {
+                int cb = f.IndexOf("}", i);
+                if (cb >= 0) {
+                    int bar = f.IndexOf("|", i);
+                    if (bar >= 0 && bar < cb) {
+                        // 段前的行首文本（若非空）先行进表。
+                        if (i > segLineStart) {
+                            RichSeg pre = new RichSeg();
+                            pre.text = f.Substring(segLineStart, i - segLineStart);
+                            pre.line = line;
+                            pre.st = null;
+                            outSegs.Add(pre);
+                            lineHasSeg = true;
+                        }
+                        RichSeg sg = new RichSeg();
+                        sg.st = Chart.RichStyleOf(st,
+                            f.Substring(i + 1, bar - i - 1));
+                        sg.text = f.Substring(bar + 1, cb - bar - 1);
+                        sg.line = line;
+                        outSegs.Add(sg);
+                        lineHasSeg = true;
+                        i = cb + 1;
+                        segLineStart = i;
+                        continue;
+                    }
+                }
+            }
+            i = i + 1;
+        }
+        if (segLineStart < f.Length || !lineHasSeg || outSegs.Count == 0) {
+            RichSeg last = new RichSeg();
+            last.text = f.Substring(segLineStart);
+            last.line = line;
+            last.st = null;
+            outSegs.Add(last);
+        }
+        return outSegs;
+    }
+
+    // 段盒高贡献：声明 height 用 height，否则行盒 fontH；均加纵向
+    // padding（负 padding 官方允许——gauge-speed 的 [0,0,-20,10]，
+    // 结果可为负，排版时按 max(1, ·) 兜底）。
+    public static int RichSegH(int declaredH, int fontH, int padT, int padB) {
+        int h = declaredH >= 0 ? declaredH : fontH;
+        return h + padT + padB;
+    }
+
+    // 剥壳文本：富文本格式串去掉 `{name|…}` 壳后的纯内容（未知样式
+    // 名同样保留内容）。供量宽（CategoryTicks）、旋转/退化路径和
+    // 系列标签文本（LabelText）——带壳串直接 DrawText 会把花括号
+    // 画出来。无 `{` 快速返回原串。
+    public static string RichStrip(string f) {
+        if (f.IndexOf("{") < 0) { return f; }
+        List<RichSeg> segs = Chart.RichTokenize(f, null);
+        string r = "";
+        for (int i = 0; i < segs.Count; i = i + 1) {
+            r = r + segs[i].text;
+        }
+        return r;
+    }
+
+    // 固定小数位数的确定性格式化（四舍五入，无浮点打印依赖）。
+    // precision 钳制在 0..4。
+    public static string FormatFixed(double v, int precision) {
+        if (precision < 0) { precision = 0; }
+        if (precision > 4) { precision = 4; }
+        int scale = 1;
+        for (int i = 0; i < precision; i = i + 1) { scale = scale * 10; }
+        bool neg = false;
+        double av = v;
+        if (av < 0) { neg = true; av = 0 - av; }
+        int scaled = (int)(av * (double)scale + 0.5);
+        int ip = scaled / scale;
+        string s = Convert.ToString(ip);
+        if (precision > 0) {
+            int frac = scaled % scale;
+            string fs = Convert.ToString(frac);
+            while (fs.Length < precision) { fs = "0" + fs; }
+            s = s + "." + fs;
+        }
+        if (neg) { s = "-" + s; }
+        return s;
+    }
+
+    // legend.formatter 纯 seam：{name} 占位替换（模板空 = 原名）。
+    public static string LegendLabel(string fmt, string name) {
+        if (fmt.Length < 1) { return name; }
+        return fmt.Replace("{name}", name);
+    }
+
+    // ---- legend 选项帧内访问器（Chart.legendOpt 未置 = 保持旧行为）----
+    // 本帧图例是否纵向排布（legendOpt 未置 = 横向）。
+    public static bool LegendVertical() {
+        ChartOption lo = Chart.legendOpt;
+        if (lo == null) { return false; }
+        return lo.legendOrient == "vertical";
+    }
+    // 本帧图例 formatter 模板（legendOpt 未置 = 空模板 = 原名）。
+    public static string LegendFmt() {
+        ChartOption lo = Chart.legendOpt;
+        if (lo == null) { return ""; }
+        return lo.legendFormatter;
+    }
+    // 本帧卡片底色（ECharts option.backgroundColor）。
+    // 官方语义（core/echarts.ts:1927）：未声明 → 'transparent'，
+    // 由 zrender 底层呈现；Zan 的等价物是主题面板色（0 = 跟随主题）。
+    // 声明了就整卡铺它——pie-custom 的 #2c343c 深底配白字标签、
+    // gauge-car 的 #000 都是这个用途。
+    public static int PanelBgOr(int themeBg) {
+        ChartOption lo = Chart.legendOpt;
+        if (lo == null) { return themeBg; }
+        if (lo.backgroundColor == 0) { return themeBg; }
+        return lo.backgroundColor;
+    }
+
+    // 本帧标题副标题（ECharts title.subtext；legendOpt 未置 = 空）。
+    public static string TitleSubText() {
+        ChartOption lo = Chart.legendOpt;
+        if (lo == null) { return ""; }
+        return lo.titleSub;
+    }
+    // 本帧标题水平对齐："left" | "center"（官方默认）| "right"。
+    public static string TitleAlignMode() {
+        ChartOption lo = Chart.legendOpt;
+        if (lo == null) { return ""; }
+        return lo.titleAlign;
+    }
+    // 标题正文色。官方 tokens.color.primary = neutral80 = #3c3c41；
+    // option.title.textStyle.color 显式给出时以它为准。
+    public static int TitleColor() {
+        ChartOption lo = Chart.legendOpt;
+        if (lo != null && lo.titleColor != 0) { return lo.titleColor; }
+        return Chart.TitleNeutral(0x3c, 0x3c, 0x41);
+    }
+    // 标题副文本色。官方 tokens.color.quaternary = neutral50 = #86878c。
+    public static int TitleSubColor() {
+        ChartOption lo = Chart.legendOpt;
+        if (lo != null && lo.titleSubColor != 0) { return lo.titleSubColor; }
+        return Chart.TitleNeutral(0x86, 0x87, 0x8c);
+    }
+    // 打包 RGB 为不透明 ARGB（alpha 0 在 DrawText 里视为不透明）。
+    public static int TitleNeutral(int r, int g, int b) {
+        return (r << 16) | (g << 8) | b;
+    }
+    // legend.left/right 的等效水平对齐（官方盒模型）：显式
+    // left/right/center 关键字直接返回；数值/百分比锚返回 ""（走 px
+    // 通路）；两锚都未声明时返回官方默认 "center"。
+    public static string LegendBoxAlignX() {
+        ChartOption lo = Chart.legendOpt;
+        if (lo == null) { return "center"; }
+        if (lo.legendHasLeft) {
+            if (lo.legendLeft == "left" || lo.legendLeft == "center"
+                || lo.legendLeft == "right") { return lo.legendLeft; }
+            return "";
+        }
+        if (lo.legendHasRight) {
+            if (lo.legendRight == "right") { return "right"; }
+            if (lo.legendRight == "left") { return "left"; }
+            if (lo.legendRight == "center") { return "center"; }
+            return "";
+        }
+        return "center";  // 官方 LegendModel.defaultOption: left 'center'
+    }
+    // legend.left 数值锚（px）；未声明数值锚返回 -1。
+    public static int LegendAnchorLeftPx() {
+        ChartOption lo = Chart.legendOpt;
+        if (lo == null) { return 0 - 1; }
+        if (lo.legendHasLeft && lo.legendLeftPx >= 0) { return lo.legendLeftPx; }
+        return 0 - 1;
+    }
+    // legend.right 数值锚（px）；未声明返回 -1。
+    public static int LegendAnchorRightPx() {
+        ChartOption lo = Chart.legendOpt;
+        if (lo == null) { return 0 - 1; }
+        if (lo.legendHasRight && lo.legendRightPx >= 0) { return lo.legendRightPx; }
+        return 0 - 1;
+    }
+    // legend.top 数值锚（px）；未声明返回 -1。
+    public static int LegendAnchorTopPx() {
+        ChartOption lo = Chart.legendOpt;
+        if (lo == null) { return 0 - 1; }
+        if (lo.legendHasTop && lo.legendTopPx >= 0) { return lo.legendTopPx; }
+        return 0 - 1;
+    }
+    // legend.bottom 数值锚（px）；未声明返回 -1（布局侧按官方默认
+    // tokens.size.m = 15 处理）。
+    public static int LegendAnchorBottomPx() {
+        ChartOption lo = Chart.legendOpt;
+        if (lo == null) { return 0 - 1; }
+        if (lo.legendHasBottom && lo.legendBottomPx >= 0) { return lo.legendBottomPx; }
+        return 0 - 1;
+    }
+    // legend.top/bottom 是否声明为 top/middle/bottom 关键字。
+    public static string LegendBoxAlignY() {
+        ChartOption lo = Chart.legendOpt;
+        if (lo == null) { return ""; }
+        if (lo.legendHasTop) {
+            if (lo.legendTop == "top" || lo.legendTop == "middle"
+                || lo.legendTop == "bottom") { return lo.legendTop; }
+        }
+        if (lo.legendHasBottom) {
+            if (lo.legendBottom == "top" || lo.legendBottom == "middle"
+                || lo.legendBottom == "bottom") { return lo.legendBottom; }
+        }
+        return "";
+    }
+
+    // 图例浮层顶边 Y（官方盒模型，供各视图共用）：
+    // 显式 top 锚贴顶、显式 bottom 锚贴底（值即距底 px）、关键字
+    // top/middle/bottom 对应上/中/下，均未声明时按官方默认
+    // bottom = tokens.size.m = 15 贴底。lgH = 图例整体高度。
+    public static int LegendFloatTop(App app, int y, int h, int lgH, int pad) {
+        int vTop = Chart.LegendAnchorTopPx();
+        int vBot = Chart.LegendAnchorBottomPx();
+        string vAlign = Chart.LegendBoxAlignY();
+        if (vTop >= 0) { return y + app.Scale(vTop); }
+        if (vBot >= 0) { return y + h - app.Scale(vBot) - lgH; }
+        if (vAlign == "top") { return y + pad; }
+        if (vAlign == "middle") { return y + (h - lgH) / 2; }
+        return y + h - app.Scale(15) - lgH;  // 官方默认 bottom 15
+    }
+
+    // 图例浮层左边 X（官方盒模型）：显式 left/right 数值锚优先，其次
+    // 关键字 left/center/right，均未声明时官方默认 center（在
+    // [x0, maxX] 内居中）。contentW = 图例整行/整列宽度。
+    public static int LegendFloatLeft(App app, int x, int w, int contentW,
+                               int pad, int x0, int maxX) {
+        int lAnc = Chart.LegendAnchorLeftPx();
+        int rAnc = Chart.LegendAnchorRightPx();
+        if (lAnc >= 0) { return x + app.Scale(lAnc); }
+        if (rAnc >= 0) { return maxX - app.Scale(rAnc) - contentW; }
+        string lax = Chart.LegendBoxAlignX();
+        if (lax == "left") { return x0; }
+        if (lax == "right") { return maxX - contentW; }
+        if (contentW > 0 && contentW <= maxX - x0) {
+            return x0 + (maxX - x0 - contentW) / 2;
+        }
+        return x0;
+    }
+
+    // 本帧图例点击模式：0 = multiple（现状）| 1 = single |
+    // -1 = false（不可点）。
+    public static int LegendSelMode() {
+        ChartOption lo = Chart.legendOpt;
+        if (lo == null) { return 0; }
+        if (lo.legendSelectedMode == "single") { return 1; }
+        if (lo.legendSelectedMode == "false") { return 0 - 1; }
+        return 0;
+    }
+
+    // dataRange calculable 滑条位置（0..1000）到值域的线性映射
+    // （纯 seam）：q=0 → dLo、q=1000 → dHi。q 越界钳制。
+    public static int DataRangeValue(int dLo, int dHi, int q) {
+        int span = dHi - dLo;
+        if (span < 0) { span = 0; }
+        if (q < 0) { q = 0; }
+        if (q > 1000) { q = 1000; }
+        return dLo + span * q / 1000;
+    }
+
+    // 单个图例色块占宽：色块 + 间隙 + 标签文本宽 + 右侧留白。
+    public static int LegendChipW(App app, string label) {
+        int lgFs = ChartFonts.Legend(app);
+        return app.Scale(12) + app.Scale(6)
+            + Canvas.MeasureText(label, lgFs) + app.Scale(10);
+    }
+
+    // 标题行与工具箱行的底边：空标题不占大号行高，有工具箱时
+    // 内容从工具箱下方开始，避免标题/色块和工具图标叠在一起。
+    public static int HeadBandBottomValues(int y, int pad, int titleH,
+                                    int toolboxH, int gap) {
+        int h = titleH;
+        if (toolboxH > h) { h = toolboxH; }
+        if (h < 1) { return y + pad; }
+        return y + pad + h + gap;
+    }
+
+    // 按主题内边距与标题/工具箱行高算出面板内容起始 y
+    // （工具箱存在性取本帧 toolReserve）。
+    public static int HeadBandBottom(App app, int y, string title) {
+        int pad = app.theme.paddingMedium;
+        int titleH = 0;
+        if (title.Length > 0) {
+            titleH = Canvas.FontHeight(Style.FontFallback(app, "large"));
+            if (Chart.TitleSubText().Length > 0) {
+                titleH = titleH + Canvas.FontHeight(ChartFonts.SeriesLabel(app))
+                    + app.Scale(2);
+            }
+        }
+        int toolboxH = 0;
+        if (Chart.toolReserve > 0) {
+            toolboxH = ChartToolbox.Height(app);
+        }
+        return Chart.HeadBandBottomValues(y, pad, titleH, toolboxH,
+            app.Scale(4));
+    }
+
+    // 右侧色块图例一行（独立 AllocId 命中）。stateKey 跨帧持久化：
+    // 点一下切换隐藏（变暗 + 删除线），再点恢复。stateKey=0 时
+    // 纯展示不可点。返回是否刚点中。
+    public static bool DrawLegendChip(App app, int lx, int ly, int legendW, int lh,
+                               int color, string label, bool hidden, int stateKey) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int sw = app.Scale(12);
+        int hitId = app.focus.AllocId();
+        app.hitTester.RegisterRect(hitId, lx, ly, legendW, lh, 3);
+        bool hot = app.mouseX >= lx && app.mouseX < lx + legendW
+            && app.mouseY >= ly && app.mouseY < ly + lh;
+        int rowCol = color;
+        int lblColor = Style.Part(app, "chart", "label", "", "", "",
+            Style.SNormal()).FgOr(0);
+        if (hidden) {
+            rowCol = ChartColor.WithAlpha(color, 90);
+            lblColor = ChartColor.WithAlpha(lblColor, 110);
+        }
+        c.FillRoundRect(lx, ly + app.Scale(2), sw, sw, t.borderRadiusSmall, rowCol);
+        if (hot && !hidden) {
+            c.DrawRoundRect(lx - app.Scale(1), ly + app.Scale(1),
+                sw + app.Scale(2), sw + app.Scale(2), t.borderRadiusSmall,
+                t.primary, 1);
+        }
+        int lgFs = ChartFonts.Legend(app);
+        c.DrawText(lx + sw + app.Scale(6), ly + app.Scale(1), label, lblColor, lgFs);
+        if (hidden) {
+            int my = ly + app.Scale(2) + Canvas.FontHeight(lgFs) / 2;
+            int tw = Canvas.MeasureText(label, lgFs);
+            c.FillRect(lx + sw + app.Scale(6), my, tw, 1, lblColor);
+        }
+        if (stateKey != 0 && Ui.Clicked(app, hitId)) {
+            int nv = 1;
+            if (hidden) { nv = 0; }
+            app.StateSet(stateKey, nv);
+            app.RequestRedraw();
+            return true;
+        }
+        return false;
+    }
+
+    // 格式化标签比裸数值多占的宽度（axisLabel.formatter 模板，
+    // 如 "{value} °C"），供轴栏预留。
+    public static int FormatterExtraW(string fmt, int v, int fs) {
+        string raw = Chart.Commas(v);
+        string full = fmt.Replace("{value}", raw);
+        return Canvas.MeasureText(full, fs) - Canvas.MeasureText(raw, fs);
+    }
+
+    // ECharts 数值默认千分位（axisLabel 的 {value}、tooltip 数值
+    // 都过 addCommas）：3000 → "3,000"，负号不占分组位。
+    public static string Commas(int v) {
+        bool neg = v < 0;
+        string d = Convert.ToString(neg ? 0 - v : v);
+        int n = d.Length;
+        if (n <= 3) { return neg ? "-" + d : d; }
+        StringBuilder b = new StringBuilder();
+        if (neg) { b.Append("-"); }
+        int firstGroup = n % 3;
+        if (firstGroup == 0) { firstGroup = 3; }
+        b.Append(d.Substring(0, firstGroup));
+        int i = firstGroup;
+        while (i < n) {
+            b.Append(",");
+            b.Append(d.Substring(i, 3));
+            i = i + 3;
+        }
+        return b.ToString();
+    }
+
+    // 1/1000 定点 → 小数文本：fr 为 0 时输出整数（500000 → "500"、
+    // -1000 → "-1"），否则两位小数去尾零（500 → "0.5"、860 →
+    // "0.86"）。折线小数值（line6 流量 0.86..1.5）在 int 渲染
+    // 管线的承载约定：值 ×1000 存整型，展示前经此除回。
+    public static string FracText(int v) {
+        bool neg = v < 0;
+        int av = neg ? 0 - v : v;
+        int ip = av / 1000;
+        int fr = (av - ip * 1000 + 5) / 10;
+        if (fr >= 100) { ip = ip + 1; fr = fr - 100; }
+        if (fr == 0) {
+            string whole = Chart.Commas(ip);
+            return neg ? "-" + whole : whole;
+        }
+        string fs = Convert.ToString(fr);
+        while (fs.Length > 1 && (fs[fs.Length - 1] & 255) == 48) {
+            fs = fs.Substring(0, fs.Length - 1);
+        }
+        string o = Convert.ToString(ip) + "." + fs;
+        return neg ? "-" + o : o;
+    }
+
+    // 系列第 i 项的展示文本：小数系列（numberSet 且非整数）输出
+    // 两位小数（ECharts 数值默认 ×1000 定点），整数系列仍是
+    // 千分位整数——与轴刻度、tooltip 的展示约定一致。
+    // labelLayout moveOverlap 的一维解叠（labelLayoutHelper.ts
+    // shiftLayoutOnXY:324 的化简——sort by rect pos + 前向顶开，
+    // delta = pos - 前盒末缘，负则推到前盒末缘；他们的 bounds
+    // squeeze / balanceShift 不在语料路径，未移）。pos 须按升序
+    // 给定（调用方带索引排序），size 为各盒沿轴长度，gap = 盒间缝。
+    public static List<int> LlShift1D(List<int> pos, List<int> size, int gap) {
+        int n = pos.Count;
+        List<int> cur = new List<int>();
+        for (int i = 0; i < n; i = i + 1) { cur.Add(pos[i]); }
+        for (int i = 1; i < n; i = i + 1) {
+            int lim = cur[i - 1] + size[i - 1] + gap;
+            if (cur[i] < lim) { cur[i] = lim; }
+        }
+        return cur;
+    }
+
+    public static string SeriesNumText(ChartSeries s, int i) {
+        if (s.SeriesFrac(i)) {
+            double dn = s.Number(i);
+            return Chart.FracText((int)(dn * 1000 + (dn >= 0 ? 0.5 : 0 - 0.5)));
+        }
+        return Chart.Commas(s.Value(i));
+    }
+
+    // [lo, hi] 范围分成 `ticks` 步时最宽的刻度标签（像素），
+    // 用于预留左/右轴 gut 宽度。
+    public static int TickLabelW(int lo, int hi, int ticks, int fs) {
+        int span = hi - lo;
+        int wmax = 0;
+        for (int k = 0; k <= ticks; k = k + 1) {
+            int val = lo + span * k / ticks;
+            int lw = Canvas.MeasureText(Chart.Commas(val), fs);
+            if (lw > wmax) { wmax = lw; }
+        }
+        return wmax;
+    }
+
+    // TickLabelW 的 ×1000 定点对偶：小数轴刻度文本（FracText）
+    // 的最宽像素。
+    public static int TickLabelWF(int loF, int hiF, int ticks, int fs) {
+        int span = hiF - loF;
+        int wmax = 0;
+        for (int k = 0; k <= ticks; k = k + 1) {
+            int lw = Canvas.MeasureText(Chart.FracText(loF + span * k / ticks), fs);
+            if (lw > wmax) { wmax = lw; }
+        }
+        return wmax;
+    }
+
+}
