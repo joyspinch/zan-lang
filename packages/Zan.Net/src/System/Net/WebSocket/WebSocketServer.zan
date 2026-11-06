@@ -1,0 +1,425 @@
+using System;
+using System.Collections.Generic;
+using System.Net.Sockets;
+using System.Net.Http;
+using System.Text;
+using System.Security.Cryptography;
+using System.Threading;
+
+namespace System.Net.WebSocket;
+
+// 处理一条已解码的文本消息，返回值自动作为响应发回客户端（为 null 或空串则不发送）
+public async delegate string WebSocketMessageHandler(string message);
+
+// 包含连接上下文的消息处理器（可访问 conn.SendAsync / conn.CloseAsync 等）
+public async delegate string WebSocketContextMessageHandler(WebSocketConnection conn, string message);
+
+// 客户端连接/断开事件处理器
+public async delegate void WebSocketConnectionHandler(WebSocketConnection conn);
+
+// 单条活跃 WebSocket 客户端连接上下文
+public class WebSocketConnection : IDisposable {
+    public nint sock;
+    public TcpClient client;
+    public bool connected;
+    private Mutex sendLock;
+
+    public WebSocketConnection(nint sock, TcpClient client) {
+        this.sock = sock;
+        this.client = client;
+        this.connected = true;
+        this.sendLock = new Mutex();
+    }
+
+    // 异步发送文本帧（RFC 6455 Opcode 1）
+    public async int SendAsync(string text) {
+        if (!this.connected || text == null) { return -1; }
+        byte[] payload = text.ToBytes();
+        WsFrame frame = WsFrame.RawFrame(WsOpcode.Text, payload, payload.Length);
+        byte[] encoded = frame.Encode();
+        int frameLen = WsFrame.HeaderLen(payload.Length) + payload.Length;
+
+        this.sendLock.WaitOne();
+        try {
+            int r = await this.client.SendBytesAsync(encoded, frameLen);
+            return r;
+        } finally {
+            this.sendLock.ReleaseMutex();
+        }
+    }
+
+    // 异步发送二进制帧（RFC 6455 Opcode 2）
+    public async int SendBytesAsync(byte[] data, int len) {
+        if (!this.connected || data == null || len <= 0) { return -1; }
+        WsFrame frame = WsFrame.RawFrame(WsOpcode.Binary, data, len);
+        byte[] encoded = frame.Encode();
+        int frameLen = WsFrame.HeaderLen(len) + len;
+
+        this.sendLock.WaitOne();
+        try {
+            int r = await this.client.SendBytesAsync(encoded, frameLen);
+            return r;
+        } finally {
+            this.sendLock.ReleaseMutex();
+        }
+    }
+
+    // 发送 Ping 探活帧（RFC 6455 Opcode 9）
+    public async void PingAsync() {
+        if (!this.connected) { return; }
+        WsFrame ping = WsFrame.RawFrame(WsOpcode.Ping, new byte[0], 0);
+        byte[] encoded = ping.Encode();
+
+        this.sendLock.WaitOne();
+        try {
+            await this.client.SendBytesAsync(encoded, 2);
+        } catch (Exception ex) {
+        } finally {
+            this.sendLock.ReleaseMutex();
+        }
+    }
+
+    // 发送正常关闭帧（RFC 6455 Opcode 8）并断开连接
+    public async void CloseAsync() {
+        if (!this.connected) { return; }
+        this.connected = false;
+        WsFrame close = WsFrame.CloseFrame();
+        byte[] encoded = close.Encode();
+
+        this.sendLock.WaitOne();
+        try {
+            await this.client.SendBytesAsync(encoded, 2);
+        } catch (Exception ex) {
+        } finally {
+            this.sendLock.ReleaseMutex();
+            if (this.client != null) { this.client.Close(); }
+            if (this.sock >= 0) { Socket.Close(this.sock); this.sock = -1; }
+        }
+    }
+
+    public void Dispose() {
+        this.connected = false;
+        if (this.client != null) { this.client.Close(); }
+        if (this.sock >= 0) { Socket.Close(this.sock); this.sock = -1; }
+    }
+}
+
+// RFC 6455 标准明文 WebSocket (ws://) 高性能轻量服务器。
+// 核心能力：
+// 1. 严格握手校验防线：Upgrade: websocket、Connection: Upgrade、Sec-WebSocket-Key 校验及 SHA1 Accept 派生计算。
+// 2. RFC 6455 §5.1 客户端入站掩码校验（未掩码帧直接 1002 阻断断开）。
+// 3. RFC 6455 §5.4 分片数据帧（Continuation Frames）安全拼接重组与 16MiB 防爆限制（1009）。
+// 4. RFC 6455 §5.5 控制帧调度：Ping 自动回显 Pong、双向 Close 优雅断开握手。
+// 5. UTF-8 编码合规安全门禁（非法文本载荷阻断 1007）。
+// 6. 支持全局并发广播（Broadcast）、连接生命周期监听及优雅停机。
+public class WebSocketServer : IDisposable {
+    public TcpListener listener;
+    public string host;
+    public int port;
+    public bool running;
+    public int activeConnections;
+    public int maxConnections;
+    public int requestTimeoutMs;
+
+    public WebSocketMessageHandler messageHandler;
+    public WebSocketContextMessageHandler contextHandler;
+    public WebSocketConnectionHandler connectHandler;
+    public WebSocketConnectionHandler closeHandler;
+
+    public List<WebSocketConnection> connections;
+    private Mutex connLock;
+
+    public WebSocketServer(string host, int port) {
+        this.host = host;
+        this.port = port;
+        this.running = false;
+        this.activeConnections = 0;
+        this.maxConnections = 10000;
+        this.requestTimeoutMs = 30000;
+        this.messageHandler = null;
+        this.contextHandler = null;
+        this.connectHandler = null;
+        this.closeHandler = null;
+        this.connections = new List<WebSocketConnection>();
+        this.connLock = new Mutex();
+    }
+
+    public WebSocketServer OnMessage(WebSocketMessageHandler handler) {
+        this.messageHandler = handler;
+        return this;
+    }
+
+    public WebSocketServer OnContextMessage(WebSocketContextMessageHandler handler) {
+        this.contextHandler = handler;
+        return this;
+    }
+
+    public WebSocketServer OnConnect(WebSocketConnectionHandler handler) {
+        this.connectHandler = handler;
+        return this;
+    }
+
+    public WebSocketServer OnClose(WebSocketConnectionHandler handler) {
+        this.closeHandler = handler;
+        return this;
+    }
+
+    public WebSocketServer SetMaxConnections(int max) {
+        this.maxConnections = max;
+        return this;
+    }
+
+    public WebSocketServer SetTimeout(int ms) {
+        this.requestTimeoutMs = ms;
+        return this;
+    }
+
+    // 启动非阻塞 Accept 循环
+    public async void Start() {
+        Socket.Initialize();
+        this.listener = new TcpListener(this.host, this.port);
+        this.listener.Start();
+        this.running = true;
+
+        while (this.running) {
+            nint clientSock = await this.listener.AcceptAsync();
+            if (clientSock >= 0) {
+                Socket.SetNoDelay(clientSock);
+                if (this.activeConnections >= this.maxConnections) {
+                    Socket.Close(clientSock);
+                } else {
+                    this.activeConnections = this.activeConnections + 1;
+                    Task.Spawn(this.HandleConnection(clientSock));
+                }
+            }
+        }
+    }
+
+    async void HandleConnection(nint clientSock) {
+        WebSocketConnection conn = null;
+        try {
+            Socket.SetNonBlocking(clientSock);
+            HttpDeadlineToken watch = HttpDeadline.Arm(clientSock, this.requestTimeoutMs);
+            TcpClient client = TcpClient.FromSocket(clientSock);
+            WsReader reader = new WsReader(clientSock);
+            int headerEnd = -1;
+            bool alive = true;
+
+            // 1. 读满 HTTP 握手头部
+            while (alive) {
+                headerEnd = reader.FindHeaderEnd();
+                if (HttpDeadline.Expired(watch)) { alive = false; break; }
+                if (headerEnd >= 0) { break; }
+                if (reader.Buffered() > 65536) { alive = false; break; }
+                int n = await reader.FillMore();
+                if (n <= 0 || HttpDeadline.Expired(watch)) { alive = false; break; }
+            }
+
+            if (!alive || headerEnd < 0) {
+                HttpDeadline.Disarm(watch);
+                client.Close();
+                return;
+            }
+
+            string head = reader.Slice(headerEnd + 4);
+            HttpRequest req = HttpRequest.Parse(head);
+
+            // 2. 校验 RFC 6455 升级握手格式
+            if (!WsHandshake.Valid(req)) {
+                HttpDeadline.Disarm(watch);
+                string bad = "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                await client.SendAsync(bad);
+                client.Close();
+                return;
+            }
+
+            string wsKey = req.GetHeader("Sec-WebSocket-Key");
+            string acceptKey = Encoding.WebSocketAccept(wsKey);
+
+            StringBuilder sb = new StringBuilder();
+            sb.Append("HTTP/1.1 101 Switching Protocols\r\n");
+            sb.Append("Upgrade: websocket\r\n");
+            sb.Append("Connection: Upgrade\r\n");
+            sb.Append("Sec-WebSocket-Accept: ");
+            sb.Append(acceptKey);
+            sb.Append("\r\n\r\n");
+            string hs = sb.ToString();
+
+            int sent = await client.SendAsync(hs);
+            bool timedOut = HttpDeadline.Expired(watch);
+            HttpDeadline.Disarm(watch);
+            if (sent < 0 || timedOut) {
+                client.Close();
+                return;
+            }
+
+            // 消费握手字节，保留管道中已到达的后续帧字节
+            reader.Consume(headerEnd + 4);
+            conn = new WebSocketConnection(clientSock, client);
+
+            this.AddConnection(conn);
+            if (this.connectHandler != null) {
+                await this.connectHandler(conn);
+            }
+
+            // 3. 进入 RFC 6455 帧解码循环
+            await this.ServeLoopAsync(conn, reader);
+        } finally {
+            if (conn != null) {
+                this.RemoveConnection(conn);
+                if (this.closeHandler != null) {
+                    try {
+                        await this.closeHandler(conn);
+                    } catch (Exception ex) {}
+                }
+                conn.Dispose();
+            } else {
+                Socket.Close(clientSock);
+            }
+            this.activeConnections = this.activeConnections - 1;
+        }
+    }
+
+    async Task ServeLoopAsync(WebSocketConnection conn, WsReader reader) {
+        WsAssembler asm = new WsAssembler(reader.MaxLen());
+
+        while (conn.connected) {
+            int total = reader.FrameSize();
+            while (total < 0) {
+                if (total == -2 || total == -3) {
+                    byte[] enc = WsFrame.CloseFrameWithCode(total == -3 ? 1009 : 1002).Encode();
+                    await conn.client.SendBytesAsync(enc, 4);
+                    conn.connected = false;
+                    return;
+                }
+                int n = await reader.FillMore();
+                if (n <= 0) {
+                    conn.connected = false;
+                    return;
+                }
+                total = reader.FrameSize();
+            }
+            if (!conn.connected) { return; }
+
+            WsFrame frame = reader.TakeFrame(total);
+
+            // RFC 6455 §5.1: 客户端至服务端的数据帧必须进行掩码处理
+            if (!WsFrame.ValidInbound(frame, true)) {
+                byte[] enc = WsFrame.CloseFrameWithCode(1002).Encode();
+                await conn.client.SendBytesAsync(enc, 4);
+                conn.connected = false;
+                return;
+            }
+
+            if (frame.opcode == WsOpcode.Ping) {
+                // RFC 6455 §5.5.3: 回显 Pong 帧并带回相同应用数据
+                WsFrame pong = WsFrame.RawFrame(WsOpcode.Pong, frame.payload, frame.payloadLen);
+                byte[] enc = pong.Encode();
+                await conn.client.SendBytesAsync(enc, WsFrame.HeaderLen(frame.payloadLen) + frame.payloadLen);
+                continue;
+            }
+            if (frame.opcode == WsOpcode.Pong) {
+                continue;
+            }
+            if (frame.opcode == WsOpcode.Close) {
+                // 优雅双向关闭握手
+                WsFrame closeResp = WsFrame.CloseFrame();
+                byte[] enc = closeResp.Encode();
+                await conn.client.SendBytesAsync(enc, 2);
+                conn.connected = false;
+                return;
+            }
+
+            // 数据帧分片与重组
+            int feed = asm.Feed(frame);
+            if (feed < 0) {
+                byte[] enc = WsFrame.CloseFrameWithCode(feed == -2 ? 1009 : 1002).Encode();
+                await conn.client.SendBytesAsync(enc, 4);
+                conn.connected = false;
+                return;
+            }
+            if (feed == 0) { continue; } // 分片未完，等待下一个 continuation 帧
+
+            if (!asm.ValidComplete()) {
+                // 文本帧包含畸形 UTF-8 字符
+                byte[] encUtf = WsFrame.CloseFrameWithCode(1007).Encode();
+                await conn.client.SendBytesAsync(encUtf, 4);
+                conn.connected = false;
+                return;
+            }
+
+            string message = asm.Complete();
+            string reply = null;
+
+            if (this.contextHandler != null) {
+                reply = await this.contextHandler(conn, message);
+            } else if (this.messageHandler != null) {
+                reply = await this.messageHandler(message);
+            }
+
+            if (reply != null && reply.Length > 0 && conn.connected) {
+                await conn.SendAsync(reply);
+            }
+        }
+    }
+
+    void AddConnection(WebSocketConnection conn) {
+        this.connLock.WaitOne();
+        try {
+            this.connections.Add(conn);
+        } finally {
+            this.connLock.ReleaseMutex();
+        }
+    }
+
+    void RemoveConnection(WebSocketConnection conn) {
+        this.connLock.WaitOne();
+        try {
+            for (int i = 0; i < this.connections.Count; i = i + 1) {
+                if (this.connections[i] == conn) {
+                    this.connections.RemoveAt(i);
+                    break;
+                }
+            }
+        } finally {
+            this.connLock.ReleaseMutex();
+        }
+    }
+
+    // 向当前所有活跃客户端广播文本消息
+    public void Broadcast(string message) {
+        if (message == null || message.Length == 0) { return; }
+        this.connLock.WaitOne();
+        try {
+            for (int i = 0; i < this.connections.Count; i = i + 1) {
+                WebSocketConnection c = this.connections[i];
+                if (c.connected) {
+                    Task.Spawn(c.SendAsync(message));
+                }
+            }
+        } finally {
+            this.connLock.ReleaseMutex();
+        }
+    }
+
+    // 优雅停机并断开所有活跃客户端连接
+    public void Stop() {
+        this.running = false;
+        if (this.listener != null) {
+            this.listener.Stop();
+        }
+        this.connLock.WaitOne();
+        try {
+            for (int i = 0; i < this.connections.Count; i = i + 1) {
+                this.connections[i].CloseAsync();
+            }
+            this.connections.Clear();
+        } finally {
+            this.connLock.ReleaseMutex();
+        }
+    }
+
+    public void Dispose() {
+        this.Stop();
+    }
+}

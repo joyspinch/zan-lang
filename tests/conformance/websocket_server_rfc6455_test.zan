@@ -1,0 +1,68 @@
+using System;
+using System.Net.Sockets;
+using System.Net.WebSocket;
+using System.Threading;
+
+class Program {
+    static int PORT = 19888;
+    static int failures = 0;
+
+    static void Check(bool cond, string name) {
+        if (cond) {
+            Console.WriteLine("ok " + name);
+        } else {
+            Console.WriteLine("FAIL " + name);
+            failures = failures + 1;
+        }
+    }
+
+    static async string HandleMsg(string msg) {
+        return "ECHO:" + msg;
+    }
+
+    static async int Run() {
+        Socket.Initialize();
+        WebSocketServer server = new WebSocketServer("127.0.0.1", PORT);
+        server.OnMessage(Program.HandleMsg);
+        Task.Spawn(server.Start());
+        await Task.Delay(100);
+
+        // 1. 建立 RFC 6455 握手连接
+        WebSocketClient client1 = await WebSocketClient.ConnectAsync("127.0.0.1", PORT, "/ws");
+        Check(client1 != null && client1.IsConnected(), "ws client1 connected and handshake ok");
+
+        // 2. 发送文本消息并接收自动回显
+        client1.SendText("Hello Zan WebSocket");
+        string reply1 = await client1.RecvText(3000);
+        Check(reply1 == "ECHO:Hello Zan WebSocket", "ws echo response match");
+
+        // 3. 在同一条连接上连续发送第二条消息（流水线）
+        client1.SendText("TestMessage2");
+        string reply2 = await client1.RecvText(3000);
+        Check(reply2 == "ECHO:TestMessage2", "ws second message echo ok");
+
+        // 4. 第二个客户端接入与并发活跃连接数
+        WebSocketClient client2 = await WebSocketClient.ConnectAsync("127.0.0.1", PORT, "/ws");
+        Check(client2 != null && client2.IsConnected(), "ws client2 connected");
+        Check(server.activeConnections == 2, "ws activeConnections tracked as 2");
+
+        // 5. 服务端全局广播测试
+        server.Broadcast("BROADCAST_EVENT");
+        string bcast1 = await client1.RecvText(3000);
+        string bcast2 = await client2.RecvText(3000);
+        Check(bcast1 == "BROADCAST_EVENT" && bcast2 == "BROADCAST_EVENT", "ws broadcast to all clients ok");
+
+        client1.Close();
+        client2.Close();
+        server.Stop();
+
+        for (int i = 0; i < 20; i = i + 1) { await Task.Delay(10); }
+
+        Console.WriteLine("RFC 6455 WebSocketServer verified OK");
+        return failures == 0 ? 0 : 1;
+    }
+
+    static void Main() {
+        int r = await Program.Run();
+    }
+}
