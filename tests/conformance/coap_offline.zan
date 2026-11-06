@@ -1,0 +1,102 @@
+using System;
+using System.Collections.Generic;
+using System.Net.Coap;
+
+// CoAP 离线协议编解码与 RFC 7252 门禁验证测试（不连网，纯内存离线执行）
+class Program {
+    static int fails = 0;
+
+    static void Check(string name, string got, string want) {
+        if (got == want) {
+            Console.WriteLine("ok " + name);
+        } else {
+            fails = fails + 1;
+            Console.WriteLine("FAIL " + name);
+            Console.WriteLine("  got:  " + got);
+            Console.WriteLine("  want: " + want);
+        }
+    }
+
+    static void Main() {
+        CoapClient client = new CoapClient("127.0.0.1", 5683);
+
+        // 1. BuildRequest 基础请求组装验证 (CON, GET, TKL=2)
+        List<int> lenBox = new List<int>();
+        byte[] req = client.BuildRequest(CoapCode.GET, "sensors/temp", "", 100, 200, lenBox);
+        int reqLen = lenBox[0];
+        Check("req-not-null", req != null ? "yes" : "no", "yes");
+        // Header: Ver=1, Type=0 (CON), TKL=2 -> 0x42 (66)
+        Check("req-hdr0", Convert.ToString(req[0] & 255), "66");
+        Check("req-code", Convert.ToString(req[1] & 255), "1");
+        Check("req-mid", Convert.ToString(((req[2] & 255) << 8) | (req[3] & 255)), "100");
+        Check("req-tok", Convert.ToString(((req[4] & 255) << 8) | (req[5] & 255)), "200");
+
+        // 2. BuildRequest 带载荷与 0xFF 分隔符
+        List<int> lenBox2 = new List<int>();
+        byte[] req2 = client.BuildRequest(CoapCode.POST, "actuators/switch", "on", 101, 201, lenBox2);
+        int reqLen2 = lenBox2[0];
+        // 验证载荷前存在 0xFF (255)
+        Check("req2-payload-marker", (req2[reqLen2 - 3] & 255) == 255 ? "yes" : "no", "yes");
+        Check("req2-payload-body", req2.ToStr(reqLen2 - 2, 2), "on");
+
+        // 3. BuildRequest null 参数鲁棒性防御
+        List<int> lenBox3 = new List<int>();
+        byte[] req3 = client.BuildRequest(CoapCode.GET, null, null, 102, 202, lenBox3);
+        Check("req3-null-path", req3 != null ? "yes" : "no", "yes");
+
+        // 4. ParseResponse 正常应答解码 (TKL=2, 匹配 tok)
+        byte[] resp1 = new byte[10];
+        resp1[0] = 66; // ver=1, type=ACK, tkl=2
+        resp1[1] = 69; // 2.05 Content
+        resp1[2] = 0; resp1[3] = 100; // mid=100
+        resp1[4] = 0; resp1[5] = 200; // tok=200
+        resp1[6] = 255; // payload marker
+        resp1[7] = 79; resp1[8] = 75; // "OK"
+        resp1[9] = 33; // "!"
+        CoapResponse r1 = CoapClient.ParseResponse(resp1, 10, 100, 200);
+        Check("resp1-not-null", r1 != null ? "yes" : "no", "yes");
+        Check("resp1-code", Convert.ToString(r1.code), "69");
+        Check("resp1-payload", r1.payload, "OK!");
+
+        // 5. ParseResponse Token 不匹配拒绝
+        CoapResponse rBadTok = CoapClient.ParseResponse(resp1, 10, 100, 999);
+        Check("resp-bad-tok", rBadTok == null ? "yes" : "no", "yes");
+
+        // 6. ParseResponse 报文过短 (<4) 拒绝
+        byte[] shortPkt = new byte[3];
+        CoapResponse rShort = CoapClient.ParseResponse(shortPkt, 3, 100, 200);
+        Check("resp-short", rShort == null ? "yes" : "no", "yes");
+
+        // 7. ParseResponse RFC 7252 TKL > 8 保留格式错误拒绝
+        byte[] badTklPkt = new byte[15];
+        badTklPkt[0] = 73; // TKL=9 (0x49)
+        badTklPkt[1] = 69;
+        CoapResponse rBadTkl = CoapClient.ParseResponse(badTklPkt, 15, 100, 200);
+        Check("resp-bad-tkl", rBadTkl == null ? "yes" : "no", "yes");
+
+        // 8. ParseResponse RFC 7252 §3 0xFF 载荷标记后零长度载荷格式错误拒绝
+        byte[] emptyPayloadAfterMarker = new byte[7];
+        emptyPayloadAfterMarker[0] = 66; // tkl=2
+        emptyPayloadAfterMarker[1] = 69;
+        emptyPayloadAfterMarker[2] = 0; emptyPayloadAfterMarker[3] = 100;
+        emptyPayloadAfterMarker[4] = 0; emptyPayloadAfterMarker[5] = 200;
+        emptyPayloadAfterMarker[6] = 255; // 载荷标记，但后续字节数为 0
+        CoapResponse rEmptyMarker = CoapClient.ParseResponse(emptyPayloadAfterMarker, 7, 100, 200);
+        Check("resp-empty-marker-err", rEmptyMarker == null ? "yes" : "no", "yes");
+
+        // 9. ParseResponse 无载荷标记 (纯选项/空载荷应答) 正常通过
+        byte[] noPayloadPkt = new byte[6];
+        noPayloadPkt[0] = 66;
+        noPayloadPkt[1] = 68; // 2.04 Changed
+        noPayloadPkt[2] = 0; noPayloadPkt[3] = 100;
+        noPayloadPkt[4] = 0; noPayloadPkt[5] = 200;
+        CoapResponse rNoPayload = CoapClient.ParseResponse(noPayloadPkt, 6, 100, 200);
+        Check("resp-no-payload", rNoPayload != null && rNoPayload.payload == "" ? "yes" : "no", "yes");
+
+        if (fails == 0) {
+            Console.WriteLine("coap-offline-done");
+        } else {
+            Console.WriteLine("coap-offline-fail " + Convert.ToString(fails));
+        }
+    }
+}

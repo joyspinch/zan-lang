@@ -132,7 +132,7 @@ public class ModbusClient {
             return new byte[1];
         }
         int tid = this.nextTid & 65535;
-        this.nextTid = this.nextTid + 1;
+        this.nextTid = (this.nextTid % 65535) + 1;
 
         byte[] req = new byte[7 + pduLen];
         req[0] = (byte)((tid >> 8) & 255);
@@ -182,10 +182,21 @@ public class ModbusClient {
             this.lastError = "connection closed";
             return new byte[1];
         }
+        int expectedFc = pdu[0] & 255;
+        int respFc = body[0] & 255;
         // body[0] 为功能码回显；0x80 位表示异常应答。
-        if ((body[0] & 128) != 0) {
+        if ((respFc & 128) != 0) {
+            int exCode = 0;
+            if (len - 1 >= 2) {
+                exCode = body[1] & 255;
+            }
             this.lastError = "exception code "
-                + Convert.ToString(body[1] & 255);
+                + Convert.ToString(exCode);
+            return new byte[1];
+        }
+        if (respFc != expectedFc) {
+            this.lastError = "function code mismatch";
+            this.connected = false;
             return new byte[1];
         }
         byte[] outb = new byte[len];
@@ -206,9 +217,11 @@ public class ModbusClient {
         pdu[4] = (byte)(count & 255);
         byte[] r = await TransactAsync(pdu, 5);
         List<int> vals = new List<int>();
-        if (this.lastError.Length > 0) { return vals; }
+        if (this.lastError.Length > 0 || r == null || r.Length < 2) { return vals; }
         int nBytes = r[1] & 255;
-        for (int k = 0; k < count && (k / 8) < nBytes; k = k + 1) {
+        int available = r.Length - 2;
+        int validBytes = nBytes < available ? nBytes : available;
+        for (int k = 0; k < count && (k / 8) < validBytes; k = k + 1) {
             int b = r[2 + k / 8] & 255;
             vals.Add((b >> (k % 8)) & 1);
         }
@@ -226,9 +239,11 @@ public class ModbusClient {
         pdu[4] = (byte)(count & 255);
         byte[] r = await TransactAsync(pdu, 5);
         List<int> vals = new List<int>();
-        if (this.lastError.Length > 0) { return vals; }
+        if (this.lastError.Length > 0 || r == null || r.Length < 2) { return vals; }
         int nBytes = r[1] & 255;
-        for (int k = 0; k < count && k * 2 + 1 < nBytes; k = k + 1) {
+        int available = r.Length - 2;
+        int validBytes = nBytes < available ? nBytes : available;
+        for (int k = 0; k < count && (k * 2 + 1) < validBytes; k = k + 1) {
             vals.Add(((r[2 + k * 2] & 255) << 8) + (r[3 + k * 2] & 255));
         }
         return vals;
@@ -236,24 +251,40 @@ public class ModbusClient {
 
     // 读取线圈（功能码 1）：每个线圈对应一个 0/1 int。
     public async List<int> ReadCoilsAsync(int addr, int count) {
+        if (addr < 0 || addr > 65535 || count < 1 || count > 2000) {
+            this.lastError = "invalid arguments";
+            return new List<int>();
+        }
         List<int> r = await ReadBitsAsync(1, addr, count);
         return r;
     }
 
     // 读取离散输入（功能码 2）：每个输入对应一个 0/1 int。
     public async List<int> ReadDiscreteAsync(int addr, int count) {
+        if (addr < 0 || addr > 65535 || count < 1 || count > 2000) {
+            this.lastError = "invalid arguments";
+            return new List<int>();
+        }
         List<int> r = await ReadBitsAsync(2, addr, count);
         return r;
     }
 
     // 读取保持寄存器（功能码 3）。
     public async List<int> ReadHoldingAsync(int addr, int count) {
+        if (addr < 0 || addr > 65535 || count < 1 || count > 125) {
+            this.lastError = "invalid arguments";
+            return new List<int>();
+        }
         List<int> r = await ReadRegsAsync(3, addr, count);
         return r;
     }
 
     // 读取输入寄存器（功能码 4）。
     public async List<int> ReadInputAsync(int addr, int count) {
+        if (addr < 0 || addr > 65535 || count < 1 || count > 125) {
+            this.lastError = "invalid arguments";
+            return new List<int>();
+        }
         List<int> r = await ReadRegsAsync(4, addr, count);
         return r;
     }
@@ -261,6 +292,10 @@ public class ModbusClient {
     // 写入单个线圈（功能码 5）。成功返回 1，失败返回 0
     // （详见 LastError）。
     public async int WriteCoilAsync(int addr, bool on) {
+        if (addr < 0 || addr > 65535) {
+            this.lastError = "invalid arguments";
+            return 0;
+        }
         byte[] pdu = new byte[5];
         pdu[0] = 5;
         pdu[1] = (byte)((addr >> 8) & 255);
@@ -275,6 +310,10 @@ public class ModbusClient {
     // 写入单个保持寄存器（功能码 6）。成功返回 1，
     // 失败返回 0（详见 LastError）。
     public async int WriteRegisterAsync(int addr, int val) {
+        if (addr < 0 || addr > 65535 || val < 0 || val > 65535) {
+            this.lastError = "invalid arguments";
+            return 0;
+        }
         byte[] pdu = new byte[5];
         pdu[0] = 6;
         pdu[1] = (byte)((addr >> 8) & 255);
@@ -289,6 +328,10 @@ public class ModbusClient {
     // 批量写入保持寄存器（功能码 16）。成功返回 1，
     // 失败返回 0（详见 LastError）。
     public async int WriteRegistersAsync(int addr, List<int> values) {
+        if (values == null || values.Count < 1 || values.Count > 123 || addr < 0 || addr > 65535) {
+            this.lastError = "invalid arguments";
+            return 0;
+        }
         int n = values.Count;
         byte[] pdu = new byte[6 + n * 2];
         pdu[0] = 16;

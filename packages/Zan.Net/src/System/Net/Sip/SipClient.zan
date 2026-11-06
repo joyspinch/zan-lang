@@ -131,41 +131,46 @@ public class SipClient {
                 string d = udp.RecvFrom(65536);
                 SipMessage resp = SipMessage.Parse(d);
                 if (resp != null && !resp.GetIsRequest()) {
-                    int status = resp.GetStatus();
-                    call.SetLastStatus(status, resp.GetReason());
+                    string respCallId = resp.Header("Call-ID");
+                    string respCSeq = resp.Header("CSeq");
+                    // 严格依据 RFC 3261 §17.1.3 核对事务关联：Call-ID 与 CSeq 必须匹配当前呼叫
+                    if (respCallId == callId && respCSeq.StartsWith(Convert.ToString(seq))) {
+                        int status = resp.GetStatus();
+                        call.SetLastStatus(status, resp.GetReason());
 
-                    // 180 Ringing 或 183 Session Progress：记录远端状态为振铃
-                    if (status == 180 || status == 183) {
-                        call.SetState(SipCallState.Ringing);
-                        string remoteTag = SipMessage.ExtractTag(resp.Header("To"));
-                        if (remoteTag.Length > 0) {
-                            call.SetRemoteTag(remoteTag);
-                        }
-                    } else if (status >= 200 && status < 300) {
-                        // 200 OK：对方接听电话！提取 Remote Tag 与对端 SDP，发送 ACK 确认握手
-                        string remoteTag = SipMessage.ExtractTag(resp.Header("To"));
-                        if (remoteTag.Length > 0) {
-                            call.SetRemoteTag(remoteTag);
-                        }
-                        string remoteSdpText = resp.GetBody();
-                        if (remoteSdpText.Length > 0) {
-                            SdpMessage remoteSdp = SdpMessage.Parse(remoteSdpText);
-                            call.SetRemoteSdp(remoteSdp);
-                        }
-                        call.SetState(SipCallState.Connected);
+                        // 180 Ringing 或 183 Session Progress：记录远端状态为振铃
+                        if (status == 180 || status == 183) {
+                            call.SetState(SipCallState.Ringing);
+                            string remoteTag = SipMessage.ExtractTag(resp.Header("To"));
+                            if (remoteTag.Length > 0) {
+                                call.SetRemoteTag(remoteTag);
+                            }
+                        } else if (status >= 200 && status < 300) {
+                            // 200 OK：对方接听电话！提取 Remote Tag 与对端 SDP，发送 ACK 确认握手
+                            string remoteTag = SipMessage.ExtractTag(resp.Header("To"));
+                            if (remoteTag.Length > 0) {
+                                call.SetRemoteTag(remoteTag);
+                            }
+                            string remoteSdpText = resp.GetBody();
+                            if (remoteSdpText.Length > 0) {
+                                SdpMessage remoteSdp = SdpMessage.Parse(remoteSdpText);
+                                call.SetRemoteSdp(remoteSdp);
+                            }
+                            call.SetState(SipCallState.Connected);
 
-                        // 发送 ACK 请求（完成三路握手）
-                        await SendAckAsync(udp, call, calleeUri, branch);
+                            // 发送 ACK 请求（完成三路握手）
+                            await SendAckAsync(udp, call, calleeUri, branch);
 
-                        // 创建就绪的 RTP 音频流媒体通道
-                        call.GetOrCreateRtpChannel();
-                        done = true;
-                    } else if (status >= 300) {
-                        // 呼叫被拒绝、无人接听或失败（486 Busy, 603 Decline 等）
-                        call.SetState(SipCallState.Terminated);
-                        // RFC 3261 要求对非 2xx 响应也发送 ACK
-                        await SendAckAsync(udp, call, calleeUri, branch);
-                        done = true;
+                            // 创建就绪的 RTP 音频流媒体通道
+                            call.GetOrCreateRtpChannel();
+                            done = true;
+                        } else if (status >= 300) {
+                            // 呼叫被拒绝、无人接听或失败（486 Busy, 603 Decline 等）
+                            call.SetState(SipCallState.Terminated);
+                            // RFC 3261 要求对非 2xx 响应也发送 ACK
+                            await SendAckAsync(udp, call, calleeUri, branch);
+                            done = true;
+                        }
                     }
                 }
             } else {
@@ -272,6 +277,8 @@ public class SipClient {
         if (udp == null) {
             udp = new UdpClient();
         }
+        string reqCallId = req.Header("Call-ID");
+        string reqCSeq = req.Header("CSeq");
         string wire = req.Serialize();
         long start = Stopwatch.GetMilliseconds();
         long nextSend = start;
@@ -288,8 +295,13 @@ public class SipClient {
             if (Socket.IsReadable(udp.GetSocket())) {
                 string d = udp.RecvFrom(65536);
                 SipMessage m = SipMessage.Parse(d);
-                if (m != null && !m.isRequest && m.status >= 200) {
-                    result = m;
+                if (m != null && !m.isRequest) {
+                    string respCallId = m.Header("Call-ID");
+                    string respCSeq = m.Header("CSeq");
+                    // 严格核对 RFC 3261 §17.1.3 事务标识：仅接收属于本请求且最终(>=200)的响应
+                    if (respCallId == reqCallId && respCSeq == reqCSeq && m.status >= 200) {
+                        result = m;
+                    }
                 }
             } else {
                 await Task.Delay(20);

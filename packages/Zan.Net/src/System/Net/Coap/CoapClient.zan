@@ -59,6 +59,8 @@ public class CoapClient {
     // 实际长度写入 <paramref name="outLen"/>[0]。
     public byte[] BuildRequest(int code, string path, string payload, int msgId,
                         int tok, List<int> outLen) {
+        if (path == null) { path = ""; }
+        if (payload == null) { payload = ""; }
         byte[] p = new byte[4 + 2 + 4 + path.Length * 2 + 32 + 1 + payload.Length + 8];
         int o = 0;
         p[o] = (byte)((1 << 6) + (0 << 4) + 2);  // ver=1, type=CON, tkl=2
@@ -130,18 +132,20 @@ public class CoapClient {
     // 解析响应数据报（<paramref name="d"/> 中有
     // <paramref name="n"/> 个有效字节）。数据报不属于本次请求
     // （message id 与 token 均不匹配）或只是空 ACK 时返回 null。
-    private static CoapResponse ParseResponse(byte[] d, int n, int msgId, int tok) {
-        if (n < 4) { return null; }
+    public static CoapResponse ParseResponse(byte[] d, int n, int msgId, int tok) {
+        if (d == null || n < 4) { return null; }
         int tkl = d[0] & 15;
+        if (tkl > 8) { return null; }  // RFC 7252 §3: TKL 9-15 属于保留格式错误
+        if (4 + tkl > n) { return null; }  // Token 被截断
         int code = d[1] & 255;
         int mid = ((d[2] & 255) << 8) + (d[3] & 255);
         int o = 4;
         int rtok = 0;
-        for (int t = 0; t < tkl && o < n; t = t + 1) {
+        for (int t = 0; t < tkl; t = t + 1) {
             rtok = (rtok << 8) + (d[o] & 255);
             o = o + 1;
         }
-        bool ours = mid == msgId || (tkl == 2 && rtok == tok);
+        bool ours = (tkl == 2 && rtok == tok) || (tkl == 0 && mid == msgId);
         if (!ours) { return null; }
         if (code == 0) { return null; }  // 空 ACK：真正的应答稍后到达
 
@@ -172,8 +176,14 @@ public class CoapClient {
             if (o > n) { return null; }
         }
         string payload = "";
-        if (o < n && (d[o] & 255) == 255 && o + 1 < n) {
-            payload = d.ToStr(o + 1, n - o - 1);
+        if (o < n) {
+            if ((d[o] & 255) == 255) {
+                // RFC 7252 §3: 存在 0xFF 载荷标记但载荷长度为 0 属于非法格式（必须拒绝）
+                if (o + 1 >= n) { return null; }
+                payload = d.ToStr(o + 1, n - o - 1);
+            } else {
+                return null;
+            }
         }
         return new CoapResponse(code, payload);
     }
@@ -184,7 +194,7 @@ public class CoapClient {
     async CoapResponse RequestAsync(int code, string path, string payload) {
         UdpClient udp = new UdpClient();
         int msgId = this.nextMsgId & 65535;
-        this.nextMsgId = this.nextMsgId + 1;
+        this.nextMsgId = (this.nextMsgId % 65535) + 1;
         byte[] rtokBytes = RandomNumberGenerator.GetBytes(2);
         int tok = 0;
         if (rtokBytes != null) {
@@ -209,7 +219,10 @@ public class CoapClient {
                     int rn = udp.RecvBytesFrom(rb, 2048);
                     result = CoapClient.ParseResponse(rb, rn, msgId, tok);
                 } else {
-                    await Task.Delay(20);
+                    int remain = (int)(window - (Stopwatch.GetMilliseconds() - start));
+                    if (remain <= 0) { break; }
+                    int sleepMs = remain < 20 ? remain : 20;
+                    await Task.Delay(sleepMs);
                 }
             }
             attempt = attempt + 1;

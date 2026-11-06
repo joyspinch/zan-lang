@@ -415,10 +415,74 @@ class Program {
         Console.WriteLine("sip cancel workflow ok");
     }
 
+    static void TestSipSecurityAndRobustness() {
+        // 1. CRLF 注入防御：Add 自动剥离控制字符与换行
+        SipMessage m = new SipMessage();
+        m.Add("X-Injected\r\nBad-Header", "injected-value\r\nAnother-Bad: 123");
+        string serialized = m.Serialize();
+        if (serialized.IndexOf("Bad-Header") >= 0 || serialized.IndexOf("Another-Bad") >= 0) {
+            Console.WriteLine("FAIL: sip crlf injection not sanitized");
+            Environment.Exit(40);
+        }
+
+        // 2. RFC 3261 紧凑缩写双向查询
+        SipMessage m2 = new SipMessage();
+        m2.Add("i", "call-id-test-999");
+        m2.Add("f", "alice-from");
+        m2.Add("t", "bob-to");
+        if (m2.Header("Call-ID") != "call-id-test-999" || m2.Header("i") != "call-id-test-999") {
+            Console.WriteLine("FAIL: compact Call-ID lookup");
+            Environment.Exit(41);
+        }
+        if (m2.Header("From") != "alice-from" || m2.Header("f") != "alice-from") {
+            Console.WriteLine("FAIL: compact From lookup");
+            Environment.Exit(42);
+        }
+        if (m2.Header("To") != "bob-to" || m2.Header("t") != "bob-to") {
+            Console.WriteLine("FAIL: compact To lookup");
+            Environment.Exit(43);
+        }
+
+        // 3. 畸形 SDP 容错：非法字符不导致崩溃，回退安全默认值
+        SdpMessage badSdp = SdpMessage.Parse("v=0\r\nm=audio abc RTP/AVP xyz\r\na=rtpmap:99 OPUS/notanumber\r\n");
+        if (badSdp == null || badSdp.GetMediaPort() != 0 || badSdp.GetPayloadType() != 0 || badSdp.GetSampleRate() != 0) {
+            Console.WriteLine("FAIL: malformed sdp recovery");
+            Environment.Exit(44);
+        }
+
+        // 4. RTP 数据包越界与填充校验
+        if (RtpPacket.Decode(null, 0, 10) != null) {
+            Console.WriteLine("FAIL: rtp decode null buf");
+            Environment.Exit(45);
+        }
+        byte[] tiny = new byte[8];
+        if (RtpPacket.Decode(tiny, 0, 8) != null) {
+            Console.WriteLine("FAIL: rtp decode tiny");
+            Environment.Exit(46);
+        }
+        // 带 Padding 的 RTP 数据包：V=2, P=1, PT=0, seq=10, ts=20, ssrc=30, payload 4 字节，padding 2 字节（末尾为 2）
+        byte[] padded = new byte[18];
+        padded[0] = 160; // V=2 (128) + P=1 (32)
+        padded[1] = 0;   // M=0, PT=0
+        padded[2] = 0; padded[3] = 10; // seq
+        padded[4] = 0; padded[5] = 0; padded[6] = 0; padded[7] = 20; // ts
+        padded[8] = 0; padded[9] = 0; padded[10] = 0; padded[11] = 30; // ssrc
+        padded[12] = 1; padded[13] = 2; padded[14] = 3; padded[15] = 4; // payload
+        padded[16] = 0; padded[17] = 2; // padding 2 字节
+        RtpPacket decPadded = RtpPacket.Decode(padded, 0, 18);
+        if (decPadded == null || decPadded.GetPayload() == null || decPadded.GetPayload().Length != 4) {
+            Console.WriteLine("FAIL: rtp decode padding");
+            Environment.Exit(47);
+        }
+
+        Console.WriteLine("sip security and robustness ok");
+    }
+
     static async void Main() {
         TestSdpSerializationAndParse();
         TestRtpPacketEncodeDecode();
         TestSipCallModel();
+        TestSipSecurityAndRobustness();
         await TestSipCallWorkflow();
         await TestSipRegisterWorkflow();
         await TestSipCancelWorkflow();
