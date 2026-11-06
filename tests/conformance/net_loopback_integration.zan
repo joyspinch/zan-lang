@@ -1,0 +1,328 @@
+using System;
+using System.Collections.Generic;
+using System.Net;
+using System.Net.Http;
+using System.Net.Http.Client;
+using System.Net.Mqtt;
+using System.Net.Sockets;
+using System.Net.WebSocket;
+using System.Threading;
+using System.Text;
+
+class Program {
+    static int TCP_PORT = 19535;
+    static int UDP_SRV_PORT = 19536;
+    static int UDP_CLI_PORT = 19537;
+    static int HTTP_PORT = 19538;
+    static int WS_PORT = 19539;
+    static int MQTT_PORT = 19540;
+
+    // ==========================================
+    // 1. TCP Loopback Test
+    // ==========================================
+    static string tcpServerRecv = "";
+    static bool tcpServerDone = false;
+
+    static async void TcpServerTask(TcpListener listener) {
+        TcpClient srvConn = await listener.AcceptTcpClientAsync();
+        if (srvConn != null) {
+            string req = await srvConn.RecvAsync(1024);
+            Program.tcpServerRecv = req;
+            await srvConn.SendAsync("TCP_PONG_RESP");
+            srvConn.Dispose();
+        }
+        Program.tcpServerDone = true;
+    }
+
+    static async Task<bool> TestTcpLoopback() {
+        Program.tcpServerRecv = "";
+        Program.tcpServerDone = false;
+        TcpListener listener = new TcpListener("127.0.0.1", TCP_PORT);
+        listener.Start();
+
+        Task.Spawn(TcpServerTask(listener));
+        await Task.Delay(20);
+
+        TcpClient client = await TcpClient.ConnectAsync("127.0.0.1", TCP_PORT);
+        bool clientOk = false;
+        if (client != null) {
+            await client.SendAsync("TCP_PING_REQ");
+            string resp = await client.RecvAsync(1024);
+            clientOk = (resp == "TCP_PONG_RESP");
+            client.Dispose();
+        }
+
+        while (!Program.tcpServerDone) {
+            await Task.Delay(10);
+        }
+
+        listener.Dispose();
+        bool serverOk = (Program.tcpServerRecv == "TCP_PING_REQ");
+        return clientOk && serverOk;
+    }
+
+    // ==========================================
+    // 2. UDP Loopback Test
+    // ==========================================
+    static string udpServerRecv = "";
+    static bool udpServerDone = false;
+
+    static async void UdpServerTask(UdpClient server) {
+        string msg = await server.RecvFromAsync(512);
+        Program.udpServerRecv = msg;
+        await server.SendToAsync("UDP_PONG_PACKET", "127.0.0.1", UDP_CLI_PORT);
+        Program.udpServerDone = true;
+    }
+
+    static async Task<bool> TestUdpLoopback() {
+        Program.udpServerRecv = "";
+        Program.udpServerDone = false;
+        UdpClient server = UdpClient.Bind("127.0.0.1", UDP_SRV_PORT);
+        if (server == null) { return false; }
+
+        Task.Spawn(UdpServerTask(server));
+        await Task.Delay(20);
+
+        UdpClient client = UdpClient.Bind("127.0.0.1", UDP_CLI_PORT);
+        if (client == null) {
+            server.Dispose();
+            return false;
+        }
+
+        await client.SendToAsync("UDP_PING_PACKET", "127.0.0.1", UDP_SRV_PORT);
+        string clientRecv = await client.RecvFromAsync(512);
+
+        while (!Program.udpServerDone) {
+            await Task.Delay(10);
+        }
+
+        bool ok = (clientRecv == "UDP_PONG_PACKET") && (Program.udpServerRecv == "UDP_PING_PACKET");
+        client.Dispose();
+        server.Dispose();
+        return ok;
+    }
+
+    // ==========================================
+    // 3. HTTP/1.1 Loopback Test
+    // ==========================================
+    static async HttpResponse HttpRequestHandler(HttpRequest req) {
+        if (req.path == "/api/status") {
+            return HttpResponse.Ok("{\"status\":\"online\"}");
+        }
+        if (req.path == "/api/echo") {
+            return HttpResponse.Ok("{\"echo\":\"" + req.body + "\"}");
+        }
+        return HttpResponse.NotFound();
+    }
+
+    static async Task<bool> TestHttpLoopback() {
+        HttpServer server = new HttpServer("127.0.0.1", HTTP_PORT);
+        server.OnRequest(HttpRequestHandler);
+        Task.Spawn(server.Start());
+        await Task.Delay(30);
+
+        HttpClient client = new HttpClient("127.0.0.1", HTTP_PORT);
+
+        // Test GET
+        HttpResponse getResp = await client.SendAsync("GET", "/api/status", "");
+        bool getOk = (getResp != null && getResp.statusCode == 200 && getResp.body == "{\"status\":\"online\"}");
+
+        // Test POST
+        HttpResponse postResp = await client.SendAsync("POST", "/api/echo", "hello_loopback");
+        bool postOk = (postResp != null && postResp.statusCode == 200 && postResp.body == "{\"echo\":\"hello_loopback\"}");
+
+        client.Close();
+        server.Stop();
+        for (int i = 0; i < 20; i = i + 1) { await Task.Delay(10); }
+
+        return getOk && postOk;
+    }
+
+    // ==========================================
+    // 4. WebSocket Loopback Test
+    // ==========================================
+    static async string WsEcho(Connection conn, string message) {
+        return message;
+    }
+
+    static void WsSendMasked(nint s, int opcode, bool fin, string payload, int len) {
+        byte[] f = new byte[2 + 4 + len + 1];
+        f[0] = (byte)((fin ? 128 : 0) | opcode);
+        f[1] = (byte)(128 | len);
+        f[2] = 1; f[3] = 2; f[4] = 3; f[5] = 4;
+        for (int i = 0; i < len; i = i + 1) {
+            f[6 + i] = (byte)((payload[i] & 255) ^ (byte)(i % 4 + 1));
+        }
+        int _n = Socket.Send(s, f, 6 + len);
+    }
+
+    static int WsFindHead(string s) {
+        int n = s.Length - 3;
+        for (int i = 0; i < n; i = i + 1) {
+            if ((s[i] & 255) == 13 && (s[i + 1] & 255) == 10
+                && (s[i + 2] & 255) == 13 && (s[i + 3] & 255) == 10) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    static async string WsReadEcho(nint s) {
+        string raw = "";
+        int need = 2;
+        while (raw.Length < need) {
+            await Socket.ReadReady(s);
+            raw = raw + Socket.Receive(s, 4096);
+            if (raw.Length >= 2) {
+                int l0 = raw[1] & 255;
+                if (l0 < 126) { need = 2 + l0; }
+            }
+        }
+        int plen = raw[1] & 127;
+        return raw.Substring(2, plen);
+    }
+
+    static async Task<bool> TestWebSocketLoopback() {
+        Worker ws = new Worker("websocket", "127.0.0.1", WS_PORT);
+        ws.onMessage = Program.WsEcho;
+        nint listenSock = ws.BindSocket(false);
+        if (listenSock < 0) {
+            return false;
+        }
+
+        List<nint> socks = new List<nint>();
+        socks.Add(listenSock);
+        Task.Spawn(Worker.RunAllLoopsOnSockets(socks));
+
+        nint s = 0;
+        bool connected = false;
+        for (int i = 0; i < 50; i = i + 1) {
+            TcpClient c = await TcpClient.ConnectAsync("127.0.0.1", WS_PORT);
+            if (c != null) { s = c.Sock(); connected = true; break; }
+            Thread.Sleep(20);
+        }
+        if (!connected) {
+            ws.Stop();
+            Socket.Close(listenSock);
+            return false;
+        }
+
+        Socket.SetNonBlocking(s);
+        string req = "GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nUpgrade: websocket\r\n"
+            + "Connection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+            + "Sec-WebSocket-Version: 13\r\n\r\n";
+        Socket.SendString(s, req);
+
+        string head = "";
+        while (Program.WsFindHead(head) < 0) {
+            await Socket.ReadReady(s);
+            head = head + Socket.Receive(s, 4096);
+        }
+
+        bool handshakeOk = (head.Length >= 12 && head.Substring(9, 3) == "101");
+
+        // Send Text Frame
+        string testPayload = "ZAN_WS_FULL_DUPLEX";
+        Program.WsSendMasked(s, 1, true, testPayload, testPayload.Length);
+        string echoed = await Program.WsReadEcho(s);
+        bool frameOk = (echoed == testPayload);
+
+        Socket.Close(s);
+        ws.Stop();
+        Socket.Close(listenSock);
+        for (int i = 0; i < 20; i = i + 1) { await Task.Delay(10); }
+
+        return handshakeOk && frameOk;
+    }
+
+    // ==========================================
+    // 5. MQTT Loopback Test
+    // ==========================================
+    static async Task<bool> TestMqttLoopback() {
+        Worker broker = new Worker("mqtt", "127.0.0.1", MQTT_PORT);
+        nint listenSock = broker.BindSocket(false);
+        if (listenSock < 0) {
+            return false;
+        }
+
+        List<nint> socks = new List<nint>();
+        socks.Add(listenSock);
+        Task.Spawn(Worker.RunAllLoopsOnSockets(socks));
+
+        MqttClient sub = null;
+        for (int i = 0; i < 50; i = i + 1) {
+            sub = await MqttClient.ConnectAsync("127.0.0.1", MQTT_PORT, "sub_loopback");
+            if (sub.IsConnected()) { break; }
+            Thread.Sleep(20);
+        }
+
+        if (!sub.IsConnected()) {
+            broker.Stop();
+            Socket.Close(listenSock);
+            return false;
+        }
+
+        int _subRet = await sub.SubscribeAsync("sensor/loopback", MqttQos.AtLeastOnce);
+
+        MqttClient pub = await MqttClient.ConnectAsync("127.0.0.1", MQTT_PORT, "pub_loopback");
+        if (!pub.IsConnected()) {
+            await sub.DisconnectAsync();
+            broker.Stop();
+            Socket.Close(listenSock);
+            return false;
+        }
+
+        string expectedMsg = "MQTT_FULL_DUPLEX_PAYLOAD";
+        int _pubRet = await pub.PublishAsync("sensor/loopback", expectedMsg, MqttQos.AtLeastOnce);
+        string receivedMsg = await sub.ReceiveAsync();
+
+        bool mqttOk = (receivedMsg == expectedMsg);
+
+        await pub.DisconnectAsync();
+        await sub.DisconnectAsync();
+        broker.Stop();
+        Socket.Close(listenSock);
+        for (int i = 0; i < 20; i = i + 1) { await Task.Delay(10); }
+
+        return mqttOk;
+    }
+
+    // ==========================================
+    // Main Entry
+    // ==========================================
+    static async Task<int> RunAll() {
+        Socket.Initialize();
+        WorkerWs.Install();
+        WorkerMqtt.Install();
+
+        Console.WriteLine("=== NET LOOPBACK FULL-DUPLEX INTEGRATION SUITE ===");
+
+        bool tcpOk = await TestTcpLoopback();
+        Console.WriteLine("tcp_loopback=" + (tcpOk ? "1" : "0"));
+
+        bool udpOk = await TestUdpLoopback();
+        Console.WriteLine("udp_loopback=" + (udpOk ? "1" : "0"));
+
+        bool httpOk = await TestHttpLoopback();
+        Console.WriteLine("http_loopback=" + (httpOk ? "1" : "0"));
+
+        bool wsOk = await TestWebSocketLoopback();
+        Console.WriteLine("ws_loopback=" + (wsOk ? "1" : "0"));
+
+        bool mqttOk = await TestMqttLoopback();
+        Console.WriteLine("mqtt_loopback=" + (mqttOk ? "1" : "0"));
+
+        bool allOk = tcpOk && udpOk && httpOk && wsOk && mqttOk;
+        Console.WriteLine("all_loopback_tests_ok=" + (allOk ? "1" : "0"));
+
+        WorkerWs.Uninstall();
+        WorkerMqtt.Uninstall();
+        for (int i = 0; i < 20; i = i + 1) { await Task.Delay(10); }
+        Socket.Cleanup();
+        return allOk ? 0 : 1;
+    }
+
+    static async void Main() {
+        int code = await Program.RunAll();
+    }
+}
