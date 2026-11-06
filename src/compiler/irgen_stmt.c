@@ -2670,18 +2670,20 @@ void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *locals) {
                     LLVMValueRef ofl = LLVMBuildLoad2(g->builder, i32t, owned_g2, "exc.ofl");
                     zan_store_fit(g, ofl, exc_owned_slot);
                     zan_store_fit(g, LLVMConstInt(i32t, 0, 0), owned_g2);
-                    LLVMValueRef isown = zan_icmp(g->builder, LLVMIntNE, ofl,
-                        LLVMConstInt(i32t, 0, 0), "exc.isown");
-                    LLVMBasicBlockRef push_bb =
-                        LLVMAppendBasicBlockInContext(g->ctx, fn, "exc.push");
-                    LLVMBasicBlockRef pcont_bb =
-                        LLVMAppendBasicBlockInContext(g->ctx, fn, "exc.pcont");
-                    LLVMBuildCondBr(g->builder, isown, push_bb, pcont_bb);
-                    LLVMPositionBuilderAtEnd(g->builder, push_bb);
-                    LLVMValueRef ev2 = LLVMBuildLoad2(g->builder, i8ptr, exc_slot, "exc.re");
-                    emit_eh_tmp_push(g, ev2);
-                    LLVMBuildBr(g->builder, pcont_bb);
-                    LLVMPositionBuilderAtEnd(g->builder, pcont_bb);
+                    if (!g->current_async_frame) {
+                        LLVMValueRef isown = zan_icmp(g->builder, LLVMIntNE, ofl,
+                            LLVMConstInt(i32t, 0, 0), "exc.isown");
+                        LLVMBasicBlockRef push_bb =
+                            LLVMAppendBasicBlockInContext(g->ctx, fn, "exc.push");
+                        LLVMBasicBlockRef pcont_bb =
+                            LLVMAppendBasicBlockInContext(g->ctx, fn, "exc.pcont");
+                        LLVMBuildCondBr(g->builder, isown, push_bb, pcont_bb);
+                        LLVMPositionBuilderAtEnd(g->builder, push_bb);
+                        LLVMValueRef ev2 = LLVMBuildLoad2(g->builder, i8ptr, exc_slot, "exc.re");
+                        emit_eh_tmp_push(g, ev2);
+                        LLVMBuildBr(g->builder, pcont_bb);
+                        LLVMPositionBuilderAtEnd(g->builder, pcont_bb);
+                    }
                 }
                 if (ZAN_TAB_ENSURE(g->catch_cleanups, g->catch_cleanup_count,
                                    g->catch_cleanup_cap, 16)) {
@@ -2733,7 +2735,9 @@ void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *locals) {
             LLVMBasicBlockRef hcont_bb = LLVMAppendBasicBlockInContext(g->ctx, cfn, "exc.hcont");
             LLVMBuildCondBr(g->builder, h_owned, hrel_bb, hcont_bb);
             LLVMPositionBuilderAtEnd(g->builder, hrel_bb);
-            emit_eh_tmp_pop(g);
+            if (!g->current_async_frame) {
+                emit_eh_tmp_pop(g);
+            }
             LLVMValueRef hev = LLVMBuildLoad2(g->builder, i8ptr, exc_slot, "exc.hre");
             zan_store_fit(g, LLVMConstInt(i32t, 0, 0), exc_owned_slot);
             zan_store_fit(g, LLVMConstNull(i8ptr), exc_slot);
@@ -3629,17 +3633,19 @@ void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *locals) {
                     LLVMBuildLoad2(g->builder, i8ptr, tid_slot, "reth.tid"),
                     get_eh_exc_tid_global(g));
                 LLVMValueRef rfn = LLVMGetBasicBlockParent(LLVMGetInsertBlock(g->builder));
-                LLVMValueRef isown = zan_icmp(g->builder, LLVMIntNE, ofl,
-                    LLVMConstInt(i32t, 0, 0), "reth.isown");
-                LLVMBasicBlockRef drop_bb =
-                    LLVMAppendBasicBlockInContext(g->ctx, rfn, "reth.drop");
-                LLVMBasicBlockRef dcont_bb =
-                    LLVMAppendBasicBlockInContext(g->ctx, rfn, "reth.dcont");
-                LLVMBuildCondBr(g->builder, isown, drop_bb, dcont_bb);
-                LLVMPositionBuilderAtEnd(g->builder, drop_bb);
-                emit_eh_tmp_drop(g, ev);
-                LLVMBuildBr(g->builder, dcont_bb);
-                LLVMPositionBuilderAtEnd(g->builder, dcont_bb);
+                if (!g->current_async_frame) {
+                    LLVMValueRef isown = zan_icmp(g->builder, LLVMIntNE, ofl,
+                        LLVMConstInt(i32t, 0, 0), "reth.isown");
+                    LLVMBasicBlockRef drop_bb =
+                        LLVMAppendBasicBlockInContext(g->ctx, rfn, "reth.drop");
+                    LLVMBasicBlockRef dcont_bb =
+                        LLVMAppendBasicBlockInContext(g->ctx, rfn, "reth.dcont");
+                    LLVMBuildCondBr(g->builder, isown, drop_bb, dcont_bb);
+                    LLVMPositionBuilderAtEnd(g->builder, drop_bb);
+                    emit_eh_tmp_drop(g, ev);
+                    LLVMBuildBr(g->builder, dcont_bb);
+                    LLVMPositionBuilderAtEnd(g->builder, dcont_bb);
+                }
                 zan_store_fit(g, LLVMConstInt(i32t, 0, 0), own_slot);
                 goto throw_unwind;
             }

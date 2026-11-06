@@ -1972,6 +1972,9 @@ static LLVMBasicBlockRef get_async_sub_rethrow_bb(zan_irgen_t *g) {
     LLVMBuildStore(g->builder, phi_ev, exc_g);
     LLVMBuildStore(g->builder, tv, get_eh_exc_tid_global(g));
     LLVMBuildStore(g->builder, ov, get_eh_exc_owned_global(g));
+    LLVMValueRef ep = LLVMBuildStructGEP2(g->builder, hdr, phi_sub, ASYNC_FRAME_EXC, "sub.exc.p");
+    LLVMBuildStore(g->builder, LLVMConstNull(i8ptr), ep);
+    LLVMBuildStore(g->builder, LLVMConstInt(i32, 0, 0), op);
 
     zan_emit_frame_free(g, phi_sub);
 
@@ -2021,6 +2024,8 @@ void emit_async_check_sub_exc(zan_irgen_t *g, LLVMValueRef sub,
             &i32, 1, 0);
         zan_call2(g->builder, uwty, get_eh_tmp_unwind_fn(g), &tmp_mark, 1, "");
     }
+    LLVMBuildStore(g->builder, LLVMConstNull(i8ptr), ep);
+    LLVMBuildStore(g->builder, LLVMConstInt(i32, 0, 0), op);
     zan_emit_frame_free(g, sub);
     emit_raise_exception(g);
 
