@@ -1,0 +1,173 @@
+using System;
+using System.Collections.Generic;
+using System.Text;
+
+namespace System.Data.ZanDb;
+
+// 列数据类型编码
+public class RecordDataType {
+    public static const int Int32 = 1;
+    public static const int Int64 = 2;
+    public static const int Float32 = 3;
+    public static const int Float64 = 4;
+    public static const int FixedStr = 5;
+    public static const int Bool = 6;
+    public static const int VarStr = 7; // 变长字符串（行内存 8B 指针: offset 4B + len 4B，数据存 .zblob）
+    public static const int Blob = 8;   // 原始字节块（行内存 8B 指针: offset 4B + len 4B，数据存 .zblob）
+}
+
+// 结构化表列定义
+public class RecordColumn {
+    public string name;
+    public int dataType;
+    public int fixedLen; // 字节长度
+    public int offset;   // 行内字节偏移（行首 4 字节为标志区：1B flags + 3B padding）
+
+    public RecordColumn(string name, int dataType, int fixedLen, int offset) {
+        this.name = name != null ? name : "";
+        this.dataType = dataType;
+        this.fixedLen = fixedLen;
+        this.offset = offset;
+    }
+}
+
+// 表结构元数据
+public class RecordSchema {
+    public List<RecordColumn> columns;
+    public int rowBytes; // 定长行宽（4 字节对齐）
+
+    public RecordSchema() {
+        this.columns = new List<RecordColumn>();
+        this.rowBytes = 4; // 保留前 4 字节：flags(1B, 1=有效/0=墓碑) + 3B 保留对齐
+    }
+
+    public void AddInt32(string name) {
+        int off = this.rowBytes;
+        int dt = RecordDataType.Int32 > 0 ? RecordDataType.Int32 : 1;
+        this.columns.Add(new RecordColumn(name, dt, 4, off));
+        this.rowBytes = this.rowBytes + 4;
+    }
+
+    public void AddInt64(string name) {
+        int rem = this.rowBytes % 8;
+        if (rem != 0) { this.rowBytes = this.rowBytes + (8 - rem); }
+        int off = this.rowBytes;
+        int dt = RecordDataType.Int64 > 0 ? RecordDataType.Int64 : 2;
+        this.columns.Add(new RecordColumn(name, dt, 8, off));
+        this.rowBytes = this.rowBytes + 8;
+    }
+
+    public void AddFloat32(string name) {
+        int off = this.rowBytes;
+        int dt = RecordDataType.Float32 > 0 ? RecordDataType.Float32 : 3;
+        this.columns.Add(new RecordColumn(name, dt, 4, off));
+        this.rowBytes = this.rowBytes + 4;
+    }
+
+    public void AddFloat64(string name) {
+        int rem = this.rowBytes % 8;
+        if (rem != 0) { this.rowBytes = this.rowBytes + (8 - rem); }
+        int off = this.rowBytes;
+        int dt = RecordDataType.Float64 > 0 ? RecordDataType.Float64 : 4;
+        this.columns.Add(new RecordColumn(name, dt, 8, off));
+        this.rowBytes = this.rowBytes + 8;
+    }
+
+    public void AddFixedStr(string name, int maxBytes) {
+        int rem = maxBytes % 4;
+        int aligned = rem == 0 ? maxBytes : maxBytes + (4 - rem);
+        int off = this.rowBytes;
+        int dt = RecordDataType.FixedStr > 0 ? RecordDataType.FixedStr : 5;
+        this.columns.Add(new RecordColumn(name, dt, aligned, off));
+        this.rowBytes = this.rowBytes + aligned;
+    }
+
+    public void AddBool(string name) {
+        int off = this.rowBytes;
+        int dt = RecordDataType.Bool > 0 ? RecordDataType.Bool : 6;
+        this.columns.Add(new RecordColumn(name, dt, 4, off));
+        this.rowBytes = this.rowBytes + 4;
+    }
+
+    // 变长字符串：行内存 8 字节指针 (4B blobOffset + 4B blobLen)
+    public void AddVarStr(string name) {
+        int off = this.rowBytes;
+        int dt = RecordDataType.VarStr > 0 ? RecordDataType.VarStr : 7;
+        this.columns.Add(new RecordColumn(name, dt, 8, off));
+        this.rowBytes = this.rowBytes + 8;
+    }
+
+    // 原始大二进制字节块：行内存 8 字节指针 (4B blobOffset + 4B blobLen)
+    public void AddBlob(string name) {
+        int off = this.rowBytes;
+        int dt = RecordDataType.Blob > 0 ? RecordDataType.Blob : 8;
+        this.columns.Add(new RecordColumn(name, dt, 8, off));
+        this.rowBytes = this.rowBytes + 8;
+    }
+
+    public RecordColumn FindColumn(string name) {
+        if (name == null) { return null; }
+        for (int i = 0; i < this.columns.Count; i = i + 1) {
+            if (this.columns[i].name == name) { return this.columns[i]; }
+        }
+        string lower = name.ToLower();
+        for (int i = 0; i < this.columns.Count; i = i + 1) {
+            if (this.columns[i].name.ToLower() == lower) { return this.columns[i]; }
+        }
+        return null;
+    }
+
+    public int ColumnIndex(string name) {
+        if (name == null) { return 0 - 1; }
+        for (int i = 0; i < this.columns.Count; i = i + 1) {
+            if (this.columns[i].name == name) { return i; }
+        }
+        string lower = name.ToLower();
+        for (int i = 0; i < this.columns.Count; i = i + 1) {
+            if (this.columns[i].name.ToLower() == lower) { return i; }
+        }
+        return 0 - 1;
+    }
+
+    // 序列化 Schema 为二进制格式
+    public ByteBuffer Serialize() {
+        ByteBuffer b = ByteBuffer.Alloc(128);
+        b.WriteU16(this.rowBytes);
+        b.WriteU16(this.columns.Count);
+        for (int i = 0; i < this.columns.Count; i = i + 1) {
+            RecordColumn c = this.columns[i];
+            b.WriteU8(c.dataType);
+            b.WriteU16(c.fixedLen);
+            b.WriteU16(c.offset);
+            byte[] nb = Encoding.GetBytes(c.name);
+            int nlen = nb != null ? nb.Length : 0;
+            if (nlen > 255) { nlen = 255; }
+            b.WriteU8(nlen);
+            for (int j = 0; j < nlen; j = j + 1) {
+                b.WriteU8((int)nb[j]);
+            }
+        }
+        return b;
+    }
+
+    // 从二进制格式反序列化 Schema
+    public static RecordSchema Deserialize(ByteBuffer b) {
+        RecordSchema s = new RecordSchema();
+        s.columns.Clear();
+        s.rowBytes = b.ReadU16();
+        int count = b.ReadU16();
+        for (int i = 0; i < count; i = i + 1) {
+            int dt = b.ReadU8();
+            int flen = b.ReadU16();
+            int off = b.ReadU16();
+            int nlen = b.ReadU8();
+            byte[] nb = new byte[nlen];
+            for (int j = 0; j < nlen; j = j + 1) {
+                nb[j] = (byte)b.ReadU8();
+            }
+            string name = Encoding.GetString(nb, 0, nlen);
+            s.columns.Add(new RecordColumn(name, dt, flen, off));
+        }
+        return s;
+    }
+}
