@@ -3,22 +3,20 @@
 服务端 Web 框架（纯 Zan，无原生依赖）。`using System.Web;` 按需拉入，
 命名空间保留零破坏。
 
-## 内容（服务端 Web 框架核心）
+## 内容（服务端 Web 框架核心分层规划）
 
-| 文件 | 内容 |
+| 模块目录 | 内容 |
 |---|---|
-| `WebApp.zan` | WebApp/WebHost/WebServer 应用骨架与状态文档 |
-| `Router.zan` | 路由表与命中（Route/RouteHitDoc） |
-| `Controller.zan` | 控制器基型 + HTTP 方法属性（HttpGet/Post/Put/Patch/Delete/NonAction）与 Filter/Hooks |
-| `HttpContext.zan` | 请求上下文（Listing/ListQuery/RowList/StrMap/VNode） |
-| `View.zan` | 视图渲染（View/ViewData） |
-| `Validator.zan` / `Filter.zan` | 校验器（Validator/ApiEnvelope/ApiError）与过滤器 |
-| `StaticFiles.zan` | 静态文件挂载（StaticMount/ContentTypes） |
-| `ApiDocs.zan` | API 文档生成（ApiParam/ApiParam 描述） |
-| `MenuNode.zan` | 菜单构建（MenuBuilder/MenuNode） |
-| `LockManager.zan` / `Csrf.zan` | 分布式锁/Csrf/RateLimiter/PermBit/CustomAuthorization |
-| `Attribute.zan` | 自定义特性（Attribute/CustomAttribute/DescriptionAttribute 等） |
-| `WebWs.zan` / `WsSession.zan` | WebSocket 与会话（Sessions） |
+| `Http/` | WebApp / WebHost / WebServer 应用骨架与生命周期、HttpContext 请求上下文、Hooks 与 Filter |
+| `Routing/` | Router / Route 路由表与匹配引擎、RouteTable 跨进程共享路由快照 |
+| `Attributes/` | 统一特性标注（Attribute 基类、HttpGet/Post/Put/Patch/Delete、Route/RouteR、NonAction、ReadOnly 等） |
+| `Controllers/` | Controller 控制器基型与 View 页面/片段视图渲染引擎 |
+| `Security/` | AuthDelegates (AuthFn/PermissionFn)、Csrf 防护、RateLimiter 限流器、LockManager 排他锁、Sessions 会话、Validator 校验器 |
+| `Seo/` | GeoAgent AI 爬虫识别、GeoMeta、GeoSchema、GeoSource、LlmsTxt (llms.txt)、RobotsTxt、Sitemap (sitemap.xml) |
+| `Static/` | StaticFiles 静态资源挂载与流式分发中间件 |
+| `WebSocket/` | WebWs 握手升级装配与 WsSession 长连接会话 |
+| `Navigation/` | MenuBuilder / MenuNode 动态导航树构建、ApiDocs 接口文档生成 |
+| `Models/` | 领域传输与状态模型（ApiEnvelope、ApiError、Listing、LockLease、RouteStatEntry 等） |
 
 ## 标记层归位（Gui.Markup）
 

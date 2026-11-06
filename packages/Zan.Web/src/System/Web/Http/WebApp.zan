@@ -48,6 +48,10 @@ public class WebApp : IDisposable {
     bool sitemapMounted;
     bool robotsMounted;
     bool llmsMounted;
+    List<StaticMount> staticMounts;
+    bool staticHookInstalled;
+    List<string> csrfSkips;
+    List<string> wsOrigins;
 
     // 内存请求体上限（字节），超出回答 413。
     int maxBodyBytes;  // in-memory request body cap (413 above this)
@@ -101,6 +105,10 @@ public class WebApp : IDisposable {
         this.sitemapMounted = false;
         this.robotsMounted = false;
         this.llmsMounted = false;
+        this.staticMounts = new List<StaticMount>();
+        this.staticHookInstalled = false;
+        this.csrfSkips = new List<string>();
+        this.wsOrigins = new List<string>();
     }
 
     // ---- configuration ----
@@ -366,15 +374,79 @@ public class WebApp : IDisposable {
     }
 
     // 渲染模板并套最近的布局；未加载视图时返回空串。
-    string RenderPage(string name, ViewData data) {
+    public string RenderPage(string name, ViewData data) {
         if (this.views == null) { return ""; }
         return this.views.RenderPage(name, data);
     }
 
     // 局部渲染模板（不包含外层 layout，供页面局部无刷新更新调用）。
-    string RenderFragment(string name, ViewData data) {
+    public string RenderFragment(string name, ViewData data) {
         if (this.views == null) { return ""; }
         return this.views.Render(name, data);
+    }
+
+    // ---- 静态文件挂载与分发 ----
+    public WebApp Mount(string urlPrefix, string dir) {
+        return this.Mount(urlPrefix, dir, 86400);
+    }
+
+    public WebApp Mount(string urlPrefix, string dir, int maxAge) {
+        this.staticMounts.Add(new StaticMount(urlPrefix, dir, maxAge));
+        if (!this.staticHookInstalled) {
+            this.staticHookInstalled = true;
+            this.Before(this.ServeStatic);
+        }
+        return this;
+    }
+
+    public List<StaticMount> StaticMounts() {
+        return this.staticMounts;
+    }
+
+    public bool ServeStatic(HttpContext ctx) {
+        if (ctx.method != "GET" && ctx.method != "HEAD") { return true; }
+        int count = this.staticMounts.Count;
+        for (int i = 0; i < count; i = i + 1) {
+            StaticMount m = this.staticMounts[i];
+            string rel = StaticFiles.RelativeTo(ctx.path, m.prefix);
+            if (rel != null) {
+                return StaticFiles.ServeFile(ctx, rel, m.root, m.prefix, m.maxAge);
+            }
+        }
+        return true;
+    }
+
+    // ---- CSRF 豁免管理 ----
+    public WebApp SkipCsrf(string prefix) {
+        if (prefix != null && prefix.Length > 0) {
+            this.csrfSkips.Add(prefix);
+        }
+        return this;
+    }
+
+    public bool HasCsrfSkip(string path) {
+        int count = this.csrfSkips.Count;
+        for (int i = 0; i < count; i = i + 1) {
+            string p = this.csrfSkips[i];
+            if (p.Length > 0 && HttpContext.StartsWith(path, p)) { return true; }
+        }
+        return false;
+    }
+
+    // ---- WebSocket 允许 Origin 管理 ----
+    public WebApp AllowWsOrigin(string origin) {
+        if (origin != null && origin.Length > 0) {
+            this.wsOrigins.Add(origin);
+        }
+        return this;
+    }
+
+    public bool HasWsOrigin(string origin) {
+        int count = this.wsOrigins.Count;
+        for (int i = 0; i < count; i = i + 1) {
+            if (this.wsOrigins[i] == origin) { return true; }
+        }
+        return false;
     }
 
     // 墙钟秒（CRT time），上传文件名与错误日志时间戳用。
@@ -515,6 +587,7 @@ public class WebApp : IDisposable {
             }
             keepAlive = request.keepAlive;
             HttpContext ctx = new HttpContext(request, remoteIp);
+            ctx.SetApp(this);
             ctx.__Attach(client);
             ctx.__SetFramer(framer);
             // 请求到达与响应处理的超时时限（毫秒）。
