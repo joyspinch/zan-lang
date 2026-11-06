@@ -1,7 +1,9 @@
 using System;
+using System.Collections.Generic;
 using System.Text;
 using System.Net.Sockets;
 using System.Net.Http;
+using System.Net.Tls;
 
 namespace System.Net.Sse;
 
@@ -10,6 +12,8 @@ namespace System.Net.Sse;
 // （避免逐字符 Substring 分配）。
 public class SseClient {
     TcpClient client;
+    TlsStream tls;
+    TlsContext tlsCtx;
     string buf;
     bool connected;
 
@@ -17,6 +21,12 @@ public class SseClient {
         this.buf = "";
         this.connected = false;
         this.client = null;
+        this.tls = null;
+        this.tlsCtx = null;
+    }
+
+    public bool IsTlsActive() {
+        return this.tls != null;
     }
 
     // 建立连接并发送订阅请求。服务器拒绝该流时，返回的客户端
@@ -72,6 +82,85 @@ public class SseClient {
         return c;
     }
 
+    // 建立 HTTPS 安全连接并发送订阅请求（TLS 加密传输，常用于云端 AI 流式输出等）。
+    public static async SseClient ConnectHttpsAsync(string host, int port, string path, bool verifyCert) {
+        return await SseClient.ConnectHttpsHeadersAsync(host, port, path, null, verifyCert);
+    }
+
+    // 带自定义请求头的 HTTPS SSE 订阅请求（例如传递 Authorization: Bearer <token>）。
+    public static async SseClient ConnectHttpsHeadersAsync(string host, int port, string path, List<string> customHeaders, bool verifyCert) {
+        SseClient c = new SseClient();
+        c.buf = "";
+        c.connected = false;
+        c.client = await TcpClient.ConnectAsync(host, port);
+        if (c.client == null) { return c; }
+
+        TlsContext ctx = TlsContext.CreateClient();
+        if (!verifyCert) { ctx.DisableVerify(); }
+        TlsStream ts = await TlsStream.ConnectAsync(ctx, c.client.GetSocket(), host, 15000);
+        if (ts == null) {
+            c.client.Close();
+            ctx.Free();
+            return c;
+        }
+        c.tls = ts;
+        c.tlsCtx = ctx;
+
+        StringBuilder req = new StringBuilder();
+        req.Append("GET ");
+        req.Append(path);
+        req.Append(" HTTP/1.1\r\n");
+        req.Append("Host: ");
+        req.Append(host);
+        if (port != 443) {
+            req.Append(":");
+            req.Append(Convert.ToString(port));
+        }
+        req.Append("\r\n");
+        req.Append("Accept: text/event-stream\r\n");
+        req.Append("Connection: keep-alive\r\n");
+        if (customHeaders != null) {
+            for (int i = 0; i < customHeaders.Count; i = i + 1) {
+                req.Append(customHeaders[i]);
+                req.Append("\r\n");
+            }
+        }
+        req.Append("\r\n");
+
+        byte[] reqBytes = Encoding.UTF8.GetBytes(req.ToString());
+        int sent = await c.tls.SendBytesAsync(reqBytes, 0, reqBytes.Length);
+        if (sent <= 0) {
+            c.Close();
+            return c;
+        }
+
+        string head = "";
+        byte[] tmp = new byte[4096];
+        while (SseText.Find(head, "\r\n\r\n", 0) < 0 && head.Length < 65536) {
+            int rn = await c.tls.RecvBytesAsync(tmp, 0, 4096);
+            if (rn <= 0) {
+                c.Close();
+                return c;
+            }
+            string chunk = Encoding.UTF8.GetString(tmp, 0, rn);
+            head = head + chunk;
+        }
+        int bodyAt = SseText.Find(head, "\r\n\r\n", 0);
+        bool ok = false;
+        if (bodyAt >= 0 && head.Length >= 12
+            && (head.Substring(0, 5) == "HTTP/")
+            && (head.Substring(9, 3) == "200")) {
+            ok = true;
+        }
+        if (!ok) {
+            c.Close();
+            return c;
+        }
+        c.buf = head.Substring(bodyAt + 4, head.Length - bodyAt - 4);
+        c.connected = true;
+        return c;
+    }
+
     // 握手是否成功（连接失败或服务器拒绝该流时为 false）。
     public bool IsConnected() { return this.connected; }
 
@@ -94,7 +183,16 @@ public class SseClient {
                 if (e != null) { return e; }
                 continue;  // 该块只有注释
             }
-            string chunk = await this.client.RecvAsync(4096);
+            string chunk = "";
+            if (this.tls != null) {
+                byte[] tmp = new byte[4096];
+                int rn = await this.tls.RecvBytesAsync(tmp, 0, 4096);
+                if (rn > 0) {
+                    chunk = Encoding.UTF8.GetString(tmp, 0, rn);
+                }
+            } else if (this.client != null) {
+                chunk = await this.client.RecvAsync(4096);
+            }
             if (chunk.Length == 0) {
                 this.connected = false;
                 return null;
@@ -103,8 +201,7 @@ public class SseClient {
             // 空行只可能是对端在发无界垃圾（或彻底违反协议）——此前
             // 无上限，恶意上游可把客户端喂到 OOM。超限按断流处理。
             if (this.buf.Length + chunk.Length > 8388608) {
-                this.connected = false;
-                this.client.Close();
+                this.Close();
                 return null;
             }
             this.buf = this.buf + chunk;
@@ -166,6 +263,17 @@ public class SseClient {
     // 关闭连接并标记断开（幂等）。
     public void Close() {
         this.connected = false;
-        if (this.client != null) { this.client.Close(); }
+        if (this.tls != null) {
+            this.tls.Close();
+            this.tls = null;
+        }
+        if (this.tlsCtx != null) {
+            this.tlsCtx.Free();
+            this.tlsCtx = null;
+        }
+        if (this.client != null) {
+            this.client.Close();
+            this.client = null;
+        }
     }
 }
