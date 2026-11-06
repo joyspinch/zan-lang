@@ -108,10 +108,72 @@ class Program {
         clientUdp.Close();
         server.Close();
 
+        // 7. 验证 RFC 1035 §4.2.1: UDP 报文截断 (TC=1) 时自动回退至 TCP 53 端口获取完整记录
+        int TCP_DNS_PORT = 19532;
+        UdpClient udpTruncSrv = UdpClient.Bind("127.0.0.1", TCP_DNS_PORT);
+        TcpListener tcpDnsSrv = new TcpListener("127.0.0.1", TCP_DNS_PORT);
+        tcpDnsSrv.Start();
+
+        Task.Spawn(Program.ServeTruncatedMockAsync(udpTruncSrv, tcpDnsSrv));
+
+        DnsClient fallbackClient = new DnsClient("127.0.0.1", TCP_DNS_PORT);
+        fallbackClient.SetTimeout(3000);
+        List<string> fallbackIps = await fallbackClient.ResolveAsync("fallback.test");
+        Check(fallbackIps.Count == 2 && fallbackIps[0] == "10.0.0.1" && fallbackIps[1] == "10.0.0.2",
+            "rfc 1035 tc=1 tcp fallback resolved ips ok");
+
+        udpTruncSrv.Close();
+        tcpDnsSrv.Stop();
+
         for (int i = 0; i < 20; i = i + 1) { await Task.Delay(10); }
 
         Console.WriteLine("RFC 1035 UDP DNS client verified OK");
         return failures == 0 ? 0 : 1;
+    }
+
+    static async void ServeTruncatedMockAsync(UdpClient udpSrv, TcpListener tcpSrv) {
+        // 1. UDP 服务端接收到查询，故意回送截断报文 (TC=1)
+        byte[] udpBuf = new byte[1024];
+        int un = await udpSrv.RecvBytesFromAsync(udpBuf, 1024);
+        if (un > 0) {
+            int clientPort = Socket.PeerPort();
+            string clientIp = Socket.PeerIp();
+            DnsPacket req = DnsPacket.Parse(udpBuf, un);
+            if (req != null && req.questions.Count > 0) {
+                byte[] truncResp = DnsPacket.BuildMockTruncatedResponse(req.transactionId, req.questions[0].name, req.questions[0].recordType);
+                await udpSrv.SendBytesToAsync(truncResp, truncResp.Length, clientIp, clientPort);
+            }
+        }
+
+        // 2. TCP 服务端等待客户端的回退连接
+        nint clientSock = await tcpSrv.AcceptAsync();
+        if (clientSock >= 0) {
+            TcpClient tcpClient = TcpClient.FromSocket(clientSock);
+            byte[] prefix = new byte[2];
+            int pr = await tcpClient.RecvBytesAsync(prefix, 2, 2000);
+            if (pr == 2) {
+                int qlen = ((prefix[0] & 255) << 8) | (prefix[1] & 255);
+                byte[] qbuf = new byte[qlen];
+                int qr = await tcpClient.RecvBytesAsync(qbuf, qlen, 2000);
+                if (qr == qlen) {
+                    DnsPacket tcpReq = DnsPacket.Parse(qbuf, qr);
+                    if (tcpReq != null && tcpReq.questions.Count > 0) {
+                        List<string> ips = new List<string>();
+                        ips.Add("10.0.0.1");
+                        ips.Add("10.0.0.2");
+                        byte[] mockResp = DnsPacket.BuildMockResponse(tcpReq.transactionId, tcpReq.questions[0].name, tcpReq.questions[0].recordType, ips, 300);
+                        byte[] outBuf = new byte[mockResp.Length + 2];
+                        outBuf[0] = (byte)((mockResp.Length >> 8) & 255);
+                        outBuf[1] = (byte)(mockResp.Length & 255);
+                        for (int i = 0; i < mockResp.Length; i = i + 1) {
+                            outBuf[i + 2] = mockResp[i];
+                        }
+                        await tcpClient.SendBytesAsync(outBuf, outBuf.Length);
+                    }
+                }
+            }
+            tcpClient.Close();
+        }
     }
 
     static async void ServeMockAsync(UdpClient srv) {

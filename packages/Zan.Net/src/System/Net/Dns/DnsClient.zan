@@ -66,7 +66,8 @@ public class DnsClient : IDisposable {
         return ips;
     }
 
-    // 异步发送 RFC 1035 UDP DNS 查询报文，并等待对端回显应答
+    // 异步发送 RFC 1035 UDP DNS 查询报文，并等待对端回显应答。
+    // RFC 1035 §4.2.1: 若响应报文被截断（TC=1），自动回退至 TCP 53 端口重新查询。
     public async List<DnsRecord> QueryAsync(string domain, int queryType) {
         if (domain == null || domain.Length == 0) {
             return new List<DnsRecord>();
@@ -93,9 +94,89 @@ public class DnsClient : IDisposable {
                 return new List<DnsRecord>();
             }
 
+            // RFC 1035 §4.2.1 规范要求：若 UDP 报文被截断（TC=1），必须自动切换至 TCP 53 端口获取完整记录
+            if (pkt.isTruncated) {
+                return await this.DoQueryTcpAsync(domain, queryType, queryPkt, txId);
+            }
+
             return pkt.answers;
         } finally {
             udp.Close();
+        }
+    }
+
+    // 显式执行 RFC 1035 §4.2.2 基于 TCP 53 端口的 DNS 异步查询
+    public async List<DnsRecord> QueryTcpAsync(string domain, int queryType) {
+        if (domain == null || domain.Length == 0) {
+            return new List<DnsRecord>();
+        }
+        int txId = this.NextTxId();
+        byte[] queryPkt = DnsPacket.BuildQuery(domain, queryType, txId);
+        return await this.DoQueryTcpAsync(domain, queryType, queryPkt, txId);
+    }
+
+    private async List<DnsRecord> DoQueryTcpAsync(string domain, int queryType, byte[] queryPkt, int txId) {
+        TcpClient client = await TcpClient.ConnectAsync(this.dnsServer, this.dnsPort, this.timeoutMs);
+        if (client == null || !client.IsConnected()) {
+            return new List<DnsRecord>();
+        }
+
+        try {
+            int qlen = queryPkt.Length;
+            byte[] tcpQuery = new byte[qlen + 2];
+            tcpQuery[0] = (byte)((qlen >> 8) & 255);
+            tcpQuery[1] = (byte)(qlen & 255);
+            for (int i = 0; i < qlen; i = i + 1) {
+                tcpQuery[i + 2] = queryPkt[i];
+            }
+
+            int sent = await client.SendBytesAsync(tcpQuery, tcpQuery.Length);
+            if (sent <= 0) {
+                return new List<DnsRecord>();
+            }
+
+            // RFC 1035 §4.2.2: TCP 报文前置 2 字节大端网络序长度
+            byte[] prefix = new byte[2];
+            int pRead = 0;
+            while (pRead < 2) {
+                byte[] pBuf = new byte[2 - pRead];
+                int n = await client.RecvBytesAsync(pBuf, 2 - pRead, this.timeoutMs);
+                if (n <= 0) { return new List<DnsRecord>(); }
+                for (int i = 0; i < n; i = i + 1) {
+                    prefix[pRead + i] = pBuf[i];
+                }
+                pRead = pRead + n;
+            }
+
+            int msgLen = ((prefix[0] & 255) << 8) | (prefix[1] & 255);
+            if (msgLen <= 0 || msgLen > 65535) {
+                return new List<DnsRecord>();
+            }
+
+            byte[] respBuf = new byte[msgLen];
+            int received = 0;
+            while (received < msgLen) {
+                byte[] chunk = new byte[msgLen - received];
+                int r = await client.RecvBytesAsync(chunk, msgLen - received, this.timeoutMs);
+                if (r <= 0) { break; }
+                for (int i = 0; i < r; i = i + 1) {
+                    respBuf[received + i] = chunk[i];
+                }
+                received = received + r;
+            }
+
+            if (received < msgLen) {
+                return new List<DnsRecord>();
+            }
+
+            DnsPacket pkt = DnsPacket.Parse(respBuf, msgLen);
+            if (pkt == null || pkt.transactionId != txId || !pkt.isResponse) {
+                return new List<DnsRecord>();
+            }
+
+            return pkt.answers;
+        } finally {
+            client.Close();
         }
     }
 

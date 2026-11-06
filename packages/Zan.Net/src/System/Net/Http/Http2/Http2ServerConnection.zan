@@ -30,12 +30,14 @@ public class Http2ServerStream {
     public HttpRequest request;
     public ByteBuffer bodyBuffer;
     public bool complete;
+    public int outboundStreamWindow;
 
     public Http2ServerStream(int id, HttpRequest req) {
         this.streamId = id;
         this.request = req;
         this.bodyBuffer = ByteBuffer.Alloc(1024);
         this.complete = false;
+        this.outboundStreamWindow = 65535;
     }
 
     public void Dispose() {
@@ -62,6 +64,10 @@ public class Http2ServerConnection : IDisposable {
     public bool connected;
     public List<Http2ServerStream> pendingStreams;
     public int lastStreamId;
+    public int outboundConnWindow;
+    public int initialStreamWindow;
+    public int maxFrameSize;
+    public int inboundConsumed;
 
     public Http2ServerConnection(HttpFramer framer, HttpRequestHandler handler, Http2SendFn sendFn) {
         this.framer = framer;
@@ -73,6 +79,10 @@ public class Http2ServerConnection : IDisposable {
         this.connected = true;
         this.pendingStreams = new List<Http2ServerStream>();
         this.lastStreamId = 0;
+        this.outboundConnWindow = 65535;
+        this.initialStreamWindow = 65535;
+        this.maxFrameSize = 16384;
+        this.inboundConsumed = 0;
     }
 
     // 从 HttpFramer 精确读取指定字节数（不丢弃多余字节，留给下个帧）
@@ -133,6 +143,26 @@ public class Http2ServerConnection : IDisposable {
     async Task DispatchFrameAsync(Http2Frame frame, byte[] payload) {
         if (frame.type == Http2FrameType.SETTINGS) {
             if ((frame.flags & Http2Flags.ACK) == 0) {
+                if (payload != null && payload.Length >= 6) {
+                    int pCount = payload.Length / 6;
+                    for (int p = 0; p < pCount; p = p + 1) {
+                        int idx = p * 6;
+                        int sId = ((payload[idx] & 255) << 8) | (payload[idx + 1] & 255);
+                        int sVal = ((payload[idx + 2] & 255) << 24) | ((payload[idx + 3] & 255) << 16)
+                                 | ((payload[idx + 4] & 255) << 8) | (payload[idx + 5] & 255);
+                        if (sId == 4) { // SETTINGS_INITIAL_WINDOW_SIZE
+                            int delta = sVal - this.initialStreamWindow;
+                            this.initialStreamWindow = sVal;
+                            for (int i = 0; i < this.pendingStreams.Count; i = i + 1) {
+                                this.pendingStreams[i].outboundStreamWindow = this.pendingStreams[i].outboundStreamWindow + delta;
+                            }
+                        } else if (sId == 5) { // SETTINGS_MAX_FRAME_SIZE
+                            if (sVal >= 16384 && sVal <= 16777215) {
+                                this.maxFrameSize = sVal;
+                            }
+                        }
+                    }
+                }
                 byte[] ack = Http2Frame.BuildSettingsAck();
                 await this.SendRawAsync(ack, ack.Length);
             }
@@ -161,9 +191,17 @@ public class Http2ServerConnection : IDisposable {
             } else {
                 // 有待接收的数据帧，登记到挂起流
                 Http2ServerStream st = new Http2ServerStream(frame.streamId, req);
+                st.outboundStreamWindow = this.initialStreamWindow;
                 this.pendingStreams.Add(st);
             }
         } else if (frame.type == Http2FrameType.DATA) {
+            this.inboundConsumed = this.inboundConsumed + frame.length;
+            if (this.inboundConsumed >= 32768) {
+                byte[] wu = Http2Frame.BuildWindowUpdate(0, this.inboundConsumed);
+                await this.SendRawAsync(wu, wu.Length);
+                this.inboundConsumed = 0;
+            }
+
             Http2ServerStream st = this.FindPendingStream(frame.streamId);
             if (st != null) {
                 if (payload != null && payload.Length > 0) {
@@ -180,6 +218,48 @@ public class Http2ServerConnection : IDisposable {
                 // 未知流或已关闭流收到 DATA，返回 STREAM_CLOSED
                 byte[] rst = Http2Frame.BuildRstStream(frame.streamId, Http2Error.STREAM_CLOSED);
                 await this.SendRawAsync(rst, rst.Length);
+            }
+        } else if (frame.type == Http2FrameType.WINDOW_UPDATE) {
+            if (payload == null || payload.Length < 4) {
+                byte[] goaway = Http2Frame.BuildGoAway(this.lastStreamId, Http2Error.FRAME_SIZE_ERROR);
+                await this.SendRawAsync(goaway, goaway.Length);
+                this.connected = false;
+                return;
+            }
+            int increment = ((payload[0] & 127) << 24) | ((payload[1] & 255) << 16)
+                          | ((payload[2] & 255) << 8) | (payload[3] & 255);
+            // RFC 7540 §6.9.1: 增量为 0 是协议错误
+            if (increment == 0) {
+                if (frame.streamId == 0) {
+                    byte[] goaway = Http2Frame.BuildGoAway(this.lastStreamId, Http2Error.PROTOCOL_ERROR);
+                    await this.SendRawAsync(goaway, goaway.Length);
+                    this.connected = false;
+                } else {
+                    byte[] rst = Http2Frame.BuildRstStream(frame.streamId, Http2Error.PROTOCOL_ERROR);
+                    await this.SendRawAsync(rst, rst.Length);
+                }
+                return;
+            }
+            if (frame.streamId == 0) {
+                long newWin = (long)this.outboundConnWindow + increment;
+                if (newWin > 2147483647) {
+                    byte[] goaway = Http2Frame.BuildGoAway(this.lastStreamId, Http2Error.FLOW_CONTROL_ERROR);
+                    await this.SendRawAsync(goaway, goaway.Length);
+                    this.connected = false;
+                    return;
+                }
+                this.outboundConnWindow = (int)newWin;
+            } else {
+                Http2ServerStream st = this.FindPendingStream(frame.streamId);
+                if (st != null) {
+                    long newStreamWin = (long)st.outboundStreamWindow + increment;
+                    if (newStreamWin > 2147483647) {
+                        byte[] rst = Http2Frame.BuildRstStream(frame.streamId, Http2Error.FLOW_CONTROL_ERROR);
+                        await this.SendRawAsync(rst, rst.Length);
+                        return;
+                    }
+                    st.outboundStreamWindow = (int)newStreamWin;
+                }
             }
         } else if (frame.type == Http2FrameType.RST_STREAM) {
             this.RemovePendingStream(frame.streamId);
@@ -322,11 +402,31 @@ public class Http2ServerConnection : IDisposable {
                     bodyBytes = resp.body.ToBytes();
                 }
                 if (bodyBytes != null && bodyBytes.Length > 0) {
-                    byte[] dataPkt = new byte[9 + bodyBytes.Length];
-                    byte[] dataHdr = Http2Frame.EncodeHeader(bodyBytes.Length, Http2FrameType.DATA, Http2Flags.END_STREAM, streamId);
-                    NativeMemory.Copy((nint)dataPkt, (nint)dataHdr, 9);
-                    NativeMemory.Copy((nint)dataPkt + 9, (nint)bodyBytes, bodyBytes.Length);
-                    await this.sendFn(dataPkt, dataPkt.Length);
+                    int offset = 0;
+                    int totalLen = bodyBytes.Length;
+                    while (offset < totalLen && this.connected) {
+                        int remaining = totalLen - offset;
+                        int chunkLimit = this.maxFrameSize;
+                        if (chunkLimit <= 0) { chunkLimit = 16384; }
+
+                        // 流量控制预算截断：结合连接级出站窗口动态切片
+                        int budget = this.outboundConnWindow;
+                        if (budget < 1024) { budget = 1024; } // 维持基本推进进度
+                        if (chunkLimit > budget) { chunkLimit = budget; }
+                        int chunkSize = remaining < chunkLimit ? remaining : chunkLimit;
+
+                        bool isEnd = (offset + chunkSize >= totalLen);
+                        int dataFlags = isEnd ? Http2Flags.END_STREAM : 0;
+
+                        byte[] dataPkt = new byte[9 + chunkSize];
+                        byte[] dataHdr = Http2Frame.EncodeHeader(chunkSize, Http2FrameType.DATA, dataFlags, streamId);
+                        NativeMemory.Copy((nint)dataPkt, (nint)dataHdr, 9);
+                        NativeMemory.Copy((nint)dataPkt + 9, (nint)bodyBytes + offset, chunkSize);
+                        await this.sendFn(dataPkt, dataPkt.Length);
+
+                        this.outboundConnWindow = this.outboundConnWindow - chunkSize;
+                        offset = offset + chunkSize;
+                    }
                 }
             }
         } finally {
