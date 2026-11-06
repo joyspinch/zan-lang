@@ -40,9 +40,33 @@ public class IPAddress {
     }
 
     // 检查字符串是否为规范的 IPv6 地址格式（RFC 4291 / RFC 5952）。
-    // 支持标准 8 组 16 进制、单次 "::" 零压缩表示法。
+    // 支持标准 8 组 16 进制、单次 "::" 零压缩表示法以及 RFC 4291 §2.5.5.2 IPv4 映射混合表示（如 ::ffff:192.0.2.1）。
     public static bool IsIPv6(string str) {
-        if (str == null || str.Length < 2 || str.Length > 39) { return false; }
+        if (str == null || str.Length < 2 || str.Length > 45) { return false; }
+
+        // 支持 RFC 4291 §2.5.5.2 IPv4-Mapped IPv6 混合地址 (例如 "::ffff:192.0.2.1" 或 "0:0:0:0:0:ffff:192.0.2.1")
+        if (str.IndexOf(".", 0) >= 0) {
+            int lastColon = -1;
+            for (int i = str.Length - 1; i >= 0; i = i - 1) {
+                if ((str[i] & 255) == 58) { // ':'
+                    lastColon = i;
+                    break;
+                }
+            }
+            if (lastColon >= 0 && lastColon + 1 < str.Length) {
+                string ipv4Part = str.Substring(lastColon + 1, str.Length - lastColon - 1);
+                string prefixPart = str.Substring(0, lastColon);
+                if (IPAddress.IsIPv4(ipv4Part)) {
+                    if (prefixPart == "::ffff" || prefixPart == "::FFFF"
+                        || prefixPart == "0:0:0:0:0:ffff" || prefixPart == "0:0:0:0:0:FFFF"
+                        || prefixPart == "::") {
+                        return true;
+                    }
+                }
+            }
+            return false;
+        }
+
         int colonCount = 0;
         int doubleColon = -1;
         int groupDigits = 0;
@@ -82,6 +106,58 @@ public class IPAddress {
             // 无 "::" 压缩，必须恰好 8 组、7 个分隔冒号（加上结尾哨兵共 8 次）
             return groups == 8 && colonCount == 8;
         }
+    }
+
+    // 将点分十进制 IPv4 地址解析为 32 位无符号整数（存储在 long 中），非法时返回 -1。
+    public static long ParseIPv4(string ip) {
+        if (!IPAddress.IsIPv4(ip)) { return -1; }
+        long val = 0;
+        int octet = 0;
+        int len = ip.Length;
+        for (int i = 0; i <= len; i = i + 1) {
+            bool atEnd = (i == len);
+            int c = atEnd ? 46 : (ip[i] & 255);
+            if (c == 46) {
+                val = (val << 8) | (long)octet;
+                octet = 0;
+            } else {
+                octet = octet * 10 + (c - 48);
+            }
+        }
+        return val;
+    }
+
+    // 检查 IPv4 地址是否属于指定的 CIDR 子网（RFC 4632，例如 "192.168.1.15" 属于 "192.168.1.0/24"）。
+    // 前缀长度必须在 0..32 之间，输入非法或格式错误时返回 false。
+    public static bool IsInSubnet(string ip, string cidr) {
+        if (ip == null || cidr == null) { return false; }
+        long ipVal = IPAddress.ParseIPv4(ip);
+        if (ipVal < 0) { return false; }
+
+        int slash = cidr.IndexOf("/", 0);
+        if (slash <= 0 || slash + 1 >= cidr.Length) { return false; }
+        string netStr = cidr.Substring(0, slash);
+        long netVal = IPAddress.ParseIPv4(netStr);
+        if (netVal < 0) { return false; }
+
+        string prefixStr = cidr.Substring(slash + 1, cidr.Length - slash - 1);
+        if (prefixStr.Length == 0 || prefixStr.Length > 2) { return false; }
+        int prefix = 0;
+        for (int i = 0; i < prefixStr.Length; i = i + 1) {
+            int c = prefixStr[i] & 255;
+            if (c < 48 || c > 57) { return false; }
+            prefix = prefix * 10 + (c - 48);
+        }
+        if (prefix < 0 || prefix > 32) { return false; }
+        if (prefix == 0) { return true; }
+
+        // 计算 32 位掩码
+        long mask = 0;
+        for (int k = 0; k < prefix; k = k + 1) {
+            mask = mask | ((long)1 << (31 - k));
+        }
+
+        return (ipVal & mask) == (netVal & mask);
     }
 
     // 检查 IP 是否为本地环回地址（127.0.0.0/8 或 ::1）。
