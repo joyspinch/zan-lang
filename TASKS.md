@@ -18,7 +18,7 @@
 ### 批次 1 · 根修项（闭它解锁下游，优先领）
 
 - [x] B-ID163 编译器 fail-loud 四收口（本轮整改，C 宿主，commit 91ef9e8bd）：① 同步 lambda 赋 async 委托发 E3104（irgen_expr_lambda.c）；② 擦除体 new T() 硬失败（irgen_expr_construct.c）；③ (T)x 强转/拆箱失败无条件抛 InvalidCastException，stdlib 补异常类（irgen_expr_construct.c）；④ as 表达式对 string/object/interface 补运行时类型检查。测试集 42/42 全绿。
-- [ ] B-ID160 publish 反射 thunk 门控使框架字符串钩子哑火：`irgen_reflect.c` need_thunk 判定（约 :769-777）为 `!publish_mode || (flags & (MF_PROPGET|MF_PROPSET)) || attrs->count>0`——publish 档只为属性访问器/带注解方法生成 Invoke thunk（防 --gc-sections 锚定死代码），于是 `GetType().HasMethod("OnLoad")` 真而 Invoke 哑火，框架按字符串名回调的钩子（Form.Show 的 OnLoad 等）在 publish 形态静默丢失。证据链：同一程序 plain 形态钩子正常、publish 形态不触发、ZAN_NO_SHARD/nostrip 均无关、加 `[Custom]` 注解后 publish 全绿。现行契约（已写进 gui-design/html-window.md）：框架钩子方法必须带 `[Custom]` 注解。根修方向二选一：框架钩子默认保留 thunk；或编译期收集字符串字面量中的方法名作为 thunk 保留清单。单文件改动，不与任何在飞冲突。
+- [x] B-ID160 publish 反射 thunk 门控使框架字符串钩子哑火：`irgen_reflect.c` 完善 `refl_is_framework_hook_name` 原生识别 `On*` 框架生命周期钩子规范（OnLoad/OnInit 等），need_thunk 门控及 refl_method_should_export 与 irgen_emit root 判定全链路放行，解决 HasMethod 为真而 Invoke 哑火问题，无需手动 `[Custom]` 注解。用例 case_reflect_publish_hook 与 cwpublish 验证全绿。
 
 ### 批次 2 · 独立账（无前置，任一会话可领，按编号序）
 

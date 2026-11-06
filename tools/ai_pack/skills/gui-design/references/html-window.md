@@ -730,10 +730,10 @@ Cookie，"对照组"就不成立了。
    - **模板脚手架约束**：新建项目模板中的入口类必须声明为 `partial class {{NAME}} : Form`，严禁遗漏 `{{NAME}}` 占位符或 `: Form` 继承，否则编译器入口合成（`new <基名>().Show()`）将因类型未定义中断。
    - **`<include src="...">` 组合化**：支持在 HTML 中通过 `<include src="fragment.html" />` 组合引入组件化片段，装载期展开（深度 8 封顶防环），片段内事件与数据绑定对宿主窗口类同构生效。
    - **窗口键与子窗模态**：根/body 的 `data-win-title/w/h/center/chrome/round` 装配期消费（`:data-win-*` 走 bindProps 泵）；子窗 `new` + `Show()`，归属语义设 `w.owner = this` 后 `w.ShowDialog()`（关闭后宿主补 `MarkDirty()` 重绘），`Show()` 恒为非模态。
-   - **publish 构建钩子必须带 `[Custom]` 注解（B-ID160 契约，不遵守 = 静默失效）**：`OnLoad(Form)` 等框架按字符串名反射回调的钩子方法，在 `--publish` 形态下若不加注解会**哑火**——publish 档只为属性访问器与带注解方法生成 Invoke thunk（`irgen_reflect.c` need_thunk 门控，防 `--gc-sections` 锚定死代码），表现为 `HasMethod("OnLoad")` 返回真、`Invoke` 无效果：plain 形态一切正常、publish 形态钩子整段丢失、无任何诊断（B-ID160 已立账）。写法：`[Custom] public void OnLoad(Form f) { ... }`。排查口诀：**plain 好 publish 坏、HasMethod 真回调假，先查钩子注解**。
+   - **publish 框架钩子默认自动保留 thunk（B-ID160 编译器根修闭环）**：`OnLoad(Form)` 等框架按字符串名反射回调的钩子方法，在 `--publish` 形态下编译器原生识别 `On*` 框架生命周期钩子规范（`irgen_reflect.c`），默认生成 Invoke thunk 与反射导出并保留为链接 root，无需手动附加 `[Custom]` 注解。
    - **ChildWindow 子窗同类名约定**：`EnsureDesign()` 按"类名 ↔ 同名 .html"装载（覆写 `DesignName()` 可自定义名），与 Form.Show 同源；开发态（plain 构建）散盘扫描从工作目录与 src 树递归找。注意 `Directory.GetDirectories` 返回**裸目录名**（stdlib 刻意口径，与 GetFiles 全路径刻意不同）——递归扫描必须手动拼回父路径，否则嵌套设计稿永远 MISS。
-   - **ChildWindow 装配序（与 Form.assembleDoc 同语义）**：`EnsureDesign` 载树并默认挂**窗自身**为模型（实例字段即 ViewModel、方法即事件处理器；Build 里 `SetRoot(root, mdl)` 换挂 JsonValue 等模型的尊重之）；`OpenHost` 在 host 就绪后做声明式装配——`@click` 等按名对账接线（缺失 **exit 1** 列名）、bind 路径启动期对账（JsonValue 模型的键不是反射字段，跳过对账）、`OnLoad` 钩子 `Invoke` + 标脏。双模型语义：**事件恒解析窗方法，bind 走当前模型**。publish 形态 `OnLoad` 必须带 `[Custom]`（同上条契约）。
-   - **html 事件处理器在 publish 自动保留**：zanc 扫内嵌设计稿的 @x / v-on / z-on / data-on / on* 处理器名，按名保留反射条目、thunk 与函数体，处理器无需 `[Custom]`；框架按名调的钩子（OnLoad 等）不在 html 里，仍须 `[Custom]`。
+   - **ChildWindow 装配序（与 Form.assembleDoc 同语义）**：`EnsureDesign` 载树并默认挂**窗自身**为模型（实例字段即 ViewModel、方法即事件处理器；Build 里 `SetRoot(root, mdl)` 换挂 JsonValue 等模型的尊重之）；`OpenHost` 在 host 就绪后做声明式装配——`@click` 等按名对账接线（缺失 **exit 1** 列名）、bind 路径启动期对账（JsonValue 模型的键不是反射字段，跳过对账）、`OnLoad` 钩子 `Invoke` + 标脏。双模型语义：**事件恒解析窗方法，bind 走当前模型**。publish 形态 `OnLoad` 默认自动保留 thunk（同上条契约）。
+   - **html 事件处理器在 publish 自动保留**：zanc 扫内嵌设计稿的 @x / v-on / z-on / data-on / on* 处理器名，按名保留反射条目、thunk 与函数体，处理器无需 `[Custom]`；框架按名调的钩子（OnLoad 等）由编译器原生识别 On* 钩子保留，亦无需 `[Custom]`。
    - **反射方法表含继承方法**：HasMethod/Invoke 能命中基类方法（名字级遮蔽、最近声明胜出，基类静态方法除外），html 处理器可声明在基类窗上。
    - **`OnCloseRequested` 里可以再调 `Close()`**：Close 先置 open=false 再回调，重入早退，不会互递归。
    - **`(Label)r.Find(id)` 只对 `<label>` 成立**：`<span>` 不产出 Label；`<label><input/></label>` 里的 input 取不到，复选框文字写 `<input type="checkbox" value="文字">`。子类窗没有同名 html 时覆写 `DesignName()` 指向基类设计稿。

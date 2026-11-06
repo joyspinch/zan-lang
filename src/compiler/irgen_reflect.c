@@ -542,9 +542,34 @@ static int refl_accessor_flag(zan_symbol_t *sym, zan_symbol_t *msym) {
     return 0;
 }
 
-/* 设计稿事件处理器只经 Invoke 按名调用：publish 不保留的话 HasMethod
- * 对账通过、点击却静默不执行。 */
+/* 框架按名反射调用的生命周期钩子（Form / ChildWindow 的 OnLoad 等）。
+ * 在 publish 模式下默认保留 thunk 与反射导出，避免 HasMethod 返回真而 Invoke 哑火（B-ID160）。 */
+static bool refl_is_framework_hook_name(const char *s, size_t n) {
+    if (!s || n < 3) return false;
+    /* 显式常用生命周期与事件钩子 */
+    if (n == 6 && memcmp(s, "OnLoad", 6) == 0) return true;
+    if (n == 6 && memcmp(s, "OnInit", 6) == 0) return true;
+    if (n == 6 && memcmp(s, "OnShow", 6) == 0) return true;
+    if (n == 6 && memcmp(s, "OnHide", 6) == 0) return true;
+    if (n == 7 && memcmp(s, "OnClose", 7) == 0) return true;
+    if (n == 9 && memcmp(s, "OnClosing", 9) == 0) return true;
+    if (n == 8 && memcmp(s, "OnClosed", 8) == 0) return true;
+    if (n == 9 && memcmp(s, "OnDestroy", 9) == 0) return true;
+    if (n == 8 && memcmp(s, "OnResize", 8) == 0) return true;
+    if (n == 7 && memcmp(s, "OnPaint", 7) == 0) return true;
+    if (n == 8 && memcmp(s, "OnUpdate", 8) == 0) return true;
+    /* 凡是符合 OnPascalCase 规范的方法（如 OnCustomHook 等），
+     * 均作为框架生命周期/事件钩子默认保留 thunk */
+    if (s[0] == 'O' && s[1] == 'n' && (s[2] >= 'A' && s[2] <= 'Z'))
+        return true;
+    return false;
+}
+
+/* 设计稿事件处理器与框架钩子只经 Invoke 按名调用：publish 不保留的话 HasMethod
+ * 对账通过、点击/回调却静默不执行。 */
 bool refl_is_html_handler_name(zan_irgen_t *g, const char *s, size_t n) {
+    if (refl_is_framework_hook_name(s, n))
+        return true;
     for (int i = 0; i < g->html_handler_count; i++) {
         const char *h = g->html_handlers[i];
         if (strlen(h) == n && memcmp(h, s, n) == 0)
@@ -838,7 +863,8 @@ static LLVMValueRef refl_method_record(zan_irgen_t *g, zan_symbol_t *sym,
     flags |= refl_accessor_flag(sym, msym);
     LLVMValueRef thunk = LLVMConstNull(i8ptr);
     if (late) {
-        /* 在 publish 模式下，仅为属性访问器（get_/set_）或带注解方法生成 thunk，
+        /* 在 publish 模式下，仅为属性访问器（get_/set_）、带注解方法、
+         * 设计稿事件处理器与框架生命周期钩子（B-ID160）生成 thunk，
          * 避免为所有普通方法生成包装桩强行锚定死代码，让链接器 --gc-sections 正常工作 */
         zan_ast_list_t *attrs = zan_ast_attributes(decl);
         bool need_thunk = !g->publish_mode ||

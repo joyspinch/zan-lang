@@ -67,13 +67,11 @@ int safeLen = name?.Length ?? 0;
 
 ### 2.4 Integer Overflow
 
-Integer arithmetic wraps on overflow (two's complement) in every build
-configuration — there is no overflow checking. There is no `int.MaxValue`
-constant. The `checked`/`unchecked` keywords are accepted for C# source
-compatibility but are **no-ops** (`src/compiler/parser.c`: "Overflow checking
-is always off in this runtime (wrapping semantics), so both forms lower to a
-plain expression"); `checked(x + 1)` wraps exactly like `x + 1`
-(`tests/conformance/cs_b14_checked.zan`).
+Integer arithmetic wraps on overflow (two's complement) by default.
+When compiled with the `--checked` flag (or inside an explicit `checked` expression / block context),
+integer arithmetic operations (`+`, `-`, `*`) undergo hardware-accelerated overflow checks via LLVM overflow intrinsics
+(`llvm.sadd.with.overflow`, etc.) and raise `System.OverflowException` upon overflow (B-ID76).
+Unchecked operations and expressions explicitly wrapped in `unchecked(...)` retain wrapping semantics.
 
 ### 2.5 Uninitialized Variables
 
