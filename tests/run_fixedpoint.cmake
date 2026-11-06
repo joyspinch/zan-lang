@@ -42,9 +42,9 @@ else()
     ${SELFHOST_DIR}/lexer.zan
     ${SELFHOST_DIR}/ngen.zan
     ${SELFHOST_DIR}/ngen_macho.zan
-    ${SELFHOST_DIR}/../selfhost_runtime/ngen_obj.zan
+    ${SELFHOST_DIR}/ngen_obj.zan
     ${SELFHOST_DIR}/ngen_x86.zan
-    ${SELFHOST_DIR}/../selfhost_runtime/ngen_host.zan
+    ${SELFHOST_DIR}/ngen_host.zan
     ${SELFHOST_DIR}/ngen_numeric.zan
     ${SELFHOST_DIR}/ngen_guard.zan
     ${SELFHOST_DIR}/ngen_string.zan
