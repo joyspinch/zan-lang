@@ -42,7 +42,7 @@
 
 - [ ] B-ID168 selfhost 孪生与巨石拆分：① A1（lambda→async 委托，selfhost 无 delegate_is_async 概念需补判定）与 A3（强转异常同号）的 selfhost 同号孪生；② ngen.zan(15608)/irgen_expr.zan(11305)/ngen_host.zan(7496) 等拆分——验证走三门 `selfhost_gen1`+`selfhost_fixed_point`(g2==g3 字节等值)+`selfhost_diff`，新文件必须插 `scripts/selfhost_sources.txt` 原文件相邻位、搬家不重排（MergePartials 按源清单顺序合并）。
 - [ ] B-ID169 `Convert.*` 静默 0 语义收敛：坏输入返回 0 使 try/catch 兜底成死代码（SKILL.md:496-509 已记陷阱）；落地前先全仓用量审计，或新增 Strict 变体保留旧径并公告。
-- [ ] B-ID170 结构收口三件：① 中风险拆分（Designer 三件套 6909/4301/3466、App.zan 4470 的 ProcessEvent/ApplyEvent 纠缠块、SceneDesigner 2951）；② 命名空间三前缀统一（System.* 被 stdlib/packages 同名分仓、Gui/Game 裸名——独立大工程，动前定一尊）；③ zan.pkg 加 deps 字段 + zan-pm restore 下载闭环（pm_main.c:216-248 现为空转）。
+- [ ] B-ID170 结构收口三件：① 中风险拆分（Designer 三件套：Designer.Form.zan 4301行已于 commit 3b8cdd439 按 partial 拆出 Ribbon/Layout/Free/Canvas/Ruler/Preview 6切面并完成 RenderDesignCanvas 巨函数拆解；余 Designer.zan 6909 与 Designer.Inspector.zan 3466、App.zan 4470 的 ProcessEvent/ApplyEvent 纠缠块、SceneDesigner 2951）；② 命名空间三前缀统一（System.* 被 stdlib/packages 同名分仓、Gui/Game 裸名——独立大工程，动前定一尊）；③ zan.pkg 加 deps 字段 + zan-pm restore 下载闭环（pm_main.c:216-248 现为空转）。
 
 - [ ] B-ID152〔裁定搁置〕ZanDB 刀8 段 zstd 压缩：stdlib 无压缩绑定，需引入外部库链接与三平台分发——与自包含分发架构相抵；且压缩块缓存仍需解压驻留，对 2G 内存机目标无益。数据面收益已被 tag 11 行编码（4×↓）替代大半，除非出现大文本字段压缩需求，不领。
 - [ ] B-ID153〔裁定搁置〕ZanDB 刀9 SIMD 距离内核：运行时只有 CPU 特性探测（System.Runtime.Intrinsics.Cpu）无向量算术内建，落地须编译器/运行时新增 AVX2/NEON 内建——超出 ZanDB 数据面范围。评估前置已满足：发布档基线实测 approx 2ms/20k 库（debug 9.9ms，约 5×，见 ZanDb README 量化检索实测），而真实查询延迟由重打分文档行点查主导（12ms，IO 不随构建档变），SIMD 对端到端收益被摊薄；除非出现纯 ADC 高 QPS 场景，不领。
