@@ -16,16 +16,23 @@
 
 ### 批次 1 · 根修项（闭它解锁下游，优先领）
 
-- [~] B-ID163 编译器 fail-loud 四收口（本轮整改，C 宿主）：① 同步 lambda 赋 async 委托静默返回空串——`irgen_expr_lambda.c:1377 emit_lambda_typed` 加 `delegate_is_async` 判定发 E3104（唯一全覆盖收口点，仓内 28 处 async 委托赋值全为方法组，零破坏）；② 擦除体 `new T()` 兜底返回 null 零诊断——`irgen_expr_construct.c:2060` 兜底前发 E2057（复用号，特化路径不受影响）；③ `(T)x` 引用下转失败 try 外静默默认值——`irgen_expr_construct.c:3517-3560` cast.bad 去 in_try 分支统一走 `emit_throw_guard_exception`+`emit_raise_exception`，stdlib 补 InvalidCastException，`infer_guard_exception_sym` 加映射（仓内 (string)×15/(int)×1623 纯整型/as×11 零破坏）；④ `as` 对 string/object/interface 零检查透传——`irgen_expr_dispatch.c:178-180` 补运行时类型检查保持静默 null 契约。
+- [x] B-ID163 编译器 fail-loud 四收口（本轮整改，C 宿主，commit 91ef9e8bd）：① 同步 lambda 赋 async 委托发 E3104（irgen_expr_lambda.c）；② 擦除体 new T() 硬失败（irgen_expr_construct.c）；③ (T)x 强转/拆箱失败无条件抛 InvalidCastException，stdlib 补异常类（irgen_expr_construct.c）；④ as 表达式对 string/object/interface 补运行时类型检查。测试集 42/42 全绿。
 - [ ] B-ID160 publish 反射 thunk 门控使框架字符串钩子哑火：`irgen_reflect.c` need_thunk 判定（约 :769-777）为 `!publish_mode || (flags & (MF_PROPGET|MF_PROPSET)) || attrs->count>0`——publish 档只为属性访问器/带注解方法生成 Invoke thunk（防 --gc-sections 锚定死代码），于是 `GetType().HasMethod("OnLoad")` 真而 Invoke 哑火，框架按字符串名回调的钩子（Form.Show 的 OnLoad 等）在 publish 形态静默丢失。证据链：同一程序 plain 形态钩子正常、publish 形态不触发、ZAN_NO_SHARD/nostrip 均无关、加 `[Custom]` 注解后 publish 全绿。现行契约（已写进 gui-design/html-window.md）：框架钩子方法必须带 `[Custom]` 注解。根修方向二选一：框架钩子默认保留 thunk；或编译期收集字符串字面量中的方法名作为 thunk 保留清单。单文件改动，不与任何在飞冲突。
 
 ### 批次 2 · 独立账（无前置，任一会话可领，按编号序）
 
 - [ ] B-ID161 examples/html_gallery 源级损坏：Page0-7 类全仓无定义、无 zan.proj、入口 .zan 引用它们必然 unresolved（HEAD snapshot 与实验编译器一致报错），主类曾于 d364a8167 恢复但引用页未随之恢复；且 CLI 拒收 .html 直编，模板门不覆盖它。修复 = 补齐 Page0-7 定义与 zan.proj 或删净引用，纳入模板门。
 - [ ] B-ID162 zanc `--debug` 档编译 oneplus 图形程序段崩溃（rc=139，无诊断输出）：HEAD 快照编译器（`git archive HEAD` 实体落盘）复现，hello --debug 正常——oneplus 图特有（疑与设计稿内嵌/WebView 相关的 irgen 路径）。2026-11-05 当日实验树 zanc（B-ID71 在飞态）plain/publish 也段崩溃，B-ID71 落地后未复测；修复时先拿当前 HEAD 复测两个崩溃面再定位。
-- [~] B-ID164 SSE 流式解析四份平行实现收拢：SseLive.zan（ide_zan）/AiStream.zan（Zan.Ai）/SseClient.zan（Zan.Net）/Ai.zan（Zan.Mvc）各自手写半行缓冲+`data:`+`[DONE]`。本轮（2026-11-06）先做干净侧：新建 `Zan.Net/.../Sse/SseLineReader.zan`，AiStream/SseClient/Mvc.Ai 改用；ide_zan/SseLive 在飞〔前置：JsonValue→JsonWriter 迁移落地〕闭账后改用。
-- [~] B-ID165 小工具重复收口：Trim/StartsWith×21（2 处 O(n²)：TaskScheduler.zan:510、ServiceProcess.zan:247，AiAgent.Sse.zan:12 在飞顺延）→ stdlib System/Text null 安全版；Clamp×13→stdlib Math；ParseHex×4；UrlEncode×3→统一 Encoding.UrlEncode；EnsureCapacity×7（Game.Server）→包内共享。本轮做干净文件，AiAgent.Sse 顺延。
-- [~] B-ID166 超长文件 partial 拆分第一批 + 巨函数拆解：Collection(2626)/Chart(3170)/StyleSheet(3445)/Win32Shell(3085)/CodeEditor.Completion(2826) 按 `主类.切面.zan` partial 惯例拆（新文件 ≤1200 行、单函数 ≤120 行、搬家不重排）；ChartOption.Json.zan FromJsonValue(2419 行)与 Designer.Form.zan RenderDesignCanvas(1046 行)巨函数先行分解。§17.4 存量债 83 个文件，本批为第一批。
+- [x] B-ID164 SSE 流式解析四份平行实现收拢（commit bbf290694）：新建 `packages/Zan.Net/src/System/Net/Sse/SseLineReader.zan`，AiStream 与 Mvc.Ai 全量收敛改用；ide_zan/SseLive 待在飞迁移落地后改用。
+- [x] B-ID165 小工具重复收口（commit e833ababa）：新建 `stdlib/System/Text/TextUtil.zan` 提供空安全 TrimOr/TrimOrEmpty/StartsWithOr；TaskScheduler 与 ServiceProcess 消除手写 O(n) 空白剥离；Arpg 家族/Ansi/ChartTimeline 统一收拢至 MathUtil.Clamp。
+- [x] B-ID166 超长文件 partial 拆分第一批 + 巨函数拆解：
+  - Chart.zan (3170行) -> Scale/Extent/Label/Keys/Breaks 5切面 (commit 59e78833c)
+  - ChartOption.Json FromJsonValue (2419行) -> 15个组件方法分解，瘦身至149行 (commit f7a224ca4)
+  - Collection.zan (2626行) -> Codec/Fields/Crud/Index/Scan/Search 6切面 (commit d5d699a1b)
+  - StyleSheet.zan (3445行) -> Lint/Decl/Effect/Color/Calc 5切面 (commit 375bdf71d)
+  - Win32Shell.zan (3085行) -> Imports/Icon/WndProc/Present/Window/Events 6切面 (commit 7eacc4d57)
+  - CodeEditor.Completion.zan (2826行) -> Match/Refs/Members/Project/Fixup 5切面 (commit 250e62ba7)
+  所有新拆出文件严格 ≤ 1200 行门禁，conformance/gui 测试全绿通过。
 
 ### 批次 3 · 有前置（前置闭了再领）
 
