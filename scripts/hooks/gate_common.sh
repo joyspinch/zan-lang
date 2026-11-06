@@ -135,6 +135,7 @@ gate_check_blob_size() {
 #   2. Strict unidirectional dependencies: stdlib/ must never depend on packages/.
 #   3. PascalCase naming for public types and methods in .zan.
 #   4. Newly added files must not exceed 1200 lines.
+#   5. Zan.Gui layering ratchet (scripts/gui_layer_rules.py, baseline only goes down).
 gate_check_code_standards() {
     _gcs_mode="$1"
     _gcs_py=""

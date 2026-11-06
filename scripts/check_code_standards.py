@@ -8,6 +8,9 @@ Validates code changes against core quality baselines:
   2. Strict unidirectional dependencies: stdlib/ must never depend on packages/ (using Zan.*).
   3. PascalCase naming for public types and methods in .zan files.
   4. File and function size limits to prevent monolithic bloat.
+  5. Zan.Gui layering ratchet (scripts/gui_layer_rules.py + scripts/gui_layers_baseline.json):
+     no new upward dependencies inside Zan.Gui, no new immediate-mode entry points or
+     arbitration calls, no new legacy layout attributes, no new Signal* outside Zan.Gui.
 
 Usage:
     python scripts/check_code_standards.py --staged      # Check staged git changes (pre-commit)
@@ -217,6 +220,15 @@ def check_staged() -> int:
             err = check_pascal_case_api(rel_path, line_num, raw_line, stripped)
             if err:
                 violations.append(f"[FAIL] {rel_path}:{line_num} - {err}")
+
+    # 3. Zan.Gui layering ratchet (whole-file counts vs. baseline, see gui_layer_rules.py).
+    #    A crash in the checker itself must not block every commit in the repo: report it loudly
+    #    and let the commit through.
+    try:
+        import gui_layer_rules
+        violations.extend(gui_layer_rules.check_staged())
+    except Exception as exc:  # noqa: BLE001 - tool failure is reported, not fatal
+        sys.stderr.write(f"[WARN] Zan.Gui 分层机检自身出错，本次已跳过：{exc}\n")
 
     if violations:
         sys.stderr.write("=" * 70 + "\n")
