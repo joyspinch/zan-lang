@@ -1,0 +1,278 @@
+using System;
+using System.Collections.Generic;
+
+namespace System.Net.Http.Hpack;
+
+// RFC 7541 HPACK 编码与解码上下文环境（包含动态表、头部匹配、整数与字符串编解码）。
+public class HpackContext {
+    public List<HpackHeader> dynamicTable;
+    public int maxTableSize;
+    public int currentTableSize;
+
+    public HpackContext(int maxTableSize) {
+        this.dynamicTable = new List<HpackHeader>();
+        this.maxTableSize = maxTableSize > 0 ? maxTableSize : 4096;
+        this.currentTableSize = 0;
+    }
+
+    public HpackContext() {
+        this.dynamicTable = new List<HpackHeader>();
+        this.maxTableSize = 4096;
+        this.currentTableSize = 0;
+    }
+
+    // 设置动态表最大字节上限（并触发超额淘汰）。
+    public void SetMaxTableSize(int newSize) {
+        this.maxTableSize = newSize >= 0 ? newSize : 0;
+        this.EvictToMax(this.maxTableSize);
+    }
+
+    void EvictToMax(int limit) {
+        while (this.currentTableSize > limit && this.dynamicTable.Count > 0) {
+            int lastIdx = this.dynamicTable.Count - 1;
+            HpackHeader oldest = this.dynamicTable[lastIdx];
+            this.currentTableSize = this.currentTableSize - oldest.Size();
+            this.dynamicTable.RemoveAt(lastIdx);
+        }
+    }
+
+    // 向动态表插入新条目（FIFO：插入表头 0，即索引 62 处）。
+    public void AddHeader(string name, string value) {
+        HpackHeader entry = new HpackHeader(name, value);
+        int entrySize = entry.Size();
+        if (entrySize > this.maxTableSize) {
+            // 单条目超过表上限：按 RFC 7541 §4.3 清空全表
+            this.dynamicTable.Clear();
+            this.currentTableSize = 0;
+            return;
+        }
+        this.EvictToMax(this.maxTableSize - entrySize);
+        this.dynamicTable.Add(entry);
+        for (int i = this.dynamicTable.Count - 1; i > 0; i = i - 1) {
+            this.dynamicTable[i] = this.dynamicTable[i - 1];
+        }
+        this.dynamicTable[0] = entry;
+        this.currentTableSize = this.currentTableSize + entrySize;
+    }
+
+    // 根据 1-based 索引检索静态表（1..61）或动态表（62..）。
+    public HpackHeader GetHeader(int index) {
+        if (index >= 1 && index <= 61) {
+            return HpackStaticTable.Get(index);
+        }
+        int dynamicIdx = index - 62;
+        if (dynamicIdx >= 0 && dynamicIdx < this.dynamicTable.Count) {
+            return this.dynamicTable[dynamicIdx];
+        }
+        return null;
+    }
+
+    // 在静态表与动态表中查找完全匹配（返回非 0 索引）或仅名称匹配（outNameIndex 记录首个匹配）。
+    public int Find(string name, string value, List<int> outNameIndex) {
+        List<int> staticName = new List<int>();
+        int exactStatic = HpackStaticTable.Find(name, value, staticName);
+        if (exactStatic > 0) {
+            return exactStatic;
+        }
+        int firstNameIdx = staticName.Count > 0 ? staticName[0] : 0;
+
+        for (int i = 0; i < this.dynamicTable.Count; i = i + 1) {
+            HpackHeader e = this.dynamicTable[i];
+            if (e.name == name) {
+                if (e.value == value) {
+                    return 62 + i;
+                }
+                if (firstNameIdx == 0) {
+                    firstNameIdx = 62 + i;
+                }
+            }
+        }
+        if (outNameIndex != null && firstNameIdx > 0) {
+            outNameIndex.Add(firstNameIdx);
+        }
+        return 0;
+    }
+
+    // RFC 7541 §5.1: 变长整数编码
+    public static void EncodeInt(List<int> outBytes, int initialByte, int prefixBits, int val) {
+        int maxPrefix = (1 << prefixBits) - 1;
+        if (val < maxPrefix) {
+            outBytes.Add(initialByte | val);
+            return;
+        }
+        outBytes.Add(initialByte | maxPrefix);
+        val = val - maxPrefix;
+        while (val >= 128) {
+            outBytes.Add((val & 127) | 128);
+            val = val >> 7;
+        }
+        outBytes.Add(val);
+    }
+
+    // RFC 7541 §5.1: 变长整数解码
+    public static int DecodeInt(byte[] buf, List<int> pos, int prefixBits) {
+        int p = pos[0];
+        if (p >= buf.Length) { return 0; }
+        int maxPrefix = (1 << prefixBits) - 1;
+        int b = buf[p] & 255;
+        p = p + 1;
+        int val = b & maxPrefix;
+        if (val < maxPrefix) {
+            pos[0] = p;
+            return val;
+        }
+        int m = 0;
+        while (p < buf.Length) {
+            int b2 = buf[p] & 255;
+            p = p + 1;
+            val = val + ((b2 & 127) << m);
+            m = m + 7;
+            if ((b2 & 128) == 0) { break; }
+        }
+        pos[0] = p;
+        return val;
+    }
+
+    // RFC 7541 §5.2: 字符串字面量编码
+    public static void EncodeString(List<int> outBytes, string s, bool useHuffman) {
+        if (s == null) { s = ""; }
+        if (useHuffman) {
+            byte[] huff = HpackHuffman.Encode(s);
+            if (huff.Length < s.Length) {
+                // H = 1 (bit 7 为 1)
+                HpackContext.EncodeInt(outBytes, 128, 7, huff.Length);
+                for (int i = 0; i < huff.Length; i = i + 1) {
+                    outBytes.Add(huff[i] & 255);
+                }
+                return;
+            }
+        }
+        // H = 0
+        HpackContext.EncodeInt(outBytes, 0, 7, s.Length);
+        for (int j = 0; j < s.Length; j = j + 1) {
+            outBytes.Add(s[j] & 255);
+        }
+    }
+
+    // RFC 7541 §5.2: 字符串字面量解码
+    public static string DecodeString(byte[] buf, List<int> pos) {
+        int p = pos[0];
+        if (p >= buf.Length) { return ""; }
+        bool huffman = (buf[p] & 128) != 0;
+        int strLen = HpackContext.DecodeInt(buf, pos, 7);
+        p = pos[0];
+        if (p + strLen > buf.Length) { return ""; }
+        string result = "";
+        if (huffman) {
+            result = HpackHuffman.Decode(buf, p, strLen);
+            if (result == null) { result = ""; }
+        } else {
+            result = buf.ToStr(p, strLen);
+        }
+        pos[0] = p + strLen;
+        return result;
+    }
+
+    // 解码整个 HTTP/2 HEADERS 帧有效载荷中的 HPACK 头部块（RFC 7541 §6）。
+    public List<HpackHeader> DecodeHeaderBlock(byte[] buf, int offset, int length) {
+        List<HpackHeader> list = new List<HpackHeader>();
+        if (buf == null || offset < 0 || length <= 0 || offset + length > buf.Length) {
+            return list;
+        }
+        List<int> posBox = new List<int>();
+        posBox.Add(offset);
+        int end = offset + length;
+
+        while (posBox[0] < end) {
+            int p = posBox[0];
+            int b = buf[p] & 255;
+            if ((b & 128) != 0) {
+                // 1. Indexed Header Field (RFC 7541 §6.1, prefix 7 bits)
+                int index = HpackContext.DecodeInt(buf, posBox, 7);
+                HpackHeader h = this.GetHeader(index);
+                if (h != null) {
+                    list.Add(new HpackHeader(h.name, h.value));
+                }
+            } else if ((b & 192) == 64) {
+                // 2. Literal Header Field with Incremental Indexing (RFC 7541 §6.2.1, prefix 6 bits)
+                int index = HpackContext.DecodeInt(buf, posBox, 6);
+                string name = "";
+                if (index > 0) {
+                    HpackHeader hn = this.GetHeader(index);
+                    name = hn != null ? hn.name : "";
+                } else {
+                    name = HpackContext.DecodeString(buf, posBox);
+                }
+                string val = HpackContext.DecodeString(buf, posBox);
+                this.AddHeader(name, val);
+                list.Add(new HpackHeader(name, val));
+            } else if ((b & 240) == 0) {
+                // 3. Literal Header Field without Indexing (RFC 7541 §6.2.2, prefix 4 bits)
+                int index = HpackContext.DecodeInt(buf, posBox, 4);
+                string name = "";
+                if (index > 0) {
+                    HpackHeader hn = this.GetHeader(index);
+                    name = hn != null ? hn.name : "";
+                } else {
+                    name = HpackContext.DecodeString(buf, posBox);
+                }
+                string val = HpackContext.DecodeString(buf, posBox);
+                list.Add(new HpackHeader(name, val));
+            } else if ((b & 240) == 16) {
+                // 4. Literal Header Field Never Indexed (RFC 7541 §6.2.3, prefix 4 bits)
+                int index = HpackContext.DecodeInt(buf, posBox, 4);
+                string name = "";
+                if (index > 0) {
+                    HpackHeader hn = this.GetHeader(index);
+                    name = hn != null ? hn.name : "";
+                } else {
+                    name = HpackContext.DecodeString(buf, posBox);
+                }
+                string val = HpackContext.DecodeString(buf, posBox);
+                list.Add(new HpackHeader(name, val));
+            } else if ((b & 224) == 32) {
+                // 5. Dynamic Table Size Update (RFC 7541 §6.3, prefix 5 bits)
+                int newSize = HpackContext.DecodeInt(buf, posBox, 5);
+                this.SetMaxTableSize(newSize);
+            } else {
+                // 无法识别的格式直接前进 1 字节跳过
+                posBox[0] = p + 1;
+            }
+        }
+        return list;
+    }
+
+    // 编码一组头部字段为 HPACK 字节流（采用紧凑且标准的增量索引策略）。
+    public byte[] EncodeHeaders(List<HpackHeader> headers, bool useHuffman) {
+        if (headers == null || headers.Count == 0) { return new byte[0]; }
+        List<int> bytesList = new List<int>();
+
+        for (int i = 0; i < headers.Count; i = i + 1) {
+            HpackHeader h = headers[i];
+            List<int> nameBox = new List<int>();
+            int exactIdx = this.Find(h.name, h.value, nameBox);
+            if (exactIdx > 0) {
+                // 完全命中：以 Indexed Header Field (1xxxxxxx, prefix 7) 编码
+                HpackContext.EncodeInt(bytesList, 128, 7, exactIdx);
+            } else if (nameBox.Count > 0 && nameBox[0] > 0) {
+                // 名称命中：以 Literal Header Field with Incremental Indexing (01xxxxxx, prefix 6) 编码
+                int nameIdx = nameBox[0];
+                HpackContext.EncodeInt(bytesList, 64, 6, nameIdx);
+                HpackContext.EncodeString(bytesList, h.value, useHuffman);
+                this.AddHeader(h.name, h.value);
+            } else {
+                // 全新头部：Literal with Incremental Indexing (01000000, index 0)
+                HpackContext.EncodeInt(bytesList, 64, 6, 0);
+                HpackContext.EncodeString(bytesList, h.name, useHuffman);
+                HpackContext.EncodeString(bytesList, h.value, useHuffman);
+                this.AddHeader(h.name, h.value);
+            }
+        }
+
+        byte[] res = new byte[bytesList.Count];
+        for (int k = 0; k < bytesList.Count; k = k + 1) {
+            res[k] = (byte)bytesList[k];
+        }
+        return res;
+    }
+}

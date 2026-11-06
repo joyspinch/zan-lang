@@ -1,0 +1,76 @@
+using System;
+using System.Collections.Generic;
+using System.Text;
+using System.Threading;
+using System.Net.Http.Hpack;
+
+namespace System.Net.Http.Http2;
+
+// HTTP/2 独立逻辑流状态与多路复用上下文（RFC 7540 §5）。
+public class Http2Stream {
+    public int streamId;
+    public int state; // 0=Idle, 1=Open, 2=HalfClosedLocal, 3=HalfClosedRemote, 4=Closed
+    public int responseStatus;
+    public List<HpackHeader> responseHeaders;
+    public StringBuilder responseBody;
+    public int errorCode;
+    public bool completed;
+    public AsyncGate gate;
+
+    public Http2Stream(int streamId) {
+        this.streamId = streamId;
+        this.state = 1; // Open
+        this.responseStatus = 0;
+        this.responseHeaders = new List<HpackHeader>();
+        this.responseBody = new StringBuilder();
+        this.errorCode = 0;
+        this.completed = false;
+        this.gate = new AsyncGate();
+    }
+
+    public void AddHeader(string name, string value) {
+        this.responseHeaders.Add(new HpackHeader(name, value));
+        if (name == ":status") {
+            int code = 0;
+            for (int i = 0; i < value.Length; i = i + 1) {
+                int c = value[i] & 255;
+                if (c >= 48 && c <= 57) {
+                    code = code * 10 + (c - 48);
+                }
+            }
+            this.responseStatus = code;
+        }
+    }
+
+    public string GetHeader(string name) {
+        for (int i = 0; i < this.responseHeaders.Count; i = i + 1) {
+            if (this.responseHeaders[i].name == name) {
+                return this.responseHeaders[i].value;
+            }
+        }
+        return "";
+    }
+
+    public void AppendBody(byte[] data, int offset, int length) {
+        if (data == null || length <= 0) { return; }
+        string chunk = data.ToStr(offset, length);
+        this.responseBody.Append(chunk);
+    }
+
+    public void Complete() {
+        if (!this.completed) {
+            this.state = 4; // Closed
+            this.completed = true;
+            this.gate.Signal();
+        }
+    }
+
+    public void Reset(int err) {
+        if (!this.completed) {
+            this.errorCode = err;
+            this.state = 4; // Closed
+            this.completed = true;
+            this.gate.Signal();
+        }
+    }
+}

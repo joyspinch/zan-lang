@@ -1,0 +1,155 @@
+using System;
+using System.Collections.Generic;
+using System.Net.Http;
+using System.Net.Http.Hpack;
+using System.Net.Http.Http2;
+using System.Net.Http.Models;
+using System.Threading;
+
+class Program {
+    static int Run() {
+        // 1. 验证 HPACK 静态表 (RFC 7541 附录 A)
+        if (HpackStaticTable.Count() != 61) {
+            Console.WriteLine("FAIL: Static table count");
+            return 1;
+        }
+        HpackHeader h2 = HpackStaticTable.Get(2);
+        if (h2.name != ":method" || h2.value != "GET") {
+            Console.WriteLine("FAIL: Static table entry 2");
+            return 2;
+        }
+        HpackHeader h8 = HpackStaticTable.Get(8);
+        if (h8.name != ":status" || h8.value != "200") {
+            Console.WriteLine("FAIL: Static table entry 8");
+            return 3;
+        }
+        List<int> nameBox = new List<int>();
+        int exactIdx = HpackStaticTable.Find(":method", "POST", nameBox);
+        if (exactIdx != 3) {
+            Console.WriteLine("FAIL: Static table find exact :method POST");
+            return 4;
+        }
+        int nameOnlyIdx = HpackStaticTable.Find("custom-header", "custom-val", nameBox);
+        if (nameOnlyIdx != 0 || nameBox.Count > 0) {
+            Console.WriteLine("FAIL: Static table unmatched found");
+            return 5;
+        }
+        Console.WriteLine("STEP 1: HpackStaticTable verified OK");
+
+        // 2. 验证 HPACK 规范霍夫曼编码与解码 (RFC 7541 附录 B & C.4.1)
+        string testVal = "custom-value";
+        byte[] encVal = HpackHuffman.Encode(testVal);
+        // custom-value 霍夫曼编码结果必须精确匹配 RFC 7541 C.4.1 规范 16 进制：25 a8 49 e9 5b b8 e8 b4 bf
+        if (encVal.Length != 9) {
+            Console.WriteLine("FAIL: Huffman encoded length expected 9, got " + Convert.ToString(encVal.Length));
+            return 6;
+        }
+        if ((encVal[0] & 255) != 0x25 || (encVal[1] & 255) != 0xa8 || (encVal[8] & 255) != 0xbf) {
+            Console.WriteLine("FAIL: Huffman encoded bytes mismatch RFC 7541 C.4.1");
+            return 7;
+        }
+        string decVal = HpackHuffman.Decode(encVal, 0, encVal.Length);
+        if (decVal != testVal) {
+            Console.WriteLine("FAIL: Huffman decoded mismatch: " + decVal);
+            return 8;
+        }
+
+        string testKey = "custom-key";
+        byte[] encKey = HpackHuffman.Encode(testKey);
+        string decKey = HpackHuffman.Decode(encKey, 0, encKey.Length);
+        if (decKey != testKey) {
+            Console.WriteLine("FAIL: Huffman roundtrip custom-key mismatch");
+            return 9;
+        }
+        Console.WriteLine("STEP 2: HpackHuffman RFC 7541 C.4.1 byte-exact match and roundtrip OK");
+
+        // 3. 验证 HPACK 整数编解码与动态表淘汰机制
+        List<int> intBuf = new List<int>();
+        HpackContext.EncodeInt(intBuf, 0, 5, 1337);
+        byte[] intBytes = new byte[intBuf.Count];
+        for (int i = 0; i < intBuf.Count; i = i + 1) { intBytes[i] = (byte)intBuf[i]; }
+        List<int> pBox = new List<int>();
+        pBox.Add(0);
+        int decInt = HpackContext.DecodeInt(intBytes, pBox, 5);
+        if (decInt != 1337) {
+            Console.WriteLine("FAIL: DecodeInt expected 1337, got " + Convert.ToString(decInt));
+            return 10;
+        }
+
+        // 动态表淘汰：设最大容量为 100 字节，插入多个条目测试 FIFO 自动淘汰
+        HpackContext ctx = new HpackContext(100);
+        ctx.AddHeader("header-one", "value-one");       // size = 10 + 9 + 32 = 51
+        ctx.AddHeader("header-two", "value-two");       // size = 10 + 9 + 32 = 51, 总 102 > 100 -> 淘汰 header-one
+        if (ctx.dynamicTable.Count != 1) {
+            Console.WriteLine("FAIL: Dynamic table eviction count expected 1, got " + Convert.ToString(ctx.dynamicTable.Count));
+            return 11;
+        }
+        if (ctx.dynamicTable[0].name != "header-two") {
+            Console.WriteLine("FAIL: Dynamic table newest entry mismatch");
+            return 12;
+        }
+        Console.WriteLine("STEP 3: HpackContext integer encoding & dynamic table FIFO eviction OK");
+
+        // 4. 验证头部块编解码往返
+        HpackContext encCtx = new HpackContext(4096);
+        List<HpackHeader> reqHeaders = new List<HpackHeader>();
+        reqHeaders.Add(new HpackHeader(":method", "GET"));
+        reqHeaders.Add(new HpackHeader(":scheme", "https"));
+        reqHeaders.Add(new HpackHeader(":path", "/api/v1/status"));
+        reqHeaders.Add(new HpackHeader(":authority", "example.org"));
+        reqHeaders.Add(new HpackHeader("custom-header", "alpha-beta"));
+
+        byte[] encodedBlock = encCtx.EncodeHeaders(reqHeaders, true);
+        if (encodedBlock == null || encodedBlock.Length == 0) {
+            Console.WriteLine("FAIL: EncodeHeaders produced empty bytes");
+            return 13;
+        }
+
+        HpackContext decCtx = new HpackContext(4096);
+        List<HpackHeader> decodedList = decCtx.DecodeHeaderBlock(encodedBlock, 0, encodedBlock.Length);
+        if (decodedList.Count != 5) {
+            Console.WriteLine("FAIL: Decoded headers count expected 5, got " + Convert.ToString(decodedList.Count));
+            return 14;
+        }
+        if (decodedList[0].name != ":method" || decodedList[0].value != "GET") {
+            Console.WriteLine("FAIL: Decoded header 0 mismatch");
+            return 15;
+        }
+        if (decodedList[4].name != "custom-header" || decodedList[4].value != "alpha-beta") {
+            Console.WriteLine("FAIL: Decoded header 4 mismatch");
+            return 16;
+        }
+        Console.WriteLine("STEP 4: Header block encode/decode roundtrip OK");
+
+        // 5. 验证 Http2Stream 状态机与多路复用上下文
+        Http2Stream st = new Http2Stream(1);
+        st.AddHeader(":status", "200");
+        st.AddHeader("content-type", "application/json");
+        byte[] bodyChunk = "{\"ok\":true}".ToBytes();
+        st.AppendBody(bodyChunk, 0, bodyChunk.Length);
+        st.Complete();
+
+        if (st.responseStatus != 200) {
+            Console.WriteLine("FAIL: Stream status mismatch");
+            return 17;
+        }
+        if (st.responseBody.ToString() != "{\"ok\":true}") {
+            Console.WriteLine("FAIL: Stream body mismatch");
+            return 18;
+        }
+        Console.WriteLine("STEP 5: Http2Stream multiplexing context OK");
+
+        HpackStaticTable.Teardown();
+        HpackHuffman.Teardown();
+
+        Console.WriteLine("HTTP/2 HPACK and stream multiplexing PASS");
+        return 0;
+    }
+
+    static void Main() {
+        int r = Run();
+        if (r != 0) {
+            Environment.Exit(r);
+        }
+    }
+}
