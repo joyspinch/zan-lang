@@ -15,7 +15,7 @@ namespace System.Net.Modbus;
 // // 用法：
 // int ok = await m.WriteRegisterAsync(10, 1234);
 // m.Close();
-public class ModbusClient {
+public class ModbusClient : IDisposable {
     TcpClient conn;
     int unitId;
     int nextTid;
@@ -63,6 +63,11 @@ public class ModbusClient {
         this.busy = false;
         if (this.conn != null) { this.conn.Close(); }
         this.connected = false;
+    }
+
+    // 实现 IDisposable 接口，释放网络与等待门资源。
+    public void Dispose() {
+        this.Close();
     }
 
     // 在 IO reactor 上挂起，跨多次 recv 精确读取
@@ -345,6 +350,38 @@ public class ModbusClient {
             pdu[7 + i * 2] = (byte)(values[i] & 255);
         }
         byte[] _r = await TransactAsync(pdu, 6 + n * 2);
+        if (this.lastError.Length > 0) { return 0; }
+        return 1;
+    }
+
+    // 批量写入线圈（功能码 15 / 0x0F，Modbus Application Protocol V1.1b3 §6.11）。
+    // values 中每个元素非零表示线圈置 1 (ON)，0 表示置 0 (OFF)。
+    // 成功返回 1，失败返回 0（详见 LastError）。
+    public async int WriteCoilsAsync(int addr, List<int> values) {
+        if (values == null || values.Count < 1 || values.Count > 1968 || addr < 0 || addr > 65535) {
+            this.lastError = "invalid arguments";
+            return 0;
+        }
+        int count = values.Count;
+        int byteCount = (count + 7) / 8;
+        byte[] pdu = new byte[6 + byteCount];
+        pdu[0] = 15;
+        pdu[1] = (byte)((addr >> 8) & 255);
+        pdu[2] = (byte)(addr & 255);
+        pdu[3] = (byte)((count >> 8) & 255);
+        pdu[4] = (byte)(count & 255);
+        pdu[5] = (byte)(byteCount & 255);
+        for (int i = 0; i < byteCount; i = i + 1) {
+            pdu[6 + i] = 0;
+        }
+        for (int i = 0; i < count; i = i + 1) {
+            if (values[i] != 0) {
+                int byteIdx = 6 + (i / 8);
+                int bitOffset = i % 8;
+                pdu[byteIdx] = (byte)((pdu[byteIdx] & 255) | (1 << bitOffset));
+            }
+        }
+        byte[] _r = await TransactAsync(pdu, 6 + byteCount);
         if (this.lastError.Length > 0) { return 0; }
         return 1;
     }
