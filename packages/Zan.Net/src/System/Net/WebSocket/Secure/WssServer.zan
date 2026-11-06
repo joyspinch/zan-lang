@@ -1,21 +1,114 @@
 using System;
+using System.Collections.Generic;
 using System.Net.Sockets;
 using System.Net.Http;
 using System.Net.Tls;
+using System.Text;
+using System.Security.Cryptography;
+using System.Threading;
 
 namespace System.Net.WebSocket.Secure;
 
-// 处理一条已解码的文本/二进制消息；返回值会发回
-// 客户端（纯 echo 服务器只需原样返回参数）。异步设计使
-// 处理器可以 await I/O 而不会阻塞连接的协程。
+// 处理一条已解码的文本/二进制消息；返回值会发回客户端（为 null 或空串则不发送）。
 public async delegate string WssMessageHandler(string message);
 
-// 基于 TLS 的 WebSocket（wss://）服务器。帧格式与
-// Worker.HandleWebSocket 的帧循环相同，所有字节都流经
-// 每条连接各自的 <see cref="TlsStream"/>。
-// 用法：
-// server.OnMessage(Handle);
-public class WssServer {
+// 包含连接上下文的 WSS 消息处理器（可访问 conn.SendAsync / conn.CloseAsync 等）
+public async delegate string WssContextMessageHandler(WssConnection conn, string message);
+
+// WSS 客户端连接/断开事件处理器
+public async delegate void WssConnectionHandler(WssConnection conn);
+
+// 单条活跃 TLS WebSocket (wss://) 客户端连接上下文
+public class WssConnection : IDisposable {
+    public nint sock;
+    public TlsStream stream;
+    public bool connected;
+    private Mutex sendLock;
+
+    public WssConnection(nint sock, TlsStream stream) {
+        this.sock = sock;
+        this.stream = stream;
+        this.connected = true;
+        this.sendLock = new Mutex();
+    }
+
+    // 异步发送文本帧（RFC 6455 Opcode 1）
+    public async int SendAsync(string text) {
+        if (!this.connected || text == null) { return -1; }
+        byte[] payload = text.ToBytes();
+        WsFrame frame = WsFrame.RawFrame(WsOpcode.Text, payload, payload.Length);
+        byte[] encoded = frame.Encode();
+        int frameLen = WsFrame.HeaderLen(payload.Length) + payload.Length;
+
+        this.sendLock.WaitOne();
+        try {
+            int r = await this.stream.SendAsync(encoded, frameLen);
+            return r;
+        } finally {
+            this.sendLock.ReleaseMutex();
+        }
+    }
+
+    // 异步发送二进制帧（RFC 6455 Opcode 2）
+    public async int SendBytesAsync(byte[] data, int len) {
+        if (!this.connected || data == null || len <= 0) { return -1; }
+        WsFrame frame = WsFrame.RawFrame(WsOpcode.Binary, data, len);
+        byte[] encoded = frame.Encode();
+        int frameLen = WsFrame.HeaderLen(len) + len;
+
+        this.sendLock.WaitOne();
+        try {
+            int r = await this.stream.SendAsync(encoded, frameLen);
+            return r;
+        } finally {
+            this.sendLock.ReleaseMutex();
+        }
+    }
+
+    // 发送 Ping 探活帧（RFC 6455 Opcode 9）
+    public async void PingAsync() {
+        if (!this.connected) { return; }
+        WsFrame ping = WsFrame.RawFrame(WsOpcode.Ping, new byte[0], 0);
+        byte[] encoded = ping.Encode();
+
+        this.sendLock.WaitOne();
+        try {
+            await this.stream.SendAsync(encoded, 2);
+        } catch (Exception ex) {
+        } finally {
+            this.sendLock.ReleaseMutex();
+        }
+    }
+
+    // 发送正常关闭帧（RFC 6455 Opcode 8）并优雅断开连接
+    public async void CloseAsync() {
+        if (!this.connected) { return; }
+        this.connected = false;
+        WsFrame close = WsFrame.CloseFrame();
+        byte[] encoded = close.Encode();
+
+        this.sendLock.WaitOne();
+        try {
+            await this.stream.SendAsync(encoded, 2);
+        } catch (Exception ex) {
+        } finally {
+            this.sendLock.ReleaseMutex();
+            if (this.stream != null) { this.stream.Close(); }
+            if (this.sock >= 0) { Socket.Close(this.sock); this.sock = -1; }
+        }
+    }
+
+    public void Dispose() {
+        this.connected = false;
+        if (this.stream != null) { this.stream.Close(); }
+        if (this.sock >= 0) { Socket.Close(this.sock); this.sock = -1; }
+    }
+}
+
+// 基于 TLS 的 WebSocket（wss://）高性能服务器。
+// 具备完整 RFC 6455 掩码校验、16MiB 分片防爆重组、Ping-Pong 回显、优雅双向关闭握手、
+// 连接生命周期管理与多端全局并发广播能力。
+public class WssServer : IDisposable {
     public TcpListener listener;
     public TlsContext tls;
     public string host;
@@ -25,6 +118,11 @@ public class WssServer {
     public int maxConnections;
     public int requestTimeoutMs;
     public WssMessageHandler messageHandler;
+    public WssContextMessageHandler contextHandler;
+    public WssConnectionHandler connectHandler;
+    public WssConnectionHandler closeHandler;
+    public List<WssConnection> connections;
+    private Mutex connLock;
 
     public WssServer(string host, int port) {
         this.host = host;
@@ -34,7 +132,12 @@ public class WssServer {
         this.maxConnections = 10000;
         this.requestTimeoutMs = 30000;
         this.messageHandler = null;
+        this.contextHandler = null;
+        this.connectHandler = null;
+        this.closeHandler = null;
         this.tls = null;
+        this.connections = new List<WssConnection>();
+        this.connLock = new Mutex();
     }
 
     // 从 PEM 证书链和 PEM 私钥创建
@@ -53,6 +156,21 @@ public class WssServer {
     // （子类重写路径，与 Worker 的 onMessage 同款）。
     public WssServer OnMessage(WssMessageHandler handler) {
         this.messageHandler = handler;
+        return this;
+    }
+
+    public WssServer OnContextMessage(WssContextMessageHandler handler) {
+        this.contextHandler = handler;
+        return this;
+    }
+
+    public WssServer OnConnect(WssConnectionHandler handler) {
+        this.connectHandler = handler;
+        return this;
+    }
+
+    public WssServer OnClose(WssConnectionHandler handler) {
+        this.closeHandler = handler;
         return this;
     }
 
@@ -92,12 +210,64 @@ public class WssServer {
         }
     }
 
-    // 请求停止接受连接；在途连接处理完当前消息后自然收尾。
+    void AddConnection(WssConnection conn) {
+        this.connLock.WaitOne();
+        try {
+            this.connections.Add(conn);
+        } finally {
+            this.connLock.ReleaseMutex();
+        }
+    }
+
+    void RemoveConnection(WssConnection conn) {
+        this.connLock.WaitOne();
+        try {
+            for (int i = 0; i < this.connections.Count; i = i + 1) {
+                if (this.connections[i] == conn) {
+                    this.connections.RemoveAt(i);
+                    break;
+                }
+            }
+        } finally {
+            this.connLock.ReleaseMutex();
+        }
+    }
+
+    // 向当前所有活跃 WSS 客户端广播文本消息
+    public void Broadcast(string message) {
+        if (message == null || message.Length == 0) { return; }
+        this.connLock.WaitOne();
+        try {
+            for (int i = 0; i < this.connections.Count; i = i + 1) {
+                WssConnection c = this.connections[i];
+                if (c.connected) {
+                    Task.Spawn(c.SendAsync(message));
+                }
+            }
+        } finally {
+            this.connLock.ReleaseMutex();
+        }
+    }
+
+    // 请求停止接受连接并优雅断开所有客户端；在途连接处理完当前消息后自然收尾。
     public void Stop() {
         this.running = false;
         if (this.listener != null) {
             this.listener.Stop();
         }
+        this.connLock.WaitOne();
+        try {
+            for (int i = 0; i < this.connections.Count; i = i + 1) {
+                this.connections[i].CloseAsync();
+            }
+            this.connections.Clear();
+        } finally {
+            this.connLock.ReleaseMutex();
+        }
+    }
+
+    public void Dispose() {
+        this.Stop();
     }
 
     // 单条连接的生命周期：TLS 握手 → WebSocket Upgrade（缺 Upgrade
@@ -127,6 +297,7 @@ public class WssServer {
         }
 
         HttpDeadlineToken watch = HttpDeadline.Arm(clientSock, this.requestTimeoutMs);
+        WssConnection conn = null;
         try {
             // 握手与后续帧共用一个 WsReader（TLS 字节源）：握手可能被
             // TLS 记录边界拆开，而与握手同批到达的首帧字节可能含 NUL
@@ -177,26 +348,31 @@ public class WssServer {
             // 与升级请求同批到达的首批帧已留在 reader 里，跳过握手
             // 字节继续使用即可。
             reader.Consume(headerEnd + 4);
+            conn = new WssConnection(clientSock, stream);
+            this.AddConnection(conn);
+            if (this.connectHandler != null) {
+                await this.connectHandler(conn);
+            }
+
             WsAssembler asm = new WsAssembler(reader.MaxLen());
-            bool connected = true;
-            while (connected) {
+            while (conn.connected) {
                 int total = reader.FrameSize();
                 while (total < 0) {
                     if (total == -2 || total == -3) {
                         // -2 = 帧长编码违规（1002）；-3 = 消息过大（1009）。
                         byte[] enc = WsFrame.CloseFrameWithCode(total == -3 ? 1009 : 1002).Encode();
                         int _v = await stream.SendAsync(enc, 4);
-                        connected = false;
+                        conn.connected = false;
                         break;
                     }
                     int n = await reader.FillMore();
                     if (n <= 0) {
-                        connected = false;
+                        conn.connected = false;
                         break;
                     }
                     total = reader.FrameSize();
                 }
-                if (!connected) { break; }
+                if (!conn.connected) { break; }
 
                 WsFrame frame = reader.TakeFrame(total);
 
@@ -205,7 +381,7 @@ public class WssServer {
                 if (!WsFrame.ValidInbound(frame, true)) {
                     byte[] enc = WsFrame.CloseFrameWithCode(1002).Encode();
                     int _v = await stream.SendAsync(enc, 4);
-                    connected = false;
+                    conn.connected = false;
                     break;
                 }
                 if (frame.opcode == WsOpcode.Ping) {
@@ -220,7 +396,7 @@ public class WssServer {
                     WsFrame closeResp = WsFrame.CloseFrame();
                     byte[] encoded = closeResp.Encode();
                     int _c = await stream.SendAsync(encoded, 2);
-                    connected = false;
+                    conn.connected = false;
                     break;
                 }
                 // 数据帧：分片消息在 fin 时整条交付——此前 continuation
@@ -229,43 +405,55 @@ public class WssServer {
                 if (feed < 0) {
                     byte[] enc = WsFrame.CloseFrameWithCode(feed == -2 ? 1009 : 1002).Encode();
                     int _v = await stream.SendAsync(enc, 4);
-                    connected = false;
+                    conn.connected = false;
                     break;
                 }
                 if (feed == 0) { continue; }
                 if (!asm.ValidComplete()) {
                     byte[] encUtf = WsFrame.CloseFrameWithCode(1007).Encode();
                     int _u = await stream.SendAsync(encUtf, 4);
-                    connected = false;
+                    conn.connected = false;
                     break;
                 }
 
                 int msgOpcode = asm.MessageOpcode();
                 string message = asm.Complete();
-                string response = await OnMessageInternal(message);
-                if (response == null) { response = ""; }
-                if (response.Length > 16777216) {
-                    byte[] encBig = WsFrame.CloseFrameWithCode(1009).Encode();
-                    int _big = await stream.SendAsync(encBig, 4);
-                    connected = false;
-                    break;
+                string response = null;
+                if (this.contextHandler != null) {
+                    response = await this.contextHandler(conn, message);
+                } else {
+                    response = await OnMessageInternal(message);
                 }
-                int respLen = response.Length;
-                WsFrame respFrame = WsFrame.BinaryFrame(response, respLen);
-                respFrame.opcode = msgOpcode;
-                byte[] respEnc = respFrame.Encode();
-                int sent = await stream.SendAsync(respEnc, WsFrame.HeaderLen(respLen) + respLen);
-                if (sent < 0) { connected = false; }
-            }
 
-            stream.Close();
-            Socket.Close(clientSock);
+                if (response != null && response.Length > 0 && conn.connected) {
+                    if (response.Length > 16777216) {
+                        byte[] encBig = WsFrame.CloseFrameWithCode(1009).Encode();
+                        int _big = await stream.SendAsync(encBig, 4);
+                        conn.connected = false;
+                        break;
+                    }
+                    int respLen = response.Length;
+                    WsFrame respFrame = WsFrame.BinaryFrame(response, respLen);
+                    respFrame.opcode = msgOpcode;
+                    byte[] respEnc = respFrame.Encode();
+                    int sent = await stream.SendAsync(respEnc, WsFrame.HeaderLen(respLen) + respLen);
+                    if (sent < 0) { conn.connected = false; }
+                }
+            }
         } finally {
             HttpDeadline.Disarm(watch);
-            // 异常路径兜底：上面的正常关闭是幂等关闭（Close 幂等），
-            // 异常时由这里保证 fd/SSL 一定释放。
-            stream.Close();
-            Socket.Close(clientSock);
+            if (conn != null) {
+                this.RemoveConnection(conn);
+                if (this.closeHandler != null) {
+                    try {
+                        await this.closeHandler(conn);
+                    } catch (Exception ex) {}
+                }
+                conn.Dispose();
+            } else {
+                if (stream != null) { stream.Close(); }
+                Socket.Close(clientSock);
+            }
         }
     }
 
