@@ -1,0 +1,354 @@
+using System;
+using System.Collections.Generic;
+
+namespace System.Net.Tls;
+
+// RFC 6960: OCSP 证书吊销状态常量
+public class OcspCertStatus {
+    public static int Good = 0;
+    public static int Revoked = 1;
+    public static int Unknown = 2;
+}
+
+// RFC 6960: OCSP 响应解析器与状态实体。
+// 支持解析 OCSPResponse、ResponseBytes、BasicOCSPResponse 以及 SingleResponse 的 certStatus。
+public class OcspResponse {
+    public int responseStatus;    // 0=successful, 1=malformedRequest, 2=internalError, 3=tryLater, 5=sigRequired, 6=unauthorized
+    public int certStatus;        // 0=Good, 1=Revoked, 2=Unknown, -1=Unparsed
+    public long revocationTime;   // 吊销时间戳 (Unix 秒)
+    public int revocationReason;  // 吊销原因 (CRLReason)
+    public long thisUpdate;       // 本次更新时间戳
+    public long nextUpdate;       // 下次更新时间戳
+    public byte[] rawBytes;
+
+    public OcspResponse() {
+        this.responseStatus = -1;
+        this.certStatus = -1;
+        this.revocationTime = 0;
+        this.revocationReason = 0;
+        this.thisUpdate = 0;
+        this.nextUpdate = 0;
+        this.rawBytes = null;
+    }
+
+    // 基础 ASN.1 DER TLV 解析原语
+    private static int Tlv(byte[] d, int bound, List<int> p, int tag) {
+        int at = p[0];
+        if (at < 0 || at + 2 > bound || (d[at] & 255) != tag) { return -1; }
+        int first = d[at + 1] & 255;
+        int len = first;
+        int start = at + 2;
+        if (first >= 128) {
+            int count = first - 128;
+            if (count == 0 || count > 4 || start + count > bound || (d[start] & 255) == 0) { return -1; }
+            len = 0;
+            for (int i = 0; i < count; i = i + 1) {
+                if (len > 2147483647 / 256) { return -1; }
+                len = len * 256 + (d[start + i] & 255);
+            }
+            if (len < 128) { return -1; }
+            start = start + count;
+        }
+        if (len < 0 || len > bound - start) { return -1; }
+        p[0] = start;
+        return start + len;
+    }
+
+    private static int Digits(byte[] d, int p, int count) {
+        int value = 0;
+        for (int i = 0; i < count; i = i + 1) {
+            int c = d[p + i] & 255;
+            if (c < 48 || c > 57) { return -1; }
+            value = value * 10 + c - 48;
+        }
+        return value;
+    }
+
+    private static long ParseTime(byte[] d, int bound, List<int> p) {
+        if (p[0] >= bound) { return -1; }
+        int tag = d[p[0]] & 255;
+        int end = Tlv(d, bound, p, tag);
+        if (end < 0) { return -1; }
+        int size = end - p[0];
+        if ((tag != 23 || size != 13) && (tag != 24 || size != 15)) { return -1; }
+        if ((d[end - 1] & 255) != 90) { return -1; }
+        int i = p[0];
+        int year = Digits(d, i, tag == 23 ? 2 : 4);
+        if (year < 0) { return -1; }
+        if (tag == 23) { year = year >= 50 ? year + 1900 : year + 2000; i = i + 2; }
+        else { i = i + 4; }
+        int month = Digits(d, i, 2); int day = Digits(d, i + 2, 2);
+        int hour = Digits(d, i + 4, 2); int minute = Digits(d, i + 6, 2);
+        int second = Digits(d, i + 8, 2);
+        if (year < 1970 || month < 1 || month > 12 || day < 1 || day > DateTime.DaysInMonth(year, month)
+            || hour < 0 || hour > 23 || minute < 0 || minute > 59 || second < 0 || second > 59) { return -1; }
+        p[0] = end;
+        return DateTime.FromParts(year, month, day, hour, minute, second).ToUnixSeconds();
+    }
+
+    // 解析 DER 编码的 OCSPResponse 字节流。
+    public static OcspResponse Parse(byte[] der, int offset, int length) {
+        if (der == null || offset < 0 || length <= 0 || offset + length > der.Length) {
+            return null;
+        }
+        OcspResponse resp = new OcspResponse();
+        resp.rawBytes = new byte[length];
+        NativeMemory.Copy((nint)resp.rawBytes, (nint)der + (nint)offset, length);
+
+        List<int> p = new List<int>();
+        p.Add(offset);
+        int bound = offset + length;
+
+        // 1. OCSPResponse ::= SEQUENCE { responseStatus, responseBytes? }
+        int respEnd = Tlv(der, bound, p, 48); // 0x30
+        if (respEnd != bound) { return null; }
+
+        // 2. responseStatus ENUMERATED (0x0A = 10)
+        int statusEnd = Tlv(der, respEnd, p, 10);
+        if (statusEnd < 0 || statusEnd - p[0] != 1) { return null; }
+        resp.responseStatus = der[p[0]] & 255;
+        p[0] = statusEnd;
+
+        // 若响应状态非 0 (successful)，则无 responseBytes
+        if (resp.responseStatus != 0) {
+            return resp;
+        }
+
+        // 3. responseBytes [0] EXPLICIT ResponseBytes (0xA0 = 160)
+        if (p[0] >= respEnd) { return resp; }
+        int expEnd = Tlv(der, respEnd, p, 160);
+        if (expEnd < 0) { return resp; }
+
+        // 4. ResponseBytes ::= SEQUENCE { responseType OBJECT IDENTIFIER, response OCTET STRING }
+        int rbSeqEnd = Tlv(der, expEnd, p, 48);
+        if (rbSeqEnd < 0) { return resp; }
+
+        // 5. responseType OID: id-pkix-ocsp-basic (1.3.6.1.5.5.7.48.1.1)
+        int oidEnd = Tlv(der, rbSeqEnd, p, 6);
+        if (oidEnd < 0) { return resp; }
+        byte[] expectedOid = new byte[] { 43, 6, 1, 5, 5, 7, 48, 1, 1 };
+        int oidLen = oidEnd - p[0];
+        if (oidLen != 9) { return resp; }
+        for (int i = 0; i < 9; i = i + 1) {
+            if ((der[p[0] + i] & 255) != (expectedOid[i] & 255)) { return resp; }
+        }
+        p[0] = oidEnd;
+
+        // 6. response OCTET STRING (0x04 = 4)
+        int octetEnd = Tlv(der, rbSeqEnd, p, 4);
+        if (octetEnd < 0) { return resp; }
+
+        // 7. 进入 BasicOCSPResponse ::= SEQUENCE
+        int basicBound = octetEnd;
+        int basicSeqEnd = Tlv(der, basicBound, p, 48);
+        if (basicSeqEnd < 0) { return resp; }
+
+        // 8. tbsResponseData ResponseData ::= SEQUENCE
+        int tbsEnd = Tlv(der, basicSeqEnd, p, 48);
+        if (tbsEnd < 0) { return resp; }
+
+        // 9. 可选的 version [0] EXPLICIT Version (0xA0 = 160)
+        if (p[0] < tbsEnd && (der[p[0]] & 255) == 160) {
+            int verEnd = Tlv(der, tbsEnd, p, 160);
+            if (verEnd < 0) { return resp; }
+            p[0] = verEnd;
+        }
+
+        // 10. responderID CHOICE: byName [1] (0xA1 = 161) 或 byKey [2] (0xA2 = 162)
+        if (p[0] >= tbsEnd) { return resp; }
+        int respIdTag = der[p[0]] & 255;
+        if (respIdTag != 161 && respIdTag != 162) { return resp; }
+        int respIdEnd = Tlv(der, tbsEnd, p, respIdTag);
+        if (respIdEnd < 0) { return resp; }
+        p[0] = respIdEnd;
+
+        // 11. producedAt GeneralizedTime (0x18 = 24) 或 UTCTime (0x17 = 23)
+        if (p[0] >= tbsEnd) { return resp; }
+        int prodTag = der[p[0]] & 255;
+        if (prodTag != 24 && prodTag != 23) { return resp; }
+        int prodEnd = Tlv(der, tbsEnd, p, prodTag);
+        if (prodEnd < 0) { return resp; }
+        p[0] = prodEnd;
+
+        // 12. responses SEQUENCE OF SingleResponse (0x30 = 48)
+        if (p[0] >= tbsEnd) { return resp; }
+        int responsesEnd = Tlv(der, tbsEnd, p, 48);
+        if (responsesEnd < 0) { return resp; }
+
+        // 13. 第一个 SingleResponse ::= SEQUENCE
+        if (p[0] >= responsesEnd) { return resp; }
+        int srEnd = Tlv(der, responsesEnd, p, 48);
+        if (srEnd < 0) { return resp; }
+
+        // 14. certID CertID ::= SEQUENCE
+        int certIdEnd = Tlv(der, srEnd, p, 48);
+        if (certIdEnd < 0) { return resp; }
+        p[0] = certIdEnd; // 跳过 CertID 深入校验
+
+        // 15. certStatus CertStatus
+        if (p[0] >= srEnd) { return resp; }
+        int csTag = der[p[0]] & 255;
+        if (csTag == 128) {
+            // [0] IMPLICIT NULL -> Good
+            int csEnd = Tlv(der, srEnd, p, 128);
+            if (csEnd < 0) { return resp; }
+            resp.certStatus = OcspCertStatus.Good;
+            p[0] = csEnd;
+        } else if (csTag == 129 || csTag == 161) {
+            // [1] IMPLICIT/EXPLICIT RevokedInfo -> Revoked
+            int csEnd = Tlv(der, srEnd, p, csTag);
+            if (csEnd < 0) { return resp; }
+            resp.certStatus = OcspCertStatus.Revoked;
+            // 解析 revocationTime
+            if (p[0] < csEnd) {
+                int revTimeTag = der[p[0]] & 255;
+                if (revTimeTag == 24 || revTimeTag == 23) {
+                    resp.revocationTime = ParseTime(der, csEnd, p);
+                }
+            }
+            p[0] = csEnd;
+        } else if (csTag == 130) {
+            // [2] IMPLICIT NULL -> Unknown
+            int csEnd = Tlv(der, srEnd, p, 130);
+            if (csEnd < 0) { return resp; }
+            resp.certStatus = OcspCertStatus.Unknown;
+            p[0] = csEnd;
+        } else {
+            return resp;
+        }
+
+        // 16. thisUpdate GeneralizedTime / UTCTime
+        if (p[0] < srEnd) {
+            int tuTag = der[p[0]] & 255;
+            if (tuTag == 24 || tuTag == 23) {
+                resp.thisUpdate = ParseTime(der, srEnd, p);
+            }
+        }
+
+        // 17. 可选 nextUpdate [0] EXPLICIT GeneralizedTime (0xA0 = 160)
+        if (p[0] < srEnd && (der[p[0]] & 255) == 160) {
+            int nuExpEnd = Tlv(der, srEnd, p, 160);
+            if (nuExpEnd > 0 && p[0] < nuExpEnd) {
+                int nuTag = der[p[0]] & 255;
+                if (nuTag == 24 || nuTag == 23) {
+                    resp.nextUpdate = ParseTime(der, nuExpEnd, p);
+                }
+            }
+            p[0] = nuExpEnd;
+        }
+
+        return resp;
+    }
+
+    // 辅助工具：生成指定 tag 与载荷的 DER TLV 块
+    public static byte[] MakeTlv(int tag, byte[] val) {
+        int len = val != null ? val.Length : 0;
+        List<int> buf = new List<int>();
+        buf.Add(tag);
+        if (len < 128) {
+            buf.Add(len);
+        } else if (len <= 255) {
+            buf.Add(129);
+            buf.Add(len);
+        } else {
+            buf.Add(130);
+            buf.Add((len >> 8) & 255);
+            buf.Add(len & 255);
+        }
+        if (val != null) {
+            for (int i = 0; i < val.Length; i = i + 1) {
+                buf.Add(val[i] & 255);
+            }
+        }
+        byte[] res = new byte[buf.Count];
+        for (int k = 0; k < buf.Count; k = k + 1) { res[k] = (byte)buf[k]; }
+        return res;
+    }
+
+    // 辅助工具：拼接字节数组列表
+    private static byte[] Concat(List<byte[]> items) {
+        int total = 0;
+        for (int i = 0; i < items.Count; i = i + 1) {
+            if (items[i] != null) { total = total + items[i].Length; }
+        }
+        byte[] res = new byte[total];
+        int off = 0;
+        for (int j = 0; j < items.Count; j = j + 1) {
+            byte[] b = items[j];
+            if (b != null && b.Length > 0) {
+                NativeMemory.Copy((nint)res + (nint)off, (nint)b, b.Length);
+                off = off + b.Length;
+            }
+        }
+        return res;
+    }
+
+    // 构造标准的测试用 OCSP 响应 DER 报文（用于离线与可信测试验证）。
+    public static byte[] BuildMockResponse(int responseStatus, int certStatus) {
+        if (responseStatus != 0) {
+            byte[] errStatus = MakeTlv(10, new byte[] { (byte)responseStatus });
+            return MakeTlv(48, errStatus);
+        }
+
+        // 1. certStatus 载荷
+        byte[] csDer = null;
+        if (certStatus == OcspCertStatus.Good) {
+            csDer = MakeTlv(128, new byte[0]); // [0] IMPLICIT NULL
+        } else if (certStatus == OcspCertStatus.Revoked) {
+            byte[] revTimeDer = MakeTlv(24, "20261106120000Z".ToBytes());
+            csDer = MakeTlv(161, revTimeDer); // [1] EXPLICIT RevokedInfo
+        } else {
+            csDer = MakeTlv(130, new byte[0]); // [2] IMPLICIT NULL
+        }
+
+        // 2. certID 载荷
+        byte[] certIdDer = MakeTlv(48, new byte[] { 2, 1, 1 });
+
+        // 3. thisUpdate
+        byte[] tuDer = MakeTlv(24, "20261106000000Z".ToBytes());
+
+        // 4. SingleResponse
+        List<byte[]> srParts = new List<byte[]>();
+        srParts.Add(certIdDer);
+        srParts.Add(csDer);
+        srParts.Add(tuDer);
+        byte[] srDer = MakeTlv(48, Concat(srParts));
+
+        // 5. responses
+        byte[] responsesDer = MakeTlv(48, srDer);
+
+        // 6. ResponseData
+        byte[] respIdDer = MakeTlv(162, MakeTlv(4, new byte[] { 1, 2, 3, 4 }));
+        byte[] prodDer = MakeTlv(24, "20261106100000Z".ToBytes());
+        List<byte[]> rdParts = new List<byte[]>();
+        rdParts.Add(respIdDer);
+        rdParts.Add(prodDer);
+        rdParts.Add(responsesDer);
+        byte[] rdDer = MakeTlv(48, Concat(rdParts));
+
+        // 7. BasicOCSPResponse
+        byte[] sigAlgDer = MakeTlv(48, new byte[] { 6, 9, 42, 134, 72, 134, 247, 13, 1, 1, 11 });
+        byte[] sigDer = MakeTlv(3, new byte[] { 0, 1, 2, 3 });
+        List<byte[]> basicParts = new List<byte[]>();
+        basicParts.Add(rdDer);
+        basicParts.Add(sigAlgDer);
+        basicParts.Add(sigDer);
+        byte[] basicOcspDer = MakeTlv(48, Concat(basicParts));
+
+        // 8. ResponseBytes
+        byte[] oidDer = MakeTlv(6, new byte[] { 43, 6, 1, 5, 5, 7, 48, 1, 1 });
+        byte[] respOctetDer = MakeTlv(4, basicOcspDer);
+        List<byte[]> rbParts = new List<byte[]>();
+        rbParts.Add(oidDer);
+        rbParts.Add(respOctetDer);
+        byte[] rbSeqDer = MakeTlv(48, Concat(rbParts));
+        byte[] rbExpDer = MakeTlv(160, rbSeqDer);
+
+        // 9. OCSPResponse
+        byte[] statusDer = MakeTlv(10, new byte[] { 0 });
+        List<byte[]> fullParts = new List<byte[]>();
+        fullParts.Add(statusDer);
+        fullParts.Add(rbExpDer);
+        return MakeTlv(48, Concat(fullParts));
+    }
+}
