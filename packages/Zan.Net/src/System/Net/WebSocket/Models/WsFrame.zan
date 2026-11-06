@@ -175,7 +175,17 @@ public class WsFrame {
         }
 
         byte[] mask = RandomNumberGenerator.GetBytes(4);
-        if (mask == null) { mask = new byte[] { 0, 0, 0, 0 }; }
+        if (mask == null) {
+            long seed = Stopwatch.GetTimestamp();
+            mask = new byte[5];
+            mask[0] = (byte)(seed & 255);
+            mask[1] = (byte)((seed >> 8) & 255);
+            mask[2] = (byte)((seed >> 16) & 255);
+            mask[3] = (byte)((seed >> 24) & 255);
+            if (mask[0] == 0 && mask[1] == 0 && mask[2] == 0 && mask[3] == 0) {
+                mask[0] = 1;
+            }
+        }
         for (int m = 0; m < 4; m = m + 1) { buf[pos + m] = mask[m]; }
         pos = pos + 4;
 
@@ -263,6 +273,12 @@ public class WsFrame {
         f.opcode = byte0 & 15;
         f.masked = (byte1 & 128) != 0;
 
+        // RFC 6455 §5.2: RSV 必须为 0，保留 opcode (3..7, 11..15) 必须拒绝
+        if (f.rsv != 0 || (f.opcode >= 3 && f.opcode <= 7) || (f.opcode >= 11 && f.opcode <= 15)) {
+            f.opcode = WsOpcode.Close;
+            return f;
+        }
+
         int payloadLen = byte1 & 127;
         if (f.opcode >= 8) {
             // RFC 6455 §5.5: 所有控制帧（Close/Ping/Pong）载荷不得超过 125 字节，
@@ -277,6 +293,8 @@ public class WsFrame {
         if (payloadLen == 126) {
             if (offset0 + 4 > dataEnd) { f.opcode = WsOpcode.Close; return f; }
             payloadLen = ((data[offset0 + 2] & 255) << 8) + (data[offset0 + 3] & 255);
+            // RFC 6455 §5.2: 规范长度最小化要求，126 扩展编码的载荷长度必须 >= 126
+            if (payloadLen < 126) { f.opcode = WsOpcode.Close; return f; }
             offset = offset0 + 4;
         } else if (payloadLen == 127) {
             if (offset0 + 10 > dataEnd) { f.opcode = WsOpcode.Close; return f; }
@@ -290,7 +308,8 @@ public class WsFrame {
             payloadLen = ((data[offset0 + 6] & 255) << 24) +
                          ((data[offset0 + 7] & 255) << 16) +
                          ((data[offset0 + 8] & 255) << 8) + (data[offset0 + 9] & 255);
-            if (payloadLen < 0) {
+            // RFC 6455 §5.2: 规范长度最小化要求，127 扩展编码的载荷长度必须 > 65535
+            if (payloadLen < 65536) {
                 f.opcode = WsOpcode.Close;
                 return f;
             }

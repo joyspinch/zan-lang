@@ -20,6 +20,10 @@ public class HttpConnectionPool : IDisposable {
     Gate gate;
     bool allowOverflow;
     bool disposed;
+    long statRented;
+    long statReused;
+    long statCreated;
+    long statWaitTimeouts;
 
     public HttpConnectionPool(int maxConnections, int maxIdleConnections, long idleTimeoutMs, long maxLifetimeMs) {
         this.maxConnections = maxConnections > 0 ? maxConnections : 32;
@@ -32,6 +36,10 @@ public class HttpConnectionPool : IDisposable {
         this.gate = new Gate();
         this.allowOverflow = false;
         this.disposed = false;
+        this.statRented = 0;
+        this.statReused = 0;
+        this.statCreated = 0;
+        this.statWaitTimeouts = 0;
     }
 
     public static HttpConnectionPool CreateDefault() {
@@ -84,6 +92,12 @@ public class HttpConnectionPool : IDisposable {
             long elapsed = Stopwatch.GetMilliseconds() - startMs;
             long remain = budget - elapsed;
             if (remain <= 0) {
+                Mutex.Lock(this.mtx);
+                try {
+                    this.statWaitTimeouts = this.statWaitTimeouts + 1;
+                } finally {
+                    Mutex.Unlock(this.mtx);
+                }
                 throw new HttpRequestException("connection pool wait timeout: all "
                     + Convert.ToString(this.maxConnections) + " connections are busy");
             }
@@ -114,6 +128,8 @@ public class HttpConnectionPool : IDisposable {
                     continue;
                 }
                 this.activeCount = this.activeCount + 1;
+                this.statReused = this.statReused + 1;
+                this.statRented = this.statRented + 1;
                 chosen = conn;
                 break;
             }
@@ -133,6 +149,8 @@ public class HttpConnectionPool : IDisposable {
         try {
             if (this.activeCount + this.idleList.Count < this.maxConnections) {
                 this.activeCount = this.activeCount + 1;
+                this.statCreated = this.statCreated + 1;
+                this.statRented = this.statRented + 1;
                 return true;
             }
             return false;
@@ -229,6 +247,30 @@ public class HttpConnectionPool : IDisposable {
         } finally {
             Mutex.Unlock(this.mtx);
         }
+    }
+
+    public long TotalRented() {
+        if (this.mtx == 0) { return this.statRented; }
+        Mutex.Lock(this.mtx);
+        try { return this.statRented; } finally { Mutex.Unlock(this.mtx); }
+    }
+
+    public long TotalReused() {
+        if (this.mtx == 0) { return this.statReused; }
+        Mutex.Lock(this.mtx);
+        try { return this.statReused; } finally { Mutex.Unlock(this.mtx); }
+    }
+
+    public long TotalCreated() {
+        if (this.mtx == 0) { return this.statCreated; }
+        Mutex.Lock(this.mtx);
+        try { return this.statCreated; } finally { Mutex.Unlock(this.mtx); }
+    }
+
+    public long TotalWaitTimeouts() {
+        if (this.mtx == 0) { return this.statWaitTimeouts; }
+        Mutex.Lock(this.mtx);
+        try { return this.statWaitTimeouts; } finally { Mutex.Unlock(this.mtx); }
     }
 
     // 彻底销毁连接池，清理所有存活连接并释放互斥量底层系统句柄
