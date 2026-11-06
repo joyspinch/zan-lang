@@ -16,7 +16,7 @@ Zan.Gui 只做两件事：
 
 凡不服务于这两件事的机制都是历史包袱，按本文路线退役。
 
-## 2. 现状（2026-11-06 审计）
+## 2. 现状（当前实现：2026-11-06 源码审计核实，证据路径见表）
 
 主线是健康的：五个装载入口都汇聚到 `Html.Parse`，绘制管线只有一条路径，
 SelectBox/Input/Button 的外观全部走 CSS（零硬编码颜色）。臃肿集中在下面几处
@@ -38,7 +38,7 @@ SelectBox/Input/Button 的外观全部走 CSS（零硬编码颜色）。臃肿�
 Serialize）→ HTML 时代（标记 + CSS + 绑定）→ 设计器时代（DesignerHtml 方言、
 绝对坐标）→ 工具应用时代（Gallery/设计器养大的即时模式）。
 
-## 3. 目标架构
+## 3. 目标架构（目标设计：依赖 B-ID171～B-ID179，对应阶段落地前本节不为真）
 
 三条规则：**依赖只能向下；Core 不认识任何具体控件；扩展包只经控件注册表挂入，
 各用自己的命名空间。**
@@ -62,7 +62,7 @@ Serialize）→ HTML 时代（标记 + CSS + 绑定）→ 设计器时代（Desi
 - `Gui.Widget`、`Gui.Component`、`Gui.Backend` 不改名：它们本来就是独立命名空间，
   改名只多出约 1,500 处机械改动，不增加任何边界。
 
-## 4. 迁移路线
+## 4. 迁移路线（目标设计）
 
 ### 执行总则
 
@@ -181,8 +181,10 @@ UiDriver 五例。
    定位（不插包装元素，id 与子序不变）；`data-fx/fy/fw/fh` 换算成 absolute 定位；
    代码里的 `.dock = N` 逐处改 CSS。随后删 Dock 引擎（`Core/Dock.zan`、StyleBox 的
    display:0 旧模式、`Control.Layout.zan` 的 dock 分支、仅代码可达的 StackLayout）。
-4. 非设计器文档改纯 CSS：IDE 的 html、examples/html_gallery、测试 html 用脚本改写为
-   class/style；带 `data-zan-design` 的设计器文档暂留方言，由第 3 步兜底。
+4. 设计器文档以外不得使用旧方言：现存 42 个带 `data-dock/fx/span` 的 html 全部是带
+   `data-zan-design` 的设计器文档（含 IDE 30 多个面板、templates/gui、examples/html_gallery、
+   测试夹具），由第 3 步的脱糖兜底，文件改写并入 P8；本步只靠 P0 的机检拦住手写 html
+   新增旧方言。
 
 验证：P0 布局树金标逐个比对（±1px）；`conformance_gui_flex`、
 `conformance_gui_flex_shrink_floor`、`conformance_gui_panel_flex`、
@@ -243,7 +245,8 @@ System.Automation/System.Data）逐个加限定；同一目录不得混放不同
 ### P8 设计器改为产出 CSS（B-ID179，后续）
 
 Zan.Gui.Designer、`Markup/DesignerHtml.zan`、IDE DesignCodeGen 改为直接读写 CSS；
-脚本改写模板的设计文档；删除 P5 第 3 步的脱糖兜底。P5 完成后单独出计划。
+脚本改写全部 42 个设计器文档（IDE 面板、模板、html_gallery、测试夹具）；删除 P5 第 3 步的
+脱糖兜底。P5 完成后单独出计划。
 
 ## 5. 顺序、完成标志与风险
 
@@ -276,3 +279,5 @@ P4 先于 P6（弹层是输入轮询最密的地方）；P7 放最后（没有�
   命名空间并放在最后；`Gui.Widget`/`Gui.Component`/`Gui.Backend` 不改名。
 - 2026-11-06 更正：旧 kind 别名只有 1 个（`HeavyControls.RegisterAlias("Alert",
   "AlertBox")`），审计初稿误记为 34 个。
+- 2026-11-06 更正（P0 机检落地时实测）：带旧布局属性的 42 个 html 全部是设计器文档，
+  IDE 面板也在内。P5 只做运行时脱糖与删除 Dock 引擎，文件改写并入 P8。

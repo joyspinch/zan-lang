@@ -1,11 +1,15 @@
 # GUI / 主题 / 设计器 / HMI 开发速查
 
-## 心智模型：保留模式 Visual Tree 与即时渲染双轨架构
+## 心智模型：HTML+CSS 画界面，Zan 双向绑定
 
-`packages/Zan.Gui/src/Gui` 采用**现代保留模式 Visual Tree 拓扑为核心、辅以即时渲染双轨**架构：
+Zan.Gui 只做两件事（`docs/GUI_ARCHITECTURE.md`）：**用 .html + .css 描述并绘制界面**——
+标签长成保留式控件树；**Zan 数据与界面双向绑定**——HTML 窗口用 `data-bind`，代码侧用
+`Binding<T> data` 字段。应用代码每帧调用 `widget.Render(app, x, y, …)` 的即时模式是历史
+包袱，按 B-ID177 逐步下线，新代码不得新增（pre-commit 棘轮拦截，见
+`docs/WORKSPACE_CONVENTIONS.md` §17 第 5 条）。
 - 控件树（`Control`）具备长生命周期的树状对象图（`parent` 弱引用、`children` 列表、`MeasureTree`、`Arrange` 绝对坐标边界 `bx, by, bw, bh`、`RenderTree` 裁切栈）。
-- 事件分发通过 **Visual Tree 路由分发**（`Tunneling` 隧穿向下 + `Bubbling` 冒泡向上，`RoutedEventArgs` 携带 `originalSource`、`source` 与 `handled` 消费标记，支持指针捕获 `App.CapturePointer`）。
-- 即时模式与动态子元素采用 **作用域 Hash 栈（Scoped ID Hash Stack）** 进行命名空间隔离，完全杜绝硬编码号段魔数。
+- 事件分发的 **Visual Tree 路由分发**（`Tunneling` 隧穿向下 + `Bubbling` 冒泡向上，`RoutedEventArgs` 携带 `originalSource`、`source` 与 `handled` 消费标记，支持指针捕获 `App.CapturePointer`）已经实现，`App.ProcessEvent` 会先走它；但存量控件大多仍在绘制期用 `ClaimClick`/`BlockHitsRect` 轮询输入，按 B-ID177 分批迁到路由事件。
+- 存量即时模式代码用 **作用域 Hash 栈（Scoped ID Hash Stack）** 隔离控件 ID；保留式控件按对象引用识别，不需要 ID，这套机制随即时模式一起退役。
 
 典型应用程序循环（`Gui/App.zan` / `Form.zan`）：
 
@@ -16,12 +20,13 @@ form.Run(); // 自动挂载 rootControl 到 App 并开启事件驱动渲染循�
 
 由此推出几条**必须遵守**的现代架构约定：
 
-1. **事件与输入处理首选 Visual Tree 路由分发**：
+1. **新控件的事件与输入处理走 Visual Tree 路由分发**：
    - 控件重写 `OnRoutedEvent(RoutedEventArgs e)` 或 `OnPreviewRoutedEvent(RoutedEventArgs e)` 处理事件；
    - 消费事件时显式调用 `e.Handle()`，冒泡派发自动终止；
    - 拖拽手势（分割条、滑块、窗口移动）在按下时调用 `app.CapturePointer(this)`，释放时调用 `app.ReleasePointerCapture()`，后续位移与抬键直接定向派发，无需各处手动打脏标记。
+   - 不要在新代码里新增 `app.ClaimClick` / `BlockHitsRect` 等即时模式仲裁调用（机检拦截）。
 
-2. **杜绝硬编码号段魔数，动态/即时组件统一使用作用域 Hash 栈（Scoped ID Stack）**：
+2. **存量即时模式代码杜绝硬编码号段魔数，统一使用作用域 Hash 栈（Scoped ID Stack）**：
    - **严禁**使用 `WidgetId.SetSeq(850000)` 等魔数号段（已彻底废除，跨实例必冲突踩踏）；
    - 需局部隔离 ID 空间或循环派生项时，统一使用：
      ```zan
@@ -31,9 +36,12 @@ form.Run(); // 自动挂载 rootControl 到 App 并开启事件驱动渲染循�
      ```
    - 栈式 Hash 自动结合父级 Hash 生成均匀分布的高位隔离 ID，天然支持无限层级嵌套与同类组件同屏多实例。
 
-3. **状态响应式绑定**，推荐使用 `Signal<T>` / `SignalInt` / `Input` 等承载（`Gui/Reactive.zan`、
-   `Widget/Input.zan`）或通过 `ModelBinder` 双向绑定，控件负责视觉呈现与交互映射。
-3. **UI 线程专职渲染与交互，一切耗时业务/IO/计算完全异步解耦非阻塞（开发基本铁律）**：
+3. **数据绑定只有两条正道**：HTML 窗口用 `data-bind`（ModelBinder 自动双向同步，
+   `<template data-for>` 展开列表行）；代码侧用控件的 `Binding<T> data` 字段
+   （如 `sel.data = form.color;`，`docs/STDLIB_COMPONENT_STANDARDS.md` §6）。设计器、
+   PropertyGrid 这类动态宿主走 `GetProp/SetProp` 属性协议。`Signal*` 只作控件内部
+   状态缓冲，Zan.Gui 以外不得新建（机检拦截）。
+4. **UI 线程专职渲染与交互，一切耗时业务/IO/计算完全异步解耦非阻塞（开发基本铁律）**：
    - **职责边界**：UI 线程（主线程事件循环）有且仅有两项职责：分发操作系统输入事件（按键/鼠标/焦点/窗口尺寸）与推进界面排版绘制（Layout/Paint/Present）。任何单次超过 1~2ms 的操作严禁在 UI 线程执行。
    - **严禁同步阻塞反模式**：严禁在 UI 线程直接执行网络请求（HTTP/WebSocket）、磁盘文件大读写、数据库存取、大 JSON 解析、图像编解码、压缩解压、重 CPU 矩阵/分词计算或同步 `Sleep`。同步阻塞是造成界面掉帧、卡顿、甚至触发系统“未响应”白屏的万恶之源。
    - **标准异步解耦定式（Worker + App.Post）**：
@@ -58,7 +66,7 @@ form.Run(); // 自动挂载 rootControl 到 App 并开启事件驱动渲染循�
      });
      ```
    - **生命周期与取消协同**：后台任务必须支持协作取消（`CancellationToken` 或 atomic 标志），在窗口关闭或前序操作作废时停止后续回传，杜绝后台游离任务向已销毁控件回调导致的空引用或野指针异常。
-4. 尺寸一律走 `app.Scale(n)` 做 DPI 缩放，不要写死像素。
+5. 尺寸一律走 `app.Scale(n)` 做 DPI 缩放，不要写死像素。
 
 ## Theme token（`packages/Zan.Gui/src/Gui/Styling/Theme.zan`）
 

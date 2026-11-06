@@ -34,7 +34,7 @@
   - Win32Shell.zan (3085行) -> Imports/Icon/WndProc/Present/Window/Events 6切面 (commit 7eacc4d57)
   - CodeEditor.Completion.zan (2826行) -> Match/Refs/Members/Project/Fixup 5切面 (commit 250e62ba7)
   所有新拆出文件严格 ≤ 1200 行门禁，conformance/gui 测试全绿通过。
-- [~] B-ID171 GUI 分层重构 P0 安全网与护栏（`docs/GUI_ARCHITECTURE.md` §4，后续 B-ID172～179 同）：① 计划落盘（立项即落）；② 补注册未登记 GUI 用例 + 布局树金标用例（P5 等价门）〔串行前置：批次 0 在飞 CMakeLists.txt〕；③ `scripts/check_code_standards.py` 层级棘轮 + 基线；④ 清死 using（Core 23、Widget 7；在飞的 Control.zan/ChildWindow.zan 顺延）与文档漂移（zan.pkg、README、agent-kb、gui-design skill）。
+- [~] B-ID171 GUI 分层重构 P0 安全网与护栏（`docs/GUI_ARCHITECTURE.md` §4，后续 B-ID172～179 同）：① 计划落盘（立项即落）；② 补注册未登记 GUI 用例 + 布局树金标用例（P5 等价门）〔串行前置：批次 0 在飞 CMakeLists.txt〕；③ `scripts/check_code_standards.py` 层级棘轮 + 基线（已落 eb289a6bd）；④ 清死 using（Core 23、Widget 7；在飞的 Control.zan/ChildWindow.zan 顺延）与文档漂移（zan.pkg、README、agent-kb、gui-design skill）。
 - [ ] B-ID172 GUI 分层重构 P1 断包环、按目标层摆目录：① HMI 注册移入 Zan.Industrial `HmiBootstrap`，ControlBootstrap 删 `using Gui.Hmi`；② 新建 Forms/Binding/Testing 目录、基元移到 src/Gui 根（命名空间不变）〔串行前置：批次 0 在飞 ChildWindow/DocWire/ModelBinder/UiDriver〕；③ ControlBootstrap 移入 Widget/。
 
 ### 批次 3 · 有前置（前置闭了再领）
@@ -43,9 +43,9 @@
 - [ ] B-ID173〔前置 B-ID172〕GUI 分层重构 P2 绑定收敛：PropSpec 标默认绑定属性、ModelBinder 删 10 处 `is X` 特判；模型游标接口统一 POCO/JsonValue/JsonDoc/字典取值；ChildWindow 绑定泵并入 ModelHosts；IDE 里当应用状态用的 Signal 改字段 + `Binding<T>`。
 - [ ] B-ID174〔前置 B-ID172〕GUI 分层重构 P3 拆 App：颜色计算、BackdropPainter、DamageTracker、FrameLoop、WindowHost、HtmlLoader、InputArbiter、OverlayHost 骨架逐项抽出，目标 App.zan < 1000 行（承接 B-ID170 ① 的 App.zan 部分）。
 - [ ] B-ID175〔前置 B-ID174〕GUI 分层重构 P4 统一浮层：OverlayHost 分层结算命中与原生遮挡；OverlayPopup 下沉 Widget；SelectBox/DatePicker/ColorPicker/Popover/菜单改用共享件；模态合一。
-- [ ] B-ID176〔前置 B-ID171 ②〕GUI 分层重构 P5 布局方言退役：删 Serialize.zan 与 Alert 别名；补齐 CSS grid/absolute；解析期脱糖 data-dock/data-fx 后删 Dock 引擎；非设计器 html 改纯 CSS。
+- [ ] B-ID176〔前置 B-ID171 ②〕GUI 分层重构 P5 布局方言退役：删 Serialize.zan 与 Alert 别名；补齐 CSS grid/absolute；解析期脱糖 data-dock/data-fx 后删 Dock 引擎（带旧属性的 42 个 html 全是设计器文档，文件改写并入 B-ID179）。
 - [ ] B-ID177〔前置 B-ID175〕GUI 分层重构 P6 即时模式下线：路由事件转正 → 控件分批改事件驱动 → 514 处调用方迁移（设计器预览离屏、gui_gallery 并入 html_gallery 等）→ 删 `Render(App` 入口与 InputArbiter。
-- [ ] B-ID179〔前置 B-ID176〕GUI 分层重构 P8 设计器改产出 CSS，删 P5 脱糖兜底（P5 完成后单独出计划）。
+- [ ] B-ID179〔前置 B-ID176〕GUI 分层重构 P8 设计器改产出 CSS，脚本改写 42 个设计器文档（含 IDE 面板），删 P5 脱糖兜底（P5 完成后单独出计划）。
 
 ### 批次 4 · 大工程 / 独占窗口（无其他 irgen/runtime 改动在飞时领）
 
