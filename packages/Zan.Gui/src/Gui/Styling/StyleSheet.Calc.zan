@@ -1,0 +1,484 @@
+using System;
+using System.Collections.Generic;
+using Gui;
+
+namespace Gui;
+
+public partial class StyleSheet {
+    // token 读作数字时返回 true（可选符号、十进制、带
+    // px/ms/s/%/deg 等单位后缀），而非关键字或颜色。
+    static bool IsNumeric(string tok) {
+        string s = StyleSheet.Trim(tok);
+        int len = s.Length;
+        if (len == 0) { return false; }
+        int b0 = s[0] & 255;
+        if (b0 == 45 || b0 == 43 || b0 == 46) {
+            if (len < 2) { return false; }
+            int b1 = s[1] & 255;
+            return b1 >= 48 && b1 <= 57;
+        }
+        return b0 >= 48 && b0 <= 57;
+    }
+
+    // 将 CSS 长度/数字转为 int：感知符号、容忍单位（`12px`、`-4`、
+    // `1.5rem` -> 1、`200ms`），非数字 token 返回 0。
+    static int Num(string val) {
+        string s = StyleSheet.Trim(val);
+        int len = s.Length;
+        if (len == 0) { return 0; }
+        int sign = 1;
+        int i = 0;
+        int b0 = s[0] & 255;
+        if (b0 == 45) { sign = -1; i = 1; }
+        else if (b0 == 43) { i = 1; }
+        int acc = 0;
+        bool any = false;
+        while (i < len) {
+            int b = s[i] & 255;
+            if (b >= 48 && b <= 57) {
+                acc = acc * 10 + (b - 48);
+                any = true;
+                i = i + 1;
+            } else {
+                break;
+            }
+        }
+        if (!any) { return 0; }
+        return sign * acc;
+    }
+
+    // 比例转千分数：`1` / `1.0` -> 1000、`0.5` -> 500、`60%` -> 600、
+    // `255`（alpha 通道）由调用方保持 255 比例。
+    static int Perm(string val) {
+        string s = StyleSheet.Trim(val);
+        if (s.Length == 0) { return 1000; }
+        if (StyleSheet.IndexOf(s, "%") >= 0) {
+            return StyleSheet.Num(s) * 10;
+        }
+        int dot = StyleSheet.IndexOf(s, ".");
+        if (dot < 0) {
+            int n = StyleSheet.Num(s);
+            if (n <= 1) { return n * 1000; }
+            return n;
+        }
+        int whole = StyleSheet.Num(s.Substring(0, dot));
+        string fracStr = s.Substring(dot + 1, s.Length - dot - 1);
+        int frac = 0;
+        int scale = 100;
+        int i = 0;
+        while (i < fracStr.Length && i < 3) {
+            string ch = fracStr.Substring(i, 1);
+            if (!StyleSheet.Digit(ch)) { i = fracStr.Length; }
+            else {
+                frac = frac + StyleSheet.HexDigit(ch) * scale;
+                scale = scale / 10;
+                i = i + 1;
+            }
+        }
+        int sign = 1;
+        if (whole < 0) { sign = -1; whole = -whole; }
+        return sign * (whole * 1000 + frac);
+    }
+
+    // CSS 时长（毫秒）：`200`、`200ms`、`0.25s`。
+    static int Ms(string val) {
+        string s = StyleSheet.Trim(val);
+        if (StyleSheet.IndexOf(StyleSheet.Lower(s), "ms") >= 0) {
+            return StyleSheet.Num(s);
+        }
+        if (StyleSheet.IndexOf(StyleSheet.Lower(s), "s") >= 0) {
+            return StyleSheet.Perm(s);
+        }
+        return StyleSheet.Num(s);
+    }
+
+    // ---- 长度与数学（calc 家族）---------------------------------------------
+
+    // CSS 长度求值，返回 px 整数。单位：px/无单位照旧；em 相对当前
+    // 有效字号（解析级联里已声明的 font-size，未声明时主题正文）；
+    // rem 相对根字号；ex/ch 近似半高（0.5em）；pt 按 96dpi 折算；
+    // vw/vh/vmin/vmax 相对窗口逻辑尺寸；`%` 保持各属性原有语义
+    // （这里当裸数字返回，声明点的百分比分支不受影响）。
+    // calc()/min()/max()/clamp() 递归求值（见 CssMath）。
+    static int Len(StyleBox b, string val) {
+        string v = StyleSheet.Trim(val);
+        b.lengthPhysical = false;
+        if (v == "") { return 0; }
+        bool previousMath = b.lengthMath;
+        b.lengthMath = StyleSheet.HasMath(v);
+        int n = b.lengthMath ? StyleSheet.CssMath(b, v) : StyleSheet.UnitPx(b, v);
+        b.lengthMath = previousMath;
+        return n;
+    }
+
+    // 每个赋值点记录自身结果的量纲，简写的其他分量不受影响。
+    static int LenField(StyleBox b, string val, long source) {
+        bool previous = b.lengthDevice;
+        b.lengthDevice = true;
+        int n = StyleSheet.Len(b, val);
+        b.lengthDevice = previous;
+        b.SetPrescaled(source, b.lengthPhysical);
+        return n;
+    }
+
+    static int LenStored(StyleBox b, string val, long source) {
+        bool previous = b.lengthDevice;
+        // 表达式先统一量纲再运算；普通阴影/blur 字面量仍留到绘制缩放。
+        b.lengthDevice = StyleSheet.HasMath(val);
+        int n = StyleSheet.Len(b, val);
+        b.lengthDevice = previous;
+        b.SetPrescaled(source, b.lengthPhysical);
+        return n;
+    }
+
+    static int UnitResult(StyleBox b, int n, bool physical) {
+        if (physical) { b.lengthPhysical = true; return n; }
+        if (b.lengthDevice && b.envDpiScale != 100) {
+            b.lengthPhysical = true;
+            return b.ScaleLogical(n);
+        }
+        return n;
+    }
+
+    static int FontUnit(StyleBox b, bool root) {
+        bool useFont = !root && b.fontPx > 0;
+        int rootFont = b.envRootFontPx > 0 ? b.envRootFontPx : b.envRemPx;
+        int f = useFont ? b.fontPx : (rootFont > 0 ? rootFont : 16);
+        bool physical = useFont ? b.IsPrescaled(StyleBox.SourceFont()) : b.envRemPhysical;
+        if (b.lengthDevice && !physical && b.envDpiScale != 100) {
+            f = b.ScaleLogical(f);
+            physical = true;
+        }
+        if (physical) { b.lengthPhysical = true; }
+        return f;
+    }
+
+    // 值里是否带数学函数（calc/min/max/clamp）。
+    static bool HasMath(string v) {
+        string s = StyleSheet.Lower(v);
+        return Css.IndexFrom(s, "calc(", 0) >= 0
+            || Css.IndexFrom(s, "min(", 0) >= 0
+            || Css.IndexFrom(s, "max(", 0) >= 0
+            || Css.IndexFrom(s, "clamp(", 0) >= 0;
+    }
+
+    // 千分比转 px 的四舍五入。
+    static int Round1000(int perm) {
+        if (perm >= 0) { return (perm + 500) / 1000; }
+        return 0 - ((0 - perm + 500) / 1000);
+    }
+
+    // 数字文本 -> 千分比整数：`12` -> 12000、`1.5` -> 1500、
+    // `.5` -> 500、`-2` -> -2000。（不能复用 Perm：它对无小数点的
+    // 整数按原样返回——那是 alpha 通道的语义，不是长度。）
+    // 纯字符与直接整数累加解析，零堆分配与零子串开销。
+    static int NumPerm(string numStr) {
+        if (numStr == null) { return 0; }
+        int len = numStr.Length;
+        if (len == 0) { return 0; }
+        int sign = 1;
+        int i = 0;
+        int b0 = numStr[0] & 255;
+        if (b0 == 45) {
+            sign = -1;
+            i = 1;
+        } else if (b0 == 43) {
+            i = 1;
+        }
+        int whole = 0;
+        while (i < len) {
+            int b = numStr[i] & 255;
+            if (b >= 48 && b <= 57) {
+                whole = whole * 10 + (b - 48);
+                i = i + 1;
+            } else {
+                break;
+            }
+        }
+        int frac = 0;
+        if (i < len && (numStr[i] & 255) == 46) {
+            i = i + 1;
+            if (i < len) {
+                int b1 = numStr[i] & 255;
+                if (b1 >= 48 && b1 <= 57) {
+                    frac = frac + (b1 - 48) * 100;
+                    i = i + 1;
+                    if (i < len) {
+                        int b2 = numStr[i] & 255;
+                        if (b2 >= 48 && b2 <= 57) {
+                            frac = frac + (b2 - 48) * 10;
+                            i = i + 1;
+                            if (i < len) {
+                                int b3 = numStr[i] & 255;
+                                if (b3 >= 48 && b3 <= 57) {
+                                    frac = frac + (b3 - 48);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        return sign * (whole * 1000 + frac);
+    }
+
+    // 单个"数字+单位"记号 -> px 整数。未知单位按裸数字处理
+    // （ValueUnresolved 仍会点名），空数字回退 Num。
+    static int UnitPx(StyleBox b, string tok) {
+        string s = StyleSheet.Trim(tok);
+        int len = s.Length;
+        if (len == 0) { return 0; }
+        int i = 0;
+        int b0 = s[0] & 255;
+        if (b0 == 45 || b0 == 43) { i = 1; }
+        while (i < len) {
+            int ch = s[i] & 255;
+            if ((ch >= 48 && ch <= 57) || ch == 46) { i = i + 1; }
+            else { break; }
+        }
+        string numStr = s.Substring(0, i);
+        string unit = StyleSheet.Lower(s.Substring(i, len - i));
+        if (numStr == "" || numStr == "-" || numStr == "+") {
+            return StyleSheet.Num(s);
+        }
+        int perm = StyleSheet.NumPerm(numStr);
+        int n = StyleSheet.Round1000(perm);
+        if (unit == "dpx" || b.declPrescaled) {
+            return StyleSheet.UnitResult(b, n, true);
+        }
+        // calc 的无单位乘除因子不能跟着长度一起缩放。
+        if (unit == "" && b.lengthMath) { return n; }
+        if (unit == "" || unit == "px") { return StyleSheet.UnitResult(b, n, false); }
+        if (unit == "em" || unit == "rem" || unit == "ex" || unit == "ch") {
+            int font = StyleSheet.FontUnit(b, unit == "rem");
+            if (unit == "ex" || unit == "ch") { return StyleSheet.Round1000(perm * font / 2); }
+            return StyleSheet.Round1000(perm * font);
+        }
+        if (unit == "pt") { n = StyleSheet.Round1000(perm * 4 / 3); }
+        else if (unit == "pc") { n = StyleSheet.Round1000(perm * 16); }
+        else if (unit == "in") { n = StyleSheet.Round1000(perm * 96); }
+        else if (unit == "cm") { n = StyleSheet.Round1000(perm * 37795 / 1000); }
+        else if (unit == "mm") { n = StyleSheet.Round1000(perm * 37795 / 10000); }
+        else if (unit == "q") { n = StyleSheet.Round1000(perm * 37795 / 40000); }
+        else if (unit == "vw") {
+            int w = b.envVw > 0 ? b.envVw : 1280;
+            n = StyleSheet.Round1000(perm * w / 100);
+        } else if (unit == "vh") {
+            int h = b.envVh > 0 ? b.envVh : 720;
+            n = StyleSheet.Round1000(perm * h / 100);
+        } else if (unit == "vmin" || unit == "vmax") {
+            int w2 = b.envVw > 0 ? b.envVw : 1280;
+            int h2 = b.envVh > 0 ? b.envVh : 720;
+            int base2 = unit == "vmin" ? (w2 < h2 ? w2 : h2) : (w2 > h2 ? w2 : h2);
+            n = StyleSheet.Round1000(perm * base2 / 100);
+        } else if (unit == "%") {
+            // width/basis 百分比、line-height 倍数仍交给声明点和布局。
+            return n;
+        }
+        return StyleSheet.UnitResult(b, n, false);
+    }
+
+    // calc()/min()/max()/clamp() 求值（可嵌套）。叶子单位在 UnitPx
+    // 折算成 px；`%` 在表达式里按视口宽近似——容器宽度在样式解析期
+    // （布局之前）不可得，视口是稳定的基准，Lint/审计文档有说明。
+    static int CssMath(StyleBox b, string val) {
+        string v = StyleSheet.Trim(val);
+        string lo = StyleSheet.Lower(v);
+        if (StyleSheet.StartsWith(lo, "clamp(")) {
+            int open = StyleSheet.IndexOf(v, "(");
+            int close = v.Length - 1;
+            while (close > open && v.Substring(close, 1) != ")") { close = close - 1; }
+            List<string> a = Css.SplitTopTrim(
+                v.Substring(open + 1, close - open - 1), ",");
+            if (a.Count < 3) { return 0; }
+            int mn = StyleSheet.CssMath(b, a[0]);
+            int mid = StyleSheet.CssMath(b, a[1]);
+            int mx = StyleSheet.CssMath(b, a[2]);
+            return mn > mx ? mn : (mid < mn ? mn : (mid > mx ? mx : mid));
+        }
+        if (StyleSheet.StartsWith(lo, "min(") || StyleSheet.StartsWith(lo, "max(")) {
+            bool isMin = StyleSheet.StartsWith(lo, "min(");
+            int open2 = StyleSheet.IndexOf(v, "(");
+            int close2 = v.Length - 1;
+            while (close2 > open2 && v.Substring(close2, 1) != ")") { close2 = close2 - 1; }
+            List<string> a2 = Css.SplitTopTrim(
+                v.Substring(open2 + 1, close2 - open2 - 1), ",");
+            if (a2.Count == 0) { return 0; }
+            int best = StyleSheet.CssMath(b, a2[0]);
+            for (int i = 1; i < a2.Count; i = i + 1) {
+                int cur = StyleSheet.CssMath(b, a2[i]);
+                if (isMin ? cur < best : cur > best) { best = cur; }
+            }
+            return best;
+        }
+        // calc(...) 或裸表达式（min/max 的参数可以是 `10px + 2em`）。
+        int op = Css.IndexFrom(lo, "calc(", 0);
+        string expr = op >= 0
+            ? v.Substring(op + 5, v.Length - op - 5) : v;
+        int endI = expr.Length - 1;
+        while (endI >= 0 && expr.Substring(endI, 1) != ")") { endI = endI - 1; }
+        if (endI >= 0 && op >= 0) { expr = expr.Substring(0, endI); }
+        List<string> toks = StyleSheet.MathTokens(expr);
+        MathCursor cur2 = new MathCursor();
+        cur2.toks = toks;
+        cur2.pos = 0;
+        int val2 = StyleSheet.MathExpr(b, cur2);
+        return val2;
+    }
+
+    // 表达式 token 化：数字+单位、运算符、括号；空白跳过。
+    static List<string> MathTokens(string s) {
+        List<string> outp = new List<string>();
+        int i = 0;
+        while (i < s.Length) {
+            string ch = s.Substring(i, 1);
+            if (Css.Space(ch)) { i = i + 1; continue; }
+            if (ch == "(" || ch == ")" || ch == "+" || ch == "-"
+                || ch == "*" || ch == "/") {
+                outp.Add(ch);
+                i = i + 1;
+                continue;
+            }
+            int st = i;
+            while (i < s.Length) {
+                string c2 = s.Substring(i, 1);
+                if (Css.Space(c2) || c2 == "(" || c2 == ")" || c2 == "+"
+                    || c2 == "-" || c2 == "*" || c2 == "/") {
+                    break;
+                }
+                i = i + 1;
+            }
+            outp.Add(s.Substring(st, i - st));
+        }
+        return outp;
+    }
+
+    // 加减层：term (('+'|'-') term)*。
+    static int MathExpr(StyleBox b, MathCursor c) {
+        int v = StyleSheet.MathTerm(b, c);
+        while (c.pos < c.toks.Count) {
+            string op = c.toks[c.pos];
+            if (op != "+" && op != "-") { break; }
+            c.pos = c.pos + 1;
+            int r = StyleSheet.MathTerm(b, c);
+            v = op == "+" ? v + r : v - r;
+        }
+        return v;
+    }
+
+    // 乘除层：factor (('*'|'/') factor)*。除零按 0（坏表达式不炸）。
+    static int MathTerm(StyleBox b, MathCursor c) {
+        int v = StyleSheet.MathFactor(b, c);
+        while (c.pos < c.toks.Count) {
+            string op = c.toks[c.pos];
+            if (op != "*" && op != "/") { break; }
+            c.pos = c.pos + 1;
+            int r = StyleSheet.MathFactor(b, c);
+            if (op == "*") { v = v * r; }
+            else { v = r == 0 ? 0 : v / r; }
+        }
+        return v;
+    }
+
+    // 因子层：括号表达式 / 一元符号 / 数字+单位。
+    static int MathFactor(StyleBox b, MathCursor c) {
+        if (c.pos >= c.toks.Count) { return 0; }
+        string tok = c.toks[c.pos];
+        if (tok == "(") {
+            c.pos = c.pos + 1;
+            int v = StyleSheet.MathExpr(b, c);
+            if (c.pos < c.toks.Count && c.toks[c.pos] == ")") { c.pos = c.pos + 1; }
+            return v;
+        }
+        if (tok == "-") {
+            c.pos = c.pos + 1;
+            return 0 - StyleSheet.MathFactor(b, c);
+        }
+        if (tok == "+") {
+            c.pos = c.pos + 1;
+            return StyleSheet.MathFactor(b, c);
+        }
+        c.pos = c.pos + 1;
+        return StyleSheet.UnitPx(b, tok);
+    }
+
+    // 值转整数（透传 Num 解析）。
+    static int ParseInt(string s) {
+        return StyleSheet.Num(s);
+    }
+
+    // 将值按空白拆分为 token，保持 `fn(a, b)`
+    // 分组完整，使 `rgba(0,0,0,.4)` 作为一个 token 保留。
+    static List<string> Tokens(string val) {
+        List<string> outp = new List<string>();
+        string cur = "";
+        int depth = 0;
+        int i = 0;
+        while (i < val.Length) {
+            string ch = val.Substring(i, 1);
+            i = i + 1;
+            if (ch == "(") { depth = depth + 1; cur = cur + ch; continue; }
+            if (ch == ")") { depth = depth - 1; cur = cur + ch; continue; }
+            if (depth == 0 && Css.Space(ch)) {
+                if (cur != "") { outp.Add(cur); }
+                cur = "";
+                continue;
+            }
+            cur = cur + ch;
+        }
+        if (cur != "") { outp.Add(cur); }
+        return outp;
+    }
+
+    // s 是否以 prefix 开头。
+    static bool StartsWith(string s, string prefix) {
+        if (s == null || prefix == null) { return false; }
+        return s.StartsWith(prefix);
+    }
+
+    // 子串首次出现位置（无则 -1，转发 Css.IndexFrom）。
+    static int IndexOf(string s, string ch) {
+        return Css.IndexFrom(s, ch, 0);
+    }
+
+    // s 是否以 suffix 结尾。
+    static bool EndsWith(string s, string suffix) {
+        if (s == null || suffix == null) { return false; }
+        return s.EndsWith(suffix);
+    }
+
+    // 单字符查找（`ch` 只取首字符）。
+    static int LastIndexOf(string s, string ch) {
+        if (s == null || ch == null) { return -1; }
+        return s.LastIndexOf(ch);
+    }
+
+    // 转小写（属性名/关键字匹配用）。
+    static string Lower(string s) {
+        return s.ToLower();
+    }
+
+    // 转发 Css.Trim（去两端空白）。
+    static string Trim(string s) {
+        return Css.Trim(s);
+    }
+
+    // 把停靠名（`top`/`bottom`/`left`/`right`/`fill`）解析为
+    // Dock 常量。供样式表 / JSON 文档共用。
+    static int DockValue(string text) {
+        if (text == "top" || text == "Top") { return Dock.Top(); }
+        if (text == "bottom" || text == "Bottom") { return Dock.Bottom(); }
+        if (text == "left" || text == "Left") { return Dock.Left(); }
+        if (text == "right" || text == "Right") { return Dock.Right(); }
+        if (text == "fill" || text == "Fill") { return Dock.Fill(); }
+        return Dock.Manual();
+    }
+
+    // 把标量 JSON 值渲染为 SetProp 期望的文本。
+    static string Scalar(JsonValue v) {
+        if (v.IsString()) { return v.AsString(""); }
+        if (v.IsNumber()) { return v.AsString(""); }
+        if (v.IsBool()) { if (v.AsBool(false)) { return "true"; } return "false"; }
+        return "";
+    }
+}

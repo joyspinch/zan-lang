@@ -1,0 +1,360 @@
+using System;
+using System.Collections.Generic;
+using Gui;
+
+namespace Gui;
+
+public partial class StyleSheet {
+    // 把这张样式表里"写了但没生效"的部分整理成可读报告：
+    // * 被跳过的 at-rule（`@media` 等）——引擎没有媒体查询；
+    // * 选择器含组合同器/伪元素而被丢弃的规则——引擎的选择器模型
+    // 只有 `type.class#id::part:state`，没有祖先链；
+    // * 声明全部不被 Decl 消费的规则（`float`、`text-shadow` 之类
+    // 拼错或未实现的属性）。
+    // 返回空列表表示这张表里的每一条都真的会生效。皮肤调试时
+    // 调一次就能把"改了没反应"从猜测变成清单；正常渲染路径不
+    // 调用它，因此不影响开销。
+    List<string> Lint() {
+        List<string> outR = new List<string>();
+        if (rules == null) { return outR; }
+        this.Index();
+        this.CollectLint();
+        if (atRulesDropped > 0) {
+            outR.Add("dropped " + Convert.ToString(atRulesDropped)
+                     + " at-rule block(s): " + StyleSheet.AtRuleSummary(atRuleKinds)
+                     + " are not supported");
+        }
+        if (atGuardsSkipped > 0) {
+            outR.Add("skipped " + Convert.ToString(atGuardsSkipped)
+                     + " @supports block(s), guard false on this engine: "
+                     + StyleSheet.GuardSummary(atRuleGuards));
+        }
+        for (int i = 0; i < lintDropped.Count; i = i + 1) {
+            outR.Add("selector not modelled, rule ignored: " + lintDropped[i]);
+        }
+        for (int n = 0; n < lintNever.Count; n = n + 1) {
+            outR.Add("selector can never match: " + lintNever[n]);
+        }
+        for (int v = 0; v < lintValue.Count; v = v + 1) {
+            outR.Add("value unit not resolved, used as a bare number: "
+                     + lintValue[v]);
+        }
+        for (int j = 0; j < lintUnused.Count; j = j + 1) {
+            outR.Add("no declaration consumed by the engine: " + lintUnused[j]);
+        }
+        for (int m = 0; m < lintInert.Count; m = m + 1) {
+            outR.Add("accepted but has no effect here: " + lintInert[m]);
+        }
+        int relCount = 0;
+        if (ruleEntries != null) {
+            for (int r = 0; r < ruleEntries.Count; r = r + 1) {
+                if (ruleEntries[r].selector.Relational()) { relCount = relCount + 1; }
+            }
+        }
+        if (relCount > 0) {
+            outR.Add(Convert.ToString(relCount)
+                     + " relational selector(s) (combinator/structural) match"
+                     + " only inside a retained control tree");
+        }
+        return outR;
+    }
+
+    // 填充 lintDropped / lintUnused（按 rules 代次缓存，Lint 连调免费）。
+    void CollectLint() {
+        if (lintGen == rules.Count()) { return; }
+        lintDropped = new List<string>();
+        lintUnused = new List<string>();
+        lintInert = new List<string>();
+        lintNever = new List<string>();
+        lintValue = new List<string>();
+        // 未能进入选择器索引的规则 = Selector.Parse 返回 null 的那些。
+        // 用一张名字集合反查缺了谁；同时留一份选择器对象，好把"永不匹配"的规则连同原因报出来。
+        Dict<string, Selector> indexed = new Dict<string, Selector>();
+        if (ruleEntries != null) {
+            for (int s = 0; s < ruleEntries.Count; s = s + 1) {
+                if (!indexed.ContainsKey(ruleEntries[s].text)) {
+                    indexed.Add(ruleEntries[s].text, ruleEntries[s].selector);
+                }
+            }
+        }
+        for (int i = 0; i < rules.Count(); i = i + 1) {
+            string sel = rules.KeyAt(i);
+            Selector parsed = null;
+            bool hasParsed = indexed.TryGetValue(sel, out parsed);
+            if (!hasParsed) {
+                lintDropped.Add(sel);
+                continue;
+            }
+            if (parsed != null && parsed.never) {
+                lintNever.Add(sel + "  [never: " + parsed.why + "]");
+            }
+            JsonValue blk = rules.ValAt(i);
+            if (blk == null || !blk.IsObject()) { continue; }
+            int consumed = 0;
+            List<string> inert = new List<string>();
+            for (int k = 0; k < blk.Count(); k = k + 1) {
+                string key = blk.KeyAt(k);
+                if (StyleSheet.InternalKey(key)) { continue; }
+                if (StyleSheet.Known(key)) {
+                    consumed = consumed + 1;
+                    if (StyleSheet.ValueUnresolved(key, StyleSheet.ValStr(blk.ValAt(k)))) {
+                        lintValue.Add(sel + "  [" + key + ": "
+                                      + StyleSheet.ValStr(blk.ValAt(k)) + "]");
+                    }
+                } else if (StyleSheet.Inert(key)) { inert.Add(key); }
+            }
+            if (consumed == 0 && inert.Count == 0) { lintUnused.Add(sel); }
+            if (inert.Count > 0) {
+                lintInert.Add(sel + "  [inert: "
+                              + string.Join(", ", inert) + "]");
+            }
+        }
+        lintGen = rules.Count();
+    }
+
+    // 属性名是否被 Decl 消费（用一次性探针盒判定，与真实的
+    // 派发走同一条路径，因此新增属性不会和这份清单脱节）。
+    // 会改到盒子的探针无妨：盒子是新建的，用完即弃。
+    static bool Known(string key) {
+        if (key == "" || (key[0] & 255) == 95) { return false; }
+        if (StyleSheet.Inert(key)) { return false; }
+        StyleBox probe = new StyleBox();
+        return StyleSheet.Decl(probe, key, "1");
+    }
+
+    // `@supports (prop: value)` 的声明测试：引擎认得这条声明即为真。
+    // 用与真实派发同一条路，所以"支持什么"不会和实现脱节。
+    static bool SupportsDecl(string prop, string val) {
+        string p = StyleSheet.StripVendor(StyleSheet.Lower(StyleSheet.Trim(prop)));
+        if (p == "" || val == "") { return false; }
+        if (p.Length > 2 && (p[0] & 255) == 45 && (p[1] & 255) == 45) { return true; }
+        if (!StyleSheet.GuardValueKnown(p, val)) { return false; }
+        StyleBox probe = new StyleBox();
+        return StyleSheet.Decl(probe, p, val);
+    }
+
+    // `@supports` 的值级校验。DeclLayout/DeclText 里有一批属性对未知取值
+    // 静默回落到默认值（`display: grid` 变 block、`position: sticky` 变
+    // static），若只看"属性认得"就会把假守卫判真：作者写
+    // `@supports (display: grid) { .g { display: grid } }` 的本意是"不支持
+    // 就用前面的 flex 兜底"，误判真反而把兜底覆盖成 block 布局。故这些
+    // 属性按 Decl 里的取值表逐值核对；表外属性不做值级判断（保守回退）。
+    // 取值表与 DeclLayout/DeclText 同步维护，只影响守卫判断的方向
+    // （表漏了只会让守卫偏假，不会凭空支持）。
+    static bool GuardValueKnown(string prop, string val) {
+        prop = StyleSheet.StripVendor(StyleSheet.Lower(StyleSheet.Trim(prop)));
+        string v = StyleSheet.Lower(StyleSheet.Trim(val));
+        int sp = Css.IndexFrom(v, " ", 0);
+        if (sp > 0) { v = v.Substring(0, sp); }
+        if (prop == "display") {
+            return v == "block" || v == "inline" || v == "inline-block"
+                || v == "flex" || v == "inline-flex" || v == "none"
+                || v == "flow-root" || v == "grid" || v == "inline-grid";
+        }
+        if (prop == "position") {
+            return v == "static" || v == "relative"
+                || v == "absolute" || v == "fixed";
+        }
+        if (prop == "overflow" || prop == "overflow-x" || prop == "overflow-y") {
+            return v == "visible" || v == "hidden" || v == "clip"
+                || v == "auto" || v == "scroll";
+        }
+        if (prop == "visibility") {
+            return v == "visible" || v == "hidden" || v == "collapse";
+        }
+        if (prop == "flex-direction") {
+            return v == "row" || v == "row-reverse" || v == "column"
+                || v == "col" || v == "column-reverse";
+        }
+        if (prop == "flex-wrap") {
+            return v == "nowrap" || v == "wrap" || v == "wrap-reverse";
+        }
+        if (prop == "align-items") {
+            return v == "flex-start" || v == "start" || v == "top"
+                || v == "center" || v == "flex-end" || v == "end"
+                || v == "bottom" || v == "stretch";
+        }
+        if (prop == "align-self") {
+            return v == "auto" || v == "flex-start" || v == "start"
+                || v == "top" || v == "center" || v == "flex-end"
+                || v == "end" || v == "bottom";
+        }
+        if (prop == "justify-content" || prop == "align-content") {
+            return v == "flex-start" || v == "start" || v == "left"
+                || v == "top" || v == "center" || v == "flex-end"
+                || v == "end" || v == "right" || v == "bottom"
+                || v == "space-between" || v == "space-around"
+                || v == "space-evenly" || v == "stretch";
+        }
+        if (prop == "text-align") {
+            return v == "left" || v == "start" || v == "center"
+                || v == "right" || v == "end";
+        }
+        if (prop == "white-space") {
+            return v == "normal" || v == "nowrap" || v == "pre";
+        }
+        if (prop == "text-transform") {
+            return v == "none" || v == "uppercase" || v == "lowercase";
+        }
+        if (prop == "text-overflow") {
+            return v == "clip" || v == "ellipsis";
+        }
+        return true;
+    }
+
+    // 被跳过的 at-rule 的可读清单（`@media x3, @keyframes x1`）。
+    static string AtRuleSummary(Dict<string, int> kinds) {
+        if (kinds == null || kinds.Count == 0) { return "@media/@keyframes"; }
+        string outR = "";
+        List<string> ks = kinds.Keys;
+        for (int i = 0; i < ks.Count; i = i + 1) {
+            if (outR != "") { outR = outR + ", "; }
+            int n = 0;
+            kinds.TryGetValue(ks[i], out n);
+            outR = outR + "@" + ks[i] + " x" + Convert.ToString(n);
+        }
+        return outR;
+    }
+
+    // 判假的 `@supports` 守卫条件计数（`(display: grid) x2`），
+    // 与 AtRuleSummary 的区别是不加 `@` 前缀（键是条件原文，不是名字）。
+    static string GuardSummary(Dict<string, int> conds) {
+        if (conds == null || conds.Count == 0) { return ""; }
+        string outR = "";
+        List<string> ks = conds.Keys;
+        for (int i = 0; i < ks.Count; i = i + 1) {
+            if (outR != "") { outR = outR + ", "; }
+            int n = 0;
+            conds.TryGetValue(ks[i], out n);
+            outR = outR + ks[i] + " x" + Convert.ToString(n);
+        }
+        return outR;
+    }
+
+    // 这条声明的值里有没有引擎解析不了、会被当裸数字吞掉的部分。
+    static bool ValueUnresolved(string key, string val) {
+        if (val == "") { return false; }
+        // 图片背景：引擎背景只有颜色/线性渐变，url() 会被当成
+        // 解析不了的颜色静默变 0，点名。
+        if (Css.IndexFrom(StyleSheet.Lower(val), "url(", 0) >= 0
+            && (key == "background" || key == "background-image")) {
+            return true;
+        }
+        // 引擎没有径向/锥形渐变绘制原语，混进停靠点解析会得到
+        // 透明色，点名。
+        string vlo = StyleSheet.Lower(val);
+        if (Css.IndexFrom(vlo, "radial-gradient(", 0) >= 0
+            || Css.IndexFrom(vlo, "conic-gradient(", 0) >= 0) {
+            return true;
+        }
+        if (StyleSheet.HasUnresolvedUnit(val)) { return true; }
+        // `%` 只在少数属性上有语义（width/height 走 widthPm，opacity 走
+        // Perm）；这些属性上的 `%` 是实打实的强转，点名。
+        if (Css.IndexFrom(val, "%", 0) >= 0
+            && StyleSheet.PctCoerced(StyleSheet.Lower(StyleSheet.Trim(key)))) {
+            return true;
+        }
+        return false;
+    }
+
+    // 该属性上的 `%` 会被当裸数字用（与 width/height 的 widthPm 相对）。
+    static bool PctCoerced(string k) {
+        if (k == "font-size" || k == "font" || k == "line-height"
+            || k == "letter-spacing") {
+            return true;
+        }
+        if (StyleSheet.StartsWith(k, "padding")
+            || StyleSheet.StartsWith(k, "margin")
+            || StyleSheet.StartsWith(k, "gap")) {
+            return true;
+        }
+        if (k == "row-gap" || k == "column-gap") { return true; }
+        if (StyleSheet.StartsWith(k, "border")
+            && Css.IndexFrom(k, "width", 0) >= 0) {
+            return true;
+        }
+        return false;
+    }
+
+    // 值里是否含引擎不认识的长度单位拼写。px/em/rem/ex/ch/vw/vh/
+    // vmin/vmax/pt/pc/cm/mm/in/q 与 calc()/min()/max()/clamp() 都有
+    // 求值器，不再是"会被当裸数字吞掉"的一类；`%` 按属性另有通道。
+    static bool HasUnresolvedUnit(string val) {
+        string s = StyleSheet.Lower(val);
+        // calc()/min()/max()/clamp() 已有求值器，不算"没解析"。
+        if (Css.IndexFrom(s, "repeating-linear-gradient(", 0) >= 0) {
+            return true;
+        }
+        // 颜色（#hex / rgb()/hsl() 族）与 url() 里的数字不是长度，
+        // 不参与单位点名（否则 #00ff00 会被拆成 00 + 单位 ff00）。
+        if (Css.IndexFrom(s, "#", 0) >= 0 || Css.IndexFrom(s, "url(", 0) >= 0
+            || Css.StartsWithStr(s, "rgb(") || Css.StartsWithStr(s, "rgba(")
+            || Css.StartsWithStr(s, "hsl(") || Css.StartsWithStr(s, "hsla(")
+            || Css.StartsWithStr(s, "hwb(") || Css.StartsWithStr(s, "oklab(")
+            || Css.StartsWithStr(s, "oklch(") || Css.StartsWithStr(s, "lab(")
+            || Css.StartsWithStr(s, "lch(")
+            || Css.StartsWithStr(s, "color-mix(")) {
+            return false;
+        }
+        int i = 0;
+        while (i < s.Length) {
+            if (!StyleSheet.Digit(s.Substring(i, 1))) { i = i + 1; continue; }
+            while (i < s.Length) {
+                string c = s.Substring(i, 1);
+                if (StyleSheet.Digit(c) || c == ".") { i = i + 1; }
+                else { break; }
+            }
+            int st = i;
+            while (i < s.Length && StyleSheet.IsAlpha(s.Substring(i, 1))) {
+                i = i + 1;
+            }
+            string u = s.Substring(st, i - st);
+            if (u == "") { continue; }
+            // 长度单位全部有换算；ms/s/deg/turn/fr/hz 是时长/角度/
+            // 频率的单位，各有各的解析通道，都不算"没解析"。
+            if (u != "px" && u != "em" && u != "rem" && u != "ex"
+                && u != "ch" && u != "vw" && u != "vh" && u != "vmin"
+                && u != "vmax" && u != "pt" && u != "pc" && u != "cm"
+                && u != "mm" && u != "in" && u != "q" && u != "ms"
+                && u != "s" && u != "deg" && u != "turn" && u != "fr"
+                && u != "hz" && u != "khz") {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // 单字符是否为 ASCII 字母。
+    static bool IsAlpha(string ch) {
+        if (ch.Length != 1) { return false; }
+        string lo = StyleSheet.Lower(ch);
+        return lo >= "a" && lo <= "z";
+    }
+
+
+    // 声明值的文本形式（数字转成字符串，因此 JSON 表中的 `radius: 8`
+    // 行为与 CSS 中的 `radius: 8px` 一致）。
+    static string ValStr(JsonValue v) {
+        if (v == null) { return ""; }
+        if (v.IsNumber()) { return Convert.ToString(v.AsInt(0)); }
+        return v.AsString("");
+    }
+
+    static bool InternalKey(string key) {
+        return StyleSheet.StartsWith(key, "__zan_");
+    }
+
+    static bool IsPrescaled(JsonValue block, string key) {
+        return StyleSheet.IsPrescaled(block, key, false);
+    }
+
+    static bool IsPrescaled(JsonValue block, string key, bool important) {
+        if (block == null) { return false; }
+        JsonValue source = block.Get(important
+            ? "__zan_important_prescaled" : "__zan_prescaled");
+        if (source == null || !source.IsObject()) { return false; }
+        JsonValue value = source.Get(key);
+        return value != null && value.AsBool(false);
+    }
+
+}

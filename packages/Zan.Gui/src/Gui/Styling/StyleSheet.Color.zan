@@ -1,0 +1,675 @@
+using System;
+using System.Collections.Generic;
+using Gui;
+
+namespace Gui;
+
+public partial class StyleSheet {
+    // ---- 值解析 -----
+
+    static Dict<string, int> colorCache = new Dict<string, int>();
+
+    // 将 CSS 颜色解析为打包的 0xAARRGGBB int。接受 `#RGB`、
+    // `0x...`、纯十进制数和 CSS 命名颜色。空值或无法解析的值
+    // 返回 0（= 未设置），因此坏规则只是什么都不做。
+    static int ParseColor(string val) {
+        if (val == null || val == "") { return 0; }
+        int cached;
+        if (StyleSheet.colorCache.TryGetValue(val, out cached)) {
+            return cached;
+        }
+        int col = StyleSheet.ParseColorRaw(val);
+        if (StyleSheet.colorCache.Count < 1024) {
+            StyleSheet.colorCache.Add(val, col);
+        }
+        return col;
+    }
+
+    static int ParseColorRaw(string val) {
+        string s = StyleSheet.Trim(val);
+        if (s.Length == 0) { return 0; }
+        int b0 = s[0] & 255;
+        if (b0 == 35) {
+            int slen = s.Length;
+            if (slen == 4) {
+                // #RGB
+                int r = StyleSheet.HexDigitByte(s[1] & 255);
+                int g = StyleSheet.HexDigitByte(s[2] & 255);
+                int b = StyleSheet.HexDigitByte(s[3] & 255);
+                if (r < 0 || g < 0 || b < 0) { return 0; }
+                int rr = (r << 4) | r;
+                int gg = (g << 4) | g;
+                int bb = (b << 4) | b;
+                return (255 << 24) | (rr << 16) | (gg << 8) | bb;
+            } else if (slen == 5) {
+                // #RGBA
+                int r = StyleSheet.HexDigitByte(s[1] & 255);
+                int g = StyleSheet.HexDigitByte(s[2] & 255);
+                int b = StyleSheet.HexDigitByte(s[3] & 255);
+                int a = StyleSheet.HexDigitByte(s[4] & 255);
+                if (r < 0 || g < 0 || b < 0 || a < 0) { return 0; }
+                int aa = (a << 4) | a;
+                int rr = (r << 4) | r;
+                int gg = (g << 4) | g;
+                int bb = (b << 4) | b;
+                return (aa << 24) | (rr << 16) | (gg << 8) | bb;
+            } else if (slen == 7) {
+                // #RRGGBB
+                int r0 = StyleSheet.HexDigitByte(s[1] & 255);
+                int r1 = StyleSheet.HexDigitByte(s[2] & 255);
+                int g0 = StyleSheet.HexDigitByte(s[3] & 255);
+                int g1 = StyleSheet.HexDigitByte(s[4] & 255);
+                int b0c = StyleSheet.HexDigitByte(s[5] & 255);
+                int b1c = StyleSheet.HexDigitByte(s[6] & 255);
+                if (r0 < 0 || r1 < 0 || g0 < 0 || g1 < 0 || b0c < 0 || b1c < 0) { return 0; }
+                int rr = (r0 << 4) | r1;
+                int gg = (g0 << 4) | g1;
+                int bb = (b0c << 4) | b1c;
+                return (255 << 24) | (rr << 16) | (gg << 8) | bb;
+            } else if (slen == 9) {
+                // #AARRGGBB
+                int acc = 0;
+                for (int i = 1; i < 9; i = i + 1) {
+                    int d = StyleSheet.HexDigitByte(s[i] & 255);
+                    if (d < 0) { return 0; }
+                    acc = (acc << 4) | d;
+                }
+                return acc;
+            }
+            return 0;
+        }
+        if (s.Length > 2 && b0 == 48 && ((s[1] & 255) == 120 || (s[1] & 255) == 88)) {
+            // 0x...
+            int acc = 0;
+            int slen = s.Length;
+            for (int i = 2; i < slen; i = i + 1) {
+                int d = StyleSheet.HexDigitByte(s[i] & 255);
+                if (d < 0) { return 0; }
+                acc = (acc << 4) | d;
+            }
+            return acc;
+        }
+        if (b0 >= 48 && b0 <= 57) {
+            return StyleSheet.ParseInt(s);
+        }
+        string lo = StyleSheet.Lower(s);
+        if (StyleSheet.StartsWith(lo, "rgb")) { return StyleSheet.ParseRgb(s); }
+        if (StyleSheet.StartsWith(lo, "hsl")) { return StyleSheet.ParseHsl(s); }
+        if (StyleSheet.StartsWith(lo, "hwb(")) { return StyleSheet.ParseHwb(s); }
+        if (StyleSheet.StartsWith(lo, "oklab(")) {
+            return StyleSheet.ParseOklabLike(s, false);
+        }
+        if (StyleSheet.StartsWith(lo, "oklch(")) {
+            return StyleSheet.ParseOklabLike(s, true);
+        }
+        if (StyleSheet.StartsWith(lo, "lab(")) {
+            return StyleSheet.ParseCielabLike(s, false);
+        }
+        if (StyleSheet.StartsWith(lo, "lch(")) {
+            return StyleSheet.ParseCielabLike(s, true);
+        }
+        if (StyleSheet.StartsWith(lo, "color-mix(")) {
+            return StyleSheet.ParseColorMix(s);
+        }
+        if (lo == "transparent" || lo == "none" || lo == "currentcolor") { return 0; }
+        int named = StyleSheet.NamedColor(lo);
+        if (named != 0) { return named; }
+        return StyleSheet.ParseInt(s);
+    }
+
+    // `rgb(r,g,b)` / `rgba(r,g,b,a)`，也收现代空格语法
+    // `rgb(0 128 255)` 与斜杠 alpha `rgb(0 128 255 / 50%)`。
+    static int ParseRgb(string val) {
+        List<string> a = StyleSheet.FuncArgs(val);
+        if (a.Count < 3) { return 0; }
+        int r = StyleSheet.Chan(a[0]);
+        int g = StyleSheet.Chan(a[1]);
+        int b = StyleSheet.Chan(a[2]);
+        int al = a.Count >= 4 ? StyleSheet.Alpha255(a[3]) : 255;
+        return StyleSheet.Pack(al, r, g, b);
+    }
+
+    // 函数式颜色取参：顶层 `/` 之后是 alpha；主串按逗号（旧语法）
+    // 或空白（现代语法）切分。
+    static List<string> FuncArgs(string val) {
+        int open = StyleSheet.IndexOf(val, "(");
+        int close = StyleSheet.LastIndexOf(val, ")");
+        if (open < 0 || close < open) { return new List<string>(); }
+        string inner = val.Substring(open + 1, close - open - 1);
+        string main = inner;
+        string alpha = "";
+        int slash = Css.IndexFrom(inner, "/", 0);
+        if (slash >= 0) {
+            main = Css.Trim(inner.Substring(0, slash));
+            alpha = Css.Trim(inner.Substring(slash + 1,
+                                             inner.Length - slash - 1));
+        }
+        List<string> outp = new List<string>();
+        List<string> parts = Css.IndexFrom(main, ",", 0) >= 0
+            ? Css.SplitTrim(main, ",")
+            : Css.SplitTopTrim(main, " ");
+        for (int i = 0; i < parts.Count; i = i + 1) {
+            if (parts[i] != "") { outp.Add(parts[i]); }
+        }
+        if (alpha != "") { outp.Add(alpha); }
+        return outp;
+    }
+
+    static int Alpha255(string tok) {
+        if (Css.IndexFrom(tok, "%", 0) >= 0) {
+            return StyleSheet.Perm(tok) * 255 / 1000;
+        }
+        return StyleSheet.Clamp255((int)(StyleSheet.ParseDbl(tok) * 255.0));
+    }
+
+    // 颜色函数的浮点通道：`50%` -> Perm/pctDiv（oklab 标度 0..1 用
+    // 1000，lab 标度 0..100 用 10），裸数按十进制浮点。
+    static double DblChan(string tok, double pctDiv) {
+        string t = Css.Trim(tok);
+        if (Css.IndexFrom(t, "%", 0) >= 0) {
+            return StyleSheet.Perm(t) / pctDiv;
+        }
+        return StyleSheet.ParseDbl(t);
+    }
+
+    // 十进制 token -> double（无指数；色彩换算专用）。
+    static double ParseDbl(string tok) {
+        string t = Css.Trim(tok);
+        if (t == "") { return 0.0; }
+        double sign = 1.0;
+        string c0 = t.Substring(0, 1);
+        if (c0 == "-") {
+            sign = 0.0 - 1.0;
+            t = Css.Trim(t.Substring(1, t.Length - 1));
+        } else if (c0 == "+") {
+            t = Css.Trim(t.Substring(1, t.Length - 1));
+        }
+        double v = 0.0;
+        int i = 0;
+        while (i < t.Length && StyleSheet.Digit(t.Substring(i, 1))) {
+            v = v * 10.0 + StyleSheet.HexToInt(t.Substring(i, 1));
+            i = i + 1;
+        }
+        if (i < t.Length && t.Substring(i, 1) == ".") {
+            i = i + 1;
+            double fr = 1.0;
+            while (i < t.Length && StyleSheet.Digit(t.Substring(i, 1))) {
+                fr = fr / 10.0;
+                v = v + fr * StyleSheet.HexToInt(t.Substring(i, 1));
+                i = i + 1;
+            }
+        }
+        return sign * v;
+    }
+
+    // 色相 token -> 0..359 度：`210`、`210deg`、`0.5turn`、
+    // `200grad`、`3.14rad`（浮点解析，支持小数色相）。
+    static int Hue360(string tok) {
+        string lo2 = StyleSheet.Lower(Css.Trim(tok));
+        double v = StyleSheet.ParseDbl(lo2);
+        double deg = v;
+        if (StyleSheet.EndsWith(lo2, "grad")) { deg = v * 0.9; }
+        else if (StyleSheet.EndsWith(lo2, "rad")) { deg = v * 57.2957795; }
+        else if (StyleSheet.EndsWith(lo2, "turn")) { deg = v * 360.0; }
+        int d = (int)deg;
+        d = d % 360;
+        if (d < 0) { d = d + 360; }
+        return d;
+    }
+
+    // 色环六棱锥：h（度）、c（千分色度）-> 千分制 r,g,b，最大
+    // 分量恰为 c。hsl 与 hwb 共用。
+    static void Hexcone(int h, int c, out int r, out int g, out int b) {
+        int hp = h * 1000 / 60;
+        int mod2 = hp % 2000;
+        int xm = mod2 - 1000;
+        if (xm < 0) { xm = 0 - xm; }
+        int x = c * (1000 - xm) / 1000;
+        r = 0; g = 0; b = 0;
+        if (h < 60) { r = c; g = x; }
+        else if (h < 120) { r = x; g = c; }
+        else if (h < 180) { g = c; b = x; }
+        else if (h < 240) { g = x; b = c; }
+        else if (h < 300) { r = x; b = c; }
+        else { r = c; b = x; }
+    }
+
+    // `hsl(h,s%,l%)` / `hsla(...)` / `hsl(120 50% 50% / 30%)`
+    // 转换为 RGB（整数运算）。
+    static int ParseHsl(string val) {
+        List<string> a = StyleSheet.FuncArgs(val);
+        if (a.Count < 3) { return 0; }
+        int h = StyleSheet.Hue360(a[0]);
+        int sat = StyleSheet.Perm(a[1]);
+        int lit = StyleSheet.Perm(a[2]);
+        int al = a.Count >= 4 ? StyleSheet.Alpha255(a[3]) : 255;
+        // c = (1 - |2l - 1|) * s；所有值均为千分数
+        int d2l = 2 * lit - 1000;
+        if (d2l < 0) { d2l = 0 - d2l; }
+        int chroma = (1000 - d2l) * sat / 1000;
+        int r; int g; int b;
+        StyleSheet.Hexcone(h, chroma, out r, out g, out b);
+        int m = lit - chroma / 2;
+        return StyleSheet.Pack(al, (r + m) * 255 / 1000,
+                               (g + m) * 255 / 1000,
+                               (b + m) * 255 / 1000);
+    }
+
+    // `hwb(h w% b% [/ a])`：色相纯色按白、黑分量收缩（w+b 超过
+    // 100% 时按比例归一）。
+    static int ParseHwb(string val) {
+        List<string> a = StyleSheet.FuncArgs(val);
+        if (a.Count < 3) { return 0; }
+        int h = StyleSheet.Hue360(a[0]);
+        int w = StyleSheet.Perm(a[1]);
+        int bk = StyleSheet.Perm(a[2]);
+        int al = a.Count >= 4 ? StyleSheet.Alpha255(a[3]) : 255;
+        int sum = w + bk;
+        if (sum > 1000) {
+            w = w * 1000 / sum;
+            bk = 1000 - w;
+            sum = 1000;
+        }
+        int keep = 1000 - sum;
+        int r; int g; int b;
+        StyleSheet.Hexcone(h, 1000, out r, out g, out b);
+        // 纯色（千分刻度）按 keep 收缩到 255 刻度，再叠白分量；
+        // r*keep*255 最大 1e3*1e3*255 < 2^31，不溢出。
+        return StyleSheet.Pack(al, r * keep * 255 / 1000000 + w * 255 / 1000,
+                               g * keep * 255 / 1000000 + w * 255 / 1000,
+                               b * keep * 255 / 1000000 + w * 255 / 1000);
+    }
+
+    // `oklab(L a b [/ a])` 与 `oklch(L C H [/ a])`（感知色彩空间，
+    // Tailwind 一类现代调色板的缺省写法）。
+    static int ParseOklabLike(string val, bool polar) {
+        List<string> a = StyleSheet.FuncArgs(val);
+        if (a.Count < 3) { return 0; }
+        double L = StyleSheet.DblChan(a[0], 1000.0);
+        int alpha = a.Count >= 4 ? StyleSheet.Alpha255(a[3]) : 255;
+        double ax; double bx;
+        if (polar) {
+            double c = StyleSheet.DblChan(a[1], 1000.0);
+            double hd = StyleSheet.Hue360(a[2]);
+            ax = c * StyleSheet.CosD(hd);
+            bx = c * StyleSheet.SinD(hd);
+        } else {
+            ax = StyleSheet.DblChan(a[1], 1000.0);
+            bx = StyleSheet.DblChan(a[2], 1000.0);
+        }
+        return StyleSheet.OklabToRgb(L, ax, bx, alpha);
+    }
+
+    // OKLab -> 线性 sRGB（Björn Ottosson 的常数）-> gamma 8bit。
+    static int OklabToRgb(double L, double ax, double bx, int alpha) {
+        double l_ = L + 0.3963377774 * ax + 0.2158037573 * bx;
+        double m_ = L - 0.1055613458 * ax - 0.0638541728 * bx;
+        double s_ = L - 0.0894841775 * ax - 1.2914855480 * bx;
+        double l = l_ * l_ * l_;
+        double m = m_ * m_ * m_;
+        double s2 = s_ * s_ * s_;
+        double rl = 4.0767416621 * l - 3.3077115913 * m + 0.2309699292 * s2;
+        double gl = -1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s2;
+        double bl = -0.0041960863 * l - 0.7034186147 * m + 1.7076147010 * s2;
+        return StyleSheet.Pack(alpha, StyleSheet.Gamma255(rl),
+                               StyleSheet.Gamma255(gl),
+                               StyleSheet.Gamma255(bl));
+    }
+
+    // `lab(L a b [/ a])` 与 `lch(L C H [/ a])`（CIE Lab，白点）。
+    static int ParseCielabLike(string val, bool polar) {
+        List<string> a = StyleSheet.FuncArgs(val);
+        if (a.Count < 3) { return 0; }
+        double L = StyleSheet.DblChan(a[0], 10.0);
+        int alpha = a.Count >= 4 ? StyleSheet.Alpha255(a[3]) : 255;
+        double ax; double bx;
+        if (polar) {
+            double c = StyleSheet.DblChan(a[1], 10.0);
+            double hd = StyleSheet.Hue360(a[2]);
+            ax = c * StyleSheet.CosD(hd);
+            bx = c * StyleSheet.SinD(hd);
+        } else {
+            ax = StyleSheet.DblChan(a[1], 10.0);
+            bx = StyleSheet.DblChan(a[2], 10.0);
+        }
+        return StyleSheet.LabToRgb(L, ax, bx, alpha);
+    }
+
+    // CIE Lab() -> XYZ() -> Bradford 适应到 ->
+    // 线性 sRGB。矩阵常数取自 CSS Color 4 转换样例。
+    static int LabToRgb(double L, double ax, double bx, int alpha) {
+        double e = 216.0 / 24389.0;
+        double k = 24389.0 / 27.0;
+        double fy = (L + 16.0) / 116.0;
+        double fx = fy + ax / 500.0;
+        double fz = fy - bx / 200.0;
+        double fx3 = fx * fx * fx;
+        double fz3 = fz * fz * fz;
+        double fy3 = fy * fy * fy;
+        double xr = fx3 > e ? fx3 : (116.0 * fx - 16.0) / k;
+        double yr = L > k * e ? fy3 : L / k;
+        double zr = fz3 > e ? fz3 : (116.0 * fz - 16.0) / k;
+        double X = xr * 0.96422;
+        double Y = yr;
+        double Z = zr * 0.82521;
+        double xd = 0.9555766 * X - 0.0230393 * Y + 0.0631636 * Z;
+        double yd = -0.0282895 * X + 1.0099416 * Y + 0.0210077 * Z;
+        double zd = 0.0122982 * X - 0.0204830 * Y + 1.3299098 * Z;
+        double rl = 3.2404542 * xd - 1.5371385 * yd - 0.4985314 * zd;
+        double gl = -0.9692660 * xd + 1.8760108 * yd + 0.0415560 * zd;
+        double bl = 0.0556434 * xd - 0.2040259 * yd + 1.0572252 * zd;
+        return StyleSheet.Pack(alpha, StyleSheet.Gamma255(rl),
+                               StyleSheet.Gamma255(gl),
+                               StyleSheet.Gamma255(bl));
+    }
+
+    // 颜色的一个 8bit 通道：shift 16=r、8=g、0=b。颜色 int 带
+    // FF alpha 时为负，必须用无符号移位语义（>> 后 & 255）。
+    static int ByteOf(int c, int shift) {
+        return (c >> shift) & 255;
+    }
+
+    // 线性光分量 -> sRGB gamma -> 0..255。
+    static int Gamma255(double c) {
+        double v;
+        if (c <= 0.0031308) { v = 12.92 * c; }
+        else { v = 1.055 * Math.Pow(c, 1.0 / 2.4) - 0.055; }
+        return StyleSheet.Clamp255((int)Math.Round(v * 255.0));
+    }
+
+    // 度制余弦：区间归约后五阶泰勒（|误差| < 5e-6，色彩换算足够；
+    // 运行时没有 Math.Cos/Sin）。
+    static double CosD(double deg) {
+        double x = deg % 360.0;
+        if (x < 0.0) { x = x + 360.0; }
+        double rad = x * 3.14159265358979 / 180.0;
+        double sign = 1.0;
+        if (rad > 3.14159265358979) {
+            rad = 6.28318530717958 - rad;
+        }
+        if (rad > 1.57079632679490) {
+            rad = 3.14159265358979 - rad;
+            sign = 0.0 - sign;
+        }
+        double x2 = rad * rad;
+        return sign * (1.0 - x2 / 2.0 + x2 * x2 / 24.0
+                       - x2 * x2 * x2 / 720.0
+                       + x2 * x2 * x2 * x2 / 40320.0
+                       - x2 * x2 * x2 * x2 * x2 / 3628800.0);
+    }
+
+    // 度制正弦（cos(x-90) = sin(x)）。
+    static double SinD(double deg) {
+        return CosD(deg - 90.0);
+    }
+
+    // `color-mix(in <space>, c1 [p1], c2 [p2])`：混合空间按 sRGB
+    // 近似（感知空间的混合差异对本引擎的用途可忽略）；百分比
+    // 缺省 50%，两侧和不为 100% 时按比例归一。
+    static int ParseColorMix(string val) {
+        int open = StyleSheet.IndexOf(val, "(");
+        int close = StyleSheet.LastIndexOf(val, ")");
+        if (open < 0 || close < open) { return 0; }
+        List<string> parts = Css.SplitTopTrim(
+            val.Substring(open + 1, close - open - 1), ",");
+        int idx = 0;
+        if (parts.Count > 0
+            && StyleSheet.StartsWith(StyleSheet.Lower(parts[0]), "in ")) {
+            idx = 1;
+        }
+        if (parts.Count - idx < 2) { return 0; }
+        int p1 = 0 - 1; int p2 = 0 - 1;
+        string s1 = StyleSheet.TakePct(parts[idx], out p1);
+        string s2 = StyleSheet.TakePct(parts[idx + 1], out p2);
+        if (p1 < 0) { p1 = 500; }
+        if (p2 < 0) { p2 = 500; }
+        int c1 = StyleSheet.ParseColor(s1);
+        int c2 = StyleSheet.ParseColor(s2);
+        int sum = p1 + p2;
+        if (sum <= 0) { p1 = 500; p2 = 500; sum = 1000; }
+        p1 = p1 * 1000 / sum;
+        p2 = 1000 - p1;
+        int r = (StyleSheet.ByteOf(c1, 16) * p1
+                 + StyleSheet.ByteOf(c2, 16) * p2) / 1000;
+        int g = (StyleSheet.ByteOf(c1, 8) * p1
+                 + StyleSheet.ByteOf(c2, 8) * p2) / 1000;
+        int b = (StyleSheet.ByteOf(c1, 0) * p1
+                 + StyleSheet.ByteOf(c2, 0) * p2) / 1000;
+        int a1 = (c1 >> 24) & 255;
+        int a2 = (c2 >> 24) & 255;
+        int al = (a1 * p1 + a2 * p2) / 1000;
+        return StyleSheet.Pack(al, r, g, b);
+    }
+
+    // 抽出尾部独立百分比 token（`red 30%` -> "red", 300）；
+    // 没有时 pct 返回 -1、原串返回。
+    static string TakePct(string s, out int pct) {
+        pct = 0 - 1;
+        string t = Css.Trim(s);
+        int i = t.Length;
+        while (i > 0 && t.Substring(i - 1, 1) != " ") { i = i - 1; }
+        if (i <= 0) { return t; }
+        string tail = Css.Trim(t.Substring(i, t.Length - i));
+        if (StyleSheet.EndsWith(tail, "%") && tail.Length >= 2) {
+            string digits = tail.Substring(0, tail.Length - 1);
+            bool ok = digits.Length > 0;
+            for (int k = 0; k < digits.Length; k = k + 1) {
+                string d = digits.Substring(k, 1);
+                if (!StyleSheet.Digit(d) && d != "."
+                    && d != "-" && d != "+") { ok = false; }
+            }
+            if (ok) {
+                pct = StyleSheet.Perm(tail);
+                return Css.Trim(t.Substring(0, i));
+            }
+        }
+        return t;
+    }
+
+    // 单个 rgb() 通道：`0..255` 或百分比。
+    static int Chan(string tok) {
+        string s = StyleSheet.Trim(tok);
+        if (StyleSheet.IndexOf(s, "%") >= 0) { return StyleSheet.Perm(s) * 255 / 1000; }
+        return StyleSheet.Clamp255(StyleSheet.Num(s));
+    }
+
+    // 钳制到 0..255。
+    static int Clamp255(int v) {
+        if (v < 0) { return 0; }
+        if (v > 255) { return 255; }
+        return v;
+    }
+
+    // 将 a,r,g,b（0..255）打包为 GUI 的有符号 0xAARRGGBB int。
+    static int Pack(int a, int r, int g, int b) {
+        int av = StyleSheet.Clamp255(a);
+        int rv = StyleSheet.Clamp255(r);
+        int gv = StyleSheet.Clamp255(g);
+        int bv = StyleSheet.Clamp255(b);
+        return av * 16777216 + rv * 65536 + gv * 256 + bv;
+    }
+
+    // 皮肤实际会用到的 CSS 命名颜色（未知时为 0）。
+    // CSS Color Module Level 4 全部 148 个具名颜色（X11 + CSS
+    // 扩展）。此前只有 42 个常用名，官方示例用到的 lightskyblue /
+    // orangered / azure / tomato / peru / chocolate 落空解析成 0——
+    // 0 在渲染期等于"未着色"，map-HK 的 visualMap 色带因此整图
+    // 透明（区域全不画），这是 C6 会话查出来的第二处独立缺陷。
+    static int NamedColor(string name) {
+        if (name == "aliceblue") { return StyleSheet.Pack(255, 240, 248, 255); }
+        if (name == "antiquewhite") { return StyleSheet.Pack(255, 250, 235, 215); }
+        if (name == "aqua" || name == "cyan") { return StyleSheet.Pack(255, 0, 255, 255); }
+        if (name == "aquamarine") { return StyleSheet.Pack(255, 127, 255, 212); }
+        if (name == "azure") { return StyleSheet.Pack(255, 240, 255, 255); }
+        if (name == "beige") { return StyleSheet.Pack(255, 245, 245, 220); }
+        if (name == "bisque") { return StyleSheet.Pack(255, 255, 228, 196); }
+        if (name == "black") { return StyleSheet.Pack(255, 0, 0, 0); }
+        if (name == "blanchedalmond") { return StyleSheet.Pack(255, 255, 235, 205); }
+        if (name == "blue") { return StyleSheet.Pack(255, 0, 0, 255); }
+        if (name == "blueviolet") { return StyleSheet.Pack(255, 138, 43, 226); }
+        if (name == "brown") { return StyleSheet.Pack(255, 165, 42, 42); }
+        if (name == "burlywood") { return StyleSheet.Pack(255, 222, 184, 135); }
+        if (name == "cadetblue") { return StyleSheet.Pack(255, 95, 158, 160); }
+        if (name == "chartreuse") { return StyleSheet.Pack(255, 127, 255, 0); }
+        if (name == "chocolate") { return StyleSheet.Pack(255, 210, 105, 30); }
+        if (name == "coral") { return StyleSheet.Pack(255, 255, 127, 80); }
+        if (name == "cornflowerblue") { return StyleSheet.Pack(255, 100, 149, 237); }
+        if (name == "cornsilk") { return StyleSheet.Pack(255, 255, 248, 220); }
+        if (name == "crimson") { return StyleSheet.Pack(255, 220, 20, 60); }
+        if (name == "darkblue") { return StyleSheet.Pack(255, 0, 0, 139); }
+        if (name == "darkcyan") { return StyleSheet.Pack(255, 0, 139, 139); }
+        if (name == "darkgoldenrod") { return StyleSheet.Pack(255, 184, 134, 11); }
+        if (name == "darkgray" || name == "darkgrey") { return StyleSheet.Pack(255, 169, 169, 169); }
+        if (name == "darkgreen") { return StyleSheet.Pack(255, 0, 100, 0); }
+        if (name == "darkkhaki") { return StyleSheet.Pack(255, 189, 183, 107); }
+        if (name == "darkmagenta") { return StyleSheet.Pack(255, 139, 0, 139); }
+        if (name == "darkolivegreen") { return StyleSheet.Pack(255, 85, 107, 47); }
+        if (name == "darkorange") { return StyleSheet.Pack(255, 255, 140, 0); }
+        if (name == "darkorchid") { return StyleSheet.Pack(255, 153, 50, 204); }
+        if (name == "darkred") { return StyleSheet.Pack(255, 139, 0, 0); }
+        if (name == "darksalmon") { return StyleSheet.Pack(255, 233, 150, 122); }
+        if (name == "darkseagreen") { return StyleSheet.Pack(255, 143, 188, 143); }
+        if (name == "darkslateblue") { return StyleSheet.Pack(255, 72, 61, 139); }
+        if (name == "darkslategray" || name == "darkslategrey") { return StyleSheet.Pack(255, 47, 79, 79); }
+        if (name == "darkturquoise") { return StyleSheet.Pack(255, 0, 206, 209); }
+        if (name == "darkviolet") { return StyleSheet.Pack(255, 148, 0, 211); }
+        if (name == "deeppink") { return StyleSheet.Pack(255, 255, 20, 147); }
+        if (name == "deepskyblue") { return StyleSheet.Pack(255, 0, 191, 255); }
+        if (name == "dimgray" || name == "dimgrey") { return StyleSheet.Pack(255, 105, 105, 105); }
+        if (name == "dodgerblue") { return StyleSheet.Pack(255, 30, 144, 255); }
+        if (name == "firebrick") { return StyleSheet.Pack(255, 178, 34, 34); }
+        if (name == "floralwhite") { return StyleSheet.Pack(255, 255, 250, 240); }
+        if (name == "forestgreen") { return StyleSheet.Pack(255, 34, 139, 34); }
+        if (name == "fuchsia" || name == "magenta") { return StyleSheet.Pack(255, 255, 0, 255); }
+        if (name == "gainsboro") { return StyleSheet.Pack(255, 220, 220, 220); }
+        if (name == "ghostwhite") { return StyleSheet.Pack(255, 248, 248, 255); }
+        if (name == "gold") { return StyleSheet.Pack(255, 255, 215, 0); }
+        if (name == "goldenrod") { return StyleSheet.Pack(255, 218, 165, 32); }
+        if (name == "gray" || name == "grey") { return StyleSheet.Pack(255, 128, 128, 128); }
+        if (name == "green") { return StyleSheet.Pack(255, 0, 128, 0); }
+        if (name == "greenyellow") { return StyleSheet.Pack(255, 173, 255, 47); }
+        if (name == "honeydew") { return StyleSheet.Pack(255, 240, 255, 240); }
+        if (name == "hotpink") { return StyleSheet.Pack(255, 255, 105, 180); }
+        if (name == "indianred") { return StyleSheet.Pack(255, 205, 92, 92); }
+        if (name == "indigo") { return StyleSheet.Pack(255, 75, 0, 130); }
+        if (name == "ivory") { return StyleSheet.Pack(255, 255, 255, 240); }
+        if (name == "khaki") { return StyleSheet.Pack(255, 240, 230, 140); }
+        if (name == "lavender") { return StyleSheet.Pack(255, 230, 230, 250); }
+        if (name == "lavenderblush") { return StyleSheet.Pack(255, 255, 240, 245); }
+        if (name == "lawngreen") { return StyleSheet.Pack(255, 124, 252, 0); }
+        if (name == "lemonchiffon") { return StyleSheet.Pack(255, 255, 250, 205); }
+        if (name == "lightblue") { return StyleSheet.Pack(255, 173, 216, 230); }
+        if (name == "lightcoral") { return StyleSheet.Pack(255, 240, 128, 128); }
+        if (name == "lightcyan") { return StyleSheet.Pack(255, 224, 255, 255); }
+        if (name == "lightgoldenrodyellow") { return StyleSheet.Pack(255, 250, 250, 210); }
+        if (name == "lightgray" || name == "lightgrey") { return StyleSheet.Pack(255, 211, 211, 211); }
+        if (name == "lightgreen") { return StyleSheet.Pack(255, 144, 238, 144); }
+        if (name == "lightpink") { return StyleSheet.Pack(255, 255, 182, 193); }
+        if (name == "lightsalmon") { return StyleSheet.Pack(255, 255, 160, 122); }
+        if (name == "lightseagreen") { return StyleSheet.Pack(255, 32, 178, 170); }
+        if (name == "lightskyblue") { return StyleSheet.Pack(255, 135, 206, 250); }
+        if (name == "lightslategray" || name == "lightslategrey") { return StyleSheet.Pack(255, 119, 136, 153); }
+        if (name == "lightsteelblue") { return StyleSheet.Pack(255, 176, 196, 222); }
+        if (name == "lightyellow") { return StyleSheet.Pack(255, 255, 255, 224); }
+        if (name == "lime") { return StyleSheet.Pack(255, 0, 255, 0); }
+        if (name == "limegreen") { return StyleSheet.Pack(255, 50, 205, 50); }
+        if (name == "linen") { return StyleSheet.Pack(255, 250, 240, 230); }
+        if (name == "maroon") { return StyleSheet.Pack(255, 128, 0, 0); }
+        if (name == "mediumaquamarine") { return StyleSheet.Pack(255, 102, 205, 170); }
+        if (name == "mediumblue") { return StyleSheet.Pack(255, 0, 0, 205); }
+        if (name == "mediumorchid") { return StyleSheet.Pack(255, 186, 85, 211); }
+        if (name == "mediumpurple") { return StyleSheet.Pack(255, 147, 112, 219); }
+        if (name == "mediumseagreen") { return StyleSheet.Pack(255, 60, 179, 113); }
+        if (name == "mediumslateblue") { return StyleSheet.Pack(255, 123, 104, 238); }
+        if (name == "mediumspringgreen") { return StyleSheet.Pack(255, 0, 250, 154); }
+        if (name == "mediumturquoise") { return StyleSheet.Pack(255, 72, 209, 204); }
+        if (name == "mediumvioletred") { return StyleSheet.Pack(255, 199, 21, 133); }
+        if (name == "midnightblue") { return StyleSheet.Pack(255, 25, 25, 112); }
+        if (name == "mintcream") { return StyleSheet.Pack(255, 245, 255, 250); }
+        if (name == "mistyrose") { return StyleSheet.Pack(255, 255, 228, 225); }
+        if (name == "moccasin") { return StyleSheet.Pack(255, 255, 228, 181); }
+        if (name == "navajowhite") { return StyleSheet.Pack(255, 255, 222, 173); }
+        if (name == "navy") { return StyleSheet.Pack(255, 0, 0, 128); }
+        if (name == "oldlace") { return StyleSheet.Pack(255, 253, 245, 230); }
+        if (name == "olive") { return StyleSheet.Pack(255, 128, 128, 0); }
+        if (name == "olivedrab") { return StyleSheet.Pack(255, 107, 142, 35); }
+        if (name == "orange") { return StyleSheet.Pack(255, 255, 165, 0); }
+        if (name == "orangered") { return StyleSheet.Pack(255, 255, 69, 0); }
+        if (name == "orchid") { return StyleSheet.Pack(255, 218, 112, 214); }
+        if (name == "palegoldenrod") { return StyleSheet.Pack(255, 238, 232, 170); }
+        if (name == "palegreen") { return StyleSheet.Pack(255, 152, 251, 152); }
+        if (name == "paleturquoise") { return StyleSheet.Pack(255, 175, 238, 238); }
+        if (name == "palevioletred") { return StyleSheet.Pack(255, 219, 112, 147); }
+        if (name == "papayawhip") { return StyleSheet.Pack(255, 255, 239, 213); }
+        if (name == "peachpuff") { return StyleSheet.Pack(255, 255, 218, 185); }
+        if (name == "peru") { return StyleSheet.Pack(255, 205, 133, 63); }
+        if (name == "pink") { return StyleSheet.Pack(255, 255, 192, 203); }
+        if (name == "plum") { return StyleSheet.Pack(255, 221, 160, 221); }
+        if (name == "powderblue") { return StyleSheet.Pack(255, 176, 224, 230); }
+        if (name == "purple") { return StyleSheet.Pack(255, 128, 0, 128); }
+        if (name == "rebeccapurple") { return StyleSheet.Pack(255, 102, 51, 153); }
+        if (name == "red") { return StyleSheet.Pack(255, 255, 0, 0); }
+        if (name == "rosybrown") { return StyleSheet.Pack(255, 188, 143, 143); }
+        if (name == "royalblue") { return StyleSheet.Pack(255, 65, 105, 225); }
+        if (name == "saddlebrown") { return StyleSheet.Pack(255, 139, 69, 19); }
+        if (name == "salmon") { return StyleSheet.Pack(255, 250, 128, 114); }
+        if (name == "sandybrown") { return StyleSheet.Pack(255, 244, 164, 96); }
+        if (name == "seagreen") { return StyleSheet.Pack(255, 46, 139, 87); }
+        if (name == "seashell") { return StyleSheet.Pack(255, 255, 245, 238); }
+        if (name == "sienna") { return StyleSheet.Pack(255, 160, 82, 45); }
+        if (name == "silver") { return StyleSheet.Pack(255, 192, 192, 192); }
+        if (name == "skyblue") { return StyleSheet.Pack(255, 135, 206, 235); }
+        if (name == "slateblue") { return StyleSheet.Pack(255, 106, 90, 205); }
+        if (name == "slategray" || name == "slategrey") { return StyleSheet.Pack(255, 112, 128, 144); }
+        if (name == "snow") { return StyleSheet.Pack(255, 255, 250, 250); }
+        if (name == "springgreen") { return StyleSheet.Pack(255, 0, 255, 127); }
+        if (name == "steelblue") { return StyleSheet.Pack(255, 70, 130, 180); }
+        if (name == "tan") { return StyleSheet.Pack(255, 210, 180, 140); }
+        if (name == "teal") { return StyleSheet.Pack(255, 0, 128, 128); }
+        if (name == "thistle") { return StyleSheet.Pack(255, 216, 191, 216); }
+        if (name == "tomato") { return StyleSheet.Pack(255, 255, 99, 71); }
+        if (name == "turquoise") { return StyleSheet.Pack(255, 64, 224, 208); }
+        if (name == "violet") { return StyleSheet.Pack(255, 238, 130, 238); }
+        if (name == "wheat") { return StyleSheet.Pack(255, 245, 222, 179); }
+        if (name == "white") { return StyleSheet.Pack(255, 255, 255, 255); }
+        if (name == "whitesmoke") { return StyleSheet.Pack(255, 245, 245, 245); }
+        if (name == "yellow") { return StyleSheet.Pack(255, 255, 255, 0); }
+        if (name == "yellowgreen") { return StyleSheet.Pack(255, 154, 205, 50); }
+    }
+
+    // 单个十六进制字节的数值（0-15），非十六进制时 -1（ASCII 区间快速计算，消除 16 次字符串比对）。
+    static int HexDigitByte(int b) {
+        if (b >= 48 && b <= 57) { return b - 48; }
+        if (b >= 97 && b <= 102) { return b - 87; }
+        if (b >= 65 && b <= 70) { return b - 55; }
+        return -1;
+    }
+
+    // 将十六进制字符串（最多 8 位）转换为打包 int。最高位为 1
+    // （alpha >= 0x80）自然产生负数，与 Theme token 一致。
+    static int HexToInt(string h) {
+        if (h == null) { return 0; }
+        int acc = 0;
+        int len = h.Length;
+        for (int i = 0; i < len; i = i + 1) {
+            int d = StyleSheet.HexDigitByte(h[i] & 255);
+            if (d < 0) { return 0; }
+            acc = (acc << 4) | d;
+        }
+        return acc;
+    }
+
+    // 单个十六进制字符的值（0-15），非十六进制时 -1。
+    static int HexDigit(string ch) {
+        if (ch == null || ch.Length == 0) { return -1; }
+        return StyleSheet.HexDigitByte(ch[0] & 255);
+    }
+
+    // 字符是否为十进制数字。
+    static bool Digit(string ch) {
+        if (ch == null || ch.Length == 0) { return false; }
+        int b = ch[0] & 255;
+        return b >= 48 && b <= 57;
+    }
+
+}
