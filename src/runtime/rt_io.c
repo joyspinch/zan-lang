@@ -743,6 +743,39 @@ int32_t zan_io_resolve_all(const char *name, int32_t port, void *buf,
         memset(buf, 0, (size_t)cap);
         return 0;
     }
+
+    /* 快路径 1: 尝试直接按 IPv4 字面量解析，避开 getaddrinfo 调度开销与网络风暴 */
+    struct sockaddr_in sin4;
+    memset(&sin4, 0, sizeof(sin4));
+    sin4.sin_family = AF_INET;
+    sin4.sin_port = htons((uint16_t)port);
+    if (inet_pton(AF_INET, name, &sin4.sin_addr) == 1) {
+        memset(buf, 0, (size_t)cap);
+        memcpy(buf, &sin4, sizeof(sin4));
+        return 1;
+    }
+
+    /* 快路径 2: 尝试直接按 IPv6 字面量解析（支持带方括号形态 [::1]） */
+    const char *v6name = name;
+    char v6strip[64];
+    if (name[0] == '[') {
+        size_t l = strlen(name);
+        if (l > 2 && l < sizeof(v6strip) && name[l - 1] == ']') {
+            memcpy(v6strip, name + 1, l - 2);
+            v6strip[l - 2] = '\0';
+            v6name = v6strip;
+        }
+    }
+    struct sockaddr_in6 sin6;
+    memset(&sin6, 0, sizeof(sin6));
+    sin6.sin6_family = AF_INET6;
+    sin6.sin6_port = htons((uint16_t)port);
+    if (inet_pton(AF_INET6, v6name, &sin6.sin6_addr) == 1) {
+        memset(buf, 0, (size_t)cap);
+        memcpy(buf, &sin6, sizeof(sin6));
+        return 1;
+    }
+
     char portstr[16];
     snprintf(portstr, sizeof(portstr), "%d", port);
     struct addrinfo hints;

@@ -76,10 +76,17 @@ public class TcpClient : IDisposable {
         long deadline = 0;
         if (bounded) { deadline = Socket.NativeMonotonicUs() + limit * 1000; }
         byte[] records = new byte[16 * 32];
-        int count = await Socket.ResolveAllAsync(host, port, records);
-        if (count <= 0) {
-            TcpClient.MarkConnectResolveFailed(true);
-            return null;
+        bool fromCache = false;
+        int count = DnsCache.Lookup(host, port, records);
+        if (count > 0) {
+            fromCache = true;
+        } else {
+            count = await Socket.ResolveAllAsync(host, port, records);
+            if (count <= 0) {
+                TcpClient.MarkConnectResolveFailed(true);
+                return null;
+            }
+            DnsCache.Store(host, port, records, count);
         }
         for (int i = 0; i < count; i = i + 1) {
             byte[] rec = new byte[32];
@@ -120,6 +127,19 @@ public class TcpClient : IDisposable {
                 TcpClient.MarkConnectTimeout(true);
                 return null;
             }
+        }
+        if (fromCache) {
+            // 缓存的候选地址全部失效（如对端漂移或下线），主动驱逐失效缓存并以剩余预算重试一次新鲜解析
+            DnsCache.Invalidate(host, port);
+            int retryRemain = -1;
+            if (bounded) {
+                retryRemain = (int)((deadline - Socket.NativeMonotonicUs()) / 1000);
+                if (retryRemain <= 0) {
+                    TcpClient.MarkConnectTimeout(true);
+                    return null;
+                }
+            }
+            return await TcpClient.ConnectAsync(host, port, retryRemain, allowLoopback, allowPrivate);
         }
         return null;
     }

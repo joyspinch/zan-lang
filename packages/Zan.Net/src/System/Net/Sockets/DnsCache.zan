@@ -1,0 +1,120 @@
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Threading;
+
+namespace System.Net.Sockets;
+
+// DNS 解析条目容器：持有序列化后的 sockaddr 记录数组与到期时间戳。
+public class DnsCacheEntry {
+    public byte[] records;
+    public int count;
+    public long expiryMs;
+
+    public DnsCacheEntry(byte[] rec, int cnt, long exp) {
+        this.records = rec;
+        this.count = cnt;
+        this.expiryMs = exp;
+    }
+}
+
+// 线程与协程安全的进程内 DNS 解析结果缓存。
+// 高并发场景下（如微服务/API网关每秒数千次向同一域名建连）避免反复触发
+// 同步 getaddrinfo 系统调用与阻塞调度器，杜绝 DNS 请求风暴。
+// 默认 TTL 为 60 秒，最大容量 256 条，支持在建连失败时主动驱逐失效记录。
+public class DnsCache {
+    private static Dictionary<string, DnsCacheEntry> entries = new Dictionary<string, DnsCacheEntry>();
+    private static nint mtx = Mutex.Create();
+    private static int maxEntries = 256;
+    private static long defaultTtlMs = 60000;
+
+    private static void EnsureInit() {
+        if (DnsCache.mtx == 0) {
+            DnsCache.mtx = Mutex.Create();
+        }
+    }
+
+    private static string MakeKey(string host, int port) {
+        if (host == null) { host = ""; }
+        return host.ToLower() + ":" + Convert.ToString(port);
+    }
+
+    // 查询缓存。若命中且未过期，将 records 拷贝到 outRecords 并返回地址数量；否则返回 0。
+    public static int Lookup(string host, int port, byte[] outRecords) {
+        if (host == null || host.Length == 0 || outRecords == null) { return 0; }
+        DnsCache.EnsureInit();
+        string key = DnsCache.MakeKey(host, port);
+        long now = Stopwatch.GetMilliseconds();
+        DnsCacheEntry found = null;
+        Mutex.Lock(DnsCache.mtx);
+        try {
+            if (DnsCache.entries.ContainsKey(key)) {
+                DnsCacheEntry e = DnsCache.entries[key];
+                if (now < e.expiryMs) {
+                    found = e;
+                } else {
+                    DnsCache.entries.Remove(key);
+                }
+            }
+        } finally {
+            Mutex.Unlock(DnsCache.mtx);
+        }
+        if (found != null && found.count > 0) {
+            int copyLen = found.count * 32;
+            if (copyLen > outRecords.Length) { copyLen = outRecords.Length; }
+            for (int i = 0; i < copyLen; i = i + 1) {
+                outRecords[i] = found.records[i];
+            }
+            return copyLen / 32;
+        }
+        return 0;
+    }
+
+    // 存入缓存。
+    public static void Store(string host, int port, byte[] records, int count) {
+        if (host == null || host.Length == 0 || records == null || count <= 0) { return; }
+        DnsCache.EnsureInit();
+        string key = DnsCache.MakeKey(host, port);
+        long exp = Stopwatch.GetMilliseconds() + DnsCache.defaultTtlMs;
+        byte[] copy = new byte[count * 32];
+        for (int i = 0; i < copy.Length; i = i + 1) {
+            copy[i] = records[i];
+        }
+        DnsCacheEntry entry = new DnsCacheEntry(copy, count, exp);
+        Mutex.Lock(DnsCache.mtx);
+        try {
+            if (DnsCache.entries.Count >= DnsCache.maxEntries) {
+                DnsCache.entries.Clear();
+            }
+            DnsCache.entries[key] = entry;
+        } finally {
+            Mutex.Unlock(DnsCache.mtx);
+        }
+    }
+
+    // 驱逐单条记录（用于在连接建立失败时主动清除失效缓存）。
+    public static void Invalidate(string host, int port) {
+        if (host == null || host.Length == 0) { return; }
+        DnsCache.EnsureInit();
+        string key = DnsCache.MakeKey(host, port);
+        Mutex.Lock(DnsCache.mtx);
+        try {
+            if (DnsCache.entries.ContainsKey(key)) {
+                DnsCache.entries.Remove(key);
+            }
+        } finally {
+            Mutex.Unlock(DnsCache.mtx);
+        }
+    }
+
+    // 清空全部缓存。
+    public static void Clear() {
+        DnsCache.EnsureInit();
+        Mutex.Lock(DnsCache.mtx);
+        try {
+            DnsCache.entries.Clear();
+        } finally {
+            Mutex.Unlock(DnsCache.mtx);
+        }
+    }
+}

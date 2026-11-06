@@ -1,5 +1,6 @@
 using System;
 using System.IO;
+using System.Diagnostics;
 using System.Net.Sockets;
 using System.Net.Http;
 using System.Net.Tls;
@@ -16,6 +17,9 @@ public class HttpConnectionPool : IDisposable {
     nint mtx;
     List<PooledHttpConnection> idleList;
     int activeCount;
+    Gate gate;
+    bool allowOverflow;
+    bool disposed;
 
     public HttpConnectionPool(int maxConnections, int maxIdleConnections, long idleTimeoutMs, long maxLifetimeMs) {
         this.maxConnections = maxConnections > 0 ? maxConnections : 32;
@@ -25,6 +29,9 @@ public class HttpConnectionPool : IDisposable {
         this.mtx = Mutex.Create();
         this.idleList = new List<PooledHttpConnection>();
         this.activeCount = 0;
+        this.gate = new Gate();
+        this.allowOverflow = false;
+        this.disposed = false;
     }
 
     public static HttpConnectionPool CreateDefault() {
@@ -35,6 +42,8 @@ public class HttpConnectionPool : IDisposable {
     public int MaxIdleConnections() { return this.maxIdleConnections; }
     public long IdleTimeoutMs() { return this.idleTimeoutMs; }
     public long MaxLifetimeMs() { return this.maxLifetimeMs; }
+    public bool AllowsOverflow() { return this.allowOverflow; }
+    public void SetAllowOverflow(bool allow) { this.allowOverflow = allow; }
 
     public void SetLimits(int maxConnections, int maxIdleConnections, long idleTimeoutMs, long maxLifetimeMs) {
         if (this.mtx == 0) { return; }
@@ -46,6 +55,44 @@ public class HttpConnectionPool : IDisposable {
             if (maxLifetimeMs > 0) { this.maxLifetimeMs = maxLifetimeMs; }
         } finally {
             Mutex.Unlock(this.mtx);
+        }
+    }
+
+    // 异步租借空闲连接或获取新建连接许可。
+    // 1. 若有健康空闲连接，直接返回复用；
+    // 2. 若当前存活连接数未达 maxConnections，成功申请 1 个创建许可并返回 null（由调用方建连，失败须调 ReleasePermit）；
+    // 3. 若并发连接数已满，挂起在协程 Gate 上排队等待其他请求归还连接或释放槽位；
+    // 4. 若在 timeoutMs 内未等到可用槽位且未开启 allowOverflow，抛出 HttpRequestException 熔断，杜绝无界溢出创建连接击穿下游；
+    //    若开启了 allowOverflow，在排队超时后返回 null 且不计入 pool 计数（降级为单次无池化连接）。
+    public async PooledHttpConnection RentOrPermitAsync(int timeoutMs) {
+        if (this.mtx == 0 || this.disposed) {
+            throw new InvalidOperationException("HttpConnectionPool is closed or disposed");
+        }
+        long budget = timeoutMs > 0 ? (long)timeoutMs : 10000L;
+        long startMs = Stopwatch.GetMilliseconds();
+        while (true) {
+            if (this.mtx == 0 || this.disposed) {
+                throw new InvalidOperationException("HttpConnectionPool is closed or disposed");
+            }
+            PooledHttpConnection idle = this.TryRentIdle();
+            if (idle != null) {
+                return idle;
+            }
+            if (this.TryAcquirePermit()) {
+                return null;
+            }
+            long elapsed = Stopwatch.GetMilliseconds() - startMs;
+            long remain = budget - elapsed;
+            if (remain <= 0) {
+                throw new HttpRequestException("connection pool wait timeout: all "
+                    + Convert.ToString(this.maxConnections) + " connections are busy");
+            }
+            int waitMs = remain > 2000L ? 2000 : (int)remain;
+            if (this.gate != null) {
+                await this.gate.Wait(waitMs);
+            } else {
+                await Task.Delay(20);
+            }
         }
     }
 
@@ -121,6 +168,9 @@ public class HttpConnectionPool : IDisposable {
         if (needDispose) {
             conn.Dispose();
         }
+        if (this.gate != null) {
+            this.gate.Signal();
+        }
     }
 
     // 撤销创建许可（建连失败时回退计数）
@@ -133,6 +183,9 @@ public class HttpConnectionPool : IDisposable {
             }
         } finally {
             Mutex.Unlock(this.mtx);
+        }
+        if (this.gate != null) {
+            this.gate.Signal();
         }
     }
 
@@ -152,6 +205,9 @@ public class HttpConnectionPool : IDisposable {
         }
         for (int i = 0; i < toClose.Count; i = i + 1) {
             toClose[i].Dispose();
+        }
+        if (this.gate != null) {
+            this.gate.SignalAll();
         }
     }
 
@@ -177,10 +233,16 @@ public class HttpConnectionPool : IDisposable {
 
     // 彻底销毁连接池，清理所有存活连接并释放互斥量底层系统句柄
     public void Dispose() {
+        this.disposed = true;
         if (this.mtx != 0) {
             this.CloseAll();
             Mutex.Destroy(this.mtx);
             this.mtx = 0;
+        }
+        if (this.gate != null) {
+            this.gate.SignalAll();
+            this.gate.Close();
+            this.gate = null;
         }
     }
 }
