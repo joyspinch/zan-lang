@@ -11,13 +11,13 @@ ChatView 等大型组件跨两列，每张卡片按组件自身特性配置演�
 ## 运行
 
 ```bash
-build/zanc examples/html_gallery/App.html examples/html_gallery/App.zan \
-    --auto-stdlib -o html_gallery.exe
+build/zanc examples/html_gallery/zan.proj --auto-stdlib -o html_gallery.exe
 html_gallery.exe
 ```
 
-- **设计稿必须是编译输入的第一个文件**（zanc 从第一份设计文档合成
-  窗口与控件字段；漏了它 GenForm 不运行，报一片 undeclared identifier）。
+- **声明式窗口与设计稿嵌入**：项目遵从 B-ID149 声明式窗口规范（"窗口即对象"）。
+  在 `zan.proj` 中配置 `gen.embed = src/HtmlGallery.html` 将设计稿打包进二进制资源，
+  主窗口继承 `Form`，运行时由 `Form.Show()` 解析 HTML 并自动完成控件树挂载与事件绑定。
 - 编译没加 `--subsystem windows`，故意保留控制台：启动自检会逐组件
   打印结果，最后一行 `SELFTEST fails=0 of 86` 即全部建成且类型正确
   （标签名拼错会回退 Element 占位，自检让它变成可机检事实）。

@@ -22,7 +22,7 @@
 
 ### 批次 2 · 独立账（无前置，任一会话可领，按编号序）
 
-- [ ] B-ID161 examples/html_gallery 源级损坏：Page0-7 类全仓无定义、无 zan.proj、入口 .zan 引用它们必然 unresolved（HEAD snapshot 与实验编译器一致报错），主类曾于 d364a8167 恢复但引用页未随之恢复；且 CLI 拒收 .html 直编，模板门不覆盖它。修复 = 补齐 Page0-7 定义与 zan.proj 或删净引用，纳入模板门。
+- [x] B-ID161 examples/html_gallery 源级损坏修复与纳入模板门：补齐 Page0-7 控件字段与 zan.proj，规范主窗声明式 Form 代码，补齐 ControlBootstrap 与 TagToKind 对 Typography/IconView/RadioButton/ListItem/Upload 等的映射与组件工厂自注册，更新 tests/run_templates.cmake 与 CMakeLists.txt templates_build 测试集成，实机自检 86 组控件自检全部通过（fails=0 of 86）。
 - [x] B-ID164 SSE 流式解析四份平行实现收拢（commit bbf290694）：新建 `packages/Zan.Net/src/System/Net/Sse/SseLineReader.zan`，AiStream 与 Mvc.Ai 全量收敛改用；ide_zan/SseLive 待在飞迁移落地后改用。
 - [x] B-ID165 小工具重复收口（commit e833ababa）：新建 `stdlib/System/Text/TextUtil.zan` 提供空安全 TrimOr/TrimOrEmpty/StartsWithOr；TaskScheduler 与 ServiceProcess 消除手写 O(n) 空白剥离；Arpg 家族/Ansi/ChartTimeline 统一收拢至 MathUtil.Clamp。
 - [x] B-ID166 超长文件 partial 拆分第一批 + 巨函数拆解：

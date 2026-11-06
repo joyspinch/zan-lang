@@ -4192,6 +4192,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
     COMMAND ${CMAKE_COMMAND}
       -DZANC=$<TARGET_FILE:zanc>
       -DTEMPLATES=${CMAKE_SOURCE_DIR}/templates
+      -DEXTRA_PROJECTS=${CMAKE_SOURCE_DIR}/examples/html_gallery/zan.proj
       -DSTDLIB=${CMAKE_SOURCE_DIR}/stdlib
       -DDRIVER_DIR=$<TARGET_FILE_DIR:zan_gui>
       -DWORK=${CMAKE_BINARY_DIR}/templates_build

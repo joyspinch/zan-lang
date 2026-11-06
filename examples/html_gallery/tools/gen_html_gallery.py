@@ -19,7 +19,7 @@ import json, io, base64, struct, zlib
 import os
 ROOT = os.path.normpath(os.path.join(os.path.dirname(
     os.path.abspath(__file__)), "..", "..", ".."))
-OUT = os.path.join(ROOT, "examples", "html_gallery", "App.html")
+OUT = os.path.join(ROOT, "examples", "html_gallery", "src", "HtmlGallery.html")
 EXCLUDED = {"WebViewBox", "CefBrowserBox", "ChoiceGroup"}
 # 由 code-behind 构造真控件的占位壳（HTML 里是 Panel）
 CODE_FED = {"Wizard", "Popover", "FormField", "ListView", "AlarmBanner",
