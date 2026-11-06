@@ -191,7 +191,7 @@
 | E2054 | E | no '%.*s' indexer takes an index of type '%.*s' |
 | E2055 | E | rank-%d array indexed with %d indices |
 | E2056 | E | no '%.*s' indexer accepts this assignment |
-| E2057 | E | cannot instantiate a type parameter '%s' |
+| E2057 | E | cannot instantiate a type parameter '%s'（checker 拦无 `new()` 约束写法；B-ID163② 起受约束但处于擦除体（类型实参未定）的 `new T()` 在 irgen 兜底处同号响亮硬失败 exit 70——`emit_erased_new_hard_fail`，单态化路径不受影响） |
 | E2058 | E | cannot instantiate abstract class '%s' |
 | E2059 | E | an array creation with an initializer requires constant dimensions |
 | E2060 | E | array initializer has %d element%s but the dimensions describe %lld |
@@ -355,6 +355,7 @@
 | E3101 | E | out of memory recording obfuscated string literals (%d recorded) |
 | E3102 | E | entry point 'Main' cannot be declared in a generic class -- move it to a non-generic type (C# parity) |
 | E3103 | E | expression tree lambda: …（树 lambda 不可译形状 fail-closed——decimal 字面、不支持的运算符/方法、lambda 参数自身引用、外层变量捕获、非 `x.F` 直接成员访问、LIKE 实参非常量等；见 src/compiler/irgen_expr_lambda.c。树 lambda = 显式 `(ExprNode x) => …` / `(Expr&lt;T&gt; x) => …` 单参表达式体，在 irgen emit_lambda_typed 降级为 ExprNode 构造树，静默降级会把 ORM 谓词变成全表扫） |
+| E3104 | E | cannot convert a lambda to async delegate '%.*s': a lambda is not a coroutine; assign an async method group instead（B-ID163①：lambda 非协程（体内 await 即 E3032），旧实现静默通过、调用侧按协程帧步进发射、结果槽永远留默认值——string 形即静默空串。收口点 emit_lambda_typed，lambda→delegate 全部转换面汇聚于此；方法组路径的孪生检查是 E3047。selfhost 孪生见 TASKS B-ID168） |
 
 ### 互操作/运行时契约（src/compiler/irgen_abi.c + irgen_expr_core.c + checker.c，段 4000–4999）
 

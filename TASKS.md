@@ -12,23 +12,30 @@
 
 ### 批次 0 · 在飞（持有会话未提交；其他会话勿碰同文件）
 
-（暂空）
-
+- [~] 在飞观察（2026-11-06）：工作区约 177 个文件未提交——JsonValue→JsonWriter 迁移（Zan.Ai/Zan.Json/Zan.Mvc/Zan.Net/ide_zan services+dialogs/templates 全家）+ IDE LSP 模型调整（LspRange/LspTextEdit 新增、dap/lsp 旧模型删除）+ `src/compiler/irgen_async.c` 改动 + 新增 conformance（json_serializer_dict）。持有会话未走调度器注册；本轮全量整改（B-ID163-166）已按黑名单绕开这些文件。
 
 ### 批次 1 · 根修项（闭它解锁下游，优先领）
 
+- [~] B-ID163 编译器 fail-loud 四收口（本轮整改，C 宿主）：① 同步 lambda 赋 async 委托静默返回空串——`irgen_expr_lambda.c:1377 emit_lambda_typed` 加 `delegate_is_async` 判定发 E3104（唯一全覆盖收口点，仓内 28 处 async 委托赋值全为方法组，零破坏）；② 擦除体 `new T()` 兜底返回 null 零诊断——`irgen_expr_construct.c:2060` 兜底前发 E2057（复用号，特化路径不受影响）；③ `(T)x` 引用下转失败 try 外静默默认值——`irgen_expr_construct.c:3517-3560` cast.bad 去 in_try 分支统一走 `emit_throw_guard_exception`+`emit_raise_exception`，stdlib 补 InvalidCastException，`infer_guard_exception_sym` 加映射（仓内 (string)×15/(int)×1623 纯整型/as×11 零破坏）；④ `as` 对 string/object/interface 零检查透传——`irgen_expr_dispatch.c:178-180` 补运行时类型检查保持静默 null 契约。
 - [ ] B-ID160 publish 反射 thunk 门控使框架字符串钩子哑火：`irgen_reflect.c` need_thunk 判定（约 :769-777）为 `!publish_mode || (flags & (MF_PROPGET|MF_PROPSET)) || attrs->count>0`——publish 档只为属性访问器/带注解方法生成 Invoke thunk（防 --gc-sections 锚定死代码），于是 `GetType().HasMethod("OnLoad")` 真而 Invoke 哑火，框架按字符串名回调的钩子（Form.Show 的 OnLoad 等）在 publish 形态静默丢失。证据链：同一程序 plain 形态钩子正常、publish 形态不触发、ZAN_NO_SHARD/nostrip 均无关、加 `[Custom]` 注解后 publish 全绿。现行契约（已写进 gui-design/html-window.md）：框架钩子方法必须带 `[Custom]` 注解。根修方向二选一：框架钩子默认保留 thunk；或编译期收集字符串字面量中的方法名作为 thunk 保留清单。单文件改动，不与任何在飞冲突。
 
 ### 批次 2 · 独立账（无前置，任一会话可领，按编号序）
 
 - [ ] B-ID161 examples/html_gallery 源级损坏：Page0-7 类全仓无定义、无 zan.proj、入口 .zan 引用它们必然 unresolved（HEAD snapshot 与实验编译器一致报错），主类曾于 d364a8167 恢复但引用页未随之恢复；且 CLI 拒收 .html 直编，模板门不覆盖它。修复 = 补齐 Page0-7 定义与 zan.proj 或删净引用，纳入模板门。
 - [ ] B-ID162 zanc `--debug` 档编译 oneplus 图形程序段崩溃（rc=139，无诊断输出）：HEAD 快照编译器（`git archive HEAD` 实体落盘）复现，hello --debug 正常——oneplus 图特有（疑与设计稿内嵌/WebView 相关的 irgen 路径）。2026-11-05 当日实验树 zanc（B-ID71 在飞态）plain/publish 也段崩溃，B-ID71 落地后未复测；修复时先拿当前 HEAD 复测两个崩溃面再定位。
+- [~] B-ID164 SSE 流式解析四份平行实现收拢：SseLive.zan（ide_zan）/AiStream.zan（Zan.Ai）/SseClient.zan（Zan.Net）/Ai.zan（Zan.Mvc）各自手写半行缓冲+`data:`+`[DONE]`。本轮（2026-11-06）先做干净侧：新建 `Zan.Net/.../Sse/SseLineReader.zan`，AiStream/SseClient/Mvc.Ai 改用；ide_zan/SseLive 在飞〔前置：JsonValue→JsonWriter 迁移落地〕闭账后改用。
+- [~] B-ID165 小工具重复收口：Trim/StartsWith×21（2 处 O(n²)：TaskScheduler.zan:510、ServiceProcess.zan:247，AiAgent.Sse.zan:12 在飞顺延）→ stdlib System/Text null 安全版；Clamp×13→stdlib Math；ParseHex×4；UrlEncode×3→统一 Encoding.UrlEncode；EnsureCapacity×7（Game.Server）→包内共享。本轮做干净文件，AiAgent.Sse 顺延。
+- [~] B-ID166 超长文件 partial 拆分第一批 + 巨函数拆解：Collection(2626)/Chart(3170)/StyleSheet(3445)/Win32Shell(3085)/CodeEditor.Completion(2826) 按 `主类.切面.zan` partial 惯例拆（新文件 ≤1200 行、单函数 ≤120 行、搬家不重排）；ChartOption.Json.zan FromJsonValue(2419 行)与 Designer.Form.zan RenderDesignCanvas(1046 行)巨函数先行分解。§17.4 存量债 83 个文件，本批为第一批。
 
 ### 批次 3 · 有前置（前置闭了再领）
 
-（暂空——本批次全部闭账移出。）
+- [ ] B-ID167〔前置：批次 0 在飞 JsonValue→JsonWriter 迁移落地〕在飞文件上的整改顺延包：① `AiClient.zan:74-76` 三参构造器漏初始化 `clients` 字段（经此构造的客户端一调 Dispose 即空引用；头部 `: this(new AiConfig(...))` 链修复）；② AiClient/AnthropicClient 提炼 AiHttp（PostJson 36 行逐行同、客户端缓存、错误提取）；③ ide_zan SseLive.zan 改用 SseLineReader 只留业务增量；④ ide_zan dialogs `T(lang,en,zh)`×8 收拢 Lang.Tr + Window `Get/GetInt`×4 提炼 ChildWindow 基类；⑤ JsonWriter 17 个单行别名三套命名收敛（动公共 API 先全仓 grep 消费方）。
 
 ### 批次 4 · 大工程 / 独占窗口（无其他 irgen/runtime 改动在飞时领）
+
+- [ ] B-ID168 selfhost 孪生与巨石拆分：① A1（lambda→async 委托，selfhost 无 delegate_is_async 概念需补判定）与 A3（强转异常同号）的 selfhost 同号孪生；② ngen.zan(15608)/irgen_expr.zan(11305)/ngen_host.zan(7496) 等拆分——验证走三门 `selfhost_gen1`+`selfhost_fixed_point`(g2==g3 字节等值)+`selfhost_diff`，新文件必须插 `scripts/selfhost_sources.txt` 原文件相邻位、搬家不重排（MergePartials 按源清单顺序合并）。
+- [ ] B-ID169 `Convert.*` 静默 0 语义收敛：坏输入返回 0 使 try/catch 兜底成死代码（SKILL.md:496-509 已记陷阱）；落地前先全仓用量审计，或新增 Strict 变体保留旧径并公告。
+- [ ] B-ID170 结构收口三件：① 中风险拆分（Designer 三件套 6909/4301/3466、App.zan 4470 的 ProcessEvent/ApplyEvent 纠缠块、SceneDesigner 2951）；② 命名空间三前缀统一（System.* 被 stdlib/packages 同名分仓、Gui/Game 裸名——独立大工程，动前定一尊）；③ zan.pkg 加 deps 字段 + zan-pm restore 下载闭环（pm_main.c:216-248 现为空转）。
 
 - [ ] B-ID152〔裁定搁置〕ZanDB 刀8 段 zstd 压缩：stdlib 无压缩绑定，需引入外部库链接与三平台分发——与自包含分发架构相抵；且压缩块缓存仍需解压驻留，对 2G 内存机目标无益。数据面收益已被 tag 11 行编码（4×↓）替代大半，除非出现大文本字段压缩需求，不领。
 - [ ] B-ID153〔裁定搁置〕ZanDB 刀9 SIMD 距离内核：运行时只有 CPU 特性探测（System.Runtime.Intrinsics.Cpu）无向量算术内建，落地须编译器/运行时新增 AVX2/NEON 内建——超出 ZanDB 数据面范围。评估前置已满足：发布档基线实测 approx 2ms/20k 库（debug 9.9ms，约 5×，见 ZanDb README 量化检索实测），而真实查询延迟由重打分文档行点查主导（12ms，IO 不随构建档变），SIMD 对端到端收益被摊薄；除非出现纯 ADC 高 QPS 场景，不领。

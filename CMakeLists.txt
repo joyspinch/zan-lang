@@ -1554,6 +1554,18 @@ add_test(NAME diag_method_group_as_value_rejected
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_method_group_as_value_rejected PROPERTIES TIMEOUT 60)
 
+# B-ID163①: A sync lambda silently landing on an async delegate used to pass
+# the checker and return the type default ("" for strings) at call time.
+# A lambda is not a coroutine (in-body await is already E3032).
+add_test(NAME diag_lambda_to_async_delegate
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/lambda_to_async_delegate.zan
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/diag_lambda_to_async_delegate${_exe_ext}
+    "-DEXPECT_REGEX=\\[E3104\\] cannot convert a lambda to async delegate .Fetch."
+    -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
+set_tests_properties(diag_lambda_to_async_delegate PROPERTIES TIMEOUT 60)
+
 add_test(NAME diag_method_group_binary_rejected
   COMMAND ${CMAKE_COMMAND}
     -DZANC=$<TARGET_FILE:zanc>
@@ -6433,7 +6445,9 @@ foreach(_runtime_case IN ITEMS
     substring_window_oob
     span_window_oob
     span_negative_length
-    member_array_field_oob)
+    member_array_field_oob
+    cast_invalid_downcast)
+  set(_runtime_exit 70)
   if(_runtime_case STREQUAL list_removeat_oob OR
      _runtime_case STREQUAL list_insert_oob OR
      _runtime_case STREQUAL member_list_field_oob)
@@ -6452,6 +6466,11 @@ foreach(_runtime_case IN ITEMS
     set(_runtime_regex "substring index out of bounds")
   elseif(_runtime_case STREQUAL substring_window_oob)
     set(_runtime_regex "substring range out of bounds")
+  elseif(_runtime_case STREQUAL cast_invalid_downcast)
+    # B-ID163③: out-of-try invalid downcast throws InvalidCastException and
+    # terminates as an unhandled exception (exit 1, not the guard-hard 70).
+    set(_runtime_regex "InvalidCastException")
+    set(_runtime_exit 1)
   else()
     set(_runtime_regex "array index out of bounds")
   endif()
@@ -6461,6 +6480,7 @@ foreach(_runtime_case IN ITEMS
       -DSRC=${CMAKE_SOURCE_DIR}/tests/runtime/${_runtime_case}.zan
       -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/runtime_${_runtime_case}${_exe_ext}
       "-DEXPECT_REGEX=${_runtime_regex}"
+      "-DEXPECT_EXIT=${_runtime_exit}"
       -P ${CMAKE_SOURCE_DIR}/tests/run_runtime_error.cmake)
   set_tests_properties(runtime_${_runtime_case} PROPERTIES TIMEOUT 60)
 endforeach()

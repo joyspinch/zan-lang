@@ -1000,6 +1000,31 @@ LLVMValueRef emit_expr_tuple(zan_irgen_t *g, zan_ast_node_t *expr,
     return alloca;
 }
 zan_ast_node_t *owned_rhs_marker(zan_irgen_t *g, zan_loc_t loc);
+/* B-ID163②：new T() 擦除体兜底出口。类型实参未定时旧实现静默返回零值
+ * （调用方拿 null 继续跑）；此处把失败发射挪进独立块再硬失败
+ * （emit_erased_new_hard_fail，exit 70 带文案），当前块正常 br 出去——
+ * 调用方还要在"死块"里继续发射（LLVM 块中块 terminator 非法，探针实录
+ * E3090）。单态化路径（实参已替换，见 conformance generic_new_constraint）
+ * actual_t 不是 TYPE_TYPE_PARAM，不受影响。 */
+static LLVMValueRef new_erased_fallback(zan_irgen_t *g, zan_type_t *actual_t) {
+    if (actual_t && actual_t->kind == TYPE_TYPE_PARAM && g->current_fn &&
+        LLVMGetInsertBlock(g->builder)) {
+        LLVMValueRef cfn = LLVMGetBasicBlockParent(
+            LLVMGetInsertBlock(g->builder));
+        LLVMBasicBlockRef fail_bb = LLVMAppendBasicBlockInContext(
+            g->ctx, cfn, "newt.fail");
+        LLVMBasicBlockRef dead_bb = LLVMAppendBasicBlockInContext(
+            g->ctx, cfn, "newt.dead");
+        LLVMBuildBr(g->builder, fail_bb);
+        LLVMPositionBuilderAtEnd(g->builder, fail_bb);
+        emit_erased_new_hard_fail(g);
+        if (!LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(g->builder)))
+            LLVMBuildUnreachable(g->builder);
+        LLVMPositionBuilderAtEnd(g->builder, dead_bb);
+    }
+    return LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 0, 0);
+}
+
 LLVMValueRef emit_expr_new_expr(zan_irgen_t *g, zan_ast_node_t *expr,
         local_scope_t *locals) {
         /* 工厂调用接对象初始化式 */
@@ -2056,8 +2081,8 @@ LLVMValueRef emit_expr_new_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                 }
             }
         }
-        return LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 0, 0);
-    return LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 0, 0);
+        return new_erased_fallback(g, actual_t);
+    return new_erased_fallback(g, actual_t);
 }
 
 /* 统一三元表达式分支值类型至 PHI 节点类型，适配整型位宽与指针类型 */
@@ -3478,21 +3503,19 @@ LLVMValueRef emit_expr_cast_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                     LLVMBasicBlockRef cast_m = LLVMAppendBasicBlockInContext(
                         g->ctx, cfn, "cast.m");
                     LLVMBuildCondBr(g->builder, ok, cast_m, cast_bad);
+                    /* B-ID163③：失败一律抛 InvalidCastException（C# 同语义：
+                     * try 内可 catch，try 外未捕获终止进程）。旧实现 try 外
+                     * 走 A509 软失败——stderr 一次后拿 null 继续跑，正是
+                     * "强转失败静默给默认值"缺陷本体。cast_m 现在只有
+                     * cast_ok 单前驱，直接返回 val，不再需要 phi。 */
                     LLVMPositionBuilderAtEnd(g->builder, cast_bad);
-                    emit_runtime_check(g,
-                        LLVMConstInt(LLVMInt1TypeInContext(g->ctx), 1, 0),
-                        expr->loc,
+                    emit_cast_throw(g, expr->loc,
                         "InvalidCastException: object is not an instance of the target type");
-                    LLVMBasicBlockRef cast_bad_end =
-                        LLVMGetInsertBlock(g->builder);
-                    LLVMBuildBr(g->builder, cast_m);
+                    if (!LLVMGetBasicBlockTerminator(
+                            LLVMGetInsertBlock(g->builder)))
+                        LLVMBuildUnreachable(g->builder);
                     LLVMPositionBuilderAtEnd(g->builder, cast_m);
-                    LLVMValueRef rphi = LLVMBuildPhi(g->builder, target,
-                                                     "cast.r");
-                    LLVMValueRef rvals[] = { val, LLVMConstNull(target) };
-                    LLVMBasicBlockRef rbbs[] = { cast_ok, cast_bad_end };
-                    LLVMAddIncoming(rphi, rvals, rbbs, 2);
-                    return rphi;
+                    return val;
                 }
             }
         }
@@ -3847,17 +3870,13 @@ static LLVMValueRef emit_unbox_struct(zan_irgen_t *g, zan_type_t *tt,
     LLVMValueRef good = LLVMBuildLoad2(g->builder, lt, slot, "unbox.v");
     LLVMBuildBr(g->builder, m_bb);
     LLVMPositionBuilderAtEnd(g->builder, bad_bb);
-    emit_runtime_check(g,
-        LLVMConstInt(LLVMInt1TypeInContext(g->ctx), 1, 0),
-        expr->loc,
+    /* B-ID163③：拆箱失败同强转口径——无条件抛 InvalidCastException，
+     * 不再软失败拿零值结构体继续跑。m_bb 只剩 ok_bb 单前驱，无需 phi。 */
+    emit_cast_throw(g, expr->loc,
         "InvalidCastException: object is not an instance of the target struct type");
-    LLVMBasicBlockRef bad_end = LLVMGetInsertBlock(g->builder);
-    LLVMBuildBr(g->builder, m_bb);
+    if (!LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(g->builder)))
+        LLVMBuildUnreachable(g->builder);
     LLVMPositionBuilderAtEnd(g->builder, m_bb);
-    LLVMValueRef phi = LLVMBuildPhi(g->builder, lt, "unbox.r");
-    LLVMValueRef vals[] = { good, LLVMConstNull(lt) };
-    LLVMBasicBlockRef bbs[] = { ok_bb, bad_end };
-    LLVMAddIncoming(phi, vals, bbs, 2);
-    return phi;
+    return good;
 }
 

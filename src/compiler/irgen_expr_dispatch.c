@@ -199,21 +199,22 @@ LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_t *loca
                       st->kind == TYPE_STRING || st->kind == TYPE_CLASS;
         bool tt_ref = tt->kind == TYPE_OBJECT || tt->kind == TYPE_INTERFACE ||
                       tt->kind == TYPE_STRING || tt->kind == TYPE_CLASS;
-        if (!st_ref || !tt_ref || st->kind == TYPE_STRING ||
-            tt->kind == TYPE_STRING || tt->kind == TYPE_OBJECT ||
-            tt->kind == TYPE_INTERFACE)
+        if (!st_ref || !tt_ref)
+            return emit_expr(g, expr->type_test.expr, locals);
+        /* B-ID163④：免查透传仅限静态可证安全的两条——object 目标（引用
+         * 源上转恒真）、string 源到 string（恒等）。旧实现把 string/
+         * interface 目标也零检查透传：异型对象 `as string` 直接把指针当
+         * string 用、无关类 `as 接口` 绕过实现检查——类型混淆
+         * （TASKS B-ID163④）。其余一律补运行时检查，失败静默 null
+         * （as 契约，C# 同语义；与强转 `(T)x` 的抛异常口径不同）。 */
+        if (tt->kind == TYPE_OBJECT)
+            return emit_expr(g, expr->type_test.expr, locals);
+        if (st->kind == TYPE_STRING && tt->kind == TYPE_STRING)
             return emit_expr(g, expr->type_test.expr, locals);
         LLVMValueRef v = emit_expr(g, expr->type_test.expr, locals);
         if (st->kind == TYPE_CLASS && type_is_or_derives(st, tt))
             return v;
-        if (st->kind == TYPE_CLASS && !type_is_or_derives(tt, st))
-            return v; 
-        char tbuf[320];
-        int tlen = (int)tt->sym->name.len;
-        if (tlen > 319) tlen = 319;
-        memcpy(tbuf, tt->sym->name.str, (size_t)tlen);
-        tbuf[tlen] = 0;
-        LLVMValueRef ok = emit_runtime_is_check(g, v, tbuf);
+        LLVMValueRef ok = emit_runtime_is_check_name(g, v, tt);
         return LLVMBuildSelect(g->builder, ok, v,
             LLVMConstNull(LLVMTypeOf(v)), "as.res");
     }

@@ -1380,6 +1380,20 @@ LLVMValueRef emit_lambda_typed(zan_irgen_t *g, zan_ast_node_t *expr,
     int pc = expr->lambda.params.count;
     bool exp_delegate = expected && expected->kind == TYPE_DELEGATE;
 
+    /* B-ID163①：lambda 不是协程（体内 await 本身就是 E3032），同步 lambda
+     * 落到 async 委托后，调用侧按协程帧步进发射、结果槽永远留默认值——
+     * string 形即静默空串（TASKS B-ID163 探针实录）。lambda→delegate 的
+     * 全部转换面（实参/var decl/字段初始化/赋值/对象初始化式）都汇聚于
+     * 本函数，这里是唯一全覆盖收口点；方法组路径的孪生检查是 E3047
+     * （check_delegate_async_match）。报错即收敛为 null，防级联噪声
+     * （E3103 同款写法）。 */
+    if (exp_delegate && expected->delegate_is_async) {
+        zan_diag_emit_code(g->diag, DIAG_ERROR, expr->loc, 3104,
+            "cannot convert a lambda to async delegate '%.*s': a lambda is not a coroutine; assign an async method group instead",
+            expected->name.len, expected->name.str ? expected->name.str : "?");
+        return LLVMConstNull(LLVMPointerType(i64, 0));
+    }
+
     /* B-ID65：显式树类型形参的 lambda 在发射口降级为 ExprNode 构造树。
      * 目标为委托时不降级——树 lambda 不隐式转委托（C# Expression<T> 同
      * 规），响亮拒绝。 */

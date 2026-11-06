@@ -1090,7 +1090,7 @@ void emit_release_active_catch_excs(zan_irgen_t *g, int base) {
         LLVMBuildCondBr(g->builder, is_own, rel_bb, cont_bb);
         LLVMPositionBuilderAtEnd(g->builder, rel_bb);
         LLVMValueRef ev = LLVMBuildLoad2(g->builder, i8ptr, exc_slot, "cex.re");
-        emit_eh_tmp_drop(g, ev);
+        if (!g->current_async_frame) emit_eh_tmp_drop(g, ev);
         zan_call2(g->builder,
             LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), &i8ptr, 1, 0),
             g->rt_release_dyn, &ev, 1, "");
@@ -1487,7 +1487,11 @@ static zan_symbol_t *lookup_sys_class(zan_irgen_t *g, const char *short_name, co
 
 static zan_symbol_t *infer_guard_exception_sym(zan_irgen_t *g, const char *msg) {
     zan_symbol_t *sym = NULL;
-    if (strstr(msg, "division by zero")) {
+    if (strstr(msg, "InvalidCast")) {
+        /* B-ID163③：强转/拆箱失败抛 InvalidCastException。放分支链最前，
+         * 防消息体其他子串（"instance"/"target" 等）被后面的分支误判。 */
+        sym = lookup_sys_class(g, "InvalidCastException", "System.InvalidCastException");
+    } else if (strstr(msg, "division by zero")) {
         sym = lookup_sys_class(g, "DivideByZeroException", "System.DivideByZeroException");
     } else if (strstr(msg, "not a valid")) {
         /* 解析失败（int.Parse / Convert.ToInt* 等的 "input is not a valid
@@ -1613,6 +1617,36 @@ void emit_runtime_check(zan_irgen_t *g, LLVMValueRef is_error,
     }
 
     LLVMPositionBuilderAtEnd(g->builder, cont_bb);
+}
+
+/* B-ID163②：擦除体（泛型类/泛型方法的未特化变体，类型实参未定，
+ * irgen_call_spec.c 同款场景）里的 new T() 落到 irgen 兜底——旧实现直接
+ * 返回零值，调用方拿 null 继续跑（TASKS B-ID163② 静默失效实录）。擦除体
+ * 编译期造不出对象（实参未定；单态化路径不经过兜底，conformance
+ * generic_new_constraint 不受影响），改为运行期响亮硬失败：擦除体真被
+ * 调到这里即 exit 70 带明确文案。 */
+void emit_erased_new_hard_fail(zan_irgen_t *g) {
+    if (!g->current_fn) return;
+    LLVMValueRef text = zan_irgen_intern_string(g,
+        "new T() in a generic-erased body: the type argument is not available here");
+    emit_guard_hard(g, text, 70);
+}
+
+/* B-ID163③：引用下转强转/拆箱失败一律抛异常（A509 软失败通道停用于
+ * 强转族——旧实现 try 外 stderr 一次后拿 null 继续跑，正是静默默认值
+ * 缺陷本体）。try 内可 catch（emit_raise_exception 的 lpad 通路）；
+ * try 外未捕获由运行时按未处理异常终止进程。C# 同语义。wasm 无 EH
+ * 通道，兜底硬失败 exit 70。调用方发射后续块前需检查/补 terminator。 */
+void emit_cast_throw(zan_irgen_t *g, zan_loc_t loc, const char *msg) {
+    (void)loc;
+    if (!g->current_fn) return;
+    zan_symbol_t *sym = infer_guard_exception_sym(g, msg);
+    if (sym && !g->target_is_wasm) {
+        emit_throw_guard_exception(g, sym, msg);
+        return;
+    }
+    LLVMValueRef text = zan_irgen_intern_string(g, msg);
+    emit_guard_hard(g, text, 70);
 }
 
 static void emit_string_null_report(zan_irgen_t *g, LLVMValueRef payload,

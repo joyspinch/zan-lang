@@ -2,6 +2,8 @@
 # Required: ZANC, SRC, OUT_EXE, EXPECT_REGEX.
 # STRICT=1 compiles with --strict-runtime and verifies exit(70) happens with
 # NO ZAN_RT_HARD env var (the program-baked flag, audit D7-family).
+# EXPECT_EXIT overrides the expected exit code (default 70, the guard-hard
+# contract); B-ID163③ unhandled-exception cases exit 1.
 
 cmake_policy(SET CMP0012 NEW)
 if(NOT ZANC OR NOT SRC OR NOT OUT_EXE OR NOT EXPECT_REGEX)
@@ -28,13 +30,16 @@ endif()
 if(NOT STRICT)
   set(ENV{ZAN_RT_HARD} "1")
 endif()
+if(NOT EXPECT_EXIT)
+  set(EXPECT_EXIT 70)
+endif()
 execute_process(
   COMMAND ${OUT_EXE}
   RESULT_VARIABLE run_rc
   OUTPUT_VARIABLE run_out
   ERROR_VARIABLE run_err)
-if(NOT run_rc EQUAL 70)
-  message(FATAL_ERROR "expected runtime-check exit 70, got ${run_rc}\n${run_out}${run_err}")
+if(NOT run_rc EQUAL ${EXPECT_EXIT})
+  message(FATAL_ERROR "expected runtime-check exit ${EXPECT_EXIT}, got ${run_rc}\n${run_out}${run_err}")
 endif()
 set(runtime_text "${run_out}${run_err}")
 if(NOT runtime_text MATCHES "${EXPECT_REGEX}")
