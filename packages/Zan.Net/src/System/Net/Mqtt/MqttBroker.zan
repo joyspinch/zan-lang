@@ -610,19 +610,42 @@ public class MqttBroker {
             byte[] body = pkt.body;
             int packetType = pkt.packetType;
 
+            // MQTT-3.1.0-1: 客户端建立连接后发送的首个报文必须是 CONNECT，否则断开连接
+            if (!sess.connected && packetType != MqttPacketType.CONNECT) {
+                break;
+            }
+
             if (packetType == MqttPacketType.CONNECT) {
                 // MQTT 禁止同一条连接发第二条 CONNECT——按协议错误断连，
                 // 否则同一会话对象会被重复加入会话表。
                 if (sess.connected) { break; }
+                if (pkt.flags != 0) { break; } // MQTT-2.2.2-1: CONNECT 固定头 flags 必须为 0
+                if (remainLen < 10) { break; } // MQTT-3.1.2-1: 协议变长头至少 10 字节
+                // 校验协议名 (0x00 0x04 'M' 'Q' 'T' 'T')
+                if (body[0] != 0 || body[1] != 4 || body[2] != 77 || body[3] != 81 || body[4] != 84 || body[5] != 84) {
+                    break;
+                }
+                if (body[6] != 4) {
+                    // MQTT-3.1.2-2: 不支持的协议级别回复 CONNACK 0x01 并断连
+                    byte[] unacc = new byte[4];
+                    unacc[0] = (byte)(MqttPacketType.CONNACK << 4);
+                    unacc[1] = 2;
+                    unacc[2] = 0;
+                    unacc[3] = 1;
+                    int _un = await Socket.SendAsync(sock, unacc, 4);
+                    break;
+                }
+                int connFlags = body[7] & 255;
+                if ((connFlags & 1) != 0) { break; } // MQTT-3.1.2-3: 保留位 bit 0 必须为 0
+                sess.cleanSession = (connFlags & 2) != 0;
+                sess.willFlag = (connFlags & 4) != 0;
+                sess.willQos = (connFlags >> 3) & 3;
+                sess.willRetain = (connFlags & 32) != 0;
+                if (!sess.willFlag && (sess.willQos != 0 || sess.willRetain)) { break; }
+                if (sess.willFlag && sess.willQos == 3) { break; }
                 sess.connected = true;
-                if (remainLen >= 10) {
-                    int connFlags = body[7] & 255;
-                    sess.cleanSession = (connFlags & 2) != 0;
-                    sess.willFlag = (connFlags & 4) != 0;
-                    sess.willQos = (connFlags >> 3) & 3;
-                    sess.willRetain = (connFlags & 32) != 0;
-                    sess.keepAlive = ((body[8] & 255) << 8) + (body[9] & 255);
-                    int cur = 10;
+                sess.keepAlive = ((body[8] & 255) << 8) + (body[9] & 255);
+                int cur = 10;
                     if (cur + 2 <= remainLen) {
                         int idLen = ((body[cur] & 255) << 8) + (body[cur + 1] & 255);
                         cur = cur + 2;
@@ -648,7 +671,6 @@ public class MqttBroker {
                             }
                         }
                     }
-                }
                 if (sess.clientId.Length == 0) {
                     sess.clientId = "anon-" + Convert.ToString(sess.id);
                 }
@@ -677,6 +699,9 @@ public class MqttBroker {
                 // body[0] 直接越界崩溃——公网 broker 一个坏包打死进程）。
                 if (remainLen < 2) { break; }
                 int qos = (b0 >> 1) & 3;
+                if (qos == 3) { break; } // MQTT-3.3.1-4: QoS 两个 bit 不能同时为 1
+                bool dup = (b0 & 8) != 0;
+                if (qos == 0 && dup) { break; } // MQTT-3.3.1-2: QoS 为 0 时 DUP 必须为 0
                 int topicLen = ((body[0] & 255) << 8) + (body[1] & 255);
                 int offset = 2 + topicLen;
                 // 主题必须落在报文内且非空；QoS>0 时其后还有
@@ -725,6 +750,7 @@ public class MqttBroker {
                     int _r2 = await Socket.SendAsync(sock, pubrec, 4);
                 }
             } else if (packetType == MqttPacketType.SUBSCRIBE) {
+                if (pkt.flags != 2) { break; } // MQTT-3.8.1-1: SUBSCRIBE 固定头 bits 3,2,1,0 必须为 0010
                 if (remainLen < 2) { break; }  // 包标识 2 字节
                 // 订阅已满时仍要走完解析并回 SUBACK（0x80 = 失败），
                 // 直接断连会违反协议；先记住配额是否已用尽。
@@ -798,6 +824,7 @@ public class MqttBroker {
                     }
                 }
             } else if (packetType == MqttPacketType.UNSUBSCRIBE) {
+                if (pkt.flags != 2) { break; } // MQTT-3.10.1-1: UNSUBSCRIBE 固定头 bits 3,2,1,0 必须为 0010
                 if (remainLen < 2) { break; }  // 包标识 2 字节
                 int pid = ((body[0] & 255) << 8) + (body[1] & 255);
                 int offset = 2;
@@ -825,14 +852,17 @@ public class MqttBroker {
                 unsuback[3] = (byte)(pid & 255);
                 int _u = await Socket.SendAsync(sock, unsuback, 4);
             } else if (packetType == MqttPacketType.PINGREQ) {
+                if (pkt.flags != 0 || remainLen != 0) { break; } // MQTT-3.12.1-1: flags=0, 无载荷
                 byte[] pong = new byte[3];
                 pong[0] = (byte)(MqttPacketType.PINGRESP << 4);
                 pong[1] = 0;
                 int _p = await Socket.SendAsync(sock, pong, 2);
             } else if (packetType == MqttPacketType.DISCONNECT) {
+                if (pkt.flags != 0 || remainLen != 0) { break; } // MQTT-3.14.1-1: flags=0, 无载荷
                 sess.receivedDisconnect = true;
                 active = false;
             } else if (packetType == MqttPacketType.PUBREL) {
+                if (pkt.flags != 2) { break; } // MQTT-3.6.1-1: PUBREL 固定头 bits 3,2,1,0 必须为 0010
                 // QoS 2 阶段 3：收到客户端 PUBREL，回复 PUBCOMP (7)
                 int relPid = 0;
                 if (remainLen >= 2) {
@@ -845,8 +875,12 @@ public class MqttBroker {
                 pubcomp[3] = (byte)(relPid & 255);
                 int _cp = await Socket.SendAsync(sock, pubcomp, 4);
             } else if (packetType == MqttPacketType.PUBACK || packetType == MqttPacketType.PUBREC || packetType == MqttPacketType.PUBCOMP) {
+                if (pkt.flags != 0) { break; } // MQTT-2.2.2: 确认类报文 flags 必须为 0
                 // 收到确认类报文，更新会话最后活跃时间
                 sess.lastSeen = MqttBroker.Now();
+            } else {
+                // 未知或保留控制报文类型（如 0 或 15），按协议违规断连
+                break;
             }
 
             // keepalive 强制（MQTT-3.1.2.10）：客户端声明 keepAlive > 0
