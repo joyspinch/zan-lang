@@ -1,0 +1,167 @@
+using System;
+using System.Collections.Generic;
+using Gui;
+using Gui.Widget.Models;
+
+namespace Gui.Widget;
+
+// 通用下拉与浮动层触发基类（PopupTrigger）：
+// 统一管理所有带下拉卡片组件（SelectBox、DatePicker、ColorPicker、Popover、Dropdown）
+// 的触发器排版、生命周期、外部点击自动关闭，以及最重要的【任意组件互嵌（Slot / Children Nesting）】。
+public class PopupTrigger : Control {
+    protected SignalBool open;
+    protected int triggerId;
+    protected string triggerText;
+    protected int popupWidth;
+    protected int popupHeight;
+    protected Control popupPanel;
+    protected Control customTrigger;
+
+    // 事件
+    public UiEvent OpenEvent;
+    public UiEvent CloseEvent;
+
+    protected void InitPopupTrigger(string kind, string trigText, int w, int h) {
+        this.InitControl(kind != "" ? kind : "popuptrigger", 1);
+        open = new SignalBool(false);
+        triggerId = WidgetId.Next();
+        triggerText = trigText;
+        popupWidth = w > 0 ? w : 260;
+        popupHeight = h > 0 ? h : 0;
+        popupPanel = null;
+        customTrigger = null;
+        OpenEvent = new UiEvent();
+        CloseEvent = new UiEvent();
+    }
+
+    public PopupTrigger() {
+        this.InitPopupTrigger("popuptrigger", "Select", 260, 0);
+    }
+
+    public PopupTrigger(string trigText) {
+        this.InitPopupTrigger("popuptrigger", trigText, 260, 0);
+    }
+
+    public PopupTrigger(string kind, string trigText, int w, int h) {
+        this.InitPopupTrigger(kind, trigText, w, h);
+    }
+
+    public bool IsOpen() {
+        return open.Get();
+    }
+
+    // 插槽支持：允许外部直接通过 MountSlot 传入任意复杂的控件树作为弹层或触发器！
+    public override bool MountSlot(string slot, Control c) {
+        if (slot == "popup" || slot == "dropdown" || slot == "content") {
+            this.SetPopupContent(c);
+            return true;
+        }
+        if (slot == "trigger" || slot == "extra") {
+            customTrigger = c;
+            this.Add(c);
+            return true;
+        }
+        return base.MountSlot(slot, c);
+    }
+
+    // 设置下拉弹层的内容节点（可以是 Table、TreeView、Card、ListView 或任意组件树）
+    public virtual void SetPopupContent(Control content) {
+        popupPanel = content;
+        if (content != null && !children.Contains(content)) {
+            this.Add(content);
+        }
+    }
+
+    public virtual Control GetPopupContent() {
+        return popupPanel;
+    }
+
+    // 子类钩子：当未显式挂载 popupPanel 时，构建默认弹层子树
+    public virtual Control BuildDefaultPopup(App app) {
+        Card card = new Card();
+        card.Class = "popup-card";
+        return card;
+    }
+
+    // 确保弹层控件实例已就绪
+    public virtual void EnsurePopup(App app) {
+        if (popupPanel == null) {
+            Control def = this.BuildDefaultPopup(app);
+            if (def != null) {
+                this.SetPopupContent(def);
+            }
+        }
+        if (popupPanel != null) {
+            if (popupWidth > 0) { popupPanel.prefW = popupWidth; }
+            if (popupHeight > 0) { popupPanel.prefH = popupHeight; }
+            if (app != null) {
+                popupPanel.OnMeasure(app);
+            }
+        }
+    }
+
+    // 打开或关闭弹层，统一接入 OverlayHost 生命周期
+    public virtual void SetOpen(bool want) {
+        if (open.Get() == want) { return; }
+        open.Set(want);
+        App a = this.FindApp();
+        if (a == null) { a = App.FrameApp(); }
+
+        if (want) {
+            this.EnsurePopup(a);
+            if (popupPanel != null) {
+                OverlayHost.ShowPopup(a, this, popupPanel);
+            }
+            OpenEvent.RaiseS(this);
+        } else {
+            OverlayHost.DismissPopup();
+            CloseEvent.RaiseS(this);
+        }
+        if (a != null && a.window != null) { a.window.Wake(); }
+    }
+
+    // 响应 OverlayHost 外部点击关闭或 Escape 键关闭
+    public override void OnPopupDismissed() {
+        if (open.Get()) {
+            open.Set(false);
+            CloseEvent.RaiseS(this);
+            App a = this.FindApp();
+            if (a != null && a.window != null) { a.window.Wake(); }
+        }
+    }
+
+    // 默认触发器测量：标准控件高度
+    public override void OnMeasure(App app) {
+        prefH = app != null ? app.theme.heightMedium : 32;
+        prefW = app != null ? app.Scale(160) : 160;
+    }
+
+    // 默认绘制触发器并在点击时开合
+    public override void OnPaint(App app) {
+        if (customTrigger != null) {
+            customTrigger.Arrange(bx, by, bw, bh);
+            customTrigger.RenderTree(app);
+        } else {
+            this.PaintTrigger(app, bx, by, bw, bh);
+        }
+
+        // 统一注册触发器焦点与点击事件
+        app.focus.RegisterFocusable(triggerId);
+        if (Ui.Clicked(app, triggerId)) {
+            this.SetOpen(!open.Get());
+        }
+    }
+
+    // 绘制触发器按钮外观，子类可覆写以定制不同的外观（如输入框外观、图标外观）
+    public virtual void PaintTrigger(App app, int x, int y, int w, int h) {
+        DropdownChrome.PaintTrigger(app, triggerId, x, y, w, h, triggerText, open.Get());
+    }
+
+    public virtual void SetTriggerText(string txt) {
+        triggerText = txt;
+    }
+
+    public virtual string GetTriggerText() {
+        return triggerText;
+    }
+}

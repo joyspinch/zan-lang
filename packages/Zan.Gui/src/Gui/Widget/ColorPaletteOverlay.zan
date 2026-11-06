@@ -1,0 +1,178 @@
+using System;
+using System.Collections.Generic;
+using Gui;
+using Gui.Widget.Models;
+
+namespace Gui.Widget;
+
+// 调色面板浮层渲染与拖拽交互引擎（ColorPaletteOverlay）：
+// 负责 ColorPicker 的 SV 饱和度/明度双层渐变、色相条六段渐变、
+// 棋盘格透明度条及 RGBA/HEX/HSL/HSB 多格式输入行的交互排布与提交。
+public class ColorPaletteOverlay {
+    public static void Render(ColorPicker cp, App app) {
+        Canvas c = app.canvas;
+        int scale = app.Scale(1);
+        int panelW = app.Scale(236);
+        int pad = app.Scale(10);
+        int svH = app.Scale(148);
+        int barH = app.Scale(12);
+        int gap = app.Scale(8);
+        int rowsH = app.Scale(26);
+        int popH = pad + svH + gap + barH + gap + rowsH + pad;
+        if (cp.showAlpha) { popH = popH + barH + gap; }
+        int popX = OverlayPopup.FitX(app, cp.bx, panelW);
+        int popY = OverlayPopup.FitY(app, cp.by + cp.bh + scale * 4,
+                                     cp.bh, popH);
+        StyleBox pop = cp.ResolvePartAs(app, "colorpicker", "panel",
+                                          "select", cp.Class, Style.SNormal());
+        pop.Paint(app, popX, popY, panelW, popH);
+        app.BlockHitsBelow();
+        app.BlockHitsRect(popX, popY, panelW, popH);
+
+        int svX = popX + pad;
+        int svY = popY + pad;
+        int svW = panelW - pad * 2;
+        bool clicked = app.ClickAvailable();
+
+        // ---- SV 面板：两层渐变合成（白→纯色横排、透明→黑纵排）----
+        int pure = ColorPicker.HsvToRgb(cp.hue, 1000, 1000);
+        int svR = app.Scale(4);
+        c.FillGradMask(svX, svY, svW, svH, svR, Corner.All(), 1,
+                       0xFFFFFFFF, 0, pure);
+        c.FillGradMask(svX, svY, svW, svH, svR, Corner.All(), 0,
+                       0, 0, 0xFF000000);
+        int dotX = svX + cp.sat * svW / 1000;
+        int dotY = svY + (1000 - cp.val) * svH / 1000;
+        int dotR = app.Scale(5);
+        c.DrawCircle(dotX, dotY, dotR + scale, 0xFFFFFFFF, scale + 1);
+        c.DrawCircle(dotX, dotY, dotR, 0xFF000000, scale);
+        app.hitTester.RegisterRect(cp.wid + ColorPicker.SvPanelOff(),
+                                   svX, svY, svW, svH, 3);
+
+        // ---- 色相条：红橙黄绿青蓝紫 六段渐变拼成 --------------------
+        int barY = svY + svH + gap;
+        int segN = 6;
+        int segW = svW / segN;
+        for (int i = 0; i < segN; i = i + 1) {
+            int c0 = ColorPicker.HsvToRgb(i * 60, 1000, 1000);
+            int c1 = ColorPicker.HsvToRgb((i + 1) * 60, 1000, 1000);
+            c.FillGradMask(popX + pad + i * segW, barY,
+                           i == segN - 1 ? svW - i * segW : segW, barH,
+                           0, 0, 1, c0, 0, c1);
+        }
+        int hueX = popX + pad + cp.hue * svW / 360;
+        c.DrawCircle(hueX, barY + barH / 2, barH / 2 + scale - 1,
+                     0xFFFFFFFF, scale + 1);
+        app.hitTester.RegisterRect(cp.wid + ColorPicker.HueOff(),
+                                   popX + pad, barY, svW, barH, 3);
+
+        // ---- 透明度条：棋盘格打底 + 白↔纯色水平渐变 -----------------
+        if (cp.showAlpha) {
+            int aY = barY + barH + gap;
+            int chk = app.Scale(5);
+            StyleBox checker = cp.ResolvePartAs(
+                app, "colorpicker", "checker", "", cp.Class, Style.SNormal());
+            c.PushClip(popX + pad, aY, svW, barH);
+            int row = 0;
+            while (row * chk < barH) {
+                int col = 0;
+                while (col * chk < svW) {
+                    bool dark = (row + col) % 2 == 0;
+                    c.FillRect(popX + pad + col * chk, aY + row * chk,
+                               chk, chk,
+                               dark ? checker.BorderOr(0xFFCCCCCC)
+                                    : checker.BgOr(0xFFFFFFFF));
+                    col = col + 1;
+                }
+                row = row + 1;
+            }
+            c.PopClip();
+            c.FillGradMask(popX + pad, aY, svW, barH, 0, 0, 1,
+                           App.WithAlpha(pure, 0), 0,
+                           App.WithAlpha(pure, 255));
+            int aX = popX + pad + cp.alpha * svW / 255;
+            c.DrawCircle(aX, aY + barH / 2, barH / 2 + scale - 1,
+                         0xFFFFFFFF, scale + 1);
+            app.hitTester.RegisterRect(cp.wid + ColorPicker.AlphaOff(),
+                                       popX + pad, aY, svW, barH, 3);
+        }
+
+        // ---- 指针：拖 SV / 色相 / 透明度 ----------------------------
+        bool changed = false;
+        if (!cp.IsDisabled()) {
+            if (app.focus.IsPressed(cp.wid + ColorPicker.SvPanelOff())) {
+                cp.dragPart = 1;
+            } else if (app.focus.IsPressed(cp.wid + ColorPicker.HueOff())) {
+                cp.dragPart = 2;
+            } else if (cp.showAlpha
+                       && app.focus.IsPressed(cp.wid + ColorPicker.AlphaOff())) {
+                cp.dragPart = 3;
+            } else if (cp.dragPart != 0 && app.EventKind() == 3) {
+                cp.dragPart = 0;
+            }
+            if (cp.dragPart == 1) {
+                int ns = (app.mouseX - svX) * 1000 / svW;
+                int nv = 1000 - (app.mouseY - svY) * 1000 / svH;
+                if (ns < 0) { ns = 0; } if (ns > 1000) { ns = 1000; }
+                if (nv < 0) { nv = 0; } if (nv > 1000) { nv = 1000; }
+                if (ns != cp.sat || nv != cp.val) {
+                    cp.sat = ns; cp.val = nv;
+                    cp.hsvTouched = true;
+                    changed = true;
+                }
+            } else if (cp.dragPart == 2) {
+                int nh = (app.mouseX - (popX + pad)) * 360 / svW;
+                if (nh < 0) { nh = 0; } if (nh > 359) { nh = 359; }
+                if (nh != cp.hue) {
+                    cp.hue = nh;
+                    cp.hsvTouched = true;
+                    changed = true;
+                }
+            } else if (cp.dragPart == 3) {
+                int na = (app.mouseX - (popX + pad)) * 255 / svW;
+                if (na < 0) { na = 0; } if (na > 255) { na = 255; }
+                if (na != cp.alpha) {
+                    cp.alpha = na;
+                    changed = true;
+                }
+            }
+        } else {
+            cp.dragPart = 0;
+        }
+
+        // ---- 输入行：RGBA / HEX / HSL / HSB，标签点击循环切换 -------
+        int rowY = popY + popH - pad - rowsH;
+        string modeName = cp.ModeName();
+        if (cp.modes != null && cp.modes.Count == 1) {
+            cp.inputView = ColorPicker.ViewOf(modeName);
+        }
+        if (!cp.viewAligned) {
+            cp.viewAligned = true;
+            int want = ColorPicker.ViewOf(modeName);
+            if (cp.modes == null || cp.modes.Count == 0
+                || ColorPicker.Allowed(want, cp.modes)) {
+                cp.inputView = want;
+            }
+        }
+        StyleBox lab = cp.ResolvePartAs(app, "colorpicker", "label",
+                                          "", cp.Class, Style.SNormal());
+        int labFs = lab.FontOr(Style.FontFallback(app, "small"));
+        int labW = app.Scale(34);
+        c.DrawText(popX + pad,
+                   Canvas.CenterTextY(rowY, rowsH, labFs),
+                   ColorPicker.ViewLabel(cp.inputView), lab.FgOr(pop.fg), labFs);
+        if (app.ClickAvailable()
+            && Ui.Over(app, popX + pad, rowY, labW, rowsH)) {
+            cp.inputView = ColorPicker.NextAllowedView(cp.inputView + 1, cp.modes);
+            app.ClaimClick();
+            app.RequestRedraw();
+        }
+        cp.PaintInputsFromOverlay(app, popX + pad + labW + scale * 6, rowY, rowsH,
+                                  panelW - pad * 2 - labW - scale * 6, clicked);
+
+        if (changed) {
+            cp.Commit();
+            app.RequestRedraw();
+        }
+    }
+}

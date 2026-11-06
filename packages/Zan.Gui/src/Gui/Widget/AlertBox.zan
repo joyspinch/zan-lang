@@ -19,16 +19,51 @@ public class AlertBox : Control {
     // 语义类型在 type 枚举里的下标：0 info / 1 success /
     // 2 warning / 3 error。Layer 通知类型 = 下标 + 2
     int typeNo;
+    // 操作插槽（slot="action" 或 "extra"）
+    Control actionControl;
+    // 自定义主体插槽（slot="content" 或 "body"）
+    Control customContent;
 
     // 初始化：以横幅文本注册，默认 info 档。
     void InitAlertBox(string msg) {
         this.InitControl(msg, 1);
         Text = msg;
         typeNo = 0;
-        // 横幅整块由 OnPaint 经 Layer.DrawNotify 绘制（底、色条、
-        // 图标、文本一体），表面不再另画背景。
-        styleSurfaceOwned = true;
+        actionControl = null;
+        customContent = null;
     }
+
+    // 插槽支持：支持 action（操作按钮）与 content（富内容）
+    public override bool MountSlot(string slot, Control c) {
+        if (slot == "action" || slot == "extra") {
+            this.actionControl = c;
+            if (!children.Contains(c)) { this.Children.Add(c); }
+            return true;
+        }
+        if (slot == "content" || slot == "body") {
+            this.customContent = c;
+            if (!children.Contains(c)) { this.Children.Add(c); }
+            return true;
+        }
+        return base.MountSlot(slot, c);
+    }
+
+    public override Control Add(Control child) {
+        if (child == null) { return null; }
+        if (child.slotName != "" && this.MountSlot(child.slotName, child)) {
+            return child;
+        }
+        if (this.customContent == null) {
+            this.customContent = child;
+        }
+        if (!children.Contains(child)) {
+            this.Children.Add(child);
+        }
+        return child;
+    }
+
+    public Control GetActionContent() { return this.actionControl; }
+    public Control GetCustomContent() { return this.customContent; }
 
     // 空文本横幅（设计器用）。
     AlertBox() { InitAlertBox(""); }
@@ -43,14 +78,82 @@ public class AlertBox : Control {
 
     // 覆写：首选高度与 Layer 通知卡片一致，宽度铺满父容器。
     override void OnMeasure(App app) {
-        prefH = app.theme.heightLarge + app.theme.paddingSmall;
+        int baseH = app.theme.heightLarge + app.theme.paddingSmall;
+        if (customContent != null) {
+            customContent.OnMeasure(app);
+            if (customContent.prefH + app.theme.paddingSmall * 2 > baseH) {
+                baseH = customContent.prefH + app.theme.paddingSmall * 2;
+            }
+        }
+        prefH = baseH;
         prefW = 0;
     }
 
-    // 覆写：整幅委托 Layer.DrawNotify（与设计器画布预览、
-    // 运行期通知共用同一渲染器，所见即所得）。
+    override void SyncBinding() {
+        base.SyncBinding();
+        string cls = "info";
+        if (typeNo == 1) { cls = "success"; }
+        else if (typeNo == 2) { cls = "warning"; }
+        else if (typeNo == 3) { cls = "error"; }
+        this.SetClassIn("info success warning error", cls);
+    }
+
+    // 覆写：外盒由基类 PaintStyleBox 统一绘制，此处绘制左侧色条、图标与提示文本或插槽。
     override void OnPaint(App app) {
-        Layer.DrawNotify(app, bx, by, bw, this.Label(), typeNo + 2);
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int h = bh;
+        if (h <= 0) { h = t.heightLarge + t.paddingSmall; }
+
+        string cls = "info";
+        if (typeNo == 1) { cls = "success"; }
+        else if (typeNo == 2) { cls = "warning"; }
+        else if (typeNo == 3) { cls = "error"; }
+
+        if (computedStyle == null) {
+            this.ResolveStyle(app, Style.SNormal());
+        }
+        StyleBox s = computedStyle;
+        StyleBox barStyle = Style.Part(app, "notification", "bar", "", cls,
+                                       "", Style.SNormal());
+        string iconName = "info";
+        if (typeNo == 1) { iconName = "success"; }
+        else if (typeNo == 2) { iconName = "warning"; }
+        else if (typeNo == 3) { iconName = "error"; }
+
+        int fontSize = s.FontOr(Style.FontFallback(app, "medium"));
+        int barColor = barStyle.bg;
+
+        // 左侧语义色条
+        c.FillRect(bx, by, barStyle.WidthOr(3), h, barColor);
+
+        // 语义图标
+        c.DrawGlyphIn(iconName, bx + t.paddingMedium, by,
+                      t.iconSizeMedium, h, t.iconSizeMedium,
+                      barColor);
+
+        // 右侧操作插槽排布
+        int actW = 0;
+        if (actionControl != null) {
+            actionControl.OnMeasure(app);
+            actW = actionControl.prefW > 0 ? actionControl.prefW : app.Scale(60);
+            int actH = actionControl.prefH > 0 ? actionControl.prefH : app.Scale(28);
+            actionControl.Arrange(bx + bw - t.paddingMedium - actW,
+                                  by + (h - actH) / 2, actW, actH);
+        }
+
+        // 主体内容区（自定义组件插槽优先，无插槽回退文本）
+        int textX = bx + t.paddingMedium + t.iconSizeMedium + t.gapSmall;
+        int textAvailW = bw - (textX - bx) - t.paddingMedium - (actW > 0 ? actW + t.gapMedium : 0);
+        if (textAvailW < 0) { textAvailW = 0; }
+
+        if (customContent != null) {
+            customContent.Arrange(textX, by + t.paddingSmall, textAvailW, h - t.paddingSmall * 2);
+        } else {
+            c.DrawText(textX,
+                       Canvas.CenterTextY(by, h, fontSize),
+                       this.Label(), s.fg, fontSize);
+        }
     }
 
     // ---- 设计器 / 序列化模型 ----

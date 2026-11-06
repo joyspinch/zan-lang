@@ -98,7 +98,7 @@ public class Button : Control {
         clicked = false;
         corners = Corner.All();
         wid = WidgetId.Next();
-        wiresOwnEvents = true;
+        wiresOwnEvents = false;
         Click = new UiEvent();
         Color = 0;
         TextColor = 0;
@@ -242,79 +242,13 @@ public class Button : Control {
         return this.RenderIn(app, x, y, w, 0);
     }
 
-    // 把按钮绘制到显式盒子中；`h` 为 0 时取解析样式的高度
-    // （即 Render 的行为），其他值优先——条状控件
-    // （ribbon 带、工具栏）给命令统一行高时，
-    // 直接传进来即可，无需逐个设置样式。
+    // 把按钮绘制到显式盒子中（统一走标准 DOM Arrange 与 RenderTree 管线）。
     int RenderIn(App app, int x, int y, int w, int h) {
-        bool busy = Style.Has(Class, "loading");
-        bool off = this.IsDisabled();
-        clicked = false;
-        // 颜色绑定在每帧解析前注入对应 CSS 规则（Color 变化时
-        // 触发 bgThemeGen 失效缓存）。只注入一次：
-        // 同一色值后续帧直接命中 StyleSheet 规则。
-        this.EnsureColorInjected(app);
-        // 自定义 Color 编码为 Class 中的 `custom-{hex}` 片段，
-        // base.css 中的 `[class*="custom-"]` 子串匹配规则负责
-        // 派生出 hover/pressed 色。
-        string origClass = Class;
-        int c = 0;
-        if (Color != null) { c = Color.Get(); }
-        if (c != 0) { Class = this.AppendCustomClass(origClass, c); }
-        // Tertiary/Quaternary/Strong 是 Naive UI 风格的便利布尔 prop，
-        // 渲染时等价于在 Class 里写 tertiary/quaternary/strong。
-        if (Tertiary) { this.AddClass("tertiary"); }
-        if (Quaternary) { this.AddClass("quaternary"); }
-        if (Strong) { this.AddClass("strong"); }
-        // 尺寸档（tiny/small/medium/large）落到 class 上。
-        this.ApplySizeClass();
         if (w <= 0) { w = this.AutoWidth(app); }
         if (h <= 0) { h = this.AutoHeight(app); }
-        // 一次性解析整个外观：按钮各 class 的主题默认值，
-        // 叠加皮肤的 `button…` 规则，再用解析出的 `transition`
-        // 对悬停/按下/焦点状态做交叉淡化。
-        StyleBox s = this.ResolveEasedStyleAsIn(
-            app, wid, "button", Class, off, this.IsChecked(),
-            x, y, w, h);
-        // Strong prop 覆盖皮肤字重（Naive UI 风格）。
-        if (Strong) { s.fontWeight = 700; }
-        s.SetRadius(s.RadiusOr(app.theme.borderRadiusMedium));
-        if (styleRadius != 0) { s.SetRadius(styleRadius); }
-        if (corners != Corner.All()) { s.SetCorners(corners); }
-        w = s.ClampW(w);
-        h = s.ClampH(h);
-        // IconPlacement 决定图标走前置槽位还是 BoxContent 的 trailing
-        // 槽位；两者宽度相同，所以测量不必分支。
-        string lead = Icon;
-        string tail = "";
-        if (IconPlacement == "right") { lead = ""; tail = Icon; }
-        BoxContent.Paint(app, wid, "button", Class, name, s, x, y, w, h,
-                         lead, this.Label(), tail, busy, off);
-        // 恢复 Class，避免设计器/序列化器读到污染的字段。
-        Class = origClass;
-        if (off || busy) { return wid; }
-        string a11y = this.EffectiveA11yRole("button") + ":" + this.EffectiveA11yLabel(this.Label());
-        if (Ui.ActivateL(app, wid, x, y, w, h, a11y)) {
-            clicked = true;
-            // 绑定的 Checked 使按钮成为切换开关：点击先把
-            // 模型通过绑定写回，再运行处理器。
-            if (this.IsToggle()) { Checked.Set(!this.IsChecked()); }
-            Click.PostS(this);
-            // 唤醒事件循环，使排队的处理器在下一轮执行，
-            // 即使之后没有新的 OS 事件到达。
-            app.window.Wake();
-        }
-        if (Tip != "" && (Ui.HoverLevelMsIn(app, wid, 0, x, y, w, h) >= 900
-                          || Ui.HoldTipIn(app, wid, x, y, w, h))) {
-            int place = Tooltip.Bottom();
-            if (TipSide == "top") { place = Tooltip.Top(); }
-            else if (TipSide == "left") { place = Tooltip.Left(); }
-            else if (TipSide == "right") { place = Tooltip.Right(); }
-            Tooltip.RequestBox(app, x, y, w, h, this.TipText(), place,
-                               app.Scale(260));
-        }
-        On.Fire(app, wid, this);
-        return wid;
+        this.Arrange(x, y, w, h);
+        this.RenderTree(app);
+        return this.CommonId();
     }
 
     // ---- 自定义 Color 注入 ------------------------------------------------
@@ -486,9 +420,72 @@ public class Button : Control {
     // 手写尺寸或被拉成巨块都值得报给作者。
     override bool LintLeafSize() { return true; }
 
-    // 覆写：保留模式绘制 = 在自身矩形上 RenderIn。
+    // 覆写：交互命中注册与点击事件响应由通用事件管线调度，绝不在 OnPaint 中轮询或抢占。
+    override void FireCommon(App app) {
+        if (this.IsDisabled()) { return; }
+        if (bw <= 0 || bh <= 0) { return; }
+        int id = this.CommonId();
+        string a11y = this.EffectiveA11yRole("button") + ":" + this.EffectiveA11yLabel(this.Label());
+        app.hitTester.RegisterRectL(id, bx, by, bw, bh, 0, a11y);
+        if (Ui.Clicked(app, id)) {
+            this.TriggerEvent("Click");
+        }
+        On.Fire(app, id, this);
+    }
+
+    // 事件调度中枢：统一处理 Click（触发轮询标志、翻转切换状态、广播专有 UiEvent、唤醒渲染）
+    override void TriggerEvent(string evt) {
+        if (evt == "Click") {
+            if (this.IsDisabled()) { return; }
+            clicked = true;
+            if (this.IsToggle()) { Checked.Set(!this.IsChecked()); }
+            Click.PostS(this);
+            App a = this.FindApp();
+            if (a != null && a.window != null) { a.window.Wake(); }
+            return;
+        }
+        base.TriggerEvent(evt);
+    }
+
+    // 在样式解析与外盒绘制前，将 Color、尺寸档与修饰布尔同步至 Class
+    override void SyncBinding() {
+        base.SyncBinding();
+        App a = this.FindApp();
+        if (a != null) { this.EnsureColorInjected(a); }
+        int c = 0;
+        if (Color != null) { c = Color.Get(); }
+        if (c != 0) { Class = this.AppendCustomClass(Class, c); }
+        if (Tertiary) { this.AddClass("tertiary"); }
+        if (Quaternary) { this.AddClass("quaternary"); }
+        if (Strong) { this.AddClass("strong"); }
+        this.ApplySizeClass();
+    }
+
+    // 覆写：保留模式绘制 = 基类 PaintStyleBox 统一完成外盒（背景/边框/圆角/阴影），此处仅绘制内容图元与提示框。
     override void OnPaint(App app) {
-        this.RenderIn(app, bx, by, bw, bh);
+        bool busy = Style.Has(Class, "loading");
+        bool off = this.IsDisabled();
+        clicked = false;
+        string lead = Icon;
+        string tail = "";
+        if (IconPlacement == "right") { lead = ""; tail = Icon; }
+
+        if (computedStyle == null) {
+            this.ResolveStyle(app, Style.SNormal());
+        }
+        BoxContent.PaintContent(app, this.CommonId(), "button", Class, name,
+                                computedStyle, bx, by, bw, bh,
+                                lead, this.Label(), tail, busy, off);
+
+        if (Tip != "" && (Ui.HoverLevelMsIn(app, this.CommonId(), 0, bx, by, bw, bh) >= 900
+                          || Ui.HoldTipIn(app, this.CommonId(), bx, by, bw, bh))) {
+            int place = Tooltip.Bottom();
+            if (TipSide == "top") { place = Tooltip.Top(); }
+            else if (TipSide == "left") { place = Tooltip.Left(); }
+            else if (TipSide == "right") { place = Tooltip.Right(); }
+            Tooltip.RequestBox(app, bx, by, bw, bh, this.TipText(), place,
+                               app.Scale(260));
+        }
     }
 
     // 覆写：存在自定义子组件时，将其自动居中布局在内容盒内部。

@@ -1,8 +1,6 @@
 using System;
 using System.Collections.Generic;
 using Gui;
-using Gui.Backend;
-using Gui.Widget;
 
 namespace Gui;
 
@@ -59,7 +57,7 @@ public partial class Control {
             if (keepH > 0) { prefH = keepH; }
             prefSet = true;
         }
-        this.MeasureDocked(app);
+        this.MeasureContent(app);
     }
 
     // 把已知的断行宽度传给纵向排布的子节点。纵向排布（停靠成一列，
@@ -79,11 +77,7 @@ public partial class Control {
         for (int i = 0; i < children.Count; i = i + 1) {
             Control c = children[i];
             if (c.hintWrapW > 0) { continue; }
-            if (flex) {
-                if (flexRow) { continue; }
-            } else if (c.dock == 3 || c.dock == 4) {
-                continue;
-            }
+            if (flex && flexRow) { continue; }
             c.hintWrapW = inner;
         }
     }
@@ -938,56 +932,21 @@ public partial class Control {
     // 停靠容器在没人给尺寸时按内容测量：一列停靠的行
     // 高等于各行之和，一行停靠的控件宽等于各控件之和
     // （加上内边距和间距）。少了这一步，设计器只能给
-    // 每个容器写死一个高度，字号或 DPI 一变就错位。
+    // 纯 CSS 标准流式/弹性容器内容测量（Flex / Grid / Flow）
     // 只填补留空的那根轴：OnMeasure 或作者给过的尺寸优先。
-    void MeasureDocked(App app) {
+    void MeasureContent(App app) {
         if (children.Count == 0 && this.FlowEntries().Count == 0) { return; }
         int disp = this.StyleDisplay();
         if (disp == 1) {
             this.MeasureFlexContent(app);
             return;
         }
-        if (disp == 3) {
-            this.MeasureFlow(app);
-            return;
-        }
         if (disp == 4) {
             this.MeasureGridContent(app);
             return;
         }
-        if (prefW > 0 && prefH > 0) { return; }
-        int sumH = 0;
-        int sumW = 0;
-        int maxH = 0;
-        int maxW = 0;
-        int rows = 0;
-        int cols = 0;
-        for (int i = 0; i < children.Count; i = i + 1) {
-            Control c = children[i];
-            if (!c.StyleVisible() || c.StylePosition() == 2) { continue; }
-            if (c.dock == 1 || c.dock == 2) {
-                sumH = sumH + c.prefH;
-                rows = rows + 1;
-                if (c.prefW > maxW) { maxW = c.prefW; }
-            } else if (c.dock == 3 || c.dock == 4) {
-                sumW = sumW + c.prefW;
-                cols = cols + 1;
-                if (c.prefH > maxH) { maxH = c.prefH; }
-            }
-        }
-        int innerGap = this.StyleGap();
-        if (rows > 1) { sumH = sumH + innerGap * (rows - 1); }
-        if (cols > 1) { sumW = sumW + innerGap * (cols - 1); }
-        if (sumH < maxH) { sumH = maxH; }
-        if (sumW < maxW) { sumW = maxW; }
-        if (prefH <= 0 && sumH > 0) {
-            prefH = sumH + this.StyleInsetT() + this.StyleInsetB();
-            this.fillH = true;
-        }
-        if (prefW <= 0 && sumW > 0) {
-            prefW = sumW + this.StyleInsetL() + this.StyleInsetR();
-            this.fillW = true;
-        }
+        // 纯 CSS 标准流式测量（Flow / Block / Inline 默认兜底）
+        this.MeasureFlow(app);
     }
 
     // 按内容测量一个 `display: flex` 容器：主轴取各子项之和（换行时
@@ -1146,7 +1105,7 @@ public partial class Control {
         int right = 0;
         for (int i = 0; i < children.Count; i = i + 1) {
             Control c = children[i];
-            if (!c.StyleVisible() || c.designFloat) { continue; }
+            if (!c.StyleVisible() || c.StylePosition() == 2) { continue; }
             int b = c.by + c.bh;
             if (b > bottom) { bottom = b; }
             int r = c.bx + c.bw;
@@ -1216,233 +1175,29 @@ public partial class Control {
         int pbw = pw;
         int pbh = ph;
         int dispBox = this.StyleDisplay();
-        if (dispBox == 3) {
-            this.ArrangeFlow(cx, cy, cw, ch, innerGap);
-            this.ArrangePositioned(pbx, pby, pbw, pbh);
-            this.CheckKidsLayout();
-            this.ArrangeScrollTail(ch);
-            return;
-        }
         if (dispBox == 1) {
             this.ArrangeFlex(cx, cy, cw, ch, innerGap);
-            this.ArrangePositioned(pbx, pby, pbw, pbh);
-            this.CheckKidsLayout();
-            this.ArrangeScrollTail(ch);
-            return;
-        }
-        if (dispBox == 4) {
+        } else if (dispBox == 4) {
             this.ArrangeGrid(cx, cy, cw, ch);
-            this.ArrangePositioned(pbx, pby, pbw, pbh);
-            this.CheckKidsLayout();
-            this.ArrangeScrollTail(ch);
-            return;
-        }
-        for (int i = 0; i < children.Count; i = i + 1) {
-            Control c = children[i];
-            if (c.StyleVisible() && c.StylePosition() != 2) {
-                if (c.dock == 1) {
-                    bool isTopBar = (c.Kind() == "ToolStrip" || c.Kind() == "MenuBar");
-                    int ml = isTopBar ? 0 : c.StyleMarL();
-                    int mt = isTopBar ? 0 : c.StyleMarT();
-                    int mr = isTopBar ? 0 : c.StyleMarR();
-                    int mb = isTopBar ? 0 : c.StyleMarB();
-                    int availH = isTopBar ? (ph - mt - mb) : (ch - mt - mb);
-                    if (availH < 0) { availH = 0; }
-                    int hh = Control.FitSize(c.DockSize(availH, false), availH);
-                    int curX = isTopBar ? px : (cx + ml);
-                    int curW = isTopBar ? pw : (cw - ml - mr);
-                    int curY = isTopBar ? py : (cy + mt);
-                    if (curW < 0) { curW = 0; }
-                    c.Arrange(curX, curY, curW, hh);
-                    int stepH = hh + mt + mb;
-                    int restH = ch - stepH;
-                    int gh = isTopBar ? 0 : Control.FitGap(innerGap, restH);
-                    cy = cy + stepH + gh;
-                    ch = restH - gh;
-                } else if (c.dock == 2) {
-                    bool isStatusBar = (c.Kind() == "StatusBar");
-                    int ml = isStatusBar ? 0 : c.StyleMarL();
-                    int mt = isStatusBar ? 0 : c.StyleMarT();
-                    int mr = isStatusBar ? 0 : c.StyleMarR();
-                    int mb = isStatusBar ? 0 : c.StyleMarB();
-                    int availH = isStatusBar ? (ph - mt - mb) : (ch - mt - mb);
-                    if (availH < 0) { availH = 0; }
-                    int hh = Control.FitSize(c.DockSize(availH, false), availH);
-                    int curX = isStatusBar ? px : (cx + ml);
-                    int curW = isStatusBar ? pw : (cw - ml - mr);
-                    int curY = isStatusBar ? (py + ph - hh) : (cy + ch - hh - mb);
-                    if (curW < 0) { curW = 0; }
-                    c.Arrange(curX, curY, curW, hh);
-                    int stepH = hh + mt + mb;
-                    int restH = ch - stepH;
-                    int gh = isStatusBar ? 0 : Control.FitGap(innerGap, restH);
-                    ch = restH - gh;
-                } else if (c.dock == 3) {
-                    int ml = c.StyleMarL();
-                    int mt = c.StyleMarT();
-                    int mr = c.StyleMarR();
-                    int mb = c.StyleMarB();
-                    int availW = cw - ml - mr;
-                    if (availW < 0) { availW = 0; }
-                    int ww = Control.FitSize(c.DockSize(availW, true), availW);
-                    int availH = ch - mt - mb;
-                    if (availH < 0) { availH = 0; }
-                    if (c.StyleDeclaresHeight()) {
-                        int hh = Control.FitSize(c.StyleHeightIn(availH), availH);
-                        c.Arrange(cx + ml, cy + mt + (availH - hh) / 2, ww, hh);
-                    } else {
-                        c.Arrange(cx + ml, cy + mt, ww, availH);
-                    }
-                    int stepW = ww + ml + mr;
-                    int restW = cw - stepW;
-                    int gw = Control.FitGap(innerGap, restW);
-                    cx = cx + stepW + gw;
-                    cw = restW - gw;
-                } else if (c.dock == 4) {
-                    int ml = c.StyleMarL();
-                    int mt = c.StyleMarT();
-                    int mr = c.StyleMarR();
-                    int mb = c.StyleMarB();
-                    int availW = cw - ml - mr;
-                    if (availW < 0) { availW = 0; }
-                    int ww = Control.FitSize(c.DockSize(availW, true), availW);
-                    int availH = ch - mt - mb;
-                    if (availH < 0) { availH = 0; }
-                    if (c.StyleDeclaresHeight()) {
-                        int hh = Control.FitSize(c.StyleHeightIn(availH), availH);
-                        c.Arrange(cx + cw - ww - mr, cy + mt + (availH - hh) / 2, ww, hh);
-                    } else {
-                        c.Arrange(cx + cw - ww - mr, cy + mt, ww, availH);
-                    }
-                    int stepW = ww + ml + mr;
-                    int restW = cw - stepW;
-                    int gw = Control.FitGap(innerGap, restW);
-                    cw = restW - gw;
-                } else if (c.dock != 5) {
-                    int ml = c.StyleMarL();
-                    int mt = c.StyleMarT();
-                    int mr = c.StyleMarR();
-                    int mb = c.StyleMarB();
-                    int ww = c.StyleWidth();
-                    int hh = c.StyleHeight();
-                    int maxW = cw - ml - mr;
-                    int maxH = ch - mt - mb;
-                    if (maxW < 0) { maxW = 0; }
-                    if (maxH < 0) { maxH = 0; }
-                    if (ww > maxW && maxW > 0) { ww = maxW; }
-                    if (hh > maxH && maxH > 0) { hh = maxH; }
-                    if (ww < 0) { ww = 0; }
-                    if (hh < 0) { hh = 0; }
-                    c.Arrange(cx + c.mx + ml, cy + c.my + mt, ww, hh);
-                }
-            }
-        }
-        for (int i = 0; i < children.Count; i = i + 1) {
-            Control c = children[i];
-            if (c.StyleVisible() && c.dock == 5
-                && c.StylePosition() != 2) {
-                int ml = c.StyleMarL();
-                int mt = c.StyleMarT();
-                int mr = c.StyleMarR();
-                int mb = c.StyleMarB();
-                int fw = cw - ml - mr;
-                int fh = ch - mt - mb;
-                if (fw < 0) { fw = 0; }
-                if (fh < 0) { fh = 0; }
-                c.Arrange(cx + ml, cy + mt, fw, fh);
-            }
+        } else {
+            // 纯 CSS 标准流式排版（Flow / Block / Inline 默认兜底）
+            this.ArrangeFlow(cx, cy, cw, ch, innerGap);
         }
         this.ArrangePositioned(pbx, pby, pbw, pbh);
         this.CheckKidsLayout();
         this.ArrangeScrollTail(ch);
     }
 
-    // 排布 `position` 子项。absolute/fixed 脱离常规流（停靠/flex
+    // 排布 `position` 子项。absolute/fixed 脱离常规流（停靠/flex/flow
     // 的测量与排布两端都跳过它），包含块是父内容框：top/right/
     // bottom/left（inset 展开成这四条）里声明的边起作用，宽度
     // 优先取声明值，左右两边都声明时用差值，否则取测量偏好；
     // relative 不脱流，在流位置上平移（left/right 同设按 CSS 用
     // left，top/bottom 同设用 top，未声明当 0）。
     void ArrangePositioned(int cx, int cy, int cw, int ch) {
-        // 顶部停靠条（标题栏 / 工具条 / 面包屑）：浮动件的定位基准要
-        // 让开它——否则 fy=0 的浮动件正好压在标题栏上（"浮动组件忽略
-        // 标题栏高度"）。只让开最靠上的那一条：浮动件本来就浮在内容
-        // 之上，后面的内容条不挡它。浮动件自己与布局内部的流式容器
-        // 都不算（前者正是在从流里摘出来的那一条，后者是布局结构，
-        // 不是作者摆的标题栏）。
-        int band = 0;
-        int bandTop = 0;
-        bool hasBand = false;
-        for (int i = 0; i < children.Count; i = i + 1) {
-            Control d = children[i];
-            if (d.dock != 1 || d.layoutFlow || d.designFloat) { continue; }
-            if (!d.StyleVisible() || d.StylePosition() == 2) { continue; }
-            if (!hasBand || d.by < bandTop) {
-                hasBand = true;
-                bandTop = d.by;
-                band = d.StyleMarT() + d.bh;
-            }
-        }
         for (int i = 0; i < children.Count; i = i + 1) {
             Control c = children[i];
             if (!c.StyleVisible()) { continue; }
-            if (c.designFloat) {
-                bool isStatusBar = (c.Kind() == "StatusBar");
-                bool isTopBar = (c.Kind() == "ToolStrip" || c.Kind() == "MenuBar");
-                int dx = (isTopBar || isStatusBar) ? 0 : this.StylePadL();
-                int dy = isTopBar ? 0 : (this.StylePadT() + band);
-                int aw = (isTopBar || isStatusBar) ? cw : (cw - dx - this.StylePadR());
-                int ah = isStatusBar ? (ch - dy) : (isTopBar ? (ch - this.StylePadB()) : (ch - dy - this.StylePadB()));
-                if (aw < 0) { aw = 0; }
-                if (ah < 0) { ah = 0; }
-                int ml = (isTopBar || isStatusBar) ? 0 : c.StyleMarL();
-                int mt = isTopBar ? 0 : c.StyleMarT();
-                int mr = (isTopBar || isStatusBar) ? 0 : c.StyleMarR();
-                int mb = isStatusBar ? 0 : c.StyleMarB();
-                int availW = aw - ml - mr;
-                int availH = ah - mt - mb;
-                if (availW < 0) { availW = 0; }
-                if (availH < 0) { availH = 0; }
-                // 设计器记录的是最终框尺寸；拖动后显式尺寸优先于原 CSS。
-                int w = c.logW > 0 ? c.prefW : c.StyleWidthIn(availW);
-                int h = c.logH > 0 ? c.prefH : c.StyleHeightIn(availH);
-                if (isTopBar || isStatusBar) {
-                    if (w <= 0 || c.logW <= 0) { w = availW; }
-                }
-                if (c.logW <= 0 && w > availW && availW > 0) { w = availW; }
-                if (c.logH <= 0 && h > availH && availH > 0) { h = availH; }
-                int x = cx + dx + c.mx + ml;
-                int y = cy + dy + c.my + mt;
-                int anchor = c.designAnchor;
-                if (anchor == 10) {
-                    x = cx + dx + ml;
-                    y = cy + dy + mt;
-                    w = availW;
-                    h = availH;
-                    if (w < 0) { w = 0; }
-                    if (h < 0) { h = 0; }
-                } else if (anchor >= 1 && anchor <= 9) {
-                    int col = (anchor - 1) % 3;
-                    int row = (anchor - 1) / 3;
-                    x = x + (availW - w) * col / 2;
-                    y = y + (availH - h) * row / 2;
-                }
-                if (isStatusBar) {
-                    // StatusBar 永远贴底全宽，独占窗口底边，消除浮动偏移和父内边距导致的间隙
-                    x = cx;
-                    w = cw;
-                    y = cy + ch - h;
-                } else if (isTopBar) {
-                    // ToolStrip / MenuBar 永远贴顶全宽，独占窗口顶边
-                    x = cx;
-                    w = cw;
-                    y = cy;
-                }
-                if (w < 0) { w = 0; }
-                if (h < 0) { h = 0; }
-                c.Arrange(x, y, w, h);
-                continue;
-            }
             StyleBox sb = c.computedStyle;
             int pos = c.StylePosition();
             if (pos != 1 && pos != 2) { continue; }
@@ -1450,6 +1205,8 @@ public partial class Control {
             int posR = sb == null ? 0 - 1 : sb.posR;
             int posB = sb == null ? 0 - 1 : sb.posB;
             int posL = sb == null ? 0 - 1 : sb.posL;
+            if (posL == 0 - 1 && c.mx != 0) { posL = c.mx; }
+            if (posT == 0 - 1 && c.my != 0) { posT = c.my; }
             if (pos == 1) {
                 int dx = posL != 0 - 1 ? posL
                     : (posR != 0 - 1 ? 0 - posR : 0);
@@ -1460,8 +1217,8 @@ public partial class Control {
                 }
                 continue;
             }
-            int w = c.StyleWidthIn(cw);
-            int h = c.StyleHeightIn(ch);
+            int w = c.logW > 0 ? c.logW : c.StyleWidthIn(cw);
+            int h = c.logH > 0 ? c.logH : c.StyleHeightIn(ch);
             if (posL != 0 - 1 && posR != 0 - 1) { w = cw - posL - posR; }
             if (posT != 0 - 1 && posB != 0 - 1) { h = ch - posT - posB; }
             if (w < 0) { w = 0; }
@@ -1631,9 +1388,9 @@ public partial class Control {
             if (c.StylePosition() == 2) { continue; } // absolute/fixed 脱流合法
 
             bool autoParent = (this.StyleDisplay() != 0) || (this.layout != 0);
-            if (autoParent || c.dock != 0) {
+            if (autoParent) {
                 this.ReportLint(c, "无效坐标",
-                    "在自动容器或停靠模式下手动设置了 (x="
+                    "在自动容器下手动设置了 (x="
                     + Convert.ToString(c.mx) + ", y=" + Convert.ToString(c.my)
                     + ")，坐标被完全忽略。请移除 Place()/Float()，改用父级 Gap、Padding 或对齐");
             }

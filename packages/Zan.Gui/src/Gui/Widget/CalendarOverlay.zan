@@ -1,0 +1,245 @@
+using System;
+using System.Collections.Generic;
+using Gui;
+using Gui.Widget.Models;
+
+namespace Gui.Widget;
+
+// 日历弹层渲染与交互引擎（CalendarOverlay）：
+// 负责 DatePicker 的单月/双月历网格绘制、年份/月份/季度宫格选择、
+// 快捷选项侧边栏、起止区间悬停预览与时分时间调整行的渲染交互。
+public class CalendarOverlay {
+    public static void Render(DatePicker dp, App app) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int scale = app.Scale(1);
+        string gran = dp.Granularity();
+        bool dayPanels = gran == "day";
+        bool dual = dp.IsRange();
+        bool hasShortcuts = dual && dayPanels && dp.shortcuts != null &&
+                            dp.shortcuts.Count > 0;
+        int sidebarW = hasShortcuts ? app.Scale(84) : 0;
+        int panelW = app.Scale(224);
+        int popH = app.Scale(200);
+        if (dp.HasTime()) { popH = popH + app.Scale(40); }
+        int popW = panelW;
+        if (dual) { popW = sidebarW + panelW + panelW; }
+        int popX = OverlayPopup.FitX(app, dp.bx, popW);
+        int popY = OverlayPopup.FitY(app, dp.by + dp.bh + app.Scale(4), dp.bh, popH);
+        StyleBox pop = dp.ResolvePartAs(app, "select", "popup", "popup",
+                                          dp.Class, Style.SSelected());
+        pop.Paint(app, popX, popY, popW, popH);
+        app.BlockHitsBelow();
+        app.BlockHitsRect(popX, popY, popW, popH);
+        bool clicked = app.ClickAvailable();
+
+        int fs = Style.FontFallback(app, "small");
+        int pad = app.Scale(6);
+        int headerH = app.Scale(28);
+        int cellW;
+        int cellH;
+        if (dayPanels) {
+            cellW = (panelW - pad * 2) / 7;
+            cellH = app.Scale(24);
+        } else {
+            int cols = 3;
+            if (gran == "quarter") { cols = 1; }
+            cellW = (panelW - pad * 2) / cols;
+            cellH = app.Scale(38);
+        }
+        int top = popY + headerH;
+        int panelsX = popX + sidebarW;
+
+        if (hasShortcuts) {
+            c.FillRect(panelsX - app.Scale(1), popY, app.Scale(1), popH,
+                       pop.BorderOr(pop.fg));
+            int scCount = dp.shortcuts.Count;
+            int itemH = (popH - pad * 2) / (scCount > 0 ? scCount : 1);
+            for (int i = 0; i < scCount; i = i + 1) {
+                DateShortcut sc = dp.shortcuts[i];
+                int iy = popY + pad + i * itemH;
+                bool hover = app.mouseX >= popX && app.mouseX < panelsX &&
+                             app.mouseY >= iy && app.mouseY < iy + itemH;
+                if (hover) {
+                    StyleBox hov = Style.Part(app, "datepicker", "cell", "", "",
+                                              "", Style.SHover());
+                    c.FillRoundRect(popX + app.Scale(2), iy + app.Scale(1),
+                                    sidebarW - app.Scale(4), itemH - app.Scale(2),
+                                    app.Scale(3), hov.BgOr(pop.accent));
+                    if (clicked) {
+                        dp.ApplyShortcut(sc);
+                        app.ClaimClick();
+                        app.RequestRedraw();
+                        return;
+                    }
+                }
+                string name = sc.label;
+                int color = hover ? pop.accent : pop.fg;
+                c.DrawText(popX + (sidebarW - Canvas.MeasureText(name, fs)) / 2,
+                           Canvas.CenterTextY(iy, itemH, fs), name, color, fs);
+            }
+        }
+
+        int rightYear = dp.viewYear;
+        int rightMonth = dp.viewMonth;
+        if (gran == "day") {
+            rightMonth = dp.viewMonth + 1;
+            if (rightMonth > 12) { rightMonth = 1; rightYear = rightYear + 1; }
+        } else if (gran == "year") {
+            rightYear = dp.viewYear + 12;
+        } else {
+            rightYear = dp.viewYear + 1;
+        }
+        int leftBase = dp.viewYear;
+        int rightBase = rightYear;
+        if (gran == "year") {
+            leftBase = dp.PageStart(dp.viewYear);
+            rightBase = leftBase + 12;
+        }
+
+        int arrowW = app.Scale(22);
+        if (dual) {
+            int titleW = panelW - pad * 2 - arrowW * 2;
+            string leftTitle = dp.TitleText(dp.viewYear, dp.viewMonth);
+            string rightTitle = dp.TitleText(rightYear, rightMonth);
+            c.DrawText(panelsX + pad + arrowW +
+                       (titleW - Canvas.MeasureText(leftTitle, fs)) / 2,
+                       Canvas.CenterTextY(popY, headerH, fs),
+                       leftTitle, pop.fg, fs);
+            c.DrawText(panelsX + panelW + pad + arrowW +
+                       (titleW - Canvas.MeasureText(rightTitle, fs)) / 2,
+                       Canvas.CenterTextY(popY, headerH, fs),
+                       rightTitle, pop.fg, fs);
+            c.DrawGlyphIn("chevron-left", panelsX + pad, popY, arrowW,
+                          headerH, app.Scale(13), pop.fg);
+            c.DrawGlyphIn("chevron-right", popX + popW - pad - arrowW,
+                          popY, arrowW, headerH, app.Scale(13), pop.fg);
+            if (clicked) {
+                if (app.mouseX >= panelsX &&
+                    app.mouseX < panelsX + pad + arrowW &&
+                    app.mouseY >= popY && app.mouseY < popY + headerH) {
+                    dp.MoveView(-1); app.ClaimClick(); app.RequestRedraw(); return;
+                }
+                if (app.mouseX >= popX + popW - pad - arrowW &&
+                    app.mouseX < popX + popW &&
+                    app.mouseY >= popY && app.mouseY < popY + headerH) {
+                    dp.MoveView(1); app.ClaimClick(); app.RequestRedraw(); return;
+                }
+            }
+        } else {
+            c.DrawText(popX + pad, Canvas.CenterTextY(popY, headerH, fs),
+                       dp.TitleText(dp.viewYear, dp.viewMonth), pop.fg, fs);
+            c.DrawGlyphIn("chevron-left", popX + popW - app.Scale(48),
+                          popY, arrowW, headerH, app.Scale(13), pop.fg);
+            c.DrawGlyphIn("chevron-right", popX + popW - app.Scale(24),
+                          popY, arrowW, headerH, app.Scale(13), pop.fg);
+            if (clicked) {
+                if (app.mouseX >= popX + popW - app.Scale(50) &&
+                    app.mouseX < popX + popW - app.Scale(26) &&
+                    app.mouseY >= popY && app.mouseY < popY + headerH) {
+                    dp.MoveView(-1); app.ClaimClick(); app.RequestRedraw(); return;
+                }
+                if (app.mouseX >= popX + popW - app.Scale(26) &&
+                    app.mouseX < popX + popW &&
+                    app.mouseY >= popY && app.mouseY < popY + headerH) {
+                    dp.MoveView(1); app.ClaimClick(); app.RequestRedraw(); return;
+                }
+            }
+        }
+
+        dp.hasHover = false;
+        dp.hoverDate = null;
+        if (dayPanels) {
+            dp.hoverDate = dp.HoverDay(app, panelsX, top, pad, cellW, cellH,
+                                      dp.viewYear, dp.viewMonth);
+            if (dual && dp.hoverDate == null) {
+                dp.hoverDate = dp.HoverDay(app, panelsX + panelW, top, pad,
+                                          cellW, cellH, rightYear, rightMonth);
+            }
+        } else {
+            dp.hoverDate = dp.HoverCell(app, panelsX, top, pad, cellW, cellH,
+                                       leftBase);
+            if (dual && dp.hoverDate == null) {
+                dp.hoverDate = dp.HoverCell(app, panelsX + panelW, top, pad,
+                                           cellW, cellH, rightBase);
+            }
+        }
+        dp.hasHover = dp.hoverDate != null;
+
+        if (dayPanels) {
+            if (dp.PaintMonth(app, c, pop, panelsX, top, pad, cellW, cellH,
+                                fs, pop.fg, dp.viewYear, dp.viewMonth, clicked)) {
+                return;
+            }
+            if (dual) {
+                if (dp.PaintMonth(app, c, pop, panelsX + panelW, top, pad,
+                                    cellW, cellH, fs, pop.fg,
+                                    rightYear, rightMonth, clicked)) {
+                    return;
+                }
+            }
+        } else {
+            if (dp.PaintCellGrid(app, c, pop, panelsX, top, pad, cellW, cellH,
+                                   fs, pop.fg, leftBase, clicked)) {
+                return;
+            }
+            if (dual) {
+                if (dp.PaintCellGrid(app, c, pop, panelsX + panelW, top, pad,
+                                       cellW, cellH, fs, pop.fg, rightBase,
+                                       clicked)) {
+                    return;
+                }
+            }
+        }
+
+        if (dp.Type == "datetime") {
+            int timeY = top + 8 * cellH;
+            int groupW = app.Scale(64);
+            int gx = popX + (popW - groupW) / 2;
+            int hit = dp.PaintTimeGroup(app, c, pop, gx, timeY, cellH,
+                                          fs, dp.hour, dp.minute, clicked);
+            if (hit == 1) {
+                dp.hour = (dp.hour + 1) % 24;
+                dp.editor.SetText(dp.FormatText());
+                app.ClaimClick(); app.RequestRedraw(); return;
+            }
+            if (hit == 2) {
+                dp.minute = (dp.minute + 1) % 60;
+                dp.editor.SetText(dp.FormatText());
+                app.ClaimClick(); app.RequestRedraw(); return;
+            }
+        }
+        if (dp.Type == "datetimerange") {
+            int timeY = top + 8 * cellH;
+            int groupW = app.Scale(64);
+            int hit = dp.PaintTimeGroup(app, c, pop,
+                                          popX + (panelW - groupW) / 2,
+                                          timeY, cellH, fs,
+                                          dp.hour, dp.minute, clicked);
+            if (hit == 1) {
+                dp.hour = (dp.hour + 1) % 24;
+                dp.editor.SetText(dp.FormatText());
+                app.ClaimClick(); app.RequestRedraw(); return;
+            }
+            if (hit == 2) {
+                dp.minute = (dp.minute + 1) % 60;
+                dp.editor.SetText(dp.FormatText());
+                app.ClaimClick(); app.RequestRedraw(); return;
+            }
+            hit = dp.PaintTimeGroup(app, c, pop,
+                                      popX + panelW + (panelW - groupW) / 2,
+                                      timeY, cellH, fs,
+                                      dp.endHour, dp.endMinute, clicked);
+            if (hit == 1) {
+                dp.endHour = (dp.endHour + 1) % 24;
+                dp.editor.SetText(dp.FormatText());
+                app.ClaimClick(); app.RequestRedraw(); return;
+            }
+            if (hit == 2) {
+                dp.endMinute = (dp.endMinute + 1) % 60;
+                dp.editor.SetText(dp.FormatText());
+                app.ClaimClick(); app.RequestRedraw(); return;
+            }
+        }
+    }
+}

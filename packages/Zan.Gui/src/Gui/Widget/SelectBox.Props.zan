@@ -1,0 +1,154 @@
+using System;
+using System.Collections.Generic;
+using Gui;
+
+namespace Gui.Widget;
+
+// SelectBox.Props.zan - 设计器属性、序列化反射与特定事件绑定分片
+public partial class SelectBox {
+    // 控件类型标识（序列化/设计器用）。必须与注册键一致：
+    // Serialize/Html 克隆按 `c.Kind()` 写、按同名 kind 重建——
+    // 旧自报名 "Select" 在注册表里没有键，下拉框在克隆通道
+    // 拿 null 被静默丢弃（注册表探针实证）。
+    override string Kind() { return "SelectBox"; }
+
+    // 覆写：返回设计器属性清单（占位 / 选项 / 选中值 / 清除 / 尺寸 /
+    // 弹层方向 / 过滤与级联选项）。
+    override List<PropSpec> Props() {
+        List<PropSpec> ps = new List<PropSpec>();
+        PropSpec ph = PropSpec.Text("hint", "Placeholder");
+        ph.str = hint;
+        ph.Also("placeholder");
+        ps.Add(ph);
+        ps.Add(PropSpec.Text("options", "Options"));
+        PropSpec sel = PropSpec.Int("value", "Selected");
+        sel.num = selected;
+        sel.Also("selected");
+        ps.Add(sel);
+        PropSpec clr = PropSpec.Bool("clearable", "Clearable");
+        clr.flag = clearable;
+        ps.Add(clr);
+        PropSpec szp = PropSpec.Enum("size", "Size",
+            PropSpec.Sizes3());
+        szp.str = Size;
+        ps.Add(szp);
+        PropSpec pl = PropSpec.Enum("placement", "Placement",
+            new List<string>{ "auto", "bottom", "top" });
+        pl.num = placement;
+        ps.Add(pl);
+        PropSpec flt = PropSpec.Bool("filterable", "Filterable");
+        flt.flag = filterable;
+        ps.Add(flt);
+        PropSpec sp = PropSpec.Bool("showPath", "ShowPath");
+        sp.flag = showPath;
+        ps.Add(sp);
+        PropSpec cs = PropSpec.Enum("checkStrategy", "CheckStrategy",
+            new List<string>{ "all", "parent", "child" });
+        cs.num = checkStrategy;
+        ps.Add(cs);
+        PropSpec he = PropSpec.Bool("hoverExpand", "HoverExpand");
+        he.flag = hoverExpand;
+        ps.Add(he);
+        return ps;
+    }
+
+    override int WidgetId() { return wid; }
+
+    // 选项列表为文本或原始 JSON，每项一个 `label|value` 对。
+    override string GetExtra(string key) {
+        if (key == "options") { return optionsRaw != "" ? optionsRaw : this.OptionsText(); }
+        if (key == "value" || key == "text" || key == "label" || key == "selectedText") { return this.Text(); }
+        if (key == "val" || key == "selectedValue") { return this.SelectedValue(); }
+        return "";
+    }
+
+    // 覆写：写回扩展属性，"options" 支持每行 label|value 或 JSON 数组，值属性支持文本与键名反查。
+    override bool SetExtra(string key, string val) {
+        if (key == "options") {
+            this.SetOptionsText(val);
+            return true;
+        }
+        if (key == "value" || key == "selected" || key == "text" || key == "label" || key == "val" || key == "selectedValue") {
+            if (val == null) { this.Select(0 - 1); return true; }
+            for (int i = 0; i < opts.Count; i = i + 1) {
+                if (opts[i].val == val || opts[i].label == val) {
+                    this.Select(i);
+                    return true;
+                }
+            }
+            if (val != "" && SelectBox.IsIntString(val)) {
+                int idx = Convert.ToInt32(val);
+                if (idx >= 0 && idx < opts.Count) {
+                    this.Select(idx);
+                    return true;
+                }
+            }
+            return false;
+        }
+        return false;
+    }
+
+    static bool IsIntString(string s) {
+        if (s == null || s == "") { return false; }
+        int start = 0;
+        if (s[0] == 45) { // '-'
+            start = 1;
+            if (s.Length <= 1) { return false; }
+        }
+        for (int i = start; i < s.Length; i = i + 1) {
+            int ch = (int)s[i];
+            if (ch < 48 || ch > 57) { return false; }
+        }
+        return true;
+    }
+
+    override string GetProp(string key) {
+        if (key == "options") { return optionsRaw != "" ? optionsRaw : this.OptionsText(); }
+        if (key == "text" || key == "label" || key == "selectedText") { return this.Text(); }
+        if (key == "val" || key == "selectedValue") { return this.SelectedValue(); }
+        if (key == "value" || key == "selected") { return Convert.ToString(selected); }
+        return base.GetProp(key);
+    }
+
+    override void SetProp(string key, string val) {
+        if (key == "options") {
+            this.SetOptionsText(val);
+            return;
+        }
+        if (key == "value" || key == "selected" || key == "text" || key == "label" || key == "val" || key == "selectedValue") {
+            if (this.SetExtra(key, val)) { return; }
+            return;
+        }
+        base.SetProp(key, val);
+    }
+
+    // 覆写：公共事件之外提供 "Change"/"SelectionChanged"/"Open"/"Close"/"Hover"。
+    override List<string> Events() {
+        List<string> e = Control.CommonEvents();
+        e.Add("Change");
+        e.Add("SelectionChanged");
+        e.Add("Open");
+        e.Add("Close");
+        e.Add("Hover");
+        return e;
+    }
+
+    // 覆写：语义事件挂对应 UiEvent，其余按名称走通用路由。
+    override void BindEvent(string evt, Action a) {
+        if (evt == "Change" || evt == "SelectionChanged") { Change.Add(a); return; }
+        if (evt == "Open") { Open.Add(a); return; }
+        if (evt == "Close") { Close.Add(a); return; }
+        if (evt == "Hover") { Hover.Add(a); return; }
+        On.AddByName(evt, a);
+    }
+
+    // <see cref="BindEvent"/> 的 sender 通道（S = Sender）：
+    // 特化事件接本控件的 UiEvent，通用事件按名路由。
+    override void BindEventS(string evt, ControlEvent a) {
+        if (evt == "Change" || evt == "SelectionChanged") { Change.AddS(a); return; }
+        if (evt == "Open") { Open.AddS(a); return; }
+        if (evt == "Close") { Close.AddS(a); return; }
+        if (evt == "Hover") { Hover.AddS(a); return; }
+        On.AddByNameS(evt, a);
+    }
+}

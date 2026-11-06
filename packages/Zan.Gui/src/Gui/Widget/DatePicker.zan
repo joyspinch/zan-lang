@@ -21,6 +21,7 @@ namespace Gui.Widget;
 // "year"          — 12 年一页选年份，取值=当年 1 月 1 日
 // "yearrange"     — 双面板选年份区间（右面板 = 下一个 12 年页）
 public class DatePicker : Control {
+    Control customPopup;
     // 最近交互的实例（Input.Change 不带宿主，静态转发经它找实例）。
     static DatePicker current;
     // 取值输入框（键盘编辑路径）。
@@ -551,7 +552,11 @@ public class DatePicker : Control {
     // 解析编辑框文本（单值）。
     void ToggleOpen() {
         open = !open;
-        if (!open) { return; }
+        if (!open) {
+            OverlayHost.DismissPopup();
+            return;
+        }
+        OverlayHost.ShowPopup(App.FrameApp(), this, this);
         pickingEnd = false;
         if (this.IsRange()) {
             // 编辑框文本是 "A ~ B"，ParseSingle 解析不了；左面板
@@ -569,6 +574,44 @@ public class DatePicker : Control {
             viewYear = value.Year();
             viewMonth = value.Month();
         }
+    }
+
+    public override void OnPopupDismissed() {
+        open = false;
+    }
+
+    public bool IsOpen() {
+        return open;
+    }
+
+    public void SetOpen(bool want) {
+        if (open == want) { return; }
+        if (want) {
+            this.ToggleOpen();
+        } else {
+            open = false;
+            OverlayHost.DismissPopup();
+        }
+    }
+
+    // 插槽支持：支持任意复杂组件（如自制日程日历卡片、快速选期表格）互嵌到日期弹层
+    public override bool MountSlot(string slot, Control c) {
+        if (slot == "popup" || slot == "dropdown" || slot == "content") {
+            this.SetPopupContent(c);
+            return true;
+        }
+        return base.MountSlot(slot, c);
+    }
+
+    public void SetPopupContent(Control c) {
+        this.customPopup = c;
+        if (c != null && !children.Contains(c)) {
+            this.Add(c);
+        }
+    }
+
+    public Control GetPopupContent() {
+        return this.customPopup;
     }
 
     // 左面板月份翻页（跨年自动进退）。
@@ -729,254 +772,33 @@ public class DatePicker : Control {
 
     // 覆写：展开且归属本实例时绘制日历/时间弹层（Naive UI 各 type 面板）。
     override void OnPaintOverlay(App app) {
-        Canvas c = app.canvas;
-        Theme t = app.theme;
-        int scale = app.Scale(1);
         if (!open || DatePicker.current != this) { return; }
-        string gran = this.Granularity();
-        bool dayPanels = gran == "day";
-        bool dual = this.IsRange();
-        bool hasShortcuts = dual && dayPanels && this.shortcuts != null &&
-                            this.shortcuts.Count > 0;
-        int sidebarW = hasShortcuts ? app.Scale(84) : 0;
-        int panelW = app.Scale(224);
-        int popH = app.Scale(200);
-        if (this.HasTime()) { popH = popH + app.Scale(40); }
-        // range 弹层横向并排两个面板（Naive UI *range 系列）。
-        int popW = panelW;
-        if (dual) { popW = sidebarW + panelW + panelW; }
-        int popX = OverlayPopup.FitX(app, bx, popW);
-        int popY = OverlayPopup.FitY(app, by + bh + app.Scale(4), bh, popH);
-        StyleBox pop = this.ResolvePartAs(app, "select", "popup", "popup",
-                                          Class, Style.SSelected());
-        pop.Paint(app, popX, popY, popW, popH);
-        app.BlockHitsBelow();
-        app.BlockHitsRect(popX, popY, popW, popH);
-        bool clicked = app.ClickAvailable();
-
-        int fs = Style.FontFallback(app, "small");
-        int pad = app.Scale(6);
-        int headerH = app.Scale(28);
-        int cellW;
-        int cellH;
-        if (dayPanels) {
-            cellW = (panelW - pad * 2) / 7;
-            cellH = app.Scale(24);
-        } else {
-            int cols = 3;
-            if (gran == "quarter") { cols = 1; }
-            cellW = (panelW - pad * 2) / cols;
-            cellH = app.Scale(38);
-        }
-        int top = popY + headerH;
-        int panelsX = popX + sidebarW;
-
-        if (hasShortcuts) {
-            c.FillRect(panelsX - app.Scale(1), popY, app.Scale(1), popH,
-                       pop.BorderOr(pop.fg));
-            int scCount = this.shortcuts.Count;
-            int itemH = (popH - pad * 2) / (scCount > 0 ? scCount : 1);
-            for (int i = 0; i < scCount; i = i + 1) {
-                DateShortcut sc = this.shortcuts[i];
-                int iy = popY + pad + i * itemH;
-                bool hover = app.mouseX >= popX && app.mouseX < panelsX &&
-                             app.mouseY >= iy && app.mouseY < iy + itemH;
-                if (hover) {
-                    StyleBox hov = Style.Part(app, "datepicker", "cell", "", "",
-                                              "", Style.SHover());
-                    c.FillRoundRect(popX + app.Scale(2), iy + app.Scale(1),
-                                    sidebarW - app.Scale(4), itemH - app.Scale(2),
-                                    app.Scale(3), hov.BgOr(pop.accent));
-                    if (clicked) {
-                        this.ApplyShortcut(sc);
-                        app.ClaimClick();
-                        app.RequestRedraw();
-                        return;
-                    }
+        if (this.customPopup != null) {
+            int popW = this.customPopup.prefW > 0 ? this.customPopup.prefW : app.Scale(224);
+            int popH = this.customPopup.prefH > 0 ? this.customPopup.prefH : app.Scale(200);
+            int popX = OverlayPopup.FitX(app, bx, popW);
+            int popY = OverlayPopup.FitY(app, by + bh + app.Scale(4), bh, popH);
+            app.BlockHitsBelow();
+            app.BlockHitsRect(popX, popY, popW, popH);
+            this.customPopup.Arrange(popX, popY, popW, popH);
+            this.customPopup.RenderTree(app);
+            if (app.ClickAvailable()) {
+                bool inside = app.mouseX >= popX && app.mouseX < popX + popW
+                    && app.mouseY >= popY && app.mouseY < popY + popH;
+                if (!inside) {
+                    this.open = false;
+                    app.ClaimClick();
                 }
-                string name = sc.label;
-                int color = hover ? pop.accent : pop.fg;
-                c.DrawText(popX + (sidebarW - Canvas.MeasureText(name, fs)) / 2,
-                           Canvas.CenterTextY(iy, itemH, fs), name, color, fs);
-            }
-        }
-
-        // 双面板时右面板 = 左面板的下一档：day=下个月，
-        // month/quarter=下一年，year=下一个 12 年页。
-        int rightYear = viewYear;
-        int rightMonth = viewMonth;
-        if (gran == "day") {
-            rightMonth = viewMonth + 1;
-            if (rightMonth > 12) { rightMonth = 1; rightYear = rightYear + 1; }
-        } else if (gran == "year") {
-            rightYear = viewYear + 12;
-        } else {
-            rightYear = viewYear + 1;
-        }
-        // year 粒度的网格从页起点（PageStart）画起，标题也按页起点
-        // 显示 —— 两边必须同源，否则标题写 2016-2027 而网格是
-        // 2026-2037。
-        int leftBase = viewYear;
-        int rightBase = rightYear;
-        if (gran == "year") {
-            leftBase = this.PageStart(viewYear);
-            rightBase = leftBase + 12;
-        }
-
-        // 头部：单面板标题在左、双箭头在右；双面板箭头分居弹层
-        // 两端，标题在各自面板内居中。
-        int arrowW = app.Scale(22);
-        if (dual) {
-            int titleW = panelW - pad * 2 - arrowW * 2;
-            string leftTitle = this.TitleText(viewYear, viewMonth);
-            string rightTitle = this.TitleText(rightYear, rightMonth);
-            c.DrawText(panelsX + pad + arrowW +
-                       (titleW - Canvas.MeasureText(leftTitle, fs)) / 2,
-                       Canvas.CenterTextY(popY, headerH, fs),
-                       leftTitle, pop.fg, fs);
-            c.DrawText(panelsX + panelW + pad + arrowW +
-                       (titleW - Canvas.MeasureText(rightTitle, fs)) / 2,
-                       Canvas.CenterTextY(popY, headerH, fs),
-                       rightTitle, pop.fg, fs);
-            c.DrawGlyphIn("chevron-left", panelsX + pad, popY, arrowW,
-                          headerH, app.Scale(13), pop.fg);
-            c.DrawGlyphIn("chevron-right", popX + popW - pad - arrowW,
-                          popY, arrowW, headerH, app.Scale(13), pop.fg);
-            if (clicked) {
-                if (app.mouseX >= panelsX &&
-                    app.mouseX < panelsX + pad + arrowW &&
-                    app.mouseY >= popY && app.mouseY < popY + headerH) {
-                    this.MoveView(-1); app.ClaimClick(); app.RequestRedraw(); return;
-                }
-                if (app.mouseX >= popX + popW - pad - arrowW &&
-                    app.mouseX < popX + popW &&
-                    app.mouseY >= popY && app.mouseY < popY + headerH) {
-                    this.MoveView(1); app.ClaimClick(); app.RequestRedraw(); return;
-                }
-            }
-        } else {
-            c.DrawText(popX + pad, Canvas.CenterTextY(popY, headerH, fs),
-                       this.TitleText(viewYear, viewMonth), pop.fg, fs);
-            c.DrawGlyphIn("chevron-left", popX + popW - app.Scale(48),
-                          popY, arrowW, headerH, app.Scale(13), pop.fg);
-            c.DrawGlyphIn("chevron-right", popX + popW - app.Scale(24),
-                          popY, arrowW, headerH, app.Scale(13), pop.fg);
-            if (clicked) {
-                if (app.mouseX >= popX + popW - app.Scale(50) &&
-                    app.mouseX < popX + popW - app.Scale(26) &&
-                    app.mouseY >= popY && app.mouseY < popY + headerH) {
-                    this.MoveView(-1); app.ClaimClick(); app.RequestRedraw(); return;
-                }
-                if (app.mouseX >= popX + popW - app.Scale(26) &&
-                    app.mouseX < popX + popW &&
-                    app.mouseY >= popY && app.mouseY < popY + headerH) {
-                    this.MoveView(1); app.ClaimClick(); app.RequestRedraw(); return;
-                }
-            }
-        }
-
-        // 区间预览和格子 hover 反馈都要在绘制前拿到整帧统一的
-        // hover 值，所以先把悬停取值扫出来。
-        hasHover = false;
-        hoverDate = null;
-        if (dayPanels) {
-            hoverDate = this.HoverDay(app, panelsX, top, pad, cellW, cellH,
-                                      viewYear, viewMonth);
-            if (dual && hoverDate == null) {
-                hoverDate = this.HoverDay(app, panelsX + panelW, top, pad,
-                                          cellW, cellH, rightYear, rightMonth);
-            }
-        } else {
-            hoverDate = this.HoverCell(app, panelsX, top, pad, cellW, cellH,
-                                       leftBase);
-            if (dual && hoverDate == null) {
-                hoverDate = this.HoverCell(app, panelsX + panelW, top, pad,
-                                           cellW, cellH, rightBase);
-            }
-        }
-        hasHover = hoverDate != null;
-
-        if (dayPanels) {
-            if (this.PaintMonth(app, c, pop, panelsX, top, pad, cellW, cellH,
-                                fs, pop.fg, viewYear, viewMonth, clicked)) {
+                app.RequestRedraw();
                 return;
             }
-            if (dual) {
-                if (this.PaintMonth(app, c, pop, panelsX + panelW, top, pad,
-                                    cellW, cellH, fs, pop.fg,
-                                    rightYear, rightMonth, clicked)) {
-                    return;
-                }
+            if (app.EventKind() == 4 && app.window.EventKeyCode() == 27) {
+                this.open = false;
+                app.RequestRedraw();
             }
-        } else {
-            if (this.PaintCellGrid(app, c, pop, panelsX, top, pad, cellW, cellH,
-                                   fs, pop.fg, leftBase, clicked)) {
-                return;
-            }
-            if (dual) {
-                if (this.PaintCellGrid(app, c, pop, panelsX + panelW, top, pad,
-                                       cellW, cellH, fs, pop.fg, rightBase,
-                                       clicked)) {
-                    return;
-                }
-            }
+            return;
         }
-        // ---- 含时分变体的时间输入行（点击数字区递增） ----
-        if (Type == "datetime") {
-            int timeY = top + 8 * cellH;  // 7 行日期之后
-            int groupW = app.Scale(64);
-            int gx = popX + (popW - groupW) / 2;
-            int hit = this.PaintTimeGroup(app, c, pop, gx, timeY, cellH,
-                                          fs, hour, minute, clicked);
-            if (hit == 1) {
-                hour = (hour + 1) % 24;
-                editor.SetText(this.FormatText());
-                app.ClaimClick(); app.RequestRedraw(); return;
-            }
-            if (hit == 2) {
-                minute = (minute + 1) % 60;
-                editor.SetText(this.FormatText());
-                app.ClaimClick(); app.RequestRedraw(); return;
-            }
-        }
-        if (Type == "datetimerange") {
-            int timeY = top + 8 * cellH;
-            int groupW = app.Scale(64);
-            int hit = this.PaintTimeGroup(app, c, pop,
-                                          popX + (panelW - groupW) / 2,
-                                          timeY, cellH, fs,
-                                          hour, minute, clicked);
-            if (hit == 1) {
-                hour = (hour + 1) % 24;
-                editor.SetText(this.FormatText());
-                app.ClaimClick(); app.RequestRedraw(); return;
-            }
-            if (hit == 2) {
-                minute = (minute + 1) % 60;
-                editor.SetText(this.FormatText());
-                app.ClaimClick(); app.RequestRedraw(); return;
-            }
-            hit = this.PaintTimeGroup(app, c, pop,
-                                      popX + panelW + (panelW - groupW) / 2,
-                                      timeY, cellH, fs,
-                                      endHour, endMinute, clicked);
-            if (hit == 1) {
-                endHour = (endHour + 1) % 24;
-                editor.SetText(this.FormatText());
-                app.ClaimClick(); app.RequestRedraw(); return;
-            }
-            if (hit == 2) {
-                endMinute = (endMinute + 1) % 60;
-                editor.SetText(this.FormatText());
-                app.ClaimClick(); app.RequestRedraw(); return;
-            }
-        }
-        if (clicked && (app.mouseX < popX || app.mouseX >= popX + popW ||
-                        app.mouseY < popY || app.mouseY >= popY + popH)) {
-            open = false;
-            app.ClaimClick();
-            app.RequestRedraw();
-        }
+        CalendarOverlay.Render(this, app);
     }
 
     // 快捷区间点选应用：按配置的相对今天偏移计算起止日期。

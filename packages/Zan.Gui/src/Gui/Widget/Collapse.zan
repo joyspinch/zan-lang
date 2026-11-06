@@ -7,8 +7,10 @@ namespace Gui.Widget;
 // 展开面板的索引（-1 = 全部折叠），可双向绑定：
 // c.Active = vm.openPanel;
 public class Collapse : Control {
-    // 面板列表（AddPanel 追加）。
+    // 面板列表（AddPanel 追加，旧纯文本兼容）。
     List<CollapsePanel> panels;
+    // 现代组件化子项列表（AddItem 追加，支持任意复杂组件互嵌）。
+    List<CollapseItem> items;
     // 内部展开索引信号（-1 = 全折叠），与 Active 双向同步。
     SignalInt open;
     // 双向绑定的展开索引；-1 折叠所有面板。
@@ -27,6 +29,7 @@ public class Collapse : Control {
     void InitCollapse(SignalInt m) {
         this.InitControl("collapse", 1);
         panels = new List<CollapsePanel>();
+        items = new List<CollapseItem>();
         open = m;
         baseId = 0;
         idCount = 0;
@@ -36,7 +39,7 @@ public class Collapse : Control {
         expander = true;
     }
 
-    // 空手风琴（之后 AddPanel）。
+    // 空手风琴（之后 AddPanel 或 AddItem）。
     Collapse() { InitCollapse(new SignalInt(0 - 1)); }
 
     // 共享展开索引信号（-1 = 全折叠）。
@@ -49,6 +52,24 @@ public class Collapse : Control {
 
     // 追加一个已构建的面板记录。
     void AddPanel(CollapsePanel panel) { panels.Add(panel); }
+
+    // 追加一个现代组件化面板（支持任意组件互嵌）
+    public void AddItem(CollapseItem item) {
+        if (item == null) { return; }
+        if (!items.Contains(item)) { items.Add(item); }
+        if (!children.Contains(item)) { this.Children.Add(item); }
+    }
+
+    public override Control Add(Control child) {
+        if (child == null) { return null; }
+        if (child is CollapseItem) {
+            this.AddItem((CollapseItem)child);
+            return child;
+        }
+        return base.Add(child);
+    }
+
+    public List<CollapseItem> GetItems() { return this.items; }
 
     // 基于现有面板记录构建手风琴。
     static Collapse Of(List<CollapsePanel> items, SignalInt m) {
@@ -79,9 +100,10 @@ public class Collapse : Control {
     // 每个面板标题占一个 id，作为连续块预留，使
     // 面板列表不变时点击 id 保持稳定。
     void EnsureIds() {
-        if (idCount >= panels.Count) { return; }
-        baseId = WidgetId.Block(panels.Count);
-        idCount = panels.Count;
+        int cnt = items.Count > 0 ? items.Count : panels.Count;
+        if (idCount >= cnt) { return; }
+        baseId = WidgetId.Block(cnt);
+        idCount = cnt;
     }
 
     // 覆写：把 Active 绑定的值拉入本地展开信号（model -> UI）。
@@ -95,20 +117,33 @@ public class Collapse : Control {
     override void OnMeasure(App app) {
         StyleBox s = this.ResolveStyleAs(app, "collapse", Class,
                                          Style.SNormal());
-        // 面板头/正文的高度必须走 OnPaint 同一条路径（部件样式
-        // HeightOr 兜底 theme 常量）：skin/字号/内边距给的隐式高度
-        // 比 heightLarge 大时，少量的测量会把最后一行面板头裁掉。
         StyleBox hs = this.ResolvePartAs(app, "collapse", "header", "",
                                          Class, Style.SNormal());
         StyleBox bs = this.ResolvePartAs(app, "collapse", "body", "",
                                          Class, Style.SNormal());
         int headerH = hs.HeightOr(Collapse.HeaderHeight(app));
         int bodyH = bs.HeightOr(Collapse.BodyHeight(app));
-        // 与 OnPaint 开头的 SyncBinding 一致：双向绑定的值决定
-        // 是否多算一行正文。
         int opened = open.Get();
         if (Active != null) { opened = Active.Get(); }
-        prefH = panels.Count * headerH + (opened >= 0 ? bodyH : 0);
+
+        int totalH = 0;
+        if (items.Count > 0) {
+            totalH = items.Count * headerH;
+            if (opened >= 0 && opened < items.Count) {
+                CollapseItem cur = items[opened];
+                Control content = cur.GetContent();
+                if (content != null) {
+                    content.OnMeasure(app);
+                    int ch = content.prefH > 0 ? content.prefH + app.theme.paddingSmall * 2 : bodyH;
+                    totalH = totalH + ch;
+                } else {
+                    totalH = totalH + bodyH;
+                }
+            }
+        } else {
+            totalH = panels.Count * headerH + (opened >= 0 ? bodyH : 0);
+        }
+        prefH = totalH;
         prefW = s.WidthOr(app.Scale(240));
     }
 
@@ -119,7 +154,6 @@ public class Collapse : Control {
         Theme t = app.theme;
         this.SyncBinding();
         this.EnsureIds();
-        // 调整 ::arrow 的位置（左/右）。
         string origClass = Class;
         if (arrowPlacement == "right") { this.AddClass("arrow-right"); }
         StyleBox hs = this.ResolvePartAs(app, "collapse", "header", "", Class,
@@ -135,15 +169,28 @@ public class Collapse : Control {
         int headFont = hs.FontOr(Style.FontFallback(app, "medium"));
         int bodyFont = bs.FontOr(Style.FontFallback(app, "small"));
         int ico = as2.WidthOr(t.iconSizeSmall);
-        int n = panels.Count;
+        int n = items.Count > 0 ? items.Count : panels.Count;
         int opened = open.Get();
         int cy = by;
 
-        // 把所有内容裁剪到手风琴自身区域内，长标题/正文
-        // 会被截断，而不是向右或向下溢出。
         c.PushClip(bx, by, bw, bh);
         for (int i = 0; i < n; i = i + 1) {
-            CollapsePanel panel = panels[i];
+            string pTitle = "";
+            string pBody = "";
+            Control extra = null;
+            Control content = null;
+            if (items.Count > 0) {
+                CollapseItem ci = items[i];
+                pTitle = ci.Title();
+                pBody = ci.BodyText();
+                extra = ci.GetExtra();
+                content = ci.GetContent();
+            } else {
+                CollapsePanel panel = panels[i];
+                pTitle = panel.title;
+                pBody = panel.body;
+            }
+
             int id = baseId + i;
             bool isOpen = i == opened;
             if (i > 0) { c.FillRect(bx, cy, bw, 1, ds.bg); }
@@ -161,20 +208,38 @@ public class Collapse : Control {
 
             int textX = bx + t.paddingMedium + ico + t.gapMedium;
             int textMaxW = bx + bw - t.paddingMedium - textX;
+
+            if (extra != null) {
+                extra.OnMeasure(app);
+                int ew = extra.prefW > 0 ? extra.prefW : app.Scale(60);
+                int eh = extra.prefH > 0 ? extra.prefH : headerH - t.paddingSmall * 2;
+                extra.Arrange(bx + bw - t.paddingMedium - ew, cy + (headerH - eh) / 2, ew, eh);
+                textMaxW = textMaxW - ew - t.gapSmall;
+                if (textMaxW < 0) { textMaxW = 0; }
+            }
+
             c.DrawText(textX, Canvas.CenterTextY(cy, headerH, headFont),
-                       Ellipsis.Fit(panel.title, textMaxW, headFont),
+                       Ellipsis.Fit(pTitle, textMaxW, headFont),
                        hs.fg, headFont);
 
             app.hitTester.RegisterRect(id, bx, cy, bw, headerH, 0);
             cy = cy + headerH;
 
             if (isOpen) {
-                c.FillRect(bx, cy, bw, bodyH, bs.bg);
-                c.DrawText(textX,
-                           Canvas.CenterTextY(cy, bodyH, bodyFont),
-                           Ellipsis.Fit(panel.body, textMaxW, bodyFont),
-                           bs.fg, bodyFont);
-                cy = cy + bodyH;
+                if (content != null) {
+                    content.OnMeasure(app);
+                    int curBodyH = content.prefH > 0 ? content.prefH + t.paddingSmall * 2 : bodyH;
+                    c.FillRect(bx, cy, bw, curBodyH, bs.bg);
+                    content.Arrange(textX, cy + t.paddingSmall, textMaxW, curBodyH - t.paddingSmall * 2);
+                    cy = cy + curBodyH;
+                } else {
+                    c.FillRect(bx, cy, bw, bodyH, bs.bg);
+                    c.DrawText(textX,
+                               Canvas.CenterTextY(cy, bodyH, bodyFont),
+                               Ellipsis.Fit(pBody, textMaxW, bodyFont),
+                               bs.fg, bodyFont);
+                    cy = cy + bodyH;
+                }
             }
         }
         c.PopClip();
@@ -183,9 +248,6 @@ public class Collapse : Control {
         int hit = app.ClickTarget();
         if (hit < baseId || hit >= baseId + n) { return; }
         int idx = hit - baseId;
-        // accordion=true（默认）：单选，点击当前展开面板则折叠。
-        // accordion=false（expandable）：可多开，点击已开面
-        // 板保持。Naive UI expandX / arrow-placement。
         if (expander) {
             if (open.Get() == idx) { idx = 0 - 1; }
         }

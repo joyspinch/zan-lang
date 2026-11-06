@@ -181,53 +181,82 @@ public class Html {
         for (int i = 0; i < wd.nodes.Count; i = i + 1) {
             built.Add(Html.Build(wd, wd.nodes[i], doc, handlers));
         }
-        // 文档级自由画布标记（旧管线 layoutMode=1 同语义）：声明了
-        // fx/fy 的方言子节点浮动定位。
-        bool docFree = false;
-        for (int i = 0; i < wd.nodes.Count; i = i + 1) {
-            if (HtmlText.NodeAttr(wd.nodes[i].attrs, "data-layout-mode") == "1") {
-                docFree = true;
-                break;
-            }
-        }
         // 装配：逐父按 items 文档序走一遍——AddText 与 AddChild 的
         // 交错顺序就是 HTML 的行内内容顺序（混排行盒依赖）。
         for (int i = 0; i < wd.nodes.Count; i = i + 1) {
             WNode n = wd.nodes[i];
             Control c = built[i];
-            if (n.tag == "tab" || n.tag == "tab-pane" || n.tag == "tabpane" || n.tag == "option") {
+            if (n.tag == "option" || n.tag == "thead" || n.tag == "tbody" || n.tag == "tfoot") {
                 continue;
             }
-            List<Control> flowKids = null;
-            List<HtmlKidSpec> flowSpecs = null;
             for (int k = 0; k < n.items.Count; k = k + 1) {
                 WItem it = n.items[k];
                 if (it.kid < 0) {
-                    // 真控件下的游离文本无处安放（映射控件的文本走
-                    // 自己的协议——button 吃捕获文本）
                     if (c is Element) {
                         ((Element)c).AddText(it.text);
                         if (it.text.IndexOf("{{") >= 0 && c.bindTpl == "") {
                             c.bindTpl = it.text;
                         }
+                    } else if (c is TableCell) {
+                        string t = it.text.Trim();
+                        if (t != "") {
+                            ((TableCell)c).SetText(t);
+                        }
+                    } else if (c is TabPane) {
+                        string t = it.text.Trim();
+                        if (t != "" && ((TabPane)c).Label() == "") {
+                            ((TabPane)c).SetLabel(t);
+                        }
+                    } else if (c is BreadcrumbItem) {
+                        string t = it.text.Trim();
+                        if (t != "" && ((BreadcrumbItem)c).Text() == "") {
+                            ((BreadcrumbItem)c).SetText(t);
+                        }
+                    } else if (c is TimelineItem) {
+                        string t = it.text.Trim();
+                        if (t != "" && ((TimelineItem)c).title == "") {
+                            ((TimelineItem)c).title = t;
+                        }
                     }
                 } else {
                     WNode kidNode = wd.nodes[it.kid];
                     if (IsMetaChild(n.tag, kidNode.tag)) {
-                        // 若父容器是 Tabs 且子项是 tab/tab-pane 元节点，把 tab 内部的子控件转挂到对应标签页
-                        if (c is Tabs && (kidNode.tag == "tab" || kidNode.tag == "tab-pane" || kidNode.tag == "tabpane")) {
-                            string tTitle = HtmlText.NodeAttr(kidNode.attrs, "title");
-                            if (tTitle == "") { tTitle = HtmlText.NodeAttr(kidNode.attrs, "label"); }
-                            if (tTitle == "") { tTitle = HtmlText.NodeAttr(kidNode.attrs, "name"); }
+                        // 若父容器是 Table 且子项是 thead/tbody/tfoot 元节点，把内部 tr 扁平转挂到 Table
+                        if (c is Table && (kidNode.tag == "thead" || kidNode.tag == "tbody" || kidNode.tag == "tfoot")) {
                             for (int ti = 0; ti < kidNode.items.Count; ti = ti + 1) {
                                 WItem tit = kidNode.items[ti];
                                 if (tit.kid >= 0) {
                                     Control grandKid = built[tit.kid];
                                     if (grandKid != null) {
-                                        if (grandKid.slotName == "" && tTitle != "") {
-                                            grandKid.slotName = tTitle;
+                                        if (kidNode.tag == "thead" && grandKid is TableRow) {
+                                            ((TableRow)grandKid).SetHeader(true);
                                         }
                                         Html.AddChild(c, grandKid);
+                                    }
+                                }
+                            }
+                        }
+                        // 若父容器是 Tabs 且子项是 tab/tab-pane 元节点，把 tab 内部的子控件转挂到对应标签页
+                        if (c is Tabs && (kidNode.tag == "tab" || kidNode.tag == "tab-pane" || kidNode.tag == "tabpane")) {
+                            string tTitle = HtmlText.NodeAttr(kidNode.attrs, "title");
+                            if (tTitle == "") { tTitle = HtmlText.NodeAttr(kidNode.attrs, "label"); }
+                            if (tTitle == "") { tTitle = HtmlText.NodeAttr(kidNode.attrs, "name"); }
+                            Control tabControl = built[it.kid];
+                            if (tabControl is TabPane) {
+                                TabPane tp = (TabPane)tabControl;
+                                if (tp.Label() == "" && tTitle != "") { tp.SetLabel(tTitle); }
+                                ((Tabs)c).AddTab(tp);
+                            } else {
+                                for (int ti = 0; ti < kidNode.items.Count; ti = ti + 1) {
+                                    WItem tit = kidNode.items[ti];
+                                    if (tit.kid >= 0) {
+                                        Control grandKid = built[tit.kid];
+                                        if (grandKid != null) {
+                                            if (grandKid.slotName == "" && tTitle != "") {
+                                                grandKid.slotName = tTitle;
+                                            }
+                                            Html.AddChild(c, grandKid);
+                                        }
                                     }
                                 }
                             }
@@ -235,30 +264,12 @@ public class Html {
                         continue;
                     }
                     Control kidCtl = built[it.kid];
-                    if (c is Element) {
-                        // Element 父保持行内文档序（AddText 交错依赖）。
-                        HtmlKidAttach.ApplyDialect(kidCtl, Html.SpecOf(kidNode, docFree));
-                        Html.AddChild(c, kidCtl);
-                    } else {
-                        // 真控件父：方言几何（span/fx/fy/标题/停靠）在
-                        // FormBuilder.HtmlKidAttach 落——与旧 JSON 管线
-                        // AttachNode 全同构。
-                        if (flowKids == null) {
-                            flowKids = new List<Control>();
-                            flowSpecs = new List<HtmlKidSpec>();
-                        }
-                        flowKids.Add(kidCtl);
-                        flowSpecs.Add(Html.SpecOf(kidNode, docFree));
-                    }
+                    Html.AddChild(c, kidCtl);
                 }
-            }
-            if (flowKids != null) {
-                HtmlKidAttach.Kids(c, flowKids, flowSpecs);
             }
         }
         doc.root = built.Count > 0 ? built[0] : null;
         if (doc.root != null) {
-            doc.root.Dock(Dock.Fill());
             if (doc.css != "") {
                 doc.root.designCss = doc.css;
             }
@@ -268,10 +279,9 @@ public class Html {
         return doc;
     }
 
-    // 设计半件直挂（DesignedControl.Design 用）：body 子节点按方言几何
-    // （span/fx/fy/dock…）直接挂进宿主控件——宿主自己就是设计根，不经
-    // body 占位包装。与 Form 装配循环同构：真控件宿主走 HtmlKidAttach，
-    // Element 宿主保持行内序。
+    // 设计半件直挂（DesignedControl.Design 用）：body 子节点按标准文档序
+    // 直接挂进宿主控件——宿主自己就是设计根，不经 body 占位包装。
+    // 统一通过 Html.AddChild 挂载，彻底终结双轨分裂。
     public static void ProjectBody(Control host, HtmlDoc doc) {
         Install();
         if (host == null || doc == null || doc.root == null
@@ -280,82 +290,20 @@ public class Html {
         if (wd.nodes.Count == 0) { return; }
         WNode body = wd.nodes[0];
         Control bodyCtl = doc.built[0];
-        bool docFree = false;
-        for (int i = 0; i < wd.nodes.Count; i = i + 1) {
-            if (HtmlText.NodeAttr(wd.nodes[i].attrs, "data-layout-mode") == "1") {
-                docFree = true;
-                break;
-            }
-        }
         List<Control> kids = new List<Control>();
-        List<HtmlKidSpec> specs = new List<HtmlKidSpec>();
         for (int k = 0; k < body.items.Count; k = k + 1) {
             WItem it = body.items[k];
             if (it.kid < 0) {
-                // 游离文本：Element 宿主收（body 占位即废，重复无碍）；
-                // 真控件宿主无处安放（与装配循环同契约）。
                 if (host is Element) { ((Element)host).AddText(it.text); }
                 continue;
             }
             kids.Add(doc.built[it.kid]);
-            specs.Add(Html.SpecOf(wd.nodes[it.kid], docFree));
         }
         bodyCtl.RemoveAll();
         if (kids.Count == 0) { return; }
-        if (host is Element) {
-            for (int i = 0; i < kids.Count; i = i + 1) {
-                Html.AddChild(host, kids[i]);
-            }
-            return;
+        for (int i = 0; i < kids.Count; i = i + 1) {
+            Html.AddChild(host, kids[i]);
         }
-        HtmlKidAttach.Kids(host, kids, specs);
-    }
-
-    // 节点 → 设计几何标量（属性提取在这里，布局语义在 FormBuilder
-    // 的 HtmlKidAttach——旧 JSON 管线与新 Html 单跳管线共用一套）。
-    static HtmlKidSpec SpecOf(WNode n, bool free) {
-        HtmlKidSpec s = new HtmlKidSpec();
-        s.kind = TagToKind(n.tag);
-        s.free = free;
-        s.label = HtmlText.NodeAttr(n.attrs, "data-label");
-        s.span = Html.NodeInt(n, "data-span");
-        s.childTab = Html.NodeInt(n, "data-child-tab");
-        s.fw = Html.NodeInt(n, "data-fw");
-        s.fh = Html.NodeInt(n, "data-fh");
-        s.ph = Html.NodeInt(n, "data-ph");
-        s.anchor = Html.NodeInt(n, "data-anchor");
-        s.position = Html.NodeInt(n, "data-position");
-        string dv = HtmlText.NodeAttr(n.attrs, "data-dock");
-        if (Html.IsIntText(dv)) { s.dock = Convert.ToInt32(dv); }
-        s.hasFx = Html.HasAttr(n, "data-fx");
-        if (s.hasFx) { s.fx = Html.NodeInt(n, "data-fx"); }
-        s.hasFy = Html.HasAttr(n, "data-fy");
-        if (s.hasFy) { s.fy = Html.NodeInt(n, "data-fy"); }
-        s.hasPad = Html.HasAttr(n, "data-padding");
-        if (s.hasPad) { s.pad = Html.NodeInt(n, "data-padding"); }
-        s.hasGap = Html.HasAttr(n, "data-gap");
-        if (s.hasGap) { s.gap = Html.NodeInt(n, "data-gap"); }
-        s.hasMar = Html.HasAttr(n, "data-margin");
-        if (s.hasMar) { s.mar = Html.NodeInt(n, "data-margin"); }
-        s.isContainer = false;
-        for (int i = 0; i < n.items.Count; i = i + 1) {
-            if (n.items[i].kid >= 0) { s.isContainer = true; break; }
-        }
-        s.dialect = s.span > 0 || s.childTab > 0 || s.label != ""
-            || s.hasFx || s.hasFy || s.fw > 0 || s.fh > 0 || s.ph > 0
-            || s.position == 1 || s.dock > 0 || s.hasPad || s.hasGap || s.hasMar;
-        return s;
-    }
-
-    // 节点属性整数（缺失/非法 → 0）。
-    static int NodeInt(WNode n, string key) {
-        string v = HtmlText.NodeAttr(n.attrs, key);
-        if (!Html.IsIntText(v)) { return 0; }
-        return Convert.ToInt32(v);
-    }
-
-    static bool HasAttr(WNode n, string key) {
-        return HtmlText.NodeAttr(n.attrs, key) != "";
     }
 
     // 整数字面量（可选负号 + 纯数字）。
@@ -545,7 +493,10 @@ public class Html {
                 c = img;
                 break;
             }
-            case "select": {
+            case "select":
+            case "selectbox":
+            case "select-box":
+            case "zan-select-box": {
                 SelectBox sb = new SelectBox();
                 string opts = "";
                 int selIdx = 0 - 1;
@@ -653,6 +604,64 @@ public class Html {
                 c = tb;
                 break;
             }
+            case "table": {
+                Table tbl = new Table();
+                c = tbl;
+                break;
+            }
+            case "tr": {
+                TableRow tr = new TableRow();
+                c = tr;
+                break;
+            }
+            case "th": {
+                TableCell th = new TableCell();
+                th.SetHeader(true);
+                c = th;
+                break;
+            }
+            case "td": {
+                TableCell td = new TableCell();
+                c = td;
+                break;
+            }
+            case "tab-pane":
+            case "tabpane": {
+                TabPane tp = new TabPane();
+                string t = HtmlText.NodeAttr(n.attrs, "label");
+                if (t == "") { t = HtmlText.NodeAttr(n.attrs, "title"); }
+                if (t != "") { tp.SetLabel(t); }
+                c = tp;
+                break;
+            }
+            case "breadcrumb-item": {
+                BreadcrumbItem bi = new BreadcrumbItem();
+                string href = HtmlText.NodeAttr(n.attrs, "href");
+                if (href != "") { bi.SetHref(href); }
+                c = bi;
+                break;
+            }
+            case "timeline-item": {
+                TimelineItem ti = new TimelineItem();
+                string tm = HtmlText.NodeAttr(n.attrs, "time");
+                if (tm != "") { ti.time = tm; }
+                string ttl = HtmlText.NodeAttr(n.attrs, "title");
+                if (ttl != "") { ti.title = ttl; }
+                c = ti;
+                break;
+            }
+            case "collapse-item":
+            case "collapseitem":
+            case "collapse-panel": {
+                CollapseItem ci = new CollapseItem();
+                string ttl = HtmlText.NodeAttr(n.attrs, "title");
+                if (ttl == "") { ttl = HtmlText.NodeAttr(n.attrs, "header"); }
+                if (ttl != "") { ci.SetTitle(ttl); }
+                string bd = HtmlText.NodeAttr(n.attrs, "body");
+                if (bd != "") { ci.SetBodyText(bd); }
+                c = ci;
+                break;
+            }
             default: {
                 // 通用动态解析：优先通过 ControlFactory 与已注册组件族（ControlBootstrap,
                 // DataTableBootstrap, ChartBootstrap 等）实例化，杜绝死硬编码
@@ -709,6 +718,10 @@ public class Html {
             }
             if (k == "slot" || k == "data-slot") {
                 c.slotName = v;
+                continue;
+            }
+            if (k == "z-mount" || k == "data-mount") {
+                c.bindMount = v;
                 continue;
             }
             if (k == "data-bind" || k == "z-model" || k == "v-model"
@@ -858,16 +871,57 @@ public class Html {
                 }
                 case "dock":
                 case "data-dock": {
-                    // 数字停靠值（旧管线 Dock 值语义）留给装配层，与
-                    // 字面（fill/left/...）共用一个入口。
-                    if (Html.IsIntText(v)) { break; }
                     string dlow = v.ToLower();
-                    switch (dlow) {
-                        case "fill":   c.DockFill(); break;
-                        case "left":   c.DockLeft(); break;
-                        case "right":  c.DockRight(); break;
-                        case "top":    c.DockTop(); break;
-                        case "bottom": c.DockBottom(); break;
+                    if (dlow == "fill" || dlow == "5") { c.DockFill(); }
+                    else if (dlow == "left" || dlow == "3") { c.DockLeft(); }
+                    else if (dlow == "right" || dlow == "4") { c.DockRight(); }
+                    else if (dlow == "top" || dlow == "1") { c.DockTop(); }
+                    else if (dlow == "bottom" || dlow == "2") { c.DockBottom(); }
+                    continue;
+                }
+                case "data-fx": {
+                    if (Html.IsIntText(v)) {
+                        c.designFloat = true;
+                        c.logPlaceSet = true;
+                        c.logX = Convert.ToInt32(v);
+                    }
+                    continue;
+                }
+                case "data-fy": {
+                    if (Html.IsIntText(v)) {
+                        c.designFloat = true;
+                        c.logPlaceSet = true;
+                        c.logY = Convert.ToInt32(v);
+                    }
+                    continue;
+                }
+                case "data-fw": {
+                    if (Html.IsIntText(v)) {
+                        c.logW = Convert.ToInt32(v);
+                    }
+                    continue;
+                }
+                case "data-fh": {
+                    if (Html.IsIntText(v)) {
+                        c.DeclareHeight(Convert.ToInt32(v));
+                    }
+                    continue;
+                }
+                case "data-padding": {
+                    if (Html.IsIntText(v)) {
+                        c.logPad = Convert.ToInt32(v);
+                    }
+                    continue;
+                }
+                case "data-gap": {
+                    if (Html.IsIntText(v)) {
+                        c.logGap = Convert.ToInt32(v);
+                    }
+                    continue;
+                }
+                case "data-margin": {
+                    if (Html.IsIntText(v)) {
+                        c.logMar = Convert.ToInt32(v);
                     }
                     continue;
                 }
@@ -941,6 +995,9 @@ public class Html {
 
     static bool IsMetaChild(string ptag, string ctag) {
         switch (ptag) {
+            case "table":
+            case "zan-table":
+                return ctag == "thead" || ctag == "tbody" || ctag == "tfoot";
             case "select":
             case "selectbox":
             case "zan-select-box":
@@ -1260,11 +1317,27 @@ public class Html {
             case "datatable":
             case "grid":
             case "data-grid":
-            case "table":
                 return "DataGrid";
+            case "table":
+                return "Table";
+            case "tr":
+            case "table-row":
+                return "TableRow";
+            case "td":
+            case "th":
+            case "table-cell":
+                return "TableCell";
             case "tabs":
             case "tab-control":
                 return "Tabs";
+            case "tab-pane":
+            case "tabpane":
+            case "tab":
+                return "TabPane";
+            case "breadcrumb-item":
+                return "BreadcrumbItem";
+            case "timeline-item":
+                return "TimelineItem";
             case "splitpanel":
             case "split-panel":
             case "splitter":
@@ -1338,6 +1411,10 @@ public class Html {
                 return "StatusBar";
             case "collapse":
                 return "Collapse";
+            case "collapse-item":
+            case "collapseitem":
+            case "collapse-panel":
+                return "CollapseItem";
             case "breadcrumb":
                 return "Breadcrumb";
             case "steps":
@@ -1395,6 +1472,10 @@ public class Html {
             case "checkbox-group":
             case "checkboxgroup":
                 return "CheckboxGroup";
+            case "select":
+            case "selectbox":
+            case "select-box":
+                return "SelectBox";
             default:
                 // zan-<kebab> 自定义族：还原 PascalCase kind 供工厂查表。
                 if (zan) { return ZanKind(t); }

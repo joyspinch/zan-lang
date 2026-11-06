@@ -1,16 +1,13 @@
 using System;
+using System.Collections.Generic;
 using Gui;
 
 namespace Gui.Widget;
 
-// 锚定在某一点的浮动面板，带小箭头凹口和
-// 自动换行的正文。
-// C# 风格的有状态实例——自持打开状态，并在延迟的
-// 覆盖阶段绘制，因此显示在其他控件之上、阻挡其下方一切输入
-// （无父子点击穿透），点击外部或按 Esc 关闭：
-// Esc：
-// pop.Render(app, x, y, w, h);
-// 静态 Render(...) 是立即模式版本（状态由调用方管理）。
+// 气泡卡片（Popover）：标准声明式浮层组件。
+// 点击触发器后在锚点下方（空间不足时自动上翻）弹出内容卡片，
+// 统一接入 OverlayHost 生命周期，天然置于顶层、具备外部点击自动关闭，
+// 彻底消灭手工 BlockHitsBelow、BlockHitsRect 与画布三角形手绘。
 public class Popover : Control {
     string trigLabel;
     string title;
@@ -18,12 +15,7 @@ public class Popover : Control {
     int panelW;
     int trigId;
     SignalBool open;
-    // 每帧暂存锚点几何，使延迟面板（OnPaintOverlay）
-    // 能相对触发控件定位。
-    int trigX;
-    int trigY;
-    int trigW;
-    int trigH;
+    Card popupCard;
 
     // 初始化：以 "popover" 注册，置触发文本/标题/正文/面板宽并保持关闭。
     void InitPopover(string trig, string ti, string bo, int w) {
@@ -31,39 +23,89 @@ public class Popover : Control {
         trigLabel = trig;
         title = ti;
         body = bo;
-        panelW = w;
+        panelW = w > 0 ? w : 260;
         trigId = WidgetId.Next();
         open = new SignalBool(false);
+        popupCard = null;
     }
 
-    // 有状态模式构造函数。
+    Popover() {
+        InitPopover("Click", "", "", 260);
+    }
+
+    Popover(string trig) {
+        InitPopover(trig, "", "", 260);
+    }
+
     Popover(string trig, string ti, string bo, int w) {
         InitPopover(trig, ti, bo, w);
     }
 
-    // 面板当前是否打开。
     bool IsOpen() { return open.Get(); }
 
-    // 绘制触发器并处理点击开合；打开时把面板登记为帧末覆盖层
-    // （经 OnPaintOverlay 绘制，点击外部或 Esc 关闭）。返回触发器 id。
+    void EnsurePopupCard(App app) {
+        if (popupCard == null) {
+            popupCard = new Card(title);
+            popupCard.Class = "popover-card";
+            if (body != "") {
+                Label lbl = new Label(body);
+                lbl.wrap = true;
+                popupCard.With(lbl);
+            }
+        }
+        popupCard.prefW = panelW;
+        if (app != null) {
+            popupCard.OnMeasure(app);
+        }
+    }
+
+    void SetOpen(bool want) {
+        if (open.Get() == want) { return; }
+        open.Set(want);
+        App a = this.FindApp();
+        if (a == null) { a = App.FrameApp(); }
+        if (want) {
+            this.EnsurePopupCard(a);
+            OverlayHost.ShowPopup(a, this, popupCard);
+        } else {
+            OverlayHost.DismissPopup();
+        }
+        if (a != null && a.window != null) { a.window.Wake(); }
+    }
+
+    public override void OnPopupDismissed() {
+        if (open.Get()) {
+            open.Set(false);
+            App a = this.FindApp();
+            if (a != null && a.window != null) { a.window.Wake(); }
+        }
+    }
+
+    // 插槽支持：支持通过 slot="popup" 挂载任意复杂组件作为气泡内容
+    public override bool MountSlot(string slot, Control c) {
+        if (slot == "popup" || slot == "content" || slot == "body") {
+            if (c is Card) {
+                this.popupCard = (Card)c;
+            } else {
+                this.popupCard = new Card("");
+                this.popupCard.Class = "popover-card";
+                this.popupCard.With(c);
+            }
+            if (!children.Contains(this.popupCard)) {
+                this.Add(this.popupCard);
+            }
+            return true;
+        }
+        return base.MountSlot(slot, c);
+    }
+
+    // 绘制触发器并处理点击开合；返回触发器 id。
     int Render(App app, int x, int y, int w, int h) {
         DropdownChrome.PaintTrigger(app, trigId, x, y, w, h, trigLabel, open.Get());
         app.focus.RegisterFocusable(trigId);
 
         if (Ui.Clicked(app, trigId)) {
-            open.Set(!open.Get());
-            app.RequestRedraw();
-        }
-
-        // 将面板推迟到覆盖阶段，使其绘制在本控件之后的所有控件之上，
-        // 并拥有最顶层的命中区域。参见
-        // OnPaintOverlay。
-        trigX = x;
-        trigY = y;
-        trigW = w;
-        trigH = h;
-        if (open.Get()) {
-            app.AddOverlay(OverlayPopup.Host(this));
+            this.SetOpen(!open.Get());
         }
         return trigId;
     }
@@ -87,124 +129,40 @@ public class Popover : Control {
         ps.Add(w);
         PropSpec op = PropSpec.Bool("open", "Open");
         op.sflag = open;
-        op.WithTip("Design default; users toggle it by clicking the trigger.");
         ps.Add(op);
         return ps;
     }
 
-    // 延迟面板：在所有内容之后由 App.RunOverlays 绘制并派发事件。
-    override void OnPaintOverlay(App app) {
-        if (!open.Get()) { return; }
-        // 遮罩阻挡 popover 下方的所有控件（不可穿透点击）；
-        // 随后面板在顶部注册自己的阻挡区域。
-        app.BlockHitsBelow();
-        int panelId = Popover.PaintPanel(app, trigX + trigW / 2, trigY + trigH,
-            panelW, title, body);
-
-        // 点击外部或按 Esc 关闭；按压触发控件则切换开关。
-        int kind = app.EventKind();
-        if (kind == 2) {
-            int pt = app.PressTarget();
-            if (pt != panelId && pt != trigId) {
-                open.Set(false);
-                app.RequestRedraw();
-            }
-        }
-        if (kind == 4 && app.window.EventKeyCode() == 27) {
-            open.Set(false);
-            app.RequestRedraw();
-        }
-    }
+    override string Kind() { return "Popover"; }
 
     // 覆写：触发器默认一行高、120 逻辑像素宽。
     override void OnMeasure(App app) {
-        prefH = app.theme.heightMedium;
-        prefW = app.Scale(120);
+        prefH = app != null ? app.theme.heightMedium : 32;
+        prefW = app != null ? app.Scale(120) : 120;
     }
 
-    // 覆写：在自身矩形内画触发器并处理点击开合（转发到 Render）。
+    // 覆写：在自身矩形内画触发器并处理点击开合。
     override void OnPaint(App app) {
         this.Render(app, bx, by, bw, bh);
     }
 
-    // 绘制锚定面板（阴影、主体、边框、箭头凹口），
-    // 正文自动换行并贴齐窗口各边。`anchorX` 为
-    // 指针 x，`anchorY` 为触发控件正下方的 y。返回面板上
-    // 注册的阻挡区域 id。
-    static int PaintPanel(App app, int anchorX, int anchorY, int w,
-                          string title, string body) {
-        Canvas c = app.canvas;
-        Theme t = app.theme;
-
-        int margin = app.Scale(4);
-        int pad = t.paddingMedium;
-        int notch = app.Scale(6);
-        StyleBox titleStyle = Style.Part(app, "popover", "title", "", "", "",
-                                         Style.SNormal());
-        StyleBox bodyStyle = Style.Part(app, "popover", "body", "", "", "",
-                                        Style.SNormal());
-        int titleFont = titleStyle.FontOr(Style.FontFallback(app, "medium"));
-        int bodyFont = bodyStyle.FontOr(Style.FontFallback(app, "small"));
-
-        if (w > c.Width() - margin * 2) { w = c.Width() - margin * 2; }
-        if (w < app.Scale(80)) { w = app.Scale(80); }
-
-        int th = 0;
-        if (title != "") { th = Canvas.FontHeight(titleFont) + t.gapSmall; }
-        List<string> lines = Tooltip.WrapLines(body, bodyFont, w - pad * 2);
-        int lh = Canvas.FontHeight(bodyFont);
-        int h = pad * 2 + th + lines.Count * lh;
-
-        // 优先显示在锚点下方；若会超出窗口则翻到上方。
-        bool below = true;
-        int x = anchorX - w / 2;
-        int y = anchorY + notch + app.Scale(2);
-        if (y + h > c.Height() - margin) {
-            int above = anchorY - notch - app.Scale(2) - h
-                - t.heightMedium;
-            if (above >= margin) { y = above; below = false; }
-        }
-        if (x + w > c.Width() - margin) { x = c.Width() - margin - w; }
-        if (x < margin) { x = margin; }
-        if (y + h > c.Height() - margin) { y = c.Height() - margin - h; }
-        if (y < margin) { y = margin; }
-
-        StyleBox s = Style.Of(app, "popover", "", Style.SNormal());
-        c.FillRoundRect(x + s.shadowDx, y + s.shadowDy, w, h,
-                        s.RadiusOr(t.borderRadiusMedium), s.shadow);
-        c.SurfaceRoundRect(x, y, w, h, s.RadiusOr(t.borderRadiusMedium),
-                           s.bg, s.borderColor, s.BorderWOr(1));
-        int blockerId = app.BlockHitsRect(x, y, w, h);
-
-        // 箭头凹口，限制在面板圆角主体内。
-        int nx = anchorX;
-        if (nx < x + t.borderRadiusMedium + notch) { nx = x + t.borderRadiusMedium + notch; }
-        if (nx > x + w - t.borderRadiusMedium - notch) { nx = x + w - t.borderRadiusMedium - notch; }
-        if (below) {
-            Tooltip.TriUp(c, nx, y - notch, notch, notch, s.bg);
-        } else {
-            Tooltip.TriDown(c, nx, y + h, notch, notch, s.bg);
-        }
-
-        c.PushClip(x, y, w, h);
-        int ty = y + pad;
-        if (title != "") {
-            c.DrawText(x + pad, ty, title, titleStyle.fg, titleFont);
-            ty = ty + Canvas.FontHeight(titleFont) + t.gapSmall;
-        }
-        for (int li = 0; li < lines.Count; li = li + 1) {
-            c.DrawText(x + pad, ty, lines[li], bodyStyle.fg, bodyFont);
-            ty = ty + lh;
-        }
-        c.PopClip();
-        return blockerId;
-    }
-
-    // 立即模式版本：可见性由调用方管理。`anchorX` 为箭头
-    // x，`anchorY` 为锚点正下方的 y。自动换行并限制范围；
-    // 弹层高度由标题与文本内容自动测量排版，`h` 为视口高度推荐槽位。
+    // 立即模式兼容版本：可见性由调用方管理。
     static void Render(App app, int anchorX, int anchorY, int w, int h,
                        string title, string body) {
-        Popover.PaintPanel(app, anchorX, anchorY, w, title, body);
+        if (app == null) { return; }
+        Card card = new Card(title);
+        card.Class = "popover-card";
+        if (body != "") {
+            Label lbl = new Label(body);
+            lbl.wrap = true;
+            card.With(lbl);
+        }
+        card.prefW = w > 0 ? w : 260;
+        card.OnMeasure(app);
+        int popH = card.prefH > 0 ? card.prefH : app.Scale(120);
+        int popX = OverlayPopup.FitX(app, anchorX - w / 2, card.prefW);
+        int popY = OverlayPopup.FitY(app, anchorY + app.Scale(4), h, popH);
+        card.Arrange(popX, popY, card.prefW, popH);
+        card.RenderTree(app);
     }
 }

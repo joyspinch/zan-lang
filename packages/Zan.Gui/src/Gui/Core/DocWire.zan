@@ -73,9 +73,67 @@ public class DocWire {
         if (DocWire.IsPlainPath(c.bindDisabled) && !DocWire.FieldExists(vm, c.bindDisabled)) {
             bad.Add(c.bindDisabled);
         }
+        // :prop="field"（如 :options）同样启动期对账：字面量/关键字/表达式跳过，
+        // 否则拼错的字段名只会静默渲染成空。
+        if (c.bindProps != null) {
+            for (int k = 0; k < c.bindProps.Count; k++) {
+                string ex = c.bindProps[k].expr;
+                if (DocWire.IsFieldRef(ex) && !DocWire.FieldExists(vm, ex)) {
+                    bad.Add(ex);
+                }
+            }
+        }
         for (int j = 0; j < c.children.Count; j++) {
             DocWire.CollectBinds(c.children[j], vm, bad);
         }
+    }
+
+    // z-mount 挂载：声明 z-mount="field" 的节点，把 owner 同名字段（须为
+    // 非空 Control——在 OnCreate 里建好）挂进该节点。字段缺失、为空或
+    // 不是 Control 的，开窗前一次性列出 exit 1（与缺失处理器同语义）。
+    // 先收齐槽位再挂，不会走进刚挂上的代码建子树；模板子树跳过（行克隆
+    // 没有单一字段可挂）。
+    public static void MountSlots(Control tree, object owner) {
+        List<Control> slots = new List<Control>();
+        DocWire.CollectMounts(tree, slots);
+        List<string> bad = new List<string>();
+        for (int i = 0; i < slots.Count; i++) {
+            Control slot = slots[i];
+            string f = slot.bindMount;
+            object o = owner.HasField(f) ? owner.GetFieldObject(f) : null;
+            if (o == null || !(o is Control)) {
+                bad.Add(f);
+                continue;
+            }
+            slot.With((Control)o);
+        }
+        if (bad.Count > 0) {
+            string list = "";
+            for (int i = 0; i < bad.Count; i++) {
+                list = list + (i > 0 ? ", " : "") + bad[i];
+            }
+            Console.WriteLine("WINDOW: z-mount fields missing, null or not a Control on " +
+                              owner.GetType().Name + ": " + list);
+            Environment.Exit(1);
+        }
+    }
+
+    static void CollectMounts(Control c, List<Control> slots) {
+        if (c.Kind() == "template") { return; }
+        if (c.bindMount != "") { slots.Add(c); }
+        for (int j = 0; j < c.children.Count; j++) {
+            DocWire.CollectMounts(c.children[j], slots);
+        }
+    }
+
+    // 字段引用：纯路径且首字符是字母/下划线，排除 true/false/null 字面量。
+    public static bool IsFieldRef(string s) {
+        if (!DocWire.IsPlainPath(s)) { return false; }
+        char ch = s[0];
+        if (!((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || ch == '_')) {
+            return false;
+        }
+        return s != "true" && s != "false" && s != "null";
     }
 
     public static bool FieldExists(object vm, string path) {

@@ -3,7 +3,6 @@ using System.IO;
 using System.Net.External;
 using System.Threading;
 using Gui;
-using Gui.Component;
 
 namespace Gui.Widget;
 
@@ -27,7 +26,7 @@ public delegate void UploadRequestFn(UploadFile item);
 // 事件（Change/Upload/Finish/Error/Remove/Download/Exceed）
 // 处理器读 LastItem 拿当前项。内置选择弹窗按 FilePicker
 // 范式路由：OwnsEventWindow → ApplyEventWindow → RenderDialog。
-public class Upload : Control {
+public partial class Upload : Control {
     // 文件列表。null 时组件自建（非受控）；宿主赋入
     // 自己的 List 即受控共享引用（Naive UI file-list 对位）。
     List<UploadFile> Files;
@@ -590,155 +589,6 @@ public class Upload : Control {
 
     // 接收一批拖入的本地文件（等价 AddPaths，供宿主事件回路调用）。
     int AcceptDropped(List<string> paths) { return this.AddPaths(paths); }
-
-    // ---- 内建文件选择弹窗（FilePicker 路由） ------------------------------
-
-    // 懒建内建选择弹窗并接 Accepted 回调。
-    void EnsurePicker() {
-        if (picker != null) { return; }
-        picker = new FilePicker();
-        picker.Accepted.Add(this.OnPicked);
-    }
-
-    // 打开内建选择弹窗：Multiple 或 Max>1 时走多选模式（Ctrl/Shift
-    // 点选，确认后逐项过门入列）；Accept 生成过滤器。弹窗皮肤跟随
-    // 宿主当前主题；initial 留空让 FilePicker 续用上一次浏览的目录。
-    // 弹窗事件/渲染由 Form.Run 的标准循环按 ChildWindows 注册表自动
-    // 泵送；自写循环的宿主（gallery 范式）依旧可以用
-    // OwnsEventWindow/RenderDialog 自己泵——两条路互不干扰。
-    void OpenDialog() {
-        if (this.IsDisabled()) { return; }
-        this.EnsurePicker();
-        // 每次打开都登记（幂等）：注册表在弹窗关闭后由 PrunePickers
-        // 移出该实例，复用同一 picker 的第二次打开必须重新登记，
-        // 否则标准循环不再泵它——第二次开弹窗就会卡死。
-        ChildWindows.RegisterComponentPicker(picker);
-        // 皮肤不跟随是组件弹窗的通病：宿主只会给自己直拉的 picker 调
-        // ApplySkin（gallery 范式），组件自持的弹窗没人管、永远是暗色。
-        // 打开前同步一次宿主当前主题。
-        if (uiApp != null) { picker.ApplySkin(uiApp.ThemeMenuIndex()); }
-        // Max 透传进弹窗：多选里选到上限就选不进（弹窗内实时显示
-        // 「已选 x/N」），确认后 Admit 的 Max 门仍兜底。Multiple 单独
-        // 开多选而没给 Max 时传 0（弹窗不限，由宿主门兜底）。
-        picker.SetMaxSelect(Max);
-        if (Multiple || Max > 1) {
-            picker.BeginOpenFileFiltersMulti("", this.BuildFilters(), "选择文件");
-        } else {
-            picker.BeginOpenFileFilters("", this.BuildFilters(), "选择文件");
-        }
-        if (uiApp != null) { uiApp.RequestRedraw(); }
-    }
-
-    // 程序化关闭内建选择弹窗（取消语义，对位 FilePicker.Close）。
-    // 测试与宿主清场用；用户关闭走弹窗自身的取消/关闭按钮。
-    void CloseDialog() {
-        if (picker != null) { picker.Close(); }
-    }
-
-    // 内建弹窗本体（未开且从未打开过为 null）。测试与宿主检查
-    // lastDir/上限透传等 picker 侧语义用；宿主正常流程无需触碰。
-    FilePicker Picker() { return picker; }
-
-    // 弹窗确认回调：按单/多选模式取选中路径，逐项过门入列。
-    void OnPicked() {
-        if (picker == null) { return; }
-        if (Multiple || Max > 1) {
-            // 多选模式：确认时 SelectedPaths() 里有全部选中项。
-            List<string> many = picker.SelectedPaths();
-            if (many != null && many.Count > 0) { this.AddPaths(many); }
-            return;
-        }
-        string p = picker.SelectedPath();
-        if (p == "") { return; }
-        List<string> one = new List<string>();
-        one.Add(p);
-        this.AddPaths(one);
-    }
-
-    // Accept 字符串 → 选择对话框过滤器（始终追加“所有文件”兜底）。
-    List<FileFilter> BuildFilters() {
-        List<FileFilter> items = new List<FileFilter>();
-        if (Accept != null && Accept != "") {
-            string acc = Accept.ToLower();
-            StringBuilder pats = new StringBuilder();
-            int start = 0;
-            int len = acc.Length;
-            for (int i = 0; i <= len; i = i + 1) {
-                if (i == len || (acc[i] & 255) == 44 || (acc[i] & 255) == 59) {
-                    if (i > start) {
-                        string tok = acc.Substring(start, i - start).Trim();
-                        if (tok != "") {
-                            if (tok.StartsWith("*.")) { }
-                            else if (tok.StartsWith(".")) { tok = "*" + tok; }
-                            else { tok = "*." + tok; }
-                            if (pats.Length > 0) { pats.Append(";"); }
-                            pats.Append(tok);
-                        }
-                    }
-                    start = i + 1;
-                }
-            }
-            if (pats.Length > 0) {
-                string patStr = pats.ToString();
-                items.Add(new FileFilter("接受的文件 (" + patStr + ")", patStr));
-            }
-        }
-        items.Add(new FileFilter("所有文件 (*.*)", ""));
-        return items;
-    }
-
-    // 选择弹窗是否打开中。
-    bool DialogOpen() { return picker != null && picker.IsOpen(); }
-
-    // 内建弹窗要求重绘（对位 FilePicker.NeedsRedraw：宿主用它决定
-    // 主循环节奏——弹窗开着时不能阻塞在 WaitEvent 上）。
-    bool DialogNeedsRedraw() {
-        return picker != null && picker.NeedsRedraw();
-    }
-
-    // 宿主事件路由：事件窗口属于 Upload 内建的弹窗时返回 true——
-    // 命中后该帧的 OS 事件交给 ApplyEventWindow，其余交给弹窗自己的
-    // 渲染通道 RenderDialog（FilePicker 文档范式）。
-    bool OwnsEventWindow(nint evh) {
-        return picker != null && picker.OwnsWindow(evh);
-    }
-
-    // 内建弹窗的原生窗口句柄（未开为 0）。宿主焦点管理与路由测试用。
-    nint DialogWindowHandle() {
-        return picker != null ? picker.PopupWindowHandle() : 0;
-    }
-
-    // 处理投递到内建弹窗的 OS 事件。按属主门控：只有 evh 确实是本
-    // 组件弹窗的窗口时才接手并返回 true；非属主（从未开过、弹窗已
-    // 关的实例一律在内）返回 false。FilePicker.ApplyEvent 的布尔是
-    // 「回路是否继续」语义，对非属主窗口返回 true——宿主若按
-    // 「谁拥有谁处理」折叠扫描（gallery 的 UploadApplyEvent 范式），
-    // 不门控就会在第一个开过弹窗的实例处吞掉后面所有弹窗的事件。
-    bool ApplyEventWindow(nint evh) {
-        if (picker == null || !picker.OwnsWindow(evh)) { return false; }
-        return picker.ApplyEvent(evh);
-    }
-
-    // 渲染内建弹窗（OwnsEventWindow 为 true 的帧里，替代主窗口的
-    // 一帧渲染）。
-    void RenderDialog() {
-        if (picker != null) { picker.RenderWindow(); }
-    }
-
-    // 收一次弹窗结果（对位 FilePicker.TakeResult）：关闭瞬间触发
-    // Accepted → OnPicked，选中路径已并入文件列表；0 = 本轮未关，
-    // 2 = 用户取消。
-    int TakeDialogResult() {
-        if (picker == null) { return 0; }
-        return picker.TakeResult();
-    }
-
-    // 弹窗刚关闭的收尾（对位 FilePicker.SweepClosed）：销毁程序化
-    // Close 留下的死窗口、清空 picker 内部引用。宿主在
-    // TakeDialogResult() != 0 的那一轮调用一次。
-    void SweepDialogClosed() {
-        if (picker != null) { picker.SweepClosed(); }
-    }
 
     // ---- 样式辅助 --------------------------------------------------------
 

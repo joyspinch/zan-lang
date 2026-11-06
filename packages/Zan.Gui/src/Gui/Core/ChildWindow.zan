@@ -15,6 +15,7 @@ public class ChildWindow {
     object model;
     bool open;
     bool destroyed;
+    bool designAssembled;
     int idBase;
     Action renderCb;
     long lastRenderUs = 0;
@@ -71,12 +72,12 @@ public class ChildWindow {
     // 运行期装载设计稿（B-ID149：Html.Parse 单跳管线，与 Form.Show 同源）。
     // 名字解析与 Form.Show 同一约定：DesignName() 覆写优先（自定义名），
     // 否则按"类名 ↔ 同名 .html"走 Form.FindDoc（内嵌 VFS → 工作目录 →
-    // 工程 src 树，歧义 fail-fast）。此前只认 DesignName() 且默认返回 ""，
-    // 全仓没有一个子窗覆写它——EnsureDesign 成了永久 no-op，Build 里
-    // 首个设计稿字段访问即 null 崩溃（oneplus 114 窗全数命中）。
-    // 模型默认挂窗自身（实例字段即 ViewModel、方法即事件处理器）；窗在
-    // Build 里再调 SetRoot(root, mdl) 换挂 JsonValue 等模型的，尊重之。
-    public virtual void EnsureDesign() {
+    // 工程 src 树，歧义 fail-fast）。模型默认挂窗自身（实例字段即
+    // ViewModel、方法即事件处理器）。
+    // 装载是框架的事（与 Form.Show 零装载语句同一契约）：只由
+    // AssembleDesign 调用，private 让窗代码里的装载调用编译期即报错。
+    // 已 SetRoot 手搭树的窗（无同名设计稿）这里是 no-op。
+    private void EnsureDesign() {
         if (this.root != null) { return; }
         string tname = this.DesignName();
         if (tname == "") { tname = this.GetType().Name; }
@@ -89,12 +90,35 @@ public class ChildWindow {
         }
     }
 
+    // 业务初始化钩子：框架在设计稿装载后、宿主创建与声明式接线之前
+    // 调用一次（时序同旧"先 Build 再 OpenHost"，Title()/IdBase() 能看到
+    // 这里算出的状态）。在这里算绑定字段的初值、建 z-mount 要挂的
+    // 复合控件；不装载、不 Find、不 SetRoot、不手工接线。
+    protected virtual void OnCreate() { }
+
+    // bind 模型覆写：默认 null = 窗自身（或手搭树 SetRoot 指定的模型）；
+    // JsonValue 等外部模型的窗覆写返回之。事件处理器恒解析窗方法。
+    protected virtual object ViewModel() { return null; }
+
+    // 设计稿装配序（只跑一次，OpenHost/OpenStandalone 最先调用）：
+    // 装载 → OnCreate → 换挂 ViewModel → z-mount 挂载。
+    private void AssembleDesign() {
+        if (this.designAssembled) { return; }
+        this.designAssembled = true;
+        this.EnsureDesign();
+        this.OnCreate();
+        if (this.root == null) { return; }
+        object vm = this.ViewModel();
+        if (vm != null) { this.SetRoot(this.root, vm); }
+        DocWire.MountSlots(this.root, this);
+    }
+
     // 声明式装配（子窗收官，与 Form.assembleDoc 同一语义）：事件按名
     // 对账接线（缺失 fail-fast exit 1）、bind 路径启动期对账、OnLoad
     // 钩子（publish 形态钩子须带 [Custom] 注解，见 B-ID160 契约）。
     // 必须在 host 就绪后调用——Wire 的 SetApp 与触发闭包都要 host。
     // 事件处理器恒解析窗实例方法；bind 模型用 binder 当前模型
-    // （EnsureDesign 挂的 this，或窗自换的 JsonValue 等）。JsonValue
+    // （装载默认挂的 this，或 ViewModel() 换挂的 JsonValue 等）。JsonValue
     // 模型的键不是反射字段，bind 对账跳过（运行期 binder 自会软兜底）。
     void AssembleDoc() {
         if (this.root == null) { return; }
@@ -168,6 +192,7 @@ public class ChildWindow {
     virtual void OnLanguageChanged(string lang) { }
 
     void OpenHost(App parent) {
+        this.AssembleDesign();
         this.parentApp = parent;
         open = true;
         idBase = this.IdBase();
@@ -212,6 +237,7 @@ public class ChildWindow {
     }
 
     void OpenStandalone() {
+        this.AssembleDesign();
         open = true;
         idBase = this.IdBase();
         host = App.CreateDark(this.Title(), this.Width(), this.Height());

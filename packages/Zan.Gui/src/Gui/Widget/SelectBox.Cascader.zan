@@ -1,0 +1,216 @@
+using System;
+using System.Collections.Generic;
+using Gui;
+
+namespace Gui.Widget;
+
+// SelectBox.Cascader.zan - 级联多列选择、树形选择浮层与层级勾选算法分片
+public partial class SelectBox {
+    // 级联/树形弹层共用的收尾手势：点击弹层外部（含触发器）
+    // 关闭；弹层内没被任何子控件认领的点击在这里吃掉，不能
+    // 落到弹层下面的内容上；Esc 关闭。须在弹层内容处理完
+    // 点击之后调用。
+    void OverlayDismiss(App app, int popX, int popY, int w, int viewH, int ek) {
+        if (app.ClickAvailable()) {
+            bool inside = app.mouseX >= popX && app.mouseX < popX + w
+                && app.mouseY >= popY && app.mouseY < popY + viewH;
+            if (!inside) {
+                this.SetOpen(false);
+                app.ClaimClick();
+            }
+            app.RequestRedraw();
+            return;
+        }
+        if (ek == 4 && app.window.EventKeyCode() == 27) {
+            this.SetOpen(false);
+            app.RequestRedraw();
+        }
+    }
+
+    // 级联弹层：一列一级。点中带子级的选项在其右侧展开下一列
+    // （HoverExpand 时悬停即展开），叶子（联动关闭时的任意层级）
+    // 选中收值；多选渲染行首勾选框，勾/半勾沿父子推导。每列自带
+    // 滚动（滚轮 + 内嵌真 Scrollbar）；filterable 时顶部搜索条，
+    // 命中项平铺单列、行文本是完整路径。列宽固定、弹层向右生长，
+    // 最多同时 4 列。
+    // 委托给级联弹层引擎 CascaderOverlay 进行渲染与交互分发。
+    void CascadeOverlay(App app, int x, int y, int w, int h, int fs,
+                        int arrowSlot) {
+        CascaderOverlay.Render(this, app, x, y, w, h, fs, arrowSlot);
+    }
+
+    // 设第 col 列滚动偏移（委托至 CascaderOverlay）。
+    void SetColScroll(int col, int v) {
+        CascaderOverlay.SetColScroll(this, col, v);
+    }
+
+    // 级联选中一个节点（平铺下标）：写入触发器（showPath 决定完整
+    // 路径还是末级短标签）、同步绑定并关闭。联动开启时只有叶子能
+    // 走到这里；关闭时带子级的分支也可以直接选中。
+    void ChooseCascade(int idx) {
+        if (idx < 0 || idx >= opts.Count) { return; }
+        pathText = this.ValueText(idx);
+        selected = idx;
+        if (model != null) { model.Set(selected); lastModel = selected; }
+        if (data != null) { data.Set(selected); lastData = selected; }
+        Change.RaiseS(this);
+        this.SetOpen(false);
+    }
+
+    // 第 `idx` 个选项的完整路径文本（"浙江省 / 杭州市 / 西湖区"）。
+    string PathOf(int idx) {
+        if (idx < 0 || idx >= opts.Count) { return ""; }
+        List<int> chain = new List<int>();
+        int cur = idx;
+        while (cur >= 0 && cur < opts.Count) {
+            chain.Insert(0, cur);
+            cur = opts[cur].parentIdx;
+        }
+        string path = "";
+        for (int i = 0; i < chain.Count; i = i + 1) {
+            if (i > 0) { path = path + " / "; }
+            path = path + opts[chain[i]].label;
+        }
+        return path;
+    }
+
+    // 值的显示文本：showPath 决定完整路径还是末级短标签。
+    string ValueText(int idx) {
+        if (!showPath) { return this.OptionLabel(idx); }
+        return this.PathOf(idx);
+    }
+
+    // 勾选策略下的值集合（平铺下标）：all = 全部勾选节点；
+    // parent = 没有被更深的勾选祖先盖住的节点（完整勾选子树的顶）；
+    // child = 勾选的叶子。
+    List<int> ValueIdxs() {
+        List<int> r = new List<int>();
+        for (int i = 0; i < opts.Count; i = i + 1) {
+            if (!opts[i].chosen || opts[i].grp) { continue; }
+            if (checkStrategy == 2) {
+                if (!opts[i].HasChildren()) { r.Add(i); }
+                continue;
+            }
+            if (checkStrategy == 1) {
+                int p = opts[i].parentIdx;
+                bool covered = false;
+                while (p >= 0 && p < opts.Count) {
+                    if (opts[p].chosen) { covered = true; break; }
+                    p = opts[p].parentIdx;
+                }
+                if (covered) { continue; }
+            }
+            r.Add(i);
+        }
+        return r;
+    }
+
+    // 值集合的显示标签（配合 ValueText 的 showPath 语义）。
+    List<string> ValueLabels() {
+        List<int> vs = this.ValueIdxs();
+        List<string> r = new List<string>();
+        for (int i = 0; i < vs.Count; i = i + 1) {
+            r.Add(this.ValueText(vs[i]));
+        }
+        return r;
+    }
+
+    // 级联多选：把 `idx` 的勾选态设为 `on`。联动开启时带动全部
+    // 子孙，再沿父链回推（父级 = 全部子级勾上才算勾上）；
+    // 关闭时只改自己。统一触发 Change。
+    void SetChecked(int idx, bool on) {
+        if (idx < 0 || idx >= opts.Count) { return; }
+        if (opts[idx].grp || opts[idx].disabled) { return; }
+        this.ApplyCheck(idx, on);
+        this.FixupAncestors(idx);
+        Change.RaiseS(this);
+    }
+
+    // 递归应用勾选：联动开启时带动全部子孙。
+    void ApplyCheck(int idx, bool on) {
+        opts[idx].chosen = on;
+        if (cascadeLink && opts[idx].HasChildren()) {
+            List<SelectOption> kids = opts[idx].children;
+            for (int i = 0; i < kids.Count; i = i + 1) {
+                this.ApplyCheck(kids[i].flatIdx, on);
+            }
+        }
+    }
+
+    // 沿父链回推勾选态：全子勾上 → 父勾上，否则父取消。
+    // 某层已一致就停——更上层不可能因此变化。
+    void FixupAncestors(int idx) {
+        if (!cascadeLink) { return; }
+        int p = opts[idx].parentIdx;
+        while (p >= 0 && p < opts.Count) {
+            bool all = true;
+            List<SelectOption> kids = opts[p].children;
+            for (int i = 0; i < kids.Count; i = i + 1) {
+                if (!kids[i].chosen) { all = false; break; }
+            }
+            if (opts[p].chosen == all) { break; }
+            opts[p].chosen = all;
+            p = opts[p].parentIdx;
+        }
+    }
+
+    // 第 `idx` 个选项的半勾态：自身未勾但有勾选的子孙（联动模式）。
+    bool IsPartial(int idx) {
+        if (idx < 0 || idx >= opts.Count) { return false; }
+        if (opts[idx].chosen || !cascadeLink) { return false; }
+        return this.HasCheckedDescendant(idx);
+    }
+
+    // 是否存在已勾选的子孙（递归）。
+    bool HasCheckedDescendant(int idx) {
+        if (!opts[idx].HasChildren()) { return false; }
+        List<SelectOption> kids = opts[idx].children;
+        for (int i = 0; i < kids.Count; i = i + 1) {
+            if (kids[i].chosen) { return true; }
+            if (this.HasCheckedDescendant(kids[i].flatIdx)) { return true; }
+        }
+        return false;
+    }
+
+    // 第 col 列的滚动偏移（委托至 CascaderOverlay）。
+    int ColScroll(int col, int contentH, int viewH) {
+        return CascaderOverlay.ColScroll(this, col, contentH, viewH);
+    }
+
+    // 树形弹层：内嵌真 TreeView，选中叶节点收值关闭。
+    // 展开/折叠、滚动、悬停全部是 TreeView 自己的行为；
+    // SelectBox 只给矩形、轮询选中、把叶子收成路径文本。
+    void TreeOverlay(App app, int x, int y, int w, int h) {
+        if (treeBox == null) { return; }
+        Theme t = app.theme;
+        int optH = h;
+        int viewH = OverlayPopup.FitH(app, maxVisible * optH
+            + t.paddingSmall * 2);
+        if (w < app.Scale(260)) { w = app.Scale(260); }
+        int popX = OverlayPopup.FitX(app, x, w);
+        int popY = OverlayPopup.FitY(app, y + h + app.Scale(4), h, viewH);
+        StyleBox pop = this.ResolvePartAs(app, "select", "popup", "popup",
+                                          Class, Style.SSelected());
+        pop.Paint(app, popX, popY, w, viewH);
+        int pad = app.Scale(4);
+        treeBox.RenderInside(app, new Rect(popX + pad, popY + pad,
+            w - pad * 2, viewH - pad * 2));
+        // 轮询选中变化：叶节点收值（payload 优先于 label）并关闭；
+        // 目录节点的选中只高亮，不收值。
+        int si = treeBox.SelectedIndex();
+        if (si >= 0 && si != treeSelSeen) {
+            treeSelSeen = si;
+            if (si < treeBox.data.Count) {
+                TreeNode node = treeBox.data[si];
+                if (!node.isDir) {
+                    pathText = node.payload;
+                    if (pathText == "") { pathText = node.label; }
+                    Change.RaiseS(this);
+                    app.RequestRedraw();
+                    this.SetOpen(false);
+                }
+            }
+        }
+        this.OverlayDismiss(app, popX, popY, w, viewH, app.EventKind());
+    }
+}

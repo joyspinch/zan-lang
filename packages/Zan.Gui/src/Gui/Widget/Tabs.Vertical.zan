@@ -1,0 +1,210 @@
+using System;
+using System.Collections.Generic;
+using Gui;
+
+namespace Gui.Widget;
+
+// Tabs.Vertical.zan - 纵向选项卡轨道渲染与右键上下文菜单分片
+public partial class Tabs {
+    // 垂直轨道：一列全宽标签行，活动项在
+    // 左侧高亮。调用方把页面绘制在轨道右侧。
+    void PaintTabsVertical(App app, int x, int y, int w, int h) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+
+        int rowH = t.heightMedium;
+
+        // 同水平 Render：侧边轨道也是纯几何消费点击，必须注册命中区。
+        string a11yV = this.EffectiveA11yRole("tablist") + ":" + this.EffectiveA11yLabel(name);
+        app.hitTester.RegisterRectL(this.CommonId(), x, y, w, h, 0, a11yV);
+
+        int ek = app.EventKind();
+        int eb = app.window.EventButton();
+        // 标签按几何自己判定点击，所以要问过上层弹层/遮罩：
+        // 否则画在标签条上的下拉一点就穿透过来切了标签。
+        bool cap = app.PointerCaptured();
+        bool leftUp = app.ClickAvailable() && eb == 0;
+        bool rightUp = ek == 3 && eb == 1 && !cap;
+
+        // 侧边轨道也会右键开菜单，所以菜单的发起与消费同样要在这里
+        // 走一遭；否则轨道上选的「关闭全部」永远不会被执行。
+        this.ApplyMenuAction();
+        this.PumpClosed(app);
+
+        // 同上：菜单里的批量关闭已经改过列表长度了。
+        int count = tabs.Count;
+
+        string tcls = this.TabClasses();
+        if (style == 0) {
+            StyleBox divider = Style.Part(app, "tabs", "divider", "", Class, "",
+                                          Style.SNormal());
+            c.FillRect(x + w - 1, y, 1, h, divider.BgOr(0));
+        }
+
+        c.PushClip(x, y, w, h);
+
+        int rowY = y;
+        for (int i = 0; i < count; i = i + 1) {
+            bool isActive = i == active;
+            bool overRow = !cap && app.mouseX >= x && app.mouseX < x + w
+                && app.mouseY >= rowY && app.mouseY < rowY + rowH;
+
+            int closeW = app.Scale(14);
+            int closeX = x + w - closeW - app.Scale(6);
+            bool overClose = tabs[i].closable && overRow
+                && app.mouseX >= closeX && app.mouseX < closeX + closeW;
+
+            // 与水平条相同的 `tab` 框解析；轨道仅
+            // 在活动标记改为左边缘这点上不同。
+            string rowCls = tcls;
+            if (style == 0) { rowCls = tcls + " rail"; }
+            StyleBox rs = this.ResolveStyleAs(app, "tab", rowCls, Tabs.StateOf(overRow, isActive));
+            int inset = 0;
+            if (style == 1) { inset = 2; }
+            else if (style == 2) { inset = 3; }
+            if (style == 0) {
+                // 轨道在左边缘标记活动行，因此去掉
+                // Line 变体所带的下划线。
+                rs.borderBottomW = 0 - 1;
+            }
+            rs.Paint(app, x + inset, rowY + inset,
+                     w - inset * 2, rowH - inset * 2);
+            if (style == 0 && isActive) {
+                StyleBox indicator = Style.Part(app, "tab", "indicator", "", tcls,
+                                                "", Style.SNormal());
+                c.FillRect(x, rowY, app.Scale(3), rowH, indicator.BgOr(0));
+            }
+
+            int rowFs = rs.FontOr(Style.FontFallback(app, "medium"));
+            // 皮肤没配行文字色时的兜底：state::caption 按状态解析
+            // （选中主色 / 悬停主文字 / 常态次级文字）。
+            int tcFall = Style.Part(app, "state", "caption", "", "", "",
+                isActive ? Style.SSelected()
+                         : (overRow ? Style.SHover() : Style.SNormal())).FgOr(0);
+            int tc = rs.FgOr(tcFall);
+            int ty = Canvas.CenterTextY(rowY, rowH, rowFs);
+            // 轨道行同样截断：可关闭行的文字预算要给 close 按钮让位。
+            int rowTextW = w - rs.PadLOr(t.paddingLarge) - rs.PadROr(t.paddingLarge);
+            if (tabs[i].closable) { rowTextW = rowTextW - closeW - app.Scale(6); }
+            c.DrawText(x + rs.PadLOr(t.paddingLarge), ty,
+                       Ellipsis.Fit(tabs[i].label, rowTextW, rowFs), tc, rowFs);
+
+            if (tabs[i].closable) {
+                StyleBox close = Style.Part(app, "tab", "close", "", tcls, "",
+                                            overClose ? Style.SHover() : Style.SNormal());
+                if (overClose) {
+                    c.FillRoundRect(closeX, rowY + (rowH - closeW) / 2, closeW, closeW,
+                        close.RadiusOr(t.borderRadiusSmall), close.BgOr(0));
+                }
+                c.DrawGlyphIn("close", closeX, rowY + (rowH - closeW) / 2, closeW, closeW,
+                    app.Scale(10), close.FgOr(0));
+            }
+
+            if (rightUp && overRow) {
+                menuOpen.Set(true);
+                menuTab = i;
+                menuX = app.mouseX;
+                menuY = app.mouseY;
+                menuSub.Set(0 - 1);
+                app.RequestRedraw();
+            } else if (!menuOpen.Get()) {
+                if (leftUp && overClose) {
+                    this.CloseAt(i);
+                    app.RequestRedraw();
+                    break;
+                } else if (leftUp && overRow) {
+                    this.Select(i);
+                    app.RequestRedraw();
+                }
+            }
+
+            rowY = rowY + rowH;
+        }
+
+        if (showAdd) {
+            bool overAdd = !cap && app.mouseX >= x && app.mouseX < x + w
+                && app.mouseY >= rowY && app.mouseY < rowY + rowH;
+            StyleBox add = Style.Part(app, "tabs", "add", "", Class, "",
+                                      overAdd ? Style.SHover() : Style.SNormal());
+            if (overAdd) {
+                c.FillRoundRect(x + 3, rowY + 3, w - 6, rowH - 6,
+                    add.RadiusOr(t.borderRadiusSmall), add.BgOr(0));
+            }
+            int addFont = add.FontOr(Style.FontFallback(app, "medium"));
+            int ty = Canvas.CenterTextY(rowY, rowH, addFont);
+            c.DrawGlyphIn("plus", x + app.Scale(4), rowY, app.Scale(20), rowH,
+                t.iconSizeSmall, add.FgOr(0));
+            c.DrawText(x + app.Scale(28), ty, "New tab", add.FgOr(0), addFont);
+            if (leftUp && overAdd && !menuOpen.Get()) {
+                this.AddNew();
+                app.RequestRedraw();
+            }
+        }
+
+        c.PopClip();
+        this.EmitMenu(app);
+    }
+
+    // 应用前一帧从上下文菜单中选择的动作。
+    // overlay 在延迟 overlay 阶段（Render 之后）将所选索引写入 menuAction，
+    // 因此在这里于下一帧消费。
+    void ApplyMenuAction() {
+        int picked = menuAction.Get();
+        if (picked < 0) { return; }
+        menuAction.Set(0 - 1);
+        if (picked == 0) {
+            this.CloseAt(menuTab);
+        } else if (picked == 1) {
+            this.CloseOthers(menuTab);
+        } else if (picked == 2) {
+            this.CloseAll();
+        } else if (picked == 3) {
+            this.AddNew();
+        } else if (picked == 4) {
+            if (menuTab >= 0 && menuTab < tabs.Count) {
+                tabs.Add(new TabItem(tabs[menuTab].label, true));
+                active = tabs.Count - 1;
+                addedIndex = active;
+                // 与 AddNew() 一致地告知宿主：没有这一下，它就无从得知
+                // 多了一个标签，新标签永远是一个空页。
+                TabAdded.RaiseS(this);
+                changedIndex = active;
+                TabChanged.RaiseS(this);
+            }
+        }
+    }
+
+    // 将标签上下文菜单入队到框架 overlay 层，使其始终
+    // 绘制在后续内容之上，并在外部点击时关闭。菜单在
+    // 右键抬起时打开，使触发事件是抬起（kind 3），而不是
+    // overlay 视为外部点击关闭的按下（kind 2）。使用
+    // 共享的富菜单组件（图标、组标题、分隔线和
+    // 子菜单）。
+    void EmitMenu(App app) {
+        if (!menuOpen.Get()) { return; }
+        // 菜单项跟着 closable 走：固定标签的「关闭」置灰，没有别的可关闭
+        // 标签时「关闭其他/关闭全部」也置灰，免得点了没反应。
+        string closeText = Tabs.TT("Close", "关闭");
+        string othersText = Tabs.TT("Close others", "关闭其他");
+        string allText = Tabs.TT("Close all", "关闭全部");
+        MenuItem closeItem = this.Closable(menuTab)
+            ? MenuItem.Shortcut(closeText, "close", "Ctrl+W", 0)
+            : MenuItem.Disabled(closeText, "close", 0);
+        MenuItem othersItem = this.ClosableCount(menuTab) > 0
+            ? MenuItem.Item(othersText, "minus", 1)
+            : MenuItem.Disabled(othersText, "minus", 1);
+        MenuItem allItem = this.ClosableCount(0 - 1) > 0
+            ? MenuItem.Item(allText, "trash", 2)
+            : MenuItem.Disabled(allText, "trash", 2);
+        List<MenuItem> items = new List<MenuItem>{
+            MenuItem.Header(Tabs.TT("This tab", "当前标签")),
+            closeItem, othersItem, allItem };
+        items.Add(MenuItem.Separator());
+        List<MenuItem> sub = new List<MenuItem>{
+            MenuItem.Item(Tabs.TT("New tab", "新建标签"), "plus", 3),
+            MenuItem.Item(Tabs.TT("Duplicate", "复制标签"), "copy", 4) };
+        items.Add(MenuItem.Submenu(Tabs.TT("New", "新建"), "file", sub));
+        app.AddOverlay(OverlayPopup.RichMenu(menuX, menuY, items,
+            menuBaseId, menuAction, menuOpen, menuSub));
+    }
+}

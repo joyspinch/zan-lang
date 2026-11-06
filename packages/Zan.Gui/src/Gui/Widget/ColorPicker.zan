@@ -22,6 +22,7 @@ namespace Gui.Widget;
 // 的 int 是 32 位，打包色常以负数形式存储——凡提取分量一律走
 // RgbOf / AlphaOf（App.LerpColor 同款符号安全写法），禁止裸除。
 public class ColorPicker : Control {
+    Control customPopup;
     // 内部当前打包色信号（0xAARRGGBB）；存在双向绑定时与其同步。
     SignalInt model;
     // 双向绑定值（打包 0xAARRGGBB）：`pick.data = model.color;`
@@ -713,23 +714,29 @@ public class ColorPicker : Control {
         return s.HeightOr(app.theme.heightMedium);
     }
 
-    // 保留式渲染：以触发条标准高度绘制，返回触发条命中 id。
+    // 即时模式兼容入口：统一走标准 DOM Arrange 与 RenderTree 管线。
     int Render(App app, int x, int y, int width) {
         int h = this.TriggerH(app);
         return this.RenderIn(app, x, y, width, h);
     }
 
-    // 显式盒高版本（保留式布局走 OnPaint 自动带 bh）。
+    // 显式盒高版本；即时模式兼容入口：统一走标准 DOM Arrange 与 RenderTree 管线。
     int RenderIn(App app, int x, int y, int width, int height) {
+        if (width <= 0) {
+            if (this.prefW <= 0) { this.OnMeasure(app); }
+            width = this.prefW;
+        }
+        if (height <= 0) {
+            if (this.prefH <= 0) { this.OnMeasure(app); }
+            height = this.prefH > 0 ? this.prefH : this.TriggerH(app);
+        }
+        this.Arrange(x, y, width, height);
+        this.RenderTree(app);
+        return wid;
+    }
+
+    int PaintTrigger(App app, int x, int y, int width, int height) {
         int id = wid;
-        // 锚点：弹层按 bx/by/bh 定位（OverlayPopup.FitX/FitY）。
-        // 即时模式没有 Arrange，锚点必须在这里落，否则弹层会跑到
-        // 窗口原点；保留式布局的 OnPaint 传进来的正是排布后的同一
-        // 组值，重设无副作用。
-        this.bx = x;
-        this.by = y;
-        this.bw = width;
-        this.bh = height;
         SyncBinding();
         // 外部写模型（程序化赋值）时把内部 HSV 拉齐。
         int ext = model.Get();
@@ -740,8 +747,7 @@ public class ColorPicker : Control {
         StyleBox root = this.ResolveEasedStyleAsIn(
             app, id, "colorpicker", Class, disabled, false, x, y, width, height);
         root.Paint(app, x, y, width, height);
-        // 触发条中央铺当前色块（Naive UI 是整块色 + 圆角）。
-        Canvas c = app.canvas;
+        // 触发条中央铺当前色块（统一经 SubBox 委托底层盒模型绘制）。
         StyleBox trg = this.ResolveEasedPartAsIn(
             app, id, "colorpicker", "trigger", "", Class, disabled, false,
             x, y, width, height);
@@ -749,23 +755,67 @@ public class ColorPicker : Control {
         int swW = width - pad * 2;
         int swH = height - pad * 2;
         if (swW > 0 && swH > 0) {
-            c.FillRoundRect(x + pad, y + pad, swW, swH,
-                            trg.RadiusOr(app.Scale(4)), this.CurrentRgb());
+            trg.bg = this.CurrentRgb();
+            trg.SetRadius(trg.RadiusOr(app.Scale(4)));
+            SubBox.Paint(app, trg, x + pad, y + pad, swW, swH);
         }
         app.hitTester.RegisterRect(id, x, y, width, height, 3);
         app.focus.RegisterFocusable(id);
-        // 点击触发条开/关弹层；开着时触发条被弹层的 BlockHitsBelow
-        // 挡住，点击由弹层的"外部关闭"收口。
+        // 点击触发条开/关弹层；开着时触发条与弹层由 OverlayHost 统一管理外部关闭与层级。
         if (!disabled && Ui.Clicked(app, id)) {
             open = !open;
             viewAligned = false;
+            if (open) {
+                OverlayHost.ShowPopup(app, this, this);
+            } else {
+                OverlayHost.DismissPopup();
+            }
             app.ClaimClick();
             app.RequestRedraw();
         }
-        if (disabled) { open = false; }
+        if (disabled) {
+            if (open) { OverlayHost.DismissPopup(); }
+            open = false;
+        }
         if (open) { app.AddOverlay(OverlayPopup.Host(this)); }
         if (this.On.Any()) { On.Fire(app, id, this); }
         return id;
+    }
+
+    public override void OnPopupDismissed() {
+        open = false;
+    }
+
+    public bool IsOpen() {
+        return open;
+    }
+
+    public void SetOpen(bool want) {
+        if (open == want) { return; }
+        open = want;
+        if (!want) {
+            OverlayHost.DismissPopup();
+        }
+    }
+
+    // 插槽支持：支持任意复杂组件（如调色板、预设色块、表格）互嵌到颜色选择器弹层
+    public override bool MountSlot(string slot, Control c) {
+        if (slot == "popup" || slot == "dropdown" || slot == "content") {
+            this.SetPopupContent(c);
+            return true;
+        }
+        return base.MountSlot(slot, c);
+    }
+
+    public void SetPopupContent(Control c) {
+        this.customPopup = c;
+        if (c != null && !children.Contains(c)) {
+            this.Add(c);
+        }
+    }
+
+    public Control GetPopupContent() {
+        return this.customPopup;
     }
 
     // ---- 弹层（OnPaintOverlay 覆盖阶段绘制 + 分发）-------------------
@@ -773,182 +823,32 @@ public class ColorPicker : Control {
     // 弹层打开时在覆盖阶段绘制取色弹层，并拦截、分发弹层内的交互。
     override void OnPaintOverlay(App app) {
         if (!open) { return; }
-        Canvas c = app.canvas;
-        int scale = app.Scale(1);
-        int panelW = app.Scale(236);
-        int pad = app.Scale(10);
-        int svH = app.Scale(148);
-        int barH = app.Scale(12);
-        int gap = app.Scale(8);
-        int rowsH = app.Scale(26);
-        int popH = pad + svH + gap + barH + gap + rowsH + pad;
-        if (showAlpha) { popH = popH + barH + gap; }
-        int popX = OverlayPopup.FitX(app, this.bx, panelW);
-        int popY = OverlayPopup.FitY(app, this.by + this.bh + scale * 4,
-                                     this.bh, popH);
-        StyleBox pop = this.ResolvePartAs(app, "colorpicker", "panel",
-                                          "select", Class, Style.SNormal());
-        pop.Paint(app, popX, popY, panelW, popH);
-        app.BlockHitsBelow();
-        app.BlockHitsRect(popX, popY, panelW, popH);
-
-        int svX = popX + pad;
-        int svY = popY + pad;
-        int svW = panelW - pad * 2;
-        bool clicked = app.ClickAvailable();
-
-        // ---- SV 面板：两层渐变合成（白→纯色横排、透明→黑纵排）----
-        int pure = ColorPicker.HsvToRgb(hue, 1000, 1000);
-        int svR = app.Scale(4);
-        c.FillGradMask(svX, svY, svW, svH, svR, Corner.All(), 1,
-                       0xFFFFFFFF, 0, pure);
-        c.FillGradMask(svX, svY, svW, svH, svR, Corner.All(), 0,
-                       0, 0, 0xFF000000);
-        int dotX = svX + sat * svW / 1000;
-        int dotY = svY + (1000 - val) * svH / 1000;
-        int dotR = app.Scale(5);
-        c.DrawCircle(dotX, dotY, dotR + scale, 0xFFFFFFFF, scale + 1);
-        c.DrawCircle(dotX, dotY, dotR, 0xFF000000, scale);
-        app.hitTester.RegisterRect(wid + ColorPicker.SvPanelOff(),
-                                   svX, svY, svW, svH, 3);
-
-        // ---- 色相条：红橙黄绿青蓝紫 六段渐变拼成 --------------------
-        int barY = svY + svH + gap;
-        int segN = 6;
-        int segW = svW / segN;
-        for (int i = 0; i < segN; i = i + 1) {
-            int c0 = ColorPicker.HsvToRgb(i * 60, 1000, 1000);
-            int c1 = ColorPicker.HsvToRgb((i + 1) * 60, 1000, 1000);
-            c.FillGradMask(popX + pad + i * segW, barY,
-                           i == segN - 1 ? svW - i * segW : segW, barH,
-                           0, 0, 1, c0, 0, c1);
-        }
-        int hueX = popX + pad + hue * svW / 360;
-        c.DrawCircle(hueX, barY + barH / 2, barH / 2 + scale - 1,
-                     0xFFFFFFFF, scale + 1);
-        app.hitTester.RegisterRect(wid + ColorPicker.HueOff(),
-                                   popX + pad, barY, svW, barH, 3);
-
-        // ---- 透明度条：棋盘格打底 + 白↔纯色水平渐变 -----------------
-        if (showAlpha) {
-            int aY = barY + barH + gap;
-            int chk = app.Scale(5);
-            StyleBox checker = this.ResolvePartAs(
-                app, "colorpicker", "checker", "", Class, Style.SNormal());
-            c.PushClip(popX + pad, aY, svW, barH);
-            int row = 0;
-            while (row * chk < barH) {
-                int col = 0;
-                while (col * chk < svW) {
-                    bool dark = (row + col) % 2 == 0;
-                    c.FillRect(popX + pad + col * chk, aY + row * chk,
-                               chk, chk,
-                               dark ? checker.BorderOr(0xFFCCCCCC)
-                                    : checker.BgOr(0xFFFFFFFF));
-                    col = col + 1;
+        if (this.customPopup != null) {
+            int popW = this.customPopup.prefW > 0 ? this.customPopup.prefW : app.Scale(236);
+            int popH = this.customPopup.prefH > 0 ? this.customPopup.prefH : app.Scale(200);
+            int popX = OverlayPopup.FitX(app, this.bx, popW);
+            int popY = OverlayPopup.FitY(app, this.by + this.bh + app.Scale(4), this.bh, popH);
+            app.BlockHitsBelow();
+            app.BlockHitsRect(popX, popY, popW, popH);
+            this.customPopup.Arrange(popX, popY, popW, popH);
+            this.customPopup.RenderTree(app);
+            if (app.ClickAvailable()) {
+                bool inside = app.mouseX >= popX && app.mouseX < popX + popW
+                    && app.mouseY >= popY && app.mouseY < popY + popH;
+                if (!inside) {
+                    this.SetOpen(false);
+                    app.ClaimClick();
                 }
-                row = row + 1;
+                app.RequestRedraw();
+                return;
             }
-            c.PopClip();
-            c.FillGradMask(popX + pad, aY, svW, barH, 0, 0, 1,
-                           App.WithAlpha(pure, 0), 0,
-                           App.WithAlpha(pure, 255));
-            int aX = popX + pad + alpha * svW / 255;
-            c.DrawCircle(aX, aY + barH / 2, barH / 2 + scale - 1,
-                         0xFFFFFFFF, scale + 1);
-            app.hitTester.RegisterRect(wid + ColorPicker.AlphaOff(),
-                                       popX + pad, aY, svW, barH, 3);
-        }
-
-        // ---- 指针：拖 SV / 色相 / 透明度 ----------------------------
-        bool changed = false;
-        if (!this.IsDisabled()) {
-            if (app.focus.IsPressed(wid + ColorPicker.SvPanelOff())) {
-                dragPart = 1;
-            } else if (app.focus.IsPressed(wid + ColorPicker.HueOff())) {
-                dragPart = 2;
-            } else if (showAlpha
-                       && app.focus.IsPressed(wid + ColorPicker.AlphaOff())) {
-                dragPart = 3;
-            } else if (dragPart != 0 && app.EventKind() == 3) {
-                dragPart = 0;
+            if (app.EventKind() == 4 && app.window.EventKeyCode() == 27) {
+                this.SetOpen(false);
+                app.RequestRedraw();
             }
-            if (dragPart == 1) {
-                int ns = (app.mouseX - svX) * 1000 / svW;
-                int nv = 1000 - (app.mouseY - svY) * 1000 / svH;
-                if (ns < 0) { ns = 0; } if (ns > 1000) { ns = 1000; }
-                if (nv < 0) { nv = 0; } if (nv > 1000) { nv = 1000; }
-                if (ns != sat || nv != val) {
-                    sat = ns; val = nv;
-                    hsvTouched = true;
-                    changed = true;
-                }
-            } else if (dragPart == 2) {
-                int nh = (app.mouseX - (popX + pad)) * 360 / svW;
-                if (nh < 0) { nh = 0; } if (nh > 359) { nh = 359; }
-                if (nh != hue) {
-                    hue = nh;
-                    hsvTouched = true;
-                    changed = true;
-                }
-            } else if (dragPart == 3) {
-                int na = (app.mouseX - (popX + pad)) * 255 / svW;
-                if (na < 0) { na = 0; } if (na > 255) { na = 255; }
-                if (na != alpha) {
-                    alpha = na;
-                    changed = true;
-                }
-            }
-        } else {
-            dragPart = 0;
+            return;
         }
-
-        // ---- 输入行：RGBA / HEX / HSL / HSB，标签点击循环切换 -------
-        // popH 已含透明度条的 barH+gap，行贴弹层底即可，不能再扣。
-        int rowY = popY + popH - pad - rowsH;
-        string modeName = this.ModeName();
-        // 输入行视图跟随模式：modes 只剩一种时锁定该格式。
-        if (modes != null && modes.Count == 1) {
-            inputView = ColorPicker.ViewOf(modeName);
-        }
-        // Mode 显式指定且允许时，弹层打开的第一帧把输入行对齐到它。
-        if (!viewAligned) {
-            viewAligned = true;
-            int want = ColorPicker.ViewOf(modeName);
-            if (modes == null || modes.Count == 0
-                || ColorPicker.Allowed(want, modes)) {
-                inputView = want;
-            }
-        }
-        StyleBox lab = this.ResolvePartAs(app, "colorpicker", "label",
-                                          "", Class, Style.SNormal());
-        int labFs = lab.FontOr(Style.FontFallback(app, "small"));
-        int labW = app.Scale(34);
-        c.DrawText(popX + pad,
-                   Canvas.CenterTextY(rowY, rowsH, labFs),
-                   ColorPicker.ViewLabel(inputView), lab.FgOr(pop.fg), labFs);
-        if (app.ClickAvailable()
-            && Ui.Over(app, popX + pad, rowY, labW, rowsH)) {
-            inputView = ColorPicker.NextAllowedView(inputView + 1, modes);
-            app.ClaimClick();
-            app.RequestRedraw();
-        }
-        editing = this;
-        this.PaintInputs(app, popX + pad + labW + scale * 6, rowY, rowsH,
-                         panelW - pad * 2 - labW - scale * 6, clicked);
-
-        if (changed) {
-            this.Commit();
-            app.RequestRedraw();
-        }
-
-        // ---- 关闭：点弹层外 ----------------------------------------
-        if (clicked && (app.mouseX < popX || app.mouseX >= popX + panelW ||
-                        app.mouseY < popY || app.mouseY >= popY + popH)) {
-            open = false;
-            app.ClaimClick();
-            app.RequestRedraw();
-        }
+        ColorPaletteOverlay.Render(this, app);
     }
 
     // 输入行视图编号：0 RGBA / 1 HEX / 2 HSL / 3 HSB。
@@ -1072,7 +972,7 @@ public class ColorPicker : Control {
 
     // 输入行的保留态子控件排布 + 文本同步。四种格式各一组 Input，
     // 只排当前视图那组（其余不排布即不显示、不吃键盘）。
-    void PaintInputs(App app, int x, int y, int h, int w, bool clicked) {
+    public void PaintInputsFromOverlay(App app, int x, int y, int h, int w, bool clicked) {
         if (inputView == 0) {
             int each = (w - app.Scale(6) * 3) / 4;
             this.LayInput(app, inR, x, y, each, h);
@@ -1134,8 +1034,8 @@ public class ColorPicker : Control {
         prefW = s.WidthOr(app.Scale(160));
     }
 
-    // 保留式绘制：在自身矩形内 RenderIn。
+    // 覆写：保留模式绘制——基于自身盒模型 (bx, by, bw, bh) 完成触发器绘制与事件交互（弹层经 OnPaintOverlay 延迟绘制）。
     override void OnPaint(App app) {
-        this.RenderIn(app, bx, by, bw, bh);
+        this.PaintTrigger(app, bx, by, bw, bh);
     }
 }

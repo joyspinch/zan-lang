@@ -44,7 +44,7 @@ public class Tag : Control {
         Checkable = false;
         Checked = false;
         wid = WidgetId.Next();
-        wiresOwnEvents = true;
+        wiresOwnEvents = false;
         Close = new UiEvent();
         Change = new UiEvent();
         Size = "medium";
@@ -78,37 +78,13 @@ public class Tag : Control {
         return this.RenderW(app, x, y, this.AutoWidth(app));
     }
 
-    // 以给定宽度绘制；比自然宽度窄时由共享盒子层省略
-    // 标签文本。
+    // 以给定宽度绘制（统一走标准 DOM Arrange 与 RenderTree 管线）。
     int RenderW(App app, int x, int y, int w) {
         int h = this.prefH;
         if (h <= 0) { h = app.theme.heightTiny; }
-        // Checkable 时把 Checked 传到样式表 → 皮肤用 `tag:selected` 着色。
-        bool isSel = Checkable && Checked.Get();
-        StyleBox s = this.ResolveEasedStyleAsIn(
-            app, wid, "tag", Class, false, isSel, x, y, w, h);
-        h = s.ClampH(s.HeightOr(app.theme.heightTiny));
-        string trailing = "";
-        if (Closable) { trailing = "close"; }
-        int closeX = BoxContent.Paint(app, wid, "tag", Class, name, s, x, y, w, h,
-                                      Icon, this.Label(), trailing, false, false);
-        if (Checkable) {
-            // Checkable 标签：点击任意空白切换 Checked，触发 Change。
-            if (Ui.Activate(app, wid, x, y, w, h)) {
-                Checked.Set(!this.IsChecked());
-                Change.PostS(this);
-                app.window.Wake();
-            }
-        }
-        if (!Closable) { return wid; }
-        int glyph = BoxContent.GlyphSize(
-            s.FontOr(Style.FontFallback(app, "small")));
-        if (Ui.Activate(app, wid, closeX, y, glyph, h)) {
-            Close.PostS(this);
-            app.window.Wake();
-        }
-        On.Fire(app, wid, this);
-        return wid;
+        this.Arrange(x, y, w, h);
+        this.RenderTree(app);
+        return this.CommonId();
     }
 
     // Checkable 时的当前选中态；未绑定 Checked 为 false。
@@ -255,17 +231,37 @@ public class Tag : Control {
         prefH = s.HeightOr(app.theme.heightTiny);
     }
 
-    // 覆写：在停靠边界内垂直居中并按自然宽度绘制（空间不足时
-    // 省略文本，不越界）。
+    override void SyncBinding() {
+        base.SyncBinding();
+        this.ApplySizeClass();
+    }
+
+    // 覆写：保留模式绘制 = 基类 PaintStyleBox 统一完成外盒（背景/边框/圆角/阴影），此处仅绘制内容图元。
     override void OnPaint(App app) {
         if (bw <= 0) { return; }
-        // 行通常比标签高，因此在停靠边界内居中。
-        int h = this.ResolvedStyle(app).HeightOr(app.theme.heightTiny);
-        int py = by;
-        if (bh > h) { py = by + (bh - h) / 2; }
-        // 不越过布局分配的边界：空间不足时省略文本。
-        int w = this.AutoWidth(app);
-        if (w > bw) { w = bw; }
-        this.RenderW(app, bx, py, w);
+        if (computedStyle == null) {
+            this.ResolveStyle(app, Style.SNormal());
+        }
+        string trailing = "";
+        if (Closable) { trailing = "close"; }
+        int closeX = BoxContent.PaintContent(app, this.CommonId(), "tag", Class, name,
+                                             computedStyle, bx, by, bw, bh,
+                                             Icon, this.Label(), trailing, false, false);
+        if (Closable) {
+            int glyph = BoxContent.GlyphSize(computedStyle.FontOr(Style.FontFallback(app, "small")));
+            if (Ui.Activate(app, this.CommonId(), closeX, by, glyph, bh)) {
+                Close.PostS(this);
+                App a = this.FindApp();
+                if (a != null && a.window != null) { a.window.Wake(); }
+            }
+        }
+        if (Checkable) {
+            if (Ui.Activate(app, this.CommonId(), bx, by, bw, bh)) {
+                Checked.Set(!this.IsChecked());
+                Change.PostS(this);
+                App a = this.FindApp();
+                if (a != null && a.window != null) { a.window.Wake(); }
+            }
+        }
     }
 }

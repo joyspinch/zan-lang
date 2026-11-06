@@ -6,7 +6,8 @@ Zan.Gui 分层重构的棘轮机检（docs/GUI_ARCHITECTURE.md §4 P0 第 3 步�
 由 scripts/check_code_standards.py --staged 在 pre-commit 时调用；也可单独运行：
 
     python scripts/gui_layer_rules.py --report     # 全树对照基线，列出超出基线的违规
-    python scripts/gui_layer_rules.py --baseline   # 重写基线（工作树与 HEAD 逐项取大）
+    python scripts/gui_layer_rules.py --update F…  # 修掉违规后：按工作树重算这些文件的基线条目（锁定收紧）
+    python scripts/gui_layer_rules.py --baseline   # 整份重写基线（工作树与 HEAD 逐项取大，仅初建/重置用）
 
 五类规则，全部是"只减不增"的棘轮——现存违规记在 scripts/gui_layers_baseline.json，
 提交时逐文件比对暂存版内容，计数超过基线即拒绝：
@@ -445,7 +446,7 @@ def check_staged() -> List[str]:
                     violations.append(
                         "[FAIL] %s - %s：%s 现 %d 处，基线 %d 处。\n"
                         "       Zan.Gui 分层重构的棘轮只减不增（%s）。请改为不新增的写法；"
-                        "确属必要时运行 python scripts/gui_layer_rules.py --baseline 更新基线，"
+                        "确属必要时运行 python scripts/gui_layer_rules.py --update <文件> 更新基线，"
                         "基线总数上升需设置 ZAN_GUI_BASELINE_RAISE=1 并在提交说明写明理由。"
                         % (path, CATEGORY_DESC[cat], key, count, allowed, DOC))
 
@@ -525,16 +526,40 @@ def write_baseline() -> int:
                         merged[key] = max(merged[key], count)
             if merged:
                 categories[cat][rel] = dict(sorted(merged.items()))
+    save_baseline(categories)
+    print_totals(categories)
+    return 0
 
+
+def save_baseline(categories: Dict[str, Dict[str, Dict[str, int]]]) -> None:
     data = {
         "version": 1,
-        "note": "Zan.Gui 分层重构棘轮基线（%s）。只许降不许升；由 scripts/gui_layer_rules.py --baseline 生成，"
-                "取工作树与 HEAD 逐项最大值，勿手改。" % DOC,
-        "categories": categories,
+        "note": "Zan.Gui 分层重构棘轮基线（%s）。只许降不许升；由 scripts/gui_layer_rules.py 生成"
+                "（--update 定点收紧，--baseline 整份重建），勿手改。" % DOC,
+        "categories": {cat: dict(sorted(categories[cat].items())) for cat in CATEGORIES},
     }
     with open(os.path.join(REPO_ROOT, BASELINE_REL), "w", encoding="utf-8", newline="\n") as f:
         json.dump(data, f, ensure_ascii=False, indent=1, sort_keys=False)
         f.write("\n")
+
+
+def update_baseline(paths: List[str]) -> int:
+    """按工作树内容重算给定文件的基线条目；文件已不存在则删除其条目（git mv 时新旧路径都传）。"""
+    with open(os.path.join(REPO_ROOT, BASELINE_REL), "r", encoding="utf-8") as f:
+        categories = load_baseline_text(f.read())
+    rels = [norm_rel(os.path.relpath(os.path.abspath(p), REPO_ROOT)) for p in paths]
+    table = TypeTable.build() if any(needs_type_table(r) for r in rels) else None
+    for rel in rels:
+        for cat in CATEGORIES:
+            categories[cat].pop(rel, None)
+        text = read_worktree(rel) if in_scope(rel) else None
+        if text is None:
+            continue
+        metrics = file_metrics(rel, text, table)
+        for cat in CATEGORIES:
+            if metrics[cat]:
+                categories[cat][rel] = dict(sorted(metrics[cat].items()))
+    save_baseline(categories)
     print_totals(categories)
     return 0
 
@@ -568,7 +593,7 @@ def report() -> int:
     print_totals(baseline)
     if any(reducible.values()):
         print("可收紧：" + "，".join("%s 少 %d 处" % (cat, n) for cat, n in reducible.items() if n) +
-              "（运行 --baseline 锁定）")
+              "（对改动文件运行 --update 锁定）")
     print("超出基线 %d 项。" % exceeded)
     return 1 if exceeded else 0
 
@@ -576,6 +601,8 @@ def report() -> int:
 def main() -> int:
     if len(sys.argv) > 1 and sys.argv[1] == "--baseline":
         return write_baseline()
+    if len(sys.argv) > 1 and sys.argv[1] == "--update":
+        return update_baseline(sys.argv[2:])
     if len(sys.argv) > 1 and sys.argv[1] == "--report":
         return report()
     violations = check_staged()

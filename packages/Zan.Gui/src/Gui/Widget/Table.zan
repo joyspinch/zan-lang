@@ -3,10 +3,55 @@ using Gui;
 
 namespace Gui.Widget;
 
-// 带表头和斑马纹行的数据表。
-public class Table {
+// 带表头和斑马纹行的数据表（DOM 容器组件，支持组件任意互嵌）。
+// 既支持标准 DOM 容器化写法（Table -> TableRow -> TableCell -> 任意组件），
+// 亦完整保留静态工具方法供旧代码零破坏调用。
+public class Table : Control {
+    Table() {
+        this.InitControl("table", 1);
+    }
+
+    Table AddRow(TableRow row) {
+        if (row != null) {
+            this.Add(row);
+        }
+        return this;
+    }
+
+    override string Kind() { return "Table"; }
+
+    override void OnMeasure(App app) {
+        // 先度量所有行和各单元格
+        int totalH = 0;
+        int maxW = 0;
+        for (int i = 0; i < children.Count; i = i + 1) {
+            Control r = children[i];
+            r.OnMeasure(app);
+            totalH = totalH + r.prefH;
+            if (r.prefW > maxW) { maxW = r.prefW; }
+        }
+        prefW = maxW;
+        prefH = totalH;
+    }
+
+    override void OnPaint(App app) {
+        if (bw <= 0 || bh <= 0) { return; }
+        // 按流式垂直堆叠排布并渲染所有行
+        int cy = by;
+        for (int i = 0; i < children.Count; i = i + 1) {
+            Control r = children[i];
+            int rh = r.prefH;
+            if (rh <= 0) { rh = app.theme.heightMedium; }
+            r.Arrange(bx, cy, bw, rh);
+            r.RenderTree(app);
+            cy = cy + rh;
+        }
+    }
+
+    // ---- 静态兼容入口（保留旧调用 100% 正常运行） ------------------------
+
     // 强类型实体主方法：表头行。
-    static void RenderHeaderCols(App app, int x, int y, List<TableColumnSpec> cols) {
+    public static void RenderHeaderCols(App app, int x, int y, List<TableColumnSpec> cols) {
         if (cols == null) { return; }
         List<string> columns = new List<string>();
         List<int> widths = new List<int>();
@@ -19,7 +64,7 @@ public class Table {
 
     // 表头行（主题中等控件高）：columns/widths 按下标配对，长表头
     // 在列宽内省略，底部画分隔线。
-    static void RenderHeader(App app, int x, int y, List<string> columns, List<int> widths) {
+    public static void RenderHeader(App app, int x, int y, List<string> columns, List<int> widths) {
         Canvas c = app.canvas;
         Theme t = app.theme;
         StyleBox header = Style.Part(app, "table", "header", "", "", "",
@@ -36,7 +81,8 @@ public class Table {
         for (; i < widths.Count; i = i + 1) {
             totalW = totalW + widths[i];
         }
-        c.FillRect(x, y, totalW, rowH, header.BgOr(0));
+        header.bg = header.BgOr(0);
+        SubBox.Paint(app, header, x, y, totalW, rowH);
 
         int cx = x;
         i = 0;
@@ -54,12 +100,13 @@ public class Table {
             i = i + 1;
         }
 
-        c.FillRect(x, y + rowH - 1, totalW, 1, divider.BgOr(0));
+        divider.bg = divider.BgOr(0);
+        SubBox.Paint(app, divider, x, y + rowH - 1, totalW, 1);
     }
 
     // 强类型实体主方法：数据行渲染（带选中态）。
-    static void RenderRowCellsSel(App app, int x, int y, List<TableCellItem> cells,
-                                  bool striped, bool selected) {
+    public static void RenderRowCellsSel(App app, int x, int y, List<TableCellItem> cells,
+                                         bool striped, bool selected) {
         if (cells == null) { return; }
         List<string> cellTexts = new List<string>();
         List<int> widths = new List<int>();
@@ -71,20 +118,20 @@ public class Table {
     }
 
     // 强类型实体主方法：普通数据行渲染。
-    static void RenderRowCells(App app, int x, int y, List<TableCellItem> cells, bool striped) {
+    public static void RenderRowCells(App app, int x, int y, List<TableCellItem> cells, bool striped) {
         Table.RenderRowCellsSel(app, x, y, cells, striped, false);
     }
 
     // 普通数据行（无选中）：striped 为 true 时铺斑马纹底。
-    static void RenderRow(App app, int x, int y, List<string> cells, List<int> widths, bool striped) {
+    public static void RenderRow(App app, int x, int y, List<string> cells, List<int> widths, bool striped) {
         Table.RenderRowSel(app, x, y, cells, widths, striped, false);
     }
 
     // 带选中态的行：选中行铺 `table::row:selected` 的主色浅底
     // 并在左缘画强调条——与 VirtualList / DataTable 的选中语言
     // 一致，静态演示也能表达"哪一行是选中的"。
-    static void RenderRowSel(App app, int x, int y, List<string> cells, List<int> widths,
-                             bool striped, bool selected) {
+    public static void RenderRowSel(App app, int x, int y, List<string> cells, List<int> widths,
+                                    bool striped, bool selected) {
         Canvas c = app.canvas;
         Theme t = app.theme;
         // 选中优先于斑马纹：同一行不会既是选中又是斑马纹。
@@ -106,7 +153,10 @@ public class Table {
             totalW = totalW + widths[i];
         }
 
-        if (selected || striped) { c.FillRect(x, y, totalW, rowH, row.BgOr(0)); }
+        if (selected || striped) {
+            row.bg = row.BgOr(0);
+            SubBox.Paint(app, row, x, y, totalW, rowH);
+        }
 
         int cx = x;
         i = 0;
@@ -125,8 +175,10 @@ public class Table {
         }
 
         if (selected) {
-            c.FillRect(x, y, app.Scale(3), rowH, accent.BgOr(0));
+            accent.bg = accent.BgOr(0);
+            SubBox.Paint(app, accent, x, y, app.Scale(3), rowH);
         }
-        c.FillRect(x, y + rowH - 1, totalW, 1, divider.BgOr(0));
+        divider.bg = divider.BgOr(0);
+        SubBox.Paint(app, divider, x, y + rowH - 1, totalW, 1);
     }
 }

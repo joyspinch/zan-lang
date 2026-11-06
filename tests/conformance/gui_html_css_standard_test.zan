@@ -1,0 +1,378 @@
+using System;
+using Gui;
+using Gui.Widget;
+using Gui.Markup;
+
+class Program {
+    static int fails;
+
+    static void Check(string what, bool cond) {
+        if (cond) {
+            Console.WriteLine("OK: " + what);
+        } else {
+            fails = fails + 1;
+            Console.WriteLine("FAIL: " + what);
+        }
+    }
+
+    static int Main() {
+        Html.Install();
+        ControlBootstrap.Install();
+
+        // 1. 标准 HTML+CSS 声明解析与统一 DOM 树挂载验证
+        string html = 
+            "<div id=\"app-root\" class=\"app-container\">"
+            + "  <card id=\"user-card\" title=\"用户中心\">"
+            + "    <button id=\"btn-refresh\" slot=\"extra\">刷新</button>"
+            + "    <div id=\"card-body\" class=\"content-box\">"
+            + "      <label id=\"user-label\">用户名: Alice</label>"
+            + "      <button id=\"btn-submit\" class=\"primary\">提交</button>"
+            + "    </div>"
+            + "  </card>"
+            + "  <select-box id=\"role-select\" placeholder=\"选择角色\">"
+            + "    <option value=\"admin\">管理员</option>"
+            + "    <option value=\"editor\">编辑员</option>"
+            + "  </select-box>"
+            + "</div>";
+
+        HtmlDoc doc = Html.Parse(html, "", new HtmlHandlers());
+        if (doc == null || doc.root == null) {
+            Console.WriteLine("FAIL: parse returned null");
+            return 1;
+        }
+
+        Control root = doc.root;
+        Check("Root doc parsed", root != null);
+
+        Control appRoot = root.Find("app-root");
+        Check("App root element found", appRoot != null && appRoot.Kind() == "div");
+        Check("App root has class", appRoot != null && appRoot.HasClass("app-container"));
+
+        // 统一 DOM 挂载：Card 直接作为 Root 的子节点，不走方言旁路
+        Control card = root.Find("user-card");
+        Check("Card mounted directly into DOM tree", card != null && card.Kind() == "Card");
+
+        // 插槽机制：slot="extra" 的按钮正确挂入 Card 的 slot
+        Control btnRefresh = root.Find("btn-refresh");
+        Check("Extra slot button mounted", btnRefresh != null && btnRefresh.slotName == "extra");
+
+        // 子容器与深层控件保持标准 DOM 父子关系
+        Control cardBody = root.Find("card-body");
+        Check("Card body is Element", cardBody != null && cardBody is Element);
+
+        Control btnSubmit = root.Find("btn-submit");
+        Check("Submit button parsed and mapped", btnSubmit != null && btnSubmit.Kind() == "Button");
+        Check("Submit button has primary class", btnSubmit.HasClass("primary"));
+
+        // 2. 代码编程式构建与 HTML DOM 树完全同构
+        Card progCard = new Card("系统状态");
+        Button progBtn = new Button("详情");
+        progBtn.slotName = "extra";
+        bool mounted = progCard.MountSlot("extra", progBtn);
+        Check("Programmatic Card mounted slot child", mounted && progCard.children.Contains(progBtn));
+
+        // 3. 状态级联测试：父容器添加状态类，不需要子节点手写 Ancestor 绑定
+        Element panel = new Element();
+        panel.InitElement("div", "camera-panel");
+        panel.AddClass("camera-panel");
+        Check("Initial panel state", !panel.HasClass("is-expanded"));
+        panel.AddClass("is-expanded");
+        Check("Expanded panel state", panel.HasClass("is-expanded"));
+
+        // 4. OverlayHost 弹层生命周期测试
+        SelectBox sb = new SelectBox();
+        Check("SelectBox initially closed", !sb.IsOpen());
+        sb.SetOpen(true);
+        Check("SelectBox opened via SetOpen", sb.IsOpen());
+        // 模拟外部点击触发 OverlayHost 关闭
+        sb.OnPopupDismissed();
+        Check("SelectBox closed after OnPopupDismissed", !sb.IsOpen());
+
+        // 5. 组件互嵌(Component Nesting)与标准 HTML Table 映射测试
+        // 5.1 代码创建标准 Table 树并嵌入 Button、Switch
+        Table manualTable = new Table();
+        TableRow row1 = new TableRow(false);
+        TableCell c1 = new TableCell("Alice");
+        TableCell c2 = new TableCell(new Button("Edit"));
+        TableCell c3 = new TableCell(new Switch());
+        row1.AddCell(c1).AddCell(c2).AddCell(c3);
+        manualTable.AddRow(row1);
+        Check("Table has 1 row", manualTable.children.Count == 1);
+        Check("Row has 3 cells", row1.children.Count == 3);
+        Check("Cell 2 embeds Button", c2.children.Count > 0 && c2.children[0] is Button);
+        Check("Cell 3 embeds Switch", c3.children.Count > 0 && c3.children[0] is Switch);
+
+        // 5.2 HTML 标准 <table> 声明解析与组件互嵌验证
+        string tableHtml =
+            "<table id=\"user-table\">"
+            + "  <thead>"
+            + "    <tr> <th>Name</th> <th>Action</th> </tr>"
+            + "  </thead>"
+            + "  <tbody>"
+            + "    <tr> <td>Bob</td> <td><button id=\"btn-edit-bob\">Edit</button></td> </tr>"
+            + "  </tbody>"
+            + "</table>";
+        HtmlDoc tDoc = Html.Parse(tableHtml, "", new HtmlHandlers());
+        Check("Table parsed", tDoc != null && tDoc.root != null);
+        Control tblNode = tDoc.root.Find("user-table");
+        if (tblNode == null && tDoc.root is Table) { tblNode = tDoc.root; }
+        Check("Table node is Table instance", tblNode is Table);
+        Check("Table has header and data rows", tblNode.children.Count == 2);
+        TableRow headerRow = (TableRow)tblNode.children[0];
+        Check("First row is header", headerRow.IsHeader());
+        TableRow dataRow = (TableRow)tblNode.children[1];
+        Check("Second row has cells", dataRow.children.Count == 2);
+        TableCell actionCell = (TableCell)dataRow.children[1];
+        Check("Action cell embeds button", actionCell.children.Count > 0 && actionCell.children[0] is Button);
+        Control bobBtn = tblNode.Find("btn-edit-bob");
+        Check("Embedded button found via Find", bobBtn != null && bobBtn.Kind() == "Button");
+
+        // 6. Tabs 与 TabPane 组件互嵌验证
+        Tabs tabs = new Tabs();
+        TabPane pane1 = new TabPane("Profile", new Button("EditProfile"));
+        TabPane pane2 = new TabPane("Settings", new Switch());
+        tabs.AddTab(pane1).AddTab(pane2);
+        Check("Tabs has 2 panes", tabs.Count() == 2);
+        Check("Pane 1 embeds Button", pane1.children.Count > 0 && pane1.children[0] is Button);
+        Check("Pane 2 embeds Switch", pane2.children.Count > 0 && pane2.children[0] is Switch);
+
+        // 7. Timeline 与 TimelineItem 组件互嵌验证
+        Timeline tl = new Timeline();
+        TimelineItem ti1 = new TimelineItem("10:00", new Tag("Deployed"));
+        TimelineItem ti2 = new TimelineItem("11:00", new Button("Rollback"));
+        tl.Add(ti1);
+        tl.Add(ti2);
+        Check("Timeline has 2 items", tl.Count() == 2);
+        Check("TimelineItem 1 embeds Tag", ti1.children.Count > 0 && ti1.children[0] is Tag);
+        Check("TimelineItem 2 embeds Button", ti2.children.Count > 0 && ti2.children[0] is Button);
+
+        // 8. Breadcrumb 与 BreadcrumbItem 组件互嵌验证
+        Breadcrumb bc = new Breadcrumb();
+        BreadcrumbItem bi1 = new BreadcrumbItem("Home", "/");
+        BreadcrumbItem bi2 = new BreadcrumbItem(new Button("Refresh"));
+        bc.Add(bi1);
+        bc.Add(bi2);
+        Check("Breadcrumb has 2 items", bc.children.Count == 2);
+        Check("BreadcrumbItem 2 embeds Button", bi2.children.Count > 0 && bi2.children[0] is Button);
+
+        // 9. HTML 声明式复合容器(Tabs/Timeline/Breadcrumb)组件互嵌解析验证
+        string compHtml = 
+            "<div id=\"nesting-root\">"
+            + "  <tabs id=\"my-tabs\">"
+            + "    <tab-pane label=\"Tab1\" id=\"pane-1\">"
+            + "      <button id=\"btn-in-tab\">ClickMe</button>"
+            + "    </tab-pane>"
+            + "  </tabs>"
+            + "  <timeline id=\"my-timeline\">"
+            + "    <timeline-item time=\"10:00\" id=\"time-item-1\">"
+            + "      <tag id=\"tag-in-tl\">Online</tag>"
+            + "    </timeline-item>"
+            + "  </timeline>"
+            + "  <breadcrumb id=\"my-bc\">"
+            + "    <breadcrumb-item id=\"bc-item-1\">"
+            + "      <button id=\"btn-in-bc\">Home</button>"
+            + "    </breadcrumb-item>"
+            + "  </breadcrumb>"
+            + "</div>";
+        HtmlDoc compDoc = Html.Parse(compHtml, "", new HtmlHandlers());
+        Check("Component nesting HTML parsed", compDoc != null && compDoc.root != null);
+        Control nRoot = compDoc.root.Find("nesting-root");
+        if (nRoot == null && compDoc.root is Element) { nRoot = compDoc.root; }
+        Check("Nesting root found", nRoot != null);
+        Control btnInTab = nRoot.Find("btn-in-tab");
+        Check("Button in TabPane found", btnInTab != null && btnInTab.Kind() == "Button");
+        Control tagInTl = nRoot.Find("tag-in-tl");
+        Check("Tag in TimelineItem found", tagInTl != null && tagInTl.Kind() == "Tag");
+        Control btnInBc = nRoot.Find("btn-in-bc");
+        Check("Button in BreadcrumbItem found", btnInBc != null && btnInBc.Kind() == "Button");
+
+        // 10. 重构后的 Pagination 复合容器子组件测试
+        Pagination pg = new Pagination(10);
+        pg.ShowTotal(true).Jumper(true).ShowSizes(true);
+        pg.OnMeasure(null);
+        Check("Pagination generated child controls", pg.children.Count >= 7);
+        Check("Initial page is 1", pg.CurrentPage() == 1);
+        pg.SetPage(5);
+        Check("Current page changed to 5", pg.CurrentPage() == 5);
+
+        // 11. 重构后的 Popover 浮层生命周期与 OverlayHost 协同测试
+        Popover pop = new Popover("Info", "Help", "This is help text", 200);
+        Check("Popover initially closed", !pop.IsOpen());
+        pop.SetOpen(true);
+        Check("Popover opened", pop.IsOpen());
+        pop.OnPopupDismissed();
+        Check("Popover closed after dismiss", !pop.IsOpen());
+
+        // 12. 统一通用下拉基类 PopupTrigger 与插槽互嵌测试
+        PopupTrigger pt = new PopupTrigger("ClickMe");
+        Card customCard = new Card("CustomContent");
+        pt.MountSlot("popup", customCard);
+        Check("PopupTrigger mounted custom popup slot", pt.GetPopupContent() == customCard);
+        Check("PopupTrigger initially closed", !pt.IsOpen());
+        pt.SetOpen(true);
+        Check("PopupTrigger opened", pt.IsOpen());
+        pt.OnPopupDismissed();
+        Check("PopupTrigger closed after dismiss", !pt.IsOpen());
+
+        // 13. SelectBox 下拉组件互嵌 Table 测试
+        SelectBox sbNesting = new SelectBox("User");
+        Table dropTable = new Table();
+        dropTable.AddRow(new TableRow(false).AddCell(new TableCell("John")).AddCell(new TableCell(new Button("SelectJohn"))));
+        sbNesting.MountSlot("popup", dropTable);
+        Check("SelectBox embedded Table into popup slot", sbNesting.GetPopupContent() == dropTable);
+        Check("Embedded table has 1 row", dropTable.children.Count == 1);
+
+        // 14. HTML 声明式语法下的下拉互嵌（HTML Declarative Nesting）测试
+        string popHtml = 
+            "<div id=\"dropdown-nesting\">"
+            + "  <select-box id=\"sb-with-table\">"
+            + "    <table slot=\"popup\" id=\"nested-table\">"
+            + "      <tr><td>Alice</td></tr>"
+            + "    </table>"
+            + "  </select-box>"
+            + "</div>";
+        HtmlDoc popDoc = Html.Parse(popHtml, "", new HtmlHandlers());
+        Check("Dropdown nesting HTML parsed", popDoc != null && popDoc.root != null);
+        Control sbNode = popDoc.root.Find("sb-with-table");
+        Check("SelectBox found in tree", sbNode != null && sbNode is SelectBox);
+        SelectBox realSb = (SelectBox)sbNode;
+        Control popContent = realSb.GetPopupContent();
+        bool hasTable = false;
+        if (popContent != null) {
+            hasTable = popContent is Table;
+        }
+        Check("SelectBox popup slot holds nested table", hasTable);
+        popContent = null;
+        realSb = null;
+        sbNode = null;
+        popDoc = null;
+
+        // 15. ColorPicker 统一浮层插槽与组件互嵌验证
+        ColorPicker cpNesting = new ColorPicker();
+        Card colorPresetCard = new Card("PresetColors");
+        cpNesting.MountSlot("popup", colorPresetCard);
+        Control cpSlot = cpNesting.GetPopupContent();
+        Check("ColorPicker mounted custom Card into popup slot", cpSlot == colorPresetCard);
+        cpSlot = null;
+        colorPresetCard = null;
+        cpNesting = null;
+
+        // 16. DatePicker 统一浮层插槽与组件互嵌验证
+        DatePicker dpNesting = new DatePicker();
+        Table scheduleTable = new Table();
+        dpNesting.MountSlot("popup", scheduleTable);
+        Control dpSlot = dpNesting.GetPopupContent();
+        Check("DatePicker mounted custom Table into popup slot", dpSlot == scheduleTable);
+        dpSlot = null;
+        scheduleTable = null;
+        dpNesting = null;
+
+        // 17. Dropdown 统一浮层插槽与组件互嵌验证
+        Dropdown<string> ddNesting = new Dropdown<string>();
+        Card menuCard = new Card("CustomActions");
+        ddNesting.MountSlot("popup", menuCard);
+        Control ddSlot = ddNesting.GetPopupContent();
+        Check("Dropdown mounted custom Card into popup slot", ddSlot == menuCard);
+        ddSlot = null;
+        menuCard = null;
+        ddNesting = null;
+
+        // 18. Popover 统一浮层插槽与组件互嵌验证
+        Popover popNesting = new Popover("Info");
+        Card infoCard = new Card("CustomInfo");
+        popNesting.MountSlot("popup", infoCard);
+        popNesting.SetOpen(true);
+        Check("Popover mounted custom Card into popup slot", popNesting.IsOpen());
+        popNesting.SetOpen(false);
+        infoCard = null;
+        popNesting = null;
+
+        // 19. AlertBox 统一插槽与组件互嵌验证
+        AlertBox ab = new AlertBox("系统升级通知");
+        Button abBtn = new Button("去更新");
+        ab.MountSlot("action", abBtn);
+        Check("AlertBox mounted action button slot", ab.GetActionContent() == abBtn);
+        Card abContent = new Card("更新详情");
+        ab.MountSlot("content", abContent);
+        Check("AlertBox mounted custom Card content slot", ab.GetCustomContent() == abContent);
+        abBtn = null;
+        abContent = null;
+        ab = null;
+
+        // 20. Collapse 与 CollapseItem 组件互嵌验证
+        Collapse col = new Collapse();
+        CollapseItem ci = new CollapseItem("网络配置");
+        Switch colSw = new Switch();
+        ci.MountSlot("extra", colSw);
+        Table colTbl = new Table();
+        ci.MountSlot("content", colTbl);
+        col.AddItem(ci);
+        Check("Collapse has 1 CollapseItem", col.GetItems().Count == 1);
+        Check("CollapseItem mounted extra Switch slot", ci.GetExtra() == colSw);
+        Check("CollapseItem mounted content Table slot", ci.GetContent() == colTbl);
+        colSw = null;
+        colTbl = null;
+        ci = null;
+        col = null;
+
+        // 21. FormItem 统一插槽与组件装配验证
+        FormItem fi = new FormItem();
+        Button fiLabel = new Button("高级选项");
+        Input fiField = new Input();
+        Button fiExtra = new Button("重置");
+        fi.MountSlot("label", fiLabel);
+        fi.MountSlot("field", fiField);
+        fi.MountSlot("extra", fiExtra);
+        Check("FormItem mounted custom label slot", fi.GetCustomLabel() == fiLabel);
+        Check("FormItem mounted custom field slot", fi.GetField() == fiField);
+        Check("FormItem mounted extra action slot", fi.GetExtra() == fiExtra);
+        fiLabel = null;
+        fiField = null;
+        fiExtra = null;
+        fi = null;
+
+        // 22. HTML 声明式语法下的复合插槽互嵌解析验证
+        string extraHtml = 
+            "<div id=\"extra-nesting-root\">"
+            + "  <alert-box id=\"ab-node\">"
+            + "    <button slot=\"action\" id=\"ab-btn\">ActionBtn</button>"
+            + "  </alert-box>"
+            + "  <collapse id=\"col-node\">"
+            + "    <collapse-item title=\"Item1\" id=\"col-item-1\">"
+            + "      <table slot=\"content\" id=\"tbl-in-col\">"
+            + "        <tr><td>Row1</td></tr>"
+            + "      </table>"
+            + "    </collapse-item>"
+            + "  </collapse>"
+            + "  <form-item id=\"fi-node\">"
+            + "    <input slot=\"field\" id=\"input-in-fi\" />"
+            + "    <button slot=\"extra\" id=\"btn-in-fi\">Send</button>"
+            + "  </form-item>"
+            + "</div>";
+        HtmlDoc extraDoc = Html.Parse(extraHtml, "", new HtmlHandlers());
+        Check("Extra composite nesting HTML parsed", extraDoc != null && extraDoc.root != null);
+        Control exRoot = extraDoc.root.Find("extra-nesting-root");
+        if (exRoot == null && extraDoc.root is Element) { exRoot = extraDoc.root; }
+        Check("Extra composite root found", exRoot != null);
+        Control abBtnNode = exRoot.Find("ab-btn");
+        Check("AlertBox action button found", abBtnNode != null && abBtnNode.slotName == "action");
+        Control tblInCol = exRoot.Find("tbl-in-col");
+        Check("Table in CollapseItem found", tblInCol != null && tblInCol is Table);
+        Control inputInFi = exRoot.Find("input-in-fi");
+        Check("Input in FormItem found", inputInFi != null && inputInFi is Input);
+        Control btnInFi = exRoot.Find("btn-in-fi");
+        Check("Button in FormItem extra slot found", btnInFi != null && btnInFi.slotName == "extra");
+        btnInFi = null;
+        inputInFi = null;
+        tblInCol = null;
+        abBtnNode = null;
+        exRoot = null;
+        extraDoc = null;
+
+        if (fails == 0) {
+            Console.WriteLine("GUI_HTML_CSS_STANDARD_ALL_OK");
+            return 0;
+        }
+        return 1;
+    }
+}

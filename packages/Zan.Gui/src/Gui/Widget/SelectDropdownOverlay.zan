@@ -1,0 +1,273 @@
+using System;
+using System.Collections.Generic;
+using Gui;
+using Gui.Widget.Models;
+
+namespace Gui.Widget;
+
+// 下拉列表弹层渲染与交互引擎（SelectDropdownOverlay）：
+// 负责 SelectBox 默认平铺选项列表、搜索过滤条、表格多列模式、
+// 虚拟行渲染以及内嵌滚动条的渲染与点击交互。
+public class SelectDropdownOverlay {
+    public static void Render(SelectBox s, App app) {
+        if (!s.open) { return; }
+        int overlayBase = app.hitTester.RegionCount();
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+
+        int x = s.trigX;
+        int y = s.trigY;
+        int w = s.trigW;
+        int h = s.lastH;
+        if (h <= 0) { h = s.computedStyle.HeightOr(s.HeadHeight(t)); }
+        int fs = s.FontSize(app, s.computedStyle);
+        int optH = h;
+        StyleBox arrowStyle = s.ResolvePartAs(app, "select", "arrow", "",
+                                             s.Class, Style.SSelected());
+        int arrowSlot = arrowStyle.WidthOr(t.paddingLarge + t.iconSizeSmall);
+        int ek = app.EventKind();
+
+        int nCols = s.ColumnCount();
+        int nRows = s.RowCount();
+        if (s.filterable && s.filterText != "") { nCols = 1; nRows = s.DisplayCount(); }
+        int visRows = nRows;
+        if (visRows > s.maxVisible) { visRows = s.maxVisible; }
+        int fbH = s.FilterBarH(app);
+        int hdH = s.HeaderH(app);
+        int sbMargin = app.Scale(8);
+        int sbChrome = hdH;
+        if (s.filterable && fbH > 0) { sbChrome = hdH + fbH + sbMargin * 2; }
+        int viewH = OverlayPopup.FitH(app, visRows * optH + sbChrome);
+        int contentH = nRows * optH;
+
+        w = s.PopupWidth(app, t, w, fs, arrowSlot);
+        int popX = OverlayPopup.FitX(app, x, w);
+        int popY = OverlayPopup.FitY(app, y + h + app.Scale(4), h, viewH);
+
+        // ---- filterable 搜索框处理 ----
+        bool overSearch = false;
+        int searchBarX = popX + sbMargin;
+        int searchBarY = popY + sbMargin;
+        int searchBarW = w - sbMargin * 2;
+        int searchBarH = fbH;
+        if (s.filterable && searchBarH > 0) {
+            overSearch = app.mouseX >= searchBarX
+                && app.mouseX < searchBarX + searchBarW
+                && app.mouseY >= searchBarY
+                && app.mouseY < searchBarY + searchBarH;
+        }
+
+        int listTop = popY;
+        if (s.filterable && searchBarH > 0) {
+            listTop = searchBarY + searchBarH + sbMargin;
+        }
+        int headerY = listTop;
+        int listY = headerY + hdH;
+        int listH = popY + viewH - listY;
+        if (listH < 0) { listH = 0; }
+        bool overPopup = app.mouseX >= popX && app.mouseX < popX + w
+            && app.mouseY >= popY && app.mouseY < popY + viewH;
+
+        int colW = w;
+        if (nCols > 1) { colW = w / nCols; }
+        if (colW < 1) { colW = 1; }
+        int over = 0 - 1;
+        if (overPopup && !overSearch && app.mouseY >= listY) {
+            int row = (app.mouseY - listY + s.scrollY) / optH;
+            int col = (app.mouseX - popX) / colW;
+            if (col >= nCols) { col = nCols - 1; }
+            if (col < 0) { col = 0; }
+            if (row >= 0 && row < nRows) {
+                over = s.RowToOpt(col * nRows + row);
+                if (over >= 0 && (s.opts[over].grp || s.opts[over].disabled)) {
+                    over = 0 - 1;
+                }
+            }
+        }
+        if (over != s.hoverRow) {
+            s.hoverRow = over;
+            s.Hover.RaiseS(s);
+            app.RequestRedraw();
+        }
+
+        int maxScroll = contentH - listH;
+        if (maxScroll < 0) { maxScroll = 0; }
+        if (overPopup && !overSearch) {
+            bool ownsWheel = app.CaptureWheel(popX, listY, w, listH);
+            if (ownsWheel && ek == 13) {
+                int d = app.window.EventKeyCode();
+                s.scrollY = s.scrollY - d * app.scrollSpeed / 120;
+                app.RequestRedraw();
+            }
+        }
+        if (s.scrollY > maxScroll) { s.scrollY = maxScroll; }
+        if (s.scrollY < 0) { s.scrollY = 0; }
+
+        app.BlockHitsBelow();
+        StyleBox pop = s.ResolvePartAs(app, "select", "popup", "popup",
+                                       s.Class, Style.SSelected());
+        pop.Paint(app, popX, popY, w, viewH);
+        app.BlockHitsRect(popX, popY, w, viewH);
+
+        // ---- 搜索框渲染（filterable）----
+        if (s.filterable && searchBarH > 0) {
+            if (s.filterBox == null) {
+                string bh = s.filterHint;
+                if (bh == "") { bh = "Search"; }
+                s.filterBox = new Input(bh);
+                s.filterBox.Clearable = true;
+            }
+            if (!app.focus.IsFocused(s.filterBox.WidgetId())) {
+                app.focus.SetFocused(s.filterBox.WidgetId());
+            }
+            s.filterBox.Render(app, searchBarX, searchBarY, searchBarW, searchBarH);
+            string live = s.filterBox.GetText();
+            if (live != s.filterText) {
+                s.filterText = live;
+                s.scrollY = 0;
+                s.RebuildFilter();
+                app.RequestRedraw();
+            }
+        }
+
+        // ---- 表头（表格模式）----
+        if (hdH > 0) {
+            StyleBox hdStyle = s.ResolvePartAs(app, "select", "header", "",
+                                               s.Class, Style.SNormal());
+            hdStyle.Paint(app, popX, headerY, w, hdH);
+            int hdFs = hdStyle.FontOr(fs);
+            int hdPad = hdStyle.PadLOr(t.paddingSmall);
+            int cx = popX + hdPad;
+            for (int ci = 0; ci < s.tableColumns.Count; ci = ci + 1) {
+                string title = s.tableColumns[ci].title;
+                int cw = s.tableColumns[ci].width;
+                c.DrawText(cx, Canvas.CenterTextY(headerY, hdH, hdFs),
+                    Ellipsis.Fit(title, cw - app.Scale(6), hdFs),
+                    hdStyle.FgOr(pop.fg), hdFs);
+                cx = cx + cw;
+            }
+        }
+
+        // ---- 选项列表渲染 ----
+        c.PushClip(popX, listY, w, listH);
+        int firstRow = s.scrollY / optH;
+        if (firstRow < 0) { firstRow = 0; }
+        int lastRow = (s.scrollY + listH) / optH + 1;
+        if (lastRow > nRows) { lastRow = nRows; }
+        for (int oCol = 0; oCol < nCols; oCol = oCol + 1) {
+            for (int oRow = firstRow; oRow < lastRow; oRow = oRow + 1) {
+                int realIdx = s.RowToOpt(oCol * nRows + oRow);
+                if (realIdx < 0) { continue; }
+                int ox = popX + oCol * colW;
+                int oy = listY + oRow * optH - s.scrollY;
+                bool overRow = realIdx == s.hoverRow;
+                bool isSel = false;
+                if (s.multi) { isSel = s.opts[realIdx].chosen; }
+                else { isSel = realIdx == s.selected; }
+                bool isGrp = s.opts[realIdx].grp;
+                bool isOff = s.opts[realIdx].disabled;
+
+                int st = Style.SNormal();
+                if (isGrp || isOff) {
+                    st = Style.SDisabled();
+                } else {
+                    if (overRow) { st = st + Style.SHover(); }
+                    if (isSel) { st = st + Style.SSelected(); }
+                }
+                StyleBox row = s.ResolvePartAs(app, "select", "option", "option",
+                                                s.Class, st);
+                row.Paint(app, ox + 1, oy, colW - 2, optH);
+                int rowFs = row.FontOr(fs);
+                int rowPad = row.PadLOr(t.paddingSmall);
+                if (isGrp) {
+                    StyleBox grpStyle = s.ResolvePartAs(app, "select", "group",
+                                                          "", s.Class, Style.SNormal());
+                    c.DrawText(ox + t.paddingSmall,
+                        Canvas.CenterTextY(oy, optH, rowFs),
+                        Ellipsis.Fit(s.opts[realIdx].label,
+                                     colW - t.paddingSmall * 2, rowFs),
+                        grpStyle.FgOr(row.fg), grpStyle.FontOr(rowFs));
+                    continue;
+                }
+                if (s.IsTable()) {
+                    int cellX = ox + rowPad;
+                    for (int ci = 0; ci < s.tableColumns.Count; ci = ci + 1) {
+                        int cw = s.tableColumns[ci].width;
+                        c.DrawText(cellX, Canvas.CenterTextY(oy, optH, rowFs),
+                            Ellipsis.Fit(s.opts[realIdx].Cell(ci),
+                                         cw - app.Scale(6), rowFs),
+                            row.fg, rowFs);
+                        cellX = cellX + cw;
+                    }
+                } else {
+                    int oMaxW = colW - rowPad - arrowSlot - t.paddingSmall;
+                    c.DrawText(ox + rowPad,
+                        Canvas.CenterTextY(oy, optH, rowFs),
+                        Ellipsis.Fit(s.opts[realIdx].label, oMaxW, rowFs),
+                        row.fg, rowFs);
+                }
+                if (isSel) {
+                    StyleBox checkStyle = s.ResolvePartAs(app, "select", "checkmark", "",
+                                                          s.Class, st);
+                    int checkSize = checkStyle.FontOr(t.iconSizeSmall);
+                    c.DrawGlyphIn("check", ox + colW - arrowSlot, oy,
+                        arrowSlot, optH, checkSize,
+                        checkStyle.FgOr(checkStyle.AccentOr(row.accent)));
+                }
+            }
+        }
+        c.PopClip();
+
+        // 弹层滚动条
+        if (contentH > listH && listH > 0) {
+            if (s.scrollSignal == null) { s.scrollSignal = new SignalInt(s.scrollY); }
+            s.scrollSignal.Set(s.scrollY);
+            Scrollbar.RenderVerticalScroll(app, popX + w - app.Scale(12),
+                listY, listH, listH, contentH, s.scrollSignal);
+            int sbScroll = s.scrollSignal.Get();
+            if (sbScroll > maxScroll) { sbScroll = maxScroll; }
+            if (sbScroll < 0) { sbScroll = 0; }
+            if (sbScroll != s.scrollY) {
+                s.scrollY = sbScroll;
+                app.RequestRedraw();
+            }
+        }
+
+        // ---- 弹层输入处理 ----
+        if (app.ClickAvailable()) {
+            if (overSearch) {
+                // 搜索框区域点击不关闭
+            } else if (overPopup && app.mouseY >= listY) {
+                if (app.hitTester.HitTestFrom(app.mouseX, app.mouseY,
+                                              overlayBase) != 0 - 1) {
+                    app.ClaimClick();
+                } else {
+                    int rel = app.mouseY - listY + s.scrollY;
+                    int col = (app.mouseX - popX) / colW;
+                    if (col >= nCols) { col = nCols - 1; }
+                    if (col < 0) { col = 0; }
+                    int rowHit = rel / optH;
+                    int realIdx = 0 - 1;
+                    if (rowHit >= 0 && rowHit < nRows) {
+                        realIdx = s.RowToOpt(col * nRows + rowHit);
+                    }
+                    if (realIdx >= 0 && realIdx < s.opts.Count
+                        && !s.opts[realIdx].grp && !s.opts[realIdx].disabled) {
+                        s.Choose(realIdx);
+                        if (!s.multi) { s.SetOpen(false); }
+                        app.ClaimClick();
+                        app.RequestRedraw();
+                    }
+                }
+            } else {
+                s.SetOpen(false);
+                app.ClaimClick();
+                app.RequestRedraw();
+            }
+        }
+        if (ek == 4 && app.window.EventKeyCode() == 27) {
+            s.SetOpen(false);
+            app.RequestRedraw();
+        }
+    }
+}
