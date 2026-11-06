@@ -1,0 +1,256 @@
+using System;
+using System.Collections.Generic;
+using System.Data;
+using System.Text;
+
+namespace System.Data.ZanDb;
+
+// 实体字段与物理 RecordColumn 的零分配高速绑定槽位
+public class RecordFieldBinding {
+    public string fieldName;
+    public string colName;
+    public int dataType;
+    public RecordColumn column;
+    public bool isPk;
+
+    public RecordFieldBinding(string fieldName, string colName, int dataType, RecordColumn column, bool isPk) {
+        this.fieldName = fieldName;
+        this.colName = colName;
+        this.dataType = dataType;
+        this.column = column;
+        this.isPk = isPk;
+    }
+}
+
+// ZanDB 强类型实体元数据绑定器：预解析字段偏移与类型，实现零反射税实体读写
+public class RecordBinding<T> {
+    public TypeInfo typeInfo;
+    public string tableName;
+    public RecordSchema schema;
+    public List<RecordFieldBinding> fields;
+    public RecordFieldBinding pkField;
+
+    public RecordBinding() {
+        this.typeInfo = typeof(T);
+        this.tableName = this.typeInfo.TableName.Length > 0 ? this.typeInfo.TableName : this.typeInfo.Name;
+        this.fields = new List<RecordFieldBinding>();
+        this.pkField = null;
+        this.schema = this.BuildDefaultSchema();
+    }
+
+    public RecordBinding(RecordSchema existingSchema) {
+        this.typeInfo = typeof(T);
+        this.tableName = this.typeInfo.TableName.Length > 0 ? this.typeInfo.TableName : this.typeInfo.Name;
+        this.fields = new List<RecordFieldBinding>();
+        this.pkField = null;
+        this.schema = existingSchema;
+        this.BindToSchema(existingSchema);
+    }
+
+    // 从实体反射自动推导物理定长/变长对齐 Schema
+    public RecordSchema BuildDefaultSchema() {
+        RecordSchema s = new RecordSchema();
+        for (int i = 0; i < this.typeInfo.FieldCount; i = i + 1) {
+            if (this.typeInfo.IsFieldIgnored(i)) { continue; }
+            string fname = this.typeInfo.GetFieldName(i);
+            string cname = this.typeInfo.GetFieldCustomName(i);
+            if (cname == null || cname.Length == 0) { cname = fname; }
+            string ftype = this.typeInfo.GetFieldType(i);
+            bool isPk = this.typeInfo.IsFieldPk(i) || this.typeInfo.IsFieldIdentity(i) || fname == "Id" || fname == "id" || cname == "id" || cname == "Id";
+
+            if (isPk) {
+                RecordFieldBinding bPk = new RecordFieldBinding(fname, cname, RecordDataType.Int32, null, true);
+                this.pkField = bPk;
+                this.fields.Add(bPk);
+                continue; // 主键直接映射 RecordRow.id，不占用行内额外物理槽位
+            }
+
+            int dt = RecordDataType.Int32 > 0 ? RecordDataType.Int32 : 1;
+            if (ftype == "string") {
+                string lower = fname.ToLower();
+                if (lower.IndexOf("bio") >= 0 || lower.IndexOf("desc") >= 0 || lower.IndexOf("content") >= 0 ||
+                    lower.IndexOf("text") >= 0 || lower.IndexOf("json") >= 0 || lower.IndexOf("remark") >= 0) {
+                    s.AddVarStr(cname);
+                    dt = RecordDataType.VarStr > 0 ? RecordDataType.VarStr : 7;
+                } else {
+                    s.AddFixedStr(cname, 64);
+                    dt = RecordDataType.FixedStr > 0 ? RecordDataType.FixedStr : 5;
+                }
+            } else if (ftype == "double") {
+                s.AddFloat64(cname);
+                dt = RecordDataType.Float64 > 0 ? RecordDataType.Float64 : 4;
+            } else if (ftype == "float") {
+                s.AddFloat32(cname);
+                dt = RecordDataType.Float32 > 0 ? RecordDataType.Float32 : 3;
+            } else if (ftype == "long" || ftype == "ulong") {
+                s.AddInt64(cname);
+                dt = RecordDataType.Int64 > 0 ? RecordDataType.Int64 : 2;
+            } else if (ftype == "bool") {
+                s.AddBool(cname);
+                dt = RecordDataType.Bool > 0 ? RecordDataType.Bool : 6;
+            } else if (ftype == "byte[]") {
+                s.AddBlob(cname);
+                dt = RecordDataType.Blob > 0 ? RecordDataType.Blob : 8;
+            } else {
+                s.AddInt32(cname);
+                dt = RecordDataType.Int32 > 0 ? RecordDataType.Int32 : 1;
+            }
+
+            RecordColumn col = s.FindColumn(cname);
+            RecordFieldBinding b = new RecordFieldBinding(fname, cname, dt, col, false);
+            this.fields.Add(b);
+        }
+        return s;
+    }
+
+    // 将实体字段绑定到现有已打开的表 Schema
+    public void BindToSchema(RecordSchema s) {
+        this.fields.Clear();
+        this.pkField = null;
+        for (int i = 0; i < this.typeInfo.FieldCount; i = i + 1) {
+            if (this.typeInfo.IsFieldIgnored(i)) { continue; }
+            string fname = this.typeInfo.GetFieldName(i);
+            string cname = this.typeInfo.GetFieldCustomName(i);
+            if (cname == null || cname.Length == 0) { cname = fname; }
+            bool isPk = this.typeInfo.IsFieldPk(i) || this.typeInfo.IsFieldIdentity(i) || fname == "Id" || fname == "id" || cname == "id" || cname == "Id";
+
+            if (isPk) {
+                RecordFieldBinding bPk = new RecordFieldBinding(fname, cname, RecordDataType.Int32, null, true);
+                this.pkField = bPk;
+                this.fields.Add(bPk);
+                continue;
+            }
+
+            RecordColumn col = s.FindColumn(cname);
+            if (col != null) {
+                RecordFieldBinding b = new RecordFieldBinding(fname, cname, col.dataType, col, false);
+                this.fields.Add(b);
+            }
+        }
+    }
+
+    // 高速将实体转为 RecordRow（无字段名字符串哈希计算，直写物理槽位）
+    public RecordRow ToRow(T entity, RecordTable table) {
+        if (entity == null || table == null) { return null; }
+        RecordRow row = table.NewRow();
+        object obj = (object)entity;
+
+        for (int i = 0; i < this.fields.Count; i = i + 1) {
+            RecordFieldBinding f = this.fields[i];
+            if (f.isPk) {
+                row.id = obj.GetFieldInt(f.fieldName);
+                continue;
+            }
+            if (f.column == null) { continue; }
+
+            int dt = f.dataType;
+            if (dt == RecordDataType.Int32) {
+                row.SetInt32Fast(f.column, obj.GetFieldInt(f.fieldName));
+            } else if (dt == RecordDataType.Int64) {
+                row.SetInt64Fast(f.column, obj.GetFieldLong(f.fieldName));
+            } else if (dt == RecordDataType.Float64) {
+                row.SetFloat64Fast(f.column, obj.GetFieldDouble(f.fieldName));
+            } else if (dt == RecordDataType.Float32) {
+                row.SetFloat32(f.colName, (float)obj.GetFieldDouble(f.fieldName));
+            } else if (dt == RecordDataType.Bool) {
+                row.SetBoolFast(f.column, obj.GetFieldBool(f.fieldName));
+            } else if (dt == RecordDataType.FixedStr || dt == RecordDataType.VarStr) {
+                row.SetStrFast(f.column, obj.GetFieldString(f.fieldName));
+            } else if (dt == RecordDataType.Blob) {
+                byte[] blob = (byte[])obj.GetFieldObject(f.fieldName);
+                if (blob != null) {
+                    row.SetBlob(f.colName, blob);
+                }
+            }
+        }
+        return row;
+    }
+
+    // 高速将 RecordRow 物化反序列化为实体实例
+    public T ToEntity(RecordRow row) {
+        if (row == null) { return null; }
+        object obj = this.typeInfo.CreateInstance();
+        if (obj == null) { return null; }
+
+        if (this.pkField != null) {
+            obj.SetFieldInt(this.pkField.fieldName, row.id);
+        }
+
+        for (int i = 0; i < this.fields.Count; i = i + 1) {
+            RecordFieldBinding f = this.fields[i];
+            if (f.isPk) { continue; }
+            if (f.column == null) { continue; }
+
+            int dt = f.dataType;
+            if (dt == RecordDataType.Int32) {
+                obj.SetFieldInt(f.fieldName, row.GetInt32Fast(f.column));
+            } else if (dt == RecordDataType.Int64) {
+                obj.SetFieldLong(f.fieldName, row.GetInt64Fast(f.column));
+            } else if (dt == RecordDataType.Float64) {
+                obj.SetFieldDouble(f.fieldName, row.GetFloat64Fast(f.column));
+            } else if (dt == RecordDataType.Float32) {
+                obj.SetFieldDouble(f.fieldName, (double)row.GetFloat32(f.colName));
+            } else if (dt == RecordDataType.Bool) {
+                obj.SetFieldBool(f.fieldName, row.GetBoolFast(f.column));
+            } else if (dt == RecordDataType.FixedStr || dt == RecordDataType.VarStr) {
+                obj.SetFieldString(f.fieldName, row.GetStrFast(f.column));
+            } else if (dt == RecordDataType.Blob) {
+                obj.SetFieldObject(f.fieldName, row.GetBlob(f.colName));
+            }
+        }
+        return (T)obj;
+    }
+
+    // 将实体的变更同步回已有 RecordRow 物理槽位（复用内存，不重新分配行）
+    public void SyncToRow(T entity, RecordRow row) {
+        if (entity == null || row == null) { return; }
+        object obj = (object)entity;
+        for (int i = 0; i < this.fields.Count; i = i + 1) {
+            RecordFieldBinding f = this.fields[i];
+            if (f.isPk || f.column == null) { continue; }
+
+            int dt = f.dataType;
+            if (dt == RecordDataType.Int32) {
+                row.SetInt32Fast(f.column, obj.GetFieldInt(f.fieldName));
+            } else if (dt == RecordDataType.Int64) {
+                row.SetInt64Fast(f.column, obj.GetFieldLong(f.fieldName));
+            } else if (dt == RecordDataType.Float64) {
+                row.SetFloat64Fast(f.column, obj.GetFieldDouble(f.fieldName));
+            } else if (dt == RecordDataType.Float32) {
+                row.SetFloat32(f.colName, (float)obj.GetFieldDouble(f.fieldName));
+            } else if (dt == RecordDataType.Bool) {
+                row.SetBoolFast(f.column, obj.GetFieldBool(f.fieldName));
+            } else if (dt == RecordDataType.FixedStr || dt == RecordDataType.VarStr) {
+                row.SetStrFast(f.column, obj.GetFieldString(f.fieldName));
+            } else if (dt == RecordDataType.Blob) {
+                byte[] blob = (byte[])obj.GetFieldObject(f.fieldName);
+                if (blob != null) {
+                    row.SetBlob(f.colName, blob);
+                }
+            }
+        }
+    }
+
+    // 查找字段绑定的物理列名
+    public string FindColName(string fieldName) {
+        if (fieldName == null) { return ""; }
+        for (int i = 0; i < this.fields.Count; i = i + 1) {
+            if (this.fields[i].fieldName == fieldName || this.fields[i].colName == fieldName) {
+                return this.fields[i].colName;
+            }
+        }
+        return fieldName;
+    }
+}
+
+// 全局泛型单例缓存：进程生命周期内每种实体类型只解析构建一次绑定器
+public class RecordBindingCache<T> {
+    public static RecordBinding<T> _instance;
+
+    public static RecordBinding<T> Get() {
+        if (RecordBindingCache<T>._instance == null) {
+            RecordBindingCache<T>._instance = new RecordBinding<T>();
+        }
+        return RecordBindingCache<T>._instance;
+    }
+}

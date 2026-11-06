@@ -378,6 +378,26 @@ db.Close();
 
 - **结论**：`RecordTable` 写入吞吐是原文档路径的 **53.8 倍**，点查耗时缩减至 **1/9**，彻底根除了结构化业务数据被 JsonValue 抽象语法树拖垮的致命性能缺陷。
 
+### 强类型单机高速 ORM 架构（RecordRepository<T> & RecordBinding<T>）
+
+为彻底解决关系型 ORM 反射探针税（`DetectColInt` 等魔数探测）与全表内存反序列化瓶颈，ZanDB 提供工业级强类型实体 ORM 方案：
+
+1. **零反射税预解析（RecordBinding<T>）**：
+   - 进程生命周期内对 `typeof(T)` 仅做一次元数据推导，构建 4/8 字节紧凑对齐的 `RecordSchema`；
+   - 预先绑定并固化每个实体字段对应的物理字节偏移（`RecordColumn.offset`）与数据类型（`Int32/Int64/Float32/Float64/FixedStr/Bool/VarStr/Blob`）；
+   - 实体序列化/反序列化（`ToRow`/`ToEntity`/`SyncToRow`）直接通过高速存取器（`SetInt32Fast`/`GetInt32Fast`/`SetStrFast` 等）直写物理字节数组，**0 次字符串哈希查找，0 次列名遍历查找**。
+2. **完整泛型仓储 CRUD 与主键回填**：
+   - `repo.Insert(entity)` / `repo.InsertBatch(list)`：单条与批量实体高速落盘，自动将底层自增主键物理 ID 回写至实体的 `Id` 属性；
+   - `repo.FindById(id)` / `repo.Read(id)`：$O(1)$ 绝对寻址物理直读，反序列化为实体实例；
+   - `repo.Update(entity)` / `repo.DeleteById(id)`：按实体主键就地更新槽位或软删除墓碑标记，自动维护二级索引一致性。
+3. **编译期 AST 语法树下推（RecordEntityQuery<T>）**：
+   - 依托编译器 B-ID65 规范，`(ExprNode x) => x.Dept == "tech"` 在编译期直接降级为 `ExprNode` 语法树，由 `BindTreeCols` 映射为物理列名；
+   - **纯索引 Count 优化**：条件命中二级索引且无残余条件时直接返回 `candidateIds.Count`，**0 磁盘 I/O**；
+   - **两段式延迟关联分页（Two-Phase Pagination）**：`repo.Where(...).Skip(2).Take(3).ToList()` 在 ID 序列层面先行切片，仅对最终切片后的目标行执行物理读盘，消除大表深翻页内存暴涨。
+4. **流式标量聚合与事务级批量变更**：
+   - `SumInt`、`SumLong`、`SumDouble`、`Avg`、`Min`、`Max`：支持 Lambda 表达式（如 `(ExprNode x) => x.Salary`）或列名，直接在物理槽位上流式累加，**0 实体装箱**；
+   - `Update(updater)` / `Delete()`：支持条件批量突变，原子打包写入预写日志并在单次提交中完成，具备完整断电自愈能力。
+
 ### 多引擎解耦与企业级高并发列式向量表（VectorTable）
 
 - **引擎分工**：

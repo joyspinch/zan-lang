@@ -1,0 +1,182 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+
+namespace System.Data.ZanDb;
+
+// ZanDB 强类型单机高速仓储
+// 对齐工业级 ORM（BaseRepository）开发范式，彻底消除反射税与 SQL 字符串序列化开销
+public class RecordRepository<T> {
+    public RecordTable Table;
+    public RecordBinding<T> Binding;
+    public string dbPath;
+    public string tableName;
+
+    // 构造：从物理表直接绑定
+    public RecordRepository(RecordTable table) {
+        this.Table = table;
+        this.Binding = new RecordBinding<T>(table.schema);
+        this.dbPath = table.basePath;
+        this.tableName = table.tableName;
+    }
+
+    // 构造：自动从实体元数据建立/打开表
+    public RecordRepository(string dbPath, string tableName = "") {
+        this.dbPath = dbPath;
+        this.Binding = RecordBindingCache<T>.Get();
+        this.tableName = (tableName != null && tableName.Length > 0) ? tableName : this.Binding.tableName;
+        // 尝试按已有元数据自适应加载，若为全新库则自动按 Schema 创建
+        this.Table = RecordTable.Open(dbPath, this.tableName, this.Binding.schema);
+        // 将字段绑定刷新为真实打开的表 Schema（确保 offset 与 column 精准对齐）
+        this.Binding.BindToSchema(this.Table.schema);
+    }
+
+    // 确保二级索引存在（如 EnsureIndex("dept") 或 EnsureIndex((ExprNode x) => x.Dept)）
+    public void EnsureIndex(string col) {
+        if (this.Table != null) {
+            this.Table.EnsureIndex(this.Binding.FindColName(col));
+        }
+    }
+
+    public void EnsureIndex(ExprNode expr) {
+        string col = this.ExtractCol(expr);
+        if (col.Length > 0) {
+            this.EnsureIndex(col);
+        }
+    }
+
+    public string ExtractCol(ExprNode expr) {
+        if (expr == null) { return ""; }
+        if (expr.Kind == 0) {
+            return this.Binding.FindColName(expr.Name);
+        }
+        if (expr.Kind == 4 && expr.A != null) {
+            return this.ExtractCol(expr.A);
+        }
+        return "";
+    }
+
+    // ----------------------------------------------------
+    // 单条与批量 CRUD 接口
+    // ----------------------------------------------------
+
+    // 插入单条实体，返回自增主键 ID，并自动回写到实体的 Id 字段
+    public int Insert(T entity) {
+        if (entity == null || this.Table == null) { return 0; }
+        RecordRow row = this.Binding.ToRow(entity, this.Table);
+        int newId = this.Table.Add(row);
+        if (this.Binding.pkField != null) {
+            ((object)entity).SetFieldInt(this.Binding.pkField.fieldName, newId);
+        }
+        return newId;
+    }
+
+    // 批量插入实体列表
+    public int InsertBatch(List<T> entities) {
+        if (entities == null || entities.Count == 0 || this.Table == null) { return 0; }
+        List<RecordRow> rows = new List<RecordRow>();
+        for (int i = 0; i < entities.Count; i = i + 1) {
+            RecordRow row = this.Binding.ToRow(entities[i], this.Table);
+            if (row != null) {
+                rows.Add(row);
+            }
+        }
+        int firstId = this.Table.AddBulk(rows);
+        if (this.Binding.pkField != null) {
+            for (int i = 0; i < entities.Count; i = i + 1) {
+                ((object)entities[i]).SetFieldInt(this.Binding.pkField.fieldName, firstId + i);
+            }
+        }
+        return rows.Count;
+    }
+
+    // 按主键更新实体
+    public bool Update(T entity) {
+        if (entity == null || this.Table == null) { return false; }
+        int id = 0;
+        if (this.Binding.pkField != null) {
+            id = ((object)entity).GetFieldInt(this.Binding.pkField.fieldName);
+        }
+        if (id <= 0) {
+            throw new ArgumentException("Update requires a positive primary key Id");
+        }
+        RecordRow row = this.Binding.ToRow(entity, this.Table);
+        row.id = id;
+        return this.Table.Update(row);
+    }
+
+    // 按整数主键删除记录
+    public bool DeleteById(int id) {
+        if (this.Table == null) { return false; }
+        return this.Table.Delete(id);
+    }
+
+    // 按主键查询单条实体
+    public T FindById(int id) {
+        if (this.Table == null) { return null; }
+        RecordRow row = this.Table.Get(id);
+        if (row == null) { return null; }
+        return this.Binding.ToEntity(row);
+    }
+
+    // FindById 业务别名
+    public T Read(int id) {
+        return this.FindById(id);
+    }
+
+    // 主键记录是否存在
+    public bool ExistsById(int id) {
+        return this.FindById(id) != null;
+    }
+
+    // ----------------------------------------------------
+    // 流式查询构造器与快速入口
+    // ----------------------------------------------------
+    public RecordEntityQuery<T> Select() {
+        return new RecordEntityQuery<T>(this.Table, this.Binding);
+    }
+
+    public RecordEntityQuery<T> Where(ExprNode predicate) {
+        return this.Select().Where(predicate);
+    }
+
+    public RecordEntityQuery<T> Where(Expr<T> expr) {
+        return this.Select().Where(expr);
+    }
+
+    public RecordEntityQuery<T> OrderBy(string col) {
+        return this.Select().OrderBy(col);
+    }
+
+    public RecordEntityQuery<T> OrderBy(ExprNode expr) {
+        return this.Select().OrderBy(expr);
+    }
+
+    public RecordEntityQuery<T> OrderBy(Expr<T> expr) {
+        return this.Select().OrderBy(expr);
+    }
+
+    public RecordEntityQuery<T> OrderByDescending(string col) {
+        return this.Select().OrderByDescending(col);
+    }
+
+    public RecordEntityQuery<T> OrderByDescending(ExprNode expr) {
+        return this.Select().OrderByDescending(expr);
+    }
+
+    public RecordEntityQuery<T> OrderByDescending(Expr<T> expr) {
+        return this.Select().OrderByDescending(expr);
+    }
+
+    public List<T> ToList() {
+        return this.Select().ToList();
+    }
+
+    public int Count() {
+        return this.Select().Count();
+    }
+
+    public List<T> Page(int page, int pageSize) {
+        return this.Select().Page(page, pageSize).ToList();
+    }
+}

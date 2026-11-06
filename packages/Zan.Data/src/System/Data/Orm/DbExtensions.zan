@@ -129,11 +129,11 @@ public class SelectQuery<T> {
 
     public string DetectColInt(Func<T, int> expr) {
         TypeInfo ti = (this.meta != null && this.meta.Type.Name.Length > 0) ? this.meta.Type : typeof(T);
+        object dummy = ti.CreateInstance();
+        if (dummy == null) { return ""; }
         for (int i = 0; i < this.meta.Cols.Count; i = i + 1) {
             Col c = this.meta.Cols[i];
             if (c.Kind == 0) {
-                object dummy = ti.CreateInstance();
-                if (dummy == null) { break; }
                 if (c.I64) {
                     dummy.SetFieldLong(c.Field, 987654L);
                 } else {
@@ -143,6 +143,8 @@ public class SelectQuery<T> {
                     int res = expr((T)dummy);
                     if (res == 987654) { return c.Col; }
                 } catch {}
+                if (c.I64) { dummy.SetFieldLong(c.Field, 0L); }
+                else { dummy.SetFieldInt(c.Field, 0); }
             }
         }
         return "";
@@ -150,23 +152,25 @@ public class SelectQuery<T> {
 
     public string DetectColLong(Func<T, long> expr) {
         TypeInfo ti = (this.meta != null && this.meta.Type.Name.Length > 0) ? this.meta.Type : typeof(T);
+        object dummy = ti.CreateInstance();
+        if (dummy == null) { return ""; }
         for (int i = 0; i < this.meta.Cols.Count; i = i + 1) {
             Col c = this.meta.Cols[i];
             if (c.Kind == 0) {
-                object dummy = ti.CreateInstance();
-                if (dummy == null) { break; }
                 if (c.I64) {
                     dummy.SetFieldLong(c.Field, 9876543210L);
                     try {
                         long res = expr((T)dummy);
                         if (res == 9876543210L) { return c.Col; }
                     } catch {}
+                    dummy.SetFieldLong(c.Field, 0L);
                 } else {
                     dummy.SetFieldInt(c.Field, 987654);
                     try {
                         long res = expr((T)dummy);
                         if (res == 987654L) { return c.Col; }
                     } catch {}
+                    dummy.SetFieldInt(c.Field, 0);
                 }
             }
         }
@@ -175,16 +179,17 @@ public class SelectQuery<T> {
 
     public string DetectColDouble(Func<T, double> expr) {
         TypeInfo ti = (this.meta != null && this.meta.Type.Name.Length > 0) ? this.meta.Type : typeof(T);
+        object dummy = ti.CreateInstance();
+        if (dummy == null) { return ""; }
         for (int i = 0; i < this.meta.Cols.Count; i = i + 1) {
             Col c = this.meta.Cols[i];
             if (c.Kind == 1) {
-                object dummy = ti.CreateInstance();
-                if (dummy == null) { break; }
                 dummy.SetFieldDouble(c.Field, 987654.25);
                 try {
                     double res = expr((T)dummy);
                     if (res == 987654.25) { return c.Col; }
                 } catch {}
+                dummy.SetFieldDouble(c.Field, 0.0);
             }
         }
         return "";
@@ -192,16 +197,17 @@ public class SelectQuery<T> {
 
     public string DetectColString(Func<T, string> expr) {
         TypeInfo ti = (this.meta != null && this.meta.Type.Name.Length > 0) ? this.meta.Type : typeof(T);
+        object dummy = ti.CreateInstance();
+        if (dummy == null) { return ""; }
         for (int i = 0; i < this.meta.Cols.Count; i = i + 1) {
             Col c = this.meta.Cols[i];
             if (c.Kind == 3) {
-                object dummy = ti.CreateInstance();
-                if (dummy == null) { break; }
                 dummy.SetFieldString(c.Field, "__detect_marker__");
                 try {
                     string res = expr((T)dummy);
                     if (res == "__detect_marker__") { return c.Col; }
                 } catch {}
+                dummy.SetFieldString(c.Field, "");
             }
         }
         return "";
@@ -257,6 +263,13 @@ public class SelectQuery<T> {
         return this;
     }
 
+    public SelectQuery<T> Where(Expr<T> expr) {
+        if (expr != null && expr.Root != null) {
+            this.inner.WExpr(expr.Root);
+        }
+        return this;
+    }
+
     public SelectQuery<T> WhereConds(List<Cond> cs) {
         this.inner.WhereConds(cs);
         return this;
@@ -293,8 +306,35 @@ public class SelectQuery<T> {
         return this;
     }
 
+    public string ExtractColFromExpr(ExprNode expr) {
+        if (expr == null) { return ""; }
+        if (expr.Kind == 0) {
+            Col c = this.meta.Find(expr.Name);
+            if (c != null) { return c.Col; }
+            for (int i = 0; i < this.meta.Cols.Count; i = i + 1) {
+                if (this.meta.Cols[i].Field == expr.Name) { return this.meta.Cols[i].Col; }
+            }
+            return expr.Name;
+        }
+        if (expr.Kind == 4 && expr.A != null) {
+            return this.ExtractColFromExpr(expr.A);
+        }
+        return "";
+    }
+
     public SelectQuery<T> OrderBy(string col) {
         this.inner.OrderBy(col);
+        return this;
+    }
+
+    public SelectQuery<T> OrderBy(ExprNode expr) {
+        string col = this.ExtractColFromExpr(expr);
+        if (col.Length > 0) { this.inner.OrderBy(col); }
+        return this;
+    }
+
+    public SelectQuery<T> OrderBy(Expr<T> expr) {
+        if (expr != null) { return this.OrderBy(expr.Root); }
         return this;
     }
 
@@ -325,6 +365,17 @@ public class SelectQuery<T> {
         return this;
     }
 
+    public SelectQuery<T> OrderByDescending(ExprNode expr) {
+        string col = this.ExtractColFromExpr(expr);
+        if (col.Length > 0) { this.inner.OBD(col); }
+        return this;
+    }
+
+    public SelectQuery<T> OrderByDescending(Expr<T> expr) {
+        if (expr != null) { return this.OrderByDescending(expr.Root); }
+        return this;
+    }
+
     public SelectQuery<T> OrderByDescending(Func<T, long> expr) {
         this.orderByLongFn = expr;
         this.orderByDesc = true;
@@ -349,6 +400,17 @@ public class SelectQuery<T> {
 
     public SelectQuery<T> GroupBy(string col) {
         this.inner.GroupBy(col);
+        return this;
+    }
+
+    public SelectQuery<T> GroupBy(ExprNode expr) {
+        string col = this.ExtractColFromExpr(expr);
+        if (col.Length > 0) { this.inner.GroupBy(col); }
+        return this;
+    }
+
+    public SelectQuery<T> GroupBy(Expr<T> expr) {
+        if (expr != null) { return this.GroupBy(expr.Root); }
         return this;
     }
 
@@ -1260,6 +1322,19 @@ public class DeleteQuery<T> {
         return this;
     }
 
+    // 表达式树过滤条件（编译期 ExprNode 下推，直接生成参数化 DELETE，零反射零装箱）
+    public DeleteQuery<T> Where(ExprNode expr) {
+        this.inner.WExpr(expr);
+        return this;
+    }
+
+    public DeleteQuery<T> Where(Expr<T> expr) {
+        if (expr != null && expr.Root != null) {
+            this.inner.WExpr(expr.Root);
+        }
+        return this;
+    }
+
     public DeleteQuery<T> WhereIf(bool condition, Func<T, bool> expr) {
         if (condition && expr != null) {
             this.Where(expr);
@@ -1507,6 +1582,19 @@ public class UpdateQuery<T> {
 
     public UpdateQuery<T> Where(string sql) {
         this.inner.W(sql);
+        return this;
+    }
+
+    // 表达式树过滤条件（编译期 ExprNode 下推，直接生成参数化 UPDATE，零反射零装箱）
+    public UpdateQuery<T> Where(ExprNode expr) {
+        this.inner.WExpr(expr);
+        return this;
+    }
+
+    public UpdateQuery<T> Where(Expr<T> expr) {
+        if (expr != null && expr.Root != null) {
+            this.inner.WExpr(expr.Root);
+        }
         return this;
     }
 

@@ -1,0 +1,235 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+
+namespace System.Data.ZanDb;
+
+public delegate void EntityUpdater<T>(T item);
+
+// 强类型实体查询构造器：基于 ExprNode 编译期语法树下推与两段式延迟分页
+// 支持零反射纯索引计数、流式标量聚合与事务级批量变更
+public class RecordEntityQuery<T> {
+    public RecordTable table;
+    public RecordBinding<T> binding;
+    public RecordQuery query;
+
+    public RecordEntityQuery(RecordTable table, RecordBinding<T> binding) {
+        this.table = table;
+        this.binding = binding;
+        this.query = new RecordQuery(table);
+    }
+
+    public string ExtractCol(ExprNode expr) {
+        if (expr == null) { return ""; }
+        if (expr.Kind == 0) { // Member
+            return this.binding.FindColName(expr.Name);
+        }
+        if (expr.Kind == 4 && expr.A != null) { // Lambda
+            return this.ExtractCol(expr.A);
+        }
+        return "";
+    }
+
+    // 递归把表达式树中的成员字段名映射替换为物理表的列名
+    public void BindTreeCols(ExprNode n) {
+        if (n == null) { return; }
+        if (n.Kind == 0) { // Member
+            n.Name = this.binding.FindColName(n.Name);
+            return;
+        }
+        this.BindTreeCols(n.A);
+        this.BindTreeCols(n.B);
+    }
+
+    // 过滤条件构造器（编译期 ExprNode 语法树下推）
+    public RecordEntityQuery<T> Where(ExprNode predicate) {
+        if (predicate != null) {
+            this.BindTreeCols(predicate);
+            this.query.Where(predicate);
+        }
+        return this;
+    }
+
+    public RecordEntityQuery<T> Where(Expr<T> expr) {
+        if (expr != null && expr.Root != null) {
+            return this.Where(expr.Root);
+        }
+        return this;
+    }
+
+    public RecordEntityQuery<T> WhereIf(bool condition, ExprNode predicate) {
+        if (condition && predicate != null) {
+            return this.Where(predicate);
+        }
+        return this;
+    }
+
+    public RecordEntityQuery<T> WhereIf(bool condition, Expr<T> expr) {
+        if (condition && expr != null) {
+            return this.Where(expr);
+        }
+        return this;
+    }
+
+    // 升序排序
+    public RecordEntityQuery<T> OrderBy(string col) {
+        this.query.OrderBy(this.binding.FindColName(col));
+        return this;
+    }
+
+    public RecordEntityQuery<T> OrderBy(ExprNode expr) {
+        string col = this.ExtractCol(expr);
+        if (col.Length > 0) { this.query.OrderBy(col); }
+        return this;
+    }
+
+    public RecordEntityQuery<T> OrderBy(Expr<T> expr) {
+        if (expr != null) { return this.OrderBy(expr.Root); }
+        return this;
+    }
+
+    // 降序排序
+    public RecordEntityQuery<T> OrderByDescending(string col) {
+        this.query.OrderByDescending(this.binding.FindColName(col));
+        return this;
+    }
+
+    public RecordEntityQuery<T> OrderByDescending(ExprNode expr) {
+        string col = this.ExtractCol(expr);
+        if (col.Length > 0) { this.query.OrderByDescending(col); }
+        return this;
+    }
+
+    public RecordEntityQuery<T> OrderByDescending(Expr<T> expr) {
+        if (expr != null) { return this.OrderByDescending(expr.Root); }
+        return this;
+    }
+
+    // 跳过指定条数
+    public RecordEntityQuery<T> Skip(int n) {
+        this.query.Skip(n);
+        return this;
+    }
+
+    // 截取指定条数
+    public RecordEntityQuery<T> Take(int n) {
+        this.query.Take(n);
+        return this;
+    }
+
+    // 分页便捷封装（page 从 1 开始，pageSize > 0）
+    public RecordEntityQuery<T> Page(int page, int pageSize) {
+        int p = page > 1 ? page : 1;
+        int sz = pageSize > 0 ? pageSize : 10;
+        this.Skip((p - 1) * sz);
+        this.Take(sz);
+        return this;
+    }
+
+    // 纯索引快速计数：无磁盘 I/O，无对象装箱
+    public int Count() {
+        return this.query.Count();
+    }
+
+    // 是否存在匹配记录
+    public bool Any() {
+        return this.Count() > 0;
+    }
+
+    // 读取首条匹配记录
+    public T FirstOrDefault() {
+        this.Take(1);
+        List<T> list = this.ToList();
+        return list.Count > 0 ? list[0] : null;
+    }
+
+    public T First() {
+        T item = this.FirstOrDefault();
+        if (item == null) {
+            throw new InvalidOperationException("Sequence contains no matching element");
+        }
+        return item;
+    }
+
+    // 执行两段式延迟分页查询，返回强类型实体列表
+    public List<T> ToList() {
+        List<RecordRow> rows = this.query.ToList();
+        List<T> results = new List<T>();
+        if (rows == null) { return results; }
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            T entity = this.binding.ToEntity(rows[i]);
+            if (entity != null) {
+                results.Add(entity);
+            }
+        }
+        return results;
+    }
+
+    // ----------------------------------------------------
+    // 流式标量聚合算子（零实体装箱、零全量行反序列化）
+    // ----------------------------------------------------
+    public int SumInt(string col) {
+        return this.query.SumInt(this.binding.FindColName(col));
+    }
+
+    public int SumInt(ExprNode expr) {
+        return this.SumInt(this.ExtractCol(expr));
+    }
+
+    public long SumLong(string col) {
+        return this.query.SumLong(this.binding.FindColName(col));
+    }
+
+    public long SumLong(ExprNode expr) {
+        return this.SumLong(this.ExtractCol(expr));
+    }
+
+    public double SumDouble(string col) {
+        return this.query.SumDouble(this.binding.FindColName(col));
+    }
+
+    public double SumDouble(ExprNode expr) {
+        return this.SumDouble(this.ExtractCol(expr));
+    }
+
+    public double Avg(string col) {
+        return this.query.Avg(this.binding.FindColName(col));
+    }
+
+    public double Avg(ExprNode expr) {
+        return this.Avg(this.ExtractCol(expr));
+    }
+
+    public double Min(string col) {
+        return this.query.Min(this.binding.FindColName(col));
+    }
+
+    public double Min(ExprNode expr) {
+        return this.Min(this.ExtractCol(expr));
+    }
+
+    public double Max(string col) {
+        return this.query.Max(this.binding.FindColName(col));
+    }
+
+    public double Max(ExprNode expr) {
+        return this.Max(this.ExtractCol(expr));
+    }
+
+    // ----------------------------------------------------
+    // 事务级条件批量变更与删除
+    // ----------------------------------------------------
+    public int Delete() {
+        return this.query.Delete();
+    }
+
+    public int Update(EntityUpdater<T> updater) {
+        if (updater == null) { return 0; }
+        RecordBinding<T> b = this.binding;
+        return this.query.Update((RecordRow r) => {
+            T entity = b.ToEntity(r);
+            updater(entity);
+            b.SyncToRow(entity, r);
+        });
+    }
+}

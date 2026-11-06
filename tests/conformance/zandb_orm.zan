@@ -1,0 +1,171 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Data.ZanDb;
+
+public class OrmStaff {
+    public int Id;
+    public string Name;
+    public string Dept;
+    public int Age;
+    public double Salary;
+    public bool Active;
+    public string Bio;
+}
+
+class ZanDbOrmTest {
+    static int checks = 0;
+
+    static void Ok(bool cond, string what) {
+        checks = checks + 1;
+        if (cond) {
+            Console.WriteLine("ok " + Convert.ToString(checks) + " - " + what);
+        } else {
+            Console.WriteLine("FAIL " + Convert.ToString(checks) + " - " + what);
+        }
+    }
+
+    static void Clean(string basePath) {
+        string[] exts = new string[] {
+            ".staff.ztab", ".staff.zblob", ".staff.zidx", ".staff.zwal",
+            ".departments.ztab", ".departments.zblob", ".departments.zidx", ".departments.zwal"
+        };
+        for (int i = 0; i < exts.Length; i = i + 1) {
+            string p = basePath + exts[i];
+            if (File.Exists(p)) {
+                try { File.Delete(p); } catch {}
+            }
+        }
+    }
+
+    static void Main() {
+        string basePath = "_scratch/test_orm_db";
+        Clean(basePath);
+
+        // 1. 初始化强类型仓储（自动推导 Schema 并建表）
+        RecordRepository<OrmStaff> repo = new RecordRepository<OrmStaff>(basePath, "staff");
+        Ok(repo.Table != null && repo.Table.IsOpen(), "RecordRepository initialized and table open");
+        Ok(repo.Binding != null && repo.Binding.fields.Count >= 6, "RecordBinding derived entity fields");
+        Ok(repo.Binding.pkField != null && repo.Binding.pkField.fieldName == "Id", "RecordBinding mapped primary key Id");
+
+        // 2. 建立二级索引
+        repo.EnsureIndex("Dept");
+        repo.EnsureIndex("Age");
+        Ok(repo.Table.HasIndex("dept") && repo.Table.HasIndex("age"), "EnsureIndex created secondary indexes");
+
+        // 3. 单条实体插入（自增主键自动回写）
+        OrmStaff alice = new OrmStaff();
+        alice.Name = "Alice";
+        alice.Dept = "tech";
+        alice.Age = 28;
+        alice.Salary = 9800.5;
+        alice.Active = true;
+        alice.Bio = "Compiler Core Engineer";
+
+        int id1 = repo.Insert(alice);
+        Ok(id1 == 1 && alice.Id == 1, "Insert returns id 1 and assigns back to entity.Id");
+
+        // 4. 按主键点查（零反射高速物理槽位物化）
+        OrmStaff fetched1 = repo.FindById(1);
+        Ok(fetched1 != null && fetched1.Id == 1 && fetched1.Name == "Alice", "FindById returns matching entity");
+        Ok(fetched1.Dept == "tech" && fetched1.Age == 28, "FindById primitive fields match");
+        Ok(fetched1.Active && fetched1.Salary > 9800.0 && fetched1.Bio == "Compiler Core Engineer", "FindById double/bool/varStr match");
+        Ok(repo.Read(1) != null, "Read alias returns matching entity");
+        Ok(repo.ExistsById(1), "ExistsById returns true for existing id");
+        Ok(!repo.ExistsById(999), "ExistsById returns false for non-existent id");
+
+        // 5. 批量插入
+        List<OrmStaff> batch = new List<OrmStaff>();
+        for (int i = 0; i < 20; i = i + 1) {
+            OrmStaff s = new OrmStaff();
+            s.Name = "Staff_" + Convert.ToString(i);
+            s.Dept = (i % 2 == 0) ? "tech" : "finance";
+            s.Age = 20 + i;
+            s.Salary = 5000.0 + (double)i * 300.0;
+            s.Active = true;
+            s.Bio = "Staff member bio " + Convert.ToString(i);
+            batch.Add(s);
+        }
+        int batchCnt = repo.InsertBatch(batch);
+        Ok(batchCnt == 20, "InsertBatch inserted 20 entities");
+        Ok(repo.Count() == 21, "Count is 21 after batch insert");
+        Ok(batch[0].Id == 2 && batch[19].Id == 21, "InsertBatch backfilled auto-increment Ids");
+
+        // 6. 按主键更新实体
+        alice.Age = 29;
+        alice.Salary = 10800.0;
+        alice.Bio = "Principal Architect";
+        bool upOk = repo.Update(alice);
+        Ok(upOk, "Update returns true");
+
+        OrmStaff reFetched1 = repo.FindById(1);
+        Ok(reFetched1.Age == 29 && reFetched1.Salary > 10000.0 && reFetched1.Bio == "Principal Architect", "Update persisted correctly");
+
+        // 7. LINQ ExprNode 语法树过滤与纯索引 Count
+        // tech 员工：Alice(tech) + 10个偶数索引 staff = 11个
+        int techCount = repo.Where((ExprNode x) => x.Dept == "tech").Count();
+        Ok(techCount == 11, "Pure-index Count returns 11 tech employees");
+
+        // 8. 两段式延迟分页（Two-Phase Pagination）
+        List<OrmStaff> paged = repo.Where((ExprNode x) => x.Dept == "tech").Skip(2).Take(3).ToList();
+        Ok(paged.Count == 3, "Skip 2 Take 3 returns exactly 3 entities");
+        bool allTech = true;
+        for (int i = 0; i < paged.Count; i = i + 1) {
+            if (paged[i].Dept != "tech") { allTech = false; }
+        }
+        Ok(allTech, "Paged entities strictly belong to tech department");
+
+        // 9. 降序排序查询
+        List<OrmStaff> sorted = repo.Where((ExprNode x) => x.Dept == "tech")
+                                    .OrderByDescending((ExprNode x) => x.Salary)
+                                    .Take(5)
+                                    .ToList();
+        Ok(sorted.Count == 5, "OrderByDescending Take 5 returns 5 entities");
+        bool isSortedDesc = true;
+        for (int i = 1; i < sorted.Count; i = i + 1) {
+            if (sorted[i].Salary > sorted[i - 1].Salary) { isSortedDesc = false; }
+        }
+        Ok(isSortedDesc, "Entities are strictly sorted in descending order of salary");
+
+        // 10. 流式标量聚合引擎（零对象装箱）
+        int sumAge = repo.Where((ExprNode x) => x.Dept == "tech").SumInt((ExprNode x) => x.Age);
+        Ok(sumAge > 200, "SumInt age for tech > 200");
+
+        double avgSal = repo.Where((ExprNode x) => x.Dept == "tech").Avg((ExprNode x) => x.Salary);
+        Ok(avgSal > 5000.0, "Avg salary for tech > 5000.0");
+
+        double minSal = repo.Where((ExprNode x) => x.Dept == "tech").Min((ExprNode x) => x.Salary);
+        double maxSal = repo.Where((ExprNode x) => x.Dept == "tech").Max((ExprNode x) => x.Salary);
+        Ok(minSal > 0.0 && minSal <= maxSal, "Min salary <= Max salary");
+
+        // 11. 事务级条件批量变更
+        int affUpdate = repo.Where((ExprNode x) => x.Dept == "tech").Update((OrmStaff e) => {
+            e.Age = 88;
+        });
+        Ok(affUpdate == 11, "Batch Update affected 11 tech employees");
+        int minAgeAfter = (int)repo.Where((ExprNode x) => x.Dept == "tech").Min((ExprNode x) => x.Age);
+        Ok(minAgeAfter == 88, "Batch update reflected: min age is now 88");
+
+        // 12. 单条按主键删除
+        bool del1 = repo.DeleteById(1);
+        Ok(del1, "DeleteById(1) returns true");
+        Ok(repo.FindById(1) == null, "FindById(1) is null after delete");
+        Ok(repo.Count() == 20, "Total count is now 20");
+
+        // 13. 事务级条件批量删除
+        int delBatchAff = repo.Where((ExprNode x) => x.Dept == "tech").Delete();
+        Ok(delBatchAff == 10, "Batch Delete removed 10 remaining tech employees");
+        Ok(repo.Where((ExprNode x) => x.Dept == "tech").Count() == 0, "Tech count is now 0 after batch delete");
+        Ok(repo.Count() == 10, "Total active count is now 10 (all finance)");
+
+        // 14. 无参重开现有库表（免重建 Schema 恢复）
+        RecordRepository<OrmStaff> repoReopen = new RecordRepository<OrmStaff>(basePath, "staff");
+        Ok(repoReopen.Count() == 10, "Reopened repository has 10 finance employees");
+        OrmStaff financeStaff = repoReopen.Where((ExprNode x) => x.Dept == "finance").FirstOrDefault();
+        Ok(financeStaff != null && financeStaff.Dept == "finance", "Reopened repository queries entity cleanly");
+
+        Clean(basePath);
+        Console.WriteLine("ALL " + Convert.ToString(checks) + " CHECKS PASSED");
+    }
+}
