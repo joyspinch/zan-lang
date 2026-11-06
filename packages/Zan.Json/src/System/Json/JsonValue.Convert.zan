@@ -1,0 +1,598 @@
+using System;
+using System.Text;
+
+namespace System.Json;
+
+// JsonValue.Convert.zan - JsonValue 紧凑/排版序列化 (ToJson/PrettyToJson)、标量类型转换与解析入口 (FromDoc/Parse)
+public partial class JsonValue {
+    // ---- 带默认值的标量读取器 -----------------------------------------
+
+    // 将该值序列化为紧凑 JSON 字符串。字符串和
+    // 对象 key 经 Encoding.JsonEscape 转义；数字按 token 形态
+    // 输出（整数走整型格式化，浮点走最短 double 格式化）。
+    // 是 Parse 对值模型的逆操作。嵌套超过 JsonValue.MaxDepth
+    // 层时抛出 JsonException——WriteTo 是递归的，无界深度的树
+    // 会耗尽调用栈直接段错误（与 Parse 的 MaxDepth 对称）。
+    public string ToJson() {
+        StringBuilder sb = new StringBuilder();
+        this.WriteTo(sb);
+        return sb.ToString();
+    }
+
+    // WriteToAt 的入口（depth 从 0 起）。
+    public void WriteTo(StringBuilder sb) {
+        this.WriteToAt(sb, 0);
+    }
+
+    // WriteTo 的递归实现：`depth` 用于 MaxDepth 保护。
+    public void WriteToAt(StringBuilder sb, int depth) {
+        if (depth > JsonValue.MaxDepth) {
+            throw new JsonException("JSON nesting too deep to serialize");
+        }
+        if (kind == 0) { sb.Append("null"); return; }
+        if (kind == 1) {
+            if (boolVal) { sb.Append("true"); } else { sb.Append("false"); }
+            return;
+        }
+        if (kind == 2) {
+            if (this.numRaw != null && this.numRaw.Length > 0) {
+                sb.Append(this.numRaw);
+            } else if (this.numIsInt) {
+                sb.Append(this.numI);
+            } else {
+                double d = this.numD;
+                if (d != d || d - d != 0) { sb.Append("null"); }
+                else { sb.Append(this.numD); }
+            }
+            return;
+        }
+        if (kind == 3) {
+            sb.Append("\"");
+            Encoding.JsonEscapeTo(sb, strVal);
+            sb.Append("\"");
+            return;
+        }
+        if (kind == 4) {
+            sb.Append("[");
+            if (this.numArr != null) {
+                // 元素按 NewDouble 的 numD 分支渲染（NaN/±Inf → null）。
+                for (int i = 0; i < this.numArr.Length; i = i + 1) {
+                    if (i > 0) { sb.Append(","); }
+                    double d = this.numArr[i];
+                    if (d != d || d - d != 0) { sb.Append("null"); }
+                    else { sb.Append(d); }
+                }
+                sb.Append("]");
+                return;
+            }
+            for (int i = 0; i < items.Count; i = i + 1) {
+                if (i > 0) { sb.Append(","); }
+                items[i].WriteToAt(sb, depth + 1);
+            }
+            sb.Append("]");
+            return;
+        }
+        if (kind == 5) {
+            sb.Append("{");
+            for (int i = 0; i < keys.Count; i = i + 1) {
+                if (i > 0) { sb.Append(","); }
+                sb.Append("\"");
+                string k = keys[i];
+                if (JsonValue.IsSafeAsciiKey(k)) {
+                    sb.Append(k);
+                } else {
+                    Encoding.JsonEscapeTo(sb, k);
+                }
+                sb.Append("\":");
+                vals[i].WriteToAt(sb, depth + 1);
+            }
+            sb.Append("}");
+            return;
+        }
+    }
+
+    // 判断键名是否为纯普通 ASCII 字符（无引号、反斜杠、控制字符及高位字节），
+    // 满足条件时可直接写入 StringBuilder，避开复杂的转义扫描。
+    public static bool IsSafeAsciiKey(string s) {
+        if (s == null) { return false; }
+        int len = s.Length;
+        if (len == 0) { return true; }
+        for (int i = 0; i < len; i = i + 1) {
+            int c = s[i] & 255;
+            // 允许常见无转义字符：字母、数字、下划线、短横线、点、冒号 (33..126 中排除 " 34 和 \ 92)
+            if (c <= 32 || c >= 127 || c == 34 || c == 92) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    // 数字的输出文本：解析时就地解析的整数/浮点走格式化，
+    // NewNum 手工构造的值保留原始字面量。NaN/±Infinity 不是合法
+    // JSON 数字，统一输出 null。
+    public static string NumText(JsonValue v) {
+        if (v.numRaw != null && v.numRaw.Length > 0) { return v.numRaw; }
+        if (v.numIsInt) { return Convert.ToString(v.numI); }
+        double d = v.numD;
+        if (d != d || d - d != 0) { return "null"; }
+        return Convert.ToString(v.numD);
+    }
+
+    // 序列化为便于阅读的多行 JSON 字符串（两空格
+    // 缩进，每个 key 一行），用于手工编辑的交换文件或配置。
+    // 与 ToJson 一样可通过 Parse 往返。
+    // 嵌套超限时与 ToJson 一样抛 JsonException。
+    public string PrettyToJson() {
+        StringBuilder sb = new StringBuilder();
+        this.WritePretty(sb, 0);
+        return sb.ToString();
+    }
+
+    // PrettyToJson 的递归实现；嵌套超限时抛 JsonException。
+    public void WritePretty(StringBuilder sb, int depth) {
+        if (depth > JsonValue.MaxDepth) {
+            throw new JsonException("JSON nesting too deep to serialize");
+        }
+        if (kind == 5) {
+            if (keys.Count == 0) { sb.Append("{}"); return; }
+            sb.Append("{\n");
+            for (int i = 0; i < keys.Count; i = i + 1) {
+                sb.Append(JsonValue.PrettyIndent(depth + 1));
+                sb.Append("\"");
+                string k = keys[i];
+                if (JsonValue.IsSafeAsciiKey(k)) {
+                    sb.Append(k);
+                } else {
+                    Encoding.JsonEscapeTo(sb, k);
+                }
+                sb.Append("\": ");
+                vals[i].WritePretty(sb, depth + 1);
+                if (i < keys.Count - 1) { sb.Append(","); }
+                sb.Append("\n");
+            }
+            sb.Append(JsonValue.PrettyIndent(depth));
+            sb.Append("}");
+            return;
+        }
+        if (kind == 4) {
+            if (this.numArr != null) {
+                // 元素渲染同 WriteToAt 的 numArr 分支（numD 分支）。
+                if (this.numArr.Length == 0) { sb.Append("[]"); return; }
+                sb.Append("[\n");
+                for (int i = 0; i < this.numArr.Length; i = i + 1) {
+                    sb.Append(JsonValue.PrettyIndent(depth + 1));
+                    double d = this.numArr[i];
+                    if (d != d || d - d != 0) { sb.Append("null"); }
+                    else { sb.Append(d); }
+                    if (i < this.numArr.Length - 1) { sb.Append(","); }
+                    sb.Append("\n");
+                }
+                sb.Append(JsonValue.PrettyIndent(depth));
+                sb.Append("]");
+                return;
+            }
+            if (items.Count == 0) { sb.Append("[]"); return; }
+            sb.Append("[\n");
+            for (int i = 0; i < items.Count; i = i + 1) {
+                sb.Append(JsonValue.PrettyIndent(depth + 1));
+                items[i].WritePretty(sb, depth + 1);
+                if (i < items.Count - 1) { sb.Append(","); }
+                sb.Append("\n");
+            }
+            sb.Append(JsonValue.PrettyIndent(depth));
+            sb.Append("]");
+            return;
+        }
+        this.WriteTo(sb);
+    }
+
+    // 生成 depth 层两空格缩进串。
+    public static string PrettyIndent(int depth) {
+        string s = "";
+        for (int i = 0; i < depth; i = i + 1) { s = s + "  "; }
+        return s;
+    }
+
+    // 十进制数字字符的值，非数字返回 -1。
+    public static int Digit(string ch) {
+        if (ch == null || ch.Length == 0) { return -1; }
+        int d = (ch[0] & 255) - 48;
+        if (d >= 0 && d <= 9) { return d; }
+        return -1;
+    }
+
+    // 解析数字 token 的前导（可选符号）整数部分，
+    // 在 '.'/'e' 处停止。避免 "60.0"/"1e3" 触发 Convert 异常。
+    public static int IntOf(string t) {
+        int n = t.Length;
+        int i = 0;
+        bool neg = false;
+        if (n > 0 && (t[0] & 255) == 45) { neg = true; i = 1; }
+        int acc = 0;
+        while (i < n) {
+            int d = (t[i] & 255) - 48;
+            if (d < 0 || d > 9) { break; }
+            acc = acc * 10 + d;
+            i = i + 1;
+        }
+        if (neg) { return 0 - acc; }
+        return acc;
+    }
+
+    // 与 IntOf 类似，但按 64 位累加，使 `long`/`ulong` 字段能保存
+    // 超出 32 位范围的值。
+    public static long LongOf(string t) {
+        int n = t.Length;
+        int i = 0;
+        bool neg = false;
+        if (n > 0 && (t[0] & 255) == 45) { neg = true; i = 1; }
+        long acc = 0;
+        while (i < n) {
+            int d = (t[i] & 255) - 48;
+            if (d < 0 || d > 9) { break; }
+            acc = acc * 10 + (long)d;
+            i = i + 1;
+        }
+        if (neg) { return 0 - acc; }
+        return acc;
+    }
+
+    // 无需 Convert 解析数字 token（符号、小数、指数），
+    // 避免异常；非数字前缀时返回 0.0。
+    // 10 的幂表：10^0..10^22 全部可被 double 精确表示（5^22 < 2^53），
+    // 一次乘/除只引入一次舍入。更大的指数按 22 一档链式应用。
+    public static double[] Pow10Tab = new double[] {
+        1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10, 1e11,
+        1e12, 1e13, 1e14, 1e15, 1e16, 1e17, 1e18, 1e19, 1e20, 1e21, 1e22
+    };
+
+    // 把十进制文本转成 double：有效数字吸进 long（上限 2^53 内保持
+    // 精确，超出部分按首个被丢数字四舍五入），再以精确的 10 的幂表
+    // 一次性缩放，保证 ≤16 位有效数字与适中指数下的精确舍入。
+    public static double DoubleOf(string t) {
+        int n = t.Length;
+        int i = 0;
+        bool neg = false;
+        if (n > 0 && (t[0] & 255) == 45) { neg = true; i = 1; }
+        else if (n > 0 && (t[0] & 255) == 43) { i = 1; }
+        long mant = 0;
+        int exp10 = 0;
+        bool roundUp = false;
+        bool seenDigit = false;
+        while (i < n) {
+            int d = (t[i] & 255) - 48;
+            if (d < 0 || d > 9) { break; }
+            seenDigit = true;
+            if (mant < 100000000000000000) {
+                mant = mant * 10 + d;
+            } else {
+                if (!roundUp && d >= 5) { roundUp = true; }
+                exp10 = exp10 + 1;
+            }
+            i = i + 1;
+        }
+        if (i < n && (t[i] & 255) == 46) {
+            i = i + 1;
+            while (i < n) {
+                int d = (t[i] & 255) - 48;
+                if (d < 0 || d > 9) { break; }
+                seenDigit = true;
+                if (mant < 100000000000000000) {
+                    mant = mant * 10 + d;
+                    exp10 = exp10 - 1;
+                } else {
+                    if (!roundUp && d >= 5) { roundUp = true; }
+                }
+                i = i + 1;
+            }
+        }
+        if (!seenDigit) { return 0.0; }
+        if (i < n && ((t[i] & 255) == 101 || (t[i] & 255) == 69)) {
+            i = i + 1;
+            bool eneg = false;
+            if (i < n && (t[i] & 255) == 45) { eneg = true; i = i + 1; }
+            else if (i < n && (t[i] & 255) == 43) { i = i + 1; }
+            int ex = 0;
+            while (i < n) {
+                int d = (t[i] & 255) - 48;
+                if (d < 0 || d > 9) { break; }
+                if (ex < 100000000) { ex = ex * 10 + d; }
+                i = i + 1;
+            }
+            if (eneg) { exp10 = exp10 - ex; } else { exp10 = exp10 + ex; }
+        }
+        if (roundUp) { mant = mant + 1; }
+        double v = mant;
+        int e = exp10;
+        if (e > 350) { e = 350; }
+        else if (e < -350) { e = -350; }
+        while (e > 22) { v = v * 1e22; e = e - 22; }
+        while (e < -22) { v = v / 1e22; e = e + 22; }
+        if (e >= 0) {
+            v = v * JsonValue.Pow10Tab[e];
+        } else {
+            v = v / JsonValue.Pow10Tab[0 - e];
+        }
+        if (neg) {
+            if (v == 0.0) { return -0.0; }
+            return 0.0 - v;
+        }
+        return v;
+    }
+
+    // AsString：字符串原样返回；数字输出 NumText 同源文本；布尔返回
+    // "true"/"false"；其他类型退回 `dflt`。
+    public string AsString(string dflt) {
+        if (kind == 3) { return strVal; }
+        if (kind == 2) { return JsonValue.NumText(this); }
+        if (kind == 1) { if (boolVal) { return "true"; } return "false"; }
+        return dflt;
+    }
+
+    // AsInt：数字按 token 形态取（纯整数免解析）；布尔 1/0；
+    // 字符串解析整数前缀；其余退回 `dflt`。
+    public int AsInt(int dflt) {
+        if (kind == 2) {
+            if (numRaw != null && numRaw.Length > 0) { return JsonValue.IntOf(numRaw); }
+            if (numIsInt) { return (int)numI; }
+            return (int)numD;
+        }
+        if (kind == 1) { if (boolVal) { return 1; } return 0; }
+        if (kind == 3) { return JsonValue.IntOf(strVal); }
+        return dflt;
+    }
+
+    // AsLong：同 AsInt 但按 64 位。
+    public long AsLong(long dflt) {
+        if (kind == 2) {
+            if (numRaw != null && numRaw.Length > 0) { return JsonValue.LongOf(numRaw); }
+            if (numIsInt) { return numI; }
+            return (long)numD;
+        }
+        if (kind == 1) { if (boolVal) { return 1; } return 0; }
+        if (kind == 3) { return JsonValue.LongOf(strVal); }
+        return dflt;
+    }
+
+    // AsDouble：数字按 token 形态取；布尔 1/0；字符串解析；
+    // 其余退回 `dflt`。
+    public double AsDouble(double dflt) {
+        if (kind == 2) {
+            if (numRaw != null && numRaw.Length > 0) { return JsonValue.DoubleOf(numRaw); }
+            if (numIsInt) { return (double)numI; }
+            return numD;
+        }
+        if (kind == 1) { if (boolVal) { return 1.0; } return 0.0; }
+        if (kind == 3) { return JsonValue.DoubleOf(strVal); }
+        return dflt;
+    }
+
+    // AsBool：布尔原样；数字按非 0 为真；字符串仅 "true" 为真；
+    // 其余退回 `dflt`。
+    public bool AsBool(bool dflt) {
+        if (kind == 1) { return boolVal; }
+        if (kind == 2) { return this.AsLong(0) != 0; }
+        if (kind == 3) { return strVal == "true"; }
+        return dflt;
+    }
+
+    // ---- 类型化字段助手（对象 + key） -----------------------------------
+
+    // `key` 的字符串值，缺失或类型不符时退回 `dflt`。
+    public string Str(string key, string dflt) {
+        JsonValue v = Get(key);
+        if (v == null) { return dflt; }
+        return v.AsString(dflt);
+    }
+
+    // `key` 的整数值，缺失或类型不符时退回 `dflt`。
+    public int Int(string key, int dflt) {
+        JsonValue v = Get(key);
+        if (v == null) { return dflt; }
+        return v.AsInt(dflt);
+    }
+
+    // 点分路径的类型化读取：路径上任何一段缺失（PathGet 返回 null）都
+    // 退回 `dflt`，而不是让调用方对 null 调 AsString/AsInt 而崩溃。
+    public string PathStr(string path, string dflt) {
+        JsonValue v = PathGet(path);
+        if (v == null) { return dflt; }
+        return v.AsString(dflt);
+    }
+
+    // 同 PathStr，整数版。
+    public int PathInt(string path, int dflt) {
+        JsonValue v = PathGet(path);
+        if (v == null) { return dflt; }
+        return v.AsInt(dflt);
+    }
+
+    // `key` 的 64 位整数值，缺失或类型不符时退回 `dflt`。
+    public long Long(string key, long dflt) {
+        JsonValue v = Get(key);
+        if (v == null) { return dflt; }
+        return v.AsLong(dflt);
+    }
+
+    // `key` 的布尔值，缺失或类型不符时退回 `dflt`。
+    public bool Bool(string key, bool dflt) {
+        JsonValue v = Get(key);
+        if (v == null) { return dflt; }
+        return v.AsBool(dflt);
+    }
+
+    // `key` 的浮点值，缺失或解析不出时退回 `dflt`。
+    public double Double(string key, double dflt) {
+        JsonValue v = Get(key);
+        if (v == null) { return dflt; }
+        return v.AsDouble(dflt);
+    }
+
+    // 就地解析 [from, to) 的 JSON 数字 token：无 . e 且能安全装进
+    // long 的走整数快路径，否则走浮点。
+    public static JsonValue ParseNumberToken(string t, int from, int to) {
+        int i = from;
+        bool neg = false;
+        // 负号后要从**符号之后**继续（i = i + 1），写死成 1 会在
+        // from > 0 时（数字不在文档开头）从错误的位置读数字位：
+        // {"x":-7} 会读成 0、[1,-2] 会读成 -1。
+        if (i < to && (t[i] & 255) == 45) { neg = true; i = i + 1; }
+        bool hasDotExp = false;
+        for (int k = i; k < to; k = k + 1) {
+            int c = (t[k] & 255);
+            if (c == 46 || c == 101 || c == 69) { hasDotExp = true; break; }
+        }
+        if (!hasDotExp && to - i <= 18) {
+            long acc = 0;
+            for (int k = i; k < to; k = k + 1) {
+                int d = (t[k] & 255) - 48;
+                if (d < 0 || d > 9) { break; }
+                acc = acc * 10 + d;
+            }
+            if (neg) { acc = 0 - acc; }
+            return JsonValue.NewInt(acc);
+        }
+        // 走 double 的只有 . / e 形态与 >18 位整数：这两类用格式化文本
+        // 还原会丢精度（1e2 → "100"、20 位整数 → "1.23E19"），把已经切出来
+        // 的 token 文本留下当 numRaw，AsString/ToJson 才是无损的。
+        string raw = t.Substring(from, to - from);
+        double d2 = JsonValue.DoubleOf(raw);
+        JsonValue v = JsonValue.NewDouble(d2);
+        v.numRaw = raw;
+        return v;
+    }
+
+    // ---- 解析 -----------------------------------------------------------
+
+    // 从线程局部复用池中快速按原位字节去重键名，避免重复 Substring 产生的堆分配与 ARC 追踪。
+    public static string InternKey(JsonDoc doc, int keyStart, int keyLen) {
+        if (keyStart < 0) {
+            return doc.escPool[keyLen];
+        }
+        if (keyLen == 0) {
+            return "";
+        }
+        JsonScratch sc = JsonDoc.GetScratch();
+        string[] pool = sc.keyPool;
+        if (pool != null && doc.buf != null) {
+            int first = doc.buf[keyStart] & 255;
+            int last = doc.buf[keyStart + keyLen - 1] & 255;
+            int h = (keyLen * 33 + first * 17 + last) & 255;
+            string cached = pool[h];
+            if (cached != null && cached.Length == keyLen) {
+                bool match = true;
+                for (int i = 0; i < keyLen; i = i + 1) {
+                    if ((doc.buf[keyStart + i] & 255) != (cached[i] & 255)) {
+                        match = false;
+                        break;
+                    }
+                }
+                if (match) {
+                    return cached;
+                }
+            }
+            string s = doc.src.Substring(keyStart, keyLen);
+            pool[h] = s;
+            return s;
+        }
+        return doc.src.Substring(keyStart, keyLen);
+    }
+
+    // 将 JsonDoc Tape 节点快速物化为可变的 JsonValue DOM 子树。
+    public static JsonValue FromDoc(JsonDoc doc) {
+        if (doc == null) { return JsonValue.NewNull(); }
+        return JsonValue.FromDoc(doc, doc.root);
+    }
+
+    // 从 JsonDoc 指定槽位快速物化为 JsonValue DOM 节点（预知容量、零重复语法校验）。
+    public static JsonValue FromDoc(JsonDoc doc, int at) {
+        if (doc == null || at < 0 || at >= doc.slotCount) { return JsonValue.NewNull(); }
+        int k = doc.KindAt(at);
+        if (k == 0) { return JsonValue.NewNull(); }
+        if (k == 1) { return JsonValue.NewBool(doc.BoolAt(at, false)); }
+        if (k == 2) {
+            long a = doc.slots[at].a;
+            int rawK = (int)(a & 255);
+            if (rawK == 7) {
+                JsonValue v = JsonValue.NewDouble(doc.DoubleAt(at, 0.0));
+                v.numRaw = doc.StrAt(at, "");
+                return v;
+            }
+            long numVal = doc.LongAt(at, 0L);
+            return JsonValue.NewInt(numVal);
+        }
+        if (k == 3) { return JsonValue.NewStr(doc.StrAt(at, "")); }
+        if (k == 4) {
+            int n = doc.Count(at);
+            if (n == 0) { return JsonValue.NewArray(); }
+            int c = doc.FirstChild(at);
+            // 优化：当数组长度 >= 8 且所有元素均为浮点数值（rawK == 7）时，
+            // 优先自适应物化为 double[] numArr 直存形态，消除海量 JsonValue 节点分配。
+            if (n >= 8 && c >= 0) {
+                bool allDouble = true;
+                int cur = c;
+                for (int i = 0; i < n; i = i + 1) {
+                    if (cur < 0 || cur >= doc.slotCount) { allDouble = false; break; }
+                    long slotA = doc.slots[cur].a;
+                    int rawK = (int)(slotA & 255);
+                    if (rawK != 7) { allDouble = false; break; }
+                    cur = doc.NextSibling(cur);
+                }
+                if (allDouble) {
+                    double[] arrData = new double[n];
+                    cur = c;
+                    for (int i = 0; i < n; i = i + 1) {
+                        arrData[i] = doc.DoubleAt(cur, 0.0);
+                        cur = doc.NextSibling(cur);
+                    }
+                    return JsonValue.NewDoubleArray(arrData);
+                }
+            }
+            JsonValue arr = JsonValue.NewArray();
+            arr.items.Reserve(n);
+            for (int i = 0; i < n; i = i + 1) {
+                arr.items.Add(JsonValue.FromDoc(doc, c));
+                c = doc.NextSibling(c);
+            }
+            return arr;
+        }
+        if (k == 5) {
+            int n = doc.Count(at);
+            JsonValue obj = JsonValue.NewObject();
+            if (n == 0) { return obj; }
+            obj.keys.Reserve(n);
+            obj.vals.Reserve(n);
+            int p = (int)(doc.slots[at].a >> 8);
+            int seen = 0;
+            while (p >= 0 && seen < n) {
+                JsonPair pair = doc.pairs[p];
+                string key = JsonValue.InternKey(doc, pair.keyStart, pair.keyLen);
+                obj.keys.Add(key);
+                obj.vals.Add(JsonValue.FromDoc(doc, pair.valueSlot));
+                p = pair.nextPair;
+                seen = seen + 1;
+            }
+            if (n > 8) {
+                obj.EnsureKeyIndex();
+            }
+            return obj;
+        }
+        return JsonValue.NewNull();
+    }
+
+    // 将 JSON 文档解析为值树。基于 JsonDoc Tape 高速扫描索引一次性物化 DOM 树，
+    // 预知子容器容量且免除二次语法校验。格式错误时抛出 JsonException。
+    public static JsonValue Parse(string src) {
+        if (src == null) { throw new JsonException("JSON source cannot be null"); }
+        JsonDoc doc = JsonDoc.Parse(src);
+        return JsonValue.FromDoc(doc, doc.root);
+    }
+
+    // 尽力而为的解析：输入格式错误时返回已解析的部分
+    // 而不抛异常（用于手工编写/工具生成的 UI 文档，部分
+    // 结果树比异常更合适）。
+    public static JsonValue ParseLenient(string src) {
+        JsonReader r = JsonReader.Of(src);
+        return r.ReadValue();
+    }
+}
