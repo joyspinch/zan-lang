@@ -1,0 +1,539 @@
+using System;
+using System.IO;
+using System.Json;
+using System.Text;
+using System.Threading;
+
+namespace System.Data.ZanDb;
+
+public partial class Collection {
+    // 数值字段投影扫描：每条含 field 的文档以 (id, 数值)
+    // 调用一次 visit，不构建任何 JsonValue（varint 直接还原，
+    // 文本数值才解析）；visit 返回 false 提前结束。返回 visit
+    // 被调用的次数。
+    public int ScanNumField(string field, NumVisit visit) {
+        this.tlock.EnterRead();
+        try {
+        SyncMeta();
+        int kid = KeyIdOf(field);
+        if (kid == 0) { return 0; }
+        string hi = "c:" + this.name + ";";
+        int n = 0;
+        this.kv.ScanRows("c:" + this.name + ":", hi, delegate(ScanRow row) {
+            long v;
+            if (FieldNumRow(row, kid, out v)) {
+                n = n + 1;
+                if (!visit(Collection.IdOfKey(row.Key()), v)) { return false; }
+            }
+            return true;
+        });
+        return n;
+        } finally { this.tlock.ExitRead(); }
+    }
+
+    // 文本字段投影扫描：每条含 field 的文档以 (id, 文本)
+    // 调用一次 visit，只物化该字段的字符串（不建 JsonValue 包装）；
+    // visit 返回 false 提前结束。返回 visit 被调用的次数。
+    public int ScanStrField(string field, StrVisit visit) {
+        this.tlock.EnterRead();
+        try {
+        SyncMeta();
+        int kid = KeyIdOf(field);
+        if (kid == 0) { return 0; }
+        string hi = "c:" + this.name + ";";
+        int n = 0;
+        this.kv.ScanRows("c:" + this.name + ":", hi, delegate(ScanRow row) {
+            string s = FieldTextRow(row, kid);
+            if (s != null) {
+                n = n + 1;
+                if (!visit(Collection.IdOfKey(row.Key()), s)) { return false; }
+            }
+            return true;
+        });
+        return n;
+        } finally { this.tlock.ExitRead(); }
+    }
+
+    // 数值字段的全文求和：单段稳态走块级聚合内核
+    // （免游标/ScanRow 对象，记录裸走读直累加）；记录含转义
+    // （0xFF）或目标字段是文本数值(4)时逐行回退
+    // <see cref="FieldNum"/> 权威走读，语义与之一致——数值型
+    // 标签直接还原累加，非数值型文档跳过。字段不存在或全非
+    // 数值时返回 0。
+    public long SumField(string field) {
+        this.tlock.EnterRead();
+        try {
+        SyncMeta();
+        int kid = KeyIdOf(field);
+        long sum = 0;
+        if (kid == 0) { return 0; }
+        string lo = "c:" + this.name + ":";
+        string hi = "c:" + this.name + ";";
+        // 块级内核路径：每行一次裸走读回调，无对象分配。
+        // 遇到需要权威走读的行（转义/文本数值）置 walk 标记，
+        // 回调无法"继续扫剩下的行"，故记录已计入内核的行数，
+        // 剩余行（含当行）回退 ScanRows——用计数哨兵跳过已聚合行。
+        NumAcc acc = new NumAcc();
+        bool[] walk = new bool[1];
+        long[] skipUntilId = new long[1];
+        skipUntilId[0] = -1;
+        int kernelN = this.kv.TryScanKernel(lo, hi,
+        delegate(nint basePtr, int keyOff, int keyLen, int valOff, int valLen) {
+            int id = Collection.IdOfPtr(basePtr + keyOff, keyLen);
+            if (id <= skipUntilId[0]) { return true; }
+            if (!Collection.RecAccNum(basePtr, valOff, valLen, kid, acc)) {
+                walk[0] = true;
+                skipUntilId[0] = id - 1;
+                return false;
+            }
+            return true;
+        });
+        if (kernelN >= 0 && !walk[0]) {
+            return acc.Sum();
+        }
+        if (kernelN >= 0) {
+            sum = acc.Sum();
+        }
+        // 权威路径：字符串走读（全量回退或内核让出的剩余行）。
+        string fromKey = kernelN >= 0 ? DocKey((int)skipUntilId[0] + 1) : lo;
+        this.kv.ScanRows(fromKey, hi, delegate(ScanRow row) {
+            long v;
+            if (FieldNumRow(row, kid, out v)) { sum = sum + v; }
+            return true;
+        });
+        return sum;
+        } finally { this.tlock.ExitRead(); }
+    }
+
+    // 字段值的分组计数（GROUP BY field 的 COUNT）：
+    // 一遍流式扫描直接在键控结构里聚合，每组只分配一次键字符串。
+    // null/容器/缺字段的文档不计入。索引就绪时零文档读：该索引
+    // 字段的条目键序 = （值, id）序，值相同的条目天然连片——扫
+    // 索引前缀范围、按值切段计数即可。
+    public Dictionary<string, int> CountGroups(string field) {
+        this.tlock.EnterRead();
+        try {
+        return CountGroupsLocked(field);
+        } finally { this.tlock.ExitRead(); }
+    }
+
+    // 刀12：CountGroups 的持锁实现（公开壳持有整库线程读写锁；内部互调走本变体）。
+    public Dictionary<string, int> CountGroupsLocked(string field) {
+        SyncMeta();
+        Dictionary<string, int> groups = new Dictionary<string, int>();
+        int kid = KeyIdOf(field);
+        if (kid == 0) { return groups; }
+        if (IndexReadyLocked(field)) {
+            // 索引条目键 = "i:{coll}:{kid}:{value}\t{id}"；范围扫该
+            // 字段的全部条目，键中 \t 前的部分即组值。单段稳态走
+            // 键只读内核：条目（基址+偏移+长）零拷贝交付，值段
+            // 直接 memcmp 判同组——同组连片，与上一条同组则免物化
+            // 计数，组值只在开新组时物化一次。
+            string head = "i:" + this.name + ":" + Collection.PadId(kid) + ":";
+            string endKey = "i:" + this.name + ":" + Collection.PadId(kid) + ";";
+            int baseLen = head.Length;
+            List<string>[] lastVal = new List<string>[1];  // 上一条目组值（单元素数组绕闭包捕获）
+            int[] lastCount = new int[1];
+            int kernelN = this.kv.TryScanKeyKernel(head, endKey,
+            delegate(nint basePtr, int keyOff, int keyLen) {
+                int vStart = keyOff + baseLen;
+                int vLen = 0;
+                for (int i = vStart; i < keyOff + keyLen; i = i + 1) {
+                    if (Collection.PeekB(basePtr + i) == 9) { vLen = i - vStart; break; }
+                }
+                if (vLen == 0 && keyOff + keyLen == vStart) { vLen = 0; }
+                bool same = false;
+                if (lastVal[0] != null) {
+                    string lv = lastVal[0][0];
+                    if (lv.Length == vLen
+                    && NativeMemory.Compare(basePtr + vStart, lv, vLen) == 0) {
+                        same = true;
+                    }
+                }
+                if (same) {
+                    lastCount[0] = lastCount[0] + 1;
+                    return true;
+                }
+                // 开新组：物化组键（每组一次）。同组连片，上一
+                // 组到此封账。
+                if (lastVal[0] != null) {
+                    groups.Add(lastVal[0][0], lastCount[0]);
+                }
+                string nv = NativeMemory.GetString(basePtr, vStart, vLen);
+                lastVal[0] = new List<string>();
+                lastVal[0].Add(nv);
+                lastCount[0] = 1;
+                return true;
+            });
+            if (kernelN >= 0) {
+                if (lastVal[0] != null) { groups.Add(lastVal[0][0], lastCount[0]); }
+                return groups;
+            }
+            // 多源/未固化态：退 KvEntry 字符串路径。
+            List<KvEntry> entries = new List<KvEntry>();
+            this.kv.ScanRange(head, endKey, 0, entries);
+            for (int i = 0; i < entries.Count; i = i + 1) {
+                string k = entries[i].key;
+                // value 段 = head 之后到 \t 之前；索引值不含 \t。
+                int tab = k.IndexOf("\t", baseLen);  // 键内首个 \t = 值段终点
+                string val = tab > baseLen ? k.Substring(baseLen, tab - baseLen) : "";
+                int c;
+                if (groups.TryGetValue(val, out c)) {
+                    groups.Remove(val);
+                    groups.Add(val, c + 1);
+                } else {
+                    groups.Add(val, 1);
+                }
+            }
+            return groups;
+        }
+        string docHi = "c:" + this.name + ";";
+        this.kv.ScanRows("c:" + this.name + ":", docHi, delegate(ScanRow row) {
+            string s = FieldTextRow(row, kid);
+            if (s != null) {
+                int c;
+                if (groups.TryGetValue(s, out c)) {
+                    groups.Remove(s);
+                    groups.Add(s, c + 1);
+                } else {
+                    groups.Add(s, 1);
+                }
+            }
+            return true;
+        });
+        return groups;
+    }
+
+
+    // 字段值等于 val 的文档数，无需具体化
+    // 任何文档：字符串值零分配比较，全程流式计数。
+    public int CountByField(string field, string val) {
+        this.tlock.EnterRead();
+        try {
+        SyncMeta();
+        int n = 0;
+        if (HasIndexLocked(field) && !this.kv.Contains(IdxPosKey(field))) {
+            // 已就绪的索引仅凭其键即可作答：无需读取任何文档。
+            List<KvEntry> entries = new List<KvEntry>();
+            return this.kv.ScanPrefix(IdxPrefix(field, val), 0, entries);
+        }
+        int kid = KeyIdOf(field);
+        if (kid == 0) {
+            return 0;
+        }
+        bool fastReject = EqFastReject(val);
+        string hi = "c:" + this.name + ";";
+        this.kv.ScanRows("c:" + this.name + ":", hi, delegate(ScanRow row) {
+            if (FieldEqualsRow(row, kid, val, fastReject)) { n = n + 1; }
+            return true;
+        });
+        return n;
+        } finally { this.tlock.ExitRead(); }
+    }
+
+    // 文档总数（命名空间的键范围直数）。上界判定
+    // 与存活判定都在存储层循环内，无回调、大集合不按文档数分配。
+    public int Count() {
+        this.tlock.EnterRead();
+        try {
+        return this.kv.CountRange("c:" + this.name + ":", "c:" + this.name + ";");
+        } finally { this.tlock.ExitRead(); }
+    }
+
+
+    // 按 id 顺序返回所有文档。
+    public List<JsonValue> FindAll() {
+        this.tlock.EnterRead();
+        try {
+        return FindRangeLocked(0, 0, 0);
+        } finally { this.tlock.ExitRead(); }
+    }
+
+    // 满足 fromId <= _id <= toId 的文档（0 表示无界），
+    // limit 0 表示不限数量，按 id 顺序返回。
+    public List<JsonValue> FindRange(int fromId, int toId, int limit) {
+        this.tlock.EnterRead();
+        try {
+        return FindRangeLocked(fromId, toId, limit);
+        } finally { this.tlock.ExitRead(); }
+    }
+
+    // 刀12：FindRange 的持锁实现（公开壳持有整库线程读写锁；内部互调走本变体）。
+    public List<JsonValue> FindRangeLocked(int fromId, int toId, int limit) {
+        SyncMeta();
+        string lo = DocKey(fromId);
+        string hi = "";
+        if (toId > 0) { hi = DocKey(toId); }
+        else { hi = "c:" + this.name + ";"; }  // ';' 的排序紧随 ':' 之后
+        // 流式解码：扫描回调里直接建文档树，不经 KvEntry 中间层；
+        // 上界由存储层判定。
+        List<JsonValue> docs = new List<JsonValue>();
+        this.kv.ScanBetween(lo, hi, delegate(string k, string v) {
+            JsonValue doc = DecodeDoc(v);
+            doc.Set("_id", JsonValue.NewNum(Convert.ToString(Collection.IdOfKey(k))));
+            docs.Add(doc);
+            return limit <= 0 || docs.Count < limit;
+        });
+        return docs;
+    }
+
+    // 投影式扫描：按 id 序遍历集合，每篇含 field 的文档
+    // 以 (id, 值) 调用一次 visit；visit 返回 false 提前结束。
+    // 每条记录只解码这一个字段——值留在块内按偏移解析，不构建
+    // 文档树、不物化文档，单字段聚合/过滤的每文档成本与文档的
+    // 字段数无关。返回 visit 被调用的次数。
+    public int ScanField(string field, FieldVisit visit) {
+        this.tlock.EnterRead();
+        try {
+        SyncMeta();
+        int kid = KeyIdOf(field);
+        if (kid == 0) { return 0; }
+        string hi = "c:" + this.name + ";";
+        int n = 0;
+        this.kv.ScanRows("c:" + this.name + ":", hi, delegate(ScanRow row) {
+            JsonValue f = FieldOfRow(row, kid);
+            if (f != null) {
+                n = n + 1;
+                if (!visit(Collection.IdOfKey(row.Key()), f)) { return false; }
+            }
+            return true;
+        });
+        return n;
+        } finally { this.tlock.ExitRead(); }
+    }
+
+
+    // 数值聚合的公共骨架：单段稳态先走块级内核
+    // （RecAccNum 裸走读，语义同 FieldNum 的数值标签判定），
+    // 内核路径遇到需权威处理的行（转义 0xFF/文本数值/格式
+    // 异常/容器）时以「已聚合到 id-1」为界，剩余行回退
+    // <see cref="ScanRows"/> 字符串路径，sum 与 min/max 在两段
+    // 之间保持一致。返回 false = 内核不可用（多源/未固化数据），
+    // 调用方直接全量走权威路径。
+    public bool NumAggregate(string field, NumAcc acc, out int fromId) {
+        this.tlock.EnterRead();
+        try {
+        return NumAggregateLocked(field, acc, out fromId);
+        } finally { this.tlock.ExitRead(); }
+    }
+
+    // 刀12：NumAggregate 的持锁实现（公开壳持有整库线程读写锁；内部互调走本变体）。
+    public bool NumAggregateLocked(string field, NumAcc acc, out int fromId) {
+        fromId = 0;
+        int kid = KeyIdOf(field);
+        if (kid == 0) { return true; }
+        string lo = "c:" + this.name + ":";
+        string hi = "c:" + this.name + ";";
+        int[] fallbackId = new int[1];
+        fallbackId[0] = -1;
+        bool[] walk = new bool[1];
+        int kernelN = this.kv.TryScanKernel(lo, hi,
+        delegate(nint basePtr, int keyOff, int keyLen, int valOff, int valLen) {
+            int id = Collection.IdOfPtr(basePtr + keyOff, keyLen);
+            if (id <= fallbackId[0]) { return true; }
+            if (!Collection.RecAccNum(basePtr, valOff, valLen, kid, acc)) {
+                walk[0] = true;
+                fallbackId[0] = id;  // 该行起（含）回退权威走读
+                return false;
+            }
+            return true;
+        });
+        if (kernelN < 0) { return false; }
+        fromId = walk[0] ? fallbackId[0] : 0;
+        if (!walk[0]) { return true; }
+        // 内核让出部分行：剩余行走权威路径（有界：本集合段内）。
+        this.kv.ScanRows(DocKey(fromId), hi, delegate(ScanRow row) {
+            long x;
+            if (FieldNumRow(row, kid, out x)) { acc.Add(x); }
+            return true;
+        });
+        return true;
+    }
+
+    // 数值字段的最小值：块级内核直算（带权威回退），
+    // 无 JsonValue；无数值文档时返回 false。out 参数被闭包捕获
+    // 时不回传（捕获的是副本），先累计到局部变量、扫完再写回。
+    public bool MinField(string field, out long v) {
+        this.tlock.EnterRead();
+        try {
+        v = 0;
+        int kid = KeyIdOf(field);
+        if (kid == 0) { return false; }
+        bool has = false;
+        long acc = 0;
+        string hi = "c:" + this.name + ";";
+        NumAcc a = new NumAcc();
+        int fromId;
+        bool ok = NumAggregateLocked(field, a, out fromId);
+        if (ok && a.Count() > 0) {
+            v = a.Min();
+            return true;
+        }
+        // 内核不可用（多源/未固化数据）：全量权威路径。
+        this.kv.ScanRows("c:" + this.name + ":", hi, delegate(ScanRow row) {
+            long x;
+            if (FieldNumRow(row, kid, out x)) {
+                if (!has || x < acc) { acc = x; has = true; }
+            }
+            return true;
+        });
+        if (has) { v = acc; }
+        return has;
+        } finally { this.tlock.ExitRead(); }
+    }
+
+    // 数值字段的最大值：块级内核直算（带权威回退），
+    // 无 JsonValue；无数值文档时返回 false。
+    public bool MaxField(string field, out long v) {
+        this.tlock.EnterRead();
+        try {
+        v = 0;
+        int kid = KeyIdOf(field);
+        if (kid == 0) { return false; }
+        bool has = false;
+        long acc = 0;
+        string hi = "c:" + this.name + ";";
+        NumAcc a = new NumAcc();
+        int fromId;
+        bool ok = NumAggregateLocked(field, a, out fromId);
+        if (ok && a.Count() > 0) {
+            v = a.Max();
+            return true;
+        }
+        this.kv.ScanRows("c:" + this.name + ":", hi, delegate(ScanRow row) {
+            long x;
+            if (FieldNumRow(row, kid, out x)) {
+                if (!has || x > acc) { acc = x; has = true; }
+            }
+            return true;
+        });
+        if (has) { v = acc; }
+        return has;
+        } finally { this.tlock.ExitRead(); }
+    }
+
+    // 数值字段的平均值：一遍流式同时累计和与计数
+    // （块级内核，带权威回退）；无数值文档时返回 0。
+    public double AvgField(string field) {
+        this.tlock.EnterRead();
+        try {
+        int kid = KeyIdOf(field);
+        if (kid == 0) { return 0.0; }
+        NumAcc a = new NumAcc();
+        int fromId;
+        bool ok = NumAggregateLocked(field, a, out fromId);
+        if (ok) {
+            return a.Count() == 0 ? 0.0 : (double)a.Sum() / (double)a.Count();
+        }
+        long sum = 0;
+        long cnt = 0;
+        string hi = "c:" + this.name + ";";
+        this.kv.ScanRows("c:" + this.name + ":", hi, delegate(ScanRow row) {
+            long x;
+            if (FieldNumRow(row, kid, out x)) {
+                sum = sum + x;
+                cnt = cnt + 1;
+            }
+            return true;
+        });
+        if (cnt == 0) { return 0.0; }
+        return (double)sum / (double)cnt;
+        } finally { this.tlock.ExitRead(); }
+    }
+
+    // 数值字段 TopN：按字段值降序的前 n 个文档 id
+    // （等值时 id 小者在前）。容量有界的最小堆流式筛选——堆里
+    // 只驻留 n 项，内存 O(n) 与文档数无关；非数值/缺字段文档
+    // 不参与。n ≤ 0 返回空表。排行榜类负载免全排序。
+    public List<int> FindTopIds(string field, int n) {
+        this.tlock.EnterRead();
+        try {
+        return FindTopIdsLocked(field, n);
+        } finally { this.tlock.ExitRead(); }
+    }
+
+    // 刀12：FindTopIds 的持锁实现（公开壳持有整库线程读写锁；内部互调走本变体）。
+    public List<int> FindTopIdsLocked(string field, int n) {
+        List<int> tops = new List<int>();
+        if (n <= 0) { return tops; }
+        int kid = KeyIdOf(field);
+        if (kid == 0) { return tops; }
+        List<long> heapVal = new List<long>();
+        List<int> heapId = new List<int>();
+        string hi = "c:" + this.name + ";";
+        this.kv.ScanRows("c:" + this.name + ":", hi, delegate(ScanRow row) {
+            long v;
+            if (FieldNumRow(row, kid, out v)) {
+                int id = Collection.IdOfKey(row.Key());
+                if (heapVal.Count < n) {
+                    HeapPush(heapVal, heapId, v, id);
+                } else if (ZanCollectionBetter(v, id, heapVal[0], heapId[0])) {
+                    // 比堆顶（当前第 n 名）更好：换根后下沉。
+                    heapVal[0] = v;
+                    heapId[0] = id;
+                    HeapSiftDown(heapVal, heapId);
+                }
+            }
+            return true;
+        });
+        // 堆内 n 项做选择式输出（n 小，O(n²) 可忽略）：反复取最优。
+        int total = heapVal.Count;
+        for (int out2 = 0; out2 < total; out2 = out2 + 1) {
+            int best = 0;
+            for (int i = 1; i < heapVal.Count; i = i + 1) {
+                if (ZanCollectionBetter(heapVal[i], heapId[i], heapVal[best], heapId[best])) {
+                    best = i;
+                }
+            }
+            tops.Add(heapId[best]);
+            heapVal.RemoveAt(best);
+            heapId.RemoveAt(best);
+        }
+        return tops;
+    }
+
+    // 候选 (va,ia) 是否优于 (vb,ib)：值大者优；等值 id 小者优。
+    public static bool ZanCollectionBetter(long va, int ia, long vb, int ib) {
+        if (va != vb) { return va > vb; }
+        return ia < ib;
+    }
+
+    // 堆不变量：父节点"不优于"子节点（worst-at-top）——根永远是
+    // 当前保留集里第 n 名，替换判定只跟根比较。
+    public static void HeapPush(List<long> hv, List<int> hi, long v, int id) {
+        hv.Add(v);
+        hi.Add(id);
+        int c = hv.Count - 1;
+        while (c > 0) {
+            int p = (c - 1) / 2;
+            // 父优于子 → 违例，差的上浮。
+            if (ZanCollectionBetter(hv[p], hi[p], hv[c], hi[c])) {
+                long tv = hv[c]; hv[c] = hv[p]; hv[p] = tv;
+                int ti = hi[c]; hi[c] = hi[p]; hi[p] = ti;
+                c = p;
+            } else { break; }
+        }
+    }
+
+    public static void HeapSiftDown(List<long> hv, List<int> hi) {
+        int p = 0;
+        while (true) {
+            int l = p * 2 + 1;
+            int r = l + 1;
+            int worst = p;
+            // 找 p 与两子里"最差"的那个；最差者应居上。
+            if (l < hv.Count && !ZanCollectionBetter(hv[l], hi[l], hv[worst], hi[worst])) { worst = l; }
+            if (r < hv.Count && !ZanCollectionBetter(hv[r], hi[r], hv[worst], hi[worst])) { worst = r; }
+            if (worst == p) { break; }
+            long tv = hv[p]; hv[p] = hv[worst]; hv[worst] = tv;
+            int ti = hi[p]; hi[p] = hi[worst]; hi[worst] = ti;
+            p = worst;
+        }
+    }
+
+    // 对集合启动流畅的 LINQ 风格查询。
+    public DocQuery Query() {
+        return DocQuery.Of(this);
+    }
+
+}

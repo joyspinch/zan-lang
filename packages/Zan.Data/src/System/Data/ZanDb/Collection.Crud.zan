@@ -1,0 +1,313 @@
+using System;
+using System.IO;
+using System.Json;
+using System.Text;
+using System.Threading;
+
+namespace System.Data.ZanDb;
+
+public partial class Collection {
+    // 存储新文档，分配并返回其 _id
+    // （同时写入文档中）。
+    public int Insert(JsonValue doc) {
+        this.tlock.EnterWrite();
+        try {
+            return this.InsertLocked(doc);
+        } finally { this.tlock.ExitWrite(); }
+    }
+    // 刀12：Insert 的持锁实现（公开壳持有整库线程读写锁；内部互调走本变体）。
+    public int InsertLocked(JsonValue doc) {
+        SyncMeta();
+        PrepareDoc(doc);
+        this.kv.Begin();
+        try {
+            int id = NextIdLocked();
+            doc.Set("_id", JsonValue.NewNum(Convert.ToString(id)));
+            this.kv.Put(DocKey(id), EncodeDoc(doc));
+            AddIndexEntries(id, doc);
+            this.search.Stage(id, doc);
+            CommitWrite();
+            CachePut(id, doc);
+            return id;
+        } catch {
+            this.kv.Rollback();
+            SyncMeta();
+            throw;
+        }
+    }
+
+    // 在单个原子提交中批量插入（整个批次
+    // 只做一次 WAL 刷新）。返回第一个分配的 id。
+    public int InsertBulk(List<JsonValue> docs) {
+        this.tlock.EnterWrite();
+        try {
+        SyncMeta();
+        for (int i = 0; i < docs.Count; i = i + 1) { PrepareDoc(docs[i]); }
+        this.kv.Begin();
+        try {
+            int first = 0;
+            for (int i = 0; i < docs.Count; i = i + 1) {
+                int id = NextIdLocked();
+                if (first == 0) { first = id; }
+                docs[i].Set("_id", JsonValue.NewNum(Convert.ToString(id)));
+                this.kv.Put(DocKey(id), EncodeDoc(docs[i]));
+                AddIndexEntries(id, docs[i]);
+                this.search.Stage(id, docs[i]);
+            }
+            CommitWriteBulk();
+            for (int i = 0; i < docs.Count; i = i + 1) { CachePut(first + i, docs[i]); }
+            return first;
+        } catch {
+            this.kv.Rollback();
+            SyncMeta();
+            throw;
+        }
+        } finally { this.tlock.ExitWrite(); }
+    }
+
+    // 类型化向量批量直插（刀10）：「名 + float32 向量」两字段行直接
+    // 编码成记录 tape，全程不经 JsonValue。行格式与 EncodeDoc 逐字节
+    // 一致（同字典 id、同转义段），两路插入可位级比对；索引/搜索
+    // 定义在册时喂两字段轻量文档走 Validate/AddIndexEntries/Stage
+    // 常规通道。整批单事务提交（崩溃窗口全有或全无）。
+    // 返回第一个分配的 id。
+    public int InsertVectorBulk(List<string> names, List<float[]> vectors, string nameField, string vecField) {
+        this.tlock.EnterWrite();
+        try {
+        if (names == null || vectors == null || names.Count != vectors.Count) {
+            throw new ArgumentException("InsertVectorBulk: names and vectors must be same non-null length");
+        }
+        int dims = 0;
+        for (int i = 0; i < vectors.Count; i = i + 1) {
+            if (vectors[i] == null) {
+                throw new ArgumentException("InsertVectorBulk: null vector at " + Convert.ToString(i));
+            }
+            if (i == 0) { dims = vectors[0].Length; }
+            else if (vectors[i].Length != dims) {
+                throw new ArgumentException("InsertVectorBulk: vector dimensions differ at " + Convert.ToString(i));
+            }
+            if (dims <= 0) {
+                // 零维直写会出 tag 11 空数组，与装箱路的 tag 6 判据分叉。
+                throw new ArgumentException("InsertVectorBulk: zero-dimension vector");
+            }
+        }
+        SyncMeta();
+        this.kv.Begin();
+        List<JsonValue> cacheDocs = new List<JsonValue>();
+        try {
+            int first = 0;
+            for (int i = 0; i < names.Count; i = i + 1) {
+                int id = NextIdLocked();
+                if (first == 0) { first = id; }
+                ByteBuffer b = ByteBuffer.Alloc(64 + names[i].Length + dims * 4);
+                b.WriteU8(66);  // 'B'
+                b.WriteVarInt(2);
+                b.WriteVarInt(KeyId(nameField));
+                if (names[i].Length == 0) { b.WriteU8(10); }
+                else { b.WriteU8(5); b.WriteString(names[i]); }
+                b.WriteVarInt(KeyId(vecField));
+                b.WriteU8(11);
+                b.WriteVarInt(dims);
+                for (int j = 0; j < dims; j = j + 1) { b.WriteF32(vectors[i][j]); }
+                this.kv.Put(DocKey(id), Collection.EscapeRecord(b));
+                // 轻量文档只服务索引维护、搜索 staging 与缓存。
+                JsonValue doc = JsonValue.NewObject();
+                doc.Set(nameField, JsonValue.NewStr(names[i]));
+                double[] dv = new double[dims];
+                for (int j = 0; j < dims; j = j + 1) { dv[j] = vectors[i][j]; }
+                doc.Set(vecField, JsonValue.NewDoubleArray(dv));
+                doc.Set("_id", JsonValue.NewNum(Convert.ToString(id)));
+                this.search.Validate(doc);
+                AddIndexEntries(id, doc);
+                this.search.Stage(id, doc);
+                cacheDocs.Add(doc);
+            }
+            PersistKeyDict();
+            CommitWriteBulk();
+            for (int i = 0; i < cacheDocs.Count; i = i + 1) { CachePut(first + i, cacheDocs[i]); }
+            return first;
+        } catch {
+            this.kv.Rollback();
+            SyncMeta();
+            throw;
+        }
+        } finally { this.tlock.ExitWrite(); }
+    }
+
+    // 返回文档；优先走内存 LRU Buffer Pool，未命中则反序列化；不存在则返回 null。
+    public JsonValue FindById(int id) {
+        this.tlock.EnterRead();
+        try {
+            return this.FindByIdLocked(id);
+        } finally { this.tlock.ExitRead(); }
+    }
+    // 刀12：FindById 的持锁实现（公开壳持有整库线程读写锁；内部互调走本变体）。
+    public JsonValue FindByIdLocked(int id) {
+        SyncMeta();
+        JsonValue cached = CacheGet(id);
+        if (cached != null) {
+            return cached.Clone();
+        }
+        string body = this.kv.Get(DocKey(id));
+        JsonValue doc = null;
+        if (body.Length > 0) {
+            doc = DecodeDoc(body);
+            doc.Set("_id", JsonValue.NewNum(Convert.ToString(id)));
+            CachePut(id, doc);
+            return doc.Clone();
+        }
+        return doc;
+    }
+
+    // 文档 id 是否存在。
+    public bool Exists(int id) {
+        this.tlock.EnterRead();
+        try {
+             return this.kv.Contains(DocKey(id));
+        } finally { this.tlock.ExitRead(); }
+    }
+
+    // 替换现有文档；id 不存在时返回 false。
+    public bool Update(int id, JsonValue doc) {
+        this.tlock.EnterWrite();
+        try {
+            return this.UpdateLocked(id, doc);
+        } finally { this.tlock.ExitWrite(); }
+    }
+    // 刀12：Update 的持锁实现（公开壳持有整库线程读写锁；内部互调走本变体）。
+    public bool UpdateLocked(int id, JsonValue doc) {
+        if (!this.kv.Contains(DocKey(id))) { return false; }
+        SyncMeta();
+        PrepareDoc(doc);
+        this.kv.Begin();
+        try {
+            if (this.indexedFields.Count > 0) { RemoveIndexEntries(id, FindByIdLocked(id)); }
+            doc.Set("_id", JsonValue.NewNum(Convert.ToString(id)));
+            this.kv.Put(DocKey(id), EncodeDoc(doc));
+            AddIndexEntries(id, doc);
+            this.search.Stage(id, doc);
+            CommitWrite();
+            CachePut(id, doc);
+            return true;
+        } catch {
+            this.kv.Rollback();
+            SyncMeta();
+            throw;
+        }
+    }
+
+    // 在显式 id 下插入或替换。推进自增 id
+    // 序列越过该 id，避免后续插入冲突。
+    public void Upsert(int id, JsonValue doc) {
+        this.tlock.EnterWrite();
+        try {
+        UpsertLocked(id, doc);
+        } finally { this.tlock.ExitWrite(); }
+    }
+
+    // 刀12：Upsert 的持锁实现（公开壳持有整库线程读写锁；内部互调走本变体）。
+    public void UpsertLocked(int id, JsonValue doc) {
+        if (id < 1) { throw new ArgumentException("document id must be positive"); }
+        SyncMeta();
+        PrepareDoc(doc);
+        this.kv.Begin();
+        try {
+            string cur = this.kv.Get(SeqKey());
+            int seq = cur.Length > 0 ? Convert.ToInt(cur) : 0;
+            if (id > seq) {
+                this.kv.Put(SeqKey(), Convert.ToString(id));
+                if (this.nextIdCache < id) { this.nextIdCache = id; }
+            }
+            if (this.indexedFields.Count > 0 && this.kv.Contains(DocKey(id))) {
+                RemoveIndexEntries(id, FindByIdLocked(id));
+            }
+            doc.Set("_id", JsonValue.NewNum(Convert.ToString(id)));
+            this.kv.Put(DocKey(id), EncodeDoc(doc));
+            AddIndexEntries(id, doc);
+            this.search.Stage(id, doc);
+            CommitWrite();
+            CachePut(id, doc);
+        } catch {
+            this.kv.Rollback();
+            SyncMeta();
+            throw;
+        }
+    }
+
+    // 删除文档及其索引条目；返回该 id 是否原本存在。
+    public bool DeleteById(int id) {
+        this.tlock.EnterWrite();
+        try {
+            return this.DeleteByIdLocked(id);
+        } finally { this.tlock.ExitWrite(); }
+    }
+    // 刀12：DeleteById 的持锁实现（公开壳持有整库线程读写锁；内部互调走本变体）。
+    public bool DeleteByIdLocked(int id) {
+        SyncMeta();
+        this.kv.Begin();
+        try {
+            if (this.indexedFields.Count > 0) { RemoveIndexEntries(id, FindByIdLocked(id)); }
+            bool existed = this.kv.Delete(DocKey(id));
+            if (existed) { this.search.Stage(id, null); }
+            CommitWrite();
+            if (existed) { CacheEvict(id); }
+            return existed;
+        } catch {
+            this.kv.Rollback();
+            SyncMeta();
+            throw;
+        }
+    }
+
+
+    // ===== 协程安全的异步 API =====
+
+    // <see cref="FindById"/> 的协程版本：读操作会维护缓存，因此也独占锁。
+    public async JsonValue FindByIdAsync(int id) {
+        await this.rw.EnterWrite();
+        this.tlock.EnterWrite();
+        try { return FindByIdLocked(id); }
+        finally { this.tlock.ExitWrite(); this.rw.ExitWrite(); }
+    }
+
+    // <see cref="Insert"/> 的协程版本：在共享读写锁的写侧执行。
+    public async int InsertAsync(JsonValue doc) {
+        await this.rw.EnterWrite();
+        this.tlock.EnterWrite();
+        try { return InsertLocked(doc); }
+        finally { this.tlock.ExitWrite(); this.rw.ExitWrite(); }
+    }
+
+    // <see cref="Update"/> 的协程版本：在共享读写锁的写侧执行。
+    public async bool UpdateAsync(int id, JsonValue doc) {
+        await this.rw.EnterWrite();
+        this.tlock.EnterWrite();
+        try { return UpdateLocked(id, doc); }
+        finally { this.tlock.ExitWrite(); this.rw.ExitWrite(); }
+    }
+
+    // <see cref="DeleteById"/> 的协程版本：在共享读写锁的写侧执行。
+    public async bool DeleteByIdAsync(int id) {
+        await this.rw.EnterWrite();
+        this.tlock.EnterWrite();
+        try { return DeleteByIdLocked(id); }
+        finally { this.tlock.ExitWrite(); this.rw.ExitWrite(); }
+    }
+
+    // 对单篇文档的原子读改写：fn 在
+    // 写临界区内基于最新已提交版本运行，因此
+    // 并发更新不会丢失写入（判断与写入是
+    // 一个原子步骤）。当文档存在且 fn
+    // 返回了替换值时返回 true。
+    public async bool UpdateAtomic(int id, DocUpdater fn) {
+        await this.rw.EnterWrite();
+        this.tlock.EnterWrite();
+        try {
+            JsonValue cur = FindByIdLocked(id);
+            if (cur == null) { return false; }
+            JsonValue next = fn(cur);
+            if (next == null) { return false; }
+            return UpdateLocked(id, next);
+        } finally { this.tlock.ExitWrite(); this.rw.ExitWrite(); }
+    }
+}

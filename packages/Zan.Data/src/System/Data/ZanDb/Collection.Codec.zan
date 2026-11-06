@@ -1,0 +1,378 @@
+using System;
+using System.IO;
+using System.Json;
+using System.Text;
+using System.Threading;
+
+namespace System.Data.ZanDb;
+
+public partial class Collection {
+    // 二进制记录的值标签：0 null、1 false、2 true、3 非负整数
+    // （varint）、8 负整数（其幅度的 varint）、9 整数零（无
+    // 载荷）、4 文本数字（非整数）、5 字符串、10 空字符串（无
+    // 载荷）、6 数组、7 对象。标签 9/10 为最常见的两个单元格
+    // （0 和 ""）提供 SQLite 式“值即类型”表示——它们还
+    // 让 0x00 不进入记录，因此下面的 NUL 转义几乎从不触发。
+    // 字符串是否为纯十进制整数（可带负号，至多 18 位以留在 varint 范围内）。
+    public static bool IsIntStr(string s) {
+        int n = s.Length;
+        if (n == 0) { return false; }
+        int i = 0;
+        if ((s[0] & 255) == 45) { i = 1; if (n == 1) { return false; } }
+        if (n - i > 18) { return false; }  // 保持在 zigzag varint 范围内
+        while (i < n) {
+            int c = s[i] & 255;
+            if (c < 48 || c > 57) { return false; }
+            i = i + 1;
+        }
+        return true;
+    }
+
+    // 解析带符号的十进制整数为 64 位。用它替代 Convert.ToInt，因为后者
+    // 目前降级为 C 的 atoi（声明返回 i64），因此无法
+    // 符号扩展——负数及大于 2^31 的值会以零扩展的
+    // 垃圾数据返回。累加器必须是 long：IsIntStr 放行最长 18 位，
+    // epoch 毫秒时间戳（13 位，>2^31）此前在 int 里静默回绕后落盘。
+    public static long ParseI64(string s) {
+        int n = s.Length;
+        int i = 0;
+        bool neg = false;
+        if (n > 0 && (s[0] & 255) == 45) { neg = true; i = 1; }  // '-'
+        long acc = 0;
+        while (i < n) {
+            int c = s[i] & 255;
+            if (c < 48 || c > 57) { break; }
+            acc = acc * 10 + (c - 48);
+            i = i + 1;
+        }
+        if (neg) { return 0 - acc; }
+        return acc;
+    }
+
+    // 按上方标签表把一个 JsonValue 写入记录；对象键写作字典 id（须在 kv 事务内）。
+    public void WriteVal(ByteBuffer b, JsonValue v) {
+        if (v.IsNull()) { b.WriteU8(0); return; }
+        if (v.IsBool()) {
+            if (v.AsBool(false)) { b.WriteU8(2); } else { b.WriteU8(1); }
+            return;
+        }
+        if (v.IsNumber()) {
+            string raw = v.AsString("");
+            if (Collection.IsIntStr(raw)) {
+                long iv = Collection.ParseI64(raw);
+                if (iv == 0) { b.WriteU8(9); }
+                else if (iv < 0) { b.WriteU8(8); b.WriteVarInt(0 - iv); }
+                else { b.WriteU8(3); b.WriteVarInt(iv); }
+            } else {
+                b.WriteU8(4);
+                b.WriteString(raw);
+            }
+            return;
+        }
+        if (v.IsString()) {
+            string sv = v.AsString("");
+            if (sv.Length == 0) { b.WriteU8(10); }
+            else { b.WriteU8(5); b.WriteString(sv); }
+            return;
+        }
+        if (v.IsArray()) {
+            // 刀7 float32 数组直编码（tag 11）：大数值数组（嵌入
+            // 向量场景）从逐元素文本（~8-16 字节/值）压到 4 字节/
+            // 维，编码/解码免逐元素 JSON 化。判据零谎报：元素
+            // ≥ 32、全数值、且每个值位级无损转 float32——缓存
+            // 命中（原 double）与落盘读回（float32）因此位级一
+            // 致；不可无损收敛的 double 数组保持 tag 6 文本保真
+            // （纯整数数组自然落入 tag 6，整数值不经 float32 渲
+            // 染变形）。
+            int cnt = v.Count();
+            if (cnt >= 32 && Collection.ArrayIsF32Encodable(v)) {
+                b.WriteU8(11);
+                b.WriteVarInt(cnt);
+                // 刀11 数值直存形态：直读 double[]，免 At 逐元素懒装箱。
+                if (v.numArr != null) {
+                    for (int i = 0; i < cnt; i = i + 1) {
+                        b.WriteF32((float)v.numArr[i]);
+                    }
+                    return;
+                }
+                for (int i = 0; i < cnt; i = i + 1) {
+                    b.WriteF32((float)v.At(i).AsDouble(0));
+                }
+                return;
+            }
+            b.WriteU8(6);
+            b.WriteVarInt(cnt);
+            for (int i = 0; i < cnt; i = i + 1) { WriteVal(b, v.At(i)); }
+            return;
+        }
+        b.WriteU8(7);
+        b.WriteVarInt(v.Count());
+        for (int i = 0; i < v.Count(); i = i + 1) {
+            b.WriteVarInt(KeyId(v.KeyAt(i)));
+            WriteVal(b, v.ValAt(i));
+        }
+    }
+
+    // tag 11 编码判据：元素 ≥ 32、全数值、每个值位级无损转
+    // float32（写读一致：缓存 double 原值 = 磁盘 float32 读回）、
+    // 且至少一个非整数文本——纯整数数组保持 tag 6 文本（varint
+    // 1-5 字节/值本就 ≤ 4 字节/值，且整数值的 float32 位形
+    // （如 0x40400000）低字节系统性含 0x00，经转义反膨胀）。
+    // 溢出/NaN 拒绝（|v| 超出 float32 成 Inf 或 NaN 时整体放弃
+    // ——tag 6 文本路径保真）。
+    public static bool ArrayIsF32Encodable(JsonValue v) {
+        // 刀11 数值直存形态：免 At 懒装箱，谓词与装箱形态逐条对齐
+        // （文本判定输入同为 Convert.ToString(d)）。
+        double[] arr = v.numArr;
+        if (arr != null) {
+            bool dec = false;
+            for (int i = 0; i < arr.Length; i = i + 1) {
+                double d = arr[i];
+                if (!Collection.IsIntStr(Convert.ToString(d))) { dec = true; }
+                if (d != d || d - d != 0) { return false; }
+                float f = (float)d;
+                if ((double)f != d) { return false; }
+            }
+            return dec;
+        }
+        int cnt = v.Count();
+        bool hasDecimal = false;
+        for (int i = 0; i < cnt; i = i + 1) {
+            JsonValue e = v.At(i);
+            if (!e.IsNumber()) { return false; }
+            if (!Collection.IsIntStr(e.AsString(""))) { hasDecimal = true; }
+            double d = e.AsDouble(0);
+            if (d != d || d - d != 0) { return false; }
+            float f = (float)d;
+            if ((double)f != d) { return false; }
+        }
+        return hasDecimal;
+    }
+
+    // doc 的 from 之后是否还存在同名键。
+    // 集合正文约定顶层重复键以后写为准；JsonValue.Get 自身首键胜，
+    // 因而写入前先消除旧键，使缓存、字段索引和检索输入一致。
+    public static bool HasLaterKey(JsonValue doc, string key, int from) {
+        for (int j = from + 1; j < doc.Count(); j = j + 1) {
+            if (doc.KeyAt(j) == key) { return true; }
+        }
+        return false;
+    }
+
+    public void PrepareDoc(JsonValue doc) {
+        if (doc == null || !doc.IsObject()) { throw new ArgumentException("document must be an object"); }
+        int i = 0;
+        while (i < doc.Count()) {
+            if (Collection.HasLaterKey(doc, doc.KeyAt(i), i)) { doc.RemoveAt(i); }
+            else { i = i + 1; }
+        }
+        this.search.Validate(doc);
+    }
+
+    // 将文档序列化为紧凑的二进制记录：一个 'B'
+    // 格式字节，随后是顶层对象的字段（字典 id 键 +
+    // 带类型的值）。冗余的 "_id" 被省略——它是行键，读取时
+    // 重新附加。重复键只写最后一次出现（Put 的追加语义下
+    // 老值作废），部分读取（FieldOf）与全量解码因此一致。
+    // 必须在 kv 事务内运行：新字段名
+    // 会与正文一起持久化。
+    public string EncodeDoc(JsonValue doc) {
+        ByteBuffer b = ByteBuffer.Alloc(64);
+        b.WriteU8(66);  // 'B'
+        int n = 0;
+        int i = 0;
+        for (; i < doc.Count(); i = i + 1) {
+            string k0 = doc.KeyAt(i);
+            if (k0 != "_id" && !Collection.HasLaterKey(doc, k0, i)) { n = n + 1; }
+        }
+        b.WriteVarInt(n);
+        i = 0;
+        while (i < doc.Count()) {
+            string k = doc.KeyAt(i);
+            if (k != "_id" && !Collection.HasLaterKey(doc, k, i)) {
+                b.WriteVarInt(KeyId(k));
+                WriteVal(b, doc.ValAt(i));
+            }
+            i = i + 1;
+        }
+        PersistKeyDict();
+        return Collection.EscapeRecord(b);
+    }
+
+    // 记录缓冲 → 存储字符串（刀13 废除 0x00/0xFF 转义，确立全二进制安全
+    // 原生 Tape）：底层与运行时已具备显式长度对象头，无需 0x00 截断防御。
+    // 单次 memcpy 交付原生带长字符串，免除逐字节扫描与二次堆分配。
+    // 拿走并释放传入缓冲的所有权。
+    public static string EscapeRecord(ByteBuffer b) {
+        string s = b.ToStr();
+        b.Free();
+        return s;
+    }
+
+    // 键尾随数字中编码的 id。行键和
+    // 索引条目都以定宽 id 结尾，因此无需搜索分隔符——
+    // id 的某个数字可能恰好像分隔符。
+    public static int IdOfKey(string key) {
+        int off = key.Length - Collection.ID_DIGITS;
+        if (off < 0) { return 0; }
+        return Collection.UnpadId(key.Substring(off, Collection.ID_DIGITS));
+    }
+
+    // <see cref="IdOfKey"/> 的裸指针形式：键尾 6 字节定宽
+    // id（'?'..'~'）直接还原，零分配。baseKey 指向键首字节，
+    // keyLen 为键长。
+    public static int IdOfPtr(nint baseKey, int keyLen) {
+        int off = keyLen - Collection.ID_DIGITS;
+        if (off < 0) { return 0; }
+        return Collection.UnpadIdPtr(baseKey + off);
+    }
+
+    // <see cref="IdOfKey"/> 的字符串形式。
+    public static string IdFromKey(string key) {
+        return Convert.ToString(Collection.IdOfKey(key));
+    }
+
+    // ===== 字符串直读解码器：不经 ByteBuffer、常态零拷贝零分配（除值本身）。=====
+    // 记录格式见 EncodeDoc：'B' + VarInt(字段数) + (VarInt(字典id) + 值)*。
+    // 刀13：全二进制安全原生 Tape，免除 UnescapeRecord 往返。
+
+    [DllImport("crt", EntryPoint = "memchr")]
+    public static extern nint StrMemChr(string p, int c, long n);
+
+    [DllImport("crt", EntryPoint = "memcmp")]
+    public static extern int MemCmpRaw(nint a, string b, long n);
+
+    // 与 ByteBuffer.WriteVarInt 同格式的变长整数读取（显式位置传递）。
+    public static long RecVarInt(string s, int p, out int np) {
+        long v = 0;
+        int shift = 0;
+        while (true) {
+            int by = s[p] & 255;
+            p = p + 1;
+            v = v + ((long)(by & 127) << shift);
+            if ((by & 128) == 0) { break; }
+            shift = shift + 7;
+        }
+        np = p;
+        return v;
+    }
+
+    // 刀13：存储串为原生 Tape，反转义空转返回原串（保留签名向下兼容）。
+    public static string UnescapeRecord(string body) {
+        return body;
+    }
+
+    // 从记录中读取 <see cref="WriteVal"/> 写出的一个值并还原为
+    // JsonValue；p 为值起始字节，np 为值结束后的位置。
+    public JsonValue ReadValS(string s, int p, out int np) {
+        int tag = s[p] & 255;
+        p = p + 1;
+        if (tag == 0) { np = p; return JsonValue.NewNull(); }
+        if (tag == 1) { np = p; return JsonValue.NewBool(false); }
+        if (tag == 2) { np = p; return JsonValue.NewBool(true); }
+        if (tag == 3) {
+            long v = Collection.RecVarInt(s, p, out np);
+            return JsonValue.NewNum(Convert.ToString(v));
+        }
+        if (tag == 8) {
+            long v = Collection.RecVarInt(s, p, out np);
+            return JsonValue.NewNum(Convert.ToString(0 - v));
+        }
+        if (tag == 9) { np = p; return JsonValue.NewNum("0"); }
+        if (tag == 4 || tag == 5) {
+            long n = Collection.RecVarInt(s, p, out p);
+            string t = s.Substring(p, (int)n);
+            np = p + (int)n;
+            if (tag == 4) { return JsonValue.NewNum(t); }
+            return JsonValue.NewStr(t);
+        }
+        if (tag == 10) { np = p; return JsonValue.NewStr(""); }
+        if (tag == 11) {
+            // 刀7 float32 数组直编码：dims + dims×4 字节小端。
+            // 刀11：直还数值形态，免逐元素装箱。
+            long c = Collection.RecVarInt(s, p, out p);
+            double[] arr = new double[(int)c];
+            for (int i = 0; i < (int)c; i = i + 1) {
+                int bits = (s[p] & 255)
+                + ((s[p + 1] & 255) << 8)
+                + ((s[p + 2] & 255) << 16)
+                + ((s[p + 3] & 255) << 24);
+                arr[i] = (double)NativeMemory.AsF32(bits);
+                p = p + 4;
+            }
+            np = p;
+            return JsonValue.NewDoubleArray(arr);
+        }
+        if (tag == 6) {
+            long c = Collection.RecVarInt(s, p, out p);
+            JsonValue a = JsonValue.NewArray();
+            for (int i = 0; i < (int)c; i = i + 1) {
+                JsonValue v = ReadValS(s, p, out p);
+                a.Append(v);
+            }
+            np = p;
+            return a;
+        }
+        // tag == 7：对象
+        long oc = Collection.RecVarInt(s, p, out p);
+        JsonValue obj = JsonValue.NewObject();
+        for (int i = 0; i < (int)oc; i = i + 1) {
+            long kid = Collection.RecVarInt(s, p, out p);
+            JsonValue v = ReadValS(s, p, out p);
+            obj.Set(KeyName((int)kid), v);
+        }
+        np = p;
+        return obj;
+    }
+
+    // 跳过一个编码值，而不从中构建任何内容。
+    // 字符串和文本形式的数字按长度跳过，而非复制。
+    public static void SkipValS(string s, int p, out int np) {
+        int tag = s[p] & 255;
+        p = p + 1;
+        if (tag == 3 || tag == 8) { Collection.RecVarInt(s, p, out np); return; }
+        if (tag == 11) {
+            long c = Collection.RecVarInt(s, p, out np);
+            np = np + (int)c * 4;
+            return;
+        }
+        if (tag == 4 || tag == 5) {
+            long n = Collection.RecVarInt(s, p, out p);
+            np = p + (int)n;
+            return;
+        }
+        if (tag == 6) {
+            long c = Collection.RecVarInt(s, p, out p);
+            for (int i = 0; i < (int)c; i = i + 1) { Collection.SkipValS(s, p, out p); }
+            np = p;
+            return;
+        }
+        if (tag == 7) {
+            long c = Collection.RecVarInt(s, p, out p);
+            for (int i = 0; i < (int)c; i = i + 1) {
+                p = (int)Collection.RecVarInt(s, p, out p);
+                Collection.SkipValS(s, p, out p);
+            }
+            np = p;
+            return;
+        }
+        // 标签 0、1、2、9、10 不带载荷。
+        np = p;
+    }
+
+
+    // 把存储的二进制记录（见 <see cref="EncodeDoc"/>）解码回 JsonValue 对象；
+    // "_id" 由调用方从行键附加。
+    public JsonValue DecodeDoc(string body) {
+        int p = 1;  // 'B' = 66
+        long n = Collection.RecVarInt(body, p, out p);
+        JsonValue o = JsonValue.NewObject();
+        for (int i = 0; i < (int)n; i = i + 1) {
+            long kid = Collection.RecVarInt(body, p, out p);
+            JsonValue v = ReadValS(body, p, out p);
+            o.Set(KeyName((int)kid), v);
+        }
+        return o;
+    }
+
+}
