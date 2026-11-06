@@ -1,0 +1,243 @@
+using System;
+using System.Collections.Generic;
+using System.Bench;
+using System.Net;
+using System.Net.Http;
+using System.Net.Http.Client;
+using System.Net.Sockets;
+using System.Threading;
+using System.Text;
+
+class Program {
+    static int TCP_PORT = 19541;
+    static int HTTP_PORT = 19542;
+    static int UDP_SRV_PORT = 19543;
+    static int UDP_CLI_PORT = 19544;
+
+    // ==========================================
+    // 1. TCP Echo Throughput & Latency Benchmark
+    // ==========================================
+    static bool tcpServerRunning = false;
+
+    static async void TcpEchoServerTask(TcpListener listener) {
+        Program.tcpServerRunning = true;
+        TcpClient client = await listener.AcceptTcpClientAsync();
+        if (client != null) {
+            while (Program.tcpServerRunning) {
+                string msg = await client.RecvAsync(1024);
+                if (msg == null || msg.Length == 0) { break; }
+                await client.SendAsync(msg);
+            }
+            client.Dispose();
+        }
+    }
+
+    static async Task<bool> BenchTcp(List<bool> invResults) {
+        TcpListener listener = new TcpListener("127.0.0.1", TCP_PORT);
+        listener.Start();
+
+        Task.Spawn(TcpEchoServerTask(listener));
+        await Task.Delay(20);
+
+        TcpClient client = await TcpClient.ConnectAsync("127.0.0.1", TCP_PORT);
+        if (client == null) {
+            listener.Dispose();
+            return false;
+        }
+
+        string payload = "TCP_BENCHMARK_STREAM_PACKET_64_BYTES_PADDING_0123456789ABCDEF012345";
+        int totalOps = 50;
+        long[] samples = new long[totalOps];
+        int successCount = 0;
+
+        long benchStart = Stopwatch.GetMicroseconds();
+        for (int i = 0; i < totalOps; i = i + 1) {
+            long t0 = Stopwatch.GetMicroseconds();
+            await client.SendAsync(payload);
+            string resp = await client.RecvAsync(1024);
+            long t1 = Stopwatch.GetMicroseconds();
+
+            if (resp == payload) {
+                successCount = successCount + 1;
+            }
+            samples[i] = (t1 >= t0) ? (t1 - t0) : 0L;
+        }
+        long benchEnd = Stopwatch.GetMicroseconds();
+        long totalElapsedUs = (benchEnd >= benchStart) ? (benchEnd - benchStart) : 1L;
+
+        Program.tcpServerRunning = false;
+        client.Dispose();
+        listener.Dispose();
+        for (int i = 0; i < 20; i = i + 1) { await Task.Delay(10); }
+
+        long minUs = BenchStats.Min(samples);
+        long maxUs = BenchStats.Max(samples);
+        long medianUs = BenchStats.Median(samples);
+        long meanUs = BenchStats.Mean(samples);
+        double opsPerSec = (double)successCount / ((double)totalElapsedUs / 1000000.0);
+
+        bool successOk = (successCount == totalOps);
+        bool invOk = (minUs >= 0) && (minUs <= medianUs) && (medianUs <= maxUs)
+                     && (minUs <= meanUs) && (meanUs <= maxUs)
+                     && (opsPerSec > 0.0);
+
+        invResults.Add(invOk);
+        return successOk;
+    }
+
+    // ==========================================
+    // 2. HTTP/1.1 Keep-Alive Benchmark
+    // ==========================================
+    static async HttpResponse HttpBenchHandler(HttpRequest req) {
+        return HttpResponse.Ok("{\"status\":200,\"bench\":\"ok\"}");
+    }
+
+    static async Task<bool> BenchHttp(List<bool> invResults) {
+        HttpServer server = new HttpServer("127.0.0.1", HTTP_PORT);
+        server.OnRequest(HttpBenchHandler);
+        Task.Spawn(server.Start());
+        await Task.Delay(30);
+
+        HttpClient client = new HttpClient("127.0.0.1", HTTP_PORT);
+        int totalOps = 30;
+        long[] samples = new long[totalOps];
+        int successCount = 0;
+
+        long benchStart = Stopwatch.GetMicroseconds();
+        for (int i = 0; i < totalOps; i = i + 1) {
+            long t0 = Stopwatch.GetMicroseconds();
+            HttpResponse resp = await client.SendAsync("GET", "/api/bench", "");
+            long t1 = Stopwatch.GetMicroseconds();
+
+            if (resp != null && resp.statusCode == 200 && resp.body == "{\"status\":200,\"bench\":\"ok\"}") {
+                successCount = successCount + 1;
+            }
+            samples[i] = (t1 >= t0) ? (t1 - t0) : 0L;
+        }
+        long benchEnd = Stopwatch.GetMicroseconds();
+        long totalElapsedUs = (benchEnd >= benchStart) ? (benchEnd - benchStart) : 1L;
+
+        client.Close();
+        server.Stop();
+        for (int i = 0; i < 20; i = i + 1) { await Task.Delay(10); }
+
+        long minUs = BenchStats.Min(samples);
+        long maxUs = BenchStats.Max(samples);
+        long medianUs = BenchStats.Median(samples);
+        long meanUs = BenchStats.Mean(samples);
+        double opsPerSec = (double)successCount / ((double)totalElapsedUs / 1000000.0);
+
+        bool successOk = (successCount == totalOps);
+        bool invOk = (minUs >= 0) && (minUs <= medianUs) && (medianUs <= maxUs)
+                     && (minUs <= meanUs) && (meanUs <= maxUs)
+                     && (opsPerSec > 0.0);
+
+        invResults.Add(invOk);
+        return successOk;
+    }
+
+    // ==========================================
+    // 3. UDP Roundtrip Benchmark
+    // ==========================================
+    static bool udpServerRunning = false;
+
+    static async void UdpEchoServerTask(UdpClient server) {
+        Program.udpServerRunning = true;
+        while (Program.udpServerRunning) {
+            string msg = await server.RecvFromAsync(512);
+            if (msg != null && msg.Length > 0) {
+                await server.SendToAsync(msg, "127.0.0.1", UDP_CLI_PORT);
+            }
+        }
+    }
+
+    static async Task<bool> BenchUdp(List<bool> invResults) {
+        UdpClient server = UdpClient.Bind("127.0.0.1", UDP_SRV_PORT);
+        if (server == null) { return false; }
+
+        Task.Spawn(UdpEchoServerTask(server));
+        await Task.Delay(20);
+
+        UdpClient client = UdpClient.Bind("127.0.0.1", UDP_CLI_PORT);
+        if (client == null) {
+            server.Dispose();
+            return false;
+        }
+
+        int totalOps = 30;
+        long[] samples = new long[totalOps];
+        int successCount = 0;
+        string payload = "UDP_ROUNDTRIP_BENCHMARK_BURST";
+
+        long benchStart = Stopwatch.GetMicroseconds();
+        for (int i = 0; i < totalOps; i = i + 1) {
+            long t0 = Stopwatch.GetMicroseconds();
+            await client.SendToAsync(payload, "127.0.0.1", UDP_SRV_PORT);
+            string resp = await client.RecvFromAsync(512);
+            long t1 = Stopwatch.GetMicroseconds();
+
+            if (resp == payload) {
+                successCount = successCount + 1;
+            }
+            samples[i] = (t1 >= t0) ? (t1 - t0) : 0L;
+        }
+        long benchEnd = Stopwatch.GetMicroseconds();
+        long totalElapsedUs = (benchEnd >= benchStart) ? (benchEnd - benchStart) : 1L;
+
+        Program.udpServerRunning = false;
+        client.Dispose();
+        server.Dispose();
+        for (int i = 0; i < 20; i = i + 1) { await Task.Delay(10); }
+
+        long minUs = BenchStats.Min(samples);
+        long maxUs = BenchStats.Max(samples);
+        long medianUs = BenchStats.Median(samples);
+        long meanUs = BenchStats.Mean(samples);
+        double opsPerSec = (double)successCount / ((double)totalElapsedUs / 1000000.0);
+
+        bool successOk = (successCount == totalOps);
+        bool invOk = (minUs >= 0) && (minUs <= medianUs) && (medianUs <= maxUs)
+                     && (minUs <= meanUs) && (meanUs <= maxUs)
+                     && (opsPerSec > 0.0);
+
+        invResults.Add(invOk);
+        return successOk;
+    }
+
+    // ==========================================
+    // Main Benchmark Driver
+    // ==========================================
+    static async Task<int> RunAll() {
+        Socket.Initialize();
+
+        Console.WriteLine("=== NET THROUGHPUT & LATENCY BENCHMARK SUITE ===");
+
+        List<bool> tcpInv = new List<bool>();
+        bool tcpSucc = await BenchTcp(tcpInv);
+        bool tcpInvOk = (tcpInv.Count > 0 && tcpInv[0]);
+        Console.WriteLine("tcp_bench_success=" + (tcpSucc ? "1" : "0"));
+        Console.WriteLine("tcp_bench_invariants=" + (tcpInvOk ? "1" : "0"));
+
+        List<bool> httpInv = new List<bool>();
+        bool httpSucc = await BenchHttp(httpInv);
+        bool httpInvOk = (httpInv.Count > 0 && httpInv[0]);
+        Console.WriteLine("http_bench_success=" + (httpSucc ? "1" : "0"));
+        Console.WriteLine("http_bench_invariants=" + (httpInvOk ? "1" : "0"));
+
+        List<bool> udpInv = new List<bool>();
+        bool udpSucc = await BenchUdp(udpInv);
+        bool udpInvOk = (udpInv.Count > 0 && udpInv[0]);
+        Console.WriteLine("udp_bench_success=" + (udpSucc ? "1" : "0"));
+        Console.WriteLine("udp_bench_invariants=" + (udpInvOk ? "1" : "0"));
+
+        bool allOk = tcpSucc && tcpInvOk && httpSucc && httpInvOk && udpSucc && udpInvOk;
+        Console.WriteLine("all_throughput_benchmarks_ok=" + (allOk ? "1" : "0"));
+
+        Socket.Cleanup();
+        return allOk ? 0 : 1;
+    }
+
+    static async void Main() {
+        int code = await Program.RunAll();
+    }
+}
