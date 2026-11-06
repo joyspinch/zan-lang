@@ -11,6 +11,8 @@ public class MqttBroker {
     public List<MqttSession> sessions;
     public List<MqttTopicStat> topics;
     public List<MqttRetainedMessage> retainedMessages;
+    public List<MqttInflightMessage> inflightMessages;
+    public MqttWal wal;
     bool keepAliveRunning;
     MqttSharedBus sharedBus;
 
@@ -32,6 +34,8 @@ public class MqttBroker {
         this.sessions = new List<MqttSession>();
         this.topics = new List<MqttTopicStat>();
         this.retainedMessages = new List<MqttRetainedMessage>();
+        this.inflightMessages = new List<MqttInflightMessage>();
+        this.wal = null;
         this.keepAliveRunning = false;
         this.nextId = 0;
         this.startedAt = MqttBroker.Now();
@@ -40,6 +44,44 @@ public class MqttBroker {
         this.msgsOut = 0;
         this.bytesIn = 0;
         this.bytesOut = 0;
+    }
+
+    // 启用磁盘预写日志（WAL）与崩溃恢复引擎。
+    // 启动时自动从 WAL 文件重放并恢复所有保留消息和 QoS 1/2 飞行中未确认消息；
+    // 后续保留消息变更与飞行中消息状态将追加到磁盘。
+    public bool EnableWal(string walFilePath) {
+        this.wal = new MqttWal(walFilePath);
+        return this.wal.Recover(this.retainedMessages, this.inflightMessages);
+    }
+
+    // 执行快照压缩收缩 WAL 文件尺寸。
+    public void CheckpointWal() {
+        if (this.wal != null) {
+            this.wal.Checkpoint(this.retainedMessages, this.inflightMessages);
+        }
+    }
+
+    // 记录 QoS 1/2 待确认报文到飞行状态与 WAL。
+    public void TrackInflight(string clientId, int packetId, int qos, string topic, string payload) {
+        if (clientId == null || clientId.Length == 0) { return; }
+        if (this.wal != null) {
+            this.wal.LogInflightAdd(clientId, packetId, qos, topic, payload);
+        }
+        this.inflightMessages.Add(new MqttInflightMessage(clientId, packetId, qos, topic, payload, payload.Length));
+    }
+
+    // 确认消除已完成的 QoS 1/2 飞行中消息（收到 PUBACK 或 PUBCOMP）。
+    public void AcknowledgeInflight(string clientId, int packetId) {
+        if (this.wal != null) {
+            this.wal.LogInflightAck(clientId, packetId);
+        }
+        for (int i = this.inflightMessages.Count - 1; i >= 0; i = i - 1) {
+            MqttInflightMessage m = this.inflightMessages[i];
+            if (m.clientId == clientId && m.packetId == packetId) {
+                this.inflightMessages.RemoveAt(i);
+                break;
+            }
+        }
     }
 
     // 墙上时钟秒；用于管理快照中的时间戳。
@@ -87,6 +129,14 @@ public class MqttBroker {
         this.sessions.Clear();
         this.topics.Clear();
         this.retainedMessages.Clear();
+        this.inflightMessages.Clear();
+        if (this.wal != null) {
+            this.wal.Flush();
+        }
+    }
+
+    public void Stop() {
+        this.Shutdown();
     }
 
     // 当前连接的客户端数。
@@ -269,6 +319,9 @@ public class MqttBroker {
             if (r.topic == topic) {
                 if (payloadLen == 0) {
                     this.retainedMessages.RemoveAt(i);
+                    if (this.wal != null) {
+                        this.wal.LogRetainDelete(topic);
+                    }
                     return;
                 } else {
                     int keep = payloadLen;
@@ -276,6 +329,9 @@ public class MqttBroker {
                     r.payload = keep < payload.Length ? payload.Substring(0, keep) : payload;
                     r.payloadLen = keep;
                     r.qos = qos;
+                    if (this.wal != null) {
+                        this.wal.LogRetainSet(topic, qos, r.payload);
+                    }
                     return;
                 }
             }
@@ -286,6 +342,9 @@ public class MqttBroker {
             if (keep > 65536) { keep = 65536; }
             string safePayload = keep < payload.Length ? payload.Substring(0, keep) : payload;
             this.retainedMessages.Add(new MqttRetainedMessage(topic, safePayload, keep, qos));
+            if (this.wal != null) {
+                this.wal.LogRetainSet(topic, qos, safePayload);
+            }
         }
     }
 
@@ -878,6 +937,10 @@ public class MqttBroker {
                 if (pkt.flags != 0) { break; } // MQTT-2.2.2: 确认类报文 flags 必须为 0
                 // 收到确认类报文，更新会话最后活跃时间
                 sess.lastSeen = MqttBroker.Now();
+                if (remainLen >= 2) {
+                    int ackPid = ((body[0] & 255) << 8) + (body[1] & 255);
+                    this.AcknowledgeInflight(sess.clientId, ackPid);
+                }
             } else {
                 // 未知或保留控制报文类型（如 0 或 15），按协议违规断连
                 break;

@@ -1,0 +1,135 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Net.Mqtt;
+using System.Net.Sockets;
+using System.Threading;
+
+class Program {
+    static async int Run() {
+        Socket.Initialize();
+
+        // 1. 验证 UdpClient 原生 Reactor 超时机制（消除 Task.Delay 轮询）
+        UdpClient udp = new UdpClient();
+        byte[] udpBuf = new byte[1024];
+        long t0 = Stopwatch.GetMilliseconds();
+        int rn = await udp.RecvBytesFromAsync(udpBuf, 1024, 60);
+        long elapsed = Stopwatch.GetMilliseconds() - t0;
+        udp.Close();
+
+        if (rn != -1) {
+            Console.WriteLine("FAIL: UDP timeout expected -1, got " + Convert.ToString(rn));
+            return 1;
+        }
+        if (elapsed < 30 || elapsed > 300) {
+            Console.WriteLine("FAIL: UDP timeout duration out of bounds: " + Convert.ToString(elapsed) + "ms");
+            return 2;
+        }
+        Console.WriteLine("STEP 1: UDP reactor timeout OK (res=-1)");
+
+        // 2. 验证 MQTT WAL 预写日志与崩溃恢复
+        string scratchDir = "_scratch";
+        if (!Directory.Exists(scratchDir)) {
+            Directory.CreateDirectory(scratchDir);
+        }
+        string walFile = "_scratch/mqtt_conformance.wal";
+        if (File.Exists(walFile)) {
+            File.Delete(walFile);
+        }
+
+        // 阶段 A: Broker 1 写入保留消息与飞行中报文
+        MqttBroker broker1 = new MqttBroker("127.0.0.1", 1883);
+        broker1.EnableWal(walFile);
+
+        broker1.SaveRetained("device/temp", "24.5C", 5, 1);
+        broker1.SaveRetained("device/mode", "AUTO", 4, 0);
+
+        broker1.TrackInflight("client_alpha", 1001, 1, "cmd/reboot", "EXEC_REBOOT");
+        broker1.TrackInflight("client_beta", 2002, 2, "cmd/upgrade", "FIRMWARE_V2");
+
+        // client_alpha 的 1001 收到确认
+        broker1.AcknowledgeInflight("client_alpha", 1001);
+
+        // 模拟 Broker 异常崩溃 / 断电关闭
+        broker1.Stop();
+
+        // 阶段 B: Broker 2 重启并加载同一 WAL
+        MqttBroker broker2 = new MqttBroker("127.0.0.1", 1883);
+        bool recovered = broker2.EnableWal(walFile);
+        if (!recovered) {
+            Console.WriteLine("FAIL: Broker 2 recover failed");
+            return 3;
+        }
+
+        if (broker2.retainedMessages.Count != 2) {
+            Console.WriteLine("FAIL: Expected 2 retained messages, got " + Convert.ToString(broker2.retainedMessages.Count));
+            return 4;
+        }
+
+        bool tempOk = false;
+        bool modeOk = false;
+        for (int i = 0; i < broker2.retainedMessages.Count; i = i + 1) {
+            MqttRetainedMessage r = broker2.retainedMessages[i];
+            if (r.topic == "device/temp" && r.payload == "24.5C" && r.qos == 1) {
+                tempOk = true;
+            }
+            if (r.topic == "device/mode" && r.payload == "AUTO" && r.qos == 0) {
+                modeOk = true;
+            }
+        }
+        if (!tempOk || !modeOk) {
+            Console.WriteLine("FAIL: Retained messages content mismatch");
+            return 5;
+        }
+
+        if (broker2.inflightMessages.Count != 1) {
+            Console.WriteLine("FAIL: Expected 1 in-flight message, got " + Convert.ToString(broker2.inflightMessages.Count));
+            return 6;
+        }
+        MqttInflightMessage inflight = broker2.inflightMessages[0];
+        if (inflight.clientId != "client_beta" || inflight.packetId != 2002 || inflight.topic != "cmd/upgrade" || inflight.payload != "FIRMWARE_V2") {
+            Console.WriteLine("FAIL: Inflight message mismatch: " + inflight.clientId + " " + Convert.ToString(inflight.packetId));
+            return 7;
+        }
+        Console.WriteLine("STEP 2: Broker crash recovery restored retained & inflight OK");
+
+        // 阶段 C: 删除一个保留消息并执行 Checkpoint 压缩
+        broker2.SaveRetained("device/mode", "", 0, 0); // payloadLen == 0 删除
+        broker2.CheckpointWal();
+        broker2.Stop();
+
+        // 阶段 D: Broker 3 重启验证压缩后的快照
+        MqttBroker broker3 = new MqttBroker("127.0.0.1", 1883);
+        broker3.EnableWal(walFile);
+
+        if (broker3.retainedMessages.Count != 1) {
+            Console.WriteLine("FAIL: Expected 1 retained message after checkpoint, got " + Convert.ToString(broker3.retainedMessages.Count));
+            return 8;
+        }
+        if (broker3.retainedMessages[0].topic != "device/temp" || broker3.retainedMessages[0].payload != "24.5C") {
+            Console.WriteLine("FAIL: Retained message after checkpoint mismatch");
+            return 9;
+        }
+        if (broker3.inflightMessages.Count != 1 || broker3.inflightMessages[0].clientId != "client_beta") {
+            Console.WriteLine("FAIL: Inflight after checkpoint mismatch");
+            return 10;
+        }
+        Console.WriteLine("STEP 3: Checkpoint compression and recovery OK");
+
+        // 清理临时文件
+        if (File.Exists(walFile)) {
+            File.Delete(walFile);
+        }
+        broker3.Stop();
+
+        Console.WriteLine("MQTT WAL recovery and UDP reactor timeout PASS");
+        return 0;
+    }
+
+    static void Main() {
+        int r = await Run();
+        if (r != 0) {
+            Environment.Exit(r);
+        }
+    }
+}
