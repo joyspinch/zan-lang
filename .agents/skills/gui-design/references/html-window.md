@@ -737,4 +737,5 @@ Cookie，"对照组"就不成立了。
    - **反射方法表含继承方法**：HasMethod/Invoke 能命中基类方法（名字级遮蔽、最近声明胜出，基类静态方法除外），html 处理器可声明在基类窗上。
    - **`OnCloseRequested` 里可以再调 `Close()`**：Close 先置 open=false 再回调，重入早退，不会互递归。
    - **`(Label)r.Find(id)` 只对 `<label>` 成立**：`<span>` 不产出 Label；`<label><input/></label>` 里的 input 取不到，复选框文字写 `<input type="checkbox" value="文字">`。子类窗没有同名 html 时覆写 `DesignName()` 指向基类设计稿。
+   - **html 裸布尔属性通道（`readonly`，与 `disabled` 同语义）**：html 里裸写 `readonly` 出现即生效，解析期直落 `SetProp("readonly","true")`。键名走 PropSpec **精确匹配（区分大小写）**：TextArea 的键是小写 `readonly`（与 input/rate 先例对齐）——历史键名 `readOnly` 双重失配（键名不命中 + 裸属性无值按 off 判 false）会**静默失效**。契约钉在 cwdocscan（TextCw：初始推送/一帧同步/readonly 命中三断言）。
 
