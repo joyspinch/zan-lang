@@ -442,10 +442,11 @@ description: Zan GUI（Zan.Gui 包）审美与排版规范——对齐、间距�
   禁止在使用处用 Canvas 原语重画已有控件——组件修好后示例还在按旧画法显示,
   就会"组件是对的,demo 是错的"。
 - **组件的命名空间必须与它所在的目录一致**(BandGrid 教训):`Gui/Component/`
-  下的控件一律 `namespace Gui.Component`;编译器里 `QualifyKind` 出现
-  "Gui.BandGrid" 这类特判(类名与目录不一致)就是没归位的信号。Gui 根命名
-  空间留给控件基类本身,组件一律在 Gui.Component 下——用户项目里出现同名
-  全局类时不会压过 stdlib 真身(限定名按命名空间解析,不按最后一段猜)。
+  下的控件一律 `namespace Gui.Component`——类名与目录不一致就是没归位的信号。
+  组件一律在 Gui.Component 下,用户项目里出现同名全局类时不会压过包里的真身
+  (限定名按命名空间解析,不按最后一段猜)。分层重构的终态是"目录即命名空间"
+  (`docs/GUI_ARCHITECTURE.md` P7):Gui 根命名空间只留 Point/Rect/Color 等基元,
+  Core/Styling/Rendering 等各归 `Gui.<目录>`;在那之前它们仍在 Gui 根下。
   迁名的连带面通常很小:解析器会沿命名空间链向上找
   (`Gui.Component.DataTable` → `Gui.Component` → `Gui`),同族包里直接写
   `BandGrid` 不用补 using;只有命名空间与目标无关的地方(如独立命名空间
@@ -1225,7 +1226,11 @@ ScreenToClient 与应用鼠标坐标同帧对照,不用注入式 SetCursorPos
   当成浮层区域（该落回文本区的点击被吞掉）。
 - **「按外部关闭」的浮层要在按下帧就消费这次手势**：浮层在按下帧关掉自己，
   遮罩随之不在该帧的命中快照里，同一次手势的释放会解析成下层控件的点击。
-  框架的既定做法是 `app.ClaimClick()`（认领）+ 组件级提前返回。
+  存量代码的做法是 `app.ClaimClick()`（认领）+ 组件级提前返回。**新代码不得再新增
+  ClaimClick / BlockHitsRect / BlockHits* 这类仲裁调用**（`scripts/gui_layer_rules.py`
+  棘轮拦截）：新浮层复用 `OverlayPopup.Host`、`Layer` 等共享件；统一浮层 OverlayHost 与
+  路由事件落地后（`docs/GUI_ARCHITECTURE.md` P4/P6）整体迁过去。本节以下几条描述的是
+  现行仲裁机制，供维护存量代码。
 
 - **遮罩只挡自身矩形 = 点外面也穿透**：下拉/菜单类的浮层若只
   `BlockHitsRect(自身矩形)`，用户在浮层**外面**点一下时，这次点击照样落回
