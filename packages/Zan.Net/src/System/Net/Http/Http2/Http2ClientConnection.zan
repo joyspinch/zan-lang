@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Net.Sockets;
+using System.Net.Tls;
 using System.Net.Http;
 using System.Net.Http.Hpack;
 using System.Net.Http.Models;
@@ -19,8 +20,12 @@ public class Http2ClientConnection : IDisposable {
     public int port;
     public bool isSecure;
     public nint sock;
+    public TlsStream tls;
+    public TlsContext tlsCtx;
     public bool connected;
     public int nextStreamId;
+    public int outboundConnWindow;
+    public int inboundConsumed;
 
     public HpackContext inboundHpack;
     public HpackContext outboundHpack;
@@ -32,8 +37,12 @@ public class Http2ClientConnection : IDisposable {
         this.port = port;
         this.isSecure = isSecure;
         this.sock = -1;
+        this.tls = null;
+        this.tlsCtx = null;
         this.connected = false;
         this.nextStreamId = 1; // 客户端流 ID 必须为奇数（1, 3, 5, ...）
+        this.outboundConnWindow = 65535; // RFC 7540 默认初始流控窗口
+        this.inboundConsumed = 0;
         this.inboundHpack = new HpackContext(4096);
         this.outboundHpack = new HpackContext(4096);
         this.activeStreams = new List<Http2Stream>();
@@ -59,6 +68,51 @@ public class Http2ClientConnection : IDisposable {
         // 2. 发送初始 SETTINGS 帧（RFC 7540 §6.5）
         byte[] initSettings = Http2Frame.EncodeHeader(0, Http2FrameType.SETTINGS, 0, 0);
         int _ss = await Socket.SendAsync(s, initSettings, 9);
+
+        // 3. 启动后台帧派发协程
+        Task.Spawn(conn.RunFrameLoopAsync());
+        return conn;
+    }
+
+    // 通过 TLS 安全加密通道与 ALPN "h2" 协商握手连接 HTTP/2 服务端（RFC 7540 §3.3）
+    public static async Http2ClientConnection ConnectTlsAsync(string host, int port) {
+        return await Http2ClientConnection.ConnectTlsAsync(host, port, true);
+    }
+
+    // 通过 TLS 安全通道连接 HTTP/2 服务端并控制证书校验
+    public static async Http2ClientConnection ConnectTlsAsync(string host, int port, bool verifyCert) {
+        Http2ClientConnection conn = new Http2ClientConnection(host, port, true);
+        Socket.Initialize();
+        TcpClient client = await TcpClient.ConnectAsync(host, port);
+        if (client == null) {
+            return null;
+        }
+        nint s = client.GetSocket();
+        conn.sock = s;
+
+        TlsContext ctx = TlsContext.CreateClient();
+        if (!verifyCert) {
+            ctx.DisableVerify();
+        }
+        ctx.alpnProtocols.Add("h2");
+        ctx.alpnProtocols.Add("http/1.1");
+        TlsStream ts = await TlsStream.ConnectAsync(ctx, s, host, 10000);
+        if (ts == null) {
+            client.Close();
+            ctx.Free();
+            return null;
+        }
+        conn.tls = ts;
+        conn.tlsCtx = ctx;
+        conn.connected = true;
+
+        // 1. 发送 24 字节客户端连接序言（RFC 7540 §3.5）
+        byte[] prefaceBytes = Http2Frame.PREFACE.ToBytes();
+        int _sp = await ts.SendBytesAsync(prefaceBytes, prefaceBytes.Length);
+
+        // 2. 发送初始 SETTINGS 帧（RFC 7540 §6.5）
+        byte[] initSettings = Http2Frame.EncodeHeader(0, Http2FrameType.SETTINGS, 0, 0);
+        int _ss = await ts.SendBytesAsync(initSettings, 9);
 
         // 3. 启动后台帧派发协程
         Task.Spawn(conn.RunFrameLoopAsync());
@@ -121,6 +175,31 @@ public class Http2ClientConnection : IDisposable {
                 st.AppendBody(payload, 0, payload.Length);
                 if ((frame.flags & Http2Flags.END_STREAM) != 0) {
                     st.Complete();
+                }
+            }
+            // 流控回补：向服务端回发 WINDOW_UPDATE 恢复窗口
+            if (payload != null && payload.Length > 0) {
+                this.inboundConsumed = this.inboundConsumed + payload.Length;
+                if (this.inboundConsumed >= 32768) {
+                    this.SendWindowUpdate(0, this.inboundConsumed);
+                    this.inboundConsumed = 0;
+                }
+                if (frame.streamId > 0 && (frame.flags & Http2Flags.END_STREAM) == 0) {
+                    this.SendWindowUpdate(frame.streamId, payload.Length);
+                }
+            }
+        } else if (frame.type == Http2FrameType.WINDOW_UPDATE) {
+            if (payload != null && payload.Length >= 4) {
+                int increment = ((payload[0] & 127) << 24) | ((payload[1] & 255) << 16)
+                              | ((payload[2] & 255) << 8) | (payload[3] & 255);
+                if (increment <= 0) {
+                    this.Close();
+                    return;
+                }
+                if (frame.streamId == 0) {
+                    this.stateLockWait();
+                    this.outboundConnWindow = this.outboundConnWindow + increment;
+                    this.stateLockRelease();
                 }
             }
         } else if (frame.type == Http2FrameType.RST_STREAM) {
@@ -273,21 +352,29 @@ public class Http2ClientConnection : IDisposable {
 
     // 辅助同步直接发送原始控制报文（受出站锁保护）。
     void SendRaw(byte[] buf, int len) {
-        if (this.sock < 0 || buf == null || len <= 0) { return; }
+        if (buf == null || len <= 0) { return; }
         this.stateLockWait();
         try {
-            Socket.Send(this.sock, buf, len);
+            if (this.tls != null) {
+                this.tls.SendBytesAsync(buf, len);
+            } else if (this.sock >= 0) {
+                Socket.Send(this.sock, buf, len);
+            }
         } catch (Exception ex) {}
         this.stateLockRelease();
     }
 
     // 异步串行发送完整数据帧。
     async int SendRawAsync(byte[] buf, int len) {
-        if (this.sock < 0 || buf == null || len <= 0) { return 0; }
+        if (buf == null || len <= 0) { return 0; }
         this.stateLockWait();
         int sent = 0;
         try {
-            sent = await Socket.SendAsync(this.sock, buf, len);
+            if (this.tls != null) {
+                sent = await this.tls.SendBytesAsync(buf, len);
+            } else if (this.sock >= 0) {
+                sent = await Socket.SendAsync(this.sock, buf, len);
+            }
         } catch (Exception ex) {}
         this.stateLockRelease();
         return sent;
@@ -298,7 +385,12 @@ public class Http2ClientConnection : IDisposable {
         int got = 0;
         byte[] tmp = new byte[count];
         while (got < count && this.connected) {
-            int n = await Socket.RecvOv(this.sock, tmp, count - got);
+            int n = 0;
+            if (this.tls != null) {
+                n = await this.tls.RecvBytesAsync(tmp, 0, count - got);
+            } else if (this.sock >= 0) {
+                n = await Socket.RecvOv(this.sock, tmp, count - got);
+            }
             if (n <= 0) { break; }
             for (int i = 0; i < n; i = i + 1) {
                 buf[got] = tmp[i];
@@ -310,6 +402,14 @@ public class Http2ClientConnection : IDisposable {
 
     public void Close() {
         this.connected = false;
+        if (this.tls != null) {
+            this.tls.Close();
+            this.tls = null;
+        }
+        if (this.tlsCtx != null) {
+            this.tlsCtx.Free();
+            this.tlsCtx = null;
+        }
         if (this.sock >= 0) {
             Socket.Close(this.sock);
             this.sock = -1;
