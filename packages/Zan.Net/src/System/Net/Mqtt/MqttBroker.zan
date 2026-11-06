@@ -18,16 +18,16 @@ public class MqttBroker : IDisposable {
     public List<MqttInflightMessage> inflightMessages;
     public MqttWal wal;
     public MqttAuthHandler authHandler;
-    bool keepAliveRunning;
-    MqttSharedBus sharedBus;
+    private bool keepAliveRunning;
+    private MqttSharedBus sharedBus;
 
-    int nextId;
-    int startedAt;
-    int totalConnections;
-    int msgsIn;
-    int msgsOut;
-    int bytesIn;
-    int bytesOut;
+    private int nextId;
+    private int startedAt;
+    private int totalConnections;
+    private int msgsIn;
+    private int msgsOut;
+    private int bytesIn;
+    private int bytesOut;
 
     [DllImport("crt")]
     private static extern long strlen(string str);
@@ -100,7 +100,7 @@ public class MqttBroker : IDisposable {
 
     // 供 Worker 集成使用的共享实例（"mqtt" 协议的 worker 会将
     // 每个接受的连接路由到这里）；首次调用时惰性创建。
-    static MqttBroker inst;
+    private static MqttBroker inst;
     // 进程级共享实例的取用入口：未 Use 时惰性创建默认 broker。
     public static MqttBroker Global() {
         if (inst == null) { inst = new MqttBroker("", 0); }
@@ -164,7 +164,7 @@ public class MqttBroker : IDisposable {
     // ReadReady + Recv：后者在数据未到达时把 would-block 误判
     // 为对端关闭，而在对端 RST 后死套接字永远"可读"，重试只会
     // 让协程原地空转。RecvOv 只有读到数据或对端关闭才完成。
-    async int ReadByteAsync(nint sock) {
+    private async int ReadByteAsync(nint sock) {
         byte[] b = new byte[2];
         int n = await Socket.RecvOv(sock, b, 1);
         if (n <= 0) {
@@ -175,7 +175,7 @@ public class MqttBroker : IDisposable {
     }
 
     // 循环读满 `need` 字节；对端中途关闭时返回已读部分。
-    async byte[] ReadBytesAsync(nint sock, int need) {
+    private async byte[] ReadBytesAsync(nint sock, int need) {
         byte[] buf = new byte[need + 1];
         byte[] tmp = new byte[need + 1];
         int got = 0;
@@ -192,7 +192,7 @@ public class MqttBroker : IDisposable {
 
     // 读 MQTT 变长（varint）剩余长度；套接字关闭返回 -1，
     // 超过 4 字节编码上限返回 -2（协议错误）。
-    async int ReadRemainingLenAsync(nint sock) {
+    private async int ReadRemainingLenAsync(nint sock) {
         int multiplier = 1;
         int acc = 0;
         int encoded = 128;
@@ -328,7 +328,7 @@ public class MqttBroker : IDisposable {
     // 存储或清除保留消息（payloadLen == 0 时按规范删除对应主题的保留消息）。
     // 工业级上限防护：单条保留消息 payload 限制最大 64KB，总保留消息条数上限 4096 条，
     // 超过上限时拒绝新主题存入，防止恶意客户端发布大量随机主题耗尽 Broker 堆内存。
-    void SaveRetained(string topic, string payload, int payloadLen, int qos) {
+    private void SaveRetained(string topic, string payload, int payloadLen, int qos) {
         for (int i = this.retainedMessages.Count - 1; i >= 0; i = i - 1) {
             MqttRetainedMessage r = this.retainedMessages[i];
             if (r.topic == topic) {
@@ -365,7 +365,7 @@ public class MqttBroker : IDisposable {
 
     // 同一报文的线上总长（1 固定头 + varint 长度 + 剩余），
     // 供发送方统计字节用，不必实际构建报文。
-    int PublishPacketLen(string topic, int payloadLen) {
+    private int PublishPacketLen(string topic, int payloadLen) {
         int topicLen = (int)strlen(topic);
         int remainLen = 2 + topicLen + payloadLen;
         int varint = 1;
@@ -421,7 +421,7 @@ public class MqttBroker : IDisposable {
 
     // 分发消息：先投递给本进程内匹配的会话，若启用了跨进程共享总线，
     // 则同时广播至总线同步到其他 Worker 进程。
-    async int PublishToSubscribers(string topic, string payload, int payloadLen) {
+    private async int PublishToSubscribers(string topic, string payload, int payloadLen) {
         int receivers = await this.PublishLocal(topic, payload, payloadLen);
         if (this.sharedBus != null) {
             this.sharedBus.Broadcast(topic, payload, payloadLen);
@@ -436,7 +436,7 @@ public class MqttBroker : IDisposable {
     // 恶意客户端发布无限多不同的主题即可让 broker 内存无界
     // 增长（每个条目还保留整条 lastPayload）。达到上限后新主题
     // 不再建条目，已有主题的计数照常累加。
-    void Touch(string topic, string payload) {
+    private void Touch(string topic, string payload) {
         for (int i = 0; i < this.topics.Count; i = i + 1) {
             if (this.topics[i].name == topic) {
                 this.topics[i].messages = this.topics[i].messages + 1;
@@ -920,7 +920,7 @@ public class MqttBroker : IDisposable {
 
     // HandleConnection 的主体；注意此时套接字的关闭统一由
     // HandleConnection 的 finally 负责，本方法不自行 Close。
-    async void HandleConnectionInner(nint sock) {
+    private async void HandleConnectionInner(nint sock) {
         MqttSession sess = new MqttSession(sock);
         this.nextId = this.nextId + 1;
         sess.id = this.nextId;

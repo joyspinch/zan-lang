@@ -60,50 +60,50 @@ public async delegate HttpResponse HttpBytesDriver(HttpClient client, string met
 // 3. 探测路径（<see cref="SseSink"/> 系）：绝不抛错，每次尝试以
 // "ok" 或 "err: ..." 标记结束，便于轮询方统一判别。
 public partial class HttpClient : IDisposable {
-    string host;
-    int port;
-    int timeout;
-    bool useTls;
-    bool verifyTls;
-    string clientCertificateFile;
-    string clientPrivateKeyFile;
-    List<string> defaultHeaders;
+    private string host;
+    private int port;
+    private int timeout;
+    private bool useTls;
+    private bool verifyTls;
+    private string clientCertificateFile;
+    private string clientPrivateKeyFile;
+    private List<string> defaultHeaders;
     // 公钥固定：接受的服务器 SPKI SHA-256 固定值（base64）以及
     // 是否强制执行。正式版构建中强制保持开启；
     // 下面的开发开关在发布二进制中会被编译掉。
-    List<string> tlsPins;
-    bool pinningEnabled;
+    private List<string> tlsPins;
+    private bool pinningEnabled;
     // 证书策略：链/主机名校验不通过时逐连接裁决（见 SetCertPolicy）。
-    CertPolicyFn certPolicy;
+    private CertPolicyFn certPolicy;
     // cookie 存储；null = 不参与 cookie（Set-Cookie 只留在响应头里）。
-    CookieJar jar;
+    private CookieJar jar;
     // 取消探针；null = 不可取消（见 SetCancelProbe）。
-    HttpCancelFn cancelProbe;
+    private HttpCancelFn cancelProbe;
     // 上传进度探针；null = 不报进度（见 SetUploadProbe）。
-    HttpUploadProgressFn uploadProbe;
+    private HttpUploadProgressFn uploadProbe;
     // 内容解码器；null = 不解码（见 SetContentDecoder）。没装解码器又
     // 碰上带 Content-Encoding 的响应时直接报错，不把压缩字节当正文。
-    HttpContentDecoder contentDecoder;
+    private HttpContentDecoder contentDecoder;
     // 全局默认的内容解码器：逐个客户端装配太啰嗦时装一次。
-    static HttpContentDecoder defaultContentDecoder;
+    private static HttpContentDecoder defaultContentDecoder;
     // 共享外部调用预算；null 使用兼容的客户端 timeout 行为。
-    ExternalCallPolicy callPolicy;
-    string lastDownloadError;
+    private ExternalCallPolicy callPolicy;
+    private string lastDownloadError;
     // 跨跳共享的绝对总截止时间（Socket.NativeMonotonicUs() 时基，微秒）。
     // 0 = 未武装：无 policy 的客户端保持旧的"每跳各自 timeout"语义；
     // 绑定 policy 的客户端在公共入口武装一次，重定向每一跳继承同一
     // 时刻，阶段/总预算取总剩余时间的较小值——多跳链路、慢速滴流都
     // 无法把一次外呼拖过 policy 的 total。
-    long totalDeadlineUs;
+    private long totalDeadlineUs;
     // ---- keep-alive 连接复用（见 RequestAliveAsync）----
-    HttpFramer ka;  // 非空 = 池中有一条空闲可复用的连接
-    TcpClient kaConn;
-    TlsStream kaTls;
-    TlsContext kaCtx;
-    bool kaBusy;  // 在途请求标志：并发请求退回一次性通道
-    bool kaEnabled;
-    HttpConnectionPool pool;
-    string traceParent;
+    private HttpFramer ka;  // 非空 = 池中有一条空闲可复用的连接
+    private TcpClient kaConn;
+    private TlsStream kaTls;
+    private TlsContext kaCtx;
+    private bool kaBusy;  // 在途请求标志：并发请求退回一次性通道
+    private bool kaEnabled;
+    private HttpConnectionPool pool;
+    private string traceParent;
 
     [DllImport("crt")]
     private static extern nint fopen(string path, string mode);
@@ -129,7 +129,7 @@ public partial class HttpClient : IDisposable {
     private static extern int ftell(nint fp);
 
     // 为指定的主机和端口创建 HTTP 客户端。
-    HttpClient(string host, int port) {
+    public HttpClient(string host, int port) {
         this.host = host;
         this.port = port;
         this.timeout = 30000;
@@ -310,7 +310,7 @@ public partial class HttpClient : IDisposable {
     }
 
     // 当前外部调用预算；未绑定时返回 null。
-    ExternalCallPolicy CallPolicy() {
+    public ExternalCallPolicy CallPolicy() {
         return this.callPolicy;
     }
 
@@ -318,7 +318,7 @@ public partial class HttpClient : IDisposable {
     // 这样图片、下载、上传和 AI 即使误用了裸 host API，也不会绕过
     // ExternalTargetPolicy。DNS 多地址复核仍由 socket 层继续补齐。
     // 不允许时抛 HttpRequestException。
-    void CheckTargetPolicy() {
+    private void CheckTargetPolicy() {
         if (this.callPolicy == null) { return; }
         bool ok = ExternalTargetPolicy.IsClientAllowed(this.host, this.port,
             this.useTls, this.callPolicy.AllowsLoopback(),
@@ -331,7 +331,7 @@ public partial class HttpClient : IDisposable {
 
     // 绑定 policy 后，正文在建连前按统一 max request bytes 拒绝，
     // 避免副作用请求已经上线。超限时抛 HttpRequestException。
-    void CheckRequestLimit(long bodyBytes) {
+    private void CheckRequestLimit(long bodyBytes) {
         if (this.callPolicy == null) { return; }
         long limit = (long)this.callPolicy.MaxRequestBytes();
         if (limit > 0 && bodyBytes > limit) {
@@ -342,7 +342,7 @@ public partial class HttpClient : IDisposable {
 
     // HttpFramer 的响应正文上限：无 policy 时沿用此前的 64 MiB，
     // 有 policy 时由调用方显式预算覆盖。
-    int ResponseLimit() {
+    private int ResponseLimit() {
         if (this.callPolicy == null) { return 67108864; }
         int limit = this.callPolicy.MaxResponseBytes();
         if (limit > 0) { return limit; }
@@ -353,7 +353,7 @@ public partial class HttpClient : IDisposable {
     // policy 的四类 timeout 因而不会再被 SetCallPolicy 的 total 值静默覆盖。
     // totalDeadlineUs 已武装时，阶段预算还要再与"总剩余时间"取较小值：
     // 重定向每一跳继承同一个绝对时刻，任何通道都无法超出共享 total。
-    int BudgetMin(int phaseMs) {
+    private int BudgetMin(int phaseMs) {
         if (this.callPolicy == null) { return this.timeout; }
         int total = this.callPolicy.TotalTimeoutMs();
         if (phaseMs > 0 && total > 0) { phaseMs = phaseMs < total ? phaseMs : total; }
@@ -368,32 +368,32 @@ public partial class HttpClient : IDisposable {
     }
 
     // 绑定 policy 后的连接阶段预算；未绑定时退回客户端 timeout。
-    int ConnectBudget() {
+    private int ConnectBudget() {
         if (this.callPolicy == null) { return this.timeout; }
         return this.BudgetMin(this.callPolicy.ConnectTimeoutMs());
     }
     // 绑定 policy 后的写阶段预算；未绑定时退回客户端 timeout。
-    int WriteBudget() {
+    private int WriteBudget() {
         if (this.callPolicy == null) { return this.timeout; }
         return this.BudgetMin(this.callPolicy.WriteTimeoutMs());
     }
     // 绑定 policy 后的读阶段预算；未绑定时退回客户端 timeout。
-    int ReadBudget() {
+    private int ReadBudget() {
         if (this.callPolicy == null) { return this.timeout; }
         return this.BudgetMin(this.callPolicy.ReadTimeoutMs());
     }
     // 绑定 policy 后的流式空闲窗口预算（SSE/下载逐块续期）；未绑定时退回客户端 timeout。
-    int IdleBudget() {
+    private int IdleBudget() {
         if (this.callPolicy == null) { return this.timeout; }
         return this.BudgetMin(this.callPolicy.IdleTimeoutMs());
     }
     // TLS 握手预算，与连接阶段共用同一档。
-    int HandshakeBudget() {
+    private int HandshakeBudget() {
         return this.ConnectBudget();
     }
     // 绑定 policy 后的总预算（已扣除总截止时间的已耗部分）；
     // 未绑定时返回 0（表示无总截止）。
-    int TotalBudget() {
+    private int TotalBudget() {
         if (this.callPolicy == null) { return 0; }
         int total = this.callPolicy.TotalTimeoutMs();
         if (this.totalDeadlineUs > 0 && total > 0) {
@@ -409,7 +409,7 @@ public partial class HttpClient : IDisposable {
     // 入口调用；total <= 0 时不武装，保持该通道各自预算的旧行为。
     // 已武装时不重置：一次外呼（含 UploadFileBytesAsync 先行武装、
     // 通道随后调用）从第一跳起点计时，重定向各跳继承同一时刻。
-    void ArmTotalBudget() {
+    private void ArmTotalBudget() {
         if (this.callPolicy == null) {
             this.totalDeadlineUs = 0;
             return;
@@ -422,7 +422,7 @@ public partial class HttpClient : IDisposable {
     }
 
     // 每个公共入口重新武装；只有内部重定向跳数继承已有截止时间。
-    void ResetTotalBudget() {
+    private void ResetTotalBudget() {
         this.totalDeadlineUs = 0;
         this.ArmTotalBudget();
     }
@@ -454,7 +454,7 @@ public partial class HttpClient : IDisposable {
 
     // 丢弃池中的连接。连接可能已被对端半关或处于错误状态，
     // 因此四个句柄都要收干净；幂等，可在任何时候调用。
-    void DropAlive() {
+    private void DropAlive() {
         if (this.ka != null) { this.ka.Dispose(); }
         this.ka = null;
         if (this.kaTls != null) { this.kaTls.Close(); }
@@ -495,7 +495,7 @@ public partial class HttpClient : IDisposable {
     // 当 <see cref="SetHeader"/> 已提供过一个名字
     // （ASCII 大小写不敏感）匹配的头部时返回 true。这样 BuildRequest 可以只保留
     // 调用者自选的 Content-Type，而非总是强制表单编码。
-    bool HasHeaderName(string name) {
+    private bool HasHeaderName(string name) {
         int nlen = name.Length;
         for (int i = 0; i < this.defaultHeaders.Count; i = i + 1) {
             string h = this.defaultHeaders[i];
@@ -559,7 +559,7 @@ public partial class HttpClient : IDisposable {
     }
 
     // 构建请求头部半区；bodyLen<=0 时不写 Content-Length。支持 64 位大请求体。
-    string BuildRequestHead(string method, string path, long bodyLen,
+    private string BuildRequestHead(string method, string path, long bodyLen,
                             bool close) {
         if (!HttpClient.IsMethodSafe(method) || !HttpClient.IsHostSafe(this.host)
             || !HttpClient.IsRequestTargetSafe(path)) {
@@ -638,7 +638,7 @@ public partial class HttpClient : IDisposable {
     }
 
     // BuildRequestHead 加上文本正文（一次性通道用）。
-    string BuildRequest(string method, string path, string body, bool close) {
+    private string BuildRequest(string method, string path, string body, bool close) {
         string head = this.BuildRequestHead(method, path, body.Length, close);
         if (body.Length > 0) {
             return head + body;
@@ -648,7 +648,7 @@ public partial class HttpClient : IDisposable {
 
     // 下载请求沿用统一 method/host/path/header 注入校验，只额外插入
     // Range 字段；Range 不从调用方原文拼接进请求行，支持 64 位大文件断点。
-    string BuildDownloadRequest(string path, long have) {
+    private string BuildDownloadRequest(string path, long have) {
         string head = this.BuildRequestHead("GET", path, 0, true);
         if (have <= 0) { return head; }
         int end = head.Length - 2;
@@ -658,13 +658,13 @@ public partial class HttpClient : IDisposable {
 
     // 把响应里的 Set-Cookie 交给存储。未启用 cookie 时什么都不做，
     // 所以调用点不必自己判空。
-    void AbsorbCookies(string path, string raw) {
+    private void AbsorbCookies(string path, string raw) {
         if (this.jar == null) { return; }
         this.jar.AbsorbHead(this.host, path, raw);
     }
 
     // 报告连接失败，区分被拒绝的连接与超时耗尽的截止时间。
-    void FailConnect() {
+    private void FailConnect() {
         if (TcpClient.LastConnectTimedOut()) {
             throw new HttpRequestException("Connect to " + this.host + ":"
                 + Convert.ToString(this.port) + " timed out after "
@@ -676,14 +676,14 @@ public partial class HttpClient : IDisposable {
 
     // 报告请求截止时间耗尽（清扫器已挂起
     // 套接字，这结束了调用者的读取循环）。
-    void FailTimeout() {
+    private void FailTimeout() {
         throw new HttpRequestException("Request to " + this.host + ":"
             + Convert.ToString(this.port) + " timed out after "
             + Convert.ToString(this.timeout) + "ms");
     }
 
     // 单次 DNS 解析并在 TcpClient 中遍历 A/AAAA 记录尝试连接。
-    async TcpClient ConnectTarget() {
+    private async TcpClient ConnectTarget() {
         // 保持旧版 host/port 构造函数与本地测试服务器兼容。
         bool allowLoopback = this.callPolicy == null
             || this.callPolicy.AllowsLoopback();
@@ -698,7 +698,7 @@ public partial class HttpClient : IDisposable {
     // 相对 Location 和循环会拒绝；到达显式跳数上限时返回当前 3xx，
     // 不会猜测另一个目标，也不会继续发出请求。逐跳规则（跳数/防环/
     // 动作改写/下一跳派生）与字节通道共用同一组 helper
-    async string RequestAsync(string method, string path, string body) {
+    private async string RequestAsync(string method, string path, string body) {
         this.ResetTotalBudget();
         string raw = await this.RequestOnceWithRetry(method, path, body);
         if (this.callPolicy == null || this.callPolicy.MaxRedirects() <= 0) {
@@ -768,7 +768,7 @@ public partial class HttpClient : IDisposable {
     // 默认走 keep-alive 复用通道（同一客户端同时只允许一个在途
     // 请求）；已有请求在途时，并发调用退回一次性 Connection: close
     // 通道，各自读到对端关闭为止。
-    void ValidateTextResponse(string raw, string method) {
+    private void ValidateTextResponse(string raw, string method) {
         int end = HttpClient.IndexOf(raw, "\r\n\r\n", 0);
         if (end < 0) {
             throw new HttpRequestException("connection closed before a response arrived");
@@ -790,7 +790,7 @@ public partial class HttpClient : IDisposable {
         }
     }
 
-    async string RequestOnceAsync(string method, string path, string body) {
+    private async string RequestOnceAsync(string method, string path, string body) {
         this.CheckRequestLimit(body.Length);
         this.CheckTargetPolicy();
         if (this.kaEnabled && this.pool != null) {
@@ -810,7 +810,7 @@ public partial class HttpClient : IDisposable {
     // 只捕获 HttpRequestException：传输层的连接失败、超时、对端关闭、
     // 帧格式错都归这一种，而编程错误（空引用之类）不会被误当成网络
     // 抖动重试。
-    async string RequestOnceWithRetry(string method, string path, string body) {
+    private async string RequestOnceWithRetry(string method, string path, string body) {
         ExternalCallPolicy policy = this.callPolicy;
         if (policy == null || policy.RetryAttempts() <= 0) {
             return await this.RequestOnceAsync(method, path, body);
@@ -847,13 +847,13 @@ public partial class HttpClient : IDisposable {
     }
 
     // GET/HEAD 不产生副作用，可安全重放。
-    static bool SideEffectFreeMethod(string method) {
+    private static bool SideEffectFreeMethod(string method) {
         if (method == null) { return false; }
         string m = method.ToUpper();
         return m == "GET" || m == "HEAD";
     }
 
-    async string RequestUnpooledAsync(string method, string path, string body) {
+    private async string RequestUnpooledAsync(string method, string path, string body) {
         if (this.useTls) {
             string raw = await RequestTlsAsync(method, path, body);
             return raw;
@@ -931,7 +931,7 @@ public partial class HttpClient : IDisposable {
     // 且发生在任何请求分配之前），然后发送
     // 请求并读取完整响应（Connection: close 帧结构）。
     // 一次性 TLS 请求：新建 TLS 连接后发送请求并读取完整响应。
-    async string RequestTlsAsync(string method, string path, string body) {
+    private async string RequestTlsAsync(string method, string path, string body) {
         Socket.Initialize();
         TcpClient conn = await this.ConnectTarget();
         if (conn == null) {
@@ -1039,7 +1039,7 @@ public partial class HttpClient : IDisposable {
     // 清扫器挂断套接字后握手通常以普通失败收场（stream == null），
     // 因此过期判断必须先于 stream 判空，否则超时会被报成一般握手失败。
     // 在同一 deadline 清扫下执行 TLS 握手；超时返回 null。
-    async TlsStream ConnectTls(TlsContext ctx, nint sock) {
+    private async TlsStream ConnectTls(TlsContext ctx, nint sock) {
         HttpDeadlineToken watch = HttpDeadline.Arm(sock,
             this.HandshakeBudget(), this.TotalBudget());
         TlsStream stream = await TlsStream.ConnectAsync(ctx, sock, this.host,
@@ -1057,7 +1057,7 @@ public partial class HttpClient : IDisposable {
     // 发送请求并返回解析后的响应，使调用者可以看到
     // 状态行和头部，而不只是正文：来自网关的 502
     // 与一个负载古怪的 200 响应本来无法区分。
-    async HttpResponse SendAsync(string method, string path, string body) {
+    public async HttpResponse SendAsync(string method, string path, string body) {
         string raw = await RequestAsync(method, path, body);
         return this.ApplyContentEncoding(HttpResponse.Parse(raw));
     }
