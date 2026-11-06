@@ -1,0 +1,631 @@
+using System;
+using System.Collections.Generic;
+using System.Security.Cryptography;
+
+namespace System.Net.Tls;
+
+// TlsEngine.Client.zan - 客户端 TLS 1.2 / TLS 1.3 握手状态机实现
+// 包含 ServerHello 解析、证书链提取与校验、ServerKeyExchange、Finished 处理
+public partial class TlsEngine {
+    /* ---- 客户端：ServerHello 解析与版本分流 ---- */
+
+    int HandleServerHello(byte[] fullMsg, byte[] body) {
+        TlsByteReader r = new TlsByteReader(body, 0, body.Length);
+        if (r.Remaining() < 38) { this.Fail("ServerHello 报文过短"); return -1; }
+
+        int legacyVer = r.ReadU16();
+        this.serverRandom = r.ReadBytes(32);
+        int sidLen = r.ReadU8();
+        if (sidLen > 0) { r.Skip(sidLen); }
+        this.negotiatedCipherSuite = r.ReadU16();
+        int comp = r.ReadU8();
+
+        int selectedVersion = legacyVer;
+        byte[] serverShare = null;
+
+        if (r.Remaining() >= 2) {
+            int extTotal = r.ReadU16();
+            if (extTotal != r.Remaining()) {
+                this.Fail("ServerHello extensions 长度不匹配"); return -1;
+            }
+            int extEnd = r.Offset() + extTotal;
+            List<int> seenExtensions = new List<int>();
+            while (r.Offset() < extEnd) {
+                if (extEnd - r.Offset() < 4) {
+                    this.Fail("ServerHello extension 截断"); return -1;
+                }
+                int extType = r.ReadU16();
+                int extLen = r.ReadU16();
+                if (extLen > extEnd - r.Offset() || seenExtensions.Contains(extType)) {
+                    this.Fail("ServerHello extension 长度或重复非法"); return -1;
+                }
+                seenExtensions.Add(extType);
+                if (extType == 43) {  // supported_versions (0x002b)
+                    if (extLen != 2) {
+                        this.Fail("ServerHello supported_versions 非法"); return -1;
+                    }
+                    selectedVersion = r.ReadU16();
+                } else if (extType == 51) {  // key_share (0x0033)
+                    if (extLen != 36) {
+                        this.Fail("ServerHello X25519 key_share 非法"); return -1;
+                    }
+                    int group = r.ReadU16();
+                    int keyLen = r.ReadU16();
+                    if (group != 0x001d || keyLen != 32) {
+                        this.Fail("ServerHello X25519 key_share 非法"); return -1;
+                    }
+                    serverShare = r.ReadBytes(32);
+                    if (serverShare == null) {
+                        this.Fail("ServerHello X25519 key_share 截断"); return -1;
+                    }
+                } else if (extType == 16) {  // alpn (0x0010)
+                    if (extLen >= 3) {
+                        int listLen = r.ReadU16();
+                        int pLen = r.ReadU8();
+                        if (pLen > 0 && pLen <= r.Remaining()) {
+                            byte[] pBytes = r.ReadBytes(pLen);
+                            this.negotiatedAlpn = pBytes.ToStr(0, pLen);
+                        } else {
+                            r.Skip(extLen - 3);
+                        }
+                    } else {
+                        r.Skip(extLen);
+                    }
+                } else {
+                    r.Skip(extLen);
+                }
+            }
+            if (r.Offset() != extEnd) {
+                this.Fail("ServerHello extensions 越界"); return -1;
+            }
+        }
+
+        if (this.isServer || this.state != StateClientHelloSent || comp != 0
+            || (selectedVersion != TlsRecord.VersionTls12 && selectedVersion != TlsRecord.VersionTls13)
+            || (selectedVersion == TlsRecord.VersionTls13 && (this.disableTls13 || this.negotiatedCipherSuite != 0x1301))
+            || (selectedVersion == TlsRecord.VersionTls12
+                && this.negotiatedCipherSuite != 0xc02f && this.negotiatedCipherSuite != 0xc02b)) {
+            this.Fail("不支持的 TLS 服务器版本或密码套件"); return -1;
+        }
+        this.transcript.Update(fullMsg);
+
+        if (selectedVersion == TlsRecord.VersionTls13 && !this.disableTls13) {
+            this.negotiatedVersion = TlsRecord.VersionTls13;
+            if (serverShare == null || serverShare.Length != 32) {
+                this.Fail("TLS 1.3 ServerHello 缺少 X25519 key_share");
+                return -1;
+            }
+            this.serverX25519Pub = serverShare;
+
+            // 计算 X25519 共享密钥；全零结果表示低阶点，必须失败关闭。
+            byte[] sharedSecret = this.DeriveX25519Shared(
+                this.clientX25519Priv,
+                this.serverX25519Pub,
+                "TLS 1.3 X25519 密钥协商失败");
+            if (sharedSecret == null) { return -1; }
+
+            byte[] zeros32 = new byte[32];
+            byte[] earlySecret = Hkdf.Extract(null, zeros32);
+            byte[] emptyHash = Sha256.Hash(new byte[0], 0);
+            byte[] derivedSecret = Hkdf.ExpandLabel(earlySecret, "derived", emptyHash, 32);
+            this.handshakeSecret = Hkdf.Extract(derivedSecret, sharedSecret);
+
+            byte[] helloHash = this.transcript.CurrentHash();
+            this.clientHsTraffic = Hkdf.ExpandLabel(this.handshakeSecret, "c hs traffic", helloHash, 32);
+            this.serverHsTraffic = Hkdf.ExpandLabel(this.handshakeSecret, "s hs traffic", helloHash, 32);
+
+            byte[] clientHsKey = Hkdf.ExpandLabel(this.clientHsTraffic, "key", null, 16);
+            byte[] clientHsIv = Hkdf.ExpandLabel(this.clientHsTraffic, "iv", null, 12);
+            byte[] serverHsKey = Hkdf.ExpandLabel(this.serverHsTraffic, "key", null, 16);
+            byte[] serverHsIv = Hkdf.ExpandLabel(this.serverHsTraffic, "iv", null, 12);
+
+            this.writeCipher = new TlsCipherState(TlsRecord.VersionTls13, clientHsKey, clientHsIv);
+            this.readCipher = new TlsCipherState(TlsRecord.VersionTls13, serverHsKey, serverHsIv);
+
+            // 发送 dummy CCS (0x14)
+            byte[] dummyCcs = new byte[1]; dummyCcs[0] = 1;
+            byte[] ccsRec = TlsRecord.FormatPlaintext(TlsRecord.ContentTypeChangeCipherSpec, TlsRecord.VersionTls12, dummyCcs, 0, 1);
+            if (ccsRec != null) { this.outNet.WriteBytes(ccsRec); }
+
+            this.state = StateTls13Handshake;
+            return 0;
+        } else {
+            this.negotiatedVersion = TlsRecord.VersionTls12;
+            this.state = StateTls12Handshake;
+            return 0;
+        }
+    }
+
+    /* ---- 证书解析与验证 ---- */
+
+    int HandleCertificate(byte[] fullMsg, byte[] body) {
+        if (this.isServer || (this.negotiatedVersion != TlsRecord.VersionTls12 && this.negotiatedVersion != TlsRecord.VersionTls13)
+            || this.peerCert != null) { this.Fail("意外的服务端 Certificate"); return -1; }
+        TlsByteReader r = new TlsByteReader(body, 0, body.Length);
+        if (this.negotiatedVersion == TlsRecord.VersionTls13) {
+            int ctxLen = r.ReadU8();
+            if (ctxLen != 0) { this.Fail("Certificate 请求上下文不受支持"); return -1; }
+        }
+        int certsTotalLen = r.ReadU24();
+        if (certsTotalLen <= 0 || r.Remaining() != certsTotalLen) {
+            this.Fail("Certificate 列表长度非法"); return -1;
+        }
+        while (r.Remaining() > 0 && this.peerChain.Count < 8) {
+            int certLen = r.ReadU24();
+            if (certLen <= 0 || r.Remaining() < certLen) { this.Fail("Certificate 条目长度非法"); return -1; }
+            byte[] der = r.ReadBytes(certLen);
+            X509Certificate cert = X509Certificate.ParseForTls(der, certLen);
+            if (cert == null) { this.Fail("证书 DER 或签名算法不受支持"); return -1; }
+            this.peerChain.Add(cert);
+            if (this.negotiatedVersion == TlsRecord.VersionTls13) {
+                int extLen = r.ReadU16();
+                if (extLen < 0 || r.Remaining() < extLen) { this.Fail("Certificate 扩展长度非法"); return -1; }
+                if (extLen > 0) {
+                    byte[] extBytes = r.ReadBytes(extLen);
+                    if (this.peerChain.Count == 1) {
+                        int extRc = this.HandleTls13CertificateExtensions(extBytes);
+                        if (extRc != 0) { return -1; }
+                    }
+                }
+            }
+        }
+        if (r.Remaining() != 0 || this.peerChain.Count == 0) { this.Fail("证书链超限或缺失"); return -1; }
+        this.peerCert = this.peerChain[0];
+        this.peerCertText = "issuer=" + this.peerCert.Issuer() + " subject=" + this.peerCert.Subject();
+        this.transcript.Update(fullMsg);
+        return this.VerifyCertificate();
+    }
+
+    // 解析 TLS 1.3 证书扩展列表（RFC 8446 §4.4.2），提取 status_request (OCSP Stapling)
+    int HandleTls13CertificateExtensions(byte[] extBytes) {
+        if (extBytes == null || extBytes.Length == 0) { return 0; }
+        TlsByteReader er = new TlsByteReader(extBytes, 0, extBytes.Length);
+        while (er.Remaining() >= 4) {
+            int extType = er.ReadU16();
+            int extDataLen = er.ReadU16();
+            if (extDataLen < 0 || er.Remaining() < extDataLen) {
+                this.Fail("Certificate 扩展数据截断"); return -1;
+            }
+            if (extType == 5) {
+                // status_request (RFC 8446 §4.4.2.1)
+                if (extDataLen >= 4) {
+                    int statusType = er.ReadU8();
+                    int ocspRespLen = er.ReadU24();
+                    if (statusType == 1 && ocspRespLen > 0 && ocspRespLen <= er.Remaining()) {
+                        byte[] ocspDer = er.ReadBytes(ocspRespLen);
+                        this.stapledOcsp = OcspResponse.Parse(ocspDer, 0, ocspDer.Length);
+                        if (this.stapledOcsp != null && this.stapledOcsp.certStatus == OcspCertStatus.Revoked) {
+                            this.Fail("对端证书已被 OCSP 吊销 (Certificate revoked by OCSP)");
+                            return -1;
+                        }
+                    } else {
+                        er.Skip(extDataLen - 4);
+                    }
+                } else {
+                    er.Skip(extDataLen);
+                }
+            } else {
+                er.Skip(extDataLen);
+            }
+        }
+        return 0;
+    }
+
+    // 处理 TLS 1.2 CertificateStatus 握手报文（RFC 6066 §8）
+    int HandleCertificateStatus(byte[] fullMsg, byte[] body) {
+        if (this.isServer || this.negotiatedVersion != TlsRecord.VersionTls12 || this.peerCert == null) {
+            this.Fail("意外的 CertificateStatus 握手报文"); return -1;
+        }
+        TlsByteReader r = new TlsByteReader(body, 0, body.Length);
+        if (r.Remaining() < 4) {
+            this.Fail("CertificateStatus 报文过短"); return -1;
+        }
+        int statusType = r.ReadU8();
+        int respLen = r.ReadU24();
+        if (statusType == 1 && respLen > 0 && respLen <= r.Remaining()) {
+            byte[] ocspDer = r.ReadBytes(respLen);
+            this.stapledOcsp = OcspResponse.Parse(ocspDer, 0, ocspDer.Length);
+            if (this.stapledOcsp != null && this.stapledOcsp.certStatus == OcspCertStatus.Revoked) {
+                this.Fail("对端证书已被 OCSP 吊销 (Certificate revoked by OCSP)");
+                return -1;
+            }
+        }
+        this.transcript.Update(fullMsg);
+        return 0;
+    }
+
+    #if WINDOWS
+    bool WindowsTrustedPeer() {
+        if (this.peerChain == null || this.peerChain.Count == 0 || this.host == null
+            || this.host.Length == 0 || this.host.Length > 253) { return false; }
+        TlsByteWriter derChain = new TlsByteWriter();
+        for (int i = 0; i < this.peerChain.Count; i = i + 1) {
+            X509Certificate cert = this.peerChain[i];
+            if (cert == null) { return false; }
+            byte[] der = cert.RawDer();
+            int size = cert.RawDerLen();
+            if (der == null || size < 1 || size > 65536 || size > der.Length
+                || derChain.Length() + 4 + size > 524288) { return false; }
+            derChain.WriteU8(size & 255);
+            derChain.WriteU8((size >> 8) & 255);
+            derChain.WriteU8((size >> 16) & 255);
+            derChain.WriteU8((size >> 24) & 255);
+            derChain.WriteBytes(der, 0, size);
+        }
+        byte[] packed = derChain.ToArray();
+        this.osTrustDiag = WindowsSslPolicy((nint)packed, packed.Length, this.peerChain.Count,
+            (nint)this.host, this.host.Length);
+        return this.osTrustDiag == 1;
+    }
+    #endif
+
+    int VerifyCertificate() {
+        if (this.disableVerify) {
+            if (this.pinRequired && (this.pins == null || this.pins.Count == 0)) {
+                this.verifyResult = 63; this.Fail("TLS 已要求公钥固定但未配置 pin"); return -1;
+            }
+            if (this.pins != null && this.pins.Count > 0) {
+                if (this.peerCert == null) { this.verifyResult = 63; this.Fail("TLS 公钥固定缺少对端证书"); return -1; }
+                string disabledPin = this.peerCert.SpkiSha256Pin();
+                bool disabledPinMatched = false;
+                for (int i = 0; i < this.pins.Count; i = i + 1) {
+                    if (this.pins[i] == disabledPin) { disabledPinMatched = true; break; }
+                }
+                if (!disabledPinMatched) { this.verifyResult = 63; this.Fail("TLS 公钥固定校验失败"); return -1; }
+            }
+            if (this.requireOcspStapling && this.stapledOcsp == null) {
+                this.verifyResult = 64; this.Fail("要求 OCSP Stapling 但对端未提供状态扩展"); return -1;
+            }
+            if (this.stapledOcsp != null && this.stapledOcsp.certStatus == OcspCertStatus.Revoked) {
+                this.verifyResult = 65; this.Fail("对端证书已被 OCSP 吊销 (Certificate revoked by OCSP)"); return -1;
+            }
+            this.verifyResult = 0;
+            return 0;
+        }
+        this.verifyResult = 1;
+        if (this.peerCert == null || this.host == null || this.host.Length == 0
+            || !this.peerCert.ValidNow() || !this.peerCert.CanServeTls()) {
+            this.Fail("对端证书缺失、过期或不允许用于 TLS 服务端"); return -1;
+        }
+        bool hostMatches = this.peerCert.VerifyHost(this.host);
+        bool anchored = false;
+        #if WINDOWS
+        bool osTrusted = this.WindowsTrustedPeer();
+        #else
+        bool osTrusted = false;
+        #endif
+        // 有界候选路径构建：签发者可在信任锚或对端链的任意未用位置选取
+        // （乱序链可接受，但约束按实际构建的路径求值）。每选中一个非锚
+        // 中间 CA 即 hops+1；选中 issuer（含锚）时校验其 pathLenConstraint
+        // 覆盖已消耗的中间 CA 数（RFC 5280 §4.15.1.1 语义）。签名与完整
+        // Name 比较仍由 VerifySignedBy 强制，任何一步失败即整体拒绝。
+        X509Certificate current = this.peerCert;
+        bool[] used = new bool[this.peerChain.Count];
+        int hops = 0;
+        int maxSteps = this.peerChain.Count + 1;
+        for (int step = 0; step < maxSteps && !anchored && !osTrusted; step = step + 1) {
+            if (this.trustedCerts != null) {
+                for (int i = 0; i < this.trustedCerts.Count; i = i + 1) {
+                    X509Certificate anchor = this.trustedCerts[i];
+                    if (anchor == null || !anchor.ValidNow() || !anchor.CanSignCertificates()) { continue; }
+                    if (!current.VerifySignedBy(anchor)) { continue; }
+                    if (anchor.HasPathLen() && hops > anchor.PathLenConstraint()) { continue; }
+                    anchored = true;
+                    break;
+                }
+            }
+            if (anchored || osTrusted) { break; }
+            X509Certificate next = null;
+            for (int j = 0; j < this.peerChain.Count; j = j + 1) {
+                if (used[j]) { continue; }
+                X509Certificate issuerCert = this.peerChain[j];
+                if (issuerCert == null || !issuerCert.ValidNow() || !issuerCert.CanSignCertificates()) { continue; }
+                if (!current.VerifySignedBy(issuerCert)) { continue; }
+                if (issuerCert.HasPathLen() && hops > issuerCert.PathLenConstraint()) { continue; }
+                next = issuerCert;
+                used[j] = true;
+                break;
+            }
+            if (next == null) { break; }
+            current = next;
+            hops = hops + 1;
+        }
+        if (!anchored && !osTrusted) {
+            this.verifyResult = 19;
+            if (this.certPolicy == null || !this.certPolicy((long)this.verifyResult, this.peerCertText)) {
+                this.Fail("TLS 证书链无受信任签名锚"); return -1;
+            }
+        }
+        if (!hostMatches) {
+            this.verifyResult = 62;
+            if (this.certPolicy == null || !this.certPolicy((long)this.verifyResult, this.peerCertText)) {
+                this.Fail("TLS 证书主机名不匹配"); return -1;
+            }
+        }
+        if (this.pinRequired && (this.pins == null || this.pins.Count == 0)) {
+            this.verifyResult = 63; this.Fail("TLS 已要求公钥固定但未配置 pin"); return -1;
+        }
+        if (this.pins != null && this.pins.Count > 0) {
+            string actualPin = this.peerCert.SpkiSha256Pin();
+            bool pinMatched = false;
+            for (int i = 0; i < this.pins.Count; i = i + 1) {
+                if (this.pins[i] == actualPin) { pinMatched = true; break; }
+            }
+            if (!pinMatched) { this.verifyResult = 63; this.Fail("TLS 公钥固定校验失败"); return -1; }
+        }
+        if (this.requireOcspStapling && this.stapledOcsp == null) {
+            this.verifyResult = 64; this.Fail("要求 OCSP Stapling 但对端未提供状态扩展"); return -1;
+        }
+        if (this.stapledOcsp != null && this.stapledOcsp.certStatus == OcspCertStatus.Revoked) {
+            this.verifyResult = 65; this.Fail("对端证书已被 OCSP 吊销 (Certificate revoked by OCSP)"); return -1;
+        }
+        this.verifyResult = 0;
+        return 0;
+    }
+
+    int HandleCertificateVerify(byte[] fullMsg, byte[] body) {
+        if (this.isServer || this.negotiatedVersion != TlsRecord.VersionTls13 || this.peerCert == null
+            || this.handshakeSignatureVerified || body.Length < 4) {
+            this.Fail("意外的 TLS 1.3 CertificateVerify"); return -1;
+        }
+        TlsByteReader r = new TlsByteReader(body, 0, body.Length);
+        int scheme = r.ReadU16();
+        int sigLen = r.ReadU16();
+        if (sigLen < 1 || sigLen != r.Remaining()) { this.Fail("CertificateVerify 签名长度非法"); return -1; }
+        // 0x0804=rsa_pss_rsae_sha256；0x0805=ecdsa_secp256r1_sha256（显式曲线
+        // 绑定）、0x0403=ecdsa_sha256（曲线由证书密钥决定，RFC 8446 §4.2.3，
+        // OpenSSL 对 EC 证书自身默认即选 0x0403）。两种 EC 方案均为
+        // ECDSA-SHA256，验证语义相同。
+        if (scheme != 0x0804 && scheme != 0x0805 && scheme != 0x0403) {
+            this.Fail("不支持 TLS 1.3 CertificateVerify 签名方案: " + scheme); return -1;
+        }
+        byte[] signature = r.ReadBytes(sigLen);
+        byte[] hash = this.transcript.CurrentHash();
+        byte[] signed = new byte[130];
+        for (int i = 0; i < 64; i = i + 1) { signed[i] = 32; }
+        string context = "TLS 1.3, server CertificateVerify";
+        for (int i = 0; i < 33; i = i + 1) { signed[64 + i] = (byte)(context[i] & 255); }
+        signed[97] = 0;
+        NativeMemory.Copy((nint)signed + 98, hash, 32);
+        // 方案与服务器证书密钥类型必须一致：EC 方案只能由 EC SPKI 验证、
+        // RSA 方案只能由 RSA 证书验证，交叉一律失败关闭。
+        bool ecScheme = scheme == 0x0805 || scheme == 0x0403;
+        if (ecScheme != this.peerCert.HasEcKey()) {
+            this.Fail("CertificateVerify 签名方案与服务器证书密钥类型不符"); return -1;
+        }
+        bool sigOk = false;
+        if (ecScheme) {
+            sigOk = this.peerCert.VerifyEcdsaSha256(signed, signature);
+        } else {
+            sigOk = this.peerCert.VerifyPssSha256(signed, signature);
+        }
+        if (!sigOk) {
+            this.Fail("TLS 1.3 CertificateVerify 签名校验失败"); return -1;
+        }
+        this.handshakeSignatureVerified = true;
+        this.transcript.Update(fullMsg);
+        return 0;
+    }
+
+    /* ---- 客户端：Finished 验证与应用密钥派生 ---- */
+
+    int HandleFinished(byte[] fullMsg, byte[] body) {
+        if (this.negotiatedVersion == TlsRecord.VersionTls13) {
+            return this.HandleFinishedTls13(fullMsg, body);
+        } else {
+            return this.HandleFinishedTls12(fullMsg, body);
+        }
+    }
+
+    int HandleFinishedTls13(byte[] fullMsg, byte[] body) {
+        if (!this.disableVerify && (this.peerCert == null || !this.handshakeSignatureVerified || this.verifyResult != 0)) {
+            this.Fail("TLS 1.3 服务端身份未认证"); return -1;
+        }
+        // 1. 验证 Server Finished
+        byte[] serverFinishedKey = Hkdf.ExpandLabel(this.serverHsTraffic, "finished", null, 32);
+        byte[] th = this.transcript.CurrentHash();
+        byte[] expectedVerifyData = Hmac.Sha256(serverFinishedKey, serverFinishedKey.Length, th, th.Length);
+
+        if (body.Length != 32 || expectedVerifyData == null) {
+            this.Fail("TLS 1.3 Server Finished 校验数据长度不符");
+            return -1;
+        }
+        int diff = 0;
+        for (int i = 0; i < 32; i = i + 1) {
+            diff = diff | ((body[i] & 255) ^ (expectedVerifyData[i] & 255));
+        }
+        if (diff != 0) {
+            this.Fail("TLS 1.3 Server Finished verify_data 不匹配");
+            return -1;
+        }
+
+        this.transcript.Update(fullMsg);
+        byte[] hApp = this.transcript.CurrentHash();
+
+        // 2. 发送 Client Finished
+        byte[] clientFinishedKey = Hkdf.ExpandLabel(this.clientHsTraffic, "finished", null, 32);
+        byte[] thClient = hApp;
+        byte[] clientVerifyData = Hmac.Sha256(clientFinishedKey, clientFinishedKey.Length, thClient, thClient.Length);
+
+        byte[] clientFinishedMsg = new byte[4 + 32];
+        clientFinishedMsg[0] = (byte)TlsRecord.HandshakeFinished;  // 20
+        clientFinishedMsg[1] = 0; clientFinishedMsg[2] = 0; clientFinishedMsg[3] = 32;
+        for (int i = 0; i < 32; i = i + 1) { clientFinishedMsg[4 + i] = clientVerifyData[i]; }
+
+        this.transcript.Update(clientFinishedMsg);
+
+        byte[] encClientFinished = this.writeCipher.Encrypt(TlsRecord.ContentTypeHandshake, clientFinishedMsg, 0, clientFinishedMsg.Length);
+        if (encClientFinished == null) { this.Fail("加密 Client Finished 失败"); return -1; }
+        this.outNet.WriteBytes(encClientFinished);
+
+        // 3. 派生 Application Traffic Keys
+        byte[] zero32 = new byte[32];
+        byte[] emptyHash = Sha256.Hash(new byte[0], 0);
+        byte[] derived = Hkdf.ExpandLabel(this.handshakeSecret, "derived", emptyHash, 32);
+        byte[] masterSecret = Hkdf.Extract(derived, zero32);
+
+        byte[] clientAppTraffic = Hkdf.ExpandLabel(masterSecret, "c ap traffic", hApp, 32);
+        byte[] serverAppTraffic = Hkdf.ExpandLabel(masterSecret, "s ap traffic", hApp, 32);
+
+        byte[] clientAppKey = Hkdf.ExpandLabel(clientAppTraffic, "key", null, 16);
+        byte[] clientAppIv = Hkdf.ExpandLabel(clientAppTraffic, "iv", null, 12);
+        byte[] serverAppKey = Hkdf.ExpandLabel(serverAppTraffic, "key", null, 16);
+        byte[] serverAppIv = Hkdf.ExpandLabel(serverAppTraffic, "iv", null, 12);
+
+        this.writeCipher = new TlsCipherState(TlsRecord.VersionTls13, clientAppKey, clientAppIv);
+        this.readCipher = new TlsCipherState(TlsRecord.VersionTls13, serverAppKey, serverAppIv);
+
+        this.peerAuthenticated = !this.disableVerify;
+        this.state = StateConnected;
+        return 1;
+    }
+
+    /* ---- 客户端：TLS 1.2 握手流程 ---- */
+
+    int HandleServerKeyExchange(byte[] fullMsg, byte[] body) {
+        TlsByteReader r = new TlsByteReader(body, 0, body.Length);
+        int curveType = r.ReadU8();  // 3 = named_curve
+        int namedCurve = r.ReadU16();  // 29 = X25519 (0x001d)
+        int pubLen = r.ReadU8();
+        if (pubLen != 32 || r.Remaining() < 32) {
+            this.Fail("ServerKeyExchange 缺少 32 字节 X25519 公钥");
+            return -1;
+        }
+        this.serverX25519Pub = r.ReadBytes(32);
+        int scheme = r.ReadU16();
+        int sigLen = r.ReadU16();
+        if (this.isServer || this.negotiatedVersion != TlsRecord.VersionTls12 || this.peerCert == null
+            || this.handshakeSignatureVerified || curveType != 3 || namedCurve != 29
+            || (scheme != 0x0401 && scheme != 0x0403)
+            || sigLen <= 0 || sigLen != r.Remaining() || this.clientRandom == null || this.serverRandom == null) {
+            this.Fail("ServerKeyExchange 参数或签名算法不受支持"); return -1;
+        }
+        byte[] signature = r.ReadBytes(sigLen);
+        byte[] signed = new byte[100];
+        NativeMemory.Copy(signed, this.clientRandom, 32);
+        NativeMemory.Copy((nint)signed + 32, this.serverRandom, 32);
+        NativeMemory.Copy((nint)signed + 64, body, 36);
+        // 方案与服务器证书密钥类型必须一致：0x0403 只能由 EC SPKI 验证、
+        // 0x0401 只能由 RSA 证书验证，交叉一律失败关闭。
+        if ((scheme == 0x0403) != this.peerCert.HasEcKey()) {
+            this.Fail("ServerKeyExchange 签名方案与服务器证书密钥类型不符"); return -1;
+        }
+        bool sigOk = false;
+        if (scheme == 0x0403) {
+            sigOk = this.peerCert.VerifyEcdsaSha256(signed, signature);
+        } else {
+            sigOk = this.peerCert.VerifyHandshakeSignature(signed, signature);
+        }
+        if (!sigOk) {
+            this.Fail("TLS 1.2 ServerKeyExchange 签名校验失败"); return -1;
+        }
+        this.handshakeSignatureVerified = true;
+        this.transcript.Update(fullMsg);
+        return 0;
+    }
+
+    int HandleServerHelloDone(byte[] fullMsg, byte[] body) {
+        if (body.Length != 0 || (!this.disableVerify && (this.peerCert == null || !this.handshakeSignatureVerified || this.verifyResult != 0))) {
+            this.Fail("TLS 1.2 服务端身份未认证"); return -1;
+        }
+        this.transcript.Update(fullMsg);
+
+        if (this.serverX25519Pub == null || this.serverX25519Pub.Length != 32) {
+            this.Fail("TLS 1.2 缺少 Server X25519 公钥");
+            return -1;
+        }
+
+        // 1. 计算 Premaster Secret；低阶点产生的全零结果必须拒绝。
+        byte[] pms = this.DeriveX25519Shared(
+            this.clientX25519Priv,
+            this.serverX25519Pub,
+            "TLS 1.2 X25519 密钥协商失败");
+        if (pms == null) { return -1; }
+
+        // 2. 发送 ClientKeyExchange (含客户端 32 字节 X25519 临时公钥)
+        byte[] cke = new byte[4 + 1 + 32];
+        cke[0] = (byte)TlsRecord.HandshakeClientKeyExchange;  // 16
+        cke[1] = 0; cke[2] = 0; cke[3] = 33;
+        cke[4] = 32;
+        for (int i = 0; i < 32; i = i + 1) { cke[5 + i] = this.clientX25519Pub[i]; }
+
+        this.transcript.Update(cke);
+        byte[] ckeRec = TlsRecord.FormatPlaintext(TlsRecord.ContentTypeHandshake, TlsRecord.VersionTls12, cke, 0, cke.Length);
+        this.outNet.WriteBytes(ckeRec);
+
+        // 3. 派生 TLS 1.2 MasterSecret (48 bytes)
+        byte[] seed = new byte[64];
+        for (int i = 0; i < 32; i = i + 1) { seed[i] = this.clientRandom[i]; }
+        for (int i = 0; i < 32; i = i + 1) { seed[32 + i] = this.serverRandom[i]; }
+        this.tls12MasterSecret = Hkdf.Tls12Prf(pms, "master secret", seed, 48);
+
+        // 4. 派生 KeyBlock (40 字节: 16 clientKey + 16 serverKey + 4 clientIV + 4 serverIV)
+        byte[] kbSeed = new byte[64];
+        for (int i = 0; i < 32; i = i + 1) { kbSeed[i] = this.serverRandom[i]; }
+        for (int i = 0; i < 32; i = i + 1) { kbSeed[32 + i] = this.clientRandom[i]; }
+        byte[] keyBlock = Hkdf.Tls12Prf(this.tls12MasterSecret, "key expansion", kbSeed, 40);
+
+        byte[] clientKey = new byte[16];
+        byte[] serverKey = new byte[16];
+        byte[] clientIv = new byte[4];
+        byte[] serverIv = new byte[4];
+        for (int i = 0; i < 16; i = i + 1) { clientKey[i] = keyBlock[i]; }
+        for (int i = 0; i < 16; i = i + 1) { serverKey[i] = keyBlock[16 + i]; }
+        for (int i = 0; i < 4; i = i + 1) { clientIv[i] = keyBlock[32 + i]; }
+        for (int i = 0; i < 4; i = i + 1) { serverIv[i] = keyBlock[36 + i]; }
+
+        this.tls12ServerWriteKey = serverKey;
+        this.tls12ServerWriteIv = serverIv;
+        this.tls12ClientWriteKey = clientKey;
+        this.tls12ClientWriteIv = clientIv;
+
+        // 5. 发送 ChangeCipherSpec
+        byte[] ccs = new byte[1]; ccs[0] = 1;
+        byte[] ccsRec = TlsRecord.FormatPlaintext(TlsRecord.ContentTypeChangeCipherSpec, TlsRecord.VersionTls12, ccs, 0, 1);
+        this.outNet.WriteBytes(ccsRec);
+
+        // 6. 激活 Client 加密
+        this.writeCipher = new TlsCipherState(TlsRecord.VersionTls12, clientKey, clientIv);
+
+        // 7. 发送 Client Finished
+        byte[] th = this.transcript.CurrentHash();
+        byte[] clientVerifyData = Hkdf.Tls12Prf(this.tls12MasterSecret, "client finished", th, 12);
+
+        byte[] finishedMsg = new byte[4 + 12];
+        finishedMsg[0] = (byte)TlsRecord.HandshakeFinished;
+        finishedMsg[1] = 0; finishedMsg[2] = 0; finishedMsg[3] = 12;
+        for (int i = 0; i < 12; i = i + 1) { finishedMsg[4 + i] = clientVerifyData[i]; }
+
+        this.transcript.Update(finishedMsg);
+        this.transcriptHashBeforeFinished = this.transcript.CurrentHash();
+
+        byte[] encFinished = this.writeCipher.Encrypt(TlsRecord.ContentTypeHandshake, finishedMsg, 0, finishedMsg.Length);
+        if (encFinished == null) { this.Fail("加密 TLS 1.2 Finished 失败"); return -1; }
+        this.outNet.WriteBytes(encFinished);
+
+        this.state = StateTls12WaitingFinished;
+        return 0;
+    }
+
+    int HandleFinishedTls12(byte[] fullMsg, byte[] body) {
+        byte[] th = this.transcript.CurrentHash();
+        byte[] expectedVerifyData = Hkdf.Tls12Prf(this.tls12MasterSecret, "server finished", th, 12);
+        if (body.Length != 12 || expectedVerifyData == null) {
+            this.Fail("TLS 1.2 Server Finished 长度不符");
+            return -1;
+        }
+        int diff = 0;
+        for (int i = 0; i < 12; i = i + 1) {
+            diff = diff | ((body[i] & 255) ^ (expectedVerifyData[i] & 255));
+        }
+        if (diff != 0) {
+            this.Fail("TLS 1.2 Server Finished verify_data 校验失败");
+            return -1;
+        }
+
+        this.transcript.Update(fullMsg);
+        this.peerAuthenticated = !this.disableVerify;
+        this.state = StateConnected;
+        return 1;
+    }
+}
