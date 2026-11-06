@@ -283,6 +283,112 @@ public class WebDavClient {
         return resp;
     }
 
+    // 独占写锁请求（RFC 4918 §9.10）：获取资源锁定，返回包含状态码与响应体的 HttpResponse。
+    // timeoutSec <= 0 表示无限期锁 ("Infinite")，>0 表示 "Second-{timeoutSec}"。
+    public async HttpResponse LockAsync(string path, string owner, int timeoutSec) {
+        HttpClient client = this.NewHttpClient();
+        client.SetHeader("Content-Type", "application/xml; charset=utf-8");
+        client.SetHeader("Depth", "0");
+        if (timeoutSec > 0) {
+            client.SetHeader("Timeout", "Second-" + Convert.ToString(timeoutSec));
+        } else {
+            client.SetHeader("Timeout", "Infinite");
+        }
+        string ownerXml = "";
+        if (owner != null && owner.Length > 0) {
+            ownerXml = "<D:owner><D:href>" + WebDavClient.EscapeXml(owner) + "</D:href></D:owner>";
+        }
+        string body = "<?xml version=\"1.0\" encoding=\"utf-8\"?>"
+            + "<D:lockinfo xmlns:D=\"DAV:\">"
+            + "<D:lockscope><D:exclusive/></D:lockscope>"
+            + "<D:locktype><D:write/></D:locktype>"
+            + ownerXml
+            + "</D:lockinfo>";
+        HttpResponse resp = await client.SendAsync("LOCK", path, body);
+        client.Close();
+        return resp;
+    }
+
+    // 刷新现有锁的超时时限（RFC 4918 §9.10.2）。
+    public async HttpResponse RefreshLockAsync(string path, string lockToken, int timeoutSec) {
+        HttpClient client = this.NewHttpClient();
+        if (timeoutSec > 0) {
+            client.SetHeader("Timeout", "Second-" + Convert.ToString(timeoutSec));
+        } else {
+            client.SetHeader("Timeout", "Infinite");
+        }
+        if (lockToken != null && lockToken.Length > 0) {
+            string tokenFmt = lockToken;
+            if (tokenFmt.IndexOf("<") < 0) {
+                tokenFmt = "(<" + tokenFmt + ">)";
+            }
+            client.SetHeader("If", tokenFmt);
+        }
+        HttpResponse resp = await client.SendAsync("LOCK", path, "");
+        client.Close();
+        return resp;
+    }
+
+    // 释放写锁：提供 Lock-Token 头撤销资源锁定（RFC 4918 §9.11）。
+    public async HttpResponse UnlockAsync(string path, string lockToken) {
+        if (lockToken == null || lockToken.Length == 0) {
+            throw new ArgumentException("WebDAV Unlock requires a valid lockToken");
+        }
+        HttpClient client = this.NewHttpClient();
+        string tokenHdr = lockToken;
+        if (tokenHdr.IndexOf("<") < 0) {
+            tokenHdr = "<" + tokenHdr + ">";
+        }
+        client.SetHeader("Lock-Token", tokenHdr);
+        HttpResponse resp = await client.SendAsync("UNLOCK", path, "");
+        client.Close();
+        return resp;
+    }
+
+    // 修改资源属性（PROPPATCH，RFC 4918 §9.2）。
+    // name/value 为要设置的属性，若 remove 为 true 则为移除该属性。
+    public async HttpResponse PropPatchAsync(string path, string propName, string propValue, bool remove) {
+        if (propName == null || propName.Length == 0) {
+            throw new ArgumentException("WebDAV PropPatch requires a valid property name");
+        }
+        HttpClient client = this.NewHttpClient();
+        client.SetHeader("Content-Type", "application/xml; charset=utf-8");
+        string body = "";
+        if (remove) {
+            body = "<?xml version=\"1.0\" encoding=\"utf-8\"?>"
+                + "<D:propertyupdate xmlns:D=\"DAV:\">"
+                + "<D:remove><D:prop><D:" + WebDavClient.EscapeXml(propName) + "/></D:prop></D:remove>"
+                + "</D:propertyupdate>";
+        } else {
+            body = "<?xml version=\"1.0\" encoding=\"utf-8\"?>"
+                + "<D:propertyupdate xmlns:D=\"DAV:\">"
+                + "<D:set><D:prop><D:" + WebDavClient.EscapeXml(propName) + ">"
+                + WebDavClient.EscapeXml(propValue)
+                + "</D:" + WebDavClient.EscapeXml(propName) + "></D:prop></D:set>"
+                + "</D:propertyupdate>";
+        }
+        HttpResponse resp = await client.SendAsync("PROPPATCH", path, body);
+        client.Close();
+        return resp;
+    }
+
+    // 从 LOCK 响应头或响应 XML 中提取 Lock-Token
+    public static string ExtractLockToken(HttpResponse resp) {
+        if (resp == null) { return ""; }
+        string hdr = resp.GetHeader("Lock-Token");
+        if (hdr != null && hdr.Length > 0) {
+            string token = hdr.Trim();
+            if (token.Length >= 2 && (token[0] & 255) == 60 && (token[token.Length - 1] & 255) == 62) {
+                token = token.Substring(1, token.Length - 2);
+            }
+            return token;
+        }
+        if (resp.body != null && resp.body.Length > 0) {
+            return WebDavClient.TagValue(resp.body, "locktoken");
+        }
+        return "";
+    }
+
     // 每次调用新建的底层 HttpClient：按 useTls/verifyTls 建连，
     // 套用 timeout，并把默认头逐条搬过去。
     HttpClient NewHttpClient() {
