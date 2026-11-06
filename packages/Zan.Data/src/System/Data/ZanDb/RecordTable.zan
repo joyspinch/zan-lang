@@ -651,8 +651,32 @@ public class RecordTable {
         return this.Update(row.id, row);
     }
 
+    // 校验表名合法性（严格阻断路径穿越，如 `../`, `..\\`, 绝对路径等 CWE-22 漏洞）
+    public static bool IsValidTableName(string name) {
+        if (name == null || name.Length == 0 || name.Length > 64) {
+            return false;
+        }
+        for (int i = 0; i < name.Length; i = i + 1) {
+            char c = name[i];
+            bool ok = (c >= 'a' && c <= 'z') ||
+                      (c >= 'A' && c <= 'Z') ||
+                      (c >= '0' && c <= '9') ||
+                      c == '_' || c == '-';
+            if (!ok) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     // 打开或创建表（schema 为 null 时从已有 .ztab 元数据自动反序列化）
     public static RecordTable Open(string basePath, string name, RecordSchema schema = null) {
+        if (basePath == null || basePath.Length == 0) {
+            throw new ArgumentException("basePath cannot be null or empty");
+        }
+        if (!RecordTable.IsValidTableName(name)) {
+            throw new ArgumentException("invalid tableName '" + name + "': must be 1-64 characters containing only alphanumeric, '_' or '-'");
+        }
         RecordTable rt = new RecordTable();
         rt.name = name;
         rt.tableName = name;
@@ -667,6 +691,13 @@ public class RecordTable {
             rt.file = PageFile.OpenExisting(rt.tabPath);
             if (!rt.file.IsOpen()) {
                 rt.lastError = "cannot open existing ztab file: " + rt.file.GetError();
+                return rt;
+            }
+
+            long fsize = rt.file.Size();
+            if (fsize < (long)HEADER_SIZE) {
+                rt.lastError = "truncated ztab header: file size smaller than header";
+                rt.file.Close();
                 return rt;
             }
 
@@ -692,6 +723,23 @@ public class RecordTable {
 
             if (magic != MAGIC_TAB || ver != VERSION) {
                 rt.lastError = "invalid ztab magic or version";
+                rt.file.Close();
+                return rt;
+            }
+
+            // 防御性头部边界校验：阻断整型溢出与畸形文件导致的内存耗尽 / 崩溃
+            if (rowBytes < 4 || rowBytes > 1048576 || (rowBytes % 4) != 0 ||
+                colCount < 0 || colCount > 4096 ||
+                schemaOffset < (long)HEADER_SIZE || schemaBytes <= 0L || schemaBytes > 4194304L ||
+                dataOffset < schemaOffset + schemaBytes ||
+                total < 0L || active < 0L || active > total) {
+                rt.lastError = "corrupted ztab header bounds";
+                rt.file.Close();
+                return rt;
+            }
+
+            if (fsize < dataOffset + total * (long)rowBytes) {
+                rt.lastError = "truncated ztab data: file size smaller than header records";
                 rt.file.Close();
                 return rt;
             }
@@ -1186,11 +1234,15 @@ public class RecordTable {
         blobLen = len;
     }
 
-    // 从 .zblob 读取 Blob 字节
+    // 从 .zblob 读取 Blob 字节（防大内存 OOM 与越界读安全防护）
     public byte[] ReadBlobBytesLocked(long offset, int len) {
-        if (len <= 0 || offset <= 0L) { return new byte[0]; }
+        if (len <= 0 || len > 67108864 || offset < (long)BLOB_HEADER_SIZE) { return new byte[0]; }
         if (this.blobFile == null || !this.blobFile.IsOpen()) {
             this.OpenOrCreateBlobFileLocked();
+        }
+        if (this.blobFile == null || !this.blobFile.IsOpen()) { return new byte[0]; }
+        if (offset + (long)len > this.blobTotalBytes && offset + (long)len > (long)this.blobFile.Size()) {
+            return new byte[0];
         }
         byte[] buf = new byte[len];
         Mutex.Lock(this.ioMtx);
@@ -1251,6 +1303,9 @@ public class RecordTable {
         try {
             if (!this.IsOpen()) { throw new InvalidOperationException("RecordTable is not open: " + this.GetError()); }
             if (row == null) { throw new ArgumentException("row cannot be null"); }
+            if (this.totalRows >= 2147483647 || this.totalRows < 0) {
+                throw new InvalidOperationException("RecordTable reached maximum 32-bit row limit (2,147,483,647)");
+            }
 
             int id = this.totalRows + 1;
             row.id = id;
@@ -1307,6 +1362,9 @@ public class RecordTable {
             if (rows == null || rows.Count == 0) { return; }
 
             int n = rows.Count;
+            if ((long)this.totalRows + (long)n > 2147483647L || this.totalRows < 0) {
+                throw new InvalidOperationException("AddBulk exceeds maximum 32-bit row limit (2,147,483,647)");
+            }
             int rbytes = this.schema.rowBytes;
             firstId = this.totalRows + 1;
 
