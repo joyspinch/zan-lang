@@ -286,6 +286,11 @@ public class WebDavClient {
     // 独占写锁请求（RFC 4918 §9.10）：获取资源锁定，返回包含状态码与响应体的 HttpResponse。
     // timeoutSec <= 0 表示无限期锁 ("Infinite")，>0 表示 "Second-{timeoutSec}"。
     public async HttpResponse LockAsync(string path, string owner, int timeoutSec) {
+        return await this.LockAsync(path, owner, timeoutSec, false);
+    }
+
+    // 写锁请求（RFC 4918 §9.10）：isShared 为 true 则请求共享锁 (<D:shared/>)，否则为独占锁 (<D:exclusive/>)。
+    public async HttpResponse LockAsync(string path, string owner, int timeoutSec, bool isShared) {
         HttpClient client = this.NewHttpClient();
         client.SetHeader("Content-Type", "application/xml; charset=utf-8");
         client.SetHeader("Depth", "0");
@@ -298,9 +303,10 @@ public class WebDavClient {
         if (owner != null && owner.Length > 0) {
             ownerXml = "<D:owner><D:href>" + WebDavClient.EscapeXml(owner) + "</D:href></D:owner>";
         }
+        string scopeTag = isShared ? "<D:shared/>" : "<D:exclusive/>";
         string body = "<?xml version=\"1.0\" encoding=\"utf-8\"?>"
             + "<D:lockinfo xmlns:D=\"DAV:\">"
-            + "<D:lockscope><D:exclusive/></D:lockscope>"
+            + "<D:lockscope>" + scopeTag + "</D:lockscope>"
             + "<D:locktype><D:write/></D:locktype>"
             + ownerXml
             + "</D:lockinfo>";
@@ -384,7 +390,22 @@ public class WebDavClient {
             return token;
         }
         if (resp.body != null && resp.body.Length > 0) {
-            return WebDavClient.TagValue(resp.body, "locktoken");
+            string tokenInner = WebDavClient.TagInner(resp.body, "locktoken");
+            if (tokenInner != null && tokenInner.Length > 0) {
+                string href = WebDavClient.TagValue(tokenInner, "href");
+                if (href != null && href.Length > 0) {
+                    string res = href.Trim();
+                    if (res.Length >= 2 && (res[0] & 255) == 60 && (res[res.Length - 1] & 255) == 62) {
+                        res = res.Substring(1, res.Length - 2);
+                    }
+                    return res;
+                }
+                string res2 = WebDavClient.UnescapeXml(WebDavClient.Trim(tokenInner));
+                if (res2.Length >= 2 && (res2[0] & 255) == 60 && (res2[res2.Length - 1] & 255) == 62) {
+                    res2 = res2.Substring(1, res2.Length - 2);
+                }
+                return res2;
+            }
         }
         return "";
     }
