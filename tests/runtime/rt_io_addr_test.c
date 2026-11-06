@@ -40,12 +40,32 @@ static void check_v4(const char *text, int allow_loopback, int expected) {
     }
 }
 
+static void check_v4_ex(const char *text, int allow_loopback, int allow_private, int expected) {
+    struct sockaddr_in a = v4_addr(text);
+    int got = zan_io_sockaddr_is_safe_ex(&a, (int32_t)sizeof(a), allow_loopback, allow_private);
+    if (got != expected) {
+        fprintf(stderr, "FAIL: v4_ex %s allow_lb=%d allow_priv=%d got=%d want=%d\n",
+                text, allow_loopback, allow_private, got, expected);
+        fail = 1;
+    }
+}
+
 static void check_v6(const char *text, int allow_loopback, int expected) {
     struct sockaddr_in6 a = v6_addr(text);
     int got = zan_io_sockaddr_is_safe(&a, (int32_t)sizeof(a), allow_loopback);
     if (got != expected) {
         fprintf(stderr, "FAIL: v6 %s allow=%d got=%d want=%d\n",
                 text, allow_loopback, got, expected);
+        fail = 1;
+    }
+}
+
+static void check_v6_ex(const char *text, int allow_loopback, int allow_private, int expected) {
+    struct sockaddr_in6 a = v6_addr(text);
+    int got = zan_io_sockaddr_is_safe_ex(&a, (int32_t)sizeof(a), allow_loopback, allow_private);
+    if (got != expected) {
+        fprintf(stderr, "FAIL: v6_ex %s allow_lb=%d allow_priv=%d got=%d want=%d\n",
+                text, allow_loopback, allow_private, got, expected);
         fail = 1;
     }
 }
@@ -108,6 +128,34 @@ int main(void) {
     check_v6("::8.8.8.8", 1, 1);
     check_v6("2001:0000:4136:e378:8000:63bf:3fff:fdd2", 1, 0);
     check_v6("2001:0000:4136:e378:8000:63bf:8787:8787", 1, 1);
+
+    /* 测试 zan_io_sockaddr_is_safe_ex 的 allow_private 开关 */
+    check_v4_ex("10.1.2.3", 1, 0, 0);
+    check_v4_ex("10.1.2.3", 1, 1, 1);
+    check_v4_ex("172.16.0.1", 1, 0, 0);
+    check_v4_ex("172.16.0.1", 1, 1, 1);
+    check_v4_ex("172.31.255.254", 1, 0, 0);
+    check_v4_ex("172.31.255.254", 1, 1, 1);
+    check_v4_ex("192.168.1.1", 1, 0, 0);
+    check_v4_ex("192.168.1.1", 1, 1, 1);
+    check_v4_ex("169.254.1.2", 1, 0, 0);
+    check_v4_ex("169.254.1.2", 1, 1, 1);
+    check_v4_ex("100.64.0.1", 1, 0, 0);
+    check_v4_ex("100.64.0.1", 1, 1, 1);
+    check_v4_ex("127.0.0.1", 0, 1, 0);
+    check_v4_ex("127.0.0.1", 1, 0, 1);
+    check_v4_ex("0.1.2.3", 1, 1, 0);
+    check_v4_ex("224.0.0.1", 1, 1, 0);
+
+    check_v6_ex("fc00::1", 1, 0, 0);
+    check_v6_ex("fc00::1", 1, 1, 1);
+    check_v6_ex("fd12:3456::1", 1, 0, 0);
+    check_v6_ex("fd12:3456::1", 1, 1, 1);
+    check_v6_ex("fe80::1", 1, 0, 0);
+    check_v6_ex("fe80::1", 1, 1, 1);
+    check_v6_ex("ff02::1", 1, 1, 0);
+    check_v6_ex("::ffff:10.0.0.1", 1, 0, 0);
+    check_v6_ex("::ffff:10.0.0.1", 1, 1, 1);
 
     memset(records, 0xa5, sizeof(records));
     int n = (int)zan_io_resolve_all("127.0.0.1", 80, records, sizeof(records));

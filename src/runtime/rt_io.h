@@ -44,6 +44,9 @@ int32_t zan_io_sockaddr_family(const void *sa, int32_t len);
 /* 检查目标地址是否为公网可路由地址（排除本地回环） */
 int32_t zan_io_sockaddr_is_safe(const void *sa, int32_t len,
                                int32_t allow_loopback);
+/* 检查目标地址类别，支持配置允许回环 (allow_loopback) 和允许私网 (allow_private) */
+int32_t zan_io_sockaddr_is_safe_ex(const void *sa, int32_t len,
+                                  int32_t allow_loopback, int32_t allow_private);
 
 /* 启动底层 sockaddr 原始连接：已连接返回 0，进行中返回 EINPROGRESS，错误返回正数错误码 */
 int32_t zan_io_connect_sa_start(intptr_t fd, const void *sa, int32_t salen);

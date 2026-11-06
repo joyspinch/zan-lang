@@ -436,6 +436,11 @@ int zan_io_sockaddr_is_safe(const void *sa, int len, int allow_loopback) {
     return 0;
 }
 
+int zan_io_sockaddr_is_safe_ex(const void *sa, int len, int allow_loopback, int allow_private) {
+    (void)sa; (void)len; (void)allow_loopback; (void)allow_private;
+    return 0;
+}
+
 const char *zan_io_sockaddr_ip_str(const void *sa) {
     (void)sa;
     g_wasm_shared_string[0] = '\0';

@@ -641,8 +641,8 @@ int32_t zan_io_sockaddr_family(const void *sa, int32_t len) {
 }
 
 /* 连接目标地址类别判定 (环回/私网/公网) */
-int32_t zan_io_sockaddr_is_safe(const void *sa, int32_t len,
-                               int32_t allow_loopback) {
+int32_t zan_io_sockaddr_is_safe_ex(const void *sa, int32_t len,
+                                  int32_t allow_loopback, int32_t allow_private) {
     int family = zan_io_sockaddr_family(sa, len);
     if (family == AF_INET) {
         const struct sockaddr_in *v4 = (const struct sockaddr_in *)sa;
@@ -650,11 +650,20 @@ int32_t zan_io_sockaddr_is_safe(const void *sa, int32_t len,
         uint32_t first = a >> 24;
         uint32_t second = (a >> 16) & 255u;
         if (first == 127u) return allow_loopback ? 1 : 0;
-        if (first == 0u || first == 10u || first >= 224u || first >= 240u)
+        if (first == 0u || first >= 224u || first >= 240u)
             return 0;
-        if (first == 169u && second == 254u) return 0;
-        if (first == 172u && second >= 16u && second <= 31u) return 0;
-        if (first == 192u && second == 168u) return 0;
+        /* RFC 1918 私网与链路本地/CGNAT 地址判定 */
+        if (first == 10u)
+            return allow_private ? 1 : 0;
+        if (first == 169u && second == 254u)
+            return allow_private ? 1 : 0;
+        if (first == 172u && second >= 16u && second <= 31u)
+            return allow_private ? 1 : 0;
+        if (first == 192u && second == 168u)
+            return allow_private ? 1 : 0;
+        if (first == 100u && second >= 64u && second <= 127u)
+            return allow_private ? 1 : 0;
+
         if (first == 192u && second == 0u) return 0;
         uint32_t third = (a >> 8) & 255u;
         if (first == 192u && second == 2u) return 0;
@@ -662,7 +671,6 @@ int32_t zan_io_sockaddr_is_safe(const void *sa, int32_t len,
         if (first == 198u && second >= 18u && second <= 19u) return 0;
         if (first == 198u && second == 51u && third == 100u) return 0;
         if (first == 203u && second == 0u && third == 113u) return 0;
-        if (first == 100u && second >= 64u && second <= 127u) return 0;
         if (a == 0xffffffffu) return 0;
         return 1;
     }
@@ -675,9 +683,9 @@ int32_t zan_io_sockaddr_is_safe(const void *sa, int32_t len,
         int loop = 1;
         for (int i = 0; i < 15; i++) if (b[i] != 0) loop = 0;
         if (loop && b[15] == 1) return allow_loopback ? 1 : 0;
-        if ((b[0] & 0xfeu) == 0xfcu) return 0;       /* ULA fc00::/7 */
+        if ((b[0] & 0xfeu) == 0xfcu) return allow_private ? 1 : 0;       /* ULA fc00::/7 */
         if ((b[0] & 0xfeu) == 0xfeu && (b[1] & 0xc0u) == 0x80u)
-            return 0;                                 /* link-local fe80::/10 */
+            return allow_private ? 1 : 0;                                 /* link-local fe80::/10 */
         if (b[0] == 0xffu) return 0;                  /* multicast */
         if (b[0] == 0x20u && b[1] == 0x01u && b[2] == 0x0du
             && b[3] == 0xb8u) return 0;               /* documentation */
@@ -688,8 +696,8 @@ int32_t zan_io_sockaddr_is_safe(const void *sa, int32_t len,
             memset(&mapped4, 0, sizeof(mapped4));
             mapped4.sin_family = AF_INET;
             memcpy(&mapped4.sin_addr, b + 12, 4);
-            return zan_io_sockaddr_is_safe(&mapped4,
-                (int32_t)sizeof(mapped4), allow_loopback);
+            return zan_io_sockaddr_is_safe_ex(&mapped4,
+                (int32_t)sizeof(mapped4), allow_loopback, allow_private);
         }
         /* Teredo 隧道 IPv6 地址解析 */
         if (b[0] == 0x20u && b[1] == 0x01u && b[2] == 0x00u && b[3] == 0x00u) {
@@ -698,11 +706,11 @@ int32_t zan_io_sockaddr_is_safe(const void *sa, int32_t len,
             memset(&t4, 0, sizeof(t4));
             t4.sin_family = AF_INET;
             memcpy(&t4.sin_addr, b + 4, 4);
-            if (!zan_io_sockaddr_is_safe(&t4, (int32_t)sizeof(t4), allow_loopback))
+            if (!zan_io_sockaddr_is_safe_ex(&t4, (int32_t)sizeof(t4), allow_loopback, allow_private))
                 return 0;
             for (int i = 0; i < 4; i++) cli[i] = (unsigned char)(b[12 + i] ^ 0xffu);
             memcpy(&t4.sin_addr, cli, 4);
-            return zan_io_sockaddr_is_safe(&t4, (int32_t)sizeof(t4), allow_loopback);
+            return zan_io_sockaddr_is_safe_ex(&t4, (int32_t)sizeof(t4), allow_loopback, allow_private);
         }
         int v4_off = -1;
         if (b[0] == 0x20u && b[1] == 0x02u)
@@ -716,11 +724,16 @@ int32_t zan_io_sockaddr_is_safe(const void *sa, int32_t len,
             memset(&e4, 0, sizeof(e4));
             e4.sin_family = AF_INET;
             memcpy(&e4.sin_addr, b + v4_off, 4);
-            return zan_io_sockaddr_is_safe(&e4, (int32_t)sizeof(e4), allow_loopback);
+            return zan_io_sockaddr_is_safe_ex(&e4, (int32_t)sizeof(e4), allow_loopback, allow_private);
         }
         return 1;
     }
     return 0;
+}
+
+int32_t zan_io_sockaddr_is_safe(const void *sa, int32_t len,
+                               int32_t allow_loopback) {
+    return zan_io_sockaddr_is_safe_ex(sa, len, allow_loopback, 0);
 }
 
 int32_t zan_io_resolve_all(const char *name, int32_t port, void *buf,

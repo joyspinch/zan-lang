@@ -532,6 +532,12 @@ public class TlsEngine {
             } else {
                 return this.HandleFinished(fullMsg, body);
             }
+        } else if (msgType == TlsRecord.HandshakeNewSessionTicket) {
+            // RFC 5077 §3.3 / RFC 8446 §4.6.1：
+            // 服务端发出的 NewSessionTicket 在 TLS 1.2 中位于 Finished 之前，
+            // 必须计入握手 transcript，否则随后 Finished 校验的 verify_data 必败。
+            this.transcript.Update(fullMsg);
+            return 0;
         } else if (msgType == TlsRecord.HandshakeKeyUpdate) {
             // RFC 8446 §4.6.3：KeyUpdate 要求双方滚动流量密钥；未实现却
             // 静默忽略会让对端切换写密钥后本端所有记录解密失败，连接
@@ -1054,7 +1060,8 @@ public class TlsEngine {
     }
 
     int HandleFinishedTls12(byte[] fullMsg, byte[] body) {
-        byte[] expectedVerifyData = Hkdf.Tls12Prf(this.tls12MasterSecret, "server finished", this.transcriptHashBeforeFinished, 12);
+        byte[] th = this.transcript.CurrentHash();
+        byte[] expectedVerifyData = Hkdf.Tls12Prf(this.tls12MasterSecret, "server finished", th, 12);
         if (body.Length != 12 || expectedVerifyData == null) {
             this.Fail("TLS 1.2 Server Finished 长度不符");
             return -1;
@@ -1068,6 +1075,7 @@ public class TlsEngine {
             return -1;
         }
 
+        this.transcript.Update(fullMsg);
         this.peerAuthenticated = !this.disableVerify;
         this.state = StateConnected;
         return 1;
