@@ -1,0 +1,57 @@
+using System;
+
+namespace System.Net.Sse;
+
+// SSE 行分帧：把到达的字节切成一行行完整的数据行。
+//
+// ## 为什么需要它
+//
+// 一次到达的字节可能把一行切成两半（"data: {\"a\":" + "1}\n\n"）。
+// 所以要有半个行的缓冲，跨次拼接。
+//
+// ## 收尾要**补处理**残留的半行
+//
+// SSE 允许最后一个事件不带空行收尾。客户端若只在遇到 "\n" 时才处理行，
+// 流结束时缓冲区里剩下的那半行就会被**静默丢掉**——收流正常结束、内容
+// 却少一截，而且**没有任何错误提示**。所以 `Flush` 把残留半行按完整的
+// 一行交出来。
+//
+// 与 SseClient（完整 SSE 协议层：事件块/字段/心跳）是两个关注点——
+// 只需要"按行消费 data: 负载"的流式消费方（AI 流式补全等）用本类。
+// B-ID164：原先 Zan.Ai/Zan.Mvc/ide_zan 各自手写同构逻辑，收拢至此。
+public class SseLineReader {
+    // 还没凑齐一行的残留字节。
+    string pending;
+
+    public SseLineReader() {
+        this.pending = "";
+    }
+
+    // 喂进新到的字节。
+    public void Feed(string data) {
+        if (data == null || data.Length == 0) { return; }
+        this.pending = this.pending + data;
+    }
+
+    // 取下一行**非空**行（空行是 SSE 的事件分隔符，没有内容，直接跳过）。
+    //
+    // 没有完整的一行时返回空串。跳过空行不是偷懒：调用方拿"空串"当"没有
+    // 更多行了"的信号，若把空行也交出去，调用方就会把"这一批处理完了"
+    //误当成"整个缓冲处理完了"，把后面还没读的行留在缓冲里。
+    public string Next() {
+        while (true) {
+            int nl = this.pending.IndexOf("\n");
+            if (nl < 0) { return ""; }
+            string line = this.pending.Substring(0, nl).Trim();
+            this.pending = this.pending.Substring(nl + 1);
+            if (line.Length > 0) { return line; }
+        }
+    }
+
+    // 流结束时把残留的半行按完整的一行交出来（没有则返回空串）。
+    public string Flush() {
+        string rest = this.pending.Trim();
+        this.pending = "";
+        return rest;
+    }
+}

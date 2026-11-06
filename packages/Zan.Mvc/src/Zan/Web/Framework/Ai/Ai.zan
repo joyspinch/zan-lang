@@ -4,6 +4,7 @@ using System.Json;
 using System.Net.External;
 using System.Net.Http;
 using System.Net.Http.Client;
+using System.Net.Sse;
 using System.Text;
 using System.Web;
 using Zan.Web.Security;
@@ -321,7 +322,10 @@ public class Ai {
         ep.Path() + "/chat/completions", w.ToJson(), sink));
 
         StringBuilder full = new StringBuilder();
-        string pending = "";
+        /* B-ID164：行分帧收拢到 Zan.Net 的 SseLineReader——原先这里手写的
+         * pending+IndexOf 循环与 Zan.Ai 的 SseLineReader 逐句同构（含"流
+         * 结束补处理残留半行"契约），四份平行实现收拢为一件。 */
+        SseLineReader lines = new SseLineReader();
         bool finished = false;
         string streamError = "";
         while (!finished) {
@@ -336,11 +340,9 @@ public class Ai {
                 if (finished) { break; }
                 continue;
             }
-            pending = pending + piece;
-            int nl = pending.IndexOf("\n");
-            while (nl >= 0) {
-                string line = pending.Substring(0, nl).Trim();
-                pending = pending.Substring(nl + 1);
+            lines.Feed(piece);
+            string line = lines.Next();
+            while (line.Length > 0) {
                 AiStreamFrame f = Delta(line);
                 if (f.kind == "error") {
                     /* 流内错误帧：不是"用户断开"，也不是传输层错误。
@@ -361,7 +363,7 @@ public class Ai {
                     if (!await ctx.SseSend("delta",
                     Json.Serialize<AiDeltaDoc>(d))) {
                         /* 用户关闭面板：先让 producer 在安全的 transport
-                        * 边界拆掉上游；不能在其仍运行时 Dispose sink。 */
+                         * 边界拆掉上游；不能在其仍运行时 Dispose sink。 */
                         sink.Abort();
                         await WaitStreamProducer(producer);
                         sink.Dispose();
@@ -369,7 +371,7 @@ public class Ai {
                         return AiReply.Bad("客户端已断开");
                     }
                 }
-                nl = pending.IndexOf("\n");
+                line = lines.Next();
             }
             if (finished) { break; }
         }
@@ -378,8 +380,9 @@ public class Ai {
          * （SSE 允许这样收尾，最后一个事件不必有空行）。这半行要按
          * 完整的一行处理，否则最后一个分片会被**静默丢掉**——收流
          * 正常结束、内容却少一截，且没有任何错误提示。 */
-        if (streamError.Length == 0 && pending.Trim().Length > 0) {
-            AiStreamFrame f = Delta(pending.Trim());
+        if (streamError.Length == 0) {
+            string rest = lines.Flush();
+            AiStreamFrame f = Delta(rest);
             if (f.kind == "error") {
                 streamError = f.text;
             } else if (f.kind == "delta") {
