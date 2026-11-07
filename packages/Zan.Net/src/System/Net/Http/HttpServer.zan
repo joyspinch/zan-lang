@@ -38,8 +38,11 @@ public class HttpServer : IDisposable {
     public int port;
     private bool running;
     public int maxConnections;
+    public int maxConnectionsPerIp;
     public int activeConnections;
     private List<nint> activeSockets;
+    private Dictionary<nint, string> socketIps;
+    private Dictionary<string, int> ipConnections;
     private int requestTimeout;
     private int maxRequestBytes;
     private int maxHeaderBytes;
@@ -52,8 +55,11 @@ public class HttpServer : IDisposable {
         this.port = port;
         this.running = false;
         this.maxConnections = 10000;
+        this.maxConnectionsPerIp = 0;
         this.activeConnections = 0;
         this.activeSockets = new List<nint>();
+        this.socketIps = new Dictionary<nint, string>();
+        this.ipConnections = new Dictionary<string, int>();
         this.requestTimeout = 30000;
         this.maxRequestBytes = 1048576;
         this.maxHeaderBytes = 16384;
@@ -66,6 +72,15 @@ public class HttpServer : IDisposable {
         if (max < 1) { max = 1; }
         if (max > 1000000) { max = 1000000; }
         this.maxConnections = max;
+        return this;
+    }
+
+    // 设置单个 IP 允许的最大并发连接数（0 表示不限制）。
+    // 防止单客户端建立巨量连接耗尽服务端连接槽（Connection Slot Exhaustion）。
+    public HttpServer SetMaxConnectionsPerIp(int max) {
+        if (max < 0) { max = 0; }
+        if (max > 100000) { max = 100000; }
+        this.maxConnectionsPerIp = max;
         return this;
     }
 
@@ -180,6 +195,20 @@ public class HttpServer : IDisposable {
             if (this.activeConnections >= this.maxConnections) {
                 return false;
             }
+            if (this.maxConnectionsPerIp > 0) {
+                string ip = Socket.RemoteIp(clientSock);
+                if (ip != null && ip.Length > 0) {
+                    int cur = 0;
+                    if (this.ipConnections.ContainsKey(ip)) {
+                        cur = this.ipConnections[ip];
+                    }
+                    if (cur >= this.maxConnectionsPerIp) {
+                        return false;
+                    }
+                    this.ipConnections[ip] = cur + 1;
+                    this.socketIps[clientSock] = ip;
+                }
+            }
             this.activeConnections = this.activeConnections + 1;
             this.activeSockets.Add(clientSock);
             return true;
@@ -192,6 +221,18 @@ public class HttpServer : IDisposable {
             this.activeConnections = this.activeConnections - 1;
             if (this.activeSockets != null) {
                 this.activeSockets.Remove(clientSock);
+            }
+            if (this.socketIps != null && this.socketIps.ContainsKey(clientSock)) {
+                string ip = this.socketIps[clientSock];
+                this.socketIps.Remove(clientSock);
+                if (this.ipConnections != null && this.ipConnections.ContainsKey(ip)) {
+                    int c = this.ipConnections[ip] - 1;
+                    if (c <= 0) {
+                        this.ipConnections.Remove(ip);
+                    } else {
+                        this.ipConnections[ip] = c;
+                    }
+                }
             }
         }
     }
