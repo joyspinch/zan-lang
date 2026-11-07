@@ -134,11 +134,11 @@ static bool parse_top_level_decl(zan_parser_t *p, zan_ast_node_t *unit);
 
 
 /* Composite Dispatcher Submodules */
-#include "parser_type.c"
-#include "parser_expr_primary.c"
-#include "parser_expr.c"
-#include "parser_stmt_decl.c"
-#include "parser_stmt.c"
-#include "parser_member.c"
-#include "parser_type_decl.c"
-#include "parser_unit.c"
+#include "parser/parser_type.c"
+#include "parser/parser_expr_primary.c"
+#include "parser/parser_expr.c"
+#include "parser/parser_stmt_decl.c"
+#include "parser/parser_stmt.c"
+#include "parser/parser_member.c"
+#include "parser/parser_type_decl.c"
+#include "parser/parser_unit.c"

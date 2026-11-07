@@ -318,11 +318,11 @@ static char *read_file_arena(zan_arena_t *arena, const char *path, size_t *out_l
     return buf;
 }
 
-#include "main_sources.c"
+#include "driver/main_sources.c"
 
 
 
-#include "main_prune.c"
+#include "driver/main_prune.c"
 
 static void zan_apply_lex_defines(zan_lexer_t *lex, zan_target_t target,
                                   const char *const *pp_defines,
@@ -422,9 +422,9 @@ static zan_ast_node_t *parse_secondary_unit(const char *path,
     return unit;
 }
 
-#include "main_synth.c"
-#include "main_dump.c"
-#include "main_driver.c"
+#include "driver/main_synth.c"
+#include "driver/main_dump.c"
+#include "driver/main_driver.c"
 
 static int zan_run_archiver(const char *tool, const char *format,
                             const char *arc, const char *obj) {
@@ -536,7 +536,7 @@ static int zan_write_static_lib(const char *obj, const char *arc,
 }
 
 
-#include "main_options.c"
+#include "driver/main_options.c"
 
 
 int main(int argc, char **argv) {
@@ -784,11 +784,11 @@ int main(int argc, char **argv) {
         return 0;
     }
 
-#include "main_frontend.c"
+#include "driver/main_frontend.c"
 
-#include "main_codegen.c"
+#include "driver/main_codegen.c"
 
-#include "main_linker.c"
+#include "driver/main_linker.c"
 
 
         phase("link");
