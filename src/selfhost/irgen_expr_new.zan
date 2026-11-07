@@ -27,7 +27,7 @@ partial class Irgen {
             string sidx = NT();
             L("  " + sidx + " = select i1 " + isn + ", i64 0, i64 " + idx.op);
             string ln = NT();
-            L("  " + ln + " = call i64 @zstr_len(i8* " + bstr + ")");
+            L("  " + ln + " = call i64 @zstr_len(i8* " + obj.op + ")");
             string neg = NT();
             L("  " + neg + " = icmp slt i64 " + sidx + ", 0");
             string ge = NT();
@@ -116,10 +116,45 @@ partial class Irgen {
         string flat = idx.op;
         int rk2 = ArrRankOf(obj.ty);
         if (rk2 > 1) { flat = MdFlatIndex(e, obj.op, rk2, idx.op); }
+        // B-ID183：一维数组 null + 越界守卫（镜像 C 宿主 irgen_expr_access.c
+        // emit_index_bounds_check + emit_string_base_guard 同款；B-ID182 字符
+        // 串同模式）。旧实现裸 GEP：越界读越界内存（探针负索引读到数组头
+        // 垃圾）、null 无报告；宿主 null 数组索引更是直接段错误（探针
+        // _scratch/arrprobe）。双轨：try 内 null 抛 NullReferenceException、
+        // 越界抛 IndexOutOfRangeException；try 外 soft 报告 + 落零页、越界
+        // 索引钳 0（读 0 号元素，双端口径一致）。
+        string abase = obj.op;
+        if (rk2 == 1) {
+            string isn = NT();
+            L("  " + isn + " = icmp eq i64* " + obj.op + ", null");
+            EmitRuntimeCheckIf(e, isn,
+                "null reference where a string/byte buffer is required (element access)");
+            string zp = NT();
+            L("  " + zp + " = getelementptr inbounds [16 x i8], [16 x i8]* @.zeropage, i64 0, i64 0");
+            string zarr = NT();
+            L("  " + zarr + " = bitcast i8* " + zp + " to i64*");
+            string bsel = NT();
+            L("  " + bsel + " = select i1 " + isn + ", i64* " + zarr + ", i64* " + obj.op);
+            string lp = NT();
+            L("  " + lp + " = getelementptr i64, i64* " + bsel + ", i64 -1");
+            string ln = NT();
+            L("  " + ln + " = load i64, i64* " + lp);
+            string neg = NT();
+            L("  " + neg + " = icmp slt i64 " + flat + ", 0");
+            string ge = NT();
+            L("  " + ge + " = icmp sge i64 " + flat + ", " + ln);
+            string oob = NT();
+            L("  " + oob + " = or i1 " + neg + ", " + ge);
+            EmitRuntimeCheckIf(e, oob, "array index out of bounds");
+            string safe = NT();
+            L("  " + safe + " = select i1 " + oob + ", i64 0, i64 " + flat);
+            abase = bsel;
+            flat = safe;
+        }
         if (esz2 == 1) {
             // a byte array: one byte per element
             string ab = NT();
-            L("  " + ab + " = bitcast i64* " + obj.op + " to i8*");
+            L("  " + ab + " = bitcast i64* " + abase + " to i8*");
             L("  " + p2 + " = getelementptr i8, i8* " + ab + ", i64 " + flat);
             string bv = NT();
             L("  " + bv + " = load i8, i8* " + p2);
@@ -128,7 +163,7 @@ partial class Irgen {
             if (elemTy2 != null) { return FromSlot(z, elemTy2); }
             return new ExprVal(z, MkType("int"));
         }
-        L("  " + p2 + " = getelementptr i64, i64* " + obj.op + ", i64 " + flat);
+        L("  " + p2 + " = getelementptr i64, i64* " + abase + ", i64 " + flat);
         string v = NT();
         L("  " + v + " = load i64, i64* " + p2);
         // T[] element: unpack the i64 slot to the declared element type

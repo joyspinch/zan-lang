@@ -649,6 +649,11 @@ public class Checker {
         }
         if (k == AK.CastExpr()) { return e.type; }
         if (k == AK.AsExpr()) { return e.type; }
+        if (k == AK.Lambda()) {
+            if (e.type != null) { return e.type; }
+            if (e.a != null) { return InferType(e.a); }
+            return null;
+        }
         if (k == AK.AwaitExpr()) { return InferType(e.a); }
         if (k == AK.NewExpr()) { return e.type; }
         if (k == AK.CallInit()) { return InferType(e.a); }
@@ -2167,22 +2172,63 @@ public class Checker {
         }
         if (k == AK.Lambda()) {
             int mark = ScopeMark();
+            Node retTy = null;
+            List<Node> expectedParamTypes = new List<Node>();
+            if (curTargetType != null) {
+                if (binder.IsDelegateName(curTargetType.sval)) {
+                    Node d = binder.FindDelegate(curTargetType.sval);
+                    if (d != null) {
+                        retTy = d.type;
+                        int pi = 0;
+                        while (pi < d.kids.Count) {
+                            if (d.kids[pi].kind == AK.Param()) {
+                                expectedParamTypes.Add(d.kids[pi].type);
+                            }
+                            pi = pi + 1;
+                        }
+                    }
+                } else if (curTargetType.sval == "Func" && curTargetType.kids.Count > 0) {
+                    retTy = curTargetType.kids[curTargetType.kids.Count - 1];
+                    int pi = 0;
+                    while (pi < curTargetType.kids.Count - 1) {
+                        expectedParamTypes.Add(curTargetType.kids[pi]);
+                        pi = pi + 1;
+                    }
+                } else if (curTargetType.sval == "Action") {
+                    retTy = MkType("void");
+                    int pi = 0;
+                    while (pi < curTargetType.kids.Count) {
+                        expectedParamTypes.Add(curTargetType.kids[pi]);
+                        pi = pi + 1;
+                    }
+                }
+            }
             int i = 0;
+            int pidx = 0;
             while (i < n.kids.Count) {
                 Node p = n.kids[i];
-                if (p.kind == AK.Param()) { ScopeAdd(p.sval, p.type); }
+                if (p.kind == AK.Param()) {
+                    if ((p.type == null || p.type.sval == "var") && pidx < expectedParamTypes.Count) {
+                        p.type = expectedParamTypes[pidx];
+                    }
+                    pidx = pidx + 1;
+                    ScopeAdd(p.sval, p.type);
+                }
                 i = i + 1;
             }
-            // A lambda returns ITS OWN value, not the enclosing method's: the
-            // return type of a lambda is not known here (the self-hosted
-            // checker does not type a lambda from its context), so the
-            // `return` statements inside its body are not policed against the
-            // enclosing method.
             Node saveRet = curRet;
-            curRet = null;
-            CheckExpr(n.a);
+            curRet = retTy;
+            if (n.a != null) {
+                CheckExpr(n.a);
+                if (retTy == null) {
+                    retTy = InferType(n.a);
+                }
+            }
             CheckStmt(n.d);
             curRet = saveRet;
+            if (n.type == null && retTy != null) {
+                n.type = retTy;
+            }
             ScopeTrim(mark);
             return;
         }

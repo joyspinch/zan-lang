@@ -41,6 +41,9 @@ partial class Irgen {
             EmitTempReleases();
         } else if (k == AK.ReturnStmt()) {
             if (s.a != null) {
+                if (s.a.kind == AK.Lambda() && curRetTy != null && IsDelegate(curRetTy)) {
+                    AnnotateLambda(s.a, curRetTy);
+                }
                 stmtTemps = new List<string>(); stmtTempTypes = new List<Node>();
                 ExprVal v = GenExpr(s.a);
                 if (curRet == "void") {
@@ -1365,15 +1368,13 @@ partial class Irgen {
 
     void GenVarDecl(Node s) {
         if (curAsync) {
-            int pli = LocalIdx(s.sval);
-            if (pli >= 0) {
-                Node pty0 = locType[pli]; string preg0 = locReg[pli]; string plt0 = MapType(pty0);
+            int slot = (int)s.ival;
+            if (slot >= 0 && slot < asyncLocalRegs.Count) {
+                Node pty0 = asyncLocalTypes[slot]; string preg0 = asyncLocalRegs[slot];
+                bool isBx = asyncLocalBox[slot]; string plt0 = MapType(pty0);
                 if (s.b != null) {
                     ExprVal iv0 = GenExpr(s.b);
-                    if (curAsync && locBox[pli]) {
-                        // the local lives in a heap cell: allocate it here and
-                        // keep the cell pointer in the spill slot, so the cell
-                        // survives a suspension
+                    if (isBx) {
                         string c = NT();
                         L("  " + c + " = call i8* @malloc(i64 " + TypeSizeBytes(plt0) + ")");
                         string p = NT();
@@ -1390,15 +1391,9 @@ partial class Irgen {
                         EmitArcRetain(sv0, pty0);
                     }
                 } else {
-                    // No initializer: a value struct still needs its zeroed
-                    // storage (the sync path allocates it below) -- without it
-                    // the local keeps the garbage of the frame slot and the
-                    // first field write goes to a wild address.
                     Node sd0 = binder.FindType(pty0.sval);
                     if (sd0 != null && sd0.kind == AK.StructDecl() && pty0.ival == 0 && !IsNullable(pty0)) {
-                        if (curAsync && locBox[pli]) {
-                            // the local lives in a heap cell: the cell holds
-                            // the struct instance
+                        if (isBx) {
                             string c = NT();
                             L("  " + c + " = call i8* @malloc(i64 " + TypeSizeBytes(plt0) + ")");
                             string p = NT();
@@ -1414,6 +1409,14 @@ partial class Irgen {
                         L("  store " + plt0 + " null, " + plt0 + "* " + preg0);
                     }
                 }
+                locName.Add(s.sval);
+                locType.Add(pty0);
+                locReg.Add(preg0);
+                locBox.Add(isBx);
+                locIter.Add(false);
+                locCell.Add("");
+                locRef.Add(false);
+                locOpaque.Add(false);
                 return;
             }
         }
@@ -2329,10 +2332,12 @@ partial class Irgen {
             finActive.Add(mark);
             GenStmt(s.c);
             finActive.RemoveAt(finActive.Count - 1);
-            string ev1 = NT(); L("  " + ev1 + " = load i8*, i8** " + sv2);
-            L("  store i8* " + ev1 + ", i8** @__exc_val");
-            string td1 = NT(); L("  " + td1 + " = load i8*, i8** " + st2);
-            L("  store i8* " + td1 + ", i8** @__exc_tid");
+            if (!term) {
+                string ev1 = NT(); L("  " + ev1 + " = load i8*, i8** " + sv2);
+                L("  store i8* " + ev1 + ", i8** @__exc_val");
+                string td1 = NT(); L("  " + td1 + " = load i8*, i8** " + st2);
+                L("  store i8* " + td1 + ", i8** @__exc_tid");
+            }
         }
         if (!term) {
             if (s.b == null) {

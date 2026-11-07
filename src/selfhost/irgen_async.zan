@@ -1081,10 +1081,32 @@ partial class Irgen {
             Node ty = s.type; if (ty == null) { ty = res.ty; }
             string lt = MapType(ty);
             string reg;
-            if (curAsync) { reg = locReg[LocalIdx(s.sval)]; }
-            else { reg = AddLocal(s.sval, ty); L("  " + reg + " = alloca " + lt); }
+            bool isBx = false;
+            if (curAsync) {
+                int slot = (int)s.ival;
+                if (slot >= 0 && slot < asyncLocalRegs.Count) {
+                    reg = asyncLocalRegs[slot];
+                    isBx = asyncLocalBox[slot];
+                } else {
+                    reg = AddLocal(s.sval, ty);
+                    L("  " + reg + " = alloca " + lt);
+                }
+            } else {
+                reg = AddLocal(s.sval, ty);
+                L("  " + reg + " = alloca " + lt);
+            }
             string sv = Coerce(res, lt);
             L("  store " + lt + " " + sv + ", " + lt + "* " + reg);
+            if (curAsync) {
+                locName.Add(s.sval);
+                locType.Add(ty);
+                locReg.Add(reg);
+                locBox.Add(isBx);
+                locIter.Add(false);
+                locCell.Add("");
+                locRef.Add(false);
+                locOpaque.Add(false);
+            }
             // await result is already +1 owned; transfer ownership (no retain).
             return;
         }
@@ -1121,19 +1143,18 @@ partial class Irgen {
     }
     void PrescanAsyncLocals(Node s, List<string> names, List<Node> types) {
         if (s == null) { return; }
+        if (s.kind == AK.Lambda()) { return; }
         if (s.kind == AK.VarDecl()) {
-            if (!Contains(names, s.sval)) {
-                names.Add(s.sval);
-                Node ty = s.type; if (ty == null) { ty = MkType("int"); }
-                types.Add(ty);
-            }
+            s.ival = names.Count;
+            names.Add(s.sval);
+            Node ty = s.type; if (ty == null) { ty = MkType("int"); }
+            types.Add(ty);
         }
         if (s.kind == AK.IsExpr() && s.sval != null && s.sval.Length > 0) {
-            if (!Contains(names, s.sval)) {
-                names.Add(s.sval);
-                Node ty = s.type; if (ty == null) { ty = MkType("object"); }
-                types.Add(ty);
-            }
+            s.ival = names.Count;
+            names.Add(s.sval);
+            Node ty = s.type; if (ty == null) { ty = MkType("object"); }
+            types.Add(ty);
         }
         int i = 0;
         while (i < s.kids.Count) { PrescanAsyncLocals(s.kids[i], names, types); i = i + 1; }
@@ -1323,23 +1344,29 @@ partial class Irgen {
             asyncSlotReg.Add(reg); asyncSlotTy.Add(pt[j]); asyncSlotIdx.Add(paramBase + j);
             j = j + 1;
         }
+        asyncLocalRegs = new List<string>();
+        asyncLocalBox = new List<bool>();
+        asyncLocalTypes = new List<Node>();
         j = 0;
         while (j < lnames.Count) {
             string lt = MapType(ltypes[j]);
-            string reg = AddLocal(lnames[j], ltypes[j]);
-            if (ShouldBox(lnames[j])) {
+            string reg = "%v.async." + j;
+            bool bx = ShouldBox(lnames[j]);
+            if (bx) {
                 // Captured by a closure: the local lives in a heap cell and the
                 // spill slot keeps the *cell pointer* across a suspension (the
                 // resume function is a fresh call with a fresh stack, so the
                 // cell -- not the value -- is what has to survive).
                 L("  " + reg + " = alloca i8*");
-                locBox[locName.Count - 1] = true;
                 asyncBoxIdx.Add(j);
                 asyncSlotReg.Add(reg); asyncSlotTy.Add(MkType("string")); asyncSlotIdx.Add(localBase + j);
             } else {
                 L("  " + reg + " = alloca " + lt);
                 asyncSlotReg.Add(reg); asyncSlotTy.Add(ltypes[j]); asyncSlotIdx.Add(localBase + j);
             }
+            asyncLocalRegs.Add(reg);
+            asyncLocalBox.Add(bx);
+            asyncLocalTypes.Add(ltypes[j]);
             j = j + 1;
         }
         // The coroutine's trampoline handler: it catches what no try block
