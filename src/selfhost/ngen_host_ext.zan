@@ -1,0 +1,1171 @@
+using System;
+using System.Collections.Generic;
+namespace Zan;
+
+partial class Ngen {
+    void HostBegin(string sym) {
+        syms.Add(new Sym(sym, FnPad()));
+        RtPrologue(); AddSPImm(128, false);
+    }
+    void HostEnd() { AddSPImm(128, true); RtEpilogue(); }
+    void HostSave(int reg, int slot) { StrU(reg, 31, slot * 8); }
+    void HostLoad(int reg, int slot) { LdrU(reg, 31, slot * 8); }
+    void HostCmp(int a, int b) {
+        if (tgt86 == 1) {
+            if (b == 31) {
+                // cmp xa, xzr:cmp r, 0(全 64 位)
+                int r = XMapReal(a);
+                if (r < 0) { XGetV(a, 10); r = 10; }
+                X1(XrexW(0, r)); X1(0x83); X1(0xF8 | (r & 7)); X1(0);
+                return;
+            }
+            if (a == 31) {
+                // cmp xzr, xb:0 - x(保序)
+                X3(0x45, 0x31, 0xD2);            // xor r10d, r10d
+                XGetV(b, 11);
+                Xop(0x39, 10, 11);
+                return;
+            }
+            XGetV(a, 10); XGetV(b, 11); Xop(0x39, 10, 11); return;
+        }
+        E4(0xEB00001F | (b << 16) | (a << 5));
+    }
+    // x0 string, x1 byte length. Preserve both; clobber x2/x3.
+    // Native Length/indexing reads the low 32 bits at ptr-8, NOT strlen.
+    void HostStamp() {
+        LoadImm(2, 0x5A414E5300000000);
+        Uxtw32(3, 1);                          // ubfm x3, x1, #0, #31 (batch 31: was a raw word)
+        OrrRR(2, 2, 3);                        // orr x2, x2, x3
+        RtStur(2, 0, -8);
+    }
+    // Each failure site supplies a stable subsystem.operation label. The
+    // failure runtime takes x0=message; it never inspects stale errno/flags.
+    void HostFailAt(string site) {
+        LoadStr(InternStr("zan host: " + site), 0);
+        BLInternal("_zan_host_fail");
+    }
+    void HostNonzero(int reg, string site) {
+        int ok = NL(); CbnzReg(reg, ok);
+        HostFailAt(site); Mark(ok);
+    }
+    void HostZero32(string site) {
+        int ok = NL();
+        ExtCmpImm(0, 0); // cmp w0, #0 (C int results, NOT x0)
+        EmitBcond(0, ok); HostFailAt(site); Mark(ok);
+    }
+    void HostEqual(int a, int b, string site) {
+        int ok = NL(); HostCmp(a, b); EmitBcond(0, ok);
+        HostFailAt(site); Mark(ok);
+    }
+    // slot 7 retains the original File path across fopen. Print delimiters
+    // on separate lines so embedded/trailing LF in a malformed path is visible.
+    void HostFileOpened(string site) {
+        int ok = NL(); CbnzReg(0, ok);
+        LoadStr(InternStr("zan host: failed File path begins >>>"), 0); BLExtern("_puts");
+        HostLoad(0, 7); BLExtern("_puts");
+        LoadStr(InternStr("<<< failed File path ends"), 0); BLExtern("_puts");
+        HostFailAt(site); Mark(ok);
+    }
+
+    void EmitHostEntryArgs() {
+        LoadSymRef("l_.g.host_argc", 9); StrU(0, 9, 0);
+        LoadSymRef("l_.g.host_argv", 9); StrU(1, 9, 0);
+    }
+
+    void EmitHostRuntime() {
+        hostError = InternStr("zan host: I/O, allocation or argument failure");
+        hostRB = InternStr("rb"); hostWB = InternStr("wb");
+        hostNL = InternStr("\n"); hostTrue = InternStr("true"); hostFalse = InternStr("false");
+        dglbs.Add(new DGlob("host_argc", 8, dataLen)); dataLen = dataLen + 8;
+        dglbs.Add(new DGlob("host_argv", 8, dataLen)); dataLen = dataLen + 8;
+        HostEmitFail();
+        HostEmitCopy(); HostEmitSbLen(); HostEmitArgs(); HostEmitFiles(); HostEmitPaths(); HostEmitSb();
+        HostEmitExt();
+        HostEmitHost2();
+    }
+
+    // x0 = diagnostic label; puts + exit(1). The post-exit brk is ud2 on
+    // x86 (batch 31: factored out of EmitHostRuntime so the string-op
+    // faces can reach it on both lanes -- emission order unchanged).
+    void HostEmitFail() {
+        HostBegin("_zan_host_fail");
+        // x0 is the per-site diagnostic supplied by HostFailAt.
+        BLExtern("_puts");
+        LoadImm(0, 1); BLExtern("_exit");
+        if (tgt86 == 1) { X2(0x0F, 0x0B); } else { E4(0xD4200000); }   // brk if exit returns / ud2
+        HostEnd();
+    }
+
+    // x0 = C string, x1 = byte count; copy to an owning native string.
+    void HostEmitCopy() {
+        HostBegin("_zan_host_copy");
+        HostSave(0, 0); HostSave(1, 1);
+        AddImm(0, 1, 1); BLInternal("_zan_rt_str_alloc"); HostSave(0, 2);
+        HostLoad(1, 0); HostLoad(2, 1); BLExtern("_memcpy");
+        HostLoad(0, 2); HostLoad(1, 1); AddRR(2, 0, 1); Strb0(2); HostStamp();
+        HostEnd();
+    }
+
+    // x0 = string value -> x0 = byte length, trusting nothing about the
+    // producer. Managed strings carry a stamp at ptr-8: the low 32 bits
+    // hold the byte length and the high word the magic 0x5A414E53. That
+    // magic alone is not proof -- the str_alloc sentinel 0x54524D47_.53
+    // lives at raw+8 and shares the same high word, and an unstamped
+    // pointer can land right after one -- so the sentinel slot itself is
+    // ruled out too. Anything failing the check is raw (extern renders,
+    // getenv, digit buffers), where strlen is exact; raw consumers can
+    // reach this helper through locals and returns that call-shape
+    // peepholing cannot follow. Null -> 0.
+    void HostEmitSbLen() {
+        HostBegin("_zan_host_sblen");
+        HostSave(0, 0); HostSave(1, 1);
+        int isNull = NL(); CbzReg(0, isNull);
+        AddImm(9, 0, -8);
+        if (tgt86 == 1) { XGetV(9, 10); X3(0x49, 0x8B, 0x12); XSetV(9, 10); }   // ldr x9, [x9]
+        else { E4(0xF9400129); }                                // (stamp)
+        LsrImm(10, 9, 32);                     // magic word
+        LoadImm(11, 0x5A414E53);
+        HostCmp(10, 11);
+        int rawLen = NL(); EmitBcond(1, rawLen);
+        Uxtw32(10, 9);                         // len 低 32
+        LoadImm(11, 0x54524D47);
+        HostCmp(10, 11);
+        EmitBcond(0, rawLen);                  // len == sentinel low word: it is
+                                               // the str_alloc sentinel, not a stamp
+        MovRR(0, 10);
+        int fin = NL(); EmitB(fin);
+        Mark(rawLen);
+        HostLoad(0, 0); BLExtern("_strlen"); EmitB(fin);
+        Mark(isNull); LoadImm(0, 0);
+        Mark(fin);
+        HostLoad(1, 1);                        // x1 is caller-saved: strlen
+        HostEnd();                             // may trash the rendered ptr
+    }
+
+    void HostEmitArgs() {
+        HostBegin("_zan_host_argc");
+        LoadSymRef("l_.g.host_argc", 9); LdrU(0, 9, 0);
+        SubImm(0, 0, 1); HostEnd();
+        HostBegin("_zan_host_argat");
+        // C host irgen_call.c: idx >= 0 && unsigned(idx + 1) < argc.
+        // Check BEFORE adding one: negative indices and INT64_MAX must not
+        // wrap into a valid argv slot. Out-of-range returns a stamped empty
+        // string, not a diagnostic, a null pointer, or argv[0].
+        int empty = NL(); int done = NL();
+        LoadImm(1, 0); HostCmp(0, 1); EmitBcond(11, empty); // signed lt
+        AddImm(0, 0, 1);
+        LoadSymRef("l_.g.host_argc", 9); LdrU(1, 9, 0);
+        HostCmp(0, 1); EmitBcond(2, empty); // unsigned hs
+        LoadSymRef("l_.g.host_argv", 9); LdrU(1, 9, 0);
+        ExtLdrRegScaled(0, 1, 0, 3); // ldr x0, [x1, x0, lsl #3]
+        HostSave(0, 0); BLExtern("_strlen"); MovRR(1, 0);
+        HostLoad(0, 0); BLInternal("_zan_host_copy"); EmitB(done);
+        Mark(empty); LoadStr(emptyIdx, 0);
+        Mark(done); HostEnd();
+    }
+
+    void HostEmitFiles() {
+        HostBegin("_zan_host_exists");
+        LoadStr(hostRB, 1); BLExtern("_fopen");
+        int missing = NL(); int done = NL(); CbzReg(0, missing);
+        BLExtern("_fclose"); LoadImm(0, 1); EmitB(done);
+        Mark(missing); LoadImm(0, 0); Mark(done); HostEnd();
+
+        HostBegin("_zan_host_read");
+        HostSave(0, 7);
+        LoadStr(hostRB, 1); BLExtern("_fopen"); HostFileOpened("file.read.fopen"); HostSave(0, 0);
+        LoadImm(1, 0); LoadImm(2, 2); BLExtern("_fseek"); HostZero32("file.read.seek_end");
+        HostLoad(0, 0); BLExtern("_ftell");
+        LoadImm(1, 0); HostCmp(0, 1);
+        int sizeOK = NL(); EmitBcond(10, sizeOK); HostFailAt("file.read.ftell"); Mark(sizeOK);
+        HostSave(0, 1);
+        HostLoad(0, 0); LoadImm(1, 0); LoadImm(2, 0); BLExtern("_fseek"); HostZero32("file.read.seek_start");
+        HostLoad(0, 1); AddImm(0, 0, 1); BLInternal("_zan_rt_str_alloc"); HostSave(0, 2);
+        LoadImm(1, 1); HostLoad(2, 1); HostLoad(3, 0); BLExtern("_fread");
+        HostLoad(1, 1); HostEqual(0, 1, "file.read.short_read");
+        HostLoad(0, 2); HostLoad(1, 1); AddRR(2, 0, 1); Strb0(2); HostStamp();
+        HostLoad(0, 0); BLExtern("_fclose"); HostZero32("file.read.fclose");
+        HostLoad(0, 2); HostEnd();
+
+        HostBegin("_zan_host_write");
+        HostSave(0, 7);
+        HostSave(1, 1); LoadStr(hostWB, 1); BLExtern("_fopen");
+        HostFileOpened("file.write.fopen"); HostSave(0, 0);
+        HostLoad(0, 1); BLExtern("_strlen"); HostSave(0, 2);
+        MovRR(2, 0); HostLoad(0, 1); LoadImm(1, 1); HostLoad(3, 0); BLExtern("_fwrite");
+        HostLoad(1, 2); HostEqual(0, 1, "file.write.short_write");
+        HostLoad(0, 0); BLExtern("_fclose"); HostZero32("file.write.fclose"); LoadImm(0, 0); HostEnd();
+    }
+
+    void HostEmitPaths() {
+        HostBegin("_zan_host_dir");
+        HostSave(0, 0); LoadImm(0, 65536); BLInternal("_zan_rt_str_alloc"); HostSave(0, 1);
+        Strb0(0);
+        // Darwin arm64 glob_t: size 88, gl_pathc@0, gl_pathv@32.
+        // Verified against MacOSX26.2.sdk/usr/include/glob.h and clang
+        // _Static_assert(sizeof/offsetof); symbols verified as _glob/_globfree.
+        // The struct is heap allocated, separate from our fixed stack frame.
+        LoadImm(0, 1); LoadImm(1, 88); BLExtern("_calloc"); HostNonzero(0, "dir.glob_state.calloc"); HostSave(0, 2);
+        MovRR(3, 0); HostLoad(0, 0); LoadImm(1, 0); LoadImm(2, 0); BLExtern("_glob");
+        int cleanup = NL(); int loop = NL(); int haveBase = NL();
+        ExtCmpImm(0, 0); EmitBcond(1, cleanup); // any glob error -> empty, matching shim
+        LoadImm(0, 0); HostSave(0, 3); HostSave(0, 4); // i, output count
+        Mark(loop);
+        HostLoad(0, 2); LdrU(1, 0, 0); HostLoad(2, 3); HostCmp(2, 1); EmitBcond(2, cleanup);
+        LdrU(0, 0, 32);
+        ExtLdrRegScaled(0, 0, 2, 3); // ldr x0, [x0, x2, lsl #3]
+        HostSave(0, 5); LoadImm(1, 47); BLExtern("_strrchr");
+        CbzReg(0, haveBase); AddImm(0, 0, 1); HostSave(0, 5); Mark(haveBase);
+        HostLoad(0, 5); BLExtern("_strlen"); HostSave(0, 6);
+        HostLoad(1, 4); AddRR(2, 0, 1); AddImm(2, 2, 2); LoadImm(3, 65536);
+        HostCmp(2, 3); EmitBcond(8, cleanup); // keep room for newline + NUL
+        HostLoad(0, 1); AddRR(0, 0, 1); HostLoad(1, 5); HostLoad(2, 6); BLExtern("_memcpy");
+        HostLoad(0, 1); HostLoad(1, 4); HostLoad(2, 6); AddRR(1, 1, 2); AddRR(2, 0, 1);
+        LoadImm(3, 10);
+        if (tgt86 == 1) { XGetV(2, 11); XGetV(3, 10); X3(0x45, 0x88, 0x13); }   // strb w3, [x2] -> [r11]<-r10b(rm=r11 需 B+modrm 13)
+        else { E4(0x39000043); }
+        AddImm(2, 2, 1); Strb0(2); AddImm(1, 1, 1); HostSave(1, 4);
+        HostLoad(0, 3); AddImm(0, 0, 1); HostSave(0, 3); EmitB(loop);
+        Mark(cleanup);
+        HostLoad(0, 2); BLExtern("_globfree"); HostLoad(0, 2); BLExtern("_free");
+        HostLoad(0, 1); BLExtern("_strlen"); MovRR(1, 0);
+        HostLoad(0, 1); HostStamp(); HostEnd();
+
+        HostBegin("_zan_host_exedir");
+        // Query required uint32 capacity, then retry with an allocated buffer.
+        LoadImm(0, 0); HostSave(0, 0);
+        if (tgt86 == 1) { X3(0x49, 0x89, 0xE2); XSetV(1, 10); }   // x1 = sp
+        else { AddImm(1, 31, 0); }
+        BLExtern("_zan_exe_path");
+        if (tgt86 == 1) {
+            X1(0x44); X1(0x8B); X1(0x14); X1(0x24);          // mov r10d,[rsp](32位零扩展;mod=00+SIB 无位移,首版拖 X4(0) 杂字)
+            XSetV(0, 10);                      // ldr w0, [sp] (size is uint32)
+        } else {
+            E4(0xB94003E0);                    // ldr w0, [sp]
+        }
+        HostNonzero(0, "exedir.query_size"); BLExtern("_malloc"); HostNonzero(0, "exedir.path.malloc"); HostSave(0, 1);
+        if (tgt86 == 1) { X3(0x49, 0x89, 0xE2); XSetV(1, 10); } else { AddImm(1, 31, 0); }
+        BLExtern("_zan_exe_path"); HostZero32("exedir.get_path");
+        HostLoad(0, 1); LoadImm(1, 0); BLExtern("_realpath"); HostNonzero(0, "exedir.realpath"); HostSave(0, 2);
+        HostLoad(0, 1); BLExtern("_free");
+        HostLoad(0, 2); LoadImm(1, 47); BLExtern("_strrchr"); HostNonzero(0, "exedir.dirname");
+        HostLoad(1, 2); ExtSubRR(2, 0, 1); // sub x2, x0, x1 (dirname length)
+        int nonroot = NL(); CbnzReg(2, nonroot); LoadImm(2, 1); Mark(nonroot);
+        MovRR(0, 1); MovRR(1, 2); BLInternal("_zan_host_copy"); HostSave(0, 3);
+        HostLoad(0, 2); BLExtern("_free"); HostLoad(0, 3); HostEnd();
+    }
+
+    void HostEmitSb() {
+        HostBegin("_zan_host_sb_new");
+        LoadImm(0, 40); LoadImm(1, 0); BLInternal("_zan_rt_alloc");
+        // Core alloc is zero-filled, 40 = 16-byte header + 24-byte payload.
+        HostEnd();
+
+        HostBegin("_zan_host_sb_append");
+        // (ptr sb, ptr s, i64 len): the CALL SITE supplies the length --
+        // the managed stamp word for strings, strlen for the digit renders
+        // (int2str's raw malloc buffer has no stamp, but its digits can
+        // never hold a NUL). A strlen on a managed string would drop any
+        // embedded NUL (UrlDecode's %00), so it is wrong there.
+        HostSave(0, 0); HostSave(1, 1); HostSave(2, 2);
+        int empty = NL(); CbzReg(1, empty); // null append is empty
+        HostLoad(1, 0); LdrU(2, 1, 0); HostSave(2, 3);
+        HostLoad(0, 2);                        // x0 = len (call-site supplied)
+        // need=count+len, reject carry and signed overflow before allocation.
+        if (tgt86 == 1) {
+            XGetV(0, 10); XGetV(2, 11);
+            X3(0x4D, 0x01, 0xDA);              // add r10, r11(置 CF,== arm64 adds)
+            XSetV(0, 10);                      // mov/store 不碰 flags
+        } else {
+            E4(0xAB020000);                    // adds x0, x0, x2
+        }
+        int sumOK = NL();
+        // ADD 旗标:arm64 ADDS 与 x86 ADD 的 CF 同为"无符号溢出"——但
+        // XccOf 的 cond 2/3 映射是按 SUB/CMP 语义写的(x86 jb=CF=1 当
+        // below),在 ADD 旗标上正好反转:x86 要 jae(CF=0=无进位),arm64
+        // 仍是 CC(cond 3)。
+        if (tgt86 == 1) { EmitBcond(2, sumOK); } else { EmitBcond(3, sumOK); }
+        HostFailAt("sb.append.size_carry"); Mark(sumOK);
+        LoadImm(1, 0); HostCmp(0, 1);
+        int positive = NL(); EmitBcond(10, positive); HostFailAt("sb.append.size_signed_overflow"); Mark(positive);
+        HostSave(0, 4);
+        HostLoad(1, 0); LdrU(2, 1, 8); HostCmp(0, 2);
+        int enough = NL(); EmitBcond(9, enough); // unsigned ls
+        // capacity = max(need, cap*2, 64); cap <= INT64_MAX / 2 else need.
+        LoadImm(3, 4611686018427387903); HostCmp(2, 3);
+        int useNeed = NL(); EmitBcond(8, useNeed);
+        AddRR(2, 2, 2); HostCmp(2, 0); EmitBcond(2, useNeed);
+        MovRR(2, 0);
+        Mark(useNeed);
+        // Overflow branch above must select need, not retain oversized cap.
+        HostCmp(2, 3); int bounded = NL(); EmitBcond(9, bounded);
+        HostLoad(2, 4); Mark(bounded);
+        LoadImm(3, 64); HostCmp(2, 3); int minOK = NL(); EmitBcond(2, minOK);
+        MovRR(2, 3); Mark(minOK); HostSave(2, 5);
+        HostLoad(0, 0); LdrU(0, 0, 16); MovRR(1, 2); BLExtern("_realloc"); HostNonzero(0, "sb.grow.realloc");
+        HostLoad(1, 0); StrU(0, 1, 16); HostLoad(2, 5); StrU(2, 1, 8);
+        Mark(enough);
+        HostLoad(0, 0); LdrU(0, 0, 16); HostLoad(1, 3); AddRR(0, 0, 1);
+        HostLoad(1, 1); HostLoad(2, 2);
+        int noCopy = NL(); CbzReg(2, noCopy); BLExtern("_memcpy"); Mark(noCopy);
+        HostLoad(0, 0); HostLoad(1, 4); StrU(1, 0, 0);
+        Mark(empty); HostLoad(0, 0); HostEnd();
+
+        HostBegin("_zan_host_sb_string");
+        LdrU(1, 0, 0); LdrU(0, 0, 16);
+        // Empty builders have a null buffer: avoid even a zero-byte memcpy
+        // with null by substituting a valid empty literal.
+        int hasData = NL(); CbnzReg(0, hasData); LoadStr(emptyIdx, 0); Mark(hasData);
+        BLInternal("_zan_host_copy"); HostEnd();
+    }
+
+    // ===================== extended conformance families =====================
+    // Additive host surfaces behind the same hooks (HostExtRetTy feeds
+    // HostCallRetTy, TryGenHostExtCall sits behind TryGenHostCall,
+    // TryGenHostExtMember behind TryGenHostMember, HostEmitExt behind
+    // EmitHostRuntime). Recognition only fires for members the user has not
+    // defined, mirroring HostStatic's UserDefinesClsMember guard.
+    //
+    // Families: Hex, Base64, Sha256/Sha1/Md5/Sha512, Hmac.Sha256Mac (the
+    // CommonCrypto entry points are re-exported by libSystem, so -lSystem
+    // alone resolves them), Encoding.Base64Encode/UrlDecode/UrlEncode/
+    // WebSocketAccept, Encoding.UTF8.GetBytes/GetString (U+FFFD replacement
+    // identical to the stdlib Zan), string.ToBytes, byte[].ToStr,
+    // Guid.New/Parse/ToString, Otp hash-algorithm constants and the missing
+    // string ops (LastIndexOf/Trim/ToUpper/ToLower/StartsWith/EndsWith/
+    // Equals/CompareTo/String.Format/string.Join). The byte-shaping helpers
+    // reproduce the stdlib Zan implementations observable-for-observable.
+    //
+    // Layouts (must stay in lockstep with the core emitters):
+    //  * string: 16-byte header, magic|byte length at ptr-8, NUL at ptr+len
+    //  * array:  user ptr = raw+32; count at ptr-16; data at ptr+0 with
+    //    8-byte element slots (byte arrays store one byte per slot)
+    //  * List<T>: count at +0, cap at +8, data at +16 (8-byte slots)
+    //
+    // Runtime-ABI discipline is the host one: x0..x7 inputs, x0 result,
+    // 128-byte frames, sp slots carry values across libc, loop bodies either
+    // keep state in registers (no calls) or spill to slots (strncmp loops).
+
+        int extTblHex;
+        int extSlash;
+        int extBSlash;
+        int extDot;
+        int extTmp;
+        int extTmpDir;
+        int extZero;
+        int extDash;
+        int extColon;
+        int extSpace;
+    int extTblB64;
+    int extWsGuid;
+    int extEmpty;
+    int extTrue;
+    int extFalse;
+    int ioHome;
+    int ioTemp;
+    int ioTmp;
+    int ioTmpdir;
+    int ioXdgCfg;
+    int ioDotConfig;
+    int ioSlashTmp;
+    int extDollar;
+
+    // ---- codegen shorthands ----
+    // (batch 31: the string-op family's helpers carry x86 arms; the
+    // byte/half/word shorthands the io/utf8 faces use stay raw and are
+    // caught by the E4 gate if ever reached on x86)
+    void ExtUbfmLo(int rd, int rn, int hi) {
+        // rd = rn & ((1<<(hi+1))-1); hi==31 is the 32-bit zero-extend the
+        // length header needs (arm64 ubfm == Uxtw32's word). Other masks
+        // only serve the utf8 face -- fail closed rather than guess.
+        if (tgt86 == 1) {
+            // rd = rn & ((1<<(hi+1))-1):utf8 面用 hi=3/4/5/15 等位宽掩码,
+            // 批 35 一并移植(hi==31 的 32 位零扩展仍是 Uxtw32 快道)
+            if (hi == 31) { Uxtw32(rd, rn); return; }
+            if (hi == 63) { ExtMov(rd, rn); return; }
+            XGetV(rn, 10);
+            XLoadImm(17, (1L << (hi + 1)) - 1);
+            X3(0x4D, 0x23, 0xD3);                // and r10, r11
+            XSetV(rd, 10);
+            return;
+        }
+        E4(0xD3400000 | ((hi & 63) << 10) | (rn << 5) | rd);
+    }
+    void ExtLdrbReg(int rt, int rn, int rm) {
+        // ldrb rt,[rn,rm]: arm64 word identical to EmitArrElemLoad's byte
+        // arm -- one call serves both lanes
+        if (tgt86 == 1) { EmitArrElemLoad(1, "byte", rn, rm, rt); return; }
+        E4(0x38606800 | (rm << 16) | (rn << 5) | rt);
+    }
+    void ExtStrbImm(int rt, int rn, int imm) {
+        if (tgt86 == 1) {
+            // strb rt,[rn+imm8]: value->r10b, base->r11; rt==31 (wzr) stores 0
+            if (rt == 31) { X3(0x45, 0x31, 0xD2); } else { XGetV(rt, 10); }
+            XGetV(rn, 11);
+            // REX 必须 45(R|B):44 的 rm=011 无 B 位解码成 [rbx]——首跑
+            // 字节全落垃圾基址,缓冲区保持 malloc 零页,输出空串
+            X3(0x45, 0x88, 0x53); X1(imm & 0xFF);    // mov byte [r11+disp8], r10b
+            return;
+        }
+        E4(0x39000000 | (imm << 10) | (rn << 5) | rt);
+    }
+    void ExtSubRR(int rd, int rn, int rm) {
+        if (tgt86 == 1) { XGetV(rn, 10); XGetV(rm, 11); Xop(0x29, 10, 11); XSetV(rd, 10); return; }
+        E4(0xCB000000 | (rm << 16) | (rn << 5) | rd);
+    }
+    void ExtCmpImm(int rn, int imm) {
+        if (tgt86 == 1) { XGetV(rn, 10); XLoadImm(17, imm); Xop(0x39, 10, 11); return; }
+        E4(0xF1000000 | (imm << 10) | (rn << 5) | 31);
+    }
+    void ExtMov(int rd, int rm) {
+        if (tgt86 == 1) { XGetV(rm, 10); XSetV(rd, 10); return; }
+        E4(0xAA000000 | (rm << 16) | (31 << 5) | rd); // mov rd, rm (rn = xzr)
+    }
+    void ExtPush(int r) { if (tgt86 == 1) { XPushR(r); return; } E4(0xF81F0FE0 | r); }
+    void ExtPop(int r) { if (tgt86 == 1) { XPopV(r); return; } E4(0xF84107E0 | r); }
+    // io/utf8-face shorthands, still arm64-only (the E4 gate names them
+    // if an x86 emission ever reaches them)
+    void ExtLsl(int rd, int rn, int n) {
+        // ubfm r=(64-n) s=63-n:x86 侧语义 = (x ROL n) & (2^(64-n)-1)——
+        // 首位进位被掩掉;LslImm 的纯 shl 对大数高位不等价,故此处按
+        // rol+and 精确翻译(batch 35)
+        if (tgt86 == 1) {
+            if (n == 0) { ExtMov(rd, rn); return; }
+            XGetV(rn, 10);
+            X1(0x49); X1(0xC1); X1(0xC2); X1(n & 63);          // rol r10, n
+            XLoadImm(17, (1L << (64 - n)) - 1);
+            X3(0x4D, 0x23, 0xD3);                              // and r10, r11
+            XSetV(rd, 10);
+            return;
+        }
+        E4(0xD3400000 | (((64 - n) & 63) << 16) | ((63 - n) << 10) | (rn << 5) | rd);
+    }
+    void ExtLsr(int rd, int rn, int n) {
+        if (tgt86 == 1) { LsrImm(rd, rn, n); return; }
+        E4(0xD3400000 | ((n & 63) << 16) | (63 << 10) | (rn << 5) | rd);
+    }
+    void ExtLdrbImm(int rt, int rn, int imm) {
+        if (tgt86 == 1) {
+            XGetV(rn, 11);
+            X3(0x45, 0x0F, 0xB6); X1(0x5B); X1(imm & 0xFF);   // movzx r11d, byte [r11+disp8]
+            XSetV(rt, 11);
+            return;
+        }
+        E4(0x39400000 | (imm << 10) | (rn << 5) | rt);
+    }
+    void LeafRet() {                             // 无帧叶子的裸返回(batch 34 hexval/utf8)
+        if (tgt86 == 1) { X1(0xC3); return; }
+        E4(0xD65F03C0);                          // ret(首版误写自递归)
+    }
+    // 批 35:x86 SysV 返回值走 rax,arm64 的 x0 身兼参数与返回——首版叶面
+    // (nibble/hexval)把结果留在 v0(rdi)就裸 ret,调用方读 rax 只见陈旧值
+    void LeafRetV0() {
+        if (tgt86 == 1) { XGetV(0, 0); X1(0xC3); return; }   // v0 -> rax(裸 0 = rax;XGetV 第二参是裸寄存器号)
+        E4(0xD65F03C0);
+    }
+    void ExtStrbReg(int rt, int rn, int rm) {
+        if (tgt86 == 1) {
+            XGetV(rn, 11);
+            XGetV(rm, 9);
+            X1(0x4F); X1(0x8D); X1(0x1C); X1(0x0B);          // lea r11,[r11+r9](mod=00 无位移;首版拖 X4(0) 4 个 00 被当 addb 执行)
+            XGetV(rt, 10);
+            X3(0x45, 0x88, 0x13);                // mov byte [r11], r10b(44/1A 双错:B 位与 reg/rm 互换)
+            return;
+        }
+        E4(0x38206800 | (rm << 16) | (rn << 5) | rt);
+    }
+    void ExtOrr(int rd, int rn, int rm) {
+        if (tgt86 == 1) { OrrRR(rd, rn, rm); return; }
+        E4(0xAA000000 | (rm << 16) | (rn << 5) | rd);
+    }
+    void ExtStrScaled(int rt, int rn, int rm) {
+        if (tgt86 == 1) {
+            XGetV(rn, 11);
+            XGetV(rm, 2);
+            X1(0x4D); X1(0x8D); X1(0x1C); X1(0xD3);          // lea r11,[r11+rdx*8](dest=r11 需 R——49 解码成 lea rbx)
+            XGetV(rt, 10);
+            X3(0x49, 0x89, 0x13);                // mov [r11], r10
+            return;
+        }
+        E4(0xF8207800 | (rm << 16) | (rn << 5) | rt); // str xt, [xn, xm, lsl #3]
+    }
+    void ExtUbfmR(int rd, int rn, int immr, int imms) {
+        if (tgt86 == 1) {
+            XGetV(rn, 10);
+            if (imms >= immr) {
+                // UBFX: (x >> lsb) & ((1<<width)-1)
+                if (immr > 0) { X1(0x49); X1(0xC1); X1(0xEA); X1(immr & 63); }   // shr r10, imm8
+                long w = imms - immr + 1;
+                if (w < 64) { XLoadImm(17, (1L << w) - 1); X3(0x4D, 0x23, 0xD3); }   // and r10, r11
+            } else {
+                // 位域回绕:(x ROL (64-r)) & (2^(s+1)-1)
+                int rl = (64 - immr) & 63;
+                if (rl > 0) { X1(0x49); X1(0xC1); X1(0xC2); X1(rl); }            // rol r10, imm8
+                if (imms < 63) { XLoadImm(17, (1L << (imms + 1)) - 1); X3(0x4D, 0x23, 0xD3); }
+            }
+            XSetV(rd, 10);
+            return;
+        }
+        E4(0xD3400000 | ((immr & 63) << 16) | ((imms & 63) << 10) | (rn << 5) | rd);
+    }
+    // ldr xt, [xn, xm](UXTX/SXTX 对 64 位寄存器等价):表/指针数组取元素
+    void ExtLdrReg(int rt, int rn, int rm) {
+        if (tgt86 == 1) {
+            XGetV(rn, 11);
+            XGetV(rm, 10);
+            // 批 35:同 ExtLdrRegScaled——首版 lea 拖 X4(0) 杂字 + 载入写
+            // 1B(reg 域 011=rbx 裸踩,rt 读陈旧 r10)。改为 4F 8B 1C SIB =
+            // mov r11,[r11+r10],值经 r11 直落 rt
+            X1(0x4F); X1(0x8B); X1(0x1C); X1(0x13);
+            XSetV(rt, 11);
+            return;
+        }
+        E4(0xF8606800 | (rm << 16) | (rn << 5) | rt);
+    }
+    void ExtLdrRegScaled(int rt, int rn, int rm, int sh) {
+        if (tgt86 == 1) {
+            XGetV(rn, 11);
+            XGetV(rm, 10);
+            // 批 35:4F 8B 1C SIB = mov r11,[r11+r10<<sh](SIB=sh<<6|0x13,
+            // mod=00 无位移)。首版 lea 后拖了 X4(0)——4 个 00 字节被
+            // 当真指令执行(addb %al,(%rax),写 rip 相对数据槽);载入又
+            // 写 1B(reg 域 011=rbx,r10 要 REX.R 的 0x13)——rbx 被裸踩
+            // (SysV 被调者保存),rt 拿到陈旧 r10。argat/dir/format/
+            // join 四面全中此雷
+            X1(0x4F); X1(0x8B); X1(0x1C); X1((sh << 6) | 0x13);
+            XSetV(rt, 11);
+            return;
+        }
+        E4(0xF8607800 | (rm << 16) | (rn << 5) | rt);   // ldr xt, [xn, xm, lsl #sh]
+    }
+    void ExtUdiv(int rd, int rn, int rm) {
+        if (tgt86 == 1) { UdivRR(rd, rn, rm); return; }
+        E4(0x9AC00800 | (rm << 16) | (rn << 5) | rd);
+    }
+    void ExtMsub(int rd, int rn, int rm, int ra) {
+        if (tgt86 == 1) {
+            XGetV(rn, 10);
+            XGetV(rm, 11);
+            X3(0x4D, 0x0F, 0xAF); X1(0xD3);      // imul r10, r11(积)
+            // 批 35:ra 装进 r11(积算完 rm 已死)——首版装 r9,而 r9 是
+            // v5 的家:b64 的 groups 家被 rem 覆写,随后 ExtLsl(7,5,2)
+            // 读到 rem*4 当 outlen,malloc 请求恒为 rem*4+1(len15 请求
+            // 1 字节却写 20 字节,libmalloc tiny 元数据被砸,free 自旋)
+            XGetV(ra, 11);
+            // sub 方向——0x29 是 sub r10, r11(积-ra);0x2B 才是
+            // r11 = ra - 积(mod=11 reg=011+REX.R rm=010+REX.B -> 0xDA)
+            X3(0x4D, 0x2B, 0xDA);                // sub r11, r10
+            XSetV(rd, 11);
+            return;
+        }
+        E4(0x9B008000 | (rm << 16) | (ra << 10) | (rn << 5) | rd); // rd = ra - rn*rm
+    }
+    void ExtMadd(int rd, int rn, int rm, int ra) {
+        if (tgt86 == 1) { MaddRR(rd, rn, rm, ra); return; }
+        E4(0x9B000000 | (rm << 16) | (ra << 10) | (rn << 5) | rd); // rd = ra + rn*rm
+    }
+
+    // x0 = string -> x0 = byte length (header low 32 bits; null = 0)
+    void ExtLenOf(int src, int dst) {
+        int isn = NL(); int fin = NL();
+        CbnzReg(src, isn);
+        LoadImm(dst, 0); EmitB(fin);
+        Mark(isn);
+        AddImm(dst, src, -8);
+        LdrU(dst, dst, 0);
+        ExtUbfmLo(dst, dst, 31);
+        Mark(fin);
+    }
+
+    // x0 = array -> x0 = element count (null = 0)
+    void ExtCountOf(int src, int dst) {
+        int isn = NL(); int fin = NL();
+        CbnzReg(src, isn);
+        LoadImm(dst, 0); EmitB(fin);
+        Mark(isn);
+        if (tgt86 == 1) { XMemV(1, dst, src, -16); }   // ldur dst, [src, #-16] (batch 34)
+        else { E4(0xF85F0000 | (src << 5) | dst); }
+        Mark(fin);
+    }
+
+    // x0 = min(max(x0, 0), x1)
+    void ExtClampLen() {
+        ExtCmpImm(0, 0);
+        int nonneg = NL();
+        EmitBcond(10, nonneg);
+        LoadImm(0, 0);
+        Mark(nonneg);
+        HostCmp(0, 1);                          // cmp x0, x1
+        int ok = NL();
+        EmitBcond(9, ok);                        // b.ls keep x0
+        ExtMov(0, 1);
+        Mark(ok);
+    }
+
+    // ---- recognition helpers ----
+
+    // does this expression carry a scalar integer value? (Length member
+    // accesses, integer literals, integer-typed locals/fields/statics/calls)
+    bool ExtIsIntExpr(Node e) {
+        if (e == null) { return false; }
+        if (e.kind == AK.IntLit()) { return true; }
+        if (e.kind == AK.MemberAccess() && e.sval == "Length") { return true; }
+        string t = null;
+        if (e.kind == AK.Ident()) {
+            int li = LocalIdx(e.sval);
+            if (li >= 0) { t = locTy[li]; }
+            if (t == null) { Fld f = CurField(e.sval); if (f != null) { t = f.ty; } }
+            if (t == null) { t = FindStaticTy(curCls, e.sval); }
+        } else if (e.kind == AK.Call()) {
+            t = CallRetTy(e);
+        } else if (e.kind == AK.MemberAccess()) {
+            Fld f = FieldOf(e);
+            if (f != null) { t = f.ty; }
+        }
+        return t == "int" || t == "long" || t == "short" || t == "byte"
+            || t == "sbyte" || t == "uint" || t == "ushort";
+    }
+
+    // dotted static-path receiver: matches Encoding.UTF8.GetBytes(...)
+    bool ExtStaticQ(Node e, string path, string name, int count) {
+        if (e == null || e.kind != AK.Call() || e.a == null) { return false; }
+        Node m = e.a;
+        if (m.kind != AK.MemberAccess() || m.sval != name) { return false; }
+        Node r = m.a;
+        bool walking = true;
+        while (walking) {
+            int dot = -1;
+            int i = 0;
+            while (i < path.Length) {
+                if (path.Substring(i, 1) == ".") { dot = i; }
+                i = i + 1;
+            }
+            string tail = dot >= 0 ? path.Substring(dot + 1, path.Length - dot - 1) : path;
+            if (r == null || (r.kind != AK.Ident() && r.kind != AK.MemberAccess())
+                    || r.sval != tail) { return false; }
+            r = r.a;
+            if (dot < 0) { walking = false; }
+            else {
+                path = path.Substring(0, dot);
+                if (path.Length == 0) { return false; }
+            }
+        }
+        return r == null && e.kids.Count == count;
+    }
+
+    // does this expression carry host byte-array identity (declared
+    // array-typed local/field/static, a new array, or a call the host
+    // itself types as an array)?
+    bool ExtIsBytes(Node a) {
+        if (a == null) { return false; }
+        if (a.kind == AK.Call()) {
+            string t = HostCallRetTy(a);
+            if (t != null && t.Length > 1 && t.Substring(t.Length - 2, 2) == "[]") { return true; }
+            // a stdlib/user static call declares its own result type:
+            // Cls.Method(...) whose return type is an array
+            if (a.a != null && a.a.kind == AK.MemberAccess() && a.a.a != null
+                    && a.a.a.kind == AK.Ident()) {
+                if (StatMethRetArrTy(a.a.a.sval, a.a.sval)) { return true; }
+            }
+            // any other call shape (an instance method like pkt.Data()):
+            // the checker-stamped static type decides
+            t = StaticTyOf(a);
+            return t != null && t.Length > 1 && t.Substring(t.Length - 2, 2) == "[]";
+        }
+        if (a.kind == AK.NewExpr() && a.ival == 1) { return true; }
+        if (a.kind == AK.MemberAccess()) {
+            // this.field / obj.field receivers (WebSocket's this.dataBuf,
+            // TlsStream's this.scratch): the declared field type decides
+            Fld f = FieldOf(a);
+            return f != null && IsArrTy(f.ty);
+        }
+        if (a.kind == AK.Ident()) {
+            int li = LocalIdx(a.sval);
+            if (li >= 0) { return IsArrTy(locTy[li]); }
+            Fld f = CurField(a.sval);
+            if (f != null) { return IsArrTy(f.ty); }
+            return IsArrTy(FindStaticTy(curCls, a.sval));
+        }
+        return false;
+    }
+
+    // is there a static method Cls.name whose declared return type is an
+    // array type? (typing `Cls.name(...)` receivers for the ToStr/ToBytes
+    // builtins, e.g. Hex.Decode(...).ToStr(...))
+    bool StatMethRetArrTy(string cls, string name) {
+        List<int> cs = MethCandsClsName(cls, name);
+        if (cs == null) { return false; }
+        int i = 0;
+        while (i < cs.Count) {
+            if (methStat[cs[i]] == 1) {
+                string rt = TypeFullName(methNodes[cs[i]].type);
+                return rt != null && rt.Length > 1
+                    && rt.Substring(rt.Length - 2, 2) == "[]";
+            }
+            i = i + 1;
+        }
+        return false;
+    }
+
+    // ---- typing (consumed by CallRetTy through HostCallRetTy) ----
+
+    string HostExtRetTy(Node e) {
+        if (e == null || e.kind != AK.Call() || e.a == null
+                || e.a.kind != AK.MemberAccess()) { return null; }
+        string name = e.a.sval;
+        Node r = e.a.a;
+        int n = e.kids.Count;
+        // instance families on string receivers (r may be any string expr);
+        // name gate BEFORE IsStrExpr: typing the receiver re-walks
+        // fluent-chain prefixes at every level (exponential in chain length)
+        if (r != null && (name == "ToBytes" || name == "LastIndexOf"
+                || name == "Contains" || name == "Split" || name == "Trim"
+                || name == "ToUpper" || name == "ToLower" || name == "StartsWith"
+                || name == "EndsWith" || name == "Equals" || name == "CompareTo"
+                || name == "Substring")
+                && IsStrExpr(r)) {
+            if (name == "ToBytes" && n == 0 && !UserDefinesClsMember(null, "ToBytes")) { return "byte[]"; }
+            if (!UserDefinesClsMember(null, name)) {
+                if (name == "LastIndexOf" && n == 1) { return "int"; }
+                if (name == "Contains" && n == 1) { return "bool"; }
+                if (name == "Split" && n == 1) { return "List<string>"; }
+                if (name == "Trim" && n == 0) { return "string"; }
+                if ((name == "ToUpper" || name == "ToLower") && n == 0) { return "string"; }
+                if ((name == "StartsWith" || name == "EndsWith") && n == 1) { return "bool"; }
+                if (name == "Equals" && n == 1) { return "bool"; }
+                if (name == "CompareTo" && n == 1) { return "int"; }
+                // a chained `x.F().Substring(...)` needs the call's return
+                // type before the extension fallback can type ITS receiver
+                if (name == "Substring" && (n == 1 || n == 2)) { return "string"; }
+            }
+        }
+        // instance family on array receivers
+        if (name == "ToStr" && (n == 0 || n == 2) && ExtIsBytes(r)
+                && !UserDefinesClsMember(null, "ToStr")) { return "string"; }
+        // scalar.ToString(): built-in property chains (Length/Count), plain
+        // scalars and int property getters — the receiver carries no field
+        // symbol, so the generic member path cannot type the call
+        if (name == "ToString" && n == 0 && r != null
+                && !UserDefinesClsMember(null, "ToString")
+                && HostToStrArgKind(r) != null) { return "string"; }
+        // dotted static families (Encoding.UTF8.*): the receiver is a
+        // MemberAccess, so these must be claimed before the Ident-only gate
+        if (ExtStaticQ(e, "Encoding.UTF8", "GetBytes", 1)) { return "byte[]"; }
+        if (ExtStaticQ(e, "Encoding.UTF8", "GetString", 1)
+                || ExtStaticQ(e, "Encoding.UTF8", "GetString", 3)) { return "string"; }
+        if (r == null || r.kind != AK.Ident()) { return null; }
+        string cls = r.sval;
+        if ((cls == "Sha256" || cls == "Sha1" || cls == "Md5" || cls == "Sha512")
+                && name == "Hash" && n == 2 && !UserDefinesClsMember(cls, "Hash")) { return "byte[]"; }
+        if (cls == "Hmac" && name == "Sha256Mac" && n == 4
+                && !UserDefinesClsMember("Hmac", "Sha256Mac")) { return "byte[]"; }
+        if (cls == "Hex" && !UserDefinesClsMember("Hex", name)) {
+            if (name == "Encode" && n == 2) { return "string"; }
+            if (name == "Decode" && n == 1) { return "byte[]"; }
+        }
+        if (cls == "Base64" && name == "Encode" && n == 2
+                && !UserDefinesClsMember("Base64", "Encode")) { return "string"; }
+        if (cls == "Guid" && !UserDefinesClsMember("Guid", name)) {
+            if (name == "New" && n == 0) { return "string"; }
+            if (name == "Parse" && n == 1) { return "Guid"; }
+            if (name == "ToString" && n == 1) { return "string"; }
+        }
+        if (cls == "Encoding" && !UserDefinesClsMember("Encoding", name)) {
+            if (name == "Base64Encode" && n == 1) { return "string"; }
+            if (name == "UrlDecode" && n == 1) { return "string"; }
+            if (name == "UrlEncode" && n == 1) { return "string"; }
+            if (name == "WebSocketAccept" && n == 1) { return "string"; }
+        }
+        if (cls == "Convert" && name == "ToString" && n == 1
+                && !UserDefinesClsMember("Convert", "ToString")) {
+            Node ca = e.kids[0];
+            if (ExtIsIntExpr(ca) || IsBoolExpr(ca) || IsStrExpr(ca)) { return "string"; }
+        }
+        // String.Format / string.Join (both spellings of the class name)
+        if ((cls == "String" || cls == "string") && !UserDefinesClsMember(cls, name)) {
+            if (name == "Format" && n >= 1 && n <= 4) { return "string"; }
+            if (name == "Join" && n == 2) { return "string"; }
+        }
+        return null;
+    }
+
+    // static constant reads (Otp.SHA1 / SHA256 / SHA512)
+    bool TryGenHostExtMember(Node e) {
+        if (e == null || e.kind != AK.MemberAccess() || e.a == null) { return false; }
+        if (e.a.kind == AK.Ident() && e.a.sval == "Otp" && !UserDefinesClsMember("Otp", e.sval)) {
+            if (e.sval == "SHA1") { LoadImm(0, 1); return true; }
+            if (e.sval == "SHA256") { LoadImm(0, 2); return true; }
+            if (e.sval == "SHA512") { LoadImm(0, 3); return true; }
+        }
+        return false;
+    }
+
+    // ---- call generation ----
+
+    bool TryGenHostExtCall(Node e) {
+        if (e == null || e.kind != AK.Call() || e.a == null
+                || e.a.kind != AK.MemberAccess()) { return false; }
+        string name = e.a.sval;
+        Node r = e.a.a;
+        int n = e.kids.Count;
+
+        // ---- string instance ops ----
+        if (r != null && IsStrExpr(r)) {
+            if (n == 0 && name == "ToBytes" && !UserDefinesClsMember(null, "ToBytes")) {
+                GenExpr(r);
+                BLInternal("_zan_ext_to_bytes");
+                return true;
+            }
+            if (!UserDefinesClsMember(null, name)) {
+                if (n == 0 && (name == "ToLower" || name == "ToUpper" || name == "Trim")) {
+                    GenExpr(r);
+                    BLInternal(name == "ToLower" ? "_zan_ext_str_lower"
+                        : name == "ToUpper" ? "_zan_ext_str_upper" : "_zan_ext_str_trim");
+                    return true;
+                }
+                if (n == 1 && name == "Contains") {
+                    GenExpr(r);
+                    ExtPush(0);
+                    GenExpr(e.kids[0]);
+                    if (IsCharExpr(e.kids[0])) { BLInternal("_zan_rt_chrstr"); }
+                    ExtPush(0);
+                    ExtPop(1);                     // x1 = the needle
+                    ExtPop(0);                     // x0 = the receiver
+                    BLInternal("_zan_ext_str_contains");
+                    return true;
+                }
+                if (n == 1 && name == "Split") {
+                    // str.Split(sep) -> fresh List<string> of every segment
+                    // (empty separator yields the whole string; empty
+                    // segments are kept, including the tail)
+                    GenExpr(r);
+                    ExtPush(0);
+                    GenExpr(e.kids[0]);
+                    if (IsCharExpr(e.kids[0])) { BLInternal("_zan_rt_chrstr"); }
+                    ExtPush(0);
+                    LoadImm(0, 4);
+                    BLInternal("_zan_host_list_new");
+                    ExtPush(0);                    // list (top of stack)
+                    ExtPop(2);                     // x2 = list
+                    ExtPop(1);                     // x1 = sep
+                    ExtPop(0);                     // x0 = receiver
+                    BLInternal("_zan_str_split");  // returns the list in x0
+                    return true;
+                }
+                if (n == 1 && (name == "StartsWith" || name == "EndsWith"
+                        || name == "Equals" || name == "CompareTo" || name == "LastIndexOf")) {
+                    GenExpr(r);
+                    ExtPush(0);
+                    GenExpr(e.kids[0]);
+                    ExtPush(0);
+                    ExtPop(1);                     // x1 = the argument
+                    ExtPop(0);                     // x0 = the receiver
+                    BLInternal(name == "StartsWith" ? "_zan_ext_str_startswith"
+                        : name == "EndsWith" ? "_zan_ext_str_endswith"
+                        : name == "Equals" ? "_zan_ext_str_equals"
+                        : name == "CompareTo" ? "_zan_ext_str_compareto"
+                        : "_zan_ext_str_lastidx");
+                    return true;
+                }
+            }
+        }
+        // ---- scalar.ToString(): built-in property chains (xs.Count,
+        // sb.Length, arr.Length, s.Length), plain int/bool/char/double/ulong
+        // values and int property getters ----
+        if (n == 0 && name == "ToString" && r != null
+                && !UserDefinesClsMember(null, "ToString")) {
+            string k = HostToStrArgKind(r);
+            if (k != null) {
+                if (k == "strlen") {
+                    GenExpr(r.a);                  // string pointer
+                    E4(0xD1002009);                // sub x9, x0, #8
+                    E4(0xF9400120);                // ldr x0, [x9]
+                    E4(0xD3407C00);                // ubfm x0, x0, #0, #31
+                } else {
+                    GenExpr(r);
+                }
+                if (k == "bool") {
+                    int bf = NL(); int bd = NL();
+                    CbzReg(0, bf);
+                    LoadStr(extTrue, 0);
+                    EmitB(bd);
+                    Mark(bf);
+                    LoadStr(extFalse, 0);
+                    Mark(bd);
+                }
+                else if (k == "char") { BLInternal("_zan_rt_chrstr"); }
+                else if (k == "double") { BLInternal("_zan_rt_dbl2str"); }
+                else if (k == "ulong") { BLInternal("_zan_rt_uint2str"); }
+                else { BLInternal("_zan_rt_int2str"); }
+                return true;
+            }
+        }
+        // ---- String.Format / string.Join (both class spellings) ----
+        if (r != null && r.kind == AK.Ident()
+                && (r.sval == "String" || r.sval == "string")) {
+            if (name == "Format" && n >= 1 && n <= 4
+                    && !UserDefinesClsMember(r.sval, "Format")) {
+                GenExpr(e.kids[0]);
+                ExtPush(0);                        // fmt
+                int ai = 1;
+                while (ai < n) {
+                    Node ag = e.kids[ai];
+                    if (IsStrExpr(ag)) { GenExpr(ag); }
+                    else if (ExtIsIntExpr(ag)) { GenExpr(ag); BLInternal("_zan_rt_int2str"); }
+                    else if (IsBoolExpr(ag)) {
+                        GenExpr(ag);
+                        int bf = NL(); int bd = NL();
+                        CbzReg(0, bf);
+                        LoadStr(extTrue, 0);
+                        EmitB(bd);
+                        Mark(bf);
+                        LoadStr(extFalse, 0);
+                        Mark(bd);
+                    }
+                    else if (IsCharExpr(ag)) { GenExpr(ag); BLInternal("_zan_rt_chrstr"); }
+                    else if (IsDblExpr(ag)) { GenExpr(ag); BLInternal("_zan_rt_dbl2str"); }
+                    else if (IsUlongExpr(ag)) { GenExpr(ag); BLInternal("_zan_rt_uint2str"); }
+                    else {
+                        diags.Error("ngen host: unsupported String.Format argument type", ag.line, ag.col);
+                        LoadStr(extEmpty, 0);
+                    }
+                    ExtPush(0);
+                    ai = ai + 1;
+                }
+                if (n >= 4) { ExtPop(4); }         // arg2
+                if (n >= 3) { ExtPop(3); }         // arg1
+                if (n >= 2) { ExtPop(2); }         // arg0
+                ExtPop(0);                         // fmt
+                LoadImm(1, n - 1);                 // argc
+                BLInternal("_zan_ext_str_format");
+                return true;
+            }
+            if (name == "Join" && n == 2
+                    && !UserDefinesClsMember(r.sval, "Join")) {
+                GenExpr(e.kids[1]);
+                ExtPush(0);                        // list
+                GenExpr(e.kids[0]);                // sep -> x0
+                ExtPop(1);                         // x1 = list
+                // x86 车道走 zan 原生 join(零 C 面);arm64 维持 host 面
+                BLInternal(tgt86 == 1 ? "_zan_rt_strjoin" : "_zan_ext_str_join");
+                return true;
+            }
+        }
+        // ---- Encoding.UTF8 static family ----
+        if (ExtStaticQ(e, "Encoding.UTF8", "GetBytes", 1)
+                && !UserDefinesClsMember("Encoding", "GetBytes")) {
+            GenExpr(e.kids[0]);
+            BLInternal("_zan_ext_to_bytes");
+            return true;
+        }
+        if (ExtStaticQ(e, "Encoding.UTF8", "GetString", 1)
+                && !UserDefinesClsMember("Encoding", "GetString")) {
+            GenExpr(e.kids[0]);
+            BLInternal("_zan_ext_utf8_getstring1");
+            return true;
+        }
+        if (ExtStaticQ(e, "Encoding.UTF8", "GetString", 3)
+                && !UserDefinesClsMember("Encoding", "GetString")) {
+            GenExpr(e.kids[0]); ExtPush(0);
+            GenExpr(e.kids[1]); ExtPush(0);
+            GenExpr(e.kids[2]); ExtPush(0);
+            ExtPop(2); ExtPop(1); ExtPop(0);
+            BLInternal("_zan_ext_utf8_getstring3");
+            return true;
+        }
+        // ---- byte[] instance ops ----
+        if ((n == 0 || n == 2) && name == "ToStr" && ExtIsBytes(r)
+                && !UserDefinesClsMember(null, "ToStr")) {
+            GenExpr(r);
+            ExtPush(0);                        // arr
+            if (n == 2) {
+                GenExpr(e.kids[0]);
+                ExtPush(0);
+                GenExpr(e.kids[1]);
+                ExtPush(0);
+            } else {
+                ExtCountOf(0, 9);              // whole-array length (x0 = arr)
+                LoadImm(0, 0);                 // start
+                ExtPush(0);                    // start
+                ExtPush(9);                    // len (top -> x2)
+            }
+            // stack (top down): len, start, arr
+            ExtPop(2); ExtPop(1); ExtPop(0);
+            BLInternal("_zan_ext_arr_slice_str");
+            return true;
+        }
+        if (r == null || r.kind != AK.Ident()) { return false; }
+        string cls = r.sval;
+
+        // ---- Convert.ToString: int-ish -> decimal, bool -> true/false,
+        // string -> identity ----
+        if (cls == "Convert" && name == "ToString" && n == 1
+                && !UserDefinesClsMember("Convert", "ToString")) {
+            Node ca = e.kids[0];
+            if (ExtIsIntExpr(ca)) { GenExpr(ca); BLInternal("_zan_rt_int2str"); return true; }
+            if (IsBoolExpr(ca)) {
+                // the reference renders Convert.ToString(bool) as "1"/"0"
+                GenExpr(ca);
+                int cbf = NL(); int cbd = NL();
+                CbzReg(0, cbf);
+                LoadImm(0, 1);
+                EmitB(cbd);
+                Mark(cbf);
+                LoadImm(0, 0);
+                Mark(cbd);
+                BLInternal("_zan_rt_int2str");
+                return true;
+            }
+            if (IsStrExpr(ca)) { GenExpr(ca); return true; }
+        }
+        // ---- Guid family (Parse returns an opaque handle that IS the
+        // canonical lowercase text; ToString is the identity on it) ----
+        if (cls == "Guid" && !UserDefinesClsMember("Guid", name)) {
+            if (name == "New" && n == 0) { BLInternal("_zan_ext_guid_new"); return true; }
+            if (name == "Parse" && n == 1) {
+                GenExpr(e.kids[0]);
+                BLInternal("_zan_ext_guid_parse");
+                return true;
+            }
+            if (name == "ToString" && n == 1) {
+                GenExpr(e.kids[0]);                // identity on the handle
+                return true;
+            }
+        }
+        // ---- Encoding.UrlDecode / UrlEncode / WebSocketAccept ----
+        if (cls == "Encoding" && n == 1 && !UserDefinesClsMember("Encoding", name)) {
+            if (name == "UrlDecode") { GenExpr(e.kids[0]); BLInternal("_zan_ext_urldecode"); return true; }
+            if (name == "UrlEncode") { GenExpr(e.kids[0]); BLInternal("_zan_ext_urlencode"); return true; }
+            if (name == "WebSocketAccept") { GenExpr(e.kids[0]); BLInternal("_zan_ext_wsaccept"); return true; }
+        }
+
+        // ---- digests ----
+        if ((cls == "Sha256" || cls == "Sha1" || cls == "Md5" || cls == "Sha512")
+                && name == "Hash" && n == 2 && !UserDefinesClsMember(cls, "Hash")) {
+            GenExpr(e.kids[0]);
+            ExtPush(0);
+            GenExpr(e.kids[1]);
+            ExtPush(0);
+            ExtPop(1);
+            ExtPop(0);
+            BLInternal(cls == "Sha256" ? "_zan_ext_sha256" : cls == "Sha1" ? "_zan_ext_sha1" : cls == "Md5" ? "_zan_ext_md5" : "_zan_ext_sha512");
+            return true;
+        }
+        if (cls == "Hmac" && name == "Sha256Mac" && n == 4
+                && !UserDefinesClsMember("Hmac", "Sha256Mac")) {
+            int hi = 0;
+            while (hi < 4) { GenExpr(e.kids[hi]); ExtPush(0); hi = hi + 1; }
+            ExtPop(3); ExtPop(2); ExtPop(1); ExtPop(0);
+            BLInternal("_zan_ext_hmac_sha256");
+            return true;
+        }
+        // ---- Hex ----
+        if (cls == "Hex" && name == "Encode" && n == 2
+                && !UserDefinesClsMember("Hex", "Encode")) {
+            bool fromBytes = ExtIsBytes(e.kids[0]);
+            GenExpr(e.kids[0]);
+            ExtPush(0);
+            GenExpr(e.kids[1]);
+            ExtPush(0);
+            ExtPop(1);
+            ExtPop(0);
+            if (fromBytes) { ExtCountOf(0, 9); } else { ExtLenOf(0, 9); }
+            HostCmp(1, 9);                     // cmp x1, x9 (batch 34)
+            int okh = NL();
+            EmitBcond(9, okh);                 // b.ls keep the request
+            ExtMov(1, 9);                      // clamp to available
+            Mark(okh);
+            // 批 35:byte[] 元素是打包布局(1 字节/元素,探测已验证,
+            // 见 EmitArrElemLoad byte 臂与 _zan_packed_slice_str)——首版
+            // 快照宿主的 8 字节槽距残留在 fromBytes 分支,摘要经
+            // Hex.Encode 读出 8 选 1(ba41b0b4 根因)
+            LoadImm(2, 1);
+            BLInternal("_zan_ext_hex_encode");
+            return true;
+        }
+        if (cls == "Hex" && name == "Decode" && n == 1
+                && !UserDefinesClsMember("Hex", "Decode")) {
+            GenExpr(e.kids[0]);
+            BLInternal("_zan_ext_hex_decode");
+            return true;
+        }
+        // ---- Base64 ----
+        if (cls == "Base64" && name == "Encode" && n == 2
+                && !UserDefinesClsMember("Base64", "Encode")) {
+            bool fromBytes = ExtIsBytes(e.kids[0]);
+            GenExpr(e.kids[0]);
+            ExtPush(0);
+            GenExpr(e.kids[1]);
+            ExtPush(0);
+            ExtPop(1);
+            ExtPop(0);
+            if (fromBytes) { ExtCountOf(0, 9); } else { ExtLenOf(0, 9); }
+            HostCmp(1, 9);
+            int okb = NL();
+            EmitBcond(9, okb);
+            ExtMov(1, 9);
+            Mark(okb);
+            // 批 35:同 Hex.Encode——byte[] 打包布局,槽距 1(原 8 为快照宿主残留)
+            LoadImm(2, 1);
+            BLInternal("_zan_ext_b64_encode");
+            return true;
+        }
+        if (cls == "Encoding" && name == "Base64Encode" && n == 1
+                && !UserDefinesClsMember("Encoding", "Base64Encode")) {
+            GenExpr(e.kids[0]);
+            BLInternal("_zan_ext_b64_str");
+            return true;
+        }
+        return false;
+    }
+
+    // ===================== extended runtime emitters =====================
+
+    void HostEmitExt() {
+        extTblHex = InternStr("0123456789abcdef");
+        extTblB64 = InternStr("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/");
+        extWsGuid = InternStr("258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
+        extEmpty = InternStr("");
+        extTrue = InternStr("true");
+        extFalse = InternStr("false");
+        extSlash = InternStr("/");
+        extBSlash = InternStr("\\");
+        extDot = InternStr(".");
+        extTmp = InternStr("/tmp/");
+        extTmpDir = InternStr("TMPDIR");
+        extZero = InternStr("0");
+        extDash = InternStr("-");
+        extColon = InternStr(":");
+        extSpace = InternStr(" ");
+        HostEmitArrNew();
+        HostEmitSlotCopy();
+        HostEmitToBytes();
+        HostEmitSlice();
+        HostEmitHexDecode();
+        HostEmitB64();
+        HostEmitDigests();
+        HostEmitUtf8();
+        HostEmitUrl();
+        HostEmitWsAccept();
+        HostEmitGuid();
+        HostEmitStrOps();
+        HostEmitStrFormat();
+        HostEmitStrJoin();
+        HostEmitPath();
+        HostEmitDt();
+        HostEmitIo();
+    }
+
+    // host frame with room for a 160-byte struct stat buffer above the
+    // 16 slot words (buffer base = sp + 128)
+    void HostBeginN(string sym, int extra) {
+        syms.Add(new Sym(sym, FnPad()));
+        RtPrologue(); AddSPImm(128 + extra, false);
+    }
+    void HostEndN(int extra) { AddSPImm(128 + extra, true); RtEpilogue(); }
+
+    // 32-bit status register tests (C int results do not sign-extend x0)
+    void HostCbzW(int lbl) { ExtCmpImm(0, 0); EmitBcond(0, lbl); }
+    void HostCbnzW(int lbl) { ExtCmpImm(0, 0); EmitBcond(1, lbl); }
+
+}

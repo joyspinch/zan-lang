@@ -1,0 +1,776 @@
+using System;
+using System.Collections.Generic;
+namespace Zan;
+
+partial class Ngen {
+    // ---- nullable value types (`int?`, `double?`, `T?` over enum/struct) ----
+    // a nullable value is an 8-byte heap cell: the pointer IS the value, 0
+    // is null, and the payload rides at [cell]. This mirrors gen0's
+    // {payload, i1} struct observably: HasValue is ptr != 0, .Value guards
+    // on null before loading, and lifted operators branch on the nulls
+    // BEFORE any arithmetic (so `b / 0` with b null never divides).
+    // Reference-type `?` erases at TypeFullName and never reaches here.
+
+    // does the type NAME denote a nullable value?
+    bool IsNulTy(string t) {
+        return t != null && t.Length > 1 && t.Substring(t.Length - 1, 1) == "?";
+    }
+    string NulPayOf(string t) {
+        return IsNulTy(t) ? t.Substring(0, t.Length - 1) : null;
+    }
+    // does this payload type name accept a `?`?
+    bool IsNulableValueTy(string t) {
+        if (t == "bool" || t == "byte" || t == "sbyte" || t == "short"
+                || t == "ushort" || t == "int" || t == "uint" || t == "long"
+                || t == "ulong" || t == "nint" || t == "nuint"
+                || t == "char" || t == "float" || t == "double") { return true; }
+        if (FindEnum(t) >= 0) { return true; }
+        Cls sc = FindClass(t);
+        return sc != null && sc.isStruct == 1;
+    }
+
+    // sizeof(T): the mapped store width (oracle map_type: i1/i8 -> 1,
+    // i16 -> 2, i32/f32 -> 4, i64/f64 -> 8; char maps to i64)
+    int SizeOfTyName(string t) {
+        if (t == "bool" || t == "byte" || t == "sbyte") { return 1; }
+        if (t == "short" || t == "ushort") { return 2; }
+        if (t == "int" || t == "uint" || t == "float") { return 4; }
+        return 8;
+    }
+    // does this expression carry a nullable value (or the null literal,
+    // which rides as the null cell)?
+    bool IsNulExpr(Node e) {
+        if (e == null) { return false; }
+        if (e.kind == AK.NullLit()) { return true; }
+        if (IsNulTy(StaticTyOf(e))) { return true; }
+        if (e.kind == AK.Binary()) {
+            if (e.op == TK.QQ()) { return IsNulExpr(e.b); }
+            if (e.op == TK.Plus() || e.op == TK.Minus() || e.op == TK.Star()
+                    || e.op == TK.Slash() || e.op == TK.Percent()) {
+                return IsNulExpr(e.a) || IsNulExpr(e.b);
+            }
+        }
+        return false;
+    }
+
+    // box a payload into a fresh nullable cell; x0 leaves holding the cell.
+    // The payload ALWAYS rides x0 as its bit pattern (the internal value
+    // model); dbl names the payload kind only, nothing reads d0 here. No
+    // caller may rely on GenExpr leaving a value in d0: since FloatLit
+    // became a compile-time immediate it only sets x0.
+    void GenNulWrap(bool dbl) {
+        XPushV0();                              // push payload
+        LoadImm(0, 8);
+        LoadImm(1, 0);
+        BLInternal("_zan_rt_alloc");                 // x0 = zeroed cell
+        XPopV(1);                              // x1 = payload
+        StrU(1, 0, 0);                               // cell->payload
+    }
+
+    // string form of a nullable value for concat/Write: null renders ""
+    // (gen0 prints the empty string), a payload renders per its kind
+    void GenNulToStr(Node e) {
+        string pay = NulPayOf(StaticTyOf(e));
+        GenExpr(e);                                  // x0 = cell
+        int isnul = NL();
+        int fin = NL();
+        CbzReg(0, isnul);                            // null: the empty string
+        LdrU(0, 0, 0);                               // payload
+        if (pay != null && IsDblTy(pay)) { BLInternal("_zan_rt_dbl2str"); }
+        else if (pay == "char") { BLInternal("_zan_rt_chrstr"); }
+        else if (pay == "ulong") { BLInternal("_zan_rt_uint2str"); }
+        else { BLInternal("_zan_rt_int2str"); }
+        EmitB(fin);
+        Mark(isnul);
+        LoadStr(InternStr(""), 0);
+        Mark(fin);
+    }
+
+    // `x.HasValue` / `x.Value` on a nullable value
+    void GenNulMemberRead(Node e) {
+        GenExpr(e.a);                                // x0 = cell
+        if (e.sval == "HasValue") {
+            int no = NL();
+            int fin = NL();
+            CbzReg(0, no);
+            LoadImm(0, 1);
+            EmitB(fin);
+            Mark(no);
+            LoadImm(0, 0);
+            Mark(fin);
+            return;
+        }
+        int ok = NL();
+        CbnzReg(0, ok);
+        LoadSymRef("l_.str." + guardFileIdx, 0);
+        LoadImm(1, curLine);
+        LoadImm(2, curCol);
+        LoadSymRef("l_.str." + guardNulVal, 3);
+        BLInternal("_zan_rt_guard_fail3");
+        LoadImm(0, 0);
+        Mark(ok);
+        LdrU(0, 0, 0);                               // payload
+        if (IsDblTy(NulPayOf(StaticTyOf(e.a)))) { if (tgt86 == 1) { X3(0x66, 0x48, 0x0F); X2(0x6E, 0xC7); } else { E4(0x9E670000); } }   // fmov d0, x0
+    }
+
+    // a builtin binary op with a nullable VALUE operand: lifted semantics.
+    // String operands stay on the concat/strcmp paths.
+    bool IsLiftedNulBinary(Node e) {
+        int op = e.op;
+        if (op == TK.Plus() || op == TK.Minus() || op == TK.Star()
+                || op == TK.Slash() || op == TK.Percent()
+                || op == TK.Less() || op == TK.Greater()
+                || op == TK.LessEq() || op == TK.GreaterEq()
+                || op == TK.EqEq() || op == TK.BangEq()) {
+            if (IsStrExpr(e.a) || IsStrExpr(e.b)) { return false; }
+            return (e.a != null && IsNulTy(StaticTyOf(e.a)))
+                || (e.b != null && IsNulTy(StaticTyOf(e.b)));
+        }
+        return false;
+    }
+
+    // lifted operator over nullables: either side may be null; arithmetic
+    // yields null without running (so `b / 0` with b null never divides),
+    // == answers both-null as equal, relational answers false. Arithmetic
+    // wraps its result into a fresh cell.
+    void GenLiftedNulBinary(Node e) {
+        int op = e.op;
+        bool arith = op == TK.Plus() || op == TK.Minus() || op == TK.Star()
+            || op == TK.Slash() || op == TK.Percent();
+        string pay = NulPayOf(StaticTyOf(e.a));
+        if (pay == null) { pay = NulPayOf(StaticTyOf(e.b)); }
+        bool dbl = IsDblTy(pay);
+        GenExpr(e.a);
+        if (!IsNulExpr(e.a)) { GenNulWrap(IsDblExpr(e.a)); }    // payload -> cell
+        XPushV0();                              // push left cell
+        GenExpr(e.b);
+        if (!IsNulExpr(e.b)) { GenNulWrap(IsDblExpr(e.b)); }
+        XPopV(1);                              // x1 = left, x0 = right
+        int done = NL();
+        int lnn = NL();
+        int rnn = NL();
+        CbnzReg(1, lnn);
+        // left null: == true, everything else null/false
+        if (op == TK.EqEq()) { LoadImm(0, 1); } else { LoadImm(0, 0); }
+        EmitB(done);
+        Mark(lnn);
+        CbnzReg(0, rnn);
+        // right null: != true, the rest false
+        if (op == TK.BangEq()) { LoadImm(0, 1); } else { LoadImm(0, 0); }
+        EmitB(done);
+        Mark(rnn);
+        // both non-null: apply the operator to the payloads
+            if (dbl) {
+                LdrU(2, 1, 0);                           // left payload bits
+                LdrU(3, 0, 0);                           // right payload bits
+                // movq xmm0, rdx / movq xmm1, rcx:每条 movq 都要完整的
+                // 66 48 0F 6E /r 前缀——首版两条共用一个 X3,第二条只剩
+                // 6E C9,解码成 outsb+leave,leave 拆掉 rbp 后全函数的
+                // [rbp-…] 局部寻址全烂(批46 float_shapes 提升加法
+                // 退野跳转实)
+                if (tgt86 == 1) { X3(0x66, 0x48, 0x0F); X2(0x6E, 0xC2); X3(0x66, 0x48, 0x0F); X2(0x6E, 0xC9); } else { E4(0x9E670040); E4(0x9E670061); }                          // fmov d0, x2 / d1, x3
+            if (op == TK.Plus()) {
+                if (tgt86 == 1) { X4(0xC1580FF2); } else { E4(0x1E602820); }                      // fadd d0, d1, d0
+            } else if (op == TK.Minus()) {
+                E4(0x1E603820);                      // fsub d0, d1, d0
+            } else if (op == TK.Star()) {
+                E4(0x1E604820);                      // fmul d0, d1, d0
+            } else if (op == TK.Slash()) {
+                E4(0x1E605820);                      // fdiv d0, d1, d0
+            } else if (op == TK.Less()) {
+                // x86:comisd xmm1, xmm0 + seta——b>a 有序 ⇔ a<b;NaN
+                // (ZF=CF=1) 落 seta=0,与 fcmp+cset lt 的 NaN→false 对齐。
+                // 首版 comisd xmm0, xmm1 + seta 算的是 a>b——四条关系
+                // 运算两两并轨(a<b 印 ge,批46 float_shapes 实证)。
+                if (tgt86 == 1) { X3(0x66, 0x0F, 0x2F); X1(0xC8); XSetV0cc(0x97); } else { E4(0x1E612000); E4(0x9A9FA7E0); }                      // comisd xmm1, xmm0 + seta(b>a ⇔ a<b)
+            } else if (op == TK.Greater()) {
+                if (tgt86 == 1) { X3(0x66, 0x0F, 0x2F); X1(0xC1); } else { E4(0x1E612000); }
+                if (tgt86 == 1) { X3(0x0F, 0x97, 0xC0); X3(0x48, 0x0F, 0xB6); X1(0xF8); } else { E4(0x9A9FD7E0); }                      // cset x0, gt
+            } else if (op == TK.LessEq()) {
+                // comisd xmm1, xmm0 + setae:b>=a 有序 ⇔ a<=b,NaN→0。
+                // 首版不换操作数,算成 a>=b(与 GreaterEq 并轨)。
+                if (tgt86 == 1) { X3(0x66, 0x0F, 0x2F); X1(0xC8); XSetV0cc(0x93); } else { E4(0x1E612000); E4(0x9A9FC7E0); }                      // comisd xmm1, xmm0 + setae(b>=a ⇔ a<=b,NaN→0)
+            } else if (op == TK.GreaterEq()) {
+                if (tgt86 == 1) { X3(0x66, 0x0F, 0x2F); X1(0xC1); } else { E4(0x1E612000); }
+                if (tgt86 == 1) { X3(0x0F, 0x93, 0xC0); X3(0x48, 0x0F, 0xB6); X1(0xF8); } else { E4(0x9A9FB7E0); }                      // cset x0, ge
+            } else if (op == TK.EqEq()) {
+                if (tgt86 == 1) { X3(0x66, 0x0F, 0x2F); X1(0xC8); } else { E4(0x1E602020); }
+                if (tgt86 == 1) { X3(0x0F, 0x94, 0xC0); X3(0x48, 0x0F, 0xB6); X1(0xF8); } else { E4(0x9A9F17E0); }                      // cset x0, eq
+            } else if (op == TK.BangEq()) {
+                if (tgt86 == 1) { X3(0x66, 0x0F, 0x2F); X1(0xC8); } else { E4(0x1E602020); }
+                if (tgt86 == 1) { X3(0x0F, 0x95, 0xC0); X3(0x48, 0x0F, 0xB6); X1(0xF8); } else { E4(0x9A9F07E0); }                      // cset x0, ne
+            }
+            if (arith) {
+                if (tgt86 == 1) { X3(0x66, 0x48, 0x0F); X2(0x7E, 0xC7); } else { E4(0x9E660000); }                      // fmov x0, d0
+                GenNulWrap(true);
+            }
+        } else {
+            LdrU(1, 1, 0);                           // left payload -> x1
+            LdrU(0, 0, 0);                           // right payload -> x0
+            if (op == TK.Plus()) {
+                AddRR(0, 1, 0);                      // add x0, x1, x0
+                if (pay == "int") { Wrap32(1); }
+            } else if (op == TK.Minus()) {
+                SubRR(0, 1, 0);                      // sub x0, x1, x0
+                if (pay == "int") { Wrap32(1); }
+            } else if (op == TK.Star()) {
+                MaddRR(0, 1, 0, 31);                      // mul x0, x1, x0
+                if (pay == "int") { Wrap32(1); }
+            } else if (op == TK.Slash() || op == TK.Percent()) {
+                // the lifted divide keeps the ordinary guards; a null
+                // operand never reaches this point
+                int bad = NL();
+                int cont = NL();
+                int safe = NL();
+                CbzReg(0, bad);
+                EmitB(cont);
+                Mark(bad);
+                XPushR(1);                      // keep dividend
+                LoadSymRef("l_.str." + guardFileIdx, 0);
+                LoadImm(1, curLine);
+                LoadImm(2, curCol);
+                if (op == TK.Slash()) { LoadSymRef("l_.str." + guardDivIdx, 3); }
+                else { LoadSymRef("l_.str." + guardModIdx, 3); }
+                BLInternal("_zan_rt_guard_fail3");
+                XPopV(1);
+                LoadImm(0, 1);                       // safe divisor
+                Mark(cont);
+                LoadImm(2, 0x8000000000000000);
+                LoadImm(3, -1);
+                if (tgt86 == 1) { Xop(0x39, 7, 1); } else { E4(0xEB03001F); }                      // cmp x0, x3
+                EmitBcond(1, safe);
+                CmpRR(1, 2);                      // cmp x1, x2
+                EmitBcond(1, safe);
+                LoadImm(0, 1);
+                Mark(safe);
+                if (op == TK.Slash()) {
+                    E4(0x9AC00C20);                  // sdiv x0, x1, x0
+                    if (pay == "int") { Wrap32(1); }
+                } else {
+                    E4(0x9AC00C24);                  // sdiv x4, x1, x0
+                    E4(0x9B008480);                  // msub x0, x4, x0, x1
+                }
+            } else if (op == TK.Less()) {
+                CmpRR(1, 0);                      // cmp x1, x0
+                CsetCondX0(11);                      // cset x0, lt
+            } else if (op == TK.Greater()) {
+                CmpRR(1, 0);
+                if (tgt86 == 1) { X3(0x0F, 0x97, 0xC0); X3(0x48, 0x0F, 0xB6); X1(0xF8); } else { E4(0x9A9FD7E0); }                      // cset x0, gt
+            } else if (op == TK.LessEq()) {
+                CmpRR(1, 0);
+                CsetCondX0(13);                      // cset x0, le
+            } else if (op == TK.GreaterEq()) {
+                CmpRR(1, 0);
+                if (tgt86 == 1) { X3(0x0F, 0x93, 0xC0); X3(0x48, 0x0F, 0xB6); X1(0xF8); } else { E4(0x9A9FB7E0); }                      // cset x0, ge
+            } else if (op == TK.EqEq()) {
+                CmpRR(1, 0);
+                if (tgt86 == 1) { X3(0x0F, 0x94, 0xC0); X3(0x48, 0x0F, 0xB6); X1(0xF8); } else { E4(0x9A9F17E0); }                      // cset x0, eq
+            } else if (op == TK.BangEq()) {
+                CmpRR(1, 0);
+                if (tgt86 == 1) { X3(0x0F, 0x95, 0xC0); X3(0x48, 0x0F, 0xB6); X1(0xF8); } else { E4(0x9A9F07E0); }                      // cset x0, ne
+            } else {
+                LoadImm(0, 0);
+            }
+            if (arith) { GenNulWrap(false); }
+        }
+        Mark(done);
+    }
+
+    // does this expression evaluate to a bool? (comparisons / bool locals,
+    // fields and method results -- WriteLine renders those true/false)
+    bool IsBoolExpr(Node e) {
+        if (e == null) { return false; }
+        if (e.kind == AK.AwaitExpr()) { return AsyncAwaitElemTyNg(e.a) == "bool"; }
+        if (e.kind == AK.BoolLit()) { return true; }
+        if (e.kind == AK.Binary()) {
+            int op = e.op;
+            return op == TK.Less() || op == TK.Greater() || op == TK.LessEq()
+                || op == TK.GreaterEq() || op == TK.EqEq() || op == TK.BangEq()
+                || op == TK.AmpAmp() || op == TK.PipePipe();
+        }
+        if (e.kind == AK.Unary()) { return e.op == TK.Bang(); }
+        if (e.kind == AK.MemberAccess()) {
+            string rmt = ReflMemberTy(e);
+            if (rmt != null) { return rmt == "bool"; }
+            if (e.sval == "HasValue" && e.a != null && IsNulTy(StaticTyOf(e.a))) { return true; }
+            Fld f = FieldOf(e);
+            if (f != null) { return f.ty == "bool"; }
+            return PropGetterTy(e) == "bool";
+        }
+        if (e.kind == AK.Ident()) {
+            int li = LocalIdx(e.sval);
+            if (li >= 0) { return locTy[li] == "bool"; }
+            Fld f = CurField(e.sval);
+            if (f != null && f.ty == "bool") { return true; }
+            return FindStaticTy(curCls, e.sval) == "bool";
+        }
+        if (e.kind == AK.Call() && e.a != null) {
+            // string.IsNullOrEmpty(s): gen0's inference fails on the
+            // extension-method-in-static form, so WriteLine renders its
+            // 0/1 result numerically instead of true/false
+            if (e.a.kind == AK.MemberAccess() && e.a.sval == "IsNullOrEmpty"
+                    && e.kids.Count == 1 && e.a.a != null
+                    && e.a.a.kind == AK.Ident()
+                    && (e.a.a.sval == "string" || e.a.a.sval == "String")) {
+                return false;
+            }
+            // gen0 lowers STRING Contains to a 0/1 int probe, so WriteLine
+            // renders it numerically (log_rolling_file golden prints 0/1,
+            // not true/false); List.Contains keeps its declared bool and
+            // renders true/false
+            if (e.a.kind == AK.MemberAccess() && e.a.sval != null
+                    && e.a.a != null && IsStrExpr(e.a.a)) {
+                string cn9 = e.a.sval;
+                int d9 = cn9.IndexOf("$");
+                if (d9 > 0) { cn9 = cn9.Substring(0, d9); }
+                if (cn9 == "Contains") { return false; }
+            }
+            return CallRetTy(e) == "bool";
+        }
+        return false;
+    }
+
+    string MethRetTy(string name) {
+        List<int> cs = MethCandsName(name);
+        if (cs == null) { return ""; }
+        int i = 0;
+        while (i < cs.Count) {
+            // TypeFullName keeps the array suffix and generic argument;
+            // type.sval alone would turn a `byte[]` return into "byte"
+            if (methNodes[cs[i]].type != null) { return TypeFullName(methNodes[cs[i]].type); }
+            i = i + 1;
+        }
+        return "";
+    }
+
+    // declared return type of a call with the receiver's type arguments
+    // substituted for the declaring class's type parameters: with
+    // `Box<string> b`, `b.At(i)` reads as `string`, not the bare `T`
+    // (gen0 instantiates generics; ngen substitutes textually). Falls
+    // back to the raw declared type whenever either side is unknown.
+    // type of a call's callee VALUE, typing the receiver chain once; mirrors
+    // StaticTyOfInner's MemberAccess arm for member callees. CallRetTy needs
+    // both the callee's type (delegate dispatch) and the receiver's class
+    // (generic SubstTy tail); typing each independently re-walks a fluent
+    // chain's prefix per level and turns a 12-call chain into an
+    // exponential number of walks (DownloadJob.SnapshotPolicy hang).
+    string CalleeTyOf(Node cc) {
+        if (cc == null) { return null; }
+        if (cc.kind != AK.MemberAccess()) { return StaticTyOf(cc); }
+        if ((cc.sval == "Keys" || cc.sval == "Values") && ExprCls(cc.a) == "Dict") {
+            return "List<" + DictSlotTy(cc.a, cc.sval == "Keys") + ">";
+        }
+        if (cc.a != null && cc.a.kind == AK.Ident() && FindEnum(cc.a.sval) >= 0) { return cc.a.sval; }
+        Fld f = FieldOf(cc);
+        return f != null ? f.ty : null;
+    }
+
+    string CallRetTy(Node e) {
+        string dty = DelegateCallRetTy(e);
+        if (dty != null) { return dty; }
+        string rct = ReflCallRetTy(e);
+        if (rct != null) { return rct; }
+        Node cc = DelegateCalleeNg(e);
+        if (cc == null) { cc = e.a; }
+        string recvTy = null;
+        string valTy = null;
+        if (cc != null && cc.kind == AK.MemberAccess() && cc.a != null) {
+            // one walk down the receiver chain; FieldOf's substitution is
+            // applied directly so the chain is not re-typed
+            recvTy = StaticTyOf(cc.a);
+            if (recvTy != null) {
+                Fld cf = FieldOfInst(recvTy, cc.sval);
+                if (cf != null) { valTy = cf.ty; }
+            }
+        } else {
+            valTy = StaticTyOf(cc);
+        }
+        if (valTy != null && IsDelegateTyNg(valTy)) { return DelegateRetNg(valTy); }
+        // `E(args)` on a class instance dispatches the class's static
+        // op_call protocol (the emitter rewrites to Cls.op_call(E, args)
+        // and resolves by fit). The type model must answer with the SAME
+        // overload's declared return -- resolving the bare call by name
+        // finds nothing (the receiver is a local, not a class), consumers
+        // see "no type", and WriteLine prints the returned string pointer
+        // as an integer
+        if (valTy != null && e.a == cc && FindClass(valTy) != null
+                && e.kids != null && OpStaticSym(valTy, "op_call") != null) {
+            Node oma = new Node(AK.MemberAccess());
+            Node otn = new Node(AK.Ident());
+            otn.sval = valTy;
+            oma.a = otn;
+            oma.sval = "op_call";
+            Node osyn = new Node(AK.Call());
+            osyn.a = oma;
+            osyn.Add(cc);
+            int oki = 0;
+            while (oki < e.kids.Count) { osyn.Add(e.kids[oki]); oki = oki + 1; }
+            int oidx = ResolveStaticNg(osyn);
+            if (oidx >= 0 && methNodes[oidx].type != null) {
+                return TypeFullName(methNodes[oidx].type);
+            }
+        }
+        // instance op_call: `E(args)` is E.op_call(args); answer the same
+        // overload's declared return so consumers see the real type
+        if (valTy != null && e.a == cc && FindClass(valTy) != null
+                && cc != null && cc.kind == AK.Ident() && LocalIdx(cc.sval) >= 0) {
+            List<int> occ = new List<int>();
+            InstanceCands(valTy, "op_call", occ);
+            if (occ.Count > 0) {
+                int ocPick = FitPickIdx(occ, e);
+                if (ocPick >= 0 && methNodes[ocPick].type != null) {
+                    return TypeFullName(methNodes[ocPick].type);
+                }
+            }
+        }
+        string ht = HostCallRetTy(e);
+        if (ht != null) { return ht; }
+        // Task.Spawn/Task.Run(<async call>) yields the coroutine handle as a
+        // long (Task has no stdlib class the type model could consult)
+        if (e.a != null && e.a.kind == AK.MemberAccess() && e.a.a != null
+                && e.a.a.kind == AK.Ident() && e.a.a.sval == "Task"
+                && (e.a.sval == "Spawn" || e.a.sval == "Run")
+                && e.kids != null && e.kids.Count == 1) {
+            return "long";
+        }
+        string st = StringCallRetTy(e);
+        if (st != null) { return st; }
+        // builtin ToString renders a string although no user method
+        // declares it: enum receivers do a member-name lookup and scalar
+        // receivers go through the shared renderers (GenCall's builtin
+        // branches run before user dispatch, so the type model must agree
+        // -- otherwise consumers like WriteLine see "no type" and print
+        // the returned pointer as an integer)
+        if (e.a != null && e.a.kind == AK.MemberAccess() && e.a.sval == "ToString"
+                && e.kids != null && e.kids.Count == 0 && e.a.a != null
+                && (EnumTyOf(e.a.a) != null || ScalarToStringTy(e.a.a) != null)) {
+            return "string";
+        }
+        if (e.a != null && e.a.kind == AK.MemberAccess() && e.a.sval == "TryParse"
+                && e.kids != null && e.kids.Count == 2 && e.a.a != null
+                && e.a.a.kind == AK.Ident() && FindEnum(e.a.a.sval) >= 0) {
+            return "bool";
+        }
+        // Dictionary Remove the runtime lowers directly; the reference types
+        // it bool (prints true/false) while ContainsKey/TryGetValue stay int
+        // (prints 0/1). Keep the model exact. The callee may carry a generic
+        // spec suffix ("Remove$string"), so compare the bare name.
+        if (e.a != null && e.a.kind == AK.MemberAccess() && e.a.sval != null
+                && e.kids != null && e.kids.Count == 1) {
+            string rname = e.a.sval;
+            int rd = rname.IndexOf("$");
+            if (rd > 0) { rname = rname.Substring(0, rd); }
+            // name check BEFORE ExprCls: typing the receiver here re-walks
+            // fluent-chain prefixes and compounds per level
+            if (rname == "Remove" && e.a.a != null && ExprCls(e.a.a) == "Dict") { return "bool"; }
+        }
+        // File.Exists the runtime answers with a 0/1 bool (feeds `!`/if directly)
+        if (e.a != null && e.a.kind == AK.MemberAccess() && e.a.sval == "Exists"
+                && e.a.a != null && e.a.a.kind == AK.Ident() && e.a.a.sval == "File"
+                && e.kids != null && e.kids.Count == 1) {
+            return "bool";
+        }
+        int staticIdx = ResolveStaticNg(e);
+        if (staticIdx < 0 && e.a != null && e.a.kind == AK.Ident() && LocalIdx("this") >= 0) {
+            List<int> inst = new List<int>();
+            InstanceCands(curCls, e.a.sval, inst);
+            if (inst.Count > 0) {
+                int ii = inst.Count == 1 ? inst[0] : FitPickIdx(inst, e);
+                if (ii >= 0) { return TypeFullName(methNodes[ii].type); }
+            }
+            // curCls's own statics (incl. inherited) outrank the global name
+            // table: same-named methods across classes are common in real
+            // stdlib compiles
+            string wcls = curCls;
+            while (wcls != null && staticIdx < 0) {
+                List<int> wc2 = MethCandsClsName(wcls, e.a.sval);
+                if (wc2 != null) {
+                    int wi = 0;
+                    while (wi < wc2.Count) {
+                        if (methStat[wc2[wi]] == 1) { staticIdx = wc2[wi]; break; }
+                        wi = wi + 1;
+                    }
+                }
+                Cls wc = FindClass(wcls);
+                wcls = wc != null ? wc.baseName : null;
+            }
+        }
+        string rty = null;
+        string rcv = null;
+        if (staticIdx >= 0) {
+            rty = TypeFullName(methNodes[staticIdx].type);
+        } else if (e.a != null && e.a.kind == AK.MemberAccess() && e.a.a != null) {
+            // the receiver's class chain outranks the global name table:
+            // same-named methods across classes are common (SignalString.Get
+            // vs SignalInt.Get) and the global pick is arbitrary
+            rcv = recvTy != null ? recvTy : StaticTyOf(e.a.a);
+            if (rcv != null && !IsDelegateTyNg(rcv)) {
+                string w2 = rcv;
+                int lt9 = w2.IndexOf("<");
+                if (lt9 > 0) { w2 = w2.Substring(0, lt9); }
+                List<int> ic = new List<int>();
+                while (w2 != null && ic.Count == 0) {
+                    InstanceCands(w2, e.a.sval, ic);
+                    if (ic.Count == 0) {
+                        Cls c9 = FindClass(w2);
+                        w2 = c9 != null ? c9.baseName : null;
+                        if (w2 != null) {
+                            int lt = w2.IndexOf("<");
+                            if (lt > 0 && w2.Substring(w2.Length - 1, 1) == ">") {
+                                w2 = w2.Substring(0, lt);
+                            }
+                        }
+                    }
+                }
+                int pick9 = ic.Count == 1 ? ic[0] : (ic.Count > 1 ? FitPickIdx(ic, e) : -1);
+                if (pick9 >= 0) { rty = TypeFullName(methNodes[pick9].type); }
+            }
+        }
+        if (rty == null || rty == "") {
+            // instance-form extension calls (`xs.Sum()`) resolve through the
+            // extension machinery, not the receiver's (builtin) member table
+            // or the global name fallback -- gen0 types them from the
+            // resolved overload's declared return type
+            string ert = ExtRetTyWithRecvNg(e, rcv);
+            if (ert != null && ert != "") { rty = ert; }
+        }
+        if (rty == null || rty == "") { rty = MethRetTy(e.a != null ? e.a.sval : null); }
+        if (rty == null || rty == "") { return rty; }
+        if (e.a == null || e.a.kind != AK.MemberAccess() || e.a.a == null) { return rty; }
+        // recvTy (typed above, cc == e.a here) IS StaticTyOf(e.a.a): re-typing
+        // it re-walks fluent-chain prefixes at every level, compounding
+        // exponentially (DownloadJob.SnapshotPolicy hang). Only the
+        // .Invoke-stripped shape needs a fresh type.
+        string recv = recvTy;
+        if (recv == null && e.a.sval == "Invoke") { recv = StaticTyOf(e.a.a); }
+        if (recv == null) { return rty; }
+        int lt = recv.IndexOf("<");
+        if (lt <= 0 || recv.Substring(recv.Length - 1, 1) != ">") { return rty; }
+        Cls rc = FindClass(recv.Substring(0, lt));
+        if (rc == null || rc.tps.Count == 0) { return rty; }
+        List<string> targs = SplitTyArgs(recv.Substring(lt + 1, recv.Length - lt - 2));
+        return SubstTy(rty, rc.tps, targs);
+    }
+
+    // top-level comma split of a generic argument list ("Node, Box<Node>")
+    List<string> SplitTyArgs(string s) {
+        List<string> parts = new List<string>();
+        string cur = "";
+        int depth = 0;
+        int i = 0;
+        while (i < s.Length) {
+            string ch = s.Substring(i, 1);
+            if (ch == "<") { depth = depth + 1; }
+            else if (ch == ">") { depth = depth - 1; }
+            if (ch == "," && depth == 0) { parts.Add(cur); cur = ""; }
+            else { cur = cur + ch; }
+            i = i + 1;
+        }
+        if (cur != "") { parts.Add(cur); }
+        return parts;
+    }
+
+    // rewrite type-parameter names inside a declared type string: bare
+    // `T`, `T[]` and `Head<A, T>` forms all substitute
+    string SubstTy(string t, List<string> ps, List<string> as2) {
+        if (t == null || t == "") { return t; }
+        if (ps == null || as2 == null) { return t; }
+        if (IsArrTy(t)) { return SubstTy(t.Substring(0, t.Length - 2), ps, as2) + "[]"; }
+        int lt = t.IndexOf("<");
+        if (lt > 0 && t.Substring(t.Length - 1, 1) == ">") {
+            string head = t.Substring(0, lt);
+            List<string> kids = SplitTyArgs(t.Substring(lt + 1, t.Length - lt - 2));
+            string res = SubstTy(head, ps, as2) + "<";
+            int i = 0;
+            while (i < kids.Count) {
+                if (i > 0) { res = res + ","; }
+                res = res + SubstTy(kids[i], ps, as2);
+                i = i + 1;
+            }
+            return res + ">";
+        }
+        int pi = IndexOfStrNg(ps, t);
+        if (pi >= 0) { return as2[pi]; }
+        return t;
+    }
+
+    // dispatch a binary operator to a static op_* overload declared on
+    // either operand's class (mirrors irgen's TryOpOverload): the call goes
+    // through the ordinary static-call machinery, so overload fit, argument
+    // narrowing and double conversion all behave like a written-out call.
+    // Returns false when no overload applies and the builtin paths must run.
+    bool TryOpOverloadNg(Node e) {
+        if (IsStrExpr(e.a) || IsStrExpr(e.b)) { return false; }
+        // comparisons against the null literal stay reference compares, so
+        // an op_eq body can null-check without recursing into itself
+        // (gen0 irgen's null_cmp rule)
+        if ((e.a != null && e.a.kind == AK.NullLit())
+                || (e.b != null && e.b.kind == AK.NullLit())) { return false; }
+        string mn = OpMethodNameNg(e.op);
+        if (mn == "") { return false; }
+        string owner = null;
+        string ca = ExprCls(e.a);
+        if (ca != null && OpOverloadExists(ca, mn)) { owner = ca; }
+        if (owner == null) {
+            string cb = ExprCls(e.b);
+            if (cb != null && OpOverloadExists(cb, mn)) { owner = cb; }
+        }
+        // gen0 semantics: only the exact op_* dispatches; `!=`/`==` without
+        // their own overload fall back to reference comparison (the builtin
+        // path), NOT to the negation of the paired operator
+        if (owner == null) { return false; }
+        Node callN = new Node(AK.Call());
+        Node tgt = new Node(AK.Ident());
+        tgt.line = e.line;
+        tgt.col = e.col;
+        tgt.sval = mn;
+        callN.a = tgt;
+        callN.line = e.line;
+        callN.col = e.col;
+        callN.kids.Add(e.a);
+        callN.kids.Add(e.b);
+        GenCall(callN);
+        return true;
+    }
+
+    // operator token -> op_* overload method name ("" when not overloadeable)
+    string OpMethodNameNg(int op) {
+        if (op == TK.Plus()) { return "op_add"; }
+        if (op == TK.Minus()) { return "op_sub"; }
+        if (op == TK.Star()) { return "op_mul"; }
+        if (op == TK.Slash()) { return "op_div"; }
+        if (op == TK.Percent()) { return "op_mod"; }
+        if (op == TK.EqEq()) { return "op_eq"; }
+        if (op == TK.BangEq()) { return "op_neq"; }
+        if (op == TK.Less()) { return "op_lt"; }
+        if (op == TK.Greater()) { return "op_gt"; }
+        if (op == TK.LessEq()) { return "op_le"; }
+        if (op == TK.GreaterEq()) { return "op_ge"; }
+        return "";
+    }
+
+    // does this class (or any base) declare a member with that name?
+    bool OpOverloadExists(string cls, string name) {
+        string c2 = cls;
+        while (c2 != null) {
+            if (UserDefinesClsMember(c2, name)) { return true; }
+            Cls cc = FindClass(c2);
+            c2 = cc != null ? cc.baseName : null;
+        }
+        return false;
+    }
+
+    // symbol of a static op_* method declared on cls, or null
+    string OpStaticSym(string cls, string name) {
+        List<int> cs = MethCandsClsName(cls, name);
+        if (cs == null) { return null; }
+        int i = 0;
+        while (i < cs.Count) {
+            if (methStat[cs[i]] == 1) {
+                return MethSymNg(cls, methNodes[cs[i]]);
+            }
+            i = i + 1;
+        }
+        return null;
+    }
+
+    // shared IndexOf/Contains loop: value equality per element kind --
+    // strings by strcmp, structs by their op_eq (when declared) else
+    // field-wise, primitives by register compare (gen0 parity)
+    void GenListFind(Node recv, Node arg, bool wantIndex) {
+        GenListSearch(recv, arg, wantIndex, false);
+    }
+
+    void GenListSearch(Node recv, Node arg, bool wantIndex, bool remove) {
+        int save = 19;
+        while (save <= 23) { XPushR(save); save = save + 1; }
+        GenExpr(recv);
+        XPushV0();                          // push list
+        GenExpr(arg);
+        XPopV(1);                                // pop list -> x1 (x0 = value)
+        MovRR(19, 1);                            // x19 = list
+        MovRR(22, 0);                            // x22 = value
+        LdrU(20, 19, 0);                         // x20 = count
+        LdrU(21, 19, 16);                        // x21 = data
+        if (tgt86 == 1) { LoadImm(23, 0); } else { E4(0xD2800017); }    // movz x23, #0 (i)
+        Cls es = StructOf(arg);
+        string eqSym = es != null ? OpStaticSym(es.name, "op_eq") : null;
+        int lp = NL();
+        int nof = NL();
+        int yes = NL();
+        int done = NL();
+        Mark(lp);
+        if (tgt86 == 1) { XGetV(23, 10); XGetV(20, 11); X3(0x4D, 0x39, 0xDA); } else { E4(0xEB1402FF); }   // cmp r10(i), r11(count)
+        EmitBcond(10, nof);                      // b.ge nof
+        EmitArrElemLoad(8, "long", 21, 23, 0);   // ldr x0, [x21, x23, lsl #3]
+        if (IsStrExpr(arg)) {
+            MovRR(1, 22);
+            BLExtern("_strcmp");
+            if (tgt86 == 1) { X3(0x83, 0xF8, 0x00); } else { E4(0x7100001F); }   // cmp eax, #0 (strcmp 返回在 eax)
+            EmitBcond(0, yes);                   // b.eq
+        } else if (eqSym != null) {
+            MovRR(1, 22);
+            BLInternal(eqSym);                   // bool op_eq(elem, value)
+            EmitCbnz(0, yes);                    // non-zero -> hit
+        } else if (es != null) {
+            // field-wise: every slot must match (批43:扁平叶比较)
+            int fail = NL();
+            List<Fld> flatCt = new List<Fld>();
+            FlatValueFields(es, flatCt, 0, new List<string>());
+            int fi = 0;
+            while (fi < flatCt.Count) {
+                LoadFieldNg(2, 0, flatCt[fi]);
+                LoadFieldNg(3, 22, flatCt[fi]);
+                if (tgt86 == 1) { Xop(0x39, 1, 2); } else { E4(0xEB03005F); }    // cmp x3, x2
+                EmitBcond(1, fail);              // b.ne
+                fi = fi + 1;
+            }
+            EmitB(yes);
+            Mark(fail);
+        } else {
+            if (tgt86 == 1) { XGetV(22, 11); X3(0x4C, 0x39, 0xDF); } else { E4(0xEB16001F); }   // cmp x0, x22
+            EmitBcond(0, yes);                   // b.eq
+        }
+        AddImm(23, 23, 1);
+        EmitB(lp);
+        Mark(nof);
+        if (wantIndex) { LoadImm(0, -1); } else { LoadImm(0, 0); }
+        EmitB(done);
+        Mark(yes);
+        if (remove) {
+            MovRR(0, 19);
+            MovRR(1, 23);
+            BLInternal("_zan_rt_list_removeat");
+            LoadImm(0, 1);
+        } else if (wantIndex) { MovRR(0, 23); } else { LoadImm(0, 1); }
+        Mark(done);
+        save = 23;
+        while (save >= 19) { XPopV(save); save = save - 1; }
+    }
+
+    // nearest instance implementation of `name` strictly above curCls in the
+    // base chain (base-call semantics: curCls's own overrides are skipped,
+    // abstract declarations do not terminate the walk)
+    int ResolveBaseImplNg(string name, Node call) {
+        Cls mine = curCls != null ? FindClass(curCls) : null;
+        string cur = mine != null ? mine.baseName : null;
+        while (cur != null) {
+            Cls cc = FindClass(cur);
+            string cn = cc != null ? cc.name : cur;
+            List<int> cands = new List<int>();
+            List<int> cc2 = MethCandsClsName(cn, name);
+            if (cc2 != null) {
+                int q = 0;
+                while (q < cc2.Count) {
+                    if (methStat[cc2[q]] != 1) { cands.Add(cc2[q]); }
+                    q = q + 1;
+                }
+            }
+            int pick = cands.Count > 0 ? FitPickIdx(cands, call) : -1;
+            if (pick >= 0 && !HasMod(methNodes[pick], MOD.Abstract())) { return pick; }
+            cur = cc != null ? cc.baseName : null;
+        }
+        return -1;
+    }
+
+}

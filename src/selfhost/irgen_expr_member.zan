@@ -1,0 +1,964 @@
+using System;
+using System.Collections.Generic;
+namespace Zan;
+
+partial class Irgen {
+    // ---- member access (field / .Length / .Count) ----
+    // Null-conditional `a?.b` / `a?.M(...)`: evaluate the receiver once, bind
+    // it to a synthetic local, and only evaluate the member/call when it is
+    // non-null; a null receiver yields the result type's zero value. The
+    // member node is temporarily rewired to read the synthetic local so the
+    // ordinary member/call codegen applies unchanged, then restored.
+    ExprVal GenNullCond(Node full, Node qmem) {
+        ExprVal obj = GenExpr(qmem.a);
+        string ot = MapType(obj.ty);
+        if (!IsPtrLL(ot)) {
+            qmem.ival = 0;
+            ExprVal pv = GenExpr(full);
+            qmem.ival = 1;
+            return pv;
+        }
+        qdotSeq = qdotSeq + 1;
+        string nm = "__qdot" + qdotSeq;
+        string reg = AddLocal(nm, obj.ty);
+        EA(reg, ot);
+        L("  store " + ot + " " + obj.op + ", " + ot + "* " + reg);
+        Node ident = new Node(AK.Ident());
+        ident.sval = nm; ident.line = qmem.line; ident.col = qmem.col;
+        Node saved = qmem.a;
+        qmem.a = ident; qmem.ival = 0;
+        int lthen = NL(); int lend = NL();
+        string isn = NT();
+        L("  " + isn + " = icmp eq " + ot + " " + obj.op + ", null");
+        string bpre = curLbl;
+        L("  br i1 " + isn + ", label %L" + lend + ", label %L" + lthen);
+        Label(lthen);
+        List<string> svT = stmtTemps; List<Node> svTT = stmtTempTypes;
+        stmtTemps = new List<string>(); stmtTempTypes = new List<Node>();
+        ExprVal v = GenExpr(full);
+        EmitArcRetain(v.op, v.ty);
+        EmitTempReleases();
+        stmtTemps = svT; stmtTempTypes = svTT;
+        qmem.a = saved; qmem.ival = 1;
+        string bthen = curLbl;
+        L("  br label %L" + lend);
+        Label(lend);
+        string vt = MapType(v.ty);
+        if (vt == "void") { return new ExprVal("0", MkType("int")); }
+        string dflt = "0";
+        if (IsPtrLL(vt)) { dflt = "null"; }
+        if (vt == "double") { dflt = "0.0"; }
+        string r = NT();
+        L("  " + r + " = phi " + vt + " [ " + dflt + ", %" + bpre + " ], [ " + v.op + ", %" + bthen + " ]");
+        AddTemp(r, v.ty);
+        return new ExprVal(r, v.ty);
+    }
+
+    // ---- Console.* ----
+    // Every Console member is lowered the way the C host lowers it
+    // (src/compiler/irgen_call.c). The old code had ONE catch-all that
+    // treated every Console member as "print the first argument", so
+    // Console.Clear() printed "0", Console.ReadLine() printed "0" and
+    // returned garbage -- the program got wrong answers without a word.
+    //
+    // Returns null when the member is not a Console builtin (the caller
+    // then reports it).
+    // ---- Console.ForegroundColor / Console.BackgroundColor / Console.Title ----
+    // The C host keeps the current console color in two module-level slots
+    // and emits the ANSI sequence on assignment (irgen_expr.c:
+    // console_color_slot / emit_console_color / emit_console_title).
+    // Console.Title is write-only: the host has no getter for it (reading it
+    // is a compile error there), so only the assignment is lowered.
+    bool IsConsoleProp(Node e, string name) {
+        if (e == null || e.kind != AK.MemberAccess()) { return false; }
+        if (e.a == null || e.a.kind != AK.Ident()) { return false; }
+        if (e.a.sval != "Console") { return false; }
+        if (LocalIdx("Console") >= 0) { return false; }
+        return e.sval == name;
+    }
+    // the two color slots and the two escape formats
+    void EnsureConsoleSlots() {
+        if (conSlots) { return; }
+        conSlots = true;
+        H("@__zan_console_fg = private global i64 7");
+        H("@__zan_console_bg = private global i64 0");
+        H("@.fmt.ansi = private unnamed_addr constant [6 x i8] c\"\\1B[%dm\\00\"");
+        H("@.fmt.osc = private unnamed_addr constant [8 x i8] c\"\\1B]0;%s\\07\\00\"");
+    }
+    ExprVal ConsoleColorGet(bool isBg) {
+        EnsureConsoleSlots();
+        string g = isBg ? "@__zan_console_bg" : "@__zan_console_fg";
+        string t = NT();
+        L("  " + t + " = load i64, i64* " + g);
+        return new ExprVal(t, MkType("int"));
+    }
+    // Console.ForegroundColor = c / Console.BackgroundColor = c: the slot
+    // keeps the color index (color & 15) and the escape carries the ANSI
+    // code -- (idx < 8 ? 30 : 90) + 4*b0 + 2*b1 + b2 (the host's table),
+    // plus 10 for the background.
+    void ConsoleColorSet(ExprVal v, bool isBg) {
+        EnsureConsoleSlots();
+        string g = isBg ? "@__zan_console_bg" : "@__zan_console_fg";
+        string idx = NT();
+        L("  " + idx + " = and i64 " + v.op + ", 15");
+        L("  store i64 " + idx + ", i64* " + g);
+        string b0 = NT(); L("  " + b0 + " = and i64 " + idx + ", 1");
+        string sh1 = NT(); L("  " + sh1 + " = lshr i64 " + idx + ", 1");
+        string b1 = NT(); L("  " + b1 + " = and i64 " + sh1 + ", 1");
+        string sh2 = NT(); L("  " + sh2 + " = lshr i64 " + idx + ", 2");
+        string b2 = NT(); L("  " + b2 + " = and i64 " + sh2 + ", 1");
+        string m0 = NT(); L("  " + m0 + " = mul i64 " + b0 + ", 4");
+        string m1 = NT(); L("  " + m1 + " = mul i64 " + b1 + ", 2");
+        string lo = NT(); L("  " + lo + " = add i64 " + m0 + ", " + m1);
+        string lo2 = NT(); L("  " + lo2 + " = add i64 " + lo + ", " + b2);
+        string lt8 = NT(); L("  " + lt8 + " = icmp ult i64 " + idx + ", 8");
+        string bsel = NT(); L("  " + bsel + " = select i1 " + lt8 + ", i64 30, i64 90");
+        string code = NT(); L("  " + code + " = add i64 " + bsel + ", " + lo2);
+        if (isBg) {
+            string c2 = NT(); L("  " + c2 + " = add i64 " + code + ", 10");
+            code = c2;
+        }
+        string c32 = NT(); L("  " + c32 + " = trunc i64 " + code + " to i32");
+        string gp = NT();
+        L("  " + gp + " = getelementptr inbounds [6 x i8], [6 x i8]* @.fmt.ansi, i64 0, i64 0");
+        L("  call i32 (i8*, ...) @printf(i8* " + gp + ", i32 " + c32 + ")");
+    }
+    // Console.Title = s: the OSC sequence "\033]0;<title>\a"
+    void ConsoleTitleSet(ExprVal v) {
+        EnsureConsoleSlots();
+        string gp = NT();
+        L("  " + gp + " = getelementptr inbounds [8 x i8], [8 x i8]* @.fmt.osc, i64 0, i64 0");
+        L("  call i32 (i8*, ...) @printf(i8* " + gp + ", i8* " + v.op + ")");
+    }
+    ExprVal GenConsoleCall(string mname, Node e) {
+        int argc = e.kids.Count;
+        // ---- Console.Write / WriteLine / PrintLine ----
+        // The host prints the argument and, for WriteLine/PrintLine, a
+        // newline. The rendering depends on the argument's type:
+        //   string -> the string;  double -> the shortest round-trip form;
+        //   bool -> "true"/"false";  char -> its UTF-8 text;
+        //   ulong -> %llu;  everything else -> %lld.
+        if (mname == "Write" || mname == "WriteLine" || mname == "PrintLine") {
+            bool nl = (mname != "Write");
+            // WriteLine with no argument prints an empty line (the host
+            // calls println with the empty string).
+            if (argc == 0) {
+                if (!nl) { return new ExprVal("0", MkType("void")); }
+                string ep = NT();
+                L("  " + ep + " = call i8* @zstr_new(i64 0)");
+                string gp = NT();
+                L("  " + gp + " = getelementptr inbounds [4 x i8], [4 x i8]* @.fmt.snl, i64 0, i64 0");
+                L("  call i32 (i8*, ...) @printf(i8* " + gp + ", i8* " + ep + ")");
+                return new ExprVal("0", MkType("void"));
+            }
+            if (argc != 1) {
+                diags.Error("Console." + mname + " takes at most one argument", e.line, e.col);
+                return new ExprVal("0", MkType("void"));
+            }
+            ExprVal a = GenExpr(e.kids[0]);
+            // a NULLABLE value prints its payload, or an empty line when it
+            // is null (the C host's Nullable.ToString)
+            if (IsNullableValue(a.ty)) {
+                string ult = UnderLL(a.ty);
+                string zp = NT();
+                L("  " + zp + " = getelementptr inbounds [16 x i8], [16 x i8]* @.zeropage, i64 0, i64 0");
+                string isn = NT();
+                L("  " + isn + " = icmp eq i8* " + a.op + ", null");
+                string saf = NT();
+                L("  " + saf + " = select i1 " + isn + ", i8* " + zp + ", i8* " + a.op);
+                string pp = NT();
+                L("  " + pp + " = bitcast i8* " + saf + " to " + ult + "*");
+                string pv = NT();
+                L("  " + pv + " = load " + ult + ", " + ult + "* " + pp);
+                Node pty = MkType(a.ty.sval);
+                string nums = ToCStr(new ExprVal(pv, pty));
+                ExprVal empt = GenStr("");
+                string rs = NT();
+                L("  " + rs + " = select i1 " + isn + ", i8* " + empt.op + ", i8* " + nums);
+                string gp = NT();
+                string fg = "@.fmt.sn"; int fl = 3;
+                if (nl) { fg = "@.fmt.snl"; fl = 4; }
+                L("  " + gp + " = getelementptr inbounds [" + fl + " x i8], [" + fl + " x i8]* " + fg + ", i64 0, i64 0");
+                L("  call i32 (i8*, ...) @printf(i8* " + gp + ", i8* " + rs + ")");
+                return new ExprVal("0", MkType("void"));
+            }
+            // bool -> "true"/"false"
+            if (a.ty != null && a.ty.sval == "bool" && a.ty.ival == 0) {
+                ExprVal ts = GenStr("true");
+                ExprVal fs = GenStr("false");
+                string c = NT(); L("  " + c + " = icmp ne i64 " + a.op + ", 0");
+                string r = NT(); L("  " + r + " = select i1 " + c + ", i8* " + ts.op + ", i8* " + fs.op);
+                string gp = NT();
+                string fg = "@.fmt.sn"; int fl = 3;
+                if (nl) { fg = "@.fmt.snl"; fl = 4; }
+                L("  " + gp + " = getelementptr inbounds [" + fl + " x i8], [" + fl + " x i8]* " + fg + ", i64 0, i64 0");
+                L("  call i32 (i8*, ...) @printf(i8* " + gp + ", i8* " + r + ")");
+                return new ExprVal("0", MkType("void"));
+            }
+            // a char is its UTF-8 text, a string is itself, a double is the
+            // shortest round-trip form -- all three print as %s
+            if (IsStr(a.ty) || (a.ty != null && a.ty.sval == "TypeInfo") || IsDbl(a.ty) || (a.ty != null && a.ty.sval == "char" && a.ty.ival == 0)) {
+                string sv = a.op;
+                if (IsDbl(a.ty)) {
+                    if (a.ty != null && a.ty.sval == "float") { sv = FltToStr(a.op).op; }
+                    else { sv = DblToStr(a.op).op; }
+                }
+                else if (a.ty.sval == "char") { sv = CharToStr(a.op); }
+                string gp = NT();
+                string fg = "@.fmt.sn"; int fl = 3;
+                if (nl) { fg = "@.fmt.snl"; fl = 4; }
+                L("  " + gp + " = getelementptr inbounds [" + fl + " x i8], [" + fl + " x i8]* " + fg + ", i64 0, i64 0");
+                L("  call i32 (i8*, ...) @printf(i8* " + gp + ", i8* " + sv + ")");
+                return new ExprVal("0", MkType("void"));
+            }
+            // an integer: %llu for ulong (the high bit is data), %lld else
+            string gp = NT();
+            string fg = "@.fmt.nn"; int fl = 5;
+            if (nl) { fg = "@.fmt.nl"; fl = 6; }
+            if (IsUlong(a.ty)) {
+                fg = "@.fmt.unn"; fl = 5;
+                if (nl) { fg = "@.fmt.unl"; fl = 6; }
+            }
+            L("  " + gp + " = getelementptr inbounds [" + fl + " x i8], [" + fl + " x i8]* " + fg + ", i64 0, i64 0");
+            L("  call i32 (i8*, ...) @printf(i8* " + gp + ", i64 " + a.op + ")");
+            return new ExprVal("0", MkType("void"));
+        }
+        // ---- Console.Clear() ----
+        // The host emits the ANSI sequence "\033[2J\033[H".
+        if (mname == "Clear" && argc == 0) {
+            string gp = NT();
+            L("  " + gp + " = getelementptr inbounds [8 x i8], [8 x i8]* @.esc.clear, i64 0, i64 0");
+            L("  call i32 (i8*, ...) @printf(i8* " + gp + ")");
+            return new ExprVal("0", MkType("void"));
+        }
+        // ---- Console.ResetColor() ----
+        // The host emits "\033[0m".
+        if (mname == "ResetColor" && argc == 0) {
+            string gp = NT();
+            L("  " + gp + " = getelementptr inbounds [5 x i8], [5 x i8]* @.esc.reset, i64 0, i64 0");
+            L("  call i32 (i8*, ...) @printf(i8* " + gp + ")");
+            return new ExprVal("0", MkType("void"));
+        }
+        // ---- Console.ReadLine() ----
+        // The host allocates 1024 bytes, NUL-terminates up front and yields
+        // the buffer whatever fgets does (an EOF reads back the empty
+        // string). The trailing newline stays in the value -- the host
+        // does not trim it.
+        if (mname == "ReadLine" && argc == 0) {
+            if (!ExternSeen("fgets")) { externDecls.Add("fgets"); H("declare i8* @fgets(i8*, i32, i8*)"); }
+            string buf = NT(); L("  " + buf + " = call i8* @zstr_new(i64 1024)");
+            string z = NT(); L("  " + z + " = getelementptr i8, i8* " + buf + ", i64 0");
+            L("  store i8 0, i8* " + z);
+            // stdin: the Windows CRT exposes it through __acrt_iob_func(0),
+            // everywhere else it is the `stdin` global
+            string sp = NT();
+            if (hostWin) {
+                if (!ExternSeen("__acrt_iob_func")) {
+                    externDecls.Add("__acrt_iob_func");
+                    H("declare i8* @__acrt_iob_func(i32)");
+                }
+                L("  " + sp + " = call i8* @__acrt_iob_func(i32 0)");
+            } else {
+                string sg = NT(); L("  " + sg + " = load i8*, i8** @stdin");
+                L("  " + sp + " = bitcast i8* " + sg + " to i8*");
+            }
+            string got = NT();
+            L("  " + got + " = call i8* @fgets(i8* " + buf + ", i32 1024, i8* " + sp + ")");
+            // the exact length of what was read (fgets stops at the NUL)
+            string len = NT(); L("  " + len + " = call i64 @strlen(i8* " + buf + ")");
+            // the value keeps the exact length, so trim the header to it
+            string hdr = NT(); L("  " + hdr + " = getelementptr i8, i8* " + buf + ", i64 -16");
+            L("  store i64 " + len + ", i64* " + hdr);
+            return new ExprVal(buf, MkType("string"));
+        }
+        // ---- Console.Read() ----
+        // The host reads one character with getchar.
+        if (mname == "Read" && argc == 0) {
+            if (!ExternSeen("getchar")) { externDecls.Add("getchar"); H("declare i32 @getchar()"); }
+            string r = NT(); L("  " + r + " = call i32 @getchar()");
+            string r64 = NT(); L("  " + r64 + " = sext i32 " + r + " to i64");
+            return new ExprVal(r64, MkType("int"));
+        }
+        // ---- Console.ReadKey() ----
+        // The host reads one key without echo: _getch on Windows, getchar
+        // elsewhere. The builtin takes an optional bool (intercept) and the
+        // host ignores it.
+        if (mname == "ReadKey" && argc <= 1) {
+            if (hostWin) {
+                if (!ExternSeen("_getch")) { externDecls.Add("_getch"); H("declare i32 @_getch()"); }
+                string r = NT(); L("  " + r + " = call i32 @_getch()");
+                string r64 = NT(); L("  " + r64 + " = sext i32 " + r + " to i64");
+                return new ExprVal(r64, MkType("int"));
+            }
+            if (!ExternSeen("getchar")) { externDecls.Add("getchar"); H("declare i32 @getchar()"); }
+            string r = NT(); L("  " + r + " = call i32 @getchar()");
+            string r64 = NT(); L("  " + r64 + " = sext i32 " + r + " to i64");
+            return new ExprVal(r64, MkType("int"));
+        }
+        return null;
+    }
+    // A simple name in an expression binds to the innermost declaration: a
+    // local, then a field of the enclosing class, and only then a type. A
+    // field named like a type shadows that type -- `Collapse.Add(...)` with
+    // a `Collapse` field is a call on the field, not on the class.
+    bool ShadowsTypeName(string name) {
+        if (curClass == "") { return false; }
+        Node cls = binder.FindType(curClass);
+        if (cls == null) { return false; }
+        if (FieldIndex(cls, name) >= 0) { return true; }
+        return FindStaticField(cls, name) != null;
+    }
+
+    // The built-in scalar type constants (int.MaxValue, uint.MinValue,
+    // double.NaN, float.Epsilon, ...). The C host folds them into
+    // compile-time constants (src/compiler/irgen_expr.c:6796-6870); the
+    // self-host keeps the same values in its own value model: the integers
+    // in the i64 slot (the host's int is 32 bits, but the value is the same
+    // number), the doubles as doubles (the host's float is an f32 -- the
+    // float constants are the f32 values widened, so float.Epsilon is exact).
+    // Returns null when the type or the member is not one of them.
+    ExprVal PrimTypeConst(string tn, string m) {
+        if (tn == "int") {
+            if (m == "MaxValue") { return new ExprVal("2147483647", MkType("int")); }
+            if (m == "MinValue") { return new ExprVal("-2147483648", MkType("int")); }
+        }
+        if (tn == "uint") {
+            if (m == "MaxValue") { return new ExprVal("4294967295", MkType("uint")); }
+        }
+        if (tn == "long") {
+            if (m == "MaxValue") { return new ExprVal("9223372036854775807", MkType("long")); }
+            if (m == "MinValue") { return new ExprVal("-9223372036854775808", MkType("long")); }
+        }
+        if (tn == "ulong") {
+            // the host's ulong.MaxValue is the all-ones bit pattern
+            if (m == "MaxValue") { return new ExprVal("-1", MkType("ulong")); }
+        }
+        if (tn == "short") {
+            if (m == "MaxValue") { return new ExprVal("32767", MkType("short")); }
+            if (m == "MinValue") { return new ExprVal("-32768", MkType("short")); }
+        }
+        if (tn == "ushort") {
+            if (m == "MaxValue") { return new ExprVal("65535", MkType("ushort")); }
+        }
+        if (tn == "byte") {
+            if (m == "MaxValue") { return new ExprVal("255", MkType("byte")); }
+        }
+        if (tn == "sbyte") {
+            if (m == "MaxValue") { return new ExprVal("127", MkType("sbyte")); }
+            if (m == "MinValue") { return new ExprVal("-128", MkType("sbyte")); }
+        }
+        if (tn == "char") {
+            if (m == "MaxValue") { return new ExprVal("65535", MkType("char")); }
+        }
+        if (tn == "double") {
+            if (m == "MaxValue") { return new ExprVal("1.7976931348623157E+308", MkType("double")); }
+            if (m == "MinValue") { return new ExprVal("-1.7976931348623157E+308", MkType("double")); }
+            if (m == "NaN") { return new ExprVal("0x7FF8000000000000", MkType("double")); }
+            if (m == "PositiveInfinity") { return new ExprVal("0x7FF0000000000000", MkType("double")); }
+            if (m == "NegativeInfinity") { return new ExprVal("0xFFF0000000000000", MkType("double")); }
+        }
+        if (tn == "float") {
+            // the f32 values widened to a double (the self-host's float is a
+            // double): Epsilon is 2^-149, the extremes are the f32 bounds
+            if (m == "Epsilon") { return new ExprVal("0x36A0000000000000", MkType("float")); }
+            if (m == "MaxValue") { return new ExprVal("0x47EFFFFFE0000000", MkType("float")); }
+            if (m == "MinValue") { return new ExprVal("0xC7EFFFFFE0000000", MkType("float")); }
+            if (m == "NaN") { return new ExprVal("0x7FF8000000000000", MkType("float")); }
+            if (m == "PositiveInfinity") { return new ExprVal("0x7FF0000000000000", MkType("float")); }
+            if (m == "NegativeInfinity") { return new ExprVal("0xFFF0000000000000", MkType("float")); }
+        }
+        return null;
+    }
+
+    // The enum member values, folded in declaration order. The C host binds
+    // the members in order and folds each value expression
+    // (src/compiler/binder.c: fold_enum_member_value): a literal, a unary
+    // +/- , a binary + - * / & |, or a reference to an ALREADY folded member.
+    // So `Red = -5, Green, Blue = Red + 10` is -5, -4, 5 -- not the ordinals.
+    List<string> enumFoldNames;   // the members folded so far
+    List<long> enumFoldVals;
+    bool enumFoldOk;
+    long enumFoldVal;
+
+    // The enum is folded once per member access, so a bad member would be
+    // reported once per access. The host reports it once (at bind time), so
+    // the report is remembered per member.
+    List<Node> enumBadReported = new List<Node>();
+
+    void EnumReportBad(Node mem, string msg) {
+        int i = 0;
+        while (i < enumBadReported.Count) {
+            if (enumBadReported[i] == mem) { return; }
+            i = i + 1;
+        }
+        enumBadReported.Add(mem);
+        diags.Error(msg, mem.line, mem.col);
+    }
+
+    List<long> EnumMemberValues(Node tc) {
+        List<long> vals = new List<long>();
+        enumFoldNames = new List<string>();
+        enumFoldVals = new List<long>();
+        long run = 0;   // the running value: the next member continues from it
+        int i = 0;
+        while (i < tc.kids.Count) {
+            Node mem = tc.kids[i];
+            if (mem.kind == AK.EnumMember()) {
+                long v = 0;
+                if (mem.a == null) {
+                    v = run;
+                } else {
+                    enumFoldOk = true;
+                    enumFoldVal = 0;
+                    EnumFold(mem.a);
+                    if (enumFoldOk) {
+                        v = enumFoldVal;
+                        // the enum members are 32-bit (the host's
+                        // enum_value_fits_int -- only the EXPLICIT values are
+                        // checked, the continuation ones are not)
+                        if (v < -2147483648L || v > 2147483647L) {
+                            EnumReportBad(mem, "enum member '" + mem.sval + "' value " + v
+                                + " does not fit in 'int' (enum members are 32-bit)");
+                        }
+                    } else {
+                        // the host refuses the program ("must be an integer
+                        // constant expression"); say the same instead of
+                        // answering with the ordinal
+                        EnumReportBad(mem, "enum member '" + mem.sval
+                            + "' initializer must be an integer constant expression");
+                        v = run;
+                    }
+                }
+                enumFoldNames.Add(mem.sval);
+                enumFoldVals.Add(v);
+                // the folded value keeps its SIGNED 64-bit shape here: the
+                // host compares the runtime value against the signed value
+                // (irgen_call.c) and stores the signed value through the out
+                // address of TryParse. The member CONSTANT is a different
+                // domain -- it is emitted zero-extended from 32 bits (the
+                // emission site does that).
+                vals.Add(v);
+                run = v + 1;
+            }
+            i = i + 1;
+        }
+        return vals;
+    }
+
+    // Fold one enum member value expression (the host's
+    // fold_enum_member_value, src/compiler/binder.c).
+    void EnumFold(Node e) {
+        if (e == null) { enumFoldOk = false; return; }
+        if (e.kind == AK.IntLit()) { enumFoldVal = e.ival; return; }
+        if (e.kind == AK.Unary()) {
+            EnumFold(e.a);
+            if (!enumFoldOk) { return; }
+            long v = enumFoldVal;
+            if (e.op == TK.Minus()) { enumFoldVal = 0 - v; return; }
+            if (e.op == TK.Plus()) { enumFoldVal = v; return; }
+            if (e.op == TK.Tilde()) { enumFoldVal = ~v; return; }
+            enumFoldOk = false;
+            return;
+        }
+        if (e.kind == AK.Binary()) {
+            EnumFold(e.a);
+            if (!enumFoldOk) { return; }
+            long l = enumFoldVal;
+            EnumFold(e.b);
+            if (!enumFoldOk) { return; }
+            long r = enumFoldVal;
+            int op = e.op;
+            if (op == TK.Plus()) { enumFoldVal = l + r; return; }
+            if (op == TK.Minus()) { enumFoldVal = l - r; return; }
+            if (op == TK.Star()) { enumFoldVal = l * r; return; }
+            if (op == TK.Slash()) {
+                // the host refuses the two undefined divisions
+                if (r == 0) { enumFoldOk = false; return; }
+                if (l == (-9223372036854775807L - 1) && r == -1) { enumFoldOk = false; return; }
+                enumFoldVal = l / r;
+                return;
+            }
+            if (op == TK.LessLess()) { enumFoldVal = l << (r & 63); return; }
+            if (op == TK.Amp()) { enumFoldVal = l & r; return; }
+            if (op == TK.Pipe()) { enumFoldVal = l | r; return; }
+            enumFoldOk = false;
+            return;
+        }
+        if (e.kind == AK.Ident()) {
+            // an earlier member of the same enum (the host only finds the
+            // members that are already bound)
+            int k = 0;
+            while (k < enumFoldNames.Count) {
+                if (enumFoldNames[k] == e.sval) {
+                    enumFoldVal = enumFoldVals[k];
+                    return;
+                }
+                k = k + 1;
+            }
+            enumFoldOk = false;
+            return;
+        }
+        enumFoldOk = false;
+    }
+
+    // the enum declaration a type name names, or null
+    Node EnumDeclOf(string tname) {
+        if (tname == null || tname == "") { return null; }
+        Node d = binder.FindType(tname);
+        if (d == null || d.kind != AK.EnumDecl()) { return null; }
+        return d;
+    }
+
+    // enum x.ToString(): the name of the FIRST member whose folded value
+    // equals the runtime value (the host's irgen_call.c compares the members
+    // in declaration order, so a value two members share answers with the
+    // earlier one); a value that matches no member prints as its number.
+    //
+    // The comparison uses the member's SIGNED folded value while the value
+    // itself travels zero-extended from 32 bits (the host emits the member
+    // constants as (uint64)(uint32)v), so a negative member answers with its
+    // number -- exactly what the host prints.
+    ExprVal EmitEnumToString(ExprVal recv, Node en) {
+        List<long> vals = EnumMemberValues(en);
+        List<string> names = enumFoldNames;
+        string cur = ToCStr(recv);          // the numeric fallback
+        int i = names.Count - 1;
+        while (i >= 0) {
+            string c = NT();
+            L("  " + c + " = icmp eq i64 " + recv.op + ", " + vals[i]);
+            ExprVal nm = GenStr(names[i]);
+            string r = NT();
+            L("  " + r + " = select i1 " + c + ", i8* " + nm.op + ", i8* " + cur);
+            cur = r;
+            i = i - 1;
+        }
+        return new ExprVal(cur, MkType("string"));
+    }
+
+    // EnumType.TryParse(text, out value): a case-sensitive probe over the
+    // member names in declaration order (the host's irgen_call.c). A hit
+    // stores the member's folded value through the out address and answers
+    // true; a miss stores 0 and answers false.
+    ExprVal EmitEnumTryParse(Node e, Node en) {
+        List<long> vals = EnumMemberValues(en);
+        List<string> names = enumFoldNames;
+        ExprVal txt = GenExpr(e.kids[0]);
+        // the out address
+        Node oa = e.kids[1];
+        string outp = "";
+        if (oa.type != null) {
+            outp = AddLocal(oa.sval, oa.type);
+            EA(outp, MapType(oa.type));
+        } else {
+            string onm = oa.sval;
+            if (onm == "" && oa.a != null && oa.a.kind == AK.Ident()) { onm = oa.a.sval; }
+            int li = LocalIdx(onm);
+            if (li >= 0) { outp = locReg[li]; }
+        }
+        // the answer: 1 on a hit, 0 on a miss -- the first match wins
+        string res = "0";
+        string val = "0";
+        int i = names.Count - 1;
+        while (i >= 0) {
+            ExprVal nm = GenStr(names[i]);
+            string c = NT();
+            L("  " + c + " = call i32 @strcmp(i8* " + txt.op + ", i8* " + nm.op + ")");
+            string eq = NT();
+            L("  " + eq + " = icmp eq i32 " + c + ", 0");
+            string r1 = NT();
+            L("  " + r1 + " = select i1 " + eq + ", i64 1, i64 " + res);
+            string r2 = NT();
+            L("  " + r2 + " = select i1 " + eq + ", i64 " + vals[i] + ", i64 " + val);
+            res = r1;
+            val = r2;
+            i = i - 1;
+        }
+        if (outp != "") { L("  store i64 " + val + ", i64* " + outp); }
+        return new ExprVal(res, MkType("bool"));
+    }
+
+    ExprVal GenMember(Node e) {
+        if (e.a.kind == AK.Ident() && LocalIdx(e.a.sval) < 0 && !ShadowsTypeName(e.a.sval)) {
+            // Console.ForegroundColor / Console.BackgroundColor: the current
+            // color, kept in a module-level slot by the C host.
+            if (e.a.sval == "Console" && binder.FindType("Console") == null) {
+                if (e.sval == "ForegroundColor") { return ConsoleColorGet(false); }
+                if (e.sval == "BackgroundColor") { return ConsoleColorGet(true); }
+            }
+            // Math.PI: the C host folds the member into a compile-time
+            // double constant (src/compiler/irgen_expr.c:6783). The very
+            // same digits, so a program that prints it prints the same
+            // string under both compilers.
+            if (e.a.sval == "Math" && e.sval == "PI" && binder.FindType("Math") == null) {
+                return new ExprVal("3.14159265358979323846", MkType("double"));
+            }
+            // Cpu.HasXxx: the C host lowers these to its compiler-internal
+            // __zan_cpu_feature() (src/compiler/irgen_expr.c:6651-6667).
+            // On a native build the host's target triple is empty, so that
+            // helper takes its "neither x86 nor arm" fallback and reports
+            // NO feature at all -- the emitted IR is a plain `ret i32 0`.
+            // The self-host has no cross-compile target either, so it
+            // answers the same "no".
+            if (e.a.sval == "Cpu" && LocalIdx("Cpu") < 0 && CpuFeatureId(e.sval) > 0) {
+                return new ExprVal("0", MkType("bool"));
+            }
+            // the built-in scalar type constants (int.MaxValue, double.NaN,
+            // ...): the C host folds them into compile-time constants
+            // (src/compiler/irgen_expr.c:6796-6870). The self-host keeps the
+            // same values in its own value model (the integers in the i64
+            // slot, the doubles as doubles).
+            ExprVal pc = PrimTypeConst(e.a.sval, e.sval);
+            if (pc != null) { return pc; }
+            Node tc = binder.FindType(e.a.sval);
+            // Vector128/256 static members (Zero, AllBitsSet) are values, not
+            // storage — lower them inline instead of loading a static field
+            if (tc != null && (e.a.sval == "Vector128" || e.a.sval == "Vector256")) {
+                if (e.sval == "Zero") {
+                    return new ExprVal("zeroinitializer", MkType(e.a.sval));
+                }
+                if (e.sval == "AllBitsSet") {
+                    string vt = e.a.sval == "Vector128" ? "<2 x i64>" : "<4 x i64>";
+                    string ones = NT();
+                    L("  " + ones + " = insertelement " + vt + " undef, i64 -1, i32 0");
+                    int lane = 1;
+                    int lanes = e.a.sval == "Vector128" ? 2 : 4;
+                    while (lane < lanes) {
+                        string r2 = NT();
+                        L("  " + r2 + " = insertelement " + vt + " " + ones + ", i64 -1, i32 " + lane);
+                        ones = r2;
+                        lane = lane + 1;
+                    }
+                    return new ExprVal(ones, MkType(e.a.sval));
+                }
+            }
+            if (tc != null && FindStaticField(tc, e.sval) != null) {
+                // `Stat<int>.s`: the static storage belongs to that one
+                // instantiation of the generic class
+                return LoadStaticField(tc, e.sval, ConcreteInstArgs(e, tc.sval));
+            }
+            // static property: Cls.Prop -> Cls.get_Prop(). The parser turns a
+            // property into a getter method, so the property is a static
+            // method call.
+            if (tc != null) {
+                Node sg = FindMethodUp(tc, "get_" + e.sval);
+                if (sg != null && HasMod(sg, MOD.Static())) {
+                    Node sc = new Node(AK.Call());
+                    sc.line = e.line; sc.col = e.col;
+                    return EmitStaticCall(tc.sval, "get_" + e.sval, sc);
+                }
+            }
+            // enum member constant: Color.Red -> its folded value (the host
+            // folds the member values in declaration order, so a member may
+            // refer to an EARLIER one: `Blue = Red + 10`)
+            if (tc != null && tc.kind == AK.EnumDecl()) {
+                List<long> vals = EnumMemberValues(tc);
+                int k = 0;
+                int j = 0;
+                while (j < tc.kids.Count) {
+                    Node mem = tc.kids[j];
+                    if (mem.kind == AK.EnumMember()) {
+                        if (mem.sval == e.sval) {
+                            // the member constant is emitted zero-extended
+                            // from 32 bits (the host: (uint64)(uint32)value)
+                            if (k < vals.Count) { return new ExprVal("" + (vals[k] & 4294967295L), MkType("int")); }
+                            return new ExprVal("0", MkType("int"));
+                        }
+                        k = k + 1;
+                    }
+                    j = j + 1;
+                }
+            }
+            // static method group used as a delegate value: Prog.AddOne
+            if (tc != null) {
+                Node mg = FindMethodUp(tc, e.sval);
+                if (mg != null && HasMod(mg, MOD.Static()) && !HasMod(mg, MOD.Extern())) {
+                    return EmitMethodGroup(e.a.sval, tc, mg);
+                }
+            }
+        }
+        ExprVal obj = GenExpr(e.a);
+        // Vector128.Low / Vector128.High: the two 64-bit halves of the
+        // vector (the C host carries the vector in a { i64, i64 } struct and
+        // reads the halves out of it)
+        if (obj.ty != null && (obj.ty.sval == "Vector128" || obj.ty.sval == "Vector256")
+            && (e.sval == "Low" || e.sval == "High")) {
+            string vt = MapType(obj.ty);
+            string idx = "0";
+            if (e.sval == "High") { idx = "1"; }
+            string lane = NT();
+            L("  " + lane + " = extractelement " + vt + " " + obj.op + ", i32 " + idx);
+            return new ExprVal(lane, MkType("long"));
+        }
+        // Task 句柄的属性形态：`t.Result` / `t.IsCompleted`（不带括号的成员
+        // 访问；`t.Wait()` 走调用路径）。
+        if (obj.ty != null && obj.ty.sval == "Task") {
+            return EmitTaskMemberCall(obj, e.sval, e);
+        }
+        if (IsNullableValue(obj.ty) && e.sval == "HasValue") {
+            string t = NT();
+            L("  " + t + " = icmp ne i8* " + obj.op + ", null");
+            string z = NT();
+            L("  " + z + " = zext i1 " + t + " to i64");
+            return new ExprVal(z, MkType("bool"));
+        }
+        if (IsNullableValue(obj.ty) && e.sval == "Value") {
+            string ult = UnderLL(obj.ty);
+            string p = NT();
+            L("  " + p + " = bitcast i8* " + obj.op + " to " + ult + "*");
+            string t = NT();
+            L("  " + t + " = load " + ult + ", " + ult + "* " + p);
+            Node uty = MkType(obj.ty.sval);
+            return new ExprVal(t, uty);
+        }
+        if (IsTuple(obj.ty) && IsItemName(e.sval)) {
+            int idx = ItemIndex(e.sval);
+            List<Node> ekids = obj.ty.kids;
+            Node ety = MkType("int");
+            if (idx < ekids.Count) { ety = ekids[idx]; }
+            string p = NT();
+            L("  " + p + " = bitcast i8* " + obj.op + " to i64*");
+            string slot = NT();
+            L("  " + slot + " = getelementptr i64, i64* " + p + ", i64 " + idx);
+            string raw = NT();
+            L("  " + raw + " = load i64, i64* " + slot);
+            return FromSlot(raw, ety);
+        }
+        if ((e.sval == "Length" || e.sval == "Count") && obj.ty != null && obj.ty.ival >= 1) {
+            string lp = NT();
+            L("  " + lp + " = getelementptr i64, i64* " + obj.op + ", i64 -1");
+            string t = NT();
+            L("  " + t + " = load i64, i64* " + lp);
+            return new ExprVal(t, MkType("int"));
+        }
+        if (e.sval == "Length" && IsSbType(obj.ty)) {
+            string bp = NT();
+            L("  " + bp + " = bitcast i8* " + obj.op + " to %zsb*");
+            string cp = NT();
+            L("  " + cp + " = getelementptr %zsb, %zsb* " + bp + ", i32 0, i32 0");
+            string t = NT();
+            L("  " + t + " = load i64, i64* " + cp);
+            return new ExprVal(t, MkType("int"));
+        }
+        if (e.sval == "Capacity" && IsSbType(obj.ty)) {
+            string bp = NT();
+            L("  " + bp + " = bitcast i8* " + obj.op + " to %zsb*");
+            string cp = NT();
+            L("  " + cp + " = getelementptr %zsb, %zsb* " + bp + ", i32 0, i32 1");
+            string t = NT();
+            L("  " + t + " = load i64, i64* " + cp);
+            return new ExprVal(t, MkType("int"));
+        }
+        if (e.sval == "Length" && IsStr(obj.ty)) {
+            string t = StrLen(obj.op);
+            return new ExprVal(t, MkType("int"));
+        }
+        if (e.sval == "Length" && obj.ty != null && (obj.ty.sval == "Span" || obj.ty.sval == "ReadOnlySpan")) {
+            // Span/ReadOnlySpan views are non-owning and bounds-checking is
+            // omitted in the self-hosted single-word layout; return a safe
+            // non-restrictive length (int.MaxValue) so validation checks pass.
+            return new ExprVal("2147483647", MkType("int"));
+        }
+        if (e.sval == "Count" && IsListType(obj.ty)) {
+            string t = NT();
+            L("  " + t + " = call i64 @zlist_count(i8* " + obj.op + ")");
+            return new ExprVal(t, MkType("int"));
+        }
+        if (e.sval == "Count" && IsDictType(obj.ty)) {
+            string t = NT();
+            L("  " + t + " = call i64 @zdict_count(i8* " + obj.op + ")");
+            return new ExprVal(t, MkType("int"));
+        }
+        if (e.sval == "Clear" && IsDictType(obj.ty)) {
+            L("  call void @zdict_clear(i8* " + obj.op + ")");
+            return new ExprVal("0", MkType("void"));
+        }
+        if ((e.sval == "Keys" || e.sval == "Values") && IsDictType(obj.ty)) {
+            string t = NT();
+            if (e.sval == "Keys") { L("  " + t + " = call i8* @zdict_keys(i8* " + obj.op + ")"); }
+            else { L("  " + t + " = call i8* @zdict_values(i8* " + obj.op + ")"); }
+            Node lt = MkType("List");
+            Node et = MkType("string");
+            if (obj.ty.kids.Count >= 2) {
+                if (e.sval == "Keys") { et = obj.ty.kids[0]; } else { et = obj.ty.kids[1]; }
+            }
+            lt.kids.Add(et);
+            AddTemp(t, lt);
+            return new ExprVal(t, lt);
+        }
+        Node cls = ClassOf(obj.ty);
+        if (cls != null && FieldIndex(cls, e.sval) >= 0) {
+            return LoadField(obj.op, obj.ty, e.sval);
+        }
+        // property getter: obj.Name -> obj.get_Name()
+        if (cls != null && FindMethodUp(cls, "get_" + e.sval) != null) {
+            return EmitInstanceCall(obj, obj.ty.sval, "get_" + e.sval, new Node(AK.Call()));
+        }
+        // an INSTANCE method group used as a delegate value (`obj.Method`):
+        // the closure binds the receiver (the C host's
+        // emit_method_group_closure).
+        if (cls != null) {
+            Node mg = FindMethodUp(cls, e.sval);
+            if (mg != null && !HasMod(mg, MOD.Static()) && !HasMod(mg, MOD.Extern())) {
+                return EmitInstanceMethodGroup(obj, cls, mg);
+            }
+        }
+        // The member is not a field, not a property and not a known builtin
+        // member of the receiver's type. Fail closed: a silent 0 would hand
+        // the program wrong answers without a word.
+        //
+        // A RECEIVER WHOSE TYPE IS A TYPE PARAMETER is the exception: the C
+        // host is silent there too (its member check only reports for class /
+        // struct / interface types), because the generic body is a TEMPLATE
+        // -- the real member access happens in the monomorphized body, where
+        // the type argument is concrete. Here the template slot just yields
+        // a zero of the erased type; the monomorphized clone does the work.
+        //
+        // With a CONSTRAINT (`where T : Conn`) the template still knows the
+        // member: the erased slot holds the object pointer, and the field
+        // sits at the constraint class's offset.
+        if (IsErasedType(obj.ty)) {
+            Node ct = TypeParamConstraint(obj.ty.sval);
+            if (ct != null) {
+                Node ccls = ClassOf(ct);
+                if (ccls != null && FieldIndex(ccls, e.sval) >= 0) {
+                    ExprVal r = FromSlot(obj.op, ct);
+                    return LoadField(r.op, ct, e.sval);
+                }
+            }
+            return new ExprVal("0", obj.ty);
+        }
+        if (obj.ty != null && (obj.ty.sval == "TypeInfo" || (obj.op != null && obj.ty.sval == "string" && e.sval == "Name"))) {
+            return EmitTypeInfoProp(obj, e.sval, e);
+        }
+        diags.Error("member '" + e.sval + "' of type '"
+            + (obj.ty != null ? obj.ty.sval : "?")
+            + "' is not supported by the self-hosted compiler yet", e.line, e.col);
+        return new ExprVal("0", MkType("int"));
+    }
+
+    // A raw C-string constant for a compile-time message: the payload pointer
+    // the zan_rt_* helpers take (not a managed string).  The self-host has no
+    // per-node file name (one merged compilation unit), so runtime-error text
+    // prefixes the location with "<unknown>" -- the same placeholder the C
+    // runtime prints when its site file is unavailable.
+    string RawCString(string s) {
+        List<int> bytes = new List<int>();
+        int i = 0;
+        while (i < s.Length) { StrEsc.AddUtf8(bytes, (int)s[i]); i = i + 1; }
+        string txt = "";
+        i = 0;
+        while (i < bytes.Count) { txt = txt + "\\" + Hex2(bytes[i]); i = i + 1; }
+        txt = txt + "\\00";
+        int n = bytes.Count + 1;
+        strn = strn + 1;
+        string g = "@.r" + strn;
+        H(g + " = private unnamed_addr constant [" + n + " x i8] c\"" + txt + "\"");
+        string t = NT();
+        L("  " + t + " = getelementptr inbounds [" + n + " x i8], [" + n + " x i8]* " + g + ", i64 0, i64 0");
+        return t;
+    }
+
+    // The soft runtime-error channel, the self-host's mirror of the C host's
+    // emit_runtime_check (src/compiler/irgen_generics.c): one stderr line per
+    // distinct text (the runtime deduplicates) and, under --strict-runtime /
+    // ZAN_RT_HARD=1, exit 70.  The C host builds the "file:line:col: runtime
+    // error: msg" text at compile time; this backend knows the line and the
+    // column but not the file (TASKS.md A508's "same-shape diagnostic" is the
+    // message and the once-per-location behaviour, not the file name).
+    void EmitSoftRuntimeError(Node at, string msg) {
+        EmitRuntimeCheckIf(at, "1", msg);
+    }
+
+    // The predicate form: the C host's emit_runtime_check takes the `bad`
+    // value and reports only when it is set (irgen_generics.c). Same-shape
+    // diagnostic, same once-per-text dedup, same exit 70 under
+    // --strict-runtime / ZAN_RT_HARD=1. The bad value must be computed
+    // BEFORE this call: everything it needs has to live in the block that
+    // dominates both the report and the skip path.
+    void EmitRuntimeCheckIf(Node at, string bad, string msg) {
+        // The C host's split-path report (irgen_generics.c emit_runtime_check
+        // -> emit_guard_report3 -> zan_rt_guard_fail3 -> zan_rt_soft_note3)
+        // appends a newline to the message and then another one when it
+        // prints, so a soft diagnostic is "file:line:col: ... msg" followed
+        // by a BLANK line; the hard path prints the single-newline form
+        // before exiting. The location is the expression the check came
+        // from -- for the parse family that is the ARGUMENT node (the
+        // string literal's own line:col).
+        string text = "<unknown>:" + at.line + ":" + at.col
+            + ": runtime error: " + msg + "\n";
+        string tsoft = RawCString(text + "\n");
+        string thard = RawCString(text);
+        if (!ExternSeen("zan_rt_soft_is_hard")) {
+            externDecls.Add("zan_rt_soft_is_hard");
+            H("declare i32 @zan_rt_soft_is_hard()");
+        }
+        if (!ExternSeen("zan_rt_soft_note")) {
+            externDecls.Add("zan_rt_soft_note");
+            H("declare void @zan_rt_soft_note(i8*)");
+        }
+        if (!ExternSeen("exit")) { externDecls.Add("exit"); H("declare void @exit(i32)"); }
+        int lcheck = NL(); int lskip = NL();
+        L("  br i1 " + bad + ", label %L" + lcheck + ", label %L" + lskip);
+        Label(lcheck);
+        int lhard = NL(); int lsoft = NL();
+        string hd = NT();
+        L("  " + hd + " = call i32 @zan_rt_soft_is_hard()");
+        string hz = NT();
+        L("  " + hz + " = icmp ne i32 " + hd + ", 0");
+        L("  br i1 " + hz + ", label %L" + lhard + ", label %L" + lsoft);
+        Label(lhard);
+        L("  call void @zan_rt_soft_note(i8* " + thard + ")");
+        L("  call void @exit(i32 70)");
+        L("  unreachable");
+        Label(lsoft);
+        L("  call void @zan_rt_soft_note(i8* " + tsoft + ")");
+        L("  br label %L" + lskip);
+        Label(lskip);
+    }
+
+    // 把 i8/i32/i64 的字符值规整到 i32（镜像 C11 char 静态类的截断/扩展口径）。
+    string CharToI32(ExprVal v) {
+        string vt = MapType(v.ty);
+        if (vt == "i32") { return v.op; }
+        string r = NT();
+        L("  " + r + " = " + (vt == "i64" ? "trunc" : "sext") + " " + vt + " " + v.op + " to i32");
+        return r;
+    }
+
+    // The null-string guard in front of every parse (the C host's
+    // emit_parse_str_guard, irgen_call.c): strtoll/strtod on null is UB,
+    // so the null is reported once and replaced with the empty string.
+    string ParseStrGuard(Node at, string s) {
+        string isn = NT();
+        L("  " + isn + " = icmp eq i8* " + s + ", null");
+        string empty = RawCString("");
+        EmitRuntimeCheckIf(at, isn, "null string passed to a parse function");
+        string safe = NT();
+        L("  " + safe + " = select i1 " + isn + ", i8* " + empty + ", i8* " + s);
+        return safe;
+    }
+
+    // The parse-failure predicate of the C host (irgen_call.c
+    // emit_parse_bad_pred): strtoll/strtod leave the end pointer at the
+    // string start when nothing was consumed, and trailing garbage is any
+    // non-NUL byte where the scan stopped. A null end pointer folds to the
+    // empty string so the byte read stays in bounds.
+    string ParseBadPred(string s, string endp) {
+        string epn = NT();
+        L("  " + epn + " = icmp eq i8* " + endp + ", null");
+        string eps = NT();
+        L("  " + eps + " = select i1 " + epn + ", i8* " + RawCString("") + ", i8* " + endp);
+        string ch = NT();
+        L("  " + ch + " = load i8, i8* " + eps);
+        string tr = NT();
+        L("  " + tr + " = icmp ne i8 " + ch + ", 0");
+        string no = NT();
+        L("  " + no + " = icmp eq i8* " + endp + ", " + s);
+        string b1 = NT();
+        L("  " + b1 + " = or i1 " + epn + ", " + tr);
+        string bad = NT();
+        L("  " + bad + " = or i1 " + b1 + ", " + no);
+        return bad;
+    }
+
+}

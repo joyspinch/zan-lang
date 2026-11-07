@@ -1,0 +1,349 @@
+using System;
+using System.Collections.Generic;
+namespace Zan;
+
+partial class Ngen {
+    // ---- statements ----
+    // label id for `goto name` / `name:`: ids are created on first
+    // reference (forward gotos included) and reset per method
+    int GotoLabelId(string name) {
+        int i = gotoNames.Count - 1;
+        while (i >= 0) {
+            if (gotoNames[i] == name) { return gotoIds[i]; }
+            i = i - 1;
+        }
+        int id = NL();
+        gotoNames.Add(name);
+        gotoIds.Add(id);
+        return id;
+    }
+
+    void GenStmt(Node s) {
+        if (s == null) { return; }
+        int saved = EnterEnvNg(s);
+        GenStmtInEnvNg(s);
+        locHead = saved;
+    }
+
+    void GenStmtInEnvNg(Node s) {
+        PrepareDelegateStmt(s);
+        if (s.line > 0) { curLine = s.line; curCol = s.col; }
+        // ngen_async hook B: a discarded async call statement detaches
+        if (PrepareAsyncStmtNg(s)) { return; }
+        int k = s.kind;
+        if (k == AK.Block()) {
+            int i = 0;
+            while (i < s.kids.Count) { GenStmt(s.kids[i]); i = i + 1; }
+        } else if (k == AK.VarDecl()) {
+            if (s.b != null) {
+                string vt = s.type != null ? TypeFullName(s.type) : null;
+                if (vt == null || vt == "") { vt = InferExprTyNg(s.b); }   // silent: ReserveLocals already diagnosed
+                if (!TryGenBindingValue(s.b, vt)) { GenConversionValueNg(s.b, vt); }
+                StoreDeclValNg(s);
+            }
+            int dsi = 0;
+            while (dsi < s.kids.Count) {
+                Node d = s.kids[dsi];
+                if (d.b != null) {
+                    string dvt = d.type != null ? TypeFullName(d.type) : null;
+                    if (dvt == null || dvt == "") { dvt = InferExprTyNg(d.b); }
+                    if (!TryGenBindingValue(d.b, dvt)) { GenConversionValueNg(d.b, dvt); }
+                    StoreDeclValNg(d);
+                }
+                dsi = dsi + 1;
+            }
+            if (s.b == null) {
+                // `S x;` with S a struct: a fresh zero-filled value (gen0
+                // zero-inits inline storage); a boxed word local still needs
+                // its cell from the declaration point on; other types start
+                // unassigned. A BOXED struct wraps the fresh value in the
+                // shared cell -- later field writes go through it.
+                Cls dc = s.type != null ? SpecClsOf(TypeFullName(s.type)) : null;
+                if (dc != null && dc.isStruct == 1) {
+                    int dslot = DeclSlotNg(s);
+                    LoadImm(0, dc.size + 16);
+                    LoadImm(1, 0);
+                    BLInternal("_zan_rt_alloc");             // x0 = zeroed struct
+                    if (LocBoxedNg(dslot)) {
+                        XPushV0();                      // push struct
+                        LoadImm(0, 8);
+                        LoadImm(1, 0);
+                        BLInternal("_zan_rt_alloc");         // x0 = cell
+                        XPopV(1);                      // x1 = struct
+                        StrU(1, 0, 0);                       // cell->struct
+                    }
+                    StoreLocal(dslot, 0);
+                } else {
+                    StoreDeclZeroCellNg(s);
+                }
+            }
+        } else if (k == AK.ExprStmt()) {
+            Node flat = FlatCompoundAssign(s.a);
+            if (flat != null) { GenCompoundTemps(s.a); }
+            GenExpr(flat != null ? flat : s.a);
+        } else if (k == AK.LabelStmt()) {
+            Mark(GotoLabelId(s.sval));
+        } else if (k == AK.GotoStmt()) {
+            EmitB(GotoLabelId(s.sval));
+        } else if (k == AK.DeconDecl()) {
+            GenDeconNg(s);
+        } else if (k == AK.ReturnStmt()) {
+            if (s.a != null) {
+                GenConversionValueNg(s.a, curMeth != null ? TypeFullName(curMeth.type) : null);
+            }
+            XPushV0();                          // hold the result value
+            EmitPendingFins(false);                  // C# runs every finally
+            EhDisarmBase();                          // and disarms what they leave
+            XPopV(0);
+            Epilogue();
+        } else if (k == AK.IfStmt()) {
+            int els = NL(); int end = NL();
+            GenExpr(s.a);
+            EmitCBZ(0, els);
+            GenStmt(s.b);
+            EmitB(end);
+            Mark(els);
+            if (s.c != null) { GenStmt(s.c); }
+            Mark(end);
+        } else if (k == AK.SwitchStmt()) {
+            GenSwitchStmt(s);
+        } else if (k == AK.WhileStmt()) {
+            int top = NL(); int outL = NL(); int cnt = NL();
+            brkL.Add(outL); cntL.Add(cnt);
+            brkLoop.Add(true); brkFinBase.Add(finBodies.Count);
+            cntFinBase.Add(finBodies.Count);
+            if (curHasTry) { LoadLocal(ehTopLocal, 0); StoreLocal(ehBrkLocal, 0); }
+            Mark(top);
+            GenExpr(s.a);
+            EmitCBZ(0, outL);
+            GenStmt(s.b);
+            Mark(cnt);
+            EmitB(top);
+            Mark(outL);
+            brkL.RemoveAt(brkL.Count - 1);
+            cntL.RemoveAt(cntL.Count - 1);
+            brkLoop.RemoveAt(brkLoop.Count - 1);
+            brkFinBase.RemoveAt(brkFinBase.Count - 1);
+            cntFinBase.RemoveAt(cntFinBase.Count - 1);
+        } else if (k == AK.DoWhileStmt()) {
+            // do body while (cond);: the continue point is the condition,
+            // like the reference lowering (body -> cond -> branch)
+            int top = NL(); int outL = NL(); int cnt = NL();
+            brkL.Add(outL); cntL.Add(cnt);
+            brkLoop.Add(true); brkFinBase.Add(finBodies.Count);
+            cntFinBase.Add(finBodies.Count);
+            if (curHasTry) { LoadLocal(ehTopLocal, 0); StoreLocal(ehBrkLocal, 0); }
+            Mark(top);
+            GenStmt(s.b);
+            Mark(cnt);
+            GenExpr(s.a);
+            EmitCBZ(0, outL);
+            EmitB(top);
+            Mark(outL);
+            brkL.RemoveAt(brkL.Count - 1);
+            cntL.RemoveAt(cntL.Count - 1);
+            brkLoop.RemoveAt(brkLoop.Count - 1);
+            brkFinBase.RemoveAt(brkFinBase.Count - 1);
+            cntFinBase.RemoveAt(cntFinBase.Count - 1);
+        } else if (k == AK.ForStmt()) {
+            // for (init; cond; step) body: init runs once, cond guards the
+            // top, step runs at the continue point before looping back
+            if (s.a != null) { GenStmt(s.a); }
+            int top = NL(); int outL = NL(); int cnt = NL();
+            brkL.Add(outL); cntL.Add(cnt);
+            brkLoop.Add(true); brkFinBase.Add(finBodies.Count);
+            cntFinBase.Add(finBodies.Count);
+            if (curHasTry) { LoadLocal(ehTopLocal, 0); StoreLocal(ehBrkLocal, 0); }
+            Mark(top);
+            if (s.b != null) {
+                GenExpr(s.b);
+                EmitCBZ(0, outL);
+            }
+            GenStmt(s.d);
+            Mark(cnt);
+            if (s.c != null) { GenExpr(s.c); }
+            EmitB(top);
+            Mark(outL);
+            brkL.RemoveAt(brkL.Count - 1);
+            cntL.RemoveAt(cntL.Count - 1);
+            brkLoop.RemoveAt(brkLoop.Count - 1);
+            brkFinBase.RemoveAt(brkFinBase.Count - 1);
+            cntFinBase.RemoveAt(cntFinBase.Count - 1);
+        } else if (k == AK.ForeachStmt()) {
+            GenForeach(s);
+        } else if (k == AK.BreakStmt()) {
+            if (brkL.Count == 0) {
+                diags.Error("ngen: break outside loop", s.line, s.col);
+            } else {
+                EmitPendingFinsFrom(brkFinBase[brkFinBase.Count - 1], false);
+                // a loop break also leaves every try opened inside the loop;
+                // a switch break does not leave any try by itself
+                if (brkLoop[brkLoop.Count - 1]) { EhDisarmLoop(); }
+                EmitB(brkL[brkL.Count - 1]);
+            }
+        } else if (k == AK.ContinueStmt()) {
+            if (cntL.Count == 0) {
+                diags.Error("ngen: continue outside loop", s.line, s.col);
+            } else {
+                EmitPendingFinsFrom(cntFinBase[cntFinBase.Count - 1], false);
+                EhDisarmLoop();
+                EmitB(cntL[cntL.Count - 1]);
+            }
+        } else if (k == AK.TryStmt()) {
+            GenTry(s);
+        } else if (k == AK.LockStmt()) {
+            GenLockStmt(s);
+        } else if (k == AK.MonitorExitStmt()) {
+            LoadLocal(DeclSlotNg(s.a), 0);
+            BLExtern("_zan_monitor_exit");
+        } else if (k == AK.ThrowStmt()) {
+            GenThrow(s);
+        } else {
+            diags.Error("ngen: unsupported statement kind " + k, s.line, s.col);
+        }
+    }
+
+    // foreach (T x in coll) body: collection re-evaluated each iteration
+    // into a stack slot, hidden index local drives the bounds; arrays use
+    // their -16 length header, lists the count field
+    // ---- foreach over a user GetEnumerator protocol -------------------------
+    // A collection class exposing a 0-arg GetEnumerator() drives the loop
+    // through MoveNext()/Current instead of the legacy List layout (count@0,
+    // data@16); Current works both as a 0-arg method and as a get_ accessor.
+
+    int FeProtoMethodUp(string cls, string name, int wantPc) {
+        string cur = cls;
+        while (cur != null) {
+            List<int> ms = MethCandsClsName(cur, name);
+            if (ms != null) {
+                int i = 0;
+                while (i < ms.Count) {
+                    if (methStat[ms[i]] != 2 && ParamCount(methNodes[ms[i]]) == wantPc) { return ms[i]; }
+                    i = i + 1;
+                }
+            }
+            Cls c = FindClass(cur);
+            cur = c != null ? c.baseName : null;
+        }
+        return -1;
+    }
+
+    int FeProtoEnumMi(Node coll) {
+        string ct = StaticTyOf(coll);
+        if (ct == null || ct == "List" || ct == "Dict" || ct == "string") { return -1; }
+        if (ct.IndexOf("<") > 0) { return -1; }
+        Cls c = FindClass(ct);
+        if (c == null || c.isStruct == 1) { return -1; }
+        return FeProtoMethodUp(c.name, "GetEnumerator", 0);
+    }
+
+    int FeProtoCurMi(string enumCls) {
+        int mi = FeProtoMethodUp(enumCls, "Current", 0);
+        if (mi >= 0) { return mi; }
+        return FeProtoMethodUp(enumCls, "get_Current", 0);
+    }
+
+    void GenForeach(Node s) {
+        Node coll = s.b;
+        int protoMi = FeProtoEnumMi(coll);
+        if (protoMi >= 0) {
+            string ec = methNodes[protoMi].type != null ? TypeFullName(methNodes[protoMi].type) : null;
+            int mvMi = ec != null ? FeProtoMethodUp(ec, "MoveNext", 0) : -1;
+            int cuMi = ec != null ? FeProtoCurMi(ec) : -1;
+            int elemVar = DeclSlotNg(s);
+            int top = NL(); int outL = NL(); int cnt = NL();
+            int popOut = NL();
+            brkL.Add(outL); cntL.Add(cnt);
+            brkLoop.Add(true); brkFinBase.Add(finBodies.Count);
+            cntFinBase.Add(finBodies.Count);
+            if (curHasTry) { LoadLocal(ehTopLocal, 0); StoreLocal(ehBrkLocal, 0); }
+            GenExpr(coll);
+            BLInternal(MethSymNg(methCls[protoMi], methNodes[protoMi]));   // x0 = enumerator
+            XPushV0();                          // push e (lives across the body)
+            Mark(top);
+            LdrU(0, 31, 0);
+            BLInternal(MethSymNg(methCls[mvMi], methNodes[mvMi]));         // x0 = MoveNext
+            CbzReg(0, popOut);
+            LdrU(0, 31, 0);
+            BLInternal(MethSymNg(methCls[cuMi], methNodes[cuMi]));         // x0 = element
+            StoreLocal(elemVar, 0);
+            GenStmt(s.c);
+            Mark(cnt);
+            EmitB(top);
+            Mark(popOut);
+            XPopV(0);                          // pop e
+            EmitB(outL);
+            Mark(outL);
+            brkL.RemoveAt(brkL.Count - 1);
+            cntL.RemoveAt(cntL.Count - 1);
+            brkLoop.RemoveAt(brkLoop.Count - 1);
+            brkFinBase.RemoveAt(brkFinBase.Count - 1);
+            cntFinBase.RemoveAt(cntFinBase.Count - 1);
+            return;
+        }
+        bool isArr = IsArrExpr(coll);
+        // strings iterate as chars: the length header and byte loads
+        bool isStr = !isArr && IsStrExpr(coll);
+        int esz = isArr ? ArrElemSize(ArrTyOf(coll)) : 8;
+        int elemVar = DeclSlotNg(s);
+        int idxVar = elemVar + 1; // this foreach's reserved hidden index
+        int top = NL(); int outL = NL(); int cnt = NL();
+        brkL.Add(outL); cntL.Add(cnt);
+        brkLoop.Add(true); brkFinBase.Add(finBodies.Count);
+        cntFinBase.Add(finBodies.Count);
+        if (curHasTry) { LoadLocal(ehTopLocal, 0); StoreLocal(ehBrkLocal, 0); }
+        LoadImm(0, 0);
+        StoreLocal(idxVar, 0);
+        Mark(top);
+        GenExpr(coll);
+        XPushV0();                              // push coll
+        if (isArr) {
+            if (tgt86 == 1) { LdrU(2, 0, -16); } else { E4(0xF85F0002); }   // ldur x2, [x0, #-16] (len)
+        } else if (isStr) {
+            if (tgt86 == 1) {
+                SubImm(2, 0, 8);                     // header: [s-8] 的高 32 位是 ZANS 魔数
+                LdrU(2, 2, 0);
+                X2(0x89, 0xD2);                      // mov edx,edx:32 位装回 rdx 即截掉魔数
+            } else {
+                E4(0xD1002002);                      // sub x2, x0, #8
+                E4(0xF9400042);                      // ldr x2, [x2]
+                E4(0xD3407C42);                      // ubfm x2, x2, #0, #31
+            }
+        } else {
+            LdrU(2, 0, 0);                           // x2 = count
+        }
+        LoadLocal(idxVar, 0);                        // x0 = i (coll now only on the stack)
+        if (tgt86 == 1) { Xop(0x39, 7, 2); } else { E4(0xEB02001F); }    // cmp i, len
+        int popOut = NL();
+        EmitBcond(10, popOut);                       // b.ge popOut (coll still pushed)
+        if (isArr) {
+            XPopV(2);                                // pop coll -> x2/rdx
+            EmitArrElemLoad(esz, ArrElemName(ArrTyOf(coll)), 2, 0, 0);
+        } else if (isStr) {
+            XPopV(2);                                // pop coll -> x2/rdx
+            if (tgt86 == 1) { X2(0x0F, 0xB6); X2(0x3C, 0x3A); } else { E4(0x38606840); }   // ldrb w0, [x2, x0]
+        } else {
+            LdrU(3, 31, 0);                          // x3 = coll (stack slot)
+            LdrU(3, 3, 16);                          // x3 = data
+            if (tgt86 == 1) { X3(0x48, 0x8B, 0x3C); X1(0xF9); } else { E4(0xF8607860); }   // ldr x0, [x3, x0, lsl #3]
+            XPopV(2);                                // pop coll (discard)
+        }
+        StoreLocal(elemVar, 0);
+        GenStmt(s.c);
+        Mark(cnt);
+        LoadLocal(idxVar, 0);
+        AddImm(0, 0, 1);
+        StoreLocal(idxVar, 0);
+        EmitB(top);
+        Mark(popOut);
+        XPopV(2);                                    // pop coll (discard)
+        EmitB(outL);
+        Mark(outL);
+        brkL.RemoveAt(brkL.Count - 1);
+        cntL.RemoveAt(cntL.Count - 1);
+        brkLoop.RemoveAt(brkLoop.Count - 1);
+        brkFinBase.RemoveAt(brkFinBase.Count - 1);
+        cntFinBase.RemoveAt(cntFinBase.Count - 1);
+    }
+
+}

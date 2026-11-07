@@ -48,7 +48,6 @@
 
 ### 批次 4 · 大工程 / 独占窗口（无其他 irgen/runtime 改动在飞时领）
 
-- [ ] B-ID168 selfhost 孪生与巨石拆分：① A1（lambda→async 委托，selfhost 无 delegate_is_async 概念需补判定）与 A3（强转异常同号）的 selfhost 同号孪生；② ngen.zan(15608)/irgen_expr.zan(11305)/ngen_host.zan(7496) 等拆分——验证走三门 `selfhost_gen1`+`selfhost_fixed_point`(g2==g3 字节等值)+`selfhost_diff`，新文件必须插 `scripts/selfhost_sources.txt` 原文件相邻位、搬家不重排（MergePartials 按源清单顺序合并）。
 - [ ] B-ID169 `Convert.*` 静默 0 语义收敛：坏输入返回 0 使 try/catch 兜底成死代码（SKILL.md:496-509 已记陷阱）；落地前先全仓用量审计，或新增 Strict 变体保留旧径并公告。
 - [ ] B-ID170 结构收口三件：① 中风险拆分（Designer 三件套：Designer.Form.zan 4301行已于 commit 3b8cdd439 按 partial 拆出 Ribbon/Layout/Free/Canvas/Ruler/Preview 6切面并完成 RenderDesignCanvas 巨函数拆解；余 Designer.zan 6909 与 Designer.Inspector.zan 3466、SceneDesigner 2951——后两者将在 B-ID177 改写为保留式，拆前先评估；App.zan 已并入 B-ID174）；② 命名空间三前缀统一（System.* 被 stdlib/packages 同名分仓、Game 裸名——独立大工程，动前定一尊；Gui 已定案并入 B-ID178）；③ zan.pkg 加 deps 字段 + zan-pm restore 下载闭环（pm_main.c:216-248 现为空转）。
 

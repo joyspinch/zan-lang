@@ -1,0 +1,737 @@
+using System;
+using System.Collections.Generic;
+namespace Zan;
+
+partial class Irgen {
+    // ---- TypeInfo reflection support ----
+
+    ExprVal GenTypeof(Node e) {
+        string disp = e.b != null ? FormatTypeNode(e.b) : (e.sval != "" ? e.sval : "object");
+        return ReflMetaFor(e.b, disp);
+    }
+
+    ExprVal EmitGetType(ExprVal recv) {
+        string staticName = recv.ty != null ? recv.ty.sval : "object";
+        ExprVal fallback = ReflMetaFor(recv.ty, staticName);
+        if (recv.ty == null || recv.op == "null") { return fallback; }
+        Node scls = binder.FindType(staticName);
+        if (scls != null && scls.kind == AK.StructDecl()) { return fallback; }
+        if (scls != null && scls.kind == AK.EnumDecl()) { return fallback; }
+        if (recv.ty.ival > 0) { return fallback; }
+        string cid = NT();
+        L("  " + cid + " = call i8* @__zan_class_id(i8* " + recv.op + ")");
+        List<string> cands = new List<string>();
+        int i = 0;
+        while (i < tidNames.Count) {
+            string cn = tidNames[i];
+            if (staticName == "object" || IsSubclassName(cn, staticName) || cn == staticName) {
+                cands.Add(cn);
+            }
+            i = i + 1;
+        }
+        if (cands.Count <= 1) {
+            return fallback;
+        }
+        int lend = NL();
+        string resSlot = NT();
+        L("  " + resSlot + " = alloca i8*");
+        L("  store i8* " + fallback.op + ", i8** " + resSlot);
+        int ci = 0;
+        while (ci < cands.Count) {
+            string cand = cands[ci];
+            int lmatch = NL();
+            int lnext = NL();
+            string eq = NT();
+            L("  " + eq + " = icmp eq i8* " + cid + ", bitcast (i8** @__tid_" + cand + " to i8*)");
+            L("  br i1 " + eq + ", label %L" + lmatch + ", label %L" + lnext);
+            Label(lmatch);
+            ExprVal ti = ReflMetaFor(MkType(cand), cand);
+            L("  store i8* " + ti.op + ", i8** " + resSlot);
+            L("  br label %L" + lend);
+            Label(lnext);
+            ci = ci + 1;
+        }
+        L("  br label %L" + lend);
+        Label(lend);
+        string ret = NT();
+        L("  " + ret + " = load i8*, i8** " + resSlot);
+        return new ExprVal(ret, MkType("TypeInfo"));
+    }
+
+    string GenConstStr(string raw) {
+        List<int> bytes = DecodeStr(raw);
+        string bodytxt = "";
+        int i = 0;
+        while (i < bytes.Count) { bodytxt = bodytxt + "\\" + Hex2(bytes[i]); i = i + 1; }
+        bodytxt = bodytxt + "\\00";
+        int blen = bytes.Count + 1;
+        string hdr = HexI64LE(0) + HexI64LE(bytes.Count) + "\\54\\53\\4E\\5A\\00\\00\\00\\00";
+        strn = strn + 1;
+        string g = "@.s" + strn;
+        int tlen = 24 + blen;
+        H(g + " = private unnamed_addr constant [" + tlen + " x i8] c\"" + hdr + bodytxt + "\"");
+        return "getelementptr inbounds ([" + tlen + " x i8], [" + tlen + " x i8]* " + g + ", i64 0, i64 24)";
+    }
+
+    string ToI64(ExprVal v) {
+        string t = MapType(v.ty);
+        if (t == "i64") { return v.op; }
+        if (t == "i32") {
+            string r = NT();
+            L("  " + r + " = sext i32 " + v.op + " to i64");
+            return r;
+        }
+        string r64 = NT();
+        L("  " + r64 + " = sext " + t + " " + v.op + " to i64");
+        return r64;
+    }
+
+    int ReflFkOf(string t) {
+        if (t == "bool") { return 1; }
+        if (t == "sbyte") { return 2; }
+        if (t == "byte") { return 3; }
+        if (t == "short") { return 4; }
+        if (t == "ushort") { return 5; }
+        if (t == "int" || t == "uint") { return 6; }
+        if (t == "long" || t == "ulong" || t == "nint") { return 8; }
+        if (t == "char") { return 10; }
+        if (t == "float") { return 12; }
+        if (t == "double") { return 13; }
+        if (t == "string") { return 14; }
+        return 15;
+    }
+
+    string FormatTypeNode(Node t) {
+        if (t == null) { return "object"; }
+        if (t.sval == "") { return "object"; }
+        string s = t.sval;
+        int ranks = 0;
+        if (s.EndsWith("[]")) { s = s.Substring(0, s.Length - 2); ranks = 1; }
+        if (t.kids.Count > 0) {
+            s = s + "<";
+            int ki = 0;
+            while (ki < t.kids.Count) {
+                if (ki > 0) { s = s + ", "; }
+                s = s + FormatTypeNode(t.kids[ki]);
+                ki = ki + 1;
+            }
+            s = s + ">";
+        }
+        if (t.op == 1 || t.op == 2) { s = s + "?"; }
+        int r = ranks + t.ival;
+        while (r > 0) { s = s + "[]"; r = r - 1; }
+        return s;
+    }
+
+    void CollectClassFields(Node cls, List<string> fNames, List<string> fTys, List<long> fKinds, List<long> fVals, List<string> fCusts, List<long> fFlags, List<string> fDflts, List<string> fAttrs) {
+        if (cls == null) { return; }
+        Node baseNode = BaseClassOf(cls);
+        if (baseNode != null && baseNode.sval != "" && baseNode.sval != "object") {
+            Node baseCls = binder.FindType(baseNode.sval);
+            if (baseCls != null) {
+                CollectClassFields(baseCls, fNames, fTys, fKinds, fVals, fCusts, fFlags, fDflts, fAttrs);
+            }
+        }
+        int i = 0;
+        while (i < cls.kids.Count) {
+            Node m = cls.kids[i];
+            if (m.kind == AK.FieldDecl()) {
+                if (!HasMod(m, MOD.Static())) {
+                    string fname = m.sval;
+                    string ftype = m.type != null ? FormatTypeNode(m.type) : "object";
+                    fNames.Add(fname);
+                    fTys.Add(ftype);
+                    fKinds.Add((long)ReflFkOf(ftype));
+                    fVals.Add((long)(fNames.Count - 1));
+                    string cust = (m.attrFieldCustom != null && m.attrFieldCustom != "") ? m.attrFieldCustom : fname;
+                    fCusts.Add(cust);
+                    fFlags.Add(m.attrFieldFlags);
+                    fDflts.Add(m.attrFieldDefault != null ? m.attrFieldDefault : "");
+                    fAttrs.Add(m.attrBlob != null ? m.attrBlob : "");
+                }
+            }
+            i = i + 1;
+        }
+    }
+
+    string ReflMetaConst(Node ty, string disp) {
+        ReflMetaFor(ty, disp);
+        int i = 0;
+        string gv = "";
+        while (i < reflMetaNames.Count) {
+            if (reflMetaNames[i] == disp) {
+                gv = reflMetaGvs[i];
+                break;
+            }
+            i = i + 1;
+        }
+        if (gv == "") { return "null"; }
+        List<int> bytes = DecodeStr(disp);
+        int nlen = bytes.Count + 1;
+        string tyDecl = "{ i8*, i8*, i8*, i8*, i64, i8*, i64, i8*, i8*, i8*, i64, i64, i64, i64, [" + nlen + " x i8] }";
+        return "getelementptr inbounds (" + tyDecl + ", " + tyDecl + "* " + gv + ", i64 0, i32 14, i64 0)";
+    }
+
+    ExprVal ReflMetaFor(Node ty, string disp) {
+        int i = 0;
+        while (i < reflMetaNames.Count) {
+            if (reflMetaNames[i] == disp) {
+                string gv = reflMetaGvs[i];
+                List<int> eb = DecodeStr(disp);
+                string tyDeclExisting = "{ i8*, i8*, i8*, i8*, i64, i8*, i64, i8*, i8*, i8*, i64, i64, i64, i64, [" + (eb.Count + 1) + " x i8] }";
+                string te = NT();
+                L("  " + te + " = getelementptr inbounds " + tyDeclExisting + ", " + tyDeclExisting + "* " + gv + ", i64 0, i32 14, i64 0");
+                return new ExprVal(te, MkType("TypeInfo"));
+            }
+            i = i + 1;
+        }
+
+        int metaIdx = reflMetaSeq;
+        reflMetaSeq = reflMetaSeq + 1;
+        string gvName = "@__zan_refl_type_" + metaIdx;
+        reflMetaNames.Add(disp);
+        reflMetaGvs.Add(gvName);
+
+        int kind = 1;
+        if (disp == "int" || disp == "uint" || disp == "long" || disp == "ulong"
+            || disp == "short" || disp == "ushort" || disp == "byte" || disp == "sbyte"
+            || disp == "char" || disp == "bool" || disp == "string" || disp == "double"
+            || disp == "float" || disp == "object" || disp == "nint" || disp == "nuint"
+            || disp == "void") {
+            kind = 6;
+        } else if (disp.Length > 2 && disp.Substring(disp.Length - 2, 2) == "[]") {
+            kind = 7;
+        } else if (disp.Length > 1 && disp.Substring(disp.Length - 1, 1) == "?") {
+            kind = 8;
+        } else {
+            Node cls = binder.FindType(disp);
+            if (cls != null) {
+                if (cls.kind == AK.StructDecl()) { kind = 2; }
+                else if (cls.kind == AK.EnumDecl()) { kind = 3; }
+                else if (HasMod(cls, MOD.Iface())) { kind = 4; }
+                else { kind = 1; }
+            }
+        }
+
+        List<string> fNames = new List<string>();
+        List<string> fTys = new List<string>();
+        List<long> fKinds = new List<long>();
+        List<long> fVals = new List<long>();
+        List<string> fCusts = new List<string>();
+        List<long> fFlags = new List<long>();
+        List<string> fDflts = new List<string>();
+        List<string> fAttrs = new List<string>();
+
+        Node targetCls = binder.FindType(disp);
+        if (targetCls != null) {
+            if (targetCls.kind == AK.EnumDecl()) {
+                List<long> evals = EnumMemberValues(targetCls);
+                int ei = 0;
+                int memIdx = 0;
+                while (ei < targetCls.kids.Count) {
+                    Node em = targetCls.kids[ei];
+                    if (em.kind == AK.EnumMember()) {
+                        long eval = memIdx < evals.Count ? evals[memIdx] : (long)memIdx;
+                        fNames.Add(em.sval);
+                        fTys.Add(disp);
+                        fKinds.Add(11);
+                        fVals.Add(eval);
+                        fCusts.Add(em.sval);
+                        fFlags.Add(0);
+                        fDflts.Add("");
+                        fAttrs.Add("");
+                        memIdx = memIdx + 1;
+                    }
+                    ei = ei + 1;
+                }
+            } else if (targetCls.kind == AK.ClassDecl() || targetCls.kind == AK.StructDecl()) {
+                CollectClassFields(targetCls, fNames, fTys, fKinds, fVals, fCusts, fFlags, fDflts, fAttrs);
+            }
+        }
+
+        string fieldsGlobal = "null";
+        int fieldCount = fNames.Count;
+        if (fieldCount > 0) {
+            string fieldsGvName = "@__zan_refl_fields_" + metaIdx;
+            StringBuilder fb = new StringBuilder();
+            fb.Append(fieldsGvName + " = private unnamed_addr constant [" + fieldCount + " x { i8*, i8*, i64, i64, i8*, i64, i8*, i8*, i8* }] [\n");
+            int fi = 0;
+            while (fi < fieldCount) {
+                string fnStr = GenConstStr(fNames[fi]);
+                string ftStr = GenConstStr(fTys[fi]);
+                string fcStr = GenConstStr(fCusts[fi]);
+                string fdStr = GenConstStr(fDflts[fi]);
+                string faStr = GenConstStr(fAttrs[fi]);
+                string fvalExpr = "" + fVals[fi];
+                if (targetCls != null && targetCls.kind != AK.EnumDecl()) {
+                    int fidx = FieldIndex(targetCls, fNames[fi]);
+                    Node fty = FieldType(targetCls, fNames[fi]);
+                    string ft = MapType(fty);
+                    fvalExpr = "ptrtoint (" + ft + "* getelementptr inbounds (%" + targetCls.sval + ", %" + targetCls.sval + "* null, i32 0, i32 " + fidx + ") to i64)";
+                }
+                string ftiExpr = "null";
+                string ftName = fTys[fi];
+                if (ftName != "" && ftName != "object" && ftName != "void" && ftName != disp) {
+                    ftiExpr = ReflMetaConst(MkType(ftName), ftName);
+                }
+                fb.Append("    { i8*, i8*, i64, i64, i8*, i64, i8*, i8*, i8* } { ");
+                fb.Append("i8* " + fnStr + ", ");
+                fb.Append("i8* " + ftStr + ", ");
+                fb.Append("i64 " + fKinds[fi] + ", ");
+                fb.Append("i64 " + fvalExpr + ", ");
+                fb.Append("i8* " + fcStr + ", ");
+                fb.Append("i64 " + fFlags[fi] + ", ");
+                fb.Append("i8* " + fdStr + ", ");
+                fb.Append("i8* " + ftiExpr + ", ");
+                fb.Append("i8* " + faStr + " }");
+                if (fi + 1 < fieldCount) { fb.Append(",\n"); } else { fb.Append("\n"); }
+                fi = fi + 1;
+            }
+            fb.Append("]");
+            H(fb.ToString());
+            fieldsGlobal = "bitcast ([" + fieldCount + " x { i8*, i8*, i64, i64, i8*, i64, i8*, i8*, i8* }]* " + fieldsGvName + " to i8*)";
+        }
+
+        int typeArgCount = 0;
+        string typeArgsGlobal = "null";
+        int lt = disp.IndexOf("<");
+        int gt = disp.LastIndexOf(">");
+        if (lt > 0 && gt > lt) {
+            string inner = disp.Substring(lt + 1, gt - lt - 1);
+            List<string> targs = new List<string>();
+            int lastComma = 0;
+            int depth = 0;
+            int ci = 0;
+            while (ci < inner.Length) {
+                char c = inner[ci];
+                if (c == '<') { depth = depth + 1; }
+                else if (c == '>') { depth = depth - 1; }
+                else if (c == ',' && depth == 0) {
+                    targs.Add(inner.Substring(lastComma, ci - lastComma).Trim());
+                    lastComma = ci + 1;
+                }
+                ci = ci + 1;
+            }
+            if (lastComma < inner.Length) {
+                targs.Add(inner.Substring(lastComma, inner.Length - lastComma).Trim());
+            }
+            typeArgCount = targs.Count;
+            if (typeArgCount > 0) {
+                string targsGvName = "@__zan_refl_targs_" + metaIdx;
+                StringBuilder tab = new StringBuilder();
+                tab.Append(targsGvName + " = private unnamed_addr constant [" + (typeArgCount + 1) + " x i8*] [\n");
+                int tai = 0;
+                while (tai < typeArgCount) {
+                    string targName = targs[tai];
+                    string targConst = ReflMetaConst(MkType(targName), targName);
+                    tab.Append("    i8* " + targConst + ",\n");
+                    tai = tai + 1;
+                }
+                tab.Append("    i8* null\n");
+                tab.Append("]");
+                H(tab.ToString());
+                typeArgsGlobal = "bitcast ([" + (typeArgCount + 1) + " x i8*]* " + targsGvName + " to i8*)";
+            }
+        }
+
+        string elemGlobal = "null";
+        if (disp.Length > 2 && disp.Substring(disp.Length - 2, 2) == "[]") {
+            string el = disp.Substring(0, disp.Length - 2);
+            elemGlobal = ReflMetaConst(MkType(el), el);
+        } else if (disp.Length > 1 && disp.Substring(disp.Length - 1, 1) == "?") {
+            string el = disp.Substring(0, disp.Length - 1);
+            elemGlobal = ReflMetaConst(MkType(el), el);
+        }
+
+        List<string> mNames = new List<string>();
+        List<string> mRetTys = new List<string>();
+        List<long> mRetKinds = new List<long>();
+        List<long> mPCnts = new List<long>();
+        List<string> mPTypesGvs = new List<string>();
+        List<long> mFlags = new List<long>();
+        List<string> mAttrs = new List<string>();
+
+        List<string> cNames = new List<string>();
+        List<string> cRetTys = new List<string>();
+        List<long> cRetKinds = new List<long>();
+        List<long> cPCnts = new List<long>();
+        List<string> cPTypesGvs = new List<string>();
+        List<long> cFlags = new List<long>();
+
+        if (targetCls != null) {
+            int mi = 0;
+            while (mi < targetCls.kids.Count) {
+                Node m = targetCls.kids[mi];
+                if (m.kind == AK.MethodDecl() && !m.sval.StartsWith("op_") && m.sval != "_init_fields") {
+                    mNames.Add(m.sval);
+                    string mret = m.type != null ? FormatTypeNode(m.type) : "void";
+                    mRetTys.Add(mret);
+                    mRetKinds.Add(mret == "void" ? 0 : (long)ReflFkOf(mret));
+                    List<string> pts = new List<string>();
+                    int pi = 0;
+                    while (pi < m.kids.Count) {
+                        if (m.kids[pi].kind == AK.Param()) {
+                            pts.Add(m.kids[pi].type != null ? FormatTypeNode(m.kids[pi].type) : "object");
+                        }
+                        pi = pi + 1;
+                    }
+                    mPCnts.Add((long)pts.Count);
+                    long fl = HasMod(m, MOD.Static()) ? 1 : 0;
+                    if (HasMod(m, MOD.Virtual()) || HasMod(m, MOD.Override()) || HasMod(m, MOD.Abstract())) { fl = fl | 2; }
+                    mFlags.Add(fl);
+                    mAttrs.Add(m.attrBlob != null ? m.attrBlob : "");
+                    if (pts.Count > 0) {
+                        string ptGv = "@__zan_refl_mpt_" + metaIdx + "_" + (mNames.Count - 1);
+                        StringBuilder ptb = new StringBuilder();
+                        ptb.Append(ptGv + " = private unnamed_addr constant [" + pts.Count + " x i8*] [\n");
+                        int pti = 0;
+                        while (pti < pts.Count) {
+                            ptb.Append("    i8* " + GenConstStr(pts[pti]));
+                            if (pti + 1 < pts.Count) { ptb.Append(",\n"); } else { ptb.Append("\n"); }
+                            pti = pti + 1;
+                        }
+                        ptb.Append("]");
+                        H(ptb.ToString());
+                        mPTypesGvs.Add("bitcast ([" + pts.Count + " x i8*]* " + ptGv + " to i8**)");
+                    } else {
+                        mPTypesGvs.Add("null");
+                    }
+                } else if (m.kind == AK.CtorDecl() && !HasMod(m, MOD.Static())) {
+                    cNames.Add(".ctor");
+                    cRetTys.Add(targetCls.sval);
+                    cRetKinds.Add(15);
+                    List<string> pts = new List<string>();
+                    int pi = 0;
+                    while (pi < m.kids.Count) {
+                        if (m.kids[pi].kind == AK.Param()) {
+                            pts.Add(m.kids[pi].type != null ? FormatTypeNode(m.kids[pi].type) : "object");
+                        }
+                        pi = pi + 1;
+                    }
+                    cPCnts.Add((long)pts.Count);
+                    cFlags.Add(0);
+                    if (pts.Count > 0) {
+                        string ptGv = "@__zan_refl_cpt_" + metaIdx + "_" + (cNames.Count - 1);
+                        StringBuilder ptb = new StringBuilder();
+                        ptb.Append(ptGv + " = private unnamed_addr constant [" + pts.Count + " x i8*] [\n");
+                        int pti = 0;
+                        while (pti < pts.Count) {
+                            ptb.Append("    i8* " + GenConstStr(pts[pti]));
+                            if (pti + 1 < pts.Count) { ptb.Append(",\n"); } else { ptb.Append("\n"); }
+                            pti = pti + 1;
+                        }
+                        ptb.Append("]");
+                        H(ptb.ToString());
+                        cPTypesGvs.Add("bitcast ([" + pts.Count + " x i8*]* " + ptGv + " to i8**)");
+                    } else {
+                        cPTypesGvs.Add("null");
+                    }
+                }
+                mi = mi + 1;
+            }
+            if (cNames.Count == 0 && (targetCls.kind == AK.ClassDecl() || targetCls.kind == AK.StructDecl())) {
+                cNames.Add(".ctor");
+                cRetTys.Add(targetCls.sval);
+                cRetKinds.Add(15);
+                cPCnts.Add(0);
+                cPTypesGvs.Add("null");
+                cFlags.Add(0);
+            }
+        }
+
+        string methodsGlobal = "null";
+        int methodCount = mNames.Count;
+        if (methodCount > 0) {
+            string mGvName = "@__zan_refl_methods_" + metaIdx;
+            StringBuilder mb = new StringBuilder();
+            mb.Append(mGvName + " = private unnamed_addr constant [" + methodCount + " x { i8*, i8*, i64, i64, i8**, i8*, i64, i8* }] [\n");
+            int mi = 0;
+            while (mi < methodCount) {
+                mb.Append("    { i8*, i8*, i64, i64, i8**, i8*, i64, i8* } { ");
+                mb.Append("i8* " + GenConstStr(mNames[mi]) + ", ");
+                mb.Append("i8* " + GenConstStr(mRetTys[mi]) + ", ");
+                mb.Append("i64 " + mRetKinds[mi] + ", ");
+                mb.Append("i64 " + mPCnts[mi] + ", ");
+                mb.Append("i8** " + mPTypesGvs[mi] + ", ");
+                mb.Append("i8* null, ");
+                mb.Append("i64 " + mFlags[mi] + ", ");
+                mb.Append("i8* " + GenConstStr(mAttrs[mi]) + " }");
+                if (mi + 1 < methodCount) { mb.Append(",\n"); } else { mb.Append("\n"); }
+                mi = mi + 1;
+            }
+            mb.Append("]");
+            H(mb.ToString());
+            methodsGlobal = "bitcast ([" + methodCount + " x { i8*, i8*, i64, i64, i8**, i8*, i64, i8* }]* " + mGvName + " to i8*)";
+        }
+
+        string ctorsGlobal = "null";
+        int ctorCount = cNames.Count;
+        if (ctorCount > 0) {
+            string cGvName = "@__zan_refl_ctors_" + metaIdx;
+            StringBuilder cb = new StringBuilder();
+            cb.Append(cGvName + " = private unnamed_addr constant [" + ctorCount + " x { i8*, i8*, i64, i64, i8**, i8*, i64 }] [\n");
+            int ci = 0;
+            while (ci < ctorCount) {
+                cb.Append("    { i8*, i8*, i64, i64, i8**, i8*, i64 } { ");
+                cb.Append("i8* " + GenConstStr(cNames[ci]) + ", ");
+                cb.Append("i8* " + GenConstStr(cRetTys[ci]) + ", ");
+                cb.Append("i64 " + cRetKinds[ci] + ", ");
+                cb.Append("i64 " + cPCnts[ci] + ", ");
+                cb.Append("i8** " + cPTypesGvs[ci] + ", ");
+                cb.Append("i8* null, ");
+                cb.Append("i64 " + cFlags[ci] + " }");
+                if (ci + 1 < ctorCount) { cb.Append(",\n"); } else { cb.Append("\n"); }
+                ci = ci + 1;
+            }
+            cb.Append("]");
+            H(cb.ToString());
+            ctorsGlobal = "bitcast ([" + ctorCount + " x { i8*, i8*, i64, i64, i8**, i8*, i64 }]* " + cGvName + " to i8*)";
+        }
+
+        List<int> bytes = DecodeStr(disp);
+        string bodytxt = "";
+        int bi = 0;
+        while (bi < bytes.Count) { bodytxt = bodytxt + "\\" + Hex2(bytes[bi]); bi = bi + 1; }
+        bodytxt = bodytxt + "\\00";
+        int nlen = bytes.Count + 1;
+
+        string tyDecl = "{ i8*, i8*, i8*, i8*, i64, i8*, i64, i8*, i8*, i8*, i64, i64, i64, i64, [" + nlen + " x i8] }";
+        StringBuilder tb = new StringBuilder();
+        tb.Append(gvName + " = private unnamed_addr constant " + tyDecl + " {\n");
+        // B-ID107: full_name (-112 slot), ns-qualified like the C host's
+        // render_type_full; type_attrs (-104 slot); table_name (-96 slot)
+        string typeAttrs = (targetCls != null && targetCls.attrBlob != null && targetCls.attrBlob != "") ? targetCls.attrBlob : "";
+        string tableName = (targetCls != null && targetCls.attrTableName != null && targetCls.attrTableName != "") ? targetCls.attrTableName : "";
+        tb.Append("    i8* " + GenConstStr(ReflFullNameOf(disp)) + ",\n");
+        tb.Append("    i8* " + GenConstStr(typeAttrs) + ",\n");
+        tb.Append("    i8* " + GenConstStr(tableName) + ",\n");
+        tb.Append("    i8* " + methodsGlobal + ",\n");
+        tb.Append("    i64 " + methodCount + ",\n");
+        tb.Append("    i8* " + ctorsGlobal + ",\n");
+        tb.Append("    i64 " + ctorCount + ",\n");
+        tb.Append("    i8* " + elemGlobal + ",\n");
+        tb.Append("    i8* " + typeArgsGlobal + ",\n");
+        tb.Append("    i8* " + fieldsGlobal + ",\n");
+        tb.Append("    i64 " + fieldCount + ",\n");
+        tb.Append("    i64 " + kind + ",\n");
+        tb.Append("    i64 " + bytes.Count + ",\n");
+        tb.Append("    i64 1515082580,\n");
+        tb.Append("    [" + nlen + " x i8] c\"" + bodytxt + "\"\n");
+        tb.Append("}");
+        H(tb.ToString());
+
+        string t = NT();
+        L("  " + t + " = getelementptr inbounds " + tyDecl + ", " + tyDecl + "* " + gvName + ", i64 0, i32 14, i64 0");
+        return new ExprVal(t, MkType("TypeInfo"));
+    }
+
+    // B-ID107: FullName = ns-qualified name ("System.Json.JsonValue"),
+    // mirroring the C host's render_type_full; primitives/arrays keep the
+    // display spelling, already-qualified names pass through unchanged
+    string ReflFullNameOf(string disp) {
+        if (disp.IndexOf(".") >= 0) { return disp; }
+        Node cls = binder.FindType(disp);
+        if (cls == null) { return disp; }
+        string ns = cls.nsName != null ? cls.nsName : "";
+        if (ns.Length == 0) { return disp; }
+        return ns + "." + disp;
+    }
+
+    ExprVal EmitTypeInfoProp(ExprVal obj, string name, Node e) {
+        if (name == "Name") {
+            ExprVal emptyStr = GenStr("");
+            string rn = NT();
+            L("  " + rn + " = icmp eq i8* " + obj.op + ", null");
+            string r = NT();
+            L("  " + r + " = select i1 " + rn + ", i8* " + emptyStr.op + ", i8* " + obj.op);
+            return new ExprVal(r, MkType("string"));
+        }
+        if (name == "Kind") {
+            int lNull = NL();
+            int lRead = NL();
+            int lEnd = NL();
+            string isN = NT();
+            L("  " + isN + " = icmp eq i8* " + obj.op + ", null");
+            L("  br i1 " + isN + ", label %L" + lNull + ", label %L" + lRead);
+            Label(lRead);
+            string kp = NT();
+            L("  " + kp + " = getelementptr inbounds i8, i8* " + obj.op + ", i64 -24");
+            string kp_i64 = NT();
+            L("  " + kp_i64 + " = bitcast i8* " + kp + " to i64*");
+            string kv = NT();
+            L("  " + kv + " = load i64, i64* " + kp_i64);
+
+            ExprVal sCls = GenStr("class");
+            ExprVal sStr = GenStr("struct");
+            ExprVal sEnm = GenStr("enum");
+            ExprVal sIfc = GenStr("interface");
+            ExprVal sPrm = GenStr("primitive");
+            ExprVal sArr = GenStr("array");
+            ExprVal sNul = GenStr("nullable");
+            ExprVal sDlg = GenStr("delegate");
+            ExprVal sOth = GenStr("other");
+
+            string c1 = NT(); L("  " + c1 + " = icmp eq i64 " + kv + ", 1");
+            string c2 = NT(); L("  " + c2 + " = icmp eq i64 " + kv + ", 2");
+            string c3 = NT(); L("  " + c3 + " = icmp eq i64 " + kv + ", 3");
+            string c4 = NT(); L("  " + c4 + " = icmp eq i64 " + kv + ", 4");
+            string c6 = NT(); L("  " + c6 + " = icmp eq i64 " + kv + ", 6");
+            string c7 = NT(); L("  " + c7 + " = icmp eq i64 " + kv + ", 7");
+            string c8 = NT(); L("  " + c8 + " = icmp eq i64 " + kv + ", 8");
+            string c9 = NT(); L("  " + c9 + " = icmp eq i64 " + kv + ", 9");
+
+            string r8 = NT(); L("  " + r8 + " = select i1 " + c9 + ", i8* " + sDlg.op + ", i8* " + sOth.op);
+            string r7 = NT(); L("  " + r7 + " = select i1 " + c8 + ", i8* " + sNul.op + ", i8* " + r8);
+            string r6 = NT(); L("  " + r6 + " = select i1 " + c7 + ", i8* " + sArr.op + ", i8* " + r7);
+            string r5 = NT(); L("  " + r5 + " = select i1 " + c6 + ", i8* " + sPrm.op + ", i8* " + r6);
+            string r4 = NT(); L("  " + r4 + " = select i1 " + c4 + ", i8* " + sIfc.op + ", i8* " + r5);
+            string r3 = NT(); L("  " + r3 + " = select i1 " + c3 + ", i8* " + sEnm.op + ", i8* " + r4);
+            string r2 = NT(); L("  " + r2 + " = select i1 " + c2 + ", i8* " + sStr.op + ", i8* " + r3);
+            string r1 = NT(); L("  " + r1 + " = select i1 " + c1 + ", i8* " + sCls.op + ", i8* " + r2);
+            L("  br label %L" + lEnd);
+            Label(lNull);
+            ExprVal sEmp = GenStr("");
+            L("  br label %L" + lEnd);
+            Label(lEnd);
+            string phi = NT();
+            L("  " + phi + " = phi i8* [ " + r1 + ", %L" + lRead + " ], [ " + sEmp.op + ", %L" + lNull + " ]");
+            return new ExprVal(phi, MkType("string"));
+        }
+        if (name == "FieldCount") {
+            string fcp = NT();
+            L("  " + fcp + " = getelementptr inbounds i8, i8* " + obj.op + ", i64 -32");
+            string fcp_i64 = NT();
+            L("  " + fcp_i64 + " = bitcast i8* " + fcp + " to i64*");
+            string fcv = NT();
+            L("  " + fcv + " = load i64, i64* " + fcp_i64);
+            return new ExprVal(fcv, MkType("int"));
+        }
+        if (name == "MethodCount") {
+            string mcp = NT();
+            L("  " + mcp + " = getelementptr inbounds i8, i8* " + obj.op + ", i64 -80");
+            string mcp_i64 = NT();
+            L("  " + mcp_i64 + " = bitcast i8* " + mcp + " to i64*");
+            string mcv = NT();
+            L("  " + mcv + " = load i64, i64* " + mcp_i64);
+            return new ExprVal(mcv, MkType("int"));
+        }
+        if (name == "ConstructorCount") {
+            string ccp = NT();
+            L("  " + ccp + " = getelementptr inbounds i8, i8* " + obj.op + ", i64 -64");
+            string ccp_i64 = NT();
+            L("  " + ccp_i64 + " = bitcast i8* " + ccp + " to i64*");
+            string ccv = NT();
+            L("  " + ccv + " = load i64, i64* " + ccp_i64);
+            return new ExprVal(ccv, MkType("int"));
+        }
+        if (name == "IsArray" || name == "IsNullable" || name == "IsInterface") {
+            string kp = NT();
+            L("  " + kp + " = getelementptr inbounds i8, i8* " + obj.op + ", i64 -24");
+            string kp_i64 = NT();
+            L("  " + kp_i64 + " = bitcast i8* " + kp + " to i64*");
+            string kv = NT();
+            L("  " + kv + " = load i64, i64* " + kp_i64);
+            int targetKind = name == "IsArray" ? 7 : (name == "IsNullable" ? 8 : 4);
+            string cmp = NT();
+            L("  " + cmp + " = icmp eq i64 " + kv + ", " + targetKind);
+            string z = NT();
+            L("  " + z + " = zext i1 " + cmp + " to i64");
+            return new ExprVal(z, MkType("bool"));
+        }
+        if (name == "IsGeneric") {
+            string tap = NT();
+            L("  " + tap + " = getelementptr inbounds i8, i8* " + obj.op + ", i64 -48");
+            string tap_ptr = NT();
+            L("  " + tap_ptr + " = bitcast i8* " + tap + " to i8**");
+            string tav = NT();
+            L("  " + tav + " = load i8*, i8** " + tap_ptr);
+            string cmp = NT();
+            L("  " + cmp + " = icmp ne i8* " + tav + ", null");
+            string z = NT();
+            L("  " + z + " = zext i1 " + cmp + " to i64");
+            return new ExprVal(z, MkType("bool"));
+        }
+        if (name == "TypeArgCount") {
+            int lnull = NL();
+            int lcheck = NL();
+            int lloop = NL();
+            int lnext = NL();
+            int lend = NL();
+            string isNull = NT();
+            L("  " + isNull + " = icmp eq i8* " + obj.op + ", null");
+            L("  br i1 " + isNull + ", label %L" + lnull + ", label %L" + lcheck);
+            Label(lcheck);
+            string tap = NT();
+            L("  " + tap + " = getelementptr inbounds i8, i8* " + obj.op + ", i64 -48");
+            string tap_ptr = NT();
+            L("  " + tap_ptr + " = bitcast i8* " + tap + " to i8***");
+            string tav = NT();
+            L("  " + tav + " = load i8**, i8*** " + tap_ptr);
+            string isTaNull = NT();
+            L("  " + isTaNull + " = icmp eq i8** " + tav + ", null");
+            L("  br i1 " + isTaNull + ", label %L" + lnull + ", label %L" + lloop);
+            Label(lloop);
+            string iPhi = NT();
+            string nextI = NT();
+            L("  " + iPhi + " = phi i64 [ 0, %L" + lcheck + " ], [ " + nextI + ", %L" + lnext + " ]");
+            string gep = NT();
+            L("  " + gep + " = getelementptr inbounds i8*, i8** " + tav + ", i64 " + iPhi);
+            string elem = NT();
+            L("  " + elem + " = load i8*, i8** " + gep);
+            string isEnd = NT();
+            L("  " + isEnd + " = icmp eq i8* " + elem + ", null");
+            L("  br i1 " + isEnd + ", label %L" + lend + ", label %L" + lnext);
+            Label(lnext);
+            L("  " + nextI + " = add i64 " + iPhi + ", 1");
+            L("  br label %L" + lloop);
+            Label(lnull);
+            L("  br label %L" + lend);
+            Label(lend);
+            string cntPhi = NT();
+            L("  " + cntPhi + " = phi i64 [ 0, %L" + lnull + " ], [ " + iPhi + ", %L" + lloop + " ]");
+            return new ExprVal(cntPhi, MkType("int"));
+        }
+        if (name == "ElementType") {
+            string ep = NT();
+            L("  " + ep + " = getelementptr inbounds i8, i8* " + obj.op + ", i64 -56");
+            string ep_ptr = NT();
+            L("  " + ep_ptr + " = bitcast i8* " + ep + " to i8**");
+            string ev = NT();
+            L("  " + ev + " = load i8*, i8** " + ep_ptr);
+            string isNull = NT();
+            L("  " + isNull + " = icmp eq i8* " + ev + ", null");
+            string sel = NT();
+            L("  " + sel + " = select i1 " + isNull + ", i8* " + obj.op + ", i8* " + ev);
+            return new ExprVal(sel, MkType("TypeInfo"));
+        }
+        if (name == "FullName") {
+            string fnp = NT();
+            L("  " + fnp + " = getelementptr inbounds i8, i8* " + obj.op + ", i64 -112");
+            string fnp_ptr = NT();
+            L("  " + fnp_ptr + " = bitcast i8* " + fnp + " to i8**");
+            string fnv = NT();
+            L("  " + fnv + " = load i8*, i8** " + fnp_ptr);
+            string isNull = NT();
+            L("  " + isNull + " = icmp eq i8* " + fnv + ", null");
+            string sel = NT();
+            L("  " + sel + " = select i1 " + isNull + ", i8* " + obj.op + ", i8* " + fnv);
+            return new ExprVal(sel, MkType("string"));
+        }
+        if (name == "TableName") {
+            string tnp = NT();
+            L("  " + tnp + " = getelementptr inbounds i8, i8* " + obj.op + ", i64 -96");
+            string tnp_ptr = NT();
+            L("  " + tnp_ptr + " = bitcast i8* " + tnp + " to i8**");
+            string tnv = NT();
+            L("  " + tnv + " = load i8*, i8** " + tnp_ptr);
+            string isNull = NT();
+            L("  " + isNull + " = icmp eq i8* " + tnv + ", null");
+            string sel = NT();
+            L("  " + sel + " = select i1 " + isNull + ", i8* " + obj.op + ", i8* " + tnv);
+            return new ExprVal(sel, MkType("string"));
+        }
+        diags.Error("TypeInfo property '" + name + "' is not supported by the self-hosted compiler yet", e.line, e.col);
+        return new ExprVal("0", MkType("int"));
+    }
+
+}

@@ -1,0 +1,933 @@
+using System;
+using System.Collections.Generic;
+namespace Zan;
+
+partial class Irgen {
+    string OpName(int op) {
+        if (op == TK.Plus()) { return "op_add"; }
+        if (op == TK.Minus()) { return "op_sub"; }
+        if (op == TK.Star()) { return "op_mul"; }
+        if (op == TK.Slash()) { return "op_div"; }
+        if (op == TK.Percent()) { return "op_mod"; }
+        if (op == TK.EqEq()) { return "op_eq"; }
+        if (op == TK.BangEq()) { return "op_ne"; }
+        if (op == TK.Less()) { return "op_lt"; }
+        if (op == TK.Greater()) { return "op_gt"; }
+        if (op == TK.LessEq()) { return "op_le"; }
+        if (op == TK.GreaterEq()) { return "op_ge"; }
+        return "";
+    }
+
+    // Dispatch a binary op to a static operator method on either operand's
+    // class, e.g. a + b -> @Vec_op_add(Vec, Vec). Returns null when none.
+    // `an`/`bn` are the operand expressions: an int literal's type depends
+    // on its suffix (the host types `7L` as long), and the overload choice
+    // depends on it.
+    ExprVal TryOpOverload(int op, ExprVal a, ExprVal b, Node an, Node bn) {
+        string mn = OpName(op);
+        if (mn == "") { return null; }
+        Node ownerCls = null;
+        Node ca = ClassOf(a.ty);
+        if (ca != null && OpDeclClass(ca, mn) != null) { ownerCls = ca; }
+        if (ownerCls == null) {
+            Node cb = ClassOf(b.ty);
+            if (cb != null && OpDeclClass(cb, mn) != null) { ownerCls = cb; }
+        }
+        if (ownerCls == null) { return null; }
+        // the operator may be declared by a base class: the call must name
+        // the declaring class (that is where the definition is emitted).
+        Node declCls = OpDeclClass(ownerCls, mn);
+        if (declCls == null) { return null; }
+        Node m = SelectOpOverload(declCls, mn, OperandType(an, a), OperandType(bn, b));
+        if (m == null) { return null; }
+        string owner = declCls.sval;
+        Node p0 = ParamTypeNode(m, 0);
+        Node p1 = ParamTypeNode(m, 1);
+        string args = MapType(p0) + " " + CallArg(a, p0, false) + ", " + MapType(p1) + " " + CallArg(b, p1, false);
+        string rt = MapType(m.type);
+        // an overloaded operator needs the mangled symbol -- `Owner_op_add`
+        // would not exist (and the plain name would collide between the
+        // overloads).
+        string sym = MethodSym(owner, m);
+        if (rt == "void") {
+            L("  call void @" + sym + "(" + args + ")");
+            return new ExprVal("0", MkType("void"));
+        }
+        string t = NT();
+        L("  " + t + " = call " + rt + " @" + sym + "(" + args + ")");
+        return new ExprVal(t, m.type);
+    }
+
+    // The class that declares the operator `mn`, searched up the base chain
+    // of `cls`; null when neither the class nor its bases declares it.
+    Node OpDeclClass(Node cls, string mn) {
+        Node c = cls;
+        int cg = 0;
+        while (c != null) {
+            int i = 0;
+            while (i < c.kids.Count) {
+                Node m = c.kids[i];
+                if (m.kind == AK.MethodDecl() && m.sval == mn) { return c; }
+                i = i + 1;
+            }
+            c = binder.FindType(c.sval2);
+            cg = cg + 1;
+            if (cg > 512) { c = null; }
+        }
+        return null;
+    }
+
+    // The operator overload that fits the operand types. The host resolves
+    // op_* by argument type as well (`v + 2.5` must reach the double
+    // overload, `v + 7L` the long one), so a name-only lookup picks the wrong
+    // overload -- and the call it emits does not even type-check.
+    Node SelectOpOverload(Node cls, string mn, Node at0, Node at1) {
+        List<Node> cands = new List<Node>();
+        int i = 0;
+        while (i < cls.kids.Count) {
+            Node m = cls.kids[i];
+            if (m.kind == AK.MethodDecl() && m.sval == mn) { cands.Add(m); }
+            i = i + 1;
+        }
+        if (cands.Count == 0) { return null; }
+        if (cands.Count == 1) { return cands[0]; }
+        int best = -1000000;
+        Node pick = cands[0];
+        i = 0;
+        while (i < cands.Count) {
+            Node m = cands[i];
+            int s = OpArgScore(ParamTypeNode(m, 0), at0) + OpArgScore(ParamTypeNode(m, 1), at1);
+            if (s > best) { best = s; pick = m; }
+            i = i + 1;
+        }
+        return pick;
+    }
+
+    // The indexer overload that fits the index (and value) argument types.
+    // The host resolves the indexers by argument type -- `b["k"]` must reach
+    // the string indexer -- so a name-only lookup picks the wrong one. The
+    // candidates are the whole class chain: a derived indexer hides a base
+    // one only when the signatures match.
+    Node SelectIndexer(Node cls, string mn, Node at0, Node at1) {
+        if (cls == null) { return null; }
+        List<Node> cands = new List<Node>();
+        Node c = cls;
+        int cg = 0;
+        while (c != null) {
+            int i = 0;
+            while (i < c.kids.Count) {
+                Node m = c.kids[i];
+                if (m.kind == AK.MethodDecl() && m.sval == mn && !HasSameSig(cands, m)) { cands.Add(m); }
+                i = i + 1;
+            }
+            c = BaseClassOf(c);
+            cg = cg + 1;
+            if (cg > 512) { c = null; }
+        }
+        if (cands.Count == 0) { return null; }
+        if (cands.Count == 1) { return cands[0]; }
+        int best = -1000000;
+        Node pick = cands[0];
+        int i = 0;
+        while (i < cands.Count) {
+            Node m = cands[i];
+            // a STATIC indexer takes the receiver as its explicit first
+            // parameter, so the key is the second one
+            int keyIdx = 0;
+            if (IsStatic(m)) { keyIdx = 1; }
+            int s = OpArgScore(ParamTypeNode(m, keyIdx), at0);
+            if (at1 != null) { s = s + OpArgScore(ParamTypeNode(m, keyIdx + 1), at1); }
+            if (s > best) { best = s; pick = m; }
+            i = i + 1;
+        }
+        return pick;
+    }
+
+    // Two type references name the same type.
+    bool SameTypeTag(Node a, Node b) {
+        if (a == null || b == null) { return false; }
+        return TypeTag(a) == TypeTag(b);
+    }
+
+    // The user-defined conversion that turns a value of type `from` into one
+    // of type `to`: a static method named `opName` with exactly one
+    // parameter, returning the target type. The host looks in the source
+    // type first, then in the target type (`irgen_expr.c`:
+    // `find_user_conversion` / `find_conversion_method`).
+    Node FindUserConv(Node fromTy, Node toTy, string opName) {
+        if (fromTy == null || toTy == null) { return null; }
+        Node fc = ClassOf(fromTy);
+        if (fc != null) {
+            Node m = ConvMethodIn(fc, fromTy, toTy, opName);
+            if (m != null) { convOwner = fc.sval; return m; }
+        }
+        Node tc = ClassOf(toTy);
+        if (tc != null) {
+            Node m = ConvMethodIn(tc, fromTy, toTy, opName);
+            if (m != null) { convOwner = tc.sval; return m; }
+        }
+        return null;
+    }
+
+    // The conversion operator `opName` declared by `cls` itself.
+    Node ConvMethodIn(Node cls, Node fromTy, Node toTy, string opName) {
+        if (cls == null) { return null; }
+        int i = 0;
+        while (i < cls.kids.Count) {
+            Node m = cls.kids[i];
+            if (m.kind == AK.MethodDecl() && m.sval == opName && IsStatic(m)
+                && m.kids.Count == 1 && m.kids[0].kind == AK.Param()
+                && SameTypeTag(m.type, toTy)
+                && SameTypeTag(m.kids[0].type, fromTy)) { return m; }
+            i = i + 1;
+        }
+        return null;
+    }
+
+    // Apply the user-defined conversion that turns `v` into a value of type
+    // `targetTy`. An implicit conversion only uses `op_implicit`; a cast
+    // (`explicitOk`) may also use `op_explicit`. Returns `v` unchanged when
+    // no operator applies -- `convApplied` tells the caller which it was.
+    ExprVal ApplyUserConv(Node targetTy, ExprVal v, bool explicitOk) {
+        convApplied = false;
+        if (v.ty == null || targetTy == null) { return v; }
+        if (SameTypeTag(v.ty, targetTy)) { return v; }
+        Node m = FindUserConv(v.ty, targetTy, "op_implicit");
+        if (m == null && explicitOk) { m = FindUserConv(v.ty, targetTy, "op_explicit"); }
+        if (m == null) { return v; }
+        Node p0 = m.kids[0].type;
+        string t = NT();
+        L("  " + t + " = call " + MapType(m.type) + " @" + MethodSym(convOwner, m)
+            + "(" + MapType(p0) + " " + CallArg(v, p0, false) + ")");
+        convApplied = true;
+        return new ExprVal(t, m.type);
+    }
+
+    // How well an operator parameter type fits an operand type: an exact
+    // match wins, then the host's implicit widening order (int -> long ->
+    // float/double), a mismatch only loses.
+    int OpArgScore(Node pt, Node at) {
+        if (pt == null || at == null) { return 0; }
+        string p = TypeTag(pt);
+        string a = TypeTag(at);
+        if (p == a) { return 4; }
+        if (p == "object") { return 1; }
+        if (a == "int" || a == "short" || a == "byte" || a == "sbyte"
+            || a == "char" || a == "ushort" || a == "uint") {
+            if (p == "long" || p == "ulong") { return 3; }
+            if (p == "float" || p == "double") { return 2; }
+            return -1;
+        }
+        if (a == "long" || a == "ulong") {
+            if (p == "float" || p == "double") { return 2; }
+            return -1;
+        }
+        if (a == "float") {
+            if (p == "double") { return 1; }
+            return -1;
+        }
+        return -1;
+    }
+
+    // The operand's static type, with the int-literal suffix honoured: the
+    // host types `7L` as long (checker.c: AST_INT_LITERAL / lit_suffix), so
+    // `v + 7L` reaches the long overload. The value's own type is always int
+    // in the self-host, so the AST node is needed for the refinement.
+    Node OperandType(Node ast, ExprVal v) {
+        if (ast != null && ast.kind == AK.IntLit()) {
+            // the radix folds into the same field, so the type suffix is the
+            // low three bits (`0x1FL` is a long, like `1L`)
+            int sfx = ast.LitTypeSuffix();
+            if (sfx == 1) { return MkType("long"); }
+            if (sfx == 2) { return MkType("uint"); }
+            if (sfx == 3) { return MkType("ulong"); }
+        }
+        return v.ty;
+    }
+
+    bool ExprIsStr(Node e) {
+        if (e == null) { return false; }
+        if (e.kind == AK.StringLit()) { return true; }
+        return false;
+    }
+
+    // A double as text, in the C host's format: the runtime's zan_rt_dbl_str
+    // writes the shortest form that round-trips (the C host's
+    // Console.WriteLine / Convert.ToString go through the same writer).
+    // "%g" would print only six digits and disagree with the host.
+    ExprVal DblToStr(string dval) {
+        if (!ExternSeen("zan_rt_dbl_str")) {
+            externDecls.Add("zan_rt_dbl_str");
+            H("declare void @zan_rt_dbl_str(i8*, i64, double)");
+        }
+        string buf = NT();
+        L("  " + buf + " = call i8* @malloc(i64 64)");
+        L("  call void @zan_rt_dbl_str(i8* " + buf + ", i64 64, double " + dval + ")");
+        string s = NT();
+        L("  " + s + " = call i8* @zstr_of(i8* " + buf + ")");
+        L("  call void @free(i8* " + buf + ")");
+        return new ExprVal(s, MkType("string"));
+    }
+
+    // A single-precision float as text: passes the float flag (-9223372036854775744 = 64 | (1<<63))
+    // to zan_rt_dbl_str for shortest round-trip single-precision formatting (A523).
+    ExprVal FltToStr(string dval) {
+        if (!ExternSeen("zan_rt_dbl_str")) {
+            externDecls.Add("zan_rt_dbl_str");
+            H("declare void @zan_rt_dbl_str(i8*, i64, double)");
+        }
+        string buf = NT();
+        L("  " + buf + " = call i8* @malloc(i64 64)");
+        L("  call void @zan_rt_dbl_str(i8* " + buf + ", i64 -9223372036854775744, double " + dval + ")");
+        string s = NT();
+        L("  " + s + " = call i8* @zstr_of(i8* " + buf + ")");
+        L("  call void @free(i8* " + buf + ")");
+        return new ExprVal(s, MkType("string"));
+    }
+
+    // A char as text: the C host renders it as its UTF-8 encoding
+    // (emit_char_to_cstr), not as its code point -- 'x' prints "x",
+    // '\u4e2d' prints the three UTF-8 bytes of U+4E2D. The encoding is
+    // emitted inline (the same 1/2/3/4-byte case split the host uses).
+    string CharToStr(string cval) {
+        string cp = NT(); L("  " + cp + " = and i64 " + cval + ", 2097151");
+        // 1 byte: cp < 0x80
+        string lt80 = NT(); L("  " + lt80 + " = icmp ult i64 " + cp + ", 128");
+        // 2 bytes: cp < 0x800
+        string lt800 = NT(); L("  " + lt800 + " = icmp ult i64 " + cp + ", 2048");
+        // 3 bytes: cp < 0x10000
+        string lt10000 = NT(); L("  " + lt10000 + " = icmp ult i64 " + cp + ", 65536");
+        // The payload bits, split the way the UTF-8 encoding splits them:
+        //   low6  = cp & 0x3F          (last byte)
+        //   mid6  = (cp >> 6) & 0x3F   (second-to-last byte)
+        //   c12   = (cp >> 12) & 0x3F  (third byte)
+        string low6 = NT(); L("  " + low6 + " = and i64 " + cp + ", 63");
+        string sh6 = NT(); L("  " + sh6 + " = lshr i64 " + cp + ", 6");
+        string mid6 = NT(); L("  " + mid6 + " = and i64 " + sh6 + ", 63");
+        string sh12 = NT(); L("  " + sh12 + " = lshr i64 " + cp + ", 12");
+        string c12 = NT(); L("  " + c12 + " = and i64 " + sh12 + ", 63");
+        string sh18 = NT(); L("  " + sh18 + " = lshr i64 " + cp + ", 18");
+        // byte 0: the tag plus the leading payload bits
+        //   1 byte: cp
+        //   2 bytes: 0xC0 | (cp >> 6)
+        //   3 bytes: 0xE0 | (cp >> 12)
+        //   4 bytes: 0xF0 | (cp >> 18)
+        // The host ORs the *unmasked* shift into the tag (irgen_generics.c
+        // emit_char_to_cstr): within each length class the shift is narrow
+        // enough that the tag bits never collide.
+        string b0_1 = NT(); L("  " + b0_1 + " = add i64 " + cp + ", 0");
+        string b0_2 = NT(); L("  " + b0_2 + " = or i64 " + sh6 + ", 192");
+        string b0_3 = NT(); L("  " + b0_3 + " = or i64 " + sh12 + ", 224");
+        string b0_4 = NT(); L("  " + b0_4 + " = or i64 " + sh18 + ", 240");
+        // byte 1: 0x80 | payload (absent in the 1-byte form)
+        //   2 bytes: 0x80 | (cp & 0x3F)
+        //   3 bytes: 0x80 | ((cp >> 6) & 0x3F)
+        //   4 bytes: 0x80 | ((cp >> 12) & 0x3F)
+        string b1_2 = NT(); L("  " + b1_2 + " = or i64 " + low6 + ", 128");
+        string b1_3 = NT(); L("  " + b1_3 + " = or i64 " + mid6 + ", 128");
+        string b1_4 = NT(); L("  " + b1_4 + " = or i64 " + c12 + ", 128");
+        // byte 2: 0x80 | payload (absent in the 1- and 2-byte forms)
+        //   3 bytes: 0x80 | (cp & 0x3F)
+        //   4 bytes: 0x80 | ((cp >> 6) & 0x3F)
+        string b2_3 = NT(); L("  " + b2_3 + " = or i64 " + low6 + ", 128");
+        string b2_4 = NT(); L("  " + b2_4 + " = or i64 " + mid6 + ", 128");
+        // byte 3: 0x80 | payload (only in the 4-byte form)
+        string b3_4 = NT(); L("  " + b3_4 + " = or i64 " + low6 + ", 128");
+        // pick the encoding by code point.  The classes are nested, so the
+        // selects have to narrow step by step: a later select must not fall
+        // back to a byte that belongs to a shorter class (that mistake made
+        // the three- and four-byte forms lose their tail).
+        string b0p1 = NT(); L("  " + b0p1 + " = select i1 " + lt80 + ", i64 " + b0_1 + ", i64 " + b0_2);
+        string b0p2 = NT(); L("  " + b0p2 + " = select i1 " + lt800 + ", i64 " + b0p1 + ", i64 " + b0_3);
+        string b0p3 = NT(); L("  " + b0p3 + " = select i1 " + lt10000 + ", i64 " + b0p2 + ", i64 " + b0_4);
+        string b1p1 = NT(); L("  " + b1p1 + " = select i1 " + lt80 + ", i64 0, i64 " + b1_2);
+        string b1p2 = NT(); L("  " + b1p2 + " = select i1 " + lt800 + ", i64 " + b1p1 + ", i64 " + b1_3);
+        string b1p3 = NT(); L("  " + b1p3 + " = select i1 " + lt10000 + ", i64 " + b1p2 + ", i64 " + b1_4);
+        // byte 2 exists from three bytes on
+        string b2p1 = NT(); L("  " + b2p1 + " = select i1 " + lt800 + ", i64 0, i64 " + b2_3);
+        string b2p3 = NT(); L("  " + b2p3 + " = select i1 " + lt10000 + ", i64 " + b2p1 + ", i64 " + b2_4);
+        string b3p3 = NT(); L("  " + b3p3 + " = select i1 " + lt10000 + ", i64 0, i64 " + b3_4);
+        // length: one byte below 0x80, two below 0x800, three below 0x10000,
+        // four otherwise
+        string lenA = NT(); L("  " + lenA + " = select i1 " + lt80 + ", i64 1, i64 2");
+        string lenB = NT(); L("  " + lenB + " = select i1 " + lt800 + ", i64 " + lenA + ", i64 3");
+        string len4 = NT(); L("  " + len4 + " = select i1 " + lt10000 + ", i64 " + lenB + ", i64 4");
+        // the managed string carries the exact length, so the bytes land in
+        // the payload and the NUL terminator follows them
+        string buf = NT(); L("  " + buf + " = call i8* @zstr_new(i64 " + len4 + ")");
+        string p0 = NT(); L("  " + p0 + " = getelementptr i8, i8* " + buf + ", i64 0");
+        L("  store i8 " + "0, i8* " + p0);
+        string p1 = NT(); L("  " + p1 + " = getelementptr i8, i8* " + buf + ", i64 1");
+        string p2 = NT(); L("  " + p2 + " = getelementptr i8, i8* " + buf + ", i64 2");
+        string p3 = NT(); L("  " + p3 + " = getelementptr i8, i8* " + buf + ", i64 3");
+        // truncate the stores to the encoded length
+        string h1 = NT(); L("  " + h1 + " = icmp ugt i64 " + len4 + ", 1");
+        string h2 = NT(); L("  " + h2 + " = icmp ugt i64 " + len4 + ", 2");
+        string h3 = NT(); L("  " + h3 + " = icmp ugt i64 " + len4 + ", 3");
+        string t0 = NT(); L("  " + t0 + " = trunc i64 " + b0p3 + " to i8");
+        L("  store i8 " + t0 + ", i8* " + p0);
+        string t1 = NT(); L("  " + t1 + " = trunc i64 " + b1p3 + " to i8");
+        string s1 = NT(); L("  " + s1 + " = select i1 " + h1 + ", i8 " + t1 + ", i8 0");
+        L("  store i8 " + s1 + ", i8* " + p1);
+        string t2 = NT(); L("  " + t2 + " = trunc i64 " + b2p3 + " to i8");
+        string s2 = NT(); L("  " + s2 + " = select i1 " + h2 + ", i8 " + t2 + ", i8 0");
+        L("  store i8 " + s2 + ", i8* " + p2);
+        string t3 = NT(); L("  " + t3 + " = trunc i64 " + b3p3 + " to i8");
+        string s3 = NT(); L("  " + s3 + " = select i1 " + h3 + ", i8 " + t3 + ", i8 0");
+        L("  store i8 " + s3 + ", i8* " + p3);
+        // The host reports length 0 for the NUL character (emit_char_to_cstr
+        // stamps 0 when the code point is 0), so the string header has to
+        // follow -- the bytes are still written, the length is not.
+        string isz = NT(); L("  " + isz + " = icmp eq i64 " + cp + ", 0");
+        string lenRep = NT(); L("  " + lenRep + " = select i1 " + isz + ", i64 0, i64 " + len4);
+        string lp = NT(); L("  " + lp + " = getelementptr i8, i8* " + buf + ", i64 -16");
+        L("  store i64 " + lenRep + ", i64* " + lp);
+        return buf;
+    }
+
+    // The C host maps an interpolated-string format specifier to a printf
+    // pattern (src/compiler/irgen_expr.c: interp_format_to_printf). "" means
+    // "no format": the value is rendered the default way. The rules are
+    // the host's, not C#'s: D/X need a digit count (> 0), F/E clamp it,
+    // G means "significant digits", and 0/# is the custom pattern.
+    string FormatSpecToPrintf(string spec, bool isUlong) {
+        if (spec == null || spec.Length == 0) { return ""; }
+        string code = spec.Substring(0, 1);
+        int digits = 0;
+        int i = 1;
+        while (i < spec.Length) {
+            int d = spec[i] - 48;
+            if (d >= 0 && d <= 9) { if (digits <= 9999) { digits = digits * 10 + d; } }
+            i = i + 1;
+        }
+        if (code == "D" || code == "d") {
+            if (digits <= 0 || digits > 512) { return ""; }
+            return "%0" + Convert.ToString(digits) + (isUlong ? "llu" : "lld");
+        }
+        if (code == "X" || code == "x") {
+            if (digits <= 0 || digits > 512) { return ""; }
+            return "%0" + Convert.ToString(digits) + (code == "X" ? "llX" : "llx");
+        }
+        if (code == "F" || code == "f") {
+            if (digits > 512) { digits = 512; }
+            return "%." + Convert.ToString(digits) + "f";
+        }
+        if (code == "E" || code == "e") {
+            if (digits > 512) { digits = 512; }
+            return "%." + Convert.ToString(digits) + "E";
+        }
+        if (code == "G" || code == "g") {
+            if (digits > 0) { return "%." + Convert.ToString(digits) + "g"; }
+            return "";
+        }
+        if (code == "0" || code == "#") {
+            // custom numeric pattern: 0 = required digit, # = optional
+            int ipad = 0;
+            int frac = 0;
+            bool afterDot = false;
+            bool haveDot = false;
+            i = 0;
+            while (i < spec.Length) {
+                string ch = spec.Substring(i, 1);
+                if (ch == ".") { afterDot = true; haveDot = true; }
+                else if (ch == "0" || ch == "#") {
+                    if (afterDot) { frac = frac + 1; }
+                    else if (ch == "0") { ipad = ipad + 1; }
+                }
+                i = i + 1;
+            }
+            if (haveDot) { return "%." + Convert.ToString(frac) + "f"; }
+            if (ipad > 0) { return "%0" + Convert.ToString(ipad) + (isUlong ? "llu" : "lld"); }
+            return "";
+        }
+        return "";
+    }
+
+    // does the mapped printf pattern render as a double (a fixed/scientific
+    // spec on an integer widens it first)?
+    bool SpecWantsDouble(string spec) {
+        if (spec == null || spec.Length == 0) { return false; }
+        string code = spec.Substring(0, 1);
+        if (code == "F" || code == "f" || code == "E" || code == "e" || code == "G" || code == "g") { return true; }
+        if (code == "0" || code == "#") {
+            int i = 0;
+            while (i < spec.Length) {
+                if (spec.Substring(i, 1) == ".") { return true; }
+                i = i + 1;
+            }
+        }
+        return false;
+    }
+
+    // A printf pattern global (one per distinct pattern).
+    string FmtPatGlobal(string pat) {
+        fmtSeq = fmtSeq + 1;
+        string g = "@.fmt.p" + Convert.ToString(fmtSeq);
+        int n = pat.Length + 1;
+        H(g + " = private unnamed_addr constant [" + n + " x i8] c\"" + pat + "\\00\"");
+        return "getelementptr inbounds ([" + n + " x i8], [" + n + " x i8]* " + g + ", i64 0, i64 0)";
+    }
+
+    // scalar x.ToString("spec"): the interpolated-string hole format (the
+    // lexer splices the hole `{v:D4}` into `v.ToString("D4")`). The C host
+    // formats the hole with printf semantics (irgen_expr.c
+    // emit_expr_string_interp + interp_format_to_printf).
+    ExprVal EmitScalarToStringFmt(ExprVal recv, string spec) {
+        if (recv.ty == null) { return new ExprVal(ToCStr(recv), MkType("string")); }
+        string sty = recv.ty.sval;
+        if (sty == "bool") {
+            // a bool renders as "true"/"false" (the host's interpolation
+            // branch), not as 1/0
+            ExprVal ts = GenStr("true");
+            ExprVal fs = GenStr("false");
+            string c = NT(); L("  " + c + " = icmp ne i64 " + recv.op + ", 0");
+            string r = NT(); L("  " + r + " = select i1 " + c + ", i8* " + ts.op + ", i8* " + fs.op);
+            return new ExprVal(r, MkType("string"));
+        }
+        if (sty == "char" && recv.ty.ival == 0) {
+            return new ExprVal(CharToStr(recv.op), MkType("string"));
+        }
+        bool isDbl = IsDbl(recv.ty);
+        bool isU = IsUlong(recv.ty);
+        // a double ignores the decimal/hex padding specs (the host: the
+        // spec-to-printf mapping refuses them for a float operand)
+        string code = spec != null && spec.Length > 0 ? spec.Substring(0, 1) : "";
+        if (isDbl && (code == "D" || code == "d" || code == "X" || code == "x")) {
+            return new ExprVal(ToCStr(recv), MkType("string"));
+        }
+        string pat = FormatSpecToPrintf(spec, isU);
+        if (pat == "") { return new ExprVal(ToCStr(recv), MkType("string")); }
+        string vop = recv.op;
+        string vty = "i64";
+        if (isDbl) { vty = "double"; }
+        else if (SpecWantsDouble(spec)) {
+            string d = NT(); L("  " + d + " = sitofp i64 " + recv.op + " to double");
+            vop = d; vty = "double";
+        }
+        string fp = FmtPatGlobal(pat);
+        string need = NT();
+        L("  " + need + " = call i32 (i8*, i64, i8*, ...) @snprintf(i8* null, i64 0, i8* " + fp + ", " + vty + " " + vop + ")");
+        string need64 = NT(); L("  " + need64 + " = sext i32 " + need + " to i64");
+        string bsz = NT(); L("  " + bsz + " = add i64 " + need64 + ", 1");
+        string buf = NT(); L("  " + buf + " = call i8* @malloc(i64 " + bsz + ")");
+        L("  call i32 (i8*, i64, i8*, ...) @snprintf(i8* " + buf + ", i64 " + bsz + ", i8* " + fp + ", " + vty + " " + vop + ")");
+        return new ExprVal(WrapManaged(buf), MkType("string"));
+    }
+
+    // coerce a value to i8* string form (numbers via snprintf)
+    string ToCStr(ExprVal v) {
+        if (v == null || v.op == "null") {
+            ExprVal es = GenStr("");
+            return es.op;
+        }
+        // 可空值类型：宿主 emit_to_cstr_u（irgen_generics.c:2429）——null
+        // 出 ""，有值出值的渲染。盒子是 8 字节槽（double/float 装 double，
+        // 其余 i64），有值即指针非空；渲染只在 some 块里做（cond_br + phi，
+        // 与宿主同构，none 侧不分配、some 侧不白渲）。此前可空实参掉进
+        // 整数分支，box 指针被当 i64 喂 snprintf——LLVM verify 当场炸。
+        if (v.ty != null && IsNullableValue(v.ty)) {
+            string hz = NT();
+            L("  " + hz + " = icmp ne i8* " + v.op + ", null");
+            int lSome = NL(); int lNone = NL(); int lEnd = NL();
+            L("  br i1 " + hz + ", label %L" + lSome + ", label %L" + lNone);
+            Label(lSome);
+            string ult = (v.ty.sval == "double" || v.ty.sval == "float")
+                ? "double" : "i64";
+            string p2 = NT();
+            L("  " + p2 + " = bitcast i8* " + v.op + " to " + ult + "*");
+            string uv = NT();
+            L("  " + uv + " = load " + ult + ", " + ult + "* " + p2);
+            ExprVal iv = new ExprVal(uv, MkType(v.ty.sval));
+            string rendered = ToCStr(iv);
+            string someEnd = curLbl;
+            L("  br label %L" + lEnd);
+            Label(lNone);
+            ExprVal emp = GenStr("");
+            L("  br label %L" + lEnd);
+            Label(lEnd);
+            string r = NT();
+            L("  " + r + " = phi i8* [ " + rendered + ", %" + someEnd
+                + " ], [ " + emp.op + ", %L" + lNone + " ]");
+            return r;
+        }
+        if (IsStr(v.ty)) {
+            string isNull = NT();
+            L("  " + isNull + " = icmp eq i8* " + v.op + ", null");
+            string nn = NT();
+            L("  " + nn + " = select i1 " + isNull + ", i8* " + GenStr("").op + ", i8* " + v.op);
+            return nn;
+        }
+        if (v.ty != null && v.ty.sval == "StringView") {
+            string pp = NT();
+            L("  " + pp + " = getelementptr %StringView, %StringView* " + v.op + ", i32 0, i32 0");
+            string p64 = NT();
+            L("  " + p64 + " = load i64, i64* " + pp);
+            string lp = NT();
+            L("  " + lp + " = getelementptr %StringView, %StringView* " + v.op + ", i32 0, i32 1");
+            string l32 = NT();
+            L("  " + l32 + " = load i32, i32* " + lp);
+            string l64 = NT();
+            L("  " + l64 + " = zext i32 " + l32 + " to i64");
+            string bptr = NT();
+            L("  " + bptr + " = inttoptr i64 " + p64 + " to i8*");
+            string buf = NT();
+            L("  " + buf + " = call i8* @zstr_new(i64 " + l64 + ")");
+            L("  call i8* @memcpy(i8* " + buf + ", i8* " + bptr + ", i64 " + l64 + ")");
+            return buf;
+        }
+        // double / float -> string (the runtime's shortest round-trip form)
+        if (IsDbl(v.ty)) {
+            if (v.ty != null && v.ty.sval == "float") { return FltToStr(v.op).op; }
+            return DblToStr(v.op).op;
+        }
+        // char -> its UTF-8 text (the host's emit_char_to_cstr)
+        if (v.ty != null && v.ty.sval == "char" && v.ty.ival == 0) {
+            return CharToStr(v.op);
+        }
+        // bool -> "true"/"false" (the host's emit_value_as_cstr). Without this
+        // the value falls into the integer branch and prints as "1"/"0" -- the
+        // same bool then looks different depending on the path that renders it
+        // (`Convert.ToString(b)` vs `b.ToString()`).
+        if (v.ty != null && v.ty.sval == "bool" && v.ty.ival == 0) {
+            ExprVal ts = GenStr("true");
+            ExprVal fs = GenStr("false");
+            string c = NT(); L("  " + c + " = icmp ne i64 " + v.op + ", 0");
+            string r = NT(); L("  " + r + " = select i1 " + c + ", i8* " + ts.op + ", i8* " + fs.op);
+            return r;
+        }
+        // integer -> string ("%llu" for ulong so the high bit prints unsigned)
+        string ifmt = "@.fmt.nn";
+        if (IsUlong(v.ty)) { ifmt = "@.fmt.unn"; }
+        string need = NT();
+        L("  " + need + " = call i32 (i8*, i64, i8*, ...) @snprintf(i8* null, i64 0, i8* getelementptr inbounds ([5 x i8], [5 x i8]* " + ifmt + ", i64 0, i64 0), i64 " + v.op + ")");
+        string need64 = NT();
+        L("  " + need64 + " = sext i32 " + need + " to i64");
+        string bsz = NT();
+        L("  " + bsz + " = add i64 " + need64 + ", 1");
+        string buf = NT();
+        L("  " + buf + " = call i8* @malloc(i64 " + bsz + ")");
+        L("  call i32 (i8*, i64, i8*, ...) @snprintf(i8* " + buf + ", i64 " + bsz + ", i8* getelementptr inbounds ([5 x i8], [5 x i8]* " + ifmt + ", i64 0, i64 0), i64 " + v.op + ")");
+        return WrapManaged(buf);
+    }
+
+    // wrap a plain C string (a number formatted by snprintf, a file read, a
+    // command-line argument) into the managed string layout
+    string WrapManaged(string cstr) {
+        string r = NT();
+        L("  " + r + " = call i8* @zstr_of(i8* " + cstr + ")");
+        return r;
+    }
+
+    // the exact byte length of a managed string
+    string StrLen(string s) {
+        string r = NT();
+        L("  " + r + " = call i64 @zstr_len(i8* " + s + ")");
+        return r;
+    }
+
+    // the C-visible length of a managed string: the offset of the first NUL
+    // byte.  The C host keeps the exact length for Length / indexing /
+    // concatenation but truncates its search and transform methods there
+    // (Trim / ToUpper / Replace / Split / EndsWith / LastIndexOf / ...).
+    string StrCLen(string s) {
+        string r = NT();
+        L("  " + r + " = call i64 @zstr_clen(i8* " + s + ")");
+        return r;
+    }
+
+    // a byte[] value (the self-hosted array keeps one element per 8-byte
+    // slot); char[]/sbyte[] count as well -- a character buffer is the usual
+    // way the standard library builds a string
+    bool IsByteArr(Node t) {
+        if (t == null) { return false; }
+        if (t.sval == "byte[]" || t.sval == "char[]" || t.sval == "sbyte[]") { return true; }
+        if (t.ival >= 1 && (t.sval == "byte" || t.sval == "char" || t.sval == "sbyte")) { return true; }
+        return false;
+    }
+
+    // The element width of a byte-array-like value: a byte[]/sbyte[] stores
+    // one byte per element, a char[] keeps the 8-byte slot (a char is a
+    // code point, not a byte). A value whose static type is unknown counts
+    // as a byte[].
+    int ByteArrElemSize(ExprVal v) {
+        if (v.ty == null) { return 1; }
+        Node et = ArrElemOf(v.ty);
+        if (et == null) { return 1; }
+        return ArrElemSize(et);
+    }
+
+    // byte[] -> string: pack the byte elements into a managed string. The
+    // self-hosted array stores one element per 8-byte slot, so the bytes are
+    // copied into a fresh buffer; the C host's view shares the array instead
+    // (TASKS A390).
+    ExprVal ByteArrToStr(ExprVal v) {
+        int esz = ByteArrElemSize(v);
+        string ap = NT();
+        L("  " + ap + " = bitcast i8* " + v.op + " to i64*");
+        string lenp = NT();
+        L("  " + lenp + " = getelementptr i64, i64* " + ap + ", i64 -1");
+        string len = NT();
+        L("  " + len + " = load i64, i64* " + lenp);
+        string dst = NT();
+        L("  " + dst + " = call i8* @zstr_new(i64 " + len + ")");
+        string idx = NT();
+        EA(idx, "i64");
+        L("  store i64 0, i64* " + idx);
+        int lc = NL(); int lb = NL(); int lend = NL();
+        L("  br label %L" + lc);
+        Label(lc);
+        string ci = NT();
+        L("  " + ci + " = load i64, i64* " + idx);
+        string c = NT();
+        L("  " + c + " = icmp uge i64 " + ci + ", " + len);
+        L("  br i1 " + c + ", label %L" + lend + ", label %L" + lb);
+        Label(lb);
+        string b = "";
+        if (esz == 1) {
+            // a byte array stores one byte per element
+            string eb = NT();
+            L("  " + eb + " = getelementptr i8, i8* " + v.op + ", i64 " + ci);
+            string bv = NT();
+            L("  " + bv + " = load i8, i8* " + eb);
+            b = bv;
+        } else {
+            string ep = NT();
+            L("  " + ep + " = getelementptr i64, i64* " + ap + ", i64 " + ci);
+            string raw = NT();
+            L("  " + raw + " = load i64, i64* " + ep);
+            string bb = NT();
+            L("  " + bb + " = trunc i64 " + raw + " to i8");
+            b = bb;
+        }
+        string dp = NT();
+        L("  " + dp + " = getelementptr i8, i8* " + dst + ", i64 " + ci);
+        L("  store i8 " + b + ", i8* " + dp);
+        string ni = NT();
+        L("  " + ni + " = add i64 " + ci + ", 1");
+        L("  store i64 " + ni + ", i64* " + idx);
+        L("  br label %L" + lc);
+        Label(lend);
+        return new ExprVal(dst, MkType("string"));
+    }
+
+    // string -> byte[]: the C host's bridge primitive (irgen_expr.c
+    // emit_bytes_call) allocates an array of the string's exact length and
+    // copies the bytes over. The self-hosted byte array stores one byte per
+    // element, so the buffer is a plain byte run.
+    ExprVal StrToBytes(ExprVal s) {
+        string len = StrLen(s.op);
+        string bytes = NT();
+        L("  " + bytes + " = add i64 " + len + ", 0");
+        string tot = NT();
+        L("  " + tot + " = add i64 " + bytes + ", 16");
+        string raw = NT();
+        L("  " + raw + " = call i8* @calloc(i64 1, i64 " + tot + ")");
+        string hdr = NT();
+        L("  " + hdr + " = bitcast i8* " + raw + " to i64*");
+        string lenp = NT();
+        L("  " + lenp + " = getelementptr i64, i64* " + hdr + ", i64 1");
+        L("  store i64 " + len + ", i64* " + lenp);
+        string arr = NT();
+        L("  " + arr + " = getelementptr i64, i64* " + hdr + ", i64 2");
+        string idx = NT();
+        EA(idx, "i64");
+        L("  store i64 0, i64* " + idx);
+        int lc = NL(); int lb = NL(); int lend = NL();
+        L("  br label %L" + lc);
+        Label(lc);
+        string ci = NT();
+        L("  " + ci + " = load i64, i64* " + idx);
+        string c = NT();
+        L("  " + c + " = icmp uge i64 " + ci + ", " + len);
+        L("  br i1 " + c + ", label %L" + lend + ", label %L" + lb);
+        Label(lb);
+        string sp = NT();
+        L("  " + sp + " = getelementptr i8, i8* " + s.op + ", i64 " + ci);
+        string bv = NT();
+        L("  " + bv + " = load i8, i8* " + sp);
+        string ab = NT();
+        L("  " + ab + " = bitcast i64* " + arr + " to i8*");
+        string ap = NT();
+        L("  " + ap + " = getelementptr i8, i8* " + ab + ", i64 " + ci);
+        L("  store i8 " + bv + ", i8* " + ap);
+        string ni = NT();
+        L("  " + ni + " = add i64 " + ci + ", 1");
+        L("  store i64 " + ni + ", i64* " + idx);
+        L("  br label %L" + lc);
+        Label(lend);
+        Node at = MkType("byte");
+        at.ival = 1;
+        return new ExprVal(arr, at);
+    }
+
+    // byte[] -> string over the window [off, off+len): the C host clamps the
+    // window to the array and materialises a string of that length
+    // (irgen_expr.c emit_bytes_call). The self-hosted array keeps one byte
+    // per 8-byte slot, so the bytes are packed into a fresh buffer.
+    ExprVal ByteArrWindowToStr(ExprVal a, Node e) {
+        int esz = ByteArrElemSize(a);
+        string ap = NT();
+        L("  " + ap + " = bitcast i8* " + a.op + " to i64*");
+        string lenp = NT();
+        L("  " + lenp + " = getelementptr i64, i64* " + ap + ", i64 -1");
+        string alen = NT();
+        L("  " + alen + " = load i64, i64* " + lenp);
+        string off = "0";
+        string len = alen;
+        if (e.kids.Count == 2) {
+            ExprVal o = GenExpr(e.kids[0]);
+            ExprVal l = GenExpr(e.kids[1]);
+            // off := min(max(off, 0), alen)
+            string on = NT();
+            L("  " + on + " = icmp slt i64 " + o.op + ", 0");
+            string o0 = NT();
+            L("  " + o0 + " = select i1 " + on + ", i64 0, i64 " + o.op);
+            string ob = NT();
+            L("  " + ob + " = icmp sgt i64 " + o0 + ", " + alen);
+            off = NT();
+            L("  " + off + " = select i1 " + ob + ", i64 " + alen + ", i64 " + o0);
+            // avail := alen - off
+            string avail = NT();
+            L("  " + avail + " = sub i64 " + alen + ", " + off);
+            // len := min(max(len, 0), avail)
+            string ln = NT();
+            L("  " + ln + " = icmp slt i64 " + l.op + ", 0");
+            string l0 = NT();
+            L("  " + l0 + " = select i1 " + ln + ", i64 0, i64 " + l.op);
+            string lb2 = NT();
+            L("  " + lb2 + " = icmp sgt i64 " + l0 + ", " + avail);
+            len = NT();
+            L("  " + len + " = select i1 " + lb2 + ", i64 " + avail + ", i64 " + l0);
+        }
+        string dst = NT();
+        L("  " + dst + " = call i8* @zstr_new(i64 " + len + ")");
+        string idx = NT();
+        EA(idx, "i64");
+        L("  store i64 0, i64* " + idx);
+        int lc = NL(); int lb = NL(); int lend = NL();
+        L("  br label %L" + lc);
+        Label(lc);
+        string ci = NT();
+        L("  " + ci + " = load i64, i64* " + idx);
+        string c = NT();
+        L("  " + c + " = icmp uge i64 " + ci + ", " + len);
+        L("  br i1 " + c + ", label %L" + lend + ", label %L" + lb);
+        Label(lb);
+        string si = NT();
+        L("  " + si + " = add i64 " + ci + ", " + off);
+        string b = "";
+        if (esz == 1) {
+            string eb = NT();
+            L("  " + eb + " = getelementptr i8, i8* " + a.op + ", i64 " + si);
+            string bv = NT();
+            L("  " + bv + " = load i8, i8* " + eb);
+            b = bv;
+        } else {
+            string ep = NT();
+            L("  " + ep + " = getelementptr i64, i64* " + ap + ", i64 " + si);
+            string raw = NT();
+            L("  " + raw + " = load i64, i64* " + ep);
+            string bb = NT();
+            L("  " + bb + " = trunc i64 " + raw + " to i8");
+            b = bb;
+        }
+        string dp = NT();
+        L("  " + dp + " = getelementptr i8, i8* " + dst + ", i64 " + ci);
+        L("  store i8 " + b + ", i8* " + dp);
+        string ni = NT();
+        L("  " + ni + " = add i64 " + ci + ", 1");
+        L("  store i64 " + ni + ", i64* " + idx);
+        L("  br label %L" + lc);
+        Label(lend);
+        return new ExprVal(dst, MkType("string"));
+    }
+
+    // assigning a byte[] to a string slot packs it into a managed string.
+    // A source whose static type is unknown (the self-host often leaves the
+    // type of an identifier's value unresolved) is treated as a byte[]; the
+    // checker rejects the other mismatches, and a null literal stays null.
+    ExprVal StrSlotConv(Node targetTy, ExprVal v) {
+        if (!IsStr(targetTy)) { return v; }
+        if (v.op == "null") { return v; }
+        if (IsStr(v.ty)) { return v; }
+        if (v.ty != null && !IsByteArr(v.ty)) { return v; }
+        return ByteArrToStr(v);
+    }
+
+    // True when `e` provably yields a string: a string literal, or a `+`
+    // with a provably-string side.
+    bool StrNodeish(Node e) {
+        if (e == null) { return false; }
+        if (e.kind == AK.StringLit()) { return true; }
+        if (e.kind == AK.Ident()) {
+            int li = LocalIdx(e.sval);
+            if (li >= 0) { return IsStr(locType[li]); }
+            return false;
+        }
+        if (e.kind == AK.Binary() && e.op == TK.Plus()) {
+            return StrNodeish(e.a) || StrNodeish(e.b);
+        }
+        return false;
+    }
+
+    // A concatenation-chain link: `+` whose either side is provably string.
+    bool IsStrChain(Node e) {
+        if (e == null) { return false; }
+        if (e.kind != AK.Binary() || e.op != TK.Plus()) { return false; }
+        return StrNodeish(e.a) || StrNodeish(e.b);
+    }
+
+    // Collect the leaves of a `+` concatenation chain in evaluation order.
+    // A sub-tree that is not itself a provable string chain stays one leaf
+    // (it is evaluated with its own semantics, e.g. numeric addition).
+    void CollectConcat(Node e, List<Node> outParts) {
+        if (outParts.Count < 40 && IsStrChain(e)) {
+            CollectConcat(e.a, outParts);
+            CollectConcat(e.b, outParts);
+        } else {
+            outParts.Add(e);
+        }
+    }
+
+    // n-way concatenation with a single allocation: sum the part lengths,
+    // malloc once, memcpy each part in order and NUL-terminate. Replaces the
+    // O(n^2) copying of emitting a chain pairwise.
+    ExprVal StrConcatN(List<Node> parts) {
+        List<string> vals = new List<string>();
+        List<string> lens = new List<string>();
+        string tot = "0";
+        int i = 0;
+        while (i < parts.Count) {
+            ExprVal v = GenExpr(parts[i]);
+            string s = ToCStr(v);
+            vals.Add(s);
+            lens.Add(StrLen(s));
+            string nt = NT(); L("  " + nt + " = add i64 " + tot + ", " + lens[i]);
+            tot = nt;
+            i = i + 1;
+        }
+        string buf = NT(); L("  " + buf + " = call i8* @zstr_new(i64 " + tot + ")");
+        string off = "0";
+        i = 0;
+        while (i < parts.Count) {
+            string dst = NT(); L("  " + dst + " = getelementptr i8, i8* " + buf + ", i64 " + off);
+            L("  call i8* @memcpy(i8* " + dst + ", i8* " + vals[i] + ", i64 " + lens[i] + ")");
+            string no = NT(); L("  " + no + " = add i64 " + off + ", " + lens[i]);
+            off = no;
+            i = i + 1;
+        }
+        return new ExprVal(buf, MkType("string"));
+    }
+
+    ExprVal StrConcat(string a, string b) {
+        string la = StrLen(a);
+        string lb = StrLen(b);
+        string tot = NT(); L("  " + tot + " = add i64 " + la + ", " + lb);
+        string buf = NT(); L("  " + buf + " = call i8* @zstr_new(i64 " + tot + ")");
+        L("  call i8* @memcpy(i8* " + buf + ", i8* " + a + ", i64 " + la + ")");
+        string off = NT(); L("  " + off + " = getelementptr i8, i8* " + buf + ", i64 " + la);
+        L("  call i8* @memcpy(i8* " + off + ", i8* " + b + ", i64 " + lb + ")");
+        return new ExprVal(buf, MkType("string"));
+    }
+
+}

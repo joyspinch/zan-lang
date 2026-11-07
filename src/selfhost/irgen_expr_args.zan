@@ -1,0 +1,925 @@
+using System;
+using System.Collections.Generic;
+namespace Zan;
+
+partial class Irgen {
+    string ParamTypeStr(Node m, int idx) {
+        int seen = 0; int i = 0;
+        while (i < m.kids.Count) {
+            if (m.kids[i].kind == AK.Param()) {
+                if (seen == idx) { return MapType(m.kids[i].type); }
+                seen = seen + 1;
+            }
+            i = i + 1;
+        }
+        return "i64";
+    }
+
+    Node ParamTypeNode(Node m, int idx) {
+        int seen = 0; int i = 0;
+        while (i < m.kids.Count) {
+            if (m.kids[i].kind == AK.Param()) {
+                if (seen == idx) { return m.kids[i].type; }
+                seen = seen + 1;
+            }
+            i = i + 1;
+        }
+        return MkType("int");
+    }
+
+    // The static op_call declared by the class chain (null when there is none).
+    Node FindStaticOpCall(Node cls) {
+        Node c = cls;
+        while (c != null) {
+            int i = 0;
+            while (i < c.kids.Count) {
+                Node m = c.kids[i];
+                if (m.kind == AK.MethodDecl() && m.sval == "op_call" && IsStatic(m)) { return m; }
+                i = i + 1;
+            }
+            c = BaseClassOf(c);
+        }
+        return null;
+    }
+
+    // The invoked-object protocol: `E(args)` where E names a class-typed local
+    // dispatches the class's op_call -- a static one takes E as its explicit
+    // first argument, an instance one is a normal method call on E. The
+    // rewrite re-dispatches, so the overload fit, the `params` packing and
+    // the argument conversions apply unchanged (the ngen backend lowers the
+    // same shape). Returns null when the receiver's class declares no
+    // op_call.
+    ExprVal TryGenOpCall(Node callee, Node e) {
+        int li = LocalIdx(callee.sval);
+        if (li < 0) { return null; }
+        Node cls = ClassOf(locType[li]);
+        if (cls == null) { return null; }
+        if (FindStaticOpCall(cls) != null) {
+            // Cls.op_call(recv, args...)
+            Node ma = new Node(AK.MemberAccess());
+            Node tn = new Node(AK.Ident());
+            tn.sval = cls.sval;
+            ma.a = tn; ma.sval = "op_call";
+            ma.line = e.line; ma.col = e.col;
+            Node call = new Node(AK.Call());
+            call.a = ma; call.line = e.line; call.col = e.col;
+            call.Add(callee);
+            int i = 0;
+            while (i < e.kids.Count) { call.Add(e.kids[i]); i = i + 1; }
+            return GenCall(call);
+        }
+        if (FindMethodUp(cls, "op_call") != null) {
+            // recv.op_call(args...)
+            Node ma = new Node(AK.MemberAccess());
+            ma.a = callee; ma.sval = "op_call";
+            ma.line = e.line; ma.col = e.col;
+            Node call = new Node(AK.Call());
+            call.a = ma; call.line = e.line; call.col = e.col;
+            int i = 0;
+            while (i < e.kids.Count) { call.Add(e.kids[i]); i = i + 1; }
+            return GenCall(call);
+        }
+        return null;
+    }
+
+    // Does parameter `idx` of method m carry a `ref`/`out` modifier?
+    bool IsRefParam(Node m, int idx) {
+        int seen = 0; int i = 0;
+        while (i < m.kids.Count) {
+            if (m.kids[i].kind == AK.Param()) {
+                if (seen == idx) { return m.kids[i].ival == 1; }
+                seen = seen + 1;
+            }
+            i = i + 1;
+        }
+        return false;
+    }
+
+    // The address of a by-ref argument place. `ref x` / `out x` at the call
+    // site hand the callee the ADDRESS of the place, so the callee reads and
+    // writes the caller's own storage (the C host's emit_ref_arg). The
+    // address has the type of the place's slot (`<mapped type>*`), which is
+    // exactly what the callee's by-ref parameter expects.
+    string RefPlacePtr(Node place, Node pty) {
+        if (place == null) {
+            diags.Error("[E3049] ref/out argument must be a variable, a field, or an element", 0, 0);
+            return "null";
+        }
+        string lt = MapType(pty);
+        if (place.kind == AK.Ident()) {
+            int li = LocalIdx(place.sval);
+            if (li >= 0) {
+                if (curAsync && locBox[li]) {
+                    // the local lives in a heap cell: the cell IS its storage
+                    string c = NT();
+                    L("  " + c + " = load i8*, i8** " + locReg[li]);
+                    string p = NT();
+                    L("  " + p + " = bitcast i8* " + c + " to " + lt + "*");
+                    return p;
+                }
+                return locReg[li];
+            }
+            if (curClass != "") {
+                Node scls = binder.FindType(curClass);
+                if (scls != null && FindStaticField(scls, place.sval) != null) {
+                    string sown = StaticFieldOwner(scls, place.sval);
+                    return StaticGlobal(sown, place.sval, CurInstFor(sown));
+                }
+                // this.field
+                if (curHasThis) {
+                    Node cls = binder.FindType(curClass);
+                    if (cls != null && FieldIndex(cls, place.sval) >= 0) {
+                        Node fty = FieldType(cls, place.sval);
+                        return FieldPlacePtr("%this", curClass, place.sval, fty, lt);
+                    }
+                }
+            }
+            diags.Error("[E3049] ref/out argument must be a variable, a field, or an element", place.line, place.col);
+            return "null";
+        }
+        if (place.kind == AK.MemberAccess()) {
+            // obj.field: the address of the field itself
+            ExprVal obj = GenExpr(place.a);
+            string cn = obj.ty.sval;
+            Node ocls = binder.FindType(cn);
+            if (ocls == null || FieldIndex(ocls, place.sval) < 0) {
+                diags.Error("[E3049] ref/out argument must be a variable, a field, or an element", place.line, place.col);
+                return "null";
+            }
+            Node fty = FieldType(ocls, place.sval);
+            return FieldPlacePtr(obj.op, cn, place.sval, fty, lt);
+        }
+        if (place.kind == AK.Index()) {
+            // arr[i]: the address of the element.
+            ExprVal obj = GenExpr(place.a);
+            ExprVal idx = GenExpr(place.b);
+            Node et = ArrayElemType(obj.ty);
+            if (et == null) {
+                diags.Error("ref/out argument must be a variable, a field, or an element", place.line, place.col);
+                return "null";
+            }
+            if (IsByteArr(obj.ty)) {
+                string ab = NT();
+                L("  " + ab + " = bitcast i64* " + obj.op + " to i8*");
+                string p = NT();
+                L("  " + p + " = getelementptr i8, i8* " + ab + ", i64 " + idx.op);
+                return p;
+            }
+            string p2 = NT();
+            L("  " + p2 + " = getelementptr i64, i64* " + obj.op + ", i64 " + idx.op);
+            return p2;
+        }
+        diags.Error("ref/out argument must be a variable, a field, or an element", place.line, place.col);
+        return "null";
+    }
+
+    // The address of a class field, typed as the place the caller expects
+    // (`<field type>*`).
+    string FieldPtr(string objOp, string clsName, string field, string wantLt) {
+        Node cls = binder.FindType(clsName);
+        int idx = FieldIndex(cls, field);
+        string p = NT();
+        L("  " + p + " = getelementptr %" + clsName + ", %" + clsName + "* " + objOp + ", i32 0, i32 " + idx);
+        if (wantLt == "%" + clsName + "*") { return p; }
+        // the GEP yields the struct-typed address; the place wants the
+        // field's own type
+        string b = NT();
+        L("  " + b + " = bitcast %" + clsName + "* " + p + " to " + wantLt);
+        return b;
+    }
+
+    // The address of a field place, typed as the by-ref parameter's slot.
+    string FieldPlacePtr(string objOp, string clsName, string field, Node fty, string wantLt) {
+        string ad = FieldPtr(objOp, clsName, field, MapType(fty) + "*");
+        if (MapType(fty) == wantLt) { return ad; }
+        string b = NT();
+        L("  " + b + " = bitcast " + MapType(fty) + "* " + ad + " to " + wantLt + "*");
+        return b;
+    }
+
+    // The element type of an array-typed expression (null when it is not an
+    // array).
+    Node ArrayElemType(Node t) {
+        if (t == null || t.ival < 1) { return null; }
+        Node et = new Node(AK.TypeRef());
+        et.sval = t.sval;
+        et.ival = t.ival - 1;
+        et.op = t.op;
+        // the element of a rectangular array keeps the INNER ranks: the
+        // outermost group is the one the index consumes
+        et.arrRanks = Node.ArrRankDrop(t.arrRanks);
+        // the type arguments travel with the element: the element of a
+        // `List<string>[]` is a `List<string>`, not a bare `List`
+        et.kids = t.kids;
+        return et;
+    }
+
+    // The element type of an array-typed value. The array type comes in two
+    // shapes: a resolved one (the element name in `sval`, the rank in
+    // `ival`) and a declared one ("byte[]" with a rank of 0) -- both have to
+    // answer the element type, and the element of a jagged array keeps the
+    // remaining rank.
+    Node ArrElemOf(Node t) {
+        if (t == null) { return null; }
+        string en = t.sval;
+        if (en.EndsWith("[]")) {
+            Node et = MkType(en.Substring(0, en.Length - 2));
+            if (t.ival >= 1) { et.ival = t.ival - 1; }
+            return et;
+        }
+        if (t.ival >= 1) { return ArrayElemType(t); }
+        if (en == "Span" || en == "ReadOnlySpan") {
+            if (t.kids != null && t.kids.Count > 0) {
+                return t.kids[0];
+            }
+            return MkType("byte");
+        }
+        return null;
+    }
+
+    // The width of one array element in the self-hosted layout. The
+    // byte-sized element types are stored one per byte: the standard
+    // library hands a byte[] to the runtime as a raw buffer (Base64, the
+    // digest kernels, the protocol codecs), so a byte array has to be a
+    // byte array -- one byte per element, not one byte per 8-byte slot.
+    // Every other element type keeps an 8-byte slot.
+    int ArrElemSize(Node elemTy) {
+        if (elemTy == null) { return 8; }
+        if (elemTy.ival >= 1) { return 8; }
+        string n = elemTy.sval;
+        if (n == "byte" || n == "sbyte") { return 1; }
+        return 8;
+    }
+
+    // The address of element `idx` of an array (the array value points at
+    // the first element).
+    string ArrElemAddr(string arrOp, string idxOp, int esz) {
+        if (esz == 1) {
+            string b = NT();
+            L("  " + b + " = bitcast i64* " + arrOp + " to i8*");
+            string p = NT();
+            L("  " + p + " = getelementptr i8, i8* " + b + ", i64 " + idxOp);
+            return p;
+        }
+        string p = NT();
+        L("  " + p + " = getelementptr i64, i64* " + arrOp + ", i64 " + idxOp);
+        return p;
+    }
+
+    // The element value of an array slot, read at the element's own width.
+    string ArrElemLoad(string addr, int esz) {
+        if (esz == 1) {
+            string v = NT();
+            L("  " + v + " = load i8, i8* " + addr);
+            string z = NT();
+            L("  " + z + " = zext i8 " + v + " to i64");
+            return z;
+        }
+        string v = NT();
+        L("  " + v + " = load i64, i64* " + addr);
+        return v;
+    }
+
+    // Store an element value at the element's own width.
+    void ArrElemStore(string addr, int esz, string val) {
+        if (esz == 1) {
+            string b = NT();
+            L("  " + b + " = trunc i64 " + val + " to i8");
+            L("  store i8 " + b + ", i8* " + addr);
+            return;
+        }
+        L("  store i64 " + val + ", i64* " + addr);
+    }
+    // `out T name` at the call site: the callee writes through the address of
+    // a fresh local, which stays visible to the caller afterwards (the C
+    // host's emit_ref_arg declaration form).
+    string NewOutLocal(Node oa) {
+        Node ty = oa.type;
+        string lt = MapType(ty);
+        string reg = AddLocal(oa.sval, ty);
+        EA(reg, lt);
+        L("  store " + lt + " " + ZeroConst(lt) + ", " + lt + "* " + reg);
+        return reg;
+    }
+
+    // The zero value of a lowered type.
+    string ZeroConst(string lt) {
+        if (lt == "i64") { return "0"; }
+        if (lt == "double") { return "0.0"; }
+        if (lt.Length > 0 && (lt.Substring(0, 1) == "<" || lt.Substring(0, 1) == "{")) {
+            return "zeroinitializer";
+        }
+        return "null";
+    }
+
+    // The scalar/enum types a one-argument class constructor can materialize
+    // (the C host's is_implicit_ctor_source).
+    bool CtorSrcTy(string t) {
+        if (t == null) { return false; }
+        if (t == "bool" || t == "sbyte" || t == "byte" || t == "short"
+                || t == "ushort" || t == "int" || t == "uint" || t == "long"
+                || t == "ulong" || t == "nint" || t == "char") { return true; }
+        Node d = binder.FindType(t);
+        return d != null && d.kind == AK.EnumDecl();
+    }
+
+    // A scalar (or enum) argument reaches a class-typed parameter through a
+    // matching one-argument constructor -- the C host's implicit constructor
+    // conversion (is_implicit_ctor_source / implicit_ctor_for_arg /
+    // wrap_implicit_ctor_arg). The argument is rewritten to `new Target(arg)`
+    // so the ordinary `new` pipeline owns the allocation, the constructor
+    // call and the ARC bookkeeping. Returns the replacement node, or null
+    // when the argument is left as written.
+    Node WrapImplicitCtorArg(Node pty, Node arg) {
+        if (pty == null || arg == null) { return null; }
+        // a type parameter is not a class: the parameter's type parameter
+        // only lives in the declaring class' scope, so it must not resolve
+        // to a user class of the same name (the C host's SYM_PARAM rule)
+        if (IsErasedType(pty)) { return null; }
+        Node pd = binder.FindType(pty.sval);
+        if (pd == null || pd.kind != AK.ClassDecl()) { return null; }
+        int k = arg.kind;
+        if (k == AK.NewExpr() || k == AK.NullLit() || k == AK.OutArg()
+                || k == AK.ThisExpr() || k == AK.BaseExpr() || k == AK.Lambda()) { return null; }
+        Node st = ArgTypeNode(arg);
+        if (st == null) { return null; }
+        string sn = st.sval;
+        if (sn == null || sn == pty.sval) { return null; }
+        if (!CtorSrcTy(sn)) { return null; }
+        Node tr = new Node(AK.TypeRef());
+        tr.sval = pty.sval;
+        tr.op = pty.op;
+        tr.ival = pty.ival;
+        tr.sval2 = pty.sval2;
+        tr.arrRanks = pty.arrRanks;
+        tr.line = pty.line; tr.col = pty.col;
+        tr.a = pty.a;
+        int i = 0;
+        while (i < pty.kids.Count) { tr.Add(pty.kids[i]); i = i + 1; }
+        Node ne = new Node(AK.NewExpr());
+        ne.type = tr;
+        ne.line = arg.line; ne.col = arg.col;
+        ne.Add(arg);
+        if (ResolveCtor(pd, ne) == null) {
+            diags.Error("cannot convert '" + sn + "' to '" + pty.sval
+                + "' in argument: no matching constructor", arg.line, arg.col);
+            return null;
+        }
+        return ne;
+    }
+
+    // evaluate a call argument, first pushing a delegate parameter's
+    // signature onto a bare lambda argument
+    ExprVal GenArgExpr(Node a, Node pty) {
+        if (a != null && a.kind == AK.Lambda() && pty != null && IsDelegate(pty)) {
+            AnnotateLambda(a, pty);
+        }
+        // a scalar argument for a class parameter becomes `new Target(arg)`
+        Node w = WrapImplicitCtorArg(pty, a);
+        if (w != null) { return GenExpr(w); }
+        return GenExpr(a);
+    }
+
+    // build a call argument for a (possibly erased) parameter type.
+    //
+    // `rawStr` skips the byte[] -> managed string packing: an EXTERN
+    // (DllImport) callee is C code that wants the raw buffer, and the C host
+    // hands it the array's own pointer (src/compiler/irgen_arc.c:
+    // coerce_args_to_params only bitcasts the pointer types -- it never
+    // copies). Packing instead would give the C side a throwaway copy:
+    // `sqlite3_open(filename, ppDb)` would write the connection handle into
+    // that copy's payload (over the string header) and the program's buffer
+    // would stay empty -- and the copy's header would be corrupted.
+    string CallArg(ExprVal av, Node pty, bool rawStr) {
+        // a user-defined implicit conversion applies to the argument
+        av = ApplyUserConv(pty, av, false);
+        // a struct parameter is a value: the callee gets its own copy
+        if (NeedsStructCopy(pty, av)) { av = StructCopyTemp(av, pty); }
+        if (IsErasedType(pty)) { return ToSlot(av, av.ty); }
+        ExprVal src = av;
+        if (!rawStr) { src = StrSlotConv(pty, av); }
+        src = NarrowToDeclared(src, pty);
+        return Coerce(src, MapType(pty));
+    }
+
+    int IndexOfStr(List<string> xs, string s) {
+        int i = 0;
+        while (i < xs.Count) { if (xs[i] == s) { return i; } i = i + 1; }
+        return -1;
+    }
+
+    // Reorder a call's arguments to positional order, applying named-argument
+    // placement and filling omitted trailing parameters with their defaults.
+    // When there are no named args and every parameter is supplied, the call's
+    // own argument list is returned unchanged (keeps existing IR byte-identical).
+    List<Node> OrderArgs(Node m, Node e) {
+        if (m == null) { return e.kids; }
+        List<string> pnames = new List<string>();
+        List<Node> pdefault = new List<Node>();
+        int i = 0;
+        while (i < m.kids.Count) {
+            if (m.kids[i].kind == AK.Param()) { pnames.Add(m.kids[i].sval); pdefault.Add(m.kids[i].b); }
+            i = i + 1;
+        }
+        int np = pnames.Count;
+        // `params T[] rest` tail: bundle extra positional args into a real
+        // array (`new T[]{...}`, gen0 semantics). A single trailing argument
+        // that is already the array bundle passes through unpacked.
+        Node lastParam = null;
+        i = m.kids.Count - 1;
+        while (i >= 0) {
+            if (m.kids[i].kind == AK.Param()) { lastParam = m.kids[i]; break; }
+            i = i - 1;
+        }
+        if (lastParam != null && lastParam.op == 1 && np > 0) {
+            bool named0 = false;
+            int q = 0;
+            while (q < e.kids.Count) { if (e.kids[q].argName != "") { named0 = true; } q = q + 1; }
+            if (!named0 && e.kids.Count >= np - 1) {
+                bool passthrough = false;
+                if (e.kids.Count == np) {
+                    Node la = e.kids[np - 1];
+                    if (la.kind == AK.NewExpr() && la.ival == 1) { passthrough = true; }
+                    if (la.kind == AK.Ident()) {
+                        int li = LocalIdx(la.sval);
+                        if (li >= 0 && locType[li] != null && locType[li].ival >= 1) { passthrough = true; }
+                    }
+                }
+                if (!passthrough) {
+                    Node packed = new Node(AK.NewExpr());
+                    packed.ival = 1;
+                    packed.type = lastParam.type;
+                    packed.line = e.line; packed.col = e.col;
+                    int w = np - 1;
+                    while (w < e.kids.Count) { packed.Add(e.kids[w]); w = w + 1; }
+                    List<Node> outk = new List<Node>();
+                    w = 0;
+                    while (w < np - 1) { outk.Add(e.kids[w]); w = w + 1; }
+                    outk.Add(packed);
+                    return outk;
+                }
+            }
+        }
+        if (e.kids.Count > np) {
+            diags.Error("too many arguments to '" + m.sval + "' (expected "
+                + np + ", got " + e.kids.Count + ")", e.line, e.col);
+        }
+        bool anyNamed = false;
+        int j = 0;
+        while (j < e.kids.Count) { if (e.kids[j].argName != "") { anyNamed = true; } j = j + 1; }
+        if (!anyNamed && e.kids.Count >= np) { return e.kids; }
+        List<Node> slots = new List<Node>();
+        int s = 0; while (s < np) { slots.Add(null); s = s + 1; }
+        int pos = 0;
+        j = 0;
+        while (j < e.kids.Count) {
+            Node arg = e.kids[j];
+            if (arg.argName != "") {
+                int idx = IndexOfStr(pnames, arg.argName);
+                if (idx >= 0 && idx < np) { slots[idx] = arg; }
+            } else {
+                if (pos < np) { slots[pos] = arg; }
+                pos = pos + 1;
+            }
+            j = j + 1;
+        }
+        int k = 0;
+        while (k < np) {
+            if (slots[k] == null) {
+                if (pdefault[k] != null) { slots[k] = pdefault[k]; }
+                else {
+                    diags.Error("missing required argument for parameter '"
+                        + pnames[k] + "' of '" + m.sval + "'", e.line, e.col);
+                    Node z = new Node(AK.IntLit()); z.ival = 0; slots[k] = z;
+                }
+            }
+            k = k + 1;
+        }
+        return slots;
+    }
+
+    ExprVal EmitStaticCall(string clsName, string name, Node e) {
+        Node cls = binder.FindType(clsName);
+        Node m = ResolveMethod(cls, name, e, true);
+        string sym = clsName + "_" + name;
+        if (m != null) { sym = MethodSym(DeclOwnerOf(cls, m), m); }
+        bool spec = false;
+        List<string> stns = new List<string>();
+        List<Node> strs = new List<Node>();
+        // CLASS-level monomorphization: a static method of a generic class,
+        // called on a concrete instantiation (`Stat<int>.Bump()`), gets a
+        // specialized body -- the class's type parameters are bound to that
+        // instantiation, so `Stat<T>.s` inside it names the instantiation's
+        // OWN static storage (the C host mangles the static names per
+        // instantiation).
+        List<Node> ctypes = new List<Node>();
+        bool clsSpec = false;
+        if (m != null && CanSpecialize(m)) {
+            List<string> mtps = TParams(m);
+            List<string> ctps = TParams(cls);
+            // the callee carries the explicit instantiation (`Stat<int>.Bump()`)
+            List<Node> iargs = null;
+            if (e != null && e.a != null && e.a.kind == AK.MemberAccess()) {
+                iargs = ConcreteInstArgs(e.a, clsName);
+            }
+            // only a method declared by the generic class ITSELF: an
+            // inherited one lives in a base class that has no type parameters
+            if (ctps.Count > 0 && DeclOwnerOf(cls, m) == clsName && iargs != null) {
+                int ci = 0;
+                while (ci < ctps.Count) {
+                    stns.Add(ctps[ci]); strs.Add(iargs[ci]); ctypes.Add(iargs[ci]);
+                    ci = ci + 1;
+                }
+                clsSpec = true;
+            }
+            if (mtps.Count > 0) {
+                // the explicit type arguments win over the inferred ones
+                if (!BindTypeArgs(m, e, mtps, stns, strs)) {
+                    BindFromArgs(m, e, 0, mtps, stns, strs);
+                }
+            }
+            if (clsSpec || mtps.Count > 0) {
+                string tag = SpecTagC(m, ctypes, mtps, stns, strs, clsSpec ? "I" : "");
+                if (tag != "") {
+                    // a static clone has no receiver: the instantiation rides
+                    // along as the clone's receiver type, so the static fields
+                    // it touches resolve to that instantiation's storage
+                    Node ity = null;
+                    if (clsSpec) { ity = InstType(clsName, iargs); }
+                    sym = SpecQueueTy(clsName, m, stns, strs, tag, ity);
+                    spec = true;
+                }
+            }
+        }
+        string declCls = clsName;
+        if (m != null) { declCls = DeclOwnerOf(cls, m); }
+        string rt = "i64";
+        if (m != null) { rt = MapTypeDecl(m.type, declCls); }
+        if (spec) { rt = MapTypeDecl(SubstTP(m.type, stns, strs), declCls); }
+        bool isAsyncCall = (m != null && IsAsync(m));
+        if (isAsyncCall) { rt = "i8*"; }
+        string args = "";
+        List<Node> aargs = OrderArgs(m, e);
+        bool freeArgIsStr = false;
+        int i = 0;
+        while (i < aargs.Count) {
+            Node pty = MkType("int"); if (m != null) { pty = ParamTypeNode(m, i); }
+            if (spec) { pty = SubstTP(pty, stns, strs); }
+            if (m != null && IsRefParam(m, i) && aargs[i] != null
+                && aargs[i].kind == AK.OutArg()) {
+                if (i > 0) { args = args + ", "; }
+                string addr;
+                if (aargs[i].type != null) { addr = NewOutLocal(aargs[i]); }
+                else { addr = RefPlacePtr(aargs[i].a, pty); }
+                args = args + MapTypeDecl(pty, declCls) + "* " + addr;
+                i = i + 1;
+                continue;
+            }
+            ExprVal av = GenArgExpr(aargs[i], pty);
+            if (i == 0 && IsStr(av.ty)) { freeArgIsStr = true; }
+            if (i > 0) { args = args + ", "; }
+            if (m != null && HasMod(m, MOD.Extern()) && IsDelegate(pty)) {
+                // The C host hands the delegate VALUE to the C side (the
+                // argument is passed as the pointer it is -- irgen_call.c).
+                // For a static method group that value IS the function
+                // pointer, so the C side calls it with the C signature: that
+                // is what makes a Zan delegate usable as a native callback.
+                args = args + "i8* " + av.op;
+            } else {
+                // an extern (DllImport) callee is C code: it gets the raw
+                // buffer, not a packed copy of it (see CallArg)
+                bool rawArg = m != null && HasMod(m, MOD.Extern());
+                args = args + MapTypeDecl(pty, declCls) + " " + CallArg(av, pty, rawArg);
+            }
+            i = i + 1;
+        }
+        if (rt == "void") {
+            L("  call void @" + sym + "(" + args + ")");
+            // C `free(s)` consumes the string: null out the freed lvalue so
+            // ARC never touches the dangling pointer again
+            if (m != null && HasMod(m, MOD.Extern()) && ExternName(m) == "free"
+                && aargs.Count == 1 && aargs[0] != null && freeArgIsStr
+                && (aargs[0].kind == AK.Ident() || aargs[0].kind == AK.MemberAccess())) {
+                StoreTo(aargs[0], new ExprVal("null", MkType("string")));
+            }
+            return new ExprVal("0", MkType("void"));
+        }
+        string t = NT();
+        L("  " + t + " = call " + rt + " @" + sym + "(" + args + ")");
+        if (m != null && HasMod(m, MOD.Extern()) && IsStr(m.type)) {
+            // an extern hands back a plain C string: wrap it into the managed
+            // layout so its length is exact
+            t = WrapManaged(t);
+        }
+        if (m != null && HasMod(m, MOD.Extern()) && IsDelegate(m.type)) {
+            // extern C returns a bare fn pointer: rewrap as a {fn, env} closure
+            string clo = NT();
+            L("  " + clo + " = call i8* @malloc(i64 16)");
+            string clop = NT();
+            L("  " + clop + " = bitcast i8* " + clo + " to i8**");
+            L("  store i8* " + t + ", i8** " + clop);
+            string clop1 = NT();
+            L("  " + clop1 + " = getelementptr i8*, i8** " + clop + ", i64 1");
+            L("  store i8* null, i8** " + clop1);
+            string isn = NT();
+            L("  " + isn + " = icmp eq i8* " + t + ", null");
+            string res = NT();
+            L("  " + res + " = select i1 " + isn + ", i8* null, i8* " + TagClosure(clo));
+            return new ExprVal(res, m.type);
+        }
+        // an async call hands back the coroutine FRAME; the awaited value's
+        // type is the method's RETURN type -- substituted when the call
+        // specialized the method (`await s.Echo<int>(42)` awaits an int, not
+        // the erased type parameter)
+        if (isAsyncCall) {
+            Node tt = MkType("__task");
+            tt.a = m.type;
+            if (spec) { tt.a = SubstTP(m.type, stns, strs); }
+            return AsyncFrame(t, tt);
+        }
+        if (spec) {
+            Node srt = SubstTP(m.type, stns, strs);
+            AddTemp(t, srt);
+            return new ExprVal(t, srt);
+        }
+        if (m != null && IsErasedType(m.type)) { return FromSlot(t, m.type); }
+        Node retTy = MkType("int"); if (m != null) { retTy = m.type; }
+        AddTemp(t, retTy);
+        return new ExprVal(t, retTy);
+    }
+
+    // choose the extension overload matching the call's arg count, preferring
+    // receivers whose concrete type arguments match over generic wildcards
+    int PickExtension(List<Node> ms, Node recvTy, Node e) {
+        int best = 0; int bestScore = -1;
+        int i = 0;
+        while (i < ms.Count) {
+            Node m = ms[i];
+            int np = 0;
+            int k = 0;
+            while (k < m.kids.Count) { if (m.kids[k].kind == AK.Param()) { np = np + 1; } k = k + 1; }
+            int score = 0;
+            if (np - 1 == e.kids.Count) { score = 100; }
+            score = score + MatchTypeScore(ParamTypeNode(m, 0), recvTy, TParams(m));
+            score = score + LambdaArgScore(m, recvTy, e);
+            if (score > bestScore) { bestScore = score; best = i; }
+            i = i + 1;
+        }
+        return best;
+    }
+
+    // the result type of a block-bodied lambda: the type of the value its
+    // `return` carries (the C host's stmt_lambda_return_type -- every
+    // return has to agree, the first one decides)
+    Node LambdaBlockRetType(Node block) {
+        if (block == null) { return null; }
+        List<Node> rets = new List<Node>();
+        List<int> mixed = new List<int>();
+        mixed.Add(0);
+        int mark = locName.Count;
+        CollectLambdaReturns(block, rets, mixed);
+        while (locName.Count > mark) {
+            locName.RemoveAt(locName.Count - 1);
+            locType.RemoveAt(locType.Count - 1);
+            locReg.RemoveAt(locReg.Count - 1);
+            if (locRef.Count > mark) { locRef.RemoveAt(locRef.Count - 1); }
+        }
+        if (mixed[0] != 0) { return null; }
+        if (rets.Count == 0) { return null; }
+        Node first = rets[0];
+        int i = 1;
+        while (i < rets.Count) {
+            if (TypeTag(rets[i]) != TypeTag(first)) { return null; }
+            i = i + 1;
+        }
+        return first;
+    }
+
+    // walk a lambda body collecting the types its `return`s carry; `mixed`
+    // is set when the C host gives up too (a bare `return;`, a type it
+    // cannot infer, or a loop/switch/try body)
+    void CollectLambdaReturns(Node s, List<Node> rets, List<int> mixed) {
+        if (s == null || mixed[0] != 0) { return; }
+        int k = s.kind;
+        if (k == AK.ReturnStmt()) {
+            if (s.a == null) { mixed[0] = 1; return; }
+            Node t = ArgTypeNode(s.a);
+            if (t == null) { mixed[0] = 1; return; }
+            rets.Add(t);
+            return;
+        }
+        if (k == AK.Block()) {
+            int i = 0;
+            while (i < s.kids.Count) {
+                CollectLambdaReturns(s.kids[i], rets, mixed);
+                i = i + 1;
+            }
+            return;
+        }
+        if (k == AK.IfStmt()) {
+            CollectLambdaReturns(s.b, rets, mixed);
+            CollectLambdaReturns(s.c, rets, mixed);
+            return;
+        }
+        if (k == AK.VarDecl()) {
+            // `var x = e;` puts x in scope for the returns that follow
+            if (s.b != null) {
+                Node t = ArgTypeNode(s.b);
+                if (t != null) {
+                    locName.Add(s.sval); locType.Add(t); locReg.Add("");
+                    locBox.Add(false); locIter.Add(false); locCell.Add(""); locRef.Add(false);
+                }
+            }
+            return;
+        }
+        if (k == AK.WhileStmt() || k == AK.DoWhileStmt() || k == AK.ForStmt()
+            || k == AK.ForeachStmt() || k == AK.SwitchStmt() || k == AK.TryStmt()) {
+            mixed[0] = 1;
+            return;
+        }
+    }
+
+    // score an extension candidate's lambda arguments: bind the method type
+    // parameters from the receiver, then compare each lambda's inferred
+    // result type against the delegate's return type so same-name overloads
+    // differing only in key type resolve correctly (a block-bodied lambda
+    // counts too -- the C host scores it the same way)
+    int LambdaArgScore(Node m, Node recvTy, Node e) {
+        List<string> mtps = TParams(m);
+        List<string> tns = new List<string>();
+        List<Node> trs = new List<Node>();
+        UnifyTP(ParamTypeNode(m, 0), recvTy, mtps, tns, trs);
+        int score = 0;
+        int k = 0;
+        while (k < e.kids.Count) {
+            Node arg = e.kids[k];
+            if (arg != null && arg.kind == AK.Lambda()) {
+                Node pty = SubstTP(ParamTypeNode(m, k + 1), tns, trs);
+                Node dd = null;
+                if (pty != null) { dd = binder.FindDelegate(pty.sval); }
+                if (dd != null) {
+                    List<string> dtn = TParams(dd);
+                    Node drt = SubstTP(dd.type, dtn, DelegTArgs(dd, pty, dtn));
+                    if (drt != null && !MentionsTypeParam(drt)) {
+                        List<Node> dps = DelegParams(pty);
+                        int mark = locName.Count;
+                        int pi = 0; int j = 0;
+                        while (j < arg.kids.Count) {
+                            if (arg.kids[j].kind == AK.Param()) {
+                                Node pt2 = null;
+                                if (pi < dps.Count) { pt2 = dps[pi]; }
+                                locName.Add(arg.kids[j].sval); locType.Add(pt2); locReg.Add("");
+                                locBox.Add(false); locIter.Add(false); locCell.Add(""); locRef.Add(false);
+                                pi = pi + 1;
+                            }
+                            j = j + 1;
+                        }
+                        Node lrt = null;
+                        if (arg.d == null) { lrt = ArgTypeNode(arg.a); }
+                        else { lrt = LambdaBlockRetType(arg.d); }
+                        while (locName.Count > mark) {
+                            locName.RemoveAt(locName.Count - 1);
+                            locType.RemoveAt(locType.Count - 1);
+                            locReg.RemoveAt(locReg.Count - 1);
+                            if (locRef.Count > mark) { locRef.RemoveAt(locRef.Count - 1); }
+                        }
+                        if (lrt != null) {
+                            // the C host scores a lambda argument a flat
+                            // base and adds a bonus only when the body's
+                            // type equals the delegate's return type -- a
+                            // mismatch is NOT penalised, so a candidate
+                            // whose body type is unknown still ties with
+                            // a mismatching one (declaration order wins)
+                            if (TypeTag(lrt) == TypeTag(drt)) { score = score + 8; }
+                        }
+                    }
+                }
+            }
+            k = k + 1;
+        }
+        return score;
+    }
+
+    // deep receiver-shape match: concrete equality scores above a
+    // type-parameter wildcard; a mismatch scores zero
+    int MatchTypeScore(Node shape, Node conc, List<string> mtps) {
+        if (shape == null || conc == null) { return 0; }
+        if (IndexOfStr(mtps, shape.sval) >= 0 && shape.kids.Count == 0) { return 1; }
+        if (shape.sval != conc.sval) { return 0; }
+        int s = 2;
+        int i = 0;
+        while (i < shape.kids.Count && i < conc.kids.Count) {
+            s = s + MatchTypeScore(shape.kids[i], conc.kids[i], mtps);
+            i = i + 1;
+        }
+        return s;
+    }
+
+    // bind a generic shape (e.g. List<T>) against a concrete type
+    // (List<User>), recording each method type-parameter binding found
+    void UnifyTP(Node shape, Node conc, List<string> mtps, List<string> names, List<Node> reps) {
+        if (shape == null || conc == null) { return; }
+        if (IndexOfStr(mtps, shape.sval) >= 0 && shape.kids.Count == 0) {
+            if (IndexOfStr(names, shape.sval) < 0) { names.Add(shape.sval); reps.Add(conc); }
+            return;
+        }
+        int i = 0;
+        while (i < shape.kids.Count && i < conc.kids.Count) {
+            UnifyTP(shape.kids[i], conc.kids[i], mtps, names, reps);
+            i = i + 1;
+        }
+    }
+
+    // A deep copy of a type node. A substitution must never hand back the
+    // ORIGINAL AST node: the concrete type argument is shared with the call
+    // site, and stamping the array rank onto it (the array branch of
+    // `SubstTP`) turned every `int` in the program into an array type --
+    // the program then compared pointers as integers and the IR stopped
+    // verifying.
+    Node CopyType(Node t) {
+        if (t == null) { return null; }
+        Node n = new Node(t.kind);
+        n.sval = t.sval; n.op = t.op; n.ival = t.ival; n.sval2 = t.sval2;
+        n.arrRanks = t.arrRanks;
+        n.mods = t.mods; n.line = t.line; n.col = t.col;
+        int i = 0;
+        while (i < t.kids.Count) { n.Add(CopyType(t.kids[i])); i = i + 1; }
+        return n;
+    }
+
+    Node SubstTP(Node t, List<string> names, List<Node> reps) {
+        if (t == null) { return null; }
+        if (t.ival >= 1) {
+            // an array type keeps its RANK: `T[]` must stay an array after
+            // the substitution (the element type substitutes, the levels do
+            // not) -- dropping the rank turned `T[]` into a bare element.
+            Node el = new Node(AK.TypeRef());
+            el.sval = t.sval;
+            Node se = SubstTP(el, names, reps);
+            if (se == null) { return t; }
+            se.ival = t.ival;
+            se.sval2 = t.sval2;
+            se.arrRanks = t.arrRanks;
+            se.op = t.op;
+            se.line = t.line; se.col = t.col; se.mods = t.mods;
+            return se;
+        }
+        if (t.kids.Count == 0) {
+            int hit = IndexOfStr(names, t.sval);
+            // a COPY, not the original node: the substitution writes the
+            // array rank onto its result, and the original belongs to the
+            // caller's AST
+            if (hit >= 0) { return CopyType(reps[hit]); }
+            return t;
+        }
+        Node n = new Node(t.kind);
+        n.sval = t.sval; n.op = t.op; n.ival = t.ival; n.sval2 = t.sval2;
+        n.arrRanks = t.arrRanks;
+        int i = 0;
+        while (i < t.kids.Count) { n.Add(SubstTP(t.kids[i], names, reps)); i = i + 1; }
+        return n;
+    }
+
+    // The type parameter node named `name` declared by `owner` (a class or a
+    // method declaration)
+    Node FindTypeParamNode(Node owner, string name) {
+        if (owner == null) { return null; }
+        int i = 0;
+        while (i < owner.kids.Count) {
+            Node k = owner.kids[i];
+            if (k.kind == AK.TypeParam() && k.sval == name) { return k; }
+            i = i + 1;
+        }
+        return null;
+    }
+
+    // The constraint of a type parameter, looked up in the CURRENT scope: the
+    // method's own type parameters shadow the class's. Returns null when the
+    // parameter is unconstrained (or is not a parameter of this scope at all).
+    Node TypeParamConstraint(string name) {
+        Node c = FindTypeParamNode(curMethodNode, name);
+        if (c != null) { return c.b; }
+        Node cls = binder.FindType(curClass);
+        if (cls != null) {
+            c = FindTypeParamNode(cls, name);
+            if (c != null) { return c.b; }
+        }
+        return null;
+    }
+
+    // The concrete type of a member whose declared type mentions the
+    // enclosing class's type parameters: `Box<double>.values` is
+    // `List<double>`, not `List<T>`. The self-hosted backend erases the
+    // type parameters, but the RECEIVER's static type still carries the
+    // concrete arguments -- use them so the value keeps its real type (the
+    // element of a `List<double>` is a double, not an opaque slot).
+    Node SubstRecvTy(Node fty, Node recvTy) {
+        if (fty == null || recvTy == null) { return fty; }
+        Node cls = binder.FindType(recvTy.sval);
+        if (cls == null) { return fty; }
+        List<string> tps = TParams(cls);
+        if (tps.Count == 0 || recvTy.kids.Count == 0) { return fty; }
+        return SubstTP(fty, tps, recvTy.kids);
+    }
+
+}

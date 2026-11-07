@@ -1,0 +1,877 @@
+using System;
+using System.Collections.Generic;
+namespace Zan;
+
+partial class Ngen {
+    // ---- x0 = char -> x0 = value 0..15, or -1 when not a hex digit
+    // (frameless leaf: only x0 is touched, every return is a bare ret).
+    // Unlike _zan_ext_nibble this distinguishes invalid from '0'.
+    void HostEmitHexVal() {
+        syms.Add(new Sym("_zan_ext_hexval", FnPad()));
+        int hBad = NL(); int hLet = NL(); int hUp = NL();
+        ExtCmpImm(0, 57);
+        EmitBcond(12, hLet);
+        ExtCmpImm(0, 48);
+        EmitBcond(11, hBad);
+        AddImm(0, 0, -48);
+        LeafRetV0();
+        Mark(hLet);
+        ExtCmpImm(0, 102);
+        EmitBcond(12, hBad);
+        ExtCmpImm(0, 97);
+        EmitBcond(11, hUp);
+        AddImm(0, 0, -87);
+        LeafRetV0();
+        Mark(hUp);
+        ExtCmpImm(0, 70);
+        EmitBcond(12, hBad);
+        ExtCmpImm(0, 65);
+        EmitBcond(11, hBad);
+        AddImm(0, 0, -55);
+        LeafRetV0();
+        Mark(hBad);
+        LoadImm(0, -1);
+        LeafRetV0();
+    }
+
+    // x0 = bytes, x1 = offset, x2 = count -> validated UTF-8 string. Invalid
+    // leads / lone continuations / overlong encodings / window-truncated
+    // tails each become U+FFFD (EF BF BD), matching the stdlib Zan.
+    // Loop state lives in registers (no calls in the body):
+    // x9 arr, x10 alen, x11 avail, x12 end, x13 i, x14 base, x15 cursor.
+    void HostEmitUtf8() {
+        HostEmitHexVal();
+        HostBegin("_zan_ext_utf8_getstring3");
+        HostSave(0, 0); HostSave(1, 1); HostSave(2, 2);
+        int uHave = NL(); int uFin = NL(); int uLoop = NL(); int uMulti = NL();
+        int uRet = NL();
+        int uHaveNeed = NL(); int uFfd = NL(); int uOk = NL();
+        int gA = NL(); int lA = NL(); int lB = NL(); int lC = NL();
+        int kDone = NL(); int kLoop = NL(); int kBad = NL();
+        int m1 = NL(); int m2 = NL();
+        int rDone = NL(); int rLoop = NL();
+        HostLoad(0, 0);
+        CbzReg(0, uHave);
+        // clamps
+        ExtCountOf(0, 10);                     // alen
+        HostLoad(0, 1);                        // offset
+        ExtCmpImm(0, 0);
+        int uOp = NL(); EmitBcond(10, uOp); LoadImm(0, 0); Mark(uOp);
+        HostCmp(0, 10);                        // cmp x0, x10
+        int uOo = NL(); EmitBcond(9, uOo); ExtMov(0, 10); Mark(uOo);
+        ExtSubRR(11, 10, 0);                   // avail
+        HostLoad(1, 2);                        // count
+        ExtCmpImm(1, 0);
+        int uCp = NL(); EmitBcond(10, uCp); LoadImm(1, 0); Mark(uCp);
+        HostCmp(1, 11);                        // cmp x1, x11
+        int uCo = NL(); EmitBcond(9, uCo); ExtMov(1, 11); Mark(uCo);
+        HostSave(1, 2);                        // clamped count (x1 dies in malloc)
+        // out = malloc(3 * count + 1): every input byte at worst becomes 3
+        ExtLsl(0, 1, 1);
+        AddRR(0, 0, 1);
+        AddImm(0, 0, 1);
+        BLExtern("_malloc");
+        HostNonzero(0, "ext.utf8.malloc");
+        MovRR(15, 0);                          // cursor
+        MovRR(14, 0);                          // base
+        HostLoad(9, 0);                        // arr data
+        HostLoad(13, 1);                       // i = offset (post-call)
+        HostLoad(1, 2);                        // count (clamped, post-call)
+        AddRR(12, 13, 1);                      // end = i + count
+        EmitB(uLoop);
+        Mark(uHave);
+        LoadStr(extEmpty, 0);
+        EmitB(uRet);
+        Mark(uLoop);
+        HostCmp(13, 12);
+        EmitBcond(2, uFin);                    // i >= end -> done
+        ExtLsl(16, 13, 3);                     // byte[] slots stride 8
+        ExtLdrbReg(0, 9, 16);                  // b0
+        ExtCmpImm(0, 128);
+        EmitBcond(2, uMulti);                  // hs -> multibyte
+        ExtStrbImm(0, 15, 0);                  // ascii: copy one byte
+        AddImm(15, 15, 1);
+        AddImm(13, 13, 1);
+        EmitB(uLoop);
+        Mark(uMulti);
+        LoadImm(1, 0);                         // need = 0
+        ExtCmpImm(0, 194);
+        EmitBcond(2, gA);                      // >= 194
+        EmitB(uFfd);
+        Mark(gA);
+        ExtCmpImm(0, 223);
+        EmitBcond(9, lA);                      // <= 223 -> need 1
+        ExtCmpImm(0, 239);
+        EmitBcond(9, lB);                      // <= 239 -> need 2
+        ExtCmpImm(0, 244);
+        EmitBcond(9, lC);                      // <= 244 -> need 3
+        EmitB(uFfd);                           // invalid lead
+        Mark(lA);
+        ExtUbfmLo(2, 0, 4);                    // cp = b0 & 31
+        LoadImm(1, 1);
+        EmitB(uHaveNeed);
+        Mark(lB);
+        ExtUbfmLo(2, 0, 3);                    // cp = b0 & 15
+        LoadImm(1, 2);
+        EmitB(uHaveNeed);
+        Mark(lC);
+        ExtUbfmLo(2, 0, 2);                    // cp = b0 & 7
+        LoadImm(1, 3);
+        Mark(uHaveNeed);
+        // window truncation: i + need >= end -> FFFD
+        AddRR(3, 13, 1);                       // add x3, x13, x1
+        HostCmp(3, 12);
+        EmitBcond(2, uFfd);
+        // continuation loop: k = 1 (x3), bad = x4
+        LoadImm(3, 1);
+        LoadImm(4, 0);
+        Mark(kLoop);
+        HostCmp(3, 1);                         // cmp x3, x1 (k, need)
+        EmitBcond(8, kDone);                   // k > need -> done
+        ExtLsl(16, 13, 3);                     // slot stride: src[i + k]
+        ExtLsl(5, 3, 3);                       // k*8 进 v5:16+17 双暂存加法在 x86
+        AddRR(5, 16, 5);                       // 无第三累加器(x86 addRR 撞车),改等价形
+        // x5 = (i + k) * 8
+        ExtLdrbReg(5, 9, 5);                   // bx
+        // continuation bytes are exactly 128..191
+        ExtCmpImm(5, 128);
+        EmitBcond(3, kBad);
+        ExtCmpImm(5, 191);
+        EmitBcond(8, kBad);
+        ExtLsl(2, 2, 6);                       // cp = (cp << 6) | (bx & 63)
+        ExtUbfmLo(5, 5, 5);
+        ExtOrr(2, 2, 5);
+        AddImm(3, 3, 1);
+        EmitB(kLoop);
+        Mark(kBad);
+        LoadImm(4, 1);
+        Mark(kDone);
+        CbnzReg(4, uFfd);                      // bad continuation -> FFFD
+        // overlong: min = 128 / 2048 / 65536 by need
+        ExtCmpImm(1, 1);
+        EmitBcond(0, m1);
+        ExtCmpImm(1, 2);
+        EmitBcond(0, m2);
+        ExtCmpImm(2, 65536);
+        EmitBcond(3, uFfd);
+        EmitB(uOk);
+        Mark(m1);
+        ExtCmpImm(2, 128);
+        EmitBcond(3, uFfd);
+        EmitB(uOk);
+        Mark(m2);
+        ExtCmpImm(2, 2048);
+        EmitBcond(3, uFfd);
+        Mark(uOk);
+        // append the raw sequence: need + 1 bytes from i
+        AddImm(6, 1, 1);                       // n = need + 1
+        ExtLsl(16, 13, 3);                     // src slot offset = i * 8
+        LoadImm(5, 0);                         // j
+        Mark(rLoop);
+        HostCmp(5, 6);
+        EmitBcond(2, rDone);                   // j >= n -> done
+        ExtLdrbReg(7, 9, 16);                  // src[i + j], stride 8
+        ExtStrbImm(7, 15, 0);
+        AddImm(15, 15, 1);
+        AddImm(16, 16, 8);
+        AddImm(5, 5, 1);
+        EmitB(rLoop);
+        Mark(rDone);
+        AddRR(13, 13, 6);                      // add x13, x13, x6 (i += need+1)
+        EmitB(uLoop);
+        Mark(uFfd);
+        LoadImm(7, 239);
+        ExtStrbImm(7, 15, 0);
+        AddImm(15, 15, 1);
+        LoadImm(7, 191);
+        ExtStrbImm(7, 15, 0);
+        AddImm(15, 15, 1);
+        LoadImm(7, 189);
+        ExtStrbImm(7, 15, 0);
+        AddImm(15, 15, 1);
+        AddImm(13, 13, 1);
+        EmitB(uLoop);
+        Mark(uFin);
+        ExtStrbImm(31, 15, 0);
+        ExtMov(0, 15);                         // cursor
+        ExtSubRR(1, 0, 14);                    // produced = cursor - base
+        ExtMov(0, 14);                         // base
+        ExtPush(0);
+        BLInternal("_zan_host_copy");
+        ExtPop(1);                             // base
+        HostSave(0, 5);                        // result
+        HostSave(1, 6);                        // base
+        HostLoad(0, 6);
+        BLExtern("_free");
+        HostLoad(0, 5);
+        Mark(uRet);
+        HostEnd();
+
+        // x0 = bytes -> GetString(bytes, 0, length); null -> ""
+        HostBegin("_zan_ext_utf8_getstring1");
+        int s1N = NL(); int s1Fin = NL();
+        HostSave(0, 0);
+        HostLoad(0, 0);
+        CbzReg(0, s1N);
+        ExtCountOf(0, 2);                      // count (x2)
+        LoadImm(1, 0);                         // offset (x1)
+        BLInternal("_zan_ext_utf8_getstring3");
+        EmitB(s1Fin);
+        Mark(s1N);
+        LoadStr(extEmpty, 0);
+        Mark(s1Fin);
+        HostEnd();
+    }
+
+    // x0 = string -> x0 = form-decoded string. Uses the string-header byte
+    // length, so decoded NUL bytes survive. Malformed escapes keep '%'.
+    // Loop registers: x9 s, x10 len, x11 cursor, x12 base, x13 i.
+    void HostEmitUrl() {
+        HostBegin("_zan_ext_urldecode");
+        HostSave(0, 0);
+        int dFin = NL(); int dLoop = NL();
+        int dPlus = NL(); int dPct = NL(); int dHave2 = NL(); int dBadEsc = NL();
+        HostLoad(9, 0);
+        ExtLenOf(9, 10);
+        HostLoad(0, 0);
+        AddImm(0, 10, 1);
+        BLExtern("_malloc");
+        HostNonzero(0, "ext.url.malloc");
+        MovRR(11, 0);                          // cursor
+        MovRR(12, 0);                          // base
+        HostLoad(9, 0);                        // s
+        LoadImm(13, 0);                        // i
+        HostLoad(0, 0);
+        ExtLenOf(0, 10);                       // len (reloaded post-call)
+        Mark(dLoop);
+        HostCmp(13, 10);
+        EmitBcond(2, dFin);
+        ExtLdrbReg(0, 9, 13);                  // c
+        ExtCmpImm(0, 43);
+        EmitBcond(0, dPlus);
+        ExtCmpImm(0, 37);
+        EmitBcond(0, dPct);
+        ExtStrbImm(0, 11, 0);                  // default: copy c
+        AddImm(11, 11, 1);
+        AddImm(13, 13, 1);
+        EmitB(dLoop);
+        Mark(dPlus);
+        LoadImm(0, 32);                        // '+' -> ' '
+        ExtStrbImm(0, 11, 0);
+        AddImm(11, 11, 1);
+        AddImm(13, 13, 1);
+        EmitB(dLoop);
+        Mark(dPct);
+        AddImm(0, 13, 2);
+        HostCmp(0, 10);
+        EmitBcond(3, dHave2);                  // i + 2 < len
+        EmitB(dBadEsc);
+        Mark(dHave2);
+        AddImm(0, 13, 1);
+        ExtLdrbReg(1, 9, 0);                   // c1
+        AddImm(0, 13, 2);
+        ExtLdrbReg(2, 9, 0);                   // c2
+        int dHO = NL(); int dLO = NL();
+        ExtMov(0, 1);
+        BLInternal("_zan_ext_hexval");
+        ExtMov(3, 0);                          // h
+        ExtMov(0, 2);
+        BLInternal("_zan_ext_hexval");
+        ExtMov(4, 0);                          // l
+        ExtCmpImm(3, 0);
+        EmitBcond(10, dHO);                    // h >= 0
+        EmitB(dBadEsc);
+        Mark(dHO);
+        ExtCmpImm(4, 0);
+        EmitBcond(10, dLO);                    // l >= 0
+        EmitB(dBadEsc);
+        Mark(dLO);
+        ExtLsl(3, 3, 4);
+        ExtOrr(3, 3, 4);
+        ExtStrbImm(3, 11, 0);
+        AddImm(11, 11, 1);
+        AddImm(13, 13, 3);
+        EmitB(dLoop);
+        Mark(dBadEsc);
+        LoadImm(0, 37);
+        ExtStrbImm(0, 11, 0);
+        AddImm(11, 11, 1);
+        AddImm(13, 13, 1);
+        EmitB(dLoop);
+        Mark(dFin);
+        ExtStrbImm(31, 11, 0);
+        ExtMov(0, 11);
+        ExtSubRR(1, 0, 12);                    // produced
+        ExtMov(0, 12);
+        ExtPush(0);
+        BLInternal("_zan_host_copy");
+        ExtPop(1);
+        HostSave(0, 5);
+        HostSave(1, 6);
+        HostLoad(0, 6);
+        BLExtern("_free");
+        HostLoad(0, 5);
+        HostEnd();
+
+        // x0 = string -> x0 = %XX-encoded string (RFC 3986 unreserved kept,
+        // space becomes '+', lowercase hex escapes). Loop registers:
+        // x9 s, x10 len, x11 cursor, x12 base, x13 i, x14 hex table.
+        HostBegin("_zan_ext_urlencode");
+        HostSave(0, 0);
+        int eFin = NL(); int eLoop = NL();
+        int eSp = NL(); int eUn = NL();
+        int eA1 = NL(); int eA2 = NL(); int eA3 = NL();
+        HostLoad(9, 0);
+        ExtLenOf(9, 10);
+        HostLoad(0, 0);
+        ExtLsl(0, 10, 1);                      // worst case: 3 bytes per input
+        AddRR(0, 0, 10);
+        AddImm(0, 0, 1);
+        BLExtern("_malloc");
+        HostNonzero(0, "ext.url.malloc");
+        MovRR(11, 0);                          // cursor
+        MovRR(12, 0);                          // base
+        HostLoad(9, 0);                        // s
+        LoadImm(13, 0);                        // i
+        LoadStr(extTblHex, 14);
+        HostLoad(0, 0);
+        ExtLenOf(0, 10);                       // len (reloaded post-call)
+        Mark(eLoop);
+        HostCmp(13, 10);
+        EmitBcond(2, eFin);
+        ExtLdrbReg(0, 9, 13);                  // c
+        ExtCmpImm(0, 65);
+        EmitBcond(11, eA1);                    // < 'A'
+        ExtCmpImm(0, 90);
+        EmitBcond(9, eUn);                     // <= 'Z'
+        Mark(eA1);
+        ExtCmpImm(0, 97);
+        EmitBcond(11, eA2);                    // < 'a'
+        ExtCmpImm(0, 122);
+        EmitBcond(9, eUn);                     // <= 'z'
+        Mark(eA2);
+        ExtCmpImm(0, 48);
+        EmitBcond(11, eA3);                    // < '0'
+        ExtCmpImm(0, 57);
+        EmitBcond(9, eUn);                     // <= '9'
+        Mark(eA3);
+        ExtCmpImm(0, 45);
+        EmitBcond(0, eUn);                     // '-'
+        ExtCmpImm(0, 95);
+        EmitBcond(0, eUn);                     // '_'
+        ExtCmpImm(0, 46);
+        EmitBcond(0, eUn);                     // '.'
+        ExtCmpImm(0, 126);
+        EmitBcond(0, eUn);                     // '~'
+        ExtCmpImm(0, 32);
+        EmitBcond(0, eSp);                     // ' '
+        LoadImm(1, 37);                        // '%'
+        ExtStrbImm(1, 11, 0);
+        AddImm(11, 11, 1);
+        ExtLsr(2, 0, 4);
+        ExtLdrbReg(1, 14, 2);                  // high nibble digit
+        ExtStrbImm(1, 11, 0);
+        AddImm(11, 11, 1);
+        ExtUbfmLo(2, 0, 3);
+        ExtLdrbReg(1, 14, 2);                  // low nibble digit
+        ExtStrbImm(1, 11, 0);
+        AddImm(11, 11, 1);
+        AddImm(13, 13, 1);
+        EmitB(eLoop);
+        Mark(eSp);
+        LoadImm(1, 43);                        // '+'
+        ExtStrbImm(1, 11, 0);
+        AddImm(11, 11, 1);
+        AddImm(13, 13, 1);
+        EmitB(eLoop);
+        Mark(eUn);
+        ExtStrbImm(0, 11, 0);
+        AddImm(11, 11, 1);
+        AddImm(13, 13, 1);
+        EmitB(eLoop);
+        Mark(eFin);
+        ExtStrbImm(31, 11, 0);
+        ExtMov(0, 11);
+        ExtSubRR(1, 0, 12);
+        ExtMov(0, 12);
+        ExtPush(0);
+        BLInternal("_zan_host_copy");
+        ExtPop(1);
+        HostSave(0, 5);
+        HostSave(1, 6);
+        HostLoad(0, 6);
+        BLExtern("_free");
+        HostLoad(0, 5);
+        HostEnd();
+    }
+
+    // x0 = Sec-WebSocket-Key -> base64(SHA1(key + "258EAFA5-...")) (RFC 6455).
+    void HostEmitWsAccept() {
+        HostBegin("_zan_ext_wsaccept");
+        HostSave(0, 0);
+        int wKd = NL(); int wKl = NL(); int wSd = NL(); int wSl = NL();
+        HostLoad(9, 0);
+        ExtLenOf(9, 10);                       // key length
+        HostLoad(0, 0);
+        AddImm(0, 10, 37);                     // key + 36 suffix + NUL
+        BLExtern("_malloc");
+        HostNonzero(0, "ext.ws.malloc");
+        MovRR(11, 0);                          // cursor
+        MovRR(12, 0);                          // base
+        HostLoad(9, 0);                        // key
+        LoadImm(13, 0);
+        HostLoad(0, 0);
+        ExtLenOf(0, 10);                       // key length (reloaded post-call)
+        Mark(wKl);
+        HostCmp(13, 10);
+        EmitBcond(2, wKd);
+        ExtLdrbReg(0, 9, 13);
+        ExtStrbImm(0, 11, 0);
+        AddImm(11, 11, 1);
+        AddImm(13, 13, 1);
+        EmitB(wKl);
+        Mark(wKd);
+        LoadStr(extWsGuid, 9);                 // suffix literal
+        LoadImm(13, 0);
+        Mark(wSl);
+        ExtCmpImm(13, 36);
+        EmitBcond(2, wSd);
+        ExtLdrbReg(0, 9, 13);
+        ExtStrbImm(0, 11, 0);
+        AddImm(11, 11, 1);
+        AddImm(13, 13, 1);
+        EmitB(wSl);
+        Mark(wSd);
+        ExtMov(0, 11);
+        ExtSubRR(0, 0, 12);                    // total bytes
+        BLInternal("_zan_ext_sha1");           // slot array, 20 bytes
+        LoadImm(1, 20);
+        LoadImm(2, 8);
+        BLInternal("_zan_ext_b64_encode");
+        HostEnd();
+    }
+
+    // Guid.New(): 16 random bytes, version nibble 4, RFC 4122 variant,
+    // formatted 8-4-4-4-12 lowercase hex.
+    void HostEmitGuid() {
+        HostBegin("_zan_ext_guid_new");
+        int gFin = NL(); int gLoop = NL(); int gDash = NL(); int gNoDash = NL();
+        LoadImm(0, 17);
+        BLExtern("_malloc");
+        HostNonzero(0, "ext.guid.malloc");
+        HostSave(0, 0);                        // buf (spilled: libc calls next)
+        MovRR(9, 0);
+        MovRR(0, 9);
+        LoadImm(1, 16);
+        BLExtern("_zan_urandom");
+        HostLoad(9, 0);                        // buf (reloaded post-call)
+        ExtLdrbImm(0, 9, 6);
+        ExtUbfmLo(0, 0, 3);                    // & 0x0F
+        LoadImm(1, 64);
+        ExtOrr(0, 0, 1);                       // | 0x40
+        ExtStrbImm(0, 9, 6);
+        ExtLdrbImm(0, 9, 8);
+        ExtUbfmLo(0, 0, 5);                    // & 0x3F
+        LoadImm(1, 128);
+        ExtOrr(0, 0, 1);                       // | 0x80
+        ExtStrbImm(0, 9, 8);
+        LoadImm(0, 37);
+        BLExtern("_malloc");
+        HostNonzero(0, "ext.guid.malloc");
+        MovRR(10, 0);                          // out cursor
+        HostSave(0, 1);                        // out base (cursor advances)
+        LoadImm(11, 0);                        // byte index
+        LoadStr(extTblHex, 12);
+        HostLoad(9, 0);                        // buf (reloaded post-call)
+        Mark(gLoop);
+        ExtCmpImm(11, 16);
+        EmitBcond(2, gFin);
+        ExtLdrbReg(0, 9, 11);                  // b
+        ExtLsr(1, 0, 4);
+        ExtLdrbReg(1, 12, 1);
+        ExtStrbImm(1, 10, 0);
+        AddImm(10, 10, 1);
+        ExtUbfmLo(1, 0, 3);
+        ExtLdrbReg(1, 12, 1);
+        ExtStrbImm(1, 10, 0);
+        AddImm(10, 10, 1);
+        ExtCmpImm(11, 3);
+        EmitBcond(0, gDash);
+        ExtCmpImm(11, 5);
+        EmitBcond(0, gDash);
+        ExtCmpImm(11, 7);
+        EmitBcond(0, gDash);
+        ExtCmpImm(11, 9);
+        EmitBcond(0, gDash);
+        EmitB(gNoDash);
+        Mark(gDash);
+        LoadImm(1, 45);
+        ExtStrbImm(1, 10, 0);
+        AddImm(10, 10, 1);
+        Mark(gNoDash);
+        AddImm(11, 11, 1);
+        EmitB(gLoop);
+        Mark(gFin);
+        ExtStrbImm(31, 10, 0);
+        LoadImm(1, 36);
+        HostLoad(0, 1);                        // out base
+        ExtPush(0);
+        BLInternal("_zan_host_copy");
+        ExtPop(1);                             // x1 = out base
+        HostSave(0, 5);                        // result
+        HostSave(1, 6);                        // out base
+        HostLoad(0, 0);                        // buf
+        BLExtern("_free");
+        HostLoad(0, 6);
+        BLExtern("_free");                     // out scratch
+        HostLoad(0, 5);
+        HostEnd();
+
+        // Guid.Parse(s): 36 chars, dashes at 8/13/18/23, hex elsewhere
+        // (either case); returns the lowercased canonical text as the
+        // Guid handle, or null.
+        HostBegin("_zan_ext_guid_parse");
+        HostSave(0, 0);
+        int pFin = NL(); int pOk = NL(); int pDone = NL();
+        int pLen = NL(); int pLoop = NL(); int pDash = NL();
+        int cFin = NL(); int cLoop = NL(); int cGeA = NL(); int cLeZ = NL();
+        HostLoad(9, 0);
+        ExtLenOf(9, 10);
+        ExtCmpImm(10, 36);
+        EmitBcond(0, pLen);
+        LoadImm(0, 0);
+        EmitB(pFin);
+        Mark(pLen);
+        HostLoad(9, 0);                        // s
+        LoadImm(11, 0);                        // i
+        Mark(pLoop);
+        ExtCmpImm(11, 36);
+        EmitBcond(2, pOk);
+        ExtCmpImm(11, 8);
+        EmitBcond(0, pDash);
+        ExtCmpImm(11, 13);
+        EmitBcond(0, pDash);
+        ExtCmpImm(11, 18);
+        EmitBcond(0, pDash);
+        ExtCmpImm(11, 23);
+        EmitBcond(0, pDash);
+        ExtLdrbReg(0, 9, 11);
+        BLInternal("_zan_ext_hexval");
+        ExtCmpImm(0, 0);
+        EmitBcond(11, pFin);                   // -1 -> reject
+        AddImm(11, 11, 1);
+        EmitB(pLoop);
+        Mark(pDash);
+        ExtLdrbReg(0, 9, 11);
+        ExtCmpImm(0, 45);
+        EmitBcond(11, pFin);                   // < '-' -> reject
+        EmitBcond(12, pFin);                   // > '-' -> reject
+        AddImm(11, 11, 1);
+        EmitB(pLoop);
+        Mark(pOk);
+        LoadImm(0, 37);
+        BLExtern("_malloc");
+        HostNonzero(0, "ext.guid.malloc");
+        MovRR(10, 0);                          // out cursor
+        HostSave(0, 1);                        // out base (cursor advances)
+        LoadImm(11, 0);                        // i
+        HostLoad(9, 0);                        // s reload
+        int cCopy = NL();
+        Mark(cLoop);
+        ExtCmpImm(11, 36);
+        EmitBcond(2, cFin);
+        ExtLdrbReg(0, 9, 11);
+        ExtCmpImm(0, 65);
+        EmitBcond(2, cGeA);                    // >= 'A'
+        EmitB(cCopy);                          // else copy as-is
+        Mark(cGeA);
+        ExtCmpImm(0, 90);
+        EmitBcond(9, cLeZ);                    // <= 'Z' -> lowercase
+        EmitB(cCopy);                          // else copy as-is
+        Mark(cLeZ);
+        AddImm(0, 0, 32);                      // + 32
+        Mark(cCopy);
+        ExtStrbImm(0, 10, 0);
+        AddImm(10, 10, 1);
+        AddImm(11, 11, 1);
+        EmitB(cLoop);
+        Mark(cFin);
+        ExtStrbImm(31, 10, 0);
+        LoadImm(1, 36);
+        HostLoad(0, 1);                        // out base
+        ExtPush(0);
+        BLInternal("_zan_host_copy");
+        ExtPop(1);                             // x1 = out base
+        HostSave(0, 5);                        // result
+        HostSave(1, 6);                        // out base
+        HostLoad(0, 6);
+        BLExtern("_free");                     // out scratch
+        HostLoad(0, 5);
+        EmitB(pDone);
+        Mark(pFin);
+        LoadImm(0, 0);
+        Mark(pDone);
+        HostEnd();
+    }
+
+    // x0 = count -> x0 = zero-filled array (8-byte slots). Negative counts
+    // behave as 0; callers keep counts <= 2^28 so the slot math cannot wrap.
+    void HostEmitArrNew() {
+        HostBegin("_zan_ext_arr_new");
+        ExtCmpImm(0, 0);
+        int nonneg = NL();
+        EmitBcond(10, nonneg);
+        LoadImm(0, 0);
+        Mark(nonneg);
+        ExtPush(0);                            // count (clamped)
+        ExtLsl(0, 0, 3);                       // bytes = count * 8
+        AddImm(0, 0, 32);
+        LoadImm(1, 1);
+        BLExtern("_calloc");
+        HostNonzero(0, "ext.arr.calloc");
+        MovRR(1, 0);                           // x1 = raw
+        LoadImm(2, 1);
+        StrU(2, 1, 0);                         // raw->rc = 1
+        LoadImm(2, 25404552263127619);
+        StrU(2, 1, 8);                         // raw->rcmagic
+        ExtPop(2);
+        StrU(2, 1, 16);                        // raw->count
+        LoadImm(2, 6503565379360670041);
+        StrU(2, 1, 24);                        // raw->magic2
+        AddImm(0, 1, 32);                      // arr
+        HostEnd();
+    }
+
+    // x0 = dst array, x1 = src buffer, x2 = count -> copies count bytes
+    // into the array in the packed layout Zan element reads use (ArrElemSize:
+    // byte[] elements are one byte).
+    void HostEmitSlotCopy() {
+        HostBegin("_zan_ext_slot_copy");
+        LoadImm(9, 0);                         // i
+        int done = NL(); int loop = NL();
+        Mark(loop);
+        HostCmp(9, 2);                         // cmp x9, x2
+        EmitBcond(2, done);                    // hs -> done
+        ExtLdrbReg(10, 1, 9);                  // w10 = src[i]
+        AddRR(11, 0, 9);                       // add x11, x0, x9
+        ExtStrbImm(10, 11, 0);                 // dst[i] = w10
+        AddImm(9, 9, 1);
+        EmitB(loop);
+        Mark(done);
+        HostEnd();
+    }
+
+    void HostEmitToBytes() {
+        HostBegin("_zan_ext_to_bytes");
+        HostSave(0, 0);                        // src
+        HostLoad(9, 0);
+        ExtLenOf(9, 9);
+        HostSave(9, 2);                        // len (x9 dies across the call)
+        ExtMov(0, 9);
+        BLInternal("_zan_ext_arr_new");
+        HostSave(0, 1);                        // arr
+        ExtMov(10, 0);                         // dst cursor (packed bytes)
+        HostLoad(11, 2);                       // remaining
+        HostLoad(12, 0);                       // src cursor
+        int tbDone = NL();
+        int tbLoop = NL();
+        Mark(tbLoop);
+        CbzReg(11, tbDone);
+        ExtLdrbImm(13, 12, 0);                 // byte -> w13
+        ExtStrbImm(13, 10, 0);                 // dst[i] = byte (packed layout)
+        AddImm(10, 10, 1);
+        AddImm(12, 12, 1);
+        AddImm(11, 11, -1);
+        EmitB(tbLoop);
+        Mark(tbDone);
+        HostLoad(0, 1);
+        HostEnd();
+    }
+
+    // x0 = arr, x1 = start, x2 = len -> stamped string copy. One byte per
+    // 8-byte slot, low byte of each slot. Clamps mirror the stdlib ToStr:
+    // start<0 -> 0, start>count -> count, len<0 -> 0, len beyond the tail
+    // truncates; null converges to the empty string.
+    void HostEmitSlice() {
+        HostBegin("_zan_ext_arr_slice_str");
+        HostSave(0, 0);
+        HostSave(1, 1);
+        HostSave(2, 2);
+        HostLoad(0, 0);
+        ExtCountOf(0, 9);                      // x9 = count
+        HostLoad(1, 1);
+        ExtCmpImm(1, 0);
+        int sPos = NL();
+        EmitBcond(10, sPos);
+        LoadImm(1, 0);
+        Mark(sPos);
+        HostCmp(1, 9);                         // cmp start, count
+        int sIn = NL();
+        EmitBcond(9, sIn);                     // b.ls keep
+        ExtMov(1, 9);
+        Mark(sIn);
+        HostLoad(2, 2);
+        ExtCmpImm(2, 0);
+        int lPos = NL();
+        EmitBcond(10, lPos);
+        LoadImm(2, 0);
+        Mark(lPos);
+        ExtSubRR(9, 9, 1);                     // avail = count - start
+        HostCmp(2, 9);
+        int lIn = NL();
+        EmitBcond(9, lIn);
+        ExtMov(2, 9);
+        Mark(lIn);
+        HostSave(1, 1);                        // clamped start
+        HostSave(2, 2);                        // clamped len
+        HostLoad(0, 2);
+        AddImm(0, 0, 1);
+        BLExtern("_malloc");
+        HostNonzero(0, "ext.slice.malloc");
+        HostSave(0, 3);                        // out
+        ExtMov(10, 0);                         // out cursor
+        HostLoad(11, 2);                       // remaining (x2 died in malloc)
+        HostLoad(12, 0);                       // arr
+        HostLoad(13, 1);                       // start
+        ExtLsl(13, 13, 3);
+        AddRR(12, 12, 13);                     // slot cursor
+        int slDone = NL();
+        int slLoop = NL();
+        Mark(slLoop);
+        CbzReg(11, slDone);
+        LdrU(14, 12, 0);                       // slot value
+        ExtUbfmLo(14, 14, 7);                  // low byte
+        ExtStrbImm(14, 10, 0);
+        AddImm(10, 10, 1);
+        AddImm(12, 12, 8);
+        AddImm(11, 11, -1);
+        EmitB(slLoop);
+        Mark(slDone);
+        ExtStrbImm(31, 10, 0);                 // NUL
+        HostLoad(0, 3);
+        HostLoad(1, 2);
+        BLInternal("_zan_host_copy");          // stamps + NUL
+        HostSave(0, 4);
+        HostLoad(0, 3);
+        BLExtern("_free");
+        HostLoad(0, 4);
+        HostEnd();
+    }
+
+    // x0 = hex string -> byte[]; invalid digits read as 0 (stdlib nibble)
+    void HostEmitHexDecode() {
+        // x0 = base, x1 = len (>= 0), x2 = stride -> lowercase hex string
+        HostBegin("_zan_ext_hex_encode");
+        HostSave(0, 0);                        // base
+        HostSave(1, 1);                        // len
+        HostSave(2, 2);                        // stride
+        ExtLsl(0, 1, 1);
+        AddImm(0, 0, 1);
+        BLExtern("_malloc");
+        HostNonzero(0, "ext.hex.malloc");
+        ExtMov(10, 0);                         // write cursor
+        HostSave(0, 3);                        // out
+        HostLoad(14, 1);
+        ExtLsl(11, 14, 1);
+        AddRR(11, 11, 10);                     // write end = out + 2*len
+        LoadStr(extTblHex, 13);
+        HostLoad(9, 0);                        // read cursor
+        HostLoad(12, 2);                       // stride
+        int hxDone = NL();
+        int hxLoop = NL();
+        Mark(hxLoop);
+        HostCmp(10, 11);
+        EmitBcond(2, hxDone);
+        ExtLdrbImm(4, 9, 0);                   // b
+        ExtLsr(5, 4, 4);
+        ExtLdrbReg(5, 13, 5);                  // tbl[b >> 4]
+        ExtStrbImm(5, 10, 0);
+        AddImm(10, 10, 1);
+        ExtUbfmLo(5, 4, 3);                    // b & 15
+        ExtLdrbReg(5, 13, 5);
+        ExtStrbImm(5, 10, 0);
+        AddImm(10, 10, 1);
+        AddRR(9, 9, 12);
+        EmitB(hxLoop);
+        Mark(hxDone);
+        ExtStrbImm(31, 10, 0);
+        HostLoad(0, 3);                        // out (string start)
+        HostLoad(1, 1);
+        ExtLsl(1, 1, 1);                       // produced length
+        ExtPush(0);                            // keep out across the copy
+        BLInternal("_zan_host_copy");
+        ExtPop(1);                             // x1 = out (sp restored, x0 = result)
+        HostSave(0, 4);                        // result
+        HostSave(1, 5);                        // out
+        HostLoad(0, 5);                        // free(out)
+        BLExtern("_free");
+        HostLoad(0, 4);
+        HostEnd();
+
+        // frameless leaf: nibble only reads and writes x0 and never calls,
+        // so every return path below is a bare ret
+        syms.Add(new Sym("_zan_ext_nibble", FnPad()));
+        int nBad = NL(); int nLet = NL(); int nUp = NL();
+        ExtCmpImm(0, 57);
+        EmitBcond(12, nLet);                   // > '9' -> letters
+        ExtCmpImm(0, 48);
+        EmitBcond(11, nBad);                   // < '0' -> invalid
+        AddImm(0, 0, -48);
+        LeafRetV0();                        // ret (0-9)
+        Mark(nLet);
+        ExtCmpImm(0, 102);
+        EmitBcond(12, nBad);                   // > 'f' -> invalid
+        ExtCmpImm(0, 97);
+        EmitBcond(11, nUp);                    // < 'a' -> uppercase
+        AddImm(0, 0, -87);
+        LeafRetV0();                        // ret (a-f)
+        Mark(nUp);
+        ExtCmpImm(0, 70);
+        EmitBcond(12, nBad);                   // > 'F' -> invalid
+        ExtCmpImm(0, 65);
+        EmitBcond(11, nBad);                   // < 'A' -> invalid
+        AddImm(0, 0, -55);
+        LeafRetV0();                        // ret (A-F)
+        Mark(nBad);
+        LoadImm(0, 0);
+        LeafRetV0();
+
+        HostBegin("_zan_ext_hex_decode");
+        HostSave(0, 0);                        // s
+        HostLoad(9, 0);
+        ExtLenOf(9, 9);
+        ExtLsr(0, 9, 1);                       // n = len / 2
+        HostSave(9, 2);                        // n (x9 dies across the call)
+        BLInternal("_zan_ext_arr_new");
+        HostSave(0, 1);                        // arr
+        ExtMov(10, 0);                         // slot cursor
+        HostLoad(11, 2);                       // n remaining
+        HostLoad(12, 0);                       // s cursor
+        int hdDone = NL();
+        int hdLoop = NL();
+        Mark(hdLoop);
+        CbzReg(11, hdDone);
+        ExtLdrbImm(13, 12, 0);                 // c1
+        ExtMov(0, 13);
+        BLInternal("_zan_ext_nibble");         // nibble only touches x0/x9
+        ExtMov(13, 0);
+        ExtLdrbImm(14, 12, 1);                 // c2
+        ExtMov(0, 14);
+        BLInternal("_zan_ext_nibble");
+        ExtMov(14, 0);
+        ExtLsl(13, 13, 4);
+        ExtOrr(13, 13, 14);                    // byte = (c1 << 4) | c2
+        // 批 35:arr 元素打包(1 字节/元素)——首版 StrU+槽距 8 是快照宿主
+        // 残留,Hex.Decode 结果经打包读只见每第 8 字节
+        ExtStrbImm(13, 10, 0);
+        AddImm(10, 10, 1);
+        AddImm(12, 12, 2);
+        AddImm(11, 11, -1);
+        EmitB(hdLoop);
+        Mark(hdDone);
+        HostLoad(0, 1);
+        HostEnd();
+    }
+
+    // x0 = base, x1 = len (>= 0), x2 = stride -> standard base64, padded
+}

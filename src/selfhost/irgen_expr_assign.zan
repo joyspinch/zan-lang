@@ -1,0 +1,892 @@
+using System;
+using System.Collections.Generic;
+namespace Zan;
+
+partial class Irgen {
+    // ---- assignment ----
+    ExprVal GenAssign(Node e) {
+        ExprVal rhs;
+        if (e.op == TK.Eq()) {
+            // a Binding<T>-typed slot takes a fresh Binding object, not the
+            // raw value (the C host's emit_binding_value)
+            Node slotTy = SlotTypeOf(e.a);
+            if (IsBindingTy(slotTy)) {
+                ExprVal bv = GenBindingValue(e.b, slotTy);
+                if (bv != null) { StoreTo(e.a, bv); return bv; }
+            }
+            rhs = GenExpr(e.b);
+            StoreTo(e.a, rhs);
+            return rhs;
+        }
+        // "a ??= b" lowers to "a = (a ?? b)" reusing the ARC-safe ?? codegen.
+        if (e.op == TK.QQEq()) {
+            Node q = new Node(AK.Binary());
+            q.op = TK.QQ(); q.a = e.a; q.b = e.b;
+            q.line = e.line; q.col = e.col;
+            ExprVal qv = GenBinary(q);
+            StoreTo(e.a, qv);
+            return qv;
+        }
+        // compound: load current, apply, store
+        ExprVal cur = GenExpr(e.a);
+        ExprVal r = GenExpr(e.b);
+        // user-defined operator: a += b -> a = T.op_add(a, b)
+        if (ClassOf(cur.ty) != null) {
+            int bop = 0;
+            if (e.op == TK.PlusEq()) { bop = TK.Plus(); }
+            if (e.op == TK.MinusEq()) { bop = TK.Minus(); }
+            if (e.op == TK.StarEq()) { bop = TK.Star(); }
+            if (e.op == TK.SlashEq()) { bop = TK.Slash(); }
+            // %= must be here too: without it a class operand falls through to
+            // the integer path below and the class pointer is fed to `srem`
+            // ("%t48 defined with type 'ptr' but expected 'i64'").
+            if (e.op == TK.PercentEq()) { bop = TK.Percent(); }
+            if (bop != 0) {
+                ExprVal ov = TryOpOverload(bop, cur, r, e.a, e.b);
+                if (ov != null) {
+                    StoreTo(e.a, ov);
+                    return ov;
+                }
+            }
+        }
+        if (IsStr(cur.ty) && e.op == TK.PlusEq()) {
+            ExprVal cc = StrConcat(ToCStr(cur), ToCStr(r));
+            StoreTo(e.a, cc);
+            return cc;
+        }
+        if (IsDbl(cur.ty) || IsDbl(r.ty)) {
+            string da = AsDouble(cur);
+            string db = AsDouble(r);
+            string fopn = "fadd";
+            if (e.op == TK.MinusEq()) { fopn = "fsub"; }
+            if (e.op == TK.StarEq()) { fopn = "fmul"; }
+            if (e.op == TK.SlashEq()) { fopn = "fdiv"; }
+            string ft = NT();
+            L("  " + ft + " = " + fopn + " double " + da + ", " + db);
+            ExprVal fnv = new ExprVal(ft, MkType("double"));
+            StoreTo(e.a, fnv);
+            return fnv;
+        }
+        string opn = "add";
+        if (e.op == TK.MinusEq()) { opn = "sub"; }
+        if (e.op == TK.StarEq()) { opn = "mul"; }
+        if (e.op == TK.SlashEq()) { opn = "sdiv"; }
+        if (e.op == TK.PercentEq()) { opn = "srem"; }
+        if (e.op == TK.AmpEq()) { opn = "and"; }
+        if (e.op == TK.PipeEq()) { opn = "or"; }
+        if (e.op == TK.CaretEq()) { opn = "xor"; }
+        if (e.op == TK.LessLessEq()) { opn = "shl"; }
+        if (e.op == TK.GreaterGreaterEq()) { opn = "ashr"; }
+        if (e.op == TK.GreaterGreaterGreaterEq()) { opn = "lshr"; }
+        string t = NT();
+        string rs = r.op;
+        if (e.op == TK.LessLessEq() || e.op == TK.GreaterGreaterEq() || e.op == TK.GreaterGreaterGreaterEq()) {
+            // the shift count is masked to the width of the left operand
+            int mbits = 63;
+            int cb = IntBits(cur.ty);
+            if (cb > 0 && cb < 64) { mbits = cb - 1; }
+            string m = NT();
+            L("  " + m + " = and i64 " + rs + ", " + mbits);
+            rs = m;
+        }
+        if (e.op == TK.SlashEq() || e.op == TK.PercentEq()) {
+            // the C host's division guard, same as in the plain division
+            int dop = TK.Slash(); if (e.op == TK.PercentEq()) { dop = TK.Percent(); }
+            int dw = ArithWidth(e.a, cur, e.b, r);
+            rs = GuardDivisor(cur, r, dop, e, dw, ArithUnsigned(e.a, cur, e.b, r));
+        }
+        // >>>=（逻辑右移复合赋值）按声明宽度做**真**位移（与 >>> 同款，见
+        // GenBinary）——lshr i64 后经 NarrowToDeclared 的 sext 收窄会变成
+        // 算术移位结果（neg >>>= 2 曾得 -4，宿主 1073741820）。
+        if (e.op == TK.GreaterGreaterGreaterEq()) {
+            int cb2 = IntBits(cur.ty);
+            if (cb2 > 0 && cb2 < 64) {
+                string a32c = NT();
+                L("  " + a32c + " = trunc i64 " + cur.op + " to i32");
+                string c32c = NT();
+                L("  " + c32c + " = trunc i64 " + rs + " to i32");
+                string s32c = NT();
+                L("  " + s32c + " = lshr i32 " + a32c + ", " + c32c);
+                string z64c = NT();
+                L("  " + z64c + " = zext i32 " + s32c + " to i64");
+                ExprVal nvc = new ExprVal(z64c, MkType("int"));
+                StoreTo(e.a, nvc);
+                return nvc;
+            }
+        }
+        L("  " + t + " = " + opn + " i64 " + cur.op + ", " + rs);
+        ExprVal nv = new ExprVal(t, MkType("int"));
+        StoreTo(e.a, nv);
+        return nv;
+    }
+    void StoreTo(Node lhs, ExprVal v) {
+        if (lhs.kind == AK.Ident()) {
+            int li = LocalIdx(lhs.sval);
+            if (li >= 0) {
+                Node lty = locType[li];
+                if (IsNullableValue(lty)) {
+                    L("  store i8* " + BoxFor(v, lty) + ", i8** " + locReg[li]);
+                    return;
+                }
+                v = ApplyUserConv(lty, v, false);
+                if (!convApplied) { v = StrSlotConv(lty, v); }
+                // a struct is a value: the variable gets its own copy
+                if (NeedsStructCopy(lty, v)) { v = StructCopyTemp(v, lty); }
+                v = NarrowToDeclared(v, lty);
+                string lt = MapType(lty);
+                if (curAsync && locBox[li]) {
+                    // the local lives in a heap cell: write through the cell
+                    string c = NT();
+                    L("  " + c + " = load i8*, i8** " + locReg[li]);
+                    string p = NT();
+                    L("  " + p + " = bitcast i8* " + c + " to " + lt + "*");
+                    string sv = Coerce(v, lt);
+                    if (ArcManaged(lty)) {
+                        string old = NT();
+                        L("  " + old + " = load " + lt + ", " + lt + "* " + p);
+                        L("  store " + lt + " " + sv + ", " + lt + "* " + p);
+                        EmitArcRetain(sv, lty);
+                        EmitArcRelease(old, lty);
+                    } else {
+                        L("  store " + lt + " " + sv + ", " + lt + "* " + p);
+                    }
+                    return;
+                }
+                if (ArcManaged(lty)) {
+                    string old = NT();
+                    L("  " + old + " = load " + lt + ", " + lt + "* " + locReg[li]);
+                    string sv = Coerce(v, lt);
+                    L("  store " + lt + " " + sv + ", " + lt + "* " + locReg[li]);
+                    EmitArcRetain(sv, lty);
+                    EmitArcRelease(old, lty);
+                } else {
+                    string sv = Coerce(v, lt);
+                    L("  store " + lt + " " + sv + ", " + lt + "* " + locReg[li]);
+                    EmitArcRetainStore(sv, lty, v.ty);
+                }
+                return;
+            }
+            if (curHasThis) {
+                Node cls = binder.FindType(curClass);
+                if (cls != null && FieldIndex(cls, lhs.sval) >= 0) {
+                    StoreField("%this", curClass, lhs.sval, v);
+                    return;
+                }
+                if (cls != null && EmitPropSet("%this", CurThisTy(), lhs.sval, v)) { return; }
+            }
+            if (curClass != "") {
+                Node scls = binder.FindType(curClass);
+                if (scls != null && FindStaticField(scls, lhs.sval) != null) {
+                    string sown = StaticFieldOwner(scls, lhs.sval);
+                    StoreStaticField(scls, lhs.sval, v, CurInstFor(sown));
+                    return;
+                }
+                // a static property write from a static method
+                if (scls != null) {
+                    Node sm = FindMethodUp(scls, "set_" + lhs.sval);
+                    if (sm != null && HasMod(sm, MOD.Static())
+                        && EmitPropSet("", MkType(curClass), lhs.sval, v)) { return; }
+                }
+            }
+            return;
+        }
+        if (lhs.kind == AK.MemberAccess()) {
+            // Console.ForegroundColor / Console.BackgroundColor / Console.Title
+            // are built-in properties: the assignment emits the escape (and
+            // updates the color slot) instead of storing into a field.
+            if (IsConsoleProp(lhs, "ForegroundColor")) { ConsoleColorSet(v, false); return; }
+            if (IsConsoleProp(lhs, "BackgroundColor")) { ConsoleColorSet(v, true); return; }
+            if (IsConsoleProp(lhs, "Title")) { ConsoleTitleSet(v); return; }
+            if (lhs.a.kind == AK.Ident() && LocalIdx(lhs.a.sval) < 0 && !ShadowsTypeName(lhs.a.sval)) {
+                Node tc = binder.FindType(lhs.a.sval);
+                if (tc != null) {
+                    if (FindStaticField(tc, lhs.sval) != null) {
+                        StoreStaticField(tc, lhs.sval, v, ConcreteInstArgs(lhs, tc.sval));
+                        return;
+                    }
+                    // a static property written through its class name:
+                    // `A.StatMixed = 9` -- the parser turns the property into a
+                    // `set_StatMixed` accessor, so this is a static call with no
+                    // receiver.
+                    Node sm = FindMethodUp(tc, "set_" + lhs.sval);
+                    if (sm != null && HasMod(sm, MOD.Static())) {
+                        EmitPropSet("", MkType(tc.sval), lhs.sval, v);
+                        return;
+                    }
+                }
+            }
+            ExprVal obj = GenExpr(lhs.a);
+            string cn = obj.ty.sval;
+            Node ocls = binder.FindType(cn);
+            if (ocls != null && FieldIndex(ocls, lhs.sval) < 0
+                && EmitPropSet(obj.op, obj.ty, lhs.sval, v)) { return; }
+            if (ocls != null) {
+                // a user-defined implicit conversion applies to the field
+                v = ApplyUserConv(FieldType(ocls, lhs.sval), v, false);
+                if (!convApplied) { v = StrSlotConv(FieldType(ocls, lhs.sval), v); }
+            }
+            StoreField(obj.op, cn, lhs.sval, v);
+            return;
+        }
+        if (lhs.kind == AK.Index()) {
+            ExprVal obj = GenExpr(lhs.a);
+            ExprVal idx = GenExpr(lhs.b);
+            if (IsListType(obj.ty)) {
+                // A507② 自举半边（List）：zlist_set 曾无界——OOB 直接写穿
+                // 数据区。调用点守卫（这里才知道行:列）：软诊断 + 跳过调用
+                // （ARC 平衡保持：不进入 zlist_set 就不 retain/release）。
+                string lc2 = NT();
+                L("  " + lc2 + " = call i64 @zlist_count(i8* " + obj.op + ")");
+                string lneg2 = NT();
+                L("  " + lneg2 + " = icmp slt i64 " + idx.op + ", 0");
+                string lge2 = NT();
+                L("  " + lge2 + " = icmp sge i64 " + idx.op + ", " + lc2);
+                string loob2 = NT();
+                L("  " + loob2 + " = or i1 " + lneg2 + ", " + lge2);
+                EmitRuntimeCheckIf(lhs, loob2, "index out of bounds: List store");
+                string sv0 = StructElemSlot(v, ListElem(obj.ty));
+                int ldo2 = NL(); int lskip2 = NL();
+                L("  br i1 " + loob2 + ", label %L" + lskip2 + ", label %L" + ldo2);
+                Label(ldo2);
+                L("  call void @zlist_set(i8* " + obj.op + ", i64 " + idx.op + ", i64 " + sv0 + ")");
+                L("  br label %L" + lskip2);
+                Label(lskip2);
+                return;
+            }
+            if (IsDictType(obj.ty)) {
+                string sv = StructElemSlot(v, DictVal(obj.ty));
+                L("  call void @zdict_set(i8* " + obj.op + ", i8* " + DictKeyOp(idx, obj.ty) + ", i64 " + sv + ", i64 " + DictKeyStrFlag(obj.ty) + ")");
+                return;
+            }
+            if (IsSpanType(obj.ty)) {
+                Node el = SpanElem(obj.ty);
+                string ity = SpanIty(el);
+                string ep = SpanElemPtr(obj.op, idx.op, ity);
+                string sv = v.op;
+                if (ity == "double" || ity == "float") {
+                    if (v.ty == null || !IsDbl(v.ty)) {
+                        string t = NT();
+                        L("  " + t + " = sitofp i64 " + v.op + " to " + ity);
+                        sv = t;
+                    } else if (ity == "float") {
+                        // the value is a `double` in this model (float and
+                        // double travel as LLVM double), but the span's
+                        // element is a real 32-bit float -- narrow it. The
+                        // value's own type can be `float` as well (a float[]
+                        // element), so the check is on "is a floating value",
+                        // not on the name being exactly "double".
+                        string t = NT();
+                        L("  " + t + " = fptrunc double " + v.op + " to float");
+                        sv = t;
+                    }
+                } else if (ity != "i64") {
+                    string t = NT();
+                    L("  " + t + " = trunc i64 " + v.op + " to " + ity);
+                    sv = t;
+                }
+                L("  store " + ity + " " + sv + ", " + ity + "* " + ep + ", align 1");
+                return;
+            }
+            if (IsStr(obj.ty)) {
+                // A507② 自举半边（string）：字符写曾无界——OOB 改写字符串
+                // 后面的内存。软诊断 + 软基址 select（OOB 时落 scratch 字节）。
+                bool isOpaque = false;
+                if (lhs.a != null && lhs.a.kind == AK.Ident()) {
+                    int li = LocalIdx(lhs.a.sval);
+                    if (li >= 0 && li < locOpaque.Count && locOpaque[li]) {
+                        isOpaque = true;
+                    }
+                }
+                string soob = "";
+                if (isOpaque) {
+                    // Opaque string（来自 extern 调用如 calloc/malloc，无托管上界）：
+                    // 对齐 C 宿主（irgen_expr.c:5671）与自举机器码后端（ngen_string.zan:110）：
+                    // 故意只检查 null/负数索引，不检查上界。
+                    string sneg = NT();
+                    L("  " + sneg + " = icmp slt i64 " + idx.op + ", 0");
+                    soob = sneg;
+                } else {
+                    string sln = NT();
+                    L("  " + sln + " = call i64 @zstr_len(i8* " + obj.op + ")");
+                    string sneg = NT();
+                    L("  " + sneg + " = icmp slt i64 " + idx.op + ", 0");
+                    string sge = NT();
+                    L("  " + sge + " = icmp sge i64 " + idx.op + ", " + sln);
+                    string oob = NT();
+                    L("  " + oob + " = or i1 " + sneg + ", " + sge);
+                    soob = oob;
+                }
+                EmitRuntimeCheckIf(lhs, soob, "index out of bounds: string store");
+                string sp = NT();
+                L("  " + sp + " = getelementptr i8, i8* " + obj.op + ", i64 " + idx.op);
+                if (!ExternSeen("__zan_soft_scratch")) {
+                    externDecls.Add("__zan_soft_scratch");
+                    H("@__zan_soft_scratch = internal global [64 x i8] zeroinitializer");
+                }
+                string scrs = NT();
+                L("  " + scrs + " = getelementptr inbounds [64 x i8], [64 x i8]* @__zan_soft_scratch, i64 0, i64 0");
+                string spsel = NT();
+                L("  " + spsel + " = select i1 " + soob + ", i8* " + scrs + ", i8* " + sp);
+                string sb = NT();
+                L("  " + sb + " = trunc i64 " + v.op + " to i8");
+                L("  store i8 " + sb + ", i8* " + spsel);
+                return;
+            }
+            // A user class indexer: `obj[idx] = v` -> Owner_op_index_set(...).
+            // Without this the store went into the array path and wrote the
+            // value into the object's own header (class id / refcount).
+            Node ocls = null;
+            if (obj.ty != null && obj.ty.ival == 0) { ocls = ClassOf(obj.ty); }
+            if (ocls != null) {
+                Node m = SelectIndexer(ocls, "op_index_set", OperandType(lhs.b, idx), v.ty);
+                if (m != null) { EmitIndexSet(obj, m, idx, v); return; }
+                diags.Error("indexing a value of type '" + obj.ty.sval
+                    + "' is not supported by the self-hosted compiler yet", lhs.line, lhs.col);
+                return;
+            }
+            // array of i64 slots; pointer/double values are packed into the slot
+            Node elemTy = ArrElemOf(obj.ty);
+            int esz = ArrElemSize(elemTy);
+            // a rectangular array folds its subscripts into a flat offset
+            string sflat = idx.op;
+            int srk = ArrRankOf(obj.ty);
+            string mdOob = null;
+            if (srk > 1) {
+                // A507② 自举半边（二维+）：折叠同时取逐维越界 OR——钳位扁平
+                // 值永远落进 [0,total)，对总长的检查形同虚设；OOB 判定要按
+                // 维度来（宿主 emit_index_oob_pred 逐维同款），命中走 scratch。
+                MdTrackOob = true;
+                MdOobAll = null;
+                sflat = MdFlatIndex(lhs, obj.op, srk, idx.op);
+                MdTrackOob = false;
+                mdOob = MdOobAll;
+            }
+            // A507② 自举半边：越界元素 store 曾完全无界——直接写穿真实内
+            // 存（宿主至少钳位槽 0）。补软诊断 + 软基址：OOB 时元素地址换
+            // scratch 槽，写落 scratch 不伤真实元素（诊断 + 数据保住，与宿
+            // 主同口径）。
+            string lp2s = NT();
+            L("  " + lp2s + " = getelementptr i64, i64* " + obj.op + ", i64 -1");
+            string ln2s = NT();
+            L("  " + ln2s + " = load i64, i64* " + lp2s);
+            string inegs = NT();
+            L("  " + inegs + " = icmp slt i64 " + sflat + ", 0");
+            string iges = NT();
+            L("  " + iges + " = icmp sge i64 " + sflat + ", " + ln2s);
+            string oobs = NT();
+            L("  " + oobs + " = or i1 " + inegs + ", " + iges);
+            if (mdOob != null) {
+                // 二维+：逐维真谓词覆盖总长检查（钳位值必在界内，总长检查
+                // 永假）；一维维持原判定（一维无钳位，sflat 是裸下标）。
+                string oobm = NT();
+                L("  " + oobm + " = or i1 " + oobs + ", " + mdOob);
+                oobs = oobm;
+            }
+            EmitRuntimeCheckIf(lhs, oobs, "index out of bounds: array store");
+            if (!ExternSeen("__zan_soft_scratch")) {
+                externDecls.Add("__zan_soft_scratch");
+                H("@__zan_soft_scratch = internal global [64 x i8] zeroinitializer");
+            }
+            string scrb = NT();
+            L("  " + scrb + " = getelementptr inbounds [64 x i8], [64 x i8]* @__zan_soft_scratch, i64 0, i64 0");
+            string p = NT();
+            if (esz == 1) {
+                // a byte array: one byte per element
+                string ab = NT();
+                L("  " + ab + " = bitcast i64* " + obj.op + " to i8*");
+                L("  " + p + " = getelementptr i8, i8* " + ab + ", i64 " + sflat);
+                string psel = NT();
+                L("  " + psel + " = select i1 " + oobs + ", i8* " + scrb + ", i8* " + p);
+                if (IsStructTy(v.ty)) {
+                    ExprVal c = CopyStructValue(v);
+                    ArrElemStore(psel, 1, ToI64(c.op, MapType(c.ty)));
+                    return;
+                }
+                ArrElemStore(psel, 1, ToI64(v.op, MapType(v.ty)));
+                return;
+            }
+            L("  " + p + " = getelementptr i64, i64* " + obj.op + ", i64 " + sflat);
+            string p64s = NT();
+            {
+                string p64b = NT();
+                L("  " + p64b + " = bitcast i8* " + scrb + " to i64*");
+                L("  " + p64s + " = select i1 " + oobs + ", i64* " + p64b + ", i64* " + p);
+            }
+            // a struct element is a value: the array holds its own copy
+            if (IsStructTy(v.ty)) {
+                ExprVal c = CopyStructValue(v);
+                L("  store i64 " + ToI64(c.op, MapType(c.ty)) + ", i64* " + p64s);
+                return;
+            }
+            // a NULLABLE element is a pointer slot: the value is boxed
+            // (`a[0] = 5` stores a pointer to 5, `a[1] = null` stores null)
+            if (IsNullableValue(elemTy)) {
+                string bx = BoxFor(v, elemTy);
+                string bi = NT();
+                L("  " + bi + " = ptrtoint i8* " + bx + " to i64");
+                L("  store i64 " + bi + ", i64* " + p64s);
+                return;
+            }
+            if (ArcManaged(v.ty)) { EmitArcRetain(v.op, v.ty); }
+            // a float element carries single precision: the host stores an f32
+            // A floating element carries its own precision: the host stores an f32
+            // for `float` and converts an integer into the slot -- the array path
+            // converts where the container path does not.
+            if (elemTy != null && elemTy.ival == 0
+                    && (elemTy.sval == "float" || elemTy.sval == "double")) {
+                if (v.ty != null && MapType(v.ty) == "i64") {
+                    string t = NT();
+                    L("  " + t + " = sitofp i64 " + v.op + " to double");
+                    v = new ExprVal(t, MkType("double"));
+                }
+                if (IsFloatTy(elemTy) && v.ty != null && IsDbl(v.ty)) {
+                    v = new ExprVal(F32Round(v.op), v.ty);
+                }
+            }
+            L("  store i64 " + ToI64(v.op, MapType(v.ty)) + ", i64* " + p64s);
+            return;
+        }
+    }
+
+    // The class-level specialized symbol of `m` (a method of a generic class)
+    // when the receiver's static type carries the concrete type arguments.
+    // The indexer and property paths need it as much as a plain call does:
+    // the erased body converts its key with the WRONG format (a `TKey` slot
+    // read as a number) and writes the value into a slot of the wrong width.
+    // Returns "" when no specialization applies; the binding it used is
+    // left in csNames/csReps.
+    string ClassSpecSym(string owner, Node m, Node recvTy) {
+        csNames = new List<string>();
+        csReps = new List<Node>();
+        if (m == null || recvTy == null) { return ""; }
+        Node cls = binder.FindType(owner);
+        if (cls == null) { return ""; }
+        List<string> ctps = TParams(cls);
+        if (ctps.Count == 0) { return ""; }
+        if (recvTy.kids.Count != ctps.Count) { return ""; }
+        // a method with its own type parameters needs those bound too --
+        // the plain call path does that; here we only specialize the
+        // class-level ones
+        if (TParams(m).Count > 0) { return ""; }
+        int i = 0;
+        while (i < ctps.Count) {
+            csNames.Add(ctps[i]);
+            csReps.Add(recvTy.kids[i]);
+            i = i + 1;
+        }
+        List<Node> ctypes = new List<Node>();
+        i = 0;
+        while (i < csReps.Count) { ctypes.Add(csReps[i]); i = i + 1; }
+        string tag = SpecTagC(m, ctypes, new List<string>(), csNames, csReps, "I");
+        if (tag == "") { return ""; }
+        return SpecQueueTy(owner, m, csNames, csReps, tag, recvTy);
+    }
+
+    // The indexer read: `obj[idx]` -> Owner_op_index(obj, idx).
+    ExprVal EmitIndexCall(ExprVal obj, Node m, ExprVal idx) {
+        Node cls = ClassOf(obj.ty);
+        string owner = DeclOwnerOf(cls, m);
+        if (owner == "") { owner = obj.ty.sval; }
+        string thisOp = obj.op;
+        if (owner != obj.ty.sval) {
+            string bc = NT();
+            L("  " + bc + " = bitcast %" + obj.ty.sval + "* " + obj.op + " to %" + owner + "*");
+            thisOp = bc;
+        }
+        // a generic class's indexer gets a specialized body: the key and the
+        // value keep their concrete types
+        string sym = MethodSym(owner, m);
+        string rtm = MapTypeDecl(m.type, owner);
+        // a STATIC indexer takes the receiver as its explicit first
+        // parameter (`static int op_index(Cls self, long key)`), so the key
+        // is the SECOND parameter
+        int keyIdx = 0;
+        if (IsStatic(m)) { keyIdx = 1; }
+        Node p0 = ParamTypeNode(m, keyIdx);
+        string p0m = MapTypeDecl(p0, owner);
+        Node rty = m.type;
+        string ss = ClassSpecSym(owner, m, obj.ty);
+        if (ss != "") {
+            sym = ss;
+            rty = SubstTP(m.type, csNames, csReps);
+            p0 = SubstTP(p0, csNames, csReps);
+            rtm = MapType(rty);
+            p0m = MapType(p0);
+        }
+        string t = NT();
+        L("  " + t + " = call " + rtm + " @" + sym + "(%" + owner + "* " + thisOp
+            + ", " + p0m + " " + CallArg(idx, p0, false) + ")");
+        return new ExprVal(t, rty);
+    }
+
+    // The indexer write: `obj[idx] = v` -> Owner_op_index_set(obj, idx, v).
+    void EmitIndexSet(ExprVal obj, Node m, ExprVal idx, ExprVal v) {
+        Node cls = ClassOf(obj.ty);
+        string owner = DeclOwnerOf(cls, m);
+        if (owner == "") { owner = obj.ty.sval; }
+        string thisOp = obj.op;
+        if (owner != obj.ty.sval) {
+            string bc = NT();
+            L("  " + bc + " = bitcast %" + obj.ty.sval + "* " + obj.op + " to %" + owner + "*");
+            thisOp = bc;
+        }
+        string sym = MethodSym(owner, m);
+        // a STATIC indexer takes the receiver as its explicit first
+        // parameter: the key is the second one, the value the third
+        int keyIdx = 0;
+        if (IsStatic(m)) { keyIdx = 1; }
+        Node p0 = ParamTypeNode(m, keyIdx);
+        Node p1 = ParamTypeNode(m, keyIdx + 1);
+        string p0m = MapTypeDecl(p0, owner);
+        string p1m = MapTypeDecl(p1, owner);
+        string ss = ClassSpecSym(owner, m, obj.ty);
+        if (ss != "") {
+            sym = ss;
+            p0 = SubstTP(p0, csNames, csReps);
+            p1 = SubstTP(p1, csNames, csReps);
+            p0m = MapType(p0);
+            p1m = MapType(p1);
+        }
+        L("  call void @" + sym + "(%" + owner + "* " + thisOp
+            + ", " + p0m + " " + CallArg(idx, p0, false)
+            + ", " + p1m + " " + CallArg(v, p1, false) + ")");
+    }
+
+    // obj.Name = v  ->  Owner_set_Name(obj, v). Returns false if no setter.
+    bool EmitPropSet(string objOp, Node recvTy, string name, ExprVal v) {
+        string clsName = recvTy.sval;
+        Node cls = binder.FindType(clsName);
+        Node m = FindMethodUp(cls, "set_" + name);
+        if (m == null) { return false; }
+        string owner = MethodOwner(cls, "set_" + name);
+        if (owner == "") { owner = clsName; }
+        Node pty = ParamTypeNode(m, 0);
+        // a static property setter takes no receiver: `Custom = 40` inside
+        // the class means `Custom.set_Custom(40)`
+        if (HasMod(m, MOD.Static())) {
+            L("  call void @" + MethodSym(owner, m) + "(" + MapType(pty) + " " + CallArg(v, pty, false) + ")");
+            return true;
+        }
+        string thisOp = objOp;
+        if (owner != clsName) {
+            string bc = NT();
+            L("  " + bc + " = bitcast %" + clsName + "* " + objOp + " to %" + owner + "*");
+            thisOp = bc;
+        }
+        // a generic class's property setter gets a specialized body: the
+        // value keeps its concrete type
+        string sym = MethodSym(owner, m);
+        string ptym = MapTypeDecl(pty, owner);
+        string ss = ClassSpecSym(owner, m, recvTy);
+        if (ss != "") {
+            sym = ss;
+            pty = SubstTP(pty, csNames, csReps);
+            ptym = MapType(pty);
+        }
+        L("  call void @" + sym + "(%" + owner + "* " + thisOp
+            + ", " + ptym + " " + CallArg(v, pty, false) + ")");
+        return true;
+    }
+
+    void StoreField(string objOp, string clsName, string field, ExprVal v) {
+        // hardware vectors are first-class values with no memory layout:
+        // their getter bodies' V0..V3 field writes fold into the constant
+        // (zeroinitializer / all-ones) and must not touch memory
+        if (clsName == "Vector128" || clsName == "Vector256") { return; }
+        Node cls = binder.FindType(clsName);
+        int idx = FieldIndex(cls, field);
+        Node fty = FieldType(cls, field);
+        string p = NT();
+        L("  " + p + " = getelementptr %" + clsName + ", %" + clsName + "* " + objOp + ", i32 0, i32 " + idx);
+        // erased field: pack the value into an i64 slot
+        if (IsErasedType(fty)) {
+            // a struct value is copied: the field holds its own instance
+            if (NeedsStructCopy(fty, v)) { v = StructCopyTemp(v, fty); }
+            // The field owns the reference it holds. In the erased body the
+            // value's type is a type parameter (nothing to retain); in a
+            // SPECIALIZED clone the concrete type is known -- without the
+            // retain the field would keep a borrowed pointer, the caller's
+            // temporary would be released and the field would dangle (the
+            // next read was a use-after-free).
+            if (ArcManaged(v.ty) && !WeakTy(fty)) { EmitArcRetain(v.op, v.ty); }
+            string sv = ToSlot(v, v.ty);
+            if (WeakTy(fty)) {
+                // a weak slot: the registry keeps it, the value is NOT owned
+                string slotp = NT();
+                L("  " + slotp + " = bitcast %" + clsName + "* " + p + " to i64*");
+                EmitWeakStore(slotp, sv);
+            } else {
+                L("  store i64 " + sv + ", i64* " + p);
+            }
+            return;
+        }
+        // a struct field is a value: the field gets its own copy
+        if (NeedsStructCopy(fty, v)) { v = StructCopyTemp(v, fty); }
+        string ft = MapType(fty);
+        ExprVal src = StrSlotConv(fty, v);
+        src = NarrowToDeclared(src, fty);
+        if (WeakTy(fty) && ft.EndsWith("*")) {
+            // a weak slot: the registry keeps it, the value is NOT owned (a
+            // weak field never retains and never releases what it holds)
+            string sv = Coerce(src, ft);
+            string slotp = NT();
+            L("  " + slotp + " = bitcast %" + clsName + "* " + p + " to i64*");
+            string v64 = NT();
+            L("  " + v64 + " = ptrtoint " + ft + " " + sv + " to i64");
+            EmitWeakStore(slotp, v64);
+            return;
+        }
+        if (ArcManaged(fty) && !WeakTy(fty)) {
+            string old = NT();
+            L("  " + old + " = load " + ft + ", " + ft + "* " + p);
+            string sv = Coerce(src, ft);
+            L("  store " + ft + " " + sv + ", " + ft + "* " + p);
+            EmitArcRetain(sv, fty);
+            EmitArcRelease(old, fty);
+        } else {
+            string sv = Coerce(src, ft);
+            L("  store " + ft + " " + sv + ", " + ft + "* " + p);
+            EmitArcRetainStore(sv, fty, src.ty);
+        }
+    }
+
+    // convert a value to an i64 list slot (pointers via ptrtoint)
+    string ToSlot(ExprVal v, Node elemTy) {
+        string lt = MapType(elemTy);
+        if (lt == "i64") {
+            if (v != null && v.ty != null && MapType(v.ty) != "i64") {
+                string vt = MapType(v.ty);
+                if (vt == "i8*" || vt.EndsWith("*")) {
+                    if (v.op == "null" || v.op == "0") { return "0"; }
+                    string pt = NT();
+                    L("  " + pt + " = ptrtoint " + vt + " " + v.op + " to i64");
+                    return pt;
+                }
+            }
+            return v.op;
+        }
+        if (lt == "double") {
+            // A floating element slot holds the value's bits.  A floating value
+            // keeps its own bits; an INTEGER keeps the host's unconverted bit
+            // pattern -- the container path does not convert where the array path
+            // does, so `List<float>.Add(1)` reads back as the f32 whose bits are 1.
+            if (v.ty != null && MapType(v.ty) == "i64" && v.op != "null") {
+                if (IsFloatTy(elemTy)) {
+                    string ap = NT();
+                    L("  " + ap + " = alloca i64");
+                    L("  store i64 " + v.op + ", i64* " + ap);
+                    string fp = NT();
+                    L("  " + fp + " = bitcast i64* " + ap + " to float*");
+                    string fb = NT();
+                    L("  " + fb + " = load float, float* " + fp);
+                    string db = NT();
+                    L("  " + db + " = fpext float " + fb + " to double");
+                    string tb = NT();
+                    L("  " + tb + " = bitcast double " + db + " to i64");
+                    return tb;
+                }
+                string db2 = NT();
+                L("  " + db2 + " = bitcast i64 " + v.op + " to double");
+                string tb2 = NT();
+                L("  " + tb2 + " = bitcast double " + db2 + " to i64");
+                return tb2;
+            }
+            string tb = NT();
+            L("  " + tb + " = bitcast double " + v.op + " to i64");
+            return tb;
+        }
+        if (v.op == "null" || v.op == "0") { return "0"; }
+        string t = NT();
+        L("  " + t + " = ptrtoint " + lt + " " + v.op + " to i64");
+        return t;
+    }
+
+    ExprVal FromSlot(string slot, Node elemTy) {
+        string lt = MapType(elemTy);
+        if (lt == "i64") { return new ExprVal(slot, elemTy); }
+        string t = NT();
+        if (lt == "double") {
+            L("  " + t + " = bitcast i64 " + slot + " to double");
+            return new ExprVal(t, elemTy);
+        }
+        L("  " + t + " = inttoptr i64 " + slot + " to " + lt);
+        return new ExprVal(t, elemTy);
+    }
+
+    bool IsTuple(Node t) {
+        if (t == null) { return false; }
+        return t.sval == "Tuple";
+    }
+
+    bool IsItemName(string s) {
+        if (s.Length < 5) { return false; }
+        return s[0] == 'I' && s[1] == 't' && s[2] == 'e' && s[3] == 'm';
+    }
+
+    int ItemIndex(string s) {
+        int n = 0; int i = 4;
+        while (i < s.Length) { n = n * 10 + (s[i] - '0'); i = i + 1; }
+        return n - 1;
+    }
+
+    // is class `sub` equal to or derived from `baseName`?
+    bool IsSubclassName(string sub, string baseName) {
+        if (sub == baseName) { return true; }
+        if (baseName == "Exception" && sub == "InvalidCastException") { return true; }
+        if (binder.IsAssignableFrom(baseName, sub)) { return true; }
+        Node c = binder.FindType(sub);
+        while (c != null) {
+            if (c.sval == baseName) { return true; }
+            c = BaseClassOf(c);
+        }
+        return false;
+    }
+
+    // type test:  obj is T [name].  Closed-world RTTI: compare the object's
+    // vtable pointer against the vtable of T and of every concrete polymorphic
+    // subclass of T. Optional `name` binds obj cast to T*.
+    ExprVal GenIs(Node e) {
+        ExprVal obj = GenExpr(e.a);
+        if (e.type == null) {
+            // `x is null` / `x is not null`: no type, just a null test
+            string cmp = "eq"; if (e.op == 1) { cmp = "ne"; }
+            string t = NT();
+            if (IsPtrType(obj.ty)) {
+                L("  " + t + " = icmp " + cmp + " " + MapType(obj.ty) + " " + obj.op + ", null");
+            } else {
+                L("  " + t + " = icmp " + cmp + " i64 " + obj.op + ", 0");
+            }
+            string z = NT();
+            L("  " + z + " = zext i1 " + t + " to i64");
+            return new ExprVal(z, MkType("bool"));
+        }
+        string tname = e.type.sval;
+        string sty = obj.ty.sval;
+        Node scls = binder.FindType(sty);
+        string reg = "";
+        string plt = "";
+        if (e.sval != null && e.sval.Length > 0) {
+            // the bound variable has the pattern's type: a class pointer, or
+            // i8* for `string` (strings are not an LLVM struct type).
+            // A pattern variable borrows the tested value: mark it locRef so
+            // ReleaseLocalsFrom does not release it (the tested object is
+            // already released by its owner, matching C11 gen0 semantics).
+            plt = MapType(e.type);
+            int li = LocalIdx(e.sval);
+            if (li >= 0) {
+                reg = locReg[li];
+                locRef[li] = true;
+            } else {
+                reg = AddLocal(e.sval, e.type);
+                locRef[locName.Count - 1] = true;
+                if (ShouldBox(e.sval)) {
+                    reg = BoxLocal(locName.Count - 1);
+                } else {
+                    EA(reg, plt);
+                }
+            }
+            string nullLit = "null";
+            if (!IsPtrLL(plt)) { nullLit = "0"; }
+            L("  store " + plt + " " + nullLit + ", " + plt + "* " + reg);
+        }
+        string res;
+        if (tname == "string") {
+            if (sty == "string") { res = EmitNonNullVal(obj); }
+            else { res = Bool64(EmitStringIdTest(obj)); }
+        } else {
+            Node tc = binder.FindType(tname);
+            bool tCls = tc != null && (tc.kind == AK.ClassDecl() || tc.kind == AK.StructDecl());
+            // a built-in container is a heap object: the runtime decides
+            if (!tCls) { tCls = IsContainerType(tname); }
+            bool sIsCls = scls != null && (scls.kind == AK.ClassDecl() || scls.kind == AK.StructDecl());
+            if (!tCls) {
+                // a value type pattern: the static types decide (gen0's rule)
+                int ok = 0;
+                if (sty == tname) { ok = 1; }
+                res = "" + ok;
+            } else if (!sIsCls) {
+                // an `object` slot: the runtime class id decides
+                res = Bool64(EmitClassIdTest(obj, tname));
+            } else if (IsSubclassName(sty, tname)) {
+                // the static type already guarantees the pattern: only
+                // nullness matters
+                res = EmitNonNullVal(obj);
+            } else {
+                // a downcast: the runtime class id decides
+                res = Bool64(EmitClassIdTest(obj, tname));
+            }
+        }
+        if (e.sval != null && e.sval.Length > 0) {
+            string bc = obj.op;
+            if (MapType(obj.ty) != plt) {
+                if (IsPtrLL(MapType(obj.ty)) && IsPtrLL(plt)) {
+                    bc = NT();
+                    L("  " + bc + " = bitcast " + MapType(obj.ty) + " " + obj.op + " to " + plt);
+                } else {
+                    bc = Coerce(obj, plt);
+                }
+            }
+            string nullLit = "null";
+            if (!IsPtrLL(plt)) { nullLit = "0"; }
+            string isOk = NT();
+            L("  " + isOk + " = icmp ne i64 " + res + ", 0");
+            string safe = NT();
+            L("  " + safe + " = select i1 " + isOk + ", " + plt + " " + bc + ", " + plt + " " + nullLit);
+            L("  store " + plt + " " + safe + ", " + plt + "* " + reg);
+        }
+        if (e.op == 1) {
+            // `x is not T`: negate the test
+            string n = NT();
+            L("  " + n + " = xor i64 " + res + ", 1");
+            res = n;
+        }
+        return new ExprVal(res, MkType("bool"));
+    }
+
+    // tuple literal (a, b, ...) -> heap i64[N], each element packed into a slot.
+    ExprVal GenTuple(Node e) {
+        int n = e.kids.Count;
+        Node tty = new Node(AK.TypeRef()); tty.sval = "Tuple";
+        string buf = NT();
+        L("  " + buf + " = call i8* @malloc(i64 " + (n * 8) + ")");
+        string p = NT();
+        L("  " + p + " = bitcast i8* " + buf + " to i64*");
+        int i = 0;
+        while (i < n) {
+            ExprVal ev = GenExpr(e.kids[i]);
+            tty.Add(ev.ty);
+            string slot = NT();
+            L("  " + slot + " = getelementptr i64, i64* " + p + ", i64 " + i);
+            L("  store i64 " + ToSlot(ev, ev.ty) + ", i64* " + slot);
+            i = i + 1;
+        }
+        return new ExprVal(buf, tty);
+    }
+
+    // deconstruction: var (a, b, ...) = tupleExpr;  unpacks each slot into a local.
+    void GenDecon(Node s) {
+        ExprVal rhs = GenExpr(s.b);
+        List<Node> ekids = rhs.ty.kids;
+        string p = NT();
+        L("  " + p + " = bitcast i8* " + rhs.op + " to i64*");
+        int i = 0;
+        while (i < s.kids.Count) {
+            Node tgt = s.kids[i];
+            Node ety = tgt.type;
+            if (ety == null) {
+                if (i < ekids.Count) { ety = ekids[i]; } else { ety = MkType("int"); }
+            }
+            string slot = NT();
+            L("  " + slot + " = getelementptr i64, i64* " + p + ", i64 " + i);
+            string raw = NT();
+            L("  " + raw + " = load i64, i64* " + slot);
+            ExprVal ev = FromSlot(raw, ety);
+            string lt = MapType(ety);
+            string reg = AddLocal(tgt.sval, ety);
+            EA(reg, lt);
+            L("  store " + lt + " " + Coerce(ev, lt) + ", " + lt + "* " + reg);
+            i = i + 1;
+        }
+    }
+
+}

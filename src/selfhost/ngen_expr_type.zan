@@ -1,0 +1,626 @@
+using System;
+using System.Collections.Generic;
+namespace Zan;
+
+partial class Ngen {
+    void EmitTypeTestNg(string tt, string st) {
+        if (tt == "string") {
+            // string targets are decided by the header tag, not a site
+            if (st == "string") {
+                if (tgt86 == 1) { X3(0x48, 0x83, 0xFF); X1(0x00); } else { E4(0xEB1F001F); }                          // cmp x0, xzr
+                if (tgt86 == 1) { X3(0x0F, 0x95, 0xC0); X3(0x48, 0x0F, 0xB6); X1(0xF8); } else { E4(0x9A9F07E0); }                          // cset x0, ne
+            } else if (st == "object") {
+                // the slot may hold a heap string: tag == "ZANS" answers it
+                int noL = NL();
+                int endL = NL();
+                CbzReg(0, noL);                          // null -> false
+                RtLdur(1, 0, -8);                        // ldur x1, [x0, #-8]
+                LsrImm64(1, 32);                          // lsr x1, x1, #32
+                LoadImm(2, 1514229331);                  // 0x5A414E53 "ZANS"
+                CmpRR(1, 2);                          // cmp x1, x2
+                if (tgt86 == 1) { X3(0x0F, 0x94, 0xC0); X3(0x48, 0x0F, 0xB6); X1(0xF8); } else { E4(0x9A9F17E0); }                          // cset x0, eq
+                EmitB(endL);
+                Mark(noL);
+                LoadImm(0, 0);
+                Mark(endL);
+            } else {
+                LoadImm(0, 0);                           // value type / unknown
+            }
+            return;
+        }
+        Cls tc = FindClass(tt);
+        if (tc == null) {
+            // non-class target: strings and value types are decided by the
+            // static types alone
+            if (tt == "string" && st == "string") {
+                if (tgt86 == 1) { X3(0x48, 0x83, 0xFF); X1(0x00); } else { E4(0xEB1F001F); }                          // cmp x0, xzr
+                if (tgt86 == 1) { X3(0x0F, 0x95, 0xC0); X3(0x48, 0x0F, 0xB6); X1(0xF8); } else { E4(0x9A9F07E0); }                          // cset x0, ne
+            } else if (st != null && st == tt) {
+                LoadImm(0, 1);                           // same value type: always
+            } else {
+                LoadImm(0, 0);
+            }
+            return;
+        }
+        string sc = ClassTyOf(st);
+        if (sc == null) {
+            // a string can never hold a class instance; anything else with
+            // no class identity cannot either
+            LoadImm(0, 0);
+            return;
+        }
+        if (st == "object") {
+            // object-typed source: identity is unknown statically, always
+            // consult the runtime site (gen0 rule)
+            GenIsSite(tc);
+            return;
+        }
+        if (sc == tt || DerivesFrom(sc, tt)) {
+            if (tgt86 == 1) { X3(0x48, 0x83, 0xFF); X1(0x00); } else { E4(0xEB1F001F); }                              // cmp x0, xzr
+            if (tgt86 == 1) { X3(0x0F, 0x95, 0xC0); X3(0x48, 0x0F, 0xB6); X1(0xF8); } else { E4(0x9A9F07E0); }                              // cset x0, ne
+            return;
+        }
+        if (DerivesFrom(tt, sc)) {
+            GenIsSite(tc);
+            return;
+        }
+        LoadImm(0, 0);
+    }
+
+    void GenIs(Node e) {
+        if (e.type == null) {                            // `x is null`
+            GenExpr(e.a);
+            if (tgt86 == 1) { X3(0x48, 0x83, 0xFF); X1(0x00); } else { E4(0xEB1F001F); }                              // cmp x0, xzr
+            if (e.op == 1) {
+                if (tgt86 == 1) { X3(0x0F, 0x95, 0xC0); X3(0x48, 0x0F, 0xB6); X1(0xF8); } else { E4(0x9A9F07E0); }                          // `is not null`: cset ne
+            } else {
+                if (tgt86 == 1) { X3(0x0F, 0x94, 0xC0); X3(0x48, 0x0F, 0xB6); X1(0xF8); } else { E4(0x9A9F17E0); }                          // `is null`: cset eq
+            }
+            return;
+        }
+        // the FULL pattern name: a bare sval is just the head ("List", or
+        // "int" with the nullable `?` parked in op), which could never match
+        // the receiver's rendered static type ("List<int?>", "int?")
+        string tt = TypeFullName(e.type);
+        string st = StaticTyOf(e.a);
+        if (e.sval != null) {
+            // `x is T v`: evaluate once and hold the value across the test;
+            // a match stores it into the pre-stamped binding slot. Storing
+            // unconditionally is observably the same as storing on match
+            // only: reads are guarded by this very test (definite
+            // assignment), so the junk slot is never observed on a miss.
+            GenExpr(e.a);
+            XPushV0();                              // push v
+            LdrU(0, 31, 0);                              // x0 = v (peek)
+            EmitTypeTestNg(tt, st);
+            int li = LocalIdx(e.sval);
+            XPopV(1);                              // pop v -> x1
+            if (li >= 0) { StoreLocal(li, 1); }
+        } else {
+            GenExpr(e.a);                                // x0 = receiver
+            EmitTypeTestNg(tt, st);
+        }
+        if (e.op == 1) {                                 // `is not`: negate
+            E4(0xF100001F);                              // cmp x0, #0
+            if (tgt86 == 1) { X3(0x0F, 0x94, 0xC0); X3(0x48, 0x0F, 0xB6); X1(0xF8); } else { E4(0x9A9F17E0); }                              // cset x0, eq
+        }
+    }
+
+    // x as T -- like gen0: upcasts/identity, unrelated static types and
+    // non-class targets pass the value through; a downcast consults the
+    // runtime class site and yields null on failure
+    void GenAs(Node e) {
+        string tt = e.type != null ? e.type.sval : null;
+        string st = StaticTyOf(e.a);
+        Cls tc = tt != null ? FindClass(tt) : null;
+        if (tt == null || tc == null || st == null) { GenExpr(e.a); return; }
+        string sc = ClassTyOf(st);
+        if (sc == null) { GenExpr(e.a); return; }
+        if (st != "object") {
+            if (sc == tt || DerivesFrom(sc, tt)) { GenExpr(e.a); return; }
+            if (!DerivesFrom(tt, sc)) { GenExpr(e.a); return; }
+        }
+        // downcast: keep the value on the stack across the site test
+        GenExpr(e.a);
+        XPushV0();                                  // push v
+        LdrU(0, 31, 0);                                  // x0 = v
+        GenIsSite(tc);                                   // x0 = 0/1
+        int failL = NL();
+        int endL = NL();
+        CbzReg(0, failL);
+        XPopV(0);                                  // pop v -> x0
+        EmitB(endL);
+        Mark(failL);
+        XPopV(0);                                  // pop v (discard)
+        LoadImm(0, 0);                                   // null
+        Mark(endL);
+    }
+
+    // runtime site check for `x is T` with the object in x0: extract the
+    // site from obj-8's upper half and compare against T's site set (T and
+    // every class deriving from it)
+    void GenIsSite(Cls c) {
+        int zeroL = NL();
+        int foundL = NL();
+        int endL = NL();
+        CbzReg(0, zeroL);                                // null -> false
+        RtLdur(1, 0, -8);                                // ldur x1, [x0, #-8]
+        LsrImm64(1, 32);                                  // lsr x1, x1, #32 (site)
+        int i = 0;
+        while (i < classes.Count) {
+            Cls cc = classes[i];
+            if (cc.site > 0 && DerivesFrom(cc.name, c.name)) {
+                LoadImm(2, cc.site);
+                CmpRR(1, 2);                          // cmp x1, x2
+                EmitBcond(0, foundL);                    // b.eq
+            }
+            i = i + 1;
+        }
+        Mark(zeroL);
+        LoadImm(0, 0);
+        EmitB(endL);
+        Mark(foundL);
+        LoadImm(0, 1);
+        Mark(endL);
+    }
+
+    // declared static type name of an expression (before class identity
+    // normalization), or null when nothing is known
+    string StaticTyOf(Node e) {
+        // Depth guard: cyclic type chains bottom out as unknown instead of
+        // recursing forever. Fluent chains are typed WITHOUT memoization:
+        // position keys mislabel sub-nodes sharing an expression start, and
+        // the chain walkers reuse already-computed receiver types instead.
+        if (stTyDepth > 256) { return null; }
+        stTyDepth = stTyDepth + 1;
+        string r = StaticTyOfInner(e);
+        stTyDepth = stTyDepth - 1;
+        return r;
+    }
+
+    string StaticTyOfInner(Node e) {
+        if (e == null) { return null; }
+        if (HostIsLength(e)) { return "int"; }
+        if (e.kind == AK.ThisExpr() || (e.kind == AK.Ident() && e.sval == "this")) {
+            // a specialization's `this` carries the instantiation type
+            string tt = NamedSlotTy("this");
+            return tt != null && tt != "" ? tt : curCls;
+        }
+        if (e.kind == AK.BaseExpr() || (e.kind == AK.Ident() && e.sval == "base")) {
+            Cls bc = FindClass(curCls);
+            return bc != null ? bc.baseName : null;
+        }
+        if (e.kind == AK.NewExpr()) {
+            if (e.type == null) { return null; }
+            if (e.ival != 1) { return TypeFullName(e.type); }
+            return TypeFullName(e.type) + ArrSuffix(1 + e.op);
+        }
+        if (e.kind == AK.CastExpr() && e.type != null) { return e.type.sval; }
+        if (e.kind == AK.AsExpr() && e.type != null) { return e.type.sval; }
+        if (e.kind == AK.AwaitExpr()) { return AsyncAwaitElemTyNg(e.a); }
+        if (e.kind == AK.TupleExpr()) { return TupleExprMangledNg(e); }
+        if (e.kind == AK.MemberAccess() && (e.sval == "IsCompleted" || e.sval == "Result")) {
+            string tt2 = StaticTyOf(e.a);
+            if (tt2 != null && (tt2 == "Task" || tt2.IndexOf("Task<") == 0)) {
+                if (e.sval == "IsCompleted") { return "int"; }
+                int lt2 = tt2.IndexOf("<");
+                if (lt2 > 0) { return tt2.Substring(lt2 + 1, tt2.Length - lt2 - 2); }
+                return "int";
+            }
+        }
+        if (e.kind == AK.MemberAccess()) {
+            string rmt = ReflMemberTy(e);
+            if (rmt != null) { return rmt; }
+        }
+        if (e.kind == AK.Ident()) { return NamedSlotTy(e.sval); }
+        if (e.kind == AK.Call()) {
+            // `a?.M(...)` (callee marker ival==1): a value return lifts to
+            // T? like the member form, so the decl/assignment boundary
+            // never boxes the already-boxed cell twice
+            if (e.a != null && e.a.kind == AK.MemberAccess() && e.a.ival == 1) {
+                e.a.ival = 0;
+                string crt = CallRetTy(e);
+                e.a.ival = 1;
+                if (crt != null && IsNulableValueTy(crt)) { return crt + "?"; }
+                return crt;
+            }
+            return CallRetTy(e);
+        }
+        if (e.kind == AK.MemberAccess()) {
+            // null-conditional `a?.m` (parser marker ival==1): a value-typed
+            // member result lifts to T? exactly like the oracle's
+            // null_cond_result_type; references stay raw
+            if (e.ival == 1) {
+                e.ival = 0;
+                string qmt = StaticTyOfInner(e);
+                e.ival = 1;
+                if (qmt != null && IsNulableValueTy(qmt)) { return qmt + "?"; }
+                return qmt;
+            }
+            // primitive-type constants type as their primitive
+            // (double.MaxValue prints as a double)
+            if (PrimitiveConstLit(e) != null) {
+                if (e.a.sval == "double" || e.a.sval == "float" || e.a.sval == "Math") { return "double"; }
+                if (e.a.sval == "long") { return "long"; }
+                if (e.a.sval == "ulong") { return "ulong"; }
+                if (e.a.sval == "char") { return "char"; }
+                return "int";
+            }
+            if ((e.sval == "Keys" || e.sval == "Values") && ExprCls(e.a) == "Dict") {
+                return "List<" + DictSlotTy(e.a, e.sval == "Keys") + ">";
+            }
+            // span view member: Length is the boxed view length
+            if (e.sval == "Length" && SpanContainerTy(e.a) != null) { return "int"; }
+            // nullable payload members: HasValue is bool, Value the payload
+            if (e.sval == "HasValue" || e.sval == "Value") {
+                string nrt = e.a != null ? StaticTyOf(e.a) : null;
+                if (nrt != null && IsNulTy(nrt)) {
+                    if (e.sval == "HasValue") { return "bool"; }
+                    if (e.sval == "Value") { return NulPayOf(nrt); }
+                }
+            }
+            // EnumType.Member constants carry their enum identity
+            if (e.a != null && e.a.kind == AK.Ident() && FindEnum(e.a.sval) >= 0) { return e.a.sval; }
+            Fld f = FieldOf(e);
+            if (f != null) { return f.ty; }
+            // qualified static field read: ClsName.field carries the
+            // field's declared type (Store.items.Count)
+            if (e.a != null && e.a.kind == AK.Ident() && LocalIdx(e.a.sval) < 0
+                    && FindClass(e.a.sval) != null) {
+                string qst = FindStaticTy(QualifiedCls(e.a.sval, e.sval2), e.sval);
+                if (qst != null) { return qst; }
+            }
+            return PropGetterTy(e);
+        }
+        if (e.kind == AK.Index()) { return ElemTyOf(e); }
+        return null;
+    }
+
+    // declared type of an instance property read (obj.Prop with no backing
+    // field): resolve the desugared get_Prop accessor in the receiver's
+    // class chain and substitute generic arguments
+    // (KeyValuePair<string,int>.Key -> string). Only Ident/this receivers
+    // are typed -- cheap slot lookups; chaining into deeper expressions
+    // would re-walk fluent prefixes from every StaticTyOf query.
+    string PropGetterTy(Node mem) {
+        if (mem == null || mem.kind != AK.MemberAccess()) { return null; }
+        if (mem.a == null) { return null; }
+        // ClsName.Prop: the desugared static getter carries the declared type
+        // (Encoding.UTF8 types as Encoding)
+        if (mem.a.kind == AK.Ident() && LocalIdx(mem.a.sval) < 0 && FindClass(mem.a.sval) != null) {
+            Node sg = AccessorInChain(mem.a.sval, "get_" + mem.sval);
+            if (sg != null && sg.type != null && HasMod(sg, MOD.Static())) { return TypeFullName(sg.type); }
+        }
+        string recvTy = StaticTyOf(mem.a);
+        if (recvTy == null) { return null; }
+        string cn = ClassTyOf(recvTy);
+        if (cn == null) { return null; }
+        Node gm = AccessorInChain(cn, "get_" + mem.sval);
+        if (gm == null || gm.type == null) { return null; }
+        string rty = TypeFullName(gm.type);
+        int lt = recvTy.IndexOf("<");
+        Cls rc = FindClass(cn);
+        if (lt <= 0 || rc == null || rc.tps.Count == 0) { return rty; }
+        List<string> targs = SplitTyArgs(recvTy.Substring(lt + 1, recvTy.Length - lt - 2));
+        return SubstTy(rty, rc.tps, targs);
+    }
+
+    // map an interpolation format specifier to a printf pattern, mirroring
+    // gen0's interp_format_to_printf exactly (the conformance suite pins the
+    // mapping); "" means the default rendering
+    string FormatSpecToPrintf(string spec, bool isUlong) {
+        if (spec == null || spec.Length == 0) { return ""; }
+        string code = spec.Substring(0, 1);
+        int digits = 0;
+        int i = 1;
+        while (i < spec.Length) {
+            int d = spec[i] - 48;
+            if (d >= 0 && d <= 9) { digits = digits * 10 + d; }
+            i = i + 1;
+        }
+        if (code == "D" || code == "d") {
+            // decimal, zero-padded to `digits`
+            if (isUlong) { return digits <= 0 ? "" : "%0" + Convert.ToString(digits) + "llu"; }
+            return digits <= 0 ? "" : "%0" + Convert.ToString(digits) + "lld";
+        }
+        if (code == "X" || code == "x") {
+            // hex (upper/lower), zero-padded to `digits`
+            return digits <= 0 ? "" : "%0" + Convert.ToString(digits) + "llX";
+        }
+        if (code == "F" || code == "f") { return "%." + Convert.ToString(digits) + "lf"; }
+        if (code == "E" || code == "e") { return "%." + Convert.ToString(digits) + "E"; }
+        if (code == "G" || code == "g") {
+            // general: default is the shortest round-trip render; a digit
+            // count means significant digits ({v:G3} -> %.3g)
+            return digits > 0 ? "%." + Convert.ToString(digits) + "g" : "";
+        }
+        if (code == "0" || code == "#") {
+            // custom numeric: 0 = required digit, # = optional
+            int ipad = 0;
+            int frac = 0;
+            bool afterDot = false;
+            bool haveDot = false;
+            i = 0;
+            while (i < spec.Length) {
+                string ch = spec.Substring(i, 1);
+                if (ch == ".") { afterDot = true; haveDot = true; }
+                else if (ch == "0" || ch == "#") {
+                    if (afterDot) { frac = frac + 1; }
+                    else if (ch == "0") { ipad = ipad + 1; }
+                }
+                i = i + 1;
+            }
+            if (haveDot) { return "%." + Convert.ToString(frac) + "lf"; }
+            if (ipad > 0) {
+                string u = isUlong ? "llu" : "lld";
+                return "%0" + Convert.ToString(ipad) + u;
+            }
+            return "";
+        }
+        return "";                             // unrecognized: default format
+    }
+
+    // does the mapped printf pattern render as a double (fixed/scientific
+    // spec on an integer widens it first, like C#)?
+    bool SpecWantsDouble(string spec) {
+        if (spec == null || spec.Length == 0) { return false; }
+        string code = spec.Substring(0, 1);
+        if (code == "F" || code == "f" || code == "E" || code == "e") { return true; }
+        if (code == "0" || code == "#") {
+            int i = 0;
+            while (i < spec.Length) {
+                if (spec.Substring(i, 1) == ".") { return true; }
+                i = i + 1;
+            }
+        }
+        return false;
+    }
+
+    // scalar x.ToString("spec"): the compiler-mapped printf render (the
+    // lexer splice turns an interpolation hole `{v:D4}` into
+    // `v.ToString("D4")`). bool/string/char ignore the spec like gen0;
+    // int-family receivers widen to double for fixed/scientific patterns.
+    void GenScalarToStringFmt(Node e, Node recv, string spec) {
+        string sty = ScalarToStringTy(recv);
+        if (sty == "bool") {
+            GenExpr(recv);
+            int fls = NL();
+            int doneb = NL();
+            CbzReg(0, fls);
+            LoadStr(InternStr("true"), 0);
+            EmitB(doneb);
+            Mark(fls);
+            LoadStr(InternStr("false"), 0);
+            Mark(doneb);
+            return;
+        }
+        if (sty == "string") { GenExpr(recv); return; }
+        if (sty == "char") {
+            GenExpr(recv);
+            BLInternal("_zan_rt_chrstr");
+            return;
+        }
+        // gen0's is_float rule: a double receiver ignores decimal/hex
+        // padding specs (D/X) and renders with the default path
+        string c0 = spec != null && spec.Length > 0 ? spec.Substring(0, 1) : "";
+        bool dblNoFmt = sty == "double"
+            && (c0 == "D" || c0 == "d" || c0 == "X" || c0 == "x");
+        string pf = dblNoFmt ? "" : FormatSpecToPrintf(spec, sty == "ulong");
+        if (pf == "") {
+            // default rendering: the plain paths
+            if (sty == "double") {
+                GenExpr(recv);
+                BLInternal("_zan_rt_dbl2str");
+            } else if (sty == "ulong") {
+                GenExpr(recv);
+                BLInternal("_zan_rt_uint2str");
+            } else {
+                GenExpr(recv);
+                BLInternal("_zan_rt_int2str");
+            }
+            return;
+        }
+        GenExpr(recv);
+        // gen0 widens an integer receiver to double for fixed/scientific
+        // patterns (its SIToFP sees the same signed bits scvtf does)
+        if (SpecWantsDouble(spec) && (sty == "int" || sty == "ulong")) { ConvI2D(); }
+        LoadStr(InternStr(pf), 1);
+        BLInternal("_zan_rt_fmt");
+    }
+
+    // the struct class when the expression is struct-typed, else null
+    Cls StructOf(Node e) {
+        string t = StaticTyOf(e);
+        if (t == null) { return null; }
+        // 批47:实例化泛型 struct 优先取替换视图 —— 擦除(FindClass→开
+        // 模板)叶类型擦成 "T1/T2",等值的 double 叶会丢 IEEE 语义
+        // (fmov/fcmp 走不上);视图给回精确叶型。批49:按需建视图,
+        // struct 实参形状也入视图;递归/基类/虚形状落回擦除,箱语义照旧。
+        if (t.IndexOf("<") > 0) {
+            Cls vc = StructInstViewOf(t);
+            if (vc != null) { return vc; }
+        }
+        Cls c = FindClass(t);
+        return c != null && c.isStruct == 1 ? c : null;
+    }
+
+    // 批47:实例化泛型 struct 的代码生成端回退 —— 只认布局期已批准并
+    // 缓存的替换视图。布局期拒掉的形状(递归、基类/虚、显式布局)在
+    // 箱语义下照旧合法,这里静默回退 null。
+    Cls StructInstViewCached(string ty) {
+        if (instViewKeys == null) { return null; }
+        int vi = IndexOfStrNg(instViewKeys, ty);
+        return vi >= 0 ? instViewVals[vi] : null;
+    }
+
+    // 批49:按需建视图 —— 布局二遍只为类字段里出现的实例化建视图;
+    // 只在方法签名/体里出现的实例化(new Pair<Pt,long>(...))在此补建,
+    // 守卫(基类/虚/显式布局/递归)与布局期同一套,建不成回 null。
+    Cls StructInstViewOf(string ty) {
+        if (ty == null) { return null; }
+        int lt = ty.IndexOf("<");
+        if (lt <= 0 || ty.Substring(ty.Length - 1, 1) != ">") { return null; }
+        Cls vc = StructInstViewCached(ty);
+        if (vc != null) { return vc; }
+        List<string> stack = new List<string>();
+        return StructExpandTy(ty, stack);
+    }
+
+    // 批49:类型全名的特化解析 —— 实例化泛型 struct 优先替换视图
+    // (箱载荷 = 特化布局),其余照旧擦除解析。所有 struct 箱分配点
+    // (声明/new/克隆/with)经此取形状,与 FieldOfInst 视图优先对表。
+    Cls SpecClsOf(string ty) {
+        if (ty == null || ty == "") { return null; }
+        if (ty.IndexOf("<") > 0) {
+            Cls vc = StructInstViewOf(ty);
+            if (vc != null) { return vc; }
+        }
+        return FindClass(ty);
+    }
+
+    // the shared struct type when BOTH operands are the same struct, else
+    // null (guards field-wise ==/!= emission)
+    // null coalescing only lowers when the left operand's null really is 0:
+    // reference shapes (string, class/interface, array, List/Dict/Task)
+    bool QQRefShapeNg(Node a) {
+        if (a == null) { return false; }
+        if (IsStrExpr(a)) { return true; }
+        string t = StaticTyOf(a);
+        if (t == null) { return false; }
+        if (ClassTyOf(t) != null) { return true; }
+        return t == "object" || t == "ptr"
+            || (t.Length > 2 && t.Substring(t.Length - 2, 2) == "[]")
+            || t.IndexOf("List<") == 0 || IsDictTyName(t)
+            || t.IndexOf("Task") == 0;
+    }
+
+    Cls StructEqPair(Node a, Node b) {
+        Cls sa = StructOf(a);
+        if (sa == null) { return null; }
+        Cls sb = StructOf(b);
+        if (sb == null || sb != sa) { return null; }
+        return sa;
+    }
+
+    // struct value semantics: when expression e is struct-typed, replace x0
+    // with a fresh copy of the object (gen0 keeps structs inline with value
+    // semantics; ngen models them as heap objects, so every slot a struct
+    // lands in -- assignment, initialization, argument, return -- copies).
+    // The clone duplicates the descriptor word (class site) and all fields.
+    void GenCloneIfStruct(Node e) {
+        string t = StaticTyOf(e);
+        Cls c = t != null ? SpecClsOf(t) : null;
+        if (c == null || c.isStruct != 1) { return; }
+        GenCloneStructCls(c);
+    }
+
+    // x0 = fresh heap copy of the struct box in x0 (the box pointer travels
+    // with a 16-byte header; the clone duplicates header + payload)
+    void GenCloneStructCls(Cls c) {
+        XPushV0();                          // push src BEFORE x0 is reused
+        LoadImm(0, c.size + 16);
+        LoadImm(1, 0);
+        BLInternal("_zan_rt_alloc");             // x0 = dst
+        XPopV(1);                          // pop src -> x1
+        LoadImm(2, c.size + 16);
+        SubImm(0, 0, 8);                         // dst - 8 (descriptor)
+        SubImm(1, 1, 8);                         // src - 8
+        BLExtern("_memcpy");
+        AddImm(0, 0, 8);                         // x0 = dst
+    }
+
+    // ---- 批43:嵌套 struct 值字段(扁平展开)----
+    // the concrete struct a field's flattened region holds, else null
+    // (批47:expCls 是布局期落下的单一真源 —— 实例化泛型字段的替换视图
+    // 只在这里可达,按 ty 串 FindClass 对带 < 的名字必 null)
+    Cls ExpandedStructOf(Fld f) {
+        if (f == null || f.expanded != true) { return null; }
+        if (f.expCls != null) { return f.expCls; }
+        return FindClass(f.ty);
+    }
+
+    // is every link of this member chain an expanded struct value field
+    // (so the chain is offset arithmetic into the root's payload, never a
+    // dereference)? An Ident naming an expanded instance field counts as a
+    // one-link chain through `this`; a local/static/call root with an
+    // expanded first link is fine -- offsets apply to the evaluated value
+    bool ChainIsExpanded(Node prefix) {
+        Node cur = prefix;
+        while (cur != null && cur.kind == AK.MemberAccess()) {
+            Fld cf = FieldOf(cur);
+            if (cf == null || ExpandedStructOf(cf) == null) { return false; }
+            cur = cur.a;
+        }
+        if (cur == null) { return false; }
+        if (cur.kind == AK.Ident()) {
+            if (LocalIdx(cur.sval) >= 0) { return true; }
+            if (FindStaticSym(curCls, cur.sval) != null) { return true; }
+            Fld rf = CurField(cur.sval);
+            return rf != null && ExpandedStructOf(rf) != null;
+        }
+        return true;
+    }
+
+    // x0 = the absolute payload base of a nested struct value region: the
+    // root receiver evaluates once, then every expanded link adds its
+    // offset -- no dereference, no copy (stores and addresses land in the
+    // parent's own payload). Call only when ChainIsExpanded(prefix).
+    void GenNestedRegionAddr(Node prefix) {
+        List<Node> links = new List<Node>();
+        Node cur = prefix;
+        while (cur != null && cur.kind == AK.MemberAccess()) {
+            links.Add(cur);
+            cur = cur.a;
+        }
+        GenExpr(cur);
+        int k = links.Count - 1;                 // outermost link first
+        while (k >= 0) {
+            Fld cf = FieldOf(links[k]);
+            if (cf != null) {
+                if (cf.off <= 4095) { AddImm(0, 0, cf.off); }
+                else { LoadImm(16, cf.off); AddRR(0, 0, 16); }
+            }
+            k = k - 1;
+        }
+    }
+
+    // x0 = receiver (already null-guarded by the caller) -> x0 = a fresh
+    // box whose payload is the receiver's flattened sub-struct region.
+    // Value reads materialize a copy so later member writes can never
+    // reach back into the parent.
+    void MaterializeNestedBox(Cls nc, Fld f) {
+        XPushV0();                              // hold recv
+        LoadImm(0, nc.size + 16);
+        LoadImm(1, 0);
+        BLInternal("_zan_rt_alloc");             // x0 = box
+        XPopV(1);                              // x1 = recv
+        XPushV0();                              // hold box
+        if (f.off <= 4095) { AddImm(1, 1, f.off); }
+        else { LoadImm(16, f.off); AddRR(1, 1, 16); }
+        LoadImm(2, nc.size);
+        BLExtern("_memcpy");                    // memcpy(dst=box, src=recv+off, n)
+        XPopV(0);                              // x0 = box
+    }
+
+    // 批43:flatten a struct's value fields into leaf slots (absolute
+    // offsets, width-8 synthetic Flds) for field-wise equality and array
+    // Contains; non-expanded fields (class/string/array boxes and legacy
+    // slots) come through as single slots -- exactly the pre-批43
+    // behavior for those shapes
+    void FlatValueFields(Cls c, List<Fld> outF, int baseOff, List<string> stack) {
+        if (IndexOfStrNg(stack, c.name) >= 0) { return; }
+        List<string> ns = new List<string>();
+        int si = 0;
+        while (si < stack.Count) { ns.Add(stack[si]); si = si + 1; }
+        ns.Add(c.name);
+        int k = 0;
+        while (k < c.flds.Count) {
+            Fld f = c.flds[k];
+            Cls nc = ExpandedStructOf(f);
+            if (nc != null) { FlatValueFields(nc, outF, baseOff + f.off, ns); }
+            else { outF.Add(new Fld(f.name, baseOff + f.off, f.ty)); }
+            k = k + 1;
+        }
+    }
+
+}

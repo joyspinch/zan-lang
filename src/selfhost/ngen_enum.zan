@@ -1,0 +1,389 @@
+using System;
+using System.Collections.Generic;
+namespace Zan;
+
+partial class Ngen {
+    // ---- enums ----
+    void CollectEnums(Node unit) {
+        enName = new List<string>();
+        enOff = new List<int>();
+        enCnt = new List<int>();
+        enMem = new List<string>();
+        enVal = new List<long>();
+        int i = 0;
+        while (i < unit.kids.Count) {
+            Node dcl = unit.kids[i];
+            if (dcl.kind == AK.EnumDecl()) {
+                enName.Add(dcl.sval);
+                enOff.Add(enMem.Count);
+                int cnt = 0;
+                long val = 0;
+                int k = 0;
+                while (k < dcl.kids.Count) {
+                    Node m = dcl.kids[k];
+                    if (m.sval != null && m.sval != "") {
+                        // an explicit `= n` (int literal, possibly negated)
+                        // resets the running counter, like gen0's fold
+                        if (m.a != null && m.a.kind == AK.IntLit()) { val = m.a.ival; }
+                        else if (m.a != null && m.a.kind == AK.Unary()
+                                && m.a.op == TK.Minus() && m.a.a != null
+                                && m.a.a.kind == AK.IntLit()) { val = -m.a.a.ival; }
+                        enMem.Add(m.sval);
+                        enVal.Add(val);
+                        cnt = cnt + 1;
+                        val = val + 1;
+                    }
+                    k = k + 1;
+                }
+                enCnt.Add(cnt);
+            }
+            i = i + 1;
+        }
+    }
+
+    int FindEnum(string n) {
+        int i = 0;
+        while (i < enName.Count) { if (enName[i] == n) { return i; } i = i + 1; }
+        return -1;
+    }
+
+    // flat index of member `mem` of enum `en`, or -1
+    int FindEnumMemIdx(string en, string mem) {
+        int ei = FindEnum(en);
+        if (ei < 0) { return -1; }
+        int i = 0;
+        while (i < enCnt[ei]) {
+            if (enMem[enOff[ei] + i] == mem) { return enOff[ei] + i; }
+            i = i + 1;
+        }
+        return -1;
+    }
+
+    // the enum type an expression's static type names, or null
+    string EnumTyOf(Node e) {
+        if (e == null) { return null; }
+        string t = StaticTyOf(e);
+        if (t != null && FindEnum(t) >= 0) { return t; }
+        return null;
+    }
+
+    // enum x.ToString(): the name of the first member whose constant equals
+    // the value (declaration order wins duplicates, like gen0); an unmatched
+    // value formats as its number
+    void GenEnumToString(Node recv, string et) {
+        int ei = FindEnum(et);
+        GenExpr(recv);
+        XPushV0();                                  // push v
+        int numL = NL();
+        int joinL = NL();
+        int cnt = enCnt[ei];
+        int[] hits = new int[cnt];
+        int i = 0;
+        while (i < cnt) {
+            hits[i] = NL();
+            LdrU(1, 31, 0);                              // x1 = [sp] (peek v)
+            LoadImm(2, enVal[enOff[ei] + i]);
+            CmpRR(1, 2);                              // cmp x1, x2
+            EmitBcond(0, hits[i]);                       // b.eq
+            i = i + 1;
+        }
+        XPopV(0);                                  // pop v -> x0
+        BLInternal("_zan_rt_int2str");                   // numeric fallback
+        EmitB(joinL);
+        i = 0;
+        while (i < cnt) {
+            Mark(hits[i]);
+            XPopV(0);                              // pop v (discard)
+            LoadStr(InternStr(enMem[enOff[ei] + i]), 0);
+            EmitB(joinL);
+            i = i + 1;
+        }
+        Mark(joinL);
+    }
+
+    // EnumType.TryParse(text, out value): a case-sensitive probe over the
+    // declaration-order member names, like gen0 -- a hit stores the member
+    // constant through the out address and yields 1, a miss stores
+    // default(T) and yields 0
+    void GenEnumTryParse(Node e) {
+        string en = e.a.a.sval;
+        int ei = FindEnum(en);
+        GenRefArg(e.kids[1]);                            // x0 = out address
+        XPushV0();                                  // push addr
+        GenExpr(e.kids[0]);                              // x0 = text
+        XPushV0();                                  // push text (strcmp0
+                                                        // clobbers x0-x17, so
+                                                        // every probe peeks)
+        int cnt = enCnt[ei];
+        int miss = NL();
+        int join = NL();
+        int[] hits = new int[cnt];
+        int i = 0;
+        while (i < cnt) {
+            hits[i] = NL();
+            E4(0xF84003E1);                              // ldur x1, [sp] (text)
+            LoadStr(InternStr(enMem[enOff[ei] + i]), 0);
+            BLInternal("_zan_rt_strcmp0");               // w0 = 0 iff equal
+            E4(0x7100001F);                              // cmp w0, #0
+            EmitBcond(0, hits[i]);                       // b.eq hit
+            i = i + 1;
+        }
+        XPopV(0);                                  // pop text (discard)
+        XPopV(1);                                  // pop addr -> x1
+        StrU(31, 1, 0);                                  // str xzr, [x1] (default)
+        LoadImm(0, 0);
+        EmitB(join);
+        i = 0;
+        while (i < cnt) {
+            Mark(hits[i]);
+            XPopV(0);                              // pop text (discard)
+            XPopV(1);                              // pop addr -> x1
+            LoadImm(2, enVal[enOff[ei] + i]);
+            StrU(2, 1, 0);                               // member constant
+            LoadImm(0, 1);
+            EmitB(join);
+            i = i + 1;
+        }
+        Mark(join);
+    }
+
+    // true when sub's base chain reaches anc (equal counts)
+    bool DerivesFrom(string sub, string anc) {
+        if (sub == null || anc == null) { return false; }
+        string cur = sub;
+        while (cur != null) {
+            if (cur == anc) { return true; }
+            Cls cc = FindClass(cur);
+            if (cc == null) { return false; }
+            cur = cc.baseName;
+        }
+        return false;
+    }
+
+    // declared type of a local, field or static of that name (locals shadow
+    // fields shadow statics, matching the binder's lookup order). A local
+    // declared in a closed sibling block still types by name (the oracle
+    // binder's method-flat table): ChartViewPolar reads `p.radiusInner`
+    // after the loop that declared `p` has closed.
+    string NamedSlotTy(string name) {
+        int li = LocalIdx(name);
+        if (li >= 0) { return locTy[li]; }
+        Fld f = CurField(name);
+        if (f != null) { return f.ty; }
+        string st = FindStaticTy(curCls, name);
+        if (st != null) { return st; }
+        int di = DeclaredLocIdxNg(name);
+        return di >= 0 ? locTy[di] : null;
+    }
+
+    // the latest method-wide slot declaring `name`: the reserve walk adds
+    // declarations in program order, so the last index wins
+    int DeclaredLocIdxNg(string name) {
+        int i = nloc - 1;
+        while (i >= 0) {
+            if (locName[i] == name) { return i; }
+            i = i - 1;
+        }
+        return -1;
+    }
+
+    string TypeFullName(Node t) {
+        if (t == null) { return ""; }
+        // tuple ref: sval already carries the mangled "__Tuple_<elems>"
+        // class name; the element types ride in kids for layout only
+        if (t.op == 2) { return t.sval + ArrSuffix(t.ival); }
+        string n = t.sval;
+        if (t.kids != null && t.kids.Count > 0) {
+            n = n + "<";
+            int i = 0;
+            while (i < t.kids.Count) {
+                if (i > 0) { n = n + ","; }
+                n = n + TypeFullName(t.kids[i]);
+                i = i + 1;
+            }
+            n = n + ">";
+        }
+        // `T?` marks a nullable VALUE payload (primitive, enum, struct): the
+        // question rides the payload name ahead of any array suffix.
+        // Reference types erase it -- a null reference needs no wrapper
+        // (the oracle's `int[]?` is equally a no-op).
+        if (t.op == 1 && IsNulableValueTy(n)) { n = n + "?"; }
+        // multidim rank: sval2 counts the commas of the level that carried
+        // them ("int[,]" 1, "int[,,]" 2, "int[][,]" 1 from the inner level)
+        // -- the comma suffix renders on the final level
+        if (t.ival > 0 && t.sval2 != null && t.sval2 != "") {
+            int commas = (int)Convert.ToInt64(t.sval2);
+            string suf = "[";
+            int ci = 0;
+            while (ci < commas) { suf = suf + ","; ci = ci + 1; }
+            return n + ArrSuffix(t.ival - 1) + suf + "]";
+        }
+        return n + ArrSuffix(t.ival);
+    }
+
+    // array-type helpers ("int[]" style declared types). The outermost
+    // bracket group decides the shape: it holds nothing (jagged "[]") or
+    // commas only (rectangular "[,]", "[,,]")
+    bool IsArrTy(string t) {
+        if (t == null || t.Length < 2) { return false; }
+        if (t.Substring(t.Length - 1, 1) != "]") { return false; }
+        int i = t.Length - 2;
+        while (i >= 0) {
+            string c = t.Substring(i, 1);
+            if (c == "[") { return true; }
+            if (c != ",") { return false; }
+            i = i - 1;
+        }
+        return false;
+    }
+    // rank of the outermost level ("int[]" 1, "int[,]" 2, "int[,,]" 3);
+    // non-array types answer 1
+    int ArrRankOf(string t) {
+        if (!IsArrTy(t)) { return 1; }
+        int i = t.Length - 2;
+        int commas = 0;
+        while (i >= 0 && t.Substring(i, 1) != "[") { commas = commas + 1; i = i - 1; }
+        return commas + 1;
+    }
+    bool IsArrExpr(Node e) {
+        if (e == null) { return false; }
+        string act = ArrContainerTy(e);
+        if (act != null) { return true; }
+        if (e.kind == AK.Ident()) {
+            int li = LocalIdx(e.sval);
+            if (li >= 0) { return IsArrTy(locTy[li]); }
+            Fld f = CurField(e.sval);
+            return f != null && IsArrTy(f.ty);
+        }
+        if (e.kind == AK.NewExpr()) {
+            return e.ival == 1;
+        }
+        return false;
+    }
+    // n copies of the array suffix ("[][]" for 2)
+    string ArrSuffix(int n2) {
+        string s2 = "";
+        int i = 0;
+        while (i < n2) { s2 = s2 + "[]"; i = i + 1; }
+        return s2;
+    }
+
+    // allocated array type of a `new T[...]` node: one sized rank (dims
+    // count rides in sval2 -- "new int[2,3]" is "int[,]") plus one suffix
+    // per trailing rank-only bracket ("new int[3][]" is "int[][]")
+    string NewArrTyOf(Node e) {
+        string n = TypeFullName(e.type);
+        int dims = e.sval2 != null && e.sval2 != "" ? (int)Convert.ToInt64(e.sval2) : 1;
+        if (dims > 1) {
+            string suf = "[";
+            int ci = 1;
+            while (ci < dims) { suf = suf + ","; ci = ci + 1; }
+            n = n + suf + "]";
+        } else {
+            n = n + "[]";
+        }
+        return n + ArrSuffix(e.op);
+    }
+
+    string ArrTyOf(Node e) {
+        string act = ArrContainerTy(e);
+        if (act != null) { return act; }
+        if (e.kind == AK.Ident()) {
+            int li = LocalIdx(e.sval);
+            if (li >= 0 && IsArrTy(locTy[li])) { return locTy[li]; }
+            Fld f = CurField(e.sval);
+            if (f != null && IsArrTy(f.ty)) { return f.ty; }
+            return "int[]";
+        }
+        if (e.kind == AK.NewExpr() && e.type != null && e.ival == 1) {
+            return NewArrTyOf(e);
+        }
+        return "int[]";
+    }
+
+    // declared array type of an expression usable as an element container:
+    // a local, an instance field (implicit this or through a receiver), a
+    // static field (of the current class or class-qualified), `new T[]`,
+    // a cast/as to an array type, a nested element read of an
+    // array-of-arrays, or a call returning an array. Unlike ArrTyOf this
+    // never guesses -- null means "not a known array".
+    string ArrContainerTy(Node e) {
+        if (e == null) { return null; }
+        if (e.kind == AK.Ident()) {
+            int li = LocalIdx(e.sval);
+            if (li >= 0 && IsArrTy(locTy[li])) { return locTy[li]; }
+            Fld f = CurField(e.sval);
+            if (f != null && IsArrTy(f.ty)) { return f.ty; }
+            string st = FindStaticTy(curCls, e.sval);
+            if (st != null && IsArrTy(st)) { return st; }
+            return null;
+        }
+        if (e.kind == AK.NewExpr() && e.type != null && e.ival == 1) {
+            return NewArrTyOf(e);
+        }
+        if (e.kind == AK.CastExpr() && e.type != null) {
+            string ct = TypeFullName(e.type);
+            if (IsArrTy(ct)) { return ct; }
+            return null;
+        }
+        if (e.kind == AK.AsExpr() && e.type != null) {
+            string at2 = TypeFullName(e.type);
+            if (IsArrTy(at2)) { return at2; }
+            return null;
+        }
+        if (e.kind == AK.MemberAccess()) {
+            Fld f = FieldOf(e);
+            if (f != null && IsArrTy(f.ty)) { return f.ty; }
+            if (e.a != null && e.a.kind == AK.Ident() && FindClass(e.a.sval) != null) {
+                string st = FindStaticTy(QualifiedCls(e.a.sval, e.a.sval2), e.sval);
+                if (st != null && IsArrTy(st)) { return st; }
+            }
+            return null;
+        }
+        if (e.kind == AK.Index()) {
+            string et = ElemTyOf(e);
+            if (et != null && IsArrTy(et)) { return et; }
+            return null;
+        }
+        if (e.kind == AK.Call()) {
+            string rt = CallRetTy(e);
+            if (IsArrTy(rt)) { return rt; }
+            return null;
+        }
+        if (e.kind == AK.AwaitExpr()) {
+            string at = AsyncAwaitElemTyNg(e.a);
+            if (IsArrTy(at)) { return at; }
+            return null;
+        }
+        return null;
+    }
+    int ArrElemSize(string t) {
+        string el = ArrElemName(t);
+        if (el == "int" || el == "uint" || el == "float" || el == "char") { return 4; }
+        if (el == "short" || el == "ushort") { return 2; }
+        if (el == "byte" || el == "sbyte" || el == "bool") { return 1; }
+        return 8;
+    }
+
+    // element type name of an array type: strips the outermost bracket
+    // group ("byte[]" -> "byte", "int[,]" -> "int", "int[][,]" -> "int[]")
+    string ArrElemName(string t) {
+        if (t == null || t.Length < 3) { return ""; }
+        if (IsArrTy(t)) {
+            int i = t.Length - 2;
+            while (i >= 0 && t.Substring(i, 1) != "[") { i = i - 1; }
+            if (i > 0) { return t.Substring(0, i); }
+        }
+        return t.Substring(0, t.Length - 2);
+    }
+
+    // base-2 log of the element size (1->0, 2->1, 4->2, 8->3): the lsl
+    // shift used in scaled register addressing
+    int ArrElemShift(int esz) {
+        if (esz == 2) { return 1; }
+        if (esz == 4) { return 2; }
+        if (esz == 8) { return 3; }
+        return 0;
+    }
+
+}

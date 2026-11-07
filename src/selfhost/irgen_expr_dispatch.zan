@@ -1,0 +1,647 @@
+using System;
+using System.Collections.Generic;
+namespace Zan;
+
+partial class Irgen {
+    // ---- method-level monomorphization ----
+    // deep-clone a method AST substituting its type parameters with the
+    // concrete bindings so the specialized body lowers with concrete types
+    Node CloneSubst(Node n, List<string> tns, List<Node> trs) {
+        if (n == null) { return null; }
+        // a TYPE node carries its name in `sval` -- substituting it is what
+        // makes an explicit type argument concrete inside the clone
+        // (`this.Describe<T>(c)` in a `Describe<Conn>` clone must call
+        // `Describe<Conn>`, not `Describe<T>`)
+        if (n.kind == AK.TypeRef()) {
+            Node sub = SubstTP(n, tns, trs);
+            if (sub == null) { return null; }
+            // a copy: stamping the position on the substituted node would
+            // write through to the caller's AST when the substitution did
+            // not replace anything
+            Node r = CopyType(sub);
+            if (r == null) { return null; }
+            r.line = n.line; r.col = n.col; r.mods = n.mods;
+            r.type = CopyType(SubstTP(n.type, tns, trs));
+            return r;
+        }
+        Node c = new Node(n.kind);
+        c.op = n.op; c.ival = n.ival; c.sval = n.sval; c.sval2 = n.sval2;
+        c.mods = n.mods; c.line = n.line; c.col = n.col;
+        c.type = CopyType(SubstTP(n.type, tns, trs));
+        c.a = CloneSubst(n.a, tns, trs);
+        c.b = CloneSubst(n.b, tns, trs);
+        c.c = CloneSubst(n.c, tns, trs);
+        c.d = CloneSubst(n.d, tns, trs);
+        if (n.kind == AK.StringLit() && c.b != null && c.b.sval != "") {
+            c.sval = c.b.sval;
+        }
+        int i = 0;
+        while (i < n.kids.Count) { c.Add(CloneSubst(n.kids[i], tns, trs)); i = i + 1; }
+        return c;
+    }
+
+    // Bind a generic method's type parameters from the call's EXPLICIT type
+    // arguments (`M<int>(x)`). Returns false when the call carries none (or
+    // the count does not match the candidate), so the caller can fall back
+    // to inferring them from the argument types.
+    bool BindTypeArgs(Node m, Node e, List<string> mtps, List<string> names, List<Node> reps) {
+        Node targs = ExplicitTypeArgs(e);
+        if (targs == null) { return false; }
+        if (targs.kids.Count != mtps.Count) { return false; }
+        int i = 0;
+        while (i < mtps.Count) {
+            if (IndexOfStr(names, mtps[i]) < 0) { names.Add(mtps[i]); reps.Add(targs.kids[i]); }
+            i = i + 1;
+        }
+        return true;
+    }
+
+    // "" when the binding is incomplete or still generic; otherwise a tag
+    // encoding both the concrete type arguments and the declared param shapes
+    // (so same-name overloads specialize to distinct symbols)
+    string SpecTag(Node m, List<string> mtps, List<string> tns, List<Node> trs) {
+        return SpecTagP(m, mtps, tns, trs, "");
+    }
+
+    // The same tag, with a prefix that separates the two kinds of
+    // specialization: a method's own type parameters ("" ) and a generic
+    // CLASS's type parameters ("I"). Without the prefix a class-level clone
+    // and a method-level clone of the same method with the same argument
+    // would claim one symbol -- and the first registered body would win
+    // every call site.
+    string SpecTagP(Node m, List<string> mtps, List<string> tns, List<Node> trs, string prefix) {
+        return SpecTagC(m, new List<Node>(), mtps, tns, trs, prefix);
+    }
+
+    // The tag of a class-level clone: it ALSO encodes the class's concrete
+    // type arguments (`ctypes`, taken positionally from the receiver's
+    // static type). Without that part two instantiations of the same generic
+    // class (`Stack<int>` and `Stack<string>`) would claim ONE symbol --
+    // and the first registered body would win every call site, so a
+    // `Stack<string>` call would run the `Stack<int>` body.
+    string SpecTagC(Node m, List<Node> ctypes, List<string> mtps, List<string> tns, List<Node> trs, string prefix) {
+        StringBuilder sb = new StringBuilder();
+        sb.Append(prefix);
+        int i = 0;
+        while (i < ctypes.Count) {
+            if (ctypes[i] == null || MentionsTypeParam(ctypes[i])) { return ""; }
+            sb.Append("_");
+            sb.Append(TypeTag(ctypes[i]));
+            i = i + 1;
+        }
+        i = 0;
+        while (i < mtps.Count) {
+            int hit = IndexOfStr(tns, mtps[i]);
+            if (hit < 0) { return ""; }
+            if (MentionsTypeParam(trs[hit])) { return ""; }
+            sb.Append("_");
+            sb.Append(TypeTag(trs[hit]));
+            i = i + 1;
+        }
+        i = 0;
+        while (i < m.kids.Count) {
+            Node p = m.kids[i];
+            if (p.kind == AK.Param()) { sb.Append("_"); sb.Append(TypeTag(p.type)); }
+            i = i + 1;
+        }
+        return sb.ToString();
+    }
+
+    // queue (once) a specialized clone of `m` under owner and return the
+    // specialized symbol; the drain loop in Gen emits the bodies
+    string SpecQueue(string owner, Node m, List<string> tns, List<Node> trs, string tag) {
+        return SpecQueueTy(owner, m, tns, trs, tag, null);
+    }
+
+    // The same, with the receiver's static type of the clone: a clone of a
+    // generic class's method carries the concrete instantiation
+    // (`Pool<string>`), so a field read inside it resolves the real value
+    // type instead of the erased one.
+    string SpecQueueTy(string owner, Node m, List<string> tns, List<Node> trs, string tag, Node thisTy) {
+        string sname = m.sval + "__SP" + tag;
+        string sym = owner + "_" + sname;
+        if (IndexOfStr(specSyms, sym) < 0) {
+            specSyms.Add(sym);
+            Node clone = CloneSubst(m, tns, trs);
+            if (clone == null) { throw new Exception("clone failed for " + m.sval); }
+            clone.sval = sname;
+            specMs.Add(clone);
+            specClss.Add(binder.FindType(owner));
+            specThis.Add(thisTy);
+        }
+        return sym;
+    }
+
+    // infer the static type of an expression-bodied lambda's result with its
+    // parameters bound to the delegate's (possibly substituted) param types
+    Node LambdaBodyType(Node lam, List<Node> dps) {
+        int mark = locName.Count;
+        int pi = 0; int j = 0;
+        while (j < lam.kids.Count) {
+            if (lam.kids[j].kind == AK.Param()) {
+                Node pt2 = lam.kids[j].type;
+                // an UNTYPED lambda parameter (the parser writes "var") takes
+                // the delegate's parameter type -- that is the only source
+                // for the body's type (`u => u.name` with `u` a User). Left
+                // as "var" the body's type comes out as "var" and the
+                // method's type parameter binds to "var" instead of the real
+                // type (the clone then compares a pointer as an integer).
+                if ((pt2 == null || pt2.sval == "var") && pi < dps.Count) { pt2 = dps[pi]; }
+                locName.Add(lam.kids[j].sval); locType.Add(pt2); locReg.Add("");
+                locBox.Add(false); locIter.Add(false); locCell.Add(""); locRef.Add(false);
+                pi = pi + 1;
+            }
+            j = j + 1;
+        }
+        Node lrt = ArgTypeNode(lam.a);
+        while (locName.Count > mark) {
+            locName.RemoveAt(locName.Count - 1);
+            locType.RemoveAt(locType.Count - 1);
+            locReg.RemoveAt(locReg.Count - 1);
+            if (locRef.Count > mark) { locRef.RemoveAt(locRef.Count - 1); }
+        }
+        return lrt;
+    }
+
+    // extend a receiver-derived binding with bindings inferred from the call
+    // arguments: plain args unify their static type against the declared
+    // param shape; expression-bodied lambdas unify their inferred body type
+    // against the delegate's return shape
+    void BindFromArgs(Node m, Node e, int base0, List<string> mtps, List<string> tns, List<Node> trs) {
+        int k = 0;
+        while (k < e.kids.Count) {
+            Node arg = e.kids[k];
+            Node pty = SubstTP(ParamTypeNode(m, k + base0), tns, trs);
+            if (arg != null && pty != null) {
+                if (arg.kind == AK.Lambda()) {
+                    Node dd = binder.FindDelegate(pty.sval);
+                    if (dd != null && arg.d == null && arg.a != null) {
+                        List<Node> dps = DelegParams(pty);
+                        Node lrt = LambdaBodyType(arg, dps);
+                        List<string> dtn = TParams(dd);
+                        Node drs = SubstTP(dd.type, dtn, DelegTArgs(dd, pty, dtn));
+                        if (lrt != null) { UnifyTP(drs, lrt, mtps, tns, trs); }
+                    }
+                } else {
+                    Node aty = ArgTypeNode(arg);
+                    if (aty != null) { UnifyTP(pty, aty, mtps, tns, trs); }
+                }
+            }
+            k = k + 1;
+        }
+    }
+
+    bool CanSpecialize(Node m) {
+        if (m == null || m.d == null) { return false; }
+        if (HasMod(m, MOD.Extern())) { return false; }
+        // an async method specializes like any other: the clone is lowered by
+        // GenAsyncMethod, whose symbol is the clone's own name (`Owner_M__SPint`)
+        // -- the same one SpecQueue hands to the call site. The awaited RESULT
+        // type comes from the clone's substituted return type.
+        return true;
+    }
+
+    // extension call: static method invoked as recv.M(args) -> M(recv, args).
+    // The method's own type parameters are bound from the receiver's static
+    // type so lambda arguments and the result see concrete types; the call
+    // ABI itself stays on the declared (erased) parameter types.
+    ExprVal EmitExtensionCall(ExprVal recv, string owner, Node m, Node e) {
+        List<string> mtps = TParams(m);
+        List<string> tns = new List<string>();
+        List<Node> trs = new List<Node>();
+        UnifyTP(ParamTypeNode(m, 0), recv.ty, mtps, tns, trs);
+        string sym = MethodSym(owner, m);
+        bool spec = false;
+        if (mtps.Count > 0 && CanSpecialize(m)) {
+            BindFromArgs(m, e, 1, mtps, tns, trs);
+            string tag = SpecTag(m, mtps, tns, trs);
+            if (tag != "") { sym = SpecQueue(owner, m, tns, trs, tag); spec = true; }
+        }
+        Node mrt = m.type;
+        Node p0 = ParamTypeNode(m, 0);
+        if (spec) { mrt = SubstTP(m.type, tns, trs); p0 = SubstTP(p0, tns, trs); }
+        string rt = MapType(mrt);
+        string args = MapType(p0) + " " + CallArg(recv, p0, false);
+        int i = 0;
+        while (i < e.kids.Count) {
+            Node pty = ParamTypeNode(m, i + 1);
+            Node spty = SubstTP(pty, tns, trs);
+            if (spec) { pty = spty; }
+            ExprVal av = GenArgExpr(e.kids[i], spty);
+            args = args + ", " + MapType(pty) + " " + CallArg(av, pty, false);
+            i = i + 1;
+        }
+        if (rt == "void") {
+            L("  call void @" + sym + "(" + args + ")");
+            return new ExprVal("0", MkType("void"));
+        }
+        string t = NT();
+        L("  " + t + " = call " + rt + " @" + sym + "(" + args + ")");
+        Node retTy = SubstTP(m.type, tns, trs);
+        if (!spec && IsErasedType(m.type)) { return FromSlot(t, retTy); }
+        AddTemp(t, retTy);
+        return new ExprVal(t, retTy);
+    }
+
+    ExprVal EmitInstanceCall(ExprVal recv, string clsName, string name, Node e) {
+        return EmitInstanceCallAs(recv, clsName, name, e, false);
+    }
+
+    // `direct` bypasses the virtual dispatch: the C host's `base.M()` calls
+    // the base class' own body, not the override (src/compiler/irgen_call.c:
+    // base_recv -> emit_dispatch_call with a NULL class).
+    ExprVal EmitInstanceCallAs(ExprVal recv, string clsName, string name, Node e, bool direct) {
+        Node cls = binder.FindType(clsName);
+        Node m = ResolveMethodUp(cls, name, e, false);
+        if (m == null && (name == "ToString" || name == "Equals" || name == "GetHashCode")) {
+            return EmitObjectFamilyCall(recv, name, e);
+        }
+        if (!direct && m != null && IsPolyClass(cls) && HasMod(cls, MOD.Iface())) {
+            return EmitInterfaceCall(recv, cls, name, m, e);
+        }
+        if (!direct && m != null && IsPolyClass(cls) && VSlotIndexM(cls, m) >= 0) {
+            return EmitVirtualCall(recv, cls, name, m, e);
+        }
+        string owner = MethodOwner(cls, name);
+        if (owner == "") { owner = clsName; }
+        // the resolved overload may be declared by a BASE class: the call has
+        // to name the declaring class (that is where the definition lives).
+        if (m != null) { owner = DeclOwnerOf(cls, m); }
+        string sym = owner + "_" + name;
+        if (m != null) { sym = MethodSym(owner, m); }
+        // method-level monomorphization: a generic method called with
+        // concrete type arguments gets a specialized body, so the body sees
+        // the concrete types (`c.Name()` where `c` is `T` becomes a call on
+        // the concrete class) and the call's result keeps its real type.
+        //
+        // CLASS-level monomorphization: a method of a generic class, called
+        // on a receiver whose static type carries the concrete type
+        // arguments (`Pool<string>`), gets a specialized body too -- the
+        // class's own type parameters are bound to those arguments, so a
+        // field read inside the body (`this.item`) has the real value type.
+        bool spec = false;
+        List<string> stns = new List<string>();
+        List<Node> strs = new List<Node>();
+        // the CLASS's own type arguments, kept apart from the method's: the
+        // tag is built from both, and a method type parameter may shadow a
+        // class one (same name) -- the two must not be looked up in the
+        // same list
+        List<Node> ctypes = new List<Node>();
+        if (m != null && CanSpecialize(m)) {
+            List<string> mtps = TParams(m);
+            List<string> ctps = TParams(cls);
+            bool clsSpec = false;
+            // only a method declared by the generic class ITSELF: an
+            // inherited one lives in a base class that has no type
+            // parameters, and a virtual one is dispatched through the
+            // vtable (which points at the unspecialized definition)
+            if (ctps.Count > 0 && owner == clsName && recv.ty != null
+                && recv.ty.kids.Count == ctps.Count) {
+                int ci = 0;
+                while (ci < ctps.Count) {
+                    stns.Add(ctps[ci]); strs.Add(recv.ty.kids[ci]);
+                    ctypes.Add(recv.ty.kids[ci]);
+                    ci = ci + 1;
+                }
+                clsSpec = true;
+            }
+            if (mtps.Count > 0) {
+                if (!BindTypeArgs(m, e, mtps, stns, strs)) {
+                    BindFromArgs(m, e, 0, mtps, stns, strs);
+                }
+            }
+            if (clsSpec || mtps.Count > 0) {
+                string tag = SpecTagC(m, ctypes, mtps, stns, strs, clsSpec ? "I" : "");
+                if (tag != "") {
+                    sym = SpecQueueTy(owner, m, stns, strs, tag, clsSpec ? recv.ty : null);
+                    spec = true;
+                }
+            }
+        }
+        string thisOp = recv.op;
+        if (owner != clsName) {
+            string bc = NT();
+            L("  " + bc + " = bitcast %" + clsName + "* " + recv.op + " to %" + owner + "*");
+            thisOp = bc;
+        }
+        // A STATIC method reached through an instance (`Encoding.UTF8.GetString(b)`)
+        // takes no receiver: the C host resolves it as a static member and the
+        // receiver is dropped. Passing it anyway shifts every argument by one
+        // -- the call reads the receiver as the first parameter.
+        bool isStatic = (m != null && IsStatic(m));
+        string rt = "i64";
+        if (m != null) { rt = MapTypeDecl(m.type, owner); }
+        if (spec) { rt = MapTypeDecl(SubstTP(m.type, stns, strs), owner); }
+        bool isAsyncCall = (m != null && IsAsync(m));
+        if (isAsyncCall) { rt = "i8*"; }
+        string args = "";
+        if (!isStatic) { args = "%" + owner + "* " + thisOp; }
+        List<Node> aargs = OrderArgs(m, e);
+        int i = 0;
+        while (i < aargs.Count) {
+            Node pty = MkType("int"); if (m != null) { pty = ParamTypeNode(m, i); }
+            if (spec) { pty = SubstTP(pty, stns, strs); }
+            if (m != null && IsRefParam(m, i) && aargs[i] != null
+                && aargs[i].kind == AK.OutArg()) {
+                // the receiver is always the first argument, so the
+                // separator is needed even for the first declared parameter
+                string addr;
+                if (aargs[i].type != null) { addr = NewOutLocal(aargs[i]); }
+                else { addr = RefPlacePtr(aargs[i].a, pty); }
+                if (args != "") { args = args + ", "; }
+                args = args + MapTypeDecl(pty, owner) + "* " + addr;
+                i = i + 1;
+                continue;
+            }
+            ExprVal av = GenArgExpr(aargs[i], pty);
+            if (args != "") { args = args + ", "; }
+            // an extern (DllImport) callee is C code: it gets the raw buffer
+            bool rawArg = m != null && HasMod(m, MOD.Extern());
+            args = args + MapTypeDecl(pty, owner) + " " + CallArg(av, pty, rawArg);
+            i = i + 1;
+        }
+        if (rt == "void") {
+            L("  call void @" + sym + "(" + args + ")");
+            return new ExprVal("0", MkType("void"));
+        }
+        string t = NT();
+        L("  " + t + " = call " + rt + " @" + sym + "(" + args + ")");
+        // an async call hands back the coroutine FRAME; the awaited value's
+        // type is the method's RETURN type -- substituted when the call
+        // specialized the method (`await s.Echo<int>(42)` awaits an int, not
+        // the erased type parameter)
+        if (isAsyncCall) {
+            Node tt = MkType("__task");
+            tt.a = m.type;
+            if (spec) { tt.a = SubstTP(m.type, stns, strs); }
+            return AsyncFrame(t, tt);
+        }
+        if (spec) {
+            Node srt = SubstTP(m.type, stns, strs);
+            AddTemp(t, srt);
+            return new ExprVal(t, srt);
+        }
+        if (m != null && IsErasedTypeDecl(m.type, owner)) { return FromSlot(t, ConcreteTP(m.type, recv.ty)); }
+        Node retTy = MkType("int"); if (m != null) { retTy = m.type; }
+        AddTemp(t, retTy);
+        return new ExprVal(t, retTy);
+    }
+
+    // `base.Method(...)`: a direct call to the base class' method with `this`
+    // as the receiver. Returns null when the current class has no base class
+    // or the base has no such method.
+    ExprVal EmitBaseCall(string name, Node e) {
+        if (!curHasThis) { return null; }
+        Node cls = binder.FindType(curClass);
+        if (cls == null) { return null; }
+        Node bcls = BaseClassOf(cls);
+        if (bcls == null) { return null; }
+        // the receiver: `this` seen as the base class
+        string thisOp = "%this";
+        if (bcls.sval != curClass) {
+            string bc = NT();
+            L("  " + bc + " = bitcast %" + curClass + "* %this to %" + bcls.sval + "*");
+            thisOp = bc;
+        }
+        ExprVal recv = new ExprVal(thisOp, MkType(bcls.sval));
+        return EmitInstanceCallAs(recv, bcls.sval, name, e, true);
+    }
+
+    ExprVal EmitInterfaceCall(ExprVal recv, Node ifc, string name, Node m, Node e) {
+        string ifcName = ifc.sval;
+        string declCls = DeclOwnerOf(ifc, m);
+        string rt = MapTypeDecl(m.type, declCls);
+        bool isAsyncCall = IsAsync(m);
+        if (isAsyncCall) { rt = "i8*"; }
+        bool isVoid = (rt == "void");
+
+        // 1. Evaluate arguments once into temporaries before branching.
+        List<string> argTypes = new List<string>();
+        List<string> argVals = new List<string>();
+        List<Node> aargs = OrderArgs(m, e);
+        int i = 0;
+        while (i < aargs.Count) {
+            Node pty = ParamTypeNode(m, i);
+            if (IsRefParam(m, i) && aargs[i] != null && aargs[i].kind == AK.OutArg()) {
+                string addr;
+                if (aargs[i].type != null) { addr = NewOutLocal(aargs[i]); }
+                else { addr = RefPlacePtr(aargs[i].a, pty); }
+                argTypes.Add(MapTypeDecl(pty, declCls) + "*");
+                argVals.Add(addr);
+                i = i + 1;
+                continue;
+            }
+            ExprVal av = GenArgExpr(aargs[i], pty);
+            bool rawArg = m != null && HasMod(m, MOD.Extern());
+            argTypes.Add(MapTypeDecl(pty, declCls));
+            argVals.Add(CallArg(av, pty, rawArg));
+            i = i + 1;
+        }
+
+        // 2. Prepare raw pointer to receiver object (which has vtable at offset 0).
+        string recvRaw = NT();
+        string rty = MapType(recv.ty);
+        if (rty == "i8*") {
+            recvRaw = recv.op;
+        } else {
+            L("  " + recvRaw + " = bitcast " + rty + " " + recv.op + " to i8*");
+        }
+
+        // 3. Find all candidate concrete classes implementing this interface.
+        List<Node> cands = new List<Node>();
+        List<Node> candMeths = new List<Node>();
+        List<string> candImpls = new List<string>();
+        string tags = ParamTags(m);
+        int ti = 0;
+        while (ti < binder.types.Count) {
+            Node c = binder.types[ti];
+            bool isCls = (c.kind == AK.ClassDecl() || c.kind == AK.StructDecl());
+            if (isCls && !HasMod(c, MOD.Abstract()) && !HasMod(c, MOD.Iface())) {
+                if (binder.IsAssignableFrom(ifcName, c.sval)) {
+                    string impl = FindMethodImplCls(c, name, tags);
+                    if (impl == "") { impl = FindMethodImplClsName(c, name); }
+                    if (impl == "") { impl = c.sval; }
+                    Node im = FindMethodImplNode(c, name, tags);
+                    if (im != null && !IsAbstract(im)) {
+                        cands.Add(c);
+                        candMeths.Add(im);
+                        candImpls.Add(impl);
+                    }
+                }
+            }
+            ti = ti + 1;
+        }
+
+        if (cands.Count == 0) {
+            if (!ExternSeen("abort")) { externDecls.Add("abort"); H("declare void @abort()"); }
+            L("  call void @abort()");
+            if (isVoid) { return new ExprVal("0", MkType("void")); }
+            string dummyVal = rt == "i8*" ? "null" : (rt == "double" ? "0.0" : "0");
+            AddTemp(dummyVal, m.type);
+            return new ExprVal(dummyVal, m.type);
+        }
+
+        // Single candidate devirtualization: if only 1 concrete class implements this interface,
+        // directly invoke that implementation without runtime tag comparison overhead.
+        if (cands.Count == 1) {
+            Node candCls = cands[0];
+            Node candMeth = candMeths[0];
+            string impl = candImpls[0];
+            string thisPtr = NT();
+            L("  " + thisPtr + " = bitcast i8* " + recvRaw + " to %" + impl + "*");
+            string callArgs = "%" + impl + "* " + thisPtr;
+            int ai = 0;
+            while (ai < argVals.Count) {
+                callArgs = callArgs + ", " + argTypes[ai] + " " + argVals[ai];
+                ai = ai + 1;
+            }
+            if (isVoid) {
+                L("  call void @" + MethodSym(impl, candMeth) + "(" + callArgs + ")");
+                return new ExprVal("0", MkType("void"));
+            }
+            string callRes = NT();
+            L("  " + callRes + " = call " + rt + " @" + MethodSym(impl, candMeth) + "(" + callArgs + ")");
+            if (isAsyncCall) {
+                Node tt = MkType("__task"); tt.a = m.type;
+                return AsyncFrame(callRes, tt);
+            }
+            if (IsErasedTypeDecl(m.type, declCls)) { return FromSlot(callRes, ConcreteTP(m.type, recv.ty)); }
+            AddTemp(callRes, m.type);
+            return new ExprVal(callRes, m.type);
+        }
+
+        // 4. Multiple candidates: runtime vtable tag comparison chain.
+        string tagp = NT();
+        L("  " + tagp + " = bitcast i8* " + recvRaw + " to i8**");
+        string tag = NT();
+        L("  " + tag + " = load i8*, i8** " + tagp);
+
+        string resSlot = "";
+        if (!isVoid) {
+            resSlot = NT();
+            EA(resSlot, rt);
+        }
+        int lend = NL();
+
+        int ci = 0;
+        while (ci < cands.Count) {
+            Node candCls = cands[ci];
+            Node candMeth = candMeths[ci];
+            string impl = candImpls[ci];
+            List<string> vslots = new List<string>();
+            CollectVSlots(candCls, vslots);
+
+            int lmatch = NL();
+            int lnext = NL();
+            string cmp = NT();
+            L("  " + cmp + " = icmp eq i8* " + tag + ", bitcast ([" + vslots.Count + " x i8*]* @" + candCls.sval + "_vtable to i8*)");
+            L("  br i1 " + cmp + ", label %L" + lmatch + ", label %L" + lnext);
+            Label(lmatch);
+
+            string thisPtr = NT();
+            L("  " + thisPtr + " = bitcast i8* " + recvRaw + " to %" + impl + "*");
+            string callArgs = "%" + impl + "* " + thisPtr;
+            int ai = 0;
+            while (ai < argVals.Count) {
+                callArgs = callArgs + ", " + argTypes[ai] + " " + argVals[ai];
+                ai = ai + 1;
+            }
+            if (isVoid) {
+                L("  call void @" + MethodSym(impl, candMeth) + "(" + callArgs + ")");
+            } else {
+                string callRes = NT();
+                L("  " + callRes + " = call " + rt + " @" + MethodSym(impl, candMeth) + "(" + callArgs + ")");
+                L("  store " + rt + " " + callRes + ", " + rt + "* " + resSlot);
+            }
+            L("  br label %L" + lend);
+            Label(lnext);
+            ci = ci + 1;
+        }
+
+        // Fallback if no tag matched (e.g. unhandled subtype or corrupted object).
+        if (!ExternSeen("abort")) { externDecls.Add("abort"); H("declare void @abort()"); }
+        L("  call void @abort()");
+        if (!isVoid) {
+            string dummyVal = rt == "i8*" ? "null" : (rt == "double" ? "0.0" : "0");
+            L("  store " + rt + " " + dummyVal + ", " + rt + "* " + resSlot);
+        }
+        L("  br label %L" + lend);
+        Label(lend);
+
+        if (isVoid) {
+            return new ExprVal("0", MkType("void"));
+        }
+        string finalRes = NT();
+        L("  " + finalRes + " = load " + rt + ", " + rt + "* " + resSlot);
+        if (isAsyncCall) {
+            Node tt = MkType("__task"); tt.a = m.type;
+            return AsyncFrame(finalRes, tt);
+        }
+        if (IsErasedTypeDecl(m.type, declCls)) { return FromSlot(finalRes, ConcreteTP(m.type, recv.ty)); }
+        AddTemp(finalRes, m.type);
+        return new ExprVal(finalRes, m.type);
+    }
+
+    ExprVal EmitVirtualCall(ExprVal recv, Node cls, string name, Node m, Node e) {
+        string clsName = cls.sval;
+        int slot = VSlotIndexM(cls, m);
+        string declCls = DeclOwnerOf(cls, m);
+        string rt = MapTypeDecl(m.type, declCls);
+        // an async method returns the coroutine FRAME, not the declared
+        // result -- `async void` included: the ramp hands back the frame
+        // pointer and the await needs it. The void branch below must not
+        // swallow the call, or the frame is lost and the await refuses the
+        // operand ("this operand is not lowered as a coroutine frame").
+        bool isAsyncCall = IsAsync(m);
+        if (isAsyncCall) { rt = "i8*"; }
+        string vtp = NT();
+        L("  " + vtp + " = getelementptr %" + clsName + ", %" + clsName + "* " + recv.op + ", i32 0, i32 0");
+        string vt = NT();
+        L("  " + vt + " = load i8*, i8** " + vtp);
+        string vta = NT();
+        L("  " + vta + " = bitcast i8* " + vt + " to i8**");
+        string slotp = NT();
+        L("  " + slotp + " = getelementptr i8*, i8** " + vta + ", i64 " + slot);
+        string fni8 = NT();
+        L("  " + fni8 + " = load i8*, i8** " + slotp);
+        string fn = NT();
+        L("  " + fn + " = bitcast i8* " + fni8 + " to " + MethodFnTypeThis(m, clsName));
+        string args = "%" + clsName + "* " + recv.op;
+        List<Node> aargs = OrderArgs(m, e);
+        int i = 0;
+        while (i < aargs.Count) {
+            Node pty = ParamTypeNode(m, i);
+            if (IsRefParam(m, i) && aargs[i] != null && aargs[i].kind == AK.OutArg()) {
+                string addr;
+                if (aargs[i].type != null) { addr = NewOutLocal(aargs[i]); }
+                else { addr = RefPlacePtr(aargs[i].a, pty); }
+                args = args + ", " + MapTypeDecl(pty, declCls) + "* " + addr;
+                i = i + 1;
+                continue;
+            }
+            ExprVal av = GenArgExpr(aargs[i], pty);
+            // an extern (DllImport) callee is C code: it gets the raw buffer
+            bool rawArg = m != null && HasMod(m, MOD.Extern());
+            args = args + ", " + MapTypeDecl(pty, declCls) + " " + CallArg(av, pty, rawArg);
+            i = i + 1;
+        }
+        if (rt == "void") {
+            L("  call void " + fn + "(" + args + ")");
+            return new ExprVal("0", MkType("void"));
+        }
+        string t = NT();
+        L("  " + t + " = call " + rt + " " + fn + "(" + args + ")");
+        // a coroutine call through the vtable: the slot holds the ramp, which
+        // returns the frame pointer. The await has to know that the operand
+        // is a frame -- without the marker it refuses the call ("this operand
+        // is not lowered as a coroutine frame").
+        if (isAsyncCall) {
+            Node tt = MkType("__task"); tt.a = m.type;
+            return AsyncFrame(t, tt);
+        }
+        if (IsErasedTypeDecl(m.type, declCls)) { return FromSlot(t, ConcreteTP(m.type, recv.ty)); }
+        AddTemp(t, m.type);
+        return new ExprVal(t, m.type);
+    }
+
+}

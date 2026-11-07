@@ -1,0 +1,1038 @@
+using System;
+using System.Collections.Generic;
+namespace Zan;
+
+partial class Irgen {
+    // ---- lambdas / delegates ----
+    bool IsDelegate(Node t) {
+        if (t == null) { return false; }
+        return binder.IsDelegateName(t.sval);
+    }
+
+    Node MkIdent(string name) { Node n = new Node(AK.Ident()); n.sval = name; return n; }
+
+    bool Contains(List<string> xs, string s) {
+        int i = 0;
+        while (i < xs.Count) { if (xs[i] == s) { return true; } i = i + 1; }
+        return false;
+    }
+    bool ContainsInt(List<int> xs, int v) {
+        int i = 0;
+        while (i < xs.Count) { if (xs[i] == v) { return true; } i = i + 1; }
+        return false;
+    }
+
+    void CollectIdents(Node n, List<string> outv) {
+        if (n == null) { return; }
+        if (n.kind == AK.Ident()) { if (!Contains(outv, n.sval)) { outv.Add(n.sval); } }
+        CollectIdents(n.a, outv); CollectIdents(n.b, outv);
+        CollectIdents(n.c, outv); CollectIdents(n.d, outv);
+        int i = 0;
+        while (i < n.kids.Count) { CollectIdents(n.kids[i], outv); i = i + 1; }
+    }
+
+    // Names a closure inside this function may capture: every identifier
+    // that shows up inside a lambda. Deliberately over-approximated -- a
+    // local that merely shares a name with something a lambda mentions is
+    // boxed too, which costs one allocation but changes no behaviour.
+    void CollectCapturedNames(Node n, List<string> outv) {
+        if (n == null) { return; }
+        if (n.kind == AK.Lambda()) {
+            List<string> used = new List<string>();
+            CollectIdents(n.a, used);
+            CollectIdents(n.d, used);
+            int i = 0;
+            while (i < used.Count) {
+                if (!Contains(outv, used[i])) { outv.Add(used[i]); }
+                i = i + 1;
+            }
+            return;
+        }
+        CollectCapturedNames(n.a, outv); CollectCapturedNames(n.b, outv);
+        CollectCapturedNames(n.c, outv); CollectCapturedNames(n.d, outv);
+        int i = 0;
+        while (i < n.kids.Count) { CollectCapturedNames(n.kids[i], outv); i = i + 1; }
+    }
+
+    void CollectDeclared(Node n, List<string> outv) {
+        if (n == null) { return; }
+        if (n.kind == AK.VarDecl()) { if (!Contains(outv, n.sval)) { outv.Add(n.sval); } }
+        if (n.kind == AK.Param()) { if (!Contains(outv, n.sval)) { outv.Add(n.sval); } }
+        if (n.kind == AK.IsExpr() && n.sval != null && n.sval.Length > 0) {
+            if (!Contains(outv, n.sval)) { outv.Add(n.sval); }
+        }
+        CollectDeclared(n.a, outv); CollectDeclared(n.b, outv);
+        CollectDeclared(n.c, outv); CollectDeclared(n.d, outv);
+        int i = 0;
+        while (i < n.kids.Count) { CollectDeclared(n.kids[i], outv); i = i + 1; }
+    }
+
+    // free enclosing-scope locals referenced by the lambda body (captured by value)
+    void CollectCaptures(Node lam, List<string> pnames, List<string> caps, List<Node> capTy) {
+        List<string> declared = new List<string>();
+        int i = 0;
+        while (i < pnames.Count) { declared.Add(pnames[i]); i = i + 1; }
+        Node bodyN = lam.d; if (bodyN == null) { bodyN = lam.a; }
+        CollectDeclared(bodyN, declared);
+        List<string> used = new List<string>();
+        CollectIdents(bodyN, used);
+        int j = 0;
+        while (j < used.Count) {
+            string nm = used[j];
+            if (!Contains(declared, nm) && !Contains(caps, nm)) {
+                int li = LocalIdx(nm);
+                if (li >= 0) { caps.Add(nm); capTy.Add(locType[li]); }
+            }
+            j = j + 1;
+        }
+    }
+
+    // A closure that mentions a field or an instance method of the enclosing
+    // class needs the receiver: the C host captures `this` in the closure's
+    // display class (checker.c's expr_captures_this) and the ngen backend
+    // does the same (ngen_delegate.zan's DelegateCaptureNameNg). The self-host
+    // lowers the receiver into one more env slot.
+    bool CapturesThis(Node n, List<string> declared) {
+        if (n == null) { return false; }
+        int k = n.kind;
+        if (k == AK.ThisExpr()) { return true; }
+        if (k == AK.Ident()) {
+            // a local -- or a name the closure declares itself -- shadows the
+            // member: nothing to capture
+            if (Contains(declared, n.sval)) { return false; }
+            if (LocalIdx(n.sval) >= 0) { return false; }
+            Node cls = binder.FindType(curClass);
+            if (cls == null) { return false; }
+            if (FieldIndex(cls, n.sval) >= 0) { return true; }
+            Node m = FindMethodUp(cls, n.sval);
+            if (m != null && !HasMod(m, MOD.Static())) { return true; }
+            if (FindMethodUp(cls, "get_" + n.sval) != null) { return true; }
+            return false;
+        }
+        if (k == AK.Lambda()) {
+            // a nested closure: its own declarations shadow the outer ones
+            List<string> inner = new List<string>();
+            int i = 0;
+            while (i < declared.Count) { inner.Add(declared[i]); i = i + 1; }
+            CollectDeclared(n, inner);
+            return CapturesThis(n.a, inner) || CapturesThis(n.d, inner);
+        }
+        if (CapturesThis(n.a, declared)) { return true; }
+        if (CapturesThis(n.b, declared)) { return true; }
+        if (CapturesThis(n.c, declared)) { return true; }
+        if (CapturesThis(n.d, declared)) { return true; }
+        int j = 0;
+        while (j < n.kids.Count) { if (CapturesThis(n.kids[j], declared)) { return true; } j = j + 1; }
+        return false;
+    }
+
+    // does this closure need the receiver of the scope it is written in?
+    bool LambdaNeedsThis(Node lam) {
+        if (!ReceiverAvailable()) { return false; }
+        List<string> declared = new List<string>();
+        CollectDeclared(lam, declared);
+        return CapturesThis(lam.a, declared) || CapturesThis(lam.d, declared);
+    }
+
+    // is a receiver reachable here? the method parameter `%this`, or the
+    // receiver an enclosing closure captured
+    bool ReceiverAvailable() {
+        if (LocalIdx("this") >= 0) { return true; }
+        return curHasThis && curClass != "";
+    }
+
+    // the receiver of the current scope: the method parameter `%this`, or the
+    // receiver an enclosing closure captured
+    ExprVal ThisReceiver() {
+        int li = LocalIdx("this");
+        if (li >= 0) { return GenIdent(MkIdent("this")); }
+        return new ExprVal("%this", CurThisTy());
+    }
+
+    // copy delegate parameter/return types onto a lambda's params + return slot
+    void AnnotateLambda(Node lam, Node dty) {
+        if (dty != null && (IsAsyncDelegate(dty) || binder.DelegateIsAsync(dty.sval))) {
+            diags.Error("[E3104] cannot convert a lambda to async delegate '" + dty.sval
+                + "': a lambda is not a coroutine; assign an async method group instead", lam.line, lam.col);
+            return;
+        }
+        List<Node> pts = DelegParams(dty);
+        int j = 0; int pi = 0;
+        while (j < lam.kids.Count) {
+            if (lam.kids[j].kind == AK.Param()) {
+                if (pi < pts.Count) { lam.kids[j].type = pts[pi]; }
+                pi = pi + 1;
+            }
+            j = j + 1;
+        }
+        lam.type = DelegRet(dty);
+    }
+
+    string LamFnType(Node retTy, List<Node> pt) {
+        string s = MapType(retTy) + " (i8*";
+        int i = 0;
+        while (i < pt.Count) { s = s + ", " + MapType(pt[i]); i = i + 1; }
+        s = s + ")*";
+        return s;
+    }
+
+    // A closure value is the closure record address with the closure tag
+    // (bit0 = 1) set, the same convention the C host uses: the tag tells a
+    // heap closure apart from a bare native function pointer (an nint cast
+    // to a delegate), which is called without the record.
+    string TagClosure(string rec) {
+        string iv = NT();
+        L("  " + iv + " = ptrtoint i8* " + rec + " to i64");
+        string tv = NT();
+        L("  " + tv + " = or i64 " + iv + ", 1");
+        string tp = NT();
+        L("  " + tp + " = inttoptr i64 " + tv + " to i8*");
+        return tp;
+    }
+    // strip the closure tag: the record address is the closure value minus one
+    string UntagClosure(string v) {
+        string iv = NT();
+        L("  " + iv + " = ptrtoint i8* " + v + " to i64");
+        string uv = NT();
+        L("  " + uv + " = and i64 " + iv + ", -2");
+        string up = NT();
+        L("  " + up + " = inttoptr i64 " + uv + " to i8*");
+        return up;
+    }
+    // a method group is a module-level { fn, null } record; the delegate value
+    // is that record with the closure tag set
+    string MgClosureValue(string gname) {
+        string rec = NT();
+        L("  " + rec + " = bitcast [2 x i8*]* " + gname + " to i8*");
+        return TagClosure(rec);
+    }
+
+    Node DelegTypeOf(Node retTy, List<Node> pt) {
+        Node d = new Node(AK.TypeRef());
+        int i = 0;
+        while (i < pt.Count) { d.Add(pt[i]); i = i + 1; }
+        if (retTy != null && retTy.sval == "void") { d.sval = "Action"; }
+        else { d.sval = "Func"; d.Add(retTy); }
+        return d;
+    }
+
+    List<Node> DelegParams(Node dty) {
+        List<Node> r = new List<Node>();
+        // named delegate: signature comes from its declaration, with the
+        // delegate's own type parameters bound to the use-site type arguments
+        if (dty.sval != "Func" && dty.sval != "Action") {
+            Node d = binder.FindDelegate(dty.sval);
+            if (d != null) {
+                List<string> dtn = TParams(d);
+                List<Node> dta = DelegTArgs(d, dty, dtn);
+                int j = 0;
+                while (j < d.kids.Count) {
+                    if (d.kids[j].kind == AK.Param()) { r.Add(SubstTP(d.kids[j].type, dtn, dta)); }
+                    j = j + 1;
+                }
+                return r;
+            }
+        }
+        int n = dty.kids.Count;
+        int lim = n;
+        if (dty.sval == "Func" && n > 0) { lim = n - 1; }
+        int i = 0;
+        while (i < lim) { r.Add(dty.kids[i]); i = i + 1; }
+        return r;
+    }
+
+    // positional type arguments for a named delegate use (missing args stay
+    // as the declared type-parameter names so unbound uses keep erased slots)
+    List<Node> DelegTArgs(Node d, Node dty, List<string> dtn) {
+        List<Node> dta = new List<Node>();
+        int q = 0;
+        while (q < dtn.Count) {
+            if (q < dty.kids.Count) { dta.Add(dty.kids[q]); }
+            else { dta.Add(MkType(dtn[q])); }
+            q = q + 1;
+        }
+        return dta;
+    }
+
+    Node DelegRet(Node dty) {
+        if (dty.sval != "Func" && dty.sval != "Action") {
+            Node d = binder.FindDelegate(dty.sval);
+            if (d != null && d.type != null) {
+                List<string> dtn = TParams(d);
+                return SubstTP(d.type, dtn, DelegTArgs(d, dty, dtn));
+            }
+        }
+        if (dty.sval == "Func" && dty.kids.Count > 0) { return dty.kids[dty.kids.Count - 1]; }
+        return MkType("void");
+    }
+
+    // A lambda lowers to a hoisted top-level function @__lambda_N(i8* env, ...)
+    // plus a heap closure { i8* fn, i8* env } capturing free locals by value.
+    // static method group as a delegate value: the C host hands the STATIC
+    // method's own function pointer to the delegate value (irgen_expr.c: a
+    // static method reference used as a delegate IS the function -- there is
+    // no closure record). That is what makes a Zan delegate usable as a
+    // NATIVE callback: the C side calls the pointer with the C signature.
+    // A closure would shift the arguments (the self-host's closure ABI puts
+    // the env first), so the callback would see the wrong parameters.
+    ExprVal EmitMethodGroup(string clsName, Node cls, Node m) {
+        string owner = MethodOwner(cls, m.sval);
+        if (owner == "") { owner = clsName; }
+        string target = MethodSym(owner, m);
+        List<Node> pt = new List<Node>();
+        int i = 0;
+        while (i < m.kids.Count) {
+            Node p = m.kids[i];
+            if (p.kind == AK.Param()) { pt.Add(p.type); }
+            i = i + 1;
+        }
+        Node retTy = m.type; if (retTy == null) { retTy = MkType("void"); }
+        string rt = MapType(retTy);
+        string fnty = rt + " (";
+        int a = 0;
+        while (a < pt.Count) {
+            if (a > 0) { fnty = fnty + ", "; }
+            fnty = fnty + MapType(pt[a]);
+            a = a + 1;
+        }
+        fnty = fnty + ")";
+        string fp = NT();
+        L("  " + fp + " = bitcast " + fnty + "* @" + target + " to i8*");
+        return new ExprVal(fp, DelegTypeOf(retTy, pt));
+    }
+
+    // An INSTANCE method group used as a delegate value (`obj.Method`): the
+    // closure binds the receiver -- the C host's emit_method_group_closure
+    // (the receiver travels in the closure record; the thunk calls the
+    // method with it as the first argument).
+    //
+    // The self-host's closure ABI is the lambda one: a { fn, env } record and
+    // a thunk with the signature (i8* env, params...). The env of an
+    // instance method group holds exactly one slot -- the receiver.
+    ExprVal EmitInstanceMethodGroup(ExprVal recv, Node cls, Node m) {
+        string owner = DeclOwnerOf(cls, m);
+        if (owner == "") { owner = MethodOwner(cls, m.sval); }
+        if (owner == "") { owner = cls.sval; }
+        string target = MethodSym(owner, m);
+        List<Node> pt = new List<Node>();
+        int i = 0;
+        while (i < m.kids.Count) {
+            Node p = m.kids[i];
+            if (p.kind == AK.Param()) { pt.Add(p.type); }
+            i = i + 1;
+        }
+        Node retTy = m.type; if (retTy == null) { retTy = MkType("void"); }
+        string rt = MapType(retTy);
+        string fname = "@__mg_" + target;
+        // the receiver's type: the class that declares the method
+        string rcvTy = MapType(MkType(owner));
+        bool arc = ArcManaged(MkType(owner));
+        // one thunk per method (the receiver is not part of it -- it comes
+        // from the closure's env)
+        if (IndexOfStr(mgTargets, target) < 0) {
+            mgTargets.Add(target);
+            string sig = "define " + rt + " " + fname + "(i8* %env";
+            int a = 0;
+            while (a < pt.Count) { sig = sig + ", " + MapType(pt[a]) + " %p" + a; a = a + 1; }
+            sig = sig + ") {";
+            deferred.Append(sig); deferred.Append("\n");
+            deferred.Append("entry:\n");
+            deferred.Append("  %envi = bitcast i8* %env to i64*\n");
+            deferred.Append("  %rcvi = load i64, i64* %envi\n");
+            deferred.Append("  %rcv = inttoptr i64 %rcvi to " + rcvTy + "\n");
+            if (arc) { deferred.Append("  %rcv8 = bitcast " + rcvTy + " %rcv to i8*\n"); }
+            string args = rcvTy + " %rcv";
+            a = 0;
+            while (a < pt.Count) { args = args + ", " + MapType(pt[a]) + " %p" + a; a = a + 1; }
+            // the closure keeps the receiver alive for the duration of the
+            // call (the host's closure record retains its target and releases
+            // it when the record dies; the self-host's records are never
+            // freed, so the retain/release pair lives in the thunk)
+            if (arc) { deferred.Append("  call void @zretain(i8* %rcv8)\n"); }
+            if (rt == "void") {
+                deferred.Append("  call void @" + target + "(" + args + ")\n");
+                if (arc) { deferred.Append("  call void @zrelease(i8* %rcv8)\n"); }
+                deferred.Append("  ret void\n");
+            } else {
+                deferred.Append("  %r = call " + rt + " @" + target + "(" + args + ")\n");
+                if (arc) { deferred.Append("  call void @zrelease(i8* %rcv8)\n"); }
+                deferred.Append("  ret " + rt + " %r\n");
+            }
+            deferred.Append("}\n");
+        }
+        // the env: one slot holding the receiver
+        string env = NT();
+        L("  " + env + " = call i8* @malloc(i64 8)");
+        string envi = NT();
+        L("  " + envi + " = bitcast i8* " + env + " to i64*");
+        string rcvi = NT();
+        L("  " + rcvi + " = ptrtoint " + MapType(recv.ty) + " " + recv.op + " to i64");
+        L("  store i64 " + rcvi + ", i64* " + envi);
+        // the closure record { fn, env }
+        string rec = NT();
+        L("  " + rec + " = call i8* @malloc(i64 16)");
+        string recp = NT();
+        L("  " + recp + " = bitcast i8* " + rec + " to i8**");
+        string fni8 = NT();
+        L("  " + fni8 + " = bitcast " + LamFnType(retTy, pt) + " " + fname + " to i8*");
+        L("  store i8* " + fni8 + ", i8** " + recp);
+        string envp = NT();
+        L("  " + envp + " = getelementptr i8*, i8** " + recp + ", i64 1");
+        L("  store i8* " + env + ", i8** " + envp);
+        return new ExprVal(TagClosure(rec), DelegTypeOf(retTy, pt));
+    }
+
+    ExprVal GenLambda(Node lam) {
+        int id = lamCount; lamCount = lamCount + 1;
+        string fname = "@__lambda_" + id;
+
+        List<string> pn = new List<string>();
+        List<Node> pt = new List<Node>();
+        int i = 0;
+        while (i < lam.kids.Count) {
+            Node p = lam.kids[i];
+            if (p.kind == AK.Param()) {
+                pn.Add(p.sval);
+                Node ptp = p.type;
+                if (ptp == null || ptp.sval == "var") { ptp = MkType("int"); }
+                pt.Add(ptp);
+            }
+            i = i + 1;
+        }
+        Node retTy = lam.type; if (retTy == null) { retTy = MkType("int"); }
+
+        List<string> caps = new List<string>();
+        List<Node> capTy = new List<Node>();
+        CollectCaptures(lam, pn, caps, capTy);
+        // The closure may need the receiver of the scope it is written in:
+        // the receiver travels as one more env slot.
+        bool capThis = LambdaNeedsThis(lam);
+        if (capThis) {
+            caps.Add("this");
+            capTy.Add(MkType(curClass));
+        }
+        int nc = caps.Count;
+
+        // A captured local lives in a heap cell: the closure keeps the cell,
+        // so a write to the local after the capture stays visible inside the
+        // closure (C# semantics). A per-iteration variable (for/foreach) is
+        // snapshotted into a fresh cell instead, so every iteration's
+        // closure keeps its own value.
+        List<bool> capBox = new List<bool>();
+        List<bool> capIter = new List<bool>();
+        int cb = 0;
+        while (cb < nc) {
+            int li = LocalIdx(caps[cb]);
+            bool bx = false; bool it = false;
+            if (li >= 0) { bx = locBox[li]; it = locIter[li]; }
+            capBox.Add(bx); capIter.Add(it);
+            cb = cb + 1;
+        }
+
+        // build the env with the captured values (in the enclosing function)
+        string env = "null";
+        if (nc > 0) {
+            env = NT();
+            L("  " + env + " = call i8* @malloc(i64 " + (nc * 8) + ")");
+            string envi = NT();
+            L("  " + envi + " = bitcast i8* " + env + " to i64*");
+            int c = 0;
+            while (c < nc) {
+                string slot = NT();
+                L("  " + slot + " = getelementptr i64, i64* " + envi + ", i64 " + c);
+                string packed = "0";
+                if (capBox[c]) {
+                    int li = LocalIdx(caps[c]);
+                    string cell = locCell[li];
+                    if (curAsync) {
+                        // in an async method the cell pointer lives in the
+                        // local's spill slot (it survives a suspension)
+                        string cp = NT();
+                        L("  " + cp + " = load i8*, i8** " + locReg[li]);
+                        cell = cp;
+                    } else if (capIter[c]) {
+                        // per-iteration capture: copy the current value into a
+                        // fresh cell so this closure keeps its own iteration
+                        string lt = MapType(capTy[c]);
+                        string val = NT();
+                        L("  " + val + " = load " + lt + ", " + lt + "* " + locReg[li]);
+                        string nc2 = NT();
+                        L("  " + nc2 + " = call i8* @malloc(i64 " + TypeSizeBytes(lt) + ")");
+                        string np2 = NT();
+                        L("  " + np2 + " = bitcast i8* " + nc2 + " to " + lt + "*");
+                        L("  store " + lt + " " + val + ", " + lt + "* " + np2);
+                        cell = nc2;
+                    }
+                    string civ = NT();
+                    L("  " + civ + " = ptrtoint i8* " + cell + " to i64");
+                    packed = civ;
+                } else {
+                    ExprVal cv;
+                    if (caps[c] == "this") { cv = ThisReceiver(); }
+                    else { cv = GenExpr(MkIdent(caps[c])); }
+                    // a captured struct is a value: the closure keeps its own copy
+                    packed = StructElemSlot(cv, capTy[c]);
+                }
+                L("  store i64 " + packed + ", i64* " + slot);
+                c = c + 1;
+            }
+        }
+
+        // emit the hoisted lambda body into the deferred buffer
+        StringBuilder savedBody = body;
+        int sTmp = tmp; int sLbl = lbl; bool sTerm = term; string sCurLbl = curLbl;
+        string sRet = curRet; string sClass = curClass; bool sHasThis = curHasThis;
+        List<string> sLocName = locName; List<Node> sLocType = locType;
+        List<string> sLocReg = locReg; int sLocSeq = locSeq;
+        List<bool> sLocBox = locBox; List<bool> sLocIter = locIter; List<string> sLocCell = locCell;
+        List<string> sCapNames = capNames;
+        int sBrk = brkTarget; int sCont = contTarget;
+        int sLoopScope = loopScopeBase;
+        List<string> svT = stmtTemps; List<Node> svTT = stmtTempTypes;
+
+        StringBuilder sEa = entryAllocas; bool sEaAct = eaActive;
+        bool sAsync = curAsync;
+        body = new StringBuilder();
+        entryAllocas = new StringBuilder(); eaActive = true;
+        tmp = 0; lbl = 0; term = false; curLbl = "entry"; curAsync = false;
+        locName = new List<string>(); locType = new List<Node>(); locReg = new List<string>(); locSeq = 0;
+        locBox = new List<bool>(); locIter = new List<bool>(); locCell = new List<string>();
+        locRef = new List<bool>();
+        // a closure inside this lambda may capture the lambda's own locals
+        capNames = new List<string>();
+        CollectCapturedNames(lam.d, capNames);
+        CollectCapturedNames(lam.a, capNames);
+        curRet = MapType(retTy);
+        // The closure still belongs to the enclosing class: a bare STATIC
+        // call (`CaptureSafe(exe, args)`) and a bare static field/property
+        // resolve against it even when the receiver was not captured.
+        // Only the INSTANCE context (`%this`) needs the capture.
+        curClass = sClass;
+        curHasThis = capThis;
+        brkTarget = 0; contTarget = 0;
+
+        string sig = "define " + curRet + " " + fname + "(i8* %env";
+        int a = 0;
+        while (a < pn.Count) { sig = sig + ", " + MapType(pt[a]) + " %p" + a; a = a + 1; }
+        sig = sig + ") {";
+        a = 0;
+        while (a < pn.Count) {
+            string lt = MapType(pt[a]);
+            string preg = AddLocal(pn[a], pt[a]);
+            if (ShouldBox(pn[a])) {
+                // a closure inside this lambda may capture the parameter:
+                // it has to live in a cell
+                preg = BoxLocal(locName.Count - 1);
+            } else {
+                L("  " + preg + " = alloca " + lt);
+            }
+            L("  store " + lt + " %p" + a + ", " + lt + "* " + preg);
+            EmitArcRetain("%p" + a, pt[a]);
+            a = a + 1;
+        }
+        if (nc > 0) {
+            string envi = NT();
+            L("  " + envi + " = bitcast i8* %env to i64*");
+            int c = 0;
+            while (c < nc) {
+                string slot = NT();
+                L("  " + slot + " = getelementptr i64, i64* " + envi + ", i64 " + c);
+                string raw = NT();
+                L("  " + raw + " = load i64, i64* " + slot);
+                string lt = MapType(capTy[c]);
+                if (caps[c] == "this") {
+                    // the receiver: the body sees it as `%this`, and a local of
+                    // the same name lets a nested closure capture it too
+                    L("  %this = inttoptr i64 " + raw + " to " + lt);
+                    string treg = AddLocal("this", capTy[c]);
+                    L("  " + treg + " = alloca " + lt);
+                    L("  store " + lt + " %this, " + lt + "* " + treg);
+                    EmitArcRetain("%this", capTy[c]);
+                    c = c + 1;
+                    continue;
+                }
+                string creg = AddLocal(caps[c], capTy[c]);
+                if (capBox[c]) {
+                    // the env slot holds the cell: the captured local is read
+                    // and written through it, so a write after the capture
+                    // stays visible here
+                    string cell = NT();
+                    L("  " + cell + " = inttoptr i64 " + raw + " to i8*");
+                    string p = NT();
+                    L("  " + p + " = bitcast i8* " + cell + " to " + lt + "*");
+                    locReg[locName.Count - 1] = p;
+                    locBox[locName.Count - 1] = true;
+                    locCell[locName.Count - 1] = cell;
+                    string cv = NT();
+                    L("  " + cv + " = load " + lt + ", " + lt + "* " + p);
+                    EmitArcRetain(cv, capTy[c]);
+                    c = c + 1;
+                    continue;
+                }
+                ExprVal cv = FromSlot(raw, capTy[c]);
+                L("  " + creg + " = alloca " + lt);
+                string csv = Coerce(cv, lt);
+                L("  store " + lt + " " + csv + ", " + lt + "* " + creg);
+                EmitArcRetain(csv, capTy[c]);
+                c = c + 1;
+            }
+        }
+        if (lam.d != null) {
+            // The body has its OWN temp list: the lambda's temps must not
+            // reach the enclosing function. Their register names collide with
+            // the caller's (`%t4` here is the exception object, `%t4` there
+            // is the closure's function pointer), and the caller would then
+            // release a function pointer as if it were an object.
+            stmtTemps = new List<string>(); stmtTempTypes = new List<Node>();
+            GenStmt(lam.d);
+            if (!term) {
+                EmitTempReleases();
+                ReleaseLocalsFrom(0);
+                if (curRet == "void") { L("  ret void"); }
+                else if (curRet == "i64") { L("  ret i64 0"); }
+                else { L("  ret " + curRet + " null"); }
+            }
+        } else {
+            stmtTemps = new List<string>(); stmtTempTypes = new List<Node>();
+            ExprVal rv = GenExpr(lam.a);
+            if (curRet == "void") {
+                EmitTempReleases();
+                ReleaseLocalsFrom(0);
+                L("  ret void");
+            } else {
+                string rvs = "";
+                if (IsErasedType(retTy) && MapType(rv.ty) != "i64") {
+                    // erased return slot: pack the concrete value (double via
+                    // bitcast, pointers via ptrtoint) instead of Coerce
+                    EmitArcRetain(rv.op, rv.ty);
+                    rvs = ToSlot(rv, rv.ty);
+                } else {
+                    rvs = Coerce(rv, curRet);
+                    EmitArcRetain(rvs, rv.ty);
+                }
+                EmitTempReleases();
+                ReleaseLocalsFrom(0);
+                L("  ret " + curRet + " " + rvs);
+            }
+        }
+        L("}");
+        // append the whole function at once so a nested lambda emitted while
+        // this body was being generated does not interleave with our text
+        deferred.Append(sig); deferred.Append("\n");
+        deferred.Append("entry:\n");
+        deferred.Append(entryAllocas.ToString());
+        deferred.Append(body.ToString());
+
+        entryAllocas = sEa; eaActive = sEaAct;
+        curAsync = sAsync;
+        body = savedBody;
+        tmp = sTmp; lbl = sLbl; term = sTerm; curLbl = sCurLbl;
+        curRet = sRet; curClass = sClass; curHasThis = sHasThis;
+        locName = sLocName; locType = sLocType; locReg = sLocReg; locSeq = sLocSeq;
+        locBox = sLocBox; locIter = sLocIter; locCell = sLocCell; capNames = sCapNames;
+        brkTarget = sBrk; contTarget = sCont;
+        loopScopeBase = sLoopScope;
+        stmtTemps = svT; stmtTempTypes = svTT;
+
+        // build closure { i8* fn, i8* env }
+        string clo = NT();
+        L("  " + clo + " = call i8* @malloc(i64 16)");
+        string clop = NT();
+        L("  " + clop + " = bitcast i8* " + clo + " to i8**");
+        string fni8 = NT();
+        L("  " + fni8 + " = bitcast " + LamFnType(retTy, pt) + " " + fname + " to i8*");
+        L("  store i8* " + fni8 + ", i8** " + clop);
+        string clop1 = NT();
+        L("  " + clop1 + " = getelementptr i8*, i8** " + clop + ", i64 1");
+        L("  store i8* " + env + ", i8** " + clop1);
+        // the delegate value is the tagged record, not the bare record address
+        return new ExprVal(TagClosure(clo), DelegTypeOf(retTy, pt));
+    }
+
+    // invoke a closure value:  f(args) -> load {fn,env}, bitcast fn, call fn(env, args)
+    // A delegate value may be a heap closure (tagged bit0=1) or a bare native
+    // function pointer (bit0=0, e.g. from an nint→delegate cast) — the host
+    // discriminates on the tag bit; bare pointers are called without env.
+    ExprVal EmitDelegateCall(Node calleeExpr, Node dty, Node e) {
+        return EmitDelegateCallVal(GenExpr(calleeExpr), dty, e);
+    }
+
+    // A delegate field of a generic class carries the class's type parameter
+    // in its signature: `TextOf<T>` in `Bag<T>` means `TextOf<Item>` in
+    // `Bag<Item>`. The C host specializes the signature with the receiver's
+    // type arguments (src/compiler/irgen_expr.c: subst_delegate_sig) --
+    // without it the call passes an erased i64 where the closure expects the
+    // object pointer, and the closure dereferences the integer.
+    Node InstDelegateType(Node dty) {
+        if (dty == null) { return dty; }
+        if (curInstCls == "" || curInstArgs == null || curInstArgs.Count == 0) { return dty; }
+        List<string> tps = TParams(binder.FindType(curInstCls));
+        if (tps.Count == 0) { return dty; }
+        if (!MentionsTypeParam(dty)) { return dty; }
+        return SubstTP(dty, tps, curInstArgs);
+    }
+
+    bool IsAsyncDelegate(Node dty) {
+        if (dty == null || dty.sval == null) { return false; }
+        if (dty.sval == "Func" || dty.sval == "Action") { return false; }
+        Node d = binder.FindDelegate(dty.sval);
+        if (d != null) { return IsAsync(d); }
+        return false;
+    }
+
+    // invoke an already-evaluated delegate value
+    ExprVal EmitDelegateCallVal(ExprVal clo, Node dty, Node e) {
+        dty = InstDelegateType(dty);
+        List<Node> pt = DelegParams(dty);
+        Node retTy = DelegRet(dty);
+        bool isAsyncDeleg = IsAsyncDelegate(dty);
+        Node callRetTy = retTy;
+        if (isAsyncDeleg) { callRetTy = MkType("object"); }
+        // The arguments are evaluated ONCE, before the closure/bare split.
+        // Evaluating them inside the arms nests one call's branch-and-phi
+        // inside the other arm's block, and that shape crashes the X86
+        // instruction selector (clang 19/20 ICE in 'X86 DAG->DAG Instruction
+        // Selection'), so a delegate call whose argument is another delegate
+        // call could not be compiled at all.
+        List<string> argTypes = new List<string>();
+        List<string> argVals = new List<string>();
+        int i = 0;
+        while (i < e.kids.Count) {
+            Node pty = MkType("int"); if (i < pt.Count) { pty = pt[i]; }
+            ExprVal av = GenArgExpr(e.kids[i], pty);
+            string lt = MapType(pty);
+            argTypes.Add(lt);
+            argVals.Add(Coerce(av, lt));
+            i = i + 1;
+        }
+        string iv = NT();
+        L("  " + iv + " = ptrtoint i8* " + clo.op + " to i64");
+        string bit = NT();
+        L("  " + bit + " = and i64 " + iv + ", 1");
+        string isClo = NT();
+        L("  " + isClo + " = icmp ne i64 " + bit + ", 0");
+        int lClo = NL(); int lBare = NL(); int lJoin = NL();
+        L("  br i1 " + isClo + ", label %L" + lClo + ", label %L" + lBare);
+        // 用 Label() 发标签：手工 L("L"+n+":") 不会更新 curLbl，之后的
+        // phi 会把前驱块记成旧块（LLVM: PHI node entries do not match
+        // predecessors）。
+        Label(lClo);
+        // the closure value is the tagged record: strip the tag before
+        // reading the { fn, env } slots
+        string rec = UntagClosure(clo.op);
+        string clop = NT();
+        L("  " + clop + " = bitcast i8* " + rec + " to i8**");
+        string fni8 = NT();
+        L("  " + fni8 + " = load i8*, i8** " + clop);
+        string envp = NT();
+        L("  " + envp + " = getelementptr i8*, i8** " + clop + ", i64 1");
+        string env = NT();
+        L("  " + env + " = load i8*, i8** " + envp);
+        string args = "i8* " + env;
+        string ptypesB = "";
+        int ib = 0;
+        while (ib < argTypes.Count) {
+            // the closure arm passes the env first, so every user argument is
+            // preceded by a comma; the bare arm has no env
+            args = args + ", " + argTypes[ib] + " " + argVals[ib];
+            ptypesB = ptypesB + (ib == 0 ? "" : ", ") + argTypes[ib];
+            ib = ib + 1;
+        }
+        string rt = MapType(callRetTy);
+        string fnt = LamFnType(callRetTy, pt);
+        // strip the trailing '*' of the pointer type: opaque-pointer LLVM
+        // rejects `call rt (args)* %ptr(...)`; the modern form is
+        // `call (args) %ptr(...)` where the fn type carries ret+params
+        string fnty = fnt.Substring(0, fnt.Length - 1);
+        // the closure record holds the function as an i8*: bitcast it to the
+        // function pointer type before calling -- calling an i8* directly is
+        // not valid IR (and the X86 backend crashes on it)
+        string fp = NT();
+        L("  " + fp + " = bitcast i8* " + fni8 + " to " + fnty + "*");
+        string rClo = "0";
+        if (rt != "void") { rClo = NT(); L("  " + rClo + " = call " + fnty + " " + fp + "(" + args + ")"); }
+        else { L("  call " + fnty + " " + fp + "(" + args + ")"); }
+        L("  br label %L" + lJoin);
+        Label(lBare);
+        // 裸原生函数指针没有 env 槽，函数类型只带声明形参；闭包路径的
+        // LamFnType 头部塞了 env 的 i8*，在这里不能复用（否则形参个数
+        // 与实参个数对不上，调用会被 LLVM 判为签名不符）。
+        string argsB = "";
+        ib = 0;
+        while (ib < argTypes.Count) {
+            string sepB = ib == 0 ? "" : ", ";
+            argsB = argsB + sepB + argTypes[ib] + " " + argVals[ib];
+            ib = ib + 1;
+        }
+        string fntyB = rt + " (" + ptypesB + ")";
+        // a bare native pointer is an i8* too: bitcast it before the call
+        string fpB = NT();
+        L("  " + fpB + " = bitcast i8* " + clo.op + " to " + fntyB + "*");
+        string rBare = "0";
+        if (rt != "void") { rBare = NT(); L("  " + rBare + " = call " + fntyB + " " + fpB + "(" + argsB + ")"); }
+        else { L("  call " + fntyB + " " + fpB + "(" + argsB + ")"); }
+        L("  br label %L" + lJoin);
+        Label(lJoin);
+        if (rt == "void") { return new ExprVal("0", MkType("void")); }
+        string t = NT();
+        L("  " + t + " = phi " + rt + " [ " + rClo + ", %L" + lClo + " ], [ " + rBare + ", %L" + lBare + " ]");
+        AddTemp(t, retTy);
+        if (isAsyncDeleg) {
+            Node tt = MkType("__task");
+            tt.a = retTy;
+            return AsyncFrame(t, tt);
+        }
+        return new ExprVal(t, retTy);
+    }
+
+    // Can this name be resolved as a value in the current context? Mirrors
+    // GenIdent's lookup order (local, this-field, this-property, static
+    // field, static method group). The call path uses it to tell an
+    // unknown receiver from a known one.
+    bool IdentResolves(string name) {
+        if (LocalIdx(name) >= 0) { return true; }
+        if (curHasThis) {
+            Node cls = binder.FindType(curClass);
+            if (cls != null) {
+                if (FieldIndex(cls, name) >= 0) { return true; }
+                if (FindMethodUp(cls, "get_" + name) != null) { return true; }
+            }
+        }
+        if (curClass != "") {
+            Node scls = binder.FindType(curClass);
+            if (scls != null) {
+                if (FindStaticField(scls, name) != null) { return true; }
+                Node mg = FindMethodUp(scls, name);
+                if (mg != null && HasMod(mg, MOD.Static())) { return true; }
+            }
+        }
+        return false;
+    }
+
+    bool MatchBuiltinClass(string name, string target) {
+        if (name == target) { return true; }
+        if (name.Length > target.Length + 1 && name.EndsWith("_" + target)) { return true; }
+        return false;
+    }
+
+    // The static classes the C host exposes as builtins. The self-host
+    // lowers only some of their members: a call to a member it does not
+    // know is a capability gap, not a typo, and is reported as such.
+    bool IsBuiltinClassName(string name) {
+        if (name == "Console" || name == "Convert" || name == "Math") { return true; }
+        if (name == "Task" || name == "Gate" || name == "Socket") { return true; }
+        if (name == "Environment" || name == "File" || name == "Directory") { return true; }
+        if (name == "NativeMemory" || name == "BitOperations") { return true; }
+        if (name == "Vector128" || name == "Vector256" || name == "Sse2" || name == "Aes") { return true; }
+        if (name == "string" || name == "String") { return true; }
+        if (name == "int" || name == "long" || name == "double" || name == "float") { return true; }
+        if (name == "Int32" || name == "Int64" || name == "Double" || name == "Single") { return true; }
+        if (MatchBuiltinClass(name, "NativeMemory") || MatchBuiltinClass(name, "BitOperations") ||
+            MatchBuiltinClass(name, "Console") || MatchBuiltinClass(name, "Math") ||
+            MatchBuiltinClass(name, "File") || MatchBuiltinClass(name, "Directory") ||
+            MatchBuiltinClass(name, "Path") || MatchBuiltinClass(name, "Environment")) {
+            return true;
+        }
+        return false;
+    }
+
+    // The feature id the C host's __zan_cpu_feature() takes
+    // (src/compiler/irgen_expr.c:1497-1502); 0 means "not a feature".
+    int CpuFeatureId(string name) {
+        if (name == "HasPopcnt") { return 1; }
+        if (name == "HasLzcnt") { return 2; }
+        if (name == "HasSse42") { return 3; }
+        if (name == "HasAvx2") { return 4; }
+        if (name == "HasAesNi") { return 5; }
+        if (name == "HasNeon") { return 6; }
+        return 0;
+    }
+
+    // "Cls.Name" -- the name a diagnostic quotes for a call the self-host
+    // cannot lower.
+    string CallLabel(Node recv, string mname) {
+        if (recv != null && recv.kind == AK.Ident()) { return recv.sval + "." + mname; }
+        return mname;
+    }
+
+    // The type name a Math.* argument must NOT have, or "" when the value may
+    // be used as a number.
+    //
+    // The C host (irgen_call.c math_arg_is_numeric) judges the LOWERCED value:
+    // an integer, a float or a double is numeric, everything else -- a class
+    // instance, an array, a delegate, a string (all of them pointers) -- is
+    // not. The self-host only has the static type here, so the same set is
+    // reproduced by name: the integral types, the floating types and `char`
+    // lower to numbers, a string lowers to a pointer.
+    //
+    // `bool` is NOT one of them: the host lowers it to i1 and takes i1 out of
+    // the numeric whitelist (TASKS.md A498), so `Math.Sqrt(true)` is refused
+    // there. C# agrees -- bool has no implicit conversion to double. The
+    // self-host used to answer 1.0, so the two backends disagreed on the same
+    // program.
+    //
+    // The self-host used to lower every argument with `sitofp i64 <ptr>`,
+    // which is invalid IR ("'x' defined with type 'ptr' but expected 'i64'")
+    // -- the compile died in the LLVM verifier instead of telling the user
+    // what was wrong.
+    string MathNumBadType(Node ty) {
+        if (ty == null) { return ""; }               // unknown: stay permissive
+        if (ty.op == 1) { return ty.sval; }          // a nullable lowers to a struct
+        if (ty.ival >= 1) { return ty.sval; }        // an array is a pointer
+        string n = ty.sval;
+        if (n == "" || n == "var") { return ""; }
+        if (IsIntLike(ty)) { return ""; }            // every integer rides an i64
+        if (n == "double" || n == "float") { return ""; }
+        if (n == "char") { return ""; }
+        if (n == "bool") { return "bool"; }          // no implicit bool -> double
+        if (n == "string") { return "string"; }      // a string is a pointer
+        if (n == "object") { return "object"; }      // `object` is a pointer
+        if (n == "decimal") { return "decimal"; }    // the host lowers it to a struct
+        if (binder.IsTypeParam(n)) { return ""; }    // known only at instantiation
+        if (binder.IsDelegateName(n)) { return n; }
+        Node d = binder.FindType(n);
+        if (d == null) { return ""; }                // unknown: stay permissive
+        if (d.kind == AK.EnumDecl()) { return ""; }  // an enum rides an i64
+        return n;                                    // class / struct
+    }
+
+    // The value as a double (an int argument is converted, like the C host)
+    //
+    // `fname` is the Math function being lowered and `at` the CALL itself:
+    // the C host reports the refusal at the call (irgen_call.c
+    // math_require_numeric, expr->loc). A value that is not a number is
+    // refused with the C host's wording instead of being lowered into
+    // invalid IR; the call then answers 0.0.
+    string ToDbl(ExprVal v, string fname, Node at) {
+        // A487: the bad-type check must run BEFORE the IsDbl shortcut --
+        // `decimal` rides a double payload (IsDbl) but the host still refuses
+        // it here (`Math.Sqrt(2.5m)` -- decimal is a struct there).
+        string bad = MathNumBadType(v.ty);
+        if (bad != "") {
+            diags.Error("Math." + fname + " requires an int or floating-point argument",
+                at.line, at.col);
+            return "0.0";
+        }
+        if (IsDbl(v.ty)) { return v.op; }
+        string c = NT();
+        L("  " + c + " = sitofp i64 " + v.op + " to double");
+        return c;
+    }
+
+    // Math.<fn>(...) -> the libm call the C host lowers (irgen_call.c):
+    // the one-argument family (sin/cos/tan/log/exp/atan/asin/acos/sqrt),
+    // Pow/Atan2, Floor/Ceiling, Abs, and Max/Min. Max/Min keep the argument
+    // type (int in -> int out) and are NaN-aware, exactly like the host's
+    // select-based lowering. Returns null for a name that is not a Math
+    // intrinsic (the caller then reports it).
+    ExprVal GenMathCall(string name, Node e) {
+        int argc = e.kids.Count;
+        string f1 = "";
+        if (name == "Sin") { f1 = "sin"; }
+        else if (name == "Cos") { f1 = "cos"; }
+        else if (name == "Tan") { f1 = "tan"; }
+        else if (name == "Log") { f1 = "log"; }
+        else if (name == "Exp") { f1 = "exp"; }
+        else if (name == "Atan") { f1 = "atan"; }
+        else if (name == "Asin") { f1 = "asin"; }
+        else if (name == "Acos") { f1 = "acos"; }
+        else if (name == "Sqrt") { f1 = "sqrt"; }
+        if (f1 != "" && argc == 1) {
+            ExprVal a = GenExpr(e.kids[0]);
+            string av = ToDbl(a, name, e);
+            if (!ExternSeen(f1)) { externDecls.Add(f1); H("declare double @" + f1 + "(double)"); }
+            string r = NT();
+            L("  " + r + " = call double @" + f1 + "(double " + av + ")");
+            return new ExprVal(r, MkType("double"));
+        }
+        if ((name == "Pow" || name == "Atan2") && argc == 2) {
+            string fn = "pow";
+            if (name == "Atan2") { fn = "atan2"; }
+            ExprVal a = GenExpr(e.kids[0]);
+            ExprVal b = GenExpr(e.kids[1]);
+            string av = ToDbl(a, name, e);
+            string bv = ToDbl(b, name, e);
+            if (!ExternSeen(fn)) { externDecls.Add(fn); H("declare double @" + fn + "(double, double)"); }
+            string r = NT();
+            L("  " + r + " = call double @" + fn + "(double " + av + ", double " + bv + ")");
+            return new ExprVal(r, MkType("double"));
+        }
+        if ((name == "Floor" || name == "Ceiling") && argc == 1) {
+            string fn = "floor";
+            if (name == "Ceiling") { fn = "ceil"; }
+            ExprVal a = GenExpr(e.kids[0]);
+            string av = ToDbl(a, name, e);
+            if (!ExternSeen(fn)) { externDecls.Add(fn); H("declare double @" + fn + "(double)"); }
+            string r = NT();
+            L("  " + r + " = call double @" + fn + "(double " + av + ")");
+            return new ExprVal(r, MkType("double"));
+        }
+        if (name == "Abs" && argc == 1) {
+            ExprVal a = GenExpr(e.kids[0]);
+            // The integer path lowers `ashr i64 <op>` -- a class instance (a
+            // pointer) would make that invalid IR. Refuse it the way the C
+            // host does (irgen_call.c math_require_numeric).
+            if (MathNumBadType(a.ty) != "") {
+                diags.Error("Math.Abs requires an int or floating-point argument",
+                    e.line, e.col);
+                return new ExprVal("0", MkType("int"));
+            }
+            if (IsDbl(a.ty)) {
+                if (!ExternSeen("fabs")) { externDecls.Add("fabs"); H("declare double @fabs(double)"); }
+                string r = NT();
+                L("  " + r + " = call double @fabs(double " + a.op + ")");
+                return new ExprVal(r, MkType("double"));
+            }
+            // integer abs: (x ^ (x >> 63)) - (x >> 63)
+            string sh = NT();
+            L("  " + sh + " = ashr i64 " + a.op + ", 63");
+            string xr = NT();
+            L("  " + xr + " = xor i64 " + a.op + ", " + sh);
+            string r = NT();
+            L("  " + r + " = sub i64 " + xr + ", " + sh);
+            return new ExprVal(r, MkType("int"));
+        }
+        if ((name == "Max" || name == "Min") && argc == 2) {
+            ExprVal a = GenExpr(e.kids[0]);
+            ExprVal b = GenExpr(e.kids[1]);
+            // Both arguments are judged separately: the C host does the same
+            // (irgen_call.c math_arg_is_numeric on each side) -- a pointer
+            // next to an integer used to slip through and then be sitofp'd
+            // into invalid IR.
+            string badA = MathNumBadType(a.ty);
+            string badB = MathNumBadType(b.ty);
+            if (badA != "" || badB != "") {
+                diags.Error("Math." + name + " requires numeric arguments",
+                    e.line, e.col);
+                return new ExprVal("0", MkType("int"));
+            }
+            bool dbl = IsDbl(a.ty) || IsDbl(b.ty);
+            if (dbl) {
+                string av = ToDbl(a, name, e);
+                string bv = ToDbl(b, name, e);
+                string an = NT();
+                L("  " + an + " = fcmp uno double " + av + ", " + av);
+                string bn = NT();
+                L("  " + bn + " = fcmp uno double " + bv + ", " + bv);
+                string c = NT();
+                if (name == "Max") { L("  " + c + " = fcmp ogt double " + av + ", " + bv); }
+                else { L("  " + c + " = fcmp olt double " + av + ", " + bv); }
+                string picked = NT();
+                L("  " + picked + " = select i1 " + c + ", double " + av + ", double " + bv);
+                string fb = NT();
+                L("  " + fb + " = select i1 " + bn + ", double " + bv + ", double " + picked);
+                string r = NT();
+                L("  " + r + " = select i1 " + an + ", double " + av + ", double " + fb);
+                return new ExprVal(r, MkType("double"));
+            }
+            string c = NT();
+            if (name == "Max") { L("  " + c + " = icmp sgt i64 " + a.op + ", " + b.op); }
+            else { L("  " + c + " = icmp slt i64 " + a.op + ", " + b.op); }
+            string r = NT();
+            L("  " + r + " = select i1 " + c + ", i64 " + a.op + ", i64 " + b.op);
+            return new ExprVal(r, MkType("int"));
+        }
+        return null;
+    }
+
+}

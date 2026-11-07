@@ -1,0 +1,771 @@
+using System;
+using System.Collections.Generic;
+namespace Zan;
+
+partial class Irgen {
+    // ---- cast ----
+    ExprVal GenCast(Node e) {
+        ExprVal v = GenExpr(e.b);
+        Node tgt = e.type;
+        // a user-defined conversion operator wins over the built-in cast
+        ExprVal uc = ApplyUserConv(tgt, v, true);
+        if (convApplied) { return uc; }
+        bool toD = IsDbl(tgt);
+        bool fromD = IsDbl(v.ty);
+        // int -> double
+        if (toD && !fromD && MapType(v.ty) == "i64") {
+            string t = NT();
+            L("  " + t + " = sitofp i64 " + v.op + " to double");
+            // a float target carries single precision: the host converts the
+            // integer to an f32
+            if (IsFloatTy(tgt)) { t = F32Round(t); }
+            return new ExprVal(t, tgt);
+        }
+        // double -> int (truncating toward zero)
+        if (fromD && !toD && MapType(tgt) == "i64") {
+            string t = NT();
+            L("  " + t + " = fptosi double " + v.op + " to i64");
+            return new ExprVal(t, tgt);
+        }
+        // -> float: the single-precision rounding (the host narrows to f32)
+        if (IsFloatTy(tgt) && fromD) {
+            return new ExprVal(F32Round(v.op), tgt);
+        }
+        // unsigned / small-width targets share the i64 slot, so their cast is a
+        // wrap-to-width mask (zero-extend for uint/ushort, sign-extend from 8
+        // bits for sbyte) applied to the i64 value. The host lowers the same
+        // casts by truncating to the target's own width and widening back
+        // (irgen_expr.c: emit_expr_cast_expr): byte/uint/ushort zero-extend,
+        // sbyte/short/int sign-extend, char/long/ulong keep the whole 64 bits.
+        if (!toD && !fromD && tgt != null && MapType(v.ty) == "i64") {
+            string tn = tgt.sval;
+            if (tn == "uint") {
+                string t = NT();
+                L("  " + t + " = and i64 " + v.op + ", 4294967295");
+                return new ExprVal(t, tgt);
+            }
+            if (tn == "ushort") {
+                string t = NT();
+                L("  " + t + " = and i64 " + v.op + ", 65535");
+                return new ExprVal(t, tgt);
+            }
+            if (tn == "byte") {
+                string t = NT();
+                L("  " + t + " = and i64 " + v.op + ", 255");
+                return new ExprVal(t, tgt);
+            }
+            if (tn == "sbyte") {
+                string s1 = NT();
+                L("  " + s1 + " = shl i64 " + v.op + ", 56");
+                string s2 = NT();
+                L("  " + s2 + " = ashr i64 " + s1 + ", 56");
+                return new ExprVal(s2, tgt);
+            }
+            if (tn == "short") {
+                string s1 = NT();
+                L("  " + s1 + " = shl i64 " + v.op + ", 48");
+                string s2 = NT();
+                L("  " + s2 + " = ashr i64 " + s1 + ", 48");
+                return new ExprVal(s2, tgt);
+            }
+            if (tn == "int") {
+                // the host's int is 32 bits: a cast to int keeps the low 32
+                // bits and sign-extends them
+                string s1 = NT();
+                L("  " + s1 + " = shl i64 " + v.op + ", 32");
+                string s2 = NT();
+                L("  " + s2 + " = ashr i64 " + s1 + ", 32");
+                return new ExprVal(s2, tgt);
+            }
+        }
+        // address <-> pointer: (Delegate)addr makes a runtime-resolved address
+        // callable, (nint)handler takes a callback address.
+        if (tgt != null && !toD && !fromD) {
+            string tll = MapType(tgt);
+            string sll = MapType(v.ty);
+            if (sll == "i64" && tll != "i64" && IsPtrType(tgt)) {
+                string t = NT();
+                L("  " + t + " = inttoptr i64 " + v.op + " to " + tll);
+                return new ExprVal(t, tgt);
+            }
+            if (tll == "i64" && sll != "i64" && IsPtrType(v.ty)) {
+                string t = NT();
+                L("  " + t + " = ptrtoint " + sll + " " + v.op + " to i64");
+                return new ExprVal(t, tgt);
+            }
+        }
+        // B-ID163③ / B-ID168 A3: a reference -> reference downcast or struct unbox
+        // whose static types cannot prove safety gets runtime type check.
+        // Failing cast throws InvalidCastException (catchable in try; outside try
+        // unhandled exception exits 70).
+        if (tgt != null && v.ty != null && tgt.ival < 1 && IsPtrLL(MapType(v.ty)) && IsPtrLL(MapType(tgt))) {
+            string tn = tgt.sval;
+            Node tc = binder.FindType(tn);
+            bool isStruct = tc != null && tc.kind == AK.StructDecl();
+            bool refTarget = tn == "string" || tn == "object" || IsContainerType(tn)
+                || (tc != null && (tc.kind == AK.ClassDecl() || tc.kind == AK.StructDecl()));
+            bool staticOk = tn == "object" || v.ty.sval == tn || IsSubclassName(v.ty.sval, tn);
+            if (refTarget && !staticOk) {
+                string ok;
+                if (tn == "string") { ok = EmitStringIdTest(v); }
+                else { ok = EmitClassIdTest(v, tn); }
+                int lok = NL();
+                int lbad = NL();
+                L("  br i1 " + ok + ", label %L" + lok + ", label %L" + lbad);
+                Label(lbad);
+                if (isStruct) {
+                    EmitCastThrow("InvalidCastException: object is not an instance of the target struct type");
+                } else {
+                    EmitCastThrow("InvalidCastException: object is not an instance of the target type");
+                }
+                Label(lok);
+                term = false;
+                string tll = MapType(tgt);
+                string cv = v.op;
+                if (MapType(v.ty) != tll) {
+                    string b = NT();
+                    L("  " + b + " = bitcast " + MapType(v.ty) + " " + v.op + " to " + tll);
+                    cv = b;
+                }
+                return new ExprVal(cv, tgt);
+            }
+        }
+        // remaining numeric casts are all i64 in this model; just retag
+        return new ExprVal(v.op, tgt);
+    }
+
+    // x as T -- like gen0: upcasts/identity and object targets pass the value
+    // through; a downcast or dynamic type test consults the runtime class id
+    // (or string id) and yields null on failure without throwing.
+    ExprVal GenAs(Node e) {
+        ExprVal v = GenExpr(e.a);
+        if (e.type == null || v == null) { return v; }
+        Node tgt = e.type;
+        string tll = MapType(tgt);
+        if (v.ty != null && tgt.ival < 1 && IsPtrLL(MapType(v.ty)) && IsPtrLL(tll)) {
+            string tn = tgt.sval;
+            Node tc = binder.FindType(tn);
+            bool refTarget = tn == "string" || tn == "object" || IsContainerType(tn)
+                || (tc != null && tc.kind == AK.ClassDecl());
+            bool staticOk = tn == "object" || v.ty.sval == tn || IsSubclassName(v.ty.sval, tn);
+            if (staticOk) {
+                string cv = v.op;
+                if (MapType(v.ty) != tll) {
+                    string b = NT();
+                    L("  " + b + " = bitcast " + MapType(v.ty) + " " + v.op + " to " + tll);
+                    cv = b;
+                }
+                return new ExprVal(cv, tgt);
+            }
+            if (refTarget) {
+                string ok;
+                if (tn == "string") { ok = EmitStringIdTest(v); }
+                else { ok = EmitClassIdTest(v, tn); }
+                string cv = v.op;
+                if (MapType(v.ty) != tll) {
+                    string b = NT();
+                    L("  " + b + " = bitcast " + MapType(v.ty) + " " + v.op + " to " + tll);
+                    cv = b;
+                }
+                string safe = NT();
+                L("  " + safe + " = select i1 " + ok + ", " + tll + " " + cv + ", " + tll + " null");
+                return new ExprVal(safe, tgt);
+            }
+        }
+        return v;
+    }
+
+    // ---- integer width at typed locations ----
+    // The C host keeps an integer value in a 64-bit slot, but a value that
+    // enters a *typed location* (a variable, a field, an argument, a return
+    // value) is narrowed to that type's width: `int z = unchecked(x + 1)`
+    // wraps to -2147483648 exactly like the host's 32-bit int arithmetic,
+    // while the same expression printed directly stays 64-bit.
+    int IntBits(Node t) {
+        if (t == null) { return 0; }
+        string n = t.sval;
+        if (n == "int" || n == "uint") { return 32; }
+        if (n == "short" || n == "ushort" || n == "char") { return 16; }
+        if (n == "byte" || n == "sbyte") { return 8; }
+        if (n == "bool") { return 8; }
+        return 0;
+    }
+
+    // An unsigned integer type widens back with zero-extension, a signed one
+    // with sign-extension.
+    bool IntUnsigned(Node t) {
+        if (t == null) { return false; }
+        string n = t.sval;
+        return n == "uint" || n == "ushort" || n == "byte" || n == "char";
+    }
+
+    // Narrow an integer carrier to the declared type's width. Only plain
+    // integer carriers are narrowed: a pointer, a double, a boxed nullable,
+    // an erased type parameter or an array slot keeps its value.
+    ExprVal NarrowToDeclared(ExprVal v, Node declTy) {
+        // a float-typed slot carries single precision: the host narrows the
+        // value to an f32 there (an integer is converted, then rounded)
+        if (IsFloatTy(declTy) && v != null && v.ty != null) {
+            if (IsDbl(v.ty)) {
+                return new ExprVal(F32Round(v.op), declTy);
+            }
+            if (MapType(v.ty) == "i64") {
+                string t = NT();
+                L("  " + t + " = sitofp i64 " + v.op + " to double");
+                return new ExprVal(F32Round(t), declTy);
+            }
+        }
+        int bits = IntBits(declTy);
+        if (bits == 0 || v == null || v.ty == null) { return v; }
+        if (declTy.ival >= 1) { return v; }
+        if (IsNullableValue(declTy)) { return v; }
+        if (IsErasedType(declTy) || IsErasedType(v.ty)) { return v; }
+        if (MapType(v.ty) != "i64") { return v; }
+        string t1 = NT();
+        L("  " + t1 + " = trunc i64 " + v.op + " to i" + bits);
+        string t2 = NT();
+        if (IntUnsigned(declTy)) {
+            L("  " + t2 + " = zext i" + bits + " " + t1 + " to i64");
+        }
+        else {
+            L("  " + t2 + " = sext i" + bits + " " + t1 + " to i64");
+        }
+        return new ExprVal(t2, declTy);
+    }
+
+    // switch expression:  subj switch { pat => e, _ => e }. Constant patterns
+    // (int / string) compared against the subject; "_" is the default arm.
+    // Lowered to a test cascade feeding a phi at the join block.
+    string RelCmp(int op) {
+        if (op == TK.Less()) { return "slt"; }
+        if (op == TK.Greater()) { return "sgt"; }
+        if (op == TK.LessEq()) { return "sle"; }
+        if (op == TK.GreaterEq()) { return "sge"; }
+        return "eq";
+    }
+
+    // conditional expression: cond ? a : b, lowered to branches + phi.
+    //
+    // Each branch owns its own temporaries and releases them INSIDE the
+    // branch (the shape the null-coalescing operator above uses): the branch
+    // value is retained first, so the merged phi carries exactly one
+    // reference.  Releasing the branch temporaries after the merge would
+    // also release the slot of the branch that did NOT run -- that slot is
+    // still null, and releasing it corrupts the heap (the C host's
+    // emit_expr_conditional retains the non-owned branch inside the branch
+    // for the same reason).
+    // The static type of a conditional arm, decided BEFORE either arm is
+    // generated: the merged result type must be known while the then-block is
+    // still current (the then arm's coercion is emitted there and the block is
+    // never revisited), so the arms are typed from the AST -- the same
+    // pre-lowering inference the C host does (infer_expr_type, TASKS.md
+    // A514).  Null means "unknown"; the caller keeps the then arm's type then,
+    // which is exactly the old behaviour.
+    Node ArmStaticTy(Node e) {
+        if (e == null) { return null; }
+        int k = e.kind;
+        if (k == AK.IntLit()) { return MkType(e.IntLitTypeName()); }
+        if (k == AK.FloatLit()) {
+            if (e.suffix == 1) { return MkType("float"); }
+            if (e.suffix == 2) { return MkType("decimal"); }
+            return MkType("double");
+        }
+        if (k == AK.StringLit()) { return MkType("string"); }
+        if (k == AK.CharLit()) { return MkType("char"); }
+        if (k == AK.BoolLit()) { return MkType("bool"); }
+        if (k == AK.CastExpr() || k == AK.NewExpr()) { return e.type; }
+        if (k == AK.Ident()) {
+            int si = LocalIdx(e.sval);
+            if (si >= 0) { return locType[si]; }
+            Node tc = curClass != null && curClass != "" ? binder.FindType(curClass) : null;
+            if (tc != null) { return FieldType(tc, e.sval); }
+            return null;
+        }
+        if (k == AK.Conditional()) {
+            return MergeArmTypes(ArmStaticTy(e.b), ArmStaticTy(e.c));
+        }
+        return null;
+    }
+
+    // The merged conditional type: C#'s ?: takes the common promoted type of
+    // the two arms -- the host's irgen_promote_pair ladder (TASKS.md A514):
+    // decimal over every integer, double over float, float over every
+    // integer, ulong over long, long over int.  A decimal mixed with a
+    // float/double has no common type and unknown or non-numeric mixes keep
+    // the then arm -- the host's "return lt" fallback.
+    Node MergeArmTypes(Node a, Node b) {
+        if (a == null || b == null) { return a != null ? a : b; }
+        if (a.sval == b.sval && a.ival == b.ival) { return a; }
+        string an = a.sval; string bn = b.sval;
+        if (an == "decimal") { return (bn == "float" || bn == "double") ? a : MkType("decimal"); }
+        if (bn == "decimal") { return (an == "float" || an == "double") ? b : MkType("decimal"); }
+        if (an == "double" || bn == "double") { return MkType("double"); }
+        if (an == "float" || bn == "float") { return MkType("float"); }
+        if (an == "ulong" || bn == "ulong") { return MkType("ulong"); }
+        if (an == "long" || bn == "long") { return MkType("long"); }
+        return a;
+    }
+
+    ExprVal GenConditional(Node e) {
+        ExprVal c = GenExpr(e.a);
+        string ci = NT();
+        L("  " + ci + " = icmp ne i64 " + c.op + ", 0");
+        // The merged type is decided before the then arm is coerced.  It is
+        // adopted only when both carriers are plain numeric slots (i64 or
+        // double -- floats ride doubles here), because a decimal travels as a
+        // %Decimal* in this backend and coercing an integer into that phi
+        // would mint a garbage pointer; such mixes keep the then arm, which
+        // is what this backend did before the merge existed.
+        Node mty = MergeArmTypes(ArmStaticTy(e.b), ArmStaticTy(e.c));
+        int lt = NL(); int lf = NL(); int lend = NL();
+        L("  br i1 " + ci + ", label %L" + lt + ", label %L" + lf);
+        Label(lt);
+        List<string> svT = stmtTemps; List<Node> svTT = stmtTempTypes;
+        stmtTemps = new List<string>(); stmtTempTypes = new List<Node>();
+        ExprVal tv = GenExpr(e.b);
+        Node rty = tv.ty;
+        if (mty != null && tv.ty != null && mty.sval != tv.ty.sval) {
+            string ml = MapType(mty); string tl = MapType(tv.ty);
+            if ((ml == "i64" || ml == "double") && (tl == "i64" || tl == "double")) {
+                rty = mty;
+            }
+        }
+        string rll = MapType(rty);
+        string tvo = Coerce(tv, rll);
+        EmitArcRetain(tvo, rty);
+        EmitTempReleases();
+        stmtTemps = svT; stmtTempTypes = svTT;
+        string tlbl = curLbl;
+        L("  br label %L" + lend);
+        Label(lf);
+        List<string> svT2 = stmtTemps; List<Node> svTT2 = stmtTempTypes;
+        stmtTemps = new List<string>(); stmtTempTypes = new List<Node>();
+        ExprVal fv = GenExpr(e.c);
+        string fvo = Coerce(fv, rll);
+        EmitArcRetain(fvo, rty);
+        EmitTempReleases();
+        stmtTemps = svT2; stmtTempTypes = svTT2;
+        string flbl = curLbl;
+        L("  br label %L" + lend);
+        Label(lend);
+        // A482 自举半边：两臂都是 void 调用（语句位三元 flag ? A() : B();，
+        // 最常见的三元写法之一）不建 phi——phi void 是非法 IR（宿主同病，
+        // 宿主侧 ec1447686 已修），直接汇合返哑值。两臂已各自 br 到 lend，
+        // 这里只差 phi 与返回值。
+        if (tv.ty != null && fv.ty != null && tv.ty.sval == "void" && fv.ty.sval == "void") {
+            AddTemp("0", MkType("int"));
+            return new ExprVal("0", MkType("int"));
+        }
+        string r = NT();
+        L("  " + r + " = phi " + rll + " [ " + tvo + ", %" + tlbl + " ], [ " + fvo + ", %" + flbl + " ]");
+        AddTemp(r, rty);
+        return new ExprVal(r, rty);
+    }
+
+    // switch statement: case bodies as an if-else cascade; `break` jumps to
+    // the end label (C# switch cases cannot fall through).
+    // A switch section has a body when it carries at least one statement;
+    // an empty section falls through into the next section that has one
+    // (C# section semantics: `case 1: case 2: r = 30;` runs r = 30 for 1).
+    bool SwitchCaseHasBody(Node cse) {
+        if (cse == null || cse.b == null) { return false; }
+        return cse.b.kids.Count > 0;
+    }
+
+    // The type test half of a switch pattern (`case T x:`): an i1 condition.
+    // A pattern that needs a runtime class identity (an `object`-typed
+    // scrutinee, or a downcast to a derived class) asks the object's header:
+    // it carries the address of its class's tid global.
+    string EmitTypeTestVal(ExprVal obj, Node pat, Node at) {
+        string tt = pat.sval;
+        string st = obj.ty != null ? obj.ty.sval : "";
+        if (tt == "string") {
+            if (st == "string") { return Bool1(EmitNonNullVal(obj)); }
+            // a string in an `object` slot: the managed string keeps a magic
+            // word right before the payload
+            return EmitStringIdTest(obj);
+        }
+        Node tc = binder.FindType(tt);
+        bool tCls = tc != null && (tc.kind == AK.ClassDecl() || tc.kind == AK.StructDecl());
+        // a built-in container is a heap object: the runtime decides
+        if (!tCls) { tCls = IsContainerType(tt); }
+        if (!tCls) {
+            // a value type pattern: the static types decide (gen0's rule)
+            if (st == tt) { return Bool1("1"); }
+            return Bool1("0");
+        }
+        Node sc = binder.FindType(st);
+        bool sCls = sc != null && (sc.kind == AK.ClassDecl() || sc.kind == AK.StructDecl());
+        if (!sCls) {
+            // an `object` slot: the runtime class id decides
+            return EmitClassIdTest(obj, tt);
+        }
+        if (IsSubclassName(st, tt)) {
+            // the static type already guarantees the pattern: only nullness matters
+            return Bool1(EmitNonNullVal(obj));
+        }
+        if (IsSubclassName(tt, st)) {
+            // a downcast: the runtime class id decides
+            return EmitClassIdTest(obj, tt);
+        }
+        diags.Error("'" + st + "' can never be a '" + tt + "'", at.line, at.col);
+        return Bool1("0");
+    }
+
+    // an i64 0/1 value as an i1 branch condition
+    string Bool1(string v) {
+        string r = NT();
+        L("  " + r + " = icmp ne i64 " + v + ", 0");
+        return r;
+    }
+
+    // an i1 condition as the i64 0/1 value a bool is spelled with
+    string Bool64(string v) {
+        string r = NT();
+        L("  " + r + " = zext i1 " + v + " to i64");
+        return r;
+    }
+
+    // The runtime class identity test: the object's header carries the
+    // address of its class's tid global, so the test accepts every class that
+    // derives from `tt` (closed world, the same rule the vtable test uses).
+    string EmitClassIdTest(ExprVal obj, string tt) {
+        string cid = NT();
+        L("  " + cid + " = call i8* @__zan_class_id(i8* " + obj.op + ")");
+        string acc = "";
+        // a built-in container: its own class id (the element type is not part
+        // of the runtime identity -- the C host tells a List<int> from a
+        // List<string> by the class alone as well)
+        if (IsContainerType(tt)) {
+            string ccmp = NT();
+            L("  " + ccmp + " = icmp eq i8* " + cid + ", bitcast (i8** @__tid_" + ContainerTidName(tt) + " to i8*)");
+            acc = ccmp;
+        }
+        int i = 0;
+        while (i < tidNames.Count) {
+            string cn = tidNames[i];
+            if (IsSubclassName(cn, tt)) {
+                string cmp = NT();
+                L("  " + cmp + " = icmp eq i8* " + cid + ", bitcast (i8** @__tid_" + cn + " to i8*)");
+                if (acc == "") { acc = cmp; }
+                else {
+                    string o = NT();
+                    L("  " + o + " = or i1 " + acc + ", " + cmp);
+                    acc = o;
+                }
+            }
+            i = i + 1;
+        }
+        if (acc == "") { return Bool1("0"); }
+        return acc;
+    }
+
+    // Is the object a managed string? The string header keeps a magic word
+    // right before the payload; a class instance has a destructor pointer
+    // there instead.
+    string EmitStringIdTest(ExprVal obj) {
+        string v = NT();
+        L("  " + v + " = call i64 @__zan_is_string(i8* " + obj.op + ")");
+        return Bool1(v);
+    }
+
+    // null test on a reference value -> i64 0/1
+    string EmitNonNullVal(ExprVal obj) {
+        string ot = MapType(obj.ty);
+        // an erased type parameter travels in an i64 slot (see the null
+        // comparison in GenBinary): it is compared against 0
+        string nul = "null"; if (!IsPtrLL(ot)) { nul = "0"; }
+        string t = NT();
+        L("  " + t + " = icmp ne " + ot + " " + obj.op + ", " + nul);
+        string z = NT();
+        L("  " + z + " = zext i1 " + t + " to i64");
+        return z;
+    }
+
+    // runtime vtable comparison against every concrete subclass of `tt`
+    // (the same closed-world rule GenIs uses for `x is T`)
+    string EmitVtableTestVal(ExprVal obj, string tt) {
+        string sty = obj.ty.sval;
+        string vtp = NT();
+        L("  " + vtp + " = getelementptr %" + sty + ", %" + sty + "* " + obj.op + ", i32 0, i32 0");
+        string vt = NT();
+        L("  " + vt + " = load i8*, i8** " + vtp);
+        List<Node> ts = binder.types;
+        string acc = "";
+        int i = 0;
+        while (i < ts.Count) {
+            Node c = ts[i];
+            bool isCls = (c.kind == AK.ClassDecl() || c.kind == AK.StructDecl());
+            if (isCls && IsPolyClass(c) && !HasMod(c, MOD.Abstract()) && IsSubclassName(c.sval, tt)) {
+                List<string> vslots = new List<string>();
+                CollectVSlots(c, vslots);
+                string cmp = NT();
+                L("  " + cmp + " = icmp eq i8* " + vt + ", bitcast ([" + vslots.Count + " x i8*]* @" + c.sval + "_vtable to i8*)");
+                if (acc == "") { acc = cmp; }
+                else {
+                    string o = NT();
+                    L("  " + o + " = or i1 " + acc + ", " + cmp);
+                    acc = o;
+                }
+            }
+            i = i + 1;
+        }
+        if (acc == "") { return "0"; }
+        string z = NT();
+        L("  " + z + " = zext i1 " + acc + " to i64");
+        return z;
+    }
+
+    // bind a pattern variable to the scrutinee value (the value type's slot
+    // layout is the same as the scrutinee's; ARC-managed types are retained)
+    void EmitPatternBind(Node cse, ExprVal subj) {
+        if (cse.sval == null || cse.sval == "") { return; }
+        Node pty = cse.type;
+        if (pty == null) { return; }
+        string plt = MapType(pty);
+        string reg = AddLocal(cse.sval, pty);
+        EA(reg, plt);
+        if (IsNullableValue(pty)) {
+            L("  store i8* " + BoxFor(subj, pty) + ", i8** " + reg);
+            return;
+        }
+        string sv = Coerce(subj, plt);
+        L("  store " + plt + " " + sv + ", " + plt + "* " + reg);
+        EmitArcRetain(sv, pty);
+    }
+
+    void GenSwitchStmt(Node s) {
+        stmtTemps = new List<string>(); stmtTempTypes = new List<Node>();
+        ExprVal subj = GenExpr(s.a);
+        int lend = NL();
+        int sBrk = brkTarget; int sLoop = loopScopeBase;
+        brkTarget = lend; loopScopeBase = locName.Count;
+        int nc = s.kids.Count;
+        int[] bodyL = new int[nc];
+        int[] nextL = new int[nc];
+        int[] matchL = new int[nc];
+        int[] guardL = new int[nc];
+        int i = 0;
+        while (i < nc) { bodyL[i] = NL(); nextL[i] = NL(); matchL[i] = NL(); guardL[i] = NL(); i = i + 1; }
+        // the default section (no label, no pattern)
+        int defIdx = -1;
+        i = 0;
+        while (i < nc) {
+            Node cse = s.kids[i];
+            if (cse.ival != 1 && cse.a == null) { defIdx = i; }
+            i = i + 1;
+        }
+        // an empty section falls through into the next section that has a body
+        int[] fallTo = new int[nc];
+        int nxt = -1;
+        i = nc - 1;
+        while (i >= 0) {
+            fallTo[i] = nxt;
+            Node cse = s.kids[i];
+            if (i != defIdx && SwitchCaseHasBody(cse)) { nxt = i; }
+            i = i - 1;
+        }
+        // the entry label of a section: a pattern section binds its variable
+        // before the body, a constant section goes straight to the body
+        int[] entryL = new int[nc];
+        i = 0;
+        while (i < nc) {
+            Node cse = s.kids[i];
+            if (cse.ival == 1) { entryL[i] = matchL[i]; } else { entryL[i] = bodyL[i]; }
+            i = i + 1;
+        }
+        i = 0;
+        while (i < nc) {
+            Node cse = s.kids[i];
+            if (i == defIdx) { i = i + 1; continue; }
+            int scopeStart = locName.Count;
+            string c = NT();
+            if (cse.ival == 1) {
+                // pattern section: `case T x [when g]:` or `case null:`
+                if (cse.type == null) {
+                    if (!IsPtrType(subj.ty)) {
+                        diags.Error("'case null:' needs a reference value to test", cse.line, cse.col);
+                        c = Bool1("0");
+                    } else {
+                        L("  " + c + " = icmp eq " + MapType(subj.ty) + " " + subj.op + ", null");
+                    }
+                } else {
+                    c = EmitTypeTestVal(subj, cse.type, s.a);
+                }
+            } else {
+                ExprVal pv = GenExpr(cse.a);
+                if (IsStr(subj.ty) && IsStr(pv.ty)) {
+                    string r = NT();
+                    L("  " + r + " = call i32 @__zan_strcmp0(i8* " + subj.op + ", i8* " + pv.op + ")");
+                    L("  " + c + " = icmp eq i32 " + r + ", 0");
+                } else {
+                    L("  " + c + " = icmp eq i64 " + subj.op + ", " + pv.op);
+                }
+            }
+            if (cse.c != null) {
+                // a `when` guard: the pattern must match and the guard must hold
+                L("  br i1 " + c + ", label %L" + matchL[i] + ", label %L" + nextL[i]);
+                Label(matchL[i]);
+                EmitPatternBind(cse, subj);
+                L("  br label %L" + guardL[i]);
+                Label(guardL[i]);
+                ExprVal gv = GenExpr(cse.c);
+                string gi = NT();
+                L("  " + gi + " = icmp ne i64 " + gv.op + ", 0");
+                L("  br i1 " + gi + ", label %L" + bodyL[i] + ", label %L" + nextL[i]);
+            } else {
+                L("  br i1 " + c + ", label %L" + matchL[i] + ", label %L" + nextL[i]);
+                Label(matchL[i]);
+                EmitPatternBind(cse, subj);
+                L("  br label %L" + bodyL[i]);
+            }
+            Label(bodyL[i]);
+            if (!SwitchCaseHasBody(cse)) {
+                // empty section: fall through into the next section with a body
+                if (fallTo[i] >= 0) { L("  br label %L" + entryL[fallTo[i]]); }
+                else if (defIdx >= 0 && SwitchCaseHasBody(s.kids[defIdx])) { L("  br label %L" + bodyL[defIdx]); }
+                else { L("  br label %L" + lend); }
+            } else {
+                GenStmt(cse.b);
+                if (!term) { ReleaseLocalsFrom(scopeStart); L("  br label %L" + lend); }
+                term = false;
+                TrimLocals(scopeStart);
+            }
+            Label(nextL[i]);
+            i = i + 1;
+        }
+        if (defIdx >= 0) {
+            L("  br label %L" + bodyL[defIdx]);
+            Label(bodyL[defIdx]);
+            int scopeStart2 = locName.Count;
+            GenStmt(s.kids[defIdx].b);
+            if (!term) { ReleaseLocalsFrom(scopeStart2); L("  br label %L" + lend); }
+            term = false;
+            TrimLocals(scopeStart2);
+        } else {
+            L("  br label %L" + lend);
+        }
+        Label(lend);
+        brkTarget = sBrk; loopScopeBase = sLoop;
+    }
+
+    ExprVal GenSwitchExpr(Node e) {
+        List<string> svT = stmtTemps; List<Node> svTT = stmtTempTypes;
+        stmtTemps = new List<string>(); stmtTempTypes = new List<Node>();
+        ExprVal subj = GenExpr(e.a);
+        int nend = NL();
+        List<string> vals = new List<string>();
+        List<string> labs = new List<string>();
+        string resLL = "i64";
+        Node resTy = MkType("int");
+        int i = 0;
+        while (i < e.kids.Count) {
+            Node arm = e.kids[i];
+            // the arm's pattern binding is only valid in this arm: the slot is
+            // written on the matching path only, so it must be released (and
+            // dropped) here -- never at the function's epilogue, where the
+            // other arms' slots would still be uninitialised.
+            int armScope = locName.Count;
+            int bodyL = NL();
+            int nextL = NL();
+            if (arm.ival == 1) {
+                // pattern arm: `T x when g => v`
+                string c = NT();
+                if (arm.type == null) {
+                    if (!IsPtrType(subj.ty)) {
+                        diags.Error("a 'null' pattern needs a reference value to test", arm.line, arm.col);
+                        c = Bool1("0");
+                    } else {
+                        L("  " + c + " = icmp eq " + MapType(subj.ty) + " " + subj.op + ", null");
+                    }
+                } else {
+                    c = EmitTypeTestVal(subj, arm.type, e.a);
+                }
+                int pMatch = NL();
+                int pGuard = NL();
+                L("  br i1 " + c + ", label %L" + pMatch + ", label %L" + nextL);
+                Label(pMatch);
+                EmitPatternBind(arm, subj);
+                if (arm.c != null) {
+                    L("  br label %L" + pGuard);
+                    Label(pGuard);
+                    ExprVal gv = GenExpr(arm.c);
+                    string gi = NT();
+                    L("  " + gi + " = icmp ne i64 " + gv.op + ", 0");
+                    L("  br i1 " + gi + ", label %L" + bodyL + ", label %L" + nextL);
+                } else {
+                    L("  br label %L" + bodyL);
+                }
+            } else if (arm.a == null) {
+                if (arm.c != null) {
+                    ExprVal gv = GenExpr(arm.c);
+                    string gi = NT();
+                    L("  " + gi + " = icmp ne i64 " + gv.op + ", 0");
+                    L("  br i1 " + gi + ", label %L" + bodyL + ", label %L" + nextL);
+                } else {
+                    L("  br label %L" + bodyL);
+                }
+            } else {
+                ExprVal pv = GenExpr(arm.a);
+                string c = NT();
+                if (arm.op != 0) {
+                    L("  " + c + " = icmp " + RelCmp(arm.op) + " i64 " + subj.op + ", " + pv.op);
+                } else if (pv.op == "null") {
+                    // a `null` label: compare against null in the subject's type
+                    if (!IsPtrType(subj.ty)) {
+                        diags.Error("a 'null' label needs a reference value to test", arm.line, arm.col);
+                        c = Bool1("0");
+                    } else {
+                        L("  " + c + " = icmp eq " + MapType(subj.ty) + " " + subj.op + ", null");
+                    }
+                } else if (IsStr(subj.ty) && IsStr(pv.ty)) {
+                    string r = NT();
+                    L("  " + r + " = call i32 @__zan_strcmp0(i8* " + subj.op + ", i8* " + pv.op + ")");
+                    L("  " + c + " = icmp eq i32 " + r + ", 0");
+                } else {
+                    L("  " + c + " = icmp eq i64 " + subj.op + ", " + pv.op);
+                }
+                if (arm.c != null) {
+                    int guardL = NL();
+                    L("  br i1 " + c + ", label %L" + guardL + ", label %L" + nextL);
+                    Label(guardL);
+                    ExprVal gv = GenExpr(arm.c);
+                    string gi = NT();
+                    L("  " + gi + " = icmp ne i64 " + gv.op + ", 0");
+                    L("  br i1 " + gi + ", label %L" + bodyL + ", label %L" + nextL);
+                } else {
+                    L("  br i1 " + c + ", label %L" + bodyL + ", label %L" + nextL);
+                }
+            }
+            Label(bodyL);
+            ExprVal rv = GenExpr(arm.b);
+            resLL = MapType(rv.ty);
+            resTy = rv.ty;
+            vals.Add(Coerce(rv, resLL));
+            labs.Add(curLbl);
+            ReleaseLocalsFrom(armScope);
+            TrimLocals(armScope);
+            L("  br label %L" + nend);
+            Label(nextL);
+            i = i + 1;
+        }
+        L("  br label %L" + nend);
+        string fbLbl = curLbl;
+        Label(nend);
+        string t = NT();
+        string zero = "0"; if (resLL == "i8*") { zero = "null"; }
+        string phi = t + " = phi " + resLL;
+        int j = 0;
+        while (j < vals.Count) {
+            if (j > 0) { phi = phi + ","; }
+            phi = phi + " [ " + vals[j] + ", %" + labs[j] + " ]";
+            j = j + 1;
+        }
+        if (vals.Count > 0) { phi = phi + ", [ " + zero + ", %" + fbLbl + " ]"; }
+        else { phi = phi + " [ " + zero + ", %" + fbLbl + " ]"; }
+        L("  " + phi);
+        stmtTemps = svT; stmtTempTypes = svTT;
+        return new ExprVal(t, resTy);
+    }
+
+}

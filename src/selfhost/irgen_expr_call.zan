@@ -1,0 +1,913 @@
+using System;
+using System.Collections.Generic;
+namespace Zan;
+
+partial class Irgen {
+    // ---- calls ----
+    ExprVal GenCall(Node e) {
+        Node callee = e.a;
+        // Environment / File builtins: ClassName.Method(...)
+        if (callee.kind == AK.MemberAccess() && callee.a != null && callee.a.kind == AK.Ident()) {
+            string cn = callee.a.sval;
+            string mn = callee.sval;
+            if (cn == "Task" && (mn == "Run" || mn == "Spawn") && e.kids.Count == 1) {
+                return EmitTaskRunCall(e, mn == "Spawn");
+            }
+            if (cn == "Task" && mn == "IsDone" && e.kids.Count == 1) {
+                return EmitTaskIsDone(e);
+            }
+            if (cn == "Task" && mn == "Cancel" && e.kids.Count == 1) {
+                return EmitTaskCancel(e);
+            }
+            if (cn == "Task" && mn == "Yield" && e.kids.Count == 0) {
+                return new ExprVal("0", MkType("int"));
+            }
+            if (cn == "Task" && mn == "IsCancellationRequested" && e.kids.Count == 0) {
+                if (curAsync) {
+                    string cfl = NT();
+                    L("  " + cfl + " = load i64, i64* " + FrameGep("%ff", 10));
+                    string cfc = NT();
+                    L("  " + cfc + " = icmp ne i64 " + cfl + ", 0");
+                    string cfc32 = NT();
+                    L("  " + cfc32 + " = zext i1 " + cfc + " to i32");
+                    string cfc64 = NT();
+                    L("  " + cfc64 + " = zext i32 " + cfc32 + " to i64");
+                    return new ExprVal(cfc64, MkType("int"));
+                }
+                return new ExprVal("0", MkType("int"));
+            }
+            if (cn == "Task" && mn == "JoinNew" && e.kids.Count == 2) {
+                ExprVal a0 = GenExpr(e.kids[0]);
+                ExprVal a1 = GenExpr(e.kids[1]);
+                string a0_32 = NT(); L("  " + a0_32 + " = trunc i64 " + a0.op + " to i32");
+                string a1_32 = NT(); L("  " + a1_32 + " = trunc i64 " + a1.op + " to i32");
+                string r = NT();
+                L("  " + r + " = call i64 @zan_join_new(i32 " + a0_32 + ", i32 " + a1_32 + ")");
+                return new ExprVal(r, MkType("long"));
+            }
+            if (cn == "Task" && mn == "JoinBind" && e.kids.Count == 3) {
+                ExprVal a0 = GenExpr(e.kids[0]);
+                ExprVal a1 = GenExpr(e.kids[1]);
+                ExprVal a2 = GenExpr(e.kids[2]);
+                string fp;
+                if (MapType(a1.ty) == "i64") {
+                    fp = NT(); L("  " + fp + " = inttoptr i64 " + a1.op + " to i8*");
+                } else {
+                    fp = a1.op;
+                }
+                string a2_32 = NT(); L("  " + a2_32 + " = trunc i64 " + a2.op + " to i32");
+                string r = NT();
+                L("  " + r + " = call i32 @zan_join_bind(i64 " + a0.op + ", i8* " + fp + ", i32 " + a2_32 + ")");
+                string r64 = NT();
+                L("  " + r64 + " = zext i32 " + r + " to i64");
+                return new ExprVal(r64, MkType("int"));
+            }
+            if (cn == "Task" && mn == "JoinCancel" && e.kids.Count == 1) {
+                ExprVal a0 = GenExpr(e.kids[0]);
+                L("  call void @zan_join_cancel(i64 " + a0.op + ")");
+                return new ExprVal("0", MkType("void"));
+            }
+            if (cn == "Task" && mn == "JoinWait" && e.kids.Count == 1) {
+                return new ExprVal("2", MkType("int"));
+            }
+            if (cn == "Task" && mn != "Delay") {
+                diags.Error("call to 'Task." + mn + "' is not supported by the self-hosted "
+                    + "compiler yet", e.line, e.col);
+                return new ExprVal("0", MkType("int"));
+            }
+            // Cpu.CpuFeature(id): the C host lowers it to its internal
+            // __zan_cpu_feature() (src/compiler/irgen_expr.c:1488-1493).
+            // On a native build that helper reports no feature at all, so
+            // the call answers 0 -- the same value the Has* properties
+            // report.
+            if (cn == "Cpu" && mn == "CpuFeature" && e.kids.Count == 1) {
+                return new ExprVal("0", MkType("int"));
+            }
+            if (cn == "Environment" && mn == "ArgCount") {
+                string a = NT(); L("  " + a + " = load i32, i32* @__zan_argc");
+                string a64 = NT(); L("  " + a64 + " = sext i32 " + a + " to i64");
+                string r = NT(); L("  " + r + " = sub i64 " + a64 + ", 1");
+                return new ExprVal(r, MkType("int"));
+            }
+            if (cn == "Environment" && mn == "ArgAt") {
+                ExprVal idx = GenExpr(e.kids[0]);
+                string i1 = NT(); L("  " + i1 + " = add i64 " + idx.op + ", 1");
+                string av = NT(); L("  " + av + " = load i8**, i8*** @__zan_argv");
+                string sp = NT(); L("  " + sp + " = getelementptr i8*, i8** " + av + ", i64 " + i1);
+                string r = NT(); L("  " + r + " = load i8*, i8** " + sp);
+                return new ExprVal(WrapManaged(r), MkType("string"));
+            }
+            if (cn == "File" && mn == "ReadAllText") {
+                ExprVal path = GenExpr(e.kids[0]);
+                string rb = NT(); L("  " + rb + " = getelementptr inbounds [3 x i8], [3 x i8]* @.mode_rb, i64 0, i64 0");
+                string fp = NT(); L("  " + fp + " = call i8* @fopen(i8* " + path.op + ", i8* " + rb + ")");
+                EmitFopenCheck(fp, "@.msg.rderr", 18);
+                string se0 = NT(); L("  " + se0 + " = call i32 @fseek(i8* " + fp + ", i64 0, i32 2)");
+                string se0c = NT(); L("  " + se0c + " = icmp ne i32 " + se0 + ", 0"); EmitAbortIf(se0c, "@.msg.rderr", 18);
+                string sz = NT(); L("  " + sz + " = call i64 @ftell(i8* " + fp + ")");
+                string szc = NT(); L("  " + szc + " = icmp slt i64 " + sz + ", 0"); EmitAbortIf(szc, "@.msg.rderr", 18);
+                string se1 = NT(); L("  " + se1 + " = call i32 @fseek(i8* " + fp + ", i64 0, i32 0)");
+                string se1c = NT(); L("  " + se1c + " = icmp ne i32 " + se1 + ", 0"); EmitAbortIf(se1c, "@.msg.rderr", 18);
+                string bsz = NT(); L("  " + bsz + " = add i64 " + sz + ", 1");
+                string buf = NT(); L("  " + buf + " = call i8* @malloc(i64 " + bsz + ")");
+                string bufc = NT(); L("  " + bufc + " = icmp eq i8* " + buf + ", null"); EmitAbortIf(bufc, "@.msg.rderr", 18);
+                string got = NT(); L("  " + got + " = call i64 @fread(i8* " + buf + ", i64 1, i64 " + sz + ", i8* " + fp + ")");
+                string gotc = NT(); L("  " + gotc + " = icmp ne i64 " + got + ", " + sz); EmitAbortIf(gotc, "@.msg.rderr", 18);
+                string ep = NT(); L("  " + ep + " = getelementptr i8, i8* " + buf + ", i64 " + sz);
+                L("  store i8 0, i8* " + ep);
+                string rc = NT(); L("  " + rc + " = call i32 @fclose(i8* " + fp + ")");
+                string rcc = NT(); L("  " + rcc + " = icmp ne i32 " + rc + ", 0"); EmitAbortIf(rcc, "@.msg.rderr", 18);
+                return new ExprVal(WrapManaged(buf), MkType("string"));
+            }
+            if (cn == "File" && mn == "Exists") {
+                ExprVal path = GenExpr(e.kids[0]);
+                string rb = NT(); L("  " + rb + " = getelementptr inbounds [3 x i8], [3 x i8]* @.mode_rb, i64 0, i64 0");
+                string fp = NT(); L("  " + fp + " = call i8* @fopen(i8* " + path.op + ", i8* " + rb + ")");
+                string ok = NT(); L("  " + ok + " = icmp ne i8* " + fp + ", null");
+                int lcl = NL(); int lend2 = NL();
+                string okx = NT(); L("  " + okx + " = zext i1 " + ok + " to i64");
+                L("  br i1 " + ok + ", label %L" + lcl + ", label %L" + lend2);
+                Label(lcl);
+                string fc = NT(); L("  " + fc + " = call i32 @fclose(i8* " + fp + ")");
+                L("  br label %L" + lend2);
+                Label(lend2);
+                return new ExprVal(okx, MkType("bool"));
+            }
+            if (cn == "Environment" && mn == "ExeDir") {
+                usesDirList = true;
+                string t = NT(); L("  " + t + " = call i8* @zan_exe_dir()");
+                return new ExprVal(WrapManaged(t), MkType("string"));
+            }
+            if (cn == "Directory" && mn == "ListNames") {
+                usesDirList = true;
+                ExprVal pat = GenExpr(e.kids[0]);
+                string t = NT(); L("  " + t + " = call i8* @zan_dir_list(i8* " + pat.op + ")");
+                return new ExprVal(WrapManaged(t), MkType("string"));
+            }
+            if (cn == "File" && mn == "WriteAllText") {
+                ExprVal path = GenExpr(e.kids[0]);
+                ExprVal content = GenExpr(e.kids[1]);
+                string wb = NT(); L("  " + wb + " = getelementptr inbounds [3 x i8], [3 x i8]* @.mode_wb, i64 0, i64 0");
+                string fp = NT(); L("  " + fp + " = call i8* @fopen(i8* " + path.op + ", i8* " + wb + ")");
+                EmitFopenCheck(fp, "@.msg.wrerr", 19);
+                string ln = StrLen(content.op);
+                string wr = NT(); L("  " + wr + " = call i64 @fwrite(i8* " + content.op + ", i64 1, i64 " + ln + ", i8* " + fp + ")");
+                string wrc = NT(); L("  " + wrc + " = icmp ne i64 " + wr + ", " + ln); EmitAbortIf(wrc, "@.msg.wrerr", 19);
+                string wrcl = NT(); L("  " + wrcl + " = call i32 @fclose(i8* " + fp + ")");
+                string wrclc = NT(); L("  " + wrclc + " = icmp ne i32 " + wrcl + ", 0"); EmitAbortIf(wrclc, "@.msg.wrerr", 19);
+                return new ExprVal("0", MkType("void"));
+            }
+        }
+        // Console.* -- every member is lowered the way the C host lowers it
+        // (src/compiler/irgen_call.c). The old code had ONE catch-all that
+        // treated every Console member as "print the first argument", so
+        // Console.Clear() printed "0", Console.ReadLine() printed "0" and
+        // returned garbage -- the program got wrong answers without a word.
+        if (callee.kind == AK.MemberAccess() && callee.a != null && callee.a.kind == AK.Ident()
+            && callee.a.sval == "Console" && LocalIdx("Console") < 0 && binder.FindType("Console") == null) {
+            ExprVal cv = GenConsoleCall(callee.sval, e);
+            if (cv != null) { return cv; }
+        }
+        // Convert.ToString(x) -> heap string via snprintf; Convert.ToInt32(s) -> atoi
+        bool isConvertBuiltin = (callee.sval == "ToString" || callee.sval == "ToDouble"
+            || callee.sval == "ToInt32" || callee.sval == "ToInt" || callee.sval == "ToInt64")
+            && e.kids.Count == 1;
+        if (callee.kind == AK.MemberAccess() && callee.a != null && callee.a.kind == AK.Ident()
+            && callee.a.sval == "Convert" && isConvertBuiltin) {
+            if (callee.sval == "ToString" && e.kids.Count == 1) {
+                ExprVal a = GenExpr(e.kids[0]);
+                // The C host only accepts values that really have a string form
+                // (src/compiler/irgen_call.c, type_is_textual_or_numeric): a
+                // class instance / array / delegate / struct does not -- its
+                // pointer read as a C string walks off into the image and
+                // prints whatever it finds there. The host reports it; the
+                // self-host used to print the ADDRESS (an information leak
+                // and a useless answer), so the rule is mirrored here.
+                string bad = ConvertToStringBadType(a.ty);
+                if (bad != "") {
+                    diags.Error("[E3060] Convert.ToString: cannot convert '" + bad
+                        + "' to a string -- call .ToString() on the value instead",
+                        e.kids[0].line, e.kids[0].col);
+                    return new ExprVal("0", MkType("string"));
+                }
+                string s;
+                if (IsStr(a.ty)) { s = a.op; }
+                else if (IsNullableValue(a.ty)) { s = ToCStr(a); }
+                else if (MapType(a.ty) == "i8*") {
+                    // object 实参：宿主指针分支（irgen_call.c:2274，pointer-kind
+                    // → strlen+memcpy）把指针当 C 字符串——对象装着字符串时打印
+                    // 内容（两侧一直一致的「指针拷贝」语义）。曾掉进 itoa 分支、
+                    // 指针被当 i64 喂 snprintf（无效 IR）。收在 Convert.ToString
+                    // 位点内，不动 ToCStr 的其它 15 个调用点（拼接/插值对 object
+                    // 在宿主是 type_is_concatable 拒绝的，不走到这里）。
+                    //
+                    // A444 安全栏（与宿主同形，irgen_call.c 用
+                    // zan_obj_slot_is_string）：object 负载可能是类实例——原先
+                    // 拿 strlen 量对象指针 → 越界读 + 内存信息泄露。自举串头
+                    // 24 字节：[-24]=cid（字符串为 null，类实例是类 tid 地址）、
+                    // [-16]=len、[-8]=magic 0x5A4E5354（GenStr 字面量与
+                    // zstr_new 动态串同形，zstr_len 已用同一 magic 判别）。
+                    // 非字符串/null → 软运行时错（与解析家族同形，strict 模式
+                    // exit 70）+ 空串兜底，不再读对象指针。
+                    string isn2 = NT();
+                    L("  " + isn2 + " = icmp eq i8* " + a.op + ", null");
+                    int lnull = NL(); int lprobe = NL(); int lmerge = NL();
+                    L("  br i1 " + isn2 + ", label %L" + lnull + ", label %L" + lprobe);
+                    Label(lnull);
+                    L("  br label %L" + lmerge);
+                    Label(lprobe);
+                    string hp = NT();
+                    L("  " + hp + " = bitcast i8* " + a.op + " to i64*");
+                    string cp2 = NT();
+                    L("  " + cp2 + " = getelementptr i64, i64* " + hp + ", i64 -3");
+                    string cv2 = NT();
+                    L("  " + cv2 + " = load i64, i64* " + cp2);
+                    string mp2 = NT();
+                    L("  " + mp2 + " = getelementptr i64, i64* " + hp + ", i64 -1");
+                    string mv2 = NT();
+                    L("  " + mv2 + " = load i64, i64* " + mp2);
+                    string cok = NT();
+                    L("  " + cok + " = icmp eq i64 " + cv2 + ", 0");
+                    string mok = NT();
+                    L("  " + mok + " = icmp eq i64 " + mv2 + ", 1515082580");
+                    string sok = NT();
+                    L("  " + sok + " = and i1 " + cok + ", " + mok);
+                    L("  br label %L" + lmerge);
+                    Label(lmerge);
+                    string pred = NT();
+                    L("  " + pred + " = phi i1 [ 0, %L" + lnull + " ], [ " + sok + ", %L" + lprobe + " ]");
+                    string badv = NT();
+                    L("  " + badv + " = xor i1 " + pred + ", 1");
+                    EmitRuntimeCheckIf(e.kids[0], badv,
+                        "Convert.ToString: object holds a non-string value -- "
+                        + "call .ToString() on the concrete value instead");
+                    string empty2 = RawCString("");
+                    string safe2 = NT();
+                    L("  " + safe2 + " = select i1 " + pred + ", i8* " + a.op + ", i8* " + empty2);
+                    string n2 = NT();
+                    L("  " + n2 + " = call i64 @strlen(i8* " + safe2 + ")");
+                    string b2 = NT();
+                    L("  " + b2 + " = add i64 " + n2 + ", 1");
+                    string bf2 = NT();
+                    L("  " + bf2 + " = call i8* @malloc(i64 " + b2 + ")");
+                    L("  call i8* @memcpy(i8* " + bf2 + ", i8* " + safe2 + ", i64 " + b2 + ")");
+                    s = WrapManaged(bf2);
+                }
+                else { s = ToCStr(a); }
+                return new ExprVal(s, MkType("string"));
+            }
+            if (callee.sval == "ToDouble" && e.kids.Count == 1) {
+                ExprVal a = GenExpr(e.kids[0]);
+                // The C host refuses a class instance / struct / array /
+                // delegate (irgen_call.c type_is_textual_or_numeric): the
+                // pointer would be read as a C string, which walks off into
+                // the image. The self-host used to sitofp that pointer --
+                // invalid IR, and the program the host refuses compiled here.
+                string bad = ConvertNumberBadType(a.ty);
+                if (bad != "") {
+                    diags.Error("Convert.ToDouble: cannot convert '" + bad
+                        + "' to a number -- pass a string or a numeric value",
+                        e.line, e.col);
+                    return new ExprVal("0.0", MkType("double"));
+                }
+                return new ExprVal(ConvertDoubleOperand(e, a), MkType("double"));
+            }
+            if ((callee.sval == "ToInt32" || callee.sval == "ToInt" ||
+                 callee.sval == "ToInt64") && e.kids.Count == 1) {
+                // the C host (irgen_call.c:1937) parses the text with strtoll,
+                // truncates a float towards zero and keeps an integer as it
+                // is. The 32-bit narrowing is NOT part of the call: it
+                // happens where the value enters a typed location (an int
+                // slot is an i32), so the value travels as an i64 here.
+                ExprVal a = GenExpr(e.kids[0]);
+                string rt = "int";
+                if (callee.sval == "ToInt64") { rt = "long"; }
+                string bad = ConvertNumberBadType(a.ty);
+                if (bad != "") {
+                    diags.Error("Convert." + callee.sval + ": cannot convert '" + bad
+                        + "' to a number -- pass a string or a numeric value",
+                        e.line, e.col);
+                    return new ExprVal("0", MkType(rt));
+                }
+                return new ExprVal(ConvertIntOperand(e, a, callee.sval == "ToInt64"), MkType(rt));
+            }
+        }
+        // int/long.Parse(s), double/float.Parse(s) and matching
+        // TryParse(s, out v) -> strtoll/strtod (mirrors the C host)
+        if (callee.kind == AK.MemberAccess() && callee.a != null && callee.a.kind == AK.Ident()
+            && LocalIdx(callee.a.sval) < 0) {
+            string prn = callee.a.sval;
+            bool intRecv = prn == "int" || prn == "long" || prn == "Int32" || prn == "Int64";
+            bool dblRecv = prn == "double" || prn == "float" || prn == "Double" || prn == "Single";
+            // EnumType.TryParse(text, out value): the member-name probe (the
+            // host lowers it in irgen_call.c -- a case-sensitive strcmp over
+            // the members in declaration order)
+            Node en = EnumDeclOf(prn);
+            if (en != null && callee.sval == "TryParse" && e.kids.Count == 2) {
+                return EmitEnumTryParse(e, en);
+            }
+            // char 的静态类（镜像 C11 irgen_call_builtins.c A525）：谓词走
+            // <ctype.h>（ASCII 口径）；ToUpper/ToLower 在 C11 走烙表
+            // @__zan_case_map，自宿主无烙表通道，重写到 stdlib
+            // UnicodeCase.CaseToUpper/CaseToLower（charcase_table.h 同源
+            // 数据，语义一致）。stdlib 未随载（程序没 pull System.Text）
+            // 时退 libc 口径——ASCII 域两口径相同，仅非 ASCII 有偏差。
+            // 注意：重写路径必须先换节点再 GenExpr，参数只求值一次。
+            bool charRecv = prn == "char" || prn == "Char";
+            if (charRecv && e.kids.Count == 1) {
+                string cm = callee.sval;
+                if (cm == "ToUpper" || cm == "ToLower") {
+                    bool cup = cm == "ToUpper";
+                    if (binder.FindType("UnicodeCase") != null) {
+                        Node fa = new Node(AK.IntLit());
+                        fa.ival = cup ? 1 : 0;
+                        e.kids[0] = fa;
+                        callee.a.sval = "UnicodeCase";
+                        callee.sval = cup ? "CaseToUpper" : "CaseToLower";
+                        return GenExpr(e);
+                    }
+                    ExprVal ca = GenExpr(e.kids[0]);
+                    string cp32 = CharToI32(ca);
+                    string lf = cup ? "toupper" : "tolower";
+                    if (!ExternSeen(lf)) { externDecls.Add(lf); H("declare i32 @" + lf + "(i32)"); }
+                    string mr = NT();
+                    L("  " + mr + " = call i32 @" + lf + "(i32 " + cp32 + ")");
+                    return new ExprVal(mr, MkType("int"));
+                }
+                if (cm == "IsDigit" || cm == "IsLetter" || cm == "IsLetterOrDigit"
+                        || cm == "IsUpper" || cm == "IsLower" || cm == "IsWhiteSpace") {
+                    ExprVal ca = GenExpr(e.kids[0]);
+                    string cp32 = CharToI32(ca);
+                    string lf = cm == "IsDigit" ? "isdigit" : cm == "IsLetter" ? "isalpha"
+                        : cm == "IsLetterOrDigit" ? "isalnum" : cm == "IsUpper" ? "isupper"
+                        : cm == "IsLower" ? "islower" : "isspace";
+                    if (!ExternSeen(lf)) { externDecls.Add(lf); H("declare i32 @" + lf + "(i32)"); }
+                    string pr = NT();
+                    L("  " + pr + " = call i32 @" + lf + "(i32 " + cp32 + ")");
+                    string nz = NT();
+                    L("  " + nz + " = icmp ne i32 " + pr + ", 0");
+                    return new ExprVal(nz, MkType("bool"));
+                }
+            }
+            if ((intRecv || dblRecv) && callee.sval == "Parse" && e.kids.Count == 1) {
+                ExprVal a = GenExpr(e.kids[0]);
+                string r = NT();
+                if (intRecv) {
+                    bool is64 = prn == "long" || prn == "Int64";
+                    if (!ExternSeen("strtoll")) { externDecls.Add("strtoll"); H("declare i64 @strtoll(i8*, i8**, i32)"); }
+                    string s = ParseStrGuard(e, a.op);
+                    string endp = NT();
+                    EA(endp, "i8*");
+                    L("  store i8* null, i8** " + endp);
+                    L("  " + r + " = call i64 @strtoll(i8* " + s + ", i8** " + endp + ", i32 10)");
+                    string ep = NT();
+                    L("  " + ep + " = load i8*, i8** " + endp);
+                    string bad = ParseBadPred(s, ep);
+                    string b2 = bad;
+                    if (!is64) {
+                        string lo = NT();
+                        L("  " + lo + " = icmp slt i64 " + r + ", -2147483648");
+                        string hi = NT();
+                        L("  " + hi + " = icmp sgt i64 " + r + ", 2147483647");
+                        string ov = NT();
+                        L("  " + ov + " = or i1 " + lo + ", " + hi);
+                        string b2n = NT();
+                        L("  " + b2n + " = or i1 " + bad + ", " + ov);
+                        b2 = b2n;
+                    }
+                    EmitRuntimeCheckIf(e, b2,
+                        prn + ".Parse: input is not a valid integer (or out of range)");
+                    string safe = NT();
+                    L("  " + safe + " = select i1 " + b2 + ", i64 0, i64 " + r);
+                    return new ExprVal(safe, MkType(is64 ? "long" : "int"));
+                }
+                // The C host parses through zan_rt_dbl_parse (strtod plus
+                // the C# NaN/Infinity literals, rt_timer.c) and reports
+                // failure, trailing garbage and the +-inf overflow.
+                if (!ExternSeen("zan_rt_dbl_parse")) {
+                    externDecls.Add("zan_rt_dbl_parse");
+                    H("declare double @zan_rt_dbl_parse(i8*, i8**)");
+                }
+                string dstr = ParseStrGuard(e, a.op);
+                string dendp = NT();
+                EA(dendp, "i8*");
+                L("  store i8* null, i8** " + dendp);
+                L("  " + r + " = call double @zan_rt_dbl_parse(i8* " + dstr + ", i8** " + dendp + ")");
+                string dep = NT();
+                L("  " + dep + " = load i8*, i8** " + dendp);
+                string dbad = ParseBadPred(dstr, dep);
+                string dpinf = NT();
+                L("  " + dpinf + " = fcmp oeq double " + r + ", 0x7FF0000000000000");
+                string dninf = NT();
+                L("  " + dninf + " = fcmp oeq double " + r + ", 0xFFF0000000000000");
+                string dinf = NT();
+                L("  " + dinf + " = or i1 " + dpinf + ", " + dninf);
+                string db2 = NT();
+                L("  " + db2 + " = or i1 " + dbad + ", " + dinf);
+                EmitRuntimeCheckIf(e, db2,
+                    "double.Parse: input is not a valid number (or out of range)");
+                string dsafe = NT();
+                L("  " + dsafe + " = select i1 " + db2 + ", double 0.0, double " + r);
+                return new ExprVal(dsafe, MkType("double"));
+            }
+            if ((intRecv || dblRecv) && callee.sval == "TryParse" && e.kids.Count == 2
+                && e.kids[1].kind == AK.OutArg()) {
+                ExprVal a = GenExpr(e.kids[0]);
+                string isn = NT();
+                L("  " + isn + " = icmp eq i8* " + a.op + ", null");
+                string empty = RawCString("");
+                string s_safe = NT();
+                L("  " + s_safe + " = select i1 " + isn + ", i8* " + empty + ", i8* " + a.op);
+                Node oa = e.kids[1];
+                Node oty = null;
+                string outp = "";
+                if (oa.type != null) {
+                    oty = oa.type;
+                    outp = AddLocal(oa.sval, oty);
+                    EA(outp, MapType(oty));
+                } else {
+                    // the place form (`out v`): the name lives in the place
+                    string onm = oa.sval;
+                    if (onm == "" && oa.a != null && oa.a.kind == AK.Ident()) { onm = oa.a.sval; }
+                    int li = LocalIdx(onm);
+                    if (li >= 0) { oty = locType[li]; outp = locReg[li]; }
+                }
+                string endp = NT();
+                EA(endp, "i8*");
+                L("  store i8* null, i8** " + endp);
+                string v = NT();
+                if (intRecv) {
+                    if (!ExternSeen("strtoll")) { externDecls.Add("strtoll"); H("declare i64 @strtoll(i8*, i8**, i32)"); }
+                    L("  " + v + " = call i64 @strtoll(i8* " + s_safe + ", i8** " + endp + ", i32 10)");
+                } else {
+                    if (!ExternSeen("strtod")) { externDecls.Add("strtod"); H("declare double @strtod(i8*, i8**)"); }
+                    L("  " + v + " = call double @strtod(i8* " + s_safe + ", i8** " + endp + ")");
+                }
+                string ep = NT();
+                L("  " + ep + " = load i8*, i8** " + endp);
+                string moved = NT();
+                L("  " + moved + " = icmp ne i8* " + ep + ", " + s_safe);
+                string ch = NT();
+                L("  " + ch + " = load i8, i8* " + ep);
+                string atend = NT();
+                L("  " + atend + " = icmp eq i8 " + ch + ", 0");
+                string not_null = NT();
+                L("  " + not_null + " = xor i1 " + isn + ", 1");
+                string mat = NT();
+                L("  " + mat + " = and i1 " + moved + ", " + atend);
+                string ok = NT();
+                L("  " + ok + " = and i1 " + not_null + ", " + mat);
+                if (intRecv) {
+                    bool is64 = prn == "long" || prn == "Int64";
+                    if (!is64) {
+                        string lo = NT();
+                        L("  " + lo + " = icmp slt i64 " + v + ", -2147483648");
+                        string hi = NT();
+                        L("  " + hi + " = icmp sgt i64 " + v + ", 2147483647");
+                        string ov = NT();
+                        L("  " + ov + " = or i1 " + lo + ", " + hi);
+                        string nov = NT();
+                        L("  " + nov + " = xor i1 " + ov + ", 1");
+                        string okn = NT();
+                        L("  " + okn + " = and i1 " + ok + ", " + nov);
+                        ok = okn;
+                    }
+                }
+                if (outp != "") {
+                    string zero = "0";
+                    string vty = "i64";
+                    if (dblRecv) { zero = "0.0"; vty = "double"; }
+                    string stv = NT();
+                    L("  " + stv + " = select i1 " + ok + ", " + vty + " " + v + ", " + vty + " " + zero);
+                    L("  store " + vty + " " + stv + ", " + vty + "* " + outp);
+                }
+                string okz = NT();
+                L("  " + okz + " = zext i1 " + ok + " to i64");
+                return new ExprVal(okz, MkType("bool"));
+            }
+        }
+        // Math.Round(x[, digits]) -> libm rint: C# rounds to even (banker's)
+        // and the host lowers it to rint for the same reason (TASKS.md A513);
+        // libc round is away-from-zero and turned 2.5 into 3. The digits form
+        // scales by 10^d, rints and divides back.
+        if (callee.kind == AK.MemberAccess() && callee.a != null && callee.a.kind == AK.Ident()
+            && callee.a.sval == "Math" && LocalIdx("Math") < 0 && binder.FindType("Math") == null
+            && callee.sval == "Round" && e.kids.Count >= 1 && e.kids.Count <= 2) {
+            if (!ExternSeen("rint")) { externDecls.Add("rint"); H("declare double @rint(double)"); }
+            ExprVal a = GenExpr(e.kids[0]);
+            string av = ToDbl(a, "Round", e);
+            if (e.kids.Count == 1) {
+                string r = NT();
+                L("  " + r + " = call double @rint(double " + av + ")");
+                return new ExprVal(r, MkType("double"));
+            }
+            if (!ExternSeen("pow")) { externDecls.Add("pow"); H("declare double @pow(double, double)"); }
+            ExprVal d = GenExpr(e.kids[1]);
+            string dv = ToDbl(d, "Round", e);
+            string sc = NT();
+            L("  " + sc + " = call double @pow(double 1.0e1, double " + dv + ")");
+            string sd = NT();
+            L("  " + sd + " = fmul double " + av + ", " + sc);
+            string rr = NT();
+            L("  " + rr + " = call double @rint(double " + sd + ")");
+            string res = NT();
+            L("  " + res + " = fdiv double " + rr + ", " + sc);
+            return new ExprVal(res, MkType("double"));
+        }
+        // Math.<fn>(...) -> the libm call the C host lowers (irgen_call.c).
+        // Round has its own branch above (it takes an optional digit count).
+        if (callee.kind == AK.MemberAccess() && callee.a != null && callee.a.kind == AK.Ident()
+            && callee.a.sval == "Math" && LocalIdx("Math") < 0 && binder.FindType("Math") == null
+            && callee.sval != "Round") {
+            ExprVal mv = GenMathCall(callee.sval, e);
+            if (mv != null) { return mv; }
+        }
+        // string.IsNullOrEmpty / string.Join / string.Format statics
+        if (callee.kind == AK.MemberAccess() && callee.a != null && callee.a.kind == AK.Ident()
+            && (callee.a.sval == "string" || callee.a.sval == "String") && LocalIdx(callee.a.sval) < 0) {
+            if (callee.sval == "IsNullOrEmpty" && e.kids.Count == 1) {
+                ExprVal a = GenExpr(e.kids[0]);
+                usesStrOps = true;
+                string r = NT();
+                L("  " + r + " = call i64 @zstr_isempty(i8* " + a.op + ")");
+                return new ExprVal(r, MkType("bool"));
+            }
+            if (callee.sval == "Join" && e.kids.Count == 2) {
+                ExprVal sep = GenExpr(e.kids[0]);
+                ExprVal lst = GenExpr(e.kids[1]);
+                usesStrOps = true;
+                string r = NT();
+                L("  " + r + " = call i8* @zstr_join(i8* " + sep.op + ", i8* " + lst.op + ")");
+                return new ExprVal(r, MkType("string"));
+            }
+            if (callee.sval == "Format" && e.kids.Count >= 1 && e.kids[0].kind == AK.StringLit()) {
+                return EmitStrFormat(e);
+            }
+        }
+        // B-ID62: 符号级 Intrinsic 门控：若 checker 已解析绑定为非 Intrinsic 用户符号，
+        // 绝不按名称横截，直接跳过内置原语发射
+        bool canIntercept = e.resolvedSym == null || e.isIntrinsic;
+
+        // NativeMemory.* -> inline raw-memory intrinsics (no external symbol)
+        if (canIntercept && callee.kind == AK.MemberAccess() && callee.a != null && callee.a.kind == AK.Ident()
+            && MatchBuiltinClass(callee.a.sval, "NativeMemory") && LocalIdx("NativeMemory") < 0) {
+            ExprVal nm = GenNativeMemory(callee, e);
+            if (nm != null) { return nm; }
+        }
+        // BitOperations.* -> LLVM bit-manipulation intrinsics; Vector128/256.* ->
+        // hardware SIMD (mirrors the C host's emit_builtin_invocation +
+        // emit_vector128_call). Only reached when the name is the builtin type,
+        // not a local of the same name.
+        if (canIntercept && callee.kind == AK.MemberAccess() && callee.a != null && callee.a.kind == AK.Ident()
+            && LocalIdx(callee.a.sval) < 0
+            && (MatchBuiltinClass(callee.a.sval, "BitOperations") || MatchBuiltinClass(callee.a.sval, "Vector128")
+                || MatchBuiltinClass(callee.a.sval, "Vector256") || MatchBuiltinClass(callee.a.sval, "Sse2")
+                || MatchBuiltinClass(callee.a.sval, "Sse42") || MatchBuiltinClass(callee.a.sval, "Aes")
+                || MatchBuiltinClass(callee.a.sval, "PixelOps"))) {
+            ExprVal bv = GenBuiltinStatic(callee.a.sval, callee.sval, e);
+            if (bv != null) { return bv; }
+        }
+        // String.CompareOrdinal(a, b) -> strcmp: a compiler intrinsic in the
+        // C host (irgen_call.c), not a stdlib method. Byte-wise ordinal
+        // compare of two NUL-terminated strings.
+        if (canIntercept && callee.kind == AK.MemberAccess() && callee.a != null && callee.a.kind == AK.Ident()
+            && LocalIdx(callee.a.sval) < 0
+            && (callee.a.sval == "String" || callee.a.sval == "string")
+            && callee.sval == "CompareOrdinal" && e.kids.Count == 2) {
+            ExprVal a = GenExpr(e.kids[0]);
+            ExprVal b = GenExpr(e.kids[1]);
+            if (!ExternSeen("strcmp")) { externDecls.Add("strcmp"); H("declare i32 @strcmp(i8*, i8*)"); }
+            string r0 = NT();
+            L("  " + r0 + " = call i32 @strcmp(i8* " + a.op + ", i8* " + b.op + ")");
+            string r = NT();
+            L("  " + r + " = sext i32 " + r0 + " to i64");
+            return new ExprVal(r, MkType("int"));
+        }
+        // method access forms
+        if (callee.kind == AK.MemberAccess()) {
+            Node obj = callee.a;
+            string mname = callee.sval;
+            // `base.Method(...)`: a DIRECT call to the base class' method --
+            // the C host bypasses the vtable for it (src/compiler/
+            // irgen_call.c: base_recv -> emit_dispatch_call with a NULL
+            // class, so the base's own body runs, not the override).
+            if (obj.kind == AK.BaseExpr()) {
+                ExprVal br = EmitBaseCall(mname, e);
+                if (br != null) { return br; }
+                diags.Error("'" + curClass + "' has no base class with a method '"
+                    + mname + "'", e.line, e.col);
+                return new ExprVal("0", MkType("int"));
+            }
+            // static call: ClassName.Method(...)
+            if (obj.kind == AK.Ident() && binder.FindType(obj.sval) != null
+                && LocalIdx(obj.sval) < 0 && !ShadowsTypeName(obj.sval)) {
+                Node stc = binder.FindType(obj.sval);
+                // delegate-typed static field invoked as Cls.f(args)
+                if (FindMethodUp(stc, mname) == null) {
+                    Node sf = FindStaticField(stc, mname);
+                    if (sf != null && sf.type != null && IsDelegate(sf.type)) {
+                        return EmitDelegateCall(callee, sf.type, e);
+                    }
+                }
+                return EmitStaticCall(obj.sval, mname, e);
+            }
+            // A receiver that resolves to nothing is a dead end: the call
+            // cannot be lowered. Say so -- evaluating the receiver into a
+            // constant 0 would hand the program wrong answers without a
+            // word (the C host rejects the same program).
+            if (obj.kind == AK.Ident() && !IdentResolves(obj.sval) && !IsBuiltinClassName(obj.sval)) {
+                diags.Error("unresolved call '" + obj.sval + "." + mname + "': '" + obj.sval
+                    + "' is not a known variable, type, or namespace", e.line, e.col);
+                return new ExprVal("0", MkType("int"));
+            }
+            // evaluate receiver
+            ExprVal recv = GenExpr(obj);
+            // byte[] <-> string bridges: compiler intrinsics in the C host
+            // (irgen_expr.c emit_bytes_call), lowered here the same way.
+            if (mname == "ToBytes" && e.kids.Count == 0 && IsStr(recv.ty)) {
+                return StrToBytes(recv);
+            }
+            if (mname == "ToStr" && (e.kids.Count == 0 || e.kids.Count == 2) && IsByteArr(recv.ty)) {
+                return ByteArrWindowToStr(recv, e);
+            }
+            // scalar ToString with a format specifier: the interpolated-string
+            // hole format (the lexer splices the hole `{v:D4}` into
+            // `v.ToString("D4")`; the C host formats the hole with printf
+            // semantics).
+            if (mname == "ToString" && e.kids.Count == 1 && !IsStr(recv.ty)
+                && ClassOf(recv.ty) == null && !IsListType(recv.ty) && !IsDictType(recv.ty) && !IsSbType(recv.ty)
+                && e.kids[0] != null && e.kids[0].kind == AK.StringLit()) {
+                string spec = StrEsc.DecodeText(e.kids[0].sval);
+                return EmitScalarToStringFmt(recv, spec);
+            }
+            // a string receiver ignores the format specifier (the host's
+            // interpolation uses the string as it is)
+            if (mname == "ToString" && e.kids.Count == 1 && IsStr(recv.ty)
+                && e.kids[0] != null && e.kids[0].kind == AK.StringLit()) {
+                string n = StrCLen(recv.op);
+                string buf = NT(); L("  " + buf + " = call i8* @zstr_new(i64 " + n + ")");
+                L("  call i8* @memcpy(i8* " + buf + ", i8* " + recv.op + ", i64 " + n + ")");
+                return new ExprVal(buf, MkType("string"));
+            }
+            // enum ToString(): the name of the member the value stands for
+            // (the host compares the value against the members in
+            // declaration order, so a duplicate value answers with the
+            // earlier member)
+            if (mname == "ToString" && e.kids.Count == 0) {
+                Node en = null;
+                if (recv.ty != null) { en = EnumDeclOf(recv.ty.sval); }
+                if (en == null && obj.kind == AK.MemberAccess() && obj.a != null
+                    && obj.a.kind == AK.Ident() && LocalIdx(obj.a.sval) < 0) {
+                    // a member CONSTANT (`Color.Green.ToString()`): the
+                    // constant carries the number, the enum carries the names
+                    en = EnumDeclOf(obj.a.sval);
+                }
+                if (en != null) { return EmitEnumToString(recv, en); }
+            }
+            if (mname == "ToString" && e.kids.Count == 0 && recv.ty != null && recv.ty.sval == "object") {
+                return EmitObjectFamilyCall(recv, mname, e);
+            }
+            // scalar ToString: bool -> "true"/"false", numbers via snprintf
+            if (mname == "ToString" && e.kids.Count == 0 && !IsStr(recv.ty)
+                && (recv.ty == null || recv.ty.sval != "object")
+                && ClassOf(recv.ty) == null && !IsListType(recv.ty) && !IsDictType(recv.ty) && !IsSbType(recv.ty)) {
+                if (IsNullableValue(recv.ty)) {
+                    // int?.ToString(): unbox the payload first -- the BOX
+                    // pointer must not reach the formatter (a qq1 probe fed
+                    // `i8* %t43` to snprintf's i64 hole). A null receiver's
+                    // ToString stays unguarded here (the host throws NRE;
+                    // the soft channel for it is a separate item).
+                    string uult = UnderLL(recv.ty);
+                    string up3 = NT();
+                    L("  " + up3 + " = bitcast i8* " + recv.op + " to " + uult + "*");
+                    string uv3 = NT();
+                    L("  " + uv3 + " = load " + uult + ", " + uult + "* " + up3);
+                    recv = new ExprVal(uv3, MkType(recv.ty.sval));
+                }
+                if (recv.ty.sval == "bool") {
+                    ExprVal ts = GenStr("true");
+                    ExprVal fs = GenStr("false");
+                    string c = NT(); L("  " + c + " = icmp ne i64 " + recv.op + ", 0");
+                    string r = NT(); L("  " + r + " = select i1 " + c + ", i8* " + ts.op + ", i8* " + fs.op);
+                    return new ExprVal(r, MkType("string"));
+                }
+                // A523 自举半边：char.ToString() 曾落通用 itoa 返回码点数字
+                // "65"（C# "A"）；WriteLine(char) 与拼接路径早就是 CharToStr
+                // 字符渲染——三条路对齐到同一个帮手（宿主 09dbfbc5d 同修）。
+                if (recv.ty.sval == "char") {
+                    return new ExprVal(CharToStr(recv.op), MkType("string"));
+                }
+                return new ExprVal(ToCStr(recv), MkType("string"));
+            }
+            // Task 句柄上的成员：Wait / Result / IsCompleted
+            if (recv.ty != null && recv.ty.sval == "Task") {
+                return EmitTaskMemberCall(recv, mname, e);
+            }
+            // builtin in-place List.Reverse wins over the copying extension
+            if (IsListType(recv.ty) && mname == "Reverse" && e.kids.Count == 0) {
+                L("  call void @zlist_reverse(i8* " + recv.op + ")");
+                return new ExprVal("0", MkType("void"));
+            }
+            // string-method intrinsics win over same-named extensions: the
+            // C host's call pipeline lowers these before any user-visible
+            // method resolution, so s.Equals(',') packs the char argument
+            // instead of binding the 3-arg Unicode Equals extension with a
+            // raw pointer (B-ID109)
+            if (IsStr(recv.ty) && HandlesStrMethod(mname, e.kids.Count)) {
+                return EmitStrMethod(recv, mname, e);
+            }
+            // extension methods: static method with a `this` receiver of recv's type
+            List<Node> extMs = new List<Node>();
+            List<string> extOwners = new List<string>();
+            binder.FindExtensionAll(recv.ty.sval, mname, extMs, extOwners);
+            if (extMs.Count > 0) {
+                int pick = PickExtension(extMs, recv.ty, e);
+                return EmitExtensionCall(recv, extOwners[pick], extMs[pick], e);
+            }
+            // string methods
+            if (IsStr(recv.ty)) { return EmitStrMethod(recv, mname, e); }
+            // list methods
+            if (IsListType(recv.ty)) { return EmitListMethod(recv, mname, e); }
+            // dictionary methods
+            if (IsDictType(recv.ty)) { return EmitDictMethod(recv, mname, e); }
+            // string-builder methods
+            if (IsSbType(recv.ty)) { return EmitSbMethod(recv, mname, e); }
+            // array methods: GetLength on a rectangular array (the C host's
+            // irgen_call.c reads the dimension out of the array's header)
+            if (mname == "GetLength" && ArrRankOf(recv.ty) > 1) {
+                return EmitGetLength(recv, e);
+            }
+            if (mname == "GetType" && e.kids.Count == 0) {
+                return EmitGetType(recv);
+            }
+            // TypeInfo methods
+            if (recv.ty != null && recv.ty.sval == "TypeInfo") {
+                return EmitTypeInfoMethod(recv, mname, e);
+            }
+            if (mname == "HasField" || mname == "GetFieldString" || mname == "GetFieldInt" || mname == "GetFieldLong"
+                || mname == "GetFieldDouble" || mname == "GetFieldBool" || mname == "GetFieldObject"
+                || mname == "SetFieldString" || mname == "SetFieldInt" || mname == "SetFieldLong"
+                || mname == "SetFieldDouble" || mname == "SetFieldBool" || mname == "SetFieldObject"
+                || mname == "HasMethod" || mname == "Invoke" || mname == "InvokeInt" || mname == "InvokeLong"
+                || mname == "InvokeDouble" || mname == "InvokeString" || mname == "InvokeObject") {
+                Node testCls = ClassOf(recv.ty);
+                if (testCls == null || FindMethodUp(testCls, mname) == null) {
+                    return EmitReflInstCall(recv, mname, e);
+                }
+            }
+            // instance method
+            Node cls = ClassOf(recv.ty);
+            if (cls != null) {
+                // delegate-typed field invoked as obj.f(args)
+                if (FindMethodUp(cls, mname) == null) {
+                    Node fdty = FieldType(cls, mname);
+                    if (fdty != null && IsDelegate(fdty)) {
+                        return EmitDelegateCall(callee, fdty, e);
+                    }
+                }
+                // A507 自举半边：null 接收者的实例方法调用曾一路进方法体读
+                // 字段 SIGSEGV 且无任何诊断。与宿主 irgen_call.c 局部变量快
+                // 速路径同口径：软诊断（点名接收者位置）+ 软基址 scratch——
+                // 字段读落在 scratch 上返零值，程序继续（--strict-runtime
+                // 下 exit 70）。
+                string rt0 = MapType(recv.ty);
+                if (IsPtrLL(rt0)) {
+                    string rn = NT();
+                    L("  " + rn + " = icmp eq " + rt0 + " " + recv.op + ", null");
+                    string rnm = obj != null && obj.kind == AK.Ident() && obj.sval != ""
+                        ? obj.sval : mname;
+                    EmitRuntimeCheckIf(e, rn,
+                        "null reference: receiver '" + rnm + "' is null");
+                    if (!ExternSeen("__zan_soft_scratch")) {
+                        externDecls.Add("__zan_soft_scratch");
+                        H("@__zan_soft_scratch = internal global [64 x i8] zeroinitializer");
+                    }
+                    string sb = NT();
+                    L("  " + sb + " = getelementptr inbounds [64 x i8], [64 x i8]* @__zan_soft_scratch, i64 0, i64 0");
+                    string sel = NT();
+                    L("  " + sel + " = select i1 " + rn + ", i8* " + sb + ", i8* " + recv.op);
+                    recv = new ExprVal(sel, recv.ty);
+                }
+                return EmitInstanceCall(recv, cls.sval, mname, e);
+            }
+            if (mname == "ToString" || mname == "Equals" || mname == "GetHashCode") {
+                return EmitObjectFamilyCall(recv, mname, e);
+            }
+            // The receiver's type is not one the self-host can call methods
+            // on. Fail closed: a silent 0 would hand the program wrong
+            // answers without a word.
+            //
+            // A RECEIVER WHOSE TYPE IS A TYPE PARAMETER is the exception:
+            // the C host is silent there too -- the generic body is a
+            // template, and the real call happens in the monomorphized body
+            // where the type argument is concrete.
+            //
+            // With a CONSTRAINT (`where T : IConn`) the template still knows
+            // what the receiver offers: the call goes through the
+            // constraint's member table -- an interface method is a virtual
+            // call, a class method a direct one.
+            if (IsErasedType(recv.ty)) {
+                Node ct = TypeParamConstraint(recv.ty.sval);
+                if (ct != null) {
+                    Node ccls = ClassOf(ct);
+                    if (ccls != null && FindMethodUp(ccls, mname) != null) {
+                        ExprVal r = FromSlot(recv.op, ct);
+                        if (HasMod(ccls, MOD.Iface())) {
+                            return EmitInterfaceCall(r, ccls, mname, FindMethodUp(ccls, mname), e);
+                        }
+                        return EmitInstanceCall(r, ct.sval, mname, e);
+                    }
+                }
+                return new ExprVal("0", recv.ty);
+            }
+            diags.Error("call to '" + CallLabel(obj, mname)
+                + "' is not supported by the self-hosted compiler yet", e.line, e.col);
+            return new ExprVal("0", MkType("int"));
+        }
+        // bare call
+        if (callee.kind == AK.Ident()) {
+            string name = callee.sval;
+            // delegate invocation: a local of Func/Action type
+            int dli = LocalIdx(name);
+            if (dli >= 0 && IsDelegate(locType[dli])) {
+                return EmitDelegateCall(callee, locType[dli], e);
+            }
+            // the invoked-object protocol: `E(args)` on a class-typed local
+            if (dli >= 0) {
+                ExprVal oc = TryGenOpCall(callee, e);
+                if (oc != null) { return oc; }
+            }
+            // a STATIC delegate field of this class, invoked without a
+            // qualifier (`cloneTree(root)` where `cloneTree` is a static
+            // field): the field is a module global, not a method -- without
+            // this the call went to a method symbol that does not exist
+            // (`@App_cloneTree`), and the link failed.
+            Node scls2 = binder.FindType(curClass);
+            if (scls2 != null && FindMethodUp(scls2, name) == null) {
+                Node sfd = FindStaticField(scls2, name);
+                if (sfd != null && sfd.type != null && IsDelegate(sfd.type)) {
+                    return EmitDelegateCall(callee, sfd.type, e);
+                }
+            }
+            if (curHasThis) {
+                Node cls = binder.FindType(curClass);
+                Node bm = FindMethodUp(cls, name);
+                if (bm != null && !IsStatic(bm)) {
+                    ExprVal recv = new ExprVal("%this", CurThisTy());
+                    return EmitInstanceCall(recv, curClass, name, e);
+                }
+                // delegate-typed field invoked without `this.`
+                if (bm == null) {
+                    Node fdty2 = FieldType(cls, name);
+                    if (fdty2 != null && IsDelegate(fdty2)) {
+                        return EmitDelegateCall(callee, fdty2, e);
+                    }
+                }
+            }
+            return EmitStaticCall(curClass, name, e);
+        }
+        // A call whose callee is neither a member access nor a plain name:
+        // the only shape that lowers is a delegate-typed expression
+        // (`filters[f](item)`) -- and the invoked-object protocol on a
+        // class-typed expression (`Make()(5)`), which dispatches the
+        // class's op_call with the expression as the receiver.
+        {
+            Node cty = ArgTypeNode(callee);
+            Node ccls = ClassOf(cty);
+            if (ccls != null) {
+                if (FindStaticOpCall(ccls) != null) {
+                    // Cls.op_call(<expr>, args...)
+                    Node ma = new Node(AK.MemberAccess());
+                    Node tn = new Node(AK.Ident());
+                    tn.sval = ccls.sval;
+                    ma.a = tn; ma.sval = "op_call";
+                    ma.line = e.line; ma.col = e.col;
+                    Node call = new Node(AK.Call());
+                    call.a = ma; call.line = e.line; call.col = e.col;
+                    call.Add(callee);
+                    int i = 0;
+                    while (i < e.kids.Count) { call.Add(e.kids[i]); i = i + 1; }
+                    return GenCall(call);
+                }
+                if (FindMethodUp(ccls, "op_call") != null) {
+                    // <expr>.op_call(args...)
+                    Node ma = new Node(AK.MemberAccess());
+                    ma.a = callee; ma.sval = "op_call";
+                    ma.line = e.line; ma.col = e.col;
+                    Node call = new Node(AK.Call());
+                    call.a = ma; call.line = e.line; call.col = e.col;
+                    int i = 0;
+                    while (i < e.kids.Count) { call.Add(e.kids[i]); i = i + 1; }
+                    return GenCall(call);
+                }
+            }
+        }
+        ExprVal clo = GenExpr(callee);
+        if (clo.ty != null && IsDelegate(clo.ty)) {
+            return EmitDelegateCallVal(clo, clo.ty, e);
+        }
+        diags.Error("call expression is not supported by the self-hosted compiler yet", e.line, e.col);
+        return new ExprVal("0", MkType("int"));
+    }
+
+}

@@ -1,0 +1,529 @@
+using System;
+using System.Collections.Generic;
+namespace Zan;
+
+partial class Ngen {
+    // ---- exceptions: try / catch / throw ----
+    // EH state is per-thread: the block ({ i32 top, ptr exc, 256 x 1024-byte
+    // setjmp slots }) comes from _zan_eh_tls_state in the transition runtime
+    // (a static block in the qemu stub). Mirrors the observable semantics of
+    // gen0's TLS-backed %zan.eh.state.
+    // lock (obj) body: the striped recursive monitor (zan_monitor_enter/
+    // exit, oracle rt_sync.c), with the release riding a REAL try/finally so
+    // every exit path releases it exactly like the oracle's lowering
+    // (irgen_stmt.c AST_LOCK_STMT lowers lock to try/finally): a throw runs
+    // the release at the throw site, return/break/continue walk it via the
+    // pending-fin machinery, and a nested unwind lands in this try's own
+    // armed buf. Desugared here, after checking:
+    //   { var $lockN = obj; monitor_enter($lockN);
+    //     try body finally monitor_exit($lockN) }
+    // The temp's slot is allocated in ReserveLocals (see the LockStmt arm
+    // there) and stashed in s.c; HasTry counts LockStmt so the method gets
+    // the EH bookkeeping slots and the frame covers everything.
+    void GenLockStmt(Node s) {
+        string vt = InferExprTyNg(s.a);
+        if (!TryGenBindingValue(s.a, vt)) { GenConversionValueNg(s.a, vt); }
+        StoreLocal(DeclSlotNg(s.c), 0);
+        BLExtern("_zan_monitor_enter");              // x0 = obj
+        Node fin = new Node(AK.MonitorExitStmt());
+        fin.a = s.c;
+        Node t = new Node(AK.TryStmt());
+        t.a = s.b;
+        t.b = null;
+        t.c = fin;
+        GenStmt(t);
+    }
+
+    bool FinIsActive(int idx) {
+        if (finActive == null) { return false; }
+        int k = 0;
+        while (k < finActive.Count) {
+            if (finActive[k] == idx) { return true; }
+            k = k + 1;
+        }
+        return false;
+    }
+
+    void GenTry(Node s) {
+        BLInternal("_zan_rt_eh_state");              // x0 = state (lazy alloc)
+        XPushV0();                              // push state
+        LoadLocal(ehTopLocal, 1);                    // top (mirror: it also
+                                                     // survives return/break
+                                                     // paths that skip the
+                                                     // normal-path restore)
+        XPushV1();                                   // push saved top
+        LoadImm(3, 1024);
+        if (tgt86 == 1) { MovRR(2, 1); X3(0x48, 0x0F, 0xAF); X1(0xD1); }  // rdx = rsi * rcx
+        else { E4(0x9B037C22); }                     // mul x2, x1, x3
+        AddRR(2, 0, 2);                              // state + top*1024
+        AddImm(2, 2, 16);                            // &bufs[top]
+        if (ehStack.Count == 0) {
+            // outermost try opened in this activation: remember the top it
+            // was armed at, so return/break/continue can disarm from here
+            StoreLocal(ehBaseLocal, 1);
+        }
+        AddImm(1, 1, 1);                             // top + 1
+        StrU(1, 0, 0);                               // state->top = top + 1
+        StoreLocal(ehTopLocal, 1);                   // mirror = top + 1
+        ehStack.Add(1);
+        if (dbgEh) {
+            XPushR(2);                               // hold buf
+            LoadImm(0, 7000000 + ehStack.Count);
+            BLExtern("_zan_rt_print_int");
+            XPopV(2);                                // buf back
+        }
+        MovRR(0, 2);
+        BLExtern("_setjmp");                         // returns 0 (direct) / 1 (thrown)
+        EmitCbnz(0, NL());
+        int catchL = lblPos.Count - 1;
+        // stamp the buf as live for this activation: the rethrow path checks
+        // the arming fp before longjmping, so a leaked disarm turns into a
+        // clean uncaught exit instead of a wild PC from a dead frame
+        BLInternal("_zan_rt_eh_state");              // x0 = state
+        LoadLocal(ehTopLocal, 1);                    // mirror (= top + 1)
+        SubImm(1, 1, 1);                             // pre-arm top
+        LoadImm(3, 1024);
+        if (tgt86 == 1) { MovRR(2, 1); X3(0x48, 0x0F, 0xAF); X1(0xD1); }  // rdx = rsi * rcx
+        else { E4(0x9B037C22); }                     // mul x2, x1, x3
+        AddRR(2, 0, 2);
+        AddImm(2, 2, 16);                            // &bufs[top]
+        MovRR(3, 29);                                // fp
+        StrU(3, 2, 1008);                            // arming fp stamp
+        LoadImm(3, 1514933314);                      // "ZANB"
+        StrU(3, 2, 1016);                            // magic stamp
+        if (dbgEh) {
+            XPushR(2);
+            LdrU(0, 2, 0);
+            BLExtern("_zan_rt_print_int");               // ctx fingerprint
+            XPopV(2);
+            XPushR(2);
+            LdrU(0, 2, 1008);
+            BLExtern("_zan_rt_print_int");               // fp stamp
+            XPopV(2);
+        }
+        int endL = NL();
+        int finIdx = -1;
+        if (s.c != null) {
+            finBodies.Add(s.c);
+            finInHandler.Add(0);
+            finIdx = finBodies.Count - 1;
+        }
+        // ---- normal path: run the try body, disarm, then the finally ----
+        GenStmt(s.a);
+        EhRestoreTop();
+        LdrU(1, 31, 0);                              // saved top
+        StoreLocal(ehTopLocal, 1);                   // mirror = saved top
+        if (s.c != null) {
+            finActive.Add(finIdx);
+            int savedFinCur = finCur;
+            finCur = finIdx;                         // a throw in the finally propagates
+            GenStmt(s.c);
+            finCur = savedFinCur;
+            finActive.RemoveAt(finActive.Count - 1);
+        }
+        EmitB(endL);
+        Mark(catchL);
+        if (dbgEh) {
+            LoadImm(0, 7777001);
+            BLExtern("_zan_rt_print_int");               // landing reached
+        }
+        // ---- thrown path: disarm first (a throw from a handler or the
+        // finally must unwind to the enclosing try, not re-enter this one),
+        // then dispatch the clauses. x0 holds the in-flight exception and
+        // x2 its class site: 0 when null; a thrown string keeps its magic
+        // site, which sorts above every declared class, so a typed walk
+        // never matches it and it lands in the first clause (gen0's rule).
+        EhRestoreTop();
+        LdrU(1, 31, 0);                              // saved top
+        StoreLocal(ehTopLocal, 1);                   // mirror = saved top
+        LdrU(1, 31, 16);                             // x1 = state again
+        if (finIdx >= 0) { finInHandler[finIdx] = 1; }
+        LdrU(0, 1, 8);                               // exc (x1 = state)
+        LoadImm(2, 0);
+        int hasObj = NL();
+        CbzReg(0, hasObj);
+        RtLdur(2, 0, -8);                            // desc
+        if (tgt86 == 1) { X3(0x48, 0xC1, 0xEA); X1(32); }   // shr rdx, 32 (site)
+        else { LsrImm64(2, 32); }                     // lsr x2, x2, #32 (site)
+        Mark(hasObj);
+        int doneL = NL();
+        int noMatch = NL();
+        if (s.b == null) {
+            // no clauses at all: the exception is nobody's to handle here;
+            // the finally (if any) runs on the noMatch path, then unwinding
+            // continues
+            EmitB(noMatch);
+        }
+        // A string throw (site = the str_alloc magic, above every declared
+        // class) is matched by NO typed clause: binding it to
+        // `catch (Exception e)` would read string bytes as an object header
+        // when the handler touches e.Message. Only an untyped `catch { }`
+        // takes it (the reference's A36 rule); the compare loop below already
+        // skips it for every later typed clause by inequality.
+        Node cc = s.b;
+        bool first = true;
+        while (cc != null) {
+            string ctname = cc.type != null ? cc.type.sval : null;
+            Cls ctcls = ctname != null ? FindClass(ctname) : null;
+            int hitL = NL();
+            int missL = cc.b != null ? NL() : noMatch;
+            if (ctcls != null) {
+                if (first) {
+                    LoadImm(3, classes.Count);
+                    if (tgt86 == 1) { Xop(0x39, 2, 1); }   // cmp rdx, rcx
+                    else { E4(0xEB03005F); }         // cmp x2, x3
+                    EmitBcond(8, missL);             // b.hi: string/legacy site misses typed
+                    CbzReg(0, hitL);                 // null exception object
+                }
+                List<int> msn = MatchSites(ctname);
+                int k = 0;
+                while (k < msn.Count) {
+                    LoadImm(3, msn[k]);
+                    if (tgt86 == 1) { Xop(0x39, 2, 1); }   // cmp rdx, rcx
+                    else { E4(0xEB03005F); }         // cmp x2, x3
+                    EmitBcond(0, hitL);              // b.eq
+                    k = k + 1;
+                }
+                EmitB(missL);
+            }
+            // an untyped clause (or one of unknown type) catches everything
+            Mark(hitL);
+            if (cc.sval != null && cc.sval != "") {
+                int ci = DeclSlotNg(cc);
+                if (ci >= 0) { StoreLocal(ci, 0); }
+            }
+            int cxSlot = ClauseExcSlotOf(s, cc);
+            if (cxSlot >= 0) {
+                StoreLocal(cxSlot, 0);                   // the clause's own exc
+                clauseExcOpen.Add(cxSlot);
+            }
+            GenStmt(cc.a);
+            if (cxSlot >= 0) { clauseExcOpen.RemoveAt(clauseExcOpen.Count - 1); }
+            EmitB(doneL);
+            first = false;
+            if (cc.b != null) { Mark(missL); }
+            cc = cc.b;
+        }
+        Mark(doneL);
+        if (s.c != null) {
+            finActive.Add(finIdx);
+            int savedFinCur = finCur;
+            finCur = finIdx;                         // finally after a handled catch
+            GenStmt(s.c);
+            finCur = savedFinCur;
+            finActive.RemoveAt(finActive.Count - 1);
+        }
+        EmitB(endL);
+        Mark(noMatch);
+        if (s.c != null) {
+            // the exception leaves this try unmatched (or there was never a
+            // clause): the finally runs while it keeps unwinding
+            finActive.Add(finIdx);
+            int savedFinCur = finCur;
+            finCur = finIdx;
+            GenStmt(s.c);
+            finCur = savedFinCur;
+            finActive.RemoveAt(finActive.Count - 1);
+        }
+        EhRethrowNg();
+        Mark(endL);
+        if (finIdx >= 0) {
+            finBodies.RemoveAt(finBodies.Count - 1);
+            finInHandler.RemoveAt(finInHandler.Count - 1);
+        }
+        AddSPImm(32, true);                          // pop saved top + state
+        ehStack.RemoveAt(ehStack.Count - 1);
+    }
+
+    // frame slot holding this clause's own exception (-1 when the try never
+    // went through ReserveLocals -- a synthesized try has no clauses anyway)
+    int ClauseExcSlotOf(Node tryN, Node cc) {
+        if (tryN == null || cc == null || clauseExcNodes == null) { return -1; }
+        int baseIx = tryN.ival;
+        if (baseIx < 0 || baseIx >= clauseExcNodes.Count) { return -1; }
+        int i = baseIx;
+        while (i < clauseExcNodes.Count) {
+            if (clauseExcNodes[i] == cc) { return clauseExcSlots[i]; }
+            i = i + 1;
+        }
+        return -1;
+    }
+
+    // disarm every try this return leaves: the runtime top goes back to the
+    // outermost open try's armed base. Without this, a later throw longjmps
+    // into a stale jmp_buf captured by a frame that already returned -- the
+    // wild-PC crashes gen0 avoids with emit_eh_disarm_from.
+    void EhDisarmBase() {
+        if (ehStack.Count == 0) { return; }
+        BLInternal("_zan_rt_eh_state");              // x0 = state
+        MovRR(1, 0);                                 // x1 = state (before the
+                                                     // base load clobbers x0)
+        LoadLocal(ehBaseLocal, 0);                   // x0 = base top
+        StrU(0, 1, 0);                               // state->top = base
+        LoadLocal(ehBaseLocal, 0);
+        StoreLocal(ehTopLocal, 0);                   // keep the mirror current
+    }
+
+    // break/continue leaves every try opened inside the loop: restore the
+    // loop-entry top
+    void EhDisarmLoop() {
+        if (!curHasTry) { return; }
+        BLInternal("_zan_rt_eh_state");              // x0 = state
+        MovRR(1, 0);                                 // x1 = state (before the
+                                                     // top load clobbers x0)
+        LoadLocal(ehBrkLocal, 0);
+        StrU(0, 1, 0);
+        LoadLocal(ehBrkLocal, 0);
+        StoreLocal(ehTopLocal, 0);
+    }
+
+    // every class site a thrown descriptor may carry for this clause to hit:
+    // the clause class itself plus every subclass, transitively
+    List<int> MatchSites(string name) {
+        List<int> r = new List<int>();
+        Cls c = FindClass(name);
+        if (c != null) { r.Add(c.site); }
+        int i = 0;
+        while (i < classes.Count) {
+            Cls t = classes[i];
+            bool hit2 = false;
+            while (t != null && t.baseName != null) {
+                if (t.baseName == name) { hit2 = true; break; }
+                t = FindClass(t.baseName);
+            }
+            if (hit2) { r.Add(classes[i].site); }
+            i = i + 1;
+        }
+        return r;
+    }
+
+    // does this subtree reference the builtin Exception class? (ctor, catch
+    // clause, cast, or any type mention -- drives the builtin synthesis)
+    bool TreeNeedsException(Node n) {
+        if (n == null) { return false; }
+        if (n.kind == AK.TypeRef() && n.sval == "Exception") { return true; }
+        if (n.kind == AK.TryStmt()) {
+            Node cc = n.b;
+            while (cc != null) {
+                if (TreeNeedsException(cc.type)) { return true; }
+                cc = cc.b;
+            }
+        }
+        if (TreeNeedsException(n.a) || TreeNeedsException(n.b)
+                || TreeNeedsException(n.c) || TreeNeedsException(n.d)
+                || TreeNeedsException(n.type)) { return true; }
+        int k = 0;
+        while (k < n.kids.Count) {
+            if (TreeNeedsException(n.kids[k])) { return true; }
+            k = k + 1;
+        }
+        return false;
+    }
+
+    // run the finally bodies this exit path leaves, innermost first. With
+    // stopAtBody, the walk stops at the first try whose body we are still
+    // inside -- its clause dispatch owns the finally. A finally never
+    // re-runs itself: while body i executes, entries at i and above are
+    // frozen (gen0's finally_count truncation).
+    void EmitPendingFins(bool stopAtBody) {
+        EmitPendingFinsFrom(0, stopAtBody);
+    }
+
+    // run the finally bodies from index `from` down (innermost first); a
+    // loop's break/continue only runs the finallys opened inside it
+    void EmitPendingFinsFrom(int from, bool stopAtBody) {
+        int i = finBodies.Count - 1;
+        while (i >= from) {
+            if (FinIsActive(i)) { i = i - 1; continue; }
+            if (stopAtBody && finInHandler[i] == 0) { break; }
+            if (finBodies[i] != null) {
+                finActive.Add(i);
+                int saved = finCur;
+                finCur = i;
+                ExcSave();
+                GenStmt(finBodies[i]);
+                ExcRestore();
+                finCur = saved;
+                finActive.RemoveAt(finActive.Count - 1);
+            }
+            i = i - 1;
+        }
+    }
+
+    // keep the in-flight exception across a finally body: the body may run
+    // try/catch of its own, which overwrites the stored exception
+    void ExcSave() {
+        BLInternal("_zan_rt_eh_state");
+        LdrU(1, 0, 8);                               // exc (x0 = state; read
+                                                     // before the push -- [sp+8]
+                                                     // would read the caller's
+                                                     // slot, not state->exc)
+        XPushV0();                              // push state
+        XPushV1();                                   // push exc
+    }
+
+    void ExcRestore() {
+        XPopV(1);                              // pop exc -> x1
+        XPopV(0);                              // pop state -> x0
+        StrU(1, 0, 8);                               // state->exc = saved
+    }
+
+    void EhRestoreTop() {
+        LdrU(1, 31, 16);                             // state (pushed first: [sp+16])
+        LdrU(3, 31, 0);                              // saved top
+        StrU(3, 1, 0);                               // state->top = saved
+    }
+
+    void GenThrow(Node s) {
+        if (s.a != null) {
+            GenExpr(s.a);
+        } else {
+            // bare rethrow: the owning catch clause's OWN exception (a nested
+            // try inside the clause body overwrote the in-flight global --
+            // the reference keeps the original per clause); with no clause
+            // open, the in-flight exception stays the value
+            if (clauseExcOpen.Count > 0) {
+                LoadLocal(clauseExcOpen[clauseExcOpen.Count - 1], 0);
+            } else {
+                BLInternal("_zan_rt_eh_state");
+                LdrU(0, 0, 8);
+            }
+        }
+        XPushV0();                              // push exception value
+        // a throw leaves every try whose handler is already disarmed (we
+        // are in its catch or finally body): their finallys run here, at
+        // the throw site, before the exception goes on. The first try whose
+        // body we are still inside keeps its own -- its landing dispatch
+        // runs the finally after its clause (or before re-raising).
+        EmitPendingFins(true);
+        BLInternal("_zan_rt_eh_state");              // x0 = state
+        MovRR(1, 0);
+        LdrU(2, 31, 0);                              // exception value
+        StrU(2, 1, 8);                               // state->exc = value
+        EhRethrowNg();
+    }
+
+    // unwind one frame: longjmp into the handler below the current top; with
+    // no handler left, report and exit(1). A string exception prints its
+    // text; a class object prints its class name via the clsn registry --
+    // both to stdout with the "Unhandled exception: " prefix, matching the
+    // oracle's uncaught tail (irgen_stmt.c reh.*).
+    void EhRethrowNg() {
+        BLInternal("_zan_rt_eh_state");
+        MovRR(1, 0);
+        LdrU(2, 1, 0);                               // top
+        if (dbgEh) {
+            XPushR(2);                               // hold top
+            LoadImm(0, 8000000);
+            AddRR(0, 0, 2);                          // tag 8M + top
+            BLExtern("_zan_rt_print_int");
+            XPopV(2);                                // top back
+            BLInternal("_zan_rt_eh_state");          // print clobbered x1
+            MovRR(1, 0);
+        }
+        LoadImm(3, 64);                              // bufs capacity: an
+                                                     // overflown top means a
+                                                     // disarm leak -- exit
+                                                     // loudly instead of
+                                                     // longjmping into heap
+                                                     // bytes past the block
+        if (tgt86 == 1) { Xop(0x39, 2, 1); }         // cmp rdx, rcx
+        else { E4(0xEB03005F); }                     // cmp x2, x3
+        EmitBcond(3, NL());                          // b.ls (unsigned <=)
+        int okTop = lblPos.Count - 1;
+        LoadImm(0, 99);
+        BLExtern("_exit");
+        Mark(okTop);
+        CbzReg(2, NL());
+        int uncaught = lblPos.Count - 1;
+        SubImm(2, 2, 1);                             // top - 1
+        LoadImm(3, 1024);
+        if (tgt86 == 1) { X3(0x48, 0x0F, 0xAF); X1(0xD1); }  // imul rdx, rcx
+        else { E4(0x9B037C42); }                     // mul x2, x2, x3
+        AddRR(2, 1, 2);
+        AddImm(2, 2, 16);                            // &bufs[top-1]
+        MovRR(0, 2);
+        if (dbgEh) {
+            XPushR(2);
+            LdrU(0, 2, 0);
+            BLExtern("_zan_rt_print_int");               // ctx fingerprint
+            XPopV(2);
+            XPushR(2);
+            LdrU(0, 2, 1016);
+            BLExtern("_zan_rt_print_int");               // magic read
+            XPopV(2);
+            XPushR(2);
+            LdrU(0, 2, 1008);
+            BLExtern("_zan_rt_print_int");               // fp read
+            XPopV(2);
+            MovRR(0, 2);                                 // longjmp arg restored
+        }
+        // liveness stamp: an armed buf carries the arming activation's fp and
+        // a magic word. A target whose stamp is missing or whose fp lies
+        // BELOW the current sp was captured by a dead, deeper frame -- a
+        // disarm leak. Longjmping there lands on the dead frame's registers
+        // (the wild-PC crashes), so treat it as uncaught instead.
+        LoadImm(3, 1514933314);                      // "ZANB" magic
+        LdrU(4, 0, 1016);                            // stamp magic
+        if (tgt86 == 1) { Xop(0x39, 8, 1); }         // cmp r8, rcx
+        else { E4(0xEB03009F); }                     // cmp x4, x3
+        EmitBcond(1, uncaught);                      // b.ne: never armed
+        LdrU(4, 0, 1008);                            // arming fp
+        if (tgt86 == 1) {                            // fp - sp, sign bit -> dead
+            X3(0x4C, 0x2B, 0xC4);                    // sub r8, rsp
+            X3(0x49, 0xC1, 0xE8); X1(63);                // shr r8, 63
+        } else {
+            E4(0xCB3F0084);                          // sub x4, x4, sp
+            E4(0xD37FFC84);                          // lsr x4, x4, #63
+        }
+        EmitCbnz(4, uncaught);                       // fp < sp: dead frame
+        LoadImm(1, 1);
+        BLExtern("_longjmp");
+        Mark(uncaught);
+        BLInternal("_zan_rt_eh_state");
+        MovRR(1, 0);
+        // report like the oracle (irgen_stmt.c reh.*): a string throw prints
+        // its text, a class throw the class name via _zan_eh_cls_name,
+        // nothing in flight the bare note -- then exit(1). Everything rides
+        // literal blobs + _zan_rt_strcat2/_zan_rt_println, the exact
+        // path Console.WriteLine uses, so no printf/raw-cstring variables.
+        LdrU(0, 1, 8);                               // exc
+        int none = NL();
+        CbzReg(0, none);
+        RtLdur(2, 0, -8);                            // desc
+        if (tgt86 == 1) { X3(0x48, 0xC1, 0xEA); X1(32); }   // shr rdx, 32 (site)
+        else { LsrImm64(2, 32); }                     // lsr x2, x2, #32 (site)
+        LoadImm(3, classes.Count + 1);
+        if (tgt86 == 1) { Xop(0x39, 2, 1); }         // cmp rdx, rcx
+        else { E4(0xEB03005F); }                     // cmp x2, x3
+        int isStr = NL();
+        EmitBcond(8, isStr);                         // b.hi: not a class site
+        MovRR(0, 2);                                 // x0 = site
+        BLInternal("_zan_eh_cls_name");              // x0 = heap name or 0
+        int anon = NL();
+        CbzReg(0, anon);
+        MovRR(1, 0);                                 // x1 = name
+        LoadStr(fmtUnhandledIdx, 0);                 // x0 = prefix
+        BLInternal("_zan_rt_strcat2");
+        BLInternal("_zan_rt_println");
+        int done = NL();
+        EmitB(done);
+        Mark(anon);
+        LoadStr(fmtUnhandledClsIdx, 0);
+        BLInternal("_zan_rt_println");
+        EmitB(done);
+        Mark(isStr);
+        MovRR(1, 0);                                 // x1 = exc string
+        LoadStr(fmtUnhandledIdx, 0);                 // x0 = prefix
+        BLInternal("_zan_rt_strcat2");
+        BLInternal("_zan_rt_println");
+        EmitB(done);
+        Mark(none);
+        LoadStr(fmtUnhandledBareIdx, 0);
+        BLInternal("_zan_rt_println");
+        Mark(done);
+        LoadImm(0, 1);
+        BLExtern("_exit");
+    }
+
+}

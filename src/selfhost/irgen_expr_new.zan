@@ -1,0 +1,519 @@
+using System;
+using System.Collections.Generic;
+namespace Zan;
+
+partial class Irgen {
+    // ---- indexing (string char / list element / array) ----
+    ExprVal GenIndex(Node e) {
+        ExprVal obj = GenExpr(e.a);
+        ExprVal idx = GenExpr(e.b);
+        if (IsStr(obj.ty)) {
+            // a null string is a soft runtime error in the C host: it reports
+            // and reads a scratch page, so the program keeps running and the
+            // element reads as NUL. The self-host switches to a zero page.
+            string isn = NT();
+            L("  " + isn + " = icmp eq i8* " + obj.op + ", null");
+            string zp = NT();
+            L("  " + zp + " = getelementptr inbounds [16 x i8], [16 x i8]* @.zeropage, i64 0, i64 0");
+            string bstr = NT();
+            L("  " + bstr + " = select i1 " + isn + ", i8* " + zp + ", i8* " + obj.op);
+            string sidx = NT();
+            L("  " + sidx + " = select i1 " + isn + ", i64 0, i64 " + idx.op);
+            string p = NT();
+            L("  " + p + " = getelementptr i8, i8* " + bstr + ", i64 " + sidx);
+            string ch = NT();
+            L("  " + ch + " = load i8, i8* " + p);
+            string z = NT();
+            L("  " + z + " = zext i8 " + ch + " to i64");
+            return new ExprVal(z, MkType("char"));
+        }
+        if (IsListType(obj.ty)) {
+            string slot = NT();
+            L("  " + slot + " = call i64 @zlist_get(i8* " + obj.op + ", i64 " + idx.op + ")");
+            return FromSlot(slot, ListElem(obj.ty));
+        }
+        if (IsSpanType(obj.ty)) {
+            Node el = SpanElem(obj.ty);
+            string ity = SpanIty(el);
+            string ep = SpanElemPtr(obj.op, idx.op, ity);
+            string v0 = NT();
+            // align 1: a span may view a raw address (protocol framing, FFI
+            // structs) whose elements are not naturally aligned.
+            L("  " + v0 + " = load " + ity + ", " + ity + "* " + ep + ", align 1");
+            if (ity == "double" || ity == "float") {
+                if (ity == "float") {
+                    string w = NT();
+                    L("  " + w + " = fpext float " + v0 + " to double");
+                    return new ExprVal(w, el);
+                }
+                return new ExprVal(v0, el);
+            }
+            if (ity == "i64") { return new ExprVal(v0, el); }
+            string w = NT();
+            string ext = "sext";
+            if (SpanZext(el)) { ext = "zext"; }
+            L("  " + w + " = " + ext + " " + ity + " " + v0 + " to i64");
+            return new ExprVal(w, el);
+        }
+        if (IsDictType(obj.ty)) {
+            string slot = NT();
+            L("  " + slot + " = call i64 @zdict_get(i8* " + obj.op + ", i8* " + DictKeyOp(idx, obj.ty) + ", i64 " + DictKeyStrFlag(obj.ty) + ")");
+            // A missing key is a runtime error, not a silent default: the C
+            // host reports "Dict key not found in indexer read" through the
+            // soft channel and hands back the zero value (TASKS.md A508).
+            // TryGetValue is the correct exit for a may-miss lookup and does
+            // not report; only the indexer read does.
+            string hit = NT();
+            L("  " + hit + " = call i64 @zdict_contains(i8* " + obj.op + ", i8* " + DictKeyOp(idx, obj.ty) + ", i64 " + DictKeyStrFlag(obj.ty) + ")");
+            string missv = NT();
+            L("  " + missv + " = icmp eq i64 " + hit + ", 0");
+            int lmiss = NL(); int ldone = NL();
+            L("  br i1 " + missv + ", label %L" + lmiss + ", label %L" + ldone);
+            Label(lmiss);
+            EmitSoftRuntimeError(e, "Dict key not found in indexer read");
+            L("  br label %L" + ldone);
+            Label(ldone);
+            return FromSlot(slot, DictVal(obj.ty));
+        }
+        // A user class indexer: the parser desugars `this[int i]` into an
+        // `op_index` method (and `op_index_set` for the setter). Call it --
+        // treating the object as an array read a slot out of the object
+        // header and answered with a garbage pointer (and the setter wrote
+        // into the header: the class id / refcount!).
+        // An array of user types (`Vec[]`) carries the element name in sval
+        // and the levels in ival -- it must stay on the array path.
+        Node ocls = null;
+        if (obj.ty != null && obj.ty.ival == 0) { ocls = ClassOf(obj.ty); }
+        if (ocls != null) {
+            Node m = SelectIndexer(ocls, "op_index", OperandType(e.b, idx), null);
+            if (m != null) { return EmitIndexCall(obj, m, idx); }
+            diags.Error("indexing a value of type '" + obj.ty.sval
+                + "' is not supported by the self-hosted compiler yet", e.line, e.col);
+            return new ExprVal("0", MkType("int"));
+        }
+        string p2 = NT();
+        Node elemTy2 = ArrElemOf(obj.ty);
+        int esz2 = ArrElemSize(elemTy2);
+        // a rectangular array folds its subscripts into a flat offset
+        string flat = idx.op;
+        int rk2 = ArrRankOf(obj.ty);
+        if (rk2 > 1) { flat = MdFlatIndex(e, obj.op, rk2, idx.op); }
+        if (esz2 == 1) {
+            // a byte array: one byte per element
+            string ab = NT();
+            L("  " + ab + " = bitcast i64* " + obj.op + " to i8*");
+            L("  " + p2 + " = getelementptr i8, i8* " + ab + ", i64 " + flat);
+            string bv = NT();
+            L("  " + bv + " = load i8, i8* " + p2);
+            string z = NT();
+            L("  " + z + " = zext i8 " + bv + " to i64");
+            if (elemTy2 != null) { return FromSlot(z, elemTy2); }
+            return new ExprVal(z, MkType("int"));
+        }
+        L("  " + p2 + " = getelementptr i64, i64* " + obj.op + ", i64 " + flat);
+        string v = NT();
+        L("  " + v + " = load i64, i64* " + p2);
+        // T[] element: unpack the i64 slot to the declared element type
+        // (a jagged T[][] keeps its remaining levels on the element)
+        if (obj.ty != null && obj.ty.ival >= 1) {
+            Node et2 = MkType(obj.ty.sval); et2.ival = obj.ty.ival - 1;
+            // the type arguments travel with the element: the element of a
+            // `List<string>[]` is a `List<string>`, not a bare `List`
+            et2.kids = obj.ty.kids;
+            // the element of a `T?[]` is a NULLABLE value: the flag rides on
+            // the array type, so it has to travel down to the element
+            et2.op = obj.ty.op;
+            // the inner ranks travel down as well: the element of `int[,]`
+            // is `int`, the element of `int[][,]` is `int[,]`
+            et2.arrRanks = Node.ArrRankDrop(obj.ty.arrRanks);
+            return FromSlot(v, et2);
+        }
+        return new ExprVal(v, MkType("int"));
+    }
+
+    // ---- new ----
+    ExprVal GenNew(Node e) {
+        Node ty = e.type;
+        if (e.ival != 1 && IsSpanType(ty)) {
+            // new Span<T>(base, len): a view value is just its base address;
+            // the length is evaluated for its side effects only.
+            string baseOp = "0";
+            if (e.kids.Count > 0) { baseOp = GenExpr(e.kids[0]).op; }
+            if (e.kids.Count > 1) { GenExpr(e.kids[1]); }
+            return new ExprVal(baseOp, ty);
+        }
+        if (e.ival == 1) {
+            // array new: T[n] as i64* (the elements follow the i64 length
+            // header; a byte-sized element type takes one byte per element)
+            // The RANK LIST of the created array (the parser records it):
+            // the dims group's rank first, then the trailing groups. The
+            // rank decides the shape: a rank of 1 is the plain array, a
+            // higher rank is a rectangular one.
+            string rkl = e.arrRanks;
+            if (rkl == null) { rkl = ""; }
+            int rank = Node.ArrRankAt(rkl, 0);
+            int ndimkids = rank - 1;
+            int nitems = e.kids.Count - ndimkids;
+            if (nitems < 0) { nitems = 0; }
+            bool init = nitems > 0;
+            // the array type of the result: the element name with the rank
+            // (the declared type of `new T[n]` does not carry the rank yet)
+            // the element's NULLABLE flag rides along: `new int?[3]` is an
+            // array of nullable ints, not a nullable array of ints
+            // the rank list rides along too: it is what tells the codegen
+            // that the array is rectangular (and how many dimensions it has)
+            Node at = MkType(ty.sval); at.ival = Node.ArrRankCount(rkl); at.op = ty.op;
+            at.kids = ty.kids;
+            at.arrRanks = rkl;
+            Node elemTy = ArrElemOf(at);
+            int esz = ArrElemSize(elemTy);
+            if (rank > 1) {
+                // a rectangular array: the header carries the dimensions
+                return GenMdArrNew(e, ty, at, elemTy, esz, rank, ndimkids, nitems);
+            }
+            ExprVal nsz = new ExprVal("0", MkType("int"));
+            if (e.b != null) { nsz = GenExpr(e.b); }
+            else if (init) {
+                // array initializer `new T[] { a, b, c }`: the element count
+                // is the number of initializer expressions
+                nsz = new ExprVal("" + nitems, MkType("int"));
+            }
+            string bytes = NT();
+            if (esz == 1) { L("  " + bytes + " = add i64 " + nsz.op + ", 0"); }
+            else { L("  " + bytes + " = mul i64 " + nsz.op + ", 8"); }
+            string tot = NT();
+            // the array header is [class id][length] -- the same 24-byte
+            // shape as an object header, so the runtime type test can read
+            // the class-id slot of any heap value
+            L("  " + tot + " = add i64 " + bytes + ", 16");
+            string raw = NT();
+            L("  " + raw + " = call i8* @calloc(i64 1, i64 " + tot + ")");
+            string hdr = NT();
+            L("  " + hdr + " = bitcast i8* " + raw + " to i64*");
+            string lenp = NT();
+            L("  " + lenp + " = getelementptr i64, i64* " + hdr + ", i64 1");
+            L("  store i64 " + nsz.op + ", i64* " + lenp);
+            string arr = NT();
+            L("  " + arr + " = getelementptr i64, i64* " + hdr + ", i64 2");
+            if (init) {
+                Node et = elemTy;
+                if (et == null) { et = MkType(ty.sval); }
+                int jn = 0;
+                while (jn < e.kids.Count) {
+                    ExprVal iv = GenExpr(e.kids[jn]);
+                    string sv = "";
+                    if (IsNullableValue(et)) {
+                        // a nullable element is a pointer slot: box the value
+                        string bx = BoxFor(iv, et);
+                        string bi = NT();
+                        L("  " + bi + " = ptrtoint i8* " + bx + " to i64");
+                        sv = bi;
+                    } else {
+                        sv = StructElemSlot(iv, et);
+                    }
+                    if (esz == 1) {
+                        string ab = NT();
+                        L("  " + ab + " = bitcast i64* " + arr + " to i8*");
+                        string ep = NT();
+                        L("  " + ep + " = getelementptr i8, i8* " + ab + ", i64 " + jn);
+                        ArrElemStore(ep, 1, sv);
+                    } else {
+                        string ep = NT();
+                        L("  " + ep + " = getelementptr i64, i64* " + hdr + ", i64 " + (jn + 2));
+                        L("  store i64 " + sv + ", i64* " + ep);
+                    }
+                    jn = jn + 1;
+                }
+            }
+            Node at2 = at;
+            if (!init && esz != 1) {
+                // an array of struct elements: every slot needs an instance
+                // (the C host keeps the struct inline in the slot)
+                Node et3 = elemTy;
+                if (et3 != null && IsStructTy(et3)) {
+                    L("  call void @" + et3.sval + "_initarr(i64* " + arr + ", i64 " + nsz.op + ")");
+                }
+            }
+            return new ExprVal(arr, at2);
+        }
+        if (IsListType(ty)) {
+            string t = NT();
+            string ow = "0"; if (ArcManaged(ListElem(ty))) { ow = "1"; }
+            L("  " + t + " = call i8* @zlist_new(i64 " + ow + ")");
+            if (e.ival == 2) {
+                // collection initializer: append each item
+                int j = 0;
+                while (j < e.kids.Count) {
+                    ExprVal iv = GenExpr(e.kids[j]);
+                    string sv = StructElemSlot(iv, ListElem(ty));
+                    L("  call void @zlist_add(i8* " + t + ", i64 " + sv + ")");
+                    j = j + 1;
+                }
+            }
+            else if (e.kids.Count == 1) {
+                // `new List<T>(src)`: a list argument is the copy constructor
+                // (the C host's list_copy lowering) -- the source's elements
+                // are copied into the new list. Any other argument is a
+                // single-item collection initializer, exactly like the host.
+                ExprVal sv = GenExpr(e.kids[0]);
+                if (IsListType(sv.ty)) {
+                    L("  call void @zlist_copy(i8* " + t + ", i8* " + sv.op + ")");
+                }
+                else {
+                    string ss = StructElemSlot(sv, ListElem(ty));
+                    L("  call void @zlist_add(i8* " + t + ", i64 " + ss + ")");
+                }
+            }
+            else if (e.kids.Count > 1) {
+                // `new List<T>(a, b, c)`: the items of a collection initializer
+                int j = 0;
+                while (j < e.kids.Count) {
+                    ExprVal iv = GenExpr(e.kids[j]);
+                    string sv = StructElemSlot(iv, ListElem(ty));
+                    L("  call void @zlist_add(i8* " + t + ", i64 " + sv + ")");
+                    j = j + 1;
+                }
+            }
+            AddTemp(t, ty);
+            return new ExprVal(t, ty);
+        }
+        if (IsDictType(ty)) {
+            string t = NT();
+            string ow = "0"; if (ArcManaged(DictVal(ty))) { ow = "1"; }
+            L("  " + t + " = call i8* @zdict_new(i64 " + ow + ")");
+            if (e.ival == 2) {
+                // collection initializer: each item is a key/value pair.
+                int j = 0;
+                while (j < e.kids.Count) {
+                    Node item = e.kids[j];
+                    if (item.kids.Count >= 2) {
+                        ExprVal key = GenExpr(item.kids[0]);
+                        ExprVal val = GenExpr(item.kids[1]);
+                        string sv = StructElemSlot(val, DictVal(ty));
+                        L("  call void @zdict_set(i8* " + t + ", i8* " + DictKeyOp(key, ty) + ", i64 " + sv + ", i64 " + DictKeyStrFlag(ty) + ")");
+                    }
+                    j = j + 1;
+                }
+            }
+            AddTemp(t, ty);
+            return new ExprVal(t, ty);
+        }
+        if (IsSbType(ty)) {
+            string t = NT();
+            L("  " + t + " = call i8* @zsb_new()");
+            AddTemp(t, ty);
+            return new ExprVal(t, ty);
+        }
+        // object
+        string cn = ty.sval;
+        // hardware vectors are first-class values: `new Vector128()` /
+        // `new Vector256()` yields zeroinitializer and the field stores that
+        // follow (V0..V3 = 0 / -1) fold into the value via the ordinary
+        // constant paths — no heap allocation, no dtor
+        if (cn == "Vector128" || cn == "Vector256") {
+            return new ExprVal("zeroinitializer", ty);
+        }
+        if (cn == "object") {
+            // `new object()`: a bare heap object with no fields (the C host's
+            // builtin object class). It is a real instance -- `o != null` holds.
+            string oraw = NT();
+            L("  " + oraw + " = call i8* @zalloc(i64 8, i8* bitcast (void (i8*)* @__zan_object_dtor to i8*), i8* null)");
+            AddTemp(oraw, ty);
+            return new ExprVal(oraw, ty);
+        }
+        Node cls = binder.FindType(cn);
+        if (cls == null) { return new ExprVal("null", ty); }
+        string szp = NT();
+        L("  " + szp + " = getelementptr %" + cn + ", %" + cn + "* null, i32 1");
+        string szi = NT();
+        L("  " + szi + " = ptrtoint %" + cn + "* " + szp + " to i64");
+        string raw = NT();
+        L("  " + raw + " = call i8* @zalloc(i64 " + szi + ", i8* bitcast (void (i8*)* @" + cn + "_dtor to i8*), i8* bitcast (i8** @__tid_" + cn + " to i8*))");
+        string obj = NT();
+        L("  " + obj + " = bitcast i8* " + raw + " to %" + cn + "*");
+        // a struct-typed field points at a nested instance: allocate it
+        InitNestedFields(obj, cls);
+        if (IsPolyClass(cls)) {
+            List<string> vslots = new List<string>();
+            CollectVSlots(cls, vslots);
+            string vtp0 = NT();
+            L("  " + vtp0 + " = getelementptr %" + cn + ", %" + cn + "* " + obj + ", i32 0, i32 0");
+            L("  store i8* bitcast ([" + vslots.Count + " x i8*]* @" + cn + "_vtable to i8*), i8** " + vtp0);
+        }
+        // The constructor: with an object initializer (ival == 2) the kids are
+        // `Field = value` pairs, not ctor args, so only a parameterless ctor
+        // is invoked and the field stores follow. Otherwise the arguments
+        // pick the overload (arity fit plus argument-type score; defaults
+        // fill omitted trailing args). When no constructor matches, the
+        // instance field initializers run at the allocation site -- that is
+        // what the implicit parameterless constructor of the C host does.
+        if (e.ival == 2) {
+            Node pctor = binder.FindCtorArity(cls, 0);
+            if (pctor != null) {
+                L("  call void @" + CtorSym(cn, pctor) + "(%" + cn + "* " + obj + ")");
+            }
+            else if (HasChainFieldInits(cls)) {
+                L("  call void @" + FieldInitsSym(cls) + "(%" + cn + "* " + obj + ")");
+            }
+        }
+        else {
+            Node ctor = ResolveCtor(cls, e);
+            if (ctor != null) {
+                List<Node> cargs = OrderArgs(ctor, e);
+                // A generic class's constructor sees the CONCRETE type
+                // arguments: a delegate-typed parameter (`LabelOf<T>`) must
+                // carry them, or the lambda handed in gets an erased
+                // parameter type and its body silently does nothing.
+                List<string> ctps = TParams(cls);
+                bool ctorSpec = (ctps.Count > 0 && ty != null && ty.ival == 0
+                    && ty.kids.Count == ctps.Count);
+                string args = "%" + cn + "* " + obj;
+                int i = 0;
+                while (i < cargs.Count) {
+                    Node pty = CtorParamType(ctor, i);
+                    // The argument is INFERRED with the concrete type (a
+                    // delegate-typed parameter carries the class's type
+                    // arguments, so a lambda gets a real parameter type),
+                    // but the CALL keeps the erased shape: the constructor
+                    // body is shared, so it takes the value in a slot.
+                    Node epty = pty;
+                    if (ctorSpec) { epty = SubstTP(pty, ctps, ty.kids); }
+                    // The CALL matches the constructor that actually runs: a
+                    // specialized constructor takes the CONCRETE parameter
+                    // types (the C host's find_generic_ctor), the shared one
+                    // the erased shapes.
+                    Node cty = pty;
+                    if (ctorSpec) { cty = epty; }
+                    if (IsRefParam(ctor, i) && cargs[i] != null
+                        && cargs[i].kind == AK.OutArg()) {
+                        string addr;
+                        if (cargs[i].type != null) { addr = NewOutLocal(cargs[i]); }
+                        else { addr = RefPlacePtr(cargs[i].a, cty); }
+                        args = args + ", " + MapType(cty) + "* " + addr;
+                        i = i + 1;
+                        continue;
+                    }
+                    ExprVal av = GenArgExpr(cargs[i], epty);
+                    args = args + ", " + MapType(cty) + " " + CallArg(av, cty, false);
+                    i = i + 1;
+                }
+                string ctorSym = CtorSym(cn, ctor);
+                if (ctorSpec) { ctorSym = SpecCtorSym(cn, ctor, ty); }
+                L("  call void @" + ctorSym + "(" + args + ")");
+            }
+            else {
+                int argc = e.kids.Count;
+                // The C host's checker accepts the call when a constructor's
+                // arity range covers the arguments; its code generator matches
+                // the parameter count exactly. A `params` array is the one
+                // case the checker lets through and the code generator
+                // refuses.
+                bool checkerOk = false;
+                int i = 0;
+                while (i < cls.kids.Count) {
+                    if (cls.kids[i].kind == AK.CtorDecl()
+                        && CtorArityFits(cls.kids[i], argc)) { checkerOk = true; }
+                    i = i + 1;
+                }
+                // A STRUCT always has an implicit parameterless constructor:
+                // the C host's checker skips the constructor check for struct
+                // types altogether (`type->kind != TYPE_CLASS` ->
+                // return, src/compiler/checker.c: check_ctor_available), so
+                // `new Matrix4x4()` -- a struct whose only constructor takes
+                // 16 floats -- is legal there and yields a zeroed instance.
+                // Only a CLASS has the "no implicit parameterless one" rule.
+                if (cls.kind == AK.StructDecl()) {
+                    checkerOk = false;
+                }
+                else if (checkerOk) {
+                    diags.Error("[E2017] no constructor of '" + cn + "' accepts " + argc
+                        + (argc == 1 ? " argument" : " arguments"), e.line, e.col);
+                }
+                else if (binder.FindCtor(cls) != null) {
+                    diags.Error("[E2018] no constructor of '" + cn + "' takes " + argc
+                        + " argument(s); a class that declares constructors has no implicit parameterless one",
+                        e.line, e.col);
+                }
+                else if (argc > 0) {
+                    diags.Error("[E2017] no constructor of '" + cn + "' accepts " + argc
+                        + " arguments", e.line, e.col);
+                }
+                if (HasChainFieldInits(cls)) {
+                    L("  call void @" + FieldInitsSym(cls) + "(%" + cn + "* " + obj + ")");
+                }
+            }
+        }
+        // object initializer: store each `Field = value` into the instance
+        if (e.ival == 2) {
+            int j = 0;
+            while (j < e.kids.Count) {
+                Node it = e.kids[j];
+                if (it.kind == AK.Assignment() && it.a != null
+                    && it.a.kind == AK.Ident()) {
+                    // A Binding-typed field takes a fresh Binding object, not
+                    // the raw value (the C host's emit_binding_value): the
+                    // initializer's value replaces the one the constructor put
+                    // into the slot.
+                    Node fty0 = FieldType(cls, it.a.sval);
+                    ExprVal fv = null;
+                    if (fty0 != null && IsBindingTy(fty0)) {
+                        fv = GenBindingValue(it.b, fty0);
+                    }
+                    if (fv == null) { fv = GenExpr(it.b); }
+                    // A property in the initializer goes through its setter:
+                    // `new A { Mixed = 50 }` calls `set_Mixed(50)`. Storing it
+                    // as a field wrote into a field slot that does not exist
+                    // (index -1 -> invalid IR).
+                    if (EmitPropSet(obj, ty, it.a.sval, fv)) { j = j + 1; continue; }
+                    StoreField(obj, cn, it.a.sval, fv);
+                }
+                j = j + 1;
+            }
+        }
+        // preserve generic type arguments (ty may carry <...>) for the result
+        AddTemp(obj, ty);
+        return new ExprVal(obj, ty);
+    }
+
+    int CtorParamCount(Node ctor) {
+        int n = 0; int i = 0;
+        while (i < ctor.kids.Count) {
+            if (ctor.kids[i].kind == AK.Param()) { n = n + 1; }
+            i = i + 1;
+        }
+        return n;
+    }
+
+    Node CtorParamType(Node ctor, int argIdx) {
+        int seen = 0; int i = 0;
+        while (i < ctor.kids.Count) {
+            if (ctor.kids[i].kind == AK.Param()) {
+                if (seen == argIdx) { return ctor.kids[i].type; }
+                seen = seen + 1;
+            }
+            i = i + 1;
+        }
+        return MkType("int");
+    }
+
+    void EmitCastThrow(string msg) {
+        string raw = NT();
+        L("  " + raw + " = call i8* @zalloc(i64 24, i8* bitcast (void (i8*)* @__zan_object_dtor to i8*), i8* bitcast (i8** @__tid_InvalidCastException to i8*))");
+        string objArr = NT();
+        L("  " + objArr + " = bitcast i8* " + raw + " to i8**");
+        string f0 = NT();
+        L("  " + f0 + " = getelementptr i8*, i8** " + objArr + ", i64 0");
+        L("  store i8* null, i8** " + f0);
+        ExprVal ms = GenStr(msg);
+        string f1 = NT();
+        L("  " + f1 + " = getelementptr i8*, i8** " + objArr + ", i64 1");
+        L("  store i8* " + ms.op + ", i8** " + f1);
+        string f2 = NT();
+        L("  " + f2 + " = getelementptr i8*, i8** " + objArr + ", i64 2");
+        L("  store i8* null, i8** " + f2);
+        L("  store i8* bitcast (i8** @__tid_InvalidCastException to i8*), i8** @__exc_tid");
+        L("  store i8* " + raw + ", i8** @__exc_val");
+        EmitRaise();
+    }
+
+}

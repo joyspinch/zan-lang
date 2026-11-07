@@ -1,0 +1,471 @@
+using System;
+using System.Collections.Generic;
+namespace Zan;
+
+partial class Irgen {
+    ExprVal GenBinary(Node e) {
+        int op = e.op;
+        // constant folding: collapse pure integer-constant subtrees to a literal
+        if (IsConstInt(e)) {
+            // the host folds an integer constant to an i64
+            ExprVal r = new ExprVal("" + EvalConstInt(e), MkType("int"));
+            r.wbits = 64;
+            return r;
+        }
+        // lifted operators on a nullable left arm (C# lifted semantics, the
+        // host's emit_nullable_binary): either arm null -> null; else the
+        // payloads operate and the result reboxes. `x = x + 3` on an int?
+        // used to feed the BOX POINTER into `add i64` -- clang rejected the
+        // module ("'%t45' defined with type 'ptr' but expected 'i64'").
+        ExprVal la = null;
+        if (op == TK.Plus() || op == TK.Minus() || op == TK.Star()
+            || op == TK.Slash() || op == TK.Percent()) {
+            Node lat = ArgTypeNode(e.a);
+            if (lat == null || IsNullableValue(lat)) {
+                la = GenExpr(e.a);
+                if (IsNullableValue(la.ty)) {
+                    int lnb = NL(); int lrhs = NL(); int ldone = NL();
+                    string aisn = NT();
+                    L("  " + aisn + " = icmp eq i8* " + la.op + ", null");
+                    L("  br i1 " + aisn + ", label %L" + lnb + ", label %L" + lrhs);
+                    Label(lnb);
+                    L("  br label %L" + ldone);
+                    string anullLbl = curLbl;
+                    Label(lrhs);
+                    List<string> svT4 = stmtTemps; List<Node> svTT4 = stmtTempTypes;
+                    stmtTemps = new List<string>(); stmtTempTypes = new List<Node>();
+                    ExprVal lb = GenExpr(e.b);
+                    string bnullLbl = "";
+                    if (lb.ty != null && IsNullable(lb.ty)) {
+                        // right arm null propagates too: branch to the merge null
+                        int lbnull = NL();
+                        string bisn = NT();
+                        L("  " + bisn + " = icmp eq i8* " + lb.op + ", null");
+                        L("  br i1 " + bisn + ", label %L" + lbnull + ", label %L" + ldone);
+                        Label(lbnull);
+                        L("  br label %L" + ldone);
+                        bnullLbl = curLbl;
+                    }
+                    string ault = UnderLL(la.ty);
+                    string ap = NT();
+                    L("  " + ap + " = bitcast i8* " + la.op + " to " + ault + "*");
+                    string av = NT();
+                    L("  " + av + " = load " + ault + ", " + ault + "* " + ap);
+                    string bv = Coerce(lb, ault);
+                    bool isF = ault == "double";
+                    string opn2 = "add";
+                    if (op == TK.Minus()) { opn2 = isF ? "fsub" : "sub"; }
+                    else if (op == TK.Star()) { opn2 = isF ? "fmul" : "mul"; }
+                    else if (op == TK.Slash()) { opn2 = isF ? "fdiv" : "sdiv"; }
+                    else if (op == TK.Percent()) { opn2 = isF ? "frem" : "srem"; }
+                    else { opn2 = isF ? "fadd" : "add"; }
+                    string rv = NT();
+                    L("  " + rv + " = " + opn2 + " " + ault + " " + av + ", " + bv);
+                    ExprVal rvx = new ExprVal(rv, MkType(la.ty.sval));
+                    string rbox = BoxVal(rvx, la.ty);
+                    EmitTempReleases();
+                    stmtTemps = svT4; stmtTempTypes = svTT4;
+                    L("  br label %L" + ldone);
+                    string bvalLbl = curLbl;
+                    Label(ldone);
+                    string rr = NT();
+                    if (bnullLbl != "") {
+                        L("  " + rr + " = phi i8* [ null, %" + anullLbl + " ], [ null, %" + bnullLbl + " ], [ " + rbox + ", %" + bvalLbl + " ]");
+                    } else {
+                        L("  " + rr + " = phi i8* [ null, %" + anullLbl + " ], [ " + rbox + ", %" + bvalLbl + " ]");
+                    }
+                    AddTemp(rr, la.ty);
+                    return new ExprVal(rr, la.ty);
+                }
+            }
+        }
+        if (op == TK.AmpAmp() || op == TK.PipePipe()) {
+            List<string> svT = stmtTemps; List<Node> svTT = stmtTempTypes;
+            stmtTemps = new List<string>(); stmtTempTypes = new List<Node>();
+            bool isAnd = (op == TK.AmpAmp());
+            int lrhs = NL(); int lend = NL();
+            string la = GenCond(e.a);
+            string bpre = curLbl;
+            if (isAnd) { L("  br i1 " + la + ", label %L" + lrhs + ", label %L" + lend); }
+            else { L("  br i1 " + la + ", label %L" + lend + ", label %L" + lrhs); }
+            Label(lrhs);
+            string lb = GenCond(e.b);
+            string bpost = curLbl;
+            L("  br label %L" + lend);
+            Label(lend);
+            string r = NT();
+            string dflt = "true"; if (isAnd) { dflt = "false"; }
+            L("  " + r + " = phi i1 [ " + dflt + ", %" + bpre + " ], [ " + lb + ", %" + bpost + " ]");
+            string z = NT();
+            L("  " + z + " = zext i1 " + r + " to i64");
+            stmtTemps = svT; stmtTempTypes = svTT;
+            return new ExprVal(z, MkType("bool"));
+        }
+        // null-coalescing "a ?? b": if a is non-null use a, else b. Result is
+        // normalised to a single owned (+1) temp so ARC release is balanced in
+        // both branches (no leak, no double-free); no-op retains for non-ARC types.
+        if (op == TK.QQ()) {
+            // T? ?? T（checker 在 e.ival 钉了负载形态标记）：左支解箱取负载，
+            // 右支在分支内惰性求值，phi 按负载型。checker 同步定型为负载
+            // 类型（A536 家族，宿主 emit_null_coalesce 同口径）。曾走聚合
+            // phi 且定型 int?，`int y = x ?? 5;` 编不过。
+            if (e.ival == 1) {
+                ExprVal qa = GenExpr(e.a);
+                int ulb = NL(); int ula = NL(); int ulend = NL();
+                string uisn = NT();
+                L("  " + uisn + " = icmp eq i8* " + qa.op + ", null");
+                L("  br i1 " + uisn + ", label %L" + ulb + ", label %L" + ula);
+                Label(ula);
+                string uult = UnderLL(qa.ty);
+                string up = NT();
+                L("  " + up + " = bitcast i8* " + qa.op + " to " + uult + "*");
+                string upv = NT();
+                L("  " + upv + " = load " + uult + ", " + uult + "* " + up);
+                L("  br label %L" + ulend);
+                string uapost = curLbl;
+                Label(ulb);
+                List<string> svT3 = stmtTemps; List<Node> svTT3 = stmtTempTypes;
+                stmtTemps = new List<string>(); stmtTempTypes = new List<Node>();
+                ExprVal ub = GenExpr(e.b);
+                string ubc = Coerce(ub, uult);
+                EmitTempReleases();
+                stmtTemps = svT3; stmtTempTypes = svTT3;
+                string ubpost = curLbl;
+                L("  br label %L" + ulend);
+                Label(ulend);
+                string ur = NT();
+                L("  " + ur + " = phi " + uult + " [ " + upv + ", %" + uapost + " ], [ " + ubc + ", %" + ubpost + " ]");
+                Node uuty = MkType(qa.ty.sval);
+                AddTemp(ur, uuty);
+                return new ExprVal(ur, uuty);
+            }
+            ExprVal a = GenExpr(e.a);
+            string at = MapType(a.ty);
+            int lb = NL(); int la = NL(); int lend = NL();
+            string isn = NT();
+            L("  " + isn + " = icmp eq " + at + " " + a.op + ", null");
+            L("  br i1 " + isn + ", label %L" + lb + ", label %L" + la);
+            // a non-null: retain a so the merged result carries +1
+            Label(la);
+            EmitArcRetain(a.op, a.ty);
+            string apost = curLbl;
+            L("  br label %L" + lend);
+            // a null: evaluate b in an isolated temp scope, retain the chosen
+            // value, release bs own temporaries within the branch.
+            Label(lb);
+            List<string> svT = stmtTemps; List<Node> svTT = stmtTempTypes;
+            stmtTemps = new List<string>(); stmtTempTypes = new List<Node>();
+            ExprVal b = GenExpr(e.b);
+            EmitArcRetain(b.op, b.ty);
+            string bop = b.op;
+            if (MapType(b.ty) != at) {
+                string bc = NT();
+                L("  " + bc + " = bitcast " + MapType(b.ty) + " " + bop + " to " + at);
+                bop = bc;
+            }
+            EmitTempReleases();
+            stmtTemps = svT; stmtTempTypes = svTT;
+            string bpost = curLbl;
+            L("  br label %L" + lend);
+            Label(lend);
+            string r = NT();
+            L("  " + r + " = phi " + at + " [ " + a.op + ", %" + apost + " ], [ " + bop + ", %" + bpost + " ]");
+            Node rty = a.ty;
+            if (rty == null || rty.sval == "object" || rty.sval == "var") { rty = b.ty; }
+            AddTemp(r, rty);
+            return new ExprVal(r, rty);
+        }
+        // pointer/null comparisons (peek operand kind before evaluating)
+        if (op == TK.EqEq() || op == TK.BangEq()) {
+            if (e.a.kind == AK.NullLit() || e.b.kind == AK.NullLit()) {
+                Node other = e.a; if (e.a.kind == AK.NullLit()) { other = e.b; }
+                ExprVal ov = GenExpr(other);
+                string ot = MapType(ov.ty);
+                string cc = "eq"; if (op == TK.BangEq()) { cc = "ne"; }
+                // an erased type parameter travels in an i64 slot: it is
+                // compared against 0, not against the null pointer
+                string nul = "null"; if (!IsPtrLL(ot)) { nul = "0"; }
+                string c = NT();
+                L("  " + c + " = icmp " + cc + " " + ot + " " + ov.op + ", " + nul);
+                string z = NT();
+                L("  " + z + " = zext i1 " + c + " to i64");
+                return new ExprVal(z, MkType("bool"));
+            }
+        }
+        // A chain of 3+ string `+` parts is emitted as one flattened
+        // allocation instead of pairwise (see StrConcatN). Only chains whose
+        // string-ness is provable (a string literal or string-typed local in
+        // the subtree) are flattened; anything else keeps the pairwise
+        // path that decides from the evaluated operand types.
+        if (op == TK.Plus() && IsStrChain(e)) {
+            List<Node> parts = new List<Node>();
+            CollectConcat(e, parts);
+            if (parts.Count > 2) { return StrConcatN(parts); }
+        }
+        ExprVal a;
+        if (la != null) { a = la; } else { a = GenExpr(e.a); }
+        ExprVal b = GenExpr(e.b);
+        // ulong operands select unsigned div/rem/shift/compare and carry the
+        // unsigned type through so results print with %llu.
+        bool uns = IsUlong(a.ty) || IsUlong(b.ty);
+        // user-defined operator overloading takes precedence for class operands
+        ExprVal ov = TryOpOverload(op, a, b, e.a, e.b);
+        if (ov != null) { return ov; }
+        // floating-point arithmetic/comparison (string `+` concatenation wins)
+        if ((IsDbl(a.ty) || IsDbl(b.ty)) && !(IsStr(a.ty) || IsStr(b.ty))) {
+            string da = AsDouble(a);
+            string db = AsDouble(b);
+            string fop = FArithOp(op);
+            if (fop != "") {
+                string t = NT();
+                L("  " + t + " = " + fop + " double " + da + ", " + db);
+                // a float-typed result carries single precision: the host
+                // computes it in f32
+                Node rty = FloatResultTy(a.ty, b.ty);
+                if (IsFloatTy(rty)) {
+                    t = F32Round(t);
+                    return new ExprVal(t, rty);
+                }
+                return new ExprVal(t, rty);
+            }
+            string fcp = FCmpOp(op);
+            if (fcp != "") {
+                string c = NT();
+                L("  " + c + " = fcmp " + fcp + " double " + da + ", " + db);
+                string z = NT();
+                L("  " + z + " = zext i1 " + c + " to i64");
+                return new ExprVal(z, MkType("bool"));
+            }
+        }
+        // addition: concatenate when either operand is a string, else integer add
+        if (op == TK.Plus()) {
+            if (IsStr(a.ty) || IsStr(b.ty)) {
+                return StrConcat(ToCStr(a), ToCStr(b));
+            }
+            string t = NT();
+            L("  " + t + " = add i64 " + a.op + ", " + b.op);
+            // the host adds in the operands' width: two int values add in
+            // 32 bits and wrap there
+            int aw = ArithWidth(e.a, a, e.b, b);
+            if (aw < 64) { t = WrapArith(t, aw, ArithUnsigned(e.a, a, e.b, b)); }
+            return ArithResult(t, aw, uns);
+        }
+        if (op == TK.EqEq() || op == TK.BangEq()) {
+            // lifted equality on nullable value arms (C# lifted operators):
+            // `b == null` -> !Has, `b != null` -> Has; both nullable -> both
+            // have value AND the payloads compare (the host's
+            // emit_nullable_binary). The generic path used to feed the BOX
+            // POINTER into `icmp eq i64 ..., 1` (bool? == true).
+            if ((a.ty != null && IsNullableValue(a.ty)) || (b.ty != null && IsNullableValue(b.ty))) {
+                bool aN = e.a.kind == AK.NullLit();
+                bool bN = e.b.kind == AK.NullLit();
+                if (aN || bN) {
+                    ExprVal other = aN ? b : a;
+                    Node otherTy = other.ty;
+                    string has;
+                    if (otherTy != null && IsNullableValue(otherTy)) {
+                        string hc = NT();
+                        L("  " + hc + " = icmp ne i8* " + other.op + ", null");
+                        has = hc;
+                    } else {
+                        has = aN && bN ? "0" : "1";
+                    }
+                    if (op == TK.BangEq()) {
+                        string z0 = NT();
+                        L("  " + z0 + " = zext i1 " + has + " to i64");
+                        return new ExprVal(z0, MkType("bool"));
+                    }
+                    string hn = NT();
+                    L("  " + hn + " = xor i1 " + has + ", 1");
+                    string z1 = NT();
+                    L("  " + z1 + " = zext i1 " + hn + " to i64");
+                    return new ExprVal(z1, MkType("bool"));
+                }
+                string hasA;
+                string hasB;
+                if (IsNullableValue(a.ty)) {
+                    string ha = NT();
+                    L("  " + ha + " = icmp ne i8* " + a.op + ", null");
+                    hasA = ha;
+                } else { hasA = "1"; }
+                if (IsNullableValue(b.ty)) {
+                    string hb = NT();
+                    L("  " + hb + " = icmp ne i8* " + b.op + ", null");
+                    hasB = hb;
+                } else { hasB = "1"; }
+                string bothH = NT();
+                L("  " + bothH + " = and i1 " + hasA + ", " + hasB);
+                int lcmp2 = NL(); int lmerge2 = NL();
+                string preLbl = curLbl;
+                L("  br i1 " + bothH + ", label %L" + lcmp2 + ", label %L" + lmerge2);
+                Label(lcmp2);
+                string aUlt = (a.ty != null && IsNullableValue(a.ty)) ? UnderLL(a.ty) : MapType(a.ty);
+                string bUlt = (b.ty != null && IsNullableValue(b.ty)) ? UnderLL(b.ty) : MapType(b.ty);
+                string aPl = a.op;
+                if (IsNullableValue(a.ty)) {
+                    string ap2 = NT();
+                    L("  " + ap2 + " = bitcast i8* " + a.op + " to " + aUlt + "*");
+                    string av2 = NT();
+                    L("  " + av2 + " = load " + aUlt + ", " + aUlt + "* " + ap2);
+                    aPl = av2;
+                }
+                string bPl = b.op;
+                if (IsNullableValue(b.ty)) {
+                    string bp2 = NT();
+                    L("  " + bp2 + " = bitcast i8* " + b.op + " to " + bUlt + "*");
+                    string bv2 = NT();
+                    L("  " + bv2 + " = load " + bUlt + ", " + bUlt + "* " + bp2);
+                    bPl = bv2;
+                }
+                string cmp2 = NT();
+                L("  " + cmp2 + " = icmp " + (op == TK.EqEq() ? "eq" : "ne") + " " + aUlt + " " + aPl + ", " + bPl);
+                string cv = NT();
+                L("  " + cv + " = zext i1 " + cmp2 + " to i64");
+                L("  br label %L" + lmerge2);
+                Label(lmerge2);
+                string mrg = NT();
+                L("  " + mrg + " = phi i64 [ 0, %" + preLbl + " ], [ " + cv + ", %L" + lcmp2 + " ]");
+                return new ExprVal(mrg, MkType("bool"));
+            }
+            if (IsStr(a.ty) && IsStr(b.ty)) {
+                string r = NT();
+                L("  " + r + " = call i32 @__zan_strcmp0(i8* " + a.op + ", i8* " + b.op + ")");
+                string cc = "eq"; if (op == TK.BangEq()) { cc = "ne"; }
+                string c = NT();
+                L("  " + c + " = icmp " + cc + " i32 " + r + ", 0");
+                string z = NT();
+                L("  " + z + " = zext i1 " + c + " to i64");
+                return new ExprVal(z, MkType("bool"));
+            }
+            // a struct without operator== compares by VALUE (C# struct
+            // semantics): the self-host's struct is a heap object, so pointer
+            // identity would call two equal values "not equal".
+            Node sa = ClassOf(a.ty);
+            if (sa != null && sa.kind == AK.StructDecl() && b.ty != null && b.ty.sval == a.ty.sval) {
+                string c = EmitStructEq(a, b, a.ty);
+                string z = NT();
+                L("  " + z + " = zext i1 " + c + " to i64");
+                if (op == TK.BangEq()) {
+                    string n = NT();
+                    L("  " + n + " = xor i64 " + z + ", 1");
+                    return new ExprVal(n, MkType("bool"));
+                }
+                return new ExprVal(z, MkType("bool"));
+            }
+            // reference identity: compare pointer operands as pointers, not i64
+            string alt = MapType(a.ty); string blt = MapType(b.ty);
+            if (IsPtrLL(alt) && IsPtrLL(blt)) {
+                string pty = alt;
+                string ao = a.op; string bo = b.op;
+                if (blt != pty) {
+                    string tb = NT();
+                    L("  " + tb + " = bitcast " + blt + " " + bo + " to " + pty);
+                    bo = tb;
+                }
+                string ccp = "eq"; if (op == TK.BangEq()) { ccp = "ne"; }
+                string cp = NT();
+                L("  " + cp + " = icmp " + ccp + " " + pty + " " + ao + ", " + bo);
+                string zp = NT();
+                L("  " + zp + " = zext i1 " + cp + " to i64");
+                return new ExprVal(zp, MkType("bool"));
+            }
+            string cc2 = CmpOp(op);
+            string c2 = NT();
+            L("  " + c2 + " = icmp " + cc2 + " i64 " + a.op + ", " + b.op);
+            string z2 = NT();
+            L("  " + z2 + " = zext i1 " + c2 + " to i64");
+            return new ExprVal(z2, MkType("bool"));
+        }
+        // string ordering: `<`/`<=`/`>`/`>=` compare content via strcmp, not
+        // the raw i8* pointers.
+        if (IsStr(a.ty) && IsStr(b.ty)) {
+            string scp = CmpOp(op);
+            if (scp != "") {
+                string r = NT();
+                L("  " + r + " = call i32 @__zan_strcmp0(i8* " + a.op + ", i8* " + b.op + ")");
+                string c = NT();
+                L("  " + c + " = icmp " + scp + " i32 " + r + ", 0");
+                string z = NT();
+                L("  " + z + " = zext i1 " + c + " to i64");
+                return new ExprVal(z, MkType("bool"));
+            }
+        }
+        string ar = ArithOp(op);
+        if (ar != "") {
+            // peephole: identity simplifications (operands already evaluated)
+            if ((op == TK.Plus() || op == TK.Minus()) && b.op == "0") { return a; }
+            if (op == TK.Plus() && a.op == "0") { return b; }
+            if ((op == TK.Star() || op == TK.Slash()) && b.op == "1") { return a; }
+            if (op == TK.Star() && a.op == "1") { return b; }
+            if (uns) {
+                if (op == TK.Slash()) { ar = "udiv"; }
+                else if (op == TK.Percent()) { ar = "urem"; }
+                else if (op == TK.GreaterGreater()) { ar = "lshr"; }
+            }
+            string t = NT();
+            // the shift count is masked to the width of the left operand (the
+            // C host's mask_shift_count): 31 for a 32-bit type, 63 for a
+            // 64-bit one. An unmasked count is poison in LLVM.
+            string bs = b.op;
+            if (op == TK.LessLess() || op == TK.GreaterGreater() || op == TK.GreaterGreaterGreater()) {
+                int mbits = 63;
+                int ab = IntBits(a.ty);
+                if (ab > 0 && ab < 64) { mbits = ab - 1; }
+                string m = NT();
+                L("  " + m + " = and i64 " + bs + ", " + mbits);
+                bs = m;
+            }
+            // the operation width: the host computes the narrow types in
+            // their own width, so the result wraps there
+            int aw = ArithWidth(e.a, a, e.b, b);
+            bool awu = ArithUnsigned(e.a, a, e.b, b);
+            if (op == TK.Slash() || op == TK.Percent()) {
+                // the C host's division guard: a zero divisor and the
+                // MIN / -1 combination divide by 1 instead of trapping
+                bs = GuardDivisor(a, b, op, e, aw, awu);
+            }
+            L("  " + t + " = " + ar + " i64 " + a.op + ", " + bs);
+            // >>>（逻辑右移）按声明宽度做**真**位移（宿主 irgen_expr.c：int
+            // 操作数 trunc i32 → lshr i32 → zext，long 直接 lshr i64）——
+            // 不能用「lshr i64 再 WrapArith(32)」模拟：-16 >>> 2 的 64 位
+            // 逻辑值 0x3FFF…FC 截低 32 位是 0xFFFFFFFC，而真 32 位位移是
+            // 0x3FFFFFFC（1073741820）。>> / << 维持 ashr/shl + WrapArith
+            // （算术移位与符号扩回等价、shl 低 32 位不受高位进位影响）。
+            if (op == TK.GreaterGreaterGreater() && aw > 0 && aw < 64) {
+                string a32 = NT();
+                L("  " + a32 + " = trunc i64 " + a.op + " to i32");
+                string c32 = NT();
+                L("  " + c32 + " = trunc i64 " + bs + " to i32");
+                string s32 = NT();
+                L("  " + s32 + " = lshr i32 " + a32 + ", " + c32);
+                string z64 = NT();
+                L("  " + z64 + " = zext i32 " + s32 + " to i64");
+                return ArithResult(z64, aw, uns);
+            }
+            if (aw < 64) { t = WrapArith(t, aw, awu); }
+            return ArithResult(t, aw, uns);
+        }
+        string cp = CmpOp(op);
+        if (uns) { cp = UCmpOp(op); }
+        if (cp != "") {
+            // lexicographic ordering for strings (matches ==/!= strcmp handling)
+            if (IsStr(a.ty) && IsStr(b.ty)) {
+                string r = NT();
+                L("  " + r + " = call i32 @__zan_strcmp0(i8* " + a.op + ", i8* " + b.op + ")");
+                string cs = NT();
+                L("  " + cs + " = icmp " + cp + " i32 " + r + ", 0");
+                string zs = NT();
+                L("  " + zs + " = zext i1 " + cs + " to i64");
+                return new ExprVal(zs, MkType("bool"));
+            }
+            string c = NT();
+            L("  " + c + " = icmp " + cp + " i64 " + a.op + ", " + b.op);
+            string z = NT();
+            L("  " + z + " = zext i1 " + c + " to i64");
+            return new ExprVal(z, MkType("bool"));
+        }
+        return new ExprVal("0", MkType("int"));
+    }
+
+    // Map an operator token to the mangled method name (must match parser).
+}

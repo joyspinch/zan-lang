@@ -1,0 +1,702 @@
+using System;
+using System.Collections.Generic;
+namespace Zan;
+
+partial class Irgen {
+    // literal format string: expand {N} placeholders through a StringBuilder
+    ExprVal EmitStrFormat(Node e) {
+        string sb = NT();
+        L("  " + sb + " = call i8* @zsb_new()");
+        string f = e.kids[0].sval;
+        string seg = "";
+        int i = 0;
+        while (i < f.Length) {
+            bool subst = false;
+            if (f[i] == 123) {
+                int j = i + 1;
+                int idx = 0;
+                bool has = false;
+                while (j < f.Length && f[j] >= 48 && f[j] <= 57) { idx = idx * 10 + (f[j] - 48); j = j + 1; has = true; }
+                if (has && j < f.Length && f[j] == 125 && idx + 1 < e.kids.Count) {
+                    if (seg != "") {
+                        ExprVal sl = GenStr(seg);
+                        L("  call void @zsb_append(i8* " + sb + ", i8* " + sl.op + ")");
+                        seg = "";
+                    }
+                    ExprVal av = GenExpr(e.kids[idx + 1]);
+                    string s = ToCStr(av);
+                    L("  call void @zsb_append(i8* " + sb + ", i8* " + s + ")");
+                    i = j + 1;
+                    subst = true;
+                }
+            }
+            if (!subst) { seg = seg + f.Substring(i, 1); i = i + 1; }
+        }
+        if (seg != "") {
+            ExprVal sl = GenStr(seg);
+            L("  call void @zsb_append(i8* " + sb + ", i8* " + sl.op + ")");
+        }
+        string r = NT();
+        L("  " + r + " = call i8* @zsb_tostring(i8* " + sb + ")");
+        L("  call void @zrelease(i8* " + sb + ")");
+        return new ExprVal(r, MkType("string"));
+    }
+
+    // A string argument that the program may spell as a char: the C host
+    // accepts a char wherever it accepts a string (is_string_like_expr in
+    // src/compiler/irgen_call.c) and turns it into the one-character text.
+    // The self-host's string runtime works on managed strings, so the char
+    // is packed the same way -- and the temporary is released with the
+    // statement.
+    ExprVal StrArg(Node e) {
+        ExprVal a = GenExpr(e);
+        if (a.ty != null && a.ty.sval == "char" && a.ty.ival == 0) {
+            string s = CharToStr(a.op);
+            AddTemp(s, MkType("string"));
+            return new ExprVal(s, MkType("string"));
+        }
+        return a;
+    }
+
+    // the string-method intrinsics EmitStrMethod lowers: a string receiver
+    // with one of these (name, argc) shapes takes the builtin path before
+    // extension resolution (mirrors the C host's call-pipeline order)
+    bool HandlesStrMethod(string name, int argc) {
+        if (name == "Substring") { return argc >= 1; }
+        if (name == "Equals" || name == "Contains" || name == "LastIndexOf"
+                || name == "StartsWith" || name == "EndsWith") { return argc == 1; }
+        if (name == "IndexOf" || name == "Split") { return argc == 1 || argc == 2; }
+        if (name == "Replace") { return argc == 2; }
+        if (name == "Trim" || name == "ToUpper" || name == "ToLower" || name == "ToString") { return argc == 0; }
+        return false;
+    }
+
+    ExprVal EmitStrMethod(ExprVal recv, string name, Node e) {
+        if (name == "Substring") {
+            ExprVal start = GenExpr(e.kids[0]);
+            string lenOp;
+            if (e.kids.Count >= 2) { ExprVal l = GenExpr(e.kids[1]); lenOp = l.op; }
+            else {
+                string sl = StrLen(recv.op);
+                string rem = NT(); L("  " + rem + " = sub i64 " + sl + ", " + start.op);
+                lenOp = rem;
+            }
+            string buf = NT(); L("  " + buf + " = call i8* @zstr_new(i64 " + lenOp + ")");
+            string srcp = NT(); L("  " + srcp + " = getelementptr i8, i8* " + recv.op + ", i64 " + start.op);
+            L("  call i8* @memcpy(i8* " + buf + ", i8* " + srcp + ", i64 " + lenOp + ")");
+            return new ExprVal(buf, MkType("string"));
+        }
+        if (name == "Equals" && e.kids.Count == 1) {
+            // the C host compares the *exact* lengths and bytes
+            // (irgen_call.c -> __zan_str_ocmp), not the C-visible prefix;
+            // a null receiver converges to "" (D20, emit_str_nonnull)
+            ExprVal o = StrArg(e.kids[0]);
+            string rn = NT();
+            L("  " + rn + " = icmp eq i8* " + recv.op + ", null");
+            ExprVal ez = GenStr("");
+            string rs = NT();
+            L("  " + rs + " = select i1 " + rn + ", i8* " + ez.op + ", i8* " + recv.op);
+            if (!ExternSeen("memcmp")) { externDecls.Add("memcmp"); H("declare i32 @memcmp(i8*, i8*, i64)"); }
+            string la = StrLen(rs);
+            string lb = StrLen(o.op);
+            string lt = NT();
+            L("  " + lt + " = icmp slt i64 " + la + ", " + lb);
+            string m = NT();
+            L("  " + m + " = select i1 " + lt + ", i64 " + la + ", i64 " + lb);
+            string mc = NT();
+            L("  " + mc + " = call i32 @memcmp(i8* " + rs + ", i8* " + o.op + ", i64 " + m + ")");
+            string mz = NT();
+            L("  " + mz + " = icmp eq i32 " + mc + ", 0");
+            string lz = NT();
+            L("  " + lz + " = icmp eq i64 " + la + ", " + lb);
+            string both = NT();
+            L("  " + both + " = and i1 " + mz + ", " + lz);
+            string z = NT();
+            L("  " + z + " = zext i1 " + both + " to i64");
+            return new ExprVal(z, MkType("bool"));
+        }
+        if (name == "Contains" && e.kids.Count == 1) {
+            ExprVal sub = StrArg(e.kids[0]);
+            DeclStrstr();
+            string hit = NT(); L("  " + hit + " = call i8* @strstr(i8* " + recv.op + ", i8* " + sub.op + ")");
+            string r = NT(); L("  " + r + " = icmp ne i8* " + hit + ", null");
+            string z = NT(); L("  " + z + " = zext i1 " + r + " to i64");
+            return new ExprVal(z, MkType("bool"));
+        }
+        if (name == "IndexOf" && (e.kids.Count == 1 || e.kids.Count == 2)) {
+            ExprVal sub = StrArg(e.kids[0]);
+            string start = "0";
+            if (e.kids.Count == 2) {
+                ExprVal s = GenExpr(e.kids[1]);
+                start = s.op;
+            }
+            DeclStrstr();
+            string srcp = recv.op;
+            if (start != "0") {
+                string off = NT();
+                L("  " + off + " = getelementptr i8, i8* " + recv.op + ", i64 " + start);
+                srcp = off;
+            }
+            string hit = NT(); L("  " + hit + " = call i8* @strstr(i8* " + srcp + ", i8* " + sub.op + ")");
+            string hi = NT(); L("  " + hi + " = ptrtoint i8* " + hit + " to i64");
+            string si = NT(); L("  " + si + " = ptrtoint i8* " + recv.op + " to i64");
+            string diff = NT(); L("  " + diff + " = sub i64 " + hi + ", " + si);
+            string miss = NT(); L("  " + miss + " = icmp eq i8* " + hit + ", null");
+            string r = NT(); L("  " + r + " = select i1 " + miss + ", i64 -1, i64 " + diff);
+            return new ExprVal(r, MkType("int"));
+        }
+        if (name == "LastIndexOf" && e.kids.Count == 1) {
+            ExprVal sub = StrArg(e.kids[0]);
+            usesStrOps = true;
+            string r = NT(); L("  " + r + " = call i64 @zstr_lastidx(i8* " + recv.op + ", i8* " + sub.op + ")");
+            return new ExprVal(r, MkType("int"));
+        }
+        if ((name == "StartsWith" || name == "EndsWith") && e.kids.Count == 1) {
+            ExprVal p = StrArg(e.kids[0]);
+            DeclStrncmp();
+            string lp = StrCLen(p.op);
+            string z = NT();
+            if (name == "StartsWith") {
+                string cmp = NT(); L("  " + cmp + " = call i32 @strncmp(i8* " + recv.op + ", i8* " + p.op + ", i64 " + lp + ")");
+                string r = NT(); L("  " + r + " = icmp eq i32 " + cmp + ", 0");
+                L("  " + z + " = zext i1 " + r + " to i64");
+            } else {
+                string ls = StrCLen(recv.op);
+                string off = NT(); L("  " + off + " = sub i64 " + ls + ", " + lp);
+                string fits = NT(); L("  " + fits + " = icmp sge i64 " + off + ", 0");
+                string offc = NT(); L("  " + offc + " = select i1 " + fits + ", i64 " + off + ", i64 0");
+                string tail = NT(); L("  " + tail + " = getelementptr i8, i8* " + recv.op + ", i64 " + offc);
+                string cmp = NT(); L("  " + cmp + " = call i32 @strcmp(i8* " + tail + ", i8* " + p.op + ")");
+                string eq = NT(); L("  " + eq + " = icmp eq i32 " + cmp + ", 0");
+                string r = NT(); L("  " + r + " = and i1 " + fits + ", " + eq);
+                L("  " + z + " = zext i1 " + r + " to i64");
+            }
+            return new ExprVal(z, MkType("bool"));
+        }
+        if (name == "Replace" && e.kids.Count == 2) {
+            ExprVal from = StrArg(e.kids[0]);
+            ExprVal to = StrArg(e.kids[1]);
+            usesStrOps = true;
+            string r = NT(); L("  " + r + " = call i8* @zstr_replace(i8* " + recv.op + ", i8* " + from.op + ", i8* " + to.op + ")");
+            return new ExprVal(r, MkType("string"));
+        }
+        if (name == "Trim" && e.kids.Count == 0) {
+            usesStrOps = true;
+            string r = NT(); L("  " + r + " = call i8* @zstr_trim(i8* " + recv.op + ")");
+            return new ExprVal(r, MkType("string"));
+        }
+        if ((name == "ToUpper" || name == "ToLower") && e.kids.Count == 0) {
+            usesStrOps = true;
+            string up = "1"; if (name == "ToLower") { up = "0"; }
+            string r = NT(); L("  " + r + " = call i8* @zstr_case(i8* " + recv.op + ", i64 " + up + ")");
+            return new ExprVal(r, MkType("string"));
+        }
+        if (name == "Split" && (e.kids.Count == 1 || e.kids.Count == 2)) {
+            ExprVal sep = StrArg(e.kids[0]);
+            string opt = "0";
+            if (e.kids.Count == 2) {
+                ExprVal ov = GenExpr(e.kids[1]);
+                opt = Coerce(ov, "i64");
+            }
+            usesStrOps = true;
+            string r = NT(); L("  " + r + " = call i8* @zstr_split(i8* " + recv.op + ", i8* " + sep.op + ", i64 " + opt + ")");
+            Node lt = MkType("List");
+            lt.kids.Add(MkType("string"));
+            AddTemp(r, lt);
+            return new ExprVal(r, lt);
+        }
+        if (name == "ToString" && e.kids.Count == 0) {
+            // owned copy of the receiver (C-visible bytes, like the C host)
+            string n = StrCLen(recv.op);
+            string buf = NT(); L("  " + buf + " = call i8* @zstr_new(i64 " + n + ")");
+            L("  call i8* @memcpy(i8* " + buf + ", i8* " + recv.op + ", i64 " + n + ")");
+            return new ExprVal(buf, MkType("string"));
+        }
+        // An unknown string method must not degrade into "the receiver
+        // itself": the program would silently get wrong answers.
+        diags.Error("string method '" + name + "' is not supported by the self-hosted compiler yet", e.line, e.col);
+        return recv;
+    }
+
+    void DeclStrstr() {
+        if (!ExternSeen("strstr")) { externDecls.Add("strstr"); H("declare i8* @strstr(i8*, i8*)"); }
+    }
+    void DeclStrncmp() {
+        if (!ExternSeen("strncmp")) { externDecls.Add("strncmp"); H("declare i32 @strncmp(i8*, i8*, i64)"); }
+    }
+
+    ExprVal EmitListMethod(ExprVal recv, string name, Node e) {
+        if (name == "Add") {
+            ExprVal v = GenExpr(e.kids[0]);
+            string sv = StructElemSlot(v, ListElem(recv.ty));
+            L("  call void @zlist_add(i8* " + recv.op + ", i64 " + sv + ")");
+            return new ExprVal("0", MkType("void"));
+        }
+        if (name == "get_Count" || name == "Count") {
+            string t = NT();
+            L("  " + t + " = call i64 @zlist_count(i8* " + recv.op + ")");
+            return new ExprVal(t, MkType("int"));
+        }
+        if (name == "RemoveAt") {
+            ExprVal idx = GenExpr(e.kids[0]);
+            L("  call void @zlist_removeat(i8* " + recv.op + ", i64 " + idx.op + ")");
+            return new ExprVal("0", MkType("void"));
+        }
+        if (name == "Clear") {
+            L("  call void @zlist_clear(i8* " + recv.op + ")");
+            return new ExprVal("0", MkType("void"));
+        }
+        if (name == "Reverse" && e.kids.Count == 0) {
+            L("  call void @zlist_reverse(i8* " + recv.op + ")");
+            return new ExprVal("0", MkType("void"));
+        }
+        if (name == "ToArray" && e.kids.Count == 0) {
+            // List<T>.ToArray(): copy the slots into a fresh array. The
+            // self-hosted list keeps one element per 8-byte slot; a byte
+            // array takes one byte per element, so the slots are narrowed
+            // on the way in.
+            string cnt = NT();
+            L("  " + cnt + " = call i64 @zlist_count(i8* " + recv.op + ")");
+            Node elemTy = ListElem(recv.ty);
+            int esz = ArrElemSize(elemTy);
+            string bytes = NT();
+            if (esz == 1) { L("  " + bytes + " = add i64 " + cnt + ", 0"); }
+            else { L("  " + bytes + " = mul i64 " + cnt + ", 8"); }
+            string tot = NT();
+            L("  " + tot + " = add i64 " + bytes + ", 16");
+            string raw = NT();
+            L("  " + raw + " = call i8* @calloc(i64 1, i64 " + tot + ")");
+            string hdr = NT();
+            L("  " + hdr + " = bitcast i8* " + raw + " to i64*");
+            string lenp = NT();
+            L("  " + lenp + " = getelementptr i64, i64* " + hdr + ", i64 1");
+            L("  store i64 " + cnt + ", i64* " + lenp);
+            string arr = NT();
+            L("  " + arr + " = getelementptr i64, i64* " + hdr + ", i64 2");
+            string idx = NT();
+            EA(idx, "i64");
+            L("  store i64 0, i64* " + idx);
+            int lc = NL(); int lb = NL(); int lend = NL();
+            L("  br label %L" + lc);
+            Label(lc);
+            string ci = NT();
+            L("  " + ci + " = load i64, i64* " + idx);
+            string c = NT();
+            L("  " + c + " = icmp uge i64 " + ci + ", " + cnt);
+            L("  br i1 " + c + ", label %L" + lend + ", label %L" + lb);
+            Label(lb);
+            string slot = NT();
+            L("  " + slot + " = call i64 @zlist_get(i8* " + recv.op + ", i64 " + ci + ")");
+            if (esz == 1) {
+                string ab = NT();
+                L("  " + ab + " = bitcast i64* " + arr + " to i8*");
+                string ap = NT();
+                L("  " + ap + " = getelementptr i8, i8* " + ab + ", i64 " + ci);
+                ArrElemStore(ap, 1, slot);
+            } else {
+                string ap = NT();
+                L("  " + ap + " = getelementptr i64, i64* " + arr + ", i64 " + ci);
+                L("  store i64 " + slot + ", i64* " + ap);
+            }
+            string ni = NT();
+            L("  " + ni + " = add i64 " + ci + ", 1");
+            L("  store i64 " + ni + ", i64* " + idx);
+            L("  br label %L" + lc);
+            Label(lend);
+            Node et = ListElem(recv.ty);
+            Node at = new Node(AK.TypeRef());
+            at.sval = et.sval;
+            at.ival = 1;
+            at.kids = et.kids;
+            return new ExprVal(arr, at);
+        }
+        if (name == "AddRange" && e.kids.Count == 1) {
+            ExprVal other = GenExpr(e.kids[0]);
+            L("  call void @zlist_addrange(i8* " + recv.op + ", i8* " + other.op + ")");
+            return new ExprVal("0", MkType("void"));
+        }
+        if (name == "Reserve" && e.kids.Count == 1) {
+            ExprVal n = GenExpr(e.kids[0]);
+            L("  call void @zlist_reserve(i8* " + recv.op + ", i64 " + n.op + ")");
+            // the C host returns int 0 from List<T>.Reserve
+            return new ExprVal("0", MkType("int"));
+        }
+        if (name == "Insert" && e.kids.Count == 2) {
+            ExprVal idx = GenExpr(e.kids[0]);
+            ExprVal v = GenExpr(e.kids[1]);
+            string sv = StructElemSlot(v, ListElem(recv.ty));
+            L("  call void @zlist_insert(i8* " + recv.op + ", i64 " + idx.op + ", i64 " + sv + ")");
+            return new ExprVal("0", MkType("void"));
+        }
+        if (name == "IndexOf" && e.kids.Count == 1) {
+            ExprVal search = GenExpr(e.kids[0]);
+            return EmitListIndexOf(recv, ListElem(recv.ty), search, false);
+        }
+        if (name == "Contains" && e.kids.Count == 1) {
+            ExprVal search = GenExpr(e.kids[0]);
+            return EmitListIndexOf(recv, ListElem(recv.ty), search, true);
+        }
+        if (name == "LastIndexOf" && e.kids.Count == 1) {
+            ExprVal search = GenExpr(e.kids[0]);
+            return EmitListLastIndexOf(recv, ListElem(recv.ty), search);
+        }
+        // an unknown List method must not compile into a call that does
+        // nothing: the program would silently get wrong answers
+        diags.Error("List method '" + name + "' is not supported by the self-hosted compiler yet", e.line, e.col);
+        return new ExprVal("0", MkType("int"));
+    }
+
+    // List<T>.IndexOf(value) / Contains(value): walk the list and compare
+    // each element with the typed equality -- an operator== when the element
+    // type defines one, a field-wise compare for structs, a content compare
+    // for strings, identity for classes.
+    ExprVal EmitListIndexOf(ExprVal recv, Node elemTy, ExprVal search, bool asContains) {
+        string res = NT();
+        EA(res, "i64");
+        L("  store i64 -1, i64* " + res);
+        string idx = NT();
+        EA(idx, "i64");
+        L("  store i64 0, i64* " + idx);
+        int lc = NL(); int lb = NL(); int lfound = NL(); int lstep = NL(); int lend = NL();
+        L("  br label %L" + lc);
+        Label(lc);
+        string ci = NT();
+        L("  " + ci + " = load i64, i64* " + idx);
+        string cnt = NT();
+        L("  " + cnt + " = call i64 @zlist_count(i8* " + recv.op + ")");
+        string c = NT();
+        L("  " + c + " = icmp uge i64 " + ci + ", " + cnt);
+        L("  br i1 " + c + ", label %L" + lend + ", label %L" + lb);
+        Label(lb);
+        string raw = NT();
+        L("  " + raw + " = call i64 @zlist_get(i8* " + recv.op + ", i64 " + ci + ")");
+        ExprVal ev = FromSlot(raw, elemTy);
+        string eq = EmitElemEq(ev, search, elemTy);
+        L("  br i1 " + eq + ", label %L" + lfound + ", label %L" + lstep);
+        Label(lstep);
+        string ni = NT();
+        L("  " + ni + " = add i64 " + ci + ", 1");
+        L("  store i64 " + ni + ", i64* " + idx);
+        L("  br label %L" + lc);
+        Label(lfound);
+        L("  store i64 " + ci + ", i64* " + res);
+        L("  br label %L" + lend);
+        Label(lend);
+        string r = NT();
+        L("  " + r + " = load i64, i64* " + res);
+        if (asContains) {
+            string hit = NT();
+            L("  " + hit + " = icmp ne i64 " + r + ", -1");
+            string z = NT();
+            L("  " + z + " = zext i1 " + hit + " to i64");
+            return new ExprVal(z, MkType("bool"));
+        }
+        return new ExprVal(r, MkType("int"));
+    }
+
+    // List<T>.LastIndexOf(value): the same walk as IndexOf, but from the end
+    // of the list backwards -- the last match wins.
+    ExprVal EmitListLastIndexOf(ExprVal recv, Node elemTy, ExprVal search) {
+        string res = NT();
+        EA(res, "i64");
+        L("  store i64 -1, i64* " + res);
+        string idx = NT();
+        EA(idx, "i64");
+        string cnt = NT();
+        L("  " + cnt + " = call i64 @zlist_count(i8* " + recv.op + ")");
+        string ci = NT();
+        L("  " + ci + " = sub i64 " + cnt + ", 1");
+        L("  store i64 " + ci + ", i64* " + idx);
+        int lc = NL(); int lb = NL(); int lfound = NL(); int lstep = NL(); int lend = NL();
+        L("  br label %L" + lc);
+        Label(lc);
+        string i0 = NT();
+        L("  " + i0 + " = load i64, i64* " + idx);
+        string c = NT();
+        L("  " + c + " = icmp slt i64 " + i0 + ", 0");
+        L("  br i1 " + c + ", label %L" + lend + ", label %L" + lb);
+        Label(lb);
+        string raw = NT();
+        L("  " + raw + " = call i64 @zlist_get(i8* " + recv.op + ", i64 " + i0 + ")");
+        ExprVal ev = FromSlot(raw, elemTy);
+        string eq = EmitElemEq(ev, search, elemTy);
+        L("  br i1 " + eq + ", label %L" + lfound + ", label %L" + lstep);
+        Label(lstep);
+        string ni = NT();
+        L("  " + ni + " = sub i64 " + i0 + ", 1");
+        L("  store i64 " + ni + ", i64* " + idx);
+        L("  br label %L" + lc);
+        Label(lfound);
+        L("  store i64 " + i0 + ", i64* " + res);
+        L("  br label %L" + lend);
+        Label(lend);
+        string r = NT();
+        L("  " + r + " = load i64, i64* " + res);
+        return new ExprVal(r, MkType("int"));
+    }
+
+    // typed equality of two list elements; returns an i1
+    string EmitElemEq(ExprVal a, ExprVal b, Node elemTy) {        if (elemTy != null) {
+            Node ca = ClassOf(elemTy);
+            if (ca != null) {
+                Node m = binder.FindMethod(ca, "op_eq");
+                if (m != null) {
+                    ExprVal r = TryOpOverload(TK.EqEq(), a, b, null, null);
+                    if (r != null) {
+                        string c = NT();
+                        L("  " + c + " = icmp ne i64 " + r.op + ", 0");
+                        return c;
+                    }
+                }
+                if (ca.kind == AK.StructDecl()) {
+                    return EmitStructEq(a, b, elemTy);
+                }
+                // a class without operator== compares by identity
+                string c = NT();
+                L("  " + c + " = icmp eq " + MapType(elemTy) + " " + a.op + ", " + b.op);
+                return c;
+            }
+            if (IsStr(elemTy)) {
+                string r = NT();
+                L("  " + r + " = call i32 @__zan_strcmp0(i8* " + a.op + ", i8* " + b.op + ")");
+                string c = NT();
+                L("  " + c + " = icmp eq i32 " + r + ", 0");
+                return c;
+            }
+            if (IsDbl(elemTy)) {
+                string c = NT();
+                L("  " + c + " = fcmp oeq double " + a.op + ", " + b.op);
+                return c;
+            }
+        }
+        // raw slot compare (int, long, bool, char, enum, ...)
+        string c = NT();
+        L("  " + c + " = icmp eq i64 " + a.op + ", " + b.op);
+        return c;
+    }
+
+    // struct equality without an operator==: compare the fields one by one
+    string EmitStructEq(ExprVal a, ExprVal b, Node elemTy) {
+        Node cls = ClassOf(elemTy);
+        List<string> names = new List<string>();
+        List<Node> types = new List<Node>();
+        CollectFields(cls, names, types);
+        string acc = "1";
+        int i = 0;
+        while (i < names.Count) {
+            ExprVal fa = LoadField(a.op, elemTy, names[i]);
+            ExprVal fb = LoadField(b.op, elemTy, names[i]);
+            string c = EmitElemEq(fa, fb, types[i]);
+            string na = NT();
+            L("  " + na + " = and i1 " + acc + ", " + c);
+            acc = na;
+            i = i + 1;
+        }
+        return acc;
+    }
+
+    // The declared key type of a dictionary (null when it is not known).
+    Node DictKeyTy(Node dictTy) {
+        if (dictTy != null && dictTy.kids.Count > 0) { return dictTy.kids[0]; }
+        return null;
+    }
+
+    // The dictionary's key kind, taken from the DECLARED key type: the C host
+    // compares string keys ordinally and every other key by identity
+    // (src/compiler/irgen_expr.c:3391 -- is_str is 1 only for a string key).
+    // A non-string key is an opaque 64-bit token, so `Dictionary<int,V>.Keys`
+    // hands back the int keys instead of their decimal image.
+    bool DictKeyIsStr(Node dictTy) {
+        Node kt = DictKeyTy(dictTy);
+        if (kt == null) { return true; }
+        return kt.sval == "string" && kt.ival == 0;
+    }
+
+    // The `is_str` flag the dict runtime calls take.
+    string DictKeyStrFlag(Node dictTy) {
+        if (DictKeyIsStr(dictTy)) { return "1"; }
+        return "0";
+    }
+
+    // The key operand of a dict call: a string key is the C string itself; any
+    // other key is an opaque token -- an integer key is its value narrowed to
+    // the key type's width, a reference key is its address.  The SLOT width
+    // decides: an erased type parameter (Dictionary<TKey,V>) rides an i64
+    // slot too, so the token conversion must not be limited to the named
+    // integer types.
+    string DictKeyOp(ExprVal k, Node dictTy) {
+        if (DictKeyIsStr(dictTy)) {
+            if (IsStr(k.ty)) { return k.op; }
+            return ToCStr(k);
+        }
+        if (k.ty != null && MapType(k.ty) == "i64") {
+            int w = HostIntWidth(k.ty);
+            string v = k.op;
+            if (w > 0 && w < 64) { v = WrapArith(v, w, IntUnsigned(k.ty)); }
+            string t = NT();
+            L("  " + t + " = inttoptr i64 " + v + " to i8*");
+            return t;
+        }
+        return k.op;
+    }
+
+    ExprVal EmitDictMethod(ExprVal recv, string name, Node e) {
+        if (name == "Add" || name == "set_Item") {
+            ExprVal key = GenExpr(e.kids[0]);
+            ExprVal val = GenExpr(e.kids[1]);
+            string sv = StructElemSlot(val, DictVal(recv.ty));
+            L("  call void @zdict_set(i8* " + recv.op + ", i8* " + DictKeyOp(key, recv.ty) + ", i64 " + sv + ", i64 " + DictKeyStrFlag(recv.ty) + ")");
+            return new ExprVal("0", MkType("void"));
+        }
+        if (name == "ContainsKey") {
+            ExprVal key = GenExpr(e.kids[0]);
+            string t = NT();
+            L("  " + t + " = call i64 @zdict_contains(i8* " + recv.op + ", i8* " + DictKeyOp(key, recv.ty) + ", i64 " + DictKeyStrFlag(recv.ty) + ")");
+            return new ExprVal(t, MkType("bool"));
+        }
+        if (name == "Remove") {
+            ExprVal key = GenExpr(e.kids[0]);
+            string t = NT();
+            L("  " + t + " = call i64 @zdict_remove(i8* " + recv.op + ", i8* " + DictKeyOp(key, recv.ty) + ", i64 " + DictKeyStrFlag(recv.ty) + ")");
+            return new ExprVal(t, MkType("bool"));
+        }
+        if (name == "get_Count" || name == "Count") {
+            string t = NT();
+            L("  " + t + " = call i64 @zdict_count(i8* " + recv.op + ")");
+            return new ExprVal(t, MkType("int"));
+        }
+        if (name == "TryGetValue" && e.kids.Count == 2) {
+            // Dictionary<K,V>.TryGetValue(key, out value): the value is written
+            // into the caller's slot and the call reports whether the key was
+            // there. The C host's emit (irgen_call.c) leaves the out slot
+            // UNTOUCHED on a miss -- so the store is behind the hit branch.
+            Node oarg = e.kids[1];
+            if (oarg == null || oarg.kind != AK.OutArg()) {
+                diags.Error("dictionary method 'TryGetValue' needs an out argument", e.line, e.col);
+                return new ExprVal("0", MkType("bool"));
+            }
+            ExprVal key = GenExpr(e.kids[0]);
+            string kstr = DictKeyOp(key, recv.ty);
+            Node vty = DictVal(recv.ty);
+            string kidx = NT();
+            L("  " + kidx + " = call i64 @zdict_index(i8* " + recv.op + ", i8* " + kstr + ", i64 " + DictKeyStrFlag(recv.ty) + ")");
+            string hit = NT();
+            L("  " + hit + " = icmp sge i64 " + kidx + ", 0");
+            string slot = NT();
+            L("  " + slot + " = call i64 @zdict_get(i8* " + recv.op + ", i8* " + kstr + ", i64 " + DictKeyStrFlag(recv.ty) + ")");
+            ExprVal val = FromSlot(slot, vty);
+            int lhit = NL(); int lmiss = NL(); int ldone = NL();
+            L("  br i1 " + hit + ", label %L" + lhit + ", label %L" + lmiss);
+            Label(lhit);
+            if (oarg.type != null) {
+                // `out T v`: a fresh local the caller sees afterwards
+                string addr = NewOutLocal(oarg);
+                string lt = MapType(oarg.type);
+                string sv = Coerce(val, lt);
+                L("  store " + lt + " " + sv + ", " + lt + "* " + addr);
+                EmitArcRetain(sv, oarg.type);
+            } else {
+                // `out place`: the value lands in the caller's own slot
+                StoreTo(oarg.a, val);
+            }
+            L("  br label %L" + ldone);
+            Label(lmiss);
+            L("  br label %L" + ldone);
+            Label(ldone);
+            string z = NT();
+            L("  " + z + " = zext i1 " + hit + " to i64");
+            return new ExprVal(z, MkType("bool"));
+        }
+        if (name == "Clear" && e.kids.Count == 0) {
+            L("  call void @zdict_clear(i8* " + recv.op + ")");
+            return new ExprVal("0", MkType("void"));
+        }
+        // An unknown dictionary method must not degrade into a constant 0:
+        // the program would silently get wrong answers.
+        diags.Error("dictionary method '" + name + "' is not supported by the self-hosted compiler yet", e.line, e.col);
+        return new ExprVal("0", MkType("int"));
+    }
+
+    ExprVal EmitSbMethod(ExprVal recv, string name, Node e) {
+        if (name == "AppendLine") {
+            if (e.kids.Count >= 1) {
+                ExprVal a = GenExpr(e.kids[0]);
+                if (a.ty != null && a.ty.sval == "StringView") {
+                    string pp = NT();
+                    L("  " + pp + " = getelementptr %StringView, %StringView* " + a.op + ", i32 0, i32 0");
+                    string p64 = NT();
+                    L("  " + p64 + " = load i64, i64* " + pp);
+                    string lp = NT();
+                    L("  " + lp + " = getelementptr %StringView, %StringView* " + a.op + ", i32 0, i32 1");
+                    string l32 = NT();
+                    L("  " + l32 + " = load i32, i32* " + lp);
+                    string l64 = NT();
+                    L("  " + l64 + " = zext i32 " + l32 + " to i64");
+                    string bptr = NT();
+                    L("  " + bptr + " = inttoptr i64 " + p64 + " to i8*");
+                    L("  call void @zsb_append_bytes(i8* " + recv.op + ", i8* " + bptr + ", i64 " + l64 + ")");
+                } else {
+                    string s = a.op;
+                    if (!IsStr(a.ty)) { s = ToCStr(a); }
+                    L("  call void @zsb_append(i8* " + recv.op + ", i8* " + s + ")");
+                }
+            }
+            ExprVal nl = GenStr("\n");
+            L("  call void @zsb_append(i8* " + recv.op + ", i8* " + nl.op + ")");
+            return recv;
+        }
+        if (name == "Append") {
+            ExprVal a = GenExpr(e.kids[0]);
+            if (a.ty != null && a.ty.sval == "StringView") {
+                string pp = NT();
+                L("  " + pp + " = getelementptr %StringView, %StringView* " + a.op + ", i32 0, i32 0");
+                string p64 = NT();
+                L("  " + p64 + " = load i64, i64* " + pp);
+                string lp = NT();
+                L("  " + lp + " = getelementptr %StringView, %StringView* " + a.op + ", i32 0, i32 1");
+                string l32 = NT();
+                L("  " + l32 + " = load i32, i32* " + lp);
+                string l64 = NT();
+                L("  " + l64 + " = zext i32 " + l32 + " to i64");
+                string bptr = NT();
+                L("  " + bptr + " = inttoptr i64 " + p64 + " to i8*");
+                L("  call void @zsb_append_bytes(i8* " + recv.op + ", i8* " + bptr + ", i64 " + l64 + ")");
+            } else {
+                string s = a.op;
+                if (!IsStr(a.ty)) { s = ToCStr(a); }
+                L("  call void @zsb_append(i8* " + recv.op + ", i8* " + s + ")");
+            }
+            return recv;
+        }
+        if (name == "ToString") {
+            string t = NT();
+            L("  " + t + " = call i8* @zsb_tostring(i8* " + recv.op + ")");
+            return new ExprVal(t, MkType("string"));
+        }
+        if (name == "Clear" && e.kids.Count == 0) {
+            // the builder keeps its buffer; only the count goes back to zero
+            string bp = NT();
+            L("  " + bp + " = bitcast i8* " + recv.op + " to %zsb*");
+            string cp = NT();
+            L("  " + cp + " = getelementptr %zsb, %zsb* " + bp + ", i32 0, i32 0");
+            L("  store i64 0, i64* " + cp);
+            return new ExprVal("0", MkType("void"));
+        }
+        if (name == "BufferPtr" && e.kids.Count == 0) {
+            string bp = NT();
+            L("  " + bp + " = bitcast i8* " + recv.op + " to %zsb*");
+            string dp = NT();
+            L("  " + dp + " = getelementptr %zsb, %zsb* " + bp + ", i32 0, i32 2");
+            string data = NT();
+            L("  " + data + " = load i8*, i8** " + dp);
+            string pval = NT();
+            L("  " + pval + " = ptrtoint i8* " + data + " to i64");
+            return new ExprVal(pval, MkType("nint"));
+        }
+        // An unknown string-builder method must not degrade into "the
+        // receiver itself": the program would silently get wrong answers.
+        diags.Error("string builder method '" + name + "' is not supported by the self-hosted compiler yet", e.line, e.col);
+        return recv;
+    }
+
+}

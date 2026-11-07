@@ -1,0 +1,839 @@
+using System;
+using System.Collections.Generic;
+namespace Zan;
+
+partial class Ngen {
+    // ---- rectangular multidim arrays (B8) ----
+    // one subscript's bounds check: `reg` holds the index, x1 the dim; a
+    // bad index reports the array guard and continues with 0 (gen0 parity)
+    void MdBoundNg(int reg, int line, int col) {
+        int bad = NL();
+        int cont = NL();
+        CmpRR(reg, 1);                                   // cmp reg, x1 (dim)
+        EmitBcond(10, bad);                              // b.ge bad
+        CmpRR(reg, 31);                                  // cmp reg, xzr
+        EmitBcond(11, bad);                              // b.lt bad
+        EmitB(cont);
+        Mark(bad);
+        XPushR(reg);                            // keep index
+        LoadSymRef("l_.str." + guardFileIdx, 0);
+        LoadImm(1, line);
+        LoadImm(2, col);
+        LoadSymRef("l_.str." + guardArrIdx, 3);
+        BLInternal("_zan_rt_guard_fail3");
+        XPopV(reg);                            // pop index
+        LoadImm(reg, 0);
+        Mark(cont);
+    }
+
+    // element-access prologue: the array lands in x19 (callee-saved in the
+    // C ABI, untouched by the internal helpers) and the subscripts are
+    // pushed in reverse so i0 pops first
+    void MdPrologueNg(Node idx) {
+        GenExpr(idx.a);                                  // arr -> x0
+        MovRR(19, 0);
+        int si = idx.kids.Count;
+        while (si >= 1) {
+            GenExpr(idx.kids[si - 1]);
+            XPushV0();
+            si = si - 1;
+        }
+        GenExpr(idx.b);                                  // i0 last (top)
+        XPushV0();
+    }
+
+    // row-major flat index: pops every subscript and folds
+    // ((i0*D1 + i1)*D2 + ...) into x9, each against its own dim
+    void MdFlatNg(Node idx, int nsub, int line, int col) {
+        XPopV(0);                                  // pop i0 -> x0
+        LdrU(1, 19, 0);                                  // dims[0]
+        MovRR(9, 0);
+        MdBoundNg(9, line, col);
+        int d = 1;
+        while (d < nsub) {
+            XPopV(0);                              // pop i_d -> x0
+            LdrU(1, 19, 8 * d);                          // dims[d]
+            MdBoundNg(0, line, col);
+            LdrU(1, 19, 8 * d);                          // (guard clobbers x1)
+            E4(0x9B017D29);                              // mul x9, x9, x1
+            E4(0x8B000129);                              // add x9, x9, x0
+            d = d + 1;
+        }
+    }
+
+    // element load with the reference compiler's packed layout and value
+    // extension rules: x1 = array data, x0 = index -> x0 = element.
+    // byte/bool zero-extend, sbyte/short sign-extend, ushort/uint/char
+    // zero-extend, int sign-extends; long/ulong/double load full words.
+    void EmitArrElemLoad(int esz, string el, int arrReg, int idxReg, int dstReg) {
+        if (tgt86 == 1) {
+            // 基址->r10、下标->r11(纯暂存),装进 dst 的家;dst 是槽位时
+            // 装进 r10(r10 同时是被寻址基址,装入即消费,无第三寄存器
+            // 需求,不碰任何 v 的家)。SIB = (s<<6)|0x1A(idx 域 011 经 REX.X
+            // 落 r11,base 域 010 经 REX.B 落 r10;写成 000 会落在 r8)。
+            XGetV(arrReg, 10);
+            XGetV(idxReg, 11);
+            int d = XMapReal(dstReg);
+            if (d < 0) {
+                // 槽位目的:先落 r10 再 XSetV;modrm reg=010(r10),REX.R=1
+                if (esz == 1) {
+                    if (el == "sbyte") { X3(0x4F, 0x0F, 0xBE); X2(0x14, 0x1A); }   // movsx r10, byte [r10+r11]
+                    else { X3(0x47, 0x0F, 0xB6); X2(0x14, 0x1A); }                 // movzx r10d, byte [r10+r11]
+                } else if (esz == 2) {
+                    if (el == "short") { X3(0x4F, 0x0F, 0xBF); X2(0x14, 0x5A); }   // movsx r10, word [r10+r11*2]
+                    else { X3(0x47, 0x0F, 0xB7); X2(0x14, 0x5A); }                 // movzx r10d, word [r10+r11*2]
+                } else if (esz == 4) {
+                    if (el == "float") {
+                        X3(0xF3, 0x43, 0x0F); X3(0x10, 0x04, 0x9A);                // movss xmm0, [r10+r11*4]
+                        X3(0xF3, 0x0F, 0x5A); X1(0xC0);                            // cvtss2sd xmm0, xmm0
+                        X3(0x66, 0x49, 0x0F); X2(0x7E, 0xC2);                      // movq r10, xmm0
+                    } else if (el == "int") { X3(0x4F, 0x63, 0x14); X1(0x9A); }    // movsxd r10, dword [r10+r11*4]
+                    else { X3(0x47, 0x8B, 0x14); X1(0x9A); }                       // mov r10d, [r10+r11*4] (零扩展)
+                } else { X3(0x4F, 0x8B, 0x14); X1(0xDA); }                         // mov r10, [r10+r11*8]
+                XSetV(dstReg, 10);
+                return;
+            }
+            int dm = 0x04 | ((d & 7) << 3);              // mod=00 reg=dst rm=SIB
+            int rx = (d >> 3) & 1;                       // REX.R:dst 编码 >=8
+            if (esz == 1) {
+                if (el == "sbyte") { X3(0x4B | (rx << 2), 0x0F, 0xBE); X2(dm, 0x1A); }   // movsx rd, byte [r10+r11]
+                else { X3(0x43 | (rx << 2), 0x0F, 0xB6); X2(dm, 0x1A); }                 // movzx rd, byte [r10+r11]
+            } else if (esz == 2) {
+                if (el == "short") { X3(0x4B | (rx << 2), 0x0F, 0xBF); X2(dm, 0x5A); }   // movsx rd, word [r10+r11*2]
+                else { X3(0x43 | (rx << 2), 0x0F, 0xB7); X2(dm, 0x5A); }                 // movzx rd, word [r10+r11*2]
+            } else if (esz == 4) {
+                if (el == "float") {
+                    X3(0xF3, 0x43, 0x0F); X3(0x10, 0x04, 0x9A);                    // movss xmm0, [r10+r11*4]
+                    X3(0xF3, 0x0F, 0x5A); X1(0xC0);                                // cvtss2sd xmm0, xmm0
+                    X3(0x66, 0x48 | rx, 0x0F); X2(0x7E, 0xC0 | (d & 7));           // movq rd, xmm0
+                } else if (el == "int") { X3(0x4B | (rx << 2), 0x63, dm); X1(0x9A); }      // movsxd rd, dword [r10+r11*4]
+                else { X3(0x43 | (rx << 2), 0x8B, dm); X1(0x9A); }                 // mov rd, [r10+r11*4] (零扩展)
+            } else { X3(0x4B | (rx << 2), 0x8B, dm); X1(0xDA); }                   // mov rd, [r10+r11*8]
+            return;
+        }
+        if (esz == 1) {
+            if (el == "sbyte") {
+                // 寄存器形式 bit21 必须=1:0x38C0… 缺位,编码落进 LDTRSB
+                // 立即数类(实际发成 ldtrsb w,[x,#imm]);byte 一条本来就对。
+                // 批37b:opc 位再修——0x38E0… 是 ldrsb **w**t(符号扩展止步
+                // 32,高 32 清零,负值读回 4294967289 一类);ldrsb xt 的
+                // opc=10。汇编器对质定案:0x38A07820=ldrsh x0、0x38E07820
+                // =ldrsh w0(otool -tvV 把 xt 形也显示成 w 寄存器,别信显示)。
+                E4(0x38A06800 | (idxReg << 16) | (arrReg << 5) | dstReg);  // ldrsb xd, [xn, xi]
+            } else {
+                E4(0x38606800 | (idxReg << 16) | (arrReg << 5) | dstReg);  // ldrb wd, [xn, xi]
+            }
+        } else if (esz == 2) {
+            if (el == "short") {
+                // bit21 + S=1 双修:0x78C0… 落 LDTRSH 类且无缩放,发成
+                // ldtrsh w0,[x1,#6](t7 探针当场抓获)。
+                // 批37b:0x78E0… 是 ldrsh wt(W 形)——负 short 数组读回
+                // 全错;xt 形 opc=10,汇编器 0x78A07820 铁证。
+                E4(0x78A07800 | (idxReg << 16) | (arrReg << 5) | dstReg);  // ldrsh xd, [xn, xi, lsl #1]
+            } else {
+                // ldrh 原本是合法编码但 S=0 无缩放,与 x86 的 [r+r*2] 分歧
+                E4(0x78607800 | (idxReg << 16) | (arrReg << 5) | dstReg);  // ldrh wd, [xn, xi, lsl #1]
+            }
+        } else if (esz == 4) {
+            if (el == "int") {
+                E4(0xB8A07800 | (idxReg << 16) | (arrReg << 5) | dstReg);  // ldrsw xd, [xn, xi, lsl #2]
+            } else if (el == "float") {
+                // widen on the way out: single bits in the packed slot
+                // (x16 is scratch: register 31 would be the zero register)
+                E4(0xB8607800 | (idxReg << 16) | (arrReg << 5) | 16);  // ldr w16, [xn, xi, lsl #2]
+                E4(0x1E27021F);                                        // fmov s31, w16
+                E4(0x1E22C3FF);                                        // fcvt d31, s31
+                E4(0x9E6603E0 | dstReg);                               // fmov xd, d31
+            } else {
+                E4(0xB8607800 | (idxReg << 16) | (arrReg << 5) | dstReg);  // ldr wd (uint/char bits)
+            }
+        } else {
+            E4(0xF8607800 | (idxReg << 16) | (arrReg << 5) | dstReg);      // ldr xd, [xn, xi, lsl #3]
+        }
+    }
+
+    // [arr base + idx * esz] = src (8-byte slots): the store twin of
+    // EmitArrElemLoad. x86 stages the SCALED ADDRESS into r10 (lea with
+    // r10+r11 SIB), then the value into r11 -- no third scratch register
+    // is ever needed and no live v-home is clobbered (batch 32, the
+    // dlg-intern face's copy loop was the first customer).
+    void EmitArrElemStore(int esz, string el, int arrReg, int idxReg, int srcReg) {
+        if (esz != 8 && esz != 4 && esz != 2 && esz != 1) { XFailClosed("unknown element store", curLine, curCol); return; }
+        if (tgt86 == 1) {
+            XGetV(arrReg, 10);
+            XGetV(idxReg, 11);
+            if (esz == 8) { X4(0xDA148D4F); }      // lea r10, [r10 + r11*8]
+            else if (esz == 4) { X4(0x9A148D4F); } // lea r10, [r10 + r11*4]
+            else if (esz == 2) { X4(0x5A148D4F); } // lea r10, [r10 + r11*2]
+            else { X4(0x1A148D4F); }               // lea r10, [r10 + r11] (rm=100+SIB:1A 是 SIB,modrm 恒 14)
+            XGetV(srcReg, 11);
+            // REX 必须 4D(W|R|B):49 的 reg=011 无 R 位解码成 rbx——值全
+            // 落 rbx,intern 槽保持零页,同 REX 族第五课(值在 reg 域 ≥r8
+            // 必须 R 位)。32 位形式 R 不带 W = 45。窄宽沿用 EmitSpanElemStore
+            // 批37b 校正过的 0x45(R|B) 族(esz2 加 0x66 前缀):r11b/r11w 取
+            // 值寄存器低 8/16 位——窄整在寄存器模型里恒为 64 位符号扩展,
+            // 截断到元素宽即存储语义(arm64 strb/strh 同理取 Ws 低位)。
+            if (esz == 8) { X3(0x4D, 0x89, 0x1A); }                // mov [r10], r11
+            else if (esz == 4) { X3(0x45, 0x89, 0x1A); }           // mov [r10], r11d
+            else if (esz == 2) { X3(0x66, 0x45, 0x89); X1(0x1A); } // mov [r10], r11w
+            else { X3(0x45, 0x88, 0x1A); }                         // mov [r10], r11b
+            return;
+        }
+        // strb/strh 寄存器形基座已用汇编器对质(批38:as 逐条复核,
+        // strb=0x38206800 / strh=0x78207800,与 5283 语句存储臂一致)
+        if (esz == 8) { E4(0xF8207800 | (idxReg << 16) | (arrReg << 5) | srcReg); }        // str xs, [xn, xi, lsl #3]
+        else if (esz == 4) { E4(0xB8207800 | (idxReg << 16) | (arrReg << 5) | srcReg); }   // str ws, [xn, xi, lsl #2]
+        else if (esz == 2) { E4(0x78207800 | (idxReg << 16) | (arrReg << 5) | srcReg); }   // strh ws, [xn, xi, lsl #1]
+        else { E4(0x38206800 | (idxReg << 16) | (arrReg << 5) | srcReg); }                 // strb ws, [xn, xi]
+    }
+
+    // byte[].ToStr() / ToStr(start, len) with the reference compiler's
+    // PACKED byte layout (1 byte per element, probe-verified): the snapshot
+    // host lowering walks 8-byte slots, so this call is claimed here and
+    // routed to the packed reader below instead of _zan_ext_arr_slice_str.
+    bool TryGenPackedSlice(Node e) {
+        if (e == null || e.kind != AK.Call() || e.a == null
+                || e.a.kind != AK.MemberAccess()) { return false; }
+        string name = e.a.sval;
+        Node r = e.a.a;
+        int n = e.kids.Count;
+        if (!((n == 0 || n == 2) && name == "ToStr" && ExtIsBytes(r)
+                && !UserDefinesClsMember(null, "ToStr"))) { return false; }
+        GenExpr(r);
+        ExtPush(0);                              // arr
+        if (n == 2) {
+            GenExpr(e.kids[0]);
+            ExtPush(0);
+            GenExpr(e.kids[1]);
+            ExtPush(0);
+        } else {
+            ExtCountOf(0, 9);                    // whole-array length
+            LoadImm(0, 0);                       // start
+            ExtPush(0);
+            ExtPush(9);                          // len (top -> x2)
+        }
+        // stack (top down): len, start, arr
+        ExtPop(2); ExtPop(1); ExtPop(0);
+        BLInternal("_zan_packed_slice_str");
+        return true;
+    }
+
+    // x0 = arr, x1 = start, x2 = len -> stamped string copy of the packed
+    // bytes at arr[start..start+len). Same clamps as the host lowering:
+    // start<0 -> 0, start>count -> count, len<0 -> 0, tail truncates.
+    void HostEmitPackedSlice() {
+        HostBegin("_zan_packed_slice_str");
+        HostSave(0, 0);
+        HostSave(1, 1);
+        HostSave(2, 2);
+        HostLoad(0, 0);
+        ExtCountOf(0, 9);                        // x9 = count
+        HostLoad(1, 1);
+        ExtCmpImm(1, 0);
+        int sPos = NL();
+        EmitBcond(10, sPos);
+        LoadImm(1, 0);
+        Mark(sPos);
+        HostCmp(1, 9);
+        int sIn = NL();
+        EmitBcond(9, sIn);
+        ExtMov(1, 9);
+        Mark(sIn);
+        HostLoad(2, 2);
+        ExtCmpImm(2, 0);
+        int lPos = NL();
+        EmitBcond(10, lPos);
+        LoadImm(2, 0);
+        Mark(lPos);
+        ExtSubRR(9, 9, 1);                       // avail = count - start
+        HostCmp(2, 9);
+        int lIn = NL();
+        EmitBcond(9, lIn);
+        ExtMov(2, 9);
+        Mark(lIn);
+        HostSave(1, 1);                          // clamped start
+        HostSave(2, 2);                          // clamped len
+        HostLoad(0, 2);
+        AddImm(0, 0, 1);
+        BLExtern("_malloc");
+        HostNonzero(0, "ext.pslice.malloc");
+        HostSave(0, 3);                          // out
+        ExtMov(10, 0);                           // out cursor
+        HostLoad(11, 2);                         // remaining
+        HostLoad(12, 0);                         // arr
+        HostLoad(13, 1);                         // start
+        AddRR(12, 12, 13);                       // packed: cursor = arr + start
+        int slDone = NL();
+        int slLoop = NL();
+        Mark(slLoop);
+        CbzReg(11, slDone);
+        ExtLdrbImm(14, 12, 0);                   // ldrb w14, [x12]
+        ExtStrbImm(14, 10, 0);
+        AddImm(10, 10, 1);
+        AddImm(12, 12, 1);                       // one byte per element
+        AddImm(11, 11, -1);
+        EmitB(slLoop);
+        Mark(slDone);
+        ExtStrbImm(31, 10, 0);                   // NUL
+        HostLoad(0, 3);
+        HostLoad(1, 2);
+        BLInternal("_zan_host_copy");            // stamps + NUL
+        HostSave(0, 4);
+        HostLoad(0, 3);
+        BLExtern("_free");
+        HostLoad(0, 4);
+        HostEnd();
+    }
+
+    Fld FieldOf(Node mem) {
+        // keep the receiver's instantiation args (Box<double>) -- ClassTyOf
+        // would strip them before the type-parameter substitution runs
+        string cls = StaticTyOf(mem.a);
+        if (cls == null) { return null; }
+        return FieldOfInst(cls, mem.sval);
+    }
+
+    // field of the instantiated class: the declared field type comes back
+    // with the receiver's concrete generic arguments substituted
+    // ("List<T>" on Box<double> reads as "List<double>")
+    Fld FieldOfInst(string cls, string name) {
+        int lt = cls.IndexOf("<");
+        string open = lt > 0 ? cls.Substring(0, lt) : cls;
+        List<string> args = lt > 0
+            ? SplitTyArgs(cls.Substring(lt + 1, cls.Length - lt - 2))
+            : new List<string>();
+        Cls c = FindClass(open);
+        if (c == null) { return null; }
+        // 批49:闭实例替换视图优先 —— 视图 Fld(替换 ty、off、expanded/
+        // expCls)是特化布局与形状的单一真源(箱分配/克隆/构造体一律按
+        // 视图落位);无视图(递归、基类/虚形状)回落开模板擦除槽
+        if (c.tps.Count > 0 && args.Count == c.tps.Count) {
+            Cls vc = StructInstViewOf(cls);
+            if (vc != null) {
+                Fld vf = FindField(vc, name);
+                if (vf != null) { return vf; }
+            }
+        }
+        Fld f = FindField(c, name);
+        if (f == null || c.tps.Count == 0 || args.Count == 0) { return f; }
+        Fld nf = new Fld(f.name, f.off, SubstTy(f.ty, c.tps, args), f.width, f.explicitLayout);
+        nf.expanded = f.expanded;
+        nf.expCls = f.expCls;                    // 批47:开模板字段恒为槽,随形状带过
+        return nf;
+    }
+
+    // field of the class being emitted (implicit `this` references). A
+    // specialization's `this` carries the instantiation (meth.sval2, e.g.
+    // "Pool<string>"), so a field declared with the class's type parameter
+    // ("T item") resolves through it: `item.ToString()` in Pair$int sees a
+    // string field, not an unresolvable "T"
+    Fld CurField(string name) {
+        // pre-emission inference sweeps (tuple sweep inside
+        // CollectClasses) run before any method body sets curCls
+        Cls c = curCls != null ? FindClass(curCls) : null;
+        Fld f = FindField(c, name);
+        if (f == null || c == null || c.tps.Count == 0) { return f; }
+        if (curMeth == null || curMeth.sval2 == null || curMeth.sval2 == "") { return f; }
+        return FieldOfInst(curMeth.sval2, name);
+    }
+
+    // does ty name a type parameter of the class being emitted? Open
+    // generic bodies emit before any instantiation fixes the parameter,
+    // so type params stand for erased words (delegate signatures, dict
+    // slots); concrete instantiations take the spec pipeline
+    bool IsTypeParamErasedNg(string ty) {
+        if (ty == null || curCls == null) { return false; }
+        Cls c = FindClass(curCls);
+        if (c == null) { return false; }
+        int i = 0;
+        while (i < c.tps.Count) { if (c.tps[i] == ty) { return true; } i = i + 1; }
+        return false;
+    }
+
+    // One RAW byte as a fresh 1-byte string (strings are byte sequences).
+    // Convert.ToString((char)b) is honest UTF-8 since the chrstr rewrite (b >= 0x80 renders multi-byte),
+    // but the escape decoder needs literal-POOL bytes, not an encoded code
+    // point: slice a fresh 1-byte string and overwrite the byte (string
+    // index-write truncates to u8, native_string_ops semantics).
+    string RawByteStr(int b) {
+        string t = Convert.ToString((char)b);
+        string s = t.Substring(0, 1);
+        s[0] = b;
+        return s;
+    }
+
+    // UTF-8 encoding of a code point as a byte string
+    string CharBytesNg(int cp) {
+        if (cp < 0x80) { return RawByteStr(cp); }
+        if (cp < 0x800) {
+            return RawByteStr(0xC0 + cp / 64) + RawByteStr(0x80 + cp % 64);
+        }
+        if (cp < 0x10000) {
+            return RawByteStr(0xE0 + cp / 4096) + RawByteStr(0x80 + (cp / 64) % 64)
+                + RawByteStr(0x80 + cp % 64);
+        }
+        return RawByteStr(0xF0 + cp / 262144) + RawByteStr(0x80 + (cp / 4096) % 64)
+            + RawByteStr(0x80 + (cp / 64) % 64) + RawByteStr(0x80 + cp % 64);
+    }
+
+    bool IsHexDigNg(int c) {
+        if (c >= 48 && c <= 57) { return true; }
+        if (c >= 97 && c <= 102) { return true; }
+        if (c >= 65 && c <= 70) { return true; }
+        return false;
+    }
+
+    int HexValNg(int c) {
+        if (c >= 48 && c <= 57) { return c - 48; }
+        if (c >= 97 && c <= 102) { return c - 97 + 10; }
+        return c - 65 + 10;
+    }
+
+    string DecodeLiteralNg(string raw) {
+        string result = "";
+        int i = 0;
+        while (i < raw.Length) {
+            string c = raw.Substring(i, 1);
+            if ((int)raw[i] == 92 && i + 1 < raw.Length) {
+                i = i + 1;
+                int next = (int)raw[i];
+                c = raw.Substring(i, 1);
+                if (next == 110) { c = "\n"; }
+                else if (next == 116) { c = "\t"; }
+                else if (next == 114) { c = "\r"; }
+                else if (next == 48) { c = "\0"; }
+                else if (next == 120 || next == 88) {
+                    // \xH[HH..]: greedy 1..4 hex digits (C# rule)
+                    int hv = 0;
+                    int cnt = 0;
+                    i = i + 1;
+                    while (cnt < 4 && i < raw.Length && IsHexDigNg((int)raw[i])) {
+                        hv = hv * 16 + HexValNg((int)raw[i]);
+                        i = i + 1;
+                        cnt = cnt + 1;
+                    }
+                    c = CharBytesNg(hv);
+                    result = result + c;
+                    continue;
+                }
+                else if (next == 117 || next == 85) {
+                    // \uHHHH / \UHHHHHHHH: fixed-width hex code point
+                    int width = next == 117 ? 4 : 8;
+                    int hv2 = 0;
+                    int cnt2 = 0;
+                    i = i + 1;
+                    while (cnt2 < width && i < raw.Length && IsHexDigNg((int)raw[i])) {
+                        hv2 = hv2 * 16 + HexValNg((int)raw[i]);
+                        i = i + 1;
+                        cnt2 = cnt2 + 1;
+                    }
+                    c = CharBytesNg(hv2);
+                    result = result + c;
+                    continue;
+                }
+            }
+            result = result + c;
+            i = i + 1;
+        }
+        return result;
+    }
+
+    // Whether a string-typed expression's NUL terminator is a reliable bound
+    // for the substring window check (mirrors the C host's
+    // expr_has_reliable_string_bounds): only string literals and plain local
+    // identifiers of string type qualify. Everything else -- string
+    // parameters, extern call results and raw FFI buffers kept in `string`
+    // slots (the stdlib slices `struct dirent*` byte by byte) -- may carry
+    // bytes past the first NUL or lack a length header entirely, so a
+    // header-backed window check would reject in-range reads; those slice
+    // raw.
+    bool IsBoundedStrExpr(Node e) {
+        if (e == null) { return false; }
+        if (e.kind == AK.StringLit()) { return true; }
+        if (e.kind == AK.Ident()) {
+            int li = LocalIdx(e.sval);
+            return li >= 0 && locTy[li] == "string" && locOpaq[li] == 0;
+        }
+        return false;
+    }
+
+    // does this expression evaluate to a string? (local type / field type /
+    // string literal / concatenation / method with a string return type)
+    bool IsStrExpr(Node e) {
+        if (e == null) { return false; }
+        if (e.kind == AK.AwaitExpr()) { return AsyncAwaitElemTyNg(e.a) == "string"; }
+        if (e.kind == AK.Call() && HostCallRetTy(e) == "string") { return true; }
+        if (e.kind == AK.StringLit()) { return true; }
+        // (string)e keeps riding the heap string bits; without this a
+        // cast-typed arg reaches WriteLine's int renderer and prints the
+        // pointer (the reference prints the text)
+        if (e.kind == AK.CastExpr() && e.type != null) {
+            return e.type.sval == "string" || TypeFullName(e.type) == "string";
+        }
+        if (e.kind == AK.Binary()) {
+            if (e.op == TK.QQ()) { return IsStrExpr(e.a) || IsStrExpr(e.b); }
+            return e.op == TK.Plus() && (IsStrExpr(e.a) || IsStrExpr(e.b));
+        }
+        // both arms strings: the conditional yields a heap string either way
+        if (e.kind == AK.Conditional()) { return IsStrExpr(e.b) && IsStrExpr(e.c); }
+        // every arm's result a heap string: the switch yields a string
+        // whichever arm wins (a missing discard falls to the null string)
+        if (e.kind == AK.SwitchExpr()) {
+            int i = 0;
+            while (i < e.kids.Count) {
+                if (!IsStrExpr(e.kids[i].b)) { return false; }
+                i = i + 1;
+            }
+            return e.kids.Count > 0;
+        }
+        if (e.kind == AK.MemberAccess()) {
+            string rmt = ReflMemberTy(e);
+            if (rmt != null) { return rmt == "string"; }
+            Fld f = FieldOf(e);
+            if (f != null && f.ty == "string") { return true; }
+            // class-qualified static field (`Registry.tag`); the receiver
+            // must NAME a class -- a plain local (`blog.score`) is an
+            // instance read even when another class declares a same-named
+            // static, and FindStaticTy's by-name fallback would otherwise
+            // mislabel it (kv.Key may still be an instance property read)
+            if (e.a != null && e.a.kind == AK.Ident() && LocalIdx(e.a.sval) < 0
+                    && FindClass(e.a.sval) != null) {
+                string st2 = FindStaticTy(QualifiedCls(e.a.sval, e.a.sval2), e.sval);
+                if (st2 != null) { return st2 == "string"; }
+            }
+            return PropGetterTy(e) == "string";
+        }
+        if (e.kind == AK.Ident()) {
+            int li = LocalIdx(e.sval);
+            if (li >= 0) { return locTy[li] == "string"; }
+            Fld f = CurField(e.sval);
+            if (f != null && f.ty == "string") { return true; }
+            return FindStaticTy(curCls, e.sval) == "string";
+        }
+        if (e.kind == AK.Index()) {
+            // instantiated generic containers carry string elements
+            // (List<string> read through Box<string>.values)
+            return ElemTyOf(e) == "string";
+        }
+        if (e.kind == AK.Call() && e.a != null) {
+            if (e.a.kind == AK.MemberAccess()) {
+                // string.Join(sep, List<string>) yields a heap string;
+                // Substring too; any other member call falls through to
+                // the user-method return type below
+                if (e.a.sval == "Substring") { return true; }
+                Node rj = e.a.a;
+                if (rj != null && rj.kind == AK.Ident() && rj.sval == "string" && e.a.sval == "Join") { return true; }
+                // Convert.ToString(x) yields a heap string
+                if (rj != null && rj.kind == AK.Ident() && rj.sval == "Convert"
+                        && e.a.sval == "ToString" && e.kids.Count == 1
+                        && !UserDefinesClsMember("Convert", "ToString")) { return true; }
+                // scalar x.ToString("spec"): the printf-render intrinsic
+                // (spliced from interpolation holes) yields a heap string
+                if (e.a.sval == "ToString" && e.kids.Count == 1
+                        && e.kids[0] != null && e.kids[0].kind == AK.StringLit()
+                        && ScalarToStringTy(e.a.a) != null) { return true; }
+            }
+            return CallRetTy(e) == "string";
+        }
+        // List<string> element reads yield heap strings (string indexing
+        // yields a char codepoint -- see IsCharExpr, not a string)
+        if (e.kind == AK.Index()) { return IsStrListOf(e.a); }
+        return false;
+    }
+
+    // does this expression denote a List<string> (element reads are strings)?
+    // does this expression evaluate to a List<double>/double[]? (element
+    // reads are double bit patterns either way)
+    bool IsDblListOf(Node e) {
+        if (e == null) { return false; }
+        if (e.kind == AK.Ident()) {
+            int li = LocalIdx(e.sval);
+            if (li < 0) { return false; }
+            return IsDblListTy(locTy[li]);
+        }
+        if (e.kind == AK.MemberAccess()) {
+            Fld f = FieldOf(e);
+            return f != null && IsDblListTy(f.ty);
+        }
+        if (e.kind == AK.NewExpr()) {
+            return e.type != null && IsDblListTy(TypeFullName(e.type) + (e.ival == 1 ? "[]" : ""));
+        }
+        return false;
+    }
+
+    bool IsDblListTy(string t) {
+        return t == "List<double>" || t == "List<float>" || t == "double[]" || t == "float[]";
+    }
+
+    bool IsStrListOf(Node e) {
+        if (e == null) { return false; }
+        if (e.kind == AK.Ident()) {
+            int li = LocalIdx(e.sval);
+            if (li >= 0) { return locTy[li] == "List<string>" || locTy[li] == "string[]"; }
+            Fld f = CurField(e.sval);
+            return f != null && (f.ty == "List<string>" || f.ty == "string[]");
+        }
+        if (e.kind == AK.NewExpr()) {
+            return e.type != null
+                && (TypeFullName(e.type) == "List<string>"
+                    || (e.ival == 1 && TypeFullName(e.type) + "[]" == "string[]"));
+        }
+        return false;
+    }
+
+    // does this expression evaluate to a double? (float literal / double
+    // typed local or field / double-returning method / double arithmetic)
+    // declared floating type: `float` rides the same f64 registers and
+    // conversions as `double` (ngen keeps one floating representation)
+    bool IsDblTy(string t) { return t == "double" || t == "float"; }
+
+    bool IsDblExpr(Node e) {
+        if (e == null) { return false; }
+        if (e.kind == AK.AwaitExpr()) {
+            string at2 = AsyncAwaitElemTyNg(e.a);
+            return at2 == "double" || at2 == "float";
+        }
+        if (e.kind == AK.Conditional()) { return IsDblExpr(e.b) || IsDblExpr(e.c); }
+        if (e.kind == AK.SwitchExpr()) {
+            int i = 0;
+            while (i < e.kids.Count) {
+                if (IsDblExpr(e.kids[i].b)) { return true; }
+                i = i + 1;
+            }
+            return false;
+        }
+        if (e.kind == AK.FloatLit()) { return true; }
+        if (e.kind == AK.Unary() && e.op == TK.Minus()) { return IsDblExpr(e.a); }
+        if (e.kind == AK.Binary()) {
+            int op = e.op;
+            if (op == TK.QQ()) {
+                // a coalesce over a floating payload yields a double
+                return IsDblExpr(e.b)
+                    || (IsNulTy(StaticTyOf(e.a)) && IsDblTy(NulPayOf(StaticTyOf(e.a))));
+            }
+            if (op == TK.Plus() || op == TK.Minus() || op == TK.Star() || op == TK.Slash()) {
+                return IsDblExpr(e.a) || IsDblExpr(e.b);
+            }
+            return false;
+        }
+        if (e.kind == AK.CastExpr() && e.type != null) { return IsDblTy(e.type.sval); }
+        if (e.kind == AK.Index()) {
+            if (ExprCls(e.a) == "Dict") { return IsDblTy(ElemTyOf(e)); }
+            if (IsArrExpr(e.a)) {
+                string at3 = ArrTyOf(e.a);
+                return at3 == "double[]" || at3 == "float[]";
+            }
+            // a List's own element type (ElemTyOf resolves chains:
+            // PolarStackTops' `tops[si][i]` reads List<List<double>>)
+            if (ExprCls(e.a) == "List") { return IsDblTy(ElemTyOf(e)); }
+            // Span<double>/Span<float> views carry their payload as FP bit
+            // patterns (EmitSpanElemLoad shapes them so). Without this the
+            // read types as integer and any double-domain consumer
+            // re-converts the bits with scvtf -- the shared_table
+            // float-column read corruption.
+            string sct = SpanContainerTy(e.a);
+            if (sct != null) { return IsDblTy(SpanTyElem(sct)); }
+            return IsDblListOf(e.a);
+        }
+        if (e.kind == AK.MemberAccess()) {
+            Fld f = FieldOf(e);
+            if (f != null) { return IsDblTy(f.ty); }
+            string pt = PropGetterTy(e);
+            if (pt != null && pt != "") { return IsDblTy(pt); }
+            // qualified static reads (Store.d, double.MaxValue) type
+            // through StaticTyOf
+            return IsDblTy(StaticTyOf(e));
+        }
+        if (e.kind == AK.Ident()) {
+            int li = LocalIdx(e.sval);
+            if (li >= 0) { return IsDblTy(locTy[li]); }
+            Fld f = CurField(e.sval);
+            if (f != null && IsDblTy(f.ty)) { return true; }
+            return IsDblTy(FindStaticTy(curCls, e.sval));
+        }
+        if (e.kind == AK.Call() && e.a != null) {
+            if (e.a.kind == AK.MemberAccess()) {
+                Node rm = e.a.a;
+                // Convert.ToDouble(x) is always double (gen0 lowerings)
+                if (rm != null && rm.kind == AK.Ident() && rm.sval == "Convert"
+                        && e.a.sval == "ToDouble" && e.kids.Count == 1) { return true; }
+                // double.Parse(s) is always double
+                if (rm != null && rm.kind == AK.Ident() && e.a.sval == "Parse"
+                        && e.kids.Count == 1
+                        && (rm.sval == "double" || rm.sval == "float"
+                            || rm.sval == "Double" || rm.sval == "Single")) { return true; }
+                // Math library calls: Sqrt/Floor/Ceiling/Pow/Sin/Cos/Tan/
+                // Log/Exp/Round are always double; Abs/Max/Min are double
+                // when any argument is
+                if (rm != null && rm.kind == AK.Ident() && rm.sval == "Math") {
+                    string mn = e.a.sval;
+                    if (mn == "Sqrt" || mn == "Floor" || mn == "Ceiling" || mn == "Pow"
+                            || mn == "Sin" || mn == "Cos" || mn == "Tan"
+                            || mn == "Log" || mn == "Exp" || mn == "Round"
+                            || mn == "Atan" || mn == "Asin" || mn == "Acos" || mn == "Atan2") { return true; }
+                    if (mn == "Abs" && e.kids.Count == 1) { return IsDblExpr(e.kids[0]); }
+                    if ((mn == "Max" || mn == "Min") && e.kids.Count == 2) {
+                        return IsDblExpr(e.kids[0]) || IsDblExpr(e.kids[1]);
+                    }
+                }
+            }
+            return IsDblTy(CallRetTy(e));
+        }
+        return false;
+    }
+
+    // does this expression evaluate to a char? (char literals, string
+    // indexing, char-typed locals/fields/statics -- rendering goes through
+    // zan_rt_chrstr)
+    bool IsCharExpr(Node e) {
+        if (e == null) { return false; }
+        if (e.kind == AK.AwaitExpr()) { return AsyncAwaitElemTyNg(e.a) == "char"; }
+        if (e.kind == AK.CharLit()) { return true; }
+        if (e.kind == AK.Index()) { return IsStrExpr(e.a); }
+        if (e.kind == AK.CastExpr() && e.type != null) { return e.type.sval == "char"; }
+        if (e.kind == AK.MemberAccess()) {
+            if (PrimitiveConstRecvTy(e) == "char") { return true; }
+            Fld f = FieldOf(e);
+            return f != null && f.ty == "char";
+        }
+        if (e.kind == AK.Ident()) {
+            int li = LocalIdx(e.sval);
+            if (li >= 0) { return locTy[li] == "char"; }
+            Fld f = CurField(e.sval);
+            if (f != null && f.ty == "char") { return true; }
+            return FindStaticTy(curCls, e.sval) == "char";
+        }
+        if (e.kind == AK.Call() && e.a != null) { return CallRetTy(e) == "char"; }
+        return false;
+    }
+
+    // does this expression evaluate to a ulong? (ulong typed locals,
+    // fields and method results; arithmetic carrying a ulong operand --
+    // ulong is the only integer type whose slot can set the high bit)
+    bool IsUlongExpr(Node e) {
+        if (e == null) { return false; }
+        if (e.kind == AK.AwaitExpr()) { return AsyncAwaitElemTyNg(e.a) == "ulong"; }
+        if (e.kind == AK.IntLit()) {
+            // a UL/lu-suffixed literal types as ulong (gen0's checker)
+            return e.suffix - (e.suffix / 4) * 4 == 3;
+        }
+        if (e.kind == AK.Binary()) {
+            int op = e.op;
+            if (op == TK.Plus() || op == TK.Minus() || op == TK.Star()
+                    || op == TK.Slash() || op == TK.Percent()
+                    || op == TK.LessLess() || op == TK.GreaterGreater()
+                    || op == TK.GreaterGreaterGreater()) {
+                return IsUlongExpr(e.a) || IsUlongExpr(e.b);
+            }
+            return false;
+        }
+        if (e.kind == AK.CastExpr() && e.type != null) {
+            return e.type.sval == "ulong" && !IsDblExpr(e.b);
+        }
+        if (e.kind == AK.MemberAccess()) {
+            if (PrimitiveConstRecvTy(e) == "ulong") { return true; }
+            Fld f = FieldOf(e);
+            return f != null && f.ty == "ulong";
+        }
+        if (e.kind == AK.Ident()) {
+            int li = LocalIdx(e.sval);
+            if (li >= 0) { return locTy[li] == "ulong"; }
+            Fld f = CurField(e.sval);
+            if (f != null && f.ty == "ulong") { return true; }
+            return FindStaticTy(curCls, e.sval) == "ulong";
+        }
+        if (e.kind == AK.Call() && e.a != null) {
+            return CallRetTy(e) == "ulong";
+        }
+        return false;
+    }
+
+    // 32-bit-ness of an integer expression: 1 = signed int, 2 = unsigned
+    // uint, 0 = long/ulong/unknown (leave 64-bit arithmetic alone). gen0
+    // wraps int/uint arithmetic at the declared width.
+    int Int32Kind(Node e) {
+        if (e == null) { return 0; }
+        if (e.kind == AK.IntLit()) {
+            // literals emit as 64-bit values in gen0: `a * 3` reconciles the
+            // i32 local up to i64 and never wraps, while `a + b` (two i32
+            // locals) wraps at the operation. Only a shift's declared-width
+            // count masking still treats a bare literal as int (ShiftMask32).
+            return 0;
+        }
+        if (e.kind == AK.Unary() && e.op == TK.Minus()) { return Int32Kind(e.a); }
+        if (e.kind == AK.Binary()) {
+            int op = e.op;
+            if (op == TK.Plus() || op == TK.Minus() || op == TK.Star()
+                    || op == TK.Slash() || op == TK.Percent()) {
+                int ka = Int32Kind(e.a);
+                int kb = Int32Kind(e.b);
+                if (ka == 2 && kb == 2) { return 2; }
+                if (ka == 1 && kb == 1) { return 1; }
+                return 0;
+            }
+            return 0;
+        }
+        if (e.kind == AK.CastExpr() && e.type != null) {
+            if (e.type.sval == "int") { return 1; }
+            if (e.type.sval == "uint") { return 2; }
+            return 0;
+        }
+        if (e.kind == AK.MemberAccess()) {
+            Fld f = FieldOf(e);
+            if (f != null && f.ty == "int") { return 1; }
+            if (f != null && f.ty == "uint") { return 2; }
+            return 0;
+        }
+        if (e.kind == AK.Ident()) {
+            // the local wins over a same-named field: PieLayout declares
+            // both an `int total` field and (in Of) a `long total` local,
+            // and letting the field answer made `total + s.Value(di)`
+            // classify as int32 and Wrap32 the 64-bit sum
+            int li = LocalIdx(e.sval);
+            if (li >= 0) {
+                if (locTy[li] == "int") { return 1; }
+                if (locTy[li] == "uint") { return 2; }
+                return 0;
+            }
+            string t = null;
+            Fld f = CurField(e.sval);
+            if (f != null) { t = f.ty; }
+            if (t == null) { t = FindStaticTy(curCls, e.sval); }
+            if (t == "int") { return 1; }
+            if (t == "uint") { return 2; }
+            return 0;
+        }
+        if (e.kind == AK.Call() && e.a != null) {
+            string rt = CallRetTy(e);
+            if (rt == "int") { return 1; }
+            if (rt == "uint") { return 2; }
+            return 0;
+        }
+        return 0;
+    }
+
+    // truncate x0 to its 32-bit slot width: signed re-extends the sign,
+    // unsigned fills with zeros (gen0's declared-width arithmetic)
+    void Wrap32(int kind) {
+        if (tgt86 == 1) {
+            if (kind == 1) { X3(0x48, 0x63, 0xFF); }     // movsxd rdi, edi
+            else { X2(0x89, 0xFF); }                     // mov edi, edi (zero-extends to 64)
+            return;
+        }
+        if (kind == 1) { Sxtw0(); }           // sbfm x0, x0, #0, #31
+        else if (kind == 2) { E4(0xD3407C00); }      // ubfm x0, x0, #0, #31
+    }
+
+    // does this shift's LEFT operand declare a <=32-bit width? gen0 masks
+    // the count by the declared width (a bare literal declares int; only
+    // an L/UL suffix declares long), regardless of its 64-bit register form
+    bool ShiftMask32(Node e) {
+        if (e == null) { return false; }
+        if (e.kind == AK.IntLit()) {
+            int sfx = e.suffix - (e.suffix / 4) * 4;   // 1 = L, 3 = UL
+            return sfx != 1 && sfx != 3;
+        }
+        return Int32Kind(e) != 0;
+    }
+
+}
