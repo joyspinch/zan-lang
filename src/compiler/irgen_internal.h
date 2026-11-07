@@ -731,6 +731,7 @@ void emit_lpad_cleanups(zan_irgen_t *g, zan_lpad_entry_t *entry);
 void emit_runtime_check(zan_irgen_t *g, LLVMValueRef is_error, zan_loc_t loc, const char *msg);
 void emit_erased_new_hard_fail(zan_irgen_t *g);
 void emit_cast_throw(zan_irgen_t *g, zan_loc_t loc, const char *msg);
+LLVMValueRef emit_fptosi_guarded(zan_irgen_t *g, LLVMValueRef val, LLVMTypeRef target, zan_loc_t loc);
 void emit_sb_append_bytes(zan_irgen_t *g, LLVMValueRef sbp, LLVMValueRef s, LLVMValueRef slen);
 LLVMValueRef emit_soft_base_select(zan_irgen_t *g, LLVMValueRef base, LLVMValueRef isnull, zan_loc_t loc);
 void emit_span_safe_window(zan_irgen_t *g, LLVMValueRef *start_out, LLVMValueRef *window_out, LLVMValueRef length, zan_loc_t loc, const char *kind);

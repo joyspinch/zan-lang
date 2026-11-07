@@ -6,51 +6,55 @@ namespace System.IO;
 // 基于 C 运行时（Windows 为 msvcrt，POSIX 为 libc）的跨平台文件操作。
 // 所有方法均支持 Windows 与 Linux/macOS。
 public class File {
-    // C 运行时函数（所有平台均以 libc/msvcrt 形式提供）
+    private const int TEXT_CHUNK_SIZE = 8192;
+    private const int BINARY_CHUNK_SIZE = 65536;
+    private const int COPY_BUFFER_SIZE = 1048576;
+
+    // C 运行时函数（所有平台均以 libc/msvcrt 形式提供，仅内部及 IO 模块安全访问）
     [DllImport("crt", EntryPoint = "zan_file_fopen")]
-    public static extern nint fopen(string path, string mode);
+    internal static extern nint fopen(string path, string mode);
 
     [DllImport("crt")]
-    public static extern nint zan_pkg_fopen(string path, string mode);
+    internal static extern nint zan_pkg_fopen(string path, string mode);
 
     [DllImport("crt")]
-    public static extern int fclose(nint fp);
+    internal static extern int fclose(nint fp);
 
     [DllImport("crt")]
-    public static extern int fseek(nint fp, int offset, int origin);
+    internal static extern int fseek(nint fp, int offset, int origin);
 
     // 64 位文件位置：ftell 返回 long，避免 2GB 截断；
     // Windows CRT 的 64 位形态是 _ftelli64，POSIX 是 ftello。
     #if WINDOWS
     [DllImport("crt", EntryPoint = "_ftelli64")]
-    public static extern long ftell64(nint fp);
+    internal static extern long ftell64(nint fp);
     #else
     [DllImport("crt", EntryPoint = "ftello")]
-    public static extern long ftell64(nint fp);
+    internal static extern long ftell64(nint fp);
     #endif
 
     [DllImport("crt")]
-    public static extern long fread(string buf, long size, long count, nint fp);
+    internal static extern long fread(string buf, long size, long count, nint fp);
 
     [DllImport("crt")]
-    public static extern long fwrite(string buf, long size, long count, nint fp);
+    internal static extern long fwrite(string buf, long size, long count, nint fp);
 
     [DllImport("crt", EntryPoint = "zan_file_remove")]
-    public static extern int remove(string path);
+    internal static extern int remove(string path);
 
     [DllImport("crt", EntryPoint = "zan_file_rename")]
-    public static extern int rename(string oldname, string newname);
+    internal static extern int rename(string oldname, string newname);
 
     [DllImport("crt")]
-    public static extern int fputc(int ch, nint fp);
+    internal static extern int fputc(int ch, nint fp);
 
     // 位 0 只读、位 1 隐藏、位 2 目录；路径不存在时为 -1。
     [DllImport("crt")]
-    public static extern long zan_file_attributes(string path);
+    internal static extern long zan_file_attributes(string path);
 
     // 文件 64 位字节长度；路径不存在时为 -1。
     [DllImport("crt")]
-    public static extern long zan_file_length(string path);
+    internal static extern long zan_file_length(string path);
 
     // 内嵌资源：发布时被编进可执行文件的只读文件，按项目相对路径寻址
     // （zanc --embed，IDE 里给文件/文件夹选「内嵌」）。磁盘上找不到时
@@ -143,11 +147,11 @@ public class File {
             return "";
         }
         StringBuilder sb = new StringBuilder();
-        byte[] chunk = new byte[8192];
-        int n = (int)fread(chunk, 1, 8192, fp);
+        byte[] chunk = new byte[TEXT_CHUNK_SIZE];
+        int n = (int)fread(chunk, 1, TEXT_CHUNK_SIZE, fp);
         while (n > 0) {
             sb.Append(chunk.ToStr(0, n));
-            n = (int)fread(chunk, 1, 8192, fp);
+            n = (int)fread(chunk, 1, TEXT_CHUNK_SIZE, fp);
         }
         fclose(fp);
         return File.StripBom(sb.ToString());
@@ -227,10 +231,10 @@ public class File {
     }
 
     [DllImport("crt")]
-    public static extern long zan_file_try_lock(string path);
+    internal static extern long zan_file_try_lock(string path);
 
     [DllImport("crt")]
-    public static extern long zan_file_unlock(long handle);
+    internal static extern long zan_file_unlock(long handle);
 
     // 抢占 <paramref name="path"/> 的跨进程独占锁（文件不存在
     // 就创建），拿到返回非 0 句柄，已被别的进程占用返回 0，不等待。
@@ -296,9 +300,9 @@ public class File {
             fclose(fpSrc);
             throw new IOException("Could not open file for writing: " + dest);
         }
-        byte[] buf = new byte[1048576];
+        byte[] buf = new byte[COPY_BUFFER_SIZE];
         while (true) {
-            int got = (int)fread(buf, 1, 1048576, fpSrc);
+            int got = (int)fread(buf, 1, COPY_BUFFER_SIZE, fpSrc);
             if (got <= 0) { break; }
             if ((int)fwrite(buf, 1, got, fpDst) != got) {
                 fclose(fpSrc);
@@ -460,10 +464,10 @@ public class File {
         fseek(fp, offset, 0);
         byte[] buf = new byte[count];
         int total = 0;
-        byte[] chunk = new byte[65536];
+        byte[] chunk = new byte[BINARY_CHUNK_SIZE];
         while (total < count) {
             int want = count - total;
-            if (want > 65536) { want = 65536; }
+            if (want > BINARY_CHUNK_SIZE) { want = BINARY_CHUNK_SIZE; }
             int got = (int)fread(chunk, 1, want, fp);
             if (got <= 0) { break; }
             NativeMemory.Copy((nint)buf + (nint)total, (nint)chunk, got);

@@ -1654,6 +1654,9 @@ static void refl_append_method_params(zan_irgen_t *g, zan_ast_node_t *decl, char
         if (param->param.type && param->param.type->kind == AST_TYPE_REF) {
             refl_istr_to(ptype, sizeof(ptype), param->param.type->type_ref.name);
         }
+        if (strcmp(ptype, "HttpContext") == 0 || strcmp(ptype, "System.Web.HttpContext") == 0) {
+            continue;
+        }
 
         /* 表单模型类展开：如果参数类型是类且有实例字段，展开为 form 来源字段 */
         zan_type_t *pt = NULL;

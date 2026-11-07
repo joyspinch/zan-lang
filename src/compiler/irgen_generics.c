@@ -1649,6 +1649,52 @@ void emit_cast_throw(zan_irgen_t *g, zan_loc_t loc, const char *msg) {
     emit_guard_hard(g, text, 70);
 }
 
+/* B-ID180：浮点→整型全通道 poison 收口（cast / 三元统一 / Convert 族，
+ * 自举孪生三处同口径）。LLVM fptosi 对溢出值产生 poison：x86 得 0x8000…、
+ * ARM64 饱和、WASM trap——三平台三种结果且优化器可任意利用，违反
+ * SECURITY.md §1「无 UB」承诺（探针 _scratch/bid180_probe：越界值打印
+ * 出 -0 垃圾、try 内毫无异常分发）。发射序：
+ *   ① 范围谓词 [-2^63, 2^63)：NaN 两个比较全 false 自动落网；
+ *   ② emit_runtime_check —— try 内抛 OverflowException（消息含
+ *      "outside the range" 走既有映射），try 外 soft 报告后继续；
+ *   ③ clamp 归一化（上越界→INT64_MAX、下越界→INT64_MIN、NaN→0），
+ *      fptosi 输入必定义，绝无 poison；
+ *   ④ 窄目标（<64 位）截断：域内值与旧窄直转逐位一致，域外旧 poison
+ *      现为定义值。 */
+LLVMValueRef emit_fptosi_guarded(zan_irgen_t *g, LLVMValueRef val,
+                                 LLVMTypeRef target, zan_loc_t loc) {
+    LLVMTypeRef dbl = LLVMDoubleTypeInContext(g->ctx);
+    if (LLVMGetTypeKind(LLVMTypeOf(val)) == LLVMFloatTypeKind)
+        val = LLVMBuildFPExt(g->builder, val, dbl, "f2i.ext");
+    /* f64 可精确表示 ±2^63；上界开区间（fptosi(2^63) 即 poison）。 */
+    LLVMValueRef lo = LLVMConstReal(dbl, -9223372036854775808.0);
+    LLVMValueRef hi = LLVMConstReal(dbl, 9223372036854775808.0);
+    LLVMValueRef ge_lo = LLVMBuildFCmp(g->builder, LLVMRealOGE, val, lo, "f2i.lo");
+    LLVMValueRef lt_hi = LLVMBuildFCmp(g->builder, LLVMRealOLT, val, hi, "f2i.hi");
+    LLVMValueRef in_range = LLVMBuildAnd(g->builder, ge_lo, lt_hi, "f2i.in");
+    if (g->runtime_checks && g->current_fn) {
+        LLVMValueRef bad = LLVMBuildNot(g->builder, in_range, "f2i.bad");
+        emit_runtime_check(g, bad, loc,
+            "value is outside the range of the target type");
+    }
+    /* clamp：域内值正常转，域外/NaN 归一化（上越界→INT64_MAX、下越界→INT64_MIN、NaN→0） */
+    LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
+    LLVMValueRef safe_f = LLVMBuildSelect(g->builder, in_range, val,
+        LLVMConstReal(dbl, 0.0), "f2i.safe_f");
+    LLVMValueRef converted = LLVMBuildFPToSI(g->builder, safe_f, i64t, "f2i.val");
+    LLVMValueRef ge_hi = LLVMBuildFCmp(g->builder, LLVMRealOGE, val, hi, "f2i.chi");
+    LLVMValueRef lt_lo = LLVMBuildFCmp(g->builder, LLVMRealOLT, val, lo, "f2i.clo");
+    LLVMValueRef clamped = LLVMBuildSelect(g->builder, ge_hi,
+        LLVMConstInt(i64t, INT64_MAX, 1),
+        LLVMBuildSelect(g->builder, lt_lo,
+            LLVMConstInt(i64t, INT64_MIN, 1),
+            converted, "f2i.clo"),
+        "f2i.chi");
+    if (LLVMGetIntTypeWidth(target) < 64)
+        return LLVMBuildTrunc(g->builder, clamped, target, "f2i.trunc");
+    return clamped;
+}
+
 static void emit_string_null_report(zan_irgen_t *g, LLVMValueRef payload,
                                     zan_loc_t loc) {
     if (!g->rt_guard_split) {

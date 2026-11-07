@@ -1299,7 +1299,7 @@ static zan_ast_node_t *parse_secondary_unit(const char *path,
  * 所以派发在编译期展开成强类型调用：本函数扫描编译单元里的用户控制器
  * （跳过 stdlib / packages 来源，口径同 checker_collect_controllers），
  * 合成一个 __ZanActionDispatch 类——每个动作一条 `if (actionKey == "...")`
- * 分支，分支内 new 控制器 → __Bind(ctx) → 参数绑定 → 前置钩子 → await 动作
+ * 分支，分支内 new 控制器 → Bind(ctx) → 参数绑定 → 前置钩子 → await 动作
  * → 后置钩子。checker 在 __AttrRoutes.Register 调用点把它作为第三实参传给
  * 框架（Register(app, controllers, dispatcher)）。
  *
@@ -1471,7 +1471,7 @@ static zan_ast_node_t *zd_find_class(zan_ast_node_t *unit, const char *name) {
 }
 
 /* 控制器判定：基类链上任一段以 Controller 结尾。非控制器（如 Program
-   里的 Index 方法）也进路由表，但没有 __Bind 等钩子，不能合成强类型调用。 */
+   里的 Index 方法）也进路由表，但没有 Bind 等钩子，不能合成强类型调用。 */
 static bool zd_class_is_controller(zan_ast_node_t *unit, zan_ast_node_t *decl,
                                    int depth) {
     if (!decl || depth > 16) return false;
@@ -1663,30 +1663,30 @@ static bool zd_emit_action(zd_buf_t *b, zan_ast_node_t *unit, zan_ast_node_t *m,
         zd_putf(b, "            %s%s.%s(%s);\n", aw, full, mname, args);
     } else {
         zd_putf(b, "            %s __c = new %s();\n", full, full);
-        zd_putf(b, "            __c.__Bind(ctx);\n");
-        if (ro) zd_putf(b, "            __c.__UseReadOnly();\n");
+        zd_putf(b, "            __c.Bind(ctx);\n");
+        if (ro) zd_putf(b, "            __c.UseReadOnly();\n");
         if (tx) zd_putf(b, "            bool __tx = false;\n");
         zd_putf(b, "            try {\n");
-        zd_putf(b, "                if (await __c.__BeforeAsync()) {\n");
+        zd_putf(b, "                if (await __c.BeforeAsync()) {\n");
         if (tx) {
-            zd_putf(b, "                    bool __begun = await __c.__TxBegin();\n");
+            zd_putf(b, "                    bool __begun = await __c.TxBegin();\n");
             zd_putf(b, "                    if (!__begun) { throw new System.Web.ApiError(503, \"0503\", \"服务不可用\"); }\n");
             zd_putf(b, "                    __tx = true;\n");
         }
         zd_putf(b, "%s", binds);
         zd_putf(b, "                    %s__c.%s(%s);\n", aw, mname, args);
         if (tx) {
-            zd_putf(b, "                    await __c.__TxCommit();\n");
+            zd_putf(b, "                    await __c.TxCommit();\n");
             zd_putf(b, "                    __tx = false;\n");
         }
         zd_putf(b, "                }\n");
         if (tx) {
             zd_putf(b, "            } catch (System.Exception __x) {\n");
-            zd_putf(b, "                if (__tx) { try { await __c.__TxRollback(); } catch (System.Exception __r) { } }\n");
+            zd_putf(b, "                if (__tx) { try { await __c.TxRollback(); } catch (System.Exception __r) { } }\n");
             zd_putf(b, "                throw;\n");
         }
         zd_putf(b, "            } finally {\n");
-        zd_putf(b, "                await __c.__AfterAsync();\n");
+        zd_putf(b, "                await __c.AfterAsync();\n");
         zd_putf(b, "            }\n");
     }
     zd_putf(b, "            return true;\n        }\n");

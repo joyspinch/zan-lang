@@ -2096,7 +2096,7 @@ static LLVMValueRef coerce_ternary_value(zan_irgen_t *g, LLVMValueRef v,
         return LLVMBuildSIToFP(g->builder, v, target, "tern.sitofp");
     if ((vk == LLVMFloatTypeKind || vk == LLVMDoubleTypeKind) &&
         tk == LLVMIntegerTypeKind)
-        return LLVMBuildFPToSI(g->builder, v, target, "tern.fptosi");
+        return emit_fptosi_guarded(g, v, target, (zan_loc_t){0});
     return coerce_int_to(g, v, target);
 }
 LLVMValueRef emit_expr_conditional(zan_irgen_t *g, zan_ast_node_t *expr,
@@ -3604,7 +3604,7 @@ LLVMValueRef emit_expr_cast_expr(zan_irgen_t *g, zan_ast_node_t *expr,
             return val;
         }
         if (src_fp && tk == LLVMIntegerTypeKind)
-            return LLVMBuildFPToSI(g->builder, val, target, "cast");
+            return emit_fptosi_guarded(g, val, target, expr->loc);
         if (sk == LLVMIntegerTypeKind && tgt_fp)
             return LLVMBuildSIToFP(g->builder, val, target, "cast");
         if (src_fp && tgt_fp) {
