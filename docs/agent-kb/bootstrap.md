@@ -68,13 +68,15 @@ mirrors the module structure of the C host in `src/compiler/`:
 | `irgen_expr.zan` | Irgen part: expression codegen (assignment, member access, indexing, …) |
 | `irgen_stmt.zan` | Irgen part: statement codegen, vtable emission for polymorphic classes |
 | `irgen_async.zan` | Irgen part: async/await CPS lowering (heap frames, resume steps) |
-| `jsongen.zan`  | Compile-time entity-mapper generation for `System.Json` (mirrors the C host pass) |
-| `dbgen.zan`    | Compile-time typed ORM query generation for `System.Data` (mirrors the C host pass) |
-| `attrgen.zan` | Compile-time attribute/route synthesis (mirrors the C host pass) |
 | `lsp.zan`     | Language-server surface used by the driver                    |
 | `nio.zan`     | Binary file output helper                                     |
 | `ngen*.zan`   | Cross-platform machine-code generator (x86/ARM, Mach-O/ELF/COFF/Wasm) |
 | `main.zan`    | Driver: read files, run the pipeline, write `.ll`          |
+
+C-host passes with **no self-hosted counterpart** (code compiled by gen1 cannot
+rely on them): compile-time entity-mapper generation for `System.Json`, typed
+ORM query generation for `System.Data`, and attribute/route synthesis. They are
+listed in the gap index under "Known limitations" below.
 
 ### Design choices dictated by the bootstrap subset
 
@@ -290,7 +292,24 @@ links, runs the programs and compares stdout with the C host's golden file.
 
 ## Known limitations / future work
 
-- **The self-hosted coroutine frame is a flat `i64` array, while the C host's
+Gap index (this table is the machine-referenced whitelist source for the
+`selfhost_ir_diff` gate and the differential fuzzer; each row's detail follows
+as a bullet, tracking refs in `TASKS.md` where noted):
+
+| # | Gap | Detail below | Tracking |
+|---|-----|--------------|----------|
+| G1 | Coroutine frame representation (flat `i64` array vs host mixed-width struct) | bullet 1 | A385 |
+| G2 | Async closure-capture edges still by value (params, foreach element) | bullet 2 | A391 |
+| G3 | `struct` is a heap object (value semantics now, representation differs) | bullet 3 | A389 |
+| G4 | Full pattern matching | bullet 4 | — |
+| G5 | String interpolation coverage | bullet 4 | — |
+| G6 | EH: single catch clause per try, no type dispatch / rethrow-to-outer; ARC edge cases (throw escaping catch, async unwind) | bullet 4 | — |
+| G7 | Diagnostics: limited positions, no recovery, no `code` field | bullet 5 | — |
+| G8 | No optimization (naive IR; bare on the `ngen` path) | bullet 6 | — |
+| G9 | Nested erased generic slot read-back (`List<List<int>>`) | Generics section | — |
+| G10 | C-host passes without selfhost counterpart (entity-mapper / ORM / attr synthesis) | file-table note | — |
+
+
   frame is a mixed-width struct.** The *slot numbering* is aligned with the
   host (`0=sched 1=sched_step 2=state 3=done …`, the `ASYNC_FRAME_*` order),
   and the two slots the shipped runtime touches (`sched`'s CO_* bits and

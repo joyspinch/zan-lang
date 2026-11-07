@@ -46,6 +46,16 @@
 - [ ] B-ID177〔前置 B-ID175〕GUI 分层重构 P6 即时模式下线：路由事件转正 → 控件分批改事件驱动 → 514 处调用方迁移（设计器预览离屏、gui_gallery 并入 html_gallery 等）→ 删 `Render(App` 入口与 InputArbiter。
 - [ ] B-ID179〔前置 B-ID176〕GUI 分层重构 P8 设计器改产出 CSS，脚本改写 42 个设计器文档（含 IDE 面板），删 P5 脱糖兜底（P5 完成后单独出计划）。
 
+### 批次 5 · 自举工业化（2026-11-07 立项：自举闭环已达 L5 固定点，转入验证面扩容与诊断工程；蓝本见 docs/agent-kb/bootstrap.md "Known limitations" 缺口索引 G1~G10）
+
+- [ ] B-ID184 全仓编译门 `selfhost_repo`：gen1 编译面从 230 手选用例扩到 stdlib/packages/templates/examples 全量 `.zan`；首轮盘点失败项记 `tests/selfhost/repo_known_gaps.txt`（与 diff_known_gaps.txt 同模式白名单记账），门按"白名单外全绿"判；新增 `tests/run_selfhost_repo.cmake` + CMakeLists 注册。
+- [ ] B-ID185 IR 规范化差分 `selfhost_ir_diff`：`scripts/normalize_ir.py` 归一化两侧 IR（gen0 走 LLVM C API、gen1 手写文本——label/SS 重编号、metadata 剥离、属性排序）；先 `_scratch/` 对 diff_cases 230 用例盘点剩余差异形态定白名单规则，再落 `tests/run_selfhost_ir_diff.cmake`，白名单 `tests/selfhost/ir_diff_known_gaps.txt` 记账、长期目标清零。目标：抓 B-ID180 型"stdout 碰巧一致、发射路径已分叉"。
+- [ ] B-ID186 差分 Fuzzer 种子变异：`scripts/fuzz_mutate.py` 以 diff_cases 230 用例为变异源（数值边界 0/MIN/MAX/NaN/±Inf、null 注入、越界索引、try/catch 包裹剥离、整型宽度翻转）；驱动放 `_scratch/`（一次性，不进 tests）；猎物缩减最小复现 → conformance 双端金标入库 → 按 WC §10 探针→根因→单跑→自然写法收口。
+- [ ] B-ID187 诊断表驱动：DIAGNOSTIC_CODES.md 表格单源机器可读，C 宿主与 selfhost `Diag` 同表生成（C 侧 diag_codes.h、selfhost 侧 .zan 常量片段，生成物进提交）；已对齐 E3012/E3049/E3052/E3053/E3060/E3086 先迁作模板。
+- [ ] B-ID188 reject 金标：reject_cases.txt 每用例配 `.stderr` 金标（先只锁 `code: 摘要` 两字段，容忍位置差异），run_selfhost_diff reject 分支从"rc≠0 即过"升级为"rc≠0 且 stderr 匹配金标"；前置 B-ID187（金标依赖 code 字段）。
+- [ ] B-ID189 防倒退指纹：① gen1/gen0 `--version` 输出代次 + selfhost_sources.txt 内容 SHA256（差分报告可复现）；② run_fixedpoint 把 g2 SHA256 写 `build/fixedpoint.sha`、bootstrap.md 维护最近固定点 SHA；③ pre-commit 增检：diff 触及 src/selfhost/** 或 src/compiler/** 时提交说明须含 `selfhost-verified:` 标记（只机检标记存在，真跑仍按 WC §8 定向执行）；④ `scripts/check_selfhost_docs.py` 机检 selfhost_sources.txt 与 bootstrap.md 文件表的存在性。
+- [ ] B-ID190〔独占大项〕parser 错误恢复：错误后继续 parse，服务 LSP/IDE 体验；单开计划，不与 B-ID187/188 混线。
+
 ### 批次 4 · 大工程 / 独占窗口（无其他 irgen/runtime 改动在飞时领）
 
 - [x] B-ID169 Convert/Parse 异常抛出与自举孪生对齐：全仓审计 345 处调用方证实绝大多数依赖非 try 默认安全兜底，C 宿主原有 try 内部 emit_runtime_check 异常分发路径成立；修复自举端 irgen_expr_member.zan 在 @__exc_sp > 1（进入用户级 try 块）时经由 EmitExceptionThrow 抛出 FormatException/OverflowException，非 try 作用域保持 stderr soft note + 0 兜底。内置异常类描述符在 binder/checker/irgen/irgen_expr_assign 注册并对齐 tid_Exception 继承链。新增 conformance/convert_invalid_catch.zan，selfhost_gen1、selfhost_fixed_point（37.9MB 逐字节对齐）、selfhost_diff（213通过/0已知缺口/50拒绝）三门自举全体验证通过。
