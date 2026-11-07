@@ -3,6 +3,10 @@
 #include <string.h>
 #include <stdlib.h>
 
+#if defined(_WIN32)
+  #include <windows.h>
+#endif
+
 #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
   #include <immintrin.h>
   #include <wmmintrin.h>
@@ -12,12 +16,9 @@
 #endif
 #if defined(__aarch64__) || defined(_M_ARM64)
   #include <arm_neon.h>
-  #if defined(_WIN32)
-    /* windows */
-    #include <windows.h>
-  #elif defined(__APPLE__)
+  #if defined(__APPLE__)
     #include <sys/sysctl.h>
-  #else
+  #elif !defined(_WIN32)
     #include <sys/auxv.h>
   #endif
 #endif
@@ -176,8 +177,14 @@ static void zan_hw_init_cpu_features(void) {
         __atomic_store_n(&g_cpuid_state, 2, __ATOMIC_RELEASE);
     } else {
         while (__atomic_load_n(&g_cpuid_state, __ATOMIC_ACQUIRE) != 2) {
-#if defined(__i386__) || defined(__x86_64__)
+#if defined(_WIN32)
+            YieldProcessor();
+#elif defined(__i386__) || defined(__x86_64__)
             __builtin_ia32_pause();
+#elif defined(__aarch64__) || defined(__arm__)
+            __asm__ __volatile__("yield" ::: "memory");
+#elif defined(__riscv)
+            __asm__ __volatile__(".insn i 0x0F, 0, x0, x0, 0x010" ::: "memory");
 #endif
         }
     }
@@ -194,11 +201,31 @@ static int g_gate_crc32  = 0;
 static int g_gate_sm4    = 0;
 
 static int zan_hw_gate(int *state, int feature, int (*kat)(void)) {
-    if (*state == 0) {
-        if (!feature) { *state = -1; return 0; }
-        *state = kat() ? 1 : -1;
+    int s = __atomic_load_n(state, __ATOMIC_ACQUIRE);
+    if (s != 0 && s != 2) return s == 1;
+    if (!feature) {
+        __atomic_store_n(state, -1, __ATOMIC_RELEASE);
+        return 0;
     }
-    return *state == 1;
+    int expected = 0;
+    if (__atomic_compare_exchange_n(state, &expected, 2, 0,
+                                    __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+        int res = kat() ? 1 : -1;
+        __atomic_store_n(state, res, __ATOMIC_RELEASE);
+        return res == 1;
+    }
+    while ((s = __atomic_load_n(state, __ATOMIC_ACQUIRE)) == 2) {
+#if defined(_WIN32)
+        YieldProcessor();
+#elif defined(__i386__) || defined(__x86_64__)
+        __builtin_ia32_pause();
+#elif defined(__aarch64__) || defined(__arm__)
+        __asm__ __volatile__("yield" ::: "memory");
+#elif defined(__riscv)
+        __asm__ __volatile__(".insn i 0x0F, 0, x0, x0, 0x010" ::: "memory");
+#endif
+    }
+    return s == 1;
 }
 
 int zan_hw_kat_state(int id) {
