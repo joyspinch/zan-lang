@@ -22,6 +22,9 @@ public class WebApp : IDisposable {
     private Hooks hooks;
     private View views;
     private Sessions sessions;
+    private ISessionStorage sessionStorage;
+    private ForwardedHeaders forwardedHeaders;
+    private HealthChecks healthChecks;
     private RateLimiter limiter;
     private LockManager locks;
     private AuthFn authResolver;
@@ -78,6 +81,9 @@ public class WebApp : IDisposable {
         this.hooks = new Hooks();
         this.views = null;
         this.sessions = new Sessions();
+        this.sessionStorage = this.sessions;
+        this.forwardedHeaders = null;
+        this.healthChecks = null;
         this.authResolver = null;
         this.permissionResolver = null;
         this.metrics = ServerMetrics.Global();
@@ -121,6 +127,52 @@ public class WebApp : IDisposable {
     public View GetViews() { return this.views; }
     // 内存/分布式会话管理器。
     public Sessions Sessions() { return this.sessions; }
+    // 配置分布式或自定义会话持久化存储驱动（默认使用本地高性能内存会话）。
+    public WebApp UseSessions(ISessionStorage storage) {
+        if (storage != null) {
+            this.sessionStorage = storage;
+        }
+        return this;
+    }
+    public ISessionStorage SessionStorage() { return this.sessionStorage; }
+
+    // 启用反向代理标头还原（解析 X-Forwarded-For 真实客户端 IP 与 X-Forwarded-Proto 协议）。
+    public WebApp UseForwardedHeaders() {
+        if (this.forwardedHeaders == null) {
+            this.forwardedHeaders = new ForwardedHeaders();
+        }
+        this.forwardedHeaders.Enable();
+        return this;
+    }
+    public ForwardedHeaders ForwardedHeaders() { return this.forwardedHeaders; }
+
+    // 启用云原生与负载均衡器健康检查探针（默认 /healthz 与 /readyz）。
+    public WebApp UseHealthChecks() {
+        return this.UseHealthChecks("/healthz", "/readyz");
+    }
+    public WebApp UseHealthChecks(string livenessPath, string readinessPath) {
+        if (this.healthChecks == null) {
+            this.healthChecks = new HealthChecks(livenessPath, readinessPath);
+        }
+        this.healthChecks.Enable();
+        this.router.Get(this.healthChecks.LivenessPath(), HealthChecks.HandleLiveness);
+        this.router.Get(this.healthChecks.ReadinessPath(), this.healthChecks.HandleReadiness);
+        return this;
+    }
+    public HealthChecks Health() { return this.healthChecks; }
+
+    // 平滑排空本节点流量（Ready 探针置为 503 DRAINING，网关摘除流量）。
+    public void Drain() {
+        if (this.healthChecks != null) {
+            this.healthChecks.Drain();
+        }
+    }
+
+    // 配置集群 WebSocket 跨节点消息广播背板（IWsBackplane）。
+    public WebApp UseWsBackplane(IWsBackplane backplane) {
+        WsHub.Default().UseBackplane(backplane);
+        return this;
+    }
     // 服务端度量统计收集器。
     public ServerMetrics Metrics() { return this.metrics; }
     // 加载视图目录（编译进内存）并返回自身。
@@ -445,7 +497,15 @@ public class WebApp : IDisposable {
             Convert.ToString(procs), "[OK]");
         b.Info("routes", Convert.ToString(this.router.Count()));
         if (this.views != null) { b.Info("views", "loaded"); }
-        if (this.sessions != null) { b.Info("sessions", "in-memory"); }
+        if (this.sessionStorage != null) {
+            b.Info("sessions", this.sessionStorage == this.sessions ? "in-memory" : "distributed");
+        }
+        if (this.forwardedHeaders != null && this.forwardedHeaders.IsEnabled()) {
+            b.Info("proxy-headers", "on");
+        }
+        if (this.healthChecks != null && this.healthChecks.IsEnabled()) {
+            b.Info("health", "on");
+        }
         b.Info("max body", Convert.ToString(this.maxBodyBytes / (1024 * 1024))
             + "MB");
         b.Info("uploads", this.uploadDir + "/ "
@@ -587,6 +647,9 @@ public class WebApp : IDisposable {
                 }
                 keepAlive = request.keepAlive;
                 HttpContext ctx = new HttpContext(request, remoteIp);
+                if (this.forwardedHeaders != null && this.forwardedHeaders.IsEnabled()) {
+                    ctx.SetClientIp(this.forwardedHeaders.ResolveClientIp(ctx));
+                }
                 ctx.SetApp(this);
                 ctx.AttachTls(stream);
                 ctx.SetFramer(framer);
@@ -743,6 +806,9 @@ public class WebApp : IDisposable {
             }
             keepAlive = request.keepAlive;
             HttpContext ctx = new HttpContext(request, remoteIp);
+            if (this.forwardedHeaders != null && this.forwardedHeaders.IsEnabled()) {
+                ctx.SetClientIp(this.forwardedHeaders.ResolveClientIp(ctx));
+            }
             ctx.SetApp(this);
             ctx.Attach(client);
             ctx.SetFramer(framer);
@@ -867,7 +933,7 @@ public class WebApp : IDisposable {
         string uid = await this.AuthUser(ctx);
         ctx.SetUid(uid);
         string principal = uid;
-        if (principal.Length == 0) { principal = ctx.RemoteIp(); }
+        if (principal.Length == 0) { principal = ctx.ClientIp(); }
         if (principal.Length == 0) { principal = "_unknown_"; }
         if (this.globalLimit > 0
             && !this.Limiter().Allow("_global_:" + principal, this.globalLimit)) {
@@ -878,7 +944,7 @@ public class WebApp : IDisposable {
         if (route.RateScope() == "uid") {
             rateKey = rateKey + ":uid:" + uid;
         } else if (route.RateScope() == "ip") {
-            rateKey = rateKey + ":ip:" + ctx.RemoteIp();
+            rateKey = rateKey + ":ip:" + ctx.ClientIp();
         }
         return !this.Limiter().Allow(rateKey, route.RateLimit());
     }
@@ -893,7 +959,7 @@ public class WebApp : IDisposable {
 
         string uid = ctx.Uid();
         string principal = uid;
-        if (principal.Length == 0) { principal = ctx.RemoteIp(); }
+        if (principal.Length == 0) { principal = ctx.ClientIp(); }
         if (principal.Length == 0) { principal = "_unknown_"; }
 
         if (!this.hooks.RunBefore(ctx)) {
@@ -1022,11 +1088,13 @@ public class WebApp : IDisposable {
         if (auth != null && auth.StartsWith("Bearer ")) {
             string token = auth.Substring(7);
             if (this.authResolver != null) { return await this.authResolver(token); }
+            if (this.sessionStorage != null) { return this.sessionStorage.UserOf(token, 0); }
             return this.sessions.UserOf(token);
         }
         string cookie = ctx.Cookie("zsession");
         if (cookie.Length > 0) {
             if (this.authResolver != null) { return await this.authResolver(cookie); }
+            if (this.sessionStorage != null) { return this.sessionStorage.UserOf(cookie, 0); }
             return this.sessions.UserOf(cookie);
         }
         return "";

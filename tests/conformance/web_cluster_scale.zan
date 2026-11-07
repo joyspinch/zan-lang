@@ -1,0 +1,199 @@
+using System;
+using System.Collections.Generic;
+using System.Net.Sockets;
+using System.Threading;
+using System.Web;
+
+// 模拟分布式 Redis / 集群共享会话存储
+class MockDistributedSessionStore : ISessionStorage {
+    private Dictionary<string, string> store;
+
+    public MockDistributedSessionStore() {
+        this.store = new Dictionary<string, string>();
+    }
+
+    public string Issue(string uid, int nowSeconds, int ttlSeconds) {
+        string token = "cluster-token-" + uid;
+        this.store[token] = uid;
+        return token;
+    }
+
+    public string UserOf(string token, int nowSeconds) {
+        if (token != null && this.store.ContainsKey(token)) {
+            return this.store[token];
+        }
+        return "";
+    }
+
+    public bool Remove(string token) {
+        if (token != null && this.store.ContainsKey(token)) {
+            this.store.Remove(token);
+            return true;
+        }
+        return false;
+    }
+
+    public void Clear() {
+        this.store.Clear();
+    }
+}
+
+// 模拟 WebSocket 跨节点消息背板 (如 Redis PubSub / RabbitMQ / Kafka)
+class MockWsBackplane : IWsBackplane {
+    public string lastAction;
+    public string lastTarget;
+    public string lastPayload;
+    public int publishCount;
+
+    public MockWsBackplane() {
+        this.lastAction = "";
+        this.lastTarget = "";
+        this.lastPayload = "";
+        this.publishCount = 0;
+    }
+
+    public void Publish(string action, string target, string payload) {
+        this.lastAction = action;
+        this.lastTarget = target;
+        this.lastPayload = payload;
+        this.publishCount = this.publishCount + 1;
+    }
+
+    public void Clear() {
+        this.lastAction = "";
+        this.lastTarget = "";
+        this.lastPayload = "";
+        this.publishCount = 0;
+    }
+}
+
+class Program {
+    static int failures = 0;
+
+    static void Check(bool cond, string name) {
+        if (cond) {
+            Console.WriteLine("ok " + name);
+        } else {
+            Console.WriteLine("FAIL " + name);
+            Program.failures = Program.failures + 1;
+        }
+    }
+
+    static string lastExtractedIp = "";
+
+    static async void HandleWhoAmI(HttpContext ctx) {
+        Program.lastExtractedIp = ctx.ClientIp();
+        ctx.Status(200, "OK");
+        ctx.Text(ctx.ClientIp());
+    }
+
+    static async void HandleUserProfile(HttpContext ctx) {
+        ctx.Status(200, "OK");
+        ctx.Text("hello " + ctx.Uid());
+    }
+
+    static async int Run() {
+        Socket.Initialize();
+
+        // 1. 验证 ISessionStorage 分布式插拔与 WebApp 绑定
+        MockDistributedSessionStore distStore = new MockDistributedSessionStore();
+        string token1 = distStore.Issue("user_9988", 0, 3600);
+        Check(distStore.UserOf(token1, 0) == "user_9988", "mock session store issue & read");
+
+        WebApp app = new WebApp("127.0.0.1", 39090);
+        app.UseSessions(distStore);
+        Check(app.SessionStorage() == distStore, "webapp custom session storage plugged");
+
+        // 2. 验证反向代理标头还原 UseForwardedHeaders 与 ClientIp
+        app.UseForwardedHeaders();
+        Check(app.ForwardedHeaders() != null && app.ForwardedHeaders().IsEnabled(), "forwarded headers enabled");
+
+        app.Get("/whoami", Program.HandleWhoAmI);
+        app.Get("/profile", Program.HandleUserProfile);
+
+        // 3. 验证云原生健康探针与平滑流量排空 UseHealthChecks
+        app.UseHealthChecks("/healthz", "/readyz");
+        Check(app.Health() != null && app.Health().IsEnabled(), "health checks enabled");
+
+        // 4. 模拟请求测试 ForwardedHeaders (X-Forwarded-For 与 X-Real-IP)
+        HttpRequest reqXff = HttpRequest.Parse("GET /whoami HTTP/1.1\r\nHost: localhost\r\nX-Forwarded-For: 203.0.113.195, 10.0.0.1\r\n\r\n");
+        HttpContext ctxXff = new HttpContext(reqXff, "127.0.0.1");
+        ctxXff.SetClientIp(app.ForwardedHeaders().ResolveClientIp(ctxXff));
+        Check(ctxXff.ClientIp() == "203.0.113.195", "client ip resolved from X-Forwarded-For");
+
+        HttpRequest reqXReal = HttpRequest.Parse("GET /whoami HTTP/1.1\r\nHost: localhost\r\nX-Real-IP: 198.51.100.77\r\n\r\n");
+        HttpContext ctxXReal = new HttpContext(reqXReal, "127.0.0.1");
+        ctxXReal.SetClientIp(app.ForwardedHeaders().ResolveClientIp(ctxXReal));
+        Check(ctxXReal.ClientIp() == "198.51.100.77", "client ip resolved from X-Real-IP");
+
+        // 5. 模拟分布式会话授权校验 (AuthUser)
+        HttpRequest reqAuth = HttpRequest.Parse("GET /profile HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer " + token1 + "\r\n\r\n");
+        HttpContext ctxAuth = new HttpContext(reqAuth, "127.0.0.1");
+        ctxAuth.SetApp(app);
+        string authUid = app.SessionStorage().UserOf(token1, 0);
+        ctxAuth.SetUid(authUid);
+        Check(ctxAuth.Uid() == "user_9988", "distributed session resolved user id in context");
+
+        // 6. 验证健康检查处理与 Drain 平滑排空
+        HttpRequest reqLiveness = HttpRequest.Parse("GET /healthz HTTP/1.1\r\nHost: localhost\r\n\r\n");
+        HttpContext ctxLive = new HttpContext(reqLiveness, "127.0.0.1");
+        HealthChecks.HandleLiveness(ctxLive);
+        await Task.Delay(20);
+        Check(ctxLive.GetStatus() == 200 && ctxLive.ResponseBody() == "{\"status\":\"UP\"}", "liveness probe UP");
+
+        HttpRequest reqReadiness = HttpRequest.Parse("GET /readyz HTTP/1.1\r\nHost: localhost\r\n\r\n");
+        HttpContext ctxReady = new HttpContext(reqReadiness, "127.0.0.1");
+        app.Health().HandleReadiness(ctxReady);
+        await Task.Delay(20);
+        Check(ctxReady.GetStatus() == 200 && ctxReady.ResponseBody() == "{\"status\":\"READY\"}", "readiness probe READY");
+
+        // 触发 Drain
+        app.Drain();
+        Check(app.Health().IsDraining(), "health state is draining");
+
+        HttpRequest reqDraining = HttpRequest.Parse("GET /readyz HTTP/1.1\r\nHost: localhost\r\n\r\n");
+        HttpContext ctxDrain = new HttpContext(reqDraining, "127.0.0.1");
+        app.Health().HandleReadiness(ctxDrain);
+        await Task.Delay(20);
+        Check(ctxDrain.GetStatus() == 503 && ctxDrain.ResponseBody() == "{\"status\":\"DRAINING\"}", "readiness probe 503 DRAINING");
+
+        // 7. 验证 WsHub 与 IWsBackplane 跨节点背板广播
+        WsHub hub = WsHub.Default();
+        MockWsBackplane backplane = new MockWsBackplane();
+        app.UseWsBackplane(backplane);
+        Check(hub.Backplane() == backplane, "ws hub plugged with cluster backplane");
+
+        // 验证向用户发送触发背板
+        hub.SendToUser("uid_client_88", "{\"event\":\"order_created\"}");
+        Check(backplane.publishCount == 1, "backplane published count 1");
+        Check(backplane.lastAction == "user", "backplane action user");
+        Check(backplane.lastTarget == "uid_client_88", "backplane target matched");
+        Check(backplane.lastPayload == "{\"event\":\"order_created\"}", "backplane payload matched");
+
+        // 验证向群组发送触发背板
+        hub.SendToGroup("trading_room", "{\"quote\":199.5}");
+        Check(backplane.publishCount == 2, "backplane published count 2");
+        Check(backplane.lastAction == "group", "backplane action group");
+        Check(backplane.lastTarget == "trading_room", "backplane target trading_room");
+
+        // 验证全集群广播触发背板
+        hub.Broadcast("{\"sys\":\"maintenance\"}");
+        Check(backplane.publishCount == 3, "backplane published count 3");
+        Check(backplane.lastAction == "broadcast", "backplane action broadcast");
+
+        // 8. 资源清理与释放
+        hub.Clear();
+        distStore.Clear();
+        app.Dispose();
+
+        if (failures == 0) {
+            Console.WriteLine("ok web cluster scale suite passed");
+            return 0;
+        }
+        return 1;
+    }
+
+    static void Main() {
+        int r = await Run();
+    }
+}

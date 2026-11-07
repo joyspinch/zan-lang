@@ -1,0 +1,204 @@
+using System;
+using System.Collections.Generic;
+
+namespace System.Web;
+
+// WebSocket 集群会话枢纽：管理本地长连接、组/用户映射，并驱动跨节点背板 (IWsBackplane)
+public class WsHub {
+    private static WsHub defaultHub;
+    private Dictionary<string, List<WsSession>> userMap;
+    private Dictionary<string, List<WsSession>> groupMap;
+    private List<WsSession> allSessions;
+    private IWsBackplane backplane;
+
+    public WsHub() {
+        this.userMap = new Dictionary<string, List<WsSession>>();
+        this.groupMap = new Dictionary<string, List<WsSession>>();
+        this.allSessions = new List<WsSession>();
+        this.backplane = null;
+    }
+
+    public static WsHub Default() {
+        if (WsHub.defaultHub == null) {
+            WsHub.defaultHub = new WsHub();
+        }
+        return WsHub.defaultHub;
+    }
+
+    public void UseBackplane(IWsBackplane bp) {
+        this.backplane = bp;
+    }
+
+    public IWsBackplane Backplane() {
+        return this.backplane;
+    }
+
+    // 登记用户连接
+    public void Register(string uid, WsSession session) {
+        if (session == null) { return; }
+        lock (this) {
+            if (!this.allSessions.Contains(session)) {
+                this.allSessions.Add(session);
+            }
+            if (uid != null && uid.Length > 0) {
+                if (!this.userMap.ContainsKey(uid)) {
+                    this.userMap[uid] = new List<WsSession>();
+                }
+                List<WsSession> uList = this.userMap[uid];
+                if (!uList.Contains(session)) {
+                    uList.Add(session);
+                }
+            }
+        }
+    }
+
+    // 加入分组/频道
+    public void JoinGroup(string group, WsSession session) {
+        if (session == null || group == null || group.Length == 0) { return; }
+        lock (this) {
+            if (!this.groupMap.ContainsKey(group)) {
+                this.groupMap[group] = new List<WsSession>();
+            }
+            List<WsSession> gList = this.groupMap[group];
+            if (!gList.Contains(session)) {
+                gList.Add(session);
+            }
+        }
+    }
+
+    // 离开分组/频道
+    public void LeaveGroup(string group, WsSession session) {
+        if (session == null || group == null || group.Length == 0) { return; }
+        lock (this) {
+            if (this.groupMap.ContainsKey(group)) {
+                this.groupMap[group].Remove(session);
+            }
+        }
+    }
+
+    // 注销会话
+    public void Unregister(WsSession session) {
+        if (session == null) { return; }
+        lock (this) {
+            this.allSessions.Remove(session);
+            List<string> ukeys = this.userMap.Keys;
+            for (int i = 0; i < ukeys.Count; i = i + 1) {
+                this.userMap[ukeys[i]].Remove(session);
+            }
+            List<string> gkeys = this.groupMap.Keys;
+            for (int i = 0; i < gkeys.Count; i = i + 1) {
+                this.groupMap[gkeys[i]].Remove(session);
+            }
+        }
+    }
+
+    // 向指定用户推送（单机直推 + 集群跨节点背板广播）
+    public void SendToUser(string uid, string message) {
+        if (uid == null || uid.Length == 0 || message == null) { return; }
+        // 1. 本机投递
+        this.DeliverUserLocal(uid, message);
+
+        // 2. 集群背板广播
+        if (this.backplane != null) {
+            this.backplane.Publish("user", uid, message);
+        }
+    }
+
+    // 向指定分组推送（单机直推 + 集群跨节点背板广播）
+    public void SendToGroup(string group, string message) {
+        if (group == null || group.Length == 0 || message == null) { return; }
+        // 1. 本机投递
+        this.DeliverGroupLocal(group, message);
+
+        // 2. 集群背板广播
+        if (this.backplane != null) {
+            this.backplane.Publish("group", group, message);
+        }
+    }
+
+    // 全集群全量广播（单机直推 + 集群跨节点背板广播）
+    public void Broadcast(string message) {
+        if (message == null) { return; }
+        // 1. 本机投递
+        this.DeliverAllLocal(message);
+
+        // 2. 集群背板广播
+        if (this.backplane != null) {
+            this.backplane.Publish("broadcast", "", message);
+        }
+    }
+
+    // 收到来自跨节点背板的消息时（仅向本地会话分发，避免重入广播死循环）
+    public void OnBackplaneMessage(string action, string target, string payload) {
+        if (action == "user") {
+            this.DeliverUserLocal(target, payload);
+        } else if (action == "group") {
+            this.DeliverGroupLocal(target, payload);
+        } else if (action == "broadcast") {
+            this.DeliverAllLocal(payload);
+        }
+    }
+
+    private void DeliverUserLocal(string uid, string message) {
+        List<WsSession> targets = null;
+        lock (this) {
+            if (this.userMap.ContainsKey(uid)) {
+                targets = new List<WsSession>();
+                List<WsSession> src = this.userMap[uid];
+                for (int i = 0; i < src.Count; i = i + 1) {
+                    targets.Add(src[i]);
+                }
+            }
+        }
+        if (targets != null) {
+            for (int i = 0; i < targets.Count; i = i + 1) {
+                targets[i].SendText(message);
+            }
+        }
+    }
+
+    private void DeliverGroupLocal(string group, string message) {
+        List<WsSession> targets = null;
+        lock (this) {
+            if (this.groupMap.ContainsKey(group)) {
+                targets = new List<WsSession>();
+                List<WsSession> src = this.groupMap[group];
+                for (int i = 0; i < src.Count; i = i + 1) {
+                    targets.Add(src[i]);
+                }
+            }
+        }
+        if (targets != null) {
+            for (int i = 0; i < targets.Count; i = i + 1) {
+                targets[i].SendText(message);
+            }
+        }
+    }
+
+    private void DeliverAllLocal(string message) {
+        List<WsSession> targets = new List<WsSession>();
+        lock (this) {
+            for (int i = 0; i < this.allSessions.Count; i = i + 1) {
+                targets.Add(this.allSessions[i]);
+            }
+        }
+        for (int i = 0; i < targets.Count; i = i + 1) {
+            targets[i].SendText(message);
+        }
+    }
+
+    public int OnlineCount() {
+        lock (this) {
+            return this.allSessions.Count;
+        }
+    }
+
+    public void Clear() {
+        lock (this) {
+            this.allSessions.Clear();
+            this.userMap.Clear();
+            this.groupMap.Clear();
+            this.backplane = null;
+        }
+    }
+}
