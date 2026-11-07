@@ -2170,10 +2170,13 @@ static LLVMValueRef refl_pget_as_i64(zan_irgen_t *g, LLVMValueRef slot,
         LLVMBuildICmp(g->builder, LLVMIntEQ, kind,
                       LLVMConstInt(i64, ZAN_REFL_FK_DOUBLE, 0), "refl.pd"),
         "refl.pfp");
+    /* B-ID180：fp 槽位型重释越界 poison 收口。arm_mask=is_fp——整型槽
+     * bitcast 出的位型是垃圾浮点，守卫只在 fp 臂生效。 */
     return LLVMBuildSelect(g->builder, is_fp,
-        LLVMBuildFPToSI(g->builder,
+        emit_fptosi_guarded(g,
             LLVMBuildBitCast(g->builder, slot, dbl, "refl.pbc"), i64,
-            "refl.pf2i"), slot, "refl.pi");
+            (zan_loc_t){0}, is_fp),
+        slot, "refl.pi");
 }
 
 static LLVMValueRef refl_pget_as_f64(zan_irgen_t *g, LLVMValueRef slot,
@@ -2223,6 +2226,8 @@ static LLVMValueRef refl_get_i64_fn(zan_irgen_t *g) {
     LLVMValueRef find = refl_find_fn(g);
 
     LLVMBasicBlockRef save = LLVMGetInsertBlock(g->builder);
+    LLVMValueRef save_fn = g->current_fn;
+    g->current_fn = fn;
     LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(g->ctx, fn, "entry");
     LLVMBasicBlockRef have  = LLVMAppendBasicBlockInContext(g->ctx, fn, "have");
     LLVMBasicBlockRef konst = LLVMAppendBasicBlockInContext(g->ctx, fn, "const");
@@ -2308,13 +2313,14 @@ static LLVMValueRef refl_get_i64_fn(zan_irgen_t *g) {
             LLVMBuildBitCast(g->builder, p,
                 LLVMPointerType(cases[ci].ty, 0), "refl.sp"), "refl.v");
         if (cases[ci].ty == flt || cases[ci].ty == dbl)
-            v = LLVMBuildFPToSI(g->builder, v, i64, "refl.f2i");
+            v = emit_fptosi_guarded(g, v, i64, (zan_loc_t){0}, NULL);
         else if (cases[ci].ty != i64)
             v = cases[ci].sext ? LLVMBuildSExt(g->builder, v, i64, "refl.sx")
                                : LLVMBuildZExt(g->builder, v, i64, "refl.zx");
         LLVMBuildRet(g->builder, v);
     }
 
+    g->current_fn = save_fn;
     if (save) LLVMPositionBuilderAtEnd(g->builder, save);
     return fn;
 }
@@ -3142,6 +3148,8 @@ static LLVMValueRef refl_set_fn(zan_irgen_t *g) {
     LLVMValueRef find = refl_find_fn(g);
 
     LLVMBasicBlockRef save = LLVMGetInsertBlock(g->builder);
+    LLVMValueRef save_fn = g->current_fn;
+    g->current_fn = fn;
     LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(g->ctx, fn, "entry");
     LLVMBasicBlockRef setr  = LLVMAppendBasicBlockInContext(g->ctx, fn, "setter");
     LLVMBasicBlockRef fld   = LLVMAppendBasicBlockInContext(g->ctx, fn, "field");
@@ -3204,8 +3212,9 @@ static LLVMValueRef refl_set_fn(zan_irgen_t *g) {
         LLVMBuildBitCast(g->builder, val, dbl, "refl.vbc"),
         LLVMBuildSIToFP(g->builder, val, dbl, "refl.vi2f"), "refl.vd");
     LLVMValueRef as_i = LLVMBuildSelect(g->builder, is_fp,
-        LLVMBuildFPToSI(g->builder,
-            LLVMBuildBitCast(g->builder, val, dbl, "refl.vbc2"), i64, "refl.vf2i"),
+        emit_fptosi_guarded(g,
+            LLVMBuildBitCast(g->builder, val, dbl, "refl.vbc2"), i64,
+            (zan_loc_t){0}, is_fp),
         val, "refl.vi");
 
     struct { int kind; LLVMTypeRef ty; int fp; const char *nm; } cases[] = {
@@ -3297,6 +3306,7 @@ static LLVMValueRef refl_set_fn(zan_irgen_t *g) {
     LLVMPositionBuilderAtEnd(g->builder, no);
     LLVMBuildRet(g->builder, LLVMConstInt(i64, 0, 0));
 
+    g->current_fn = save_fn;
     if (save) LLVMPositionBuilderAtEnd(g->builder, save);
     return fn;
 }
