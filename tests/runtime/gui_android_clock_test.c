@@ -75,7 +75,7 @@ static int injected_clock_gettime(int clock_id, struct timespec *ts) {
 typedef int64_t i64;
 #define ZAN_GUI_ANDROID_CLOCK_TEST
 #define clock_gettime injected_clock_gettime
-#include "../../src/runtime/gui_runtime_android_native.c"
+#include "../../src/drivers/gui/gui_runtime_android_native.c"
 #undef clock_gettime
 
 static WORKER_RESULT first_reader(void *arg) {

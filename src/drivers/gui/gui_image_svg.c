@@ -5,9 +5,9 @@
 #include <string.h>
 
 #define NANOSVG_IMPLEMENTATION
-#include "nanosvg/nanosvg.h"
+#include "../../third_party/nanosvg/nanosvg.h"
 #define NANOSVGRAST_IMPLEMENTATION
-#include "nanosvg/nanosvgrast.h"
+#include "../../third_party/nanosvg/nanosvgrast.h"
 
 int zan_svg_raster(const char *text, int len, uint32_t **outPix, int *outW,
                    int *outH, int boxW, int boxH) {

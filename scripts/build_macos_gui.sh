@@ -16,14 +16,14 @@ build() {
     local image="packages/Zan.Image/src/System/Drawing/Imaging/drivers/$target"
     local audio="packages/Zan.Desktop/src/System/Media/drivers/$target"
     local game="packages/Zan.Game/src/Game/Graphics/drivers/$target"
-    local flags=(-O2 -g0 -DNDEBUG -fPIC -arch "$arch" -mmacosx-version-min=11.0)
+    local flags=(-O2 -g0 -DNDEBUG -fPIC -arch "$arch" -mmacosx-version-min=11.0 -I src/drivers -I src/third_party -I src/runtime)
     local frameworks=(-framework Cocoa -framework CoreText -framework QuartzCore -framework IOSurface -framework WebKit)
     mkdir -p "$work" "$gui/static" "$image/static" "$audio/static" "$game/static"
-    xcrun clang "${flags[@]}" -DZAN_GUI_COCOA -DZAN_GUI_STATIC -c src/runtime/gui_runtime.c -o "$work/gui.o"
-    xcrun clang "${flags[@]}" -DZAN_GUI_COCOA -c src/runtime/gui_runtime_mac.m -o "$work/cocoa.o"
-    xcrun clang "${flags[@]}" -DZAN_IMAGE_STATIC -c src/runtime/zan_image.c -o "$work/image.o"
-    xcrun clang "${flags[@]}" -DZAN_AUDIO_STATIC -c src/runtime/zan_audio.c -o "$work/audio.o"
-    xcrun clang "${flags[@]}" -DZAN_GAME_STATIC -DZAN_GUI_COCOA -c src/runtime/zan_game.c -o "$work/game.o"
+    xcrun clang "${flags[@]}" -DZAN_GUI_COCOA -DZAN_GUI_STATIC -c src/drivers/gui/gui_runtime.c -o "$work/gui.o"
+    xcrun clang "${flags[@]}" -DZAN_GUI_COCOA -c src/drivers/gui/gui_runtime_mac.m -o "$work/cocoa.o"
+    xcrun clang "${flags[@]}" -DZAN_IMAGE_STATIC -c src/drivers/image/zan_image.c -o "$work/image.o"
+    xcrun clang "${flags[@]}" -DZAN_AUDIO_STATIC -c src/drivers/audio/zan_audio.c -o "$work/audio.o"
+    xcrun clang "${flags[@]}" -DZAN_GAME_STATIC -DZAN_GUI_COCOA -c src/drivers/game/zan_game.c -o "$work/game.o"
 
     xcrun clang "${flags[@]}" -dynamiclib -install_name @rpath/libzan_gui.dylib -o "$gui/libzan_gui.dylib" "$work/gui.o" "$work/cocoa.o" -lm "${frameworks[@]}"
     xcrun clang "${flags[@]}" -dynamiclib -install_name @rpath/libzan_image.dylib -o "$image/libzan_image.dylib" "$work/image.o" -lm

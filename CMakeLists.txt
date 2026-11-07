@@ -926,13 +926,13 @@ if(ZAN_BUILD_GUI)
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
                 $<TARGET_FILE:zanc> ${ZAN_ABI_PROBE}
         VERBATIM)
-    set_source_files_properties(src/runtime/gui/gui_runtime.c src/runtime/gui/gui_runtime_dwrite.cpp
+    set_source_files_properties(src/drivers/gui/gui_runtime.c src/drivers/gui/gui_runtime_dwrite.cpp
         PROPERTIES OBJECT_DEPENDS "${ZAN_ABI_PROBE}")
     if(WIN32)
         # gui_runtime_dwrite.cpp: DirectWrite glyph fallback (color emoji).
         # C++ because the SDK's dwrite.h only parses as C++; the rest of the
         # runtime stays C and calls it through the zan_dw_* extern "C" ABI.
-        add_library(zan_gui SHARED src/runtime/gui/gui_runtime.c src/runtime/rt_crash.c src/runtime/gui/gui_runtime_dwrite.cpp)
+        add_library(zan_gui SHARED src/drivers/gui/gui_runtime.c src/runtime/rt_crash.c src/drivers/gui/gui_runtime_dwrite.cpp)
         target_link_libraries(zan_gui PRIVATE user32 gdi32 dwmapi shcore imm32 ole32)
         zan_native_import_library(zan_gui)
         # Embedded WebView needs nothing here: the Edge WebView2 backend is
@@ -947,15 +947,15 @@ if(ZAN_BUILD_GUI)
         # Real Cocoa backend (Objective-C) + shared renderer + Metal GPU pipeline. The C file
         # is compiled with ZAN_GUI_COCOA so its macOS stub branch is disabled and
         # gui_runtime_mac.m supplies the native windowing/window-management ABI.
-        add_library(zan_gui SHARED src/runtime/gui/gui_runtime.c src/runtime/rt_crash.c src/runtime/gui/gui_runtime_mac.m src/runtime/gui/gui_metal_backend.m)
-        set_source_files_properties(src/runtime/gui/gui_runtime.c
+        add_library(zan_gui SHARED src/drivers/gui/gui_runtime.c src/runtime/rt_crash.c src/drivers/gui/gui_runtime_mac.m src/drivers/gui/gui_metal_backend.m)
+        set_source_files_properties(src/drivers/gui/gui_runtime.c
             PROPERTIES COMPILE_DEFINITIONS ZAN_GUI_COCOA)
         target_link_libraries(zan_gui PRIVATE m "-framework Cocoa" "-framework CoreText" "-framework QuartzCore" "-framework IOSurface" "-framework WebKit" "-framework Metal")
         set(ZAN_GUI_AVAILABLE TRUE)
     else()
         find_package(X11)
         if(X11_FOUND)
-            add_library(zan_gui SHARED src/runtime/gui/gui_runtime.c src/runtime/rt_crash.c)
+            add_library(zan_gui SHARED src/drivers/gui/gui_runtime.c src/runtime/rt_crash.c)
             target_include_directories(zan_gui PRIVATE ${X11_INCLUDE_DIR})
             target_link_libraries(zan_gui PRIVATE ${X11_LIBRARIES} m)
             find_package(Freetype QUIET)
@@ -971,7 +971,7 @@ if(ZAN_BUILD_GUI)
         endif()
     endif()
     if(ZAN_GUI_AVAILABLE)
-        target_include_directories(zan_gui PRIVATE ${CMAKE_SOURCE_DIR}/src/runtime)
+        target_include_directories(zan_gui PRIVATE ${CMAKE_SOURCE_DIR}/src/drivers ${CMAKE_SOURCE_DIR}/src/third_party ${CMAKE_SOURCE_DIR}/src/runtime)
         # Order-only edge: zanc (and its POST_BUILD probe refresh) before the
         # zan_gui submake reads the probe. See the B-ID23 comment above.
         add_dependencies(zan_gui zanc)
@@ -979,8 +979,8 @@ if(ZAN_BUILD_GUI)
 endif()
 
 if(ZAN_BUILD_IMAGE)
-    add_library(zan_image SHARED src/runtime/image/zan_image.c)
-    target_include_directories(zan_image PRIVATE ${CMAKE_SOURCE_DIR}/src/runtime)
+    add_library(zan_image SHARED src/drivers/image/zan_image.c)
+    target_include_directories(zan_image PRIVATE ${CMAKE_SOURCE_DIR}/src/drivers ${CMAKE_SOURCE_DIR}/src/third_party ${CMAKE_SOURCE_DIR}/src/runtime)
     if(NOT WIN32)
         target_link_libraries(zan_image PRIVATE m)
     endif()
@@ -990,8 +990,8 @@ endif()
 
 if(ZAN_BUILD_AUDIO)
     add_library(zan_audio SHARED
-        src/runtime/audio/zan_audio.c)
-    target_include_directories(zan_audio PRIVATE ${CMAKE_SOURCE_DIR}/src/runtime)
+        src/drivers/audio/zan_audio.c)
+    target_include_directories(zan_audio PRIVATE ${CMAKE_SOURCE_DIR}/src/drivers ${CMAKE_SOURCE_DIR}/src/third_party ${CMAKE_SOURCE_DIR}/src/runtime)
     if(WIN32)
         target_link_libraries(zan_audio PRIVATE ole32)
     else()
@@ -1008,8 +1008,8 @@ endif()
 
 if(ZAN_BUILD_GAME)
     if(TARGET zan_gui AND TARGET zan_image)
-        add_library(zan_game SHARED src/runtime/game/zan_game.c)
-        target_include_directories(zan_game PRIVATE ${CMAKE_SOURCE_DIR}/src/runtime)
+        add_library(zan_game SHARED src/drivers/game/zan_game.c)
+        target_include_directories(zan_game PRIVATE ${CMAKE_SOURCE_DIR}/src/drivers ${CMAKE_SOURCE_DIR}/src/runtime)
         target_link_libraries(zan_game PRIVATE zan_gui zan_image)
         if(WIN32)
             target_link_libraries(zan_game PRIVATE user32 gdi32)

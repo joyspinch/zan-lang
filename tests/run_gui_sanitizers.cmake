@@ -26,9 +26,9 @@ if(WIN32)
   list(APPEND _flags -D_CRT_SECURE_NO_WARNINGS -mllvm -asan-realign-stack=16)
   run_checked("${CC}" ${_flags} -c "${ROOT}/tests/runtime/gui_surface_round_test.c"
     -o "${OUT_DIR}/surface.obj")
-  run_checked("${CC}" ${_flags} -c "${ROOT}/src/runtime/gui_runtime.c"
+  run_checked("${CC}" ${_flags} -c "${ROOT}/src/drivers/gui/gui_runtime.c"
     -o "${OUT_DIR}/gui.obj")
-  run_checked("${CXX}" ${_flags} -c "${ROOT}/src/runtime/gui_runtime_dwrite.cpp"
+  run_checked("${CXX}" ${_flags} -c "${ROOT}/src/drivers/gui/gui_runtime_dwrite.cpp"
     -o "${OUT_DIR}/dwrite.obj")
   set(_exe "${OUT_DIR}/gui_surface_san.exe")
   run_checked("${CXX}" ${_flags} -fuse-ld=lld "${OUT_DIR}/surface.obj"
@@ -47,7 +47,7 @@ else()
   set(_exe "${OUT_DIR}/gui_surface_san")
   run_checked("${CC}" ${_flags} -std=c11 -D_GNU_SOURCE
     "${ROOT}/tests/runtime/gui_surface_round_test.c"
-    "${ROOT}/src/runtime/gui_runtime.c" -o "${_exe}" -pthread -lX11 -ldl -lm)
+    "${ROOT}/src/drivers/gui/gui_runtime.c" -o "${_exe}" -pthread -lX11 -ldl -lm)
   set(_asan_options "detect_leaks=1")
 endif()
 

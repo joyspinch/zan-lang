@@ -1,6 +1,6 @@
 /* gui_runtime_tray */
 
-#include "zan_bitmap.h"
+#include "../image/zan_bitmap.h"
 
 #if defined(__linux__) && !defined(__ANDROID__) && !defined(__OHOS__)
 

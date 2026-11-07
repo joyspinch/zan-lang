@@ -1,6 +1,6 @@
 #include <stdio.h>
 #include <stdlib.h>
-#include "../../src/runtime/gui_touch_game.h"
+#include "../../src/drivers/gui/gui_touch_game.h"
 
 typedef struct {
     zan_touch_game game;

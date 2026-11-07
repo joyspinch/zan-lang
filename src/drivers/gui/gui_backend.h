@@ -4,7 +4,7 @@
 #define ZAN_GUI_BACKEND_H
 
 #include <stdint.h>
-#include "zan_bitmap.h"
+#include "../image/zan_bitmap.h"
 
 struct zan_surface_s;
 

@@ -61,18 +61,31 @@ if ($Static) {
     foreach ($driver in $Drivers) {
         $directory = Join-Path (Driver-Dir $driver) "static"
         New-Item -ItemType Directory -Force -Path $directory | Out-Null
-        $source = if ($driver -eq "zan_gui") { "gui_runtime.c" } else { "$driver.c" }
+        $driverSubdir = switch ($driver) {
+            "zan_gui" { "gui" }
+            "zan_image" { "image" }
+            "zan_audio" { "audio" }
+            "zan_game" { "game" }
+        }
+        $sourceName = if ($driver -eq "zan_gui") { "gui_runtime.c" } else { "$driver.c" }
+        $source = Join-Path $root "src\drivers\$driverSubdir\$sourceName"
         $object = Join-Path $work "$driver.o"
         $definition = "-D" + $driver.ToUpperInvariant() + "_STATIC"
         Invoke-Native $clangExe @("--target=$triple", "-O2", "-DNDEBUG", $definition,
-            "-DWINVER=0x0601", "-D_WIN32_WINNT=0x0601", "-c",
-            (Join-Path $root "src\runtime\$source"), "-o", $object)
+            "-DWINVER=0x0601", "-D_WIN32_WINNT=0x0601",
+            "-I", (Join-Path $root "src\drivers"),
+            "-I", (Join-Path $root "src\third_party"),
+            "-I", (Join-Path $root "src\runtime"),
+            "-c", $source, "-o", $object)
         $objects = @($object)
         if ($driver -eq "zan_gui") {
             $dwrite = Join-Path $work "zan_gui_dwrite.o"
+            $dwriteSource = Join-Path $root "src\drivers\gui\gui_runtime_dwrite.cpp"
             Invoke-Native $clangCxx @("--target=$triple", "-O2", "-DNDEBUG", "-DZAN_GUI_STATIC",
-                "-fno-exceptions", "-fno-rtti", "-c",
-                (Join-Path $root "src\runtime\gui_runtime_dwrite.cpp"), "-o", $dwrite)
+                "-fno-exceptions", "-fno-rtti",
+                "-I", (Join-Path $root "src\drivers"),
+                "-I", (Join-Path $root "src\runtime"),
+                "-c", $dwriteSource, "-o", $dwrite)
             $objects += $dwrite
         }
         $archive = Join-Path $directory "lib$driver.a"

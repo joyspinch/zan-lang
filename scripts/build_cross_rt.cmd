@@ -14,6 +14,8 @@ setlocal
 set ZIG=%~1
 if "%ZIG%"=="" set ZIG=zig
 set RT=src\runtime
+set DRV=src\drivers
+set TP=src\third_party
 where %ZIG% >nul 2>nul || if not exist "%ZIG%" (
   echo zig not found: pass the path to zig.exe as the first argument
   exit /b 1
@@ -67,7 +69,7 @@ for %%P in (arm64:aarch64 x64:x86_64) do (
     "%ZIG%" cc -target %%B-macos.11.0 -g0 -std=c11 -fPIC -I %RT% -O2 -c %RT%\rt_hw_accel.c -o toolchain\macos\%%A\zan_crypto.o || exit /b 1
     if exist toolchain\macos\%%A\libzancrypto.a del /q toolchain\macos\%%A\libzancrypto.a
     "%ZIG%" ar rcs toolchain\macos\%%A\libzancrypto.a toolchain\macos\%%A\zan_crypto.o || exit /b 1
-    "%ZIG%" cc -target %%B-macos.11.0 -g0 -std=c11 -fPIC -I %RT% -O2 -c %RT%\gui_compat_mac.c -o toolchain\macos\%%A\zanrt_gui.o || exit /b 1
+    "%ZIG%" cc -target %%B-macos.11.0 -g0 -std=c11 -fPIC -I %RT% -I %DRV% -I %TP% -O2 -c %DRV%\gui\gui_compat_mac.c -o toolchain\macos\%%A\zanrt_gui.o || exit /b 1
     rem Embedded-resource API + decoder for the auto-embed path (GUI skins/icons).
     "%ZIG%" cc -target %%B-macos.11.0 -g0 -std=c11 -fPIC -I %RT% -O2 -c %RT%\zan_embed_api.c -o toolchain\macos\%%A\zan_embed_api.o || exit /b 1
     "%ZIG%" cc -target %%B-macos.11.0 -g0 -std=c11 -fPIC -O2 -DMINIZ_NO_ARCHIVE_APIS -DMINIZ_NO_ZIP_APIS -DMINIZ_NO_STDIO -DMINIZ_NO_TIME -DMINIZ_NO_ARCHIVE_WRITERS -I src\common -c %RT%\zan_inflate.c -o toolchain\macos\%%A\zan_inflate.o || exit /b 1
@@ -79,7 +81,7 @@ rem iOS. The ios os-tag wires no libc headers (unlike macos), so the runtime
 rem objects hand in zig's bundled Darwin set (any-macos-any); the .14.0 suffix
 rem matches the objects' LC_BUILD_VERSION. gui_compat_mac.c is self-contained.
 if not exist toolchain\ios\arm64 mkdir toolchain\ios\arm64
-"%ZIG%" cc -target aarch64-ios.14.0 -g0 -std=c11 -fPIC -I %RT% -O2 -c %RT%\gui_compat_mac.c -o toolchain\ios\arm64\zanrt_gui.o || exit /b 1
+"%ZIG%" cc -target aarch64-ios.14.0 -g0 -std=c11 -fPIC -I %RT% -I %DRV% -I %TP% -O2 -c %DRV%\gui\gui_compat_mac.c -o toolchain\ios\arm64\zanrt_gui.o || exit /b 1
 for %%Z in ("%ZIG%") do set ZROOT=%%~dpZ
 set IOSHDR=%ZROOT%lib\libc\include\any-macos-any
 "%ZIG%" cc -target aarch64-ios.14.0 -I "%IOSHDR%" -g0 -DZAN_IO_STACKLESS_ONLY -fPIC -I %RT% -O2 -c %RT%\rt_io.c    -o toolchain\ios\arm64\zanrt_io.o    || exit /b 1
@@ -151,19 +153,19 @@ if "%FT_INC%"=="" if exist "%HOME%\firefox\modules\freetype2\include\ft2build.h"
 if "%FT_INC%"=="" if exist "%USERPROFILE%\.mozbuild\firefox\modules\freetype2\include\ft2build.h" set FT_INC=%USERPROFILE%\.mozbuild\firefox\modules\freetype2\include
 if "%FT_INC%"=="" echo note: FreeType headers not found; set FREETYPE_INC or ZAN_FREETYPE_ROOT for proportional text on wasm32 (bitmap fallback otherwise)
 if exist "%FT_INC%\ft2build.h" if exist toolchain\wasm32\libfreetype.a goto ft_gui
-"%ZIG%" cc -target wasm32-wasi -g0 -std=gnu11 -I %RT% -O2 -c %RT%\gui_runtime.c -DZAN_GUI_WASM -DZAN_GUI_STATIC -o toolchain\wasm32\zanrt_gui.o || exit /b 1
+"%ZIG%" cc -target wasm32-wasi -g0 -std=gnu11 -I %RT% -I %DRV% -I %TP% -O2 -c %DRV%\gui\gui_runtime.c -DZAN_GUI_WASM -DZAN_GUI_STATIC -o toolchain\wasm32\zanrt_gui.o || exit /b 1
 goto gui_done
 :ft_gui
-"%ZIG%" cc -target wasm32-wasi -g0 -std=gnu11 -I %RT% -I "%FT_INC%" -I toolchain\wasm32\freetype-shim -O2 -c %RT%\gui_runtime.c -DZAN_GUI_WASM -DZAN_GUI_STATIC -DZAN_GUI_FREETYPE -o toolchain\wasm32\zanrt_gui.o || exit /b 1
+"%ZIG%" cc -target wasm32-wasi -g0 -std=gnu11 -I %RT% -I %DRV% -I %TP% -I "%FT_INC%" -I toolchain\wasm32\freetype-shim -O2 -c %DRV%\gui\gui_runtime.c -DZAN_GUI_WASM -DZAN_GUI_STATIC -DZAN_GUI_FREETYPE -o toolchain\wasm32\zanrt_gui.o || exit /b 1
 :gui_done
 rem Decoder/cache owns stb_image, the vendored libwebp TU and gui_image_svg.c;
 rem it has no window, FreeType or GUI dependency.
-"%ZIG%" cc -target wasm32-wasi -g0 -std=gnu11 -I %RT% -I %RT%\libwebp\src -O2 -c %RT%\zan_image.c -DZAN_IMAGE_STATIC -o toolchain\wasm32\zanrt_image.o || exit /b 1
+"%ZIG%" cc -target wasm32-wasi -g0 -std=gnu11 -I %RT% -I %DRV% -I %TP% -I %TP%\libwebp\src -O2 -c %DRV%\image\zan_image.c -DZAN_IMAGE_STATIC -o toolchain\wasm32\zanrt_image.o || exit /b 1
 rem Game consumes the shared graphics context and image cache via their headers.
-"%ZIG%" cc -target wasm32-wasi -g0 -std=gnu11 -I %RT% -O2 -c %RT%\zan_game.c -DZAN_GAME_STATIC -o toolchain\wasm32\zanrt_game.o || exit /b 1
+"%ZIG%" cc -target wasm32-wasi -g0 -std=gnu11 -I %RT% -I %DRV% -O2 -c %DRV%\game\zan_game.c -DZAN_GAME_STATIC -o toolchain\wasm32\zanrt_game.o || exit /b 1
 rem WASI keeps offline WAV/Vorbis APIs and the existing no-device result;
 rem zan_audio.c's WASI path must not require desktop pthread/dlopen backends.
-"%ZIG%" cc -target wasm32-wasi -g0 -std=gnu11 -I %RT% -O2 -c %RT%\zan_audio.c -DZAN_AUDIO_STATIC -o toolchain\wasm32\zanrt_audio.o || exit /b 1
+"%ZIG%" cc -target wasm32-wasi -g0 -std=gnu11 -I %RT% -I %DRV% -I %TP% -O2 -c %DRV%\audio\zan_audio.c -DZAN_AUDIO_STATIC -o toolchain\wasm32\zanrt_audio.o || exit /b 1
 rem Single-threaded sync equivalents for wasm32 GUI programs (rt_sync_wasm.c):
 rem threads run their body synchronously, atomics are plain cells, the shared
 rem table degrades to "unavailable", clocks are real. main.c links this next to

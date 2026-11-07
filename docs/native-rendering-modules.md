@@ -114,4 +114,4 @@ powershell -File scripts/build_gui_driver.ps1 -Static -Target win-x64
 | Android ARM64 / x64 | `bash scripts/build_gui_android.sh all`，转入 `build_gui_android_static.sh` 生成 shared/static；配置 NDK 与 `FREETYPE_SRC` |
 | OHOS ARM64 / x64 | `bash scripts/build_gui_ohos.sh all`，生成 shared/static；配置 `DEVECO_ROOT` 与 `FREETYPE_SRC` |
 
-核实来源：`CMakeLists.txt`、上述构建脚本、`packages/Zan.Image/src/System/Drawing/Imaging/ImageCodec.zan`，以及 `src/runtime/zan_bitmap.h`、`zan_image.h`、`zan_gui_graphics.h`、`zan_game.h`。
+核实来源：`CMakeLists.txt`、上述构建脚本、`packages/Zan.Image/src/System/Drawing/Imaging/ImageCodec.zan`，以及 `src/drivers/image/zan_bitmap.h`、`zan_image.h`、`src/drivers/gui/zan_gui_graphics.h`、`src/drivers/game/zan_game.h`。

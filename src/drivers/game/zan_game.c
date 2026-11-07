@@ -1,6 +1,6 @@
 #include "zan_game.h"
-#include "zan_gui_graphics.h"
-#include "zan_image.h"
+#include "../gui/zan_gui_graphics.h"
+#include "../image/zan_image.h"
 
 #include <stddef.h>
 #include <stdio.h>

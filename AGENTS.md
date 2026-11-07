@@ -11,7 +11,7 @@ Guidance for humans and AI agents working in this repo. **本文件只是一行�
 
 | Path | Contents |
 |---|---|
-| `src/compiler` `src/runtime` `src/common` | C11 编译器前后端 / C11 运行时（ARC、集合、IO、调度）/ 共享 C 工具 |
+| `src/compiler` `src/runtime` `src/drivers` `src/third_party` `src/common` | C11 编译器前后端 / 语言微运行时（ARC、IO、调度、同步）/ 平台原生系统驱动（GUI、Audio、Image、Game）/ 第三方源码库 / 共享 C 工具 |
 | `src/lsp` `src/dap` | 语言服务器 zan-lsp（intellisense 引擎）/ 调试适配器 zan-dap |
 | `src/ide_zan` `src/fmt` `src/doc` `src/selfhost` | 自举 IDE（入口 src/IdeForm.html）/ 格式化 / 文档生成 / 自举编译器（.zan） |
 | `stdlib` `packages` | 标准库（.zan + 原生驱动束）/ 可复用包 Zan.* |

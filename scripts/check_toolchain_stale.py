@@ -55,36 +55,36 @@ RT_CRASH = ["src/runtime/rt_crash.c", "src/runtime/rt_crash.h"]
 RT_CRYPTO = ["src/runtime/rt_hw_accel.c", "src/runtime/rt_hw_accel.h"]
 RT_WASM = ["src/runtime/rt_wasm.c"]   # zanrt_wasm.o compiles rt_wasm.c only; rt_file.c
                                      # links alongside as its own object (build_cross_rt.cmd)
-RT_GUI_MAC = ["src/runtime/gui_compat_mac.c"]
+RT_GUI_MAC = ["src/drivers/gui/gui_compat_mac.c"]
 RT_MEM = ["src/runtime/rt_mem.c"]
 EMBED = ["src/runtime/zan_embed_api.c", "src/runtime/rt_timer.h",
          "src/common/host_oom.h"]
 INFLATE = ["src/runtime/zan_inflate.c", "src/common/miniz_tinfl.c",
            "src/common/miniz.h"]
-WASM_GUI = ["src/runtime/gui_runtime.c", "src/runtime/gui_gl_backend.c",
-            "src/runtime/gui_gl_context.c", "src/runtime/gui_runtime_wasm.c",
-            "src/runtime/gui_runtime_glyph.c", "src/runtime/gui_runtime_text.c",
-            "src/runtime/gui_runtime_font.c", "src/runtime/gui_runtime_tray.c",
-            "src/runtime/gui_runtime_shims.c", "src/runtime/gui_runtime_android.c",
-            "src/runtime/gui_backend.h", "src/runtime/gui_gl.h",
-            "src/runtime/zan_gui_graphics.h", "src/runtime/zan_bitmap.h",
+WASM_GUI = ["src/drivers/gui/gui_runtime.c", "src/drivers/gui/gui_gl_backend.c",
+            "src/drivers/gui/gui_gl_context.c", "src/drivers/gui/gui_runtime_wasm.c",
+            "src/drivers/gui/gui_runtime_glyph.c", "src/drivers/gui/gui_runtime_text.c",
+            "src/drivers/gui/gui_runtime_font.c", "src/drivers/gui/gui_runtime_tray.c",
+            "src/drivers/gui/gui_runtime_shims.c", "src/drivers/gui/gui_runtime_android.c",
+            "src/drivers/gui/gui_backend.h", "src/drivers/gui/gui_gl.h",
+            "src/drivers/gui/zan_gui_graphics.h", "src/drivers/image/zan_bitmap.h",
             "src/common/host_oom.h", "toolchain/wasm32/freetype-shim"]
 ANDROID_NDK = []  # NDK-derived: no repo source drives it; never "stale" by src
 OHOS_NDK = []     # same for the OHOS SDK sysroot subset (libc.a, crt*, builtins)
 ZIG_BUNDLED = []  # zig/wasi/musl sysroot subsets + external prebuilts: no repo source
-GUI = [p for p in sorted(glob.glob("src/runtime/gui_*"))
+GUI = [p for p in sorted(glob.glob("src/drivers/gui/*"))
        if not p.endswith("gui_image_svg.c")] + [
-    "src/runtime/zan_gui_graphics.h", "src/runtime/rt_crash.h",
+    "src/drivers/gui/zan_gui_graphics.h", "src/runtime/rt_crash.h",
     "src/runtime/zan_fortify_compat.c"]
-IMAGE = ["src/runtime/zan_image.c", "src/runtime/zan_image.h",
-         "src/runtime/zan_bitmap.h", "src/runtime/gui_image_svg.c",
-         "src/runtime/stb_image.h", "src/runtime/libwebp",
+IMAGE = ["src/drivers/image/zan_image.c", "src/drivers/image/zan_image.h",
+         "src/drivers/image/zan_bitmap.h", "src/drivers/gui/gui_image_svg.c",
+         "src/third_party/stb_image.h", "src/third_party/libwebp",
          "src/common/host_oom.h"]
-AUDIO = ["src/runtime/zan_audio.c", "src/runtime/stb_vorbis.c",
+AUDIO = ["src/drivers/audio/zan_audio.c", "src/third_party/stb_vorbis.c",
          "src/common/host_oom.h"]
-GAME = ["src/runtime/zan_game.c", "src/runtime/zan_game.h",
-        "src/runtime/zan_gui_graphics.h", "src/runtime/zan_image.h",
-        "src/runtime/zan_bitmap.h", "src/runtime/gui_gl.h"]
+GAME = ["src/drivers/game/zan_game.c", "src/drivers/game/zan_game.h",
+        "src/drivers/gui/zan_gui_graphics.h", "src/drivers/image/zan_image.h",
+        "src/drivers/image/zan_bitmap.h", "src/drivers/gui/gui_gl.h"]
 
 # (path, sources, group). The groups exist so CI can hold the part it can
 # rebuild -- `--group runtime`, which zig cc produces for every target from one

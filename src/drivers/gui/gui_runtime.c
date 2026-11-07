@@ -53,7 +53,7 @@
 #define EXPORT __attribute__((visibility("default")))
 #endif
 
-#include "../common/host_oom.h"
+#include "../../common/host_oom.h"
 #if !defined(__wasm__)
 #include "rt_crash.h"
 #endif

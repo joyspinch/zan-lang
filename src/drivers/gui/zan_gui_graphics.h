@@ -1,7 +1,7 @@
 #ifndef ZAN_GUI_GRAPHICS_H
 #define ZAN_GUI_GRAPHICS_H
 
-#include "zan_bitmap.h"
+#include "../image/zan_bitmap.h"
 #include "gui_gl.h"
 
 #ifndef ZAN_GUI_GRAPHICS_API

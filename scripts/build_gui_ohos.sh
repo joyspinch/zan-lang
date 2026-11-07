@@ -112,14 +112,15 @@ build_arch() {  # build_arch <arch>   (x64 | arm64)
   echo "== ohos-$a: compile gui_runtime.c"
   "$CLANG" -O2 -fPIC -g0 -DNDEBUG -std=c11 -D_GNU_SOURCE -DZAN_GUI_OHOS \
     -DZAN_GUI_FREETYPE -DZAN_GUI_STATIC -I"$FT/include" -I"$REPO/src/runtime" \
+    -I"$REPO/src/drivers" -I"$REPO/src/third_party" \
     --target=$triple --sysroot="$SYS" \
-    -c "$REPO/src/runtime/gui_runtime.c" -o "$OUT/gui_ohos_$a.o"
+    -c "$REPO/src/drivers/gui/gui_runtime.c" -o "$OUT/gui_ohos_$a.o"
 
   for feature in image audio game; do
     "$CLANG" -O2 -fPIC -g0 -DNDEBUG -std=c11 -D_GNU_SOURCE \
       -D"ZAN_$(printf '%s' "$feature" | tr '[:lower:]' '[:upper:]')_STATIC" \
-      -I"$REPO/src/runtime" --target=$triple --sysroot="$SYS" \
-      -c "$REPO/src/runtime/zan_$feature.c" -o "$OUT/zan_${feature}_$a.o"
+      -I"$REPO/src/runtime" -I"$REPO/src/drivers" -I"$REPO/src/third_party" --target=$triple --sysroot="$SYS" \
+      -c "$REPO/src/drivers/$feature/zan_$feature.c" -o "$OUT/zan_${feature}_$a.o"
   done
   "$CLANG" -fPIC -shared -g0 --target=$triple --sysroot="$SYS" \
     -Wl,-soname,libzan_gui.so -o "$drv/libzan_gui.so" "$OUT/gui_ohos_$a.o" \

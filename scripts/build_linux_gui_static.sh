@@ -57,7 +57,9 @@ $CC -O2 -g0 -DNDEBUG -ffunction-sections -fdata-sections -fPIC -std=gnu11 \
     -DZAN_GUI_STATIC -DZAN_GUI_FREETYPE \
     $FT_CFLAGS \
     -I"$ROOT/src/runtime" \
-    -c "$ROOT/src/runtime/gui_runtime.c" -o "$WORK/zan_gui_${ARCH_SUFFIX}.o"
+    -I"$ROOT/src/drivers" \
+    -I"$ROOT/src/third_party" \
+    -c "$ROOT/src/drivers/gui/gui_runtime.c" -o "$WORK/zan_gui_${ARCH_SUFFIX}.o"
 
 # Crash reporter object: rt_crash.h implementations moved to rt_crash.c
 # (B-ID106); gui_runtime.o now references zan__* instead of baking them in,
@@ -71,7 +73,8 @@ $CC -O2 -g0 -DNDEBUG -ffunction-sections -fdata-sections -fPIC -std=gnu11 \
 for feature in image audio game; do
     $CC -O2 -g0 -DNDEBUG -ffunction-sections -fdata-sections -fPIC -std=gnu11 \
         -U_FORTIFY_SOURCE -DZAN_NO_EXECINFO -D"ZAN_${feature^^}_STATIC" \
-        -I"$ROOT/src/runtime" -c "$ROOT/src/runtime/zan_$feature.c" -o "$WORK/zan_$feature.o"
+        -I"$ROOT/src/runtime" -I"$ROOT/src/drivers" -I"$ROOT/src/third_party" \
+        -c "$ROOT/src/drivers/$feature/zan_$feature.c" -o "$WORK/zan_$feature.o"
 done
 
 echo "== [1b] Compiling fortify/link shims =="

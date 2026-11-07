@@ -3,7 +3,7 @@
 #include <stdlib.h>
 #include <math.h>
 #include <limits.h>
-#include "../../src/runtime/zan_gui_graphics.h"
+#include "../../src/drivers/gui/zan_gui_graphics.h"
 
 extern int32_t zan_gui_create_surface(int32_t, int32_t);
 extern int32_t zan_gui_destroy_surface(int32_t);

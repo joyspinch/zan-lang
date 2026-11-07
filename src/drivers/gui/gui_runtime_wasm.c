@@ -5,7 +5,7 @@
 #include <string.h>
 #include <time.h>
 
-#include "../common/zan_abi.h"
+#include "../../common/zan_abi.h"
 
 __attribute__((import_module("zan_env"), import_name("pump")))
 static void zan__env_pump(void);

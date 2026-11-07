@@ -47,7 +47,7 @@ mkdir -p "$FT_CUSTOM_INC/freetype/config"
 # Match the module list below; always refresh when the FreeType checkout changes.
 grep -vE "ft_sdf_renderer_class|ft_bitmap_sdf_renderer_class|ft_svg_renderer_class|ft_raster1_renderer_class|t1cid_driver_class|pfr_driver_class|t42_driver_class|winfnt_driver_class|pcf_driver_class|bdf_driver_class|t1_driver_class" \
   "$FT/include/freetype/config/ftmodule.h" > "$FT_CUSTOM_INC/freetype/config/ftmodule.h"
-COMMON=(-O2 -g0 -DNDEBUG -fPIC -std=c11 -I"$REPO/src/runtime")
+COMMON=(-O2 -g0 -DNDEBUG -fPIC -std=c11 -I"$REPO/src/runtime" -I"$REPO/src/drivers" -I"$REPO/src/third_party")
 FT_FLAGS=(-DFT2_BUILD_LIBRARY -I"$FT_CUSTOM_INC" -I"$FT/include")
 FT_SRC="autofit/autofit.c cff/cff.c base/ftbase.c base/ftbbox.c base/ftbitmap.c \
 base/ftdebug.c base/ftgasp.c base/ftglyph.c gzip/ftgzip.c base/ftinit.c \
@@ -67,7 +67,7 @@ build() { # triple driver-target
   mkdir -p "$work" "$gui/static" "$image/static" "$audio/static" "$game/static"
   "$NDKBIN/clang" "${target_flags[@]}" "${COMMON[@]}" "${FT_FLAGS[@]}" \
     -DZAN_GUI_ANDROID_NATIVE -DZAN_GUI_FREETYPE -DZAN_GUI_STATIC -I"$REPO/toolchain/$target" \
-    -c "$REPO/src/runtime/gui_runtime.c" -o "$work/gui.o"
+    -c "$REPO/src/drivers/gui/gui_runtime.c" -o "$work/gui.o"
   for f in $FT_SRC; do
     m=$(basename "$f" .c)
     "$NDKBIN/clang" "${target_flags[@]}" "${COMMON[@]}" "${FT_FLAGS[@]}" \
@@ -77,7 +77,7 @@ build() { # triple driver-target
   for feature in image audio game; do
     "$NDKBIN/clang" "${target_flags[@]}" "${COMMON[@]}" \
       -D"ZAN_$(printf '%s' "$feature" | tr '[:lower:]' '[:upper:]')_STATIC" \
-      -c "$REPO/src/runtime/zan_$feature.c" -o "$work/$feature.o"
+      -c "$REPO/src/drivers/$feature/zan_$feature.c" -o "$work/$feature.o"
   done
   rm -f "$gui/static/libzan_gui.a" "$image/static/libzan_image.a" "$audio/static/libzan_audio.a" "$game/static/libzan_game.a"
   "$NDKBIN/llvm-ar" rcs "$gui/static/libzan_gui.a" "$work/gui.o" "${ft_objects[@]}"
